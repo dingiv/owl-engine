@@ -1,0 +1,13 @@
+[package]
+name = "owl-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Memory planner (graph-allowance first), scheduler, runner with sync isolation"
+
+[dependencies]
+owl-graph = { path = "../graph" }
+owl-comm = { path = "../comm" }
+owl-kernels = { path = "../kernels" }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }

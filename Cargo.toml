@@ -1,0 +1,17 @@
+[workspace]
+members = [
+    "crates/graph",
+    "crates/comm",
+    "crates/kernels",
+    "crates/core",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+parking_lot = "0.12"
+thiserror = "1"

@@ -1,0 +1,11 @@
+[package]
+name = "owl-comm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TP communication: size-routed backends, capture-awareness, fusion seams"
+
+[dependencies]
+owl-graph = { path = "../graph" }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }

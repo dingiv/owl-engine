@@ -1,0 +1,9 @@
+[package]
+name = "owl-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CUDA graph runtime: budget-first planning, capture governance, replay dispatch"
+
+[dependencies]
+thiserror = { workspace = true }
