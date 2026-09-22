@@ -137,7 +137,6 @@ unsafe fn audit_kernel_node(
     let mut kern = params.kern;
     if kern.is_null() {
         let r = unsafe { func_to_kernel(params.func, &mut kern) };
-        eprintln!("[dbg2] func=0x{:x} -> cuFuncGetKernel = {r:?}", params.func as usize);
         if !r {
             rep.opaque_nodes += 1;
             return Ok(());
@@ -151,10 +150,8 @@ unsafe fn audit_kernel_node(
         let mut size: usize = 0;
         let r = sys::cuKernelGetParamInfo(kern, n_params, &mut off, &mut size);
         if r != sys::CUresult::CUDA_SUCCESS {
-            eprintln!("[dbg2] node func=0x{:x}: 参数枚举在 #{} 处停: {r:?} (已枚举 {n_params})", params.func as usize, n_params);
             break;
         }
-        eprintln!("[dbg2] node func=0x{:x}: param#{} off={} size={}", params.func as usize, n_params, off, size);
         n_params += 1;
     }
     // pass 2:参数值对账。参数可能是标量(size≤8)或结构体(size>8,

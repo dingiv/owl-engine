@@ -16,7 +16,7 @@ use super::pool::PoolBufInner;
 use crate::buffers::Persistent;
 use crate::ffi::{sys, graph_destroy, graph_exec_destroy, graph_instantiate, graph_launch, stream_end_capture};
 use cudarc::driver::CudaStream;
-use owl_iface::{BackendError, BufToken, MemValue};
+use owl_iface::{BackendError, BufToken, MemPhase, MemValue};
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
@@ -73,6 +73,19 @@ impl CaptureSession {
                 "姿势 6:捕获前本设备须完成至少一次 eager 发射(warmup;JIT/懒状态清理)",
             ));
         }
+
+        // P2 接线:捕获窗口 = Capturing 相(延迟释放生效)。未 lease 的缓冲
+        // 在窗口内 drop 不再即时 free/unmap,图指针不会悬空;窗口结束恢复原相。
+        struct PhaseGuard<'a>(&'a Governor);
+        impl Drop for PhaseGuard<'_> {
+            fn drop(&mut self) {
+                self.0.restore_phase();
+            }
+        }
+        let _phase = {
+            self.gov.push_phase(MemPhase::Capturing);
+            PhaseGuard(&self.gov)
+        };
 
         self.stream
             .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
@@ -198,6 +211,8 @@ pub struct DeviceGraph {
     /// drop 时 Arc 计数回落,回收流程自然解封。
     #[allow(dead_code)]
     keepalive: Vec<Arc<PoolBufInner>>,
+    /// 治理句柄(debug 构建的 replay 前租约校验通道;release 下仅保活)
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     gov: Arc<Governor>,
     audit: AuditReport,
 }

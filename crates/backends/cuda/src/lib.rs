@@ -269,7 +269,7 @@ mod tests {
                 bytes: 1 << 20,
             })
             .unwrap();
-        let mut t = dev.alloc_persistent_in::<u8>(&pool, 4096).unwrap();
+        let t = dev.alloc_persistent_in::<u8>(&pool, 4096).unwrap();
         let token = t.token.unwrap();
 
         unsafe {

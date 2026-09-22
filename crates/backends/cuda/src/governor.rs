@@ -15,6 +15,8 @@ pub(crate) struct Governor {
     pub(crate) ctx: Option<Arc<CudaContext>>,
     pub(crate) phase: RwLock<MemPhase>,
     pub(crate) deferred: Mutex<Vec<DeferredFree>>,
+    /// 捕获窗口相栈(push_phase/restore_phase 作用域用)
+    pub(crate) phase_stack: Mutex<Vec<MemPhase>>,
     pub(crate) stats: Mutex<MemStats>,
     /// A5.2 全局账本:存活字节 / 累计分配字节
     pub(crate) bytes_alive: Mutex<u64>,
@@ -41,6 +43,19 @@ pub(crate) struct Governor {
 impl Governor {
     pub(crate) fn phase(&self) -> MemPhase {
         *self.phase.read()
+    }
+
+    /// 捕获窗口相压栈(push Capturing;窗口结束弹出恢复调用方原相)。
+    /// 与 set_phase 分立:窗口是作用域语义,不应把用户设的 Live 永久覆盖。
+    pub(crate) fn push_phase(&self, phase: MemPhase) {
+        self.phase_stack.lock().push(*self.phase.read());
+        *self.phase.write() = phase;
+    }
+
+    pub(crate) fn restore_phase(&self) {
+        if let Some(prev) = self.phase_stack.lock().pop() {
+            *self.phase.write() = prev;
+        }
     }
 
     pub(crate) fn set_phase(&self, phase: MemPhase) {
