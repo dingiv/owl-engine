@@ -134,8 +134,10 @@ impl<D: Device> DynTensor<D> {
     }
 
 
-    /// 重塑(元数据;元素数不变,contiguous 保持——真实现)
-    pub fn reshape(&self, shape: &[usize]) -> Result<Self, BackendError> {
+    /// 重塑(元数据;元素数不变,contiguous 保持——真实现)。
+    /// 形参多态(S6 搬运友好):切片/Vec/usize/元组(1-5 元)均可。
+    pub fn reshape(&self, shape: impl ShapeLike) -> Result<Self, BackendError> {
+        let shape = shape.to_shape_vec();
         let n: usize = shape.iter().product();
         let elems: usize = self.shape.iter().product();
         if n != elems {
@@ -144,7 +146,7 @@ impl<D: Device> DynTensor<D> {
             )));
         }
         let mut out = self.clone();
-        out.shape = shape.to_vec();
+        out.shape = shape;
         Ok(out)
     }
 
@@ -200,3 +202,51 @@ impl<D: Device> Clone for DynKeepalive<D> {
         }
     }
 }
+
+/// 形状多态(S6 搬运友好:candle 调用点传切片/元组/Vec 均可)
+pub trait ShapeLike {
+    fn to_shape_vec(self) -> Vec<usize>;
+}
+impl ShapeLike for &[usize] {
+    fn to_shape_vec(self) -> Vec<usize> {
+        self.to_vec()
+    }
+}
+impl ShapeLike for Vec<usize> {
+    fn to_shape_vec(self) -> Vec<usize> {
+        self
+    }
+}
+impl ShapeLike for usize {
+    fn to_shape_vec(self) -> Vec<usize> {
+        vec![self]
+    }
+}
+impl ShapeLike for (usize,) {
+    fn to_shape_vec(self) -> Vec<usize> {
+        vec![self.0]
+    }
+}
+impl<const N: usize> ShapeLike for [usize; N] {
+    fn to_shape_vec(self) -> Vec<usize> {
+        self.to_vec()
+    }
+}
+impl<const N: usize> ShapeLike for &[usize; N] {
+    fn to_shape_vec(self) -> Vec<usize> {
+        self.to_vec()
+    }
+}
+macro_rules! shape_like_tuple {
+    ($($t:ident),+; $($i:tt),+) => {
+        impl ShapeLike for ($($t),+) {
+            fn to_shape_vec(self) -> Vec<usize> {
+                vec![$(self.$i),+]
+            }
+        }
+    };
+}
+shape_like_tuple!(usize, usize; 0, 1);
+shape_like_tuple!(usize, usize, usize; 0, 1, 2);
+shape_like_tuple!(usize, usize, usize, usize; 0, 1, 2, 3);
+shape_like_tuple!(usize, usize, usize, usize, usize; 0, 1, 2, 3, 4);

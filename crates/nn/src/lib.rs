@@ -18,6 +18,7 @@ pub mod tensor;
 
 pub use dtype::{Bf16, Dtype, F16, IndexScalar, Scalar};
 pub use dyn_tensor::DynTensor;
+pub use ops::OpsCtx;
 pub use tensor::TensorPoolOps;
 
 use owl_iface::{BackendError, BufToken, MemPhase};

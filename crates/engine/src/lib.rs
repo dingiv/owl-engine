@@ -18,6 +18,7 @@ pub mod distributed;
 pub mod env;
 pub mod error;
 pub mod image;
+pub mod graphplan;
 pub mod kvcache;
 pub mod loader;
 pub mod models;
