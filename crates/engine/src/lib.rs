@@ -19,6 +19,7 @@ pub mod env;
 pub mod error;
 pub mod image;
 pub mod kvcache;
+pub mod loader;
 pub mod models;
 pub mod multi_node;
 pub mod prefix_cache;

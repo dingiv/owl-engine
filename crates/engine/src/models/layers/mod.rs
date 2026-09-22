@@ -16,6 +16,26 @@
 
 #![allow(unused_variables)]
 
+pub mod deepstack;
+pub mod mask;
+pub mod distributed;
+pub mod linear;
+pub mod mlp;
+pub mod others;
+pub mod rotary_emb;
+pub mod wna16;
+
+/// 权重名映射(GGUF 键名 vs HF 键名;= xinfer collect_key_map 直译)
+pub fn collect_key_map<'a, const N: usize>(
+    is_qvar_builder: bool,
+    pairs: [(&'a str, &'a str); N],
+) -> std::collections::HashMap<&'a str, &'a str> {
+    if is_qvar_builder {
+        pairs.into_iter().collect()
+    } else {
+        pairs.into_iter().map(|(key, _)| (key, key)).collect()
+    }
+}
 //pub mod attention;
 //pub mod deepstack;
 //pub mod deltanet;
@@ -52,6 +72,11 @@ pub struct Shape(pub Vec<usize>);
 impl From<&[usize]> for Shape {
     fn from(s: &[usize]) -> Self {
         Shape(s.to_vec())
+    }
+}
+impl From<&Vec<usize>> for Shape {
+    fn from(s: &Vec<usize>) -> Self {
+        Shape(s.clone())
     }
 }
 impl From<Vec<usize>> for Shape {
@@ -213,6 +238,16 @@ pub trait OwlTensor: Sized {
         sin: &Tensor,
         n_rotations: usize,
     ) -> Result<Tensor>;
+
+    // ---- 其余层件调用面(T2-三 波次补齐)----
+    fn broadcast_left(&self, left: impl Into<Shape>) -> Result<Tensor>;
+    fn is_contiguous(&self) -> bool;
+    fn dims3(&self) -> Result<(usize, usize, usize)>;
+    fn elem_count(&self) -> Result<usize>;
+    fn permute(&self, order: &[usize]) -> Result<Tensor>;
+    fn avg_pool2d_with_stride(&self, kernel: usize, stride: usize) -> Result<Tensor>;
+    /// 量化张量解包(GGUF 路径;体 = marlin-ffi 路线,运行里程碑)
+    fn dequantize(&self, device: &Device) -> Result<Tensor>;
 }
 
 /// T3 回填占位(编译先行口径;运行里程碑经 owl-kernels/marlin-ffi 替换为真实 kernel)
@@ -312,6 +347,28 @@ impl OwlTensor for Tensor {
     ) -> Result<Tensor> {
         t3_unimpl("apply_rotary_emb_qkv")
     }
+    fn broadcast_left(&self, _left: impl Into<Shape>) -> Result<Tensor> {
+        t3_unimpl("broadcast_left")
+    }
+    fn is_contiguous(&self) -> bool {
+        true // S3:owl 无惰性布局,恒紧凑
+    }
+    fn dims3(&self) -> Result<(usize, usize, usize)> {
+        t3_unimpl("dims3")
+    }
+    fn elem_count(&self) -> Result<usize> {
+        t3_unimpl("elem_count")
+    }
+    fn permute(&self, order: &[usize]) -> Result<Tensor> {
+        let _ = order;
+        t3_unimpl("permute")
+    }
+    fn avg_pool2d_with_stride(&self, _kernel: usize, _stride: usize) -> Result<Tensor> {
+        t3_unimpl("avg_pool2d_with_stride")
+    }
+    fn dequantize(&self, _device: &Device) -> Result<Tensor> {
+        t3_unimpl("dequantize(量化 = marlin-ffi 路线)")
+    }
 }
 
 // ============================================================================
@@ -328,8 +385,16 @@ pub mod ops {
     pub fn softmax_last_dim(x: &Tensor) -> Result<Tensor> { t3_unimpl("softmax_last_dim") }
     pub fn gelu_erf(x: &Tensor) -> Result<Tensor> { t3_unimpl("gelu_erf") }
     pub fn tanh(x: &Tensor) -> Result<Tensor> { t3_unimpl("tanh") }
-    pub fn sigmoid(x: &Tensor) -> Result<Tensor> { t3_unimpl("sigmoid") }
     pub fn silu_and_mul(x: &Tensor) -> Result<Tensor> { t3_unimpl("silu_and_mul") }
+    pub fn sigmoid(x: &Tensor) -> Result<Tensor> { t3_unimpl("sigmoid") }
+    pub fn cat(xs: &[Tensor], dim: usize) -> Result<Tensor> {
+        let _ = (xs, dim);
+        t3_unimpl("cat")
+    }
+    pub fn full(v: f64, shape: &[usize], _like: &Tensor) -> Result<Tensor> {
+        let _ = (v, shape);
+        t3_unimpl("full")
+    }
     pub fn _dt(_d: DType) {}
 }
 
@@ -417,6 +482,9 @@ impl VarBuilderX {
         })
     }
 
+    pub fn is_gguf(&self) -> bool {
+        self.is_gguf
+    }
     pub fn is_var_builder(&self) -> bool {
         !self.is_gguf
     }
@@ -459,72 +527,55 @@ impl VarBuilderX {
     pub fn has_key(&self, _name: &str) -> bool {
         false // T3 回填
     }
+    pub fn contains_tensor(&self, _name: &str) -> bool {
+        false // T3 回填
+    }
+    pub fn get_no_shape(&self, _name: &str) -> Result<Tensor> {
+        unimplemented!("T3 权重装载通道回填: get_no_shape")
+    }
     pub fn tensor_shape(&self, _name: &str) -> Option<Vec<usize>> {
         None // T3 回填
     }
 
     pub fn get_with_hints_dtype(
         &self,
-        _s: impl Into<Shape>,
-        _name: &str,
-        _shard: Shard,
-        _dtype: DType,
+        s: impl Into<Shape>,
+        name: &str,
+        shard: Shard,
+        dtype: DType,
     ) -> Result<Tensor> {
+        let _ = (&s, name, &shard, dtype);
         unimplemented!("T3 权重装载通道回填: get_with_hints_dtype")
     }
-    pub fn get(&self, _s: impl Into<Shape>, _name: &str) -> Result<Tensor> {
+    pub fn get(&self, s: impl Into<Shape>, name: &str) -> Result<Tensor> {
+        let _ = (name, &s);
         unimplemented!("T3 权重装载通道回填: get")
     }
-    pub fn get_with_hints(&self, _hints: &[&str], _s: impl Into<Shape>, _name: &str) -> Result<Tensor> {
+    pub fn get_with_hints(
+        &self,
+        s: impl Into<Shape>,
+        name: &str,
+        hints: Shard,
+    ) -> Result<Tensor> {
+        let _ = (&s, name, hints);
         unimplemented!("T3 权重装载通道回填: get_with_hints")
     }
 }
 
-/// 分片枚举(= candle_nn::var_builder::Shard;类型面)
+/// 分片参数(= candle_nn::var_builder::Shard;结构直译)
 #[derive(Copy, Clone, Debug, Default)]
-pub enum Shard {
-    #[default]
-    None,
-    Row(usize),
-    Col(usize),
+pub struct Shard {
+    pub dim: usize,
+    pub rank: usize,
+    pub world_size: usize,
 }
 
 // ============================================================================
 // candle_nn 容器桩(Linear/Conv/Embedding/Module/...)
 // ============================================================================
 
-/// 线性层(= candle_nn::Linear;权重 T3 回填)
-#[derive(Clone)]
-pub struct Linear {
-    pub weight: Tensor,
-    pub bias: Option<Tensor>,
-}
-
-impl Linear {
-    pub fn new(weight: Tensor, bias: Option<Tensor>) -> Self {
-        Self { weight, bias }
-    }
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        x.matmul(&self.weight).and_then(|y| {
-            match &self.bias {
-                Some(b) => y.broadcast_add(b),
-                None => Ok(y),
-            }
-        })
-    }
-    pub fn weight(&self) -> &Tensor {
-        &self.weight
-    }
-    pub fn bias(&self) -> Option<&Tensor> {
-        self.bias.as_ref()
-    }
-    pub fn n_in(&self) -> Option<usize> {
-        None // T3 回填
-    }
-    pub fn n_out(&self) -> Option<usize> {
-        None // T3 回填
-    }
-}
+/// 线性层真身在 linear::Linear(本桩已被其取代;re-export 统一词汇)
+pub use linear::Linear;
 
 /// 卷积层(= candle_nn::Conv;deltanet 用;权重 T3 回填)
 #[derive(Clone)]
@@ -540,7 +591,19 @@ pub struct Conv {
     pub with_bias: bool,
 }
 
+/// 2D 卷积配置(= candle_nn::Conv2dConfig;类型面)
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Conv2dConfig {
+    pub padding: usize,
+    pub stride: usize,
+    pub dilation: usize,
+    pub groups: usize,
+}
+
 impl Conv {
+    pub fn weight(&self) -> &Tensor {
+        &self.weight
+    }
     pub fn new(weight: Tensor, bias: Option<Tensor>) -> Self {
         let kernel = weight.shape().last().copied().unwrap_or(1);
         let with_bias = bias.is_some();
@@ -562,6 +625,10 @@ impl Conv {
     pub fn conv2d(&self, x: &Tensor) -> Result<Tensor> {
         let _ = &self.weight;
         unimplemented!("T3 kernel 回填: conv2d")
+    }
+    /// 统一前向入口(others::conv2d/Conv3dNoBias 调用面)
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.conv2d(x)
     }
     pub fn bias(&self) -> Option<&Tensor> {
         self.bias.as_ref()
@@ -611,10 +678,46 @@ pub struct LayerNorm {
     pub affine: bool,
 }
 
+impl LayerNorm {
+    pub fn new(weight: Tensor, bias: Tensor, eps: f64) -> Self {
+        Self {
+            weight: Some(weight),
+            bias: Some(bias),
+            eps,
+            affine: true,
+        }
+    }
+    pub fn new_no_bias(weight: Tensor, eps: f64) -> Self {
+        Self {
+            weight: Some(weight),
+            bias: None,
+            eps,
+            affine: true,
+        }
+    }
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let _ = x;
+        unimplemented!("T3 kernel 回填: layer_norm")
+    }
+}
+
 #[derive(Clone)]
 pub struct RmsNorm {
     pub weight: Option<Tensor>,
     pub eps: f64,
+}
+
+impl RmsNorm {
+    pub fn new(weight: Tensor, eps: f64) -> Self {
+        Self {
+            weight: Some(weight),
+            eps,
+        }
+    }
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let _ = x;
+        unimplemented!("T3 kernel 回填: rms_norm")
+    }
 }
 
 // ============================================================================
@@ -624,6 +727,32 @@ pub struct RmsNorm {
 /// vendor kernel/缓存面占位。design:三选一(自研 kernel 进 owl-kernels /
 /// 保留 vendor 依赖 / 换 flashinfer)在 T3 运行里程碑前裁决。
 pub mod vendor {
+    // fused rope(= attention_rs::fused_rope::FusedRope)
+    pub mod fused_rope {
+        use crate::Result;
+        use super::super::Tensor;
+        pub fn apply_inplace(
+            _q: &Tensor,
+            _k: &Tensor,
+            _cos: &Tensor,
+            _sin: &Tensor,
+            _positions: &Tensor,
+            _is_rope_i: bool,
+        ) -> Result<()> {
+            Err(crate::Error::Msg("vendor fused_rope::apply_inplace: T3 kernel 回填".into()))
+        }
+        pub fn apply_inplace_partial(
+            _q: &Tensor,
+            _k: &Tensor,
+            _cos: &Tensor,
+            _sin: &Tensor,
+            _positions: &Tensor,
+            _is_rope_i: bool,
+            _rotary_dim: usize,
+        ) -> Result<()> {
+            Err(crate::Error::Msg("vendor fused_rope::apply_inplace_partial: T3 kernel 回填".into()))
+        }
+    }
     /// 分页注意力句柄(= attention_rs::PagedAttention)
     pub struct PagedAttention;
     /// Mamba/GDN 状态缓存(= attention_rs::mamba_cache::MambaCache)
@@ -655,6 +784,41 @@ pub mod vendor {
     pub mod sort {
         pub struct ArgSortOp;
     }
+    /// DeepSeek-V4 ATen-order RMSNorm(= attention_rs::deepseek_v4)
+    pub mod deepseek_v4 {
+        use crate::Result;
+        use super::super::Tensor;
+        pub fn rms_norm_v4(
+            _x: &Tensor,
+            _weight: &Tensor,
+            _dim: usize,
+            _eps: f32,
+        ) -> Result<Tensor> {
+            Err(crate::Error::Msg("vendor deepseek_v4::rms_norm_v4: T3 kernel 回填".into()))
+        }
+        pub fn rms_norm_v4_inplace(
+            _x: &Tensor,
+            _weight: &Tensor,
+            _dim: usize,
+            _eps: f32,
+        ) -> Result<()> {
+            Err(crate::Error::Msg("vendor deepseek_v4::rms_norm_v4_inplace: T3 kernel 回填".into()))
+        }
+    }
+    /// MLX NVFP4 反量化(= attention_rs::nvfp4_linear)
+    pub mod nvfp4_linear {
+        use crate::Result;
+        use super::super::{Tensor, DType};
+        pub fn mlx_dequant_embedding(
+            _w_u32: &Tensor,
+            _scales: &Tensor,
+            _vocab: usize,
+            _hidden: usize,
+            _out_dtype: DType,
+        ) -> Result<Tensor> {
+            Err(crate::Error::Msg("vendor nvfp4_linear: 量化 = marlin-ffi 路线".into()))
+        }
+    }
 }
 
 /// 量化 dtype(= candle_core::quantized::GgmlDType;类型面)
@@ -677,6 +841,11 @@ pub enum GgmlDType {
     IQ3_S,
     IQ4_XS,
     IQ4_NL,
+    Q2K,
+    Q3K,
+    Q4K,
+    Q5K,
+    Q6K,
 }
 
 /// 量化张量(= candle_core::quantized::QTensor;类型面)
