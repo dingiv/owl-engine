@@ -9,12 +9,14 @@
 //!   每处标注 `// ported from candle-kernels/src/xxx.cu`。
 
 pub mod cublas;
+pub mod dyn_tensor;
 pub mod dtype;
 pub mod kernels;
 pub mod ops;
 pub mod tensor;
 
 pub use dtype::{Bf16, Dtype, F16, IndexScalar, Scalar};
+pub use dyn_tensor::DynTensor;
 pub use tensor::TensorPoolOps;
 
 use owl_iface::{BufToken, MemPhase};

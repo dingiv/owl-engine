@@ -73,6 +73,14 @@ pub struct Tensor<T: MemValue, D: Device> {
     _dev: std::marker::PhantomData<D>,
 }
 
+impl<T: Scalar, D: Device> Clone for Tensor<T, D> {
+    /// 克隆 = 视图共享(底层存储引用计数 +1;对应 candle 浅拷贝语义,
+    /// owl 下同时是租约克隆:活性由存储 Arc 兜底)。shape/dtype 元数据复制。
+    fn clone(&self) -> Self {
+        self.clone_shallow()
+    }
+}
+
 impl<T: Scalar, D: Device> Tensor<T, D> {
     fn elems(shape: &[usize]) -> usize {
         shape.iter().product()
