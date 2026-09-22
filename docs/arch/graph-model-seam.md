@@ -99,16 +99,15 @@ GraphPlan 依赖的最小真实 kernel 面(其余 unimplemented 不阻塞):
    与 vendor 归宿裁决联动);
 4. `argmax/sort`(采样链;radix 已定谳直吃 logits)。
 
-## 五、裁决请求(用户拍板)
+## 五、裁决记录(2026-09-22 用户拍板,全部闭合)
 
-1. **档位表**:1..=32 精确档(xinfer 语义,GDN 硬要求)——建议原样继承,
-   图预算 A1.1 = Σ 各档 bindings + 最大档激活 × 共享池系数;
-2. **dflash2 verify 图**:第二图族,同池共预算(A1.3);锚复用 bonus
-   逻辑在 engine 采样层,图面只是第二个 forward 路径;
-3. **vendor 归宿联动**:paged attention 是 decode FULL 图的最大缺口,
-   三选一(自研/保留 attention-rs/换 flashinfer)直接决定 A1.5 的
-   可捕获性审计工作量——attention-rs 的 kernel 是裸 CUDA 天生可捕获,
-   保留依赖的最小改动路径 = 只 port kernel 不 port 其运行时;
-4. **mamba/GDN 前缀回滚**(xinfer capture_mamba_prefix_state):状态
-   快照属于 slot 语义,建议随 qwen3_5 搬运时以 owl 池缓冲重表达,
-   快照点 = 捕获前钉住的 slot 池整段 memcpy。
+1. **档位表**:✅ 原样继承 1..=32 精确档(GDN/mamba slot 映射不可 pad,
+   语义硬约束;图预算 A1.1 = Σ 各档 bindings + 最大档激活 × 共享池系数);
+2. **dflash2 verify 图**:✅ 第二图族,共享同一捕获池和预算(A1.3);
+   锚复用 bonus 逻辑在 engine 采样层;
+3. **vendor 归宿**:✅ **保留 attention-rs 裸 kernel——只 port kernel,
+   不 port 运行时**(裸 CUDA 天生可捕获,A1.5 审计面最小;
+   把需要的 kernel 搬进 owl 所有权范围);**flashinfer 后续也会引入**
+   (attention-rs 包内已含,作为可选后端面预留,不是本轮依赖);
+4. **mamba 前缀回滚**:✅ 随 qwen3_5 搬运,以 owl 池缓冲重表达
+   (快照点 = 捕获前钉住的 slot 池整段 memcpy)。
