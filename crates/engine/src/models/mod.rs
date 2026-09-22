@@ -3,3 +3,4 @@
 //! 编译先行口径:控制流骨架保留,设备体 T3 kernel 回填。
 
 pub mod layers;
+pub mod qwen3_5;
