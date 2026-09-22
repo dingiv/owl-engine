@@ -31,5 +31,10 @@ quant = []
 cuda = []
 metal = []
 nccl = []
+# xinfer cfg 面镜像(恒关;allocator 的 cfg! 分支保留原样表达,T3 按需启用)
+flash = []
+flashattn = []
+flashinfer = []
+cutlass = []
 
 

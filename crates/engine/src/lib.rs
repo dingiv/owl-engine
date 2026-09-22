@@ -12,6 +12,7 @@
 pub mod block_manager;
 pub mod config;
 pub mod dim;
+pub mod hybrid;
 pub mod downloader;
 pub mod distributed;
 pub mod env;
