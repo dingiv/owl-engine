@@ -24,6 +24,10 @@ pub enum Error {
     /// 调度/序列类(scheduler/runner 搬运期增补)
     #[error("schedule: {0}")]
     Schedule(String),
+    /// IPC/TCP 传输错误(candle Error: From<io::Error> 对应面;
+    /// runner 广播宏的 `?` 依赖此转换)
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// 引擎层 Result 别名:搬运点把 `candle_core::Result<T>` 机械替换为本类型。

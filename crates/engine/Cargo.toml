@@ -14,11 +14,22 @@ bytemuck = { workspace = true }
 llguidance = { workspace = true }
 regex = { workspace = true }
 serde_json = { workspace = true }
+interprocess = { workspace = true }
+tokenizers = { workspace = true }
+rayon = { workspace = true }
+tracing = { workspace = true }
+bincode = { workspace = true }
+parking_lot = { workspace = true }
 
 [features]
 default = []
 # 量化路径(Q8/F8E8M0/GGUF)占位;运行里程碑回填
 quant = []
+# T3 占位特性(镜像 xinfer cfg 面,非 default 与 xinfer 默认构建一致;
+# engine 是 cuda-only 基座——cuda 特性的真实语义 T3 回填时重定,
+# 届时大概率改为 default-on 并删 not(cuda) 分支)
+cuda = []
+metal = []
+nccl = []
 
-[dev-dependencies]
-bincode = "1"
+

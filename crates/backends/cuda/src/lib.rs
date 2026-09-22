@@ -42,6 +42,14 @@ pub use owl_iface::{BackendError, MemPhase, MemStats};
 
 #[cfg(test)]
 mod tests {
+    /// GPU 测试互斥:同一张卡上的测试串行化(双 context 并发图操作有
+    /// GPU 级竞态,观察项 O-1;锁是测试卫生,不是引擎语义)
+    static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn gpu() -> std::sync::MutexGuard<'static, ()> {
+        GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+
     use super::ffi::sys;
     use super::{BackendError, Budget, CudaBackend, CudaDevice, CudaPool};
     use owl_iface::{Backend as _, DevBuf, Device as _, MemPhase, PoolConfig, PoolKind, Pool as _};
@@ -71,6 +79,7 @@ mod tests {
     /// 契约:池化分配 + A1.2 延迟归还 + 净空窗口清账
     #[test]
     fn pool_malloc_contract_and_deferred_free() {
+    let _g = gpu();
         let dev = make();
         let pool = scratch_pool(&dev, "scratch", 64 << 10);
 
@@ -98,6 +107,7 @@ mod tests {
     /// A5:预算合同——超支 fail-fast,账本可归因
     #[test]
     fn budget_violation_fails_fast() {
+    let _g = gpu();
         let dev = make();
         dev.set_budget(Budget {
             bytes: 1024 * 1024,
@@ -123,6 +133,7 @@ mod tests {
     /// 强租约保证 replay 仍正确;图销毁后租约解,账本回基线。
     #[test]
     fn graph_lease_keeps_memory_alive_across_user_drop() {
+    let _g = gpu();
         let dev = CudaDevice::new(super::test_device_ordinal()).expect("需要 CUDA 设备");
         let pool = dev
             .create_pool(PoolConfig {
@@ -207,6 +218,7 @@ mod tests {
     /// A2.8:VMM 分配(2MiB 粒度,可被对端 P2P 映射的唯一合法路径)
     #[test]
     fn vmm_alloc_granularity_and_ledger() {
+    let _g = gpu();
         let dev = make();
         let buf = dev.vmm_alloc(1024).expect("vmm_alloc");
         assert!(buf.bytes() >= 2 * 1024 * 1024);
@@ -220,6 +232,7 @@ mod tests {
     /// 语义分立:池类型与分配性质错配 = LawViolation
     #[test]
     fn pool_kind_mismatch_is_law_violation() {
+    let _g = gpu();
         let dev = make();
         let scratch = scratch_pool(&dev, "s", 1 << 20);
         let weights = persistent_pool(&dev, "w", 1 << 20);
@@ -248,6 +261,7 @@ mod tests {
     /// A2.8:PeerShared 池 malloc_peer_shared 真机验证
     #[test]
     fn peer_shared_malloc_uses_vmm() {
+    let _g = gpu();
         let dev = make();
         let peer = dev
             .create_pool(PoolConfig {
@@ -271,6 +285,7 @@ mod tests {
     /// 旧实现 retire 挂在用户句柄 drop 的 count==1 判定上,本顺序必挂。
     #[test]
     fn lease_survivor_drops_before_graph_token_stays_valid() {
+    let _g = gpu();
         let dev = CudaDevice::new(super::test_device_ordinal()).expect("需要 CUDA 设备");
         let pool = dev
             .create_pool(PoolConfig {
@@ -331,6 +346,7 @@ mod tests {
     /// 设备隔离律:UUID 钉卡回环 + Backend 枚举
     #[test]
     fn uuid_pinning_roundtrip() {
+    let _g = gpu();
         let backend = CudaBackend;
         let devs = backend.enumerate().expect("需要 CUDA 设备");
         assert!(!devs.is_empty());
