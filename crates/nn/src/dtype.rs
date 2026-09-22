@@ -118,3 +118,16 @@ impl Scalar for i64 {
 pub trait IndexScalar: Scalar {}
 impl IndexScalar for u32 {}
 
+// ---------------------------------------------------------------------------
+// S6 模型层算子风格律(2026-09-22 裁决:单一风格,拒绝双轨)
+//
+// - 模型/层代码统一 functional-via-ctx:`fn(ctx: &KernelCtx, ...) -> Result<Tensor>`;
+// - 中间张量分配唯一入口 = `ctx.scratch_tensor`(Live/Capturing 相合法;
+//   捕获期创建 → token 自动 emit → 图租约;生命周期 = 本次 forward);
+// - **运算符重载禁用**(Add/Mul 等):无法返回 Result,会把 CUDA 错误
+//   变回 panic 面——`a + b` 一律改 `ctx.add(&a, &b)`;
+// - out-param 不属于层代码风格,只存在于图边界接缝(weights = P 阶段;
+//   logits_out = 租约绑定缓冲,地址稳定是物理约束);
+// - Persistent 分配(权重/KV)仍只在 P 阶段经 Pool 工厂,ctx 不开此口。
+// ---------------------------------------------------------------------------
+

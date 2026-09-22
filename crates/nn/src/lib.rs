@@ -19,7 +19,7 @@ pub use dtype::{Bf16, Dtype, F16, IndexScalar, Scalar};
 pub use dyn_tensor::DynTensor;
 pub use tensor::TensorPoolOps;
 
-use owl_iface::{BufToken, MemPhase};
+use owl_iface::{BackendError, BufToken, MemPhase};
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
@@ -81,6 +81,8 @@ pub struct KernelCtx {
     /// Signal 追踪作用域(capturing 态持有;drop 时弹栈——持有即语义)
     #[allow(dead_code)]
     pub(crate) track: Option<owl_signal::TrackingHandle>,
+    /// S6 激活 scratch 池(经 OpsCtx 注入;无池 = 层代码不得分配中间量)
+    pub(crate) scratch: Option<std::sync::Arc<owl_cuda::CudaPool>>,
 }
 
 impl KernelCtx {
@@ -91,6 +93,7 @@ impl KernelCtx {
             stream,
             recorder: None,
             track: None,
+            scratch: None,
         }
     }
 
@@ -109,6 +112,7 @@ impl KernelCtx {
             stream,
             recorder: Some(recorder),
             track: Some(owl_signal::enter(sink)),
+            scratch: None,
         }
     }
 
@@ -129,6 +133,7 @@ impl KernelCtx {
             stream: Arc::clone(frame.stream),
             recorder: Some(recorder),
             track: Some(owl_signal::enter(sink)),
+            scratch: None,
         }
     }
 
@@ -145,6 +150,30 @@ impl KernelCtx {
     pub fn recording(&self) -> bool {
         self.recorder.is_some()
     }
+
+    /// 注入 S6 激活 scratch 池(builder 链尾;两构造路径共用)
+    pub fn with_scratch(mut self, pool: std::sync::Arc<owl_cuda::CudaPool>) -> Self {
+        self.scratch = Some(pool);
+        self
+    }
+
+    /// S6:中间张量分配唯一入口(Live/Capturing 合法;Persistent 不经此口)。
+    /// 捕获期创建 → token 自动 emit → 图租约钉住,生命周期 = 本次 forward。
+    pub fn scratch_tensor<T: crate::dtype::Scalar>(
+        &self,
+        shape: &[usize],
+    ) -> Result<crate::tensor::Tensor<T, owl_cuda::CudaDevice>, BackendError> {
+        let pool = self.scratch.as_ref().ok_or_else(|| {
+            BackendError::Init("KernelCtx 无 scratch 池(经 OpsCtx::new_with_scratch 构造)".into())
+        })?;
+        let t = pool.scratch_tensor::<T>(shape)?;
+        if self.recording() {
+            if let Some(tok) = t.token() {
+                owl_signal::emit(tok); // 捕获期:自动入图租约(哨兵①)
+            }
+        }
+        Ok(t)
+ }
 
     /// 记录一次 kernel 发射(非记录态为 no-op)
     pub fn trace_launch(&self, kernel: &'static str) {

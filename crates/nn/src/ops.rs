@@ -95,21 +95,48 @@ pub struct OpsCtx {
     /// bind_to_thread。不再持有流所有权——**流由 KernelCtx 携带**
     /// (M1②:流选择显式化,eager/捕获各持其流)
     dev: owl_cuda::CudaDevice,
+    /// S6 激活 scratch 池(跨图族共享,A1.3 同族;None = 无池)
+    scratch: Option<std::sync::Arc<owl_cuda::CudaPool>>,
 }
 
 impl OpsCtx {
-    /// P 阶段构造:读设备句柄装配执行器(零显存申请)。
+    /// P 阶段构造:读设备句柄装配执行器(零显存申请;无 scratch 池——
+    /// 层代码 functional 风格请用 new_with_scratch,S6)。
     pub fn new(device: &owl_cuda::CudaDevice) -> Result<Self, BackendError> {
-        let kernels = Kernels::new(device.ctx()).map_err(BackendError::Init)?;
-        Ok(Self {
-            kernels,
-            dev: device.clone(),
-        })
+        Self::new_with_scratch(device, 0)
     }
 
-    /// E 阶段上下文:设备主显存流(非阻塞;M1②)
+    /// P 阶段构造 + S6 激活 scratch 池(bytes = 0 则不建池;预算由
+    /// A1.1 内存规划器登记,T3 接管——本默认值属临时)。
+    pub fn new_with_scratch(
+        device: &owl_cuda::CudaDevice,
+        scratch_bytes: u64,
+    ) -> Result<Self, BackendError> {
+        let kernels = Kernels::new(device.ctx()).map_err(BackendError::Init)?;
+        use owl_iface::Device as _;
+        let scratch = if scratch_bytes > 0 {
+            Some(std::sync::Arc::new(
+                device
+                    .create_pool(owl_iface::PoolConfig {
+                        name: "ctx-scratch".into(),
+                        kind: owl_iface::PoolKind::Scratch,
+                        bytes: scratch_bytes,
+                    })
+                    .map_err(|e| BackendError::Init(format!("scratch pool: {e:?}")))?,
+            ))
+        } else {
+            None
+        };
+        Ok(Self { kernels, dev: device.clone(), scratch })
+    }
+
+    /// E 阶段上下文:设备主显存流(非阻塞;M1②)+ scratch 池注入
     pub fn ctx(&self, phase: owl_iface::MemPhase) -> KernelCtx {
-        KernelCtx::eager(phase, Arc::clone(self.dev.stream()))
+        let c = KernelCtx::eager(phase, Arc::clone(self.dev.stream()));
+        match &self.scratch {
+            Some(p) => c.with_scratch(std::sync::Arc::clone(p)),
+            None => c
+        }
     }
 
     /// 每发射一次核函数计一次(姿势 6 warmup 门禁)
