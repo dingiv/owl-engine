@@ -9,8 +9,16 @@ owl-cuda = { path = "../backends/cuda" }
 owl-signal = { path = "../signal" }
 owl-nn = { path = "../nn" }
 thiserror.workspace = true
+serde = { workspace = true }
+bytemuck = { workspace = true }
+llguidance = { workspace = true }
+regex = { workspace = true }
+serde_json = { workspace = true }
 
 [features]
 default = []
 # 量化路径(Q8/F8E8M0/GGUF)占位;运行里程碑回填
 quant = []
+
+[dev-dependencies]
+bincode = "1"

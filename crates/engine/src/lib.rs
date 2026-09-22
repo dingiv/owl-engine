@@ -10,6 +10,9 @@
 //! `cargo build --workspace` 全绿为准,运行指标另立里程碑。
 
 pub mod config;
+pub mod image;
+pub mod sequence;
+pub mod transfer;
 pub mod dim;
 pub mod error;
 pub mod kvcache;
