@@ -1598,10 +1598,15 @@ pub mod vendor {
             &mut self.recurrent_states[layer]
         }
 
-        /// A9:分配(或查既有)槽位
+        /// A9:分配(或查既有)槽位;零层状态表(纯注意力模型)= 形式槽,
+        /// 直接用 seq_id 作槽号(无表可寻址,与旧 dry-run 语义一致)
         pub fn ensure_slot(&mut self, seq_id: usize) -> Result<usize> {
             if let Some(&s) = self.owner_of.get(&seq_id) {
                 return Ok(s);
+            }
+            if !self.is_allocated() {
+                self.owner_of.insert(seq_id, seq_id);
+                return Ok(seq_id);
             }
             let slot = self
                 .free_slots
