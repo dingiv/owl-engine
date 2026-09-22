@@ -68,8 +68,58 @@ fn qwen3_hybrid_raw_from_extra_config(config: &Config) -> Option<Qwen3HybridRawC
     serde_json::from_value::<Qwen3HybridRawConfig>(cfg).ok()
 }
 
+/// A2 后 Config 已直解 hybrid 字段(from_json_str text_config 解壳归一):
+/// config 字段优先,extra_config_json 作旧路径回退(xinfer 语义)。
+fn qwen3_hybrid_raw_from_config(config: &Config) -> Qwen3HybridRawConfig {
+    Qwen3HybridRawConfig {
+        layers_block_type: config.layer_types.clone(),
+        conv_kernel_size: config.linear_conv_kernel_dim,
+        full_attention_interval: config.full_attention_interval,
+        linear_num_heads: None,
+        linear_num_key_heads: config.linear_num_key_heads,
+        linear_num_value_heads: config.linear_num_value_heads,
+        linear_num_key_value_heads: None,
+        linear_key_head_dim: config.linear_key_head_dim,
+        linear_value_head_dim: config.linear_value_head_dim,
+        mamba_ssm_dtype: None,
+    }
+}
+
 pub fn resolve_qwen3_hybrid_config(config: &Config) -> Qwen3HybridConfig {
-    let raw_cfg = qwen3_hybrid_raw_from_extra_config(config).unwrap_or_default();
+    // 逐字段优先级:Config 直解字段 > extra_config_json(旧路径)> 缺省回退
+    let mut raw_cfg = qwen3_hybrid_raw_from_config(config);
+    if let Some(extra) = qwen3_hybrid_raw_from_extra_config(config) {
+        if raw_cfg.layers_block_type.is_none() {
+            raw_cfg.layers_block_type = extra.layers_block_type;
+        }
+        if raw_cfg.conv_kernel_size.is_none() {
+            raw_cfg.conv_kernel_size = extra.conv_kernel_size;
+        }
+        if raw_cfg.full_attention_interval.is_none() {
+            raw_cfg.full_attention_interval = extra.full_attention_interval;
+        }
+        if raw_cfg.linear_num_heads.is_none() {
+            raw_cfg.linear_num_heads = extra.linear_num_heads;
+        }
+        if raw_cfg.linear_num_key_heads.is_none() {
+            raw_cfg.linear_num_key_heads = extra.linear_num_key_heads;
+        }
+        if raw_cfg.linear_num_value_heads.is_none() {
+            raw_cfg.linear_num_value_heads = extra.linear_num_value_heads;
+        }
+        if raw_cfg.linear_num_key_value_heads.is_none() {
+            raw_cfg.linear_num_key_value_heads = extra.linear_num_key_value_heads;
+        }
+        if raw_cfg.linear_key_head_dim.is_none() {
+            raw_cfg.linear_key_head_dim = extra.linear_key_head_dim;
+        }
+        if raw_cfg.linear_value_head_dim.is_none() {
+            raw_cfg.linear_value_head_dim = extra.linear_value_head_dim;
+        }
+        if raw_cfg.mamba_ssm_dtype.is_none() {
+            raw_cfg.mamba_ssm_dtype = extra.mamba_ssm_dtype;
+        }
+    }
 
     let mut layer_types = if let Some(layer_types) = raw_cfg.layers_block_type {
         layer_types
@@ -186,4 +236,122 @@ pub fn gemma4_per_layer_cache_config(config: &Config) -> Option<Vec<(usize, usiz
         })
         .collect();
     Some(per_layer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const REAL_CONFIG: &str = "/home/div/Documents/codes/models/Qwen/Qwen3.5-0.8B/config.json";
+
+    /// 最小必需字段骨架(required 字段:head 数/hidden/intermediate/eps/hidden_act)
+    fn cfg_json(body: &str) -> Config {
+        let json = format!(
+            r#"{{
+                "architectures": ["Qwen3_5ForCausalLM"],
+                "num_attention_heads": 8,
+                "num_key_value_heads": 2,
+                "max_position_embeddings": 4096,
+                "hidden_size": 1024,
+                "num_hidden_layers": 4,
+                "intermediate_size": 256,
+                "rms_norm_eps": 1e-6,
+                "hidden_act": "silu"
+                {body}
+            }}"#
+        );
+        Config::from_json_str(&json).expect("测试 config 反序列化")
+    }
+
+    #[test]
+    fn resolve_prefers_config_fields_real_qwen35_08b() {
+        if !std::path::Path::new(REAL_CONFIG).exists() {
+            eprintln!("skip: 真模型 config 不在本机({REAL_CONFIG})");
+            return;
+        }
+        let json = std::fs::read_to_string(REAL_CONFIG).unwrap();
+        let cfg = Config::from_json_str(&json).unwrap();
+        let h = resolve_qwen3_hybrid_config(&cfg);
+        assert_eq!(h.layer_types.len(), 24);
+        assert_eq!(
+            h.layer_types.iter().filter(|t| t.as_str() == "linear_attention").count(),
+            18
+        );
+        assert_eq!(
+            h.layer_types.iter().filter(|t| t.as_str() == "full_attention").count(),
+            6
+        );
+        for &i in &[3usize, 7, 11, 15, 19, 23] {
+            assert_eq!(h.layer_types[i], "full_attention", "第 {i} 层应为 full_attention");
+        }
+        assert_eq!(h.conv_kernel_size, 4);
+        assert_eq!(h.num_v_heads, 16);
+        assert_eq!(h.num_k_heads, 16);
+        assert_eq!(h.key_head_dim, 128);
+        assert_eq!(h.value_head_dim, 128);
+    }
+
+    #[test]
+    fn resolve_config_layer_types_wins_over_extra_config_json() {
+        let cfg = cfg_json(
+            r#", "layer_types": ["linear_attention", "full_attention", "linear_attention", "full_attention"],
+            "linear_num_value_heads": 16,
+            "extra_config_json": "{\"layer_types\": [\"full_attention\", \"full_attention\", \"full_attention\", \"full_attention\"], \"linear_num_value_heads\": 8}""#,
+        );
+        let h = resolve_qwen3_hybrid_config(&cfg);
+        assert_eq!(
+            h.layer_types,
+            vec![
+                "linear_attention".to_string(),
+                "full_attention".to_string(),
+                "linear_attention".to_string(),
+                "full_attention".to_string(),
+            ]
+        );
+        assert_eq!(h.num_v_heads, 16, "config 字段应胜过 extra_config_json");
+    }
+
+    #[test]
+    fn resolve_extra_config_json_path_still_works_when_config_fields_absent() {
+        let cfg = cfg_json(
+            r#", "extra_config_json": "{\"layer_types\": [\"linear_attention\", \"linear_attention\", \"linear_attention\", \"full_attention\"], \"linear_num_value_heads\": 8, \"linear_key_head_dim\": 96}""#,
+        );
+        let h = resolve_qwen3_hybrid_config(&cfg);
+        assert_eq!(
+            h.layer_types,
+            vec![
+                "linear_attention".to_string(),
+                "linear_attention".to_string(),
+                "linear_attention".to_string(),
+                "full_attention".to_string(),
+            ]
+        );
+        assert_eq!(h.num_v_heads, 8);
+        assert_eq!(h.key_head_dim, 96);
+    }
+
+    #[test]
+    fn resolve_interval_fallback_from_config_field() {
+        let cfg = cfg_json(r#", "full_attention_interval": 2"#);
+        let h = resolve_qwen3_hybrid_config(&cfg);
+        assert_eq!(
+            h.layer_types,
+            vec![
+                "linear_attention".to_string(),
+                "full_attention".to_string(),
+                "linear_attention".to_string(),
+                "full_attention".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_zero_gdn_fallback_unchanged() {
+        // 无 layer_types/interval/extra:全 full_attention(纯注意力旧模型行为不变)
+        let cfg = cfg_json("");
+        let h = resolve_qwen3_hybrid_config(&cfg);
+        assert_eq!(h.layer_types, vec!["full_attention".to_string(); 4]);
+        assert_eq!(h.num_v_heads, 8, "缺省 = num_attention_heads");
+        assert_eq!(h.key_head_dim, 128, "缺省 = hidden_size/num_attention_heads");
+    }
 }
