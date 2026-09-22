@@ -31,18 +31,23 @@ pub struct GraphProfile {
     pub max_frontier: u32,
 }
 
-/// 捕获治理状态机 —— A1.2 生命周期律的执行者。
+/// 捕获治理状态机 —— A1.2 生命周期律 + 定影协议(A1.2 增补)的执行者。
 ///
 /// 合法迁移:
-///   Idle → Capturing(净空窗口:无任何存活图)→ Ready(逐档)
-///   Ready → Idle(全部销毁;唯一合法 trim 窗口之一)
+///   Idle → Capturing(净空窗口:无任何存活图)
+///        → Captured(已实例化,未定影;禁止 replay)
+///        → [定影协议:暖场 replay×k + sync → 测量 footprint]
+///        → Live(seal 后:尺寸永久固定,可 replay,禁 trim)
+///        → Idle(全部销毁;唯一合法 trim 窗口之一)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GraphPhase {
     /// 无图存活:唯一允许 trim / 池属性变更的窗口
     Idle,
     /// 捕获中:禁止一切治理动作
     Capturing,
-    /// 图存活:禁止 trim / empty_cache / 池属性变更(A1.2)
+    /// 已实例化未定影:懒提交未发生完,禁止 replay,禁止 trim
+    Captured,
+    /// 已定影:footprint 已测且 ≤ allowance,永久固定;可 replay
     Live,
 }
 
@@ -54,6 +59,8 @@ pub struct GraphGovernor {
     profiles: Vec<GraphProfile>,
     /// 已实例化图计数(Live 的判据;M1 接 CUDA exec 后成为真实句柄表)
     live_graphs: u32,
+    /// 定影值:seal 后的图 footprint(永久不变)
+    sealed_bytes: Option<u64>,
 }
 
 impl GraphGovernor {
@@ -64,6 +71,7 @@ impl GraphGovernor {
             allowance,
             profiles,
             live_graphs: 0,
+            sealed_bytes: None,
         }
     }
 
@@ -110,8 +118,39 @@ impl GraphGovernor {
             "捕获档必须来自规划档位表"
         );
         self.live_graphs += 1;
-        self.phase = GraphPhase::Live;
+        self.phase = GraphPhase::Captured;
         Ok(())
+    }
+
+    /// **定影协议**(A1.2 增补):暖场 replay + sync 后调用。
+    /// `measured_bytes` = 此刻池/driver 实测的图 footprint。
+    /// 校验 ≤ allowance(A1.1 上限)后,图尺寸声明永久固定;
+    /// 超限 = 捕获规划失误,按 A5.4 违约处理(销图,不宽容)。
+    pub fn seal(&mut self, measured_bytes: u64) -> Result<(), GraphError> {
+        match self.phase {
+            GraphPhase::Captured => {
+                let allowance = self.allowance.total();
+                if measured_bytes > allowance {
+                    return Err(GraphError::OverAllowance {
+                        measured: measured_bytes,
+                        allowance,
+                    });
+                }
+                self.sealed_bytes = Some(measured_bytes);
+                self.phase = GraphPhase::Live;
+                Ok(())
+            }
+            _ => Err(GraphError::IllegalTransition {
+                from: self.phase,
+                op: "seal",
+                law: "定影协议:仅 Captured 态可 seal(先暖场 replay 强制懒提交)",
+            }),
+        }
+    }
+
+    /// 定影后的图 footprint(A5.4 账本对账用)
+    pub fn sealed_bytes(&self) -> Option<u64> {
+        self.sealed_bytes
     }
 
     /// 捕获预检(A1.4):free 不足则要求收窄档位表或降级。
@@ -145,8 +184,9 @@ impl GraphGovernor {
     /// 销毁全部图。Live → Idle 的唯一出口;返回的窗口内允许 trim(A1.2)。
     pub fn destroy_all(&mut self) -> Result<GraphPhase, GraphError> {
         match self.phase {
-            GraphPhase::Live | GraphPhase::Idle => {
+            GraphPhase::Live | GraphPhase::Captured | GraphPhase::Idle => {
                 self.live_graphs = 0;
+                self.sealed_bytes = None;
                 self.phase = GraphPhase::Idle;
                 Ok(self.phase)
             }
@@ -173,6 +213,22 @@ mod tests {
         )
     }
 
+    /// 定影协议:超 allowance → OverAllowance;通过后尺寸永久固定
+    #[test]
+    fn seal_enforces_allowance_and_freezes() {
+        let mut g = gov();
+        g.begin_capture().unwrap();
+        g.end_capture(GraphProfile { batch: 1, max_frontier: 4096 }).unwrap();
+        assert_eq!(g.sealed_bytes(), None); // Captured:未定影
+        assert!(matches!(
+            g.seal(u64::MAX),
+            Err(GraphError::OverAllowance { .. })
+        ));
+        g.seal(1024).unwrap();
+        assert_eq!(g.sealed_bytes(), Some(1024));
+        assert_eq!(g.phase(), GraphPhase::Live);
+    }
+
     /// A1.1:图预算必须从池容量中前置扣除
     #[test]
     fn allowance_reserved_before_pool() {
@@ -186,6 +242,7 @@ mod tests {
         let mut g = gov();
         g.begin_capture().unwrap();
         g.end_capture(GraphProfile { batch: 1, max_frontier: 4096 }).unwrap();
+        g.seal(1024).unwrap(); // 定影后方可回到净空窗口判定
         assert!(matches!(
             g.begin_capture(),
             Err(GraphError::IllegalTransition { law: "A1.2: 捕获仅允许净空窗口(无存活图)", .. })
@@ -198,6 +255,7 @@ mod tests {
         let mut g = gov();
         g.begin_capture().unwrap();
         g.end_capture(GraphProfile { batch: 1, max_frontier: 4096 }).unwrap();
+        g.seal(1024).unwrap();
         assert_eq!(g.destroy_all().unwrap(), GraphPhase::Idle);
         g.begin_capture().unwrap(); // 净空窗口重开合法
     }
@@ -231,4 +289,7 @@ pub enum GraphError {
     /// A1.4 优雅降级:预算不足以支撑任何档位,整体回 eager
     #[error("图预算不足,降级 eager:free {free_bytes} < 最低档需求 {needed}")]
     DegradedToEager { free_bytes: u64, needed: u64 },
+    /// 定影超限:实测 footprint 超过规划 allowance(A5.4 同族)
+    #[error("A5.4 定影超限:实测 {measured}B > allowance {allowance}B,销图处理")]
+    OverAllowance { measured: u64, allowance: u64 },
 }

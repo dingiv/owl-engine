@@ -1,31 +1,202 @@
-//! owl-cuda —— cudarc **官方版**(crates.io,非 guoqingbao fork)的治理
-//! 封装层,实现 `owl_iface::GpuBackend`(charter A1/A4 落点)。
+//! owl-cuda —— cudarc **官方版**(crates.io)的治理封装层,实现
+//! `owl_iface` 的 `Backend`/`Device`/`Pool` 三层契约(charter A1/A4/A5)。
 //!
-//! 选型注记(2026-09-22):fork(cudarc-gb @ 2e81793)的图安全增量
-//! (capture_status/捕获期池分配/Drop 禁 free)在官方 0.19 已被原生
-//! API 覆盖(CudaGraph/begin_capture/stream-ordered 分配),且 fork 的
-//! 13.x sys 绑定官方也已支持——按 A4"语义分歧不进第三方库",选官方。
+//! 选型注记(2026-09-22):官方 cudarc 0.19 已原生覆盖 fork 的图安全增量
+//! (CudaGraph/stream-ordered 分配/13.x 绑定),按 A4"语义分歧不进第三方
+//! 库"选官方。cudarc 仅在本 crate 导入;上层经 `ffi` 模块的精确白名单
+//! 使用(整库 re-export 禁止)。
 //!
-//! 治理语义(实现 GpuBackend 的方式):
-//! 1. **分配分域**:`Persistent`/`Scratch` 两种生命周期,类型系统强制;
-//! 2. **A1.2 执行**:非 Idle 相的 drop 一律延迟,回 Idle(净空窗口)归还;
-//! 3. **字节级原语**:iface 的 MemValue 是抽象标记,后端不得要求它携带
-//!    driver 私有 bound(如 DeviceRepr)——所以分配按 `len * size_of::<T>`
-//!    字节进行,类型解释由 `DevBuf<T>` 的视图承担。这保证 iface 契约
-//!    不泄漏任何 cudarc 类型到上层。
-//!
-//! 捕获期语义:分配走 stream-ordered allocator(可捕获);非 Idle 相
-//! drop 延迟;专属捕获池路由在 M1 由 graph 治理层实现。
+//! 分配架构(裁决 5 + A5.2):
+//! - **Pool 是分配者**:`CudaPool::malloc` 是 P 阶段唯一分配入口,
+//!   校验链 = 池余量(A5.4)→ 全局预算(A5.4)→ 物理分配;
+//! - 物理路径按池类型路由:`PeerShared` → VMM(cuMemCreate,2MiB 粒度,
+//!   A2.8);其余 → stream-ordered(捕获安全);
+//! - 所有缓冲 drop 时自动归池账 + 全局账(非 Idle 相延迟到净空窗口,
+//!   A1.2);
+//! - Device 的 `alloc_*_in` 只是 `pool.malloc` 的类型化薄封装。
 
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr};
-use cudarc::driver::sys;
-use owl_iface::{Arch, Backend, BackendError, BackendFamily, Device, DeviceDesc, DevBuf, MemValue, Pool, PoolConfig, PoolId, PoolKind, PoolUsage};
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
+use cudarc::driver::{DevicePtr, sys};
+use owl_iface::{MemPhase as _, Pool as _, PoolBuf as _};
+use owl_iface::{
+    Arch, Backend, BackendError, BackendFamily, BufToken, Device, DeviceDesc, DevBuf, MemValue,
+    OpaqueDevBuf, Pool, PoolBuf, PoolConfig, PoolId, PoolKind, PoolUsage,
+};
 use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;
 
 pub use owl_iface::{MemPhase, MemStats};
 
-type DeferredFree = Box<dyn FnOnce(&mut u64) + Send>;
+/// cudarc 受控再导出(A4:精确到接口粒度,禁止整库 re-export)。
+/// 这是上层(nn/未来的 rocnn)唯一可见的 cudarc 表面。
+/// 扩充本清单 = 扩大 driver 依赖面,须过 backends/README 准入审核并登记。
+pub mod ffi {
+    // driver safe 层(逐项)
+    pub use cudarc::driver::{
+        CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr,
+        LaunchConfig, PushKernelArg,
+    };
+    /// result 同步原语(逐项;当前仅 D2H 回读)
+    pub use cudarc::driver::result::memcpy_dtoh_sync;
+
+    /// 裸 FFI(唯一低层出口;逐项白名单)
+    pub mod sys {
+        // driver 侧:指针类型 + 显式拷贝(tensor 装载/回读)
+        pub use cudarc::driver::sys::{
+            CUdeviceptr, cuMemcpyDtoH_v2, cuMemcpyHtoD_v2,
+            // graph 捕获(M1 归入 graph 治理层)
+            CUgraphInstantiate_flags, CUstreamCaptureMode,
+        };
+
+        /// cuBLAS FFI(matmul/workspace)
+        pub mod cublas {
+            pub use cudarc::cublas::sys::{
+                cublasCreate_v2, cublasDestroy_v2, cublasHandle_t,
+                cublasOperation_t, cublasSetStream_v2, cublasSetWorkspace_v2,
+                cublasSgemm_v2, cublasStatus_t,
+            };
+        }
+    }
+
+    /// nvrtc 运行时编译(kernel 加载)
+    pub mod nvrtc {
+        pub use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
+    }
+}
+
+// ---- 治理句柄:相位机 + 双账本 + 延迟队列 ----
+
+type DeferredFree = Box<dyn FnOnce() + Send>;
+
+#[derive(Default)]
+struct Governor {
+    ctx: Option<Arc<CudaContext>>,
+    phase: RwLock<MemPhase>,
+    deferred: Mutex<Vec<DeferredFree>>,
+    stats: Mutex<MemStats>,
+    /// A5.2 全局账本:存活字节 / 累计分配字节
+    bytes_alive: Mutex<u64>,
+    bytes_allocated_total: Mutex<u64>,
+    /// A5.1 预算(None = 未设;设置后每次分配断言不超)
+    budget: Mutex<Option<Budget>>,
+    /// 显存池账本(A5.2);Arc 供池对象跨线程归账
+    pools: Arc<Mutex<std::collections::HashMap<u64, PoolLedger>>>,
+    next_pool_id: std::sync::atomic::AtomicU64,
+    /// 哨兵①词汇:缓冲令牌发放与存活登记(id → gen)
+    next_buf_id: std::sync::atomic::AtomicU64,
+    alive: Mutex<std::collections::HashMap<u64, u64>>,
+}
+
+impl Governor {
+    fn phase(&self) -> MemPhase {
+        *self.phase.read()
+    }
+
+    fn set_phase(&self, phase: MemPhase) {
+        *self.phase.write() = phase;
+        if phase == MemPhase::Idle {
+            // 净空窗口:统一归还延迟队列(A1.2);归还动作由各缓冲自己的
+            // 闭包完成(含池账 + 全局账)
+            let mut q = self.deferred.lock();
+            let n = q.len();
+            for free in q.drain(..) {
+                free();
+            }
+            self.stats.lock().drained_frees += n as u64;
+        }
+    }
+
+    fn defer(&self, free: DeferredFree) {
+        self.stats.lock().deferred_frees += 1;
+        self.deferred.lock().push(free);
+    }
+
+    fn charge(&self, bytes: u64) -> Result<(), BackendError> {
+        let mut alive = self.bytes_alive.lock();
+        *alive += bytes;
+        *self.bytes_allocated_total.lock() += bytes;
+        if let Some(b) = *self.budget.lock() {
+            // A5 判据:引擎自身账本(含延迟滞留)≤ 预算。整卡 used 含
+            // 其他进程/上下文,不能作为本引擎预算的判据
+            if *alive > b.bytes {
+                *alive -= bytes; // 违约:预记回滚
+                return Err(BackendError::LawViolation(
+                    "A5.4 显存超支(引擎账本超预算,详见账本快照日志)",
+                ));
+            }
+            // A5.3 第三道闸:driver 侧对账,free 低于警线即告警
+            if let Some(ctx) = &self.ctx {
+                let (free, _total) = ctx
+                    .mem_get_info()
+                    .map_err(|e| BackendError::Init(format!("{e:?}")))?;
+                if (free as u64) < b.reserve_floor {
+                    eprintln!(
+                        "[owl-mem] WARN: free {free}B < reserve_floor {}B(A5 警线,账本 alive={})",
+                        b.reserve_floor, *alive
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn uncharge(&self, bytes: u64) {
+        *self.bytes_alive.lock() -= bytes;
+    }
+
+    fn uncharge_pool(&self, id: u64, bytes: u64) {
+        if let Some(led) = self.pools.lock().get_mut(&id) {
+            led.used = led.used.saturating_sub(bytes);
+        }
+    }
+
+    /// 哨兵①:签发缓冲令牌并登记存活
+    fn issue_token(&self) -> BufToken {
+        let id = self
+            .next_buf_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let gen = id.wrapping_mul(2654435761) | 1;
+        self.alive.lock().insert(id, gen);
+        BufToken { id, gen }
+    }
+
+    /// 哨兵①:世代校验(replay 前检查;死亡令牌 = 结构化报错的依据)
+    fn validate(&self, t: &BufToken) -> bool {
+        self.alive.lock().get(&t.id).is_some_and(|&g| g == t.gen)
+    }
+
+    /// 哨兵①:令牌注销(drop 即死;延迟的只是物理回收,不是身份)
+    fn retire(&self, t: &BufToken) {
+        self.alive.lock().remove(&t.id);
+    }
+
+    /// 池余量校验(A5.4 第一道):池耗尽即违约。通过后调用方已占池账。
+    fn charge_pool(&self, pool: &CudaPool, bytes: u64) -> Result<(), BackendError> {
+        let mut pools = self.pools.lock();
+        let led = pools
+            .get_mut(&pool.id.0)
+            .ok_or(BackendError::UnknownPool(pool.id.0))?;
+        let available = led.capacity - led.used;
+        if bytes > available {
+            return Err(BackendError::PoolExhausted {
+                pool: led.name.clone(),
+                needed: bytes,
+                available,
+                capacity: led.capacity,
+            });
+        }
+        led.used += bytes;
+        led.peak = led.peak.max(led.used);
+        Ok(())
+    }
+}
+
+/// A5 硬预算:启动时声明,生命周期恒不超(见 charter 公理 A5)。
+#[derive(Debug, Clone, Copy)]
+pub struct Budget {
+    pub bytes: u64,
+    pub reserve_floor: u64,
+}
 
 /// A5.4 账本快照:违约/诊断时的完整内存叙事
 #[derive(Debug, Clone, Copy)]
@@ -36,25 +207,9 @@ pub struct LedgerSnapshot {
     pub phase: MemPhase,
 }
 
-/// 共享治理句柄(phase + 延迟释放队列 + 审计)。
-#[derive(Default)]
-struct Governor {
-    ctx: Option<Arc<CudaContext>>,
-    phase: RwLock<MemPhase>,
-    deferred: Mutex<Vec<DeferredFree>>,
-    stats: Mutex<MemStats>,
-    /// A5.2 账本:当前存活字节(persistent 存量 + 未归还延迟释放)
-    bytes_alive: Mutex<u64>,
-    /// A5.2 账本:生命周期累计分配字节(单调增,用于漂移归因)
-    bytes_allocated_total: Mutex<u64>,
-    /// A5.1 预算(None = 未设;设置后每次分配断言不超)
-    budget: Mutex<Option<Budget>>,
-    /// 显存池账本(A5.2:一切分配归属具名池);Arc 供池对象跨线程归账
-    pools: Arc<Mutex<std::collections::HashMap<u64, PoolLedger>>>,
-    next_pool_id: std::sync::atomic::AtomicU64,
-}
 
-/// 池账本:容量承诺 + 存量 + 峰值
+// ---- 池:iface Pool 的实现,也是分配者 ----
+
 /// 池账目记录(Governor 持有;CudaPool 是它的对外视图)
 struct PoolLedger {
     name: String,
@@ -64,16 +219,26 @@ struct PoolLedger {
     peak: u64,
 }
 
-/// 池对象:iface Pool 的 cuda 实现。缓冲持有它的 Arc,drop 时归账。
+/// 显存池:**分配者**。持有 driver 原语句柄,按 PoolKind 路由物理路径。
+#[derive(Clone)]
 pub struct CudaPool {
     id: PoolId,
     name: String,
     kind: PoolKind,
     capacity: u64,
+    ctx: Arc<CudaContext>,
+    stream: Arc<CudaStream>,
     gov: Arc<Governor>,
+    dev: CudaDevice,
 }
 
 impl Pool for CudaPool {
+    type Dev = CudaDevice;
+
+    fn device(&self) -> Self::Dev {
+        self.dev.clone()
+    }
+
     fn id(&self) -> PoolId {
         self.id
     }
@@ -95,180 +260,359 @@ impl Pool for CudaPool {
             peak: led.peak,
         }
     }
+
+    fn malloc_scratch(&self, bytes: u64) -> Result<PoolBuf, BackendError> {
+        self.kind_check(PoolKind::Scratch)?;
+        Ok(PoolBuf::wrap(Box::new(self.malloc_inner(bytes)?)))
+    }
+
+    fn malloc_persistent(&self, bytes: u64) -> Result<PoolBuf, BackendError> {
+        match self.kind {
+            PoolKind::Weights | PoolKind::KvCache | PoolKind::Workspace => {}
+            _ => {
+                return Err(BackendError::LawViolation(
+                    "持久分配语义与池类型不匹配(需 Weights/KvCache/Workspace)",
+                ));
+            }
+        }
+        Ok(PoolBuf::wrap(Box::new(self.malloc_inner(bytes)?)))
+    }
+
+    fn malloc_peer_shared(&self, bytes: u64) -> Result<PoolBuf, BackendError> {
+        self.kind_check(PoolKind::PeerShared)?;
+        Ok(PoolBuf::wrap(Box::new(self.malloc_inner(bytes)?)))
+    }
 }
 
 impl CudaPool {
-    fn uncharge(&self, bytes: u64) {
-        if let Some(led) = self.gov.pools.lock().get_mut(&self.id.0) {
-            led.used = led.used.saturating_sub(bytes);
+    /// A2.8 设备最小分配粒度(sm86 实测 2MiB)
+    fn vmm_granularity(&self) -> Result<usize, BackendError> {
+        use sys::{cuMemGetAllocationGranularity, CUmemAllocationProp, CUmemLocation};
+        unsafe {
+            let mut props = CUmemAllocationProp {
+                type_: sys::CUmemAllocationType_enum::CU_MEM_ALLOCATION_TYPE_PINNED,
+                requestedHandleTypes:
+                    sys::CUmemAllocationHandleType_enum::CU_MEM_HANDLE_TYPE_NONE,
+                location: CUmemLocation {
+                    type_: sys::CUmemLocationType_enum::CU_MEM_LOCATION_TYPE_DEVICE,
+                    __bindgen_anon_1: sys::CUmemLocation_st__bindgen_ty_1 {
+                        id: self.ctx.cu_device() as i32,
+                    },
+                },
+                win32HandleMetaData: std::ptr::null_mut(),
+                allocFlags: sys::CUmemAllocationProp_st__bindgen_ty_1 {
+                    compressionType: 0,
+                    gpuDirectRDMACapable: 0,
+                    usage: 0,
+                    reserved: [0; 4],
+                },
+            };
+            props.location.__bindgen_anon_1.id = self.ctx.cu_device() as i32;
+            let mut gran: usize = 0;
+            cuMemGetAllocationGranularity(
+                &mut gran,
+                &props,
+                sys::CUmemAllocationGranularity_flags_enum::CU_MEM_ALLOC_GRANULARITY_MINIMUM,
+            )
+            .result()
+            .map_err(|e| BackendError::Init(format!("granularity: {e:?}")))?;
+            Ok(gran)
         }
     }
-}
 
-/// A5 硬预算:启动时声明,生命周期恒不超(见 charter 公理 A5)。
-#[derive(Debug, Clone, Copy)]
-pub struct Budget {
-    /// 预算上限(bytes/卡)。含运行时底价与安全余量,由内存规划器分解而来。
-    pub bytes: u64,
-    /// 对账时的最低 free 余量警线(低于即告警,高于即违约)
-    pub reserve_floor: u64,
-}
-
-impl Governor {
-    /// 池余量校验(A5.4 第一道):池耗尽即违约。返回后调用方已占池账。
-    fn charge_pool(&self, pool: &CudaPool, bytes: u64) -> Result<(), BackendError> {
-        let mut pools = self.pools.lock();
-        let led = pools
-            .get_mut(&pool.id.0)
-            .ok_or(BackendError::UnknownPool(pool.id.0))?;
-        let available = led.capacity - led.used;
-        if bytes > available {
-            return Err(BackendError::PoolExhausted {
-                pool: led.name.clone(),
-                needed: bytes,
-                available,
-                capacity: led.capacity,
-            });
-        }
-        led.used += bytes;
-        led.peak = led.peak.max(led.used);
-        Ok(())
-    }
-
-    fn charge(&self, bytes: u64) -> Result<(), BackendError> {
-        let mut alive = self.bytes_alive.lock();
-        *alive += bytes;
-        *self.bytes_allocated_total.lock() += bytes;
-        if let Some(b) = *self.budget.lock() {
-            // A5 判据:引擎自身账本(含延迟滞留)≤ 预算。整卡 used 含
-            // 其他进程/上下文,不能作为本引擎预算的判据
-            if *alive > b.bytes {
-                *alive -= bytes; // 违约:预记回滚,账本如实反映"未发生"
-                return Err(BackendError::LawViolation(
-                    "A5.4 显存超支(引擎账本超预算,详见账本快照日志)",
-                ));
+    /// 内部统一分配路径:校验链(kind 可选)→ 池账 → 全局账 → 物理 →
+    /// 签发租约型 CudaPoolBuf(Arc;Clone 即租约)。Persistent/Scratch/
+    /// CaptureSession 全部经由这里。
+    fn malloc_inner(&self, bytes: u64) -> Result<CudaPoolBuf, BackendError> {
+        // A2.8:PeerShared 走 VMM,粒度取整后的真实占用必须先入账
+        let effective = match self.kind {
+            PoolKind::PeerShared => {
+                let gran = self.vmm_granularity()? as u64;
+                bytes.div_ceil(gran) * gran
             }
-            // A5.3 第三道闸:driver 侧对账,free 低于警线即告警
-            // (可能是本引擎超支,也可能是同卡邻居;归因走 ledger())
-            let (free, _total) = self.mem_get_info()?;
-            if (free as u64) < b.reserve_floor {
-                eprintln!(
-                    "[owl-mem] WARN: free {free}B < reserve_floor {}B(A5 警线,账本 alive={})",
-                    b.reserve_floor,
-                    *alive
-                );
-            }
+            _ => bytes,
+        };
+        self.gov.charge_pool(self, effective)?;
+        if let Err(e) = self.gov.charge(effective) {
+            self.uncharge_pool(effective);
+            return Err(e);
         }
-        Ok(())
+        let backing = match self.kind {
+            PoolKind::PeerShared => match self.vmm_alloc_raw(effective as usize) {
+                Ok((b, r)) => {
+                    debug_assert_eq!(r as u64, effective);
+                    b
+                }
+                Err(e) => {
+                    self.uncharge_global(effective);
+                    self.uncharge_pool(effective);
+                    return Err(e);
+                }
+            },
+            _ => match self.stream.alloc_zeros::<u8>(effective as usize) {
+                Ok(slice) => PoolBacking::Slice(slice),
+                Err(e) => {
+                    self.uncharge_global(effective);
+                    self.uncharge_pool(effective);
+                    return Err(BackendError::AllocFailed {
+                        kind: "pool-malloc",
+                        len: effective as usize,
+                        detail: e.to_string(),
+                    });
+                }
+            },
+        };
+        let token = self.gov.issue_token();
+        Ok(CudaPoolBuf {
+            inner: Arc::new(PoolBufInner {
+                backing: Mutex::new(backing),
+                bytes: effective,
+                pool: Arc::new(self.clone_account()),
+                gov: Arc::clone(&self.gov),
+            }),
+            token,
+        })
     }
 
-    fn uncharge(&self, bytes: u64) {
-        *self.bytes_alive.lock() -= bytes;
-    }
-
-    fn uncharge_pool(&self, id: u64, bytes: u64) {
-        if let Some(led) = self.pools.lock().get_mut(&id) {
-            led.used = led.used.saturating_sub(bytes);
-        }
-    }
-
-    fn mem_get_info(&self) -> Result<(usize, usize), BackendError> {
-        self.ctx
-            .as_ref()
-            .expect("Governor.ctx")
-            .mem_get_info()
-            .map_err(|e| BackendError::Init(format!("mem_get_info: {e}")))
-    }
-}
-
-impl Governor {
-    fn phase(&self) -> MemPhase {
-        *self.phase.read()
-    }
-
-    fn set_phase(&self, phase: MemPhase) {
-        *self.phase.write() = phase;
-        if phase == MemPhase::Idle {
-            // 净空窗口:统一归还延迟队列(A1.2)
-            let mut q = self.deferred.lock();
-            let n = q.len();
-            let mut bytes = 0u64;
-            for free in q.drain(..) {
-                free(&mut bytes);
-            }
-            *self.bytes_alive.lock() -= bytes;
-            self.stats.lock().drained_frees += n as u64;
-        }
-    }
-
-    fn defer(&self, free: DeferredFree) {
-        self.stats.lock().deferred_frees += 1;
-        self.deferred.lock().push(free);
-    }
-
-    /// 非 Idle 相 → 延迟;Idle → 立即。所有缓冲域 drop 的公共出口。
-    fn release_slice<T: Send + 'static>(&self, slice: CudaSlice<T>, bytes: u64) {
-        if self.phase() == MemPhase::Idle {
-            drop(slice);
-            self.uncharge(bytes);
+    fn kind_check_any(&self, kinds: &[PoolKind]) -> Result<(), BackendError> {
+        if kinds.contains(&self.kind) {
+            Ok(())
         } else {
-            self.defer(Box::new(move |out| {
-                drop(slice);
-                *out += bytes;
+            Err(BackendError::LawViolation(
+                "分配语义与池类型不匹配(语义错配是架构错误)",
+            ))
+        }
+    }
+
+    fn kind_check(&self, expect: PoolKind) -> Result<(), BackendError> {
+        if self.kind != expect {
+            return Err(BackendError::LawViolation(
+                "分配语义与池类型不匹配(语义错配是架构错误)",
+            ));
+        }
+        Ok(())
+    }
+
+    /// 归还全局账本
+    fn uncharge_global(&self, bytes: u64) {
+        self.gov.uncharge(bytes);
+    }
+
+    /// 归还池账本
+    fn uncharge_pool(&self, bytes: u64) {
+        self.gov.uncharge_pool(self.id.0, bytes);
+    }
+
+    fn clone_account(&self) -> CudaPool {
+        self.clone()
+    }
+
+    /// A2.8:VMM 物理分配(reserve→create→map→setAccess RW)。
+    /// 返回未封装句柄;调用方负责包装与销账。
+    fn vmm_alloc_raw(
+        &self,
+        bytes: usize,
+    ) -> Result<(PoolBacking, usize), BackendError> {
+        use sys::{
+            cuMemAddressFree, cuMemAddressReserve, cuMemCreate, cuMemMap, cuMemSetAccess,
+            cuMemUnmap, cuMemRelease, cuMemGetAllocationGranularity, CUmemAccessDesc,
+            CUmemAllocationProp, CUmemLocation, CUresult::CUDA_SUCCESS,
+        };
+        unsafe {
+            self.ctx
+                .bind_to_thread()
+                .map_err(|e| BackendError::Init(format!("{e:?}")))?;
+            let mut gran: usize = 0;
+            let mut props = CUmemAllocationProp {
+                type_: sys::CUmemAllocationType_enum::CU_MEM_ALLOCATION_TYPE_PINNED,
+                requestedHandleTypes:
+                    sys::CUmemAllocationHandleType_enum::CU_MEM_HANDLE_TYPE_NONE,
+                location: CUmemLocation {
+                    type_: sys::CUmemLocationType_enum::CU_MEM_LOCATION_TYPE_DEVICE,
+                    __bindgen_anon_1: sys::CUmemLocation_st__bindgen_ty_1 {
+                        id: self.ctx.cu_device() as i32,
+                    },
+                },
+                win32HandleMetaData: std::ptr::null_mut(),
+                allocFlags: sys::CUmemAllocationProp_st__bindgen_ty_1 {
+                    compressionType: 0,
+                    gpuDirectRDMACapable: 0,
+                    usage: 0,
+                    reserved: [0; 4],
+                },
+            };
+            props.location.__bindgen_anon_1.id = self.ctx.cu_device() as i32;
+            cuMemGetAllocationGranularity(
+                &mut gran,
+                &props,
+                sys::CUmemAllocationGranularity_flags_enum::CU_MEM_ALLOC_GRANULARITY_MINIMUM,
+            )
+            .result()
+            .map_err(|e| BackendError::Init(format!("granularity: {e:?}")))?;
+            let rounded = bytes.div_ceil(gran) * gran;
+
+            let mut ptr: sys::CUdeviceptr = 0;
+            if cuMemAddressReserve(&mut ptr, rounded, gran, 0, 0) != CUDA_SUCCESS {
+                return Err(BackendError::AllocFailed {
+                    kind: "vmm-reserve",
+                    len: rounded,
+                    detail: "cuMemAddressReserve".into(),
+                });
+            }
+            let mut chunk: sys::CUmemGenericAllocationHandle = Default::default();
+            if cuMemCreate(&mut chunk, rounded, &props, 0) != CUDA_SUCCESS {
+                let _ = cuMemAddressFree(ptr, rounded);
+                return Err(BackendError::AllocFailed {
+                    kind: "vmm-create",
+                    len: rounded,
+                    detail: "cuMemCreate".into(),
+                });
+            }
+            if cuMemMap(ptr, rounded, 0, chunk, 0) != CUDA_SUCCESS {
+                let _ = cuMemRelease(chunk);
+                let _ = cuMemAddressFree(ptr, rounded);
+                return Err(BackendError::AllocFailed {
+                    kind: "vmm-map",
+                    len: rounded,
+                    detail: "cuMemMap".into(),
+                });
+            }
+            let access = [CUmemAccessDesc {
+                location: props.location,
+                flags: sys::CUmemAccess_flags_enum::CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
+            }];
+            if cuMemSetAccess(ptr, rounded, access.as_ptr(), 1) != CUDA_SUCCESS {
+                let _ = cuMemUnmap(ptr, rounded);
+                let _ = cuMemRelease(chunk);
+                let _ = cuMemAddressFree(ptr, rounded);
+                return Err(BackendError::AllocFailed {
+                    kind: "vmm-set-access",
+                    len: rounded,
+                    detail: "cuMemSetAccess".into(),
+                });
+            }
+            Ok((
+                PoolBacking::Vmm {
+                    ptr,
+                    bytes: rounded,
+                    chunk,
+                    ctx: Arc::clone(&self.ctx),
+                },
+                rounded,
+            ))
+        }
+    }
+}
+
+/// 池缓冲的物理背面:stream-ordered 切片或 VMM 映射
+enum PoolBacking {
+    Empty,
+    Slice(CudaSlice<u8>),
+    Vmm {
+        ptr: sys::CUdeviceptr,
+        bytes: usize,
+        chunk: sys::CUmemGenericAllocationHandle,
+        ctx: Arc<CudaContext>,
+    },
+}
+
+/// 池缓冲句柄:**Arc 共享所有权 = 租约系统**。
+/// Clone(租约)把 Arc 计数 +1——图捕获期 lease 进 CapturedGraph 的
+/// keepalive,用户侧句柄先 drop 也不会进入回收流程(强租约保证)。
+/// 身份(token retire)只随**最后一个**句柄的 drop 消亡。
+#[derive(Clone)]
+pub struct CudaPoolBuf {
+    inner: Arc<PoolBufInner>,
+    token: BufToken,
+}
+
+pub struct PoolBufInner {
+    backing: Mutex<PoolBacking>,
+    bytes: u64,
+    pool: Arc<CudaPool>,
+    gov: Arc<Governor>,
+}
+
+impl Drop for PoolBufInner {
+    fn drop(&mut self) {
+        // 仅最后一个句柄消亡时到达此处(Arc 计数归零)
+        let bytes = self.bytes;
+        let pool = Arc::clone(&self.pool);
+        let gov = Arc::clone(&self.gov);
+        let backing = std::mem::replace(self.backing.get_mut(), PoolBacking::Empty);
+        let idle = gov.phase() == MemPhase::Idle;
+        let gov_for_closure = Arc::clone(&gov);
+        if idle {
+            drop(backing);
+            gov.uncharge(bytes);
+            pool.uncharge_pool(bytes);
+        } else {
+            gov.defer(Box::new(move || {
+                drop(backing); // Slice 释放切片 / Vmm unmap+release
+                gov_for_closure.uncharge(bytes);
+                pool.uncharge_pool(bytes);
             }));
         }
     }
 }
 
-// ---- A2.8:VMM 分配器(cuMemCreate/MAP/SetAccess)----
-// 魔改驱动 BAR1=256MiB 约束下,跨卡共享缓冲的唯一合法分配路径。
-// legacy cudaMalloc/池分配的物理段无法通过 BAR1 窗口(857MB 段判例)。
-
-/// VMM 缓冲:物理 chunk(2MiB 粒度)+ 本地虚拟映射,可导出/可被对端
-/// cuMemMap。Drop = unmap + release,账本同步销账。
-pub struct VmmBuf {
-    ptr: sys::CUdeviceptr,
-    bytes: usize,
-    chunk: sys::CUmemGenericAllocationHandle,
-    ctx: Arc<CudaContext>,
-    gov: Arc<Governor>,
-}
-
-impl VmmBuf {
-    pub fn device_ptr(&self) -> sys::CUdeviceptr {
-        self.ptr
-    }
-    pub fn bytes(&self) -> usize {
-        self.bytes
-    }
-}
-
-impl Drop for VmmBuf {
-    fn drop(&mut self) {
-        unsafe {
-            use sys::{cuMemAddressFree, cuMemMap, cuMemRelease, cuMemUnmap};
-            let _ = cuMemUnmap(self.ptr, self.bytes);
-            let _ = cuMemRelease(self.chunk);
-            let _ = cuMemAddressFree(self.ptr, self.bytes);
+impl CudaPoolBuf {
+    /// 最后一个句柄消亡 = 身份消亡 + 物理回收排队
+    pub(crate) fn retire_if_last(&self) {
+        if Arc::strong_count(&self.inner) == 1 {
+            self.inner.gov.retire(&self.token);
         }
-        self.gov.uncharge(self.bytes as u64);
     }
 }
 
-/// CUDA 设备上下文:owl 的 cuda 后端入口。
-/// 设备隔离律:一个 OwlCuda 实例绑定一张卡(UUID 钉),账本独立。
-pub struct OwlCuda {
-    ctx: Arc<CudaContext>,
+impl Drop for CudaPoolBuf {
+    fn drop(&mut self) {
+        let is_last = Arc::strong_count(&self.inner) == 1;
+        if is_last {
+            self.inner.gov.retire(&self.token); // 身份随内存消亡
+        }
+        // PoolBufInner::drop 负责物理回收(Idle 立即 / 非 Idle 延迟)
+    }
+}
+
+impl OpaqueDevBuf for CudaPoolBuf {
+    fn token(&self) -> BufToken {
+        self.token
+    }
+}
+
+impl DevBuf<u8> for CudaPoolBuf {
+    fn len(&self) -> usize {
+        self.inner.bytes as usize
+    }
+    fn device_ptr(&self) -> *mut u8 {
+        use cudarc::driver::DevicePtr;
+        let backing = self.inner.backing.lock();
+        match &*backing {
+            PoolBacking::Slice(s) => {
+                let (ptr, _sync) = s.device_ptr(&self.inner.pool.stream);
+                ptr as *mut u8
+            }
+            PoolBacking::Vmm { ptr, .. } => *ptr as *mut u8,
+            PoolBacking::Empty => unreachable!("PoolBuf 已被消费"),
+        }
+    }
+}
+
+// ---- Device:一张卡,账本 + 池组 + 相位机的宿主 ----
+
+/// CUDA 设备实例:一个 CudaDevice 绑定一张卡(UUID 钉),账本独立。
+#[derive(Clone)]
+pub struct CudaDevice {
     ordinal: usize,
-    /// 分配/拷贝走 stream-ordered 语义(捕获安全)
+    ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     gov: Arc<Governor>,
     desc: DeviceDesc,
 }
 
-impl OwlCuda {
+impl CudaDevice {
     /// 按 UUID 钉卡(唯一合法入口;数字序禁用,09-19 事故判例)。
-    /// UUID 形如 "GPU-e565c505-4921-9979-2e0f-2b83490b7aed"。
     pub fn new_by_uuid(uuid: &str) -> Result<Self, BackendError> {
         let ordinal = resolve_uuid_ordinal(uuid)?;
         let s = Self::new(ordinal)?;
@@ -286,10 +630,9 @@ impl OwlCuda {
             .map_err(|e| BackendError::Init(format!("cuda:{ordinal}: {e}")))?;
         let stream = ctx.default_stream();
         let uuid = cuda_uuid(ordinal)?;
-        let (free, total) = ctx
+        let (_free, total) = ctx
             .mem_get_info()
             .map_err(|e| BackendError::Init(format!("mem_get_info: {e}")))?;
-        let _ = free;
         Ok(Self {
             ordinal,
             ctx: Arc::clone(&ctx),
@@ -304,30 +647,6 @@ impl OwlCuda {
                 total_bytes: total as u64,
             },
         })
-    }
-
-    /// **A5 硬预算**:声明预算后,每次分配即时校验(超支 fail-fast),
-    /// 且 reserve_floor 触发告警。规划器(core)负责在启动前完成分解封闭性
-    /// 静态证明;这里是运行时第二道闸。
-    pub fn set_budget(&self, budget: Budget) {
-        *self.gov.budget.lock() = Some(budget);
-    }
-
-    /// A5.3 第三道闸:driver 侧对账(free,total)。返回 (free, total)。
-    pub fn mem_get_info(&self) -> Result<(usize, usize), BackendError> {
-        self.ctx
-            .mem_get_info()
-            .map_err(|e| BackendError::Init(format!("mem_get_info: {e}")))
-    }
-
-    /// 账本快照(A5.4 违约时打印)
-    pub fn ledger(&self) -> LedgerSnapshot {
-        LedgerSnapshot {
-            bytes_alive: *self.gov.bytes_alive.lock(),
-            bytes_allocated_total: *self.gov.bytes_allocated_total.lock(),
-            stats: self.stats(),
-            phase: self.phase(),
-        }
     }
 
     pub fn ctx(&self) -> &Arc<CudaContext> {
@@ -347,47 +666,41 @@ impl OwlCuda {
         *self.gov.stats.lock()
     }
 
-    fn alloc_zeroed_bytes(&self, bytes: usize) -> Result<CudaSlice<u8>, BackendError> {
-        // A5.2:先过账本校验(含预算断言),再分配
-        self.gov.charge(bytes as u64)?;
-        self.stream
-            .alloc_zeros::<u8>(bytes)
-            .map_err(|e| {
-                self.gov.uncharge(bytes as u64); // 分配失败,账本回滚
-                BackendError::AllocFailed {
-                    kind: "zeroed",
-                    len: bytes,
-                    detail: e.to_string(),
-                }
-            })
+    /// **A5 硬预算**:声明预算后,每次分配即时校验(超支 fail-fast)。
+    pub fn set_budget(&self, budget: Budget) {
+        *self.gov.budget.lock() = Some(budget);
     }
 
-    /// **A2.8**:VMM 分配(PeerShared 缓冲的唯一合法路径)。
-    /// 物理粒度取设备最小值(sm86 实测 2MiB),容量向上取整;
-    /// 本地 RW 映射;经账本 charge(A5.2);可被对端 P2P 映射/导出。
+    /// A5.3 第三道闸:driver 侧对账(free,total)。
+    pub fn mem_get_info(&self) -> Result<(usize, usize), BackendError> {
+        self.ctx
+            .mem_get_info()
+            .map_err(|e| BackendError::Init(format!("mem_get_info: {e}")))
+    }
+
+    /// **A2.8**:VMM 分配(2MiB 粒度;PeerShared 池语义的独立入口,
+    /// 测试/诊断用;正式路径 = create_pool(PeerShared) + pool.malloc)。
     pub fn vmm_alloc(&self, bytes: usize) -> Result<VmmBuf, BackendError> {
         use sys::{
-            cuMemAddressFree, cuMemAddressReserve, cuMemCreate, cuMemUnmap,
-            cuMemGetAllocationGranularity, cuMemMap, cuMemRelease, cuMemSetAccess,
-            CUmemAccessDesc, CUmemAllocationProp, CUmemLocation, CUresult::CUDA_SUCCESS,
+            cuMemAddressFree, cuMemAddressReserve, cuMemCreate, cuMemMap, cuMemSetAccess,
+            cuMemUnmap, cuMemRelease, cuMemGetAllocationGranularity, CUmemAccessDesc,
+            CUmemAllocationProp, CUmemLocation, CUresult::CUDA_SUCCESS,
         };
         unsafe {
             self.ctx
                 .bind_to_thread()
                 .map_err(|e| BackendError::Init(format!("{e:?}")))?;
-
             let mut gran: usize = 0;
-            let mut location = CUmemLocation {
-                type_: sys::CUmemLocationType_enum::CU_MEM_LOCATION_TYPE_DEVICE,
-                __bindgen_anon_1: sys::CUmemLocation_st__bindgen_ty_1 {
-                    id: self.ctx.cu_device() as i32,
-                },
-            };
             let mut props = CUmemAllocationProp {
                 type_: sys::CUmemAllocationType_enum::CU_MEM_ALLOCATION_TYPE_PINNED,
                 requestedHandleTypes:
                     sys::CUmemAllocationHandleType_enum::CU_MEM_HANDLE_TYPE_NONE,
-                location,
+                location: CUmemLocation {
+                    type_: sys::CUmemLocationType_enum::CU_MEM_LOCATION_TYPE_DEVICE,
+                    __bindgen_anon_1: sys::CUmemLocation_st__bindgen_ty_1 {
+                        id: self.ctx.cu_device() as i32,
+                    },
+                },
                 win32HandleMetaData: std::ptr::null_mut(),
                 allocFlags: sys::CUmemAllocationProp_st__bindgen_ty_1 {
                     compressionType: 0,
@@ -396,6 +709,7 @@ impl OwlCuda {
                     reserved: [0; 4],
                 },
             };
+            props.location.__bindgen_anon_1.id = self.ctx.cu_device() as i32;
             cuMemGetAllocationGranularity(
                 &mut gran,
                 &props,
@@ -403,10 +717,8 @@ impl OwlCuda {
             )
             .result()
             .map_err(|e| BackendError::Init(format!("granularity: {e:?}")))?;
-
             let rounded = bytes.div_ceil(gran) * gran;
             self.gov.charge(rounded as u64)?;
-
             let mut ptr: sys::CUdeviceptr = 0;
             if cuMemAddressReserve(&mut ptr, rounded, gran, 0, 0) != CUDA_SUCCESS {
                 self.gov.uncharge(rounded as u64);
@@ -460,326 +772,20 @@ impl OwlCuda {
             })
         }
     }
-}
 
-/// 持久域缓冲:图存活期 drop = 延迟,不丢数据也不撕图。
-/// 内部持字节缓冲,按 `T` 视图暴露(DevBuf)。
-pub struct Persistent<T: MemValue> {
-    inner: Option<CudaSlice<u8>>,
-    len: usize,
-    stream: Arc<CudaStream>,
-    gov: Arc<Governor>,
-    /// 归属池(None = 历史无池分配;M1 起强制 Some)
-    pool: Option<PoolId>,
-    bytes: u64,
-    _marker: std::marker::PhantomData<fn() -> T>,
-}
+    /// 哨兵①:缓冲令牌存活校验(replay 前世代检查;未来 M1 用)
+    pub fn validate_token(&self, t: &BufToken) -> bool {
+        self.gov.validate(t)
+    }
 
-impl<T: MemValue> Persistent<T> {
-    fn new(
-        slice: CudaSlice<u8>,
-        len: usize,
-        bytes: u64,
-        pool: Option<PoolId>,
-        ctx: &OwlCuda,
-    ) -> Self {
-        Self {
-            inner: Some(slice),
-            len,
-            bytes,
-            stream: Arc::clone(&ctx.stream),
-            pool,
-            gov: Arc::clone(&ctx.gov),
-            _marker: std::marker::PhantomData,
+    /// 账本快照(A5.4 违约时打印)
+    pub fn ledger(&self) -> LedgerSnapshot {
+        LedgerSnapshot {
+            bytes_alive: *self.gov.bytes_alive.lock(),
+            bytes_allocated_total: *self.gov.bytes_allocated_total.lock(),
+            stats: self.stats(),
+            phase: self.phase(),
         }
-    }
-
-    /// 主动提前归还(仅 Idle 合法)。拒绝时所有权原样带回 Err,数据不丢。
-    pub fn release(mut self) -> Result<(), (Self, BackendError)> {
-        if self.gov.phase() != MemPhase::Idle {
-            return Err((
-                self,
-                BackendError::LawViolation("A1.2: 图存活期禁止提前释放持久缓冲"),
-            ));
-        }
-        drop(self.inner.take());
-        Ok(())
-    }
-}
-
-impl<T: MemValue> Drop for Persistent<T> {
-    fn drop(&mut self) {
-        if let Some(slice) = self.inner.take() {
-            if let Some(pid) = &self.pool {
-                self.gov.uncharge_pool(pid.0, self.bytes);
-            }
-            self.gov.release_slice(slice, self.bytes);
-        }
-    }
-}
-
-impl<T: MemValue> DevBuf<T> for Persistent<T> {
-    fn len(&self) -> usize {
-        self.len
-    }
-    fn device_ptr(&self) -> *mut T {
-        let (ptr, _sync) = self
-            .inner
-            .as_ref()
-            .expect("Persistent 未被 drop")
-            .device_ptr(&self.stream);
-        ptr as *mut T
-    }
-}
-
-/// 暂存域缓冲:允许 Capturing 相创建(stream-ordered 分配可捕获);
-/// 非 Idle 相 drop 延迟(与 Persistent 同律)。
-pub struct Scratch<T: MemValue> {
-    inner: Option<CudaSlice<u8>>,
-    len: usize,
-    stream: Arc<CudaStream>,
-    gov: Arc<Governor>,
-    pool: Option<PoolId>,
-    bytes: u64,
-    _marker: std::marker::PhantomData<fn() -> T>,
-}
-
-impl<T: MemValue> Drop for Scratch<T> {
-    fn drop(&mut self) {
-        if let Some(slice) = self.inner.take() {
-            if let Some(pid) = &self.pool {
-                self.gov.uncharge_pool(pid.0, self.bytes);
-            }
-            self.gov.release_slice(slice, self.bytes);
-        }
-    }
-}
-
-impl<T: MemValue> DevBuf<T> for Scratch<T> {
-    fn len(&self) -> usize {
-        self.len
-    }
-    fn device_ptr(&self) -> *mut T {
-        let (ptr, _sync) = self
-            .inner
-            .as_ref()
-            .expect("Scratch 未被 drop")
-            .device_ptr(&self.stream);
-        ptr as *mut T
-    }
-}
-
-// ---- iface 接线:owl-cuda 是 GpuBackend 的第一个实现 ----
-
-/// 跨卡远端映射视图:指针在本地可读写(同一统一地址空间),
-/// 生命周期内占用本卡 `peer_mapped_bytes` 账本。
-pub struct RemoteBuf<T: MemValue> {
-    ptr: *mut T,
-    len: usize,
-    peer_uuid: String,
-    gov: Arc<Governor>,
-}
-
-unsafe impl<T: Send + 'static> Send for RemoteBuf<T> {}
-
-impl<T: MemValue> Drop for RemoteBuf<T> {
-    fn drop(&mut self) {
-        let mut st = self.gov.stats.lock();
-        st.peer_mapped_bytes -= (self.len * std::mem::size_of::<T>()) as u64;
-        st.peer_mappings -= 1;
-    }
-}
-
-impl<T: MemValue> DevBuf<T> for RemoteBuf<T> {
-    fn len(&self) -> usize {
-        self.len
-    }
-    fn device_ptr(&self) -> *mut T {
-        self.ptr
-    }
-}
-
-impl OwlCuda {
-    /// P2P 授权 + 对端映射的全套窄口操作(经 sys::culib 直接驱动 API;
-    /// cudarc 0.19 尚无 safe 封装)。
-    pub fn enable_peer_access(&self, peer: &OwlCuda) -> Result<(), BackendError> {
-        unsafe {
-            let can: unsafe extern "C" fn(*mut i32, sys::CUdevice, sys::CUdevice) -> sys::CUresult =
-                *sys::culib()
-                .get(b"cuDeviceCanAccessPeer\0")
-                .map_err(|e| BackendError::Init(format!("symbol: {e}")))?;
-            let mut ok: i32 = 0;
-            can(&mut ok, self.ctx.cu_device(), peer.ctx.cu_device()).result().map_err(|e| BackendError::Init(format!("{e:?}")))?;
-            if ok != 1 {
-                return Err(BackendError::LawViolation(
-                    "P2P 不可达(cuDeviceCanAccessPeer=0):检查驱动 P2P 支持与黑名单",
-                ));
-            }
-            self.ctx.bind_to_thread().map_err(|e| BackendError::Init(format!("{e:?}")))?;
-            let en: unsafe extern "C" fn(sys::CUcontext, u32) -> sys::CUresult =
-                *sys::culib()
-                .get(b"cuCtxEnablePeerAccess\0")
-                .map_err(|e| BackendError::Init(format!("symbol: {e}")))?;
-            en(peer.ctx.cu_ctx(), 0).result().map_err(|e| BackendError::Init(format!("{e:?}")))?;
-        }
-        Ok(())
-    }
-
-    fn map_remote_internal<T: MemValue>(
-        &self,
-        peer: &DeviceDesc,
-        ptr: *mut T,
-        len: usize,
-    ) -> Result<RemoteBuf<T>, BackendError> {
-        let mut st = self.gov.stats.lock();
-        st.peer_mappings += 1;
-        st.peer_mapped_bytes += (len * std::mem::size_of::<T>()) as u64;
-        Ok(RemoteBuf {
-            ptr,
-            len,
-            peer_uuid: peer.uuid.clone(),
-            gov: Arc::clone(&self.gov),
-        })
-    }
-}
-
-impl Device for OwlCuda {
-    type Pool = CudaPool;
-
-    type Persistent<T: MemValue> = Persistent<T>;
-    type Scratch<T: MemValue> = Scratch<T>;
-
-    fn desc(&self) -> &DeviceDesc {
-        &self.desc
-    }
-
-    fn arch(&self) -> Arch {
-        self.desc().arch
-    }
-
-    fn phase(&self) -> MemPhase {
-        Governor::phase(&self.gov)
-    }
-
-    fn set_phase(&self, phase: MemPhase) {
-        OwlCuda::set_phase(self, phase)
-    }
-
-    fn stats(&self) -> MemStats {
-        OwlCuda::stats(self)
-    }
-
-    fn enable_peer_access(&self, peer: &Self) -> Result<(), BackendError> {
-        OwlCuda::enable_peer_access(self, peer)
-    }
-
-    fn map_remote<T: MemValue>(
-        &self,
-        peer: &DeviceDesc,
-        ptr: *mut T,
-        len: usize,
-    ) -> Result<Self::Remote<T>, BackendError> {
-        OwlCuda::map_remote_internal(self, peer, ptr, len)
-    }
-
-    type Remote<T: MemValue> = RemoteBuf<T>;
-
-    fn create_pool(&self, cfg: PoolConfig) -> Result<Self::Pool, BackendError> {
-        let mut pools = self.gov.pools.lock();
-        if pools.values().any(|p| p.name == cfg.name) {
-            return Err(BackendError::Init(format!(
-                "A5.1: 重复池名 '{}'——分解表不应有两行同名账",
-                cfg.name
-            )));
-        }
-        let id = self
-            .gov
-            .next_pool_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        pools.insert(
-            id,
-            PoolLedger {
-                name: cfg.name.clone(),
-                kind: cfg.kind,
-                capacity: cfg.bytes,
-                used: 0,
-                peak: 0,
-            },
-        );
-        Ok(CudaPool {
-            id: PoolId(id),
-            name: cfg.name.clone(),
-            kind: cfg.kind,
-            capacity: cfg.bytes,
-            gov: Arc::clone(&self.gov),
-        })
-    }
-
-    fn pool(&self, id: PoolId) -> Result<Self::Pool, BackendError> {
-        let pools = self.gov.pools.lock();
-        let led = pools.get(&id.0).ok_or(BackendError::UnknownPool(id.0))?;
-        Ok(CudaPool {
-            id: PoolId(id.0),
-            name: led.name.clone(),
-            kind: led.kind,
-            capacity: led.capacity,
-            gov: Arc::clone(&self.gov),
-        })
-    }
-
-    fn alloc_persistent_in<T: MemValue>(
-        &self,
-        pool: &CudaPool,
-        len: usize,
-    ) -> Result<Self::Persistent<T>, BackendError> {
-        let bytes = (len * std::mem::size_of::<T>()) as u64;
-        self.gov.charge_pool(pool, bytes)?; // A5.4 池校验
-        let slice = self.alloc_zeroed_bytes(bytes as usize)?; // 全局预算 + 账本
-        self.gov.stats.lock().persistent_allocs += 1;
-        Ok(Persistent::new(slice, len, bytes, Some(pool.id), self))
-    }
-
-    fn htod_persistent_in<T: MemValue>(
-        &self,
-        pool: &CudaPool,
-        src: Vec<T>,
-    ) -> Result<Self::Persistent<T>, BackendError> {
-        let len = src.len();
-        let bytes = (len * std::mem::size_of::<T>()) as u64;
-        self.gov.charge_pool(pool, bytes)?;
-        let mut slice = self.alloc_zeroed_bytes(bytes as usize)?;
-        let host_bytes =
-            unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u8, bytes as usize) };
-        if let Err(e) = self.stream.memcpy_htod(host_bytes, &mut slice) {
-            self.gov.uncharge(bytes);
-            self.gov.uncharge_pool(pool.id.0, bytes);
-            return Err(BackendError::CopyFailed {
-                dir: "htod",
-                detail: e.to_string(),
-            });
-        }
-        self.gov.stats.lock().persistent_allocs += 1;
-        Ok(Persistent::new(slice, len, bytes, Some(pool.id), self))
-    }
-
-    fn alloc_scratch_in<T: MemValue>(
-        &self,
-        pool: &CudaPool,
-        len: usize,
-    ) -> Result<Self::Scratch<T>, BackendError> {
-        let bytes = (len * std::mem::size_of::<T>()) as u64;
-        self.gov.charge_pool(pool, bytes)?;
-        let slice = self.alloc_zeroed_bytes(bytes as usize)?;
-        self.gov.stats.lock().scratch_allocs += 1;
-        Ok(Scratch {
-            inner: Some(slice),
-            len,
-            stream: Arc::clone(&self.stream),
-            pool: Some(pool.id),
-            bytes,
-            gov: Arc::clone(&self.gov),
-            _marker: std::marker::PhantomData,
-        })
     }
 }
 
@@ -823,11 +829,47 @@ fn resolve_uuid_ordinal(uuid: &str) -> Result<usize, BackendError> {
     Err(BackendError::Init(format!("UUID 未找到: {uuid}")))
 }
 
-/// CUDA 厂商栈:枚举 + 按 UUID 打开设备。不记账(账本在 OwlCuda/Device)。
-pub struct CudaBackend;
+// ---- P2P 窄口(A2.6 例外通道)----
+
+impl CudaDevice {
+    /// P2P 授权(经 sys::culib 直接驱动 API;cudarc 0.19 无 safe 封装)。
+    pub fn enable_peer_access(&self, peer: &CudaDevice) -> Result<(), BackendError> {
+        unsafe {
+            let can: unsafe extern "C" fn(
+                *mut i32,
+                sys::CUdevice,
+                sys::CUdevice,
+            ) -> sys::CUresult = *sys::culib()
+                .get(b"cuDeviceCanAccessPeer\0")
+                .map_err(|e| BackendError::Init(format!("symbol: {e}")))?;
+            let mut ok: i32 = 0;
+            can(&mut ok, self.ctx.cu_device(), peer.ctx.cu_device())
+                .result()
+                .map_err(|e| BackendError::Init(format!("{e:?}")))?;
+            if ok != 1 {
+                return Err(BackendError::LawViolation(
+                    "P2P 不可达(cuDeviceCanAccessPeer=0):检查驱动 P2P 支持与黑名单",
+                ));
+            }
+            self.ctx
+                .bind_to_thread()
+                .map_err(|e| BackendError::Init(format!("{e:?}")))?;
+            let en: unsafe extern "C" fn(sys::CUcontext, u32) -> sys::CUresult =
+                *sys::culib()
+                    .get(b"cuCtxEnablePeerAccess\0")
+                    .map_err(|e| BackendError::Init(format!("symbol: {e}")))?;
+            en(peer.ctx.cu_ctx(), 0)
+                .result()
+                .map_err(|e| BackendError::Init(format!("{e:?}")))?;
+        }
+        Ok(())
+    }
+}
+
+// ---- Device / Backend 契约实现 ----
 
 impl Backend for CudaBackend {
-    type Device = OwlCuda;
+    type Device = CudaDevice;
 
     fn family(&self) -> BackendFamily {
         BackendFamily::Cuda
@@ -867,131 +909,453 @@ impl Backend for CudaBackend {
     }
 
     fn open(&self, uuid: &str) -> Result<Self::Device, BackendError> {
-        OwlCuda::new_by_uuid(uuid)
+        CudaDevice::new_by_uuid(uuid)
     }
 }
+
+pub struct CudaBackend;
+
+/// 持久域缓冲:P 阶段经池分配;drop 归账由 PoolBuf/CudaPoolBuf 负责。
+pub struct Persistent<T: MemValue> {
+    buf: Option<PoolBuf>,
+    len: usize,
+    token: Option<BufToken>,
+    _marker: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T: MemValue> Persistent<T> {
+    fn new(buf: PoolBuf, len: usize) -> Self {
+        let token = buf.token();
+        Self {
+            buf: Some(buf),
+            len,
+            token: Some(token),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    fn token(&self) -> Option<BufToken> {
+        self.token
+    }
+}
+
+impl<T: MemValue> DevBuf<T> for Persistent<T> {
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn device_ptr(&self) -> *mut T {
+        self.buf
+            .as_ref()
+            .expect("Persistent 未被 drop")
+            .device_ptr() as *mut T
+    }
+}
+
+/// 暂存域缓冲(允许 Capturing 相创建;归账同 Persistent)。
+pub struct Scratch<T: MemValue> {
+    buf: Option<PoolBuf>,
+    len: usize,
+    token: Option<BufToken>,
+    _marker: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T: MemValue> Scratch<T> {
+    fn token(&self) -> Option<BufToken> {
+        self.token
+    }
+}
+
+impl<T: MemValue> DevBuf<T> for Scratch<T> {
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn device_ptr(&self) -> *mut T {
+        self.buf
+            .as_ref()
+            .expect("Scratch 未被 drop")
+            .device_ptr() as *mut T
+    }
+}
+
+impl Device for CudaDevice {
+    type Persistent<T: MemValue> = Persistent<T>;
+    type Scratch<T: MemValue> = Scratch<T>;
+    type Remote<T: MemValue> = RemoteBuf<T>;
+    type Pool = CudaPool;
+
+    fn desc(&self) -> &DeviceDesc {
+        &self.desc
+    }
+
+    fn arch(&self) -> Arch {
+        self.desc().arch
+    }
+
+    fn persistent_token<T: MemValue>(&self, p: &Self::Persistent<T>) -> Option<BufToken> {
+        p.token()
+    }
+
+    fn scratch_token<T: MemValue>(&self, s: &Self::Scratch<T>) -> Option<BufToken> {
+        s.token()
+    }
+
+    fn phase(&self) -> MemPhase {
+        Governor::phase(&self.gov)
+    }
+
+    fn set_phase(&self, phase: MemPhase) {
+        CudaDevice::set_phase(self, phase)
+    }
+
+    fn stats(&self) -> MemStats {
+        CudaDevice::stats(self)
+    }
+
+    fn enable_peer_access(&self, peer: &Self) -> Result<(), BackendError> {
+        CudaDevice::enable_peer_access(self, peer)
+    }
+
+    fn map_remote<T: MemValue>(
+        &self,
+        peer: &DeviceDesc,
+        ptr: *mut T,
+        len: usize,
+    ) -> Result<Self::Remote<T>, BackendError> {
+        let mut st = self.gov.stats.lock();
+        st.peer_mappings += 1;
+        st.peer_mapped_bytes += (len * std::mem::size_of::<T>()) as u64;
+        Ok(RemoteBuf {
+            ptr,
+            len,
+            peer_uuid: peer.uuid.clone(),
+        })
+    }
+
+    fn create_pool(&self, cfg: PoolConfig) -> Result<Self::Pool, BackendError> {
+        let mut pools = self.gov.pools.lock();
+        if pools.values().any(|p| p.name == cfg.name) {
+            return Err(BackendError::Init(format!(
+                "A5.1: 重复池名 '{}'——分解表不应有两行同名账",
+                cfg.name
+            )));
+        }
+        let id = self
+            .gov
+            .next_pool_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        pools.insert(
+            id,
+            PoolLedger {
+                name: cfg.name.clone(),
+                kind: cfg.kind,
+                capacity: cfg.bytes,
+                used: 0,
+                peak: 0,
+            },
+        );
+        Ok(CudaPool {
+            id: PoolId(id),
+            name: cfg.name.clone(),
+            kind: cfg.kind,
+            capacity: cfg.bytes,
+            ctx: Arc::clone(&self.ctx),
+            stream: Arc::clone(&self.stream),
+            gov: Arc::clone(&self.gov),
+            dev: self.clone(),
+        })
+    }
+
+    fn pool(&self, id: PoolId) -> Result<Self::Pool, BackendError> {
+        let pools = self.gov.pools.lock();
+        let led = pools.get(&id.0).ok_or(BackendError::UnknownPool(id.0))?;
+        Ok(CudaPool {
+            id: PoolId(id.0),
+            name: led.name.clone(),
+            kind: led.kind,
+            capacity: led.capacity,
+            ctx: Arc::clone(&self.ctx),
+            stream: Arc::clone(&self.stream),
+            gov: Arc::clone(&self.gov),
+            dev: self.clone(),
+        })
+    }
+
+    fn alloc_persistent_in<T: MemValue>(
+        &self,
+        pool: &Self::Pool,
+        len: usize,
+    ) -> Result<Self::Persistent<T>, BackendError> {
+        let bytes = (len * std::mem::size_of::<T>()) as u64;
+        let buf = pool.malloc_persistent(bytes)?;
+        self.gov.stats.lock().persistent_allocs += 1;
+        Ok(Persistent::new(buf, len))
+    }
+
+    fn htod_persistent_in<T: MemValue>(
+        &self,
+        pool: &Self::Pool,
+        src: Vec<T>,
+    ) -> Result<Self::Persistent<T>, BackendError> {
+        let len = src.len();
+        let bytes = (len * std::mem::size_of::<T>()) as u64;
+        let buf = pool.malloc_persistent(bytes)?;
+        // MemValue = Send + 'static 的 plain-old-data 按字节搬运;
+        // VMM/Slice 两种背面都是连续设备内存,统一走裸指针拷贝
+        let host_bytes =
+            unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u8, bytes as usize) };
+        self.ctx
+            .bind_to_thread()
+            .map_err(|e| BackendError::Init(format!("{e:?}")))?;
+        unsafe {
+            use sys::{cuMemcpyHtoD_v2, CUresult::CUDA_SUCCESS};
+            if cuMemcpyHtoD_v2(
+                buf.device_ptr() as sys::CUdeviceptr,
+                host_bytes.as_ptr() as *const core::ffi::c_void,
+                bytes as usize,
+            ) != CUDA_SUCCESS
+            {
+                // buf 归账由其 Drop 完成(路径治理不变)
+                return Err(BackendError::CopyFailed {
+                    dir: "htod",
+                    detail: "cuMemcpyHtoD_v2".into(),
+                });
+            }
+        }
+        self.gov.stats.lock().persistent_allocs += 1;
+        Ok(Persistent::new(buf, len))
+    }
+
+    fn alloc_scratch_in<T: MemValue>(
+        &self,
+        pool: &Self::Pool,
+        len: usize,
+    ) -> Result<Self::Scratch<T>, BackendError> {
+        let bytes = (len * std::mem::size_of::<T>()) as u64;
+        let buf = pool.malloc_scratch(bytes)?;
+        self.gov.stats.lock().scratch_allocs += 1;
+        let token = buf.token();
+        Ok(Scratch {
+            buf: Some(buf),
+            len,
+            token: Some(token),
+            _marker: std::marker::PhantomData,
+        })
+    }
+}
+
+// ---- A2.8 VMM 独立缓冲 ----
+
+/// A2.8 VMM 缓冲(独立入口;PeerShared 池内路径用 PoolBacking::Vmm)
+pub struct VmmBuf {
+    ptr: sys::CUdeviceptr,
+    bytes: usize,
+    chunk: sys::CUmemGenericAllocationHandle,
+    ctx: Arc<CudaContext>,
+    gov: Arc<Governor>,
+}
+
+impl VmmBuf {
+    pub fn device_ptr(&self) -> sys::CUdeviceptr {
+        self.ptr
+    }
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for VmmBuf {
+    fn drop(&mut self) {
+        unsafe {
+            use sys::{cuMemAddressFree, cuMemRelease, cuMemUnmap};
+            let _ = cuMemUnmap(self.ptr, self.bytes);
+            let _ = cuMemRelease(self.chunk);
+            let _ = cuMemAddressFree(self.ptr, self.bytes);
+        }
+        self.gov.uncharge(self.bytes as u64);
+    }
+}
+
+// ---- P2P 远端映射视图 ----
+
+pub struct RemoteBuf<T: MemValue> {
+    ptr: *mut T,
+    len: usize,
+    peer_uuid: String,
+}
+
+unsafe impl<T: Send + 'static> Send for RemoteBuf<T> {}
+
+impl<T: MemValue> DevBuf<T> for RemoteBuf<T> {
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn device_ptr(&self) -> *mut T {
+        self.ptr
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use owl_iface::Pool as _;
 
-    /// 真机冒烟:iface 契约 + 分配分域 + A1.2 延迟释放 + 净空窗口归还。
-    /// 需要至少一块 CUDA 设备。
+    fn make() -> CudaDevice {
+        CudaDevice::new(0).expect("需要 CUDA 设备")
+    }
+
+    fn scratch_pool(b: &CudaDevice, name: &str, bytes: u64) -> CudaPool {
+        b.create_pool(PoolConfig {
+            name: name.into(),
+            kind: PoolKind::Scratch,
+            bytes,
+        })
+        .unwrap()
+    }
+
+    fn persistent_pool(b: &CudaDevice, name: &str, bytes: u64) -> CudaPool {
+        b.create_pool(PoolConfig {
+            name: name.into(),
+            kind: PoolKind::Weights,
+            bytes,
+        })
+        .unwrap()
+    }
+
+    /// 契约:池化分配 + A1.2 延迟归还 + 净空窗口清账
     #[test]
-    fn backend_contract_defers_free_during_live_phase() {
-        fn use_backend<B: Device>(b: &B) {
-            // A5.1:建池 = 分解表逐行实体化
-            let weights = b
-                .create_pool(PoolConfig {
-                    name: "weights".into(),
-                    kind: PoolKind::Weights,
-                    bytes: 1 << 20,
-                })
-                .unwrap();
-            let scratch_pool = b
-                .create_pool(PoolConfig {
-                    name: "scratch".into(),
-                    kind: PoolKind::Scratch,
-                    bytes: 64 << 10,
-                })
-                .unwrap();
+    fn pool_malloc_contract_and_deferred_free() {
+        let dev = make();
+        let pool = scratch_pool(&dev, "scratch", 64 << 10);
 
-            // 示例 API ①:池内持久分配(上层无 cudarc 类型)
-            let buf = b.alloc_persistent_in::<f32>(&weights, 1024).expect("alloc");
-            assert_eq!(DevBuf::<f32>::len(&buf), 1024);
-            assert!(!buf.device_ptr().is_null());
+        let scratch = dev.alloc_scratch_in::<f32>(&pool, 4096).unwrap();
+        assert_eq!(DevBuf::<f32>::len(&scratch), 4096);
+        assert_eq!(pool.usage().used, 16 * 1024);
 
-            // 示例 API ②:池内暂存分配
-            let scratch = b.alloc_scratch_in::<f32>(&scratch_pool, 4096).expect("scratch");
-            assert_eq!(DevBuf::<f32>::len(&scratch), 4096);
+        // 池耗尽 → A5.4 PoolExhausted
+        let over = dev.alloc_scratch_in::<f32>(&pool, 1024 * 1024);
+        assert!(matches!(over, Err(BackendError::PoolExhausted { .. })));
 
-            // htod 持久写入(入池)
-            let hb = b.htod_persistent_in::<u32>(&weights, (0..64).collect()).unwrap();
-            assert_eq!(DevBuf::<u32>::len(&hb), 64);
+        // Live 相 drop → 延迟(池账 + 全局账都不动)
+        dev.set_phase(MemPhase::Live);
+        let victim = dev.alloc_scratch_in::<f32>(&pool, 16).unwrap();
+        drop(victim);
+        assert_eq!(dev.stats().deferred_frees, 1);
+        assert_eq!(dev.stats().drained_frees, 0);
 
-            // 池校验:scratch 池(64KiB)装不下 1MiB → A5.4 PoolExhausted
-            let over = b.alloc_scratch_in::<f32>(&scratch_pool, 1024 * 1024);
-            assert!(matches!(over, Err(BackendError::PoolExhausted { .. })));
-
-            // 用量快照:weights 池 = 1024*4 + 64*4 字节
-            let u = weights.usage();
-            assert_eq!(u.used, (1024 + 64) * 4);
-
-            // 图存活期 drop → 延迟(全局 + 池账都延迟归还)
-            b.set_phase(MemPhase::Live);
-            let victim = b.alloc_persistent_in::<f32>(&weights, 16).unwrap();
-            drop(victim);
-            assert_eq!(b.stats().deferred_frees, 1);
-            assert_eq!(b.stats().drained_frees, 0);
-
-            // 回 Idle → 延迟队列统一归还,池账同步回落
-            b.set_phase(MemPhase::Idle);
-            let s = b.stats();
-            assert_eq!(s.deferred_frees, 1);
-            assert_eq!(s.drained_frees, 1);
-            let u = weights.usage();
-            assert_eq!(u.used, (1024 + 64) * 4); // victim 的 64B 已还
-            assert_eq!(b.phase(), MemPhase::Idle);
-        }
-
-        // Backend 枚举 → 按 UUID 打开(上层全程只见 iface 的 Backend/Device)
-        let backend = CudaBackend;
-        let devs = backend.enumerate().expect("需要 CUDA 设备");
-        assert!(!devs.is_empty());
-        let mut cuda = backend.open(&devs[0].uuid).expect("open by uuid");
-        assert_eq!(cuda.desc().uuid, devs[0].uuid);
-        assert!(cuda.desc().total_bytes > 0);
-        use_backend(&mut cuda); // 静态分发:上层全程只见 Device trait
+        // Idle(净空窗口)→ 延迟队列统一归还
+        dev.set_phase(MemPhase::Idle);
+        assert_eq!(dev.stats().drained_frees, 1);
+        assert_eq!(pool.usage().used, 16 * 1024);
     }
 
     /// A5:预算合同——超支 fail-fast,账本可归因
     #[test]
     fn budget_violation_fails_fast() {
-        let ctx = OwlCuda::new(0).expect("需要 CUDA 设备");
-        ctx.set_budget(Budget {
+        let dev = make();
+        dev.set_budget(Budget {
             bytes: 1024 * 1024,
             reserve_floor: 512 * 1024,
         });
+        let pool = persistent_pool(&dev, "b", 8 << 20);
 
-        // 预算内分配正常(经池)
-        let pool = ctx
-            .create_pool(PoolConfig {
-                name: "test".into(),
-                kind: PoolKind::Scratch,
-                bytes: 8 << 20,
-            })
-            .unwrap();
-        let ok = ctx.alloc_persistent_in::<u8>(&pool, 1024).unwrap();
+        let ok = dev.alloc_persistent_in::<u8>(&pool, 1024).unwrap();
         drop(ok);
-        ctx.set_phase(MemPhase::Idle); // 归还,账本归零基线
+        dev.set_phase(MemPhase::Idle);
 
-        // 超支分配 → LawViolation(A5.4 fail-fast)
-        let huge = ctx.alloc_persistent_in::<u8>(&pool, 8 * 1024 * 1024);
+        let huge = dev.alloc_persistent_in::<u8>(&pool, 8 * 1024 * 1024);
         assert!(matches!(
             huge,
             Err(BackendError::LawViolation(msg)) if msg.contains("A5.4")
         ));
-        // 失败分配已回滚账本
-        let led = ctx.ledger();
-        assert!(led.bytes_alive < 1024 * 1024);
-
-        // A5.3 对账原语可用
-        let (free, _total) = ctx.mem_get_info().unwrap();
+        assert!(dev.ledger().bytes_alive < 1024 * 1024);
+        let (free, _total) = dev.mem_get_info().unwrap();
         assert!(free > 0);
     }
 
     /// A2.8:VMM 分配(2MiB 粒度,可被对端 P2P 映射的唯一合法路径)
     #[test]
     fn vmm_alloc_granularity_and_ledger() {
-        let ctx = OwlCuda::new(0).expect("需要 CUDA 设备");
-        // 1KB 请求 → 粒度向上取整(≥2MiB)
-        let buf = ctx.vmm_alloc(1024).expect("vmm_alloc");
+        let dev = make();
+        let buf = dev.vmm_alloc(1024).expect("vmm_alloc");
         assert!(buf.bytes() >= 2 * 1024 * 1024);
         assert!(buf.bytes() % (2 * 1024 * 1024) == 0);
         assert!(buf.device_ptr() != 0);
-        // 账本:粒度取整后的字节已入账
-        assert_eq!(ctx.ledger().bytes_alive, buf.bytes() as u64);
+        assert_eq!(dev.ledger().bytes_alive, buf.bytes() as u64);
         drop(buf);
-        assert_eq!(ctx.ledger().bytes_alive, 0);
+        assert_eq!(dev.ledger().bytes_alive, 0);
+    }
+
+    /// 语义分立:池类型与分配性质错配 = LawViolation
+    #[test]
+    fn pool_kind_mismatch_is_law_violation() {
+        let dev = make();
+        let scratch = scratch_pool(&dev, "s", 1 << 20);
+        let weights = persistent_pool(&dev, "w", 1 << 20);
+        // Scratch 池上做持久分配 → 拒
+        assert!(matches!(
+            dev.alloc_persistent_in::<f32>(&scratch, 16),
+            Err(BackendError::LawViolation(msg)) if msg.contains("不匹配")
+        ));
+        // Weights 池上做跨卡共享分配 → 拒
+        assert!(matches!(
+            weights.malloc_peer_shared(16),
+            Err(BackendError::LawViolation(msg)) if msg.contains("不匹配")
+        ));
+        // 正确配对可用
+        assert!(weights.malloc_persistent(256).is_ok());
+        let peer = dev
+            .create_pool(PoolConfig {
+                name: "p".into(),
+                kind: PoolKind::PeerShared,
+                bytes: 8 << 20,
+            })
+            .unwrap();
+        assert!(peer.malloc_peer_shared(4096).is_ok());
+    }
+
+    /// A2.8:PeerShared 池 malloc_peer_shared 真机验证
+    #[test]
+    fn peer_shared_malloc_uses_vmm() {
+        let dev = make();
+        let peer = dev
+            .create_pool(PoolConfig {
+                name: "ps".into(),
+                kind: PoolKind::PeerShared,
+                bytes: 8 << 20,
+            })
+            .unwrap();
+        let buf = peer.malloc_peer_shared(1024).unwrap();
+        // 粒度 ≥2MiB 对齐(经 DevBuf<u8> len 查询)
+        assert!(buf.len() >= 2 * 1024 * 1024);
+        assert!(buf.len() % (2 * 1024 * 1024) == 0);
+        assert!(!buf.device_ptr().is_null());
+        assert_eq!(dev.ledger().bytes_alive, buf.len() as u64);
+        drop(buf);
+        assert_eq!(dev.ledger().bytes_alive, 0);
+    }
+
+    /// 设备隔离律:UUID 钉卡回环 + Backend 枚举
+    #[test]
+    fn uuid_pinning_roundtrip() {
+        let backend = CudaBackend;
+        let devs = backend.enumerate().expect("需要 CUDA 设备");
+        assert!(!devs.is_empty());
+        let mut dev = backend.open(&devs[0].uuid).expect("open by uuid");
+        assert_eq!(dev.desc().uuid, devs[0].uuid);
+        assert!(dev.desc().total_bytes > 0);
+
+        // 池化契约走 Device trait 静态分发
+        let pool = dev
+            .create_pool(PoolConfig {
+                name: "t".into(),
+                kind: PoolKind::Weights,
+                bytes: 1 << 20,
+            })
+            .unwrap();
+        let buf = dev.alloc_persistent_in::<f32>(&pool, 64).unwrap();
+        assert_eq!(buf.len(), 64);
+        drop(buf);
+        dev.set_phase(MemPhase::Idle);
     }
 }

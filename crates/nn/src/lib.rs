@@ -1,7 +1,7 @@
 //! owl-nn —— 最小张量层 + NN 算子(一期)。
 //!
 //! 职责边界(roadmap.local.md 裁决 2/3/5):
-//! - **分配与使用两阶段分离**:`OwlTensor` 只能经 Device 池分配获得;
+//! - **分配与使用两阶段分离**:`Tensor` 只能经 Device 池分配获得;
 //!   算子层(ops)只接收 [`KernelCtx`]——它没有分配能力,类型上保证
 //!   E 阶段(使用)不可能发生分配;
 //! - **out-style**:所有算子显式写出到既有缓冲,owl 层不做隐式分配;
@@ -12,19 +12,108 @@ pub mod cublas;
 pub mod kernels;
 pub mod ops;
 pub mod tensor;
+pub use tensor::TensorPoolOps;
 
-use owl_iface::MemPhase;
+use owl_iface::{BufToken, MemPhase};
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
+
+/// 哨兵①产物:一次捕获的依赖痕迹(launch 序列 + 触碰的全部缓冲令牌)。
+/// replay 前可据此做世代校验(死亡令牌 = 结构化报错,而非 Xid 盲死)。
+#[derive(Debug, Default, Clone)]
+pub struct CaptureRecord {
+    /// 捕获期 kernel 发射序列(顺序即图内节点序)
+    pub launches: Vec<&'static str>,
+    /// 触碰的全部缓冲令牌(图依赖集合;封闭性由裁决 5 保证)
+    pub touched: BTreeSet<BufToken>,
+}
+
+/// 捕获记录器:挂进 [`KernelCtx`] 后,launch/缓冲触碰被自动记录。
+/// Clone 共享同一记录(进入闭包/跨函数)。
+#[derive(Debug, Clone)]
+pub struct CaptureRecorder {
+    record: Arc<Mutex<CaptureRecord>>,
+}
+
+impl CaptureRecorder {
+    pub fn new() -> Self {
+        Self {
+            record: Arc::new(Mutex::new(CaptureRecord::default())),
+        }
+    }
+
+    fn trace_launch(&self, kernel: &'static str) {
+        self.record.lock().expect("CaptureRecord 中毒").launches.push(kernel);
+    }
+
+    fn trace_buf(&self, t: BufToken) {
+        self.record.lock().expect("CaptureRecord 中毒").touched.insert(t);
+    }
+
+    /// 取当前痕迹快照
+    pub fn snapshot(&self) -> CaptureRecord {
+        self.record.lock().expect("CaptureRecord 中毒").clone()
+    }
+}
+
+impl Default for CaptureRecorder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// E 阶段的唯一上下文:只有 launch 能力,**没有分配能力**。
 /// 算子函数签名只允许接收它(裁决 5 的类型强制)。
+/// 捕获场景:带 [`CaptureRecorder`] —— launch/触碰自动留痕(哨兵①)。
 #[derive(Clone)]
 pub struct KernelCtx {
     pub(crate) phase: MemPhase,
+    pub(crate) recorder: Option<CaptureRecorder>,
 }
 
 impl KernelCtx {
+    /// eager 上下文(无痕迹记录)
+    pub fn eager(phase: MemPhase) -> Self {
+        Self {
+            phase,
+            recorder: None,
+        }
+    }
+
+    /// 捕获上下文(带记录器)
+    pub fn capturing(recorder: CaptureRecorder) -> Self {
+        Self {
+            phase: MemPhase::Capturing,
+            recorder: Some(recorder),
+        }
+    }
+
     pub fn phase(&self) -> MemPhase {
         self.phase
+    }
+
+    /// 是否处于记录态(捕获中)
+    pub fn recording(&self) -> bool {
+        self.recorder.is_some()
+    }
+
+    /// 记录一次 kernel 发射(非记录态为 no-op)
+    pub fn trace_launch(&self, kernel: &'static str) {
+        if let Some(r) = &self.recorder {
+            r.trace_launch(kernel);
+        }
+    }
+
+    /// 记录一次缓冲触碰(非记录态为 no-op)
+    pub fn trace_buf(&self, t: BufToken) {
+        if let Some(r) = &self.recorder {
+            r.trace_buf(t);
+        }
+    }
+
+    /// 痕迹快照(非记录态 = None)
+    pub fn snapshot(&self) -> Option<CaptureRecord> {
+        self.recorder.as_ref().map(|r| r.snapshot())
     }
 }
 

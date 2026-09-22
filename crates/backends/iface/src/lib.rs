@@ -31,6 +31,15 @@
 /// 后端 Arch 标识(与 kernels 的 arch 分发表共用一套词汇)
 pub use owl_kernels::Arch;
 
+/// 缓冲令牌:池缓冲出生时签发,(id, generation) 二元组。
+/// 捕获期记录于 CaptureRecord(哨兵①),replay 前可校验存活
+/// (世代校验;死亡令牌 = 结构化报错而非 Xid 盲死)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BufToken {
+    pub id: u64,
+    pub gen: u64,
+}
+
 /// 厂商后端栈家族
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendFamily {
@@ -193,10 +202,49 @@ pub trait Backend: Send + Sync + 'static {
 /// - `Scratch` 允许在 Capturing 相创建(捕获安全分配),非 Idle 相
 ///   drop 同样延迟;
 /// - 实现是否真的安全由各自测试兜底(iface 层提供验收用例模板)。
+/// 池内字节缓冲(P 阶段原语产物)。
+/// 不透明句柄:drop 时由后端自动归还池账 + 全局账本(含延迟语义)。
+pub struct PoolBuf {
+    inner: Box<dyn OpaqueDevBuf + Send>,
+}
+
+impl PoolBuf {
+    pub fn wrap(inner: Box<dyn OpaqueDevBuf + Send>) -> Self {
+        Self { inner }
+    }
+
+    /// 出生令牌(哨兵①)
+    pub fn token(&self) -> BufToken {
+        self.inner.token()
+    }
+}
+
+impl DevBuf<u8> for PoolBuf {
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+    fn device_ptr(&self) -> *mut u8 {
+        self.inner.device_ptr()
+    }
+}
+
+/// 后端不透明字节缓冲的 iface 视图(blanket impl,零 dyn 开销于热路径
+/// 之外的 P 阶段对象上)
+pub trait OpaqueDevBuf: DevBuf<u8> {
+    /// 出生令牌(哨兵①:捕获期依赖记录的钥匙)
+    fn token(&self) -> BufToken;
+}
+
 /// 显存池:Device 账本里的一条容量承诺(A5.1 分解表一行)。
-/// 上层持有池对象 = 持有"从这笔预算出账"的资格;分配原语以
-/// `&Self::Pool` 为准——没有池对象,就没有分配(类型系统强制)。
+/// **池是分配者**:`malloc` 是 P 阶段唯一分配入口;Device 只提供
+/// driver 原语。上层持有池对象 = 持有"从这笔预算出账"的资格。
 pub trait Pool: Send + Sync {
+    /// 本池所属的设备(池↔设备归属关系类型化)
+    type Dev: Device;
+
+    /// 设备句柄(张量创建入口经池直达设备原语,调用点不再出现 Device)
+    fn device(&self) -> Self::Dev;
+
     fn id(&self) -> PoolId;
     fn name(&self) -> &str;
     fn kind(&self) -> PoolKind;
@@ -204,6 +252,24 @@ pub trait Pool: Send + Sync {
 
     /// 用量快照(审计/对账;A5.3 周期调用)
     fn usage(&self) -> PoolUsage;
+
+    // ---- 分配原语(P 阶段;按性质分立)----
+    // 校验顺序:kind 语义匹配 → 池余量(A5.4)→ 全局预算(A5.4)→ 物理。
+    // 池类型与分配性质不匹配 = LawViolation(语义错配是架构错误)。
+    // 返回的不透明缓冲 drop 时自动归还池账 + 全局账(非 Idle 相按 A1.2 延迟)。
+
+    /// 暂存分配:stream-ordered、清零、允许 Capturing 相创建。
+    /// 仅接受 PoolKind::Scratch。
+    fn malloc_scratch(&self, bytes: u64) -> Result<PoolBuf, BackendError>;
+
+    /// 持久分配(权重/KV/workspace):地址稳定、清零、非 Idle 相 drop
+    /// 延迟。接受 Weights/KvCache/Workspace。
+    fn malloc_persistent(&self, bytes: u64) -> Result<PoolBuf, BackendError>;
+
+    /// A2.8 跨卡共享分配:VMM(cuMemCreate,粒度取设备最小值,向上
+    /// 取整),本地 RW 映射。仅接受 PoolKind::PeerShared。
+    /// 注意:VMM 背面**不清零**,调用方负责 memset 或整块覆盖。
+    fn malloc_peer_shared(&self, bytes: u64) -> Result<PoolBuf, BackendError>;
 }
 
 /// 设备实例:一张具体卡。账本 + 池组 + 相位机的唯一宿主(设备隔离律)。
@@ -213,7 +279,7 @@ pub trait Pool: Send + Sync {
 /// - `Scratch` 允许在 Capturing 相创建(捕获安全分配),非 Idle 相
 ///   drop 同样延迟;
 /// - 实现是否真的安全由各自测试兜底(iface 层提供验收用例模板)。
-pub trait Device: Send + Sync + 'static {
+pub trait Device: Clone + Send + Sync + 'static {
     /// 持久域缓冲类型(权重/KV/图缓冲)
     type Persistent<T: MemValue>: DevBuf<T>;
     /// 暂存域缓冲类型(kernel 中间结果)
@@ -228,6 +294,15 @@ pub trait Device: Send + Sync + 'static {
 
     fn arch(&self) -> Arch {
         self.desc().arch
+    }
+
+    // ---- 哨兵①词汇:缓冲令牌(默认 None;后端有账本则覆写)----
+
+    fn persistent_token<T: MemValue>(&self, _p: &Self::Persistent<T>) -> Option<BufToken> {
+        None
+    }
+    fn scratch_token<T: MemValue>(&self, _s: &Self::Scratch<T>) -> Option<BufToken> {
+        None
     }
 
     // ---- 跨卡窄口(A2.6 唯一例外通道;一切映射入本卡账本)----

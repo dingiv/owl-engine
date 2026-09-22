@@ -11,6 +11,8 @@ description = "CUDA backend: cudarc wrapped with memory-safety governance (chart
 cudarc = { version = "0.19", default-features = false, features = [
     "std",
     "driver",
+    "cublas",
+    "nvrtc",
     "cuda-version-from-build-system",
     "dynamic-loading",
 ] }
