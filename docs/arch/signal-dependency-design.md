@@ -75,6 +75,32 @@ launch 拦截点拿到地址做 O(log n) 反查,命中 → `scope.subscribe(toke
 A1.2 延迟归还 = 强租约的执行臂(不变);定影协议 = footprint 对账(不变);
 EagerOnly(fill_from_host)= untracked(不变,且语义上终于"名正言顺")。
 
+## 二·五、统一不变量:八大死亡姿势的 Signal 收编(2026-09-22 设计)
+
+> 推演结论:把追踪对象从"缓冲"扩展到"一切 CUDA 资源操作",
+> 图鉴 10 姿势中的 8 条被同一个不变量统一封死:
+>
+> **【不变量 Φ】捕获作用域内,一切 CUDA 资源操作(发射/分配/拷贝/
+> 流切换)必须经由追踪栈;栈外操作 = LawViolation。**
+
+四个执法 choke point(全部是我们自己的代码,零第三方依赖):
+
+| Choke point | 拦截的姿势 | 执法 |
+|---|---|---|
+| ① launch 封装(Kernels) | 2 依赖登记、8 节点记录 | 自动 subscribe + 地址反查 |
+| ② Pool.malloc 原语 | 5 池内不当分配、7 池外分配、4 库懒分配(预登记后即合规) | Capturing 相仅允许已登记池的 scratch;未登记分配 = 违约 |
+| ③ ffi 白名单包装(相位感知) | 1 D2H 回读、10 host 暂存 | `memcpy_dtoh_sync` 等 Capturing 相调用 = 违约 |
+| ④ stream 所有权(session.stream) | 9 野流、1 legacy 流 | launch 仅接 session 流 |
+
+姿势 3(存活期回收)升格为不变量:"**retire 有活跃订阅者的 token = 违约**"
+(现有延迟归还为其执行臂)。姿势 6(warmup)= "effect 未完整执行过一次
+不可 seal"(定影协议已隐含,制度化)。姿势 8 = 触发→响应的完整形态
+(M1+ 策略化)。
+
+**Signal 解不了的(诚实清单)**:BAR1/VMM 物理约束(A2.8,物理定律);
+性能策略(cublas 入图时机、档位数量);warmup 的内容清单(过程性知识)。
+Signal 提供的是"违规必被抓住",不是"正确决策自动做出"。
+
 ## 三、风险与边界
 
 1. **thread-local 与 runner 线程模型**:A3 规定每卡一线程,tracking
