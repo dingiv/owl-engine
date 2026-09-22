@@ -44,6 +44,27 @@ impl Default for Comm {
     }
 }
 
+/// 分片参数构造(= xinfer layers::distributed::shard 直译)
+pub fn shard(dim: usize, rank: usize, world_size: usize) -> Shard {
+    Shard {
+        dim,
+        rank,
+        world_size,
+    }
+}
+
+/// KV 头切分(GQA;奇数头 = world_size 整除断言。= xinfer kv_head_shard 直译)
+pub fn kv_head_shard(
+    num_kv_heads: usize,
+    rank: usize,
+    world_size: usize,
+) -> Result<(usize, Shard)> {
+    if num_kv_heads % world_size != 0 {
+        crate::bail!("kv heads {num_kv_heads} not divisible by TP {world_size}");
+    }
+    Ok((num_kv_heads / world_size, shard(0, rank, world_size)))
+}
+
 /// 复制线性(无切分;装载走 dense 通道)
 pub struct ReplicatedLinear {
     inner: LinearX,
@@ -67,6 +88,26 @@ impl ReplicatedLinear {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         self.inner.forward(x)
+    }
+
+    /// 装载口(candle load_b 直译;量化壳透传)
+    pub fn load_b(
+        in_dim: usize,
+        out_dim: usize,
+        bias: bool,
+        vb: VarBuilderX,
+        dtype: DType,
+    ) -> Result<Self> {
+        Self::new(
+            in_dim,
+            out_dim,
+            &vb,
+            Shard::default(),
+            &None,
+            &None,
+            dtype,
+            bias,
+        )
     }
 }
 
@@ -112,6 +153,37 @@ impl TensorParallelColumnLinear {
     pub fn w4a8_active(&self) -> bool {
         self.inner.w4a8_active()
     }
+
+    /// 装载口(= candle load_with_hints;comm 内取 rank/world 构造 shard)
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_with_hints(
+        in_dim: usize,
+        out_dim: usize,
+        bias: bool,
+        vb: VarBuilderX,
+        comm: Rc<Comm>,
+        quant_cfg: QuantCfgRef,
+        quant: &Option<String>,
+        dtype: DType,
+    ) -> Result<Self> {
+        let shard = shard(0, comm.rank, comm.world_size);
+        Self::new_loaded(in_dim, out_dim, &vb, shard, quant_cfg, quant, dtype, bias)
+    }
+
+    /// 装载口(外部 shard;KV 头类切分)
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_with_shard(
+        in_dim: usize,
+        out_dim: usize,
+        bias: bool,
+        vb: VarBuilderX,
+        shard: Shard,
+        quant_cfg: QuantCfgRef,
+        quant: &Option<String>,
+        dtype: DType,
+    ) -> Result<Self> {
+        Self::new_loaded(in_dim, out_dim, &vb, shard, quant_cfg, quant, dtype, bias)
+    }
 }
 
 /// 合并列并行(gate/up 融合;forward 返回切片向量)
@@ -152,6 +224,50 @@ impl MergedParallelColumnLinear {
     pub fn forward_cat(&self, x: &Tensor, dim: usize) -> Result<Tensor> {
         let parts = self.forward(x)?;
         super::ops::cat(&parts, dim)
+    }
+
+    /// 打包权重本地构造(= xinfer from_packed_local;切片切割 T3 loader 回填)
+    pub fn from_packed_local(
+        _weight: Tensor,
+        _bias: Option<Tensor>,
+        _splits: Vec<usize>,
+    ) -> Result<Self> {
+        unimplemented!("T3: from_packed_local(loader 切片切割回填)")
+    }
+
+    /// 分块合并装载(= xinfer load_merged_chunks;逐段 linear_b_x)
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_merged_chunks(
+        in_dim: usize,
+        _out_dim_total: usize,
+        chunks: Vec<usize>,
+        vb: VarBuilderX,
+        quant_cfg: QuantCfgRef,
+        quant: &Option<String>,
+        dtype: DType,
+    ) -> Result<Self> {
+        let shard = Shard::default();
+        let mut linears = Vec::with_capacity(chunks.len());
+        for (i, clen) in chunks.iter().enumerate() {
+            let vbx = vb.pp(&format!("{i}"));
+            let inner = linear_b_x(*clen, in_dim, false, &vbx, shard, quant_cfg, quant, dtype)?;
+            linears.push(TensorParallelColumnLinear { inner });
+        }
+        let _ = vb;
+        Ok(Self { linears })
+    }
+
+    /// fp8 打包权重本地构造(量化体 = marlin-ffi,运行里程碑)
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_packed_local_fp8(
+        _weight: Tensor,
+        _scale: Tensor,
+        _bias: Option<Tensor>,
+        _block_size: Vec<usize>,
+        _sm_version: usize,
+        _splits: Vec<usize>,
+    ) -> Result<Self> {
+        unimplemented!("T3: from_packed_local_fp8(marlin-ffi 路线)")
     }
 }
 
@@ -213,6 +329,21 @@ impl TensorParallelRowLinear {
             bias,
             comm,
         )
+    }
+
+    /// 装载口(= candle load_with_hints;行并行 shard = dim 1)
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_with_hints(
+        in_dim: usize,
+        out_dim: usize,
+        vb: VarBuilderX,
+        comm: Rc<Comm>,
+        quant_cfg: QuantCfgRef,
+        quant: &Option<String>,
+        dtype: DType,
+    ) -> Result<Self> {
+        let shard = shard(1, comm.rank, comm.world_size);
+        Self::new_loaded(in_dim, out_dim, &vb, shard, quant_cfg, quant, dtype, false, comm)
     }
 
     /// 无 all_reduce 的本地前向(序列并行/预量化路径)

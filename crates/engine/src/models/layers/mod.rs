@@ -36,7 +36,9 @@ pub fn collect_key_map<'a, const N: usize>(
         pairs.into_iter().map(|(key, _)| (key, key)).collect()
     }
 }
-//pub mod attention;
+pub mod attention;
+pub mod deltanet;
+pub mod moe;
 //pub mod deepstack;
 //pub mod deltanet;
 //pub mod distributed;
@@ -762,6 +764,12 @@ pub mod vendor {
     pub struct InputMetadata {
         pub seqlens: Vec<usize>,
         pub context_lens: Vec<usize>,
+        /// prefill/decode 分派(attention/deltanet forward 入口分支)
+        pub is_prefill: bool,
+        /// MTP/DFlash2 verify 打包批次标记(快照区写入面)
+        pub is_mtp_verify: bool,
+        /// 变长 prefill 的序列偏移(U32 device 张量;A1.5 动态量设备化)
+        pub cu_seqlens_q: Option<super::Tensor>,
     }
     /// MoE 算子面(= attention_rs::moe)
     pub mod moe {
