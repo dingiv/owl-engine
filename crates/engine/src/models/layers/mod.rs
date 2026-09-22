@@ -2142,6 +2142,9 @@ mod varbuilder_tests {
 
         let d2h = |t: &Tensor| -> Vec<f32> {
             let n = t.shape().iter().product::<usize>();
+            // 装载 kernel 在非默认流:同步后再 DtoH(全量测试下偶发零读,
+            // 同根见 rotary_truth.rs 先例)
+            dev.ctx().synchronize().unwrap();
             let mut host = vec![0f32; n];
             unsafe {
                 owl_cuda::ffi::sys::cuMemcpyDtoH_v2(
