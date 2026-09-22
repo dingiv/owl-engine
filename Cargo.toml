@@ -8,6 +8,7 @@ members = [
     "crates/backends/iface",
     "crates/nn",
     "crates/signal",
+    "crates/engine",
 ]
 resolver = "2"
 

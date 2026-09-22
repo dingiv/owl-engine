@@ -1,0 +1,15 @@
+[package]
+name = "owl-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+owl-iface = { path = "../backends/iface" }
+owl-cuda = { path = "../backends/cuda" }
+owl-signal = { path = "../signal" }
+owl-nn = { path = "../nn" }
+
+[features]
+default = []
+# 量化路径(Q8/F8E8M0/GGUF)占位;运行里程碑回填
+quant = []
