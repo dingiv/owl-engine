@@ -62,34 +62,78 @@ impl Default for CaptureRecorder {
     }
 }
 
-/// E 阶段的唯一上下文:只有 launch 能力,**没有分配能力**。
+/// E 阶段的唯一上下文:只有 launch 能力(**流 + 发射**,**没有分配能力**)。
 /// 算子函数签名只允许接收它(裁决 5 的类型强制)。
 /// 捕获场景:带 [`CaptureRecorder`] —— launch/触碰自动留痕(哨兵①)。
+///
+/// M1②:**流由 ctx 携带,不再由 OpsCtx 持有**——eager 持设备主流,
+/// 捕获持会话捕获流;算子发射到哪条流在构造 ctx 时即定,无运行时状态。
 #[derive(Clone)]
 pub struct KernelCtx {
     pub(crate) phase: MemPhase,
+    pub(crate) stream: Arc<owl_cuda::ffi::CudaStream>,
     pub(crate) recorder: Option<CaptureRecorder>,
+    /// Signal 追踪作用域(capturing 态持有;drop 时弹栈——持有即语义)
+    #[allow(dead_code)]
+    pub(crate) track: Option<owl_signal::TrackingHandle>,
 }
 
 impl KernelCtx {
-    /// eager 上下文(无痕迹记录)
-    pub fn eager(phase: MemPhase) -> Self {
+    /// eager 上下文(无痕迹记录;stream = 发射目标)
+    pub fn eager(phase: MemPhase, stream: Arc<owl_cuda::ffi::CudaStream>) -> Self {
         Self {
             phase,
+            stream,
             recorder: None,
+            track: None,
         }
     }
 
-    /// 捕获上下文(带记录器)
-    pub fn capturing(recorder: CaptureRecorder) -> Self {
+    /// 捕获上下文(带记录器;记录器即追踪 sink)
+    pub fn capturing(
+        recorder: CaptureRecorder,
+        stream: Arc<owl_cuda::ffi::CudaStream>,
+    ) -> Self {
+        // Signal 接线:recorder 即追踪 sink——ops 的 owl_signal::emit
+        // 自动落到这里(依赖追踪自动化,roadmap §四·五)
+        let rec = recorder.clone();
+        let sink: owl_signal::Sink =
+            Arc::new(move |t: owl_signal::Token| rec.trace_buf(t));
         Self {
             phase: MemPhase::Capturing,
+            stream,
             recorder: Some(recorder),
+            track: Some(owl_signal::enter(sink)),
+        }
+    }
+
+    /// 绑会话帧的捕获上下文:launch 留痕(recorder)+ 自动租约
+    /// (frame.lease_sink)共用一条 signal 通道(signal 设计 §2.1)。
+    pub fn capturing_leased(
+        recorder: CaptureRecorder,
+        frame: &owl_cuda::CaptureFrame<'_>,
+    ) -> Self {
+        let rec = recorder.clone();
+        let lease = frame.lease_sink.clone();
+        let sink: owl_signal::Sink = Arc::new(move |t: owl_signal::Token| {
+            rec.trace_buf(t);
+            (lease)(t);
+        });
+        Self {
+            phase: MemPhase::Capturing,
+            stream: Arc::clone(frame.stream),
+            recorder: Some(recorder),
+            track: Some(owl_signal::enter(sink)),
         }
     }
 
     pub fn phase(&self) -> MemPhase {
         self.phase
+    }
+
+    /// 发射目标流(eager = 设备主流;捕获 = 会话捕获流)
+    pub fn stream(&self) -> &Arc<owl_cuda::ffi::CudaStream> {
+        &self.stream
     }
 
     /// 是否处于记录态(捕获中)

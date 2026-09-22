@@ -8,7 +8,7 @@ use owl_cuda::CudaDevice;
 use owl_iface::{Device, PoolConfig, PoolKind};
 use owl_nn::cublas::NnBlas;
 use owl_nn::ops::OpsCtx;
-use owl_nn::tensor::{Tensor, TensorPoolOps};
+use owl_nn::tensor::TensorPoolOps;
 
 fn cpu_matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f64> {
     let mut c = vec![0.0f64; m * n];
@@ -82,7 +82,7 @@ fn main() {
         .expect("建池");
     let blas = NnBlas::new(&dev).expect("NnBlas(workspace 预钉)");
     let mut ops = OpsCtx::new(&dev).expect("OpsCtx");
-    let ctx = owl_nn::KernelCtx::eager(owl_iface::MemPhase::Idle);
+    let ctx = ops.ctx(owl_iface::MemPhase::Idle);
 
     const M: usize = 64;
     const K: usize = 128;

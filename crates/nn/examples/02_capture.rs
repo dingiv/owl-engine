@@ -1,23 +1,25 @@
-//! 一期 example 02:同链 CUDA graph 捕获 + replay + 计时对照。
+//! example 02:M1 全链 CUDA graph 捕获 + replay + 计时对照。
 //!
-//! 链:matmul → add → silu → rmsnorm。
-//! **一期边界(实测确认)**:NnBlas 绑 legacy NULL stream(T2 移交事项),
-//! capture(Relaxed)下 GEMM 不会被烙进图——故本 example 的图覆盖
-//! add→silu→rmsnorm 三算子,matmul 保持 eager 前置,重放序列 =
-//! eager matmul + graph.launch。这正是 M1"cublas 改绑 device stream"
-//! 的存在理由,经验证记录于 docs/bench/owl.md。
+//! 链:matmul → add → silu → rmsnorm,**全部入图**(M1①:cublas 逐次
+//! setStream 到捕获流,GEMM 被烙进图;workspace 预钉 = 姿势 4 防线)。
 //!
-//! 纪律:P 阶段分配全部缓冲;warmup 先 eager 全链(kernel JIT 预热 +
-//! 捕获前的懒状态清理,T3 移交事项①);replay 喂新输入走旁路
-//! (fill_from_host / eager matmul,不经捕获)。
+//! M1 纪律落地:
+//! - 姿势 6:warmup 制度化——捕获前全链 eager 跑一遍,由
+//!   `CaptureSession::capture` 的发射计数门禁强制(未 warmup 拒捕获);
+//! - 信号自动租约:闭包内 ops 读过的缓冲自动成为图强租约
+//!   (无手工 `session.lease` 调用);
+//! - 哨兵③:instantiate 前 driver 自审——图内全部 8 字节参数对账
+//!   账本区间,∉ 租约集 = 依赖泄漏(结构化违约,非 Xid 盲死)。
+//!
+//! 重放序列 = 仅 graph.launch(全链在图内);喂新输入走旁路
+//! (fill_from_host,EagerOnly,设备主流)。
 
 use owl_cuda::CudaDevice;
-use owl_iface::{Device, PoolConfig, PoolKind};
+use owl_iface::{Device, MemPhase, PoolConfig, PoolKind};
 use owl_nn::cublas::NnBlas;
 use owl_nn::ops::OpsCtx;
 use owl_nn::tensor::{Tensor, TensorPoolOps};
-
-use owl_cuda::ffi::sys;
+use owl_nn::{CaptureRecorder, KernelCtx};
 use std::time::Instant;
 
 struct Lcg(u32);
@@ -36,9 +38,30 @@ fn median(xs: &mut [f64]) -> f64 {
     xs[xs.len() / 2]
 }
 
+/// 链体:matmul → add → silu → rmsnorm(流由 ctx 携带,与捕获无关)
+fn run_chain<D: owl_iface::Device>(
+    ctx: &KernelCtx,
+    ops: &mut OpsCtx,
+    blas: &NnBlas,
+    w: &Tensor<f32, D>,
+    a: &Tensor<f32, D>,
+    bias: &Tensor<f32, D>,
+    alpha: &Tensor<f32, D>,
+    mm_out: &mut Tensor<f32, D>,
+    add_out: &mut Tensor<f32, D>,
+    silu_out: &mut Tensor<f32, D>,
+    out: &mut Tensor<f32, D>,
+) -> Result<(), owl_iface::BackendError> {
+    ops.matmul(ctx, blas, w, a, mm_out)?;
+    ops.add(ctx, mm_out, bias, add_out)?;
+    ops.silu(ctx, add_out, silu_out)?;
+    ops.rmsnorm(ctx, silu_out, alpha, out, 1e-5)?;
+    Ok(())
+}
+
 fn main() {
     let dev = CudaDevice::new(0).expect("需要 CUDA 设备");
-    println!("== owl 02_capture:matmul(eager) + [add|silu|rmsnorm](graph)==");
+    println!("== owl 02_capture(M1):全链 [matmul|add|silu|rmsnorm] 单图捕获 ==");
 
     // ---- P 阶段 ----
     let pool = dev
@@ -50,7 +73,7 @@ fn main() {
         .expect("建池");
     let blas = NnBlas::new(&dev).expect("NnBlas");
     let mut ops = OpsCtx::new(&dev).expect("OpsCtx");
-    let ctx = owl_nn::KernelCtx::eager(owl_iface::MemPhase::Idle);
+    let ctx = ops.ctx(MemPhase::Idle); // 设备主流(非阻塞;M1②)
 
     const M: usize = 64;
     const K: usize = 128;
@@ -79,75 +102,87 @@ fn main() {
 
     let base_ledger = dev.ledger();
 
-    // ---- warmup(T3 移交事项①:kernel JIT/懒状态在捕获前清理)----
-    ops.matmul(&ctx, &blas, &w, &a, &mut mm_out).unwrap();
-    ops.add(&ctx, &mm_out, &bias, &mut add_out).unwrap();
-    ops.silu(&ctx, &add_out, &mut silu_out).unwrap();
-    ops.rmsnorm(&ctx, &silu_out, &alpha, &mut graph_out, 1e-5).unwrap();
+    // ---- 姿势 6:warmup(全链 eager;capture 门禁 = 发射计数 >0)----
+    run_chain(
+        &ctx,
+        &mut ops,
+        &blas,
+        &w,
+        &a,
+        &bias,
+        &alpha,
+        &mut mm_out,
+        &mut add_out,
+        &mut silu_out,
+        &mut graph_out,
+    )
+    .unwrap();
     dev.ctx().synchronize().unwrap();
 
-    // ---- 捕获:non-blocking stream + Kernels 直发 ----
-    // 实测发现(重要,记录给 M1):cudarc 的 default_stream = legacy NULL
-    // stream,**天然不可捕获**(begin_capture 直接
-    // CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED)。T3 的 OpsCtx 绑死的正是
-    // 这条流——故本 example 捕获段改用 Kernels 直发到自建 non-blocking
-    // 流(不改 T0/T2 源码);matmul(cublas/legacy)保持 eager 前置。
-    // GraphLease:捕获会话登记依赖租约(强租约),DeviceGraph 持有 keepalive
+    // ---- 捕获:全链单图(matmul 经 cublas 在捕获流上被烙进图)----
+    // 信号自动租约:闭包内 ops 读过的 7 个缓冲自动成为强租约,无手工登记
     let mut session = dev.capture_session().expect("capture_session");
-    let cap_stream = session.stream().clone();
-    let mut cap_kernels = owl_nn::kernels::Kernels::new(dev.ctx()).expect("kernels");
-    let m_n = M * N;
-
-    // 依赖租约登记(哨兵①:CaptureRecord 的实体化前奏)
-    session.lease(mm_out.persistent().unwrap());
-    session.lease(bias.persistent().unwrap());
-    session.lease(add_out.persistent().unwrap());
-    session.lease(silu_out.persistent().unwrap());
-    session.lease(alpha.persistent().unwrap());
-    session.lease(graph_out.persistent().unwrap());
-
-    cap_stream
-        .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
-        .expect("begin_capture");
-    cap_kernels
-        .add_f32(&cap_stream, m_n, mm_out.device_ptr(), bias.device_ptr(), add_out.device_ptr())
-        .expect("cap add");
-    cap_kernels
-        .silu_f32(&cap_stream, m_n, add_out.device_ptr(), silu_out.device_ptr())
-        .expect("cap silu");
-    cap_kernels
-        .rmsnorm_f32(
-            &cap_stream,
-            M,
-            N,
-            silu_out.device_ptr(),
-            alpha.device_ptr(),
-            graph_out.device_ptr(),
-            1e-5,
+    let (rec, graph) = session
+        .capture(
+            owl_cuda::ffi::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+            |frame| {
+                let rec = CaptureRecorder::new();
+                let ctx = KernelCtx::capturing_leased(rec.clone(), frame);
+                run_chain(
+                    &ctx,
+                    &mut ops,
+                    &blas,
+                    &w,
+                    &a,
+                    &bias,
+                    &alpha,
+                    &mut mm_out,
+                    &mut add_out,
+                    &mut silu_out,
+                    &mut graph_out,
+                )?;
+                Ok(rec)
+            },
         )
-        .expect("cap rmsnorm");
-    let graph = session
-        .end(sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
-        .expect("end_capture");
+        .expect("capture(姿势6门禁 + 自动租约 + 哨兵③)");
     graph.upload().unwrap();
-    println!("捕获完成 + upload(3 kernel@non-blocking stream;matmul legacy 保持 eager;租约 {} 条)", 6);
 
+    let audit = graph.audit();
+    println!(
+        "捕获完成 + upload:kernel 节点 {} / 总节点 {} / 指针引用 {} / 租约 {} 条 / launch 序 {:?}",
+        audit.kernel_nodes,
+        audit.total_nodes,
+        audit.ptr_refs.len(),
+        graph.leases().len(),
+        rec.snapshot().launches
+    );
+    // 8 个链缓冲 + 1 个 cublas workspace(matmul 的隐藏依赖)= 9 条
+    assert_eq!(graph.leases().len(), 9, "自动租约应为 8 链缓冲 + 1 workspace = 9 条");
 
-    // ---- replay 正确性:新输入(旁路写入)→ eager matmul + graph.launch ----
+    // ---- replay 正确性:新输入(旁路写入)→ 仅 graph.launch ----
     let mut seed2 = Lcg(23);
     for it in 0..4 {
         let new_bias = seed2.vec(M * N);
         ops.fill_from_host(&ctx, &mut bias, &new_bias).unwrap(); // 旁路:EagerOnly,零分配
-        ops.matmul(&ctx, &blas, &w, &a, &mut mm_out).unwrap(); // eager 前置
-        dev.ctx().synchronize().unwrap(); // legacy→non-blocking 无隐式同步,显式栅栏
+        dev.ctx().synchronize().unwrap();
         graph.launch().expect("graph launch");
         dev.ctx().synchronize().unwrap();
 
-        // eager 参考链(独立缓冲)
-        ops.matmul(&ctx, &blas, &w, &a, &mut ref_mm).unwrap();
-        ops.add(&ctx, &ref_mm, &bias, &mut ref_add).unwrap();
-        ops.silu(&ctx, &ref_add, &mut ref_silu).unwrap();
-        ops.rmsnorm(&ctx, &ref_silu, &alpha, &mut ref_out, 1e-5).unwrap();
+        // eager 参考链(独立缓冲,设备主流)
+        run_chain(
+            &ctx,
+            &mut ops,
+            &blas,
+            &w,
+            &a,
+            &bias,
+            &alpha,
+            &mut ref_mm,
+            &mut ref_add,
+            &mut ref_silu,
+            &mut ref_out,
+        )
+        .unwrap();
         dev.ctx().synchronize().unwrap();
 
         let got = graph_out.to_vec().unwrap();
@@ -160,8 +195,6 @@ fn main() {
         assert!(max_diff <= 1e-4, "replay #{it} 与 eager 不一致: {max_diff}");
         println!("replay #{it}: graph vs eager 最大偏差 {:.3e} ✓", max_diff);
     }
-    // 旁路喂入确实生效(bias 变了,输出随之变化)
-    assert!(seed2.vec(1).len() == 1);
 
     // ---- 计时对照(median of ITER;每次同步,单请求口径)----
     let mut seed3 = Lcg(99);
@@ -172,24 +205,32 @@ fn main() {
         ops.fill_from_host(&ctx, &mut bias, &nb).unwrap();
 
         let t0 = Instant::now();
-        ops.matmul(&ctx, &blas, &w, &a, &mut mm_out).unwrap();
-        ops.add(&ctx, &mm_out, &bias, &mut add_out).unwrap();
-        ops.silu(&ctx, &add_out, &mut silu_out).unwrap();
-        ops.rmsnorm(&ctx, &silu_out, &alpha, &mut graph_out, 1e-5).unwrap();
+        run_chain(
+            &ctx,
+            &mut ops,
+            &blas,
+            &w,
+            &a,
+            &bias,
+            &alpha,
+            &mut mm_out,
+            &mut add_out,
+            &mut silu_out,
+            &mut graph_out,
+        )
+        .unwrap();
         dev.ctx().synchronize().unwrap();
         eager_t.push(t0.elapsed().as_secs_f64() * 1e3);
 
         let t1 = Instant::now();
-        ops.matmul(&ctx, &blas, &w, &a, &mut mm_out).unwrap();
-        dev.ctx().synchronize().unwrap(); // 栅栏:legacy 产物 → 图
-        graph.launch().unwrap();
+        graph.launch().unwrap(); // 全链在图内,一次 launch
         dev.ctx().synchronize().unwrap();
         graph_t.push(t1.elapsed().as_secs_f64() * 1e3);
     }
     let e_med = median(&mut eager_t);
     let g_med = median(&mut graph_t);
     println!(
-        "计时(median of {ITER},ms): eager 全链 {:.4} | matmul+graph {:.4} | graph 提速 {:.1}%",
+        "计时(median of {ITER},ms): eager 全链 {:.4} | 全链图 {:.4} | graph 提速 {:.1}%",
         e_med,
         g_med,
         (e_med - g_med) / e_med * 100.0
@@ -198,10 +239,5 @@ fn main() {
     // ---- A5 终验:账本零漂移 ----
     let end = dev.ledger();
     assert_eq!(end.bytes_alive, base_ledger.bytes_alive, "A5: 生命周期末账本必须回到基线");
-    println!(
-        "== ledger 快照: alive {:.2} KiB(=基线 ✓)/ 累计 {:.2} KiB / peer_map {} ==",
-        end.bytes_alive as f64 / 1024.0,
-        end.bytes_allocated_total as f64 / 1024.0,
-        end.stats.peer_mappings,
-    );
+    println!("A5 终验:账本回基线 ✓ (alive = {} B)", end.bytes_alive);
 }

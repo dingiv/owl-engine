@@ -43,14 +43,30 @@ impl BlasWorkspace {
         use owl_iface::DevBuf;
         self.buf.device_ptr() as *mut core::ffi::c_void
     }
+
+    /// 哨兵①:workspace 缓冲令牌。cublas 把 workspace 指针烘进 launch
+    /// 参数,捕获期它就是图的真实依赖——A5.2"池外原语必须预分配
+    /// 并登记"的执行点(matmul 捕获路径必须把它 emit 进租约)。
+    pub fn token(&self) -> Option<owl_iface::BufToken> {
+        self.buf.token()
+    }
 }
 
 /// 绑定 workspace 的 cuBLAS 句柄(handle 的销毁先于 workspace 释放,
 /// 见 Drop 实现的字段顺序)。
 pub struct NnBlas {
     ctx: std::sync::Arc<owl_cuda::ffi::CudaContext>,
+    /// 设备句柄:姿势 6 发射计数(matmul 每次发射 note_launch)
+    dev: owl_cuda::CudaDevice,
     handle: Option<cublasHandle_t>,
-    _ws: BlasWorkspace,
+    ws: BlasWorkspace,
+}
+
+impl NnBlas {
+    /// workspace 令牌(捕获路径 emit 进租约,见 [`BlasWorkspace::token`])
+    pub fn workspace_token(&self) -> Option<owl_iface::BufToken> {
+        self.ws.token()
+    }
 }
 
 fn check(st: cublasStatus_t, what: &'static str) -> Result<(), BackendError> {
@@ -78,18 +94,22 @@ impl NnBlas {
                 "cublasSetWorkspace_v2",
             )?;
         }
-        // T2 使用 legacy default stream(NULL):与所有阻塞流天然同步;
-        // M1 接图治理时改绑 device stream(见 roadmap 裁决 3②)
+        // M1①:绑设备主显存流(非阻塞、可捕获)。legacy NULL 流不可捕获
+        // (T4 判例);matmul 逐次 setStream 到实际发射流(见 matmul_f32)
+        // driver CUstream 与 cublas cudaStream_t 是两套不透明类型:经
+        // c_void 转接(两者同为裸句柄,零拷贝)
+        let s = device.stream().cu_stream() as *mut core::ffi::c_void;
         unsafe {
             check(
-                cublasSetStream_v2(handle, std::ptr::null_mut()),
+                cublasSetStream_v2(handle, s as _),
                 "cublasSetStream_v2",
             )?;
         }
         Ok(Self {
             ctx: std::sync::Arc::clone(device.ctx()),
+            dev: device.clone(),
             handle: Some(handle),
-            _ws: ws,
+            ws,
         })
     }
 
@@ -99,6 +119,8 @@ impl NnBlas {
     /// A ≡ Aᵀ(K×M)、B ≡ Bᵀ(N×K)、C ≡ Cᵀ(N×M),故
     /// `Cᵀ = B × A`(全部不转置),即 cublas 侧 (m=N, n=M, k=K),
     /// 首参传 B(lda=N)、次参传 A(ldb=K)、C ldc=N。
+    /// `stream`:发射目标流(eager = 设备主流;捕获 = 会话捕获流)。
+    /// cublasSetStream 是 host 侧句柄配置(不触碰流),捕获期安全。
     pub fn matmul_f32(
         &self,
         m: usize,
@@ -107,7 +129,9 @@ impl NnBlas {
         a: *const f32,
         b: *const f32,
         c: *mut f32,
+        stream: &owl_cuda::ffi::CudaStream,
     ) -> Result<(), BackendError> {
+        self.dev.note_launch();
         self.ctx
             .bind_to_thread()
             .map_err(|e| BackendError::Init(format!("bind_to_thread: {e:?}")))?;
@@ -115,7 +139,12 @@ impl NnBlas {
         let (m, n, k) = (m as i32, n as i32, k as i32);
         let alpha = 1.0f32;
         let beta = 0.0f32;
+        let s = stream.cu_stream() as *mut core::ffi::c_void;
         unsafe {
+            check(
+                cublasSetStream_v2(handle, s as _),
+                "cublasSetStream_v2",
+            )?;
             check(
                 cublasSgemm_v2(
                     handle,
@@ -142,7 +171,7 @@ impl NnBlas {
 
 impl Drop for NnBlas {
     fn drop(&mut self) {
-        // handle 先销毁,再让 _ws(账本缓冲)随后 drop——顺序不能反
+        // handle 先销毁,再让 ws(账本缓冲)随后 drop——字段声明顺序保证
         if let Some(handle) = self.handle.take() {
             unsafe {
                 let _ = cublasDestroy_v2(handle);
@@ -156,7 +185,7 @@ use owl_iface::{BackendError, Device, PoolConfig, PoolKind};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use owl_iface::{DevBuf, Pool};
+    use owl_iface::DevBuf;
 
     /// 确定性伪随机([-1,1)),无 rand 依赖
     struct Lcg(u32);
@@ -183,6 +212,7 @@ mod tests {
     #[test]
     fn matmul_f32_matches_cpu_reference() {
         let dev = CudaDevice::new(0).expect("需要 CUDA 设备");
+        let stream = dev.stream().clone();
         let (blas, pool) = setup(&dev).expect("setup");
 
         const M: usize = 128;
@@ -197,7 +227,16 @@ mod tests {
         let dc = dev.alloc_persistent_in::<f32>(&pool, M * N).unwrap();
         dev.ctx().synchronize().unwrap();
 
-        blas.matmul_f32(M, N, K, da.device_ptr(), db.device_ptr(), dc.device_ptr())
+        blas
+            .matmul_f32(
+                M,
+                N,
+                K,
+                da.device_ptr(),
+                db.device_ptr(),
+                dc.device_ptr(),
+                &stream,
+            )
             .unwrap();
         dev.ctx().synchronize().unwrap();
 
@@ -252,6 +291,7 @@ mod tests {
         let dc = dev.alloc_persistent_in::<f32>(&pool, M * N).unwrap();
         dev.ctx().synchronize().unwrap();
 
+        let stream = dev.stream().clone();
         let before = dev.ledger();
         for _ in 0..1000 {
             blas.matmul_f32(
@@ -261,6 +301,7 @@ mod tests {
                 da.device_ptr(),
                 db.device_ptr(),
                 dc.device_ptr(),
+                &stream,
             )
             .unwrap();
         }

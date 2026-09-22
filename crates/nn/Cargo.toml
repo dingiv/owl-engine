@@ -7,6 +7,7 @@ description = "Minimal tensor + NN ops on owl-iface devices; capture-safe by con
 
 [dependencies]
 owl-cuda = { path = "../backends/cuda" }
+owl-signal = { path = "../signal" }
 owl-iface = { path = "../backends/iface" }
 owl-kernels = { path = "../kernels" }
 thiserror = { workspace = true }

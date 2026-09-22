@@ -16,9 +16,9 @@
 //! 裁决 3①)+ T2 的 cuBLAS(`NnBlas`,workspace 预钉)。
 
 use crate::kernels::Kernels;
+use owl_signal;
 use crate::tensor::Tensor;
 use crate::{CaptureSafe, KernelCtx};
-use owl_cuda::ffi::CudaStream;
 use owl_iface::BackendError;
 use std::sync::Arc;
 
@@ -67,11 +67,12 @@ macro_rules! unary_op {
             D: owl_iface::Device,
         {
             ctx.trace_launch(stringify!($method));
-            ctx.trace_buf(x.token().expect("token"));
-            ctx.trace_buf(out.token().expect("token"));
+            self.note_launch();
+            owl_signal::emit(x.token().expect("token"));
+            owl_signal::emit(out.token().expect("token"));
             assert_eq!(x.shape(), out.shape(), "unary: out 形状不一致");
             let n = owl_iface::DevBuf::<T>::len(x);
-            let stream = Arc::clone(&self.stream);
+            let stream = Arc::clone(ctx.stream());
             self.kernels
                 .$kernel(
                     &stream,
@@ -90,25 +91,30 @@ macro_rules! unary_op {
 /// 所有算子经 `&mut self` 使用——裁决 5 的类型强制载体。
 pub struct OpsCtx {
     kernels: Kernels,
-    stream: Arc<CudaStream>,
-    /// 仅用于 EagerOnly 路径的 bind_to_thread;不暴露
-    bind: Arc<owl_cuda::ffi::CudaContext>,
+    /// 设备句柄:主流引用 + 发射计数(姿势 6 门禁)+ EagerOnly 的
+    /// bind_to_thread。不再持有流所有权——**流由 KernelCtx 携带**
+    /// (M1②:流选择显式化,eager/捕获各持其流)
+    dev: owl_cuda::CudaDevice,
 }
 
 impl OpsCtx {
     /// P 阶段构造:读设备句柄装配执行器(零显存申请)。
     pub fn new(device: &owl_cuda::CudaDevice) -> Result<Self, BackendError> {
-        let stream = device.ctx().default_stream();
         let kernels = Kernels::new(device.ctx()).map_err(BackendError::Init)?;
         Ok(Self {
             kernels,
-            stream,
-            bind: device.ctx().clone(),
+            dev: device.clone(),
         })
     }
 
-    fn stream(&self) -> &CudaStream {
-        &self.stream
+    /// E 阶段上下文:设备主显存流(非阻塞;M1②)
+    pub fn ctx(&self, phase: owl_iface::MemPhase) -> KernelCtx {
+        KernelCtx::eager(phase, Arc::clone(self.dev.stream()))
+    }
+
+    /// 每发射一次核函数计一次(姿势 6 warmup 门禁)
+    fn note_launch(&self) {
+        self.dev.note_launch();
     }
 
     fn assert_same_shape<T: crate::tensor::Scalar, Dex: owl_iface::Device>(
@@ -139,7 +145,8 @@ impl OpsCtx {
         );
         let n = owl_iface::DevBuf::<T>::len(t);
         assert_eq!(n, src.len(), "fill_from_host: 长度不一致");
-        self.bind
+        self.dev
+            .ctx()
             .bind_to_thread()
             .map_err(|e| BackendError::Init(format!("{e:?}")))?;
         use owl_cuda::ffi::sys;
@@ -173,11 +180,12 @@ impl OpsCtx {
     {
         Self::assert_same_shape(a, b, out);
         ctx.trace_launch("add");
-        ctx.trace_buf(a.token().expect("token"));
-        ctx.trace_buf(b.token().expect("token"));
-        ctx.trace_buf(out.token().expect("token"));
+        self.note_launch();
+        owl_signal::emit(a.token().expect("token"));
+        owl_signal::emit(b.token().expect("token"));
+        owl_signal::emit(out.token().expect("token"));
         let n = owl_iface::DevBuf::<T>::len(a);
-        let stream = Arc::clone(&self.stream);
+        let stream = Arc::clone(ctx.stream());
         self.kernels
             .add_f32(
                 &stream,
@@ -203,11 +211,12 @@ impl OpsCtx {
     {
         Self::assert_same_shape(a, b, out);
         ctx.trace_launch("mul");
-        ctx.trace_buf(a.token().expect("token"));
-        ctx.trace_buf(b.token().expect("token"));
-        ctx.trace_buf(out.token().expect("token"));
+        self.note_launch();
+        owl_signal::emit(a.token().expect("token"));
+        owl_signal::emit(b.token().expect("token"));
+        owl_signal::emit(out.token().expect("token"));
         let n = owl_iface::DevBuf::<T>::len(a);
-        let stream = Arc::clone(&self.stream);
+        let stream = Arc::clone(ctx.stream());
         self.kernels
             .mul_f32(
                 &stream,
@@ -239,12 +248,13 @@ impl OpsCtx {
         D: owl_iface::Device,
     {
         ctx.trace_launch("softmax");
-        ctx.trace_buf(x.token().expect("token"));
-        ctx.trace_buf(out.token().expect("token"));
+        self.note_launch();
+        owl_signal::emit(x.token().expect("token"));
+        owl_signal::emit(out.token().expect("token"));
         assert_eq!(x.shape(), out.shape(), "softmax: out 形状不一致");
         let shape = x.shape();
         assert!(shape.len() == 2, "softmax: 一期仅 [rows, cols]");
-        let stream = Arc::clone(&self.stream);
+        let stream = Arc::clone(ctx.stream());
         self.kernels
             .softmax_f32(
                 &stream,
@@ -272,9 +282,10 @@ impl OpsCtx {
         D: owl_iface::Device,
     {
         ctx.trace_launch("rmsnorm");
-        ctx.trace_buf(x.token().expect("token"));
-        ctx.trace_buf(alpha.token().expect("token"));
-        ctx.trace_buf(out.token().expect("token"));
+        self.note_launch();
+        owl_signal::emit(x.token().expect("token"));
+        owl_signal::emit(alpha.token().expect("token"));
+        owl_signal::emit(out.token().expect("token"));
         assert_eq!(x.shape(), out.shape(), "rmsnorm: out 形状不一致");
         let shape = x.shape();
         assert!(shape.len() == 2, "rmsnorm: 一期仅 [rows, cols]");
@@ -283,7 +294,7 @@ impl OpsCtx {
             shape[1],
             "rmsnorm: alpha 长度须等于 last dim"
         );
-        let stream = Arc::clone(&self.stream);
+        let stream = Arc::clone(ctx.stream());
         self.kernels
             .rmsnorm_f32(
                 &stream,
@@ -315,9 +326,15 @@ impl OpsCtx {
         D: owl_iface::Device,
     {
         ctx.trace_launch("matmul");
-        ctx.trace_buf(a.token().expect("token"));
-        ctx.trace_buf(b.token().expect("token"));
-        ctx.trace_buf(out.token().expect("token"));
+        self.note_launch();
+        // workspace 是 cublas 节点的隐藏依赖(指针烘进 launch 参数):
+        // 捕获路径必须把它 emit 进租约(A5.2 池外原语预登记)
+        if let Some(t) = blas.workspace_token() {
+            owl_signal::emit(t);
+        }
+        owl_signal::emit(a.token().expect("token"));
+        owl_signal::emit(b.token().expect("token"));
+        owl_signal::emit(out.token().expect("token"));
         let sa = a.shape();
         let sb = b.shape();
         assert!(sa.len() == 2 && sb.len() == 2, "matmul: 一期仅 2D");
@@ -325,6 +342,9 @@ impl OpsCtx {
         let (k2, n) = (sb[0], sb[1]);
         assert_eq!(k, k2, "matmul: 内维不一致");
         assert_eq!(out.shape(), &[m, n], "matmul: out 形状应为 [M, N]");
+        // M1①:发射到 ctx 携带的流(eager = 设备主流;捕获 = 会话捕获流)——
+        // cublas 逐次 setStream,捕获期 GEMM 才能被烙进图(姿势 4 防线:
+        // workspace 已预钉,零懒分配)
         blas.matmul_f32(
             m,
             n,
@@ -332,6 +352,7 @@ impl OpsCtx {
             a.device_ptr() as *const f32,
             b.device_ptr() as *const f32,
             out.device_ptr() as *mut f32,
+            ctx.stream(),
         )
     }
 }
@@ -435,7 +456,7 @@ mod tests {
         let mut norm_out = pool.zeros_tensor::<f32>(&[M, N]).unwrap();
 
         // 装数(fill_from_host:EagerOnly,零分配)
-        let ctx = KernelCtx::eager(owl_iface::MemPhase::Idle);
+        let ctx = ops.ctx(owl_iface::MemPhase::Idle);
         ops.fill_from_host(&ctx, &mut w, &seed.vec(M * K)).unwrap();
         ops.fill_from_host(&ctx, &mut a, &seed.vec(K * N)).unwrap();
         ops.fill_from_host(&ctx, &mut bias, &seed.vec(M * N)).unwrap();
@@ -455,8 +476,8 @@ mod tests {
         let a_h = a.to_vec().unwrap();
         let mm = cpu_matmul(&w_h, &a_h, M, K, N);
         // 分级断言 2/3:add、silu
-        let add_gpu = add_out.to_vec().unwrap();
-        let silu_gpu = silu_out.to_vec().unwrap();
+        let _add_gpu = add_out.to_vec().unwrap();
+        let _silu_gpu = silu_out.to_vec().unwrap();
         // 分级断言 1:matmul
         let mm_gpu = mm_out.to_vec().unwrap();
         assert_close(&mm_gpu, &mm, 2e-3, 2e-3);
@@ -510,27 +531,28 @@ mod tests {
             })
             .unwrap();
 
-        let mut w = pool.zeros_tensor::<f32>(&[M, K]).unwrap();
-        let mut a = pool.zeros_tensor::<f32>(&[K, N]).unwrap();
+        let w = pool.zeros_tensor::<f32>(&[M, K]).unwrap();
+        let a = pool.zeros_tensor::<f32>(&[K, N]).unwrap();
         let mut mm_out = pool.zeros_tensor::<f32>(&[M, N]).unwrap();
         let mut silu_out = pool.zeros_tensor::<f32>(&[M, N]).unwrap();
 
         // eager:无痕迹
-        let eager = KernelCtx::eager(MemPhase::Idle);
+        let eager = ops.ctx(MemPhase::Idle);
         ops.silu(&eager, &mm_out, &mut silu_out).unwrap();
         assert!(eager.snapshot().is_none());
         assert!(!eager.recording());
 
         // 捕获:matmul → silu,launch 序列与触碰令牌全部留痕
         let recorder = CaptureRecorder::new();
-        let cap = KernelCtx::capturing(recorder.clone());
+        let cap = KernelCtx::capturing(recorder.clone(), dev.stream().clone());
         ops.matmul(&cap, &blas, &w, &a, &mut mm_out).unwrap();
         ops.silu(&cap, &mm_out, &mut silu_out).unwrap();
 
         let rec = cap.snapshot().expect("捕获态必有快照");
         assert_eq!(rec.launches, vec!["matmul", "silu"]);
         let touched: Vec<_> = rec.touched.iter().copied().collect();
-        assert_eq!(touched.len(), 4, "w/a/mm_out/silu_out 四个令牌");
+        // w/a/mm_out/silu_out + cublas workspace(隐藏依赖,M1①) = 5 个
+        assert_eq!(touched.len(), 5, "4 个链缓冲 + 1 个 workspace 令牌");
         assert!(touched.contains(&w.token().unwrap()));
         assert!(touched.contains(&a.token().unwrap()));
         assert!(touched.contains(&mm_out.token().unwrap()));
@@ -577,17 +599,17 @@ mod tests {
             })
             .unwrap();
 
-        let mut w = pool.zeros_tensor::<f32>(&[M, K]).unwrap();
-        let mut a = pool.zeros_tensor::<f32>(&[K, N]).unwrap();
-        let mut bias = pool.zeros_tensor::<f32>(&[M, N]).unwrap();
+        let w = pool.zeros_tensor::<f32>(&[M, K]).unwrap();
+        let a = pool.zeros_tensor::<f32>(&[K, N]).unwrap();
+        let bias = pool.zeros_tensor::<f32>(&[M, N]).unwrap();
         let mut mm_out = pool.zeros_tensor::<f32>(&[M, N]).unwrap();
         let mut add_out = pool.zeros_tensor::<f32>(&[M, N]).unwrap();
         let mut silu_out = pool.zeros_tensor::<f32>(&[M, N]).unwrap();
-        let mut alpha = pool.zeros_tensor::<f32>(&[N]).unwrap();
+        let alpha = pool.zeros_tensor::<f32>(&[N]).unwrap();
         let mut norm_out = pool.zeros_tensor::<f32>(&[M, N]).unwrap();
 
         let recorder = CaptureRecorder::new();
-        let cap = KernelCtx::capturing(recorder.clone());
+        let cap = KernelCtx::capturing(recorder.clone(), dev.stream().clone());
         ops.matmul(&cap, &blas, &w, &a, &mut mm_out).unwrap();
         ops.add(&cap, &mm_out, &bias, &mut add_out).unwrap();
         ops.silu(&cap, &add_out, &mut silu_out).unwrap();
@@ -595,6 +617,7 @@ mod tests {
 
         let rec = cap.snapshot().expect("捕获态必有快照");
         assert_eq!(rec.launches, vec!["matmul", "add", "silu", "rmsnorm"]);
+        // 8 个链缓冲 + cublas workspace(matmul 的隐藏依赖,M1①)
         let expected: BTreeSet<_> = [
             w.token(),
             a.token(),
@@ -604,6 +627,7 @@ mod tests {
             silu_out.token(),
             alpha.token(),
             norm_out.token(),
+            blas.workspace_token(),
         ]
         .into_iter()
         .flatten()

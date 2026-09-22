@@ -135,6 +135,7 @@ impl<T: Scalar> Tensor<T, CudaDevice> {
     }
 
     /// P 阶段:host → device 持久写入(权重装载)。(内部;经 PoolTensorOps)
+    #[allow(dead_code)] // 通用版;当前调用点走 Device trait 的 from_vec_tensor 直配路径
     fn from_vec_cuda(
         d: &CudaDevice,
         pool: &<CudaDevice as Device>::Pool,
@@ -193,7 +194,7 @@ impl<T: Scalar> crate::EagerOnly for Tensor<T, CudaDevice> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use owl_iface::{Pool, PoolConfig, PoolKind};
+    use owl_iface::{PoolConfig, PoolKind};
 
     fn dev() -> CudaDevice {
         CudaDevice::new(0).expect("需要 CUDA 设备")

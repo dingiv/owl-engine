@@ -203,6 +203,77 @@ impl Kernels {
         }
         Ok(())
     }
+
+    /// rope rotate-half:[rows, n_cols],pos: [rows] i64(token 位置),
+    /// theta_base 标量(裁决 3①:动态量 device 化,launch 无 htod)。
+    pub fn rope_f32(
+        &mut self,
+        stream: &CudaStream,
+        rows: usize,
+        n_cols: usize,
+        x: *const f32,
+        pos: *const i64,
+        out: *mut f32,
+        theta_base: f32,
+    ) -> Result<(), String> {
+        if n_cols == 0 || n_cols % 2 != 0 {
+            return Err(format!("rope: n_cols 必须为正偶数,得到 {n_cols}"));
+        }
+        let func = self.func("owl_rope_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let x_u = x as u64;
+        let pos_u = pos as u64;
+        let out_u = out as u64;
+        let cols = n_cols as i32;
+        unsafe {
+            let mut b = stream.launch_builder(&func);
+            b.arg(&x_u);
+            b.arg(&pos_u);
+            b.arg(&out_u);
+            b.arg(&cols);
+            b.arg(&theta_base);
+            b.launch(cfg).map_err(|e| format!("launch(rope): {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// embedding lookup:table [vocab, n_cols],ids [rows] i32,out [rows, n_cols]。
+    pub fn embedding_f32(
+        &mut self,
+        stream: &CudaStream,
+        rows: usize,
+        n_cols: usize,
+        table: *const f32,
+        ids: *const i32,
+        out: *mut f32,
+    ) -> Result<(), String> {
+        if n_cols == 0 {
+            return Ok(());
+        }
+        let func = self.func("owl_embedding_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let table_u = table as u64;
+        let ids_u = ids as u64;
+        let out_u = out as u64;
+        let cols = n_cols as i32;
+        unsafe {
+            let mut b = stream.launch_builder(&func);
+            b.arg(&table_u);
+            b.arg(&ids_u);
+            b.arg(&out_u);
+            b.arg(&cols);
+            b.launch(cfg).map_err(|e| format!("launch(embedding): {e}"))?;
+        }
+        Ok(())
+    }
 }
 
 // f16 封装:任务要求 add/mul f16(容差放宽);ptr 仍为裸指针
@@ -245,30 +316,31 @@ mod tests {
     use super::*;
     use owl_cuda::ffi::{CudaSlice, DevicePtr};
 
-    fn setup() -> (Arc<CudaContext>, Arc<CudaStream>, Kernels) {
+    pub(crate) fn setup() -> (Arc<CudaContext>, Arc<CudaStream>, Kernels) {
         let ctx = CudaContext::new(0).expect("需要 CUDA 设备");
-        let stream = ctx.default_stream();
+        // M1②:非阻塞流(与设备主流纪律一致;legacy 流不可捕获)
+        let stream = ctx.new_stream().expect("non-blocking 流");
         let k = Kernels::new(&ctx).expect("nvrtc 编译");
         (ctx, stream, k)
     }
 
-    fn htod_f32(stream: &Arc<CudaStream>, v: &[f32]) -> CudaSlice<f32> {
+    pub(crate) fn htod_f32(stream: &Arc<CudaStream>, v: &[f32]) -> CudaSlice<f32> {
         let mut s = stream.alloc_zeros::<f32>(v.len()).unwrap();
         stream.memcpy_htod(v, &mut s).unwrap();
         s
     }
 
-    fn dtoh_f32(stream: &Arc<CudaStream>, s: &CudaSlice<f32>) -> Vec<f32> {
+    pub(crate) fn dtoh_f32(stream: &Arc<CudaStream>, s: &CudaSlice<f32>) -> Vec<f32> {
         let mut out = vec![0f32; s.len()];
         stream.memcpy_dtoh(s, &mut out).unwrap();
         out
     }
 
     /// 固定种子 LCG(可复现输入;裁决 4)
-    const SEED: u64 = 20260922;
-    struct Lcg(u64);
+    pub(crate) const SEED: u64 = 20260922;
+    pub(crate) struct Lcg(pub(crate) u64);
     impl Lcg {
-        fn next_f32(&mut self) -> f32 {
+        pub(crate) fn next_f32(&mut self) -> f32 {
             self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             ((self.0 >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
         }
@@ -281,7 +353,7 @@ mod tests {
         p
     }
 
-    fn assert_close(a: &[f32], b: &[f32], abs: f32, what: &str) {
+    pub(crate) fn assert_close(a: &[f32], b: &[f32], abs: f32, what: &str) {
         assert!(
             a.len() == b.len()
                 && a.iter().zip(b).all(|(x, y)| (x - y).abs() <= abs + 1e-5 * y.abs().max(1.0)),
@@ -291,14 +363,14 @@ mod tests {
 
     #[test]
     fn binary_add_mul_f32() {
-        let (ctx, stream, mut k) = setup();
+        let (_ctx, stream, mut k) = setup();
         let mut rng = Lcg(SEED);
         let n = 4096;
         let a: Vec<f32> = (0..n).map(|_| rng.next_f32()).collect();
         let b: Vec<f32> = (0..n).map(|_| rng.next_f32()).collect();
         let da = htod_f32(&stream, &a);
         let db = htod_f32(&stream, &b);
-        let mut dc = stream.alloc_zeros::<f32>(n).unwrap();
+        let dc = stream.alloc_zeros::<f32>(n).unwrap();
 
         let (pa, _sa) = da.device_ptr(&stream);
         let (pb, _sb) = db.device_ptr(&stream);
@@ -322,12 +394,12 @@ mod tests {
 
     #[test]
     fn unary_silu_exp_gelu_f32() {
-        let (ctx, stream, mut k) = setup();
+        let (_ctx, stream, mut k) = setup();
         let mut rng = Lcg(SEED ^ 0xBEEF);
         let n = 2048;
         let a: Vec<f32> = (0..n).map(|_| rng.next_f32()).collect();
         let da = htod_f32(&stream, &a);
-        let mut dc = stream.alloc_zeros::<f32>(n).unwrap();
+        let dc = stream.alloc_zeros::<f32>(n).unwrap();
         let (pa, _sa) = da.device_ptr(&stream);
         let pc = slice_ptr(&dc, &stream);
 
@@ -356,13 +428,13 @@ mod tests {
 
     #[test]
     fn softmax_f32_last_dim() {
-        let (ctx, stream, mut k) = setup();
+        let (_ctx, stream, mut k) = setup();
         let mut rng = Lcg(SEED ^ 0xCAFE);
         let rows = 8;
         let cols = 512;
         let src: Vec<f32> = (0..rows * cols).map(|_| rng.next_f32() * 4.0).collect();
         let dsrc = htod_f32(&stream, &src);
-        let mut ddst = stream.alloc_zeros::<f32>(rows * cols).unwrap();
+        let ddst = stream.alloc_zeros::<f32>(rows * cols).unwrap();
         let (ps, _s1) = dsrc.device_ptr(&stream);
         let pd = slice_ptr(&ddst, &stream);
 
@@ -382,7 +454,7 @@ mod tests {
 
     #[test]
     fn rmsnorm_f32() {
-        let (ctx, stream, mut k) = setup();
+        let (_ctx, stream, mut k) = setup();
         let mut rng = Lcg(SEED ^ 0xD00D);
         let rows = 4;
         let cols = 256;
@@ -391,7 +463,7 @@ mod tests {
         let alpha: Vec<f32> = (0..cols).map(|i| 0.5 + 0.1 * i as f32).collect();
         let dsrc = htod_f32(&stream, &src);
         let dalpha = htod_f32(&stream, &alpha);
-        let mut ddst = stream.alloc_zeros::<f32>(rows * cols).unwrap();
+        let ddst = stream.alloc_zeros::<f32>(rows * cols).unwrap();
         let (ps, _s1) = dsrc.device_ptr(&stream);
         let pa = slice_ptr(&dalpha, &stream);
         let pd = slice_ptr(&ddst, &stream);
@@ -415,7 +487,7 @@ mod tests {
     /// f16 add:位型 u16 直接上卡,容差放宽(f16 精度)
     #[test]
     fn add_f16_bitpattern() {
-        let (ctx, stream, mut k) = setup();
+        let (_ctx, stream, mut k) = setup();
         let mut rng = Lcg(SEED ^ 0xF16);
         let n = 1024;
         let a: Vec<u16> = (0..n)
@@ -428,7 +500,7 @@ mod tests {
         stream.memcpy_htod(&a, &mut da).unwrap();
         let mut db = stream.alloc_zeros::<u16>(n).unwrap();
         stream.memcpy_htod(&b, &mut db).unwrap();
-        let mut dc = stream.alloc_zeros::<u16>(n).unwrap();
+        let dc = stream.alloc_zeros::<u16>(n).unwrap();
         let pa = slice_ptr(&da, &stream);
         let pb = slice_ptr(&db, &stream);
         let pc = slice_ptr(&dc, &stream);
@@ -476,5 +548,98 @@ mod tests {
             sign | ((exp + 127 - 15) << 23) | (man << 13)
         };
         f32::from_bits(bits)
+    }
+}
+
+#[cfg(test)]
+mod rope_embed_tests {
+    use super::tests::{dtoh_f32, htod_f32, setup, Lcg, SEED};
+    
+    use owl_cuda::ffi::DevicePtr;
+
+    /// rope rotate-half:CPU f64 参考(与 kernel 同公式)
+    fn rope_ref(x: &[f32], pos: &[i64], n_cols: usize, theta: f32) -> Vec<f64> {
+        let half = n_cols / 2;
+        let rows = pos.len();
+        let mut out = vec![0f64; rows * n_cols];
+        for (r, &p) in pos.iter().enumerate() {
+            for i in 0..half {
+                let inv_freq = (theta as f64).powf(-(2.0 * i as f64) / n_cols as f64);
+                let ang = p as f64 * inv_freq;
+                let (c, s) = (ang.cos(), ang.sin());
+                let x1 = x[r * n_cols + i] as f64;
+                let x2 = x[r * n_cols + i + half] as f64;
+                out[r * n_cols + i] = x1 * c - x2 * s;
+                out[r * n_cols + i + half] = x1 * s + x2 * c;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn rope_f32_rotate_half() {
+        let (ctx, stream, mut k) = setup();
+        let rows = 8;
+        let n_cols = 64;
+        let mut rng = Lcg(SEED);
+        let x: Vec<f32> = (0..rows * n_cols).map(|_| rng.next_f32()).collect();
+        let pos: Vec<i64> = (0..rows).map(|i| (i * 97) as i64).collect();
+
+        let dx = htod_f32(&stream, &x);
+        let mut dpos = stream.alloc_zeros::<i64>(rows).unwrap();
+        stream.memcpy_htod(&pos, &mut dpos).unwrap();
+        let dout = stream.alloc_zeros::<f32>(rows * n_cols).unwrap();
+
+        k.rope_f32(&stream, rows, n_cols, dx.device_ptr(&stream).0 as *const f32, dpos.device_ptr(&stream).0 as *const i64, dout.device_ptr(&stream).0 as *mut f32, 10000.0)
+            .unwrap();
+        ctx.synchronize().unwrap();
+
+        let got = dtoh_f32(&stream, &dout);
+        let want = rope_ref(&x, &pos, n_cols, 10000.0);
+        let max_diff = got
+            .iter()
+            .zip(&want)
+            .map(|(g, w)| ((*g as f64) - *w).abs())
+            .fold(0.0f64, f64::max);
+        assert!(max_diff < 1e-4, "rope 最大偏差 {max_diff}");
+    }
+
+    #[test]
+    fn embedding_f32_lookup() {
+        let (ctx, stream, mut k) = setup();
+        let vocab = 16;
+        let n_cols = 8;
+        let rows = 4;
+        let mut rng = Lcg(SEED + 1);
+        let table: Vec<f32> = (0..vocab * n_cols).map(|_| rng.next_f32()).collect();
+        let ids: Vec<i32> = vec![3, 0, 15, 7];
+
+        let dtable = htod_f32(&stream, &table);
+        let mut dids = stream.alloc_zeros::<i32>(rows).unwrap();
+        stream.memcpy_htod(&ids, &mut dids).unwrap();
+        let dout = stream.alloc_zeros::<f32>(rows * n_cols).unwrap();
+
+        k.embedding_f32(
+            &stream,
+            rows,
+            n_cols,
+            dtable.device_ptr(&stream).0 as *const f32,
+            dids.device_ptr(&stream).0 as *const i32,
+            dout.device_ptr(&stream).0 as *mut f32,
+        )
+        .unwrap();
+        ctx.synchronize().unwrap();
+
+        let got = dtoh_f32(&stream, &dout);
+        for (r, &id) in ids.iter().enumerate() {
+            let want = &table[id as usize * n_cols..(id as usize + 1) * n_cols];
+            let got_row = &got[r * n_cols..(r + 1) * n_cols];
+            for (c, (g, w)) in got_row.iter().zip(want).enumerate() {
+                assert!(
+                    (g - w).abs() <= 1e-6 + 1e-5 * w.abs(),
+                    "embedding row {r} col {c} (id={id}): {g} != {w}"
+                );
+            }
+        }
     }
 }
