@@ -280,10 +280,10 @@ pub trait Pool: Send + Sync {
 ///   drop 同样延迟;
 /// - 实现是否真的安全由各自测试兜底(iface 层提供验收用例模板)。
 pub trait Device: Clone + Send + Sync + 'static {
-    /// 持久域缓冲类型(权重/KV/图缓冲)
-    type Persistent<T: MemValue>: DevBuf<T>;
-    /// 暂存域缓冲类型(kernel 中间结果)
-    type Scratch<T: MemValue>: DevBuf<T>;
+    /// 持久域缓冲类型(权重/KV/图缓冲;Clone = 视图算子的浅拷贝基元)
+    type Persistent<T: MemValue>: DevBuf<T> + Clone;
+    /// 暂存域缓冲类型(kernel 中间结果;同上)
+    type Scratch<T: MemValue>: DevBuf<T> + Clone;
     /// 跨卡远端映射视图(A2.6 例外通道的窄口产物;本卡账本记账)
     type Remote<T: MemValue>: DevBuf<T>;
     /// 池对象类型

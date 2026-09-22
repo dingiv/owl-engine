@@ -428,7 +428,7 @@ mod tests {
     /// P 阶段一次性建齐全部缓冲;E 阶段纯使用零分配——裁决 5 运行时示范。
     #[test]
     fn chain_matmul_add_silu_rmsnorm_matches_cpu() {
-        let dev = CudaDevice::new(0).expect("需要 CUDA 设备");
+        let dev = CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
 
         // ---- P 阶段:池 + 全部缓冲(含 chain 中间量)一次性到位 ----
         let pool = dev
@@ -498,7 +498,7 @@ mod tests {
     /// (创建链缓冲时)暴露并透传 PoolExhausted。
     #[test]
     fn pool_exhaustion_surfaces_at_planning_phase() {
-        let dev = CudaDevice::new(0).expect("需要 CUDA 设备");
+        let dev = CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
         let pool = dev
             .create_pool(PoolConfig {
                 name: format!("t3-exhaust-{}", std::process::id()),
@@ -520,7 +520,7 @@ mod tests {
         const K: usize = 32;
         const N: usize = 16;
 
-        let dev = CudaDevice::new(0).expect("需要 CUDA 设备");
+        let dev = CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
         let mut ops = OpsCtx::new(&dev).unwrap();
         let blas = NnBlas::new(&dev).unwrap();
         let pool = dev
@@ -563,7 +563,7 @@ mod tests {
     /// 哨兵①:drop 后令牌注销 → validate=false(结构化发现替代 Xid 盲死)
     #[test]
     fn dropped_tensor_token_invalidated() {
-        let dev = CudaDevice::new(0).expect("需要 CUDA 设备");
+        let dev = CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
         let pool = dev
             .create_pool(PoolConfig {
                 name: "tok".into(),
@@ -588,7 +588,7 @@ mod tests {
         const K: usize = 64;
         const N: usize = 32;
 
-        let dev = CudaDevice::new(0).expect("需要 CUDA 设备");
+        let dev = CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
         let mut ops = OpsCtx::new(&dev).unwrap();
         let blas = NnBlas::new(&dev).unwrap();
         let pool = dev

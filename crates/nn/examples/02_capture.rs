@@ -60,7 +60,7 @@ fn run_chain<D: owl_iface::Device>(
 }
 
 fn main() {
-    let dev = CudaDevice::new(0).expect("需要 CUDA 设备");
+    let dev = CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
     println!("== owl 02_capture(M1):全链 [matmul|add|silu|rmsnorm] 单图捕获 ==");
 
     // ---- P 阶段 ----

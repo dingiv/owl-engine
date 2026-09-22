@@ -9,12 +9,23 @@ use owl_iface::{BufToken, DevBuf, MemValue};
 use std::sync::Arc;
 
 /// 持久域缓冲:P 阶段经池分配;drop 归账由 PoolBuf/CudaPoolBuf 负责。
-#[derive(Clone)]
+/// Clone 为手写(字段全 Clone,无需 T: Clone —— derive 会保守地误加界)
 pub struct Persistent<T: MemValue> {
     pub(crate) buf: Option<CudaPoolBuf>,
     pub(crate) len: usize,
     pub(crate) token: Option<BufToken>,
     pub(crate) _marker: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T: MemValue> Clone for Persistent<T> {
+    fn clone(&self) -> Self {
+        Self {
+            buf: self.buf.clone(),
+            len: self.len,
+            token: self.token,
+            _marker: std::marker::PhantomData,
+        }
+    }
 }
 
 impl<T: MemValue> Persistent<T> {
@@ -52,13 +63,23 @@ impl<T: MemValue> DevBuf<T> for Persistent<T> {
     }
 }
 
-/// 暂存域缓冲(允许 Capturing 相创建;归账同 Persistent)。
-#[derive(Clone)]
+/// 暂存域缓冲(允许 Capturing 相创建;归账同 Persistent)。手写 Clone 同上。
 pub struct Scratch<T: MemValue> {
     pub(crate) buf: Option<CudaPoolBuf>,
     pub(crate) len: usize,
     pub(crate) token: Option<BufToken>,
     pub(crate) _marker: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T: MemValue> Clone for Scratch<T> {
+    fn clone(&self) -> Self {
+        Self {
+            buf: self.buf.clone(),
+            len: self.len,
+            token: self.token,
+            _marker: std::marker::PhantomData,
+        }
+    }
 }
 
 impl<T: MemValue> Scratch<T> {

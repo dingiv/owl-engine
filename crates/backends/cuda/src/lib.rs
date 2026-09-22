@@ -23,6 +23,16 @@ pub(crate) mod pool;
 pub(crate) mod device;
 pub(crate) mod buffers;
 
+/// 测试/示例的设备序号(环境变量 `OWL_TEST_DEVICE`,默认 0)。
+/// 生产引擎与测试同卡会互相踩(kv cache 满载时测试抖动),
+/// CI/真机验证用 `OWL_TEST_DEVICE=2` 指到空闲卡。
+pub fn test_device_ordinal() -> usize {
+    std::env::var("OWL_TEST_DEVICE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
 pub use buffers::{Persistent, RemoteBuf, Scratch, VmmBuf};
 pub use device::{CudaBackend, CudaDevice};
 pub use governor::{Budget, LedgerSnapshot};
@@ -37,7 +47,7 @@ mod tests {
     use owl_iface::{Backend as _, DevBuf, Device as _, MemPhase, PoolConfig, PoolKind, Pool as _};
 
     fn make() -> CudaDevice {
-        CudaDevice::new(0).expect("需要 CUDA 设备")
+        CudaDevice::new(super::test_device_ordinal()).expect("需要 CUDA 设备")
     }
 
     fn scratch_pool(b: &CudaDevice, name: &str, bytes: u64) -> CudaPool {
@@ -113,7 +123,7 @@ mod tests {
     /// 强租约保证 replay 仍正确;图销毁后租约解,账本回基线。
     #[test]
     fn graph_lease_keeps_memory_alive_across_user_drop() {
-        let dev = CudaDevice::new(0).expect("需要 CUDA 设备");
+        let dev = CudaDevice::new(super::test_device_ordinal()).expect("需要 CUDA 设备");
         let pool = dev
             .create_pool(PoolConfig {
                 name: "lease-t".into(),
@@ -261,7 +271,7 @@ mod tests {
     /// 旧实现 retire 挂在用户句柄 drop 的 count==1 判定上,本顺序必挂。
     #[test]
     fn lease_survivor_drops_before_graph_token_stays_valid() {
-        let dev = CudaDevice::new(0).expect("需要 CUDA 设备");
+        let dev = CudaDevice::new(super::test_device_ordinal()).expect("需要 CUDA 设备");
         let pool = dev
             .create_pool(PoolConfig {
                 name: "lease-order".into(),

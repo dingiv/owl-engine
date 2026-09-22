@@ -13,21 +13,29 @@ use owl_cuda::ffi::CudaContext;
 use owl_cuda::CudaDevice;
 use owl_iface::{BackendError, Device, DevBuf, MemValue, Pool};
 
-/// 张量元素类型(一期 f32;f16 预留)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Dtype {
-    F32,
-    /// 预留:M3 接入(f16 kernel 与 cublas 路径齐备后启用)
-    F16,
-}
+pub use crate::dtype::Dtype;
+pub use crate::dtype::Scalar;
 
-/// 可入池标量:类型 ↔ Dtype 元数据桥
-pub trait Scalar: MemValue {
-    const DTYPE: Dtype;
-}
-
-impl Scalar for f32 {
-    const DTYPE: Dtype = Dtype::F32;
+/// S2 broadcast 右对齐检查:从右往左逐维配对,相等或目标维为 1 可播,
+/// 源维数不足左补 1。返回 Ok(()) 或结构化错误。
+pub(crate) fn broadcast_check(from: &[usize], to: &[usize]) -> Result<(), BackendError> {
+    if to.len() < from.len() {
+        return Err(BackendError::Init(format!(
+            "broadcast: 目标维数 {} < 源维数 {}(S2 右对齐)",
+            to.len(),
+            from.len()
+        )));
+    }
+    let off = to.len() - from.len();
+    for (i, &f) in from.iter().enumerate() {
+        let t = to[off + i];
+        if f != t && f != 1 {
+            return Err(BackendError::Init(format!(
+                "broadcast: 源维 {f} 不可播到目标维 {t}(S2:相等或源=1)"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// 存储域:持久(权重/KV,Idle 外 drop 延迟)或暂存(捕获期可创建)。
@@ -111,6 +119,87 @@ impl<T: Scalar, D: Device> Tensor<T, D> {
     /// 哨兵①:出生令牌(捕获期依赖记录;后端无账本则 None)
     pub fn token(&self) -> Option<BufToken> {
         self.token
+    }
+
+    // ---- T1 签名层:shape 视图算子(语义表 SEMANTICS S3:无惰性布局,
+    // 视图方法只做元数据;需要物理布局的 kernel 入口由算子层 assert)----
+
+    /// 维数
+    pub fn dims(&self) -> usize {
+        self.shape.len()
+    }
+
+    /// 重塑(元素数不变;不触设备,纯元数据)
+    pub fn reshape(&self, shape: &[usize]) -> Result<Self, BackendError> {
+        let n: usize = shape.iter().product();
+        if n != Self::elems(&self.shape) {
+            return Err(BackendError::Init(format!(
+                "reshape: 元素数不变约束 {n} != {}",
+                Self::elems(&self.shape)
+            )));
+        }
+        let mut out = self.clone_shallow();
+        out.shape = shape.to_vec();
+        Ok(out)
+    }
+
+    /// 转置最后两维(元数据;materialize 延迟到 kernel 入口,S3)
+    pub fn t2(&self) -> Result<Self, BackendError> {
+        self.transpose(self.dims() - 2, self.dims() - 1)
+    }
+
+    /// 任意两维转置(元数据;形状重排,不触设备)
+    pub fn transpose(&self, a: usize, b: usize) -> Result<Self, BackendError> {
+        let d = self.dims();
+        if a >= d || b >= d {
+            return Err(BackendError::Init(format!("transpose: 维越界 {a}/{b}/{d}")));
+        }
+        let mut s = self.shape.clone();
+        s.swap(a, b);
+        let mut out = self.clone_shallow();
+        out.shape = s;
+        Ok(out)
+    }
+
+    /// 窄切(第 dim 维取 [start, start+len))(元数据 + 指针偏移待 kernel 回填;
+    /// 编译口径:物理偏移视图在运行里程碑实现,当前只校验 shape)
+    pub fn narrow(&self, dim: usize, start: usize, len: usize) -> Result<Self, BackendError> {
+        let d = self.dims();
+        if dim >= d || start + len > self.shape[dim] {
+            return Err(BackendError::Init(format!(
+                "narrow: dim={dim} start={start} len={len} shape={:?}",
+                self.shape
+            )));
+        }
+        let mut s = self.shape.clone();
+        s[dim] = len;
+        let mut out = self.clone_shallow();
+        out.shape = s;
+        Ok(out)
+    }
+
+    /// 广播到目标 shape(S2 右对齐规则;元数据)
+    pub fn broadcast_as(&self, shape: &[usize]) -> Result<Self, BackendError> {
+        crate::tensor::broadcast_check(&self.shape, shape)?;
+        let mut out = self.clone_shallow();
+        out.shape = shape.to_vec();
+        Ok(out)
+    }
+
+    /// 浅拷贝(共享同一底层存储;视图算子的实现基元。
+    /// 活性由存储 Arc/租约兜底,克隆不触设备)
+    fn clone_shallow(&self) -> Self {
+        Self {
+            storage: match &self.storage {
+                Storage::Persistent(p) => Storage::Persistent(p.clone()),
+                Storage::Scratch(s) => Storage::Scratch(s.clone()),
+            },
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+            token: self.token,
+            ctx: self.ctx.clone(),
+            _dev: std::marker::PhantomData,
+        }
     }
 }
 
@@ -197,7 +286,7 @@ mod tests {
     use owl_iface::{PoolConfig, PoolKind};
 
     fn dev() -> CudaDevice {
-        CudaDevice::new(0).expect("需要 CUDA 设备")
+        CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备")
     }
 
     fn scratch_pool(d: &CudaDevice, bytes: u64) -> <CudaDevice as Device>::Pool {

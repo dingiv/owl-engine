@@ -68,7 +68,7 @@ impl Lcg {
 }
 
 fn main() {
-    let dev = CudaDevice::new(0).expect("需要 CUDA 设备");
+    let dev = CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
     println!("== owl 01_eager:统一显存管理下的 NN 链路 ==");
     println!("设备: {} ({:.1} GiB)", dev.desc().uuid, dev.desc().total_bytes as f64 / 2f64.powi(30));
 
