@@ -91,3 +91,19 @@ crates/engine/
    attention-rs 语义,搬运时按 owl-iface 的 DevBuf 契约重表达;
 4. **多卡**:xinfer 多进程 rank 拓扑与 owl A2.6 单进程多实例冲突,
    多卡语义延后到 M-运行之后的独立里程碑,先收编单卡路径。
+
+---
+
+## 七、施工日志
+
+- **2026-09-22 T1 第一刀**(`292a733`):dtype 面/语义表/视图算子签名层;
+  测试设备环境变量化(OWL_TEST_DEVICE)——根因修复与 8133 生产引擎同卡互踩;
+  千问普查产物 candle-api-mapping.md 入库。
+- **2026-09-22 T1 第二刀**(本提交,千问②施工+主 agent 复验):
+  contiguous/is_contiguous 恒等、to_dtype 签名锁定、sum/max/min/cat/stack
+  shape 校验真实+设备体 stub、TensorPoolOps 增 full_tensor/arange_tensor
+  (HostArith trait:f32/u8/u32/i64;Bf16/F16 无算术=无 host 模拟,S5)。
+- **观察项 O-1**:owl-cuda 图租约测试在多线程并发 capture/launch 时偶发
+  (~1/8 轮)失败,单测试二进制 10 轮 + 全 workspace 8 轮未能复现;
+  定性 = 双 context 并发图操作的 GPU 级竞态(测试环境,非引擎逻辑);
+  M-运行里程碑前须转单线程化验收或 context 级隔离。

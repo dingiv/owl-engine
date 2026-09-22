@@ -186,6 +186,134 @@ impl<T: Scalar, D: Device> Tensor<T, D> {
         Ok(out)
     }
 
+    /// 紧凑化(S3 语义:owl Tensor 恒紧凑布局,无惰性 layout,本方法恒等;
+    /// 返回共享同一存储的视图,不触设备)
+    pub fn contiguous(&self) -> Result<Self, BackendError> {
+        Ok(self.clone_shallow())
+    }
+
+    /// S3 语义:owl 无惰性布局,恒真
+    pub fn is_contiguous(&self) -> bool {
+        true
+    }
+
+    /// dtype 转换。编译先行口径:运行里程碑回填(转换 kernel 未移植),
+    /// 签名先行锁定调用面(对应 candle `to_dtype`)。
+    pub fn to_dtype<U: crate::dtype::Scalar>(&self) -> Result<Tensor<U, D>, BackendError> {
+        Err(BackendError::Init(
+            "to_dtype: 跨 dtype 转换 kernel 未回填(T1 签名层)".into(),
+        ))
+    }
+
+    /// 与自身同 shape 的清零张量(对应 candle `zeros_like`)。
+    /// 编译先行口径:T2 池直连工厂接通后回填(Tensor 暂不持有池引用)。
+    pub fn zeros_like(&self) -> Result<Self, BackendError> {
+        unimplemented!("T1 签名层:zeros_like 池引用接通待 T2")
+    }
+
+    // ---- T1 签名层:归约/组合算子(shape 校验真实,设备体待运行里程碑回填)----
+
+    /// 沿 dim 维求和,结果 shape = self.shape 且 shape[dim] = 1(语义同 candle sum)
+    pub fn sum(&self, dim: usize) -> Result<Self, BackendError> {
+        let d = self.dims();
+        if dim >= d {
+            return Err(BackendError::Init(format!("sum: dim 越界 {dim}/{d}")));
+        }
+        let mut s = self.shape.clone();
+        s[dim] = 1;
+        let mut out = self.clone_shallow();
+        out.shape = s;
+        unimplemented!("T1 签名层:kernel 回填待运行里程碑");
+    }
+
+    /// 沿 dim 维取最大,结果 shape = self.shape 且 shape[dim] = 1(语义同 candle max)
+    pub fn max(&self, dim: usize) -> Result<Self, BackendError> {
+        let d = self.dims();
+        if dim >= d {
+            return Err(BackendError::Init(format!("max: dim 越界 {dim}/{d}")));
+        }
+        let mut s = self.shape.clone();
+        s[dim] = 1;
+        let mut out = self.clone_shallow();
+        out.shape = s;
+        unimplemented!("T1 签名层:kernel 回填待运行里程碑");
+    }
+
+    /// 沿 dim 维取最小,结果 shape = self.shape 且 shape[dim] = 1(语义同 candle min)
+    pub fn min(&self, dim: usize) -> Result<Self, BackendError> {
+        let d = self.dims();
+        if dim >= d {
+            return Err(BackendError::Init(format!("min: dim 越界 {dim}/{d}")));
+        }
+        let mut s = self.shape.clone();
+        s[dim] = 1;
+        let mut out = self.clone_shallow();
+        out.shape = s;
+        unimplemented!("T1 签名层:kernel 回填待运行里程碑");
+    }
+
+    /// 沿 dim 维拼接(静态方法;语义同 candle cat:除 dim 外各维须一致,dtype 须一致)
+    pub fn cat(parts: &[&Self], dim: usize) -> Result<Self, BackendError> {
+        if parts.is_empty() {
+            return Err(BackendError::Init("cat: parts 为空".into()));
+        }
+        let ref_shape = parts[0].shape();
+        let d = ref_shape.len();
+        if dim >= d {
+            return Err(BackendError::Init(format!("cat: dim 越界 {dim}/{d}")));
+        }
+        for p in parts {
+            if p.shape().len() != d {
+                return Err(BackendError::Init(format!(
+                    "cat: 维数不一致 {:?} vs {:?}",
+                    p.shape(),
+                    ref_shape
+                )));
+            }
+            if p.dtype() != parts[0].dtype() {
+                return Err(BackendError::Init("cat: dtype 不一致(S1 禁隐式提升)".into()));
+            }
+            for i in 0..d {
+                if i != dim && p.shape()[i] != ref_shape[i] {
+                    return Err(BackendError::Init(format!(
+                        "cat: 非拼接维 {i} 长度不一致 {:?} vs {:?}",
+                        p.shape(),
+                        ref_shape
+                    )));
+                }
+            }
+        }
+        unimplemented!("T1 签名层:kernel 回填待运行里程碑");
+    }
+
+    /// 沿新 dim 维堆叠(静态方法;语义同 candle stack:各 part shape 须完全相同,
+    /// dim 为新维插入位置,允许 dim = dims(右端追加))
+    pub fn stack(parts: &[&Self], dim: usize) -> Result<Self, BackendError> {
+        if parts.is_empty() {
+            return Err(BackendError::Init("stack: parts 为空".into()));
+        }
+        let ref_shape = parts[0].shape();
+        if dim > ref_shape.len() {
+            return Err(BackendError::Init(format!(
+                "stack: dim 越界 {dim}/{}(新维插入位置)",
+                ref_shape.len()
+            )));
+        }
+        for p in parts {
+            if p.shape() != ref_shape {
+                return Err(BackendError::Init(format!(
+                    "stack: shape 不一致 {:?} vs {:?}",
+                    p.shape(),
+                    ref_shape
+                )));
+            }
+            if p.dtype() != parts[0].dtype() {
+                return Err(BackendError::Init("stack: dtype 不一致(S1 禁隐式提升)".into()));
+            }
+        }
+        unimplemented!("T1 签名层:kernel 回填待运行里程碑");
+    }
+
     /// 浅拷贝(共享同一底层存储;视图算子的实现基元。
     /// 活性由存储 Arc/租约兜底,克隆不触设备)
     fn clone_shallow(&self) -> Self {
@@ -364,12 +492,47 @@ mod tests {
 /// let s = pool.scratch_tensor::<f32>(&[M, N])?;    // 暂存域
 /// let w = pool.from_vec_tensor(&[M, K], host)?;    // host 装载
 /// ```
+/// host 侧可迭代算术(T1 工厂专用:arange_tensor 在 host 算好 vec 再装载;
+/// Bf16/F16 无算术语义(S5),不实现本 trait)
+pub trait HostArith: Scalar + Copy + core::ops::Add<Output = Self> {}
+impl HostArith for f32 {}
+impl HostArith for u8 {}
+impl HostArith for u32 {}
+impl HostArith for i64 {}
+
 pub trait TensorPoolOps: Pool {
     /// P 阶段:池内持久分配(清零)。Weights/KvCache/Workspace 池语义。
     fn zeros_tensor<T: Scalar>(
         &self,
         shape: &[usize],
     ) -> Result<Tensor<T, Self::Dev>, BackendError>;
+
+    /// P 阶段:常量填充张量(复用 from_vec_tensor;对应 candle `full`)
+    fn full_tensor<T: Scalar + Copy>(
+        &self,
+        shape: &[usize],
+        fill: T,
+    ) -> Result<Tensor<T, Self::Dev>, BackendError> {
+        let n: usize = shape.iter().product();
+        self.from_vec_tensor(shape, vec![fill; n])
+    }
+
+    /// P 阶段:等差序列 [start, start+step, ...)(长度 n,复用 from_vec_tensor;
+    /// 对应 candle `arange`)。T 须 host 可迭代算术(HostArith)。
+    fn arange_tensor<T: HostArith>(
+        &self,
+        start: T,
+        step: T,
+        n: usize,
+    ) -> Result<Tensor<T, Self::Dev>, BackendError> {
+        let mut v = Vec::with_capacity(n);
+        let mut x = start;
+        for _ in 0..n {
+            v.push(x);
+            x = x + step;
+        }
+        self.from_vec_tensor(&[n], v)
+    }
 
     /// P 阶段:池内暂存分配(清零;捕获期可创建)。Scratch 池语义。
     fn scratch_tensor<T: Scalar>(
@@ -384,6 +547,7 @@ pub trait TensorPoolOps: Pool {
         src: Vec<T>,
     ) -> Result<Tensor<T, Self::Dev>, BackendError>;
 }
+
 
 impl<P, D> TensorPoolOps for P
 where
