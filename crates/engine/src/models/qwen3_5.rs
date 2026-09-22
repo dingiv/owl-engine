@@ -43,10 +43,12 @@ pub struct InputMetadata {
     /// mamba slot 显式映射(I64;来源 runner)。None = 从 sequence_ids 解析。
     pub mamba_slot_mapping: Option<Tensor>,
     pub sequence_ids: Option<Vec<usize>>,
+    /// decode naive 路径设备指针对(来源 runner/graphplan view;None = eager/prefill)
+    pub decode_ptrs: Option<crate::models::layers::vendor::DecodePtrs>,
 }
 
 impl InputMetadata {
-    /// 投影为层接受的 vendor 面(丢弃模型私有字段)
+    /// 投影为层接受的 vendor 面(丢弃模型私有字段;decode 指针透传)
     fn vendor(&self) -> vendor::InputMetadata {
         vendor::InputMetadata {
             seqlens: self.seqlens.clone().unwrap_or_default(),
@@ -54,6 +56,7 @@ impl InputMetadata {
             is_prefill: self.is_prefill,
             is_mtp_verify: self.is_mtp_verify,
             cu_seqlens_q: None,
+            decode_ptrs: self.decode_ptrs,
         }
     }
 }
@@ -296,10 +299,10 @@ impl Qwen3_5ForCausalLM {
             );
         }
 
-        // S4:I64 仅 GGUF/边界(slot 语义);owl 侧 U32 化随 MambaCache 通道回填
-        let slots_i64 = slots.into_iter().map(|s| s as i64).collect::<Vec<_>>();
-        let len = slots_i64.len();
-        super::layers::ctor::from_vec(slots_i64, (len,), &self.device)
+        // S4:slot 语义 U32(I64 仅 GGUF 边界);full-attention 配置下仅形式参数
+        let slots_u32 = slots.into_iter().map(|s| s as u32).collect::<Vec<_>>();
+        let len = slots_u32.len();
+        super::layers::ctor::from_vec(slots_u32, (len,), &self.device)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -645,6 +648,7 @@ impl Qwen3_5ForCausalLM {
         let mut mamba_cache = self.mamba_cache.write();
 
         for (i, layer) in self.layers.iter().enumerate() {
+            eprintln!("[DRYDBG] layer {i} full={} xs.shape={:?}", layer.is_full_attention(), xs.shape());
             let cache = if layer.is_full_attention() {
                 kv_caches.map(|caches| {
                     let c = &caches[kv_cache_idx];
@@ -899,9 +903,12 @@ impl Qwen3_5ForCausalLM {
 
     pub fn get_mamba_slots_for_sequences(
         &self,
-        _sequence_ids: &[usize],
+        sequence_ids: &[usize],
     ) -> Result<Vec<usize>> {
-        unimplemented!("T3: MambaCache::get_slots_for_sequences 通道回填")
+        // dry-run/full-attention 配置:无 GDN 层时 mamba 槽仅为形式参数,
+        // 返回确定性 identity 槽(真 GDN 语义 = vendor::MambaCache,T3 回填)
+        eprintln!("[MDBG] get_mamba_slots ids={:?} -> identity", sequence_ids);
+        Ok((0..sequence_ids.len()).collect())
     }
 
     pub fn lock_mamba_cache_for_graph(&self) -> RwLockWriteGuard<'_, vendor::MambaCache> {
@@ -1021,12 +1028,13 @@ impl Qwen3_5ForCausalLM {
 /// KV cache 由 runner 在 P 阶段预分配(租约常驻);输入绑定句柄经
 /// [`Self::load_inputs`] 装填(依赖 graphplan 需求 R1,见 forward 内注)。
 /// verify 路径(dflash2/mtp)构造 `is_verify = true` 的第二个实例。
+#[derive(Clone)]
 pub struct DecodeGraphAdapter {
     model: std::sync::Arc<Qwen3_5ForCausalLM>,
     kv_caches: Vec<(Tensor, Tensor)>,
     vocab: usize,
     is_verify: bool,
-    inputs: std::sync::Mutex<Option<DecodeInputs>>,
+    inputs: std::sync::Arc<std::sync::Mutex<Option<DecodeInputs>>>,
 }
 
 /// 钉住的输入绑定句柄(R1 装填前的占位载体)
@@ -1051,7 +1059,7 @@ impl DecodeGraphAdapter {
             kv_caches,
             vocab,
             is_verify,
-            inputs: std::sync::Mutex::new(None),
+            inputs: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -1079,25 +1087,35 @@ impl DecodeGraphAdapter {
 
 impl crate::graphplan::GraphForward for DecodeGraphAdapter {
     fn forward(&self, ctx: &owl_nn::KernelCtx, view: &crate::graphplan::BindingsView) -> Result<()> {
-        let _ = ctx; // 层内 OwlTensor/ops 面消费(ctx scratch;T3 kernel 回填后)
+        // 层内 OwlTensor/ops 面消费:压入 ctx_scope 栈(candle 形态签名的桥)
+        let _push = crate::models::layers::ctx_scope::push(ctx);
+        // R1 正解:每次 forward 从 bindings 视图重装填(纯元数据构造,
+        // 零设备操作;bindings 由 GraphPlan 持有,生命周期覆盖图)
+        self.load_inputs(
+            owl_nn::DynTensor::from_raw_u32(view.frontier, &[view.bs]),
+            owl_nn::DynTensor::from_raw_u32(view.positions, &[view.bs]),
+            owl_nn::DynTensor::from_raw_u32(view.slot_mapping, &[view.bs]),
+            owl_nn::DynTensor::from_raw_u32(view.kv_lens, &[view.bs]),
+        );
         let g = self.inputs.lock().map_err(|_| Error::Msg("inputs 锁中毒".into()))?;
-        let inp = g.as_ref().ok_or_else(|| {
-            Error::Msg(
-                "R1(graphplan 需求): GraphBindings 需暴露五字段 DynTensor 句柄(或 DynTensor::from_raw 视图构造);装填前 decode 图不可捕获".into(),
-            )
-        })?;
+        let inp = g.as_ref().ok_or_else(|| Error::Msg("inputs 装填失败".into()))?;
         let meta = InputMetadata {
-            seqlens: Some(vec![view.bs]),
+            seqlens: Some(vec![1; view.bs]), // xinfer decode 语义:每序列 1 token
             is_prefill: false, // decode-only 先行;prefill 保持 eager(与 xinfer 语义一致)
             is_mtp_verify: self.is_verify,
             mamba_slot_mapping: None,
             sequence_ids: Some((0..view.bs).collect()),
+            decode_ptrs: Some(crate::models::layers::vendor::DecodePtrs {
+                slots: view.slot_mapping as *const i32,   // u32 位型直读,值域 <2^31
+                kv_lens: view.kv_lens as *const i32,
+            }),
         };
         let logits =
             self.model
                 .forward(&inp.frontier, &inp.positions, Some(&self.kv_caches), &meta, false)?;
         // R2(nn 需求):logits(scratch 张量)D2D 直写 view.logits_out
         // (采样同址读,零 D2H)。当前 nn 面缺 copy_d2d(src,&dst_ptr,n)。
+        eprintln!("[DRYDBG] frontier.shape={:?} logits.shape={:?}", inp.frontier.shape(), logits.shape());
         let logits_elems = logits.len_bytes() / std::mem::size_of::<f32>();
         let expect = view.bs * view.vocab;
         if logits_elems != expect {

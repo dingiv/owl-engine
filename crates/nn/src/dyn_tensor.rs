@@ -31,6 +31,9 @@ pub struct DynTensor<D: Device> {
 }
 
 enum DynKeepalive<D: Device> {
+    /// 视图构造(from_raw):无保活——调用方保证缓冲存活
+    /// (bindings 由 GraphPlan 持有,生命周期覆盖图)。
+    Raw,
     F32(Tensor<f32, D>),
     F16(Tensor<crate::dtype::F16, D>),
     Bf16(Tensor<crate::dtype::Bf16, D>),
@@ -86,6 +89,28 @@ typed_getter!(typed_u32, u32, U32, Dtype::U32, "typed_u32");
 typed_getter!(typed_i64, i64, I64, Dtype::I64, "typed_i64");
 
 impl<D: Device> DynTensor<D> {
+    /// R1:裸指针视图构造(无保活;shape = 逻辑形状)。
+    /// 仅 bindings 类长期缓冲使用(存活方 = GraphPlan)。
+    pub fn from_raw_u32(ptr: *mut u32, shape: &[usize]) -> Self {
+        Self {
+            ptr: ptr as *mut u8,
+            shape: shape.to_vec(),
+            dtype: Dtype::U32,
+            len_bytes: shape.iter().product::<usize>() * 4,
+            token: None,
+            _keepalive: DynKeepalive::Raw,
+        }
+    }
+    pub fn from_raw_f32(ptr: *mut f32, shape: &[usize]) -> Self {
+        Self {
+            ptr: ptr as *mut u8,
+            shape: shape.to_vec(),
+            dtype: Dtype::F32,
+            len_bytes: shape.iter().product::<usize>() * 4,
+            token: None,
+            _keepalive: DynKeepalive::Raw,
+        }
+    }
     erase_ctor!(from_f32, f32, F32, Dtype::F32);
     erase_ctor!(from_f16, crate::dtype::F16, F16, Dtype::F16);
     erase_ctor!(from_bf16, crate::dtype::Bf16, Bf16, Dtype::BF16);
@@ -141,6 +166,8 @@ impl<D: Device> DynTensor<D> {
         let n: usize = shape.iter().product();
         let elems: usize = self.shape.iter().product();
         if n != elems {
+            let bt = std::backtrace::Backtrace::force_capture();
+            eprintln!("[RDBG] DynTensor::reshape 元素数 {n} != {elems} shape={:?}\n{bt}", self.shape);
             return Err(BackendError::Init(format!(
                 "DynTensor::reshape: 元素数 {n} != {elems}"
             )));
@@ -193,6 +220,7 @@ impl<'a, T: MemValue, D: Device> TensorRef<'a, T, D> {
 impl<D: Device> Clone for DynKeepalive<D> {
     fn clone(&self) -> Self {
         match self {
+            DynKeepalive::Raw => DynKeepalive::Raw,
             DynKeepalive::F32(t) => DynKeepalive::F32(t.clone()),
             DynKeepalive::F16(t) => DynKeepalive::F16(t.clone()),
             DynKeepalive::Bf16(t) => DynKeepalive::Bf16(t.clone()),

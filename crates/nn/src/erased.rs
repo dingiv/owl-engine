@@ -159,7 +159,13 @@ pub fn rmsnorm(
 ) -> Result<DynTensor<CudaDevice>, BackendError> {
     require_f32(x.dtype(), "rmsnorm")?;
     require_f32(alpha.dtype(), "rmsnorm")?;
-    if x.shape().len() != 2 {
+    // 1D 输入视作 [1, n](decode 单 token 常态)
+    let x2: Vec<usize> = if x.shape().len() == 1 {
+        vec![1, x.shape()[0]]
+    } else {
+        x.shape().to_vec()
+    };
+    if x2.len() != 2 {
         return Err(BackendError::Init(format!(
             "erased::rmsnorm: 一期仅 2D,得 {:?}",
             x.shape()
@@ -175,13 +181,12 @@ pub fn rmsnorm(
             owl_signal::emit(t);
         }
     }
-    let shape = x.shape();
     let stream = std::sync::Arc::clone(ctx.stream());
     ops.kernels()
         .rmsnorm_f32(
             &stream,
-            shape[0],
-            shape[1],
+            x2[0],
+            x2[1],
             rx.device_ptr(),
             ralpha.device_ptr(),
             out.device_ptr(),
@@ -203,6 +208,8 @@ pub fn matmul(
     require_f32(b.dtype(), "matmul")?;
     let (sa, sb) = (a.shape(), b.shape());
     if sa.len() != 2 || sb.len() != 2 || sa[1] != sb[0] {
+        let bt = std::backtrace::Backtrace::force_capture();
+        eprintln!("[MMDBG] {sa:?} x {sb:?}\n{bt}");
         return Err(BackendError::Init(format!(
             "erased::matmul: 形状不兼容 {sa:?} × {sb:?}(一期 2D,内积维须相等)"
         )));
@@ -546,6 +553,8 @@ pub fn index_select(
 ) -> Result<DynTensor<CudaDevice>, BackendError> {
     require_f32(src.dtype(), "index_select")?;
     if idx.dtype() != Dtype::U32 {
+        let bt = std::backtrace::Backtrace::force_capture();
+        eprintln!("[IDXDBG] idx dtype {} shape={:?}\n{bt}", idx.dtype(), idx.shape());
         return Err(BackendError::Init(format!(
             "index_select: 索引 dtype {} ≠ U32(S4)",
             idx.dtype()

@@ -62,6 +62,13 @@ pub struct NnBlas {
     ws: BlasWorkspace,
 }
 
+// cublas 句柄是裸指针(不自动 Send/Sync);Rig/dry-run 单线程持有
+// (A2.6:每 runner 线程一套实例,句柄随线程 bind_to_thread)。
+// SAFETY:cublasContext * 在 bind_to_thread 后的持有线程内使用,
+// 所有调用点单线程;不跨线程转移句柄所有权。
+unsafe impl Send for NnBlas {}
+unsafe impl Sync for NnBlas {}
+
 impl NnBlas {
     /// workspace 令牌(捕获路径 emit 进租约,见 [`BlasWorkspace::token`])
     pub fn workspace_token(&self) -> Option<owl_iface::BufToken> {

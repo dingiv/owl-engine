@@ -50,7 +50,9 @@ pub struct TrackingHandle {
 
 impl Drop for TrackingHandle {
     fn drop(&mut self) {
-        STACK.with(|s| {
+        // try_with:线程析构期访问 TLS 会 AccessError——此时追踪已无意义,
+        // 静默放弃(2026-09-22 dry-run 线程退出 abort 事故的修复)
+        let _ = STACK.try_with(|s| {
             let mut stack = s.borrow_mut();
             if stack.last().map(|f| f.id) == Some(self.frame.id) {
                 stack.pop();
@@ -73,7 +75,8 @@ pub fn enter(sink: Sink) -> TrackingHandle {
 /// 发射一个 token:栈非空 → 路由到最内层作用域的 sink;
 /// 栈空(untracked,如 E 阶段)→ **no-op**,零分配零锁。
 pub fn emit(t: Token) {
-    STACK.with(|s| {
+    // try_with:同 Drop——线程析构期 emit = 追踪窗口已关,no-op
+    let _ = STACK.try_with(|s| {
         if let Some(frame) = s.borrow().last() {
             (Arc::clone(&frame.sink))(t);
         }

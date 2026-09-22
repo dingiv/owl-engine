@@ -87,6 +87,7 @@ impl ReplicatedLinear {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        eprintln!("[TPDBG] row-linear x.shape={:?}", x.shape());
         self.inner.forward(x)
     }
 
@@ -137,6 +138,7 @@ impl TensorParallelColumnLinear {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        eprintln!("[TPDBG] row-linear x.shape={:?}", x.shape());
         self.inner.forward(x)
     }
 
@@ -226,13 +228,32 @@ impl MergedParallelColumnLinear {
         super::ops::cat(&parts, dim)
     }
 
-    /// 打包权重本地构造(= xinfer from_packed_local;切片切割 T3 loader 回填)
+    /// 打包权重本地构造(= xinfer from_packed_local)。
+    /// dry-run 实装:weight [out_total, in_dim] 按 splits 逐段 narrow_dim0
+    /// (DynTensor 指针级偏移视图)→ Linear 无偏线性;bias 切片同理。
     pub fn from_packed_local(
-        _weight: Tensor,
-        _bias: Option<Tensor>,
-        _splits: Vec<usize>,
+        weight: Tensor,
+        bias: Option<Tensor>,
+        splits: Vec<usize>,
     ) -> Result<Self> {
-        unimplemented!("T3: from_packed_local(loader 切片切割回填)")
+        let in_dim = *weight.shape().last().ok_or_else(|| {
+            crate::Error::Msg("from_packed_local: 空 weight".into())
+        })?;
+        let mut linears = Vec::with_capacity(splits.len());
+        let mut start = 0usize;
+        for out in splits {
+            let w_part = weight.narrow_dim0(start, out)?;
+            let b_part = match &bias {
+                Some(b) => Some(b.narrow_dim0(start, out)?),
+                None => None,
+            };
+            let inner = crate::models::layers::linear::LinearX::Linear(
+                crate::models::layers::linear::Linear::new(w_part, b_part),
+            );
+            linears.push(TensorParallelColumnLinear { inner });
+            start += out;
+        }
+        Ok(Self { linears })
     }
 
     /// 分块合并装载(= xinfer load_merged_chunks;逐段 linear_b_x)

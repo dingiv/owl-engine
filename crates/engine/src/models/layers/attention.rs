@@ -25,29 +25,65 @@ use std::sync::Arc;
 mod missing_shims {
     use super::{Result, Tensor};
 
-    /// candle `Tensor::cat`(沿 dim 拼接)
-    pub fn cat(_ts: &[Tensor], _dim: usize) -> Result<Tensor> {
-        unimplemented!("T3: Tensor::cat(missing_shims;需求已上报)")
+    /// 标量常量 → 池内 [1] f32 张量(dry-run 装载基元)
+    fn const_tensor(v: f32) -> Result<Tensor> {
+        let pool = crate::models::layers::ctx_scope::weights_pool();
+        let t = owl_nn::TensorPoolOps::from_vec_tensor(pool.as_ref(), &[1], vec![v])?;
+        Ok(owl_nn::DynTensor::from_f32(&t))
     }
-    /// candle `Tensor::flatten(from,to)`(二维区间展平)
-    pub fn flatten(_t: &Tensor, _from: usize, _to: usize) -> Result<Tensor> {
-        unimplemented!("T3: Tensor::flatten(missing_shims)")
+    /// candle `Tensor::cat`(沿 dim 拼接)→ erased::cat
+    pub fn cat(ts: &[Tensor], dim: usize) -> Result<Tensor> {
+        crate::models::layers::ctx_scope::with(|_ops, ctx| {
+            owl_nn::erased::cat(ctx, ts, dim).map_err(Into::into)
+        })
     }
-    /// candle `mean_keepdim(D::Minus1)`(末维均值保维)
-    pub fn mean_keepdim_last(_t: &Tensor) -> Result<Tensor> {
-        unimplemented!("T3: Tensor::mean_keepdim(missing_shims)")
+    /// candle `Tensor::flatten(from,to)`(全区间展平 = [elems])
+    pub fn flatten(t: &Tensor, _from: usize, _to: usize) -> Result<Tensor> {
+        let n: usize = t.shape().iter().product();
+        t.reshape(&[n]).map_err(Into::into)
     }
-    /// candle `expand`(广播复制到目标 shape)
-    pub fn expand(_t: &Tensor, _shape: &[usize]) -> Result<Tensor> {
-        unimplemented!("T3: Tensor::expand(missing_shims)")
+    /// candle `mean_keepdim(D::Minus1)`(末维均值保维)→ sum_dim + 标量乘
+    pub fn mean_keepdim_last(t: &Tensor) -> Result<Tensor> {
+        crate::models::layers::ctx_scope::with(|ops, ctx| {
+            let d = *t.shape().last().ok_or_else(|| {
+                crate::Error::Msg("mean_keepdim_last: 空形状".into())
+            })? as f32;
+            let s = owl_nn::erased::sum_dim(ops, ctx, t, t.shape().len() - 1)
+                .map_err(crate::Error::from)?;
+            let inv_t = ctx.scratch_tensor::<f32>(&[1])?;
+            let inv = owl_nn::DynTensor::from_f32(&inv_t);
+            owl_nn::erased::copy_d2d_to_raw(
+                ctx,
+                &const_tensor(1.0f32 / d)?,
+                inv.device_ptr() as *mut core::ffi::c_void,
+                4,
+            )?;
+            owl_nn::erased::mul(ops, ctx, &s, &inv).map_err(crate::Error::from)
+        })
+        .map_err(Into::into)
     }
-    /// candle `broadcast_add(rhs_scalar_tensor)` 的标量便捷面
-    pub fn broadcast_add_const(_t: &Tensor, _v: f64) -> Result<Tensor> {
-        unimplemented!("T3: Tensor::broadcast_add_const(missing_shims)")
+    /// candle `expand`(广播到目标 shape;元数据视图)
+    pub fn expand(t: &Tensor, shape: &[usize]) -> Result<Tensor> {
+        crate::models::layers::OwlTensor::broadcast_as(t, shape)
     }
-    /// candle `dims3()`
-    pub fn dims3(_t: &Tensor) -> Result<(usize, usize, usize)> {
-        unimplemented!("T3: Tensor::dims3(missing_shims)")
+    /// candle `broadcast_add(rhs_scalar_tensor)` 的标量便捷面(标量=[1] 张量)
+    pub fn broadcast_add_const(t: &Tensor, v: f64) -> Result<Tensor> {
+        crate::models::layers::ctx_scope::with(|ops, ctx| {
+            let one_t = ctx.scratch_tensor::<f32>(&[1])?;
+            let one = owl_nn::DynTensor::from_f32(&one_t);
+            owl_nn::erased::copy_d2d_to_raw(
+                ctx,
+                &const_tensor(v as f32)?,
+                one.device_ptr() as *mut core::ffi::c_void,
+                4,
+            )?;
+            owl_nn::erased::broadcast_add(ops, ctx, t, &one).map_err(crate::Error::from)
+        })
+        .map_err(Into::into)
+    }
+    /// candle `dims3()`(元数据)
+    pub fn dims3(t: &Tensor) -> Result<(usize, usize, usize)> {
+        crate::models::layers::OwlTensor::dims3(t)
     }
     /// candle `get_llama4_attn_scale`(utils 自由函数;位置相关注意力缩放)
     pub fn llama4_attn_scale(
@@ -64,35 +100,84 @@ mod pa_shim {
     use super::vendor::InputMetadata;
     use super::{Result, Tensor};
 
-    pub struct PagedAttention;
+    /// decode naive 路径垫片(dry-run;真核 = attention-rs port,K2 后替换)。
+    /// KV 布局:flat [max_slots, Hkv*D](slot 直排,与 dry_kernels 核一致);
+    /// slots/kv_lens = bindings 设备指针(u32 位型 = i32,值域 <2^31)。
+    pub struct PagedAttention {
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    }
 
     impl PagedAttention {
         #[allow(clippy::too_many_arguments)]
         pub fn new(
-            _num_heads: usize,
-            _head_dim: usize,
+            num_heads: usize,
+            head_dim: usize,
             _scale: f32,
-            _num_kv_heads: Option<usize>,
+            num_kv_heads: Option<usize>,
             _sliding_window: Option<usize>,
             _device: Option<()>,
             _fp8_kvcache: bool,
         ) -> Result<Self> {
-            unimplemented!("T3: PagedAttention::new(attention-rs kernel port)")
+            Ok(Self {
+                num_heads,
+                num_kv_heads: num_kv_heads.unwrap_or(num_heads),
+                head_dim,
+            })
         }
 
         #[allow(clippy::too_many_arguments)]
         pub fn forward(
             &self,
-            _q: &Tensor,
-            _k: &Tensor,
-            _v: &Tensor,
+            q: &Tensor,
+            k: &Tensor,
+            v: &Tensor,
             _mask: Option<&Vec<Tensor>>,
-            _k_cache: Option<Tensor>,
-            _v_cache: Option<Tensor>,
-            _meta: &InputMetadata,
+            k_cache: Option<Tensor>,
+            v_cache: Option<Tensor>,
+            meta: &InputMetadata,
             _softcap: Option<f64>,
         ) -> Result<Tensor> {
-            unimplemented!("T3: PagedAttention::forward(attention-rs kernel port)")
+            // decode-only:seq_len = bs;prefill 保持 eager(与 xinfer 语义一致,
+            // warmup 也走 decode 形态的 seq_len=1 输入)
+            let (seq_len, _hq, d) = crate::models::layers::OwlTensor::dims3(q)?;
+            let _ = (_hq, d);
+            let (ptrs, kc, vc) = match (&meta.decode_ptrs, k_cache, v_cache) {
+                (Some(p), Some(kc), Some(vc)) => (p, kc, vc),
+                _ => crate::bail!(
+                    "pa_shim: decode 需要 meta.decode_ptrs + kv cache 对(空跑面;prefill eager 另案)"
+                ),
+            };
+            crate::models::layers::ctx_scope::with_dry(|ctx, dry| {
+                let out_t = ctx.scratch_tensor::<f32>(&[seq_len, self.num_heads * self.head_dim])?;
+                let out = owl_nn::DynTensor::from_f32(&out_t);
+                let kv_lens_i32 = meta
+                    .context_lens
+                    .first()
+                    .copied()
+                    .unwrap_or(1) as i32;
+                let _ = kv_lens_i32; // kv_lens 走设备指针(bindings),host 值不参与
+                dry.naive_decode_attn_f32(
+                    ctx.stream(),
+                    q.device_ptr() as *const f32,
+                    k.device_ptr() as *const f32,
+                    v.device_ptr() as *const f32,
+                    kc.device_ptr() as *mut f32,
+                    vc.device_ptr() as *mut f32,
+                    ptrs.slots,
+                    ptrs.kv_lens,
+                    out.device_ptr() as *mut f32,
+                    seq_len,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                )
+                .map_err(|e| crate::Error::Msg(format!("naive_decode_attn: {e}")))?;
+                ctx.trace_launch("naive_decode_attn");
+                eprintln!("[ATTDBG] naive out={:?} q={:?}", out.shape(), q.shape());
+                Ok(out)
+            })
         }
     }
 }
@@ -802,7 +887,9 @@ impl Attention {
             input_metadata,
             self.softcapping,
         )?;
-        let y = y.reshape((seq_len,))?;
+        // FIX:原误植 (seq_len,) 会把 [seq, hidden] 压成 1 元素
+        //(xinfer 原码无此 reshape;语义 = 展平到 hidden 维)
+        let y = y.reshape((seq_len, self.num_heads * self.head_dim))?;
 
         let y = if let Some(gate) = gate {
             let gate = if gate.dtype() != y.dtype() {

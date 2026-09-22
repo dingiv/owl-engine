@@ -123,7 +123,10 @@ impl MLP {
                     // Qwen3.5 swiglu-limit 变体(限制因子钳制;kernel 回填点)
                     bail!("swiglu_limit 变体:T3 kernel 回填")
                 }
-                ops::silu_and_mul(&ops::cat(&[gate.broadcast_mul(&up)?, up.clone()], 0)?)
+                // Qwen3.5 swiglu = silu(gate) ⊙ up(逐元素;S1 同型)
+                // FIX:原 cat([gate*up, up], 0) 组合为搬运捏造,维度语义错误
+                let g = ops::silu(&gate)?;
+                g.broadcast_mul(&up)
             }
             Activation::Gelu => {
                 let g = gate.gelu()?;

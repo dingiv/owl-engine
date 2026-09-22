@@ -109,7 +109,12 @@ impl ApplyRotaryEmbedding for RotaryEmbedding {
         // Full rotary embedding - use fused kernel with position selection
         // Pass full cos/sin tables and positions - kernel selects on-the-fly
         // This eliminates the index_select kernel launch!
-        vendor::fused_rope::apply_inplace(q, k, &self.cos, &self.sin, positions, self.is_rope_i)?;
+        let (_t, q_heads, head_dim) = q.dims3()?;
+        let (_kt, k_heads, _kd) = k.dims3()?;
+        vendor::fused_rope::apply_inplace(
+            q, k, &self.cos, &self.sin, positions, self.is_rope_i,
+            q_heads, k_heads, head_dim,
+        )?;
         Ok(None)
     }
 

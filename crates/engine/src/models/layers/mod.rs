@@ -51,8 +51,12 @@ pub mod moe;
 //pub mod wna16;
 
 use crate::error::{Error, Result};
+use owl_iface::BackendError;
 use owl_cuda::CudaDevice;
 use owl_nn::DynTensor;
+use owl_nn::erased;
+
+pub mod ctx_scope;
 
 // ============================================================================
 // 基础类型别名(对应 candle_core 词汇面)
@@ -149,9 +153,24 @@ pub enum D {
 }
 
 /// 维度索引约束(= candle `Dim`;usize 与 D 均可作 dim 参数)。
-pub trait Dim: Copy + Sized {}
-impl Dim for usize {}
-impl Dim for D {}
+pub trait Dim: Copy + Sized {
+    fn resolve_dim(self, rank: usize) -> std::result::Result<usize, String>;
+}
+impl Dim for usize {
+    fn resolve_dim(self, rank: usize) -> std::result::Result<usize, String> {
+        if self < rank { Ok(self) } else { Err(format!("dim {self} 越界(rank={rank})")) }
+    }
+}
+impl Dim for D {
+    fn resolve_dim(self, rank: usize) -> std::result::Result<usize, String> {
+        let off = match self {
+            D::Minus1 => 1,
+            D::Minus2 => 2,
+            D::Minus3 => 3,
+        };
+        if rank >= off { Ok(rank - off) } else { Err(format!("D::{self:?} 越界(rank={rank})")) }
+    }
+}
 
 // ============================================================================
 // OwlTensor:张量算子扩展(方法体 T3 回填;调用点语法与 candle 一致)
@@ -258,144 +277,481 @@ fn t3_unimpl(_name: &str) -> ! {
 }
 
 impl OwlTensor for Tensor {
-    // 所有设备体 = T3 kernel 回填(编译先行口径);控制流骨架由调用方保留。
-    fn reshape(&self, _shape: impl Into<Shape>) -> Result<Tensor> { t3_unimpl("reshape") }
-    fn narrow(&self, _dim: impl Dim, _start: usize, _len: usize) -> Result<Tensor> {
-        t3_unimpl("narrow")
+    // S6 垫片:candle 形态签名 → ctx_scope TLS 消费 (OpsCtx, NnBlas, DryKernels, ctx)
+    // → owl_nn::erased 真实实现(f32)/ dry-kernels naive 核;元数据类不触设备。
+
+    fn reshape(&self, shape: impl Into<Shape>) -> Result<Tensor> {
+        let target = shape.into();
+        let n: usize = target.dims().iter().product();
+        let have: usize = self.shape().iter().product();
+        if n != have {
+            let bt = std::backtrace::Backtrace::force_capture();
+            eprintln!("[RSHP-DBG] have={have} target={n} shape={:?}\n{bt}", self.shape());
+        }
+        Ok(DynTensor::reshape(self, &target.dims()[..])?)
     }
-    fn transpose(&self, _d1: impl Dim, _d2: impl Dim) -> Result<Tensor> { t3_unimpl("transpose") }
-    fn t(&self) -> Result<Tensor> { t3_unimpl("t") }
-    fn t2(&self) -> Result<Tensor> { t3_unimpl("t2") }
-    fn unsqueeze(&self, _dim: impl Dim) -> Result<Tensor> { t3_unimpl("unsqueeze") }
-    fn squeeze(&self, _dim: impl Dim) -> Result<Tensor> { t3_unimpl("squeeze") }
-    fn contiguous(&self) -> Result<Tensor> { t3_unimpl("contiguous") }
-    fn broadcast_as(&self, _shape: impl Into<Shape>) -> Result<Tensor> { t3_unimpl("broadcast_as") }
-    fn chunk(&self, _c: usize, _dim: impl Dim) -> Result<Vec<Tensor>> { t3_unimpl("chunk") }
-    fn split(&self, _s: usize, _dim: impl Dim) -> Result<Vec<Tensor>> { t3_unimpl("split") }
-    fn select(&self, _dim: impl Dim, _i: usize) -> Result<Tensor> { t3_unimpl("select") }
-    fn add(&self, _r: &Tensor) -> Result<Tensor> { t3_unimpl("add") }
-    fn sub(&self, _r: &Tensor) -> Result<Tensor> { t3_unimpl("sub") }
-    fn mul(&self, _r: &Tensor) -> Result<Tensor> { t3_unimpl("mul") }
-    fn div(&self, _r: &Tensor) -> Result<Tensor> { t3_unimpl("div") }
-    fn broadcast_add(&self, _r: &Tensor) -> Result<Tensor> { t3_unimpl("broadcast_add") }
-    fn broadcast_mul(&self, _r: &Tensor) -> Result<Tensor> { t3_unimpl("broadcast_mul") }
-    fn broadcast_div(&self, _r: &Tensor) -> Result<Tensor> { t3_unimpl("broadcast_div") }
-    fn broadcast_sub(&self, _r: &Tensor) -> Result<Tensor> { t3_unimpl("broadcast_sub") }
-    fn matmul(&self, _r: &Tensor) -> Result<Tensor> { t3_unimpl("matmul") }
-    fn affine(&self, _a: f64, _b: f64) -> Result<Tensor> { t3_unimpl("affine") }
-    fn where_cond(&self, _t: &Tensor, _f: &Tensor) -> Result<Tensor> { t3_unimpl("where_cond") }
-    fn sum(&self, _dim: impl Dim) -> Result<Tensor> { t3_unimpl("sum") }
-    fn sum_all(&self) -> Result<Tensor> { t3_unimpl("sum_all") }
-    fn max(&self, _dim: impl Dim) -> Result<Tensor> { t3_unimpl("max") }
-    fn min(&self, _dim: impl Dim) -> Result<Tensor> { t3_unimpl("min") }
-    fn argmax(&self, _dim: impl Dim) -> Result<Tensor> { t3_unimpl("argmax") }
-    fn mean(&self, _dim: impl Dim) -> Result<Tensor> { t3_unimpl("mean") }
-    fn cumsum(&self, _dim: impl Dim) -> Result<Tensor> { t3_unimpl("cumsum") }
-    fn exp(&self) -> Result<Tensor> { t3_unimpl("exp") }
-    fn sqrt(&self) -> Result<Tensor> { t3_unimpl("sqrt") }
-    fn sin(&self) -> Result<Tensor> { t3_unimpl("sin") }
-    fn cos(&self) -> Result<Tensor> { t3_unimpl("cos") }
-    fn tanh(&self) -> Result<Tensor> { t3_unimpl("tanh") }
-    fn abs(&self) -> Result<Tensor> { t3_unimpl("abs") }
-    fn neg(&self) -> Result<Tensor> { t3_unimpl("neg") }
-    fn sqr(&self) -> Result<Tensor> { t3_unimpl("sqr") }
-    fn log(&self) -> Result<Tensor> { t3_unimpl("log") }
-    fn clamp(&self, _min: f64, _max: f64) -> Result<Tensor> { t3_unimpl("clamp") }
-    fn powf(&self, _e: f64) -> Result<Tensor> { t3_unimpl("powf") }
-    fn reciprocal(&self) -> Result<Tensor> { t3_unimpl("reciprocal") }
-    fn gelu(&self) -> Result<Tensor> { t3_unimpl("gelu") }
-    fn silu(&self) -> Result<Tensor> { t3_unimpl("silu") }
-    fn softmax(&self, _dim: impl Dim) -> Result<Tensor> { t3_unimpl("softmax") }
-    fn softmax_last_dim(&self) -> Result<Tensor> { t3_unimpl("softmax_last_dim") }
-    fn index_select(&self, _dim: impl Dim, _idx: &Tensor) -> Result<Tensor> {
-        t3_unimpl("index_select")
+    fn narrow(&self, dim: impl Dim, start: usize, len: usize) -> Result<Tensor> {
+        let d = resolve_dim(dim, self.shape().len())?;
+        match d {
+            0 => Ok(DynTensor::narrow_dim0(self, start, len)?),
+            _ => ctx_scope::with_dry(|ctx, dry| {
+                let s = self.shape();
+                let outer: usize = s[..d].iter().product();
+                let after: usize = s[d + 1..].iter().product();
+                let src_dim = s[d] * after;
+                let mut out_shape = s.to_vec();
+                out_shape[d] = len;
+                let out = ctx.scratch_tensor::<f32>(&out_shape)?;
+                dry.narrow_strided_f32(
+                    ctx.stream(),
+                    self.device_ptr() as *const f32,
+                    out.device_ptr(),
+                    outer,
+                    src_dim,
+                    start * after,
+                    len,
+                )
+                .map_err(BackendError::Init)?;
+                Ok(DynTensor::from_f32(&out))
+            }),
+        }
     }
-    fn gather(&self, _dim: impl Dim, _idx: &Tensor) -> Result<Tensor> { t3_unimpl("gather") }
+    fn transpose(&self, dim1: impl Dim, dim2: impl Dim) -> Result<Tensor> {
+        let rank = self.shape().len();
+        let (a, b) = (resolve_dim(dim1, rank)?, resolve_dim(dim2, rank)?);
+        let mut s = self.shape().to_vec();
+        s.swap(a, b);
+        if self.shape()[a] == 1 || self.shape()[b] == 1 {
+            // size-1 维换位 = 布局等价,纯 reshape
+            eprintln!("[RS2] transpose have={:?} target={:?}", self.shape(), s);
+            eprintln!("[RS3] squeeze have={:?} target={:?}", self.shape(), s);
+        Ok(DynTensor::reshape(self, &s[..])?)
+        } else if rank == 2 {
+            // 2D 真转置:dry 转置核物化拷贝
+            ctx_scope::with_dry(|ctx, dry| {
+                let out = ctx.scratch_tensor::<f32>(&s[..])?;
+                dry.transpose2d_f32(
+                    ctx.stream(),
+                    self.device_ptr() as *const f32,
+                    out.device_ptr() as *mut f32,
+                    self.shape()[0],
+                    self.shape()[1],
+                ).map_err(|e| crate::Error::Msg(format!("transpose2d: {e}")))?;
+                Ok(DynTensor::from_f32(&out))
+            })
+        } else {
+            Err(Error::from(BackendError::Init(format!(
+                "transpose: >2D 非 size-1 换位需 stride 语义(shape={:?} a={a} b={b})",
+                self.shape()
+            ))))
+        }
+    }
+    fn t(&self) -> Result<Tensor> { self.t2() }
+    fn t2(&self) -> Result<Tensor> {
+        let rank = self.shape().len();
+        self.transpose(rank - 2, rank - 1)
+    }
+    fn unsqueeze(&self, dim: impl Dim) -> Result<Tensor> {
+        let d = resolve_dim(dim, self.shape().len() + 1)?;
+        let mut s = self.shape().to_vec();
+        s.insert(d, 1);
+        eprintln!("[RS3] squeeze have={:?} target={:?}", self.shape(), s);
+        Ok(DynTensor::reshape(self, &s[..])?)
+    }
+    fn squeeze(&self, dim: impl Dim) -> Result<Tensor> {
+        let d = resolve_dim(dim, self.shape().len())?;
+        let mut s = self.shape().to_vec();
+        if s[d] == 1 { s.remove(d); }
+        eprintln!("[RS3] squeeze have={:?} target={:?}", self.shape(), s);
+        Ok(DynTensor::reshape(self, &s[..])?)
+    }
+    fn contiguous(&self) -> Result<Tensor> { Ok(self.clone()) }
+    fn broadcast_as(&self, _shape: impl Into<Shape>) -> Result<Tensor> {
+        Err(Error::from(BackendError::Init("broadcast_as: S2 广播 = P1(走 broadcast_* 算子)".to_string())))
+    }
+    fn chunk(&self, c: usize, dim: impl Dim) -> Result<Vec<Tensor>> {
+        let d = resolve_dim(dim, self.shape().len())?;
+        let full = self.shape()[d];
+        if full % c != 0 {
+            return Err(Error::from(BackendError::Init(format!("chunk: {full} 不可均分 {c}"))));
+        }
+        let seg = full / c;
+        (0..c).map(|i| self.narrow(d, i * seg, seg)).collect()
+    }
+    fn split(&self, s: usize, dim: impl Dim) -> Result<Vec<Tensor>> {
+        let d = resolve_dim(dim, self.shape().len())?;
+        let full = self.shape()[d];
+        let n = full.div_ceil(s);
+        (0..n)
+            .map(|i| {
+                let start = i * s;
+                let len = s.min(full - start);
+                self.narrow(d, start, len)
+            })
+            .collect()
+    }
+    fn select(&self, dim: impl Dim, i: usize) -> Result<Tensor> {
+        Ok(self.narrow(dim, i, 1)?.squeeze(dim)?)
+    }
+
+    fn add(&self, rhs: &Tensor) -> Result<Tensor> {
+        ctx_scope::with(|ops, ctx| erased::add(ops, ctx, self, rhs).map_err(Into::into))
+    }
+    fn sub(&self, rhs: &Tensor) -> Result<Tensor> {
+        ctx_scope::with(|ops, ctx| {
+            let neg = scalar_dyn(ctx, -1.0)?;
+            let nr = erased::broadcast_mul(ops, ctx, &neg, rhs)?;
+            erased::add(ops, ctx, self, &nr).map_err(Into::into)
+        })
+    }
+    fn mul(&self, rhs: &Tensor) -> Result<Tensor> {
+        ctx_scope::with(|ops, ctx| erased::mul(ops, ctx, self, rhs).map_err(Into::into))
+    }
+    fn div(&self, rhs: &Tensor) -> Result<Tensor> {
+        ctx_scope::with(|ops, ctx| {
+            let inv = recip_dyn(ctx, rhs)?;
+            erased::mul(ops, ctx, self, &inv).map_err(Into::into)
+        })
+    }
+    fn broadcast_add(&self, rhs: &Tensor) -> Result<Tensor> {
+        ctx_scope::with(|ops, ctx| erased::broadcast_add(ops, ctx, self, rhs).map_err(Into::into))
+    }
+    fn broadcast_mul(&self, rhs: &Tensor) -> Result<Tensor> {
+        ctx_scope::with(|ops, ctx| erased::broadcast_mul(ops, ctx, self, rhs).map_err(Into::into))
+    }
+    fn broadcast_div(&self, rhs: &Tensor) -> Result<Tensor> {
+        ctx_scope::with(|ops, ctx| {
+            let inv = recip_dyn(ctx, rhs)?;
+            erased::broadcast_mul(ops, ctx, self, &inv).map_err(Into::into)
+        })
+    }
+    fn broadcast_sub(&self, rhs: &Tensor) -> Result<Tensor> {
+        ctx_scope::with(|ops, ctx| {
+            let neg = scalar_dyn(ctx, -1.0)?;
+            let nr = erased::broadcast_mul(ops, ctx, &neg, rhs)?;
+            erased::add(ops, ctx, self, &nr).map_err(Into::into)
+        })
+    }
+    fn matmul(&self, rhs: &Tensor) -> Result<Tensor> {
+        ctx_scope::with_blas(|ops, ctx, blas| {
+            erased::matmul(ops, ctx, blas, self, rhs).map_err(Into::into)
+        })
+    }
+    fn affine(&self, a: f64, b: f64) -> Result<Tensor> {
+        // dry-run 组合:mul 常量 + add 常量(标量经 [1] 张量广播)
+        ctx_scope::with(|ops, ctx| {
+            let const_mul = |ctx: &owl_nn::KernelCtx, v: f32| -> Result<Tensor> {
+                let t = ctx.scratch_tensor::<f32>(&[1])?;
+                owl_nn::erased::copy_d2d_to_raw(
+                    ctx,
+                    &owl_nn::DynTensor::from_f32(&owl_nn::TensorPoolOps::from_vec_tensor(
+                        crate::models::layers::ctx_scope::weights_pool().as_ref(),
+                        &[1],
+                        vec![v],
+                    )?),
+                    owl_iface::DevBuf::device_ptr(&t) as *mut core::ffi::c_void,
+                    4,
+                )?;
+                Ok(owl_nn::DynTensor::from_f32(&t))
+            };
+            let mul_t = const_mul(ctx, a as f32)?;
+            let scaled = erased::broadcast_mul(ops, ctx, self, &mul_t)?;
+            let add_t = const_mul(ctx, b as f32)?;
+            erased::broadcast_add(ops, ctx, &scaled, &add_t).map_err(Into::into)
+        })
+    }
+    fn where_cond(&self, _t: &Tensor, _f: &Tensor) -> Result<Tensor> {
+        Err(Error::from(BackendError::Init("where_cond: P1".to_string())))
+    }
+
+    fn sum(&self, dim: impl Dim) -> Result<Tensor> {
+        let d = resolve_dim(dim, self.shape().len())?;
+        ctx_scope::with(|ops, ctx| erased::sum_dim(ops, ctx, self, d).map_err(Into::into))
+    }
+    fn sum_all(&self) -> Result<Tensor> {
+        eprintln!("[RS4] sum_all have={:?} target={}", self.shape(), self.len_bytes() / 4);
+        let flat = DynTensor::reshape(self, &[self.len_bytes() / 4])?;
+        ctx_scope::with(|ops, ctx| erased::sum_dim(ops, ctx, &flat, 0).map_err(Into::into))
+    }
+    fn max(&self, dim: impl Dim) -> Result<Tensor> {
+        let d = resolve_dim(dim, self.shape().len())?;
+        ctx_scope::with(|ops, ctx| erased::max_dim(ops, ctx, self, d).map_err(Into::into))
+    }
+    fn min(&self, _dim: impl Dim) -> Result<Tensor> {
+        Err(Error::from(BackendError::Init("min: P1".to_string())))
+    }
+    fn argmax(&self, _dim: impl Dim) -> Result<Tensor> {
+        Err(Error::from(BackendError::Init("argmax: P1(采样链 radix 接管)".to_string())))
+    }
+    fn mean(&self, dim: impl Dim) -> Result<Tensor> {
+        let d = resolve_dim(dim, self.shape().len())?;
+        let n = self.shape()[d] as f32;
+        ctx_scope::with(|ops, ctx| {
+            let s: DynTensor<owl_cuda::CudaDevice> = erased::sum_dim(ops, ctx, self, d).map_err(|e| crate::error::Error::from(e))?;
+            let inv = scalar_dyn(ctx, 1.0 / n)?;
+            erased::broadcast_mul(ops, ctx, &s, &inv).map_err(Into::into)
+        })
+    }
+    fn cumsum(&self, _dim: impl Dim) -> Result<Tensor> {
+        Err(Error::from(BackendError::Init("cumsum: P1".to_string())))
+    }
+
+    fn exp(&self) -> Result<Tensor> { Err(Error::from(BackendError::Init("exp: P1".to_string()))) }
+    fn sqrt(&self) -> Result<Tensor> { Err(Error::from(BackendError::Init("sqrt: P1".to_string()))) }
+    fn sin(&self) -> Result<Tensor> {
+        ctx_scope::with_dry(|ctx, dry| {
+            let n = self.len_bytes() / 4;
+            let out = ctx.scratch_tensor::<f32>(self.shape())?;
+            dry.sin_f32(ctx.stream(), self.device_ptr() as *const f32, out.device_ptr(), n)
+                .map_err(BackendError::Init)?;
+            Ok(DynTensor::from_f32(&out))
+        })
+    }
+    fn cos(&self) -> Result<Tensor> {
+        ctx_scope::with_dry(|ctx, dry| {
+            let n = self.len_bytes() / 4;
+            let out = ctx.scratch_tensor::<f32>(self.shape())?;
+            dry.cos_f32(ctx.stream(), self.device_ptr() as *const f32, out.device_ptr(), n)
+                .map_err(BackendError::Init)?;
+            Ok(DynTensor::from_f32(&out))
+        })
+    }
+    fn tanh(&self) -> Result<Tensor> { Err(Error::from(BackendError::Init("tanh: P1(softcap 未用)".to_string()))) }
+    fn abs(&self) -> Result<Tensor> { Err(Error::from(BackendError::Init("abs: P1".to_string()))) }
+    fn neg(&self) -> Result<Tensor> {
+        ctx_scope::with(|ops, ctx| {
+            let neg = scalar_dyn(ctx, -1.0)?;
+            erased::broadcast_mul(ops, ctx, &neg, self).map_err(Into::into)
+        })
+    }
+    fn sqr(&self) -> Result<Tensor> { self.mul(self) }
+    fn log(&self) -> Result<Tensor> { Err(Error::from(BackendError::Init("log: P1".to_string()))) }
+    fn clamp(&self, _min: f64, _max: f64) -> Result<Tensor> {
+        Err(Error::from(BackendError::Init("clamp: P1".to_string())))
+    }
+    fn powf(&self, _exp: f64) -> Result<Tensor> { Err(Error::from(BackendError::Init("powf: P1".to_string()))) }
+    fn reciprocal(&self) -> Result<Tensor> {
+        ctx_scope::with(|ops, ctx| recip_dyn(ctx, self).map_err(Into::into))
+    }
+    fn gelu(&self) -> Result<Tensor> {
+        Err(Error::from(BackendError::Init("gelu: P1(hidden_act=Silu)".to_string())))
+    }
+    fn silu(&self) -> Result<Tensor> {
+        ctx_scope::with(|ops, ctx| erased::silu(ops, ctx, self).map_err(Into::into))
+    }
+    fn softmax(&self, dim: impl Dim) -> Result<Tensor> {
+        let d = resolve_dim(dim, self.shape().len())?;
+        if d + 1 != self.shape().len() {
+            return Err(Error::from(BackendError::Init("softmax: 一期 last 维".to_string())));
+        }
+        self.softmax_last_dim()
+    }
+    fn softmax_last_dim(&self) -> Result<Tensor> {
+        ctx_scope::with(|ops, ctx| erased::softmax_last_dim(ops, ctx, self).map_err(Into::into))
+    }
+
+    fn index_select(&self, dim: impl Dim, idx: &Tensor) -> Result<Tensor> {
+        let d = resolve_dim(dim, self.shape().len())?;
+        ctx_scope::with(|ops, ctx| erased::index_select(ops, ctx, self, d, idx).map_err(Into::into))
+    }
+    fn gather(&self, dim: impl Dim, idx: &Tensor) -> Result<Tensor> {
+        let d = resolve_dim(dim, self.shape().len())?;
+        let _ = d;
+        ctx_scope::with(|ops, ctx| erased::gather(ops, ctx, self, idx).map_err(Into::into))
+    }
     fn scatter(&self, _dim: impl Dim, _idx: &Tensor, _src: &Tensor) -> Result<Tensor> {
-        t3_unimpl("scatter")
+        Err(Error::from(BackendError::Init("scatter: P1".to_string())))
     }
-    fn scatter_add(&self, _idx: &Tensor, _src: &Tensor, _dim: impl Dim) -> Result<Tensor> {
-        t3_unimpl("scatter_add")
+    fn scatter_add(&self, idx: &Tensor, src: &Tensor, dim: impl Dim) -> Result<Tensor> {
+        let d = resolve_dim(dim, self.shape().len())?;
+        let _ = d;
+        let num = self.len_bytes() / 4;
+        ctx_scope::with(|ops, ctx| {
+            erased::scatter_add(ops, ctx, num, src, idx).map_err(Into::into)
+        })
     }
-    fn repeat(&self, _shape: impl Into<Shape>) -> Result<Tensor> { t3_unimpl("repeat") }
+    fn repeat(&self, _shape: impl Into<Shape>) -> Result<Tensor> {
+        Err(Error::from(BackendError::Init("repeat: P1".to_string())))
+    }
     fn repeat_interleave(&self, _repeats: usize, _dim: impl Dim) -> Result<Tensor> {
-        t3_unimpl("repeat_interleave")
+        Err(Error::from(BackendError::Init("repeat_interleave: P1".to_string())))
     }
-    fn to_dtype(&self, _dtype: DType) -> Result<Tensor> { t3_unimpl("to_dtype") }
-    fn to_device(&self, _device: &Device) -> Result<Tensor> { t3_unimpl("to_device") }
+    fn to_dtype(&self, dtype: DType) -> Result<Tensor> {
+        if dtype == self.dtype() {
+            return Ok(self.clone());
+        }
+        // dry-run 数值转换:仅 U32→F32;构造期 = P 阶段,host 往返合法
+        if self.dtype() == DType::U32 && dtype == DType::F32 {
+            let dev = ctx_scope::with_device();
+            use owl_cuda::ffi::sys;
+            dev.ctx().bind_to_thread().map_err(|e| {
+                Error::from(BackendError::Init(format!("bind_to_thread: {e:?}")))
+            })?;
+            let n = self.len_bytes() / 4;
+            let mut host = vec![0u32; n];
+            unsafe {
+                sys::cuMemcpyDtoH_v2(
+                    host.as_mut_ptr() as *mut std::ffi::c_void,
+                    self.device_ptr() as sys::CUdeviceptr,
+                    n * 4,
+                )
+                .result()
+                .map_err(|e| {
+                    Error::from(BackendError::CopyFailed { dir: "dtoh", detail: format!("{e:?}") })
+                })?;
+            }
+            let conv: Vec<f32> = host.iter().map(|&b| b as f32).collect();
+            let pool = ctx_scope::weights_pool();
+            let t = owl_nn::TensorPoolOps::from_vec_tensor(pool.as_ref(), &[n], conv)?;
+            return Ok(owl_nn::DynTensor::from_f32(&t));
+        }
+        Err(Error::from(BackendError::Init(format!(
+            "to_dtype {}→{dtype}: 转换核未回填(dry-run 全 f32)",
+            self.dtype()
+        ))))
+    }
+    fn to_device(&self, _device: &Device) -> Result<Tensor> { Ok(self.clone()) }
+
     fn device(&self) -> Device {
-        t3_unimpl("device")
+        ctx_scope::with_device()
     }
-    fn dim(&self, _i: usize) -> Result<usize> {
-        t3_unimpl("dim")
+    fn dim(&self, i: usize) -> Result<usize> {
+        self.shape()
+            .get(i)
+            .copied()
+            .ok_or_else(|| Error::from(BackendError::Init(format!("dim {i} 越界"))))
     }
-    fn dims(&self) -> Result<Vec<usize>> {
-        t3_unimpl("dims")
-    }
+    fn dims(&self) -> Result<Vec<usize>> { Ok(self.shape().to_vec()) }
     fn dims2(&self) -> Result<(usize, usize)> {
-        t3_unimpl("dims2")
-    }
-    fn flatten_all(&self) -> Result<Tensor> {
-        t3_unimpl("flatten_all")
-    }
-    fn to_scalar<T: Copy>(&self) -> Result<T> {
-        t3_unimpl("to_scalar")
-    }
-    fn apply_rotary_emb_qkv(
-        &self,
-        _cos: &Tensor,
-        _sin: &Tensor,
-        _n: usize,
-    ) -> Result<Tensor> {
-        t3_unimpl("apply_rotary_emb_qkv")
-    }
-    fn broadcast_left(&self, _left: impl Into<Shape>) -> Result<Tensor> {
-        t3_unimpl("broadcast_left")
-    }
-    fn is_contiguous(&self) -> bool {
-        true // S3:owl 无惰性布局,恒紧凑
+        let s = self.shape();
+        match s.len() {
+            2 => Ok((s[0], s[1])),
+            _ => Err(Error::from(BackendError::Init(format!("dims2: rank {} ≠ 2", s.len())))),
+        }
     }
     fn dims3(&self) -> Result<(usize, usize, usize)> {
-        t3_unimpl("dims3")
+        let s = self.shape();
+        match s.len() {
+            3 => Ok((s[0], s[1], s[2])),
+            _ => Err(Error::from(BackendError::Init(format!("dims3: rank {} ≠ 3", s.len())))),
+        }
     }
-    fn elem_count(&self) -> Result<usize> {
-        t3_unimpl("elem_count")
+    fn elem_count(&self) -> Result<usize> { Ok(self.len_bytes() / 4) }
+    fn flatten_all(&self) -> Result<Tensor> {
+        eprintln!("[RS5] flatten_all have={:?} target={}", self.shape(), self.len_bytes() / 4);
+        Ok(DynTensor::reshape(self, &[self.len_bytes() / 4])?)
     }
+    fn broadcast_left(&self, _left: impl Into<Shape>) -> Result<Tensor> {
+        Err(Error::from(BackendError::Init("broadcast_left: P1".to_string())))
+    }
+    fn is_contiguous(&self) -> bool { true }
     fn permute(&self, order: &[usize]) -> Result<Tensor> {
-        let _ = order;
-        t3_unimpl("permute")
+        Err(Error::from(BackendError::Init(format!("permute {order:?}: P1(stride 语义)"))))
     }
-    fn avg_pool2d_with_stride(&self, _kernel: usize, _stride: usize) -> Result<Tensor> {
-        t3_unimpl("avg_pool2d_with_stride")
+    fn avg_pool2d_with_stride(&self, _k: usize, _s: usize) -> Result<Tensor> {
+        Err(Error::from(BackendError::Init("avg_pool2d: deltanet 专项".to_string())))
     }
     fn dequantize(&self, _device: &Device) -> Result<Tensor> {
-        t3_unimpl("dequantize(量化 = marlin-ffi 路线)")
+        Err(Error::from(BackendError::Init("dequantize: marlin-ffi 归属".to_string())))
+    }
+    fn to_scalar<T: Copy>(&self) -> Result<T> {
+        Err(Error::from(BackendError::Init("to_scalar: D2H 面(采样层另行接)".to_string())))
+    }
+
+    fn apply_rotary_emb_qkv(&self, _cos: &Tensor, _sin: &Tensor, _n: usize) -> Result<Tensor> {
+        Err(Error::from(BackendError::Init("apply_rotary_emb_qkv: rope 走 vendor::fused_rope".to_string())))
     }
 }
+
+/// 标量张量([1] f32;scratch + dry fill 核,捕获安全)
+pub(crate) fn scalar_dyn(ctx: &owl_nn::KernelCtx, v: f32) -> Result<Tensor> {
+    ctx_scope::with_dry(|ctx, dry| {
+        let out = ctx.scratch_tensor::<f32>(&[1])?;
+        dry.fill_f32(ctx.stream(), out.device_ptr(), v, 1).map_err(BackendError::Init)?;
+        Ok(DynTensor::from_f32(&out))
+    })
+}
+
+/// 逐元素倒数(dry recip 核;捕获安全)
+pub(crate) fn recip_dyn(ctx: &owl_nn::KernelCtx, x: &Tensor) -> Result<Tensor> {
+    ctx_scope::with_dry(|ctx, dry| {
+        let n = x.len_bytes() / 4;
+        let out = ctx.scratch_tensor::<f32>(x.shape())?;
+        dry.recip_f32(ctx.stream(), x.device_ptr() as *const f32, out.device_ptr(), n)
+            .map_err(BackendError::Init)?;
+        Ok(DynTensor::from_f32(&out))
+    })
+}
+
+/// 维度解析(usize 直通;D 负维回绕)
+pub(crate) fn resolve_dim(d: impl Dim, rank: usize) -> Result<usize> {
+    Ok(d.resolve_dim(rank).map_err(|m| Error::Msg(m))?)
+}
+
+/// 标量张量([1] f32,捕获安全:scratch + dry fill 核)
+
+
+/// 逐元素倒数(dry recip 核;捕获安全)
+
+
+/// 维度解析(usize 直通;D::Minus1/2/3 负维回绕)
+
 
 // ============================================================================
 // 自由算子(candle_nn::ops / 层内 rms_norm 等)
 // ============================================================================
 
 pub mod ops {
-    #![allow(unused_variables)]
-    use super::{t3_unimpl, DType, Result, Tensor};
+    use super::ctx_scope;
+    use super::{DType, Result, Tensor};
+    use owl_nn::erased;
 
-    pub fn silu(x: &Tensor) -> Result<Tensor> { t3_unimpl("silu") }
-    pub fn gelu(x: &Tensor) -> Result<Tensor> { t3_unimpl("gelu") }
-    pub fn softmax(x: &Tensor, dim: impl super::Dim) -> Result<Tensor> { t3_unimpl("softmax") }
-    pub fn softmax_last_dim(x: &Tensor) -> Result<Tensor> { t3_unimpl("softmax_last_dim") }
-    pub fn gelu_erf(x: &Tensor) -> Result<Tensor> { t3_unimpl("gelu_erf") }
-    pub fn tanh(x: &Tensor) -> Result<Tensor> { t3_unimpl("tanh") }
-    pub fn silu_and_mul(x: &Tensor) -> Result<Tensor> { t3_unimpl("silu_and_mul") }
-    pub fn sigmoid(x: &Tensor) -> Result<Tensor> { t3_unimpl("sigmoid") }
-    pub fn cat(xs: &[Tensor], dim: usize) -> Result<Tensor> {
-        let _ = (xs, dim);
-        t3_unimpl("cat")
+    fn softmax_any_dim(x: &Tensor, dim: usize) -> Result<Tensor> {
+        let rank = x.shape().len();
+        let dim = if (dim as i32) < 0 { rank as i32 + dim as i32 } else { dim as i32 } as usize;
+        // 末维 softmax = erased 真身;非末维 = transpose 到末维再回(元数据)
+        ctx_scope::with(|ops, ctx| {
+            if dim == rank - 1 {
+                erased::softmax_last_dim(ops, ctx, x).map_err(Into::into)
+            } else {
+                let _ = x;
+                unimplemented!("softmax 非末维(dry-run 走末维路径)")
+            }
+        })
     }
-    pub fn full(v: f64, shape: &[usize], _like: &Tensor) -> Result<Tensor> {
-        let _ = (v, shape);
-        t3_unimpl("full")
+
+    pub fn silu(x: &Tensor) -> Result<Tensor> {
+        ctx_scope::with(|ops, ctx| erased::silu(ops, ctx, x).map_err(Into::into))
+    }
+    pub fn gelu(_x: &Tensor) -> Result<Tensor> { unimplemented!("T3 kernel 回填: gelu") }
+    pub fn softmax(x: &Tensor, dim: usize) -> Result<Tensor> { softmax_any_dim(x, dim) }
+    pub fn softmax_last_dim(x: &Tensor) -> Result<Tensor> { softmax_any_dim(x, x.shape().len() - 1) }
+    pub fn gelu_erf(_x: &Tensor) -> Result<Tensor> { unimplemented!("T3 kernel 回填: gelu_erf") }
+    pub fn tanh(_x: &Tensor) -> Result<Tensor> { unimplemented!("T3 kernel 回填: tanh") }
+    pub fn silu_and_mul(x: &Tensor) -> Result<Tensor> {
+        // fused swiglu:out[r, :half] = silu(x[r, :half]) * x[r, half:](dry 核)
+        ctx_scope::with_dry(|ctx, dry| {
+            let rank = x.shape().len();
+            let n = *x.shape().last().ok_or_else(|| crate::Error::Msg("silu_and_mul: 0 维".into()))?;
+            let half = n / 2;
+            let rows: usize = x.shape()[..rank - 1].iter().product();
+            let out = ctx.scratch_tensor::<f32>(&[if rank == 1 { half } else { rows }, half])?;
+            dry.silu_and_mul_f32(
+                ctx.stream(),
+                x.device_ptr() as *const f32,
+                out.device_ptr() as *mut f32,
+                half,
+                rows,
+            ).map_err(|e| crate::Error::Msg(format!("silu_and_mul: {e}")))?;
+            Ok(super::DynTensor::from_f32(&out))
+        })
+    }
+    pub fn sigmoid(_x: &Tensor) -> Result<Tensor> { unimplemented!("T3 kernel 回填: sigmoid") }
+    pub fn cat(xs: &[Tensor], dim: usize) -> Result<Tensor> {
+        ctx_scope::with(|_ops, ctx| erased::cat(ctx, xs, dim).map_err(Into::into))
+    }
+    pub fn full(_v: f64, _shape: &[usize], _like: &Tensor) -> Result<Tensor> {
+        unimplemented!("T3 kernel 回填: full(dry-run 未见调用,撞上再接)")
     }
     pub fn _dt(_d: DType) {}
 }
@@ -418,19 +774,41 @@ pub mod ctor {
         t3_unimpl("full")
     }
     pub fn arange(start: usize, end: usize, _dtype: DType, _device: &Device) -> Result<Tensor> {
-        let _ = (start, end);
-        t3_unimpl("arange")
+        // dry-run 装载基元:host 生成等差序列落池(u32 位型;rope 位置表用)
+        let v: Vec<u32> = (start as u32..end as u32).collect();
+        let shape = vec![v.len()];
+        let pool = crate::models::layers::ctx_scope::weights_pool();
+        let t = owl_nn::TensorPoolOps::from_vec_tensor(pool.as_ref(), &shape, v)?;
+        Ok(owl_nn::DynTensor::from_u32(&t))
     }
     pub fn eye(n: usize, m: usize, _dtype: DType, _device: &Device) -> Result<Tensor> {
         let _ = (n, m);
         t3_unimpl("eye")
     }
-    pub fn from_vec<T: Copy>(
-        _v: Vec<T>,
-        _shape: impl Into<Shape>,
+    pub fn from_vec<T: Copy + 'static>(
+        v: Vec<T>,
+        shape: impl Into<Shape>,
         _device: &Device,
     ) -> Result<Tensor> {
-        t3_unimpl("from_vec")
+        // dry-run 装载基元:借 ctx_scope rig 的 weights 池落池(账本化)。
+        // FIX:u32 保真 U32 位型(原 f32::from_bits 强转 = 位型误解,
+        // 索引/slot 全变垃圾 f32,S4 违约根源)。
+        let shape = shape.into().dims().to_vec();
+        let pool = crate::models::layers::ctx_scope::weights_pool();
+        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
+            let data: Vec<f32> = unsafe { std::mem::transmute::<Vec<T>, Vec<f32>>(v) };
+            let t = owl_nn::TensorPoolOps::from_vec_tensor(pool.as_ref(), &shape, data)?;
+            return Ok(owl_nn::DynTensor::from_f32(&t));
+        }
+        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<u32>() {
+            let data: Vec<u32> = unsafe { std::mem::transmute::<Vec<T>, Vec<u32>>(v) };
+            let t = owl_nn::TensorPoolOps::from_vec_tensor(pool.as_ref(), &shape, data)?;
+            return Ok(owl_nn::DynTensor::from_u32(&t));
+        }
+        return Err(crate::Error::Msg(format!(
+            "ctor::from_vec: dry-run 仅支持 f32/u32(收到 {})",
+            std::any::type_name::<T>()
+        )));
     }
     pub fn new<T: Copy>(
         _v: Vec<T>,
@@ -465,8 +843,10 @@ pub struct VarBuilderX {
     gguf: Option<std::sync::Arc<crate::loader::gguf::GGufVarBuilder>>,
     /// R3 统一装载口(池由 allocator 持有;None = Host 测试模式)
     alloc: Option<std::sync::Arc<crate::loader::DeviceWeightAllocator<owl_cuda::CudaPool>>>,
-    /// 设备句柄(device() 查询面)
+    // 设备句柄(device() 查询面)
     device: Option<Device>,
+    // dry-run 假数据模式(from_fake;种子 = 键名哈希,确定性可复现)
+    fake: bool,
 }
 
 
@@ -493,7 +873,31 @@ impl VarBuilderX {
             gguf,
             alloc: None,
             device: Some(device.clone()),
+            fake: false,
         })
+    }
+
+    /// dry-run 假数据模式:不读文件,get 按请求 shape 产种子化确定性数据。
+    pub fn from_fake(pool: std::sync::Arc<owl_cuda::CudaPool>, device: &Device) -> Result<Self> {
+        let mut vb = Self::new(
+            &crate::downloader::ModelPaths {
+                tokenizer_filename: Default::default(),
+                tokenizer_config_filename: Default::default(),
+                config_filename: Default::default(),
+                generation_config_filename: Default::default(),
+                filenames: vec![],
+                auxiliary_filenames: vec![],
+                chat_template_filename: None,
+            },
+            false,
+            DType::F32,
+            device,
+        )?;
+        vb.fake = true;
+        vb.alloc = Some(std::sync::Arc::new(
+            crate::loader::DeviceWeightAllocator::new(pool),
+        ));
+        Ok(vb)
     }
 
     /// 注入装载目标池(P 阶段;R3 统一装载口:内部持 DeviceWeightAllocator)。
@@ -513,6 +917,7 @@ impl VarBuilderX {
             gguf: Some(std::sync::Arc::new(vb)),
             alloc: None,
             device: None,
+            fake: false,
         })
     }
 
@@ -545,6 +950,7 @@ impl VarBuilderX {
             gguf: self.gguf.clone(),
             alloc: self.alloc.clone(),
             device: self.device.clone(),
+            fake: self.fake,
         }
     }
 
@@ -622,6 +1028,31 @@ impl VarBuilderX {
     ) -> Result<Tensor> {
         if shard.world_size > 1 {
             unimplemented!("TP 分片装载(Row/Col)= T3 后续(当前单卡面)");
+        }
+        // dry-run 假数据模式:种子 = FNV(键名),值域 ±0.01(小值防 softmax 饱和)
+        if self.fake {
+            let shape = s.into().dims().to_vec();
+            let n: usize = shape.iter().product();
+            let mut h: u64 = 0xcbf29ce484222325;
+            for b in name.bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            let mut x = h | 1;
+            let mut data = Vec::with_capacity(n);
+            for _ in 0..n {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                data.push(((x >> 33) % 2001) as f32 / 100_000.0 - 0.01);
+            }
+            let pool = self.alloc.as_ref().ok_or_else(|| {
+                Error::Msg("fake 模式需要 with_pool(装载口统一,R3)".into())
+            })?;
+            // f32 dry-run;dtype 面在运行里程碑接位型转换
+            return Ok(pool.materialize_dyn(
+                &shape,
+                owl_nn::Dtype::F32,
+                bytemuck::cast_slice(&data),
+            )?);
         }
         let gg = self.gguf_ref()?;
         let full = self.full_name(name);
@@ -786,8 +1217,13 @@ impl Embedding {
         Self { weight }
     }
     pub fn embed(&self, ids: &Tensor) -> Result<Tensor> {
-        let _ = &self.weight;
-        unimplemented!("T3 kernel 回填: embedding lookup")
+        // dry-run:erased index_select(dim=0,U32 索引)→ [n_ids, d]
+        crate::models::layers::ctx_scope::with(|ops, ctx| {
+            let out = owl_nn::erased::index_select(ops, ctx, &self.weight, 0, ids)
+                .map_err(crate::Error::from)?;
+            // xinfer Embedding 语义:返回 [n_ids, d](调用点自行 reshape 扩维)
+            Ok(out)
+        })
     }
     pub fn forward(&self, ids: &Tensor) -> Result<Tensor> {
         self.embed(ids)
@@ -855,8 +1291,11 @@ impl RmsNorm {
         }
     }
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let _ = x;
-        unimplemented!("T3 kernel 回填: rms_norm")
+        let w = self.weight.as_ref().ok_or_else(|| {
+            crate::Error::Msg("RmsNorm: 无 weight(dry-run 需 affine 形态)".into())
+        })?;
+        let eps = self.eps as f32;
+        ctx_scope::with(|ops, ctx| erased::rmsnorm(ops, ctx, x, w, eps).map_err(Into::into))
     }
 }
 
@@ -870,16 +1309,46 @@ pub mod vendor {
     // fused rope(= attention_rs::fused_rope::FusedRope)
     pub mod fused_rope {
         use crate::Result;
-        use super::super::Tensor;
+        use super::super::{ctx_scope, erased, Tensor};
+        use owl_nn::DynTensor;
         pub fn apply_inplace(
-            _q: &Tensor,
-            _k: &Tensor,
-            _cos: &Tensor,
-            _sin: &Tensor,
-            _positions: &Tensor,
+            q: &Tensor,
+            k: &Tensor,
+            cos: &Tensor,
+            sin: &Tensor,
+            positions: &Tensor,
             _is_rope_i: bool,
+            num_heads: usize,
+            num_kv_heads: usize,
+            head_dim: usize,
         ) -> Result<()> {
-            Err(crate::Error::Msg("vendor fused_rope::apply_inplace: T3 kernel 回填".into()))
+            // naive rope_half dry 核(q/k 各 tokens×heads×head_dim 连续;写回 in-place)
+            ctx_scope::with_dry(|ctx, dry| {
+                let tokens = positions.shape()[0];
+                let q_out = ctx.scratch_tensor::<f32>(q.shape())?;
+                let k_out = ctx.scratch_tensor::<f32>(k.shape())?;
+                dry.rope_half_f32(
+                    ctx.stream(),
+                    q.device_ptr() as *const f32,
+                    k.device_ptr() as *const f32,
+                    q_out.device_ptr() as *mut f32,
+                    k_out.device_ptr() as *mut f32,
+                    cos.device_ptr() as *const f32,
+                    sin.device_ptr() as *const f32,
+                    positions.device_ptr() as *const u32,
+                    tokens,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                ).map_err(|e| crate::Error::Msg(format!("rope_half: {e}")))?;
+                let q_bytes = q.len_bytes();
+                let k_bytes = k.len_bytes();
+                let qo = DynTensor::from_f32(&q_out);
+                let ko = DynTensor::from_f32(&k_out);
+                erased::copy_d2d_to_raw(ctx, &qo, q.device_ptr() as *mut core::ffi::c_void, q_bytes)?;
+                erased::copy_d2d_to_raw(ctx, &ko, k.device_ptr() as *mut core::ffi::c_void, k_bytes)?;
+                Ok(())
+            })
         }
         pub fn apply_inplace_partial(
             _q: &Tensor,
@@ -908,6 +1377,16 @@ pub mod vendor {
         pub is_mtp_verify: bool,
         /// 变长 prefill 的序列偏移(U32 device 张量;A1.5 动态量设备化)
         pub cu_seqlens_q: Option<super::Tensor>,
+        /// decode naive 路径的设备指针对(位型直读:i32 slots/kv_lens;
+        /// u32 bindings 的位型一致)。None = 未提供(pa_shim 拒绝 decode)。
+        pub decode_ptrs: Option<DecodePtrs>,
+    }
+
+    /// decode 设备指针对(slots/kv_lens;值域 <2^31,u32 位型等价 i32)
+    #[derive(Clone, Copy)]
+    pub struct DecodePtrs {
+        pub slots: *const i32,
+        pub kv_lens: *const i32,
     }
     /// MoE 算子面(= attention_rs::moe)
     pub mod moe {

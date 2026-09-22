@@ -92,11 +92,24 @@ impl CaptureSession {
             .map_err(|e| BackendError::Init(format!("begin_capture: {e:?}")))?;
 
         // signal 作用域:闭包内 owl_signal::emit 自动汇聚为依赖集(哨兵①自动化)
+        //
+        // 关键时序修正(2026-09-22):强租约升级必须在 **emit 时刻**完成——
+        // functional 风格的 forward 中间量是语句级瞬态,forward 返回时早已
+        // drop(retire)。"f 结束后统一升级"永远只见到尸体(A1.7 假违约)。
+        // emit 时缓冲必然存活 → 当场 Weak 升级 Arc 入 keepalive 暂存。
         let toks: Arc<Mutex<Vec<BufToken>>> = Arc::new(Mutex::new(Vec::new()));
+        let keepalive_new: Arc<Mutex<Vec<Arc<PoolBufInner>>>> =
+            Arc::new(Mutex::new(Vec::new()));
         let sink: owl_signal::Sink = Arc::new({
             let t = Arc::clone(&toks);
+            let ka = Arc::clone(&keepalive_new);
+            let gov = std::sync::Arc::clone(&self.gov);
             move |tok: owl_signal::Token| {
                 t.lock().expect("lease sink 中毒").push(tok);
+                // 当场升级(emit 时缓冲必活);重复 emit 幂等(dedup 在合并段)
+                if let Some(inner) = gov.live_bufs.lock().get(&tok.id).and_then(|w| w.upgrade()) {
+                    ka.lock().expect("ka 中毒").push(inner);
+                }
             }
         });
         let _guard = owl_signal::enter(sink.clone());
@@ -116,10 +129,14 @@ impl CaptureSession {
                 let cu_graph = unsafe { stream_end_capture(self.stream.cu_stream()) }
                     .map_err(|e| BackendError::Init(format!("end_capture: {e:?}")))?;
 
-                // 自动租约:闭包读过的每个令牌 → 强租约(Weak 登记表升级)
+                // 自动租约:emit 期已升级的强引用合并进会话 keepalive;
+                // 令牌在 emit 后、定影前死亡的(真 P 阶段违规)仍被 validate 拦截
                 let dead = {
                     let live = self.gov.live_bufs.lock();
                     let collected = std::mem::take(&mut *toks.lock().expect("toks 中毒"));
+                    let upgraded: Vec<Arc<PoolBufInner>> =
+                        std::mem::take(&mut *keepalive_new.lock().expect("ka 中毒"));
+                    self.keepalive.extend(upgraded);
                     let mut dead = Vec::new();
                     for t in collected {
                         if self.leases.iter().any(|l| l.id == t.id) {

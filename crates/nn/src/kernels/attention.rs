@@ -421,7 +421,7 @@ mod paged_tests {
         };
         // 逻辑 Q/K/V(全 f32,再量化 f16)
         let mut q = vec![0u16; NUM_SEQS * HEADS * HEAD_SIZE];
-        for (i, v) in q.iter_mut().enumerate() {
+        for (_i, v) in q.iter_mut().enumerate() {
             *v = f32_to_f16_bits(nxt() * 4.0);
         }
         let mut logical_k = vec![vec![0f32; HEAD_SIZE]; NUM_SEQS * HEADS * BS];
