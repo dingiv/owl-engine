@@ -274,6 +274,110 @@ impl Kernels {
         }
         Ok(())
     }
+
+    // ---- P1 索引/归约/broadcast 族(owl 原创核,2026-09-22)----
+
+    /// gather:dst[i] = src[idx[i]]
+    pub fn gather_f32(
+        &mut self,
+        stream: &CudaStream,
+        n: usize,
+        src: *const f32,
+        idx: *const u32,
+        dst: *mut f32,
+    ) -> Result<(), String> {
+        self.launch_f32(stream, "owl_gather_f32", n, &[n as u64, src as u64, idx as u64, dst as u64])
+    }
+
+    /// scatter_add:atomicAdd(&dst[idx[i]], src[i])
+    pub fn scatter_add_f32(
+        &mut self,
+        stream: &CudaStream,
+        n: usize,
+        src: *const f32,
+        idx: *const u32,
+        dst: *mut f32,
+    ) -> Result<(), String> {
+        self.launch_f32(stream, "owl_scatter_add_f32", n, &[n as u64, src as u64, idx as u64, dst as u64])
+    }
+
+    /// 轴归约 sum:src [outer, axis, inner] → dst [outer, inner]
+    pub fn sum_axis_f32(
+        &mut self,
+        stream: &CudaStream,
+        outer: usize,
+        axis: usize,
+        inner: usize,
+        src: *const f32,
+        dst: *mut f32,
+    ) -> Result<(), String> {
+        self.launch_f32(
+            stream,
+            "owl_sum_axis_f32",
+            outer * inner,
+            &[outer as u64, axis as u64, inner as u64, src as u64, dst as u64],
+        )
+    }
+
+    /// 轴归约 max:同 sum_axis 形状约定
+    pub fn max_axis_f32(
+        &mut self,
+        stream: &CudaStream,
+        outer: usize,
+        axis: usize,
+        inner: usize,
+        src: *const f32,
+        dst: *mut f32,
+    ) -> Result<(), String> {
+        self.launch_f32(
+            stream,
+            "owl_max_axis_f32",
+            outer * inner,
+            &[outer as u64, axis as u64, inner as u64, src as u64, dst as u64],
+        )
+    }
+
+    /// 右对齐 broadcast 加(S2:b 任意轴 = 1)
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_bcast_f32(
+        &mut self,
+        stream: &CudaStream,
+        outer: usize,
+        mid: usize,
+        inner: usize,
+        b_mid: usize,
+        a: *const f32,
+        b: *const f32,
+        out: *mut f32,
+    ) -> Result<(), String> {
+        self.launch_f32(
+            stream,
+            "owl_add_bcast_f32",
+            outer * mid * inner,
+            &[outer as u64, mid as u64, inner as u64, b_mid as u64, a as u64, b as u64, out as u64],
+        )
+    }
+
+    /// 右对齐 broadcast 乘(同 add_bcast 形状约定)
+    #[allow(clippy::too_many_arguments)]
+    pub fn mul_bcast_f32(
+        &mut self,
+        stream: &CudaStream,
+        outer: usize,
+        mid: usize,
+        inner: usize,
+        b_mid: usize,
+        a: *const f32,
+        b: *const f32,
+        out: *mut f32,
+    ) -> Result<(), String> {
+        self.launch_f32(
+            stream,
+            "owl_mul_bcast_f32",
+            outer * mid * inner,
+            &[outer as u64, mid as u64, inner as u64, b_mid as u64, a as u64, b as u64, out as u64],
+        )
+    }
 }
 
 // f16 封装:任务要求 add/mul f16(容差放宽);ptr 仍为裸指针

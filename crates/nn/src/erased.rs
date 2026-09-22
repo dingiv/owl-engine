@@ -399,3 +399,393 @@ mod tests {
         assert_eq!(got, vec![5.0, 6.0, 7.0, 8.0]);
     }
 }
+
+// ============================================================================
+// P1:索引 / 归约 / 组合 / broadcast 族(f32;S4 索引恒 U32)
+// ============================================================================
+
+/// 流上 D2D 拷贝(捕获安全;字节级)
+fn copy_d2d(
+    ctx: &KernelCtx,
+    dst: *mut core::ffi::c_void,
+    src: *const core::ffi::c_void,
+    bytes: usize,
+) -> Result<(), BackendError> {
+    use owl_cuda::ffi::sys;
+    unsafe {
+        sys::cuMemcpyDtoDAsync_v2(
+            dst as sys::CUdeviceptr,
+            src as sys::CUdeviceptr,
+            bytes,
+            ctx.stream().cu_stream(),
+        )
+        .result()
+        .map_err(|e| BackendError::CopyFailed { dir: "d2d", detail: format!("{e:?}") })
+    }
+}
+
+/// cat(f32;dim ∈ {0, last};同 dtype 断言;偏移视图安全)
+pub fn cat(
+    ctx: &KernelCtx,
+    parts: &[DynTensor<CudaDevice>],
+    dim: usize,
+) -> Result<DynTensor<CudaDevice>, BackendError> {
+    if parts.is_empty() {
+        return Err(BackendError::Init("cat: 空输入".into()));
+    }
+    let dt = parts[0].dtype();
+    require_f32(dt, "cat")?;
+    let rank = parts[0].shape().len();
+    if dim >= rank || (dim != 0 && dim + 1 != rank) {
+        return Err(BackendError::Init(format!(
+            "cat: 一期仅支持 dim=0 或 last(收到 dim={dim}/rank={rank})"
+        )));
+    }
+    for p in parts {
+        if p.dtype() != dt {
+            return Err(BackendError::Init("cat: dtype 不一致(S1)".into()));
+        }
+        if p.shape().len() != rank {
+            return Err(BackendError::Init("cat: rank 不一致".into()));
+        }
+        for (i, (a, b)) in p.shape().iter().zip(parts[0].shape()).enumerate() {
+            if i != dim && a != b {
+                return Err(BackendError::Init(format!("cat: 非拼接维 {i} 不一致")));
+            }
+        }
+    }
+    let mut out_shape = parts[0].shape().to_vec();
+    out_shape[dim] = parts.iter().map(|p| p.shape()[dim]).sum();
+    let out = ctx.scratch_tensor::<f32>(&out_shape)?;
+    ctx.trace_launch("cat(copy_d2d)");
+    let _inner: usize = out_shape[dim + 1..].iter().product();
+    let mut dst_off = 0usize;
+    if dim == 0 {
+        // 行块拷贝:每段 = rows × inner 连续块
+        for p in parts {
+            let bytes = elems(p.shape()) * 4;
+            copy_d2d(
+                ctx,
+                unsafe { out.device_ptr().add(dst_off) } as *mut _,
+                p.device_ptr() as *const _,
+                bytes,
+            )?;
+            dst_off += elems(p.shape());
+        }
+    } else {
+        // last 维:逐行段拷贝(rows = 外面积)
+        let rows: usize = out_shape[..dim].iter().product();
+        let mut src_row_off = 0usize;
+        for p in parts {
+            let seg = p.shape()[dim];
+            for r in 0..rows {
+                copy_d2d(
+                    ctx,
+                    unsafe { out.device_ptr().add(r * out_shape[dim] + dst_off) } as *mut _,
+                    unsafe { p.device_ptr().add(r * seg) } as *const _,
+                    seg * 4,
+                )?;
+            }
+            let _ = src_row_off;
+            src_row_off += seg;
+            dst_off += seg;
+        }
+        let _ = src_row_off;
+    }
+    for p in parts {
+        if let Some(t) = p.token() {
+            owl_signal::emit(t);
+        }
+    }
+    if let Some(t) = out.token() {
+        owl_signal::emit(t);
+    }
+    Ok(DynTensor::from_f32(&out))
+}
+
+/// stack(f32;仅 dim=0:新首维,其余形状必须一致)
+pub fn stack(
+    ctx: &KernelCtx,
+    parts: &[DynTensor<CudaDevice>],
+) -> Result<DynTensor<CudaDevice>, BackendError> {
+    if parts.is_empty() {
+        return Err(BackendError::Init("stack: 空输入".into()));
+    }
+    let mut shape = vec![parts.len()];
+    shape.extend_from_slice(parts[0].shape());
+    let out = ctx.scratch_tensor::<f32>(&shape)?;
+    ctx.trace_launch("stack(copy_d2d)");
+    let seg = elems(parts[0].shape()) * 4;
+    for (i, p) in parts.iter().enumerate() {
+        if p.shape() != parts[0].shape() || p.dtype() != parts[0].dtype() {
+            return Err(BackendError::Init("stack: 形状/dtype 不一致".into()));
+        }
+        copy_d2d(
+            ctx,
+            unsafe { out.device_ptr().add(i * elems(parts[0].shape())) } as *mut _,
+            p.device_ptr() as *const _,
+            seg,
+        )?;
+        if let Some(t) = p.token() {
+            owl_signal::emit(t);
+        }
+    }
+    if let Some(t) = out.token() {
+        owl_signal::emit(t);
+    }
+    Ok(DynTensor::from_f32(&out))
+}
+
+/// index_select(f32;dim=0 或 last;idx = U32 DynTensor,S4)
+pub fn index_select(
+    ops: &mut OpsCtx,
+    ctx: &KernelCtx,
+    src: &DynTensor<CudaDevice>,
+    dim: usize,
+    idx: &DynTensor<CudaDevice>,
+) -> Result<DynTensor<CudaDevice>, BackendError> {
+    require_f32(src.dtype(), "index_select")?;
+    if idx.dtype() != Dtype::U32 {
+        return Err(BackendError::Init(format!(
+            "index_select: 索引 dtype {} ≠ U32(S4)",
+            idx.dtype()
+        )));
+    }
+    let rank = src.shape().len();
+    if dim >= rank || (dim != 0 && dim + 1 != rank) {
+        return Err(BackendError::Init(format!(
+            "index_select: 一期仅 dim=0 或 last(收到 {dim}/{rank})"
+        )));
+    }
+    let n_idx = elems(idx.shape());
+    let inner: usize = src.shape()[dim + 1..].iter().product();
+    let mut out_shape = src.shape().to_vec();
+    out_shape[dim] = n_idx;
+    let out = ctx.scratch_tensor::<f32>(&out_shape)?;
+    ctx.trace_launch("gather");
+    ops.note_launch();
+    // 统一折算成扁平 gather:dim=0 → idx×inner;last → idx 直读
+    let flat_n = n_idx * inner;
+    let stream = std::sync::Arc::clone(ctx.stream());
+    if dim == 0 {
+        // idx 增广 ×inner 的缩放 gather:每 idx 值拷 inner 元素 →
+        // 复用 gather 核 n=flat_n,idx 已在设备侧;host 侧不行——
+        // 需要设备侧乘法。改用 inner-行块 copy 循环(D2D,捕获安全):
+        let ri = idx.downcast::<u32>()?;
+        // 逐 index 行块拷贝(idx 在设备,host 无值;→ 用 gather 核处理
+        // 行内首个元素再整行拷贝会错位。一期约束:dim=0 走 gather 核
+        // 展开式[idx[i]*inner + j],需展平核。当前以 gather 核直发,
+        // 参数为展平索引张量,由调用方预先传入展平 idx(见 gather)。
+        let _ = ri;
+        return Err(BackendError::Init(
+            "index_select(dim=0): 请用 gather(展平索引)或等 rows-块核回填(P1 后续)".into(),
+        ));
+    }
+    let rs = src.downcast::<f32>()?;
+    let ri = idx.downcast::<u32>()?;
+    let ro = out.device_ptr();
+    ops.kernels()
+        .gather_f32(&stream, flat_n, rs.device_ptr(), ri.device_ptr(), ro)
+        .map_err(BackendError::Init)?;
+    for t in [src.token(), idx.token(), out.token()] {
+        if let Some(t) = t {
+            owl_signal::emit(t);
+        }
+    }
+    Ok(DynTensor::from_f32(&out))
+}
+
+/// gather(f32;last 维语义扁平化:out[i] = src[flat_idx[i]],
+/// flat_idx 由调用方按 idx*inner 预展开;P1 通用版 = idx 直读版,见下)
+pub fn gather(
+    ops: &mut OpsCtx,
+    ctx: &KernelCtx,
+    src: &DynTensor<CudaDevice>,
+    idx: &DynTensor<CudaDevice>,
+) -> Result<DynTensor<CudaDevice>, BackendError> {
+    require_f32(src.dtype(), "gather")?;
+    if idx.dtype() != Dtype::U32 {
+        return Err(BackendError::Init("gather: 索引恒 U32(S4)".into()));
+    }
+    let n = elems(idx.shape());
+    let out = ctx.scratch_tensor::<f32>(&[n])?;
+    ctx.trace_launch("gather");
+    ops.note_launch();
+    let stream = std::sync::Arc::clone(ctx.stream());
+    let rs = src.downcast::<f32>()?;
+    let ri = idx.downcast::<u32>()?;
+    ops.kernels()
+        .gather_f32(&stream, n, rs.device_ptr(), ri.device_ptr(), out.device_ptr())
+        .map_err(BackendError::Init)?;
+    for t in [src.token(), idx.token(), out.token()] {
+        if let Some(t) = t {
+            owl_signal::emit(t);
+        }
+    }
+    Ok(DynTensor::from_f32(&out))
+}
+
+/// scatter_add(f32;dim0 语义:src [n, F] 按 idx[n] 累加进 out [num, F],out 预清零)
+pub fn scatter_add(
+    ops: &mut OpsCtx,
+    ctx: &KernelCtx,
+    num: usize,
+    src: &DynTensor<CudaDevice>,
+    idx: &DynTensor<CudaDevice>,
+) -> Result<DynTensor<CudaDevice>, BackendError> {
+    require_f32(src.dtype(), "scatter_add")?;
+    if idx.dtype() != Dtype::U32 {
+        return Err(BackendError::Init("scatter_add: 索引恒 U32(S4)".into()));
+    }
+    let f = src.shape().last().copied().ok_or_else(|| BackendError::Init("scatter_add: 空 src".into()))?;
+    if elems(idx.shape()) * f != elems(src.shape()) {
+        return Err(BackendError::Init("scatter_add: src 行数 ≠ idx 长度".into()));
+    }
+    let out = ctx.scratch_tensor::<f32>(&[num, f])?;
+    ctx.trace_launch("scatter_add");
+    ops.note_launch();
+    let stream = std::sync::Arc::clone(ctx.stream());
+    let rs = src.downcast::<f32>()?;
+    let ri = idx.downcast::<u32>()?;
+    ops.kernels()
+        .scatter_add_f32(&stream, elems(idx.shape()), rs.device_ptr(), ri.device_ptr(), out.device_ptr())
+        .map_err(BackendError::Init)?;
+    for t in [src.token(), idx.token(), out.token()] {
+        if let Some(t) = t {
+            owl_signal::emit(t);
+        }
+    }
+    Ok(DynTensor::from_f32(&out))
+}
+
+/// 轴归约(keepdim 恒真:out 同 rank,axis 维 = 1)
+pub fn sum_dim(
+    ops: &mut OpsCtx,
+    ctx: &KernelCtx,
+    src: &DynTensor<CudaDevice>,
+    dim: usize,
+) -> Result<DynTensor<CudaDevice>, BackendError> {
+    reduce_axis(ops, ctx, src, dim, true, "sum")
+}
+
+pub fn max_dim(
+    ops: &mut OpsCtx,
+    ctx: &KernelCtx,
+    src: &DynTensor<CudaDevice>,
+    dim: usize,
+) -> Result<DynTensor<CudaDevice>, BackendError> {
+    reduce_axis(ops, ctx, src, dim, false, "max")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reduce_axis(
+    ops: &mut OpsCtx,
+    ctx: &KernelCtx,
+    src: &DynTensor<CudaDevice>,
+    dim: usize,
+    is_sum: bool,
+    what: &str,
+) -> Result<DynTensor<CudaDevice>, BackendError> {
+    require_f32(src.dtype(), what)?;
+    let rank = src.shape().len();
+    if dim >= rank {
+        return Err(BackendError::Init(format!("{what}: dim 越界 {dim}/{rank}")));
+    }
+    // 重排到 [outer, axis, inner]:dim 后面的维进 inner
+    let inner: usize = src.shape()[dim + 1..].iter().product();
+    let outer: usize = src.shape()[..dim].iter().product();
+    // dim 之后还有多个维时 inner 含它们;axis = src.shape[dim] ✓
+    let axis = src.shape()[dim];
+    let mut out_shape = src.shape().to_vec();
+    out_shape[dim] = 1;
+    let out = ctx.scratch_tensor::<f32>(&out_shape)?;
+    ctx.trace_launch("reduce_axis");
+    ops.note_launch();
+    let stream = std::sync::Arc::clone(ctx.stream());
+    let rs = src.downcast::<f32>()?;
+    if is_sum {
+        ops.kernels()
+            .sum_axis_f32(&stream, outer, axis, inner, rs.device_ptr(), out.device_ptr())
+    } else {
+        ops.kernels()
+            .max_axis_f32(&stream, outer, axis, inner, rs.device_ptr(), out.device_ptr())
+    }
+    .map_err(BackendError::Init)?;
+    if let Some(t) = src.token() {
+        owl_signal::emit(t);
+    }
+    if let Some(t) = out.token() {
+        owl_signal::emit(t);
+    }
+    Ok(DynTensor::from_f32(&out))
+}
+
+/// 右对齐 broadcast 加(S2:b 任意轴 = 1;前导维必须相等)
+pub fn broadcast_add(
+    ops: &mut OpsCtx,
+    ctx: &KernelCtx,
+    a: &DynTensor<CudaDevice>,
+    b: &DynTensor<CudaDevice>,
+) -> Result<DynTensor<CudaDevice>, BackendError> {
+    bcast(ops, ctx, a, b, true)
+}
+
+pub fn broadcast_mul(
+    ops: &mut OpsCtx,
+    ctx: &KernelCtx,
+    a: &DynTensor<CudaDevice>,
+    b: &DynTensor<CudaDevice>,
+) -> Result<DynTensor<CudaDevice>, BackendError> {
+    bcast(ops, ctx, a, b, false)
+}
+
+fn bcast(
+    ops: &mut OpsCtx,
+    ctx: &KernelCtx,
+    a: &DynTensor<CudaDevice>,
+    b: &DynTensor<CudaDevice>,
+    is_add: bool,
+) -> Result<DynTensor<CudaDevice>, BackendError> {
+    require_f32(a.dtype(), "bcast")?;
+    require_f32(b.dtype(), "bcast")?;
+    let ra = a.shape();
+    let rb = b.shape();
+    if rb.len() > ra.len() {
+        return Err(BackendError::Init("bcast: b rank > a rank(S2 右对齐)".into()));
+    }
+    let off = ra.len() - rb.len();
+    for (i, &bv) in rb.iter().enumerate() {
+        let av = ra[off + i];
+        if bv != av && bv != 1 {
+            return Err(BackendError::Init(format!(
+                "bcast: b 维 {bv} 与 a 维 {av} 不兼容(S2)"
+            )));
+        }
+    }
+    // 三段分解:outer(前导积)| mid(b 覆盖区,a 各轴)| inner(b 尾部连续 1 段)
+    let b_ones = rb.iter().rev().take_while(|&&v| v == 1).count();
+    let outer: usize = ra[..off].iter().product();
+    let mid: usize = ra[off..ra.len() - b_ones].iter().product::<usize>().max(if ra.len() - b_ones == off { 1 } else { 0 });
+    let inner: usize = if b_ones == 0 { 1 } else { rb[rb.len() - b_ones..].iter().product() };
+    // b_mid = b 覆盖区各维之积(空 = 1;含 1 轴时模运算自然广播)
+    let b_mid: usize = rb[..rb.len() - b_ones].iter().product::<usize>().max(if rb.len() - b_ones == 0 { 1 } else { 0 });
+    let out = ctx.scratch_tensor::<f32>(ra)?;
+    ctx.trace_launch(if is_add { "add_bcast" } else { "mul_bcast" });
+    ops.note_launch();
+    let stream = std::sync::Arc::clone(ctx.stream());
+    let r_a = a.downcast::<f32>()?;
+    let r_b = b.downcast::<f32>()?;
+    let k = ops.kernels();
+    let res = if is_add {
+        k.add_bcast_f32(&stream, outer, mid, inner, b_mid, r_a.device_ptr(), r_b.device_ptr(), out.device_ptr())
+    } else {
+        k.mul_bcast_f32(&stream, outer, mid, inner, b_mid, r_a.device_ptr(), r_b.device_ptr(), out.device_ptr())
+    };
+    res.map_err(BackendError::Init)?;
+    for t in [a.token(), b.token(), out.token()] {
+        if let Some(t) = t {
+            owl_signal::emit(t);
+        }
+    }
+    Ok(DynTensor::from_f32(&out))
+}

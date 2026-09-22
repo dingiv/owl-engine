@@ -171,3 +171,71 @@ extern "C" __global__ void owl_embedding_f32(
         dst[col] = src[col];
     }
 }
+
+// ---- gather(owl 原创;语义 = candle index_select/gather 的 f32 核)----
+// dst[i] = src[idx[i]];idx 为 U32(S4 索引律)。n = dst 元素数。
+extern "C" __global__ void owl_gather_f32(
+    const unsigned long long n, const float *src,
+    const unsigned int *idx, float *dst) {
+    const unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { dst[i] = src[idx[i]]; }
+}
+
+// ---- scatter_add(owl 原创;语义 = candle scatter_add dim0)----
+// atomicAdd(&dst[idx[i]], src[i]);src/idx 长 n,dst 预清零。
+extern "C" __global__ void owl_scatter_add_f32(
+    const unsigned long long n, const float *src,
+    const unsigned int *idx, float *dst) {
+    const unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { atomicAdd(&dst[idx[i]], src[i]); }
+}
+
+// ---- 轴归约(owl 原创;sum/max 沿 axis,一 thread 一输出)----
+// src [outer, axis, inner] → dst [outer, inner];keepdim 由上层元数据表达。
+extern "C" __global__ void owl_sum_axis_f32(
+    const unsigned long long outer, const unsigned long long axis,
+    const unsigned long long inner, const float *src, float *dst) {
+    const unsigned long long oi = blockIdx.x * blockDim.x + threadIdx.x;
+    if (oi < outer * inner) {
+        const unsigned long long o = oi / inner, i = oi % inner;
+        float acc = 0.0f;
+        for (unsigned long long a = 0; a < axis; ++a) {
+            acc += src[(o * axis + a) * inner + i];
+        }
+        dst[oi] = acc;
+    }
+}
+extern "C" __global__ void owl_max_axis_f32(
+    const unsigned long long outer, const unsigned long long axis,
+    const unsigned long long inner, const float *src, float *dst) {
+    const unsigned long long oi = blockIdx.x * blockDim.x + threadIdx.x;
+    if (oi < outer * inner) {
+        const unsigned long long o = oi / inner, i = oi % inner;
+        float acc = src[(o * axis) * inner + i];
+        for (unsigned long long a = 1; a < axis; ++a) {
+            const float v = src[(o * axis + a) * inner + i];
+            if (v > acc) { acc = v; }
+        }
+        dst[oi] = acc;
+    }
+}
+
+// ---- 右对齐 broadcast 二元(owl 原创;S2)----
+// a [outer, mid, inner](mid = a 中段轴积);b 同 rank 右对齐,
+// 任意轴可为 1 → b_mid = b 中段轴积(1 轴在模运算里自然广播)。
+#define OWL_BCAST_F32(FN_NAME, FUNC)                                   \
+extern "C" __global__ void FN_NAME(                                    \
+    const unsigned long long outer, const unsigned long long mid,      \
+    const unsigned long long inner, const unsigned long long b_mid,    \
+    const float *a, const float *b, float *out) {                      \
+    const unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x;\
+    const unsigned long long n = outer * mid * inner;                  \
+    if (i < n) {                                                       \
+        const unsigned long long o = i / (mid * inner);                \
+        const unsigned long long r = i % (mid * inner);                \
+        const unsigned long long m = r / inner, c = r % inner;         \
+        out[i] = FUNC;                                                 \
+    }                                                                  \
+}
+OWL_BCAST_F32(owl_add_bcast_f32, a[i] + b[o * b_mid * inner + (m % b_mid) * inner + c])
+OWL_BCAST_F32(owl_mul_bcast_f32, a[i] * b[o * b_mid * inner + (m % b_mid) * inner + c])
