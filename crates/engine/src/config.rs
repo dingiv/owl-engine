@@ -1,4 +1,5 @@
 // src/utils/config.rs
+use crate::error::Result;
 use crate::transfer::PdConfig;
 use llguidance::api::TopLevelGrammar;
 use serde::de::value::SeqAccessDeserializer;
@@ -23,6 +24,8 @@ pub enum Activation {
     Relu,
     Relu2,
     Relu6,
+    /// HF 字符串 "silu"(Qwen3.5 等小写原文)
+    #[serde(alias = "silu", alias = "SiLU")]
     Silu,
     Sigmoid,
     HardSigmoid,
@@ -354,6 +357,24 @@ pub struct Config {
     pub mtp_max_verify_tokens: usize,
     #[serde(default)]
     pub expert_dtype: Option<String>,
+    // ---- Qwen3.5 hybrid(GDN 线性注意力)字段(字段名 = HF config.json 原文)----
+    /// 逐层类型表("linear_attention" | "full_attention");None = 全 full_attention
+    /// (兼容纯注意力旧模型)。alias 兼容 xinfer 命名 layers_block_type。
+    #[serde(default, alias = "layers_block_type")]
+    pub layer_types: Option<Vec<String>>,
+    /// 无 layer_types 时的回退周期:第 (i+1)%interval==0 层为 full_attention
+    #[serde(default)]
+    pub full_attention_interval: Option<usize>,
+    #[serde(default)]
+    pub linear_num_value_heads: Option<usize>,
+    #[serde(default)]
+    pub linear_num_key_heads: Option<usize>,
+    #[serde(default)]
+    pub linear_key_head_dim: Option<usize>,
+    #[serde(default)]
+    pub linear_value_head_dim: Option<usize>,
+    #[serde(default)]
+    pub linear_conv_kernel_dim: Option<usize>,
 }
 
 impl fmt::Debug for Config {
@@ -384,6 +405,55 @@ impl fmt::Debug for Config {
 }
 
 impl Config {
+    /// 从 config.json 原文反序列化。
+    ///
+    /// HF 多模态壳(architectures = Qwen3_5ForConditionalGeneration 等)把文本
+    /// 模型字段嵌在 `text_config` 对象下;此处解壳:根对象与 text_config 合并,
+    /// 同名键 text_config 优先(architectures / tie_word_embeddings /
+    /// image_token_id 等根字段保留)。纯文本 config(无 text_config)原样反序列化。
+    /// 另:`rope_parameters.{rope_theta,partial_rotary_factor}` 提升到顶层
+    /// (Qwen3.5 把 rope 参数收在 rope_parameters 里;xinfer 装载分支同语义)。
+    pub fn from_json_str(json: &str) -> Result<Self> {
+        let root: serde_json::Value = serde_json::from_str(json)
+            .map_err(|e| crate::error::Error::Msg(format!("config.json 解析失败: {e}")))?;
+        let merged = match root.get("text_config") {
+            Some(t) if t.is_object() => {
+                let mut obj = root
+                    .as_object()
+                    .cloned()
+                    .expect("root 为 JSON object(text_config 分支)");
+                for (k, v) in t.as_object().expect("text_config 为 object") {
+                    obj.insert(k.clone(), v.clone());
+                }
+                serde_json::Value::Object(obj)
+            }
+            _ => root,
+        };
+        // rope 参数提升(仅顶层缺省时;合并后的 rope_parameters 已入 rope_scaling)
+        let mut merged = merged;
+        if let Some(rp) = merged.get("rope_parameters").cloned() {
+            if merged.get("rope_theta").and_then(serde_json::Value::as_f64).is_none() {
+                if let Some(theta) = rp.get("rope_theta").and_then(serde_json::Value::as_f64) {
+                    merged["rope_theta"] = serde_json::Value::from(theta);
+                }
+            }
+            if merged
+                .get("partial_rotary_factor")
+                .and_then(serde_json::Value::as_f64)
+                .is_none()
+            {
+                if let Some(prf) = rp
+                    .get("partial_rotary_factor")
+                    .and_then(serde_json::Value::as_f64)
+                {
+                    merged["partial_rotary_factor"] = serde_json::Value::from(prf as f32);
+                }
+            }
+        }
+        serde_json::from_value(merged)
+            .map_err(|e| crate::error::Error::Msg(format!("config 反序列化失败: {e}")))
+    }
+
     pub fn apply_generation_cfg(&mut self, generation_cfg: Option<&GenerationConfig>) {
         let Some(gcfg) = generation_cfg else { return };
 
@@ -1987,5 +2057,76 @@ mod tests {
             Some("xhigh".to_string())
         );
         assert_eq!(ReasoningEffort::ModelDefault.chat_template_value(), None);
+    }
+
+    // ---- 阶段二线 A:真 config.json(Qwen3.5-0.8B)反序列化 + text_config 解壳 ----
+
+    /// 真模型 config(本地工作区;缺失时跳过——CI 无此文件)。
+    const REAL_CONFIG: &str = "/home/div/Documents/codes/models/Qwen/Qwen3.5-0.8B/config.json";
+
+    #[test]
+    fn from_json_str_unwraps_text_config_qwen35_08b() {
+        if !std::path::Path::new(REAL_CONFIG).exists() {
+            eprintln!("skip: 真模型 config 不在本机({REAL_CONFIG})");
+            return;
+        }
+        let json = std::fs::read_to_string(REAL_CONFIG).unwrap();
+        let cfg = Config::from_json_str(&json).expect("text_config 解壳后反序列化");
+
+        // 层型分布:18 linear + 6 full,full 恒在 3,7,11,15,19,23
+        let lt = cfg.layer_types.as_ref().expect("layer_types 存在");
+        assert_eq!(lt.len(), 24);
+        assert_eq!(lt.iter().filter(|t| t.as_str() == "linear_attention").count(), 18);
+        assert_eq!(lt.iter().filter(|t| t.as_str() == "full_attention").count(), 6);
+        for &i in &[3usize, 7, 11, 15, 19, 23] {
+            assert_eq!(lt[i], "full_attention", "第 {i} 层应为 full_attention");
+        }
+
+        // GDN 线性层参数(config.json 原文核对)
+        assert_eq!(cfg.linear_num_value_heads, Some(16));
+        assert_eq!(cfg.linear_num_key_heads, Some(16));
+        assert_eq!(cfg.linear_key_head_dim, Some(128));
+        assert_eq!(cfg.linear_value_head_dim, Some(128));
+        assert_eq!(cfg.linear_conv_kernel_dim, Some(4));
+
+        // full-attention 侧:num_attention_heads=8 × head_dim 256
+        // (q_proj [4096,1024] = 8×256×2,×2 来自 attn_output_gate 门控,非 16 头)
+        assert_eq!(cfg.num_attention_heads, 8);
+        assert_eq!(cfg.head_dim, Some(256));
+        assert_eq!(cfg.num_key_value_heads, 2);
+        assert_eq!(cfg.attn_output_gate, Some(true));
+        assert_eq!(cfg.hidden_size, 1024);
+        assert_eq!(cfg.intermediate_size, 3584);
+        assert_eq!(cfg.vocab_size, Some(248320));
+        assert_eq!(cfg.max_position_embeddings, 262144);
+        assert_eq!(cfg.rms_norm_eps, 1e-6);
+        assert_eq!(cfg.tie_word_embeddings, Some(true));
+        assert_eq!(cfg.mtp_num_hidden_layers, Some(1));
+
+        // rope 参数提升:rope_parameters.{rope_theta,partial_rotary_factor} → 顶层
+        assert_eq!(cfg.rope_theta, Some(10_000_000.0));
+        assert_eq!(cfg.partial_rotary_factor, Some(0.25));
+        // rope_scaling(alias rope_parameters)已接住 mrope 面与 rope_type
+        let rs = cfg.rope_scaling.as_ref().expect("rope_scaling 存在");
+        assert_eq!(rs.get("rope_type").and_then(|v| v.as_str()), Some("default"));
+        assert!(matches!(
+            rs.get("mrope_interleaved"),
+            Some(crate::config::RopeScalingValue::Bool(true))
+        ));
+    }
+
+    #[test]
+    fn from_json_str_flat_config_still_works() {
+        // 纯文本 config(无 text_config)原样反序列化(旧路径兼容)
+        let cfg = Config::from_json_str(
+            r#"{"architectures":["Qwen3ForCausalLM"],"num_attention_heads":4,
+                "num_key_value_heads":2,"max_position_embeddings":40960,
+                "hidden_size":256,"num_hidden_layers":2,"intermediate_size":512,
+                "rms_norm_eps":1e-6,"vocab_size":1000,"hidden_act":"silu",
+                "rope_theta":1000000.0}"#,
+        )
+        .expect("扁平 config 直接反序列化");
+        assert_eq!(cfg.num_attention_heads, 4);
+        assert!(cfg.layer_types.is_none(), "无 layer_types 字段时应为 None");
     }
 }

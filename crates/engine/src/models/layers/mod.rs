@@ -822,6 +822,66 @@ pub mod ctor {
 }
 
 
+/// safetensors 多文件查找索引(VarBuilderX safetensors 通道专用)。
+///
+/// 建索引时做两件事(零数据读取,只碰 header):
+/// - **过滤**:`mtp.*`(MTP 草稿头)与 `model.visual.*`(视觉塔)不入索引,
+///   查询返回不存在而非命中;
+/// - **归一**:HF 多模态壳把文本模型嵌在 `model.language_model.`,checkpoint
+///   键 `model.language_model.X` 追加别名 `model.X`(引擎请求路径;纯文本
+///   checkpoint 无此嵌套时别名不产生,恒等查找)。
+struct SafeIndex {
+    files: Vec<crate::loader::safetensors::SafeTensorsFile>,
+    /// 查找键 → (文件序号, 文件内实名)
+    map: std::collections::HashMap<String, (usize, String)>,
+}
+
+impl SafeIndex {
+    fn open(paths: &[std::path::PathBuf]) -> Result<Self> {
+        let mut files = Vec::with_capacity(paths.len());
+        let mut map: std::collections::HashMap<String, (usize, String)> =
+            std::collections::HashMap::new();
+        for (fi, p) in paths.iter().enumerate() {
+            let f = crate::loader::safetensors::SafeTensorsFile::open(p)?;
+            let names: Vec<String> = f.names().map(String::from).collect();
+            for name in names {
+                if name.starts_with("mtp.") || name.starts_with("model.visual.") {
+                    continue;
+                }
+                map.entry(name.clone()).or_insert((fi, name.clone()));
+                if let Some(rest) = name.strip_prefix("model.language_model.") {
+                    map.entry(format!("model.{rest}"))
+                        .or_insert((fi, name.clone()));
+                }
+            }
+            files.push(f);
+        }
+        Ok(Self { files, map })
+    }
+
+    fn resolve(&self, key: &str) -> Option<(&crate::loader::safetensors::SafeTensorsFile, &str)> {
+        self.map
+            .get(key)
+            .and_then(|(fi, real)| self.files.get(*fi).map(|f| (f, real.as_str())))
+    }
+
+    fn contains(&self, key: &str) -> bool {
+        self.map.contains_key(key)
+    }
+
+    fn shape(&self, key: &str) -> Option<Vec<usize>> {
+        self.resolve(key)
+            .and_then(|(f, real)| f.info(real).ok().map(|i| i.shape.clone()))
+    }
+
+    fn tensor_f32(&self, key: &str) -> Result<Vec<f32>> {
+        let (f, real) = self
+            .resolve(key)
+            .ok_or_else(|| Error::Msg(format!("safetensors: 无此张量 {key}")))?;
+        f.tensor_f32(real)
+    }
+}
+
 /// GGUF/safetensors 双路 var builder 包装(= xinfer `models::layers::VarBuilderX`)。
 ///
 /// T2-三 接线(2026-09-22):GGUF 通道经 [`crate::loader::gguf::GGufVarBuilder`]
@@ -842,6 +902,8 @@ pub struct VarBuilderX {
     gguf: Option<std::sync::Arc<crate::loader::gguf::GGufVarBuilder>>,
     /// R3 统一装载口(池由 allocator 持有;None = Host 测试模式)
     alloc: Option<std::sync::Arc<crate::loader::DeviceWeightAllocator<owl_cuda::CudaPool>>>,
+    /// HF safetensors 通道(is_gguf=false 且 filenames 非空;Arc 共享,pp 下钻零拷贝)
+    st: Option<std::sync::Arc<SafeIndex>>,
     // 设备句柄(device() 查询面)
     device: Option<Device>,
     // dry-run 假数据模式(from_fake;种子 = 键名哈希,确定性可复现)
@@ -858,18 +920,25 @@ impl VarBuilderX {
         _dtype: DType,
         device: &Device,
     ) -> Result<Self> {
-        let gguf = if is_gguf && !model_pathes.filenames.is_empty() {
-            Some(std::sync::Arc::new(
-                crate::loader::gguf::GGufVarBuilder::from_gguf_files(&model_pathes.filenames)?,
-            ))
+        let (gguf, st) = if is_gguf && !model_pathes.filenames.is_empty() {
+            (
+                Some(std::sync::Arc::new(
+                    crate::loader::gguf::GGufVarBuilder::from_gguf_files(&model_pathes.filenames)?,
+                )),
+                None,
+            )
+        } else if !is_gguf && !model_pathes.filenames.is_empty() {
+            // HF safetensors(单/多分片);header 全量校验在 open 内
+            (None, Some(std::sync::Arc::new(SafeIndex::open(&model_pathes.filenames)?)))
         } else {
-            None
+            (None, None)
         };
         Ok(Self {
             module_path: String::new(),
             weight_paths: Some(model_pathes.filenames.clone()),
             is_gguf,
             gguf,
+            st,
             alloc: None,
             device: Some(device.clone()),
             fake: false,
@@ -914,6 +983,23 @@ impl VarBuilderX {
             weight_paths: None,
             is_gguf: true,
             gguf: Some(std::sync::Arc::new(vb)),
+            st: None,
+            alloc: None,
+            device: None,
+            fake: false,
+        })
+    }
+
+    /// safetensors host 模式构造器(零设备依赖;装载链/对拍单测用)。
+    pub fn from_safetensors_file_host<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
+        let paths = vec![path.as_ref().to_path_buf()];
+        let idx = SafeIndex::open(&paths)?;
+        Ok(Self {
+            module_path: String::new(),
+            weight_paths: None,
+            is_gguf: false,
+            gguf: None,
+            st: Some(std::sync::Arc::new(idx)),
             alloc: None,
             device: None,
             fake: false,
@@ -947,6 +1033,7 @@ impl VarBuilderX {
             weight_paths: self.weight_paths.clone(),
             is_gguf: self.is_gguf,
             gguf: self.gguf.clone(),
+            st: self.st.clone(),
             alloc: self.alloc.clone(),
             device: self.device.clone(),
             fake: self.fake,
@@ -969,6 +1056,13 @@ impl VarBuilderX {
         &self.module_path
     }
     pub fn has_key(&self, name: &str) -> bool {
+        if !self.is_gguf {
+            return self
+                .st
+                .as_ref()
+                .map(|s| s.contains(&self.full_name(name)))
+                .unwrap_or(false);
+        }
         self.gguf
             .as_ref()
             .map(|g| g.contains_key(&self.full_name(name)))
@@ -978,8 +1072,17 @@ impl VarBuilderX {
         self.has_key(name)
     }
     pub fn get_no_shape(&self, name: &str) -> Result<Tensor> {
-        // 无 shape 请求 = 按元数据原 shape 反解(GGUF 维序反转回 owl 行主序)
+        // 无 shape 请求 = 按元数据原 shape 反解(safetensors 原生行主序;
+        // GGUF 维序反转回 owl 行主序)
         let full = self.full_name(name);
+        if !self.is_gguf {
+            let shape = self
+                .st
+                .as_ref()
+                .and_then(|s| s.shape(&full))
+                .ok_or_else(|| Error::Msg(format!("VarBuilderX: 权重缺失 {full}")))?;
+            return self.get_with_hints_dtype(shape, name, Shard::default(), DType::F32);
+        }
         let shape = self
             .gguf
             .as_ref()
@@ -991,6 +1094,9 @@ impl VarBuilderX {
         self.get_with_hints_dtype(owl_shape, name, Shard::default(), DType::F32)
     }
     pub fn tensor_shape(&self, name: &str) -> Option<Vec<usize>> {
+        if !self.is_gguf {
+            return self.st.as_ref().and_then(|s| s.shape(&self.full_name(name)));
+        }
         let mut s = self.gguf.as_ref().and_then(|g| g.tensor_shape(&self.full_name(name)))?;
         s.reverse(); // GGUF 反转维序 → owl 行主序
         Some(s)
@@ -1007,7 +1113,36 @@ impl VarBuilderX {
     fn gguf_ref(&self) -> Result<std::sync::Arc<crate::loader::gguf::GGufVarBuilder>> {
         self.gguf
             .clone()
-            .ok_or_else(|| Error::Msg("VarBuilderX: 非 GGUF 路径(safetensors 通道 T3 回填)".into()))
+            .ok_or_else(|| Error::Msg("VarBuilderX: 非 GGUF 路径".into()))
+    }
+
+    fn st_ref(&self) -> Result<std::sync::Arc<SafeIndex>> {
+        self.st
+            .clone()
+            .ok_or_else(|| Error::Msg("VarBuilderX: 非 safetensors 路径".into()))
+    }
+
+    /// R3 统一装载口尾段:f32 → 目标 dtype 字节流 → materialize_dyn 落池
+    /// (账本化)→ 擦除句柄。
+    fn materialize_f32_weight(
+        &self,
+        shape: Vec<usize>,
+        f32s: Vec<f32>,
+        dtype: DType,
+    ) -> Result<Tensor> {
+        let alloc = self.alloc_ref()?;
+        let target = match dtype {
+            DType::F32 => DType::F32,
+            DType::BF16 => DType::BF16,
+            DType::F16 => DType::F16,
+            _ => {
+                return Err(Error::Msg(format!(
+                    "VarBuilderX: 目标 dtype {dtype} 权重装载未开(U8/U32/I64 经 kvcache/索引专用通道;F8 量化 = marlin-ffi 路线)"
+                )))
+            }
+        };
+        let bytes = crate::loader::f32_vec_to_dtype_bytes(target, &f32s)?;
+        alloc.materialize_dyn(&shape, target, &bytes)
     }
 
     fn alloc_ref(&self) -> Result<std::sync::Arc<crate::loader::DeviceWeightAllocator<owl_cuda::CudaPool>>> {
@@ -1053,8 +1188,23 @@ impl VarBuilderX {
                 bytemuck::cast_slice(&data),
             )?);
         }
-        let gg = self.gguf_ref()?;
         let full = self.full_name(name);
+        if !self.is_gguf {
+            // safetensors 通道:shape 校验(原生行主序)→ 懒转 f32 → 落池
+            let st = self.st_ref()?;
+            let want = s.into().dims().to_vec();
+            let shape = st
+                .shape(&full)
+                .ok_or_else(|| Error::Msg(format!("VarBuilderX: 权重缺失 {full}")))?;
+            if shape != want {
+                return Err(Error::Msg(format!(
+                    "VarBuilderX: {full} shape 不符: 请求 {want:?}, 实际 {shape:?}"
+                )));
+            }
+            let f32s = st.tensor_f32(&full)?;
+            return self.materialize_f32_weight(shape, f32s, dtype);
+        }
+        let gg = self.gguf_ref()?;
         // shape 校验真实:请求(owl 行主序)→ GGUF 反转维序后比对
         let mut want = s.into().dims().to_vec();
         want.reverse();
@@ -1062,8 +1212,7 @@ impl VarBuilderX {
         let mut owl_shape = raw.shape.clone();
         owl_shape.reverse();
 
-        // R3 统一装载口:反解到 f32 → allocator 转目标 dtype 字节流 →
-        // materialize_dyn 落池(账本化)→ 擦除句柄
+        // GGUF:反解到 f32(量化经 dequantize)后走统一尾段
         let f32s: Vec<f32> = if raw.dtype == crate::loader::gguf::GgmlDType::F32 {
             raw.raw
                 .chunks_exact(4)
@@ -1072,19 +1221,7 @@ impl VarBuilderX {
         } else {
             crate::loader::gguf::dequantize_to_f32(raw.dtype, &raw.shape, &raw.raw)?
         };
-        let alloc = self.alloc_ref()?;
-        let target = match dtype {
-            DType::F32 => DType::F32,
-            DType::BF16 => DType::BF16,
-            DType::F16 => DType::F16,
-            _ => {
-                return Err(Error::Msg(format!(
-                    "VarBuilderX: 目标 dtype {dtype} 权重装载未开(U8/U32/I64 经 kvcache/索引专用通道;F8 量化 = marlin-ffi 路线)"
-                )))
-            }
-        };
-        let bytes = crate::loader::f32_vec_to_dtype_bytes(target, &f32s)?;
-        alloc.materialize_dyn(&owl_shape, target, &bytes)
+        self.materialize_f32_weight(owl_shape, f32s, dtype)
     }
     pub fn get(&self, s: impl Into<Shape>, name: &str) -> Result<Tensor> {
         self.get_with_hints_dtype(s, name, Shard::default(), DType::F32)
@@ -1100,8 +1237,26 @@ impl VarBuilderX {
 
     /// Host 测试模式:反解产物留在内存(零设备依赖;供装载链单测)。
     pub fn get_host(&self, s: impl Into<Shape>, name: &str) -> Result<HostTensorBoxed> {
-        let gg = self.gguf_ref()?;
         let full = self.full_name(name);
+        if !self.is_gguf {
+            let st = self.st_ref()?;
+            let want = s.into().dims().to_vec();
+            let shape = st
+                .shape(&full)
+                .ok_or_else(|| Error::Msg(format!("VarBuilderX: 权重缺失 {full}")))?;
+            if shape != want {
+                return Err(Error::Msg(format!(
+                    "VarBuilderX: {full} shape 不符: 请求 {want:?}, 实际 {shape:?}"
+                )));
+            }
+            let f32s = st.tensor_f32(&full)?;
+            let mut bytes = Vec::with_capacity(f32s.len() * 4);
+            for f in &f32s {
+                bytes.extend_from_slice(&f.to_le_bytes());
+            }
+            return Ok(HostTensorBoxed { shape, data: bytes });
+        }
+        let gg = self.gguf_ref()?;
         let mut want = s.into().dims().to_vec();
         want.reverse();
         let raw = gg.get(&want, &full)?;
@@ -1623,5 +1778,174 @@ mod varbuilder_tests {
         }
         assert_eq!(host, [1.0, 2.0, 3.0, 4.0]);
         std::fs::remove_file(&p).ok();
+    }
+
+    // ---- HF safetensors 通道(真文件;缺失时跳过——CI 无此文件)----
+
+    const ST_MODEL: &str =
+        "/home/div/Documents/codes/models/Qwen/Qwen3.5-0.8B/model.safetensors-00001-of-00001.safetensors";
+
+    fn st_host_vb() -> Option<VarBuilderX> {
+        if !std::path::Path::new(ST_MODEL).exists() {
+            eprintln!("skip: 真模型文件不在本机({ST_MODEL})");
+            return None;
+        }
+        Some(VarBuilderX::from_safetensors_file_host(ST_MODEL).unwrap())
+    }
+
+    /// host 通道:别名归一 + checkpoint 过滤 + 元数据面 + get_host 数值抽查
+    #[test]
+    fn safetensors_host_channel_alias_filter_values() {
+        let Some(vb) = st_host_vb() else { return };
+        // 归一:model.language_model.X → model.X(引擎请求路径)
+        assert!(vb.has_key("model.embed_tokens.weight"));
+        assert!(vb.has_key("model.layers.0.linear_attn.conv1d.weight"));
+        assert!(vb.has_key("model.layers.3.self_attn.q_proj.weight"));
+        assert!(vb.contains_tensor("model.norm.weight"));
+        // 过滤:mtp. / model.visual. 查询 = 不存在而非报错
+        assert!(!vb.has_key("mtp.norm.weight"));
+        assert!(!vb.has_key("mtp.fc.weight"));
+        assert!(!vb.has_key("model.visual.patch_embed.proj.weight"));
+        assert!(!vb.contains_tensor("model.visual.merger.linear_fc1.weight"));
+        // 元数据 shape:原生行主序,无反转
+        assert_eq!(
+            vb.tensor_shape("model.layers.3.self_attn.q_proj.weight"),
+            Some(vec![4096, 1024])
+        );
+        assert_eq!(
+            vb.tensor_shape("model.layers.0.linear_attn.conv1d.weight"),
+            Some(vec![6144, 1, 4])
+        );
+
+        // get_host 数值抽查:与直接 SafeTensorsFile 读数位型一致(BF16→F32 扩位精确)
+        let direct =
+            crate::loader::safetensors::SafeTensorsFile::open(ST_MODEL).unwrap();
+
+        // ① embed_tokens(别名路径;首行 1024 元素全对拍)
+        let host = vb
+            .get_host([248320, 1024], "model.embed_tokens.weight")
+            .unwrap();
+        assert_eq!(host.shape, vec![248320, 1024]);
+        assert_eq!(host.data.len(), 248320 * 1024 * 4);
+        let want = direct
+            .tensor_f32("model.language_model.embed_tokens.weight")
+            .unwrap();
+        for (i, c) in host.data[..1024 * 4].chunks_exact(4).enumerate() {
+            let g = f32::from_le_bytes(c.try_into().unwrap());
+            assert_eq!(g, want[i], "embed 第 {i} 元素不符");
+        }
+
+        // ② GDN 层 conv1d [6144,1,4](中段一点)
+        let conv = vb
+            .get_host([6144, 1, 4], "model.layers.0.linear_attn.conv1d.weight")
+            .unwrap();
+        assert_eq!(conv.shape, vec![6144, 1, 4]);
+        let want_conv = direct
+            .tensor_f32("model.language_model.layers.0.linear_attn.conv1d.weight")
+            .unwrap();
+        let mid = 6144 / 2;
+        assert_eq!(
+            f32::from_le_bytes(conv.data[mid * 4..mid * 4 + 4].try_into().unwrap()),
+            want_conv[mid]
+        );
+
+        // ③ attn 层 q_proj [4096,1024] = 8 头×256×2(门控加倍;头数定谳依据)
+        let q = vb
+            .get_host([4096, 1024], "model.layers.3.self_attn.q_proj.weight")
+            .unwrap();
+        assert_eq!(q.shape, vec![4096, 1024]);
+
+        // shape 不符 = 结构化报错
+        assert!(vb.get_host([1, 2], "model.layers.3.self_attn.q_proj.weight").is_err());
+        // 缺失 = 结构化报错
+        assert!(vb.get_host([2], "nope").is_err());
+    }
+
+    /// 设备通道:真文件 → with_pool 落池,三键(GDN conv1d / attn q_proj / norm)
+    /// D2H 对拍 = 直接读数一致
+    #[test]
+    fn safetensors_device_channel_loads() {
+        let Some(vb_host) = st_host_vb() else { return };
+        use owl_iface::Device as _;
+        let dev =
+            owl_cuda::CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
+        let pool = std::sync::Arc::new(
+            dev.create_pool(owl_iface::PoolConfig {
+                name: format!("vb-st-test-{}", std::process::id()),
+                kind: owl_iface::PoolKind::Weights,
+                bytes: 64 << 20,
+            })
+            .unwrap(),
+        );
+        let paths = vec![std::path::PathBuf::from(ST_MODEL)];
+        let vb = VarBuilderX::new(
+            &crate::downloader::ModelPaths {
+                tokenizer_filename: Default::default(),
+                tokenizer_config_filename: Default::default(),
+                config_filename: Default::default(),
+                generation_config_filename: Default::default(),
+                filenames: paths,
+                auxiliary_filenames: vec![],
+                chat_template_filename: None,
+            },
+            false,
+            DType::F32,
+            &dev,
+        )
+        .unwrap()
+        .with_pool(pool);
+        assert!(!vb.is_qvar_builder());
+
+        let d2h = |t: &Tensor| -> Vec<f32> {
+            let n = t.shape().iter().product::<usize>();
+            let mut host = vec![0f32; n];
+            unsafe {
+                owl_cuda::ffi::sys::cuMemcpyDtoH_v2(
+                    host.as_mut_ptr() as *mut std::ffi::c_void,
+                    t.device_ptr() as owl_cuda::ffi::sys::CUdeviceptr,
+                    n * 4,
+                )
+                .result()
+                .unwrap();
+            }
+            host
+        };
+
+        // ① GDN conv1d(中段一点)
+        let conv = vb
+            .get([6144, 1, 4], "model.layers.0.linear_attn.conv1d.weight")
+            .unwrap();
+        assert_eq!(conv.dtype(), DType::F32);
+        assert_eq!(conv.shape(), &[6144, 1, 4]);
+        let direct =
+            crate::loader::safetensors::SafeTensorsFile::open(ST_MODEL).unwrap();
+        let want_conv = direct
+            .tensor_f32("model.language_model.layers.0.linear_attn.conv1d.weight")
+            .unwrap();
+        let got_conv = d2h(&conv);
+        assert_eq!(got_conv[6144 / 2], want_conv[6144 / 2]);
+
+        // ② attn q_proj(首 16 点)
+        let q = vb
+            .get([4096, 1024], "model.layers.3.self_attn.q_proj.weight")
+            .unwrap();
+        assert_eq!(q.shape(), &[4096, 1024]);
+        let want_q = direct
+            .tensor_f32("model.language_model.layers.3.self_attn.q_proj.weight")
+            .unwrap();
+        for (i, g) in d2h(&q).into_iter().take(16).enumerate() {
+            assert_eq!(g, want_q[i]);
+        }
+
+        // ③ norm [1024](全量)
+        let norm = vb.get([1024], "model.norm.weight").unwrap();
+        assert_eq!(norm.shape(), &[1024]);
+        let want_norm = direct
+            .tensor_f32("model.language_model.norm.weight")
+            .unwrap();
+        assert_eq!(d2h(&norm), want_norm);
+
+        // host 参照物仍存活(避免 unused 警告;别名面一致性)
+        assert!(vb_host.has_key("model.embed_tokens.weight"));
     }
 }
