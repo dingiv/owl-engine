@@ -5,6 +5,7 @@
 //! 无运行时 htod 形状数组;contiguous-only。
 
 pub mod attention;
+pub mod gdn_kernels;
 
 use owl_cuda::ffi::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use owl_cuda::ffi::nvrtc::{compile_ptx_with_opts, CompileOptions};
