@@ -27,7 +27,8 @@ use std::rc::Rc;
 // ---- vendor gdn kernel 垫片(attention-rs port,T3 回填) ----
 #[allow(dead_code)] // flashinfer 引入后接通(裁决 2026-09-22)
 mod gdn_shim {
-    use super::{ctx_scope, Result, Tensor};
+    use super::{ctx_scope, cat_local, Result, Tensor};
+    use crate::models::layers::OwlTensor;
     use owl_nn::kernels::gdn_kernels::GdnKernels;
     use std::sync::{Arc, Mutex, OnceLock};
 
@@ -44,19 +45,73 @@ mod gdn_shim {
         Ok(Arc::clone(K.get().expect("gdn kernels 初始化")))
     }
 
-    /// 因果卷积 prefill(变长;conv_state 就地更新 + 可选快照)
+    /// 因果卷积 prefill(变长;conv_state [nseq, d, 3] 已由调用方 gather,
+    /// 核按序列序号就地滚动,写回由 forward 的 scatter 路负责)
     #[allow(clippy::too_many_arguments)]
     pub fn causal_conv1d_fwd(
-        _mixed_qkv: &Tensor,
-        _weight: &Tensor,
-        _bias: Option<&Tensor>,
-        _conv_state: &mut Tensor,
-        _snapshots: Option<&Tensor>,
-        _cu_seqlens: &Tensor,
-        _silu: bool,
+        mixed_qkv: &Tensor,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        conv_state: &mut Tensor,
+        snapshots: Option<&Tensor>,
+        cu_seqlens: &Tensor,
+        silu: bool,
     ) -> Result<Tensor> {
-        // TODO(B3.3-续): conv1d_fwd_k4 直通(与 update_slots 同构,差 cu_seqlens 入参)
-        unimplemented!("B3.3-续: causal_conv1d_fwd 接 gdn_conv1d_fwd_k4(方案已定,见交接档)")
+        if snapshots.is_some() {
+            return Err(crate::Error::Schedule(
+                "gdn conv1d_fwd: MTP conv 快照未接(MTP verify 域外,结构化报错)".into(),
+            ));
+        }
+        if mixed_qkv.dtype() != owl_nn::Dtype::F32 {
+            return Err(crate::Error::Msg(format!(
+                "gdn conv1d_fwd: 仅 F32(mamba_ssm_dtype=f32),得到 {:?}",
+                mixed_qkv.dtype()
+            )));
+        }
+        let shape = mixed_qkv.shape().to_vec(); // [total, d]
+        if shape.len() != 2 {
+            return Err(crate::Error::Msg(format!(
+                "gdn conv1d_fwd: 期望 [total, d],实际 {shape:?}"
+            )));
+        }
+        let (total, d) = (shape[0], shape[1]);
+        // cu_seqlens host 读取(急切 prefill 路径合法;捕获路径不走此处)
+        let cu = super::vendor::read_u32_device(cu_seqlens)?;
+        if cu.len() < 2 || cu.len() - 1 != conv_state.shape()[0] {
+            return Err(crate::Error::Msg(format!(
+                "gdn conv1d_fwd: cu_seqlens len {} 与 conv_state 行数 {} 不一致",
+                cu.len(),
+                conv_state.shape()[0]
+            )));
+        }
+        if (cu[cu.len() - 1] as usize) != total {
+            return Err(crate::Error::Msg(format!(
+                "gdn conv1d_fwd: cu_seqlens 末值 {} != token 总数 {total}",
+                cu[cu.len() - 1]
+            )));
+        }
+        // 核期望 weight [d, 4] 连续(conv1d.weight [d,1,4] 同一内存布局,直传指针)
+        let batch = (cu.len() - 1) as i32;
+        let k = kernels()?;
+        ctx_scope::with_dry(|ctx, _dry| {
+            let out = ctx.scratch_tensor::<f32>(&shape)?;
+            let mut kk = k.lock().map_err(|_| crate::Error::Msg("gdn kernels 中毒".into()))?;
+            kk.conv1d_fwd_k4(
+                ctx.stream(),
+                "f32",
+                mixed_qkv.device_ptr(),
+                weight.device_ptr(),
+                bias.map(|b| b.device_ptr() as *const u8).unwrap_or(std::ptr::null()),
+                conv_state.device_ptr() as *mut f32,
+                out.device_ptr() as *mut u8,
+                cu_seqlens.device_ptr() as *const u32,
+                batch,
+                d as i32,
+                silu,
+            )
+            .map_err(|e| crate::Error::Msg(format!("conv1d_fwd: {e}")))?;
+            Ok(owl_nn::DynTensor::from_f32(&out))
+        })
     }
 
     /// 因果卷积 decode(按 slot 更新状态)
@@ -174,37 +229,41 @@ mod gdn_shim {
         unimplemented!("T3: gdn::gated_delta_rule_prefill_flashinfer_gqa(flashinfer 引入后)")
     }
 
-    /// prefill 变长 GQA 递推(主路)
+    /// prefill 变长 GQA 递推(主路;g log 空间,q 未缩放 → 核内约定在垫片统一)
     #[allow(clippy::too_many_arguments)]
     pub fn gated_delta_rule_recurrence_varlen_gqa(
-        _q: &Tensor,
-        _k: &Tensor,
-        _v: &Tensor,
-        _g: &Tensor,
-        _beta: &Tensor,
-        _state: &mut Tensor,
-        _seq_slots: &Tensor,
-        _cu_seqlens: &Tensor,
-        _scale: f32,
-        _snapshots: Option<&Tensor>,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        g: &Tensor,
+        beta: &Tensor,
+        state: &mut Tensor,
+        seq_slots: &Tensor,
+        cu_seqlens: &Tensor,
+        scale: f32,
+        snapshots: Option<&Tensor>,
     ) -> Result<Tensor> {
-        unimplemented!("T3: gdn::gated_delta_rule_recurrence_varlen_gqa(attention-rs port)")
+        recurrence_varlen_impl(
+            q, k, v, g, beta, state, seq_slots, cu_seqlens, snapshots, scale,
+        )
     }
 
-    /// prefill 变长 MHA 递推(k==v 头数)
+    /// prefill 变长 MHA 递推(k==v 头数;q 已由调用方缩放)
     #[allow(clippy::too_many_arguments)]
     pub fn gated_delta_rule_recurrence_varlen(
-        _q: &Tensor,
-        _k: &Tensor,
-        _v: &Tensor,
-        _g: &Tensor,
-        _beta: &Tensor,
-        _state: &mut Tensor,
-        _seq_slots: &Tensor,
-        _cu_seqlens: &Tensor,
-        _snapshots: Option<&Tensor>,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        g: &Tensor,
+        beta: &Tensor,
+        state: &mut Tensor,
+        seq_slots: &Tensor,
+        cu_seqlens: &Tensor,
+        snapshots: Option<&Tensor>,
     ) -> Result<Tensor> {
-        unimplemented!("T3: gdn::gated_delta_rule_recurrence_varlen(attention-rs port)")
+        recurrence_varlen_impl(
+            q, k, v, g, beta, state, seq_slots, cu_seqlens, snapshots, 1.0,
+        )
     }
 
     /// decode 按 slot GQA 递推
@@ -302,6 +361,141 @@ mod gdn_shim {
         head_v_dim: usize,
     ) -> Result<Tensor> {
         gated_rmsnorm_act(output, z, weight, bias, eps, head_v_dim, 1)
+    }
+
+    /// prefill 变长递推统一实现(09-23 深夜改道定谳):
+    /// 原 gdn_delta_rec_fb 直通在 bh>1 时 out 写缺失(状态写正确;owl-nn 单独
+    /// 对拍却绿——多块并发下 out 路径行为与状态路径不一致,另案查 .cu)。
+    /// 现役实现 = delta_decode_slots_gqa 逐 token 推进:语义 = delta rule
+    /// 按时间展开,逐序列 token 连续(narrow_dim0 视图零拷贝),状态常驻表
+    /// 槽寻址就地读写,g log 空间核内自 exp(两核约定差异消失),GQA 映射
+    /// 核内完成(q 缩放核内)。代价 = 每 token 一次 launch(fallback 可接受;
+    /// tiled/varlen 核引入后替换,见 phase2 路线)。
+    #[allow(clippy::too_many_arguments)]
+    fn recurrence_varlen_impl(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        g: &Tensor,
+        beta: &Tensor,
+        state: &mut Tensor,
+        seq_slots: &Tensor,
+        cu_seqlens: &Tensor,
+        snapshots: Option<&Tensor>,
+        q_scale: f32,
+    ) -> Result<Tensor> {
+        if snapshots.is_some() {
+            return Err(crate::Error::Schedule(
+                "gdn recurrence: MTP recurrent 快照未接(MTP verify 域外,结构化报错)".into(),
+            ));
+        }
+        if q.dtype() != owl_nn::Dtype::F32 {
+            return Err(crate::Error::Msg(format!(
+                "gdn recurrence: 仅 F32(mamba_ssm_dtype=f32),得到 {:?}",
+                q.dtype()
+            )));
+        }
+        let q_shape = q.shape().to_vec(); // [T, nk, kd]
+        if q_shape.len() != 3 {
+            return Err(crate::Error::Msg(format!(
+                "gdn recurrence: 期望 q [T, nk, kd],实际 {q_shape:?}"
+            )));
+        }
+        let v_shape = v.shape().to_vec(); // [T, nv, vd]
+        if v_shape.len() != 3 || v_shape[0] != q_shape[0] {
+            return Err(crate::Error::Msg(format!(
+                "gdn recurrence: q {q_shape:?} 与 v {v_shape:?} token 数不一致"
+            )));
+        }
+        let (total, nk, kd) = (q_shape[0], q_shape[1], q_shape[2]);
+        let (nv, vd) = (v_shape[1], v_shape[2]);
+        if nv % nk != 0 {
+            return Err(crate::Error::Msg(format!(
+                "gdn recurrence: nv={nv} 须被 nk={nk} 整除(GQA 组映射)"
+            )));
+        }
+        // host 读取:cu_seqlens [n+1] + 槽位 [n](急切 prefill 合法;捕获不走此处)
+        let cu = super::vendor::read_u32_device(cu_seqlens)?;
+        let slots = super::vendor::read_u32_device(seq_slots)?;
+        if cu.len() < 2 || cu.len() - 1 != slots.len() {
+            return Err(crate::Error::Msg(format!(
+                "gdn recurrence: cu_seqlens len {} 与槽位数 {} 不一致",
+                cu.len(),
+                slots.len()
+            )));
+        }
+        if (cu[cu.len() - 1] as usize) != total {
+            return Err(crate::Error::Msg(format!(
+                "gdn recurrence: cu_seqlens 末值 {} != token 总数 {total}",
+                cu[cu.len() - 1]
+            )));
+        }
+        if state.shape()[0] as u64 <= *slots.iter().max().unwrap_or(&0) as u64 {
+            return Err(crate::Error::Msg(format!(
+                "gdn recurrence: 槽位越界 max={} state 行数 {}",
+                slots.iter().max().unwrap_or(&0),
+                state.shape()[0]
+            )));
+        }
+        let kn = kernels()?;
+        let mut pieces: Vec<Tensor> = Vec::with_capacity(total);
+        for (i, &slot) in slots.iter().enumerate() {
+            let (s, e) = (cu[i] as usize, cu[i + 1] as usize);
+            if e <= s {
+                continue; // 空序列跳过
+            }
+            if slot == u32::MAX {
+                return Err(crate::Error::Schedule(
+                    "gdn recurrence: prefill 序列命中无效槽位哨兵(prefill 不应出现)".into(),
+                ));
+            }
+            // 槽位张量视图([1] U32):decode 核按 slots[0] 寻址常驻状态行
+            let slot_view = seq_slots.narrow_dim0(i, 1)?;
+            for t in s..e {
+                let q_t = q.narrow_dim0(t, 1)?; // [1, nk, kd] 视图
+                let k_t = k.narrow_dim0(t, 1)?;
+                let v_t = v.narrow_dim0(t, 1)?; // [1, nv, vd]
+                let g_t = g.narrow_dim0(t, 1)?; // [1, nv](log 空间,核内 exp)
+                let beta_t = beta.narrow_dim0(t, 1)?;
+                let out_t = ctx_scope::with_dry(|ctx, _dry| {
+                    let out = ctx.scratch_tensor::<f32>(&[1, nv, vd])?;
+                    let mut kk =
+                        kn.lock().map_err(|_| crate::Error::Msg("gdn kernels 中毒".into()))?;
+                    kk.delta_decode_slots_gqa(
+                        ctx.stream(),
+                        "f32",
+                        q_t.device_ptr(),
+                        k_t.device_ptr(),
+                        v_t.device_ptr(),
+                        g_t.device_ptr() as *const f32,
+                        beta_t.device_ptr() as *const f32,
+                        state.device_ptr() as *mut f32,
+                        slot_view.device_ptr() as *const u32,
+                        out.device_ptr() as *mut u8,
+                        1,
+                        nv as i32,
+                        nk as i32,
+                        kd as i32,
+                        vd as i32,
+                        q_scale,
+                    )
+                    .map_err(|e| crate::Error::Msg(format!("delta_dec(prefill): {e}")))?;
+                    Ok(owl_nn::DynTensor::from_f32(&out))
+                })?;
+                pieces.push(out_t.reshape((1, nv * vd))?);
+            }
+        }
+        if pieces.is_empty() {
+            return Err(crate::Error::Msg(
+                "gdn recurrence: 无非空序列(cu_seqlens 退化)".into(),
+            ));
+        }
+        let out = if pieces.len() == 1 {
+            pieces.remove(0)
+        } else {
+            cat_local(&pieces, 0)? // [T, nv*vd](行主序即 [T,nv,vd])
+        };
+        OwlTensor::reshape(&out, (total, nv, vd))
     }
 
     /// 门控 RMSNorm × silu(z)
@@ -1081,10 +1275,10 @@ impl GatedDeltaNet {
             cache.set_batch_conv_state(self.gdn_layer_idx, seq_slots, &conv_state)?;
         }
 
-        // 卷积输出切回 q'/k'/v'
-        let q_conv = kv_conv.narrow(1usize, 0, self.key_dim)?;
-        let k_conv = kv_conv.narrow(1usize, self.key_dim, self.key_dim)?;
-        let v_conv = kv_conv.narrow(1usize, self.key_dim * 2, self.value_dim)?;
+        // 卷积输出切回 q'/k'/v'(列切片走 transpose 路径,规避 narrow 中间维缺陷,见 slice_cols)
+        let q_conv = slice_cols(&kv_conv, 0, self.key_dim)?;
+        let k_conv = slice_cols(&kv_conv, self.key_dim, self.key_dim)?;
+        let v_conv = slice_cols(&kv_conv, self.key_dim * 2, self.value_dim)?;
 
         // 融合 GDN 门控
         let (a_expanded, b_expanded) = (a.unsqueeze(0usize)?, b.unsqueeze(0usize)?);
@@ -1288,6 +1482,14 @@ fn cat_local(ts: &[Tensor], dim: usize) -> Result<Tensor> {
     ctx_scope::with(|_ops, ctx| Ok(erased::cat(ctx, ts, dim)?))
 }
 
+/// 2D 列切片 [rows, cols] → [rows, len](transpose ×2 + narrow_dim0;
+/// 规避 OwlTensor::narrow 中间维 dry 调用丢 after 因子的缺陷,见汇报)
+fn slice_cols(t: &Tensor, start: usize, len: usize) -> Result<Tensor> {
+    let tr = t.transpose(0usize, 1usize)?; // [cols, rows] 物化
+    let piece = tr.narrow_dim0(start, len)?; // [len, rows] 视图
+    piece.transpose(0usize, 1usize) // [rows, len] 物化
+}
+
 /// zeros 构造(P 阶段 ctor 工厂;设备 = rig 单卡)
 fn ctor_zeros(_shape: &[usize], _dtype: DType) -> Result<Tensor> {
     super::ctor::zeros(_shape, _dtype, &ctx_scope::with_device())
@@ -1306,4 +1508,327 @@ pub(crate) fn tensor_parallel_chunk(
     }
     let _ = name;
     unimplemented!("TP>1 分片装载(单卡面已回退;TP = A2.6 另案)")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::dry_kernels::DryKernels;
+    use owl_nn::cublas::NnBlas;
+    use owl_nn::TensorPoolOps;
+    use std::sync::Arc;
+
+    type Dev = owl_cuda::CudaDevice;
+    type Pool = owl_cuda::CudaPool;
+
+    /// 进程级测试 rig(与 dry_run 同构;OnceLock 幂等,多测试共享互斥安全)
+    fn rig() -> (Dev, Arc<Pool>, Arc<Pool>) {
+        static R: std::sync::OnceLock<(Dev, Arc<Pool>, Arc<Pool>)> = std::sync::OnceLock::new();
+        R.get_or_init(|| {
+            use owl_iface::{Device as _, PoolConfig, PoolKind};
+            let dev = Dev::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
+            let scratch = Arc::new(
+                dev.create_pool(PoolConfig {
+                    name: format!("gdn-e2e-scratch-{}", std::process::id()),
+                    kind: PoolKind::Scratch,
+                    bytes: 64 << 20,
+                })
+                .unwrap(),
+            );
+            let wpool = Arc::new(
+                dev.create_pool(PoolConfig {
+                    name: format!("gdn-e2e-weights-{}", std::process::id()),
+                    kind: PoolKind::Weights,
+                    bytes: 128 << 20,
+                })
+                .unwrap(),
+            );
+            let ops = owl_nn::OpsCtx::new(&dev).unwrap();
+            let blas = NnBlas::new(&dev).unwrap();
+            let dry = DryKernels::new(dev.ctx()).unwrap();
+            ctx_scope::install(ops, blas, dry, scratch.clone(), wpool.clone(), &dev);
+            (dev, scratch, wpool)
+        })
+        .clone()
+    }
+
+    fn htod(wpool: &Pool, shape: &[usize], v: Vec<f32>) -> Tensor {
+        let t = wpool.from_vec_tensor(shape, v).unwrap();
+        owl_nn::DynTensor::from_f32(&t)
+    }
+
+    fn htod_u32(wpool: &Pool, shape: &[usize], v: Vec<u32>) -> Tensor {
+        let t = wpool.from_vec_tensor(shape, v).unwrap();
+        owl_nn::DynTensor::from_u32(&t)
+    }
+
+    fn dtoh_f32(dev: &Dev, t: &Tensor) -> Vec<f32> {
+        use owl_cuda::ffi::sys;
+        dev.ctx().bind_to_thread().unwrap();
+        dev.ctx().synchronize().unwrap();
+        let n = t.shape().iter().product::<usize>();
+        let mut out = vec![0f32; n];
+        unsafe {
+            sys::cuMemcpyDtoH_v2(
+                out.as_mut_ptr() as *mut std::ffi::c_void,
+                t.device_ptr() as sys::CUdeviceptr,
+                out.len() * 4,
+            )
+            .result()
+            .unwrap();
+        }
+        out
+    }
+
+    /// 微形回归:1 序列/1 token/零态/4 头多 bh + 状态写回,手算可验证
+    #[test]
+    fn recurrence_micro_sanity() {
+        let (_dev, _scratch, wpool) = rig();
+        // 固定微形:4 头/1 token/零态/decay=1/beta=1/k=e_0 → y = v(头可辨)
+        let (nk, nv, kd, vd) = (4usize, 4usize, 2usize, 2usize);
+        let scale = 1.0f32;
+        let total = 1usize;
+        let q = vec![1.0f32; total * nk * kd];
+        let k: Vec<f32> = (0..total * nk * kd).map(|i| if i % kd == 0 { 1.0 } else { 0.0 }).collect();
+        let v: Vec<f32> = (0..total * nv * vd)
+            .map(|i| (i / vd) as f32 * vd as f32 + (i % vd) as f32 + 1.0)
+            .collect();
+        let g_log = vec![0.0f32; total * nv];
+        let beta = vec![1.0f32; total * nv];
+        let state = vec![0.0f32; nv * kd * vd];
+        let d_q = htod(&wpool, &[total, nk, kd], q);
+        let d_k = htod(&wpool, &[total, nk, kd], k);
+        let d_v = htod(&wpool, &[total, nv, vd], v);
+        let d_g = htod(&wpool, &[total, nv], g_log);
+        let d_beta = htod(&wpool, &[total, nv], beta);
+        let mut d_state = htod(&wpool, &[1, nv, kd, vd], state);
+        let d_slots = htod_u32(&wpool, &[1], vec![0]);
+        let d_cu = htod_u32(&wpool, &[2], vec![0, total as u32]);
+        let out = gdn_shim::gated_delta_rule_recurrence_varlen_gqa(
+            &d_q, &d_k, &d_v, &d_g, &d_beta, &mut d_state, &d_slots, &d_cu, scale, None,
+        )
+        .unwrap();
+        let got = dtoh_f32(&_dev, &out);
+        let st = dtoh_f32(&_dev, &d_state);
+        // 期望:每头 y = v[bh](零态 + k=e_0 + beta=1 → s[0] = v,y = s·q = v)
+        assert_eq!(got, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    }
+
+    /// 递推垫片对拍:2 序列(3+2)/GQA(nk=2,nv=4)/带初态,fb 公式直译。
+    /// g 以 log 空间入参(垫片负责 exp);q 缩放在垫片。
+    #[test]
+    fn recurrence_varlen_gqa_shim_host_parity() {
+        let (dev, _scratch, wpool) = rig();
+        let (nk, nv, kd, vd) = (2usize, 4usize, 4usize, 8usize);
+        let gs = nv / nk;
+        let lens = [3usize, 2usize];
+        let total: usize = lens.iter().sum();
+        let scale = 1.0f32 / (kd as f32).sqrt();
+
+        let q: Vec<f32> = (0..total * nk * kd).map(|i| ((i % 5) as f32 - 2.0) * 0.3).collect();
+        let kv: Vec<f32> = (0..total * nk * kd).map(|i| ((i % 7) as f32 - 3.0) * 0.2).collect();
+        let v: Vec<f32> = (0..total * nv * vd).map(|i| ((i % 11) as f32 - 5.0) * 0.25).collect();
+        // log 空间负值(exp 后 <1 = 衰减)
+        let g_log: Vec<f32> = (0..total * nv).map(|i| -0.05 - 0.02 * (i % 3) as f32).collect();
+        let beta: Vec<f32> = (0..total * nv).map(|i| 0.5 + 0.1 * (i % 2) as f32).collect();
+        // 初态非零且逐槽可辨(slot1 与 slot0 不同;row2 = 未触碰守卫行)
+        let state: Vec<f32> = (0..3 * nv * kd * vd)
+            .map(|i| ((i % 23) as f32 - 11.0) * 0.1)
+            .collect();
+
+        let d_q = htod(&wpool, &[total, nk, kd], q.clone());
+        let d_k = htod(&wpool, &[total, nk, kd], kv.clone());
+        let d_v = htod(&wpool, &[total, nv, vd], v.clone());
+        let d_g = htod(&wpool, &[total, nv], g_log.clone());
+        let d_beta = htod(&wpool, &[total, nv], beta.clone());
+        let mut d_state = htod(&wpool, &[3, nv, kd, vd], state.clone());
+        let d_slots = htod_u32(&wpool, &[2], vec![1, 0]);
+        let mut cu = vec![0u32];
+        for l in lens {
+            cu.push(cu.last().unwrap() + l as u32);
+        }
+        let d_cu = htod_u32(&wpool, &[cu.len() as u32 as usize], cu.clone());
+
+        let out = gdn_shim::gated_delta_rule_recurrence_varlen_gqa(
+            &d_q, &d_k, &d_v, &d_g, &d_beta, &mut d_state, &d_slots, &d_cu, scale, None,
+        )
+        .unwrap();
+        assert_eq!(out.shape(), &[total, nv, vd]);
+
+        // ---- host 参考(fb 公式直译 + GQA 头映射 + 状态行按 slot)----
+        let g_real: Vec<f32> = g_log.iter().map(|x| x.exp()).collect();
+        let got = dtoh_f32(&dev, &out);
+        let got_state = dtoh_f32(&dev, &d_state);
+        let mut tok = 0usize;
+        for (seq, &slot) in [1usize, 0].iter().enumerate() {
+            let l = lens[seq];
+            let mut s = state[slot * nv * kd * vd..(slot + 1) * nv * kd * vd].to_vec();
+            for t in 0..l {
+                for h in 0..nv {
+                    let qh = h / gs; // GQA 头映射
+                    let decay = g_real[(tok + t) * nv + h];
+                    for j in 0..kd {
+                        for vi in 0..vd {
+                            s[(h * kd + j) * vd + vi] *= decay;
+                        }
+                    }
+                    let base = (tok + t) * nv * vd + h * vd;
+                    let kbase = (tok + t) * nk * kd + qh * kd;
+                    for vi in 0..vd {
+                        let mut kv_mem = 0.0f32;
+                        for j in 0..kd {
+                            kv_mem += s[(h * kd + j) * vd + vi] * kv[kbase + j];
+                        }
+                        let delta = (v[base + vi] - kv_mem) * beta[(tok + t) * nv + h];
+                        for j in 0..kd {
+                            s[(h * kd + j) * vd + vi] += kv[kbase + j] * delta;
+                        }
+                    }
+                    for vi in 0..vd {
+                        let mut y = 0.0f32;
+                        for j in 0..kd {
+                            y += s[(h * kd + j) * vd + vi] * q[kbase + j] * scale;
+                        }
+                        let go = got[(tok + t) * nv * vd + h * vd + vi];
+                        assert!(
+                            (go - y).abs() < 2e-4,
+                            "OUT seq={seq} t={t} h={h} vi={vi} got={go} want={y}"
+                        );
+                    }
+                }
+            }
+            for (i, (a, b)) in got_state[slot * nv * kd * vd..(slot + 1) * nv * kd * vd]
+                .iter()
+                .zip(&s)
+                .enumerate()
+            {
+                assert!(
+                    (a - b).abs() < 1e-4,
+                    "STATE seq={seq} idx={i} got={a} want={b}"
+                );
+            }
+            tok += l;
+        }
+        // 未触碰槽位(row2)状态不变
+        assert_eq!(
+            got_state[2 * nv * kd * vd..3 * nv * kd * vd],
+            state[2 * nv * kd * vd..3 * nv * kd * vd],
+            "未触碰槽位状态被改动"
+        );
+    }
+
+    /// shim 链路 e2e:conv1d_fwd → gating → l2norm → delta 递推 → 门控 rmsnorm,
+    /// 小形状(nk=2/nv=4/kd=8/vd=8,变长 2 序列)自建状态张量。
+    /// 注:经 MambaCache::preallocate 的全层 forward 因 ctor::zeros 桩(mod.rs,
+    /// B3.2 遗留)暂不可行,已上报;本测试覆盖同一算子链与状态连续性。
+    #[test]
+    fn deltanet_shim_chain_e2e_selfcheck() {
+        let (dev, _scratch, wpool) = rig();
+        let (nk, nv, kd, vd) = (2usize, 4usize, 8usize, 8usize);
+        let key_dim = nk * kd; // 16
+        let value_dim = nv * vd; // 32
+        let conv_dim = key_dim * 2 + value_dim; // 64
+        let hidden = 32usize;
+        let lens = [3usize, 2usize];
+        let total: usize = lens.iter().sum();
+
+        // ---- 输入与权重(逐张量可辨)----
+        let xs: Vec<f32> = (0..total * conv_dim).map(|i| ((i % 13) as f32 - 6.0) * 0.2).collect();
+        let cw: Vec<f32> = (0..conv_dim * 4).map(|i| ((i % 7) as f32 - 3.0) * 0.1).collect();
+        let cb: Vec<f32> = (0..conv_dim).map(|i| 0.01 * i as f32).collect();
+        let a_log: Vec<f32> = (0..nv).map(|i| -0.3 - 0.1 * i as f32).collect();
+        let dtb: Vec<f32> = (0..nv).map(|i| 0.2 * i as f32).collect();
+        let nrm: Vec<f32> = (0..vd).map(|i| 0.5 + 0.05 * i as f32).collect();
+
+        let d_x = htod(&wpool, &[total, conv_dim], xs);
+        let d_w = htod(&wpool, &[conv_dim, 1, 4], cw);
+        let d_b = htod(&wpool, &[conv_dim], cb);
+        let d_a_log = htod(&wpool, &[nv], a_log);
+        let d_dtb = htod(&wpool, &[nv], dtb);
+        let d_nrm = htod(&wpool, &[vd], nrm);
+        // conv_state 收集副本 [2, conv_dim, 3];递推状态 [3, nv, kd, vd](row2 守卫)
+        let mut d_conv_state = htod(&wpool, &[2, conv_dim, 3], vec![0f32; 2 * conv_dim * 3]);
+        let st0: Vec<f32> = (0..3 * nv * kd * vd).map(|i| ((i % 23) as f32 - 11.0) * 0.1).collect();
+        let mut d_rec = htod(&wpool, &[3, nv, kd, vd], st0.clone());
+        let mut cu = vec![0u32];
+        for l in lens {
+            cu.push(cu.last().unwrap() + l as u32);
+        }
+        let d_cu = htod_u32(&wpool, &[cu.len()], cu.clone());
+        let d_slots = htod_u32(&wpool, &[2], vec![1, 0]);
+
+        // ① conv1d_fwd(prefill 变长,silu)
+        let kv_conv = gdn_shim::causal_conv1d_fwd(
+            &d_x, &d_w, Some(&d_b), &mut d_conv_state, None, &d_cu, true,
+        )
+        .expect("conv1d_fwd");
+        assert_eq!(kv_conv.shape(), &[total, conv_dim]);
+
+        // ② 列切片 q'/k'/v'(走 slice_cols,同 forward)
+        let q_c = slice_cols(&kv_conv, 0, key_dim).unwrap();
+        let v_c = slice_cols(&kv_conv, key_dim * 2, value_dim).unwrap();
+
+        // ③ gating(a/b 展开 [T,nv];此处以常数 a/b 走真核)
+        let a_e = htod(&wpool, &[total, nv], vec![0.3f32; total * nv]);
+        let b_e = htod(&wpool, &[total, nv], vec![0.6f32; total * nv]);
+        let (g, beta) = gdn_shim::fused_gdn_gating(&d_a_log, &a_e, &b_e, &d_dtb).unwrap();
+
+        // ④ l2norm(q/k 末维)
+        let q_r = q_c.reshape((total, nk, kd)).unwrap();
+        let q_n = gdn_shim::l2_norm_last_dim(&q_r, 1e-6).unwrap();
+
+        // ⑤ delta 递推(decode 逐 token;g log 空间入参)
+        let v_r = v_c.reshape((total, nv, vd)).unwrap();
+        let g2 = g.squeeze(0usize).unwrap();
+        let beta2 = beta.squeeze(0usize).unwrap();
+        let out = gdn_shim::gated_delta_rule_recurrence_varlen_gqa(
+            &q_n, &q_n, &v_r, &g2, &beta2, &mut d_rec, &d_slots, &d_cu,
+            (1.0 / (kd as f32).sqrt()) as f32, None,
+        )
+        .expect("recurrence");
+        assert_eq!(out.shape(), &[total, nv, vd]);
+        let host_out = dtoh_f32(&dev, &out);
+        assert!(host_out.iter().all(|x| x.is_finite()));
+
+        // ⑥ 门控 rmsnorm(z = conv 输出的 v 段走 silu 路径)
+        let z = slice_cols(&kv_conv, key_dim * 2, value_dim).unwrap();
+        let flat = OwlTensor::reshape(&out, (total, value_dim)).unwrap();
+        let gated = gdn_shim::gated_rmsnorm_silu_mul(
+            &flat, &z, &d_nrm, None, 1e-5, vd,
+        )
+        .expect("rmsnorm");
+        let host_g = dtoh_f32(&dev, &gated);
+        assert!(host_g.iter().all(|x| x.is_finite()));
+
+        // ⑦ 确定性:全链重跑(状态重置)位级一致
+        let mut d_conv_state2 = htod(&wpool, &[2, conv_dim, 3], vec![0f32; 2 * conv_dim * 3]);
+        let mut d_rec2 = htod(&wpool, &[3, nv, kd, vd], st0.clone());
+        let kv2 = gdn_shim::causal_conv1d_fwd(
+            &d_x, &d_w, Some(&d_b), &mut d_conv_state2, None, &d_cu, true,
+        )
+        .unwrap();
+        let q_c2 = slice_cols(&kv2, 0, key_dim).unwrap();
+        let v_c2 = slice_cols(&kv2, key_dim * 2, value_dim).unwrap();
+        let (g3, beta3) = gdn_shim::fused_gdn_gating(&d_a_log, &a_e, &b_e, &d_dtb).unwrap();
+        let q_n2 = gdn_shim::l2_norm_last_dim(&q_c2.reshape((total, nk, kd)).unwrap(), 1e-6).unwrap();
+        let out2 = gdn_shim::gated_delta_rule_recurrence_varlen_gqa(
+            &q_n2, &q_n2, &v_c2.reshape((total, nv, vd)).unwrap(), &g3.squeeze(0usize).unwrap(),
+            &beta3.squeeze(0usize).unwrap(), &mut d_rec2, &d_slots, &d_cu,
+            (1.0 / (kd as f32).sqrt()) as f32, None,
+        )
+        .unwrap();
+        let host_out2 = dtoh_f32(&dev, &out2);
+        assert_eq!(host_out, host_out2, "全链两次结果不一致");
+        let st1 = dtoh_f32(&dev, &d_rec);
+        let st2 = dtoh_f32(&dev, &d_rec2);
+        assert_eq!(st1, st2, "递推状态两次不一致");
+        // 状态确实被写(非全零)
+        assert!(st1.iter().any(|x| x.abs() > 1e-6));
+        // 未触碰槽位 row2 不变
+        assert_eq!(
+            st1[2 * nv * kd * vd..3 * nv * kd * vd],
+            st0[2 * nv * kd * vd..3 * nv * kd * vd]
+        );
+    }
+
 }
