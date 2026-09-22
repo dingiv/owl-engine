@@ -905,15 +905,9 @@ impl Qwen3_5ForCausalLM {
         &self,
         sequence_ids: &[usize],
     ) -> Result<Vec<usize>> {
-        let cache = self.mamba_cache.read();
-        sequence_ids
-            .iter()
-            .map(|&id| {
-                cache.slot_of(id).ok_or_else(|| {
-                    crate::Error::Schedule(format!("mamba slot 未分配: seq {id}"))
-                })
-            })
-            .collect()
+        // 惰性分配:decode 步序列可能未经本进程 prefill(重启恢复/直入 decode)
+        let mut cache = self.mamba_cache.write();
+        sequence_ids.iter().map(|&id| cache.ensure_slot(id)).collect()
     }
 
     pub fn lock_mamba_cache_for_graph(&self) -> RwLockWriteGuard<'_, vendor::MambaCache> {
