@@ -46,17 +46,69 @@
 
 - **公理 A2.1 消息尺寸路由显式化**:comm 层按消息尺寸选后端——小消息
   (KB 级,decode allreduce)走单 kernel one-shot AR(可融合、可捕获);
-  大消息(prefill 激活)走 NCCL(IPC/P2P)。路由策略是架构对象,不是
+  大消息(prefill 激活)走 two-shot/分块 ring。路由策略是架构对象,不是
   运行时巧合。依据:exl3 卷——prefill nccl +38% / decode native +22%。
 - **公理 A2.2 通信必须可捕获或显式出段**:comm 后端要么 graph-capture
-  安全(自研 AR:裸 kernel 天生安全),要么声明"只能在段边界 eager 执行"
-  (NCCL 现状),类型系统表达(`enum CommCap { InGraph, SegmentBoundary }`),
+  安全(自研 AR:裸 kernel 天生安全),要么声明"只能在段边界 eager 执行",
+  类型系统表达(`enum CommCap { InGraph, SegmentBoundary }`),
   编排层据此排段。禁止"捕获期意外撞上不可捕获通信"这类运行时惊喜。
+- **公理 A2.5 NCCL 除名(2026-09-22 裁决)**:NCCL 内部自建通信缓冲
+  (每卡数百 MB,不透明不可登记),违反 A5.2"一切分配过账本";capture
+  支持姿势苛刻,违反 A2.2。通信全栈自研:one-shot/two-shot AR
+  (port vLLM custom_all_reduce)+ IPC/VMM P2P 通道 + SHM host 中转
+  保险丝(llama/exl3 native 判例)。**一切通信缓冲经后端账本登记**。
+  这是 REQ-DESIGN-03 例外条款的正式引用(社区无可抄的"可审计 allreduce")。
+- **公理 A2.6 设备隔离律 + 单进程多实例拓扑(2026-09-22 二次裁决,
+  推翻初版多进程倾向)**:一个后端实例 = 一张卡 = 一个独立账本
+  (DeviceDesc 绑 UUID,数字序禁);后端实例禁止触碰第二张卡;
+  多卡 = **单进程内 N 个后端实例**,每卡一个 runner 线程
+  (A3 的 bind_to_thread 纪律保证 context↔线程绑定)。
+  跨卡通信走 enablePeerAccess 直写(one-shot AR),无 IPC handle
+  序列化协议;控制面 = 进程内 channel。故障语义见 A6。
 - **公理 A2.3 融合口子内建**:AR+残差+norm 的融合接口在 comm trait 里预留
   (`fused AR add rmsnorm`),decode 带宽-bound 的最大通信杠杆。
 - **公理 A2.4 卡管理纪律继承**:UUID 钉卡唯一合法(数字序禁,09-19 事故);
   IPC 主路 / SHM 保险丝;P2P 能力探测与黑名单(GPU2 类雷卡)在 comm 初始化
   时完成,不进热路径。
+
+### A5. 严格显存预算(硬合同,2026-09-22 增补)
+
+启动时声明预算 B(如 23G),整个程序生命周期的设备内存占用**恒 ≤ B**。
+可证伪,不可协商:
+
+- **A5.1 分解封闭**:B = 权重 + KV 池 + 图预算(A1.1)+ 激活峰值 +
+  workspace + 通信缓冲 + 运行时底价 + 安全余量。任何一项没有实测数字,
+  **拒绝启动**。"先跑起来再看显存"在本引擎不存在。
+- **A5.2 一切分配过账本**:后端层是唯一分配出口,账本按域记账
+  (persistent 存量/scratch 峰值/延迟释放滞留);池外原语
+  (cuBLAS workspace、NCCL 缓冲)必须预分配并登记——mistral trim 案
+  与 vLLM draft 捕获 OOM 都是这一条缺失的判例。
+- **A5.3 三层强制**:①启动静态证明(分解封闭性校验,超 B 拒启);
+  ②运行时账本断言(每次分配记账,超支 fail-fast,debug 构建硬断言);
+  ③周期性 `mem_get_info` 对账(捕捉账本外漏网,driver 无硬配额,
+  对账是最后防线)。
+- **A5.4 超支即违约**:运行中超 B 是架构 bug,处理方式是 fail-fast
+  (带账本快照),不是优雅降级。降级只属于捕获预检(A1.4)的
+  **事前**行为。
+
+- **公理 A2.7 故障语义 = 全有或全无(2026-09-22 裁决)**:本地单人
+  引擎不做 rank 级故障隔离与带病运行。任一 runner 线程报错 →
+  全引擎进入 `Paused/Unrecoverable` 状态:① 停止调度,冻结全部设备的
+  `LedgerSnapshot`;② 错误链完整收集(不崩溃,错误要能被读到);
+  ③ 对外健康状态 = Unrecoverable。恢复 = 整进程重启,无 rank 级
+  热恢复。Xid 级硬故障掀翻进程是其极端形态,与本题无冲突。
+
+- **公理 A2.8 VMM-only 远程显存(2026-09-22 裁决,魔改驱动约束)**:
+  本引擎适配魔改驱动(BAR1 仅 256MiB,无 ReBAR)。跨卡共享/可被对端
+  P2P 映射的缓冲,**必须**走新版虚拟内存管理 API(cuMemCreate/
+  cuMemMap/cuMemSetAccess,物理 chunk 粒度,律 2MiB),**禁止**使用
+  legacy cudaMalloc/池分配导出——大块连续段无法通过 256MiB BAR1 窗口
+  (vmm-p2p 会战判例:857MB 段 × 192MB 预算墙)。推论:
+  ① stream-ordered 分配(alloc_scratch)仅限本卡自用,永不导出;
+  ② `PoolKind::PeerShared` 独立成池,粒度对齐 2MiB,BAR1 窗口占用
+     显式入账(账本新增 BAR1 维度,§A5.3 对账扩展);
+  ③ cuMemExportToShareableHandle 留作未来多进程 IPC 的升级路径,
+     与单进程 peer 直映射不冲突。
 
 ### A3. 同步点隔离(继承 REQ-CODE-03 并升格)
 
@@ -79,6 +131,7 @@
 |---|---|---|---|
 | candle fork(图安全焊缝) | repos/candle-gb @ 23a6f38 | 张量底座,只读快照 | 冻结 |
 | attention-rs @ c0f19f2 | repos/attention.rs | paged attention/fused rope/moe kernel | 冻结 |
+| mistral.rs   |  全库 | copy 源码 | 冻结 |
 | marlin-ffi / moe-marlin-ffi | packages/xinfer(P3 产物) | W4A16/W4A8/moe GEMM 主力算子 | **我们自己写的,活跃** |
 | cudarc fork @ 2e81793 | 经 candle 传递 | driver API(graph/池) | 冻结 |
 | DFlash2 草稿 | models/syvai 等 | 投机解码草稿 | 数据 |
@@ -128,3 +181,7 @@ packages/owl/
 
 - 2026-09-22 立项:独立新包 `owl`;xinfer 冻结存档(456524b 不修,作为
   反面判例归档);vLLM 继续生产;graph/TP 升格为一等公民并形成 A1/A2 公理。
+- 2026-09-22 增补:A5 严格显存预算(硬合同);A2.5 NCCL 除名(通信全自研);
+  A2.6 设备隔离律 + 单进程多实例拓扑(二次裁决,推翻初版多进程倾向);
+  A2.7 故障语义全有或全无(Paused/Unrecoverable);iface 增加显存池管理与
+  DeviceDesc 抽象,backends 增加第三方 CUDA 准入铁律(账外分配零容忍)。

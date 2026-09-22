@@ -1,0 +1,19 @@
+[package]
+name = "owl-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CUDA backend: cudarc wrapped with memory-safety governance (charter A1/A4)"
+
+[dependencies]
+# 官方 crates.io 版(非 guoqingbao fork):图相关语义由本封装层自持,
+# 不依赖 fork 的 graph feature(A4:语义分歧不进第三方库)
+cudarc = { version = "0.19", default-features = false, features = [
+    "std",
+    "driver",
+    "cuda-version-from-build-system",
+    "dynamic-loading",
+] }
+owl-iface = { path = "../iface" }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }

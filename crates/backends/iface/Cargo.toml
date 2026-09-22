@@ -1,0 +1,10 @@
+[package]
+name = "owl-iface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Backend HAL: unified GPU backend contract (memory/phase/stats); upper layers code against this, backends implement"
+
+[dependencies]
+owl-kernels = { path = "../../kernels" }
+thiserror = { workspace = true }

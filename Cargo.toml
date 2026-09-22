@@ -4,6 +4,9 @@ members = [
     "crates/comm",
     "crates/kernels",
     "crates/core",
+    "crates/backends/cuda",
+    "crates/backends/iface",
+    "crates/nn",
 ]
 resolver = "2"
 

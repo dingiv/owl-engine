@@ -1,2 +1,5 @@
 /target
 Cargo.lock
+AGENTS.md
+*.local.md
+roadmap.local/

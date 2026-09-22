@@ -1,0 +1,21 @@
+[package]
+name = "owl-nn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Minimal tensor + NN ops on owl-iface devices; capture-safe by construction"
+
+[dependencies]
+owl-cuda = { path = "../backends/cuda" }
+owl-iface = { path = "../backends/iface" }
+owl-kernels = { path = "../kernels" }
+cudarc = { version = "0.19", default-features = false, features = [
+    "std",
+    "driver",
+    "cublas",
+    "nvrtc",
+    "cuda-version-from-build-system",
+    "dynamic-loading",
+] }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }

@@ -9,9 +9,10 @@ use owl_graph::GraphPhase;
 /// 后端的可捕获性声明(A2.2)—— 编排层据此排段,禁止运行时撞上。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommCap {
-    /// 裸 kernel 实现(one-shot AR):可在图内烙
+    /// 裸 kernel 实现(one-shot/two-shot AR):可在图内烙
     InGraph,
-    /// NCCL 类:只能在段边界 eager 执行;编排层保证不落进捕获段
+    /// 段边界专用(SHM host 中转保险丝等):编排层保证不落进捕获段。
+    /// 注:NCCL 已除名(A2.5)——账外显存不可登记,违反 A5.2。
     SegmentBoundary,
 }
 
