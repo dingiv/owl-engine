@@ -100,6 +100,18 @@ pub struct OpsCtx {
 }
 
 impl OpsCtx {
+    /// kernel 发射器访问(擦除算子面用;同 crate 内部)
+    pub(crate) fn kernels(&mut self) -> &mut Kernels {
+        &mut self.kernels
+    }
+
+    /// 姿势 6 发射计数(擦除算子面用)
+    pub(crate) fn note_launch(&self) {
+        self.dev.note_launch();
+    }
+}
+
+impl OpsCtx {
     /// P 阶段构造:读设备句柄装配执行器(零显存申请;无 scratch 池——
     /// 层代码 functional 风格请用 new_with_scratch,S6)。
     pub fn new(device: &owl_cuda::CudaDevice) -> Result<Self, BackendError> {
@@ -137,11 +149,6 @@ impl OpsCtx {
             Some(p) => c.with_scratch(std::sync::Arc::clone(p)),
             None => c
         }
-    }
-
-    /// 每发射一次核函数计一次(姿势 6 warmup 门禁)
-    fn note_launch(&self) {
-        self.dev.note_launch();
     }
 
     fn assert_same_shape<T: crate::tensor::Scalar, Dex: owl_iface::Device>(

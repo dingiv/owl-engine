@@ -9,6 +9,7 @@
 //!   每处标注 `// ported from candle-kernels/src/xxx.cu`。
 
 pub mod cublas;
+pub mod erased;
 pub mod dyn_tensor;
 pub mod dtype;
 pub mod kernels;

@@ -56,6 +56,35 @@ macro_rules! erase_ctor {
     };
 }
 
+
+/// typed_getter:拥有克隆下行转换(六型封闭;S1 结构化报错)
+macro_rules! typed_getter {
+
+    ($fn_name:ident, $t:ty, $var:ident, $dt:expr, $name:expr) => {
+        impl<D: Device> DynTensor<D> {
+            pub fn $fn_name(&self) -> Result<Tensor<$t, D>, BackendError> {
+                if self.dtype != $dt {
+                    return Err(BackendError::Init(format!(
+                        "DynTensor::{}: 擦除 dtype {} != 请求 {}(S1 禁隐式提升)",
+                        $name, self.dtype, $dt
+                    )));
+                }
+                match &self._keepalive {
+                    DynKeepalive::$var(t) => Ok(t.clone()),
+                    _ => unreachable!("dtype 标注与 keepalive 变体不一致"),
+                }
+            }
+        }
+    };
+}
+
+typed_getter!(typed_f32, f32, F32, Dtype::F32, "typed_f32");
+typed_getter!(typed_f16, crate::dtype::F16, F16, Dtype::F16, "typed_f16");
+typed_getter!(typed_bf16, crate::dtype::Bf16, Bf16, Dtype::BF16, "typed_bf16");
+typed_getter!(typed_u8, u8, U8, Dtype::U8, "typed_u8");
+typed_getter!(typed_u32, u32, U32, Dtype::U32, "typed_u32");
+typed_getter!(typed_i64, i64, I64, Dtype::I64, "typed_i64");
+
 impl<D: Device> DynTensor<D> {
     erase_ctor!(from_f32, f32, F32, Dtype::F32);
     erase_ctor!(from_f16, crate::dtype::F16, F16, Dtype::F16);
@@ -102,6 +131,43 @@ impl<D: Device> DynTensor<D> {
             shape: &self.shape,
             _marker: std::marker::PhantomData,
         })
+    }
+
+
+    /// 重塑(元数据;元素数不变,contiguous 保持——真实现)
+    pub fn reshape(&self, shape: &[usize]) -> Result<Self, BackendError> {
+        let n: usize = shape.iter().product();
+        let elems: usize = self.shape.iter().product();
+        if n != elems {
+            return Err(BackendError::Init(format!(
+                "DynTensor::reshape: 元素数 {n} != {elems}"
+            )));
+        }
+        let mut out = self.clone();
+        out.shape = shape.to_vec();
+        Ok(out)
+    }
+
+    /// 摊平(reshape 特例;真实现)
+    pub fn flatten_all(&self) -> Result<Self, BackendError> {
+        let n: usize = self.shape.iter().product();
+        self.reshape(&[n])
+    }
+
+    /// 第 0 维窄切(真实现:基址偏移 + keepalive 克隆;连续块子集)。
+    /// 非 0 维窄切需 stride 语义(S3),当前不支持 = 结构化报错。
+    pub fn narrow_dim0(&self, start: usize, len: usize) -> Result<Self, BackendError> {
+        if len == 0 || start + len > self.shape[0] {
+            return Err(BackendError::Init(format!(
+                "DynTensor::narrow_dim0: start={start} len={len} shape={:?}",
+                self.shape
+            )));
+        }
+        let mut out = self.clone();
+        let row: usize = self.shape[1..].iter().product::<usize>().max(1) * self.dtype.size_bytes();
+        out.ptr = unsafe { self.ptr.add(start * row) };
+        out.shape[0] = len;
+        Ok(out)
     }
 }
 
