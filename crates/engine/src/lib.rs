@@ -27,6 +27,7 @@ pub mod prefix_cache;
 pub mod runner;
 pub mod sampler;
 pub mod scheduler;
+pub mod session;
 pub mod sequence;
 pub mod server;
 pub mod speculative;

@@ -175,7 +175,6 @@ mod pa_shim {
                 )
                 .map_err(|e| crate::Error::Msg(format!("naive_decode_attn: {e}")))?;
                 ctx.trace_launch("naive_decode_attn");
-                eprintln!("[ATTDBG] naive out={:?} q={:?}", out.shape(), q.shape());
                 Ok(out)
             })
         }

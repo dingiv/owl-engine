@@ -286,7 +286,6 @@ impl OwlTensor for Tensor {
         let have: usize = self.shape().iter().product();
         if n != have {
             let bt = std::backtrace::Backtrace::force_capture();
-            eprintln!("[RSHP-DBG] have={have} target={n} shape={:?}\n{bt}", self.shape());
         }
         Ok(DynTensor::reshape(self, &target.dims()[..])?)
     }

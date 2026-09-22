@@ -87,7 +87,6 @@ impl ReplicatedLinear {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        eprintln!("[TPDBG] row-linear x.shape={:?}", x.shape());
         self.inner.forward(x)
     }
 
@@ -138,7 +137,6 @@ impl TensorParallelColumnLinear {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        eprintln!("[TPDBG] row-linear x.shape={:?}", x.shape());
         self.inner.forward(x)
     }
 

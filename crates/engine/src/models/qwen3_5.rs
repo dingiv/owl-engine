@@ -648,7 +648,6 @@ impl Qwen3_5ForCausalLM {
         let mut mamba_cache = self.mamba_cache.write();
 
         for (i, layer) in self.layers.iter().enumerate() {
-            eprintln!("[DRYDBG] layer {i} full={} xs.shape={:?}", layer.is_full_attention(), xs.shape());
             let cache = if layer.is_full_attention() {
                 kv_caches.map(|caches| {
                     let c = &caches[kv_cache_idx];
@@ -907,7 +906,6 @@ impl Qwen3_5ForCausalLM {
     ) -> Result<Vec<usize>> {
         // dry-run/full-attention 配置:无 GDN 层时 mamba 槽仅为形式参数,
         // 返回确定性 identity 槽(真 GDN 语义 = vendor::MambaCache,T3 回填)
-        eprintln!("[MDBG] get_mamba_slots ids={:?} -> identity", sequence_ids);
         Ok((0..sequence_ids.len()).collect())
     }
 
@@ -1115,7 +1113,6 @@ impl crate::graphplan::GraphForward for DecodeGraphAdapter {
                 .forward(&inp.frontier, &inp.positions, Some(&self.kv_caches), &meta, false)?;
         // R2(nn 需求):logits(scratch 张量)D2D 直写 view.logits_out
         // (采样同址读,零 D2H)。当前 nn 面缺 copy_d2d(src,&dst_ptr,n)。
-        eprintln!("[DRYDBG] frontier.shape={:?} logits.shape={:?}", inp.frontier.shape(), logits.shape());
         let logits_elems = logits.len_bytes() / std::mem::size_of::<f32>();
         let expect = view.bs * view.vocab;
         if logits_elems != expect {
