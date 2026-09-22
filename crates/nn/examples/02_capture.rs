@@ -92,9 +92,19 @@ fn main() {
     // CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED)。T3 的 OpsCtx 绑死的正是
     // 这条流——故本 example 捕获段改用 Kernels 直发到自建 non-blocking
     // 流(不改 T0/T2 源码);matmul(cublas/legacy)保持 eager 前置。
-    let cap_stream = dev.ctx().new_stream().expect("new_stream");
+    // GraphLease:捕获会话登记依赖租约(强租约),DeviceGraph 持有 keepalive
+    let mut session = dev.capture_session().expect("capture_session");
+    let cap_stream = session.stream().clone();
     let mut cap_kernels = owl_nn::kernels::Kernels::new(dev.ctx()).expect("kernels");
     let m_n = M * N;
+
+    // 依赖租约登记(哨兵①:CaptureRecord 的实体化前奏)
+    session.lease(mm_out.persistent().unwrap());
+    session.lease(bias.persistent().unwrap());
+    session.lease(add_out.persistent().unwrap());
+    session.lease(silu_out.persistent().unwrap());
+    session.lease(alpha.persistent().unwrap());
+    session.lease(graph_out.persistent().unwrap());
 
     cap_stream
         .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
@@ -116,14 +126,11 @@ fn main() {
             1e-5,
         )
         .expect("cap rmsnorm");
-    let graph = cap_stream
-        .end_capture(
-            sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
-        )
-        .expect("end_capture")
-        .expect("捕获内容为空(图节点数为 0)");
+    let graph = session
+        .end(sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+        .expect("end_capture");
     graph.upload().unwrap();
-    println!("捕获完成 + upload(3 kernel@non-blocking stream;matmul legacy 保持 eager)");
+    println!("捕获完成 + upload(3 kernel@non-blocking stream;matmul legacy 保持 eager;租约 {} 条)", 6);
 
 
     // ---- replay 正确性:新输入(旁路写入)→ eager matmul + graph.launch ----

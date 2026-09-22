@@ -56,3 +56,17 @@ eager 链与 CPU f64 参考:matmul 2.1e-6 / silu 2.2e-6 / rmsnorm 7.7e-7。
 cargo run --release -p owl-nn --example 01_eager
 cargo run --release -p owl-nn --example 02_capture
 ```
+
+
+---
+
+## 附录:GraphLease 落地记录(2026-09-22)
+
+- `OwlCuda::capture_session()` → `session.lease(&tensor)`(强租约 Arc 登记依赖)→
+  `session.end(flags)` → `DeviceGraph{leases, keepalive}`;
+- `DeviceGraph::launch()`:debug 构建逐租约世代校验(失效 = LawViolation
+  结构化报错),release 直发;真机验证"图存活期用户 drop 依赖缓冲 →
+  replay 仍正确"(graph_lease_keeps_memory_alive_across_user_drop);
+- 02_capture 已迁移至 CaptureSession(6 依赖租约登记),replay×4 偏差
+  0.000e0,账本回基线;
+- M1 交接新增:租约表与 cuGraphGetNodes 的对账审计(哨兵③)。

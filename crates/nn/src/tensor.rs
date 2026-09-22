@@ -123,9 +123,17 @@ impl<T: Scalar, D: Device> DevBuf<T> for Tensor<T, D> {
     }
 }
 
-// ---- OwlCuda 专属:EagerOnly 的 D2H 回读 ----
+// ---- OwlCuda 专属:EagerOnly 的 D2H 回读 + GraphLease 租约登记 ----
 
 impl<T: Scalar> Tensor<T, CudaDevice> {
+    /// GraphLease:暴露底层持久存储,供捕获会话登记租约(哨兵①)。
+    pub fn persistent(&self) -> Option<&owl_cuda::Persistent<T>> {
+        match &self.storage {
+            Storage::Persistent(p) => Some(p),
+            _ => None,
+        }
+    }
+
     /// P 阶段:host → device 持久写入(权重装载)。(内部;经 PoolTensorOps)
     fn from_vec_cuda(
         d: &CudaDevice,
