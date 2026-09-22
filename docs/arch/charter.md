@@ -42,6 +42,16 @@
   禁 D2H/同步/host 分支。attention 不做例外——paged KV + device 标量,
   目标是 decode FULL 图,不为 piecewise 留 attention 豁口。
 
+- **公理 A1.6 捕获期自动依赖登记(哨兵①,2026-09-22 增补)**:
+  捕获作用域内的全部 kernel 发射与缓冲触碰,必须自动登记进
+  `CaptureRecord { launches, touched: BufToken }`(BufToken{id,gen}
+  由 malloc 时签发)——图的依赖清单以数据结构形式存在,不靠人工登记。
+  EagerOnly 操作(host 回读类)以 debug_assert 禁入捕获段(姿势 1/10 防线)。
+- **公理 A1.7 GraphLease 强租约(2026-09-22 增补)**:池缓冲为 Arc 共享
+  所有权;捕获会话对全部烙印缓冲持有强租约,**用户侧先行 drop 时内存
+  物理不回收**(租约在,身份在)——图鉴姿势 2(replay 悬空地址)与
+  姿势 3(存活期回收)结构性封死;图销毁 → 租约全解 → 才归池账。
+
 ### A2. TP 通信是一等 crate(不是后端细节)
 
 - **公理 A2.1 消息尺寸路由显式化**:comm 层按消息尺寸选后端——小消息
@@ -110,6 +120,24 @@
   ③ cuMemExportToShareableHandle 留作未来多进程 IPC 的升级路径,
      与单进程 peer 直映射不冲突。
 
+### A6. 池分配者契约(2026-09-22 增补)
+
+- **Pool 是分配者,Device 退出分配角色**:`Pool` 提供
+  `malloc_scratch / malloc_persistent / malloc_peer_shared` 三原语
+  (性质分立:stream-ordered 清零 / 地址稳定延迟归还 / VMM 2MiB 粒度
+  可对端映射);**kind 错配 = LawViolation**(Scratch 池存权重、
+  Weights 池做跨卡共享皆为架构错误)。
+- **四道校验链**:kind 语义匹配 → 池余量(A5.4)→ 全局预算(A5.4)
+  → 物理分配;任一失败逐级回滚,账本如实。
+- **三元关系**(§四 细化):Backend(厂商栈:枚举/打开)1:N
+  Device(一卡 = 一账本 + 一池组 + 一相位机)1:N Pool(分解表一行
+  = 容量承诺 + 分配者)N Buf(池内缓冲,出生带 BufToken)。
+  上层(nn)只见 Pool 工厂(`zeros_tensor/scratch_tensor`),
+  Device 不在分配调用点出现。
+- **PoolBuf 不透明句柄**:drop 时后端自动归池账 + 全局账(非 Idle 相
+  按 A1.2 延迟);iface 以 `Box<dyn OpaqueDevBuf>` 封装(P 阶段对象,
+  非 E 阶段热路径,符合 REQ-CODE-01)。
+
 ### A3. 同步点隔离(继承 REQ-CODE-03 并升格)
 
 全引擎真阻塞点只有 logits D2H。runner 线程持有全部 CUDA 上下文,tokio 侧
@@ -124,6 +152,10 @@
   按认领纪律走(parity 硬门 + 差异清单 + 只 cherry-pick 不 merge),
   不允许顺手改。
 - 每个快照登记来源 rev 与已知差异(见 §三表)。
+- **ffi 白名单(2026-09-22 增补)**:cudarc 受控再导出,精确到接口
+  粒度——整库 re-export 禁止;白名单每一项的扩充须过
+  `backends/README.md` 准入铁律审核并登记。第三方 CUDA 库的账外
+  分配零容忍(不用,或 copy 改造)。
 
 ## 三、借力清单(原材料 → 用法)
 
@@ -143,21 +175,47 @@
 
 ```
 packages/owl/
-├── crates/graph    图运行时:预算登记/捕获治理/replay 调度/降级(公理 A1 全部落点)
-├── crates/comm     TP 通信:尺寸路由/one-shot AR/NCCL 边界/融合口(公理 A2 全部落点)
-├── crates/kernels  算子分发:arch 表(sm86 先行)/marlin 接线/可捕获 kernel 契约(A1.5)
-├── crates/core     模型注册表/scheduler/runner(同步隔离 A3)/内存规划器(含 graph_allowance)
-└── crates/server   tokio API 层(M2 才开)
+├── crates/signal      依赖追踪栈(thread-local;零后端语义,ROCm 可复用)
+├── crates/graph       图运行时:预算登记/捕获治理/定影协议/降级(公理 A1 落点)
+├── crates/comm        TP 通信:尺寸路由/one-shot AR/融合口(公理 A2 落点)
+├── crates/kernels     算子分发:arch 表(sm86 先行)/可捕获 kernel 契约(A1.5)
+├── crates/backends/
+│   ├── iface          HAL 契约:Backend/Device/Pool/DevBuf/BufToken(上层唯一入口)
+│   ├── cuda           CUDA 栈(官方 cudarc 封装):CudaBackend/CudaDevice/CudaPool
+│   └── rocm           占位(未来厂商栈)
+├── crates/core        内存规划器/scheduler/runner(同步隔离 A3)/健康状态(A2.7)
+├── crates/nn          最小张量层 + NN 算子(池工厂 API,CaptureSafe 契约)
+└── crates/server      tokio API 层(M2 才开)
 ```
 
-依赖方向单向:`server → core → {graph, comm, kernels}`;graph/comm/kernels
-互不依赖,共享类型下沉 core。数据面:candle 快照作为 core 的张量后端引入
-(方式待 M1 定:直接依赖 or 自持薄层)。
+依赖方向单向:`server → core → nn → {iface 派生 Device 实现}` 与
+`core → {graph, comm, kernels, signal}`;signal 零后端依赖。
+数据面:官方 cudarc 仅在 backends/cuda 导入,经 `ffi` 白名单受控再导出。
+
+### 三元关系(2026-09-22 裁决,类型化于 iface)
+
+```text
+Backend(厂商栈:枚举/打开)  1:N  Device(一卡 = 一账本 + 一池组 + 一相位机)
+Device                       1:N  Pool(A5.1 分解表一行 = 容量承诺 + 分配者)
+Pool                         1:N  Buf(池内缓冲,出生带 BufToken)
+```
+
+- **Backend** 回答"哪个厂商 API 家族";**Device** 回答"哪张卡";
+  **Pool** 回答"从哪笔预算出";**Buf** 是被批准的结论。
+- 分配语义见公理 A6;依赖追踪见公理 A1.6;租约见公理 A1.7。
 
 ## 五、里程碑(粗粒度,细节走 roadmap)
 
-- **M0(本轮)**:立项文档 + 骨架编译绿 + 公理落成 trait 签名。
-- **M1 内存规划器 + 图运行时最小闭环**:单卡、单模型(小 decoder)、decode
+- **M0(✅ 2026-09-22 完成)**:立项文档 + 骨架编译绿 + 公理落成
+  trait 签名;另完成 **nn 一期**(2026-09-22,五任务四 worker 并行):
+  nvrtc kernel 移植 ×9 / 池化张量 / cublas 预钉 / out-style 8 算子 /
+  02_capture examples,13+ 测试真机绿;GraphLease/定影/哨兵①/
+  Pool 分配者全部带代码位与测试。
+- **M1(进行中)**:Governor 接线自动化(seal/warmup 制度化)、cublas
+  改绑 non-blocking stream 入图、哨兵③ cuGraphGetNodes 审计、
+  多档 shape 预捕获、Signal 追踪栈实现(设计稿
+  `docs/arch/signal-dependency-design.md`)。
+- **M1 内存规划器 + 图运行时最小闭环**(原条文,验收标准不变):单卡、单模型(小 decoder)、decode
   全图捕获/replay,allowance 预算生效,A1.2/A1.3/A1.4 有 debug_assert 与
   单测。验收:eager↔graph 数值对拍,重复捕获/销毁循环无显存漂移。
 - **M2 TP2 通信**:comm 尺寸路由 + one-shot AR + NCCL 边界;UUID 钉卡;
@@ -185,3 +243,9 @@ packages/owl/
   A2.6 设备隔离律 + 单进程多实例拓扑(二次裁决,推翻初版多进程倾向);
   A2.7 故障语义全有或全无(Paused/Unrecoverable);iface 增加显存池管理与
   DeviceDesc 抽象,backends 增加第三方 CUDA 准入铁律(账外分配零容忍)。
+- 2026-09-22 增补(第二批):Pool 分配者语义化(三原语 + kind 错配
+  LawViolation);BufToken/哨兵①(CaptureRecord 类型化);GraphLease
+  强租约(姿势 2/3 封死);ffi 精确白名单;**Signal 式依赖追踪设计稿**
+  落地(`docs/arch/signal-dependency-design.md`,不变量 Φ:捕获作用域内
+  一切 CUDA 资源操作必经追踪栈,四 choke point 收编图鉴 8/10 姿势);
+  三元关系(Backend/Device/Pool/Buf)类型化于 iface。
