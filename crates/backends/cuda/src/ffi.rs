@@ -25,7 +25,7 @@ pub use cudarc::driver::result::stream::{
 pub mod sys {
     // driver 侧:指针类型 + 显式拷贝(tensor 装载/回读)
     pub use cudarc::driver::sys::{
-        CUdeviceptr, cuMemcpyDtoH_v2, cuMemcpyHtoD_v2, cuMemcpyDtoDAsync_v2, cuMemsetD8Async, cuMemsetD32Async,
+        CUdeviceptr, cuMemcpyDtoH_v2, cuMemcpyHtoD_v2, cuMemcpyDtoDAsync_v2, cuMemsetD8Async, cuMemsetD16Async, cuMemsetD32Async,
         // graph 捕获(M1 归入 graph 治理层)
         CUgraphInstantiate_flags, CUstreamCaptureMode,
         // 图审计与枚举(哨兵③,M1;只读查询 API,零分配零懒状态——
