@@ -9,6 +9,7 @@ owl-cuda = { path = "../backends/cuda" }
 owl-signal = { path = "../signal" }
 owl-nn = { path = "../nn" }
 thiserror.workspace = true
+ahash = "0.8"
 serde = { workspace = true }
 bytemuck = { workspace = true }
 llguidance = { workspace = true }
