@@ -432,7 +432,7 @@ mod tests {
         )
         .unwrap();
         let profiles = match outcome {
-            CaptureOutcome::Captured { profiles, sealed_bytes } => {
+            CaptureOutcome::Captured { profiles, sealed_bytes: _ } => {
                 assert_eq!(profiles, vec![1, 2, 3, 4], "四档全定影");
                 // memset-only 假模型捕获期零分配,footprint=0 合法;
                 // 真模型(qwen3_5 接入后)此处应 > 0(scratch 中间量存活)

@@ -8,6 +8,7 @@
 //! 本模型特性:hybrid 层(full_attention / linear_attention=GDN 交错),
 //! mamba slot 状态管理,DFlash verify 逐层 hidden 捕获,MTP hidden 缓冲。
 
+use crate::error::Error;
 use super::layers::attention::Attention;
 use super::layers::deltanet::GatedDeltaNet;
 use super::layers::distributed::{Comm, TensorParallelRowLinear};
@@ -1010,3 +1011,101 @@ impl Qwen3_5ForCausalLM {
 //    restore_prefix_state/reset_all + 构造面(9 参数形状元数据)
 // A10 ctor::from_vec 对 I64 的 dtype 面(S4 边界;slot 语义回填 U32 化
 //     时同步裁剪)
+
+// ============================================================================
+// GraphForward 对接(T2-三 目标二;graph-model-seam.md §三)
+// ============================================================================
+
+/// decode 图适配器:把 [`Qwen3_5ForCausalLM`] 塞进 GraphPlan 的最小面。
+///
+/// KV cache 由 runner 在 P 阶段预分配(租约常驻);输入绑定句柄经
+/// [`Self::load_inputs`] 装填(依赖 graphplan 需求 R1,见 forward 内注)。
+/// verify 路径(dflash2/mtp)构造 `is_verify = true` 的第二个实例。
+pub struct DecodeGraphAdapter {
+    model: std::sync::Arc<Qwen3_5ForCausalLM>,
+    kv_caches: Vec<(Tensor, Tensor)>,
+    vocab: usize,
+    is_verify: bool,
+    inputs: std::sync::Mutex<Option<DecodeInputs>>,
+}
+
+/// 钉住的输入绑定句柄(R1 装填前的占位载体)
+struct DecodeInputs {
+    frontier: Tensor,
+    positions: Tensor,
+    #[allow(dead_code)]
+    slot_mapping: Tensor,
+    #[allow(dead_code)]
+    kv_lens: Tensor,
+}
+
+impl DecodeGraphAdapter {
+    pub fn new(
+        model: std::sync::Arc<Qwen3_5ForCausalLM>,
+        kv_caches: Vec<(Tensor, Tensor)>,
+        vocab: usize,
+        is_verify: bool,
+    ) -> Self {
+        Self {
+            model,
+            kv_caches,
+            vocab,
+            is_verify,
+            inputs: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub fn vocab(&self) -> usize {
+        self.vocab
+    }
+
+    /// R1 装填口:graphplan 暴露 bindings DynTensor 句柄后由 runner 调用
+    /// (graph-model-seam 需求 R1;在此之前 decode 图不可捕获)。
+    pub fn load_inputs(
+        &self,
+        frontier: Tensor,
+        positions: Tensor,
+        slot_mapping: Tensor,
+        kv_lens: Tensor,
+    ) {
+        *self.inputs.lock().expect("inputs 锁中毒") = Some(DecodeInputs {
+            frontier,
+            positions,
+            slot_mapping,
+            kv_lens,
+        });
+    }
+}
+
+impl crate::graphplan::GraphForward for DecodeGraphAdapter {
+    fn forward(&self, ctx: &owl_nn::KernelCtx, view: &crate::graphplan::BindingsView) -> Result<()> {
+        let _ = ctx; // 层内 OwlTensor/ops 面消费(ctx scratch;T3 kernel 回填后)
+        let g = self.inputs.lock().map_err(|_| Error::Msg("inputs 锁中毒".into()))?;
+        let inp = g.as_ref().ok_or_else(|| {
+            Error::Msg(
+                "R1(graphplan 需求): GraphBindings 需暴露五字段 DynTensor 句柄(或 DynTensor::from_raw 视图构造);装填前 decode 图不可捕获".into(),
+            )
+        })?;
+        let meta = InputMetadata {
+            seqlens: Some(vec![view.bs]),
+            is_prefill: false, // decode-only 先行;prefill 保持 eager(与 xinfer 语义一致)
+            is_mtp_verify: self.is_verify,
+            mamba_slot_mapping: None,
+            sequence_ids: Some((0..view.bs).collect()),
+        };
+        let logits =
+            self.model
+                .forward(&inp.frontier, &inp.positions, Some(&self.kv_caches), &meta, false)?;
+        // R2(nn 需求):logits(scratch 张量)D2D 直写 view.logits_out
+        // (采样同址读,零 D2H)。当前 nn 面缺 copy_d2d(src,&dst_ptr,n)。
+        let logits_elems = logits.len_bytes() / std::mem::size_of::<f32>();
+        let expect = view.bs * view.vocab;
+        if logits_elems != expect {
+            return Err(Error::Msg(format!(
+                "decode 图: logits 元素数 {logits_elems} != bs×vocab {expect}"
+            )));
+        }
+        let _ = view.logits_out;
+        unimplemented!("R2(nn): copy_d2d(logits → logits_out)回填;shape 校验已真实")
+    }
+}

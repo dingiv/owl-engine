@@ -50,7 +50,7 @@ pub mod moe;
 //pub mod rotary_emb;
 //pub mod wna16;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use owl_cuda::CudaDevice;
 use owl_nn::DynTensor;
 
@@ -444,13 +444,15 @@ pub mod ctor {
     }
 }
 
-// ============================================================================
-// VarBuilderX 桩(权重装载通道 T3 回填;类型面照抄 xinfer)
-// ============================================================================
 
 /// GGUF/safetensors 双路 var builder 包装(= xinfer `models::layers::VarBuilderX`)。
-/// 编译先行:仅保留类型面与路径拼接语义;`get`/`get_with_hints_dtype` 为
-/// T3 权重装载通道回填前的 unimplemented。
+///
+/// T2-三 接线(2026-09-22):GGUF 通道经 [`crate::loader::gguf::GGufVarBuilder`]
+/// 全链真实化——元数据查询(has_key/contains_tensor/tensor_shape/get_no_shape)
+/// 与 `get/get_with_hints_dtype`(元数据 shape 校验 → 反解 → 目标 dtype
+/// 位型转换 → 池直连工厂落池 → 擦除张量)。分配语义遵守裁决 5:
+/// 权重装载 = P 阶段,经注入的 Weights 池(`with_pool`);无池 = Host
+/// 测试模式(get 系列结构化报错,host 产物走 [`Self::get_host`])。
 #[derive(Clone)]
 pub struct VarBuilderX {
     /// 模块路径(前缀)
@@ -459,28 +461,90 @@ pub struct VarBuilderX {
     pub weight_paths: Option<Vec<std::path::PathBuf>>,
     /// 是否 GGUF(Q) 路径
     pub is_gguf: bool,
+    /// GGUF 内容句柄(全量元数据 + 分片解析;Arc 共享,pp 下钻零拷贝)
+    gguf: Option<std::sync::Arc<crate::loader::gguf::GGufVarBuilder>>,
+    /// 装载目标池(P 阶段注入;None = Host 测试模式)
+    pool: Option<std::sync::Arc<owl_cuda::CudaPool>>,
+    /// 设备句柄(device() 查询面)
+    device: Option<Device>,
+}
+
+/// f32 → bf16 位型(RNE 舍入;host 位操作,无算术面)
+fn f32_to_bf16_bits(v: f32) -> u16 {
+    let b = v.to_bits();
+    let lsb = (b >> 16) & 1;
+    ((b + 0x7fff + lsb) >> 16) as u16
+}
+
+/// f32 → f16 位型(IEEE 754 half,RNE;查表-free 位算法)
+fn f32_to_f16_bits(v: f32) -> u16 {
+    let b = v.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xff) as i32;
+    let man = b & 0x007f_ffff;
+    if exp == 0xff {
+        // inf/nan
+        return sign | 0x7c00 | if man != 0 { 0x0200 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00; // overflow → inf
+    }
+    if e <= 0 {
+        // 次正规(右移含隐藏位)
+        if e < -10 {
+            return sign;
+        }
+        let m = ((man | 0x0080_0000) >> (14 - e + 1)) as u16;
+        let round = ((man >> (13 - e)) & 1) as u16;
+        return sign | (m + round);
+    }
+    let half = ((e as u16) << 10) | ((man >> 13) as u16);
+    let round = ((man >> 12) & 1) as u16;
+    sign | (half + round)
 }
 
 impl VarBuilderX {
-    /// 占位构造(T3 权重装载通道回填:safetensors/GGUF 打开)
+    /// GGUF 打开(全量元数据;数据按需读取)。`model_pathes.filenames`
+    /// 为空或 is_gguf=false 时仅建空壳(Host 模式测试/纯元数据用途)。
     pub fn new(
-        _model_pathes: &crate::downloader::ModelPaths,
+        model_pathes: &crate::downloader::ModelPaths,
         is_gguf: bool,
         _dtype: DType,
-        _device: &Device,
+        device: &Device,
     ) -> Result<Self> {
+        let gguf = if is_gguf && !model_pathes.filenames.is_empty() {
+            Some(std::sync::Arc::new(
+                crate::loader::gguf::GGufVarBuilder::from_gguf_files(&model_pathes.filenames)?,
+            ))
+        } else {
+            None
+        };
         Ok(Self {
             module_path: String::new(),
-            weight_paths: None,
+            weight_paths: Some(model_pathes.filenames.clone()),
             is_gguf,
+            gguf,
+            pool: None,
+            device: Some(device.clone()),
         })
     }
 
-    pub fn from_gguf_file<P: AsRef<std::path::Path>>(_path: P, _device: &Device) -> Result<Self> {
+    /// 注入装载目标池(P 阶段;裁决 5:分配入口在 Pool)。
+    pub fn with_pool(mut self, pool: std::sync::Arc<owl_cuda::CudaPool>) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
+    pub fn from_gguf_file_host<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
+        let vb = crate::loader::gguf::GGufVarBuilder::from_gguf(path)?;
         Ok(Self {
             module_path: String::new(),
             weight_paths: None,
             is_gguf: true,
+            gguf: Some(std::sync::Arc::new(vb)),
+            pool: None,
+            device: None,
         })
     }
 
@@ -494,7 +558,9 @@ impl VarBuilderX {
         self.is_gguf
     }
     pub fn device(&self) -> Device {
-        unimplemented!("T3 权重装载通道回填: device 绑定")
+        self.device
+            .clone()
+            .expect("VarBuilderX::device: 无设备句柄(Host 模式)")
     }
 
     /// 前缀下钻(路径拼接语义 = 真实,与 xinfer 一致)
@@ -508,35 +574,75 @@ impl VarBuilderX {
             module_path: next,
             weight_paths: self.weight_paths.clone(),
             is_gguf: self.is_gguf,
+            gguf: self.gguf.clone(),
+            pool: self.pool.clone(),
+            device: self.device.clone(),
         }
     }
 
     pub fn aux(&self) -> Option<VarBuilderX> {
-        None // T3 回填
+        None // 多文件 aux 权重(xinfer mm projector);本项目面未见,按需回填
     }
     pub fn gguf_path(&self) -> Option<&str> {
-        None // T3 回填
+        self.gguf.as_ref().map(|g| g.gguf_path())
     }
     pub fn weight_paths(&self) -> Option<Vec<std::path::PathBuf>> {
         self.weight_paths.clone()
     }
     pub fn cpu_var_builder(&self) -> Option<VarBuilderX> {
-        None // T3 回填
+        None // CPU offload 面本项目未见;按需回填
     }
     pub fn module_path(&self) -> &str {
         &self.module_path
     }
-    pub fn has_key(&self, _name: &str) -> bool {
-        false // T3 回填
+    pub fn has_key(&self, name: &str) -> bool {
+        self.gguf
+            .as_ref()
+            .map(|g| g.contains_key(&self.full_name(name)))
+            .unwrap_or(false)
     }
-    pub fn contains_tensor(&self, _name: &str) -> bool {
-        false // T3 回填
+    pub fn contains_tensor(&self, name: &str) -> bool {
+        self.has_key(name)
     }
-    pub fn get_no_shape(&self, _name: &str) -> Result<Tensor> {
-        unimplemented!("T3 权重装载通道回填: get_no_shape")
+    pub fn get_no_shape(&self, name: &str) -> Result<Tensor> {
+        // 无 shape 请求 = 按元数据原 shape 反解(GGUF 维序反转回 owl 行主序)
+        let full = self.full_name(name);
+        let shape = self
+            .gguf
+            .as_ref()
+            .and_then(|g| g.tensor_shape(&full))
+            .ok_or_else(|| Error::Msg(format!("VarBuilderX: 权重缺失 {full}")))?;
+        // GGUF 元数据为反转维序
+        let mut owl_shape = shape;
+        owl_shape.reverse();
+        self.get_with_hints_dtype(owl_shape, name, Shard::default(), DType::F32)
     }
-    pub fn tensor_shape(&self, _name: &str) -> Option<Vec<usize>> {
-        None // T3 回填
+    pub fn tensor_shape(&self, name: &str) -> Option<Vec<usize>> {
+        let mut s = self.gguf.as_ref().and_then(|g| g.tensor_shape(&self.full_name(name)))?;
+        s.reverse(); // GGUF 反转维序 → owl 行主序
+        Some(s)
+    }
+
+    fn full_name(&self, name: &str) -> String {
+        if self.module_path.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}.{}", self.module_path, name)
+        }
+    }
+
+    fn gguf_ref(&self) -> Result<std::sync::Arc<crate::loader::gguf::GGufVarBuilder>> {
+        self.gguf
+            .clone()
+            .ok_or_else(|| Error::Msg("VarBuilderX: 非 GGUF 路径(safetensors 通道 T3 回填)".into()))
+    }
+
+    fn pool_ref(&self) -> Result<std::sync::Arc<owl_cuda::CudaPool>> {
+        self.pool
+            .clone()
+            .ok_or_else(|| Error::Msg(
+                "VarBuilderX: 未注入装载池(Host 测试模式;设备 get 需 with_pool)".into(),
+            ))
     }
 
     pub fn get_with_hints_dtype(
@@ -546,12 +652,53 @@ impl VarBuilderX {
         shard: Shard,
         dtype: DType,
     ) -> Result<Tensor> {
-        let _ = (&s, name, &shard, dtype);
-        unimplemented!("T3 权重装载通道回填: get_with_hints_dtype")
+        if shard.world_size > 1 {
+            unimplemented!("TP 分片装载(Row/Col)= T3 后续(当前单卡面)");
+        }
+        let gg = self.gguf_ref()?;
+        let full = self.full_name(name);
+        // shape 校验真实:请求(owl 行主序)→ GGUF 反转维序后比对
+        let mut want = s.into().dims().to_vec();
+        want.reverse();
+        let raw = gg.get(&want, &full)?;
+        let mut owl_shape = raw.shape.clone();
+        owl_shape.reverse();
+
+        // 反解到 f32(除 F32 直通)→ 目标 dtype 位型 → 池直连
+        let f32s = if raw.dtype == crate::loader::gguf::GgmlDType::F32 {
+            raw.raw
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<f32>>()
+        } else {
+            crate::loader::gguf::dequantize_to_f32(raw.dtype, &raw.shape, &raw.raw)?
+        };
+        let pool = self.pool_ref()?;
+        use owl_nn::TensorPoolOps;
+        match dtype {
+            DType::F32 => {
+                let t = pool.from_vec_tensor::<f32>(&owl_shape, f32s)?;
+                Ok(Tensor::from_f32(&t))
+            }
+            DType::BF16 => {
+                let v: Vec<owl_nn::Bf16> =
+                    f32s.iter().map(|&f| owl_nn::Bf16(f32_to_bf16_bits(f))).collect();
+                let t = pool.from_vec_tensor::<owl_nn::Bf16>(&owl_shape, v)?;
+                Ok(Tensor::from_bf16(&t))
+            }
+            DType::F16 => {
+                let v: Vec<owl_nn::F16> =
+                    f32s.iter().map(|&f| owl_nn::F16(f32_to_f16_bits(f))).collect();
+                let t = pool.from_vec_tensor::<owl_nn::F16>(&owl_shape, v)?;
+                Ok(Tensor::from_f16(&t))
+            }
+            _ => Err(Error::Msg(format!(
+                "VarBuilderX: 目标 dtype {dtype} 权重装载未开(U8/U32/I64 经 kvcache/索引专用通道;F8 量化 = marlin-ffi 路线)"
+            ))),
+        }
     }
     pub fn get(&self, s: impl Into<Shape>, name: &str) -> Result<Tensor> {
-        let _ = (name, &s);
-        unimplemented!("T3 权重装载通道回填: get")
+        self.get_with_hints_dtype(s, name, Shard::default(), DType::F32)
     }
     pub fn get_with_hints(
         &self,
@@ -559,9 +706,41 @@ impl VarBuilderX {
         name: &str,
         hints: Shard,
     ) -> Result<Tensor> {
-        let _ = (&s, name, hints);
-        unimplemented!("T3 权重装载通道回填: get_with_hints")
+        self.get_with_hints_dtype(s, name, hints, DType::F32)
     }
+
+    /// Host 测试模式:反解产物留在内存(零设备依赖;供装载链单测)。
+    pub fn get_host(&self, s: impl Into<Shape>, name: &str) -> Result<HostTensorBoxed> {
+        let gg = self.gguf_ref()?;
+        let full = self.full_name(name);
+        let mut want = s.into().dims().to_vec();
+        want.reverse();
+        let raw = gg.get(&want, &full)?;
+        let f32s = if raw.dtype == crate::loader::gguf::GgmlDType::F32 {
+            raw.raw
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<f32>>()
+        } else {
+            crate::loader::gguf::dequantize_to_f32(raw.dtype, &raw.shape, &raw.raw)?
+        };
+        let mut owl_shape = raw.shape.clone();
+        owl_shape.reverse();
+        let mut bytes = Vec::with_capacity(f32s.len() * 4);
+        for f in &f32s {
+            bytes.extend_from_slice(&f.to_le_bytes());
+        }
+        Ok(HostTensorBoxed {
+            shape: owl_shape,
+            data: bytes,
+        })
+    }
+}
+
+/// Host 模式反解产物(测试/对拍用;f32 LE)
+pub struct HostTensorBoxed {
+    pub shape: Vec<usize>,
+    pub data: Vec<u8>,
 }
 
 /// 分片参数(= candle_nn::var_builder::Shard;结构直译)
@@ -894,3 +1073,118 @@ impl WithDType for Tensor {
 /// IndexOp(= candle_core::IndexOp;index_select/gather 面)
 pub trait IndexOp: OwlTensor {}
 impl IndexOp for Tensor {}
+
+// ============================================================================
+// VarBuilderX 装载链真机测试(T2-三 目标一验收)
+// ============================================================================
+
+#[cfg(test)]
+mod varbuilder_tests {
+    use super::*;
+
+    /// 合成 GGUF(与 loader 测试同构造;自带 t_f32 [2,2] 与 t_q8_0 [32])
+    fn write_synthetic_gguf() -> std::path::PathBuf {
+        let mut w: Vec<u8> = Vec::new();
+        w.extend_from_slice(&0x46554747u32.to_le_bytes());
+        w.extend_from_slice(&3u32.to_le_bytes());
+        w.extend_from_slice(&2u64.to_le_bytes());
+        w.extend_from_slice(&1u64.to_le_bytes());
+        w.extend_from_slice(&17u64.to_le_bytes());
+        w.extend_from_slice(b"general.alignment");
+        w.extend_from_slice(&4u32.to_le_bytes());
+        w.extend_from_slice(&32u32.to_le_bytes());
+        let name1 = b"t_f32";
+        w.extend_from_slice(&(name1.len() as u64).to_le_bytes());
+        w.extend_from_slice(name1);
+        w.extend_from_slice(&2u32.to_le_bytes());
+        w.extend_from_slice(&2u64.to_le_bytes());
+        w.extend_from_slice(&2u64.to_le_bytes());
+        w.extend_from_slice(&0u32.to_le_bytes());
+        w.extend_from_slice(&0u64.to_le_bytes());
+        let name2 = b"t_q8_0";
+        w.extend_from_slice(&(name2.len() as u64).to_le_bytes());
+        w.extend_from_slice(name2);
+        w.extend_from_slice(&1u32.to_le_bytes());
+        w.extend_from_slice(&32u64.to_le_bytes());
+        w.extend_from_slice(&8u32.to_le_bytes());
+        w.extend_from_slice(&16u64.to_le_bytes());
+        while w.len() % 32 != 0 {
+            w.push(0);
+        }
+        for f in [1.0f32, 2.0, 3.0, 4.0] {
+            w.extend_from_slice(&f.to_le_bytes());
+        }
+        w.extend_from_slice(&0x4000u16.to_le_bytes());
+        for i in 0..32u8 {
+            w.push(i);
+        }
+        let p = std::env::temp_dir().join(format!(
+            "owl-varbuilder-test-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&p, &w).unwrap();
+        p
+    }
+
+    /// Host 模式:解析 + Q8_0 反解 + shape 校验,零设备依赖
+    #[test]
+    fn host_get_roundtrip_and_shape_guard() {
+        let p = write_synthetic_gguf();
+        let vb = VarBuilderX::from_gguf_file_host(&p).unwrap();
+        // 命中:shape 正确 → f32 内容对拍
+        let t = vb.get_host([2, 2], "t_f32").unwrap();
+        assert_eq!(t.shape, vec![2, 2]);
+        let mut want = Vec::new();
+        for f in [1.0f32, 2.0, 3.0, 4.0] {
+            want.extend_from_slice(&f.to_le_bytes());
+        }
+        assert_eq!(t.data, want);
+        // shape 不符 = 结构化报错(元数据 [2,2] vs 请求 [4,1])
+        assert!(vb.get_host([4, 1], "t_f32").is_err());
+        // 缺失 = 结构化报错
+        assert!(vb.get_host([2, 2], "nope").is_err());
+        // Q8_0 → f32 反解(d=2.0,qs=[0..32] 对称量化)
+        let q = vb.get_host([32], "t_q8_0").unwrap();
+        assert_eq!(q.data.len(), 32 * 4);
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 设备模式:with_pool 注入 → get → DynTensor(F32)→ D2H 对拍
+    #[test]
+    fn device_get_roundtrip() {
+        use owl_iface::Device as _;
+        let dev = owl_cuda::CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA");
+        let p = write_synthetic_gguf();
+        let pool = std::sync::Arc::new(
+            dev.create_pool(owl_iface::PoolConfig {
+                name: format!("vb-test-{}", std::process::id()),
+                kind: owl_iface::PoolKind::Weights,
+                bytes: 1 << 20,
+            })
+            .unwrap(),
+        );
+        let vb = VarBuilderX::from_gguf_file_host(&p)
+            .unwrap()
+            .with_pool(pool);
+        let t = vb.get([2, 2], "t_f32").unwrap();
+        assert_eq!(t.dtype(), DType::F32);
+        assert_eq!(t.shape(), &[2, 2]);
+        // D2H 对拍:落池内容 = GGUF 原值
+        let mut host = [0f32; 4];
+        unsafe {
+            owl_cuda::ffi::sys::cuMemcpyDtoH_v2(
+                host.as_mut_ptr() as *mut std::ffi::c_void,
+                t.device_ptr() as owl_cuda::ffi::sys::CUdeviceptr,
+                16,
+            )
+            .result()
+            .unwrap();
+        }
+        assert_eq!(host, [1.0, 2.0, 3.0, 4.0]);
+        std::fs::remove_file(&p).ok();
+    }
+}
