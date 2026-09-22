@@ -308,7 +308,7 @@ impl OwlTensor for Tensor {
                     outer,
                     src_dim,
                     start * after,
-                    len,
+                    len * after,
                 )
                 .map_err(BackendError::Init)?;
                 Ok(DynTensor::from_f32(&out))
@@ -761,16 +761,43 @@ pub mod ops {
 
 pub mod ctor {
     #![allow(unused_variables)]
-    use super::{t3_unimpl, DType, Device, Result, Shape, Tensor};
+    use super::{DType, Device, Result, Shape, Tensor};
+    use owl_nn::TensorPoolOps;
 
-    pub fn zeros(shape: impl Into<Shape>, _dtype: DType, _device: &Device) -> Result<Tensor> {
-        t3_unimpl("zeros")
+    /// dtype 分派:F32/U32 走真路径(与其余 ctor 同口子),其余结构化报错。
+    pub(self) fn zeros_impl(shape: &[usize], dtype: DType, name: &str, fill: Option<f64>) -> Result<Tensor> {
+        let pool = crate::models::layers::ctx_scope::weights_pool();
+        let pool = pool.as_ref();
+        let n: usize = shape.iter().product();
+        match dtype {
+            DType::F32 => {
+                let t = match fill {
+                    Some(x) => pool.from_vec_tensor::<f32>(shape, vec![x as f32; n])?,
+                    None => pool.zeros_tensor::<f32>(shape)?,
+                };
+                Ok(owl_nn::DynTensor::from_f32(&t))
+            }
+            DType::U32 => {
+                let t = match fill {
+                    Some(x) => pool.from_vec_tensor::<u32>(shape, vec![x as u32; n])?,
+                    None => pool.zeros_tensor::<u32>(shape)?,
+                };
+                Ok(owl_nn::DynTensor::from_u32(&t))
+            }
+            _ => Err(crate::Error::Msg(format!(
+                "ctor::{name}: 仅支持 F32/U32(收到 {dtype:?})"
+            ))),
+        }
     }
-    pub fn ones(shape: impl Into<Shape>, _dtype: DType, _device: &Device) -> Result<Tensor> {
-        t3_unimpl("ones")
+
+    pub fn zeros(shape: impl Into<Shape>, dtype: DType, _device: &Device) -> Result<Tensor> {
+        zeros_impl(shape.into().dims(), dtype, "zeros", None)
     }
-    pub fn full(shape: impl Into<Shape>, _v: f64, _dtype: DType, _device: &Device) -> Result<Tensor> {
-        t3_unimpl("full")
+    pub fn ones(shape: impl Into<Shape>, dtype: DType, _device: &Device) -> Result<Tensor> {
+        zeros_impl(shape.into().dims(), dtype, "ones", Some(1.0))
+    }
+    pub fn full(shape: impl Into<Shape>, v: f64, dtype: DType, _device: &Device) -> Result<Tensor> {
+        zeros_impl(shape.into().dims(), dtype, "full", Some(v))
     }
     pub fn arange(start: usize, end: usize, _dtype: DType, _device: &Device) -> Result<Tensor> {
         // dry-run 装载基元:host 生成等差序列落池(u32 位型;rope 位置表用)
@@ -780,9 +807,13 @@ pub mod ctor {
         let t = owl_nn::TensorPoolOps::from_vec_tensor(pool.as_ref(), &shape, v)?;
         Ok(owl_nn::DynTensor::from_u32(&t))
     }
-    pub fn eye(n: usize, m: usize, _dtype: DType, _device: &Device) -> Result<Tensor> {
-        let _ = (n, m);
-        t3_unimpl("eye")
+    pub fn eye(n: usize, m: usize, dtype: DType, _device: &Device) -> Result<Tensor> {
+        // host 生成单位阵再落池(f32;u32 同构造)
+        let mut v = vec![0.0f32; n * m];
+        for i in 0..n.min(m) {
+            v[i * m + i] = 1.0;
+        }
+        from_vec(v, [n, m], _device)
     }
     pub fn from_vec<T: Copy + 'static>(
         v: Vec<T>,
@@ -809,15 +840,18 @@ pub mod ctor {
             std::any::type_name::<T>()
         )));
     }
-    pub fn new<T: Copy>(
-        _v: Vec<T>,
-        _shape: impl Into<Shape>,
-        _device: &Device,
+    pub fn new<T: Copy + 'static>(
+        v: Vec<T>,
+        shape: impl Into<Shape>,
+        device: &Device,
     ) -> Result<Tensor> {
-        t3_unimpl("new")
+        // candle Tensor::new 语义 = from_vec 的别名(数据已在 host Vec)
+        from_vec(v, shape, device)
     }
-    pub fn empty(shape: impl Into<Shape>, _dtype: DType, _device: &Device) -> Result<Tensor> {
-        t3_unimpl("empty")
+    pub fn empty(shape: impl Into<Shape>, dtype: DType, device: &Device) -> Result<Tensor> {
+        // persistent 分配本身清零(zeros_tensor 走 alloc_persistent 清零语义),
+        // "未初始化"语义在此等价 zeros——调用方不应依赖内容
+        zeros(shape, dtype, device)
     }
 }
 
