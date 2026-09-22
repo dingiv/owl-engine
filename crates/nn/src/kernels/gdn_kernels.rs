@@ -56,8 +56,24 @@ impl GdnKernels {
         block: (u32, u32, u32),
         args: &[u64],
     ) -> Result<(), String> {
+        self.launch_smem(stream, name, grid, block, 0, args)
+    }
+
+    fn launch_smem(
+        &mut self,
+        stream: &CudaStream,
+        name: &'static str,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        shared_mem_bytes: u32,
+        args: &[u64],
+    ) -> Result<(), String> {
         let func = self.func(name)?;
-        let cfg = LaunchConfig { grid_dim: grid, block_dim: block, shared_mem_bytes: 0 };
+        let cfg = LaunchConfig {
+            grid_dim: grid,
+            block_dim: block,
+            shared_mem_bytes,
+        };
         unsafe {
             let mut builder = stream.launch_builder(&func);
             for a in args {
@@ -147,16 +163,19 @@ impl GdnKernels {
         )
     }
 
-    /// gated rmsnorm + act(z)(silu/sigmoid)+ mul
+    /// gated rmsnorm + act(z)(silu/sigmoid)+ mul。
+    /// 语义(二刀定谳,对齐 deltanet 调用点):gamma/bias 恒 f32;
+    /// per_group_weights=true → [group_size] 组内共享(生产加载形态),
+    /// false → 全长 [value_dim];bias 可空(has_bias=false 时传 null)。
     #[allow(clippy::too_many_arguments)]
     pub fn rmsnorm_act(
         &mut self,
         stream: &CudaStream,
-        dtype: &'static str,
+        dtype: &'static str, // "f32" | "f16" | "bf16"
         x: *const u8,
         z: *const u8,
-        gamma: *const u8,
-        bias: *const u8, // 可空
+        gamma: *const f32,
+        bias: *const f32, // 可空
         out: *mut u8,
         rows: i32,
         value_dim: i32,
@@ -166,11 +185,238 @@ impl GdnKernels {
         has_bias: bool,
         act: i32, // 0=silu(Qwen3.5) 1=sigmoid(Qwen4)
     ) -> Result<(), String> {
-        // 障碍挂起(2026-09-22):per-group gamma 长度语义与 deltanet 调用点
-        // 不一致(host 参考按单组共享,kernel 按组偏移)——K3 第二刀与
-        // deltanet.rs 调用面对齐后启用;cu 核已写好(cu/gdn/gdn_kernels.cu)
-        let _ = (stream, dtype, x, z, gamma, bias, out, rows, value_dim, group_size, eps, per_group_weights, has_bias, act);
-        unimplemented!("K3 第二刀: rmsnorm_act 参数语义对齐 deltanet 调用点")
+        let name: &'static str = match dtype {
+            "f32" => "gdn_rmsnorm_act_f32",
+            "f16" => "gdn_rmsnorm_act_f16",
+            "bf16" => "gdn_rmsnorm_act_bf16",
+            _ => return Err(format!("rmsnorm_act: 未知 dtype {dtype}")),
+        };
+        let num_groups = value_dim / group_size;
+        let blocks = (rows * num_groups).max(1) as u32;
+        self.launch(
+            stream,
+            name,
+            (blocks, 1, 1),
+            (256, 1, 1),
+            &[
+                x as u64,
+                z as u64,
+                gamma as u64,
+                bias as u64,
+                out as u64,
+                rows as u64,
+                value_dim as u64,
+                group_size as u64,
+                eps.to_bits() as u64,
+                per_group_weights as u64,
+                has_bias as u64,
+                act as u64,
+            ],
+        )
+    }
+
+    /// causal_conv1d prefill(变长,kernel=4 收窄):因果卷积 + silu 可选,
+    /// conv_state [batch, d_conv, 3] 恒F32 就地更新为各序列末 3 个输入;
+    /// cu_seqlens [batch+1] u32 前缀和。x/out [total_tokens, d_conv]。
+    /// MTP 快照(state_snapshots)未搬——T3 接线时按需求补。
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d_fwd_k4(
+        &mut self,
+        stream: &CudaStream,
+        dtype: &'static str,
+        x: *const u8,
+        weight: *const u8,
+        bias: *const u8, // 可空
+        conv_state: *mut f32,
+        out: *mut u8,
+        cu_seqlens: *const u32,
+        batch: i32,
+        d_conv: i32,
+        silu: bool,
+    ) -> Result<(), String> {
+        let name: &'static str = match dtype {
+            "f32" => "gdn_conv1d_fwd_k4_f32",
+            "f16" => "gdn_conv1d_fwd_k4_f16",
+            "bf16" => "gdn_conv1d_fwd_k4_bf16",
+            _ => return Err(format!("conv1d_fwd_k4: 未知 dtype {dtype}")),
+        };
+        let grid_y = (d_conv as u32).div_ceil(256).max(1);
+        self.launch(
+            stream,
+            name,
+            (batch.max(1) as u32, grid_y, 1),
+            (256, 1, 1),
+            &[
+                x as u64,
+                weight as u64,
+                bias as u64,
+                conv_state as u64,
+                out as u64,
+                cu_seqlens as u64,
+                batch as u64,
+                d_conv as u64,
+                silu as u64,
+            ],
+        )
+    }
+
+    /// causal_conv1d decode 单步(kernel=4 收窄):slot 寻址滑窗更新。
+    /// conv_state [max_batch, d_conv, 3] 恒F32;slots [batch] i64(<0 跳过);
+    /// x/out [batch, d_conv]。total = batch*d_conv。
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d_update_slots_k4(
+        &mut self,
+        stream: &CudaStream,
+        dtype: &'static str,
+        x: *const u8,
+        weight: *const u8,
+        bias: *const u8, // 可空
+        conv_state: *mut f32,
+        slots: *const i64,
+        out: *mut u8,
+        batch: i32,
+        d_conv: i32,
+        silu: bool,
+    ) -> Result<(), String> {
+        let name: &'static str = match dtype {
+            "f32" => "gdn_conv1d_upd_k4_f32",
+            "f16" => "gdn_conv1d_upd_k4_f16",
+            "bf16" => "gdn_conv1d_upd_k4_bf16",
+            _ => return Err(format!("conv1d_update_slots_k4: 未知 dtype {dtype}")),
+        };
+        let total = batch * d_conv;
+        let blocks = (total as u32).div_ceil(256).max(1);
+        self.launch(
+            stream,
+            name,
+            (blocks, 1, 1),
+            (256, 1, 1),
+            &[
+                x as u64,
+                weight as u64,
+                bias as u64,
+                conv_state as u64,
+                slots as u64,
+                out as u64,
+                total as u64,
+                d_conv as u64,
+                silu as u64,
+            ],
+        )
+    }
+
+    /// gated_delta_rule prefill 递推(fallback 变体,任意 k_dim ≤ 256)。
+    /// g 为**实空间 decay(已 exp)**;beta in (0,1)。
+    /// q/k [BH,S,K],v/out [BH,S,V],state [BH,K,V] 恒F32 in/out。
+    /// 档位 BV=64;smem = (2k+2)×4B。tiled/varlen 未搬(见汇报)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn delta_recurrence_fallback(
+        &mut self,
+        stream: &CudaStream,
+        dtype: &'static str,
+        q: *const u8,
+        k: *const u8,
+        v: *const u8,
+        g: *const f32,
+        beta: *const f32,
+        state: *mut f32,
+        out: *mut f32,
+        bh: i32,
+        seq_len: i32,
+        k_dim: i32,
+        v_dim: i32,
+    ) -> Result<(), String> {
+        if k_dim > 256 {
+            return Err(format!("delta_recurrence_fallback: k_dim={k_dim} > 256"));
+        }
+        let name: &'static str = match dtype {
+            "f32" => "gdn_delta_rec_fb_f32",
+            "f16" => "gdn_delta_rec_fb_f16",
+            "bf16" => "gdn_delta_rec_fb_bf16",
+            _ => return Err(format!("delta_recurrence_fallback: 未知 dtype {dtype}")),
+        };
+        let grid_x = (v_dim as u32).div_ceil(64).max(1);
+        let smem = ((2 * k_dim + 2) * 4) as u32;
+        self.launch_smem(
+            stream,
+            name,
+            (grid_x, bh.max(1) as u32, 1),
+            (64, 1, 1),
+            smem,
+            &[
+                q as u64,
+                k as u64,
+                v as u64,
+                g as u64,
+                beta as u64,
+                state as u64,
+                out as u64,
+                seq_len as u64,
+                k_dim as u64,
+                v_dim as u64,
+            ],
+        )
+    }
+
+    /// gated_delta_rule decode 单步(slot 寻址,GQA 映射)。k_dim ≤ 128(BK=128)。
+    /// g 为 **log 空间(核内 exp)**;q 核内乘 q_scale。
+    /// q/k [B,num_k_heads,K],v/out [B,num_v_heads,V],
+    /// state [max_batch,num_v_heads,K,V] 恒F32 in/out,slots [batch] i64(<0 跳过)。
+    /// 档位 BV=64;smem = (2×128+2)×4B = 1032B。
+    #[allow(clippy::too_many_arguments)]
+    pub fn delta_decode_slots_gqa(
+        &mut self,
+        stream: &CudaStream,
+        dtype: &'static str,
+        q: *const u8,
+        k: *const u8,
+        v: *const u8,
+        g: *const f32,
+        beta: *const f32,
+        state: *mut f32,
+        slots: *const i64,
+        out: *mut u8,
+        batch: i32,
+        num_v_heads: i32,
+        num_k_heads: i32,
+        k_dim: i32,
+        v_dim: i32,
+        q_scale: f32,
+    ) -> Result<(), String> {
+        if k_dim > 128 {
+            return Err(format!("delta_decode_slots_gqa: k_dim={k_dim} > 128"));
+        }
+        let name: &'static str = match dtype {
+            "f32" => "gdn_delta_dec_gqa_f32",
+            "f16" => "gdn_delta_dec_gqa_f16",
+            "bf16" => "gdn_delta_dec_gqa_bf16",
+            _ => return Err(format!("delta_decode_slots_gqa: 未知 dtype {dtype}")),
+        };
+        let grid_x = (v_dim as u32).div_ceil(64).max(1);
+        let grid_y = (batch * num_v_heads).max(1) as u32;
+        self.launch_smem(
+            stream,
+            name,
+            (grid_x, grid_y, 1),
+            (64, 1, 1),
+            (2 * 128 + 2) * 4,
+            &[
+                q as u64,
+                k as u64,
+                v as u64,
+                g as u64,
+                beta as u64,
+                state as u64,
+                slots as u64,
+                out as u64,
+                batch as u64,
+                num_v_heads as u64,
+                num_k_heads as u64,
+                k_dim as u64,
+                v_dim as u64,
+                q_scale.to_bits() as u64,
+            ],
+        )
     }
 }
 
@@ -318,8 +564,8 @@ mod tests {
     }
 
     /// gated rmsnorm + silu/sigmoid(z) mul 对拍(含 per-group 权重 + bias)
+    /// 语义 = deltanet 调用点:gamma/bias [group_size] 组内共享,恒 f32
     #[test]
-    #[ignore = "K3 第二刀: rmsnorm_act 参数语义对齐 deltanet 调用点后启用"]
     fn rmsnorm_act_f32_host_parity() {
         let (dev, mut k, pool) = setup();
         let rows = 2usize;
@@ -339,8 +585,8 @@ mod tests {
             let d_b = htod(&dev, &pool, bias.clone());
             let x_p = owl_iface::DevBuf::device_ptr(&d_x) as *const u8;
             let z_p = owl_iface::DevBuf::device_ptr(&d_z) as *const u8;
-            let g_p = owl_iface::DevBuf::device_ptr(&d_g) as *const u8;
-            let bias_p = owl_iface::DevBuf::device_ptr(&d_b) as *const u8;
+            let g_p = owl_iface::DevBuf::device_ptr(&d_g) as *const f32;
+            let bias_p = owl_iface::DevBuf::device_ptr(&d_b) as *const f32;
             let out_p = owl_iface::DevBuf::device_ptr(&out_buf) as *mut u8;
             let stream = dev.stream();
             k.rmsnorm_act(
@@ -385,6 +631,289 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// causal_conv1d prefill 对拍(k=4,变长,bias+silu,末态写回)
+    #[test]
+    fn conv1d_fwd_k4_f32_host_parity() {
+        let (dev, mut k, pool) = setup();
+        let lens = [3usize, 1usize];
+        let batch = lens.len();
+        let total: usize = lens.iter().sum();
+        let d_conv = 6usize;
+        let mut cu = vec![0u32];
+        for l in lens {
+            cu.push(cu.last().unwrap() + l as u32);
+        }
+        let x: Vec<f32> = (0..total * d_conv).map(|i| ((i % 19) as f32 - 9.0) * 0.25).collect();
+        let weight: Vec<f32> = (0..d_conv * 4).map(|i| ((i % 11) as f32 - 5.0) * 0.2).collect();
+        let bias: Vec<f32> = (0..d_conv).map(|i| 0.03 * i as f32).collect();
+        let state0: Vec<f32> = (0..batch * d_conv * 3).map(|i| ((i % 7) as f32 - 3.0) * 0.5).collect();
+
+        let d_x = htod(&dev, &pool, x.clone());
+        let d_w = htod(&dev, &pool, weight.clone());
+        let d_b = htod(&dev, &pool, bias.clone());
+        let d_cu = htod(&dev, &pool, cu.clone());
+        let d_state = htod(&dev, &pool, state0.clone());
+        let out_buf = htod(&dev, &pool, vec![0f32; total * d_conv]);
+        let x_p = owl_iface::DevBuf::device_ptr(&d_x) as *const u8;
+        let w_p = owl_iface::DevBuf::device_ptr(&d_w) as *const u8;
+        let b_p = owl_iface::DevBuf::device_ptr(&d_b) as *const u8;
+        let cu_p = owl_iface::DevBuf::device_ptr(&d_cu) as *const u32;
+        let st_p = owl_iface::DevBuf::device_ptr(&d_state) as *mut f32;
+        let out_p = owl_iface::DevBuf::device_ptr(&out_buf) as *mut u8;
+
+        k.conv1d_fwd_k4(dev.stream(), "f32", x_p, w_p, b_p, st_p, out_p, cu_p,
+                        batch as i32, d_conv as i32, true)
+            .unwrap();
+        dev.ctx().synchronize().unwrap();
+
+        let got = dtoh_f32(&dev, out_p as *const f32, total * d_conv);
+        let got_state = dtoh_f32(&dev, st_p, batch * d_conv * 3);
+        let silu = |v: f32| v / (1.0 + (-v).exp());
+        let mut want_state = state0.clone();
+        for b in 0..batch {
+            let (s, e) = (cu[b] as usize, cu[b + 1] as usize);
+            for ch in 0..d_conv {
+                let mut hist: Vec<f32> =
+                    state0[(b * d_conv + ch) * 3..(b * d_conv + ch) * 3 + 3].to_vec();
+                for t in s..e {
+                    let x_t = x[t * d_conv + ch];
+                    let mut sum = x_t * weight[ch * 4 + 3];
+                    for j in 0..3 {
+                        sum += hist[j] * weight[ch * 4 + j];
+                    }
+                    sum += bias[ch];
+                    let want = silu(sum);
+                    let go = got[t * d_conv + ch];
+                    assert!((go - want).abs() < 1e-4,
+                        "b={b} t={t} ch={ch} got={go} want={want}");
+                    hist = vec![hist[1], hist[2], x_t];
+                }
+                let off = (b * d_conv + ch) * 3;
+                want_state[off..off + 3].copy_from_slice(&hist);
+            }
+        }
+        for (i, (g, w)) in got_state.iter().zip(&want_state).enumerate() {
+            assert!((g - w).abs() < 1e-6, "state[{i}] got={g} want={w}");
+        }
+    }
+
+    /// causal_conv1d decode 单步对拍(k=4,slot 寻址,含 slot<0 跳过)
+    #[test]
+    fn conv1d_update_slots_k4_f32_host_parity() {
+        let (dev, mut k, pool) = setup();
+        let batch = 3usize;
+        let max_batch = 5usize;
+        let d_conv = 4usize;
+        let slots: Vec<i64> = vec![2, -1, 0]; // slot 3 闲置,slot -1 跳过
+        let x: Vec<f32> = (0..batch * d_conv).map(|i| ((i % 13) as f32 - 6.0) * 0.4).collect();
+        let weight: Vec<f32> = (0..d_conv * 4).map(|i| ((i % 9) as f32 - 4.0) * 0.3).collect();
+        let state0: Vec<f32> = (0..max_batch * d_conv * 3).map(|i| ((i % 17) as f32 - 8.0) * 0.3).collect();
+
+        let d_x = htod(&dev, &pool, x.clone());
+        let d_w = htod(&dev, &pool, weight.clone());
+        let d_cu_slots = htod(&dev, &pool, slots.clone());
+        let d_state = htod(&dev, &pool, state0.clone());
+        let out_buf = htod(&dev, &pool, vec![0f32; batch * d_conv]);
+        let x_p = owl_iface::DevBuf::device_ptr(&d_x) as *const u8;
+        let w_p = owl_iface::DevBuf::device_ptr(&d_w) as *const u8;
+        let sl_p = owl_iface::DevBuf::device_ptr(&d_cu_slots) as *const i64;
+        let st_p = owl_iface::DevBuf::device_ptr(&d_state) as *mut f32;
+        let out_p = owl_iface::DevBuf::device_ptr(&out_buf) as *mut u8;
+
+        k.conv1d_update_slots_k4(dev.stream(), "f32", x_p, w_p, std::ptr::null(), st_p,
+                                 sl_p, out_p, batch as i32, d_conv as i32, true)
+            .unwrap();
+        dev.ctx().synchronize().unwrap();
+
+        let got = dtoh_f32(&dev, out_p as *const f32, batch * d_conv);
+        let got_state = dtoh_f32(&dev, st_p, max_batch * d_conv * 3);
+        let silu = |v: f32| v / (1.0 + (-v).exp());
+        let mut want_state = state0.clone();
+        for b in 0..batch {
+            let slot = slots[b];
+            if slot < 0 {
+                continue;
+            }
+            for ch in 0..d_conv {
+                let off = ((slot as usize) * d_conv + ch) * 3;
+                let hist: Vec<f32> = state0[off..off + 3].to_vec();
+                let x_t = x[b * d_conv + ch];
+                let mut sum = x_t * weight[ch * 4 + 3];
+                for j in 0..3 {
+                    sum += hist[j] * weight[ch * 4 + j];
+                }
+                sum = silu(sum);
+                let go = got[b * d_conv + ch];
+                assert!((go - sum).abs() < 1e-4, "b={b} ch={ch} got={go} want={sum}");
+                want_state[off..off + 3].copy_from_slice(&[hist[1], hist[2], x_t]);
+            }
+        }
+        for (i, (g, w)) in got_state.iter().zip(&want_state).enumerate() {
+            assert!((g - w).abs() < 1e-6, "state[{i}] got={g} want={w}");
+        }
+    }
+
+    /// gated_delta_rule prefill 递推对拍(fallback,g 实空间 decay)
+    #[test]
+    fn delta_recurrence_fallback_f32_host_parity() {
+        let (dev, mut k, pool) = setup();
+        let bh = 2usize;
+        let seq = 3usize;
+        let k_dim = 4usize; // < 128,验证非 0.8B 档也能走 fallback
+        let v_dim = 8usize;
+        let q: Vec<f32> = (0..bh * seq * k_dim).map(|i| ((i % 5) as f32 - 2.0) * 0.3).collect();
+        let kv: Vec<f32> = (0..bh * seq * k_dim).map(|i| ((i % 7) as f32 - 3.0) * 0.2).collect();
+        let v: Vec<f32> = (0..bh * seq * v_dim).map(|i| ((i % 11) as f32 - 5.0) * 0.25).collect();
+        let g: Vec<f32> = (0..bh * seq).map(|i| 0.9 + 0.01 * (i % 3) as f32).collect(); // 实空间 decay
+        let beta: Vec<f32> = (0..bh * seq).map(|i| 0.5 + 0.1 * (i % 2) as f32).collect();
+        let state0: Vec<f32> = (0..bh * k_dim * v_dim).map(|i| ((i % 23) as f32 - 11.0) * 0.1).collect();
+
+        let d_q = htod(&dev, &pool, q.clone());
+        let d_k = htod(&dev, &pool, kv.clone());
+        let d_v = htod(&dev, &pool, v.clone());
+        let d_g = htod(&dev, &pool, g.clone());
+        let d_beta = htod(&dev, &pool, beta.clone());
+        let d_state = htod(&dev, &pool, state0.clone());
+        let out_buf = htod(&dev, &pool, vec![0f32; bh * seq * v_dim]);
+        let q_p = owl_iface::DevBuf::device_ptr(&d_q) as *const u8;
+        let k_p = owl_iface::DevBuf::device_ptr(&d_k) as *const u8;
+        let v_p = owl_iface::DevBuf::device_ptr(&d_v) as *const u8;
+        let g_p = owl_iface::DevBuf::device_ptr(&d_g) as *const f32;
+        let beta_p = owl_iface::DevBuf::device_ptr(&d_beta) as *const f32;
+        let st_p = owl_iface::DevBuf::device_ptr(&d_state) as *mut f32;
+        let out_p = owl_iface::DevBuf::device_ptr(&out_buf) as *mut f32;
+
+        k.delta_recurrence_fallback(dev.stream(), "f32", q_p, k_p, v_p, g_p, beta_p,
+                                    st_p, out_p, bh as i32, seq as i32,
+                                    k_dim as i32, v_dim as i32)
+            .unwrap();
+        dev.ctx().synchronize().unwrap();
+
+        let got = dtoh_f32(&dev, out_p, bh * seq * v_dim);
+        let got_state = dtoh_f32(&dev, st_p, bh * k_dim * v_dim);
+        let mut want_state = state0.clone();
+        for h in 0..bh {
+            // host 参考:fallback 公式直译
+            let mut s = vec![0f32; k_dim * v_dim];
+            s.copy_from_slice(&state0[h * k_dim * v_dim..(h + 1) * k_dim * v_dim]);
+            for t in 0..seq {
+                for j in 0..k_dim {
+                    let decay = g[h * seq + t];
+                    for vi in 0..v_dim {
+                        s[j * v_dim + vi] *= decay;
+                    }
+                }
+                for vi in 0..v_dim {
+                    let mut kv_mem = 0.0f32;
+                    for j in 0..k_dim {
+                        kv_mem += s[j * v_dim + vi] * kv[h * seq * k_dim + t * k_dim + j];
+                    }
+                    let delta =
+                        (v[h * seq * v_dim + t * v_dim + vi] - kv_mem) * beta[h * seq + t];
+                    for j in 0..k_dim {
+                        s[j * v_dim + vi] +=
+                            kv[h * seq * k_dim + t * k_dim + j] * delta;
+                    }
+                }
+                for vi in 0..v_dim {
+                    let mut y = 0.0f32;
+                    for j in 0..k_dim {
+                        y += s[j * v_dim + vi] * q[h * seq * k_dim + t * k_dim + j];
+                    }
+                    let go = got[h * seq * v_dim + t * v_dim + vi];
+                    assert!((go - y).abs() < 1e-4,
+                        "h={h} t={t} vi={vi} got={go} want={y}");
+                }
+            }
+            want_state[h * k_dim * v_dim..(h + 1) * k_dim * v_dim].copy_from_slice(&s);
+        }
+        for (i, (a, b)) in got_state.iter().zip(&want_state).enumerate() {
+            assert!((a - b).abs() < 1e-5, "state[{i}] got={a} want={b}");
+        }
+    }
+
+    /// gated_delta_rule decode 对拍(slot GQA,g log 空间,q_scale)
+    #[test]
+    fn delta_decode_slots_gqa_f32_host_parity() {
+        let (dev, mut k, pool) = setup();
+        let batch = 2usize;
+        let nv = 4usize;
+        let nk = 2usize; // kv_group = 2,验证 GQA 头映射
+        let k_dim = 8usize; // < 128,BK=128 档内 j<k_dim 守护
+        let v_dim = 8usize;
+        let slots: Vec<i64> = vec![1, 0];
+        let max_batch = 3usize;
+        let q: Vec<f32> = (0..batch * nk * k_dim).map(|i| ((i % 7) as f32 - 3.0) * 0.2).collect();
+        let kv: Vec<f32> = (0..batch * nk * k_dim).map(|i| ((i % 5) as f32 - 2.0) * 0.3).collect();
+        let v: Vec<f32> = (0..batch * nv * v_dim).map(|i| ((i % 13) as f32 - 6.0) * 0.15).collect();
+        let g: Vec<f32> = (0..batch * nv).map(|i| -0.02 * (i % 4) as f32).collect(); // log 空间
+        let beta: Vec<f32> = (0..batch * nv).map(|i| 0.6 + 0.05 * (i % 3) as f32).collect();
+        let state0: Vec<f32> =
+            (0..max_batch * nv * k_dim * v_dim).map(|i| ((i % 19) as f32 - 9.0) * 0.2).collect();
+        let q_scale = 0.5f32;
+
+        let d_q = htod(&dev, &pool, q.clone());
+        let d_k = htod(&dev, &pool, kv.clone());
+        let d_v = htod(&dev, &pool, v.clone());
+        let d_g = htod(&dev, &pool, g.clone());
+        let d_beta = htod(&dev, &pool, beta.clone());
+        let d_state = htod(&dev, &pool, state0.clone());
+        let d_slots = htod(&dev, &pool, slots.clone());
+        let out_buf = htod(&dev, &pool, vec![0f32; batch * nv * v_dim]);
+        let q_p = owl_iface::DevBuf::device_ptr(&d_q) as *const u8;
+        let k_p = owl_iface::DevBuf::device_ptr(&d_k) as *const u8;
+        let v_p = owl_iface::DevBuf::device_ptr(&d_v) as *const u8;
+        let g_p = owl_iface::DevBuf::device_ptr(&d_g) as *const f32;
+        let beta_p = owl_iface::DevBuf::device_ptr(&d_beta) as *const f32;
+        let st_p = owl_iface::DevBuf::device_ptr(&d_state) as *mut f32;
+        let sl_p = owl_iface::DevBuf::device_ptr(&d_slots) as *const i64;
+        let out_p = owl_iface::DevBuf::device_ptr(&out_buf) as *mut u8;
+
+        k.delta_decode_slots_gqa(dev.stream(), "f32", q_p, k_p, v_p, g_p, beta_p,
+                                 st_p, sl_p, out_p, batch as i32, nv as i32,
+                                 nk as i32, k_dim as i32, v_dim as i32, q_scale)
+            .unwrap();
+        dev.ctx().synchronize().unwrap();
+
+        let got = dtoh_f32(&dev, out_p as *const f32, batch * nv * v_dim);
+        let got_state = dtoh_f32(&dev, st_p, max_batch * nv * k_dim * v_dim);
+        let mut want_state = state0.clone();
+        for b in 0..batch {
+            let slot = slots[b] as usize;
+            for vh in 0..nv {
+                let kh = vh / (nv / nk);
+                let decay = g[b * nv + vh].exp();
+                let beta_t = beta[b * nv + vh];
+                let mut s = vec![0f32; k_dim * v_dim];
+                let soff = (slot * nv + vh) * k_dim * v_dim;
+                s.copy_from_slice(&state0[soff..soff + k_dim * v_dim]);
+                for vi in 0..v_dim {
+                    let mut kv_mem = 0.0f32;
+                    for j in 0..k_dim {
+                        s[j * v_dim + vi] *= decay;
+                        kv_mem += s[j * v_dim + vi] * kv[(b * nk + kh) * k_dim + j];
+                    }
+                    let delta =
+                        (v[(b * nv + vh) * v_dim + vi] - kv_mem) * beta_t;
+                    let mut y = 0.0f32;
+                    for j in 0..k_dim {
+                        s[j * v_dim + vi] += kv[(b * nk + kh) * k_dim + j] * delta;
+                        y += s[j * v_dim + vi]
+                            * q[(b * nk + kh) * k_dim + j]
+                            * q_scale;
+                    }
+                    let go = got[(b * nv + vh) * v_dim + vi];
+                    assert!((go - y).abs() < 1e-4,
+                        "b={b} vh={vh} vi={vi} got={go} want={y}");
+                }
+                want_state[soff..soff + k_dim * v_dim].copy_from_slice(&s);
+            }
+        }
+        for (i, (a, b2)) in got_state.iter().zip(&want_state).enumerate() {
+            assert!((a - b2).abs() < 1e-5, "state[{i}] got={a} want={b2}");
         }
     }
 }
