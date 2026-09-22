@@ -31,14 +31,12 @@
 /// 后端 Arch 标识(与 kernels 的 arch 分发表共用一套词汇)
 pub use owl_kernels::Arch;
 
-/// 缓冲令牌:池缓冲出生时签发,(id, generation) 二元组。
+/// 缓冲令牌:(id, generation) 二元组。词汇权威在 owl-signal
+/// (`owl_signal::Token`,后端无关;rocnn 复用同一定义),
+/// 此处做类型别名保持 iface 词汇名稳定。
 /// 捕获期记录于 CaptureRecord(哨兵①),replay 前可校验存活
 /// (世代校验;死亡令牌 = 结构化报错而非 Xid 盲死)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct BufToken {
-    pub id: u64,
-    pub gen: u64,
-}
+pub type BufToken = owl_signal::Token;
 
 /// 厂商后端栈家族
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +75,8 @@ pub enum MemPhase {
     Idle,
     /// 捕获中
     Capturing,
+    /// 已实例化未定影(懒提交窗口;禁 replay,A1.2 定影协议)
+    Captured,
     /// 图存活
     Live,
 }

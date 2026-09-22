@@ -7,4 +7,5 @@ description = "Backend HAL: unified GPU backend contract (memory/phase/stats); u
 
 [dependencies]
 owl-kernels = { path = "../../kernels" }
+owl-signal = { path = "../../signal" }
 thiserror = { workspace = true }
