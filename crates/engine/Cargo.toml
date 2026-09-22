@@ -8,6 +8,7 @@ owl-iface = { path = "../backends/iface" }
 owl-cuda = { path = "../backends/cuda" }
 owl-signal = { path = "../signal" }
 owl-nn = { path = "../nn" }
+thiserror.workspace = true
 
 [features]
 default = []

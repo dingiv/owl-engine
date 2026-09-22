@@ -10,6 +10,8 @@
 //! `cargo build --workspace` 全绿为准,运行指标另立里程碑。
 
 pub mod config;
+pub mod dim;
+pub mod error;
 pub mod kvcache;
 pub mod models;
 pub mod runner;
@@ -17,3 +19,5 @@ pub mod sampler;
 pub mod scheduler;
 pub mod server;
 pub mod speculative;
+
+pub use error::{Error, Result};
