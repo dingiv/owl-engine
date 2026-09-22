@@ -19,7 +19,7 @@ use super::distributed::{
     shard, Comm, MergedParallelColumnLinear, TensorParallelColumnLinear, TensorParallelRowLinear,
 };
 use super::vendor;
-use super::{collect_key_map, DType, OwlTensor, Result, Shard, Tensor, VarBuilderX};
+use super::{collect_key_map, ctx_scope, erased, DType, OwlTensor, Result, Shard, Tensor, VarBuilderX};
 use crate::config::Config;
 use crate::hybrid::resolve_qwen3_hybrid_config;
 use std::rc::Rc;
@@ -27,7 +27,22 @@ use std::rc::Rc;
 // ---- vendor gdn kernel 垫片(attention-rs port,T3 回填) ----
 #[allow(dead_code)] // flashinfer 引入后接通(裁决 2026-09-22)
 mod gdn_shim {
-    use super::{Result, Tensor};
+    use super::{ctx_scope, Result, Tensor};
+    use owl_nn::kernels::gdn_kernels::GdnKernels;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    /// GDN 核族句柄(nvrtc 一次编译,进程级;rig 单卡语义)
+    fn kernels() -> Result<Arc<Mutex<GdnKernels>>> {
+        static K: OnceLock<Arc<Mutex<GdnKernels>>> = OnceLock::new();
+        if let Some(k) = K.get() {
+            return Ok(Arc::clone(k));
+        }
+        let dev = ctx_scope::with_device();
+        let k = GdnKernels::new(dev.ctx())
+            .map_err(|e| crate::Error::Msg(format!("gdn nvrtc: {e}")))?;
+        let _ = K.set(Arc::new(Mutex::new(k)));
+        Ok(Arc::clone(K.get().expect("gdn kernels 初始化")))
+    }
 
     /// 因果卷积 prefill(变长;conv_state 就地更新 + 可选快照)
     #[allow(clippy::too_many_arguments)]
@@ -40,35 +55,107 @@ mod gdn_shim {
         _cu_seqlens: &Tensor,
         _silu: bool,
     ) -> Result<Tensor> {
-        unimplemented!("T3: gdn::causal_conv1d_fwd(attention-rs kernel port)")
+        // TODO(B3.3-续): conv1d_fwd_k4 直通(与 update_slots 同构,差 cu_seqlens 入参)
+        unimplemented!("B3.3-续: causal_conv1d_fwd 接 gdn_conv1d_fwd_k4(方案已定,见交接档)")
     }
 
     /// 因果卷积 decode(按 slot 更新状态)
     #[allow(clippy::too_many_arguments)]
     pub fn causal_conv1d_update_slots(
-        _mixed_qkv: &Tensor,
-        _weight: &Tensor,
-        _bias: Option<&Tensor>,
-        _conv_state: &mut Tensor,
-        _seq_slots: &Tensor,
-        _silu: bool,
+        mixed_qkv: &Tensor,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        conv_state: &mut Tensor,
+        seq_slots: &Tensor,
+        silu: bool,
     ) -> Result<Tensor> {
-        unimplemented!("T3: gdn::causal_conv1d_update_slots(attention-rs kernel port)")
+        if mixed_qkv.dtype() != owl_nn::Dtype::F32 {
+            return Err(crate::Error::Msg(format!(
+                "gdn conv1d: 仅 F32(mamba_ssm_dtype=f32),得到 {:?}",
+                mixed_qkv.dtype()
+            )));
+        }
+        let shape = mixed_qkv.shape().to_vec();
+        let d = shape[1];
+        let batch = shape[0];
+        let k = kernels()?;
+        ctx_scope::with_dry(|ctx, _dry| {
+            let out = ctx.scratch_tensor::<f32>(&shape)?;
+            let mut kk = k.lock().map_err(|_| crate::Error::Msg("gdn kernels 中毒".into()))?;
+            kk.conv1d_update_slots_k4(
+                ctx.stream(),
+                "f32",
+                mixed_qkv.device_ptr(),
+                weight.device_ptr(),
+                bias.map(|b| b.device_ptr() as *const u8).unwrap_or(std::ptr::null()),
+                conv_state.device_ptr() as *mut f32,
+                seq_slots.device_ptr() as *const u32,
+                out.device_ptr() as *mut u8,
+                batch as i32,
+                d as i32,
+                silu,
+            )
+            .map_err(|e| crate::Error::Msg(format!("conv1d_upd: {e}")))?;
+            Ok(owl_nn::DynTensor::from_f32(&out))
+        })
     }
 
     /// 融合 GDN 门控(a_log/dt_bias → g, beta)
+    /// 融合 GDN 门控(a_log/dt_bias [H] F32;a/b [1,T,H])→ (g, beta) log 空间
     pub fn fused_gdn_gating(
-        _a_log: &Tensor,
-        _a: &Tensor,
-        _b: &Tensor,
-        _dt_bias: &Tensor,
+        a_log: &Tensor,
+        a: &Tensor,
+        b: &Tensor,
+        dt_bias: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
-        unimplemented!("T3: gdn::fused_gdn_gating(attention-rs kernel port)")
+        let shape = a.shape().to_vec();
+        let total: usize = shape.iter().product();
+        let heads = a_log.shape()[0];
+        let k = kernels()?;
+        ctx_scope::with_dry(|ctx, _dry| {
+            let g = ctx.scratch_tensor::<f32>(&[total])?;
+            let beta = ctx.scratch_tensor::<f32>(&[total])?;
+            let mut kk = k.lock().map_err(|_| crate::Error::Msg("gdn kernels 中毒".into()))?;
+            kk.fused_gating(
+                ctx.stream(),
+                "f32",
+                a_log.device_ptr() as *const f32,
+                a.device_ptr(),
+                b.device_ptr(),
+                dt_bias.device_ptr() as *const f32,
+                g.device_ptr() as *mut f32,
+                beta.device_ptr() as *mut f32,
+                total as i32,
+                heads as i32,
+            )
+            .map_err(|e| crate::Error::Msg(format!("gating: {e}")))?;
+            let g = owl_nn::DynTensor::from_f32(&g).reshape(&shape[..])?;
+            let beta = owl_nn::DynTensor::from_f32(&beta).reshape(&shape[..])?;
+            Ok((g, beta))
+        })
     }
 
     /// 末维 L2 归一
-    pub fn l2_norm_last_dim(_t: &Tensor, _eps: f64) -> Result<Tensor> {
-        unimplemented!("T3: gdn::l2_norm_last_dim(attention-rs kernel port)")
+    pub fn l2_norm_last_dim(t: &Tensor, eps: f64) -> Result<Tensor> {
+        let shape = t.shape().to_vec();
+        let last = *shape.last().expect("l2norm rank>=1");
+        let rows: usize = shape.iter().product::<usize>() / last;
+        let k = kernels()?;
+        ctx_scope::with_dry(|ctx, _dry| {
+            let out = ctx.scratch_tensor::<f32>(&shape)?;
+            let mut kk = k.lock().map_err(|_| crate::Error::Msg("gdn kernels 中毒".into()))?;
+            kk.l2_norm(
+                ctx.stream(),
+                "f32",
+                t.device_ptr(),
+                out.device_ptr() as *mut u8,
+                rows as i32,
+                last as i32,
+                eps as f32,
+            )
+            .map_err(|e| crate::Error::Msg(format!("l2norm: {e}")))?;
+            Ok(owl_nn::DynTensor::from_f32(&out))
+        })
     }
 
     /// prefill 变长 GQA 递推(flashinfer 路径;flashinfer 引入后接通)
@@ -123,42 +210,111 @@ mod gdn_shim {
     /// decode 按 slot GQA 递推
     #[allow(clippy::too_many_arguments)]
     pub fn gated_delta_rule_decode_slots_gqa(
-        _q: &Tensor,
-        _k: &Tensor,
-        _v: &Tensor,
-        _g: &Tensor,
-        _beta: &Tensor,
-        _state: &mut Tensor,
-        _seq_slots: &Tensor,
-        _scale: f32,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        g: &Tensor,
+        beta: &Tensor,
+        state: &mut Tensor,
+        seq_slots: &Tensor,
+        scale: f32,
     ) -> Result<Tensor> {
-        unimplemented!("T3: gdn::gated_delta_rule_decode_slots_gqa(attention-rs port)")
+        let bs = q.shape()[0];
+        let nk = q.shape()[1];
+        let kd = q.shape()[2];
+        let nv = v.shape()[1];
+        let vd = v.shape()[2];
+        let kn = kernels()?;
+        ctx_scope::with_dry(|ctx, _dry| {
+            let out = ctx.scratch_tensor::<f32>(&[bs, nv, vd])?;
+            let mut kk = kn.lock().map_err(|_| crate::Error::Msg("gdn kernels 中毒".into()))?;
+            kk.delta_decode_slots_gqa(
+                ctx.stream(),
+                "f32",
+                q.device_ptr(),
+                k.device_ptr(),
+                v.device_ptr(),
+                g.device_ptr() as *const f32,
+                beta.device_ptr() as *const f32,
+                state.device_ptr() as *mut f32,
+                seq_slots.device_ptr() as *const u32,
+                out.device_ptr() as *mut u8,
+                bs as i32,
+                nv as i32,
+                nk as i32,
+                kd as i32,
+                vd as i32,
+                scale,
+            )
+            .map_err(|e| crate::Error::Msg(format!("delta_dec_gqa: {e}")))?;
+            Ok(owl_nn::DynTensor::from_f32(&out))
+        })
+    }
+
+    /// 门控 RMSNorm × act(z)(act: 0=silu 1=sigmoid;weight [head_v_dim] F32 per-group)
+    #[allow(clippy::too_many_arguments)]
+    fn gated_rmsnorm_act(
+        output: &Tensor,
+        z: &Tensor,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        eps: f64,
+        head_v_dim: usize,
+        act: i32,
+    ) -> Result<Tensor> {
+        let shape = output.shape().to_vec();
+        let rows = shape[0];
+        let value_dim = shape[1];
+        let per_group = weight.shape()[0] == head_v_dim;
+        let kn = kernels()?;
+        ctx_scope::with_dry(|ctx, _dry| {
+            let out = ctx.scratch_tensor::<f32>(&shape)?;
+            let mut kk = kn.lock().map_err(|_| crate::Error::Msg("gdn kernels 中毒".into()))?;
+            kk.rmsnorm_act(
+                ctx.stream(),
+                "f32",
+                output.device_ptr(),
+                z.device_ptr(),
+                weight.device_ptr() as *const f32,
+                bias.map(|b| b.device_ptr() as *const f32).unwrap_or(std::ptr::null()),
+                out.device_ptr() as *mut u8,
+                rows as i32,
+                value_dim as i32,
+                head_v_dim as i32,
+                eps as f32,
+                per_group,
+                bias.is_some(),
+                act,
+            )
+            .map_err(|e| crate::Error::Msg(format!("rmsnorm_act: {e}")))?;
+            Ok(owl_nn::DynTensor::from_f32(&out))
+        })
     }
 
     /// 门控 RMSNorm × sigmoid(z)
     #[allow(clippy::too_many_arguments)]
     pub fn gated_rmsnorm_sigmoid_mul(
-        _output: &Tensor,
-        _z: &Tensor,
-        _weight: &Tensor,
-        _bias: Option<&Tensor>,
-        _eps: f64,
-        _head_v_dim: usize,
+        output: &Tensor,
+        z: &Tensor,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        eps: f64,
+        head_v_dim: usize,
     ) -> Result<Tensor> {
-        unimplemented!("T3: gdn::gated_rmsnorm_sigmoid_mul(attention-rs port)")
+        gated_rmsnorm_act(output, z, weight, bias, eps, head_v_dim, 1)
     }
 
     /// 门控 RMSNorm × silu(z)
     #[allow(clippy::too_many_arguments)]
     pub fn gated_rmsnorm_silu_mul(
-        _output: &Tensor,
-        _z: &Tensor,
-        _weight: &Tensor,
-        _bias: Option<&Tensor>,
-        _eps: f64,
-        _head_v_dim: usize,
+        output: &Tensor,
+        z: &Tensor,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        eps: f64,
+        head_v_dim: usize,
     ) -> Result<Tensor> {
-        unimplemented!("T3: gdn::gated_rmsnorm_silu_mul(attention-rs port)")
+        gated_rmsnorm_act(output, z, weight, bias, eps, head_v_dim, 0)
     }
 }
 
@@ -172,23 +328,23 @@ impl<'a> MambaCacheHandle<'a> {
     pub fn new(cache: &'a mut vendor::MambaCache) -> Self {
         Self { cache }
     }
-    pub fn get_batch_conv_state(&mut self, _layer: usize, _slots: &Tensor) -> Result<Tensor> {
-        unimplemented!("T3: MambaCache::get_batch_conv_state")
+    pub fn get_batch_conv_state(&mut self, layer: usize, slots: &Tensor) -> Result<Tensor> {
+        self.cache.gather_conv_rows(layer, slots)
     }
-    pub fn set_batch_conv_state(&mut self, _layer: usize, _slots: &Tensor, _s: &Tensor) -> Result<()> {
-        unimplemented!("T3: MambaCache::set_batch_conv_state")
+    pub fn set_batch_conv_state(&mut self, layer: usize, slots: &Tensor, s: &Tensor) -> Result<()> {
+        self.cache.scatter_conv_rows(layer, slots, s)
     }
-    pub fn conv_state_mut(&mut self, _layer: usize) -> &mut Tensor {
-        unimplemented!("T3: MambaCache::conv_state_mut")
+    pub fn conv_state_mut(&mut self, layer: usize) -> &mut Tensor {
+        self.cache.conv_state_mut(layer)
     }
-    pub fn conv_state(&self, _layer: usize) -> &Tensor {
-        unimplemented!("T3: MambaCache::conv_state")
+    pub fn conv_state(&self, layer: usize) -> &Tensor {
+        self.cache.conv_state(layer)
     }
-    pub fn recurrent_state_mut(&mut self, _layer: usize) -> &mut Tensor {
-        unimplemented!("T3: MambaCache::recurrent_state_mut")
+    pub fn recurrent_state_mut(&mut self, layer: usize) -> &mut Tensor {
+        self.cache.recurrent_state_mut(layer)
     }
-    pub fn set_batch_recurrent_state(&mut self, _layer: usize, _slots: &Tensor, _s: &Tensor) -> Result<()> {
-        unimplemented!("T3: MambaCache::set_batch_recurrent_state")
+    pub fn set_batch_recurrent_state(&mut self, layer: usize, slots: &Tensor, s: &Tensor) -> Result<()> {
+        self.cache.scatter_rec_rows(layer, slots, s)
     }
 }
 
@@ -1129,21 +1285,25 @@ impl GatedDeltaNet {
 
 /// cat(missing trait 面;attention.rs missing_shims 同源需求)
 fn cat_local(ts: &[Tensor], dim: usize) -> Result<Tensor> {
-    unimplemented!("T3: Tensor::cat(需求清单 #1)")
+    ctx_scope::with(|_ops, ctx| Ok(erased::cat(ctx, ts, dim)?))
 }
 
-/// zeros 构造(池直连工厂接入前的垫片;池上下文经 T3 loader 通道传入)
+/// zeros 构造(P 阶段 ctor 工厂;设备 = rig 单卡)
 fn ctor_zeros(_shape: &[usize], _dtype: DType) -> Result<Tensor> {
-    unimplemented!("T3: ctor_zeros(Pool 工厂接入)")
+    super::ctor::zeros(_shape, _dtype, &ctx_scope::with_device())
 }
 
-/// TP 切分(= xinfer tensor_parallel_chunk;体走 OwlTensor::narrow 回填)
+/// TP 切分(= xinfer tensor_parallel_chunk;world_size=1 直通,TP>1 = T3 后续)
 pub(crate) fn tensor_parallel_chunk(
-    _t: &Tensor,
+    t: &Tensor,
     _dim: usize,
     _rank: usize,
-    _world_size: usize,
-    _name: &str,
+    world_size: usize,
+    name: &str,
 ) -> Result<Tensor> {
-    unimplemented!("T3: tensor_parallel_chunk(narrow 通道回填)")
+    if world_size <= 1 {
+        return Ok(t.clone());
+    }
+    let _ = name;
+    unimplemented!("TP>1 分片装载(单卡面已回退;TP = A2.6 另案)")
 }

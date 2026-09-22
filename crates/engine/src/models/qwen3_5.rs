@@ -493,7 +493,7 @@ impl Qwen3_5ForCausalLM {
             layers,
             norm,
             lm_head,
-            mamba_cache: RwLock::new(vendor::MambaCache),
+            mamba_cache: RwLock::new(vendor::MambaCache::empty()),
             device: device.clone(),
             config: config.clone(),
             dtype,
@@ -889,32 +889,66 @@ impl Qwen3_5ForCausalLM {
     // ---- mamba slot 状态面(适配台账 A9:vendor::MambaCache 方法通道
     //      为 T3 回填;本组全部为类型面 stub,签名与 xinfer 同形)----
 
-    pub fn release_sequence_state(&self, _sequence_id: usize) {
-        unimplemented!("T3: MambaCache::free_slot 通道回填")
+    pub fn release_sequence_state(&self, sequence_id: usize) {
+        self.mamba_cache.write().free_slot(sequence_id);
     }
 
     pub fn ensure_mamba_slots_for_sequences(
         &self,
-        _sequence_ids: &[usize],
+        sequence_ids: &[usize],
     ) -> Result<Vec<usize>> {
-        unimplemented!("T3: MambaCache::ensure_slots_for_sequences 通道回填")
+        let mut cache = self.mamba_cache.write();
+        sequence_ids.iter().map(|&id| cache.ensure_slot(id)).collect()
     }
 
     pub fn get_mamba_slots_for_sequences(
         &self,
         sequence_ids: &[usize],
     ) -> Result<Vec<usize>> {
-        // dry-run/full-attention 配置:无 GDN 层时 mamba 槽仅为形式参数,
-        // 返回确定性 identity 槽(真 GDN 语义 = vendor::MambaCache,T3 回填)
-        Ok((0..sequence_ids.len()).collect())
+        let cache = self.mamba_cache.read();
+        sequence_ids
+            .iter()
+            .map(|&id| {
+                cache.slot_of(id).ok_or_else(|| {
+                    crate::Error::Schedule(format!("mamba slot 未分配: seq {id}"))
+                })
+            })
+            .collect()
     }
 
     pub fn lock_mamba_cache_for_graph(&self) -> RwLockWriteGuard<'_, vendor::MambaCache> {
         self.mamba_cache.write()
     }
 
-    pub fn preallocate_mamba_cache(&self, _max_num_seqs: usize) -> Result<()> {
-        unimplemented!("T3: MambaCache::reserve_capacity 通道回填")
+    pub fn preallocate_mamba_cache(&self, max_num_seqs: usize) -> Result<()> {
+        use crate::hybrid::resolve_qwen3_hybrid_config;
+        let hybrid = resolve_qwen3_hybrid_config(&self.config);
+        let num_gdn_layers = hybrid
+            .layer_types
+            .iter()
+            .filter(|t| t.as_str() == "linear_attention")
+            .count();
+        if num_gdn_layers == 0 {
+            return Ok(()); // 纯注意力模型:无状态表
+        }
+        // per-rank conv 通道宽:nk*K*2(q|k) + nv*V;world>1 时 hybrid 头数已含 TP 校验
+        let world = 1usize; // 单卡面(A2.6 多实例另案;构造期已拦截不可整除)
+        let nk = hybrid.num_k_heads / world;
+        let nv = hybrid.num_v_heads / world;
+        let kd = hybrid.key_head_dim;
+        let vd = hybrid.value_head_dim;
+        let d_conv = nk * kd * 2 + nv * vd;
+        let conv_len = hybrid.conv_kernel_size - 1;
+        self.mamba_cache.write().preallocate(
+            num_gdn_layers,
+            max_num_seqs,
+            d_conv,
+            conv_len,
+            nv,
+            kd,
+            vd,
+            &self.device,
+        )
     }
 
     /// MTP hidden 缓冲预分配(warmup_capture 之前调用:缓冲须在常规显存,

@@ -1460,6 +1460,8 @@ impl RmsNorm {
 /// vendor kernel/缓存面占位。design:三选一(自研 kernel 进 owl-kernels /
 /// 保留 vendor 依赖 / 换 flashinfer)在 T3 运行里程碑前裁决。
 pub mod vendor {
+    use super::{ctx_scope, erased, DType, Device, Error, OwlTensor, Result, Tensor};
+
     // fused rope(= attention_rs::fused_rope::FusedRope)
     pub mod fused_rope {
         use crate::Result;
@@ -1518,8 +1520,211 @@ pub mod vendor {
     }
     /// 分页注意力句柄(= attention_rs::PagedAttention)
     pub struct PagedAttention;
-    /// Mamba/GDN 状态缓存(= attention_rs::mamba_cache::MambaCache)
-    pub struct MambaCache;
+    /// Mamba/GDN 状态缓存(B3.2 真实现;= attention_rs::mamba_cache::MambaCache 收敛面)。
+    /// 每层两张 F32 常驻表:conv [max_batch, d_conv, k-1]、recurrent [max_batch, nv, K, V]。
+    /// P 阶段一次分配(preallocate → ctor::zeros,裁决 5);slot → 行寻址;
+    /// prefill 行收集/回写 = D2D(erased::copy_d2d_to_raw);decode 直改全表(核内 slot 寻址)。
+    pub struct MambaCache {
+        conv_states: Vec<Tensor>,
+        recurrent_states: Vec<Tensor>,
+        max_batch: usize,
+        /// 空闲 slot 栈(A9 槽分配;0 = 有效行,0xFFFFFFFF 无效哨兵与 GDN 核一致)
+        free_slots: Vec<usize>,
+        /// seq_id → slot
+        owner_of: std::collections::HashMap<usize, usize>,
+    }
+
+    impl MambaCache {
+        /// 空壳(runner 在 warmup 前 preallocate;容量参数在模型构造面才有)
+        pub fn empty() -> Self {
+            Self {
+                conv_states: Vec::new(),
+                recurrent_states: Vec::new(),
+                max_batch: 0,
+                free_slots: Vec::new(),
+                owner_of: std::collections::HashMap::new(),
+            }
+        }
+
+        /// P 阶段分配全层状态表(裁决 5:分配入口 ctor::zeros → 权重池)
+        #[allow(clippy::too_many_arguments)]
+        pub fn preallocate(
+            &mut self,
+            num_layers: usize,
+            max_batch: usize,
+            d_conv: usize,
+            conv_len: usize,
+            num_v_heads: usize,
+            k_dim: usize,
+            v_dim: usize,
+            device: &Device,
+        ) -> Result<()> {
+            if !self.conv_states.is_empty() {
+                return Ok(()); // 幂等
+            }
+            self.conv_states = (0..num_layers)
+                .map(|_| super::ctor::zeros((max_batch, d_conv, conv_len), DType::F32, device))
+                .collect::<Result<Vec<_>>>()?;
+            self.recurrent_states = (0..num_layers)
+                .map(|_| {
+                    super::ctor::zeros(
+                        (max_batch, num_v_heads, k_dim, v_dim),
+                        DType::F32,
+                        device,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            self.max_batch = max_batch;
+            self.free_slots = (0..max_batch).rev().collect();
+            Ok(())
+        }
+
+        pub fn is_allocated(&self) -> bool {
+            !self.conv_states.is_empty()
+        }
+        pub fn max_batch(&self) -> usize {
+            self.max_batch
+        }
+        pub fn conv_state(&self, layer: usize) -> &Tensor {
+            &self.conv_states[layer]
+        }
+        pub fn conv_state_mut(&mut self, layer: usize) -> &mut Tensor {
+            &mut self.conv_states[layer]
+        }
+        pub fn recurrent_state(&self, layer: usize) -> &Tensor {
+            &self.recurrent_states[layer]
+        }
+        pub fn recurrent_state_mut(&mut self, layer: usize) -> &mut Tensor {
+            &mut self.recurrent_states[layer]
+        }
+
+        /// A9:分配(或查既有)槽位
+        pub fn ensure_slot(&mut self, seq_id: usize) -> Result<usize> {
+            if let Some(&s) = self.owner_of.get(&seq_id) {
+                return Ok(s);
+            }
+            let slot = self
+                .free_slots
+                .pop()
+                .ok_or_else(|| Error::Msg(format!("MambaCache: 槽位耗尽(max_batch={})", self.max_batch)))?;
+            self.owner_of.insert(seq_id, slot);
+            Ok(slot)
+        }
+        /// A9:释放(seq 结束)
+        pub fn free_slot(&mut self, seq_id: usize) {
+            if let Some(slot) = self.owner_of.remove(&seq_id) {
+                self.free_slots.push(slot);
+            }
+        }
+        pub fn slot_of(&self, seq_id: usize) -> Option<usize> {
+            self.owner_of.get(&seq_id).copied()
+        }
+
+        /// prefill 行收集:slots U32 设备张量 → D2H(急切路径合法)→ 逐行 D2D → [n, d, k-1]
+        pub fn gather_conv_rows(&self, layer: usize, slots: &Tensor) -> Result<Tensor> {
+            let slot_ids = read_u32_device(slots)?;
+            let src = &self.conv_states[layer];
+            let row: usize = src.shape()[1..].iter().product();
+            ctx_scope::with(|_ops, ctx| {
+                let n = slot_ids.len();
+                let out = ctx.scratch_tensor::<f32>(&[n.max(1), row])?;
+                let base = out.device_ptr();
+                for (i, &s) in slot_ids.iter().enumerate() {
+                    let view = src.narrow(0usize, s as usize, 1)?;
+                    unsafe {
+                        erased::copy_d2d_to_raw(
+                            ctx,
+                            &view,
+                            base.add(i * row) as *mut core::ffi::c_void,
+                            row * 4,
+                        )?;
+                    }
+                }
+                Ok(owl_nn::DynTensor::from_f32(&out))
+            })
+        }
+
+        /// prefill 行回写(核已就地更新收集副本;按 slot 写回常驻表)
+        pub fn scatter_conv_rows(&mut self, layer: usize, slots: &Tensor, rows: &Tensor) -> Result<()> {
+            let slot_ids = read_u32_device(slots)?;
+            let row: usize = self.conv_states[layer].shape()[1..].iter().product();
+            ctx_scope::with(|_ops, ctx| {
+                for (i, &s) in slot_ids.iter().enumerate() {
+                    let piece = rows.narrow(0usize, i, 1)?;
+                    let dst = self.conv_states[layer].narrow(0usize, s as usize, 1)?;
+                    let dst_ptr = dst.device_ptr();
+                    erased::copy_d2d_to_raw(ctx, &piece, dst_ptr as *mut core::ffi::c_void, row * 4)?;
+                }
+                Ok(())
+            })
+        }
+
+        /// recurrent 行收集:slots U32 → [n, nv, K, V](prefill 递推逐序列取行)
+        pub fn gather_rec_rows(&self, layer: usize, slots: &Tensor) -> Result<Tensor> {
+            let slot_ids = read_u32_device(slots)?;
+            let src = &self.recurrent_states[layer];
+            let row: usize = src.shape()[1..].iter().product();
+            ctx_scope::with(|_ops, ctx| {
+                let n = slot_ids.len();
+                let out = ctx.scratch_tensor::<f32>(&[n.max(1), row])?;
+                let base = out.device_ptr();
+                for (i, &s) in slot_ids.iter().enumerate() {
+                    let view = src.narrow(0usize, s as usize, 1)?;
+                    unsafe {
+                        erased::copy_d2d_to_raw(
+                            ctx,
+                            &view,
+                            base.add(i * row) as *mut core::ffi::c_void,
+                            row * 4,
+                        )?;
+                    }
+                }
+                Ok(owl_nn::DynTensor::from_f32(&out))
+            })
+        }
+
+        /// recurrent 行回写
+        pub fn scatter_rec_rows(&mut self, layer: usize, slots: &Tensor, rows: &Tensor) -> Result<()> {
+            let slot_ids = read_u32_device(slots)?;
+            let row: usize = self.recurrent_states[layer].shape()[1..].iter().product();
+            ctx_scope::with(|_ops, ctx| {
+                for (i, &s) in slot_ids.iter().enumerate() {
+                    let piece = rows.narrow(0usize, i, 1)?;
+                    let dst = self.recurrent_states[layer].narrow(0usize, s as usize, 1)?;
+                    let dst_ptr = dst.device_ptr();
+                    erased::copy_d2d_to_raw(ctx, &piece, dst_ptr as *mut core::ffi::c_void, row * 4)?;
+                }
+                Ok(())
+            })
+        }
+    }
+
+    /// 设备 U32 张量 → host(急切 prefill 的槽位读取;捕获路径禁用——
+    /// decode 核内自寻址不走此路)
+    pub(crate) fn read_u32_device(t: &Tensor) -> Result<Vec<u32>> {
+        if t.dtype() != DType::U32 {
+            return Err(Error::Msg(format!(
+                "read_u32_device: 槽张量应为 U32,实际 {}(S4)",
+                t.dtype()
+            )));
+        }
+        let dev = ctx_scope::with_device();
+        let _ = dev.ctx().bind_to_thread();
+        let n = t.len_bytes() / 4;
+        let mut host = vec![0u32; n];
+        use owl_cuda::ffi::sys;
+        unsafe {
+            sys::cuMemcpyDtoH_v2(
+                host.as_mut_ptr() as *mut std::ffi::c_void,
+                t.device_ptr() as sys::CUdeviceptr,
+                n * 4,
+            )
+            .result()
+            .map_err(|e| Error::Msg(format!("dtoh slots: {e:?}")))?;
+        }
+        Ok(host)
+    }
+
     /// 输入元数据(= attention_rs::InputMetadata;字段面 T3 按调用点补齐)
     #[derive(Clone, Default)]
     pub struct InputMetadata {
