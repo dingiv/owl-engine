@@ -261,7 +261,7 @@ impl GdnKernels {
     }
 
     /// causal_conv1d decode 单步(kernel=4 收窄):slot 寻址滑窗更新。
-    /// conv_state [max_batch, d_conv, 3] 恒F32;slots [batch] i64(<0 跳过);
+    /// conv_state [max_batch, d_conv, 3] 恒F32;slots [batch] U32(0xFFFFFFFF=跳过,S4);
     /// x/out [batch, d_conv]。total = batch*d_conv。
     #[allow(clippy::too_many_arguments)]
     pub fn conv1d_update_slots_k4(
@@ -272,7 +272,7 @@ impl GdnKernels {
         weight: *const u8,
         bias: *const u8, // 可空
         conv_state: *mut f32,
-        slots: *const i64,
+        slots: *const u32,
         out: *mut u8,
         batch: i32,
         d_conv: i32,
@@ -303,6 +303,13 @@ impl GdnKernels {
                 silu as u64,
             ],
         )
+    }
+
+    /// exp 就地(f32):prefill fallback 的 g log→实空间 decay 转换。
+    /// (dec_gqa 核内自 exp;fb 核要求实空间入参——两核约定差异在 shim 统一)
+    pub fn exp_inplace_f32(&mut self, stream: &CudaStream, v: *mut f32, n: i32) -> Result<(), String> {
+        let blocks = (n as u32).div_ceil(256).max(1);
+        self.launch(stream, "gdn_exp_inplace_f32", (blocks, 1, 1), (256, 1, 1), &[v as u64, n as u64])
     }
 
     /// gated_delta_rule prefill 递推(fallback 变体,任意 k_dim ≤ 256)。
@@ -361,7 +368,7 @@ impl GdnKernels {
     /// gated_delta_rule decode 单步(slot 寻址,GQA 映射)。k_dim ≤ 128(BK=128)。
     /// g 为 **log 空间(核内 exp)**;q 核内乘 q_scale。
     /// q/k [B,num_k_heads,K],v/out [B,num_v_heads,V],
-    /// state [max_batch,num_v_heads,K,V] 恒F32 in/out,slots [batch] i64(<0 跳过)。
+    /// state [max_batch,num_v_heads,K,V] 恒F32 in/out,slots [batch] U32(0xFFFFFFFF=跳过)。
     /// 档位 BV=64;smem = (2×128+2)×4B = 1032B。
     #[allow(clippy::too_many_arguments)]
     pub fn delta_decode_slots_gqa(
@@ -374,7 +381,7 @@ impl GdnKernels {
         g: *const f32,
         beta: *const f32,
         state: *mut f32,
-        slots: *const i64,
+        slots: *const u32,
         out: *mut u8,
         batch: i32,
         num_v_heads: i32,
@@ -466,6 +473,27 @@ mod tests {
             .unwrap();
         }
         out
+    }
+
+    /// exp 就地对拍:prefill fallback 的 g log→实转换前置件
+    #[test]
+    fn exp_inplace_f32_host_parity() {
+        let (dev, mut k, _pool) = setup();
+        let n = 1000usize;
+        let v: Vec<f32> = (0..n).map(|i| -0.01 * (i % 50) as f32).collect();
+        let d_v = htod(&dev, &_pool, v.clone());
+        let v_p = owl_iface::DevBuf::device_ptr(&d_v) as *mut f32;
+        k.exp_inplace_f32(dev.stream(), v_p, n as i32).unwrap();
+        dev.ctx().synchronize().unwrap();
+        let got = dtoh_f32(&dev, v_p, n);
+        for i in 0..n {
+            let want = v[i].exp();
+            assert!(
+                (got[i] - want).abs() <= 1e-6 + want.abs() * 1e-5,
+                "exp[{i}]: got {} want {want}",
+                got[i]
+            );
+        }
     }
 
     /// gating 对拍:host 参考 = compute_gating 公式直译
@@ -707,7 +735,7 @@ mod tests {
         let batch = 3usize;
         let max_batch = 5usize;
         let d_conv = 4usize;
-        let slots: Vec<i64> = vec![2, -1, 0]; // slot 3 闲置,slot -1 跳过
+        let slots: Vec<u32> = vec![2, u32::MAX, 0]; // slot 3 闲置,0xFFFFFFFF 跳过
         let x: Vec<f32> = (0..batch * d_conv).map(|i| ((i % 13) as f32 - 6.0) * 0.4).collect();
         let weight: Vec<f32> = (0..d_conv * 4).map(|i| ((i % 9) as f32 - 4.0) * 0.3).collect();
         let state0: Vec<f32> = (0..max_batch * d_conv * 3).map(|i| ((i % 17) as f32 - 8.0) * 0.3).collect();
@@ -719,7 +747,7 @@ mod tests {
         let out_buf = htod(&dev, &pool, vec![0f32; batch * d_conv]);
         let x_p = owl_iface::DevBuf::device_ptr(&d_x) as *const u8;
         let w_p = owl_iface::DevBuf::device_ptr(&d_w) as *const u8;
-        let sl_p = owl_iface::DevBuf::device_ptr(&d_cu_slots) as *const i64;
+        let sl_p = owl_iface::DevBuf::device_ptr(&d_cu_slots) as *const u32;
         let st_p = owl_iface::DevBuf::device_ptr(&d_state) as *mut f32;
         let out_p = owl_iface::DevBuf::device_ptr(&out_buf) as *mut u8;
 
@@ -734,7 +762,7 @@ mod tests {
         let mut want_state = state0.clone();
         for b in 0..batch {
             let slot = slots[b];
-            if slot < 0 {
+            if slot == u32::MAX {
                 continue;
             }
             for ch in 0..d_conv {
@@ -844,7 +872,7 @@ mod tests {
         let nk = 2usize; // kv_group = 2,验证 GQA 头映射
         let k_dim = 8usize; // < 128,BK=128 档内 j<k_dim 守护
         let v_dim = 8usize;
-        let slots: Vec<i64> = vec![1, 0];
+        let slots: Vec<u32> = vec![1, 0];
         let max_batch = 3usize;
         let q: Vec<f32> = (0..batch * nk * k_dim).map(|i| ((i % 7) as f32 - 3.0) * 0.2).collect();
         let kv: Vec<f32> = (0..batch * nk * k_dim).map(|i| ((i % 5) as f32 - 2.0) * 0.3).collect();
@@ -869,7 +897,7 @@ mod tests {
         let g_p = owl_iface::DevBuf::device_ptr(&d_g) as *const f32;
         let beta_p = owl_iface::DevBuf::device_ptr(&d_beta) as *const f32;
         let st_p = owl_iface::DevBuf::device_ptr(&d_state) as *mut f32;
-        let sl_p = owl_iface::DevBuf::device_ptr(&d_slots) as *const i64;
+        let sl_p = owl_iface::DevBuf::device_ptr(&d_slots) as *const u32;
         let out_p = owl_iface::DevBuf::device_ptr(&out_buf) as *mut u8;
 
         k.delta_decode_slots_gqa(dev.stream(), "f32", q_p, k_p, v_p, g_p, beta_p,
@@ -882,7 +910,7 @@ mod tests {
         let got_state = dtoh_f32(&dev, st_p, max_batch * nv * k_dim * v_dim);
         let mut want_state = state0.clone();
         for b in 0..batch {
-            let slot = slots[b] as usize;
+            let slot = slots[b] as usize; // u32::MAX 时上面分支已 continue
             for vh in 0..nv {
                 let kh = vh / (nv / nk);
                 let decay = g[b * nv + vh].exp();

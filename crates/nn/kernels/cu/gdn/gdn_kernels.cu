@@ -166,7 +166,8 @@ GDN_GATING_KERNEL(__nv_bfloat16, bf16)
 //   - conv kernel_size 恒 4、gqa decode BK 恒 128(0.8B 档:linear_conv_kernel_dim=4,
 //     linear_key_head_dim=128);BV=64 与参考一致;
 //   - conv_state / recurrent state 恒 F32(与参考同);
-//   - int64_t → long long(nvrtc 无 stdint);state_snapshots(MTP 快照)未搬;
+//   - int64_t → long long(nvrtc 无 stdint);slots 统一 U32(S4 owl 槽语义,
+//     哨兵 0xFFFFFFFFu=跳过;原 i64 负数语义作废);state_snapshots(MTP)未搬;
 //   - g 空间约定:recurrence fallback 吃实空间 decay(已 exp);gqa decode 吃
 //     log 空间核内自 exp(与参考两核各自约定一致,Rust 侧注释已标明)。
 
@@ -211,15 +212,15 @@ extern "C" __global__ void gdn_conv1d_upd_k4_##SUFFIX(                          
     const T *__restrict__ weight,      /* [d_conv, 4] */                               \
     const T *__restrict__ bias,        /* [d_conv] nullable */                         \
     float *__restrict__ conv_state,    /* [max_batch, d_conv, 3] in/out 恒F32 */       \
-    const long long *__restrict__ slots, /* [batch], <0 跳过 */                         \
+    const unsigned int *__restrict__ slots, /* [batch], 0xFFFFFFFFu=跳过(S4 U32 槽语义) */                         \
     T *__restrict__ out,               /* [batch, d_conv] */                           \
     int total, int d_conv, int silu) {                                                 \
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;                             \
     if (idx >= total) return;                                                          \
     const int batch_idx = idx / d_conv;                                                \
     const int channel_idx = idx % d_conv;                                              \
-    const long long slot = slots[batch_idx];                                           \
-    if (slot < 0) return;                                                              \
+    const unsigned int slot = slots[batch_idx];                                           \
+    if (slot == 0xFFFFFFFFu) return;                                                              \
     const T *w_ptr = weight + channel_idx * 4;                                         \
     float *state_ptr =                                                                 \
         conv_state + ((size_t)slot * d_conv + channel_idx) * 3;                        \
@@ -302,14 +303,14 @@ extern "C" __global__ void gdn_delta_rec_fb_##SUFFIX(                           
 /* gated_delta_rule decode(单步,slot 寻址):k_dim <= 128(BK=128);
  *   g 为 log 空间(核内 exp),q 在核内乘 q_scale。
  * 布局 q/k [B,num_k_heads,K]、v/out [B,num_v_heads,V]、
- * state [max_batch,num_v_heads,K,V] 恒F32、slots [B] long long。 */
+ * state [max_batch,num_v_heads,K,V] 恒F32、slots [B] U32(0xFFFFFFFF=跳过)。 */
 #define GDN_DELTA_DEC_GQA_KERNEL(T, SUFFIX)                                            \
 extern "C" __global__ void gdn_delta_dec_gqa_##SUFFIX(                                 \
     const T *__restrict__ q, const T *__restrict__ k,                                  \
     const T *__restrict__ v,                                                           \
     const float *__restrict__ g, const float *__restrict__ beta,                       \
     float *__restrict__ state,                                                         \
-    const long long *__restrict__ slots,                                               \
+    const unsigned int *__restrict__ slots,                                            \
     T *__restrict__ out,                                                               \
     int batch, int num_v_heads, int num_k_heads,                                       \
     int k_dim, int v_dim, float q_scale) {                                             \
@@ -323,8 +324,8 @@ extern "C" __global__ void gdn_delta_dec_gqa_##SUFFIX(                          
     const int v_head_idx = bh % num_v_heads;                                           \
     const int kv_group = num_v_heads / num_k_heads;                                    \
     const int k_head_idx = v_head_idx / kv_group;                                      \
-    const long long slot = slots[b];                                                   \
-    const bool slot_valid = slot >= 0;                                                 \
+    const unsigned int slot = slots[b];                                                   \
+    const bool slot_valid = slot != 0xFFFFFFFFu;                                                 \
     extern __shared__ float smem[];                                                    \
     float *q_smem = smem;                                                              \
     float *k_smem = smem + 128;                                                        \
@@ -402,3 +403,11 @@ GDN_DELTA_REC_FB_KERNEL(__nv_bfloat16, bf16)
 GDN_DELTA_DEC_GQA_KERNEL(float, f32)
 GDN_DELTA_DEC_GQA_KERNEL(__half, f16)
 GDN_DELTA_DEC_GQA_KERNEL(__nv_bfloat16, bf16)
+
+// ---- exp 就地(f32):prefill fallback 的 g log→实空间 decay 转换 ----
+// (dec_gqa 核内自 exp,fb 核要求实空间入参;避免引擎侧 D2H 同步)
+extern "C" __global__ void gdn_exp_inplace_f32(float *__restrict__ v, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    v[i] = __expf(v[i]);
+}
