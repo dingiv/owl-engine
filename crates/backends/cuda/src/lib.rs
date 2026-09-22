@@ -256,6 +256,68 @@ mod tests {
         assert_eq!(dev.ledger().bytes_alive, 0);
     }
 
+    /// P1-C:lease-last 路径的 drop 顺序无关性——用户句柄先灭时,
+    /// 身份由 keepalive(而非用户句柄)钉住;图销毁后才 retire + 回收。
+    /// 旧实现 retire 挂在用户句柄 drop 的 count==1 判定上,本顺序必挂。
+    #[test]
+    fn lease_survivor_drops_before_graph_token_stays_valid() {
+        let dev = CudaDevice::new(0).expect("需要 CUDA 设备");
+        let pool = dev
+            .create_pool(PoolConfig {
+                name: "lease-order".into(),
+                kind: PoolKind::Weights,
+                bytes: 1 << 20,
+            })
+            .unwrap();
+        let mut t = dev.alloc_persistent_in::<u8>(&pool, 4096).unwrap();
+        let token = t.token.unwrap();
+
+        unsafe {
+            sys::cuMemsetD8Async(
+                t.device_ptr() as sys::CUdeviceptr,
+                0xFF,
+                4096,
+                dev.stream().cu_stream(),
+            )
+            .result()
+            .unwrap();
+        }
+        dev.ctx().synchronize().unwrap();
+        dev.note_launch();
+
+        let mut session = dev.capture_session().unwrap();
+        session.lease(&t);
+        let (_, graph) = session
+            .capture(
+                sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+                |frame| unsafe {
+                    sys::cuMemsetD8Async(
+                        t.device_ptr() as sys::CUdeviceptr,
+                        0,
+                        4096,
+                        frame.stream.cu_stream(),
+                    )
+                    .result()
+                    .unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap();
+        graph.upload().unwrap();
+
+        // 用户句柄先灭:keepalive 钉住,令牌必须仍活,replay 仍正确
+        drop(t);
+        assert!(dev.validate_token(&token), "keepalive 存活期令牌必须有效");
+        graph.launch().unwrap();
+        dev.ctx().synchronize().unwrap();
+
+        // 图销毁 → keepalive 归零 → PoolBufInner::drop 统一 retire+回收
+        drop(graph);
+        assert!(!dev.validate_token(&token), "图销毁后令牌应注销(P1-C)");
+        dev.set_phase(MemPhase::Idle);
+        assert_eq!(dev.ledger().bytes_alive, 0);
+    }
+
     /// 设备隔离律:UUID 钉卡回环 + Backend 枚举
     #[test]
     fn uuid_pinning_roundtrip() {

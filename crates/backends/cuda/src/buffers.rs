@@ -112,11 +112,18 @@ impl VmmBuf {
 impl Drop for VmmBuf {
     fn drop(&mut self) {
         let _ctx = Arc::clone(&self.ctx); // 保活至清理完成
+        let _ = _ctx.bind_to_thread(); // P1-A:释放线程未必持本 ctx
         unsafe {
             use sys::{cuMemAddressFree, cuMemRelease, cuMemUnmap};
-            let _ = cuMemUnmap(self.ptr, self.bytes);
-            let _ = cuMemRelease(self.chunk);
-            let _ = cuMemAddressFree(self.ptr, self.bytes);
+            if cuMemUnmap(self.ptr, self.bytes) != sys::CUresult::CUDA_SUCCESS {
+                eprintln!("owl-cuda: VMM cuMemUnmap 失败,物理页泄漏");
+            }
+            if cuMemRelease(self.chunk) != sys::CUresult::CUDA_SUCCESS {
+                eprintln!("owl-cuda: VMM cuMemRelease 失败,物理 handle 泄漏");
+            }
+            if cuMemAddressFree(self.ptr, self.bytes) != sys::CUresult::CUDA_SUCCESS {
+                eprintln!("owl-cuda: VMM cuMemAddressFree 失败,VA 泄漏");
+            }
         }
         self.gov.uncharge(self.bytes as u64);
     }

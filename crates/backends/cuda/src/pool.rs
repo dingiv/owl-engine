@@ -177,6 +177,7 @@ impl CudaPool {
                 backing: Mutex::new(backing),
                 bytes: effective,
                 base,
+                token: token.clone(),
                 pool: Arc::new(self.clone_account()),
                 gov: Arc::clone(&self.gov),
             }),
@@ -244,7 +245,7 @@ impl CudaPool {
         use sys::{
             cuMemAddressFree, cuMemAddressReserve, cuMemCreate, cuMemMap, cuMemSetAccess,
             cuMemUnmap, cuMemRelease, cuMemGetAllocationGranularity, CUmemAccessDesc,
-            CUmemAllocationProp, CUmemLocation, CUresult::CUDA_SUCCESS,
+            CUmemAllocationProp, CUmemLocation,
         };
         unsafe {
             self.ctx
@@ -280,7 +281,7 @@ impl CudaPool {
             let rounded = bytes.div_ceil(gran) * gran;
 
             let mut ptr: sys::CUdeviceptr = 0;
-            if cuMemAddressReserve(&mut ptr, rounded, gran, 0, 0) != CUDA_SUCCESS {
+            if cuMemAddressReserve(&mut ptr, rounded, gran, 0, 0) != sys::CUresult::CUDA_SUCCESS {
                 return Err(BackendError::AllocFailed {
                     kind: "vmm-reserve",
                     len: rounded,
@@ -288,7 +289,7 @@ impl CudaPool {
                 });
             }
             let mut chunk: sys::CUmemGenericAllocationHandle = Default::default();
-            if cuMemCreate(&mut chunk, rounded, &props, 0) != CUDA_SUCCESS {
+            if cuMemCreate(&mut chunk, rounded, &props, 0) != sys::CUresult::CUDA_SUCCESS {
                 let _ = cuMemAddressFree(ptr, rounded);
                 return Err(BackendError::AllocFailed {
                     kind: "vmm-create",
@@ -296,7 +297,7 @@ impl CudaPool {
                     detail: "cuMemCreate".into(),
                 });
             }
-            if cuMemMap(ptr, rounded, 0, chunk, 0) != CUDA_SUCCESS {
+            if cuMemMap(ptr, rounded, 0, chunk, 0) != sys::CUresult::CUDA_SUCCESS {
                 let _ = cuMemRelease(chunk);
                 let _ = cuMemAddressFree(ptr, rounded);
                 return Err(BackendError::AllocFailed {
@@ -309,7 +310,7 @@ impl CudaPool {
                 location: props.location,
                 flags: sys::CUmemAccess_flags_enum::CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
             }];
-            if cuMemSetAccess(ptr, rounded, access.as_ptr(), 1) != CUDA_SUCCESS {
+            if cuMemSetAccess(ptr, rounded, access.as_ptr(), 1) != sys::CUresult::CUDA_SUCCESS {
                 let _ = cuMemUnmap(ptr, rounded);
                 let _ = cuMemRelease(chunk);
                 let _ = cuMemAddressFree(ptr, rounded);
@@ -352,11 +353,18 @@ impl Drop for PoolBacking {
     fn drop(&mut self) {
         if let PoolBacking::Vmm { ptr, bytes, chunk, _ctx } = self {
             let _ctx = Arc::clone(_ctx); // 保活至清理完成
+            let _ = _ctx.bind_to_thread(); // P1-A
             unsafe {
                 use sys::{cuMemAddressFree, cuMemRelease, cuMemUnmap};
-                let _ = cuMemUnmap(*ptr, *bytes);
-                let _ = cuMemRelease(*chunk);
-                let _ = cuMemAddressFree(*ptr, *bytes);
+                if cuMemUnmap(*ptr, *bytes) != sys::CUresult::CUDA_SUCCESS {
+                    eprintln!("owl-cuda: VMM cuMemUnmap 失败,物理页泄漏(bytes={bytes})");
+                }
+                if cuMemRelease(*chunk) != sys::CUresult::CUDA_SUCCESS {
+                    eprintln!("owl-cuda: VMM cuMemRelease 失败,物理 handle 泄漏");
+                }
+                if cuMemAddressFree(*ptr, *bytes) != sys::CUresult::CUDA_SUCCESS {
+                    eprintln!("owl-cuda: VMM cuMemAddressFree 失败,VA 泄漏");
+                }
             }
         }
     }
@@ -377,12 +385,18 @@ pub(crate) struct PoolBufInner {
     pub(crate) bytes: u64,
     /// 设备基址(A2.6 窄口/哨兵①:区间索引键;Slice 于创建时取,VMM 为 ptr)
     pub(crate) base: u64,
+    /// 缓冲身份(P1-C:retire 落点在本结构 drop,需随行)
+    pub(crate) token: BufToken,
     pub(crate) pool: Arc<CudaPool>,
     pub(crate) gov: Arc<Governor>,
 }
 
 impl Drop for PoolBufInner {
     fn drop(&mut self) {
+        // P1-C:身份注销落点 = Arc 计数真正归零处。原先放在 CudaPoolBuf::drop
+        // 的 count==1 判定,在"keepalive 裸 Arc 是最后一个引用"的 lease-last
+        // 路径永不触发 → 死令牌 validate 为活 + live_bufs 泄漏。
+        self.gov.retire(&self.token);
         self.gov.intervals.lock().remove(&self.base);
         // 仅最后一个句柄消亡时到达此处(Arc 计数归零)
         let bytes = self.bytes;
@@ -392,17 +406,32 @@ impl Drop for PoolBufInner {
         let idle = gov.phase() == MemPhase::Idle;
         let gov_for_closure = Arc::clone(&gov);
         if idle {
-            drop(backing);
+            release_backing(backing, &pool);
             gov.uncharge(bytes);
             pool.uncharge_pool(bytes);
         } else {
             gov.defer(Box::new(move || {
-                drop(backing); // Slice 释放切片 / Vmm unmap+release
+                release_backing(backing, &pool);
                 gov_for_closure.uncharge(bytes);
                 pool.uncharge_pool(bytes);
             }));
         }
     }
+}
+
+/// 物理回收统一收口。
+///
+/// P1-A:bind_to_thread(A3)前置——释放线程可能是协调/测试线程,
+/// 当前 ctx 未必是本池 ctx(或无当前 ctx),裸调会被驱动静默拒绝。
+/// P1-B:VMM unmap 即时生效(非 stream-ordered),先排空上下文所有流,
+/// 防净空窗口 in-flight 访问竞态;Slice 走 free_async 自带排序,无此险。
+fn release_backing(backing: PoolBacking, pool: &CudaPool) {
+    let is_vmm = matches!(backing, PoolBacking::Vmm { .. });
+    let _ = pool.ctx.bind_to_thread();
+    if is_vmm {
+        let _ = pool.ctx.synchronize();
+    }
+    drop(backing);
 }
 
 impl CudaPoolBuf {
@@ -412,16 +441,7 @@ impl CudaPoolBuf {
     }
 }
 
-impl Drop for CudaPoolBuf {
-    fn drop(&mut self) {
-        let is_last = Arc::strong_count(&self.inner) == 1;
-        if is_last {
-            self.inner.gov.retire(&self.token); // 身份随内存消亡
-        }
-        // PoolBufInner::drop 负责物理回收(Idle 立即 / 非 Idle 延迟)
-    }
-}
-
+// 身份注销 retire 已移入 PoolBufInner::drop(P1-C:唯一真正的归零判定点);
 impl OpaqueDevBuf for CudaPoolBuf {
     fn token(&self) -> BufToken {
         self.token
