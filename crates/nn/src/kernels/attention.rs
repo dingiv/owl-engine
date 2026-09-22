@@ -249,12 +249,19 @@ impl PagedKernels {
             use_fast_math: Some(true),
             ..Default::default()
         };
+        let t0 = std::time::Instant::now();
         let ptx = compile_ptx_with_opts(PAGED_V1_SRC, make_opts(&include, &cu_dir))
             .map_err(|e| format!("nvrtc: {e}"))?;
+        let t_v1 = t0.elapsed();
         let module = ctx.load_module(ptx).map_err(|e| format!("load_module: {e}"))?;
+        let t1 = std::time::Instant::now();
         let ptx2 = compile_ptx_with_opts(PAGED_V2_SRC, make_opts(&include, &cu_dir))
             .map_err(|e| format!("nvrtc v2: {e}"))?;
+        let t_v2 = t1.elapsed();
         let module_v2 = ctx.load_module(ptx2).map_err(|e| format!("load_module(v2): {e}"))?;
+        eprintln!(
+            "[PagedKernels] nvrtc v1 = {t_v1:?}, v2 = {t_v2:?}"
+        );
         Ok(Self {
             ctx: Arc::clone(ctx),
             module,
@@ -288,6 +295,7 @@ impl PagedKernels {
 
     /// v1 解码核。布局契约见 cu/attention_paged_v1.cu 头部。
     /// `dtype`: 0 = f16(vLLM uint16 位型路径);1 = bf16。
+    /// `head_size`: 128 / 256(B1 双档;编译期实例化,非运行时参数)。
     /// 全部动态量(device 张量裸指针;A1.5);alibi 暂 nullptr。
     #[allow(clippy::too_many_arguments)]
     pub fn paged_attention_v1(
@@ -295,6 +303,7 @@ impl PagedKernels {
         stream: &owl_cuda::ffi::CudaStream,
         dtype: u32, // 0=f16 1=bf16
         block_size: u32,
+        head_size: u32,
         out: *mut u16,
         query: *const u16,
         key_cache: *const u16,
@@ -311,18 +320,24 @@ impl PagedKernels {
         num_seqs: i32,
         num_heads: i32,
     ) -> Result<(), String> {
-        let name = match (dtype, block_size) {
-            (0, 32) => "owl_pa_v1_f16_bs32",
-            (0, 64) => "owl_pa_v1_f16_bs64",
-            (1, 32) => "owl_pa_v1_bf16_bs32",
-            (1, 64) => "owl_pa_v1_bf16_bs64",
-            _ => return Err(format!("paged_attention_v1: dtype {dtype} bs {block_size} 未实例化")),
+        let name = match (dtype, block_size, head_size) {
+            (0, 32, 128) => "owl_pa_v1_f16_bs32",
+            (0, 64, 128) => "owl_pa_v1_f16_bs64",
+            (1, 32, 128) => "owl_pa_v1_bf16_bs32",
+            (1, 64, 128) => "owl_pa_v1_bf16_bs64",
+            (0, 32, 256) => "owl_pa_v1_f16_bs32_h256",
+            (0, 64, 256) => "owl_pa_v1_f16_bs64_h256",
+            (1, 32, 256) => "owl_pa_v1_bf16_bs32_h256",
+            (1, 64, 256) => "owl_pa_v1_bf16_bs64_h256",
+            _ => return Err(format!(
+                "paged_attention_v1: dtype {dtype} bs {block_size} head {head_size} 未实例化")),
         };
         let func = self.func(name)?;
         let padded = ((max_context_len + block_size as i32 - 1) / block_size as i32)
             * block_size as i32;
         let logits_size = padded as usize * 4;
-        let outputs_size = (128 / 32 / 2) * 128 * 4; // NUM_WARPS/2 * head_size * 4
+        // NUM_WARPS/2 * head_size * 4(NUM_WARPS = 128/32 = 4)
+        let outputs_size = (128 / 32 / 2) * head_size as usize * 4;
         let cfg = LaunchConfig {
             grid_dim: (num_heads as u32, num_seqs as u32, 1),
             block_dim: (128, 1, 1),
@@ -362,6 +377,7 @@ impl PagedKernels {
     }
 
     /// K2:v2 主核 + reduce 核(大 bs 分片归约;布局契约同 v1)。
+    /// `head_size`: 128 / 256(B1 双档);reduce 核与 head_size 无关,仅按 dtype。
     /// 临时缓冲(exp_sums/max_logits/tmp_out)= 调用方 scratch(A5.2):
     ///   exp_sums/max_logits: [num_seqs, num_heads, max_num_partitions] f32
     ///   tmp_out:             [num_seqs, num_heads, max_num_partitions, head_size] u16
@@ -372,6 +388,7 @@ impl PagedKernels {
         stream: &owl_cuda::ffi::CudaStream,
         dtype: u32, // 0=f16 1=bf16
         block_size: u32,
+        head_size: u32,
         out: *mut u16,
         exp_sums: *mut f32,
         max_logits: *mut f32,
@@ -392,22 +409,30 @@ impl PagedKernels {
         num_heads: i32,
     ) -> Result<(), String> {
         let max_num_partitions = (max_context_len + PARTITION_SIZE - 1) / PARTITION_SIZE;
-        let main_name = match (dtype, block_size) {
-            (0, 32) => "owl_pa_v2_main_f16_bs32",
-            (0, 64) => "owl_pa_v2_main_f16_bs64",
-            (1, 32) => "owl_pa_v2_main_bf16_bs32",
-            (1, 64) => "owl_pa_v2_main_bf16_bs64",
-            _ => return Err(format!("paged_attention_v2: dtype {dtype} bs {block_size} 未实例化")),
+        let main_name = match (dtype, block_size, head_size) {
+            (0, 32, 128) => "owl_pa_v2_main_f16_bs32",
+            (0, 64, 128) => "owl_pa_v2_main_f16_bs64",
+            (1, 32, 128) => "owl_pa_v2_main_bf16_bs32",
+            (1, 64, 128) => "owl_pa_v2_main_bf16_bs64",
+            (0, 32, 256) => "owl_pa_v2_main_f16_bs32_h256",
+            (0, 64, 256) => "owl_pa_v2_main_f16_bs64_h256",
+            (1, 32, 256) => "owl_pa_v2_main_bf16_bs32_h256",
+            (1, 64, 256) => "owl_pa_v2_main_bf16_bs64_h256",
+            _ => return Err(format!(
+                "paged_attention_v2: dtype {dtype} bs {block_size} head {head_size} 未实例化")),
         };
-        let reduce_name = match dtype {
-            0 => "owl_pa_v2_reduce_f16",
-            _ => "owl_pa_v2_reduce_bf16",
+        let reduce_name = match (dtype, head_size) {
+            (0, 128) => "owl_pa_v2_reduce_f16",
+            (0, 256) => "owl_pa_v2_reduce_f16_h256",
+            (_, 128) => "owl_pa_v2_reduce_bf16",
+            (_, 256) => "owl_pa_v2_reduce_bf16_h256",
+            _ => return Err(format!("paged_attention_v2 reduce: dtype {dtype} head {head_size} 未实例化")),
         };
 
-        // 主核:grid (num_heads, num_seqs, max_num_partitions);smem = max(512*4, NUM_WARPS/2*128*4)
+        // 主核:grid (num_heads, num_seqs, max_num_partitions);smem = max(512*4, NUM_WARPS/2*head_size*4)
         let func = self.func_v2(main_name)?;
         let logits_size = (PARTITION_SIZE as usize) * 4;
-        let outputs_size = (128 / 32 / 2) * 128 * 4;
+        let outputs_size = (128 / 32 / 2) * head_size as usize * 4;
         let cfg = LaunchConfig {
             grid_dim: (num_heads as u32, num_seqs as u32, max_num_partitions as u32),
             block_dim: (128, 1, 1),
@@ -527,6 +552,7 @@ mod paged_tests {
     fn bf16_bits_to_f32(h: u16) -> f32 {
         f32::from_bits((h as u32) << 16)
     }
+
 
     /// K1 验收:合成 paged KV 上 v1 核 vs host 朴素 attention 对拍(f16)。
     /// 场景:num_seqs=2(len 20/10),heads=8(kv=8),head_size=128,
@@ -673,6 +699,7 @@ mod paged_tests {
             dev.stream(),
             0,   // f16
             32,  // block_size
+            128, // head_size
             owl_iface::DevBuf::device_ptr(&d_out) as *mut u16,
             owl_iface::DevBuf::device_ptr(&d_q) as *const u16,
             owl_iface::DevBuf::device_ptr(&d_kc) as *const u16,
@@ -743,7 +770,7 @@ mod paged_tests {
         dev.ctx().synchronize().unwrap();
         let mut kern = PagedKernels::new(dev.ctx()).unwrap();
         kern.paged_attention_v1(
-            dev.stream(), 1, 32,
+            dev.stream(), 1, 32, 128,
             owl_iface::DevBuf::device_ptr(&d_out) as *mut u16,
             owl_iface::DevBuf::device_ptr(&d_q) as *const u16,
             owl_iface::DevBuf::device_ptr(&d_kc) as *const u16,
@@ -928,14 +955,14 @@ mod paged_tests {
 
         // v1
         kern.paged_attention_v1(
-            dev.stream(), 0, 32,
+            dev.stream(), 0, 32, 128,
             owl_iface::DevBuf::device_ptr(&d_out_v1) as *mut u16,
             q_p, kc_p, vc_p, common.0, common.1, bt_p, cl_p, common.2,
             common.3, common.4, common.5, common.6, common.7, common.8,
         ).unwrap();
         // v2
         kern.paged_attention_v2(
-            dev.stream(), 0, 32,
+            dev.stream(), 0, 32, 128,
             owl_iface::DevBuf::device_ptr(&d_out_v2) as *mut u16,
             owl_iface::DevBuf::device_ptr(&d_exp) as *mut f32,
             owl_iface::DevBuf::device_ptr(&d_maxl) as *mut f32,
@@ -1007,7 +1034,7 @@ mod paged_tests {
         let d_tmp = dev.alloc_persistent_in::<u16>(&pool, 2 * 8 * 2 * 128).unwrap();
         let mut kern = PagedKernels::new(dev.ctx()).unwrap();
         kern.paged_attention_v2(
-            dev.stream(), 1, 32,
+            dev.stream(), 1, 32, 128,
             owl_iface::DevBuf::device_ptr(&d_out) as *mut u16,
             owl_iface::DevBuf::device_ptr(&d_exp) as *mut f32,
             owl_iface::DevBuf::device_ptr(&d_ml) as *mut f32,
@@ -1034,5 +1061,510 @@ mod paged_tests {
         for (i, &b) in out_host.iter().enumerate() {
             let f = bf16_bits_to_f32(b);
             assert!(f.is_finite(), "v2 bf16 smoke: out[{i}] 非有限 {f}");
+        }
+       }
+
+    // ---- B1:head_size 256 档(Qwen3.5-0.8B full_attention:8 q × 256 / 2 kv)----
+
+    /// B1 验收一:v1 f16 head 256 + 真实 GQA(8 q 头 → 2 kv 头)host 对拍。
+    /// 仿 128 档同款场景;kv 映射 q 头 h → kv 头 h / (8/2);容差 2e-2。
+    #[test]
+    fn paged_attention_v1_f16_h256_gqa_host_parity() {
+        const NUM_SEQS: usize = 2;
+        const HEADS: usize = 8;
+        const KV_HEADS: usize = 2;
+        const HEAD_SIZE: usize = 256;
+        const BS: usize = 32;
+        const MAX_BPS: usize = 2;
+        const BLOCKS: usize = NUM_SEQS * 4;
+        const X: usize = 8;
+        let scale = 1.0 / (HEAD_SIZE as f32).sqrt();
+
+        let lens = [20usize, 10];
+        let mut s = 0.25f32;
+        let mut nxt = || {
+            s = (s * 1.37 + 0.13).fract() - 0.5;
+            s
+        };
+        let mut q = vec![0u16; NUM_SEQS * HEADS * HEAD_SIZE];
+        for v in q.iter_mut() {
+            *v = f32_to_f16_bits(nxt() * 4.0);
+        }
+        // logical kv 按 kv 头存(kv 头不随 q 头重复)
+        let mut logical_k = vec![vec![0f32; HEAD_SIZE]; NUM_SEQS * KV_HEADS * BS];
+        let mut logical_v = vec![vec![0f32; HEAD_SIZE]; NUM_SEQS * KV_HEADS * BS];
+        for seq in 0..NUM_SEQS {
+            for pos in 0..BS {
+                for h in 0..KV_HEADS {
+                    for d in 0..HEAD_SIZE {
+                        logical_k[(seq * KV_HEADS + h) * BS + pos][d] = nxt() * 2.0;
+                        logical_v[(seq * KV_HEADS + h) * BS + pos][d] = nxt() * 2.0;
+                    }
+                }
+            }
+        }
+
+        // 分页散布(x = 8 布局不变,head 维 = kv 头数)
+        let mut block_tables = vec![0i32; NUM_SEQS * MAX_BPS];
+        for seq in 0..NUM_SEQS {
+            block_tables[seq * MAX_BPS] = (seq * 4) as i32;
+            block_tables[seq * MAX_BPS + 1] = (seq * 4 + 1) as i32;
+        }
+        let kc_len = BLOCKS * KV_HEADS * (HEAD_SIZE / X) * BS * X;
+        let vc_len = BLOCKS * KV_HEADS * HEAD_SIZE * BS;
+        let mut key_cache = vec![f32_to_f16_bits(0.0); kc_len];
+        let mut value_cache = vec![f32_to_f16_bits(0.0); vc_len];
+        for seq in 0..NUM_SEQS {
+            for pos in 0..BS {
+                if pos >= lens[seq] {
+                    continue;
+                }
+                let pblock = block_tables[seq * MAX_BPS + pos / BS] as usize;
+                let poff = pos % BS;
+                for h in 0..KV_HEADS {
+                    for d in 0..HEAD_SIZE {
+                        let tk = pblock * (KV_HEADS * (HEAD_SIZE / X) * BS * X)
+                            + h * ((HEAD_SIZE / X) * BS * X)
+                            + (d / X) * (BS * X)
+                            + poff * X
+                            + d % X;
+                        key_cache[tk] =
+                            f32_to_f16_bits(logical_k[(seq * KV_HEADS + h) * BS + pos][d]);
+                        let tv = pblock * (KV_HEADS * HEAD_SIZE * BS)
+                            + h * (HEAD_SIZE * BS)
+                            + d * BS
+                            + poff;
+                        value_cache[tv] =
+                            f32_to_f16_bits(logical_v[(seq * KV_HEADS + h) * BS + pos][d]);
+                    }
+                }
+            }
+        }
+        let context_lens: Vec<i32> = lens.iter().map(|&l| l as i32).collect();
+
+        // host 参考:q 头 h → kv 头 h / (HEADS/KV_HEADS)
+        let q_f32: Vec<f32> = q.iter().map(|&b| f16_bits_to_f32(b)).collect();
+        let gqa = HEADS / KV_HEADS;
+        let mut expect = vec![0f32; NUM_SEQS * HEADS * HEAD_SIZE];
+        for seq in 0..NUM_SEQS {
+            let len = lens[seq];
+            for h in 0..HEADS {
+                let kvh = h / gqa;
+                let mut logits = vec![0f32; len];
+                for pos in 0..len {
+                    let mut dot = 0f32;
+                    for d in 0..HEAD_SIZE {
+                        dot += q_f32[(seq * HEADS + h) * HEAD_SIZE + d]
+                            * logical_k[(seq * KV_HEADS + kvh) * BS + pos][d];
+                    }
+                    logits[pos] = dot * scale;
+                }
+                let mx = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let exps: Vec<f32> = logits.iter().map(|&l| (l - mx).exp()).collect();
+                let sum: f32 = exps.iter().sum();
+                for d in 0..HEAD_SIZE {
+                    let mut acc = 0f32;
+                    for pos in 0..len {
+                        acc += exps[pos] / sum * logical_v[(seq * KV_HEADS + kvh) * BS + pos][d];
+                    }
+                    expect[(seq * HEADS + h) * HEAD_SIZE + d] = acc;
+                }
+            }
+        }
+
+        let dev = CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
+        let pool = dev
+            .create_pool(PoolConfig {
+                name: format!("k1h256-{}", std::process::id()),
+                kind: PoolKind::Weights,
+                bytes: 16 << 20,
+            })
+            .unwrap();
+        let d_q = dev.htod_persistent_in::<u16>(&pool, q.clone()).unwrap();
+        let d_kc = dev.htod_persistent_in::<u16>(&pool, key_cache.clone()).unwrap();
+        let d_vc = dev.htod_persistent_in::<u16>(&pool, value_cache.clone()).unwrap();
+        let d_bt = dev.htod_persistent_in::<i32>(&pool, block_tables.clone()).unwrap();
+        let d_cl = dev.htod_persistent_in::<i32>(&pool, context_lens.clone()).unwrap();
+        let d_out = dev
+            .alloc_persistent_in::<u16>(&pool, NUM_SEQS * HEADS * HEAD_SIZE)
+            .unwrap();
+        dev.ctx().synchronize().unwrap();
+
+        let mut kern = PagedKernels::new(dev.ctx()).unwrap();
+        kern.paged_attention_v1(
+            dev.stream(),
+            0,   // f16
+            32,  // block_size
+            256, // head_size
+            owl_iface::DevBuf::device_ptr(&d_out) as *mut u16,
+            owl_iface::DevBuf::device_ptr(&d_q) as *const u16,
+            owl_iface::DevBuf::device_ptr(&d_kc) as *const u16,
+            owl_iface::DevBuf::device_ptr(&d_vc) as *const u16,
+            KV_HEADS as i32,
+            scale,
+            owl_iface::DevBuf::device_ptr(&d_bt) as *const i32,
+            owl_iface::DevBuf::device_ptr(&d_cl) as *const i32,
+            MAX_BPS as i32,
+            (HEADS * HEAD_SIZE) as i32,
+            (KV_HEADS * (HEAD_SIZE / X) * BS * X) as i32,
+            ((HEAD_SIZE / X) * BS * X) as i32,
+            BS as i32,
+            NUM_SEQS as i32,
+            HEADS as i32,
+        )
+        .unwrap();
+        dev.ctx().synchronize().unwrap();
+
+        let mut out_host = vec![0u16; NUM_SEQS * HEADS * HEAD_SIZE];
+        use owl_cuda::ffi::sys;
+        dev.ctx().bind_to_thread().unwrap();
+        unsafe {
+            sys::cuMemcpyDtoH_v2(
+                out_host.as_mut_ptr() as *mut std::ffi::c_void,
+                owl_iface::DevBuf::device_ptr(&d_out) as sys::CUdeviceptr,
+                out_host.len() * 2,
+            )
+            .result()
+            .unwrap();
+        }
+        let mut max_diff = 0f32;
+        let mut shown = 0;
+        for (i, &o) in out_host.iter().enumerate() {
+            let diff = (f16_bits_to_f32(o) - expect[i]).abs();
+            if diff > 2e-2 && shown < 16 {
+                eprintln!("DBG i={i} (seq {} h {} d {}) got={} want={}",
+                    i / (HEADS * HEAD_SIZE), (i / HEAD_SIZE) % HEADS, i % HEAD_SIZE,
+                    f16_bits_to_f32(o), expect[i]);
+                shown += 1;
+            }
+            max_diff = max_diff.max(diff);
+        }
+        assert!(max_diff < 2e-2, "v1 f16 h256 GQA 对拍最大偏差 {max_diff}");
+        eprintln!("[K1-h256] v1 f16 head256 GQA max_diff = {max_diff:.4e}");
+    }
+
+    /// B1 验收二:v2 f16 head 256 大 ctx 分片 + GQA + v1/v2 交叉。
+    /// lens [1000, 600](2 partitions);8 q / 2 kv,head 256。
+    #[test]
+    fn paged_attention_v2_f16_h256_gqa_parity_and_partitions() {
+        const NUM_SEQS: usize = 2;
+        const HEADS: usize = 8;
+        const KV_HEADS: usize = 2;
+        const HEAD_SIZE: usize = 256;
+        const BS: usize = 32;
+        const MAX_BPS: usize = 33; // ceil(1000/32)=32 +1 冗余
+        const BLOCKS: usize = NUM_SEQS * MAX_BPS + 2;
+        const X: usize = 8;
+        let scale = 1.0 / (HEAD_SIZE as f32).sqrt();
+
+        let lens = [1000usize, 600usize];
+        let mut s = 0.31f32;
+        let mut nxt = || {
+            s = (s * 1.29 + 0.17).fract() - 0.5;
+            s
+        };
+        let mut q = vec![0u16; NUM_SEQS * HEADS * HEAD_SIZE];
+        for v in q.iter_mut() {
+            *v = f32_to_f16_bits(nxt() * 4.0);
+        }
+        let max_len = lens[0];
+        let mut logical_k = vec![vec![0f32; HEAD_SIZE]; NUM_SEQS * KV_HEADS * max_len];
+        let mut logical_v = vec![vec![0f32; HEAD_SIZE]; NUM_SEQS * KV_HEADS * max_len];
+        for seq in 0..NUM_SEQS {
+            for pos in 0..lens[seq] {
+                for h in 0..KV_HEADS {
+                    for d in 0..HEAD_SIZE {
+                        logical_k[(seq * KV_HEADS + h) * max_len + pos][d] = nxt() * 2.0;
+                        logical_v[(seq * KV_HEADS + h) * max_len + pos][d] = nxt() * 2.0;
+                    }
+                }
+            }
+        }
+
+        let mut block_tables = vec![0i32; NUM_SEQS * MAX_BPS];
+        for seq in 0..NUM_SEQS {
+            for b_i in 0..MAX_BPS {
+                block_tables[seq * MAX_BPS + b_i] =
+                    if b_i * BS < lens[seq] { (seq * MAX_BPS + b_i) as i32 } else { 0 };
+            }
+        }
+        let kc_len = BLOCKS * KV_HEADS * (HEAD_SIZE / X) * BS * X;
+        let vc_len = BLOCKS * KV_HEADS * HEAD_SIZE * BS;
+        let mut key_cache = vec![f32_to_f16_bits(0.0); kc_len];
+        let mut value_cache = vec![f32_to_f16_bits(0.0); vc_len];
+        for seq in 0..NUM_SEQS {
+            for pos in 0..lens[seq] {
+                let pblock = block_tables[seq * MAX_BPS + pos / BS] as usize;
+                let poff = pos % BS;
+                for h in 0..KV_HEADS {
+                    for d in 0..HEAD_SIZE {
+                        let tk = pblock * (KV_HEADS * (HEAD_SIZE / X) * BS * X)
+                            + h * ((HEAD_SIZE / X) * BS * X)
+                            + (d / X) * (BS * X)
+                            + poff * X
+                            + d % X;
+                        key_cache[tk] =
+                            f32_to_f16_bits(logical_k[(seq * KV_HEADS + h) * max_len + pos][d]);
+                        let tv = pblock * (KV_HEADS * HEAD_SIZE * BS)
+                            + h * (HEAD_SIZE * BS)
+                            + d * BS
+                            + poff;
+                        value_cache[tv] =
+                            f32_to_f16_bits(logical_v[(seq * KV_HEADS + h) * max_len + pos][d]);
+                    }
+                }
+            }
+        }
+        let context_lens: Vec<i32> = lens.iter().map(|&l| l as i32).collect();
+
+        // host 参考(GQA 同上)
+        let q_f32: Vec<f32> = q.iter().map(|&b| f16_bits_to_f32(b)).collect();
+        let gqa = HEADS / KV_HEADS;
+        let mut expect = vec![0f32; NUM_SEQS * HEADS * HEAD_SIZE];
+        for seq in 0..NUM_SEQS {
+            let len = lens[seq];
+            for h in 0..HEADS {
+                let kvh = h / gqa;
+                let mut logits = vec![0f32; len];
+                for pos in 0..len {
+                    let mut dot = 0f32;
+                    for d in 0..HEAD_SIZE {
+                        dot += q_f32[(seq * HEADS + h) * HEAD_SIZE + d]
+                            * logical_k[(seq * KV_HEADS + kvh) * max_len + pos][d];
+                    }
+                    logits[pos] = dot * scale;
+                }
+                let mx = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let exps: Vec<f32> = logits.iter().map(|&l| (l - mx).exp()).collect();
+                let sum: f32 = exps.iter().sum();
+                for d in 0..HEAD_SIZE {
+                    let mut acc = 0f32;
+                    for pos in 0..len {
+                        acc +=
+                            exps[pos] / sum * logical_v[(seq * KV_HEADS + kvh) * max_len + pos][d];
+                    }
+                    expect[(seq * HEADS + h) * HEAD_SIZE + d] = acc;
+                }
+            }
+        }
+
+        let dev = CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
+        let pool = dev
+            .create_pool(PoolConfig {
+                name: format!("k2h256-{}", std::process::id()),
+                kind: PoolKind::Weights,
+                bytes: 64 << 20,
+            })
+            .unwrap();
+        let d_q = dev.htod_persistent_in::<u16>(&pool, q.clone()).unwrap();
+        let d_kc = dev.htod_persistent_in::<u16>(&pool, key_cache.clone()).unwrap();
+        let d_vc = dev.htod_persistent_in::<u16>(&pool, value_cache.clone()).unwrap();
+        let d_bt = dev.htod_persistent_in::<i32>(&pool, block_tables.clone()).unwrap();
+        let d_cl = dev.htod_persistent_in::<i32>(&pool, context_lens.clone()).unwrap();
+        let d_out_v1 = dev
+            .alloc_persistent_in::<u16>(&pool, NUM_SEQS * HEADS * HEAD_SIZE)
+            .unwrap();
+        let d_out_v2 = dev
+            .alloc_persistent_in::<u16>(&pool, NUM_SEQS * HEADS * HEAD_SIZE)
+            .unwrap();
+        const PARTS: usize = 2;
+        let d_exp = dev
+            .alloc_persistent_in::<f32>(&pool, NUM_SEQS * HEADS * PARTS)
+            .unwrap();
+        let d_maxl = dev
+            .alloc_persistent_in::<f32>(&pool, NUM_SEQS * HEADS * PARTS)
+            .unwrap();
+        let d_tmp = dev
+            .alloc_persistent_in::<u16>(&pool, NUM_SEQS * HEADS * PARTS * HEAD_SIZE)
+            .unwrap();
+
+        let mut kern = PagedKernels::new(dev.ctx()).unwrap();
+        let (q_p, kc_p, vc_p, bt_p, cl_p) = (
+            owl_iface::DevBuf::device_ptr(&d_q) as *const u16,
+            owl_iface::DevBuf::device_ptr(&d_kc) as *const u16,
+            owl_iface::DevBuf::device_ptr(&d_vc) as *const u16,
+            owl_iface::DevBuf::device_ptr(&d_bt) as *const i32,
+            owl_iface::DevBuf::device_ptr(&d_cl) as *const i32,
+        );
+        kern.paged_attention_v1(
+            dev.stream(), 0, 32, 256,
+            owl_iface::DevBuf::device_ptr(&d_out_v1) as *mut u16,
+            q_p, kc_p, vc_p,
+            KV_HEADS as i32, scale,
+            bt_p, cl_p, MAX_BPS as i32,
+            (HEADS * HEAD_SIZE) as i32,
+            (KV_HEADS * (HEAD_SIZE / X) * BS * X) as i32,
+            ((HEAD_SIZE / X) * BS * X) as i32,
+            lens[0] as i32, NUM_SEQS as i32, HEADS as i32,
+        )
+        .unwrap();
+        kern.paged_attention_v2(
+            dev.stream(), 0, 32, 256,
+            owl_iface::DevBuf::device_ptr(&d_out_v2) as *mut u16,
+            owl_iface::DevBuf::device_ptr(&d_exp) as *mut f32,
+            owl_iface::DevBuf::device_ptr(&d_maxl) as *mut f32,
+            owl_iface::DevBuf::device_ptr(&d_tmp) as *mut u16,
+            q_p, kc_p, vc_p,
+            KV_HEADS as i32, scale,
+            bt_p, cl_p, MAX_BPS as i32,
+            (HEADS * HEAD_SIZE) as i32,
+            (KV_HEADS * (HEAD_SIZE / X) * BS * X) as i32,
+            ((HEAD_SIZE / X) * BS * X) as i32,
+            lens[0] as i32, NUM_SEQS as i32, HEADS as i32,
+        )
+        .unwrap();
+        dev.ctx().synchronize().unwrap();
+
+        let read_u16 = |ptr: *mut u16| -> Vec<u16> {
+            use owl_cuda::ffi::sys;
+            dev.ctx().bind_to_thread().unwrap();
+            let mut out = vec![0u16; NUM_SEQS * HEADS * HEAD_SIZE];
+            unsafe {
+                sys::cuMemcpyDtoH_v2(
+                    out.as_mut_ptr() as *mut std::ffi::c_void,
+                    ptr as sys::CUdeviceptr,
+                    out.len() * 2,
+                )
+                .result()
+                .unwrap();
+            }
+            out
+        };
+        let out_v1 = read_u16(owl_iface::DevBuf::device_ptr(&d_out_v1) as *mut u16);
+        let out_v2 = read_u16(owl_iface::DevBuf::device_ptr(&d_out_v2) as *mut u16);
+
+        let mut host_max = 0f32;
+        for (i, &o) in out_v2.iter().enumerate() {
+            host_max = host_max.max((f16_bits_to_f32(o) - expect[i]).abs());
+        }
+        assert!(host_max < 2e-2, "v2 h256 vs host 最大偏差 {host_max}");
+        let mut vv_max = 0f32;
+        for (&a, &b) in out_v1.iter().zip(out_v2.iter()) {
+            vv_max = vv_max.max((f16_bits_to_f32(a) - f16_bits_to_f32(b)).abs());
+        }
+        assert!(vv_max < 2e-2, "v1/v2 h256 交叉最大偏差 {vv_max}");
+        eprintln!(
+            "[K2-h256] v2-vs-host max_diff = {host_max:.4e}; v1-vs-v2 max_diff = {vv_max:.4e}"
+        );
+    }
+
+    /// B1 验收三:v1 bf16 head 256 smoke(编译链 + 有限值)。
+    #[test]
+    fn paged_attention_v1_bf16_h256_smoke() {
+        let dev = CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
+        let pool = dev
+            .create_pool(PoolConfig {
+                name: format!("k1bh256-{}", std::process::id()),
+                kind: PoolKind::Weights,
+                bytes: 16 << 20,
+            })
+            .unwrap();
+        let n_kc = 8 * 2 * 32 * 32 * 8;
+        let n_vc = 8 * 2 * 256 * 32;
+        let q = vec![f32_to_bf16_bits(0.1); 8 * 256];
+        let kc = vec![f32_to_bf16_bits(0.2); n_kc];
+        let vc = vec![f32_to_bf16_bits(0.3); n_vc];
+        let bt = vec![0i32, 1];
+        let cl = vec![16i32, 16];
+        let d_q = dev.htod_persistent_in::<u16>(&pool, q).unwrap();
+        let d_kc = dev.htod_persistent_in::<u16>(&pool, kc).unwrap();
+        let d_vc = dev.htod_persistent_in::<u16>(&pool, vc).unwrap();
+        let d_bt = dev.htod_persistent_in::<i32>(&pool, bt).unwrap();
+        let d_cl = dev.htod_persistent_in::<i32>(&pool, cl).unwrap();
+        let d_out = dev.alloc_persistent_in::<u16>(&pool, 2 * 8 * 256).unwrap();
+        dev.ctx().synchronize().unwrap();
+        let mut kern = PagedKernels::new(dev.ctx()).unwrap();
+        kern.paged_attention_v1(
+            dev.stream(), 1, 32, 256,
+            owl_iface::DevBuf::device_ptr(&d_out) as *mut u16,
+            owl_iface::DevBuf::device_ptr(&d_q) as *const u16,
+            owl_iface::DevBuf::device_ptr(&d_kc) as *const u16,
+            owl_iface::DevBuf::device_ptr(&d_vc) as *const u16,
+            2, 1.0 / 256f32.sqrt(),
+            owl_iface::DevBuf::device_ptr(&d_bt) as *const i32,
+            owl_iface::DevBuf::device_ptr(&d_cl) as *const i32,
+            1, 8 * 256, 2 * 32 * 32 * 8, 32 * 256, 32, 2, 8,
+        )
+        .unwrap();
+        dev.ctx().synchronize().unwrap();
+        let mut out_host = vec![0u16; 2 * 8 * 256];
+        use owl_cuda::ffi::sys;
+        dev.ctx().bind_to_thread().unwrap();
+        unsafe {
+            sys::cuMemcpyDtoH_v2(
+                out_host.as_mut_ptr() as *mut std::ffi::c_void,
+                owl_iface::DevBuf::device_ptr(&d_out) as sys::CUdeviceptr,
+                out_host.len() * 2,
+            )
+            .result()
+            .unwrap();
+        }
+        for (i, &b) in out_host.iter().enumerate() {
+            let f = bf16_bits_to_f32(b);
+            assert!(f.is_finite(), "v1 bf16 h256 smoke: out[{i}] 非有限 {f}");
+        }
+    }
+
+    /// B1 验收四:v2 bf16 head 256 smoke(主核+reduce 编译链 + 有限值)。
+    #[test]
+    fn paged_attention_v2_bf16_h256_smoke() {
+        let dev = CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
+        let pool = dev
+            .create_pool(PoolConfig {
+                name: format!("k2bh256-{}", std::process::id()),
+                kind: PoolKind::Weights,
+                bytes: 16 << 20,
+            })
+            .unwrap();
+        const N: usize = 2 * 8 * 256;
+        let q: Vec<u16> =
+            (0..N).map(|i| f32_to_bf16_bits(((i % 7) as f32 - 3.0) * 0.25)).collect();
+        let kc: Vec<u16> =
+            (0..8 * 2 * 32 * 32 * 8).map(|i| f32_to_bf16_bits(((i % 5) as f32 - 2.0) * 0.2)).collect();
+        let vc: Vec<u16> =
+            (0..8 * 2 * 256 * 32).map(|i| f32_to_bf16_bits(((i % 9) as f32 - 4.0) * 0.2)).collect();
+        let bt = vec![0i32, 1];
+        let cl = vec![600i32, 300i32];
+        let d_q = dev.htod_persistent_in::<u16>(&pool, q).unwrap();
+        let d_kc = dev.htod_persistent_in::<u16>(&pool, kc).unwrap();
+        let d_vc = dev.htod_persistent_in::<u16>(&pool, vc).unwrap();
+        let d_bt = dev.htod_persistent_in::<i32>(&pool, bt).unwrap();
+        let d_cl = dev.htod_persistent_in::<i32>(&pool, cl).unwrap();
+        let d_out = dev.alloc_persistent_in::<u16>(&pool, N).unwrap();
+        let d_exp = dev.alloc_persistent_in::<f32>(&pool, 2 * 8 * 2).unwrap();
+        let d_ml = dev.alloc_persistent_in::<f32>(&pool, 2 * 8 * 2).unwrap();
+        let d_tmp = dev.alloc_persistent_in::<u16>(&pool, 2 * 8 * 2 * 256).unwrap();
+        let mut kern = PagedKernels::new(dev.ctx()).unwrap();
+        kern.paged_attention_v2(
+            dev.stream(), 1, 32, 256,
+            owl_iface::DevBuf::device_ptr(&d_out) as *mut u16,
+            owl_iface::DevBuf::device_ptr(&d_exp) as *mut f32,
+            owl_iface::DevBuf::device_ptr(&d_ml) as *mut f32,
+            owl_iface::DevBuf::device_ptr(&d_tmp) as *mut u16,
+            owl_iface::DevBuf::device_ptr(&d_q) as *const u16,
+            owl_iface::DevBuf::device_ptr(&d_kc) as *const u16,
+            owl_iface::DevBuf::device_ptr(&d_vc) as *const u16,
+            2, 1.0 / 256f32.sqrt(),
+            owl_iface::DevBuf::device_ptr(&d_bt) as *const i32,
+            owl_iface::DevBuf::device_ptr(&d_cl) as *const i32,
+            2, 8 * 256, 2 * 32 * 32 * 8, 32 * 256, 600, 2, 8,
+        )
+        .unwrap();
+        dev.ctx().synchronize().unwrap();
+        let mut out_host = vec![0u16; N];
+        use owl_cuda::ffi::sys;
+        dev.ctx().bind_to_thread().unwrap();
+        unsafe {
+            sys::cuMemcpyDtoH_v2(
+                out_host.as_mut_ptr() as *mut std::ffi::c_void,
+                owl_iface::DevBuf::device_ptr(&d_out) as sys::CUdeviceptr,
+                out_host.len() * 2,
+            )
+            .result()
+            .unwrap();
+        }
+        for (i, &b) in out_host.iter().enumerate() {
+            let f = bf16_bits_to_f32(b);
+            assert!(f.is_finite(), "v2 bf16 h256 smoke: out[{i}] 非有限 {f}");
         }
     }}
