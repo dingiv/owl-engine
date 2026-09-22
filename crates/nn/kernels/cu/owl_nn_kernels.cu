@@ -239,3 +239,45 @@ extern "C" __global__ void FN_NAME(                                    \
 }
 OWL_BCAST_F32(owl_add_bcast_f32, a[i] + b[o * b_mid * inner + (m % b_mid) * inner + c])
 OWL_BCAST_F32(owl_mul_bcast_f32, a[i] * b[o * b_mid * inner + (m % b_mid) * inner + c])
+
+// ---- P1:tile / repeat_interleave / rows-gather(owl 原创)----
+// 单维 tile:out[o, m, c] = src[o, m % d_size, c]
+// (m ∈ 0..d_size*tiles;dim0 → outer=1,last → inner=1,一核通吃)
+extern "C" __global__ void owl_tile_dim_f32(
+    const unsigned long long outer, const unsigned long long d_size,
+    const unsigned long long inner, const unsigned long long tiles,
+    const float *src, float *out) {
+    const unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned long long n = outer * d_size * tiles * inner;
+    if (i < n) {
+        const unsigned long long o = i / (d_size * tiles * inner);
+        const unsigned long long r = i % (d_size * tiles * inner);
+        const unsigned long long m = r / inner, c = r % inner;
+        out[i] = src[(o * d_size + (m % d_size)) * inner + c];
+    }
+}
+// 单维 repeat_interleave:out[o, m, c] = src[o, m / repeats, c]
+extern "C" __global__ void owl_rep_interleave_dim_f32(
+    const unsigned long long outer, const unsigned long long d_size,
+    const unsigned long long inner, const unsigned long long repeats,
+    const float *src, float *out) {
+    const unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned long long n = outer * d_size * repeats * inner;
+    if (i < n) {
+        const unsigned long long o = i / (d_size * repeats * inner);
+        const unsigned long long r = i % (d_size * repeats * inner);
+        const unsigned long long m = r / inner, c = r % inner;
+        out[i] = src[(o * d_size + (m / repeats)) * inner + c];
+    }
+}
+// rows-gather(dim0 index_select;idx 设备侧 U32):out[k,c] = src[idx[k],c]
+extern "C" __global__ void owl_rows_gather_f32(
+    const unsigned long long n_idx, const unsigned long long inner,
+    const float *src, const unsigned int *idx, float *out) {
+    const unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned long long n = n_idx * inner;
+    if (i < n) {
+        const unsigned long long k = i / inner, c = i % inner;
+        out[i] = src[(unsigned long long)idx[k] * inner + c];
+    }
+}

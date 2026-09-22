@@ -562,31 +562,29 @@ pub fn index_select(
     let mut out_shape = src.shape().to_vec();
     out_shape[dim] = n_idx;
     let out = ctx.scratch_tensor::<f32>(&out_shape)?;
-    ctx.trace_launch("gather");
+    ctx.trace_launch("index_select");
     ops.note_launch();
-    // 统一折算成扁平 gather:dim=0 → idx×inner;last → idx 直读
-    let flat_n = n_idx * inner;
     let stream = std::sync::Arc::clone(ctx.stream());
-    if dim == 0 {
-        // idx 增广 ×inner 的缩放 gather:每 idx 值拷 inner 元素 →
-        // 复用 gather 核 n=flat_n,idx 已在设备侧;host 侧不行——
-        // 需要设备侧乘法。改用 inner-行块 copy 循环(D2D,捕获安全):
-        let ri = idx.downcast::<u32>()?;
-        // 逐 index 行块拷贝(idx 在设备,host 无值;→ 用 gather 核处理
-        // 行内首个元素再整行拷贝会错位。一期约束:dim=0 走 gather 核
-        // 展开式[idx[i]*inner + j],需展平核。当前以 gather 核直发,
-        // 参数为展平索引张量,由调用方预先传入展平 idx(见 gather)。
-        let _ = ri;
-        return Err(BackendError::Init(
-            "index_select(dim=0): 请用 gather(展平索引)或等 rows-块核回填(P1 后续)".into(),
-        ));
-    }
     let rs = src.downcast::<f32>()?;
     let ri = idx.downcast::<u32>()?;
     let ro = out.device_ptr();
-    ops.kernels()
-        .gather_f32(&stream, flat_n, rs.device_ptr(), ri.device_ptr(), ro)
-        .map_err(BackendError::Init)?;
+    if dim == 0 {
+        // rows-gather:out[k,c] = src[idx[k],c](idx 设备侧,捕获安全)
+        let outer: usize = src.shape()[..dim].iter().product();
+        if outer != 1 {
+            return Err(BackendError::Init(
+                "index_select(dim=0): 一期仅 leading 维为 1 的行块gather".into(),
+            ));
+        }
+        ops.kernels()
+            .rows_gather_f32(&stream, n_idx as u64, inner as u64, rs.device_ptr(), ri.device_ptr(), ro)
+            .map_err(BackendError::Init)?;
+    } else {
+        let flat_n = n_idx * inner;
+        ops.kernels()
+            .gather_f32(&stream, flat_n, rs.device_ptr(), ri.device_ptr(), ro)
+            .map_err(BackendError::Init)?;
+    }
     for t in [src.token(), idx.token(), out.token()] {
         if let Some(t) = t {
             owl_signal::emit(t);
@@ -788,4 +786,232 @@ fn bcast(
         }
     }
     Ok(DynTensor::from_f32(&out))
+}
+
+// ============================================================================
+// R2:擦除面 → 裸指针 D2D(图边界 logits 直写通道)
+// ============================================================================
+
+/// src(DynTensor)前 `bytes` 字节 → 裸目标指针(流上 D2D,捕获安全)。
+/// dst 通常 = GraphPlan 租约绑定缓冲的 device_ptr(地址由租约钉住,
+/// 此处不 emit——租约在捕获期已登记);src 侧 token 正常 emit。
+pub fn copy_d2d_to_raw(
+    ctx: &KernelCtx,
+    src: &DynTensor<CudaDevice>,
+    dst: *mut core::ffi::c_void,
+    bytes: usize,
+) -> Result<(), BackendError> {
+    if bytes > src.len_bytes() {
+        return Err(BackendError::CopyFailed {
+            dir: "d2d-raw",
+            detail: format!("请求 {bytes} B > src 容量 {} B", src.len_bytes()),
+        });
+    }
+    ctx.trace_launch("copy_d2d_to_raw");
+    copy_d2d(ctx, dst, src.device_ptr() as *const core::ffi::c_void, bytes)?;
+    if let Some(t) = src.token() {
+        owl_signal::emit(t);
+    }
+    Ok(())
+}
+
+// ============================================================================
+// P1:repeat / repeat_interleave(单维核复合;S1 f32)
+// ============================================================================
+
+/// candle `Tensor::repeat` 语义:counts 逐维 tile(右对齐 pad 1;
+/// rank 超出 = 结构化报错)。多维 = 单维核逐维复合。
+pub fn repeat(
+    ops: &mut OpsCtx,
+    ctx: &KernelCtx,
+    src: &DynTensor<CudaDevice>,
+    counts: &[usize],
+) -> Result<DynTensor<CudaDevice>, BackendError> {
+    require_f32(src.dtype(), "repeat")?;
+    let rank = src.shape().len();
+    if counts.len() > rank {
+        return Err(BackendError::Init(format!(
+            "repeat: counts 维数 {} > src rank {rank}(candle 允许前补 1,一期不支持)",
+            counts.len()
+        )));
+    }
+    // 右对齐 pad 1
+    let mut cnt = vec![1usize; rank];
+    cnt[rank - counts.len()..].copy_from_slice(counts);
+    if cnt.iter().any(|&c| c == 0) {
+        return Err(BackendError::Init("repeat: counts 含 0(candle 同律)".into()));
+    }
+    let mut cur = src.clone(); // 视图共享,首维 tile 的读取源
+    for (d, &c) in cnt.iter().enumerate() {
+        if c == 1 {
+            continue;
+        }
+        let outer: usize = cur.shape()[..d].iter().product();
+        let d_size = cur.shape()[d];
+        let inner: usize = cur.shape()[d + 1..].iter().product();
+        let mut out_shape = cur.shape().to_vec();
+        out_shape[d] = d_size * c;
+        let out = ctx.scratch_tensor::<f32>(&out_shape)?;
+        ctx.trace_launch("owl_tile_dim_f32");
+        ops.note_launch();
+        let rs = cur.downcast::<f32>()?;
+        let ro = out.device_ptr();
+        ops.kernels()
+            .tile_dim_f32(
+                &std::sync::Arc::clone(ctx.stream()),
+                outer as u64,
+                d_size as u64,
+                inner as u64,
+                c as u64,
+                rs.device_ptr(),
+                ro,
+            )
+            .map_err(BackendError::Init)?;
+        for t in [src.token(), out.token()] {
+            if let Some(t) = t {
+                owl_signal::emit(t);
+            }
+        }
+        cur = DynTensor::from_f32(&out);
+    }
+    Ok(cur)
+}
+
+/// candle `Tensor::repeat_interleave(repeats, dim)` 语义(单维;
+/// 多维 = 逐维复合,同 repeat)。
+pub fn repeat_interleave(
+    ops: &mut OpsCtx,
+    ctx: &KernelCtx,
+    src: &DynTensor<CudaDevice>,
+    repeats: usize,
+    dim: usize,
+) -> Result<DynTensor<CudaDevice>, BackendError> {
+    require_f32(src.dtype(), "repeat_interleave")?;
+    let rank = src.shape().len();
+    if dim >= rank {
+        return Err(BackendError::Init(format!(
+            "repeat_interleave: dim {dim} 越界(rank={rank})"
+        )));
+    }
+    if repeats == 0 {
+        return Err(BackendError::Init("repeat_interleave: repeats=0".into()));
+    }
+    let outer: usize = src.shape()[..dim].iter().product();
+    let d_size = src.shape()[dim];
+    let inner: usize = src.shape()[dim + 1..].iter().product();
+    let mut out_shape = src.shape().to_vec();
+    out_shape[dim] = d_size * repeats;
+    let out = ctx.scratch_tensor::<f32>(&out_shape)?;
+    ctx.trace_launch("owl_rep_interleave_dim_f32");
+    ops.note_launch();
+    let rs = src.downcast::<f32>()?;
+    let ro = out.device_ptr();
+    ops.kernels()
+        .rep_interleave_dim_f32(
+            &std::sync::Arc::clone(ctx.stream()),
+            outer as u64,
+            d_size as u64,
+            inner as u64,
+            repeats as u64,
+            rs.device_ptr(),
+            ro,
+        )
+        .map_err(BackendError::Init)?;
+    for t in [src.token(), out.token()] {
+        if let Some(t) = t {
+            owl_signal::emit(t);
+        }
+    }
+    Ok(DynTensor::from_f32(&out))
+}
+
+#[cfg(test)]
+mod p1_r2_tests {
+    use super::*;
+    use crate::TensorPoolOps;
+    use owl_cuda::test_device_ordinal;
+    use owl_iface::{Device, PoolConfig, PoolKind};
+
+    fn setup() -> (OpsCtx, KernelCtx, CudaDevice, owl_cuda::CudaPool) {
+        let dev = CudaDevice::new(test_device_ordinal()).expect("需要 CUDA 设备");
+        let ops = OpsCtx::new_with_scratch(&dev, 1 << 20).unwrap();
+        let ctx = ops.ctx(owl_iface::MemPhase::Live);
+        let pool = dev
+            .create_pool(PoolConfig {
+                name: format!("p1-r2-t-{}", std::process::id()),
+                kind: PoolKind::Weights,
+                bytes: 8 << 20,
+            })
+            .unwrap();
+        (ops, ctx, dev, pool)
+    }
+
+    fn f32_tensor(
+        _dev: &CudaDevice,
+        pool: &owl_cuda::CudaPool,
+        shape: &[usize],
+        data: &[f32],
+    ) -> DynTensor<CudaDevice> {
+        let t = pool.from_vec_tensor::<f32>(shape, data.to_vec()).unwrap();
+        DynTensor::from_f32(&t)
+    }
+
+    #[test]
+    fn repeat_tiles_rows_and_cols() {
+        let (mut ops, ctx, _dev, pool) = setup();
+        let src = f32_tensor(&_dev, &pool, &[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        // dim0 tile ×2:[4,3]
+        let r0 = repeat(&mut ops, &ctx, &src, &[2, 1]).unwrap();
+        assert_eq!(r0.shape(), &[4, 3]);
+        let got = r0.typed_f32().unwrap().to_vec().unwrap();
+        assert_eq!(got, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        // last 维 tile ×3:[2,9]
+        let r1 = repeat(&mut ops, &ctx, &src, &[1, 3]).unwrap();
+        assert_eq!(r1.shape(), &[2, 9]);
+        let got = r1.typed_f32().unwrap().to_vec().unwrap();
+        assert_eq!(
+            got,
+            vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 4.0, 5.0, 6.0, 4.0, 5.0, 6.0]
+        );
+    }
+
+    #[test]
+    fn repeat_interleave_last_dim_matches_cpu() {
+        let (mut ops, ctx, _dev, pool) = setup();
+        let src = f32_tensor(&_dev, &pool, &[1, 4], &[10.0, 20.0, 30.0, 40.0]);
+        let out = repeat_interleave(&mut ops, &ctx, &src, 2, 1).unwrap();
+        assert_eq!(out.shape(), &[1, 8]);
+        let got = out.typed_f32().unwrap().to_vec().unwrap();
+        assert_eq!(got, vec![10.0, 10.0, 20.0, 20.0, 30.0, 30.0, 40.0, 40.0]);
+    }
+
+    #[test]
+    fn index_select_dim0_rows_gather() {
+        let (mut ops, ctx, _dev, pool) = setup();
+        let src = f32_tensor(&_dev, &pool, &[3, 2], &[1.0, 1.5, 2.0, 2.5, 3.0, 3.5]);
+        // idx 设备侧(U32;S4)
+        let idx_t = pool.from_vec_tensor::<u32>(&[2], vec![2, 0]).unwrap();
+        let idx = DynTensor::from_u32(&idx_t);
+        let out = index_select(&mut ops, &ctx, &src, 0, &idx).unwrap();
+        assert_eq!(out.shape(), &[2, 2]);
+        let got = out.typed_f32().unwrap().to_vec().unwrap();
+        assert_eq!(got, vec![3.0, 3.5, 1.0, 1.5]); // rows 2,0
+    }
+
+    #[test]
+    fn copy_d2d_to_raw_roundtrip() {
+        let (_ops, ctx, _dev, pool) = setup();
+        let src = f32_tensor(&_dev, &pool, &[4], &[7.0, 8.0, 9.0, 10.0]);
+        let dst_t = pool.from_vec_tensor::<f32>(&[4], vec![0.0; 4]).unwrap();
+        let dst = DynTensor::from_f32(&dst_t);
+        copy_d2d_to_raw(
+            &ctx,
+            &src,
+            dst.device_ptr() as *mut core::ffi::c_void,
+            4 * std::mem::size_of::<f32>(),
+        )
+        .unwrap();
+        let got = dst.typed_f32().unwrap().to_vec().unwrap();
+        assert_eq!(got, vec![7.0, 8.0, 9.0, 10.0]);
+    }
 }

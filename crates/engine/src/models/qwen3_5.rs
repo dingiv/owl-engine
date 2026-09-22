@@ -1105,7 +1105,14 @@ impl crate::graphplan::GraphForward for DecodeGraphAdapter {
                 "decode 图: logits 元素数 {logits_elems} != bs×vocab {expect}"
             )));
         }
-        let _ = view.logits_out;
-        unimplemented!("R2(nn): copy_d2d(logits → logits_out)回填;shape 校验已真实")
+        // R2 落地:logits scratch → bindings logits_out(流上 D2D,捕获安全;
+        // src token emit → 捕获期自动入图租约;dst 地址由 bindings 租约钉住)
+        owl_nn::erased::copy_d2d_to_raw(
+            ctx,
+            &logits,
+            view.logits_out as *mut core::ffi::c_void,
+            expect * std::mem::size_of::<f32>(),
+        )?;
+        Ok(())
     }
 }

@@ -71,6 +71,14 @@ pub enum CaptureOutcome {
 }
 
 impl GraphBindings {
+    /// R1:五字段句柄公开(捕获期租约由 CaptureSession 自动登记;runner
+    /// /adapter 需要跨步稳定地址时经此取用,禁存副本——句柄活性随图)。
+    pub fn frontier(&self) -> &DynTensor<owl_cuda::CudaDevice> { &self.frontier }
+    pub fn positions(&self) -> &DynTensor<owl_cuda::CudaDevice> { &self.positions }
+    pub fn slot_mapping(&self) -> &DynTensor<owl_cuda::CudaDevice> { &self.slot_mapping }
+    pub fn kv_lens(&self) -> &DynTensor<owl_cuda::CudaDevice> { &self.kv_lens }
+    pub fn logits_out(&self) -> &DynTensor<owl_cuda::CudaDevice> { &self.logits_out }
+
     /// P 阶段构造:五缓冲经 Weights 池工厂(租约常驻;A1.1 预算登记点)。
     pub fn new(dev: &CudaDevice, max_bs: usize, vocab: usize) -> Result<Self, Error> {
         let pool = dev

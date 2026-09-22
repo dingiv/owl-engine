@@ -19,4 +19,4 @@ pub mod gguf_helper;
 pub mod load_cache;
 pub mod load_stats;
 
-pub use alloc::{DeviceWeightAllocator, HostWeightAllocator, HostTensor, WeightAllocator};
+pub use alloc::{DeviceWeightAllocator, HostWeightAllocator, HostTensor, WeightAllocator, f32_vec_to_dtype_bytes};

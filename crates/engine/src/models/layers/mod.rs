@@ -463,46 +463,12 @@ pub struct VarBuilderX {
     pub is_gguf: bool,
     /// GGUF 内容句柄(全量元数据 + 分片解析;Arc 共享,pp 下钻零拷贝)
     gguf: Option<std::sync::Arc<crate::loader::gguf::GGufVarBuilder>>,
-    /// 装载目标池(P 阶段注入;None = Host 测试模式)
-    pool: Option<std::sync::Arc<owl_cuda::CudaPool>>,
+    /// R3 统一装载口(池由 allocator 持有;None = Host 测试模式)
+    alloc: Option<std::sync::Arc<crate::loader::DeviceWeightAllocator<owl_cuda::CudaPool>>>,
     /// 设备句柄(device() 查询面)
     device: Option<Device>,
 }
 
-/// f32 → bf16 位型(RNE 舍入;host 位操作,无算术面)
-fn f32_to_bf16_bits(v: f32) -> u16 {
-    let b = v.to_bits();
-    let lsb = (b >> 16) & 1;
-    ((b + 0x7fff + lsb) >> 16) as u16
-}
-
-/// f32 → f16 位型(IEEE 754 half,RNE;查表-free 位算法)
-fn f32_to_f16_bits(v: f32) -> u16 {
-    let b = v.to_bits();
-    let sign = ((b >> 16) & 0x8000) as u16;
-    let exp = ((b >> 23) & 0xff) as i32;
-    let man = b & 0x007f_ffff;
-    if exp == 0xff {
-        // inf/nan
-        return sign | 0x7c00 | if man != 0 { 0x0200 } else { 0 };
-    }
-    let e = exp - 127 + 15;
-    if e >= 0x1f {
-        return sign | 0x7c00; // overflow → inf
-    }
-    if e <= 0 {
-        // 次正规(右移含隐藏位)
-        if e < -10 {
-            return sign;
-        }
-        let m = ((man | 0x0080_0000) >> (14 - e + 1)) as u16;
-        let round = ((man >> (13 - e)) & 1) as u16;
-        return sign | (m + round);
-    }
-    let half = ((e as u16) << 10) | ((man >> 13) as u16);
-    let round = ((man >> 12) & 1) as u16;
-    sign | (half + round)
-}
 
 impl VarBuilderX {
     /// GGUF 打开(全量元数据;数据按需读取)。`model_pathes.filenames`
@@ -525,14 +491,16 @@ impl VarBuilderX {
             weight_paths: Some(model_pathes.filenames.clone()),
             is_gguf,
             gguf,
-            pool: None,
+            alloc: None,
             device: Some(device.clone()),
         })
     }
 
-    /// 注入装载目标池(P 阶段;裁决 5:分配入口在 Pool)。
+    /// 注入装载目标池(P 阶段;R3 统一装载口:内部持 DeviceWeightAllocator)。
     pub fn with_pool(mut self, pool: std::sync::Arc<owl_cuda::CudaPool>) -> Self {
-        self.pool = Some(pool);
+        self.alloc = Some(std::sync::Arc::new(
+            crate::loader::DeviceWeightAllocator::new(pool),
+        ));
         self
     }
 
@@ -543,7 +511,7 @@ impl VarBuilderX {
             weight_paths: None,
             is_gguf: true,
             gguf: Some(std::sync::Arc::new(vb)),
-            pool: None,
+            alloc: None,
             device: None,
         })
     }
@@ -575,7 +543,7 @@ impl VarBuilderX {
             weight_paths: self.weight_paths.clone(),
             is_gguf: self.is_gguf,
             gguf: self.gguf.clone(),
-            pool: self.pool.clone(),
+            alloc: self.alloc.clone(),
             device: self.device.clone(),
         }
     }
@@ -637,11 +605,11 @@ impl VarBuilderX {
             .ok_or_else(|| Error::Msg("VarBuilderX: 非 GGUF 路径(safetensors 通道 T3 回填)".into()))
     }
 
-    fn pool_ref(&self) -> Result<std::sync::Arc<owl_cuda::CudaPool>> {
-        self.pool
+    fn alloc_ref(&self) -> Result<std::sync::Arc<crate::loader::DeviceWeightAllocator<owl_cuda::CudaPool>>> {
+        self.alloc
             .clone()
             .ok_or_else(|| Error::Msg(
-                "VarBuilderX: 未注入装载池(Host 测试模式;设备 get 需 with_pool)".into(),
+                "VarBuilderX: 未注入装载 allocator(Host 测试模式;设备 get 需 with_pool)".into(),
             ))
     }
 
@@ -664,38 +632,29 @@ impl VarBuilderX {
         let mut owl_shape = raw.shape.clone();
         owl_shape.reverse();
 
-        // 反解到 f32(除 F32 直通)→ 目标 dtype 位型 → 池直连
-        let f32s = if raw.dtype == crate::loader::gguf::GgmlDType::F32 {
+        // R3 统一装载口:反解到 f32 → allocator 转目标 dtype 字节流 →
+        // materialize_dyn 落池(账本化)→ 擦除句柄
+        let f32s: Vec<f32> = if raw.dtype == crate::loader::gguf::GgmlDType::F32 {
             raw.raw
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect::<Vec<f32>>()
+                .collect()
         } else {
             crate::loader::gguf::dequantize_to_f32(raw.dtype, &raw.shape, &raw.raw)?
         };
-        let pool = self.pool_ref()?;
-        use owl_nn::TensorPoolOps;
-        match dtype {
-            DType::F32 => {
-                let t = pool.from_vec_tensor::<f32>(&owl_shape, f32s)?;
-                Ok(Tensor::from_f32(&t))
+        let alloc = self.alloc_ref()?;
+        let target = match dtype {
+            DType::F32 => DType::F32,
+            DType::BF16 => DType::BF16,
+            DType::F16 => DType::F16,
+            _ => {
+                return Err(Error::Msg(format!(
+                    "VarBuilderX: 目标 dtype {dtype} 权重装载未开(U8/U32/I64 经 kvcache/索引专用通道;F8 量化 = marlin-ffi 路线)"
+                )))
             }
-            DType::BF16 => {
-                let v: Vec<owl_nn::Bf16> =
-                    f32s.iter().map(|&f| owl_nn::Bf16(f32_to_bf16_bits(f))).collect();
-                let t = pool.from_vec_tensor::<owl_nn::Bf16>(&owl_shape, v)?;
-                Ok(Tensor::from_bf16(&t))
-            }
-            DType::F16 => {
-                let v: Vec<owl_nn::F16> =
-                    f32s.iter().map(|&f| owl_nn::F16(f32_to_f16_bits(f))).collect();
-                let t = pool.from_vec_tensor::<owl_nn::F16>(&owl_shape, v)?;
-                Ok(Tensor::from_f16(&t))
-            }
-            _ => Err(Error::Msg(format!(
-                "VarBuilderX: 目标 dtype {dtype} 权重装载未开(U8/U32/I64 经 kvcache/索引专用通道;F8 量化 = marlin-ffi 路线)"
-            ))),
-        }
+        };
+        let bytes = crate::loader::f32_vec_to_dtype_bytes(target, &f32s)?;
+        alloc.materialize_dyn(&owl_shape, target, &bytes)
     }
     pub fn get(&self, s: impl Into<Shape>, name: &str) -> Result<Tensor> {
         self.get_with_hints_dtype(s, name, Shard::default(), DType::F32)

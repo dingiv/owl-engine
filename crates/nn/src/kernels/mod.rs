@@ -4,6 +4,8 @@
 //! 设计约束(charter 裁决 3①):launch 参数只用标量与裸指针,
 //! 无运行时 htod 形状数组;contiguous-only。
 
+pub mod attention;
+
 use owl_cuda::ffi::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use owl_cuda::ffi::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use std::collections::HashSet;
@@ -287,6 +289,64 @@ impl Kernels {
         dst: *mut f32,
     ) -> Result<(), String> {
         self.launch_f32(stream, "owl_gather_f32", n, &[n as u64, src as u64, idx as u64, dst as u64])
+    }
+
+    /// tile 单维(任意 dim;dim0 → outer=1,last → inner=1)
+    pub fn tile_dim_f32(
+        &mut self,
+        stream: &CudaStream,
+        outer: u64,
+        d_size: u64,
+        inner: u64,
+        tiles: u64,
+        src: *const f32,
+        dst: *mut f32,
+    ) -> Result<(), String> {
+        let n = (outer * d_size * tiles * inner) as usize;
+        self.launch_f32(
+            stream,
+            "owl_tile_dim_f32",
+            n,
+            &[outer, d_size, inner, tiles, src as u64, dst as u64],
+        )
+    }
+
+    /// repeat_interleave 单维
+    pub fn rep_interleave_dim_f32(
+        &mut self,
+        stream: &CudaStream,
+        outer: u64,
+        d_size: u64,
+        inner: u64,
+        repeats: u64,
+        src: *const f32,
+        dst: *mut f32,
+    ) -> Result<(), String> {
+        let n = (outer * d_size * repeats * inner) as usize;
+        self.launch_f32(
+            stream,
+            "owl_rep_interleave_dim_f32",
+            n,
+            &[outer, d_size, inner, repeats, src as u64, dst as u64],
+        )
+    }
+
+    /// rows-gather(dim0 index_select;idx 设备侧 U32)
+    pub fn rows_gather_f32(
+        &mut self,
+        stream: &CudaStream,
+        n_idx: u64,
+        inner: u64,
+        src: *const f32,
+        idx: *const u32,
+        dst: *mut f32,
+    ) -> Result<(), String> {
+        self.launch_f32(
+            stream,
+            "owl_rows_gather_f32",
+            (n_idx * inner) as usize,
+            &[n_idx, inner, src as u64, idx as u64, dst as u64],
+        )
     }
 
     /// scatter_add:atomicAdd(&dst[idx[i]], src[i])
