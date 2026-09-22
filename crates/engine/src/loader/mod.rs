@@ -15,6 +15,7 @@
 
 pub mod alloc;
 pub mod gguf;
+pub mod safetensors;
 pub mod gguf_helper;
 pub mod load_cache;
 pub mod load_stats;
