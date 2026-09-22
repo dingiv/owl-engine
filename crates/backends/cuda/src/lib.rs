@@ -262,8 +262,7 @@ impl Pool for CudaPool {
     }
 
     fn malloc_scratch(&self, bytes: u64) -> Result<PoolBuf, BackendError> {
-        self.kind_check(PoolKind::Scratch)?;
-        Ok(PoolBuf::wrap(Box::new(self.malloc_inner(bytes)?)))
+        Ok(PoolBuf::wrap(Box::new(self.malloc_scratch_buf(bytes)?)))
     }
 
     fn malloc_persistent(&self, bytes: u64) -> Result<PoolBuf, BackendError> {
@@ -318,6 +317,18 @@ impl CudaPool {
             .map_err(|e| BackendError::Init(format!("granularity: {e:?}")))?;
             Ok(gran)
         }
+    }
+
+    /// 内部:持久域具体分配(语义校验 + Arc 租约缓冲)
+    pub(crate) fn malloc_persistent_buf(&self, bytes: u64) -> Result<CudaPoolBuf, BackendError> {
+        self.kind_check_any(&[PoolKind::Weights, PoolKind::KvCache, PoolKind::Workspace])?;
+        self.malloc_inner(bytes)
+    }
+
+    /// 内部:暂存域具体分配
+    pub(crate) fn malloc_scratch_buf(&self, bytes: u64) -> Result<CudaPoolBuf, BackendError> {
+        self.kind_check(PoolKind::Scratch)?;
+        self.malloc_inner(bytes)
     }
 
     /// 内部统一分配路径:校验链(kind 可选)→ 池账 → 全局账 → 物理 →
@@ -866,6 +877,102 @@ impl CudaDevice {
     }
 }
 
+// ---- GraphLease:捕获会话 + 定影后的图(A1.2 生命周期律代码化)----
+
+/// 捕获会话:lease 登记依赖缓冲(强租约 keepalive),
+/// `stream()` 供 kernel 直发,`end` 消费会话产出 [`DeviceGraph`]。
+pub struct CaptureSession {
+    stream: Arc<CudaStream>,
+    leases: Vec<BufToken>,
+    keepalive: Vec<CudaPoolBuf>,
+    gov: Arc<Governor>,
+}
+
+impl CudaDevice {
+    /// 开启捕获会话(GraphLease 入口)。
+    /// 会话自带一条 non-blocking 捕获流(legacy 流不可捕获,T4 判例)。
+    pub fn capture_session(&self) -> Result<CaptureSession, BackendError> {
+        let stream = self
+            .ctx
+            .new_stream()
+            .map_err(|e| BackendError::Init(format!("capture stream: {e:?}")))?;
+        Ok(CaptureSession {
+            stream,
+            leases: Vec::new(),
+            keepalive: Vec::new(),
+            gov: Arc::clone(&self.gov),
+        })
+    }
+}
+
+impl CaptureSession {
+    /// 登记依赖缓冲:令牌入租约表,Arc 克隆入 keepalive(强租约,
+    /// 用户侧句柄先 drop 也不会进入回收流程)。
+    pub fn lease<T: MemValue>(&mut self, t: &Persistent<T>) {
+        let (buf, token) = t.lease_parts();
+        if let Some(tok) = token {
+            self.leases.push(tok);
+        }
+        self.keepalive.push(buf);
+    }
+
+    /// 捕获用流(non-blocking;kernel 直发目标)
+    pub fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
+
+    /// 结束捕获:消费全部租约进 [`DeviceGraph`]。
+    pub fn end(
+        self,
+        flags: sys::CUgraphInstantiate_flags,
+    ) -> Result<DeviceGraph, BackendError> {
+        let graph = self
+            .stream
+            .end_capture(flags)
+            .map_err(|e| BackendError::Init(format!("end_capture: {e:?}")))?
+            .ok_or_else(|| {
+                BackendError::Init("捕获内容为空(图节点数为 0)".into())
+            })?;
+        Ok(DeviceGraph {
+            graph,
+            leases: self.leases,
+            keepalive: self.keepalive,
+            gov: self.gov,
+        })
+    }
+}
+
+/// 定影后的设备图:持有全部依赖租约,
+/// replay(debug 构建)前逐租约校验,失效 = 结构化报错而非 Xid 盲死。
+pub struct DeviceGraph {
+    graph: cudarc::driver::CudaGraph,
+    leases: Vec<BufToken>,
+    keepalive: Vec<CudaPoolBuf>,
+    gov: Arc<Governor>,
+}
+
+impl DeviceGraph {
+    pub fn upload(&self) -> Result<(), BackendError> {
+        self.graph
+            .upload()
+            .map_err(|e| BackendError::Init(format!("graph upload: {e:?}")))
+    }
+
+    pub fn launch(&self) -> Result<(), BackendError> {
+        #[cfg(debug_assertions)]
+        for t in &self.leases {
+            if !self.gov.validate(t) {
+                return Err(BackendError::LawViolation(
+                    "A1.2 图依赖令牌失效(replay 前校验;详见租约表)",
+                ));
+            }
+        }
+        self.graph
+            .launch()
+            .map_err(|e| BackendError::Init(format!("graph launch: {e:?}")))
+    }
+}
+
 // ---- Device / Backend 契约实现 ----
 
 impl Backend for CudaBackend {
@@ -916,15 +1023,21 @@ impl Backend for CudaBackend {
 pub struct CudaBackend;
 
 /// 持久域缓冲:P 阶段经池分配;drop 归账由 PoolBuf/CudaPoolBuf 负责。
+#[derive(Clone)]
 pub struct Persistent<T: MemValue> {
-    buf: Option<PoolBuf>,
+    buf: Option<CudaPoolBuf>,
     len: usize,
     token: Option<BufToken>,
     _marker: std::marker::PhantomData<fn() -> T>,
 }
 
 impl<T: MemValue> Persistent<T> {
-    fn new(buf: PoolBuf, len: usize) -> Self {
+    /// GraphLease:租约克隆(Arc +1)与令牌读取
+    pub(crate) fn lease_parts(&self) -> (CudaPoolBuf, Option<BufToken>) {
+        (self.buf.as_ref().expect("Persistent 未被 drop").clone(), self.token)
+    }
+
+    fn new(buf: CudaPoolBuf, len: usize) -> Self {
         let token = buf.token();
         Self {
             buf: Some(buf),
@@ -952,8 +1065,9 @@ impl<T: MemValue> DevBuf<T> for Persistent<T> {
 }
 
 /// 暂存域缓冲(允许 Capturing 相创建;归账同 Persistent)。
+#[derive(Clone)]
 pub struct Scratch<T: MemValue> {
-    buf: Option<PoolBuf>,
+    buf: Option<CudaPoolBuf>,
     len: usize,
     token: Option<BufToken>,
     _marker: std::marker::PhantomData<fn() -> T>,
@@ -1086,7 +1200,7 @@ impl Device for CudaDevice {
         len: usize,
     ) -> Result<Self::Persistent<T>, BackendError> {
         let bytes = (len * std::mem::size_of::<T>()) as u64;
-        let buf = pool.malloc_persistent(bytes)?;
+        let buf = pool.malloc_persistent_buf(bytes)?;
         self.gov.stats.lock().persistent_allocs += 1;
         Ok(Persistent::new(buf, len))
     }
@@ -1098,7 +1212,7 @@ impl Device for CudaDevice {
     ) -> Result<Self::Persistent<T>, BackendError> {
         let len = src.len();
         let bytes = (len * std::mem::size_of::<T>()) as u64;
-        let buf = pool.malloc_persistent(bytes)?;
+        let buf = pool.malloc_persistent_buf(bytes)?;
         // MemValue = Send + 'static 的 plain-old-data 按字节搬运;
         // VMM/Slice 两种背面都是连续设备内存,统一走裸指针拷贝
         let host_bytes =
@@ -1131,7 +1245,7 @@ impl Device for CudaDevice {
         len: usize,
     ) -> Result<Self::Scratch<T>, BackendError> {
         let bytes = (len * std::mem::size_of::<T>()) as u64;
-        let buf = pool.malloc_scratch(bytes)?;
+        let buf = pool.malloc_scratch_buf(bytes)?;
         self.gov.stats.lock().scratch_allocs += 1;
         let token = buf.token();
         Ok(Scratch {
@@ -1271,6 +1385,89 @@ mod tests {
         assert!(dev.ledger().bytes_alive < 1024 * 1024);
         let (free, _total) = dev.mem_get_info().unwrap();
         assert!(free > 0);
+    }
+
+    /// GraphLease 核心验收:图存活期用户 drop 依赖缓冲,
+    /// 强租约保证 replay 仍正确;图销毁后租约解,账本回基线。
+    #[test]
+    fn graph_lease_keeps_memory_alive_across_user_drop() {
+        let dev = CudaDevice::new(0).expect("需要 CUDA 设备");
+        let pool = dev
+            .create_pool(PoolConfig {
+                name: "lease-t".into(),
+                kind: PoolKind::Weights,
+                bytes: 1 << 20,
+            })
+            .unwrap();
+        let mut t = dev.alloc_persistent_in::<u8>(&pool, 4096).unwrap();
+        let token = t.token.unwrap();
+        let survivor = t.clone(); // 租约克隆(Graph keepalive 之外的第二证明)
+
+        // 先填 0xFF(legacy 流;必须在捕获开始前,姿势 9:捕获期禁碰 legacy)
+        unsafe {
+            sys::cuMemsetD8Async(
+                t.device_ptr() as sys::CUdeviceptr,
+                0xFF,
+                4096,
+                dev.ctx().default_stream().cu_stream(),
+            )
+            .result()
+            .unwrap();
+        }
+        dev.ctx().synchronize().unwrap();
+
+        // 捕获一个 memset(0) 节点,触碰缓冲地址
+        let mut session = dev.capture_session().unwrap();
+        session.lease(&t);
+        let stream = session.stream().clone();
+        stream
+            .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+            .unwrap();
+        unsafe {
+            sys::cuMemsetD8Async(
+                t.device_ptr() as sys::CUdeviceptr,
+                0,
+                4096,
+                stream.cu_stream(),
+            )
+            .result()
+            .unwrap();
+        }
+        let graph = session
+            .end(sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+            .unwrap();
+        graph.upload().unwrap();
+
+        // 图存活期:令牌有效(强租约)
+        assert!(dev.validate_token(&token));
+
+        // 用户侧先 drop(强租约:物理与身份都不动)
+        drop(t);
+        assert!(dev.validate_token(&token), "租约存活期令牌必须有效");
+
+        // replay:memset(0) 重放,依赖显存必然有效
+        graph.launch().unwrap();
+        dev.ctx().synchronize().unwrap();
+
+        // 读回:应为 0(replay 生效于幸存显存;survivor 租约克隆提供指针)
+        let mut host = [0xAAu8; 4096];
+        unsafe {
+            sys::cuMemcpyDtoH_v2(
+                host.as_mut_ptr() as *mut std::ffi::c_void,
+                survivor.device_ptr() as sys::CUdeviceptr,
+                4096,
+            )
+            .result()
+            .unwrap();
+        }
+        assert!(host.iter().all(|&b| b == 0), "replay 应把缓冲清零");
+
+        // 图销毁 → 租约解 → 身份注销;净空窗口归账,账本回基线
+        drop(graph);
+        drop(survivor);
+        assert!(!dev.validate_token(&token), "图销毁后令牌应注销");
+        dev.set_phase(MemPhase::Idle); // 净空窗口:延迟回收落地
+        assert_eq!(dev.ledger().bytes_alive, 0);
     }
 
     /// A2.8:VMM 分配(2MiB 粒度,可被对端 P2P 映射的唯一合法路径)
