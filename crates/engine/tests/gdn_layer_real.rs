@@ -1383,7 +1383,7 @@ fn layernorm_magnitude_probe() {
         let ms = row.iter().map(|v| v * v).sum::<f32>() / hidden as f32;
         let inv = 1.0 / (ms + eps).sqrt();
         for (i, &v) in row.iter().enumerate() {
-            let want = v * inv * w[i];
+            let want = v * inv * (w[i] + 1.0); // HF modeling_qwen3_5.rs:854 ×(1+weight)
             assert!((got[t * hidden + i] - want).abs() < 1e-4, "ln[{t},{i}] dev {} vs host {}", got[t * hidden + i], want);
         }
     }
