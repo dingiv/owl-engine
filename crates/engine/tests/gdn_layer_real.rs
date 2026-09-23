@@ -434,7 +434,7 @@ fn gdn_layer8_segment_bisection() {
     // ---- 断面① conv1d(真卷积权重)----
     let d_x = htod(&rig, qkv.clone());
     let d_w = htod(&rig, w.conv_w.clone());
-    let mut d_state = htod(&rig, vec![0f32; CONV_DIM * 3]);
+    let d_state = htod(&rig, vec![0f32; CONV_DIM * 3]);
     let d_cu = htod(&rig, vec![0u32, T as u32]);
     let d_out = htod(&rig, vec![0f32; T * CONV_DIM]);
     k.conv1d_fwd_k4(
@@ -519,7 +519,7 @@ fn gdn_layer8_segment_bisection() {
     }
 
     // ---- 断面④ 递推(逐 token,slot 0)----
-    let mut d_rec_state = htod(&rig, vec![0f32; NV * KD * VD]);
+    let d_rec_state = htod(&rig, vec![0f32; NV * KD * VD]);
     let d_slots = htod(&rig, vec![0u32]);
     let d_rec_out = htod(&rig, vec![0f32; VALUE_DIM]); // 核输出 [batch,nv,vd],逐 token 覆写
     let mut host_out_collect = vec![0f32; T * VALUE_DIM];
@@ -762,7 +762,7 @@ fn gdn_layer8_device_chain_bisection() {
     let ok1 = report("链① 投影 qkv vs host", &got_qkv, &qkv_host, 1e-2);
 
     // ② 设备 conv(设备投影输出)
-    let mut d_state = htod(&rig, vec![0f32; CONV_DIM * 3]);
+    let d_state = htod(&rig, vec![0f32; CONV_DIM * 3]);
     let d_w = htod(&rig, w.conv_w.clone());
     let d_cu = htod(&rig, vec![0u32, T as u32]);
     let d_cout = htod(&rig, vec![0f32; T * CONV_DIM]);
@@ -1141,7 +1141,7 @@ fn gdn_layer8_full_device_chain() {
 
     // conv(设备投影输入)
     let d_w = htod(&rig, w.conv_w.clone());
-    let mut d_state = htod(&rig, vec![0f32; CONV_DIM * 3]);
+    let d_state = htod(&rig, vec![0f32; CONV_DIM * 3]);
     let d_cu = htod(&rig, vec![0u32, T as u32]);
     let d_cout = htod(&rig, vec![0f32; T * CONV_DIM]);
     k.conv1d_fwd_k4(
@@ -1163,9 +1163,9 @@ fn gdn_layer8_full_device_chain() {
 
     // 切片(设备,host D2H 校验)
     let (qc_d, kc_d, vc_d) = host_slices_from_conv(&got_conv);
-    let a_h = dtoh_f32(&rig.dev, a_dev.device_ptr() as *const f32, T * NV);
-    let b_h = dtoh_f32(&rig.dev, b_dev.device_ptr() as *const f32, T * NV);
-    let z_h = dtoh_f32(&rig.dev, z_dev.device_ptr() as *const f32, T * VALUE_DIM);
+    let _a_h = dtoh_f32(&rig.dev, a_dev.device_ptr() as *const f32, T * NV);
+    let _b_h = dtoh_f32(&rig.dev, b_dev.device_ptr() as *const f32, T * NV);
+    let _z_h = dtoh_f32(&rig.dev, z_dev.device_ptr() as *const f32, T * VALUE_DIM);
     let d_al = htod(&rig, w.a_log.clone());
     let d_dtb = htod(&rig, w.dt_bias.clone());
     let d_g = htod(&rig, vec![0f32; T * NV]);
@@ -1182,7 +1182,7 @@ fn gdn_layer8_full_device_chain() {
     ).unwrap();
     rig.dev.ctx().synchronize().unwrap();
     let g_d = dtoh_f32(&rig.dev, d_g.device_ptr() as *const f32, T * NV);
-    let beta_d = dtoh_f32(&rig.dev, d_beta.device_ptr() as *const f32, T * NV);
+    let _beta_d = dtoh_f32(&rig.dev, d_beta.device_ptr() as *const f32, T * NV);
     if !report("D链 gating.g", &g_d, &seg("g"), 2e-2) {
         fails.push("D-gating".into());
     }
@@ -1206,7 +1206,7 @@ fn gdn_layer8_full_device_chain() {
         (T * NK) as i32, KD as i32, 1e-6,
     ).unwrap();
     rig.dev.ctx().synchronize().unwrap();
-    let mut st = htod(&rig, vec![0f32; NV * KD * VD]);
+    let st = htod(&rig, vec![0f32; NV * KD * VD]);
     let slots = htod(&rig, vec![0u32]);
     let mut rec_d: Vec<f32> = Vec::new();
     for t in 0..T {

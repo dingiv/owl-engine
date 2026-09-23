@@ -8,7 +8,6 @@ use owl_engine::models::layers::distributed::{Comm, TensorParallelRowLinear};
 use owl_engine::models::layers::{ctx_scope, VarBuilderX};
 use owl_nn::cublas::NnBlas;
 use owl_iface::{Device as _, PoolConfig, PoolKind};
-use std::rc::Rc;
 use std::sync::Arc;
 
 #[test]

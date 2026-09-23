@@ -35,7 +35,7 @@ fn kernels(rig: &Rig) -> GdnKernels {
 #[allow(clippy::too_many_arguments)]
 fn host_step(
     state: &mut [f32],
-    max_batch: usize,
+    _max_batch: usize,
     nv: usize,
     nk: usize,
     kd: usize,

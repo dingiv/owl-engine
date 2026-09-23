@@ -14,7 +14,6 @@ use owl_engine::models::layers::{ctx_scope, VarBuilderX};
 use owl_engine::models::qwen3_5::{InputMetadata, Qwen3_5ForCausalLM};
 use owl_nn::cublas::NnBlas;
 use owl_iface::{Device as _, PoolConfig, PoolKind};
-use std::rc::Rc;
 use std::sync::Arc;
 
 const MODEL_DIR: &str = "/home/div/Documents/codes/models/Qwen/Qwen3.5-0.8B";
