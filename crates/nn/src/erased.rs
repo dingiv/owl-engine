@@ -319,7 +319,7 @@ mod tests {
                 mm_want[r * 4 + c] = s + bias[r * 4 + c] as f64;
             }
         }
-        let got = out.typed_f32().unwrap().to_vec().unwrap();
+        let got = out.to_vec::<f32>().unwrap();
         for i in 0..16 {
             assert!(
                 (got[i] as f64 - mm_want[i]).abs() < 1e-3,
@@ -337,7 +337,7 @@ mod tests {
         let x: Vec<f32> = (0..8).map(|_| seed.next() * 3.0).collect();
         let dx = f32_tensor(&dev, &pool, &[2, 4], &x);
         let out = softmax_last_dim(&mut ops, &ctx, &dx).unwrap();
-        let got = out.typed_f32().unwrap().to_vec().unwrap();
+        let got = out.to_vec::<f32>().unwrap();
         for r in 0..2 {
             let s: f32 = got[r * 4..r * 4 + 4].iter().sum();
             assert!((s - 1.0).abs() < 1e-5, "row {r} sum {s}");
@@ -352,7 +352,7 @@ mod tests {
         let dx = f32_tensor(&dev, &pool, &[3, 2], &x);
         let dalpha = f32_tensor(&dev, &pool, &[2], &alpha);
         let out = rmsnorm(&mut ops, &ctx, &dx, &dalpha, 1e-5, false).unwrap();
-        let got = out.typed_f32().unwrap().to_vec().unwrap();
+        let got = out.to_vec::<f32>().unwrap();
         for r in 0..3 {
             let row = &x[r * 2..r * 2 + 2];
             let ms = row.iter().map(|v| v * v).sum::<f32>() / 2.0;
@@ -404,7 +404,7 @@ mod tests {
         let ones = f32_tensor(&dev, &pool, &[1, 4], &vec![1.0f32; 4]);
         let row1 = d.narrow_dim0(1, 1).unwrap(); // [1,4] = [4,5,6,7]
         let out = add(&mut ops, &ctx, &row1, &ones).unwrap();
-        let got = out.typed_f32().unwrap().to_vec().unwrap();
+        let got = out.to_vec::<f32>().unwrap();
         assert_eq!(got, vec![5.0, 6.0, 7.0, 8.0]);
     }
 }
@@ -975,12 +975,12 @@ mod p1_r2_tests {
         // dim0 tile ×2:[4,3]
         let r0 = repeat(&mut ops, &ctx, &src, &[2, 1]).unwrap();
         assert_eq!(r0.shape(), &[4, 3]);
-        let got = r0.typed_f32().unwrap().to_vec().unwrap();
+        let got = r0.to_vec::<f32>().unwrap();
         assert_eq!(got, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         // last 维 tile ×3:[2,9]
         let r1 = repeat(&mut ops, &ctx, &src, &[1, 3]).unwrap();
         assert_eq!(r1.shape(), &[2, 9]);
-        let got = r1.typed_f32().unwrap().to_vec().unwrap();
+        let got = r1.to_vec::<f32>().unwrap();
         assert_eq!(
             got,
             vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 4.0, 5.0, 6.0, 4.0, 5.0, 6.0]
@@ -993,7 +993,7 @@ mod p1_r2_tests {
         let src = f32_tensor(&_dev, &pool, &[1, 4], &[10.0, 20.0, 30.0, 40.0]);
         let out = repeat_interleave(&mut ops, &ctx, &src, 2, 1).unwrap();
         assert_eq!(out.shape(), &[1, 8]);
-        let got = out.typed_f32().unwrap().to_vec().unwrap();
+        let got = out.to_vec::<f32>().unwrap();
         assert_eq!(got, vec![10.0, 10.0, 20.0, 20.0, 30.0, 30.0, 40.0, 40.0]);
     }
 
@@ -1006,7 +1006,7 @@ mod p1_r2_tests {
         let idx = DynTensor::from_u32(&idx_t);
         let out = index_select(&mut ops, &ctx, &src, 0, &idx).unwrap();
         assert_eq!(out.shape(), &[2, 2]);
-        let got = out.typed_f32().unwrap().to_vec().unwrap();
+        let got = out.to_vec::<f32>().unwrap();
         assert_eq!(got, vec![3.0, 3.5, 1.0, 1.5]); // rows 2,0
     }
 
@@ -1023,7 +1023,7 @@ mod p1_r2_tests {
             4 * std::mem::size_of::<f32>(),
         )
         .unwrap();
-        let got = dst.typed_f32().unwrap().to_vec().unwrap();
+        let got = dst.to_vec::<f32>().unwrap();
         assert_eq!(got, vec![7.0, 8.0, 9.0, 10.0]);
     }
 }

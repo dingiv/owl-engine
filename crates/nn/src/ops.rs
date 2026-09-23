@@ -16,7 +16,8 @@
 //! 裁决 3①)+ T2 的 cuBLAS(`NnBlas`,workspace 预钉)。
 
 use crate::kernels::Kernels;
-use crate::tensor::Tensor;
+// 过渡:本文件仍消费强类型面;Phase 3 随 f32 签名迁移改 TensorRef
+use crate::tensor::TypedTensor as Tensor;
 use crate::{CaptureSafe, KernelCtx};
 use owl_iface::BackendError;
 use std::sync::Arc;
@@ -391,7 +392,7 @@ impl OpsCtx {
 mod tests {
     use super::*;
     use crate::cublas::NnBlas;
-    use crate::tensor::{Tensor, TensorPoolOps};
+    use crate::tensor::TensorPoolOps;
     use owl_cuda::CudaDevice;
     use owl_iface::{Device, PoolConfig, PoolKind};
 
@@ -534,8 +535,8 @@ mod tests {
                 bytes: 4096,
             })
             .unwrap();
-        let r: Result<Tensor<f32, CudaDevice>, _> =
-            <_ as crate::tensor::TensorPoolOps>::zeros_tensor::<f32>(&pool, &[4096]); // 16KiB > 4KiB
+        
+        let r = pool.zeros_tensor::<f32>(&[4096]); // 16KiB > 4KiB(池容量)
         assert!(matches!(r, Err(BackendError::PoolExhausted { .. })));
     }
     /// 哨兵①:捕获痕迹(launch 序列 + 触碰令牌;小链)

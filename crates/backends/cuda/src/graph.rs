@@ -12,7 +12,7 @@
 
 use super::audit::{audit_graph, AuditReport};
 use super::governor::Governor;
-use super::pool::PoolBufInner;
+use super::pool::{CudaPoolBuf, PoolBufInner};
 use crate::buffers::{Persistent, Scratch};
 use crate::ffi::{sys, graph_destroy, graph_exec_destroy, graph_instantiate, graph_launch, stream_end_capture};
 use cudarc::driver::CudaStream;
@@ -41,6 +41,15 @@ impl CaptureSession {
     /// 用户侧句柄先 drop 也不回收)。
     pub fn lease<T: MemValue>(&mut self, t: &Persistent<T>) {
         let (buf, token) = t.lease_parts();
+        self.lease_buf_parts(buf, token);
+    }
+
+    /// 块租约入口(合并 Tensor 的保活形态;哨兵①语义同 lease)
+    pub fn lease_block(&mut self, b: &CudaPoolBuf) {
+        self.lease_buf_parts(b.clone(), Some(b.token()));
+    }
+
+    fn lease_buf_parts(&mut self, buf: CudaPoolBuf, token: Option<BufToken>) {
         if let Some(tok) = token {
             if !self.leases.iter().any(|l| l.id == tok.id) {
                 self.leases.push(tok);

@@ -3,7 +3,7 @@
 //! 依赖 candle Tensor 与 image crate,随 T3 模型搬运(VL 模型)时再议。
 
 use owl_iface::{Device, Pool};
-use owl_nn::tensor::{Tensor, TensorPoolOps};
+use owl_nn::tensor::{TypedTensor as Tensor, TensorPoolOps}; // 过渡:Phase 3 迁移合并 Tensor
 use serde::{Deserialize, Serialize};
 
 /// 已切片的图像 token 数据(多模态路径的引擎内表示)。

@@ -281,26 +281,71 @@ pub trait Pool: Send + Sync {
     /// 注意:VMM 背面**不清零**,调用方负责 memset 或整块覆盖。
     fn malloc_peer_shared(&self, bytes: u64) -> Result<PoolBuf, BackendError>;
 
-    // ---- 类型化分配入口(2026-09-23 用户裁决:分配只经池,Device 不分担)----
+    // ---- 字节域第一公民(2026-09-23 tensor 合并裁决:池块本就无类型,
+    // 字节分配是真原语;类型化只是字节面上的视图标注)----
+
+    /// 持久字节分配(清零)。任何相位合法。
+    fn alloc_bytes_persistent(
+        &self,
+        n_bytes: usize,
+    ) -> Result<<Self::Dev as Device>::Bytes, BackendError>;
+
+    /// host → device 持久字节写入(权重装载路径),计入本池。
+    /// 流序纪律(P0-3):必须走池流 async + sync,禁止 NULL 流同步拷贝。
+    fn htod_bytes_persistent(
+        &self,
+        src: &[u8],
+    ) -> Result<<Self::Dev as Device>::Bytes, BackendError>;
+
+    /// 暂存字节分配(清零)。允许 Capturing 相(捕获安全分配)。
+    fn alloc_bytes_scratch(
+        &self,
+        n_bytes: usize,
+    ) -> Result<<Self::Dev as Device>::Bytes, BackendError>;
+
+    // ---- 类型化分配入口(2026-09-23 用户裁决:分配只经池,Device 不分担;
+    // 默认转发 = 字节面 + 类型视图标注,存量调用点零改动)----
 
     /// 从本池做持久分配(清零)。任何相位合法。
     /// 校验顺序:池余量(A5.4)→ 全局预算(A5.4)→ 分配。
     fn alloc_persistent_in<T: MemValue>(
         &self,
         len: usize,
-    ) -> Result<<Self::Dev as Device>::Persistent<T>, BackendError>;
+    ) -> Result<<Self::Dev as Device>::Persistent<T>, BackendError> {
+        let n_bytes = len
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| BackendError::Init("alloc_persistent_in: len × size_of::<T> 溢出".into()))?;
+        let bytes = self.alloc_bytes_persistent(n_bytes)?;
+        Ok(self.device().cast_persistent::<T>(bytes, len))
+    }
 
     /// host → device 持久写入(权重装载路径),计入本池。
     fn htod_persistent_in<T: MemValue>(
         &self,
         src: Vec<T>,
-    ) -> Result<<Self::Dev as Device>::Persistent<T>, BackendError>;
+    ) -> Result<<Self::Dev as Device>::Persistent<T>, BackendError> {
+        let len = src.len();
+        let n_bytes = len
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| BackendError::Init("htod_persistent_in: len × size_of::<T> 溢出".into()))?;
+        // MemValue = plain-old-data,按字节搬运(host 侧视图,无别名风险)
+        let host_bytes =
+            unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u8, n_bytes) };
+        let buf = self.htod_bytes_persistent(host_bytes)?;
+        Ok(self.device().cast_persistent::<T>(buf, len))
+    }
 
     /// 从本池做暂存分配。允许 Capturing 相(捕获安全分配)。
     fn alloc_scratch_in<T: MemValue>(
         &self,
         len: usize,
-    ) -> Result<<Self::Dev as Device>::Scratch<T>, BackendError>;
+    ) -> Result<<Self::Dev as Device>::Scratch<T>, BackendError> {
+        let n_bytes = len
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| BackendError::Init("alloc_scratch_in: len × size_of::<T> 溢出".into()))?;
+        let bytes = self.alloc_bytes_scratch(n_bytes)?;
+        Ok(self.device().cast_scratch::<T>(bytes, len))
+    }
 }
 
 /// 设备实例:一张具体卡。账本 + 池组 + 相位机的唯一宿主(设备隔离律)。
@@ -319,6 +364,8 @@ pub trait Device: Clone + Send + Sync + 'static {
     type Remote<T: MemValue>: DevBuf<T>;
     /// 池对象类型
     type Pool: Pool;
+    /// 裸池块(u8 字节面;dtype 运行时字段化后合并 Tensor 的存储形态)
+    type Bytes: DevBuf<u8> + OpaqueDevBuf + Clone;
 
     /// 本实例绑定的卡(设备隔离律:Device : 卡 = 1:1)
     fn desc(&self) -> &DeviceDesc;
@@ -366,4 +413,17 @@ pub trait Device: Clone + Send + Sync + 'static {
 
     /// 按 id 取回池对象(重拿句柄用;正常路径持有 create_pool 的返回值)
     fn pool(&self, id: PoolId) -> Result<Self::Pool, BackendError>;
+    // ---- 类型视图(零成本换标;不分配不动账,归 Device 所有)----
+
+    /// 字节域缓冲 → T 域类型视图。零成本:纯类型面换标,账本与物理
+    /// 均不动。调用方保证 n_bytes = len × size_of::<T>()(设备对齐由
+    /// 池分配的整块边界保证)。
+    fn cast_persistent<T: MemValue>(
+        &self,
+        b: Self::Bytes,
+        len: usize,
+    ) -> Self::Persistent<T>;
+
+    /// 同 [`Device::cast_persistent`](暂存域)。
+    fn cast_scratch<T: MemValue>(&self, b: Self::Bytes, len: usize) -> Self::Scratch<T>;
 }

@@ -10,16 +10,18 @@
 
 pub mod cublas;
 pub mod erased;
-pub mod dyn_tensor;
 pub mod dtype;
 pub mod kernels;
 pub mod ops;
 pub mod tensor;
 
 pub use dtype::{Bf16, Dtype, F16, IndexScalar, Scalar};
-pub use dyn_tensor::DynTensor;
 pub use ops::OpsCtx;
-pub use tensor::TensorPoolOps;
+pub use tensor::{ShapeLike, Tensor, TensorPoolOps, TensorRef, TypedTensor};
+
+/// 过渡别名:旧名 DynTensor = 合并后的 Tensor(Phase 4 收尾时标注
+/// deprecated 并随调用点清零删除)
+pub use tensor::Tensor as DynTensor;
 
 use owl_iface::{BackendError, BufToken, MemPhase};
 use std::collections::BTreeSet;
@@ -161,10 +163,11 @@ impl KernelCtx {
 
     /// S6:中间张量分配唯一入口(Live/Capturing 合法;Persistent 不经此口)。
     /// 捕获期创建 → token 自动 emit → 图租约钉住,生命周期 = 本次 forward。
+    // Phase 2 过渡:仍返回强类型面(Phase 3 随调用点迁移改合并 Tensor)
     pub fn scratch_tensor<T: crate::dtype::Scalar>(
         &self,
         shape: &[usize],
-    ) -> Result<crate::tensor::Tensor<T, owl_cuda::CudaDevice>, BackendError> {
+    ) -> Result<crate::tensor::TypedTensor<T, owl_cuda::CudaDevice>, BackendError> {
         let pool = self.scratch.as_ref().ok_or_else(|| {
             BackendError::Init("KernelCtx 无 scratch 池(经 OpsCtx::new_with_scratch 构造)".into())
         })?;

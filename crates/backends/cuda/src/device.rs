@@ -8,7 +8,7 @@ pub const DEFAULT_POOL_BYTES: u64 = 4 << 30;
 use super::buffers::{Persistent, RemoteBuf, Scratch, VmmBuf};
 use super::governor::{Budget, Governor, LedgerSnapshot};
 use super::graph::CaptureSession;
-use super::pool::{CudaPool, Ledger};
+use super::pool::{CudaPool, CudaPoolBuf, Ledger};
 use cudarc::driver::{CudaContext, CudaStream, result, sys};
 use owl_iface::{
     Arch, Backend, BackendError, BackendFamily, BufToken, Device, DeviceDesc, MemPhase,
@@ -522,6 +522,8 @@ impl Device for CudaDevice {
     type Scratch<T: MemValue> = Scratch<T>;
     type Remote<T: MemValue> = RemoteBuf<T>;
     type Pool = CudaPool;
+    /// 裸池块(u8 字节面)
+    type Bytes = CudaPoolBuf;
 
     fn desc(&self) -> &DeviceDesc {
         &self.desc
@@ -580,6 +582,16 @@ impl Device for CudaDevice {
         let pools = self.inner.pools.lock();
         let p = pools.get(&id.0).ok_or(BackendError::UnknownPool(id.0))?;
         Ok((**p).clone())
+    }
+
+    // ---- 类型视图(零成本换标;不分配不动账)----
+
+    fn cast_persistent<T: MemValue>(&self, b: CudaPoolBuf, len: usize) -> Self::Persistent<T> {
+        crate::buffers::Persistent::from_block(b, len)
+    }
+
+    fn cast_scratch<T: MemValue>(&self, b: CudaPoolBuf, len: usize) -> Self::Scratch<T> {
+        crate::buffers::Scratch::from_block(b, len)
     }
 
 }
