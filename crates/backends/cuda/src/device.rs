@@ -131,6 +131,47 @@ impl CudaDevice {
         Ok(())
     }
 
+    /// 流序 H2D(字节级;泛型 T 位型调用点统一入口)
+    pub fn memcpy_htod_bytes(
+        &self,
+        stream: &Arc<CudaStream>,
+        dst: *mut u8,
+        src: &[u8],
+    ) -> Result<(), String> {
+        self.ctx.bind_to_thread().map_err(|e| format!("{e:?}"))?;
+        unsafe {
+            sys::cuMemcpyHtoDAsync_v2(
+                dst as sys::CUdeviceptr,
+                src.as_ptr() as *const _,
+                src.len(),
+                stream.cu_stream(),
+            )
+        }
+        .result()
+        .map_err(|e| format!("htod_async: {e:?}"))
+    }
+
+    /// 流序 D2H(字节级;泛型 T 位型调用点统一入口)。返回时 host 可读。
+    pub fn memcpy_dtoh_bytes(
+        &self,
+        stream: &Arc<CudaStream>,
+        src: *const u8,
+        out: &mut [u8],
+    ) -> Result<(), String> {
+        self.ctx.bind_to_thread().map_err(|e| format!("{e:?}"))?;
+        unsafe {
+            sys::cuMemcpyDtoHAsync_v2(
+                out.as_mut_ptr() as *mut _,
+                src as sys::CUdeviceptr,
+                out.len(),
+                stream.cu_stream(),
+            )
+        }
+        .result()
+        .map_err(|e| format!("dtoh_async: {e:?}"))?;
+        stream.synchronize().map_err(|e| format!("stream sync: {e:?}"))
+    }
+
     /// 姿势 6(warmup 门禁):记一次 kernel 发射(算子层/cublas 每次发射调用)
     pub fn note_launch(&self) {
         self.gov.note_launch();

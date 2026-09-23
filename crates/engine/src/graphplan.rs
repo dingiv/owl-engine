@@ -159,27 +159,12 @@ fn write_u32(dev: &CudaDevice, dst: *mut u32, src: &[u32], cap: usize) -> Result
     if src.len() > cap {
         crate::bail!("bindings 写入越界: {} > 容量 {cap}", src.len());
     }
-    dev.ctx()
-        .bind_to_thread()
-        .map_err(|e| Error::Msg(format!("bind_to_thread: {e:?}")))?;
-    use owl_cuda::ffi::sys;
-    let bytes = src.len() * 4;
-    if bytes == 0 {
-        return Ok(());
-    }
-    // 安全:dst 为本设备池缓冲基址(租约常驻),长度经上面越界检查
-    unsafe {
-        sys::cuMemcpyHtoD_v2(
-            dst as sys::CUdeviceptr,
-            src.as_ptr() as *const core::ffi::c_void,
-            bytes,
-        )
-        .result()
+    // P0-3:流序 H2D(memx;EagerOnly 路径)
+    dev.memcpy_htod_u32(dev.stream(), dst, src)
         .map_err(|e| Error::Backend(owl_iface::BackendError::CopyFailed {
             dir: "htod",
-            detail: format!("bindings H2D: {e:?}"),
+            detail: format!("bindings H2D: {e}"),
         }))?;
-    }
     Ok(())
 }
 

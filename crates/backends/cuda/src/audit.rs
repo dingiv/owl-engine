@@ -32,6 +32,9 @@ pub struct AuditReport {
     /// 像设备地址但未被任何池区间登记 = 逃逸嫌疑(警告,非违约:
     /// 大标量/对齐填充也可能落在该区间)
     pub suspicious: BTreeSet<u64>,
+    /// 显式豁免集(P0-2:哨兵③ 拒绝建图的白名单;暂空,按需填)。
+    /// 语义:命中 suspicious 但在 allowlist 中的指针不拦截。
+    pub allowlist: BTreeSet<u64>,
 }
 
 impl AuditReport {

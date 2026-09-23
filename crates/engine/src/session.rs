@@ -435,19 +435,14 @@ impl Session {
             .ctx()
             .synchronize()
             .map_err(|e| Error::Msg(format!("sync: {e:?}")))?;
-        use owl_cuda::ffi::sys;
-        self.dev.ctx().bind_to_thread().map_err(|e| Error::Msg(format!("{e:?}")))?;
         let n = slot.tensor.shape().iter().product::<usize>();
         let mut out = vec![0f32; n];
-        unsafe {
-            sys::cuMemcpyDtoH_v2(
-                out.as_mut_ptr() as *mut std::ffi::c_void,
-                slot.tensor.device_ptr() as sys::CUdeviceptr,
-                n * 4,
-            )
-            .result()
-            .map_err(|e| Error::Msg(format!("dtoh: {e:?}")))?;
-        }
+        // P0-3:流序 D2H(memx;与在飞 kernel 有序 + 返回可读)
+        self.dev.memcpy_dtoh_f32(
+            self.dev.stream(),
+            slot.tensor.device_ptr() as *const f32,
+            &mut out,
+        ).map_err(|e| Error::Msg(format!("dtoh: {e}")))?;
         Ok(out)
     }
 
@@ -477,17 +472,8 @@ fn data_len(inputs: &[(&str, Vec<u32>)]) -> usize {
 
 
 fn write_u32(dev: &CudaDevice, dst: *mut u32, src: &[u32], n: usize) -> Result<(), Error> {
-    use owl_cuda::ffi::sys;
-    dev.ctx().bind_to_thread().map_err(|e| Error::Msg(format!("{e:?}")))?;
-    unsafe {
-        sys::cuMemcpyHtoD_v2(
-            dst as sys::CUdeviceptr,
-            src.as_ptr() as *const std::ffi::c_void,
-            n * 4,
-        )
-        .result()
-        .map_err(|e| Error::Msg(format!("h2d: {e:?}")))?;
-    }
-    Ok(())
+    // P0-3:流序 H2D(memx)
+    dev.memcpy_htod_u32(dev.stream(), dst, &src[..n])
+        .map_err(|e| Error::Msg(format!("h2d: {e}")))
 }
 

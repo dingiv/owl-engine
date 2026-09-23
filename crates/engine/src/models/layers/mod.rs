@@ -583,23 +583,17 @@ impl OwlTensor for Tensor {
         // dry-run 数值转换:仅 U32→F32;构造期 = P 阶段,host 往返合法
         if self.dtype() == DType::U32 && dtype == DType::F32 {
             let dev = ctx_scope::with_device();
-            use owl_cuda::ffi::sys;
-            dev.ctx().bind_to_thread().map_err(|e| {
-                Error::from(BackendError::Init(format!("bind_to_thread: {e:?}")))
-            })?;
             let n = self.len_bytes() / 4;
             let mut host = vec![0u32; n];
-            unsafe {
-                sys::cuMemcpyDtoH_v2(
-                    host.as_mut_ptr() as *mut std::ffi::c_void,
-                    self.device_ptr() as sys::CUdeviceptr,
-                    n * 4,
-                )
-                .result()
-                .map_err(|e| {
-                    Error::from(BackendError::CopyFailed { dir: "dtoh", detail: format!("{e:?}") })
-                })?;
-            }
+            // P0-3:流序 D2H(memx)
+            dev.memcpy_dtoh_u32(
+                dev.stream(),
+                self.device_ptr() as *const u32,
+                &mut host,
+            )
+            .map_err(|e| {
+                Error::from(BackendError::CopyFailed { dir: "dtoh", detail: format!("{e:?}") })
+            })?;
             let conv: Vec<f32> = host.iter().map(|&b| b as f32).collect();
             let pool = ctx_scope::weights_pool();
             let t = owl_nn::TensorPoolOps::from_vec_tensor(pool.as_ref(), &[n], conv)?;
@@ -1792,19 +1786,11 @@ pub mod vendor {
             )));
         }
         let dev = ctx_scope::with_device();
-        let _ = dev.ctx().bind_to_thread();
         let n = t.len_bytes() / 4;
         let mut host = vec![0u32; n];
-        use owl_cuda::ffi::sys;
-        unsafe {
-            sys::cuMemcpyDtoH_v2(
-                host.as_mut_ptr() as *mut std::ffi::c_void,
-                t.device_ptr() as sys::CUdeviceptr,
-                n * 4,
-            )
-            .result()
-            .map_err(|e| Error::Msg(format!("dtoh slots: {e:?}")))?;
-        }
+        // P0-3:流序 D2H(memx)
+        dev.memcpy_dtoh_u32(dev.stream(), t.device_ptr() as *const u32, &mut host)
+            .map_err(|e| Error::Msg(format!("dtoh slots: {e}")))?;
         Ok(host)
     }
 

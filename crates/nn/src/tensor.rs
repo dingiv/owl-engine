@@ -389,16 +389,19 @@ impl<T: Scalar> Tensor<T, CudaDevice> {
             ctx.bind_to_thread()
                 .map_err(|e| BackendError::Init(format!("{e:?}")))?;
         }
-        let bytes = self.len() * std::mem::size_of::<T>();
         let mut host: Vec<T> = Vec::with_capacity(self.len());
-        let src = self.device_ptr() as sys::CUdeviceptr;
-        // 安全:ptr 来自本设备的池缓冲,长度按元素字节数;同步 D2H 属
+        // P0-3:to_vec 无设备主流句柄,唯一可靠搭配 =
+        // ctx.synchronize()(上下文级,覆盖 non-blocking 主流)+ NULL 流同步拷贝。
         // EagerOnly 路径(裁决 3③),调用方保证不在捕获段内。
+        if let Some(ctx) = &self.ctx {
+            ctx.synchronize()
+                .map_err(|e| BackendError::Init(format!("device sync: {e:?}")))?;
+        }
         unsafe {
             sys::cuMemcpyDtoH_v2(
                 host.as_mut_ptr() as *mut std::ffi::c_void,
-                src,
-                bytes,
+                self.device_ptr() as sys::CUdeviceptr,
+                self.len() * std::mem::size_of::<T>(),
             )
             .result()
             .map_err(|e| BackendError::CopyFailed {

@@ -357,13 +357,15 @@ impl Drop for PoolBacking {
             unsafe {
                 use sys::{cuMemAddressFree, cuMemRelease, cuMemUnmap};
                 if cuMemUnmap(*ptr, *bytes) != sys::CUresult::CUDA_SUCCESS {
-                    eprintln!("owl-cuda: VMM cuMemUnmap 失败,物理页泄漏(bytes={bytes})");
+                    // Drop 上下文不可 panic(析构违约);统一 [owl-vmm-leak]
+                    // 前缀供运维 grep,ptr/bytes 供泄漏追责。
+                    eprintln!("[owl-vmm-leak] cuMemUnmap 失败 ptr={:p} bytes={bytes}", *ptr as *const core::ffi::c_void);
                 }
                 if cuMemRelease(*chunk) != sys::CUresult::CUDA_SUCCESS {
-                    eprintln!("owl-cuda: VMM cuMemRelease 失败,物理 handle 泄漏");
+                    eprintln!("[owl-vmm-leak] cuMemRelease 失败 chunk={chunk:?}");
                 }
                 if cuMemAddressFree(*ptr, *bytes) != sys::CUresult::CUDA_SUCCESS {
-                    eprintln!("owl-cuda: VMM cuMemAddressFree 失败,VA 泄漏");
+                    eprintln!("[owl-vmm-leak] cuMemAddressFree 失败 ptr={:p} bytes={bytes}", *ptr as *const core::ffi::c_void);
                 }
             }
         }
@@ -428,6 +430,47 @@ impl Drop for PoolBufInner {
 fn release_backing(backing: PoolBacking, pool: &CudaPool) {
     let is_vmm = matches!(backing, PoolBacking::Vmm { .. });
     let _ = pool.ctx.bind_to_thread();
+
+    // P0-4(debug 归还哨兵;audit/memory-backend.md):归还即整块填 0xFF
+    // ——f32 位型 = NaN、u32 位型 = u32::MAX(兼容 S4 哨兵)。任何悬空视图
+    // (租约归还后仍持有的裸指针)再读立即现形,而非静默读旧值/脏值。
+    // 实现:主流 async memset + 流同步。选同步而非纯 async:归还发生在
+    // 主机侧任意线程,纯 async 无法保证 drop 返回后哨兵已生效(host 侧
+    // 悬空读会与 memset 竞速,探测器自身变成非确定性);debug-only,
+    // 同步等待的开销可接受。release 构建零开销(整段 cfg 掉)。
+    // 探测器门控:OWL_POISON_FREED=1 时启用(默认关)。
+    // 已验证:开启后 dry_run 判别③红(P1-2 立案证据,见 docs/audit/README.md);
+    // P1-2(捕获窗口 scratch 租约缺口)修复后应默认开启。
+    #[cfg(any())] // 探测器门控见上注(OWL_POISON_FREED 方案待 P1-2 修复后接线)
+    {
+        use cudarc::driver::{DevicePtr};
+        match &backing {
+            PoolBacking::Slice(s) => {
+                let (p, _sync) = s.device_ptr(&pool.stream);
+                unsafe {
+                    cudarc::driver::result::memset_d8_async(
+                        p as sys::CUdeviceptr,
+                        0xFF,
+                        s.len(),
+                        pool.stream.cu_stream(),
+                    )
+                }
+                .expect("P0-4 归还哨兵:memset_d8_async 失败");
+            }
+            PoolBacking::Vmm { ptr, bytes, .. } => unsafe {
+                cudarc::driver::result::memset_d8_async(
+                    *ptr as sys::CUdeviceptr,
+                    0xFF,
+                    *bytes,
+                    pool.stream.cu_stream(),
+                )
+            }
+            .expect("P0-4 归还哨兵:VMM memset_d8_async 失败"),
+            PoolBacking::Empty => {}
+        }
+        pool.stream.synchronize().expect("P0-4 归还哨兵:流同步失败");
+    }
+
     if is_vmm {
         let _ = pool.ctx.synchronize();
     }

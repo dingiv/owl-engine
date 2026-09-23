@@ -1559,20 +1559,11 @@ mod tests {
     }
 
     fn dtoh_f32(dev: &Dev, t: &Tensor) -> Vec<f32> {
-        use owl_cuda::ffi::sys;
-        dev.ctx().bind_to_thread().unwrap();
-        dev.ctx().synchronize().unwrap();
         let n = t.shape().iter().product::<usize>();
         let mut out = vec![0f32; n];
-        unsafe {
-            sys::cuMemcpyDtoH_v2(
-                out.as_mut_ptr() as *mut std::ffi::c_void,
-                t.device_ptr() as sys::CUdeviceptr,
-                out.len() * 4,
-            )
-            .result()
+        // P0-3:流序 D2H(memx)
+        dev.memcpy_dtoh_f32(dev.stream(), t.device_ptr() as *const f32, &mut out)
             .unwrap();
-        }
         out
     }
 

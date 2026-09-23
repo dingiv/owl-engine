@@ -117,7 +117,32 @@ impl CaptureSession {
             stream: &self.stream,
             lease_sink: sink,
         };
-        let r = f(&frame);
+        // P0-1(audit 2026-09-23):闭包 panic 原本直接跳栈,捕获流永久悬死
+        // (未 end_capture → 设备后续发射全失效)。兜底:panic 转结构化
+        // Error,end_capture + 毁图,捕获流复位。
+        let r = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&frame))) {
+            Ok(r) => r,
+            Err(payload) => {
+                let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                    (*s).to_string()
+                } else if let Some(s) = payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "<非字符串 panic payload>".to_string()
+                };
+                if let Ok(g) = unsafe { stream_end_capture(self.stream.cu_stream()) } {
+                    unsafe {
+                        let _ = graph_destroy(g);
+                    }
+                }
+                // P1:捕获失败,本轮租约/保活全部作废(它们只服务于本次捕获)
+                self.leases.clear();
+                self.keepalive.clear();
+                return Err(BackendError::Init(format!(
+                    "capture: 闭包 panic(已兜底:捕获流已复位、图已销毁): {msg}"
+                )));
+            }
+        };
         drop(_guard);
 
         let ctx = self.gov.ctx.as_ref().expect("ctx 缺失");
@@ -188,6 +213,37 @@ impl CaptureSession {
                     );
                 }
 
+                // P0-2(audit 2026-09-23,口径修正):拒绝的是 **leaked**
+                // (命中池区间但 ∉ 租约 = 依赖泄漏,回放必读悬空);
+                // suspicious(像地址的标量/host 指针,首跑实锤 0x3f800000=1.0f)
+                // 保持告警——误报面在 kernel 参数含立即数,无法与指针盲区分。
+                let leaked_unlisted: Vec<u64> = audit
+                    .leaked
+                    .iter()
+                    .filter(|v| !audit.allowlist.contains(v))
+                    .copied()
+                    .collect();
+                if !leaked_unlisted.is_empty() {
+                    unsafe {
+                        let _ = graph_destroy(cu_graph);
+                    }
+                    let detail = format!(
+                        "哨兵③:图引用未租约池指针,拒绝定影(泄漏指针 = {:?};指针引用 = {:?};豁免请填 AuditReport.allowlist)",
+                        leaked_unlisted
+                            .iter()
+                            .map(|v| format!("0x{v:x}"))
+                            .collect::<Vec<_>>(),
+                        audit.ptr_refs.iter().map(|v| format!("0x{v:x}")).collect::<Vec<_>>(),
+                    );
+                    return Err(BackendError::LawViolation(Box::leak(detail.into_boxed_str())));
+                }
+                if !audit.suspicious.is_empty() {
+                    eprintln!(
+                        "[owl-graph] WARN(嫌疑,非违约): {:?}",
+                        audit.suspicious.iter().map(|v| format!("0x{v:x}")).collect::<Vec<_>>(),
+                    );
+                }
+
                 let exec = unsafe { graph_instantiate(cu_graph, flags) }
                     .map_err(|e| BackendError::Init(format!("instantiate: {e:?}")))?;
                 Ok((
@@ -204,12 +260,14 @@ impl CaptureSession {
                 ))
             }
             Err(e) => {
-                // 闭包失败:结束并丢弃捕获(取回图即销毁)
+                // 闭包失败:结束并丢弃捕获(取回图即销毁);P1:同时作废本轮租约
                 if let Ok(g) = unsafe { stream_end_capture(self.stream.cu_stream()) } {
                     unsafe {
                         let _ = graph_destroy(g);
                     }
                 }
+                self.leases.clear();
+                self.keepalive.clear();
                 Err(e)
             }
         };
@@ -228,8 +286,7 @@ pub struct DeviceGraph {
     /// drop 时 Arc 计数回落,回收流程自然解封。
     #[allow(dead_code)]
     keepalive: Vec<Arc<PoolBufInner>>,
-    /// 治理句柄(debug 构建的 replay 前租约校验通道;release 下仅保活)
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    /// 治理句柄(replay 前租约校验通道;P1 后全构建生效)
     gov: Arc<Governor>,
     audit: AuditReport,
 }
@@ -248,7 +305,8 @@ impl DeviceGraph {
 
     /// 重放(租约校验 → cuGraphLaunch;E 阶段零抽象,一次 FFI)
     pub fn launch(&self) -> Result<(), BackendError> {
-        #[cfg(debug_assertions)]
+        // P1(audit):租约校验不再限 debug 构建——validate 是纯指针账本
+        // 查询,成本可忽略;失效 = 结构化报错而非 Xid 盲死(release 更需要)
         for t in &self.leases {
             if !self.gov.validate(t) {
                 return Err(BackendError::LawViolation(

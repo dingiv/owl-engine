@@ -460,18 +460,9 @@ mod tests {
     }
 
     fn dtoh_f32(dev: &CudaDevice, ptr: *const f32, n: usize) -> Vec<f32> {
-        use owl_cuda::ffi::sys;
-        dev.ctx().bind_to_thread().unwrap();
+        // P0-3:流序 D2H(memx)
         let mut out = vec![0f32; n];
-        unsafe {
-            sys::cuMemcpyDtoH_v2(
-                out.as_mut_ptr() as *mut std::ffi::c_void,
-                ptr as sys::CUdeviceptr,
-                n * 4,
-            )
-            .result()
-            .unwrap();
-        }
+        dev.memcpy_dtoh_f32(dev.stream(), ptr, &mut out).unwrap();
         out
     }
 

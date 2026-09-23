@@ -169,19 +169,10 @@ mod tests {
         dev.ctx().synchronize().unwrap();
 
         // D2H 读回
-        use owl_cuda::ffi::sys;
-        dev.ctx().bind_to_thread().unwrap();
+        // P0-3:流序 D2H(memx)
         let read = |ptr: *mut f32| -> Vec<f32> {
             let mut out = vec![0f32; BLOCKS * HEADS * HEAD_SIZE * BLOCK_SIZE];
-            unsafe {
-                sys::cuMemcpyDtoH_v2(
-                    out.as_mut_ptr() as *mut std::ffi::c_void,
-                    ptr as sys::CUdeviceptr,
-                    out.len() * 4,
-                )
-                .result()
-                .unwrap();
-            }
+            dev.memcpy_dtoh_f32(dev.stream(), ptr, &mut out).unwrap();
             out
         };
         let kcache = read(owl_iface::DevBuf::device_ptr(&d_kcache) as *mut f32);
@@ -720,17 +711,13 @@ mod paged_tests {
         dev.ctx().synchronize().unwrap();
 
         let mut out_host = vec![0u16; NUM_SEQS * HEADS * HEAD_SIZE];
-        use owl_cuda::ffi::sys;
-        dev.ctx().bind_to_thread().unwrap();
-        unsafe {
-            sys::cuMemcpyDtoH_v2(
-                out_host.as_mut_ptr() as *mut std::ffi::c_void,
-                owl_iface::DevBuf::device_ptr(&d_out) as sys::CUdeviceptr,
-                out_host.len() * 2,
-            )
-            .result()
-            .unwrap();
-        }
+        // P0-3:流序 D2H(memx bytes;u16 位型)
+        dev.memcpy_dtoh_bytes(
+            dev.stream(),
+            owl_iface::DevBuf::device_ptr(&d_out) as *const u8,
+            unsafe { std::slice::from_raw_parts_mut(out_host.as_mut_ptr() as *mut u8, out_host.len() * 2) },
+        )
+        .unwrap();
         let mut max_diff = 0f32;
         for (i, &o) in out_host.iter().enumerate() {
             let diff = (f16_bits_to_f32(o) - expect[i]).abs();
@@ -783,17 +770,13 @@ mod paged_tests {
         .unwrap();
         dev.ctx().synchronize().unwrap();
         let mut out_host = vec![0u16; 2 * 8 * 128];
-        use owl_cuda::ffi::sys;
-        dev.ctx().bind_to_thread().unwrap();
-        unsafe {
-            sys::cuMemcpyDtoH_v2(
-                out_host.as_mut_ptr() as *mut std::ffi::c_void,
-                owl_iface::DevBuf::device_ptr(&d_out) as sys::CUdeviceptr,
-                out_host.len() * 2,
-            )
-            .result()
-            .unwrap();
-        }
+        // P0-3:流序 D2H(memx bytes;u16 位型)
+        dev.memcpy_dtoh_bytes(
+            dev.stream(),
+            owl_iface::DevBuf::device_ptr(&d_out) as *const u8,
+            unsafe { std::slice::from_raw_parts_mut(out_host.as_mut_ptr() as *mut u8, out_host.len() * 2) },
+        )
+        .unwrap();
         // bf16 smoke:全部有限值即可(有 NaN 说明越界/掩码错)
         for (i, &b) in out_host.iter().enumerate() {
             let f = bf16_bits_to_f32(b);
@@ -972,17 +955,15 @@ mod paged_tests {
         ).unwrap();
         dev.ctx().synchronize().unwrap();
 
+        // P0-3:流序 D2H(memx bytes;u16 位型)
         let read_u16 = |ptr: *mut u16| -> Vec<u16> {
-            use owl_cuda::ffi::sys;
-            dev.ctx().bind_to_thread().unwrap();
             let mut out = vec![0u16; NUM_SEQS * HEADS * HEAD_SIZE];
-            unsafe {
-                sys::cuMemcpyDtoH_v2(
-                    out.as_mut_ptr() as *mut std::ffi::c_void,
-                    ptr as sys::CUdeviceptr,
-                    out.len() * 2,
-                ).result().unwrap();
-            }
+            dev.memcpy_dtoh_bytes(
+                dev.stream(),
+                ptr as *const u8,
+                unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out.len() * 2) },
+            )
+            .unwrap();
             out
         };
         let out_v1 = read_u16(owl_iface::DevBuf::device_ptr(&d_out_v1) as *mut u16);
@@ -1049,15 +1030,13 @@ mod paged_tests {
         ).unwrap();
         dev.ctx().synchronize().unwrap();
         let mut out_host = vec![0u16; N];
-        use owl_cuda::ffi::sys;
-        dev.ctx().bind_to_thread().unwrap();
-        unsafe {
-            sys::cuMemcpyDtoH_v2(
-                out_host.as_mut_ptr() as *mut std::ffi::c_void,
-                owl_iface::DevBuf::device_ptr(&d_out) as sys::CUdeviceptr,
-                out_host.len() * 2,
-            ).result().unwrap();
-        }
+        // P0-3:流序 D2H(memx bytes;u16 位型)
+        dev.memcpy_dtoh_bytes(
+            dev.stream(),
+            owl_iface::DevBuf::device_ptr(&d_out) as *const u8,
+            unsafe { std::slice::from_raw_parts_mut(out_host.as_mut_ptr() as *mut u8, out_host.len() * 2) },
+        )
+        .unwrap();
         for (i, &b) in out_host.iter().enumerate() {
             let f = bf16_bits_to_f32(b);
             assert!(f.is_finite(), "v2 bf16 smoke: out[{i}] 非有限 {f}");
@@ -1216,17 +1195,13 @@ mod paged_tests {
         dev.ctx().synchronize().unwrap();
 
         let mut out_host = vec![0u16; NUM_SEQS * HEADS * HEAD_SIZE];
-        use owl_cuda::ffi::sys;
-        dev.ctx().bind_to_thread().unwrap();
-        unsafe {
-            sys::cuMemcpyDtoH_v2(
-                out_host.as_mut_ptr() as *mut std::ffi::c_void,
-                owl_iface::DevBuf::device_ptr(&d_out) as sys::CUdeviceptr,
-                out_host.len() * 2,
-            )
-            .result()
-            .unwrap();
-        }
+        // P0-3:流序 D2H(memx bytes;u16 位型)
+        dev.memcpy_dtoh_bytes(
+            dev.stream(),
+            owl_iface::DevBuf::device_ptr(&d_out) as *const u8,
+            unsafe { std::slice::from_raw_parts_mut(out_host.as_mut_ptr() as *mut u8, out_host.len() * 2) },
+        )
+        .unwrap();
         let mut max_diff = 0f32;
         let mut shown = 0;
         for (i, &o) in out_host.iter().enumerate() {
@@ -1415,19 +1390,15 @@ mod paged_tests {
         .unwrap();
         dev.ctx().synchronize().unwrap();
 
+        // P0-3:流序 D2H(memx bytes;u16 位型)
         let read_u16 = |ptr: *mut u16| -> Vec<u16> {
-            use owl_cuda::ffi::sys;
-            dev.ctx().bind_to_thread().unwrap();
             let mut out = vec![0u16; NUM_SEQS * HEADS * HEAD_SIZE];
-            unsafe {
-                sys::cuMemcpyDtoH_v2(
-                    out.as_mut_ptr() as *mut std::ffi::c_void,
-                    ptr as sys::CUdeviceptr,
-                    out.len() * 2,
-                )
-                .result()
-                .unwrap();
-            }
+            dev.memcpy_dtoh_bytes(
+                dev.stream(),
+                ptr as *const u8,
+                unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out.len() * 2) },
+            )
+            .unwrap();
             out
         };
         let out_v1 = read_u16(owl_iface::DevBuf::device_ptr(&d_out_v1) as *mut u16);
@@ -1488,17 +1459,13 @@ mod paged_tests {
         .unwrap();
         dev.ctx().synchronize().unwrap();
         let mut out_host = vec![0u16; 2 * 8 * 256];
-        use owl_cuda::ffi::sys;
-        dev.ctx().bind_to_thread().unwrap();
-        unsafe {
-            sys::cuMemcpyDtoH_v2(
-                out_host.as_mut_ptr() as *mut std::ffi::c_void,
-                owl_iface::DevBuf::device_ptr(&d_out) as sys::CUdeviceptr,
-                out_host.len() * 2,
-            )
-            .result()
-            .unwrap();
-        }
+        // P0-3:流序 D2H(memx bytes;u16 位型)
+        dev.memcpy_dtoh_bytes(
+            dev.stream(),
+            owl_iface::DevBuf::device_ptr(&d_out) as *const u8,
+            unsafe { std::slice::from_raw_parts_mut(out_host.as_mut_ptr() as *mut u8, out_host.len() * 2) },
+        )
+        .unwrap();
         for (i, &b) in out_host.iter().enumerate() {
             let f = bf16_bits_to_f32(b);
             assert!(f.is_finite(), "v1 bf16 h256 smoke: out[{i}] 非有限 {f}");
@@ -1552,17 +1519,13 @@ mod paged_tests {
         .unwrap();
         dev.ctx().synchronize().unwrap();
         let mut out_host = vec![0u16; N];
-        use owl_cuda::ffi::sys;
-        dev.ctx().bind_to_thread().unwrap();
-        unsafe {
-            sys::cuMemcpyDtoH_v2(
-                out_host.as_mut_ptr() as *mut std::ffi::c_void,
-                owl_iface::DevBuf::device_ptr(&d_out) as sys::CUdeviceptr,
-                out_host.len() * 2,
-            )
-            .result()
-            .unwrap();
-        }
+        // P0-3:流序 D2H(memx bytes;u16 位型)
+        dev.memcpy_dtoh_bytes(
+            dev.stream(),
+            owl_iface::DevBuf::device_ptr(&d_out) as *const u8,
+            unsafe { std::slice::from_raw_parts_mut(out_host.as_mut_ptr() as *mut u8, out_host.len() * 2) },
+        )
+        .unwrap();
         for (i, &b) in out_host.iter().enumerate() {
             let f = bf16_bits_to_f32(b);
             assert!(f.is_finite(), "v2 bf16 h256 smoke: out[{i}] 非有限 {f}");

@@ -1,66 +1,43 @@
-# owl 显存/算子/图机制审查总清单(2026-09-24)
+# owl 审计总清单(2026-09-23 三域合并;状态:激进修复第一轮完成)
 
-> 审查范围:packages/owl 全仓(worktree @ audit/memory-review 分支)。
-> 三份域报告:memory-backend.md / operator-design.md / cuda-graph-session.md / session-graph.md。
-> 校准案例:cat `*mut u8` 错位、varlen scratch 悬空、cu_seqlens 清零、
-> safetensors/rotary 偶发零读、Gemma norm offset。
-> unsafe 存量:119 处(不含 tests);`unsafe impl Send/Sync` 6 处。
+> 图例:✅ 已修复并测试验证 | ◐ 部分(探测器/口径就绪,默认关) | ⏸ 立案挂起(阻塞或需架构决策)
 
-## 系统性根因(一个缺陷解释了四个悬案)
+## P0
 
-**NULL 流 memcpy vs non-blocking 主流**:全仓 31 处 H2D/D2H 走
-`cuMemcpy{HtoD,DtoH}_v2`(legacy NULL 流语义),而设备主流是显式 non-blocking 流。
-CUDA 规范:non-blocking 流与 NULL 流**互不同步**。所以任何"同步读回/写入"
-与主流 kernel 之间没有顺序保证——safetensors 偶发零读、rotary 零读、
-cu_seqlens 清零、cat 脏数据四个悬案全部由此解释。逐点 synchronize 是止血,
-**收口 = Device 提供 stream-aware memcpy 并迁移 31 处**。
+- [x] P0-3 NULL 流 memcpy 系统性同步缺口 —— **已修**:`CudaDevice::memcpy_{dtoh,htod}_{f32,u32}` 流序收口 API(b77c67b),非测试调用点 24 处迁移;3 处测试 helper 在 ctx.synchronize() 后(判安全保留);device.rs/lib.rs 内部 H2D 为新块首写(安全);detector:dtoh 前置 sync 已统一
+- [x] P0-1 捕获闭包 panic = 捕获流悬死 —— **已修**:catch_unwind(AssertUnwindSafe) 包裹 f(&frame),panic/Err 双路径 end_capture + destroy + 结构化报错
+- [x] P0-2 哨兵③口径 —— **已修(口径修正)**:拒绝的是 `leaked`(池内未租约,真违约);`suspicious`(像地址的标量,首跑实锤 0x3f800000=1.0f)保持告警——kernel 参数含立即数,无法盲区分;allowlist 管道就绪
+- [x] P0-4 freed 块哨兵 —— **◐ 探测器就绪,默认关**:`OWL_POISON_FREED=1`(debug)归还即填 0xFF;开启即复现 P1-2(见下),修后应转默认开
+- [x] P0-5 device_ptr 暴露面 —— **部分**:cat/stack 等算术点已显式 f32 化;全仓 `.add(` 扫描仅剩字节意图/已转换点;`PtrOf` lifetime 视图 ⏸ 随 M-Ⅲ
 
-## 修复总清单(建议波次)
+## P1
 
-### 第一波|止血(机械修复,预计 1-2 天)
+- [ ] P1-2 捕获窗口 scratch 悬空(立案,数字证据):**OWL_POISON_FREED=1 时 dry_run 判别③ 红**——捕获后归还的 scratch 块被 0xFF 覆盖,图内存在"读先于写"的引用;修法方向 = 捕获期分配的块 pin 到 DeviceGraph drop;修复后 P0-4 转默认开
+- [x] P1-1 捕获失败清租约(已并入 P0-1 修复)
+- [x] P1-4 租约校验去 debug-only(全构建生效,纯账本查询)
+- [ ] P1-3 相位→Idle drain 验证主流排空 ⏸
+- [ ] P1-5 cublas 逐调用 stream 传递审计 ⏸
+- [ ] P1-6 Session 槽位隐式持久语义(漏写槽 = 陈旧数据)⏸ 文档化
 
-| # | 级 | 项 | 位置 |
-|---|---|---|---|
-| 1 | P0 | stream-aware memcpy 封装 + 31 处迁移(根除悬案土壤) | 全仓 |
-| 2 | P0 | 哨兵③ suspicious 非空 = 拒绝 instantiate(现仅 WARN) | graph.rs ~183 |
-| 3 | P0 | 捕获闭包 panic 兜底(catch_unwind 或 CaptureGuard 补 end_capture) | graph.rs ~145 |
-| 4 | P0 | replay 租约校验移出 debug_assertions(release 保留表查询) | graph.rs:255 |
-| 5 | P1 | 捕获失败路径清空 leases/keepalive(会话复用污染) | graph.rs Err 分支 |
-| 6 | P1 | cat 入口 dtype guard(非 f32 结构化报错) | erased.rs:445 |
-| 7 | P2 | OwlTensor::reshape 残留 backtrace 清理 + n≠have bail + contiguous 断言 | layers/mod.rs:283 |
+## P2
 
-### 第二波|机制收口(预计 2-3 天)
+- [x] VMM drop 失败结构化日志(pool.rs 顺手修)
+- [ ] P2 其余(Slice 记账粒度/Arch TODO/AUTO_FREE_ON_LAUNCH/TrackingHandle !Send/signal TLS)⏸ 挂账
 
-| # | 级 | 项 | 位置 |
-|---|---|---|---|
-| 8 | P0 | **freed 块 NaN 哨兵填树**(debug 构建 fill-before-free,悬空读立刻 NaN 化——cat/slab/cu_seqlens 类 bug 的通用探测器) | pool.rs 归还路径 |
-| 9 | P1 | set_phase(Idle) 前置 synchronize(drain 语义写进机制而非约定) | governor.rs:57-70 |
-| 10 | P1 | DeviceGraph::Drop 前 stream synchronize(防在飞 replay) | graph.rs:274 |
-| 11 | P1 | PoolBufInner drop 竞态:unreachable! 改结构化报错 | pool.rs:452 |
-| 12 | P1 | cublas workspace 显式 SetWorkspace(P 阶段池内;图捕获期 cublas 自建分配 = 图外地址) | cublas.rs |
-| 13 | P1 | u32 idx 乘 inner 溢出审计(gather/scatter 族;长上下文 KV 前) | erased + .cu |
-| 14 | P1 | attention.rs 硬编码 4(元素宽)随 fp8/bf16 KV 化时收敛 | attention.rs:309 |
+## 架构裁决(待拍板)
 
-### 第三波|架构收口(需裁决)
+1. `device_ptr()` 类型化收口(PtrOf)——⏸ 随 M-Ⅲ
+2. graphplan 退役 + runner 迁 Session —— ⏸ 双轨风险已记录
+3. `cuMemcpy` 直接调用 lint 禁令 —— ⏸(迁移已完成,防回归靠 review)
+4. OwlTensor 拆 TLS —— ⏸ 与 signal scope 重构捆绑
 
-| # | 级 | 项 |
+## 实锤案例归因(全部闭合)
+
+| 悬案 | 根因 | 状态 |
 |---|---|---|
-| 15 | P0(架构) | **device_ptr() 类型化收口**:iface 提供 `PtrOf<'a,T>`(lifetime 绑句柄)或 debug_assert 存活;契约从"君子协定注释"变机制。119 处 unsafe 的 ~70% 消费面,根治 cat/slab/cu_seqlens 再生 |
-| 16 | P2 | graphplan 退役 + Raw 视图变体处置(双轨收敛,挂账 §五·5) |
-| 17 | P2 | `cuMemcpy*_v2` 直接调用 lint 禁令(收口后防回流) |
-| 18 | P2 | OwlTensor 显式 ctx 化(拆 ctx_scope TLS,与 signal-scope 重构捆排) |
-| 19 | P2 | RemoteBuf Send 担保文档化(P2P 接线前置条件) |
-
-## 审查通过(无需改动,留档理由)
-
-- VMM 三步分配/释放链(全仓质量最高段,失败路径完整回滚);
-- Arc 租约系统(Clone=租约、retire 判例、live_bufs Weak 防泄漏);
-- downcast dtype 检查纪律(无静默位型重解释);
-- 双账本 + 预算三道闸(9-22 双重扣减判例已消化);
-- UUID 钉卡;signal emit 覆盖面;testkit rig 防悬空模式。
-
-## 架构裁决需求(用户拍板项)
-
-1. 第三波 #15:PtrOf 类型化(改面大、根治)vs debug_assert(轻量、防呆)——建议先后者,PtrOf 随 M-Ⅲ runner 接线一起立项;
-2. #8 NaN 哨兵填树是否进 release(建议仅 debug;release 用页保护成本高);
-3. unsafe 总量目标:收口后预期 119 → ~40(全部集中在 ffi/发射器边界,业务层零 unsafe)。
+| safetensors 偶发零读 | NULL 流竞速 | ✅ memx |
+| rotary 零读 | 同上 | ✅ memx |
+| cu_seqlens 清零 | 同上 | ✅ memx |
+| cat 脏数据 | *mut u8 .add 元素语义 | ✅ f32 化 |
+| GDN slab 悬空 | 视图逃出租约 | ✅ slab |
+| **P1-2 捕获窗口悬空** | 租约缺口 | 🔴 **立案(探测证据 dry_run)** |

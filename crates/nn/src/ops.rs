@@ -182,19 +182,13 @@ impl OpsCtx {
             .ctx()
             .bind_to_thread()
             .map_err(|e| BackendError::Init(format!("{e:?}")))?;
-        use owl_cuda::ffi::sys;
-        unsafe {
-            sys::cuMemcpyHtoD_v2(
-                t.device_ptr() as owl_cuda::ffi::sys::CUdeviceptr,
-                src.as_ptr() as *const core::ffi::c_void,
-                n * std::mem::size_of::<T>(),
-            )
-            .result()
-            .map_err(|e| BackendError::CopyFailed {
-                dir: "htod",
-                detail: format!("{e:?}"),
-            })
-        }
+        // P0-3:流序 H2D(memx bytes;泛型 T 位型)
+        let bytes = unsafe {
+            std::slice::from_raw_parts(src.as_ptr() as *const u8, n * std::mem::size_of::<T>())
+        };
+        self.dev
+            .memcpy_htod_bytes(self.dev.stream(), t.device_ptr() as *mut u8, bytes)
+            .map_err(|e| BackendError::CopyFailed { dir: "htod", detail: e })
     }
 
     // ---- 二元(T0 kernel:owl_add_f32 / owl_mul_f32)----
