@@ -5,7 +5,7 @@ use super::buffers::{Persistent, RemoteBuf, Scratch, VmmBuf};
 use super::governor::{Budget, Governor, LedgerSnapshot};
 use super::graph::CaptureSession;
 use super::pool::{CudaPool, PoolLedger};
-use cudarc::driver::{CudaContext, CudaStream, sys};
+use cudarc::driver::{CudaContext, CudaStream, result, sys};
 use owl_iface::{
     Arch, Backend, BackendError, BackendFamily, BufToken, Device, DeviceDesc, DevBuf, MemPhase,
     MemStats, MemValue, PoolConfig, PoolId,
@@ -69,6 +69,66 @@ impl CudaDevice {
     /// 设备主显存流(非阻塞;E 阶段 kernel/cublas/图重放的默认目标)
     pub fn stream(&self) -> &Arc<CudaStream> {
         &self.stream
+    }
+
+    // ==================== memx:流序 memcpy 收口(P0-3 修复) ====================
+    // 审计裁定(docs/audit/README.md P0-3):NULL 流 cuMemcpy*_v2 与
+    // non-blocking 主流互不同步(safetensors 零读/rotary 零读/cu_seqlens
+    // 清零四案根因)。全部 H2D/D2H 统一走主显存流:async 发射 + synchronize,
+    // 一次保证「与在飞 kernel 有序 + host 立即可读」。
+
+    /// 流序 D2H(f32):src 在主流上与在飞 kernel 有序,返回时 host 可读。
+    pub fn memcpy_dtoh_f32(
+        &self,
+        stream: &Arc<CudaStream>,
+        src: *const f32,
+        out: &mut [f32],
+    ) -> Result<(), String> {
+        self.ctx.bind_to_thread().map_err(|e| format!("{e:?}"))?;
+        unsafe {
+            result::memcpy_dtoh_async(out, src as sys::CUdeviceptr, stream.cu_stream())
+        }
+        .map_err(|e| format!("memcpy_dtoh_async: {e:?}"))?;
+        stream.synchronize().map_err(|e| format!("stream sync: {e:?}"))
+    }
+
+    /// 流序 H2D(f32):host 数据经主流写入,后续主流 kernel 天然有序。
+    pub fn memcpy_htod_f32(
+        &self,
+        stream: &Arc<CudaStream>,
+        dst: *mut f32,
+        src: &[f32],
+    ) -> Result<(), String> {
+        self.ctx.bind_to_thread().map_err(|e| format!("{e:?}"))?;
+        unsafe { result::memcpy_htod_async(dst as sys::CUdeviceptr, src, stream.cu_stream()) }
+            .map_err(|e| format!("memcpy_htod_async: {e:?}"))?;
+        Ok(())
+    }
+
+    /// 流序 D2H(u32):槽位/索引读回。
+    pub fn memcpy_dtoh_u32(
+        &self,
+        stream: &Arc<CudaStream>,
+        src: *const u32,
+        out: &mut [u32],
+    ) -> Result<(), String> {
+        self.ctx.bind_to_thread().map_err(|e| format!("{e:?}"))?;
+        unsafe { result::memcpy_dtoh_async(out, src as sys::CUdeviceptr, stream.cu_stream()) }
+            .map_err(|e| format!("memcpy_dtoh_async: {e:?}"))?;
+        stream.synchronize().map_err(|e| format!("stream sync: {e:?}"))
+    }
+
+    /// 流序 H2D(u32)。
+    pub fn memcpy_htod_u32(
+        &self,
+        stream: &Arc<CudaStream>,
+        dst: *mut u32,
+        src: &[u32],
+    ) -> Result<(), String> {
+        self.ctx.bind_to_thread().map_err(|e| format!("{e:?}"))?;
+        unsafe { result::memcpy_htod_async(dst as sys::CUdeviceptr, src, stream.cu_stream()) }
+            .map_err(|e| format!("memcpy_htod_async: {e:?}"))?;
+        Ok(())
     }
 
     /// 姿势 6(warmup 门禁):记一次 kernel 发射(算子层/cublas 每次发射调用)
