@@ -277,6 +277,27 @@ pub trait Pool: Send + Sync {
     /// 取整),本地 RW 映射。仅接受 PoolKind::PeerShared。
     /// 注意:VMM 背面**不清零**,调用方负责 memset 或整块覆盖。
     fn malloc_peer_shared(&self, bytes: u64) -> Result<PoolBuf, BackendError>;
+
+    // ---- 类型化分配入口(2026-09-23 用户裁决:分配只经池,Device 不分担)----
+
+    /// 从本池做持久分配(清零)。任何相位合法。
+    /// 校验顺序:池余量(A5.4)→ 全局预算(A5.4)→ 分配。
+    fn alloc_persistent_in<T: MemValue>(
+        &self,
+        len: usize,
+    ) -> Result<<Self::Dev as Device>::Persistent<T>, BackendError>;
+
+    /// host → device 持久写入(权重装载路径),计入本池。
+    fn htod_persistent_in<T: MemValue>(
+        &self,
+        src: Vec<T>,
+    ) -> Result<<Self::Dev as Device>::Persistent<T>, BackendError>;
+
+    /// 从本池做暂存分配。允许 Capturing 相(捕获安全分配)。
+    fn alloc_scratch_in<T: MemValue>(
+        &self,
+        len: usize,
+    ) -> Result<<Self::Dev as Device>::Scratch<T>, BackendError>;
 }
 
 /// 设备实例:一张具体卡。账本 + 池组 + 相位机的唯一宿主(设备隔离律)。
@@ -342,26 +363,4 @@ pub trait Device: Clone + Send + Sync + 'static {
 
     /// 按 id 取回池对象(重拿句柄用;正常路径持有 create_pool 的返回值)
     fn pool(&self, id: PoolId) -> Result<Self::Pool, BackendError>;
-
-    /// 从指定池做持久分配(清零)。任何相位合法。
-    /// 校验顺序:池余量(A5.4)→ 全局预算(A5.4)→ 分配。
-    fn alloc_persistent_in<T: MemValue>(
-        &self,
-        pool: &Self::Pool,
-        len: usize,
-    ) -> Result<Self::Persistent<T>, BackendError>;
-
-    /// host → device 持久写入(权重装载路径),计入指定池。
-    fn htod_persistent_in<T: MemValue>(
-        &self,
-        pool: &Self::Pool,
-        src: Vec<T>,
-    ) -> Result<Self::Persistent<T>, BackendError>;
-
-    /// 从指定池做暂存分配。允许 Capturing 相(捕获安全分配)。
-    fn alloc_scratch_in<T: MemValue>(
-        &self,
-        pool: &Self::Pool,
-        len: usize,
-    ) -> Result<Self::Scratch<T>, BackendError>;
 }

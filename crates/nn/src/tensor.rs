@@ -367,7 +367,7 @@ impl<T: Scalar> Tensor<T, CudaDevice> {
         shape: &[usize],
         src: Vec<T>,
     ) -> Result<Self, BackendError> {
-        let storage = Storage::Persistent(d.htod_persistent_in::<T>(pool, src)?);
+        let storage = Storage::Persistent(pool.htod_persistent_in::<T>(src)?);
         let token = match &storage {
             Storage::Persistent(p) => d.persistent_token(p),
             _ => unreachable!("from_vec_cuda: 应为 Persistent"),
@@ -568,13 +568,13 @@ where
     fn zeros_tensor<T: Scalar>(&self, shape: &[usize]) -> Result<Tensor<T, D>, BackendError> {
         let dev = self.device();
         let n: usize = shape.iter().product();
-        Ok(Tensor::from_persistent(&dev, dev.alloc_persistent_in::<T>(self, n)?, shape))
+        Ok(Tensor::from_persistent(&dev, self.alloc_persistent_in::<T>(n)?, shape))
     }
 
     fn scratch_tensor<T: Scalar>(&self, shape: &[usize]) -> Result<Tensor<T, D>, BackendError> {
         let dev = self.device();
         let n: usize = shape.iter().product();
-        Ok(Tensor::from_scratch(&dev, dev.alloc_scratch_in::<T>(self, n)?, shape))
+        Ok(Tensor::from_scratch(&dev, self.alloc_scratch_in::<T>(n)?, shape))
     }
 
     fn from_vec_tensor<T: Scalar>(&self, shape: &[usize], src: Vec<T>) -> Result<Tensor<T, D>, BackendError> {
@@ -586,7 +586,7 @@ where
             });
         }
         let dev = self.device();
-        let storage = Storage::Persistent(dev.htod_persistent_in::<T>(self, src)?);
+        let storage = Storage::Persistent(self.htod_persistent_in::<T>(src)?);
         let token = match &storage {
             Storage::Persistent(p) => dev.persistent_token(p),
             Storage::Scratch(_) => unreachable!("from_vec_tensor: 应为 Persistent"),

@@ -6,7 +6,7 @@ use crate::device::CudaDevice;
 use cudarc::driver::sys;
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use owl_iface::{
-    BackendError, BufToken, DevBuf, MemPhase, OpaqueDevBuf, Pool, PoolBuf,
+    BackendError, BufToken, DevBuf, Device, MemPhase, MemValue, OpaqueDevBuf, Pool, PoolBuf,
     PoolId, PoolKind, PoolUsage,
 };
 use parking_lot::Mutex;
@@ -75,6 +75,48 @@ impl Pool for CudaPool {
     fn malloc_peer_shared(&self, bytes: u64) -> Result<PoolBuf, BackendError> {
         self.kind_check(PoolKind::PeerShared)?;
         Ok(PoolBuf::wrap(Box::new(self.malloc_inner(bytes)?)))
+    }
+
+    fn alloc_persistent_in<T: MemValue>(
+        &self,
+        len: usize,
+    ) -> Result<<CudaDevice as Device>::Persistent<T>, BackendError> {
+        let bytes = (len * std::mem::size_of::<T>()) as u64;
+        let buf = self.malloc_persistent_buf(bytes)?;
+        self.gov.stats.lock().persistent_allocs += 1;
+        Ok(crate::buffers::Persistent::new(buf, len))
+    }
+
+    fn htod_persistent_in<T: MemValue>(
+        &self,
+        src: Vec<T>,
+    ) -> Result<<CudaDevice as Device>::Persistent<T>, BackendError> {
+        let len = src.len();
+        let bytes = (len * std::mem::size_of::<T>()) as u64;
+        let buf = self.malloc_persistent_buf(bytes)?;
+        self.ctx.bind_to_thread().map_err(|e| BackendError::Init(format!("{e:?}")))?;
+        unsafe {
+            use cudarc::driver::sys;
+            sys::cuMemcpyHtoD_v2(
+                buf.device_ptr() as sys::CUdeviceptr,
+                src.as_ptr() as *const core::ffi::c_void,
+                bytes as usize,
+            )
+            .result()
+            .map_err(|e| BackendError::CopyFailed { dir: "htod", detail: format!("{e:?}") })?;
+        }
+        self.gov.stats.lock().persistent_allocs += 1;
+        Ok(crate::buffers::Persistent::new(buf, len))
+    }
+
+    fn alloc_scratch_in<T: MemValue>(
+        &self,
+        len: usize,
+    ) -> Result<<CudaDevice as Device>::Scratch<T>, BackendError> {
+        let bytes = (len * std::mem::size_of::<T>()) as u64;
+        let buf = self.malloc_scratch_buf(bytes)?;
+        self.gov.stats.lock().persistent_allocs += 1;
+        Ok(crate::buffers::Scratch::new(buf, len))
     }
 }
 

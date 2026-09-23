@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use owl_cuda::{CudaDevice, CudaPool};
-use owl_iface::{Device as _, PoolConfig, PoolKind};
+use owl_iface::{Device as _, Pool as _, PoolConfig, PoolKind};
 
 /// 设备 + 池的进程级单例(测试内直接 `Rig::acquire()`)。
 pub struct Rig {
@@ -76,10 +76,7 @@ impl Rig {
     /// H2D(通用;T: MemValue)。
     pub fn htod<T: owl_iface::MemValue>(&self, v: Vec<T>) -> DevBuf {
         let n = v.len();
-        let buf = self
-            .dev
-            .htod_persistent_in(&self.pool, v)
-            .expect("testkit htod");
+        let buf = self.pool.htod_persistent_in(v).expect("testkit htod");
         DevBuf {
             inner: Box::new(DevBufT { buf }),
             n,

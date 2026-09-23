@@ -18,7 +18,7 @@ use owl_engine::config::Config;
 use owl_engine::models::dry_kernels::DryKernels;
 use owl_engine::models::layers::deltanet::GatedDeltaNet;
 use owl_engine::models::layers::{ctx_scope, ctor, vendor, VarBuilderX};
-use owl_iface::{Device as _, DevBuf as _, PoolConfig, PoolKind};
+use owl_iface::{Device as _, DevBuf as _, Pool as _, PoolConfig, PoolKind};
 use owl_nn::cublas::NnBlas;
 use owl_nn::kernels::gdn_kernels::GdnKernels;
 use std::sync::Arc;
@@ -71,7 +71,7 @@ fn htod<T: owl_iface::MemValue + Send + Sync + 'static>(
     rig: &Rig,
     v: Vec<T>,
 ) -> owl_cuda::Persistent<T> {
-    rig.dev.htod_persistent_in(&rig.pool, v).unwrap()
+    rig.pool.htod_persistent_in(v).unwrap()
 }
 
 fn dtoh_f32(dev: &CudaDevice, ptr: *const f32, n: usize) -> Vec<f32> {

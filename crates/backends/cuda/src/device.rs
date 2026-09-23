@@ -4,21 +4,36 @@
 use super::buffers::{Persistent, RemoteBuf, Scratch, VmmBuf};
 use super::governor::{Budget, Governor, LedgerSnapshot};
 use super::graph::CaptureSession;
-use super::pool::{CudaPool, PoolLedger};
+use super::pool::CudaPool;
 use cudarc::driver::{CudaContext, CudaStream, result, sys};
 use owl_iface::{
-    Arch, Backend, BackendError, BackendFamily, BufToken, Device, DeviceDesc, DevBuf, MemPhase,
+    Arch, Backend, BackendError, BackendFamily, BufToken, Device, DeviceDesc, MemPhase,
     MemStats, MemValue, PoolConfig, PoolId,
-};
+ PoolKind, };
 use std::sync::Arc;
 
 /// CUDA 设备实例:一个 CudaDevice 绑定一张卡(UUID 钉),账本独立。
 #[derive(Clone)]
 pub struct CudaDevice {
+    pub(crate) inner: Arc<DeviceInner>,
+}
+
+/// 设备内核数据(Arc 共享;命名池挂这里,权重/暂存各一,env 可调大小)
+pub struct DeviceInner {
     pub(crate) ctx: Arc<CudaContext>,
     pub(crate) stream: Arc<CudaStream>,
     pub(crate) gov: Arc<Governor>,
     pub(crate) desc: DeviceDesc,
+    /// 命名池实例(2026-09-23 用户裁决:分配只经池,Device 不分担)
+    pub(crate) weights_pool: std::sync::OnceLock<Arc<CudaPool>>,
+    pub(crate) scratch_pool: std::sync::OnceLock<Arc<CudaPool>>,
+}
+
+impl std::ops::Deref for CudaDevice {
+    type Target = DeviceInner;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
 
 impl CudaDevice {
@@ -47,9 +62,9 @@ impl CudaDevice {
         let (_free, total) = ctx
             .mem_get_info()
             .map_err(|e| BackendError::Init(format!("mem_get_info: {e}")))?;
-        Ok(Self {
+        let inner = Arc::new(DeviceInner {
             ctx: Arc::clone(&ctx),
-            stream,
+            stream: Arc::clone(&stream),
             gov: Arc::new(Governor {
                 ctx: Some(ctx),
                 ..Default::default()
@@ -59,7 +74,42 @@ impl CudaDevice {
                 arch: Arch::Sm86, // TODO(M1): compute capability 运行时读取
                 total_bytes: total as u64,
             },
-        })
+            weights_pool: std::sync::OnceLock::new(),
+            scratch_pool: std::sync::OnceLock::new(),
+        });
+        let dev = Self { inner };
+        // 命名池初始化(用户裁决:分配只经池;大小 env 可调,默认 2G/512M)
+        let wbytes = std::env::var("OWL_WEIGHTS_POOL_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2 << 30);
+        let sbytes = std::env::var("OWL_SCRATCH_POOL_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(512 << 20);
+        let wp = create_pool_for(&dev, PoolConfig {
+            name: format!("weights-{}", std::process::id()),
+            kind: PoolKind::Weights,
+            bytes: wbytes,
+        })?;
+        let sp = create_pool_for(&dev, PoolConfig {
+            name: format!("scratch-{}", std::process::id()),
+            kind: PoolKind::Scratch,
+            bytes: sbytes,
+        })?;
+        let _ = dev.inner.weights_pool.set(wp);
+        let _ = dev.inner.scratch_pool.set(sp);
+        Ok(dev)
+    }
+
+    /// 命名池:权重(常驻,分配走它)
+    pub fn weights_pool(&self) -> Arc<CudaPool> {
+        Arc::clone(self.inner.weights_pool.get().expect("weights 池未初始化"))
+    }
+
+    /// 命名池:暂存(捕获期可借,用完还)
+    pub fn scratch_pool(&self) -> Arc<CudaPool> {
+        Arc::clone(self.inner.scratch_pool.get().expect("scratch 池未初始化"))
     }
 
     pub fn ctx(&self) -> &Arc<CudaContext> {
@@ -510,37 +560,7 @@ impl Device for CudaDevice {
     }
 
     fn create_pool(&self, cfg: PoolConfig) -> Result<Self::Pool, BackendError> {
-        let mut pools = self.gov.pools.lock();
-        if pools.values().any(|p| p.name == cfg.name) {
-            return Err(BackendError::Init(format!(
-                "A5.1: 重复池名 '{}'——分解表不应有两行同名账",
-                cfg.name
-            )));
-        }
-        let id = self
-            .gov
-            .next_pool_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        pools.insert(
-            id,
-            PoolLedger {
-                name: cfg.name.clone(),
-                kind: cfg.kind,
-                capacity: cfg.bytes,
-                used: 0,
-                peak: 0,
-            },
-        );
-        Ok(CudaPool {
-            id: PoolId(id),
-            name: cfg.name.clone(),
-            kind: cfg.kind,
-            capacity: cfg.bytes,
-            ctx: Arc::clone(&self.ctx),
-            stream: Arc::clone(&self.stream),
-            gov: Arc::clone(&self.gov),
-            dev: self.clone(),
-        })
+        Ok((*create_pool_for(self, cfg)?).clone())
     }
 
     fn pool(&self, id: PoolId) -> Result<Self::Pool, BackendError> {
@@ -558,59 +578,44 @@ impl Device for CudaDevice {
         })
     }
 
-    fn alloc_persistent_in<T: MemValue>(
-        &self,
-        pool: &Self::Pool,
-        len: usize,
-    ) -> Result<Self::Persistent<T>, BackendError> {
-        let bytes = (len * std::mem::size_of::<T>()) as u64;
-        let buf = pool.malloc_persistent_buf(bytes)?;
-        self.gov.stats.lock().persistent_allocs += 1;
-        Ok(Persistent::new(buf, len))
-    }
+}
 
-    fn htod_persistent_in<T: MemValue>(
-        &self,
-        pool: &Self::Pool,
-        src: Vec<T>,
-    ) -> Result<Self::Persistent<T>, BackendError> {
-        let len = src.len();
-        let bytes = (len * std::mem::size_of::<T>()) as u64;
-        let buf = pool.malloc_persistent_buf(bytes)?;
-        // MemValue = Send + 'static 的 plain-old-data 按字节搬运;
-        // VMM/Slice 两种背面都是连续设备内存,统一走裸指针拷贝
-        let host_bytes =
-            unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u8, bytes as usize) };
-        self.ctx
-            .bind_to_thread()
-            .map_err(|e| BackendError::Init(format!("{e:?}")))?;
-        unsafe {
-            use sys::{cuMemcpyHtoD_v2, CUresult::CUDA_SUCCESS};
-            if cuMemcpyHtoD_v2(
-                buf.device_ptr() as sys::CUdeviceptr,
-                host_bytes.as_ptr() as *const core::ffi::c_void,
-                bytes as usize,
-            ) != CUDA_SUCCESS
-            {
-                // buf 归账由其 Drop 完成(路径治理不变)
-                return Err(BackendError::CopyFailed {
-                    dir: "htod",
-                    detail: "cuMemcpyHtoD_v2".into(),
-                });
-            }
-        }
-        self.gov.stats.lock().persistent_allocs += 1;
-        Ok(Persistent::new(buf, len))
+/// 池构造(部件注入;`Device::create_pool` 与命名池初始化共用)。
+/// 注:CudaPool 内嵌 `dev: CudaDevice` 与 inner 的池槽构成有界 Arc 环
+/// (命名池与设备同生命周期,进程级常驻,不计泄漏)。
+pub(crate) fn create_pool_for(
+    dev: &CudaDevice,
+    cfg: PoolConfig,
+) -> Result<Arc<CudaPool>, BackendError> {
+    let (ctx, stream, gov) = (&dev.inner.ctx, &dev.inner.stream, &dev.inner.gov);
+    let mut pools = gov.pools.lock();
+    if pools.values().any(|p| p.name == cfg.name) {
+        return Err(BackendError::Init(format!(
+            "A5.1: 重复池名 '{}'——分解表不应有两行同名账",
+            cfg.name
+        )));
     }
-
-    fn alloc_scratch_in<T: MemValue>(
-        &self,
-        pool: &Self::Pool,
-        len: usize,
-    ) -> Result<Self::Scratch<T>, BackendError> {
-        let bytes = (len * std::mem::size_of::<T>()) as u64;
-        let buf = pool.malloc_scratch_buf(bytes)?;
-        self.gov.stats.lock().scratch_allocs += 1;
-        Ok(Scratch::new(buf, len))
-    }
+    let id = gov
+        .next_pool_id
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    pools.insert(
+        id,
+        crate::pool::PoolLedger {
+            name: cfg.name.clone(),
+            kind: cfg.kind,
+            capacity: cfg.bytes,
+            used: 0,
+            peak: 0,
+        },
+    );
+    Ok(Arc::new(CudaPool {
+        id: PoolId(id),
+        name: cfg.name.clone(),
+        kind: cfg.kind,
+        capacity: cfg.bytes,
+        ctx: Arc::clone(ctx),
+        stream: Arc::clone(stream),
+        gov: Arc::clone(gov),
+        dev: dev.clone(),
+    }))
 }
