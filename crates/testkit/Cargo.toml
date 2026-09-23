@@ -1,0 +1,11 @@
+[package]
+name = "owl-testkit"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+owl-cuda = { path = "../backends/cuda" }
+owl-iface = { path = "../backends/iface" }
+
+[dev-dependencies]
+owl-nn = { path = "../nn" }
