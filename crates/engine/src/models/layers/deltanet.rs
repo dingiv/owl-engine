@@ -27,7 +27,7 @@ use std::rc::Rc;
 // ---- vendor gdn kernel 垫片(attention-rs port,T3 回填) ----
 #[allow(dead_code)] // flashinfer 引入后接通(裁决 2026-09-22)
 mod gdn_shim {
-    use super::{ctx_scope, cat_local, Result, Tensor};
+    use super::{ctx_scope, Result, Tensor};
     use crate::models::layers::OwlTensor;
     use owl_nn::kernels::gdn_kernels::GdnKernels;
     use std::sync::{Arc, Mutex, OnceLock};
