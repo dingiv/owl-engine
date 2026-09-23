@@ -1343,3 +1343,49 @@ fn gdn_layer0_real_full_parity() {
     let (ok, msg) = e2e_case(0, T);
     assert!(ok, "M-Ⅱ e2e 层0: {msg}");
 }
+
+
+/// M-Ⅱ 追凶:input_layernorm(层 0 真权重)输出幅值——HF 侧 norm 后 ±1-3,
+/// 若 owl 输出仍 ±0.078(embed 原幅)即 RMSNorm 断裂实锤。
+#[test]
+fn layernorm_magnitude_probe() {
+    let rig = install_rig();
+    let dev = rig.dev.clone();
+    let cfg_text = std::fs::read_to_string(format!("{MODEL_DIR}/config.json")).unwrap();
+    let config = Config::from_json_str(&cfg_text).unwrap();
+    let vb = VarBuilderX::new(
+        &owl_engine::downloader::ModelPaths {
+            tokenizer_filename: Default::default(), tokenizer_config_filename: Default::default(),
+            config_filename: Default::default(), generation_config_filename: Default::default(),
+            filenames: vec![std::path::PathBuf::from(ST_MODEL)], auxiliary_filenames: vec![], chat_template_filename: None,
+        },
+        false, owl_nn::Dtype::F32, &dev,
+    ).unwrap().with_pool(rig.pool.clone());
+    let hidden = 1024usize;
+    // 输入:确定性 hidden ±0.08 幅(模仿 embed)
+    let x: Vec<f32> = (0..5 * hidden).map(|i| ((i % 17) as f32 - 8.0) / 100.0).collect();
+    let xt = ctor::from_vec(x.clone(), (5usize, hidden), &dev).unwrap();
+    let ln = owl_engine::models::layers::others::rms_norm(
+        hidden, config.rms_norm_eps,
+        vb.pp("model.layers.0.input_layernorm"), owl_nn::Dtype::F32, false,
+    ).expect("input_layernorm 构造");
+    let y = ln.forward(&xt).expect("layernorm forward");
+    dev.ctx().synchronize().unwrap();
+    let got = dtoh_f32(&dev, y.device_ptr() as *mut f32, 5 * hidden);
+    let max = got.iter().fold(0f32, |m, v| m.max(v.abs()));
+    eprintln!("[ln probe] in max = {:.4}, out max = {:.4}", x.iter().fold(0f32, |m, v| m.max(v.abs())), max);
+    // host 参考:rms_norm(x)·w,weight 从 safetensors 直读
+    let direct = owl_engine::loader::safetensors::SafeTensorsFile::open(ST_MODEL).unwrap();
+    let w = direct.tensor_f32("model.language_model.layers.0.input_layernorm.weight").unwrap();
+    let eps = config.rms_norm_eps as f32;
+    for t in 0..5usize {
+        let row = &x[t * hidden..(t + 1) * hidden];
+        let ms = row.iter().map(|v| v * v).sum::<f32>() / hidden as f32;
+        let inv = 1.0 / (ms + eps).sqrt();
+        for (i, &v) in row.iter().enumerate() {
+            let want = v * inv * w[i];
+            assert!((got[t * hidden + i] - want).abs() < 1e-4, "ln[{t},{i}] dev {} vs host {}", got[t * hidden + i], want);
+        }
+    }
+    assert!(max > 0.5, "RMSNorm 输出幅值 {} ≪ 预期 ±1-3(归一化断裂?)", max);
+}

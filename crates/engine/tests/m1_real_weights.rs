@@ -213,23 +213,24 @@ fn m1_real_weights_construct_and_prefill() {
         eprintln!("[embed probe] alt emb[0..8]={v2:?}");
     }
 
-    // 探针 1:embedding 查表正确性(host 直读对照)
+    // 探针 1(决定性):三组不同 id 的 embed 输出两两对比
     {
-        let direct = owl_engine::loader::safetensors::SafeTensorsFile::open(ST_MODEL).unwrap();
-        let emb_full = direct.tensor_f32("model.language_model.embed_tokens.weight").unwrap();
-        let ids_h: Vec<u32> = if std::env::var("M1_MILD_IDS").is_ok() { vec![11,12,13,14,15] } else { vec![100000,7,42,1,999] };
-        let e = model.embed_forward(&ids).unwrap();
-        dev.ctx().synchronize().unwrap();
-        let got = dtoh_f32(&dev, e.device_ptr() as *mut f32, seq_len * 1024);
-        for (k, &id) in ids_h.iter().enumerate() {
-            let row = &emb_full[id as usize * 1024..(id as usize + 1) * 1024];
-            let got_row = &got[k * 1024..(k + 1) * 1024];
-            let maxd: f32 = row.iter().zip(got_row).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
-            eprintln!("[emb check] token {k} id={id} max|host-dev| = {maxd:.3e}");
+        let sets: Vec<Vec<u32>> = vec![vec![100000, 7, 42, 1, 999], vec![11, 12, 13, 14, 15], vec![50, 60, 70, 80, 90]];
+        let mut sums = Vec::new();
+        for (si, idset) in sets.iter().enumerate() {
+            let e = model.embed_forward(
+                &owl_engine::models::layers::ctor::from_vec(idset.clone(), (seq_len,), &dev).unwrap(),
+            ).unwrap();
+            dev.ctx().synchronize().unwrap();
+            let v = dtoh_f32(&dev, e.device_ptr() as *mut f32, seq_len * 1024);
+            let sum: f32 = v.iter().sum();
+            eprintln!("[emb decisive] set{si} ids={idset:?} sum={sum:.5} head={:?}", &v[..3]);
+            sums.push(sum);
+        }
+        if sums[0] == sums[1] && sums[1] == sums[2] {
+            panic!("embedding 查表与 id 无关(恒定输出)!");
         }
     }
-    // 探针 2:层 0 输出 vs embedding(透传检测)
-    if false {}
 
     // 逐层有限性扫描(定位 NaN 首发层)
     let (logits_scan, collected) = model
