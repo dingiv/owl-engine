@@ -289,12 +289,8 @@ mod tests {
         const M: usize = 64;
         const K: usize = 64;
         const N: usize = 64;
-        let da = pool
-            .htod_persistent_in::<f32>(vec![0.5f32; M * K])
-            .unwrap();
-        let db = pool
-            .htod_persistent_in::<f32>(vec![0.25f32; K * N])
-            .unwrap();
+        let da = pool.htod_persistent_in::<f32>(vec![0.5f32; M * K]).unwrap();
+        let db = pool.htod_persistent_in::<f32>(vec![0.25f32; K * N]).unwrap();
         let dc = pool.alloc_persistent_in::<f32>(M * N).unwrap();
         dev.ctx().synchronize().unwrap();
 

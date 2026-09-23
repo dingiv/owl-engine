@@ -288,20 +288,20 @@ pub trait Pool: Send + Sync {
     fn alloc_bytes_persistent(
         &self,
         n_bytes: usize,
-    ) -> Result<<Self::Dev as Device>::Persistent<u8>, BackendError>;
+    ) -> Result<<Self::Dev as Device>::Bytes, BackendError>;
 
     /// host → device 持久字节写入(权重装载路径),计入本池。
     /// 流序纪律(P0-3):必须走池流 async + sync,禁止 NULL 流同步拷贝。
     fn htod_bytes_persistent(
         &self,
         src: &[u8],
-    ) -> Result<<Self::Dev as Device>::Persistent<u8>, BackendError>;
+    ) -> Result<<Self::Dev as Device>::Bytes, BackendError>;
 
     /// 暂存字节分配(清零)。允许 Capturing 相(捕获安全分配)。
     fn alloc_bytes_scratch(
         &self,
         n_bytes: usize,
-    ) -> Result<<Self::Dev as Device>::Scratch<u8>, BackendError>;
+    ) -> Result<<Self::Dev as Device>::Bytes, BackendError>;
 
     // ---- 类型化分配入口(2026-09-23 用户裁决:分配只经池,Device 不分担;
     // 默认转发 = 字节面 + 类型视图标注,存量调用点零改动)----
@@ -364,6 +364,8 @@ pub trait Device: Clone + Send + Sync + 'static {
     type Remote<T: MemValue>: DevBuf<T>;
     /// 池对象类型
     type Pool: Pool;
+    /// 裸池块(u8 字节面;dtype 运行时字段化后合并 Tensor 的存储形态)
+    type Bytes: DevBuf<u8> + OpaqueDevBuf + Clone;
 
     /// 本实例绑定的卡(设备隔离律:Device : 卡 = 1:1)
     fn desc(&self) -> &DeviceDesc;
@@ -418,10 +420,10 @@ pub trait Device: Clone + Send + Sync + 'static {
     /// 池分配的整块边界保证)。
     fn cast_persistent<T: MemValue>(
         &self,
-        b: Self::Persistent<u8>,
+        b: Self::Bytes,
         len: usize,
     ) -> Self::Persistent<T>;
 
     /// 同 [`Device::cast_persistent`](暂存域)。
-    fn cast_scratch<T: MemValue>(&self, b: Self::Scratch<u8>, len: usize) -> Self::Scratch<T>;
+    fn cast_scratch<T: MemValue>(&self, b: Self::Bytes, len: usize) -> Self::Scratch<T>;
 }

@@ -138,14 +138,11 @@ mod tests {
 
         let d_key = pool.htod_persistent_in::<f32>(key.clone()).unwrap();
         let d_value = pool.htod_persistent_in::<f32>(value.clone()).unwrap();
-        let d_slot = pool
-            .htod_persistent_in::<i64>(slot_mapping.clone())
+        let d_slot = pool.htod_persistent_in::<i64>(slot_mapping.clone())
             .unwrap();
-        let d_kcache = pool
-            .alloc_persistent_in::<f32>(BLOCKS * HEADS * HEAD_SIZE * BLOCK_SIZE)
+        let d_kcache = pool.alloc_persistent_in::<f32>(BLOCKS * HEADS * HEAD_SIZE * BLOCK_SIZE)
             .unwrap();
-        let d_vcache = pool
-            .alloc_persistent_in::<f32>(BLOCKS * HEADS * HEAD_SIZE * BLOCK_SIZE)
+        let d_vcache = pool.alloc_persistent_in::<f32>(BLOCKS * HEADS * HEAD_SIZE * BLOCK_SIZE)
             .unwrap();
         dev.ctx().synchronize().unwrap();
 
@@ -666,8 +663,7 @@ mod paged_tests {
         let d_vc = pool.htod_persistent_in::<u16>(value_cache.clone()).unwrap();
         let d_bt = pool.htod_persistent_in::<i32>(block_tables.clone()).unwrap();
         let d_cl = pool.htod_persistent_in::<i32>(context_lens.clone()).unwrap();
-        let d_out = pool
-            .alloc_persistent_in::<u16>(NUM_SEQS * HEADS * HEAD_SIZE)
+        let d_out = pool.alloc_persistent_in::<u16>(NUM_SEQS * HEADS * HEAD_SIZE)
             .unwrap();
         // 探针:预填 0xAA,区分"核没写"(保留 AA)vs"写了零"
         unsafe {
@@ -903,23 +899,18 @@ mod paged_tests {
         let d_vc = pool.htod_persistent_in::<u16>(value_cache.clone()).unwrap();
         let d_bt = pool.htod_persistent_in::<i32>(block_tables.clone()).unwrap();
         let d_cl = pool.htod_persistent_in::<i32>(context_lens.clone()).unwrap();
-        let d_out_v1 = pool
-            .alloc_persistent_in::<u16>(NUM_SEQS * HEADS * HEAD_SIZE)
+        let d_out_v1 = pool.alloc_persistent_in::<u16>(NUM_SEQS * HEADS * HEAD_SIZE)
             .unwrap();
-        let d_out_v2 = pool
-            .alloc_persistent_in::<u16>(NUM_SEQS * HEADS * HEAD_SIZE)
+        let d_out_v2 = pool.alloc_persistent_in::<u16>(NUM_SEQS * HEADS * HEAD_SIZE)
             .unwrap();
 
         // v2 临时缓冲(A5.2:调用方 scratch;P = ceil(1000/512) = 2)
         const PARTS: usize = 2;
-        let d_exp = pool
-            .alloc_persistent_in::<f32>(NUM_SEQS * HEADS * PARTS)
+        let d_exp = pool.alloc_persistent_in::<f32>(NUM_SEQS * HEADS * PARTS)
             .unwrap();
-        let d_maxl = pool
-            .alloc_persistent_in::<f32>(NUM_SEQS * HEADS * PARTS)
+        let d_maxl = pool.alloc_persistent_in::<f32>(NUM_SEQS * HEADS * PARTS)
             .unwrap();
-        let d_tmp = pool
-            .alloc_persistent_in::<u16>(NUM_SEQS * HEADS * PARTS * HEAD_SIZE)
+        let d_tmp = pool.alloc_persistent_in::<u16>(NUM_SEQS * HEADS * PARTS * HEAD_SIZE)
             .unwrap();
 
         let mut kern = PagedKernels::new(dev.ctx()).unwrap();
@@ -1164,8 +1155,7 @@ mod paged_tests {
         let d_vc = pool.htod_persistent_in::<u16>(value_cache.clone()).unwrap();
         let d_bt = pool.htod_persistent_in::<i32>(block_tables.clone()).unwrap();
         let d_cl = pool.htod_persistent_in::<i32>(context_lens.clone()).unwrap();
-        let d_out = pool
-            .alloc_persistent_in::<u16>(NUM_SEQS * HEADS * HEAD_SIZE)
+        let d_out = pool.alloc_persistent_in::<u16>(NUM_SEQS * HEADS * HEAD_SIZE)
             .unwrap();
         dev.ctx().synchronize().unwrap();
 
@@ -1336,21 +1326,16 @@ mod paged_tests {
         let d_vc = pool.htod_persistent_in::<u16>(value_cache.clone()).unwrap();
         let d_bt = pool.htod_persistent_in::<i32>(block_tables.clone()).unwrap();
         let d_cl = pool.htod_persistent_in::<i32>(context_lens.clone()).unwrap();
-        let d_out_v1 = pool
-            .alloc_persistent_in::<u16>(NUM_SEQS * HEADS * HEAD_SIZE)
+        let d_out_v1 = pool.alloc_persistent_in::<u16>(NUM_SEQS * HEADS * HEAD_SIZE)
             .unwrap();
-        let d_out_v2 = pool
-            .alloc_persistent_in::<u16>(NUM_SEQS * HEADS * HEAD_SIZE)
+        let d_out_v2 = pool.alloc_persistent_in::<u16>(NUM_SEQS * HEADS * HEAD_SIZE)
             .unwrap();
         const PARTS: usize = 2;
-        let d_exp = pool
-            .alloc_persistent_in::<f32>(NUM_SEQS * HEADS * PARTS)
+        let d_exp = pool.alloc_persistent_in::<f32>(NUM_SEQS * HEADS * PARTS)
             .unwrap();
-        let d_maxl = pool
-            .alloc_persistent_in::<f32>(NUM_SEQS * HEADS * PARTS)
+        let d_maxl = pool.alloc_persistent_in::<f32>(NUM_SEQS * HEADS * PARTS)
             .unwrap();
-        let d_tmp = pool
-            .alloc_persistent_in::<u16>(NUM_SEQS * HEADS * PARTS * HEAD_SIZE)
+        let d_tmp = pool.alloc_persistent_in::<u16>(NUM_SEQS * HEADS * PARTS * HEAD_SIZE)
             .unwrap();
 
         let mut kern = PagedKernels::new(dev.ctx()).unwrap();

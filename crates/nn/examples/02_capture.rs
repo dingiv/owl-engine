@@ -18,7 +18,7 @@ use owl_cuda::CudaDevice;
 use owl_iface::{Device, MemPhase, PoolConfig, PoolKind};
 use owl_nn::cublas::NnBlas;
 use owl_nn::ops::OpsCtx;
-use owl_nn::tensor::{Tensor, TensorPoolOps};
+use owl_nn::tensor::{TypedTensor, TensorPoolOps};
 use owl_nn::{CaptureRecorder, KernelCtx};
 use std::time::Instant;
 
@@ -43,14 +43,14 @@ fn run_chain<D: owl_iface::Device>(
     ctx: &KernelCtx,
     ops: &mut OpsCtx,
     blas: &NnBlas,
-    w: &Tensor<f32, D>,
-    a: &Tensor<f32, D>,
-    bias: &Tensor<f32, D>,
-    alpha: &Tensor<f32, D>,
-    mm_out: &mut Tensor<f32, D>,
-    add_out: &mut Tensor<f32, D>,
-    silu_out: &mut Tensor<f32, D>,
-    out: &mut Tensor<f32, D>,
+    w: &TypedTensor<f32, D>,
+    a: &TypedTensor<f32, D>,
+    bias: &TypedTensor<f32, D>,
+    alpha: &TypedTensor<f32, D>,
+    mm_out: &mut TypedTensor<f32, D>,
+    add_out: &mut TypedTensor<f32, D>,
+    silu_out: &mut TypedTensor<f32, D>,
+    out: &mut TypedTensor<f32, D>,
 ) -> Result<(), owl_iface::BackendError> {
     ops.matmul(ctx, blas, w, a, mm_out)?;
     ops.add(ctx, mm_out, bias, add_out)?;

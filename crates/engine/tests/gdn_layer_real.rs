@@ -246,6 +246,7 @@ fn host_gated_rmsnorm(x: &[f32], z: &[f32], gamma: &[f32], t: usize, eps: f64) -
     out
 }
 
+#[allow(dead_code)]
 fn max_abs_diff(a: &[f32], b: &[f32]) -> (usize, f32) {
     let mut idx = 0usize;
     let mut m = 0f32;
@@ -1056,7 +1057,7 @@ fn gdn_layer8_full_device_chain() {
     let x = gen_x();
     let (host_y, host_segs) = host_layer_forward(&w, &x);
     let seg = |n: &str| host_segs.iter().find(|(s, _)| *s == n).unwrap().1.clone();
-    use owl_engine::models::layers::{Module, OwlTensor};
+    use owl_engine::models::layers::Module;
 
     // Linear 投影(与层同 vb 路径)
     let lin_qkv = owl_engine::models::layers::linear::linear_no_bias(
