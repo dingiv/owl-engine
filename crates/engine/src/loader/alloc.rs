@@ -6,7 +6,7 @@
 
 use owl_nn::Dtype;
 use crate::error::Result;
-use owl_iface::Device;
+use owl_cuda::CudaDevice;
 
 /// host 侧张量(内存 allocator 的产出;测试/传输层通用)。
 #[derive(Clone)]
@@ -75,8 +75,8 @@ pub struct DeviceWeightAllocator<P> {
 
 impl<P> DeviceWeightAllocator<P>
 where
-    P: owl_nn::TensorPoolOps,
-    P::Dev: Device,
+    // Phase 2 过渡:擦除桥(CUDA 具体域)随 tensor 合并迁入;唯一后端即 CUDA
+    P: owl_nn::TensorPoolOps<Dev = CudaDevice>,
 {
     pub fn new(pool: std::sync::Arc<P>) -> Self {
         Self { pool }
@@ -217,8 +217,8 @@ fn f32_to_f16_rne(f: f32) -> u16 {
 
 impl<P> WeightAllocator for DeviceWeightAllocator<P>
 where
-    P: owl_nn::TensorPoolOps,
-    P::Dev: Device,
+    // 与 materialize_dyn 同界(Phase 2 过渡:擦除桥 CUDA 具体)
+    P: owl_nn::TensorPoolOps<Dev = CudaDevice>,
 {
     fn alloc(&self, _shape: &[usize], _dtype: Dtype) -> Result<HostTensor> {
         // 显存直分不走 HostTensor;materialize 全量覆写,统一走 materialize
@@ -316,17 +316,13 @@ mod tests {
             assert_eq!(dt.shape(), &[2, 2]);
             let got: Vec<f32> = match dtype {
                 Dtype::F16 => dt
-                    .typed_f16()
-                    .unwrap()
-                    .to_vec()
+                    .to_vec::<owl_nn::F16>()
                     .unwrap()
                     .into_iter()
                     .map(|h| to_f32(dtype, h.0))
                     .collect(),
                 _ => dt
-                    .typed_bf16()
-                    .unwrap()
-                    .to_vec()
+                    .to_vec::<owl_nn::Bf16>()
                     .unwrap()
                     .into_iter()
                     .map(|h| to_f32(dtype, h.0))

@@ -41,7 +41,7 @@ pub use buffers::{Persistent, RemoteBuf, Scratch, VmmBuf};
 pub use device::{CudaBackend, CudaDevice};
 pub use governor::{Budget, LedgerSnapshot};
 pub use graph::{CaptureFrame, CaptureSession, DeviceGraph};
-pub use pool::CudaPool;
+pub use pool::{CudaPool, CudaPoolBuf};
 pub use owl_iface::{BackendError, MemPhase, MemStats};
 
 #[cfg(test)]

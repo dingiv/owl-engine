@@ -610,8 +610,8 @@ fn release_backing(backing: PoolBacking, pool: &CudaPool) {
 }
 
 impl CudaPoolBuf {
-    /// 令牌读取(哨兵①登记/校验用)
-    pub(crate) fn token(&self) -> BufToken {
+    /// 令牌读取(哨兵①登记/校验用;pub = 跨 crate 的合并 Tensor 词汇面)
+    pub fn token(&self) -> BufToken {
         self.token
     }
 }

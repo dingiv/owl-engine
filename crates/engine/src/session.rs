@@ -20,7 +20,7 @@ use crate::Result;
 use owl_cuda::ffi::sys;
 use owl_cuda::CudaDevice;
 use owl_nn::DynTensor;
-use owl_nn::tensor::Tensor;
+use owl_nn::tensor::TypedTensor as Tensor; // 过渡:Phase 3 迁移合并 Tensor
 
 /// 引擎侧擦除张量别名(= ETensor)
 type ETensor = DynTensor<CudaDevice>;

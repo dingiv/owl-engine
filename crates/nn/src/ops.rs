@@ -16,7 +16,8 @@
 //! 裁决 3①)+ T2 的 cuBLAS(`NnBlas`,workspace 预钉)。
 
 use crate::kernels::Kernels;
-use crate::tensor::Tensor;
+// 过渡:本文件仍消费强类型面;Phase 3 随 f32 签名迁移改 TensorRef
+use crate::tensor::TypedTensor as Tensor;
 use crate::{CaptureSafe, KernelCtx};
 use owl_iface::BackendError;
 use std::sync::Arc;

@@ -34,7 +34,15 @@ impl<T: MemValue> Persistent<T> {
         (self.buf.as_ref().expect("Persistent 未被 drop").clone(), self.token)
     }
 
-    pub(crate) fn new(buf: CudaPoolBuf, len: usize) -> Self {
+    /// 池块租约(Arc +1;类型视图无关;tensor 合并后的保活形态)。
+    /// 仅借块不消费外壳:Persistent 本身生命周期照旧。
+    pub fn block(&self) -> CudaPoolBuf {
+        self.buf.as_ref().expect("Persistent 未被 drop").clone()
+    }
+
+    /// 字节块 → 类型视图装配(cast_persistent 的零成本底座;
+    /// len = 元素数,块字节容量由调用方保证 ≥ len×size_of::<T>())
+    pub(crate) fn from_block(buf: CudaPoolBuf, len: usize) -> Self {
         let token = buf.token();
         Self {
             buf: Some(buf),
@@ -83,7 +91,13 @@ impl<T: MemValue> Clone for Scratch<T> {
 }
 
 impl<T: MemValue> Scratch<T> {
-    pub(crate) fn new(buf: CudaPoolBuf, len: usize) -> Self {
+    /// 池块租约(同 [`Persistent::block`],暂存域)
+    pub fn block(&self) -> CudaPoolBuf {
+        self.buf.as_ref().expect("Scratch 未被 drop").clone()
+    }
+
+    /// 字节块 → 暂存域类型视图装配(同 [`Persistent::from_block`])
+    pub(crate) fn from_block(buf: CudaPoolBuf, len: usize) -> Self {
         let token = buf.token();
         Self {
             buf: Some(buf),
