@@ -6,7 +6,7 @@ use crate::device::CudaDevice;
 use cudarc::driver::sys;
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use owl_iface::{
-    BackendError, BufToken, DevBuf, Device, MemPhase, MemValue, OpaqueDevBuf, Pool, PoolBuf,
+    BackendError, BufToken, DevBuf, Device, MemPhase, OpaqueDevBuf, Pool, PoolBuf,
     PoolId, PoolKind, PoolUsage,
 };
 use parking_lot::Mutex;
@@ -167,23 +167,23 @@ impl Pool for CudaPool {
         Ok(PoolBuf::wrap(Box::new(self.malloc_inner(bytes)?)))
     }
 
-    fn alloc_persistent_in<T: MemValue>(
+    // ---- 字节域第一公民(iface 字节化面;泛型方法由默认转发承载)----
+
+    fn alloc_bytes_persistent(
         &self,
-        len: usize,
-    ) -> Result<<CudaDevice as Device>::Persistent<T>, BackendError> {
-        let bytes = (len * std::mem::size_of::<T>()) as u64;
-        let buf = self.malloc_persistent_buf(bytes)?;
+        n_bytes: usize,
+    ) -> Result<<CudaDevice as Device>::Persistent<u8>, BackendError> {
+        let buf = self.malloc_persistent_buf(n_bytes as u64)?;
         self.gov.stats.lock().persistent_allocs += 1;
-        Ok(crate::buffers::Persistent::new(buf, len))
+        Ok(crate::buffers::Persistent::new(buf, n_bytes))
     }
 
-    fn htod_persistent_in<T: MemValue>(
+    fn htod_bytes_persistent(
         &self,
-        src: Vec<T>,
-    ) -> Result<<CudaDevice as Device>::Persistent<T>, BackendError> {
-        let len = src.len();
-        let bytes = (len * std::mem::size_of::<T>()) as u64;
-        let buf = self.malloc_persistent_buf(bytes)?;
+        src: &[u8],
+    ) -> Result<<CudaDevice as Device>::Persistent<u8>, BackendError> {
+        let bytes = src.len();
+        let buf = self.malloc_persistent_buf(bytes as u64)?;
         self.ctx.bind_to_thread().map_err(|e| BackendError::Init(format!("{e:?}")))?;
         // P0-3 口径:H2D 必须走池流(async + sync),NULL 流与主流无序
         // (审计同族案:cu_seqlens 清零/cat 脏数据)
@@ -192,7 +192,7 @@ impl Pool for CudaPool {
             sys::cuMemcpyHtoDAsync_v2(
                 buf.device_ptr() as sys::CUdeviceptr,
                 src.as_ptr() as *const core::ffi::c_void,
-                bytes as usize,
+                bytes,
                 self.stream.cu_stream(),
             )
             .result()
@@ -203,17 +203,16 @@ impl Pool for CudaPool {
             })?;
         }
         self.gov.stats.lock().persistent_allocs += 1;
-        Ok(crate::buffers::Persistent::new(buf, len))
+        Ok(crate::buffers::Persistent::new(buf, bytes))
     }
 
-    fn alloc_scratch_in<T: MemValue>(
+    fn alloc_bytes_scratch(
         &self,
-        len: usize,
-    ) -> Result<<CudaDevice as Device>::Scratch<T>, BackendError> {
-        let bytes = (len * std::mem::size_of::<T>()) as u64;
-        let buf = self.malloc_scratch_buf(bytes)?;
-        self.gov.stats.lock().persistent_allocs += 1;
-        Ok(crate::buffers::Scratch::new(buf, len))
+        n_bytes: usize,
+    ) -> Result<<CudaDevice as Device>::Scratch<u8>, BackendError> {
+        let buf = self.malloc_scratch_buf(n_bytes as u64)?;
+        self.gov.stats.lock().scratch_allocs += 1;
+        Ok(crate::buffers::Scratch::new(buf, n_bytes))
     }
 }
 

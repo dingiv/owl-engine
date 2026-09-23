@@ -566,6 +566,30 @@ impl Device for CudaDevice {
         Ok((**p).clone())
     }
 
+    // ---- 类型视图(零成本换标;不分配不动账)----
+
+    fn cast_persistent<T: MemValue>(
+        &self,
+        b: Self::Persistent<u8>,
+        len: usize,
+    ) -> Self::Persistent<T> {
+        crate::buffers::Persistent {
+            buf: b.buf,
+            len,
+            token: b.token,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    fn cast_scratch<T: MemValue>(&self, b: Self::Scratch<u8>, len: usize) -> Self::Scratch<T> {
+        crate::buffers::Scratch {
+            buf: b.buf,
+            len,
+            token: b.token,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
 }
 
 /// 池构造(部件注入;`Device::create_pool` 与默认池初始化共用)。
