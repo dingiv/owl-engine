@@ -371,4 +371,161 @@ mod tests {
         drop(buf);
         dev.set_phase(MemPhase::Idle);
     }
+
+    /// P1-2 回归①:pre-window 出生、窗口内死亡的块(地址烙进图)——
+    /// 释放须停放至图 drop。毒化开下去旧路径必红(Idle drain 归还→
+    /// 0xFF 覆盖→回放读到毒);修复后 replay 读到真值。
+    #[test]
+    fn p1_2_park_pre_window_death_survives_idle_drain() {
+        let _g = gpu();
+        let dev = make();
+        dev.set_poison_freed(true);
+        let pool = scratch_pool(&dev, "p12a", 1 << 20);
+        // 源块:窗口前出生,预填 0x5A(毒化哨兵之外的真值)
+        let src = pool.malloc_scratch(4096).unwrap();
+        let out = pool.alloc_scratch_in::<u8>(4096).unwrap();
+        unsafe {
+            sys::cuMemsetD8Async(
+                src.device_ptr() as sys::CUdeviceptr,
+                0x5A,
+                4096,
+                dev.stream().cu_stream(),
+            )
+            .result()
+            .unwrap();
+        }
+        dev.ctx().synchronize().unwrap();
+        dev.note_launch(); // 姿势 6 warmup
+
+        let src_ptr = src.device_ptr() as sys::CUdeviceptr;
+        let out_ptr = out.device_ptr() as sys::CUdeviceptr;
+        let mut session = dev.capture_session().unwrap();
+        session.lease_scratch(&out); // 哨兵③:pre-window 块须在租约表
+        let (_, graph) = session
+            .capture(sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH, |frame| {
+                unsafe {
+                    // 图仅含一次读依赖:D2D 拷贝 src→out(src 只读)
+                    sys::cuMemcpyDtoDAsync_v2(
+                        out_ptr,
+                        src_ptr,
+                        4096,
+                        frame.stream.cu_stream(),
+                    )
+                    .result()
+                    .unwrap();
+                }
+                // 窗口内死亡:src 的 Arc 在闭包内归零(pre-window 出生块)
+                drop(src);
+                drop(pool);
+                Ok(())
+            })
+            .unwrap();
+        graph.upload().unwrap();
+
+        // 净空窗口 drain:旧路径此处释放+毒化 src;修复后 src 停放在图里
+        dev.set_phase(MemPhase::Idle);
+
+        graph.launch().unwrap();
+        dev.ctx().synchronize().unwrap();
+        let mut host = [0u8; 4096];
+        unsafe {
+            sys::cuMemcpyDtoH_v2(
+                host.as_mut_ptr() as *mut std::ffi::c_void,
+                out_ptr,
+                4096,
+            )
+            .result()
+            .unwrap();
+        }
+        assert!(host.iter().all(|&b| b == 0x5A), "replay 读到悬空/毒化数据(P1-2 回归①)");
+        drop(out);
+        drop(graph);
+        dev.set_phase(MemPhase::Idle);
+        assert_eq!(dev.ledger().bytes_alive, 0, "图销毁+净空后账本归零");
+    }
+
+    /// P1-2 回归②:窗口内出生、窗口内死亡的块(birth-pin)——旧路径
+    /// Arc 归零即 defer→Idle drain 释放;修复后出生即钉住,随图走。
+    #[test]
+    fn p1_2_born_in_window_pin_survives_idle_drain() {
+        let _g = gpu();
+        let dev = make();
+        dev.set_poison_freed(true);
+        let pool = scratch_pool(&dev, "p12b", 1 << 20);
+        let out = pool.alloc_scratch_in::<u8>(4096).unwrap();
+        unsafe {
+            sys::cuMemsetD8Async(
+                out.device_ptr() as sys::CUdeviceptr,
+                0,
+                4096,
+                dev.stream().cu_stream(),
+            )
+            .result()
+            .unwrap();
+        }
+        dev.ctx().synchronize().unwrap();
+        dev.note_launch();
+
+        let out_ptr = out.device_ptr() as sys::CUdeviceptr;
+        let pool2 = pool.clone();
+        let mut session = dev.capture_session().unwrap();
+        session.lease_scratch(&out); // 哨兵③:pre-window 块须在租约表
+        let (tmp, graph) = session
+            .capture(sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH, |frame| {
+                // 窗口内出生:池分配(捕获期 scratch 的真实形态);
+                // 图只含 D2D 拷贝(tmp 只读依赖)——真值由捕获后的
+                // eager memset 预填(窗口内 eager 发射会破坏 capture)
+                let tmp = pool2.malloc_scratch(4096).unwrap();
+                let tmp_ptr = tmp.device_ptr() as sys::CUdeviceptr;
+                unsafe {
+                    sys::cuMemcpyDtoDAsync_v2(
+                        out_ptr,
+                        tmp_ptr,
+                        4096,
+                        frame.stream.cu_stream(),
+                    )
+                    .result()
+                    .unwrap();
+                }
+                // tmp 活过捕获(返回给闭包外;事后 drop——birth-pin 目标场景:
+                // 无 emit/无手工租约,birth-pin 是唯一保活通道)
+                Ok(tmp)
+            })
+            .unwrap();
+        graph.upload().unwrap();
+        // 捕获后 eager 预填真值(dev 流,不在捕获窗口内;图对 tmp 只读)
+        unsafe {
+            sys::cuMemsetD8Async(
+                tmp.device_ptr() as sys::CUdeviceptr,
+                0xA5,
+                4096,
+                dev.stream().cu_stream(),
+            )
+            .result()
+            .unwrap();
+        }
+        dev.ctx().synchronize().unwrap();
+        // 用户句柄 drop + 净空 drain:旧路径在此释放+毒化 tmp(0xFF);
+        // 修复后 birth-pin 钉住,回放读到 0xA5
+        drop(tmp);
+        dev.set_phase(MemPhase::Idle);
+
+        graph.launch().unwrap();
+        dev.ctx().synchronize().unwrap();
+        let mut host = [0u8; 4096];
+        unsafe {
+            sys::cuMemcpyDtoH_v2(
+                host.as_mut_ptr() as *mut std::ffi::c_void,
+                out_ptr,
+                4096,
+            )
+            .result()
+            .unwrap();
+        }
+        assert!(host.iter().all(|&b| b == 0xA5), "replay 读到悬空/毒化数据(P1-2 回归②)");
+        drop(out);
+        drop(graph);
+        dev.set_phase(MemPhase::Idle);
+        assert_eq!(dev.ledger().bytes_alive, 0, "图销毁+净空后账本归零");
+    }
 }

@@ -93,6 +93,10 @@ impl<T: MemValue> Scratch<T> {
         }
     }
 
+    pub(crate) fn lease_parts(&self) -> (CudaPoolBuf, Option<BufToken>) {
+        (self.buf.as_ref().expect("Scratch 未被 drop").clone(), self.token)
+    }
+
     pub(crate) fn token(&self) -> Option<BufToken> {
         self.token
     }

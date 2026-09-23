@@ -14,6 +14,7 @@ use owl_iface::{
     Arch, Backend, BackendError, BackendFamily, BufToken, Device, DeviceDesc, MemPhase,
     MemStats, MemValue, PoolConfig, PoolId,
  PoolKind, };
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// CUDA 设备实例:一个 CudaDevice 绑定一张卡(UUID 钉),账本独立。
@@ -29,6 +30,9 @@ pub struct DeviceInner {
     pub(crate) stream: Arc<CudaStream>,
     pub(crate) gov: Arc<Governor>, // 相位机/BufToken 台账/延迟队列(非账本)
     pub(crate) desc: DeviceDesc,
+    /// 池注册表(强持;2026-09-24 破环:原在 Governor 且与 CudaPool.gov
+    /// 至成强-强环,池/账本永不可回收——根 = 设备,治理不再回指池)
+    pub(crate) pools: parking_lot::Mutex<HashMap<u64, Arc<CudaPool>>>,
     /// 默认动态池(General 档;容量由构造函数参数指定;与设备同生命周期,
     /// 初始化期未装填前访问 = 编序违约)
     pool: std::sync::OnceLock<Arc<CudaPool>>,
@@ -80,8 +84,13 @@ impl CudaDevice {
                 arch: Arch::Sm86, // TODO(M1): compute capability 运行时读取
                 total_bytes: total as u64,
             },
+            pools: parking_lot::Mutex::new(HashMap::new()),
             pool: std::sync::OnceLock::new(),
         });
+        // P0-4 毒化探测器:环境初始化(测试可用 set_poison_freed 覆写)
+        if std::env::var_os("OWL_POISON_FREED").is_some_and(|v| v != "0") {
+            inner.gov.set_poison_freed(true);
+        }
         let dev = Self { inner };
         // 默认动态池(用户裁决:权重/暂存合一,General 档,容量构造参数指定)
         let p = create_pool_for(&dev, PoolConfig {
@@ -230,9 +239,14 @@ impl CudaDevice {
     /// 设备级策略:广播到全部池账本,新建池建账时继承。
     pub fn set_budget(&self, budget: Budget) {
         *self.gov.budget_seed.lock() = Some(budget);
-        for p in self.gov.pools.lock().values() {
+        for p in self.inner.pools.lock().values() {
             p.ledger.set_budget(budget);
         }
+    }
+
+    /// P0-4 毒化探测器开关(测试/诊断覆写;环境默认 OWL_POISON_FREED=1)
+    pub fn set_poison_freed(&self, on: bool) {
+        self.gov.set_poison_freed(on);
     }
 
     /// A5.3 第三道闸:driver 侧对账(free,total)。
@@ -347,9 +361,10 @@ impl CudaDevice {
 pub fn ledger(&self) -> LedgerSnapshot {
     let mut bytes_alive = 0u64;
     let mut bytes_allocated_total = 0u64;
-    for p in self.gov.pools.lock().values() {
-        bytes_alive += *p.ledger.bytes_alive.lock();
-        bytes_allocated_total += *p.ledger.bytes_allocated_total.lock();
+    for p in self.inner.pools.lock().values() {
+        let (a, t) = p.ledger.alive_and_total();
+        bytes_alive += a;
+        bytes_allocated_total += t;
     }
     LedgerSnapshot {
         bytes_alive,
@@ -556,12 +571,13 @@ impl Device for CudaDevice {
         })
     }
 
+    // FIXME: 为什么这里面还会有 create_pool 呢
     fn create_pool(&self, cfg: PoolConfig) -> Result<Self::Pool, BackendError> {
         Ok((*create_pool_for(self, cfg)?).clone())
     }
 
     fn pool(&self, id: PoolId) -> Result<Self::Pool, BackendError> {
-        let pools = self.gov.pools.lock();
+        let pools = self.inner.pools.lock();
         let p = pools.get(&id.0).ok_or(BackendError::UnknownPool(id.0))?;
         Ok((**p).clone())
     }
@@ -577,7 +593,7 @@ pub(crate) fn create_pool_for(
     cfg: PoolConfig,
 ) -> Result<Arc<CudaPool>, BackendError> {
     let (ctx, stream, gov) = (&dev.inner.ctx, &dev.inner.stream, &dev.inner.gov);
-    let mut pools = gov.pools.lock();
+    let mut pools = dev.inner.pools.lock();
     if pools.values().any(|p| p.name == cfg.name) {
         return Err(BackendError::Init(format!(
             "A5.1: 重复池名 '{}'——分解表不应有两行同名账",
@@ -594,15 +610,11 @@ pub(crate) fn create_pool_for(
         ctx: Arc::clone(ctx),
         stream: Arc::clone(stream),
         gov: Arc::clone(gov),
-        ledger: Arc::new(Ledger {
-            ctx: Some(Arc::clone(ctx)),
-            capacity: cfg.bytes,
-            used: parking_lot::Mutex::new(0),
-            peak: parking_lot::Mutex::new(0),
-            bytes_alive: parking_lot::Mutex::new(0),
-            bytes_allocated_total: parking_lot::Mutex::new(0),
-            budget: parking_lot::Mutex::new(*gov.budget_seed.lock()),
-        }),
+        ledger: Arc::new(Ledger::new(
+            Some(Arc::clone(ctx)),
+            cfg.bytes,
+            *gov.budget_seed.lock(),
+        )),
         dev: dev.clone(),
     });
     pools.insert(id, Arc::clone(&pool));

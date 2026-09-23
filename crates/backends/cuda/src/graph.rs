@@ -13,7 +13,7 @@
 use super::audit::{audit_graph, AuditReport};
 use super::governor::Governor;
 use super::pool::PoolBufInner;
-use crate::buffers::Persistent;
+use crate::buffers::{Persistent, Scratch};
 use crate::ffi::{sys, graph_destroy, graph_exec_destroy, graph_instantiate, graph_launch, stream_end_capture};
 use cudarc::driver::CudaStream;
 use owl_iface::{BackendError, BufToken, MemPhase, MemValue};
@@ -46,7 +46,21 @@ impl CaptureSession {
                 self.leases.push(tok);
             }
         }
-        // 从带 Drop 的类型不能移动字段:克隆 Arc 后弃外壳
+        // 从带 Drop 的类型不能移动字段：克隆 Arc 后弃外壳
+        let inner = buf.inner.clone();
+        drop(buf);
+        self.keepalive.push(inner);
+    }
+
+    /// 手工登记暂存域依赖缓冲(与 [`CaptureSession::lease`] 对称；原始 FFI
+    /// 引用的 pre-window scratch 块用，哨兵③对账需要它在租约表)
+    pub fn lease_scratch<T: MemValue>(&mut self, t: &Scratch<T>) {
+        let (buf, token) = t.lease_parts();
+        if let Some(tok) = token {
+            if !self.leases.iter().any(|l| l.id == tok.id) {
+                self.leases.push(tok);
+            }
+        }
         let inner = buf.inner.clone();
         drop(buf);
         self.keepalive.push(inner);
@@ -86,6 +100,8 @@ impl CaptureSession {
             self.gov.push_phase(MemPhase::Capturing);
             PhaseGuard(&self.gov)
         };
+        // P1-2:出生钉住账水位线(本窗口收编 [mark..);失败时从 mark 弃置
+        let born_mark = self.gov.capture_born_mark();
 
         self.stream
             .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
@@ -135,9 +151,11 @@ impl CaptureSession {
                         let _ = graph_destroy(g);
                     }
                 }
-                // P1:捕获失败,本轮租约/保活全部作废(它们只服务于本次捕获)
+                // P1:捕获失败,本轮租约/保活全部作废(它们只服务于本次捕获);
+                // P1-2:窗口钉住账同步清理(borns 归零落 park,统一执行释放)
                 self.leases.clear();
                 self.keepalive.clear();
+                self.gov.discard_capture_state(born_mark);
                 return Err(BackendError::Init(format!(
                     "capture: 闭包 panic(已兜底:捕获流已复位、图已销毁): {msg}"
                 )));
@@ -153,6 +171,20 @@ impl CaptureSession {
             Ok(r) => {
                 let cu_graph = unsafe { stream_end_capture(self.stream.cu_stream()) }
                     .map_err(|e| BackendError::Init(format!("end_capture: {e:?}")))?;
+
+                // P1-2 收编①:窗口内出生的块(birth-pin 的强引用)——它们的地址
+                // 可能已烙进图,统一入图 keepalive(图存活期钉住物理页);
+                // 令牌同步入租约表(哨兵③把它们当合法依赖对账 + replay 校验)
+                let borns = self.gov.take_capture_borns_from(born_mark);
+                for inner in borns {
+                    let tok = inner.token.clone();
+                    if !self.leases.iter().any(|l| l.id == tok.id) {
+                        self.leases.push(tok);
+                    }
+                    if !self.keepalive.iter().any(|k| Arc::ptr_eq(k, &inner)) {
+                        self.keepalive.push(inner);
+                    }
+                }
 
                 // 自动租约:emit 期已升级的强引用合并进会话 keepalive;
                 // 令牌在 emit 后、定影前死亡的(真 P 阶段违规)仍被 validate 拦截
@@ -189,6 +221,7 @@ impl CaptureSession {
                         "[owl-graph] A1.7 违约细节:定影前死亡的令牌 = {:?} (P 阶段缓冲生命周期必须 ≥ 捕获窗口)",
                         dead
                     );
+                    self.gov.discard_capture_state(born_mark);
                     return Err(BackendError::LawViolation(
                         "A1.7:捕获依赖缓冲已在定影前死亡(P 阶段缓冲生命周期必须 ≥ 捕获窗口;细节见日志)",
                     ));
@@ -202,6 +235,7 @@ impl CaptureSession {
                         unsafe {
                             let _ = graph_destroy(cu_graph);
                         }
+                        self.gov.discard_capture_state(born_mark);
                         return Err(e);
                     }
                 };
@@ -235,6 +269,7 @@ impl CaptureSession {
                             .collect::<Vec<_>>(),
                         audit.ptr_refs.iter().map(|v| format!("0x{v:x}")).collect::<Vec<_>>(),
                     );
+                    self.gov.discard_capture_state(born_mark);
                     return Err(BackendError::LawViolation(Box::leak(detail.into_boxed_str())));
                 }
                 if !audit.suspicious.is_empty() {
@@ -246,6 +281,10 @@ impl CaptureSession {
 
                 let exec = unsafe { graph_instantiate(cu_graph, flags) }
                     .map_err(|e| BackendError::Init(format!("instantiate: {e:?}")))?;
+                // P1-2 收编②:窗口内死亡的块(pre-window 出生、释放闭包停放)——
+                // 图 drop 时才真正释放(销毁 exec 之后);取出时机 = 定影
+                // 在手,失败路径已全部覆盖 discard
+                let parked = self.gov.take_capture_parked();
                 Ok((
                     r,
                     DeviceGraph {
@@ -254,13 +293,15 @@ impl CaptureSession {
                         stream: Arc::clone(&self.stream),
                         leases: std::mem::take(&mut self.leases),
                         keepalive: std::mem::take(&mut self.keepalive),
+                        parked,
                         gov: Arc::clone(&self.gov),
                         audit,
                     },
                 ))
             }
             Err(e) => {
-                // 闭包失败:结束并丢弃捕获(取回图即销毁);P1:同时作废本轮租约
+                // 闭包失败:结束并丢弃捕获(取回图即销毁);P1:同时作废本轮租约;
+                // P1-2:窗口钉住账清理(borns 归零落 park,统一执行释放)
                 if let Ok(g) = unsafe { stream_end_capture(self.stream.cu_stream()) } {
                     unsafe {
                         let _ = graph_destroy(g);
@@ -268,6 +309,7 @@ impl CaptureSession {
                 }
                 self.leases.clear();
                 self.keepalive.clear();
+                self.gov.discard_capture_state(born_mark);
                 Err(e)
             }
         };
@@ -283,9 +325,12 @@ pub struct DeviceGraph {
     stream: Arc<CudaStream>,
     leases: Vec<BufToken>,
     /// 强租约:持有即语义——图存活期钉住依赖缓冲的物理页,无需读取;
-    /// drop 时 Arc 计数回落,回收流程自然解封。
+    /// drop 时 Arc 计数回落,回收流程自然解封。含 P1-2 窗口出生块。
     #[allow(dead_code)]
     keepalive: Vec<Arc<PoolBufInner>>,
+    /// P1-2:窗口内死亡块的停放释放闭包——图 drop(销毁 exec 之后)才
+    /// 执行;图存活期这些地址被图引用,提前释放 = 回放悬空
+    parked: Vec<super::governor::DeferredFree>,
     /// 治理句柄(replay 前租约校验通道;P1 后全构建生效)
     gov: Arc<Governor>,
     audit: AuditReport,
@@ -338,6 +383,12 @@ impl Drop for DeviceGraph {
             if !self.cu_graph.is_null() {
                 let _ = graph_destroy(self.cu_graph);
             }
+        }
+        // P1-2:窗口内死亡块的停放释放(exec 已销毁,图不再引用;先同步
+        // 防末次 replay 在飞——release_backing 对 VMM 自带 ctx sync)
+        let _ = self.gov.ctx.as_ref().map(|c| c.synchronize());
+        for f in std::mem::take(&mut self.parked) {
+            f();
         }
     }
 }

@@ -12,53 +12,80 @@ use owl_iface::{
 use parking_lot::Mutex;
 use std::sync::Arc;
 
-/// 池内账本(2026-09-23 用户裁决:内存记账归池,Device 不持账本对象)。
+/// 池内账本(2026-09-23 用户裁决:内存记账归池，Device 不持账本对象)。
 /// 记账三件套:字节存活账 + 池容量账 + A5 预算。相位机/BufToken 台账
 /// 不在此(仍归 Device 侧 Governor)。
+/// 2026-09-24:四项字节账收进单一 Mutex(快照不可撕裂、入/归账原子；
+/// 旧五锁形态 usage() 可读到 used/alive 分属不同时刻)。
 pub(crate) struct Ledger {
     /// A5.3 driver 侧对账用(池构造时注入)
     pub(crate) ctx: Option<Arc<CudaContext>>,
     /// 池容量上限(bytes)
     pub(crate) capacity: u64,
-    /// 池内在用字节
-    pub(crate) used: Mutex<u64>,
-    /// 峰值(诊断)
-    pub(crate) peak: Mutex<u64>,
-    /// A5.2 存活字节(本池)
-    pub(crate) bytes_alive: Mutex<u64>,
-    /// A5.2 累计分配字节(本池)
-    pub(crate) bytes_allocated_total: Mutex<u64>,
+    /// 字节账单锁四联(used/peak/alive/allocated_total)
+    state: parking_lot::Mutex<LedgerState>,
     /// A5.1 预算(None = 未设;设置后每次分配断言不超)
     pub(crate) budget: Mutex<Option<Budget>>,
 }
 
+#[derive(Default)]
+pub(crate) struct LedgerState {
+    /// 池内在用字节
+    pub(crate) used: u64,
+    /// 峰值(诊断)
+    pub(crate) peak: u64,
+    /// A5.2 存活字节(本池)
+    pub(crate) bytes_alive: u64,
+    /// A5.2 累计分配字节(本池)
+    pub(crate) bytes_allocated_total: u64,
+}
+
+impl Ledger {
+    /// 建账(device.rs 构造池时用)
+    pub(crate) fn new(
+        ctx: Option<Arc<CudaContext>>,
+        capacity: u64,
+        budget: Option<Budget>,
+    ) -> Self {
+        Self {
+            ctx,
+            capacity,
+            state: parking_lot::Mutex::new(LedgerState::default()),
+            budget: Mutex::new(budget),
+        }
+    }
+}
+
 impl Ledger {
     /// 统一入账:预算闸(A5.4)→ 容量闸(池耗尽)→ 记账。
-    /// 校验先行,失败不触账(调用方失败路径无需回滚——2026-09-22
-    /// 双重扣减下溢判例)。
+    /// 校验先行，失败不触账(调用方失败路径无需回滚——2026-09-22
+    /// 双重扣减下溢判例)。入/归账在单一 state 锁内原子完成。
+    /// A5.3 driver 对账降频:仅在逼近预算(剩余 <10%)时探
+    /// mem_get_info——旧行为每次分配都同步驱动调用，热路径不可持续。
     pub(crate) fn charge(&self, pool_name: &str, bytes: u64) -> Result<(), BackendError> {
         if let Some(b) = *self.budget.lock() {
-            let cur = *self.bytes_alive.lock();
-            if cur + bytes > b.bytes {
+            let alive = self.state.lock().bytes_alive;
+            if alive + bytes > b.bytes {
                 return Err(BackendError::LawViolation(
                     "A5.4 显存超支(引擎账本超预算,详见账本快照日志)",
                 ));
             }
-            // A5.3 第三道闸:driver 侧对账,free 低于警线即告警
-            if let Some(ctx) = &self.ctx {
-                let (free, _total) = ctx
-                    .mem_get_info()
-                    .map_err(|e| BackendError::Init(format!("{e:?}")))?;
-                if (free as u64) < b.reserve_floor {
-                    eprintln!(
-                        "[owl-mem] WARN: free {free}B < reserve_floor {}B(A5 警线,账本 alive={})",
-                        b.reserve_floor, cur
-                    );
+            // A5.3 第三道闸(降频):逼近预算才 driver 对账
+            if alive + bytes >= b.bytes - b.bytes / 10 {
+                if let Some(ctx) = &self.ctx {
+                    if let Ok((free, _total)) = ctx.mem_get_info() {
+                        if (free as u64) < b.reserve_floor {
+                            eprintln!(
+                                "[owl-mem] WARN: free {free}B < reserve_floor {}B(A5 警线,账本 alive={alive})",
+                                b.reserve_floor,
+                            );
+                        }
+                    }
                 }
             }
         }
-        let mut used = self.used.lock();
-        let available = self.capacity - *used;
+        let mut st = self.state.lock();
+        let available = self.capacity - st.used;
         if bytes > available {
             return Err(BackendError::PoolExhausted {
                 pool: pool_name.to_string(),
@@ -67,45 +94,42 @@ impl Ledger {
                 capacity: self.capacity,
             });
         }
-        *used += bytes;
-        let mut peak = self.peak.lock();
-        *peak = (*peak).max(*used);
-        drop(peak);
-        drop(used);
-        *self.bytes_alive.lock() += bytes;
-        *self.bytes_allocated_total.lock() += bytes;
+        st.used += bytes;
+        st.peak = st.peak.max(st.used);
+        st.bytes_alive += bytes;
+        st.bytes_allocated_total += bytes;
         Ok(())
     }
 
-    /// 归账(下溢饱和 + 告警)
+    /// 归账(单锁原子;下溢饱和 + 告警)
     pub(crate) fn uncharge(&self, bytes: u64) {
-        // 铁律:同一语句内不可对同一 Mutex 二次加锁(parking_lot 不可重入,
-        // `*m.lock() = m.lock()...` 形态即死锁;本次 set_phase(Idle) 挂死判例)
-        {
-            let alive = self.bytes_alive.lock();
-            if *alive < bytes {
-                eprintln!(
-                    "[owl-mem][BUG] uncharge underflow: alive={alive} bytes={bytes}",
-                );
-            }
+        let mut st = self.state.lock();
+        if st.bytes_alive < bytes {
+            eprintln!(
+                "[owl-mem][BUG] uncharge underflow: alive={} bytes={bytes}",
+                st.bytes_alive,
+            );
         }
-        {
-            let mut alive = self.bytes_alive.lock();
-            *alive = alive.saturating_sub(bytes);
-        }
-        let mut used = self.used.lock();
-        *used = used.saturating_sub(bytes);
+        st.bytes_alive = st.bytes_alive.saturating_sub(bytes);
+        st.used = st.used.saturating_sub(bytes);
     }
 
     pub(crate) fn set_budget(&self, budget: Budget) {
         *self.budget.lock() = Some(budget);
     }
 
+    /// 原子快照(单锁;跨项无撕裂)
+    pub(crate) fn alive_and_total(&self) -> (u64, u64) {
+        let st = self.state.lock();
+        (st.bytes_alive, st.bytes_allocated_total)
+    }
+
     pub(crate) fn usage(&self) -> PoolUsage {
+        let st = self.state.lock();
         PoolUsage {
             capacity: self.capacity,
-            used: *self.used.lock(),
-            peak: *self.peak.lock(),
+            used: st.used,
+            peak: st.peak,
         }
     }
 }
@@ -330,6 +354,11 @@ impl CudaPool {
             .live_bufs
             .lock()
             .insert(token.id, Arc::downgrade(&buf.inner));
+        // P1-2:捕获窗口内出生的块,出生即钉住(强引用)——防 Arc 在窗口内
+        // 归零→释放→图内地址悬空;CaptureSession 定影时按水位线收编进图
+        if self.gov.is_capturing() {
+            self.gov.pin_capture_born(Arc::clone(&buf.inner));
+        }
         Ok(buf)
     }
 
@@ -539,14 +568,21 @@ impl Drop for PoolBufInner {
         // 仅最后一个句柄消亡时到达此处(Arc 计数归零)
         let bytes = self.bytes;
         let pool = Arc::clone(&self.pool);
-        let gov = Arc::clone(&self.gov);
         let backing = std::mem::replace(self.backing.get_mut(), PoolBacking::Empty);
-        let idle = gov.phase() == MemPhase::Idle;
-        if idle {
+        let phase = self.gov.phase();
+        if phase == MemPhase::Idle {
             release_backing(backing, &pool);
             pool.uncharge(bytes);
+        } else if self.gov.is_capturing() {
+            // P1-2:捕获窗口内死亡(pre-window 出生、窗口内 Arc 归零)——
+            // 地址可能已烙进图,释放闭包停放至图 drop;旧路径 defer 到
+            // Idle drain → 图存活期回放读悬空(毒化探测器实锤的缺口)
+            self.gov.park_capture(Box::new(move || {
+                release_backing(backing, &pool);
+                pool.uncharge(bytes);
+            }));
         } else {
-            gov.defer(Box::new(move || {
+            self.gov.defer(Box::new(move || {
                 release_backing(backing, &pool);
                 pool.uncharge(bytes);
             }));
@@ -567,18 +603,14 @@ fn release_backing(backing: PoolBacking, pool: &CudaPool) {
     // P0-4(debug 归还哨兵;audit/memory-backend.md):归还即整块填 0xFF
     // ——f32 位型 = NaN、u32 位型 = u32::MAX(兼容 S4 哨兵)。任何悬空视图
     // (租约归还后仍持有的裸指针)再读立即现形,而非静默读旧值/脏值。
-    // 实现:主流 async memset + 流同步。选同步而非纯 async:归还发生在
-    // 主机侧任意线程,纯 async 无法保证 drop 返回后哨兵已生效(host 侧
-    // 悬空读会与 memset 竞速,探测器自身变成非确定性);debug-only,
-    // 同步等待的开销可接受。release 构建零开销(整段 cfg 掉)。
-    // 探测器门控:OWL_POISON_FREED=1 时启用(默认关)。
-    // 已验证:开启后 dry_run 判别③红(P1-2 立案证据,见 docs/audit/README.md);
-    // P1-2(捕获窗口 scratch 租约缺口)修复后应默认开启。
-    #[cfg(any())] // 探测器门控见上注(OWL_POISON_FREED 方案待 P1-2 修复后接线)
-    {
-        use cudarc::driver::{DevicePtr};
+    // 实现:池流 async memset + 流同步(同步而非纯 async:drop 返回后
+    // 哨兵必须已生效,否则探测器自身与 host 侧悬空读竞速)。
+    // 开关:Governor.poison_freed(OWL_POISON_FREED=1 初始化,测试可覆写)。
+    // P1-2 修复(捕获窗口钉住)后接线——dry_run 判别③曾复现悬空。
+    if pool.gov.poison_freed.load(std::sync::atomic::Ordering::Relaxed) {
         match &backing {
             PoolBacking::Slice(s) => {
+                use cudarc::driver::DevicePtr;
                 let (p, _sync) = s.device_ptr(&pool.stream);
                 unsafe {
                     cudarc::driver::result::memset_d8_async(
@@ -588,7 +620,7 @@ fn release_backing(backing: PoolBacking, pool: &CudaPool) {
                         pool.stream.cu_stream(),
                     )
                 }
-                .expect("P0-4 归还哨兵:memset_d8_async 失败");
+                .unwrap_or_else(|e| eprintln!("[owl-mem] P0-4 归还哨兵 memset 失败: {e:?}"));
             }
             PoolBacking::Vmm { ptr, bytes, .. } => unsafe {
                 cudarc::driver::result::memset_d8_async(
@@ -598,10 +630,12 @@ fn release_backing(backing: PoolBacking, pool: &CudaPool) {
                     pool.stream.cu_stream(),
                 )
             }
-            .expect("P0-4 归还哨兵:VMM memset_d8_async 失败"),
+            .unwrap_or_else(|e| eprintln!("[owl-mem] P0-4 归还哨兵 VMM memset 失败: {e:?}")),
             PoolBacking::Empty => {}
         }
-        pool.stream.synchronize().expect("P0-4 归还哨兵:流同步失败");
+        pool.stream
+            .synchronize()
+            .unwrap_or_else(|e| eprintln!("[owl-mem] P0-4 归还哨兵流同步失败: {e:?}"));
     }
 
     if is_vmm {

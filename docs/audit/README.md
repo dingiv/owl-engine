@@ -7,15 +7,16 @@
 - [x] P0-3 NULL 流 memcpy 系统性同步缺口 —— **已修**:`CudaDevice::memcpy_{dtoh,htod}_{f32,u32}` 流序收口 API(b77c67b),非测试调用点 24 处迁移;3 处测试 helper 在 ctx.synchronize() 后(判安全保留);device.rs/lib.rs 内部 H2D 为新块首写(安全);detector:dtoh 前置 sync 已统一
 - [x] P0-1 捕获闭包 panic = 捕获流悬死 —— **已修**:catch_unwind(AssertUnwindSafe) 包裹 f(&frame),panic/Err 双路径 end_capture + destroy + 结构化报错
 - [x] P0-2 哨兵③口径 —— **已修(口径修正)**:拒绝的是 `leaked`(池内未租约,真违约);`suspicious`(像地址的标量,首跑实锤 0x3f800000=1.0f)保持告警——kernel 参数含立即数,无法盲区分;allowlist 管道就绪
-- [x] P0-4 freed 块哨兵 —— **◐ 探测器就绪,默认关**:`OWL_POISON_FREED=1`(debug)归还即填 0xFF;开启即复现 P1-2(见下),修后应转默认开
+- [x] P0-4 freed 块哨兵 —— **已接线(2026-09-24)**:`OWL_POISON_FREED=1`(或 `set_poison_freed`)归还即填 0xFF;零 unwrap panic(drop 上下文 eprintln);owl-cuda 两个 P1-2 回归测试双向验证(新代码绿/旧路径红)
 - [x] P0-5 device_ptr 暴露面 —— **部分**:cat/stack 等算术点已显式 f32 化;全仓 `.add(` 扫描仅剩字节意图/已转换点;`PtrOf` lifetime 视图 ⏸ 随 M-Ⅲ
 
 ## P1
 
-- [ ] P1-2 捕获窗口 scratch 悬空(立案,数字证据):**OWL_POISON_FREED=1 时 dry_run 判别③ 红**——捕获后归还的 scratch 块被 0xFF 覆盖,图内存在"读先于写"的引用;修法方向 = 捕获期分配的块 pin 到 DeviceGraph drop;修复后 P0-4 转默认开
+- [x] P1-2 捕获窗口 scratch 悬空 —— **已修(2026-09-24,双路径钉住)**:①窗口内出生 = 出生即强持(birth-pin,防 Arc 提前归零);②pre-window 出生、窗口内死亡 = 释放闭包停放(park),图 drop 才执行;定影时收编进 DeviceGraph keepalive(令牌同步入租约表,哨兵③对账覆盖);CaptureSession 新增 lease_scratch(与 Persistent.lease 对称);残留另案 → P1-7
 - [x] P1-1 捕获失败清租约(已并入 P0-1 修复)
 - [x] P1-4 租约校验去 debug-only(全构建生效,纯账本查询)
 - [ ] P1-3 相位→Idle drain 验证主流排空 ⏸
+- [ ] P1-7 warmup 遗留毒化×地址复用(2026-09-24 立案,毒化对照实验实锤):OWL_POISON_FREED=1 下 dry_run 判别③仍红,memset 改 no-op 即绿——毒化写入本身击中图读缓冲;但 backtrace 证明窗口内死亡已全部被 P1-2 双路径钉住,实际毒化仅发生于①捕获前 warmup 遗留延迟释放的 drain、②测试 unwind;嫌疑 = warmup(Live 相)瞬态 drain 释放后地址被捕获期分配复用,复用块初始内容(alloc_zeros 清零)与图"读先于写"节点所依赖的 eager 内容不一致。侦查手段:复用块初始内容断言 / 定位具体复用块。同日顺手修:Governor↔CudaPool 强-强引用环拆除(强注册表移 DeviceInner)、Ledger 单锁原子快照 + A5.3 mem_get_info 降频(仅逼近预算 10% 内探)
 - [ ] P1-5 cublas 逐调用 stream 传递审计 ⏸
 - [ ] P1-6 Session 槽位隐式持久语义(漏写槽 = 陈旧数据)⏸ 文档化
 

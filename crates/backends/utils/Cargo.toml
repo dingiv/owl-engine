@@ -1,0 +1,11 @@
+[package]
+name = "owl-backend-utils"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Backend utilities: run_with_* sugar for tests/tools (opens device, runs closure, closes device)"
+
+[dependencies]
+owl-iface = { path = "../iface" }
+owl-cuda = { path = "../cuda" }
+# rocm 后端就绪后在此接入(占位:crates/backends/rocm 仅有 README)
