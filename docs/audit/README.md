@@ -27,7 +27,7 @@
 ## 架构裁决(待拍板)
 
 1. `device_ptr()` 类型化收口(PtrOf)——⏸ 随 M-Ⅲ
-2. graphplan 退役 + runner 迁 Session —— ⏸ 双轨风险已记录
+2. ~~graphplan 退役~~ —— ✅ 已执行(删 graphplan.rs/DecodeGraphAdapter/DecodeGraphRunner;RunnerType/MessageType/多节点 IPC 保留;speculative/server 为死桩未受影响;Session 为唯一图机制)
 3. `cuMemcpy` 直接调用 lint 禁令 —— ⏸(迁移已完成,防回归靠 review)
 4. OwlTensor 拆 TLS —— ⏸ 与 signal scope 重构捆绑
 
