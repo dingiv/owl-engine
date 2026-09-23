@@ -16,7 +16,6 @@
 //! 裁决 3①)+ T2 的 cuBLAS(`NnBlas`,workspace 预钉)。
 
 use crate::kernels::Kernels;
-use owl_signal;
 use crate::tensor::Tensor;
 use crate::{CaptureSafe, KernelCtx};
 use owl_iface::BackendError;
@@ -68,8 +67,8 @@ macro_rules! unary_op {
         {
             ctx.trace_launch(stringify!($method));
             self.note_launch();
-            owl_signal::emit(x.token().expect("token"));
-            owl_signal::emit(out.token().expect("token"));
+            owl_shared::signal::emit(x.token().expect("token"));
+            owl_shared::signal::emit(out.token().expect("token"));
             assert_eq!(x.shape(), out.shape(), "unary: out 形状不一致");
             let n = owl_iface::DevBuf::<T>::len(x);
             let stream = Arc::clone(ctx.stream());
@@ -215,9 +214,9 @@ impl OpsCtx {
         Self::assert_same_shape(a, b, out);
         ctx.trace_launch("add");
         self.note_launch();
-        owl_signal::emit(a.token().expect("token"));
-        owl_signal::emit(b.token().expect("token"));
-        owl_signal::emit(out.token().expect("token"));
+        owl_shared::signal::emit(a.token().expect("token"));
+        owl_shared::signal::emit(b.token().expect("token"));
+        owl_shared::signal::emit(out.token().expect("token"));
         let n = owl_iface::DevBuf::<T>::len(a);
         let stream = Arc::clone(ctx.stream());
         self.kernels
@@ -246,9 +245,9 @@ impl OpsCtx {
         Self::assert_same_shape(a, b, out);
         ctx.trace_launch("mul");
         self.note_launch();
-        owl_signal::emit(a.token().expect("token"));
-        owl_signal::emit(b.token().expect("token"));
-        owl_signal::emit(out.token().expect("token"));
+        owl_shared::signal::emit(a.token().expect("token"));
+        owl_shared::signal::emit(b.token().expect("token"));
+        owl_shared::signal::emit(out.token().expect("token"));
         let n = owl_iface::DevBuf::<T>::len(a);
         let stream = Arc::clone(ctx.stream());
         self.kernels
@@ -283,8 +282,8 @@ impl OpsCtx {
     {
         ctx.trace_launch("softmax");
         self.note_launch();
-        owl_signal::emit(x.token().expect("token"));
-        owl_signal::emit(out.token().expect("token"));
+        owl_shared::signal::emit(x.token().expect("token"));
+        owl_shared::signal::emit(out.token().expect("token"));
         assert_eq!(x.shape(), out.shape(), "softmax: out 形状不一致");
         let shape = x.shape();
         assert!(shape.len() == 2, "softmax: 一期仅 [rows, cols]");
@@ -317,9 +316,9 @@ impl OpsCtx {
     {
         ctx.trace_launch("rmsnorm");
         self.note_launch();
-        owl_signal::emit(x.token().expect("token"));
-        owl_signal::emit(alpha.token().expect("token"));
-        owl_signal::emit(out.token().expect("token"));
+        owl_shared::signal::emit(x.token().expect("token"));
+        owl_shared::signal::emit(alpha.token().expect("token"));
+        owl_shared::signal::emit(out.token().expect("token"));
         assert_eq!(x.shape(), out.shape(), "rmsnorm: out 形状不一致");
         let shape = x.shape();
         assert!(shape.len() == 2, "rmsnorm: 一期仅 [rows, cols]");
@@ -364,11 +363,11 @@ impl OpsCtx {
         // workspace 是 cublas 节点的隐藏依赖(指针烘进 launch 参数):
         // 捕获路径必须把它 emit 进租约(A5.2 池外原语预登记)
         if let Some(t) = blas.workspace_token() {
-            owl_signal::emit(t);
+            owl_shared::signal::emit(t);
         }
-        owl_signal::emit(a.token().expect("token"));
-        owl_signal::emit(b.token().expect("token"));
-        owl_signal::emit(out.token().expect("token"));
+        owl_shared::signal::emit(a.token().expect("token"));
+        owl_shared::signal::emit(b.token().expect("token"));
+        owl_shared::signal::emit(out.token().expect("token"));
         let sa = a.shape();
         let sb = b.shape();
         assert!(sa.len() == 2 && sb.len() == 2, "matmul: 一期仅 2D");

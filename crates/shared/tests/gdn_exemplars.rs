@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use owl_nn::kernels::gdn_kernels::GdnKernels;
-use owl_testkit::{Case, Gen, GenU32, Rig};
+use owl_shared::testkit::{Case, Gen, GenU32, Rig};
 
 fn launch_kernel(rig: &Rig) -> GdnKernels {
     GdnKernels::new(rig.device().ctx()).expect("nvrtc gdn")
@@ -243,6 +243,6 @@ fn ex_gdn_exp_inplace_inplace() {
         .unwrap();
     let got = rig.dtoh_f32(&buf);
     let want: Vec<f32> = g.iter().map(|v| v.exp()).collect();
-    owl_testkit::allclose("gdn_exp_inplace_f32", &got, &want, 0.0, 1e-5, false)
+    owl_shared::testkit::allclose("gdn_exp_inplace_f32", &got, &want, 0.0, 1e-5, false)
         .expect("exp 就地对拍全绿");
 }

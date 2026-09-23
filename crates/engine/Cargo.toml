@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 owl-iface = { path = "../backends/iface" }
 owl-cuda = { path = "../backends/cuda" }
-owl-signal = { path = "../signal" }
+owl-shared = { path = "../shared", default-features = false }
 owl-nn = { path = "../nn" }
 owl-graph = { path = "../graph" }
 thiserror.workspace = true

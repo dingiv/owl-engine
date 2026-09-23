@@ -31,12 +31,19 @@
 /// 后端 Arch 标识(与 kernels 的 arch 分发表共用一套词汇)
 pub use owl_kernels::Arch;
 
-/// 缓冲令牌:(id, generation) 二元组。词汇权威在 owl-signal
-/// (`owl_signal::Token`,后端无关;rocnn 复用同一定义),
-/// 此处做类型别名保持 iface 词汇名稳定。
+pub mod signal;
+
+/// 缓冲令牌:(id, generation) 二元组。词汇权威在 iface(A1:
+/// 词汇类型归 iface;2026-09-23 从 signal 移入以断 shared(device)→cuda→iface 环)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Token {
+    pub id: u64,
+    pub gen: u64,
+}
+
 /// 捕获期记录于 CaptureRecord(哨兵①),replay 前可校验存活
 /// (世代校验;死亡令牌 = 结构化报错而非 Xid 盲死)。
-pub type BufToken = owl_signal::Token;
+pub type BufToken = Token;
 
 /// 厂商后端栈家族
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

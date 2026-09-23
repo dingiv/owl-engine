@@ -82,7 +82,7 @@ pub struct KernelCtx {
     pub(crate) recorder: Option<CaptureRecorder>,
     /// Signal 追踪作用域(capturing 态持有;drop 时弹栈——持有即语义)
     #[allow(dead_code)]
-    pub(crate) track: Option<owl_signal::TrackingHandle>,
+    pub(crate) track: Option<owl_shared::signal::TrackingHandle>,
     /// S6 激活 scratch 池(经 OpsCtx 注入;无池 = 层代码不得分配中间量)
     pub(crate) scratch: Option<std::sync::Arc<owl_cuda::CudaPool>>,
 }
@@ -104,16 +104,16 @@ impl KernelCtx {
         recorder: CaptureRecorder,
         stream: Arc<owl_cuda::ffi::CudaStream>,
     ) -> Self {
-        // Signal 接线:recorder 即追踪 sink——ops 的 owl_signal::emit
+        // Signal 接线:recorder 即追踪 sink——ops 的 owl_shared::signal::emit
         // 自动落到这里(依赖追踪自动化,roadmap §四·五)
         let rec = recorder.clone();
-        let sink: owl_signal::Sink =
-            Arc::new(move |t: owl_signal::Token| rec.trace_buf(t));
+        let sink: owl_shared::signal::Sink =
+            Arc::new(move |t: owl_shared::signal::Token| rec.trace_buf(t));
         Self {
             phase: MemPhase::Capturing,
             stream,
             recorder: Some(recorder),
-            track: Some(owl_signal::enter(sink)),
+            track: Some(owl_shared::signal::enter(sink)),
             scratch: None,
         }
     }
@@ -126,7 +126,7 @@ impl KernelCtx {
     ) -> Self {
         let rec = recorder.clone();
         let lease = frame.lease_sink.clone();
-        let sink: owl_signal::Sink = Arc::new(move |t: owl_signal::Token| {
+        let sink: owl_shared::signal::Sink = Arc::new(move |t: owl_shared::signal::Token| {
             rec.trace_buf(t);
             (lease)(t);
         });
@@ -134,7 +134,7 @@ impl KernelCtx {
             phase: MemPhase::Capturing,
             stream: Arc::clone(frame.stream),
             recorder: Some(recorder),
-            track: Some(owl_signal::enter(sink)),
+            track: Some(owl_shared::signal::enter(sink)),
             scratch: None,
         }
     }
@@ -171,7 +171,7 @@ impl KernelCtx {
         let t = pool.scratch_tensor::<T>(shape)?;
         if self.recording() {
             if let Some(tok) = t.token() {
-                owl_signal::emit(tok); // 捕获期:自动入图租约(哨兵①)
+                owl_shared::signal::emit(tok); // 捕获期:自动入图租约(哨兵①)
             }
         }
         Ok(t)

@@ -104,12 +104,16 @@ mod pa_shim {
     /// KV 布局:flat [max_slots, Hkv*D](slot 直排,与 dry_kernels 核一致);
     /// slots/kv_lens = bindings 设备指针(u32 位型 = i32,值域 <2^31)。
     pub struct PagedAttention {
+        #[allow(dead_code)] // 契约字段:发射器按档位取用
         num_heads: usize,
+        #[allow(dead_code)]
         num_kv_heads: usize,
+        #[allow(dead_code)]
         head_dim: usize,
     }
 
     /// [A,B,C] → [A,C,B](dry transpose12 核)
+    #[allow(dead_code)] // 保留:qk^T 分块路径回归时复用
     fn transpose12(t: &Tensor, a: usize, b: usize, c: usize) -> Result<Tensor> {
         crate::models::layers::ctx_scope::with_dry(|ctx, dry| {
             let out_t = ctx.scratch_tensor::<f32>(&[a, c, b])?;
@@ -205,7 +209,7 @@ mod pa_shim {
             meta: &InputMetadata,
             seq_len: usize,
         ) -> Result<Tensor> {
-            use crate::models::layers::{ctx_scope, erased, OwlTensor};
+            use crate::models::layers::ctx_scope;
             ctx_scope::with_dry(|ctx, dry| {
                 let out_t = ctx.scratch_tensor::<f32>(&[seq_len, q.shape()[2] * q.shape()[1]])?;
                 let out = owl_nn::DynTensor::from_f32(&out_t);

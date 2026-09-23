@@ -1,7 +1,9 @@
 [package]
-name = "owl-testkit"
+name = "owl-shared"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+description = "共用基建:signal 依赖追踪(re-export)+ testkit 算子对拍框架"
 
 [dependencies]
 owl-cuda = { path = "../backends/cuda" }
@@ -9,3 +11,6 @@ owl-iface = { path = "../backends/iface" }
 
 [dev-dependencies]
 owl-nn = { path = "../nn" }
+
+[[test]]
+name = "gdn_exemplars"

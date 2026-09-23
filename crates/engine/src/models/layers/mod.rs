@@ -272,6 +272,7 @@ pub trait OwlTensor: Sized {
 }
 
 /// T3 回填占位(编译先行口径;运行里程碑经 owl-kernels/marlin-ffi 替换为真实 kernel)
+#[allow(dead_code)]
 fn t3_unimpl(_name: &str) -> ! {
     unimplemented!("T3 kernel 回填")
 }

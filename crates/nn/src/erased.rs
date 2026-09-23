@@ -57,7 +57,7 @@ pub fn add(
     ops.note_launch();
     for t in [a.token(), b.token(), out.token()] {
         if let Some(t) = t {
-            owl_signal::emit(t);
+            owl_shared::signal::emit(t);
         }
     }
     let n = elems(a.shape());
@@ -84,7 +84,7 @@ pub fn mul(
     ops.note_launch();
     for t in [a.token(), b.token(), out.token()] {
         if let Some(t) = t {
-            owl_signal::emit(t);
+            owl_shared::signal::emit(t);
         }
     }
     let n = elems(a.shape());
@@ -108,7 +108,7 @@ pub fn silu(
     ops.note_launch();
     for t in [x.token(), out.token()] {
         if let Some(t) = t {
-            owl_signal::emit(t);
+            owl_shared::signal::emit(t);
         }
     }
     let n = elems(x.shape());
@@ -138,7 +138,7 @@ pub fn softmax_last_dim(
     ops.note_launch();
     for t in [x.token(), out.token()] {
         if let Some(t) = t {
-            owl_signal::emit(t);
+            owl_shared::signal::emit(t);
         }
     }
     let shape = x.shape();
@@ -178,7 +178,7 @@ pub fn rmsnorm(
     ops.note_launch();
     for t in [x.token(), alpha.token(), out.token()] {
         if let Some(t) = t {
-            owl_signal::emit(t);
+            owl_shared::signal::emit(t);
         }
     }
     let stream = std::sync::Arc::clone(ctx.stream());
@@ -221,12 +221,12 @@ pub fn matmul(
     ops.note_launch();
     for t in [a.token(), b.token(), out.token()] {
         if let Some(t) = t {
-            owl_signal::emit(t);
+            owl_shared::signal::emit(t);
         }
     }
     // workspace 是 cublas 节点的隐藏依赖:捕获路径必须 emit 进租约(A5.2)
     if let Some(t) = blas.workspace_token() {
-        owl_signal::emit(t);
+        owl_shared::signal::emit(t);
     }
     blas.matmul_f32(
         sa[0],
@@ -501,11 +501,11 @@ pub fn cat(
     }
     for p in parts {
         if let Some(t) = p.token() {
-            owl_signal::emit(t);
+            owl_shared::signal::emit(t);
         }
     }
     if let Some(t) = out.token() {
-        owl_signal::emit(t);
+        owl_shared::signal::emit(t);
     }
     Ok(DynTensor::from_f32(&out))
 }
@@ -534,11 +534,11 @@ pub fn stack(
             seg,
         )?;
         if let Some(t) = p.token() {
-            owl_signal::emit(t);
+            owl_shared::signal::emit(t);
         }
     }
     if let Some(t) = out.token() {
-        owl_signal::emit(t);
+        owl_shared::signal::emit(t);
     }
     Ok(DynTensor::from_f32(&out))
 }
@@ -596,7 +596,7 @@ pub fn index_select(
     }
     for t in [src.token(), idx.token(), out.token()] {
         if let Some(t) = t {
-            owl_signal::emit(t);
+            owl_shared::signal::emit(t);
         }
     }
     Ok(DynTensor::from_f32(&out))
@@ -626,7 +626,7 @@ pub fn gather(
         .map_err(BackendError::Init)?;
     for t in [src.token(), idx.token(), out.token()] {
         if let Some(t) = t {
-            owl_signal::emit(t);
+            owl_shared::signal::emit(t);
         }
     }
     Ok(DynTensor::from_f32(&out))
@@ -659,7 +659,7 @@ pub fn scatter_add(
         .map_err(BackendError::Init)?;
     for t in [src.token(), idx.token(), out.token()] {
         if let Some(t) = t {
-            owl_signal::emit(t);
+            owl_shared::signal::emit(t);
         }
     }
     Ok(DynTensor::from_f32(&out))
@@ -719,10 +719,10 @@ fn reduce_axis(
     }
     .map_err(BackendError::Init)?;
     if let Some(t) = src.token() {
-        owl_signal::emit(t);
+        owl_shared::signal::emit(t);
     }
     if let Some(t) = out.token() {
-        owl_signal::emit(t);
+        owl_shared::signal::emit(t);
     }
     Ok(DynTensor::from_f32(&out))
 }
@@ -791,7 +791,7 @@ fn bcast(
     res.map_err(BackendError::Init)?;
     for t in [a.token(), b.token(), out.token()] {
         if let Some(t) = t {
-            owl_signal::emit(t);
+            owl_shared::signal::emit(t);
         }
     }
     Ok(DynTensor::from_f32(&out))
@@ -819,7 +819,7 @@ pub fn copy_d2d_to_raw(
     ctx.trace_launch("copy_d2d_to_raw");
     copy_d2d(ctx, dst, src.device_ptr() as *const core::ffi::c_void, bytes)?;
     if let Some(t) = src.token() {
-        owl_signal::emit(t);
+        owl_shared::signal::emit(t);
     }
     Ok(())
 }
@@ -878,7 +878,7 @@ pub fn repeat(
             .map_err(BackendError::Init)?;
         for t in [src.token(), out.token()] {
             if let Some(t) = t {
-                owl_signal::emit(t);
+                owl_shared::signal::emit(t);
             }
         }
         cur = DynTensor::from_f32(&out);
@@ -928,7 +928,7 @@ pub fn repeat_interleave(
         .map_err(BackendError::Init)?;
     for t in [src.token(), out.token()] {
         if let Some(t) = t {
-            owl_signal::emit(t);
+            owl_shared::signal::emit(t);
         }
     }
     Ok(DynTensor::from_f32(&out))

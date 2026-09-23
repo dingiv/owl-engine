@@ -7,9 +7,9 @@
 
 use std::collections::HashMap;
 
-use crate::checks::allclose;
-use crate::rig::{DevBuf, Rig};
-use crate::rng::Rng;
+use crate::testkit::checks::allclose;
+use crate::testkit::rig::{DevBuf, Rig};
+use crate::testkit::rng::Rng;
 
 /// 输入生成器(声明面;materialize 时逐元素求值,确定性)。
 #[derive(Clone, Copy)]
@@ -246,7 +246,7 @@ impl Case {
                 continue;
             }
             let out_buf = &bound.outputs[spec.name];
-            crate::checks::expect_shape(
+            crate::testkit::checks::expect_shape(
                 &format!("{}::{}", self.name, spec.name),
                 out_buf.shape(),
                 &spec.shape,
@@ -282,7 +282,7 @@ impl Case {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rig::Rig;
+    use crate::testkit::rig::Rig;
 
     /// 设备写入辅助:走 HtoD 同步拷贝(真设备写路径,不借 kernel)。
     fn htod_into(dst: *mut f32, src: &[f32]) {

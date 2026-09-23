@@ -1,4 +1,4 @@
-//! owl-signal —— 后端无关的 Signal 式依赖追踪(设计稿 §二·一落地)。
+//! signal —— 后端无关的 Signal 式依赖追踪(设计稿 §二·一;2026-09-23 自 owl-shared 并入,词汇 Token 归本包)。
 //!
 //! Vue 语义映射:`enter(sink)` = 打开 effect 作用域;`emit(token)` =
 //! effect 内读信号(自动登记依赖);栈空 = untracked(零开销直通)。
@@ -10,6 +10,7 @@
 //! 线程模型:A3(每卡一线程)下追踪栈天然线程隔离;本 crate 的
 //! thread-local 栈与单进程多实例拓扑(A2.6)兼容。
 
+pub use super::Token;
 use std::cell::RefCell;
 use std::sync::Arc;
 
@@ -17,11 +18,7 @@ use std::sync::Arc;
 ///
 /// 与 owl-iface 的 `BufToken` 同构(iface 侧做类型别名);signal 层
 /// 不定义任何 CUDA 语义,只做身份的传递与登记。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Token {
-    pub id: u64,
-    pub gen: u64,
-}
+
 
 /// 依赖接收器:token 被当前作用域订阅时调用。
 pub type Sink = Arc<dyn Fn(Token) + Send + Sync>;

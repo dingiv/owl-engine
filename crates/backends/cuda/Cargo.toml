@@ -17,6 +17,5 @@ cudarc = { version = "0.19", default-features = false, features = [
     "dynamic-loading",
 ] }
 owl-iface = { path = "../iface" }
-owl-signal = { path = "../../signal" }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }

@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 /// 会话租约 sink(signal 自动登记通道)。
 pub struct CaptureFrame<'s> {
     pub stream: &'s Arc<CudaStream>,
-    pub lease_sink: owl_signal::Sink,
+    pub lease_sink: owl_iface::signal::Sink,
 }
 
 /// 捕获会话:强租约 keepalive + 会话流 + 治理句柄。
@@ -91,7 +91,7 @@ impl CaptureSession {
             .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
             .map_err(|e| BackendError::Init(format!("begin_capture: {e:?}")))?;
 
-        // signal 作用域:闭包内 owl_signal::emit 自动汇聚为依赖集(哨兵①自动化)
+        // signal 作用域:闭包内 owl_iface::signal::emit 自动汇聚为依赖集(哨兵①自动化)
         //
         // 关键时序修正(2026-09-22):强租约升级必须在 **emit 时刻**完成——
         // functional 风格的 forward 中间量是语句级瞬态,forward 返回时早已
@@ -100,11 +100,11 @@ impl CaptureSession {
         let toks: Arc<Mutex<Vec<BufToken>>> = Arc::new(Mutex::new(Vec::new()));
         let keepalive_new: Arc<Mutex<Vec<Arc<PoolBufInner>>>> =
             Arc::new(Mutex::new(Vec::new()));
-        let sink: owl_signal::Sink = Arc::new({
+        let sink: owl_iface::signal::Sink = Arc::new({
             let t = Arc::clone(&toks);
             let ka = Arc::clone(&keepalive_new);
             let gov = std::sync::Arc::clone(&self.gov);
-            move |tok: owl_signal::Token| {
+            move |tok: owl_iface::signal::Token| {
                 t.lock().expect("lease sink 中毒").push(tok);
                 // 当场升级(emit 时缓冲必活);重复 emit 幂等(dedup 在合并段)
                 if let Some(inner) = gov.live_bufs.lock().get(&tok.id).and_then(|w| w.upgrade()) {
@@ -112,7 +112,7 @@ impl CaptureSession {
                 }
             }
         });
-        let _guard = owl_signal::enter(sink.clone());
+        let _guard = owl_iface::signal::enter(sink.clone());
         let frame = CaptureFrame {
             stream: &self.stream,
             lease_sink: sink,
