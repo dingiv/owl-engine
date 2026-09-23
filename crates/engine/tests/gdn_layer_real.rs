@@ -1367,7 +1367,7 @@ fn layernorm_magnitude_probe() {
     let xt = ctor::from_vec(x.clone(), (5usize, hidden), &dev).unwrap();
     let ln = owl_engine::models::layers::others::rms_norm(
         hidden, config.rms_norm_eps,
-        vb.pp("model.layers.0.input_layernorm"), owl_nn::Dtype::F32, false,
+        vb.pp("model.layers.0.input_layernorm"), owl_nn::Dtype::F32, true,
     ).expect("input_layernorm 构造");
     let y = ln.forward(&xt).expect("layernorm forward");
     dev.ctx().synchronize().unwrap();
