@@ -431,7 +431,7 @@ impl GdnKernels {
 mod tests {
     use super::GdnKernels;
     use owl_cuda::CudaDevice;
-    use owl_iface::{Device as _, PoolConfig, PoolKind};
+    use owl_iface::{Device as _, Pool as _, PoolConfig, PoolKind};
 
     fn setup() -> (
         CudaDevice,
@@ -451,12 +451,11 @@ mod tests {
     }
 
     fn htod<T: owl_iface::MemValue + Send + Sync + 'static>(
-        dev: &CudaDevice,
         pool: &owl_cuda::CudaPool,
         v: Vec<T>,
     ) -> owl_cuda::Persistent<T> {
         // 返回持有缓冲(活性随行;裸指针版会即刻回收 → 悬空)
-        dev.htod_persistent_in(pool, v).unwrap()
+        pool.htod_persistent_in(v).unwrap()
     }
 
     fn dtoh_f32(dev: &CudaDevice, ptr: *const f32, n: usize) -> Vec<f32> {
@@ -472,7 +471,7 @@ mod tests {
         let (dev, mut k, _pool) = setup();
         let n = 1000usize;
         let v: Vec<f32> = (0..n).map(|i| -0.01 * (i % 50) as f32).collect();
-        let d_v = htod(&dev, &_pool, v.clone());
+        let d_v = htod(&_pool, v.clone());
         let v_p = owl_iface::DevBuf::device_ptr(&d_v) as *mut f32;
         k.exp_inplace_f32(dev.stream(), v_p, n as i32).unwrap();
         dev.ctx().synchronize().unwrap();
@@ -497,12 +496,12 @@ mod tests {
         let dt_bias: Vec<f32> = (0..heads).map(|i| 0.05 * i as f32).collect();
         let a: Vec<f32> = (0..total).map(|i| ((i % 17) as f32 - 8.0) * 0.3).collect();
         let b: Vec<f32> = (0..total).map(|i| ((i % 23) as f32 - 11.0) * 0.2).collect();
-        let g_out = htod(&dev, &pool, vec![0f32; total]);
-        let b_out = htod(&dev, &pool, vec![0f32; total]);
-        let d_alog = htod(&dev, &pool, a_log.clone());
-        let d_dt = htod(&dev, &pool, dt_bias.clone());
-        let d_a = htod(&dev, &pool, a.clone());
-        let d_b = htod(&dev, &pool, b.clone());
+        let g_out = htod(&pool, vec![0f32; total]);
+        let b_out = htod(&pool, vec![0f32; total]);
+        let d_alog = htod(&pool, a_log.clone());
+        let d_dt = htod(&pool, dt_bias.clone());
+        let d_a = htod(&pool, a.clone());
+        let d_b = htod(&pool, b.clone());
         let g_p = owl_iface::DevBuf::device_ptr(&g_out) as *mut f32;
         let b_p = owl_iface::DevBuf::device_ptr(&b_out) as *mut f32;
         let alog_p = owl_iface::DevBuf::device_ptr(&d_alog) as *const f32;
@@ -550,8 +549,8 @@ mod tests {
         for dim in [64usize, 512usize] {
             let rows = 3usize;
             let input: Vec<f32> = (0..rows * dim).map(|i| ((i % 37) as f32 - 18.0) * 0.1).collect();
-            let out_buf = htod(&dev, &pool, vec![0f32; rows * dim]);
-            let d_in = htod(&dev, &pool, input.clone());
+            let out_buf = htod(&pool, vec![0f32; rows * dim]);
+            let d_in = htod(&pool, input.clone());
             let in_p = owl_iface::DevBuf::device_ptr(&d_in) as *const u8;
             let out_p = owl_iface::DevBuf::device_ptr(&out_buf) as *mut u8;
             let stream = dev.stream();
@@ -597,11 +596,11 @@ mod tests {
         let bias: Vec<f32> = (0..group).map(|i| -0.02 * i as f32).collect();
 
         for act in [0i32, 1i32] {
-            let out_buf = htod(&dev, &pool, vec![0f32; rows * vdim]);
-            let d_x = htod(&dev, &pool, x.clone());
-            let d_z = htod(&dev, &pool, z.clone());
-            let d_g = htod(&dev, &pool, gamma.clone());
-            let d_b = htod(&dev, &pool, bias.clone());
+            let out_buf = htod(&pool, vec![0f32; rows * vdim]);
+            let d_x = htod(&pool, x.clone());
+            let d_z = htod(&pool, z.clone());
+            let d_g = htod(&pool, gamma.clone());
+            let d_b = htod(&pool, bias.clone());
             let x_p = owl_iface::DevBuf::device_ptr(&d_x) as *const u8;
             let z_p = owl_iface::DevBuf::device_ptr(&d_z) as *const u8;
             let g_p = owl_iface::DevBuf::device_ptr(&d_g) as *const f32;
@@ -670,12 +669,12 @@ mod tests {
         let bias: Vec<f32> = (0..d_conv).map(|i| 0.03 * i as f32).collect();
         let state0: Vec<f32> = (0..batch * d_conv * 3).map(|i| ((i % 7) as f32 - 3.0) * 0.5).collect();
 
-        let d_x = htod(&dev, &pool, x.clone());
-        let d_w = htod(&dev, &pool, weight.clone());
-        let d_b = htod(&dev, &pool, bias.clone());
-        let d_cu = htod(&dev, &pool, cu.clone());
-        let d_state = htod(&dev, &pool, state0.clone());
-        let out_buf = htod(&dev, &pool, vec![0f32; total * d_conv]);
+        let d_x = htod(&pool, x.clone());
+        let d_w = htod(&pool, weight.clone());
+        let d_b = htod(&pool, bias.clone());
+        let d_cu = htod(&pool, cu.clone());
+        let d_state = htod(&pool, state0.clone());
+        let out_buf = htod(&pool, vec![0f32; total * d_conv]);
         let x_p = owl_iface::DevBuf::device_ptr(&d_x) as *const u8;
         let w_p = owl_iface::DevBuf::device_ptr(&d_w) as *const u8;
         let b_p = owl_iface::DevBuf::device_ptr(&d_b) as *const u8;
@@ -731,11 +730,11 @@ mod tests {
         let weight: Vec<f32> = (0..d_conv * 4).map(|i| ((i % 9) as f32 - 4.0) * 0.3).collect();
         let state0: Vec<f32> = (0..max_batch * d_conv * 3).map(|i| ((i % 17) as f32 - 8.0) * 0.3).collect();
 
-        let d_x = htod(&dev, &pool, x.clone());
-        let d_w = htod(&dev, &pool, weight.clone());
-        let d_cu_slots = htod(&dev, &pool, slots.clone());
-        let d_state = htod(&dev, &pool, state0.clone());
-        let out_buf = htod(&dev, &pool, vec![0f32; batch * d_conv]);
+        let d_x = htod(&pool, x.clone());
+        let d_w = htod(&pool, weight.clone());
+        let d_cu_slots = htod(&pool, slots.clone());
+        let d_state = htod(&pool, state0.clone());
+        let out_buf = htod(&pool, vec![0f32; batch * d_conv]);
         let x_p = owl_iface::DevBuf::device_ptr(&d_x) as *const u8;
         let w_p = owl_iface::DevBuf::device_ptr(&d_w) as *const u8;
         let sl_p = owl_iface::DevBuf::device_ptr(&d_cu_slots) as *const u32;
@@ -790,13 +789,13 @@ mod tests {
         let beta: Vec<f32> = (0..bh * seq).map(|i| 0.5 + 0.1 * (i % 2) as f32).collect();
         let state0: Vec<f32> = (0..bh * k_dim * v_dim).map(|i| ((i % 23) as f32 - 11.0) * 0.1).collect();
 
-        let d_q = htod(&dev, &pool, q.clone());
-        let d_k = htod(&dev, &pool, kv.clone());
-        let d_v = htod(&dev, &pool, v.clone());
-        let d_g = htod(&dev, &pool, g.clone());
-        let d_beta = htod(&dev, &pool, beta.clone());
-        let d_state = htod(&dev, &pool, state0.clone());
-        let out_buf = htod(&dev, &pool, vec![0f32; bh * seq * v_dim]);
+        let d_q = htod(&pool, q.clone());
+        let d_k = htod(&pool, kv.clone());
+        let d_v = htod(&pool, v.clone());
+        let d_g = htod(&pool, g.clone());
+        let d_beta = htod(&pool, beta.clone());
+        let d_state = htod(&pool, state0.clone());
+        let out_buf = htod(&pool, vec![0f32; bh * seq * v_dim]);
         let q_p = owl_iface::DevBuf::device_ptr(&d_q) as *const u8;
         let k_p = owl_iface::DevBuf::device_ptr(&d_k) as *const u8;
         let v_p = owl_iface::DevBuf::device_ptr(&d_v) as *const u8;
@@ -874,14 +873,14 @@ mod tests {
             (0..max_batch * nv * k_dim * v_dim).map(|i| ((i % 19) as f32 - 9.0) * 0.2).collect();
         let q_scale = 0.5f32;
 
-        let d_q = htod(&dev, &pool, q.clone());
-        let d_k = htod(&dev, &pool, kv.clone());
-        let d_v = htod(&dev, &pool, v.clone());
-        let d_g = htod(&dev, &pool, g.clone());
-        let d_beta = htod(&dev, &pool, beta.clone());
-        let d_state = htod(&dev, &pool, state0.clone());
-        let d_slots = htod(&dev, &pool, slots.clone());
-        let out_buf = htod(&dev, &pool, vec![0f32; batch * nv * v_dim]);
+        let d_q = htod(&pool, q.clone());
+        let d_k = htod(&pool, kv.clone());
+        let d_v = htod(&pool, v.clone());
+        let d_g = htod(&pool, g.clone());
+        let d_beta = htod(&pool, beta.clone());
+        let d_state = htod(&pool, state0.clone());
+        let d_slots = htod(&pool, slots.clone());
+        let out_buf = htod(&pool, vec![0f32; batch * nv * v_dim]);
         let q_p = owl_iface::DevBuf::device_ptr(&d_q) as *const u8;
         let k_p = owl_iface::DevBuf::device_ptr(&d_k) as *const u8;
         let v_p = owl_iface::DevBuf::device_ptr(&d_v) as *const u8;

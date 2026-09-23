@@ -83,17 +83,17 @@ mod tests {
         let dev = make();
         let pool = scratch_pool(&dev, "scratch", 64 << 10);
 
-        let scratch = dev.alloc_scratch_in::<f32>(&pool, 4096).unwrap();
+        let scratch = pool.alloc_scratch_in::<f32>(4096).unwrap();
         assert_eq!(DevBuf::<f32>::len(&scratch), 4096);
         assert_eq!(pool.usage().used, 16 * 1024);
 
         // 池耗尽 → A5.4 PoolExhausted
-        let over = dev.alloc_scratch_in::<f32>(&pool, 1024 * 1024);
+        let over = pool.alloc_scratch_in::<f32>(1024 * 1024);
         assert!(matches!(over, Err(BackendError::PoolExhausted { .. })));
 
         // Live 相 drop → 延迟(池账 + 全局账都不动)
         dev.set_phase(MemPhase::Live);
-        let victim = dev.alloc_scratch_in::<f32>(&pool, 16).unwrap();
+        let victim = pool.alloc_scratch_in::<f32>(16).unwrap();
         drop(victim);
         assert_eq!(dev.stats().deferred_frees, 1);
         assert_eq!(dev.stats().drained_frees, 0);
@@ -115,11 +115,11 @@ mod tests {
         });
         let pool = persistent_pool(&dev, "b", 8 << 20);
 
-        let ok = dev.alloc_persistent_in::<u8>(&pool, 1024).unwrap();
+        let ok = pool.alloc_persistent_in::<u8>(1024).unwrap();
         drop(ok);
         dev.set_phase(MemPhase::Idle);
 
-        let huge = dev.alloc_persistent_in::<u8>(&pool, 8 * 1024 * 1024);
+        let huge = pool.alloc_persistent_in::<u8>(8 * 1024 * 1024);
         assert!(matches!(
             huge,
             Err(BackendError::LawViolation(msg)) if msg.contains("A5.4")
@@ -142,7 +142,7 @@ mod tests {
                 bytes: 1 << 20,
             })
             .unwrap();
-        let t = dev.alloc_persistent_in::<u8>(&pool, 4096).unwrap();
+        let t = pool.alloc_persistent_in::<u8>(4096).unwrap();
         let token = t.token.unwrap();
         let survivor = t.clone(); // 租约克隆(Graph keepalive 之外的第二证明)
 
@@ -238,7 +238,7 @@ mod tests {
         let weights = persistent_pool(&dev, "w", 1 << 20);
         // Scratch 池上做持久分配 → 拒
         assert!(matches!(
-            dev.alloc_persistent_in::<f32>(&scratch, 16),
+            scratch.alloc_persistent_in::<f32>(16),
             Err(BackendError::LawViolation(msg)) if msg.contains("不匹配")
         ));
         // Weights 池上做跨卡共享分配 → 拒
@@ -294,7 +294,7 @@ mod tests {
                 bytes: 1 << 20,
             })
             .unwrap();
-        let t = dev.alloc_persistent_in::<u8>(&pool, 4096).unwrap();
+        let t = pool.alloc_persistent_in::<u8>(4096).unwrap();
         let token = t.token.unwrap();
 
         unsafe {
@@ -362,7 +362,7 @@ mod tests {
                 bytes: 1 << 20,
             })
             .unwrap();
-        let buf = dev.alloc_persistent_in::<f32>(&pool, 64).unwrap();
+        let buf = pool.alloc_persistent_in::<f32>(64).unwrap();
         assert_eq!(buf.len(), 64);
         drop(buf);
         dev.set_phase(MemPhase::Idle);

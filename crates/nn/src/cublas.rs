@@ -35,7 +35,7 @@ impl BlasWorkspace {
             kind: PoolKind::Workspace,
             bytes: BLAS_WORKSPACE_BYTES as u64,
         })?;
-        let buf = device.alloc_persistent_in::<u8>(&pool, BLAS_WORKSPACE_BYTES)?;
+        let buf = pool.alloc_persistent_in::<u8>(BLAS_WORKSPACE_BYTES)?;
         Ok(Self { buf })
     }
 
@@ -187,7 +187,7 @@ impl Drop for NnBlas {
     }
 }
 
-use owl_iface::{BackendError, Device, PoolConfig, PoolKind};
+use owl_iface::{BackendError, Device, Pool as _, PoolConfig, PoolKind};
 
 #[cfg(test)]
 mod tests {
@@ -229,9 +229,9 @@ mod tests {
         let a: Vec<f32> = (0..M * K).map(|_| seed.next()).collect();
         let b: Vec<f32> = (0..K * N).map(|_| seed.next()).collect();
 
-        let da = dev.htod_persistent_in::<f32>(&pool, a.clone()).unwrap();
-        let db = dev.htod_persistent_in::<f32>(&pool, b.clone()).unwrap();
-        let dc = dev.alloc_persistent_in::<f32>(&pool, M * N).unwrap();
+        let da = pool.htod_persistent_in::<f32>(a.clone()).unwrap();
+        let db = pool.htod_persistent_in::<f32>(b.clone()).unwrap();
+        let dc = pool.alloc_persistent_in::<f32>(M * N).unwrap();
         dev.ctx().synchronize().unwrap();
 
         blas
@@ -289,13 +289,13 @@ mod tests {
         const M: usize = 64;
         const K: usize = 64;
         const N: usize = 64;
-        let da = dev
-            .htod_persistent_in::<f32>(&pool, vec![0.5f32; M * K])
+        let da = pool
+            .htod_persistent_in::<f32>(vec![0.5f32; M * K])
             .unwrap();
-        let db = dev
-            .htod_persistent_in::<f32>(&pool, vec![0.25f32; K * N])
+        let db = pool
+            .htod_persistent_in::<f32>(vec![0.25f32; K * N])
             .unwrap();
-        let dc = dev.alloc_persistent_in::<f32>(&pool, M * N).unwrap();
+        let dc = pool.alloc_persistent_in::<f32>(M * N).unwrap();
         dev.ctx().synchronize().unwrap();
 
         let stream = dev.stream().clone();
