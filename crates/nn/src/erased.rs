@@ -473,7 +473,7 @@ pub fn cat(
             let bytes = elems(p.shape()) * 4;
             copy_d2d(
                 ctx,
-                unsafe { out.device_ptr().add(dst_off) } as *mut _,
+                unsafe { (out.device_ptr() as *mut f32).add(dst_off) } as *mut _,
                 p.device_ptr() as *const _,
                 bytes,
             )?;
@@ -488,8 +488,9 @@ pub fn cat(
             for r in 0..rows {
                 copy_d2d(
                     ctx,
-                    unsafe { out.device_ptr().add(r * out_shape[dim] + dst_off) } as *mut _,
-                    unsafe { p.device_ptr().add(r * seg) } as *const _,
+                    unsafe { (out.device_ptr() as *mut f32).add(r * out_shape[dim] + dst_off) }
+                        as *mut _,
+                    unsafe { (p.device_ptr() as *const f32).add(r * seg) } as *const _,
                     seg * 4,
                 )?;
             }
@@ -529,7 +530,7 @@ pub fn stack(
         }
         copy_d2d(
             ctx,
-            unsafe { out.device_ptr().add(i * elems(parts[0].shape())) } as *mut _,
+            unsafe { (out.device_ptr() as *mut f32).add(i * elems(parts[0].shape())) } as *mut _,
             p.device_ptr() as *const _,
             seg,
         )?;
