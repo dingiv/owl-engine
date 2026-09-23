@@ -438,7 +438,7 @@ mod tests {
         GdnKernels,
         owl_cuda::CudaPool,
     ) {
-        let dev = CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
+        let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
         let k = GdnKernels::new(dev.ctx()).expect("nvrtc gdn");
         let pool = dev
             .create_pool(PoolConfig {

@@ -31,7 +31,7 @@ fn dtoh_f32(dev: &CudaDevice, ptr: *mut f32, n: usize) -> Vec<f32> {
 }
 
 fn install_rig() -> Arc<CudaDevice> {
-    let dev = Arc::new(CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备"));
+    let dev = Arc::new(CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备"));
     let scratch = Arc::new(
         dev.create_pool(PoolConfig {
             name: format!("infra-scratch-{}", std::process::id()),

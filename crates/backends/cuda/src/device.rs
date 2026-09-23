@@ -1,10 +1,14 @@
-//! CUDA 设备实例:一张卡,账本 + 池组 + 相位机的宿主。
+//! CUDA 设备实例:一张卡,相位机/BufToken 台账 + 默认池的宿主(账本在池上)。
 //! UUID 钉卡 + P2P 窄口 + `Backend`/`Device` 契约实现。
+
+/// `Backend::open` 无容量入参时的默认池容量;需要定制容量请走
+/// `CudaDevice::new/new_by_uuid` 构造参数(2026-09-23 裁决:容量构造指定)。
+pub const DEFAULT_POOL_BYTES: u64 = 4 << 30;
 
 use super::buffers::{Persistent, RemoteBuf, Scratch, VmmBuf};
 use super::governor::{Budget, Governor, LedgerSnapshot};
 use super::graph::CaptureSession;
-use super::pool::CudaPool;
+use super::pool::{CudaPool, Ledger};
 use cudarc::driver::{CudaContext, CudaStream, result, sys};
 use owl_iface::{
     Arch, Backend, BackendError, BackendFamily, BufToken, Device, DeviceDesc, MemPhase,
@@ -18,15 +22,16 @@ pub struct CudaDevice {
     pub(crate) inner: Arc<DeviceInner>,
 }
 
-/// 设备内核数据(Arc 共享;命名池挂这里,权重/暂存各一,env 可调大小)
+/// 设备内核数据(Arc 共享)。2026-09-23 用户裁决:单动态池挂这里
+/// (权重/暂存合一,General 档);账本归池持有,Device 不持账本对象。
 pub struct DeviceInner {
     pub(crate) ctx: Arc<CudaContext>,
     pub(crate) stream: Arc<CudaStream>,
-    pub(crate) gov: Arc<Governor>,
+    pub(crate) gov: Arc<Governor>, // 相位机/BufToken 台账/延迟队列(非账本)
     pub(crate) desc: DeviceDesc,
-    /// 命名池实例(2026-09-23 用户裁决:分配只经池,Device 不分担)
-    pub(crate) weights_pool: std::sync::OnceLock<Arc<CudaPool>>,
-    pub(crate) scratch_pool: std::sync::OnceLock<Arc<CudaPool>>,
+    /// 默认动态池(General 档;容量由构造函数参数指定;与设备同生命周期,
+    /// 初始化期未装填前访问 = 编序违约)
+    pool: std::sync::OnceLock<Arc<CudaPool>>,
 }
 
 impl std::ops::Deref for CudaDevice {
@@ -38,9 +43,10 @@ impl std::ops::Deref for CudaDevice {
 
 impl CudaDevice {
     /// 按 UUID 钉卡(唯一合法入口;数字序禁用,09-19 事故判例)。
-    pub fn new_by_uuid(uuid: &str) -> Result<Self, BackendError> {
+    /// `pool_bytes` = 默认动态池容量(构造函数参数指定,无 env 魔法)。
+    pub fn new_by_uuid(uuid: &str, pool_bytes: u64) -> Result<Self, BackendError> {
         let ordinal = resolve_uuid_ordinal(uuid)?;
-        let s = Self::new(ordinal)?;
+        let s = Self::new(ordinal, pool_bytes)?;
         if s.desc.uuid != uuid {
             return Err(BackendError::Init(format!(
                 "UUID 不匹配:请求 {uuid},ordinal {ordinal} 实际 {}",
@@ -50,7 +56,7 @@ impl CudaDevice {
         Ok(s)
     }
 
-    pub fn new(ordinal: usize) -> Result<Self, BackendError> {
+    pub fn new(ordinal: usize, pool_bytes: u64) -> Result<Self, BackendError> {
         let ctx = CudaContext::new(ordinal)
             .map_err(|e| BackendError::Init(format!("cuda:{ordinal}: {e}")))?;
         // M1②:主显存流 = 显式 non-blocking(legacy NULL 流不可捕获,
@@ -74,42 +80,22 @@ impl CudaDevice {
                 arch: Arch::Sm86, // TODO(M1): compute capability 运行时读取
                 total_bytes: total as u64,
             },
-            weights_pool: std::sync::OnceLock::new(),
-            scratch_pool: std::sync::OnceLock::new(),
+            pool: std::sync::OnceLock::new(),
         });
         let dev = Self { inner };
-        // 命名池初始化(用户裁决:分配只经池;大小 env 可调,默认 2G/512M)
-        let wbytes = std::env::var("OWL_WEIGHTS_POOL_BYTES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2 << 30);
-        let sbytes = std::env::var("OWL_SCRATCH_POOL_BYTES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(512 << 20);
-        let wp = create_pool_for(&dev, PoolConfig {
-            name: format!("weights-{}", std::process::id()),
-            kind: PoolKind::Weights,
-            bytes: wbytes,
+        // 默认动态池(用户裁决:权重/暂存合一,General 档,容量构造参数指定)
+        let p = create_pool_for(&dev, PoolConfig {
+            name: format!("owl-default-{}", std::process::id()),
+            kind: PoolKind::General,
+            bytes: pool_bytes,
         })?;
-        let sp = create_pool_for(&dev, PoolConfig {
-            name: format!("scratch-{}", std::process::id()),
-            kind: PoolKind::Scratch,
-            bytes: sbytes,
-        })?;
-        let _ = dev.inner.weights_pool.set(wp);
-        let _ = dev.inner.scratch_pool.set(sp);
+        let _ = dev.inner.pool.set(p);
         Ok(dev)
     }
 
-    /// 命名池:权重(常驻,分配走它)
-    pub fn weights_pool(&self) -> Arc<CudaPool> {
-        Arc::clone(self.inner.weights_pool.get().expect("weights 池未初始化"))
-    }
-
-    /// 命名池:暂存(捕获期可借,用完还)
-    pub fn scratch_pool(&self) -> Arc<CudaPool> {
-        Arc::clone(self.inner.scratch_pool.get().expect("scratch 池未初始化"))
+    /// 默认动态池(权重/暂存合一;唯一随设备附赠的池)
+    pub fn default_pool(&self) -> Arc<CudaPool> {
+        Arc::clone(self.inner.pool.get().expect("默认池未初始化"))
     }
 
     pub fn ctx(&self) -> &Arc<CudaContext> {
@@ -241,8 +227,12 @@ impl CudaDevice {
     }
 
     /// **A5 硬预算**:声明预算后,每次分配即时校验(超支 fail-fast)。
+    /// 设备级策略:广播到全部池账本,新建池建账时继承。
     pub fn set_budget(&self, budget: Budget) {
-        *self.gov.budget.lock() = Some(budget);
+        *self.gov.budget_seed.lock() = Some(budget);
+        for p in self.gov.pools.lock().values() {
+            p.ledger.set_budget(budget);
+        }
     }
 
     /// A5.3 第三道闸:driver 侧对账(free,total)。
@@ -292,10 +282,11 @@ impl CudaDevice {
             .result()
             .map_err(|e| BackendError::Init(format!("granularity: {e:?}")))?;
             let rounded = bytes.div_ceil(gran) * gran;
-            self.gov.charge(rounded as u64)?;
+            // VMM 独立入口非池路径,字节账记在默认池账本上
+            self.default_pool().ledger.charge("vmm-diag", rounded as u64)?;
             let mut ptr: sys::CUdeviceptr = 0;
             if cuMemAddressReserve(&mut ptr, rounded, gran, 0, 0) != CUDA_SUCCESS {
-                self.gov.uncharge(rounded as u64);
+                self.default_pool().ledger.uncharge(rounded as u64);
                 return Err(BackendError::AllocFailed {
                     kind: "vmm-reserve",
                     len: rounded,
@@ -305,7 +296,7 @@ impl CudaDevice {
             let mut chunk: sys::CUmemGenericAllocationHandle = Default::default();
             if cuMemCreate(&mut chunk, rounded, &props, 0) != CUDA_SUCCESS {
                 let _ = cuMemAddressFree(ptr, rounded);
-                self.gov.uncharge(rounded as u64);
+                self.default_pool().ledger.uncharge(rounded as u64);
                 return Err(BackendError::AllocFailed {
                     kind: "vmm-create",
                     len: rounded,
@@ -315,7 +306,7 @@ impl CudaDevice {
             if cuMemMap(ptr, rounded, 0, chunk, 0) != CUDA_SUCCESS {
                 let _ = cuMemRelease(chunk);
                 let _ = cuMemAddressFree(ptr, rounded);
-                self.gov.uncharge(rounded as u64);
+                self.default_pool().ledger.uncharge(rounded as u64);
                 return Err(BackendError::AllocFailed {
                     kind: "vmm-map",
                     len: rounded,
@@ -330,7 +321,7 @@ impl CudaDevice {
                 let _ = cuMemUnmap(ptr, rounded);
                 let _ = cuMemRelease(chunk);
                 let _ = cuMemAddressFree(ptr, rounded);
-                self.gov.uncharge(rounded as u64);
+                self.default_pool().ledger.uncharge(rounded as u64);
                 return Err(BackendError::AllocFailed {
                     kind: "vmm-set-access",
                     len: rounded,
@@ -342,7 +333,7 @@ impl CudaDevice {
                 bytes: rounded,
                 chunk,
                 ctx: Arc::clone(&self.ctx),
-                gov: Arc::clone(&self.gov),
+                ledger: Arc::clone(&self.default_pool().ledger),
             })
         }
     }
@@ -352,15 +343,21 @@ impl CudaDevice {
         self.gov.validate(t)
     }
 
-    /// 账本快照(A5.4 违约时打印)
-    pub fn ledger(&self) -> LedgerSnapshot {
-        LedgerSnapshot {
-            bytes_alive: *self.gov.bytes_alive.lock(),
-            bytes_allocated_total: *self.gov.bytes_allocated_total.lock(),
-            stats: self.stats(),
-            phase: self.phase(),
-        }
+/// 账本快照(A5.4 违约时打印;字节账在池上,跨池聚合 + 设备侧计数器)
+pub fn ledger(&self) -> LedgerSnapshot {
+    let mut bytes_alive = 0u64;
+    let mut bytes_allocated_total = 0u64;
+    for p in self.gov.pools.lock().values() {
+        bytes_alive += *p.ledger.bytes_alive.lock();
+        bytes_allocated_total += *p.ledger.bytes_allocated_total.lock();
     }
+    LedgerSnapshot {
+        bytes_alive,
+        bytes_allocated_total,
+        stats: self.stats(),
+        phase: self.phase(),
+    }
+}
 
     /// 开启捕获会话(GraphLease 入口)。
     /// 会话自带一条 non-blocking 捕获流(legacy 流不可捕获,T4 判例)。
@@ -501,7 +498,7 @@ impl Backend for CudaBackend {
     }
 
     fn open(&self, uuid: &str) -> Result<Self::Device, BackendError> {
-        CudaDevice::new_by_uuid(uuid)
+        CudaDevice::new_by_uuid(uuid, DEFAULT_POOL_BYTES)
     }
 }
 
@@ -565,24 +562,16 @@ impl Device for CudaDevice {
 
     fn pool(&self, id: PoolId) -> Result<Self::Pool, BackendError> {
         let pools = self.gov.pools.lock();
-        let led = pools.get(&id.0).ok_or(BackendError::UnknownPool(id.0))?;
-        Ok(CudaPool {
-            id: PoolId(id.0),
-            name: led.name.clone(),
-            kind: led.kind,
-            capacity: led.capacity,
-            ctx: Arc::clone(&self.ctx),
-            stream: Arc::clone(&self.stream),
-            gov: Arc::clone(&self.gov),
-            dev: self.clone(),
-        })
+        let p = pools.get(&id.0).ok_or(BackendError::UnknownPool(id.0))?;
+        Ok((**p).clone())
     }
 
 }
 
-/// 池构造(部件注入;`Device::create_pool` 与命名池初始化共用)。
+/// 池构造(部件注入;`Device::create_pool` 与默认池初始化共用)。
+/// 每池一本账(Ledger;2026-09-23 裁决:账本归池)。
 /// 注:CudaPool 内嵌 `dev: CudaDevice` 与 inner 的池槽构成有界 Arc 环
-/// (命名池与设备同生命周期,进程级常驻,不计泄漏)。
+/// (默认池与设备同生命周期,进程级常驻,不计泄漏)。
 pub(crate) fn create_pool_for(
     dev: &CudaDevice,
     cfg: PoolConfig,
@@ -598,24 +587,24 @@ pub(crate) fn create_pool_for(
     let id = gov
         .next_pool_id
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    pools.insert(
-        id,
-        crate::pool::PoolLedger {
-            name: cfg.name.clone(),
-            kind: cfg.kind,
-            capacity: cfg.bytes,
-            used: 0,
-            peak: 0,
-        },
-    );
-    Ok(Arc::new(CudaPool {
+    let pool = Arc::new(CudaPool {
         id: PoolId(id),
         name: cfg.name.clone(),
         kind: cfg.kind,
-        capacity: cfg.bytes,
         ctx: Arc::clone(ctx),
         stream: Arc::clone(stream),
         gov: Arc::clone(gov),
+        ledger: Arc::new(Ledger {
+            ctx: Some(Arc::clone(ctx)),
+            capacity: cfg.bytes,
+            used: parking_lot::Mutex::new(0),
+            peak: parking_lot::Mutex::new(0),
+            bytes_alive: parking_lot::Mutex::new(0),
+            bytes_allocated_total: parking_lot::Mutex::new(0),
+            budget: parking_lot::Mutex::new(*gov.budget_seed.lock()),
+        }),
         dev: dev.clone(),
-    }))
+    });
+    pools.insert(id, Arc::clone(&pool));
+    Ok(pool)
 }

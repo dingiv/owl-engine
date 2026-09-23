@@ -425,7 +425,7 @@ mod tests {
     use owl_iface::{PoolConfig, PoolKind};
 
     fn dev() -> CudaDevice {
-        CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备")
+        CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备")
     }
 
     fn scratch_pool(d: &CudaDevice, bytes: u64) -> <CudaDevice as Device>::Pool {

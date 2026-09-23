@@ -32,7 +32,7 @@ impl Rig {
         RIG
             .get_or_init(|| {
                 let dev =
-                    Arc::new(CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备"));
+                    Arc::new(CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备"));
                 dev.ctx().bind_to_thread().expect("bind_to_thread");
                 let pool = Arc::new(
                     dev.create_pool(PoolConfig {

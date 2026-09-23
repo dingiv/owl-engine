@@ -251,7 +251,7 @@ mod tests {
     use owl_iface::{Device, PoolConfig, PoolKind};
 
     fn setup() -> (OpsCtx, KernelCtx, CudaDevice, owl_cuda::CudaPool) {
-        let dev = CudaDevice::new(test_device_ordinal()).expect("需要 CUDA 设备");
+        let dev = CudaDevice::new(test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
         let ops = OpsCtx::new_with_scratch(&dev, 1 << 20).unwrap();
         let ctx = ops.ctx(owl_iface::MemPhase::Live);
         let pool = dev
@@ -351,7 +351,7 @@ mod tests {
         let alpha = vec![1.1f32, 0.9]; // last-dim = 2
         let dx = f32_tensor(&dev, &pool, &[3, 2], &x);
         let dalpha = f32_tensor(&dev, &pool, &[2], &alpha);
-        let out = rmsnorm(&mut ops, &ctx, &dx, &dalpha, 1e-5).unwrap();
+        let out = rmsnorm(&mut ops, &ctx, &dx, &dalpha, 1e-5, false).unwrap();
         let got = out.typed_f32().unwrap().to_vec().unwrap();
         for r in 0..3 {
             let row = &x[r * 2..r * 2 + 2];
@@ -945,7 +945,7 @@ mod p1_r2_tests {
     use owl_iface::{Device, PoolConfig, PoolKind};
 
     fn setup() -> (OpsCtx, KernelCtx, CudaDevice, owl_cuda::CudaPool) {
-        let dev = CudaDevice::new(test_device_ordinal()).expect("需要 CUDA 设备");
+        let dev = CudaDevice::new(test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
         let ops = OpsCtx::new_with_scratch(&dev, 1 << 20).unwrap();
         let ctx = ops.ctx(owl_iface::MemPhase::Live);
         let pool = dev

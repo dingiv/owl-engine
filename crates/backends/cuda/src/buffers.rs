@@ -3,7 +3,7 @@
 //! 负责;这里只做类型视图与租约接口。
 
 use super::pool::CudaPoolBuf;
-use crate::governor::Governor;
+use crate::pool::Ledger;
 use cudarc::driver::{CudaContext, sys};
 use owl_iface::{BufToken, DevBuf, MemValue};
 use std::sync::Arc;
@@ -118,7 +118,8 @@ pub struct VmmBuf {
     pub(crate) bytes: usize,
     pub(crate) chunk: sys::CUmemGenericAllocationHandle,
     pub(crate) ctx: Arc<CudaContext>,
-    pub(crate) gov: Arc<Governor>,
+    /// 字节账归默认池账本(2026-09-23 裁决:账本归池)
+    pub(crate) ledger: Arc<Ledger>,
 }
 
 impl VmmBuf {
@@ -146,7 +147,7 @@ impl Drop for VmmBuf {
                 eprintln!("owl-cuda: VMM cuMemAddressFree 失败,VA 泄漏");
             }
         }
-        self.gov.uncharge(self.bytes as u64);
+        self.ledger.uncharge(self.bytes as u64);
     }
 }
 

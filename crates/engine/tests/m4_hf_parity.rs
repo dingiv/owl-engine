@@ -264,7 +264,7 @@ fn m4_hf_parity_full_chain() {
     let hf_row = |l: usize| -> &[f32] { &hs_ref.data[l * SEQ_LEN * HIDDEN..(l + 1) * SEQ_LEN * HIDDEN] };
 
     // ---- 设备与池 ----
-    let dev = Arc::new(CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备"));
+    let dev = Arc::new(CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备"));
     let scratch = Arc::new(
         dev.create_pool(PoolConfig {
             name: format!("m4-scratch-{}", std::process::id()),

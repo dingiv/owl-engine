@@ -139,6 +139,9 @@ pub enum PoolKind {
     Workspace,
     /// 跨卡共享缓冲(A2.8:必须 VMM 分配,2MiB 粒度,BAR1 窗口预算内)
     PeerShared,
+    /// 通用动态池(2026-09-23 用户裁决:权重/暂存合一,全部动态分配,
+    /// 不再区分驻留/暂存语义;persistent/scratch 两路分配都放行)
+    General,
 }
 
 /// 建池配置。bytes 即该分解项的预算数字,建池 = 预留承诺。

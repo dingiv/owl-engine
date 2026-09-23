@@ -53,7 +53,7 @@ fn dtoh_f32(dev: &CudaDevice, ptr: *mut f32, n: usize) -> Vec<f32> {
 /// 假权重 + Session 编排面:空跑判别三连
 #[test]
 fn session_fake_weights_plan_step_discriminants() {
-    let dev = CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
+    let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
     let config = tiny_config();
     let vocab = config.vocab_size.unwrap();
     let layers = config.num_hidden_layers;

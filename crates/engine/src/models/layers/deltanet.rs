@@ -1522,7 +1522,7 @@ mod tests {
         static R: std::sync::OnceLock<(Dev, Arc<Pool>, Arc<Pool>)> = std::sync::OnceLock::new();
         R.get_or_init(|| {
             use owl_iface::{Device as _, PoolConfig, PoolKind};
-            let dev = Dev::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
+            let dev = Dev::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
             let scratch = Arc::new(
                 dev.create_pool(PoolConfig {
                     name: format!("gdn-e2e-scratch-{}", std::process::id()),

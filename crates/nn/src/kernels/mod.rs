@@ -635,7 +635,7 @@ mod tests {
         let pa = slice_ptr(&dalpha, &stream);
         let pd = slice_ptr(&ddst, &stream);
 
-        k.rmsnorm_f32(&stream, rows, cols, ps as *const f32, pa as *const f32, pd as *mut f32, eps)
+        k.rmsnorm_f32(&stream, rows, cols, ps as *const f32, pa as *const f32, pd as *mut f32, eps, 0)
             .unwrap();
         let got = dtoh_f32(&stream, &ddst);
         for r in 0..rows {

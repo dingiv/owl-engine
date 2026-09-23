@@ -2032,7 +2032,7 @@ mod varbuilder_tests {
     #[test]
     fn device_get_roundtrip() {
         use owl_iface::Device as _;
-        let dev = owl_cuda::CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA");
+        let dev = owl_cuda::CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA");
         let p = write_synthetic_gguf();
         let pool = std::sync::Arc::new(
             dev.create_pool(owl_iface::PoolConfig {
@@ -2151,7 +2151,7 @@ mod varbuilder_tests {
         let Some(vb_host) = st_host_vb() else { return };
         use owl_iface::Device as _;
         let dev =
-            owl_cuda::CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
+            owl_cuda::CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
         let pool = std::sync::Arc::new(
             dev.create_pool(owl_iface::PoolConfig {
                 name: format!("vb-st-test-{}", std::process::id()),

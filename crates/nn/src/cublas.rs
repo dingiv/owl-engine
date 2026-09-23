@@ -218,7 +218,7 @@ mod tests {
     /// f32 matmul 对拍 CPU f64 参考(裁决 4:rtol/atol = 1e-4)
     #[test]
     fn matmul_f32_matches_cpu_reference() {
-        let dev = CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
+        let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
         let stream = dev.stream().clone();
         let (blas, pool) = setup(&dev).expect("setup");
 
@@ -283,7 +283,7 @@ mod tests {
     /// 同一 handle 连续 1000 次 matmul:账本零漂移(A5.3)
     #[test]
     fn repeated_matmul_no_ledger_drift() {
-        let dev = CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
+        let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
         let (blas, pool) = setup(&dev).expect("setup");
 
         const M: usize = 64;

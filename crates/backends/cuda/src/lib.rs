@@ -33,6 +33,10 @@ pub fn test_device_ordinal() -> usize {
         .unwrap_or(0)
 }
 
+/// 测试/示例默认池容量(2026-09-23 裁决:池容量构造参数指定;
+/// 测试统一走此常量,容量只是上限,分配前不预占显存)
+pub const TEST_POOL_BYTES: u64 = 4 << 30;
+
 pub use buffers::{Persistent, RemoteBuf, Scratch, VmmBuf};
 pub use device::{CudaBackend, CudaDevice};
 pub use governor::{Budget, LedgerSnapshot};
@@ -55,7 +59,7 @@ mod tests {
     use owl_iface::{Backend as _, DevBuf, Device as _, MemPhase, PoolConfig, PoolKind, Pool as _};
 
     fn make() -> CudaDevice {
-        CudaDevice::new(super::test_device_ordinal()).expect("需要 CUDA 设备")
+        CudaDevice::new(super::test_device_ordinal(), crate::TEST_POOL_BYTES).expect("需要 CUDA 设备")
     }
 
     fn scratch_pool(b: &CudaDevice, name: &str, bytes: u64) -> CudaPool {
@@ -134,7 +138,7 @@ mod tests {
     #[test]
     fn graph_lease_keeps_memory_alive_across_user_drop() {
     let _g = gpu();
-        let dev = CudaDevice::new(super::test_device_ordinal()).expect("需要 CUDA 设备");
+        let dev = CudaDevice::new(super::test_device_ordinal(), crate::TEST_POOL_BYTES).expect("需要 CUDA 设备");
         let pool = dev
             .create_pool(PoolConfig {
                 name: "lease-t".into(),
@@ -286,7 +290,7 @@ mod tests {
     #[test]
     fn lease_survivor_drops_before_graph_token_stays_valid() {
     let _g = gpu();
-        let dev = CudaDevice::new(super::test_device_ordinal()).expect("需要 CUDA 设备");
+        let dev = CudaDevice::new(super::test_device_ordinal(), crate::TEST_POOL_BYTES).expect("需要 CUDA 设备");
         let pool = dev
             .create_pool(PoolConfig {
                 name: "lease-order".into(),

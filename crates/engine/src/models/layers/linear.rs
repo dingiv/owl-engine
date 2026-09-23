@@ -17,6 +17,7 @@ use crate::config::QuantConfig;
 pub struct GgufVarBuilderStub;
 use std::cell::Cell;
 
+// FIXME: 不允许使用全局变量。包装在结构体里面。给一个构造函数，给外面让使用者来构造。
 thread_local! {
     static LINEAR_IS_PREFILL: Cell<bool> = const { Cell::new(false) };
 }

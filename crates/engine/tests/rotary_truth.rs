@@ -26,7 +26,7 @@ fn rotary_truth_matches_reference_qwen35_08b() {
         return;
     }
     let dev =
-        owl_cuda::CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
+        owl_cuda::CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
     let scratch = std::sync::Arc::new(
         dev.create_pool(PoolConfig {
             name: format!("rope-scratch-{}", std::process::id()),

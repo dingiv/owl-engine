@@ -110,7 +110,7 @@ mod tests {
     /// 含负槽(padding 跳过)分支。
     #[test]
     fn reshape_and_cache_f32_host_parity() {
-        let dev = CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
+        let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
         let pool = dev
             .create_pool(PoolConfig {
                 name: format!("k0-{}", std::process::id()),
@@ -653,7 +653,7 @@ mod paged_tests {
         }
 
         // 设备侧
-        let dev = CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
+        let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
         let pool = dev
             .create_pool(PoolConfig {
                 name: format!("k1-{}", std::process::id()),
@@ -733,7 +733,7 @@ mod paged_tests {
     /// bf16 档 smoke:编译+发射+输出有限值(数值精度不判,仅链路)。
     #[test]
     fn paged_attention_v1_bf16_smoke() {
-        let dev = CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
+        let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
         let pool = dev
             .create_pool(PoolConfig {
                 name: format!("k1b-{}", std::process::id()),
@@ -890,7 +890,7 @@ mod paged_tests {
         }
 
         // 设备侧
-        let dev = CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
+        let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
         let pool = dev
             .create_pool(PoolConfig {
                 name: format!("k2-{}", std::process::id()),
@@ -990,7 +990,7 @@ mod paged_tests {
     /// K2 bf16 smoke:两 partition 编译链 + 输出有限值。
     #[test]
     fn paged_attention_v2_bf16_smoke() {
-        let dev = CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
+        let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
         let pool = dev
             .create_pool(PoolConfig {
                 name: format!("k2b-{}", std::process::id()),
@@ -1151,7 +1151,7 @@ mod paged_tests {
             }
         }
 
-        let dev = CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
+        let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
         let pool = dev
             .create_pool(PoolConfig {
                 name: format!("k1h256-{}", std::process::id()),
@@ -1323,7 +1323,7 @@ mod paged_tests {
             }
         }
 
-        let dev = CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
+        let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
         let pool = dev
             .create_pool(PoolConfig {
                 name: format!("k2h256-{}", std::process::id()),
@@ -1422,7 +1422,7 @@ mod paged_tests {
     /// B1 验收三:v1 bf16 head 256 smoke(编译链 + 有限值)。
     #[test]
     fn paged_attention_v1_bf16_h256_smoke() {
-        let dev = CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
+        let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
         let pool = dev
             .create_pool(PoolConfig {
                 name: format!("k1bh256-{}", std::process::id()),
@@ -1475,7 +1475,7 @@ mod paged_tests {
     /// B1 验收四:v2 bf16 head 256 smoke(主核+reduce 编译链 + 有限值)。
     #[test]
     fn paged_attention_v2_bf16_h256_smoke() {
-        let dev = CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
+        let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
         let pool = dev
             .create_pool(PoolConfig {
                 name: format!("k2bh256-{}", std::process::id()),

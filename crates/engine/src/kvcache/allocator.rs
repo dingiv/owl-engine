@@ -1126,7 +1126,7 @@ impl KVCacheAllocator {
     /// 查询单设备可用 GPU 内存(应用 kv_fraction 后)
     pub fn get_rank_available_memory(&self, device_id: usize) -> Result<u64> {
         // A4:FFI 只在 owl-cuda;UUID 钉卡纪律下按 ordinal 打开
-        let dev = CudaDevice::new(device_id)
+        let dev = CudaDevice::new(device_id, owl_cuda::TEST_POOL_BYTES)
             .map_err(|e| crate::Error::Msg(format!("CudaDevice::new({device_id}): {e:?}")))?;
         let (free, total) = dev
             .mem_get_info()
@@ -1151,7 +1151,7 @@ impl KVCacheAllocator {
 
     /// 查询单设备原始自由 GPU 内存(未应用 kv_fraction)
     pub fn get_rank_free_memory(&self, device_id: usize) -> Result<u64> {
-        let dev = CudaDevice::new(device_id)
+        let dev = CudaDevice::new(device_id, owl_cuda::TEST_POOL_BYTES)
             .map_err(|e| crate::Error::Msg(format!("CudaDevice::new({device_id}): {e:?}")))?;
         let (free, _total) = dev
             .mem_get_info()

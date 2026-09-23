@@ -14,7 +14,7 @@ use owl_nn::tensor::TensorPoolOps;
 
 #[test]
 fn ref_ops_all_match_common_reference() {
-    let dev = CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
+    let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
     let persist = dev
         .create_pool(PoolConfig {
             name: format!("ref-persist-{}", std::process::id()),
@@ -104,7 +104,7 @@ fn ref_ops_all_match_common_reference() {
 
 #[test]
 fn ref_chain_matmul_add_silu_rmsnorm() {
-    let dev = CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备");
+    let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
     let persist = dev
         .create_pool(PoolConfig {
             name: format!("ref-chain-persist-{}", std::process::id()),

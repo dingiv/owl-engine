@@ -68,7 +68,7 @@ fn m1_real_weights_construct_and_prefill() {
     assert_eq!(vocab, 248320);
 
     // ---- 设备与池(真权重 f32 化 ≈3.4G + rotary 67M + mamba 状态)----
-    let dev = Arc::new(CudaDevice::new(owl_cuda::test_device_ordinal()).expect("需要 CUDA 设备"));
+    let dev = Arc::new(CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备"));
     let scratch = Arc::new(
         dev.create_pool(PoolConfig {
             name: format!("m1-scratch-{}", std::process::id()),
