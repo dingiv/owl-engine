@@ -48,14 +48,29 @@ pub struct InputMetadata {
 }
 
 impl InputMetadata {
-    /// 投影为层接受的 vendor 面(丢弃模型私有字段;decode 指针透传)
-    fn vendor(&self) -> vendor::InputMetadata {
+    /// 投影为层接受的 vendor 面(丢弃模型私有字段;decode 指针透传)。
+    /// prefill 时从 seqlens 派生 cu_seqlens(U32 设备张量;GDN conv1d 与
+    /// varlen 分派消费,M-Ⅰ 实测缺口,2026-09-23)。
+    fn vendor(&self, device: &Device) -> vendor::InputMetadata {
+        let seqlens = self.seqlens.clone().unwrap_or_default();
+        let cu_seqlens_q = if self.is_prefill && !seqlens.is_empty() {
+            let mut v = Vec::with_capacity(seqlens.len() + 1);
+            let mut acc = 0u32;
+            v.push(0u32);
+            for s in &seqlens {
+                acc += *s as u32;
+                v.push(acc);
+            }
+            Some(super::layers::ctor::from_vec(v, (seqlens.len() + 1,), device).expect("cu_seqlens 落池"))
+        } else {
+            None
+        };
         vendor::InputMetadata {
-            seqlens: self.seqlens.clone().unwrap_or_default(),
+            seqlens,
             context_lens: Vec::new(),
             is_prefill: self.is_prefill,
             is_mtp_verify: self.is_mtp_verify,
-            cu_seqlens_q: None,
+            cu_seqlens_q,
             decode_ptrs: self.decode_ptrs,
         }
     }
@@ -182,7 +197,7 @@ impl Qwen3_5DecoderLayer {
         attention_mask: Option<&Vec<Tensor>>,
         positions: &Tensor,
         cache: Option<(&Tensor, &Tensor)>,
-        input_metadata: &InputMetadata,
+        input_metadata: &vendor::InputMetadata,
         mamba_cache: &mut vendor::MambaCache,
         seq_slots: &Tensor,
     ) -> Result<Tensor> {
@@ -198,11 +213,11 @@ impl Qwen3_5DecoderLayer {
                     attention_mask,
                     positions,
                     cache,
-                    &input_metadata.vendor(),
+                    input_metadata,
                 )?
             }
             Qwen3_5AttnType::LinearAttention(gdn) => {
-                gdn.forward(&xs, mamba_cache, &input_metadata.vendor(), seq_slots)?
+                gdn.forward(&xs, mamba_cache, input_metadata, seq_slots)?
             }
         };
 
@@ -645,6 +660,10 @@ impl Qwen3_5ForCausalLM {
 
         let mut kv_cache_idx = 0usize;
         let seq_slots = self.resolve_seq_slots(input_metadata, xs.dim(0)?)?;
+        // vendor 元数据(含 cu_seqlens)整个 forward 存活一份:逐层重建会经
+        // 池块释放复用,与异步 kernel 写竞速被清零(2026-09-23 M-Ⅰ 实测)
+        let vmeta = input_metadata.vendor(&self.device);
+        let input_metadata = &vmeta;
         let mut mamba_cache = self.mamba_cache.write();
 
         for (i, layer) in self.layers.iter().enumerate() {
@@ -663,7 +682,7 @@ impl Qwen3_5ForCausalLM {
                 attention_mask.as_ref(),
                 positions,
                 cache,
-                input_metadata,
+                &vmeta,
                 &mut mamba_cache,
                 &seq_slots,
             )?;
@@ -691,7 +710,7 @@ impl Qwen3_5ForCausalLM {
 
         if collect_layer_ids.is_some() {
             let logits_xs = if !seqlens.is_empty() {
-                let indices: Vec<_> = seqlens.iter().map(|x| x - 1).collect();
+                let indices: Vec<u32> = seqlens.iter().map(|x| *x as u32 - 1).collect();
                 let batch = indices.len();
                 xs.index_select(
                     0,
@@ -880,6 +899,16 @@ impl Qwen3_5ForCausalLM {
                 .forward(&hidden.to_dtype(self.dtype)?)?
                 .to_dtype(DType::F32)
         }
+    }
+
+    /// 观测面:full_attention 层数(hybrid 分派真跑验证用)
+    pub fn full_attention_count(&self) -> usize {
+        self.layers.iter().filter(|l| l.is_full_attention()).count()
+    }
+
+    /// 观测面:GDN(linear_attention)层数
+    pub fn gdn_layer_count(&self) -> usize {
+        self.layers.len() - self.full_attention_count()
     }
 
     pub fn get_vocab_size(&self) -> usize {

@@ -60,6 +60,79 @@ extern "C" __global__ void owl_rope_half_f32(
     }
 }
 
+// partial rotate-half RoPE:只转每头前 2*half 维(旋转对 (i, i+half)),
+// 余维直通(0.8B head_dim 256 / rotary_dim 64 实测;cos 表 [max_pos, half])
+extern "C" __global__ void owl_rope_half_partial_f32(
+    const float* q, const float* k,
+    float* q_out, float* k_out,
+    const float* cos_t, const float* sin_t,
+    const unsigned int* pos,
+    unsigned int q_heads, unsigned int kv_heads,
+    unsigned int head_dim, unsigned int half) {
+    unsigned int t = blockIdx.x;
+    unsigned int p = pos[t];
+    const float* c = cos_t + (unsigned long long)p * half;
+    const float* s = sin_t + (unsigned long long)p * half;
+    for (unsigned int h = 0; h < q_heads; ++h) {
+        const float* qs = q + ((unsigned long long)t * q_heads + h) * head_dim;
+        float* qd = q_out + ((unsigned long long)t * q_heads + h) * head_dim;
+        for (unsigned int i = threadIdx.x; i < half; i += blockDim.x) {
+            float a = qs[i], b = qs[i + half];
+            qd[i] = a * c[i] - b * s[i];
+            qd[i + half] = a * s[i] + b * c[i];
+        }
+        for (unsigned int i = half * 2 + threadIdx.x; i < head_dim; i += blockDim.x) {
+            qd[i] = qs[i];
+        }
+    }
+    for (unsigned int h = 0; h < kv_heads; ++h) {
+        const float* ks = k + ((unsigned long long)t * kv_heads + h) * head_dim;
+        float* kd = k_out + ((unsigned long long)t * kv_heads + h) * head_dim;
+        for (unsigned int i = threadIdx.x; i < half; i += blockDim.x) {
+            float a = ks[i], b = ks[i + half];
+            kd[i] = a * c[i] - b * s[i];
+            kd[i + half] = a * s[i] + b * c[i];
+        }
+        for (unsigned int i = half * 2 + threadIdx.x; i < head_dim; i += blockDim.x) {
+            kd[i] = ks[i];
+        }
+    }
+}
+
+// 3D 转置 [A,B,C] → [B,A,C](prefill eager 头前置;一线程一元素)
+extern "C" __global__ void owl_transpose01_f32(
+    const float* src, float* dst,
+    unsigned int a, unsigned int b, unsigned int c) {
+    unsigned long long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long total = (unsigned long long)a * b * c;
+    if (idx >= total) return;
+    unsigned int ci = idx % c;
+    unsigned int r = idx / c;
+    unsigned int bi = r % b;
+    unsigned int ai = r / b;
+    dst[(unsigned long long)bi * a * c + (unsigned long long)ai * c + ci] = src[idx];
+}
+
+// 3D 转置 [A,B,C] → [A,C,B](最后两维换位;QK^T 面)
+extern "C" __global__ void owl_transpose12_f32(
+    const float* src, float* dst,
+    unsigned int a, unsigned int b, unsigned int c) {
+    unsigned long long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long total = (unsigned long long)a * b * c;
+    if (idx >= total) return;
+    unsigned int ci = idx % c;
+    unsigned int r = idx / c;
+    unsigned int bi = r % b;
+    unsigned int ai = r / b;
+    dst[(unsigned long long)ai * c * b + (unsigned long long)ci * b + bi] = src[idx];
+}
+
+// 逐元素 sigmoid(attn_output_gate 门控;捕获安全,无 exp 重入)
+extern "C" __global__ void owl_sigmoid_f32(const float* x, float* out, unsigned long long n) {
+    unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = 1.0f / (1.0f + expf(-x[i]));
+}
+
 // decode(seq=1)naive attention:一线程一 (t, q_head)。
 // 写 cache(slot>=0)→ 对 cache[0..kv_len] 全行打分 softmax → 加权和出 out。
 #define OWL_DRY_MAX_KV 256

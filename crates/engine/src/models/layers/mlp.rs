@@ -46,10 +46,18 @@ impl MLP {
         _suffix: &str,
     ) -> Result<Self> {
         let shard = super::Shard::default();
+        // gate 键名双约定:GGUF 融合面 = vb 根 weight;HF 分立面 =
+        // gate_proj/weight(真 checkpoint 实测,2026-09-23 M-Ⅰ)。缺根 weight 时
+        // 自动回退分立键,两路 GGUF 行为不变。
+        let gate_vbx = if vb.has_key("weight") {
+            vb.clone()
+        } else {
+            vb.pp("gate_proj")
+        };
         let gate_proj = TensorParallelColumnLinear::new_loaded(
             hidden_size,
             intermediate_size,
-            vb,
+            &gate_vbx,
             shard,
             quant_cfg,
             quant,

@@ -745,7 +745,21 @@ pub mod ops {
             Ok(super::DynTensor::from_f32(&out))
         })
     }
-    pub fn sigmoid(_x: &Tensor) -> Result<Tensor> { unimplemented!("T3 kernel 回填: sigmoid") }
+    pub fn sigmoid(x: &Tensor) -> Result<Tensor> {
+        // sigmoid(gate)(attn_output_gate 门控;dry 逐元素核)
+        ctx_scope::with_dry(|ctx, dry| {
+            let n = x.shape().iter().product::<usize>();
+            let out_t = ctx.scratch_tensor::<f32>(x.shape())?;
+            dry.sigmoid_f32(
+                ctx.stream(),
+                x.device_ptr() as *const f32,
+                out_t.device_ptr() as *mut f32,
+                n,
+            )
+            .map_err(|e| crate::Error::Msg(format!("sigmoid: {e}")))?;
+            Ok(owl_nn::DynTensor::from_f32(&out_t))
+        })
+    }
     pub fn cat(xs: &[Tensor], dim: usize) -> Result<Tensor> {
         ctx_scope::with(|_ops, ctx| erased::cat(ctx, xs, dim).map_err(Into::into))
     }
@@ -1499,7 +1513,7 @@ pub mod vendor {
     // fused rope(= attention_rs::fused_rope::FusedRope)
     pub mod fused_rope {
         use crate::Result;
-        use super::super::{ctx_scope, erased, Tensor};
+        use super::super::{ctx_scope, erased, OwlTensor, Tensor};
         use owl_nn::DynTensor;
         pub fn apply_inplace(
             q: &Tensor,
@@ -1541,15 +1555,44 @@ pub mod vendor {
             })
         }
         pub fn apply_inplace_partial(
-            _q: &Tensor,
-            _k: &Tensor,
-            _cos: &Tensor,
-            _sin: &Tensor,
-            _positions: &Tensor,
+            q: &Tensor,
+            k: &Tensor,
+            cos: &Tensor,
+            sin: &Tensor,
+            positions: &Tensor,
             _is_rope_i: bool,
-            _rotary_dim: usize,
+            rotary_dim: usize,
         ) -> Result<()> {
-            Err(crate::Error::Msg("vendor fused_rope::apply_inplace_partial: T3 kernel 回填".into()))
+            // partial rotate-half:只转每头前 rotary_dim 维,余维直通。
+            // q/k [tokens, heads, head_dim] 连续 f32;cos/sin 表 [max_pos, rotary_dim/2]。
+            let d3 = q.dims()?; let (_tokens, q_heads, head_dim) = (d3[0], d3[1], d3[2]);
+            let kd3 = k.dims()?; let (_kt, kv_heads, _kd) = (kd3[0], kd3[1], kd3[2]);
+            let rotary_half = rotary_dim / 2;
+            ctx_scope::with_dry(|ctx, dry| {
+                let tokens = positions.shape()[0];
+                let q_out = ctx.scratch_tensor::<f32>(q.shape())?;
+                let k_out = ctx.scratch_tensor::<f32>(k.shape())?;
+                dry.rope_half_partial_f32(
+                    ctx.stream(),
+                    q.device_ptr() as *const f32,
+                    k.device_ptr() as *const f32,
+                    q_out.device_ptr() as *mut f32,
+                    k_out.device_ptr() as *mut f32,
+                    cos.device_ptr() as *const f32,
+                    sin.device_ptr() as *const f32,
+                    positions.device_ptr() as *const u32,
+                    tokens,
+                    q_heads,
+                    kv_heads,
+                    head_dim,
+                    rotary_half,
+                ).map_err(|e| crate::Error::Msg(format!("rope_half_partial: {e}")))?;
+                let qo = DynTensor::from_f32(&q_out);
+                let ko = DynTensor::from_f32(&k_out);
+                erased::copy_d2d_to_raw(ctx, &qo, q.device_ptr() as *mut core::ffi::c_void, q.len_bytes())?;
+                erased::copy_d2d_to_raw(ctx, &ko, k.device_ptr() as *mut core::ffi::c_void, k.len_bytes())?;
+                Ok(())
+            })
         }
     }
     /// 分页注意力句柄(= attention_rs::PagedAttention)

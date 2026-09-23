@@ -109,6 +109,44 @@ mod pa_shim {
         head_dim: usize,
     }
 
+    /// [A,B,C] → [A,C,B](dry transpose12 核)
+    fn transpose12(t: &Tensor, a: usize, b: usize, c: usize) -> Result<Tensor> {
+        crate::models::layers::ctx_scope::with_dry(|ctx, dry| {
+            let out_t = ctx.scratch_tensor::<f32>(&[a, c, b])?;
+            let out = owl_nn::DynTensor::from_f32(&out_t);
+            dry.transpose12_f32(
+                ctx.stream(),
+                t.device_ptr() as *const f32,
+                out.device_ptr() as *mut f32,
+                a,
+                b,
+                c,
+            )
+            .map_err(|e| crate::Error::Msg(format!("transpose12: {e}")))?;
+            ctx.trace_launch("transpose12");
+            Ok(out)
+        })
+    }
+
+    /// [A,B,C] → [B,A,C](dry transpose01 核;permute stride 语义未落地)
+    fn transpose01(t: &Tensor, a: usize, b: usize, c: usize) -> Result<Tensor> {
+        crate::models::layers::ctx_scope::with_dry(|ctx, dry| {
+            let out_t = ctx.scratch_tensor::<f32>(&[b, a, c])?;
+            let out = owl_nn::DynTensor::from_f32(&out_t);
+            dry.transpose01_f32(
+                ctx.stream(),
+                t.device_ptr() as *const f32,
+                out.device_ptr() as *mut f32,
+                a,
+                b,
+                c,
+            )
+            .map_err(|e| crate::Error::Msg(format!("transpose01: {e}")))?;
+            ctx.trace_launch("transpose01");
+            Ok(out)
+        })
+    }
+
     impl PagedAttention {
         #[allow(clippy::too_many_arguments)]
         pub fn new(
@@ -133,31 +171,44 @@ mod pa_shim {
             q: &Tensor,
             k: &Tensor,
             v: &Tensor,
-            _mask: Option<&Vec<Tensor>>,
+            mask: Option<&Vec<Tensor>>,
             k_cache: Option<Tensor>,
             v_cache: Option<Tensor>,
             meta: &InputMetadata,
             _softcap: Option<f64>,
         ) -> Result<Tensor> {
-            // decode-only:seq_len = bs;prefill 保持 eager(与 xinfer 语义一致,
-            // warmup 也走 decode 形态的 seq_len=1 输入)
-            let (seq_len, _hq, d) = crate::models::layers::OwlTensor::dims3(q)?;
-            let _ = (_hq, d);
-            let (ptrs, kc, vc) = match (&meta.decode_ptrs, k_cache, v_cache) {
-                (Some(p), Some(kc), Some(vc)) => (p, kc, vc),
+            // 分派:decode = naive 核;prefill = eager 逐序列(causal mask + GQA 展开
+            // + KV 落槽;M-Ⅰ 实接,2026-09-23)。两路均在 with_dry 面。
+            let (seq_len, _hq, _d) = crate::models::layers::OwlTensor::dims3(q)?;
+            match (&meta.decode_ptrs, k_cache.clone(), v_cache.clone()) {
+                (Some(p), Some(kc), Some(vc)) => {
+                    Self::forward_decode(q, k, v, kc, vc, *p, meta, seq_len)
+                }
+                (None, Some(kc), Some(vc)) if meta.is_prefill => {
+                    Self::forward_prefill_eager(q, k, v, kc, vc, mask, meta, seq_len)
+                }
                 _ => crate::bail!(
                     "pa_shim: decode 需要 meta.decode_ptrs + kv cache 对(空跑面;prefill eager 另案)"
                 ),
-            };
-            crate::models::layers::ctx_scope::with_dry(|ctx, dry| {
-                let out_t = ctx.scratch_tensor::<f32>(&[seq_len, self.num_heads * self.head_dim])?;
+            }
+        }
+
+        /// decode naive 路径(原实现搬入)
+        #[allow(clippy::too_many_arguments)]
+        fn forward_decode(
+            q: &Tensor,
+            k: &Tensor,
+            v: &Tensor,
+            kc: Tensor,
+            vc: Tensor,
+            ptrs: crate::models::layers::vendor::DecodePtrs,
+            meta: &InputMetadata,
+            seq_len: usize,
+        ) -> Result<Tensor> {
+            use crate::models::layers::{ctx_scope, erased, OwlTensor};
+            ctx_scope::with_dry(|ctx, dry| {
+                let out_t = ctx.scratch_tensor::<f32>(&[seq_len, q.shape()[2] * q.shape()[1]])?;
                 let out = owl_nn::DynTensor::from_f32(&out_t);
-                let kv_lens_i32 = meta
-                    .context_lens
-                    .first()
-                    .copied()
-                    .unwrap_or(1) as i32;
-                let _ = kv_lens_i32; // kv_lens 走设备指针(bindings),host 值不参与
                 dry.naive_decode_attn_f32(
                     ctx.stream(),
                     q.device_ptr() as *const f32,
@@ -169,14 +220,135 @@ mod pa_shim {
                     ptrs.kv_lens,
                     out.device_ptr() as *mut f32,
                     seq_len,
-                    self.num_heads,
-                    self.num_kv_heads,
-                    self.head_dim,
+                    q.shape()[1],
+                    k.shape()[1],
+                    q.shape()[2],
                 )
                 .map_err(|e| crate::Error::Msg(format!("naive_decode_attn: {e}")))?;
                 ctx.trace_launch("naive_decode_attn");
                 Ok(out)
             })
+        }
+
+        /// prefill eager:逐序列 naive attention(candle 形态,[H,len,D] 面)。
+        /// 单序列或 varlen 打包(cu_seqlens/seqlens 均可);KV 写回 cache 槽行
+        /// (行号 = token 全局位;M-Ⅰ 冒烟口径:fresh cache,槽 = 位置)。
+        #[allow(clippy::too_many_arguments)]
+        fn forward_prefill_eager(
+            q: &Tensor,
+            k: &Tensor,
+            v: &Tensor,
+            kc: Tensor,
+            vc: Tensor,
+            mask: Option<&Vec<Tensor>>,
+            meta: &InputMetadata,
+            _total_tokens: usize,
+        ) -> Result<Tensor> {
+            use crate::models::layers::ops;
+            use crate::models::layers::{ctx_scope, erased, OwlTensor};
+            let (_t, hq, d) = {
+                let d3 = OwlTensor::dims(q)?;
+                (d3[0], d3[1], d3[2])
+            };
+            let hkv = OwlTensor::dims(k)?[1];
+            let scale = f64::from((d as f32).powf(-0.5));
+            let group = hq / hkv;
+            let seqlens = if !meta.seqlens.is_empty() {
+                meta.seqlens.clone()
+            } else {
+                vec![OwlTensor::dims(q)?[0]]
+            };
+            let mut outs = Vec::new();
+            let mut start = 0usize;
+            for (si, &len) in seqlens.iter().enumerate() {
+                let q_s = q.narrow(0usize, start, len)?;
+                let k_s = k.narrow(0usize, start, len)?;
+                let v_s = v.narrow(0usize, start, len)?;
+                // [len, H, D] → [H, len, D]
+                let qh = transpose01(
+                    &q_s.reshape((len, hq, d))?.contiguous()?,
+                    len,
+                    hq,
+                    d,
+                )?;
+                let mut kh = transpose01(
+                    &k_s.reshape((len, hkv, d))?.contiguous()?,
+                    len,
+                    hkv,
+                    d,
+                )?;
+                let mut vh = transpose01(
+                    &v_s.reshape((len, hkv, d))?.contiguous()?,
+                    len,
+                    hkv,
+                    d,
+                )?;
+                if group > 1 {
+                    // GQA 展开:每个 kv 头连续重复 group 次(h → h/group 映射)
+                    let k_parts: Vec<Tensor> = (0..group).map(|_| kh.clone()).collect();
+                    let v_parts: Vec<Tensor> = (0..group).map(|_| vh.clone()).collect();
+                    kh = ops::cat(&k_parts, 0usize)?;
+                    vh = ops::cat(&v_parts, 0usize)?;
+                }
+                // 写 cache 槽行(行 = token 全局位 start+i)
+                let row = hkv * d;
+                let k_flat = k_s.reshape((len, row))?.contiguous()?;
+                let v_flat = v_s.reshape((len, row))?.contiguous()?;
+                ctx_scope::with_dry(|ctx, _dry| {
+                    for i in 0..len {
+                        let slot_row = start + i;
+                        let ki = k_flat.narrow(0usize, i, 1)?;
+                        let vi = v_flat.narrow(0usize, i, 1)?;
+                        erased::copy_d2d_to_raw(
+                            ctx,
+                            &ki,
+                            unsafe { kc.device_ptr().add(slot_row * row * 4) } as *mut core::ffi::c_void,
+                            row * 4,
+                        )?;
+                        erased::copy_d2d_to_raw(
+                            ctx,
+                            &vi,
+                            unsafe { vc.device_ptr().add(slot_row * row * 4) } as *mut core::ffi::c_void,
+                            row * 4,
+                        )?;
+                    }
+                    Ok(())
+                })?;
+                // 注意力:matmul 一期 2D → 逐头循环
+                // qh [Hq,len,D] / kh [Hkv,len,D](已 GQA 展开)/ vh [Hkv,len,D]
+                let qh = qh.contiguous()?;
+                let kh = kh.contiguous()?;
+                let vh = vh.contiguous()?;
+                let m2 = match mask.map(|ms| ms[si].reshape((len, len))).transpose() { Ok(m) => m, Err(e) => return Err(e.into()) };
+                let mut head_outs = Vec::with_capacity(hq);
+                for h in 0..hq {
+                    let qh2 = qh.narrow(0usize, h, 1)?.reshape((len, d))?;
+                    let kh2 = kh.narrow(0usize, h / group, 1)?.reshape((d, len))?;
+                    let mut att = qh2.matmul(&kh2)?; // [len,len]
+                    att = att.affine(scale, 0.0)?;
+                    if let Some(m) = &m2 {
+                        att = att.broadcast_add(m)?;
+                    }
+                    let att = ops::softmax_last_dim(&att)?;
+                    let vh2 = vh.narrow(0usize, h / group, 1)?.reshape((len, d))?;
+                    let o = att.matmul(&vh2)?; // [len,D]
+                    head_outs.push(o.reshape((1usize, len, d))?);
+                }
+                let ctx_out = if head_outs.len() == 1 {
+                    head_outs.into_iter().next().unwrap()
+                } else {
+                    ops::cat(&head_outs, 0usize)? // [Hq, len, D]
+                };
+                let out = transpose01(&ctx_out.contiguous()?, hq, len, d)? // [len, Hq, D]
+                    .reshape((len, hq * d))?;
+                outs.push(out);
+                start += len;
+            }
+            if outs.len() == 1 {
+                Ok(outs.into_iter().next().unwrap())
+            } else {
+                ops::cat(&outs, 0usize)
+            }
         }
     }
 }

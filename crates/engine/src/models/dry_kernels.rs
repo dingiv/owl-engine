@@ -142,6 +142,103 @@ impl DryKernels {
         )
     }
 
+    /// 逐元素 sigmoid
+    pub fn sigmoid_f32(
+        &mut self,
+        stream: &owl_cuda::ffi::CudaStream,
+        x: *const f32,
+        out: *mut f32,
+        n: usize,
+    ) -> Result<(), String> {
+        self.launch(
+            stream,
+            "owl_sigmoid_f32",
+            (((n as u32) + 127) / 128, 1, 1),
+            (128, 1, 1),
+            &[x as u64, out as u64, n as u64],
+        )
+    }
+
+    /// 3D 转置 [A,B,C] → [A,C,B](连续 f32;最后两维换位)
+    pub fn transpose12_f32(
+        &mut self,
+        stream: &owl_cuda::ffi::CudaStream,
+        src: *const f32,
+        dst: *mut f32,
+        a: usize,
+        b: usize,
+        c: usize,
+    ) -> Result<(), String> {
+        let total = (a * b * c) as u32;
+        self.launch(
+            stream,
+            "owl_transpose12_f32",
+            ((total + 127) / 128, 1, 1),
+            (128, 1, 1),
+            &[src as u64, dst as u64, a as u64, b as u64, c as u64],
+        )
+    }
+
+    /// 3D 转置 [A,B,C] → [B,A,C](连续 f32)
+    pub fn transpose01_f32(
+        &mut self,
+        stream: &owl_cuda::ffi::CudaStream,
+        src: *const f32,
+        dst: *mut f32,
+        a: usize,
+        b: usize,
+        c: usize,
+    ) -> Result<(), String> {
+        let total = (a * b * c) as u32;
+        self.launch(
+            stream,
+            "owl_transpose01_f32",
+            ((total + 127) / 128, 1, 1),
+            (128, 1, 1),
+            &[src as u64, dst as u64, a as u64, b as u64, c as u64],
+        )
+    }
+
+    /// partial rotate-half RoPE:只转每头前 2*rotary_half 维,余维直通。
+    /// q/k [tokens, heads, head_dim] 连续 f32;cos/sin 表 [max_pos, rotary_half]。
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_half_partial_f32(
+        &mut self,
+        stream: &owl_cuda::ffi::CudaStream,
+        q: *const f32,
+        k: *const f32,
+        q_out: *mut f32,
+        k_out: *mut f32,
+        cos: *const f32,
+        sin: *const f32,
+        positions: *const u32,
+        tokens: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        rotary_half: usize,
+    ) -> Result<(), String> {
+        self.launch(
+            stream,
+            "owl_rope_half_partial_f32",
+            (tokens as u32, 1, 1),
+            (128, 1, 1),
+            &[
+                q as u64,
+                k as u64,
+                q_out as u64,
+                k_out as u64,
+                cos as u64,
+                sin as u64,
+                positions as u64,
+                heads as u64,
+                kv_heads as u64,
+                head_dim as u64,
+                rotary_half as u64,
+            ],
+        )
+    }
+
     /// decode(seq=1)naive attention:
     /// q [bs,Hq,D];k/v [bs,Hkv,D];kc/vc [max_slots,Hkv,D](slot 直排);
     /// slots [bs] i64(负 = padding);kv_lens [bs] i32;out [bs,Hq*D]。

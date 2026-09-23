@@ -5,7 +5,7 @@
 //! 随 vendor 三选一裁决,体为占位。
 
 use super::{DType, Device, Result, Tensor};
-use crate::bail;
+use super::OwlTensor;
 
 pub fn get_attention_causal_mask(
     device: &Device,
@@ -31,13 +31,31 @@ pub fn get_attention_causal_mask(
 }
 
 fn get_causal_mask_internal(
-    _device: &Device,
-    _dtype: DType,
+    device: &Device,
+    dtype: DType,
     tgt_len: usize,
     sliding_window: Option<usize>,
 ) -> Result<Tensor> {
-    // vendor attention_rs::mask::causal_mask(归宿裁决随 vendor 三选一;
-    // 骨架保留 tgt_len/sliding_window 语义,T3 kernel 回填)
-    let _ = (tgt_len, sliding_window);
-    bail!("vendor causal_mask: T3 kernel 回填(vendor 归宿裁决待定)")
+    // candle 经典 additive mask:[1, 1, tgt, tgt];允许位 = 0,禁止位 = -inf。
+    // 消费面 = softmax 前 broadcast_add(attention.rs naive 分支)。
+    // sliding_window:q 位 i 对 kv 位 j 允许 ⇔ j ≤ i 且 i - j < window。
+    let neg_inf = f32::NEG_INFINITY;
+    let mut v = vec![0f32; tgt_len * tgt_len];
+    for i in 0..tgt_len {
+        for j in 0..tgt_len {
+            let banned = j > i
+                || sliding_window
+                    .is_some_and(|w| i - j >= w);
+            if banned {
+                v[i * tgt_len + j] = neg_inf;
+            }
+        }
+    }
+    let t = super::ctor::from_vec(v, (tgt_len, tgt_len), device)?;
+    let t = if dtype == DType::F32 {
+        t
+    } else {
+        t.to_dtype(dtype)?
+    };
+    Ok(t.reshape((1usize, 1, tgt_len, tgt_len))?)
 }

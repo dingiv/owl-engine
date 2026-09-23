@@ -367,12 +367,7 @@ mod gdn_shim {
     /// 原 gdn_delta_rec_fb 直通在 bh>1 时 out 写缺失(状态写正确;owl-nn 单独
     /// 对拍却绿——多块并发下 out 路径行为与状态路径不一致,另案查 .cu)。
     /// 现役实现 = delta_decode_slots_gqa 逐 token 推进:语义 = delta rule
-    /// 按时间展开,逐序列 token 连续(narrow_dim0 视图零拷贝),状态常驻表
-    /// 槽寻址就地读写,g log 空间核内自 exp(两核约定差异消失),GQA 映射
-    /// 核内完成(q 缩放核内)。代价 = 每 token 一次 launch(fallback 可接受;
-    /// tiled/varlen 核引入后替换,见 phase2 路线)。
-    #[allow(clippy::too_many_arguments)]
-    fn recurrence_varlen_impl(
+fn recurrence_varlen_impl(
         q: &Tensor,
         k: &Tensor,
         v: &Tensor,
