@@ -104,10 +104,14 @@ impl Qwen3_5DecoderLayer {
         dtype: DType,
     ) -> Result<Self> {
         let is_qvar_builder = vb.is_qvar_builder();
-        // Qwen3.5(HF safetensors)= 纯 RMSNorm×weight,无 Gemma 式 +1 offset。
-        // 旧逻辑 !is_qvar && !nvfp4 恒 true → 权重被 +1(M-Ⅳ 对拍实锤:
-        // layernorm 输出恰为参考 2.0 倍)。GGUF 路径本就 false,维持。
-        let use_norm_offset = false;
+        // Qwen3.5 RMSNorm = ×(1+w)(HF modeling_qwen3_5.rs:854;xinfer 原语义忠实)。
+        // 2026-09-23 曾误判 +1 为误植而改 false,被 m4 逐层对拍推翻:缺失 +1
+        // 导致 GDN 层贡献缩水(层 4 起 7% 发散)。kernel 已支持 w_off 参数。
+        let use_norm_offset = !is_qvar_builder
+            && !config
+                .quantization_config
+                .as_ref()
+                .is_some_and(|q| q.is_mlx_nvfp4);
 
         let attn = if layer_type == "full_attention" {
             Qwen3_5AttnType::FullAttention(Attention::new(

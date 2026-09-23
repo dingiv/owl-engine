@@ -331,6 +331,7 @@ impl OpsCtx {
                 alpha.device_ptr() as *const f32,
                 out.device_ptr() as *mut f32,
                 eps,
+                0,
             )
             .map_err(BackendError::Init)
     }

@@ -156,6 +156,7 @@ pub fn rmsnorm(
     x: &DynTensor<CudaDevice>,
     alpha: &DynTensor<CudaDevice>,
     eps: f32,
+    w_off: bool,
 ) -> Result<DynTensor<CudaDevice>, BackendError> {
     require_f32(x.dtype(), "rmsnorm")?;
     require_f32(alpha.dtype(), "rmsnorm")?;
@@ -191,6 +192,7 @@ pub fn rmsnorm(
             ralpha.device_ptr(),
             out.device_ptr(),
             eps,
+            w_off as i32,
         )
         .map_err(BackendError::Init)?;
     Ok(DynTensor::from_f32(&out))

@@ -55,3 +55,15 @@
   在 m2-endgame-wip 已验证可用)对比层 4 conv/g/beta/递推 vs HF torch
   参考(fla 未装走纯 torch,可 /tmp/hfref 直算);疑点 = conv_state 初值、
   per-seq 分段、f32 累积序(7% 或为良性,需 M-Ⅳ 容差裁决)。
+
+## M-Ⅱ 二次补记(use_norm_offset 恢复 + 池 H2D 流序修复后)
+
+- 池重构引入的回归已修:CudaPool::htod_persistent_in 的 H2D 改池流 async+sync
+  (NULL 流无序,审计 P0-3 同族,重构时重新引入过一次);
+- 当前状态:**幅值增长模式与 HF 一致**(owl 0.30→2.43 vs HF 0.61→5.56),
+  全链零 NaN;残余 = 逐层数值分歧(层 0 GDN 起,rel ~1.4);
+- 侦查工具已备:dbg_dump(feature=never)、/tmp/hf_dump.npz(HF 逐层真值)、
+  /tmp/hf_probe.py(HF 子模块挂钩样例)、/tmp/hfref venv;
+- 下一刀:HF 源码 qwen3_5.py GatedDeltaNet.forward 逐行对照
+  (chunk_gated_delta_rule 纯 torch 参考在 fla 未装时可用),
+  对层 0 GDN 的 qkv 分切/l2norm/g 折叠/delta 方向做逐子段对拍。

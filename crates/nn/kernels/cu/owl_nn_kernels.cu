@@ -88,7 +88,7 @@ extern "C" __global__ void owl_softmax_f32(
 // 一 block 一行:先算均方根,再缩放乘 alpha。
 extern "C" __global__ void owl_rmsnorm_f32(
     const float *src, float *dst, const float *alpha,
-    const int n_cols, const float eps) {
+    const int n_cols, const float eps, const int w_off) {
     extern __shared__ float smem[];
     const int row = blockIdx.x;
     const float *x = src + (size_t)row * n_cols;
@@ -107,7 +107,11 @@ extern "C" __global__ void owl_rmsnorm_f32(
     const float rms = rsqrtf(smem[0] / (float)n_cols + eps);
 
     for (int col = threadIdx.x; col < n_cols; col += blockDim.x) {
-        y[col] = x[col] * rms * alpha[col];
+        // Qwen3.5/Qwen3Next Gemma 式 +1:alpha 为可学习 w,y 用 (w+1)
+        // (HF modeling_qwen3_5.py:854 "output * (1.0 + self.weight)";
+        //  xinfer 等价实现 = 权重装载时 +1,owl 改为核内参数,避免 affine 组合)
+        const float a = w_off ? (alpha[col] + 1.0f) : alpha[col];
+        y[col] = x[col] * rms * a;
     }
 }
 

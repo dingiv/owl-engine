@@ -175,9 +175,9 @@ pub fn rms_norm_sharded(
         (vb.get(size, "weight")?.dequantize(&vb.device())?, DType::F32)
     };
 
-    let weight = if is_gemma { weight.affine(1.0, 1.0)? } else { weight };
+    // Gemma 式 +1 改由 kernel 内参数(rmsnorm w_off;affine 组合有 broadcast 布局问题)
     Ok(NormX {
-        norm: NormKind::Rms(RmsNorm::new(weight, eps)),
+        norm: NormKind::Rms(RmsNorm::new_off(weight, eps, is_gemma)),
         v4_weight: None,
         v4_eps: eps as f32,
         dtype,

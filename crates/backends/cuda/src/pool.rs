@@ -95,15 +95,22 @@ impl Pool for CudaPool {
         let bytes = (len * std::mem::size_of::<T>()) as u64;
         let buf = self.malloc_persistent_buf(bytes)?;
         self.ctx.bind_to_thread().map_err(|e| BackendError::Init(format!("{e:?}")))?;
+        // P0-3 口径:H2D 必须走池流(async + sync),NULL 流与主流无序
+        // (审计同族案:cu_seqlens 清零/cat 脏数据)
         unsafe {
             use cudarc::driver::sys;
-            sys::cuMemcpyHtoD_v2(
+            sys::cuMemcpyHtoDAsync_v2(
                 buf.device_ptr() as sys::CUdeviceptr,
                 src.as_ptr() as *const core::ffi::c_void,
                 bytes as usize,
+                self.stream.cu_stream(),
             )
             .result()
             .map_err(|e| BackendError::CopyFailed { dir: "htod", detail: format!("{e:?}") })?;
+            self.stream.synchronize().map_err(|e| BackendError::CopyFailed {
+                dir: "htod",
+                detail: format!("stream sync: {e:?}"),
+            })?;
         }
         self.gov.stats.lock().persistent_allocs += 1;
         Ok(crate::buffers::Persistent::new(buf, len))

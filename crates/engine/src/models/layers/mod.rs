@@ -1478,13 +1478,20 @@ impl LayerNorm {
 pub struct RmsNorm {
     pub weight: Option<Tensor>,
     pub eps: f64,
+    /// Gemma 式 +1:Qwen3.5/Qwen3Next 的 RMSNorm = ×(1+w)
+    /// (HF modeling_qwen3_5.rs:854;kernel 直收 offset,绕开 affine 组合)
+    pub w_off: bool,
 }
 
 impl RmsNorm {
     pub fn new(weight: Tensor, eps: f64) -> Self {
+        Self::new_off(weight, eps, false)
+    }
+    pub fn new_off(weight: Tensor, eps: f64, w_off: bool) -> Self {
         Self {
             weight: Some(weight),
             eps,
+            w_off,
         }
     }
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -1492,7 +1499,9 @@ impl RmsNorm {
             crate::Error::Msg("RmsNorm: 无 weight(dry-run 需 affine 形态)".into())
         })?;
         let eps = self.eps as f32;
-        ctx_scope::with(|ops, ctx| erased::rmsnorm(ops, ctx, x, w, eps).map_err(Into::into))
+        ctx_scope::with(|ops, ctx| {
+            erased::rmsnorm(ops, ctx, x, w, eps, self.w_off).map_err(Into::into)
+        })
     }
 }
 

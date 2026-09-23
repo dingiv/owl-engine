@@ -181,6 +181,7 @@ impl Kernels {
         alpha: *const f32,
         dst: *mut f32,
         eps: f32,
+        w_off: i32,
     ) -> Result<(), String> {
         if n_cols == 0 {
             return Ok(());
@@ -202,6 +203,7 @@ impl Kernels {
             b.arg(&alpha_u);
             b.arg(&cols);
             b.arg(&eps);
+            b.arg(&w_off);
             b.launch(cfg).map_err(|e| format!("launch(rmsnorm): {e}"))?;
         }
         Ok(())
