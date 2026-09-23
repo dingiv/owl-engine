@@ -433,29 +433,39 @@ fn recurrence_varlen_impl(
             )));
         }
         let kn = kernels()?;
-        let mut pieces: Vec<Tensor> = Vec::with_capacity(total);
-        for (i, &slot) in slots.iter().enumerate() {
-            let (s, e) = (cu[i] as usize, cu[i + 1] as usize);
-            if e <= s {
-                continue; // 空序列跳过
-            }
-            if slot == u32::MAX {
-                return Err(crate::Error::Schedule(
-                    "gdn recurrence: prefill 序列命中无效槽位哨兵(prefill 不应出现)".into(),
-                ));
-            }
-            // 槽位张量视图([1] U32):decode 核按 slots[0] 寻址常驻状态行
-            let slot_view = seq_slots.narrow_dim0(i, 1)?;
-            for t in s..e {
-                let q_t = q.narrow_dim0(t, 1)?; // [1, nk, kd] 视图
-                let k_t = k.narrow_dim0(t, 1)?;
-                let v_t = v.narrow_dim0(t, 1)?; // [1, nv, vd]
-                let g_t = g.narrow_dim0(t, 1)?; // [1, nv](log 空间,核内 exp)
-                let beta_t = beta.narrow_dim0(t, 1)?;
-                let out_t = ctx_scope::with_dry(|ctx, _dry| {
-                    let out = ctx.scratch_tensor::<f32>(&[1, nv, vd])?;
-                    let mut kk =
-                        kn.lock().map_err(|_| crate::Error::Msg("gdn kernels 中毒".into()))?;
+        // 生命周期定谳(2026-09-23):旧实现每 token 租一块 scratch、把视图
+        // push 进 pieces —— 租约随 with_dry 出口归还,后续分配覆盖悬空视图
+        // (t≥1 输出精确 0)。改为整段一块 slab [total, nv, vd],租约覆盖
+        // 全循环;t 连续覆盖 0..total,slab 即最终答案,免 cat。
+        let slab = ctx_scope::with_dry(|ctx, _dry| {
+            ctx.scratch_tensor::<f32>(&[total, nv, vd])
+                .map_err(|e| crate::Error::Msg(format!("recurrence slab: {e:?}")))
+        })?;
+        ctx_scope::with_dry(|ctx, _dry| {
+            let mut kk =
+                kn.lock().map_err(|_| crate::Error::Msg("gdn kernels 中毒".into()))?;
+            for (i, &slot) in slots.iter().enumerate() {
+                let (s, e) = (cu[i] as usize, cu[i + 1] as usize);
+                if e <= s {
+                    continue; // 空序列跳过
+                }
+                if slot == u32::MAX {
+                    return Err(crate::Error::Schedule(
+                        "gdn recurrence: prefill 序列命中无效槽位哨兵(prefill 不应出现)".into(),
+                    ));
+                }
+                // 槽位张量视图([1] U32):decode 核按 slots[0] 寻址常驻状态行
+                let slot_view = seq_slots.narrow_dim0(i, 1)?;
+                for t in s..e {
+                    let q_t = q.narrow_dim0(t, 1)?; // [1, nk, kd] 视图
+                    let k_t = k.narrow_dim0(t, 1)?;
+                    let v_t = v.narrow_dim0(t, 1)?; // [1, nv, vd]
+                    let g_t = g.narrow_dim0(t, 1)?; // [1, nv](log 空间,核内 exp)
+                    let beta_t = beta.narrow_dim0(t, 1)?;
+                    // 写入 slab 第 t 行(字节偏移;slab 租约覆盖至循环结束)
+                    let dst = unsafe {
+                        (slab.device_ptr() as *mut f32).add(t * nv * vd) as *mut u8
+                    };
                     kk.delta_decode_slots_gqa(
                         ctx.stream(),
                         "f32",
@@ -466,7 +476,7 @@ fn recurrence_varlen_impl(
                         beta_t.device_ptr() as *const f32,
                         state.device_ptr() as *mut f32,
                         slot_view.device_ptr() as *const u32,
-                        out.device_ptr() as *mut u8,
+                        dst,
                         1,
                         nv as i32,
                         nk as i32,
@@ -475,21 +485,12 @@ fn recurrence_varlen_impl(
                         q_scale,
                     )
                     .map_err(|e| crate::Error::Msg(format!("delta_dec(prefill): {e}")))?;
-                    Ok(owl_nn::DynTensor::from_f32(&out))
-                })?;
-                pieces.push(out_t.reshape((1, nv * vd))?);
+                }
             }
-        }
-        if pieces.is_empty() {
-            return Err(crate::Error::Msg(
-                "gdn recurrence: 无非空序列(cu_seqlens 退化)".into(),
-            ));
-        }
-        let out = if pieces.len() == 1 {
-            pieces.remove(0)
-        } else {
-            cat_local(&pieces, 0)? // [T, nv*vd](行主序即 [T,nv,vd])
-        };
+            Ok(())
+        })?;
+        // slab 本身即最终输出([total, nv, vd];行序 = token 全局序)
+        let out = owl_nn::DynTensor::from_f32(&slab);
         OwlTensor::reshape(&out, (total, nv, vd))
     }
 
