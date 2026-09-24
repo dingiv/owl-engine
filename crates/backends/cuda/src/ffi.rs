@@ -50,13 +50,28 @@ pub mod nvrtc {
 }
 
 // ============================================================================
-// 异步搬运 + 事件轮询(gpu_server 事件循环;A4 登记)
+// 异步搬运 + host 完成回调(server 事件循环;A4 登记)
 // ============================================================================
 
 pub use cudarc::driver::DriverError;
 
 /// pinned host 码头(自管;cuda 的 PinnedHostSlice 取裸指针会强制同步,不合用)
 pub use cudarc::driver::result::{free_host, malloc_host};
+
+/// 设备枚举(UUID 钉卡;数字序事故免疫 —— CUDA 序 ≠ nvidia-smi 序)
+pub use cudarc::driver::result::device::{
+    get as device_get, get_count as device_get_count, get_uuid as device_get_uuid,
+};
+/// 驱动初始化(result 层设备枚举的前置条件;幂等)
+pub use cudarc::driver::result::init as driver_init;
+
+/// 取指定 ordinal 的设备 UUID(内部自管 cuInit;UUID 钉卡的配套查询)
+pub fn device_uuid(ordinal: usize) -> Result<[u8; 16], DriverError> {
+    driver_init()?;
+    let dev = device_get(ordinal as i32)?;
+    let u = device_get_uuid(dev)?;
+    Ok(u.bytes.map(|b| b as u8))
+}
 
 /// 图句柄 safe 面(捕获产物;非 Send —— 钉死 actor 线程使用)
 pub use cudarc::driver::CudaGraph;

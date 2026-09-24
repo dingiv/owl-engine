@@ -3,7 +3,7 @@
 //! server 是哑执行器:本模块不做任何算子语义判断,只按类型化槽序对位。
 
 use crate::ffi::{CudaStream, LaunchConfig, PushKernelArg};
-use crate::gpu_server::state::{GpuCtx, KernelCache};
+use crate::state::{GpuCtx, KernelCache};
 use owl_models::client::{Arg, LaunchMsg};
 use owl_models::ModelError;
 use std::sync::Arc;

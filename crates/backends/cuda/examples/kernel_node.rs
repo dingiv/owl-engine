@@ -2,7 +2,7 @@
 //! 用户自定义 kernel(`TensorOps::of(kernel).arg(..)`)→ eval → GpuClient 真发射。
 //! 同时验证 grid 哨兵(自动 1D)与 with_launch 显式发射配置两条路径。
 
-use owl_cuda::gpu_server::{Command, GpuClient, GpuServer};
+use owl_cuda::{Command, DeviceSelector, GpuClient, GpuServer};
 use owl_models::client::DeviceClient as _;
 use owl_models::Dtype;
 use owl_models::shape::Shape;
@@ -44,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(0);
     // 手工组装:管道外部创建,server/client 各拿一端
     let (tx, rx) = std::sync::mpsc::channel::<Command>();
-    let server = GpuServer::new(rx, ordinal, None);
+    let server = GpuServer::new(rx, DeviceSelector::Ordinal(ordinal), None);
     let mut client = GpuClient::new(tx);
     std::thread::Builder::new()
         .name("owl-gpu-manual".into())

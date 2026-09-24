@@ -5,14 +5,43 @@
 //!
 //! 模块地图:
 //! - [`ffi`]:cudarc 受控再导出(A4;上层唯一可见的 driver 表面)
-//! - [`gpu_server`]:actor 线程 + 池块账房 + 懒编译 + LaunchMsg 发射
+//! - [`command`]:命令信封(封闭枚举)+ Ack/Waiter 回执桥(公开;手工组装用)
+//! - [`state`]:GpuCtx(三固定流/池块账房/图捕获状态机)+ KernelCache + Staging
+//! - [`launch`]:LaunchMsg 装配发射(哑执行器;零算子语义)
+//! - [`server`]:GpuServer 事件循环(rx 阻塞监听 + issue 相)+ 完成派发线程
+//! - [`gpu_client`]:GpuClient 异步门面(DeviceClient 实现)
 //!
-//! 历史档案(`.rsx` 后缀 = Tx 时代伪代码骨架,不编译,仅供追溯):
-//! `client.rsx` / `protocol.rsx` / `server.rsx` / `server-state-machine.rsx`。
-//! 旧世界(device/pool/governor/graph/buffers)归档于 `../cuda_bak/`。
+//! 组装形态(构造/管道/启动三者分离):
+//! ```text
+//! let (tx, rx) = mpsc::channel::<Command>();       // 管道:外部创建
+//! let server = GpuServer::new(rx, selector, None); // server 构造(纯构造,零 CUDA)
+//! let client = GpuClient::new(tx);                 // client 构造(纯句柄)
+//! thread::spawn(move || server.run());             // 启动(专用线程)
+//! ```
+//!
+//! 异步模型:GPU API 全走非阻塞形态(launch/memset/异步 memcpy 提交进流即返回);
+//! 完成通知用现代回调 API `cuLaunchHostFunc`(host 回调随流序由**驱动主动触发**,
+//! 零轮询零阻塞收割)—— 回调跑在驱动线程,只做 channel 投递;真正的 finish
+//! (含 free_host 等 CUDA 操作)由 server 内部的派发线程执行,结果经 Ack
+//! 回执客户端,以此构成对外的异步 API(命令流水线化;server 不因 GPU 工作而停摆)。
+
+mod command;
+mod client;
+mod launch;
+mod server;
+mod state;
 
 pub mod ffi;
-pub mod gpu_server;
 
-pub use gpu_server::GpuClient;
-pub use owl_models::client::DeviceClient;
+pub use command::Command;
+pub use client::GpuClient;
+pub use server::GpuServer;
+pub use state::DeviceSelector;
+
+/// 测试/示例的设备序号(OWL_TEST_DEVICE,默认 0)
+pub fn test_device_ordinal() -> usize {
+    std::env::var("OWL_TEST_DEVICE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}

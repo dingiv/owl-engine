@@ -7,7 +7,7 @@
 //! 4. graph_launch ×N 重放,数据经 dtoh 验证;
 //! 5. 捕获期违规命令(其他流任务/同步/搬运)被 server 结构化拒绝。
 
-use owl_cuda::gpu_server::{Command, GpuClient, GpuServer};
+use owl_cuda::{Command, DeviceSelector, GpuClient, GpuServer};
 use owl_models::client::{DeviceClient as _, GraphId};
 use owl_models::shape::Shape;
 use owl_models::{Dtype, Kernel, TensorOps};
@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(0);
     // 手工组装:管道外部创建,server/client 各拿一端
     let (tx, rx) = std::sync::mpsc::channel::<Command>();
-    let server = GpuServer::new(rx, ordinal, None);
+    let server = GpuServer::new(rx, DeviceSelector::Ordinal(ordinal), None);
     let mut client = GpuClient::new(tx);
     std::thread::Builder::new()
         .name("owl-gpu-manual".into())

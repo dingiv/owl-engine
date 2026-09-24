@@ -4,8 +4,8 @@
 //! server 只认信封,不感知 client 的 future/waker。
 //!
 //! 本模块公开:手工组装者需用它创建管道(`mpsc::channel<Command>`)
-//! 并分别传入 [`GpuServer::new`](crate::gpu_server::GpuServer) 与
-//! [`GpuClient::new`](crate::gpu_server::GpuClient)。
+//! 并分别传入 [`GpuServer::new`](crate::GpuServer) 与
+//! [`GpuClient::new`](crate::GpuClient)。
 
 use owl_models::client::{Bytes, GraphId, LaunchMsg};
 use owl_models::ModelError;
@@ -13,9 +13,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
-
-/// 完成回调(由 host func 经派发线程执行;可自由调 CUDA:放码头等)
-pub type Completion = Box<dyn FnOnce() + Send>;
 
 /// 命令信封(server dispatch 的键;新增能力 = 新变体 + actor 一臂)。
 /// 除 NewStream 外均携带目标流 id(流内保序;流间并发)。
@@ -59,6 +56,11 @@ pub enum Command {
     },
     /// 排空点(三条流全部 synchronize)
     Sync {
+        ack: Ack<Result<(), ModelError>>,
+    },
+    /// 优雅关机:回执后进入 Closing —— 排空积压命令(结构化拒绝),
+    /// 排空在飞完成回调,设备栅栏,线程退出
+    Close {
         ack: Ack<Result<(), ModelError>>,
     },
 }

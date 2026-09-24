@@ -26,11 +26,11 @@
 //! 原语带流 id —— 流内保序(依赖维),流间并发。
 
 use crate::ffi::{launch_host_function, memcpy_dtoh_async, memcpy_htod_async};
-use crate::gpu_server::command::{Ack, Command};
-use crate::gpu_server::launch::issue_launch;
-use crate::gpu_server::state::{GpuCtx, KernelCache, Staging};
+use crate::command::{Ack, Command};
+use crate::launch::issue_launch;
+use crate::state::{DeviceSelector, GpuCtx, KernelCache, Staging};
 use owl_models::client::{Bytes, LaunchMsg};
-use crate::gpu_server::state::{STREAM_COMPUTE, STREAM_D2H, STREAM_H2D};
+use crate::state::{STREAM_COMPUTE, STREAM_D2H, STREAM_H2D};
 use owl_models::ModelError;
 use std::sync::mpsc;
 
@@ -38,7 +38,7 @@ type Finish = Box<dyn FnOnce() + Send>;
 
 pub struct GpuServer {
     rx: mpsc::Receiver<Command>,
-    ordinal: usize,
+    selector: DeviceSelector,
     /// 上线握手(可选;便捷组装路径用它回传设备上线结果)
     boot: Option<mpsc::Sender<Result<(), String>>>,
     ctx: Option<GpuCtx>,
@@ -53,20 +53,28 @@ impl GpuServer {
     ///
     /// - `rx`:命令管道的 server 端(管道由外部组装者创建,分别传入
     ///   server 与 client;server 不自创管道)
+    /// - `selector`:设备选择器(UUID 钉卡推荐;数字序事故免疫)
     /// - `boot`:上线握手(可选;`None` = 外部不需要启动确认)。
     ///   用 mpsc 同步通道(boot 发生在 server 线程,组装者在另一线程同步等)。
     pub fn new(
         rx: mpsc::Receiver<Command>,
-        ordinal: usize,
+        selector: DeviceSelector,
         boot: Option<mpsc::Sender<Result<(), String>>>,
     ) -> Self {
-        Self { rx, ordinal, boot, ctx: None, kernels: KernelCache::new(), dispatch: None }
+        Self {
+            rx,
+            selector,
+            boot,
+            ctx: None,
+            kernels: KernelCache::new(),
+            dispatch: None,
+        }
     }
 
     /// 事件循环主入口(server 线程生命周期 = 循环生命周期)。
     /// 首行上线设备(本线程 bind_to_thread 一次到位)+ 起派发线程。
     pub fn run(mut self) -> Result<(), String> {
-        let ctx = GpuCtx::new(self.ordinal);
+        let ctx = GpuCtx::new(&self.selector);
         match ctx {
             Ok(c) => {
                 if let Some(boot) = self.boot.take() {
@@ -85,7 +93,7 @@ impl GpuServer {
         // 派发线程:host 回调只投递,真正 finish(含 free_host 等 CUDA 操作)在这跑
         let (dtx, drx) = mpsc::channel::<Finish>();
         std::thread::Builder::new()
-            .name(format!("owl-gpu-{}-dispatch", self.ordinal))
+            .name(format!("owl-gpu-{}-dispatch", self.selector_debug()))
             .spawn(move || {
                 for finish in drx {
                     finish();
@@ -94,12 +102,50 @@ impl GpuServer {
             .map_err(|e| format!("派发线程启动失败: {e}"))?;
         self.dispatch = Some(dtx);
 
-        // 纯阻塞监听:零轮询;客户端全部离场(Disconnected)即收摊。
-        // 在飞 finish 由派发线程排空(它持有 channel 另一端,自然收尾)。
+        // 纯阻塞监听:零轮询。两种收摊:
+        // - Close 命令 → Closing 态:排空积压(结构化拒绝)→ 栅栏 → 退出
+        // - 客户端全部离场(Disconnected)→ 直接收摊
+        // 在飞 finish 由派发线程排空(channel 关闭后自然收尾)。
         while let Some(cmd) = self.rx.recv().ok() {
+            if let Command::Close { ack } = cmd {
+                ack.send(Ok(()));
+                break;
+            }
             self.dispatch(cmd);
         }
+        self.drain_and_shutdown();
         Ok(())
+    }
+
+    fn selector_debug(&self) -> String {
+        match &self.selector {
+            DeviceSelector::Uuid(u) => format!("uuid-{:02x}{:02x}…", u[0], u[1]),
+            DeviceSelector::Ordinal(o) => format!("ordinal-{o}"),
+        }
+    }
+
+    /// Closing 收尾:排空积压命令(结构化拒绝)→ 设备栅栏 → 关派发通道
+    /// (派发线程排完在飞 finish 后自然退出)。
+    fn drain_and_shutdown(mut self) {
+        let why = || {
+            ModelError::Msg("server 正在关闭(Closing):命令被拒绝".to_string())
+        };
+        while let Ok(cmd) = self.rx.try_recv() {
+            match cmd {
+                // 关机语义:Close 幂等,直接回执
+                Command::Close { ack } => ack.send(Ok(())),
+                other => Self::reject_with(other, why().to_string()),
+            }
+        }
+        // 设备栅栏:三条流全部落定,在飞搬运/kernel 不悬空
+        if let Some(ctx) = &self.ctx {
+            for sid in [STREAM_H2D, STREAM_COMPUTE, STREAM_D2H] {
+                if let Ok(s) = ctx.stream(sid) {
+                    let _ = s.synchronize();
+                }
+            }
+        }
+        drop(self.dispatch.take()); // 关派发通道 → 派发线程排空后退出
     }
 
     fn ctx(&self) -> &GpuCtx {
@@ -123,6 +169,7 @@ impl GpuServer {
                 Command::Launch { msg, ack } => self.handle_launch(msg, ack),
                 Command::Alloc { n_elems, ack } => self.handle_alloc(n_elems, ack),
                 Command::GraphEnd { ack } => ack.send(self.ctx_mut().graph_end()),
+                Command::Close { ack } => ack.send(Ok(())), // 防御性幂等回执
                 other => Self::reject(other),
             };
         }
@@ -138,15 +185,18 @@ impl GpuServer {
             Command::GraphLaunch { graph, ack } => {
                 ack.send(self.ctx_mut().graph_launch(graph))
             }
+            // 理论不可达:run() 顶层已截获 Close;防御性回执
+            Command::Close { ack } => ack.send(Ok(())),
         }
     }
 
     /// 捕获期违规命令的结构化拒绝
     fn reject(cmd: Command) {
-        let why = format!(
-            "图捕获进行中:该操作被拒 —— 捕获期仅允许 Launch/Alloc;\
-             同步/搬运/图操作会破坏图捕获"
-        );
+        Self::reject_with(cmd, "图捕获进行中:该操作被拒 —— 捕获期仅允许 \
+             Launch/Alloc;同步/搬运/图操作会破坏图捕获".to_string());
+    }
+
+    fn reject_with(cmd: Command, why: String) {
         macro_rules! reject { ($ack:expr) => { $ack.send(Err(ModelError::Msg(why.clone()))) } }
         let name = |c: &Command| match c {
             Command::GraphBegin { .. } => "GraphBegin",
@@ -157,6 +207,7 @@ impl GpuServer {
             Command::Dtoh { .. } => "Dtoh",
             Command::Sync { .. } => "Sync",
             Command::Launch { .. } => "Launch",
+            Command::Close { .. } => "Close",
         };
         eprintln!("[owl-gpu] 捕获期拒绝: {} —— {why}", name(&cmd));
         match cmd {
@@ -168,6 +219,7 @@ impl GpuServer {
             Command::Dtoh { ack, .. } => reject!(ack),
             Command::Sync { ack, .. } => reject!(ack),
             Command::Launch { ack, .. } => reject!(ack),
+            Command::Close { ack } => ack.send(Ok(())), // 幂等
         }
     }
 

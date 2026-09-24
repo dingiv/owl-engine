@@ -3,10 +3,7 @@
 //!
 //! 只被 actor 线程触碰(单线程所有权;零锁)。
 
-use crate::ffi::{
-    free_host, malloc_host, CudaContext, CudaFunction, CudaGraph, CudaSlice, CudaStream,
-    CAPTURE_MODE_THREAD_LOCAL, INSTANTIATE_AUTO_FREE,
-};
+use crate::ffi::{device_get_count, free_host, malloc_host, CudaContext, CudaFunction, CudaGraph, CudaSlice, CudaStream, CAPTURE_MODE_THREAD_LOCAL, INSTANTIATE_AUTO_FREE};
 use cudarc::nvrtc::safe::{compile_ptx_with_opts, CompileOptions};
 use owl_models::client::GraphId;
 use owl_models::ModelError;
@@ -21,6 +18,39 @@ pub(super) type StreamId = u64;
 pub(super) const STREAM_H2D: StreamId = 0;
 pub(super) const STREAM_COMPUTE: StreamId = 1;
 pub(super) const STREAM_D2H: StreamId = 2;
+
+// ============================================================================
+// 设备选择(UUID 钉卡;数字序事故免疫)
+// ============================================================================
+
+/// 设备选择器:优先 UUID(唯一稳定身份证);Ordinal 仅测试/单机便捷用。
+#[derive(Debug, Clone)]
+pub enum DeviceSelector {
+    /// 16 字节设备 UUID(推荐;跨重启/跨机器枚举序稳定)
+    Uuid([u8; 16]),
+    /// CUDA ordinal(枚举序敏感;仅单卡/测试场景)
+    Ordinal(usize),
+}
+
+impl DeviceSelector {
+    /// 解析为 ordinal(UUID:遍历设备表比对;Ordinal:原样)
+    pub(super) fn resolve(&self) -> Result<usize, String> {
+        match self {
+            Self::Ordinal(o) => Ok(*o),
+            Self::Uuid(uuid) => {
+                let count = device_get_count().map_err(|e| format!("device_get_count: {e:?}"))?;
+                for o in 0..count as usize {
+                    if crate::ffi::device_uuid(o).map_err(|e| format!("device_uuid({o}): {e:?}"))? == *uuid {
+                        return Ok(o);
+                    }
+                }
+                Err(format!(
+                    "UUID {uuid:?} 不在设备表(count={count};检查 CUDA_VISIBLE_DEVICES)"
+                ))
+            }
+        }
+    }
+}
 
 // ============================================================================
 // 池块账房
@@ -67,7 +97,8 @@ struct GraphHolder(CudaGraph);
 unsafe impl Send for GraphHolder {}
 
 impl GpuCtx {
-    pub(super) fn new(ordinal: usize) -> Result<Self, String> {
+    pub(super) fn new(selector: &DeviceSelector) -> Result<Self, String> {
+        let ordinal = selector.resolve()?;
         let ctx = CudaContext::new(ordinal).map_err(|e| format!("{e:?}"))?;
         ctx.bind_to_thread().map_err(|e| format!("{e:?}"))?;
         // G0 护栏:关 event-tracking(坑 A)。多流 + event tracking 会让

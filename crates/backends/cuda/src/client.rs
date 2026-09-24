@@ -8,7 +8,9 @@
 //! - **流管理**:`new_stream()` 要求 server 签发新流,此后原语带流 id
 //!   (流内保序,流间并发;跨流依赖待事件边扩展)。
 
-use crate::gpu_server::command::{Ack, Command, Waiter};
+use crate::command::{Ack, Command, Waiter};
+use crate::server::GpuServer;
+use crate::state::DeviceSelector;
 use owl_models::client::{Arg, Bytes, DeviceClient, GraphId, LaunchMsg};
 use owl_models::{Dtype, ModelError};
 use owl_models::shape::Shape;
@@ -51,6 +53,38 @@ impl GpuClient {
 /// let client = GpuClient::new(tx);
 /// thread::spawn(move || server.run());
 /// ```
+impl GpuClient {
+    /// 组装糖(便捷路径):一键建管道 + 起 server 线程 + boot 握手。
+    /// 手工组装等价于:
+    /// ```text
+    /// let (tx, rx) = mpsc::channel();
+    /// let server = GpuServer::new(rx, selector, Some(boot));
+    /// let client = GpuClient::new(tx);
+    /// thread::spawn(move || server.run());
+    /// ```
+    pub fn spawn(selector: DeviceSelector) -> Result<Self, String> {
+        let (tx, rx) = mpsc::channel::<Command>();
+        let (boot_tx, boot_rx) = mpsc::channel::<Result<(), String>>();
+        let server = GpuServer::new(rx, selector, Some(boot_tx));
+        std::thread::Builder::new()
+            .spawn(move || {
+                // server 收摊 → 账房/图注册表随 ctx 析构,派发线程排空后退出
+                let _ = server.run();
+            })
+            .map_err(|e| format!("server 线程启动失败: {e}"))?;
+        boot_rx
+            .recv()
+            .map_err(|e| format!("server boot 通道关闭: {e}"))??;
+        Ok(Self::new(tx))
+    }
+
+    /// 优雅关机:server 进入 Closing —— 排空积压(结构化拒绝)+ 设备栅栏
+    /// 后线程退出。本调用回执 = 关机流程已启动并完成排空。
+    pub async fn close(&self) -> Result<(), ModelError> {
+        self.submit(move |ack| Command::Close { ack })?.await
+    }
+}
+
 impl DeviceClient for GpuClient {
     async fn graph_begin(&mut self) -> Result<(), ModelError> {
         self.submit(move |ack| Command::GraphBegin { ack })?.await
