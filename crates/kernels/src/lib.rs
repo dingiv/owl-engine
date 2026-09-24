@@ -44,3 +44,7 @@ pub fn dispatch(arch: Arch) -> &'static str {
         Arch::Sm86 | Arch::Sm89 => "marlin-ffi+attention-rs(快照)",
     }
 }
+
+pub mod cuda_ops;
+
+pub use cuda_ops::KernelFn;

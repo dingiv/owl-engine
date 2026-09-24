@@ -1,19 +1,24 @@
-//! owl-cuda —— cudarc **官方版**(crates.io)的治理封装层,实现
-//! `owl_iface` 的 `Backend`/`Device`/`Pool` 三层契约(charter A1/A4/A5)。
+//! owl-cuda —— GPU server 后端:实现 owl-models 的 `DeviceClient` 契约。
 //!
-//! 选型注记(2026-09-22):官方 cudarc 0.19 已原生覆盖 fork 的图安全增量
-//! (CudaGraph/stream-ordered 分配/13.x 绑定),按 A4"语义分歧不进第三方
-//! 库"选官方。cudarc 仅在本 crate 导入;上层经 `ffi` 模块的精确白名单
-//! 使用(整库 re-export 禁止)。
+//! 分层:owl-kernels(kernel 描述)→ owl-cuda(actor 执行)→ owl-models(契约)。
+//! server 是**哑执行器**:不认识具体算子,只认 LaunchMsg / Alloc / Htod / Dtoh / Sync。
 //!
-//! 分配架构(裁决 5 + A5.2):
-//! - **Pool 是分配者**:`CudaPool::malloc_*` 是 P 阶段唯一分配入口,
-//!   校验链 = kind 语义 → 池余量(A5.4)→ 全局预算(A5.4)→ 物理分配;
-//! - 物理路径按池类型路由:`PeerShared` → VMM(cuMemCreate,2MiB 粒度,
-//!   A2.8);其余 → stream-ordered(捕获安全);
-//! - 所有缓冲 drop 时自动归池账 + 全局账(非 Idle 相延迟到净空窗口,
-//!   A1.2);BufToken/世代校验 = 哨兵①(结构化报错替代 Xid 盲死);
-//! - Device 的 `alloc_*_in` 只是 `pool.malloc_*` 的类型化薄封装。
+//! 旧世界(device/pool/governor/graph/buffers)已归档至 `cuda_bak/`,
+//! 待 nn/engine 迁移至声明式 API 后再按需重建。
 
 pub mod ffi;
+pub mod gpu_server;
 
+/// 测试/示例的设备序号(OWL_TEST_DEVICE,默认 0)
+pub fn test_device_ordinal() -> usize {
+    std::env::var("OWL_TEST_DEVICE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// 测试/示例默认池容量
+pub const TEST_POOL_BYTES: u64 = 64 << 20;
+
+pub use gpu_server::GpuClient;
+pub use owl_models::client::DeviceClient;

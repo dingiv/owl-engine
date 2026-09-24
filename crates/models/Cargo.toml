@@ -1,10 +1,11 @@
 [package]
 name = "owl-models"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "Declarative Tensor model layer: pure-functional forward over a lazy plan; defines the capability contract the CUDA server must satisfy"
 
-# 样板 crate:零 GPU 依赖。空 [workspace] 表 = 从 owl workspace 独立出来,
-# 可单独 cargo check/test;落肉完成后加入 owl workspace 并接入 server。
-[workspace]
+
+[dev-dependencies]
+# 样例的 async 运行时(CPU face 即测即用;GPU face 经 owl-cuda actor 消化阻塞)
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

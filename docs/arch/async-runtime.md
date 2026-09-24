@@ -1,173 +1,244 @@
-# GPU 异步编程模型设计(async-runtime)
+# owl 异步编程模型(四层架构 + 声明式 Tensor)
 
-> 版本:v0.1(2026-09-23 立项)。上游:A3 同步隔离(charter)、每卡一线程裁决;
-> 实现位:`crates/backends/asyncrt`(owl-asyncrt);消费方:engine server(Tokio)、
-> runner decode 循环。
-> 状态:**设计稿,待用户拍板后实施**。A0 加固补丁(event-tracking)可先行。
+> 版本:v0.2(2026-09-23)。取代 async-runtime.md v0.1 与 declarative-tensor.md v0.1,
+> 合并为本文档。上游:charter.md、graph-model-seam.md。
+> 状态:**设计定稿,实施进行中**。
 
 ---
 
-## 一、问题定义
+## 一、四层架构
 
-CUDA 驱动面是**全阻塞 API**:memcpy 等待、事件等待、`synchronize`、捕获事务、
-池 H2D 同步——没有一条能安全地跑在 Tokio worker 上。直接混用的后果(全部实测过):
+```text
+┌─────────────────────────────────────────────────────┐
+│ 模型层 models                                        │
+│  Module::forward → TensorOps(声明链,零执行)         │
+│  .cu + 包装函数 = kernel 绑定本体                     │
+│  禁止:执行、设备、错误面                              │
+├─────────────────────────────────────────────────────┤
+│ 调度层                                               │
+│  连续推理;只碰解释层 API                              │
+│  禁止:碰设备                                         │
+├─────────────────────────────────────────────────────┤
+│ 解释层 client                                        │
+│  DAG 展开 · 预定义动作表 · KernelCtx/ForwardCtx 注入  │
+│  LaunchMsg 打包 · 后端硬件屏蔽                        │
+│  禁止:算法语义                                       │
+├─────────────────────────────────────────────────────┤
+│ 硬件层 server(owl-cuda gpu_server)                   │
+│  发射(LaunchMsg)· 搬运 · 显存池 · Buf 编号           │
+│  Capture session 收拢管理面                           │
+│  禁止:算法语义(纯哑执行器)                           │
+└─────────────────────────────────────────────────────┘
+```
 
-| 症状 | 根因 |
+### 职责矩阵
+
+| 层 | 持有 | 禁止 | 对应 crate |
+|---|---|---|---|
+| 模型层 | 算法结构声明 + 加载布局 | 执行、设备、错误面 | `owl-models` |
+| 调度层 | 业务节奏(连续推理) | 碰设备 | `owl-engine` |
+| 解释层 | DAG 展开 + 动作表 + ctx 注入 | 算法语义 | `owl-models::client` |
+| 硬件层 | 账房 + actor 线程 + kernel 缓存 | 算法语义 | `owl-cuda` |
+
+---
+
+## 二、核心类型
+
+### 2.1 TensorOps(声明链)
+
+```rust
+pub struct TensorOps {
+    id: u64,                    // 全局唯一自增(跨线程)
+    parents: Vec<TensorOps>,    // 反向边(值语义深拷贝;无 Arc)
+    depth: u32,                 // 拓扑深度
+    op: Op,                     // 语义运算
+    dtype: Dtype,
+    shape: Shape,
+    args: Vec<KernelArg>,       // Kernel 节点的有序参数槽
+    err: Option<LazyError>,     // 毒值
+}
+```
+
+- **值语义**:clone = 深拷贝子树(配置面一次性成本,可接受)
+- **无 Arc、无 Tx、无 Step/TensorMeta 中间类型**——一个 struct 就是全部
+- 声明期 total:违约变毒值,永不 panic、永不提前 return Err
+
+### 2.2 Tensor(运行时数据)
+
+```rust
+pub struct Tensor<D: Device> {
+    dev: D,
+    block: D::Bytes,     // 池块(数据所在)
+    offset: usize,       // 块内偏移(视图)
+    dtype: Dtype,
+    shape: Shape,
+    id: u64,
+}
+```
+
+- 跨设备统一:`D: Device` 对 CPU(`Cpu`)与 GPU server(将来)同一形状
+- clone = 共享底仓 + 同偏移(零拷贝视图)
+- `as_declaration()` → TensorOps(桥:数据进声明图)
+
+### 2.3 KernelFn(自描述发射包)
+
+```rust
+pub struct KernelFn {
+    pub name: &'static str,       // kernel 入口名
+    pub ptx: &'static str,        // 源码(build.rs 预编译 PTX)
+    pub slots: Vec<u64>,          // 参数槽(指针值/标量位型,按签名序)
+    pub grid: (u32, u32, u32),
+    pub block: (u32, u32, u32),
+    pub shared_mem: u32,
+}
+```
+
+### 2.4 DeviceClient(异步能力契约)
+
+```rust
+pub trait DeviceClient: Send {
+    async fn alloc(&mut self, n_bytes: usize) -> Result<Bytes, ModelError>;
+    async fn htod(&mut self, dtype: Dtype, shape: &Shape, src: &[u8])
+        -> Result<Bytes, ModelError>;
+    async fn dtoh(&mut self, b: &Bytes, out: &mut [u8]) -> Result<(), ModelError>;
+    async fn launch(&mut self, msg: LaunchMsg) -> Result<Bytes, ModelError>;
+    async fn sync(&mut self) -> Result<(), ModelError>;
+}
+```
+
+五原语。**不暴露具体算子接口**——算子语义在解释层动作表里 lower 为 LaunchMsg。
+
+---
+
+## 三、声明式编程模型
+
+### 3.1 工厂(TensorOps 关联函数)
+
+| 工厂 | 说明 |
 |---|---|
-| Tokio worker 被钉死数毫秒~秒 | 阻塞调用占住调度线程 |
-| `CAPTURE_ISOLATION` | cudarc event-tracking 给发射挂跨流事件等待(捕获窗内 = 依赖未捕获工作) |
-| `begin_capture` 被拒 | pageable host 指针的 memcpy 被驱动经 legacy NULL 流中转,流上留 legacy 依赖 |
-| decode 步进延迟毛刺 | 提交时机受调度噪声支配,host 端准备与 GPU 执行无法重叠 |
+| `TensorOps::zeros(dtype, shape)` | 清零分配声明 |
+| `TensorOps::from_host(dtype, shape, data)` | host 数据声明(值语义:数据随树走) |
+| `TensorOps::of_block(id, dtype, shape)` | 引用已物化数据块 |
+| `TensorOps::of(kernel)` | Kernel 节点声明 |
 
-**解法公理(A3 的结构化形态)**:每卡一条专用 GPU 线程,唯一触碰设备执行面;
-async 侧通过命令队列委托执行,以事件回执收结果。
+### 3.2 链式运算(total,永不失败)
 
-## 二、线程模型(唯一的正确形态)
+| 方法 | 语义 | 输出形状 |
+|---|---|---|
+| `.matmul(&b)` | [m,k]×[k,n]→[m,n] | self.shape 替换末维 |
+| `.add(&b)` | 同形逐元素加 | self.shape |
+| `.silu()` | 逐元素激活 | self.shape |
+| `.rmsnorm(&alpha, eps, w_off)` | ×(1+w) 或 ×w | self.shape |
+| `.arg(&t)` / `.arg_f32(v)` / ... | Kernel 节点参数入槽 | — |
+| `.narrow(dim, start, len)` | 视图(零节点追加) | 收窄后 shape |
 
-```text
-Tokio 任务(任意数量,任意迁移,零阻塞)
-  │  命令(mpsc)+ 回执(oneshot)
-  ▼
-GPU actor 线程(每卡一条;ctx.bind_to_thread 一次到位)
-  │  串行执行;一切阻塞只发生在这里
-  ▼
-owl-cuda 治理面(池/租约/哨兵/相位——语义不变,宿主换了)
+**毒值传播**:构造期违约(shape/dtype 不符)→ `Poisoned(LazyError)` 随链流动,
+算子对毒恒等(不追加节点、不重复报),eval 边界收割(LazyError 携带 depth 归因)。
+
+### 3.3 Module trait(layer 形态)
+
+```rust
+trait Module {
+    /// 构造期(new):唯一保留 Result 的位置(装载可败)
+    /// forward:同步 · total · 纯描述(零 ? 零 await 零 Tx)
+    fn forward(&self, prev: &Tensor, ctx: &ForwardCtx) -> TensorOps;
+}
 ```
 
-三条公理:
+- **静态依赖**(权重/Comm/KvManager 本体)→ 构造函数传引用,layer 持有
+- **动态依赖**(KvCtx/positions)→ forward 参数
+- **KV 副作用** → `tx.slot_write(kv, slots, &v)` 显式声明为节点
 
-1. **设备执行权归 actor 线程独占**。`Arc<CudaDevice>` 不外泄(`spawn` 只返回
-   `AsyncDevice` 门面);一切工作必须走命令面——绕过状态机直接用设备 = 架构违约。
-2. **多线程共享 context 的三重税**(bind 重绑/驱动 context 锁竞争/多 context
-   交替 = 架构死路)由"单线程独占"结构性消灭;async 面共享的只剩 Rust 队列锁。
-3. **actor 串行化的是"提交",不是"执行"**。kernel/graph 发射本身异步于 GPU,
-   提交即回执;性能预期见 §八(诚实条款:actor 不创造 GPU 并行度)。
+---
 
-## 三、actor 状态机
+## 四、执行模型
+
+### 4.1 解释器
+
+同一棵 TensorOps 树,三种游走:
+
+| 解释器 | Op 执行体 | 场景 |
+|---|---|---|
+| eager(档一) | 逐节点提交 server(提交即回) | decode 热路径 |
+| capture(烘焙) | 逐节点"录"→ 整单 instantiate → 哨兵③对账 | 图捕获 |
+| CPU(测试) | 纯 Rust 闭包归约 | nn 测试(保持同步写法) |
+
+**warmup = 用 eager 解释器先跑一遍同一份描述**(姿势 6 制度化)。
+
+### 4.2 KernelCtx(算子开口子 grab-bag)
+
+Fn 节点的发射上下文。算子缺什么放什么:stream / kernel 表 / scratch / kv manager。
+**由解释层构造注入**——Fn 只管发射,不碰设备管理。
+
+### 4.3 ForwardCtx(每步动态依赖 grab-bag)
+
+同性质:positions / kv 上下文 / 采样参数。每步由 runner 构造传入。
+
+---
+
+## 五、GPU server(gpu_server.rs)
+
+### 5.1 actor 线程模型
 
 ```text
-Booting ──(bind_to_thread 成功)──▶ Ready ──(Close 排空)──▶ Closing
-                                      │ ▲
-                                      └─┘  Run / Capture 循环
+async 面(零阻塞 Tokio 任务)
+  │ mpsc<Job> + oneshot 回执
+  ▼
+GPU actor 线程(唯一触碰 CudaContext/stream;bind_to_thread 一次到位)
+  ▼
+池块账房 + 懒编译缓存 + kernel 发射
 ```
 
-- 非法命令(非 Ready 态收到工作命令)= **结构化 LawViolation 回执**,不 panic;
-- **捕获窗的 MemPhase 进出由 CaptureSession 内部自持**(owl-cuda 既有治理),
-  actor 不重复管理相位——actor 只管"事务是否被允许开始"。
+### 5.2 懒编译
 
-## 四、命令面与闭包契约(核心)
+`ensure_kernel(name, source)`:按名查缓存 → 未装载 → nvrtc 编译 CUDA C →
+PTX → load_module → load_function。arch 显式钉(不钉 = INVALID_IMAGE)。
 
-| 命令 | 闭包面 | ready 语义 |
-|---|---|---|
-| `run(job)` | `FnOnce(&CudaDevice) -> Result<R>`——覆盖池分配/memcpy/装载/查询 | **完成 ready**(阻塞消化在 actor) |
-| `capture(job)` | `FnOnce(&mut CaptureSession) -> Result<DeviceGraph>`——原子捕获事务 | 完成 ready |
-| `replay(graph)` | 图所有权回传 actor,租约校验 + launch | **提交 ready**(发射即回) |
-| `sync()` / `close()` | 全设备排空 | 完成 ready |
+### 5.3 LaunchMsg 发射
 
-### 契约 1:异步停在 actor 门口,窗内只有同步发射面
+```text
+1. 解析参数槽:Block(id) → 账房取设备指针;Bits → u64 值
+2. alloc_zeros(out_elems) 分配输出
+3. ensure_kernel(name, source) 懒编译
+4. builder.arg(逐槽) + launch(cfg)
+5. new_block(out) 登记输出 → Bytes 返回
+```
 
-图捕获窗(begin→end)是**单线程原子段**:闭包必须一口气跑完,
-**窗内禁止任何 `.await`**。理由(结构性,非纪律性):
+---
 
-- Rust async = 控制流挂起,恢复线程不保证是原线程 → 跨线程捕获窗 = 驱动级失效;
-- 窗内挂起期间窗口仍开着,其他任务的发射会被录进图(RELAXED 模式静默污染);
-- 窗内 await 的完成回执恰恰需要 actor 空出来处理 → 自锁。
-
-注意区分两种"异步":**GPU 异步**(发射后不等执行,窗内合法且正是捕获的
-工作方式)与 **Rust 异步**(控制流挂起,窗内禁止)。捕获是启动期一次性事务,
-同步原子执行零性能损失;async 的价值在回放热路径,不在窗内。
-
-### 契约 2:capture 闭包面收窄,禁止旁路发射
-
-窗内发射**只允许走 KernelCtx/frame 发射面**(owl 治理的登记通道)。
-raw cudarc 直发 = 契约外对象进审计 → 池块生命周期与租约登记全部失配
-(2026-09-23 实锤:绕路直发 → end_capture/libcuda 路径 SIGSEGV)。
-
-推论:capture 闭包签名不再暴露 `&mut CaptureSession`(太宽),改为暴露
-frame 发射面 + 预绑定缓冲;"窗内至少一次发射"校验前移到命令边界。
-
-### 契约 3:host 侧输入仓一律 pinned
-
-pageable 指针的拷贝必经 legacy NULL 流中转(坑 B,§七)。actor 域内一切
-host 侧 DMA 源/宿使用 `alloc_pinned`;数据生成**直接写 pinned 仓**,禁止
-"Vec 中转再 copy"(双重拷贝;2026-09-23 社区调研确认:官方 best practice
-即 pinned 直填/直接读文件,mapped zero-copy 仅限小数据一次性流式)。
-
-### 契约 4:回执用 oneshot,不用闭包 future
-
-oneshot 回执不依赖 future 被 poll 到底——future 遗漏 = UB 的雷
-(async-cuda 的教训)在我们的形态下结构性不存在。
-
-### 契约 5:描述层纯函数化(2026-09-23 定稿,详见 declarative-tensor.md)
-
-模型层(layer/model/算子/采样)是**纯函数树**:无 Result、无 async、无相位
-分支。forward 签名定稿 = `forward(&self, tx: &mut Tx, xs: &Tensor, 动态依赖) ->
-Tensor`(惰性声明);Result 只存于 `new`(P 阶段装载)与执行边界(`interpret`/
-`to_host`)。外部依赖二分:静态(权重/Comm/KvManager 本体)构造捕获,动态
-(KvCtx)forward 参数;KV 副作用经 `tx.slot_write` 显式声明为节点。
-
-## 五、完成语义三档
-
-| 档 | 机制 | 适用 |
-|---|---|---|
-| 档一:提交即回 | launch/graph.launch 异步于 GPU,提交成功即回执 | decode 回放热路径;fire-and-forget |
-| 档二:事件完成 | 池流 record event;专用 waiter 线程 `query()` 轮询或 blocking wait → oneshot | 单次拷贝/单图完成通知;runner 接入 |
-| 档三:全量同步 | `ctx.synchronize`(actor 线程) | 排空/关机/测试 |
-
-一期实现档一 + 档三(简单正确);档二是 runner decode 循环接入时的增量
-(单 waiter 线程服务全设备事件)。
-
-## 六、参照物与不采纳理由(2026-09-23 调研)
-
-| 参照 | 机制 | 判决 |
-|---|---|---|
-| `async-cuda`(oddity-ai v0.6) | 单 runtime 线程 + mpsc 闭包队列 + 两档 ready 语义——**与我们设计同构**,社区验证 | ❌ 不采纳:独占设备所有权,与治理互斥;intentionally unsafe(future 遗漏 = UB);自持 FFI 非 cudarc |
-| `cuTile`/`cuda_async`(NVIDIA) | DeviceOp 描述/执行分离;sync/async 双 API 决策表;spawn 强制 Arc | ❌ 不采纳:完整张量框架,抽象层级与 S1-S6 语义表冲突。**偷思想**:描述/执行分离列为二期批处理调度候选;双 API 决策表收进文档 |
-| `cuda-oxide` | wrapper + async 章节 | 仅概念参考 |
-
-共识(三方收敛,即行业标准形态):专用 GPU 线程 + channel 命令 + 两档 ready
-+ spawn 时借用必须 Arc('static)。我们自研的理由:actor 必须长在治理层上
-(池/相位/租约是 owl 独有维度),这部分没有任何现成库能替。
-
-## 七、坑目录(全部实测实锤,设计逐一封死)
+## 六、坑目录(全部实测,设计逐一封死)
 
 | 坑 | 症状 | 封法 |
 |---|---|---|
-| A. cudarc event-tracking 默认开 | 捕获窗内发射 = CAPTURE_ISOLATION | CudaDevice::new 显式 `disable_event_tracking()`(unsafe)+ 钉测。**A0 补丁,先行独立落地,与 async 无关也该落** |
-| B. pageable memcpy 经 legacy NULL 流中转 | begin_capture 被拒 | 契约 3:pinned 一律 |
-| C. 空捕获窗 | 哨兵③ 取节点 INVALID_VALUE | capture 命令边界校验窗内发射数 |
-| D. 窗内旁路发射 | 治理契约外对象进审计 → libcuda SIGSEGV | 契约 2:闭包面收窄 |
-| E. nvrtc arch 未钉 | INVALID_IMAGE | 显式 arch(既有) |
-| F. launch 参数与 kernel 签名不严格一致 | INVALID_VALUE | 裁决 3①(既有) |
+| A. cudarc event-tracking 默认开 | CAPTURE_ISOLATION | `disable_event_tracking()`(A0 补丁) |
+| B. pageable memcpy 经 legacy 流 | begin_capture 被拒 | pinned 仓(alloc_pinned) |
+| C. 空捕获窗 | 哨兵③ INVALID_VALUE | 发射数 > 0 校验 |
+| D. 窗内旁路发射 | 审计 SIGSEGV | 契约 2:只走 frame 发射面 |
+| E. nvrtc arch 未钉 | INVALID_IMAGE | build.rs 显式 arch |
+| F. launch 参数不严格一致 | INVALID_VALUE | 裁决 3①:标量+裸指针 |
+| G. 同语句双锁(parking_lot) | 死锁 | 显式 drop 后再锁 |
+| H. htod 丢声明 shape | 后续 matmul 维度 OOB | htod 契约带 dtype+shape |
 
-## 八、性能预期(诚实条款)
+---
 
-actor + async **不创造 GPU 并行度**;GPU 并行度 = 流拓扑 × 数据依赖图。
-收益来源逐一列明,防止将来误判:
+## 七、实施状态(2026-09-23)
 
-| 收益 | 机制 | decode 适用性 |
+| 里程碑 | 状态 | 说明 |
 |---|---|---|
-| CPU/GPU 流水线 | host 准备与 GPU 执行重叠(队列解耦) | ✅ 主要收益 |
-| 提交时机精确 | 阻塞调度噪声归零 | ✅(20µs/步级场景,host 延迟即吞吐) |
-| 图回放省发射开销 | 与 actor 正交,叠加收益 | ✅ |
-| 多流真并行 | **需要流拓扑立项**(copy 流重叠/多请求多流),actor 不白送 | 二期:copy 流重叠是唯一"白送"型(拷贝引擎独立于 SM);多请求多流 = KV 分帐后立项 |
-| 双调度线程并行 | 仅当依赖图宽(多请求独立链) | 一期伪需求:decode 链窄,单调度面即满配 |
+| A0:加固补丁 | ✅ | event-tracking 关闭 + 双锁死锁修复 |
+| A1:server 骨架 | ✅ | actor + 五原语 + 状态机(_gpu_server.rs 全绿) |
+| A2:声明式 TensorOps | ✅ | 值语义 + 毒值 + 链式 API(playground 四 demo 全绿) |
+| A3:GPU 端到端 | ✅ | mlp_server 经 GPU server 真发射,对拍一致 |
+| A4:nn/engine 迁移 | ⏳ | owl-shared/nn/engine 旧消费面待迁(重写期已知破损) |
+| A5:memory-planner | 未立项 | liveness 着色 + 状态区(周级) |
 
-## 九、里程碑
+---
 
-| 里程碑 | 内容 | 验收 |
-|---|---|---|
-| **A0**(先行) | event-tracking 显式关闭 + infra_fixes 钉测 | 捕获窗内带事件等待的发射 = 结构化报错 |
-| **A1** | actor 骨架:单线程泵 + Run/Sync/Close + 三态机;**Arc 不外泄**;按契约 2 收窄命令面;现有测试撤下重写 | Tokio 多线程并发 run 全绿;回执无错乱 |
-| **A2** | Capture/Replay 命令;测试走 dry_run 同款 KernelCtx 闭包(契约 2 验收) | 捕获事务原子;回放判别三连过 |
-| **A3** | 事件完成语义(档二) | decode 循环经 async 面跑通 |
-| **A4** | engine server(Tokio)接入 | 多请求并发提交,回执各归各 |
+## 八、关键裁决记录
 
-## 十、开放问题
-
-1. capture 闭包签名收窄后,dflash2 verify 第二图族是否需要独立命令变体?
-   (倾向:否,同一事务面,族参数进闭包)
-2. 档二 waiter 线程归 actor 管辖还是独立?"单 waiter 服务全设备"与 A3 的
-   线程纪律兼容性待论证。
-3. `run` 闭包内禁止 `.await` 是类型系统不可表达的(闭包非 async),仅能靠
-   review + 惯例。是否需要 debug 断言(如闭包执行时长上限告警)?待议。
+1. **不用 Arc**(值语义):配置面一次性成本可接受,零共享别名;
+2. **不用 Tx**:深度构造时算、副作用即树节点、相位由解释器承担;
+3. **不用宏**:TensorOps 层定义空间足够,包装函数即绑定本体;
+4. **Server 哑执行器**:五原语,零算子知识,新算子 = load_kernel 注册一次;
+5. **KernelFn 自描述**:name + ptx + slots + grid + block 全随节点走;
+6. **Bytes = server 块身份证**:id 跨进程唯一,账房按它反查池块。

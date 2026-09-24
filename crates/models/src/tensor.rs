@@ -1,33 +1,35 @@
 //! TensorOps:声明式链式 API(客户主入口)。
 //!
-//! TensorOps = 反向多叉树上某节点的视图 + dtype/shape 标注。
-//! 命名注记:它是**声明链**(算子的懒描述),不是数据张量;
-//! 数据张量 = eval 之后的产物(将来另立类型或句柄)。
+//! TensorOps = 反向多叉树上某节点的视图 + dtype/shape 标注 + 可选 Kernel 参数槽。
 //! 运算 = 声明(构造新节点,值语义深拷贝输入子树),不执行。
-//! 链式:一元 = 方法;二元 = 方法吃 &TensorOps;毒传播;视图零往返。
+//! 链式:一元 = 方法;二元 = 方法吃 &TensorOps;Kernel 节点 = of(Kernel) + .arg 链。
 //!
-//! **结构定稿(2026-09-23 裁决:Step/TensorMeta 解体,字段全上 TensorOps)**:
-//! 值语义 + 无 Arc + 无 Tx + 无中间类型——一个 struct 就是全部。
+//! **结构定稿(2026-09-23)**:
+//! - 值语义:深拷贝输入子树(配置面一次性成本);
+//! - 无 Arc、无 Tx、无共享别名——纯值世界;
+//! - 每节点携带全局唯一自增 id(跨线程;server 对账/缓存键)。
 
 use crate::dtype::Dtype;
 use crate::error::LazyError;
-use crate::plan::Op;
+use crate::kernel::Kernel;
+use crate::plan::{KernelArg, Op};
 use crate::shape::Shape;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// 全局自增节点 id:跨线程唯一(AtomicU64;进程级身份证)。
-/// 用途:错误归因坐标(LazyError.at_id)/ server 侧节点对账 / 缓存键。
+/// 全局自增节点 id:跨线程唯一(进程级身份证)。
+/// 不变量:任何时刻不存在两个同 id 的 TensorOps。
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_id() -> u64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// 张量声明值。clone = 深拷贝遍历子树(值语义;配置面一次性成本)。
+/// 张量声明值。clone = 深拷贝遍历子树(配置面一次性成本)。
+#[derive(Clone)]
 pub struct TensorOps {
     /// 全局唯一 id(跨线程自增;进程级身份证)
     pub(crate) id: u64,
-    /// 反向边:本节点归约所需的全部输入(叶子为空)
+    /// 反向边:本节点归约所需的全部输入(叶子为空;深拷贝子树)
     pub(crate) parents: Vec<TensorOps>,
     /// 拓扑深度(归约排序 + 错误归因坐标)
     pub(crate) depth: u32,
@@ -36,45 +38,13 @@ pub struct TensorOps {
     /// 标注(client 侧;server 是字节世界)
     pub(crate) dtype: Dtype,
     pub(crate) shape: Shape,
+    /// Kernel 节点的有序参数槽(T = 张量依赖 / Bits = 标量位型)
+    pub(crate) args: Vec<KernelArg>,
     /// 毒值(构造期违约;随子树透传)
     pub(crate) err: Option<LazyError>,
 }
 
-impl Clone for TensorOps {
-    /// 深拷贝 = 整棵子树重排**全新 id**(每个节点都是新身份证)。
-    /// id 唯一性因此是全进程不变量:任何时刻不存在两个同 id 的 TensorOps。
-    fn clone(&self) -> Self {
-        let mut parents = Vec::with_capacity(self.parents.len());
-        for p in &self.parents {
-            parents.push(p.clone());
-        }
-        TensorOps {
-            id: next_id(),
-            parents,
-            depth: self.depth,
-            op: self.op.clone(),
-            dtype: self.dtype,
-            shape: self.shape.clone(),
-            err: self.err.clone(),
-        }
-    }
-}
-
 impl TensorOps {
-    /// 从已物化数据块构造声明叶子(Op::Block;数据由 server 按 id 解析)。
-    /// 注:声明叶子的 id = 物化数据的 id(同一身份证;server 侧账房按它反查)
-    pub fn of_block(id: u64, dtype: Dtype, shape: Shape) -> TensorOps {
-        TensorOps {
-            id,
-            parents: vec![],
-            depth: 0,
-            op: Op::Block { id },
-            dtype,
-            shape,
-            err: None,
-        }
-    }
-
     // ======================================================================
     // 查询
     // ======================================================================
@@ -134,6 +104,7 @@ impl TensorOps {
             op: Op::Zeros,
             dtype,
             shape,
+            args: vec![],
             err: None,
         }
     }
@@ -153,6 +124,38 @@ impl TensorOps {
             op: Op::Htod { bytes: data.to_vec() },
             dtype,
             shape,
+            args: vec![],
+            err: None,
+        }
+    }
+
+    /// 从已物化数据块构造声明叶子(Op::Block;数据由 server 按 id 解析)。
+    /// 注:声明叶子的 id = 物化数据的 id(同一身份证;server 侧账房按它反查)。
+    pub fn of_block(id: u64, dtype: Dtype, shape: Shape) -> TensorOps {
+        TensorOps {
+            id,
+            parents: vec![],
+            depth: 0,
+            op: Op::Block { id },
+            dtype,
+            shape,
+            args: vec![],
+            err: None,
+        }
+    }
+
+    /// Kernel 节点声明:`TensorOps::of(kernel).arg(..).arg(..)`
+    /// 参数按序入槽;参数与真实 kernel 签名的一致性由后端最终裁决
+    /// (INVALID_VALUE = 结构化报错)。
+    pub fn of(kernel: Kernel) -> TensorOps {
+        TensorOps {
+            id: next_id(),
+            parents: vec![],
+            depth: 0,
+            op: Op::Kernel { kernel },
+            dtype: Dtype::F32,
+            shape: vec![],
+            args: vec![],
             err: None,
         }
     }
@@ -161,7 +164,16 @@ impl TensorOps {
     pub fn narrow(&self, dim: usize, _start: usize, len: usize) -> TensorOps {
         let mut shape = self.shape.clone();
         shape[dim] = len;
-        TensorOps { id: next_id(), parents: vec![], depth: self.depth, op: Op::Zeros, dtype: self.dtype, shape, err: None }
+        TensorOps {
+            id: next_id(),
+            parents: vec![],
+            depth: self.depth,
+            op: Op::Zeros,
+            dtype: self.dtype,
+            shape,
+            args: vec![],
+            err: None,
+        }
         // 注:narrow 的 zero-op 占位实施期改为视图节点(共享 parents,不复制)
     }
 
@@ -177,18 +189,21 @@ impl TensorOps {
         let mut shape = self.shape.clone();
         let last = shape.len() - 1;
         shape[last] = b.shape.last().copied().unwrap_or(0);
-        self.join(Op::Matmul, Some(b), self.dtype, shape)
+        let meta = (self.dtype, shape);
+        self.join(Op::Matmul, Some(b), meta, vec![])
     }
 
     pub fn add(&self, b: &TensorOps) -> TensorOps {
         if let Some(e) = self.shape_rule(b, "add", |a, b| a == b) {
             return self.poisoned_local(e);
         }
-        self.join(Op::Add, Some(b), self.dtype, self.shape.clone())
+        let meta = (self.dtype, self.shape.clone());
+        self.join(Op::Add, Some(b), meta, vec![])
     }
 
     pub fn silu(&self) -> TensorOps {
-        self.join(Op::Silu, None, self.dtype, self.shape.clone())
+        let meta = (self.dtype, self.shape.clone());
+        self.join(Op::Silu, None, meta, vec![])
     }
 
     /// ×(1+w) 语义(w_off = true;use_norm_offset)
@@ -197,12 +212,48 @@ impl TensorOps {
         if let Some(e) = self.shape_rule(alpha, "rmsnorm", |a, b| a.last() == b.last()) {
             return self.poisoned_local(e);
         }
+        let meta = (self.dtype, self.shape.clone());
         self.join(
             Op::Rmsnorm { eps, w_off },
             Some(alpha),
-            self.dtype,
-            self.shape.clone(),
+            meta,
+            vec![],
         )
+    }
+
+    // ======================================================================
+    // 参数槽(Kernel 节点;按序入包)
+    // ======================================================================
+
+    /// 参数入包(张量 → 依赖 + 有序槽)
+    pub fn arg(self, t: &TensorOps) -> TensorOps {
+        let mut out = self;
+        out.args.push(KernelArg::T { id: t.id });
+        out.parents.push(t.clone());
+        out
+    }
+
+    /// 标量参数入包(位型原样)
+    pub fn arg_bits(self, bits: u64) -> TensorOps {
+        let mut out = self;
+        out.args.push(KernelArg::Bits(bits));
+        out
+    }
+
+    pub fn arg_f32(self, v: f32) -> TensorOps {
+        self.arg_bits(v.to_bits() as u64)
+    }
+
+    pub fn arg_usize(self, v: usize) -> TensorOps {
+        self.arg_bits(v as u64)
+    }
+
+    pub fn arg_i32(self, v: i32) -> TensorOps {
+        self.arg_bits(v as u64)
+    }
+
+    pub fn arg_bool(self, v: bool) -> TensorOps {
+        self.arg_bits(v as u64)
     }
 
     // ======================================================================
@@ -229,18 +280,29 @@ impl TensorOps {
             op: Op::Zeros,
             dtype: self.dtype,
             shape: self.shape.clone(),
+            args: vec![],
             err: self.err.clone().or(Some(e)),
         }
     }
 
     /// append:深拷贝输入子树进新节点(值语义;配置面一次性成本)
-    pub(crate) fn join(&self, op: Op, rhs: Option<&TensorOps>, dtype: Dtype, shape: Shape) -> TensorOps {
+    fn join(&self, op: Op, rhs: Option<&TensorOps>, meta: (Dtype, Shape), args: Vec<KernelArg>) -> TensorOps {
         let mut parents = vec![self.clone()];
         if let Some(r) = rhs {
             parents.push(r.clone());
         }
         let err = self.err.clone().or(rhs.and_then(|r| r.err.clone()));
         let depth = parents.iter().map(|p| p.depth).max().unwrap_or(0) + 1;
-        TensorOps { id: next_id(), parents, depth, op, dtype, shape, err }
+        let (dtype, shape) = meta;
+        TensorOps {
+            id: next_id(),
+            parents,
+            depth,
+            op,
+            dtype,
+            shape,
+            args,
+            err,
+        }
     }
 }

@@ -1,119 +1,151 @@
-//! Client:对 GPU server 的**能力期望**——cuda 包照此实现。
+//! Client:对 GPU server 的**能力期望**(五原语;owl-cuda 照此实现)。
 //!
-//! 本模块回答:"上层(Tensor/layer/解释器)需要 server 提供什么?"
-//! 这份清单就是 cuda server 的实现任务书。client 不感知 server 内部
-//! (池/租约/相位/哨兵如何做,是 server 自己的事);client 只消费句柄。
+//! 职责定稿(2026-09-23 四层架构):
+//! - server(硬件层)= 哑执行器:只认 LaunchMsg / Alloc / Htod / Dtoh / Sync;
+//! - 解释器 = 把声明树翻译成原语消息;
+//! - 上层(TensorOps/Module)= 纯声明,零设备知识。
 //!
-//! 两层:
-//! - [`GpuFace`]:同步能力面(actor 线程上的执行原语)——解释器消费;
-//! - [`AsyncClient`]:异步门面(Tokio)——run/capture/replay/sync/close;
-//!   server 侧以专用线程 + 命令队列实现(async-runtime.md §二)。
+//! 签名形态:RPITIT(`-> impl Future + Send`),无 async_trait 依赖;
+//! eval 为泛型静态分发,无 dyn。
 
+use crate::error::ModelError;
+use crate::plan::Op;
+use crate::shape::Shape;
+use crate::tensor::TensorOps;
+use std::future::Future;
+use std::pin::Pin;
 
-// ============================================================================
-// §1 句柄词汇(client 视角的 server 产物;不透明,不可克隆内容)
-// ============================================================================
-
-/// 池块句柄(字节面;server 签发;drop = 延迟归还语义由 server 自持)
+/// 池块句柄:server 签发的身份证(id → server 账房 → 显存)。
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // 句柄 id:server 记账用,client 侧暂不读
-pub struct Bytes(pub(crate) u64);
+pub struct Bytes {
+    pub id: u64,
+    /// 元素数(f32)
+    pub len: usize,
+}
 
-/// 图句柄(捕获产物;烘焙后的可回放计划)
-#[derive(Clone, Debug)]
-#[allow(dead_code)] // 句柄 id:server 记账用,client 侧暂不读
-pub struct Graph(pub(crate) u64);
+impl Bytes {
+    pub fn new(id: u64, len: usize) -> Self {
+        Self { id, len }
+    }
+}
 
-/// kernel 句柄(server 侧 nvrtc 编译产物;装载经 load_kernel)
-#[derive(Clone, Debug)]
-#[allow(dead_code)] // 句柄 id:server 记账用,client 侧暂不读
-pub struct Kernel(pub(crate) u64);
-
-/// KV 上下文:动态依赖的参数形态(每步由 runner 构造传入)。
-/// manager 本体是静态依赖(layer 构造捕获);Ctx 只是"这一步用哪些格"。
+/// KV 动态上下文:每步由 runner 构造。
 #[derive(Clone, Debug)]
 pub struct KvCtx {
     pub step: u64,
     pub slots: Vec<u32>,
 }
 
-// ============================================================================
-// §2 同步能力面(actor 线程上的原语;解释器消费)
-// ============================================================================
-//
-// 这些方法的**全部实现都在 server/actor 线程**;本 trait 是 cuda 包对
-// owl-models 的能力承诺。阻塞(等待/拷贝)合法——调用者就是 actor 线程。
-
-pub trait GpuFace {
-    // 分配(字节;清零;Capturing 相允许 = 捕获安全分配)
-    // PSEUDO: fn malloc(&mut self, bytes: usize) -> Result<Bytes, ModelError>;
-
-    // host → device 写入式分配(pinned 码头 + 池流 async+sync;契约 3)
-    // PSEUDO: fn htod(&mut self, src: &[u8]) -> Result<Bytes, ModelError>;
-
-    // device → host 收割(阻塞等待 + 拷贝;完成 ready)
-    // PSEUDO: fn dtoh(&mut self, b: &Bytes, out: &mut [u8]) -> Result<(), ModelError>;
-
-    // kernel 发射(提交即回:发射成功即返回,不等 GPU)
-    // PSEUDO: fn launch(&mut self, kernel: &Kernel, args: &LaunchArgs) -> Result<(), ModelError>;
-
-    // 全设备同步
-    // PSEUDO: fn sync(&mut self) -> Result<(), ModelError>;
-
-    // kernel 装载(nvrtc 源码 → 句柄;A2 期:LoadKernel 命令)
-    // PSEUDO: fn load_kernel(&mut self, src: &str, names: &[&str]) -> Result<Vec<Kernel>, ModelError>;
-
-    // 捕获事务(原子;窗内发射经 launch 通道落 capture 流)
-    // PSEUDO: fn capture<F>(&mut self, step: F) -> Result<Graph, ModelError>
-    // PSEUDO: where F: FnOnce(&mut Self) -> Result<(), ModelError>;
-
-    // 图回放(租约校验 + launch;提交即回)
-    // PSEUDO: fn replay(&mut self, graph: &Graph) -> Result<(), ModelError>;
+/// kernel 描述:入口名 + 源码。后端按 (源码哈希, 名) 懒编译缓存。
+#[derive(Clone, Debug)]
+pub struct KernelSpec {
+    pub name: String,
+    pub source: String,
 }
 
-// ============================================================================
-// §3 异步门面(生产入口;Tokio 面零阻塞)
-// ============================================================================
-//
-/// 对 server 的异步期望:专用 GPU 线程 + 命令队列(async-runtime.md §二)。
-/// 模型层的工厂/forward 全部同步;只有这里的 eval/to_host/sync 是 async。
-pub struct AsyncClient {
-    /* proto: ProtocolClient —— 协议封装在 server 侧内部;client 不感知 */
-    _priv: (),
+/// 发射参数槽(有序;与 kernel 签名严格对位)
+/// 类型化:标量按 kernel 形参宽度入槽(CUDA 参数空间自然对齐,
+/// 8 字节槽顶 4 字节形参会错位读參)
+#[derive(Clone, Debug)]
+pub enum Arg {
+    Block { id: u64 },
+    U64(u64),
+    I32(i32),
+    F32(f32),
 }
 
-impl AsyncClient {
-    // 启动 server 并握手(uuid 钉卡;pool_bytes 构造参数指定)
-    // PSEUDO: pub async fn spawn(uuid: &str, pool_bytes: u64) -> Result<Self, ModelError>;
-
-    // 评述:节目单 → server 逐节点解释(档一:提交即回)。
-    // 返回收割句柄(对任意中间节点 to_host)。
-    // PSEUDO: pub async fn eval(&self, t: &crate::tensor::TensorOps) -> Result<EvalHandle, ModelError>;
-
-    // 收割:同步等待 + D2H(全链唯一拿数据的地方;完成 ready)
-    // PSEUDO: pub async fn to_host(&self, t: &crate::tensor::TensorOps) -> Result<Vec<u8>, ModelError>;
-
-    // 捕获事务(原子)→ 图句柄
-    // PSEUDO: pub async fn capture(&self, step: CaptureStep) -> Result<Graph, ModelError>;
-
-    // 图回放(提交即回)
-    // PSEUDO: pub async fn replay(&self, graph: Graph) -> Result<(), ModelError>;
-
-    // 全设备同步
-    // PSEUDO: pub async fn sync(&self) -> Result<(), ModelError>;
-
-    // 关机
-    // PSEUDO: pub async fn close(&self) -> Result<(), ModelError>;
+/// 发射消息
+pub struct LaunchMsg {
+    pub kernel: KernelSpec,
+    pub args: Vec<Arg>,
+    pub grid: (u32, u32, u32),
+    pub block: (u32, u32, u32),
+    pub shared_mem: u32,
+    pub out_elems: usize,
 }
 
-/// 评述产物:节点 → 收割/数据访问的路由(实施期定形态)
-pub struct EvalHandle {
-    _priv: (),
+/// 设备客户端能力契约(五原语;全异步)。
+pub trait DeviceClient: Send {
+    fn alloc(&mut self, n_bytes: usize) -> impl Future<Output = Result<Bytes, ModelError>> + Send;
+    fn htod(
+        &mut self,
+        dtype: crate::dtype::Dtype,
+        shape: &Shape,
+        src: &[u8],
+    ) -> impl Future<Output = Result<Bytes, ModelError>> + Send;
+    fn dtoh(
+        &mut self,
+        b: &Bytes,
+        out: &mut [u8],
+    ) -> impl Future<Output = Result<(), ModelError>> + Send;
+    fn launch(
+        &mut self,
+        msg: LaunchMsg,
+    ) -> impl Future<Output = Result<Bytes, ModelError>> + Send;
+    fn sync(&mut self) -> impl Future<Output = Result<(), ModelError>> + Send;
 }
 
-// ============================================================================
-// §4 对 server 的错误面期望(见 error.rs ModelError 执行期段)
-// ============================================================================
-//
-// server 必须能结构化表达:PoolExhausted / DeadBlock / CaptureViolation /
-// ServerClosed / Msg。禁止 panic 跨线;禁止错误静默吞并。
+/// 声明树求值:自叶向根,逐节点翻译为原语调用。
+pub fn eval<'a, D>(
+    t: &'a TensorOps,
+    face: &'a mut D,
+) -> Pin<Box<dyn Future<Output = Result<Bytes, ModelError>> + Send + 'a>>
+where
+    D: DeviceClient + 'a,
+{
+    Box::pin(_eval(t, face))
+}
+
+async fn _eval<D: DeviceClient>(t: &TensorOps, face: &mut D) -> Result<Bytes, ModelError> {
+    if let Some(e) = &t.err {
+        return Err(ModelError::Msg(format!(
+            "[毒值落地 @depth {}] {}",
+            e.at_depth, e.detail
+        )));
+    }
+    let mut ins: Vec<Bytes> = Vec::with_capacity(t.parents.len());
+    for p in &t.parents {
+        ins.push(eval(p, face).await?);
+    }
+
+    let dtype = t.dtype;
+    let shape = t.shape.clone();
+    let n_bytes = shape.iter().product::<usize>() * dtype.size_bytes();
+
+    match &t.op {
+        Op::Htod { bytes } => face.htod(dtype, &shape, bytes).await,
+        Op::Zeros => face.alloc(n_bytes).await,
+        Op::Block { id } => Ok(Bytes { id: *id, len: 0 }),
+        Op::Add => {
+            let out = face.alloc(n_bytes).await?;
+            let msg = crate::actions::lower_add(&ins, &out);
+            face.launch(msg).await?;
+            Ok(out)
+        }
+        Op::Silu => {
+            let out = face.alloc(n_bytes).await?;
+            let msg = crate::actions::lower_silu(&ins, &out);
+            face.launch(msg).await?;
+            Ok(out)
+        }
+        Op::Matmul => {
+            let (m, n) = (shape[0], shape[1]);
+            let k = ins[0].len;
+            let out = face.alloc(m * n * dtype.size_bytes()).await?;
+            let msg = crate::actions::lower_matmul(&ins, &out, m, k, n);
+            face.launch(msg).await?;
+            Ok(out)
+        }
+        Op::Rmsnorm { eps, w_off } => {
+            let out = face.alloc(n_bytes).await?;
+            let msg = crate::actions::lower_rmsnorm(&ins, *eps, *w_off, &out);
+            face.launch(msg).await?;
+            Ok(out)
+        }
+        Op::SlotWrite => Ok(ins[0].clone()),
+        Op::Kernel { .. } => Err(ModelError::Msg(
+            "Op::Kernel: 需 server 侧 load+launch(动作表二期)".to_string(),
+        )),
+        other => Err(ModelError::Msg(format!("eval 未覆盖: {other:?}"))),
+    }
+}

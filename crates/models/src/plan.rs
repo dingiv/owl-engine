@@ -2,7 +2,16 @@
 //! server 照此实现 dispatch;新增能力 = 新变体 + server 一臂。
 //! (原 Step/TensorMeta 已解体进 Tensor——2026-09-23 用户裁决。)
 
-use crate::interpreter::Value;
+use crate::kernel::Kernel;
+
+/// Kernel 节点的参数槽(有序)
+#[derive(Clone, Debug)]
+pub enum KernelArg {
+    /// 张量依赖:归约序保证先算;发射时 server 解 id → 设备指针
+    T { id: u64 },
+    /// 标量位型(u64 槽;LE 低字节 = 真实位型)
+    Bits(u64),
+}
 
 /// 语义运算
 #[derive(Clone, Debug)]
@@ -29,15 +38,12 @@ pub enum Op {
     /// paged attention(带槽位;server 侧 kernel 从 attention-rs port)
     PagedAttn,
 
-    // ---- 逃逸舱:client 侧自定义算子(fn 指针;CPU/客户端执行)----
-    // ⚠️ 架构注记:fn 指针无法序列化成 kernel——这两个变体**不进捕获图、
-    // 不上 GPU**,由 CPU 解释器就地执行。真 GPU 自定义算子的正路 =
-    // load_kernel(装载源码)+ Launch(发射),能力面已覆盖。
-    // f 指针保留 Clone+Debug+Send+Sync(fn 指针天生全有;boxed 闭包三样全丢)。
-    /// f(Tensor) -> Tensor:一元 client 侧变换
-    UnaryFn { f: fn(Value) -> Value },
-    /// f(Tensor, Tensor) -> Tensor:二元 client 侧变换
-    BinaryFn { f: fn(Value, Value) -> Value },
+    // ---- Kernel 节点(2026-09-23 定稿:节点的本质形态,funio Pack 同源)----
+    /// 携带核函数值(Kernel{name, source})+ 有序参数槽。
+    /// 解释器:CPU = 结构化"需 GPU server";GPU = 懒编译(源哈希缓存)+ 发射。
+    /// 参数槽有序:T(张量依赖)/ Bits(标量位型);归约时张量参数先入账。
+    /// Kernel 节点(参数槽在 TensorOps.args;归约时随发射消息打包)
+    Kernel { kernel: Kernel },
 
     // ---- 状态节点(唯一显式副作用;SSA 外形,物理原地由 server 解释)----
     /// KV 写槽:声明"本节目写 kv manager 的这些格"——
@@ -66,11 +72,18 @@ impl PlanNode for crate::tensor::TensorOps {
         &self.op
     }
 
+    /// 草稿语义:join = 相加(map = silu);正式组合子随声明式算子面扩展
     fn join(&self, another: &Self, op: Op) -> Self {
-        crate::tensor::TensorOps::join(self, op, Some(another), self.dtype, self.shape.clone())
+        match op {
+            Op::Add => self.add(another),
+            _ => self.add(another),
+        }
     }
 
     fn map(&self, op: Op) -> Self {
-        crate::tensor::TensorOps::join(self, op, None, self.dtype, self.shape.clone())
+        match op {
+            Op::Silu => self.silu(),
+            _ => self.clone(),
+        }
     }
 }

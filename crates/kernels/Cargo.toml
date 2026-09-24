@@ -3,4 +3,12 @@ name = "owl-kernels"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Operator dispatch: arch table, marlin wiring, capture-safe kernel contract"
+description = "Operator dispatch + unified kernel home: .cu sources, nvrtc compile, raw-pointer launchers"
+
+[dependencies]
+# 官方 cudarc:仅本 crate 的 cuda_ops 使用(kernel 编译与发射)
+# nvrtc feature 仅为 Ptx 类型(load_module 入参;纯数据包装,零运行时编译)——
+# 编译本体已前移到 build.rs(nvcc 预编译 PTX)
+cudarc = { version = "0.19", default-features = false, features = [
+    "std", "driver", "nvrtc", "cuda-version-from-build-system", "dynamic-loading",
+] }

@@ -16,6 +16,29 @@ pub struct LazyError {
 }
 
 /// 边界错误:装载期(new)与执行期(interpret/to_host)的结构化报错。
+impl std::fmt::Display for ModelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ModelError::MissingKey { path, key } => write!(f, "MissingKey: {path}::{key}"),
+            ModelError::ShapeMismatch { path, expected, got } => {
+                write!(f, "ShapeMismatch: {path} 期望 {expected:?} 实得 {got:?}")
+            }
+            ModelError::DtypeMismatch { path, expected, got } => {
+                write!(f, "DtypeMismatch: {path} 期望 {expected:?} 实得 {got:?}")
+            }
+            ModelError::PoolExhausted { pool, needed, available } => {
+                write!(f, "PoolExhausted: {pool} 需 {needed}B 余 {available}B")
+            }
+            ModelError::DeadBlock { id } => write!(f, "DeadBlock: {id}"),
+            ModelError::CaptureViolation { detail } => write!(f, "CaptureViolation: {detail}"),
+            ModelError::ServerClosed => write!(f, "ServerClosed"),
+            ModelError::Msg(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+impl std::error::Error for ModelError {}
+
 /// 词汇表是我们对 **server 错误面**的期望——server 侧必须能表达这些。
 #[derive(Debug, Clone)]
 pub enum ModelError {

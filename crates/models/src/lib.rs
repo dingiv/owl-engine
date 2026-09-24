@@ -21,10 +21,13 @@
 //!
 //! 设计文档:docs/arch/declarative-tensor.md(async-runtime.md 契约五)。
 
+pub mod actions;
 pub mod client;
+pub mod demo;
 pub mod device;
 pub mod rt;
 pub mod dtype;
+pub mod kernel;
 pub mod error;
 pub mod interpreter;
 pub mod plan;
@@ -32,6 +35,7 @@ pub mod shape;
 pub mod tensor;
 
 pub use dtype::Dtype;
+pub use kernel::{Kernel, Scalar};
 pub use error::{LazyError, ModelError};
 pub use tensor::TensorOps;
 pub use rt::Tensor;

@@ -515,7 +515,7 @@ fn demo5_gpu_executor() {
     let alpha = Tensor::from_host(vec![1, 4], &[0.5; 4]);
 
     let h = x.matmul(&eye).add(&bias);
-    let out_t = h.silu().rmsnorm(&alpha, 1e-6, true);
+    let _out_t = h.silu().rmsnorm(&alpha, 1e-6, true);
 
     // GPU 归约(rmsnorm 走 CPU 臂收尾,其余节点在卡上;对比 CPU 结果)
     let h_gpu = eval_gpu(&h.head, &ex).expect("eval_gpu(h)");

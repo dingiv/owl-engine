@@ -17,5 +17,10 @@ cudarc = { version = "0.19", default-features = false, features = [
     "dynamic-loading",
 ] }
 owl-iface = { path = "../iface" }
+owl-models = { path = "../../models" }
+owl-kernels = { path = "../../kernels" }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
