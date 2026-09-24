@@ -1,23 +1,52 @@
-//! TensorOps:声明式链式 API(客户主入口)。
+//! Tensor:声明链(TensorOps)+ 运行时数据(Tensor<D>)+ 标注词汇(Dtype)。
 //!
-//! TensorOps = 反向多叉树上某节点的视图 + dtype/shape 标注 + 可选 Kernel 参数槽。
-//! 运算 = 声明(构造新节点,值语义深拷贝输入子树),不执行。
-//! 链式:一元 = 方法;二元 = 方法吃 &TensorOps;Kernel 节点 = of(Kernel) + .arg 链。
+//! 三层区分(2026-09-23/24 定稿):
+//!   TensorOps  = 声明链(懒描述;反向多叉树;无数据)—— §2
+//!   Tensor<D>  = 运行时数据(设备池块 + dtype/shape 标注)—— §3
+//!   Dtype      = 标注词汇(S4 语义表的 dtype 维;起步面,按需扩)—— §1
 //!
-//! **结构定稿(2026-09-23)**:
+//! **结构定稿**:
 //! - 值语义:深拷贝输入子树(配置面一次性成本);
 //! - 无 Arc、无 Tx、无共享别名——纯值世界;
-//! - 每节点携带全局唯一自增 id(跨线程;server 对账/缓存键)。
+//! - 每节点携带全局唯一自增 id(跨线程;server 对账/缓存键),声明链与
+//!   运行时张量共用同一套进程级身份证。
 
-use crate::dtype::Dtype;
-use crate::error::LazyError;
+use crate::device::Device;
+use crate::error::{LazyError, ModelError};
 use crate::kernel::Kernel;
 use crate::plan::{KernelArg, Op};
-use crate::shape::Shape;
+use crate::shape::{numel, Shape};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// 全局自增节点 id:跨线程唯一(进程级身份证)。
-/// 不变量:任何时刻不存在两个同 id 的 TensorOps。
+// ============================================================================
+// §1 Dtype:标注词汇
+// ============================================================================
+
+/// 数据类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dtype {
+    F32,
+    BF16,
+    F16,
+    U32,
+}
+
+impl Dtype {
+    /// 字节宽(server 的 Malloc 只认字节;宽是 client 侧换算用的)
+    pub fn size_bytes(self) -> usize {
+        match self {
+            Dtype::F32 => 4,
+            Dtype::BF16 | Dtype::F16 => 2,
+            Dtype::U32 => 4,
+        }
+    }
+}
+
+
+// ============================================================================
+// §2 TensorOps:声明式链式 API(客户主入口)
+// ============================================================================
+
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_id() -> u64 {
@@ -160,6 +189,13 @@ impl TensorOps {
         }
     }
 
+    /// Kernel 节点输出形状标注(of 默认 F32 空形状;eval 按此 alloc 输出块)
+    pub fn with_shape(mut self, dtype: Dtype, shape: Shape) -> TensorOps {
+        self.dtype = dtype;
+        self.shape = shape;
+        self
+    }
+
     /// 视图:纯元数据收窄,零节点追加,零 server 往返
     pub fn narrow(&self, dim: usize, _start: usize, len: usize) -> TensorOps {
         let mut shape = self.shape.clone();
@@ -240,16 +276,22 @@ impl TensorOps {
         out
     }
 
+    /// 4 字节浮点参数(与 kernel `float` 形参严格对位)
     pub fn arg_f32(self, v: f32) -> TensorOps {
-        self.arg_bits(v.to_bits() as u64)
+        let mut out = self;
+        out.args.push(KernelArg::F32(v));
+        out
     }
 
     pub fn arg_usize(self, v: usize) -> TensorOps {
         self.arg_bits(v as u64)
     }
 
+    /// 4 字节整数参数(与 kernel `int` 形参严格对位)
     pub fn arg_i32(self, v: i32) -> TensorOps {
-        self.arg_bits(v as u64)
+        let mut out = self;
+        out.args.push(KernelArg::I32(v));
+        out
     }
 
     pub fn arg_bool(self, v: bool) -> TensorOps {
@@ -304,5 +346,170 @@ impl TensorOps {
             args,
             err,
         }
+    }
+}
+
+
+// ============================================================================
+// §3 Tensor<D>:运行时数据张量(跨设备统一表达)
+// ============================================================================
+// id 与 TensorOps 共用同一套进程级身份证(§2 的 NEXT_ID)
+
+/// 运行时数据张量。
+/// - `block`:设备池块(数据所在);`offset`:块内字节偏移(视图);
+/// - clone = 共享同一底仓 + 同一偏移(视图克隆,零拷贝);
+/// - narrow/reshape 纯元数据;数据写入经设备(装载/算子),不经本类型。
+pub struct Tensor<D: Device> {
+    dev: D,
+    block: D::Bytes,
+    /// 块内字节偏移(视图;数据本体从 offset 起读)
+    offset: usize,
+    dtype: Dtype,
+    shape: Shape,
+    id: u64,
+}
+
+impl<D: Device> Tensor<D> {
+    /// 从既有池块装配(纯元数据;容量守卫——cat 案教训)
+    pub fn from_bytes(
+        dev: D,
+        dtype: Dtype,
+        shape: Shape,
+        block: D::Bytes,
+    ) -> Result<Self, ModelError> {
+        let n = numel(&shape);
+        let need = n * dtype.size_bytes();
+        let cap = dev.capacity(&block);
+        if need > cap {
+            return Err(ModelError::Msg(format!(
+                "Tensor::from_bytes: 需 {need}B > 池块 {cap}B"
+            )));
+        }
+        Ok(Self {
+            dev,
+            block,
+            offset: 0,
+            dtype,
+            shape,
+            id: next_id(),
+        })
+    }
+
+    /// 装载声明 → 执行(host 数据经设备 htod;同步面)
+    pub fn from_host(dev: D, dtype: Dtype, shape: Shape, data: &[u8]) -> Result<Self, ModelError> {
+        let n = numel(&shape);
+        let want = n * dtype.size_bytes();
+        if data.len() != want {
+            return Err(ModelError::Msg(format!(
+                "from_host: 字节数 {} != {want}(dtype×shape)",
+                data.len()
+            )));
+        }
+        let block = dev.htod(data)?;
+        Ok(Self {
+            dev,
+            block,
+            offset: 0,
+            dtype,
+            shape,
+            id: next_id(),
+        })
+    }
+
+    /// 清零分配
+    pub fn zeros(dev: D, dtype: Dtype, shape: Shape) -> Result<Self, ModelError> {
+        let n = numel(&shape);
+        let block = dev.alloc(n * dtype.size_bytes())?;
+        Ok(Self {
+            dev,
+            block,
+            offset: 0,
+            dtype,
+            shape,
+            id: next_id(),
+        })
+    }
+
+    // ======================================================================
+    // 查询
+    // ======================================================================
+
+    pub fn dtype(&self) -> Dtype {
+        self.dtype
+    }
+
+    pub fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    pub fn nbytes(&self) -> usize {
+        numel(&self.shape) * self.dtype.size_bytes()
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn device(&self) -> D {
+        self.dev.clone()
+    }
+
+    /// 视图:dim 维收窄(零拷贝;offset 随 start 走)
+    /// (仅演示最简形态:dim=0 且行主序时 offset += start × 行宽)
+    pub fn narrow_dim0(&self, start: usize, len: usize) -> Result<Self, ModelError> {
+        if self.shape.is_empty() || start + len > self.shape[0] {
+            return Err(ModelError::Msg(format!(
+                "narrow_dim0: [{start}..{}) 越界 shape {:?}",
+                start,
+                self.shape
+            )));
+        }
+        let row = if self.shape.len() > 1 {
+            self.shape[1..].iter().product::<usize>() * self.dtype.size_bytes()
+        } else {
+            self.dtype.size_bytes()
+        };
+        let t = Tensor {
+            dev: self.dev.clone(),
+            block: self.block.clone(),
+            offset: self.offset + start * row,
+            dtype: self.dtype,
+            shape: {
+                let mut s = self.shape.clone();
+                s[0] = len;
+                s
+            },
+            id: next_id(),
+        };
+        Ok(t)
+    }
+
+    // ======================================================================
+    // 数据出入(边界;同步面。GPU 的 async 包装在 client.rs 一层)
+    // ======================================================================
+
+    /// device → host 收割(全部数据)
+    /// 桥:物化数据 → 声明叶子(Block 节点引用本块的 id)。
+    /// 数据本体不动;声明图 eval 时该叶子零操作。
+    pub fn as_declaration(&self) -> TensorOps {
+        TensorOps::of_block(
+            self.id,
+            self.dtype,
+            self.shape.clone(),
+        )
+    }
+
+    pub fn to_host(&self) -> Result<Vec<u8>, ModelError> {
+        let mut out = vec![0u8; self.nbytes()];
+        // 视图收割:块内 offset 起(容量守卫在设备层)
+        self.dev.dtoh(&self.block, &mut out)?;
+        // offset 版本:设备需支持子区读——一期约束 = narrow 视图暂不支持
+        // 跨 offset 收割(需要 server dtoh 带 offset 参数,A3 期扩)。
+        if self.offset != 0 {
+            return Err(ModelError::Msg(
+                format!("to_host: 带偏移视图收割待 server dtoh 扩 offset 参数(offset={})", self.offset),
+            ));
+        }
+        Ok(out)
     }
 }

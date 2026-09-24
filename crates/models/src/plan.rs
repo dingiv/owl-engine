@@ -5,12 +5,18 @@
 use crate::kernel::Kernel;
 
 /// Kernel 节点的参数槽(有序)
+/// 类型化:标量按 kernel 形参宽度入槽(CUDA 参数空间自然对齐,
+/// 宽槽顶窄形参会错位读參 —— 与 client::Arg 同一纪律)
 #[derive(Clone, Debug)]
 pub enum KernelArg {
     /// 张量依赖:归约序保证先算;发射时 server 解 id → 设备指针
     T { id: u64 },
-    /// 标量位型(u64 槽;LE 低字节 = 真实位型)
+    /// 8 字节标量(size_t/u64)
     Bits(u64),
+    /// 4 字节有符号整数
+    I32(i32),
+    /// 4 字节浮点
+    F32(f32),
 }
 
 /// 语义运算

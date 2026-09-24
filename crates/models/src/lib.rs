@@ -11,22 +11,24 @@
 //!    GPU server 提供的**能力契约**——cuda 包照此实现。
 //!
 //! 模块地图:
-//! - [`dtype`] / [`shape`]:标注词汇
+//! - [`tensor`]:声明链 TensorOps + 运行时 Tensor<D> + Dtype 标注词汇
+//! - [`shape`]:形状词汇
 //! - [`error`]:毒值 + 两族错误(描述层逻辑违约 / 执行层资源错)
-//! - [`plan`]:反向多叉树(值语义)+ 语义 Op 枚举
-//! - [`tensor`]:声明式链式 API(客户主入口)
-//! - [`tx`]:发射上下文(相位无感:eager 直发 / 捕获录制)
-//! - [`client`]:**对 server 的能力期望**(malloc/htod/launch/capture/replay)
-//! - [`interpreter`]:解释器契约(eager / capture-bake / CPU 参考)
+//! - [`plan`]:语义 Op 枚举
+//! - [`kernel`]:Kernel 值(name + source + 发射配置)
+//! - [`client`]:**对 server 的能力期望**(五原语 DeviceClient + eval 声明树求值)
+//! - [`actions`]:预定义算子动作表(具名算子 → LaunchMsg 的唯一 lower 通道)
+//! - [`interpreter`]:CpuFace(CPU 参考执行器;与 GPU server 同一契约)
+//! - [`device`]:跨设备统一表达契约(CPU / GPU server 同一形状)
 //!
-//! 设计文档:docs/arch/declarative-tensor.md(async-runtime.md 契约五)。
+//! 设计文档:docs/arch/async-runtime.md(v0.2,含声明式 Tensor 合并)。
+//!
+//! 调试:`OWL_DEBUG=1` 开启解释层发射日志(默认静默)。
 
 pub mod actions;
 pub mod client;
 pub mod demo;
 pub mod device;
-pub mod rt;
-pub mod dtype;
 pub mod kernel;
 pub mod error;
 pub mod interpreter;
@@ -34,11 +36,9 @@ pub mod plan;
 pub mod shape;
 pub mod tensor;
 
-pub use dtype::Dtype;
-pub use kernel::{Kernel, Scalar};
+pub use kernel::{Kernel, LaunchShape, Scalar};
 pub use error::{LazyError, ModelError};
-pub use tensor::TensorOps;
-pub use rt::Tensor;
+pub use tensor::{Dtype, Tensor, TensorOps};
 pub use device::{Cpu, Device, DeviceKind};
 
 /// 本 crate 的结果别名:只用于**边界**(构造期装载 / 执行收割)。

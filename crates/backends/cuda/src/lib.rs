@@ -1,24 +1,18 @@
 //! owl-cuda —— GPU server 后端:实现 owl-models 的 `DeviceClient` 契约。
 //!
 //! 分层:owl-kernels(kernel 描述)→ owl-cuda(actor 执行)→ owl-models(契约)。
-//! server 是**哑执行器**:不认识具体算子,只认 LaunchMsg / Alloc / Htod / Dtoh / Sync。
+//! server 是**哑执行器**:不认识具体算子,只认 LaunchMsg / alloc / htod / dtoh / sync。
 //!
-//! 旧世界(device/pool/governor/graph/buffers)已归档至 `cuda_bak/`,
-//! 待 nn/engine 迁移至声明式 API 后再按需重建。
+//! 模块地图:
+//! - [`ffi`]:cudarc 受控再导出(A4;上层唯一可见的 driver 表面)
+//! - [`gpu_server`]:actor 线程 + 池块账房 + 懒编译 + LaunchMsg 发射
+//!
+//! 历史档案(`.rsx` 后缀 = Tx 时代伪代码骨架,不编译,仅供追溯):
+//! `client.rsx` / `protocol.rsx` / `server.rsx` / `server-state-machine.rsx`。
+//! 旧世界(device/pool/governor/graph/buffers)归档于 `../cuda_bak/`。
 
 pub mod ffi;
 pub mod gpu_server;
-
-/// 测试/示例的设备序号(OWL_TEST_DEVICE,默认 0)
-pub fn test_device_ordinal() -> usize {
-    std::env::var("OWL_TEST_DEVICE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0)
-}
-
-/// 测试/示例默认池容量
-pub const TEST_POOL_BYTES: u64 = 64 << 20;
 
 pub use gpu_server::GpuClient;
 pub use owl_models::client::DeviceClient;

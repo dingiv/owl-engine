@@ -8,6 +8,9 @@
 //! 签名形态:RPITIT(`-> impl Future + Send`),无 async_trait 依赖;
 //! eval 为泛型静态分发,无 dyn。
 
+/// 图身份证(server 签发;graph_end 成功后可 graph_launch 重放)
+pub type GraphId = u64;
+
 use crate::error::ModelError;
 use crate::plan::Op;
 use crate::shape::Shape;
@@ -64,24 +67,48 @@ pub struct LaunchMsg {
     pub out_elems: usize,
 }
 
-/// 设备客户端能力契约(五原语;全异步)。
+/// 设备客户端能力契约(五原语 + 流管理;全异步)。
+///
+/// 流语义:server 按业界三流模型固定路由(H2D/COMPUTE/D2H,客户端不可
+/// 自创也不可见;多并发靠算子维 batching,不靠多流)——
+/// htod→H2D,launch/alloc/graph→COMPUTE,dtoh→D2H,sync 排空全部。
+/// 流内保序(依赖维),流间并发(传输/计算重叠维)。跨流依赖(事件边)
+/// 待服务端扩展。
+///
+/// **回执语义分级**(Future resolve 时机):
+/// - `alloc` / `launch`:Ok = 提交成功 + 账房登记(fire-and-forget;
+///   数据正确性由同流保序保证,GPU 侧错误 sticky 延迟暴露,在下次
+///   `dtoh`/`sync` 收割)
+/// - `htod` / `dtoh`:Ok = GPU 真完成(pinned 码头生命周期/数据收割
+///   要求真实完成点;完成通知走 host 回调 cuLaunchHostFunc)
+/// - `sync`:栅栏,该流此前所有工作全部落定
 pub trait DeviceClient: Send {
-    fn alloc(&mut self, n_bytes: usize) -> impl Future<Output = Result<Bytes, ModelError>> + Send;
+    /// 图捕获开始:进入捕获模式(此后 Launch 进图;
+    /// Alloc 从捕获 slab 切块,零 cudaMalloc)。护栏:
+    /// - 不可嵌套/并发捕获;捕获期 Htod/Dtoh/Sync/GraphLaunch 拒绝
+    /// - 数据须在图外先物化(Block 叶子)—— warmup 契约:先 eager 跑
+    ///   同一声明树,验证逻辑正确后再捕获
+    fn graph_begin(&mut self) -> impl Future<Output = Result<(), ModelError>> + Send;
+    /// 图捕获结束:实例化并登记,返回图 id(空捕获窗拒绝 —— 发射数须 > 0)
+    fn graph_end(&mut self) -> impl Future<Output = Result<GraphId, ModelError>> + Send;
+    /// 图重放(流序异步提交;写入捕获时的同一批池块 —— 块只增不减,
+    /// 指针稳定,由 server 账房保证)
+    fn graph_launch(
+        &mut self,
+        graph: GraphId,
+    ) -> impl Future<Output = Result<(), ModelError>> + Send;
+    fn alloc(&mut self, n_bytes: usize)
+        -> impl Future<Output = Result<Bytes, ModelError>> + Send;
     fn htod(
         &mut self,
-        dtype: crate::dtype::Dtype,
+        dtype: crate::tensor::Dtype,
         shape: &Shape,
         src: &[u8],
     ) -> impl Future<Output = Result<Bytes, ModelError>> + Send;
-    fn dtoh(
-        &mut self,
-        b: &Bytes,
-        out: &mut [u8],
-    ) -> impl Future<Output = Result<(), ModelError>> + Send;
-    fn launch(
-        &mut self,
-        msg: LaunchMsg,
-    ) -> impl Future<Output = Result<Bytes, ModelError>> + Send;
+    fn dtoh(&mut self, b: &Bytes, out: &mut [u8])
+        -> impl Future<Output = Result<(), ModelError>> + Send;
+    fn launch(&mut self, msg: LaunchMsg)
+        -> impl Future<Output = Result<Bytes, ModelError>> + Send;
     fn sync(&mut self) -> impl Future<Output = Result<(), ModelError>> + Send;
 }
 
@@ -142,10 +169,13 @@ async fn _eval<D: DeviceClient>(t: &TensorOps, face: &mut D) -> Result<Bytes, Mo
             face.launch(msg).await?;
             Ok(out)
         }
+        Op::Kernel { kernel } => {
+            let out = face.alloc(n_bytes).await?;
+            let msg = crate::actions::lower_kernel(kernel, &t.args, &ins, &out);
+            face.launch(msg).await?;
+            Ok(out)
+        }
         Op::SlotWrite => Ok(ins[0].clone()),
-        Op::Kernel { .. } => Err(ModelError::Msg(
-            "Op::Kernel: 需 server 侧 load+launch(动作表二期)".to_string(),
-        )),
         other => Err(ModelError::Msg(format!("eval 未覆盖: {other:?}"))),
     }
 }

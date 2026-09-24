@@ -3,7 +3,7 @@
 //! (GpuClient)都调这里——保证两路执行的是**同一份描述**。
 
 use crate::client::{DeviceClient, KvCtx};
-use crate::dtype::Dtype;
+use crate::tensor::Dtype;
 use crate::error::ModelError;
 use crate::TensorOps;
 

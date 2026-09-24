@@ -40,3 +40,7 @@ flashinfer = []
 cutlass = []
 
 
+
+[dev-dependencies]
+owl-models = { path = "../models" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

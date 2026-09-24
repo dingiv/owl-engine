@@ -48,3 +48,34 @@ pub mod sys {
 pub mod nvrtc {
     pub use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 }
+
+// ============================================================================
+// 异步搬运 + 事件轮询(gpu_server 事件循环;A4 登记)
+// ============================================================================
+
+pub use cudarc::driver::DriverError;
+
+/// pinned host 码头(自管;cuda 的 PinnedHostSlice 取裸指针会强制同步,不合用)
+pub use cudarc::driver::result::{free_host, malloc_host};
+
+/// 图句柄 safe 面(捕获产物;非 Send —— 钉死 actor 线程使用)
+pub use cudarc::driver::CudaGraph;
+pub use cudarc::driver::sys::CUstreamCaptureMode;
+pub use cudarc::driver::sys::CUgraphInstantiate_flags;
+
+/// 捕获模式常量(ThreadLocal = 只锁本线程,不霸锁全进程)
+pub const CAPTURE_MODE_THREAD_LOCAL: CUstreamCaptureMode =
+    CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
+/// 实例化 flag(cudarc 无 NONE 变体;AUTO_FREE 只作用于图内分配节点,
+/// 我们 slab 图外预分配,无影响)
+pub const INSTANTIATE_AUTO_FREE: CUgraphInstantiate_flags =
+    CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
+
+/// host 完成回调(现代 API;cuLaunchHostFunc,取代废弃的 cudaStreamAddCallback)。
+/// ⚠️ 回调跑在驱动线程:**禁止调用任何 CUDA API、禁止阻塞** —— 只允许
+/// 做纯 host 侧动作(如 channel send)。
+pub use cudarc::driver::result::stream::launch_host_function;
+
+/// 非阻塞搬运(流序;host 侧须为 pinned)
+pub use cudarc::driver::result::{memcpy_dtoh_async, memcpy_htod_async};
+

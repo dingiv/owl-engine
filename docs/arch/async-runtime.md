@@ -1,7 +1,7 @@
 # owl 异步编程模型(四层架构 + 声明式 Tensor)
 
-> 版本:v0.2(2026-09-23)。取代 async-runtime.md v0.1 与 declarative-tensor.md v0.1,
-> 合并为本文档。上游:charter.md、graph-model-seam.md。
+> 版本:v0.3(2026-09-24)。v0.2 合并 declarative-tensor.md;v0.3 同步
+> 标量类型化/Kernel 节点落地与坑 I-L。上游:charter.md、graph-model-seam.md。
 > 状态:**设计定稿,实施进行中**。
 
 ---
@@ -80,18 +80,18 @@ pub struct Tensor<D: Device> {
 - clone = 共享底仓 + 同偏移(零拷贝视图)
 - `as_declaration()` → TensorOps(桥:数据进声明图)
 
-### 2.3 KernelFn(自描述发射包)
+### 2.3 Kernel(自描述发射包)
 
 ```rust
-pub struct KernelFn {
-    pub name: &'static str,       // kernel 入口名
-    pub ptx: &'static str,        // 源码(build.rs 预编译 PTX)
-    pub slots: Vec<u64>,          // 参数槽(指针值/标量位型,按签名序)
-    pub grid: (u32, u32, u32),
-    pub block: (u32, u32, u32),
-    pub shared_mem: u32,
+pub struct Kernel {
+    pub name: &'static str,       // kernel 入口名(编译缓存键成分)
+    pub source: &'static str,     // .cu 源码(内嵌;后端 nvrtc 懒编译)
+    pub launch: LaunchShape,      // grid/block/shared_mem;grid (0,0,0) 哨兵 = 自动 1D
 }
 ```
+
+- 参数槽 `KernelArg::{T, Bits, I32, F32}` **类型化**:与 kernel 形参宽度严格对位
+  (CUDA 参数空间按形参自然对齐,宽槽顶窄形参会错位读参 —— 坑 I);
 
 ### 2.4 DeviceClient(异步能力契约)
 
@@ -129,7 +129,8 @@ pub trait DeviceClient: Send {
 | `.add(&b)` | 同形逐元素加 | self.shape |
 | `.silu()` | 逐元素激活 | self.shape |
 | `.rmsnorm(&alpha, eps, w_off)` | ×(1+w) 或 ×w | self.shape |
-| `.arg(&t)` / `.arg_f32(v)` / ... | Kernel 节点参数入槽 | — |
+| `.arg(&t)` / `.arg_f32(v)` / `.arg_i32(v)` / `.arg_usize(v)` | Kernel 节点参数入槽(类型化) | — |
+| `.with_shape(dtype, shape)` | Kernel 节点输出形状标注 | 标注后 shape |
 | `.narrow(dim, start, len)` | 视图(零节点追加) | 收窄后 shape |
 
 **毒值传播**:构造期违约(shape/dtype 不符)→ `Poisoned(LazyError)` 随链流动,
@@ -197,12 +198,14 @@ PTX → load_module → load_function。arch 显式钉(不钉 = INVALID_IMAGE)�
 ### 5.3 LaunchMsg 发射
 
 ```text
-1. 解析参数槽:Block(id) → 账房取设备指针;Bits → u64 值
-2. alloc_zeros(out_elems) 分配输出
-3. ensure_kernel(name, source) 懒编译
-4. builder.arg(逐槽) + launch(cfg)
-5. new_block(out) 登记输出 → Bytes 返回
+1. 解析参数槽:Block(id) → 账房取设备指针;标量按类型化宽度入槽
+2. ensure_kernel(name, source) 懒编译(nvrtc → PTX → module)
+3. builder.arg(逐槽) + launch(cfg)
 ```
+
+**输出块由 eval 预先 alloc**(描述层职责;非 server 代分配),
+槽序契约:**输出块固定是最后一个 Block 参数**,server 按“最后一个 Block”
+回传句柄。`Bytes.len` 语义 = **元素数**(非字节;alloc/htod 均按元素登记)。
 
 ---
 
@@ -218,6 +221,10 @@ PTX → load_module → load_function。arch 显式钉(不钉 = INVALID_IMAGE)�
 | F. launch 参数不严格一致 | INVALID_VALUE | 裁决 3①:标量+裸指针 |
 | G. 同语句双锁(parking_lot) | 死锁 | 显式 drop 后再锁 |
 | H. htod 丢声明 shape | 后续 matmul 维度 OOB | htod 契约带 dtype+shape |
+| I. 标量参数全按 u64 推槽 | CUDA 参数空间错位读参(rmsnorm 出 garbage;Kernel 节点非法访问) | Arg/KernelArg 类型化(U64/I32/F32),与形参宽度严格对位 |
+| J. Bytes.len 当字节数再 ÷4 | n 缩水 4 倍(add/rmsnorm 只算首元素) | 定谐:len = 元素数,lower 层禁二次换算 |
+| K. Kernel 节点槽序与签名不一致 | n=4 被当指针解 → ILLEGAL_ADDRESS | 槽序契约:输出块固定最后;示例/文档双重标注 |
+| L. launch 结果写进新块(CPU 面) | eval 回传句柄读到预 alloc 零块 | CpuFace 写回 out 块原 id(与 GPU 语义一致) |
 
 ---
 
@@ -228,7 +235,8 @@ PTX → load_module → load_function。arch 显式钉(不钉 = INVALID_IMAGE)�
 | A0:加固补丁 | ✅ | event-tracking 关闭 + 双锁死锁修复 |
 | A1:server 骨架 | ✅ | actor + 五原语 + 状态机(_gpu_server.rs 全绿) |
 | A2:声明式 TensorOps | ✅ | 值语义 + 毒值 + 链式 API(playground 四 demo 全绿) |
-| A3:GPU 端到端 | ✅ | mlp_server 经 GPU server 真发射,对拍一致 |
+| A3:GPU 端到端 | ✅ | mlp_server 经 GPU server 真发射,对拍一致(2026-09-24 复验) |
+| A3.5:Op::Kernel(动作表二期) | ✅ | lower_kernel + eval Kernel 分支 + kernel_node 示例双路径全绿 |
 | A4:nn/engine 迁移 | ⏳ | owl-shared/nn/engine 旧消费面待迁(重写期已知破损) |
 | A5:memory-planner | 未立项 | liveness 着色 + 状态区(周级) |
 

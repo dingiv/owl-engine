@@ -4,7 +4,7 @@
 //! - **执行层资源错误**(池耗尽/令牌死亡/拷贝失败)→ 不经毒值,发生在
 //!   解释器/server,直接 `Err` 过线。
 
-use crate::dtype::Dtype;
+use crate::tensor::Dtype;
 
 /// 毒值载荷:案发坐标 + 细节。反向树可沿 parents 反演——错误现场永远可重放。
 #[derive(Debug, Clone)]

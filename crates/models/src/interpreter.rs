@@ -9,7 +9,7 @@
 //! walk 共用:自叶向根归约(递归;深度 = 链长,几百层内无忧)。
 //! 毒值在此落地:遇 Poisoned 节点 = 结构化报错(LazyError 归因)。
 
-use crate::dtype::Dtype;
+use crate::tensor::Dtype;
 use crate::error::ModelError;
 use crate::plan::Op;
 use crate::shape::{numel, Shape};
@@ -156,6 +156,13 @@ impl Default for CpuInterpreter {
     }
 }
 
+/// 调试门控:OWL_DEBUG=1 开启解释层发射日志
+fn dbg_on() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("OWL_DEBUG").is_some())
+}
+
 impl CpuInterpreter {
     pub fn new() -> Self {
         Self { blocks: std::collections::HashMap::new() }
@@ -183,7 +190,9 @@ impl Interpreter for CpuInterpreter {
         _dtype: Dtype,
         shape: &Shape,
     ) -> Result<Value, ModelError> {
-        eprintln!("[dbg mm] a.shape={:?} a.len={} b.shape={:?} b.len={} shape={:?}", a.shape, a.f32.len(), b.shape, b.f32.len(), shape);
+        if dbg_on() {
+            eprintln!("[dbg mm] a.shape={:?} a.len={} b.shape={:?} b.len={} shape={:?}", a.shape, a.f32.len(), b.shape, b.f32.len(), shape);
+        }
         // k = 内维 = a 的元素数 / m(行主序)
         let m_rows = a.shape[0].max(1);
         let k = a.f32.len() / m_rows;
@@ -248,7 +257,9 @@ impl Interpreter for CpuInterpreter {
 // §5 CpuFace:CPU 解释器适配为 GpuFace(与 GPU server 同一契约)
 // ============================================================================
 
-use crate::client::{Arg, Bytes as HandleBytes, DeviceClient, LaunchMsg};
+use crate::client::{
+    Arg, Bytes as HandleBytes, DeviceClient, GraphId, LaunchMsg,
+};
 use std::collections::HashMap;
 
 /// CPU 参考执行器(适配 GpuFace):与 GPU server 同一契约、同一管线,
@@ -272,7 +283,19 @@ impl CpuFace {
 }
 
 impl DeviceClient for CpuFace {
-    /// 显存分配(清零;CPU = Vec)
+    async fn graph_begin(&mut self) -> Result<(), ModelError> {
+        Err(ModelError::Msg("CpuFace: 图捕获仅 GPU server 支持".to_string()))
+    }
+
+    async fn graph_end(&mut self) -> Result<GraphId, ModelError> {
+        Err(ModelError::Msg("CpuFace: 图捕获仅 GPU server 支持".to_string()))
+    }
+
+    async fn graph_launch(&mut self, _graph: GraphId) -> Result<(), ModelError> {
+        Err(ModelError::Msg("CpuFace: 图重放仅 GPU server 支持".to_string()))
+    }
+
+    /// 显存分配(清零;CPU = Vec;流参数仅对齐契约,CPU 单线程即序)
     async fn alloc(&mut self, n_bytes: usize) -> Result<HandleBytes, ModelError> {
         let v = Value::zero(Dtype::F32, &vec![n_bytes / 4])?;
         let id = self.next;
@@ -321,7 +344,9 @@ impl DeviceClient for CpuFace {
     /// 发射:按 kernel 名路由到 CPU 参考实现(动作表的 CPU 面)
     async fn launch(&mut self, msg: LaunchMsg) -> Result<HandleBytes, ModelError> {
 
-        eprintln!("[dbg launch] {} args={:?}", msg.kernel.name, msg.args);
+        if dbg_on() {
+            eprintln!("[dbg launch] {} args={:?}", msg.kernel.name, msg.args);
+        }
         // 参数槽解析:Block → 值块;类型化标量
         let mut vals: Vec<Value> = Vec::with_capacity(msg.args.len());
         let mut u64s: Vec<u64> = Vec::new();

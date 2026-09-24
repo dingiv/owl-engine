@@ -1,9 +1,9 @@
 //! 双输入 layer 样例:具名多输入 forward + rt::Tensor 经 Block 叶子入声明图。
 
 use owl_models::device::Cpu;
-use owl_models::dtype::Dtype;
+use owl_models::tensor::Dtype;
 use owl_models::interpreter::{reduce, CpuInterpreter};
-use owl_models::rt::Tensor;
+use owl_models::tensor::Tensor;
 use owl_models::TensorOps;
 
 fn f32b(v: &[f32]) -> Vec<u8> {
