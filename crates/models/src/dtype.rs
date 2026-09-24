@@ -1,0 +1,21 @@
+//! 数据类型(S4 语义表的 dtype 维;起步面,按需扩)
+
+/// 数据类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dtype {
+    F32,
+    BF16,
+    F16,
+    U32,
+}
+
+impl Dtype {
+    /// 字节宽(server 的 Malloc 只认字节;宽是 client 侧换算用的)
+    pub fn size_bytes(self) -> usize {
+        match self {
+            Dtype::F32 => 4,
+            Dtype::BF16 | Dtype::F16 => 2,
+            Dtype::U32 => 4,
+        }
+    }
+}
