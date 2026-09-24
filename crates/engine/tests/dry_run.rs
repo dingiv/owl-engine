@@ -8,7 +8,6 @@ use owl_nn::cublas::NnBlas;
 use owl_engine::models::qwen3_5::InputMetadata;
 use owl_engine::models::qwen3_5::Qwen3_5ForCausalLM;
 use owl_engine::session::{InputSlot, OutputSlot, Session};
-use owl_iface::{Device as _, PoolConfig, PoolKind};
 use std::sync::Arc;
 
 fn tiny_config() -> Config {
@@ -61,22 +60,8 @@ fn session_fake_weights_plan_step_discriminants() {
     let hd = config.head_dim.unwrap();
 
     // 池:S6 激活 scratch + P 阶段权重(ctx_scope 桥 + from_fake 装载共用)
-    let scratch = Arc::new(
-        dev.create_pool(PoolConfig {
-            name: format!("sess-scratch-{}", std::process::id()),
-            kind: PoolKind::Scratch,
-            bytes: 64 << 20,
-        })
-        .unwrap(),
-    );
-    let wpool = Arc::new(
-        dev.create_pool(PoolConfig {
-            name: format!("sess-weights-{}", std::process::id()),
-            kind: PoolKind::Weights,
-            bytes: 256 << 20,
-        })
-        .unwrap(),
-    );
+    let scratch = dev.default_pool();
+    let wpool = dev.default_pool();
 
     // ctx_scope 桥安装(层 candle 形态签名 → TLS ctx 消费)
     let ops = owl_nn::OpsCtx::new(&dev).unwrap();

@@ -2031,17 +2031,10 @@ mod varbuilder_tests {
     /// 设备模式:with_pool 注入 → get → DynTensor(F32)→ D2H 对拍
     #[test]
     fn device_get_roundtrip() {
-        use owl_iface::Device as _;
+        
         let dev = owl_cuda::CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA");
         let p = write_synthetic_gguf();
-        let pool = std::sync::Arc::new(
-            dev.create_pool(owl_iface::PoolConfig {
-                name: format!("vb-test-{}", std::process::id()),
-                kind: owl_iface::PoolKind::Weights,
-                bytes: 1 << 20,
-            })
-            .unwrap(),
-        );
+        let pool = dev.default_pool();
         let vb = VarBuilderX::from_gguf_file_host(&p)
             .unwrap()
             .with_pool(pool);
@@ -2149,17 +2142,10 @@ mod varbuilder_tests {
     #[test]
     fn safetensors_device_channel_loads() {
         let Some(vb_host) = st_host_vb() else { return };
-        use owl_iface::Device as _;
+        
         let dev =
             owl_cuda::CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
-        let pool = std::sync::Arc::new(
-            dev.create_pool(owl_iface::PoolConfig {
-                name: format!("vb-st-test-{}", std::process::id()),
-                kind: owl_iface::PoolKind::Weights,
-                bytes: 64 << 20,
-            })
-            .unwrap(),
-        );
+        let pool = dev.default_pool();
         let paths = vec![std::path::PathBuf::from(ST_MODEL)];
         let vb = VarBuilderX::new(
             &crate::downloader::ModelPaths {

@@ -272,20 +272,14 @@ impl WeightAllocator for HostWeightAllocator {
 mod tests {
     use super::*;
     use owl_cuda::test_device_ordinal;
-    use owl_iface::{Device, PoolConfig, PoolKind};
+    
 
     /// R3:F16/BF16 臂真机往返(f16/bf16 精确可表示值,位型应无损)
     #[test]
     fn materialize_dyn_f16_bf16_roundtrip() {
         let dev = owl_cuda::CudaDevice::new(test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
-        let pool = dev
-            .create_pool(PoolConfig {
-                name: format!("alloc-dyn-t-{}", std::process::id()),
-                kind: PoolKind::Weights,
-                bytes: 1 << 20,
-            })
-            .unwrap();
-        let alloc = DeviceWeightAllocator::new(std::sync::Arc::new(pool));
+        let pool = dev.default_pool();
+        let alloc = DeviceWeightAllocator::new(pool);
 
         // 全部为 F16/BF16 精确可表示值 → 位型往返应零误差
         let f32s = vec![1.0f32, -2.0, 3.5, 0.25];

@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use owl_cuda::{CudaDevice, CudaPool};
-use owl_iface::{Device as _, Pool as _, PoolConfig, PoolKind};
+use owl_iface::{Pool as _, PoolConfig, PoolKind};
 
 /// 设备 + 池的进程级单例(测试内直接 `Rig::acquire()`)。
 pub struct Rig {
@@ -31,20 +31,23 @@ impl Rig {
     pub fn acquire_sized(pool_bytes: usize) -> Arc<Rig> {
         RIG
             .get_or_init(|| {
-                let dev =
-                    Arc::new(CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备"));
-                dev.ctx().bind_to_thread().expect("bind_to_thread");
-                let pool = Arc::new(
-                    dev.create_pool(PoolConfig {
-                        name: format!("testkit-{}", std::process::id()),
-                        kind: PoolKind::Weights,
-                        bytes: pool_bytes as u64,
-                    })
-                    .expect("testkit 池创建"),
+                let dev = Arc::new(
+                    // 池随设备出生:测试池在构造时声明(容量 = 调用方指定)
+                    CudaDevice::with_pools(
+                        owl_cuda::test_device_ordinal(),
+                        owl_cuda::TEST_POOL_BYTES,
+                        &[PoolConfig {
+                            name: format!("testkit-{}", std::process::id()),
+                            kind: PoolKind::Weights,
+                            bytes: pool_bytes as u64,
+                        }],
+                    )
+                    .expect("需要 CUDA 设备"),
                 );
+                dev.ctx().bind_to_thread().expect("bind_to_thread");
                 Arc::new(Rig {
+                    pool: std::sync::Arc::new(dev.pool_by_name(&format!("testkit-{}", std::process::id())).expect("出生池必有")),
                     dev,
-                    pool,
                     pool_bytes,
                 })
             })
@@ -73,12 +76,14 @@ impl Rig {
         self.htod(v.to_vec())
     }
 
-    /// H2D(通用;T: MemValue)。
+    /// H2D(通用;T: MemValue)。字节面分配 + 一次 H2D(池去类型裁决)。
     pub fn htod<T: owl_iface::MemValue>(&self, v: Vec<T>) -> DevBuf {
         let n = v.len();
-        let buf = self.pool.htod_persistent_in(v).expect("testkit htod");
+        let bytes = n * std::mem::size_of::<T>();
+        let host = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, bytes) };
+        let buf = self.pool.htod(host).expect("testkit htod");
         DevBuf {
-            inner: Box::new(DevBufT { buf }),
+            inner: Box::new(DevBufT::<T> { buf, _marker: std::marker::PhantomData }),
             n,
             shape: vec![n],
         }
@@ -151,12 +156,13 @@ trait DevBufErased: Send {
 }
 
 struct DevBufT<T: owl_iface::MemValue> {
-    buf: owl_cuda::Persistent<T>,
+    buf: <owl_cuda::CudaDevice as owl_iface::Device>::Bytes,
+    _marker: std::marker::PhantomData<fn() -> T>,
 }
 
 impl<T: owl_iface::MemValue> DevBufErased for DevBufT<T> {
     fn ptr_u8(&self) -> *mut u8 {
-        owl_iface::DevBuf::<T>::device_ptr(&self.buf) as *mut u8
+        owl_iface::DevBuf::<u8>::device_ptr(&self.buf)
     }
 }
 

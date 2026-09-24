@@ -431,22 +431,16 @@ impl GdnKernels {
 mod tests {
     use super::GdnKernels;
     use owl_cuda::CudaDevice;
-    use owl_iface::{Device as _, Pool as _, PoolConfig, PoolKind};
+    use owl_iface::Pool as _;
 
     fn setup() -> (
         CudaDevice,
         GdnKernels,
-        owl_cuda::CudaPool,
+        std::sync::Arc<owl_cuda::CudaPool>,
     ) {
         let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
         let k = GdnKernels::new(dev.ctx()).expect("nvrtc gdn");
-        let pool = dev
-            .create_pool(PoolConfig {
-                name: format!("gdn-t-{}", std::process::id()),
-                kind: PoolKind::Weights,
-                bytes: 16 << 20,
-            })
-            .unwrap();
+        let pool = dev.default_pool();
         (dev, k, pool)
     }
 
@@ -454,9 +448,11 @@ mod tests {
         _dev: &CudaDevice,
         pool: &owl_cuda::CudaPool,
         v: Vec<T>,
-    ) -> owl_cuda::Persistent<T> {
+    ) -> <owl_cuda::CudaDevice as owl_iface::Device>::Bytes {
         // 返回持有缓冲(活性随行;裸指针版会即刻回收 → 悬空)
-        pool.htod_persistent_in(v).unwrap()
+        let n = v.len() * std::mem::size_of::<T>();
+        let host = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, n) };
+        pool.htod(host).unwrap()
     }
 
     fn dtoh_f32(dev: &CudaDevice, ptr: *const f32, n: usize) -> Vec<f32> {

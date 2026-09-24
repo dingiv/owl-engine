@@ -7,14 +7,13 @@ use owl_engine::models::dry_kernels::DryKernels;
 use owl_engine::models::layers::distributed::{Comm, TensorParallelRowLinear};
 use owl_engine::models::layers::{ctx_scope, VarBuilderX};
 use owl_nn::cublas::NnBlas;
-use owl_iface::{Device as _, PoolConfig, PoolKind};
 use std::sync::Arc;
 
 #[test]
 fn outproj_rowlinear_numerics() {
     let dev = Arc::new(CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).unwrap());
-    let scratch = Arc::new(dev.create_pool(PoolConfig { name: format!("op-s-{}", std::process::id()), kind: PoolKind::Scratch, bytes: 64 << 20 }).unwrap());
-    let wpool = Arc::new(dev.create_pool(PoolConfig { name: format!("op-w-{}", std::process::id()), kind: PoolKind::Weights, bytes: 256 << 20 }).unwrap());
+    let scratch = dev.default_pool();
+    let wpool = dev.default_pool();
     let ops = owl_nn::OpsCtx::new(&dev).unwrap();
     let blas = NnBlas::new(&dev).unwrap();
     let dry = DryKernels::new(dev.ctx()).unwrap();

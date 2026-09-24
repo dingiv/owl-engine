@@ -125,17 +125,11 @@ impl OpsCtx {
         scratch_bytes: u64,
     ) -> Result<Self, BackendError> {
         let kernels = Kernels::new(device.ctx()).map_err(BackendError::Init)?;
-        use owl_iface::Device as _;
+        
+        // 池随设备出生(2026-09-24 裁决):scratch 复用默认池
+        // (容量闸由设备级 A5 预算承担;scratch_bytes 仅作非零哨兵)
         let scratch = if scratch_bytes > 0 {
-            Some(std::sync::Arc::new(
-                device
-                    .create_pool(owl_iface::PoolConfig {
-                        name: "ctx-scratch".into(),
-                        kind: owl_iface::PoolKind::Scratch,
-                        bytes: scratch_bytes,
-                    })
-                    .map_err(|e| BackendError::Init(format!("scratch pool: {e:?}")))?,
-            ))
+            Some(device.default_pool())
         } else {
             None
         };
@@ -394,7 +388,7 @@ mod tests {
     use crate::cublas::NnBlas;
     use crate::tensor::TensorPoolOps;
     use owl_cuda::CudaDevice;
-    use owl_iface::{Device, PoolConfig, PoolKind};
+    
 
     /// 确定性伪随机([-1,1)),与 T2 测试同款(无 rand 依赖)
     struct Lcg(u32);
@@ -460,13 +454,7 @@ mod tests {
         let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
 
         // ---- P 阶段:池 + 全部缓冲(含 chain 中间量)一次性到位 ----
-        let pool = dev
-            .create_pool(PoolConfig {
-                name: format!("t3-chain-{}", std::process::id()),
-                kind: PoolKind::Weights,
-                bytes: 16 << 20,
-            })
-            .unwrap();
+        let pool = dev.default_pool();
         let blas = NnBlas::new(&dev).unwrap();
         let mut ops = OpsCtx::new(&dev).unwrap();
 
@@ -528,13 +516,7 @@ mod tests {
     #[test]
     fn pool_exhaustion_surfaces_at_planning_phase() {
         let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
-        let pool = dev
-            .create_pool(PoolConfig {
-                name: format!("t3-exhaust-{}", std::process::id()),
-                kind: PoolKind::Weights,
-                bytes: 4096,
-            })
-            .unwrap();
+        let pool = dev.default_pool();
         
         let r = pool.zeros_tensor::<f32>(&[4096]); // 16KiB > 4KiB(池容量)
         assert!(matches!(r, Err(BackendError::PoolExhausted { .. })));
@@ -552,13 +534,7 @@ mod tests {
         let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
         let mut ops = OpsCtx::new(&dev).unwrap();
         let blas = NnBlas::new(&dev).unwrap();
-        let pool = dev
-            .create_pool(PoolConfig {
-                name: "cap".into(),
-                kind: PoolKind::Weights,
-                bytes: 4 << 20,
-            })
-            .unwrap();
+        let pool = dev.default_pool();
 
         let w = pool.zeros_tensor::<f32>(&[M, K]).unwrap();
         let a = pool.zeros_tensor::<f32>(&[K, N]).unwrap();
@@ -593,13 +569,7 @@ mod tests {
     #[test]
     fn dropped_tensor_token_invalidated() {
         let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
-        let pool = dev
-            .create_pool(PoolConfig {
-                name: "tok".into(),
-                kind: PoolKind::Weights,
-                bytes: 64 << 10,
-            })
-            .unwrap();
+        let pool = dev.default_pool();
         let t = pool.zeros_tensor::<f32>(&[16]).unwrap();
         let token = t.token().unwrap();
         assert!(dev.validate_token(&token));
@@ -620,13 +590,7 @@ mod tests {
         let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
         let mut ops = OpsCtx::new(&dev).unwrap();
         let blas = NnBlas::new(&dev).unwrap();
-        let pool = dev
-            .create_pool(PoolConfig {
-                name: "capchain".into(),
-                kind: PoolKind::Weights,
-                bytes: 4 << 20,
-            })
-            .unwrap();
+        let pool = dev.default_pool();
 
         let w = pool.zeros_tensor::<f32>(&[M, K]).unwrap();
         let a = pool.zeros_tensor::<f32>(&[K, N]).unwrap();

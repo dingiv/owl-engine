@@ -29,7 +29,6 @@ use crate::kvcache::{
 use crate::transfer::PdRole;
 use owl_cuda::CudaDevice;
 use owl_nn::{DynTensor, Dtype, TensorPoolOps};
-use owl_iface::Device as _DeviceTrait;
 use std::fmt;
 
 /// 保留内存常量——分配后警告用
@@ -49,54 +48,33 @@ pub(crate) fn hybrid_mamba_graph_capture_max_batch(max_num_seqs: usize) -> usize
 
 /// 池直连分配:按 dtype 六型分派到 owl 池工厂,擦除为 DynTensor。
 ///
-/// 每块 KV 缓冲独占一个 Weights 池(池 = 显存承诺,裁决 5);池对象
-/// 随张量存活(Arc keepalive),drop 链与 GraphLease 语义一致。
+/// 2026-09-24 池随设备出生裁决:KV 缓冲走设备默认池(容量闸由设备级
+/// A5 预算承担);块租约语义不变。
 fn alloc_gpu_buffer(device: &CudaDevice, shape: &[usize], dtype: Dtype) -> Result<DynTensor<CudaDevice>> {
-    let n: usize = shape.iter().product();
-    let bytes = (n * dtype.size_bytes()) as u64;
+    let _n: usize = shape.iter().product();
     match dtype {
         Dtype::F32 => {
-            let pool = device.create_pool(owl_iface::PoolConfig {
-                name: "kv-cache".into(),
-                kind: owl_iface::PoolKind::Weights,
-                bytes,
-            })?;
+            let pool = device.default_pool();
             let t = pool.zeros_tensor::<f32>(shape)?;
             Ok(DynTensor::from_f32(&t))
         }
         Dtype::F16 => {
-            let pool = device.create_pool(owl_iface::PoolConfig {
-                name: "kv-cache".into(),
-                kind: owl_iface::PoolKind::Weights,
-                bytes,
-            })?;
+            let pool = device.default_pool();
             let t = pool.zeros_tensor::<owl_nn::F16>(shape)?;
             Ok(DynTensor::from_f16(&t))
         }
         Dtype::BF16 => {
-            let pool = device.create_pool(owl_iface::PoolConfig {
-                name: "kv-cache".into(),
-                kind: owl_iface::PoolKind::Weights,
-                bytes,
-            })?;
+            let pool = device.default_pool();
             let t = pool.zeros_tensor::<owl_nn::Bf16>(shape)?;
             Ok(DynTensor::from_bf16(&t))
         }
         Dtype::U8 => {
-            let pool = device.create_pool(owl_iface::PoolConfig {
-                name: "kv-cache".into(),
-                kind: owl_iface::PoolKind::Weights,
-                bytes,
-            })?;
+            let pool = device.default_pool();
             let t = pool.zeros_tensor::<u8>(shape)?;
             Ok(DynTensor::from_u8(&t))
         }
         Dtype::U32 => {
-            let pool = device.create_pool(owl_iface::PoolConfig {
-                name: "kv-cache".into(),
-                kind: owl_iface::PoolKind::Weights,
-                bytes,
-            })?;
+            let pool = device.default_pool();
             let t = pool.zeros_tensor::<u32>(shape)?;
             Ok(DynTensor::from_u32(&t))
         }

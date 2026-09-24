@@ -52,8 +52,8 @@ mod tests {
         let _g = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let r = crate::run_with_cuda(super::TEST_POOL_BYTES, |dev| {
             let pool = dev.default_pool();
-            let buf = pool.alloc_persistent_in::<u32>(16).expect("alloc");
-            DevBuf::<u32>::len(&buf)
+            let buf = pool.malloc(64).expect("alloc");
+            DevBuf::<u8>::len(&buf) / 4
         })
         .expect("run_with_cuda");
         assert_eq!(r, 16);

@@ -13,10 +13,9 @@
 use super::audit::{audit_graph, AuditReport};
 use super::governor::Governor;
 use super::pool::{CudaPoolBuf, PoolBufInner};
-use crate::buffers::{Persistent, Scratch};
 use crate::ffi::{sys, graph_destroy, graph_exec_destroy, graph_instantiate, graph_launch, stream_end_capture};
 use cudarc::driver::CudaStream;
-use owl_iface::{BackendError, BufToken, MemPhase, MemValue};
+use owl_iface::{BackendError, BufToken, MemPhase};
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
@@ -39,12 +38,8 @@ impl CaptureSession {
     /// 手工登记依赖缓冲(自动租约的逃生口:非 ops 触碰的缓冲,如
     /// 仅被原始 FFI 引用的 VMM 缓冲)。Arc 克隆入 keepalive(强租约,
     /// 用户侧句柄先 drop 也不回收)。
-    pub fn lease<T: MemValue>(&mut self, t: &Persistent<T>) {
-        let (buf, token) = t.lease_parts();
-        self.lease_buf_parts(buf, token);
-    }
-
-    /// 块租约入口(合并 Tensor 的保活形态;哨兵①语义同 lease)
+    /// 块租约入口(字节面唯一手工租约通道;哨兵①:原始 FFI 引用的
+    /// pre-window 池块用,哨兵③对账需要它在租约表)
     pub fn lease_block(&mut self, b: &CudaPoolBuf) {
         self.lease_buf_parts(b.clone(), Some(b.token()));
     }
@@ -56,20 +51,6 @@ impl CaptureSession {
             }
         }
         // 从带 Drop 的类型不能移动字段：克隆 Arc 后弃外壳
-        let inner = buf.inner.clone();
-        drop(buf);
-        self.keepalive.push(inner);
-    }
-
-    /// 手工登记暂存域依赖缓冲(与 [`CaptureSession::lease`] 对称；原始 FFI
-    /// 引用的 pre-window scratch 块用，哨兵③对账需要它在租约表)
-    pub fn lease_scratch<T: MemValue>(&mut self, t: &Scratch<T>) {
-        let (buf, token) = t.lease_parts();
-        if let Some(tok) = token {
-            if !self.leases.iter().any(|l| l.id == tok.id) {
-                self.leases.push(tok);
-            }
-        }
         let inner = buf.inner.clone();
         drop(buf);
         self.keepalive.push(inner);

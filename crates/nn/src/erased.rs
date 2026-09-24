@@ -248,19 +248,13 @@ mod tests {
     use crate::dtype::Bf16;
     use crate::TensorPoolOps;
     use owl_cuda::test_device_ordinal;
-    use owl_iface::{Device, PoolConfig, PoolKind};
+    
 
-    fn setup() -> (OpsCtx, KernelCtx, CudaDevice, owl_cuda::CudaPool) {
+    fn setup() -> (OpsCtx, KernelCtx, CudaDevice, std::sync::Arc<owl_cuda::CudaPool>) {
         let dev = CudaDevice::new(test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
         let ops = OpsCtx::new_with_scratch(&dev, 1 << 20).unwrap();
         let ctx = ops.ctx(owl_iface::MemPhase::Live);
-        let pool = dev
-            .create_pool(PoolConfig {
-                name: format!("erased-t-{}", std::process::id()),
-                kind: PoolKind::Weights,
-                bytes: 16 << 20,
-            })
-            .unwrap();
+        let pool = dev.default_pool();
         (ops, ctx, dev, pool)
     }
 
@@ -942,19 +936,13 @@ mod p1_r2_tests {
     use super::*;
     use crate::TensorPoolOps;
     use owl_cuda::test_device_ordinal;
-    use owl_iface::{Device, PoolConfig, PoolKind};
+    
 
-    fn setup() -> (OpsCtx, KernelCtx, CudaDevice, owl_cuda::CudaPool) {
+    fn setup() -> (OpsCtx, KernelCtx, CudaDevice, std::sync::Arc<owl_cuda::CudaPool>) {
         let dev = CudaDevice::new(test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
         let ops = OpsCtx::new_with_scratch(&dev, 1 << 20).unwrap();
         let ctx = ops.ctx(owl_iface::MemPhase::Live);
-        let pool = dev
-            .create_pool(PoolConfig {
-                name: format!("p1-r2-t-{}", std::process::id()),
-                kind: PoolKind::Weights,
-                bytes: 8 << 20,
-            })
-            .unwrap();
+        let pool = dev.default_pool();
         (ops, ctx, dev, pool)
     }
 

@@ -1521,24 +1521,10 @@ mod tests {
     fn rig() -> (Dev, Arc<Pool>, Arc<Pool>) {
         static R: std::sync::OnceLock<(Dev, Arc<Pool>, Arc<Pool>)> = std::sync::OnceLock::new();
         R.get_or_init(|| {
-            use owl_iface::{Device as _, PoolConfig, PoolKind};
+            
             let dev = Dev::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
-            let scratch = Arc::new(
-                dev.create_pool(PoolConfig {
-                    name: format!("gdn-e2e-scratch-{}", std::process::id()),
-                    kind: PoolKind::Scratch,
-                    bytes: 64 << 20,
-                })
-                .unwrap(),
-            );
-            let wpool = Arc::new(
-                dev.create_pool(PoolConfig {
-                    name: format!("gdn-e2e-weights-{}", std::process::id()),
-                    kind: PoolKind::Weights,
-                    bytes: 128 << 20,
-                })
-                .unwrap(),
-            );
+            let scratch = dev.default_pool();
+            let wpool = dev.default_pool();
             let ops = owl_nn::OpsCtx::new(&dev).unwrap();
             let blas = NnBlas::new(&dev).unwrap();
             let dry = DryKernels::new(dev.ctx()).unwrap();

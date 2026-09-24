@@ -6,132 +6,25 @@ use crate::device::CudaDevice;
 use cudarc::driver::sys;
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use owl_iface::{
-    BackendError, BufToken, DevBuf, MemPhase, OpaqueDevBuf, Pool, PoolBuf,
+    BackendError, BufToken, DevBuf, MemPhase, OpaqueDevBuf, Pool,
     PoolId, PoolKind, PoolUsage,
 };
 use parking_lot::Mutex;
 use std::sync::Arc;
 
-/// 池内账本(2026-09-23 用户裁决:内存记账归池，Device 不持账本对象)。
-/// 记账三件套:字节存活账 + 池容量账 + A5 预算。相位机/BufToken 台账
-/// 不在此(仍归 Device 侧 Governor)。
-/// 2026-09-24:四项字节账收进单一 Mutex(快照不可撕裂、入/归账原子；
-/// 旧五锁形态 usage() 可读到 used/alive 分属不同时刻)。
-pub(crate) struct Ledger {
-    /// A5.3 driver 侧对账用(池构造时注入)
-    pub(crate) ctx: Option<Arc<CudaContext>>,
-    /// 池容量上限(bytes)
-    pub(crate) capacity: u64,
-    /// 字节账单锁四联(used/peak/alive/allocated_total)
-    state: parking_lot::Mutex<LedgerState>,
-    /// A5.1 预算(None = 未设;设置后每次分配断言不超)
-    pub(crate) budget: Mutex<Option<Budget>>,
-}
-
+/// 池字节账(单锁四联:快照不可撕裂、入/归账原子;2026-09-24 用户裁决:
+/// Ledger 结构体删除,账本直接作为 CudaPool 字段——记账本来就是池自己的事,
+/// 不该在旁边再立一个对象)
 #[derive(Default)]
-pub(crate) struct LedgerState {
+pub(crate) struct PoolAccount {
     /// 池内在用字节
-    pub(crate) used: u64,
+    used: u64,
     /// 峰值(诊断)
-    pub(crate) peak: u64,
+    peak: u64,
     /// A5.2 存活字节(本池)
-    pub(crate) bytes_alive: u64,
+    bytes_alive: u64,
     /// A5.2 累计分配字节(本池)
-    pub(crate) bytes_allocated_total: u64,
-}
-
-impl Ledger {
-    /// 建账(device.rs 构造池时用)
-    pub(crate) fn new(
-        ctx: Option<Arc<CudaContext>>,
-        capacity: u64,
-        budget: Option<Budget>,
-    ) -> Self {
-        Self {
-            ctx,
-            capacity,
-            state: parking_lot::Mutex::new(LedgerState::default()),
-            budget: Mutex::new(budget),
-        }
-    }
-}
-
-impl Ledger {
-    /// 统一入账:预算闸(A5.4)→ 容量闸(池耗尽)→ 记账。
-    /// 校验先行，失败不触账(调用方失败路径无需回滚——2026-09-22
-    /// 双重扣减下溢判例)。入/归账在单一 state 锁内原子完成。
-    /// A5.3 driver 对账降频:仅在逼近预算(剩余 <10%)时探
-    /// mem_get_info——旧行为每次分配都同步驱动调用，热路径不可持续。
-    pub(crate) fn charge(&self, pool_name: &str, bytes: u64) -> Result<(), BackendError> {
-        if let Some(b) = *self.budget.lock() {
-            let alive = self.state.lock().bytes_alive;
-            if alive + bytes > b.bytes {
-                return Err(BackendError::LawViolation(
-                    "A5.4 显存超支(引擎账本超预算,详见账本快照日志)",
-                ));
-            }
-            // A5.3 第三道闸(降频):逼近预算才 driver 对账
-            if alive + bytes >= b.bytes - b.bytes / 10 {
-                if let Some(ctx) = &self.ctx {
-                    if let Ok((free, _total)) = ctx.mem_get_info() {
-                        if (free as u64) < b.reserve_floor {
-                            eprintln!(
-                                "[owl-mem] WARN: free {free}B < reserve_floor {}B(A5 警线,账本 alive={alive})",
-                                b.reserve_floor,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        let mut st = self.state.lock();
-        let available = self.capacity - st.used;
-        if bytes > available {
-            return Err(BackendError::PoolExhausted {
-                pool: pool_name.to_string(),
-                needed: bytes,
-                available,
-                capacity: self.capacity,
-            });
-        }
-        st.used += bytes;
-        st.peak = st.peak.max(st.used);
-        st.bytes_alive += bytes;
-        st.bytes_allocated_total += bytes;
-        Ok(())
-    }
-
-    /// 归账(单锁原子;下溢饱和 + 告警)
-    pub(crate) fn uncharge(&self, bytes: u64) {
-        let mut st = self.state.lock();
-        if st.bytes_alive < bytes {
-            eprintln!(
-                "[owl-mem][BUG] uncharge underflow: alive={} bytes={bytes}",
-                st.bytes_alive,
-            );
-        }
-        st.bytes_alive = st.bytes_alive.saturating_sub(bytes);
-        st.used = st.used.saturating_sub(bytes);
-    }
-
-    pub(crate) fn set_budget(&self, budget: Budget) {
-        *self.budget.lock() = Some(budget);
-    }
-
-    /// 原子快照(单锁;跨项无撕裂)
-    pub(crate) fn alive_and_total(&self) -> (u64, u64) {
-        let st = self.state.lock();
-        (st.bytes_alive, st.bytes_allocated_total)
-    }
-
-    pub(crate) fn usage(&self) -> PoolUsage {
-        let st = self.state.lock();
-        PoolUsage {
-            capacity: self.capacity,
-            used: st.used,
-            peak: st.peak,
-        }
-    }
+    bytes_allocated_total: u64,
 }
 
 /// 显存池:**分配者**。持有 driver 原语句柄,按 PoolKind 路由物理路径。
@@ -143,8 +36,12 @@ pub struct CudaPool {
     pub(crate) ctx: Arc<CudaContext>,
     pub(crate) stream: Arc<CudaStream>,
     pub(crate) gov: Arc<Governor>,
-    /// 本池账本(字节账 + 容量账 + 预算;2026-09-23 裁决)
-    pub(crate) ledger: Arc<Ledger>,
+    /// 池容量上限(bytes)
+    pub(crate) capacity: u64,
+    /// 本池字节账(单锁四联:used/peak/alive/allocated_total)
+    pub(crate) account: Arc<Mutex<PoolAccount>>,
+    /// A5.1 预算(None = 未设;设置后每次分配断言不超)
+    pub(crate) budget: Arc<Mutex<Option<Budget>>>,
     pub(crate) dev: CudaDevice,
 }
 
@@ -165,43 +62,26 @@ impl Pool for CudaPool {
         self.kind
     }
     fn capacity(&self) -> u64 {
-        self.ledger.capacity
+        self.capacity
     }
     fn usage(&self) -> PoolUsage {
-        self.ledger.usage()
+        let st = self.account.lock();
+        PoolUsage {
+            capacity: self.capacity,
+            used: st.used,
+            peak: st.peak,
+        }
     }
 
-    fn malloc_scratch(&self, bytes: u64) -> Result<PoolBuf, BackendError> {
-        self.kind_check_any(&[PoolKind::Scratch, PoolKind::General])?;
-        Ok(PoolBuf::wrap(Box::new(self.malloc_scratch_buf(bytes)?)))
-    }
-
-    fn malloc_persistent(&self, bytes: u64) -> Result<PoolBuf, BackendError> {
-        self.kind_check_any(&[
-            PoolKind::Weights,
-            PoolKind::KvCache,
-            PoolKind::Workspace,
-            PoolKind::General,
-        ])?;
-        Ok(PoolBuf::wrap(Box::new(self.malloc_inner(bytes)?)))
-    }
-
-    fn malloc_peer_shared(&self, bytes: u64) -> Result<PoolBuf, BackendError> {
-        self.kind_check(PoolKind::PeerShared)?;
-        Ok(PoolBuf::wrap(Box::new(self.malloc_inner(bytes)?)))
-    }
-
-    // ---- 字节域第一公民(iface 字节化面;泛型方法由默认转发承载)----
-
-    fn alloc_bytes_persistent(&self, n_bytes: usize) -> Result<CudaPoolBuf, BackendError> {
-        let buf = self.malloc_persistent_buf(n_bytes as u64)?;
-        self.gov.stats.lock().persistent_allocs += 1;
+    fn malloc(&self, bytes: u64) -> Result<CudaPoolBuf, BackendError> {
+        let buf = self.malloc_inner(bytes)?;
+        self.gov.stats.lock().scratch_allocs += 1;
         Ok(buf)
     }
 
-    fn htod_bytes_persistent(&self, src: &[u8]) -> Result<CudaPoolBuf, BackendError> {
+    fn htod(&self, src: &[u8]) -> Result<CudaPoolBuf, BackendError> {
         let bytes = src.len();
-        let buf = self.malloc_persistent_buf(bytes as u64)?;
+        let buf = self.malloc_inner(bytes as u64)?;
         self.ctx.bind_to_thread().map_err(|e| BackendError::Init(format!("{e:?}")))?;
         // P0-3 口径:H2D 必须走池流(async + sync),NULL 流与主流无序
         // (审计同族案:cu_seqlens 清零/cat 脏数据)
@@ -224,24 +104,13 @@ impl Pool for CudaPool {
         Ok(buf)
     }
 
-    fn alloc_bytes_scratch(&self, n_bytes: usize) -> Result<CudaPoolBuf, BackendError> {
-        let buf = self.malloc_scratch_buf(n_bytes as u64)?;
-        self.gov.stats.lock().scratch_allocs += 1;
-        Ok(buf)
+    fn malloc_peer_shared(&self, bytes: u64) -> Result<CudaPoolBuf, BackendError> {
+        self.kind_check(PoolKind::PeerShared)?;
+        Ok(self.malloc_inner(bytes)?)
     }
 }
 
 impl CudaPool {
-    fn kind_check_any(&self, kinds: &[PoolKind]) -> Result<(), BackendError> {
-        if kinds.contains(&self.kind) {
-            Ok(())
-        } else {
-            Err(BackendError::LawViolation(
-                "分配语义与池类型不匹配(语义错配是架构错误)",
-            ))
-        }
-    }
-
     fn kind_check(&self, expect: PoolKind) -> Result<(), BackendError> {
         if self.kind != expect {
             return Err(BackendError::LawViolation(
@@ -251,31 +120,73 @@ impl CudaPool {
         Ok(())
     }
 
-    /// 归还本池账本(2026-09-23 裁决:账本归池)
+    // ---- 池字节账(原独立 Ledger 结构体,2026-09-24 用户裁决内联) ----
+
+    /// 统一入账:预算闸(A5.4)→ 容量闸(池耗尽)→ 记账。
+    /// 校验先行,失败不触账(调用方失败路径无需回滚——2026-09-22
+    /// 双重扣减下溢判例)。入/归账在单一 account 锁内原子完成。
+    /// A5.3 driver 对账降频:仅逼近预算(剩余 <10%)时探 mem_get_info。
+    pub(crate) fn charge(&self, bytes: u64) -> Result<(), BackendError> {
+        if let Some(b) = *self.budget.lock() {
+            let alive = self.account.lock().bytes_alive;
+            if alive + bytes > b.bytes {
+                return Err(BackendError::LawViolation(
+                    "A5.4 显存超支(引擎账本超预算,详见账本快照日志)",
+                ));
+            }
+            if alive + bytes >= b.bytes - b.bytes / 10 {
+                if let Ok((free, _total)) = self.ctx.mem_get_info() {
+                    if (free as u64) < b.reserve_floor {
+                        eprintln!(
+                            "[owl-mem] WARN: free {free}B < reserve_floor {}B(A5 警线,账本 alive={alive})",
+                            b.reserve_floor,
+                        );
+                    }
+                }
+            }
+        }
+        let mut st = self.account.lock();
+        let available = self.capacity - st.used;
+        if bytes > available {
+            return Err(BackendError::PoolExhausted {
+                pool: self.name.clone(),
+                needed: bytes,
+                available,
+                capacity: self.capacity,
+            });
+        }
+        st.used += bytes;
+        st.peak = st.peak.max(st.used);
+        st.bytes_alive += bytes;
+        st.bytes_allocated_total += bytes;
+        Ok(())
+    }
+
+    /// 归账(单锁原子;下溢饱和 + 告警)
     pub(crate) fn uncharge(&self, bytes: u64) {
-        self.ledger.uncharge(bytes);
+        let mut st = self.account.lock();
+        if st.bytes_alive < bytes {
+            eprintln!(
+                "[owl-mem][BUG] uncharge underflow: alive={} bytes={bytes}",
+                st.bytes_alive,
+            );
+        }
+        st.bytes_alive = st.bytes_alive.saturating_sub(bytes);
+        st.used = st.used.saturating_sub(bytes);
     }
 
-    /// 内部:持久域具体分配(语义校验 + Arc 租约缓冲)
-    pub(crate) fn malloc_persistent_buf(&self, bytes: u64) -> Result<CudaPoolBuf, BackendError> {
-        self.kind_check_any(&[
-            PoolKind::Weights,
-            PoolKind::KvCache,
-            PoolKind::Workspace,
-            PoolKind::General,
-        ])?;
-        self.malloc_inner(bytes)
+    pub(crate) fn set_budget(&self, budget: Budget) {
+        *self.budget.lock() = Some(budget);
     }
 
-    /// 内部:暂存域具体分配
-    pub(crate) fn malloc_scratch_buf(&self, bytes: u64) -> Result<CudaPoolBuf, BackendError> {
-        self.kind_check_any(&[PoolKind::Scratch, PoolKind::General])?;
-        self.malloc_inner(bytes)
+    /// 原子快照(单锁;跨项无撕裂)
+    pub(crate) fn alive_and_total(&self) -> (u64, u64) {
+        let st = self.account.lock();
+        (st.bytes_alive, st.bytes_allocated_total)
     }
 
-    /// 内部统一分配路径:校验链(kind 可选)→ 池账 → 全局账 → 物理 →
-    /// 签发租约型 CudaPoolBuf(Arc;Clone 即租约)。Persistent/Scratch/
-    /// CaptureSession 全部经由这里。
+    /// 内部统一分配路径:池账 → 全局预算 → 物理(按 kind 路由)→
+    /// 签发租约型 CudaPoolBuf(Arc;Clone 即租约)。字节面唯一入口。
     fn malloc_inner(&self, bytes: u64) -> Result<CudaPoolBuf, BackendError> {
         // A2.8:PeerShared 走 VMM,粒度取整后的真实占用必须先入账
         let effective = match self.kind {
@@ -285,7 +196,7 @@ impl CudaPool {
             }
             _ => bytes,
         };
-        self.ledger.charge(&self.name, effective)?;
+        self.charge(effective)?;
         // charge 校验先行(失败不触账本)→ 此处失败无需回滚
         let backing = match self.kind {
             PoolKind::PeerShared => match self.vmm_alloc_raw(effective as usize) {

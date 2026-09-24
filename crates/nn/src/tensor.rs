@@ -326,7 +326,7 @@ impl Tensor<CudaDevice> {
     }
 
     fn from_typed<T: Scalar>(t: &TypedTensor<T, CudaDevice>, dtype: Dtype) -> Self {
-        let block = t.block().expect("TypedTensor 必有池块(Storage 不变式)");
+        let block = t.block();
         // 容量不可失败:强类型面块容量 ≥ 元素面(构造不变式),dtype 同源
         Self::from_bytes(dtype, t.shape(), block)
             .expect("TypedTensor 擦除:容量不变式破坏")
@@ -408,37 +408,19 @@ shape_like_tuple!(usize, usize, usize, usize, usize; 0, 1, 2, 3, 4);
 
 /// 存储域:持久(权重/KV,Idle 外 drop 延迟)或暂存(捕获期可创建)。
 /// 类型参数来自 Device 的关联类型——HAL 无泄漏(不点名具体后端类型)。
-enum Storage<D: Device, T: MemValue> {
-    Persistent(D::Persistent<T>),
-    Scratch(D::Scratch<T>),
-}
-
-impl<D: Device, T: MemValue> DevBuf<T> for Storage<D, T> {
-    fn len(&self) -> usize {
-        match self {
-            Storage::Persistent(p) => p.len(),
-            Storage::Scratch(s) => s.len(),
-        }
-    }
-    fn device_ptr(&self) -> *mut T {
-        match self {
-            Storage::Persistent(p) => p.device_ptr(),
-            Storage::Scratch(s) => s.device_ptr(),
-        }
-    }
-}
+// 2026-09-24 池去类型裁决:Storage(Persistent/Scratch 双臂)退役——
+// 池块本就无类型,TypedTensor 直接持有字节块 D::Bytes + phantom T。
 
 /// 池分配的强类型张量句柄(**只在 P 阶段创建**;E 阶段算子只拿
 /// `&TypedTensor` 读视图,无任何分配入口)。
 pub struct TypedTensor<T: MemValue, D: Device> {
-    storage: Storage<D, T>,
+    /// 池字节块(唯一存储形态;类型是 phantom 标注)
+    pub(crate) block: D::Bytes,
     shape: Vec<usize>,
     dtype: Dtype,
-    /// 哨兵①:出生令牌(捕获期依赖记录的钥匙;后端无账本则 None)
-    token: Option<BufToken>,
     /// D2H 绑定上下文用(仅 OwlCuda 路径;泛型设备时为 None)
     ctx: Option<std::sync::Arc<CudaContext>>,
-    _dev: std::marker::PhantomData<D>,
+    _marker: std::marker::PhantomData<fn() -> (T, D)>,
 }
 
 impl<T: Scalar, D: Device> Clone for TypedTensor<T, D> {
@@ -454,29 +436,14 @@ impl<T: Scalar, D: Device> TypedTensor<T, D> {
         shape.iter().product()
     }
 
-    /// (私有)由 Persistent 存储装配;token 由设备签发
-    fn from_persistent(d: &D, storage: D::Persistent<T>, shape: &[usize]) -> Self {
-        let token = d.persistent_token(&storage);
+    /// (私有)由池字节块装配(ctx 由 CudaPool 签发时绑定)
+    fn from_block(block: D::Bytes, shape: &[usize], ctx: Option<std::sync::Arc<CudaContext>>) -> Self {
         Self {
-            storage: Storage::Persistent(storage),
+            block,
             shape: shape.to_vec(),
             dtype: T::DTYPE,
-            token,
-            ctx: None,
-            _dev: std::marker::PhantomData,
-        }
-    }
-
-    /// (私有)由 Scratch 存储装配
-    fn from_scratch(d: &D, storage: D::Scratch<T>, shape: &[usize]) -> Self {
-        let token = d.scratch_token(&storage);
-        Self {
-            storage: Storage::Scratch(storage),
-            shape: shape.to_vec(),
-            dtype: T::DTYPE,
-            token,
-            ctx: None,
-            _dev: std::marker::PhantomData,
+            ctx,
+            _marker: std::marker::PhantomData,
         }
     }
 
@@ -489,12 +456,12 @@ impl<T: Scalar, D: Device> TypedTensor<T, D> {
     }
 
     pub fn device_ptr(&self) -> *mut T {
-        self.storage.device_ptr()
+        self.block.device_ptr() as *mut T
     }
 
-    /// 哨兵①:出生令牌(捕获期依赖记录;后端无账本则 None)
+    /// 哨兵①:出生令牌(捕获期依赖记录;池块的 OpaqueDevBuf 面)
     pub fn token(&self) -> Option<BufToken> {
-        self.token
+        Some(owl_iface::OpaqueDevBuf::token(&self.block))
     }
 
     // ---- T1 签名层:shape 视图算子(语义表 SEMANTICS S3:无惰性布局,
@@ -585,15 +552,11 @@ impl<T: Scalar, D: Device> TypedTensor<T, D> {
     /// 活性由存储 Arc/租约兜底,克隆不触设备)
     fn clone_shallow(&self) -> Self {
         Self {
-            storage: match &self.storage {
-                Storage::Persistent(p) => Storage::Persistent(p.clone()),
-                Storage::Scratch(s) => Storage::Scratch(s.clone()),
-            },
+            block: self.block.clone(),
             shape: self.shape.clone(),
             dtype: self.dtype,
-            token: self.token,
             ctx: self.ctx.clone(),
-            _dev: std::marker::PhantomData,
+            _marker: std::marker::PhantomData,
         }
     }
 }
@@ -603,27 +566,16 @@ impl<T: Scalar, D: Device> DevBuf<T> for TypedTensor<T, D> {
         Self::elems(&self.shape)
     }
     fn device_ptr(&self) -> *mut T {
-        self.storage.device_ptr()
+        self.block.device_ptr() as *mut T
     }
 }
 
 // ---- OwlCuda 专属:EagerOnly 的 D2H 回读 + GraphLease 租约登记 ----
 
 impl<T: Scalar> TypedTensor<T, CudaDevice> {
-    /// GraphLease:暴露底层持久存储,供捕获会话登记租约(哨兵①)。
-    pub fn persistent(&self) -> Option<&owl_cuda::Persistent<T>> {
-        match &self.storage {
-            Storage::Persistent(p) => Some(p),
-            _ => None,
-        }
-    }
-
-    /// 保活池块读取(合并 Tensor 的擦除桥用;过渡期面,CUDA 具体域)
-    pub(crate) fn block(&self) -> Option<owl_cuda::CudaPoolBuf> {
-        match &self.storage {
-            Storage::Persistent(p) => Some(p.block()),
-            Storage::Scratch(s) => Some(s.block()),
-        }
+    /// 保活池块克隆(捕获会话 lease_block 用;字节面唯一形态)
+    pub fn block(&self) -> owl_cuda::CudaPoolBuf {
+        owl_cuda::CudaPoolBuf::clone(&self.block)
     }
 
     /// **EagerOnly**:D2H 回读(同步;禁入捕获段)。
@@ -665,19 +617,14 @@ impl<T: Scalar> crate::EagerOnly for TypedTensor<T, CudaDevice> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use owl_iface::{PoolConfig, PoolKind};
+    
 
     fn dev() -> CudaDevice {
         CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备")
     }
 
-    fn scratch_pool(d: &CudaDevice, bytes: u64) -> <CudaDevice as Device>::Pool {
-        d.create_pool(PoolConfig {
-            name: "t1-test".into(),
-            kind: PoolKind::Weights,
-            bytes,
-        })
-        .expect("create_pool")
+    fn scratch_pool(d: &CudaDevice, _bytes: u64) -> std::sync::Arc<owl_cuda::CudaPool> {
+        d.default_pool()
     }
 
     /// A5.4 冒烟:池耗尽 → PoolExhausted(分配在 P 阶段可失败)
@@ -722,13 +669,7 @@ mod tests {
     #[test]
     fn scratch_tensor_basics() {
         let d = dev();
-        let pool = d
-            .create_pool(PoolConfig {
-                name: "t1-scratch".into(),
-                kind: PoolKind::Scratch,
-                bytes: 64 * 1024,
-            })
-            .expect("create_pool");
+        let pool = d.default_pool();
         let t = pool.scratch_tensor::<f32>(&[16, 16]).unwrap();
         assert_eq!(t.shape(), &[16, 16]);
         assert_eq!(DevBuf::<f32>::len(&t), 256);
@@ -860,7 +801,7 @@ pub trait TensorPoolOps: Pool {
         Self::Dev: Device<Pool = Self>,
     {
         let n: usize = shape.iter().product();
-        let block = self.alloc_bytes_persistent(n * dtype.size_bytes())?;
+        let block = self.malloc((n * dtype.size_bytes()) as u64)?;
         Tensor::from_bytes(dtype, shape, block)
     }
 
@@ -870,7 +811,7 @@ pub trait TensorPoolOps: Pool {
         Self::Dev: Device<Pool = Self>,
     {
         let n: usize = shape.iter().product();
-        let block = self.alloc_bytes_scratch(n * dtype.size_bytes())?;
+        let block = self.malloc((n * dtype.size_bytes()) as u64)?;
         Tensor::from_bytes(dtype, shape, block)
     }
 
@@ -892,7 +833,7 @@ pub trait TensorPoolOps: Pool {
                 detail: format!("shape 元素字节数 {want} != src.len() {}", src.len()),
             });
         }
-        let block = self.htod_bytes_persistent(src)?;
+        let block = self.htod(src)?;
         Tensor::from_bytes(dtype, shape, block)
     }
 }
@@ -911,15 +852,14 @@ where
     D: Device<Pool = P>,
 {
     fn zeros_tensor<T: Scalar>(&self, shape: &[usize]) -> Result<TypedTensor<T, D>, BackendError> {
-        let dev = self.device();
         let n: usize = shape.iter().product();
-        Ok(TypedTensor::from_persistent(&dev, self.alloc_persistent_in::<T>(n)?, shape))
+        let block = self.malloc((n * std::mem::size_of::<T>()) as u64)?;
+        Ok(TypedTensor::from_block(block, shape, None))
     }
 
     fn scratch_tensor<T: Scalar>(&self, shape: &[usize]) -> Result<TypedTensor<T, D>, BackendError> {
-        let dev = self.device();
-        let n: usize = shape.iter().product();
-        Ok(TypedTensor::from_scratch(&dev, self.alloc_scratch_in::<T>(n)?, shape))
+        // 池去类型后与 zeros 同路径(清零字节块);保留签名供调用面兼容
+        self.zeros_tensor(shape)
     }
 
     fn from_vec_tensor<T: Scalar>(&self, shape: &[usize], src: Vec<T>) -> Result<TypedTensor<T, D>, BackendError> {
@@ -930,19 +870,10 @@ where
                 detail: format!("shape 元素数 {n} != src.len() {}", src.len()),
             });
         }
-        let dev = self.device();
-        let storage = Storage::Persistent(self.htod_persistent_in::<T>(src)?);
-        let token = match &storage {
-            Storage::Persistent(p) => dev.persistent_token(p),
-            Storage::Scratch(_) => unreachable!("from_vec_tensor: 应为 Persistent"),
-        };
-        Ok(TypedTensor {
-            token,
-            storage,
-            shape: shape.to_vec(),
-            dtype: T::DTYPE,
-            ctx: None,
-            _dev: std::marker::PhantomData,
-        })
+        let bytes = n * std::mem::size_of::<T>();
+        // MemValue = POD,host 字节视图搬运(无别名风险)
+        let host = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u8, bytes) };
+        let block = self.htod(host)?;
+        Ok(TypedTensor::from_block(block, shape, None))
     }
 }

@@ -167,14 +167,10 @@ impl SlotBank {
 
     fn lease_all(&self, session: &mut owl_cuda::CaptureSession) {
         for i in &self.inputs {
-            if let Some(p) = i.tensor.persistent() {
-                session.lease(p);
-            }
+            session.lease_block(&i.tensor.block());
         }
         for o in &self.outputs {
-            if let Some(p) = o.tensor.persistent() {
-                session.lease(p);
-            }
+            session.lease_block(&o.tensor.block());
         }
     }
 }
@@ -216,19 +212,8 @@ impl Session {
         desc: SessionDesc,
         forward: impl Fn(&StepCtx) -> Result<()> + 'static,
     ) -> Result<(Self, PlanOutcome), Error> {
-        // 槽设备面(专用 Weights 池;P 阶段分配)
-        use owl_iface::Device as _;
-        let pool = dev
-            .create_pool(owl_iface::PoolConfig {
-                name: format!("session-bank-{}", std::process::id()),
-                kind: owl_iface::PoolKind::Weights,
-                bytes: {
-                    let ins: usize = desc.inputs.iter().map(|i| i.len * 4).sum();
-                    let outs: usize = desc.outputs.iter().map(|o| o.shape.iter().product::<usize>() * 4).sum();
-                    (ins + outs).max(1 << 20) as u64
-                },
-            })
-            .map_err(|e| Error::Msg(format!("session bank pool: {e:?}")))?;
+        // 槽设备面:设备出生池(2026-09-24 池随设备出生裁决)
+        let pool = dev.default_pool();
         let bank = SlotBank::build(dev, &pool, &desc.inputs, &desc.outputs)?;
 
         // warmup(姿势 6):eager dry 执行一遍(空栈回退机制使闭包内

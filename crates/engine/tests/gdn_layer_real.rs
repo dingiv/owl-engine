@@ -18,7 +18,7 @@ use owl_engine::config::Config;
 use owl_engine::models::dry_kernels::DryKernels;
 use owl_engine::models::layers::deltanet::GatedDeltaNet;
 use owl_engine::models::layers::{ctx_scope, ctor, vendor, VarBuilderX};
-use owl_iface::{Device as _, DevBuf as _, Pool as _, PoolConfig, PoolKind};
+use owl_iface::{Device as _, DevBuf as _, Pool as _};
 use owl_nn::cublas::NnBlas;
 use owl_nn::kernels::gdn_kernels::GdnKernels;
 use std::sync::Arc;
@@ -44,22 +44,8 @@ struct Rig {
 
 fn install_rig() -> Rig {
     let dev = Arc::new(CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备"));
-    let scratch = Arc::new(
-        dev.create_pool(PoolConfig {
-            name: format!("gdn-scratch-{}", std::process::id()),
-            kind: PoolKind::Scratch,
-            bytes: 256 << 20,
-        })
-        .unwrap(),
-    );
-    let pool = Arc::new(
-        dev.create_pool(PoolConfig {
-            name: format!("gdn-weights-{}", std::process::id()),
-            kind: PoolKind::Weights,
-            bytes: 1 << 30,
-        })
-        .unwrap(),
-    );
+    let scratch = dev.default_pool();
+    let pool = dev.default_pool();
     let ops = owl_nn::OpsCtx::new(&dev).unwrap();
     let blas = NnBlas::new(&dev).unwrap();
     let dry = DryKernels::new(dev.ctx()).unwrap();
@@ -70,8 +56,21 @@ fn install_rig() -> Rig {
 fn htod<T: owl_iface::MemValue + Send + Sync + 'static>(
     rig: &Rig,
     v: Vec<T>,
-) -> owl_cuda::Persistent<T> {
-    rig.pool.htod_persistent_in(v).unwrap()
+) -> <owl_cuda::CudaDevice as owl_iface::Device>::Bytes {
+    let n = v.len() * std::mem::size_of::<T>();
+    let host = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, n) };
+    rig.pool.htod(host).unwrap()
+}
+
+
+fn ptr_f32(b: &<owl_cuda::CudaDevice as owl_iface::Device>::Bytes) -> *const f32 {
+    owl_iface::DevBuf::device_ptr(b) as *const f32
+}
+fn mut_f32(b: &<owl_cuda::CudaDevice as owl_iface::Device>::Bytes) -> *mut f32 {
+    owl_iface::DevBuf::device_ptr(b) as *mut f32
+}
+fn ptr_u32(b: &<owl_cuda::CudaDevice as owl_iface::Device>::Bytes) -> *const u32 {
+    owl_iface::DevBuf::device_ptr(b) as *const u32
 }
 
 fn dtoh_f32(dev: &CudaDevice, ptr: *const f32, n: usize) -> Vec<f32> {
@@ -441,19 +440,19 @@ fn gdn_layer8_segment_bisection() {
     k.conv1d_fwd_k4(
         rig.dev.stream(),
         "f32",
-        owl_iface::DevBuf::device_ptr(&d_x) as *const u8,
-        owl_iface::DevBuf::device_ptr(&d_w) as *const u8,
+        owl_iface::DevBuf::device_ptr(&d_x),
+        owl_iface::DevBuf::device_ptr(&d_w),
         std::ptr::null(),
-        d_state.device_ptr(),
-        d_out.device_ptr() as *mut u8,
-        owl_iface::DevBuf::device_ptr(&d_cu),
+        mut_f32(&d_state),
+        owl_iface::DevBuf::device_ptr(&d_out),
+        ptr_u32(&d_cu),
         1,
         CONV_DIM as i32,
         true,
     )
     .unwrap();
     rig.dev.ctx().synchronize().unwrap();
-    let got = dtoh_f32(&rig.dev, owl_iface::DevBuf::device_ptr(&d_out), T * CONV_DIM);
+    let got = dtoh_f32(&rig.dev, ptr_f32(&d_out), T * CONV_DIM);
     if !report("断面① conv1d", &got, &host_conv, 2e-2) {
         fails.push("① conv1d".into());
     }
@@ -468,19 +467,19 @@ fn gdn_layer8_segment_bisection() {
     k.fused_gating(
         rig.dev.stream(),
         "f32",
-        owl_iface::DevBuf::device_ptr(&d_al),
+        ptr_f32(&d_al),
         owl_iface::DevBuf::device_ptr(&d_a) as *const u8,
         owl_iface::DevBuf::device_ptr(&d_b) as *const u8,
-        owl_iface::DevBuf::device_ptr(&d_dtb),
-        d_g.device_ptr(),
-        d_beta.device_ptr(),
+        ptr_f32(&d_dtb),
+        mut_f32(&d_g),
+        mut_f32(&d_beta),
         (T * NV) as i32,
         NV as i32,
     )
     .unwrap();
     rig.dev.ctx().synchronize().unwrap();
-    let got_g = dtoh_f32(&rig.dev, owl_iface::DevBuf::device_ptr(&d_g), T * NV);
-    let got_beta = dtoh_f32(&rig.dev, owl_iface::DevBuf::device_ptr(&d_beta), T * NV);
+    let got_g = dtoh_f32(&rig.dev, ptr_f32(&d_g), T * NV);
+    let got_beta = dtoh_f32(&rig.dev, ptr_f32(&d_beta), T * NV);
     if !report("断面② gating.g", &got_g, &host_g, 1e-3) {
         fails.push("② gating.g".into());
     }
@@ -514,7 +513,7 @@ fn gdn_layer8_segment_bisection() {
     )
     .unwrap();
     rig.dev.ctx().synchronize().unwrap();
-    let got_qn = dtoh_f32(&rig.dev, owl_iface::DevBuf::device_ptr(&d_qn), T * KEY_DIM);
+    let got_qn = dtoh_f32(&rig.dev, ptr_f32(&d_qn), T * KEY_DIM);
     if !report("断面③ l2norm.q", &got_qn, &host_qn, 1e-3) {
         fails.push("③ l2norm.q".into());
     }
@@ -536,10 +535,10 @@ fn gdn_layer8_segment_bisection() {
             owl_iface::DevBuf::device_ptr(&q_t) as *const u8,
             owl_iface::DevBuf::device_ptr(&k_t) as *const u8,
             owl_iface::DevBuf::device_ptr(&v_t) as *const u8,
-            owl_iface::DevBuf::device_ptr(&g_t),
-            owl_iface::DevBuf::device_ptr(&b_t),
-            d_rec_state.device_ptr(),
-            owl_iface::DevBuf::device_ptr(&d_slots),
+            ptr_f32(&g_t),
+            ptr_f32(&b_t),
+            mut_f32(&d_rec_state),
+            ptr_u32(&d_slots),
             d_rec_out.device_ptr() as *mut u8,
             1,
             NV as i32,
@@ -559,7 +558,7 @@ fn gdn_layer8_segment_bisection() {
     }
     let got_state = dtoh_f32(
         &rig.dev,
-        owl_iface::DevBuf::device_ptr(&d_rec_state),
+        mut_f32(&d_rec_state) as *const f32,
         NV * KD * VD,
     );
     let want_state: Vec<f32> = host_state
@@ -580,7 +579,7 @@ fn gdn_layer8_segment_bisection() {
         "f32",
         owl_iface::DevBuf::device_ptr(&d_x5) as *const u8,
         owl_iface::DevBuf::device_ptr(&d_z5) as *const u8,
-        owl_iface::DevBuf::device_ptr(&d_nrm),
+        mut_f32(&d_nrm),
         std::ptr::null(),
         d_gated.device_ptr() as *mut u8,
         (T * NV) as i32,
@@ -593,7 +592,7 @@ fn gdn_layer8_segment_bisection() {
     )
     .unwrap();
     rig.dev.ctx().synchronize().unwrap();
-    let got_gated = dtoh_f32(&rig.dev, owl_iface::DevBuf::device_ptr(&d_gated), T * VALUE_DIM);
+    let got_gated = dtoh_f32(&rig.dev, ptr_f32(&d_gated), T * VALUE_DIM);
     let host_gated = host_gated_rmsnorm(&host_rec, &z, &w.norm, T, 1e-6);
     if !report("断面⑤ 门控rmsnorm", &got_gated, &host_gated, 2e-2) {
         fails.push("⑤ 门控rmsnorm".into());
@@ -772,9 +771,9 @@ fn gdn_layer8_device_chain_bisection() {
         qkv_dev.device_ptr() as *const u8,
         d_w.device_ptr() as *const u8,
         std::ptr::null(),
-        d_state.device_ptr(),
+        mut_f32(&d_state),
         d_cout.device_ptr() as *mut u8,
-        d_cu.device_ptr(),
+        ptr_u32(&d_cu),
         1, CONV_DIM as i32, true,
     ).unwrap();
     rig.dev.ctx().synchronize().unwrap();
@@ -1150,9 +1149,9 @@ fn gdn_layer8_full_device_chain() {
         proj_qkv.device_ptr() as *const u8,
         d_w.device_ptr() as *const u8,
         std::ptr::null(),
-        d_state.device_ptr(),
+        mut_f32(&d_state),
         d_cout.device_ptr() as *mut u8,
-        d_cu.device_ptr(),
+        ptr_u32(&d_cu),
         1, CONV_DIM as i32, true,
     ).unwrap();
     rig.dev.ctx().synchronize().unwrap();
@@ -1173,12 +1172,12 @@ fn gdn_layer8_full_device_chain() {
     let d_beta = htod(&rig, vec![0f32; T * NV]);
     k.fused_gating(
         rig.dev.stream(), "f32",
-        d_al.device_ptr(),
-        a_dev.device_ptr() as *const u8,
-        b_dev.device_ptr() as *const u8,
-        d_dtb.device_ptr(),
-        d_g.device_ptr(),
-        d_beta.device_ptr(),
+        ptr_f32(&d_al),
+        a_dev.device_ptr(),
+        b_dev.device_ptr(),
+        ptr_f32(&d_dtb),
+        mut_f32(&d_g),
+        mut_f32(&d_beta),
         (T * NV) as i32, NV as i32,
     ).unwrap();
     rig.dev.ctx().synchronize().unwrap();
@@ -1226,7 +1225,7 @@ fn gdn_layer8_full_device_chain() {
             g_t_p as *const f32,
             b_t_p as *const f32,
             st.device_ptr() as *mut f32,
-            slots.device_ptr(),
+            ptr_u32(&slots),
             out_t.device_ptr() as *mut u8,
             1, NV as i32, NK as i32, KD as i32, VD as i32,
             (1.0 / (KD as f32).sqrt()) as f32,
@@ -1247,7 +1246,7 @@ fn gdn_layer8_full_device_chain() {
         rig.dev.stream(), "f32",
         d_rec.device_ptr() as *const u8,
         z_dev.device_ptr() as *const u8,
-        d_nrm.device_ptr(),
+        mut_f32(&d_nrm),
         std::ptr::null(),
         d_gated.device_ptr() as *mut u8,
         (T * NV) as i32, VALUE_DIM as i32, VD as i32,

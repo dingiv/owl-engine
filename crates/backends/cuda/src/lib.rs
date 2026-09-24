@@ -37,7 +37,7 @@ pub fn test_device_ordinal() -> usize {
 /// 测试统一走此常量,容量只是上限,分配前不预占显存)
 pub const TEST_POOL_BYTES: u64 = 4 << 30;
 
-pub use buffers::{Persistent, RemoteBuf, Scratch, VmmBuf};
+pub use buffers::{RemoteBuf, VmmBuf};
 pub use device::{CudaBackend, CudaDevice};
 pub use governor::{Budget, LedgerSnapshot};
 pub use graph::{CaptureFrame, CaptureSession, DeviceGraph};
@@ -56,48 +56,44 @@ mod tests {
 
     use super::ffi::sys;
     use super::{BackendError, Budget, CudaBackend, CudaDevice, CudaPool};
-    use owl_iface::{Backend as _, DevBuf, Device as _, MemPhase, PoolConfig, PoolKind, Pool as _};
+    use owl_iface::{Backend as _, DevBuf, Device as _, MemPhase, Pool as _};
 
     fn make() -> CudaDevice {
         CudaDevice::new(super::test_device_ordinal(), crate::TEST_POOL_BYTES).expect("需要 CUDA 设备")
     }
 
-    fn scratch_pool(b: &CudaDevice, name: &str, bytes: u64) -> CudaPool {
-        b.create_pool(PoolConfig {
-            name: name.into(),
-            kind: PoolKind::Scratch,
-            bytes,
-        })
-        .unwrap()
+    /// 出生池测试:小容量命名池(容量闸验证用;池随设备出生裁决)
+    fn device_with(extra: &[owl_iface::PoolConfig]) -> CudaDevice {
+        CudaDevice::with_pools(super::test_device_ordinal(), crate::TEST_POOL_BYTES, extra)
+            .expect("需要 CUDA 设备")
     }
 
-    fn persistent_pool(b: &CudaDevice, name: &str, bytes: u64) -> CudaPool {
-        b.create_pool(PoolConfig {
-            name: name.into(),
-            kind: PoolKind::Weights,
-            bytes,
-        })
-        .unwrap()
+    fn named(dev: &CudaDevice, name: &str) -> std::sync::Arc<CudaPool> {
+        std::sync::Arc::new(dev.pool_by_name(name).expect("出生池必有"))
     }
 
     /// 契约:池化分配 + A1.2 延迟归还 + 净空窗口清账
     #[test]
     fn pool_malloc_contract_and_deferred_free() {
-    let _g = gpu();
-        let dev = make();
-        let pool = scratch_pool(&dev, "scratch", 64 << 10);
+        let _g = gpu();
+        let dev = device_with(&[owl_iface::PoolConfig {
+            name: "scratch".into(),
+            kind: owl_iface::PoolKind::Scratch,
+            bytes: 64 << 10,
+        }]);
+        let pool = named(&dev, "scratch");
 
-        let scratch = pool.alloc_scratch_in::<f32>(4096).unwrap();
-        assert_eq!(DevBuf::<f32>::len(&scratch), 4096);
+        let scratch = pool.malloc(16 * 1024).unwrap();
+        assert_eq!(DevBuf::<u8>::len(&scratch), 16 * 1024);
         assert_eq!(pool.usage().used, 16 * 1024);
 
         // 池耗尽 → A5.4 PoolExhausted
-        let over = pool.alloc_scratch_in::<f32>(1024 * 1024);
+        let over = pool.malloc(4 * 1024 * 1024);
         assert!(matches!(over, Err(BackendError::PoolExhausted { .. })));
 
         // Live 相 drop → 延迟(池账 + 全局账都不动)
         dev.set_phase(MemPhase::Live);
-        let victim = pool.alloc_scratch_in::<f32>(16).unwrap();
+        let victim = pool.malloc(64).unwrap();
         drop(victim);
         assert_eq!(dev.stats().deferred_frees, 1);
         assert_eq!(dev.stats().drained_frees, 0);
@@ -117,13 +113,13 @@ mod tests {
             bytes: 1024 * 1024,
             reserve_floor: 512 * 1024,
         });
-        let pool = persistent_pool(&dev, "b", 8 << 20);
+        let pool = dev.default_pool();
 
-        let ok = pool.alloc_persistent_in::<u8>(1024).unwrap();
+        let ok = pool.malloc(1024).unwrap();
         drop(ok);
         dev.set_phase(MemPhase::Idle);
 
-        let huge = pool.alloc_persistent_in::<u8>(8 * 1024 * 1024);
+        let huge = pool.malloc(8 * 1024 * 1024);
         assert!(matches!(
             huge,
             Err(BackendError::LawViolation(msg)) if msg.contains("A5.4")
@@ -139,15 +135,9 @@ mod tests {
     fn graph_lease_keeps_memory_alive_across_user_drop() {
     let _g = gpu();
         let dev = CudaDevice::new(super::test_device_ordinal(), crate::TEST_POOL_BYTES).expect("需要 CUDA 设备");
-        let pool = dev
-            .create_pool(PoolConfig {
-                name: "lease-t".into(),
-                kind: PoolKind::Weights,
-                bytes: 1 << 20,
-            })
-            .unwrap();
-        let t = pool.alloc_persistent_in::<u8>(4096).unwrap();
-        let token = t.token.unwrap();
+        let pool = dev.default_pool();
+        let t = pool.malloc(4096).unwrap();
+        let token = t.token();
         let survivor = t.clone(); // 租约克隆(Graph keepalive 之外的第二证明)
 
         // 先填 0xFF(eager 发射,兼 warmup;必须在捕获开始前)
@@ -166,7 +156,7 @@ mod tests {
 
         // 捕获一个 memset(0) 节点,触碰缓冲地址(原始 FFI 不 emit → 手工租约)
         let mut session = dev.capture_session().unwrap();
-        session.lease(&t);
+        session.lease_block(&t);
         let (_, graph) = session
             .capture(
                 sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
@@ -233,32 +223,30 @@ mod tests {
         assert_eq!(dev.ledger().bytes_alive, 0);
     }
 
-    /// 语义分立:池类型与分配性质错配 = LawViolation
+    /// 池去类型裁决(2026-09-24):malloc 无类型面——任意池任意分配合法;
+    /// 唯一保留的语义闸 = PeerShared(VMM 物理路径)只经 malloc_peer_shared
     #[test]
     fn pool_kind_mismatch_is_law_violation() {
     let _g = gpu();
         let dev = make();
-        let scratch = scratch_pool(&dev, "s", 1 << 20);
-        let weights = persistent_pool(&dev, "w", 1 << 20);
-        // Scratch 池上做持久分配 → 拒
-        assert!(matches!(
-            scratch.alloc_persistent_in::<f32>(16),
-            Err(BackendError::LawViolation(msg)) if msg.contains("不匹配")
-        ));
+        let scratch = dev.default_pool();
+        let weights = dev.default_pool();
+        // 字节分配已无类型面:scratch 池上 malloc 合法
+        assert!(scratch.malloc(64).is_ok());
         // Weights 池上做跨卡共享分配 → 拒
         assert!(matches!(
             weights.malloc_peer_shared(16),
             Err(BackendError::LawViolation(msg)) if msg.contains("不匹配")
         ));
         // 正确配对可用
-        assert!(weights.malloc_persistent(256).is_ok());
-        let peer = dev
-            .create_pool(PoolConfig {
-                name: "p".into(),
-                kind: PoolKind::PeerShared,
-                bytes: 8 << 20,
-            })
-            .unwrap();
+        assert!(weights.malloc(256).is_ok());
+        // PeerShared 池是出生声明池(唯一仍按 kind 路由的物理路径)
+        let dev2 = device_with(&[owl_iface::PoolConfig {
+            name: "p".into(),
+            kind: owl_iface::PoolKind::PeerShared,
+            bytes: 8 << 20,
+        }]);
+        let peer = named(&dev2, "p");
         assert!(peer.malloc_peer_shared(4096).is_ok());
     }
 
@@ -266,14 +254,12 @@ mod tests {
     #[test]
     fn peer_shared_malloc_uses_vmm() {
     let _g = gpu();
-        let dev = make();
-        let peer = dev
-            .create_pool(PoolConfig {
-                name: "ps".into(),
-                kind: PoolKind::PeerShared,
-                bytes: 8 << 20,
-            })
-            .unwrap();
+        let dev = device_with(&[owl_iface::PoolConfig {
+            name: "ps".into(),
+            kind: owl_iface::PoolKind::PeerShared,
+            bytes: 8 << 20,
+        }]);
+        let peer = named(&dev, "ps");
         let buf = peer.malloc_peer_shared(1024).unwrap();
         // 粒度 ≥2MiB 对齐(经 DevBuf<u8> len 查询)
         assert!(buf.len() >= 2 * 1024 * 1024);
@@ -291,15 +277,9 @@ mod tests {
     fn lease_survivor_drops_before_graph_token_stays_valid() {
     let _g = gpu();
         let dev = CudaDevice::new(super::test_device_ordinal(), crate::TEST_POOL_BYTES).expect("需要 CUDA 设备");
-        let pool = dev
-            .create_pool(PoolConfig {
-                name: "lease-order".into(),
-                kind: PoolKind::Weights,
-                bytes: 1 << 20,
-            })
-            .unwrap();
-        let t = pool.alloc_persistent_in::<u8>(4096).unwrap();
-        let token = t.token.unwrap();
+        let pool = dev.default_pool();
+        let t = pool.malloc(4096).unwrap();
+        let token = t.token();
 
         unsafe {
             sys::cuMemsetD8Async(
@@ -315,7 +295,7 @@ mod tests {
         dev.note_launch();
 
         let mut session = dev.capture_session().unwrap();
-        session.lease(&t);
+        session.lease_block(&t);
         let (_, graph) = session
             .capture(
                 sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
@@ -359,15 +339,9 @@ mod tests {
         assert!(dev.desc().total_bytes > 0);
 
         // 池化契约走 Device trait 静态分发
-        let pool = dev
-            .create_pool(PoolConfig {
-                name: "t".into(),
-                kind: PoolKind::Weights,
-                bytes: 1 << 20,
-            })
-            .unwrap();
-        let buf = pool.alloc_persistent_in::<f32>(64).unwrap();
-        assert_eq!(buf.len(), 64);
+        let pool = dev.default_pool();
+        let buf = pool.malloc((64) * 4).unwrap();
+        assert_eq!(DevBuf::<u8>::len(&buf), 64 * 4);
         drop(buf);
         dev.set_phase(MemPhase::Idle);
     }
@@ -380,10 +354,10 @@ mod tests {
         let _g = gpu();
         let dev = make();
         dev.set_poison_freed(true);
-        let pool = scratch_pool(&dev, "p12a", 1 << 20);
+        let pool = dev.default_pool();
         // 源块:窗口前出生,预填 0x5A(毒化哨兵之外的真值)
-        let src = pool.malloc_scratch(4096).unwrap();
-        let out = pool.alloc_scratch_in::<u8>(4096).unwrap();
+        let src = pool.malloc(4096).unwrap();
+        let out = pool.malloc(4096).unwrap();
         unsafe {
             sys::cuMemsetD8Async(
                 src.device_ptr() as sys::CUdeviceptr,
@@ -400,7 +374,7 @@ mod tests {
         let src_ptr = src.device_ptr() as sys::CUdeviceptr;
         let out_ptr = out.device_ptr() as sys::CUdeviceptr;
         let mut session = dev.capture_session().unwrap();
-        session.lease_scratch(&out); // 哨兵③:pre-window 块须在租约表
+        session.lease_block(&out); // 哨兵③:pre-window 块须在租约表
         let (_, graph) = session
             .capture(sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH, |frame| {
                 unsafe {
@@ -451,8 +425,8 @@ mod tests {
         let _g = gpu();
         let dev = make();
         dev.set_poison_freed(true);
-        let pool = scratch_pool(&dev, "p12b", 1 << 20);
-        let out = pool.alloc_scratch_in::<u8>(4096).unwrap();
+        let pool = dev.default_pool();
+        let out = pool.malloc(4096).unwrap();
         unsafe {
             sys::cuMemsetD8Async(
                 out.device_ptr() as sys::CUdeviceptr,
@@ -469,13 +443,13 @@ mod tests {
         let out_ptr = out.device_ptr() as sys::CUdeviceptr;
         let pool2 = pool.clone();
         let mut session = dev.capture_session().unwrap();
-        session.lease_scratch(&out); // 哨兵③:pre-window 块须在租约表
+        session.lease_block(&out); // 哨兵③:pre-window 块须在租约表
         let (tmp, graph) = session
             .capture(sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH, |frame| {
                 // 窗口内出生:池分配(捕获期 scratch 的真实形态);
                 // 图只含 D2D 拷贝(tmp 只读依赖)——真值由捕获后的
                 // eager memset 预填(窗口内 eager 发射会破坏 capture)
-                let tmp = pool2.malloc_scratch(4096).unwrap();
+                let tmp = pool2.malloc(4096).unwrap();
                 let tmp_ptr = tmp.device_ptr() as sys::CUdeviceptr;
                 unsafe {
                     sys::cuMemcpyDtoDAsync_v2(

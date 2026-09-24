@@ -15,7 +15,7 @@
 //! (fill_from_host,EagerOnly,设备主流)。
 
 use owl_cuda::CudaDevice;
-use owl_iface::{Device, MemPhase, PoolConfig, PoolKind};
+use owl_iface::MemPhase;
 use owl_nn::cublas::NnBlas;
 use owl_nn::ops::OpsCtx;
 use owl_nn::tensor::{TypedTensor, TensorPoolOps};
@@ -64,13 +64,7 @@ fn main() {
     println!("== owl 02_capture(M1):全链 [matmul|add|silu|rmsnorm] 单图捕获 ==");
 
     // ---- P 阶段 ----
-    let pool = dev
-        .create_pool(PoolConfig {
-            name: format!("e02-chain-{}", std::process::id()),
-            kind: PoolKind::Weights,
-            bytes: 32 << 20,
-        })
-        .expect("建池");
+    let pool = dev.default_pool();
     let blas = NnBlas::new(&dev).expect("NnBlas");
     let mut ops = OpsCtx::new(&dev).expect("OpsCtx");
     let ctx = ops.ctx(MemPhase::Idle); // 设备主流(非阻塞;M1②)

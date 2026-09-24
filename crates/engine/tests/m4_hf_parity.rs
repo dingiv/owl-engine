@@ -33,7 +33,6 @@ use owl_engine::models::layers::distributed::Comm;
 use owl_engine::models::layers::{ctx_scope, VarBuilderX};
 use owl_engine::models::qwen3_5::{InputMetadata, Qwen3_5ForCausalLM};
 use owl_nn::cublas::NnBlas;
-use owl_iface::{Device as _, PoolConfig, PoolKind};
 use std::sync::Arc;
 
 const MODEL_DIR: &str = "/home/div/Documents/codes/models/Qwen/Qwen3.5-0.8B";
@@ -265,22 +264,8 @@ fn m4_hf_parity_full_chain() {
 
     // ---- 设备与池 ----
     let dev = Arc::new(CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备"));
-    let scratch = Arc::new(
-        dev.create_pool(PoolConfig {
-            name: format!("m4-scratch-{}", std::process::id()),
-            kind: PoolKind::Scratch,
-            bytes: 2 << 30,
-        })
-        .unwrap(),
-    );
-    let wpool = Arc::new(
-        dev.create_pool(PoolConfig {
-            name: format!("m4-weights-{}", std::process::id()),
-            kind: PoolKind::Weights,
-            bytes: 6 << 30,
-        })
-        .unwrap(),
-    );
+    let scratch = dev.default_pool();
+    let wpool = dev.default_pool();
     let ops = owl_nn::OpsCtx::new(&dev).unwrap();
     let blas = NnBlas::new(&dev).unwrap();
     let dry = DryKernels::new(dev.ctx()).unwrap();

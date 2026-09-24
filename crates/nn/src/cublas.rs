@@ -16,7 +16,7 @@ use owl_cuda::ffi::sys::cublas::{
     cublasCreate_v2, cublasDestroy_v2, cublasSetStream_v2, cublasSetWorkspace_v2,
     cublasSgemm_v2, cublasHandle_t, cublasOperation_t, cublasStatus_t,
 };
-use owl_cuda::{CudaDevice, Persistent};
+use owl_cuda::{CudaDevice, CudaPoolBuf};
 
 /// workspace 大小:32 MiB,与 candle 一致(覆盖 decode 稀瘦 matmul 的
 /// split-K 归约上限)。
@@ -25,17 +25,14 @@ pub const BLAS_WORKSPACE_BYTES: usize = 32 * 1024 * 1024;
 /// port 自 candle `BlasWorkspace`:池外预钉的 cuBLAS workspace。
 /// owl 化:分配经账本(Workspace 池),缓冲句柄保活 = 地址稳定。
 pub struct BlasWorkspace {
-    buf: Persistent<u8>,
+    buf: CudaPoolBuf,
 }
 
 impl BlasWorkspace {
     pub fn new(device: &CudaDevice) -> Result<Self, BackendError> {
-        let pool = device.create_pool(PoolConfig {
-            name: "workspace".into(),
-            kind: PoolKind::Workspace,
-            bytes: BLAS_WORKSPACE_BYTES as u64,
-        })?;
-        let buf = pool.alloc_persistent_in::<u8>(BLAS_WORKSPACE_BYTES)?;
+        // 池随设备出生(2026-09-24 裁决):workspace 走默认池
+        let pool = device.default_pool();
+        let buf = pool.malloc(BLAS_WORKSPACE_BYTES as u64)?;
         Ok(Self { buf })
     }
 
@@ -48,7 +45,7 @@ impl BlasWorkspace {
     /// 参数,捕获期它就是图的真实依赖——A5.2"池外原语必须预分配
     /// 并登记"的执行点(matmul 捕获路径必须把它 emit 进租约)。
     pub fn token(&self) -> Option<owl_iface::BufToken> {
-        self.buf.token()
+        Some(self.buf.token())
     }
 }
 
@@ -187,10 +184,14 @@ impl Drop for NnBlas {
     }
 }
 
-use owl_iface::{BackendError, Device, Pool as _, PoolConfig, PoolKind};
+use owl_iface::{BackendError, Pool as _};
 
 #[cfg(test)]
 mod tests {
+    fn f32_bytes(v: &[f32]) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
+    }
+
     use super::*;
     use owl_iface::DevBuf;
 
@@ -205,13 +206,9 @@ mod tests {
 
     fn setup(
         dev: &CudaDevice,
-    ) -> Result<(NnBlas, owl_cuda::CudaPool), BackendError> {
+    ) -> Result<(NnBlas, std::sync::Arc<owl_cuda::CudaPool>), BackendError> {
         let blas = NnBlas::new(dev)?;
-        let pool = dev.create_pool(PoolConfig {
-            name: format!("nn-test-{}", std::process::id()),
-            kind: PoolKind::Weights,
-            bytes: 64 << 20,
-        })?;
+        let pool = dev.default_pool();
         Ok((blas, pool))
     }
 
@@ -229,9 +226,9 @@ mod tests {
         let a: Vec<f32> = (0..M * K).map(|_| seed.next()).collect();
         let b: Vec<f32> = (0..K * N).map(|_| seed.next()).collect();
 
-        let da = pool.htod_persistent_in::<f32>(a.clone()).unwrap();
-        let db = pool.htod_persistent_in::<f32>(b.clone()).unwrap();
-        let dc = pool.alloc_persistent_in::<f32>(M * N).unwrap();
+        let da = pool.htod(f32_bytes(&a)).unwrap();
+        let db = pool.htod(f32_bytes(&b)).unwrap();
+        let dc = pool.malloc((M * N * 4) as u64).unwrap();
         dev.ctx().synchronize().unwrap();
 
         blas
@@ -239,9 +236,9 @@ mod tests {
                 M,
                 N,
                 K,
-                da.device_ptr(),
-                db.device_ptr(),
-                dc.device_ptr(),
+                da.device_ptr() as *const f32,
+                db.device_ptr() as *const f32,
+                dc.device_ptr() as *mut f32,
                 &stream,
             )
             .unwrap();
@@ -289,9 +286,9 @@ mod tests {
         const M: usize = 64;
         const K: usize = 64;
         const N: usize = 64;
-        let da = pool.htod_persistent_in::<f32>(vec![0.5f32; M * K]).unwrap();
-        let db = pool.htod_persistent_in::<f32>(vec![0.25f32; K * N]).unwrap();
-        let dc = pool.alloc_persistent_in::<f32>(M * N).unwrap();
+        let da = pool.htod(f32_bytes(&vec![0.5f32; M * K])).unwrap();
+        let db = pool.htod(f32_bytes(&vec![0.25f32; K * N])).unwrap();
+        let dc = pool.malloc((M * N * 4) as u64).unwrap();
         dev.ctx().synchronize().unwrap();
 
         let stream = dev.stream().clone();
@@ -301,9 +298,9 @@ mod tests {
                 M,
                 N,
                 K,
-                da.device_ptr(),
-                db.device_ptr(),
-                dc.device_ptr(),
+                da.device_ptr() as *const f32,
+                db.device_ptr() as *const f32,
+                dc.device_ptr() as *mut f32,
                 &stream,
             )
             .unwrap();

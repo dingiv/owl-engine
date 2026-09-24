@@ -102,22 +102,27 @@ impl AttentionKernels {
 
 #[cfg(test)]
 mod tests {
+
+    fn htod_t<T: owl_iface::MemValue>(pool: &owl_cuda::CudaPool, v: Vec<T>) -> owl_cuda::CudaPoolBuf {
+        let n = v.len() * std::mem::size_of::<T>();
+        let host = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, n) };
+        pool.htod(host).unwrap()
+    }
+
+    fn alloc_t<T: owl_iface::MemValue>(pool: &owl_cuda::CudaPool, len: usize) -> owl_cuda::CudaPoolBuf {
+        pool.malloc((len * std::mem::size_of::<T>()) as u64).unwrap()
+    }
+
     use super::AttentionKernels;
     use owl_cuda::CudaDevice;
-    use owl_iface::{Device as _, Pool as _, PoolConfig, PoolKind};
+    use owl_iface::Pool as _;
 
     /// K0 验收:合成 KV 块写入对拍 host 参考(vLLM 布局公式直译)。
     /// 含负槽(padding 跳过)分支。
     #[test]
     fn reshape_and_cache_f32_host_parity() {
         let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
-        let pool = dev
-            .create_pool(PoolConfig {
-                name: format!("k0-{}", std::process::id()),
-                kind: PoolKind::Weights,
-                bytes: 4 << 20,
-            })
-            .unwrap();
+        let pool = dev.default_pool();
 
         const TOKENS: usize = 3;
         const HEADS: usize = 2;
@@ -136,14 +141,11 @@ mod tests {
         }
         let slot_mapping: Vec<i64> = vec![1, 5, -1]; // 末位 padding 跳过
 
-        let d_key = pool.htod_persistent_in::<f32>(key.clone()).unwrap();
-        let d_value = pool.htod_persistent_in::<f32>(value.clone()).unwrap();
-        let d_slot = pool.htod_persistent_in::<i64>(slot_mapping.clone())
-            .unwrap();
-        let d_kcache = pool.alloc_persistent_in::<f32>(BLOCKS * HEADS * HEAD_SIZE * BLOCK_SIZE)
-            .unwrap();
-        let d_vcache = pool.alloc_persistent_in::<f32>(BLOCKS * HEADS * HEAD_SIZE * BLOCK_SIZE)
-            .unwrap();
+        let d_key = htod_t::<f32> (&pool, key.clone());
+        let d_value = htod_t::<f32> (&pool, value.clone());
+        let d_slot = htod_t::<i64> (&pool, slot_mapping.clone());
+        let d_kcache = alloc_t::<f32> (&pool, BLOCKS * HEADS * HEAD_SIZE * BLOCK_SIZE);
+        let d_vcache = alloc_t::<f32> (&pool, BLOCKS * HEADS * HEAD_SIZE * BLOCK_SIZE);
         dev.ctx().synchronize().unwrap();
 
         let mut kern = AttentionKernels::new(dev.ctx()).unwrap();
@@ -491,9 +493,19 @@ fn sliding_window_zero() -> u64 {
 
 #[cfg(test)]
 mod paged_tests {
+    fn htod_t<T: owl_iface::MemValue>(pool: &owl_cuda::CudaPool, v: Vec<T>) -> owl_cuda::CudaPoolBuf {
+        let n = v.len() * std::mem::size_of::<T>();
+        let host = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, n) };
+        pool.htod(host).unwrap()
+    }
+
+    fn alloc_t<T: owl_iface::MemValue>(pool: &owl_cuda::CudaPool, len: usize) -> owl_cuda::CudaPoolBuf {
+        pool.malloc((len * std::mem::size_of::<T>()) as u64).unwrap()
+    }
+
     use super::PagedKernels;
     use owl_cuda::CudaDevice;
-    use owl_iface::{Device as _, Pool as _, PoolConfig, PoolKind};
+    use owl_iface::Pool as _;
 
     // ---- f16/bf16 位型转换(测试专用;RNE 近似,测试值全为二进制精确)----
     fn f32_to_f16_bits(f: f32) -> u16 {
@@ -651,20 +663,13 @@ mod paged_tests {
 
         // 设备侧
         let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
-        let pool = dev
-            .create_pool(PoolConfig {
-                name: format!("k1-{}", std::process::id()),
-                kind: PoolKind::Weights,
-                bytes: 8 << 20,
-            })
-            .unwrap();
-        let d_q = pool.htod_persistent_in::<u16>(q.clone()).unwrap();
-        let d_kc = pool.htod_persistent_in::<u16>(key_cache.clone()).unwrap();
-        let d_vc = pool.htod_persistent_in::<u16>(value_cache.clone()).unwrap();
-        let d_bt = pool.htod_persistent_in::<i32>(block_tables.clone()).unwrap();
-        let d_cl = pool.htod_persistent_in::<i32>(context_lens.clone()).unwrap();
-        let d_out = pool.alloc_persistent_in::<u16>(NUM_SEQS * HEADS * HEAD_SIZE)
-            .unwrap();
+        let pool = dev.default_pool();
+        let d_q = htod_t::<u16> (&pool, q.clone());
+        let d_kc = htod_t::<u16> (&pool, key_cache.clone());
+        let d_vc = htod_t::<u16> (&pool, value_cache.clone());
+        let d_bt = htod_t::<i32> (&pool, block_tables.clone());
+        let d_cl = htod_t::<i32> (&pool, context_lens.clone());
+        let d_out = alloc_t::<u16> (&pool, NUM_SEQS * HEADS * HEAD_SIZE);
         // 探针:预填 0xAA,区分"核没写"(保留 AA)vs"写了零"
         unsafe {
 
@@ -730,13 +735,7 @@ mod paged_tests {
     #[test]
     fn paged_attention_v1_bf16_smoke() {
         let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
-        let pool = dev
-            .create_pool(PoolConfig {
-                name: format!("k1b-{}", std::process::id()),
-                kind: PoolKind::Weights,
-                bytes: 8 << 20,
-            })
-            .unwrap();
+        let pool = dev.default_pool();
         let n_kc = 8 * 8 * 16 * 32 * 8;
         let n_vc = 8 * 8 * 128 * 32;
         let q = vec![f32_to_bf16_bits(0.1); 8 * 128];
@@ -744,12 +743,12 @@ mod paged_tests {
         let vc = vec![f32_to_bf16_bits(0.3); n_vc];
         let bt = vec![0i32; 2];
         let cl = vec![16i32, 16];
-        let d_q = pool.htod_persistent_in::<u16>(q).unwrap();
-        let d_kc = pool.htod_persistent_in::<u16>(kc).unwrap();
-        let d_vc = pool.htod_persistent_in::<u16>(vc).unwrap();
-        let d_bt = pool.htod_persistent_in::<i32>(bt).unwrap();
-        let d_cl = pool.htod_persistent_in::<i32>(cl).unwrap();
-        let d_out = pool.alloc_persistent_in::<u16>(2 * 8 * 128).unwrap();
+        let d_q = htod_t::<u16> (&pool, q);
+        let d_kc = htod_t::<u16> (&pool, kc);
+        let d_vc = htod_t::<u16> (&pool, vc);
+        let d_bt = htod_t::<i32> (&pool, bt);
+        let d_cl = htod_t::<i32> (&pool, cl);
+        let d_out = alloc_t::<u16> (&pool, 2 * 8 * 128);
         dev.ctx().synchronize().unwrap();
         let mut kern = PagedKernels::new(dev.ctx()).unwrap();
         kern.paged_attention_v1(
@@ -887,31 +886,20 @@ mod paged_tests {
 
         // 设备侧
         let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
-        let pool = dev
-            .create_pool(PoolConfig {
-                name: format!("k2-{}", std::process::id()),
-                kind: PoolKind::Weights,
-                bytes: 64 << 20,
-            })
-            .unwrap();
-        let d_q = pool.htod_persistent_in::<u16>(q.clone()).unwrap();
-        let d_kc = pool.htod_persistent_in::<u16>(key_cache.clone()).unwrap();
-        let d_vc = pool.htod_persistent_in::<u16>(value_cache.clone()).unwrap();
-        let d_bt = pool.htod_persistent_in::<i32>(block_tables.clone()).unwrap();
-        let d_cl = pool.htod_persistent_in::<i32>(context_lens.clone()).unwrap();
-        let d_out_v1 = pool.alloc_persistent_in::<u16>(NUM_SEQS * HEADS * HEAD_SIZE)
-            .unwrap();
-        let d_out_v2 = pool.alloc_persistent_in::<u16>(NUM_SEQS * HEADS * HEAD_SIZE)
-            .unwrap();
+        let pool = dev.default_pool();
+        let d_q = htod_t::<u16> (&pool, q.clone());
+        let d_kc = htod_t::<u16> (&pool, key_cache.clone());
+        let d_vc = htod_t::<u16> (&pool, value_cache.clone());
+        let d_bt = htod_t::<i32> (&pool, block_tables.clone());
+        let d_cl = htod_t::<i32> (&pool, context_lens.clone());
+        let d_out_v1 = alloc_t::<u16> (&pool, NUM_SEQS * HEADS * HEAD_SIZE);
+        let d_out_v2 = alloc_t::<u16> (&pool, NUM_SEQS * HEADS * HEAD_SIZE);
 
         // v2 临时缓冲(A5.2:调用方 scratch;P = ceil(1000/512) = 2)
         const PARTS: usize = 2;
-        let d_exp = pool.alloc_persistent_in::<f32>(NUM_SEQS * HEADS * PARTS)
-            .unwrap();
-        let d_maxl = pool.alloc_persistent_in::<f32>(NUM_SEQS * HEADS * PARTS)
-            .unwrap();
-        let d_tmp = pool.alloc_persistent_in::<u16>(NUM_SEQS * HEADS * PARTS * HEAD_SIZE)
-            .unwrap();
+        let d_exp = alloc_t::<f32> (&pool, NUM_SEQS * HEADS * PARTS);
+        let d_maxl = alloc_t::<f32> (&pool, NUM_SEQS * HEADS * PARTS);
+        let d_tmp = alloc_t::<u16> (&pool, NUM_SEQS * HEADS * PARTS * HEAD_SIZE);
 
         let mut kern = PagedKernels::new(dev.ctx()).unwrap();
         let (q_p, kc_p, vc_p, bt_p, cl_p) = (
@@ -982,28 +970,22 @@ mod paged_tests {
     #[test]
     fn paged_attention_v2_bf16_smoke() {
         let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
-        let pool = dev
-            .create_pool(PoolConfig {
-                name: format!("k2b-{}", std::process::id()),
-                kind: PoolKind::Weights,
-                bytes: 16 << 20,
-            })
-            .unwrap();
+        let pool = dev.default_pool();
         const N: usize = 2 * 8 * 128;
         let q: Vec<u16> = (0..N).map(|i| f32_to_bf16_bits(((i % 7) as f32 - 3.0) * 0.25)).collect();
         let kc: Vec<u16> = (0..8 * 8 * 16 * 32 * 8).map(|i| f32_to_bf16_bits(((i % 5) as f32 - 2.0) * 0.2)).collect();
         let vc: Vec<u16> = (0..8 * 8 * 128 * 32).map(|i| f32_to_bf16_bits(((i % 9) as f32 - 4.0) * 0.2)).collect();
         let bt = vec![0i32, 1];
         let cl = vec![600i32, 300i32];
-        let d_q = pool.htod_persistent_in::<u16>(q).unwrap();
-        let d_kc = pool.htod_persistent_in::<u16>(kc).unwrap();
-        let d_vc = pool.htod_persistent_in::<u16>(vc).unwrap();
-        let d_bt = pool.htod_persistent_in::<i32>(bt).unwrap();
-        let d_cl = pool.htod_persistent_in::<i32>(cl).unwrap();
-        let d_out = pool.alloc_persistent_in::<u16>(N).unwrap();
-        let d_exp = pool.alloc_persistent_in::<f32>(2 * 8 * 2).unwrap();
-        let d_ml = pool.alloc_persistent_in::<f32>(2 * 8 * 2).unwrap();
-        let d_tmp = pool.alloc_persistent_in::<u16>(2 * 8 * 2 * 128).unwrap();
+        let d_q = htod_t::<u16> (&pool, q);
+        let d_kc = htod_t::<u16> (&pool, kc);
+        let d_vc = htod_t::<u16> (&pool, vc);
+        let d_bt = htod_t::<i32> (&pool, bt);
+        let d_cl = htod_t::<i32> (&pool, cl);
+        let d_out = alloc_t::<u16> (&pool, N);
+        let d_exp = alloc_t::<f32> (&pool, 2 * 8 * 2);
+        let d_ml = alloc_t::<f32> (&pool, 2 * 8 * 2);
+        let d_tmp = alloc_t::<u16> (&pool, 2 * 8 * 2 * 128);
         let mut kern = PagedKernels::new(dev.ctx()).unwrap();
         kern.paged_attention_v2(
             dev.stream(), 1, 32, 128,
@@ -1143,20 +1125,13 @@ mod paged_tests {
         }
 
         let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
-        let pool = dev
-            .create_pool(PoolConfig {
-                name: format!("k1h256-{}", std::process::id()),
-                kind: PoolKind::Weights,
-                bytes: 16 << 20,
-            })
-            .unwrap();
-        let d_q = pool.htod_persistent_in::<u16>(q.clone()).unwrap();
-        let d_kc = pool.htod_persistent_in::<u16>(key_cache.clone()).unwrap();
-        let d_vc = pool.htod_persistent_in::<u16>(value_cache.clone()).unwrap();
-        let d_bt = pool.htod_persistent_in::<i32>(block_tables.clone()).unwrap();
-        let d_cl = pool.htod_persistent_in::<i32>(context_lens.clone()).unwrap();
-        let d_out = pool.alloc_persistent_in::<u16>(NUM_SEQS * HEADS * HEAD_SIZE)
-            .unwrap();
+        let pool = dev.default_pool();
+        let d_q = htod_t::<u16> (&pool, q.clone());
+        let d_kc = htod_t::<u16> (&pool, key_cache.clone());
+        let d_vc = htod_t::<u16> (&pool, value_cache.clone());
+        let d_bt = htod_t::<i32> (&pool, block_tables.clone());
+        let d_cl = htod_t::<i32> (&pool, context_lens.clone());
+        let d_out = alloc_t::<u16> (&pool, NUM_SEQS * HEADS * HEAD_SIZE);
         dev.ctx().synchronize().unwrap();
 
         let mut kern = PagedKernels::new(dev.ctx()).unwrap();
@@ -1314,29 +1289,18 @@ mod paged_tests {
         }
 
         let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
-        let pool = dev
-            .create_pool(PoolConfig {
-                name: format!("k2h256-{}", std::process::id()),
-                kind: PoolKind::Weights,
-                bytes: 64 << 20,
-            })
-            .unwrap();
-        let d_q = pool.htod_persistent_in::<u16>(q.clone()).unwrap();
-        let d_kc = pool.htod_persistent_in::<u16>(key_cache.clone()).unwrap();
-        let d_vc = pool.htod_persistent_in::<u16>(value_cache.clone()).unwrap();
-        let d_bt = pool.htod_persistent_in::<i32>(block_tables.clone()).unwrap();
-        let d_cl = pool.htod_persistent_in::<i32>(context_lens.clone()).unwrap();
-        let d_out_v1 = pool.alloc_persistent_in::<u16>(NUM_SEQS * HEADS * HEAD_SIZE)
-            .unwrap();
-        let d_out_v2 = pool.alloc_persistent_in::<u16>(NUM_SEQS * HEADS * HEAD_SIZE)
-            .unwrap();
+        let pool = dev.default_pool();
+        let d_q = htod_t::<u16> (&pool, q.clone());
+        let d_kc = htod_t::<u16> (&pool, key_cache.clone());
+        let d_vc = htod_t::<u16> (&pool, value_cache.clone());
+        let d_bt = htod_t::<i32> (&pool, block_tables.clone());
+        let d_cl = htod_t::<i32> (&pool, context_lens.clone());
+        let d_out_v1 = alloc_t::<u16> (&pool, NUM_SEQS * HEADS * HEAD_SIZE);
+        let d_out_v2 = alloc_t::<u16> (&pool, NUM_SEQS * HEADS * HEAD_SIZE);
         const PARTS: usize = 2;
-        let d_exp = pool.alloc_persistent_in::<f32>(NUM_SEQS * HEADS * PARTS)
-            .unwrap();
-        let d_maxl = pool.alloc_persistent_in::<f32>(NUM_SEQS * HEADS * PARTS)
-            .unwrap();
-        let d_tmp = pool.alloc_persistent_in::<u16>(NUM_SEQS * HEADS * PARTS * HEAD_SIZE)
-            .unwrap();
+        let d_exp = alloc_t::<f32> (&pool, NUM_SEQS * HEADS * PARTS);
+        let d_maxl = alloc_t::<f32> (&pool, NUM_SEQS * HEADS * PARTS);
+        let d_tmp = alloc_t::<u16> (&pool, NUM_SEQS * HEADS * PARTS * HEAD_SIZE);
 
         let mut kern = PagedKernels::new(dev.ctx()).unwrap();
         let (q_p, kc_p, vc_p, bt_p, cl_p) = (
@@ -1408,13 +1372,7 @@ mod paged_tests {
     #[test]
     fn paged_attention_v1_bf16_h256_smoke() {
         let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
-        let pool = dev
-            .create_pool(PoolConfig {
-                name: format!("k1bh256-{}", std::process::id()),
-                kind: PoolKind::Weights,
-                bytes: 16 << 20,
-            })
-            .unwrap();
+        let pool = dev.default_pool();
         let n_kc = 8 * 2 * 32 * 32 * 8;
         let n_vc = 8 * 2 * 256 * 32;
         let q = vec![f32_to_bf16_bits(0.1); 8 * 256];
@@ -1422,12 +1380,12 @@ mod paged_tests {
         let vc = vec![f32_to_bf16_bits(0.3); n_vc];
         let bt = vec![0i32, 1];
         let cl = vec![16i32, 16];
-        let d_q = pool.htod_persistent_in::<u16>(q).unwrap();
-        let d_kc = pool.htod_persistent_in::<u16>(kc).unwrap();
-        let d_vc = pool.htod_persistent_in::<u16>(vc).unwrap();
-        let d_bt = pool.htod_persistent_in::<i32>(bt).unwrap();
-        let d_cl = pool.htod_persistent_in::<i32>(cl).unwrap();
-        let d_out = pool.alloc_persistent_in::<u16>(2 * 8 * 256).unwrap();
+        let d_q = htod_t::<u16> (&pool, q);
+        let d_kc = htod_t::<u16> (&pool, kc);
+        let d_vc = htod_t::<u16> (&pool, vc);
+        let d_bt = htod_t::<i32> (&pool, bt);
+        let d_cl = htod_t::<i32> (&pool, cl);
+        let d_out = alloc_t::<u16> (&pool, 2 * 8 * 256);
         dev.ctx().synchronize().unwrap();
         let mut kern = PagedKernels::new(dev.ctx()).unwrap();
         kern.paged_attention_v1(
@@ -1461,13 +1419,7 @@ mod paged_tests {
     #[test]
     fn paged_attention_v2_bf16_h256_smoke() {
         let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
-        let pool = dev
-            .create_pool(PoolConfig {
-                name: format!("k2bh256-{}", std::process::id()),
-                kind: PoolKind::Weights,
-                bytes: 16 << 20,
-            })
-            .unwrap();
+        let pool = dev.default_pool();
         const N: usize = 2 * 8 * 256;
         let q: Vec<u16> =
             (0..N).map(|i| f32_to_bf16_bits(((i % 7) as f32 - 3.0) * 0.25)).collect();
@@ -1477,15 +1429,15 @@ mod paged_tests {
             (0..8 * 2 * 256 * 32).map(|i| f32_to_bf16_bits(((i % 9) as f32 - 4.0) * 0.2)).collect();
         let bt = vec![0i32, 1];
         let cl = vec![600i32, 300i32];
-        let d_q = pool.htod_persistent_in::<u16>(q).unwrap();
-        let d_kc = pool.htod_persistent_in::<u16>(kc).unwrap();
-        let d_vc = pool.htod_persistent_in::<u16>(vc).unwrap();
-        let d_bt = pool.htod_persistent_in::<i32>(bt).unwrap();
-        let d_cl = pool.htod_persistent_in::<i32>(cl).unwrap();
-        let d_out = pool.alloc_persistent_in::<u16>(N).unwrap();
-        let d_exp = pool.alloc_persistent_in::<f32>(2 * 8 * 2).unwrap();
-        let d_ml = pool.alloc_persistent_in::<f32>(2 * 8 * 2).unwrap();
-        let d_tmp = pool.alloc_persistent_in::<u16>(2 * 8 * 2 * 256).unwrap();
+        let d_q = htod_t::<u16> (&pool, q);
+        let d_kc = htod_t::<u16> (&pool, kc);
+        let d_vc = htod_t::<u16> (&pool, vc);
+        let d_bt = htod_t::<i32> (&pool, bt);
+        let d_cl = htod_t::<i32> (&pool, cl);
+        let d_out = alloc_t::<u16> (&pool, N);
+        let d_exp = alloc_t::<f32> (&pool, 2 * 8 * 2);
+        let d_ml = alloc_t::<f32> (&pool, 2 * 8 * 2);
+        let d_tmp = alloc_t::<u16> (&pool, 2 * 8 * 2 * 256);
         let mut kern = PagedKernels::new(dev.ctx()).unwrap();
         kern.paged_attention_v2(
             dev.stream(), 1, 32, 256,

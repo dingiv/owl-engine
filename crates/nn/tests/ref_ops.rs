@@ -7,7 +7,7 @@ use common::{
     add, assert_allclose_f32, exp, gelu, matmul, mul, rmsnorm, silu, softmax_last_dim, Lcg,
 };
 use owl_cuda::CudaDevice;
-use owl_iface::{Device, MemPhase, PoolConfig, PoolKind};
+use owl_iface::MemPhase;
 use owl_nn::cublas::NnBlas;
 use owl_nn::ops::OpsCtx;
 use owl_nn::tensor::TensorPoolOps;
@@ -15,20 +15,8 @@ use owl_nn::tensor::TensorPoolOps;
 #[test]
 fn ref_ops_all_match_common_reference() {
     let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
-    let persist = dev
-        .create_pool(PoolConfig {
-            name: format!("ref-persist-{}", std::process::id()),
-            kind: PoolKind::Weights,
-            bytes: 8 << 20,
-        })
-        .unwrap();
-    let scratch = dev
-        .create_pool(PoolConfig {
-            name: format!("ref-scratch-{}", std::process::id()),
-            kind: PoolKind::Scratch,
-            bytes: 8 << 20,
-        })
-        .unwrap();
+    let persist = dev.default_pool();
+    let scratch = dev.default_pool();
     let blas = NnBlas::new(&dev).unwrap();
     let mut ops = OpsCtx::new(&dev).unwrap();
     let ctx = ops.ctx(MemPhase::Idle);
@@ -105,20 +93,8 @@ fn ref_ops_all_match_common_reference() {
 #[test]
 fn ref_chain_matmul_add_silu_rmsnorm() {
     let dev = CudaDevice::new(owl_cuda::test_device_ordinal(), owl_cuda::TEST_POOL_BYTES).expect("需要 CUDA 设备");
-    let persist = dev
-        .create_pool(PoolConfig {
-            name: format!("ref-chain-persist-{}", std::process::id()),
-            kind: PoolKind::Weights,
-            bytes: 8 << 20,
-        })
-        .unwrap();
-    let _scratch = dev
-        .create_pool(PoolConfig {
-            name: format!("ref-chain-scratch-{}", std::process::id()),
-            kind: PoolKind::Scratch,
-            bytes: 8 << 20,
-        })
-        .unwrap();
+    let persist = dev.default_pool();
+    let _scratch = dev.default_pool();
     let blas = NnBlas::new(&dev).unwrap();
     let mut ops = OpsCtx::new(&dev).unwrap();
     let ctx = ops.ctx(MemPhase::Idle);

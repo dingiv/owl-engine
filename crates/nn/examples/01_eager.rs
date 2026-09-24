@@ -5,7 +5,7 @@
 //! (roadmap.local.md 裁决 5)。结尾打印 ledger 快照并断言零漂移(A5)。
 
 use owl_cuda::CudaDevice;
-use owl_iface::{Device, PoolConfig, PoolKind};
+use owl_iface::Device;
 use owl_nn::cublas::NnBlas;
 use owl_nn::ops::OpsCtx;
 use owl_nn::tensor::TensorPoolOps;
@@ -73,13 +73,7 @@ fn main() {
     println!("设备: {} ({:.1} GiB)", dev.desc().uuid, dev.desc().total_bytes as f64 / 2f64.powi(30));
 
     // ---- P 阶段:建池 + 一次到位分配(含链中间量)----
-    let pool = dev
-        .create_pool(PoolConfig {
-            name: format!("e01-chain-{}", std::process::id()),
-            kind: PoolKind::Weights,
-            bytes: 16 << 20,
-        })
-        .expect("建池");
+    let pool = dev.default_pool();
     let blas = NnBlas::new(&dev).expect("NnBlas(workspace 预钉)");
     let mut ops = OpsCtx::new(&dev).expect("OpsCtx");
     let ctx = ops.ctx(owl_iface::MemPhase::Idle);
