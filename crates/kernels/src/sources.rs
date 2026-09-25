@@ -19,4 +19,6 @@ pub mod text {
     pub const EMBED_F32: &str = include_str!("../cu/text/embed_f32.cu");
     /// rope(interleaved partial)
     pub const ROPE_INTERLEAVED_F32: &str = include_str!("../cu/text/rope_f32.cu");
+    /// full-attention(narrow 窄切物化 + naive decode slot 直排)
+    pub const ATTENTION_F32: &str = include_str!("../cu/text/attention.cu");
 }

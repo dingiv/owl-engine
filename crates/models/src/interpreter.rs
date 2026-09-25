@@ -1,25 +1,29 @@
-//! 解释器:同一份声明,多种执行(每后端一个解释器)。
+//! 异步解释器:同一份声明,落地为后端原语(引擎主路径)。
 //!
 //! 解释器是对上层模型层(layer)的封装:layer 只写声明(TensorOps 链),
 //! 解释器负责把声明翻译成后端调用(alloc / lower / launch)——算子的
 //! 落地逻辑由解释器兜住,上层零后端知识。毒值在解释器边界落地
 //! (结构化报错 + depth 归因)。
 //!
-//! | 解释器 | 形态 | 后端 | 场景 |
-//! |---|---|---|---|
-//! | [`eval`] | 异步(face 注入,泛型静态分发) | `owl-cpu::CpuFace`(CPU:进程内同步直调,无 server)/ `owl-cuda::GpuClient`(GPU:actor server) | 引擎主路径 |
-//! | [`reduce`] + [`CpuInterpreter`] | 同步(纯 Rust 朴素归约) | 无后端(参考实现) | 测试/对拍基准 |
+//! | 入口 | 形态 | face |
+//! |---|---|---|
+//! | [`eval`] | 计算执行(层入口;驱动 Module::forward + 归约) | `owl-cpu::CpuFace` / `owl-cuda::GpuClient` |
+//! | [`eval_ops`] | 计算归约(内部件;手工子树/非层根) | 同上 |
+//! | [`eval_load`] | 装载执行(层入口;驱动 Loadable::layout) | 同上 |
 //!
 //! 后端契约 = `owl-iface::contract::DeviceClient`(线格式同源);
 //! 解释器本身不含后端代码 —— 后端经 face 泛型注入。
+//! 同步参考解释器(reduce/CpuInterpreter,对拍锚)已拆至 [`crate::reference`]。
 //! 毒值传播契约:构造期违约随链流动,`is_poisoned()` 可查,边界收割。
+//!
+//! **维度源头单一律(C1,2026-09-26 定案)**:本文件一切维度推导只读
+//! 声明 shape(`t.shape` / `t.parents[i].shape`);`Bytes.len` 不参与语义
+//! (Block 叶子 len=0),仅在边界做断言。
 
-use crate::error::ModelError;
-use crate::loader::{Layout, LoaderOps, WeightSource};
-use crate::plan::Op;
-use crate::shape::{numel, Shape};
-use crate::tensor::{Dtype, TensorOps};
-use crate::client::{Bytes, DeviceClient};
+use crate::contract::{Bytes, DeviceClient, ModelError};
+use crate::module::{Layout, LoaderOps, WeightSource};
+use crate::ops::Op;
+use crate::tensor::TensorOps;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -41,7 +45,7 @@ pub async fn eval<M, D>(
 ) -> Result<Bytes, ModelError>
 where
     M: crate::module::Module,
-    D: crate::client::DeviceClient,
+    D: crate::contract::DeviceClient,
 {
     let ops = layer.forward(xs, ctx);   // 层产出声明(ctx 引用透传)
     eval_ops(ops.step(), face).await    // 解释器归约
@@ -54,12 +58,12 @@ pub fn eval_ops<'a, D>(
     face: &'a mut D,
 ) -> Pin<Box<dyn Future<Output = Result<Bytes, ModelError>> + Send + 'a>>
 where
-    D: crate::client::DeviceClient + 'a,
+    D: crate::contract::DeviceClient + 'a,
 {
     Box::pin(_eval(t, face))
 }
 
-async fn _eval<D: crate::client::DeviceClient>(
+async fn _eval<D: crate::contract::DeviceClient>(
     t: &TensorOps,
     face: &mut D,
 ) -> Result<Bytes, ModelError> {
@@ -84,41 +88,52 @@ async fn _eval<D: crate::client::DeviceClient>(
         Op::Block { id } => Ok(Bytes { id: *id, len: 0 }),
         Op::Add => {
             let out = face.alloc(n_bytes).await?;
-            let msg = crate::actions::lower_add(&ins, &out);
+            let msg = crate::ops::lower_add(&ins, &out);
             face.launch(msg).await?;
             Ok(out)
         }
         Op::Mul => {
             let out = face.alloc(n_bytes).await?;
-            let msg = crate::actions::lower_mul(&ins, &out);
+            let msg = crate::ops::lower_mul(&ins, &out);
             face.launch(msg).await?;
             Ok(out)
         }
         Op::Silu => {
             let out = face.alloc(n_bytes).await?;
-            let msg = crate::actions::lower_silu(&ins, &out);
+            let msg = crate::ops::lower_silu(&ins, &out);
+            face.launch(msg).await?;
+            Ok(out)
+        }
+        Op::Sigmoid => {
+            let out = face.alloc(n_bytes).await?;
+            let msg = crate::ops::lower_sigmoid(&ins, &out);
             face.launch(msg).await?;
             Ok(out)
         }
         Op::Matmul => {
             let (m, n) = (shape[0], shape[1]);
-            let k = ins[0].len;
+            // k = 内维 = ins[0] 元素数 / m(多行 [m,k]:len = m×k,不能直接取 len
+            // —— 单行时两者相等,多行取 len 会越界读;此 bug 被"历届测试都单行"掩盖)
+            let k = ins[0].len / m.max(1);
             let out = face.alloc(m * n * dtype.size_bytes()).await?;
-            let msg = crate::actions::lower_matmul(&ins, &out, m, k, n);
+            let msg = crate::ops::lower_matmul(&ins, &out, m, k, n);
             face.launch(msg).await?;
             Ok(out)
         }
         Op::Rmsnorm { eps, w_off } => {
             let out = face.alloc(n_bytes).await?;
-            let cols = shape.last().copied().unwrap_or(0);
-            let rows = shape.iter().product::<usize>() / cols.max(1);
-            let msg = crate::actions::lower_rmsnorm(&ins, *eps, *w_off, &out, rows, cols);
+            // 归一化宽度由 alpha 的声明 shape 定义(per-head 行归一化:
+            // [T, H×HD] × alpha [HD])。不能取 ins[1].len —— Block 叶子 len=0。
+            let alpha_shape = t.parents[1].shape.clone();
+            let cols: usize = alpha_shape.iter().product::<usize>().max(1);
+            let rows = shape.iter().product::<usize>() / cols;
+            let msg = crate::ops::lower_rmsnorm(&ins, *eps, *w_off, &out, rows, cols);
             face.launch(msg).await?;
             Ok(out)
         }
         Op::Kernel { kernel } => {
             let out = face.alloc(n_bytes).await?;
-            let msg = crate::actions::lower_kernel(kernel, &t.args, &ins, &out);
+            let msg = crate::ops::lower_kernel(kernel, &t.args, &ins, &out);
             face.launch(msg).await?;
             Ok(out)
         }
@@ -141,10 +156,10 @@ pub async fn eval_load<M, D, S>(
     layer: &M,
     face: &mut D,
     src: &S,
-    ctx: &crate::loader::LoaderCtx,
+    ctx: &crate::module::LoaderCtx,
 ) -> Result<(), ModelError>
 where
-    M: crate::loader::Loadable,
+    M: crate::module::Loadable,
     D: DeviceClient,
     S: WeightSource + ?Sized,
 {
@@ -160,7 +175,7 @@ async fn eval_want<D: DeviceClient, S: WeightSource + ?Sized>(
     face: &mut D,
     src: &S,
 ) -> Result<(), ModelError> {
-    use crate::loader::f32b;
+    use crate::module::f32b;
     for w in want.wants() {
         let data = src.get(w.key).ok_or_else(|| {
             ModelError::Msg(format!("Weight '{}': 数据源缺键", w.key))
@@ -201,251 +216,8 @@ async fn eval_want<D: DeviceClient, S: WeightSource + ?Sized>(
             .htod(w.dtype, &shape, &bytes)
             .await
             .map_err(|e| ModelError::Msg(format!("Weight '{}': {e}", w.key)))?;
-        w.sink.deliver(crate::client::Bytes::new(b.id, n));
+        w.sink.deliver(crate::contract::Bytes::new(b.id, n));
     }
     Ok(())
 }
 
-// ============================================================================
-// §2 同步解释器 trait + 归约驱动(CPU 参考;测试/对拍)
-// ============================================================================
-
-/// 执行单节点:输入已就绪(归约序保证),产出输出。
-pub trait Interpreter {
-    /// Htod:host 字节入块
-    fn htod(&mut self, dtype: Dtype, shape: &Shape, bytes: &[u8]) -> Result<Value, ModelError>;
-    /// Zeros:清零分配
-    fn zeros(&mut self, dtype: Dtype, shape: &Shape) -> Result<Value, ModelError>;
-    /// Matmul:[m,k]×[k,n]
-    fn matmul(&mut self, a: &Value, b: &Value, dtype: Dtype, shape: &Shape) -> Result<Value, ModelError>;
-    /// Add(同形)
-    fn add(&mut self, a: &Value, b: &Value) -> Result<Value, ModelError>;
-    /// Mul(同形逐元素乘;MLP 门控/输出门)
-    fn mul(&mut self, a: &Value, b: &Value) -> Result<Value, ModelError>;
-    /// Silu
-    fn silu(&mut self, x: &Value) -> Result<Value, ModelError>;
-    /// Rmsnorm(parents = [x, alpha];per-channel alpha([cols] 广播);w_off = ×(1+w))
-    fn rmsnorm(
-        &mut self,
-        x: &Value,
-        alpha: &Value,
-        eps: f32,
-        w_off: bool,
-    ) -> Result<Value, ModelError>;
-    /// SlotWrite:KV 写槽(副作用;返回透传值)
-    fn slot_write(&mut self, v: &Value) -> Result<Value, ModelError> {
-        Ok(v.clone()) // CPU 参考实现:无状态,透传
-    }
-    /// Block 叶子解析:按 id 取已物化数据(server 侧 = 池账房反查)
-    fn block(&mut self, id: u64, dtype: Dtype, shape: &Shape) -> Result<Value, ModelError>;
-}
-
-/// f32 值块(同步参考解释器的值形态;后端版为池块句柄 /
-/// owl-cpu 的 [`owl_cpu::Value`] host 真值 —— 与后端实现互为独立副本)。
-#[derive(Clone, Debug, PartialEq)]
-pub struct Value {
-    pub f32: Vec<f32>,
-    pub shape: Shape,
-}
-
-impl Value {
-    /// 构造(外部 demo/测试用)
-    pub fn new(f32: Vec<f32>, shape: Shape) -> Self {
-        Self { f32, shape }
-    }
-}
-
-impl Value {
-    fn zero(dtype: Dtype, shape: &Shape) -> Result<Self, ModelError> {
-        if dtype != Dtype::F32 {
-            return Err(ModelError::Msg(format!(
-                "CPU 解释器仅 F32(S1),得 {dtype:?}"
-            )));
-        }
-        Ok(Value {
-            f32: vec![0.0; numel(shape)],
-            shape: shape.clone(),
-        })
-    }
-
-    fn from_bytes(dtype: Dtype, shape: &Shape, bytes: &[u8]) -> Result<Self, ModelError> {
-        if dtype != Dtype::F32 {
-            return Err(ModelError::Msg("CPU 解释器仅 F32".into()));
-        }
-        let n = numel(shape);
-        if bytes.len() != n * 4 {
-            return Err(ModelError::Msg(format!(
-                "Htod: 字节数 {} != {}×4",
-                bytes.len(),
-                n
-            )));
-        }
-        Ok(Value {
-            f32: bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect(),
-            shape: shape.clone(),
-        })
-    }
-}
-
-/// 同步归约驱动:自叶向根。毒值在此落地;资源错误直接 Err 过线。
-pub fn reduce(
-    t: &TensorOps,
-    itp: &mut impl Interpreter,
-) -> Result<Value, ModelError> {
-    // 毒值落地(案发 = depth + detail;LazyError 可回溯)
-    if let Some(e) = &t.err {
-        return Err(ModelError::Msg(format!(
-            "[毒值落地 @depth {}] {}",
-            e.at_depth, e.detail
-        )));
-    }
-    let ins: Vec<Value> = t
-        .parents
-        .iter()
-        .map(|p| reduce(p, itp))
-        .collect::<Result<_, _>>()?;
-    match &t.op {
-        Op::Htod { bytes } => itp.htod(t.dtype, &t.shape, bytes),
-        Op::Zeros => itp.zeros(t.dtype, &t.shape),
-        Op::Matmul => itp.matmul(&ins[0], &ins[1], t.dtype, &t.shape),
-        Op::Add => itp.add(&ins[0], &ins[1]),
-        Op::Mul => itp.mul(&ins[0], &ins[1]),
-        Op::Silu => itp.silu(&ins[0]),
-        Op::Rmsnorm { eps, w_off } => itp.rmsnorm(&ins[0], &ins[1], *eps, *w_off),
-        Op::SlotWrite => itp.slot_write(&ins[0]),
-        Op::Block { id } => itp.block(*id, t.dtype, &t.shape),
-        // 逃逸舱:client 侧闭包就地执行(不经 GpuFace;server 派发表不见它)
-        Op::Kernel { kernel, .. } => Err(ModelError::Msg(format!(
-            "Kernel 节点 \"{}\" 需 GPU server 执行(后端编译 + 发射;CPU 参考解释器不支持)",
-            kernel.name
-        ))),
-        other => Err(ModelError::Msg(format!(
-            "CPU 参考解释器未覆盖: {other:?}(server 侧实现)"
-        ))),
-    }
-}
-
-// ============================================================================
-// §3 CpuInterpreter:同步 CPU 解释器(朴素实现;对拍锚)
-// ============================================================================
-
-/// 调试门控:OWL_DEBUG=1 开启解释层发射日志
-fn dbg_on() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("OWL_DEBUG").is_some())
-}
-
-/// CPU 参考解释器(朴素实现;**永不优化** —— 它的存在意义就是对拍
-/// 后端实现:`owl-cpu::CpuFace` / `owl-cuda::GpuClient`。两侧算子实现
-/// 互为独立副本,禁止互相引用,否则对拍失效)。
-pub struct CpuInterpreter {
-    /// Block 叶子登记表(id → 值;rt::Tensor 物化时由绑定方注册)
-    blocks: std::collections::HashMap<u64, Value>,
-}
-
-impl Default for CpuInterpreter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl CpuInterpreter {
-    pub fn new() -> Self {
-        Self { blocks: std::collections::HashMap::new() }
-    }
-
-    /// 登记 Block 叶子的数据(id = rt::Tensor 的全局 id)
-    pub fn bind(&mut self, id: u64, v: Value) {
-        self.blocks.insert(id, v);
-    }
-}
-
-impl Interpreter for CpuInterpreter {
-    fn htod(&mut self, dtype: Dtype, shape: &Shape, bytes: &[u8]) -> Result<Value, ModelError> {
-        Value::from_bytes(dtype, shape, bytes)
-    }
-
-    fn zeros(&mut self, _dtype: Dtype, shape: &Shape) -> Result<Value, ModelError> {
-        Value::zero(_dtype, shape)
-    }
-
-    fn matmul(
-        &mut self,
-        a: &Value,
-        b: &Value,
-        _dtype: Dtype,
-        shape: &Shape,
-    ) -> Result<Value, ModelError> {
-        if dbg_on() {
-            eprintln!("[dbg mm] a.shape={:?} a.len={} b.shape={:?} b.len={} shape={:?}", a.shape, a.f32.len(), b.shape, b.f32.len(), shape);
-        }
-        // k = 内维 = a 的元素数 / m(行主序)
-        let m_rows = a.shape[0].max(1);
-        let k = a.f32.len() / m_rows;
-        let (m, n) = (shape[0], shape[1]);
-        let mut out = vec![0.0f32; m * n];
-        for i in 0..m {
-            for p in 0..k {
-                let av = a.f32[i * k + p];
-                for j in 0..n {
-                    out[i * n + j] += av * b.f32[p * n + j];
-                }
-            }
-        }
-        Ok(Value { f32: out, shape: shape.clone() })
-    }
-
-    fn add(&mut self, a: &Value, b: &Value) -> Result<Value, ModelError> {
-        Ok(Value {
-            f32: a.f32.iter().zip(&b.f32).map(|(x, y)| x + y).collect(),
-            shape: a.shape.clone(),
-        })
-    }
-
-    fn mul(&mut self, a: &Value, b: &Value) -> Result<Value, ModelError> {
-        Ok(Value {
-            f32: a.f32.iter().zip(&b.f32).map(|(x, y)| x * y).collect(),
-            shape: a.shape.clone(),
-        })
-    }
-
-    fn block(&mut self, id: u64, _dtype: Dtype, _shape: &Shape) -> Result<Value, ModelError> {
-        self.blocks.get(&id).cloned().ok_or_else(|| {
-            ModelError::Msg(format!("Block {id} 未绑定(需先登记物化数据)"))
-        })
-    }
-
-    fn silu(&mut self, x: &Value) -> Result<Value, ModelError> {
-        Ok(Value {
-            f32: x.f32.iter().map(|v| v / (1.0 + (-v).exp())).collect(),
-            shape: x.shape.clone(),
-        })
-    }
-
-    fn rmsnorm(
-        &mut self,
-        x: &Value,
-        alpha: &Value,
-        eps: f32,
-        w_off: bool,
-    ) -> Result<Value, ModelError> {
-        // per-channel alpha([cols] 广播;与 GPU owl_rmsnorm_f32 同一语义)
-        let cols = x.shape.last().copied().unwrap_or(0).max(1);
-        let rows = x.f32.len() / cols;
-        let mut out = vec![0.0f32; x.f32.len()];
-        for r in 0..rows {
-            let xs = &x.f32[r * cols..(r + 1) * cols];
-            let ms = xs.iter().map(|v| v * v).sum::<f32>() / cols as f32;
-            let inv = 1.0 / (ms + eps).sqrt();
-            for (c, v) in xs.iter().enumerate() {
-                let g = if w_off { alpha.f32[c] + 1.0 } else { alpha.f32[c] };
-                out[r * cols + c] = v * inv * g;
-            }
-        }
-        Ok(Value { f32: out, shape: x.shape.clone() })
-    }
-}

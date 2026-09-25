@@ -16,18 +16,32 @@
 //! 那么这种设计，它的一个期望是说，哎，我让上层的这些代码量最大的这个layer声明和models声明，让它们的一些重复琐碎的代码尽可能的减少。然后呢，把副作用呢移出这些层。
 //! 也不是说没有代价的，对吧？那我们啊需要定义更加复杂的这些结构和解释器去执行上层的这些声明式的语法。并且呢，它的能力是受限的。那么，但其实这也不能说是一个缺点啊，但是它是一个。啊，不方便的一个点。啊，但是这没有关系啊，我们可以在它能力不足的时候啊，我们可以为它扩充一些新的能力.
 
+use crate::contract::{ModelError, numel, Shape};
 use crate::device::Device;
-use crate::error::{LazyError, ModelError};
 use crate::kernel::Kernel;
-use crate::plan::{KernelArg, Op};
-use crate::shape::{numel, Shape};
+use crate::ops::{KernelArg, Op};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+// ============================================================================
+// §0 LazyError:描述层毒值载荷(server 不感知)
+// ============================================================================
+
+/// 毒值载荷:案发坐标 + 细节。反向树可沿 parents 反演——错误现场永远可重放。
+/// (执行层资源错误是另一族:ModelError 直接 Err 过线,不经毒值;
+///  两族错误分而治之,原 error.rs 已并入本文件与 contract.rs。)
+#[derive(Debug, Clone)]
+pub struct LazyError {
+    /// 案发节点深度(归约链上的坐标,供回溯)
+    pub at_depth: u32,
+    /// 案发算子 + 双方元数据(如 "add: 形状不符 [4] vs [3]")
+    pub detail: String,
+}
 
 // ============================================================================
 // §1 Dtype:标注词汇(权威在 iface::contract;re-export 保路径)
 // ============================================================================
 
-pub use owl_iface::contract::Dtype;
+pub use crate::contract::Dtype;
 
 // ============================================================================
 // §2 TensorOps:声明式链式 API(客户主入口)
@@ -251,10 +265,23 @@ impl TensorOps {
         self.join(Op::Silu, None, meta, vec![])
     }
 
+    /// 逐元素 sigmoid(注意力输出门;GDN beta 同族)
+    pub fn sigmoid(&self) -> TensorOps {
+        let meta = (self.dtype, self.shape.clone());
+        self.join(Op::Sigmoid, None, meta, vec![])
+    }
+
     /// ×(1+w) 语义(w_off = true;use_norm_offset)
-    /// 二元(x + alpha 双 parent):alpha 必须入树,归约才有输入
+    /// 二元(x + alpha 双 parent):alpha 必须入树,归约才有输入。
+    /// 形状律:归一化宽度由 alpha 定义 —— x 任意前导维折叠为行,
+    /// x.total % alpha.len() == 0 即可(Qwen3.5 qk-norm:[T, H×HD] ×
+    /// alpha [HD] = per-head 行归一化,同 HF flatten(0,1) 语义)
     pub fn rmsnorm(&self, alpha: &TensorOps, eps: f32, w_off: bool) -> TensorOps {
-        if let Some(e) = self.shape_rule(alpha, "rmsnorm", |a, b| a.last() == b.last()) {
+        if let Some(e) = self.shape_rule(alpha, "rmsnorm", |a, b| {
+            let cols: usize = b.iter().product();
+            let total: usize = a.iter().product();
+            cols > 0 && total % cols == 0
+        }) {
             return self.poisoned_local(e);
         }
         let meta = (self.dtype, self.shape.clone());

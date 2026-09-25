@@ -5,7 +5,7 @@
 //! - 池块句柄 `Bytes` 由各设备自定义(CPU = Arc 内存;GPU = 池块);
 //! - owl-cuda server 将来实现本 trait(经 async 面桥接,见 async-runtime.md)。
 
-use crate::error::ModelError;
+use crate::contract::ModelError;
 use std::sync::Arc;
 
 /// 设备种类(标识/日志/归因用;路由逻辑不在此)

@@ -121,6 +121,7 @@ impl DeviceClient for CpuFace {
             "owl_add_f32" => ops::add(&vals[0], &vals[1])?,
             "owl_mul_f32" => ops::mul(&vals[0], &vals[1])?,
             "owl_silu_f32" => ops::silu(&vals[0])?,
+            "owl_sigmoid_f32" => ops::sigmoid(&vals[0])?,
             "owl_matmul_f32" => {
                 // 标量与 lower_matmul 对位:m/k/n
                 let (m, _k, n) = (i32s[0] as usize, i32s[1] as usize, i32s[2] as usize);

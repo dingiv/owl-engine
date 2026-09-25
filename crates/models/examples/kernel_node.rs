@@ -3,9 +3,9 @@
 //! 同时验证 grid 哨兵(自动 1D)与 with_launch 显式发射配置两条路径。
 
 use owl_cuda::{Command, DeviceSelector, GpuClient, GpuServer};
-use owl_models::client::DeviceClient as _;
+use owl_models::contract::DeviceClient as _;
 use owl_models::Dtype;
-use owl_models::shape::Shape;
+use owl_models::contract::Shape;
 use owl_models::{Kernel, TensorOps};
 
 // 槽序契约:标量/输入参数按声明序,输出块固定在最后一个形参

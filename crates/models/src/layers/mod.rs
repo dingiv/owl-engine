@@ -15,12 +15,13 @@
 //! 模块地图(试水批):
 //! - [`linear`] / [`rmsnorm`] / [`mlp`]:纯语义算子层(双 face 可对拍)
 //! - [`embedding`] / [`rope`]:Kernel 节点试水件
+//! - [`attention`]:M-b 批(qk-norm 复用 rmsnorm w_off + gate 切分/naive attn kernel)
 //!
 //! 未搬(试水通过后逐个立项,勿一把梭):
-//! full attention(qk-norm + output gate + paged/naive attn)、
 //! GatedDeltaNet(18/24 层,conv1d + delta rule 五 kernel 族)、
 //! DecoderLayer 编排、vision ViT、MTP、chunked prefill、量化。
 
+pub mod attention;
 pub mod embedding;
 pub mod linear;
 pub mod mlp;

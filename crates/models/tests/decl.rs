@@ -1,8 +1,8 @@
 //! 声明式模型的边界验收:毒值、形状违约、数值对拍。
 
 use owl_models::tensor::Dtype;
-use owl_models::error::ModelError;
-use owl_models::interpreter::{reduce, CpuInterpreter};
+use owl_models::contract::ModelError;
+use owl_models::reference::{reduce, CpuInterpreter};
 
 use owl_models::TensorOps;
 

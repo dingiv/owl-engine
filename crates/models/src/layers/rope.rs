@@ -10,10 +10,10 @@
 //! 取数(不经外部数据源);forward 常驻块引用。
 //! kernel 源 = 注册表 `owl_rope_interleaved_partial_f32`(owl-kernels cu/text)。
 
-use crate::error::ModelError;
+use crate::contract::ModelError;
 use crate::kernel::Kernel;
-use crate::kernels;
-use crate::loader::{Loadable, LoaderCtx, LoaderOps, Weight};
+use crate::kernel;
+use crate::module::{Loadable, LoaderCtx, LoaderOps, Weight};
 use crate::tensor::Dtype;
 use crate::TensorOps;
 
@@ -71,15 +71,15 @@ impl Rope {
     }
 
     /// 容器内表源(执行器取数用;借用层内表,生命周期随层)
-    pub fn tables(&self) -> crate::loader::TableSource<'_> {
-        crate::loader::TableSource::new(vec![
+    pub fn tables(&self) -> crate::module::TableSource<'_> {
+        crate::module::TableSource::new(vec![
             ("cos_table", &self.cos_data),
             ("sin_table", &self.sin_data),
         ])
     }
 
     fn launch_kernel(name: &'static str, tokens: usize) -> Kernel {
-        kernels::kernel_with(name, (tokens as u32, 1, 1), (128, 1, 1), 0)
+        kernel::kernel_with(name, (tokens as u32, 1, 1), (128, 1, 1), 0)
     }
 
     /// q 旋转:[T, Hq*HD] → [T, Hq*HD](前 rotary_dim 维转,余直通)

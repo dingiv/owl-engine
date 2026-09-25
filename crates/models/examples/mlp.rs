@@ -12,8 +12,8 @@
 //! OWL_TEST_DEVICE=3 cargo run -p owl-models --example mlp -- gpu
 //! ```
 
-use owl_models::client::DeviceClient;
-use owl_models::error::ModelError;
+use owl_models::contract::DeviceClient;
+use owl_models::contract::ModelError;
 use owl_cpu::CpuFace;
 use owl_models::interpreter::eval;
 use owl_models::module::KernelCtx;

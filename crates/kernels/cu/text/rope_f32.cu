@@ -1,14 +1,14 @@
 // rope:interleaved partial(Qwen3.5:rotary_dim 64/256,相邻对 2i/2i+1)
 // fused 不做(q/k 独立发射,单输出契约);一 block 一 token。
+// 标量形参 = size_t(与 Arg::U64/arg_usize 8 字节严格对位);
+// 输出块固定末参(槽序契约 4)。
 extern "C" __global__ void owl_rope_interleaved_partial_f32(
     const float* x,            // [tokens, heads, head_dim]
-    float* out,                // [tokens, heads, head_dim]
     const float* cos_t,        // [max_pos, half]
     const float* sin_t,        // [max_pos, half]
     const float* pos,          // [tokens](f32 数值形态)
-    unsigned int heads,
-    unsigned int head_dim,
-    unsigned int half) {
+    size_t heads, size_t head_dim, size_t half,
+    float* out) {              // [tokens, heads, head_dim]
     unsigned int t = blockIdx.x;
     unsigned int p = (unsigned int)pos[t];
     const float* c = cos_t + (unsigned long long)p * half;

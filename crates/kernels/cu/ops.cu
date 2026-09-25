@@ -25,6 +25,13 @@ extern "C" __global__ void owl_mul_f32(
     if (i < n) { out[i] = a[i] * b[i]; }
 }
 
+// 逐元素 sigmoid(attn_output_gate 门;GDN beta 同族)
+extern "C" __global__ void owl_sigmoid_f32(
+    const float* x, float* out, const size_t n) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { out[i] = 1.0f / (1.0f + expf(-x[i])); }
+}
+
 // [m,k] × [k,n] → [m,n](行主序;grid 二维:行 × 列)
 extern "C" __global__ void owl_matmul_f32(
     const float* a, const float* b, float* out,

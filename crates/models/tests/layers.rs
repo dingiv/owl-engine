@@ -1,12 +1,12 @@
 //! layers 试水批测试:容器 + load 钩子 + forward 纯声明的生命周期契约
 //! + 语义算子层数值对拍(CPU face 全链)+ Kernel 试水件声明构造。
 
-use owl_models::client::DeviceClient;
+use owl_models::contract::DeviceClient;
 use owl_models::interpreter::{eval_ops, eval_load};
 use owl_models::module::KernelCtx;
 use owl_models::Module;
-use owl_models::loader::Loadable;
-use owl_models::layers::{embedding, linear, mlp, rmsnorm, rope};
+use owl_models::module::Loadable;
+use owl_models::layers::{attention, embedding, linear, mlp, rmsnorm, rope};
 use owl_models::tensor::Dtype;
 use owl_models::TensorOps;
 use std::collections::HashMap;
@@ -224,12 +224,99 @@ async fn rope_declaration_is_wellformed() {
 }
 
 // ============================================================================
+// Sigmoid:语义算子(注意力输出门;CPU face 可跑)
+// ============================================================================
+
+#[tokio::test]
+async fn sigmoid_semantic_op_matches_host() {
+    let x: Vec<f32> = vec![0.0, 1.0, -2.0, 10.0, -10.0, 0.25];
+    let mut face = owl_cpu::CpuFace::new();
+    let xs = TensorOps::from_host(Dtype::F32, vec![2, 3], &f32b(&x));
+    let got = harvest(&mut face, &xs.sigmoid()).await;
+    for (g, v) in got.iter().zip(&x) {
+        let want = 1.0 / (1.0 + (-v).exp());
+        assert!((g - want).abs() < 1e-6, "{g} vs {want}");
+    }
+}
+
+// ============================================================================
+// RmsNorm ×(1+w) 变体(Qwen3.5 qk-norm per-head add_one)
+// ============================================================================
+
+#[tokio::test]
+async fn rmsnorm_add_one_variant_matches_host() {
+    let n = 4usize;
+    let gamma = vec![0.5, 1.0, 1.5, 2.0];
+    let x = vec![0.5, -1.0, 2.0, 0.25];
+    let mut face = owl_cpu::CpuFace::new();
+    let norm = rmsnorm::RmsNorm::new_add_one("q_norm", n, 1e-6);
+    let src = Src::from([("q_norm".to_string(), gamma.clone())]);
+    eval_load(&norm, &mut face, &src, &Default::default()).await.expect("eval_load");
+
+    let xs = TensorOps::from_host(Dtype::F32, vec![1, n], &f32b(&x));
+    let got = harvest(&mut face, &norm.forward(&xs, &KernelCtx::default())).await;
+    let ms = x.iter().map(|v| v * v).sum::<f32>() / n as f32;
+    let inv = 1.0 / (ms + 1e-6).sqrt();
+    for (c, g) in got.iter().enumerate() {
+        let want = x[c] * inv * (gamma[c] + 1.0);
+        assert!((g - want).abs() < 1e-5, "[{c}] {g} vs {want}");
+    }
+}
+
+// ============================================================================
+// Attention(M-b):装载六槽 + 声明形态 + 毒值契约(Kernel 节点面 GPU 例验证)
+// ============================================================================
+
+/// attention 小型配置(hq=2, hkv=1, hd=4, hidden=3)的六槽源
+fn attention_src(hq: usize, hkv: usize, hd: usize, hidden: usize) -> Src {
+    Src::from([
+        ("q_proj".to_string(), (0..hq * hd * 2 * hidden).map(|i| (i as f32 * 0.011) - 0.3).collect()),
+        ("k_proj".to_string(), (0..hkv * hd * hidden).map(|i| (i as f32 * 0.013) - 0.2).collect()),
+        ("v_proj".to_string(), (0..hkv * hd * hidden).map(|i| (i as f32 * 0.017) - 0.1).collect()),
+        ("o_proj".to_string(), (0..hidden * hq * hd).map(|i| (i as f32 * 0.019) - 0.4).collect()),
+        ("q_norm".to_string(), (0..hd).map(|i| (i as f32 * 0.02) - 0.1).collect()),
+        ("k_norm".to_string(), (0..hd).map(|i| (i as f32 * 0.03) - 0.15).collect()),
+    ])
+}
+
+#[tokio::test]
+async fn attention_load_and_declaration_wellformed() {
+    let (hq, hkv, hd, hidden) = (2usize, 1usize, 4usize, 3usize);
+    let mut face = owl_cpu::CpuFace::new();
+    let attn = attention::Attention::new(hq, hkv, hd, hidden, 1e-6);
+    eval_load(&attn, &mut face, &attention_src(hq, hkv, hd, hidden), &Default::default())
+        .await
+        .expect("eval_load 六槽");
+
+    // 声明形态(decode,T=1):含 Kernel 节点,CPU face 不执行,只验形状与无毒
+    let tokens = 1usize;
+    let xs = TensorOps::from_host(Dtype::F32, vec![tokens, hidden], &f32b(&[0.5, -0.25, 1.0]));
+    let pos = TensorOps::from_host(Dtype::F32, vec![tokens], &f32b(&[7.0]));
+    let rp = rope::Rope::new(64, hd, 2, 10_000.0).expect("rope new");
+    eval_load(&rp, &mut face, &rp.tables(), &Default::default()).await.expect("rope 表物化");
+    let kv = attention::KvBuffers {
+        k_cache: TensorOps::zeros(Dtype::F32, vec![4, hkv, hd]),
+        v_cache: TensorOps::zeros(Dtype::F32, vec![4, hkv, hd]),
+        slots: TensorOps::from_host(Dtype::F32, vec![tokens], &f32b(&[0.0])),
+        kv_lens: TensorOps::from_host(Dtype::F32, vec![tokens], &f32b(&[1.0])),
+    };
+    let out = attn.forward(&xs, &rp, &pos, &kv, &KernelCtx { tokens });
+    assert!(!out.is_poisoned(), "装载后声明不应有毒");
+    assert_eq!(out.shape(), &[tokens, hidden]);
+
+    // 毒值契约:未装载容器 → forward 声明立即带毒(eval 边界收割)
+    let attn2 = attention::Attention::new(hq, hkv, hd, hidden, 1e-6);
+    let out2 = attn2.forward(&xs, &rp, &pos, &kv, &KernelCtx { tokens });
+    assert!(out2.is_poisoned(), "未装载槽的声明应立即带毒");
+}
+
+// ============================================================================
 // 顶层装载基本函数:load_weight(单权重 = 源 → 物化 → 装进容器)
 // ============================================================================
 
 #[tokio::test]
 async fn load_weight_basic() {
-    use owl_models::loader::load_weight;
+    use owl_models::module::load_weight;
     let mut face = owl_cpu::CpuFace::new();
 
     let mut w = linear::Linear::new("w", 2, 3).into_weight(); // 取出容器里的权重格

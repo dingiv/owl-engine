@@ -8,8 +8,8 @@
 //! 5. 捕获期违规命令(其他流任务/同步/搬运)被 server 结构化拒绝。
 
 use owl_cuda::{Command, DeviceSelector, GpuClient, GpuServer};
-use owl_models::client::{DeviceClient as _, GraphId};
-use owl_models::shape::Shape;
+use owl_models::contract::{DeviceClient as _, GraphId};
+use owl_models::contract::Shape;
 use owl_models::{Dtype, Kernel, TensorOps};
 
 const SCALE_CU: &str = r#"

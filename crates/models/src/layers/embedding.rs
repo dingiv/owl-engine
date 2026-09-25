@@ -3,8 +3,8 @@
 //! (lm_head 走 `lm_head_matmul`,转置槽第二份 —— 块复用待装载账立项)。
 //! 容器 + LoaderOps 装载形态。
 
-use crate::kernels;
-use crate::loader::{Loadable, LoaderCtx, LoaderOps, Weight};
+use crate::kernel;
+use crate::module::{Loadable, LoaderCtx, LoaderOps, Weight};
 use crate::module::{KernelCtx, Module};
 use crate::tensor::Dtype;
 use crate::TensorOps;
@@ -29,10 +29,10 @@ impl Embedding {
 
     /// 查表(Module 统一入口的实体;tokens 由 ctx 提供 —— 每步动态依赖)。
     /// grid = tokens(核内 blockIdx.x = token 行;发射配置声明期显式)。
-    /// 槽序契约:kernel 签名 (w, ids, out, d_dim) → T 槽序 w、ids,输出块末尾
+    /// 槽序契约:kernel 签名 (w, ids, d_dim, out) → T 槽序 w、ids,输出块末尾
     /// (w = 物化块引用,eval 时 Block 叶子零操作)。
     pub fn embed(&self, ids: &TensorOps, tokens: usize) -> TensorOps {
-        TensorOps::of(kernels::kernel_with(
+        TensorOps::of(kernel::kernel_with(
             "owl_embed_f32",
             (tokens as u32, 1, 1),
             (1, 1, 1),

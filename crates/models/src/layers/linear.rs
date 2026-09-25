@@ -4,8 +4,7 @@
 //! 权重槽 = 转置装载:数据源 [out, in] 行主序 → 声明 [in, out]
 //! (forward 直 matmul,decode 零转置)。
 
-use crate::loader::{Loadable, LoaderCtx, LoaderOps, Weight};
-use crate::module::{KernelCtx, Module};
+use crate::module::{KernelCtx, Loadable, LoaderCtx, LoaderOps, Module, Weight};
 use crate::TensorOps;
 
 pub struct Linear {
@@ -23,8 +22,6 @@ impl Linear {
     pub fn into_weight(self) -> Weight {
         self.w
     }
-
-
 }
 
 impl Module for Linear {

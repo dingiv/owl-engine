@@ -2,7 +2,7 @@
 
 use owl_models::device::Cpu;
 use owl_models::tensor::Dtype;
-use owl_models::interpreter::{reduce, CpuInterpreter};
+use owl_models::reference::{reduce, CpuInterpreter};
 use owl_models::tensor::Tensor;
 use owl_models::TensorOps;
 
@@ -56,8 +56,8 @@ fn main() {
 
     // ---- 执行:CPU 解释器;Block 叶子按 id 解析(登记表)----
     let mut itp = CpuInterpreter::new();
-    itp.bind(a_data.id(), owl_models::interpreter::Value::new(vec![1.0, 2.0, 3.0, 4.0], vec![1, 4]));
-    itp.bind(b_data.id(), owl_models::interpreter::Value::new(vec![10.0, 20.0, 30.0, 40.0], vec![1, 4]));
+    itp.bind(a_data.id(), owl_models::reference::Value::new(vec![1.0, 2.0, 3.0, 4.0], vec![1, 4]));
+    itp.bind(b_data.id(), owl_models::reference::Value::new(vec![10.0, 20.0, 30.0, 40.0], vec![1, 4]));
     let got = reduce(out.step(), &mut itp).expect("归约");
 
     // host 参考:(a+b) = [11,22,33,44];× 单位阵 = 不变

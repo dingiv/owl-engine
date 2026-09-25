@@ -6,7 +6,7 @@
 //! 容器 + LoaderOps 装载形态(子层描述 chain 聚合)。
 
 use super::linear::Linear;
-use crate::loader::{Loadable, LoaderCtx, LoaderOps};
+use crate::module::{Loadable, LoaderCtx, LoaderOps};
 use crate::module::{KernelCtx, Module};
 use crate::TensorOps;
 

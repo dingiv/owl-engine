@@ -1,6 +1,6 @@
 //! 朴素算子实现(CPU 后端的 launch 执行体;自 models CpuInterpreter 提炼)。
 //!
-//! ⚠️ **对拍锚纪律**:本文件与 `owl_models::interpreter::CpuInterpreter`
+//! ⚠️ **对拍锚纪律**:本文件与 `owl_models::reference::CpuInterpreter`
 //! 的算子实现**互为独立副本,禁止互相引用**——models 侧参考实现的存在
 //! 意义就是对拍后端,共享代码会让对拍失效。两侧语义必须一致
 //! (行主序 / k = a.len()/m / rmsnorm ×(1+w) 语义),数值路径允许分化
@@ -61,6 +61,14 @@ pub(crate) fn mul(a: &Value, b: &Value) -> Result<Value, ModelError> {
 pub(crate) fn silu(x: &Value) -> Result<Value, ModelError> {
     Ok(Value {
         f32: x.f32.iter().map(|v| v / (1.0 + (-v).exp())).collect(),
+        shape: x.shape.clone(),
+    })
+}
+
+/// 逐元素 sigmoid(attn_output_gate 门;GDN beta 同族)
+pub(crate) fn sigmoid(x: &Value) -> Result<Value, ModelError> {
+    Ok(Value {
+        f32: x.f32.iter().map(|v| 1.0 / (1.0 + (-v).exp())).collect(),
         shape: x.shape.clone(),
     })
 }
