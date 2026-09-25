@@ -24,9 +24,9 @@
 //! `Module` trait;统一 ForwardCtx 随 runner 立项)。
 
 use crate::contract::Dtype;
-use crate::layers::narrow_strided;
 use crate::kernel;
 use crate::layers::linear::Linear;
+use crate::layers::narrow_strided;
 use crate::layers::rmsnorm::RmsNorm;
 use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module};
 use crate::TensorOps;
@@ -62,12 +62,6 @@ impl Attention {
             hd,
             hidden,
         }
-    }
-
-    /// 非连续窄切物化 → 层间共享帮手(mod.rs narrow_strided;测试专用)
-    #[cfg(test)]
-    fn narrow(src: &TensorOps, outer: usize, src_dim: usize, start: usize, out_dim: usize, shape: crate::contract::Shape) -> TensorOps {
-        narrow_strided(src, outer, src_dim, start, out_dim, shape)
     }
 
     /// 计算声明(decode;xs [T, hidden],T = ctx.tokens;C4 后回归 Module)。

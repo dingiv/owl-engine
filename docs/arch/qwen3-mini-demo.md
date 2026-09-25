@@ -56,7 +56,7 @@ model.norm [1024]                                    ×1(终局 norm)
 | 5 | `layers/rope` | Kernel `owl_rope_half_partial_f32`(rotate-half+partial) | ✅ | HF parity ✓(GPU vs HF 类直跑) |
 | 6 | `layers/attention` | 3 GEMM + qk-norm(复用 rmsnorm w_off)+ rope 复用 + naive decode attn(K)+ gate sigmoid(语义)+ mul + o_proj | ✅ | GPU 端到端两步 decode vs host 全链 ✓(含 bisect 13 段 maxdiff 全零) |
 | 7 | `layers/gdn` | 4 GEMM + conv_upd3(K)+ gating(K×2)+ l2norm(K)+ delta_dec(K)+ rmsnorm_act(K) | ⏳ | GPU 端到端 |
-| 8 | `layers/decoder` | DecoderLayer(Full/Gdn 枚举)+ 残差编排 + 24 层主干 + tied lm_head | ⏳ | 层级组装后 |
+| 8 | `layers/decoder` | DecoderLayer(Full/Gdn 枚举)+ 双残差;Model 主干 + tied lm_head | 批7 ✅ / 批8 ⏳ | GPU vs host 全链 ✓(两分支) |
 | 9 | loader | safetensors → host f32(转置/重复通道)→ layer `new` | ⏳ | 权重指纹 |
 
 (K = Kernel 节点,.cu 随层携带,server nvrtc 懒编译零改动)
@@ -155,6 +155,23 @@ model.norm [1024]                                    ×1(终局 norm)
     升级为律:新层 host 参考审阅必查内维传参。)
 17. **narrow start 语义(2026-09-26 M-c 批 6 定案)**:`owl_narrow_strided_f32`
     的 `start` 是**行内列偏移**(dst[r·out+d] = src[r·src_dim+start+d]),
+    只能切列,**做不了行块偏移** —— conv 权重行切片串行(实测 wk 全错)。
+    行块偏移走段基址标量(conv 核 w_offset),勿用 narrow。
+18. **CSE / DAG 求值定律(2026-09-26 M-d 批 7 定案;用户裁决保留)**:TensorOps 树是
+    **DAG**(共享节点克隆保留同一 id),解释器必须按 DAG 求值——
+    `_eval` 带 memo(键 = 节点 id,作用域 = 单次 eval),同节点只执行一次。**无 CSE 时共享
+    子树(残差 h:既喃 ln2 又喃残差加)被重复求值,状态副作用 kernel
+    (conv/delta)二次滑状态 → 语义破坏**(实测 mlp 段恒定 ×1.017 偏差,
+    bisect 定位)。语义根因:值形态(深拷贝 clone)与引用语义(残差复用)
+    不一致——值出度被树语义钉死为 1,残差网络需要出度 ≥ 2 的 SSA。
+    **用户裁决:CSE memo 即正式求值语义,句柄化/arena 暂不立项**,
+    列为 M-f 图捕获期再评估(图 = DAG 的物化,memo 可升级为节点表)。
+19. **节点 id 空间分离律(2026-09-26 M-d 批 7 附带)**:`of_block` 声明
+    叶子的 id 必须走 `next_id()` 全局节点空间,块 id 是 server 侧另一套
+    计数 —— 直接复用会撞 CSE memo 键(实测 Rmsnorm gamma 撞 [8] 声明的
+    64 账长块,C1 断言拦截)。两套 id 空间的映射 = Op::Block{id} 字段。
+17. **narrow start 语义(2026-09-26 M-c 批 6 定案)**:`owl_narrow_strided_f32`
+    的 `start` 是**行内列偏移**(dst[r·out+d] = src[r·src_dim+start+d]),
     只能切列,**做不了行块偏移** —— conv 权重行切片串行(wk 全错)。
     行块偏移走段基址标量(conv 核 w_offset),勿用 narrow。
 
@@ -169,9 +186,10 @@ model.norm [1024]                                    ×1(终局 norm)
   host+GPU parity,gating/l2norm/norm_act 另接 HF golden;delta 核对拍 HF
   `torch_recurrent_gated_delta_rule` out+state 双对拍)+ 批 6 层组装
   (examples/gdn.rs 两步 decode vs host 全链 1e-4 ✓);
-- **M-c(gdn 层)**:五 kernel 全链,单层对拍(gdn_exemplars /
-  recurrence_parity 旧世界判例迁移);
-- **M-d(decoder)**:24 层组装 + tied lm_head,随机权重 forward 收敛;
+- **M-d(decoder 层)✅(2026-09-26)**:DecoderLayer(Full/Gdn 枚举 +
+  双残差)两分支 GPU vs host 全链 1e-4 ✓;CSE/DAG 求值 + 节点 id 空间
+  分离两条新律落定(§四 18/19);批 8(Model 主干 + tied lm_head)随
+  M-e loader 一并立项;
 - **M-e(真权重)**:loader 灌 0.8B safetensors,decode 冒烟
   (prompt → token 流,数值抽样对比 vLLM/transformers 基准);
 - **M-f(图)**:decode FULL 图捕获(server graph 三原语已就绪)。

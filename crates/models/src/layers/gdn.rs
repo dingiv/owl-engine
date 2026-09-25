@@ -1016,7 +1016,6 @@ mod tests {
     // ======================================================================
 
     use crate::layers::gdn::fixture::{gen, weights};
-    use crate::module::Module as _;
 
     const NK: usize = 2;
     const HK_DIM: usize = 4;

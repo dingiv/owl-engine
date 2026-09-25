@@ -22,6 +22,7 @@
 //! DecoderLayer 编排、vision ViT、MTP、chunked prefill、量化。
 
 pub mod attention;
+pub mod decoder;
 pub mod embedding;
 pub mod gdn;
 pub mod linear;
