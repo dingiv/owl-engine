@@ -1,0 +1,28 @@
+[project]
+name = "models"
+version = "0.1.0"
+description = "HF parity 黄金参考:transformers 层实现 vs owl 声明式层(进程边界对拍)"
+readme = "README.md"
+authors = [
+    { name = "div", email = "dingiv456@163.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    # torch 钉 CPU 轮(对拍在 CPU 跑;索引见 [tool.uv.sources])
+    "torch>=2.9",
+    "transformers>=4.57",
+    "safetensors>=0.6",
+    "numpy>=2.0",
+]
+
+# 脚本项目(非 python 包):只要依赖同步,不构建安装
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

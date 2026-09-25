@@ -355,3 +355,64 @@ pub async fn load_weight<D: DeviceClient, S: WeightSource + ?Sized>(
     weight.cell.deliver(b);
     Ok(())
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layers::linear::Linear;
+    use crate::testkit::{f32b, f32_of, Src};
+
+    #[tokio::test]
+    async fn load_weight_basic() {
+        let mut face = owl_cpu::CpuFace::new();
+        let mut w = Linear::new("w", 2, 3).into_weight();
+        assert!(!w.is_loaded(), "初始未装载");
+
+        let src = Src::from([("w".to_string(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])]);
+        load_weight(&mut w, &mut face, &src).await.expect("load_weight");
+        assert!(w.is_loaded(), "装载后应有块句柄");
+
+        let xs = crate::TensorOps::from_host(crate::contract::Dtype::F32, vec![1, 3], &f32b(&[0.5, -1.0, 2.0]));
+        let got = {
+            let bytes = crate::interpreter::eval_ops(xs.matmul(&w.decl()).step(), &mut face)
+                .await
+                .expect("eval");
+            let mut buf = vec![0u8; 8];
+            face.dtoh(&bytes, &mut buf).await.expect("dtoh");
+            f32_of(&buf)
+        };
+        assert!((got[0] - 4.5).abs() < 1e-6 && (got[1] - 9.0).abs() < 1e-6);
+
+        let mut w2 = Linear::new("w", 2, 3).into_weight();
+        let empty = Src::new();
+        assert!(load_weight(&mut w2, &mut face, &empty).await.is_err(), "缺键应 Err");
+        assert!(!w2.is_loaded(), "失败装载不应污染容器");
+    }
+
+    fn run_through<M: Module>(m: &M, x: &crate::TensorOps, ctx: &ForwardCtx) -> crate::TensorOps {
+        m.forward(x, ctx)
+    }
+
+    #[tokio::test]
+    async fn module_trait_polymorphism() {
+        let mlp = crate::layers::mlp::Mlp::new(4, 6);
+        let src = Src::from([
+            ("gate_proj".to_string(), vec![0.1; 24]),
+            ("up_proj".to_string(), vec![0.2; 24]),
+            ("down_proj".to_string(), vec![0.3; 24]),
+        ]);
+        let mut face = owl_cpu::CpuFace::new();
+        crate::interpreter::eval_load(&mlp, &mut face, &src, &Default::default())
+            .await
+            .expect("eval_load");
+
+        let x = crate::TensorOps::from_host(crate::contract::Dtype::F32, vec![1, 4], &f32b(&vec![0.5; 4]));
+        let ctx = ForwardCtx::minimal(1);
+        let a = crate::testkit::harvest(&mut face, &run_through(&mlp, &x, &ctx)).await;
+        let layers: Vec<&dyn Module> = vec![&mlp];
+        let b = crate::testkit::harvest(&mut face, &layers[0].forward(&x, &ctx)).await;
+        assert_eq!(a, b, "静态/动态分发同链同果");
+        assert_eq!(a.len(), 4);
+    }
+}

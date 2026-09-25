@@ -230,3 +230,51 @@ async fn eval_want<D: DeviceClient, S: WeightSource + ?Sized>(
     Ok(())
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testkit::{assert_close, f32b, gpu_client, gpu_enabled, harvest, skip_note};
+
+    fn inputs() -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let x: Vec<f32> = (0..4 * 16).map(|i| ((i as f32 * 0.31) - 3.0).sin()).collect();
+        let w1: Vec<f32> = (0..16 * 8).map(|i| (i as f32 * 0.11) - 0.6).collect();
+        let gamma: Vec<f32> = (0..8).map(|i| (i as f32 * 0.23) - 0.8).collect();
+        (x, w1, gamma)
+    }
+
+    /// 全语义算子复合树(多行):matmul → add → sigmoid → silu → mul → rmsnorm
+    fn composite_tree(x: &TensorOps, w1: &TensorOps, gamma: &TensorOps, w_off: bool) -> TensorOps {
+        let h1 = x.matmul(w1); // [4,16]×[16,8] → [4,8](多行 k;防单行掩盖)
+        let h2 = h1.add(&h1.sigmoid().silu().mul(&h1));
+        h2.rmsnorm(gamma, 1e-6, w_off)
+    }
+
+    /// GPU 后端 vs CPU 参考锚(同一棵声明树,双 face 分跑;
+    /// 数值到 HF 的对拍在各层 parity 测试)
+    #[tokio::test]
+    async fn gpu_semantic_ops_match_cpu_multirow() {
+        if !gpu_enabled() {
+            skip_note();
+            return;
+        }
+        use crate::tensor::Dtype;
+        let (x, w1, gamma) = inputs();
+        let mut cpu = owl_cpu::CpuFace::new();
+        let mut gpu = gpu_client().await;
+
+        for w_off in [false, true] {
+            let tree = composite_tree(
+                &TensorOps::from_host(Dtype::F32, vec![4, 16], &f32b(&x)),
+                &TensorOps::from_host(Dtype::F32, vec![16, 8], &f32b(&w1)),
+                &TensorOps::from_host(Dtype::F32, vec![8], &f32b(&gamma)),
+                w_off,
+            );
+            let cpu_out = harvest(&mut cpu, &tree).await;
+            let gpu_out = harvest(&mut gpu, &tree).await;
+            assert_close(&gpu_out, &cpu_out, 1e-5, &format!("w_off={w_off}"));
+        }
+
+        gpu.close().await.expect("server 关机");
+    }
+}

@@ -63,3 +63,101 @@ impl Module for Embedding {
         self.embed(ids, ctx.tokens)
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testkit::{assert_close, f32b, harvest, hf_python, parity_enabled, skip_note, st_read, st_write, tmp_path, Src};
+    use crate::tensor::Dtype;
+
+    #[tokio::test]
+    async fn declaration_is_wellformed() {
+        let mut face = owl_cpu::CpuFace::new();
+        let emb = Embedding::new(16, 4);
+        let src = Src::from([
+            ("w".to_string(), (0..64).map(|i| i as f32 * 0.1).collect()),
+            ("w_t".to_string(), (0..64).map(|i| i as f32 * 0.1).collect()),
+        ]);
+        crate::interpreter::eval_load(&emb, &mut face, &src, &Default::default())
+            .await
+            .expect("eval_load");
+
+        let ids = TensorOps::from_host(Dtype::F32, vec![2], &f32b(&[3.0, 7.0]));
+        let out = emb.embed(&ids, 2);
+        assert!(!out.is_poisoned(), "embedding 声明不应有毒");
+        assert_eq!(out.shape(), &[2, 4]);
+
+        let hidden = TensorOps::from_host(Dtype::F32, vec![1, 4], &f32b(&[0.1; 4]));
+        let logits = harvest(&mut face, &emb.lm_head_matmul(&hidden)).await;
+        assert_eq!(logits.len(), 16);
+    }
+
+    /// HF parity(查表 + tied lm_head;门控 OWL_HF_PARITY=1)
+    #[tokio::test]
+    async fn parity_matches_hf() {
+        if !parity_enabled() {
+            skip_note();
+            return;
+        }
+        let (tokens, vocab, d) = (3usize, 16usize, 4usize);
+        let ids: Vec<f32> = vec![3.0, 15.0, 0.0];
+        let w: Vec<f32> = (0..vocab * d).map(|i| (i as f32 * 0.1) - 0.8).collect();
+        let x: Vec<f32> = vec![0.2, -0.5, 1.1, 0.0];
+
+        let inp = tmp_path("embed_in");
+        let outp = tmp_path("embed_out");
+        st_write(&inp, &[
+            ("ids", &ids, vec![tokens]),
+            ("w", &w, vec![vocab, d]),
+            ("x", &x, vec![1, d]),
+        ]);
+        let manifest = hf_python("embedding.py", &[
+            inp.to_str().unwrap(), outp.to_str().unwrap(),
+            &format!(r#"{{"vocab": {vocab}, "d": {d}}}"#),
+        ]);
+        eprintln!("[hf manifest] embedding: {manifest}");
+        let want_y = st_read(&outp, "y");
+        let want_logits = st_read(&outp, "logits");
+
+        for (face_tag, on_gpu) in [("cpu", false), ("gpu", true)] {
+            if on_gpu && !crate::testkit::gpu_enabled() {
+                continue;
+            }
+            let (tag, y, logits) = if !on_gpu {
+                let mut face = owl_cpu::CpuFace::new();
+                let emb = Embedding::new(vocab, d);
+                let src = Src::from([
+                    ("w".to_string(), w.clone()),
+                    ("w_t".to_string(), w.clone()),
+                ]);
+                crate::interpreter::eval_load(&emb, &mut face, &src, &Default::default())
+                    .await.expect("eval_load");
+                // embed = Kernel 节点(CPU face 不执行);lm_head = 语义 matmul 可跑
+                let x_t = TensorOps::from_host(Dtype::F32, vec![1, d], &f32b(&x));
+                let y = want_y.clone(); // CPU 臂无 embed 执行,占位由 GPU 臂覆盖
+                let logits = harvest(&mut face, &emb.lm_head_matmul(&x_t)).await;
+                ("cpu", y, logits)
+            } else {
+                let mut gpu = crate::testkit::gpu_client().await;
+                let emb = Embedding::new(vocab, d);
+                let src = Src::from([
+                    ("w".to_string(), w.clone()),
+                    ("w_t".to_string(), w.clone()),
+                ]);
+                crate::interpreter::eval_load(&emb, &mut gpu, &src, &Default::default())
+                    .await.expect("eval_load");
+                let ids_t = TensorOps::from_host(Dtype::F32, vec![tokens], &f32b(&ids));
+                let x_t = TensorOps::from_host(Dtype::F32, vec![1, d], &f32b(&x));
+                let y = harvest(&mut gpu, &emb.embed(&ids_t, tokens)).await;
+                let logits = harvest(&mut gpu, &emb.lm_head_matmul(&x_t)).await;
+                gpu.close().await.expect("server 关机");
+                ("gpu", y, logits)
+            };
+            assert_close(&y, &want_y, 1e-5, &format!("embed-{face_tag}"));
+            assert_close(&logits, &want_logits, 1e-5, &format!("lmhead-{face_tag}"));
+        }
+        std::fs::remove_file(&inp).ok();
+        std::fs::remove_file(&outp).ok();
+    }
+}

@@ -133,3 +133,52 @@ impl Loadable for Rope {
     }
 
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testkit::f32b;
+    use crate::tensor::Dtype;
+
+    #[tokio::test]
+    async fn declaration_is_wellformed() {
+        let (head_dim, rotary_dim, heads) = (8usize, 4usize, 2usize);
+        let mut face = owl_cpu::CpuFace::new();
+        let rp = Rope::new(64, head_dim, rotary_dim, 10_000.0).expect("new");
+        crate::interpreter::eval_load(&rp, &mut face, &rp.tables(), &Default::default())
+            .await
+            .expect("表物化");
+
+        let pos = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[5.0]));
+        let q = TensorOps::from_host(
+            Dtype::F32,
+            vec![1, heads * head_dim],
+            &f32b(&vec![0.3; heads * head_dim]),
+        );
+
+        let out = rp.forward_q(&q, &pos, 1, heads);
+        assert!(!out.is_poisoned(), "rope 声明不应有毒");
+        assert_eq!(out.shape(), &[1, heads * head_dim]);
+
+        assert!(Rope::new(64, head_dim, 7, 10_000.0).is_err(), "非偶 rotary_dim 应拒");
+        assert!(Rope::new(64, head_dim, head_dim * 2, 10_000.0).is_err(), "超 head_dim 应拒");
+    }
+
+    /// Rope = 位置上下文机制(双输入 + pos),不进 Module(C4 后仍成立;
+    /// attention 经 ForwardCtx 持 &Rope 调用其固有 forward_q/k)
+    #[test]
+    fn stays_outside_module_interface() {
+        fn assert_impl<M: crate::module::Module>(_: &M) {}
+        assert_impl(&crate::layers::mlp::Mlp::new(2, 4)); // Mlp 在 Module 内
+        // Rope 无 forward(&TensorOps, &ForwardCtx) 签名 —— 编译期即证不在 trait 内
+        let rp = Rope::new(64, 8, 4, 10_000.0).expect("new");
+        let pos = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[5.0]));
+        let _ = rp.forward_q(
+            &TensorOps::from_host(Dtype::F32, vec![1, 16], &f32b(&vec![0.3; 16])),
+            &pos,
+            1,
+            2,
+        );
+    }
+}

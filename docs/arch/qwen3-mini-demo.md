@@ -19,7 +19,7 @@
 | full attn 头 | 8 q / 2 kv(GQA 4:1)× head_dim 256 | `num_key_value_heads=2` |
 | GDN 头 | 16 key × 128 / 16 value × 128(**无 GQA**) | q/k/v 各 2048 |
 | GDN conv | kernel 4,q\|k\|v 共 6144 通道 | `linear_conv_kernel_dim=4` |
-| RMSNorm eps | 1e-6 | qk-norm **×(1+w)**(add_one);主干 norm ×w |
+| RMSNorm eps | 1e-6 | **全系零中心 ×(1+w)**(2026-09-26 HF 实证:Qwen3_5RMSNorm weight 零初始化 = offset 形态,主干/q_norm/k_norm 同一类;原"主干 ×w"说法作废) |
 | vocab | 248320,**tied**(无 lm_head.weight) | embedding 兼 lm_head |
 | rope | theta **1e7**,partial **0.25** → rotary_dim 64,**interleaved**(相邻对 2i/2i+1) | mrope 文本路径退化为一份 pos |
 | attn_output_gate | **true** | q_proj 输出 = value\|gate 拼接(×2) |
@@ -118,7 +118,9 @@ model.norm [1024]                                    ×1(终局 norm)
     定义 —— x 任意前导维折叠为行([T, H×HD] × alpha [HD] = per-head 归一
     化,HF flatten(0,1) 同构);权威 = `ops.rs Op::Rmsnorm` 变体注记 +
     `ops.cu owl_rmsnorm_f32`,reference.rs / owl-cpu ops 为对拍副本。
-    w_off 留 flag 不拆 op(qk-norm 是唯一 add_one 用户);
+    w_off 留 flag 不拆 op。**Qwen3.5 全系 norm 走 add_one(HF 实证:
+    主干也零中心)**,装载时 RmsNorm 一律 new_add_one + checkpoint 存
+    offset 形态;×w 语义保留给旧系(Qwen3)与通用算子面;
 11. **维度源头单一律(C1,2026-09-26 定案)**:解释器一切维度推导只读
     声明 shape(t.shape / t.parents[i].shape);`Bytes.len` 不参与语义
     (Block 叶子 len=0),仅 debug 构建边界断言(matmul 多行 k 雷即违此律);
@@ -153,4 +155,5 @@ model.norm [1024]                                    ×1(终局 norm)
 |---|---|
 | 2026-09-25 | 立项:结构盘点(488 张量反推)+ 试水批落地(linear/rmsnorm/mlp/embedding/rope + Mul 算子),`tests/layers.rs` 5/5 绿 |
 | 2026-09-25 | 垫子层:`models::kernels` 注册表(owl-kernels cu/ → 登记 → layers 按名组合);kernel 源零内嵌;owl-kernels cudarc feature 化 |
+| 2026-09-26 | **HF parity 管道落地**(crates/models:pyproject uv 项目 + src/layers/<层名>.py(就近)(common.py 复用框架)+ tests/{common/mod.rs,parity_hf.rs} 测试套件;进程边界 safetensors 交换,OWL_HF_PARITY=1 门控);首战即修文档语义:Qwen3.5 全系 norm = 零中心 ×(1+w)(含主干),"主干 ×w"作废;顺带发现 Qwen3_5RMSNormGated = M-c gdn norm 的 HF 参照 |
 | 2026-09-26 | M-b attention 层落地(narrow/naive-attn/sigmoid);四雷回溯(u32 错位/槽序/Block len/matmul 多行 k);src 重组(12 碎文件→9,client/types/shape/error→contract.rs,plan/actions→ops.rs,module/loader→module.rs,interpreter 拆 reference.rs);API 稳定化快速批:C1/C2/C3/C6/C8/C12/C13 落地(详见 roadmap.local/api-stabilize-plan.md) |

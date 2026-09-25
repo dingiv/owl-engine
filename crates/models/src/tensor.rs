@@ -563,3 +563,108 @@ impl<D: Device> Tensor<D> {
         Ok(out)
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::contract::ModelError;
+    use crate::reference::{reduce, CpuInterpreter};
+
+    fn t(v: &[f32], shape: Shape) -> TensorOps {
+        TensorOps::from_host(Dtype::F32, shape, &crate::testkit::f32b(v))
+    }
+
+    #[test]
+    fn chain_matches_host_reference() {
+        let out = t(&[1.0, 2.0, -3.0, 4.0], vec![1, 4]).silu();
+        let got = reduce(out.step(), &mut CpuInterpreter::new()).unwrap();
+        let want: Vec<f32> = [1.0f32, 2.0, -3.0, 4.0]
+            .iter()
+            .map(|v| v / (1.0 + (-v).exp()))
+            .collect();
+        assert!(got.f32.iter().zip(&want).all(|(g, w)| (g - w).abs() < 1e-6));
+    }
+
+    #[test]
+    fn shape_mismatch_becomes_poison_not_panic() {
+        let a = t(&[1.0; 4], vec![4]);
+        let b = t(&[1.0; 3], vec![3]);
+        let chain = a.add(&b).silu();
+        assert!(chain.is_poisoned(), "描述期零失败(毒随链流)");
+        let err = reduce(chain.step(), &mut CpuInterpreter::new()).unwrap_err();
+        assert!(matches!(err, ModelError::Msg(ref m) if m.contains("毒值落地")));
+    }
+
+    #[test]
+    fn poison_flows_through_downstream_ops() {
+        let a = t(&[1.0; 4], vec![4]);
+        let bad = t(&[1.0; 3], vec![3]);
+        let mid = a.add(&bad);
+        assert!(mid.is_poisoned());
+        let out = mid.silu().add(&mid);
+        assert!(out.is_poisoned(), "毒必须流过下游,不能中途消失");
+        let err = reduce(out.step(), &mut CpuInterpreter::new()).unwrap_err();
+        assert!(format!("{err:?}").contains("形状不符"));
+    }
+
+    #[test]
+    fn matmul_shapes() {
+        let a = t(&[1.0, 2.0, 3.0, 4.0], vec![1, 4]);
+        let b = t(&[1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0], vec![4, 2]);
+        let got = reduce(a.matmul(&b).step(), &mut CpuInterpreter::new()).unwrap();
+        assert_eq!(got.f32, vec![4.0, 6.0]);
+        assert_eq!(got.shape, vec![1, 2]);
+    }
+
+    #[test]
+    fn flatten_covers_whole_tree() {
+        let a = t(&[1.0, 2.0], vec![2]);
+        let s = a.silu();
+        let sum = s.add(&s);
+        let flat = sum.flatten();
+        assert_eq!(flat.len(), 5, "值语义:重复消费 = 子树深拷贝");
+        assert!(flat.windows(2).all(|w| w[0].depth() <= w[1].depth()));
+        assert!(flat.iter().all(|x| !x.is_poisoned()));
+    }
+
+    #[test]
+    fn zeros_leaf_reduces() {
+        let got = reduce(
+            TensorOps::zeros(Dtype::F32, vec![2, 3]).step(),
+            &mut CpuInterpreter::new(),
+        )
+        .unwrap();
+        assert_eq!(got.f32, vec![0.0; 6]);
+    }
+
+    #[test]
+    fn sigmoid_semantic_op_matches_host() {
+        let x = vec![0.0, 1.0, -2.0, 10.0, -10.0, 0.25];
+        let xs = t(&x, vec![2, 3]);
+        let got = reduce(xs.sigmoid().step(), &mut CpuInterpreter::new())
+            .unwrap()
+            .f32;
+        for (g, v) in got.iter().zip(&x) {
+            let want = 1.0 / (1.0 + (-v).exp());
+            assert!((g - want).abs() < 1e-6, "{g} vs {want}");
+        }
+    }
+
+    #[test]
+    fn reshape_is_metadata_passthrough() {
+        let x: Vec<f32> = (0..6).map(|i| i as f32 * 0.5).collect();
+        let xs = t(&x, vec![2, 3]);
+
+        let out = xs.reshape(vec![3, 2]);
+        assert!(!out.is_poisoned());
+        assert_eq!(out.shape(), &[3, 2]);
+        let got = reduce(out.step(), &mut CpuInterpreter::new()).unwrap();
+        assert_eq!(got.f32, x, "reshape 透传父块,元素序不变");
+
+        let bad = xs.reshape(vec![7]);
+        assert!(bad.is_poisoned(), "元素数不守恒 → 毒");
+        let err = reduce(bad.step(), &mut CpuInterpreter::new()).unwrap_err();
+        assert!(format!("{err:?}").contains("reshape"), "{err:?}");
+    }
+}

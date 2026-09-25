@@ -55,6 +55,10 @@ pub use kernel::{Kernel, LaunchShape};
 pub use module::{ForwardCtx, KvBuffers, Module};
 pub use tensor::{LazyError, Tensor, TensorOps};
 
+/// 测试套件(就近测试的公共件;仅测试构建编译)
+#[cfg(test)]
+pub mod testkit;
+
 /// 本 crate 的结果别名:只用于**边界**(构造期装载 / 执行收割)。
 /// 描述层内部禁止出现(契约五)。
 pub type Result<T> = std::result::Result<T, ModelError>;

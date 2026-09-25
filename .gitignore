@@ -4,3 +4,4 @@ AGENTS.md
 *.local.md
 roadmap.local/
 target
+__pycache__
