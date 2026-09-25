@@ -5,10 +5,17 @@ edition.workspace = true
 license.workspace = true
 description = "Operator dispatch + unified kernel home: .cu sources, nvrtc compile, raw-pointer launchers"
 
+[features]
+# cuda_ops(build.rs nvcc 预编 PTX 面)才需要 cudarc;
+# 源码之家(sources)纯 include_str 零依赖 —— models 等上层引源不拖链接
+"default" = []
+"cuda" = ["dep:cudarc"]
+
 [dependencies]
-# 官方 cudarc:仅本 crate 的 cuda_ops 使用(kernel 编译与发射)
+# 官方 cudarc:仅本 crate 的 cuda_ops 使用(kernel 编译与发射;feature 化,
+# A4 纪律:非后端 crate 引源码之家时不拖 CUDA 链接)
 # nvrtc feature 仅为 Ptx 类型(load_module 入参;纯数据包装,零运行时编译)——
 # 编译本体已前移到 build.rs(nvcc 预编译 PTX)
-cudarc = { version = "0.19", default-features = false, features = [
+cudarc = { version = "0.19", default-features = false, optional = true, features = [
     "std", "driver", "nvrtc", "cuda-version-from-build-system", "dynamic-loading",
 ] }

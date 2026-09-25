@@ -1,58 +1,15 @@
 //! 预定义算子动作表:声明层具名算子 → LaunchMsg 的唯一 lower 通道。
 //!
-//! kernel 源内嵌于此(预定义算子的实现归解释层所有;
-//! 用户自定义 kernel 走 TensorOps::of(Kernel) 直带源码)。
+//! kernel 源**不住这里** —— 经 [`crate::kernels`] 注册表按名取用
+//! (源码之家 = owl-kernels cu/;2026-09-25 垫子层裁决)。
+//! 用户自定义 kernel 走 TensorOps::of(Kernel) 直带源码(不经注册表,
+//! 它是组合面逃生舱)。
 
 use crate::client::{Arg, Bytes, KernelSpec, LaunchMsg};
+use crate::kernels;
 
-/// 预定义 f32 算子源(add/silu/matmul/rmsnorm)
-pub const PREDEFINED_CU: &str = r#"
-extern "C" __global__ void owl_add_f32(
-    const float* a, const float* b, float* out, const size_t n) {
-    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) { out[i] = a[i] + b[i]; }
-}
-extern "C" __global__ void owl_silu_f32(
-    const float* x, float* out, const size_t n) {
-    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) { out[i] = x[i] / (1.0f + expf(-x[i])); }
-}
-extern "C" __global__ void owl_matmul_f32(
-    const float* a, const float* b, float* out,
-    const int m, const int k, const int n) {
-    const int r = blockIdx.x * blockDim.x + threadIdx.x;
-    const int c = blockIdx.y * blockDim.y + threadIdx.y;
-    if (r < m && c < n) {
-        float acc = 0.0f;
-        for (int p = 0; p < k; p++) { acc += a[(size_t)r * k + p] * b[(size_t)p * n + c]; }
-        out[(size_t)r * n + c] = acc;
-    }
-}
-extern "C" __global__ void owl_rmsnorm_f32(
-    const float* x, const float* alpha, float* out,
-    const int n, const float eps, const int w_off) {
-    extern __shared__ float smem[];
-    const int row = blockIdx.x;
-    const float* xin = x + (size_t)row * n;
-    float* y = out + (size_t)row * n;
-    float local = 0.0f;
-    for (int c = threadIdx.x; c < n; c += blockDim.x) { local += xin[c] * xin[c]; }
-    smem[threadIdx.x] = local;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) { smem[threadIdx.x] += smem[threadIdx.x + s]; }
-        __syncthreads();
-    }
-    const float inv = rsqrtf(smem[0] / (float)n + eps);
-    for (int c = threadIdx.x; c < n; c += blockDim.x) {
-        const float a = w_off ? (alpha[c] + 1.0f) : alpha[c];
-        y[c] = xin[c] * inv * a;
-    }
-}
-"#;
-
-fn spec(name: &str) -> KernelSpec {
-    KernelSpec { name: name.to_string(), source: PREDEFINED_CU.to_string() }
+fn spec(name: &'static str) -> KernelSpec {
+    KernelSpec { name: name.to_string(), source: kernels::source(name).to_string() }
 }
 
 fn ceil_1d(n: usize) -> (u32, u32, u32) {
@@ -70,6 +27,19 @@ pub fn lower_add(ins: &[Bytes], out: &Bytes) -> LaunchMsg {
             Arg::Block { id: out.id },
             Arg::U64(n as u64),
         ],
+        grid: ceil_1d(n),
+        block: (256, 1, 1),
+        shared_mem: 0,
+        out_elems: n,
+    }
+}
+
+/// lower:Mul(同形逐元素乘)
+pub fn lower_mul(ins: &[Bytes], out: &Bytes) -> LaunchMsg {
+    let n: usize = ins[0].len; // Bytes.len = 元素数(alloc/htod 均按元素登记)
+    LaunchMsg {
+        kernel: spec("owl_mul_f32"),
+        args: vec![Arg::Block { id: ins[0].id }, Arg::Block { id: ins[1].id }, Arg::Block { id: out.id }, Arg::U64(n as u64)],
         grid: ceil_1d(n),
         block: (256, 1, 1),
         shared_mem: 0,
@@ -109,23 +79,23 @@ pub fn lower_matmul(ins: &[Bytes], out: &Bytes, m: usize, k: usize, n: usize) ->
     }
 }
 
-/// lower:Rmsnorm([rows,n];w_off = ×(1+w))
-pub fn lower_rmsnorm(ins: &[Bytes], eps: f32, w_off: bool, out: &Bytes) -> LaunchMsg {
-    let n: usize = ins[0].len; // Bytes.len = 元素数(alloc/htod 均按元素登记)
+/// lower:Rmsnorm([rows, cols];per-channel alpha([cols] 广播);w_off = ×(1+w))
+pub fn lower_rmsnorm(ins: &[Bytes], eps: f32, w_off: bool, out: &Bytes, rows: usize, cols: usize) -> LaunchMsg {
     LaunchMsg {
         kernel: spec("owl_rmsnorm_f32"),
         args: vec![
             Arg::Block { id: ins[0].id },
             Arg::Block { id: ins[1].id },
             Arg::Block { id: out.id },
-            Arg::I32(n as i32),
+            Arg::I32(cols as i32),
             Arg::F32(eps),
             Arg::I32(w_off as i32),
         ],
-        grid: (1, 1, 1),
+        // 一 block 一行(owl_rmsnorm_f32:row = blockIdx.x)
+        grid: (rows as u32, 1, 1),
         block: (256, 1, 1),
         shared_mem: 256 * 4,
-        out_elems: n, // rows × n
+        out_elems: rows * cols,
     }
 }
 

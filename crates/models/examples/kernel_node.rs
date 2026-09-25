@@ -26,7 +26,7 @@ fn host(shape: &[usize], v: &[f32]) -> TensorOps {
 }
 
 async fn run(client: &mut GpuClient, decl: &TensorOps) -> Vec<f32> {
-    let out = owl_models::client::eval(decl, client).await.expect("eval");
+    let out = owl_models::interpreter::eval_ops(decl, client).await.expect("eval");
     client.sync().await.expect("sync");
     let n: usize = decl.shape().iter().product();
     let mut buf = vec![0u8; n * 4];

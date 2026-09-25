@@ -11,9 +11,8 @@
 use crate::command::{Ack, Command, Waiter};
 use crate::server::GpuServer;
 use crate::state::DeviceSelector;
-use owl_models::client::{Arg, Bytes, DeviceClient, GraphId, LaunchMsg};
-use owl_models::{Dtype, ModelError};
-use owl_models::shape::Shape;
+use owl_iface::contract::{Arg, Bytes, DeviceClient, GraphId, LaunchMsg};
+use owl_iface::contract::{Dtype, ModelError, Shape};
 use std::future::Future;
 use std::sync::mpsc;
 

@@ -7,8 +7,8 @@
 //! 并分别传入 [`GpuServer::new`](crate::GpuServer) 与
 //! [`GpuClient::new`](crate::GpuClient)。
 
-use owl_models::client::{Bytes, GraphId, LaunchMsg};
-use owl_models::ModelError;
+use owl_iface::contract::{Bytes, GraphId, LaunchMsg};
+use owl_iface::contract::ModelError;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};

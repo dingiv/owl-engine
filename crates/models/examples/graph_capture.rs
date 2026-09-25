@@ -30,7 +30,7 @@ fn scale_decl(x_block: u64, k: f32) -> TensorOps {
 }
 
 async fn eval_and_harvest(client: &mut GpuClient, decl: &TensorOps) -> Vec<f32> {
-    let out = owl_models::client::eval(decl, client).await.expect("eval");
+    let out = owl_models::interpreter::eval_ops(decl, client).await.expect("eval");
     let n: usize = decl.shape().iter().product();
     let mut buf = vec![0u8; n * 4];
     client.dtoh(&out, &mut buf).await.expect("dtoh");
@@ -64,7 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ---- ② 捕获:重发同一声明(Alloc 切 slab;Launch 进图)----
     client.graph_begin().await?;
-    let cap_out = owl_models::client::eval(&scale_decl(xb.id, 3.0), &mut client)
+    let cap_out = owl_models::interpreter::eval_ops(&scale_decl(xb.id, 3.0), &mut client)
         .await
         .expect("captured eval");
     let gid: GraphId = client.graph_end().await?;

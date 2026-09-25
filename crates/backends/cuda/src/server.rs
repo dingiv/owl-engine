@@ -29,9 +29,9 @@ use crate::ffi::{launch_host_function, memcpy_dtoh_async, memcpy_htod_async, mem
 use crate::command::{Ack, Command};
 use crate::launch::issue_launch;
 use crate::state::{DeviceSelector, GpuCtx, KernelCache, Staging};
-use owl_models::client::{Bytes, LaunchMsg};
+use owl_iface::contract::{Bytes, LaunchMsg};
 use crate::state::{STREAM_COMPUTE, STREAM_D2H, STREAM_H2D};
-use owl_models::ModelError;
+use owl_iface::contract::ModelError;
 use std::sync::mpsc;
 
 type Finish = Box<dyn FnOnce() + Send>;

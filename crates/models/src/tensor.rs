@@ -3,13 +3,18 @@
 //! 三层区分(2026-09-23/24 定稿):
 //!   TensorOps  = 声明链(懒描述;反向多叉树;无数据)—— §2
 //!   Tensor<D>  = 运行时数据(设备池块 + dtype/shape 标注)—— §3
-//!   Dtype      = 标注词汇(S4 语义表的 dtype 维;起步面,按需扩)—— §1
+//!   Dtype      = 标注词汇(S4 语义表的 dtype 维;权威在 iface::contract,
+//!                此处 re-export)—— §1
 //!
 //! **结构定稿**:
 //! - 值语义:深拷贝输入子树(配置面一次性成本);
 //! - 无 Arc、无 Tx、无共享别名——纯值世界;
 //! - 每节点携带全局唯一自增 id(跨线程;server 对账/缓存键),声明链与
 //!   运行时张量共用同一套进程级身份证。
+//! 
+//! 
+//! 那么这种设计，它的一个期望是说，哎，我让上层的这些代码量最大的这个layer声明和models声明，让它们的一些重复琐碎的代码尽可能的减少。然后呢，把副作用呢移出这些层。
+//! 也不是说没有代价的，对吧？那我们啊需要定义更加复杂的这些结构和解释器去执行上层的这些声明式的语法。并且呢，它的能力是受限的。那么，但其实这也不能说是一个缺点啊，但是它是一个。啊，不方便的一个点。啊，但是这没有关系啊，我们可以在它能力不足的时候啊，我们可以为它扩充一些新的能力.
 
 use crate::device::Device;
 use crate::error::{LazyError, ModelError};
@@ -19,29 +24,10 @@ use crate::shape::{numel, Shape};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // ============================================================================
-// §1 Dtype:标注词汇
+// §1 Dtype:标注词汇(权威在 iface::contract;re-export 保路径)
 // ============================================================================
 
-/// 数据类型
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Dtype {
-    F32,
-    BF16,
-    F16,
-    U32,
-}
-
-impl Dtype {
-    /// 字节宽(server 的 Malloc 只认字节;宽是 client 侧换算用的)
-    pub fn size_bytes(self) -> usize {
-        match self {
-            Dtype::F32 => 4,
-            Dtype::BF16 | Dtype::F16 => 2,
-            Dtype::U32 => 4,
-        }
-    }
-}
-
+pub use owl_iface::contract::Dtype;
 
 // ============================================================================
 // §2 TensorOps:声明式链式 API(客户主入口)
@@ -196,6 +182,20 @@ impl TensorOps {
         self
     }
 
+    /// 毒值声明工厂(外部违约出口:槽未装载等;eval 边界收割,零 panic)
+    pub fn poisoned(dtype: Dtype, shape: Shape, detail: impl Into<String>) -> TensorOps {
+        TensorOps {
+            id: next_id(),
+            parents: vec![],
+            depth: 0,
+            op: Op::Zeros,
+            dtype,
+            shape,
+            args: vec![],
+            err: Some(LazyError { at_depth: 0, detail: detail.into() }),
+        }
+    }
+
     /// 视图:纯元数据收窄,零节点追加,零 server 往返
     pub fn narrow(&self, dim: usize, _start: usize, len: usize) -> TensorOps {
         let mut shape = self.shape.clone();
@@ -235,6 +235,15 @@ impl TensorOps {
         }
         let meta = (self.dtype, self.shape.clone());
         self.join(Op::Add, Some(b), meta, vec![])
+    }
+
+    /// 同形逐元素乘(MLP 门控 / 注意力输出门)
+    pub fn mul(&self, b: &TensorOps) -> TensorOps {
+        if let Some(e) = self.shape_rule(b, "mul", |a, b| a == b) {
+            return self.poisoned_local(e);
+        }
+        let meta = (self.dtype, self.shape.clone());
+        self.join(Op::Mul, Some(b), meta, vec![])
     }
 
     pub fn silu(&self) -> TensorOps {

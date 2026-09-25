@@ -4,8 +4,8 @@
 
 use crate::ffi::{CudaStream, LaunchConfig, PushKernelArg};
 use crate::state::{GpuCtx, KernelCache};
-use owl_models::client::{Arg, LaunchMsg};
-use owl_models::ModelError;
+use owl_iface::contract::{Arg, LaunchMsg};
+use owl_iface::contract::ModelError;
 use std::sync::Arc;
 
 /// 参数槽(发射前装配;与 kernel 形参宽度严格对位 —— 坑 I)

@@ -36,6 +36,8 @@ pub enum Op {
     /// [m,k] × [k,n]
     Matmul,
     Add,
+    /// 同形逐元素乘(MLP 门控 / 注意力输出门)
+    Mul,
     Silu,
     /// w_off = ×(1+w) 语义(use_norm_offset)
     Rmsnorm { eps: f32, w_off: bool },

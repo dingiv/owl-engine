@@ -1,6 +1,6 @@
-//! owl-cuda —— GPU server 后端:实现 owl-models 的 `DeviceClient` 契约。
+//! owl-cuda —— GPU server 后端:实现 `owl-iface::contract::DeviceClient` 契约。
 //!
-//! 分层:owl-kernels(kernel 描述)→ owl-cuda(actor 执行)→ owl-models(契约)。
+//! 分层:owl-kernels(kernel 描述)→ owl-cuda(actor 执行)→ owl-iface::contract(契约)。
 //! server 是**哑执行器**:不认识具体算子,只认 LaunchMsg / alloc / htod / dtoh / sync。
 //!
 //! 模块地图:
@@ -38,14 +38,13 @@ pub use gpu_client::GpuClient;
 pub use server::GpuServer;
 pub use state::DeviceSelector;
 
-// 线格式与词汇再导出(客户只依赖 owl-cuda 即可组装命令,不必直连 owl-models;
-// FIXME 升级:将来把契约类型迁出自 owl-models,彻底解除反向依赖)
-pub use owl_models::client::{Arg, Bytes, GraphId, KernelSpec, LaunchMsg};
-pub use owl_models::shape::Shape;
-pub use owl_models::{Dtype, ModelError};
-
-/// DeviceClient 能力契约(实现于 GpuClient;从 owl-models 契约层 re-export)
-pub use owl_models::client::DeviceClient;
+// 线格式与词汇再导出(契约权威 = owl-iface::contract,前后端共同依赖;
+// 2026-09-25 解除 owl-cuda → owl-models 反向依赖,客户只依赖 owl-cuda
+// 即可组装命令,不必直连任何前端 crate)
+pub use owl_iface::contract::{
+    Arg, Bytes, DeviceClient, GraphId, KernelSpec, LaunchMsg, ModelError,
+};
+pub use owl_iface::contract::{Dtype, Shape};
 
 /// 测试/示例的设备序号(OWL_TEST_DEVICE,默认 0)
 pub fn test_device_ordinal() -> usize {

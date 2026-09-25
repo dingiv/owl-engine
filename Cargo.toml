@@ -4,6 +4,7 @@ members = [
     "crates/comm",
     "crates/kernels",
     "crates/backends/cuda",
+    "crates/backends/cpu",
     "crates/models",
     "crates/backends/iface",
     "crates/nn",

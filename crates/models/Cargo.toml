@@ -6,8 +6,16 @@ license.workspace = true
 description = "Declarative Tensor model layer: pure-functional forward over a lazy plan; defines the capability contract the CUDA server must satisfy"
 
 
+[dependencies]
+# 契约权威:线格式 + DeviceClient 能力契约(2026-09-25 下沉;后端不依赖前端)
+owl-iface = { path = "../backends/iface" }
+# kernel 源码之家(include_str 纯源,不拖 CUDA 链接 —— cudarc 已 feature 化)
+owl-kernels = { path = "../kernels" }
+
 [dev-dependencies]
 # 样例的 async 运行时(CPU face 即测即用;GPU face 经 owl-cuda actor 消化阻塞)
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+# CPU 后端(CpuFace:进程内同步直调,无 server)
+owl-cpu = { path = "../backends/cpu" }
 # GPU 端到端样例的执行器(客户驱动 server;仅 dev —— 主依赖不含任何后端)
 owl-cuda = { path = "../backends/cuda" }

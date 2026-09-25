@@ -13,6 +13,10 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    // PTX 预编面仅 cuda feature 需要(纯源码之家消费方零 nvcc 依赖)
+    if std::env::var_os("CARGO_FEATURE_CUDA").is_none() {
+        return;
+    }
     println!("cargo:rerun-if-changed=cu/ops.cu");
     println!("cargo:rerun-if-env-changed=OWL_CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=OWL_NVCC");

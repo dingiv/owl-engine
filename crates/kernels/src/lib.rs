@@ -45,6 +45,10 @@ pub fn dispatch(arch: Arch) -> &'static str {
     }
 }
 
+pub mod sources;
+
+#[cfg(feature = "cuda")]
 pub mod cuda_ops;
 
+#[cfg(feature = "cuda")]
 pub use cuda_ops::KernelFn;

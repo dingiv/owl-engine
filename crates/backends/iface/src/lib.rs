@@ -31,7 +31,13 @@
 /// 后端 Arch 标识(与 kernels 的 arch 分发表共用一套词汇)
 pub use owl_kernels::Arch;
 
+pub mod contract;
 pub mod signal;
+
+// 契约面顶层再导出(前后端共同依赖;见 contract 模块文档)
+pub use contract::{
+    numel, Arg, Bytes, DeviceClient, Dtype, GraphId, KernelSpec, LaunchMsg, ModelError, Shape,
+};
 
 /// 缓冲令牌:(id, generation) 二元组。词汇权威在 iface(A1:
 /// 词汇类型归 iface;2026-09-23 从 signal 移入以断 shared(device)→cuda→iface 环)。

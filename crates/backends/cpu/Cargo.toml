@@ -1,0 +1,13 @@
+[package]
+name = "owl-cpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CPU backend: synchronous in-process DeviceClient (no server/actor/pipeline)"
+
+[dependencies]
+# 契约权威:线格式 + DeviceClient 能力契约(与 owl-cuda 同一 iface)
+owl-iface = { path = "../iface" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

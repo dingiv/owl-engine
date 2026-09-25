@@ -16,9 +16,14 @@
 //! - [`error`]:毒值 + 两族错误(描述层逻辑违约 / 执行层资源错)
 //! - [`plan`]:语义 Op 枚举
 //! - [`kernel`]:Kernel 值(name + source + 发射配置)
-//! - [`client`]:**对 server 的能力期望**(五原语 DeviceClient + eval 声明树求值)
+//! - [`client`]:**对 server 的能力期望**(契约权威在 owl-iface::contract,
+//!   此处 re-export)+ KvCtx
 //! - [`actions`]:预定义算子动作表(具名算子 → LaunchMsg 的唯一 lower 通道)
-//! - [`interpreter`]:CpuFace(CPU 参考执行器;与 GPU server 同一契约)
+//! - [`loader`]:**装载语法糖**(new 返回 Loader 纯描述;load 执行边界)
+//! - [`interpreter`]:**多解释器面**(对上层 layer 的封装;算子声明的落地
+//!   逻辑由解释器兜住):eval(异步,face 注入 = owl-cpu::CpuFace /
+//!   owl-cuda::GpuClient)+ reduce/CpuInterpreter(同步参考,对拍锚)
+//!   (共享 MLP 管线 demo 已迁 examples/mlp.rs —— example 私有,双 face 对拍)
 //! - [`device`]:跨设备统一表达契约(CPU / GPU server 同一形状)
 //!
 //! 设计文档:docs/arch/async-runtime.md(v0.2,含声明式 Tensor 合并)。
@@ -27,16 +32,20 @@
 
 pub mod actions;
 pub mod client;
-pub mod demo;
 pub mod device;
 pub mod kernel;
+pub mod kernels;
 pub mod error;
 pub mod interpreter;
+pub mod layers;
+pub mod loader;
+pub mod module;
 pub mod plan;
 pub mod shape;
 pub mod tensor;
 
 pub use kernel::{Kernel, LaunchShape, Scalar};
+pub use module::Module;
 pub use error::{LazyError, ModelError};
 pub use tensor::{Dtype, Tensor, TensorOps};
 pub use device::{Cpu, Device, DeviceKind};

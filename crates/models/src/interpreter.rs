@@ -1,25 +1,247 @@
-//! 解释器:同一份声明,多种执行(三种游走)。
+//! 解释器:同一份声明,多种执行(每后端一个解释器)。
 //!
-//! | 解释器 | Op 执行体 | 场景 |
-//! |---|---|---|
-//! | eager(档一) | 逐节点经 GpuFace 提交(提交即回) | decode 热路径 |
-//! | capture(烘焙) | 逐节点"录"→ 整单 instantiate → 哨兵③对账 | 图捕获 |
-//! | CPU(参考) | 纯 Rust 闭包(本文件提供) | nn 测试保持同步 |
+//! 解释器是对上层模型层(layer)的封装:layer 只写声明(TensorOps 链),
+//! 解释器负责把声明翻译成后端调用(alloc / lower / launch)——算子的
+//! 落地逻辑由解释器兜住,上层零后端知识。毒值在解释器边界落地
+//! (结构化报错 + depth 归因)。
 //!
-//! walk 共用:自叶向根归约(递归;深度 = 链长,几百层内无忧)。
-//! 毒值在此落地:遇 Poisoned 节点 = 结构化报错(LazyError 归因)。
+//! | 解释器 | 形态 | 后端 | 场景 |
+//! |---|---|---|---|
+//! | [`eval`] | 异步(face 注入,泛型静态分发) | `owl-cpu::CpuFace`(CPU:进程内同步直调,无 server)/ `owl-cuda::GpuClient`(GPU:actor server) | 引擎主路径 |
+//! | [`reduce`] + [`CpuInterpreter`] | 同步(纯 Rust 朴素归约) | 无后端(参考实现) | 测试/对拍基准 |
+//!
+//! 后端契约 = `owl-iface::contract::DeviceClient`(线格式同源);
+//! 解释器本身不含后端代码 —— 后端经 face 泛型注入。
+//! 毒值传播契约:构造期违约随链流动,`is_poisoned()` 可查,边界收割。
 
-use crate::tensor::Dtype;
 use crate::error::ModelError;
+use crate::loader::{Layout, LoaderOps, WeightSource};
 use crate::plan::Op;
 use crate::shape::{numel, Shape};
-use crate::tensor::TensorOps;
+use crate::tensor::{Dtype, TensorOps};
+use crate::client::{Bytes, DeviceClient};
+use std::future::Future;
+use std::pin::Pin;
 
 // ============================================================================
-// §1 值(CPU 参考解释器的形态;server 版 = 不透明 Block 句柄)
+// §1 异步解释器:eval(层入口)/ eval_ops(树归约;引擎主路径)
 // ============================================================================
 
-/// f32 值块(CPU 参考;server 版为 GPU 池块句柄)
+/// 计算执行(层级入口):驱动层的 `Module::forward` 声明并归约。
+/// 解释器自己调用层钩子并为它传递 ctx —— 使用者只给层与输入。
+///
+/// ```rust,ignore
+/// let out = eval(&mlp, &xs, face, KernelCtx { tokens: 1 }).await?;
+/// ```
+pub async fn eval<M, D>(
+    layer: &M,
+    xs: &TensorOps,
+    face: &mut D,
+    ctx: &crate::module::KernelCtx,
+) -> Result<Bytes, ModelError>
+where
+    M: crate::module::Module,
+    D: crate::client::DeviceClient,
+{
+    let ops = layer.forward(xs, ctx);   // 层产出声明(ctx 引用透传)
+    eval_ops(ops.step(), face).await    // 解释器归约
+}
+
+/// 声明树求值(内部件;供手工子树/非层根的归约):自叶向根,
+/// 逐节点翻译为原语调用(face = 后端句柄)。
+pub fn eval_ops<'a, D>(
+    t: &'a TensorOps,
+    face: &'a mut D,
+) -> Pin<Box<dyn Future<Output = Result<Bytes, ModelError>> + Send + 'a>>
+where
+    D: crate::client::DeviceClient + 'a,
+{
+    Box::pin(_eval(t, face))
+}
+
+async fn _eval<D: crate::client::DeviceClient>(
+    t: &TensorOps,
+    face: &mut D,
+) -> Result<Bytes, ModelError> {
+    if let Some(e) = &t.err {
+        return Err(ModelError::Msg(format!(
+            "[毒值落地 @depth {}] {}",
+            e.at_depth, e.detail
+        )));
+    }
+    let mut ins: Vec<Bytes> = Vec::with_capacity(t.parents.len());
+    for p in &t.parents {
+        ins.push(eval_ops(p, face).await?);
+    }
+
+    let dtype = t.dtype;
+    let shape = t.shape.clone();
+    let n_bytes = shape.iter().product::<usize>() * dtype.size_bytes();
+
+    match &t.op {
+        Op::Htod { bytes } => face.htod(dtype, &shape, bytes).await,
+        Op::Zeros => face.alloc(n_bytes).await,
+        Op::Block { id } => Ok(Bytes { id: *id, len: 0 }),
+        Op::Add => {
+            let out = face.alloc(n_bytes).await?;
+            let msg = crate::actions::lower_add(&ins, &out);
+            face.launch(msg).await?;
+            Ok(out)
+        }
+        Op::Mul => {
+            let out = face.alloc(n_bytes).await?;
+            let msg = crate::actions::lower_mul(&ins, &out);
+            face.launch(msg).await?;
+            Ok(out)
+        }
+        Op::Silu => {
+            let out = face.alloc(n_bytes).await?;
+            let msg = crate::actions::lower_silu(&ins, &out);
+            face.launch(msg).await?;
+            Ok(out)
+        }
+        Op::Matmul => {
+            let (m, n) = (shape[0], shape[1]);
+            let k = ins[0].len;
+            let out = face.alloc(m * n * dtype.size_bytes()).await?;
+            let msg = crate::actions::lower_matmul(&ins, &out, m, k, n);
+            face.launch(msg).await?;
+            Ok(out)
+        }
+        Op::Rmsnorm { eps, w_off } => {
+            let out = face.alloc(n_bytes).await?;
+            let cols = shape.last().copied().unwrap_or(0);
+            let rows = shape.iter().product::<usize>() / cols.max(1);
+            let msg = crate::actions::lower_rmsnorm(&ins, *eps, *w_off, &out, rows, cols);
+            face.launch(msg).await?;
+            Ok(out)
+        }
+        Op::Kernel { kernel } => {
+            let out = face.alloc(n_bytes).await?;
+            let msg = crate::actions::lower_kernel(kernel, &t.args, &ins, &out);
+            face.launch(msg).await?;
+            Ok(out)
+        }
+        Op::SlotWrite => Ok(ins[0].clone()),
+        other => Err(ModelError::Msg(format!("eval 未覆盖: {other:?}"))),
+    }
+}
+
+// ============================================================================
+// §1.5 装载解释器:eval_load(识别 LoaderOps 指令;装载域的执行能力)
+// ============================================================================
+
+/// 装载执行(层级入口):驱动层的 `Loadable::layout` 需求并物化。
+/// 解释器自己调用层钩子并为它传递 LoaderCtx —— 使用者只给层与源。
+///
+/// ```rust,ignore
+/// eval_load(&mlp, face, &src, LoaderCtx::default()).await?;
+/// ```
+pub async fn eval_load<M, D, S>(
+    layer: &M,
+    face: &mut D,
+    src: &S,
+    ctx: &crate::loader::LoaderCtx,
+) -> Result<(), ModelError>
+where
+    M: crate::loader::Loadable,
+    D: DeviceClient,
+    S: WeightSource + ?Sized,
+{
+    let want = layer.layout(ctx);   // 层产出需求清单(ctx 引用透传)
+    eval_want(&want, face, src).await
+}
+
+/// 需求清单求值(内部件):按清单从源取数 → 布局变换 → face 物化 →
+/// **经 Want.sink 自动填回容器空包**(mount 已被吸收)。
+/// 缺键/长度不符/htod 失败 → 结构化 Err(带槽键归因)。
+async fn eval_want<D: DeviceClient, S: WeightSource + ?Sized>(
+    want: &LoaderOps,
+    face: &mut D,
+    src: &S,
+) -> Result<(), ModelError> {
+    use crate::loader::f32b;
+    for w in want.wants() {
+        let data = src.get(w.key).ok_or_else(|| {
+            ModelError::Msg(format!("Weight '{}': 数据源缺键", w.key))
+        })?;
+        let n: usize = w.shape.iter().product();
+        let (shape, bytes) = match w.layout {
+            Layout::Direct => {
+                if data.len() != n {
+                    return Err(ModelError::Msg(format!(
+                        "Weight '{}': 元素 {} != shape {:?}({n})",
+                        w.key,
+                        data.len(),
+                        w.shape
+                    )));
+                }
+                (w.shape.clone(), f32b(data))
+            }
+            Layout::Transposed => {
+                // 目标 [cols, rows];源 [rows, cols](行主序)
+                let (cols, rows) = (w.shape[0], w.shape[1]);
+                if data.len() != n {
+                    return Err(ModelError::Msg(format!(
+                        "Weight '{}': 元素 {} != 源形状 {rows}×{cols}",
+                        w.key,
+                        data.len()
+                    )));
+                }
+                let mut t = vec![0.0f32; n];
+                for r in 0..rows {
+                    for c in 0..cols {
+                        t[c * rows + r] = data[r * cols + c];
+                    }
+                }
+                (w.shape.clone(), f32b(&t))
+            }
+        };
+        let b = face
+            .htod(w.dtype, &shape, &bytes)
+            .await
+            .map_err(|e| ModelError::Msg(format!("Weight '{}': {e}", w.key)))?;
+        w.sink.deliver(crate::client::Bytes::new(b.id, n));
+    }
+    Ok(())
+}
+
+// ============================================================================
+// §2 同步解释器 trait + 归约驱动(CPU 参考;测试/对拍)
+// ============================================================================
+
+/// 执行单节点:输入已就绪(归约序保证),产出输出。
+pub trait Interpreter {
+    /// Htod:host 字节入块
+    fn htod(&mut self, dtype: Dtype, shape: &Shape, bytes: &[u8]) -> Result<Value, ModelError>;
+    /// Zeros:清零分配
+    fn zeros(&mut self, dtype: Dtype, shape: &Shape) -> Result<Value, ModelError>;
+    /// Matmul:[m,k]×[k,n]
+    fn matmul(&mut self, a: &Value, b: &Value, dtype: Dtype, shape: &Shape) -> Result<Value, ModelError>;
+    /// Add(同形)
+    fn add(&mut self, a: &Value, b: &Value) -> Result<Value, ModelError>;
+    /// Mul(同形逐元素乘;MLP 门控/输出门)
+    fn mul(&mut self, a: &Value, b: &Value) -> Result<Value, ModelError>;
+    /// Silu
+    fn silu(&mut self, x: &Value) -> Result<Value, ModelError>;
+    /// Rmsnorm(parents = [x, alpha];per-channel alpha([cols] 广播);w_off = ×(1+w))
+    fn rmsnorm(
+        &mut self,
+        x: &Value,
+        alpha: &Value,
+        eps: f32,
+        w_off: bool,
+    ) -> Result<Value, ModelError>;
+    /// SlotWrite:KV 写槽(副作用;返回透传值)
+    fn slot_write(&mut self, v: &Value) -> Result<Value, ModelError> {
+        Ok(v.clone()) // CPU 参考实现:无状态,透传
+    }
+    /// Block 叶子解析:按 id 取已物化数据(server 侧 = 池账房反查)
+    fn block(&mut self, id: u64, dtype: Dtype, shape: &Shape) -> Result<Value, ModelError>;
+}
+
+/// f32 值块(同步参考解释器的值形态;后端版为池块句柄 /
+/// owl-cpu 的 [`owl_cpu::Value`] host 真值 —— 与后端实现互为独立副本)。
 #[derive(Clone, Debug, PartialEq)]
 pub struct Value {
     pub f32: Vec<f32>,
@@ -68,43 +290,7 @@ impl Value {
     }
 }
 
-// ============================================================================
-// §2 解释器 trait(cuda server 实现它;CPU 参考实现随附)
-// ============================================================================
-
-/// 执行单节点:输入已就绪(归约序保证),产出输出。
-pub trait Interpreter {
-    /// Htod:host 字节入块
-    fn htod(&mut self, dtype: Dtype, shape: &Shape, bytes: &[u8]) -> Result<Value, ModelError>;
-    /// Zeros:清零分配
-    fn zeros(&mut self, dtype: Dtype, shape: &Shape) -> Result<Value, ModelError>;
-    /// Matmul:[m,k]×[k,n]
-    fn matmul(&mut self, a: &Value, b: &Value, dtype: Dtype, shape: &Shape) -> Result<Value, ModelError>;
-    /// Add(同形)
-    fn add(&mut self, a: &Value, b: &Value) -> Result<Value, ModelError>;
-    /// Silu
-    fn silu(&mut self, x: &Value) -> Result<Value, ModelError>;
-    /// Rmsnorm(parents = [x, alpha];w_off = ×(1+w))
-    fn rmsnorm(
-        &mut self,
-        x: &Value,
-        alpha: &Value,
-        eps: f32,
-        w_off: bool,
-    ) -> Result<Value, ModelError>;
-    /// SlotWrite:KV 写槽(副作用;返回透传值)
-    fn slot_write(&mut self, v: &Value) -> Result<Value, ModelError> {
-        Ok(v.clone()) // CPU 参考实现:无状态,透传
-    }
-    /// Block 叶子解析:按 id 取已物化数据(server 侧 = 池账房反查)
-    fn block(&mut self, id: u64, dtype: Dtype, shape: &Shape) -> Result<Value, ModelError>;
-}
-
-// ============================================================================
-// §3 归约驱动(三种解释器共用的 walk)
-// ============================================================================
-
-/// 自叶向根归约。毒值在此落地;资源错误直接 Err 过线。
+/// 同步归约驱动:自叶向根。毒值在此落地;资源错误直接 Err 过线。
 pub fn reduce(
     t: &TensorOps,
     itp: &mut impl Interpreter,
@@ -126,6 +312,7 @@ pub fn reduce(
         Op::Zeros => itp.zeros(t.dtype, &t.shape),
         Op::Matmul => itp.matmul(&ins[0], &ins[1], t.dtype, &t.shape),
         Op::Add => itp.add(&ins[0], &ins[1]),
+        Op::Mul => itp.mul(&ins[0], &ins[1]),
         Op::Silu => itp.silu(&ins[0]),
         Op::Rmsnorm { eps, w_off } => itp.rmsnorm(&ins[0], &ins[1], *eps, *w_off),
         Op::SlotWrite => itp.slot_write(&ins[0]),
@@ -142,9 +329,19 @@ pub fn reduce(
 }
 
 // ============================================================================
-// §4 CPU 参考解释器(朴素实现;对拍基准)
+// §3 CpuInterpreter:同步 CPU 解释器(朴素实现;对拍锚)
 // ============================================================================
 
+/// 调试门控:OWL_DEBUG=1 开启解释层发射日志
+fn dbg_on() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("OWL_DEBUG").is_some())
+}
+
+/// CPU 参考解释器(朴素实现;**永不优化** —— 它的存在意义就是对拍
+/// 后端实现:`owl-cpu::CpuFace` / `owl-cuda::GpuClient`。两侧算子实现
+/// 互为独立副本,禁止互相引用,否则对拍失效)。
 pub struct CpuInterpreter {
     /// Block 叶子登记表(id → 值;rt::Tensor 物化时由绑定方注册)
     blocks: std::collections::HashMap<u64, Value>,
@@ -154,13 +351,6 @@ impl Default for CpuInterpreter {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// 调试门控:OWL_DEBUG=1 开启解释层发射日志
-fn dbg_on() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("OWL_DEBUG").is_some())
 }
 
 impl CpuInterpreter {
@@ -216,6 +406,13 @@ impl Interpreter for CpuInterpreter {
         })
     }
 
+    fn mul(&mut self, a: &Value, b: &Value) -> Result<Value, ModelError> {
+        Ok(Value {
+            f32: a.f32.iter().zip(&b.f32).map(|(x, y)| x * y).collect(),
+            shape: a.shape.clone(),
+        })
+    }
+
     fn block(&mut self, id: u64, _dtype: Dtype, _shape: &Shape) -> Result<Value, ModelError> {
         self.blocks.get(&id).cloned().ok_or_else(|| {
             ModelError::Msg(format!("Block {id} 未绑定(需先登记物化数据)"))
@@ -236,169 +433,19 @@ impl Interpreter for CpuInterpreter {
         eps: f32,
         w_off: bool,
     ) -> Result<Value, ModelError> {
-        let ms = x.f32.iter().map(|v| v * v).sum::<f32>() / x.f32.len() as f32;
-        let inv = 1.0 / (ms + eps).sqrt();
-        Ok(Value {
-            f32: x
-                .f32
-                .iter()
-                .zip(&alpha.f32)
-                .map(|(v, a)| {
-                    let g = if w_off { a + 1.0 } else { *a };
-                    v * inv * g
-                })
-                .collect(),
-            shape: x.shape.clone(),
-        })
-    }
-}
-
-// ============================================================================
-// §5 CpuFace:CPU 解释器适配为 GpuFace(与 GPU server 同一契约)
-// ============================================================================
-
-use crate::client::{
-    Arg, Bytes as HandleBytes, DeviceClient, GraphId, LaunchMsg,
-};
-use std::collections::HashMap;
-
-/// CPU 参考执行器(适配 GpuFace):与 GPU server 同一契约、同一管线,
-/// 测试/对拍时作为 server 的替身。
-pub struct CpuFace {
-    itp: CpuInterpreter,
-    blocks: HashMap<u64, Value>,
-    next: u64,
-}
-
-impl Default for CpuFace {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl CpuFace {
-    pub fn new() -> Self {
-        Self { itp: CpuInterpreter::new(), blocks: HashMap::new(), next: 1 }
-    }
-}
-
-impl DeviceClient for CpuFace {
-    async fn graph_begin(&mut self) -> Result<(), ModelError> {
-        Err(ModelError::Msg("CpuFace: 图捕获仅 GPU server 支持".to_string()))
-    }
-
-    async fn graph_end(&mut self) -> Result<GraphId, ModelError> {
-        Err(ModelError::Msg("CpuFace: 图捕获仅 GPU server 支持".to_string()))
-    }
-
-    async fn graph_launch(&mut self, _graph: GraphId) -> Result<(), ModelError> {
-        Err(ModelError::Msg("CpuFace: 图重放仅 GPU server 支持".to_string()))
-    }
-
-    /// 显存分配(清零;CPU = Vec;流参数仅对齐契约,CPU 单线程即序)
-    async fn alloc(&mut self, n_bytes: usize) -> Result<HandleBytes, ModelError> {
-        let v = Value::zero(Dtype::F32, &vec![n_bytes / 4])?;
-        let id = self.next;
-        self.next += 1;
-        self.blocks.insert(id, v);
-        Ok(HandleBytes::new(id, 0))
-    }
-
-    /// 装载(host 字节 → f32 值块)
-    async fn htod(
-        &mut self,
-        dtype: Dtype,
-        shape: &Shape,
-        src: &[u8],
-    ) -> Result<HandleBytes, ModelError> {
-        let v = self.itp.htod(dtype, shape, src)?;
-        let id = self.next;
-        self.next += 1;
-        self.blocks.insert(id, v);
-        Ok(HandleBytes::new(id, 0))
-    }
-
-    /// 收割(值 → LE 字节;长度须与块一致)
-    async fn dtoh(&mut self, b: &HandleBytes, out: &mut [u8]) -> Result<(), ModelError> {
-        let v = self
-            .blocks
-            .get(&b.id)
-            .ok_or_else(|| ModelError::DeadBlock { id: b.id })?;
-        let bytes: Vec<u8> = v
-            .f32
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
-        if bytes.len() != out.len() {
-            return Err(ModelError::Msg(format!(
-                "dtoh: 块 {} 字节 {} != 收割 {}",
-                b.id,
-                bytes.len(),
-                out.len()
-            )));
-        }
-        out.copy_from_slice(&bytes);
-        Ok(())
-    }
-
-    /// 发射:按 kernel 名路由到 CPU 参考实现(动作表的 CPU 面)
-    async fn launch(&mut self, msg: LaunchMsg) -> Result<HandleBytes, ModelError> {
-
-        if dbg_on() {
-            eprintln!("[dbg launch] {} args={:?}", msg.kernel.name, msg.args);
-        }
-        // 参数槽解析:Block → 值块;类型化标量
-        let mut vals: Vec<Value> = Vec::with_capacity(msg.args.len());
-        let mut u64s: Vec<u64> = Vec::new();
-        let mut i32s: Vec<i32> = Vec::new();
-        let mut f32s: Vec<f32> = Vec::new();
-        let mut out_id: Option<u64> = None;
-        for a in &msg.args {
-            match a {
-                Arg::Block { id } => {
-                    out_id = Some(*id);
-                    vals.push(
-                        self.blocks
-                            .get(id)
-                            .cloned()
-                            .ok_or(ModelError::DeadBlock { id: *id })?,
-                    )
-                }
-                Arg::U64(v) => u64s.push(*v),
-                Arg::I32(v) => i32s.push(*v),
-                Arg::F32(v) => f32s.push(*v),
+        // per-channel alpha([cols] 广播;与 GPU owl_rmsnorm_f32 同一语义)
+        let cols = x.shape.last().copied().unwrap_or(0).max(1);
+        let rows = x.f32.len() / cols;
+        let mut out = vec![0.0f32; x.f32.len()];
+        for r in 0..rows {
+            let xs = &x.f32[r * cols..(r + 1) * cols];
+            let ms = xs.iter().map(|v| v * v).sum::<f32>() / cols as f32;
+            let inv = 1.0 / (ms + eps).sqrt();
+            for (c, v) in xs.iter().enumerate() {
+                let g = if w_off { alpha.f32[c] + 1.0 } else { alpha.f32[c] };
+                out[r * cols + c] = v * inv * g;
             }
         }
-        let out = match msg.kernel.name.as_str() {
-            "owl_add_f32" => self.itp.add(&vals[0], &vals[1])?,
-            "owl_silu_f32" => self.itp.silu(&vals[0])?,
-            "owl_matmul_f32" => {
-                // 标量与 lower_matmul 对位:m/k/n
-                let (m, _k, n) =
-                    (i32s[0] as usize, i32s[1] as usize, i32s[2] as usize);
-                let shape = crate::shape::Shape::from(vec![m, n]);
-                self.itp.matmul(&vals[0], &vals[1], Dtype::F32, &shape)?
-            }
-            "owl_rmsnorm_f32" => {
-                // 标量与 lower_rmsnorm 对位:n(I32)/eps(F32)/w_off(I32)
-                self.itp.rmsnorm(&vals[0], &vals[1], f32s[0], i32s[1] != 0)?
-            }
-            other => {
-                return Err(ModelError::Msg(format!(
-                    "CpuFace::launch: 未注册的动作 {other}"
-                )))
-            }
-        };
-        // 写回 eval 预 alloc 的 out 块(与 GPU 语义一致:发射原位写输出)
-        let id = out_id.ok_or_else(|| {
-            ModelError::Msg("launch: args 中无输出块".to_string())
-        })?;
-        self.blocks.insert(id, out);
-        Ok(HandleBytes::new(id, msg.out_elems))
-    }
-
-    async fn sync(&mut self) -> Result<(), ModelError> {
-        Ok(()) // CPU:无在飞操作
+        Ok(Value { f32: out, shape: x.shape.clone() })
     }
 }
-

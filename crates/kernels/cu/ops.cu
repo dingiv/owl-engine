@@ -18,6 +18,13 @@ extern "C" __global__ void owl_silu_f32(
     if (i < n) { out[i] = x[i] / (1.0f + expf(-x[i])); }
 }
 
+// 同形逐元素乘(MLP 门控 / 注意力输出门)
+extern "C" __global__ void owl_mul_f32(
+    const float* a, const float* b, float* out, const size_t n) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { out[i] = a[i] * b[i]; }
+}
+
 // [m,k] × [k,n] → [m,n](行主序;grid 二维:行 × 列)
 extern "C" __global__ void owl_matmul_f32(
     const float* a, const float* b, float* out,

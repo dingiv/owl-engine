@@ -5,8 +5,8 @@
 
 use crate::ffi::{device_get_count, free_host, malloc_host, CudaContext, CudaFunction, CudaGraph, CudaSlice, CudaStream, CAPTURE_MODE_THREAD_LOCAL, INSTANTIATE_AUTO_FREE};
 use cudarc::nvrtc::safe::{compile_ptx_with_opts, CompileOptions};
-use owl_models::client::GraphId;
-use owl_models::ModelError;
+use owl_iface::contract::GraphId;
+use owl_iface::contract::ModelError;
 use std::collections::HashMap;
 use std::sync::Arc;
 
