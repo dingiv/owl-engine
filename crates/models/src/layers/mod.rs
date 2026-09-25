@@ -16,14 +16,46 @@
 //! - [`linear`] / [`rmsnorm`] / [`mlp`]:纯语义算子层(双 face 可对拍)
 //! - [`embedding`] / [`rope`]:Kernel 节点试水件
 //! - [`attention`]:M-b 批(qk-norm 复用 rmsnorm w_off + gate 切分/naive attn kernel)
+//! - [`gdn`]:M-c 批(GatedDeltaNet 18/24 层;批 1 gating 起逐核小步移植)
 //!
 //! 未搬(试水通过后逐个立项,勿一把梭):
-//! GatedDeltaNet(18/24 层,conv1d + delta rule 五 kernel 族)、
 //! DecoderLayer 编排、vision ViT、MTP、chunked prefill、量化。
 
 pub mod attention;
 pub mod embedding;
+pub mod gdn;
 pub mod linear;
 pub mod mlp;
 pub mod rmsnorm;
 pub mod rope;
+
+// ============================================================================
+// 层间共享 Kernel 帮手(声明构造;零状态)
+// ============================================================================
+
+use crate::TensorOps;
+
+/// 非连续窄切物化(owl_narrow_strided_f32):行展平 r ∈ [0, outer),
+/// dst[r·out_dim + d] = src[r·src_dim + start + d]。
+/// attention q gate 切分 / GDN qkv 投影列切分与 conv 权重行切分共用。
+pub(crate) fn narrow_strided(
+    src: &TensorOps,
+    outer: usize,
+    src_dim: usize,
+    start: usize,
+    out_dim: usize,
+    shape: crate::contract::Shape,
+) -> TensorOps {
+    TensorOps::of(crate::kernel::kernel_with(
+        "owl_narrow_strided_f32",
+        (0, 0, 0), // 哨兵:逐元素核,自动 1D ceil/256
+        (256, 1, 1),
+        0,
+    ))
+    .arg(src)
+    .arg_usize(outer)
+    .arg_usize(src_dim)
+    .arg_usize(start)
+    .arg_usize(out_dim)
+    .with_shape(crate::tensor::Dtype::F32, shape)
+}

@@ -40,22 +40,30 @@ pub struct ForwardCtx<'a> {
     /// 注:类型住在 layers,此处反向引用 —— ctx 是 runner 词汇,
     /// runner 持全局 rope,与旧世界 rotary_emb 注入同一形态)
     pub rope: Option<&'a Rope>,
+    /// GDN 常驻状态(conv 三段 + recurrent + slots;类型住 layers::gdn,
+    /// rope 反向引用同款先例)
+    pub gdn: Option<&'a crate::layers::gdn::GdnBuffers>,
 }
 
 impl<'a> ForwardCtx<'a> {
     /// 最小 ctx(无动态依赖;mlp/rmsnorm/linear/embedding 测试用)
     pub fn minimal(tokens: usize) -> Self {
-        Self { tokens, pos: None, kv: None, rope: None }
+        Self { tokens, pos: None, kv: None, rope: None, gdn: None }
     }
 
-    /// decode 步 ctx(全量动态依赖)
+    /// decode 步 ctx(attention 全量动态依赖;gdn 置 None)
     pub fn decode(
         tokens: usize,
         pos: &'a TensorOps,
         kv: &'a KvBuffers,
         rope: &'a Rope,
     ) -> Self {
-        Self { tokens, pos: Some(pos), kv: Some(kv), rope: Some(rope) }
+        Self { tokens, pos: Some(pos), kv: Some(kv), rope: Some(rope), gdn: None }
+    }
+
+    /// GDN decode 步 ctx(gdn 全量;attention 依赖置 None)
+    pub fn gdn_decode(tokens: usize, gdn: &'a crate::layers::gdn::GdnBuffers) -> Self {
+        Self { tokens, pos: None, kv: None, rope: None, gdn: Some(gdn) }
     }
 }
 

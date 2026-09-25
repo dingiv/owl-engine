@@ -1,14 +1,16 @@
-//! Rope:旋转位置编码(mrope interleaved + partial;Kernel 注册表)。
+//! Rope:旋转位置编码(rotate-half + partial;Kernel 注册表)。
 //!
 //! Qwen3.5-0.8B 实测配置:head_dim 256,partial_rotary_factor 0.25 →
-//! rotary_dim 64(half 32);mrope_interleaved = true → 旋转对 = 相邻
-//! (2i, 2i+1)(GPT-J 风格,非 rotate-half 的 (i, i+half));
+//! rotary_dim 64(half 32)。**配对 = rotate-half (i, i+half)** ——
+//! 2026-09-26 HF 探针翻案:config `mrope_interleaved` 指三网格(T/H/W)
+//! 在频率维交错,非 GPT-J 相邻对;文本路径三网格同 pos 退化后就是普通
+//! rotate-half(maxdiff 6e-8 vs 相邻对 2.5)。
 //! 文本路径三 section 的 pos 相同(mrope 退化为一维 rope,t [11,11,10]
 //! 分段仅在视觉多模态路径有意义 —— 本层只吃一份 pos)。
 //!
 //! cos/sin 表:new 期纯计算存于层内,经 `tables()` 容器内表源供执行器
 //! 取数(不经外部数据源);forward 常驻块引用。
-//! kernel 源 = 注册表 `owl_rope_interleaved_partial_f32`(owl-kernels cu/text)。
+//! kernel 源 = 注册表 `owl_rope_half_partial_f32`(owl-kernels cu/text)。
 
 use crate::contract::ModelError;
 use crate::kernel::Kernel;
@@ -45,7 +47,8 @@ impl Rope {
             )));
         }
         let half = rotary_dim / 2;
-        // inv_freq[i] = theta^(-2i / rotary_dim);interleaved:对 (2i, 2i+1) 用同一频率
+        // inv_freq[i] = theta^(-2i / rotary_dim);rotate-half:对 (i, i+half) 用同一频率
+        // (与 HF compute_default_rope_parameters 同式:arange(0,dim,2)/dim)
         let cos_t: Vec<f32> = (0..max_pos)
             .flat_map(|p| {
                 (0..half).map(move |i| {
@@ -91,7 +94,7 @@ impl Rope {
         q_heads: usize,
     ) -> TensorOps {
         TensorOps::of(Self::launch_kernel(
-            "owl_rope_interleaved_partial_f32",
+            "owl_rope_half_partial_f32",
             tokens,
         ))
         .arg(q)
@@ -113,7 +116,7 @@ impl Rope {
         kv_heads: usize,
     ) -> TensorOps {
         TensorOps::of(Self::launch_kernel(
-            "owl_rope_interleaved_partial_f32",
+            "owl_rope_half_partial_f32",
             tokens,
         ))
         .arg(k)
@@ -180,5 +183,57 @@ mod tests {
             1,
             2,
         );
+    }
+
+    /// HF parity(rotate-half partial 金标准 = HF 类直跑;GPU vs HF。
+    /// rope kernel 是 Kernel 节点 = GPU-only(CPU face 不注册,
+    /// 同 owl_narrow_strided 先例);双门控 OWL_HF_PARITY=1 + OWL_TEST_DEVICE)
+    #[tokio::test]
+    async fn parity_matches_hf() {
+        use crate::testkit::{assert_close, harvest, hf_python, parity_enabled, skip_note, st_read, st_write, tmp_path};
+        if !parity_enabled() {
+            skip_note();
+            return;
+        }
+        let (tokens, heads, head_dim, rotary_dim) = (3usize, 2usize, 8usize, 4usize);
+        let theta = 10_000.0f32;
+        let x: Vec<f32> = (0..tokens * heads * head_dim)
+            .map(|i| ((i as f32 * 0.37) - 1.1).cos())
+            .collect();
+        let pos: Vec<f32> = vec![2.0, 7.0, 13.0];
+
+        let inp = tmp_path("rope_in");
+        let outp = tmp_path("rope_out");
+        st_write(
+            &inp,
+            &[
+                ("x", &x, vec![tokens, heads * head_dim]),
+                ("pos", &pos, vec![tokens]),
+            ],
+        );
+        let contract = format!(
+            r#"{{"heads": {heads}, "head_dim": {head_dim}, "rotary_dim": {rotary_dim}, "theta": {theta}}}"#
+        );
+        let manifest = hf_python("rope.py", &[inp.to_str().unwrap(), outp.to_str().unwrap(), &contract]);
+        eprintln!("[hf manifest] rope: {manifest}");
+        let want = st_read(&outp, "y");
+
+        let x_t = TensorOps::from_host(Dtype::F32, vec![tokens, heads * head_dim], &f32b(&x));
+        let pos_t = TensorOps::from_host(Dtype::F32, vec![tokens], &f32b(&pos));
+
+        // GPU 臂 vs HF(kernel = owl_rope_half_partial_f32;CPU face 不执行 Kernel 节点)
+        if crate::testkit::gpu_enabled() {
+            let mut gpu = crate::testkit::gpu_client().await;
+            let rp2 = Rope::new(256, head_dim, rotary_dim, theta).expect("rope new");
+            crate::interpreter::eval_load(&rp2, &mut gpu, &rp2.tables(), &Default::default())
+                .await
+                .expect("eval_load(gpu)");
+            let gpu_out = harvest(&mut gpu, &rp2.forward_q(&x_t, &pos_t, tokens, heads)).await;
+            assert_close(&gpu_out, &want, 1e-5, "rope-gpu");
+            gpu.close().await.expect("server 关机");
+        }
+
+        std::fs::remove_file(&inp).ok();
+        std::fs::remove_file(&outp).ok();
     }
 }

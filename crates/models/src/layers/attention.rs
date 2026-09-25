@@ -24,6 +24,7 @@
 //! `Module` trait;统一 ForwardCtx 随 runner 立项)。
 
 use crate::contract::Dtype;
+use crate::layers::narrow_strided;
 use crate::kernel;
 use crate::layers::linear::Linear;
 use crate::layers::rmsnorm::RmsNorm;
@@ -63,21 +64,10 @@ impl Attention {
         }
     }
 
-    /// 非连续窄切物化(行展平 r = t*H + h,行内 stride = src_dim)。
-    /// q_raw [T, H×2HD] → q(start=0)/ gate(start=HD),各 [T, H×HD]。
+    /// 非连续窄切物化 → 层间共享帮手(mod.rs narrow_strided;测试专用)
+    #[cfg(test)]
     fn narrow(src: &TensorOps, outer: usize, src_dim: usize, start: usize, out_dim: usize, shape: crate::contract::Shape) -> TensorOps {
-        TensorOps::of(kernel::kernel_with(
-            "owl_narrow_strided_f32",
-            (0, 0, 0), // 哨兵:逐元素核,自动 1D ceil/256
-            (256, 1, 1),
-            0,
-        ))
-        .arg(src)
-        .arg_usize(outer)
-        .arg_usize(src_dim)
-        .arg_usize(start)
-        .arg_usize(out_dim)
-        .with_shape(Dtype::F32, shape)
+        narrow_strided(src, outer, src_dim, start, out_dim, shape)
     }
 
     /// 计算声明(decode;xs [T, hidden],T = ctx.tokens;C4 后回归 Module)。
@@ -101,8 +91,8 @@ impl Attention {
 
         // per-head [value|gate] 切分(两段同形 [T, Hq*HD])
         let flat_shape = vec![tokens, self.hq * self.hd];
-        let q = Self::narrow(&q_raw, tokens * self.hq, self.hd * 2, 0, self.hd, flat_shape.clone());
-        let gate = Self::narrow(&q_raw, tokens * self.hq, self.hd * 2, self.hd, self.hd, flat_shape);
+        let q = narrow_strided(&q_raw, tokens * self.hq, self.hd * 2, 0, self.hd, flat_shape.clone());
+        let gate = narrow_strided(&q_raw, tokens * self.hq, self.hd * 2, self.hd, self.hd, flat_shape);
 
         // qk-norm(per-head 行 = [T×H, HD];×(1+w))→ rope
         let q = self.q_norm.forward(&q, ctx);

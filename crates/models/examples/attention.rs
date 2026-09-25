@@ -3,7 +3,7 @@
 //! 声明/装载/毒值测试)。
 //!
 //! 覆盖:qk-norm ×(1+w)(rows=T×H 复用 owl_rmsnorm_f32 w_off)、rope
-//! interleaved partial 复用、per-head [value|gate] 切分(owl_narrow_strided
+//! rotate-half partial 复用、per-head [value|gate] 切分(owl_narrow_strided
 //! ×2)、naive decode attn 连续槽窗(bs=2 异窗位 + 跨步缓存读)、输出门
 //! sigmoid × mul、o_proj。
 //!
@@ -55,11 +55,12 @@ struct HostRef {
 }
 
 impl HostRef {
-    /// y[o] = Σ_i x[i]·w[o·in+i](与 Linear 装载期转置 + owl_matmul 同语义)
-    fn lin(&self, x: &[f32], w: &[f32], out_dim: usize) -> Vec<f32> {
+    /// y[o] = Σ_i x[i]·w[o·in+i](与 Linear 装载期转置 + owl_matmul 同语义;
+    /// in_dim = 输入宽度 —— q/k/v = HIDDEN,o_proj = HQ*HD,勿硬编码)
+    fn lin(&self, x: &[f32], w: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
         (0..out_dim)
             .map(|o| {
-                (0..HIDDEN).map(|i| x[i] * w[o * HIDDEN + i]).sum::<f32>()
+                (0..in_dim).map(|i| x[i] * w[o * in_dim + i]).sum::<f32>()
             })
             .collect()
     }
@@ -75,7 +76,8 @@ impl HostRef {
             .collect()
     }
 
-    /// rope interleaved partial(相邻对 2i/2i+1;旋转维外直通)
+    /// rope rotate-half partial(pair (i, i+half);旋转维外直通;
+    /// 2026-09-26 翻案:mrope_interleaved 指三网格频率维交错,配对就是 rotate-half)
     fn rope(&self, x: &[f32], heads: usize, pos: usize) -> Vec<f32> {
         let half = ROTARY / 2;
         let mut out = x.to_vec();
@@ -84,9 +86,9 @@ impl HostRef {
             for i in 0..half {
                 let ang = (pos as f32) * THETA.powf(-(2.0 * i as f32) / ROTARY as f32);
                 let (c, s) = (ang.cos(), ang.sin());
-                let (a, b) = (row[2 * i], row[2 * i + 1]);
-                out[h * HD + 2 * i] = a * c - b * s;
-                out[h * HD + 2 * i + 1] = a * s + b * c;
+                let (a, b) = (row[i], row[i + half]);
+                out[h * HD + i] = a * c - b * s;
+                out[h * HD + i + half] = b * c + a * s;
             }
             // 2*half..HD 直通(已由 to_vec 复制)
         }
@@ -99,9 +101,9 @@ impl HostRef {
         let mut out_all = vec![0.0f32; bs * HIDDEN];
         for t in 0..bs {
             let x = &xs[t * HIDDEN..(t + 1) * HIDDEN];
-            let q_raw = self.lin(x, &self.wq, HQ * HD * 2);
-            let k = self.lin(x, &self.wk, HKV * HD);
-            let v = self.lin(x, &self.wv, HKV * HD);
+            let q_raw = self.lin(x, &self.wq, HQ * HD * 2, HIDDEN);
+            let k = self.lin(x, &self.wk, HKV * HD, HIDDEN);
+            let v = self.lin(x, &self.wv, HKV * HD, HIDDEN);
 
             // per-head [value|gate] 切分
             let mut q = vec![0.0f32; HQ * HD];
@@ -159,7 +161,7 @@ impl HostRef {
             for (yi, g) in y.iter_mut().zip(&gate) {
                 *yi *= 1.0 / (1.0 + (-g).exp());
             }
-            let o = self.lin(&y, &self.wo, HIDDEN);
+            let o = self.lin(&y, &self.wo, HIDDEN, HQ * HD);
             out_all[t * HIDDEN..(t + 1) * HIDDEN].copy_from_slice(&o);
         }
         out_all

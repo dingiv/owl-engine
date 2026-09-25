@@ -21,7 +21,7 @@
 | GDN conv | kernel 4,q\|k\|v 共 6144 通道 | `linear_conv_kernel_dim=4` |
 | RMSNorm eps | 1e-6 | **全系零中心 ×(1+w)**(2026-09-26 HF 实证:Qwen3_5RMSNorm weight 零初始化 = offset 形态,主干/q_norm/k_norm 同一类;原"主干 ×w"说法作废) |
 | vocab | 248320,**tied**(无 lm_head.weight) | embedding 兼 lm_head |
-| rope | theta **1e7**,partial **0.25** → rotary_dim 64,**interleaved**(相邻对 2i/2i+1) | mrope 文本路径退化为一份 pos |
+| rope | theta **1e7**,partial **0.25** → rotary_dim 64,**rotate-half**(pair i/i+half;⚠️ 09-26 翻案:config `mrope_interleaved` 指三网格频率维交错,非相邻对 —— HF 探针 6e-8 vs 2.5) | mrope 文本路径退化为一份 pos |
 | attn_output_gate | **true** | q_proj 输出 = value\|gate 拼接(×2) |
 | mamba_ssm_dtype | f32 | GDN 状态/卷积恒 f32 |
 | max_position | 262144 | rope 表预生成规模 |
@@ -53,8 +53,8 @@ model.norm [1024]                                    ×1(终局 norm)
 | 2 | `layers/rmsnorm` | Op::Rmsnorm(多行 per-channel) | ✅ | host 参考 ✓ |
 | 3 | `layers/mlp` | gate/up → silu×mul → down(全语义) | ✅ | host 参考 ✓ |
 | 4 | `layers/embedding` | Kernel `owl_embed_f32`(port) | ✅ | 声明构造 ✓ |
-| 5 | `layers/rope` | Kernel `rope_interleaved_partial`(新写) | ✅ | 声明构造 ✓ |
-| 6 | `layers/attention` | 3 GEMM + qk-norm(K)+ rope 复用 + naive decode attn(K)+ gate sigmoid(K)+ mul(语义) | ⏳ 下一批 | GPU 端到端 |
+| 5 | `layers/rope` | Kernel `owl_rope_half_partial_f32`(rotate-half+partial) | ✅ | HF parity ✓(GPU vs HF 类直跑) |
+| 6 | `layers/attention` | 3 GEMM + qk-norm(复用 rmsnorm w_off)+ rope 复用 + naive decode attn(K)+ gate sigmoid(语义)+ mul + o_proj | ✅ | GPU 端到端两步 decode vs host 全链 ✓(含 bisect 13 段 maxdiff 全零) |
 | 7 | `layers/gdn` | 4 GEMM + conv_upd3(K)+ gating(K×2)+ l2norm(K)+ delta_dec(K)+ rmsnorm_act(K) | ⏳ | GPU 端到端 |
 | 8 | `layers/decoder` | DecoderLayer(Full/Gdn 枚举)+ 残差编排 + 24 层主干 + tied lm_head | ⏳ | 层级组装后 |
 | 9 | loader | safetensors → host f32(转置/重复通道)→ layer `new` | ⏳ | 权重指纹 |
@@ -75,15 +75,16 @@ model.norm [1024]                                    ×1(终局 norm)
 | Kernel | 状态 | 出处 |
 |---|---|---|
 | `owl_embed_f32` | ✅ | port dry_kernels.cu(ids f32 过线) |
-| `owl_rope_interleaved_partial_f32` | ✅ | 新写(相邻对;partial 直通尾段) |
-| `owl_qknorm_addone`(per-head ×(1+w)) | ⏳ attention 批 | 新写简版 |
-| `owl_naive_decode_attn`(slot 直排 KV) | ⏳ | port dry_kernels.cu |
-| `owl_sigmoid`(attn_output_gate) | ⏳ | port dry_kernels.cu |
-| `gdn_conv1d_upd3`(q/k/v 三段入,零拼接算子) | ⏳ gdn 批 | port gdn_kernels.cu 改签名 |
-| `gdn_gating_g` / `gdn_gating_beta` | ⏳ | port 公式:`g=-exp(A_log)·softplus(a+dt_bias)`、`beta=sigmoid(b)` |
-| `gdn_l2norm` | ⏳ | port(per-head,eps 1e-6) |
-| `gdn_delta_dec_gqa`(单步;g 核内 exp;state [maxB,Hv,K,V] f32) | ⏳ | port gdn_kernels.cu |
-| `gdn_rmsnorm_act`(silu(z) 门 × per-group gamma) | ⏳ | port gdn_kernels.cu |
+| `owl_rope_half_partial_f32` | ✅ | 新写(rotate-half pair i/i+half;原相邻对版 09-26 翻案更名) |
+| `owl_qknorm_addone`(per-head ×(1+w)) | ✅ 改判复用 | `owl_rmsnorm_f32` w_off=1(per-head 行 = [T×H, HD]),不新写 |
+| `owl_narrow_strided_f32`(q gate 切分) | ✅ | 新写(非连续窄切物化;GPU-only vs host 对拍 ✓) |
+| `owl_naive_decode_attn_f32`(slot 直排 KV) | ✅ | port dry_kernels.cu + 新世界契约改造(连续槽窗 [slot-kv_len+1, slot]、bs 上界 guard) |
+| `owl_sigmoid`(attn_output_gate) | ✅ 改判复用 | `ops.cu owl_sigmoid_f32` 语义算子,不 port |
+| `owl_gdn_gating_g_f32` | ✅ | port 旧世界 fused_gating 拆臂;**beta 臂改判复用 owl_sigmoid_f32** |
+| `owl_gdn_l2norm_f32` | ✅ | port 块内归约变体(一 block 一行;HF l2norm 同式) |
+| `owl_gdn_conv_upd_f32` | ✅ | port + **w_offset 段基址**(三段独立发射,单权重块不切) |
+| `owl_gdn_delta_dec_f32` | ✅ | port gqa decode(g log 空间核内 exp;q 核内乘 1/√kd;kd≤128 寄存器硬上界) |
+| `owl_gdn_norm_act_f32` | ✅ | port(×w **非零中心** × silu(z);HF Qwen3_5RMSNormGated 同式) |
 
 ## 四、形态契约(试水批已验证,勿反工)
 
@@ -136,12 +137,38 @@ model.norm [1024]                                    ×1(终局 norm)
 14. **编排(C5 定案,2026-09-26)**:整模单树 —— Model = Module,一步
     decode = 一次 eval;捕获 = warmup/捕获/重放同一棵树;层间物化
     (eval_ops 子树收割)仅调试用。
+15. **rope 配对语义实证律(2026-09-26 翻案)**:Qwen3.5 text rope =
+    **rotate-half(pair i/i+half)+ partial 直通**;config `mrope_interleaved`
+    指三网格(T/H/W)在**频率维**交错(recomposition_frequencies
+    slice(·,·,3)),非 GPT-J 相邻对 —— HF 类直跑探针裁决(6e-8 vs 2.5),
+    modeling 源码同证(apply_rotary_pos_emb = rotate_half 形态,attention
+    forward 无重排)。inv_freq 同式不变(theta^(-2i/rotary_dim))。
+    权威 = HF `Qwen3_5TextRotaryEmbedding` + `apply_rotary_pos_emb`,
+    金标准 = `layers/rope.py`(GPU vs HF parity 已接)。**教训:config 字段
+    名不等于实现语义(与 rmsnorm 零中心同族误读),新层必须先跑 HF
+    探针再写 kernel。**
+16. **host 参考内维硬编码雷(2026-09-26 M-b 结案附带)**:attention 端到端
+    GPU 发散的根因不在引擎 —— bisect 13 段 maxdiff 全零,发散 = example
+    `HostRef::lin` 把内维写死 HIDDEN,o_proj(内维 HQ*HD=16)只加了前
+    3 项。host 参考的一切形状参数必须随调用点传参,禁止借用全局常数。
+    (M-c 批 6 同雷再踩一次:host_gdn_step/示例 lin 同样硬编码 —— 本条
+    升级为律:新层 host 参考审阅必查内维传参。)
+17. **narrow start 语义(2026-09-26 M-c 批 6 定案)**:`owl_narrow_strided_f32`
+    的 `start` 是**行内列偏移**(dst[r·out+d] = src[r·src_dim+start+d]),
+    只能切列,**做不了行块偏移** —— conv 权重行切片串行(wk 全错)。
+    行块偏移走段基址标量(conv 核 w_offset),勿用 narrow。
 
 ## 五、验收里程碑
 
 - **M-a(试水)✅**:5 层 + Mul 算子,`tests/layers.rs` 5/5;
-- **M-b(attention 层)**:qk-norm/rope/naive-attn/gate 全链,GPU 端到端
-  单层对拍(host softmax 参考);
+- **M-b(attention 层)✅(2026-09-26)**:qk-norm(复用 w_off)/rope
+  (翻案 rotate-half)/narrow/naive-attn/gate 全链;GPU 两步 decode vs
+  host 全链 1e-4 ✓;rope GPU vs HF parity ✓;发散定位用 bisect 分段收割
+  (临时件已删,方法论录 §四 16);
+- **M-c(gdn 层)✅(2026-09-26)**:五 kernel 批 1-5 逐核小批移植(每批
+  host+GPU parity,gating/l2norm/norm_act 另接 HF golden;delta 核对拍 HF
+  `torch_recurrent_gated_delta_rule` out+state 双对拍)+ 批 6 层组装
+  (examples/gdn.rs 两步 decode vs host 全链 1e-4 ✓);
 - **M-c(gdn 层)**:五 kernel 全链,单层对拍(gdn_exemplars /
   recurrence_parity 旧世界判例迁移);
 - **M-d(decoder)**:24 层组装 + tied lm_head,随机权重 forward 收敛;

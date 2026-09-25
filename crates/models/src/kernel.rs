@@ -107,8 +107,8 @@ pub static REGISTRY: &[Entry] = &[
     // ---- 文本主干(Qwen3.5 mini-demo;Kernel 节点路径,输出块末参)----
     Entry { name: "owl_embed_f32", source: text::EMBED_F32, args: "T,T,sz,T" },
     Entry {
-        name: "owl_rope_interleaved_partial_f32",
-        source: text::ROPE_INTERLEAVED_F32,
+        name: "owl_rope_half_partial_f32",
+        source: text::ROPE_HALF_PARTIAL_F32,
         args: "T,T,T,T,sz,sz,sz,T",
     },
     Entry {
@@ -120,6 +120,33 @@ pub static REGISTRY: &[Entry] = &[
         name: "owl_naive_decode_attn_f32",
         source: text::ATTENTION_F32,
         args: "T,T,T,T,T,T,T,sz,sz,sz,sz,T",
+    },
+    // ---- GDN 线性注意力(Qwen3.5 mini-demo;Kernel 节点路径,输出块末参)----
+    // (beta 臂 = sigmoid(b) 复用 owl_sigmoid_f32,不登记)
+    Entry {
+        name: "owl_gdn_gating_g_f32",
+        source: text::GDN_F32,
+        args: "T,T,T,sz,sz,T",
+    },
+    Entry {
+        name: "owl_gdn_l2norm_f32",
+        source: text::GDN_F32,
+        args: "T,sz,sz,f32,T",
+    },
+    Entry {
+        name: "owl_gdn_conv_upd_f32",
+        source: text::GDN_F32,
+        args: "T,T,T,T,sz,sz,sz,i32,T",
+    },
+    Entry {
+        name: "owl_gdn_delta_dec_f32",
+        source: text::GDN_F32,
+        args: "T,T,T,T,T,T,T,sz,sz,sz,sz,sz,f32,T",
+    },
+    Entry {
+        name: "owl_gdn_norm_act_f32",
+        source: text::GDN_F32,
+        args: "T,T,T,sz,sz,sz,f32,i32,T",
     },
 ];
 
@@ -228,7 +255,7 @@ mod tests {
             );
             // Kernel 节点路径(text/ 域四核)输出块必须末参;语义算子族
             // (lower_* 硬编码装配)out 位置随 .cu 签名,不受此限
-            if matches!(e.name, "owl_embed_f32" | "owl_rope_interleaved_partial_f32" | "owl_narrow_strided_f32" | "owl_naive_decode_attn_f32") {
+            if matches!(e.name, "owl_embed_f32" | "owl_rope_half_partial_f32" | "owl_narrow_strided_f32" | "owl_naive_decode_attn_f32") {
                 assert!(e.args.ends_with("T"), "{}: Kernel 节点路径输出块必须末参", e.name);
             }
         }
