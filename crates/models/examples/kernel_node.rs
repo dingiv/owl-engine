@@ -17,6 +17,8 @@ extern "C" __global__ void owl_scale_f32(
 }
 "#;
 
+// 逃生舱签名:非注册 kernel 的槽序权威(T,f32,sz + 末位输出 T)
+
 fn host(shape: &[usize], v: &[f32]) -> TensorOps {
     let mut bytes = Vec::with_capacity(v.len() * 4);
     for f in v {
@@ -52,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ① grid 哨兵(自动 1D ceil/256)
     let x = host(&[4], &[1.0, 1.0, 1.0, 1.0]);
-    let decl = TensorOps::of(Kernel::new("owl_scale_f32", SCALE_CU))
+    let decl = TensorOps::of(Kernel::new("owl_scale_f32", SCALE_CU).with_sig("T,f32,sz,T"))
         .with_shape(Dtype::F32, Shape::from(vec![4]))
         .arg(&x)
         .arg_f32(3.0)
@@ -63,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ② 显式发射配置(with_launch)
     let x2 = host(&[4], &[2.0, 2.0, 2.0, 2.0]);
-    let decl2 = TensorOps::of(Kernel::new("owl_scale_f32", SCALE_CU).with_launch((1, 1, 1), (256, 1, 1), 0))
+    let decl2 = TensorOps::of(Kernel::new("owl_scale_f32", SCALE_CU).with_sig("T,f32,sz,T").with_launch((1, 1, 1), (256, 1, 1), 0))
         .with_shape(Dtype::F32, Shape::from(vec![4]))
         .arg(&x2)
         .arg_f32(0.5)

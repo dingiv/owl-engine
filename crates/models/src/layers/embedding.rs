@@ -124,7 +124,7 @@ mod tests {
             if on_gpu && !crate::testkit::gpu_enabled() {
                 continue;
             }
-            let (tag, y, logits) = if !on_gpu {
+            let (_, y, logits) = if !on_gpu {
                 let mut face = owl_cpu::CpuFace::new();
                 let emb = Embedding::new(vocab, d);
                 let src = Src::from([

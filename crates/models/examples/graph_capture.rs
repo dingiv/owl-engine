@@ -22,7 +22,7 @@ extern "C" __global__ void owl_scale_f32(
 
 /// x(Block 叶子)* k 的声明(捕获与重放共用同一棵树、同一批块)
 fn scale_decl(x_block: u64, k: f32) -> TensorOps {
-    TensorOps::of(Kernel::new("owl_scale_f32", SCALE_CU))
+    TensorOps::of(Kernel::new("owl_scale_f32", SCALE_CU).with_sig("T,f32,sz,T"))
         .with_shape(Dtype::F32, Shape::from(vec![4]))
         .arg(&TensorOps::of_block(x_block, Dtype::F32, Shape::from(vec![4])))
         .arg_f32(k)

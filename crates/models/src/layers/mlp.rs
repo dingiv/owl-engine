@@ -132,7 +132,7 @@ mod tests {
             if on_gpu && !crate::testkit::gpu_enabled() {
                 continue;
             }
-            let (tag, out) = if !on_gpu {
+            let (_, out) = if !on_gpu {
                 let mut face = owl_cpu::CpuFace::new();
                 let layer = Mlp::new(hidden, inter);
                 let src = HashMap::from([

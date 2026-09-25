@@ -16,13 +16,15 @@ use crate::kernel::Kernel;
 // §1 Kernel 节点参数槽(有序;类型化)
 // ============================================================================
 
-/// Kernel 节点的参数槽(有序)
-/// 类型化:标量按 kernel 形参宽度入槽(CUDA 参数空间自然对齐,
-/// 宽槽顶窄形参会错位读參 —— 与 contract::Arg 同一纪律)
+/// Kernel 节点的**标量**参数槽(有序)。
+///
+/// 张量依赖不在本枚举 —— `TensorOps.parents` 即张量槽(每个节点自身
+/// 声明输出类型 = f32 块,消费方查父输出即可,无需在 args 里重复标 T;
+/// 2026-09-26 用户裁决)。发射时槽序由签名唯一权威(注册表 Entry.args /
+/// 逃生舱 kernel.sig)对位:T ↔ 下一个父块,sz/i32/f32 ↔ 下一个标量。
+/// 类型化纪律:CUDA 参数空间自然对齐,宽槽顶窄形参会错位读參。
 #[derive(Clone, Debug)]
 pub enum KernelArg {
-    /// 张量依赖:归约序保证先算;发射时 server 解 id → 设备指针
-    T { id: u64 },
     /// 8 字节标量(size_t/u64;与 kernel `size_t` 形参严格对位)
     Bits(u64),
     /// 4 字节有符号整数
@@ -249,40 +251,67 @@ pub fn lower_rmsnorm(ins: &[Bytes], eps: f32, w_off: bool, out: &Bytes, rows: us
 /// 这里机器拦截。非注册 kernel(逃生舱直带源码)跳过校验。
 pub fn lower_kernel(
     kernel: &crate::kernel::Kernel,
-    decl_args: &[KernelArg],
+    scalars: &[KernelArg],
     ins: &[Bytes],
     out: &Bytes,
     out_elems: usize,
 ) -> LaunchMsg {
-    if let Some(entry) = crate::kernel::lookup(kernel.name) {
-        let mut want: Vec<&str> = decl_args.iter().map(|a| match a {
-            KernelArg::T { .. } => "T",
-            KernelArg::Bits(_) => "sz",
-            KernelArg::I32(_) => "i32",
-            KernelArg::F32(_) => "f32",
-        }).collect();
-        want.push("T"); // 输出块固定末参
-        let want_sig = want.join(",");
-        assert!(
-            want_sig == entry.args,
-            "lower_kernel({}): 签名不符\n  声明 = {want_sig}\n  登记 = {}\n  (arg_usize ↔ sz/size_t;输出块必须末参)",
-            kernel.name, entry.args
-        );
-    }
-    let mut args: Vec<Arg> = Vec::with_capacity(decl_args.len() + 1);
-    let mut pi = 0usize; // T 槽 ↔ 父依赖同序计数
-    for a in decl_args {
-        match a {
-            KernelArg::T { .. } => {
+    // 槽序唯一权威:注册表签名优先,逃生舱 kernel 自带 sig
+    let sig: &str = match crate::kernel::lookup(kernel.name) {
+        Some(e) => e.args,
+        None if !kernel.sig.is_empty() => kernel.sig,
+        None => panic!(
+            "lower_kernel({}): 非注册 kernel 必须带 with_sig(槽序契约无权威即拒绝发射)",
+            kernel.name
+        ),
+    };
+    let toks: Vec<&str> = sig.split(',').collect();
+    // 输出块 = 末位 T;其余 T 槽数必须等于父依赖数
+    let t_in = toks[..toks.len() - 1].iter().filter(|t| **t == "T").count();
+    assert!(
+        t_in == ins.len(),
+        "lower_kernel({}): 签名 T 槽 {t_in} != 父依赖 {}(检查 .arg 链)",
+        kernel.name,
+        ins.len()
+    );
+    assert!(
+        toks.len() - 1 - t_in == scalars.len(),
+        "lower_kernel({}): 签名标量槽 {} != 标量参数 {}(sz/i32/f32 与 arg_usize/arg_i32/arg_f32 对位)",
+        kernel.name,
+        toks.len() - 1 - t_in,
+        scalars.len()
+    );
+
+    // 按 sig 对位装配:T → 下一个父块(父输出类型 = 张量块,查父即得);
+    // sz/i32/f32 → 下一个标量;末位 T → 输出块
+    let mut args: Vec<Arg> = Vec::with_capacity(toks.len());
+    let (mut pi, mut si) = (0usize, 0usize);
+    for (i, tok) in toks.iter().enumerate() {
+        let is_out = i == toks.len() - 1;
+        match *tok {
+            "T" if is_out => args.push(Arg::Block { id: out.id }),
+            "T" => {
                 args.push(Arg::Block { id: ins[pi].id });
                 pi += 1;
             }
-            KernelArg::Bits(v) => args.push(Arg::U64(*v)),
-            KernelArg::I32(v) => args.push(Arg::I32(*v)),
-            KernelArg::F32(v) => args.push(Arg::F32(*v)),
+            "sz" => match &scalars[si] {
+                KernelArg::Bits(v) => args.push(Arg::U64(*v)),
+                other => panic!("lower_kernel({}): 槽 {i} 期望 sz,实得 {other:?}", kernel.name),
+            },
+            "i32" => match &scalars[si] {
+                KernelArg::I32(v) => args.push(Arg::I32(*v)),
+                other => panic!("lower_kernel({}): 槽 {i} 期望 i32,实得 {other:?}", kernel.name),
+            },
+            "f32" => match &scalars[si] {
+                KernelArg::F32(v) => args.push(Arg::F32(*v)),
+                other => panic!("lower_kernel({}): 槽 {i} 期望 f32,实得 {other:?}", kernel.name),
+            },
+            other => panic!("lower_kernel({}): 非法签名 token `{other}`", kernel.name),
+        }
+        if !is_out && *tok != "T" {
+            si += 1;
         }
     }
-    args.push(Arg::Block { id: out.id });
     let (grid, block, shared_mem) = if kernel.launch.grid == (0, 0, 0) {
         (auto_grid(out_elems), kernel.launch.block, kernel.launch.shared_mem)
     } else {

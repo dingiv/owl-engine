@@ -53,16 +53,25 @@ pub struct Kernel {
     pub name: &'static str,
     pub source: &'static str,
     pub launch: LaunchShape,
+    /// 逃生舱签名(非注册 kernel 必带;格式同 Entry.args,含末位输出 T)。
+    /// 注册 kernel 此字段留空 —— 槽序权威取注册表。
+    pub sig: &'static str,
 }
 
 impl Kernel {
     pub fn new(name: &'static str, source: &'static str) -> Self {
-        Self { name, source, launch: LaunchShape::default() }
+        Self { name, source, launch: LaunchShape::default(), sig: "" }
     }
 
     /// 显式发射配置(覆盖自动 1D)
     pub fn with_launch(mut self, grid: (u32, u32, u32), block: (u32, u32, u32), shared_mem: u32) -> Self {
         self.launch = LaunchShape { grid, block, shared_mem };
+        self
+    }
+
+    /// 逃生舱签名(非注册 kernel 的槽序权威;注册 kernel 勿用)
+    pub fn with_sig(mut self, sig: &'static str) -> Self {
+        self.sig = sig;
         self
     }
 }
@@ -226,12 +235,11 @@ mod tests {
     }
 
     #[test]
-    fn lower_kernel_rejects_signature_mismatch() {
-        // 声明槽序与登记 args 不符 → 组合期 panic(机器拦截 u32/sz 错位类雷)
+    fn lower_kernel_rejects_scalar_mismatch() {
+        // 标量槽宽度与登记 args 不符 → 组合期 panic(机器拦截 u32/sz 错位类雷)
         let k = kernel_with("owl_narrow_strided_f32", (0, 0, 0), (256, 1, 1), 0);
-        let decl_args = vec![
-            crate::ops::KernelArg::T { id: 1 },
-            crate::ops::KernelArg::I32(2), // 应为 sz(Bit)—— 故意错
+        let scalars = vec![
+            crate::ops::KernelArg::I32(2), // 首标量应为 sz(Bit)—— 故意错
             crate::ops::KernelArg::Bits(3),
             crate::ops::KernelArg::Bits(4),
             crate::ops::KernelArg::Bits(5),
@@ -239,8 +247,46 @@ mod tests {
         let ins = vec![Bytes::new(1, 0)];
         let out = Bytes::new(9, 0);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = crate::ops::lower_kernel(&k, &decl_args, &ins, &out, 0);
+            let _ = crate::ops::lower_kernel(&k, &scalars, &ins, &out, 0);
         }));
-        assert!(result.is_err(), "签名错位应 panic");
+        assert!(result.is_err(), "标量宽度错位应 panic");
+    }
+
+    #[test]
+    fn lower_kernel_rejects_parent_count_mismatch() {
+        // 父依赖数 != 签名 T 槽数 → 组合期 panic
+        let k = kernel_with("owl_narrow_strided_f32", (0, 0, 0), (256, 1, 1), 0);
+        let scalars = vec![
+            crate::ops::KernelArg::Bits(1),
+            crate::ops::KernelArg::Bits(2),
+            crate::ops::KernelArg::Bits(3),
+            crate::ops::KernelArg::Bits(4),
+        ];
+        let ins = vec![Bytes::new(1, 0), Bytes::new(2, 0)]; // 应为 1 个父
+        let out = Bytes::new(9, 0);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = crate::ops::lower_kernel(&k, &scalars, &ins, &out, 0);
+        }));
+        assert!(result.is_err(), "父数不符应 panic");
+    }
+
+    #[test]
+    fn lower_kernel_happy_path_orders_slots() {
+        // 正确声明 → 槽序 = 签名序(T 块 + 标量交错,输出末位)
+        let k = kernel_with("owl_narrow_strided_f32", (0, 0, 0), (256, 1, 1), 0);
+        let scalars = vec![
+            crate::ops::KernelArg::Bits(10),
+            crate::ops::KernelArg::Bits(20),
+            crate::ops::KernelArg::Bits(30),
+            crate::ops::KernelArg::Bits(40),
+        ];
+        let ins = vec![Bytes::new(7, 0)];
+        let out = Bytes::new(9, 8);
+        let msg = crate::ops::lower_kernel(&k, &scalars, &ins, &out, 8);
+        assert_eq!(msg.args.len(), 6); // T + sz×4 + out
+        assert!(matches!(&msg.args[0], owl_iface::contract::Arg::Block { id: 7 }));
+        assert!(matches!(&msg.args[1], owl_iface::contract::Arg::U64(10)));
+        assert!(matches!(&msg.args[5], owl_iface::contract::Arg::Block { id: 9 }));
+        assert_eq!(msg.out_elems, 8);
     }
 }

@@ -120,7 +120,7 @@ mod tests {
         let want = st_read(&outp, "y");
 
         for (face_tag, make) in [("cpu", None), ("gpu", Some(()))] {
-            let (tag, out) = if make.is_none() {
+            let (_, out) = if make.is_none() {
                 let mut face = owl_cpu::CpuFace::new();
                 let lin = Linear::new("w", out_dim, in_dim);
                 let src = HashMap::from([("w".to_string(), w.clone())]);

@@ -67,7 +67,9 @@ pub struct TensorOps {
     /// 标注(client 侧;server 是字节世界)
     pub(crate) dtype: Dtype,
     pub(crate) shape: Shape,
-    /// Kernel 节点的有序参数槽(T = 张量依赖 / Bits = 标量位型)
+    /// Kernel 节点的**标量**参数槽(有序;Bits/I32/F32)。
+    /// 张量依赖 = parents(自身输出类型声明即 f32 块,消费方查父即可,
+    /// 2026-09-26 裁决:args 不再重复标 T);槽序权威 = kernel 签名。
     pub(crate) args: Vec<KernelArg>,
     /// 毒值(构造期违约;随子树透传)
     pub(crate) err: Option<LazyError>,
@@ -314,7 +316,6 @@ impl TensorOps {
     /// 参数入包(张量 → 依赖 + 有序槽)
     pub fn arg(self, t: &TensorOps) -> TensorOps {
         let mut out = self;
-        out.args.push(KernelArg::T { id: t.id });
         out.parents.push(t.clone());
         out
     }
