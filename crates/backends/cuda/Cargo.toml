@@ -17,6 +17,7 @@ cudarc = { version = "0.19", default-features = false, features = [
     "dynamic-loading",
 ] }
 owl-iface = { path = "../iface" }
+# FIXME: 未来需要移除这个 models 依赖, 依赖反了
 owl-models = { path = "../../models" }
 owl-kernels = { path = "../../kernels" }
 parking_lot = { workspace = true }

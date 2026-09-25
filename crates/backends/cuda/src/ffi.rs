@@ -86,6 +86,9 @@ pub const CAPTURE_MODE_THREAD_LOCAL: CUstreamCaptureMode =
 pub const INSTANTIATE_AUTO_FREE: CUgraphInstantiate_flags =
     CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
 
+/// 流序清零(非阻塞;可捕获 —— 图内 memset 节点 = 每次 replay 重清零)
+pub use cudarc::driver::result::memset_d8_async;
+
 /// host 完成回调(现代 API;cuLaunchHostFunc,取代废弃的 cudaStreamAddCallback)。
 /// ⚠️ 回调跑在驱动线程:**禁止调用任何 CUDA API、禁止阻塞** —— 只允许
 /// 做纯 host 侧动作(如 channel send)。

@@ -26,7 +26,7 @@
 //! 回执客户端,以此构成对外的异步 API(命令流水线化;server 不因 GPU 工作而停摆)。
 
 mod command;
-mod client;
+mod gpu_client;
 mod launch;
 mod server;
 mod state;
@@ -34,9 +34,18 @@ mod state;
 pub mod ffi;
 
 pub use command::Command;
-pub use client::GpuClient;
+pub use gpu_client::GpuClient;
 pub use server::GpuServer;
 pub use state::DeviceSelector;
+
+// 线格式与词汇再导出(客户只依赖 owl-cuda 即可组装命令,不必直连 owl-models;
+// FIXME 升级:将来把契约类型迁出自 owl-models,彻底解除反向依赖)
+pub use owl_models::client::{Arg, Bytes, GraphId, KernelSpec, LaunchMsg};
+pub use owl_models::shape::Shape;
+pub use owl_models::{Dtype, ModelError};
+
+/// DeviceClient 能力契约(实现于 GpuClient;从 owl-models 契约层 re-export)
+pub use owl_models::client::DeviceClient;
 
 /// 测试/示例的设备序号(OWL_TEST_DEVICE,默认 0)
 pub fn test_device_ordinal() -> usize {

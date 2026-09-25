@@ -25,7 +25,7 @@
 //! **流语义**:客户端可要求签发新流(NewStream → StreamId);此后每条
 //! 原语带流 id —— 流内保序(依赖维),流间并发。
 
-use crate::ffi::{launch_host_function, memcpy_dtoh_async, memcpy_htod_async};
+use crate::ffi::{launch_host_function, memcpy_dtoh_async, memcpy_htod_async, memset_d8_async};
 use crate::command::{Ack, Command};
 use crate::launch::issue_launch;
 use crate::state::{DeviceSelector, GpuCtx, KernelCache, Staging};
@@ -102,18 +102,30 @@ impl GpuServer {
             .map_err(|e| format!("派发线程启动失败: {e}"))?;
         self.dispatch = Some(dtx);
 
-        // 纯阻塞监听:零轮询。两种收摊:
-        // - Close 命令 → Closing 态:排空积压(结构化拒绝)→ 栅栏 → 退出
-        // - 客户端全部离场(Disconnected)→ 直接收摊
+        // 纯阻塞监听:零轮询。生命周期:
+        // - Ready:正常 dispatch
+        // - Close 命令 → Closing 态:此后一切命令结构化拒绝(ServerClosed),
+        //   直到全部客户端离场(Disconnected)→ 设备栅栏 → 收摊
         // 在飞 finish 由派发线程排空(channel 关闭后自然收尾)。
-        while let Some(cmd) = self.rx.recv().ok() {
-            if let Command::Close { ack } = cmd {
-                ack.send(Ok(()));
-                break;
+        let mut closing = false;
+        loop {
+            let cmd = match self.rx.recv() {
+                Ok(c) => c,
+                Err(_) => break, // 全部客户端离场
+            };
+            match cmd {
+                Command::Close { ack } if !closing => {
+                    ack.send(Ok(()));
+                    closing = true;
+                }
+                other if closing => {
+                    // Closing 态:拒绝必须用 ServerClosed(客户端可程序化识别)
+                    Self::reject_closed(other);
+                }
+                other => self.dispatch(other),
             }
-            self.dispatch(cmd);
         }
-        self.drain_and_shutdown();
+        self.shutdown_fence();
         Ok(())
     }
 
@@ -124,20 +136,9 @@ impl GpuServer {
         }
     }
 
-    /// Closing 收尾:排空积压命令(结构化拒绝)→ 设备栅栏 → 关派发通道
-    /// (派发线程排完在飞 finish 后自然退出)。
-    fn drain_and_shutdown(mut self) {
-        let why = || {
-            ModelError::Msg("server 正在关闭(Closing):命令被拒绝".to_string())
-        };
-        while let Ok(cmd) = self.rx.try_recv() {
-            match cmd {
-                // 关机语义:Close 幂等,直接回执
-                Command::Close { ack } => ack.send(Ok(())),
-                other => Self::reject_with(other, why().to_string()),
-            }
-        }
-        // 设备栅栏:三条流全部落定,在飞搬运/kernel 不悬空
+    /// Closing 收尾:设备栅栏(三条流全部落定,在飞搬运/kernel 不悬空)
+    /// → 关派发通道(派发线程排完在飞 finish 后自然退出)。
+    fn shutdown_fence(&mut self) {
         if let Some(ctx) = &self.ctx {
             for sid in [STREAM_H2D, STREAM_COMPUTE, STREAM_D2H] {
                 if let Ok(s) = ctx.stream(sid) {
@@ -145,7 +146,7 @@ impl GpuServer {
                 }
             }
         }
-        drop(self.dispatch.take()); // 关派发通道 → 派发线程排空后退出
+        drop(self.dispatch.take());
     }
 
     fn ctx(&self) -> &GpuCtx {
@@ -196,6 +197,23 @@ impl GpuServer {
              Launch/Alloc;同步/搬运/图操作会破坏图捕获".to_string());
     }
 
+    /// Closing 态拒绝:每条命令的 ack 都必须回 ServerClosed
+    /// (否则客户端 Future 永远 pending —— 本轮挂死根因)
+    fn reject_closed(cmd: Command) {
+        macro_rules! closed { ($ack:expr) => { $ack.send(Err(ModelError::ServerClosed)) } }
+        match cmd {
+            Command::Close { ack } => ack.send(Ok(())), // 幂等
+            Command::Alloc { ack, .. } => closed!(ack),
+            Command::Htod { ack, .. } => closed!(ack),
+            Command::Dtoh { ack, .. } => closed!(ack),
+            Command::Launch { ack, .. } => closed!(ack),
+            Command::Sync { ack, .. } => closed!(ack),
+            Command::GraphBegin { ack, .. } => closed!(ack),
+            Command::GraphEnd { ack, .. } => closed!(ack),
+            Command::GraphLaunch { ack, .. } => closed!(ack),
+        }
+    }
+
     fn reject_with(cmd: Command, why: String) {
         macro_rules! reject { ($ack:expr) => { $ack.send(Err(ModelError::Msg(why.clone()))) } }
         let name = |c: &Command| match c {
@@ -224,22 +242,34 @@ impl GpuServer {
     }
 
     fn handle_alloc(&mut self, n_elems: usize, ack: Ack<Result<Bytes, ModelError>>) {
-        // 捕获期:从 slab 切块(零 cudaMalloc;malloc 在捕获窗内非法)
+        // 捕获期:从 slab 切块(零 cudaMalloc;malloc 在捕获窗内非法)。
+        // 切完必须流序清零(N4):块内容 = slab 残留,不清零则 Zeros 语义
+        // / 部分写 kernel 静默踩垃圾;memset 可捕获 → replay 时重清零,
+        // 语义恒成立。
         if self.ctx().capture_stream() {
-            let result = self
-                .ctx_mut()
-                .carve_block(n_elems)
-                .map(|id| Bytes::new(id, n_elems));
+            let result = (|| {
+                let id = self.ctx_mut().carve_block(n_elems)?;
+                let stream = self.ctx().stream(STREAM_COMPUTE)?.clone();
+                let (dptr, _) = self.ctx().block_ptr(id, &stream)?;
+                unsafe { memset_d8_async(dptr, 0, n_elems * 4, stream.cu_stream()) }
+                    .map_err(|e| ModelError::Msg(format!("carve memset: {e:?}")))?;
+                Ok(Bytes::new(id, n_elems))
+            })();
             return ack.send(result);
         }
-        // 图外:路由 COMPUTE 流,流序 memset(非阻塞);立即回执
+        // 图外:路由 COMPUTE 流;alloc 后流序清零(契约:Zeros = 清零分配)
         let stream = match self.ctx().stream(STREAM_COMPUTE) {
             Ok(s) => s.clone(),
             Err(e) => return ack.send(Err(e)),
         };
         let result = unsafe { stream.alloc::<f32>(n_elems) }
             .map_err(|e| ModelError::Msg(format!("alloc: {e:?}")))
-            .map(|slice| Bytes::new(self.ctx_mut().new_block(slice), n_elems));
+            .and_then(|mut slice| {
+                stream
+                    .memset_zeros(&mut slice)
+                    .map_err(|e| ModelError::Msg(format!("alloc memset: {e:?}")))?;
+                Ok(Bytes::new(self.ctx_mut().new_block(slice), n_elems))
+            });
         ack.send(result);
     }
 
