@@ -14,9 +14,10 @@
 
 use owl_models::contract::DeviceClient;
 use owl_models::interpreter::eval_ops;
-use owl_models::layers::attention::{Attention, KvBuffers};
+use owl_models::layers::attention::Attention;
+use owl_models::module::{ForwardCtx, KvBuffers};
+use owl_models::Module;
 use owl_models::layers::rope::Rope;
-use owl_models::module::KernelCtx;
 use owl_models::tensor::Dtype;
 use owl_models::TensorOps;
 
@@ -246,7 +247,8 @@ async fn main() {
         };
         let xs_t = TensorOps::from_host(Dtype::F32, vec![bs, HIDDEN], &f32b(xs));
         let pos_t = TensorOps::from_host(Dtype::F32, vec![bs], &f32b(pos));
-        let decl = attn.forward(&xs_t, &rp, &pos_t, &kv, &KernelCtx { tokens: bs });
+        let ctx = ForwardCtx::decode(bs, &pos_t, &kv, &rp);
+        let decl = attn.forward(&xs_t, &ctx);
 
         // 执行 + 收割
         let bytes = eval_ops(decl.step(), &mut client).await.expect("eval");

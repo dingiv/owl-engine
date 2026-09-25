@@ -20,7 +20,7 @@
 //! - [`tensor`]:声明链 TensorOps + 毒值 LazyError + 运行时 Tensor<D>(线 B 冻结)
 //! - [`ops`]:语义 Op 枚举 + lower 动作表(具名算子 → LaunchMsg 唯一通道)
 //! - [`kernel`]:Kernel 值 + 名字→源 注册表(源码之家 = owl-kernels cu/)
-//! - [`module`]:层协议双面 —— Module/KernelCtx(计算)+ Loadable/Weight/
+//! - [`module`]:层协议双面 —— Module/ForwardCtx(计算)+ Loadable/Weight/
 //!   Want/LoaderOps(装载)
 //! - [`layers`]:Qwen3.5 文本主干层(容器 + layout + forward)
 //!
@@ -52,7 +52,7 @@ pub mod tensor;
 
 pub use contract::{DeviceClient, Dtype, ModelError, Shape};
 pub use kernel::{Kernel, LaunchShape};
-pub use module::{KernelCtx, Module};
+pub use module::{ForwardCtx, KvBuffers, Module};
 pub use tensor::{LazyError, Tensor, TensorOps};
 
 /// 本 crate 的结果别名:只用于**边界**(构造期装载 / 执行收割)。

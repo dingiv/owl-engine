@@ -3,7 +3,7 @@
 
 use owl_models::contract::DeviceClient;
 use owl_models::interpreter::{eval_ops, eval_load};
-use owl_models::module::KernelCtx;
+use owl_models::module::{ForwardCtx, KvBuffers};
 use owl_models::Module;
 use owl_models::module::Loadable;
 use owl_models::layers::{attention, embedding, linear, mlp, rmsnorm, rope};
@@ -51,7 +51,7 @@ async fn linear_transposed_matmul_matches_host() {
 
     let xs = TensorOps::from_host(Dtype::F32, vec![1, 3], &f32b(&x));
     let got = {
-        let ops = lin.forward(&xs, &KernelCtx::default());
+        let ops = lin.forward(&xs, &ForwardCtx::minimal(1));
         harvest(&mut face, &ops).await
     };
     assert_eq!(got.len(), 2);
@@ -78,7 +78,7 @@ async fn rmsnorm_multirow_perchannel_matches_host() {
         .expect("eval_load");
 
     let xs = TensorOps::from_host(Dtype::F32, vec![rows, n], &f32b(&x));
-    let got = harvest(&mut face, &norm.forward(&xs, &KernelCtx::default())).await;
+    let got = harvest(&mut face, &norm.forward(&xs, &ForwardCtx::minimal(1))).await;
 
     for r in 0..rows {
         let row = &x[r * n..(r + 1) * n];
@@ -116,7 +116,7 @@ async fn mlp_chain_matches_host_reference() {
         .expect("eval_load");
 
     let xs = TensorOps::from_host(Dtype::F32, vec![1, hidden], &f32b(&x));
-    let got = harvest(&mut face, &layer.forward(&xs, &KernelCtx::default())).await;
+    let got = harvest(&mut face, &layer.forward(&xs, &ForwardCtx::minimal(1))).await;
     assert_eq!(got.len(), hidden);
 
     // host 参考(同一 SwiGLU 数学)
@@ -152,7 +152,7 @@ async fn unloaded_slot_becomes_poison_at_boundary() {
     let xs = TensorOps::from_host(Dtype::F32, vec![1, 3], &f32b(&[1.0, 2.0, 3.0]));
 
     // forward total(零 panic 零 Err);毒立即随链标注(eval 边界收割详情)
-    let out = lin.forward(&xs, &KernelCtx::default());
+    let out = lin.forward(&xs, &ForwardCtx::minimal(1));
     assert!(out.is_poisoned(), "未装载槽的声明应立即带毒(随链流动)");
     let err = eval_ops(out.step(), &mut face).await.unwrap_err();
     assert!(format!("{err:?}").contains("未装载"), "{err:?}");
@@ -187,7 +187,7 @@ async fn embedding_declaration_is_wellformed() {
         .expect("eval_load");
 
     let ids = TensorOps::from_host(Dtype::F32, vec![2], &f32b(&[3.0, 7.0]));
-    let out = emb.forward(&ids, &KernelCtx { tokens: 2 });
+    let out = emb.forward(&ids, &ForwardCtx::minimal(2));
     assert!(!out.is_poisoned(), "embedding 声明不应有毒");
     assert_eq!(out.shape(), &[2, 4]);
 
@@ -224,6 +224,37 @@ async fn rope_declaration_is_wellformed() {
 }
 
 // ============================================================================
+// Reshape:纯元数据视图(eval 透传父块;零拷贝零 kernel)
+// ============================================================================
+
+#[tokio::test]
+async fn reshape_is_metadata_passthrough() {
+    let x: Vec<f32> = (0..6).map(|i| i as f32 * 0.5).collect();
+    let mut face = owl_cpu::CpuFace::new();
+
+    // 合法:2×3 → 3×2,元素序不变
+    let xs = TensorOps::from_host(Dtype::F32, vec![2, 3], &f32b(&x));
+    let out = xs.reshape(vec![3, 2]);
+    assert!(!out.is_poisoned());
+    assert_eq!(out.shape(), &[3, 2]);
+    let got = harvest(&mut face, &out).await;
+    assert_eq!(got, x, "reshape 透传父块,元素序不变");
+
+    // 链式:reshape → matmul(视图参与下游声明)
+    let w = TensorOps::from_host(Dtype::F32, vec![2, 4], &f32b(&vec![1.0; 8]));
+    let y = out.matmul(&w);
+    assert_eq!(y.shape(), &[3, 4]);
+
+    // 违约:元素数不守恒 → 毒值,eval 收割
+    let bad = xs.reshape(vec![7]);
+    assert!(bad.is_poisoned());
+    let err = owl_models::interpreter::eval_ops(bad.step(), &mut face)
+        .await
+        .unwrap_err();
+    assert!(format!("{err:?}").contains("reshape"), "{err:?}");
+}
+
+// ============================================================================
 // Sigmoid:语义算子(注意力输出门;CPU face 可跑)
 // ============================================================================
 
@@ -254,7 +285,7 @@ async fn rmsnorm_add_one_variant_matches_host() {
     eval_load(&norm, &mut face, &src, &Default::default()).await.expect("eval_load");
 
     let xs = TensorOps::from_host(Dtype::F32, vec![1, n], &f32b(&x));
-    let got = harvest(&mut face, &norm.forward(&xs, &KernelCtx::default())).await;
+    let got = harvest(&mut face, &norm.forward(&xs, &ForwardCtx::minimal(1))).await;
     let ms = x.iter().map(|v| v * v).sum::<f32>() / n as f32;
     let inv = 1.0 / (ms + 1e-6).sqrt();
     for (c, g) in got.iter().enumerate() {
@@ -294,20 +325,26 @@ async fn attention_load_and_declaration_wellformed() {
     let pos = TensorOps::from_host(Dtype::F32, vec![tokens], &f32b(&[7.0]));
     let rp = rope::Rope::new(64, hd, 2, 10_000.0).expect("rope new");
     eval_load(&rp, &mut face, &rp.tables(), &Default::default()).await.expect("rope 表物化");
-    let kv = attention::KvBuffers {
+    let kv = KvBuffers {
         k_cache: TensorOps::zeros(Dtype::F32, vec![4, hkv, hd]),
         v_cache: TensorOps::zeros(Dtype::F32, vec![4, hkv, hd]),
         slots: TensorOps::from_host(Dtype::F32, vec![tokens], &f32b(&[0.0])),
         kv_lens: TensorOps::from_host(Dtype::F32, vec![tokens], &f32b(&[1.0])),
     };
-    let out = attn.forward(&xs, &rp, &pos, &kv, &KernelCtx { tokens });
+    let ctx = ForwardCtx::decode(tokens, &pos, &kv, &rp);
+    let out = attn.forward(&xs, &ctx);
     assert!(!out.is_poisoned(), "装载后声明不应有毒");
     assert_eq!(out.shape(), &[tokens, hidden]);
 
     // 毒值契约:未装载容器 → forward 声明立即带毒(eval 边界收割)
     let attn2 = attention::Attention::new(hq, hkv, hd, hidden, 1e-6);
-    let out2 = attn2.forward(&xs, &rp, &pos, &kv, &KernelCtx { tokens });
+    let out2 = attn2.forward(&xs, &ctx);
     assert!(out2.is_poisoned(), "未装载槽的声明应立即带毒");
+
+    // 缺动态依赖的 ctx → attention 毒值(与未装载槽同构)
+    let bare = ForwardCtx::minimal(tokens);
+    let out3 = attn.forward(&xs, &bare);
+    assert!(out3.is_poisoned(), "minimal ctx 缺 pos/kv/rope,应毒");
 }
 
 // ============================================================================
@@ -344,7 +381,7 @@ async fn load_weight_basic() {
 // ============================================================================
 
 /// 泛型静态分发(REQ-CODE-01:热路径零 dyn)
-fn run_through<M: Module>(m: &M, x: &TensorOps, ctx: &KernelCtx) -> TensorOps {
+fn run_through<M: Module>(m: &M, x: &TensorOps, ctx: &ForwardCtx) -> TensorOps {
     m.forward(x, ctx)
 }
 
@@ -367,11 +404,11 @@ async fn module_trait_polymorphism() {
     let x = TensorOps::from_host(Dtype::F32, vec![1, hidden], &f32b(&vec![0.5; hidden]));
 
     // 静态分发:泛型约束即接口
-    let a = harvest(&mut face, &run_through(&mlp, &x, &KernelCtx::default())).await;
+    let a = harvest(&mut face, &run_through(&mlp, &x, &ForwardCtx::minimal(1))).await;
 
     // 动态分发:dyn Module(配置期/注册表期多态)
     let layers: Vec<&dyn Module> = vec![&mlp];
-    let b = harvest(&mut face, &layers[0].forward(&x, &KernelCtx::default())).await;
+    let b = harvest(&mut face, &layers[0].forward(&x, &ForwardCtx::minimal(1))).await;
 
     assert_eq!(a, b, "两种分发同链同果");
     assert_eq!(a.len(), hidden);

@@ -7,7 +7,7 @@
 
 use super::linear::Linear;
 use crate::module::{Loadable, LoaderCtx, LoaderOps};
-use crate::module::{KernelCtx, Module};
+use crate::module::{ForwardCtx, Module};
 use crate::TensorOps;
 
 pub struct Mlp {
@@ -30,7 +30,7 @@ impl Mlp {
 }
 
 impl Module for Mlp {
-    fn forward(&self, xs: &TensorOps, ctx: &KernelCtx) -> TensorOps {
+    fn forward(&self, xs: &TensorOps, ctx: &ForwardCtx) -> TensorOps {
         let gate = self.gate_proj.forward(xs, ctx);
         let up = self.up_proj.forward(xs, ctx);
         // silu(gate) * up(门控;同形逐元素)

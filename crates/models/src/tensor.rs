@@ -210,21 +210,35 @@ impl TensorOps {
         }
     }
 
-    /// 视图:纯元数据收窄,零节点追加,零 server 往返
-    pub fn narrow(&self, dim: usize, _start: usize, len: usize) -> TensorOps {
+    /// 视图:narrow 收窄(未实装,显式毒 —— 勿用)。
+    ///
+    /// 窄切需求现走 Kernel 节点 `owl_narrow_strided_f32`(物化拷贝,
+    /// 见 layers/attention 的 gate 切分);真视图(共享底仓 + 偏移)牵动
+    /// 全 kernel 的 stride 语义,归线 B / view 立项(roadmap.local/
+    /// api-stabilize-plan.md C3)。调用即毒,eval 边界收割。
+    pub fn narrow(&self, dim: usize, start: usize, len: usize) -> TensorOps {
         let mut shape = self.shape.clone();
         shape[dim] = len;
-        TensorOps {
-            id: next_id(),
-            parents: vec![],
-            depth: self.depth,
-            op: Op::Zeros,
-            dtype: self.dtype,
-            shape,
-            args: vec![],
-            err: None,
+        let _ = start; // 语义占位:真视图实现时用于偏移
+        self.poisoned_local(LazyError {
+            at_depth: self.depth + 1,
+            detail: "narrow: 未实装(显式封雷)—— 窄切走 owl_narrow_strided_f32 kernel 节点".into(),
+        })
+    }
+
+    /// 视图:重解释形状(纯元数据;元素数守恒,违约即毒)。
+    /// eval 透传父块(零 kernel 零拷贝);qk-norm 的 [T×H, HD] / [T, H×HD]
+    /// 双形态需求即本节点(2026-09-26 C6 立项)。
+    pub fn reshape(&self, shape: Shape) -> TensorOps {
+        let want: usize = shape.iter().product();
+        let have: usize = self.shape.iter().product();
+        if want != have {
+            return self.poisoned_local(LazyError {
+                at_depth: self.depth + 1,
+                detail: format!("reshape: 元素数不符 {have}({:?}) → {want}({:?})", self.shape, shape),
+            });
         }
-        // 注:narrow 的 zero-op 占位实施期改为视图节点(共享 parents,不复制)
+        self.join(Op::Reshape, None, (self.dtype, shape), vec![])
     }
 
     // ======================================================================

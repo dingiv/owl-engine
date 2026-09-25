@@ -58,12 +58,16 @@ pub enum Op {
     /// 逐元素 sigmoid(attn_output_gate 门;GDN beta 同族)
     Sigmoid,
     /// w_off = ×(1+w) 语义(use_norm_offset);归一化宽度由 alpha 定义
-    /// (x 任意前导维折叠为行 —— C8 定案语义)
+    /// (x 任意前导维折叠为行)。**C8 权威定案**:本变体 + owl_rmsnorm_f32
+    /// (ops.cu)为该语义唯一权威,reference.rs / owl-cpu ops 为对拍副本;
+    /// **C12 定案**:w_off 留 flag 不拆 op(qk-norm 是唯一 add_one 用户)。
     Rmsnorm { eps: f32, w_off: bool },
     Rope { theta_base: f64 },
     Embedding,
     /// paged attention(带槽位;server 侧 kernel 从 attention-rs port)
     PagedAttn,
+    /// 形状重解释(纯元数据视图;元素数守恒;eval 透传父块,零拷贝)
+    Reshape,
 
     // ---- Kernel 节点(2026-09-23 定稿:节点的本质形态,funio Pack 同源)----
     /// 携带核函数值(Kernel{name, source})+ 有序参数槽。
@@ -131,8 +135,9 @@ fn ceil_1d(n: usize) -> (u32, u32, u32) {
 }
 
 /// lower:Add(同形二元;a/b 块等长由 server 账长校验兜底)
-pub fn lower_add(ins: &[Bytes], out: &Bytes) -> LaunchMsg {
-    let n: usize = ins[0].len; // Bytes.len = 元素数(alloc/htod 均按元素登记)
+/// lower:Add(同形二元;a/b 块等长由 server 账长校验兜底)
+/// n = 声明元素数(C1 维度源头单一律:只读声明 shape,不读块账长)
+pub fn lower_add(ins: &[Bytes], out: &Bytes, n: usize) -> LaunchMsg {
     LaunchMsg {
         kernel: spec("owl_add_f32"),
         args: vec![
@@ -149,8 +154,8 @@ pub fn lower_add(ins: &[Bytes], out: &Bytes) -> LaunchMsg {
 }
 
 /// lower:Mul(同形逐元素乘)
-pub fn lower_mul(ins: &[Bytes], out: &Bytes) -> LaunchMsg {
-    let n: usize = ins[0].len; // Bytes.len = 元素数(alloc/htod 均按元素登记)
+/// n = 声明元素数(C1 维度源头单一律:只读声明 shape,不读块账长)
+pub fn lower_mul(ins: &[Bytes], out: &Bytes, n: usize) -> LaunchMsg {
     LaunchMsg {
         kernel: spec("owl_mul_f32"),
         args: vec![Arg::Block { id: ins[0].id }, Arg::Block { id: ins[1].id }, Arg::Block { id: out.id }, Arg::U64(n as u64)],
@@ -162,8 +167,8 @@ pub fn lower_mul(ins: &[Bytes], out: &Bytes) -> LaunchMsg {
 }
 
 /// lower:Silu(一元)
-pub fn lower_silu(ins: &[Bytes], out: &Bytes) -> LaunchMsg {
-    let n: usize = ins[0].len;
+/// n = 声明元素数(C1 维度源头单一律:只读声明 shape,不读块账长)
+pub fn lower_silu(ins: &[Bytes], out: &Bytes, n: usize) -> LaunchMsg {
     LaunchMsg {
         kernel: spec("owl_silu_f32"),
         args: vec![Arg::Block { id: ins[0].id }, Arg::Block { id: out.id }, Arg::U64(n as u64)],
@@ -175,8 +180,8 @@ pub fn lower_silu(ins: &[Bytes], out: &Bytes) -> LaunchMsg {
 }
 
 /// lower:Sigmoid(一元;attn_output_gate 门 / GDN beta 同族)
-pub fn lower_sigmoid(ins: &[Bytes], out: &Bytes) -> LaunchMsg {
-    let n: usize = ins[0].len;
+/// n = 声明元素数(C1 维度源头单一律:只读声明 shape,不读块账长)
+pub fn lower_sigmoid(ins: &[Bytes], out: &Bytes, n: usize) -> LaunchMsg {
     LaunchMsg {
         kernel: spec("owl_sigmoid_f32"),
         args: vec![Arg::Block { id: ins[0].id }, Arg::Block { id: out.id }, Arg::U64(n as u64)],
@@ -187,7 +192,7 @@ pub fn lower_sigmoid(ins: &[Bytes], out: &Bytes) -> LaunchMsg {
     }
 }
 
-/// lower:Matmul([m,k]×[k,n];k 由 server 从 a 账长自推)
+/// lower:Matmul([m,k]×[k,n];m/k/n 全部来自声明 shape(C1))
 pub fn lower_matmul(ins: &[Bytes], out: &Bytes, m: usize, k: usize, n: usize) -> LaunchMsg {
     LaunchMsg {
         kernel: spec("owl_matmul_f32"),
@@ -236,12 +241,34 @@ pub fn lower_rmsnorm(ins: &[Bytes], eps: f32, w_off: bool, out: &Bytes, rows: us
 /// 对齐归约结果 ins;**输出块固定追加在槽序末尾**(server 按"最后一个
 /// Block"回传句柄;kernel 形参必须把输出声明在末位)。
 /// grid = (0,0,0) 哨兵 → 按输出元素数自动 1D ceil/256。
+/// out_elems = 声明元素数(C1)。
+///
+/// **C2 签名校验**:kernel 若在注册表(`kernel::lookup`),decl_args 的
+/// 类型序列 + 末尾输出块必须与登记的形参槽序(`Entry.args`)严格一致,
+/// 违约 panic(组合期编程错)—— u32/sz 错位、输出不在末参这两类雷在
+/// 这里机器拦截。非注册 kernel(逃生舱直带源码)跳过校验。
 pub fn lower_kernel(
     kernel: &crate::kernel::Kernel,
     decl_args: &[KernelArg],
     ins: &[Bytes],
     out: &Bytes,
+    out_elems: usize,
 ) -> LaunchMsg {
+    if let Some(entry) = crate::kernel::lookup(kernel.name) {
+        let mut want: Vec<&str> = decl_args.iter().map(|a| match a {
+            KernelArg::T { .. } => "T",
+            KernelArg::Bits(_) => "sz",
+            KernelArg::I32(_) => "i32",
+            KernelArg::F32(_) => "f32",
+        }).collect();
+        want.push("T"); // 输出块固定末参
+        let want_sig = want.join(",");
+        assert!(
+            want_sig == entry.args,
+            "lower_kernel({}): 签名不符\n  声明 = {want_sig}\n  登记 = {}\n  (arg_usize ↔ sz/size_t;输出块必须末参)",
+            kernel.name, entry.args
+        );
+    }
     let mut args: Vec<Arg> = Vec::with_capacity(decl_args.len() + 1);
     let mut pi = 0usize; // T 槽 ↔ 父依赖同序计数
     for a in decl_args {
@@ -257,7 +284,7 @@ pub fn lower_kernel(
     }
     args.push(Arg::Block { id: out.id });
     let (grid, block, shared_mem) = if kernel.launch.grid == (0, 0, 0) {
-        (auto_grid(out.len), kernel.launch.block, kernel.launch.shared_mem)
+        (auto_grid(out_elems), kernel.launch.block, kernel.launch.shared_mem)
     } else {
         (kernel.launch.grid, kernel.launch.block, kernel.launch.shared_mem)
     };
@@ -267,7 +294,7 @@ pub fn lower_kernel(
         grid,
         block,
         shared_mem,
-        out_elems: out.len,
+        out_elems,
     }
 }
 

@@ -4,7 +4,7 @@
 //! 权重槽 = 转置装载:数据源 [out, in] 行主序 → 声明 [in, out]
 //! (forward 直 matmul,decode 零转置)。
 
-use crate::module::{KernelCtx, Loadable, LoaderCtx, LoaderOps, Module, Weight};
+use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, Weight};
 use crate::TensorOps;
 
 pub struct Linear {
@@ -26,7 +26,7 @@ impl Linear {
 
 impl Module for Linear {
     /// y = x @ W([.., in] → [.., out];未装载 → 毒值声明)
-    fn forward(&self, xs: &TensorOps, _ctx: &KernelCtx) -> TensorOps {
+    fn forward(&self, xs: &TensorOps, _ctx: &ForwardCtx) -> TensorOps {
         xs.matmul(&self.w.decl())
     }
 }

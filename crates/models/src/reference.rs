@@ -130,6 +130,7 @@ pub fn reduce(
         Op::Sigmoid => itp.sigmoid(&ins[0]),
         Op::Rmsnorm { eps, w_off } => itp.rmsnorm(&ins[0], &ins[1], *eps, *w_off),
         Op::SlotWrite => itp.slot_write(&ins[0]),
+        Op::Reshape => Ok(Value { f32: ins[0].f32.clone(), shape: t.shape.clone() }),
         Op::Block { id } => itp.block(*id, t.dtype, &t.shape),
         // 逃逸舱:client 侧闭包就地执行(不经 GpuFace;server 派发表不见它)
         Op::Kernel { kernel, .. } => Err(ModelError::Msg(format!(

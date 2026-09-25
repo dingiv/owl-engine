@@ -13,24 +13,69 @@
 //! 三律(与 TensorOps 同构):同步(total)· 纯描述;执行都在解释器。
 
 use crate::contract::{Bytes, DeviceClient, Dtype, ModelError, Shape};
+use crate::layers::rope::Rope;
 use crate::TensorOps;
 use std::sync::{Arc, Mutex};
 
 // ============================================================================
-// §1 Module:计算声明协议
+// §1 Module:计算声明协议(+ 每步动态依赖词汇)
 // ============================================================================
 
-/// 每步计算上下文(forward 的 ctx;动态依赖 grab-bag,async-runtime §4.2:
-/// 算子缺什么放什么,由 runner 每步构造注入 —— 层只透传,不自取)。
-/// 按值传递(Copy);字段随域扩。
-#[derive(Clone, Copy, Debug, Default)]
-pub struct KernelCtx {
+/// 每步动态依赖(forward 的 ctx;C4 定案 2026-09-26:引用注入取代
+/// Copy KernelCtx —— rope 表本来就是设备块,ctx 借用 `&Rope` 零双重
+/// 所有权;字段 `TensorOps` 值形态让 runner 自选 from_host(调试)/
+/// of_block(图捕获),捕获路径不封)。
+///
+/// runner 每步构造,层只透传不自取(async-runtime §4.3 grab-bag);
+/// 无动态依赖的层(mlp/rmsnorm/…)忽略字段。借用结构,无 Default ——
+/// 测试用 [`ForwardCtx::minimal`]。
+pub struct ForwardCtx<'a> {
     /// 本步 token 数(decode = 1;prefill = 块长)
     pub tokens: usize,
+    /// 位置(attention/GDN 用;缺省 = 依赖违约 → 层侧毒值)
+    pub pos: Option<&'a TensorOps>,
+    /// decode KV 直排引用(attention 用;GDN state 同款随域扩)
+    pub kv: Option<&'a KvBuffers>,
+    /// 位置编码层(全局一份;表经 eval_load 已是设备块。
+    /// 注:类型住在 layers,此处反向引用 —— ctx 是 runner 词汇,
+    /// runner 持全局 rope,与旧世界 rotary_emb 注入同一形态)
+    pub rope: Option<&'a Rope>,
+}
+
+impl<'a> ForwardCtx<'a> {
+    /// 最小 ctx(无动态依赖;mlp/rmsnorm/linear/embedding 测试用)
+    pub fn minimal(tokens: usize) -> Self {
+        Self { tokens, pos: None, kv: None, rope: None }
+    }
+
+    /// decode 步 ctx(全量动态依赖)
+    pub fn decode(
+        tokens: usize,
+        pos: &'a TensorOps,
+        kv: &'a KvBuffers,
+        rope: &'a Rope,
+    ) -> Self {
+        Self { tokens, pos: Some(pos), kv: Some(kv), rope: Some(rope) }
+    }
+}
+
+/// decode 步 KV 直排缓冲(引用形态:块归 engine,层零所有权)。
+///
+/// - `k_cache` / `v_cache`:常驻池块引用(`TensorOps::of_block`),
+///   [max_slots, Hkv, HD] f32,块只增不减;
+/// - `slots` / `kv_lens`:[bs] f32 数值过线(契约 5;核内 cast);
+///   **kv_lens 含本步**(kernel 先写 cache 后打分,caller 传 past+1)。
+/// (2026-09-26 C4 重组:自 layers/attention 归位协议层 —— 它是 runner
+/// 与层之间的动态依赖词汇,非层私有。)
+pub struct KvBuffers {
+    pub k_cache: TensorOps,
+    pub v_cache: TensorOps,
+    pub slots: TensorOps,
+    pub kv_lens: TensorOps,
 }
 
 /// KV 动态上下文:每步由 runner 构造。(注:decode 直排路径暂走
-/// KvBuffers(layers::attention);本结构为 paged 路线预留。)
+/// [`KvBuffers`];本结构为 paged 路线预留。)
 #[derive(Clone, Debug)]
 pub struct KvCtx {
     pub step: u64,
@@ -39,8 +84,9 @@ pub struct KvCtx {
 
 /// 模型层统一接口
 pub trait Module {
-    /// 计算声明:xs → y(同步 · total · 纯描述;ctx = 动态依赖)
-    fn forward(&self, xs: &TensorOps, ctx: &KernelCtx) -> TensorOps;
+    /// 计算声明:xs → y(同步 · total · 纯描述;ctx = 动态依赖,
+    /// 缺依赖 → 层侧毒值声明,eval 边界收割 —— 与未装载槽同构)
+    fn forward(&self, xs: &TensorOps, ctx: &ForwardCtx) -> TensorOps;
 }
 
 // ============================================================================

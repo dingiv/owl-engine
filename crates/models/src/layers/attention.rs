@@ -23,27 +23,12 @@
 //! 动态依赖(rope 表 / pos / KV 槽)经参数显式传入(Rope 先例:不进
 //! `Module` trait;统一 ForwardCtx 随 runner 立项)。
 
+use crate::contract::Dtype;
 use crate::kernel;
 use crate::layers::linear::Linear;
 use crate::layers::rmsnorm::RmsNorm;
-use crate::layers::rope::Rope;
-use crate::module::{Loadable, LoaderCtx, LoaderOps};
-use crate::module::{KernelCtx, Module};
-use crate::tensor::Dtype;
+use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module};
 use crate::TensorOps;
-
-/// decode 步 KV 直排缓冲(引用形态:块归 engine,层零所有权)。
-///
-/// - `k_cache` / `v_cache`:常驻池块引用(`TensorOps::of_block`),
-///   [max_slots, Hkv, HD] f32,块只增不减;
-/// - `slots` / `kv_lens`:[bs] f32 数值过线(契约 5;核内 cast);
-///   **kv_lens 含本步**(kernel 先写 cache 后打分,caller 传 past+1)。
-pub struct KvBuffers {
-    pub k_cache: TensorOps,
-    pub v_cache: TensorOps,
-    pub slots: TensorOps,
-    pub kv_lens: TensorOps,
-}
 
 pub struct Attention {
     /// q_proj [2*Hq*HD, hidden](value|gate per-head 拼接;装载期转置)
@@ -58,6 +43,7 @@ pub struct Attention {
     hq: usize,
     hkv: usize,
     hd: usize,
+    hidden: usize,
 }
 
 impl Attention {
@@ -73,6 +59,7 @@ impl Attention {
             hq,
             hkv,
             hd,
+            hidden,
         }
     }
 
@@ -93,18 +80,21 @@ impl Attention {
         .with_shape(Dtype::F32, shape)
     }
 
-    /// 计算声明(decode;xs [T, hidden],T = ctx.tokens)。
-    /// rope 表与 pos 由调用方持(全局一份,跨层共享);KV 引用见 [`KvBuffers`]。
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward(
-        &self,
-        xs: &TensorOps,
-        rope: &Rope,
-        pos: &TensorOps,
-        kv: &KvBuffers,
-        ctx: &KernelCtx,
-    ) -> TensorOps {
+    /// 计算声明(decode;xs [T, hidden],T = ctx.tokens;C4 后回归 Module)。
+    /// rope 表与 pos / KV 引用由 ctx 注入(rope 全局一份,表已是设备块);
+    /// 缺任一动态依赖 → 毒值声明(eval 边界收割,与未装载槽同构)。
+    fn forward_decl(&self, xs: &TensorOps, ctx: &ForwardCtx) -> TensorOps {
         let tokens = ctx.tokens;
+        let (rope, pos, kv) = match (ctx.rope, ctx.pos, ctx.kv) {
+            (Some(r), Some(p), Some(k)) => (r, p, k),
+            _ => {
+                return TensorOps::poisoned(
+                    Dtype::F32,
+                    vec![tokens, self.hidden],
+                    "attention: ctx 缺动态依赖(需 pos + kv + rope;ForwardCtx::decode)",
+                );
+            }
+        };
         let q_raw = self.q_proj.forward(xs, ctx); // [T, 2*Hq*HD]
         let k = self.k_proj.forward(xs, ctx); // [T, Hkv*HD]
         let v = self.v_proj.forward(xs, ctx); // [T, Hkv*HD]
@@ -143,6 +133,12 @@ impl Attention {
         // 输出门:attn 输出 × sigmoid(gate)(per-head;o_proj 之前)
         let y = y.mul(&gate.sigmoid());
         self.o_proj.forward(&y, ctx)
+    }
+}
+
+impl Module for Attention {
+    fn forward(&self, xs: &TensorOps, ctx: &ForwardCtx) -> TensorOps {
+        self.forward_decl(xs, ctx)
     }
 }
 

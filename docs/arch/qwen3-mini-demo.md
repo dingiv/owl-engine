@@ -114,6 +114,26 @@ model.norm [1024]                                    ×1(终局 norm)
    同签名形态);`mount(blocks)` = 纯内存回填;数据值语义内联进 ops。
    线 B(Tensor<D>/Device trait/rt_cpu)冻结,归一另立项
    (实锤遗留:Tensor::as_declaration 的 id 错位 bug 随线 B 立项修复)。
+10. **rmsnorm 语义权威(C8/C12 定案,2026-09-26)**:归一化宽度由 alpha
+    定义 —— x 任意前导维折叠为行([T, H×HD] × alpha [HD] = per-head 归一
+    化,HF flatten(0,1) 同构);权威 = `ops.rs Op::Rmsnorm` 变体注记 +
+    `ops.cu owl_rmsnorm_f32`,reference.rs / owl-cpu ops 为对拍副本。
+    w_off 留 flag 不拆 op(qk-norm 是唯一 add_one 用户);
+11. **维度源头单一律(C1,2026-09-26 定案)**:解释器一切维度推导只读
+    声明 shape(t.shape / t.parents[i].shape);`Bytes.len` 不参与语义
+    (Block 叶子 len=0),仅 debug 构建边界断言(matmul 多行 k 雷即违此律);
+12. **kernel 签名 schema(C2,2026-09-26 定案)**:注册表 Entry.args =
+    机器可读形参序(`T/sz/i32/f32`;arg_usize ↔ sz 8 字节;Kernel 节点
+    路径输出块末参),lower_kernel 对表校验 + .cu 实签名解析互证测试
+    (u32 错位 / out 位置两雷机器拦截)。narrow 未实装已封雷显式毒(C3);
+    reshape 纯元数据视图已立(C6,eval 透传零拷贝)。
+13. **KV 写副作用(C7 定案,2026-09-26)**:decode naive attn kernel
+    内联写 cache = 已知副作用;跨步依赖 = cache 块 id + 单流保序。
+    **捕获期约束**:slots/kv_lens/pos 必须是常驻 Block 引用(runner 步间
+    改写块内容),不得烤成图内标量;SlotWrite 事件边留给 paged 路线。
+14. **编排(C5 定案,2026-09-26)**:整模单树 —— Model = Module,一步
+    decode = 一次 eval;捕获 = warmup/捕获/重放同一棵树;层间物化
+    (eval_ops 子树收割)仅调试用。
 
 ## 五、验收里程碑
 
@@ -133,3 +153,4 @@ model.norm [1024]                                    ×1(终局 norm)
 |---|---|
 | 2026-09-25 | 立项:结构盘点(488 张量反推)+ 试水批落地(linear/rmsnorm/mlp/embedding/rope + Mul 算子),`tests/layers.rs` 5/5 绿 |
 | 2026-09-25 | 垫子层:`models::kernels` 注册表(owl-kernels cu/ → 登记 → layers 按名组合);kernel 源零内嵌;owl-kernels cudarc feature 化 |
+| 2026-09-26 | M-b attention 层落地(narrow/naive-attn/sigmoid);四雷回溯(u32 错位/槽序/Block len/matmul 多行 k);src 重组(12 碎文件→9,client/types/shape/error→contract.rs,plan/actions→ops.rs,module/loader→module.rs,interpreter 拆 reference.rs);API 稳定化快速批:C1/C2/C3/C6/C8/C12/C13 落地(详见 roadmap.local/api-stabilize-plan.md) |

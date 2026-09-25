@@ -16,7 +16,7 @@ use owl_models::contract::DeviceClient;
 use owl_models::contract::ModelError;
 use owl_cpu::CpuFace;
 use owl_models::interpreter::eval;
-use owl_models::module::KernelCtx;
+use owl_models::module::ForwardCtx;
 use owl_models::tensor::Dtype;
 use owl_models::TensorOps;
 
@@ -53,7 +53,7 @@ async fn mlp_pipeline<D: DeviceClient>(face: &mut D) -> Result<Vec<f32>, ModelEr
     let x = TensorOps::from_host(Dtype::F32, vec![1, hidden], &f32b(&xvec));
 
     // 计算执行(层入口:解释器驱动 forward + 归约)
-    let bytes = eval(&mlp, &x, face, &KernelCtx { tokens: 1 }).await?;
+    let bytes = eval(&mlp, &x, face, &ForwardCtx::minimal(1)).await?;
     let n: usize = hidden;
     let mut out = vec![0u8; n * 4];
     face.dtoh(&bytes, &mut out).await?;

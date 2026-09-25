@@ -5,7 +5,7 @@
 
 use crate::kernel;
 use crate::module::{Loadable, LoaderCtx, LoaderOps, Weight};
-use crate::module::{KernelCtx, Module};
+use crate::module::{ForwardCtx, Module};
 use crate::tensor::Dtype;
 use crate::TensorOps;
 
@@ -59,7 +59,7 @@ impl Loadable for Embedding {
 
 impl Module for Embedding {
     /// 查表声明(tokens 由 ctx 提供 —— 每步动态依赖)
-    fn forward(&self, ids: &TensorOps, ctx: &KernelCtx) -> TensorOps {
+    fn forward(&self, ids: &TensorOps, ctx: &ForwardCtx) -> TensorOps {
         self.embed(ids, ctx.tokens)
     }
 }

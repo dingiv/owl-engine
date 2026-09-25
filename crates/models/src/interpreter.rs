@@ -35,13 +35,13 @@ use std::pin::Pin;
 /// 解释器自己调用层钩子并为它传递 ctx —— 使用者只给层与输入。
 ///
 /// ```rust,ignore
-/// let out = eval(&mlp, &xs, face, KernelCtx { tokens: 1 }).await?;
+/// let out = eval(&mlp, &xs, face, &ForwardCtx::minimal(1)).await?;
 /// ```
 pub async fn eval<M, D>(
     layer: &M,
     xs: &TensorOps,
     face: &mut D,
-    ctx: &crate::module::KernelCtx,
+    ctx: &crate::module::ForwardCtx<'_>,
 ) -> Result<Bytes, ModelError>
 where
     M: crate::module::Module,
@@ -78,43 +78,52 @@ async fn _eval<D: crate::contract::DeviceClient>(
         ins.push(eval_ops(p, face).await?);
     }
 
+    // C1 边界断言:非 Block 父节点的块账长 = 声明元素数(Block 叶子 len=0 无
+    // 语义)。维度推导一律不用 len(见下方各分支);此处只在 debug 构建拦账变。
+    debug_assert!(t.parents.iter().zip(&ins).all(|(p, b)| {
+        b.len == 0
+            || b.len == p.shape.iter().product::<usize>()
+    }), "块账长 != 声明元素数(node id {})", t.id);
+
     let dtype = t.dtype;
     let shape = t.shape.clone();
-    let n_bytes = shape.iter().product::<usize>() * dtype.size_bytes();
+    let n_elems: usize = shape.iter().product::<usize>();
+    let n_bytes = n_elems * dtype.size_bytes();
 
     match &t.op {
         Op::Htod { bytes } => face.htod(dtype, &shape, bytes).await,
         Op::Zeros => face.alloc(n_bytes).await,
         Op::Block { id } => Ok(Bytes { id: *id, len: 0 }),
+        Op::Reshape => Ok(ins[0].clone()), // 纯元数据视图:透传父块(零拷贝)
         Op::Add => {
             let out = face.alloc(n_bytes).await?;
-            let msg = crate::ops::lower_add(&ins, &out);
+            let msg = crate::ops::lower_add(&ins, &out, n_elems);
             face.launch(msg).await?;
             Ok(out)
         }
         Op::Mul => {
             let out = face.alloc(n_bytes).await?;
-            let msg = crate::ops::lower_mul(&ins, &out);
+            let msg = crate::ops::lower_mul(&ins, &out, n_elems);
             face.launch(msg).await?;
             Ok(out)
         }
         Op::Silu => {
             let out = face.alloc(n_bytes).await?;
-            let msg = crate::ops::lower_silu(&ins, &out);
+            let msg = crate::ops::lower_silu(&ins, &out, n_elems);
             face.launch(msg).await?;
             Ok(out)
         }
         Op::Sigmoid => {
             let out = face.alloc(n_bytes).await?;
-            let msg = crate::ops::lower_sigmoid(&ins, &out);
+            let msg = crate::ops::lower_sigmoid(&ins, &out, n_elems);
             face.launch(msg).await?;
             Ok(out)
         }
         Op::Matmul => {
             let (m, n) = (shape[0], shape[1]);
-            // k = 内维 = ins[0] 元素数 / m(多行 [m,k]:len = m×k,不能直接取 len
-            // —— 单行时两者相等,多行取 len 会越界读;此 bug 被"历届测试都单行"掩盖)
-            let k = ins[0].len / m.max(1);
+            // k = 内维 = x 声明 shape 末维(C1:只读声明 shape;原取 ins[0].len
+            // 在多行 [m,k] 时越界读 —— 此 bug 被"历届测试都单行"掩盖)
+            let k = t.parents[0].shape.last().copied().unwrap_or(0);
             let out = face.alloc(m * n * dtype.size_bytes()).await?;
             let msg = crate::ops::lower_matmul(&ins, &out, m, k, n);
             face.launch(msg).await?;
@@ -133,7 +142,7 @@ async fn _eval<D: crate::contract::DeviceClient>(
         }
         Op::Kernel { kernel } => {
             let out = face.alloc(n_bytes).await?;
-            let msg = crate::ops::lower_kernel(kernel, &t.args, &ins, &out);
+            let msg = crate::ops::lower_kernel(kernel, &t.args, &ins, &out, n_elems);
             face.launch(msg).await?;
             Ok(out)
         }

@@ -71,34 +71,46 @@ impl Kernel {
 // §2 注册表:名字 → 源(封闭常量)
 // ============================================================================
 
-/// 登记表条目:发射名 → 源码(多名字可共源;名字 = server 编译缓存键)
+/// 登记表条目:发射名 → 源码 + 形参签名(多名字可共源;名字 = server 编译
+/// 缓存键)。
+///
+/// `args` = 槽序契约的机器可读形(C2,2026-09-26):逗号分隔的形参类型序
+/// 列,`T`=块参 / `sz`=8 字节标量(Arg::U64 ↔ kernel `size_t`)/ `i32` /
+/// `f32`;**顺序即 LaunchMsg args 序**,对 Kernel 节点路径输出块固定末参。
+/// `lower_kernel` 对表校验声明槽序;下方测试解析 .cu 实签名互证 ——
+/// u32/sz 错位、输出不在末参两颗雷在这里机器拦截。
 pub struct Entry {
     pub name: &'static str,
     pub source: &'static str,
+    pub args: &'static str,
 }
 
 /// 全量登记(封闭;按域分组)
 pub static REGISTRY: &[Entry] = &[
-    // ---- 语义算子动作表(ops.cu 母本;lower_* 一一对应)----
-    Entry { name: "owl_add_f32", source: sources::OPS_F32 },
-    Entry { name: "owl_mul_f32", source: sources::OPS_F32 },
-    Entry { name: "owl_sigmoid_f32", source: sources::OPS_F32 },
-    Entry { name: "owl_silu_f32", source: sources::OPS_F32 },
-    Entry { name: "owl_matmul_f32", source: sources::OPS_F32 },
-    Entry { name: "owl_rmsnorm_f32", source: sources::OPS_F32 },
-    // ---- 文本主干(Qwen3.5 mini-demo)----
-    Entry { name: "owl_embed_f32", source: text::EMBED_F32 },
+    // ---- 语义算子动作表(ops.cu 母本;lower_* 一一对应;
+    //      此族经 lower_* 硬编码装配,out 位置随 .cu 签名)----
+    Entry { name: "owl_add_f32", source: sources::OPS_F32, args: "T,T,T,sz" },
+    Entry { name: "owl_mul_f32", source: sources::OPS_F32, args: "T,T,T,sz" },
+    Entry { name: "owl_sigmoid_f32", source: sources::OPS_F32, args: "T,T,sz" },
+    Entry { name: "owl_silu_f32", source: sources::OPS_F32, args: "T,T,sz" },
+    Entry { name: "owl_matmul_f32", source: sources::OPS_F32, args: "T,T,T,i32,i32,i32" },
+    Entry { name: "owl_rmsnorm_f32", source: sources::OPS_F32, args: "T,T,T,i32,f32,i32" },
+    // ---- 文本主干(Qwen3.5 mini-demo;Kernel 节点路径,输出块末参)----
+    Entry { name: "owl_embed_f32", source: text::EMBED_F32, args: "T,T,sz,T" },
     Entry {
         name: "owl_rope_interleaved_partial_f32",
         source: text::ROPE_INTERLEAVED_F32,
+        args: "T,T,T,T,sz,sz,sz,T",
     },
     Entry {
         name: "owl_narrow_strided_f32",
         source: text::ATTENTION_F32,
+        args: "T,sz,sz,sz,sz,T",
     },
     Entry {
         name: "owl_naive_decode_attn_f32",
         source: text::ATTENTION_F32,
+        args: "T,T,T,T,T,T,T,sz,sz,sz,sz,T",
     },
 ];
 
@@ -136,6 +148,7 @@ pub fn launch_shape(grid: (u32, u32, u32), block: (u32, u32, u32), shared_mem: u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contract::Bytes;
 
     #[test]
     fn registry_entries_have_sources() {
@@ -153,5 +166,81 @@ mod tests {
     fn lookup_known_and_unknown() {
         assert!(lookup("owl_add_f32").is_some());
         assert!(lookup("owl_not_registered").is_none());
+    }
+
+    // ======================================================================
+    // C2:登记 args ↔ .cu 实签名互证(u32/sz 错位、out 位置两雷的机器拦截)
+    // ======================================================================
+
+    /// 解析 .cu 源里 `extern "C" __global__ void <name>(...)` 的形参序列,
+    /// 映射为 Entry.args 同构字符串(无 regex,朴素扫描)。
+    fn parse_cu_sig(source: &str, name: &str) -> Option<String> {
+        // 先全文剥行注释(形参注记含逗号/括号,会干扰边界与切分)
+        let clean: String = source
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let anchor = format!("__global__ void {name}(");
+        let start = clean.find(&anchor)? + anchor.len();
+        let end = clean[start..].find(')')? + start;
+        let params = clean[start..end]
+            .split(',')
+            .map(|p| {
+                let p = p.replace("const ", "").trim().to_string();
+                if p.contains('*') {
+                    "T".to_string()
+                } else if p.contains("size_t") || p.contains("unsigned long long") {
+                    "sz".to_string()
+                } else if p.contains("float") {
+                    "f32".to_string()
+                } else if p.contains("int") {
+                    // 含 unsigned int:4 字节无符号 —— Arg 无此宽度,登记表禁止
+                    assert!(!p.contains("unsigned"), "{name}: 禁止 unsigned int 形参(用 size_t;Arg::U64 8 字节对位)");
+                    "i32".to_string()
+                } else {
+                    panic!("{name}: 无法识别的形参 `{p}`(args 词表:T/sz/i32/f32)");
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        Some(params)
+    }
+
+    #[test]
+    fn registry_sig_matches_cu_signatures() {
+        for e in REGISTRY {
+            let actual = parse_cu_sig(e.source, e.name)
+                .unwrap_or_else(|| panic!("{}: .cu 源里找不到同名核", e.name));
+            assert_eq!(
+                actual, e.args,
+                "{}: 登记签名与 .cu 实签名不符(改签名须同步登记表)",
+                e.name
+            );
+            // Kernel 节点路径(text/ 域四核)输出块必须末参;语义算子族
+            // (lower_* 硬编码装配)out 位置随 .cu 签名,不受此限
+            if matches!(e.name, "owl_embed_f32" | "owl_rope_interleaved_partial_f32" | "owl_narrow_strided_f32" | "owl_naive_decode_attn_f32") {
+                assert!(e.args.ends_with("T"), "{}: Kernel 节点路径输出块必须末参", e.name);
+            }
+        }
+    }
+
+    #[test]
+    fn lower_kernel_rejects_signature_mismatch() {
+        // 声明槽序与登记 args 不符 → 组合期 panic(机器拦截 u32/sz 错位类雷)
+        let k = kernel_with("owl_narrow_strided_f32", (0, 0, 0), (256, 1, 1), 0);
+        let decl_args = vec![
+            crate::ops::KernelArg::T { id: 1 },
+            crate::ops::KernelArg::I32(2), // 应为 sz(Bit)—— 故意错
+            crate::ops::KernelArg::Bits(3),
+            crate::ops::KernelArg::Bits(4),
+            crate::ops::KernelArg::Bits(5),
+        ];
+        let ins = vec![Bytes::new(1, 0)];
+        let out = Bytes::new(9, 0);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = crate::ops::lower_kernel(&k, &decl_args, &ins, &out, 0);
+        }));
+        assert!(result.is_err(), "签名错位应 panic");
     }
 }

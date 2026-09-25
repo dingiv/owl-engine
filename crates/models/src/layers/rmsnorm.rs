@@ -3,7 +3,7 @@
 //! 容器 + LoaderOps 装载形态。
 
 use crate::module::{Loadable, LoaderCtx, LoaderOps, Weight};
-use crate::module::{KernelCtx, Module};
+use crate::module::{ForwardCtx, Module};
 use crate::TensorOps;
 
 pub struct RmsNorm {
@@ -29,7 +29,7 @@ impl RmsNorm {
 
 impl Module for RmsNorm {
     /// x [tokens, n] → 逐行 RMSNorm × gamma(未装载 → 毒值声明)
-    fn forward(&self, xs: &TensorOps, _ctx: &KernelCtx) -> TensorOps {
+    fn forward(&self, xs: &TensorOps, _ctx: &ForwardCtx) -> TensorOps {
         xs.rmsnorm(&self.w.decl(), self.eps, self.w_off)
     }
 }
