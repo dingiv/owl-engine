@@ -8,9 +8,3 @@ description = "共用基建:signal 依赖追踪(re-export)+ testkit 算子对拍
 [dependencies]
 owl-cuda = { path = "../backends/cuda" }
 owl-iface = { path = "../backends/iface" }
-
-[dev-dependencies]
-owl-nn = { path = "../nn" }
-
-[[test]]
-name = "gdn_exemplars"

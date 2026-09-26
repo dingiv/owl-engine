@@ -7,7 +7,6 @@ members = [
     "crates/backends/cpu",
     "crates/models",
     "crates/backends/iface",
-    "crates/nn",
     "crates/shared",
     "crates/engine",
 ]

@@ -123,16 +123,15 @@ impl DeviceClient for CpuFace {
             "owl_silu_f32" => ops::silu(&vals[0])?,
             "owl_sigmoid_f32" => ops::sigmoid(&vals[0])?,
             "owl_matmul_f32" => {
-                // 标量与 lower_matmul 对位:m/k/n
-                let (m, _k, n) = (i32s[0] as usize, i32s[1] as usize, i32s[2] as usize);
-                let shape: Shape = vec![m, n];
-                ops::matmul(&vals[0], &vals[1], &shape)?
+                // 标量与 lower_matmul 对位:m/k/n(标量权威;alloc 块无形状,
+                // 原 k 自推 a.shape 被压成 1 —— 2026-09-26 engine M0 逮到)
+                let (m, k, n) = (i32s[0] as usize, i32s[1] as usize, i32s[2] as usize);
+                ops::matmul(&vals[0], &vals[1], m, k, n)?
             }
             "owl_matmul_nt_f32" => {
                 // nt:B [n,k] 直读;标量与 lower_matmul_nt 对位:m/k/n
-                let (m, _k, n) = (i32s[0] as usize, i32s[1] as usize, i32s[2] as usize);
-                let shape: Shape = vec![m, n];
-                ops::matmul_nt(&vals[0], &vals[1], &shape)?
+                let (m, k, n) = (i32s[0] as usize, i32s[1] as usize, i32s[2] as usize);
+                ops::matmul_nt(&vals[0], &vals[1], m, k, n)?
             }
             "owl_rmsnorm_f32" => {
                 // 标量与 lower_rmsnorm 对位:cols(I32)/eps(F32)/w_off(I32)

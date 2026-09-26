@@ -1,0 +1,19 @@
+[package]
+name = "owl-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Orchestration layer: session slots + step loop + graph tri-state + memory governance"
+
+[dependencies]
+# 唯一设备标准(iface contract:线格式/回执分级/顺序语义)
+owl-iface = { path = "../backends/iface" }
+# 声明式模型层(interpreters::eval_ops = 计算解释器)
+owl-models = { path = "../models" }
+# 图治理(A1:预算前置/生命周期律)—— M1 接线
+owl-graph = { path = "../graph" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+owl-cpu = { path = "../backends/cpu" }
+owl-cuda = { path = "../backends/cuda" }

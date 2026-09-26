@@ -19,16 +19,12 @@ pub(crate) fn zeros(dtype: Dtype, shape: &Shape) -> Result<Value, ModelError> {
     Value::zero(dtype, shape)
 }
 
-/// [m,k] × [k,n](行主序;k 由 a 的账长自推)
-pub(crate) fn matmul(
-    a: &Value,
-    b: &Value,
-    shape: &Shape,
-) -> Result<Value, ModelError> {
-    // k = 内维 = a 的元素数 / m(行主序)
-    let m_rows = a.shape[0].max(1);
-    let k = a.f32.len() / m_rows;
-    let (m, n) = (shape[0], shape[1]);
+/// [m,k] × [k,n](行主序;m/k/n = launch 标量权威 —— 2026-09-26 修:
+/// 原 k 自推 a.shape[0],alloc 块无形状(平面 [len])时 k 被压成 1,
+/// 被 engine M0 session 测试逮到;块账长只作容量,维度不参与语义)
+pub(crate) fn matmul(a: &Value, b: &Value, m: usize, k: usize, n: usize) -> Result<Value, ModelError> {
+    debug_assert_eq!(a.f32.len(), m * k, "matmul: a 账长 = m×k");
+    debug_assert_eq!(b.f32.len(), k * n, "matmul: b 账长 = k×n");
     let mut out = vec![0.0f32; m * n];
     for i in 0..m {
         for p in 0..k {
@@ -38,18 +34,14 @@ pub(crate) fn matmul(
             }
         }
     }
-    Ok(Value { f32: out, shape: shape.clone() })
+    Ok(Value { f32: out, shape: vec![m, n] })
 }
 
-pub(crate) fn matmul_nt(
-    a: &Value,
-    b: &Value,
-    shape: &Shape,
-) -> Result<Value, ModelError> {
+pub(crate) fn matmul_nt(a: &Value, b: &Value, m: usize, k: usize, n: usize) -> Result<Value, ModelError> {
     // B 按 [n, k] 行主序直读(nt;与 owl_matmul_nt_f32 同式)
-    let m_rows = a.shape[0].max(1);
-    let k = a.f32.len() / m_rows;
-    let (m, n) = (shape[0], shape[1]);
+    // m/k/n = launch 标量权威(同上修:alloc 块无形状,k 自推不可靠)
+    debug_assert_eq!(a.f32.len(), m * k, "matmul_nt: a 账长 = m×k");
+    debug_assert_eq!(b.f32.len(), n * k, "matmul_nt: b 账长 = n×k");
     let mut out = vec![0.0f32; m * n];
     for i in 0..m {
         for j in 0..n {
@@ -61,7 +53,7 @@ pub(crate) fn matmul_nt(
             out[i * n + j] = acc;
         }
     }
-    Ok(Value { f32: out, shape: shape.clone() })
+    Ok(Value { f32: out, shape: vec![m, n] })
 }
 
 /// 同形逐元素加
