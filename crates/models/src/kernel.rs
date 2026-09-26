@@ -88,39 +88,68 @@ impl Kernel {
 /// `f32`;**顺序即 LaunchMsg args 序**,对 Kernel 节点路径输出块固定末参。
 /// `lower_kernel` 对表校验声明槽序;下方测试解析 .cu 实签名互证 ——
 /// u32/sz 错位、输出不在末参两颗雷在这里机器拦截。
+///
+/// `dtype` = 块参 dtype 标注(f16 基线守门,2026-09-26):eval 发射前
+/// 对账声明 dtype,不符 = 结构化报错 —— 堵死「f32 核读 f16 字节 =
+/// 静默垃圾」路径。现状全族 F32;F2 起逐核加 f16 变体条目。
+/// dtype = **输出/声明口径**(守门对账节点声明);混合核(F4:conv_upd /
+/// delta_dec 激活 f16 + state f32)输入位宽由 .cu 源自证,守门不查入参。
 pub struct Entry {
     pub name: &'static str,
     pub source: &'static str,
     pub args: &'static str,
+    pub dtype: crate::contract::Dtype,
 }
 
 /// 全量登记(封闭;按域分组)
 pub static REGISTRY: &[Entry] = &[
     // ---- 语义算子动作表(ops.cu 母本;lower_* 一一对应;
     //      此族经 lower_* 硬编码装配,out 位置随 .cu 签名)----
-    Entry { name: "owl_add_f32", source: sources::OPS_F32, args: "T,T,T,sz" },
-    Entry { name: "owl_mul_f32", source: sources::OPS_F32, args: "T,T,T,sz" },
-    Entry { name: "owl_sigmoid_f32", source: sources::OPS_F32, args: "T,T,sz" },
-    Entry { name: "owl_silu_f32", source: sources::OPS_F32, args: "T,T,sz" },
-    Entry { name: "owl_matmul_f32", source: sources::OPS_F32, args: "T,T,T,i32,i32,i32" },
-    Entry { name: "owl_matmul_nt_f32", source: sources::OPS_F32, args: "T,T,T,i32,i32,i32" },
-    Entry { name: "owl_rmsnorm_f32", source: sources::OPS_F32, args: "T,T,T,i32,f32,i32" },
+    Entry { name: "owl_add_f32", source: sources::OPS_F32, args: "T,T,T,sz", dtype: crate::contract::Dtype::F32 },
+    Entry { name: "owl_mul_f32", source: sources::OPS_F32, args: "T,T,T,sz", dtype: crate::contract::Dtype::F32 },
+    Entry { name: "owl_sigmoid_f32", source: sources::OPS_F32, args: "T,T,sz", dtype: crate::contract::Dtype::F32 },
+    Entry { name: "owl_silu_f32", source: sources::OPS_F32, args: "T,T,sz", dtype: crate::contract::Dtype::F32 },
+    Entry { name: "owl_matmul_f32", source: sources::OPS_F32, args: "T,T,T,i32,i32,i32", dtype: crate::contract::Dtype::F32 },
+    Entry { name: "owl_matmul_nt_f32", source: sources::OPS_F32, args: "T,T,T,i32,i32,i32", dtype: crate::contract::Dtype::F32 },
+    Entry { name: "owl_rmsnorm_f32", source: sources::OPS_F32, args: "T,T,T,i32,f32,i32", dtype: crate::contract::Dtype::F32 },
+    // ---- f16 基线变体(F2;桥宏:读 half 算 float 写 half;matmul 无 f16 = cuBLAS)----
+    Entry { name: "owl_add_f16", source: sources::OPS_F16, args: "T,T,T,sz", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "owl_mul_f16", source: sources::OPS_F16, args: "T,T,T,sz", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "owl_sigmoid_f16", source: sources::OPS_F16, args: "T,T,sz", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "owl_silu_f16", source: sources::OPS_F16, args: "T,T,sz", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "owl_rmsnorm_f16", source: sources::OPS_F16, args: "T,T,T,i32,f32,i32", dtype: crate::contract::Dtype::F16 },
+    // ---- 模型琐核 f16 变体(F3;embed/rope 同源文件追加,narrow 在 attention.cu)----
+    Entry { name: "owl_embed_f16", source: text::EMBED_F32, args: "T,T,sz,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "owl_rope_half_partial_f16", source: text::ROPE_HALF_PARTIAL_F32, args: "T,T,T,T,sz,sz,sz,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "owl_narrow_strided_f16", source: text::ATTENTION_F32, args: "T,sz,sz,sz,sz,T", dtype: crate::contract::Dtype::F16 },
+    // ---- GDN + attention f16 变体(F4;state 恒 f32 混合核,输出口径 F16)----
+    Entry { name: "owl_gdn_gating_g_f16", source: text::GDN_F32, args: "T,T,T,sz,sz,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "owl_gdn_l2norm_f16", source: text::GDN_F32, args: "T,sz,sz,f32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "owl_gdn_conv_upd_f16", source: text::GDN_F32, args: "T,T,T,T,sz,sz,sz,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "owl_gdn_delta_dec_f16", source: text::GDN_F32, args: "T,T,T,T,T,T,T,sz,sz,sz,sz,sz,f32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "owl_gdn_norm_act_f16", source: text::GDN_F32, args: "T,T,T,sz,sz,sz,f32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "owl_naive_decode_attn_f16", source: text::ATTENTION_F32, args: "T,T,T,T,T,T,T,sz,sz,sz,sz,T", dtype: crate::contract::Dtype::F16 },
+    // ---- owl 移植位(工单 N;NInfer sigmoid_gate_mul,attention 门融合)----
+    Entry { name: "owl_sigmoid_gate_mul_f16", source: sources::owl::SIGMOID_GATE_MUL_F16, args: "T,T,sz,T", dtype: crate::contract::Dtype::F16 },
     // ---- 文本主干(Qwen3.5 mini-demo;Kernel 节点路径,输出块末参)----
-    Entry { name: "owl_embed_f32", source: text::EMBED_F32, args: "T,T,sz,T" },
+    Entry { name: "owl_embed_f32", source: text::EMBED_F32, args: "T,T,sz,T", dtype: crate::contract::Dtype::F32 },
     Entry {
         name: "owl_rope_half_partial_f32",
         source: text::ROPE_HALF_PARTIAL_F32,
         args: "T,T,T,T,sz,sz,sz,T",
+        dtype: crate::contract::Dtype::F32,
     },
     Entry {
         name: "owl_narrow_strided_f32",
         source: text::ATTENTION_F32,
         args: "T,sz,sz,sz,sz,T",
+        dtype: crate::contract::Dtype::F32,
     },
     Entry {
         name: "owl_naive_decode_attn_f32",
         source: text::ATTENTION_F32,
         args: "T,T,T,T,T,T,T,sz,sz,sz,sz,T",
+        dtype: crate::contract::Dtype::F32,
     },
     // ---- GDN 线性注意力(Qwen3.5 mini-demo;Kernel 节点路径,输出块末参)----
     // (beta 臂 = sigmoid(b) 复用 owl_sigmoid_f32,不登记)
@@ -128,26 +157,31 @@ pub static REGISTRY: &[Entry] = &[
         name: "owl_gdn_gating_g_f32",
         source: text::GDN_F32,
         args: "T,T,T,sz,sz,T",
+        dtype: crate::contract::Dtype::F32,
     },
     Entry {
         name: "owl_gdn_l2norm_f32",
         source: text::GDN_F32,
         args: "T,sz,sz,f32,T",
+        dtype: crate::contract::Dtype::F32,
     },
     Entry {
         name: "owl_gdn_conv_upd_f32",
         source: text::GDN_F32,
         args: "T,T,T,T,sz,sz,sz,i32,T",
+        dtype: crate::contract::Dtype::F32,
     },
     Entry {
         name: "owl_gdn_delta_dec_f32",
         source: text::GDN_F32,
         args: "T,T,T,T,T,T,T,sz,sz,sz,sz,sz,f32,T",
+        dtype: crate::contract::Dtype::F32,
     },
     Entry {
         name: "owl_gdn_norm_act_f32",
         source: text::GDN_F32,
         args: "T,T,T,sz,sz,sz,f32,i32,T",
+        dtype: crate::contract::Dtype::F32,
     },
 ];
 

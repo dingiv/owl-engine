@@ -291,11 +291,19 @@ impl KernelCache {
         if let Some(f) = self.compiled.get(name) {
             return Ok(f.clone());
         }
-        let ptx = compile_ptx_with_opts(
-            source,
-            CompileOptions { arch: Some("compute_86"), ..Default::default() },
-        )
-        .map_err(|e| ModelError::Msg(format!("nvrtc({name}): {e:?}")))?;
+        // include 路径:cuda_fp16.h 等 CUDA 头(f16 基线 F2;nvrtc 默认
+        // 搜索表为空,需显式给 toolkit include 目录)
+        let cuda_include = std::env::var("CUDA_HOME")
+            .or_else(|_| std::env::var("CUDA_PATH"))
+            .map(|h| std::path::PathBuf::from(h).join("include"))
+            .unwrap_or_else(|_| std::path::PathBuf::from("/usr/local/cuda/include"));
+        let opts = CompileOptions {
+            arch: Some("compute_86"),
+            include_paths: vec![cuda_include.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        let ptx = compile_ptx_with_opts(source, opts)
+            .map_err(|e| ModelError::Msg(format!("nvrtc({name}): {e:?}")))?;
         let module = ctx
             .load_module(ptx)
             .map_err(|e| ModelError::Msg(format!("load_module({name}): {e:?}")))?;

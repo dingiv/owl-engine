@@ -78,21 +78,6 @@ pub enum Command {
         msg: LaunchMsg,
         ack: Ack<Result<Bytes, ModelError>>,
     },
-    /// cuBLAS GEMM(f16 基线,2026-09-26):C = A×B^T(nt,owl Linear 惯例)
-    /// 或 C = A×B;输入 f16,COMPUTE_32F 累计,f16 输出。非捕获路径
-    /// (prefill eager;图捕获内 cublas 可捕但暂不启用,见 f16 战役 §五)
-    Gemm {
-        a: u64,
-        b: u64,
-        out: u64,
-        /// 输出行数(= nt 时权重行数 / plain 时 B 列数)
-        m: usize,
-        k: usize,
-        /// 输出列数(= token 数)
-        n: usize,
-        nt: bool,
-        ack: Ack<Result<(), ModelError>>,
-    },
     /// 排空点(三条流全部 synchronize)
     Sync {
         ack: Ack<Result<(), ModelError>>,

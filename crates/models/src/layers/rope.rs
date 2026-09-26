@@ -237,3 +237,81 @@ mod tests {
         std::fs::remove_file(&outp).ok();
     }
 }
+#[cfg(test)]
+mod f16_tests {
+    use super::*;
+    use crate::contract::DeviceClient as _;
+    use crate::testkit::{gpu_client, gpu_enabled};
+    use crate::tensor::Dtype;
+
+    fn half_le(f: f32) -> [u8; 2] {
+        half::f16::from_f32(f).to_le_bytes()
+    }
+
+    /// GPU:f16 rope(rotate-half partial)vs host f32(F3;OWL_TEST_DEVICE 门控)
+    #[tokio::test]
+    async fn gpu_rope_f16_matches_host() {
+        if !gpu_enabled() {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return;
+        }
+        let (max_pos, hd, half, heads, tokens) = (64usize, 8usize, 4usize, 2usize, 3usize);
+        // 表(host f32 生成 → f16 上载;与 Rope::new 同式)
+        let cos: Vec<f32> = (0..max_pos)
+            .flat_map(|p| (0..half).map(move |i| (p as f32 * (10000f32).powf(-(2.0 * i as f32) / hd as f32)).cos()))
+            .collect();
+        let sin: Vec<f32> = (0..max_pos)
+            .flat_map(|p| (0..half).map(move |i| (p as f32 * (10000f32).powf(-(2.0 * i as f32) / hd as f32)).sin()))
+            .collect();
+        let x: Vec<f32> = (0..tokens * heads * hd).map(|i| ((i as f32 * 0.29) - 2.0).sin()).collect();
+        let pos = [1.0f32, 4.0f32, 9.0f32];
+
+        let mut gpu = gpu_client().await;
+        let sh = crate::contract::Shape::from;
+        let dx = gpu.htod(Dtype::F16, &sh(vec![tokens, heads, hd]), &x.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()).await.expect("x");
+        let dc = gpu.htod(Dtype::F16, &sh(vec![max_pos, half]), &cos.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()).await.expect("cos");
+        let ds = gpu.htod(Dtype::F16, &sh(vec![max_pos, half]), &sin.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()).await.expect("sin");
+        let dp = gpu.htod(Dtype::F32, &sh(vec![tokens]), &crate::testkit::f32b(&pos)).await.expect("pos");
+        let (x_d, c_d, s_d, p_d) = (
+            TensorOps::of_block(dx.id, Dtype::F16, vec![tokens, heads, hd]),
+            TensorOps::of_block(dc.id, Dtype::F16, vec![max_pos, half]),
+            TensorOps::of_block(ds.id, Dtype::F16, vec![max_pos, half]),
+            TensorOps::of_block(dp.id, Dtype::F32, vec![tokens]),
+        );
+        let decl = TensorOps::of(crate::kernel::kernel_with(
+            "owl_rope_half_partial_f16", (tokens as u32, 1, 1), (128, 1, 1), 0,
+        ))
+        .arg(&x_d).arg(&c_d).arg(&s_d).arg(&p_d)
+        .arg_usize(heads).arg_usize(hd).arg_usize(half)
+        .with_shape(Dtype::F16, vec![tokens, heads, hd]);
+        let out = crate::interpreters::eval_ops(decl.step(), &mut gpu).await.expect("eval");
+        let mut buf = vec![0u8; tokens * heads * hd * 2];
+        gpu.dtoh(&out, &mut buf).await.expect("dtoh");
+
+        let mut max_diff = 0f32;
+        for t in 0..tokens {
+            let p = pos[t] as usize;
+            for h in 0..heads {
+                for i in 0..half {
+                    let a = x[(t * heads + h) * hd + i];
+                    let b = x[(t * heads + h) * hd + i + half];
+                    let cf = cos[p * half + i];
+                    let sf = sin[p * half + i];
+                    let want0 = a * cf - b * sf;
+                    let want1 = b * cf + a * sf;
+                    let g0 = half::f16::from_le_bytes([buf[((t * heads + h) * hd + i) * 2], buf[((t * heads + h) * hd + i) * 2 + 1]]).to_f32();
+                    let g1 = half::f16::from_le_bytes([buf[((t * heads + h) * hd + i + half) * 2], buf[((t * heads + h) * hd + i + half) * 2 + 1]]).to_f32();
+                    max_diff = max_diff.max((g0 - want0).abs()).max((g1 - want1).abs());
+                }
+                // partial 直通维逐位
+                for d in 2 * half..hd {
+                    let g = half::f16::from_le_bytes([buf[((t * heads + h) * hd + d) * 2], buf[((t * heads + h) * hd + d) * 2 + 1]]).to_f32();
+                    assert_eq!(g, x[(t * heads + h) * hd + d], "直通维 [{t},{h},{d}]");
+                }
+            }
+        }
+        eprintln!("[rope f16] max_diff = {max_diff:.5}");
+        assert!(max_diff < 2e-2, "旋转维容差 2e-2(f16 表量化),得 {max_diff}");
+        gpu.close().await.expect("关机");
+    }
+}

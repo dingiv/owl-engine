@@ -1,7 +1,28 @@
 //! F1 治理探针:cuBLAS 账外显存占用实测(handle 创建 / 首个 gemm /
 //! 换形状 gemm 三个时点的 nvidia-smi used 差值)。
 
-use owl_cuda::{test_device_ordinal, DeviceClient as _, DeviceSelector, Dtype, GpuClient, GpuServer, Shape};
+use owl_cuda::{test_device_ordinal, Arg, DeviceClient as _, DeviceSelector, Dtype, GpuClient, GpuServer, LaunchMsg, Shape};
+
+/// foreign-kernel 通道:Launch + 虚拟核名 cublas_gemm_f16
+/// 槽序契约(cublas.rs):[T a, T b, T out, sz m, sz k, sz n, sz nt]
+fn gemm_launch(a: &owl_cuda::Bytes, w: &owl_cuda::Bytes, o: &owl_cuda::Bytes, m: usize, k: usize, n: usize, nt: bool) -> LaunchMsg {
+    LaunchMsg {
+        kernel: owl_cuda::KernelSpec { name: "cublas_gemm_f16".into(), source: String::new() },
+        args: vec![
+            Arg::Block { id: a.id },
+            Arg::Block { id: w.id },
+            Arg::Block { id: o.id },
+            Arg::U64(m as u64),
+            Arg::U64(k as u64),
+            Arg::U64(n as u64),
+            Arg::U64(nt as u64),
+        ],
+        grid: (0, 0, 0),
+        block: (0, 0, 0),
+        shared_mem: 0,
+        out_elems: m * n,
+    }
+}
 
 fn vram_used_mib() -> usize {
     let out = std::process::Command::new("nvidia-smi")
@@ -28,18 +49,18 @@ async fn gemm_workspace_footprint() {
     let o = client.alloc(Dtype::F16, t * n).await.unwrap();
     let _ = (base, &a, &w, &o);
     let after_alloc = vram_used_mib();
-    client.gemm(&a, &w, &o, n, k, t, true).await.expect("gemm 1");
+    client.launch(gemm_launch(&a, &w, &o, n, k, t, true)).await.expect("gemm 1");
     client.sync().await.unwrap();
     let after_gemm1 = vram_used_mib();
 
     // 换形状(触发算法重选)
     let o2 = client.alloc(Dtype::F16, 512 * n).await.unwrap();
-    client.gemm(&a, &w, &o2, n, k, 512, true).await.expect("gemm 2");
+    client.launch(gemm_launch(&a, &w, &o2, n, k, 512, true)).await.expect("gemm 2");
     client.sync().await.unwrap();
     let after_gemm2 = vram_used_mib();
 
     // 复跑同形状(应零增长)
-    client.gemm(&a, &w, &o, n, k, t, true).await.expect("gemm 3");
+    client.launch(gemm_launch(&a, &w, &o, n, k, t, true)).await.expect("gemm 3");
     client.sync().await.unwrap();
     let after_gemm3 = vram_used_mib();
 

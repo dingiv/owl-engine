@@ -29,10 +29,9 @@ use crate::ffi::{launch_host_function, memcpy_dtoh_async, memcpy_htod_async, mem
 use crate::command::{Ack, Command};
 use crate::launch::issue_launch;
 use crate::state::{DeviceSelector, GpuCtx, KernelCache, Staging};
-use owl_iface::contract::{Bytes, LaunchMsg};
+use owl_iface::contract::{Arg, Bytes, LaunchMsg};
 use crate::state::{STREAM_COMPUTE, STREAM_D2H, STREAM_H2D};
 use owl_iface::contract::ModelError;
-use core::ffi::c_int;
 use std::sync::mpsc;
 
 type Finish = Box<dyn FnOnce() + Send>;
@@ -64,8 +63,8 @@ pub struct GpuServer {
     boot: Option<mpsc::Sender<Result<(), String>>>,
     ctx: Option<GpuCtx>,
     kernels: KernelCache,
-    /// cuBLAS 句柄(F1 f16 基线;懒初始化,绑 COMPUTE 流)
-    blas: Option<cudarc::cublas::CudaBlas>,
+    /// cuBLAS 封装(foreign-kernel 通道;算子之家 owl-kernels::cublas,懒初始化)
+    blas: Option<owl_kernels::cublas::OwlCublas>,
     /// 完成派发出口(host 回调只投递;派发线程执行真正的 finish)
     dispatch: Option<mpsc::Sender<Finish>>,
 }
@@ -193,9 +192,6 @@ impl GpuServer {
         if self.ctx().capture_stream() {
             return match cmd {
                 Command::Launch { msg, ack } => self.handle_launch(msg, ack),
-            Command::Gemm { ack, .. } => ack.send(Err(ModelError::Msg(
-                "gemm: 捕获期不支持(prefill eager)".to_string(),
-            ))),
                 Command::Alloc { n_bytes, elems, ack } => self.handle_alloc(n_bytes, elems, ack),
                 Command::GraphEnd { ack } => ack.send(self.ctx_mut().graph_end()),
                 Command::Close { ack } => ack.send(Ok(())), // 防御性幂等回执
@@ -215,9 +211,6 @@ impl GpuServer {
             }
             Command::Dtoh { id, want_bytes, ack } => self.handle_dtoh(id, want_bytes, ack),
             Command::Launch { msg, ack } => self.handle_launch(msg, ack),
-            Command::Gemm { a, b, out, m, k, n, nt, ack } => {
-                self.handle_gemm(a, b, out, m, k, n, nt, ack)
-            }
             Command::Sync { ack } => self.handle_sync(ack),
             Command::GraphBegin { ack } => ack.send(self.ctx_mut().graph_begin()),
             Command::GraphEnd { ack } => ack.send(self.ctx_mut().graph_end()),
@@ -244,7 +237,6 @@ impl GpuServer {
             Command::Alloc { ack, .. } => closed!(ack),
             Command::Htod { ack, .. } => closed!(ack),
             Command::HtodChunk { ack, .. } => closed!(ack),
-            Command::Gemm { ack, .. } => closed!(ack),
             Command::AllocPinned { ack, .. } => closed!(ack),
             Command::UploadPinned { ack, .. } => closed!(ack),
             Command::Dtoh { ack, .. } => closed!(ack),
@@ -265,7 +257,6 @@ impl GpuServer {
             Command::Alloc { .. } => "Alloc",
             Command::Htod { .. } => "Htod",
             Command::HtodChunk { .. } => "HtodChunk",
-            Command::Gemm { .. } => "Gemm",
             Command::AllocPinned { .. } => "AllocPinned",
             Command::UploadPinned { .. } => "UploadPinned",
             Command::Dtoh { .. } => "Dtoh",
@@ -281,7 +272,6 @@ impl GpuServer {
             Command::Alloc { ack, .. } => reject!(ack),
             Command::Htod { ack, .. } => reject!(ack),
             Command::HtodChunk { ack, .. } => reject!(ack),
-            Command::Gemm { ack, .. } => reject!(ack),
             Command::AllocPinned { ack, .. } => reject!(ack),
             Command::UploadPinned { ack, .. } => reject!(ack),
             Command::Dtoh { ack, .. } => reject!(ack),
@@ -551,86 +541,12 @@ impl GpuServer {
     }
 
 
-    /// cuBLAS GEMM(F1 f16 基线):f16 in / COMPUTE_32F 累计 / f16 out。
-    /// 行主序映射(列主序 cublas):out_cm[m, n] = op(b)·op(a)。
-    /// nt=true(owl Linear:B [m,k] 行主序权重):transa=T on b(lda=k);
-    /// nt=false(B [k,n] 行主序):transa=T on b(lda=n)。
-    fn handle_gemm(
-        &mut self,
-        a: u64,
-        b: u64,
-        out: u64,
-        m: usize,
-        k: usize,
-        n: usize,
-        nt: bool,
-        ack: Ack<Result<(), ModelError>>,
-    ) {
-        use cudarc::cublas::{result as cb, sys};
-        if self.blas.is_none() {
-            let stream = match self.ctx().stream(STREAM_COMPUTE) {
-                Ok(s) => s.clone(),
-                Err(e) => return ack.send(Err(e)),
-            };
-            match cudarc::cublas::CudaBlas::new(stream) {
-                Ok(h) => self.blas = Some(h),
-                Err(e) => {
-                    return ack.send(Err(ModelError::Msg(format!("cublas init: {e:?}"))))
-                }
-            }
-        }
-        let handle = self.blas.as_ref().unwrap().handle();
-        let stream = match self.ctx().stream(STREAM_COMPUTE) {
-            Ok(s) => s.clone(),
-            Err(e) => return ack.send(Err(e)),
-        };
-        let (a_ptr, _) = match self.ctx().block_ptr(a, &stream) {
-            Ok(p) => p,
-            Err(e) => return ack.send(Err(e)),
-        };
-        let (b_ptr, _) = match self.ctx().block_ptr(b, &stream) {
-            Ok(p) => p,
-            Err(e) => return ack.send(Err(e)),
-        };
-        let (out_ptr, _) = match self.ctx().block_ptr(out, &stream) {
-            Ok(p) => p,
-            Err(e) => return ack.send(Err(e)),
-        };
-        // lda/ldb 按行主序重解释;alpha/beta f32(COMPUTE_32F)
-        let (lda, transa) = if nt { (k as c_int, sys::cublasOperation_t::CUBLAS_OP_T) } else { (n as c_int, sys::cublasOperation_t::CUBLAS_OP_T) };
-        let alpha: f32 = 1.0;
-        let beta: f32 = 0.0;
-        let r = unsafe {
-            cb::gemm_ex(
-                *handle,
-                transa,
-                sys::cublasOperation_t::CUBLAS_OP_N,
-                m as c_int,
-                n as c_int,
-                k as c_int,
-                &alpha as *const f32 as *const _,
-                b_ptr as *const _,
-                sys::cudaDataType::CUDA_R_16F,
-                lda as c_int,
-                a_ptr as *const _,
-                sys::cudaDataType::CUDA_R_16F,
-                k as c_int,
-                &beta as *const f32 as *const _,
-                out_ptr as *mut _,
-                sys::cudaDataType::CUDA_R_16F,
-                m as c_int,
-                sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
-            )
-        };
-        // 排队即回执(fire-and-forget,同 launch 语义;COMPUTE 流保序)
-        match r {
-            Ok(()) => ack.send(Ok(())),
-            Err(e) => ack.send(Err(ModelError::Msg(format!("gemm_ex: {e:?}")))),
-        }
-    }
-
     fn handle_launch(&mut self, msg: LaunchMsg, ack: Ack<Result<Bytes, ModelError>>) {
+        // foreign-kernel 通道(2026-09-26 合并:cuBLAS 不再另立命令,
+        // 外部算子 = 虚拟核名走同一 Launch;谓词与槽序归 owl-kernels::cublas)
+        if owl_kernels::cublas::is_foreign(&msg.kernel.name) {
+            return self.handle_foreign_launch(msg, ack);
+        }
         let mut ack = Some(ack);
         // 字段级解构:ctx(不可变)与 kernels(可变)借用不相交
         let Self { ctx, kernels, .. } = self;
@@ -658,6 +574,79 @@ impl GpuServer {
                     .send(Ok(Bytes::new(out_id, msg.out_elems)))
             }
             Err(e) => ack.take().unwrap().send(Err(e)),
+        }
+    }
+
+    /// 外部核执行(cuBLAS 先行;marlin/FlashInfer 同通道后续接入)。
+    /// 槽序契约见 owl_kernels::cublas::GEMM_F16 文档。
+    fn handle_foreign_launch(&mut self, msg: LaunchMsg, ack: Ack<Result<Bytes, ModelError>>) {
+        // 捕获期拒绝(外部库 workspace 账外;capture 前须 warmup,README 口径)
+        if self
+            .ctx
+            .as_ref()
+            .map(|c| c.capture_stream())
+            .unwrap_or(false)
+        {
+            return ack.send(Err(ModelError::Msg(format!(
+                "foreign kernel {} 捕获期不支持(先 warmup;prefill eager 裁决)",
+                msg.kernel.name
+            ))));
+        }
+        if self.blas.is_none() {
+            let stream = match self.ctx().stream(STREAM_COMPUTE) {
+                Ok(s) => s.clone(),
+                Err(e) => return ack.send(Err(e)),
+            };
+            match owl_kernels::cublas::OwlCublas::new(stream) {
+                Ok(h) => self.blas = Some(h),
+                Err(e) => return ack.send(Err(ModelError::Msg(e))),
+            }
+        }
+        // 槽序:[T a, T b, T out, sz m, sz k, sz n, sz nt]
+        let mut blocks: Vec<u64> = Vec::new();
+        let mut scalars: Vec<u64> = Vec::new();
+        for a in &msg.args {
+            match a {
+                Arg::Block { id } => blocks.push(*id),
+                Arg::U64(v) => scalars.push(*v),
+                _ => {
+                    return ack.send(Err(ModelError::Msg(format!(
+                        "foreign kernel {} 槽序违约:仅 Block/U64(见 cublas.rs 契约)",
+                        msg.kernel.name
+                    ))))
+                }
+            }
+        }
+        if blocks.len() != 3 || scalars.len() != 4 {
+            return ack.send(Err(ModelError::Msg(format!(
+                "foreign kernel {} 槽序违约:3 Block + 4 U64,得 {}B/{}S",
+                msg.kernel.name,
+                blocks.len(),
+                scalars.len()
+            ))));
+        }
+        let (m, k, n, nt) =
+            (scalars[0] as usize, scalars[1] as usize, scalars[2] as usize, scalars[3] != 0);
+        let blas = self.blas.as_ref().unwrap();
+        let stream = match self.ctx().stream(STREAM_COMPUTE) {
+            Ok(s) => s.clone(),
+            Err(e) => return ack.send(Err(e)),
+        };
+        let (a_ptr, _) = match self.ctx().block_ptr(blocks[0], &stream) {
+            Ok(p) => p,
+            Err(e) => return ack.send(Err(e)),
+        };
+        let (b_ptr, _) = match self.ctx().block_ptr(blocks[1], &stream) {
+            Ok(p) => p,
+            Err(e) => return ack.send(Err(e)),
+        };
+        let (out_ptr, _) = match self.ctx().block_ptr(blocks[2], &stream) {
+            Ok(p) => p,
+            Err(e) => return ack.send(Err(e)),
+        };
+        match blas.gemm_f16(a_ptr, b_ptr, out_ptr, m, k, n, nt) {
+            Ok(()) => ack.send(Ok(Bytes::new(blocks[2], msg.out_elems))),
+            Err(e) => ack.send(Err(ModelError::Msg(e))),
         }
     }
 

@@ -178,20 +178,6 @@ impl DeviceClient for GpuClient {
         Ok(())
     }
 
-    async fn gemm(
-        &mut self,
-        a: &Bytes,
-        b: &Bytes,
-        out: &Bytes,
-        m: usize,
-        k: usize,
-        n: usize,
-        nt: bool,
-    ) -> Result<(), ModelError> {
-        let (a, b, out) = (a.id, b.id, out.id);
-        self.submit(move |ack| Command::Gemm { a, b, out, m, k, n, nt, ack })?.await
-    }
-
     // TODO: 考虑改成同步调用, 因为 launch 不用等待, 待定
     async fn launch(&mut self, msg: LaunchMsg) -> Result<Bytes, ModelError> {
         // 槽序契约前置校验(与 launch.rs 的"最后一个 Block"回传一致)

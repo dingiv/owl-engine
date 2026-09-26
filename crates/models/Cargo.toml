@@ -27,3 +27,4 @@ owl-cpu = { path = "../backends/cpu" }
 # GPU 端到端样例的执行器(客户驱动 server;仅 dev —— 主依赖不含任何后端)
 owl-cuda = { path = "../backends/cuda" }
 safetensors = "0.8.0"
+half = "2.7.1"

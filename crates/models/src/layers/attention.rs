@@ -317,3 +317,95 @@ mod tests {
         gpu.close().await.expect("server 关机");
     }
 }
+
+#[cfg(test)]
+mod f16_tests {
+    use super::*;
+    use crate::contract::DeviceClient as _;
+    use crate::testkit::{gpu_client, gpu_enabled};
+    use crate::tensor::Dtype;
+
+    /// GPU:f16 narrow gather(位型直搬,逐位一致;OWL_TEST_DEVICE 门控)
+    #[tokio::test]
+    async fn gpu_narrow_f16_matches_host() {
+        if !gpu_enabled() {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return;
+        }
+        // [2, 16] half → start=8 out_dim=8(gate 半段)
+        // 源值过 f16 量化(上载即 f16;纯拷贝 = 对量化后参考逐位)
+        let src: Vec<f32> = (0..32)
+            .map(|i| half::f16::from_f32((i as f32 * 0.17) - 1.4).to_f32())
+            .collect();
+        let (outer, src_dim, start, out_dim) = (2usize, 16usize, 8usize, 8usize);
+        let mut gpu = gpu_client().await;
+        let ds = gpu.htod(Dtype::F16, &crate::contract::Shape::from(vec![2, 16]),
+            &src.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>()).await.expect("htod");
+        let s_decl = TensorOps::of_block(ds.id, Dtype::F16, vec![2, 16]);
+        let decl = TensorOps::of(crate::kernel::kernel_with(
+            "owl_narrow_strided_f16", (0, 0, 0), (256, 1, 1), 0,
+        ))
+        .arg(&s_decl)
+        .arg_usize(outer)
+        .arg_usize(src_dim)
+        .arg_usize(start)
+        .arg_usize(out_dim)
+        .with_shape(Dtype::F16, vec![outer * out_dim]);
+        let out = crate::interpreters::eval_ops(decl.step(), &mut gpu).await.expect("eval");
+        let mut buf = vec![0u8; outer * out_dim * 2];
+        gpu.dtoh(&out, &mut buf).await.expect("dtoh");
+        for r in 0..outer {
+            for d in 0..out_dim {
+                let got = half::f16::from_le_bytes([buf[(r * out_dim + d) * 2], buf[(r * out_dim + d) * 2 + 1]]).to_f32();
+                assert_eq!(got, src[r * src_dim + start + d], "[{r},{d}] 纯拷贝须逐位");
+            }
+        }
+        gpu.close().await.expect("关机");
+    }
+}
+
+#[cfg(test)]
+mod owl_port_tests {
+    use super::*;
+    use crate::contract::DeviceClient as _;
+    use crate::testkit::{gpu_client, gpu_enabled};
+    use crate::tensor::Dtype;
+
+    /// GPU:owl_sigmoid_gate_mul_f16(NInfer 移植)vs host f32
+    /// 验融合等价:silu 链上的 sigmoid+mul 双发射 → 单核(工单 N 收口锚)
+    #[tokio::test]
+    async fn gpu_sigmoid_gate_mul_f16_matches_host() {
+        if !gpu_enabled() {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return;
+        }
+        let n = 1024usize; // 偶数(hidden/head_dim 全偶,契约)
+        let gate: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.23) - 3.0).sin() * 2.5).collect();
+        let x: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.11) - 1.0).cos() * 1.8).collect();
+        let q = |f: f32| half::f16::from_f32(f).to_f32(); // f16 量化参考
+        let mut gpu = gpu_client().await;
+        let sh = crate::contract::Shape::from(vec![n]);
+        let dg = gpu.htod(Dtype::F16, &sh, &gate.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>()).await.expect("gate");
+        let dxx = gpu.htod(Dtype::F16, &sh, &x.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>()).await.expect("x");
+        let dout = gpu.alloc(Dtype::F16, n).await.expect("alloc");
+        let g_decl = TensorOps::of_block(dg.id, Dtype::F16, vec![n]);
+        let x_decl = TensorOps::of_block(dxx.id, Dtype::F16, vec![n]);
+        let decl = TensorOps::of(crate::kernel::kernel_with(
+            "owl_sigmoid_gate_mul_f16", (0, 0, 0), (256, 1, 1), 0,
+        ))
+        .arg(&g_decl).arg(&x_decl).arg_usize(n)
+        .with_shape(Dtype::F16, vec![n]);
+        let out = crate::interpreters::eval_ops(decl.step(), &mut gpu).await.expect("eval");
+        let mut buf = vec![0u8; n * 2];
+        gpu.dtoh(&out, &mut buf).await.expect("dtoh");
+        let mut max_diff = 0f32;
+        for i in 0..n {
+            let want = q(x[i]) * (1.0 / (1.0 + (-q(gate[i])).exp()));
+            let got = half::f16::from_le_bytes([buf[i * 2], buf[i * 2 + 1]]).to_f32();
+            max_diff = max_diff.max((got - want).abs());
+        }
+        eprintln!("[gate_mul f16] max_diff = {max_diff:.5}");
+        assert!(max_diff < 2e-2, "融合门乘容差 2e-2,得 {max_diff}");
+        gpu.close().await.expect("关机");
+    }
+}

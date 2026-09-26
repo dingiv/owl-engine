@@ -166,3 +166,60 @@ mod tests {
         std::fs::remove_file(&outp).ok();
     }
 }
+
+#[cfg(test)]
+mod f16_tests {
+    use super::*;
+    use crate::testkit::{gpu_client, gpu_enabled};
+    use crate::contract::DeviceClient as _;
+    use crate::tensor::Dtype;
+
+    fn half_le(f: f32) -> [u8; 2] {
+        half::f16::from_f32(f).to_le_bytes()
+    }
+
+    /// GPU:f16 embed 查表 vs host f32(F3 收口;OWL_TEST_DEVICE 门控)
+    #[tokio::test]
+    async fn gpu_embed_f16_matches_host() {
+        if !gpu_enabled() {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return;
+        }
+        let (vocab, d) = (8usize, 16usize);
+        // 源值过 f16 量化(上载即 f16;查表正确性 = 对量化后参考逐位)
+        let w: Vec<f32> = (0..vocab * d)
+            .map(|i| half::f16::from_f32(((i as f32 * 0.37) - 3.0).sin()).to_f32())
+            .collect();
+        let ids = [2.0f32, 5.0f32, 7.0f32];
+        let tokens = 3usize;
+
+        let mut gpu = gpu_client().await;
+        let dw = gpu.htod(Dtype::F16, &crate::contract::Shape::from(vec![vocab, d]),
+            &w.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()).await.expect("htod w");
+        let di = gpu.htod(Dtype::F32, &crate::contract::Shape::from(vec![tokens]),
+            &crate::testkit::f32b(&ids)).await.expect("htod ids");
+
+        // htod 块 → Block 叶子声明(f16 链不走 CpuFace 的 from_host)
+        let w_decl = TensorOps::of_block(dw.id, Dtype::F16, vec![vocab, d]);
+        let i_decl = TensorOps::of_block(di.id, Dtype::F32, vec![tokens]);
+        let decl = TensorOps::of(crate::kernel::kernel_with(
+            "owl_embed_f16", (tokens as u32, 1, 1), (128, 1, 1), 0,
+        ))
+        .arg(&w_decl)
+        .arg(&i_decl)
+        .arg_usize(d)
+        .with_shape(Dtype::F16, vec![tokens, d]);
+        let out = crate::interpreters::eval_ops(decl.step(), &mut gpu).await.expect("eval");
+        let mut buf = vec![0u8; tokens * d * 2];
+        gpu.dtoh(&out, &mut buf).await.expect("dtoh");
+
+        for t in 0..tokens {
+            let id = ids[t] as usize;
+            for dd in 0..d {
+                let got = half::f16::from_le_bytes([buf[(t * d + dd) * 2], buf[(t * d + dd) * 2 + 1]]).to_f32();
+                assert_eq!(got, w[id * d + dd], "查表须逐位一致 [{t},{dd}]");
+            }
+        }
+        gpu.close().await.expect("关机");
+    }
+}

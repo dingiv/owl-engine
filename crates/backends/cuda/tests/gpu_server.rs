@@ -293,7 +293,23 @@ async fn gpu_gemm_f16_matches_host() {
     let da = client.htod(Dtype::F16, &Shape::from(vec![t, k]), &le_f16(&a)).await.expect("htod a");
     let dw = client.htod(Dtype::F16, &Shape::from(vec![n, k]), &le_f16(&w)).await.expect("htod w");
     let dout = client.alloc(Dtype::F16, t * n).await.expect("alloc out");
-    client.gemm(&da, &dw, &dout, n, k, t, true).await.expect("gemm");
+    let msg = LaunchMsg {
+        kernel: KernelSpec { name: "cublas_gemm_f16".into(), source: String::new() },
+        args: vec![
+            Arg::Block { id: da.id },
+            Arg::Block { id: dw.id },
+            Arg::Block { id: dout.id },
+            Arg::U64(n as u64),
+            Arg::U64(k as u64),
+            Arg::U64(t as u64),
+            Arg::U64(1),
+        ],
+        grid: (0, 0, 0),
+        block: (0, 0, 0),
+        shared_mem: 0,
+        out_elems: t * n,
+    };
+    client.launch(msg).await.expect("gemm launch");
 
     let mut buf = vec![0u8; t * n * 2];
     client.dtoh(&dout, &mut buf).await.expect("dtoh");

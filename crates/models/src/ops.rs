@@ -135,6 +135,26 @@ fn spec(name: &'static str) -> KernelSpec {
     KernelSpec { name: name.to_string(), source: crate::kernel::source(name).to_string() }
 }
 
+/// dtype 路由名(f16 基线 F2):`owl_<op>_<f32|f16>`;注册表缺条目 =
+/// source panic(编程错误口径 —— 守门已在 eval 前置,此处对齐注册表)
+fn dname(base: &str, dtype: crate::contract::Dtype) -> &'static str {
+    match dtype {
+        crate::contract::Dtype::F32 => to_static(concat_op(base, "f32")),
+        crate::contract::Dtype::F16 => to_static(concat_op(base, "f16")),
+        other => panic!("dname: 语义算子不支持 {other:?}(f16 基线:仅 F32/F16)"),
+    }
+}
+
+fn concat_op(base: &str, suffix: &str) -> String {
+    format!("{base}_{suffix}")
+}
+
+fn to_static(s: String) -> &'static str {
+    // 路由名来自封闭集合(f32/f16 后缀),注册表键为 'static;
+    // 用 Box::leak 承载(进程生命周期,量级 = 语义算子数 × 2,可忽略)
+    Box::leak(s.into_boxed_str())
+}
+
 fn ceil_1d(n: usize) -> (u32, u32, u32) {
     ((n as u32 + 255) / 256, 1, 1)
 }
@@ -142,9 +162,44 @@ fn ceil_1d(n: usize) -> (u32, u32, u32) {
 /// lower:Add(同形二元;a/b 块等长由 server 账长校验兜底)
 /// lower:Add(同形二元;a/b 块等长由 server 账长校验兜底)
 /// n = 声明元素数(C1 维度源头单一律:只读声明 shape,不读块账长)
-pub fn lower_add(ins: &[Bytes], out: &Bytes, n: usize) -> LaunchMsg {
+
+/// f16 GEMM(foreign-kernel 通道,2026-09-26):核名 = cublas 虚拟核,
+/// server 按名分派到 owl-kernels::cublas(非 nvrtc 注册表;source 空)。
+/// 槽序契约:[T a, T b, T out, sz m, sz k, sz n, sz nt](cublas.rs 文档)。
+pub fn lower_gemm(
+    ins: &[Bytes],
+    out: &Bytes,
+    m: usize,
+    k: usize,
+    n: usize,
+    nt: bool,
+) -> LaunchMsg {
     LaunchMsg {
-        kernel: spec("owl_add_f32"),
+        // 核名 = 线契约常量(权威定义 owl-kernels::cublas::GEMM_F16;
+        // models 不开 cublas feature,此处字面量对齐,测试互证)
+        kernel: KernelSpec {
+            name: "cublas_gemm_f16".to_string(),
+            source: String::new(),
+        },
+        args: vec![
+            Arg::Block { id: ins[0].id },
+            Arg::Block { id: ins[1].id },
+            Arg::Block { id: out.id },
+            Arg::U64(m as u64),
+            Arg::U64(k as u64),
+            Arg::U64(n as u64),
+            Arg::U64(nt as u64),
+        ],
+        grid: (0, 0, 0),
+        block: (0, 0, 0),
+        shared_mem: 0,
+        out_elems: m * n,
+    }
+}
+
+pub fn lower_add(ins: &[Bytes], out: &Bytes, n: usize, dtype: crate::contract::Dtype) -> LaunchMsg {
+    LaunchMsg {
+        kernel: spec(dname("owl_add", dtype)),
         args: vec![
             Arg::Block { id: ins[0].id },
             Arg::Block { id: ins[1].id },
@@ -160,9 +215,9 @@ pub fn lower_add(ins: &[Bytes], out: &Bytes, n: usize) -> LaunchMsg {
 
 /// lower:Mul(同形逐元素乘)
 /// n = 声明元素数(C1 维度源头单一律:只读声明 shape,不读块账长)
-pub fn lower_mul(ins: &[Bytes], out: &Bytes, n: usize) -> LaunchMsg {
+pub fn lower_mul(ins: &[Bytes], out: &Bytes, n: usize, dtype: crate::contract::Dtype) -> LaunchMsg {
     LaunchMsg {
-        kernel: spec("owl_mul_f32"),
+        kernel: spec(dname("owl_mul", dtype)),
         args: vec![Arg::Block { id: ins[0].id }, Arg::Block { id: ins[1].id }, Arg::Block { id: out.id }, Arg::U64(n as u64)],
         grid: ceil_1d(n),
         block: (256, 1, 1),
@@ -173,9 +228,9 @@ pub fn lower_mul(ins: &[Bytes], out: &Bytes, n: usize) -> LaunchMsg {
 
 /// lower:Silu(一元)
 /// n = 声明元素数(C1 维度源头单一律:只读声明 shape,不读块账长)
-pub fn lower_silu(ins: &[Bytes], out: &Bytes, n: usize) -> LaunchMsg {
+pub fn lower_silu(ins: &[Bytes], out: &Bytes, n: usize, dtype: crate::contract::Dtype) -> LaunchMsg {
     LaunchMsg {
-        kernel: spec("owl_silu_f32"),
+        kernel: spec(dname("owl_silu", dtype)),
         args: vec![Arg::Block { id: ins[0].id }, Arg::Block { id: out.id }, Arg::U64(n as u64)],
         grid: ceil_1d(n),
         block: (256, 1, 1),
@@ -186,9 +241,9 @@ pub fn lower_silu(ins: &[Bytes], out: &Bytes, n: usize) -> LaunchMsg {
 
 /// lower:Sigmoid(一元;attn_output_gate 门 / GDN beta 同族)
 /// n = 声明元素数(C1 维度源头单一律:只读声明 shape,不读块账长)
-pub fn lower_sigmoid(ins: &[Bytes], out: &Bytes, n: usize) -> LaunchMsg {
+pub fn lower_sigmoid(ins: &[Bytes], out: &Bytes, n: usize, dtype: crate::contract::Dtype) -> LaunchMsg {
     LaunchMsg {
-        kernel: spec("owl_sigmoid_f32"),
+        kernel: spec(dname("owl_sigmoid", dtype)),
         args: vec![Arg::Block { id: ins[0].id }, Arg::Block { id: out.id }, Arg::U64(n as u64)],
         grid: ceil_1d(n),
         block: (256, 1, 1),
@@ -236,9 +291,9 @@ pub fn lower_matmul_nt(ins: &[Bytes], out: &Bytes, m: usize, k: usize, n: usize)
 }
 
 /// lower:Rmsnorm([rows, cols];per-channel alpha([cols] 广播);w_off = ×(1+w))
-pub fn lower_rmsnorm(ins: &[Bytes], eps: f32, w_off: bool, out: &Bytes, rows: usize, cols: usize) -> LaunchMsg {
+pub fn lower_rmsnorm(ins: &[Bytes], eps: f32, w_off: bool, out: &Bytes, rows: usize, cols: usize, dtype: crate::contract::Dtype) -> LaunchMsg {
     LaunchMsg {
-        kernel: spec("owl_rmsnorm_f32"),
+        kernel: spec(dname("owl_rmsnorm", dtype)),
         args: vec![
             Arg::Block { id: ins[0].id },
             Arg::Block { id: ins[1].id },

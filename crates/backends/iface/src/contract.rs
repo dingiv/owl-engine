@@ -242,24 +242,6 @@ pub trait DeviceClient: Send {
     fn launch(&mut self, msg: LaunchMsg)
         -> impl Future<Output = Result<Bytes, ModelError>> + Send;
 
-    /// cuBLAS GEMM(f16 基线,F1):C[m,n] = A[k,n]×B^T(nt,owl Linear
-    /// 惯例:B 行主序 [m,k] 权重)或 C = A×B(plain);f16 入出,
-    /// COMPUTE_32F 累计。COMPUTE 流火后不理(同 launch);非捕获路径。
-    /// 默认实现 = 结构化报错(仅 GPU server 实现;CPU 先不搞)。
-    fn gemm(
-        &mut self,
-        _a: &Bytes,
-        _b: &Bytes,
-        _out: &Bytes,
-        _m: usize,
-        _k: usize,
-        _n: usize,
-        _nt: bool,
-    ) -> impl Future<Output = Result<(), ModelError>> + Send {
-        async {
-            Err(ModelError::Msg("gemm: 本后端不支持(仅 GPU server)".to_string()))
-        }
-    }
     /// 全设备栅栏:三条流此前全部工作落定方回执(计时/步边界/捕获前净空)
     fn sync(&mut self) -> impl Future<Output = Result<(), ModelError>> + Send;
 

@@ -95,6 +95,18 @@ where
     Box::pin(_eval_node(t, ctx))
 }
 
+/// 语义算子 f32-only 守门(F2 前;f16 变体注册后按 dtype 路由替换)
+fn f32_only_guard(name: &str, dtype: Dtype) -> Result<(), ModelError> {
+    if dtype == Dtype::F32 {
+        Ok(())
+    } else {
+        Err(ModelError::Msg(format!(
+            "[dtype 守门] 语义算子 {name} 无 {dtype:?} 变体(F2 未完成;\
+             f16 基线迁移中,注册表见 kernel.rs)"
+        )))
+    }
+}
+
 async fn _eval_node<'a, 'b, D>(
     t: &'a TensorOps,
     ctx: &'b mut EvalCtx<'a, D>,
@@ -148,25 +160,25 @@ where
         Op::Reshape => ins[0].clone(), // 纯元数据视图:透传父块(零拷贝)
         Op::Add => {
             let out = ctx.face.alloc(dtype, n_elems).await?;
-            let msg = crate::ops::lower_add(&ins, &out, n_elems);
+            let msg = crate::ops::lower_add(&ins, &out, n_elems, dtype);
             ctx.face.launch(msg).await?;
             out
         }
         Op::Mul => {
             let out = ctx.face.alloc(dtype, n_elems).await?;
-            let msg = crate::ops::lower_mul(&ins, &out, n_elems);
+            let msg = crate::ops::lower_mul(&ins, &out, n_elems, dtype);
             ctx.face.launch(msg).await?;
             out
         }
         Op::Silu => {
             let out = ctx.face.alloc(dtype, n_elems).await?;
-            let msg = crate::ops::lower_silu(&ins, &out, n_elems);
+            let msg = crate::ops::lower_silu(&ins, &out, n_elems, dtype);
             ctx.face.launch(msg).await?;
             out
         }
         Op::Sigmoid => {
             let out = ctx.face.alloc(dtype, n_elems).await?;
-            let msg = crate::ops::lower_sigmoid(&ins, &out, n_elems);
+            let msg = crate::ops::lower_sigmoid(&ins, &out, n_elems, dtype);
             ctx.face.launch(msg).await?;
             out
         }
@@ -177,9 +189,10 @@ where
             let k = t.parents[0].shape.last().copied().unwrap_or(0);
             let out = ctx.face.alloc(dtype, m * n).await?;
             if dtype == Dtype::F16 {
-                // f16 基线:cuBLAS(COMPUTE_32F 累计;nt = owl Linear 惯例)
+                // f16 基线:foreign-kernel 通道(cuBLAS;nt = owl Linear 惯例)
                 let nt = matches!(t.op, Op::MatmulNt);
-                ctx.face.gemm(&ins[0], &ins[1], &out, m, k, n, nt).await?;
+                let msg = crate::ops::lower_gemm(&ins, &out, m, k, n, nt);
+                ctx.face.launch(msg).await?;
             } else {
                 let msg = if matches!(t.op, Op::MatmulNt) {
                     crate::ops::lower_matmul_nt(&ins, &out, m, k, n)
@@ -197,11 +210,23 @@ where
             let alpha_shape = t.parents[1].shape.clone();
             let cols: usize = alpha_shape.iter().product::<usize>().max(1);
             let rows = shape.iter().product::<usize>() / cols;
-            let msg = crate::ops::lower_rmsnorm(&ins, *eps, *w_off, &out, rows, cols);
+            let msg = crate::ops::lower_rmsnorm(&ins, *eps, *w_off, &out, rows, cols, dtype);
             ctx.face.launch(msg).await?;
             out
         }
         Op::Kernel { kernel } => {
+            // f16 基线守门(2026-09-26):注册表 dtype 标注对账声明 dtype,
+            // 不符 = 结构化报错 —— 堵死「f32 核读 f16 字节 = 静默垃圾」。
+            // 逃生舱(非注册,带 sig)跳过(仅测试域)。
+            if let Some(e) = crate::kernel::lookup(kernel.name) {
+                if e.dtype != dtype {
+                    return Err(ModelError::Msg(format!(
+                        "[dtype 守门] kernel \"{}\" 登记为 {:?},声明为 {:?} \
+                         —— f16 变体未注册(F2-F4 迁移中)",
+                        kernel.name, e.dtype, dtype
+                    )));
+                }
+            }
             let out = ctx.face.alloc(dtype, n_elems).await?;
             let msg = crate::ops::lower_kernel(kernel, &t.args, &ins, &out, n_elems);
             ctx.face.launch(msg).await?;
@@ -248,4 +273,139 @@ where
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod dtype_guard_tests {
+    use super::*;
+    use crate::contract::{DeviceClient, Dtype};
+    use crate::tensor::TensorOps;
+
+    /// CPU 面:f16 语义算子结构化报错(CPU 先不搞,裁决)——不许静默
+    #[tokio::test]
+    async fn cpu_f16_semantic_unsupported() {
+        let mut face = owl_cpu::CpuFace::new();
+        // Block 叶子(CPU htod 对 f16 本就拒;守门测的是声明 dtype 对账)
+        let a = TensorOps::of_block(901, Dtype::F16, vec![2]);
+        let b = TensorOps::of_block(902, Dtype::F16, vec![2]);
+        let y = a.add(&b);
+        let err = eval_ops(y.step(), &mut face).await.unwrap_err();
+        let msg = format!("{err}");
+        // CPU 拒绝点允许更早(alloc 即拒)或语义守门,只要显式报错不静默
+        assert!(msg.contains("仅 F32") || msg.contains("dtype 守门"), "{msg}");
+    }
+
+    /// f16 基线守门:注册核(f32 条目)遇 f16 声明 = 结构化报错
+    #[tokio::test]
+    async fn f16_registered_kernel_is_rejected() {
+        let mut face = owl_cpu::CpuFace::new();
+        // narrow_strided 登记 F32;f16 声明 → 守门拦截
+        let src = TensorOps::of_block(903, Dtype::F16, vec![4]);
+        let decl = TensorOps::of(crate::kernel::kernel_with(
+            "owl_narrow_strided_f32",
+            (0, 0, 0),
+            (256, 1, 1),
+            0,
+        ))
+        .arg(&src)
+        .arg_usize(1)
+        .arg_usize(4)
+        .arg_usize(0)
+        .arg_usize(2)
+        .with_shape(Dtype::F16, vec![2]);
+        let err = eval_ops(decl.step(), &mut face).await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("dtype 守门") && msg.contains("owl_narrow_strided_f32"), "{msg}");
+    }
+
+    /// GPU:f16 语义五算子 vs host f32 参考(F2 收口锚;OWL_TEST_DEVICE 门控)
+    #[tokio::test]
+    async fn gpu_f16_semantic_matches_host() {
+        if !crate::testkit::gpu_enabled() {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return;
+        }
+        use crate::testkit::{gpu_client, f32_of};
+        let n = 1024usize;
+        let x: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.21) - 5.0).sin() * 2.0).collect();
+        let yv: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.13) - 1.0).cos() * 1.5).collect();
+        let alpha: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01) - 0.5).collect();
+        let xb: Vec<u8> = x.iter().flat_map(|f| half_le(*f)).collect();
+
+        let mut gpu = gpu_client().await;
+        let shape = crate::contract::Shape::from(vec![n]);
+        let dx_b = gpu.htod(Dtype::F16, &shape, &xb).await.expect("htod x");
+        let dy_b = gpu.htod(Dtype::F16, &shape, &yv.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()).await.expect("htod y");
+        let da_b = gpu.htod(Dtype::F16, &shape, &alpha.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()).await.expect("htod alpha");
+        let dx = TensorOps::of_block(dx_b.id, Dtype::F16, vec![n]);
+        let dy = TensorOps::of_block(dy_b.id, Dtype::F16, vec![n]);
+        let da = TensorOps::of_block(da_b.id, Dtype::F16, vec![n]);
+
+        // y = silu(x + y) * sigmoid(x);z = rmsnorm(y ×w_off, alpha)
+        let s1 = dx.add(&dy);
+        let s2 = s1.silu();
+        let g = dx.sigmoid();
+        let m = s2.mul(&g);
+        let z = m.rmsnorm(&da, 1e-6, true);
+        let bytes = eval_ops(z.step(), &mut gpu).await.expect("eval f16 chain");
+        let mut buf = vec![0u8; n * 2];
+        gpu.dtoh(&bytes, &mut buf).await.expect("dtoh");
+        let got: Vec<f32> = buf
+            .chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect();
+
+        // host f32 参考
+        let mut max_diff = 0f32;
+        for i in 0..n {
+            let s = x[i] + yv[i];
+            let silu = s / (1.0 + (-s).exp());
+            let sig = 1.0 / (1.0 + (-x[i]).exp());
+            let m_val = silu * sig;
+            // rmsnorm 行内需全行 rms —— 算全行
+            let _ = max_diff;
+            let _ = m_val;
+        }
+        let mut sumsq = 0f32;
+        for i in 0..n {
+            let s = x[i] + yv[i];
+            let silu = s / (1.0 + (-s).exp());
+            let sig = 1.0 / (1.0 + (-x[i]).exp());
+            let mv = silu * sig;
+            sumsq += mv * mv;
+        }
+        let inv = 1.0 / (sumsq / n as f32 + 1e-6).sqrt();
+        for (i, g_val) in got.iter().enumerate() {
+            let s = x[i] + yv[i];
+            let silu = s / (1.0 + (-s).exp());
+            let sig = 1.0 / (1.0 + (-x[i]).exp());
+            let want = silu * sig * inv * (alpha[i] + 1.0);
+            let diff = (g_val - want).abs();
+            max_diff = max_diff.max(diff);
+            assert!(diff < 5e-2 * (1.0 + want.abs()), "[{i}] f16 {g_val} vs host {want}");
+        }
+        eprintln!("[f16 语义链] max_diff = {max_diff:.5}");
+        gpu.close().await.expect("关机");
+    }
+
+    fn half_le(f: f32) -> [u8; 2] {
+        half::f16::from_f32(f).to_le_bytes()
+    }
+
+    /// f32 正常路径不受守门影响(回归哨)
+    #[tokio::test]
+    async fn f32_path_unaffected() {
+        let mut face = owl_cpu::CpuFace::new();
+        let a = TensorOps::from_host(Dtype::F32, vec![2], &crate::testkit::f32b(&[1.0, 2.0]));
+        let b = TensorOps::from_host(Dtype::F32, vec![2], &crate::testkit::f32b(&[3.0, 4.0]));
+        let y = a.add(&b);
+        let bytes = eval_ops(y.step(), &mut face).await.expect("f32 add");
+        let mut buf = vec![0u8; 8];
+        face.dtoh(&bytes, &mut buf).await.expect("dtoh");
+        let got: Vec<f32> = buf
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(got, vec![4.0, 6.0]);
+    }
 }
