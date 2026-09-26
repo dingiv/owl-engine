@@ -10,6 +10,7 @@
 //! | 计算(推理) | [`eval`] | TensorOps DAG 归约(CSE + 毒值落地 + C1 断言) | [`eval`] / [`eval_ops`] / [`eval_ops_tap`] |
 //! | 装载 | [`load`] | Loadable::layout → 取数/变换/物化(流式分块 + 并发流水) | [`eval_load`] |
 //! | 观测面(tap) | [`observe`] | 节点级单步调试的事件词汇与协议(挂在 eval 归约点) | [`observe::Tap`] / [`observe::StatsTap`] |
+//! | 生成 | [`generate`] | 步循环域:GenSpec 声明 + 逐 step 驱动整模单树(采样/停机) | [`eval_generate`] |
 //!
 //! 新变体(图捕获回放、量化装载、其他平台)按域另起文件,公共词汇
 //! 上提至本文件 —— 勿在变体间互相依赖。
@@ -22,9 +23,11 @@
 //! shape;`Bytes.len` 不参与语义(Block 叶子 len=0),仅边界断言。
 
 pub mod eval;
+pub mod generate;
 pub mod load;
 pub mod observe;
 
 pub use eval::{eval, eval_ops, eval_ops_tap};
+pub use generate::{eval_generate, GenSpec, Sampling};
 pub use load::eval_load;
 pub use observe::{BlockRef, BlockStats, NodeEvent, StatRecord, StatsTap, Tap, Want};

@@ -10,4 +10,4 @@
 
 pub mod qwen35;
 
-pub use qwen35::{hybrid_3to1, load_0_8b, qwen3_5_0_8b, Qwen35Convention};
+pub use qwen35::{hybrid_3to1, load_0_8b, load_tokenizer, qwen3_5_0_8b, Qwen35Convention};

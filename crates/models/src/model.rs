@@ -55,6 +55,9 @@ pub struct ModelSpec {
     /// 层混型表(true = full_attention;dense 全 true;hybrid 按检查点
     /// layer_types 填)
     pub layer_types: Vec<bool>,
+    /// 分词器声明(家族特有事实:eos 族 + chat 文本格式;机制在
+    /// [`crate::tokenizer`] —— 模型用什么分词器是声明,不是函数)
+    pub tokenizer: crate::tokenizer::TokenizerSpec,
 }
 
 // ============================================================================
@@ -215,6 +218,13 @@ mod tests {
             gdn_heads: (NK, HK_DIM, NV, HV_DIM),
             eps: EPS,
             layer_types: vec![false, false, false, true], // G,G,G,F
+            tokenizer: crate::tokenizer::TokenizerSpec {
+                eos_tokens: vec!["<|endoftext|>"],
+                chat: crate::tokenizer::ChatFormat {
+                    prefix: String::new(),
+                    suffix: String::new(),
+                },
+            },
         }
     }
 

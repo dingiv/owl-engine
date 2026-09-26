@@ -94,6 +94,13 @@ pub async fn load_0_8b<D: DeviceClient>(
     Ok(model)
 }
 
+/// Qwen3.5 tokenizer 装配:机制在 tokenizer.rs,事实在 spec 声明
+/// (ModelSpec.tokenizer)—— 本函数只是两端的接线(jinja 全引擎挂账
+/// serving 层)
+pub fn load_tokenizer(dir: &Path) -> Result<crate::tokenizer::Tokenizer, ModelError> {
+    crate::tokenizer::Tokenizer::from_spec(dir, &qwen3_5_0_8b().tokenizer)
+}
+
 /// 3:1 周期(G,G,G,F)铺满 n 层(Qwen3.5 hybrid 惯例;
 /// 24 层 → 18 GDN + 6 full,与 0.8B config.json 实测一致)
 pub fn hybrid_3to1(n: usize) -> Vec<bool> {
@@ -110,6 +117,13 @@ pub fn qwen3_5_0_8b() -> ModelSpec {
         gdn_heads: (16, 128, 16, 128),
         eps: 1e-6,
         layer_types: hybrid_3to1(24),
+        tokenizer: crate::tokenizer::TokenizerSpec {
+            eos_tokens: vec!["<|im_end|>", "<|endoftext|>"],
+            chat: crate::tokenizer::ChatFormat {
+                prefix: "<|im_start|>user\n".into(),
+                suffix: "<|im_end|>\n<|im_start|>assistant\n".into(),
+            },
+        },
     }
 }
 
