@@ -550,6 +550,165 @@ mod tests {
         Ok(())
     }
 
+    /// 批P5 真模型验收:0.8B prefill T=8 vs 8×decode 逐步(单序列语义:
+    /// GDN 状态格恒 0,KV 行随 token 走)+ 生成冒烟(prefill 喂 prompt,
+    /// greedy 4 步,tokenizer 解码打印)。
+    /// ⚠️ KV 槽本测独立 8 槽(测试常量 SLOTS=4 是 smoke 的两步口径)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gpu_real_weights_prefill() {
+        use crate::layers::gdn::GdnBuffers;
+        use crate::layers::rope::Rope;
+        use crate::module::KvBuffers;
+        let dir = manifest_dir().join("assets/Qwen3.5-0.8B");
+        let t_len = 8usize;
+        let slots_n = 8usize;
+        let eprintln_skip = (); // 门控同 smoke(真权重测试默认必跑)
+        let _ = eprintln_skip;
+
+        let mut gpu = crate::testkit::gpu_client().await;
+        let model = load_0_8b(&dir, &mut gpu).await.expect("load_0_8b(真权重)");
+        let rp = Rope::new(262_144, HD, 64, 10_000_000.0).expect("rope");
+        crate::interpreters::eval_load(&rp, &mut gpu, &rp.tables(),
+            &crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1 })
+            .await.expect("rope 表(f16 正确姿势)");
+
+        // 常驻缓冲 ×2 套(ref / prefill;KV 8 槽,GDN 状态格用 0)
+        async fn mk(
+            gpu: &mut owl_cuda::GpuClient, slots_n: usize, hd: usize, hkv: usize,
+        ) -> (Vec<KvBuffers>, Vec<GdnBuffers>) {
+            let kv_len = slots_n * hkv * hd;
+            let mut kvs = Vec::new();
+            for _ in 0..6 {
+                kvs.push(KvBuffers {
+                    k_cache: zero_block_f16(gpu, kv_len, vec![slots_n, hkv, hd]).await,
+                    v_cache: zero_block_f16(gpu, kv_len, vec![slots_n, hkv, hd]).await,
+                    slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
+                    kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0])),
+                });
+            }
+            let mut gdns = Vec::new();
+            for _ in 0..18 {
+                gdns.push(GdnBuffers {
+                    conv_q: zero_block(gpu, slots_n * 2048 * 3, vec![slots_n, 2048, 3]).await,
+                    conv_k: zero_block(gpu, slots_n * 2048 * 3, vec![slots_n, 2048, 3]).await,
+                    conv_v: zero_block(gpu, slots_n * 2048 * 3, vec![slots_n, 2048, 3]).await,
+                    rec: zero_block(gpu, slots_n * 16 * 128 * 128, vec![slots_n, 16, 128, 128]).await,
+                    slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
+                });
+            }
+            (kvs, gdns)
+        }
+        let (kvs_ref, gdns_ref) = mk(&mut gpu, slots_n, HD, HKV).await;
+        let (kvs_pre, gdns_pre) = mk(&mut gpu, slots_n, HD, HKV).await;
+
+        // prompt:8 token(合法 id;语义无关 —— 验的是路径等价)
+        let prompt: Vec<f32> = [985.0, 4123.0, 711.0, 2023.0, 1546.0, 884.0, 3001.0, 4195.0]
+            .iter().map(|v| *v).collect();
+
+        // 参考:T 次 decode 步(单序列:gdn 恒 0,kv 行 = t)
+        let mut ref_rows: Vec<Vec<f32>> = Vec::new();
+        for t in 0..t_len {
+            let ids = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[prompt[t]]));
+            let pos_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32]));
+            let kvs_step: Vec<KvBuffers> = kvs_ref
+                .iter()
+                .map(|kv| KvBuffers {
+                    k_cache: kv.k_cache.clone(),
+                    v_cache: kv.v_cache.clone(),
+                    slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32])),
+                    kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32 + 1.0])),
+                })
+                .collect();
+            let gdns_step: Vec<GdnBuffers> = gdns_ref
+                .iter()
+                .map(|g| GdnBuffers {
+                    conv_q: g.conv_q.clone(),
+                    conv_k: g.conv_k.clone(),
+                    conv_v: g.conv_v.clone(),
+                    rec: g.rec.clone(),
+                    slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
+                })
+                .collect();
+            let ctx = ForwardCtx::model_decode(1, &pos_t, &kvs_step, &rp, &gdns_step);
+            let logits = model.forward(&ids, &ctx);
+            ref_rows.push(crate::testkit::harvest_f16(&mut gpu, &logits).await);
+        }
+
+        // 被测:一次 prefill T=8
+        let ids_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&prompt));
+        let pos_all = TensorOps::from_host(Dtype::F32, vec![t_len],
+            &f32b(&(0..t_len).map(|t| t as f32).collect::<Vec<_>>()));
+        let slots_all = TensorOps::from_host(Dtype::F32, vec![t_len],
+            &f32b(&(0..t_len).map(|t| t as f32).collect::<Vec<_>>()));
+        let lens_all = TensorOps::from_host(Dtype::F32, vec![t_len],
+            &f32b(&(0..t_len).map(|t| t as f32 + 1.0).collect::<Vec<_>>()));
+        let gdn_slot = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0]));
+        let ctx = ForwardCtx::model_prefill(t_len, &pos_all, &kvs_pre, &rp, &gdns_pre,
+            &slots_all, &lens_all, &gdn_slot);
+        let all = crate::testkit::harvest_f16(&mut gpu, &model.forward(&ids_all, &ctx)).await;
+
+        // 逐行等价(路径等价 = PF1a 契约):T 批 cuBLAS(m=8)vs 逐步
+        // (m=1)核选型/浮序差 → 相对容差 5e-2 + top-1 逐行一致
+        for t in 0..t_len {
+            let row = &all[t * VOCAB..(t + 1) * VOCAB];
+            for (i, (g, w)) in row.iter().zip(&ref_rows[t]).enumerate() {
+                assert!(
+                    (g - w).abs() <= 5e-2 * (1.0 + w.abs()),
+                    "prefill 行{t}[{i}] {g} vs {w}"
+                );
+            }
+            let (tp, tr) = (
+                row.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |a, (i, v)| if *v > a.1 { (i, *v) } else { a }).0,
+                ref_rows[t].iter().enumerate().fold((0usize, f32::NEG_INFINITY), |a, (i, v)| if *v > a.1 { (i, *v) } else { a }).0,
+            );
+            assert_eq!(tp, tr, "prefill 行{t} top-1 不一致: {tp} vs {tr}");
+        }
+
+        // 生成冒烟:prefill 喂 prompt → 末行 greedy → decode 4 步 → 文本打印
+        let tok = load_tokenizer(&dir).expect("tokenizer");
+        let mut gen_ids: Vec<u32> = Vec::new();
+        let mut next = all[(t_len - 1) * VOCAB..t_len * VOCAB]
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |a, (i, v)| if *v > a.1 { (i, *v) } else { a })
+            .0 as u32;
+        for step in 0..4u32 {
+            gen_ids.push(next);
+            let t = t_len + step as usize;
+            let ids1 = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[next as f32]));
+            let pos_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32]));
+            let kvs_step: Vec<KvBuffers> = kvs_pre
+                .iter()
+                .map(|kv| KvBuffers {
+                    k_cache: kv.k_cache.clone(),
+                    v_cache: kv.v_cache.clone(),
+                    slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32])),
+                    kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32 + 1.0])),
+                })
+                .collect();
+            let gdns_step: Vec<GdnBuffers> = gdns_pre
+                .iter()
+                .map(|g| GdnBuffers {
+                    conv_q: g.conv_q.clone(),
+                    conv_k: g.conv_k.clone(),
+                    conv_v: g.conv_v.clone(),
+                    rec: g.rec.clone(),
+                    slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
+                })
+                .collect();
+            let ctx = ForwardCtx::model_decode(1, &pos_t, &kvs_step, &rp, &gdns_step);
+            let logits = model.forward(&ids1, &ctx);
+            let row = crate::testkit::harvest_f16(&mut gpu, &logits).await;
+            next = row.iter().enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |a, (i, v)| if *v > a.1 { (i, *v) } else { a })
+                .0 as u32;
+        }
+        let text = tok.decode(&gen_ids);
+        eprintln!("[prefill-smoke] 生成: {text:?}");
+        assert!(!text.is_empty(), "生成冒烟:非空");
+        gpu.close().await.expect("关机");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn gpu_real_weights_smoke() {
         use crate::layers::gdn::GdnBuffers;

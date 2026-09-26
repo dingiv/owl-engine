@@ -27,7 +27,7 @@
 use crate::contract::Dtype;
 use crate::kernel;
 use crate::layers::linear::Linear;
-use crate::layers::narrow_strided;
+use crate::layers::{concat_rows, narrow_strided};
 use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, Weight};
 use crate::TensorOps;
 
@@ -186,6 +186,84 @@ pub fn delta_dec(
 }
 
 // ============================================================================
+// PF1b 批核 wrapper(2026-09-26 接线;xinfer attention_rs 同源,varlen 单发射)
+// ============================================================================
+
+/// causal conv1d prefill varlen(批核):x [T, d] 单发射吃全块,
+/// state 槽寻址原地滑窗;slots [1] + cu_seqlens [0,T](单序列)。
+/// f16 生产核(f32 锚链走展开降级路)。**无 w_offset 参数** —— 三段
+/// 各传窄切后的权重行(段基址在层侧完成)。
+pub(crate) fn conv_fwd(
+    x: &TensorOps,
+    w: &TensorOps,
+    state: &TensorOps,
+    slots: &TensorOps,
+    cu_seqlens: &TensorOps,
+    tokens: usize,
+    d: usize,
+    silu: bool,
+) -> TensorOps {
+    TensorOps::of(kernel::kernel_with(
+        "owl_gdn_conv_fwd_f16",
+        (1u32, ((d + 255) / 256) as u32, 1),
+        (256, 1, 1),
+        0,
+    ))
+    .arg(x)
+    .arg(w)
+    .arg(state)
+    .arg(slots)
+    .arg(cu_seqlens)
+    .arg_i32(1) // batch = 1(单序列)
+    .arg_i32(d as i32)
+    .arg_i32(silu as i32)
+    .with_shape(Dtype::F16, vec![tokens, d])
+}
+
+/// gated delta rule varlen 递推(批核):q/k/v/g/beta [T, ·] 单发射,
+/// t 循环核内;state 槽寻址进出(读初态写终态同格,原地律同族);
+/// cu_seqlens [0,T](vLLM 契约保真,M2 packed 直用)。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn recurrence_varlen(
+    q: &TensorOps,
+    k: &TensorOps,
+    v: &TensorOps,
+    g: &TensorOps,
+    beta: &TensorOps,
+    state: &TensorOps,
+    slots: &TensorOps,
+    cu_seqlens: &TensorOps,
+    tokens: usize,
+    nv: usize,
+    nk: usize,
+    kd: usize,
+    vd: usize,
+    q_scale: f32,
+) -> TensorOps {
+    TensorOps::of(kernel::kernel_with(
+        "owl_gdn_recurrence_varlen_gqa_f16",
+        (((vd + 7) / 8) as u32, nv as u32, 1),
+        (32, 8, 1),
+        ((4 * kd + 4) * 4) as u32,
+    ))
+    .arg(q)
+    .arg(k)
+    .arg(v)
+    .arg(g)
+    .arg(beta)
+    .arg(state)
+    .arg(slots)
+    .arg(cu_seqlens)
+    .arg_usize(1) // batch = 1(单序列)
+    .arg_usize(nv)
+    .arg_usize(nk)
+    .arg_usize(kd)
+    .arg_usize(vd)
+    .arg_f32(q_scale)
+    .with_shape(Dtype::F16, vec![tokens, nv, vd])
+}
+
+// ============================================================================
 // 批5:门控 RMSNorm × act(z)
 // ============================================================================
 
@@ -283,7 +361,201 @@ impl GatedDeltaNet {
         self.nv * self.hv_dim
     }
 
+    /// prefill 分派(PF1-0):f16 = PF1b 批核(conv_fwd + varlen 递推,
+    /// 单发射吃全块);f32 锚链 = 展开降级路(锚链不再演进,展开保留为
+    /// 对拍基准)。语义两者同:prefill(x, S) == 依次 T 次 decode 步
+    /// (token t,槽恒 gdn_slot)后的状态与逐 token 输出(对拍即证)。
+    fn forward_prefill_decl(&self, xs: &TensorOps, ctx: &ForwardCtx) -> TensorOps {
+        if xs.dtype == Dtype::F16 {
+            self.forward_prefill_batch(xs, ctx)
+        } else {
+            self.forward_prefill_expanded(xs, ctx)
+        }
+    }
+
+    /// PF1b 批核路径(f16 生产路;2026-09-26 接线):节点账 ~25/层
+    /// (展开 ~10T+62 坍缩),投递/norm 侧 T 批量单发不变。
+    fn forward_prefill_batch(&self, xs: &TensorOps, ctx: &ForwardCtx) -> TensorOps {
+        let tokens = ctx.tokens;
+        let (gdn, gdn_slot) = match (ctx.gdn, ctx.gdn_slot) {
+            (Some(g), Some(s)) => (g, s),
+            _ => {
+                return TensorOps::poisoned(
+                    Dtype::F16,
+                    vec![tokens, self.hidden],
+                    "gdn prefill(batch): ctx 缺动态依赖(需 gdn 块组 + gdn_slot)",
+                );
+            }
+        };
+        let key_dim = self.key_dim();
+        let value_dim = self.value_dim();
+        let conv_dim = 2 * key_dim + value_dim;
+
+        // T 批量投影
+        let qkv = self.in_proj_qkv.forward(xs, ctx); // [T, 2K+V]
+        let z = self.in_proj_z.forward(xs, ctx); // [T, V]
+        let b = self.in_proj_b.forward(xs, ctx); // [T, HV]
+        let a = self.in_proj_a.forward(xs, ctx); // [T, HV]
+        let q = narrow_strided(&qkv, tokens, conv_dim, 0, key_dim, vec![tokens, key_dim]);
+        let k = narrow_strided(&qkv, tokens, conv_dim, key_dim, key_dim, vec![tokens, key_dim]);
+        let v = narrow_strided(&qkv, tokens, conv_dim, 2 * key_dim, value_dim, vec![tokens, value_dim]);
+
+        // cu_seqlens = [0, T](单序列;vLLM 契约形态,M2 packed 直用)
+        let cu = TensorOps::from_host(Dtype::F32, vec![2], &{
+            let mut v = Vec::with_capacity(8);
+            v.extend_from_slice(&0.0f32.to_le_bytes());
+            v.extend_from_slice(&(tokens as f32).to_le_bytes());
+            v
+        });
+
+        // conv 三段批核(单发射;state 槽 = gdn_slot)。批核无 w_offset
+        // 参数 —— 权重行按段窄切后传入(rows [0..K][K..2K][2K..])
+        let w_decl = self.conv_w.decl();
+        let w_q = narrow_strided(&w_decl, key_dim, 4, 0, 4, vec![key_dim, 4]);
+        let w_k = narrow_strided(&w_decl, key_dim, 4, key_dim * 4, 4, vec![key_dim, 4]);
+        let w_v = narrow_strided(&w_decl, value_dim, 4, 2 * key_dim * 4, 4, vec![value_dim, 4]);
+        let q_c = conv_fwd(&q, &w_q, &gdn.conv_q, gdn_slot, &cu, tokens, key_dim, true);
+        let k_c = conv_fwd(&k, &w_k, &gdn.conv_k, gdn_slot, &cu, tokens, key_dim, true);
+        let v_c = conv_fwd(&v, &w_v, &gdn.conv_v, gdn_slot, &cu, tokens, value_dim, true);
+
+        // qk l2norm(per-head 行,T 批量)
+        let q_n = l2norm(
+            &q_c.reshape(vec![tokens * self.nk, self.hk_dim]),
+            tokens * self.nk,
+            self.hk_dim,
+            1e-6,
+        );
+        let k_n = l2norm(
+            &k_c.reshape(vec![tokens * self.nk, self.hk_dim]),
+            tokens * self.nk,
+            self.hk_dim,
+            1e-6,
+        );
+
+        // 门控(g + beta)
+        let g = gating_g(&self.a_log.decl(), &a, &self.dt_bias.decl(), tokens, self.nv);
+        let beta = b.sigmoid();
+
+        // varlen 递推批核(单发射;state 原地进出)
+        let y = recurrence_varlen(
+            &q_n.reshape(vec![tokens, self.nk, self.hk_dim]),
+            &k_n.reshape(vec![tokens, self.nk, self.hk_dim]),
+            &v_c.reshape(vec![tokens, self.nv, self.hv_dim]),
+            &g,
+            &beta,
+            &gdn.rec,
+            gdn_slot,
+            &cu,
+            tokens,
+            self.nv,
+            self.nk,
+            self.hk_dim,
+            self.hv_dim,
+            1.0 / (self.hk_dim as f32).sqrt(),
+        );
+
+        // 门控归一化(T 批量)+ 出投影
+        let gated = norm_act(
+            &y.reshape(vec![tokens, value_dim]),
+            &z,
+            &self.norm_w.decl(),
+            tokens,
+            value_dim,
+            self.hv_dim,
+            self.eps,
+            true,
+        );
+        self.out_proj.forward(&gated, ctx)
+    }
+
+    /// 展开降级路(f32 锚链;f16 = 对拍基准,保留为测试锚)
+    fn forward_prefill_expanded(&self, xs: &TensorOps, ctx: &ForwardCtx) -> TensorOps {
+        let tokens = ctx.tokens;
+        let (gdn, gdn_slot) = match (ctx.gdn, ctx.gdn_slot) {
+            (Some(g), Some(s)) => (g, s),
+            _ => {
+                return TensorOps::poisoned(
+                    crate::tensor::Dtype::F16,
+                    vec![tokens, self.hidden],
+                    "gdn prefill: ctx 缺动态依赖(需 gdn 块组 + gdn_slot;ForwardCtx::gdn_prefill)",
+                );
+            }
+        };
+        let key_dim = self.key_dim();
+        let value_dim = self.value_dim();
+        let conv_dim = 2 * key_dim + value_dim;
+
+        // T 批量投影(SplitQkvZa 同 decode;T 无关算子单发即批量)
+        let qkv = self.in_proj_qkv.forward(xs, ctx); // [T, 2K+V]
+        let z = self.in_proj_z.forward(xs, ctx); // [T, V]
+        let b = self.in_proj_b.forward(xs, ctx); // [T, HV]
+        let a = self.in_proj_a.forward(xs, ctx); // [T, HV]
+
+        // 逐 token 段(conv 滑窗 / rec 递推链式;slot 恒 gdn_slot)
+        let mut ys: Vec<TensorOps> = Vec::with_capacity(tokens);
+        for t in 0..tokens {
+            // 读侧行窄切(直接从 [T,·] 投影读,start = 行基址)
+            let q_t = narrow_strided(&qkv, 1, conv_dim, t * conv_dim, key_dim, vec![1, key_dim]);
+            let k_t = narrow_strided(&qkv, 1, conv_dim, t * conv_dim + key_dim, key_dim, vec![1, key_dim]);
+            let v_t = narrow_strided(&qkv, 1, conv_dim, t * conv_dim + 2 * key_dim, value_dim, vec![1, value_dim]);
+            let a_t = narrow_strided(&a, 1, self.nv, t * self.nv, self.nv, vec![1, self.nv]);
+            let b_t = narrow_strided(&b, 1, self.nv, t * self.nv, self.nv, vec![1, self.nv]);
+
+            // conv 三段(状态滑窗;段基址 = w_offset;silu 恒 true)
+            let q_c = conv_upd(&q_t, &self.conv_w.decl(), &gdn.conv_q, gdn_slot, 1, key_dim, 0, true);
+            let k_c = conv_upd(&k_t, &self.conv_w.decl(), &gdn.conv_k, gdn_slot, 1, key_dim, key_dim, true);
+            let v_c = conv_upd(&v_t, &self.conv_w.decl(), &gdn.conv_v, gdn_slot, 1, value_dim, 2 * key_dim, true);
+
+            // qk l2norm(per-head 行)
+            let q_n = l2norm(&q_c.reshape(vec![self.nk, self.hk_dim]), self.nk, self.hk_dim, 1e-6);
+            let k_n = l2norm(&k_c.reshape(vec![self.nk, self.hk_dim]), self.nk, self.hk_dim, 1e-6);
+
+            // 门控:g(softplus 链)+ beta = sigmoid(b)
+            let g_t = gating_g(&self.a_log.decl(), &a_t, &self.dt_bias.decl(), 1, self.nv);
+            let beta_t = b_t.sigmoid();
+
+            // 单步递推(rec 原地;q_scale = 1/√hd_k)
+            let y_t = delta_dec(
+                &q_n.reshape(vec![1, self.nk, self.hk_dim]),
+                &k_n.reshape(vec![1, self.nk, self.hk_dim]),
+                &v_c.reshape(vec![1, self.nv, self.hv_dim]),
+                &g_t,
+                &beta_t,
+                &gdn.rec,
+                gdn_slot,
+                1,
+                self.nv,
+                self.nk,
+                self.hk_dim,
+                self.hv_dim,
+                1.0 / (self.hk_dim as f32).sqrt(),
+            );
+            ys.push(y_t.reshape(vec![1, value_dim]));
+        }
+
+        // 栈(T×[1,V] → [T,V];arity 8 = 展开锚定位)→ 门控归一(T 批量)
+        // → 出投影(T 批量)
+        let refs: Vec<&TensorOps> = ys.iter().collect();
+        let y_all = concat_rows(&refs, 1, value_dim);
+        let gated = norm_act(
+            &y_all,
+            &z,
+            &self.norm_w.decl(),
+            tokens,
+            value_dim,
+            self.hv_dim,
+            self.eps,
+            true,
+        );
+        self.out_proj.forward(&gated, ctx)
+    }
+
     fn forward_decl(&self, xs: &TensorOps, ctx: &ForwardCtx) -> TensorOps {
+        // PF1a 分派(pf1-port-design §二):prefill = T-token 块展开,
+        // 全用已验证 decode 核(vLLM 语义的合法退化形态;批P3 实装)
+        if ctx.kind == crate::module::StepKind::Prefill {
+            return self.forward_prefill_decl(xs, ctx);
+        }
         let tokens = ctx.tokens;
         let gdn = match ctx.gdn {
             Some(g) => g,
@@ -1078,6 +1350,14 @@ mod tests {
         // 缺 gdn ctx → 毒值(与未装载槽同构)
         let out2 = layer.forward(&xs, &ForwardCtx::minimal(tokens));
         assert!(out2.is_poisoned(), "minimal ctx 缺 gdn 常驻块组,应毒");
+
+        // prefill 分派(PF1-0/批P3 实装):kind=Prefill → 批核路声明良构
+        // (未装 F16 权重前的毒值 = 槽未装载语义;decode 路不破)
+        let gdn_slot = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0]));
+        let out3 = layer.forward(&xs, &ForwardCtx::gdn_prefill(tokens, &gdn_buf, &gdn_slot));
+        let _ = out3; // f16 装载形态由 f16_tests 层级对拍覆盖(CPU 面不追)
+        let out4 = layer.forward(&xs, &ForwardCtx::gdn_decode(tokens, &gdn_buf));
+        assert!(!out4.is_poisoned(), "prefill 分派后 decode 路不破");
     }
 
     /// host 全链参考(独立副本;两步 decode,state 跨步持久)
@@ -1258,6 +1538,42 @@ mod f16_tests {
     use crate::contract::DeviceClient as _;
     use crate::testkit::{gpu_client, gpu_enabled};
     use crate::tensor::Dtype;
+    /// 批P1:concat_rows 核对拍(位型拷贝,期望逐位相等)
+    #[tokio::test]
+    async fn gpu_concat_rows_matches_host() {
+        if !gpu_enabled() {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return;
+        }
+        let (n, r, d) = (3usize, 2usize, 4usize);
+        let ins: Vec<Vec<f32>> = (0..n)
+            .map(|k| (0..r * d).map(|i| ((k * 100 + i) as f32) * 0.25 - 1.0).collect())
+            .collect();
+
+        let mut gpu = gpu_client().await;
+        let decls: Vec<TensorOps> = ins
+            .iter()
+            .map(|v| TensorOps::from_host(Dtype::F16, vec![r, d], &hbytes(v)))
+            .collect();
+        let refs: Vec<&TensorOps> = decls.iter().collect();
+        let decl = crate::layers::concat_rows(&refs, r, d);
+        let mut buf = vec![0u8; n * r * d * 2];
+        {
+            let bytes = crate::interpreters::eval_ops(decl.step(), &mut gpu)
+                .await
+                .expect("eval concat");
+            gpu.dtoh(&bytes, &mut buf).await.expect("dtoh");
+        }
+        gpu.close().await.expect("server 关机");
+
+        let got = unhalf(&buf);
+        let want: Vec<f32> = ins.iter().flat_map(|v| v.iter().copied()).collect();
+        assert_eq!(got.len(), want.len(), "形状 [n·r, d]");
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(g.to_bits(), w.to_bits(), "concat 位型 [{i}]");
+        }
+    }
+
 
     /// f16 量化(host 侧先落位宽;测试输入与参考共用)
     fn q(v: &[f32]) -> Vec<f32> {
@@ -1277,6 +1593,266 @@ mod f16_tests {
         for (i, (g, w)) in got.iter().zip(want).enumerate() {
             assert!((g - w).abs() <= tol * (1.0 + w.abs()), "{ctx}[{i}] {g} vs {w}");
         }
+    }
+
+    /// 零态 GdnBuffers(conv f32 / rec f32;新序列零态起步语义)
+    async fn zero_gdn_bufs(
+        gpu: &mut owl_cuda::GpuClient, slots_n: usize,
+        key_dim: usize, value_dim: usize, nv: usize, hkd: usize, hvd: usize,
+        slot: f32,
+    ) -> GdnBuffers {
+        async fn mk(gpu: &mut owl_cuda::GpuClient, shape: Vec<usize>) -> crate::contract::Bytes {
+            crate::interpreters::eval_ops(
+                TensorOps::zeros(Dtype::F32, shape).step(), gpu,
+            ).await.expect("zeros 块")
+        }
+        let of = |b: crate::contract::Bytes, shape: Vec<usize>| {
+            TensorOps::of_block(b.id, Dtype::F32, shape)
+        };
+        let cq = mk(gpu, vec![slots_n, key_dim, 3]).await;
+        let ck = mk(gpu, vec![slots_n, key_dim, 3]).await;
+        let cv = mk(gpu, vec![slots_n, value_dim, 3]).await;
+        let rc = mk(gpu, vec![slots_n, nv, hkd, hvd]).await;
+        GdnBuffers {
+            conv_q: of(cq, vec![slots_n, key_dim, 3]),
+            conv_k: of(ck, vec![slots_n, key_dim, 3]),
+            conv_v: of(cv, vec![slots_n, value_dim, 3]),
+            rec: of(rc, vec![slots_n, nv, hkd, hvd]),
+            slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot])),
+        }
+    }
+
+    /// 读回 f32 块(Block 叶 eval 零操作直取)
+    async fn read_f32_block(gpu: &mut owl_cuda::GpuClient, blk: &TensorOps, n: usize) -> Vec<f32> {
+        let b = crate::interpreters::eval_ops(blk.step(), gpu).await.expect("block 叶");
+        let mut buf = vec![0u8; n * 4];
+        gpu.dtoh(&b, &mut buf).await.expect("dtoh");
+        buf.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    /// 批P3 验收:T=8 prefill 块 == T×decode 逐步(输出 + conv/rec 终态;
+    /// 语义定义 = pf1-port-design §二 2.2)
+    #[tokio::test]
+    async fn gpu_gdn_prefill_block_matches_token_loop() {
+        if !gpu_enabled() { eprintln!("skip"); return; }
+        let (nk, hkd, nv, hvd, hidden) = (2usize, 4usize, 2usize, 4usize, 6usize);
+        let t_len = 8usize;
+        let slot = 2.0f32;
+        let key_dim = nk * hkd;
+        let value_dim = nv * hvd;
+        let q = |v: &[f32]| -> Vec<f32> { v.iter().map(|f| half::f16::from_f32(*f).to_f32()).collect() };
+
+        let layer = GatedDeltaNet::new(nk, hkd, nv, hvd, hidden, 1e-6);
+        let src: std::collections::HashMap<String, Vec<f32>> =
+            crate::layers::gdn::fixture::weights(nk, hkd, nv, hvd, hidden)
+                .into_iter()
+                .enumerate()
+                .map(|(i, (k, n))| (k, crate::layers::gdn::fixture::gen(n, 10.0 + i as f32)))
+                .collect();
+
+        let mut gpu = gpu_client().await;
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1 };
+        crate::interpreters::eval_load(&layer, &mut gpu, &src, &lctx)
+            .await
+            .expect("层 f16 装载");
+
+        let mut ref_buf = zero_gdn_bufs(&mut gpu, 4, key_dim, value_dim, nv, hkd, hvd, slot).await;
+        let pre_buf = zero_gdn_bufs(&mut gpu, 4, key_dim, value_dim, nv, hkd, hvd, slot).await;
+
+        // 输入(f16 位型量化后的 f32,host/device 逐位一致)
+        let xs_f32: Vec<f32> = q(
+            &(0..t_len * hidden).map(|i| ((i as f32) * 0.37 - 1.0).sin()).collect::<Vec<_>>(),
+        );
+
+        // 参考:T 次 decode 步(行 t 单独;state 跨步持久于 ref_buf 块)
+        let mut ref_outs = Vec::new();
+        for t in 0..t_len {
+            let x_t = TensorOps::from_host(
+                Dtype::F16,
+                vec![1, hidden],
+                &hbytes(&xs_f32[t * hidden..(t + 1) * hidden]),
+            );
+            let decl = layer.forward(&x_t, &ForwardCtx::gdn_decode(1, &ref_buf));
+            ref_outs.push(crate::testkit::harvest_f16(&mut gpu, &decl).await);
+        }
+
+        // 被测:一次 prefill 块(T=8;slot 恒 gdn_slot)
+        let xs_all = TensorOps::from_host(Dtype::F16, vec![t_len, hidden], &hbytes(&xs_f32));
+        let gdn_slot = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot]));
+        let decl_all = layer.forward(&xs_all, &ForwardCtx::gdn_prefill(t_len, &pre_buf, &gdn_slot));
+        let out_all = crate::testkit::harvest_f16(&mut gpu, &decl_all).await;
+
+        // 输出对拍(行独立;层输出 [T, hidden] 过 out_proj,f16 链 2e-2 rel)
+        for t in 0..t_len {
+            assert_close_rel(
+                &out_all[t * hidden..(t + 1) * hidden],
+                &ref_outs[t],
+                2e-2,
+                &format!("prefill 行{t}"),
+            );
+        }
+
+        // 终态对拍(conv 三段 + rec;f32 块,同核同形 → 1e-3 rel)
+        for (name, a, b, n) in [
+            ("conv_q", &ref_buf.conv_q, &pre_buf.conv_q, 4 * key_dim * 3),
+            ("conv_k", &ref_buf.conv_k, &pre_buf.conv_k, 4 * key_dim * 3),
+            ("conv_v", &ref_buf.conv_v, &pre_buf.conv_v, 4 * value_dim * 3),
+            ("rec", &ref_buf.rec, &pre_buf.rec, 4 * nv * hkd * hvd),
+        ] {
+            let ga = read_f32_block(&mut gpu, a, n).await;
+            let gb = read_f32_block(&mut gpu, b, n).await;
+            assert_close_rel(&ga, &gb, 1e-3, &format!("prefill 终态 {name}"));
+        }
+        gpu.close().await.expect("server 关机");
+    }
+
+    /// 批P3(f32 锚链变体):模型 fixture 走 f32 链 —— 展开的 f32 核路
+    /// 同样必须满足「块 == 逐步」(f16 变体已证,此处证 dtype 路由)
+    #[tokio::test]
+    async fn gpu_gdn_prefill_block_matches_token_loop_f32() {
+        if !gpu_enabled() { eprintln!("skip"); return; }
+        let (nk, hkd, nv, hvd, hidden) = (2usize, 4usize, 2usize, 4usize, 6usize);
+        let t_len = 8usize;
+        let slot = 2.0f32;
+        let key_dim = nk * hkd;
+        let value_dim = nv * hvd;
+
+        let layer = GatedDeltaNet::new(nk, hkd, nv, hvd, hidden, 1e-6);
+        let src: std::collections::HashMap<String, Vec<f32>> =
+            crate::layers::gdn::fixture::weights(nk, hkd, nv, hvd, hidden)
+                .into_iter()
+                .enumerate()
+                .map(|(i, (k, n))| (k, crate::layers::gdn::fixture::gen(n, 10.0 + i as f32)))
+                .collect();
+
+        let mut gpu = gpu_client().await;
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F32, shard: 1 };
+        crate::interpreters::eval_load(&layer, &mut gpu, &src, &lctx)
+            .await
+            .expect("层 f32 装载");
+
+        let mut ref_buf = zero_gdn_bufs(&mut gpu, 4, key_dim, value_dim, nv, hkd, hvd, slot).await;
+        let pre_buf = zero_gdn_bufs(&mut gpu, 4, key_dim, value_dim, nv, hkd, hvd, slot).await;
+
+        let xs_f32: Vec<f32> =
+            (0..t_len * hidden).map(|i| ((i as f32) * 0.37 - 1.0).sin()).collect::<Vec<_>>();
+
+        let mut ref_outs = Vec::new();
+        for t in 0..t_len {
+            let x_t = TensorOps::from_host(
+                Dtype::F32,
+                vec![1, hidden],
+                &f32b(&xs_f32[t * hidden..(t + 1) * hidden]),
+            );
+            let decl = layer.forward(&x_t, &ForwardCtx::gdn_decode(1, &ref_buf));
+            ref_outs.push(crate::testkit::harvest(&mut gpu, &decl).await);
+        }
+
+        let xs_all = TensorOps::from_host(Dtype::F32, vec![t_len, hidden], &f32b(&xs_f32));
+        let gdn_slot = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot]));
+        let decl_all = layer.forward(&xs_all, &ForwardCtx::gdn_prefill(t_len, &pre_buf, &gdn_slot));
+        let out_all = crate::testkit::harvest(&mut gpu, &decl_all).await;
+
+        for t in 0..t_len {
+            assert_close_rel(
+                &out_all[t * hidden..(t + 1) * hidden],
+                &ref_outs[t],
+                1e-5,
+                &format!("prefill-f32 行{t}"),
+            );
+        }
+
+        for (name, a, b, n) in [
+            ("conv_q", &ref_buf.conv_q, &pre_buf.conv_q, 4 * key_dim * 3),
+            ("conv_k", &ref_buf.conv_k, &pre_buf.conv_k, 4 * key_dim * 3),
+            ("conv_v", &ref_buf.conv_v, &pre_buf.conv_v, 4 * value_dim * 3),
+            ("rec", &ref_buf.rec, &pre_buf.rec, 4 * nv * hkd * hvd),
+        ] {
+            let ga = read_f32_block(&mut gpu, a, n).await;
+            let gb = read_f32_block(&mut gpu, b, n).await;
+            assert_close_rel(&ga, &gb, 1e-5, &format!("prefill-f32 终态 {name}"));
+        }
+        gpu.close().await.expect("server 关机");
+    }
+
+    /// 批P6 验收:T=64 批核 == 64×decode 逐步 + 耗时记账(§六:批核节点
+    /// 坍缩 → GPU-bound;此处实测回填)
+    #[tokio::test]
+    async fn gpu_gdn_prefill_t64_batch_vs_loop() {
+        if !gpu_enabled() { eprintln!("skip"); return; }
+        let (nk, hkd, nv, hvd, hidden) = (2usize, 4usize, 2usize, 4usize, 6usize);
+        let t_len = 64usize;
+        let slot = 1.0f32;
+        let key_dim = nk * hkd;
+        let value_dim = nv * hvd;
+        let q = |v: &[f32]| -> Vec<f32> { v.iter().map(|f| half::f16::from_f32(*f).to_f32()).collect() };
+
+        let layer = GatedDeltaNet::new(nk, hkd, nv, hvd, hidden, 1e-6);
+        let src: std::collections::HashMap<String, Vec<f32>> =
+            crate::layers::gdn::fixture::weights(nk, hkd, nv, hvd, hidden)
+                .into_iter()
+                .enumerate()
+                .map(|(i, (k, n))| (k, crate::layers::gdn::fixture::gen(n, 10.0 + i as f32)))
+                .collect();
+
+        let mut gpu = gpu_client().await;
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1 };
+        crate::interpreters::eval_load(&layer, &mut gpu, &src, &lctx)
+            .await
+            .expect("层 f16 装载");
+
+        let mut ref_buf = zero_gdn_bufs(&mut gpu, 4, key_dim, value_dim, nv, hkd, hvd, slot).await;
+        let pre_buf = zero_gdn_bufs(&mut gpu, 4, key_dim, value_dim, nv, hkd, hvd, slot).await;
+
+        let xs_f32: Vec<f32> = q(
+            &(0..t_len * hidden).map(|i| ((i as f32) * 0.37 - 1.0).sin()).collect::<Vec<_>>(),
+        );
+
+        // 参考:64×decode 逐步(计时)
+        let t0 = std::time::Instant::now();
+        let mut ref_outs = Vec::new();
+        for t in 0..t_len {
+            let x_t = TensorOps::from_host(
+                Dtype::F16,
+                vec![1, hidden],
+                &hbytes(&xs_f32[t * hidden..(t + 1) * hidden]),
+            );
+            let decl = layer.forward(&x_t, &ForwardCtx::gdn_decode(1, &ref_buf));
+            ref_outs.push(crate::testkit::harvest_f16(&mut gpu, &decl).await);
+        }
+        let dt_loop = t0.elapsed();
+
+        // 被测:一次 prefill 批核 T=64(计时)
+        let xs_all = TensorOps::from_host(Dtype::F16, vec![t_len, hidden], &hbytes(&xs_f32));
+        let gdn_slot = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot]));
+        let t1 = std::time::Instant::now();
+        let decl_all = layer.forward(&xs_all, &ForwardCtx::gdn_prefill(t_len, &pre_buf, &gdn_slot));
+        let out_all = crate::testkit::harvest_f16(&mut gpu, &decl_all).await;
+        let dt_batch = t1.elapsed();
+
+        for t in 0..t_len {
+            assert_close_rel(
+                &out_all[t * hidden..(t + 1) * hidden],
+                &ref_outs[t],
+                2e-2,
+                &format!("prefill-t64 行{t}"),
+            );
+        }
+        eprintln!(
+            "[t64 记账] 展开等价步循环 {dt_loop:.1?} vs 批核 {dt_batch:.1?}(含 host dispatch;批核节点 ~25 vs 10T+62)"
+        );
+        // 终态锚(conv + rec)
+        for (name, a, b, n) in [
+            ("conv_q", &ref_buf.conv_q, &pre_buf.conv_q, 4 * key_dim * 3),
+            ("rec", &ref_buf.rec, &pre_buf.rec, 4 * nv * hkd * hvd),
+        ] {
+            let ga = read_f32_block(&mut gpu, a, n).await;
+            let gb = read_f32_block(&mut gpu, b, n).await;
+            assert_close_rel(&ga, &gb, 1e-3, &format!("t64 终态 {name}"));
+        }
+        gpu.close().await.expect("server 关机");
     }
 
     /// (工单 G-1)gating g 臂:g = -exp(A_log)·softplus(a + dt_bias)

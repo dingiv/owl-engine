@@ -30,4 +30,6 @@ pub mod text {
     pub const ATTENTION_F32: &str = include_str!("../cu/text/attention.cu");
     /// GDN 线性注意力(gating g 臂;后续批:l2norm/conv_upd/delta_dec/norm_act)
     pub const GDN_F32: &str = include_str!("../cu/text/gdn.cu");
+    /// PF1a 栈核(concat_rows;arity 8,展开路径测试锚专用)
+    pub const CONCAT_F32: &str = include_str!("../cu/text/concat.cu");
 }

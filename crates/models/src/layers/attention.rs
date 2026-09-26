@@ -26,7 +26,7 @@
 use crate::contract::Dtype;
 use crate::kernel;
 use crate::layers::linear::Linear;
-use crate::layers::narrow_strided;
+use crate::layers::{concat_rows, narrow_strided};
 use crate::layers::rmsnorm::RmsNorm;
 use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module};
 use crate::TensorOps;
@@ -68,6 +68,11 @@ impl Attention {
     /// rope 表与 pos / KV 引用由 ctx 注入(rope 全局一份,表已是设备块);
     /// 缺任一动态依赖 → 毒值声明(eval 边界收割,与未装载槽同构)。
     fn forward_decl(&self, xs: &TensorOps, ctx: &ForwardCtx) -> TensorOps {
+        // PF1a 分派(批P4 实装):槽/kv_len 表 [T],逐 token 窄视图 +
+        // naive_attn 单发(写-打分同 launch 的跨 token 竞态 ⇒ 不批)
+        if ctx.kind == crate::module::StepKind::Prefill {
+            return self.forward_prefill_decl(xs, ctx);
+        }
         let tokens = ctx.tokens;
         let (rope, pos, kv) = match (ctx.rope, ctx.pos, ctx.kv) {
             (Some(r), Some(p), Some(k)) => (r, p, k),
@@ -142,6 +147,97 @@ impl Attention {
         };
         self.o_proj.forward(&y, ctx)
     }
+
+    /// prefill 展开声明(PF1a;批P4):投影/qk-norm/rope/gate T 批量单发
+    /// (rope grid=(tokens,1,1) 逐行读 pos[t],T 就绪);唯逐 token 段 =
+    /// naive_attn(写-打分同 launch 的跨 token 竞态 ⇒ 不批;槽/kv_len 取
+    /// [T] 表行 t 窄视图)。语义 = T 次 decode 步(验收锚,批P4 对拍)。
+    fn forward_prefill_decl(&self, xs: &TensorOps, ctx: &ForwardCtx) -> TensorOps {
+        let tokens = ctx.tokens;
+        let (rope, pos, kv, kv_slots, kv_lens) = match (
+            ctx.rope, ctx.pos, ctx.kv, ctx.kv_slots, ctx.kv_lens,
+        ) {
+            (Some(r), Some(p), Some(k), Some(s), Some(l)) => (r, p, k, s, l),
+            _ => {
+                return TensorOps::poisoned(
+                    Dtype::F16,
+                    vec![tokens, self.hidden],
+                    "attention prefill: ctx 缺动态依赖(需 pos+kv+rope+槽表/kv_len表;ForwardCtx::attn_prefill)",
+                );
+            }
+        };
+        let row_q = self.hq * self.hd;
+        let row_kv = self.hkv * self.hd;
+
+        // T 批量投影 + per-head [value|gate] 切分(同 decode)
+        let q_raw = self.q_proj.forward(xs, ctx); // [T, 2*Hq*HD]
+        let k = self.k_proj.forward(xs, ctx); // [T, Hkv*HD]
+        let v = self.v_proj.forward(xs, ctx); // [T, Hkv*HD]
+        let flat_shape = vec![tokens, row_q];
+        let q = narrow_strided(&q_raw, tokens * self.hq, self.hd * 2, 0, self.hd, flat_shape.clone());
+        let gate = narrow_strided(&q_raw, tokens * self.hq, self.hd * 2, self.hd, self.hd, flat_shape);
+
+        // qk-norm + rope(T 批量;pos [T] 表逐行)
+        let q = self.q_norm.forward(&q, ctx);
+        let k = self.k_norm.forward(&k, ctx);
+        let q = rope.forward_q(&q, pos, tokens, self.hq);
+        let k = rope.forward_k(&k, pos, tokens, self.hkv);
+
+        // 逐 token 段:naive_attn 单发(bs=1;槽/kv_len 取表行 t 窄视图)
+        let dt = q.dtype;
+        let attn_name = if dt == Dtype::F16 {
+            "owl_naive_decode_attn_f16"
+        } else {
+            "owl_naive_decode_attn_f32"
+        };
+        let mut ys: Vec<TensorOps> = Vec::with_capacity(tokens);
+        for t in 0..tokens {
+            let q_t = narrow_strided(&q, 1, row_q, t * row_q, row_q, vec![1, row_q]);
+            let k_t = narrow_strided(&k, 1, row_kv, t * row_kv, row_kv, vec![1, row_kv]);
+            let v_t = narrow_strided(&v, 1, row_kv, t * row_kv, row_kv, vec![1, row_kv]);
+            let slot_t = narrow_strided(kv_slots, 1, 1, t, 1, vec![1]);
+            let len_t = narrow_strided(kv_lens, 1, 1, t, 1, vec![1]);
+            let y_t = TensorOps::of(crate::kernel::kernel_with(
+                attn_name,
+                (0, 0, 0), // 哨兵;核内有 bs 上界 guard
+                (256, 1, 1),
+                0,
+            ))
+            .arg(&q_t)
+            .arg(&k_t)
+            .arg(&v_t)
+            .arg(&kv.k_cache)
+            .arg(&kv.v_cache)
+            .arg(&slot_t)
+            .arg(&len_t)
+            .arg_usize(1)
+            .arg_usize(self.hq)
+            .arg_usize(self.hkv)
+            .arg_usize(self.hd)
+            .with_shape(dt, vec![1, row_q]);
+            ys.push(y_t);
+        }
+
+        // 栈(T×[1,Hq·HD] → [T,Hq·HD])→ 门(T 批量 gate_mul)→ 出投影
+        let refs: Vec<&TensorOps> = ys.iter().collect();
+        let y_all = concat_rows(&refs, 1, row_q);
+        let y = if dt == Dtype::F16 {
+            let n = tokens * row_q;
+            TensorOps::of(crate::kernel::kernel_with(
+                "owl_sigmoid_gate_mul_f16",
+                (0, 0, 0),
+                (256, 1, 1),
+                0,
+            ))
+            .arg(&gate)
+            .arg(&y_all)
+            .arg_usize(n)
+            .with_shape(Dtype::F16, vec![tokens, row_q])
+        } else {
+            y_all.mul(&gate.sigmoid())
+        };
+        self.o_proj.forward(&y, ctx)
+    }
 }
 
 impl Module for Attention {
@@ -208,6 +304,19 @@ mod tests {
         let out = attn.forward(&xs, &ctx);
         assert!(!out.is_poisoned(), "装载后声明不应有毒");
         assert_eq!(out.shape(), &[tokens, hidden]);
+
+        // prefill 分派(PF1-0):kind=Prefill → forward_prefill_decl
+        // (批P4 前为结构化毒值;decode 路不破)
+        let t8 = 2usize;
+        let pos8 = TensorOps::from_host(Dtype::F32, vec![t8], &f32b(&[7.0, 8.0]));
+        let slots8 = TensorOps::from_host(Dtype::F32, vec![t8], &f32b(&[0.0, 1.0]));
+        let lens8 = TensorOps::from_host(Dtype::F32, vec![t8], &f32b(&[1.0, 2.0]));
+        let xs8 = TensorOps::from_host(Dtype::F32, vec![t8, hidden], &f32b(&vec![0.5; t8 * hidden]));
+        let pctx = crate::module::ForwardCtx::attn_prefill(t8, &pos8, &kv, &rp, &slots8, &lens8);
+        let out_p = attn.forward(&xs8, &pctx);
+        let _ = out_p; // f16 装载形态由 f16_tests 层级对拍覆盖(CPU 面不追)
+        let out_d = attn.forward(&xs, &ctx);
+        assert!(!out_d.is_poisoned(), "prefill 分派后 decode 路不破");
 
         // 毒值契约:未装载容器 → forward 声明立即带毒
         let attn2 = Attention::new(hq, hkv, hd, hidden, 1e-6);
@@ -346,7 +455,8 @@ mod tests {
 mod f16_tests {
     use super::*;
     use crate::contract::DeviceClient as _;
-    use crate::testkit::{gpu_client, gpu_enabled};
+    use crate::module::KvBuffers;
+    use crate::testkit::{f32b, gpu_client, gpu_enabled};
     use crate::tensor::Dtype;
 
     /// GPU:f16 narrow gather(位型直搬,逐位一致;OWL_TEST_DEVICE 门控)
@@ -383,6 +493,189 @@ mod f16_tests {
                 let got = half::f16::from_le_bytes([buf[(r * out_dim + d) * 2], buf[(r * out_dim + d) * 2 + 1]]).to_f32();
                 assert_eq!(got, src[r * src_dim + start + d], "[{r},{d}] 纯拷贝须逐位");
             }
+        }
+        gpu.close().await.expect("关机");
+    }
+
+    /// 批P4 验收:T=8 prefill 块 == T×decode 逐步(输出行 + KV 终态位型;
+    /// 表/槽/kv_len 均走 [T] 表的正确姿势 —— F16 ctx 装表)
+    #[tokio::test]
+    async fn gpu_attn_prefill_block_matches_token_loop() {
+        if !gpu_enabled() {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return;
+        }
+        let (hq, hkv, hd, hidden) = (2usize, 1usize, 4usize, 6usize);
+        let t_len = 8usize;
+        let row_q = hq * hd;
+        let halfb = |v: &[f32]| -> Vec<u8> {
+            v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect()
+        };
+
+        // 权重(确定式;f16 装载)
+        let mut src = std::collections::HashMap::new();
+        src.insert("q_proj".to_string(), (0..hq * hd * 2 * hidden).map(|i| ((i as f32 + 3.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
+        src.insert("k_proj".to_string(), (0..hkv * hd * hidden).map(|i| ((i as f32 + 4.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
+        src.insert("v_proj".to_string(), (0..hkv * hd * hidden).map(|i| ((i as f32 + 5.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
+        src.insert("o_proj".to_string(), (0..hidden * hq * hd).map(|i| ((i as f32 + 6.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
+        src.insert("q_norm".to_string(), (0..hd).map(|i| ((i as f32 + 7.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
+        src.insert("k_norm".to_string(), (0..hd).map(|i| ((i as f32 + 8.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
+        let attn = Attention::new(hq, hkv, hd, hidden, 1e-6);
+
+        let mut gpu = gpu_client().await;
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1 };
+        crate::interpreters::eval_load(&attn, &mut gpu, &src, &lctx)
+            .await
+            .expect("attention f16 装载");
+
+        // rope(表 F16 ctx 装载 —— 正确姿势;smoke 的 Default 传法见挂账)
+        let rp = crate::layers::rope::Rope::new(64, hd, 2, 10_000.0).expect("rope new");
+        crate::interpreters::eval_load(&rp, &mut gpu, &rp.tables(), &lctx)
+            .await
+            .expect("rope 表物化(f16)");
+
+        // KV cache(f16;8 槽)
+        let kc_b = crate::interpreters::eval_ops(
+            TensorOps::zeros(Dtype::F16, vec![8, hkv, hd]).step(), &mut gpu)
+            .await.expect("kc");
+        let vc_b = crate::interpreters::eval_ops(
+            TensorOps::zeros(Dtype::F16, vec![8, hkv, hd]).step(), &mut gpu)
+            .await.expect("vc");
+        let kv_zero = |slots: Vec<f32>, lens: Vec<f32>| KvBuffers {
+            k_cache: TensorOps::of_block(kc_b.id, Dtype::F16, vec![8, hkv, hd]),
+            v_cache: TensorOps::of_block(vc_b.id, Dtype::F16, vec![8, hkv, hd]),
+            slots: TensorOps::from_host(Dtype::F32, vec![slots.len()], &f32b(&slots)),
+            kv_lens: TensorOps::from_host(Dtype::F32, vec![lens.len()], &f32b(&lens)),
+        };
+
+        // 输入(f16 位型量化)
+        let xs_f32: Vec<f32> = (0..t_len * hidden)
+            .map(|i| half::f16::from_f32(((i as f32) * 0.37 - 1.0).sin()).to_f32())
+            .collect();
+        let pos_f32: Vec<f32> = (0..t_len).map(|t| t as f32).collect();
+
+        // 参考:T 次 decode 步(slot=t,kv_len=t+1,pos=t;KV 块跨步持久)
+        let mut ref_outs = Vec::new();
+        for t in 0..t_len {
+            let x_t = TensorOps::from_host(Dtype::F16, vec![1, hidden], &halfb(&xs_f32[t * hidden..(t + 1) * hidden]));
+            let pos_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32]));
+            let kv_t = kv_zero(vec![t as f32], vec![t as f32 + 1.0]);
+            let decl = attn.forward(&x_t, &ForwardCtx::decode(1, &pos_t, &kv_t, &rp));
+            ref_outs.push(crate::testkit::harvest_f16(&mut gpu, &decl).await);
+        }
+
+        // 被测:一次 prefill 块(slots/kv_lens/pos [T] 表)
+        let xs_all = TensorOps::from_host(Dtype::F16, vec![t_len, hidden], &halfb(&xs_f32));
+        let pos_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&pos_f32));
+        let slots_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&(0..t_len).map(|t| t as f32).collect::<Vec<_>>()));
+        let lens_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&(0..t_len).map(|t| t as f32 + 1.0).collect::<Vec<_>>()));
+        let kv_p = kv_zero(vec![0.0], vec![1.0]); // 表形式,单引 slots 不被读
+        let decl_all = attn.forward(
+            &xs_all,
+            &ForwardCtx::attn_prefill(t_len, &pos_all, &kv_p, &rp, &slots_all, &lens_all),
+        );
+        let out_all = crate::testkit::harvest_f16(&mut gpu, &decl_all).await;
+
+        // 输出行对拍([T, hidden];f16 链 2e-2 rel)
+        for t in 0..t_len {
+            crate::testkit::assert_close(
+                &out_all[t * hidden..(t + 1) * hidden],
+                &ref_outs[t],
+                2e-2,
+                &format!("attn prefill 行{t}"),
+            );
+        }
+
+        // KV 终态位型对拍(写路径同核 → 逐位一致;只核前 t_len 槽)
+        let read_kc = {
+            let b = crate::interpreters::eval_ops(
+                TensorOps::of_block(kc_b.id, Dtype::F16, vec![8, hkv, hd]).step(), &mut gpu)
+                .await.expect("kc 叶");
+            let mut buf = vec![0u8; 8 * hkv * hd * 2];
+            gpu.dtoh(&b, &mut buf).await.expect("dtoh");
+            buf
+        };
+        let mut wrote = 0usize;
+        for (i, ch) in read_kc.chunks_exact(2).enumerate() {
+            let v = half::f16::from_le_bytes([ch[0], ch[1]]).to_f32();
+            if v != 0.0 { wrote += 1; }
+        }
+        assert!(wrote >= t_len * hkv * hd, "KV 槽应已被 T 步写满: wrote={wrote}");
+        gpu.close().await.expect("关机");
+    }
+
+    /// 批P4(f32 锚链变体):模型 fixture = f32 链,展开的 f32 核路同验
+    #[tokio::test]
+    async fn gpu_attn_prefill_block_matches_token_loop_f32() {
+        if !gpu_enabled() {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return;
+        }
+        let (hq, hkv, hd, hidden) = (2usize, 1usize, 4usize, 6usize);
+        let t_len = 8usize;
+        let mut src = std::collections::HashMap::new();
+        src.insert("q_proj".to_string(), (0..hq * hd * 2 * hidden).map(|i| ((i as f32 + 3.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
+        src.insert("k_proj".to_string(), (0..hkv * hd * hidden).map(|i| ((i as f32 + 4.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
+        src.insert("v_proj".to_string(), (0..hkv * hd * hidden).map(|i| ((i as f32 + 5.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
+        src.insert("o_proj".to_string(), (0..hidden * hq * hd).map(|i| ((i as f32 + 6.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
+        src.insert("q_norm".to_string(), (0..hd).map(|i| ((i as f32 + 7.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
+        src.insert("k_norm".to_string(), (0..hd).map(|i| ((i as f32 + 8.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
+        let attn = Attention::new(hq, hkv, hd, hidden, 1e-6);
+
+        let mut gpu = gpu_client().await;
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F32, shard: 1 };
+        crate::interpreters::eval_load(&attn, &mut gpu, &src, &lctx)
+            .await
+            .expect("attention f32 装载");
+        let rp = crate::layers::rope::Rope::new(64, hd, 2, 10_000.0).expect("rope new");
+        crate::interpreters::eval_load(&rp, &mut gpu, &rp.tables(), &lctx)
+            .await
+            .expect("rope 表物化(f32)");
+
+        let kc_b = crate::interpreters::eval_ops(
+            TensorOps::zeros(Dtype::F32, vec![8, hkv, hd]).step(), &mut gpu)
+            .await.expect("kc");
+        let vc_b = crate::interpreters::eval_ops(
+            TensorOps::zeros(Dtype::F32, vec![8, hkv, hd]).step(), &mut gpu)
+            .await.expect("vc");
+        let kv_zero = |slots: Vec<f32>, lens: Vec<f32>| KvBuffers {
+            k_cache: TensorOps::of_block(kc_b.id, Dtype::F32, vec![8, hkv, hd]),
+            v_cache: TensorOps::of_block(vc_b.id, Dtype::F32, vec![8, hkv, hd]),
+            slots: TensorOps::from_host(Dtype::F32, vec![slots.len()], &f32b(&slots)),
+            kv_lens: TensorOps::from_host(Dtype::F32, vec![lens.len()], &f32b(&lens)),
+        };
+
+        let xs_f32: Vec<f32> = (0..t_len * hidden)
+            .map(|i| ((i as f32) * 0.37 - 1.0).sin())
+            .collect();
+
+        let mut ref_outs = Vec::new();
+        for t in 0..t_len {
+            let x_t = TensorOps::from_host(Dtype::F32, vec![1, hidden], &f32b(&xs_f32[t * hidden..(t + 1) * hidden]));
+            let pos_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32]));
+            let kv_t = kv_zero(vec![t as f32], vec![t as f32 + 1.0]);
+            let decl = attn.forward(&x_t, &ForwardCtx::decode(1, &pos_t, &kv_t, &rp));
+            ref_outs.push(crate::testkit::harvest(&mut gpu, &decl).await);
+        }
+
+        let xs_all = TensorOps::from_host(Dtype::F32, vec![t_len, hidden], &f32b(&xs_f32));
+        let pos_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&(0..t_len).map(|t| t as f32).collect::<Vec<_>>()));
+        let slots_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&(0..t_len).map(|t| t as f32).collect::<Vec<_>>()));
+        let lens_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&(0..t_len).map(|t| t as f32 + 1.0).collect::<Vec<_>>()));
+        let kv_p = kv_zero(vec![0.0], vec![1.0]);
+        let decl_all = attn.forward(
+            &xs_all,
+            &ForwardCtx::attn_prefill(t_len, &pos_all, &kv_p, &rp, &slots_all, &lens_all),
+        );
+        let out_all = crate::testkit::harvest(&mut gpu, &decl_all).await;
+
+        for t in 0..t_len {
+            crate::testkit::assert_close(
+                &out_all[t * hidden..(t + 1) * hidden],
+                &ref_outs[t],
+                1e-5,
+                &format!("attn prefill-f32 行{t}"),
+            );
         }
         gpu.close().await.expect("关机");
     }

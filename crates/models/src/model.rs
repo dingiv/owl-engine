@@ -124,12 +124,16 @@ impl Model {
     ) -> ForwardCtx<'a> {
         ForwardCtx {
             tokens: ctx.tokens,
+            kind: ctx.kind,
             pos: ctx.pos,
             kv: ctx.kvs.and_then(|s| s.get(kvi)),
             rope: ctx.rope,
             gdn: ctx.gdns.and_then(|s| s.get(gi)),
             kvs: None,
             gdns: None,
+            kv_slots: ctx.kv_slots,
+            kv_lens: ctx.kv_lens,
+            gdn_slot: ctx.gdn_slot,
         }
     }
 
@@ -211,6 +215,12 @@ mod tests {
     const MAX_SLOTS: usize = 4;
     const KV_ROWS: usize = 8;
 
+    /// 层型单一来源(spec / checkpoint_src / HostModel 三处共用;
+    /// 二分批改这里)
+    fn layer_pattern() -> Vec<bool> {
+        vec![false, false, false, true] // G,G,G,F
+    }
+
     fn spec() -> ModelSpec {
         ModelSpec {
             vocab: VOCAB,
@@ -220,7 +230,7 @@ mod tests {
             full_heads: (HQ, HKV, HD),
             gdn_heads: (NK, HK_DIM, NV, HV_DIM),
             eps: EPS,
-            layer_types: vec![false, false, false, true], // G,G,G,F
+            layer_types: layer_pattern(),
             tokenizer: crate::tokenizer::TokenizerSpec {
                 eos_tokens: vec!["<|endoftext|>"],
                 chat: crate::tokenizer::ChatFormat {
@@ -243,13 +253,14 @@ mod tests {
             m.insert(k, gen(seed, n));
         };
         put(format!("{base}.embed_tokens.weight"), VOCAB * HIDDEN, 100.0);
-        for i in 0..4 {
+        let pat = layer_pattern();
+        for i in 0..pat.len() {
             let mut p = |k: &str, n: usize, seed: f32| {
                 put(format!("{base}.layers.{i}.{k}.weight"), n, seed);
             };
             p("input_layernorm", HIDDEN, 1.0 + i as f32);
             p("post_attention_layernorm", HIDDEN, 2.0 + i as f32);
-            if i < 3 {
+            if !pat[i] {
                 // GDN 层
                 let key_dim = NK * HK_DIM;
                 let value_dim = NV * HV_DIM;
@@ -354,8 +365,9 @@ mod tests {
         fn new(src: HashMap<String, Vec<f32>>) -> Self {
             let key_dim = NK * HK_DIM;
             let value_dim = NV * HV_DIM;
-            let ngdn = 3;
-            let nfull = 1;
+            let pat = layer_pattern();
+            let ngdn = pat.iter().filter(|f| !**f).count();
+            let nfull = pat.len() - ngdn;
             HostModel {
                 gdn_conv: (0..ngdn)
                     .map(|_| {
@@ -569,17 +581,23 @@ mod tests {
 
         /// 一步 decode(bs=1):ids/pos/slot/kv_len → logits [VOCAB]
         fn step(&mut self, id: f32, pos: f32, slot: usize, kv_len: usize) -> Vec<f32> {
+            self.step2(id, pos, slot, kv_len, slot)
+        }
+
+        /// kv_slot / gdn_slot 分离(单序列 prefill 对拍:KV 行随 token 走,
+        /// GDN 状态格恒定;旧双参 step 保留 = 两槽同值的两 token 语义)
+        fn step2(&mut self, id: f32, pos: f32, kv_slot: usize, kv_len: usize, gdn_slot: usize) -> Vec<f32> {
             let w = self.src["model.language_model.embed_tokens.weight"].clone();
             let mut x = w[(id as usize) * HIDDEN..(id as usize + 1) * HIDDEN].to_vec();
             let (mut kvi, mut gi) = (0usize, 0usize);
-            for (i, full) in [false, false, false, true].iter().enumerate() {
+            for (i, full) in layer_pattern().iter().enumerate() {
                 let ln1 = self.ln(&x, self.s(i, "input_layernorm"));
                 let mixed = if *full {
-                    let m = self.attn(kvi, i, &ln1, pos, slot, kv_len);
+                    let m = self.attn(kvi, i, &ln1, pos, kv_slot, kv_len);
                     kvi += 1;
                     m
                 } else {
-                    let m = self.gdn(gi, i, &ln1, slot);
+                    let m = self.gdn(gi, i, &ln1, gdn_slot);
                     gi += 1;
                     m
                 };
@@ -688,6 +706,125 @@ mod tests {
             let got = crate::testkit::harvest(&mut gpu, &logits).await;
             let want = host.step(id, pos, slot as usize, kv_len as usize);
             assert_close(&got, &want, 1e-4, &format!("model-step{si}"));
+        }
+        gpu.close().await.expect("关机");
+    }
+
+    /// 常驻缓冲一套(full 1 KV + gdn 3 状态;全零起步)
+    async fn model_bufs(gpu: &mut owl_cuda::GpuClient, n_full: usize, n_gdn: usize) -> (Vec<KvBuffers>, Vec<GdnBuffers>) {
+        let kv_zero = vec![0.0f32; KV_ROWS * HKV * HD];
+        let mut kvs = Vec::new();
+        for _ in 0..n_full {
+            kvs.push(KvBuffers {
+                k_cache: zero_block(gpu, kv_zero.len(), vec![KV_ROWS, HKV, HD]).await,
+                v_cache: zero_block(gpu, kv_zero.len(), vec![KV_ROWS, HKV, HD]).await,
+                slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
+                kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0])),
+            });
+        }
+        let key_dim = NK * HK_DIM;
+        let value_dim = NV * HV_DIM;
+        let mut gdns = Vec::new();
+        for _ in 0..n_gdn {
+            gdns.push(GdnBuffers {
+                conv_q: zero_block(gpu, MAX_SLOTS * key_dim * 3, vec![MAX_SLOTS, key_dim, 3]).await,
+                conv_k: zero_block(gpu, MAX_SLOTS * key_dim * 3, vec![MAX_SLOTS, key_dim, 3]).await,
+                conv_v: zero_block(gpu, MAX_SLOTS * value_dim * 3, vec![MAX_SLOTS, value_dim, 3]).await,
+                rec: zero_block(gpu, MAX_SLOTS * NV * HK_DIM * HV_DIM, vec![MAX_SLOTS, NV, HK_DIM, HV_DIM]).await,
+                slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
+            });
+        }
+        (kvs, gdns)
+    }
+
+    /// 批P5:fixture 全模 prefill T=4 块 vs host 全链 4 步(路径等价;
+    /// T ≤ MAX_SLOTS = GDN 槽位约束;真模型 T=8 见 qwen35 spec 测试)。
+    /// ⚠️ 重放律(testkit harvest 注):带状态树一次 eval 只收一个根 ——
+    /// last_hidden 与 logits 各走独立缓冲套,禁止同树双根。
+    #[tokio::test]
+    async fn gpu_model_prefill_block_matches_host_loop() {
+        if !gpu_enabled() {
+            skip_note();
+            return;
+        }
+        let t_len = 4usize;
+        let model = Model::new(&spec(), LlamaFamily::new("model.language_model"));
+        let src = checkpoint_src();
+        let mut gpu = gpu_client().await;
+        crate::interpreters::eval_load(&model, &mut gpu, &src, &Default::default())
+            .await
+            .expect("model.eval_load");
+        let rp = Rope::new(64, HD, HD, 10_000.0).expect("rope");
+        crate::interpreters::eval_load(&rp, &mut gpu, &rp.tables(), &Default::default())
+            .await
+            .expect("rope 表");
+
+        let ids: [f32; 4] = [5.0, 9.0, 3.0, 7.0];
+        let pos_of = |t: usize| TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32]));
+
+        // ── 参考:T 次 decode 步,单根 = last_hidden(缓冲套 A)──
+        let (kvs_a, gdns_a) = model_bufs(&mut gpu, 1, 3).await;
+        let mut ref_hidden: Vec<Vec<f32>> = Vec::new();
+        for t in 0..t_len {
+            let ids_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[ids[t]]));
+            let pos_t = pos_of(t);
+            let kvs_step: Vec<KvBuffers> = kvs_a
+                .iter()
+                .map(|kv| KvBuffers {
+                    k_cache: kv.k_cache.clone(),
+                    v_cache: kv.v_cache.clone(),
+                    slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32])),
+                    kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32 + 1.0])),
+                })
+                .collect();
+            // 单序列语义:GDN 状态格恒 gdn_slot(=0,与 prefill 一致);
+            // 槽随步换 = 每步新序列,状态不携带 —— 与 prefill 不可比
+            let gdns_step: Vec<GdnBuffers> = gdns_a
+                .iter()
+                .map(|g| GdnBuffers {
+                    conv_q: g.conv_q.clone(),
+                    conv_k: g.conv_k.clone(),
+                    conv_v: g.conv_v.clone(),
+                    rec: g.rec.clone(),
+                    slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
+                })
+                .collect();
+            let ctx = ForwardCtx::model_decode(1, &pos_t, &kvs_step, &rp, &gdns_step);
+            ref_hidden.push(crate::testkit::harvest(&mut gpu, &model.last_hidden(&ids_t, &ctx)).await);
+        }
+
+        // ── 被测:一次 prefill 块(缓冲套 B;单根 = last_hidden)──
+        let (kvs_b, gdns_b) = model_bufs(&mut gpu, 1, 3).await;
+        let ids_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&ids));
+        let pos_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&(0..t_len).map(|t| t as f32).collect::<Vec<_>>()));
+        let slots_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&(0..t_len).map(|t| t as f32).collect::<Vec<_>>()));
+        let lens_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&(0..t_len).map(|t| t as f32 + 1.0).collect::<Vec<_>>()));
+        let gdn_slot = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0]));
+        let ctx = ForwardCtx::model_prefill(t_len, &pos_all, &kvs_b, &rp, &gdns_b, &slots_all, &lens_all, &gdn_slot);
+        let pre_hidden = crate::testkit::harvest(&mut gpu, &model.last_hidden(&ids_all, &ctx)).await;
+        for t in 0..t_len {
+            let d: f32 = pre_hidden[t * HIDDEN..(t + 1) * HIDDEN]
+                .iter()
+                .zip(&ref_hidden[t])
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+            assert!(d < 1e-4, "prefill last_hidden 行{t} maxdiff={d}");
+        }
+
+        // ── logits 根(缓冲套 C)+ host 锚 ──
+        let (kvs_c, gdns_c) = model_bufs(&mut gpu, 1, 3).await;
+        let ctx_c = ForwardCtx::model_prefill(t_len, &pos_all, &kvs_c, &rp, &gdns_c, &slots_all, &lens_all, &gdn_slot);
+        let got_all = crate::testkit::harvest(&mut gpu, &model.forward(&ids_all, &ctx_c)).await;
+        let mut host2 = HostModel::new(checkpoint_src());
+        for t in 0..t_len {
+            let want = host2.step2(ids[t], t as f32, t, t + 1, 0);
+            eprintln!("[dbg] logits 行{t}: prefill {:?} host {:?}", &got_all[t * VOCAB..(t + 1) * VOCAB], &want);
+            assert_close(
+                &got_all[t * VOCAB..(t + 1) * VOCAB],
+                &want,
+                1e-3,
+                &format!("model-prefill 行{t}"),
+            );
         }
         gpu.close().await.expect("关机");
     }

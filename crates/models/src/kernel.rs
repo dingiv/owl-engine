@@ -129,6 +129,9 @@ pub static REGISTRY: &[Entry] = &[
     Entry { name: "owl_gdn_delta_dec_f16", source: text::GDN_F32, args: "T,T,T,T,T,T,T,sz,sz,sz,sz,sz,f32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_gdn_norm_act_f16", source: text::GDN_F32, args: "T,T,T,sz,sz,sz,f32,i32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_naive_decode_attn_f16", source: text::ATTENTION_F32, args: "T,T,T,T,T,T,T,sz,sz,sz,sz,T", dtype: crate::contract::Dtype::F16 },
+    // ---- PF1a 栈核(concat_rows;arity 8,展开路径测试锚专用)----
+    Entry { name: "owl_concat_rows_f16", source: text::CONCAT_F32, args: "T,T,T,T,T,T,T,T,sz,sz,sz,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "owl_concat_rows_f32", source: text::CONCAT_F32, args: "T,T,T,T,T,T,T,T,sz,sz,sz,T", dtype: crate::contract::Dtype::F32 },
     // ---- PF1b 批核(chunked prefill;T 循环核内,工单 G 换源)----
     Entry { name: "owl_gdn_conv_fwd_f16", source: text::GDN_F32, args: "T,T,T,T,T,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_gdn_recurrence_varlen_gqa_f16", source: text::GDN_F32, args: "T,T,T,T,T,T,T,T,sz,sz,sz,sz,sz,f32,T", dtype: crate::contract::Dtype::F16 },

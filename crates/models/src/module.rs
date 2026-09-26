@@ -22,6 +22,15 @@ use std::sync::{Arc, Mutex};
 // ============================================================================
 
 /// 每步动态依赖(forward 的 ctx;C4 定案 2026-09-26:引用注入取代
+/// 步形态(PF1-0 契约,pf1-port-design §二):decode 单 token(原地五核
+/// 单发);prefill T-token 块(三族逐 token 展开,其余算子 T 批量单发;
+/// PF1b 换批核不动层级)。现有构造器全部 = Decode。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StepKind {
+    Decode,
+    Prefill,
+}
+
 /// Copy KernelCtx —— rope 表本来就是设备块,ctx 借用 `&Rope` 零双重
 /// 所有权;字段 `TensorOps` 值形态让 runner 自选 from_host(调试)/
 /// of_block(图捕获),捕获路径不封)。
@@ -32,7 +41,10 @@ use std::sync::{Arc, Mutex};
 pub struct ForwardCtx<'a> {
     /// 本步 token 数(decode = 1;prefill = 块长)
     pub tokens: usize,
-    /// 位置(attention/GDN 用;缺省 = 依赖违约 → 层侧毒值)
+    /// 步形态(prefill 词汇见 kv_slots/kv_lens/gdn_slot)
+    pub kind: StepKind,
+    /// 位置(attention/GDN 用;decode [1] / prefill [T] 表;
+    /// 缺省 = 依赖违约 → 层侧毒值)
     pub pos: Option<&'a TensorOps>,
     /// decode KV 直排引用(attention 用;GDN state 同款随域扩)
     pub kv: Option<&'a KvBuffers>,
@@ -49,12 +61,32 @@ pub struct ForwardCtx<'a> {
     pub kvs: Option<&'a [KvBuffers]>,
     /// 整模路径:gdn 层常驻状态序列(gdn 层出现序)
     pub gdns: Option<&'a [crate::layers::gdn::GdnBuffers]>,
+    /// prefill:attention 槽表 [T] = base..base+T-1(因果:token t 占槽
+    /// base+t;decode 走 kv.slots [bs])
+    pub kv_slots: Option<&'a TensorOps>,
+    /// prefill:attention kv_len 表 [T] = past+1..past+T(窗 =
+    /// [slot−kv_len+1, slot],前位 token 槽已由前步写好)
+    pub kv_lens: Option<&'a TensorOps>,
+    /// prefill:GDN 序列状态格 [1](全块恒定;decode 走 gdn.slots [bs])
+    pub gdn_slot: Option<&'a TensorOps>,
 }
 
 impl<'a> ForwardCtx<'a> {
     /// 最小 ctx(无动态依赖;mlp/rmsnorm/linear/embedding 测试用)
     pub fn minimal(tokens: usize) -> Self {
-        Self { tokens, pos: None, kv: None, rope: None, gdn: None, kvs: None, gdns: None }
+        Self {
+            tokens,
+            kind: StepKind::Decode,
+            pos: None,
+            kv: None,
+            rope: None,
+            gdn: None,
+            kvs: None,
+            gdns: None,
+            kv_slots: None,
+            kv_lens: None,
+            gdn_slot: None,
+        }
     }
 
     /// decode 步 ctx(attention 全量动态依赖;gdn 置 None)
@@ -64,12 +96,81 @@ impl<'a> ForwardCtx<'a> {
         kv: &'a KvBuffers,
         rope: &'a Rope,
     ) -> Self {
-        Self { tokens, pos: Some(pos), kv: Some(kv), rope: Some(rope), gdn: None, kvs: None, gdns: None }
+        Self {
+            tokens,
+            kind: StepKind::Decode,
+            pos: Some(pos),
+            kv: Some(kv),
+            rope: Some(rope),
+            gdn: None,
+            kvs: None,
+            gdns: None,
+            kv_slots: None,
+            kv_lens: None,
+            gdn_slot: None,
+        }
     }
 
     /// GDN decode 步 ctx(gdn 全量;attention 依赖置 None)
     pub fn gdn_decode(tokens: usize, gdn: &'a crate::layers::gdn::GdnBuffers) -> Self {
-        Self { tokens, pos: None, kv: None, rope: None, gdn: Some(gdn), kvs: None, gdns: None }
+        Self {
+            tokens,
+            kind: StepKind::Decode,
+            pos: None,
+            kv: None,
+            rope: None,
+            gdn: Some(gdn),
+            kvs: None,
+            gdns: None,
+            kv_slots: None,
+            kv_lens: None,
+            gdn_slot: None,
+        }
+    }
+
+    /// GDN prefill ctx(PF1a):全块状态格恒 gdn_slot(单序列;T-token 块)
+    pub fn gdn_prefill(
+        tokens: usize,
+        gdn: &'a crate::layers::gdn::GdnBuffers,
+        gdn_slot: &'a TensorOps,
+    ) -> Self {
+        Self {
+            tokens,
+            kind: StepKind::Prefill,
+            pos: None,
+            kv: None,
+            rope: None,
+            gdn: Some(gdn),
+            kvs: None,
+            gdns: None,
+            kv_slots: None,
+            kv_lens: None,
+            gdn_slot: Some(gdn_slot),
+        }
+    }
+
+    /// attention prefill ctx(PF1a):槽/kv_len 表 [T] + pos [T]
+    pub fn attn_prefill(
+        tokens: usize,
+        pos: &'a TensorOps,
+        kv: &'a KvBuffers,
+        rope: &'a Rope,
+        kv_slots: &'a TensorOps,
+        kv_lens: &'a TensorOps,
+    ) -> Self {
+        Self {
+            tokens,
+            kind: StepKind::Prefill,
+            pos: Some(pos),
+            kv: Some(kv),
+            rope: Some(rope),
+            gdn: None,
+            kvs: None,
+            gdns: None,
+            kv_slots: Some(kv_slots),
+            kv_lens: Some(kv_lens),
+            gdn_slot: None,
+        }
     }
 
     /// 整模 decode 步 ctx(批8):双 mixer 序列 + 共享 pos/rope;
@@ -83,12 +184,43 @@ impl<'a> ForwardCtx<'a> {
     ) -> Self {
         Self {
             tokens,
+            kind: StepKind::Decode,
             pos: Some(pos),
             kv: None,
             rope: Some(rope),
             gdn: None,
             kvs: Some(kvs),
             gdns: Some(gdns),
+            kv_slots: None,
+            kv_lens: None,
+            gdn_slot: None,
+        }
+    }
+
+    /// 整模 prefill ctx(PF1a;批P5):单序列 T-token 块,
+    /// 槽表/kv_len 表 [T] + GDN 状态格 [1]。
+    pub fn model_prefill(
+        tokens: usize,
+        pos: &'a TensorOps,
+        kvs: &'a [KvBuffers],
+        rope: &'a Rope,
+        gdns: &'a [crate::layers::gdn::GdnBuffers],
+        kv_slots: &'a TensorOps,
+        kv_lens: &'a TensorOps,
+        gdn_slot: &'a TensorOps,
+    ) -> Self {
+        Self {
+            tokens,
+            kind: StepKind::Prefill,
+            pos: Some(pos),
+            kv: None,
+            rope: Some(rope),
+            gdn: None,
+            kvs: Some(kvs),
+            gdns: Some(gdns),
+            kv_slots: Some(kv_slots),
+            kv_lens: Some(kv_lens),
+            gdn_slot: Some(gdn_slot),
         }
     }
 }
