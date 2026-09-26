@@ -212,7 +212,9 @@ impl WeightSource for SafeTensorsSource {
     /// 流式装载主路径走 `take_range`(分块,条目保留)。
     fn take(&self, key: &str) -> Option<Vec<f32>> {
         let e = self.index.lock().unwrap().remove(key)?;
-        Some(self.convert_range(&e, 0, e.nbytes / 4))
+        // 元素数按条目真实位宽(F5 修:原 /4 硬编码对 bf16 条目
+        // 返回一半元素 —— 直转路径首次踩中;分块路径按 len 显式未暴露)
+        Some(self.convert_range(&e, 0, e.nbytes / e.esz()))
     }
 
     /// 区间转换(mmap 直读,**不移除条目** —— 分块上传同键多块重复取)

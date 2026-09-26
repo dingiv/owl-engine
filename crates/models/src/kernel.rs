@@ -255,6 +255,46 @@ mod tests {
             .map(|l| l.split("//").next().unwrap_or(""))
             .collect::<Vec<_>>()
             .join("\n");
+        // 宏展开核(F5 ops_pair):实例行 `OWL_<FAMILY>_KERNEL(<name>, <T>, PARAMS)`
+        // —— PARAMS 自带类型化形参,机器对账以实例为准(C2 不弱化)
+        for line in clean.lines() {
+            let t = line.trim();
+            if t.starts_with("OWL_") && t.contains("KERNEL(") {
+                if let Some(rest) = t.splitn(2, '(').nth(1) {
+                    let mut parts = rest.splitn(3, ',');
+                    if let Some(n) = parts.next().map(|x| x.trim()) {
+                        if n == name {
+                            let params = parts
+                                .nth(1)
+                                .and_then(|p| p.trim().strip_prefix('('))
+                                .and_then(|p| p.strip_suffix(')'))
+                                .unwrap_or("");
+                            return Some(
+                                params
+                                    .split(',')
+                                    .map(|p| {
+                                        let p = p.replace("const ", "").replace("__restrict__ ", "").trim().to_string();
+                                        if p.contains('*') {
+                                            "T".to_string()
+                                        } else if p.contains("size_t") || p.contains("unsigned long long") {
+                                            "sz".to_string()
+                                        } else if p.contains("float") {
+                                            "f32".to_string()
+                                        } else if p.contains("int") {
+                                            assert!(!p.contains("unsigned"), "{name}: 禁止 unsigned int 形参");
+                                            "i32".to_string()
+                                        } else {
+                                            panic!("{name}: 无法识别的宏形参 `{p}`(args 词表:T/sz/i32/f32)");
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(","),
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let anchor = format!("__global__ void {name}(");
         let start = clean.find(&anchor)? + anchor.len();
         let end = clean[start..].find(')')? + start;
@@ -293,7 +333,14 @@ mod tests {
             );
             // Kernel 节点路径(text/ 域四核)输出块必须末参;语义算子族
             // (lower_* 硬编码装配)out 位置随 .cu 签名,不受此限
-            if matches!(e.name, "owl_embed_f32" | "owl_rope_half_partial_f32" | "owl_narrow_strided_f32" | "owl_naive_decode_attn_f32") {
+            if matches!(
+                e.name,
+                "owl_embed_f32" | "owl_embed_f16"
+                    | "owl_rope_half_partial_f32" | "owl_rope_half_partial_f16"
+                    | "owl_narrow_strided_f32" | "owl_narrow_strided_f16"
+                    | "owl_naive_decode_attn_f32" | "owl_naive_decode_attn_f16"
+                    | "owl_sigmoid_gate_mul_f16"
+            ) {
                 assert!(e.args.ends_with("T"), "{}: Kernel 节点路径输出块必须末参", e.name);
             }
         }

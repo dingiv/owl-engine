@@ -45,6 +45,7 @@ impl OwlCublas {
 
     /// f16 GEMM:nt=true(owl Linear)C[T,n] = A[T,k]×W[m,k]^T;
     /// nt=false:C[T,n] = A[T,k]×B[k,n]。A/B/out = 设备地址(u64)。
+    /// 参数口径:m = n_out(权重行)/ n = T(token 数;cm 映射的 C 列)。
     /// fire-and-forget(排队即返回;COMPUTE 流保序)。
     pub fn gemm_f16(
         &self,
@@ -57,15 +58,23 @@ impl OwlCublas {
         nt: bool,
     ) -> Result<(), String> {
         // 行主序 → 列主序映射:out_cm[m, n] = op(b) · op(a)
-        // nt=true:B=W [m,k] rm = cm [k,m],transa=T(lda=k)→ [m,k];
-        // nt=false:B [k,n] rm = cm [n,k],transa=T(lda=n)→ [k,n]。
-        let (lda, b_ptr) = if nt { (k as i32, b) } else { (n as i32, b) };
+        // nt=true(owl Linear):B=W [m,k] rm = cm [k,m],transa=T(lda=k)→ [m,k];
+        // nt=false:B [k,n] rm = cm [n,k],transa=N(**lda=m = 特征数**——
+        //   2026-09-26 二修:原 lda=n(token)=1 < cm 行数 → INVALID_VALUE;
+        //   前版误用 T/ld=k → ILLEGAL_ADDRESS。两次都是非 nt 分支,B 操作数
+        //   的列主序重解释 cm [m,k] 的前导维 = m,不是 k 也不是 token 数)
+        let (transa, lda) = if nt {
+            (sys::cublasOperation_t::CUBLAS_OP_T, k as i32)
+        } else {
+            (sys::cublasOperation_t::CUBLAS_OP_N, m as i32)
+        };
+        let b_ptr = b; // cublas A 操作数 = 权重(nt)/B 矩阵
         let alpha: f32 = 1.0;
         let beta: f32 = 0.0;
         let r = unsafe {
             cb::gemm_ex(
                 *self.blas.handle(),
-                sys::cublasOperation_t::CUBLAS_OP_T,
+                transa,
                 sys::cublasOperation_t::CUBLAS_OP_N,
                 m as i32,
                 n as i32,

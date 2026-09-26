@@ -63,8 +63,9 @@ pub fn gating_g(
     tokens: usize,
     heads: usize,
 ) -> TensorOps {
+    let dt = a.dtype;
     TensorOps::of(kernel::kernel_with(
-        "owl_gdn_gating_g_f32",
+        gname("owl_gdn_gating_g", dt),
         (0, 0, 0),
         (256, 1, 1),
         0,
@@ -74,7 +75,7 @@ pub fn gating_g(
     .arg(dt_bias)
     .arg_usize(tokens * heads)
     .arg_usize(heads)
-    .with_shape(Dtype::F32, vec![tokens, heads])
+    .with_shape(dt, vec![tokens, heads])
 }
 
 // ============================================================================
@@ -85,8 +86,9 @@ pub fn gating_g(
 /// 行核(非哨兵):grid (rows,1,1) × block (256,1,1)。q/k 头向量归一用
 /// (decode:rows = tokens × heads,dim = head_k_dim 128;eps 1e-6)。
 pub fn l2norm(x: &TensorOps, rows: usize, dim: usize, eps: f32) -> TensorOps {
+    let dt = x.dtype;
     TensorOps::of(kernel::kernel_with(
-        "owl_gdn_l2norm_f32",
+        gname("owl_gdn_l2norm", dt),
         (rows as u32, 1, 1),
         (256, 1, 1),
         0,
@@ -95,7 +97,7 @@ pub fn l2norm(x: &TensorOps, rows: usize, dim: usize, eps: f32) -> TensorOps {
     .arg_usize(rows)
     .arg_usize(dim)
     .arg_f32(eps)
-    .with_shape(Dtype::F32, vec![rows, dim])
+    .with_shape(dt, vec![rows, dim])
 }
 
 // ============================================================================
@@ -117,8 +119,9 @@ pub fn conv_upd(
     w_offset: usize,
     silu: bool,
 ) -> TensorOps {
+    let dt = x.dtype;
     TensorOps::of(kernel::kernel_with(
-        "owl_gdn_conv_upd_f32",
+        gname("owl_gdn_conv_upd", dt),
         (0, 0, 0),
         (256, 1, 1),
         0,
@@ -131,7 +134,7 @@ pub fn conv_upd(
     .arg_usize(dim)
     .arg_usize(w_offset)
     .arg_i32(silu as i32)
-    .with_shape(Dtype::F32, vec![batch, dim])
+    .with_shape(dt, vec![batch, dim])
 }
 
 // ============================================================================
@@ -159,8 +162,9 @@ pub fn delta_dec(
     vd: usize,
     q_scale: f32,
 ) -> TensorOps {
+    let dt = v.dtype;
     TensorOps::of(kernel::kernel_with(
-        "owl_gdn_delta_dec_f32",
+        gname("owl_gdn_delta_dec", dt),
         (((vd + 63) / 64) as u32, (batch * nv) as u32, 1),
         (64, 1, 1),
         (2 * 128 + 2) * 4,
@@ -178,7 +182,7 @@ pub fn delta_dec(
     .arg_usize(kd)
     .arg_usize(vd)
     .arg_f32(q_scale)
-    .with_shape(Dtype::F32, vec![batch, nv, vd])
+    .with_shape(dt, vec![batch, nv, vd])
 }
 
 // ============================================================================
@@ -199,8 +203,9 @@ pub fn norm_act(
     eps: f32,
     act_silu: bool,
 ) -> TensorOps {
+    let dt = x.dtype;
     TensorOps::of(kernel::kernel_with(
-        "owl_gdn_norm_act_f32",
+        gname("owl_gdn_norm_act", dt),
         ((rows * value_dim / group_size) as u32, 1, 1),
         (256, 1, 1),
         0,
@@ -214,7 +219,7 @@ pub fn norm_act(
     .arg_f32(eps)
     // 核约定沿旧世界:act=0 → silu,act=1 → sigmoid
     .arg_i32(if act_silu { 0 } else { 1 })
-    .with_shape(Dtype::F32, vec![rows, value_dim])
+    .with_shape(dt, vec![rows, value_dim])
 }
 
 // ============================================================================
@@ -381,6 +386,21 @@ impl Loadable for GatedDeltaNet {
 /// 测试/示例公共件:确定性权重源(权重公式 + 生成器;测试与 examples
 /// 共用,保证两者输入逐位一致 —— 对拍锚纪律的独立副本指 host 参考算法,
 /// 不指输入数据)
+
+/// GDN f16/f32 核名路由(F5 整模切换;输出 dtype 跟随激活声明,
+/// state 恒 f32 混合核 —— 输出口径守门,输入位宽由 .cu 源自证)
+fn gname(base: &str, dt: crate::tensor::Dtype) -> &'static str {
+    match dt {
+        crate::tensor::Dtype::F16 => leak_name(format!("{base}_f16")),
+        _ => leak_name(format!("{base}_f32")),
+    }
+}
+
+fn leak_name(s: String) -> &'static str {
+    // 封闭集合(GDN 五核 × 2 dtype),Box::leak 量级可忽略
+    Box::leak(s.into_boxed_str())
+}
+
 pub mod fixture {
     pub fn weights(nk: usize, hk_dim: usize, nv: usize, hv_dim: usize, hidden: usize) -> Vec<(String, usize)> {
         let (key_dim, value_dim) = (nk * hk_dim, nv * hv_dim);

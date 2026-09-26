@@ -189,9 +189,11 @@ where
             let k = t.parents[0].shape.last().copied().unwrap_or(0);
             let out = ctx.face.alloc(dtype, m * n).await?;
             if dtype == Dtype::F16 {
-                // f16 基线:foreign-kernel 通道(cuBLAS;nt = owl Linear 惯例)
+                // f16 基线:foreign-kernel 通道(cuBLAS;nt = owl Linear 惯例)。
+                // gemm 侧 cm 约定:m = n_out(权重行)/ n = T(2026-09-26 修正:
+                // 原误传 (m=T, n=n_out),T=1 即 B 操作数越界读 → ILLEGAL_ADDRESS)
                 let nt = matches!(t.op, Op::MatmulNt);
-                let msg = crate::ops::lower_gemm(&ins, &out, m, k, n, nt);
+                let msg = crate::ops::lower_gemm(&ins, &out, n, k, m, nt);
                 ctx.face.launch(msg).await?;
             } else {
                 let msg = if matches!(t.op, Op::MatmulNt) {

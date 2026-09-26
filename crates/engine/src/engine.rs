@@ -73,8 +73,8 @@ impl<D: DeviceClient> ModelLoader<'_, D> {
         let model = Arc::new(load_0_8b(dir, self.face).await?);
         let tokenizer = load_tokenizer(dir)?;
         let rope = Rope::new(262_144, 256, 64, 10_000_000.0)?;
-        owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &Default::default())
-            .await?;
+        let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1 };
+        owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
         Ok(LoadedModel { model, tokenizer, rope, spec })
     }
 }
@@ -117,11 +117,13 @@ impl<D: DeviceClient> Engine<D> {
         let n_full = loaded.spec.layer_types.iter().filter(|&&f| f).count();
         let n_gdn = loaded.spec.layer_types.len() - n_full;
 
-        // 状态块(零初始化;GDN 段每 turn 开始重置)
+        // 状态块(零初始化;GDN 段每 turn 开始重置)。
+        // dtype 定盘(F5 整模切换,战役 §二):KV cache f16;GDN state 恒 f32
+        // (三方先例 + 旧世界律);slots/kv_lens f32 契约 5
         let mut kvs_b: Vec<KvBlocks> = Vec::new();
         for _ in 0..n_full {
-            let k_cache = zero_block(&mut self.face, s * hkv * hd).await?;
-            let v_cache = zero_block(&mut self.face, s * hkv * hd).await?;
+            let k_cache = zero_block_dt(&mut self.face, s * hkv * hd, loaded.spec.dtype).await?;
+            let v_cache = zero_block_dt(&mut self.face, s * hkv * hd, loaded.spec.dtype).await?;
             kvs_b.push(KvBlocks { k_cache, v_cache });
         }
         let mut gdns_b: Vec<GdnBlocks> = Vec::new();
@@ -132,9 +134,10 @@ impl<D: DeviceClient> Engine<D> {
             let rec = zero_block(&mut self.face, s * nv * hk * hv).await?;
             gdns_b.push(GdnBlocks { conv_q, conv_k, conv_v, rec });
         }
+        let kv_dt = loaded.spec.dtype;
         let kv_leaf = |b: &KvBlocks| KvBuffers {
-            k_cache: block_leaf(&(b.k_cache.0), vec![s, hkv, hd]),
-            v_cache: block_leaf(&(b.v_cache.0), vec![s, hkv, hd]),
+            k_cache: block_leaf_dt(&(b.k_cache.0), vec![s, hkv, hd], kv_dt),
+            v_cache: block_leaf_dt(&(b.v_cache.0), vec![s, hkv, hd], kv_dt),
             slots: TensorOps::zeros(Dtype::F32, vec![1]),
             kv_lens: TensorOps::zeros(Dtype::F32, vec![1]),
         };
@@ -196,7 +199,7 @@ impl<D: DeviceClient> Engine<D> {
                     InputSlot::f32("kv_slot", 1),
                     InputSlot::f32("gdn_slot", 1).init(vec![0.0]),
                 ],
-                outputs: vec![OutputSlot::f32("logits", &[1, vocab])],
+                outputs: vec![OutputSlot { name: "logits", shape: vec![1, vocab], dtype: loaded.spec.dtype }],
                 capture: true,
             },
             forward,
@@ -405,6 +408,25 @@ impl<D: DeviceClient> RunningEngine<D> {
 // ============================================================================
 // §4 小件
 // ============================================================================
+
+/// 按 dtype 清零分配(KV 池;f16 = 2B/元素字节口径)
+async fn zero_block_dt<D: DeviceClient>(face: &mut D, n: usize, dt: Dtype) -> Result<BlockN> {
+    match dt {
+        Dtype::F16 => {
+            let bytes = vec![0u8; n * 2];
+            let b = eval_ops(TensorOps::from_host(Dtype::F16, vec![n], &bytes).step(), face).await?;
+            Ok((Bytes::new(b.id, 0), n))
+        }
+        _ => zero_block(face, n).await,
+    }
+}
+
+fn block_leaf_dt(b: &Bytes, shape: Vec<usize>, dt: Dtype) -> TensorOps {
+    match dt {
+        Dtype::F16 => TensorOps::of_block(b.id, Dtype::F16, shape),
+        _ => TensorOps::of_block(b.id, Dtype::F32, shape),
+    }
+}
 
 async fn zero_block<D: DeviceClient>(face: &mut D, n: usize) -> Result<BlockN> {
     let bytes: Vec<u8> = vec![0.0f32; n].iter().flat_map(|f| f.to_le_bytes()).collect();

@@ -103,13 +103,26 @@ pub async fn eval_generate<D: DeviceClient>(
             continue; // prompt 中段:只推进状态,不采样
         }
         // 采样(Greedy = host argmax;设备采样挂账,见模块头)
-        let mut buf = vec![0u8; model.vocab_size() * 4];
+        // logits dtype 跟随声明链(F5 整模切换 = f16);按声明宽解码。
+        // 声明链根 = embed(dt)→ 传播至 logits;模型根 dtype 从 KV 缓存
+        // 声明取(同链同源)。
+        let model_dt = kvs
+            .first()
+            .map(|kv| kv.k_cache.dtype)
+            .unwrap_or(Dtype::F32);
+        let esize = model_dt.size_bytes();
+        let mut buf = vec![0u8; model.vocab_size() * esize];
         face.dtoh(&logits, &mut buf).await?;
         let (ti, _) = buf
-            .chunks_exact(4)
+            .chunks_exact(esize)
             .enumerate()
             .fold((0usize, f32::NEG_INFINITY), |a, (i, c)| {
-                let x = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                // f16/f32 双口径解码(F5;chunks_exact(esize) 已按声明宽切)
+                let x = if esize == 2 {
+                    half::f16::from_le_bytes([c[0], c[1]]).to_f32()
+                } else {
+                    f32::from_le_bytes([c[0], c[1], c[2], c[3]])
+                };
                 if x > a.1 { (i, x) } else { a }
             });
         let nt = ti as u32;

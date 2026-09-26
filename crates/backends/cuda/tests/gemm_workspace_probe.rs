@@ -5,22 +5,22 @@ use owl_cuda::{test_device_ordinal, Arg, DeviceClient as _, DeviceSelector, Dtyp
 
 /// foreign-kernel 通道:Launch + 虚拟核名 cublas_gemm_f16
 /// 槽序契约(cublas.rs):[T a, T b, T out, sz m, sz k, sz n, sz nt]
-fn gemm_launch(a: &owl_cuda::Bytes, w: &owl_cuda::Bytes, o: &owl_cuda::Bytes, m: usize, k: usize, n: usize, nt: bool) -> LaunchMsg {
+fn gemm_launch(a: &owl_cuda::Bytes, w: &owl_cuda::Bytes, o: &owl_cuda::Bytes, tokens: usize, k: usize, feats: usize, nt: bool) -> LaunchMsg {
     LaunchMsg {
         kernel: owl_cuda::KernelSpec { name: "cublas_gemm_f16".into(), source: String::new() },
         args: vec![
             Arg::Block { id: a.id },
             Arg::Block { id: w.id },
             Arg::Block { id: o.id },
-            Arg::U64(m as u64),
+            Arg::U64(tokens as u64),
             Arg::U64(k as u64),
-            Arg::U64(n as u64),
+            Arg::U64(feats as u64),
             Arg::U64(nt as u64),
         ],
         grid: (0, 0, 0),
         block: (0, 0, 0),
         shared_mem: 0,
-        out_elems: m * n,
+        out_elems: tokens * feats,
     }
 }
 

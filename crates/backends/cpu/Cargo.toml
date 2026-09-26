@@ -6,6 +6,7 @@ license.workspace = true
 description = "CPU backend: synchronous in-process DeviceClient (no server/actor/pipeline)"
 
 [dependencies]
+half = "2.7.1"
 # 契约权威:线格式 + DeviceClient 能力契约(与 owl-cuda 同一 iface)
 owl-iface = { path = "../iface" }
 

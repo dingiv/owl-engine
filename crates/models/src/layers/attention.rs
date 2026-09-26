@@ -94,9 +94,16 @@ impl Attention {
         let q = rope.forward_q(&q, pos, tokens, self.hq);
         let k = rope.forward_k(&k, pos, tokens, self.hkv);
 
-        // naive decode attention(slot 直排;一线程一 (t, q_head))
+        // naive decode attention(slot 直排;一线程一 (t, q_head));
+        // 核名/输出 dtype 跟随 q 声明(F5 整模切换;KV cache f16)
+        let dt = q.dtype;
+        let attn_name = if dt == Dtype::F16 {
+            "owl_naive_decode_attn_f16"
+        } else {
+            "owl_naive_decode_attn_f32"
+        };
         let y = TensorOps::of(kernel::kernel_with(
-            "owl_naive_decode_attn_f32",
+            attn_name,
             (0, 0, 0), // 哨兵;核内有 bs 上界 guard
             (256, 1, 1),
             0,
@@ -112,10 +119,27 @@ impl Attention {
         .arg_usize(self.hq)
         .arg_usize(self.hkv)
         .arg_usize(self.hd)
-        .with_shape(Dtype::F32, vec![tokens, self.hq * self.hd]);
+        .with_shape(dt, vec![tokens, self.hq * self.hd]);
 
         // 输出门:attn 输出 × sigmoid(gate)(per-head;o_proj 之前)
-        let y = y.mul(&gate.sigmoid());
+        // f16 路径:gate_mul 融合单发(工单 N 产 owl_sigmoid_gate_mul_f16,
+        // out = x · sigmoid(gate);n 偶数由 head_dim 全偶保证)
+        // f32 路径:语义算子 sigmoid + mul(CPU 单元锚)
+        let y = if dt == Dtype::F16 {
+            let n = tokens * self.hq * self.hd;
+            TensorOps::of(kernel::kernel_with(
+                "owl_sigmoid_gate_mul_f16",
+                (0, 0, 0),
+                (256, 1, 1),
+                0,
+            ))
+            .arg(&gate)
+            .arg(&y)
+            .arg_usize(n)
+            .with_shape(Dtype::F16, vec![tokens, self.hq * self.hd])
+        } else {
+            y.mul(&gate.sigmoid())
+        };
         self.o_proj.forward(&y, ctx)
     }
 }

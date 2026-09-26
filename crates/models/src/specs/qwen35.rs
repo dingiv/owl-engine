@@ -90,7 +90,9 @@ pub async fn load_0_8b<D: DeviceClient>(
 ) -> Result<Model, ModelError> {
     let model = Model::new(&qwen3_5_0_8b(), Qwen35Convention::new("model.language_model"));
     let src = SafeTensorsSource::open_dir(dir)?;
-    crate::interpreters::eval_load(&model, face, &src, &Default::default()).await?;
+    // F16 直转装载(F5;权重 bf16 检查点 → f16 字节,不再 f32 设备中转)
+    let ctx = crate::module::LoaderCtx { dtype: qwen3_5_0_8b().dtype, shard: 1 };
+    crate::interpreters::eval_load(&model, face, &src, &ctx).await?;
     Ok(model)
 }
 
@@ -113,6 +115,7 @@ pub fn qwen3_5_0_8b() -> ModelSpec {
         vocab: 248320,
         hidden: 1024,
         inter: 3584,
+        dtype: crate::contract::Dtype::F16,
         full_heads: (8, 2, 256),
         gdn_heads: (16, 128, 16, 128),
         eps: 1e-6,
@@ -217,6 +220,17 @@ mod tests {
         TensorOps::of_block(b.id, Dtype::F32, shape)
     }
 
+    /// f16 清零块(F5:KV cache;2B/元素)
+    async fn zero_block_f16(client: &mut owl_cuda::GpuClient, n: usize, shape: Vec<usize>) -> TensorOps {
+        let b = crate::interpreters::eval_ops(
+            TensorOps::from_host(Dtype::F16, vec![n], &vec![0u8; n * 2]).step(),
+            client,
+        )
+        .await
+        .expect("zero block f16");
+        TensorOps::of_block(b.id, Dtype::F16, shape)
+    }
+
     /// CPU face 真权重装载(非门控;验源/约定/内存,不验 CUDA)
     #[tokio::test]
     async fn cpu_real_weights_load() {
@@ -253,8 +267,8 @@ mod tests {
         let mut mk_gdns = Vec::new();
         for _ in 0..kvs_n {
             mk_kvs.push(KvBuffers {
-                k_cache: zero_block(&mut gpu, SLOTS * 2 * 256, vec![SLOTS, 2, 256]).await,
-                v_cache: zero_block(&mut gpu, SLOTS * 2 * 256, vec![SLOTS, 2, 256]).await,
+                k_cache: zero_block_f16(&mut gpu, SLOTS * 2 * 256, vec![SLOTS, 2, 256]).await,
+                v_cache: zero_block_f16(&mut gpu, SLOTS * 2 * 256, vec![SLOTS, 2, 256]).await,
                 slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
                 kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0])),
             });
@@ -620,7 +634,8 @@ mod tests {
             let ctx = ForwardCtx::model_decode(1, &pos_t, &kvs_step, &rp, &gdns_step);
             let logits = model.forward(&ids, &ctx);
             assert_eq!(logits.shape(), &[1, VOCAB]);
-            let got = crate::testkit::harvest(&mut gpu, &logits).await;
+            // f16 logits(F5 整模切换):harvest_f16 解码回 f32(top 判读口径不变)
+            let got = crate::testkit::harvest_f16(&mut gpu, &logits).await;
             assert!(got.iter().all(|v| v.is_finite()), "step{si} logits 应全有限");
             let top = (0..VOCAB)
                 .max_by(|&a, &b| got[a].abs().total_cmp(&got[b].abs()))

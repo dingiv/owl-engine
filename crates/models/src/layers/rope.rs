@@ -93,8 +93,15 @@ impl Rope {
         tokens: usize,
         q_heads: usize,
     ) -> TensorOps {
+        // 核名/输出 dtype 跟随 x 声明(F5;表 Weight 经 LoaderCtx 同 dtype)
+        let dt = q.dtype;
+        let name = if dt == Dtype::F16 {
+            "owl_rope_half_partial_f16"
+        } else {
+            "owl_rope_half_partial_f32"
+        };
         TensorOps::of(Self::launch_kernel(
-            "owl_rope_half_partial_f32",
+            name,
             tokens,
         ))
         .arg(q)
@@ -104,7 +111,7 @@ impl Rope {
         .arg_usize(q_heads)
         .arg_usize(self.head_dim)
         .arg_usize(self.rotary_dim / 2)
-        .with_shape(Dtype::F32, vec![tokens, q_heads * self.head_dim])
+        .with_shape(dt, vec![tokens, q_heads * self.head_dim])
     }
 
     /// k 旋转:[T, Hkv*HD] → [T, Hkv*HD]
@@ -115,8 +122,14 @@ impl Rope {
         tokens: usize,
         kv_heads: usize,
     ) -> TensorOps {
+        let dt = k.dtype;
+        let name = if dt == Dtype::F16 {
+            "owl_rope_half_partial_f16"
+        } else {
+            "owl_rope_half_partial_f32"
+        };
         TensorOps::of(Self::launch_kernel(
-            "owl_rope_half_partial_f32",
+            name,
             tokens,
         ))
         .arg(k)
@@ -126,7 +139,7 @@ impl Rope {
         .arg_usize(kv_heads)
         .arg_usize(self.head_dim)
         .arg_usize(self.rotary_dim / 2)
-        .with_shape(Dtype::F32, vec![tokens, kv_heads * self.head_dim])
+        .with_shape(dt, vec![tokens, kv_heads * self.head_dim])
     }
 }
 

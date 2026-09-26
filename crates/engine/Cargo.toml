@@ -14,6 +14,7 @@ owl-models = { path = "../models" }
 owl-graph = { path = "../graph" }
 # 绑定设备是引擎职责(models 主依赖零后端;engine 相反,见模块头)
 owl-cuda = { path = "../backends/cuda" }
+half = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

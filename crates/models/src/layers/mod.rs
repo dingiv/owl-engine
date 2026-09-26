@@ -40,9 +40,10 @@ pub mod rope;
 
 use crate::TensorOps;
 
-/// 非连续窄切物化(owl_narrow_strided_f32):行展平 r ∈ [0, outer),
-/// dst[r·out_dim + d] = src[r·src_dim + start + d]。
+/// 非连续窄切物化(owl_narrow_strided_{f32,f16}):行展平
+/// r ∈ [0, outer),dst[r·out_dim + d] = src[r·src_dim + start + d]。
 /// attention q gate 切分 / GDN qkv 投影列切分与 conv 权重行切分共用。
+/// dtype 跟随 src 声明(F5 整模切换;纯 gather 拷贝,f16 位型直搬)。
 pub(crate) fn narrow_strided(
     src: &TensorOps,
     outer: usize,
@@ -51,8 +52,14 @@ pub(crate) fn narrow_strided(
     out_dim: usize,
     shape: crate::contract::Shape,
 ) -> TensorOps {
+    let dt = src.dtype;
+    let name = if dt == crate::tensor::Dtype::F16 {
+        "owl_narrow_strided_f16"
+    } else {
+        "owl_narrow_strided_f32"
+    };
     TensorOps::of(crate::kernel::kernel_with(
-        "owl_narrow_strided_f32",
+        name,
         (0, 0, 0), // 哨兵:逐元素核,自动 1D ceil/256
         (256, 1, 1),
         0,
@@ -62,5 +69,5 @@ pub(crate) fn narrow_strided(
     .arg_usize(src_dim)
     .arg_usize(start)
     .arg_usize(out_dim)
-    .with_shape(crate::tensor::Dtype::F32, shape)
+    .with_shape(dt, shape)
 }

@@ -47,6 +47,8 @@ pub struct ModelSpec {
     pub vocab: usize,
     pub hidden: usize,
     pub inter: usize,
+    /// 模型计算 dtype(f16 基线 F5;装载/核名/KV 池的单一事实源)
+    pub dtype: crate::contract::Dtype,
     /// full attention 头 (hq, hkv, hd)
     pub full_heads: (usize, usize, usize),
     /// GDN 头 (nk, hk_dim, nv, hv_dim)
@@ -214,6 +216,7 @@ mod tests {
             vocab: VOCAB,
             hidden: HIDDEN,
             inter: INTER,
+            dtype: Dtype::F32, // 单元锚保持 f32(CPU 面;fixture 测试)
             full_heads: (HQ, HKV, HD),
             gdn_heads: (NK, HK_DIM, NV, HV_DIM),
             eps: EPS,

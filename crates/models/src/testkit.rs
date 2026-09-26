@@ -50,6 +50,20 @@ pub async fn harvest<D: DeviceClient>(face: &mut D, t: &TensorOps) -> Vec<f32> {
     f32_of(&buf)
 }
 
+/// f16 声明收割(F5 整模切换;eval + dtoh 2B/elem + half→f32 解码)。
+/// 重放语义同 [`harvest`](观测污染警示同样适用:带状态层禁用)。
+pub async fn harvest_f16<D: DeviceClient>(face: &mut D, t: &TensorOps) -> Vec<f32> {
+    let n: usize = t.shape().iter().product();
+    let bytes = crate::interpreters::eval_ops(t.step(), face)
+        .await
+        .expect("eval");
+    let mut buf = vec![0u8; n * 2];
+    face.dtoh(&bytes, &mut buf).await.expect("dtoh");
+    buf.chunks_exact(2)
+        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+        .collect()
+}
+
 /// f32 张量集 → safetensors 文件(HF baseline 交换)
 pub fn st_write(path: &Path, tensors: &[(&str, &[f32], Vec<usize>)]) {
     use safetensors::tensor::TensorView;

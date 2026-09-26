@@ -10,9 +10,10 @@
 //! 在后端(owl-cuda server),本 crate 的 cuda feature(build.rs nvcc 预编
 //! PTX 面)与源码之家无关。
 
-/// 语义算子动作表母本(add/mul/silu/matmul/rmsnorm;与 lower_* 一一对应)
-pub const OPS_F32: &str = include_str!("../cu/ops.cu");
-pub const OPS_F16: &str = include_str!("../cu/ops_f16.cu");
+/// 语义算子动作表母本(F5 模板统一:单源双 dtype 宏展开;matmul 除外
+/// —— f16 走 cuBLAS foreign 通道,f32 手写核保留单元锚)
+pub const OPS_F32: &str = include_str!("../cu/ops_pair.cu");
+pub const OPS_F16: &str = include_str!("../cu/ops_pair.cu");
 
 /// owl 移植位(工单 N;NInfer 等外部引擎核的 owl 契约改写)
 pub mod owl {

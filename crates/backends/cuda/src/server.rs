@@ -581,15 +581,19 @@ impl GpuServer {
     /// 外部核执行(cuBLAS 先行;marlin/FlashInfer 同通道后续接入)。
     /// 槽序契约见 owl_kernels::cublas::GEMM_F16 文档。
     fn handle_foreign_launch(&mut self, msg: LaunchMsg, ack: Ack<Result<Bytes, ModelError>>) {
-        // 捕获期拒绝(外部库 workspace 账外;capture 前须 warmup,README 口径)
+        // 捕获期策略(2026-09-26 修订):cublasGemmEx/外部核本身可捕获
+        // (kernel 入捕获流;workspace 需捕获前已分配 —— session warmup
+        // 先于 graph_begin,句柄已建即满足)。唯一拒绝态 = 捕获内首次
+        // 初始化(句柄创建含分配,捕获窗内非法)→ 结构化拒绝。
         if self
             .ctx
             .as_ref()
             .map(|c| c.capture_stream())
             .unwrap_or(false)
+            && self.blas.is_none()
         {
             return ack.send(Err(ModelError::Msg(format!(
-                "foreign kernel {} 捕获期不支持(先 warmup;prefill eager 裁决)",
+                "foreign kernel {} 捕获内首次初始化(需先 warmup 建句柄)",
                 msg.kernel.name
             ))));
         }
@@ -639,6 +643,12 @@ impl GpuServer {
         }
         let (m, k, n, nt) =
             (scalars[0] as usize, scalars[1] as usize, scalars[2] as usize, scalars[3] != 0);
+        if std::env::var_os("OWL_DEBUG").is_some() {
+            eprintln!(
+                "[dbg foreign] {} a=Block({}) b=Block({}) out=Block({}) m={n_out} k={k} n={n_tok} nt={nt}",
+                msg.kernel.name, blocks[0], blocks[1], blocks[2], n_out = m, n_tok = n
+            );
+        }
         let blas = self.blas.as_ref().unwrap();
         let stream = match self.ctx().stream(STREAM_COMPUTE) {
             Ok(s) => s.clone(),

@@ -407,18 +407,22 @@ pub struct Weight {
     shape: Shape,
     transposed: bool,
     cell: SlotCell,
+    /// 装载 dtype(F5 整模切换):layout 期从 LoaderCtx 写入,decl 按此
+    /// 出声明 —— 默认 F32(CPU 单元面);f16 模型经 LoaderCtx 自动跟随,
+    /// 层构造器零涟漪(Cell 内部可变;Weight 使用面恒 &self)
+    dtype: std::cell::Cell<Dtype>,
 }
 
 impl Weight {
     /// 登记权重(new 期;零副作用;Direct 布局)
     pub fn new(key: &'static str, shape: Shape) -> Self {
-        Self { key, shape, transposed: false, cell: SlotCell::default() }
+        Self { key, shape, transposed: false, cell: SlotCell::default(), dtype: std::cell::Cell::new(Dtype::F32) }
     }
 
     /// 转置权重:源 [rows, cols] 行主序 → 装载声明 [cols, rows]
     /// (Linear 惯例:forward 直 matmul,decode 零转置)
     pub fn new_transposed(key: &'static str, rows: usize, cols: usize) -> Self {
-        Self { key, shape: vec![cols, rows], transposed: true, cell: SlotCell::default() }
+        Self { key, shape: vec![cols, rows], transposed: true, cell: SlotCell::default(), dtype: std::cell::Cell::new(Dtype::F32) }
     }
 
     /// 装载生命周期:按语境声明需求(元数据直出 + 回填口;零 src 零数据)
@@ -429,6 +433,7 @@ impl Weight {
     /// 变键布局(tied 聚合用:lm_head 转置槽与 w 同源键直读;
     /// Want 键不需唯一 —— 各带各的 sink,eval_want 逐条取数回填)
     pub(crate) fn layout_as(&self, key: impl Into<String>, ctx: &LoaderCtx) -> LoaderOps {
+        self.dtype.set(ctx.dtype); // decl 与装载同源(F5 整模切换)
         LoaderOps::want(Want {
             key: key.into(),
             dtype: ctx.dtype,
@@ -440,14 +445,20 @@ impl Weight {
 
     /// 权重声明(未装载 → 毒值声明;of_block:eval 时 Block 叶子零操作)
     pub fn decl(&self) -> TensorOps {
+        let dt = self.dtype.get();
         match self.cell.loaded() {
-            Some(b) => TensorOps::of_block(b.id, Dtype::F32, self.shape.clone()),
+            Some(b) => TensorOps::of_block(b.id, dt, self.shape.clone()),
             None => TensorOps::poisoned(
-                Dtype::F32,
+                dt,
                 self.shape.clone(),
                 format!("Weight '{}': 未装载(eval_load 前禁止执行)", self.key),
             ),
         }
+    }
+
+    /// 装载 dtype 访问器(核名路由用;layout 前 = 默认 F32)
+    pub fn dtype(&self) -> Dtype {
+        self.dtype.get()
     }
 
     pub fn is_loaded(&self) -> bool {

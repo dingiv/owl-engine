@@ -105,6 +105,42 @@ async fn load_group<D: DeviceClient, S: WeightSource + ?Sized>(
     let mut manifest = Vec::new();
     for w in group {
         let n: usize = w.shape.iter().product();
+        // F16 直转路径(F5 整模切换;用户裁决:不再 f32 设备中转):
+        // take(f32 工作副本)→(转置)→ host 转 f16 字节 → htod(F16)。
+        // host 峰值 = 单权重 f32 + f16 双份(108GB RAM 量级可忽略)。
+        if w.dtype == Dtype::F16 {
+            let conv = |v: Vec<f32>| -> Vec<u8> {
+                v.iter()
+                    .flat_map(|f| half::f16::from_f32(*f).to_le_bytes())
+                    .collect()
+            };
+            let bytes = match w.layout {
+                crate::module::Layout::Transposed => {
+                    let data = src
+                        .take_range(&w.key, 0, n)
+                        .ok_or_else(|| attribution(src, &w.key, n))?;
+                    conv(transpose_into_vec(data.as_slice(), w, n)?)
+                }
+                _ => {
+                    let data = src
+                        .take(&w.key)
+                        .ok_or_else(|| attribution(src, &w.key, n))?;
+                    conv(data)
+                }
+            };
+            let b = face
+                .htod(Dtype::F16, &w.shape, &bytes)
+                .await
+                .map_err(|e| ModelError::Msg(format!("Weight '{}': {e}", w.key)))?;
+            w.sink.deliver(crate::contract::Bytes::new(b.id, n));
+            manifest.push(LoadEntry {
+                key: w.key.clone(),
+                shape: w.shape.clone(),
+                layout: w.layout,
+                block: crate::contract::Bytes::new(b.id, n),
+            });
+            continue;
+        }
         match w.layout {
             crate::module::Layout::Transposed => {
                 // 整取 → TILE² 转置 → htod_f32 move(小件容忍 3 拷)

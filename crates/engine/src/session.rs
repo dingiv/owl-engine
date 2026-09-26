@@ -71,11 +71,18 @@ pub struct OutputSlot {
     pub name: &'static str,
     /// 声明形状(收割量守卫)
     pub shape: Vec<usize>,
+    /// 收割 dtype(f16 基线:logits f16;read_output_f32 按此解码)
+    pub dtype: Dtype,
 }
 
 impl OutputSlot {
     pub fn f32(name: &'static str, shape: &[usize]) -> Self {
-        Self { name, shape: shape.to_vec() }
+        Self { name, shape: shape.to_vec(), dtype: Dtype::F32 }
+    }
+
+    /// f16 输出(F5 整模切换;read_output_f32 自动解码回 f32)
+    pub fn f16(name: &'static str, shape: &[usize]) -> Self {
+        Self { name, shape: shape.to_vec(), dtype: Dtype::F16 }
     }
 }
 
@@ -138,6 +145,7 @@ struct InSlotDev {
 struct OutVal {
     block: Bytes,
     len: usize,
+    dtype: Dtype,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -150,6 +158,7 @@ pub struct Session<D: DeviceClient> {
     face: D,
     inputs: Vec<InSlotDev>,
     out_specs: HashMap<&'static str, usize>, // name → 元素数
+    out_dt: HashMap<&'static str, Dtype>,   // name → 收割 dtype(F5 logits f16)
     last: HashMap<&'static str, OutVal>,
     mode: Mode,
     forward: Box<dyn Fn(&StepCtx) -> Result<()>>,
@@ -179,6 +188,11 @@ impl<D: DeviceClient> Session<D> {
                 .outputs
                 .iter()
                 .map(|o| (o.name, o.shape.iter().product::<usize>()))
+                .collect(),
+            out_dt: desc
+                .outputs
+                .iter()
+                .map(|o| (o.name, o.dtype))
                 .collect(),
             last: HashMap::new(),
             mode: Mode::Eager,
@@ -213,12 +227,22 @@ impl<D: DeviceClient> Session<D> {
             .last
             .get(name)
             .ok_or_else(|| ModelError::Msg(format!("read_output: 无输出 {name}(先 step)")))?;
-        let mut buf = vec![0u8; out.len * 4];
+        // 按 slot dtype 解码(f16 基线:logits f16 上载,f32 回 host)
+        let (esize, f16) = match out.dtype {
+            Dtype::F16 => (2usize, true),
+            _ => (4usize, false),
+        };
+        let mut buf = vec![0u8; out.len * esize];
         self.face.dtoh(&out.block, &mut buf).await?;
-        Ok(buf
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect())
+        Ok(if f16 {
+            buf.chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect()
+        } else {
+            buf.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        })
     }
 
     /// face 访问器(crate 内编排层用:turn 切换时的状态重置等
@@ -282,7 +306,8 @@ impl<D: DeviceClient> Session<D> {
                     block.len
                 )));
             }
-            self.last.insert(name, OutVal { block, len: want });
+            let dtype = self.out_dt[&name];
+            self.last.insert(name, OutVal { block, len: want, dtype });
         }
         Ok(())
     }
@@ -304,12 +329,15 @@ impl<D: DeviceClient> Session<D> {
         }
 
         // 捕获窗:launch 入图 / alloc 走 slab;输出块 id 捕获期即定
-        let mut blocks: Vec<(&'static str, Bytes, usize)> = Vec::new();
+        let mut blocks: Vec<(&'static str, Bytes, usize, Dtype)> = Vec::new();
         let mut win_err: Option<ModelError> = None;
         for (name, tree) in outs {
             let want = self.out_specs[&name];
             match eval_ops(tree.step(), &mut self.face).await {
-                Ok(b) if b.len == 0 || b.len == want => blocks.push((name, b, want)),
+                Ok(b) if b.len == 0 || b.len == want => {
+                    let dtype = self.out_dt[&name];
+                    blocks.push((name, b, want, dtype))
+                }
                 Ok(b) => {
                     win_err = Some(ModelError::Msg(format!(
                         "capture: 输出 {name} 归约 {} 元素 ≠ 声明 {want}",
@@ -330,7 +358,7 @@ impl<D: DeviceClient> Session<D> {
                 self.mode = Mode::Captured { graph };
                 self.last = blocks
                     .into_iter()
-                    .map(|(name, block, len)| (name, OutVal { block, len }))
+                    .map(|(name, block, len, dtype)| (name, OutVal { block, len, dtype }))
                     .collect();
                 Ok(PlanOutcome::Captured)
             }

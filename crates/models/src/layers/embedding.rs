@@ -37,8 +37,15 @@ impl Embedding {
     /// 槽序契约:kernel 签名 (w, ids, d_dim, out) → T 槽序 w、ids,输出块末尾
     /// (w = 物化块引用,eval 时 Block 叶子零操作)。
     pub fn embed(&self, ids: &TensorOps, tokens: usize) -> TensorOps {
+        // 核名/输出 dtype 跟随表 Weight(F5;LoaderCtx 自动跟随)
+        let dt = self.w.dtype();
+        let name = if dt == Dtype::F16 {
+            "owl_embed_f16"
+        } else {
+            "owl_embed_f32"
+        };
         TensorOps::of(kernel::kernel_with(
-            "owl_embed_f32",
+            name,
             (tokens as u32, 1, 1),
             (1, 1, 1),
             0,
@@ -46,7 +53,7 @@ impl Embedding {
         .arg(&self.w.decl())
         .arg(ids)
         .arg_usize(self.d_dim)
-        .with_shape(Dtype::F32, vec![tokens, self.d_dim])
+        .with_shape(dt, vec![tokens, self.d_dim])
     }
 
     /// lm_head(tied):hidden [.., D] → logits [.., vocab]
