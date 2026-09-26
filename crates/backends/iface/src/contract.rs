@@ -217,8 +217,11 @@ pub trait DeviceClient: Send {
         graph: GraphId,
     ) -> impl Future<Output = Result<(), ModelError>> + Send;
     /// 清零分配:块登记 + COMPUTE 流序 memset 入队(异步;捕获期 slab
-    /// 切块同款清零,Op::Zeros 语义的设备侧保证)
-    fn alloc(&mut self, n_bytes: usize)
+    /// 切块同款清零,Op::Zeros 语义的设备侧保证)。f16 基线(2026-09-26):
+    /// dtype + elems 双参,字节宽由客户端按 size_bytes 换算 —— 传输面
+    /// 不再假设 4 字节元素(旧 alloc(n_bytes)/4 在 f16 下静默减半,雷已拆)。
+    /// 返回 Bytes.len = **元素数**口径(C1 断言/账本不变)。
+    fn alloc(&mut self, dtype: Dtype, elems: usize)
         -> impl Future<Output = Result<Bytes, ModelError>> + Send;
     /// host 数据入块(H2D 流异步拷贝 + finish 回调携 ack):**回执即数据
     /// 落地**,后续 launch 跨流读安全(顺序语义,见 trait 级文档)
@@ -238,6 +241,25 @@ pub trait DeviceClient: Send {
     /// 与数据搬运的跨流先后靠回执时序/sync 建立(顺序语义,见 trait 级文档)
     fn launch(&mut self, msg: LaunchMsg)
         -> impl Future<Output = Result<Bytes, ModelError>> + Send;
+
+    /// cuBLAS GEMM(f16 基线,F1):C[m,n] = A[k,n]×B^T(nt,owl Linear
+    /// 惯例:B 行主序 [m,k] 权重)或 C = A×B(plain);f16 入出,
+    /// COMPUTE_32F 累计。COMPUTE 流火后不理(同 launch);非捕获路径。
+    /// 默认实现 = 结构化报错(仅 GPU server 实现;CPU 先不搞)。
+    fn gemm(
+        &mut self,
+        _a: &Bytes,
+        _b: &Bytes,
+        _out: &Bytes,
+        _m: usize,
+        _k: usize,
+        _n: usize,
+        _nt: bool,
+    ) -> impl Future<Output = Result<(), ModelError>> + Send {
+        async {
+            Err(ModelError::Msg("gemm: 本后端不支持(仅 GPU server)".to_string()))
+        }
+    }
     /// 全设备栅栏:三条流此前全部工作落定方回执(计时/步边界/捕获前净空)
     fn sync(&mut self) -> impl Future<Output = Result<(), ModelError>> + Send;
 

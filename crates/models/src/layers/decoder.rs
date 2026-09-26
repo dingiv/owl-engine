@@ -267,7 +267,7 @@ mod tests {
         eprintln!("[probe] booted");
         let elems = 1 << 20; // 1M f32 = 4MB
         let b = gpu
-            .alloc(elems * 4)
+            .alloc(Dtype::F32, elems)
             .await
             .expect("alloc");
         eprintln!("[probe] block {} alloc'd", b.id);

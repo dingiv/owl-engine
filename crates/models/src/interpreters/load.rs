@@ -5,6 +5,7 @@
 //! 数据单副本流动:take_range / convert_chunk_into 查到才实体化,
 //! pinned 租约 move 进消息,DMA 直读,用毕即弃(§四 24 流式律)。
 
+use crate::contract::{Dtype};
 use crate::contract::{DeviceClient, ModelError};
 use crate::module::{Layout, LoadEntry, LoadManifest, LoaderOps, WeightSource};
 use futures_util::future::join_all;
@@ -127,7 +128,7 @@ async fn load_group<D: DeviceClient, S: WeightSource + ?Sized>(
                 // pinned 租约流水(二拷贝预算:转换直达租约,DMA 直读租约;
                 // 大张量自动多块,小张量单块 —— 主机在途 = 单块)
                 let b = face
-                    .alloc(n * 4)
+                    .alloc(Dtype::F32, n)
                     .await
                     .map_err(|e| ModelError::Msg(format!("Weight '{}': {e}", w.key)))?;
                 let mut off = 0usize;

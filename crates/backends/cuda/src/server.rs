@@ -32,6 +32,7 @@ use crate::state::{DeviceSelector, GpuCtx, KernelCache, Staging};
 use owl_iface::contract::{Bytes, LaunchMsg};
 use crate::state::{STREAM_COMPUTE, STREAM_D2H, STREAM_H2D};
 use owl_iface::contract::ModelError;
+use core::ffi::c_int;
 use std::sync::mpsc;
 
 type Finish = Box<dyn FnOnce() + Send>;
@@ -63,6 +64,8 @@ pub struct GpuServer {
     boot: Option<mpsc::Sender<Result<(), String>>>,
     ctx: Option<GpuCtx>,
     kernels: KernelCache,
+    /// cuBLAS 句柄(F1 f16 基线;懒初始化,绑 COMPUTE 流)
+    blas: Option<cudarc::cublas::CudaBlas>,
     /// 完成派发出口(host 回调只投递;派发线程执行真正的 finish)
     dispatch: Option<mpsc::Sender<Finish>>,
 }
@@ -88,6 +91,7 @@ impl GpuServer {
             boot,
             ctx: None,
             kernels: KernelCache::new(),
+            blas: None,
             dispatch: None,
         }
     }
@@ -189,7 +193,10 @@ impl GpuServer {
         if self.ctx().capture_stream() {
             return match cmd {
                 Command::Launch { msg, ack } => self.handle_launch(msg, ack),
-                Command::Alloc { n_elems, ack } => self.handle_alloc(n_elems, ack),
+            Command::Gemm { ack, .. } => ack.send(Err(ModelError::Msg(
+                "gemm: 捕获期不支持(prefill eager)".to_string(),
+            ))),
+                Command::Alloc { n_bytes, elems, ack } => self.handle_alloc(n_bytes, elems, ack),
                 Command::GraphEnd { ack } => ack.send(self.ctx_mut().graph_end()),
                 Command::Close { ack } => ack.send(Ok(())), // 防御性幂等回执
                 other => Self::reject(other),
@@ -197,17 +204,20 @@ impl GpuServer {
         }
 
         match cmd {
-            Command::Alloc { n_elems, ack } => self.handle_alloc(n_elems, ack),
+            Command::Alloc { n_bytes, elems, ack } => self.handle_alloc(n_bytes, elems, ack),
             Command::Htod { data, ack } => self.handle_htod(data, ack),
-            Command::HtodChunk { block, offset_elems, data, ack } => {
-                self.handle_htod_chunk(block, offset_elems, data, ack)
+            Command::HtodChunk { block, offset_bytes, data, ack } => {
+                self.handle_htod_chunk(block, offset_bytes, data, ack)
             }
             Command::AllocPinned { elems, ack } => self.handle_alloc_pinned(elems, ack),
             Command::UploadPinned { buf, dst, offset_elems, elems, ack } => {
                 self.handle_upload_pinned(buf, dst, offset_elems, elems, ack)
             }
-            Command::Dtoh { id, want_elems, ack } => self.handle_dtoh(id, want_elems, ack),
+            Command::Dtoh { id, want_bytes, ack } => self.handle_dtoh(id, want_bytes, ack),
             Command::Launch { msg, ack } => self.handle_launch(msg, ack),
+            Command::Gemm { a, b, out, m, k, n, nt, ack } => {
+                self.handle_gemm(a, b, out, m, k, n, nt, ack)
+            }
             Command::Sync { ack } => self.handle_sync(ack),
             Command::GraphBegin { ack } => ack.send(self.ctx_mut().graph_begin()),
             Command::GraphEnd { ack } => ack.send(self.ctx_mut().graph_end()),
@@ -234,6 +244,7 @@ impl GpuServer {
             Command::Alloc { ack, .. } => closed!(ack),
             Command::Htod { ack, .. } => closed!(ack),
             Command::HtodChunk { ack, .. } => closed!(ack),
+            Command::Gemm { ack, .. } => closed!(ack),
             Command::AllocPinned { ack, .. } => closed!(ack),
             Command::UploadPinned { ack, .. } => closed!(ack),
             Command::Dtoh { ack, .. } => closed!(ack),
@@ -254,6 +265,7 @@ impl GpuServer {
             Command::Alloc { .. } => "Alloc",
             Command::Htod { .. } => "Htod",
             Command::HtodChunk { .. } => "HtodChunk",
+            Command::Gemm { .. } => "Gemm",
             Command::AllocPinned { .. } => "AllocPinned",
             Command::UploadPinned { .. } => "UploadPinned",
             Command::Dtoh { .. } => "Dtoh",
@@ -269,6 +281,7 @@ impl GpuServer {
             Command::Alloc { ack, .. } => reject!(ack),
             Command::Htod { ack, .. } => reject!(ack),
             Command::HtodChunk { ack, .. } => reject!(ack),
+            Command::Gemm { ack, .. } => reject!(ack),
             Command::AllocPinned { ack, .. } => reject!(ack),
             Command::UploadPinned { ack, .. } => reject!(ack),
             Command::Dtoh { ack, .. } => reject!(ack),
@@ -278,19 +291,19 @@ impl GpuServer {
         }
     }
 
-    fn handle_alloc(&mut self, n_elems: usize, ack: Ack<Result<Bytes, ModelError>>) {
+    fn handle_alloc(&mut self, n_bytes: usize, elems: usize, ack: Ack<Result<Bytes, ModelError>>) {
         // 捕获期:从 slab 切块(零 cudaMalloc;malloc 在捕获窗内非法)。
         // 切完必须流序清零(N4):块内容 = slab 残留,不清零则 Zeros 语义
         // / 部分写 kernel 静默踩垃圾;memset 可捕获 → replay 时重清零,
         // 语义恒成立。
         if self.ctx().capture_stream() {
             let result = (|| {
-                let id = self.ctx_mut().carve_block(n_elems)?;
+                let id = self.ctx_mut().carve_block(n_bytes)?;
                 let stream = self.ctx().stream(STREAM_COMPUTE)?.clone();
                 let (dptr, _) = self.ctx().block_ptr(id, &stream)?;
-                unsafe { memset_d8_async(dptr, 0, n_elems * 4, stream.cu_stream()) }
+                unsafe { memset_d8_async(dptr, 0, n_bytes, stream.cu_stream()) }
                     .map_err(|e| ModelError::Msg(format!("carve memset: {e:?}")))?;
-                Ok(Bytes::new(id, n_elems))
+                Ok(Bytes::new(id, elems))
             })();
             return ack.send(result);
         }
@@ -299,19 +312,19 @@ impl GpuServer {
             Ok(s) => s.clone(),
             Err(e) => return ack.send(Err(e)),
         };
-        let result = unsafe { stream.alloc::<f32>(n_elems) }
+        let result = unsafe { stream.alloc::<u8>(n_bytes) }
             .map_err(|e| ModelError::Msg(format!("alloc: {e:?}")))
             .and_then(|mut slice| {
                 stream
                     .memset_zeros(&mut slice)
                     .map_err(|e| ModelError::Msg(format!("alloc memset: {e:?}")))?;
-                Ok(Bytes::new(self.ctx_mut().new_block(slice), n_elems))
+                Ok(Bytes::new(self.ctx_mut().new_block(slice), elems))
             });
         ack.send(result);
     }
 
-    fn handle_htod(&mut self, data: Vec<f32>, ack: Ack<Result<Bytes, ModelError>>) {
-        eprintln!("[srv] Htod {} elems", data.len());
+    fn handle_htod(&mut self, data: Vec<u8>, ack: Ack<Result<Bytes, ModelError>>) {
+        eprintln!("[srv] Htod {} bytes", data.len());
         let mut ack = Some(ack);
         let n = data.len();
         let stream = match self.ctx().stream(STREAM_H2D) {
@@ -339,11 +352,11 @@ impl GpuServer {
     fn try_htod(
         &mut self,
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
-        data: &[f32],
+        data: &[u8],
     ) -> Result<(u64, Staging), ModelError> {
         let n = data.len();
-        // 1. 设备块(流序 malloc;未初始化)
-        let dst = unsafe { stream.alloc::<f32>(n) }
+        // 1. 设备块(流序 malloc;未初始化;字节口径)
+        let dst = unsafe { stream.alloc::<u8>(n) }
             .map_err(|e| ModelError::Msg(format!("htod alloc: {e:?}")))?;
         let id = self.ctx_mut().new_block(dst);
         // 2. pinned 码头 + 异步 memcpy(流序;host 侧必须 pinned 才真异步)
@@ -369,7 +382,8 @@ impl GpuServer {
             ack.send(Ok(b));
             return;
         }
-        match Staging::alloc(elems) {
+        // f32 租约口径(pinned 流水线仅剩 f32 装载路径;字节底层)
+        match Staging::alloc(elems * 4) {
             Ok(s) => ack.send(Ok(Box::new(s))),
             Err(e) => ack.send(Err(e)),
         }
@@ -430,8 +444,8 @@ impl GpuServer {
     fn handle_htod_chunk(
         &mut self,
         block: u64,
-        offset_elems: usize,
-        data: Vec<f32>,
+        offset_bytes: usize,
+        data: Vec<u8>,
         ack: Ack<Result<(), ModelError>>,
     ) {
         let stream = match self.ctx().stream(STREAM_H2D) {
@@ -450,7 +464,7 @@ impl GpuServer {
         staging.slice_mut().copy_from_slice(&data);
         unsafe {
             memcpy_htod_async(
-                dptr_base + (offset_elems as u64) * 4,
+                dptr_base + (offset_bytes as u64),
                 staging.slice(),
                 stream.cu_stream(),
             )
@@ -477,7 +491,7 @@ impl GpuServer {
     fn handle_dtoh(
         &mut self,
         id: u64,
-        want_elems: usize,
+        want_bytes: usize,
         ack: Ack<Result<Vec<u8>, ModelError>>,
     ) {
         // 路由:D2H 流(结果收割维)。先排空 COMPUTE:kernel 在 COMPUTE 流,
@@ -498,13 +512,12 @@ impl GpuServer {
             Err(e) => return ack.send(Err(e)),
         };
         let mut ack = Some(ack);
-        match self.try_dtoh(&stream, id, want_elems) {
+        match self.try_dtoh(&stream, id, want_bytes) {
             Ok(staging) => {
-                // 完成 → 码头转 LE 字节 → 回执 → 放掉码头(派发线程跑)
+                // 完成 → 码头字节直出(传输面字节口径)→ 回执 → 放掉码头
                 let mut cb_ack = ack.take();
                 let finish: Finish = Box::new(move || {
-                    let bytes: Vec<u8> =
-                        staging.slice().iter().flat_map(|f| f.to_le_bytes()).collect();
+                    let bytes = staging.slice().to_vec();
                     drop(staging);
                     cb_ack.take().unwrap().send(Ok(bytes));
                 });
@@ -522,12 +535,12 @@ impl GpuServer {
         &self,
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
         id: u64,
-        want_elems: usize,
+        want_bytes: usize,
     ) -> Result<Staging, ModelError> {
-        let n = self.ctx().block_len(id)?;
-        if n != want_elems {
+        let n = self.ctx().block_len(id)?; // 块账本 = 字节(2026-09-26 f16 基线)
+        if n != want_bytes {
             return Err(ModelError::Msg(format!(
-                "dtoh: 块 {id} 元素 {n} != 收割 {want_elems}"
+                "dtoh: 块 {id} 字节 {n} != 收割 {want_bytes}"
             )));
         }
         let (dptr, _) = self.ctx().block_ptr(id, stream)?;
@@ -535,6 +548,86 @@ impl GpuServer {
         unsafe { memcpy_dtoh_async(staging.slice_mut(), dptr, stream.cu_stream()) }
             .map_err(|e| ModelError::Msg(format!("dtoh async: {e:?}")))?;
         Ok(staging)
+    }
+
+
+    /// cuBLAS GEMM(F1 f16 基线):f16 in / COMPUTE_32F 累计 / f16 out。
+    /// 行主序映射(列主序 cublas):out_cm[m, n] = op(b)·op(a)。
+    /// nt=true(owl Linear:B [m,k] 行主序权重):transa=T on b(lda=k);
+    /// nt=false(B [k,n] 行主序):transa=T on b(lda=n)。
+    fn handle_gemm(
+        &mut self,
+        a: u64,
+        b: u64,
+        out: u64,
+        m: usize,
+        k: usize,
+        n: usize,
+        nt: bool,
+        ack: Ack<Result<(), ModelError>>,
+    ) {
+        use cudarc::cublas::{result as cb, sys};
+        if self.blas.is_none() {
+            let stream = match self.ctx().stream(STREAM_COMPUTE) {
+                Ok(s) => s.clone(),
+                Err(e) => return ack.send(Err(e)),
+            };
+            match cudarc::cublas::CudaBlas::new(stream) {
+                Ok(h) => self.blas = Some(h),
+                Err(e) => {
+                    return ack.send(Err(ModelError::Msg(format!("cublas init: {e:?}"))))
+                }
+            }
+        }
+        let handle = self.blas.as_ref().unwrap().handle();
+        let stream = match self.ctx().stream(STREAM_COMPUTE) {
+            Ok(s) => s.clone(),
+            Err(e) => return ack.send(Err(e)),
+        };
+        let (a_ptr, _) = match self.ctx().block_ptr(a, &stream) {
+            Ok(p) => p,
+            Err(e) => return ack.send(Err(e)),
+        };
+        let (b_ptr, _) = match self.ctx().block_ptr(b, &stream) {
+            Ok(p) => p,
+            Err(e) => return ack.send(Err(e)),
+        };
+        let (out_ptr, _) = match self.ctx().block_ptr(out, &stream) {
+            Ok(p) => p,
+            Err(e) => return ack.send(Err(e)),
+        };
+        // lda/ldb 按行主序重解释;alpha/beta f32(COMPUTE_32F)
+        let (lda, transa) = if nt { (k as c_int, sys::cublasOperation_t::CUBLAS_OP_T) } else { (n as c_int, sys::cublasOperation_t::CUBLAS_OP_T) };
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        let r = unsafe {
+            cb::gemm_ex(
+                *handle,
+                transa,
+                sys::cublasOperation_t::CUBLAS_OP_N,
+                m as c_int,
+                n as c_int,
+                k as c_int,
+                &alpha as *const f32 as *const _,
+                b_ptr as *const _,
+                sys::cudaDataType::CUDA_R_16F,
+                lda as c_int,
+                a_ptr as *const _,
+                sys::cudaDataType::CUDA_R_16F,
+                k as c_int,
+                &beta as *const f32 as *const _,
+                out_ptr as *mut _,
+                sys::cudaDataType::CUDA_R_16F,
+                m as c_int,
+                sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )
+        };
+        // 排队即回执(fire-and-forget,同 launch 语义;COMPUTE 流保序)
+        match r {
+            Ok(()) => ack.send(Ok(())),
+            Err(e) => ack.send(Err(ModelError::Msg(format!("gemm_ex: {e:?}")))),
+        }
     }
 
     fn handle_launch(&mut self, msg: LaunchMsg, ack: Ack<Result<Bytes, ModelError>>) {

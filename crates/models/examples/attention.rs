@@ -209,8 +209,8 @@ async fn main() {
         .expect("rope 表物化");
 
     // KV 常驻块(Zeros = 清零分配;跨步持久)
-    let kc = client.alloc(MAX_SLOTS * HKV * HD * 4).await.expect("alloc kc");
-    let vc = client.alloc(MAX_SLOTS * HKV * HD * 4).await.expect("alloc vc");
+    let kc = client.alloc(Dtype::F32, MAX_SLOTS * HKV * HD).await.expect("alloc kc");
+    let vc = client.alloc(Dtype::F32, MAX_SLOTS * HKV * HD).await.expect("alloc vc");
 
     // host 参考(独立副本;跨步持缓存)
     let mut host = HostRef {

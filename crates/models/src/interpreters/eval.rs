@@ -9,7 +9,7 @@
 //! 形态(`owl-iface::contract::DeviceClient`)与"声明/执行分离"范式,
 //! 但互不依赖 —— 新变体(图捕获回放、量化装载、其他平台)另起文件。
 
-use crate::contract::{Bytes, ModelError};
+use crate::contract::{Bytes, Dtype, ModelError};
 use crate::ops::Op;
 use crate::tensor::TensorOps;
 use std::future::Future;
@@ -143,29 +143,29 @@ where
 
     let out: Bytes = match &t.op {
         Op::Htod { bytes } => ctx.face.htod(dtype, &shape, bytes).await?,
-        Op::Zeros => ctx.face.alloc(n_bytes).await?,
+        Op::Zeros => ctx.face.alloc(dtype, n_elems).await?,
         Op::Block { id } => Bytes { id: *id, len: 0 },
         Op::Reshape => ins[0].clone(), // 纯元数据视图:透传父块(零拷贝)
         Op::Add => {
-            let out = ctx.face.alloc(n_bytes).await?;
+            let out = ctx.face.alloc(dtype, n_elems).await?;
             let msg = crate::ops::lower_add(&ins, &out, n_elems);
             ctx.face.launch(msg).await?;
             out
         }
         Op::Mul => {
-            let out = ctx.face.alloc(n_bytes).await?;
+            let out = ctx.face.alloc(dtype, n_elems).await?;
             let msg = crate::ops::lower_mul(&ins, &out, n_elems);
             ctx.face.launch(msg).await?;
             out
         }
         Op::Silu => {
-            let out = ctx.face.alloc(n_bytes).await?;
+            let out = ctx.face.alloc(dtype, n_elems).await?;
             let msg = crate::ops::lower_silu(&ins, &out, n_elems);
             ctx.face.launch(msg).await?;
             out
         }
         Op::Sigmoid => {
-            let out = ctx.face.alloc(n_bytes).await?;
+            let out = ctx.face.alloc(dtype, n_elems).await?;
             let msg = crate::ops::lower_sigmoid(&ins, &out, n_elems);
             ctx.face.launch(msg).await?;
             out
@@ -175,17 +175,23 @@ where
             // k = 内维 = x 声明 shape 末维(C1:只读声明 shape;原取 ins[0].len
             // 在多行 [m,k] 时越界读 —— 此 bug 被"历届测试都单行"掩盖)
             let k = t.parents[0].shape.last().copied().unwrap_or(0);
-            let out = ctx.face.alloc(m * n * dtype.size_bytes()).await?;
-            let msg = if matches!(t.op, Op::MatmulNt) {
-                crate::ops::lower_matmul_nt(&ins, &out, m, k, n)
+            let out = ctx.face.alloc(dtype, m * n).await?;
+            if dtype == Dtype::F16 {
+                // f16 基线:cuBLAS(COMPUTE_32F 累计;nt = owl Linear 惯例)
+                let nt = matches!(t.op, Op::MatmulNt);
+                ctx.face.gemm(&ins[0], &ins[1], &out, m, k, n, nt).await?;
             } else {
-                crate::ops::lower_matmul(&ins, &out, m, k, n)
-            };
-            ctx.face.launch(msg).await?;
+                let msg = if matches!(t.op, Op::MatmulNt) {
+                    crate::ops::lower_matmul_nt(&ins, &out, m, k, n)
+                } else {
+                    crate::ops::lower_matmul(&ins, &out, m, k, n)
+                };
+                ctx.face.launch(msg).await?;
+            }
             out
         }
         Op::Rmsnorm { eps, w_off } => {
-            let out = ctx.face.alloc(n_bytes).await?;
+            let out = ctx.face.alloc(dtype, n_elems).await?;
             // 归一化宽度由 alpha 的声明 shape 定义(per-head 行归一化:
             // [T, H×HD] × alpha [HD])。不能取 ins[1].len —— Block 叶子 len=0。
             let alpha_shape = t.parents[1].shape.clone();
@@ -196,7 +202,7 @@ where
             out
         }
         Op::Kernel { kernel } => {
-            let out = ctx.face.alloc(n_bytes).await?;
+            let out = ctx.face.alloc(dtype, n_elems).await?;
             let msg = crate::ops::lower_kernel(kernel, &t.args, &ins, &out, n_elems);
             ctx.face.launch(msg).await?;
             out

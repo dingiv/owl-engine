@@ -23,4 +23,5 @@ parking_lot = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+half = { version = "2.7.1", features = ["use-intrinsics"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

@@ -121,7 +121,10 @@ pub fn qwen3_5_0_8b() -> ModelSpec {
             eos_tokens: vec!["<|im_end|>", "<|endoftext|>"],
             chat: crate::tokenizer::ChatFormat {
                 prefix: "<|im_start|>user\n".into(),
-                suffix: "<|im_end|>\n<|im_start|>assistant\n".into(),
+                // 默认(非思考)模式:模板预填空 think 块(tokenizer_config
+                // chat_template add_generation_prompt 分支实证);缺它模型需
+                // 自己生成空 think 块,greedy 会紧跟 eos 答空(2026-09-26 实测)。
+                suffix: "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n".into(),
             },
         },
     }

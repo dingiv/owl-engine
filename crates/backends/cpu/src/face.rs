@@ -46,13 +46,20 @@ impl DeviceClient for CpuFace {
         Err(ModelError::Msg("CpuFace: 图捕获仅 GPU server 支持".to_string()))
     }
 
-    /// 显存分配(清零;CPU = Vec;无流参数 —— 同步直调即序)
-    async fn alloc(&mut self, n_bytes: usize) -> Result<Bytes, ModelError> {
-        let v = ops::zeros(Dtype::F32, &vec![n_bytes / 4])?;
+    /// 显存分配(清零;CPU = Vec;无流参数 —— 同步直调即序)。
+    /// f16 基线下 CPU 仍 f32-only(用户裁决:CPU 先不搞)——
+    /// 非 F32 结构化报错。
+    async fn alloc(&mut self, dtype: Dtype, elems: usize) -> Result<Bytes, ModelError> {
+        if dtype != Dtype::F32 {
+            return Err(ModelError::Msg(format!(
+                "CpuFace::alloc: 仅 F32(CPU 先不搞),得 {dtype:?}"
+            )));
+        }
+        let v = ops::zeros(Dtype::F32, &vec![elems])?;
         let id = self.next;
         self.next += 1;
         self.blocks.insert(id, v);
-        Ok(Bytes::new(id, 0))
+        Ok(Bytes::new(id, elems))
     }
 
     /// 装载(host 字节 → f32 值块)

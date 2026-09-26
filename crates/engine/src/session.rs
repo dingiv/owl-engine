@@ -1,5 +1,11 @@
 //! Session 编排面(P0/M1;`docs/arch/session-plan.md` 的新世界实现)。
 //!
+//! **命名分域(phase3 立项勘定,2026-09-26)**:本模块的 Session =
+//! **Capture Session**(图三态编排,底层执行概念);用户层 agent 会话
+//! (长连接、工具回灌、跨 step 状态存续)= `engine::agent` 的
+//! **AgentSession**,是另一个东西 —— 勿混同(roadmap.local/
+//! phase3-agent-session.md §〇)。
+//!
 //! 动机(session-plan.md 原文):消灭上层手工流程纪律——算子编排闭包
 //! 只写一份,执行三态(eager/捕获/回放)由 Session 承载。
 //!

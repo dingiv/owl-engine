@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// 捕获 slab 容量(64 MiB;图内 Alloc 从 slab 切块,零 cudaMalloc)
-pub(super) const CAPTURE_SLAB_ELEMS: usize = (64 << 20) / 4;
+pub(super) const CAPTURE_SLAB_BYTES: usize = 64 << 20;
 
 // 流身份证(server 内部路由键;客户端不可见 —— 三固定流是 server 策略)
 pub(super) type StreamId = u64;
@@ -60,8 +60,8 @@ impl DeviceSelector {
 /// - Owned:图外独立分配(cudaMallocAsync)
 /// - Carved:捕获期从 capture slab 切出的切片(零分配;slab 随块保活)
 pub(super) enum Block {
-    Owned(CudaSlice<f32>),
-    Carved { slab: Arc<CudaSlice<f32>>, off: usize, n: usize },
+    Owned(CudaSlice<u8>),
+    Carved { slab: Arc<CudaSlice<u8>>, off: usize, n: usize },
 }
 
 // ============================================================================
@@ -85,7 +85,7 @@ pub(super) struct GpuCtx {
 /// 捕获会话:目标流 + 切块 slab + 发射计数(空窗哨兵用)
 struct CaptureState {
     stream: Arc<CudaStream>,
-    slab: Arc<CudaSlice<f32>>,
+    slab: Arc<CudaSlice<u8>>,
     used: usize,
     launches: usize,
 }
@@ -149,7 +149,7 @@ impl GpuCtx {
         stream
             .synchronize()
             .map_err(|e| ModelError::Msg(format!("graph_begin: 预排空失败 {e:?}")))?;
-        let slab = unsafe { stream.alloc::<f32>(CAPTURE_SLAB_ELEMS) }
+        let slab = unsafe { stream.alloc::<u8>(CAPTURE_SLAB_BYTES) }
             .map_err(|e| ModelError::Msg(format!("graph_begin: 捕获 slab 分配失败 {e:?}")))?;
         let slab = Arc::new(slab);
         stream
@@ -207,7 +207,7 @@ impl GpuCtx {
     // ======================================================================
 
     /// 登记新块(图外:独立分配)
-    pub(super) fn new_block(&mut self, slice: CudaSlice<f32>) -> u64 {
+    pub(super) fn new_block(&mut self, slice: CudaSlice<u8>) -> u64 {
         let n = slice.len();
         let id = self.next_block;
         self.next_block += 1;
@@ -220,11 +220,11 @@ impl GpuCtx {
         let cap = self.capture.as_mut().ok_or_else(|| {
             ModelError::Msg("carve_block: 仅限捕获期(内部护栏违例)".to_string())
         })?;
-        if cap.used + n > CAPTURE_SLAB_ELEMS {
+        if cap.used + n > CAPTURE_SLAB_BYTES {
             return Err(ModelError::Msg(format!(
-                "捕获 slab 耗尽:已用 {} + 需 {n} > {}(提高 CAPTURE_SLAB_ELEMS)",
+                "捕获 slab 耗尽:已用 {} + 需 {n} > {}(提高 CAPTURE_SLAB_BYTES)",
                 cap.used,
-                CAPTURE_SLAB_ELEMS
+                CAPTURE_SLAB_BYTES
             )));
         }
         let id = self.next_block;
@@ -316,7 +316,7 @@ impl KernelCache {
 /// ⚠️ 生命周期纪律:pinned 内存在搬运完成前**不得释放**——本类型只允许
 /// 被 move 进完成回调,随回调一起 drop。
 pub(super) struct Staging {
-    ptr: *mut f32,
+    ptr: *mut u8,
     len: usize,
 }
 
@@ -324,27 +324,29 @@ unsafe impl Send for Staging {}
 
 impl owl_iface::contract::PinnedRegion for Staging {
     fn slice_mut(&mut self) -> &mut [f32] {
-        Staging::slice_mut(self)
+        // f32 视图(pinned 流水线仅剩 f32 装载路径在用;f16 走 htod 字节路径)
+        unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut f32, self.len / 4) }
     }
     fn as_f32(&self) -> &[f32] {
-        Staging::slice(self)
+        unsafe { std::slice::from_raw_parts(self.ptr as *const f32, self.len / 4) }
     }
 }
 
 impl Staging {
     /// 分配 n 元素的 pinned 缓冲(未初始化)
     pub(super) fn alloc(n: usize) -> Result<Self, ModelError> {
-        let ptr = unsafe { malloc_host(n * 4, 0) }
-            .map_err(|e| ModelError::Msg(format!("malloc_host: {e:?}")))? as *mut f32;
+        // 字节口径(f16 基线,2026-09-26):n = 字节数,DMA 按 byte 计数
+        let ptr = unsafe { malloc_host(n, 0) }
+            .map_err(|e| ModelError::Msg(format!("malloc_host: {e:?}")))? as *mut u8;
         assert!(!ptr.is_null());
         Ok(Self { ptr, len: n })
     }
 
-    pub(super) fn slice(&self) -> &[f32] {
+    pub(super) fn slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 
-    pub(super) fn slice_mut(&mut self) -> &mut [f32] {
+    pub(super) fn slice_mut(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
 }

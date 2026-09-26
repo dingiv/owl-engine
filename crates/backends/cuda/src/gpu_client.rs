@@ -97,13 +97,9 @@ impl DeviceClient for GpuClient {
         self.submit(move |ack| Command::GraphLaunch { graph, ack })?.await
     }
 
-    async fn alloc(&mut self, n_bytes: usize) -> Result<Bytes, ModelError> {
-        let n_elems = n_bytes / 4;
-        self.submit(move |ack| Command::Alloc { n_elems, ack })?.await
-    }
-
-    async fn htod_f32(&mut self, _shape: &Shape, data: Vec<f32>) -> Result<Bytes, ModelError> {
-        self.submit(move |ack| Command::Htod { data, ack })?.await
+    async fn alloc(&mut self, dtype: Dtype, elems: usize) -> Result<Bytes, ModelError> {
+        let n_bytes = elems * dtype.size_bytes();
+        self.submit(move |ack| Command::Alloc { n_bytes, elems, ack })?.await
     }
 
     async fn alloc_pinned(
@@ -137,10 +133,15 @@ impl DeviceClient for GpuClient {
         offset_elems: usize,
         data: &[f32],
     ) -> Result<(), ModelError> {
+        // f32 标量专用(slots/kv_lens 契约 5 恒 f32);字节化传输入口
+        let mut bytes = Vec::with_capacity(data.len() * 4);
+        for f in data {
+            bytes.extend_from_slice(&f.to_le_bytes());
+        }
         self.submit(move |ack| Command::HtodChunk {
             block: dst.id,
-            offset_elems,
-            data: data.to_vec(),
+            offset_bytes: offset_elems * 4,
+            data: bytes,
             ack,
         })?
         .await
@@ -155,23 +156,40 @@ impl DeviceClient for GpuClient {
 
     async fn htod(
         &mut self,
-        _dtype: Dtype,
-        _shape: &Shape,
+        dtype: Dtype,
+        shape: &Shape,
         src: &[u8],
     ) -> Result<Bytes, ModelError> {
-        let data: Vec<f32> = src
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        self.submit(move |ack| Command::Htod { data, ack })?.await
+        // 字节直传(f16 基线);Bytes.len = 元素数,按 shape 回填
+        let elems: usize = shape.iter().product();
+        let mut b = self
+            .submit(move |ack| Command::Htod { data: src.to_vec(), ack })?
+            .await?;
+        b.len = elems;
+        let _ = dtype;
+        Ok(b)
     }
 
     async fn dtoh(&mut self, b: &Bytes, out: &mut [u8]) -> Result<(), ModelError> {
         let id = b.id;
-        let want_elems = out.len() / 4;
-        let bytes = self.submit(move |ack| Command::Dtoh { id, want_elems, ack })?.await?;
+        let want_bytes = out.len();
+        let bytes = self.submit(move |ack| Command::Dtoh { id, want_bytes, ack })?.await?;
         out.copy_from_slice(&bytes);
         Ok(())
+    }
+
+    async fn gemm(
+        &mut self,
+        a: &Bytes,
+        b: &Bytes,
+        out: &Bytes,
+        m: usize,
+        k: usize,
+        n: usize,
+        nt: bool,
+    ) -> Result<(), ModelError> {
+        let (a, b, out) = (a.id, b.id, out.id);
+        self.submit(move |ack| Command::Gemm { a, b, out, m, k, n, nt, ack })?.await
     }
 
     // TODO: 考虑改成同步调用, 因为 launch 不用等待, 待定

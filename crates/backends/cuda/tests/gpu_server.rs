@@ -97,7 +97,7 @@ fn scale_msg(x: &Bytes, out: &Bytes, k: f32, n: usize) -> LaunchMsg {
 
 /// 步骤 1:alloc 零化(N4 图外 memset 回归哨)
 async fn step_alloc_zeroed(client: &mut GpuClient) {
-    let out = client.alloc(32).await.expect("alloc");
+    let out = client.alloc(Dtype::F32, 8).await.expect("alloc");
     let got = harvest(client, &out, 8).await;
     assert!(
         got.iter().all(|&v| v == 0.0),
@@ -123,7 +123,7 @@ async fn step_launch_scale(client: &mut GpuClient) {
         .htod(Dtype::F32, &Shape::from(vec![4]), &le_f32(&xs))
         .await
         .expect("htod");
-    let out = client.alloc(16).await.expect("alloc");
+    let out = client.alloc(Dtype::F32, 4).await.expect("alloc");
     client
         .launch(scale_msg(&x, &out, 3.0, 4))
         .await
@@ -139,7 +139,7 @@ async fn step_sync_is_barrier(client: &mut GpuClient) {
         .htod(Dtype::F32, &Shape::from(vec![src.len()]), &le_f32(&src))
         .await
         .expect("htod");
-    let out = client.alloc(src.len() * 4).await.expect("alloc");
+    let out = client.alloc(Dtype::F32, src.len()).await.expect("alloc");
     client.launch(scale_msg(&x, &out, 1.0, src.len())).await.expect("launch");
     let got = harvest(client, &out, src.len()).await;
     for (i, (g, w)) in got.iter().zip(src.iter()).enumerate() {
@@ -153,8 +153,8 @@ async fn step_graph_capture_and_replay(client: &mut GpuClient, x: &Bytes) {
     client.graph_begin().await.expect("graph_begin");
 
     // 捕获期 Alloc(切片块 + memset 进图)+ scale 发射
-    let zeros = client.alloc(16).await.expect("captured alloc");
-    let out = client.alloc(16).await.expect("captured alloc");
+    let zeros = client.alloc(Dtype::F32, 4).await.expect("captured alloc");
+    let out = client.alloc(Dtype::F32, 4).await.expect("captured alloc");
     client.launch(scale_msg(x, &out, 3.0, 4)).await.expect("launch");
 
     let gid = client.graph_end().await.expect("graph_end");
@@ -200,7 +200,7 @@ async fn step_close_semantics(client: &mut GpuClient) {
         matches!(r, Err(ModelError::ServerClosed)),
         "close 后 sync 应返回 ServerClosed,实得 {r:?}"
     );
-    let r = client.alloc(16).await;
+    let r = client.alloc(Dtype::F32, 4).await;
     assert!(
         matches!(r, Err(ModelError::ServerClosed)),
         "close 后 alloc 应返回 ServerClosed,实得 {r:?}"
@@ -255,4 +255,59 @@ async fn gpu_server_contract() {
     step_close_semantics(&mut client).await; // 7
 
     eprintln!("[t] 全部步骤完成");
+}
+
+// ============================================================================
+// F1:cuBLAS GEMM(f16 基线)对拍 —— GPU f16 gemm vs host f32 参考
+// ============================================================================
+
+fn le_f16(v: &[f32]) -> Vec<u8> {
+    v.iter()
+        .flat_map(|f| half::f16::from_f32(*f).to_le_bytes())
+        .collect()
+}
+
+fn f16_to_f32(buf: &[u8]) -> Vec<f32> {
+    buf.chunks_exact(2)
+        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+        .collect()
+}
+
+#[tokio::test]
+async fn gpu_gemm_f16_matches_host() {
+    let mut client = assemble();
+    // C[T=8, n=32] = A[8, k=64] × W[32, 64]^T(nt;owl Linear 惯例)
+    let (t, k, n) = (8usize, 64usize, 32usize);
+    let a: Vec<f32> = (0..t * k).map(|i| ((i as f32 * 0.37) - 4.0).sin() * 0.7).collect();
+    let w: Vec<f32> = (0..n * k).map(|i| ((i as f32 * 0.11) - 2.0).cos() * 0.5).collect();
+
+    // host f32 参考
+    let mut want = vec![0f32; t * n];
+    for (ti, a_row) in a.chunks_exact(k).enumerate() {
+        for (wi, w_row) in w.chunks_exact(k).enumerate() {
+            let acc: f32 = a_row.iter().zip(w_row).map(|(x, y)| x * y).sum();
+            want[ti * n + wi] = acc;
+        }
+    }
+
+    let da = client.htod(Dtype::F16, &Shape::from(vec![t, k]), &le_f16(&a)).await.expect("htod a");
+    let dw = client.htod(Dtype::F16, &Shape::from(vec![n, k]), &le_f16(&w)).await.expect("htod w");
+    let dout = client.alloc(Dtype::F16, t * n).await.expect("alloc out");
+    client.gemm(&da, &dw, &dout, n, k, t, true).await.expect("gemm");
+
+    let mut buf = vec![0u8; t * n * 2];
+    client.dtoh(&dout, &mut buf).await.expect("dtoh");
+    let got = f16_to_f32(&buf);
+
+    let mut max_diff = 0f32;
+    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        let diff = (g - w).abs();
+        max_diff = max_diff.max(diff);
+        assert!(
+            diff < 5e-2 * (1.0 + w.abs()),
+            "[{i}] gemm f16 {g} vs host {w}"
+        );
+    }
+    eprintln!("[gemm] max_diff = {max_diff:.5}(f16 in/acc32,容差 5e-2 相对)");
+    client.sync().await.expect("sync");
 }

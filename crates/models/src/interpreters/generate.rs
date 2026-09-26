@@ -70,7 +70,10 @@ pub async fn eval_generate<D: DeviceClient>(
     while out.len() < spec.max_new {
         let tid = if fed < prompt.len() { prompt[fed] } else { *out.last().expect("生成中") };
         let pos = fed;
-        // 每步动态 ctx:slots 恒 0 号槽;kv_lens 含本步(kernel 先写后打分)
+        // 每步动态 ctx:KV 槽 = 本 token 自己的格子(窗 = [slot-kv_len+1,
+        // slot] = [0, pos];2026-09-26 窗口语义探针定谳 —— slots 恒 0 会
+        // 读到块外垃圾行);GDN 状态格 = 序列槽恒 0(递推状态按序列累积)。
+        // kv_lens 含本步(kernel 先写后打分)。
         let ids_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[tid as f32]));
         let pos_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[pos as f32]));
         let kvs_step: Vec<KvBuffers> = kvs
@@ -78,7 +81,7 @@ pub async fn eval_generate<D: DeviceClient>(
             .map(|kv| KvBuffers {
                 k_cache: kv.k_cache.clone(),
                 v_cache: kv.v_cache.clone(),
-                slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
+                slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[pos as f32])),
                 kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[(pos + 1) as f32])),
             })
             .collect();

@@ -256,4 +256,64 @@ mod tests {
         assert!(format!("{err:?}").contains("缺动态依赖"), "毒值应带 ctx 归因:{err:?}");
         gpu.close().await.expect("server 关机");
     }
+
+    /// 连续槽窗语义钉(PF1-0 契约锚;OWL_TEST_DEVICE 门控):
+    /// 打分窗 = [slot-kv_len+1, slot]。缓存四行已知 k/v,q 对齐第 1 行,
+    /// 逐案验证窗口落点 —— 这也是现存“slots 恒 0”接线疑云的定谳探针。
+    #[tokio::test]
+    async fn gpu_attn_window_semantics() {
+        if !crate::testkit::gpu_enabled() {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return;
+        }
+        // hq=hkv=1, hd=2;rows: 0=[1,0] 1=[0,3] 2=[.5,.5] 3=[9,9](哨兵行不进窗)
+        let k_cache = [1.0, 0.0, 0.0, 3.0, 0.5, 0.5, 9.0, 9.0];
+        let v_cache = [1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 9.0, 9.0];
+        let q = [0.0, 3.0]; // = k1 → 正确窗内应压倒性取 v1
+        // 当前 token 的 k/v = 它自己槽位的值(核先写 cache 后打分,dummy 会脏化窗口)
+        let cur = |slot: usize| (vec![k_cache[slot * 2], k_cache[slot * 2 + 1]], vec![v_cache[slot * 2], v_cache[slot * 2 + 1]]);
+        let probe = |slot: f32, kv_len: f32| {
+            let s = slot as usize;
+            let (ck, cv) = cur(s);
+            let kc = TensorOps::from_host(Dtype::F32, vec![4, 1, 2], &f32b(&k_cache));
+            let vc = TensorOps::from_host(Dtype::F32, vec![4, 1, 2], &f32b(&v_cache));
+            TensorOps::of(kernel::kernel_with(
+                "owl_naive_decode_attn_f32",
+                (0, 0, 0),
+                (256, 1, 1),
+                0,
+            ))
+            .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1, 2], &f32b(&q)))
+            .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1, 2], &f32b(&ck)))
+            .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1, 2], &f32b(&cv)))
+            .arg(&kc)
+            .arg(&vc)
+            .arg(&TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot])))
+            .arg(&TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[kv_len])))
+            .arg_usize(1)
+            .arg_usize(1)
+            .arg_usize(1)
+            .arg_usize(2)
+            .with_shape(Dtype::F32, vec![1, 2])
+        };
+
+        let mut gpu = crate::testkit::gpu_client().await;
+        // A1:slot=2, kv_len=3 → 窗 [0,2]:q·k=[0,9,1.5] → softmax ≈ v1
+        let out = harvest(&mut gpu, &probe(2.0, 3.0)).await;
+        eprintln!("[probe] A1 slot=2 kv=3 → {:?}(期望 ≈ v1=[0,1])", out);
+        assert!(out[0] < 0.01 && (out[1] - 1.0).abs() < 0.01, "A1 窗 [0,2] 应≈v1,得 {out:?}");
+        // A2:slot=1, kv_len=1 → 窗 [1,1] 单行 → out == v1 逐位
+        let out = harvest(&mut gpu, &probe(1.0, 1.0)).await;
+        eprintln!("[probe] A2 slot=1 kv=1 → {:?}(期望 == v1=[0,1])", out);
+        assert!(out[0].abs() < 1e-5 && (out[1] - 1.0).abs() < 1e-5, "A2 单行窗应==v1,得 {out:?}");
+        // A3:slot=0, kv_len=2 → 窗 [-1,0]:现存“slots 恒 0”接线的真实落点。
+        // 行 −1 在块外(池内邻块垃圾);仅打印定谳,不做断言。
+        let out = harvest(&mut gpu, &probe(0.0, 2.0)).await;
+        eprintln!("[probe] A3 slot=0 kv=2 → {:?}(现存接线:窗 [-1,0],行-1=块外垃圾)", out);
+        // A4:对照 —— 同写窗但合法:slot=1, kv_len=2 → 窗 [0,1] → 仍≈v1
+        let out = harvest(&mut gpu, &probe(1.0, 2.0)).await;
+        eprintln!("[probe] A4 slot=1 kv=2 → {:?}(窗 [0,1] 期望≈v1)", out);
+        assert!(out[0] < 0.01 && (out[1] - 1.0).abs() < 0.01, "A4 窗 [0,1] 应≈v1,得 {out:?}");
+        gpu.close().await.expect("server 关机");
+    }
 }

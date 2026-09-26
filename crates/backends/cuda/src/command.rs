@@ -33,22 +33,24 @@ pub enum Command {
         graph: GraphId,
         ack: Ack<Result<(), ModelError>>,
     },
-    /// 清零分配(设备侧 memset,流序非阻塞;捕获期自动切 slab)
+    /// 清零分配(设备侧 memset,流序非阻塞;捕获期自动切 slab)。
+    /// n_bytes = 清零/切块字节数;elems = Bytes 账长(元素口径,f16 ≠ bytes/4)
     Alloc {
-        n_elems: usize,
+        n_bytes: usize,
+        elems: usize,
         ack: Ack<Result<Bytes, ModelError>>,
     },
-    /// host → device(pinned 码头 + 异步 memcpy;完成经 host 回调回执)
+    /// host → device(字节传输,f16 基线;Staging 字节码头 + 异步 memcpy)
     Htod {
-        data: Vec<f32>,
+        data: Vec<u8>,
         ack: Ack<Result<Bytes, ModelError>>,
     },
-    /// host → device **分块写入**(流式装载):向已 alloc 的块在
-    /// offset_elems 处写 data(pinned 码头 + 异步 memcpy 原位)
+    /// host → device **分块写入**(write_block 路径):向已 alloc 的块在
+    /// offset_bytes 处写字节(pinned 码头 + 异步 memcpy 原位)
     HtodChunk {
         block: u64,
-        offset_elems: usize,
-        data: Vec<f32>,
+        offset_bytes: usize,
+        data: Vec<u8>,
         ack: Ack<Result<(), ModelError>>,
     },
     /// 分配 pinned 租约(流式装载 DMA 源;池优先,miss 才 cudaHostAlloc)
@@ -65,16 +67,31 @@ pub enum Command {
         elems: usize,
         ack: Ack<Result<(), ModelError>>,
     },
-    /// device → host(异步 memcpy 到 pinned 码头;完成经 host 回调回执并转换字节)
+    /// device → host(异步 memcpy 到 pinned 码头;want_bytes 字节口径)
     Dtoh {
         id: u64,
-        want_elems: usize,
+        want_bytes: usize,
         ack: Ack<Result<Vec<u8>, ModelError>>,
     },
     /// kernel 发射(非阻塞;fire-and-forget)
     Launch {
         msg: LaunchMsg,
         ack: Ack<Result<Bytes, ModelError>>,
+    },
+    /// cuBLAS GEMM(f16 基线,2026-09-26):C = A×B^T(nt,owl Linear 惯例)
+    /// 或 C = A×B;输入 f16,COMPUTE_32F 累计,f16 输出。非捕获路径
+    /// (prefill eager;图捕获内 cublas 可捕但暂不启用,见 f16 战役 §五)
+    Gemm {
+        a: u64,
+        b: u64,
+        out: u64,
+        /// 输出行数(= nt 时权重行数 / plain 时 B 列数)
+        m: usize,
+        k: usize,
+        /// 输出列数(= token 数)
+        n: usize,
+        nt: bool,
+        ack: Ack<Result<(), ModelError>>,
     },
     /// 排空点(三条流全部 synchronize)
     Sync {

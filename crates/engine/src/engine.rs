@@ -149,7 +149,10 @@ impl<D: DeviceClient> Engine<D> {
         let gdns: Vec<GdnBuffers> = gdns_b.iter().map(gdn_leaf).collect();
 
         // Session 闭包:槽 → 整模单树(状态句柄捕获;模型 Arc 共享)。
-        // 捕获期禁 Htod:所有常量标量(slots 0 号槽)走持久槽 slot0。
+        // 捕获期禁 Htod:常量标量走持久槽;KV/GDN 双槽分立 ——
+        // KV 槽 = 本 token 自己的格子(窗 = [slot-kv_len+1, slot],随步进;
+        // 2026-09-26 窗口语义探针定谳:slots 恒 0 读块外垃圾行);
+        // GDN 槽 = 序列状态格,turn 内恒 0(递推状态按序列累积)。
         let model = Arc::clone(&loaded.model);
         let rp = loaded.rope;
         let vocab = loaded.model.vocab_size();
@@ -157,13 +160,14 @@ impl<D: DeviceClient> Engine<D> {
             let ids = sc.input("frontier")?;
             let pos = sc.input("pos")?;
             let kv_len = sc.input("kv_len")?;
-            let slot0 = sc.input("slot0")?;
+            let kv_slot = sc.input("kv_slot")?;
+            let gdn_slot = sc.input("gdn_slot")?;
             let kvs_step: Vec<KvBuffers> = kvs
                 .iter()
                 .map(|kv| KvBuffers {
                     k_cache: kv.k_cache.clone(),
                     v_cache: kv.v_cache.clone(),
-                    slots: slot0.clone(),
+                    slots: kv_slot.clone(),
                     kv_lens: kv_len.clone(),
                 })
                 .collect();
@@ -174,7 +178,7 @@ impl<D: DeviceClient> Engine<D> {
                     conv_k: g.conv_k.clone(),
                     conv_v: g.conv_v.clone(),
                     rec: g.rec.clone(),
-                    slots: slot0.clone(),
+                    slots: gdn_slot.clone(),
                 })
                 .collect();
             let ctx = ForwardCtx::model_decode(1, &pos, &kvs_step, &rp, &gdns_step);
@@ -189,7 +193,8 @@ impl<D: DeviceClient> Engine<D> {
                     InputSlot::f32("frontier", 1),
                     InputSlot::f32("pos", 1),
                     InputSlot::f32("kv_len", 1),
-                    InputSlot::f32("slot0", 1).init(vec![0.0]),
+                    InputSlot::f32("kv_slot", 1),
+                    InputSlot::f32("gdn_slot", 1).init(vec![0.0]),
                 ],
                 outputs: vec![OutputSlot::f32("logits", &[1, vocab])],
                 capture: true,
@@ -324,6 +329,8 @@ impl<D: DeviceClient> RunningEngine<D> {
                 ("frontier", &[tid as f32]),
                 ("pos", &[pos as f32]),
                 ("kv_len", &[(pos + 1) as f32]),
+                ("kv_slot", &[pos as f32]),
+                ("gdn_slot", &[0.0]),
             ])
             .await?;
 
