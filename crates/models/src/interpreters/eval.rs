@@ -15,6 +15,8 @@ use crate::tensor::TensorOps;
 use std::future::Future;
 use std::pin::Pin;
 
+use super::observe::{BlockRef, BlockStats, NodeEvent, Tap, Want};
+
 // ============================================================================
 // §1 异步解释器:eval(层入口)/ eval_ops(树归约;引擎主路径)
 // ============================================================================
@@ -49,15 +51,36 @@ where
     D: crate::contract::DeviceClient + 'a,
 {
     Box::pin(async move {
-        let mut ctx = EvalCtx { face, memo: std::collections::HashMap::new() };
+        let mut ctx =
+            EvalCtx { face, memo: std::collections::HashMap::new(), tap: None };
         _eval_rec(t, &mut ctx).await
     })
 }
 
-/// 求值上下文(CSE 备忘录 + 后端句柄)
+/// 带观测的求值(interpreter-tap.md §4.2):归约语义与 [`eval_ops`]
+/// 完全一致,仅在每个节点 After 窗口发事件 —— 数据读取(Stats/Bytes)
+/// 由解释器代执行,tap 零执行权(观测窗口律,候选 §四 律 25)。
+pub fn eval_ops_tap<'a, D>(
+    t: &'a TensorOps,
+    face: &'a mut D,
+    tap: &'a mut dyn Tap,
+) -> Pin<Box<dyn Future<Output = Result<Bytes, ModelError>> + Send + 'a>>
+where
+    D: crate::contract::DeviceClient + 'a,
+{
+    Box::pin(async move {
+        let mut ctx =
+            EvalCtx { face, memo: std::collections::HashMap::new(), tap: Some(tap) };
+        _eval_rec(t, &mut ctx).await
+    })
+}
+
+/// 求值上下文(CSE 备忘录 + 后端句柄 + 观测者)
 struct EvalCtx<'a, D> {
     face: &'a mut D,
     memo: std::collections::HashMap<u64, Bytes>,
+    /// 观测面(interpreter-tap.md;None = 零开销直通)
+    tap: Option<&'a mut dyn Tap>,
 }
 
 /// DAG 求值入口(装箱:async 递归要求;'b 短借用 reborrow)。
@@ -87,10 +110,12 @@ where
         return Ok(b.clone());
     }
     if let Some(e) = &t.err {
-        return Err(ModelError::Msg(format!(
-            "[毒值落地 @depth {}] {}",
-            e.at_depth, e.detail
-        )));
+        let detail = format!("[毒值落地 @depth {}] {}", e.at_depth, e.detail);
+        // Tap:Poison 事件(毒值节点无输出块,无 After;归约照旧 Err)
+        if let Some(tap) = ctx.tap.as_deref_mut() {
+            tap.on_poison(t.id, &detail);
+        }
+        return Err(ModelError::Msg(detail));
     }
     let mut ins: Vec<Bytes> = Vec::with_capacity(t.parents.len());
     for p in &t.parents {
@@ -180,5 +205,41 @@ where
         other => return Err(ModelError::Msg(format!("eval 未覆盖: {other:?}"))),
     };
     ctx.memo.insert(t.id, out.clone());
+    // ── Tap:After 窗口(输出已入 memo;父输入仍在 memo 存活)──
+    // 观测窗口律:数据读取由解释器代执行并在窗口内完成;窗口外读块
+    // 未定义(scratch 块 eval 结束后可被池复用)。tap 无 launch/alloc
+    // 权 —— 观测在结构上不可能改变计算(对照 harvest 重放污染)。
+    if let Some(tap) = ctx.tap.as_deref_mut() {
+        let ev = NodeEvent {
+            id: t.id,
+            op: &t.op,
+            dtype,
+            shape: &t.shape,
+            depth: t.depth,
+            tag: t.label.as_deref(),
+            out: BlockRef { block_id: out.id, len: out.len },
+        };
+        match tap.on_node(&ev) {
+            Want::Quiet | Want::Keep => {} // Keep:MVP 未实施,按 Quiet 落空
+            Want::Stats => {
+                let mut buf = vec![0u8; n_bytes];
+                ctx.face.dtoh(&out, &mut buf).await?;
+                let host: Vec<f32> = buf
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                tap.on_stats(t.id, BlockStats::of(&host));
+            }
+            Want::Bytes => {
+                let mut buf = vec![0u8; n_bytes];
+                ctx.face.dtoh(&out, &mut buf).await?;
+                let host: Vec<f32> = buf
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                tap.on_bytes(&ev, &host);
+            }
+        }
+    }
     Ok(out)
 }

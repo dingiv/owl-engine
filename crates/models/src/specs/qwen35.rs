@@ -211,12 +211,15 @@ mod tests {
     }
 
 
-    /// 诊断:真模型逐层 hidden 范数(定位 step1 塌零层)
+    /// 诊断(tap 单遍):真模型逐层 hidden rms 曲线(定位 step1 塌零层)。
+    /// 整模单树单遍归约,StatsTap 只看层根 tag —— 零重放,状态每步只推进
+    /// 一次(旧逐层 harvest 重放污染读数,已废;interpreter-tap.md §一)。
     #[tokio::test]
     async fn gpu_model_step_diag() -> Result<(), crate::contract::ModelError> {
         use crate::layers::gdn::GdnBuffers;
         use crate::layers::rope::Rope;
         use crate::module::KvBuffers;
+        use crate::testkit::f32_of;
         if !crate::testkit::gpu_enabled() {
             crate::testkit::skip_note();
             return Ok(());
@@ -251,10 +254,34 @@ mod tests {
         let kvs = mk_kvs;
         let gdns = mk_gdns;
 
-        // manifest(校验过的块句柄,供 matmul 直探)
+        // manifest(装载即校验;320 块 checksum 另有专测 gpu_vram_manifest_checksum)
         let src_chk = SafeTensorsSource::open_dir(&dir)?;
-        let manifest = crate::interpreters::eval_load(&model, &mut gpu, &src_chk, &Default::default()).await?;
+        let _manifest =
+            crate::interpreters::eval_load(&model, &mut gpu, &src_chk, &Default::default())
+                .await?;
         let steps = [(985.0f32, 0.0f32, 0.0f32, 1.0f32), (4123.0, 1.0, 1.0, 2.0f32)];
+        // 引用重读探针(竞速判决):记录层根块引用,步终 sync 后重读 ——
+        // 窗口内读零 + 步终读非零 = D2H 流与 COMPUTE 流无同步的竞速读
+        struct RefProbe {
+            refs: Vec<(String, crate::contract::Bytes, usize)>,
+        }
+        impl crate::interpreters::Tap for RefProbe {
+            fn on_node(
+                &mut self,
+                ev: &crate::interpreters::NodeEvent<'_>,
+            ) -> crate::interpreters::Want {
+                if let Some(t) = ev.tag {
+                    let elems: usize = ev.shape.iter().product();
+                    self.refs.push((
+                        t.to_string(),
+                        crate::contract::Bytes { id: ev.out.block_id, len: elems },
+                        elems,
+                    ));
+                }
+                crate::interpreters::Want::Quiet
+            }
+        }
+        let mut probe = RefProbe { refs: Vec::new() };
         for (si, &(id, pos, slot, kv_len)) in steps.iter().enumerate() {
             eprintln!("[diag] === step{si} (pos {pos} slot {slot} kv_len {kv_len}) ===");
             let ids = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[id]));
@@ -279,33 +306,37 @@ mod tests {
                 })
                 .collect();
             let base_ctx = ForwardCtx::model_decode(1, &pos_t, &kvs_step, &rp, &gdns_step);
-            let mut xs = model.embed.forward(&ids, &base_ctx);
-            {
-                let e0 = crate::testkit::harvest(&mut gpu, &xs).await;
-                eprintln!("[diag]   embed rms={:.6} first3={:?}", e0.iter().map(|v| v*v).sum::<f32>().sqrt()/e0.len() as f32, &e0[..3]);
-                // 决定性:用 manifest 已验证的 in_proj_qkv 块直接 matmul
-                let qkv_key = format!("model.language_model.layers.0.linear_attn.in_proj_qkv.weight");
-                let e = manifest.entries().iter().find(|x| x.key == qkv_key).unwrap();
-                let wq = TensorOps::of_block(e.block.id, Dtype::F32, e.shape.clone());
-                let mm = xs.matmul(&wq);
-                let m0 = crate::testkit::harvest(&mut gpu, &mm).await;
-                eprintln!("[diag]   L0.in_proj matmul rms={:.6} first3={:?}",
-                    m0.iter().map(|v| v*v).sum::<f32>().sqrt()/m0.len() as f32, &m0[..3]);
-            }
-            let (mut kvi, mut gi) = (0usize, 0usize);
-            for (li, layer) in model.layers.iter().enumerate() {
-                let sub = model.layer_ctx(&base_ctx, kvi, gi);
-                xs = layer.forward(&xs, &sub);
-                if layer.is_full() { kvi += 1; } else { gi += 1; }
-                let got = crate::testkit::harvest(&mut gpu, &xs).await;
-                let norm = got.iter().map(|v| v * v).sum::<f32>().sqrt() / got.len() as f32;
-                if li % 3 == 2 || got.iter().all(|v| *v == 0.0) {
-                    eprintln!("[diag]   L{li:2}({}) rms={:.6} zeros={}", if layer.is_full() {"F"} else {"G"}, norm, got.iter().filter(|v| **v == 0.0).count());
+            // ── 律 25(候选):带状态观测禁重放 —— 整模单树**单遍**归约,
+            // tap 层根曲线代替旧逐层 harvest(旧法每层整链重放,GDN 状态
+            // 被观测行为污染,读数不可信 —— interpreter-tap.md §一)。
+            let tree = model.forward(&ids, &base_ctx); // embed→…→norm→logits,层根已打标
+            let logits = {
+                let mut curve = crate::interpreters::StatsTap::curve(si);
+                let mut taps = crate::interpreters::observe::TapChain(&mut curve, &mut probe);
+                crate::interpreters::eval_ops_tap(tree.step(), &mut gpu, &mut taps).await?
+            };
+            // 步终判读:logits top-1(塌零 = top 落在 0 向量上)
+            let mut buf = vec![0u8; model.vocab_size() * 4];
+            gpu.dtoh(&logits, &mut buf).await?;
+            let lh = f32_of(&buf);
+            let (ti, tv) = lh.iter().enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |a, (i, &v)| {
+                    if v > a.1 { (i, v) } else { a }
+                });
+            eprintln!("[diag]   step{si} top@{ti} logit={tv:.4}");
+            // ── 竞速判决:三流 sync 后重读 L0 层根与 final_norm(窗口内读的同一块)──
+            gpu.sync().await?;
+            for (tag, b, elems) in &probe.refs {
+                if !matches!(tag.as_str(), "L0.gdn" | "final_norm") {
+                    continue;
                 }
+                let mut buf = vec![0u8; elems * 4];
+                gpu.dtoh(b, &mut buf).await?;
+                let h = f32_of(&buf);
+                let rms = (h.iter().map(|v| v * v).sum::<f32>() / h.len() as f32).sqrt();
+                eprintln!("[diag]   [sync后重读] {tag} rms={rms:.6} zeros={}", h.iter().filter(|v| **v == 0.0).count());
             }
-            let fin = model.norm.forward(&xs, &base_ctx);
-            let got = crate::testkit::harvest(&mut gpu, &fin).await;
-            eprintln!("[diag]   final-norm rms={:.6} first3={:?}", got.iter().map(|v| v*v).sum::<f32>().sqrt()/got.len() as f32, &got[..3.min(got.len())]);
+            probe.refs.clear();
         }
         gpu.close().await?;
         Ok(())

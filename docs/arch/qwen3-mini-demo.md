@@ -272,6 +272,7 @@ model.norm [1024]                                    ×1(终局 norm)
 
 | 2026-09-26 | **批 8 拆分**:model.rs(共有主干机制)与 specs/qwen35.rs(Qwen3.5 特有参数事实:0.8B 维度 + 3:1 层型表)分离;specs/mod.rs 立拆分律;新律 §四 23;53/53 + GPU 两步 ✓ |
 | 2026-09-26 | **批 8 拆分 + M-e 首战**:model.rs(共有主干)与 specs/qwen35.rs(Qwen3.5 参数+键名约定+load_0_8b)分离;**Want.key → String + LoaderOps::map_keys,Model 实现 Loadable 整模单清单装载(load 函数废弃,用户裁决)**;**Arc parents 修订(§四 18)**:值语义深拷贝在真 24 层下 2^24 指数爆炸(实测 48ms/层翻倍曲线),改物理 DAG 后构造/遍历/求值全线性;装载域单缓冲分块转置(§四 24);SafeTensorsSource(BF16→f32);GPU 真权重两步 decode 冒烟 ✓ 16.7s/6.7GB;新律 §四 24 |
+| 2026-09-26 | **M-e 补记:观测面 tap 落地 + step1 塔零案定谳**(设计 docs/arch/interpreter-tap.md):interpreters/observe.rs(事件词汇/Want 协议/StatsTap/TapChain)+ eval 三事件点(eval_ops_tap)+ TensorOps label/tag 标注族(同 id 必同 label)+ Model 层根自动打标 + reference reduce_tap(双锚同 id 对齐,挂账);**塔零定谳 = D2H/COMPUTE 跨流竞速**(server handle_dtoh 先排空 COMPUTE,修复后窗口读数与 sync 重读逐位一致)+ harvest 重放污染(从犯,带状态观测禁重放入律候选 25);单遍曲线 24 层全非零,step0 top@84 / **step1 top@279 logit=14.91 塔零消失**,59/59 全绿(OWL_TEST_DEVICE 钉空闲卡) |
 
 ## 七 移植参考
 - 旧世界母本:`crates/engine/src/models/qwen3_5.rs`(Qwen3_5ForCausalLM:

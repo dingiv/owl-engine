@@ -177,8 +177,22 @@ pub struct LaunchMsg {
 /// 流语义:server 按业界三流模型固定路由(H2D/COMPUTE/D2H,客户端不可
 /// 自创也不可见;多并发靠算子维 batching,不靠多流)——
 /// htod→H2D,launch/alloc/graph→COMPUTE,dtoh→D2H,sync 排空全部。
-/// 流内保序(依赖维),流间并发(传输/计算重叠维)。跨流依赖(事件边)
-/// 待服务端扩展。
+/// 流内保序(依赖维),流间并发(传输/计算重叠维)。
+///
+/// **顺序语义**(2026-09-26 塔零案定谳后成文;此前 dtoh 跨流读序未定义):
+/// - 三流之间**无隐式依赖**。跨流读写序由两个且仅两个途径建立:
+///   ① 数据搬运命令的**回执时序**(H2D 族回执即落地;dtoh 回执即读毕);
+///   ② 显式 [`DeviceClient::sync`] 栅栏。
+/// - **dtoh = 读语义**:issue 相排空 COMPUTE(处理本命令时,该流此前
+///   提交的全部 kernel 落定),随后 D2H 异步拷贝 —— 回执时 host 拿到的
+///   是块在**全部先前已回执命令**之后的值。无序拷贝(收割与独立计算
+///   重叠)列为将来显式 opt-in 原语,今日无需求不立项。
+/// - **launch 只同流保序**:kernel×kernel 先后(同流)硬件保证;
+///   kernel 与数据搬运的先后必须经上述 ①② 建立 —— 客户端顺序 await
+///   纪律下自动成立(每个回执都是时序锚);流水线姿势(发后不等回执)
+///   不在保序范围,将来需要时加显式 event 边(挂账)。
+/// - H2D 族(htod/HtodChunk/UploadPinned)2026-09-26 已核:ack 全部走
+///   finish 回调 —— **回执即数据落地**,后续 launch 跨流读安全。
 ///
 /// **回执语义分级**(Future resolve 时机):
 /// - `alloc` / `launch`:Ok = 提交成功 + 账房登记(fire-and-forget;
@@ -186,7 +200,7 @@ pub struct LaunchMsg {
 ///   `dtoh`/`sync` 收割)
 /// - `htod` / `dtoh`:Ok = GPU 真完成(pinned 码头生命周期/数据收割
 ///   要求真实完成点;完成通知走 host 回调 cuLaunchHostFunc)
-/// - `sync`:栅栏,该流此前所有工作全部落定
+/// - `sync`:栅栏,三条流此前全部工作落定(全设备语义屏障)
 pub trait DeviceClient: Send {
     /// 图捕获开始:进入捕获模式(此后 Launch 进图;
     /// Alloc 从捕获 slab 切块,零 cudaMalloc)。护栏:
@@ -202,18 +216,29 @@ pub trait DeviceClient: Send {
         &mut self,
         graph: GraphId,
     ) -> impl Future<Output = Result<(), ModelError>> + Send;
+    /// 清零分配:块登记 + COMPUTE 流序 memset 入队(异步;捕获期 slab
+    /// 切块同款清零,Op::Zeros 语义的设备侧保证)
     fn alloc(&mut self, n_bytes: usize)
         -> impl Future<Output = Result<Bytes, ModelError>> + Send;
+    /// host 数据入块(H2D 流异步拷贝 + finish 回调携 ack):**回执即数据
+    /// 落地**,后续 launch 跨流读安全(顺序语义,见 trait 级文档)
     fn htod(
         &mut self,
         dtype: Dtype,
         shape: &Shape,
         src: &[u8],
     ) -> impl Future<Output = Result<Bytes, ModelError>> + Send;
+    /// 块读出(**读语义**,2026-09-26 成文):issue 相排空 COMPUTE 后
+    /// D2H 异步拷贝 —— 回执时 out = 块在全部先前已回执命令之后的值。
+    /// 与 [`DeviceClient::sync`] 的分工:本命令为读数据;sync 为不读
+    /// 数据的显式栅栏(计时/步边界/捕获前净空)
     fn dtoh(&mut self, b: &Bytes, out: &mut [u8])
         -> impl Future<Output = Result<(), ModelError>> + Send;
+    /// 算子发射(COMPUTE 流,火后不理):Ok = 提交成功;同流保序,
+    /// 与数据搬运的跨流先后靠回执时序/sync 建立(顺序语义,见 trait 级文档)
     fn launch(&mut self, msg: LaunchMsg)
         -> impl Future<Output = Result<Bytes, ModelError>> + Send;
+    /// 全设备栅栏:三条流此前全部工作落定方回执(计时/步边界/捕获前净空)
     fn sync(&mut self) -> impl Future<Output = Result<(), ModelError>> + Send;
 
     /// f32 直传(流式装载,2026-09-26):owned Vec<f32> **所有权移入**

@@ -14,6 +14,7 @@
 
 use crate::contract::{ModelError, Shape};
 use crate::contract::numel;
+use crate::interpreters::observe::{BlockRef, BlockStats, NodeEvent, Tap, Want};
 use crate::ops::Op;
 use crate::tensor::{Dtype, TensorOps};
 
@@ -110,19 +111,41 @@ pub fn reduce(
     t: &TensorOps,
     itp: &mut impl Interpreter,
 ) -> Result<Value, ModelError> {
+    reduce_tap(t, itp, None)
+}
+
+/// 带观测的归约(interpreter-tap.md §五):事件词汇与计算域
+/// `eval_ops_tap` 同源;**同树双锚求值,id 在声明期已定,天然对齐**
+/// —— 逐节点自动 bisect 的 CPU 侧挂点。值已在手上(CPU 无池块),
+/// 统计本地即算,观测窗口律天然满足。
+pub fn reduce_tap(
+    t: &TensorOps,
+    itp: &mut impl Interpreter,
+    tap: Option<&mut dyn Tap>,
+) -> Result<Value, ModelError> {
+    let mut tap = tap;
+    reduce_rec(t, itp, &mut tap)
+}
+
+fn reduce_rec(
+    t: &TensorOps,
+    itp: &mut impl Interpreter,
+    tap: &mut Option<&mut dyn Tap>,
+) -> Result<Value, ModelError> {
     // 毒值落地(案发 = depth + detail;LazyError 可回溯)
     if let Some(e) = &t.err {
-        return Err(ModelError::Msg(format!(
-            "[毒值落地 @depth {}] {}",
-            e.at_depth, e.detail
-        )));
+        let detail = format!("[毒值落地 @depth {}] {}", e.at_depth, e.detail);
+        if let Some(tp) = tap.as_deref_mut() {
+            tp.on_poison(t.id, &detail);
+        }
+        return Err(ModelError::Msg(detail));
     }
     let ins: Vec<Value> = t
         .parents
         .iter()
-        .map(|p| reduce(p, itp))
+        .map(|p| reduce_rec(p, itp, tap))
         .collect::<Result<_, _>>()?;
-    match &t.op {
+    let value: Value = match &t.op {
         Op::Htod { bytes } => itp.htod(t.dtype, &t.shape, bytes),
         Op::Zeros => itp.zeros(t.dtype, &t.shape),
         Op::Matmul => itp.matmul(&ins[0], &ins[1], t.dtype, &t.shape),
@@ -143,7 +166,25 @@ pub fn reduce(
         other => Err(ModelError::Msg(format!(
             "CPU 参考解释器未覆盖: {other:?}(server 侧实现)"
         ))),
+    }?;
+    // ── Tap:After 窗口(CPU 无池块,block_id = NO_POOL 哨兵)──
+    if let Some(tp) = tap.as_deref_mut() {
+        let ev = NodeEvent {
+            id: t.id,
+            op: &t.op,
+            dtype: t.dtype,
+            shape: &t.shape,
+            depth: t.depth,
+            tag: t.label.as_deref(),
+            out: BlockRef { block_id: BlockRef::NO_POOL, len: value.f32.len() },
+        };
+        match tp.on_node(&ev) {
+            Want::Quiet | Want::Keep => {} // Keep:MVP 未实施,按 Quiet 落空
+            Want::Stats => tp.on_stats(t.id, BlockStats::of(&value.f32)),
+            Want::Bytes => tp.on_bytes(&ev, &value.f32),
+        }
     }
+    Ok(value)
 }
 
 // ============================================================================

@@ -130,25 +130,32 @@ impl Model {
 
     /// 主干声明至 last hidden(pre-lm_head;MTP/深栈支线的挂点)
     pub fn last_hidden(&self, ids: &TensorOps, ctx: &ForwardCtx) -> TensorOps {
-        let mut xs = self.embed.forward(ids, ctx);
+        // 层根自动打标(interpreter-tap.md §3.2):Model 是唯一知道层坐标
+        // 的声明者;tag 是纯标注(同 id 不变,CSE memo 不受影响),是观测
+        // 面 tap 曲线/golden 指纹的定位键。
+        let mut xs = self.embed.forward(ids, ctx).tag("embed");
         let (mut kvi, mut gi) = (0usize, 0usize);
-        for layer in &self.layers {
+        for (li, layer) in self.layers.iter().enumerate() {
             let sub = self.layer_ctx(ctx, kvi, gi);
-            xs = layer.forward(&xs, &sub);
+            xs = layer
+                .forward(&xs, &sub)
+                .tag(format!("L{li}.{}", if layer.is_full() { "attn" } else { "gdn" }));
             if layer.is_full() {
                 kvi += 1;
             } else {
                 gi += 1;
             }
         }
-        self.norm.forward(&xs, ctx)
+        self.norm.forward(&xs, ctx).tag("final_norm")
     }
 }
 
 impl Module for Model {
     /// 整模单树(C5):embed → 层链 → final norm → tied lm_head
     fn forward(&self, ids: &TensorOps, ctx: &ForwardCtx) -> TensorOps {
-        self.embed.lm_head_matmul(&self.last_hidden(ids, ctx))
+        self.embed
+            .lm_head_matmul(&self.last_hidden(ids, ctx))
+            .tag("logits")
     }
 }
 

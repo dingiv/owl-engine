@@ -35,7 +35,11 @@ pub fn f32_of(buf: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// 声明求值 + dtoh 收割(测试/对拍公共路径)
+/// 声明求值 + dtoh 收割(测试/对拍公共路径)。
+/// ⚠️ **重放语义**(interpreter-tap.md §一):每次调用独立 eval_ops 整链
+/// 重算 —— 纯函数小对拍用;**带状态层(GDN conv/delta 写状态)禁用**
+/// (每观测一次多执行一遍,观测污染被观测系统)。带状态观测走
+/// `interpreters::eval_ops_tap` + [`crate::interpreters::StatsTap`] 单遍曲线。
 pub async fn harvest<D: DeviceClient>(face: &mut D, t: &TensorOps) -> Vec<f32> {
     let n: usize = t.shape().iter().product();
     let bytes = crate::interpreters::eval_ops(t.step(), face)

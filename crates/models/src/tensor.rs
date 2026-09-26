@@ -122,6 +122,10 @@ pub struct TensorOps {
     pub(crate) args: Vec<KernelArg>,
     /// 毒值(构造期违约;随子树透传)
     pub(crate) err: Option<LazyError>,
+    /// 语义坐标标注(观测面 tap 的定位键;纯标注非身份 —— **同 id 必同
+    /// label**,克隆保留;执行路径零参与。见 interpreters/observe.rs 与
+    /// docs/arch/interpreter-tap.md §三)
+    pub(crate) label: Option<std::sync::Arc<str>>,
 }
 
 impl TensorOps {
@@ -154,6 +158,20 @@ impl TensorOps {
     /// 节点身份证(错误归因/server 对账/缓存键)
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// 语义坐标(观测面;None = 未打标)
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+
+    /// 打标:语义坐标(观测面 tap 的定位键;interpreter-tap.md §三)。
+    /// clone 本节点设标注 —— 同 id 不变(CSE memo/双锚对齐不受影响),
+    /// O(1)(parents Arc 共享,浅拷贝)。层根自动打标见 Model::last_hidden。
+    pub fn tag(self, s: impl Into<std::sync::Arc<str>>) -> TensorOps {
+        let mut c = self;
+        c.label = Some(s.into());
+        c
     }
 
     /// 展平:自根收集整棵遍历子树,按深度升序(审计/烘焙的原材料)。
@@ -190,6 +208,7 @@ impl TensorOps {
             shape,
             args: vec![],
             err: None,
+            label: None,
         }
     }
 
@@ -210,6 +229,7 @@ impl TensorOps {
             shape,
             args: vec![],
             err: None,
+            label: None,
         }
     }
 
@@ -227,6 +247,7 @@ impl TensorOps {
             shape,
             args: vec![],
             err: None,
+            label: None,
         }
     }
 
@@ -243,6 +264,7 @@ impl TensorOps {
             shape: vec![],
             args: vec![],
             err: None,
+            label: None,
         }
     }
 
@@ -264,6 +286,7 @@ impl TensorOps {
             shape,
             args: vec![],
             err: Some(LazyError { at_depth: 0, detail: detail.into() }),
+            label: None,
         }
     }
 
@@ -446,6 +469,7 @@ impl TensorOps {
             shape: self.shape.clone(),
             args: vec![],
             err: self.err.clone().or(Some(e)),
+            label: None,
         }
     }
 
@@ -467,6 +491,7 @@ impl TensorOps {
             shape,
             args,
             err,
+            label: None,
         }
     }
 }

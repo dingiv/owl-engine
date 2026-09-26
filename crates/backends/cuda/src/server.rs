@@ -480,7 +480,19 @@ impl GpuServer {
         want_elems: usize,
         ack: Ack<Result<Vec<u8>, ModelError>>,
     ) {
-        // 路由:D2H 流(结果收割维)
+        // 路由:D2H 流(结果收割维)。先排空 COMPUTE:kernel 在 COMPUTE 流,
+        // 本 memcpy 在 D2H 流 —— 跨流无保序,不排空则读块与产出 kernel 竞速
+        // (实测:真模型单步中途 dtoh 读到全零块;sync 后重读同块数据完好
+
+        // —— 2026-09-26 塔零案定谳,interpreter-tap.md)。收割路径本就阻塞
+        // 等回调,排空无额外代价;htod 侧 async+sync 已内建,无对称问题。
+        if let Err(e) = self
+            .ctx()
+            .stream(STREAM_COMPUTE)
+            .and_then(|s| s.synchronize().map_err(|e| ModelError::Msg(format!("sync: {e:?}"))))
+        {
+            return ack.send(Err(e));
+        }
         let stream = match self.ctx().stream(STREAM_D2H) {
             Ok(s) => s.clone(),
             Err(e) => return ack.send(Err(e)),
