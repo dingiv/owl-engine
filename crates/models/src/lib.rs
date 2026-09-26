@@ -29,7 +29,7 @@
 //! - [`specs`]:模型规格集(每档一文件;纯参数事实 + 键名约定,拆分律见模块头)
 //!
 //! **执行面(解释器)**
-//! - [`interpreter`]:异步执行(eval/eval_ops/eval_load;face 注入)
+//! - [`interpreters`]:解释器集合(计算 eval/装载 load;face 注入;变体见模块头)
 //! - [`reference`]:同步参考解释器(reduce/CpuInterpreter;对拍锚,永不优化)
 //!
 //! **冻结线**
@@ -42,7 +42,7 @@
 
 pub mod contract;
 pub mod device;
-pub mod interpreter;
+pub mod interpreters;
 pub mod kernel;
 pub mod layers;
 pub mod loader;

@@ -162,7 +162,7 @@ mod tests {
         let (hq, hkv, hd, hidden) = (2usize, 1usize, 4usize, 3usize);
         let mut face = owl_cpu::CpuFace::new();
         let attn = Attention::new(hq, hkv, hd, hidden, 1e-6);
-        crate::interpreter::eval_load(&attn, &mut face, &six_slots(hq, hkv, hd, hidden), &Default::default())
+        crate::interpreters::eval_load(&attn, &mut face, &six_slots(hq, hkv, hd, hidden), &Default::default())
             .await
             .expect("eval_load 六槽");
 
@@ -170,7 +170,7 @@ mod tests {
         let xs = TensorOps::from_host(Dtype::F32, vec![tokens, hidden], &f32b(&[0.5, -0.25, 1.0]));
         let pos = TensorOps::from_host(Dtype::F32, vec![tokens], &f32b(&[7.0]));
         let rp = RopeT::new(64, hd, 2, 10_000.0).expect("rope new");
-        crate::interpreter::eval_load(&rp, &mut face, &rp.tables(), &Default::default())
+        crate::interpreters::eval_load(&rp, &mut face, &rp.tables(), &Default::default())
             .await
             .expect("rope 表物化");
         let kv = KvBuffers {
@@ -244,13 +244,13 @@ mod tests {
         use crate::module::Module as _;
         let mut gpu = crate::testkit::gpu_client().await;
         let attn = Attention::new(2, 1, 8, 3, 1e-6);
-        crate::interpreter::eval_load(&attn, &mut gpu, &six_slots(2, 1, 8, 3), &Default::default())
+        crate::interpreters::eval_load(&attn, &mut gpu, &six_slots(2, 1, 8, 3), &Default::default())
             .await
             .expect("eval_load");
         let xs = TensorOps::from_host(Dtype::F32, vec![1, 3], &f32b(&[0.5, -0.25, 1.0]));
         let out = attn.forward(&xs, &crate::module::ForwardCtx::minimal(1));
         assert!(out.is_poisoned(), "minimal ctx 缺 pos/kv/rope → 毒");
-        let err = crate::interpreter::eval_ops(out.step(), &mut gpu)
+        let err = crate::interpreters::eval_ops(out.step(), &mut gpu)
             .await
             .unwrap_err();
         assert!(format!("{err:?}").contains("缺动态依赖"), "毒值应带 ctx 归因:{err:?}");

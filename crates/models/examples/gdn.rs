@@ -12,7 +12,7 @@
 //! ```
 
 use owl_models::contract::DeviceClient;
-use owl_models::interpreter::eval_ops;
+use owl_models::interpreters::eval_ops;
 use owl_models::layers::gdn::{fixture, GatedDeltaNet, GdnBuffers};
 use owl_models::module::{ForwardCtx, Module};
 use owl_models::tensor::Dtype;
@@ -177,7 +177,7 @@ async fn main() {
 
     let mut client = GpuClient::spawn(DeviceSelector::Ordinal(test_device_ordinal())).expect("gpu server boot");
     let layer = GatedDeltaNet::new(NK, HK_DIM, NV, HV_DIM, HIDDEN, 1e-6);
-    owl_models::interpreter::eval_load(&layer, &mut client, &src, &Default::default())
+    owl_models::interpreters::eval_load(&layer, &mut client, &src, &Default::default())
         .await
         .expect("eval_load 九槽");
 

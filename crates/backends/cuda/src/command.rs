@@ -61,6 +61,8 @@ pub enum Command {
         buf: Box<dyn owl_iface::contract::PinnedRegion + Send>,
         dst: Bytes,
         offset_elems: usize,
+        /// 逻辑长度(池租约容量 ≥ 请求;只传前 elems)
+        elems: usize,
         ack: Ack<Result<(), ModelError>>,
     },
     /// device → host(异步 memcpy 到 pinned 码头;完成经 host 回调回执并转换字节)

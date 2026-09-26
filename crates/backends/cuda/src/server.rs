@@ -36,17 +36,29 @@ use std::sync::mpsc;
 
 type Finish = Box<dyn FnOnce() + Send>;
 
-/// pinned 租约回收池(进程级;Finish 在派发线程执行、拿不到 ctx,
-/// 故池为全局 —— 单 server 实例 per 进程,无争用)
-fn pinned_pool() -> &'static std::sync::Mutex<Vec<Box<dyn owl_iface::contract::PinnedRegion + Send>>> {
-    static POOL: std::sync::OnceLock<std::sync::Mutex<Vec<Box<dyn owl_iface::contract::PinnedRegion + Send>>>> =
-        std::sync::OnceLock::new();
-    POOL.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+/// pinned 租约池(server 私有;Arc 随 dispatch 线程共持 ——
+/// 生命周期严格罩在 CUDA ctx 之内,server 关闭即整池释放,
+/// 杜绝跨 server 的悬垂页锁指针段错误)
+#[derive(Default)]
+pub(super) struct PinnedPool {
+    free: std::sync::Mutex<Vec<Box<dyn owl_iface::contract::PinnedRegion + Send>>>,
+}
+
+impl PinnedPool {
+    fn take(&self, min_elems: usize) -> Option<Box<dyn owl_iface::contract::PinnedRegion + Send>> {
+        let mut v = self.free.lock().unwrap();
+        let i = v.iter().position(|b| b.as_f32().len() >= min_elems)?;
+        Some(v.swap_remove(i))
+    }
+    fn put(&self, b: Box<dyn owl_iface::contract::PinnedRegion + Send>) {
+        self.free.lock().unwrap().push(b);
+    }
 }
 
 pub struct GpuServer {
     rx: mpsc::Receiver<Command>,
     selector: DeviceSelector,
+    pool: std::sync::Arc<PinnedPool>,
     /// 上线握手(可选;便捷组装路径用它回传设备上线结果)
     boot: Option<mpsc::Sender<Result<(), String>>>,
     ctx: Option<GpuCtx>,
@@ -72,6 +84,7 @@ impl GpuServer {
         Self {
             rx,
             selector,
+            pool: std::sync::Arc::new(PinnedPool::default()),
             boot,
             ctx: None,
             kernels: KernelCache::new(),
@@ -190,8 +203,8 @@ impl GpuServer {
                 self.handle_htod_chunk(block, offset_elems, data, ack)
             }
             Command::AllocPinned { elems, ack } => self.handle_alloc_pinned(elems, ack),
-            Command::UploadPinned { buf, dst, offset_elems, ack } => {
-                self.handle_upload_pinned(buf, dst, offset_elems, ack)
+            Command::UploadPinned { buf, dst, offset_elems, elems, ack } => {
+                self.handle_upload_pinned(buf, dst, offset_elems, elems, ack)
             }
             Command::Dtoh { id, want_elems, ack } => self.handle_dtoh(id, want_elems, ack),
             Command::Launch { msg, ack } => self.handle_launch(msg, ack),
@@ -298,6 +311,7 @@ impl GpuServer {
     }
 
     fn handle_htod(&mut self, data: Vec<f32>, ack: Ack<Result<Bytes, ModelError>>) {
+        eprintln!("[srv] Htod {} elems", data.len());
         let mut ack = Some(ack);
         let n = data.len();
         let stream = match self.ctx().stream(STREAM_H2D) {
@@ -347,13 +361,9 @@ impl GpuServer {
         elems: usize,
         ack: Ack<Result<Box<dyn owl_iface::contract::PinnedRegion + Send>, ModelError>>,
     ) {
-        if let Some(i) = pinned_pool()
-            .lock()
-            .unwrap()
-            .iter()
-            .position(|b| b.as_f32().len() >= elems)
-        {
-            let mut b = pinned_pool().lock().unwrap().swap_remove(i);
+        eprintln!("[srv] AllocPinned {elems}");
+        // 池取(内部单次加锁;容量 ≥ 请求即命中,逻辑长度由调用方界定)
+        if let Some(mut b) = self.pool.take(elems) {
             b.slice_mut()[..elems].fill(0.0);
             // 容量不可截,整块交出(调用方只用前 elems)
             ack.send(Ok(b));
@@ -371,8 +381,10 @@ impl GpuServer {
         buf: Box<dyn owl_iface::contract::PinnedRegion + Send>,
         dst: Bytes,
         offset_elems: usize,
+        elems: usize,
         ack: Ack<Result<(), ModelError>>,
     ) {
+        eprintln!("[srv] UploadPinned block{} off{} elems{}", dst.id, offset_elems, elems);
         let stream = match self.ctx().stream(STREAM_H2D) {
             Ok(s) => s.clone(),
             Err(e) => return ack.send(Err(e)),
@@ -382,31 +394,32 @@ impl GpuServer {
             Ok((p, _)) => p,
             Err(e) => return ack.take().unwrap().send(Err(e)),
         };
-        unsafe {
+        if let Err(e) = unsafe {
             memcpy_htod_async(
                 dptr_base + (offset_elems as u64) * 4,
-                buf.as_f32(),
+                &buf.as_f32()[..elems],
                 stream.cu_stream(),
             )
+        } {
+            // 建场失败:未入队任何 DMA,finish 不得投递 —— 租约回池 + 回执错误
+            let e = ModelError::Msg(format!("upload_pinned async: {e:?}"));
+            self.pool.put(buf);
+            ack.take().unwrap().send(Err(e));
+            return;
         }
-        .map_err(|e| ModelError::Msg(format!("upload_pinned async: {e:?}")))
-        .map_err(|e| {
-            if let Some(a) = ack.take() {
-                a.send(Err(e));
-            }
-        })
-        .err();
         let cell = std::sync::Arc::new(std::sync::Mutex::new(Some((buf, ack))));
         let cell2 = cell.clone();
+        let pool = self.pool.clone();
+        let pool_err = self.pool.clone();
         let finish: Finish = Box::new(move || {
             let (buf, mut ack) = cell2.lock().unwrap().take().unwrap();
-            pinned_pool().lock().unwrap().push(buf);
+            pool.put(buf);
             ack.take().unwrap().send(Ok(()));
         });
         if let Err(e) = self.notify(&stream, finish) {
             // notify 失败:finish 未投递,租约回收入池 + 回执错误
             if let Some((buf, mut ack)) = cell.lock().unwrap().take() {
-                pinned_pool().lock().unwrap().push(buf);
+                pool_err.put(buf);
                 ack.take().unwrap().send(Err(e));
             }
         }

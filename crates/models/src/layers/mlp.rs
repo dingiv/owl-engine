@@ -71,7 +71,7 @@ mod tests {
             ("up_proj".to_string(), up_w.clone()),
             ("down_proj".to_string(), down_w.clone()),
         ]);
-        crate::interpreter::eval_load(&layer, &mut face, &src, &Default::default())
+        crate::interpreters::eval_load(&layer, &mut face, &src, &Default::default())
             .await
             .expect("eval_load");
 
@@ -140,7 +140,7 @@ mod tests {
                     ("up_proj".to_string(), up_w.clone()),
                     ("down_proj".to_string(), down_w.clone()),
                 ]);
-                crate::interpreter::eval_load(&layer, &mut face, &src, &Default::default())
+                crate::interpreters::eval_load(&layer, &mut face, &src, &Default::default())
                     .await.expect("eval_load");
                 ("cpu", harvest(&mut face, &layer.forward(&xs, &ctx)).await)
             } else {
@@ -151,7 +151,7 @@ mod tests {
                     ("up_proj".to_string(), up_w.clone()),
                     ("down_proj".to_string(), down_w.clone()),
                 ]);
-                crate::interpreter::eval_load(&layer, &mut gpu, &src, &Default::default())
+                crate::interpreters::eval_load(&layer, &mut gpu, &src, &Default::default())
                     .await.expect("eval_load");
                 let o = harvest(&mut gpu, &layer.forward(&xs, &ctx)).await;
                 gpu.close().await.expect("server 关机");

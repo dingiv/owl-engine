@@ -158,7 +158,7 @@ mod tests {
             ("up_proj", 5 * 3, 10.0),
             ("down_proj", 3 * 5, 11.0),
         ]);
-        crate::interpreter::eval_load(&full, &mut face, &full_src, &Default::default())
+        crate::interpreters::eval_load(&full, &mut face, &full_src, &Default::default())
             .await
             .expect("full 层 eval_load");
 
@@ -180,7 +180,7 @@ mod tests {
             ("up_proj", 5 * 6, 13.0),
             ("down_proj", 6 * 5, 14.0),
         ]);
-        crate::interpreter::eval_load(&gdn, &mut face, &gdn_src, &Default::default())
+        crate::interpreters::eval_load(&gdn, &mut face, &gdn_src, &Default::default())
             .await
             .expect("gdn 层 eval_load");
 
@@ -244,7 +244,7 @@ mod tests {
 
     /// 零块(htod 清零;勿用裸 alloc —— 垃圾内存会进 conv/rec 状态)
     async fn zero_block(client: &mut owl_cuda::GpuClient, n: usize, shape: Vec<usize>) -> (crate::contract::Bytes, TensorOps) {
-        let b = crate::interpreter::eval_ops(
+        let b = crate::interpreters::eval_ops(
             TensorOps::from_host(Dtype::F32, vec![n], &crate::testkit::f32b(&vec![0.0; n])).step(),
             client,
         )
@@ -252,6 +252,44 @@ mod tests {
         .expect("zero block");
         let t = TensorOps::of_block(b.id, Dtype::F32, shape);
         (b, t)
+    }
+
+    /// pinned 租约往返最小隔离测试(池复用 + 分块写 + dtoh 校验)
+    #[tokio::test]
+    async fn pinned_roundtrip_probe() -> Result<(), crate::contract::ModelError> {
+        use crate::contract::DeviceClient;
+        if !crate::testkit::gpu_enabled() {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return Ok(());
+        }
+        eprintln!("[probe] boot...");
+        let mut gpu = crate::testkit::gpu_client().await;
+        eprintln!("[probe] booted");
+        let elems = 1 << 20; // 1M f32 = 4MB
+        let b = gpu
+            .alloc(elems * 4)
+            .await
+            .expect("alloc");
+        eprintln!("[probe] block {} alloc'd", b.id);
+        for round in 0..3 {
+            eprintln!("[probe] round {round}: alloc_pinned...");
+            let mut lease = gpu.alloc_pinned(elems).await.expect("alloc_pinned");
+            eprintln!("[probe] round {round}: fill...");
+            for (i, d) in lease.slice_mut().iter_mut().enumerate() {
+                *d = (round * 1000 + i % 1000) as f32;
+            }
+            eprintln!("[probe] round {round}: upload...");
+            gpu.upload_pinned(lease, &b, 0, elems).await.expect("upload_pinned");
+            eprintln!("[probe] round {round}: dtoh...");
+            let mut out = vec![0u8; elems * 4];
+            gpu.dtoh(&b, &mut out).await.expect("dtoh");
+            let f = crate::testkit::f32_of(&out);
+            assert_eq!(f[0] as usize % 1000, (round * 1000) % 1000);
+            assert_eq!(f[elems - 1] as usize % 1000, (elems - 1) % 1000);
+            eprintln!("[probe] round {round} ok");
+        }
+        gpu.close().await.expect("关机");
+        Ok(())
     }
 
     /// Full 分支单步 decode vs host(门控 OWL_TEST_DEVICE)
@@ -279,9 +317,9 @@ mod tests {
             ("up_proj", inter * hidden, 10.0),
             ("down_proj", hidden * inter, 11.0),
         ]);
-        crate::interpreter::eval_load(&layer, &mut gpu, &src, &Default::default()).await.expect("load");
+        crate::interpreters::eval_load(&layer, &mut gpu, &src, &Default::default()).await.expect("load");
         let rp = Rope::new(64, hd, hd, 10_000.0).expect("rope"); // 全旋转(rotary = head_dim)
-        crate::interpreter::eval_load(&rp, &mut gpu, &rp.tables(), &Default::default()).await.expect("rope 表");
+        crate::interpreters::eval_load(&rp, &mut gpu, &rp.tables(), &Default::default()).await.expect("rope 表");
         let (_, kc) = zero_block(&mut gpu, 8 * hkv * hd, vec![8, hkv, hd]).await;
         let (_, vc) = zero_block(&mut gpu, 8 * hkv * hd, vec![8, hkv, hd]).await;
 
@@ -395,7 +433,9 @@ mod tests {
         let value_dim = nv * hv_dim;
         let conv_dim = 2 * key_dim + value_dim;
         let layer = DecoderLayer::new_gdn(nk, hk_dim, nv, hv_dim, hidden, inter, EPS);
+        eprintln!("[gdn] boot...");
         let mut gpu = crate::testkit::gpu_client().await;
+        eprintln!("[gdn] booted; eval_load...");
         let src = src_map(&[
             ("input_layernorm", hidden, 1.0),
             ("post_attention_layernorm", hidden, 2.0),
@@ -412,7 +452,8 @@ mod tests {
             ("up_proj", inter * hidden, 13.0),
             ("down_proj", hidden * inter, 14.0),
         ]);
-        crate::interpreter::eval_load(&layer, &mut gpu, &src, &Default::default()).await.expect("load");
+        crate::interpreters::eval_load(&layer, &mut gpu, &src, &Default::default()).await.expect("load");
+        eprintln!("[gdn] loaded; buffers...");
         let tokens = 1usize;
         let xs = gen(2.0, hidden);
         let slots_v = [1.0f32];
@@ -421,6 +462,7 @@ mod tests {
         // eval 是唯一干净态:状态副作用下,同树二次 eval = 滑过态,不可比)
         let mut harvested = Vec::new();
         for i in 0..5 {
+            eprintln!("[gdn] round {i}");
             let buf = GdnBuffers {
                 conv_q: zero_block(&mut gpu, 4 * key_dim * 3, vec![4, key_dim, 3]).await.1,
                 conv_k: zero_block(&mut gpu, 4 * key_dim * 3, vec![4, key_dim, 3]).await.1,

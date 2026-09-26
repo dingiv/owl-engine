@@ -693,7 +693,7 @@ mod tests {
     /// 设备块灌入 host f32(htod 后取块句柄;测试专用)
     async fn alloc_and_fill(gpu: &mut owl_cuda::GpuClient, v: &[f32]) -> crate::contract::Bytes {
         let t = crate::TensorOps::from_host(crate::tensor::Dtype::F32, vec![v.len()], &f32b(v));
-        crate::interpreter::eval_ops(t.step(), gpu).await.expect("htod")
+        crate::interpreters::eval_ops(t.step(), gpu).await.expect("htod")
     }
 
     // ======================================================================
@@ -1036,7 +1036,7 @@ mod tests {
     async fn layer_load_and_declaration() {
         let mut face = owl_cpu::CpuFace::new();
         let layer = GatedDeltaNet::new(NK, HK_DIM, NV, HV_DIM, HIDDEN, 1e-6);
-        crate::interpreter::eval_load(&layer, &mut face, &weight_src(), &Default::default())
+        crate::interpreters::eval_load(&layer, &mut face, &weight_src(), &Default::default())
             .await
             .expect("eval_load 九槽");
 
@@ -1187,7 +1187,7 @@ mod tests {
         let src = weight_src();
         let mut gpu = crate::testkit::gpu_client().await;
         let layer = GatedDeltaNet::new(NK, HK_DIM, NV, HV_DIM, HIDDEN, 1e-6);
-        crate::interpreter::eval_load(&layer, &mut gpu, &src, &Default::default())
+        crate::interpreters::eval_load(&layer, &mut gpu, &src, &Default::default())
             .await
             .expect("eval_load");
 

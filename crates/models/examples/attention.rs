@@ -13,7 +13,7 @@
 //! ```
 
 use owl_models::contract::DeviceClient;
-use owl_models::interpreter::eval_ops;
+use owl_models::interpreters::eval_ops;
 use owl_models::layers::attention::Attention;
 use owl_models::module::{ForwardCtx, KvBuffers};
 use owl_models::Module;
@@ -198,13 +198,13 @@ async fn main() {
         ("q_norm".to_string(), qnw.clone()),
         ("k_norm".to_string(), knw.clone()),
     ]);
-    owl_models::interpreter::eval_load(&attn, &mut client, &src, &Default::default())
+    owl_models::interpreters::eval_load(&attn, &mut client, &src, &Default::default())
         .await
         .expect("eval_load 六槽");
 
     // rope 表(全局一份;cos/sin 物化)
     let rp = Rope::new(MAX_POS, HD, ROTARY, THETA).expect("rope new");
-    owl_models::interpreter::eval_load(&rp, &mut client, &rp.tables(), &Default::default())
+    owl_models::interpreters::eval_load(&rp, &mut client, &rp.tables(), &Default::default())
         .await
         .expect("rope 表物化");
 

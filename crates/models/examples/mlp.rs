@@ -15,7 +15,7 @@
 use owl_models::contract::DeviceClient;
 use owl_models::contract::ModelError;
 use owl_cpu::CpuFace;
-use owl_models::interpreter::eval;
+use owl_models::interpreters::eval;
 use owl_models::module::ForwardCtx;
 use owl_models::tensor::Dtype;
 use owl_models::TensorOps;
@@ -46,7 +46,7 @@ async fn mlp_pipeline<D: DeviceClient>(face: &mut D) -> Result<Vec<f32>, ModelEr
         ("down_proj".to_string(), vec![0.3; intermediate * hidden]),
     ]);
     // 装载执行(层入口:解释器驱动 layout + 物化 + 回填)
-    owl_models::interpreter::eval_load(&mlp, face, &src, &Default::default()).await?;
+    owl_models::interpreters::eval_load(&mlp, face, &src, &Default::default()).await?;
 
     // 输入(host → 设备,声明进树)
     let xvec = vec![0.5f32; hidden];

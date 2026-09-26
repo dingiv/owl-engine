@@ -138,7 +138,14 @@ pub trait WeightSource {
     /// 默认 = 整取切片;流式源(mmap)覆写为按需转换区间,且
     /// **不移除条目**(同一键的多块重复取)。
     fn take_range(&self, key: &str, offset_elems: usize, len: usize) -> Option<Vec<f32>> {
-        self.take(key).map(|v| v[offset_elems..offset_elems + len].to_vec())
+        // 越界 = None(调用方收割为缺键/形状错;禁 panic)
+        let v = self.take(key)?;
+        v.get(offset_elems..offset_elems + len).map(<[f32]>::to_vec)
+    }
+
+    /// 键的元素数(错误归因用:缺键 vs 长度不符;默认 None = 未知)
+    fn elem_len(&self, _key: &str) -> Option<usize> {
+        None
     }
 
     /// 分块转换**直写**目标缓冲(2026-09-26 二拷贝预算:转换这 1 次
@@ -159,6 +166,9 @@ pub trait WeightSource {
 impl WeightSource for std::collections::HashMap<String, Vec<f32>> {
     fn take(&self, key: &str) -> Option<Vec<f32>> {
         self.get(key).cloned()
+    }
+    fn elem_len(&self, key: &str) -> Option<usize> {
+        self.get(key).map(|v| v.len())
     }
 }
 
@@ -313,6 +323,39 @@ impl LoaderOps {
 
     pub fn wants(&self) -> &[Want] {
         &self.wants
+    }
+}
+
+// ============================================================================
+// §4.5 LoadManifest:装载清单(eval_load 的对账面;校验/审计 vocabulary)
+// ============================================================================
+
+/// 单条装载记录:checkpoint 全键 + 声明形状 + 布局 + VRAM 块句柄。
+/// 校验测试据此 dtoh 读回显存,与独立锚逐位比较。
+#[derive(Clone, Debug)]
+pub struct LoadEntry {
+    pub key: String,
+    pub shape: Shape,
+    pub layout: Layout,
+    pub block: Bytes,
+}
+
+/// 装载清单(顺序 = Want 清单顺序)
+#[derive(Clone, Debug, Default)]
+pub struct LoadManifest(pub Vec<LoadEntry>);
+
+impl LoadManifest {
+    pub fn entries(&self) -> &[LoadEntry] {
+        &self.0
+    }
+    pub fn push(&mut self, e: LoadEntry) {
+        self.0.push(e);
+    }
+}
+
+impl FromIterator<LoadEntry> for LoadManifest {
+    fn from_iter<I: IntoIterator<Item = LoadEntry>>(iter: I) -> Self {
+        LoadManifest(iter.into_iter().collect())
     }
 }
 
@@ -493,7 +536,7 @@ mod tests {
 
         let xs = crate::TensorOps::from_host(crate::contract::Dtype::F32, vec![1, 3], &f32b(&[0.5, -1.0, 2.0]));
         let got = {
-            let bytes = crate::interpreter::eval_ops(xs.matmul(&w.decl()).step(), &mut face)
+            let bytes = crate::interpreters::eval_ops(xs.matmul(&w.decl()).step(), &mut face)
                 .await
                 .expect("eval");
             let mut buf = vec![0u8; 8];
@@ -521,7 +564,7 @@ mod tests {
             ("down_proj".to_string(), vec![0.3; 24]),
         ]);
         let mut face = owl_cpu::CpuFace::new();
-        crate::interpreter::eval_load(&mlp, &mut face, &src, &Default::default())
+        crate::interpreters::eval_load(&mlp, &mut face, &src, &Default::default())
             .await
             .expect("eval_load");
 

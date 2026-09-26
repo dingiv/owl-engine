@@ -249,6 +249,7 @@ pub trait DeviceClient: Send {
         _buf: Box<dyn PinnedRegion + Send>,
         _dst: &Bytes,
         _offset_elems: usize,
+        _elems: usize,
     ) -> impl Future<Output = Result<(), ModelError>> + Send
     where
         Self: Sized,

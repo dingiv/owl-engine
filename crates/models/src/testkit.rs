@@ -38,7 +38,7 @@ pub fn f32_of(buf: &[u8]) -> Vec<f32> {
 /// 声明求值 + dtoh 收割(测试/对拍公共路径)
 pub async fn harvest<D: DeviceClient>(face: &mut D, t: &TensorOps) -> Vec<f32> {
     let n: usize = t.shape().iter().product();
-    let bytes = crate::interpreter::eval_ops(t.step(), face)
+    let bytes = crate::interpreters::eval_ops(t.step(), face)
         .await
         .expect("eval");
     let mut buf = vec![0u8; n * 4];

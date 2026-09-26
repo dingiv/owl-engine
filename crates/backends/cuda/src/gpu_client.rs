@@ -118,10 +118,17 @@ impl DeviceClient for GpuClient {
         buf: Box<dyn owl_iface::contract::PinnedRegion + Send>,
         dst: &Bytes,
         offset_elems: usize,
+        elems: usize,
     ) -> Result<(), ModelError> {
         let dst = dst.clone();
-        self.submit(move |ack| Command::UploadPinned { buf, dst, offset_elems, ack })?
-            .await
+        self.submit(move |ack| Command::UploadPinned {
+            buf,
+            dst,
+            offset_elems,
+            elems,
+            ack,
+        })?
+        .await
     }
 
     async fn write_block_f32(

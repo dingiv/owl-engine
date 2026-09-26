@@ -57,7 +57,7 @@ mod tests {
         let mut face = owl_cpu::CpuFace::new();
         let lin = Linear::new("w", 2, 3);
         let src = HashMap::from([("w".to_string(), w)]);
-        crate::interpreter::eval_load(&lin, &mut face, &src, &Default::default())
+        crate::interpreters::eval_load(&lin, &mut face, &src, &Default::default())
             .await
             .expect("eval_load");
 
@@ -77,20 +77,20 @@ mod tests {
 
         let out = lin.forward(&xs, &ForwardCtx::minimal(1));
         assert!(out.is_poisoned(), "未装载槽的声明应立即带毒(随链流动)");
-        let err = crate::interpreter::eval_ops(out.step(), &mut face)
+        let err = crate::interpreters::eval_ops(out.step(), &mut face)
             .await
             .unwrap_err();
         assert!(format!("{err:?}").contains("未装载"), "{err:?}");
 
         let empty: Src = HashMap::new();
-        let err = crate::interpreter::eval_load(&lin, &mut face, &empty, &Default::default())
+        let err = crate::interpreters::eval_load(&lin, &mut face, &empty, &Default::default())
             .await
             .unwrap_err();
         assert!(format!("{err:?}").contains("缺键"), "{err:?}");
 
         let lin3 = Linear::new("w", 2, 3);
         let bad_len = HashMap::from([("w".to_string(), vec![1.0; 5])]);
-        let err = crate::interpreter::eval_load(&lin3, &mut face, &bad_len, &Default::default())
+        let err = crate::interpreters::eval_load(&lin3, &mut face, &bad_len, &Default::default())
             .await
             .unwrap_err();
         assert!(format!("{err:?}").contains("元素"), "{err:?}");
@@ -124,14 +124,14 @@ mod tests {
                 let mut face = owl_cpu::CpuFace::new();
                 let lin = Linear::new("w", out_dim, in_dim);
                 let src = HashMap::from([("w".to_string(), w.clone())]);
-                crate::interpreter::eval_load(&lin, &mut face, &src, &Default::default())
+                crate::interpreters::eval_load(&lin, &mut face, &src, &Default::default())
                     .await.expect("eval_load");
                 ("cpu", harvest(&mut face, &lin.forward(&xs, &ctx)).await)
             } else {
                 let mut gpu = crate::testkit::gpu_client().await;
                 let lin = Linear::new("w", out_dim, in_dim);
                 let src = HashMap::from([("w".to_string(), w.clone())]);
-                crate::interpreter::eval_load(&lin, &mut gpu, &src, &Default::default())
+                crate::interpreters::eval_load(&lin, &mut gpu, &src, &Default::default())
                     .await.expect("eval_load");
                 let o = harvest(&mut gpu, &lin.forward(&xs, &ctx)).await;
                 gpu.close().await.expect("server 关机");

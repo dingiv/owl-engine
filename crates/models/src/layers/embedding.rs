@@ -85,7 +85,7 @@ mod tests {
         let src = Src::from([
             ("weight".to_string(), (0..64).map(|i| i as f32 * 0.1).collect()),
         ]);
-        crate::interpreter::eval_load(&emb, &mut face, &src, &Default::default())
+        crate::interpreters::eval_load(&emb, &mut face, &src, &Default::default())
             .await
             .expect("eval_load");
         assert!(emb.is_loaded(), "tied 槽应有块");
@@ -137,7 +137,7 @@ mod tests {
                 let src = Src::from([
                     ("weight".to_string(), w.clone()),
                 ]);
-                crate::interpreter::eval_load(&emb, &mut face, &src, &Default::default())
+                crate::interpreters::eval_load(&emb, &mut face, &src, &Default::default())
                     .await.expect("eval_load");
                 // embed = Kernel 节点(CPU face 不执行);lm_head = 语义 matmul 可跑
                 let x_t = TensorOps::from_host(Dtype::F32, vec![1, d], &f32b(&x));
@@ -150,7 +150,7 @@ mod tests {
                 let src = Src::from([
                     ("weight".to_string(), w.clone()),
                 ]);
-                crate::interpreter::eval_load(&emb, &mut gpu, &src, &Default::default())
+                crate::interpreters::eval_load(&emb, &mut gpu, &src, &Default::default())
                     .await.expect("eval_load");
                 let ids_t = TensorOps::from_host(Dtype::F32, vec![tokens], &f32b(&ids));
                 let x_t = TensorOps::from_host(Dtype::F32, vec![1, d], &f32b(&x));

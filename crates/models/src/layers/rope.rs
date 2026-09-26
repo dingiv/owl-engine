@@ -149,7 +149,7 @@ mod tests {
         let (head_dim, rotary_dim, heads) = (8usize, 4usize, 2usize);
         let mut face = owl_cpu::CpuFace::new();
         let rp = Rope::new(64, head_dim, rotary_dim, 10_000.0).expect("new");
-        crate::interpreter::eval_load(&rp, &mut face, &rp.tables(), &Default::default())
+        crate::interpreters::eval_load(&rp, &mut face, &rp.tables(), &Default::default())
             .await
             .expect("表物化");
 
@@ -225,7 +225,7 @@ mod tests {
         if crate::testkit::gpu_enabled() {
             let mut gpu = crate::testkit::gpu_client().await;
             let rp2 = Rope::new(256, head_dim, rotary_dim, theta).expect("rope new");
-            crate::interpreter::eval_load(&rp2, &mut gpu, &rp2.tables(), &Default::default())
+            crate::interpreters::eval_load(&rp2, &mut gpu, &rp2.tables(), &Default::default())
                 .await
                 .expect("eval_load(gpu)");
             let gpu_out = harvest(&mut gpu, &rp2.forward_q(&x_t, &pos_t, tokens, heads)).await;

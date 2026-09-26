@@ -261,7 +261,7 @@ mod tests {
 
     /// 零块(htod 清零;勿用裸 alloc —— 垃圾内存会进 conv/rec/KV 状态)
     async fn zero_block(client: &mut owl_cuda::GpuClient, n: usize, shape: Vec<usize>) -> TensorOps {
-        let b = crate::interpreter::eval_ops(
+        let b = crate::interpreters::eval_ops(
             TensorOps::from_host(Dtype::F32, vec![n], &f32b(&vec![0.0; n])).step(),
             client,
         )
@@ -288,7 +288,7 @@ mod tests {
     async fn loads_checkpoint_keys_and_declares() {
         let mut face = owl_cpu::CpuFace::new();
         let model = Model::new(&spec(), LlamaFamily::new("model.language_model"));
-        crate::interpreter::eval_load(&model, &mut face, &checkpoint_src(), &Default::default())
+        crate::interpreters::eval_load(&model, &mut face, &checkpoint_src(), &Default::default())
             .await
             .expect("model.eval_load(C10 声明路径)");
 
@@ -597,11 +597,11 @@ mod tests {
         let model = Model::new(&spec(), LlamaFamily::new("model.language_model"));
         let src = checkpoint_src();
         let mut gpu = gpu_client().await;
-        crate::interpreter::eval_load(&model, &mut gpu, &src, &Default::default())
+        crate::interpreters::eval_load(&model, &mut gpu, &src, &Default::default())
             .await
             .expect("model.eval_load");
         let rp = Rope::new(64, HD, HD, 10_000.0).expect("rope");
-        crate::interpreter::eval_load(&rp, &mut gpu, &rp.tables(), &Default::default())
+        crate::interpreters::eval_load(&rp, &mut gpu, &rp.tables(), &Default::default())
             .await
             .expect("rope 表");
 

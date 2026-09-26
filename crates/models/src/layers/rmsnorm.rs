@@ -62,7 +62,7 @@ mod tests {
         let mut face = owl_cpu::CpuFace::new();
         let norm = RmsNorm::new("gamma", n, 1e-6);
         let src = Src::from([("gamma".to_string(), gamma.clone())]);
-        crate::interpreter::eval_load(&norm, &mut face, &src, &Default::default())
+        crate::interpreters::eval_load(&norm, &mut face, &src, &Default::default())
             .await
             .expect("eval_load");
 
@@ -88,7 +88,7 @@ mod tests {
         let mut face = owl_cpu::CpuFace::new();
         let norm = RmsNorm::new_add_one("q_norm", n, 1e-6);
         let src = Src::from([("q_norm".to_string(), gamma.clone())]);
-        crate::interpreter::eval_load(&norm, &mut face, &src, &Default::default())
+        crate::interpreters::eval_load(&norm, &mut face, &src, &Default::default())
             .await
             .expect("eval_load");
 
@@ -136,7 +136,7 @@ mod tests {
             } else {
                 RmsNorm::new("weight", n, eps)
             };
-            crate::interpreter::eval_load(&norm, &mut cpu, &src, &Default::default())
+            crate::interpreters::eval_load(&norm, &mut cpu, &src, &Default::default())
                 .await
                 .expect("eval_load(cpu)");
             let cpu_out = harvest(&mut cpu, &norm.forward(&xs, &ctx)).await;
@@ -149,7 +149,7 @@ mod tests {
                 } else {
                     RmsNorm::new("weight", n, eps)
                 };
-                crate::interpreter::eval_load(&norm, &mut gpu, &src, &Default::default())
+                crate::interpreters::eval_load(&norm, &mut gpu, &src, &Default::default())
                     .await
                     .expect("eval_load(gpu)");
                 let gpu_out = harvest(&mut gpu, &norm.forward(&xs, &ctx)).await;

@@ -90,7 +90,7 @@ pub async fn load_0_8b<D: DeviceClient>(
 ) -> Result<Model, ModelError> {
     let model = Model::new(&qwen3_5_0_8b(), Qwen35Convention::new("model.language_model"));
     let src = SafeTensorsSource::open_dir(dir)?;
-    crate::interpreter::eval_load(&model, face, &src, &Default::default()).await?;
+    crate::interpreters::eval_load(&model, face, &src, &Default::default()).await?;
     Ok(model)
 }
 
@@ -119,6 +119,7 @@ mod tests {
     use crate::TensorOps;
     use crate::module::{ForwardCtx, Module};
     use crate::tensor::Dtype;
+    use std::collections::HashMap;
     use crate::testkit::{f32b, manifest_dir};
 
     #[test]
@@ -190,7 +191,7 @@ mod tests {
     const SLOTS: usize = 4;
 
     async fn zero_block(client: &mut owl_cuda::GpuClient, n: usize, shape: Vec<usize>) -> TensorOps {
-        let b = crate::interpreter::eval_ops(
+        let b = crate::interpreters::eval_ops(
             TensorOps::from_host(Dtype::F32, vec![n], &f32b(&vec![0.0; n])).step(),
             client,
         )
@@ -207,6 +208,279 @@ mod tests {
         let model = load_0_8b(&dir, &mut face).await.expect("load_0_8b(CPU)");
         assert_eq!(model.layers.len(), 24);
         assert!(model.embed.is_loaded() && model.norm.is_loaded());
+    }
+
+
+    /// 诊断:真模型逐层 hidden 范数(定位 step1 塌零层)
+    #[tokio::test]
+    async fn gpu_model_step_diag() -> Result<(), crate::contract::ModelError> {
+        use crate::layers::gdn::GdnBuffers;
+        use crate::layers::rope::Rope;
+        use crate::module::KvBuffers;
+        if !crate::testkit::gpu_enabled() {
+            crate::testkit::skip_note();
+            return Ok(());
+        }
+        let dir = manifest_dir().join("assets/Qwen3.5-0.8B");
+        let mut gpu = crate::testkit::gpu_client().await;
+        let model = load_0_8b(&dir, &mut gpu).await?;
+        eprintln!("[diag] loaded");
+        let rp = Rope::new(262_144, 256, 64, 10_000_000.0)?;
+        crate::interpreters::eval_load(&rp, &mut gpu, &rp.tables(), &Default::default()).await?;
+
+        let (kvs_n, gdns_n) = (6usize, 18usize);
+        let mut mk_kvs = Vec::new();
+        let mut mk_gdns = Vec::new();
+        for _ in 0..kvs_n {
+            mk_kvs.push(KvBuffers {
+                k_cache: zero_block(&mut gpu, SLOTS * 2 * 256, vec![SLOTS, 2, 256]).await,
+                v_cache: zero_block(&mut gpu, SLOTS * 2 * 256, vec![SLOTS, 2, 256]).await,
+                slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
+                kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0])),
+            });
+        }
+        for _ in 0..gdns_n {
+            mk_gdns.push(GdnBuffers {
+                conv_q: zero_block(&mut gpu, SLOTS * 2048 * 3, vec![SLOTS, 2048, 3]).await,
+                conv_k: zero_block(&mut gpu, SLOTS * 2048 * 3, vec![SLOTS, 2048, 3]).await,
+                conv_v: zero_block(&mut gpu, SLOTS * 2048 * 3, vec![SLOTS, 2048, 3]).await,
+                rec: zero_block(&mut gpu, SLOTS * 16 * 128 * 128, vec![SLOTS, 16, 128, 128]).await,
+                slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
+            });
+        }
+        let kvs = mk_kvs;
+        let gdns = mk_gdns;
+
+        // manifest(校验过的块句柄,供 matmul 直探)
+        let src_chk = SafeTensorsSource::open_dir(&dir)?;
+        let manifest = crate::interpreters::eval_load(&model, &mut gpu, &src_chk, &Default::default()).await?;
+        let steps = [(985.0f32, 0.0f32, 0.0f32, 1.0f32), (4123.0, 1.0, 1.0, 2.0f32)];
+        for (si, &(id, pos, slot, kv_len)) in steps.iter().enumerate() {
+            eprintln!("[diag] === step{si} (pos {pos} slot {slot} kv_len {kv_len}) ===");
+            let ids = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[id]));
+            let pos_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[pos]));
+            let kvs_step: Vec<KvBuffers> = kvs
+                .iter()
+                .map(|kv| KvBuffers {
+                    k_cache: kv.k_cache.clone(),
+                    v_cache: kv.v_cache.clone(),
+                    slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot])),
+                    kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[kv_len])),
+                })
+                .collect();
+            let gdns_step: Vec<GdnBuffers> = gdns
+                .iter()
+                .map(|g| GdnBuffers {
+                    conv_q: g.conv_q.clone(),
+                    conv_k: g.conv_k.clone(),
+                    conv_v: g.conv_v.clone(),
+                    rec: g.rec.clone(),
+                    slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot])),
+                })
+                .collect();
+            let base_ctx = ForwardCtx::model_decode(1, &pos_t, &kvs_step, &rp, &gdns_step);
+            let mut xs = model.embed.forward(&ids, &base_ctx);
+            {
+                let e0 = crate::testkit::harvest(&mut gpu, &xs).await;
+                eprintln!("[diag]   embed rms={:.6} first3={:?}", e0.iter().map(|v| v*v).sum::<f32>().sqrt()/e0.len() as f32, &e0[..3]);
+                // 决定性:用 manifest 已验证的 in_proj_qkv 块直接 matmul
+                let qkv_key = format!("model.language_model.layers.0.linear_attn.in_proj_qkv.weight");
+                let e = manifest.entries().iter().find(|x| x.key == qkv_key).unwrap();
+                let wq = TensorOps::of_block(e.block.id, Dtype::F32, e.shape.clone());
+                let mm = xs.matmul(&wq);
+                let m0 = crate::testkit::harvest(&mut gpu, &mm).await;
+                eprintln!("[diag]   L0.in_proj matmul rms={:.6} first3={:?}",
+                    m0.iter().map(|v| v*v).sum::<f32>().sqrt()/m0.len() as f32, &m0[..3]);
+            }
+            let (mut kvi, mut gi) = (0usize, 0usize);
+            for (li, layer) in model.layers.iter().enumerate() {
+                let sub = model.layer_ctx(&base_ctx, kvi, gi);
+                xs = layer.forward(&xs, &sub);
+                if layer.is_full() { kvi += 1; } else { gi += 1; }
+                let got = crate::testkit::harvest(&mut gpu, &xs).await;
+                let norm = got.iter().map(|v| v * v).sum::<f32>().sqrt() / got.len() as f32;
+                if li % 3 == 2 || got.iter().all(|v| *v == 0.0) {
+                    eprintln!("[diag]   L{li:2}({}) rms={:.6} zeros={}", if layer.is_full() {"F"} else {"G"}, norm, got.iter().filter(|v| **v == 0.0).count());
+                }
+            }
+            let fin = model.norm.forward(&xs, &base_ctx);
+            let got = crate::testkit::harvest(&mut gpu, &fin).await;
+            eprintln!("[diag]   final-norm rms={:.6} first3={:?}", got.iter().map(|v| v*v).sum::<f32>().sqrt()/got.len() as f32, &got[..3.min(got.len())]);
+        }
+        gpu.close().await?;
+        Ok(())
+    }
+
+
+    /// ★ 核心校验:VRAM 块数据 vs 独立锚 逐位比较(门控 OWL_TEST_DEVICE)。
+    /// 独立锚 = 自建文件读取(不经 SafeTensorsSource)+ 朴素 BF16 解码 +
+    /// 朴素转置(不经 transpose_into_vec)—— 与被测装载链零共享。
+    #[tokio::test]
+    async fn gpu_vram_manifest_checksum() -> Result<(), crate::contract::ModelError> {
+        use crate::module::Layout;
+        if !crate::testkit::gpu_enabled() {
+            crate::testkit::skip_note();
+            return Ok(());
+        }
+        let dir = manifest_dir().join("assets/Qwen3.5-0.8B");
+        let path = dir.join("model.safetensors-00001-of-00001.safetensors");
+
+        // ── 独立锚:一次性自读文件 → 键 → (dtype, 字节区间视图)
+        let raw_buf = std::fs::read(&path).map_err(|e| ModelError::Msg(format!("{e}")))?;
+        let raw = std::sync::Arc::new(raw_buf);
+        let st = safetensors::SafeTensors::deserialize(&raw)
+            .map_err(|e| ModelError::Msg(format!("锚解析: {e}")))?;
+        let mut anchor: HashMap<String, (safetensors::Dtype, usize, usize)> = HashMap::new();
+        for (name, t) in st.iter() {
+            let off = t.data().as_ptr() as usize - raw.as_ptr() as usize;
+            anchor.insert(name.to_string(), (t.dtype(), off, t.data().len()));
+        }
+        let anchor_decode = |dtype: safetensors::Dtype,
+                             bytes: &[u8],
+                             out: &mut Vec<f32>| {
+            match dtype {
+                safetensors::Dtype::F32 => {
+                    out.clear();
+                    out.extend(bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])));
+                }
+                safetensors::Dtype::BF16 => {
+                    out.clear();
+                    out.extend(bytes.chunks_exact(2).map(|c| {
+                        f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)
+                    }));
+                }
+                _ => panic!("锚: 不支持的 dtype"),
+            }
+        };
+
+        // ── 装载(被测链)
+        let mut gpu = crate::testkit::gpu_client().await;
+        let model = load_0_8b(&dir, &mut gpu).await?;
+        // 复跑 load 生成 manifest(权重已装载,重复装载 = 重上传,结果等价)
+        let manifest = {
+            let src = SafeTensorsSource::open_dir(&dir)?;
+            crate::interpreters::eval_load(&model, &mut gpu, &src, &Default::default()).await?
+        };
+        eprintln!("[chk] manifest {} 条", manifest.entries().len());
+
+        // ── 逐条 dtoh 读回 + 朴素期望 + 逐位比较
+        let mut bad = 0usize;
+        for (i, e) in manifest.entries().iter().enumerate() {
+            let n: usize = e.shape.iter().product();
+            let (dtype, off, nbytes) = anchor[&e.key];
+            let raw_slice = &raw[off..off + nbytes];
+            let mut want = Vec::new();
+            anchor_decode(dtype, raw_slice, &mut want);
+            if e.layout == Layout::Transposed {
+                // 源 [out, in] → 声明 [in, out]:朴素转置
+                let (cols, rows) = (e.shape[0], e.shape[1]);
+                let mut t = vec![0f32; n];
+                for r in 0..rows {
+                    for c in 0..cols {
+                        t[c * rows + r] = want[r * cols + c];
+                    }
+                }
+                want = t;
+            }
+            let mut got_bytes = vec![0u8; n * 4];
+            gpu.dtoh(&e.block, &mut got_bytes).await?;
+            let mism = got_bytes
+                .chunks_exact(4)
+                .zip(want.iter())
+                .position(|(c, w)| {
+                    let g = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                    g.to_bits() != w.to_bits()
+                });
+            match mism {
+                None => {}
+                Some(p) => {
+                    bad += 1;
+                    let g = f32::from_le_bytes([
+                        got_bytes[p * 4],
+                        got_bytes[p * 4 + 1],
+                        got_bytes[p * 4 + 2],
+                        got_bytes[p * 4 + 3],
+                    ]);
+                    eprintln!("[chk] ✗ #{i} {} 首个错位 {p}: gpu {g} vs 锚 {}", e.key, want[p]);
+                }
+            }
+            if i % 100 == 0 {
+                eprintln!("[chk] … {i}/{} 已核", manifest.entries().len());
+            }
+        }
+        eprintln!("[chk] 完成: {} 条中 {bad} 条不符", manifest.entries().len());
+        assert_eq!(bad, 0, "显存数据与独立锚逐位不一致");
+        gpu.close().await?;
+        Ok(())
+    }
+
+
+    /// ★ matmul 维度二分探针:同尺寸矩阵直调算子,host 参考逐元素对拍。
+    /// 两种数据形态:from_host 叶子 / of_block 上传块(复刻 diag 场景)。
+    #[tokio::test]
+    async fn gpu_matmul_dim_probe() -> Result<(), crate::contract::ModelError> {
+        use crate::contract::DeviceClient;
+        if !crate::testkit::gpu_enabled() {
+            crate::testkit::skip_note();
+            return Ok(());
+        }
+        let mut gpu = crate::testkit::gpu_client().await;
+        let cases: [(&str, usize, usize, usize); 5] = [
+            ("fixture      m1-k6-n6", 1, 6, 6),
+            ("k1024-n24   ", 1, 1024, 24),
+            ("k1024-n384  ", 1, 1024, 384),
+            ("k1024-n6144 ", 1, 1024, 6144),
+            ("m4-k1024-n6144", 4, 1024, 6144),
+        ];
+        for (name, m, k, n) in cases {
+            let a: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 - 8.0) * 0.25).collect();
+            let b: Vec<f32> = (0..k * n).map(|i| ((i % 13) as f32 - 6.0) * 0.125).collect();
+
+            // 形态一:from_host 叶子
+            let a_t = TensorOps::from_host(Dtype::F32, vec![m, k], &f32b(&a));
+            let b_t = TensorOps::from_host(Dtype::F32, vec![k, n], &f32b(&b));
+            let got = crate::testkit::harvest(&mut gpu, &a_t.matmul(&b_t)).await;
+
+            // host 参考(朴素)
+            let mut want = vec![0f32; m * n];
+            for i in 0..m {
+                for p in 0..k {
+                    let av = a[i * k + p];
+                    for j in 0..n {
+                        want[i * n + j] += av * b[p * n + j];
+                    }
+                }
+            }
+            let maxdiff = got
+                .iter()
+                .zip(&want)
+                .map(|(g, w)| (g - w).abs())
+                .fold(0.0f32, f32::max);
+            let zeros = got.iter().filter(|v| **v == 0.0).count();
+            eprintln!("[mm] {name} from_host : maxdiff={maxdiff:.6} zeros={zeros}/{}", got.len());
+
+            // 形态二:of_block 上传块(htod_f32 后以 Block 叶子引用)
+            let sa = vec![m, k];
+            let sb = vec![k, n];
+            let ba = gpu.htod_f32(&sa, a.clone()).await?;
+            let bb = gpu.htod_f32(&sb, b.clone()).await?;
+            let a_b = TensorOps::of_block(ba.id, Dtype::F32, vec![m, k]);
+            let b_b = TensorOps::of_block(bb.id, Dtype::F32, vec![k, n]);
+            let got2 = crate::testkit::harvest(&mut gpu, &a_b.matmul(&b_b)).await;
+            let maxdiff2 = got2
+                .iter()
+                .zip(&want)
+                .map(|(g, w)| (g - w).abs())
+                .fold(0.0f32, f32::max);
+            let zeros2 = got2.iter().filter(|v| **v == 0.0).count();
+            eprintln!("[mm] {name} of_block  : maxdiff={maxdiff2:.6} zeros={zeros2}/{}", got2.len());
+            assert!(
+                maxdiff < 1e-2 && maxdiff2 < 1e-2,
+                "{name} matmul 错误: from_host {maxdiff} / of_block {maxdiff2}"
+            );
+        }
+        gpu.close().await?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -235,7 +509,7 @@ mod tests {
         // rope 表(theta 1e7 / partial 64 / max_pos 262144)
         let rp = Rope::new(262_144, HD, 64, 10_000_000.0).expect("rope");
         eprintln!("[smoke] rope 表...");
-        crate::interpreter::eval_load(&rp, &mut gpu, &rp.tables(), &Default::default())
+        crate::interpreters::eval_load(&rp, &mut gpu, &rp.tables(), &Default::default())
             .await
             .expect("rope 表");
         eprintln!("[smoke] rope ok; 分配常驻缓冲...");

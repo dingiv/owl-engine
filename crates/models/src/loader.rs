@@ -115,6 +115,17 @@ struct Entry {
     dtype: safetensors::Dtype,
 }
 
+impl Entry {
+    /// 元素宽(字节):F32=4,BF16=2
+    fn esz(&self) -> usize {
+        match self.dtype {
+            safetensors::Dtype::F32 => 4,
+            safetensors::Dtype::BF16 => 2,
+            _ => unreachable!("open_dir 只登记 F32/BF16"),
+        }
+    }
+}
+
 impl SafeTensorsSource {
     /// 打开目录下全部 `*.safetensors`(文件名字典序;分片键天然互斥,
     /// 无需 index.json;单文件仓同样适用)。只建映射 + 索引,零数据拷贝。
@@ -171,8 +182,9 @@ impl SafeTensorsSource {
     /// 消费完立即 `madvise(MADV_DONTNEED)` 归还映射页 —— 进程 RSS
     /// 恒定在"在途块"量级,不随仓大小增长(读一点装一点)。
     fn convert_range(&self, e: &Entry, offset_elems: usize, len: usize) -> Vec<f32> {
-        let s = e.start + offset_elems * 4;
-        let nbytes = len * 4;
+        let esz = e.esz();
+        let s = e.start + offset_elems * esz;
+        let nbytes = len * esz;
         let bytes = &self.maps[e.map_ix][s..s + nbytes];
         let converted = match e.dtype {
             safetensors::Dtype::F32 => bytes
@@ -191,6 +203,11 @@ impl SafeTensorsSource {
 }
 
 impl WeightSource for SafeTensorsSource {
+    fn elem_len(&self, key: &str) -> Option<usize> {
+        let e = self.index.lock().unwrap().get(key).cloned()?;
+        Some(e.nbytes / e.esz())
+    }
+
     /// 整取(F32 直读 / BF16 升位),条目即从索引移除。
     /// 流式装载主路径走 `take_range`(分块,条目保留)。
     fn take(&self, key: &str) -> Option<Vec<f32>> {
@@ -201,7 +218,7 @@ impl WeightSource for SafeTensorsSource {
     /// 区间转换(mmap 直读,**不移除条目** —— 分块上传同键多块重复取)
     fn take_range(&self, key: &str, offset_elems: usize, len: usize) -> Option<Vec<f32>> {
         let e = self.index.lock().unwrap().get(key).cloned()?;
-        if offset_elems * 4 + len * 4 > e.nbytes {
+        if (offset_elems + len) * e.esz() > e.nbytes {
             return None;
         }
         Some(self.convert_range(&e, offset_elems, len))
@@ -216,12 +233,23 @@ impl WeightSource for SafeTensorsSource {
         len: usize,
         dst: &mut [f32],
     ) -> Option<()> {
-        let e = self.index.lock().unwrap().get(key).cloned()?;
-        if offset_elems * 4 + len * 4 > e.nbytes {
+        let e = match self.index.lock().unwrap().get(key).cloned() {
+            Some(e) => e,
+            None => {
+                eprintln!("[st][DIAG] 索引未命中: {key}");
+                return None;
+            }
+        };
+        let esz = e.esz();
+        if (offset_elems + len) * esz > e.nbytes {
+            eprintln!(
+                "[st][DIAG] OOB: {key} off{offset_elems} len{len} esz{esz} nbytes{}",
+                e.nbytes
+            );
             return None;
         }
-        let s = e.start + offset_elems * 4;
-        let bytes = &self.maps[e.map_ix][s..s + len * 4];
+        let s = e.start + offset_elems * esz;
+        let bytes = &self.maps[e.map_ix][s..s + len * esz];
         match e.dtype {
             safetensors::Dtype::F32 => {
                 for (d, c) in dst.iter_mut().zip(bytes.chunks_exact(4)) {
@@ -235,7 +263,7 @@ impl WeightSource for SafeTensorsSource {
             }
             _ => return None,
         }
-        self.maps[e.map_ix].dontneed(s, len * 4);
+        self.maps[e.map_ix].dontneed(s, len * esz);
         Some(())
     }
 }

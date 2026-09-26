@@ -156,12 +156,13 @@ impl DeviceClient for CpuFace {
         buf: Box<dyn owl_iface::contract::PinnedRegion + Send>,
         dst: &Bytes,
         offset_elems: usize,
+        elems: usize,
     ) -> Result<(), ModelError> {
         let v = self
             .blocks
             .get_mut(&dst.id)
             .ok_or(ModelError::DeadBlock { id: dst.id })?;
-        let data = buf.as_f32();
+        let data = &buf.as_f32()[..elems];
         let end = offset_elems + data.len();
         if v.f32.len() < end {
             return Err(ModelError::Msg(format!(
