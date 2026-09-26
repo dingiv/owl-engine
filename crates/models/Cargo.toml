@@ -19,7 +19,12 @@ futures-util = "0.3"
 # tokenizer(tokenizer.rs;直接加载 tokenizer.json,纯 Rust)
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 # f16 基线(F5):装载 bf16/f32 → f16 字节直转 + 层测试量化参考
+# use-intrinsics:批量 slice 转换走 F16C(x86 运行时探测)—— 装载转
+# 换段从 debug 标量 ~22MB/s 回到内存带宽级(2026-09-26 装载探针定谳:
+# 转换段 45ms/MB 是装载慢的主因,非 DMA/非排队)
 half = "2"
+owl-f16c = { path = "../f16c" }
+tokio = { version = "1", features = ["rt"] }
 
 [dev-dependencies]
 # 样例的 async 运行时(CPU face 即测即用;GPU face 经 owl-cuda actor 消化阻塞)

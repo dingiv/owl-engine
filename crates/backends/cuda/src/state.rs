@@ -338,12 +338,11 @@ pub(super) struct Staging {
 unsafe impl Send for Staging {}
 
 impl owl_iface::contract::PinnedRegion for Staging {
-    fn slice_mut(&mut self) -> &mut [f32] {
-        // f32 视图(pinned 流水线仅剩 f32 装载路径在用;f16 走 htod 字节路径)
-        unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut f32, self.len / 4) }
+    fn slice_bytes_mut(&mut self) -> &mut [u8] {
+        Staging::slice_mut(self)
     }
-    fn as_f32(&self) -> &[f32] {
-        unsafe { std::slice::from_raw_parts(self.ptr as *const f32, self.len / 4) }
+    fn as_bytes(&self) -> &[u8] {
+        Staging::slice(self)
     }
 }
 

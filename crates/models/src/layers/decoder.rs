@@ -273,13 +273,14 @@ mod tests {
         eprintln!("[probe] block {} alloc'd", b.id);
         for round in 0..3 {
             eprintln!("[probe] round {round}: alloc_pinned...");
-            let mut lease = gpu.alloc_pinned(elems).await.expect("alloc_pinned");
+            let mut lease = gpu.alloc_pinned(elems * 4).await.expect("alloc_pinned");
             eprintln!("[probe] round {round}: fill...");
-            for (i, d) in lease.slice_mut().iter_mut().enumerate() {
-                *d = (round * 1000 + i % 1000) as f32;
+            // 字节口径租约(F5 尾批):f32 LE 直写
+            for (i, d) in lease.slice_bytes_mut().chunks_exact_mut(4).enumerate() {
+                d.copy_from_slice(&((round * 1000 + i % 1000) as f32).to_le_bytes());
             }
             eprintln!("[probe] round {round}: upload...");
-            gpu.upload_pinned(lease, &b, 0, elems).await.expect("upload_pinned");
+            gpu.upload_pinned(lease, &b, 0, elems * 4).await.expect("upload_pinned");
             eprintln!("[probe] round {round}: dtoh...");
             let mut out = vec![0u8; elems * 4];
             gpu.dtoh(&b, &mut out).await.expect("dtoh");

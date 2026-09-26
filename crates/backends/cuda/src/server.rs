@@ -37,6 +37,10 @@ use std::sync::mpsc;
 
 type Finish = Box<dyn FnOnce() + Send>;
 
+fn srv_timing_on() -> bool {
+    std::env::var_os("OWL_SRV_TIMING").is_some()
+}
+
 /// pinned 租约池(server 私有;Arc 随 dispatch 线程共持 ——
 /// 生命周期严格罩在 CUDA ctx 之内,server 关闭即整池释放,
 /// 杜绝跨 server 的悬垂页锁指针段错误)
@@ -46,9 +50,9 @@ pub(super) struct PinnedPool {
 }
 
 impl PinnedPool {
-    fn take(&self, min_elems: usize) -> Option<Box<dyn owl_iface::contract::PinnedRegion + Send>> {
+    fn take(&self, min_bytes: usize) -> Option<Box<dyn owl_iface::contract::PinnedRegion + Send>> {
         let mut v = self.free.lock().unwrap();
-        let i = v.iter().position(|b| b.as_f32().len() >= min_elems)?;
+        let i = v.iter().position(|b| b.as_bytes().len() >= min_bytes)?;
         Some(v.swap_remove(i))
     }
     fn put(&self, b: Box<dyn owl_iface::contract::PinnedRegion + Send>) {
@@ -68,6 +72,8 @@ pub struct GpuServer {
     blas: Option<owl_kernels::cublas::OwlCublas>,
     /// 完成派发出口(host 回调只投递;派发线程执行真正的 finish)
     dispatch: Option<mpsc::Sender<Finish>>,
+    /// 逐命令计时账本(OWL_SRV_TIMING;name / count / total_ns / max_ns)
+    timings: Vec<(&'static str, u64, u128, u128)>,
 }
 
 impl GpuServer {
@@ -93,6 +99,7 @@ impl GpuServer {
             kernels: KernelCache::new(),
             blas: None,
             dispatch: None,
+            timings: Vec::new(),
         }
     }
 
@@ -151,6 +158,21 @@ impl GpuServer {
             }
         }
         self.shutdown_fence();
+        // server 侧逐命令分相汇总(OWL_SRV_TIMING;与 [load] 客户端探针互补)
+        if srv_timing_on() && !self.timings.is_empty() {
+            eprintln!("[srv-timing] ===== handler 分相(count / total / max) =====");
+            let mut rows = self.timings.clone();
+            rows.sort_by_key(|(_, _, total, _)| std::cmp::Reverse(*total));
+            for (name, count, total, max) in rows {
+                eprintln!(
+                    "[srv-timing]   {:<14} x{:<5} total={:>8.1}ms max={:>8.1}ms",
+                    name,
+                    count,
+                    total as f64 / 1e6,
+                    max as f64 / 1e6
+                );
+            }
+        }
         Ok(())
     }
 
@@ -164,6 +186,10 @@ impl GpuServer {
     /// Closing 收尾:设备栅栏(三条流全部落定,在飞搬运/kernel 不悬空)
     /// → 关派发通道(派发线程排完在飞 finish 后自然退出)。
     fn shutdown_fence(&mut self) {
+        // cublas 句柄先于上下文消亡(2026-09-26 定谳:字段声明序 ctx 先于
+        // blas 掉,teardown 时 cublasDestroy 撞已拆上下文 → libcublasLt
+        // SIGSEGV;显式 take = 句柄在活上下文内销毁,gdb bt 实证)
+        drop(self.blas.take());
         if let Some(ctx) = &self.ctx {
             for sid in [STREAM_H2D, STREAM_COMPUTE, STREAM_D2H] {
                 if let Ok(s) = ctx.stream(sid) {
@@ -187,6 +213,48 @@ impl GpuServer {
     // ======================================================================
 
     fn dispatch(&mut self, cmd: Command) {
+        // 逐命令计时(OWL_SRV_TIMING 门控;卸载时汇总 —— server 侧分相,
+        // 与客户端 [load] 探针互补:handler 真实执行时间,含阻塞段)
+        let timing = srv_timing_on();
+        let (t0, name) = if timing {
+            (Some(std::time::Instant::now()), Some(Self::cmd_name(&cmd)))
+        } else {
+            (None, None)
+        };
+        self.dispatch_inner(cmd);
+        if let (Some(t0), Some(name)) = (t0, name) {
+            let dt = t0.elapsed();
+            let slot = if let Some(pos) = self.timings.iter().position(|(n, ..)| *n == name) {
+                &mut self.timings[pos]
+            } else {
+                self.timings.push((name, 0u64, 0u128, 0u128));
+                let last = self.timings.len() - 1;
+                &mut self.timings[last]
+            };
+            slot.1 += 1;
+            slot.2 += dt.as_nanos() as u128;
+            slot.3 = slot.3.max(dt.as_nanos() as u128);
+        }
+    }
+
+    fn cmd_name(c: &Command) -> &'static str {
+        match c {
+            Command::GraphBegin { .. } => "GraphBegin",
+            Command::GraphEnd { .. } => "GraphEnd",
+            Command::GraphLaunch { .. } => "GraphLaunch",
+            Command::Alloc { .. } => "Alloc",
+            Command::Htod { .. } => "Htod",
+            Command::HtodChunk { .. } => "HtodChunk",
+            Command::AllocPinned { .. } => "AllocPinned",
+            Command::UploadPinned { .. } => "UploadPinned",
+            Command::Dtoh { .. } => "Dtoh",
+            Command::Sync { .. } => "Sync",
+            Command::Launch { .. } => "Launch",
+            Command::Close { .. } => "Close",
+        }
+    }
+
+    fn dispatch_inner(&mut self, cmd: Command) {
         // G2 护栏:捕获期间仅放行「Launch / Alloc(切 slab)」—— 二者由
         // 路由策略天然落在捕获流(COMPUTE);其余(搬运/同步/图操作)一律
         // 结构化拒绝 —— 它们或含非法捕获语义,或污染捕获拓扑。
@@ -206,9 +274,9 @@ impl GpuServer {
             Command::HtodChunk { block, offset_bytes, data, ack } => {
                 self.handle_htod_chunk(block, offset_bytes, data, ack)
             }
-            Command::AllocPinned { elems, ack } => self.handle_alloc_pinned(elems, ack),
-            Command::UploadPinned { buf, dst, offset_elems, elems, ack } => {
-                self.handle_upload_pinned(buf, dst, offset_elems, elems, ack)
+            Command::AllocPinned { bytes, ack } => self.handle_alloc_pinned(bytes, ack),
+            Command::UploadPinned { buf, dst, offset_bytes, len_bytes, ack } => {
+                self.handle_upload_pinned(buf, dst, offset_bytes, len_bytes, ack)
             }
             Command::Dtoh { id, want_bytes, ack } => self.handle_dtoh(id, want_bytes, ack),
             Command::Launch { msg, ack } => self.handle_launch(msg, ack),
@@ -315,7 +383,6 @@ impl GpuServer {
     }
 
     fn handle_htod(&mut self, data: Vec<u8>, ack: Ack<Result<Bytes, ModelError>>) {
-        eprintln!("[srv] Htod {} bytes", data.len());
         let mut ack = Some(ack);
         let n = data.len();
         let stream = match self.ctx().stream(STREAM_H2D) {
@@ -323,11 +390,12 @@ impl GpuServer {
             Err(e) => return ack.take().unwrap().send(Err(e)),
         };
         match self.try_htod(&stream, &data) {
-            Ok((id, staging)) => {
-                // 码头随 finish 存活至搬运完成后由派发线程释放
+            Ok((id, buf)) => {
+                // 码头随 finish 存活至搬运完成后归还池(派发线程执行)
                 let mut cb_ack = ack.take();
+                let pool = self.pool.clone();
                 let finish: Finish = Box::new(move || {
-                    drop(staging);
+                    pool.put(buf);
                     cb_ack.take().unwrap().send(Ok(Bytes::new(id, n)));
                 });
                 if let Err(e) = self.notify(&stream, finish) {
@@ -344,37 +412,43 @@ impl GpuServer {
         &mut self,
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
         data: &[u8],
-    ) -> Result<(u64, Staging), ModelError> {
+    ) -> Result<(u64, Box<dyn owl_iface::contract::PinnedRegion + Send>), ModelError> {
         let n = data.len();
         // 1. 设备块(流序 malloc;未初始化;字节口径)
         let dst = unsafe { stream.alloc::<u8>(n) }
             .map_err(|e| ModelError::Msg(format!("htod alloc: {e:?}")))?;
         let id = self.ctx_mut().new_block(dst);
-        // 2. pinned 码头 + 异步 memcpy(流序;host 侧必须 pinned 才真异步)
-        let mut staging = Staging::alloc(n)?;
-        staging.slice_mut().copy_from_slice(data);
+        // 2. pinned 码头 + 异步 memcpy(流序;host 侧必须 pinned 才真异步)。
+        //    码头池化(2026-09-26 尾批:原每次 malloc_host 新分配,大权重
+        //    锁页分配是装载耗时大头;finish 回调归还池)
+        let mut buf: Box<dyn owl_iface::contract::PinnedRegion + Send> =
+            match self.pool.take(n) {
+                Some(b) => b,
+                None => Box::new(Staging::alloc(n)?),
+            };
+        buf.slice_bytes_mut()[..n].copy_from_slice(data);
         let (dptr, _) = self.ctx().block_ptr(id, stream)?;
-        unsafe { memcpy_htod_async(dptr, staging.slice(), stream.cu_stream()) }
+        // 池块容量 ≥ 请求:DMA 长度必须截到 n(越界写设备块 = INVALID_VALUE)
+        unsafe { memcpy_htod_async(dptr, &buf.as_bytes()[..n], stream.cu_stream()) }
             .map_err(|e| ModelError::Msg(format!("htod async: {e:?}")))?;
-        Ok((id, staging))
+        Ok((id, buf))
     }
 
-    /// 分配 pinned 租约:池优先,miss 才 cudaHostAlloc
+    /// 分配 pinned 租约：池优先，miss 才 cudaHostAlloc。
+    /// 不填零（2026-09-26 装载定谳）：租约语义 = 调用方整块覆写后再按
+    /// len_bytes DMA，填零纯属 server 单线程上的双倍带宽税。
     fn handle_alloc_pinned(
         &mut self,
-        elems: usize,
+        bytes: usize,
         ack: Ack<Result<Box<dyn owl_iface::contract::PinnedRegion + Send>, ModelError>>,
     ) {
-        eprintln!("[srv] AllocPinned {elems}");
-        // 池取(内部单次加锁;容量 ≥ 请求即命中,逻辑长度由调用方界定)
-        if let Some(mut b) = self.pool.take(elems) {
-            b.slice_mut()[..elems].fill(0.0);
-            // 容量不可截,整块交出(调用方只用前 elems)
+        // 池取（内部单次加锁；容量 ≥ 请求即命中，逻辑长度由调用方界定）
+        if let Some(b) = self.pool.take(bytes) {
+            // 容量不可截，整块交出（调用方只用前 bytes）
             ack.send(Ok(b));
             return;
         }
-        // f32 租约口径(pinned 流水线仅剩 f32 装载路径;字节底层)
-        match Staging::alloc(elems * 4) {
+        match Staging::alloc(bytes) {
             Ok(s) => ack.send(Ok(Box::new(s))),
             Err(e) => ack.send(Err(e)),
         }
@@ -385,11 +459,10 @@ impl GpuServer {
         &mut self,
         buf: Box<dyn owl_iface::contract::PinnedRegion + Send>,
         dst: Bytes,
-        offset_elems: usize,
-        elems: usize,
+        offset_bytes: usize,
+        len_bytes: usize,
         ack: Ack<Result<(), ModelError>>,
     ) {
-        eprintln!("[srv] UploadPinned block{} off{} elems{}", dst.id, offset_elems, elems);
         let stream = match self.ctx().stream(STREAM_H2D) {
             Ok(s) => s.clone(),
             Err(e) => return ack.send(Err(e)),
@@ -401,8 +474,8 @@ impl GpuServer {
         };
         if let Err(e) = unsafe {
             memcpy_htod_async(
-                dptr_base + (offset_elems as u64) * 4,
-                &buf.as_f32()[..elems],
+                dptr_base + (offset_bytes as u64),
+                &buf.as_bytes()[..len_bytes],
                 stream.cu_stream(),
             )
         } {
@@ -412,20 +485,24 @@ impl GpuServer {
             ack.take().unwrap().send(Err(e));
             return;
         }
-        let cell = std::sync::Arc::new(std::sync::Mutex::new(Some((buf, ack))));
+        // 异步语义(F5 尾批,用户裁决):入队即回执 —— DMA 完成由调用方
+        // 的显式 sync 栅栏兜底;finish 只归还租约入池(页锁定代价不再
+        // 逐块支付,池真正转起来)。
+        let cell = std::sync::Arc::new(std::sync::Mutex::new(Some(buf)));
         let cell2 = cell.clone();
         let pool = self.pool.clone();
         let pool_err = self.pool.clone();
         let finish: Finish = Box::new(move || {
-            let (buf, mut ack) = cell2.lock().unwrap().take().unwrap();
+            let buf = cell2.lock().unwrap().take().unwrap();
             pool.put(buf);
-            ack.take().unwrap().send(Ok(()));
         });
+        ack.take().unwrap().send(Ok(())); // 入队即回执(非阻塞)
         if let Err(e) = self.notify(&stream, finish) {
-            // notify 失败:finish 未投递,租约回收入池 + 回执错误
-            if let Some((buf, mut ack)) = cell.lock().unwrap().take() {
+            // notify 失败:finish 未投递,租约回收入池(ack 已回,
+            // DMA 未发生 —— 块内容缺失由调用方末端 sync 后自查/重试兜底)
+            if let Some(buf) = cell.lock().unwrap().take() {
                 pool_err.put(buf);
-                ack.take().unwrap().send(Err(e));
+                eprintln!("[srv] upload notify 失败: {e:?}");
             }
         }
     }

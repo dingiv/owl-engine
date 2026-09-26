@@ -104,24 +104,24 @@ impl DeviceClient for GpuClient {
 
     async fn alloc_pinned(
         &mut self,
-        elems: usize,
+        bytes: usize,
     ) -> Result<Box<dyn owl_iface::contract::PinnedRegion + Send>, ModelError> {
-        self.submit(move |ack| Command::AllocPinned { elems, ack })?.await
+        self.submit(move |ack| Command::AllocPinned { bytes, ack })?.await
     }
 
     async fn upload_pinned(
         &mut self,
         buf: Box<dyn owl_iface::contract::PinnedRegion + Send>,
         dst: &Bytes,
-        offset_elems: usize,
-        elems: usize,
+        offset_bytes: usize,
+        len_bytes: usize,
     ) -> Result<(), ModelError> {
         let dst = dst.clone();
         self.submit(move |ack| Command::UploadPinned {
             buf,
             dst,
-            offset_elems,
-            elems,
+            offset_bytes,
+            len_bytes,
             ack,
         })?
         .await

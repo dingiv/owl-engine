@@ -84,7 +84,7 @@ impl KeyConvention for Qwen35Convention {
 /// 装载 Qwen3.5-0.8B(快照目录:`config.json` + `*.safetensors`)。
 /// 目录内全部 safetensors 合并取源(BF16 → f32,visual/mtp 键无害
 /// 常驻源内,只有主干键会被查到);装载走整模 Loadable 单清单。
-pub async fn load_0_8b<D: DeviceClient>(
+pub async fn load_0_8b<D: DeviceClient + 'static>(
     dir: &Path,
     face: &mut D,
 ) -> Result<Model, ModelError> {
@@ -250,7 +250,7 @@ mod tests {
         use crate::layers::gdn::GdnBuffers;
         use crate::layers::rope::Rope;
         use crate::module::KvBuffers;
-        use crate::testkit::f32_of;
+
         if !crate::testkit::gpu_enabled() {
             crate::testkit::skip_note();
             return Ok(());
@@ -285,16 +285,14 @@ mod tests {
         let kvs = mk_kvs;
         let gdns = mk_gdns;
 
-        // manifest(装载即校验;320 块 checksum 另有专测 gpu_vram_manifest_checksum)
-        let src_chk = SafeTensorsSource::open_dir(&dir)?;
-        let _manifest =
-            crate::interpreters::eval_load(&model, &mut gpu, &src_chk, &Default::default())
-                .await?;
+        // (装载即校验已有专测 gpu_vram_manifest_checksum;此处二次装载
+        //  在 f16 时代 = F32 ctx 污染权重 + 双倍耗时,F5-2 删)
         let steps = [(985.0f32, 0.0f32, 0.0f32, 1.0f32), (4123.0, 1.0, 1.0, 2.0f32)];
-        // 引用重读探针(竞速判决):记录层根块引用,步终 sync 后重读 ——
-        // 窗口内读零 + 步终读非零 = D2H 流与 COMPUTE 流无同步的竞速读
+        // 引用重读探针(竞速判决):记录层根块引用与 dtype,步终 sync 后
+        // 重读 —— 窗口内读零 + 步终读非零 = D2H 流与 COMPUTE 流无同步的
+        // 竞速读。字节口径随 dtype 推导,禁硬编码(×4/×2 均为雷)
         struct RefProbe {
-            refs: Vec<(String, crate::contract::Bytes, usize)>,
+            refs: Vec<(String, crate::contract::Bytes, usize, Dtype)>,
         }
         impl crate::interpreters::Tap for RefProbe {
             fn on_node(
@@ -307,6 +305,7 @@ mod tests {
                         t.to_string(),
                         crate::contract::Bytes { id: ev.out.block_id, len: elems },
                         elems,
+                        ev.dtype,
                     ));
                 }
                 crate::interpreters::Want::Quiet
@@ -341,29 +340,33 @@ mod tests {
             // tap 层根曲线代替旧逐层 harvest(旧法每层整链重放,GDN 状态
             // 被观测行为污染,读数不可信 —— interpreter-tap.md §一)。
             let tree = model.forward(&ids, &base_ctx); // embed→…→norm→logits,层根已打标
+            let root = tree.step();
+            // 步终判读:logits top-1(塌零 = top 落在 0 向量上)
+            // 读回口径随声明链根 dtype 推导(f16 基线;禁硬编码)
+            let logits_dt = root.dtype();
             let logits = {
                 let mut curve = crate::interpreters::StatsTap::curve(si);
                 let mut taps = crate::interpreters::observe::TapChain(&mut curve, &mut probe);
-                crate::interpreters::eval_ops_tap(tree.step(), &mut gpu, &mut taps).await?
+                crate::interpreters::eval_ops_tap(root, &mut gpu, &mut taps).await?
             };
-            // 步终判读:logits top-1(塌零 = top 落在 0 向量上)
-            let mut buf = vec![0u8; model.vocab_size() * 4];
+            let mut buf = vec![0u8; model.vocab_size() * logits_dt.size_bytes()];
             gpu.dtoh(&logits, &mut buf).await?;
-            let lh = f32_of(&buf);
+            let lh = crate::interpreters::eval::decode_host(logits_dt, &buf);
             let (ti, tv) = lh.iter().enumerate()
                 .fold((0usize, f32::NEG_INFINITY), |a, (i, &v)| {
                     if v > a.1 { (i, v) } else { a }
                 });
             eprintln!("[diag]   step{si} top@{ti} logit={tv:.4}");
             // ── 竞速判决:三流 sync 后重读 L0 层根与 final_norm(窗口内读的同一块)──
+            // 读回长度与解码均随块 dtype(RefProbe 记录),无硬编码
             gpu.sync().await?;
-            for (tag, b, elems) in &probe.refs {
+            for (tag, b, elems, dt) in &probe.refs {
                 if !matches!(tag.as_str(), "L0.gdn" | "final_norm") {
                     continue;
                 }
-                let mut buf = vec![0u8; elems * 4];
+                let mut buf = vec![0u8; elems * dt.size_bytes()];
                 gpu.dtoh(b, &mut buf).await?;
-                let h = f32_of(&buf);
+                let h = crate::interpreters::eval::decode_host(*dt, &buf);
                 let rms = (h.iter().map(|v| v * v).sum::<f32>() / h.len() as f32).sqrt();
                 eprintln!("[diag]   [sync后重读] {tag} rms={rms:.6} zeros={}", h.iter().filter(|v| **v == 0.0).count());
             }
@@ -415,13 +418,14 @@ mod tests {
             }
         };
 
-        // ── 装载(被测链)
+        // ── 装载(被测链;单次装载保留 manifest —— F5-2 前为重跑 load
+        //    生成 manifest,双倍上传;F5-2 删)
         let mut gpu = crate::testkit::gpu_client().await;
-        let model = load_0_8b(&dir, &mut gpu).await?;
-        // 复跑 load 生成 manifest(权重已装载,重复装载 = 重上传,结果等价)
+        let model = Model::new(&qwen3_5_0_8b(), Qwen35Convention::new("model.language_model"));
         let manifest = {
             let src = SafeTensorsSource::open_dir(&dir)?;
-            crate::interpreters::eval_load(&model, &mut gpu, &src, &Default::default()).await?
+            let ctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1 };
+            crate::interpreters::eval_load(&model, &mut gpu, &src, &ctx).await?
         };
         eprintln!("[chk] manifest {} 条", manifest.entries().len());
 
@@ -444,26 +448,27 @@ mod tests {
                 }
                 want = t;
             }
-            let mut got_bytes = vec![0u8; n * 4];
+            let esz = e.dtype.size_bytes();
+            let mut got_bytes = vec![0u8; n * esz];
             gpu.dtoh(&e.block, &mut got_bytes).await?;
+            // 期望链:锚 f32(含朴素转置)→ f16 位型(与装载链同一 half
+            // 转换,位型应全等;f16 基线后块内字节 = f16)
             let mism = got_bytes
-                .chunks_exact(4)
+                .chunks_exact(esz)
                 .zip(want.iter())
                 .position(|(c, w)| {
-                    let g = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-                    g.to_bits() != w.to_bits()
+                    let g = u16::from_le_bytes([c[0], c[1]]);
+                    g != half::f16::from_f32(*w).to_bits()
                 });
             match mism {
                 None => {}
                 Some(p) => {
                     bad += 1;
-                    let g = f32::from_le_bytes([
-                        got_bytes[p * 4],
-                        got_bytes[p * 4 + 1],
-                        got_bytes[p * 4 + 2],
-                        got_bytes[p * 4 + 3],
-                    ]);
-                    eprintln!("[chk] ✗ #{i} {} 首个错位 {p}: gpu {g} vs 锚 {}", e.key, want[p]);
+                    let g = half::f16::from_bits(u16::from_le_bytes([
+                        got_bytes[p * 2],
+                        got_bytes[p * 2 + 1],
+                    ]));
+                    eprintln!("[chk] ✗ #{i} {} 首个错位 {p}: gpu {g} vs 锚 f16({})", e.key, want[p]);
                 }
             }
             if i % 100 == 0 {
@@ -545,7 +550,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn gpu_real_weights_smoke() {
         use crate::layers::gdn::GdnBuffers;
         use crate::layers::rope::Rope;
@@ -558,12 +563,22 @@ mod tests {
         eprintln!("[smoke] boot server...");
         let mut gpu = crate::testkit::gpu_client().await;
         eprintln!("[smoke] booted; open safetensors...");
+        // 实际字节量从文件取(禁硬编码口径 —— 3.9GB f32 是 f32 时代残留,
+        // bf16 检查点 1.7GB,f16 装载后同为 1.7GB)
+        let mut ckpt_bytes = 0u64;
+        for e in std::fs::read_dir(&dir).expect("读目录") {
+            let p = e.expect("dir entry").path();
+            if p.extension().is_some_and(|x| x == "safetensors") {
+                ckpt_bytes += p.metadata().expect("meta").len();
+            }
+        }
         let t_load = std::time::Instant::now();
         let model = load_0_8b(&dir, &mut gpu).await.expect("load_0_8b(真权重)");
         let dt = t_load.elapsed().as_secs_f64();
         eprintln!(
-            "[smoke] loaded 24 layers ({dt:.2}s,权重 3.9GB f32 → {:.1}GB/s)",
-            3.9 / dt
+            "[smoke] loaded 24 layers ({dt:.2}s,检查点 {:.2}GB → {:.2}GB/s)",
+            ckpt_bytes as f64 / 1e9,
+            ckpt_bytes as f64 / 1e9 / dt
         );
         assert_eq!(model.layers.len(), 24);
         assert_eq!(model.layers.iter().filter(|l| l.is_full()).count(), 6);

@@ -1,21 +1,22 @@
 //! Linear:仿射层(容器 + LoaderOps 装载 + Matmul;无 bias —— Qwen3.5
 //! 全系 attention/mlp 权重无 bias)。
 //!
-//! 权重槽 = 转置装载:数据源 [out, in] 行主序 → 声明 [in, out]
-//! (forward 直 matmul,decode 零转置)。
+//! 权重槽 = **原生布局直读**(2026-09-26 F5-2:检查点 [out, in] 行主序
+//! 原样装载,forward matmul_nt —— cuBLAS OP_T 免费转置,host 转置路径
+//! 全删;旧"装载期转置"是 naive-matmul 时代产物)。
 
 use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, Weight};
 use crate::TensorOps;
 
 pub struct Linear {
-    /// 权重槽 [in, out](装载期已转置)
+    /// 权重槽 [out, in](检查点原生布局,零转置)
     w: Weight,
 }
 
 impl Linear {
     /// 准备容器(`key` = 数据源槽键;零数据零副作用)
     pub fn new(key: &'static str, out_dim: usize, in_dim: usize) -> Linear {
-        Linear { w: Weight::new_transposed(key, out_dim, in_dim) }
+        Linear { w: Weight::new(key, vec![out_dim, in_dim]) }
     }
 
     /// 取出权重槽(单权重基本函数 `load_weight` 的入口;消费层容器)
@@ -25,9 +26,10 @@ impl Linear {
 }
 
 impl Module for Linear {
-    /// y = x @ W([.., in] → [.., out];未装载 → 毒值声明)
+    /// y = x @ W^T([.., in] → [.., out];W 原生 [out, in],nt 直读;
+    /// 未装载 → 毒值声明)
     fn forward(&self, xs: &TensorOps, _ctx: &ForwardCtx) -> TensorOps {
-        xs.matmul(&self.w.decl())
+        xs.matmul_nt(&self.w.decl())
     }
 }
 
@@ -46,8 +48,8 @@ mod tests {
     use std::collections::HashMap;
 
     #[tokio::test]
-    async fn transposed_matmul_matches_host() {
-        let w = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // 源 [2,3] 行主序
+    async fn native_nt_matmul_matches_host() {
+        let w = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // 原生 [2,3] 行主序(out=2, in=3)
         let x = vec![0.5, -1.0, 2.0];
         let mut want = vec![0.0f32; 2];
         for (o, wo) in want.iter_mut().enumerate() {

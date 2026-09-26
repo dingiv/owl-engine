@@ -55,16 +55,17 @@ pub enum Command {
     },
     /// 分配 pinned 租约(流式装载 DMA 源;池优先,miss 才 cudaHostAlloc)
     AllocPinned {
-        elems: usize,
+        bytes: usize,
         ack: Ack<Result<Box<dyn owl_iface::contract::PinnedRegion + Send>, ModelError>>,
     },
-    /// 上传租约:buf 所有权移入,DMA 到 dst+offset;完成后 buf 回池
+    /// 上传租约:buf 所有权移入,DMA 到 dst+offset_bytes(字节口径);
+    /// 完成后 buf 回池
     UploadPinned {
         buf: Box<dyn owl_iface::contract::PinnedRegion + Send>,
         dst: Bytes,
-        offset_elems: usize,
-        /// 逻辑长度(池租约容量 ≥ 请求;只传前 elems)
-        elems: usize,
+        offset_bytes: usize,
+        /// 字节长度(池租约容量 ≥ 请求;只传前 len_bytes)
+        len_bytes: usize,
         ack: Ack<Result<(), ModelError>>,
     },
     /// device → host(异步 memcpy 到 pinned 码头;want_bytes 字节口径)

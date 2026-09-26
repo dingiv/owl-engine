@@ -108,20 +108,22 @@ impl std::error::Error for ModelError {}
 /// 图身份证(server 签发;graph_end 成功后可 graph_launch 重放)
 pub type GraphId = u64;
 
-/// pinned 主机缓冲(DMA 源;流式装载租约的统一视图)
+/// pinned 主机缓冲(DMA 源;流式装载租约的统一视图)。
+/// **字节口径**(2026-09-26 f16 基线尾批:装载流水恢复)—— 租约不绑
+/// 元素位宽,f16/f32 装载路径同一条流水;位宽语义归数据源写入侧。
 pub trait PinnedRegion: Send {
-    fn slice_mut(&mut self) -> &mut [f32];
-    fn as_f32(&self) -> &[f32];
+    fn slice_bytes_mut(&mut self) -> &mut [u8];
+    fn as_bytes(&self) -> &[u8];
 }
 
 /// 堆实现(无 pinned 能力的后端;拷贝语义同旧路径)
-pub struct HeapRegion(pub Vec<f32>);
+pub struct HeapRegion(pub Vec<u8>);
 
 impl PinnedRegion for HeapRegion {
-    fn slice_mut(&mut self) -> &mut [f32] {
+    fn slice_bytes_mut(&mut self) -> &mut [u8] {
         &mut self.0
     }
-    fn as_f32(&self) -> &[f32] {
+    fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 }
@@ -263,22 +265,25 @@ pub trait DeviceClient: Send {
     /// pinned 主机缓冲租约(流式装载的 DMA 源;转换直写 → move 上传)
     fn alloc_pinned(
         &mut self,
-        elems: usize,
+        bytes: usize,
     ) -> impl Future<Output = Result<Box<dyn PinnedRegion + Send>, ModelError>> + Send
     where
         Self: Sized,
     {
-        async move { Ok(Box::new(HeapRegion(vec![0.0f32; elems])) as _) }
+        async move { Ok(Box::new(HeapRegion(vec![0u8; bytes])) as _) }
     }
 
+    /// pinned 租约上载(**异步语义**,F5 尾批):提交即回执,DMA 完成由
+    /// 调用方显式 sync 栅栏兜底(计算读前必 sync);租约所有权移入 server,
+    /// 完成回调归还池。在途块数调用方自限(防码头膨胀)。
     /// 上传租约:buf 所有权移入,DMA/拷贝到 dst+offset_elems;
     /// buf 由后端回收(页锁池/释放)。默认 = 不支持。
     fn upload_pinned(
         &mut self,
         _buf: Box<dyn PinnedRegion + Send>,
         _dst: &Bytes,
-        _offset_elems: usize,
-        _elems: usize,
+        _offset_bytes: usize,
+        _len_bytes: usize,
     ) -> impl Future<Output = Result<(), ModelError>> + Send
     where
         Self: Sized,

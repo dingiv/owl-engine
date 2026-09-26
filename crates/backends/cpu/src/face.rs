@@ -47,13 +47,16 @@ impl DeviceClient for CpuFace {
     }
 
     /// 显存分配(清零;CPU = Vec;无流参数 —— 同步直调即序)。
-    /// f16 基线下 CPU 仍 f32-only(用户裁决:CPU 先不搞)——
-    /// 非 F32 结构化报错。
+    /// f16 基线下 CPU 执行仍 f32-only;但 **F16 清零块放行**(与 htod 的
+    /// F16 解码同款 —— 装载门禁测试需在 CPU 落 f16 权重块),BF16/U32 拒。
     async fn alloc(&mut self, dtype: Dtype, elems: usize) -> Result<Bytes, ModelError> {
-        if dtype != Dtype::F32 {
-            return Err(ModelError::Msg(format!(
-                "CpuFace::alloc: 仅 F32(CPU 先不搞),得 {dtype:?}"
-            )));
+        match dtype {
+            Dtype::F32 | Dtype::F16 => {}
+            other => {
+                return Err(ModelError::Msg(format!(
+                    "CpuFace::alloc: 仅 F32/F16(执行面 f32-only),得 {other:?}"
+                )))
+            }
         }
         let v = ops::zeros(Dtype::F32, &vec![elems])?;
         let id = self.next;
@@ -161,23 +164,29 @@ impl DeviceClient for CpuFace {
         &mut self,
         buf: Box<dyn owl_iface::contract::PinnedRegion + Send>,
         dst: &Bytes,
-        offset_elems: usize,
-        elems: usize,
+        offset_bytes: usize,
+        len_bytes: usize,
     ) -> Result<(), ModelError> {
+        // CPU 面 = f32 世界:字节租约按 f32 LE 解码入账(f16 装载路径不走
+        // CPU;若将来要,可在这是加 F16 解码分支 —— 结构已就位)
         let v = self
             .blocks
             .get_mut(&dst.id)
             .ok_or(ModelError::DeadBlock { id: dst.id })?;
-        let data = &buf.as_f32()[..elems];
-        let end = offset_elems + data.len();
-        if v.f32.len() < end {
+        let bytes = &buf.as_bytes()[..len_bytes];
+        let offset_elems = offset_bytes / 4;
+        let elems = len_bytes / 4;
+        let end = offset_elems + elems;
+        if v.f32.len() < end || bytes.len() != len_bytes {
             return Err(ModelError::Msg(format!(
-                "upload_pinned: 块 {} 长 {} < 写入终点 {end}",
+                "upload_pinned: 块 {} 长 {} < 写入终点 {end}(或字节数不符)",
                 dst.id,
                 v.f32.len()
             )));
         }
-        v.f32[offset_elems..end].copy_from_slice(data);
+        for (i, c) in bytes.chunks_exact(4).enumerate() {
+            v.f32[offset_elems + i] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        }
         Ok(())
     }
 

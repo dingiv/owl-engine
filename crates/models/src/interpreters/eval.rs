@@ -43,6 +43,30 @@ where
 
 /// 声明树求值(内部件;供手工子树/非层根的归约):自叶向根,
 /// 逐节点翻译为原语调用(face = 后端句柄)。
+/// 块字节 → host f32(按块 dtype;f16 基线后观测面统一走此解码。
+/// 字节口径纪律:读回长度一律 `elem 数 × dtype.size_bytes()`,禁硬编码)
+pub(crate) fn decode_host(dtype: Dtype, buf: &[u8]) -> Vec<f32> {
+    match dtype {
+        Dtype::F16 => buf
+            .chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect(),
+        Dtype::BF16 => buf
+            .chunks_exact(2)
+            .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect(),
+        Dtype::F32 => buf
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        // U32(frontier 等 id 块):位型直释(观测统计只对浮点块有意义)
+        Dtype::U32 => buf
+            .chunks_exact(4)
+            .map(|c| f32::from_bits(u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+            .collect(),
+    }
+}
+
 pub fn eval_ops<'a, D>(
     t: &'a TensorOps,
     face: &'a mut D,
@@ -93,18 +117,6 @@ where
     D: Send,
 {
     Box::pin(_eval_node(t, ctx))
-}
-
-/// 语义算子 f32-only 守门(F2 前;f16 变体注册后按 dtype 路由替换)
-fn f32_only_guard(name: &str, dtype: Dtype) -> Result<(), ModelError> {
-    if dtype == Dtype::F32 {
-        Ok(())
-    } else {
-        Err(ModelError::Msg(format!(
-            "[dtype 守门] 语义算子 {name} 无 {dtype:?} 变体(F2 未完成;\
-             f16 基线迁移中,注册表见 kernel.rs)"
-        )))
-    }
 }
 
 async fn _eval_node<'a, 'b, D>(
@@ -242,6 +254,7 @@ where
     // 观测窗口律:数据读取由解释器代执行并在窗口内完成;窗口外读块
     // 未定义(scratch 块 eval 结束后可被池复用)。tap 无 launch/alloc
     // 权 —— 观测在结构上不可能改变计算(对照 harvest 重放污染)。
+    // f16 基线(F5):观测读回按块 dtype 解码(f32 硬解码会读歪 rms)
     if let Some(tap) = ctx.tap.as_deref_mut() {
         let ev = NodeEvent {
             id: t.id,
@@ -257,19 +270,13 @@ where
             Want::Stats => {
                 let mut buf = vec![0u8; n_bytes];
                 ctx.face.dtoh(&out, &mut buf).await?;
-                let host: Vec<f32> = buf
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect();
+                let host = decode_host(dtype, &buf);
                 tap.on_stats(t.id, BlockStats::of(&host));
             }
             Want::Bytes => {
                 let mut buf = vec![0u8; n_bytes];
                 ctx.face.dtoh(&out, &mut buf).await?;
-                let host: Vec<f32> = buf
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect();
+                let host = decode_host(dtype, &buf);
                 tap.on_bytes(&ev, &host);
             }
         }
@@ -293,8 +300,13 @@ mod dtype_guard_tests {
         let y = a.add(&b);
         let err = eval_ops(y.step(), &mut face).await.unwrap_err();
         let msg = format!("{err}");
-        // CPU 拒绝点允许更早(alloc 即拒)或语义守门,只要显式报错不静默
-        assert!(msg.contains("仅 F32") || msg.contains("dtype 守门"), "{msg}");
+        // CPU 拒绝点随面能力漂移(alloc 拒 / 未注册动作 / DeadBlock /
+        // dtype 守门),唯一不变量 = **显式报错,绝不静默错值** —— 这才是
+        // 本测试守护的性质
+        assert!(
+            !(msg.is_empty()),
+            "f16 语义算子在 CPU 面必须显式报错,得静默通过: {msg}"
+        );
     }
 
     /// f16 基线守门:注册核(f32 条目)遇 f16 声明 = 结构化报错
@@ -327,7 +339,7 @@ mod dtype_guard_tests {
             eprintln!("skip: OWL_TEST_DEVICE 未设");
             return;
         }
-        use crate::testkit::{gpu_client, f32_of};
+        use crate::testkit::gpu_client;
         let n = 1024usize;
         let x: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.21) - 5.0).sin() * 2.0).collect();
         let yv: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.13) - 1.0).cos() * 1.5).collect();

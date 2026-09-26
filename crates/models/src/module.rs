@@ -150,16 +150,61 @@ pub trait WeightSource {
 
     /// 分块转换**直写**目标缓冲(2026-09-26 二拷贝预算:转换这 1 次
     /// 直达 pinned 租约,不再有中间 Vec;流式源覆写为 mmap 直解码)。
-    fn convert_chunk_into(
+    /// f16 基线尾批:字节口径 + dtype 参数化 —— F32 写 f32 LE、F16 写
+    /// half LE;流式源(BF16 条目)直写,免 f32 中间 Vec。
+    fn convert_chunk_into_bytes(
         &self,
         key: &str,
         offset_elems: usize,
         len: usize,
-        dst: &mut [f32],
+        dst: &mut [u8],
+        dtype: Dtype,
     ) -> Option<()> {
         let v = self.take_range(key, offset_elems, len)?;
-        dst[..len].copy_from_slice(&v);
-        Some(())
+        match dtype {
+            Dtype::F32 => {
+                if dst.len() < len * 4 {
+                    return None;
+                }
+                for (i, f) in v.iter().enumerate() {
+                    dst[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
+                }
+                Some(())
+            }
+            Dtype::F16 => {
+                if dst.len() < len * 2 {
+                    return None;
+                }
+                for (i, f) in v.iter().enumerate() {
+                    dst[i * 2..i * 2 + 2].copy_from_slice(&half::f16::from_f32(*f).to_le_bytes());
+                }
+                Some(())
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Arc 转发(F5-3:并行装载所有权入任务;全方法直通内层)
+impl<S: WeightSource + ?Sized> WeightSource for std::sync::Arc<S> {
+    fn take(&self, key: &str) -> Option<Vec<f32>> {
+        (**self).take(key)
+    }
+    fn take_range(&self, key: &str, offset_elems: usize, len: usize) -> Option<Vec<f32>> {
+        (**self).take_range(key, offset_elems, len)
+    }
+    fn elem_len(&self, key: &str) -> Option<usize> {
+        (**self).elem_len(key)
+    }
+    fn convert_chunk_into_bytes(
+        &self,
+        key: &str,
+        offset_elems: usize,
+        len: usize,
+        dst: &mut [u8],
+        dtype: Dtype,
+    ) -> Option<()> {
+        (**self).convert_chunk_into_bytes(key, offset_elems, len, dst, dtype)
     }
 }
 
@@ -186,6 +231,46 @@ impl<'a> TableSource<'a> {
 impl WeightSource for TableSource<'_> {
     fn take(&self, key: &str) -> Option<Vec<f32>> {
         self.entries.iter().find(|(k, _)| *k == key).map(|(_, v)| v.to_vec())
+    }
+
+    fn elem_len(&self, key: &str) -> Option<usize> {
+        self.entries.iter().find(|(k, _)| *k == key).map(|(_, v)| v.len())
+    }
+
+    /// 表即 host f32:直接切片转写字节 —— F16 走 owl-f16c(F16C 单
+    /// pass;默认逐元素 from_f32 实现是 debug 档标量税,rope 表 67MB
+    /// 曾付 ~0.5s,F5-4 收口时实测定谳)
+    fn convert_chunk_into_bytes(
+        &self,
+        key: &str,
+        offset_elems: usize,
+        len: usize,
+        dst: &mut [u8],
+        dtype: Dtype,
+    ) -> Option<()> {
+        let v = self.entries.iter().find(|(k, _)| *k == key)?.1;
+        let src = v.get(offset_elems..offset_elems + len)?;
+        match dtype {
+            Dtype::F16 => {
+                if dst.len() < len * 2 {
+                    return None;
+                }
+                owl_f16c::f32_slice_to_f16_bytes(src, &mut dst[..len * 2]);
+                Some(())
+            }
+            Dtype::F32 => {
+                if dst.len() < len * 4 {
+                    return None;
+                }
+                // LE 主机:f32 位型即 LE 字节 —— 整块 memcpy(逐元素
+                // to_le_bytes 循环在 debug 档 ~25ns/elem,曾占 211ms)
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u8, len * 4) };
+                dst[..len * 4].copy_from_slice(bytes);
+                Some(())
+            }
+            _ => None,
+        }
     }
 }
 
@@ -335,6 +420,7 @@ impl LoaderOps {
 #[derive(Clone, Debug)]
 pub struct LoadEntry {
     pub key: String,
+    pub dtype: Dtype,
     pub shape: Shape,
     pub layout: Layout,
     pub block: Bytes,
@@ -547,7 +633,8 @@ mod tests {
 
         let xs = crate::TensorOps::from_host(crate::contract::Dtype::F32, vec![1, 3], &f32b(&[0.5, -1.0, 2.0]));
         let got = {
-            let bytes = crate::interpreters::eval_ops(xs.matmul(&w.decl()).step(), &mut face)
+            // F5-2:Linear 原生 [out,in],forward = matmul_nt
+            let bytes = crate::interpreters::eval_ops(xs.matmul_nt(&w.decl()).step(), &mut face)
                 .await
                 .expect("eval");
             let mut buf = vec![0u8; 8];

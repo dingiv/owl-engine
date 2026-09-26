@@ -13,9 +13,14 @@
 
 use crate::contract::ModelError;
 use crate::module::WeightSource;
+use half::slice::{HalfBitsSliceExt, HalfFloatSliceExt};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
+
+// 转换热路径(独立微 crate;debug 档 profile 覆盖 opt-level=3,
+// 见 crate 根注释与 workspace Cargo.toml)
+use owl_f16c::{bf16_bytes_to_f16_bytes, f32_slice_to_f16_bytes};
 
 /// mmap 只读映射(Linux,MAP_PRIVATE;Drop = munmap)。
 /// 页缓存支撑、零堆拷贝 —— 替代 std::fs::read 的整文件堆读;
@@ -177,6 +182,16 @@ impl SafeTensorsSource {
     }
 }
 
+// ============================================================================
+// 转换热路径(手写 F16C;debug 档也保 GB/s 级)
+// ============================================================================
+// 微基准定谳(2026-09-26):half 批量转换 release 4-7.7GB/s,但 debug 仅
+// 78-153MB/s(8 宽循环包装开销),而装载测试跑 debug —— 转换段曾是装载
+// 的大头(探针:convert≈17ms/MB 恒定)。这里用裸 intrinsic 循环(指令即
+// 循环体,无 debug 包装税);舍入语义 RNE 与 half::from_f32 一致(checksum
+// 逐位门可证)。server 侧逐命令计时同时定谳:装载全程 server 仅 ~355ms,
+// 瓶颈全在客户端 CPU。
+
 impl SafeTensorsSource {
     /// 条目区间 → f32(不持锁;F32 直读 / BF16 升位)。
     /// 消费完立即 `madvise(MADV_DONTNEED)` 归还映射页 —— 进程 RSS
@@ -186,17 +201,49 @@ impl SafeTensorsSource {
         let s = e.start + offset_elems * esz;
         let nbytes = len * esz;
         let bytes = &self.maps[e.map_ix][s..s + nbytes];
-        let converted = match e.dtype {
-            safetensors::Dtype::F32 => bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect(),
-            safetensors::Dtype::BF16 => bytes
-                .chunks_exact(2)
-                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
-                .collect(),
-            _ => unreachable!("open_dir 只登记 F32/BF16"),
-        };
+        let mut converted = vec![0f32; len];
+        // 大块分线程解码(F5 尾批:与 load.rs 并行转换同款;≥8MB 4 线程)
+        const PAR_THRESHOLD: usize = 8 << 20;
+        if nbytes >= PAR_THRESHOLD {
+            let chunk = len.div_ceil(4);
+            let dst_slices: Vec<&mut [f32]> = converted.chunks_mut(chunk).collect();
+            let src_slices: Vec<&[u8]> = bytes.chunks(chunk * esz).collect();
+            std::thread::scope(|scope| {
+                for (dst_slice, src_slice) in dst_slices.into_iter().zip(src_slices) {
+                    scope.spawn(move || match e.dtype {
+                        safetensors::Dtype::F32 => {
+                            for (i, c) in src_slice.chunks_exact(4).enumerate() {
+                                dst_slice[i] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                            }
+                        }
+                        safetensors::Dtype::BF16 => {
+                            for (i, c) in src_slice.chunks_exact(2).enumerate() {
+                                dst_slice[i] = f32::from_bits(
+                                    (u16::from_le_bytes([c[0], c[1]]) as u32) << 16,
+                                );
+                            }
+                        }
+                        _ => {}
+                    });
+                }
+            });
+        } else {
+            let converted = &mut converted;
+            match e.dtype {
+                safetensors::Dtype::F32 => {
+                    for (i, c) in bytes.chunks_exact(4).enumerate() {
+                        converted[i] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                    }
+                }
+                safetensors::Dtype::BF16 => {
+                    for (i, c) in bytes.chunks_exact(2).enumerate() {
+                        converted[i] =
+                            f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16);
+                    }
+                }
+                _ => unreachable!("open_dir 只登记 F32/BF16"),
+            }
+        }
         self.maps[e.map_ix].dontneed(s, nbytes);
         converted
     }
@@ -226,14 +273,16 @@ impl WeightSource for SafeTensorsSource {
         Some(self.convert_range(&e, offset_elems, len))
     }
 
-    /// 分块转换**直写** dst(mmap → 解码 → 目标缓冲,零中间 Vec),
-    /// 消费完归还映射页(DONTNEED,读一点装一点)
-    fn convert_chunk_into(
+    /// 分块转换直写字节租约(F16 基线):mmap 直解码单 pass 直写 dst
+    /// (owl-f16c F16C 通道),零中间 Vec、零手写线程;块页读毕 DONTNEED
+    /// (读一点装一点,RSS 恒定在在途块量级)。主路径(直接臂)专用。
+    fn convert_chunk_into_bytes(
         &self,
         key: &str,
         offset_elems: usize,
         len: usize,
-        dst: &mut [f32],
+        dst: &mut [u8],
+        dtype: crate::contract::Dtype,
     ) -> Option<()> {
         let e = match self.index.lock().unwrap().get(key).cloned() {
             Some(e) => e,
@@ -252,15 +301,49 @@ impl WeightSource for SafeTensorsSource {
         }
         let s = e.start + offset_elems * esz;
         let bytes = &self.maps[e.map_ix][s..s + len * esz];
-        match e.dtype {
-            safetensors::Dtype::F32 => {
-                for (d, c) in dst.iter_mut().zip(bytes.chunks_exact(4)) {
-                    *d = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        match (e.dtype, dtype) {
+            // F32 源 → F32 目标：LE 直拷（零转换）
+            (safetensors::Dtype::F32, crate::contract::Dtype::F32) => {
+                if dst.len() < len * 4 {
+                    return None;
                 }
+                dst[..len * 4].copy_from_slice(bytes);
             }
-            safetensors::Dtype::BF16 => {
-                for (d, c) in dst.iter_mut().zip(bytes.chunks_exact(2)) {
-                    *d = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16);
+            // F32 源 → f16 目标：F16C 单 pass 直写（舍入 RNE 与 from_f32 一致）
+            (safetensors::Dtype::F32, crate::contract::Dtype::F16) => {
+                if dst.len() < len * 2 {
+                    return None;
+                }
+                f32_slice_to_f16_bytes(
+                    // SAFETY:[u8] → [f32] 视图：条目字节序 LE 与主机一致，
+                    // 长度 4 对齐由 chunks_exact 保证；只读视图
+                    unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, len) },
+                    &mut dst[..len * 2],
+                );
+            }
+            // BF16 源 → f16 目标：F16C 单 pass 直写（bf16→f32 精确展宽 +
+            // RNE 舍入，与 checksum 锚逐位一致）
+            (safetensors::Dtype::BF16, crate::contract::Dtype::F16) => {
+                if dst.len() < len * 2 {
+                    return None;
+                }
+                bf16_bytes_to_f16_bytes(bytes, &mut dst[..len * 2]);
+            }
+            // BF16 源 → f32 目标（f32 链回退路径）：批量展开
+            (safetensors::Dtype::BF16, crate::contract::Dtype::F32) => {
+                if dst.len() < len * 4 {
+                    return None;
+                }
+                let (_, mid, _) = unsafe { dst[..len * 4].align_to_mut::<f32>() };
+                let (_, smid, _) = unsafe { bytes.align_to::<u16>() };
+                if mid.len() == len && smid.len() == len {
+                    smid.reinterpret_cast::<half::bf16>()
+                        .convert_to_f32_slice(mid);
+                } else {
+                    for (i, c) in bytes.chunks_exact(2).enumerate() {
+                        let f = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16);
+                        dst[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
+                    }
                 }
             }
             _ => return None,
