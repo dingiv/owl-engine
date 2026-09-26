@@ -12,8 +12,9 @@ owl-iface = { path = "../backends/iface" }
 owl-models = { path = "../models" }
 # 图治理(A1:预算前置/生命周期律)—— M1 接线
 owl-graph = { path = "../graph" }
+# 绑定设备是引擎职责(models 主依赖零后端;engine 相反,见模块头)
+owl-cuda = { path = "../backends/cuda" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 owl-cpu = { path = "../backends/cpu" }
-owl-cuda = { path = "../backends/cuda" }

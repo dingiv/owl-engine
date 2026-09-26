@@ -68,7 +68,7 @@
 //! 受限(无控制流、无动态形状)。这不算缺点,但不方便——能力不足
 //! 时,为它扩充新能力即可(历次扩项:Reshape/Kernel 节点/CSE/DAG)。
 
-use crate::contract::{ModelError, Shape};
+use crate::contract::Shape;
 use crate::kernel::Kernel;
 use crate::ops::{KernelArg, Op};
 use std::sync::atomic::{AtomicU64, Ordering};

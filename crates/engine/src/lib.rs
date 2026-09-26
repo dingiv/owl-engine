@@ -28,7 +28,12 @@
 //! 里程碑对齐 charter:M0 骨架 → M1 图治理最小闭环 → M2 TP2 comm →
 //! M3 模型 + DFlash2 对齐线 → M4 冲刺线。
 
+pub mod engine;
 pub mod session;
+pub mod turn;
+
+pub use engine::{Engine, EngineConfig, LoadedModel, ModelLoader, RunningEngine};
+pub use turn::{TurnEvent, TurnSpec};
 
 /// 本 crate 的结果别名:错误权威 = iface `ModelError`(线上一族,不另立)
 pub type Result<T> = std::result::Result<T, owl_iface::contract::ModelError>;

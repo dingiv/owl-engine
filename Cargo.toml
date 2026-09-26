@@ -9,6 +9,8 @@ members = [
     "crates/backends/iface",
     "crates/shared",
     "crates/engine",
+    "apps/server",
+    "apps/cli",
 ]
 resolver = "2"
 

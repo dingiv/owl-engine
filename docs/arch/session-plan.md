@@ -61,3 +61,22 @@ let logits = plan.read_output_f32("logits")?; // D2H 读槽
 - graphplan.rs 保留(decode 专用,标 deprecated 语义;runner 真接线时
   迁移到 Session 后删除);
 - DecodeGraphAdapter:被 Session 闭包替代,测试迁移后删除。
+
+---
+
+## 实施状态(2026-09-26)
+
+- **新 engine crate 立项落地**(旧 engine 25k 行移 engine-bak 存档,复用审计见
+  `crates/engine/src/lib.rs`):M0 骨架 + P0 eager 闭环。
+- **生命周期 facade**(用户裁决):`Engine::new/on`(构造,零执行)→
+  `ModelLoader`(spec 声明驱动装载)→ `Engine::run(model)`(装配 Session +
+  warmup,进入执行态)→ `RunningEngine::submit/pump`(turn 流)。
+- **turn/step 词汇**(用户裁决):前端一个 turn ⇋ 引擎一个调度单元,内含
+  多步;step 治理(槽装填/状态推进/停机)归引擎;事件流
+  `Idle/Prefill/Token/Completed/Failed` 回吐。并发:M0.5 单槽串行
+  (GDN per-turn 零化;KV 由 kv_len 窗口 + 先写后打分天然隔离),
+  M2 continuous batching 换真并发,submit/pump 形状不变。
+- **附带战果**:session 测试逮到 owl-cpu `matmul` k 自推缺陷(alloc 块无
+  形状 → k=1;修复 = launch 标量权威)。
+- 待办:M1 捕获三态接线(姿势 6 门禁/A1.4 预检/GraphLease)、设备采样、
+  M2 batching。
