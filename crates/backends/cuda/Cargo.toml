@@ -18,7 +18,7 @@ cudarc = { version = "0.19", default-features = false, features = [
 ] }
 owl-iface = { path = "../iface" }
 # 契约权威已下沉 owl-iface::contract(2026-09-25):后端不依赖前端
-owl-kernels = { path = "../../kernels", features = ["cublas"] }
+owl-kernels = { path = "../../kernels", features = ["cublas", "marlin"] }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
 

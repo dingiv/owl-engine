@@ -12,6 +12,12 @@
 
 /// 语义算子动作表母本(add/mul/silu/matmul/rmsnorm;与 lower_* 一一对应)
 pub const OPS_F32: &str = include_str!("../cu/ops.cu");
+pub const OPS_F16: &str = include_str!("../cu/ops_f16.cu");
+
+/// owl 移植位(工单 N;NInfer 等外部引擎核的 owl 契约改写)
+pub mod owl {
+    pub const SIGMOID_GATE_MUL_F16: &str = include_str!("../cu/owl/sigmoid_gate_mul_f16.cu");
+}
 
 /// 文本主干 kernel(models layers 消费)
 pub mod text {

@@ -244,3 +244,430 @@ extern "C" __global__ void owl_gdn_l2norm_f32(
     for (size_t i = tid; i < dim; i += blockDim.x)
         out_row[i] = in_row[i] * inv;
 }
+
+
+// ============================================================================
+// f16 基线变体(F4 换源版;2026-09-26 工单 G)
+// 溯源:repos/attention.rs/src/kernels/src/gdn.cu 模板体显式展开(nvrtc 禁
+// host launcher,<<<>>> 剥离;旧世界 GDN_GATING_KERNEL 宏模式同款)。
+// dtype 律:激活 half → float 计算 → half 写;**rec/conv state 恒 f32**
+// (上游同款 + HF/vLLM/xinfer 三方先例);slots 恒 f32 数值过线(契约 5,
+// 上游 i64 已适配);输出块固定末参(槽序契约 4,上游 gqa 核已重排)。
+// 数学与上方 f32 版逐式同源(移植不失真由 f16_tests 对拍背书)。
+// ============================================================================
+
+#include <cuda_fp16.h>
+
+__device__ __forceinline__ float gdn16_to_float(__half x) { return __half2float(x); }
+__device__ __forceinline__ __half gdn16_from_float(float x) { return __float2half(x); }
+__device__ __forceinline__ float gdn16_warp_reduce_sum(float val) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return __shfl_sync(0xffffffff, val, 0);
+}
+
+// ---- 门控 g 臂 f16(上游 fused_gdn_gating_kernel/compute_gating 的 g 臂;
+// owl 单输出契约:beta = sigmoid(b) 走语义算子,M-b 改判)----
+//   g[i] = -exp(A_log[h]) · softplus(a[i] + dt_bias[h]),h = i % heads
+// softplus 分支沿上游(x <= 20 走 log1pf(exp x),否则直通)。
+extern "C" __global__ void owl_gdn_gating_g_f16(
+    const __half *__restrict__ a_log,    // [heads]
+    const __half *__restrict__ a,        // [total](= [T, H] 展平)
+    const __half *__restrict__ dt_bias,  // [heads]
+    size_t total, size_t heads,
+    __half *__restrict__ g) {            // [total](末参 = 输出)
+    unsigned long long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    size_t h = (size_t)(idx % heads);
+    const float x = gdn16_to_float(a[idx]) + gdn16_to_float(dt_bias[h]);
+    const float sp = (x <= 20.0f) ? log1pf(expf(x)) : x;
+    g[idx] = gdn16_from_float(-expf(gdn16_to_float(a_log[h])) * sp);
+}
+
+// ---- 末维 L2 归一 f16(上游 l2_norm_last_dim_block_kernel<T,256> 同体)----
+extern "C" __global__ void owl_gdn_l2norm_f16(
+    const __half *__restrict__ x,        // [rows, dim]
+    size_t rows, size_t dim, float eps,
+    __half *__restrict__ out) {          // [rows, dim](末参 = 输出)
+    const size_t row = blockIdx.x;
+    if (row >= rows) return;
+    const unsigned int tid = threadIdx.x;
+    const __half *in_row = x + row * dim;
+    __half *out_row = out + row * dim;
+    float sumsq = 0.0f;
+    for (size_t i = tid; i < dim; i += blockDim.x) {
+        const float v = gdn16_to_float(in_row[i]);
+        sumsq = __fmaf_rn(v, v, sumsq);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sumsq += __shfl_down_sync(0xffffffff, sumsq, offset);
+    __shared__ float warp_sums[8];
+    const unsigned int warp_id = tid / 32;
+    const unsigned int lane_id = tid % 32;
+    if (lane_id == 0) warp_sums[warp_id] = sumsq;
+    __syncthreads();
+    float total = (tid < 8) ? warp_sums[tid] : 0.0f;
+    if (warp_id == 0) {
+        for (int offset = 4; offset > 0; offset >>= 1)
+            total += __shfl_down_sync(0xffffffff, total, offset);
+    }
+    if (tid == 0) warp_sums[0] = total;
+    __syncthreads();
+    const float inv = rsqrtf(fmaxf(warp_sums[0], 0.0f) + eps);
+    for (size_t i = tid; i < dim; i += blockDim.x)
+        out_row[i] = gdn16_from_float(gdn16_to_float(in_row[i]) * inv);
+}
+
+// ---- causal conv1d decode 槽更新 f16(上游 causal_conv1d_update_slots_
+// kernel<T> 同体;KERNEL_SIZE=4 收窄,无 bias;w_offset 段基址 = owl 契约)----
+extern "C" __global__ void owl_gdn_conv_upd_f16(
+    const __half *__restrict__ x,        // [batch, d]
+    const __half *__restrict__ w,        // [conv_dim_total, 4](w_off 起为本段)
+    float *__restrict__ conv_state,      // [max_slots, d, 3](in/out 恒 f32)
+    const float *__restrict__ slots,     // [batch](负 = padding)
+    size_t total, size_t d, size_t w_offset,
+    int silu,
+    __half *__restrict__ out) {          // [batch, d](末参 = 输出)
+    unsigned long long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    const size_t b = idx / d;
+    const size_t ch = idx % d;
+    const int slot = (int)slots[b];
+    if (slot < 0) return;
+    const __half *w_ptr = w + (w_offset + ch) * 4;
+    float *state_ptr = conv_state + ((size_t)slot * d + ch) * 3;
+    float hist[3] = {state_ptr[0], state_ptr[1], state_ptr[2]};
+    const float x_t = gdn16_to_float(x[idx]);
+    float sum = x_t * gdn16_to_float(w_ptr[3]);
+    for (int k = 0; k < 3; ++k) sum = __fmaf_rn(hist[k], gdn16_to_float(w_ptr[k]), sum);
+    if (silu) sum /= (1.0f + __expf(-sum));
+    state_ptr[0] = hist[1];
+    state_ptr[1] = hist[2];
+    state_ptr[2] = x_t;
+    out[idx] = gdn16_from_float(sum);
+}
+
+// ---- gated delta rule decode f16(上游 decode_slots_gqa_kernel<T,BV,BK>
+// BK=128 档展开;g/beta half 入参(上游 float,适配 owl 块词汇);slots f32;
+// out 重排至末参(槽序契约 4));state 恒 f32;s_buf float 寄存器分片)----
+// 发射 = (ceil(vd/64), B·HV) × (64,1,1),shared = (2·128+2)·4 字节。
+#define OWL_GDN16_MAX_KD 128
+
+extern "C" __global__ void owl_gdn_delta_dec_f16(
+    const __half *__restrict__ q,        // [B, HK, K]
+    const __half *__restrict__ k,        // [B, HK, K]
+    const __half *__restrict__ v,        // [B, HV, V]
+    const __half *__restrict__ g,        // [B, HV](log 空间)
+    const __half *__restrict__ beta,     // [B, HV]
+    float *__restrict__ state,           // [max_slots, HV, K, V](in/out)
+    const float *__restrict__ slots,     // [B](负 = padding)
+    size_t batch, size_t nv, size_t nk,
+    size_t kd, size_t vd,
+    float q_scale,
+    __half *__restrict__ out) {          // [B, HV, V](末参 = 输出)
+    const unsigned int v_tile = blockIdx.x;
+    const unsigned int bh = blockIdx.y;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int v_idx = v_tile * 64u + tid;
+    if (bh >= batch * nv) return;
+    const bool v_valid = v_idx < vd;
+    const unsigned int b = bh / nv;
+    const unsigned int v_head = bh % nv;
+    const unsigned int kv_group = nv / nk;
+    const unsigned int k_head = v_head / kv_group;
+    const int slot = (int)slots[b];
+    const bool slot_valid = slot >= 0;
+    extern __shared__ float smem[];
+    float *q_smem = smem;
+    float *k_smem = smem + OWL_GDN16_MAX_KD;
+    float *scalars = smem + 2 * OWL_GDN16_MAX_KD;
+    if (tid == 0) {
+        scalars[0] = expf(gdn16_to_float(g[b * nv + v_head]));
+        scalars[1] = gdn16_to_float(beta[b * nv + v_head]);
+    }
+    const __half *q_bh = q + (b * nk + k_head) * kd;
+    const __half *k_bh = k + (b * nk + k_head) * kd;
+    for (size_t j = tid; j < kd; j += blockDim.x)
+        k_smem[j] = gdn16_to_float(k_bh[j]);
+    __syncthreads();
+    const float decay = scalars[0];
+    const float beta_t = scalars[1];
+    float *state_head = slot_valid
+        ? state + ((size_t)slot * nv + v_head) * kd * vd
+        : nullptr;
+    float s_buf[OWL_GDN16_MAX_KD];
+    for (size_t j = 0; j < kd; ++j)
+        s_buf[j] = (v_valid && slot_valid) ? state_head[j * vd + v_idx] : 0.0f;
+    float kv_mem = 0.0f;
+    for (size_t j = 0; j < kd; ++j) {
+        if (v_valid && slot_valid) {
+            s_buf[j] *= decay;
+            kv_mem = __fmaf_rn(s_buf[j], k_smem[j], kv_mem);
+        }
+    }
+    const __half *v_bh = v + (b * nv + v_head) * vd;
+    const float delta = (v_valid && slot_valid)
+        ? (gdn16_to_float(v_bh[v_idx]) - kv_mem) * beta_t : 0.0f;
+    __syncthreads();
+    for (size_t j = tid; j < kd; j += blockDim.x)
+        q_smem[j] = gdn16_to_float(q_bh[j]) * q_scale;
+    __syncthreads();
+    float y = 0.0f;
+    for (size_t j = 0; j < kd; ++j) {
+        if (v_valid && slot_valid) {
+            s_buf[j] = __fmaf_rn(k_smem[j], delta, s_buf[j]);
+            y = __fmaf_rn(s_buf[j], q_smem[j], y);
+        }
+    }
+    for (size_t j = 0; j < kd; ++j) {
+        if (v_valid && slot_valid)
+            state_head[j * vd + v_idx] = s_buf[j];
+    }
+    if (v_valid && slot_valid)
+        out[(b * nv + v_head) * vd + v_idx] = gdn16_from_float(y);
+}
+
+// ---- 门控 RMSNorm × act(z) f16(上游 gated_rmsnorm_silu_mul_kernel
+// <T,W,256> 同体;owl 简化:per_group_weights=true、无 bias)----
+extern "C" __global__ void owl_gdn_norm_act_f16(
+    const __half *__restrict__ x,        // [rows, value_dim]
+    const __half *__restrict__ z,        // [rows, value_dim]
+    const __half *__restrict__ gamma,    // [group_size](×w 非零中心)
+    size_t rows, size_t value_dim, size_t group_size,
+    float eps,
+    int act,
+    __half *__restrict__ out) {          // [rows, value_dim](末参 = 输出)
+    const size_t row_group = blockIdx.x;
+    const size_t num_groups = value_dim / group_size;
+    const size_t row = row_group / num_groups;
+    const size_t group = row_group % num_groups;
+    const unsigned int tid = threadIdx.x;
+    if (row >= rows) return;
+    const size_t group_offset = row * value_dim + group * group_size;
+    const __half *x_row = x + group_offset;
+    const __half *z_row = z + group_offset;
+    __half *out_row = out + group_offset;
+    float sumsq = 0.0f;
+    for (size_t i = tid; i < group_size; i += blockDim.x) {
+        const float v = gdn16_to_float(x_row[i]);
+        sumsq = __fmaf_rn(v, v, sumsq);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sumsq += __shfl_down_sync(0xffffffff, sumsq, offset);
+    __shared__ float warp_sums[8];
+    const unsigned int warp_id = tid / 32;
+    const unsigned int lane_id = tid % 32;
+    if (lane_id == 0) warp_sums[warp_id] = sumsq;
+    __syncthreads();
+    float total = (tid < 8) ? warp_sums[tid] : 0.0f;
+    if (warp_id == 0) {
+        for (int offset = 4; offset > 0; offset >>= 1)
+            total += __shfl_down_sync(0xffffffff, total, offset);
+    }
+    if (tid == 0) warp_sums[0] = total;
+    __syncthreads();
+    const float inv = rsqrtf(fmaxf(warp_sums[0] / (float)group_size, 0.0f) + eps);
+    for (size_t i = tid; i < group_size; i += blockDim.x) {
+        const float nx = gdn16_to_float(x_row[i]) * inv * gdn16_to_float(gamma[i]);
+        const float zv = gdn16_to_float(z_row[i]);
+        const float actv = (act == 0) ? (zv / (1.0f + __expf(-zv)))
+                                      : (1.0f / (1.0f + __expf(-zv)));
+        out_row[i] = gdn16_from_float(nx * actv);
+    }
+}
+
+// ============================================================================
+// PF1b 批核(chunked prefill;T 循环在核内,一次发射吃全块;同源上游)
+// ============================================================================
+
+// ---- causal conv1d prefill varlen f16(上游 causal_conv1d_fwd_varlen_
+// kernel<T,4> 同体;owl 适配:state 槽寻址(上游 seq 直索,免 gather/scatter
+// 垫)、去 state_snapshots(MTP 域外)、cu_seqlens [batch+1] u32 保真)----
+// grid = (batch, ceil(d/256)) × (256,1,1);t 循环核内顺序扫描。
+extern "C" __global__ void owl_gdn_conv_fwd_f16(
+    const __half *__restrict__ x,            // [total_tokens, d]
+    const __half *__restrict__ w,            // [d, 4]
+    float *__restrict__ conv_state,          // [max_slots, d, 3](in/out 恒 f32)
+    const float *__restrict__ slots,         // [batch](f32 数值;负 = 全跳)
+    const float *__restrict__ cu_seqlens,    // [batch + 1](f32 数值过线,契约 5)
+    int batch, int d, int silu,
+    __half *__restrict__ out) {              // [total_tokens, d](末参 = 输出)
+    const int seq_idx = blockIdx.x;
+    int channel_idx = blockIdx.y * blockDim.x + threadIdx.x;
+    if (seq_idx >= batch || channel_idx >= d) return;
+    const int slot = (int)slots[seq_idx];
+    const int start = (int)cu_seqlens[seq_idx];
+    const int end = (int)cu_seqlens[seq_idx + 1];
+    const int seq_len = end - start;
+    const __half *w_ptr = w + channel_idx * 4;
+    float *state_ptr = (slot >= 0)
+        ? conv_state + ((size_t)slot * d + channel_idx) * 3
+        : nullptr;
+    float w_reg[4];
+    for (int k = 0; k < 4; ++k) w_reg[k] = gdn16_to_float(w_ptr[k]);
+    float hist[3] = {0.0f, 0.0f, 0.0f};
+    if (state_ptr) {
+        for (int i = 0; i < 3; ++i) hist[i] = state_ptr[i];
+    }
+    for (int t = 0; t < seq_len; ++t) {
+        const float x_t = gdn16_to_float(x[(size_t)(start + t) * d + channel_idx]);
+        float sum = x_t * w_reg[3];
+        for (int k = 0; k < 3; ++k) sum = __fmaf_rn(hist[k], w_reg[k], sum);
+        if (silu) sum /= (1.0f + __expf(-sum));
+        out[(size_t)(start + t) * d + channel_idx] = gdn16_from_float(sum);
+        hist[0] = hist[1];
+        hist[1] = hist[2];
+        hist[2] = x_t;
+    }
+    if (state_ptr) {
+        for (int i = 0; i < 3; ++i) state_ptr[i] = hist[i];
+    }
+}
+
+// ---- gated delta rule prefill varlen gqa f16(上游 recurrence_varlen_
+// gqa_kernel<T,128,8> 同体;g/beta half 入参、slots f32、out 重排末参、
+// 去 state_snapshots;state 槽寻址恒 f32;cu_seqlens u32)----
+// grid = (ceil(vd/8), batch·HV) × (32,8);t 循环核内,q/k 双缓冲 shared,
+// s_shard 每线寄存器分片(KD≤128 → 4 行/线);warp_reduce 归约。
+#define OWL_GDN16_WARPS_PER_BLOCK 8
+
+extern "C" __global__ void owl_gdn_recurrence_varlen_gqa_f16(
+    const __half *__restrict__ q,        // [total, NK, K]
+    const __half *__restrict__ k,        // [total, NK, K]
+    const __half *__restrict__ v,        // [total, NV, V]
+    const __half *__restrict__ g,        // [total, NV](log 空间)
+    const __half *__restrict__ beta,     // [total, NV]
+    float *__restrict__ state,           // [max_slots, NV, K, V](in/out)
+    const float *__restrict__ slots,     // [batch](负 = 全跳)
+    const float *__restrict__ cu_seqlens, // [batch + 1](f32 数值过线,契约 5)
+    size_t batch, size_t nv, size_t nk,
+    size_t kd, size_t vd,
+    float q_scale,
+    __half *__restrict__ out) {          // [total, NV, V](末参 = 输出)
+    constexpr int BK = 128;
+    constexpr int WARPS_PER_BLOCK = OWL_GDN16_WARPS_PER_BLOCK;
+    constexpr int GDN_WARP_SIZE = 32;
+    constexpr int ROWS_PER_LANE = (BK + GDN_WARP_SIZE - 1) / GDN_WARP_SIZE;
+
+    const int seq_head = blockIdx.y;
+    const int lane = threadIdx.x;
+    const int warp_id = threadIdx.y;
+    const int v_idx = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+    if (seq_head >= batch * nv) return;
+
+    const int seq_idx = seq_head / nv;
+    const int v_head_idx = seq_head % nv;
+    const int kv_group = nv / nk;
+    const int k_head_idx = v_head_idx / kv_group;
+    const int slot = (int)slots[seq_idx];
+    if (slot < 0) return;
+
+    const int start = (int)cu_seqlens[seq_idx];
+    const int end = (int)cu_seqlens[seq_idx + 1];
+    const int seq_len = end - start;
+    if (seq_len <= 0) return;
+
+    const int token_stride_qk = nk * kd;
+    const int token_stride_v = nv * vd;
+    const int token_stride_g = nv;
+
+    const __half *q_base = q + (size_t)start * token_stride_qk + (size_t)k_head_idx * kd;
+    const __half *k_base = k + (size_t)start * token_stride_qk + (size_t)k_head_idx * kd;
+    const __half *v_base = v + (size_t)start * token_stride_v + (size_t)v_head_idx * vd;
+    const __half *g_base = g + (size_t)start * token_stride_g + v_head_idx;
+    const __half *beta_base = beta + (size_t)start * token_stride_g + v_head_idx;
+    __half *out_base = out + (size_t)start * token_stride_v + (size_t)v_head_idx * vd;
+
+    __shared__ float q_buf[2][BK];
+    __shared__ float k_buf[2][BK];
+    __shared__ float scalars[2][2];
+
+    const bool v_valid = (v_idx < vd);
+    float *state_head = v_valid
+        ? state + ((size_t)slot * nv + v_head_idx) * kd * vd
+        : nullptr;
+
+    float s_shard[ROWS_PER_LANE];
+    if (v_valid) {
+        for (int r = 0; r < ROWS_PER_LANE; ++r) {
+            const int k_idx = r * GDN_WARP_SIZE + lane;
+            s_shard[r] = ((size_t)k_idx < kd) ? state_head[(size_t)k_idx * vd + v_idx] : 0.0f;
+        }
+    }
+
+    const int total_threads = WARPS_PER_BLOCK * GDN_WARP_SIZE;
+    const int tid = warp_id * GDN_WARP_SIZE + lane;
+
+    if (seq_len > 0) {
+        for (int j = tid; j < BK; j += total_threads) {
+            if (j < kd) {
+                q_buf[0][j] = gdn16_to_float(q_base[j]) * q_scale;
+                k_buf[0][j] = gdn16_to_float(k_base[j]);
+            } else {
+                q_buf[0][j] = 0.0f;
+                k_buf[0][j] = 0.0f;
+            }
+        }
+        if (tid == 0) {
+            scalars[0][0] = expf(gdn16_to_float(g_base[0]));
+            scalars[0][1] = gdn16_to_float(beta_base[0]);
+        }
+        __syncthreads();
+    }
+
+    for (int t = 0; t < seq_len; ++t) {
+        const int cur = t & 1;
+        const int nxt = 1 - cur;
+        if (t + 1 < seq_len) {
+            const __half *q_next = q_base + (size_t)(t + 1) * token_stride_qk;
+            const __half *k_next = k_base + (size_t)(t + 1) * token_stride_qk;
+            for (int j = tid; j < BK; j += total_threads) {
+                if ((size_t)j < kd) {
+                    q_buf[nxt][j] = gdn16_to_float(q_next[j]) * q_scale;
+                    k_buf[nxt][j] = gdn16_to_float(k_next[j]);
+                } else {
+                    q_buf[nxt][j] = 0.0f;
+                    k_buf[nxt][j] = 0.0f;
+                }
+            }
+            if (tid == 0) {
+                scalars[nxt][0] = expf(gdn16_to_float(g_base[(size_t)(t + 1) * token_stride_g]));
+                scalars[nxt][1] = gdn16_to_float(beta_base[(size_t)(t + 1) * token_stride_g]);
+            }
+        }
+
+        if (v_valid) {
+            const float decay = scalars[cur][0];
+            const float beta_t = scalars[cur][1];
+            float kv_partial = 0.0f;
+            for (int r = 0; r < ROWS_PER_LANE; ++r) {
+                const int k_idx = r * GDN_WARP_SIZE + lane;
+                s_shard[r] *= decay;
+                kv_partial = __fmaf_rn(s_shard[r], k_buf[cur][(size_t)k_idx], kv_partial);
+            }
+            const float kv_mem = gdn16_warp_reduce_sum(kv_partial);
+            const float delta = (gdn16_to_float(v_base[(size_t)t * token_stride_v + v_idx]) - kv_mem) * beta_t;
+            float y_partial = 0.0f;
+            for (int r = 0; r < ROWS_PER_LANE; ++r) {
+                const int k_idx = r * GDN_WARP_SIZE + lane;
+                s_shard[r] = __fmaf_rn(k_buf[cur][(size_t)k_idx], delta, s_shard[r]);
+                y_partial = __fmaf_rn(s_shard[r], q_buf[cur][(size_t)k_idx], y_partial);
+            }
+            const float y_t = gdn16_warp_reduce_sum(y_partial);
+            if (lane == 0) {
+                out_base[(size_t)t * token_stride_v + (size_t)v_idx] = gdn16_from_float(y_t);
+            }
+        }
+        __syncthreads();
+    }
+
+    if (v_valid) {
+        for (int r = 0; r < ROWS_PER_LANE; ++r) {
+            const int k_idx = r * GDN_WARP_SIZE + lane;
+            if ((size_t)k_idx < kd) {
+                state_head[(size_t)k_idx * vd + (size_t)v_idx] = s_shard[r];
+            }
+        }
+    }
+}

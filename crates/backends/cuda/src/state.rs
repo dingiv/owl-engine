@@ -73,6 +73,7 @@ pub(super) struct GpuCtx {
     /// 流注册表:三固定流(H2D/COMPUTE/D2H;客户端不可自创)
     streams: HashMap<StreamId, Arc<CudaStream>>,
     /// 图捕获状态机(见 graph_begin/end 的护栏注释)
+    ordinal: usize,
     capture: Option<CaptureState>,
     /// 图注册表:id → 实例化图(重放用)
     graphs: HashMap<GraphId, GraphHolder>,
@@ -112,6 +113,7 @@ impl GpuCtx {
         Ok(Self {
             ctx,
             streams,
+            ordinal,
             capture: None,
             graphs: HashMap::new(),
             next_graph: 1,
@@ -132,6 +134,11 @@ impl GpuCtx {
     // ======================================================================
 
     /// 当前是否捕获中
+        /// 设备 ordinal(foreign-kernel 需要:marlin SM 数查询的 dev 参数)
+    pub(super) fn device_ordinal(&self) -> usize {
+        self.ordinal
+    }
+
     pub(super) fn capture_stream(&self) -> bool {
         self.capture.is_some()
     }

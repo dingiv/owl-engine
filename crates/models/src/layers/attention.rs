@@ -409,3 +409,105 @@ mod owl_port_tests {
         gpu.close().await.expect("关机");
     }
 }
+
+#[cfg(test)]
+mod naive_attn_f16_tests {
+    use super::*;
+    use crate::contract::DeviceClient as _;
+    use crate::testkit::{gpu_client, gpu_enabled};
+    use crate::tensor::Dtype;
+
+    fn hle(f: f32) -> [u8; 2] {
+        half::f16::from_f32(f).to_le_bytes()
+    }
+
+    /// GPU:naive_attn f16 窗语义(两 token 递进窗;host f32 参考)
+    /// owl 窗契约专属核(上游无对应物;数学沿 f32 版,已探针钉死)
+    #[tokio::test]
+    async fn gpu_naive_attn_f16_matches_host() {
+        if !gpu_enabled() {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return;
+        }
+        let (hq, hkv, hd, slots_n) = (2usize, 1usize, 8usize, 8usize);
+        let q: Vec<f32> = (0..2 * hq * hd).map(|i| ((i as f32 * 0.31) - 2.0).sin()).collect();
+        let k: Vec<f32> = (0..2 * hkv * hd).map(|i| ((i as f32 * 0.17) - 1.0).cos()).collect();
+        let v: Vec<f32> = (0..2 * hkv * hd).map(|i| ((i as f32 * 0.13) + 0.5).sin()).collect();
+        let mut gpu = gpu_client().await;
+        let sh = crate::contract::Shape::from;
+        let hb = |v: &[f32]| v.iter().flat_map(|f| hle(*f)).collect::<Vec<u8>>();
+        let dq = gpu.htod(Dtype::F16, &sh(vec![2, hq, hd]), &hb(&q)).await.unwrap();
+        let dk = gpu.htod(Dtype::F16, &sh(vec![2, hkv, hd]), &hb(&k)).await.unwrap();
+        let dv = gpu.htod(Dtype::F16, &sh(vec![2, hkv, hd]), &hb(&v)).await.unwrap();
+        let kc = gpu.alloc(Dtype::F16, slots_n * hkv * hd).await.unwrap();
+        let vc = gpu.alloc(Dtype::F16, slots_n * hkv * hd).await.unwrap();
+
+        // 两步:token0(slot0,win[0,0]) → token1(slot1,win[0,1])
+        let mut outs = Vec::new();
+        for t in 0..2usize {
+            // 逐 token 展开(bs=1):切片上载,槽/窗随 t 递进(真·展开形态)
+            let sl = t as f32;
+            let kl = (t + 1) as f32;
+            let qt = &q[t * hq * hd..(t + 1) * hq * hd];
+            let kt = &k[t * hkv * hd..(t + 1) * hkv * hd];
+            let vt = &v[t * hkv * hd..(t + 1) * hkv * hd];
+            let dq = gpu.htod(Dtype::F16, &sh(vec![1, hq, hd]), &hb(qt)).await.unwrap();
+            let dk = gpu.htod(Dtype::F16, &sh(vec![1, hkv, hd]), &hb(kt)).await.unwrap();
+            let dv = gpu.htod(Dtype::F16, &sh(vec![1, hkv, hd]), &hb(vt)).await.unwrap();
+            let (q_t, k_t, v_t) = (
+                TensorOps::of_block(dq.id, Dtype::F16, vec![1, hq, hd]),
+                TensorOps::of_block(dk.id, Dtype::F16, vec![1, hkv, hd]),
+                TensorOps::of_block(dv.id, Dtype::F16, vec![1, hkv, hd]),
+            );
+            let kc_d = TensorOps::of_block(kc.id, Dtype::F16, vec![slots_n, hkv, hd]);
+            let vc_d = TensorOps::of_block(vc.id, Dtype::F16, vec![slots_n, hkv, hd]);
+            let decl = TensorOps::of(crate::kernel::kernel_with(
+                "owl_naive_decode_attn_f16", (0, 0, 0), (256, 1, 1), 0,
+            ))
+            .arg(&q_t).arg(&k_t).arg(&v_t).arg(&kc_d).arg(&vc_d)
+            .arg(&TensorOps::from_host(Dtype::F32, vec![1], &sl.to_le_bytes().to_vec()))
+            .arg(&TensorOps::from_host(Dtype::F32, vec![1], &kl.to_le_bytes().to_vec()))
+            .arg_usize(1).arg_usize(hq).arg_usize(hkv).arg_usize(hd)
+            .with_shape(Dtype::F16, vec![1, hq * hd]);
+            let o = crate::interpreters::eval_ops(decl.step(), &mut gpu).await.unwrap();
+            let mut b = vec![0u8; 1 * hq * hd * 2];
+            gpu.dtoh(&o, &mut b).await.unwrap();
+            outs.push(b);
+        }
+
+        // host f32 参考(token1:窗 [0,1],token0 权重可解析计算)
+        let scale = 1.0 / (hd as f32).sqrt();
+        let mut max_diff = 0f32;
+        for t in 0..2usize {
+            let kv_len = t + 1;
+            for h in 0..hq {
+                let kvh = h * hkv / hq;
+                // 每头先算窗内权重,再对每个输出维加权求和
+                let mut w = [0f32; 8];
+                let mut wsum = 0f32;
+                for s in 0..kv_len {
+                    let mut score = 0f32;
+                    for dd in 0..hd {
+                        score += q[(t * hq + h) * hd + dd] * k[(s * hkv + kvh) * hd + dd];
+                    }
+                    w[s] = (score * scale).exp();
+                    wsum += w[s];
+                }
+                for d in 0..hd {
+                    let mut want = 0f32;
+                    for s in 0..kv_len {
+                        want += (w[s] / wsum) * v[(s * hkv + kvh) * hd + d];
+                    }
+                    let got = half::f16::from_le_bytes([
+                        outs[t][(h * hd + d) * 2],
+                        outs[t][(h * hd + d) * 2 + 1],
+                    ]).to_f32();
+                    max_diff = max_diff.max((got - want).abs());
+                }
+            }
+        }
+        eprintln!("[naive_attn f16] max_diff = {max_diff:.5}");
+        assert!(max_diff < 5e-2, "窗语义容差 5e-2,得 {max_diff}");
+        gpu.close().await.expect("关机");
+    }
+}

@@ -1224,3 +1224,430 @@ mod tests {
         gpu.close().await.expect("server 关机");
     }
 }
+
+// ============================================================================
+// f16_tests(F4 换源版对拍;工单 G 收口锚)
+// 纪律:输入先过 f16 量化(上载即 f16),host f32 参考在量化后的值上计算
+// —— 参考侧先落到目标位宽再谈容差(2026-09-26 F3 教训)。核数学 =
+// attention.rs 上游模板(见 gdn.cu 溯源头),对拍验「移植不失真」。
+// ============================================================================
+
+#[cfg(test)]
+mod f16_tests {
+    use super::*;
+    use crate::contract::DeviceClient as _;
+    use crate::testkit::{gpu_client, gpu_enabled};
+    use crate::tensor::Dtype;
+
+    /// f16 量化(host 侧先落位宽;测试输入与参考共用)
+    fn q(v: &[f32]) -> Vec<f32> {
+        v.iter().map(|f| half::f16::from_f32(*f).to_f32()).collect()
+    }
+    fn hbytes(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect()
+    }
+    fn f32b(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|f| f.to_le_bytes()).collect()
+    }
+    /// 从 f16 字节读回 f32
+    fn unhalf(buf: &[u8]) -> Vec<f32> {
+        buf.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect()
+    }
+    fn assert_close_rel(got: &[f32], want: &[f32], tol: f32, ctx: &str) {
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert!((g - w).abs() <= tol * (1.0 + w.abs()), "{ctx}[{i}] {g} vs {w}");
+        }
+    }
+
+    /// (工单 G-1)gating g 臂:g = -exp(A_log)·softplus(a + dt_bias)
+    #[tokio::test]
+    async fn gpu_gating_g_f16_matches_host() {
+        if !gpu_enabled() { eprintln!("skip"); return; }
+        let (total, heads) = (12usize, 4usize);
+        let a_log: Vec<f32> = q(&(0..heads).map(|i| (i as f32 * 0.31) - 1.0).collect::<Vec<_>>());
+        let a: Vec<f32> = q(&(0..total).map(|i| ((i as f32 * 0.7) - 4.0).sin()).collect::<Vec<_>>());
+        let dt: Vec<f32> = q(&(0..heads).map(|i| (i as f32 * 0.11) + 0.2).collect::<Vec<_>>());
+        let mut want = vec![0f32; total];
+        for i in 0..total {
+            let x = a[i] + dt[i % heads];
+            let sp = if x <= 20.0 { x.exp().ln_1p() } else { x };
+            want[i] = -a_log[i % heads].exp() * sp;
+        }
+        let mut gpu = gpu_client().await;
+        let sh = crate::contract::Shape::from;
+        let dl = gpu.htod(Dtype::F16, &sh(vec![heads]), &hbytes(&a_log)).await.unwrap();
+        let da = gpu.htod(Dtype::F16, &sh(vec![total]), &hbytes(&a)).await.unwrap();
+        let dd = gpu.htod(Dtype::F16, &sh(vec![heads]), &hbytes(&dt)).await.unwrap();
+        let (l, a_, d_) = (
+            TensorOps::of_block(dl.id, Dtype::F16, vec![heads]),
+            TensorOps::of_block(da.id, Dtype::F16, vec![total]),
+            TensorOps::of_block(dd.id, Dtype::F16, vec![heads]),
+        );
+        let decl = TensorOps::of(crate::kernel::kernel_with(
+            "owl_gdn_gating_g_f16", (0, 0, 0), (256, 1, 1), 0,
+        )).arg(&l).arg(&a_).arg(&d_).arg_usize(total).arg_usize(heads)
+        .with_shape(Dtype::F16, vec![total]);
+        let out = crate::interpreters::eval_ops(decl.step(), &mut gpu).await.unwrap();
+        let mut buf = vec![0u8; total * 2];
+        gpu.dtoh(&out, &mut buf).await.unwrap();
+        assert_close_rel(&unhalf(&buf), &want, 2e-2, "gating");
+        gpu.close().await.unwrap();
+    }
+
+    /// (工单 G-2)l2norm:行末维归一
+    #[tokio::test]
+    async fn gpu_l2norm_f16_matches_host() {
+        if !gpu_enabled() { eprintln!("skip"); return; }
+        let (rows, dim) = (4usize, 64usize);
+        let x: Vec<f32> = q(&(0..rows * dim).map(|i| ((i as f32 * 0.23) - 2.0).sin()).collect::<Vec<_>>());
+        let mut want = vec![0f32; rows * dim];
+        for r in 0..rows {
+            let ss: f32 = x[r * dim..(r + 1) * dim].iter().map(|v| v * v).sum();
+            let inv = 1.0 / (ss.max(0.0) + 1e-6).sqrt();
+            for i in 0..dim { want[r * dim + i] = x[r * dim + i] * inv; }
+        }
+        let mut gpu = gpu_client().await;
+        let dx = gpu.htod(Dtype::F16, &crate::contract::Shape::from(vec![rows, dim]), &hbytes(&x)).await.unwrap();
+        let x_decl = TensorOps::of_block(dx.id, Dtype::F16, vec![rows, dim]);
+        let decl = TensorOps::of(crate::kernel::kernel_with(
+            "owl_gdn_l2norm_f16", (rows as u32, 1, 1), (256, 1, 1), 0,
+        )).arg(&x_decl).arg_usize(rows).arg_usize(dim).arg_f32(1e-6)
+        .with_shape(Dtype::F16, vec![rows, dim]);
+        let out = crate::interpreters::eval_ops(decl.step(), &mut gpu).await.unwrap();
+        let mut buf = vec![0u8; rows * dim * 2];
+        gpu.dtoh(&out, &mut buf).await.unwrap();
+        assert_close_rel(&unhalf(&buf), &want, 2e-2, "l2norm");
+        gpu.close().await.unwrap();
+    }
+
+    /// (工单 G-3)norm_act:rmsnorm(x 组内)·gamma·silu(z)
+    #[tokio::test]
+    async fn gpu_norm_act_f16_matches_host() {
+        if !gpu_enabled() { eprintln!("skip"); return; }
+        let (rows, vd, gs) = (3usize, 32usize, 8usize);
+        let x: Vec<f32> = q(&(0..rows * vd).map(|i| ((i as f32 * 0.41) - 3.0).sin()).collect::<Vec<_>>());
+        let z: Vec<f32> = q(&(0..rows * vd).map(|i| ((i as f32 * 0.19) - 1.0).cos()).collect::<Vec<_>>());
+        let gamma: Vec<f32> = q(&(0..gs).map(|i| (i as f32 * 0.05) - 0.1).collect::<Vec<_>>());
+        let mut want = vec![0f32; rows * vd];
+        for r in 0..rows {
+            for g in 0..(vd / gs) {
+                let off = r * vd + g * gs;
+                let ss: f32 = x[off..off + gs].iter().map(|v| v * v).sum();
+                let inv = 1.0 / (ss / gs as f32 + 1e-6).sqrt();
+                for i in 0..gs {
+                    let zv = z[off + i];
+                    let act = zv / (1.0 + (-zv).exp());
+                    want[off + i] = x[off + i] * inv * gamma[i] * act;
+                }
+            }
+        }
+        let mut gpu = gpu_client().await;
+        let sh = crate::contract::Shape::from;
+        let dxi = gpu.htod(Dtype::F16, &sh(vec![rows, vd]), &hbytes(&x)).await.unwrap();
+        let dzi = gpu.htod(Dtype::F16, &sh(vec![rows, vd]), &hbytes(&z)).await.unwrap();
+        let dgi = gpu.htod(Dtype::F16, &sh(vec![gs]), &hbytes(&gamma)).await.unwrap();
+        let (x_, z_, g_) = (
+            TensorOps::of_block(dxi.id, Dtype::F16, vec![rows, vd]),
+            TensorOps::of_block(dzi.id, Dtype::F16, vec![rows, vd]),
+            TensorOps::of_block(dgi.id, Dtype::F16, vec![gs]),
+        );
+        let decl = TensorOps::of(crate::kernel::kernel_with(
+            "owl_gdn_norm_act_f16",
+            ((rows * vd / gs) as u32, 1, 1), (256, 1, 1), 0,
+        )).arg(&x_).arg(&z_).arg(&g_)
+        .arg_usize(rows).arg_usize(vd).arg_usize(gs).arg_f32(1e-6).arg_i32(0)
+        .with_shape(Dtype::F16, vec![rows, vd]);
+        let out = crate::interpreters::eval_ops(decl.step(), &mut gpu).await.unwrap();
+        let mut buf = vec![0u8; rows * vd * 2];
+        gpu.dtoh(&out, &mut buf).await.unwrap();
+        assert_close_rel(&unhalf(&buf), &want, 2e-2, "norm_act");
+        gpu.close().await.unwrap();
+    }
+
+    /// (工单 G-4)conv_upd + delta_dec:两步连续 + state f32 连续性
+    /// (padding slot 负值跳写;GQA kv_group=1 简档)
+    #[tokio::test]
+    async fn gpu_conv_delta_f16_two_steps() {
+        if !gpu_enabled() { eprintln!("skip"); return; }
+        let (nk, nv, kd, vd, batch, slots_n) = (2usize, 2usize, 16usize, 32usize, 2usize, 4usize);
+        let d = nk * kd; // conv 段简化:只测 q 段(d = key_dim)
+        let w: Vec<f32> = q(&(0..d * 4).map(|i| ((i as f32 * 0.13) - 0.5).sin()).collect::<Vec<_>>());
+        let a_log: Vec<f32> = q(&(0..nv).map(|i| (i as f32 * 0.2) - 0.3).collect::<Vec<_>>());
+        let dt: Vec<f32> = q(&(0..nv).map(|i| i as f32 * 0.1).collect::<Vec<_>>());
+        let slots = [0.0f32, -1.0f32]; // b1 padding:跳写
+
+        let mut gpu = gpu_client().await;
+        let sh = crate::contract::Shape::from;
+        // 常驻块(state f32):先物化拿 Bytes(核写这个块;重 eval 会另开新块)
+        let conv_state_b = crate::interpreters::eval_ops(
+            TensorOps::zeros(Dtype::F32, vec![slots_n, d, 3]).step(), &mut gpu).await.unwrap();
+        let conv_state = TensorOps::of_block(conv_state_b.id, Dtype::F32, vec![slots_n, d, 3]);
+        let rec_b = crate::interpreters::eval_ops(
+            TensorOps::zeros(Dtype::F32, vec![slots_n, nv, kd, vd]).step(), &mut gpu).await.unwrap();
+        let rec = TensorOps::of_block(rec_b.id, Dtype::F32, vec![slots_n, nv, kd, vd]);
+        let dwb = gpu.htod(Dtype::F16, &sh(vec![d, 4]), &hbytes(&w)).await.unwrap();
+        let dal = gpu.htod(Dtype::F16, &sh(vec![nv]), &hbytes(&a_log)).await.unwrap();
+        let ddt = gpu.htod(Dtype::F16, &sh(vec![nv]), &hbytes(&dt)).await.unwrap();
+        let w_decl = TensorOps::of_block(dwb.id, Dtype::F16, vec![d, 4]);
+        let al_decl = TensorOps::of_block(dal.id, Dtype::F16, vec![nv]);
+        let dt_decl = TensorOps::of_block(ddt.id, Dtype::F16, vec![nv]);
+
+        for step in 0..2u32 {
+            let x: Vec<f32> = q(&(0..batch * d).map(|i| ((i as f32 + step as f32 * 7.0) * 0.31).sin()).collect::<Vec<_>>());
+            let dxi = gpu.htod(Dtype::F16, &sh(vec![batch, d]), &hbytes(&x)).await.unwrap();
+            let x_decl = TensorOps::of_block(dxi.id, Dtype::F16, vec![batch, d]);
+            let sl = TensorOps::from_host(Dtype::F32, vec![batch], &f32b(&slots));
+            // conv_upd(q 段,w_offset=0)
+            let conv = TensorOps::of(crate::kernel::kernel_with(
+                "owl_gdn_conv_upd_f16", (0, 0, 0), (256, 1, 1), 0,
+            )).arg(&x_decl).arg(&w_decl).arg(&conv_state).arg(&sl)
+            .arg_usize(batch * d).arg_usize(d).arg_usize(0).arg_i32(1)
+            .with_shape(Dtype::F16, vec![batch, d]);
+            let cout = crate::interpreters::eval_ops(conv.step(), &mut gpu).await.unwrap();
+            let mut cbuf = vec![0u8; batch * d * 2];
+            gpu.dtoh(&cout, &mut cbuf).await.unwrap();
+            let got_c = unhalf(&cbuf);
+            for b in 0..batch {
+                if slots[b] < 0.0 { continue; }
+                for ch in 0..d {
+                    let sp = slots[b] as usize;
+                    let hist = [0.0f32; 3]; // 首步 state=0;两步间由设备块持久(下方直接验终态)
+                    let _ = hist;
+                    let x_t = x[b * d + ch];
+                    let mut sum = x_t * w[(0 + ch) * 4 + 3];
+                    // host 只验首步(step0 state=0);step1 的 state 由设备持久,
+                    // host 不复算(连续性由 conv_fwd 对拍 G-6 交叉验证)
+                    if step == 0 {
+                        for k in 0..3 { sum += 0.0 * w[ch * 4 + k]; }
+                        // 核尾带 silu(Qwen3.5 conv 激活;arg_i32(1))—— host 同式
+                        let want = {
+                            let raw = x_t * w[ch * 4 + 3];
+                            raw / (1.0 + (-raw).exp())
+                        };
+                        let g = got_c[b * d + ch];
+                        assert!((g - want).abs() <= 2e-2 * (1.0 + want.abs()), "conv s0[{b},{ch}] {g} vs {want}");
+                    }
+                    let _ = sum;
+                }
+            }
+            let _ = cout;
+
+            // delta_dec(单步;g/beta 由 host 公式生成)
+            let g_v: Vec<f32> = q(&(0..batch * nv).map(|i| -0.1 - i as f32 * 0.05).collect::<Vec<_>>());
+            let beta: Vec<f32> = q(&(0..batch * nv).map(|i| 0.8 - i as f32 * 0.1).collect::<Vec<_>>());
+            let qv: Vec<f32> = q(&(0..batch * nk * kd).map(|i| ((i as f32 + step as f32) * 0.17).sin()).collect::<Vec<_>>());
+            let kv: Vec<f32> = q(&(0..batch * nk * kd).map(|i| ((i as f32 + step as f32) * 0.23).cos()).collect::<Vec<_>>());
+            let vv: Vec<f32> = q(&(0..batch * nv * vd).map(|i| ((i as f32 + step as f32) * 0.29).sin()).collect::<Vec<_>>());
+            let dq = gpu.htod(Dtype::F16, &sh(vec![batch, nk, kd]), &hbytes(&qv)).await.unwrap();
+            let dk = gpu.htod(Dtype::F16, &sh(vec![batch, nk, kd]), &hbytes(&kv)).await.unwrap();
+            let dv = gpu.htod(Dtype::F16, &sh(vec![batch, nv, vd]), &hbytes(&vv)).await.unwrap();
+            let dg = gpu.htod(Dtype::F16, &sh(vec![batch, nv]), &hbytes(&g_v)).await.unwrap();
+            let db = gpu.htod(Dtype::F16, &sh(vec![batch, nv]), &hbytes(&beta)).await.unwrap();
+            let (q_, k_, v_, g_, b_) = (
+                TensorOps::of_block(dq.id, Dtype::F16, vec![batch, nk, kd]),
+                TensorOps::of_block(dk.id, Dtype::F16, vec![batch, nk, kd]),
+                TensorOps::of_block(dv.id, Dtype::F16, vec![batch, nv, vd]),
+                TensorOps::of_block(dg.id, Dtype::F16, vec![batch, nv]),
+                TensorOps::of_block(db.id, Dtype::F16, vec![batch, nv]),
+            );
+            let sl2 = TensorOps::from_host(Dtype::F32, vec![batch], &f32b(&slots));
+            let decl = TensorOps::of(crate::kernel::kernel_with(
+                "owl_gdn_delta_dec_f16",
+                (((vd + 63) / 64) as u32, (batch * nv) as u32, 1), (64, 1, 1),
+                // 核内 k/q_smem 按 OWL_GDN16_MAX_KD=128 偏移寻址 —— smem 恒按
+                // 128 档给足(kd 参数仅约束装载循环;照 f32 wrapper 同款)
+                ((2 * 128 + 2) * 4) as u32,
+            )).arg(&q_).arg(&k_).arg(&v_).arg(&g_).arg(&b_)
+            .arg(&rec).arg(&sl2)
+            .arg_usize(batch).arg_usize(nv).arg_usize(nk).arg_usize(kd).arg_usize(vd)
+            .arg_f32(1.0 / (kd as f32).sqrt())
+            .with_shape(Dtype::F16, vec![batch, nv, vd]);
+            let out = crate::interpreters::eval_ops(decl.step(), &mut gpu).await.unwrap();
+            let mut obuf = vec![0u8; batch * nv * vd * 2];
+            gpu.dtoh(&out, &mut obuf).await.unwrap();
+            let got_o = unhalf(&obuf);
+            // 首步:b0(state 0)→ out = (Σ_k q·k)·scale·beta·v[state=0 时
+            // kv_mem=0,delta=v·beta,out=Σ s·q̂ = Σ k·(v·beta)·(q·scale)];
+            // padding b1 跳写 → 应恒 0(零初始化输出块语义下首读)
+            if step == 0 {
+                for h in 0..nv {
+                    let qk: f32 = (0..kd)
+                        .map(|k| qv[h * kd + k] * kv[h * kd + k])
+                        .sum::<f32>() * (1.0 / (kd as f32).sqrt());
+                    for i in 0..vd {
+                        let want = qk * beta[h] * vv[h * vd + i];
+                        let g = got_o[h * vd + i];
+                        assert!((g - want).abs() <= 2e-2 * (1.0 + want.abs()), "delta s0[{h},{i}] {g} vs {want}");
+                    }
+                }
+            }
+        }
+        // 两步后 state 非零连续性:收割 rec 块(b0 段)应有非零有限值
+        let mut sbuf = vec![0u8; slots_n * nv * kd * vd * 4];
+        gpu.dtoh(&rec_b, &mut sbuf).await.unwrap();
+        let svals: Vec<f32> = sbuf.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let b0_nonzero = svals[0..nv * kd * vd].iter().any(|v| v.abs() > 1e-6);
+        let pad_zero = svals[(slots_n - 1) * nv * kd * vd..].iter().all(|v| v.abs() == 0.0);
+        assert!(b0_nonzero, "state 两步后应非零(f32 连续)");
+        assert!(pad_zero, "padding 槽 state 应保持零");
+        gpu.close().await.unwrap();
+    }
+
+    /// (工单 G-5)PF1b:conv_fwd varlen(单序列 T=8)== T×conv_upd 展开
+    /// (PF1a 展开形态 vs 批核的核级对拍;out + state 双锚)
+    #[tokio::test]
+    async fn gpu_conv_fwd_varlen_matches_expansion() {
+        if !gpu_enabled() { eprintln!("skip"); return; }
+        let (nk, kd, t, slot) = (2usize, 16usize, 8usize, 0usize);
+        let d = nk * kd;
+        let w: Vec<f32> = q(&(0..d * 4).map(|i| ((i as f32 * 0.13) - 0.5).sin()).collect::<Vec<_>>());
+        let x: Vec<f32> = q(&(0..t * d).map(|i| ((i as f32 * 0.31) - 1.0).sin()).collect::<Vec<_>>());
+
+        let mut gpu = gpu_client().await;
+        let sh = crate::contract::Shape::from;
+        // 批核:单发射
+        let st_a_b = crate::interpreters::eval_ops(
+            TensorOps::zeros(Dtype::F32, vec![1, d, 3]).step(), &mut gpu).await.unwrap();
+        let st_a = TensorOps::of_block(st_a_b.id, Dtype::F32, vec![1, d, 3]);
+        let dwb = gpu.htod(Dtype::F16, &sh(vec![d, 4]), &hbytes(&w)).await.unwrap();
+        let dxb = gpu.htod(Dtype::F16, &sh(vec![t, d]), &hbytes(&x)).await.unwrap();
+        let w_decl = TensorOps::of_block(dwb.id, Dtype::F16, vec![d, 4]);
+        let x_decl = TensorOps::of_block(dxb.id, Dtype::F16, vec![t, d]);
+        let sl = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot as f32]));
+        let cu = TensorOps::from_host(Dtype::F32, vec![2], &f32b(&[0.0, t as f32]));
+        let fwd = TensorOps::of(crate::kernel::kernel_with(
+            "owl_gdn_conv_fwd_f16", (1u32, ((d + 255) / 256) as u32, 1), (256, 1, 1), 0,
+        )).arg(&x_decl).arg(&w_decl).arg(&st_a).arg(&sl).arg(&cu)
+        .arg_i32(1).arg_i32(d as i32).arg_i32(1)
+        .with_shape(Dtype::F16, vec![t, d]);
+        let out_a = crate::interpreters::eval_ops(fwd.step(), &mut gpu).await.unwrap();
+
+        // 展开:T×conv_upd(独立 state 块)
+        let st_b_b = crate::interpreters::eval_ops(
+            TensorOps::zeros(Dtype::F32, vec![1, d, 3]).step(), &mut gpu).await.unwrap();
+        let st_b = TensorOps::of_block(st_b_b.id, Dtype::F32, vec![1, d, 3]);
+        let mut outs = Vec::new();
+        for tk in 0..t {
+            let one = gpu.htod(Dtype::F16, &sh(vec![1, d]), &hbytes(&x[tk * d..(tk + 1) * d])).await.unwrap();
+            let one_decl = TensorOps::of_block(one.id, Dtype::F16, vec![1, d]);
+            let sl1 = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot as f32]));
+            let c = TensorOps::of(crate::kernel::kernel_with(
+                "owl_gdn_conv_upd_f16", (0, 0, 0), (256, 1, 1), 0,
+            )).arg(&one_decl).arg(&w_decl).arg(&st_b).arg(&sl1)
+            .arg_usize(d).arg_usize(d).arg_usize(0).arg_i32(1)
+            .with_shape(Dtype::F16, vec![1, d]);
+            let o = crate::interpreters::eval_ops(c.step(), &mut gpu).await.unwrap();
+            let mut b1 = vec![0u8; d * 2];
+            gpu.dtoh(&o, &mut b1).await.unwrap();
+            outs.extend(unhalf(&b1));
+        }
+        let mut abuf = vec![0u8; t * d * 2];
+        gpu.dtoh(&out_a, &mut abuf).await.unwrap();
+        let got_a = unhalf(&abuf);
+        assert_close_rel(&got_a, &outs, 1e-4, "conv_fwd vs expansion");
+        // state 双锚
+        let mut sa = vec![0u8; d * 3 * 4];
+        let mut sb = vec![0u8; d * 3 * 4];
+        gpu.dtoh(&st_a_b, &mut sa).await.unwrap();
+        gpu.dtoh(&st_b_b, &mut sb).await.unwrap();
+        for (i, (a, b)) in sa.chunks_exact(4).zip(sb.chunks_exact(4)).enumerate() {
+            let (va, vb) = (f32::from_le_bytes(a.try_into().unwrap()), f32::from_le_bytes(b.try_into().unwrap()));
+            assert!((va - vb).abs() < 1e-6, "state[{i}] {va} vs {vb}");
+        }
+        gpu.close().await.unwrap();
+    }
+
+    /// (工单 G-6)PF1b:recurrence varlen gqa(单序列 T=8)== T×delta_dec 展开
+    /// (out + 终态 f32 双锚;两步连续的批核侧验证)
+    #[tokio::test]
+    async fn gpu_recurrence_varlen_matches_expansion() {
+        if !gpu_enabled() { eprintln!("skip"); return; }
+        let (nk, nv, kd, vd, t, slot) = (2usize, 2usize, 16usize, 32usize, 8usize, 0usize);
+        let qv: Vec<f32> = q(&(0..t * nk * kd).map(|i| ((i as f32 * 0.17) - 1.0).sin()).collect::<Vec<_>>());
+        let kv: Vec<f32> = q(&(0..t * nk * kd).map(|i| ((i as f32 * 0.23) - 0.5).cos()).collect::<Vec<_>>());
+        let vv: Vec<f32> = q(&(0..t * nv * vd).map(|i| ((i as f32 * 0.29) + 0.3).sin()).collect::<Vec<_>>());
+        let gv: Vec<f32> = q(&(0..t * nv).map(|i| -0.05 - (i as f32 % 4.0) * 0.02).collect::<Vec<_>>());
+        let bv: Vec<f32> = q(&(0..t * nv).map(|i| 0.9 - (i as f32 % 4.0) * 0.05).collect::<Vec<_>>());
+        let q_scale = 1.0 / (kd as f32).sqrt();
+
+        let mut gpu = gpu_client().await;
+        let sh = crate::contract::Shape::from;
+        let st_a_b = crate::interpreters::eval_ops(
+            TensorOps::zeros(Dtype::F32, vec![1, nv, kd, vd]).step(), &mut gpu).await.unwrap();
+        let st_a = TensorOps::of_block(st_a_b.id, Dtype::F32, vec![1, nv, kd, vd]);
+        let dq = gpu.htod(Dtype::F16, &sh(vec![t, nk, kd]), &hbytes(&qv)).await.unwrap();
+        let dk = gpu.htod(Dtype::F16, &sh(vec![t, nk, kd]), &hbytes(&kv)).await.unwrap();
+        let dv = gpu.htod(Dtype::F16, &sh(vec![t, nv, vd]), &hbytes(&vv)).await.unwrap();
+        let dg = gpu.htod(Dtype::F16, &sh(vec![t, nv]), &hbytes(&gv)).await.unwrap();
+        let db = gpu.htod(Dtype::F16, &sh(vec![t, nv]), &hbytes(&bv)).await.unwrap();
+        let (q_, k_, v_, g_, b_) = (
+            TensorOps::of_block(dq.id, Dtype::F16, vec![t, nk, kd]),
+            TensorOps::of_block(dk.id, Dtype::F16, vec![t, nk, kd]),
+            TensorOps::of_block(dv.id, Dtype::F16, vec![t, nv, vd]),
+            TensorOps::of_block(dg.id, Dtype::F16, vec![t, nv]),
+            TensorOps::of_block(db.id, Dtype::F16, vec![t, nv]),
+        );
+        let sl = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot as f32]));
+        let cu = TensorOps::from_host(Dtype::F32, vec![2], &f32b(&[0.0, t as f32]));
+        let fwd = TensorOps::of(crate::kernel::kernel_with(
+            "owl_gdn_recurrence_varlen_gqa_f16",
+            (((vd + 7) / 8) as u32, (nv) as u32, 1), (32, 8, 1),
+            ((4 * kd + 4) * 4) as u64 as u32,
+        )).arg(&q_).arg(&k_).arg(&v_).arg(&g_).arg(&b_)
+        .arg(&st_a).arg(&sl).arg(&cu)
+        .arg_usize(1).arg_usize(nv).arg_usize(nk).arg_usize(kd).arg_usize(vd)
+        .arg_f32(q_scale)
+        .with_shape(Dtype::F16, vec![t, nv, vd]);
+        let out_a = crate::interpreters::eval_ops(fwd.step(), &mut gpu).await.unwrap();
+
+        // 展开:T×delta_dec(独立 state)
+        let st_b_b = crate::interpreters::eval_ops(
+            TensorOps::zeros(Dtype::F32, vec![1, nv, kd, vd]).step(), &mut gpu).await.unwrap();
+        let st_b = TensorOps::of_block(st_b_b.id, Dtype::F32, vec![1, nv, kd, vd]);
+        let mut outs = Vec::new();
+        for tk in 0..t {
+            let (rq, rk, rv, rg, rb) = (
+                gpu.htod(Dtype::F16, &sh(vec![1, nk, kd]), &hbytes(&qv[tk * nk * kd..(tk + 1) * nk * kd])).await.unwrap(),
+                gpu.htod(Dtype::F16, &sh(vec![1, nk, kd]), &hbytes(&kv[tk * nk * kd..(tk + 1) * nk * kd])).await.unwrap(),
+                gpu.htod(Dtype::F16, &sh(vec![1, nv, vd]), &hbytes(&vv[tk * nv * vd..(tk + 1) * nv * vd])).await.unwrap(),
+                gpu.htod(Dtype::F16, &sh(vec![1, nv]), &hbytes(&gv[tk * nv..(tk + 1) * nv])).await.unwrap(),
+                gpu.htod(Dtype::F16, &sh(vec![1, nv]), &hbytes(&bv[tk * nv..(tk + 1) * nv])).await.unwrap(),
+            );
+            let (q_, k_, v_, g_, b_) = (
+                TensorOps::of_block(rq.id, Dtype::F16, vec![1, nk, kd]),
+                TensorOps::of_block(rk.id, Dtype::F16, vec![1, nk, kd]),
+                TensorOps::of_block(rv.id, Dtype::F16, vec![1, nv, vd]),
+                TensorOps::of_block(rg.id, Dtype::F16, vec![1, nv]),
+                TensorOps::of_block(rb.id, Dtype::F16, vec![1, nv]),
+            );
+            let sl1 = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot as f32]));
+            let d = TensorOps::of(crate::kernel::kernel_with(
+                "owl_gdn_delta_dec_f16",
+                (((vd + 63) / 64) as u32, (nv) as u32, 1), (64, 1, 1),
+                ((2 * 128 + 2) * 4) as u32,
+            )).arg(&q_).arg(&k_).arg(&v_).arg(&g_).arg(&b_)
+            .arg(&st_b).arg(&sl1)
+            .arg_usize(1).arg_usize(nv).arg_usize(nk).arg_usize(kd).arg_usize(vd)
+            .arg_f32(q_scale)
+            .with_shape(Dtype::F16, vec![1, nv, vd]);
+            let o = crate::interpreters::eval_ops(d.step(), &mut gpu).await.unwrap();
+            let mut b1 = vec![0u8; nv * vd * 2];
+            gpu.dtoh(&o, &mut b1).await.unwrap();
+            outs.extend(unhalf(&b1));
+        }
+        let mut abuf = vec![0u8; t * nv * vd * 2];
+        gpu.dtoh(&out_a, &mut abuf).await.unwrap();
+        assert_close_rel(&unhalf(&abuf), &outs, 1e-4, "recurrence vs expansion");
+        // 终态双锚
+        let mut sa = vec![0u8; nv * kd * vd * 4];
+        let mut sb = vec![0u8; nv * kd * vd * 4];
+        gpu.dtoh(&st_a_b, &mut sa).await.unwrap();
+        gpu.dtoh(&st_b_b, &mut sb).await.unwrap();
+        for (i, (a, b)) in sa.chunks_exact(4).zip(sb.chunks_exact(4)).enumerate() {
+            let (va, vb) = (f32::from_le_bytes(a.try_into().unwrap()), f32::from_le_bytes(b.try_into().unwrap()));
+            // varlen = warp 树归约 / 展开 = 顺序累加:求和序不同,容差取相对
+            assert!((va - vb).abs() <= 1e-5 * (1.0 + vb.abs()), "state[{i}] {va} vs {vb}");
+        }
+        gpu.close().await.unwrap();
+    }
+}

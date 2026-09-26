@@ -10,6 +10,10 @@ description = "Operator dispatch + unified kernel home: .cu sources, nvrtc compi
 # 源码之家(sources)纯 include_str 零依赖 —— models 等上层引源不拖链接
 "default" = []
 "cuda" = ["dep:cudarc"]
+# cuBLAS 封装(f16 基线 F1;独立 feature —— 引源码之家不拖链接)
+"cublas" = ["dep:cudarc"]
+# Marlin W4A16(f16 激活 × u4 权重;build.rs nvcc/预编 .a + foreign-kernel)
+"marlin" = ["dep:rayon", "dep:half"]
 
 [dependencies]
 # 官方 cudarc:仅本 crate 的 cuda_ops 使用(kernel 编译与发射;feature 化,
@@ -17,5 +21,8 @@ description = "Operator dispatch + unified kernel home: .cu sources, nvrtc compi
 # nvrtc feature 仅为 Ptx 类型(load_module 入参;纯数据包装,零运行时编译)——
 # 编译本体已前移到 build.rs(nvcc 预编译 PTX)
 cudarc = { version = "0.19", default-features = false, optional = true, features = [
-    "std", "driver", "nvrtc", "cuda-version-from-build-system", "dynamic-loading",
+    "std", "driver", "nvrtc", "cublas", "cuda-version-from-build-system", "dynamic-loading",
 ] }
+# marlin repack(compressed-tensors → marlin 布局;weight_packed LSB-first)
+rayon = { version = "1", optional = true }
+half = { version = "2", optional = true }

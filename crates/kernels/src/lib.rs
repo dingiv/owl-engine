@@ -5,6 +5,28 @@
 //! 直接接线;attention = attention-rs 快照;这里只定义**契约与分发表**,
 //! 不实现 kernel(REQ-DESIGN-03:自研是最后手段)。
 
+/// cuBLAS 封装(f16 GEMM 通道;feature "cublas",server 侧消费)
+#[cfg(feature = "cublas")]
+pub mod cublas;
+
+/// Marlin W4A16(f16 激活 × u4 权重;feature "marlin",foreign-kernel 通道)
+#[cfg(feature = "marlin")]
+pub mod marlin;
+
+/// foreign-kernel 总分派谓词(server handle_launch 前置;外部算子总表)。
+/// 新外部库 = 各自模块 is_foreign + 此处加一行(命令面零新增)。
+pub fn is_foreign_op(name: &str) -> bool {
+    #[cfg(feature = "cublas")]
+    if cublas::is_foreign(name) {
+        return true;
+    }
+    #[cfg(feature = "marlin")]
+    if marlin::is_foreign(name) {
+        return true;
+    }
+    false
+}
+
 /// Arch 分发表键(REQ-HW-01):业务代码禁止写死 arch,一律经此查询。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Arch {

@@ -30,6 +30,7 @@ use crate::command::{Ack, Command};
 use crate::launch::issue_launch;
 use crate::state::{DeviceSelector, GpuCtx, KernelCache, Staging};
 use owl_iface::contract::{Arg, Bytes, LaunchMsg};
+use std::ffi::c_void;
 use crate::state::{STREAM_COMPUTE, STREAM_D2H, STREAM_H2D};
 use owl_iface::contract::ModelError;
 use std::sync::mpsc;
@@ -544,7 +545,7 @@ impl GpuServer {
     fn handle_launch(&mut self, msg: LaunchMsg, ack: Ack<Result<Bytes, ModelError>>) {
         // foreign-kernel 通道(2026-09-26 合并:cuBLAS 不再另立命令,
         // 外部算子 = 虚拟核名走同一 Launch;谓词与槽序归 owl-kernels::cublas)
-        if owl_kernels::cublas::is_foreign(&msg.kernel.name) {
+        if owl_kernels::is_foreign_op(&msg.kernel.name) {
             return self.handle_foreign_launch(msg, ack);
         }
         let mut ack = Some(ack);
@@ -592,6 +593,17 @@ impl GpuServer {
                 msg.kernel.name
             ))));
         }
+        match msg.kernel.name.as_str() {
+            name if name == owl_kernels::cublas::GEMM_F16 => self.handle_cublas_gemm(msg, ack),
+            name if name == owl_kernels::marlin::GEMM_W4A16 => self.handle_marlin_gemm(msg, ack),
+            other => ack.send(Err(ModelError::Msg(format!(
+                "foreign kernel {other}: 无执行臂(owl_kernels::is_foreign_op 与分派表失配)"
+            )))),
+        }
+    }
+
+    /// cuBLAS f16 GEMM 臂(槽序:[T a, T b, T out, sz m, sz k, sz n, sz nt])
+    fn handle_cublas_gemm(&mut self, msg: LaunchMsg, ack: Ack<Result<Bytes, ModelError>>) {
         if self.blas.is_none() {
             let stream = match self.ctx().stream(STREAM_COMPUTE) {
                 Ok(s) => s.clone(),
@@ -647,6 +659,72 @@ impl GpuServer {
         match blas.gemm_f16(a_ptr, b_ptr, out_ptr, m, k, n, nt) {
             Ok(()) => ack.send(Ok(Bytes::new(blocks[2], msg.out_elems))),
             Err(e) => ack.send(Err(ModelError::Msg(e))),
+        }
+    }
+
+    /// Marlin W4A16 臂(槽序:[T a, T b, T out, T scales, T ws, T c_tmp,
+    /// sz m, sz k, sz n, sz groupsize];契约见 owl_kernels::marlin)。
+    /// 无句柄状态(纯 FFI);stream/dev 由本 server 注入。
+    fn handle_marlin_gemm(&mut self, msg: LaunchMsg, ack: Ack<Result<Bytes, ModelError>>) {
+        let mut blocks: Vec<u64> = Vec::new();
+        let mut scalars: Vec<u64> = Vec::new();
+        for a in &msg.args {
+            match a {
+                Arg::Block { id } => blocks.push(*id),
+                Arg::U64(v) => scalars.push(*v),
+                _ => {
+                    return ack.send(Err(ModelError::Msg(format!(
+                        "foreign kernel {} 槽序违约:仅 Block/U64(见 owl_kernels::marlin 契约)",
+                        msg.kernel.name
+                    ))))
+                }
+            }
+        }
+        if blocks.len() != 6 || scalars.len() != 4 {
+            return ack.send(Err(ModelError::Msg(format!(
+                "foreign kernel {} 槽序违约:6 Block + 4 U64,得 {}B/{}S",
+                msg.kernel.name,
+                blocks.len(),
+                scalars.len()
+            ))));
+        }
+        let (m, k, n, groupsize) =
+            (scalars[0] as usize, scalars[1] as usize, scalars[2] as usize, scalars[3] as i32);
+        let stream = match self.ctx().stream(STREAM_COMPUTE) {
+            Ok(s) => s.clone(),
+            Err(e) => return ack.send(Err(e)),
+        };
+        let mut ptrs = Vec::with_capacity(6);
+        for b in &blocks {
+            match self.ctx().block_ptr(*b, &stream) {
+                Ok((p, _)) => ptrs.push(p),
+                Err(e) => return ack.send(Err(e)),
+            }
+        }
+        let dev = self.ctx().device_ordinal() as i32;
+        // 排队即回执(fire-and-forget;marlin host launcher 入 COMPUTE 流)
+        let r = unsafe {
+            owl_kernels::marlin::gemm_v2_raw(
+                ptrs[0] as *const u16,
+                ptrs[1] as *const i32,
+                ptrs[2] as *mut u16,
+                ptrs[3] as *const u16,
+                ptrs[5] as *const c_void,
+                m as i32,
+                n as i32,
+                k as i32,
+                ptrs[4] as *mut i32,
+                groupsize,
+                dev,
+                stream.cu_stream() as usize,
+            )
+        };
+        match r {
+            Ok(()) => ack.send(Ok(Bytes::new(blocks[2], msg.out_elems))),
+            Err(e) => ack.send(Err(ModelError::Msg(format!(
+                "marlin gemm err {e}: {}",
+                owl_kernels::marlin::v2_err_str(e)
+            )))),
         }
     }
 
