@@ -36,6 +36,14 @@ use std::sync::mpsc;
 
 type Finish = Box<dyn FnOnce() + Send>;
 
+/// pinned 租约回收池(进程级;Finish 在派发线程执行、拿不到 ctx,
+/// 故池为全局 —— 单 server 实例 per 进程,无争用)
+fn pinned_pool() -> &'static std::sync::Mutex<Vec<Box<dyn owl_iface::contract::PinnedRegion + Send>>> {
+    static POOL: std::sync::OnceLock<std::sync::Mutex<Vec<Box<dyn owl_iface::contract::PinnedRegion + Send>>>> =
+        std::sync::OnceLock::new();
+    POOL.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
 pub struct GpuServer {
     rx: mpsc::Receiver<Command>,
     selector: DeviceSelector,
@@ -178,6 +186,13 @@ impl GpuServer {
         match cmd {
             Command::Alloc { n_elems, ack } => self.handle_alloc(n_elems, ack),
             Command::Htod { data, ack } => self.handle_htod(data, ack),
+            Command::HtodChunk { block, offset_elems, data, ack } => {
+                self.handle_htod_chunk(block, offset_elems, data, ack)
+            }
+            Command::AllocPinned { elems, ack } => self.handle_alloc_pinned(elems, ack),
+            Command::UploadPinned { buf, dst, offset_elems, ack } => {
+                self.handle_upload_pinned(buf, dst, offset_elems, ack)
+            }
             Command::Dtoh { id, want_elems, ack } => self.handle_dtoh(id, want_elems, ack),
             Command::Launch { msg, ack } => self.handle_launch(msg, ack),
             Command::Sync { ack } => self.handle_sync(ack),
@@ -205,6 +220,9 @@ impl GpuServer {
             Command::Close { ack } => ack.send(Ok(())), // 幂等
             Command::Alloc { ack, .. } => closed!(ack),
             Command::Htod { ack, .. } => closed!(ack),
+            Command::HtodChunk { ack, .. } => closed!(ack),
+            Command::AllocPinned { ack, .. } => closed!(ack),
+            Command::UploadPinned { ack, .. } => closed!(ack),
             Command::Dtoh { ack, .. } => closed!(ack),
             Command::Launch { ack, .. } => closed!(ack),
             Command::Sync { ack, .. } => closed!(ack),
@@ -222,6 +240,9 @@ impl GpuServer {
             Command::GraphLaunch { .. } => "GraphLaunch",
             Command::Alloc { .. } => "Alloc",
             Command::Htod { .. } => "Htod",
+            Command::HtodChunk { .. } => "HtodChunk",
+            Command::AllocPinned { .. } => "AllocPinned",
+            Command::UploadPinned { .. } => "UploadPinned",
             Command::Dtoh { .. } => "Dtoh",
             Command::Sync { .. } => "Sync",
             Command::Launch { .. } => "Launch",
@@ -234,6 +255,9 @@ impl GpuServer {
             Command::GraphLaunch { ack, .. } => reject!(ack),
             Command::Alloc { ack, .. } => reject!(ack),
             Command::Htod { ack, .. } => reject!(ack),
+            Command::HtodChunk { ack, .. } => reject!(ack),
+            Command::AllocPinned { ack, .. } => reject!(ack),
+            Command::UploadPinned { ack, .. } => reject!(ack),
             Command::Dtoh { ack, .. } => reject!(ack),
             Command::Sync { ack, .. } => reject!(ack),
             Command::Launch { ack, .. } => reject!(ack),
@@ -315,6 +339,126 @@ impl GpuServer {
         unsafe { memcpy_htod_async(dptr, staging.slice(), stream.cu_stream()) }
             .map_err(|e| ModelError::Msg(format!("htod async: {e:?}")))?;
         Ok((id, staging))
+    }
+
+    /// 分配 pinned 租约:池优先,miss 才 cudaHostAlloc
+    fn handle_alloc_pinned(
+        &mut self,
+        elems: usize,
+        ack: Ack<Result<Box<dyn owl_iface::contract::PinnedRegion + Send>, ModelError>>,
+    ) {
+        if let Some(i) = pinned_pool()
+            .lock()
+            .unwrap()
+            .iter()
+            .position(|b| b.as_f32().len() >= elems)
+        {
+            let mut b = pinned_pool().lock().unwrap().swap_remove(i);
+            b.slice_mut()[..elems].fill(0.0);
+            // 容量不可截,整块交出(调用方只用前 elems)
+            ack.send(Ok(b));
+            return;
+        }
+        match Staging::alloc(elems) {
+            Ok(s) => ack.send(Ok(Box::new(s))),
+            Err(e) => ack.send(Err(e)),
+        }
+    }
+
+    /// 上传租约:buf 所有权移入,DMA 到 dst+offset;完成回调把 buf 归还池
+    fn handle_upload_pinned(
+        &mut self,
+        buf: Box<dyn owl_iface::contract::PinnedRegion + Send>,
+        dst: Bytes,
+        offset_elems: usize,
+        ack: Ack<Result<(), ModelError>>,
+    ) {
+        let stream = match self.ctx().stream(STREAM_H2D) {
+            Ok(s) => s.clone(),
+            Err(e) => return ack.send(Err(e)),
+        };
+        let mut ack = Some(ack);
+        let dptr_base = match self.ctx().block_ptr(dst.id, &stream) {
+            Ok((p, _)) => p,
+            Err(e) => return ack.take().unwrap().send(Err(e)),
+        };
+        unsafe {
+            memcpy_htod_async(
+                dptr_base + (offset_elems as u64) * 4,
+                buf.as_f32(),
+                stream.cu_stream(),
+            )
+        }
+        .map_err(|e| ModelError::Msg(format!("upload_pinned async: {e:?}")))
+        .map_err(|e| {
+            if let Some(a) = ack.take() {
+                a.send(Err(e));
+            }
+        })
+        .err();
+        let cell = std::sync::Arc::new(std::sync::Mutex::new(Some((buf, ack))));
+        let cell2 = cell.clone();
+        let finish: Finish = Box::new(move || {
+            let (buf, mut ack) = cell2.lock().unwrap().take().unwrap();
+            pinned_pool().lock().unwrap().push(buf);
+            ack.take().unwrap().send(Ok(()));
+        });
+        if let Err(e) = self.notify(&stream, finish) {
+            // notify 失败:finish 未投递,租约回收入池 + 回执错误
+            if let Some((buf, mut ack)) = cell.lock().unwrap().take() {
+                pinned_pool().lock().unwrap().push(buf);
+                ack.take().unwrap().send(Err(e));
+            }
+        }
+    }
+
+    /// 分块写入已 alloc 的块(流式装载):pinned 码头 + memcpyAsync
+    /// 到 dst+offset;完成回调回执
+    fn handle_htod_chunk(
+        &mut self,
+        block: u64,
+        offset_elems: usize,
+        data: Vec<f32>,
+        ack: Ack<Result<(), ModelError>>,
+    ) {
+        let stream = match self.ctx().stream(STREAM_H2D) {
+            Ok(s) => s.clone(),
+            Err(e) => return ack.send(Err(e)),
+        };
+        let mut ack = Some(ack);
+        let dptr_base = match self.ctx().block_ptr(block, &stream) {
+            Ok((p, _)) => p,
+            Err(e) => return ack.take().unwrap().send(Err(e)),
+        };
+        let mut staging = match Staging::alloc(data.len()) {
+            Ok(s) => s,
+            Err(e) => return ack.take().unwrap().send(Err(e)),
+        };
+        staging.slice_mut().copy_from_slice(&data);
+        unsafe {
+            memcpy_htod_async(
+                dptr_base + (offset_elems as u64) * 4,
+                staging.slice(),
+                stream.cu_stream(),
+            )
+        }
+        .map_err(|e| ModelError::Msg(format!("htod chunk async: {e:?}")))
+        .map(|_| ())
+        .map_err(|e| {
+            if let Some(a) = ack.take() {
+                a.send(Err(e));
+            }
+        })
+        .err();
+        // 码头随 finish 存活至搬运完成后由派发线程释放
+        let mut cb_ack = ack.take();
+        let finish: Finish = Box::new(move || {
+            drop(staging);
+            cb_ack.take().unwrap().send(Ok(()));
+        });
+        if let Err(e) = self.notify(&stream, finish) {
+            ack.take().unwrap().send(Err(e));
+        }
     }
 
     fn handle_dtoh(

@@ -11,6 +11,11 @@ description = "Declarative Tensor model layer: pure-functional forward over a la
 owl-iface = { path = "../backends/iface" }
 # kernel 源码之家(include_str 纯源,不拖 CUDA 链接 —— cudarc 已 feature 化)
 owl-kernels = { path = "../kernels" }
+# safetensors 权重源(loader.rs;F32/BF16 → host f32,量化另立)
+safetensors = "0.8.0"
+# mmap 只读映射(loader.rs)+ join_all 并发装载(interpreter.rs)
+libc = "0.2"
+futures-util = "0.3"
 
 [dev-dependencies]
 # 样例的 async 运行时(CPU face 即测即用;GPU face 经 owl-cuda actor 消化阻塞)

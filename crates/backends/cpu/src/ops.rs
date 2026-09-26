@@ -41,6 +41,29 @@ pub(crate) fn matmul(
     Ok(Value { f32: out, shape: shape.clone() })
 }
 
+pub(crate) fn matmul_nt(
+    a: &Value,
+    b: &Value,
+    shape: &Shape,
+) -> Result<Value, ModelError> {
+    // B 按 [n, k] 行主序直读(nt;与 owl_matmul_nt_f32 同式)
+    let m_rows = a.shape[0].max(1);
+    let k = a.f32.len() / m_rows;
+    let (m, n) = (shape[0], shape[1]);
+    let mut out = vec![0.0f32; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let acc: f32 = a.f32[i * k..(i + 1) * k]
+                .iter()
+                .zip(&b.f32[j * k..(j + 1) * k])
+                .map(|(x, y)| x * y)
+                .sum();
+            out[i * n + j] = acc;
+        }
+    }
+    Ok(Value { f32: out, shape: shape.clone() })
+}
+
 /// 同形逐元素加
 pub(crate) fn add(a: &Value, b: &Value) -> Result<Value, ModelError> {
     Ok(Value {

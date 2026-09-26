@@ -128,6 +128,12 @@ impl DeviceClient for CpuFace {
                 let shape: Shape = vec![m, n];
                 ops::matmul(&vals[0], &vals[1], &shape)?
             }
+            "owl_matmul_nt_f32" => {
+                // nt:B [n,k] 直读;标量与 lower_matmul_nt 对位:m/k/n
+                let (m, _k, n) = (i32s[0] as usize, i32s[1] as usize, i32s[2] as usize);
+                let shape: Shape = vec![m, n];
+                ops::matmul_nt(&vals[0], &vals[1], &shape)?
+            }
             "owl_rmsnorm_f32" => {
                 // 标量与 lower_rmsnorm 对位:cols(I32)/eps(F32)/w_off(I32)
                 ops::rmsnorm(&vals[0], &vals[1], i32s[0] as usize, f32s[0], i32s[1] != 0)?
@@ -143,6 +149,51 @@ impl DeviceClient for CpuFace {
             .ok_or_else(|| ModelError::Msg("launch: args 中无输出块".to_string()))?;
         self.blocks.insert(id, out);
         Ok(Bytes::new(id, msg.out_elems))
+    }
+
+    async fn upload_pinned(
+        &mut self,
+        buf: Box<dyn owl_iface::contract::PinnedRegion + Send>,
+        dst: &Bytes,
+        offset_elems: usize,
+    ) -> Result<(), ModelError> {
+        let v = self
+            .blocks
+            .get_mut(&dst.id)
+            .ok_or(ModelError::DeadBlock { id: dst.id })?;
+        let data = buf.as_f32();
+        let end = offset_elems + data.len();
+        if v.f32.len() < end {
+            return Err(ModelError::Msg(format!(
+                "upload_pinned: 块 {} 长 {} < 写入终点 {end}",
+                dst.id,
+                v.f32.len()
+            )));
+        }
+        v.f32[offset_elems..end].copy_from_slice(data);
+        Ok(())
+    }
+
+    async fn write_block_f32(
+        &mut self,
+        dst: &Bytes,
+        offset_elems: usize,
+        data: &[f32],
+    ) -> Result<(), ModelError> {
+        let v = self
+            .blocks
+            .get_mut(&dst.id)
+            .ok_or(ModelError::DeadBlock { id: dst.id })?;
+        let end = offset_elems + data.len();
+        if v.f32.len() < end {
+            return Err(ModelError::Msg(format!(
+                "write_block_f32: 块 {} 长 {} < 写入终点 {end}",
+                dst.id,
+                v.f32.len()
+            )));
+        }
+        v.f32[offset_elems..end].copy_from_slice(data);
+        Ok(())
     }
 
     async fn sync(&mut self) -> Result<(), ModelError> {

@@ -49,6 +49,24 @@ extern "C" __global__ void owl_matmul_f32(
 
 // rmsnorm:x / rms(x) × (alpha + w_off)
 // (w_off = ×(1+w) 语义,use_norm_offset;块内归约,candle reduce.cu 同构)
+// nt 变体:B 按 [n, k] 行主序直读(输出列 c 的 B 行连续)——
+// lm_head/tied embedding 形态:权重保持 checkpoint 原布局 [vocab, hidden],
+// 免 host 转置与第二份显存(2026-09-26 M-e,抄 candle/mistral 惯例)。
+extern "C" __global__ void owl_matmul_nt_f32(
+    const float* a, const float* b, float* out,
+    const int m, const int k, const int n) {
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    const int c = blockIdx.y * blockDim.y + threadIdx.y;
+    if (r < m && c < n) {
+        const float* brow = b + (size_t)c * k;
+        float acc = 0.0f;
+        for (int p = 0; p < k; p++) {
+            acc += a[(size_t)r * k + p] * brow[p];
+        }
+        out[(size_t)r * n + c] = acc;
+    }
+}
+
 extern "C" __global__ void owl_rmsnorm_f32(
     const float* x, const float* alpha, float* out,
     const int n, const float eps, const int w_off) {

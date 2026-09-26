@@ -21,7 +21,7 @@
 //! (Block 叶子 len=0),仅在边界做断言。
 
 use crate::contract::{Bytes, DeviceClient, ModelError};
-use crate::module::{Layout, LoaderOps, WeightSource};
+use crate::module::{LoaderOps, WeightSource};
 use crate::ops::Op;
 use crate::tensor::TensorOps;
 use std::future::Future;
@@ -157,13 +157,17 @@ where
             ctx.face.launch(msg).await?;
             out
         }
-        Op::Matmul => {
+        Op::Matmul | Op::MatmulNt => {
             let (m, n) = (shape[0], shape[1]);
             // k = 内维 = x 声明 shape 末维(C1:只读声明 shape;原取 ins[0].len
             // 在多行 [m,k] 时越界读 —— 此 bug 被"历届测试都单行"掩盖)
             let k = t.parents[0].shape.last().copied().unwrap_or(0);
             let out = ctx.face.alloc(m * n * dtype.size_bytes()).await?;
-            let msg = crate::ops::lower_matmul(&ins, &out, m, k, n);
+            let msg = if matches!(t.op, Op::MatmulNt) {
+                crate::ops::lower_matmul_nt(&ins, &out, m, k, n)
+            } else {
+                crate::ops::lower_matmul(&ins, &out, m, k, n)
+            };
             ctx.face.launch(msg).await?;
             out
         }
@@ -195,8 +199,15 @@ where
 // §1.5 装载解释器:eval_load(识别 LoaderOps 指令;装载域的执行能力)
 // ============================================================================
 
+/// 装载并发度(2026-09-26 M-e loader 性能,用户裁决:4 协程流水 ——
+/// 每协程一束键组,数据单副本流动:take 取走 → 变换/move 上传 → 即弃,
+/// 主机驻留只剩"在途"份)。
+const LOAD_WORKERS: usize = 4;
+
 /// 装载执行(层级入口):驱动层的 `Loadable::layout` 需求并物化。
 /// 解释器自己调用层钩子并为它传递 LoaderCtx —— 使用者只给层与源。
+/// face 提供并发句柄(`DeviceClient::loader_faces`)且 Want 多于一条
+/// 时走分桶流水;否则顺序。
 ///
 /// ```rust,ignore
 /// eval_load(&mlp, face, &src, LoaderCtx::default()).await?;
@@ -212,61 +223,166 @@ where
     D: DeviceClient,
     S: WeightSource + ?Sized,
 {
-    let want = layer.layout(ctx);   // 层产出需求清单(ctx 引用透传)
+    let want = layer.layout(ctx); // 层产出需求清单(ctx 引用透传)
     eval_want(&want, face, src).await
 }
 
-/// 需求清单求值(内部件):按清单从源取数 → 布局变换 → face 物化 →
-/// **经 Want.sink 自动填回容器空包**(mount 已被吸收)。
-/// 缺键/长度不符/htod 失败 → 结构化 Err(带槽键归因)。
+/// 需求清单求值:并发流水(能力可用)或顺序。
 async fn eval_want<D: DeviceClient, S: WeightSource + ?Sized>(
     want: &LoaderOps,
     face: &mut D,
     src: &S,
 ) -> Result<(), ModelError> {
-    use crate::module::f32b;
-    for w in want.wants() {
-        let data = src.get(w.key).ok_or_else(|| {
-            ModelError::Msg(format!("Weight '{}': 数据源缺键", w.key))
-        })?;
+    let handles = face.loader_faces(LOAD_WORKERS);
+    match handles {
+        Some(handles) if handles.len() > 1 && want.wants().len() > 1 => {
+            eval_want_parallel(want, handles, src).await
+        }
+        _ => eval_want_sequential(want, face, src).await,
+    }
+}
+
+/// 键分组:同键多 Want(tied 双槽 = w 直读 + w_t 转置读)原子成组,
+/// take 一次供全组;组序 = 清单首次出现序。
+fn key_groups<'a>(wants: &'a [crate::module::Want]) -> Vec<Vec<&'a crate::module::Want>> {
+    let mut order: Vec<&'a str> = Vec::new();
+    let mut map: std::collections::HashMap<&'a str, Vec<&'a crate::module::Want>> =
+        std::collections::HashMap::new();
+    for w in wants {
+        if !map.contains_key(w.key.as_str()) {
+            order.push(w.key.as_str());
+            map.insert(w.key.as_str(), Vec::new());
+        }
+        map.get_mut(w.key.as_str()).unwrap().push(w);
+    }
+    order.into_iter().map(|k| map.remove(k).unwrap()).collect()
+}
+
+fn want_bytes(w: &crate::module::Want) -> usize {
+    w.shape.iter().product::<usize>() * 4
+}
+
+/// 单键组装载(数据单副本流动):
+/// 1. `src.take(key)` 取走所有权(源驻留下降);
+/// 2. Transposed Want 先行(只读 data,产出转置 Vec → htod_f32 move);
+/// 3. Direct Want 收尾:htod_f32(data) 直接 move —— 零变换零拷贝
+///    (良构校验内联;多 Direct 同键时末位以外克隆,现模型不出现)。
+async fn load_group<D: DeviceClient, S: WeightSource + ?Sized>(
+    face: &mut D,
+    group: &[&crate::module::Want],
+    src: &S,
+) -> Result<(), ModelError> {
+    let key = group[0].key.clone();
+    let data = src
+        .take(&key)
+        .ok_or_else(|| ModelError::Msg(format!("Weight '{key}': 数据源缺键")))?;
+    let mut direct: Option<&crate::module::Want> = None;
+    for w in group {
+        match w.layout {
+            crate::module::Layout::Transposed => {
+                let n_want: usize = w.shape.iter().product();
+                let t = transpose_into_vec(data.as_slice(), w, n_want)?;
+                let b = face
+                    .htod_f32(&w.shape, t)
+                    .await
+                    .map_err(|e| ModelError::Msg(format!("Weight '{}': {e}", w.key)))?;
+                let n: usize = w.shape.iter().product();
+                w.sink.deliver(crate::contract::Bytes::new(b.id, n));
+            }
+            crate::module::Layout::Direct => direct = Some(w),
+        }
+    }
+    if let Some(w) = direct {
         let n: usize = w.shape.iter().product();
-        let (shape, bytes) = match w.layout {
-            Layout::Direct => {
-                if data.len() != n {
-                    return Err(ModelError::Msg(format!(
-                        "Weight '{}': 元素 {} != shape {:?}({n})",
-                        w.key,
-                        data.len(),
-                        w.shape
-                    )));
-                }
-                (w.shape.clone(), f32b(data))
-            }
-            Layout::Transposed => {
-                // 目标 [cols, rows];源 [rows, cols](行主序)
-                let (cols, rows) = (w.shape[0], w.shape[1]);
-                if data.len() != n {
-                    return Err(ModelError::Msg(format!(
-                        "Weight '{}': 元素 {} != 源形状 {rows}×{cols}",
-                        w.key,
-                        data.len()
-                    )));
-                }
-                let mut t = vec![0.0f32; n];
-                for r in 0..rows {
-                    for c in 0..cols {
-                        t[c * rows + r] = data[r * cols + c];
-                    }
-                }
-                (w.shape.clone(), f32b(&t))
-            }
-        };
+        if data.len() != n {
+            return Err(ModelError::Msg(format!(
+                "Weight '{}': 元素 {} != shape {:?}({n})",
+                w.key,
+                data.len(),
+                w.shape
+            )));
+        }
         let b = face
-            .htod(w.dtype, &shape, &bytes)
+            .htod_f32(&w.shape, data)
             .await
             .map_err(|e| ModelError::Msg(format!("Weight '{}': {e}", w.key)))?;
         w.sink.deliver(crate::contract::Bytes::new(b.id, n));
     }
+    Ok(())
+}
+
+/// TILE² 分块转置 → 新 Vec(源 [rows, cols] → 目标 [cols, rows] f32)
+fn transpose_into_vec(data: &[f32], w: &crate::module::Want, n: usize) -> Result<Vec<f32>, ModelError> {
+    const TILE: usize = 64;
+    let (cols, rows) = (w.shape[0], w.shape[1]);
+    if data.len() != n {
+        return Err(ModelError::Msg(format!(
+            "Weight '{}': 元素 {} != 源形状 {rows}×{cols}",
+            w.key,
+            data.len()
+        )));
+    }
+    let mut out = vec![0f32; n];
+    for r0 in (0..rows).step_by(TILE) {
+        let r1 = (r0 + TILE).min(rows);
+        for c0 in (0..cols).step_by(TILE) {
+            let c1 = (c0 + TILE).min(cols);
+            for r in r0..r1 {
+                for c in c0..c1 {
+                    out[c * rows + r] = data[r * cols + c];
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 顺序路径(CpuFace / 单 Want / 无并发能力)
+async fn eval_want_sequential<D: DeviceClient, S: WeightSource + ?Sized>(
+    want: &LoaderOps,
+    face: &mut D,
+    src: &S,
+) -> Result<(), ModelError> {
+    for group in key_groups(want.wants()) {
+        load_group(face, &group, src).await?;
+    }
+    Ok(())
+}
+
+/// 并发流水(GpuClient 等提供多句柄的 face):
+/// 键组按字节 LPT 分给最轻协程(embed 双槽 2GB 独占一束);
+/// join_all 单线程协作驱动 —— 组 A await 设备拷贝期间,组 B 的
+/// take/变换在同一线程推进,与 server 线程 memcpy 流水重叠。
+/// 交付序无关(Want 各带各的 sink;分配无跨 Want 定序)。
+async fn eval_want_parallel<D: DeviceClient, S: WeightSource + ?Sized>(
+    want: &LoaderOps,
+    handles: Vec<D>,
+    src: &S,
+) -> Result<(), ModelError> {
+    let mut groups = key_groups(want.wants());
+    groups.sort_by_key(|g| {
+        std::cmp::Reverse(g.iter().map(|w| want_bytes(w)).sum::<usize>())
+    });
+    let k = handles.len().min(groups.len()).max(1);
+    let mut buckets: Vec<(D, Vec<Vec<&crate::module::Want>>, usize)> = handles
+        .into_iter()
+        .take(k)
+        .map(|f| (f, Vec::new(), 0usize))
+        .collect();
+    for g in groups {
+        let bytes: usize = g.iter().map(|w| want_bytes(w)).sum();
+        let b = buckets.iter_mut().min_by_key(|(_, _, total)| *total).unwrap();
+        b.1.push(g);
+        b.2 += bytes;
+    }
+    let futs = buckets.into_iter().map(|(mut face, bundles, _)| async move {
+        for bundle in &bundles {
+            load_group(&mut face, bundle, src).await?;
+        }
+        Ok::<(), ModelError>(())
+    });
+    let results = futures_util::future::join_all(futs).await;
+    results.into_iter().collect::<Result<Vec<_>, _>>()?;
     Ok(())
 }
 

@@ -102,6 +102,50 @@ impl DeviceClient for GpuClient {
         self.submit(move |ack| Command::Alloc { n_elems, ack })?.await
     }
 
+    async fn htod_f32(&mut self, _shape: &Shape, data: Vec<f32>) -> Result<Bytes, ModelError> {
+        self.submit(move |ack| Command::Htod { data, ack })?.await
+    }
+
+    async fn alloc_pinned(
+        &mut self,
+        elems: usize,
+    ) -> Result<Box<dyn owl_iface::contract::PinnedRegion + Send>, ModelError> {
+        self.submit(move |ack| Command::AllocPinned { elems, ack })?.await
+    }
+
+    async fn upload_pinned(
+        &mut self,
+        buf: Box<dyn owl_iface::contract::PinnedRegion + Send>,
+        dst: &Bytes,
+        offset_elems: usize,
+    ) -> Result<(), ModelError> {
+        let dst = dst.clone();
+        self.submit(move |ack| Command::UploadPinned { buf, dst, offset_elems, ack })?
+            .await
+    }
+
+    async fn write_block_f32(
+        &mut self,
+        dst: &Bytes,
+        offset_elems: usize,
+        data: &[f32],
+    ) -> Result<(), ModelError> {
+        self.submit(move |ack| Command::HtodChunk {
+            block: dst.id,
+            offset_elems,
+            data: data.to_vec(),
+            ack,
+        })?
+        .await
+    }
+
+    fn loader_faces(&self, k: usize) -> Option<Vec<Self>>
+    where
+        Self: Sized + Clone,
+    {
+        Some((0..k).map(|_| self.clone()).collect())
+    }
+
     async fn htod(
         &mut self,
         _dtype: Dtype,

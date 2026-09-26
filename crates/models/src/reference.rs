@@ -29,6 +29,8 @@ pub trait Interpreter {
     fn zeros(&mut self, dtype: Dtype, shape: &Shape) -> Result<Value, ModelError>;
     /// Matmul:[m,k]×[k,n]
     fn matmul(&mut self, a: &Value, b: &Value, dtype: Dtype, shape: &Shape) -> Result<Value, ModelError>;
+    /// MatmulNt:[m,k]×(B [n,k] 直读)→ [m,n]
+    fn matmul_nt(&mut self, a: &Value, b: &Value, dtype: Dtype, shape: &Shape) -> Result<Value, ModelError>;
     /// Add(同形)
     fn add(&mut self, a: &Value, b: &Value) -> Result<Value, ModelError>;
     /// Mul(同形逐元素乘;MLP 门控/输出门)
@@ -124,6 +126,7 @@ pub fn reduce(
         Op::Htod { bytes } => itp.htod(t.dtype, &t.shape, bytes),
         Op::Zeros => itp.zeros(t.dtype, &t.shape),
         Op::Matmul => itp.matmul(&ins[0], &ins[1], t.dtype, &t.shape),
+        Op::MatmulNt => itp.matmul_nt(&ins[0], &ins[1], t.dtype, &t.shape),
         Op::Add => itp.add(&ins[0], &ins[1]),
         Op::Mul => itp.mul(&ins[0], &ins[1]),
         Op::Silu => itp.silu(&ins[0]),
@@ -209,6 +212,31 @@ impl Interpreter for CpuInterpreter {
                 for j in 0..n {
                     out[i * n + j] += av * b.f32[p * n + j];
                 }
+            }
+        }
+        Ok(Value { f32: out, shape: shape.clone() })
+    }
+
+    fn matmul_nt(
+        &mut self,
+        a: &Value,
+        b: &Value,
+        _dtype: Dtype,
+        shape: &Shape,
+    ) -> Result<Value, ModelError> {
+        let m_rows = a.shape[0].max(1);
+        let k = a.f32.len() / m_rows;
+        let (m, n) = (shape[0], shape[1]);
+        let mut out = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let brow = &b.f32[j * k..(j + 1) * k];
+                let acc: f32 = a.f32[i * k..(i + 1) * k]
+                    .iter()
+                    .zip(brow)
+                    .map(|(x, y)| x * y)
+                    .sum();
+                out[i * n + j] = acc;
             }
         }
         Ok(Value { f32: out, shape: shape.clone() })

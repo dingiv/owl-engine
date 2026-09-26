@@ -23,6 +23,10 @@
 //! - [`module`]:层协议双面 —— Module/ForwardCtx(计算)+ Loadable/Weight/
 //!   Want/LoaderOps(装载)
 //! - [`layers`]:Qwen3.5 文本主干层(容器 + layout + forward)
+//! - [`loader`]:safetensors 权重源(通用;F32/BF16 → host f32)
+//! - [`model`]:通用解码器主干(共有机制;embed + 层链 + norm + lm_head,
+//!   整模单树 C5 + C10 装载)
+//! - [`specs`]:模型规格集(每档一文件;纯参数事实 + 键名约定,拆分律见模块头)
 //!
 //! **执行面(解释器)**
 //! - [`interpreter`]:异步执行(eval/eval_ops/eval_load;face 注入)
@@ -41,9 +45,12 @@ pub mod device;
 pub mod interpreter;
 pub mod kernel;
 pub mod layers;
+pub mod loader;
+pub mod model;
 pub mod module;
 pub mod ops;
 pub mod reference;
+pub mod specs;
 pub mod tensor;
 
 // ============================================================================

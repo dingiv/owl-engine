@@ -1,6 +1,8 @@
 //! Embedding:词表查表(Kernel 注册表:`owl_embed_f32`)。
-//! tied 权重:同一份 `[vocab, D]` 数据兼 embedding 与 lm_head
-//! (lm_head 走 `lm_head_matmul`,转置槽第二份 —— 块复用待装载账立项)。
+//! tied 权重:同一份 `[vocab, D]` checkpoint 原布局数据兼 embedding 与
+//! lm_head —— lm_head 走 **nt matmul**(`owl_matmul_nt_f32`,B 按
+//! [n,k]=[vocab,D] 直读,抄 candle/mistral "W 保持 [out,in]" 惯例):
+//! 零 host 转置、零第二份显存(2026-09-26 w_t 双槽形态作废)。
 //! 容器 + LoaderOps 装载形态。
 
 use crate::kernel;
@@ -10,21 +12,24 @@ use crate::tensor::Dtype;
 use crate::TensorOps;
 
 pub struct Embedding {
-    /// [vocab, D](原始布局;tied)
+    /// [vocab, D](checkpoint 原布局;查表 + nt matmul 共用一份)
     w: Weight,
-    /// lm_head 转置槽 [D, vocab](tied 同源数据)
-    w_t: Weight,
     d_dim: usize,
 }
 
 impl Embedding {
-    /// 准备容器
+    /// 准备容器(局部键 "weight":C10 前缀源下 →
+    /// `{base}.embed_tokens.weight`;单槽,tied 经 nt matmul 复用)
     pub fn new(vocab: usize, d_dim: usize) -> Embedding {
         Embedding {
-            w: Weight::new("w", vec![vocab, d_dim]),
-            w_t: Weight::new_transposed("w_t", vocab, d_dim),
+            w: Weight::new("weight", vec![vocab, d_dim]),
             d_dim,
         }
+    }
+
+    /// 装载完备性
+    pub fn is_loaded(&self) -> bool {
+        self.w.is_loaded()
     }
 
     /// 查表(Module 统一入口的实体;tokens 由 ctx 提供 —— 每步动态依赖)。
@@ -45,14 +50,16 @@ impl Embedding {
     }
 
     /// lm_head(tied):hidden [.., D] → logits [.., vocab]
+    /// nt 直读原始 [vocab, D] 布局(matmul_nt;零转置)
     pub fn lm_head_matmul(&self, hidden: &TensorOps) -> TensorOps {
-        hidden.matmul(&self.w_t.decl())
+        hidden.matmul_nt(&self.w.decl())
     }
 }
 
 impl Loadable for Embedding {
+    /// tied 单槽:一个 Want 兼查表与 lm_head(nt matmul)
     fn layout(&self, ctx: &LoaderCtx) -> LoaderOps {
-        self.w.layout(ctx).chain(self.w_t.layout(ctx))
+        self.w.layout(ctx)
     }
 
 }
@@ -76,12 +83,12 @@ mod tests {
         let mut face = owl_cpu::CpuFace::new();
         let emb = Embedding::new(16, 4);
         let src = Src::from([
-            ("w".to_string(), (0..64).map(|i| i as f32 * 0.1).collect()),
-            ("w_t".to_string(), (0..64).map(|i| i as f32 * 0.1).collect()),
+            ("weight".to_string(), (0..64).map(|i| i as f32 * 0.1).collect()),
         ]);
         crate::interpreter::eval_load(&emb, &mut face, &src, &Default::default())
             .await
             .expect("eval_load");
+        assert!(emb.is_loaded(), "tied 槽应有块");
 
         let ids = TensorOps::from_host(Dtype::F32, vec![2], &f32b(&[3.0, 7.0]));
         let out = emb.embed(&ids, 2);
@@ -128,8 +135,7 @@ mod tests {
                 let mut face = owl_cpu::CpuFace::new();
                 let emb = Embedding::new(vocab, d);
                 let src = Src::from([
-                    ("w".to_string(), w.clone()),
-                    ("w_t".to_string(), w.clone()),
+                    ("weight".to_string(), w.clone()),
                 ]);
                 crate::interpreter::eval_load(&emb, &mut face, &src, &Default::default())
                     .await.expect("eval_load");
@@ -142,8 +148,7 @@ mod tests {
                 let mut gpu = crate::testkit::gpu_client().await;
                 let emb = Embedding::new(vocab, d);
                 let src = Src::from([
-                    ("w".to_string(), w.clone()),
-                    ("w_t".to_string(), w.clone()),
+                    ("weight".to_string(), w.clone()),
                 ]);
                 crate::interpreter::eval_load(&emb, &mut gpu, &src, &Default::default())
                     .await.expect("eval_load");

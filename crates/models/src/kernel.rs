@@ -103,6 +103,7 @@ pub static REGISTRY: &[Entry] = &[
     Entry { name: "owl_sigmoid_f32", source: sources::OPS_F32, args: "T,T,sz" },
     Entry { name: "owl_silu_f32", source: sources::OPS_F32, args: "T,T,sz" },
     Entry { name: "owl_matmul_f32", source: sources::OPS_F32, args: "T,T,T,i32,i32,i32" },
+    Entry { name: "owl_matmul_nt_f32", source: sources::OPS_F32, args: "T,T,T,i32,i32,i32" },
     Entry { name: "owl_rmsnorm_f32", source: sources::OPS_F32, args: "T,T,T,i32,f32,i32" },
     // ---- 文本主干(Qwen3.5 mini-demo;Kernel 节点路径,输出块末参)----
     Entry { name: "owl_embed_f32", source: text::EMBED_F32, args: "T,T,sz,T" },

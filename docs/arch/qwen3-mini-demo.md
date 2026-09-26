@@ -56,8 +56,9 @@ model.norm [1024]                                    ×1(终局 norm)
 | 5 | `layers/rope` | Kernel `owl_rope_half_partial_f32`(rotate-half+partial) | ✅ | HF parity ✓(GPU vs HF 类直跑) |
 | 6 | `layers/attention` | 3 GEMM + qk-norm(复用 rmsnorm w_off)+ rope 复用 + naive decode attn(K)+ gate sigmoid(语义)+ mul + o_proj | ✅ | GPU 端到端两步 decode vs host 全链 ✓(含 bisect 13 段 maxdiff 全零) |
 | 7 | `layers/gdn` | 4 GEMM + conv_upd3(K)+ gating(K×2)+ l2norm(K)+ delta_dec(K)+ rmsnorm_act(K) | ⏳ | GPU 端到端 |
-| 8 | `layers/decoder` | DecoderLayer(Full/Gdn 枚举)+ 双残差;Model 主干 + tied lm_head | 批7 ✅ / 批8 ⏳ | GPU vs host 全链 ✓(两分支) |
-| 9 | loader | safetensors → host f32(转置/重复通道)→ layer `new` | ⏳ | 权重指纹 |
+| 8 | `layers/decoder` | DecoderLayer(Full/Gdn 枚举)+ 双残差 | 批7 ✅ | GPU vs host 全链 ✓(两分支) |
+| 9 | `model.rs` + `specs/qwen35.rs` | **共有主干**(embed + N 层 + final norm + tied lm_head;C10 装载;整模单树)与 **Qwen3.5 特有**(0.8B 维度档、3:1 层型表)分离 —— 拆分律 §四 23 | 批8 ✅ | GPU 两步 decode vs host 全链 1e-4 ✓(GDN conv/rec 跨步 + KV 增行) |
+| 10 | `loader.rs` + specs 装载 | SafeTensorsSource(**流式**:mmap + 条目索引,take/take_range 即取走)+ Qwen35Convention(子前缀/裸键)+ load_0_8b 入口 | ✅ M-e 冒烟 | GPU 真权重两步 decode ✓(**6.6s** / 峰值 **2.8GB**:mmap+流式+4 协程流水+nt 直读+w_t 灭+128MB 分块) |
 
 (K = Kernel 节点,.cu 随层携带,server nvrtc 懒编译零改动)
 
@@ -157,19 +158,60 @@ model.norm [1024]                                    ×1(终局 norm)
     的 `start` 是**行内列偏移**(dst[r·out+d] = src[r·src_dim+start+d]),
     只能切列,**做不了行块偏移** —— conv 权重行切片串行(实测 wk 全错)。
     行块偏移走段基址标量(conv 核 w_offset),勿用 narrow。
-18. **CSE / DAG 求值定律(2026-09-26 M-d 批 7 定案;用户裁决保留)**:TensorOps 树是
-    **DAG**(共享节点克隆保留同一 id),解释器必须按 DAG 求值——
-    `_eval` 带 memo(键 = 节点 id,作用域 = 单次 eval),同节点只执行一次。**无 CSE 时共享
-    子树(残差 h:既喃 ln2 又喃残差加)被重复求值,状态副作用 kernel
-    (conv/delta)二次滑状态 → 语义破坏**(实测 mlp 段恒定 ×1.017 偏差,
-    bisect 定位)。语义根因:值形态(深拷贝 clone)与引用语义(残差复用)
-    不一致——值出度被树语义钉死为 1,残差网络需要出度 ≥ 2 的 SSA。
-    **用户裁决:CSE memo 即正式求值语义,句柄化/arena 暂不立项**,
-    列为 M-f 图捕获期再评估(图 = DAG 的物化,memo 可升级为节点表)。
+18. **CSE / DAG 求值定律(2026-09-26 M-d 批 7 定案;同日 Arc 修订)**:TensorOps 是
+    **DAG**,解释器必须按 DAG 求值——`_eval` 带 memo(键 = 节点 id,作用域 = 单次
+    eval),同节点只执行一次。~~值语义深拷贝~~ **已废弃(批 8 实证)**:残差双引用使
+    声明树每层 ×2 指数膨胀,真 24 层 2^24 节点直接爆炸(浅层 fixture 测不出);
+    **parents 改 Arc 共享**,克隆 O(1),树 = 物理 DAG,构造/遍历/求值全线性,
+    “同 id = 同节点”升级为“同节点 = 同一物理对象”。memo 仍保留(DAG 菱形
+    两次入口第二次命中)。跨 eval 状态推进是特性。
 19. **节点 id 空间分离律(2026-09-26 M-d 批 7 附带)**:`of_block` 声明
     叶子的 id 必须走 `next_id()` 全局节点空间,块 id 是 server 侧另一套
     计数 —— 直接复用会撞 CSE memo 键(实测 Rmsnorm gamma 撞 [8] 声明的
     64 账长块,C1 断言拦截)。两套 id 空间的映射 = Op::Block{id} 字段。
+20. **C10 装载律(2026-09-26 批 8 定案,M-e 可插拔化)**:Want 键恒层内
+    短键,`Model` 实现 `Loadable`:layout 内三段子清单(embed / layers.{i} /
+    norm)经 `LoaderOps::map_keys` 应用 [`KeyConvention`] 改写 —— 改写
+    发生在**声明期**,Want 清单里已是 checkpoint 最终键,解释器零约定
+    感知,装载 = 一次 `eval_load(&model, ...)`。默认约定
+    [`LlamaFamily`]({base}.layers.{i}.{local}.weight);模型特有约定住
+    specs/<model>.rs(拆分律 §四 23),如 Qwen3.5 的
+    `linear_attn.`/`self_attn.` 子前缀、mlp. 前缀与 `A_log`/`dt_bias` 裸键。
+24. **装载域流式律(2026-09-26 M-e 定案,两轮演进)**:数据单副本
+    流动 —— mmap 条目区间 `take_range` 查到才转换;**≥64MB 大张量
+    分块流式上传**(alloc 一次 + 128MB 块循环 `write_block_f32`
+    写入,主机在途 = 单块);`htod_f32(Vec<f32>)` 所有权移入
+    (禁 f32→LE→f32 往返);转置 TILE² 分块(写侧 1MB 步长跳页雷)。
+    实测:0.8B 装载主机峰值从 3.4GB 常驻 + 2GB 在途 → **全程 <1GB
+    匿名堆**。mmap 打开即整文件映射但**物理页按缺页逐页进来**;
+    convert_chunk_into 消费完即 `madvise(MADV_DONTNEED)` 归还页 —— RSS
+    恒定在"在途块"量级,不随仓增长(实测 **2.25GB**)。装载段实测
+    5.1s/3.9GB f32 ≈ 0.8GB/s(4 协程,转换瓶颈);27B 外推见 §五。
+    **二拷贝预算(用户定案,2026-09-26)**:一份权重从 mmap 到显存
+    只许两次拷贝 —— ① BF16→F32 转换(直写 pinned 租约)② DMA 进
+    显存。为此新增 `PinnedRegion` 租约 + `alloc_pinned/upload_pinned`
+    能力(GpuClient:HtodPinned 命令 + 页锁池回收;CpuFace:堆租约拷块),
+    装载域 Direct 路径 = alloc → convert_chunk_into(直写租约)→
+    upload_pinned(move)—— 原 to_vec 消息拷贝与 staging 码头拷贝
+    均已消灭。转置小件(≤25MB)容忍 3 拷,设备转置立项时归一。
+21. **tied nt 直读律(2026-09-26 M-e 修订;原"单源键双 Want"作废)**:
+    Embedding 单 Want 单槽,w 与 lm_head 经 **`Op::MatmulNt`**
+    (`owl_matmul_nt_f32`,B 按 [n,k]=[vocab,D] 直读,对固定输出列 B 行
+    连续、naive 核访存反而更优)复用同一份 checkpoint 原布局权重 ——
+    host 零转置、显存零第二份(抄 candle/mistral "W 保持 [out,in]"
+    惯例;原 w_t 转置槽 -1GB 显存 -2GB 主机在途)。Want 聚合(chain)
+    语义 = 多重集合(键不需唯一)仍适用于历史形态。
+22. **整模 ctx 派生律(2026-09-26 批 8 定案)**:`ForwardCtx::model_decode`
+    携 `kvs: &[KvBuffers]` / `gdns: &[GdnBuffers]` 序列(full/gdn 层
+    各自的出现序),`Model::last_hidden` 按混型游标派生单层子 ctx ——
+    Attention/Gdn 层零感知(仍读 kv/gdn 单引用),混型表分派只在
+    Model 一处。
+23. **共有/特有拆分律(2026-09-26 批 8 拆分,用户裁决)**:`src/model.rs`
+    只住**所有模型共有**的机制(主干结构/单树求值/序列 ctx 派生/C10
+    分组件装载/fixture 测试),零模型特定参数;`specs/<model>.rs` 只住
+    **该模型特有**的参数事实(维度预设/层型表约定/检查点特例),零机制。
+    新模型 = 新 spec 文件;mixer 词汇超出 Full|Gdn(MoE/MLA/…)时另立
+    DecoderLayer 扩展口(需求基线:arch 分发表不写死),不动主干。
 17. **narrow start 语义(2026-09-26 M-c 批 6 定案)**:`owl_narrow_strided_f32`
     的 `start` 是**行内列偏移**(dst[r·out+d] = src[r·src_dim+start+d]),
     只能切列,**做不了行块偏移** —— conv 权重行切片串行(wk 全错)。
@@ -188,10 +230,34 @@ model.norm [1024]                                    ×1(终局 norm)
   (examples/gdn.rs 两步 decode vs host 全链 1e-4 ✓);
 - **M-d(decoder 层)✅(2026-09-26)**:DecoderLayer(Full/Gdn 枚举 +
   双残差)两分支 GPU vs host 全链 1e-4 ✓;CSE/DAG 求值 + 节点 id 空间
-  分离两条新律落定(§四 18/19);批 8(Model 主干 + tied lm_head)随
-  M-e loader 一并立项;
-- **M-e(真权重)**:loader 灌 0.8B safetensors,decode 冒烟
-  (prompt → token 流,数值抽样对比 vLLM/transformers 基准);
+  分离两条新律落定(§四 18/19);
+- **M-d2(Model 主干,批 8)✅(2026-09-26)**:`src/model.rs`(共有主干,
+  拆分律 §四 23)+ `src/specs/qwen35.rs`(Qwen3.5 特有:hybrid_3to1 /
+  qwen3_5_0_8b 真档预设)——
+  ModelSpec(hybrid_3to1 / qwen3_5_0_8b 真档预设)+ Model 整模单树
+  (C5)+ C10 PrefixedSource 装载 + tied 单源键双 Want +
+  ForwardCtx::model_decode 序列派生(§四 20/21/22 三条新律);
+  fixture 四层 [G,G,G,F] GPU 两步 decode vs host 全链 1e-4 ✓
+  (GDN conv/rec 跨步推进 + KV 增行 + 混型分派);52/52 测试绿;
+- **M-e(真权重)首战 ✅(2026-09-26)**:`loader.rs` SafeTensorsSource
+  (F32/BF16→f32,目录全 *.safetensors 合并,无需 index)+
+  `Qwen35Convention`(linear_attn./self_attn. 子前缀、mlp. 前缀、
+  A_log/dt_bias 裸键 —— 488 张量实测)+ `load_0_8b(dir, face)` 入口
+  (specs/qwen35.rs);**两步 decode 冒烟 ✓**(step0 top@84 /
+  step1 top@279,状态推进,16.7s 峰值 6.7GB);**loader 流水化三连**(2026-09-26,16.7→11.6→**8.9s**,峰值
+  6.7→7.6→**3.8GB**):① libc::mmap 只读映射(打开 1.7s→27µs);
+  ② `loader_faces(k)` 能力钩子 + LPT 分桶 4 协程流水;③ **流式装载
+  (用户裁决:读一点装一点,主机只有"在途"份)**:WeightSource
+  `get(&[f32])`→`take(owned)`、`DeviceClient::htod_f32(Vec<f32>)`
+  所有权移入(消灭 f32→LE→f32 字节税)、SafeTensorsSource 改 mmap+
+  条目索引(0.8B 全量常驻 3.4GB 作废,visual/mtp 0.5GB 不再发生)、
+  tied 双槽按键组原子取数(转置先行、直读收尾 move)。④ **w_t 灭 + nt 直读**(抄 candle/mistral [out,in] 惯例,§四 21 修订):
+  `owl_matmul_nt_f32` 内核 + `Op::MatmulNt` 全链 + Embedding 单槽;
+  ⑤ **128MB 分块流式上传**:`write_block_f32` 原语(iface/GpuClient
+  HtodChunk/CpuFace)+ ≥64MB 张量 alloc+分块写。最终 16.7→**6.6s**,
+  峰值 6.7→**2.8GB**(含 1.7GB 可回收 mmap 页)。挂账:tokenizer
+  接入、数值基准对比 transformers/vLLM、config.json→spec 解析、
+  量化 source;
 - **M-f(图)**:decode FULL 图捕获(server graph 三原语已就绪)。
 
 ## 六、变更记录
@@ -202,3 +268,15 @@ model.norm [1024]                                    ×1(终局 norm)
 | 2026-09-25 | 垫子层:`models::kernels` 注册表(owl-kernels cu/ → 登记 → layers 按名组合);kernel 源零内嵌;owl-kernels cudarc feature 化 |
 | 2026-09-26 | **HF parity 管道落地**(crates/models:pyproject uv 项目 + src/layers/<层名>.py(就近)(common.py 复用框架)+ tests/{common/mod.rs,parity_hf.rs} 测试套件;进程边界 safetensors 交换,OWL_HF_PARITY=1 门控);首战即修文档语义:Qwen3.5 全系 norm = 零中心 ×(1+w)(含主干),"主干 ×w"作废;顺带发现 Qwen3_5RMSNormGated = M-c gdn norm 的 HF 参照 |
 | 2026-09-26 | M-b attention 层落地(narrow/naive-attn/sigmoid);四雷回溯(u32 错位/槽序/Block len/matmul 多行 k);src 重组(12 碎文件→9,client/types/shape/error→contract.rs,plan/actions→ops.rs,module/loader→module.rs,interpreter 拆 reference.rs);API 稳定化快速批:C1/C2/C3/C6/C8/C12/C13 落地(详见 roadmap.local/api-stabilize-plan.md) |
+| 2026-09-26 | **M-d2 批 8 Model 主干落地**:`src/specs/qwen35.rs`(specs/ 每档一文件;ModelSpec.hybrid_3to1 / qwen3_5_0_8b 真档预设 + Model 整模单树 C5 + 分组件 C10 装载)+ module.rs(PrefixedSource / Weight::layout_as / ForwardCtx kvs-gdns 序列 + model_decode)+ embedding tied 单源键双 Want(局部键 "w"→"weight",三处测试同步);fixture 四层 GPU 两步 vs host 1e-4 ✓;52/52;新律 §四 20/21/22 |
+
+| 2026-09-26 | **批 8 拆分**:model.rs(共有主干机制)与 specs/qwen35.rs(Qwen3.5 特有参数事实:0.8B 维度 + 3:1 层型表)分离;specs/mod.rs 立拆分律;新律 §四 23;53/53 + GPU 两步 ✓ |
+| 2026-09-26 | **批 8 拆分 + M-e 首战**:model.rs(共有主干)与 specs/qwen35.rs(Qwen3.5 参数+键名约定+load_0_8b)分离;**Want.key → String + LoaderOps::map_keys,Model 实现 Loadable 整模单清单装载(load 函数废弃,用户裁决)**;**Arc parents 修订(§四 18)**:值语义深拷贝在真 24 层下 2^24 指数爆炸(实测 48ms/层翻倍曲线),改物理 DAG 后构造/遍历/求值全线性;装载域单缓冲分块转置(§四 24);SafeTensorsSource(BF16→f32);GPU 真权重两步 decode 冒烟 ✓ 16.7s/6.7GB;新律 §四 24 |
+
+## 七 移植参考
+- 旧世界母本:`crates/engine/src/models/qwen3_5.rs`(Qwen3_5ForCausalLM:
+  new_with_prefix 前缀装载 = C10 原型;forward_inner 主干循环 = C5 原型;
+  mamba_cache/KV per-layer 分派 = ForwardCtx 序列派生原型)——
+  本 crate layers/* 与 kernels(cu/)均自此移植;
+- 旁证:`packages/xinfer/crates/core/src/models`(qwen3_5.rs 同构实现,
+  candle 命令式;结构对照用,勿引代码)

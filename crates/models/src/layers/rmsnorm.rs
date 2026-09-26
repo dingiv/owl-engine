@@ -25,6 +25,11 @@ impl RmsNorm {
         RmsNorm { w: Weight::new(key, vec![n]), eps, w_off: true }
     }
 
+    /// 装载完备性
+    pub fn is_loaded(&self) -> bool {
+        self.w.is_loaded()
+    }
+
 }
 
 impl Module for RmsNorm {

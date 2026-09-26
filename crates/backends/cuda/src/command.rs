@@ -43,6 +43,26 @@ pub enum Command {
         data: Vec<f32>,
         ack: Ack<Result<Bytes, ModelError>>,
     },
+    /// host → device **分块写入**(流式装载):向已 alloc 的块在
+    /// offset_elems 处写 data(pinned 码头 + 异步 memcpy 原位)
+    HtodChunk {
+        block: u64,
+        offset_elems: usize,
+        data: Vec<f32>,
+        ack: Ack<Result<(), ModelError>>,
+    },
+    /// 分配 pinned 租约(流式装载 DMA 源;池优先,miss 才 cudaHostAlloc)
+    AllocPinned {
+        elems: usize,
+        ack: Ack<Result<Box<dyn owl_iface::contract::PinnedRegion + Send>, ModelError>>,
+    },
+    /// 上传租约:buf 所有权移入,DMA 到 dst+offset;完成后 buf 回池
+    UploadPinned {
+        buf: Box<dyn owl_iface::contract::PinnedRegion + Send>,
+        dst: Bytes,
+        offset_elems: usize,
+        ack: Ack<Result<(), ModelError>>,
+    },
     /// device → host(异步 memcpy 到 pinned 码头;完成经 host 回调回执并转换字节)
     Dtoh {
         id: u64,

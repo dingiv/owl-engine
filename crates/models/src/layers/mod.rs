@@ -17,9 +17,13 @@
 //! - [`embedding`] / [`rope`]:Kernel 节点试水件
 //! - [`attention`]:M-b 批(qk-norm 复用 rmsnorm w_off + gate 切分/naive attn kernel)
 //! - [`gdn`]:M-c 批(GatedDeltaNet 18/24 层;批 1 gating 起逐核小步移植)
+//! - [`decoder`]:M-d 批(DecoderLayer Full/Gdn 枚举 + 双残差)
+//!
+//! 主干(批 8)在 [`crate::model`](共有机制);Qwen3.5 预设在
+//! [`crate::specs::qwen35`]。
 //!
 //! 未搬(试水通过后逐个立项,勿一把梭):
-//! DecoderLayer 编排、vision ViT、MTP、chunked prefill、量化。
+//! vision ViT、MTP、chunked prefill、量化。
 
 pub mod attention;
 pub mod decoder;

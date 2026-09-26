@@ -108,6 +108,24 @@ impl std::error::Error for ModelError {}
 /// 图身份证(server 签发;graph_end 成功后可 graph_launch 重放)
 pub type GraphId = u64;
 
+/// pinned 主机缓冲(DMA 源;流式装载租约的统一视图)
+pub trait PinnedRegion: Send {
+    fn slice_mut(&mut self) -> &mut [f32];
+    fn as_f32(&self) -> &[f32];
+}
+
+/// 堆实现(无 pinned 能力的后端;拷贝语义同旧路径)
+pub struct HeapRegion(pub Vec<f32>);
+
+impl PinnedRegion for HeapRegion {
+    fn slice_mut(&mut self) -> &mut [f32] {
+        &mut self.0
+    }
+    fn as_f32(&self) -> &[f32] {
+        &self.0
+    }
+}
+
 /// 池块句柄:server 签发的身份证(id → server 账房 → 显存)。
 #[derive(Clone, Debug)]
 pub struct Bytes {
@@ -197,4 +215,68 @@ pub trait DeviceClient: Send {
     fn launch(&mut self, msg: LaunchMsg)
         -> impl Future<Output = Result<Bytes, ModelError>> + Send;
     fn sync(&mut self) -> impl Future<Output = Result<(), ModelError>> + Send;
+
+    /// f32 直传(流式装载,2026-09-26):owned Vec<f32> **所有权移入**
+    /// —— 消费端(装载域)的数据免 f32→LE→f32 字节往返,move 进消息
+    /// 后随 server 消费消亡。默认 = LE 编码走 [`DeviceClient::htod`]
+    /// (字节世界后端零改动);eval 域的 Htod 声明仍走旧 htod。
+    fn htod_f32(
+        &mut self,
+        shape: &Shape,
+        data: Vec<f32>,
+    ) -> impl Future<Output = Result<Bytes, ModelError>> + Send {
+        async move {
+            let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+            self.htod(Dtype::F32, shape, &bytes).await
+        }
+    }
+
+    /// pinned 主机缓冲租约(流式装载的 DMA 源;转换直写 → move 上传)
+    fn alloc_pinned(
+        &mut self,
+        elems: usize,
+    ) -> impl Future<Output = Result<Box<dyn PinnedRegion + Send>, ModelError>> + Send
+    where
+        Self: Sized,
+    {
+        async move { Ok(Box::new(HeapRegion(vec![0.0f32; elems])) as _) }
+    }
+
+    /// 上传租约:buf 所有权移入,DMA/拷贝到 dst+offset_elems;
+    /// buf 由后端回收(页锁池/释放)。默认 = 不支持。
+    fn upload_pinned(
+        &mut self,
+        _buf: Box<dyn PinnedRegion + Send>,
+        _dst: &Bytes,
+        _offset_elems: usize,
+    ) -> impl Future<Output = Result<(), ModelError>> + Send
+    where
+        Self: Sized,
+    {
+        async { Err(ModelError::Msg("upload_pinned: 此后端未实现".into())) }
+    }
+
+    /// 块内分块写入(流式装载,2026-09-26):向已 alloc 的块在
+    /// offset_elems 处写入 data —— 大张量 128MB 分块流式上传的执行面,
+    /// 装载域主机在途只余单块。默认 = 不支持。
+    fn write_block_f32(
+        &mut self,
+        _dst: &Bytes,
+        _offset_elems: usize,
+        _data: &[f32],
+    ) -> impl Future<Output = Result<(), ModelError>> + Send {
+        async {
+            Err(ModelError::Msg("write_block_f32: 此后端未实现".into()))
+        }
+    }
+
+    /// 装载并发句柄(可选能力,2026-09-26 M-e loader 性能):返回 k 个
+    /// 可独立驱动的 client 句柄克隆 —— 多协程各持一个,host 侧布局变换
+    /// 与设备拷贝在 server 线程上流水重叠。默认 None = 顺序装载(单 face)。
+    fn loader_faces(&self, _k: usize) -> Option<Vec<Self>>
+    where
+        Self: Sized,
+    {
+        None
+    }
 }

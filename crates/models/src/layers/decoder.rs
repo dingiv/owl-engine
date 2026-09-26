@@ -95,6 +95,12 @@ impl DecoderLayer {
         self.hidden
     }
 
+    /// mixer 混型观测面(旧世界 is_full_attention 同款;
+    /// Model 主干按此分派 per-layer KV/GDN 缓存)
+    pub fn is_full(&self) -> bool {
+        matches!(self.mixer, TokenMixer::Full(_))
+    }
+
     /// 测试专用:分段收割(层树内 mixed / n2 / mlp_out 的声明,非公开 API)。
     #[cfg(test)]
     pub(crate) fn forward_stages<'a>(

@@ -322,6 +322,15 @@ pub(super) struct Staging {
 
 unsafe impl Send for Staging {}
 
+impl owl_iface::contract::PinnedRegion for Staging {
+    fn slice_mut(&mut self) -> &mut [f32] {
+        Staging::slice_mut(self)
+    }
+    fn as_f32(&self) -> &[f32] {
+        Staging::slice(self)
+    }
+}
+
 impl Staging {
     /// 分配 n 元素的 pinned 缓冲(未初始化)
     pub(super) fn alloc(n: usize) -> Result<Self, ModelError> {

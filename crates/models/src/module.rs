@@ -43,12 +43,18 @@ pub struct ForwardCtx<'a> {
     /// GDN 常驻状态(conv 三段 + recurrent + slots;类型住 layers::gdn,
     /// rope 反向引用同款先例)
     pub gdn: Option<&'a crate::layers::gdn::GdnBuffers>,
+    /// 整模路径(C5;批8):full 层 KV 缓存序列 —— 按 layers 数组同序
+    /// 过滤(full 层出现序)。Model::forward 按层派生单层子 ctx,
+    /// Attention/Gdn 层零感知(仍读 kv/gdn 单引用)。
+    pub kvs: Option<&'a [KvBuffers]>,
+    /// 整模路径:gdn 层常驻状态序列(gdn 层出现序)
+    pub gdns: Option<&'a [crate::layers::gdn::GdnBuffers]>,
 }
 
 impl<'a> ForwardCtx<'a> {
     /// 最小 ctx(无动态依赖;mlp/rmsnorm/linear/embedding 测试用)
     pub fn minimal(tokens: usize) -> Self {
-        Self { tokens, pos: None, kv: None, rope: None, gdn: None }
+        Self { tokens, pos: None, kv: None, rope: None, gdn: None, kvs: None, gdns: None }
     }
 
     /// decode 步 ctx(attention 全量动态依赖;gdn 置 None)
@@ -58,12 +64,32 @@ impl<'a> ForwardCtx<'a> {
         kv: &'a KvBuffers,
         rope: &'a Rope,
     ) -> Self {
-        Self { tokens, pos: Some(pos), kv: Some(kv), rope: Some(rope), gdn: None }
+        Self { tokens, pos: Some(pos), kv: Some(kv), rope: Some(rope), gdn: None, kvs: None, gdns: None }
     }
 
     /// GDN decode 步 ctx(gdn 全量;attention 依赖置 None)
     pub fn gdn_decode(tokens: usize, gdn: &'a crate::layers::gdn::GdnBuffers) -> Self {
-        Self { tokens, pos: None, kv: None, rope: None, gdn: Some(gdn) }
+        Self { tokens, pos: None, kv: None, rope: None, gdn: Some(gdn), kvs: None, gdns: None }
+    }
+
+    /// 整模 decode 步 ctx(批8):双 mixer 序列 + 共享 pos/rope;
+    /// kv/gdn 单引用置 None(由 Model::forward 按层派生)。
+    pub fn model_decode(
+        tokens: usize,
+        pos: &'a TensorOps,
+        kvs: &'a [KvBuffers],
+        rope: &'a Rope,
+        gdns: &'a [crate::layers::gdn::GdnBuffers],
+    ) -> Self {
+        Self {
+            tokens,
+            pos: Some(pos),
+            kv: None,
+            rope: Some(rope),
+            gdn: None,
+            kvs: Some(kvs),
+            gdns: Some(gdns),
+        }
     }
 }
 
@@ -101,14 +127,38 @@ pub trait Module {
 // §2 数据源:执行器的取数对象(测试 HashMap / 将来 safetensors / 层内表)
 // ============================================================================
 
-/// 权重数据源(按槽键取 host f32;层内短键,前缀归上层适配)
+/// 权重数据源(流式,2026-09-26 M-e:查键即**取走所有权** ——
+/// 数据经变换/上传后随宿主消亡,源驻留随装载单调下降,主机上永远
+/// 只有"在途"的一份;同键多 Want(tied 双槽)由装载域按键分组,
+/// 一次 take 供全组)。
 pub trait WeightSource {
-    fn get(&self, key: &str) -> Option<&[f32]>;
+    fn take(&self, key: &str) -> Option<Vec<f32>>;
+
+    /// 区间取数(流式大张量:分块转换上传,主机在途 = 单块)。
+    /// 默认 = 整取切片;流式源(mmap)覆写为按需转换区间,且
+    /// **不移除条目**(同一键的多块重复取)。
+    fn take_range(&self, key: &str, offset_elems: usize, len: usize) -> Option<Vec<f32>> {
+        self.take(key).map(|v| v[offset_elems..offset_elems + len].to_vec())
+    }
+
+    /// 分块转换**直写**目标缓冲(2026-09-26 二拷贝预算:转换这 1 次
+    /// 直达 pinned 租约,不再有中间 Vec;流式源覆写为 mmap 直解码)。
+    fn convert_chunk_into(
+        &self,
+        key: &str,
+        offset_elems: usize,
+        len: usize,
+        dst: &mut [f32],
+    ) -> Option<()> {
+        let v = self.take_range(key, offset_elems, len)?;
+        dst[..len].copy_from_slice(&v);
+        Some(())
+    }
 }
 
 impl WeightSource for std::collections::HashMap<String, Vec<f32>> {
-    fn get(&self, key: &str) -> Option<&[f32]> {
-        self.get(key).map(|v| v.as_slice())
+    fn take(&self, key: &str) -> Option<Vec<f32>> {
+        self.get(key).cloned()
     }
 }
 
@@ -124,10 +174,52 @@ impl<'a> TableSource<'a> {
 }
 
 impl WeightSource for TableSource<'_> {
-    fn get(&self, key: &str) -> Option<&[f32]> {
-        self.entries.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
+    fn take(&self, key: &str) -> Option<Vec<f32>> {
+        self.entries.iter().find(|(k, _)| *k == key).map(|(_, v)| v.to_vec())
     }
 }
+
+/// C10(2026-09-26,批 8;M-e 可插拔化):检查点键名约定 ——
+/// 层内短键 → checkpoint 全键的改写规则。Model 在 `layout()` 期经
+/// `LoaderOps::map_keys` 应用约定(声明期改写,Want 清单里已是最终键),
+/// 解释器零约定感知:
+/// - [`LlamaFamily`]:HF/Llama 系默认(`{base}.embed_tokens.weight` /
+///   `{base}.layers.{i}.{local}.weight` / `{base}.{local}.weight`);
+/// - 模型特有约定住 `specs/<model>.rs`(拆分律 §四 23),如 Qwen3.5
+///   的 `linear_attn.`/`self_attn.` 子前缀与 `A_log`/`dt_bias` 裸键。
+pub trait KeyConvention {
+    /// tied embedding:局部键(恒 "weight")→ checkpoint 全键
+    fn embed_key(&self, local: &str) -> String;
+    /// 第 i 层:局部键 → checkpoint 全键
+    fn layer_key(&self, i: usize, local: &str) -> String;
+    /// final norm:局部键(恒 "norm")→ checkpoint 全键
+    fn norm_key(&self, local: &str) -> String;
+}
+
+/// HF/Llama 系默认约定(纯前缀 + `.weight` 叶;无子前缀无裸键)
+pub struct LlamaFamily {
+    base: String,
+}
+
+impl LlamaFamily {
+    /// base = 检查点基座(多模态仓 `model.language_model`,纯文本仓 `model`)
+    pub fn new(base: impl Into<String>) -> Self {
+        Self { base: base.into() }
+    }
+}
+
+impl KeyConvention for LlamaFamily {
+    fn embed_key(&self, local: &str) -> String {
+        format!("{}.embed_tokens.{local}", self.base)
+    }
+    fn layer_key(&self, i: usize, local: &str) -> String {
+        format!("{}.layers.{i}.{local}.weight", self.base)
+    }
+    fn norm_key(&self, local: &str) -> String {
+        format!("{}.{local}.weight", self.base)
+    }
+}
+
 
 /// f32 → LE 字节(host 装载辅助;装载域唯一权威)
 pub(crate) fn f32b(v: &[f32]) -> Vec<u8> {
@@ -176,10 +268,12 @@ impl Sink {
     }
 }
 
-/// 单条数据需求(纯元数据 + 回填口)
+/// 单条数据需求(纯元数据 + 回填口)。key 为 owned:容器聚合
+    /// (Model::layout)经 map_keys 改写为 checkpoint 全键 —— 键名
+    /// 约定在声明期应用,Want 清单里已是最终键。
 #[derive(Clone)]
 pub struct Want {
-    pub key: &'static str,
+    pub key: String,
     pub dtype: Dtype,
     pub shape: Shape,
     pub layout: Layout,
@@ -204,6 +298,16 @@ impl LoaderOps {
     /// 聚合(组合层;清单顺序 = 装填顺序)
     pub fn chain(mut self, other: LoaderOps) -> Self {
         self.wants.extend(other.wants);
+        self
+    }
+
+    /// 键改写组合子(旧世界 VarBuilder.pp 的声明式对应物):容器
+    /// layout 聚合子层清单时,把局部键改写为 checkpoint 全键。
+    /// 改写后键可重复(如 tied 双 Want 同键)—— 查键取同一源条目。
+    pub fn map_keys(mut self, mut f: impl FnMut(&str) -> String) -> Self {
+        for w in &mut self.wants {
+            w.key = f(&w.key);
+        }
         self
     }
 
@@ -276,8 +380,14 @@ impl Weight {
 
     /// 装载生命周期:按语境声明需求(元数据直出 + 回填口;零 src 零数据)
     pub fn layout(&self, ctx: &LoaderCtx) -> LoaderOps {
+        self.layout_as(self.key, ctx)
+    }
+
+    /// 变键布局(tied 聚合用:lm_head 转置槽与 w 同源键直读;
+    /// Want 键不需唯一 —— 各带各的 sink,eval_want 逐条取数回填)
+    pub(crate) fn layout_as(&self, key: impl Into<String>, ctx: &LoaderCtx) -> LoaderOps {
         LoaderOps::want(Want {
-            key: self.key,
+            key: key.into(),
             dtype: ctx.dtype,
             shape: self.shape.clone(),
             layout: if self.transposed { Layout::Transposed } else { Layout::Direct },
@@ -325,9 +435,9 @@ pub async fn load_weight<D: DeviceClient, S: WeightSource + ?Sized>(
 ) -> Result<(), ModelError> {
     let key = weight.key;
 
-    // 1. 取数:容器内表没有(表走 layout 清单),数据槽直查源
+    // 1. 取数:容器内表没有(表走 layout 清单),数据槽直查源(取走所有权)
     let data = src
-        .get(key)
+        .take(key)
         .ok_or_else(|| ModelError::Msg(format!("Weight '{key}': 数据源缺键")))?;
 
     // 2. 长度校验 + 布局变换 → (装载形状, LE 字节)
@@ -350,7 +460,7 @@ pub async fn load_weight<D: DeviceClient, S: WeightSource + ?Sized>(
         }
         (weight.shape.clone(), f32b(&t))
     } else {
-        (weight.shape.clone(), f32b(data))
+        (weight.shape.clone(), f32b(&data))
     };
 
     // 3. 物化(解释层原语:htod → 块句柄)

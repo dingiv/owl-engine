@@ -53,6 +53,9 @@ pub enum Op {
     // ---- 计算节点 ----
     /// [m,k] × [k,n]
     Matmul,
+    /// [m,k] × (B 以 [n,k] 行主序直读)→ [m,n](nt = B 非转置存储;
+    /// lm_head/tied 形态:权重保持 checkpoint 原布局,免 host 转置)
+    MatmulNt,
     Add,
     /// 同形逐元素乘(MLP 门控 / 注意力输出门)
     Mul,
@@ -198,6 +201,25 @@ pub fn lower_sigmoid(ins: &[Bytes], out: &Bytes, n: usize) -> LaunchMsg {
 pub fn lower_matmul(ins: &[Bytes], out: &Bytes, m: usize, k: usize, n: usize) -> LaunchMsg {
     LaunchMsg {
         kernel: spec("owl_matmul_f32"),
+        args: vec![
+            Arg::Block { id: ins[0].id },
+            Arg::Block { id: ins[1].id },
+            Arg::Block { id: out.id },
+            Arg::I32(m as i32),
+            Arg::I32(k as i32),
+            Arg::I32(n as i32),
+        ],
+        grid: ((m as u32 + 15) / 16, (n as u32 + 15) / 16, 1),
+        block: (16, 16, 1),
+        shared_mem: 0,
+        out_elems: m * n,
+    }
+}
+
+/// nt 变体:内核按 B [n,k] 直读(见 owl_matmul_nt_f32);网格同款
+pub fn lower_matmul_nt(ins: &[Bytes], out: &Bytes, m: usize, k: usize, n: usize) -> LaunchMsg {
+    LaunchMsg {
+        kernel: spec("owl_matmul_nt_f32"),
         args: vec![
             Arg::Block { id: ins[0].id },
             Arg::Block { id: ins[1].id },

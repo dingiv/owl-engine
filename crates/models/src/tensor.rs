@@ -102,13 +102,13 @@ fn next_id() -> u64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// 张量声明值。clone = 深拷贝遍历子树(配置面一次性成本)。
+/// 张量声明值。clone = 浅拷贝(parents 为 Arc 共享,克隆 O(1))。
 #[derive(Clone)]
 pub struct TensorOps {
     /// 全局唯一 id(跨线程自增;进程级身份证)
     pub(crate) id: u64,
-    /// 反向边:本节点归约所需的全部输入(叶子为空;深拷贝子树)
-    pub(crate) parents: Vec<TensorOps>,
+    /// 反向边:本节点归约所需的全部输入(叶子为空;Arc 共享,物理 DAG)
+    pub(crate) parents: Vec<std::sync::Arc<TensorOps>>,
     /// 拓扑深度(归约排序 + 错误归因坐标)
     pub(crate) depth: u32,
     /// 语义运算
@@ -157,11 +157,15 @@ impl TensorOps {
     }
 
     /// 展平:自根收集整棵遍历子树,按深度升序(审计/烘焙的原材料)。
-    /// 值语义下子树无共享(深拷贝),朴素 DFS 即完备。
+    /// 物理共享(Arc parents,2026-09-26)下按 id 去重 —— 同节点只收一次。
     pub fn flatten(&self) -> Vec<&TensorOps> {
         let mut all = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         let mut stack = vec![self];
         while let Some(t) = stack.pop() {
+            if !seen.insert(t.id) {
+                continue;
+            }
             all.push(t);
             for p in &t.parents {
                 stack.push(p);
@@ -299,6 +303,8 @@ impl TensorOps {
     // ======================================================================
 
     /// [m,k] × [k,n] → [m,n]
+    /// nt 矩阵乘:B 以 [n, k] 行主序直读(tied lm_head:权重保持
+    /// checkpoint [vocab, hidden] 原布局,零 host 转置零第二份显存)
     pub fn matmul(&self, b: &TensorOps) -> TensorOps {
         if let Some(e) = self.shape_rule(b, "matmul", |a, b| a.last() == b.first()) {
             return self.poisoned_local(e);
@@ -308,6 +314,20 @@ impl TensorOps {
         shape[last] = b.shape.last().copied().unwrap_or(0);
         let meta = (self.dtype, shape);
         self.join(Op::Matmul, Some(b), meta, vec![])
+    }
+
+    /// nt 矩阵乘:B 以 [n, k] 行主序直读(tied lm_head:权重保持
+    /// checkpoint [vocab, hidden] 原布局,零 host 转置零第二份显存)
+    pub fn matmul_nt(&self, b: &TensorOps) -> TensorOps {
+        if let Some(e) = self.shape_rule(b, "matmul_nt", |a, b| a.last() == b.last()) {
+            return self.poisoned_local(e);
+        }
+        let mut shape = self.shape.clone();
+        let last = shape.len() - 1;
+        // nt:n = B 的**行数**(B [n,k],k = 内维 = a.last == b.last)
+        shape[last] = b.shape.first().copied().unwrap_or(0);
+        let meta = (self.dtype, shape);
+        self.join(Op::MatmulNt, Some(b), meta, vec![])
     }
 
     pub fn add(&self, b: &TensorOps) -> TensorOps {
@@ -367,7 +387,7 @@ impl TensorOps {
     /// 参数入包(张量 → 依赖 + 有序槽)
     pub fn arg(self, t: &TensorOps) -> TensorOps {
         let mut out = self;
-        out.parents.push(t.clone());
+        out.parents.push(std::sync::Arc::new(t.clone()));
         out
     }
 
@@ -419,7 +439,7 @@ impl TensorOps {
     fn poisoned_local(&self, e: LazyError) -> TensorOps {
         TensorOps {
             id: next_id(),
-            parents: vec![self.clone()],
+            parents: vec![std::sync::Arc::new(self.clone())],
             depth: self.depth + 1,
             op: Op::Zeros,
             dtype: self.dtype,
@@ -431,9 +451,9 @@ impl TensorOps {
 
     /// append:深拷贝输入子树进新节点(值语义;配置面一次性成本)
     fn join(&self, op: Op, rhs: Option<&TensorOps>, meta: (Dtype, Shape), args: Vec<KernelArg>) -> TensorOps {
-        let mut parents = vec![self.clone()];
+        let mut parents = vec![std::sync::Arc::new(self.clone())];
         if let Some(r) = rhs {
-            parents.push(r.clone());
+            parents.push(std::sync::Arc::new(r.clone()));
         }
         let err = self.err.clone().or(rhs.and_then(|r| r.err.clone()));
         let depth = parents.iter().map(|p| p.depth).max().unwrap_or(0) + 1;
@@ -675,9 +695,13 @@ mod tests {
         let s = a.silu();
         let sum = s.add(&s);
         let flat = sum.flatten();
-        assert_eq!(flat.len(), 5, "值语义:重复消费 = 子树深拷贝");
+        // 物理共享(Arc parents,2026-09-26):重复消费 = 同节点两条入边,
+        // 物理 DAG 中只存在一份,flatten 按 id 去重 → 3 个物理节点。
+        // (旧值语义下 = 深拷贝 5 节点,已随 Arc 修订作废)
+        assert_eq!(flat.len(), 3, "物理共享:重复消费去重");
         assert!(flat.windows(2).all(|w| w[0].depth() <= w[1].depth()));
         assert!(flat.iter().all(|x| !x.is_poisoned()));
+        assert_eq!(flat.last().unwrap().id, sum.id, "根(最深)在末尾");
     }
 
     #[test]
