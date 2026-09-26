@@ -17,7 +17,9 @@
 //!   错误;权威在 owl-iface,此处零语义增量)
 //!
 //! **声明面(纯描述,零执行)**
-//! - [`tensor`]:声明链 TensorOps + 毒值 LazyError + 运行时 Tensor<D>(线 B 冻结)
+//! - [`tensor`]:声明链 TensorOps + 毒值 LazyError(运行时数据 =
+//!   池块 Bytes(memo)+ reference::Value(host 锚);旧同步 Device/
+//!   Tensor<D> 面已废,唯一标准 = iface DeviceClient,2026-09-26 收束)
 //! - [`ops`]:语义 Op 枚举 + lower 动作表(具名算子 → LaunchMsg 唯一通道)
 //! - [`kernel`]:Kernel 值 + 名字→源 注册表(源码之家 = owl-kernels cu/)
 //! - [`module`]:层协议双面 —— Module/ForwardCtx(计算)+ Loadable/Weight/
@@ -27,13 +29,12 @@
 //! - [`model`]:通用解码器主干(共有机制;embed + 层链 + norm + lm_head,
 //!   整模单树 C5 + C10 装载)
 //! - [`specs`]:模型规格集(每档一文件;纯参数事实 + 键名约定,拆分律见模块头)
+//! - [`tokenizer`]:分词器(通用机制;家族事实由 specs 注入)
 //!
 //! **执行面(解释器)**
-//! - [`interpreters`]:解释器集合(计算 eval/装载 load;face 注入;变体见模块头)
+//! - [`interpreters`]:解释器集合(计算 eval/装载 load/观测 tap/生成
+//!   generate;face 注入;变体见模块头)
 //! - [`reference`]:同步参考解释器(reduce/CpuInterpreter;对拍锚,永不优化)
-//!
-//! **冻结线**
-//! - [`device`]:Device trait + Cpu 参考设备(线 B,归一另立项)
 //!
 //! 设计文档:docs/arch/async-runtime.md、docs/arch/qwen3-mini-demo.md、
 //! roadmap.local/api-stabilize-plan.md(API 稳定化挂账)。
@@ -41,7 +42,6 @@
 //! 调试:`OWL_DEBUG=1` 开启解释层发射日志(默认静默)。
 
 pub mod contract;
-pub mod device;
 pub mod interpreters;
 pub mod kernel;
 pub mod layers;
@@ -61,7 +61,7 @@ pub mod tokenizer;
 pub use contract::{DeviceClient, Dtype, ModelError, Shape};
 pub use kernel::{Kernel, LaunchShape};
 pub use module::{ForwardCtx, KvBuffers, Module};
-pub use tensor::{LazyError, Tensor, TensorOps};
+pub use tensor::{LazyError, TensorOps};
 
 /// 测试套件(就近测试的公共件;仅测试构建编译)
 #[cfg(test)]
