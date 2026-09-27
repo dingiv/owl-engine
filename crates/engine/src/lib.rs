@@ -31,6 +31,7 @@
 //! M3 模型 + DFlash2 对齐线 → M4 冲刺线。
 
 pub mod blocks;
+pub mod prefix_cache;
 pub mod engine;
 pub mod graph_plan;
 pub mod session;

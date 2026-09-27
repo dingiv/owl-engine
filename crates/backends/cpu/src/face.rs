@@ -225,6 +225,35 @@ impl DeviceClient for CpuFace {
         Ok(())
     }
 
+    /// 设备内块→块拷贝(CPU 面 = Vec 片段复制;E2c 快照通道)
+    async fn copy_block_at(
+        &mut self,
+        src: &Bytes,
+        src_off_bytes: usize,
+        dst: &Bytes,
+        dst_off_bytes: usize,
+        len_bytes: usize,
+    ) -> Result<(), ModelError> {
+        let (start, end) = {
+            let v = self.blocks.get(&src.id).ok_or(ModelError::DeadBlock { id: src.id })?;
+            let start = (src_off_bytes / 4).min(v.f32.len());
+            (start, (start + len_bytes / 4).min(v.f32.len()))
+        };
+        let piece: Vec<f32> = {
+            let v = self.blocks.get(&src.id).ok_or(ModelError::DeadBlock { id: src.id })?;
+            v.f32[start..end].to_vec()
+        };
+        let dstart = (dst_off_bytes / 4).min(
+            self.blocks.get(&dst.id).ok_or(ModelError::DeadBlock { id: dst.id })?.f32.len(),
+        );
+        let v = self
+            .blocks
+            .get_mut(&dst.id)
+            .ok_or(ModelError::DeadBlock { id: dst.id })?;
+        v.f32[dstart..dstart + piece.len()].copy_from_slice(&piece);
+        Ok(())
+    }
+
     /// 带偏移的块清零(E2b:GDN 按格重置;CPU 面 = 切片段填零)
     async fn memset_zero_at(
         &mut self,

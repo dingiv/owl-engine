@@ -154,6 +154,21 @@ impl DeviceClient for GpuClient {
         Some((0..k).map(|_| self.clone()).collect())
     }
 
+    async fn copy_block_at(
+        &mut self,
+        src: &Bytes,
+        src_off_bytes: usize,
+        dst: &Bytes,
+        dst_off_bytes: usize,
+        len_bytes: usize,
+    ) -> Result<(), ModelError> {
+        let (src, dst) = (src.id, dst.id);
+        self.submit(move |ack| {
+            Command::CopyBlock { src, src_off_bytes, dst, dst_off_bytes, len_bytes, ack }
+        })?
+        .await
+    }
+
     async fn memset_zero(&mut self, dst: &Bytes, len_bytes: usize) -> Result<(), ModelError> {
         let block = dst.id;
         self.submit(move |ack| Command::MemsetZero { block, offset_bytes: 0, len_bytes, ack })?.await

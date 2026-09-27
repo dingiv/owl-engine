@@ -96,4 +96,6 @@ pub use cudarc::driver::result::stream::launch_host_function;
 
 /// 非阻塞搬运(流序;host 侧须为 pinned)
 pub use cudarc::driver::result::{memcpy_dtoh_async, memcpy_htod_async};
+/// 设备内块→块拷贝(DtoD,流序非阻塞;E2c GDN 快照拍摄/恢复通道)
+pub use cudarc::driver::result::memcpy_dtod_async;
 

@@ -31,6 +31,7 @@ use std::sync::Arc;
 use owl_cuda::{DeviceSelector, GpuClient};
 use owl_iface::contract::{Bytes, DeviceClient, Dtype, ModelError};
 use crate::blocks::BlockManager;
+use crate::prefix_cache::PrefixCacheConfig;
 use crate::graph_plan::f32b;
 use owl_models::interpreters::{eval_ops, eval_ops_scoped};
 use owl_models::layers::gdn::GdnBuffers;
@@ -149,7 +150,13 @@ impl<D: DeviceClient> Engine<D> {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(2 * s);
         let nb = paged.then(|| pool_tokens.div_ceil(page)).unwrap_or(nb).max(nb);
-        let blocks_m = BlockManager::new(nb, page);
+        let mut blocks_m = BlockManager::new(nb, page);
+        if paged {
+            // E2c:前缀缓存启用(容量 = 池半;OWL_PREFIX_CACHE=0 关闭)
+            if std::env::var("OWL_PREFIX_CACHE").map(|v| v != "0").unwrap_or(true) {
+                blocks_m.enable_prefix_cache((nb / 2).max(1));
+            }
+        }
         let mut kvs_b: Vec<KvBlocks> = Vec::new();
         for _ in 0..n_full {
             let k_cache = zero_block_dt(&mut self.face, nb * hkv * hd * page, loaded.spec.dtype).await?;
@@ -176,6 +183,20 @@ impl<D: DeviceClient> Engine<D> {
             let conv_v = zero_block(&mut self.face, GDN_SLOTS * nv * hv * 3).await?;
             let rec = zero_block(&mut self.face, GDN_SLOTS * nv * hk * hv).await?;
             gdns_b.push(GdnBlocks { conv_q, conv_k, conv_v, rec });
+        }
+        // GDN 快照池(E2c):行宽副本 × SNAP_MAX 份;仅 paged 形态
+        let mut gdn_snaps: Vec<GdnSnapSlot> = Vec::new();
+        if paged {
+            for _ in 0..SNAP_MAX {
+                let mut bufs: Vec<BlockN> = Vec::new();
+                for _ in 0..n_gdn {
+                    bufs.push(zero_block(&mut self.face, nk * hk * 3).await?);
+                    bufs.push(zero_block(&mut self.face, nv * hv * 3).await?);
+                    bufs.push(zero_block(&mut self.face, nv * hv * 3).await?);
+                    bufs.push(zero_block(&mut self.face, nv * hk * hv).await?);
+                }
+                gdn_snaps.push(GdnSnapSlot { key: None, last_use: 0, bufs });
+            }
         }
         let kv_dt = loaded.spec.dtype;
         eprintln!(
@@ -285,6 +306,8 @@ impl<D: DeviceClient> Engine<D> {
             page,
             nb,
             blocks_m,
+            gdn_snaps,
+            snap_tick: 0u64,
             bt: bt_b,
             paged,
             x,
@@ -322,10 +345,23 @@ struct ActiveTurn {
 
 type BlockN = (Bytes, usize); // (块句柄, 元素数;重置分块写用)
 
+/// GDN 快照槽(E2c):key = 链尾物理块 id(内容身份);bufs = 逐层逐块
+/// 行宽副本(与 gdns_b 同序同构,行宽 = elems / GDN_SLOTS)。池静态
+/// 预分配,驱逐 = 换 key 覆盖写(零 alloc/free 往返)。
+struct GdnSnapSlot {
+    key: Option<u32>,
+    last_use: u64,
+    bufs: Vec<BlockN>,
+}
+
 struct KvBlocks {
     k_cache: BlockN,
     v_cache: BlockN,
 }
+
+/// GDN 快照池深度(E2c;每份 ~19.4MB 设备侧,LRU 覆盖写)。
+/// 复用边界 = 有快照的最深块边界;短于最近边界的匹配回退全量(一档取舍)。
+const SNAP_MAX: usize = 4;
 
 /// GDN 状态格容量(**与会话数绑定,与 max_seq_tokens 解耦**)。
 /// 格语义 = 每会话一格(SessionTable 分配/释放);按位分配是历史包袱:
@@ -363,6 +399,9 @@ pub struct RunningEngine<D: DeviceClient> {
     nb: usize,
     /// KV 物理块账房(E2b;块链按会话分派,池内 ref 计数)
     blocks_m: BlockManager,
+    /// GDN 快照池(E2c;键 = 链尾物理块 id,LRU 覆盖写)
+    gdn_snaps: Vec<GdnSnapSlot>,
+    snap_tick: u64,
     bt: Bytes,
     paged: bool,
     x: usize,
@@ -484,23 +523,61 @@ impl<D: DeviceClient> RunningEngine<D> {
             let Some(turn) = self.queue.pop_front() else {
                 return Ok(TurnEvent::Idle);
             };
-            let (cached_len, gdn_slot) = {
+            // E2c 复用形态:GuardHit(同会话,块链/格态原样)/
+            // PrefixHit(跨会话,块链复用 + 快照恢复)/ Fresh(全量)
+            let (cached_len, gdn_slot, prefix_key) = {
                 let s = self
                     .sessions
                     .get_mut(turn.session_id)
                     .expect("submit 已建会话账");
-                if s.guard(&turn.prompt_ids) {
-                    (s.cached_len, s.gdn_slot)
+                // ⚠️ 新会话(空账)guard 恒真 —— cached_len == 0 必须落到
+                // 前缀匹配分支(跨会话内容复用正是新会话的场景)
+                if s.guard(&turn.prompt_ids) && s.cached_len > 0 {
+                    (s.cached_len, s.gdn_slot, None)
+                } else if self.paged {
+                    // 前缀缓存匹配(先匹配后释放旧链;内容寻址 = 跨会话)
+                    let (mut m, chain) = self.blocks_m.match_prefix(&turn.prompt_ids);
+                    if std::env::var_os("OWL_DEBUG").is_some() {
+                        eprintln!("[dbg prefix] match = {m} blocks / chain = {chain:?}");
+                    }
+                    if m > 0 && m * self.page == turn.prompt_ids.len() {
+                        m -= 1; // 完全对齐保留末块重算(非空 prefill;xinfer 同语义)
+                    }
+                    while m > 0 {
+                        let key = chain[m - 1];
+                        if self.gdn_snaps.iter().any(|sl| sl.key == Some(key)) {
+                            break;
+                        }
+                        m -= 1; // 无快照的边界不可复用(GDN 态对不上)
+                    }
+                    if m > 0 {
+                        for &b in &chain[..m] {
+                            self.blocks_m.incref(b);
+                        }
+                        let mut old = std::mem::take(&mut s.block_table);
+                        self.blocks_m.release_table(&mut old);
+                        s.block_table = chain[..m].to_vec();
+                        s.reset();
+                        s.cached_len = m * self.page;
+                        (m * self.page, s.gdn_slot, Some(chain[m - 1]))
+                    } else {
+                        let mut table = std::mem::take(&mut s.block_table);
+                        self.blocks_m.release_table(&mut table);
+                        s.reset();
+                        (0, s.gdn_slot, None)
+                    }
                 } else {
-                    // S1 回退:改写历史/模板漂移 → 块链全还 + 清账,全量重算
                     let mut table = std::mem::take(&mut s.block_table);
                     self.blocks_m.release_table(&mut table);
                     s.reset();
-                    (0, s.gdn_slot)
+                    (0, s.gdn_slot, None)
                 }
             };
             if cached_len == 0 {
                 self.reset_gdn(gdn_slot).await?;
+            } else if let Some(key) = prefix_key {
+                // 前缀命中:恢复边界快照到会话格(免重灌;GDN 态对齐)
+                self.restore_gdn_snap(gdn_slot, key).await?;
             }
             // E2b:块表确保覆盖 prompt(增量 turn 块链已存,只长新增段)
             {
@@ -541,16 +618,22 @@ impl<D: DeviceClient> RunningEngine<D> {
                     Some((
                         base,
                         act.id,
+                        act.session_id,
                         chunk,
                         base + chunk >= act.prompt_ids.len(),
                         act.prompt_ids[base..base + chunk].to_vec(),
                     ))
                 }
             };
-            if let Some((base, turn_id, chunk, is_last_prompt, chunk_ids)) = plan {
+            if let Some((base, turn_id, sid, chunk, is_last_prompt, chunk_ids)) = plan {
                 let last_row = self
                     .prefill_chunk(&chunk_ids, base, is_last_prompt)
                     .await?;
+                // E2c:块边界跨越 → GDN 快照拍摄(可复用身份 = 链尾块)
+                let new_fed = base + chunk;
+                if self.paged && new_fed % self.page == 0 {
+                    self.capture_gdn_snap(sid, new_fed).await?;
+                }
                     let act = self.active.as_mut().expect("active 已保证");
                 act.fed += chunk;
                 if !is_last_prompt {
@@ -598,6 +681,13 @@ impl<D: DeviceClient> RunningEngine<D> {
         let act = self.active.as_mut().expect("active 已保证");
         act.fed += 1;
         let logits = self.session.read_output_f32("logits").await?;
+        // E2c:decode 跨页边界 → 快照拍摄(先拍再采样,同流保序)
+        {
+            let act = self.active.as_ref().expect("active 已保证");
+            if self.paged && act.fed % self.page == 0 {
+                self.capture_gdn_snap(act.session_id, act.fed).await?;
+            }
+        }
         self.sample_and_emit(logits).await
     }
 
@@ -755,6 +845,10 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 跨 turn 连续。临时会话终了即焚(表不随 turn 数无界增长)
         if let Some(s) = self.sessions.get_mut(act.session_id) {
             s.commit_turn(&act.prompt_ids, &act.out);
+            // E2c:块链登记前缀缓存(缓存持引用;会话释放后块仍驻留)
+            if self.paged {
+                self.blocks_m.cache_seq(&s.tokens, &s.block_table);
+            }
         }
         if act.ephemeral {
             // 终了即焚:块链归还账房 + 会话表移除(GDN 格随之释放)
@@ -773,6 +867,83 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 语义下,本 turn 打分的槽位全部由本 turn 写过。
     /// GDN 状态重置(turn-open;新序列零态语义)。设备侧 memset
     /// (2026-09-26 定谳:host 往返清零 1.2GB = 14s/turn,黑洞实测)
+    /// GDN 快照拍摄(E2c;块边界跨越时调用):会话格状态 → 槽位缓冲
+    /// (D2D;每层 4 块按行宽拷贝)。同 key 覆盖写;池满 LRU 换 key。
+    /// key = **边界覆盖块**(block_table[fed/page - 1],即快照边界最后
+    /// 一块的物理 id)—— 块表在 turn-open 预长满,表尾 ≠ 边界块。
+    async fn capture_gdn_snap(&mut self, sid: u64, fed: usize) -> Result<()> {
+        let (gdn_slot, key) = {
+            let s = self.sessions.get(sid).expect("账在");
+            let bi = fed / self.page - 1;
+            (
+                s.gdn_slot,
+                *s.block_table
+                    .get(bi)
+                    .ok_or_else(|| ModelError::Msg("空块链不可拍快照".into()))?,
+            )
+        };
+        let idx = match self.gdn_snaps.iter().position(|s| s.key == Some(key)) {
+            Some(i) => i,
+            None => self
+                .gdn_snaps
+                .iter()
+                .position(|s| s.key.is_none())
+                .unwrap_or_else(|| {
+                    self.gdn_snaps
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, s)| s.last_use)
+                        .map(|(i, _)| i)
+                        .expect("池非空")
+                }),
+        };
+        self.snap_tick += 1;
+        let face = self.session.face_mut();
+        for (li, g) in self.gdns_b.iter().enumerate() {
+            let quads = [
+                (&g.conv_q.0, g.conv_q.1),
+                (&g.conv_k.0, g.conv_k.1),
+                (&g.conv_v.0, g.conv_v.1),
+                (&g.rec.0, g.rec.1),
+            ];
+            for (j, (src, elems)) in quads.iter().enumerate() {
+                let row = elems / GDN_SLOTS;
+                let dst = &self.gdn_snaps[idx].bufs[li * 4 + j];
+                face.copy_block_at(src, gdn_slot * row * 4, &dst.0, 0, row * 4).await?;
+            }
+        }
+        let slot = &mut self.gdn_snaps[idx];
+        slot.key = Some(key);
+        slot.last_use = self.snap_tick;
+        Ok(())
+    }
+
+    /// GDN 快照恢复(E2c;前缀命中时调用):槽位缓冲 → 会话格(D2D
+    /// 反向)。同流保序,后续 prefill 天然在恢复态之后。
+    async fn restore_gdn_snap(&mut self, gdn_slot: usize, key: u32) -> Result<()> {
+        let idx = self
+            .gdn_snaps
+            .iter()
+            .position(|s| s.key == Some(key))
+            .ok_or_else(|| ModelError::Msg(format!("快照 {key} 已被逐出")))?;
+        self.snap_tick += 1;
+        let face = self.session.face_mut();
+        for (li, g) in self.gdns_b.iter().enumerate() {
+            let quads = [
+                (&g.conv_q.0, g.conv_q.1),
+                (&g.conv_k.0, g.conv_k.1),
+                (&g.conv_v.0, g.conv_v.1),
+                (&g.rec.0, g.rec.1),
+            ];
+            for (j, (dst, elems)) in quads.iter().enumerate() {
+                let row = elems / GDN_SLOTS;
+                let src = &self.gdn_snaps[idx].bufs[li * 4 + j];
+                face.copy_block_at(&src.0, 0, dst, gdn_slot * row * 4, row * 4).await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn reset_gdn(&mut self, gdn_slot: usize) -> Result<()> {
         // E2b:按格重置(offset = 格号 × 行字节)—— 多会话各清各格,
         // 其余格的其他会话状态不受扰
@@ -1186,6 +1357,105 @@ mod tests {
         eprintln!("[test] A2: {ta2_text}");
         assert!(!ta2_text.trim().is_empty());
         assert!(running.session_len(101).unwrap_or(0) >= a_len_1, "A 账本推进");
+    }
+
+    /// GPU 门控:前缀缓存命中(E2c 验收;REQ-PRE-04)—— 同前缀跨会话
+    /// 二轮:A 建档(块链 + 快照登记),B 同前缀 + 异尾 → 块链复用 +
+    /// 快照恢复,prefill 只算尾部。机械断言:B 的 prefill chunk 数 ≪ A;
+    /// B 块链前缀与 A 物理共享;TTFT 可测下降。
+    #[tokio::test]
+    async fn gpu_prefix_cache_hit() {
+        let Some(ordinal) = gpu_ordinal() else {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return;
+        };
+        let dir = asset_dir();
+        let mut engine = Engine::new(EngineConfig {
+            device_ordinal: ordinal,
+            max_seq_tokens: 512,
+            prefill_chunk: 32,
+        })
+        .expect("构造");
+        let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
+
+        // A:marker + filler(~320 tok,跨 ≥1 块边界 → 快照可拍)
+        let marker = "本会话暗号:「蓝鲸二十一号」。\n\n";
+        let filler = |i: usize| {
+            format!(
+                "第{i}条:观测点{i}记录到信号{i},强度{i}级,来源坐标({i},{i}),持续{i}天。\n"
+            )
+        };
+        let mut body = String::from(marker);
+        let mut i = 0usize;
+        while loaded.tokenizer.encode(&format!("{body}{}", filler(i))).len() < 300 {
+            body = format!("{body}{}", filler(i));
+            i += 1;
+        }
+        let prompt_a = format!("{body}清单结束。按约定,暗号重复一遍:暗号是「");
+        let prompt_b = format!("{body}这次换个问题:暗号里出现了什么动物?");
+        let n_a = loaded.tokenizer.encode(&prompt_a).len();
+        let n_b = loaded.tokenizer.encode(&prompt_b).len();
+        eprintln!("[test] A prompt = {n_a} tok / B prompt = {n_b} tok(前缀共享)");
+
+        let mut running = engine.run(loaded).await.expect("装配");
+        let t0 = std::time::Instant::now();
+        let (sid_a, ta1) = running.submit_session(Some(101), prompt_a.as_str(), 12).expect("A");
+        let mut a_prefill_chunks = 0usize;
+        let (mut a_ttft, mut a_text) = (None, String::new());
+        loop {
+            match running.pump().await.expect("pump") {
+                TurnEvent::Idle => panic!("A 队列丢失"),
+                TurnEvent::Prefill { turn, .. } if turn == ta1 => a_prefill_chunks += 1,
+                TurnEvent::Token { turn, .. } if turn == ta1 && a_ttft.is_none() => {
+                    a_ttft = Some(t0.elapsed());
+                }
+                TurnEvent::Completed { turn, text } if turn == ta1 => {
+                    a_text = text;
+                    break;
+                }
+                TurnEvent::Failed { turn, err } => panic!("A{turn} 失败: {err}"),
+                _ => {}
+            }
+        }
+        eprintln!("[bench] A prefill chunks = {a_prefill_chunks}, TTFT = {:?}", a_ttft.unwrap());
+        assert!(!a_text.trim().is_empty());
+
+        // B:同前缀 + 异尾(新会话;guard 必失配 → 走前缀缓存匹配)
+        let t0b = std::time::Instant::now();
+        let (_, tb1) = running.submit_session(Some(202), prompt_b.as_str(), 12).expect("B");
+        let mut b_prefill_chunks = 0usize;
+        let mut b_ttft = None;
+        loop {
+            match running.pump().await.expect("pump") {
+                TurnEvent::Idle => panic!("B 队列丢失"),
+                TurnEvent::Prefill { turn, .. } if turn == tb1 => b_prefill_chunks += 1,
+                TurnEvent::Token { turn, .. } if turn == tb1 && b_ttft.is_none() => {
+                    b_ttft = Some(t0b.elapsed());
+                }
+                TurnEvent::Completed { turn, text } if turn == tb1 => {
+                    eprintln!("[test] B 答: {text}");
+                    break;
+                }
+                TurnEvent::Failed { turn, err } => panic!("B{turn} 失败: {err}"),
+                _ => {}
+            }
+        }
+        eprintln!(
+            "[bench] B prefill chunks = {b_prefill_chunks}, TTFT = {:?}(A = {:?})",
+            b_ttft.unwrap(),
+            a_ttft.unwrap()
+        );
+
+        // 机械断言:chunk 数骤降 + 块链物理共享 + 账本各自收口
+        let a_chain = running.sessions.get(101).expect("A").block_table.clone();
+        let b_chain = running.sessions.get(202).expect("B").block_table.clone();
+        assert!(
+            b_prefill_chunks * 4 <= a_prefill_chunks.max(1),
+            "B prefill chunk 数应 ≪ A:{b_prefill_chunks} vs {a_prefill_chunks}"
+        );
+        let shared = a_chain.iter().filter(|b| b_chain.contains(b)).count();
+        assert!(shared >= 8, "前缀块应物理共享,共享 {shared}");
+        eprintln!("[test] 共享物理块 {shared}(A 链 {} / B 链 {})", a_chain.len(), b_chain.len());
     }
 
     /// 泵到目标 turn 完成,回吐全文(其间事件仅观测)

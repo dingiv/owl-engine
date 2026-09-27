@@ -13,6 +13,7 @@
 //! block_tables(块表)—— 两表均由引擎按本账房状态装配(f32 过线,
 //! 契约 5,物理槽 < 2²⁴ 恒成立)。
 
+use crate::prefix_cache::{PrefixCache, PrefixCacheConfig, PrefixCacheUpdate};
 use crate::Result;
 use owl_iface::contract::ModelError;
 use std::collections::VecDeque;
@@ -20,11 +21,15 @@ use std::collections::VecDeque;
 /// KV 物理块账房(单实例;RunningEngine 持有)
 pub struct BlockManager {
     block_size: usize,
-    /// ref_count[i] = 物理块 i 的引用数;0 = 空闲
+    /// ref_count[i] = 物理块 i 的引用数;0 = 空闲,1 = 会话独占,
+    /// ≥2 = 前缀共享(缓存持一份 + 会话各持一份)
     ref_counts: Vec<u32>,
     /// 空闲块队列(分配 = pop_front;归还 = push_back —— FIFO 复用,
     /// E2c 前缀缓存接入后换 LRU 驱逐序)
     free_block_ids: VecDeque<u32>,
+    /// 前缀缓存(E2c;Some = 启用。缓存对已登记块持一份引用 ——
+    /// 会话释放后块仍驻留,驱逐时才真正归池)
+    prefix_cache: Option<PrefixCache>,
 }
 
 impl BlockManager {
@@ -34,7 +39,72 @@ impl BlockManager {
             block_size,
             ref_counts: vec![0; num_blocks],
             free_block_ids: (0..num_blocks as u32).collect(),
+            prefix_cache: None,
         }
+    }
+
+    /// 启用前缀缓存(容量 = 缓存块数上限;默认池半)
+    pub fn enable_prefix_cache(&mut self, max_cached_blocks: usize) {
+        if self.prefix_cache.is_none() {
+            self.prefix_cache = Some(PrefixCache::new(
+                self.block_size,
+                PrefixCacheConfig { enabled: true, max_cached_blocks },
+            ));
+        }
+    }
+
+    /// 前缀匹配(E2c):prompt 的整块 token 链式哈希查询。
+    /// 返回 (匹配块数, 匹配块链物理 id —— 与块数同序同长)
+    pub fn match_prefix(&mut self, tokens: &[u32]) -> (usize, Vec<u32>) {
+        let Some(cache) = self.prefix_cache.as_mut() else {
+            return (0, Vec::new());
+        };
+        let m = cache.match_prefix(tokens);
+        let chain: Vec<u32> = m
+            .last_hash
+            .map(|h| cache.blocks_for_match(h))
+            .unwrap_or_default()
+            .iter()
+            .map(|&b| b as u32)
+            .collect();
+        (m.matched_blocks, chain)
+    }
+
+    /// 会话块链登记进缓存(turn 收口;完整块才登记)。inserted 块
+    /// 增引用(缓存持一份),evicted 块减引用(归零归池)。
+    pub fn cache_seq(&mut self, tokens: &[u32], table: &[u32]) {
+        let Some(cache) = self.prefix_cache.as_mut() else {
+            return;
+        };
+        if !cache.enabled() {
+            return;
+        }
+        let full = tokens.len() / self.block_size;
+        if full == 0 || table.len() < full {
+            return;
+        }
+        let blocks: Vec<usize> = table[..full].iter().map(|&b| b as usize).collect();
+        let PrefixCacheUpdate { inserted, evicted } = cache.insert_prefix(tokens, &blocks);
+        if std::env::var_os("OWL_DEBUG").is_some() {
+            eprintln!(
+                "[dbg prefix] cache_seq: full={} inserted={} evicted={} 表块={}",
+                full,
+                inserted.len(),
+                evicted.len(),
+                table.len()
+            );
+        }
+        for id in inserted {
+            self.incref(id as u32);
+        }
+        for id in evicted {
+            self.decref(id as u32);
+        }
+    }
+
+    /// 引用加一(前缀复用/缓存登记)
+    pub fn incref(&mut self, id: u32) {
+        self.ref_counts[id as usize] = self.ref_counts[id as usize].saturating_add(1);
     }
 
     pub fn block_size(&self) -> usize {

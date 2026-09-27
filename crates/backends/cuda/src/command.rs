@@ -90,6 +90,15 @@ pub enum Command {
         ids: Vec<u64>,
         ack: Ack<Result<(), ModelError>>,
     },
+    /// 设备内块→块拷贝(E2c 快照通道;流序非阻塞)
+    CopyBlock {
+        src: u64,
+        src_off_bytes: usize,
+        dst: u64,
+        dst_off_bytes: usize,
+        len_bytes: usize,
+        ack: Ack<Result<(), ModelError>>,
+    },
     /// kernel 发射(非阻塞;fire-and-forget)
     Launch {
         msg: LaunchMsg,

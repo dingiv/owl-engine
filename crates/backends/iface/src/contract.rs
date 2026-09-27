@@ -323,6 +323,22 @@ pub trait DeviceClient: Send {
         async { Err(ModelError::Msg("memset_zero: 此后端未实现".into())) }
     }
 
+    /// 设备内块→块拷贝(E2c:GDN 快照拍摄/恢复 —— 会话格 ↔ 快照缓冲
+    /// D2D,免 PCIe 往返;双方偏移字节口径,长度 = 拷贝字节数)。
+    /// 默认 = 不支持。
+    fn copy_block_at(
+        &mut self,
+        _src: &Bytes,
+        _src_off_bytes: usize,
+        _dst: &Bytes,
+        _dst_off_bytes: usize,
+        _len_bytes: usize,
+    ) -> impl Future<Output = Result<(), ModelError>> + Send {
+        async {
+            Err(ModelError::Msg("copy_block_at: 此后端未实现".into()))
+        }
+    }
+
     /// 带偏移的块清零(E2b:GDN 状态按格重置 —— 格 = 块内等分行,
     /// offset_bytes = 格号 × 行字节;多会话各清各格,互不踩)。默认 =
     /// 委托整块 memset_zero(offset = 0 时语义等价)

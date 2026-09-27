@@ -250,6 +250,7 @@ impl GpuServer {
             Command::UploadPinned { .. } => "UploadPinned",
             Command::Dtoh { .. } => "Dtoh",
             Command::Free { .. } => "Free",
+            Command::CopyBlock { .. } => "CopyBlock",
             Command::Sync { .. } => "Sync",
             Command::Launch { .. } => "Launch",
             Command::Close { .. } => "Close",
@@ -288,6 +289,9 @@ impl GpuServer {
             }
             Command::Dtoh { id, want_bytes, ack } => self.handle_dtoh(id, want_bytes, ack),
             Command::Free { ids, ack } => self.handle_free(ids, ack),
+            Command::CopyBlock { src, src_off_bytes, dst, dst_off_bytes, len_bytes, ack } => {
+                self.handle_copy_block(src, src_off_bytes, dst, dst_off_bytes, len_bytes, ack)
+            }
             Command::Launch { msg, ack } => self.handle_launch(msg, ack),
             Command::Sync { ack } => self.handle_sync(ack),
             Command::GraphBegin { ack } => ack.send(self.ctx_mut().graph_begin()),
@@ -320,6 +324,7 @@ impl GpuServer {
             Command::UploadPinned { ack, .. } => closed!(ack),
             Command::Dtoh { ack, .. } => closed!(ack),
             Command::Free { ack, .. } => closed!(ack),
+            Command::CopyBlock { ack, .. } => closed!(ack),
             Command::Launch { ack, .. } => closed!(ack),
             Command::Sync { ack, .. } => closed!(ack),
             Command::GraphBegin { ack, .. } => closed!(ack),
@@ -342,6 +347,7 @@ impl GpuServer {
             Command::UploadPinned { .. } => "UploadPinned",
             Command::Dtoh { .. } => "Dtoh",
             Command::Free { .. } => "Free",
+            Command::CopyBlock { .. } => "CopyBlock",
             Command::Sync { .. } => "Sync",
             Command::Launch { .. } => "Launch",
             Command::Close { .. } => "Close",
@@ -360,6 +366,7 @@ impl GpuServer {
             Command::Dtoh { ack, .. } => reject!(ack),
             Command::Sync { ack, .. } => reject!(ack),
             Command::Free { ack, .. } => reject!(ack),
+            Command::CopyBlock { ack, .. } => reject!(ack),
             Command::Launch { ack, .. } => reject!(ack),
             Command::Close { ack } => ack.send(Ok(())), // 幂等
         }
@@ -900,6 +907,37 @@ impl GpuServer {
             eprintln!("[owl-gpu] free: {}/{} 块归池", freed, ids.len());
         }
         ack.send(Ok(()));
+    }
+
+    /// 设备内块→块拷贝(E2c 快照通道;COMPUTE 流序,fire-and-forget)
+    #[allow(clippy::too_many_arguments)]
+    fn handle_copy_block(
+        &mut self,
+        src: u64,
+        src_off_bytes: usize,
+        dst: u64,
+        dst_off_bytes: usize,
+        len_bytes: usize,
+        ack: Ack<Result<(), ModelError>>,
+    ) {
+        let stream = match self.ctx().stream(STREAM_COMPUTE) {
+            Ok(s) => s.clone(),
+            Err(e) => return ack.send(Err(e)),
+        };
+        let result = (|| {
+            let (sptr, _) = self.ctx().block_ptr(src, &stream)?;
+            let (dptr, _) = self.ctx().block_ptr(dst, &stream)?;
+            unsafe {
+                crate::ffi::memcpy_dtod_async(
+                    dptr + dst_off_bytes as u64,
+                    sptr + src_off_bytes as u64,
+                    len_bytes,
+                    stream.cu_stream(),
+                )
+            }
+            .map_err(|e| ModelError::Msg(format!("copy_block: {e:?}")))
+        })();
+        ack.send(result);
     }
 
     fn handle_sync(&mut self, ack: Ack<Result<(), ModelError>>) {
