@@ -66,6 +66,8 @@ pub use tensor::{LazyError, TensorOps};
 /// 测试套件(就近测试的公共件;仅测试构建编译)
 #[cfg(test)]
 pub mod testkit;
+#[cfg(test)]
+mod port_tests;
 
 /// 本 crate 的结果别名:只用于**边界**(构造期装载 / 执行收割)。
 /// 描述层内部禁止出现(契约五)。

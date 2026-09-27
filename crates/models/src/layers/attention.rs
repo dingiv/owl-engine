@@ -28,7 +28,7 @@ use crate::kernel;
 use crate::layers::linear::Linear;
 use crate::layers::{concat_rows_hier, narrow_strided};
 use crate::layers::rmsnorm::RmsNorm;
-use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module};
+use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, KvBuffers};
 use crate::TensorOps;
 
 pub struct Attention {
@@ -102,6 +102,13 @@ impl Attention {
         // naive decode attention(slot 直排;一线程一 (t, q_head));
         // 核名/输出 dtype 跟随 q 声明(F5 整模切换;KV cache f16)
         let dt = q.dtype;
+        if let Some(pol) = crate::module::kv_paged_policy(dt) {
+            if self.hd == 128 || self.hd == 256 {
+                // paged 分派(K1):K0 写核 + v1 分页打分(vLLM classic 布局;
+                // 页/x/核名来自 kv_paged_policy,块表语义见 block_tables 头注)
+                return self.paged_decode_output(&q, &k, &v, &gate, kv, tokens, ctx, &pol);
+            }
+        }
         let attn_name = if dt == Dtype::F16 {
             "owl_naive_decode_attn_f16"
         } else {
@@ -148,7 +155,174 @@ impl Attention {
         self.o_proj.forward(&y, ctx)
     }
 
+    /// paged decode(K1;F16 hd∈{128,256}):K0 写核(本 token k/v 入池)
+    /// + v1 分页打分。物理槽 = slots 表(恒等分页下 = 逻辑 pos);
+    /// context_lens = kv_lens 表。naive 路径保留为回退(小 hd/f32 锚链)。
+    fn paged_decode_output(
+        &self,
+        q: &TensorOps,
+        k: &TensorOps,
+        v: &TensorOps,
+        gate: &TensorOps,
+        kv: &KvBuffers,
+        tokens: usize,
+        ctx: &ForwardCtx,
+        pol: &crate::module::KvPagedPolicy,
+    ) -> TensorOps {
+        let dt = q.dtype;
+        let page = pol.page as i32;
+        let x = pol.x;
+        // ① K0 写池:本 token k/v 入池(slots [T] = 物理槽表)
+        let wr = TensorOps::of(kernel::kernel_with(
+            "vllm_reshape_and_cache_f16",
+            (tokens as u32, 1, 1),
+            (256, 1, 1),
+            0,
+        ))
+        .arg(k)
+        .arg(v)
+        .arg(&kv.k_cache)
+        .arg(&kv.v_cache)
+        .arg(&kv.slots)
+        .arg_i32(self.hkv as i32 * self.hd as i32)
+        .arg_i32(self.hkv as i32 * self.hd as i32)
+        .arg_i32(self.hkv as i32)
+        .arg_i32(self.hd as i32)
+        .arg_i32(page)
+        .arg_i32(x as i32)
+        .with_shape(dt, vec![1]); // 哑输出(契约 4;双池就地写)
+        // ② v1 分页打分(不写 cache;context_lens = kv_lens)。树序依赖:
+        // 写核哑输出块接 alibi 槽(旗标 0 不解引用)⇒ 解释器先写后打分
+        let scale = 1.0 / (self.hd as f32).sqrt();
+        let nb = kv.block_tables.shape().last().cloned().unwrap_or(1);
+        // smem 由契约函数单源推导(2026-09-27 越界事故后禁手抄常量,
+        // 公式与事故记录见 paged_v1_smem / attention-kernel-port.md)
+        let v1_smem = paged_v1_smem(self.hd, nb, pol.page);
+        let y = TensorOps::of(kernel::kernel_with(
+            v1_name(self.hd),
+            (self.hq as u32, 1, 1), // grid (num_heads, num_seqs, 1)
+            (128, 1, 1),            // NUM_THREADS=128(两档同)
+            v1_smem,
+        ))
+        .arg(q)
+        .arg(&kv.k_cache)
+        .arg(&kv.v_cache)
+        .arg(&kv.block_tables)
+        .arg(&kv.kv_lens) // context_lens
+        .arg(&wr) // alibi 槽 = 写核输出块(树序依赖边;旗标 0 不解引用)
+        .arg_i32(self.hkv as i32)
+        .arg_f32(scale)
+        .arg_i32(nb as i32)
+        .arg_i32(self.hq as i32 * self.hd as i32) // q_stride
+        .arg_i32(self.hkv as i32 * self.hd as i32 * page) // kv_block_stride
+        .arg_i32(self.hd as i32 * page) // kv_head_stride
+        .arg_f32(1.0) // softscapping 直通
+        .arg_i32(-1) // sliding_window 关
+        .arg_i32(0) // use_alibi 关
+        .with_shape(dt, vec![tokens, self.hq * self.hd]);
+        // ③ 输出门(f16 融合单发)+ 出投影(与 legacy 尾巴同)
+        let n = tokens * self.hq * self.hd;
+        let y = TensorOps::of(kernel::kernel_with(
+            "owl_sigmoid_gate_mul_f16",
+            (0, 0, 0),
+            (256, 1, 1),
+            0,
+        ))
+        .arg(gate)
+        .arg(&y)
+        .arg_usize(n)
+        .with_shape(dt, vec![tokens, self.hq * self.hd]);
+        self.o_proj.forward(&y, ctx)
+    }
+
+    /// paged prefill(PF1 终;F16 hd∈{128,256}):K0 批量写池(T 行散写)
+    /// + chunked prefill 批核(bs16 特化;因果语义 = 查询 token t 看
+    /// [0, seq_start+t])。naive 逐 token 路径保留为回退。
+    fn paged_prefill_output(
+        &self,
+        q: &TensorOps,
+        k: &TensorOps,
+        v: &TensorOps,
+        gate: &TensorOps,
+        kv: &KvBuffers,
+        tokens: usize,
+        ctx: &ForwardCtx,
+        pol: &crate::module::KvPagedPolicy,
+    ) -> TensorOps {
+        let dt = q.dtype;
+        let page = pol.page as i32;
+        let x = pol.x;
+        // ① K0 批量写池(slots [T] = 物理槽表;恒等分页下 = pos)
+        let wr = TensorOps::of(kernel::kernel_with(
+            "vllm_reshape_and_cache_f16",
+            (tokens as u32, 1, 1),
+            (256, 1, 1),
+            0,
+        ))
+        .arg(k)
+        .arg(v)
+        .arg(&kv.k_cache)
+        .arg(&kv.v_cache)
+        .arg(&kv.slots)
+        .arg_i32(self.hkv as i32 * self.hd as i32)
+        .arg_i32(self.hkv as i32 * self.hd as i32)
+        .arg_i32(self.hkv as i32)
+        .arg_i32(self.hd as i32)
+        .arg_i32(page)
+        .arg_i32(x as i32)
+        .with_shape(dt, vec![1]); // 哑输出(契约 4)
+        // ② chunked prefill 批核(bs16;seq_lens [1] = kv_lens 末元;narrow 树序亦成立)
+        let seq_lens = narrow_strided(&kv.kv_lens, 1, 1, tokens - 1, 1, vec![1]);
+        let qsl: Vec<u8> = [0.0f32, tokens as f32].iter().flat_map(|f| f.to_le_bytes()).collect();
+        let scale = 1.0 / (self.hd as f32).sqrt();
+        let nb = kv.block_tables.shape().last().cloned().unwrap_or(1);
+        let y = TensorOps::of(kernel::kernel_with(
+            prefill_name(self.hd),
+            ((self.hq / self.hkv) as u32, self.hkv as u32, (tokens as u32 + 255) / 256), // grid(头注释契约)
+            (256, 1, 1),
+            (64 + 2 * self.hd * page as usize * 2) as u32, // smem = 64 + 2·HD·BLOCK·2B
+        ))
+        .arg(q)
+        .arg(&kv.k_cache)
+        .arg(&kv.v_cache)
+        .arg(&kv.block_tables)
+        .arg(&seq_lens)
+        .arg(&TensorOps::from_host(Dtype::F32, vec![2], &qsl)) // query_start_len(急切路径,from_host 合法)
+        .arg(&wr)       // alibi 槽 = 写核输出(树序依赖;旗标 0 不解引用)
+        .arg(&kv.slots) // sinks 槽(旗标 0 不解引用)
+        .arg_i32(self.hkv as i32)
+        .arg_f32(scale)
+        .arg_i32(1) // block_table_stride(单序列)
+        .arg_i32(1) // num_seqs
+        .arg_i32(self.hq as i32)
+        .arg_i32(tokens as i32)
+        .arg_f32(1.0) // softscapping 直通
+        .arg_i32(self.hq as i32 * self.hd as i32) // o_stride_tokens
+        .arg_i32(-1) // sliding_window 关
+        .arg_i32(nb as i32) // total_num_blocks
+        .arg_i32(self.hkv as i32 * self.hd as i32 * page) // kv_block_stride
+        .arg_i32(self.hd as i32 * page) // kv_head_stride
+        .arg_i32(0) // use_alibi 关
+        .arg_i32(0) // use_sinks 关
+        .with_shape(dt, vec![tokens, self.hq * self.hd]);
+        // 输出门(f16 融合单发)+ 出投影(与 legacy 同)
+        let n = tokens * self.hq * self.hd;
+        let y = TensorOps::of(kernel::kernel_with(
+            "owl_sigmoid_gate_mul_f16",
+            (0, 0, 0),
+            (256, 1, 1),
+            0,
+        ))
+        .arg(gate)
+        .arg(&y)
+        .arg_usize(n)
+        .with_shape(dt, vec![tokens, self.hq * self.hd]);
+        self.o_proj.forward(&y, ctx)
+    }
+
     /// prefill 展开声明(PF1a;批P4):投影/qk-norm/rope/gate T 批量单发
+
+
     /// (rope grid=(tokens,1,1) 逐行读 pos[t],T 就绪);唯逐 token 段 =
     /// naive_attn(写-打分同 launch 的跨 token 竞态 ⇒ 不批;槽/kv_len 取
     /// [T] 表行 t 窄视图)。语义 = T 次 decode 步(验收锚,批P4 对拍)。
@@ -183,8 +357,17 @@ impl Attention {
         let q = rope.forward_q(&q, pos, tokens, self.hq);
         let k = rope.forward_k(&k, pos, tokens, self.hkv);
 
-        // 逐 token 段:naive_attn 单发(bs=1;槽/kv_len 取表行 t 窄视图)
         let dt = q.dtype;
+        if false && dt == Dtype::F16 {
+            if let Some(pol) = crate::module::kv_paged_policy(dt) {
+                if self.hd == 128 || self.hd == 256 {
+                    // 诊断二分:prefill paged 临时关闭
+                    return self.paged_prefill_output(&q, &k, &v, &gate, kv, tokens, ctx, &pol);
+                }
+            }
+        }
+
+        // 逐 token 段:naive_attn 单发(bs=1;槽/kv_len 取表行 t 窄视图)
         let attn_name = if dt == Dtype::F16 {
             "owl_naive_decode_attn_f16"
         } else {
@@ -298,6 +481,7 @@ mod tests {
             v_cache: TensorOps::zeros(Dtype::F32, vec![4, hkv, hd]),
             slots: TensorOps::from_host(Dtype::F32, vec![tokens], &f32b(&[0.0])),
             kv_lens: TensorOps::from_host(Dtype::F32, vec![tokens], &f32b(&[1.0])),
+            block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
         };
         let ctx = crate::module::ForwardCtx::decode(tokens, &pos, &kv, &rp);
 
@@ -546,6 +730,7 @@ mod f16_tests {
             v_cache: TensorOps::of_block(vc_b.id, Dtype::F16, vec![8, hkv, hd]),
             slots: TensorOps::from_host(Dtype::F32, vec![slots.len()], &f32b(&slots)),
             kv_lens: TensorOps::from_host(Dtype::F32, vec![lens.len()], &f32b(&lens)),
+            block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
         };
 
         // 输入(f16 位型量化)
@@ -643,6 +828,7 @@ mod f16_tests {
             v_cache: TensorOps::of_block(vc_b.id, Dtype::F32, vec![8, hkv, hd]),
             slots: TensorOps::from_host(Dtype::F32, vec![slots.len()], &f32b(&slots)),
             kv_lens: TensorOps::from_host(Dtype::F32, vec![lens.len()], &f32b(&lens)),
+            block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
         };
 
         let xs_f32: Vec<f32> = (0..t_len * hidden)
@@ -826,5 +1012,55 @@ mod naive_attn_f16_tests {
         eprintln!("[naive_attn f16] max_diff = {max_diff:.5}");
         assert!(max_diff < 5e-2, "窗语义容差 5e-2,得 {max_diff}");
         gpu.close().await.expect("关机");
+    }
+}
+
+/// paged 核入口名(nvrtc 按名寻址;registry 名为 'static 字面量)
+fn v1_name(hd: usize) -> &'static str {
+    match hd {
+        128 => "vllm_paged_attention_v1_f16_hd128bs32",
+        256 => "vllm_paged_attention_v1_f16_hd256bs32",
+        _ => unreachable!("paged 分派仅在 hd∈{{128,256}} 触发"),
+    }
+}
+
+/// v1 动态 smem 唯一合法来源(契约原文 = pagedattention_f16.cu 头注):
+/// `max(ceil(max_ctx,BLOCK)·BLOCK·4B, (NUM_WARPS/2)·HD·4B)`
+/// - 第一项 = 上下文项:logits f32,核内逐上下文 token 一格;max_ctx 取
+///   块表容量 nb·page(图捕获把 smem 烘焙进图,必须按容量上限给足);
+/// - 第二项 = 固定地板(NUM_THREADS=128 → 2 warp · hd · 4B)。
+/// 2026-09-27 事故:包装层手抄地板值 2048 漏掉上下文项 → decode
+/// kv_len > 512 即 smem 越界(图回放 ILLEGAL_ADDRESS)。纪律:**发射
+/// 参数由本函数推导,禁在调用点手写 smem 常量。**
+/// 上限 ≈ ctx 12k @HD256(>48KB 需 cudaFuncSetAttribute,launcher 扩展挂账)。
+pub(crate) fn paged_v1_smem(hd: usize, nb: usize, page: usize) -> u32 {
+    let num_warps: u32 = 128 / 32; // NUM_THREADS=128(与发射 block 同源)
+    let floor = (num_warps / 2) * hd as u32 * 4;
+    (nb * page * 4).max(floor as usize) as u32
+}
+
+#[cfg(test)]
+mod smem_contract_tests {
+    use super::paged_v1_smem;
+
+    #[test]
+    fn floor_dominates_small_nb() {
+        // s=64 档(nb=2):上下文项 256B < 地板 2048B
+        assert_eq!(paged_v1_smem(256, 2, 32), 2048);
+        assert_eq!(paged_v1_smem(128, 2, 32), 1024);
+    }
+
+    #[test]
+    fn context_dominates_large_nb() {
+        // 4k 档(nb=128):上下文项 16KB > 地板 —— 事故场景回归锚
+        assert_eq!(paged_v1_smem(256, 128, 32), 128 * 32 * 4);
+        assert_eq!(paged_v1_smem(128, 128, 32), 128 * 32 * 4);
+    }
+}
+fn prefill_name(hd: usize) -> &'static str {
+    match hd {
+        128 => "vllm_chunked_prefill_paged_attn_opt_f16_hd128",
+        256 => "vllm_chunked_prefill_paged_attn_opt_f16_hd256",
+        _ => unreachable!("paged 分派仅在 hd∈{{128,256}} 触发"),
     }
 }

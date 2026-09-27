@@ -233,11 +233,39 @@ impl<'a> ForwardCtx<'a> {
 ///   **kv_lens 含本步**(kernel 先写 cache 后打分,caller 传 past+1)。
 /// (2026-09-26 C4 重组:自 layers/attention 归位协议层 —— 它是 runner
 /// 与层之间的动态依赖词汇,非层私有。)
+/// KV paged 核集策略(REQ-HW-01 表驱动;dtype → 布局/核名几何)。
+/// None = 该 KV dtype 暂无 paged 核集 → 层/引擎走 legacy 回退
+/// (naive slot 直排 + token-major 池)。新增 dtype = 补表行 +
+/// flatten 对应 vendor 模板臂(vendor 核 cache_t 本就参数化)+
+/// REGISTRY 登记,调用点零改动(operator-matrix Q0 激活域跟随者律)。
+#[derive(Clone, Copy, Debug)]
+pub struct KvPagedPolicy {
+    /// 池页大小(tokens/block;decode v1/v2 bs32 特化 + prefill 契约交集)
+    pub page: usize,
+    /// x 向量宽(elements)= 16B / sizeof(cache_t);classic 布局
+    /// `[nb, Hkv, hd/x, page, x]` 的最后一维
+    pub x: usize,
+}
+
+/// 按 KV dtype 取策略(FP8/Q4:REQ-CTX-03 预留——vendor 核模板臂已备,
+/// flatten + registry 随 KV 量化立项;bf16 同理)
+pub fn kv_paged_policy(dt: Dtype) -> Option<KvPagedPolicy> {
+    match dt {
+        // f16:16B / 2B = 8 向量宽
+        Dtype::F16 => Some(KvPagedPolicy { page: 32, x: 8 }),
+        _ => None,
+    }
+}
+
 pub struct KvBuffers {
     pub k_cache: TensorOps,
     pub v_cache: TensorOps,
     pub slots: TensorOps,
     pub kv_lens: TensorOps,
+    /// 分页块表 [num_seqs, max_blocks](f32 物理块号;classic paged 核与
+    /// 后续 FlashInfer 共用)。恒等表 = 单序列连续分配(物理块 = 逻辑块)。
+    /// naive 旧核不解引用(测试/回退路径可填哑表)。
+    pub block_tables: TensorOps,
 }
 
 /// KV 动态上下文:每步由 runner 构造。(注:decode 直排路径暂走

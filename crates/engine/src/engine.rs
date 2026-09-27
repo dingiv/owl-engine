@@ -130,19 +130,41 @@ impl<D: DeviceClient> Engine<D> {
 
         // 状态块(零初始化;GDN 段每 turn 开始重置)。
         // dtype 定盘(F5 整模切换,战役 §二):KV cache f16;GDN state 恒 f32
-        // (三方先例 + 旧世界律);slots/kv_lens f32 契约 5
+        // (三方先例 + 旧世界律);slots/kv_lens f32 契约 5。
+        // KV 布局由 kv_paged_policy(dtype) 分发(REQ-HW-01 表驱动):
+        //   Some = paged classic(kc [nb,Hkv,hd/x,page,x] / vc [nb,Hkv,hd,page];
+        //   恒等块表:物理块 = 逻辑块,物理槽 = pos);
+        //   None = legacy token-major 池 + naive 回退(层同表驱动,两边一致)
+        let pol = owl_models::module::kv_paged_policy(loaded.spec.dtype);
+        let (page, x, nb, paged) = match &pol {
+            Some(p) => (p.page, p.x, (s + p.page - 1) / p.page, true),
+            None => (s, 1usize, 1usize, false),
+        };
         let mut kvs_b: Vec<KvBlocks> = Vec::new();
         for _ in 0..n_full {
-            let k_cache = zero_block_dt(&mut self.face, s * hkv * hd, loaded.spec.dtype).await?;
-            let v_cache = zero_block_dt(&mut self.face, s * hkv * hd, loaded.spec.dtype).await?;
+            let k_cache = zero_block_dt(&mut self.face, nb * hkv * hd * page, loaded.spec.dtype).await?;
+            let v_cache = zero_block_dt(&mut self.face, nb * hkv * hd * page, loaded.spec.dtype).await?;
             kvs_b.push(KvBlocks { k_cache, v_cache });
         }
+        // 恒等块表(持久;f32 契约 5):[1, nb] = 0..nb(legacy = 哑表)
+        let bt_b = if paged {
+            let bt_data: Vec<u8> = (0..nb).flat_map(|i| (i as f32).to_le_bytes()).collect();
+            eval_ops(
+                TensorOps::from_host(Dtype::F32, vec![1, nb], &bt_data).step(),
+                &mut self.face,
+            )
+            .await?
+        } else {
+            eval_ops(TensorOps::zeros(Dtype::F32, vec![1]).step(), &mut self.face).await?
+        };
+        let bt_shape = if paged { vec![1, nb] } else { vec![1] };
+        let bt_leaf = TensorOps::of_block(bt_b.id, Dtype::F32, bt_shape.clone());
         let mut gdns_b: Vec<GdnBlocks> = Vec::new();
         for _ in 0..n_gdn {
-            let conv_q = zero_block(&mut self.face, s * nk * hk * 3).await?;
-            let conv_k = zero_block(&mut self.face, s * nv * hv * 3).await?;
-            let conv_v = zero_block(&mut self.face, s * nv * hv * 3).await?;
-            let rec = zero_block(&mut self.face, s * nv * hk * hv).await?;
+            let conv_q = zero_block(&mut self.face, GDN_SLOTS * nk * hk * 3).await?;
+            let conv_k = zero_block(&mut self.face, GDN_SLOTS * nv * hv * 3).await?;
+            let conv_v = zero_block(&mut self.face, GDN_SLOTS * nv * hv * 3).await?;
+            let rec = zero_block(&mut self.face, GDN_SLOTS * nv * hk * hv).await?;
             gdns_b.push(GdnBlocks { conv_q, conv_k, conv_v, rec });
         }
         let kv_dt = loaded.spec.dtype;
@@ -157,20 +179,23 @@ impl<D: DeviceClient> Engine<D> {
             hkv, hd, nk, hk, nv, hv,
             hidden: loaded.spec.hidden, dtype: loaded.spec.dtype,
         };
-        let kv_leaf = |b: &KvBlocks| KvBuffers {
-            k_cache: block_leaf_dt(&(b.k_cache.0), vec![s, hkv, hd], kv_dt),
-            v_cache: block_leaf_dt(&(b.v_cache.0), vec![s, hkv, hd], kv_dt),
+        let k_shape = if paged { vec![nb, hkv, hd / x, page, x] } else { vec![s, hkv, hd] };
+        let v_shape = if paged { vec![nb, hkv, hd, page] } else { vec![s, hkv, hd] };
+        let kv_leaf = |b: &KvBlocks, bt: &TensorOps| KvBuffers {
+            k_cache: block_leaf_dt(&(b.k_cache.0), k_shape.clone(), kv_dt),
+            v_cache: block_leaf_dt(&(b.v_cache.0), v_shape.clone(), kv_dt),
             slots: TensorOps::zeros(Dtype::F32, vec![1]),
             kv_lens: TensorOps::zeros(Dtype::F32, vec![1]),
+            block_tables: bt.clone(),
         };
         let gdn_leaf = |b: &GdnBlocks| GdnBuffers {
-            conv_q: block_leaf(&(b.conv_q.0), vec![s, nk * hk, 3]),
-            conv_k: block_leaf(&(b.conv_k.0), vec![s, nv * hv, 3]),
-            conv_v: block_leaf(&(b.conv_v.0), vec![s, nv * hv, 3]),
-            rec: block_leaf(&(b.rec.0), vec![s, nv, hk, hv]),
+            conv_q: block_leaf(&(b.conv_q.0), vec![GDN_SLOTS, nk * hk, 3]),
+            conv_k: block_leaf(&(b.conv_k.0), vec![GDN_SLOTS, nv * hv, 3]),
+            conv_v: block_leaf(&(b.conv_v.0), vec![GDN_SLOTS, nv * hv, 3]),
+            rec: block_leaf(&(b.rec.0), vec![GDN_SLOTS, nv, hk, hv]),
             slots: TensorOps::zeros(Dtype::F32, vec![1]),
         };
-        let kvs: Vec<KvBuffers> = kvs_b.iter().map(kv_leaf).collect();
+        let kvs: Vec<KvBuffers> = kvs_b.iter().map(|b| kv_leaf(b, &bt_leaf)).collect();
         let gdns: Vec<GdnBuffers> = gdns_b.iter().map(gdn_leaf).collect();
 
         // Session 闭包:槽 → 整模单树(状态句柄捕获;模型 Arc 共享)。
@@ -194,6 +219,7 @@ impl<D: DeviceClient> Engine<D> {
                     v_cache: kv.v_cache.clone(),
                     slots: kv_slot.clone(),
                     kv_lens: kv_len.clone(),
+                    block_tables: kv.block_tables.clone(),
                 })
                 .collect();
             let gdns_step: Vec<GdnBuffers> = gdns
@@ -246,6 +272,11 @@ impl<D: DeviceClient> Engine<D> {
             model: loaded.model,
             rope: loaded.rope,
             dims,
+            page,
+            nb,
+            bt: bt_b,
+            paged,
+            x,
         })
     }
 }
@@ -283,6 +314,12 @@ struct KvBlocks {
     v_cache: BlockN,
 }
 
+/// GDN 状态格容量(**与会话数绑定,与 max_seq_tokens 解耦**)。
+/// 格语义 = 每会话一格,现役恒 slot 0(单会话);按位分配是历史包袱:
+/// s=4096 时 rec(1 MiB/格/层 × 18 层)将达 72 GB,而真实需求 = 格数。
+/// 4 = M2 多会话预留(需求并发 ≤8 的下取);将来提升为 EngineConfig 字段。
+const GDN_SLOTS: usize = 4;
+
 struct GdnBlocks {
     conv_q: BlockN,
     conv_k: BlockN,
@@ -308,6 +345,32 @@ pub struct RunningEngine<D: DeviceClient> {
     model: Arc<Model>,
     rope: Rope,
     dims: ModelDims,
+    /// paged 池几何(页;块数)+ 恒等块表(E1 接线;legacy 模式 page=nb=1)
+    page: usize,
+    nb: usize,
+    bt: Bytes,
+    paged: bool,
+    x: usize,
+}
+
+impl<D: DeviceClient> RunningEngine<D> {
+    /// KV 池形状(模式相关;与层分派同源策略)
+    fn k_shape(&self) -> Vec<usize> {
+        let d = &self.dims;
+        if self.paged {
+            vec![self.nb, d.hkv, d.hd / self.x, self.page, self.x]
+        } else {
+            vec![self.nb, d.hkv, d.hd] // legacy:nb=1,page=容量
+        }
+    }
+    fn v_shape(&self) -> Vec<usize> {
+        let d = &self.dims;
+        if self.paged {
+            vec![self.nb, d.hkv, d.hd, self.page]
+        } else {
+            vec![self.nb, d.hkv, d.hd]
+        }
+    }
 }
 
 /// prefill 块构造所需维度账(run 期从 spec 提取;Copy 免 Clone 传播)
@@ -442,12 +505,9 @@ impl<D: DeviceClient> RunningEngine<D> {
                 } else {
                     let base = act.fed;
                     let remaining = act.prompt_ids.len() - base;
-                    // 块长:配置块长 ∩ 剩余 ∩ 窗约束(块内 kv_len 峰值
-                    // base+chunk ≤ OWL_MAX_KV=256,attention 窗寄存器上限)
-                    let chunk = remaining
-                        .min(self.cfg.prefill_chunk)
-                        .min(256usize.saturating_sub(base))
-                        .max(1);
+                    // 块长:配置块长 ∩ 剩余(E1 paged 核后无 256 窗钳制;
+                    // 全局注意力语义,长 ctx 安全)
+                    let chunk = remaining.min(self.cfg.prefill_chunk).max(1);
                     Some((
                         base,
                         act.id,
@@ -528,7 +588,6 @@ impl<D: DeviceClient> RunningEngine<D> {
         is_last: bool,
     ) -> Result<Option<Vec<f32>>> {
         let d = self.dims;
-        let s = self.cfg.max_seq_tokens;
         let t = ids.len();
         let f32seq = |start: usize, n: usize| -> Vec<u8> {
             (0..n)
@@ -539,20 +598,21 @@ impl<D: DeviceClient> RunningEngine<D> {
             .kvs_b
             .iter()
             .map(|b| KvBuffers {
-                k_cache: block_leaf_dt(&b.k_cache.0, vec![s, d.hkv, d.hd], d.dtype),
-                v_cache: block_leaf_dt(&b.v_cache.0, vec![s, d.hkv, d.hd], d.dtype),
+                k_cache: block_leaf_dt(&b.k_cache.0, self.k_shape(), d.dtype),
+                v_cache: block_leaf_dt(&b.v_cache.0, self.v_shape(), d.dtype),
                 slots: TensorOps::from_host(Dtype::F32, vec![t], &f32seq(base, t)),
                 kv_lens: TensorOps::from_host(Dtype::F32, vec![t], &f32seq(base + 1, t)),
+                block_tables: TensorOps::of_block(self.bt.id, Dtype::F32, vec![1, self.nb]),
             })
             .collect();
         let gdns_step: Vec<GdnBuffers> = self
             .gdns_b
             .iter()
             .map(|g| GdnBuffers {
-                conv_q: block_leaf(&g.conv_q.0, vec![s, d.nk * d.hk, 3]),
-                conv_k: block_leaf(&g.conv_k.0, vec![s, d.nv * d.hv, 3]),
-                conv_v: block_leaf(&g.conv_v.0, vec![s, d.nv * d.hv, 3]),
-                rec: block_leaf(&g.rec.0, vec![s, d.nv, d.hk, d.hv]),
+                conv_q: block_leaf(&g.conv_q.0, vec![GDN_SLOTS, d.nk * d.hk, 3]),
+                conv_k: block_leaf(&g.conv_k.0, vec![GDN_SLOTS, d.nv * d.hv, 3]),
+                conv_v: block_leaf(&g.conv_v.0, vec![GDN_SLOTS, d.nv * d.hv, 3]),
+                rec: block_leaf(&g.rec.0, vec![GDN_SLOTS, d.nv, d.hk, d.hv]),
                 slots: TensorOps::from_host(Dtype::F32, vec![1], &f32seq(0, 1)),
             })
             .collect();
@@ -662,7 +722,8 @@ impl<D: DeviceClient> RunningEngine<D> {
 /// 单层 16M 元素),debug 循环烧掉 ~90s(F5-4 同款 debug 转换税);池
 /// alloc 无零保证,必须显式 memset(F5-4 已去 fill(0),不能省)
 async fn zero_block_dt<D: DeviceClient>(face: &mut D, n: usize, dt: Dtype) -> Result<BlockN> {
-    let esz = if dt == Dtype::F16 { 2 } else { 4 };
+    // 2B 激活域显式臂(BF16 曾落 else 按 4B 误解释 —— dtype 表驱动律)
+    let esz = if matches!(dt, Dtype::F16 | Dtype::BF16) { 2 } else { 4 };
     let b = face.alloc(dt, n).await?;
     face.memset_zero(&b, n * esz).await?;
     Ok((b, n))
@@ -670,7 +731,7 @@ async fn zero_block_dt<D: DeviceClient>(face: &mut D, n: usize, dt: Dtype) -> Re
 
 fn block_leaf_dt(b: &Bytes, shape: Vec<usize>, dt: Dtype) -> TensorOps {
     match dt {
-        Dtype::F16 => TensorOps::of_block(b.id, Dtype::F16, shape),
+        Dtype::F16 | Dtype::BF16 => TensorOps::of_block(b.id, dt, shape),
         _ => TensorOps::of_block(b.id, Dtype::F32, shape),
     }
 }
@@ -870,6 +931,122 @@ mod tests {
         // 属 S3 金标验收,此处不断言文本内容
         let cached = running.session_len(sid).expect("账在");
         assert!(cached > 0, "同会话收口后账本非零");
+    }
+
+    /// GPU 门控:4k 长 ctx 前缀记忆 QA(E1 收尾 P4)—— 暗号埋在 prompt
+    /// 开头(≈token 10),问题压在 ≈3900 token 处;真全局注意力下应召回,
+    /// 旧 OWL_MAX_KV=256 滑窗截断下物理不可过(暗号在窗外)。兼验收:
+    /// 4k 预算守卫、分页 prefill 百级 chunk、v1 decode 长程、同会话
+    /// turn2(前缀失配回退全量路径 @4k)。
+    #[tokio::test]
+    async fn gpu_longctx_4k_prefix_qa() {
+        let Some(ordinal) = gpu_ordinal() else {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return;
+        };
+        let dir = asset_dir();
+        let seq: usize = std::env::var("OWL_E2E_SEQ")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4096);
+        let mut engine = Engine::new(EngineConfig {
+            device_ordinal: ordinal,
+            max_seq_tokens: seq,
+            prefill_chunk: 32,
+        })
+        .expect("构造");
+        let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
+
+        // 组装:暗号开头 + 中性填充 + 补全式探针收尾(裸 LM 无 chat 模板,
+        // 问答式会退化成文本续写 —— 探针改为让模型续写暗号本体)
+        let marker = "本会话暗号:「蓝鲸二十一号」。\n\n";
+        let question = "\n\n清单结束。按约定,暗号重复一遍:暗号是「";
+        let filler = |i: usize| {
+            format!(
+                "第{i}条:观测点{i}记录到信号{i},强度{i}级,来源坐标({i},{i}),持续{i}天。\n"
+            )
+        };
+        let mut body = String::from(marker);
+        let mut i = 0usize;
+        let nofill = std::env::var_os("OWL_E2E_NOFILL").is_some();
+        loop {
+            if nofill {
+                break; // 对照实验:短 ctx 直问(验模型/模板,不验长程)
+            }
+            let cand = format!("{body}{}", filler(i));
+            let full = format!("{cand}{question}");
+            if loaded.tokenizer.encode(&full).len() + 32 > seq {
+                break; // 留 32 token 生成余量(turn2 预算同享)
+            }
+            body = cand;
+            i += 1;
+        }
+        let prompt_t1 = format!("{body}{question}");
+        let n_tok = loaded.tokenizer.encode(&prompt_t1).len();
+        eprintln!("[test] 长 ctx prompt = {n_tok} tok(填充 {i} 条)");
+        assert!(
+            nofill || n_tok > seq * 4 / 5,
+            "长文应填满窗口 ≥80%,得 {n_tok}/{seq}"
+        );
+
+        let mut running = engine.run(loaded).await.expect("装配");
+        let t0 = std::time::Instant::now();
+        let (sid, t1) = running
+            .submit_session(Some(7), prompt_t1.as_str(), 16)
+            .expect("t1 应在 4k 预算内");
+        assert_eq!(sid, 7);
+        let mut ttft = None;
+        let mut prefill_last = None;
+        let text1;
+        loop {
+            match running.pump().await.expect("pump") {
+                TurnEvent::Idle => panic!("turn {t1} 队列丢失"),
+                TurnEvent::Prefill { turn, fed, total } if turn == t1 => {
+                    if fed % (32 * 16) == 0 || fed == total {
+                        eprintln!("[ev] t{t1} prefill {fed}/{total} @ {:?}", t0.elapsed());
+                    }
+                    prefill_last = Some((fed, total, t0.elapsed()));
+                }
+                TurnEvent::Token { turn, .. } if turn == t1 && ttft.is_none() => {
+                    ttft = Some(t0.elapsed());
+                }
+                TurnEvent::Completed { turn, text } if turn == t1 => {
+                    text1 = text;
+                    break;
+                }
+                TurnEvent::Failed { turn, err } => panic!("t{turn} 失败: {err}"),
+                _ => {}
+            }
+        }
+        let wall1 = t0.elapsed();
+        if let Some((fed, total, el)) = prefill_last {
+            eprintln!(
+                "[bench] t{t1} prefill {fed}/{total} tok @ {el:?}({:.0} tok/s,debug) | TTFT {:?} | 总 {:?}",
+                fed as f64 / el.as_secs_f64(),
+                ttft.unwrap(),
+                wall1
+            );
+        }
+        eprintln!("[test] t{t1} 答: {text1}");
+        // 记忆质量金标挂 S3(0.8B + greedy + 裸模板的答句质量不可靠;
+        // 对照实验:短/长 ctx 行为一致 ⇒ 机械等价)。此处验收 =
+        // 4k 全链不崩 + 帐本收口 + 计时(v1 smem 越界已修,见上)
+        assert!(!text1.trim().is_empty(), "t{t1} 产出非空");
+
+        // turn2 同会话再问(前缀失配 → 回退全量路径)。⚠️ 仅 ≤1024 开:
+        // server 中间块现无回收(eval 全保留),4k 双 turn 累计 ~24GB
+        // OOM —— 即 E2 块分配器 + Free 路线的立项动机(量化在案)
+        if seq <= 1024 {
+            let (_, t2) = running
+                .submit_session(Some(sid), format!("{body}再重复一遍:暗号是「"), 16)
+                .expect("t2 应在预算内");
+            let t0b = std::time::Instant::now();
+            let text2 = drive_turn(&mut running, t2).await;
+            eprintln!("[bench] t{t2} 全量回退重灌 + 生成 @ {:?}", t0b.elapsed());
+            eprintln!("[test] t{t2} 答: {text2}");
+            assert!(!text2.trim().is_empty(), "t{t2} 产出非空");
+            assert!(running.session_len(sid).unwrap_or(0) >= n_tok, "账本收口");
+        }
     }
 
     /// 泵到目标 turn 完成,回吐全文(其间事件仅观测)

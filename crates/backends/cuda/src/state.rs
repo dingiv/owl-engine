@@ -81,6 +81,9 @@ pub(super) struct GpuCtx {
     /// 块账房:id → (块, 元素数)
     blocks: HashMap<u64, (Block, usize)>,
     next_block: u64,
+    /// 动态 smem 每块上限(CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK
+    /// _OPTIN;发射前硬顶守卫,超限结构化拒绝 —— 2026-09-27 v1 smem 事故)
+    smem_optin: usize,
 }
 
 /// 捕获会话:目标流 + 切块 slab + 发射计数(空窗哨兵用)
@@ -105,6 +108,12 @@ impl GpuCtx {
         // G0 护栏:关 event-tracking(坑 A)。多流 + event tracking 会让
         // safe 层在块读写上插事件,污染图捕获(CAPTURE_ISOLATION/图内事件节点)
         unsafe { ctx.disable_event_tracking() };
+        // 动态 smem 每块上限(boot 查一次缓存;发射前硬顶守卫用,
+        // 不逐发射查 CUDA —— 热路径零额外调用)
+        let smem_optin = ctx
+            .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)
+            .map_err(|e| format!("查 MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: {e:?}"))?
+            as usize;
         let mut streams = HashMap::new();
         for (id, _role) in [(STREAM_H2D, "h2d"), (STREAM_COMPUTE, "compute"), (STREAM_D2H, "d2h")] {
             let s = ctx.new_stream().map_err(|e| format!("建流({_role}): {e:?}"))?;
@@ -119,7 +128,13 @@ impl GpuCtx {
             next_graph: 1,
             blocks: HashMap::new(),
             next_block: 1,
+            smem_optin,
         })
+    }
+
+    /// 动态 smem 每块上限(boot 缓存;issue_launch 硬顶守卫用)
+    pub(super) fn smem_optin(&self) -> usize {
+        self.smem_optin
     }
 
     /// 流反查(id → 流)
@@ -200,13 +215,20 @@ impl GpuCtx {
                 "graph_launch: 捕获进行中,不可回放(先 graph_end)".to_string(),
             ));
         }
-        self.stream(STREAM_COMPUTE)?;
+        let stream = self.stream(STREAM_COMPUTE)?.clone();
         self.graphs
             .get(&gid)
             .ok_or_else(|| ModelError::Msg(format!("graph_launch: 图 {gid} 不存在")))?
             .0
             .launch()
-            .map_err(|e| ModelError::Msg(format!("graph_launch({gid}): {e:?}")))
+            .map_err(|e| ModelError::Msg(format!("graph_launch({gid}): {e:?}")))?;
+        // 诊断开关(OWL_LAUNCH_SYNC=1):回放后同步归因(烘焙指针消费者)
+        if std::env::var_os("OWL_LAUNCH_SYNC").is_some() {
+            stream
+                .synchronize()
+                .map_err(|e| ModelError::Msg(format!("graph-sync({gid}): {e:?}")))?;
+        }
+        Ok(())
     }
 
     // ======================================================================
@@ -227,17 +249,23 @@ impl GpuCtx {
         let cap = self.capture.as_mut().ok_or_else(|| {
             ModelError::Msg("carve_block: 仅限捕获期(内部护栏违例)".to_string())
         })?;
-        if cap.used + n > CAPTURE_SLAB_BYTES {
+        // 256B 对齐切块:向量化核(uint4/float4 16B 访存、cublas、后续
+        // FlashInfer)要求基底对齐;旧核全标量未暴露此缺陷(2026-09-27
+        // v1 paged 核 MISALIGNED_ADDRESS 定谳)。无对齐需求的 2B 哑块也
+        // 不会破坏后续块基底。
+        const CARVE_ALIGN: usize = 256;
+        let used = cap.used.div_ceil(CARVE_ALIGN) * CARVE_ALIGN;
+        if used + n > CAPTURE_SLAB_BYTES {
             return Err(ModelError::Msg(format!(
-                "捕获 slab 耗尽:已用 {} + 需 {n} > {}(提高 CAPTURE_SLAB_BYTES)",
-                cap.used,
+                "捕获 slab 耗尽:已用 {} + 对齐后需 {n} > {}(提高 CAPTURE_SLAB_BYTES)",
+                used,
                 CAPTURE_SLAB_BYTES
             )));
         }
         let id = self.next_block;
         self.next_block += 1;
-        let (off, slab) = (cap.used, cap.slab.clone());
-        cap.used += n;
+        let (off, slab) = (used, cap.slab.clone());
+        cap.used = used + n;
         self.blocks.insert(id, (Block::Carved { slab, off, n }, n));
         Ok(id)
     }

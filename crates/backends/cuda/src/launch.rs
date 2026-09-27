@@ -57,6 +57,19 @@ pub(super) fn issue_launch(
     // 2. 懒编译(缓存命中直返)
     let func = kernels.ensure_kernel(&ctx.ctx, &msg.kernel.name, &msg.kernel.source)?;
 
+    // 2.5 硬顶守卫:动态 smem 超设备 opt-in 上限 → 结构化拒绝(提前到
+    // 发射前,而非驱动层泛化 INVALID_VALUE)。开销 = 一次字段比较
+    // (~ns;boot 时查一次设备属性缓存,不逐发射调 CUDA)。decode 热路径
+    // 走图回放不经此处;捕获期发射会被本守卫覆盖一次。上 artifact:
+    // >48KB 需 cudaFuncSetAttribute 通道(launcher 扩展挂账)。
+    if msg.shared_mem as usize > ctx.smem_optin() {
+        return Err(ModelError::Msg(format!(
+            "launch({}): 动态 smem {}B 超设备 opt-in 上限 {}B —— \
+             检查 smem 契约推导;>48KB 走 cudaFuncSetAttribute 通道(挂账)",
+            msg.kernel.name, msg.shared_mem, ctx.smem_optin()
+        )));
+    }
+
     // 3. 发射(非阻塞:提交进流即返回)
     unsafe {
         let mut builder = stream.launch_builder(&func);

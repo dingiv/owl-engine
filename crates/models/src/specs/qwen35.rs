@@ -265,12 +265,17 @@ mod tests {
         let (kvs_n, gdns_n) = (6usize, 18usize);
         let mut mk_kvs = Vec::new();
         let mut mk_gdns = Vec::new();
+        let bt_data: Vec<u8> = [0.0f32].iter().flat_map(|f| f.to_le_bytes()).collect();
+        let bt0 = crate::interpreters::eval_ops(
+            TensorOps::from_host(Dtype::F32, vec![1, 1], &bt_data).step(), &mut gpu)
+            .await.expect("恒等块表");
         for _ in 0..kvs_n {
             mk_kvs.push(KvBuffers {
-                k_cache: zero_block_f16(&mut gpu, SLOTS * 2 * 256, vec![SLOTS, 2, 256]).await,
-                v_cache: zero_block_f16(&mut gpu, SLOTS * 2 * 256, vec![SLOTS, 2, 256]).await,
+                k_cache: zero_block_f16(&mut gpu, 2 * 256 * 32, vec![1, 2, 256 / 8, 32, 8]).await,
+                v_cache: zero_block_f16(&mut gpu, 2 * 256 * 32, vec![1, 2, 256, 32]).await,
                 slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
                 kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0])),
+                block_tables: TensorOps::of_block(bt0.id, Dtype::F32, vec![1, 1]),
             });
         }
         for _ in 0..gdns_n {
@@ -323,6 +328,7 @@ mod tests {
                     v_cache: kv.v_cache.clone(),
                     slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot])),
                     kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[kv_len])),
+                    block_tables: kv.block_tables.clone(),
                 })
                 .collect();
             let gdns_step: Vec<GdnBuffers> = gdns
@@ -576,14 +582,21 @@ mod tests {
         async fn mk(
             gpu: &mut owl_cuda::GpuClient, slots_n: usize, hd: usize, hkv: usize,
         ) -> (Vec<KvBuffers>, Vec<GdnBuffers>) {
-            let kv_len = slots_n * hkv * hd;
+            // paged 布局(页 32 = 层分派契约;恒等块表)
+            let nb = (slots_n + 31) / 32;
+            let kv_len = nb * hkv * hd * 32;
+            let bt_data: Vec<u8> = (0..nb).flat_map(|i| (i as f32).to_le_bytes()).collect();
+            let bt = crate::interpreters::eval_ops(
+                TensorOps::from_host(Dtype::F32, vec![1, nb], &bt_data).step(), gpu)
+                .await.expect("恒等块表");
             let mut kvs = Vec::new();
             for _ in 0..6 {
                 kvs.push(KvBuffers {
-                    k_cache: zero_block_f16(gpu, kv_len, vec![slots_n, hkv, hd]).await,
-                    v_cache: zero_block_f16(gpu, kv_len, vec![slots_n, hkv, hd]).await,
+                    k_cache: zero_block_f16(gpu, kv_len, vec![nb, hkv, hd / 8, 32, 8]).await,
+                    v_cache: zero_block_f16(gpu, kv_len, vec![nb, hkv, hd, 32]).await,
                     slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
                     kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0])),
+                    block_tables: TensorOps::of_block(bt.id, Dtype::F32, vec![1, nb]),
                 });
             }
             let mut gdns = Vec::new();
@@ -617,6 +630,7 @@ mod tests {
                     v_cache: kv.v_cache.clone(),
                     slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32])),
                     kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32 + 1.0])),
+                    block_tables: kv.block_tables.clone(),
                 })
                 .collect();
             let gdns_step: Vec<GdnBuffers> = gdns_ref
@@ -684,6 +698,7 @@ mod tests {
                     v_cache: kv.v_cache.clone(),
                     slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32])),
                     kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32 + 1.0])),
+                    block_tables: kv.block_tables.clone(),
                 })
                 .collect();
             let gdns_step: Vec<GdnBuffers> = gdns_pre
@@ -751,15 +766,21 @@ mod tests {
         eprintln!("[smoke] rope ok; 分配常驻缓冲...");
 
         // 常驻缓冲:6 full 层 KV + 18 gdn 层状态(真维度;全零起步)
-        let kv_len = SLOTS * HKV * HD;
+        let nb = (SLOTS + 31) / 32; // paged 池(页 32 = 层分派契约)
+        let kv_len = nb * HKV * HD * 32;
+        let bt_data: Vec<u8> = (0..nb).flat_map(|i| (i as f32).to_le_bytes()).collect();
+        let bt = crate::interpreters::eval_ops(
+            TensorOps::from_host(Dtype::F32, vec![1, nb], &bt_data).step(), &mut gpu)
+            .await.expect("恒等块表");
         let kvs: Vec<KvBuffers> = {
             let mut v = Vec::new();
             for _ in 0..6 {
                 v.push(KvBuffers {
-                    k_cache: zero_block(&mut gpu, kv_len, vec![SLOTS, HKV, HD]).await,
-                    v_cache: zero_block(&mut gpu, kv_len, vec![SLOTS, HKV, HD]).await,
+                    k_cache: zero_block(&mut gpu, kv_len, vec![nb, HKV, HD / 8, 32, 8]).await,
+                    v_cache: zero_block(&mut gpu, kv_len, vec![nb, HKV, HD, 32]).await,
                     slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
                     kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0])),
+                    block_tables: TensorOps::of_block(bt.id, Dtype::F32, vec![1, nb]),
                 });
             }
             v
@@ -793,6 +814,7 @@ mod tests {
                     v_cache: kv.v_cache.clone(),
                     slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot])),
                     kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[kv_len])),
+                    block_tables: kv.block_tables.clone(),
                 })
                 .collect();
             let gdns_step: Vec<GdnBuffers> = gdns

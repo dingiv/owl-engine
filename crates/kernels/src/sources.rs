@@ -20,6 +20,17 @@ pub mod owl {
     pub const SIGMOID_GATE_MUL_F16: &str = include_str!("../cu/owl/sigmoid_gate_mul_f16.cu");
 }
 
+/// attention port 家族(K0 起步;vendor attention.rs rev c0f19f2,Apache-2.0,
+/// 文件级复用 + f16 特化;出处与适配认领见各 .cu 头注)
+pub mod attention {
+    /// KV cache 散写(vLLM classic 布局;K1/K2 paged_attention 同款布局)
+    pub const RESHAPE_AND_CACHE_F16: &str = include_str!("../cu/attention/reshape_and_cache.cu");
+    /// paged attention decode 家族(v1 / v2 分片 / v2 reduce;K1/K2)
+    pub const PAGED_ATTENTION_F16: &str = include_str!("../cu/attention/pagedattention_f16.cu");
+    /// chunked prefill paged attention(在线 softmax + 滑窗;smem tile)
+    pub const PREFILL_PAGED_ATTN_F16: &str = include_str!("../cu/attention/prefill_paged_attn_f16.cu");
+}
+
 /// 文本主干 kernel(models layers 消费)
 pub mod text {
     /// embedding 查表

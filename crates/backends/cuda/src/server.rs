@@ -387,6 +387,14 @@ impl GpuServer {
                 stream
                     .memset_zeros(&mut slice)
                     .map_err(|e| ModelError::Msg(format!("alloc memset: {e:?}")))?;
+                // 诊断开关(OWL_LAUNCH_SYNC=1):alloc/memset 后同步归因
+                if std::env::var_os("OWL_LAUNCH_SYNC").is_some() {
+                    if let Err(e) = stream.synchronize() {
+                        return Err(ModelError::Msg(format!(
+                            "alloc-sync(n={n_bytes}): {e:?}"
+                        )));
+                    }
+                }
                 Ok(Bytes::new(self.ctx_mut().new_block(slice), elems))
             });
         ack.send(result);
@@ -461,6 +469,13 @@ impl GpuServer {
         // 池块容量 ≥ 请求:DMA 长度必须截到 n(越界写设备块 = INVALID_VALUE)
         unsafe { memcpy_htod_async(dptr, &buf.as_bytes()[..n], stream.cu_stream()) }
             .map_err(|e| ModelError::Msg(format!("htod async: {e:?}")))?;
+        // 诊断开关(OWL_LAUNCH_SYNC=1):DMA 后同步归因(H2D 错误平时
+        // 无条件 Ok 回执,sticky 晚冒 —— 2026-09-27 排查补)
+        if std::env::var_os("OWL_LAUNCH_SYNC").is_some() {
+            stream
+                .synchronize()
+                .map_err(|e| ModelError::Msg(format!("htod-sync(n={n}): {e:?}")))?;
+        }
         Ok((id, buf))
     }
 
@@ -674,9 +689,22 @@ impl GpuServer {
         // 数据正确性由同流硬件保序保证;GPU 侧错误 sticky 延迟暴露
         // (在下次 dtoh/sync 收割)。不挂 host 回调 —— decode 百级 launch
         // 零回调,流水线不被驱动唤醒打断,并为 CUDA Graph 捕获铺路。
+        let capturing = ctx.capture_stream();
         match issue_launch(ctx, &stream, kernels, &msg) {
             Ok(out_id) => {
                 self.ctx_mut().note_launch();
+                // 诊断开关(OWL_LAUNCH_SYNC=1):逐发射同步,sticky 错误
+                // 归属到具体核(2026-09-27 长 ctx ILLEGAL_ADDRESS 排查;
+                // 捕获期禁 sync —— 跳过,捕获正确性由哨兵③/④另保)
+                if std::env::var_os("OWL_LAUNCH_SYNC").is_some() && !capturing
+                {
+                    if let Err(e) = stream.synchronize() {
+                        return ack.take().unwrap().send(Err(ModelError::Msg(format!(
+                            "launch-sync({}): {e:?}",
+                            msg.kernel.name
+                        ))));
+                    }
+                }
                 ack.take()
                     .unwrap()
                     .send(Ok(Bytes::new(out_id, msg.out_elems)))
@@ -773,8 +801,19 @@ impl GpuServer {
             Ok(p) => p,
             Err(e) => return ack.send(Err(e)),
         };
+        let capturing = self.ctx().capture_stream();
         match blas.gemm_f16(a_ptr, b_ptr, out_ptr, m, k, n, nt) {
-            Ok(()) => ack.send(Ok(Bytes::new(blocks[2], msg.out_elems))),
+            Ok(()) => {
+                // 诊断开关(同 handle_launch;捕获期跳过)
+                if std::env::var_os("OWL_LAUNCH_SYNC").is_some() && !capturing {
+                    if let Err(e) = stream.synchronize() {
+                        return ack.send(Err(ModelError::Msg(format!(
+                            "gemm-sync(m={m},k={k},n={n},nt={nt}): {e:?}"
+                        ))));
+                    }
+                }
+                ack.send(Ok(Bytes::new(blocks[2], msg.out_elems)))
+            }
             Err(e) => ack.send(Err(ModelError::Msg(e))),
         }
     }

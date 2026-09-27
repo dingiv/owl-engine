@@ -246,6 +246,7 @@ async fn main() {
             v_cache: TensorOps::of_block(vc.id, Dtype::F32, vec![MAX_SLOTS, HKV, HD]),
             slots: TensorOps::from_host(Dtype::F32, vec![bs], &f32b(slots)),
             kv_lens: TensorOps::from_host(Dtype::F32, vec![bs], &f32b(kv_lens)),
+            block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
         };
         let xs_t = TensorOps::from_host(Dtype::F32, vec![bs, HIDDEN], &f32b(xs));
         let pos_t = TensorOps::from_host(Dtype::F32, vec![bs], &f32b(pos));

@@ -83,6 +83,7 @@ pub async fn eval_generate<D: DeviceClient>(
                 v_cache: kv.v_cache.clone(),
                 slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[pos as f32])),
                 kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[(pos + 1) as f32])),
+                block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
             })
             .collect();
         let gdns_step: Vec<GdnBuffers> = gdns

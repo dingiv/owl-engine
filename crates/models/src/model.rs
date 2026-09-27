@@ -336,6 +336,7 @@ mod tests {
                 v_cache: TensorOps::zeros(Dtype::F32, vec![KV_ROWS, HKV, HD]),
                 slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
                 kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0])),
+                block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
             })
             .collect();
         let gdns: Vec<GdnBuffers> = (0..3).map(gdn_buf).collect();
@@ -653,6 +654,7 @@ mod tests {
                     v_cache: zero_block(&mut gpu, kv_zero.len(), vec![KV_ROWS, HKV, HD]).await,
                     slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
                     kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0])),
+                    block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
                 });
             }
             v
@@ -689,6 +691,7 @@ mod tests {
                     v_cache: kv.v_cache.clone(),
                     slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot])),
                     kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[kv_len])),
+                    block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
                 })
                 .collect();
             let gdns_step: Vec<GdnBuffers> = gdns
@@ -720,6 +723,7 @@ mod tests {
                 v_cache: zero_block(gpu, kv_zero.len(), vec![KV_ROWS, HKV, HD]).await,
                 slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
                 kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0])),
+                block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
             });
         }
         let key_dim = NK * HK_DIM;
@@ -775,6 +779,7 @@ mod tests {
                     v_cache: kv.v_cache.clone(),
                     slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32])),
                     kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32 + 1.0])),
+                    block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
                 })
                 .collect();
             // 单序列语义:GDN 状态格恒 gdn_slot(=0,与 prefill 一致);

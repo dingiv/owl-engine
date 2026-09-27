@@ -129,6 +129,26 @@ pub static REGISTRY: &[Entry] = &[
     Entry { name: "owl_gdn_delta_dec_f16", source: text::GDN_F32, args: "T,T,T,T,T,T,T,sz,sz,sz,sz,sz,f32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_gdn_norm_act_f16", source: text::GDN_F32, args: "T,T,T,sz,sz,sz,f32,i32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_naive_decode_attn_f16", source: text::ATTENTION_F32, args: "T,T,T,T,T,T,T,sz,sz,sz,sz,T", dtype: crate::contract::Dtype::F16 },
+    // ---- attention port 家族(K0;vendor attention.rs rev c0f19f2,Apache-2.0;
+    //      vLLM classic 布局,K1/K2 paged_attention 同款;适配认领见 .cu 头注)----
+    Entry { name: "vllm_reshape_and_cache_f16", source: sources::attention::RESHAPE_AND_CACHE_F16, args: "T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    // prefill bs16 变体(池页 16,与 decode v1/v2 同池;hd256 = qwen3.5-0.8B 档)
+    // prefill 主条目 = bs32(vendor 契约 BLOCK∈{32,64};bs16 越契约已废)
+    Entry { name: "vllm_chunked_prefill_paged_attn_opt_f16_hd128", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "vllm_chunked_prefill_paged_attn_opt_f16_hd256", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    // ---- paged attention decode(K1/K2;vendor pagedattention.cuh + v1/v2.cu;
+    //      grid 契约显式:v1 (H, seq, 1) / v2 (H, seq, ceil(max_ctx/512)) /
+    //      reduce (H, seq, 1);block (128,1,1);shared 契约见 .cu 头注)----
+    Entry { name: "vllm_paged_attention_v1_f16_hd128bs32", source: sources::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "vllm_paged_attention_v1_f16_hd256bs32", source: sources::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "vllm_paged_attention_v2_f16_hd128bs32", source: sources::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "vllm_paged_attention_v2_f16_hd256bs32", source: sources::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "vllm_paged_attention_v2_reduce_f16_hd128", source: sources::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "vllm_paged_attention_v2_reduce_f16_hd256", source: sources::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,i32,T", dtype: crate::contract::Dtype::F16 },
+    // ---- chunked prefill paged attention(在线 softmax + 滑窗;grid 契约:
+    //      (Hq/Hkv, Hkv, ceil(tokens/256));block (256,1,1) = TOKEN_CHUNK)----
+    Entry { name: "vllm_chunked_prefill_paged_attn_opt_f16_hd128", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "vllm_chunked_prefill_paged_attn_opt_f16_hd256", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     // ---- PF1a 栈核(concat_rows;arity 8,展开路径测试锚专用)----
     Entry { name: "owl_concat_rows_f16", source: text::CONCAT_F32, args: "T,T,T,T,T,T,T,T,sz,sz,sz,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_concat_rows_f32", source: text::CONCAT_F32, args: "T,T,T,T,T,T,T,T,sz,sz,sz,T", dtype: crate::contract::Dtype::F32 },

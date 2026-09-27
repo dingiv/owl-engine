@@ -332,6 +332,7 @@ mod tests {
             v_cache: vc,
             slots: TensorOps::from_host(Dtype::F32, vec![tokens], &crate::testkit::f32b(&[0.0])),
             kv_lens: TensorOps::from_host(Dtype::F32, vec![tokens], &crate::testkit::f32b(&[1.0])),
+            block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
         };
         let pos = TensorOps::from_host(Dtype::F32, vec![tokens], &crate::testkit::f32b(&pos_v));
         let xs_t = TensorOps::from_host(Dtype::F32, vec![tokens, hidden], &crate::testkit::f32b(&xs));
