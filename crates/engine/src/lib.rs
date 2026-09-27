@@ -30,6 +30,7 @@
 //! 里程碑对齐 charter:M0 骨架 → M1 图治理最小闭环 → M2 TP2 comm →
 //! M3 模型 + DFlash2 对齐线 → M4 冲刺线。
 
+pub mod blocks;
 pub mod engine;
 pub mod graph_plan;
 pub mod session;

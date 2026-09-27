@@ -264,8 +264,8 @@ impl GpuServer {
             return match cmd {
                 Command::Launch { msg, ack } => self.handle_launch(msg, ack),
                 Command::Alloc { n_bytes, elems, ack } => self.handle_alloc(n_bytes, elems, ack),
-                Command::MemsetZero { block, len_bytes, ack } => {
-                    self.handle_memset_zero(block, len_bytes, ack)
+                Command::MemsetZero { block, offset_bytes, len_bytes, ack } => {
+                    self.handle_memset_zero(block, offset_bytes, len_bytes, ack)
                 }
                 Command::GraphEnd { ack } => ack.send(self.ctx_mut().graph_end()),
                 Command::Close { ack } => ack.send(Ok(())), // 防御性幂等回执
@@ -275,8 +275,8 @@ impl GpuServer {
 
         match cmd {
             Command::Alloc { n_bytes, elems, ack } => self.handle_alloc(n_bytes, elems, ack),
-            Command::MemsetZero { block, len_bytes, ack } => {
-                self.handle_memset_zero(block, len_bytes, ack)
+            Command::MemsetZero { block, offset_bytes, len_bytes, ack } => {
+                self.handle_memset_zero(block, offset_bytes, len_bytes, ack)
             }
             Command::Htod { data, ack } => self.handle_htod(data, ack),
             Command::HtodChunk { block, offset_bytes, data, ack } => {
@@ -410,6 +410,7 @@ impl GpuServer {
     fn handle_memset_zero(
         &mut self,
         block: u64,
+        offset_bytes: usize,
         len_bytes: usize,
         ack: Ack<Result<(), ModelError>>,
     ) {
@@ -419,8 +420,10 @@ impl GpuServer {
         };
         let result = (|| {
             let (dptr, _) = self.ctx().block_ptr(block, &stream)?;
-            unsafe { crate::ffi::memset_d8_async(dptr, 0, len_bytes, stream.cu_stream()) }
-                .map_err(|e| ModelError::Msg(format!("memset_zero: {e:?}")))
+            unsafe {
+                crate::ffi::memset_d8_async(dptr + offset_bytes as u64, 0, len_bytes, stream.cu_stream())
+            }
+            .map_err(|e| ModelError::Msg(format!("memset_zero: {e:?}")))
         })();
         ack.send(result);
     }

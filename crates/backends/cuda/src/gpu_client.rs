@@ -156,7 +156,20 @@ impl DeviceClient for GpuClient {
 
     async fn memset_zero(&mut self, dst: &Bytes, len_bytes: usize) -> Result<(), ModelError> {
         let block = dst.id;
-        self.submit(move |ack| Command::MemsetZero { block, len_bytes, ack })?.await
+        self.submit(move |ack| Command::MemsetZero { block, offset_bytes: 0, len_bytes, ack })?.await
+    }
+
+    async fn memset_zero_at(
+        &mut self,
+        dst: &Bytes,
+        offset_bytes: usize,
+        len_bytes: usize,
+    ) -> Result<(), ModelError> {
+        let block = dst.id;
+        self.submit(move |ack| {
+            Command::MemsetZero { block, offset_bytes, len_bytes, ack }
+        })?
+        .await
     }
 
     async fn htod(

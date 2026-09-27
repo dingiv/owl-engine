@@ -45,9 +45,11 @@ pub enum Command {
         data: Vec<u8>,
         ack: Ack<Result<Bytes, ModelError>>,
     },
-    /// 块清零(设备侧 memset_d8;引擎 turn-open GDN 状态重置专用)
+    /// 块清零(设备侧 memset_d8;引擎 turn-open GDN 状态重置专用;
+    /// E2b 增 offset_bytes = 按格重置,多会话各清各格)
     MemsetZero {
         block: u64,
+        offset_bytes: usize,
         len_bytes: usize,
         ack: Ack<Result<(), ModelError>>,
     },

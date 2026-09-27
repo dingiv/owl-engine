@@ -39,17 +39,29 @@ pub struct AgentSession {
     /// 已入 KV 的前缀长度(token)。KV 行 `[0, cached_len)` 为该会话
     /// 已缓存内容;下一个 turn 只 prefill `prompt[cached_len..]`
     pub cached_len: usize,
-    /// KV 槽基址(M0.5 单槽区 = 0;M2 分槽随 batching)
+    /// KV 槽基址(M0.5 遗留;E2b 真块表后由 `block_table` 取代)
     pub slot_base: usize,
     /// 会话 token 账(S1 前缀守卫的比对基准):已入 KV 的 token 原文,
     /// 顺序 = prompt 段 + 生成段;`guard()` 逐 id 比对
     pub tokens: Vec<u32>,
+    /// 物理块链(E2b 真块表):逻辑块序 → 物理块 id;块池共享,
+    /// 跨 turn 存续(会话存活期间块不归还)
+    pub block_table: Vec<u32>,
+    /// GDN 状态格号(E2b 多会话隔离;格 = 每会话一格,容量 GDN_SLOTS)
+    pub gdn_slot: usize,
 }
 
 impl AgentSession {
-    /// 新会话(零缓存起步)
-    pub fn new(id: u64, slot_base: usize) -> Self {
-        Self { id, cached_len: 0, slot_base, tokens: Vec::new() }
+    /// 新会话(零缓存起步;块表空,首次 turn 由账房分配)
+    pub fn new(id: u64, slot_base: usize, gdn_slot: usize) -> Self {
+        Self {
+            id,
+            cached_len: 0,
+            slot_base,
+            tokens: Vec::new(),
+            block_table: Vec::new(),
+            gdn_slot,
+        }
     }
 
     /// 前缀守卫(S1):客户端全量重发的 prompt,其 `[0, cached_len)` 段
@@ -59,7 +71,8 @@ impl AgentSession {
         prompt.len() >= self.cached_len && self.tokens[..self.cached_len] == prompt[..self.cached_len]
     }
 
-    /// 账本重置(前缀失配回退):清账,下个 turn 全量重算
+    /// 账本重置(前缀失配回退):清账 + 清块表(块归还由引擎调账房,
+    /// 本函数只负责账面 —— 引擎在 reset 路径调 `release_table`)
     pub fn reset(&mut self) {
         self.cached_len = 0;
         self.tokens.clear();
@@ -92,7 +105,8 @@ impl AgentSession {
     }
 }
 
-/// 会话注册表(M0.5 单活跃:注册表恒 1 项;M2 多会话分槽扩此表)
+/// 会话注册表(E2b 多会话:会话 × 块链 × GDN 格绑定;池容量策略在
+/// 引擎侧账房)
 #[derive(Default, Debug)]
 pub struct SessionTable {
     sessions: std::collections::HashMap<u64, AgentSession>,
@@ -104,20 +118,35 @@ impl SessionTable {
         Self::default()
     }
 
-    /// 取或建(首次 submit 隐式建会话;session_id = 0 起步)
-    pub fn get_or_create(&mut self, id: Option<u64>) -> (u64, &mut AgentSession) {
+    /// 取或建(首次 submit 隐式建会话;session_id = 0 起步)。
+    /// GDN 格分配 = 扫描首个未被存活会话占用的格号;格耗尽报错
+    /// (并发上限 = GDN_SLOTS,需求 ≤8 会话)
+    pub fn get_or_create(
+        &mut self,
+        id: Option<u64>,
+        gdn_slots: usize,
+    ) -> Result<(u64, &mut AgentSession)> {
         let id = id.unwrap_or_else(|| {
             let id = self.next_id;
             self.next_id += 1;
             id
         });
         let next = self.next_id;
+        let used: std::collections::HashSet<usize> =
+            self.sessions.values().map(|s| s.gdn_slot).collect();
+        let gdn_slot = (0..gdn_slots)
+            .find(|g| !used.contains(g))
+            .ok_or_else(|| {
+                owl_iface::contract::ModelError::Msg(format!(
+                    "GDN 状态格耗尽({gdn_slots} 格;会话数超并发上限)"
+                ))
+            })?;
         let s = self
             .sessions
             .entry(id)
-            .or_insert_with(|| AgentSession::new(id, 0));
+            .or_insert_with(|| AgentSession::new(id, 0, gdn_slot));
         self.next_id = next.max(id + 1);
-        (id, s)
+        Ok((id, s))
     }
 
     pub fn get(&self, id: u64) -> Option<&AgentSession> {
@@ -144,8 +173,9 @@ mod tests {
     #[test]
     fn session_delta_guard_and_commit() {
         let mut st = SessionTable::new();
-        let (id, s) = st.get_or_create(None);
+        let (id, s) = st.get_or_create(None, 8).expect("建会话");
         assert_eq!(id, 0);
+        assert_eq!(s.gdn_slot, 0, "首会话绑 0 号格");
         assert_eq!(s.cached_len, 0);
 
         // turn1:全量 10 token → 零缓存守卫恒真,全量 prefill;收口账本
@@ -188,16 +218,22 @@ mod tests {
     #[test]
     fn session_table_lifecycle() {
         let mut st = SessionTable::new();
-        let (a, _) = st.get_or_create(Some(7));
+        let (a, sa) = st.get_or_create(Some(7), 2).expect("显式 id");
         assert_eq!(a, 7, "显式 id 直取");
-        let (b, _) = st.get_or_create(None);
+        assert_eq!(sa.gdn_slot, 0);
+        let (b, sb) = st.get_or_create(None, 2).expect("自动分配");
         assert_eq!(b, 8, "自动分配递增");
+        assert_eq!(sb.gdn_slot, 1, "第二会话绑下一格");
+        // 格耗尽:两格全占后再建报错(close 前)
+        let err = st.get_or_create(None, 2).unwrap_err();
+        assert!(format!("{err}").contains("GDN 状态格耗尽"));
         assert!(st.get(7).is_some());
         st.close(7).expect("close");
         assert!(st.get(7).is_none());
         assert!(st.close(7).is_err(), "重复 close 报错");
-        // 复活:close 后同 id 重建 = 零缓存新会话
-        let (_, s) = st.get_or_create(Some(7));
+        // 复活:close 后同 id 重建 = 零缓存新会话(重新绑格)
+        let (_, s) = st.get_or_create(Some(7), 2).expect("复活");
         assert_eq!(s.cached_len, 0);
+        assert_eq!(s.gdn_slot, 0, "7 号 close 已释放 0 号格");
     }
 }

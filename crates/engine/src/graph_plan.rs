@@ -371,7 +371,7 @@ fn fallback(reason: &str) -> PlanOutcome {
     PlanOutcome::EagerFallback { reason: reason.to_string() }
 }
 
-fn f32b(v: &[f32]) -> Vec<u8> {
+pub(crate) fn f32b(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 

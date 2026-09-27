@@ -30,6 +30,8 @@ use std::sync::Arc;
 
 use owl_cuda::{DeviceSelector, GpuClient};
 use owl_iface::contract::{Bytes, DeviceClient, Dtype, ModelError};
+use crate::blocks::BlockManager;
+use crate::graph_plan::f32b;
 use owl_models::interpreters::{eval_ops, eval_ops_scoped};
 use owl_models::layers::gdn::GdnBuffers;
 use owl_models::layers::rope::Rope;
@@ -140,17 +142,25 @@ impl<D: DeviceClient> Engine<D> {
             Some(p) => (p.page, p.x, (s + p.page - 1) / p.page, true),
             None => (s, 1usize, 1usize, false),
         };
+        // E2b 块池容量:默认 = 2 × 单会话容量(两会话满载共存);
+        // OWL_POOL_TOKENS 可覆写(token 口径,向上取整到页)
+        let pool_tokens = std::env::var("OWL_POOL_TOKENS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2 * s);
+        let nb = paged.then(|| pool_tokens.div_ceil(page)).unwrap_or(nb).max(nb);
+        let blocks_m = BlockManager::new(nb, page);
         let mut kvs_b: Vec<KvBlocks> = Vec::new();
         for _ in 0..n_full {
             let k_cache = zero_block_dt(&mut self.face, nb * hkv * hd * page, loaded.spec.dtype).await?;
             let v_cache = zero_block_dt(&mut self.face, nb * hkv * hd * page, loaded.spec.dtype).await?;
             kvs_b.push(KvBlocks { k_cache, v_cache });
         }
-        // 恒等块表(持久;f32 契约 5):[1, nb] = 0..nb(legacy = 哑表)
+        // 块表持久块(E2b):内容 = 活跃会话块链,turn 切换/增长时重写
+        // (write_bt);legacy = 哑表
         let bt_b = if paged {
-            let bt_data: Vec<u8> = (0..nb).flat_map(|i| (i as f32).to_le_bytes()).collect();
             eval_ops(
-                TensorOps::from_host(Dtype::F32, vec![1, nb], &bt_data).step(),
+                TensorOps::zeros(Dtype::F32, vec![1, nb]).step(),
                 &mut self.face,
             )
             .await?
@@ -274,6 +284,7 @@ impl<D: DeviceClient> Engine<D> {
             dims,
             page,
             nb,
+            blocks_m,
             bt: bt_b,
             paged,
             x,
@@ -299,6 +310,8 @@ struct ActiveTurn {
     id: u64,
     session_id: u64,
     ephemeral: bool,
+    /// GDN 状态格号(会话绑定;多会话各清各格、各续各态)
+    gdn_slot: usize,
     prompt_ids: Vec<u32>,
     max_new: usize,
     out: Vec<u32>,
@@ -315,10 +328,10 @@ struct KvBlocks {
 }
 
 /// GDN 状态格容量(**与会话数绑定,与 max_seq_tokens 解耦**)。
-/// 格语义 = 每会话一格,现役恒 slot 0(单会话);按位分配是历史包袱:
+/// 格语义 = 每会话一格(SessionTable 分配/释放);按位分配是历史包袱:
 /// s=4096 时 rec(1 MiB/格/层 × 18 层)将达 72 GB,而真实需求 = 格数。
-/// 4 = M2 多会话预留(需求并发 ≤8 的下取);将来提升为 EngineConfig 字段。
-const GDN_SLOTS: usize = 4;
+/// 8 = 覆盖需求并发上限(§二 并发 ≤8);会话 close 即释放格号。
+const GDN_SLOTS: usize = 8;
 
 struct GdnBlocks {
     conv_q: BlockN,
@@ -348,6 +361,8 @@ pub struct RunningEngine<D: DeviceClient> {
     /// paged 池几何(页;块数)+ 恒等块表(E1 接线;legacy 模式 page=nb=1)
     page: usize,
     nb: usize,
+    /// KV 物理块账房(E2b;块链按会话分派,池内 ref 计数)
+    blocks_m: BlockManager,
     bt: Bytes,
     paged: bool,
     x: usize,
@@ -431,8 +446,8 @@ impl<D: DeviceClient> RunningEngine<D> {
             )));
         }
         let (session_id, ephemeral) = match session {
-            Some(id) => (self.sessions.get_or_create(Some(id)).0, false),
-            None => (self.sessions.get_or_create(None).0, true),
+            Some(id) => (self.sessions.get_or_create(Some(id), GDN_SLOTS)?.0, false),
+            None => (self.sessions.get_or_create(None, GDN_SLOTS)?.0, true),
         };
         let id = self.next_id;
         self.next_id += 1;
@@ -446,9 +461,12 @@ impl<D: DeviceClient> RunningEngine<D> {
         Ok((session_id, id))
     }
 
-    /// 显式关会话(客户端声明不再续;账本清票。KV 区域 M0.5 单槽区
-    /// 不回收,随 M2 分槽归还)
+    /// 显式关会话(客户端声明不再续;账本清票,块链归还账房)
     pub fn close_session(&mut self, id: u64) -> Result<()> {
+        if let Some(s) = self.sessions.get_mut(id) {
+            let mut table = std::mem::take(&mut s.block_table);
+            self.blocks_m.release_table(&mut table);
+        }
         self.sessions.close(id)
     }
 
@@ -466,26 +484,38 @@ impl<D: DeviceClient> RunningEngine<D> {
             let Some(turn) = self.queue.pop_front() else {
                 return Ok(TurnEvent::Idle);
             };
-            let cached_len = {
+            let (cached_len, gdn_slot) = {
                 let s = self
                     .sessions
                     .get_mut(turn.session_id)
                     .expect("submit 已建会话账");
                 if s.guard(&turn.prompt_ids) {
-                    s.cached_len
+                    (s.cached_len, s.gdn_slot)
                 } else {
-                    // S1 回退:改写历史/模板漂移 → 清账,全量重算
+                    // S1 回退:改写历史/模板漂移 → 块链全还 + 清账,全量重算
+                    let mut table = std::mem::take(&mut s.block_table);
+                    self.blocks_m.release_table(&mut table);
                     s.reset();
-                    0
+                    (0, s.gdn_slot)
                 }
             };
             if cached_len == 0 {
-                self.reset_gdn().await?;
+                self.reset_gdn(gdn_slot).await?;
             }
+            // E2b:块表确保覆盖 prompt(增量 turn 块链已存,只长新增段)
+            {
+                let s = self
+                    .sessions
+                    .get_mut(turn.session_id)
+                    .expect("submit 已建会话账");
+                self.blocks_m.ensure_for_len(&mut s.block_table, turn.prompt_ids.len())?;
+            }
+            self.write_bt(turn.session_id).await?;
             self.active = Some(ActiveTurn {
                 id: turn.id,
                 session_id: turn.session_id,
                 ephemeral: turn.ephemeral,
+                gdn_slot,
                 prompt_ids: turn.prompt_ids,
                 max_new: turn.spec.max_new,
                 out: Vec::new(),
@@ -537,18 +567,31 @@ impl<D: DeviceClient> RunningEngine<D> {
         }
 
         // ── 生成相位:decode 单步(捕获回放)+ 采样 ──
-        let (tid, pos) = {
-            let act = self.active.as_mut().expect("active 已保证");
+        let (sid, tid, pos) = {
+            let act = self.active.as_ref().expect("active 已保证");
             let tid = *act.out.last().expect("生成中");
-            (tid, act.fed)
+            (act.session_id, tid, act.fed)
         };
+        // E2b:物理槽 + 跨页增长(块链增长时重写持久块表)
+        let (kv_slot, gdn_slot_v, grew) = {
+            let s = self.sessions.get_mut(sid).expect("账在");
+            let before = s.block_table.len();
+            self.blocks_m.ensure_for_len(&mut s.block_table, pos + 1)?;
+            let grew = s.block_table.len() != before;
+            let page = self.page;
+            let b = s.block_table[pos / page];
+            (b * page as u32 + (pos % page) as u32, s.gdn_slot, grew)
+        };
+        if grew {
+            self.write_bt(sid).await?;
+        }
         self.session
             .step(&[
                 ("frontier", &[tid as f32]),
                 ("pos", &[pos as f32]),
                 ("kv_len", &[(pos + 1) as f32]),
-                ("kv_slot", &[pos as f32]),
-                ("gdn_slot", &[0.0]),
+                ("kv_slot", &[kv_slot as f32]),
+                ("gdn_slot", &[gdn_slot_v as f32]),
             ])
             .await?;
 
@@ -577,6 +620,18 @@ impl<D: DeviceClient> RunningEngine<D> {
         Ok(TurnEvent::Token { turn: turn_id, delta })
     }
 
+    /// 活跃会话块表 → 持久 bt 块(设备)。图烘焙的是 bt 指针,内容随
+    /// 会话切换/块链增长重写(指针稳定 = 图不重捕);f32 过线(契约 5)
+    async fn write_bt(&mut self, sid: u64) -> Result<()> {
+        let table = self.sessions.get(sid).expect("账在").block_table.clone();
+        let mut v = vec![0f32; self.nb];
+        for (i, b) in table.iter().enumerate() {
+            v[i] = *b as f32;
+        }
+        let face = self.session.face_mut();
+        face.write_block_f32(&self.bt, 0, &v).await
+    }
+
     /// 块式 prefill(W1;批P5 契约):ids [T] 从 KV 行 base 起步,
     /// 单序列语义(gdn_slot 恒 0;KV 行随 token 走)。末块走 logits 根
     /// 返回末行;中间块走 last_hidden 根(免 lm_head [T,V] 计算与大
@@ -589,6 +644,12 @@ impl<D: DeviceClient> RunningEngine<D> {
     ) -> Result<Option<Vec<f32>>> {
         let d = self.dims;
         let t = ids.len();
+        // E2b:活跃会话块链 + GDN 格(逻辑位 → 物理槽由块表换算)
+        let (bt_chain, gdn_slot_v) = {
+            let act = self.active.as_ref().expect("active 已保证");
+            let s = self.sessions.get(act.session_id).expect("账在");
+            (s.block_table.clone(), s.gdn_slot)
+        };
         let f32seq = |start: usize, n: usize| -> Vec<u8> {
             (0..n)
                 .flat_map(|i| ((start + i) as f32).to_le_bytes())
@@ -622,9 +683,21 @@ impl<D: DeviceClient> RunningEngine<D> {
             &ids.iter().flat_map(|v| (*v as f32).to_le_bytes()).collect::<Vec<u8>>(),
         );
         let pos_t = TensorOps::from_host(Dtype::F32, vec![t], &f32seq(base, t));
-        let slots_t = TensorOps::from_host(Dtype::F32, vec![t], &f32seq(base, t));
+        // E2b:slots = 物理槽(块链换算);legacy 恒等直排不变
+        let slots_t = if self.paged {
+            let page = self.page;
+            let phys: Vec<f32> = (base..base + t)
+                .map(|pos| {
+                    let b = bt_chain[pos / page];
+                    (b * page as u32 + (pos % page) as u32) as f32
+                })
+                .collect();
+            TensorOps::from_host(Dtype::F32, vec![t], &f32b(&phys))
+        } else {
+            TensorOps::from_host(Dtype::F32, vec![t], &f32seq(base, t))
+        };
         let lens_t = TensorOps::from_host(Dtype::F32, vec![t], &f32seq(base + 1, t));
-        let gdn_slot = TensorOps::from_host(Dtype::F32, vec![1], &f32seq(0, 1));
+        let gdn_slot = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[gdn_slot_v as f32]));
         let ctx = ForwardCtx::model_prefill(
             t, &pos_t, &kvs_step, &self.rope, &gdns_step, &slots_t, &lens_t, &gdn_slot,
         );
@@ -684,6 +757,11 @@ impl<D: DeviceClient> RunningEngine<D> {
             s.commit_turn(&act.prompt_ids, &act.out);
         }
         if act.ephemeral {
+            // 终了即焚:块链归还账房 + 会话表移除(GDN 格随之释放)
+            if let Some(s) = self.sessions.get_mut(act.session_id) {
+                let mut table = std::mem::take(&mut s.block_table);
+                self.blocks_m.release_table(&mut table);
+            }
             self.sessions.close(act.session_id).ok();
         }
         let text = self.tok.decode(&act.out);
@@ -695,7 +773,9 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 语义下,本 turn 打分的槽位全部由本 turn 写过。
     /// GDN 状态重置(turn-open;新序列零态语义)。设备侧 memset
     /// (2026-09-26 定谳:host 往返清零 1.2GB = 14s/turn,黑洞实测)
-    async fn reset_gdn(&mut self) -> Result<()> {
+    async fn reset_gdn(&mut self, gdn_slot: usize) -> Result<()> {
+        // E2b:按格重置(offset = 格号 × 行字节)—— 多会话各清各格,
+        // 其余格的其他会话状态不受扰
         for g in &self.gdns_b {
             let blocks = [
                 (&g.conv_q.0, g.conv_q.1),
@@ -703,10 +783,11 @@ impl<D: DeviceClient> RunningEngine<D> {
                 (&g.conv_v.0, g.conv_v.1),
                 (&g.rec.0, g.rec.1),
             ];
-            for (bn, bytes) in blocks {
+            for (bn, elems) in blocks {
+                let row = elems / GDN_SLOTS;
                 self.session
                     .face_mut()
-                    .memset_zero(bn, bytes * 4)
+                    .memset_zero_at(bn, gdn_slot * row * 4, row * 4)
                     .await?;
             }
         }
@@ -1049,6 +1130,62 @@ mod tests {
             assert!(!text2.trim().is_empty(), "t{t2} 产出非空");
             assert!(running.session_len(sid).unwrap_or(0) >= n_tok, "账本收口");
         }
+    }
+
+    /// GPU 门控:多会话隔离(E2b 验收)—— A/B 两会话交替 turn:
+    /// ① B 的 turn 前后,A 的块链/账本逐字节不受扰;② A/B 物理块互异
+    /// (无前缀缓存时零共享);③ 双会话产出非空。隔离 = 块管理器的
+    /// 直接行为证据(块链不同 ⇒ KV 物理槽不同)。
+    #[tokio::test]
+    async fn gpu_multi_session_isolation() {
+        let Some(ordinal) = gpu_ordinal() else {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return;
+        };
+        let dir = asset_dir();
+        let mut engine = Engine::new(EngineConfig {
+            device_ordinal: ordinal,
+            max_seq_tokens: 256,
+            prefill_chunk: 32,
+        })
+        .expect("构造");
+        let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
+        let mut running = engine.run(loaded).await.expect("装配");
+
+        let (_, ta1) = running
+            .submit_session(Some(101), "我的代号是阿尔法。", 12)
+            .expect("A1");
+        let ta1_text = drive_turn(&mut running, ta1).await;
+        eprintln!("[test] A1: {ta1_text}");
+        assert!(!ta1_text.trim().is_empty());
+        let a_table_1 = running.sessions.get(101).expect("A 账在").block_table.clone();
+        let a_len_1 = running.session_len(101).expect("A 账在");
+        assert!(!a_table_1.is_empty(), "A 块链非空");
+
+        let (_, tb1) = running
+            .submit_session(Some(202), "我的代号是贝塔。", 12)
+            .expect("B1");
+        let tb1_text = drive_turn(&mut running, tb1).await;
+        eprintln!("[test] B1: {tb1_text}");
+        assert!(!tb1_text.trim().is_empty());
+
+        // 隔离断言 ①:B 的 turn 后,A 的块链/账本逐字节不变
+        let a_table_2 = running.sessions.get(101).expect("A 账在").block_table.clone();
+        assert_eq!(a_table_1, a_table_2, "B 的 turn 不得扰动 A 块链");
+        assert_eq!(running.session_len(101), Some(a_len_1), "B 的 turn 不得扰动 A 账本");
+        // 隔离断言 ②:物理块零共享(无前缀缓存 = 全新分配)
+        let b_table = running.sessions.get(202).expect("B 账在").block_table.clone();
+        assert!(b_table.iter().all(|b| !a_table_2.contains(b)), "A/B 物理块互异");
+        eprintln!("[test] 块链 A = {a_table_2:?} / B = {b_table:?}");
+
+        // A 二轮(全量重发,前缀守卫失配回退全量也须稳)
+        let (_, ta2) = running
+            .submit_session(Some(101), "我的代号是阿尔法。我的代号是什么?", 12)
+            .expect("A2");
+        let ta2_text = drive_turn(&mut running, ta2).await;
+        eprintln!("[test] A2: {ta2_text}");
+        assert!(!ta2_text.trim().is_empty());
+        assert!(running.session_len(101).unwrap_or(0) >= a_len_1, "A 账本推进");
     }
 
     /// 泵到目标 turn 完成,回吐全文(其间事件仅观测)

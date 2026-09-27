@@ -225,6 +225,25 @@ impl DeviceClient for CpuFace {
         Ok(())
     }
 
+    /// 带偏移的块清零(E2b:GDN 按格重置;CPU 面 = 切片段填零)
+    async fn memset_zero_at(
+        &mut self,
+        dst: &Bytes,
+        offset_bytes: usize,
+        len_bytes: usize,
+    ) -> Result<(), ModelError> {
+        let v = self
+            .blocks
+            .get_mut(&dst.id)
+            .ok_or(ModelError::DeadBlock { id: dst.id })?;
+        let start = (offset_bytes / 4).min(v.f32.len());
+        let end = (start + len_bytes / 4).min(v.f32.len());
+        for x in v.f32[start..end].iter_mut() {
+            *x = 0.0;
+        }
+        Ok(())
+    }
+
     async fn sync(&mut self) -> Result<(), ModelError> {
         Ok(()) // CPU:无在飞操作(同步直调,天然无积压)
     }

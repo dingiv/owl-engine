@@ -323,6 +323,23 @@ pub trait DeviceClient: Send {
         async { Err(ModelError::Msg("memset_zero: 此后端未实现".into())) }
     }
 
+    /// 带偏移的块清零(E2b:GDN 状态按格重置 —— 格 = 块内等分行,
+    /// offset_bytes = 格号 × 行字节;多会话各清各格,互不踩)。默认 =
+    /// 委托整块 memset_zero(offset = 0 时语义等价)
+    fn memset_zero_at(
+        &mut self,
+        dst: &Bytes,
+        offset_bytes: usize,
+        len_bytes: usize,
+    ) -> impl Future<Output = Result<(), ModelError>> + Send {
+        async move {
+            if offset_bytes == 0 {
+                return self.memset_zero(dst, len_bytes).await;
+            }
+            Err(ModelError::Msg("memset_zero_at: 此后端未实现".into()))
+        }
+    }
+
     /// 装载并发句柄(可选能力,2026-09-26 M-e loader 性能):返回 k 个
     /// 可独立驱动的 client 句柄克隆 —— 多协程各持一个,host 侧布局变换
     /// 与设备拷贝在 server 线程上流水重叠。默认 None = 顺序装载(单 face)。
