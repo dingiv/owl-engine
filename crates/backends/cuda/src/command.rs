@@ -80,6 +80,14 @@ pub enum Command {
         want_bytes: usize,
         ack: Ack<Result<Vec<u8>, ModelError>>,
     },
+    /// 中间块回收(E2a,2026-09-27):调用方声明这批块此后不再引用 ——
+    /// 账房移除 Owned 块(CudaSlice drop → 流序 free_async 归还设备池);
+    /// Carved 块(slab 切片,图/scratch 生命周期)跳过不删。安全前提:
+    /// 调用方已在回收前收割所需数据(dtoh 回执即 COMPUTE 已排空)。
+    Free {
+        ids: Vec<u64>,
+        ack: Ack<Result<(), ModelError>>,
+    },
     /// kernel 发射(非阻塞;fire-and-forget)
     Launch {
         msg: LaunchMsg,

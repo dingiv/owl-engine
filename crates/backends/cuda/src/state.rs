@@ -301,6 +301,23 @@ impl GpuCtx {
     pub(super) fn block_len(&self, id: u64) -> Result<usize, ModelError> {
         Ok(self.blocks.get(&id).ok_or(ModelError::DeadBlock { id })?.1)
     }
+
+    /// 中间块回收(E2a):移除 Owned 块(CudaSlice drop → 流序
+    /// free_async 归还设备池);Carved 块(slab 切片)跳过不删;
+    /// 未知 id 容错跳过(幂等)。返回实际回收数。
+    pub(super) fn free_blocks(&mut self, ids: &[u64]) -> usize {
+        let mut n = 0;
+        for id in ids {
+            let owned = self
+                .blocks
+                .get(id)
+                .is_some_and(|(b, _)| matches!(b, Block::Owned(_)));
+            if owned && self.blocks.remove(id).is_some() {
+                n += 1; // drop 链 = free_async(块自身流,流序安全)
+            }
+        }
+        n
+    }
 }
 
 // ============================================================================

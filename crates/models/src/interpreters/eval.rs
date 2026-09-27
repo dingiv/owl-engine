@@ -76,8 +76,33 @@ where
 {
     Box::pin(async move {
         let mut ctx =
-            EvalCtx { face, memo: std::collections::HashMap::new(), tap: None };
-        _eval_rec(t, &mut ctx).await
+            EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new() };
+        let root = _eval_rec(t, &mut ctx).await?;
+        // 非 scoped 口径:竞技场原样丢弃(块常驻,历史行为不变)
+        Ok(root)
+    })
+}
+
+/// 带竞技场的求值(E2a,2026-09-27):返回 (根块, 中间块候选表)。
+/// 竞技场 = 本次求值新建的全部块 id(Htod/Alloc/launch 输出;CSE 去重);
+/// 候选表 = 竞技场 - 根。调用方在收割根数据后 `face.free(&candidates)`
+/// 归还设备池 —— 不再引用即焚,消除 eval 中间块零回收的线性累积
+/// (4k 双 turn ~24GB OOM 立案见 roadmap E2)。安全前提:free 前根
+/// 已 dtoh(COMPUTE 排空);图捕获期禁用(捕获块 = slab 切片)。
+pub fn eval_ops_scoped<'a, D>(
+    t: &'a TensorOps,
+    face: &'a mut D,
+) -> Pin<Box<dyn Future<Output = Result<(Bytes, Vec<u64>), ModelError>> + Send + 'a>>
+where
+    D: crate::contract::DeviceClient + 'a,
+{
+    Box::pin(async move {
+        let mut ctx =
+            EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new() };
+        let root = _eval_rec(t, &mut ctx).await?;
+        let mut candidates = std::mem::take(&mut ctx.arena);
+        candidates.retain(|id| *id != root.id);
+        Ok((root, candidates))
     })
 }
 
@@ -94,7 +119,7 @@ where
 {
     Box::pin(async move {
         let mut ctx =
-            EvalCtx { face, memo: std::collections::HashMap::new(), tap: Some(tap) };
+            EvalCtx { face, memo: std::collections::HashMap::new(), tap: Some(tap), arena: Vec::new() };
         _eval_rec(t, &mut ctx).await
     })
 }
@@ -105,6 +130,9 @@ struct EvalCtx<'a, D> {
     memo: std::collections::HashMap<u64, Bytes>,
     /// 观测面(interpreter-tap.md;None = 零开销直通)
     tap: Option<&'a mut dyn Tap>,
+    /// 本求值新建块 id 表(E2a 竞技场;Htod/Alloc/launch 输出在创建时登记,
+    /// CSE 命中/Reshape 透传/Block 叶不登记)。scoped 口径下回收候选源。
+    arena: Vec<u64>,
 }
 
 /// DAG 求值入口(装箱:async 递归要求;'b 短借用 reborrow)。
@@ -166,30 +194,42 @@ where
     let n_bytes = n_elems * dtype.size_bytes();
 
     let out: Bytes = match &t.op {
-        Op::Htod { bytes } => ctx.face.htod(dtype, &shape, bytes).await?,
-        Op::Zeros => ctx.face.alloc(dtype, n_elems).await?,
+        Op::Htod { bytes } => {
+            let b = ctx.face.htod(dtype, &shape, bytes).await?;
+            ctx.arena.push(b.id);
+            b
+        }
+        Op::Zeros => {
+            let b = ctx.face.alloc(dtype, n_elems).await?;
+            ctx.arena.push(b.id);
+            b
+        }
         Op::Block { id } => Bytes { id: *id, len: 0 },
         Op::Reshape => ins[0].clone(), // 纯元数据视图:透传父块(零拷贝)
         Op::Add => {
             let out = ctx.face.alloc(dtype, n_elems).await?;
+            ctx.arena.push(out.id);
             let msg = crate::ops::lower_add(&ins, &out, n_elems, dtype);
             ctx.face.launch(msg).await?;
             out
         }
         Op::Mul => {
             let out = ctx.face.alloc(dtype, n_elems).await?;
+            ctx.arena.push(out.id);
             let msg = crate::ops::lower_mul(&ins, &out, n_elems, dtype);
             ctx.face.launch(msg).await?;
             out
         }
         Op::Silu => {
             let out = ctx.face.alloc(dtype, n_elems).await?;
+            ctx.arena.push(out.id);
             let msg = crate::ops::lower_silu(&ins, &out, n_elems, dtype);
             ctx.face.launch(msg).await?;
             out
         }
         Op::Sigmoid => {
             let out = ctx.face.alloc(dtype, n_elems).await?;
+            ctx.arena.push(out.id);
             let msg = crate::ops::lower_sigmoid(&ins, &out, n_elems, dtype);
             ctx.face.launch(msg).await?;
             out
@@ -200,6 +240,7 @@ where
             // 在多行 [m,k] 时越界读 —— 此 bug 被"历届测试都单行"掩盖)
             let k = t.parents[0].shape.last().copied().unwrap_or(0);
             let out = ctx.face.alloc(dtype, m * n).await?;
+            ctx.arena.push(out.id);
             if dtype == Dtype::F16 {
                 // f16 基线:foreign-kernel 通道(cuBLAS;nt = owl Linear 惯例)。
                 // gemm 侧 cm 约定:m = n_out(权重行)/ n = T(2026-09-26 修正:
@@ -219,6 +260,7 @@ where
         }
         Op::Rmsnorm { eps, w_off } => {
             let out = ctx.face.alloc(dtype, n_elems).await?;
+            ctx.arena.push(out.id);
             // 归一化宽度由 alpha 的声明 shape 定义(per-head 行归一化:
             // [T, H×HD] × alpha [HD])。不能取 ins[1].len —— Block 叶子 len=0。
             let alpha_shape = t.parents[1].shape.clone();
@@ -242,6 +284,7 @@ where
                 }
             }
             let out = ctx.face.alloc(dtype, n_elems).await?;
+            ctx.arena.push(out.id);
             let msg = crate::ops::lower_kernel(kernel, &t.args, &ins, &out, n_elems);
             ctx.face.launch(msg).await?;
             out

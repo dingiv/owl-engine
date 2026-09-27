@@ -249,6 +249,7 @@ impl GpuServer {
             Command::AllocPinned { .. } => "AllocPinned",
             Command::UploadPinned { .. } => "UploadPinned",
             Command::Dtoh { .. } => "Dtoh",
+            Command::Free { .. } => "Free",
             Command::Sync { .. } => "Sync",
             Command::Launch { .. } => "Launch",
             Command::Close { .. } => "Close",
@@ -286,6 +287,7 @@ impl GpuServer {
                 self.handle_upload_pinned(buf, dst, offset_bytes, len_bytes, ack)
             }
             Command::Dtoh { id, want_bytes, ack } => self.handle_dtoh(id, want_bytes, ack),
+            Command::Free { ids, ack } => self.handle_free(ids, ack),
             Command::Launch { msg, ack } => self.handle_launch(msg, ack),
             Command::Sync { ack } => self.handle_sync(ack),
             Command::GraphBegin { ack } => ack.send(self.ctx_mut().graph_begin()),
@@ -317,6 +319,7 @@ impl GpuServer {
             Command::AllocPinned { ack, .. } => closed!(ack),
             Command::UploadPinned { ack, .. } => closed!(ack),
             Command::Dtoh { ack, .. } => closed!(ack),
+            Command::Free { ack, .. } => closed!(ack),
             Command::Launch { ack, .. } => closed!(ack),
             Command::Sync { ack, .. } => closed!(ack),
             Command::GraphBegin { ack, .. } => closed!(ack),
@@ -338,6 +341,7 @@ impl GpuServer {
             Command::AllocPinned { .. } => "AllocPinned",
             Command::UploadPinned { .. } => "UploadPinned",
             Command::Dtoh { .. } => "Dtoh",
+            Command::Free { .. } => "Free",
             Command::Sync { .. } => "Sync",
             Command::Launch { .. } => "Launch",
             Command::Close { .. } => "Close",
@@ -355,6 +359,7 @@ impl GpuServer {
             Command::UploadPinned { ack, .. } => reject!(ack),
             Command::Dtoh { ack, .. } => reject!(ack),
             Command::Sync { ack, .. } => reject!(ack),
+            Command::Free { ack, .. } => reject!(ack),
             Command::Launch { ack, .. } => reject!(ack),
             Command::Close { ack } => ack.send(Ok(())), // 幂等
         }
@@ -882,6 +887,16 @@ impl GpuServer {
                 owl_kernels::marlin::v2_err_str(e)
             )))),
         }
+    }
+
+    /// 中间块回收(E2a):账房移除 Owned 块归池。调用方契约 = 已收割
+    /// 所需数据(dtoh 回执即 COMPUTE 排空);图捕获期由 G2 拒绝臂拦截。
+    fn handle_free(&mut self, ids: Vec<u64>, ack: Ack<Result<(), ModelError>>) {
+        let freed = self.ctx_mut().free_blocks(&ids);
+        if std::env::var_os("OWL_DEBUG").is_some() {
+            eprintln!("[owl-gpu] free: {}/{} 块归池", freed, ids.len());
+        }
+        ack.send(Ok(()));
     }
 
     fn handle_sync(&mut self, ack: Ack<Result<(), ModelError>>) {

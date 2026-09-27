@@ -247,6 +247,14 @@ pub trait DeviceClient: Send {
     /// 全设备栅栏:三条流此前全部工作落定方回执(计时/步边界/捕获前净空)
     fn sync(&mut self) -> impl Future<Output = Result<(), ModelError>> + Send;
 
+    /// 中间块回收(E2a,2026-09-27):调用方声明这批块此后不再引用。
+    /// 安全前提:回收前已收割所需数据(dtoh 回执即 COMPUTE 已排空);
+    /// 图捕获期禁止(捕获块 = slab 切片,生命周期随图)。未知 id 容错
+    /// 跳过(幂等)。默认 = 无操作(无块账房的后端,如 CPU 面)。
+    fn free(&mut self, _ids: &[u64]) -> impl Future<Output = Result<(), ModelError>> + Send {
+        async move { Ok(()) }
+    }
+
     /// f32 直传(流式装载,2026-09-26):owned Vec<f32> **所有权移入**
     /// —— 消费端(装载域)的数据免 f32→LE→f32 字节往返,move 进消息
     /// 后随 server 消费消亡。默认 = LE 编码走 [`DeviceClient::htod`]

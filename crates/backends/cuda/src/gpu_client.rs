@@ -193,4 +193,10 @@ impl DeviceClient for GpuClient {
     async fn sync(&mut self) -> Result<(), ModelError> {
         self.submit(move |ack| Command::Sync { ack })?.await
     }
+
+    /// 中间块回收(E2a):投递 Free 命令,账房移除 Owned 块归池
+    async fn free(&mut self, ids: &[u64]) -> Result<(), ModelError> {
+        let ids = ids.to_vec();
+        self.submit(move |ack| Command::Free { ids, ack })?.await
+    }
 }

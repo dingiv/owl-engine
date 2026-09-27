@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use owl_cuda::{DeviceSelector, GpuClient};
 use owl_iface::contract::{Bytes, DeviceClient, Dtype, ModelError};
-use owl_models::interpreters::eval_ops;
+use owl_models::interpreters::{eval_ops, eval_ops_scoped};
 use owl_models::layers::gdn::GdnBuffers;
 use owl_models::layers::rope::Rope;
 use owl_models::model::{Model, ModelSpec};
@@ -632,10 +632,11 @@ impl<D: DeviceClient> RunningEngine<D> {
         let vocab = self.model.vocab_size();
         if is_last {
             let tree = self.model.forward(&ids_t, &ctx);
-            let b = eval_ops(tree.step(), face).await?;
+            let (b, arena) = eval_ops_scoped(tree.step(), face).await?;
             let esz = if d.dtype == Dtype::F16 { 2 } else { 4 };
             let mut buf = vec![0u8; t * vocab * esz];
             face.dtoh(&b, &mut buf).await?;
+            face.free(&arena).await?; // E2a:根已收割,中间块归池
             let off = (t - 1) * vocab * esz;
             let row = buf[off..off + vocab * esz]
                 .chunks_exact(esz)
@@ -651,10 +652,11 @@ impl<D: DeviceClient> RunningEngine<D> {
         } else {
             // 中间块:last_hidden 根(状态推进完整;lm_head 免算)
             let tree = self.model.last_hidden(&ids_t, &ctx);
-            let b = eval_ops(tree.step(), face).await?;
+            let (b, arena) = eval_ops_scoped(tree.step(), face).await?;
             let esz = if d.dtype == Dtype::F16 { 2 } else { 4 };
             let mut buf = vec![0u8; t * d.hidden * esz];
             face.dtoh(&b, &mut buf).await?;
+            face.free(&arena).await?; // E2a:中间块归池(每 chunk 零净增)
             Ok(None)
         }
     }
@@ -1033,10 +1035,10 @@ mod tests {
         // 4k 全链不崩 + 帐本收口 + 计时(v1 smem 越界已修,见上)
         assert!(!text1.trim().is_empty(), "t{t1} 产出非空");
 
-        // turn2 同会话再问(前缀失配 → 回退全量路径)。⚠️ 仅 ≤1024 开:
-        // server 中间块现无回收(eval 全保留),4k 双 turn 累计 ~24GB
-        // OOM —— 即 E2 块分配器 + Free 路线的立项动机(量化在案)
-        if seq <= 1024 {
+        // turn2 同会话再问(前缀失配 → 回退全量路径)。E2a 后唯一验收:
+        // 修复前此处在 4k 下 OOM(server 中间块零回收,双 turn 累计
+        // ~24GB;现 eval 竞技场每 chunk 归池,显存恒平)
+        {
             let (_, t2) = running
                 .submit_session(Some(sid), format!("{body}再重复一遍:暗号是「"), 16)
                 .expect("t2 应在预算内");
