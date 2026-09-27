@@ -99,3 +99,16 @@ pub(crate) fn concat_rows(inputs: &[&TensorOps], r: usize, d: usize) -> TensorOp
         .arg_usize(d)
         .with_shape(dt, vec![n * r, d])
 }
+
+/// 层级行栈(T > 8:组内 8 栈一层,组间再栈一层;T ≤ 64 = 单层嵌套,
+/// 组均匀约束由调用方的块规则保证 —— 非末块对齐 8)。
+pub(crate) fn concat_rows_hier(inputs: &[&TensorOps], d: usize) -> TensorOps {
+    let n = inputs.len();
+    assert!((1..=64).contains(&n), "concat_rows 层级栈封顶 64,得 {n}");
+    if n <= 8 {
+        return concat_rows(inputs, 1, d);
+    }
+    let groups: Vec<TensorOps> = inputs.chunks(8).map(|g| concat_rows(g, 1, d)).collect();
+    let refs: Vec<&TensorOps> = groups.iter().collect();
+    concat_rows(&refs, 8, d)
+}

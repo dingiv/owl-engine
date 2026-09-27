@@ -26,7 +26,7 @@
 use crate::contract::Dtype;
 use crate::kernel;
 use crate::layers::linear::Linear;
-use crate::layers::{concat_rows, narrow_strided};
+use crate::layers::{concat_rows_hier, narrow_strided};
 use crate::layers::rmsnorm::RmsNorm;
 use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module};
 use crate::TensorOps;
@@ -218,9 +218,9 @@ impl Attention {
             ys.push(y_t);
         }
 
-        // 栈(T×[1,Hq·HD] → [T,Hq·HD])→ 门(T 批量 gate_mul)→ 出投影
+        // 栈(T×[1,Hq·HD] → [T,Hq·HD];层级栈,T≤64)→ 门(T 批量)→ 出投影
         let refs: Vec<&TensorOps> = ys.iter().collect();
-        let y_all = concat_rows(&refs, 1, row_q);
+        let y_all = concat_rows_hier(&refs, row_q);
         let y = if dt == Dtype::F16 {
             let n = tokens * row_q;
             TensorOps::of(crate::kernel::kernel_with(

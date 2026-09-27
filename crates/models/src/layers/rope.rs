@@ -19,6 +19,7 @@ use crate::module::{Loadable, LoaderCtx, LoaderOps, Weight};
 use crate::tensor::Dtype;
 use crate::TensorOps;
 
+#[derive(Clone)]
 pub struct Rope {
     /// cos 表(new 期纯计算;经 tables() 源供给执行器)
     cos_data: Vec<f32>,

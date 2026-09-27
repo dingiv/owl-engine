@@ -8,8 +8,10 @@
 //!
 //! # 模块地图(M0)
 //!
-//! - [`session`]:Session 编排面(P0 **eager 闭环**:槽装填 + 闭包纯声明
-//!   + 计算解释器执行;捕获/回放三态 M1 接线)
+//! - [`graph_plan`]:GraphPlan 图三态编排面(P0 eager 闭环 + M1 捕获/
+//!   回放;原 `Session` 正名,见模块头命名裁定)
+//! - [`session`]:**客户端 Session**(agent 连续会话;引擎侧感知 = KV
+//!   cache 区域 + 会话 token 账。Session/Turn/Step 三层词汇权威定义)
 //!
 //! # 复用审计(engine-bak → 本 crate)
 //!
@@ -29,10 +31,13 @@
 //! M3 模型 + DFlash2 对齐线 → M4 冲刺线。
 
 pub mod engine;
+pub mod graph_plan;
 pub mod session;
 pub mod turn;
 
 pub use engine::{Engine, EngineConfig, LoadedModel, ModelLoader, RunningEngine};
+pub use graph_plan::{GraphPlan, GraphPlanDesc, PlanOutcome};
+pub use session::{AgentSession, SessionTable};
 pub use turn::{TurnEvent, TurnSpec};
 
 /// 本 crate 的结果别名:错误权威 = iface `ModelError`(线上一族,不另立)

@@ -45,6 +45,12 @@ pub enum Command {
         data: Vec<u8>,
         ack: Ack<Result<Bytes, ModelError>>,
     },
+    /// 块清零(设备侧 memset_d8;引擎 turn-open GDN 状态重置专用)
+    MemsetZero {
+        block: u64,
+        len_bytes: usize,
+        ack: Ack<Result<(), ModelError>>,
+    },
     /// host → device **分块写入**(write_block 路径):向已 alloc 的块在
     /// offset_bytes 处写字节(pinned 码头 + 异步 memcpy 原位)
     HtodChunk {

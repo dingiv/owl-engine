@@ -27,7 +27,7 @@ async fn main() {
 
     // ── 生命周期:构造(不执行)→ 装载 → run(进入执行态)→ 提交/泵 ──
     let t0 = std::time::Instant::now();
-    let mut engine = Engine::new(EngineConfig { device_ordinal: ordinal, max_seq_tokens: 64 })
+    let mut engine = Engine::new(EngineConfig { device_ordinal: ordinal, max_seq_tokens: 64, prefill_chunk: 32 })
         .expect("engine 构造");
     let model = engine
         .loader()

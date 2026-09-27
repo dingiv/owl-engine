@@ -212,6 +212,19 @@ impl DeviceClient for CpuFace {
         Ok(())
     }
 
+    /// 块清零(host f32 值块直接填零)
+    async fn memset_zero(&mut self, dst: &Bytes, len_bytes: usize) -> Result<(), ModelError> {
+        let v = self
+            .blocks
+            .get_mut(&dst.id)
+            .ok_or(ModelError::DeadBlock { id: dst.id })?;
+        let n = (len_bytes / 4).min(v.f32.len());
+        for x in v.f32.iter_mut().take(n) {
+            *x = 0.0;
+        }
+        Ok(())
+    }
+
     async fn sync(&mut self) -> Result<(), ModelError> {
         Ok(()) // CPU:无在飞操作(同步直调,天然无积压)
     }

@@ -305,6 +305,16 @@ pub trait DeviceClient: Send {
         }
     }
 
+    /// 块清零(设备侧 memset;2026-09-26 引擎 turn-open 定谳:GDN 状态
+    /// 1.2GB 走 host 往返清零 = 14s,memset 后 ~ms 级)。默认 = 不支持。
+    fn memset_zero(
+        &mut self,
+        _dst: &Bytes,
+        _len_bytes: usize,
+    ) -> impl Future<Output = Result<(), ModelError>> + Send {
+        async { Err(ModelError::Msg("memset_zero: 此后端未实现".into())) }
+    }
+
     /// 装载并发句柄(可选能力,2026-09-26 M-e loader 性能):返回 k 个
     /// 可独立驱动的 client 句柄克隆 —— 多协程各持一个,host 侧布局变换
     /// 与设备拷贝在 server 线程上流水重叠。默认 None = 顺序装载(单 face)。

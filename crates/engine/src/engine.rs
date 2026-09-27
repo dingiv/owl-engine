@@ -1,12 +1,12 @@
 //! 引擎面:构造(资源绑定,零执行)→ ModelLoader(模型装载)→
-//! run(装配 Session + warmup,进入执行态)→ submit/pump(turn 流)。
+//! run(装配 GraphPlan + warmup,进入执行态)→ submit/pump(turn 流)。
 //!
 //! 生命周期(用户裁决 2026-09-26):
 //! 1. [`Engine::new`] / [`Engine::on`] —— 构造:设备绑定 + 容量参数,
 //!    **不执行**;
 //! 2. [`Engine::loader`] —— 面向上层的 [`ModelLoader`]:模型(权重 +
 //!    tokenizer + rope)按 spec 声明装载;
-//! 3. [`Engine::run`] —— 模型交引擎:状态块/槽/Session 组建 + warmup,
+//! 3. [`Engine::run`] —— 模型交引擎:状态块/槽/GraphPlan 组建 + warmup,
 //!    返回执行态 [`RunningEngine`](仍不跑任何 turn);
 //! 4. [`RunningEngine::submit`] —— 提交 turn(非阻塞入队);
 //!    [`RunningEngine::pump`] —— 推进到下一个事件点(`Idle` = 队列排空)。
@@ -34,7 +34,7 @@ use owl_models::specs::{load_0_8b, load_tokenizer, qwen3_5_0_8b};
 use owl_models::tokenizer::Tokenizer;
 use owl_models::{TensorOps};
 
-use crate::session::{InputSlot, OutputSlot, Session, SessionDesc, StepCtx};
+use crate::graph_plan::{GraphPlan, GraphPlanDesc, InputSlot, OutputSlot, PlanCtx};
 use crate::turn::{TurnEvent, TurnSpec};
 
 type Result<T> = std::result::Result<T, ModelError>;
@@ -50,6 +50,10 @@ pub struct EngineConfig {
     pub device_ordinal: usize,
     /// 单 turn token 预算 = KV 直排槽位(prompt + 生成 ≤ 此值)
     pub max_seq_tokens: usize,
+    /// prefill 块长(token/块;W1 块式喂入)。约束:块内 kv_len 峰值
+    /// (块基址 + 块长)≤ OWL_MAX_KV=256(attention 窗寄存器上限);
+    /// 默认 128。长 ctx 批核另案(§五.3)
+    pub prefill_chunk: usize,
 }
 
 /// 已装载模型(权重在设备 + tokenizer 解析 + rope 表;[`Engine::run`] 的输入)
@@ -65,7 +69,7 @@ pub struct ModelLoader<'a, D: DeviceClient> {
     face: &'a mut D,
 }
 
-impl<D: DeviceClient> ModelLoader<'_, D> {
+impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
     /// Qwen3.5-0.8B(维度/键约定/分词器事实全在 specs/qwen35.rs 声明;
     /// 未来 `load(dir)` 按 config.json 分发,挂账)
     pub async fn load_qwen35_0_8b(&mut self, dir: &Path) -> Result<LoadedModel> {
@@ -135,6 +139,10 @@ impl<D: DeviceClient> Engine<D> {
             gdns_b.push(GdnBlocks { conv_q, conv_k, conv_v, rec });
         }
         let kv_dt = loaded.spec.dtype;
+        let dims = ModelDims {
+            hkv, hd, nk, hk, nv, hv, n_full, n_gdn,
+            hidden: loaded.spec.hidden, dtype: loaded.spec.dtype,
+        };
         let kv_leaf = |b: &KvBlocks| KvBuffers {
             k_cache: block_leaf_dt(&(b.k_cache.0), vec![s, hkv, hd], kv_dt),
             v_cache: block_leaf_dt(&(b.v_cache.0), vec![s, hkv, hd], kv_dt),
@@ -157,9 +165,9 @@ impl<D: DeviceClient> Engine<D> {
         // 2026-09-26 窗口语义探针定谳:slots 恒 0 读块外垃圾行);
         // GDN 槽 = 序列状态格,turn 内恒 0(递推状态按序列累积)。
         let model = Arc::clone(&loaded.model);
-        let rp = loaded.rope;
+        let rp = loaded.rope.clone();
         let vocab = loaded.model.vocab_size();
-        let forward = move |sc: &StepCtx| -> Result<()> {
+        let forward = move |sc: &PlanCtx| -> Result<()> {
             let ids = sc.input("frontier")?;
             let pos = sc.input("pos")?;
             let kv_len = sc.input("kv_len")?;
@@ -189,9 +197,9 @@ impl<D: DeviceClient> Engine<D> {
             sc.output("logits", &tree)
         };
 
-        let (session, capture_outcome) = Session::plan(
+        let (session, capture_outcome) = GraphPlan::plan(
             self.face,
-            SessionDesc {
+            GraphPlanDesc {
                 inputs: vec![
                     InputSlot::f32("frontier", 1),
                     InputSlot::f32("pos", 1),
@@ -205,7 +213,7 @@ impl<D: DeviceClient> Engine<D> {
             forward,
         )
         .await?;
-        if let crate::session::PlanOutcome::EagerFallback { reason } = &capture_outcome {
+        if let crate::graph_plan::PlanOutcome::EagerFallback { reason } = &capture_outcome {
             eprintln!("[engine] 捕获降级为 eager:{reason}");
         }
 
@@ -219,6 +227,9 @@ impl<D: DeviceClient> Engine<D> {
             queue: VecDeque::new(),
             active: None,
             next_id: 1,
+            model: loaded.model,
+            rope: loaded.rope,
+            dims,
         })
     }
 }
@@ -257,17 +268,36 @@ struct GdnBlocks {
 }
 
 pub struct RunningEngine<D: DeviceClient> {
-    session: Session<D>,
+    session: GraphPlan<D>,
     tok: Tokenizer,
     cfg: EngineConfig,
     /// 捕获三态结果(Captured = 回放态;EagerFallback = 同闭包直发)
-    pub capture_outcome: crate::session::PlanOutcome,
+    pub capture_outcome: crate::graph_plan::PlanOutcome,
     #[allow(dead_code)]
     kvs_b: Vec<KvBlocks>,
     gdns_b: Vec<GdnBlocks>,
     queue: VecDeque<Turn>,
     active: Option<ActiveTurn>,
     next_id: u64,
+    /// prefill 块式喂入(W1)的模型面:树根构造 + 维度账
+    model: Arc<Model>,
+    rope: Rope,
+    dims: ModelDims,
+}
+
+/// prefill 块构造所需维度账(run 期从 spec 提取;Copy 免 Clone 传播)
+#[derive(Clone, Copy)]
+struct ModelDims {
+    hkv: usize,
+    hd: usize,
+    nk: usize,
+    hk: usize,
+    nv: usize,
+    hv: usize,
+    n_full: usize,
+    n_gdn: usize,
+    hidden: usize,
+    dtype: Dtype,
 }
 
 impl<D: DeviceClient> RunningEngine<D> {
@@ -317,15 +347,56 @@ impl<D: DeviceClient> RunningEngine<D> {
             });
         }
 
-        // 单步:喂一个 token(prompt 相位 teacher-forcing;生成相位喂上次采样)
-        let (tid, pos, is_last_prompt, turn_id) = {
-            let act = self.active.as_mut().expect("active 已保证");
-            let tid = if act.fed < act.prompt_ids.len() {
-                act.prompt_ids[act.fed]
-            } else {
-                *act.out.last().expect("生成中")
+        // ── prompt 相位:一次 pump = 一个 chunk(块式 prefill;W1/PF1)──
+        {
+            // 先取标量(prompt 切片经 &self 借出后即刻拷走,避免与
+            // prefill_chunk 的 &mut self 相交)
+            let plan = {
+                let act = self.active.as_ref().expect("active 已保证");
+                if act.fed >= act.prompt_ids.len() {
+                    None
+                } else {
+                    let base = act.fed;
+                    let remaining = act.prompt_ids.len() - base;
+                    // 块长:配置块长 ∩ 剩余 ∩ 窗约束(块内 kv_len 峰值
+                    // base+chunk ≤ OWL_MAX_KV=256,attention 窗寄存器上限)
+                    let chunk = remaining
+                        .min(self.cfg.prefill_chunk)
+                        .min(256usize.saturating_sub(base))
+                        .max(1);
+                    Some((
+                        base,
+                        act.id,
+                        chunk,
+                        base + chunk >= act.prompt_ids.len(),
+                        act.prompt_ids[base..base + chunk].to_vec(),
+                    ))
+                }
             };
-            (tid, act.fed, act.fed + 1 >= act.prompt_ids.len(), act.id)
+            if let Some((base, turn_id, chunk, is_last_prompt, chunk_ids)) = plan {
+                let last_row = self
+                    .prefill_chunk(&chunk_ids, base, is_last_prompt)
+                    .await?;
+                    let act = self.active.as_mut().expect("active 已保证");
+                act.fed += chunk;
+                if !is_last_prompt {
+                    // 块落定,无文本产出 —— 不谎报 Idle
+                    return Ok(TurnEvent::Prefill {
+                        turn: turn_id,
+                        fed: act.fed,
+                        total: act.prompt_ids.len(),
+                    });
+                }
+                // 末块:末行采样(eos / 预算 / Token)
+                return self.sample_and_emit(last_row.expect("末块必有 logits")).await;
+            }
+        }
+
+        // ── 生成相位:decode 单步(捕获回放)+ 采样 ──
+        let (tid, pos) = {
+            let act = self.active.as_mut().expect("active 已保证");
+            let tid = *act.out.last().expect("生成中");
+            (tid, act.fed)
         };
         self.session
             .step(&[
@@ -339,17 +410,14 @@ impl<D: DeviceClient> RunningEngine<D> {
 
         let act = self.active.as_mut().expect("active 已保证");
         act.fed += 1;
-        if !is_last_prompt {
-            // prompt 中段:状态推进一个 step,无文本产出 —— 不谎报 Idle
-            return Ok(TurnEvent::Prefill {
-                turn: turn_id,
-                fed: act.fed,
-                total: act.prompt_ids.len(),
-            });
-        }
-
-        // 采样(Greedy;host argmax —— 设备采样挂账)
         let logits = self.session.read_output_f32("logits").await?;
+        self.sample_and_emit(logits).await
+    }
+
+    /// 采样 + 事件产出(Greedy;host argmax —— 设备采样挂账)。
+    /// eos 命中或预算尽 → Completed;否则 Token(delta = 解码文本增量)。
+    async fn sample_and_emit(&mut self, logits: Vec<f32>) -> Result<TurnEvent> {
+        let turn_id = self.active.as_ref().expect("active 已保证").id;
         let nt = argmax(&logits) as u32;
         if self.tok.is_eos(nt) {
             return self.complete().await;
@@ -363,6 +431,88 @@ impl<D: DeviceClient> RunningEngine<D> {
             return self.complete().await;
         }
         Ok(TurnEvent::Token { turn: turn_id, delta })
+    }
+
+    /// 块式 prefill(W1;批P5 契约):ids [T] 从 KV 行 base 起步,
+    /// 单序列语义(gdn_slot 恒 0;KV 行随 token 走)。末块走 logits 根
+    /// 返回末行;中间块走 last_hidden 根(免 lm_head [T,V] 计算与大
+    /// dtoh)返回 None。
+    async fn prefill_chunk(
+        &mut self,
+        ids: &[u32],
+        base: usize,
+        is_last: bool,
+    ) -> Result<Option<Vec<f32>>> {
+        let d = self.dims;
+        let s = self.cfg.max_seq_tokens;
+        let t = ids.len();
+        let f32seq = |start: usize, n: usize| -> Vec<u8> {
+            (0..n)
+                .flat_map(|i| ((start + i) as f32).to_le_bytes())
+                .collect()
+        };
+        let kvs_step: Vec<KvBuffers> = self
+            .kvs_b
+            .iter()
+            .map(|b| KvBuffers {
+                k_cache: block_leaf_dt(&b.k_cache.0, vec![s, d.hkv, d.hd], d.dtype),
+                v_cache: block_leaf_dt(&b.v_cache.0, vec![s, d.hkv, d.hd], d.dtype),
+                slots: TensorOps::from_host(Dtype::F32, vec![t], &f32seq(base, t)),
+                kv_lens: TensorOps::from_host(Dtype::F32, vec![t], &f32seq(base + 1, t)),
+            })
+            .collect();
+        let gdns_step: Vec<GdnBuffers> = self
+            .gdns_b
+            .iter()
+            .map(|g| GdnBuffers {
+                conv_q: block_leaf(&g.conv_q.0, vec![s, d.nk * d.hk, 3]),
+                conv_k: block_leaf(&g.conv_k.0, vec![s, d.nv * d.hv, 3]),
+                conv_v: block_leaf(&g.conv_v.0, vec![s, d.nv * d.hv, 3]),
+                rec: block_leaf(&g.rec.0, vec![s, d.nv, d.hk, d.hv]),
+                slots: TensorOps::from_host(Dtype::F32, vec![1], &f32seq(0, 1)),
+            })
+            .collect();
+        let ids_t = TensorOps::from_host(
+            Dtype::F32,
+            vec![t],
+            &ids.iter().flat_map(|v| (*v as f32).to_le_bytes()).collect::<Vec<u8>>(),
+        );
+        let pos_t = TensorOps::from_host(Dtype::F32, vec![t], &f32seq(base, t));
+        let slots_t = TensorOps::from_host(Dtype::F32, vec![t], &f32seq(base, t));
+        let lens_t = TensorOps::from_host(Dtype::F32, vec![t], &f32seq(base + 1, t));
+        let gdn_slot = TensorOps::from_host(Dtype::F32, vec![1], &f32seq(0, 1));
+        let ctx = ForwardCtx::model_prefill(
+            t, &pos_t, &kvs_step, &self.rope, &gdns_step, &slots_t, &lens_t, &gdn_slot,
+        );
+        let face = self.session.face_mut();
+        let vocab = self.model.vocab_size();
+        if is_last {
+            let tree = self.model.forward(&ids_t, &ctx);
+            let b = eval_ops(tree.step(), face).await?;
+            let esz = if d.dtype == Dtype::F16 { 2 } else { 4 };
+            let mut buf = vec![0u8; t * vocab * esz];
+            face.dtoh(&b, &mut buf).await?;
+            let off = (t - 1) * vocab * esz;
+            let row = buf[off..off + vocab * esz]
+                .chunks_exact(esz)
+                .map(|c| {
+                    if esz == 2 {
+                        half::f16::from_le_bytes([c[0], c[1]]).to_f32()
+                    } else {
+                        f32::from_le_bytes([c[0], c[1], c[2], c[3]])
+                    }
+                })
+                .collect();
+            Ok(Some(row))
+        } else {
+            // 中间块:last_hidden 根(状态推进完整;lm_head 免算)
+            let tree = self.model.last_hidden(&ids_t, &ctx);
+            let b = eval_ops(tree.step(), face).await?;
+            let esz = if d.dtype == Dtype::F16 { 2 } else { 4 };
+            let mut buf = vec![0u8; t * d.hidden * esz];
+            face.dtoh(&b, &mut buf).await?;
+            Ok(None)
+        }
     }
 
     /// 便捷入口:提交一个 turn 并泵到其完成,返回全文
@@ -389,6 +539,8 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// GDN 状态 per-turn 零化(conv 三段 + recurrent;分块写免 host 大向
     /// 量 —— rec 单层 16M 元素)。KV 不重置:kv_len 窗口 + 先写后打分
     /// 语义下,本 turn 打分的槽位全部由本 turn 写过。
+    /// GDN 状态重置(turn-open;新序列零态语义)。设备侧 memset
+    /// (2026-09-26 定谳:host 往返清零 1.2GB = 14s/turn,黑洞实测)
     async fn reset_gdn(&mut self) -> Result<()> {
         for g in &self.gdns_b {
             let blocks = [
@@ -397,10 +549,14 @@ impl<D: DeviceClient> RunningEngine<D> {
                 (&g.conv_v.0, g.conv_v.1),
                 (&g.rec.0, g.rec.1),
             ];
-            for (bn, elems) in blocks {
-                zero_fill(self.session.face_mut(), bn, elems).await?;
+            for (bn, bytes) in blocks {
+                self.session
+                    .face_mut()
+                    .memset_zero(bn, bytes * 4)
+                    .await?;
             }
         }
+        self.session.face_mut().sync().await?;
         Ok(())
     }
 }
@@ -439,17 +595,6 @@ fn block_leaf(b: &Bytes, shape: Vec<usize>) -> TensorOps {
 }
 
 /// 块零化(分块 write_block;1M 元素 = 4MB/笔)
-async fn zero_fill<D: DeviceClient>(face: &mut D, b: &Bytes, elems: usize) -> Result<()> {
-    const CHUNK: usize = 1 << 20;
-    let zeros = vec![0.0f32; CHUNK.min(elems)];
-    let mut off = 0usize;
-    while off < elems {
-        let n = CHUNK.min(elems - off);
-        face.write_block_f32(b, off, &zeros[..n]).await?;
-        off += n;
-    }
-    Ok(())
-}
 
 fn argmax(v: &[f32]) -> usize {
     v.iter()
@@ -488,7 +633,7 @@ mod tests {
     #[tokio::test]
     async fn cpu_construct_and_load() {
         let mut engine = Engine::on(
-            EngineConfig { device_ordinal: 0, max_seq_tokens: 64 },
+            EngineConfig { device_ordinal: 0, max_seq_tokens: 64, prefill_chunk: 16 },
             CpuFace::new(),
         )
         .expect("engine 构造");
@@ -507,23 +652,34 @@ mod tests {
         };
         let dir = asset_dir();
         let mut engine =
-            Engine::new(EngineConfig { device_ordinal: ordinal, max_seq_tokens: 64 })
+            Engine::new(EngineConfig { device_ordinal: ordinal, max_seq_tokens: 64, prefill_chunk: 16 })
                 .expect("构造");
         let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
         let mut running = engine.run(loaded).await.expect("装配");
         assert!(
-            matches!(running.capture_outcome, crate::session::PlanOutcome::Captured),
+            matches!(running.capture_outcome, crate::graph_plan::PlanOutcome::Captured),
             "真模型捕获应成功(回放态),得 {:?}",
             running.capture_outcome
         );
 
         let t1 = running.submit("Hello, who are you?", 16).expect("t1");
         let t2 = running.submit("用一句话介绍长城。", 16).expect("t2");
+        let (mut ttft, mut t0) = (None, std::time::Instant::now());
         let mut done = Vec::new();
         loop {
             match running.pump().await.expect("pump") {
                 TurnEvent::Idle => break,
-                TurnEvent::Completed { turn, text } => done.push((turn, text)),
+                TurnEvent::Prefill { turn, fed, total } => {
+                    eprintln!("[ev] prefill t{turn} {fed}/{total} (+{:?})", t0.elapsed());
+                }
+                TurnEvent::Token { turn, .. } if ttft.is_none() => {
+                    ttft = Some(t0.elapsed());
+                    eprintln!("[ttft] 首 Token(turn {turn}): {:?}", ttft.unwrap());
+                }
+                TurnEvent::Completed { turn, text } => {
+                    eprintln!("[ttft] turn {turn} 完成(累计 {:?})", t0.elapsed());
+                    done.push((turn, text))
+                }
                 TurnEvent::Failed { turn, err } => panic!("t{turn} 失败: {err}"),
                 _ => {}
             }

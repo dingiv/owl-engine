@@ -243,6 +243,7 @@ impl GpuServer {
             Command::GraphEnd { .. } => "GraphEnd",
             Command::GraphLaunch { .. } => "GraphLaunch",
             Command::Alloc { .. } => "Alloc",
+            Command::MemsetZero { .. } => "MemsetZero",
             Command::Htod { .. } => "Htod",
             Command::HtodChunk { .. } => "HtodChunk",
             Command::AllocPinned { .. } => "AllocPinned",
@@ -262,6 +263,9 @@ impl GpuServer {
             return match cmd {
                 Command::Launch { msg, ack } => self.handle_launch(msg, ack),
                 Command::Alloc { n_bytes, elems, ack } => self.handle_alloc(n_bytes, elems, ack),
+                Command::MemsetZero { block, len_bytes, ack } => {
+                    self.handle_memset_zero(block, len_bytes, ack)
+                }
                 Command::GraphEnd { ack } => ack.send(self.ctx_mut().graph_end()),
                 Command::Close { ack } => ack.send(Ok(())), // 防御性幂等回执
                 other => Self::reject(other),
@@ -270,6 +274,9 @@ impl GpuServer {
 
         match cmd {
             Command::Alloc { n_bytes, elems, ack } => self.handle_alloc(n_bytes, elems, ack),
+            Command::MemsetZero { block, len_bytes, ack } => {
+                self.handle_memset_zero(block, len_bytes, ack)
+            }
             Command::Htod { data, ack } => self.handle_htod(data, ack),
             Command::HtodChunk { block, offset_bytes, data, ack } => {
                 self.handle_htod_chunk(block, offset_bytes, data, ack)
@@ -304,6 +311,7 @@ impl GpuServer {
         match cmd {
             Command::Close { ack } => ack.send(Ok(())), // 幂等
             Command::Alloc { ack, .. } => closed!(ack),
+            Command::MemsetZero { ack, .. } => closed!(ack),
             Command::Htod { ack, .. } => closed!(ack),
             Command::HtodChunk { ack, .. } => closed!(ack),
             Command::AllocPinned { ack, .. } => closed!(ack),
@@ -324,6 +332,7 @@ impl GpuServer {
             Command::GraphEnd { .. } => "GraphEnd",
             Command::GraphLaunch { .. } => "GraphLaunch",
             Command::Alloc { .. } => "Alloc",
+            Command::MemsetZero { .. } => "MemsetZero",
             Command::Htod { .. } => "Htod",
             Command::HtodChunk { .. } => "HtodChunk",
             Command::AllocPinned { .. } => "AllocPinned",
@@ -339,6 +348,7 @@ impl GpuServer {
             Command::GraphEnd { ack } => reject!(ack),
             Command::GraphLaunch { ack, .. } => reject!(ack),
             Command::Alloc { ack, .. } => reject!(ack),
+            Command::MemsetZero { ack, .. } => reject!(ack),
             Command::Htod { ack, .. } => reject!(ack),
             Command::HtodChunk { ack, .. } => reject!(ack),
             Command::AllocPinned { ack, .. } => reject!(ack),
@@ -379,6 +389,26 @@ impl GpuServer {
                     .map_err(|e| ModelError::Msg(format!("alloc memset: {e:?}")))?;
                 Ok(Bytes::new(self.ctx_mut().new_block(slice), elems))
             });
+        ack.send(result);
+    }
+
+    /// 块清零(memset_d8 异步入 COMPUTE 流;入队即回执 —— 后续同流
+    /// launch 天然保序,读方由显式 sync/同流序兜底)
+    fn handle_memset_zero(
+        &mut self,
+        block: u64,
+        len_bytes: usize,
+        ack: Ack<Result<(), ModelError>>,
+    ) {
+        let stream = match self.ctx().stream(STREAM_COMPUTE) {
+            Ok(s) => s.clone(),
+            Err(e) => return ack.send(Err(e)),
+        };
+        let result = (|| {
+            let (dptr, _) = self.ctx().block_ptr(block, &stream)?;
+            unsafe { crate::ffi::memset_d8_async(dptr, 0, len_bytes, stream.cu_stream()) }
+                .map_err(|e| ModelError::Msg(format!("memset_zero: {e:?}")))
+        })();
         ack.send(result);
     }
 

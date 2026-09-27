@@ -620,6 +620,7 @@ pub trait Loadable {
 /// 与 Tensor<D> 同构(2026-09-25 拍板:句柄落线 A)—— **容器只持句柄,
 /// 存放归设备**:CpuFace 解析为 host 值块,GpuClient 解析为显存池块,
 /// 层代码零设备感知。
+#[derive(Clone)]
 pub struct Weight {
     key: &'static str,
     shape: Shape,

@@ -154,6 +154,11 @@ impl DeviceClient for GpuClient {
         Some((0..k).map(|_| self.clone()).collect())
     }
 
+    async fn memset_zero(&mut self, dst: &Bytes, len_bytes: usize) -> Result<(), ModelError> {
+        let block = dst.id;
+        self.submit(move |ack| Command::MemsetZero { block, len_bytes, ack })?.await
+    }
+
     async fn htod(
         &mut self,
         dtype: Dtype,
