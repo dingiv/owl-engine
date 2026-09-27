@@ -3,5 +3,15 @@ name = "server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "owl 引擎 SSE 服务架子(OpenAI 兼容 chat completions;engine actor 独占设备)"
 
 [dependencies]
+# 引擎面(构造/装载/submit_session/pump)
+owl-engine = { path = "../../crates/engine" }
+# GPU 绑定(Engine::new 的 GpuClient 特化;actor 泛型界见 iface)
+owl-cuda = { path = "../../crates/backends/cuda" }
+owl-iface = { path = "../../crates/backends/iface" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# 手写 HTTP/1.1 + SSE(架子零重依赖;axum/hyper 迁移挂账,见 http.rs 模块头)
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync"] }

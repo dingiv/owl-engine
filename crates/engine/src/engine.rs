@@ -18,6 +18,11 @@
 //! 并发:M0.5 单槽串行(一次一个 turn 占 0 号槽;GDN 状态 per-turn 零化,
 //! KV 由「kv_len 窗口 + 先写后打分」语义天然隔离——本 turn 打分的槽位
 //! 全部由本 turn 写过);真并发随 M2 batching 换入,submit/pump 形状不变。
+//!
+//! **会话接线(S0/S1,2026-09-26)**:SessionTable 入引擎 ——
+//! `submit_session(Some(id), …)` = 连续会话(同会话跳过 GDN 重置,
+//! 只 prefill `cached_len..` 增量段;token 账前缀守卫失配回退全量);
+//! `submit(None)` = 临时会话终了即焚,行为同 M0.5(每 turn 全量重算)。
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -35,6 +40,7 @@ use owl_models::tokenizer::Tokenizer;
 use owl_models::{TensorOps};
 
 use crate::graph_plan::{GraphPlan, GraphPlanDesc, InputSlot, OutputSlot, PlanCtx};
+use crate::session::SessionTable;
 use crate::turn::{TurnEvent, TurnSpec};
 
 type Result<T> = std::result::Result<T, ModelError>;
@@ -115,6 +121,7 @@ impl<D: DeviceClient> Engine<D> {
     /// 模型交引擎:状态块/槽/Session 组建 + warmup —— 仍不跑任何 turn,
     /// 返回执行态引擎(请求入口)。
     pub async fn run(mut self, loaded: LoadedModel) -> Result<RunningEngine<D>> {
+        let t_run = std::time::Instant::now();
         let s = self.cfg.max_seq_tokens;
         let (_, hkv, hd) = loaded.spec.full_heads;
         let (nk, hk, nv, hv) = loaded.spec.gdn_heads;
@@ -139,8 +146,15 @@ impl<D: DeviceClient> Engine<D> {
             gdns_b.push(GdnBlocks { conv_q, conv_k, conv_v, rec });
         }
         let kv_dt = loaded.spec.dtype;
+        eprintln!(
+            "[boot] 状态块分配 {:.2}s(kv f16 ×{} / gdn ×{},槽位 {})",
+            t_run.elapsed().as_secs_f32(),
+            kvs_b.len(),
+            gdns_b.len(),
+            s
+        );
         let dims = ModelDims {
-            hkv, hd, nk, hk, nv, hv, n_full, n_gdn,
+            hkv, hd, nk, hk, nv, hv,
             hidden: loaded.spec.hidden, dtype: loaded.spec.dtype,
         };
         let kv_leaf = |b: &KvBlocks| KvBuffers {
@@ -216,6 +230,7 @@ impl<D: DeviceClient> Engine<D> {
         if let crate::graph_plan::PlanOutcome::EagerFallback { reason } = &capture_outcome {
             eprintln!("[engine] 捕获降级为 eager:{reason}");
         }
+        eprintln!("[boot] GraphPlan plan(warmup+捕获) {:.2}s", t_run.elapsed().as_secs_f32());
 
         Ok(RunningEngine {
             session,
@@ -227,6 +242,7 @@ impl<D: DeviceClient> Engine<D> {
             queue: VecDeque::new(),
             active: None,
             next_id: 1,
+            sessions: SessionTable::new(),
             model: loaded.model,
             rope: loaded.rope,
             dims,
@@ -240,15 +256,22 @@ impl<D: DeviceClient> Engine<D> {
 
 struct Turn {
     id: u64,
+    /// 归属会话(已解析 id;None 提交在 submit 时已建临时账)
+    session_id: u64,
+    /// 临时会话(终了即焚;行为同 M0.5 每 turn 全量重算)
+    ephemeral: bool,
     spec: TurnSpec,
     prompt_ids: Vec<u32>,
 }
 
 struct ActiveTurn {
     id: u64,
+    session_id: u64,
+    ephemeral: bool,
     prompt_ids: Vec<u32>,
     max_new: usize,
     out: Vec<u32>,
+    /// KV/prompt 推进指针(会话 turn 从 `cached_len` 起步 = 增量 prefill)
     fed: usize,
     decoded: String,
 }
@@ -279,6 +302,8 @@ pub struct RunningEngine<D: DeviceClient> {
     queue: VecDeque<Turn>,
     active: Option<ActiveTurn>,
     next_id: u64,
+    /// 会话账(S0):同会话跨 turn 复用 KV/GDN,增量 prefill
+    sessions: SessionTable,
     /// prefill 块式喂入(W1)的模型面:树根构造 + 维度账
     model: Arc<Model>,
     rope: Rope,
@@ -294,16 +319,29 @@ struct ModelDims {
     hk: usize,
     nv: usize,
     hv: usize,
-    n_full: usize,
-    n_gdn: usize,
     hidden: usize,
     dtype: Dtype,
 }
 
 impl<D: DeviceClient> RunningEngine<D> {
-    /// 提交 turn(非阻塞;入队即返回 id)。预算越界 fail-fast:
-    /// prompt + 生成 ≤ max_seq_tokens(= KV 槽位)。
+    /// 提交 turn(临时会话:每 turn 独立,终了即焚;行为同 M0.5)。
+    /// 预算越界 fail-fast:prompt + 生成 ≤ max_seq_tokens(= KV 槽位)。
     pub fn submit(&mut self, prompt: impl Into<String>, max_new: usize) -> Result<u64> {
+        self.submit_session(None, prompt, max_new).map(|(_, t)| t)
+    }
+
+    /// 会话化提交(S0):`session = None` 自动开临时会话;`Some(id)` =
+    /// 连续会话 —— prompt 语义为**全量重发**(历史 + 新消息,客户端保证
+    /// 前缀一致):引擎按 token 账前缀守卫,命中则跳过 GDN 重置、只
+    /// prefill `cached_len..` 增量段;失配回退全量重算(S1,正确性优先)。
+    /// 返回 (session_id, turn_id)。
+    pub fn submit_session(
+        &mut self,
+        session: impl Into<Option<u64>>,
+        prompt: impl Into<String>,
+        max_new: usize,
+    ) -> Result<(u64, u64)> {
+        let session = session.into();
         let prompt = prompt.into();
         let prompt_ids = {
             let wrapped = self.tok.chat_wrap(&prompt);
@@ -312,7 +350,16 @@ impl<D: DeviceClient> RunningEngine<D> {
         if prompt_ids.is_empty() {
             return Err(ModelError::Msg("submit: 空 prompt".into()));
         }
-        if prompt_ids.len() + max_new > self.cfg.max_seq_tokens {
+        // 预算(会话感知):命中账本的 turn 按 max(prompt, cached) 记账
+        // (增量段写 `[cached, prompt)` 行,生成续写其后;失配回退全量时
+        // prompt 为准,同一上界)
+        let cached_hit = session
+            .and_then(|id| self.sessions.get(id).map(|s| (s.cached_len, s.guard(&prompt_ids))))
+            .filter(|&(_, guard)| guard)
+            .map(|(cached, _)| cached)
+            .unwrap_or(0);
+        let need = prompt_ids.len().max(cached_hit) + max_new;
+        if need > self.cfg.max_seq_tokens {
             return Err(ModelError::Msg(format!(
                 "submit: prompt {} + 生成 {} 超预算 {}",
                 prompt_ids.len(),
@@ -320,29 +367,66 @@ impl<D: DeviceClient> RunningEngine<D> {
                 self.cfg.max_seq_tokens
             )));
         }
+        let (session_id, ephemeral) = match session {
+            Some(id) => (self.sessions.get_or_create(Some(id)).0, false),
+            None => (self.sessions.get_or_create(None).0, true),
+        };
         let id = self.next_id;
         self.next_id += 1;
-        self.queue.push_back(Turn { id, spec: TurnSpec { prompt, max_new }, prompt_ids });
-        Ok(id)
+        self.queue.push_back(Turn {
+            id,
+            session_id,
+            ephemeral,
+            spec: TurnSpec { prompt, max_new },
+            prompt_ids,
+        });
+        Ok((session_id, id))
+    }
+
+    /// 显式关会话(客户端声明不再续;账本清票。KV 区域 M0.5 单槽区
+    /// 不回收,随 M2 分槽归还)
+    pub fn close_session(&mut self, id: u64) -> Result<()> {
+        self.sessions.close(id)
+    }
+
+    /// 会话账观测(已入 KV 的 token 数;None = 会话不存在)
+    pub fn session_len(&self, id: u64) -> Option<usize> {
+        self.sessions.get(id).map(|s| s.cached_len)
     }
 
     /// 推进到下一个事件点(每调用 = 活跃 turn 的一个采样步,或 turn 的
     /// 启动切换;`Idle` = 队列排空且无活跃,调用方可安全挂起等新提交)。
     pub async fn pump(&mut self) -> Result<TurnEvent> {
-        // 无活跃 → 取队首开 turn:重置 GDN 状态 + prefill 全部 prompt +
-        // 首采样,一气推进到首个 Token 事件(prompt 中段回 Prefill 事件)
+        // 无活跃 → 取队首开 turn:会话守卫(命中 = 跳过 GDN 重置 +
+        // 增量起步;失配/新会话 = 重置 + 全量),再推进到首个 Token 事件
         if self.active.is_none() {
             let Some(turn) = self.queue.pop_front() else {
                 return Ok(TurnEvent::Idle);
             };
-            let max_new = turn.spec.max_new;
-            self.reset_gdn().await?;
+            let cached_len = {
+                let s = self
+                    .sessions
+                    .get_mut(turn.session_id)
+                    .expect("submit 已建会话账");
+                if s.guard(&turn.prompt_ids) {
+                    s.cached_len
+                } else {
+                    // S1 回退:改写历史/模板漂移 → 清账,全量重算
+                    s.reset();
+                    0
+                }
+            };
+            if cached_len == 0 {
+                self.reset_gdn().await?;
+            }
             self.active = Some(ActiveTurn {
                 id: turn.id,
+                session_id: turn.session_id,
+                ephemeral: turn.ephemeral,
                 prompt_ids: turn.prompt_ids,
-                max_new,
+                max_new: turn.spec.max_new,
                 out: Vec::new(),
-                fed: 0,
+                fed: cached_len,
                 decoded: String::new(),
             });
         }
@@ -532,6 +616,14 @@ impl<D: DeviceClient> RunningEngine<D> {
 
     async fn complete(&mut self) -> Result<TurnEvent> {
         let act = self.active.take().expect("active");
+        // 会话账落地(S1 收口):KV 此刻 = prompt 全量 + 生成段;GDN 状态
+        // 跨 turn 连续。临时会话终了即焚(表不随 turn 数无界增长)
+        if let Some(s) = self.sessions.get_mut(act.session_id) {
+            s.commit_turn(&act.prompt_ids, &act.out);
+        }
+        if act.ephemeral {
+            self.sessions.close(act.session_id).ok();
+        }
         let text = self.tok.decode(&act.out);
         Ok(TurnEvent::Completed { turn: act.id, text })
     }
@@ -565,16 +657,15 @@ impl<D: DeviceClient> RunningEngine<D> {
 // §4 小件
 // ============================================================================
 
-/// 按 dtype 清零分配(KV 池;f16 = 2B/元素字节口径)
+/// 按 dtype 清零分配(KV/GDN 状态块)。**设备侧 alloc + memset**,不走
+/// host 零向量 —— 曾用 `vec![0f32; n]` + to_le_bytes 逐元素造 64MB(rec
+/// 单层 16M 元素),debug 循环烧掉 ~90s(F5-4 同款 debug 转换税);池
+/// alloc 无零保证,必须显式 memset(F5-4 已去 fill(0),不能省)
 async fn zero_block_dt<D: DeviceClient>(face: &mut D, n: usize, dt: Dtype) -> Result<BlockN> {
-    match dt {
-        Dtype::F16 => {
-            let bytes = vec![0u8; n * 2];
-            let b = eval_ops(TensorOps::from_host(Dtype::F16, vec![n], &bytes).step(), face).await?;
-            Ok((Bytes::new(b.id, 0), n))
-        }
-        _ => zero_block(face, n).await,
-    }
+    let esz = if dt == Dtype::F16 { 2 } else { 4 };
+    let b = face.alloc(dt, n).await?;
+    face.memset_zero(&b, n * esz).await?;
+    Ok((b, n))
 }
 
 fn block_leaf_dt(b: &Bytes, shape: Vec<usize>, dt: Dtype) -> TensorOps {
@@ -585,9 +676,7 @@ fn block_leaf_dt(b: &Bytes, shape: Vec<usize>, dt: Dtype) -> TensorOps {
 }
 
 async fn zero_block<D: DeviceClient>(face: &mut D, n: usize) -> Result<BlockN> {
-    let bytes: Vec<u8> = vec![0.0f32; n].iter().flat_map(|f| f.to_le_bytes()).collect();
-    let b = eval_ops(TensorOps::from_host(Dtype::F32, vec![n], &bytes).step(), face).await?;
-    Ok((Bytes::new(b.id, 0), n))
+    zero_block_dt(face, n, Dtype::F32).await
 }
 
 fn block_leaf(b: &Bytes, shape: Vec<usize>) -> TensorOps {
@@ -603,12 +692,30 @@ fn argmax(v: &[f32]) -> usize {
         .0
 }
 
-/// 增量解码:全量重解取后缀差分(byte-level BPE 多字节字符跨 token 兜底)
+/// 增量解码:全量重解取后缀差分。多字节字符跨 token 时,半截字节经
+/// tokenizers 解出 U+FFFD 占位(字节数与真前缀不等,**不能按字节
+/// index 切**)—— 差分按字节公共前缀比对,双侧回退到字符边界;尾部
+/// 占位符扣住不发,等拼全后随下一笔 delta 出(终文由 complete()
+/// 全文重解兜底,流式末字符可能延后一笔)
 fn decode_delta(tok: &Tokenizer, out: &[u32], decoded: &mut String) -> String {
+    const REPL: &str = "\u{FFFD}";
     let full = tok.decode(out);
-    let delta = full[decoded.len()..].to_string();
-    *decoded = full;
-    delta
+    let common = decoded
+        .as_bytes()
+        .iter()
+        .zip(full.as_bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut cut = common;
+    while cut > 0 && (!full.is_char_boundary(cut) || !decoded.is_char_boundary(cut)) {
+        cut -= 1;
+    }
+    let mut emit = full[cut..].to_string();
+    if emit.ends_with(REPL) {
+        emit.truncate(emit.len() - REPL.len());
+    }
+    *decoded = full[..cut + emit.len()].to_string();
+    emit
 }
 
 // ============================================================================
@@ -640,6 +747,30 @@ mod tests {
         let loaded = engine.loader().load_qwen35_0_8b(&asset_dir()).await.expect("装载");
         assert_eq!(loaded.model.layers.len(), 24);
         assert!(!loaded.tokenizer.encode("你好").is_empty(), "tokenizer 活性");
+    }
+
+    /// CPU:增量解码多字节字符跨 token(🌟 4 字节;逐 token 喂入,
+    /// 差分不得 panic 且终态与前缀累计一致)
+    #[tokio::test]
+    async fn cpu_incremental_decode_multibyte() {
+        let mut engine = Engine::on(
+            EngineConfig { device_ordinal: 0, max_seq_tokens: 64, prefill_chunk: 16 },
+            CpuFace::new(),
+        )
+        .expect("engine 构造");
+        let loaded = engine.loader().load_qwen35_0_8b(&asset_dir()).await.expect("装载");
+        let ids = loaded.tokenizer.encode("你好，一个🌟加一句中文。");
+        assert!(ids.len() >= 4, "测试需要多 token");
+        let mut acc = String::new();
+        for k in 1..=ids.len() {
+            let _delta = decode_delta(&loaded.tokenizer, &ids[..k], &mut acc);
+        }
+        let final_text = loaded.tokenizer.decode(&ids);
+        assert!(
+            final_text.starts_with(acc.trim_end()),
+            "累计差分应是终文前缀:acc={acc:?} final={final_text:?}"
+        );
+        assert!(final_text.contains('🌟'), "终文应含拆跨字符");
     }
 
     /// GPU 门控:双 turn 生命周期 —— submit 入队 / pump 事件流 / per-turn
@@ -690,6 +821,69 @@ mod tests {
         for (t, text) in &done {
             eprintln!("[test] t{t}: {text}");
             assert!(!text.trim().is_empty(), "t{t} 产出非空");
+        }
+    }
+
+    /// GPU 门控:同会话连续 turn(S0 验收)—— turn2 应命中账本
+    /// (跳过 GDN 重置,只 prefill 增量段);临时会话路径由生命周期
+    /// 测试覆盖,此处验 Some(id) 连续性 + 收口账推进。
+    #[tokio::test]
+    async fn gpu_session_continuity() {
+        let Some(ordinal) = gpu_ordinal() else {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return;
+        };
+        let dir = asset_dir();
+        let mut engine = Engine::new(EngineConfig {
+            device_ordinal: ordinal,
+            max_seq_tokens: 256,
+            prefill_chunk: 32,
+        })
+        .expect("构造");
+        let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
+        let mut running = engine.run(loaded).await.expect("装配");
+
+        // turn1:建立会话账(显式 id;None = 临时会话终了即焚,不归此测)
+        let (sid, t1) = running
+            .submit_session(Some(42), "请记住:我最喜欢的数字是七。", 16)
+            .expect("t1");
+        assert_eq!(sid, 42);
+        let text1 = drive_turn(&mut running, t1).await;
+        eprintln!("[test] t{t1}(session {sid}): {text1}");
+        assert!(!text1.trim().is_empty());
+        assert!(running.session_len(sid).unwrap_or(0) > 0, "turn1 收口账非零");
+
+        // turn2:同会话全量重发(历史 + 新问题)→ 守卫应命中,增量 prefill
+        let (sid2, t2) = running
+            .submit_session(
+                Some(sid),
+                "请记住:我最喜欢的数字是七。我刚才说我最喜欢的数字是什么?",
+                16,
+            )
+            .expect("t2");
+        assert_eq!(sid2, sid, "同会话归队");
+        let text2 = drive_turn(&mut running, t2).await;
+        eprintln!("[test] t{t2}(session {sid2}): {text2}");
+        assert!(!text2.trim().is_empty());
+
+        // 收口验证:账本应推到 turn2 全量 + 生成段;记忆质量(答“七”)
+        // 属 S3 金标验收,此处不断言文本内容
+        let cached = running.session_len(sid).expect("账在");
+        assert!(cached > 0, "同会话收口后账本非零");
+    }
+
+    /// 泵到目标 turn 完成,回吐全文(其间事件仅观测)
+    async fn drive_turn<D: DeviceClient>(running: &mut RunningEngine<D>, id: u64) -> String {
+        loop {
+            match running.pump().await.expect("pump") {
+                TurnEvent::Idle => panic!("turn {id} 队列丢失"),
+                TurnEvent::Prefill { turn, fed, total } if turn == id => {
+                    eprintln!("[ev] t{turn} prefill {fed}/{total}")
+                }
+                TurnEvent::Completed { turn, text } if turn == id => break text,
+                TurnEvent::Failed { turn, err } => panic!("t{turn} 失败: {err}"),
+                _ => {}
+            }
         }
     }
 }

@@ -6,3 +6,4 @@ roadmap.local/
 target
 __pycache__
 crates/*-bak
+dev_log

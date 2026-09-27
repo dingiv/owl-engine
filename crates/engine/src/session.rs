@@ -20,8 +20,14 @@
 //! 单槽串行:同一时刻一个活跃 session 独占 KV 槽区(0 号区起);
 //! `cached_len` 记录该会话已入 KV 的前缀长度 —— 下一个 turn 的全量
 //! prompt 中 `[0, cached_len)` 直接复用,**只 prefill 新增后缀**。
-//! 前缀一致性暂信任客户端(全量重发且顺序不变);真前缀匹配/radix
-//! 随 M2 continuous batching 立项。
+//!
+//! **S0 接线(2026-09-26)**:SessionTable 已入 RunningEngine —— 同会话
+//! turn 开启时跳过 GDN 重置、prefill 从 `cached_len` 起步;`submit(None)`
+//! = 临时会话(每 turn 独立,终了即焚,行为同 M0.5)。
+//! **S1 token 账 + 前缀守卫(同日精简版落地)**:`tokens` 账存已入 KV 的
+//! token 原文,`guard()` 比对新 prompt 前缀 —— 失配(客户端改写历史/
+//! 模板渲染不稳定)**回退全量重算**(正确性优先,缓存命中其次);
+//! 真前缀匹配/radix 树随 M2 continuous batching 立项。
 
 use crate::Result;
 
@@ -35,12 +41,28 @@ pub struct AgentSession {
     pub cached_len: usize,
     /// KV 槽基址(M0.5 单槽区 = 0;M2 分槽随 batching)
     pub slot_base: usize,
+    /// 会话 token 账(S1 前缀守卫的比对基准):已入 KV 的 token 原文,
+    /// 顺序 = prompt 段 + 生成段;`guard()` 逐 id 比对
+    pub tokens: Vec<u32>,
 }
 
 impl AgentSession {
     /// 新会话(零缓存起步)
     pub fn new(id: u64, slot_base: usize) -> Self {
-        Self { id, cached_len: 0, slot_base }
+        Self { id, cached_len: 0, slot_base, tokens: Vec::new() }
+    }
+
+    /// 前缀守卫(S1):客户端全量重发的 prompt,其 `[0, cached_len)` 段
+    /// 是否与账本逐 id 一致。true = 增量 prefill 安全;false = 失配,
+    /// 调用方须 [`Self::reset`] 后全量重算(GDN 状态一并重置)。
+    pub fn guard(&self, prompt: &[u32]) -> bool {
+        prompt.len() >= self.cached_len && self.tokens[..self.cached_len] == prompt[..self.cached_len]
+    }
+
+    /// 账本重置(前缀失配回退):清账,下个 turn 全量重算
+    pub fn reset(&mut self) {
+        self.cached_len = 0;
+        self.tokens.clear();
     }
 
     /// 会话 KV 预算校验:全量 prompt + 本 turn 生成长度 ≤ 槽区容量
@@ -59,10 +81,14 @@ impl AgentSession {
         }
     }
 
-    /// 回填账(prompt 段全部入 KV 后;generation 各 token 由引擎步进
-    /// 同步 +1 —— M0.5 由 decode 相位的 kv_len 表维护)
-    pub fn commit(&mut self, prompt_len: usize) {
-        self.cached_len = self.cached_len.max(prompt_len);
+    /// 回填账(turn 收口):KV 此刻已含「prompt 全量 + 生成段」,GDN
+    /// 状态跨 turn 连续。账本 = prompt ++ generated,`cached_len` 同步
+    /// 推进到总长(下一个 turn 的增量起点)。
+    pub fn commit_turn(&mut self, prompt: &[u32], generated: &[u32]) {
+        self.tokens.clear();
+        self.tokens.extend_from_slice(prompt);
+        self.tokens.extend_from_slice(generated);
+        self.cached_len = self.tokens.len();
     }
 }
 
@@ -116,23 +142,62 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_delta_and_commit() {
+    fn session_delta_guard_and_commit() {
         let mut st = SessionTable::new();
         let (id, s) = st.get_or_create(None);
         assert_eq!(id, 0);
         assert_eq!(s.cached_len, 0);
 
-        // turn1:全量 10 token → 全量 prefill,账推进
+        // turn1:全量 10 token → 零缓存守卫恒真,全量 prefill;收口账本
+        // = prompt(10) + 生成(2)
+        let p1: Vec<u32> = (0..10).collect();
+        assert!(s.guard(&p1));
         assert_eq!(s.delta_range(10), Some((0, 10)));
-        s.commit(10);
+        s.commit_turn(&p1, &[90, 91]);
+        assert_eq!(s.cached_len, 12);
+        assert_eq!(s.tokens, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 90, 91]);
 
-        // turn2:全量 16 token(历史 10 + 新消息 6)→ 只 prefill [10,16)
-        assert_eq!(s.delta_range(16), Some((10, 16)));
-        s.commit(16);
+        // turn2:全量 14 token(历史 12 + 新消息 2)→ 前缀命中,只 prefill
+        // [12,14);收口后再推进
+        let mut p2 = p1.clone();
+        p2.extend([90, 91, 7, 7]);
+        assert!(s.guard(&p2), "历史逐 id 一致应命中");
+        assert_eq!(s.delta_range(14), Some((12, 14)));
+        s.commit_turn(&p2, &[42]);
+        assert_eq!(s.cached_len, 15);
 
         // turn3:纯生成续段(无新增 prompt)→ None
-        assert_eq!(s.delta_range(16), None);
-        assert!(s.fits(16, 8, 32));
-        assert!(!s.fits(16, 24, 32));
+        assert_eq!(s.delta_range(15), None);
+        assert!(s.fits(15, 8, 32));
+        assert!(!s.fits(15, 24, 32));
+
+        // 前缀失配(客户端改写历史/模板漂移)→ 守卫拒 → 回退全量
+        let mut bad = p2.clone();
+        bad[3] = 999;
+        assert!(!s.guard(&bad));
+        s.reset();
+        assert_eq!(s.cached_len, 0);
+        assert!(s.tokens.is_empty());
+        assert!(s.guard(&bad), "重置后零缓存守卫恒真(全量重算)");
+
+        // 截短的历史(prompt 比账本还短)也拒
+        s.commit_turn(&p2, &[]);
+        assert!(!s.guard(&p2[..8]));
+    }
+
+    #[test]
+    fn session_table_lifecycle() {
+        let mut st = SessionTable::new();
+        let (a, _) = st.get_or_create(Some(7));
+        assert_eq!(a, 7, "显式 id 直取");
+        let (b, _) = st.get_or_create(None);
+        assert_eq!(b, 8, "自动分配递增");
+        assert!(st.get(7).is_some());
+        st.close(7).expect("close");
+        assert!(st.get(7).is_none());
+        assert!(st.close(7).is_err(), "重复 close 报错");
+        // 复活:close 后同 id 重建 = 零缓存新会话
+        let (_, s) = st.get_or_create(Some(7));
+        assert_eq!(s.cached_len, 0);
     }
 }

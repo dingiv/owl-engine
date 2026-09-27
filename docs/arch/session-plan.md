@@ -78,5 +78,23 @@ let logits = plan.read_output_f32("logits")?; // D2H 读槽
   M2 continuous batching 换真并发,submit/pump 形状不变。
 - **附带战果**:session 测试逮到 owl-cpu `matmul` k 自推缺陷(alloc 块无
   形状 → k=1;修复 = launch 标量权威)。
+- **S0/S1 会话接线(同日)**:SessionTable 入 RunningEngine ——
+  `submit_session(Some(id), …)` = 连续会话(同会话跳过 GDN 重置,只
+  prefill `cached_len..` 增量段);token 账前缀守卫(S1 精简版)失配
+  回退全量重算;`submit(None)` = 临时会话终了即焚。GPU 实测同会话
+  记忆 QA 全通(turn1 报数字 → turn2 答对)。
+- **增量解码定谳**:全量重解差分的字节 index 切法在多字节字符跨 token
+  (emoji 拆 token 解出 U+FFFD 占位)时 panic —— 改为字节公共前缀 +
+  双侧字符边界回退 + 尾部占位扣发(终文由 complete() 全文重解兜底)。
+- **服务架子**:apps/server 落地(OpenAI 兼容 `/v1/chat/completions`
+  stream SSE/非流式 + `/health` + `/v1/models`)—— engine actor 独占
+  专属 OS 线程(`RunningEngine` 非 Send:权重 Cell + 图闭包;A2.6
+  每卡一线程先声),ready 信号后开 HTTP 面;手写 HTTP/1.1 零重依赖。
+  挂账:多轮 chat template 正式渲染(现 naive 拼接,前缀守卫失配回退
+  全量)、usage 真账、采样参数(greedy)、keep-alive/chunked、turn abort。
+- **交互客户端**:apps/cli 落地(终端 REPL → server SSE;纯 std 阻塞
+  零异步依赖)——全量历史多轮 + 固定 session 键,逐 delta 流式渲染,
+  TTFT/chunk 数/总耗时统计(role 首帧空 content 不计);命令
+  `/new`(清历史+换 session 键)、`/quit`;冒烟多轮记忆全通。
 - 待办:M1 捕获三态接线(姿势 6 门禁/A1.4 预检/GraphLease)、设备采样、
-  M2 batching。
+  M2 batching、S3 会话金标验收。
