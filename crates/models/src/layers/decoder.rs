@@ -59,6 +59,15 @@ impl DecoderLayer {
             hidden,
         }
     }
+
+    /// W4A16 化(E3):mixer + mlp 的全部 Linear
+    pub fn enable_w4a16(&mut self) { // FIXME: 不基于可变范式, 在对象创建的时候，就把这个参数传进来。
+        match &mut self.mixer {
+            TokenMixer::Full(a) => a.enable_w4a16(),
+            TokenMixer::Gdn(g) => g.enable_w4a16(),
+        }
+        self.mlp.enable_w4a16();
+    }
 }
 
 impl Module for DecoderLayer {

@@ -38,7 +38,7 @@ use owl_models::layers::gdn::GdnBuffers;
 use owl_models::layers::rope::Rope;
 use owl_models::model::{Model, ModelSpec};
 use owl_models::module::{ForwardCtx, KvBuffers, Module};
-use owl_models::specs::{load_0_8b, load_tokenizer, qwen3_5_0_8b};
+use owl_models::specs::{load_0_8b, load_0_8b_w4a16, load_tokenizer, qwen3_5_0_8b};
 use owl_models::tokenizer::Tokenizer;
 use owl_models::{TensorOps};
 
@@ -85,6 +85,22 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let spec = qwen3_5_0_8b();
         let model = Arc::new(load_0_8b(dir, self.face).await?);
         let tokenizer = load_tokenizer(dir)?;
+        let rope = Rope::new(262_144, 256, 64, 10_000_000.0)?;
+        let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1 };
+        owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
+        Ok(LoadedModel { model, tokenizer, rope, spec })
+    }
+
+    /// W4A16 装载(E3;llm-compressor 产物目录):装载期重排到 marlin
+    /// 布局,q_proj 等全部达标 Linear 走 foreign GEMM(REQ-PRE-01)
+    pub async fn load_qwen35_0_8b_w4a16(
+        &mut self,
+        dir: &Path,
+        tokenizer_dir: &Path,
+    ) -> Result<LoadedModel> {
+        let spec = qwen3_5_0_8b();
+        let model = Arc::new(load_0_8b_w4a16(dir, self.face).await?);
+        let tokenizer = load_tokenizer(tokenizer_dir)?;
         let rope = Rope::new(262_144, 256, 64, 10_000_000.0)?;
         let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1 };
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
@@ -265,6 +281,9 @@ impl<D: DeviceClient> Engine<D> {
                 .collect();
             let ctx = ForwardCtx::model_decode(1, &pos, &kvs_step, &rp, &gdns_step);
             let tree = model.forward(&ids, &ctx);
+            // E3 设备采样:token = argmax(logits)(f32 数值过线,契约 5)
+            let tok = owl_models::ops::argmax_f32idx(&tree, vocab, 0);
+            sc.output("token", &tok);
             sc.output("logits", &tree)
         };
 
@@ -278,7 +297,10 @@ impl<D: DeviceClient> Engine<D> {
                     InputSlot::f32("kv_slot", 1),
                     InputSlot::f32("gdn_slot", 1).init(vec![0.0]),
                 ],
-                outputs: vec![OutputSlot { name: "logits", shape: vec![1, vocab], dtype: loaded.spec.dtype }],
+                outputs: vec![
+                    OutputSlot { name: "logits", shape: vec![1, vocab], dtype: loaded.spec.dtype },
+                    OutputSlot { name: "token", shape: vec![1], dtype: Dtype::F32 },
+                ],
                 capture: true,
             },
             forward,
@@ -678,24 +700,36 @@ impl<D: DeviceClient> RunningEngine<D> {
             ])
             .await?;
 
-        let act = self.active.as_mut().expect("active 已保证");
-        act.fed += 1;
-        let logits = self.session.read_output_f32("logits").await?;
-        // E2c:decode 跨页边界 → 快照拍摄(先拍再采样,同流保序)
+        {
+            let act = self.active.as_mut().expect("active 已保证");
+            act.fed += 1;
+        }
+        // E2c:decode 跨页边界 → 快照拍摄(同流保序,先拍再采样)
         {
             let act = self.active.as_ref().expect("active 已保证");
             if self.paged && act.fed % self.page == 0 {
                 self.capture_gdn_snap(act.session_id, act.fed).await?;
             }
         }
-        self.sample_and_emit(logits).await
+        // E3 设备采样:4B token 回读(旧 = 600KB logits dtoh + host argmax)。
+        // OWL_HOST_ARGMAX=1 = 对照开关(host argmax 校准设备采样数值)
+        let nt = if std::env::var_os("OWL_HOST_ARGMAX").is_some() {
+            let logits = self.session.read_output_f32("logits").await?;
+            logits.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |a, (i, &v)| {
+                if v > a.1 { (i, v) } else { a }
+            })
+            .0 as u32
+        } else {
+            let tok_f = self.session.read_output_f32("token").await?;
+            tok_f[0] as u32
+        };
+        self.sample_and_emit(nt).await
     }
 
-    /// 采样 + 事件产出(Greedy;host argmax —— 设备采样挂账)。
+    /// 采样 + 事件产出(Greedy;E3 设备 argmax,token id 直入)。
     /// eos 命中或预算尽 → Completed;否则 Token(delta = 解码文本增量)。
-    async fn sample_and_emit(&mut self, logits: Vec<f32>) -> Result<TurnEvent> {
+    async fn sample_and_emit(&mut self, nt: u32) -> Result<TurnEvent> {
         let turn_id = self.active.as_ref().expect("active 已保证").id;
-        let nt = argmax(&logits) as u32;
         if self.tok.is_eos(nt) {
             return self.complete().await;
         }
@@ -731,7 +765,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         ids: &[u32],
         base: usize,
         is_last: bool,
-    ) -> Result<Option<Vec<f32>>> {
+    ) -> Result<Option<u32>> {
         let d = self.dims;
         let t = ids.len();
         // E2b:活跃会话块链 + GDN 格(逻辑位 → 物理槽由块表换算)
@@ -794,24 +828,15 @@ impl<D: DeviceClient> RunningEngine<D> {
         let face = self.session.face_mut();
         let vocab = self.model.vocab_size();
         if is_last {
+            // E3:末行设备 argmax(4B 回读,免 [T,V] 大 dtoh)
             let tree = self.model.forward(&ids_t, &ctx);
-            let (b, arena) = eval_ops_scoped(tree.step(), face).await?;
-            let esz = if d.dtype == Dtype::F16 { 2 } else { 4 };
-            let mut buf = vec![0u8; t * vocab * esz];
+            let tok = owl_models::ops::argmax_f32idx(&tree, vocab, (t - 1) * vocab);
+            let (b, arena) = eval_ops_scoped(tok.step(), face).await?;
+            let mut buf = [0u8; 4];
             face.dtoh(&b, &mut buf).await?;
             face.free(&arena).await?; // E2a:根已收割,中间块归池
-            let off = (t - 1) * vocab * esz;
-            let row = buf[off..off + vocab * esz]
-                .chunks_exact(esz)
-                .map(|c| {
-                    if esz == 2 {
-                        half::f16::from_le_bytes([c[0], c[1]]).to_f32()
-                    } else {
-                        f32::from_le_bytes([c[0], c[1], c[2], c[3]])
-                    }
-                })
-                .collect();
-            Ok(Some(row))
+            let nt = f32::from_le_bytes(buf) as u32;
+            Ok(Some(nt))
         } else {
             // 中间块:last_hidden 根(状态推进完整;lm_head 免算)
             let tree = self.model.last_hidden(&ids_t, &ctx);
@@ -999,13 +1024,6 @@ fn block_leaf(b: &Bytes, shape: Vec<usize>) -> TensorOps {
 }
 
 /// 块零化(分块 write_block;1M 元素 = 4MB/笔)
-
-fn argmax(v: &[f32]) -> usize {
-    v.iter()
-        .enumerate()
-        .fold((0usize, f32::NEG_INFINITY), |a, (i, &x)| if x > a.1 { (i, x) } else { a })
-        .0
-}
 
 /// 增量解码:全量重解取后缀差分。多字节字符跨 token 时,半截字节经
 /// tokenizers 解出 U+FFFD 占位(字节数与真前缀不等,**不能按字节
@@ -1301,6 +1319,52 @@ mod tests {
             assert!(!text2.trim().is_empty(), "t{t2} 产出非空");
             assert!(running.session_len(sid).unwrap_or(0) >= n_tok, "账本收口");
         }
+    }
+
+    /// GPU 门控:W4A16 marlin 全链 e2e(E3 验收;REQ-PRE-01)——
+    /// llm-compressor 转换的 0.8B W4A16 检查点装载(装载期 ct→marlin
+    /// 重排)+ 生成:eligible Linear 走 foreign marlin GEMM,小线性
+    /// (GDN in_proj_z/b/a)反量化 f16 直读。
+    #[tokio::test]
+    async fn gpu_w4a16_marlin_e2e() {
+        // let Some(ordinal) = gpu_ordinal() else {
+        //     eprintln!("skip: OWL_TEST_DEVICE 未设");
+        //     return;
+        // };
+        let dir = asset_dir(); // 转换产物与 f16 同目录约定:../Qwen3.5-0.8B-W4A16
+        let w4a16_dir = dir
+            .parent()
+            .expect("assets")
+            .join("Qwen3.5-0.8B-W4A16");
+        if !w4a16_dir.exists() {
+            eprintln!("skip: W4A16 检查点不存在({:?}),先跑转换器", w4a16_dir);
+            return;
+        }
+        let mut engine = Engine::new(EngineConfig {
+            device_ordinal: 2,
+            max_seq_tokens: 256,
+            prefill_chunk: 32,
+        })
+        .expect("构造");
+        let loaded = engine
+            .loader()
+            .load_qwen35_0_8b_w4a16(&w4a16_dir, &dir)
+            .await
+            .expect("W4A16 装载");
+        let mut running = engine.run(loaded).await.expect("装配");
+        assert!(
+            matches!(running.capture_outcome, crate::graph_plan::PlanOutcome::Captured),
+            "W4A16 decode 图应捕获成功(回放态),得 {:?}",
+            running.capture_outcome
+        );
+        let t0 = std::time::Instant::now();
+        let t1 = running
+            .submit("用一句话介绍长城。", 16)
+            .expect("submit");
+        let text = drive_turn(&mut running, t1).await;
+        eprintln!("[bench] W4A16 16 tok @ {:?}({:.1} tok/s)", t0.elapsed(), 16.0 / t0.elapsed().as_secs_f64());
+        eprintln!("[test] W4A16 答: {text}");
+        assert!(!text.trim().is_empty(), "产出非空");
     }
 
     /// GPU 门控:多会话隔离(E2b 验收)—— A/B 两会话交替 turn:

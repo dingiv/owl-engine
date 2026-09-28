@@ -110,7 +110,8 @@ async fn run_case(client: &mut GpuClient, m: usize, n: usize, k: usize, g: usize
     // u16 位序 = f16 LE ✓(f16::to_bits 是 u16 表示,LE 字节序正确)
     let db = client.htod(Dtype::U32, &Shape::from(vec![b_packed.len()]), &le_i32(&b_packed)).await.expect("htod b");
     let ds = client.htod(Dtype::F16, &Shape::from(vec![s_packed.len()]), &le_u16(&s_packed)).await.expect("htod s");
-    let ws_len = owl_kernels::marlin::v2_workspace_len(n).max(n / 128 * 16);
+    let ws_mul: usize = std::env::var("OWL_WS_MUL").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let ws_len = owl_kernels::marlin::v2_workspace_len(n).max(n / 128 * 16) * ws_mul;
     let dws = client.alloc(Dtype::U32, ws_len).await.expect("alloc ws");
     let dctmp = client.alloc(Dtype::U32, 1).await.expect("alloc ctmp");
     let dc = client.alloc(Dtype::F16, m * n).await.expect("alloc c");
@@ -152,4 +153,18 @@ async fn marlin_w4a16_parity() {
         );
     }
     client.sync().await.expect("sync");
+}
+
+/// E3 形状扫描(0.8B W4A16 实际形状;定位 marlin 挂起形状)
+#[tokio::test]
+async fn marlin_shape_sweep() {
+    let mut client = assemble();
+    let cases: Vec<(usize, usize, usize, usize)> = (1..=12usize)
+        .map(|step| (32usize, step * 512usize, 1024usize, 128usize))
+        .collect();
+    for (m, n, k, g) in cases {
+        eprintln!("[sweep] try m={m} n={n} k={k} g={g}");
+        let (noise_ratio, _max_abs) = run_case(&mut client, m, n, k, g).await;
+        eprintln!("[sweep] done m={m} n={n} k={k} → {noise_ratio:.6}");
+    }
 }

@@ -613,3 +613,82 @@ async fn gpu_prefill_paged_attn_f16_smoke() {
     }
     gpu.close().await.expect("关机");
 }
+
+/// 设备 argmax 对拍 host(E3 采样器哨兵):随机 + 平局 + 偏移三用例
+#[tokio::test]
+async fn gpu_argmax_f32idx_matches_host() {
+    if !crate::testkit::gpu_enabled() {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    }
+    use crate::ops::argmax_f32idx;
+    let mut gpu = crate::testkit::gpu_client().await;
+
+    // 伪随机 + 人造双峰平局(max 出现在 idx 1000 与 7777 同值 → 首见者胜)
+    let n = 100_003usize;
+    let mut vals: Vec<f32> = (0..n)
+        .map(|i| ((i as f64 * 0.618_033_988_7).fract() * 2.0 - 1.0) as f32)
+        .collect();
+    vals[1000] = 0.987;
+    vals[7777] = 0.987; // 平局:首见(1000)胜
+    vals[99_999] = 0.5;
+    let bytes: Vec<u8> = vals
+        .iter()
+        .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+        .collect();
+
+    // host 参照按 f16 量化后比对(核读 f16;0.99998 与 0.99987 在 f16
+    // 同为 1.0 —— 首见者胜,与 reshape 测试的量化参照同纪律)
+    let q = |v: f32| half::f16::from_f32(v).to_f32();
+    let host = |vals: &[f32], off: usize| -> usize {
+        vals[off..]
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |a, (i, &v)| {
+                if q(v) > a.1 { (i, q(v)) } else { a }
+            })
+            .0
+            + off
+    };
+
+    // 用例 1:offset = 0
+    let decl = argmax_f32idx(&TensorOps::from_host(Dtype::F16, vec![n], &bytes), n, 0);
+    let b = crate::interpreters::eval_ops(decl.step(), &mut gpu).await.expect("eval");
+    let mut buf = [0u8; 4];
+    gpu.dtoh(&b, &mut buf).await.expect("dtoh");
+    let got = f32::from_le_bytes(buf) as usize;
+    eprintln!("[dbg argmax] got={got} host={} max_host_val={}", host(&vals, 0), vals[host(&vals, 0)]);
+    eprintln!("[dbg argmax] vals[got]={:?}", vals.get(got));
+    assert_eq!(got, host(&vals, 0), "offset=0 argmax 错位");
+
+    // 用例 2:offset = 1000(末行窄视等价;平局验证首见胜)
+    let n2 = n - 1000;
+    let decl = argmax_f32idx(&TensorOps::from_host(Dtype::F16, vec![n2], &bytes[2000..]), n2, 0);
+    let b = crate::interpreters::eval_ops(decl.step(), &mut gpu).await.expect("eval");
+    let mut buf = [0u8; 4];
+    gpu.dtoh(&b, &mut buf).await.expect("dtoh");
+    let got = f32::from_le_bytes(buf) as usize;
+    assert_eq!(
+        got,
+        host(&vals, 1000) - 1000,
+        "切片相对索引 argmax 错位"
+    );
+
+    // 用例 3:大 n(词表量级 151_936,越 64K 边界扫查)
+    let n3 = 151_936usize;
+    let vals3: Vec<f32> = (0..n3)
+        .map(|i| ((i as f64 * 0.754_877_666).fract() * 2.0 - 1.0) as f32)
+        .collect();
+    let bytes3: Vec<u8> = vals3
+        .iter()
+        .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+        .collect();
+    let decl = argmax_f32idx(&TensorOps::from_host(Dtype::F16, vec![n3], &bytes3), n3, 0);
+    let b = crate::interpreters::eval_ops(decl.step(), &mut gpu).await.expect("eval");
+    let mut buf = [0u8; 4];
+    gpu.dtoh(&b, &mut buf).await.expect("dtoh");
+    let got = f32::from_le_bytes(buf) as usize;
+    assert_eq!(got, host(&vals3, 0), "词表量级 argmax 错位");
+
+    gpu.close().await.expect("关机");
+}

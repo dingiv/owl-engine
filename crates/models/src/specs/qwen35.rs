@@ -54,6 +54,16 @@ impl KeyConvention for Qwen35Convention {
         format!("{}.{}{}.weight", self.base, "", local)
     }
     fn layer_key(&self, i: usize, local: &str) -> String {
+        // E3 量化后缀:local 可带 `.qweight/.scales/.ws`(marlin 三件套)
+        // —— 剥离后按基名定子前缀,量化后缀替代 `.weight`
+        let (local, qsuffix) = match local.rsplit_once('.') {
+            Some((b, s))
+                if matches!(s, "qweight" | "scales" | "ws" | "marlin_ws" | "marlin_ctmp") =>
+            {
+                (b, Some(format!(".{s}")))
+            }
+            _ => (local, None),
+        };
         let (sub, suffix) = match local {
             // 层共用件:双 norm 无子前缀
             "input_layernorm" | "post_attention_layernorm" => ("", ".weight"),
@@ -70,7 +80,9 @@ impl KeyConvention for Qwen35Convention {
             }
             other => unreachable!("Qwen35Convention: 未知层内局部键 {other}"),
         };
-        format!("{}.layers.{i}.{}{local}{}", self.base, sub, suffix)
+        // 量化后缀替代 `.weight`(裸键 A_log/dt_bias 不会被量化,互斥)
+        let tail = qsuffix.unwrap_or_else(|| suffix.to_string());
+        format!("{}.layers.{i}.{}{local}{tail}", self.base, sub)
     }
 }
 
@@ -92,6 +104,22 @@ pub async fn load_0_8b<D: DeviceClient + 'static>(
     let src = SafeTensorsSource::open_dir(dir)?;
     // F16 直转装载(F5;权重 bf16 检查点 → f16 字节,不再 f32 设备中转)
     let ctx = crate::module::LoaderCtx { dtype: qwen3_5_0_8b().dtype, shard: 1 };
+    crate::interpreters::eval_load(&model, face, &src, &ctx).await?;
+    Ok(model)
+}
+
+/// 装载 Qwen3.5-0.8B **W4A16**(E3;llm-compressor 产物目录,
+/// compressed-tensors pack-quantized)—— 装载期重排到 marlin 布局
+/// (w4a16.rs 源;小线性自动反量化 f16)。
+pub async fn load_0_8b_w4a16<D: DeviceClient + 'static>(
+    dir: &Path,
+    face: &mut D,
+) -> Result<Model, ModelError> {
+    let spec = qwen3_5_0_8b();
+    let mut model = Model::new(&spec, Qwen35Convention::new("model.language_model"));
+    model.enable_w4a16();
+    let src = crate::w4a16::W4A16Source::open_dir(dir)?;
+    let ctx = crate::module::LoaderCtx { dtype: crate::contract::Dtype::F16, shard: 1 };
     crate::interpreters::eval_load(&model, face, &src, &ctx).await?;
     Ok(model)
 }

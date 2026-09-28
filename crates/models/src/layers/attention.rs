@@ -64,6 +64,14 @@ impl Attention {
         }
     }
 
+    /// W4A16 化(E3):四投影量化臂(尺寸门控在 Linear 内)
+    pub fn enable_w4a16(&mut self) {
+        self.q_proj.enable_w4a16();
+        self.k_proj.enable_w4a16();
+        self.v_proj.enable_w4a16();
+        self.o_proj.enable_w4a16();
+    }
+
     /// 计算声明(decode;xs [T, hidden],T = ctx.tokens;C4 后回归 Module)。
     /// rope 表与 pos / KV 引用由 ctx 注入(rope 全局一份,表已是设备块);
     /// 缺任一动态依赖 → 毒值声明(eval 边界收割,与未装载槽同构)。
@@ -102,8 +110,11 @@ impl Attention {
         // naive decode attention(slot 直排;一线程一 (t, q_head));
         // 核名/输出 dtype 跟随 q 声明(F5 整模切换;KV cache f16)
         let dt = q.dtype;
+        // 诊断开关(OWL_FORCE_NAIVE=1):强制 naive 回退路径 —— paged 核
+        // 数值质量的 A/B 对照(2026-09-27 文本退化排查)
+        let force_naive = std::env::var_os("OWL_FORCE_NAIVE").is_some();
         if let Some(pol) = crate::module::kv_paged_policy(dt) {
-            if self.hd == 128 || self.hd == 256 {
+            if !force_naive && (self.hd == 128 || self.hd == 256) {
                 // paged 分派(K1):K0 写核 + v1 分页打分(vLLM classic 布局;
                 // 页/x/核名来自 kv_paged_policy,块表语义见 block_tables 头注)
                 return self.paged_decode_output(&q, &k, &v, &gate, kv, tokens, ctx, &pol);
@@ -235,6 +246,10 @@ impl Attention {
         self.o_proj.forward(&y, ctx)
     }
 
+    fn force_naive_prefill() -> bool {
+        std::env::var_os("OWL_FORCE_NAIVE").is_some()
+    }
+
     /// paged prefill(PF1 终;F16 hd∈{128,256}):K0 批量写池(T 行散写)
     /// + chunked prefill 批核(bs16 特化;因果语义 = 查询 token t 看
     /// [0, seq_start+t])。naive 逐 token 路径保留为回退。
@@ -362,7 +377,9 @@ impl Attention {
             if let Some(pol) = crate::module::kv_paged_policy(dt) {
                 if self.hd == 128 || self.hd == 256 {
                     // 诊断二分:prefill paged 临时关闭
-                    return self.paged_prefill_output(&q, &k, &v, &gate, kv, tokens, ctx, &pol);
+                    if !Self::force_naive_prefill() {
+                        return self.paged_prefill_output(&q, &k, &v, &gate, kv, tokens, ctx, &pol);
+                    }
                 }
             }
         }

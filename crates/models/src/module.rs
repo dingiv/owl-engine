@@ -658,18 +658,51 @@ pub struct Weight {
     /// 出声明 —— 默认 F32(CPU 单元面);f16 模型经 LoaderCtx 自动跟随,
     /// 层构造器零涟漪(Cell 内部可变;Weight 使用面恒 &self)
     dtype: std::cell::Cell<Dtype>,
+    /// dtype 覆盖(E3 量化臂:qweight U32 / scales F16 不随 LoaderCtx
+    /// 整模 dtype 漂移;Some = layout 期钉死)
+    dtype_override: Option<Dtype>,
 }
 
 impl Weight {
     /// 登记权重(new 期;零副作用;Direct 布局)
     pub fn new(key: &'static str, shape: Shape) -> Self {
-        Self { key, shape, transposed: false, cell: SlotCell::default(), dtype: std::cell::Cell::new(Dtype::F32) }
+        Self {
+            key,
+            shape,
+            transposed: false,
+            cell: SlotCell::default(),
+            dtype: std::cell::Cell::new(Dtype::F32),
+            dtype_override: None,
+        }
+    }
+
+    /// 定 dtype 的权重(E3 量化三件套:qweight U32 / scales F16 /
+    /// marlin ws U32 —— dtype 不随 LoaderCtx 整模切换漂移)
+    pub fn new_typed(key: &'static str, shape: Shape, dtype: Dtype) -> Self {
+        Self {
+            key,
+            shape,
+            transposed: false,
+            cell: SlotCell::default(),
+            dtype: std::cell::Cell::new(dtype),
+            dtype_override: Some(dtype),
+        }
+    }
+
+    /// U32 定 dtype 简写(marlin qweight / workspace)
+    pub fn new_typed_u32(key: &'static str, shape: Shape) -> Self {
+        Self::new_typed(key, shape, Dtype::U32)
+    }
+
+    /// F16 定 dtype 简写(marlin scales)
+    pub fn new_typed_f16(key: &'static str, shape: Shape) -> Self {
+        Self::new_typed(key, shape, Dtype::F16)
     }
 
     /// 转置权重:源 [rows, cols] 行主序 → 装载声明 [cols, rows]
     /// (Linear 惯例:forward 直 matmul,decode 零转置)
     pub fn new_transposed(key: &'static str, rows: usize, cols: usize) -> Self {
-        Self { key, shape: vec![cols, rows], transposed: true, cell: SlotCell::default(), dtype: std::cell::Cell::new(Dtype::F32) }
+        Self { key, shape: vec![cols, rows], transposed: true, cell: SlotCell::default(), dtype: std::cell::Cell::new(Dtype::F32), dtype_override: None }
     }
 
     /// 装载生命周期:按语境声明需求(元数据直出 + 回填口;零 src 零数据)
@@ -680,10 +713,13 @@ impl Weight {
     /// 变键布局(tied 聚合用:lm_head 转置槽与 w 同源键直读;
     /// Want 键不需唯一 —— 各带各的 sink,eval_want 逐条取数回填)
     pub(crate) fn layout_as(&self, key: impl Into<String>, ctx: &LoaderCtx) -> LoaderOps {
-        self.dtype.set(ctx.dtype); // decl 与装载同源(F5 整模切换)
+        // decl 与装载同源(F5 整模切换);dtype_override = 量化臂钉死
+        // (E3:qweight U32 / scales F16 不随整模 dtype 漂移)
+        let dtype = self.dtype_override.unwrap_or(ctx.dtype);
+        self.dtype.set(dtype);
         LoaderOps::want(Want {
             key: key.into(),
-            dtype: ctx.dtype,
+            dtype,
             shape: self.shape.clone(),
             layout: if self.transposed { Layout::Transposed } else { Layout::Direct },
             sink: Sink(self.cell.clone()),

@@ -26,6 +26,13 @@ impl Mlp {
         }
     }
 
+    /// W4A16 化(E3):三投影量化臂(尺寸门控在 Linear 内)
+    pub fn enable_w4a16(&mut self) {
+        self.gate_proj.enable_w4a16();
+        self.up_proj.enable_w4a16();
+        self.down_proj.enable_w4a16();
+    }
+
 
 }
 

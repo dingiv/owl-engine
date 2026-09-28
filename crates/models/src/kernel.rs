@@ -122,6 +122,8 @@ pub static REGISTRY: &[Entry] = &[
     Entry { name: "owl_embed_f16", source: text::EMBED_F32, args: "T,T,sz,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_rope_half_partial_f16", source: text::ROPE_HALF_PARTIAL_F32, args: "T,T,T,T,sz,sz,sz,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_narrow_strided_f16", source: text::ATTENTION_F32, args: "T,sz,sz,sz,sz,T", dtype: crate::contract::Dtype::F16 },
+    // ---- 采样(E3;设备 argmax,输出口径 F32 = 索引数值过线)----
+    Entry { name: "owl_argmax_f32idx_f16", source: sources::owl::ARGMAX_F16, args: "T,i32,i32,T", dtype: crate::contract::Dtype::F32 },
     // ---- GDN + attention f16 变体(F4;state 恒 f32 混合核,输出口径 F16)----
     Entry { name: "owl_gdn_gating_g_f16", source: text::GDN_F32, args: "T,T,T,sz,sz,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_gdn_l2norm_f16", source: text::GDN_F32, args: "T,sz,sz,f32,T", dtype: crate::contract::Dtype::F16 },

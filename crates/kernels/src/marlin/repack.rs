@@ -498,3 +498,62 @@ pub fn pack_marlin_z(zp: &[u8], out: usize, groups: usize) -> Vec<i32> {
     }
     packed
 }
+
+// ============================================================================
+// E3-ii 提速(2026-09-27):索引表单次构建 + 纯 gather 打包。
+// 原 pack_marlin_b 每 nibble 4 次除法(n16/256/16 运行时值)且任务数
+// 仅 b.len()/65536(≤8)—— 0.8B 全模重排实测 52s。拆两步:
+//   marlin_gather_indices(k, n)  除法分解,每 (k,n) 形状只算一次
+//   pack_marlin_b_gather(q, idx) 纯 gather(rayon 全宽并行)
+// 输出与 pack_marlin_b 逐字节一致(同 perm 同分解,仅消重复除法)。
+// ============================================================================
+
+/// (k, n) → 每 word 每 nibble 的 q 源下标(rayon;形状级一次构建)。
+pub fn marlin_gather_indices(k: usize, n: usize) -> Vec<u32> {
+    let perm = marlin_perm();
+    let n16 = n * 16;
+    let words = k * n / 8;
+    let mut idx = vec![0u32; words * 8];
+    idx.par_chunks_mut(8 * 4096)
+        .enumerate()
+        .for_each(|(task, out)| {
+            let w0 = task * 4096;
+            for (wi, wslot) in out.chunks_mut(8).enumerate() {
+                let w = w0 + wi;
+                let base = w * 8;
+                let chunk = base / 1024;
+                let dst0 = base % 1024;
+                for (j, cell) in wslot.iter_mut().enumerate() {
+                    let src = perm[dst0 + j];
+                    let r = chunk * 1024 + src;
+                    let kb = r / n16;
+                    let rem = r % n16;
+                    let nb = rem / 256;
+                    let t1 = (rem % 256) / 16;
+                    let t2 = rem % 16;
+                    let i = kb * 16 + t1;
+                    let o = nb * 16 + t2;
+                    *cell = (o * k + i) as u32;
+                }
+            }
+        });
+    idx
+}
+
+/// 纯 gather 打包(索引表来自 [`marlin_gather_indices`];全宽并行)。
+pub fn pack_marlin_b_gather(q: &[u8], idx: &[u32], words: usize) -> Vec<i32> {
+    let mut b = vec![0i32; words];
+    b.par_chunks_mut(4096)
+        .enumerate()
+        .for_each(|(task, out)| {
+            for (wi, word) in out.iter_mut().enumerate() {
+                let w = task * 4096 + wi;
+                let mut v = 0u32;
+                for j in 0..8 {
+                    v |= (q[idx[w * 8 + j] as usize] as u32) << (4 * j);
+                }
+                *word = v as i32;
+            }
+        });
+    b
+}

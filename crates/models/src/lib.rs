@@ -49,6 +49,7 @@ pub mod loader;
 pub mod model;
 pub mod module;
 pub mod ops;
+pub mod w4a16;
 pub mod reference;
 pub mod specs;
 pub mod tensor;

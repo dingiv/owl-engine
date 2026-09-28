@@ -79,6 +79,14 @@ pub struct Model {
 }
 
 impl Model {
+    /// W4A16 化(E3):全部 DecoderLayer 的 Linear 量化臂启用。
+    /// **embed/lm_head(tied)不量化**(质量敏感;输出头保持 f16)。
+    pub fn enable_w4a16(&mut self) {
+        for layer in &mut self.layers {
+            layer.enable_w4a16();
+        }
+    }
+
     /// 准备容器(纯元数据;零数据零副作用)。keys = 检查点键名约定
     /// (默认 [`LlamaFamily`];Qwen3.5 等特有约定由 specs 传入)。
     pub fn new(spec: &ModelSpec, keys: impl KeyConvention + Send + Sync + 'static) -> Model {

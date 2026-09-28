@@ -343,8 +343,19 @@ pub fn lower_kernel(
         ),
     };
     let toks: Vec<&str> = sig.split(',').collect();
-    // 输出块 = 末位 T;其余 T 槽数必须等于父依赖数
-    let t_in = toks[..toks.len() - 1].iter().filter(|t| **t == "T").count();
+    // 输出槽位:E3 起 sig 可含 "O"(输出块所在槽,marlin foreign 等
+    // out 非末参的核);无 O = 末位 T(向后兼容)
+    let out_pos = toks.iter().position(|t| *t == "O");
+    let is_out = |i: usize| match out_pos {
+        Some(p) => i == p,
+        None => i + 1 == toks.len(),
+    };
+    // 其余 T 槽数必须等于父依赖数
+    let t_in = toks
+        .iter()
+        .enumerate()
+        .filter(|(i, t)| **t == "T" && !is_out(*i))
+        .count();
     assert!(
         t_in == ins.len(),
         "lower_kernel({}): 签名 T 槽 {t_in} != 父依赖 {}(检查 .arg 链)",
@@ -352,10 +363,10 @@ pub fn lower_kernel(
         ins.len()
     );
     assert!(
-        toks.len() - 1 - t_in == scalars.len(),
+        toks.len() - t_in - 1 == scalars.len(), // -1 = 输出槽(末位 T 或 O)
         "lower_kernel({}): 签名标量槽 {} != 标量参数 {}(sz/i32/f32 与 arg_usize/arg_i32/arg_f32 对位)",
         kernel.name,
-        toks.len() - 1 - t_in,
+        toks.len() - t_in - 1,
         scalars.len()
     );
 
@@ -364,9 +375,10 @@ pub fn lower_kernel(
     let mut args: Vec<Arg> = Vec::with_capacity(toks.len());
     let (mut pi, mut si) = (0usize, 0usize);
     for (i, tok) in toks.iter().enumerate() {
-        let is_out = i == toks.len() - 1;
+        let is_out = is_out(i);
         match *tok {
             "T" if is_out => args.push(Arg::Block { id: out.id }),
+            "O" => args.push(Arg::Block { id: out.id }),
             "T" => {
                 args.push(Arg::Block { id: ins[pi].id });
                 pi += 1;
@@ -407,4 +419,27 @@ pub fn lower_kernel(
 /// 自动 1D grid(哨兵展开用)
 pub fn auto_grid(out_elems: usize) -> (u32, u32, u32) {
     ceil_1d(out_elems)
+}
+
+// ============================================================================
+// 采样(E3;REQ-DEC-04 每步零大 D2H)
+// ============================================================================
+
+/// 设备侧贪心采样声明:logits 树的 argmax 索引,输出 [1] f32(索引数值
+/// 过线,owl 契约 5;词表 id < 2²⁴ 精确)。平局取最小索引(与 host
+/// argmax fold 语义一致)。核 = owl_argmax_f32idx_f16(单块两段规约;
+/// cu/owl/argmax_f16.cu 头注)。`offset` = 末行起点(prefill 末块
+/// [T,V] 传 (T-1)·V;decode T=1 传 0)。
+pub fn argmax_f32idx(x: &crate::tensor::TensorOps, n: usize, offset: usize) -> crate::tensor::TensorOps {
+    use crate::contract::Dtype;
+    crate::tensor::TensorOps::of(crate::kernel::kernel_with(
+        "owl_argmax_f32idx_f16",
+        (1, 1, 1),
+        (256, 1, 1),
+        0,
+    ))
+    .arg(x)
+    .arg_i32(n as i32)
+    .arg_i32(offset as i32)
+    .with_shape(Dtype::F32, vec![1])
 }

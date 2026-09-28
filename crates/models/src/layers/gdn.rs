@@ -353,6 +353,16 @@ impl GatedDeltaNet {
         }
     }
 
+    /// W4A16 化(E3):五投影量化臂(小投影尺寸门控自动落 f16;
+    /// conv/A_log/dt_bias 保持高精度)
+    pub fn enable_w4a16(&mut self) { // FIXME: 不基于可变范式，在对象创建的时候就把这个参数传进来。
+        self.in_proj_qkv.enable_w4a16();
+        self.in_proj_z.enable_w4a16();
+        self.in_proj_b.enable_w4a16();
+        self.in_proj_a.enable_w4a16();
+        self.out_proj.enable_w4a16();
+    }
+
     fn key_dim(&self) -> usize {
         self.nk * self.hk_dim
     }

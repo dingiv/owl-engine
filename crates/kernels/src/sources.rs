@@ -18,6 +18,8 @@ pub const OPS_F16: &str = include_str!("../cu/ops_pair.cu");
 /// owl 移植位(工单 N;NInfer 等外部引擎核的 owl 契约改写)
 pub mod owl {
     pub const SIGMOID_GATE_MUL_F16: &str = include_str!("../cu/owl/sigmoid_gate_mul_f16.cu");
+    /// 设备侧贪心采样(E3;REQ-DEC-04)
+    pub const ARGMAX_F16: &str = include_str!("../cu/owl/argmax_f16.cu");
 }
 
 /// attention port 家族(K0 起步;vendor attention.rs rev c0f19f2,Apache-2.0,
