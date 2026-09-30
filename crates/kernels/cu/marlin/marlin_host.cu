@@ -452,12 +452,29 @@ int marlin_gemm_v2_w4a8_ffi(const void* A, const void* B, void* C,
   int sms = 0;
   cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
   int num_groups = (group_size == -1) ? 1 : prob_k / group_size;
-  return marlin_mm(A, B, C, c_tmp, const_cast<void*>(b_scales),
-                   const_cast<void*>(a_scales), /*a_is_s8=*/true,
-                   /*b_z=*/nullptr, /*use_zp=*/false,
-                   prob_m, prob_n, prob_k, prob_k, workspace, num_groups,
-                   group_size, dev, (cudaStream_t)stream, -1, -1, sms,
-                   /*is_bf16=*/is_bf16 != 0);
+
+  // S1 暗雷教训落地(2026-09-30):a_is_s8 ⇒ marlin_mm 内 use_fp32_reduce
+  // 恒真 → slice_count>1 形状走 global_reduce_fp32,c_tmp 由**本发射器
+  // 自管**(流序 malloc_async;内核之后流序 free_async 归池)——调用方
+  // 传什么都无法再以 4B 占位踩内存(g128 暗雷同款事故面消除)。
+  // 尺寸 = 上游契约(vLLM marlin.cu):sms × min(ceil(m/16)*16, 64)
+  // × max_thread_n(256) f32;免初始化(locks/barrier 保证写先于读)。
+  (void)c_tmp;  // 调用方占位废弃
+  int max_m_block = (prob_m + 15) / 16 * 16;
+  if (max_m_block > 64) max_m_block = 64;
+  void* c_tmp_own = nullptr;
+  if (cudaMallocAsync(&c_tmp_own,
+                      (size_t)sms * max_m_block * 256 * sizeof(float),
+                      (cudaStream_t)stream) != cudaSuccess)
+    return 7;
+  int err = marlin_mm(A, B, C, c_tmp_own, const_cast<void*>(b_scales),
+                      const_cast<void*>(a_scales), /*a_is_s8=*/true,
+                      /*b_z=*/nullptr, /*use_zp=*/false,
+                      prob_m, prob_n, prob_k, prob_k, workspace, num_groups,
+                      group_size, dev, (cudaStream_t)stream, -1, -1, sms,
+                      /*is_bf16=*/is_bf16 != 0);
+  cudaFreeAsync(c_tmp_own, (cudaStream_t)stream);
+  return err;
 }
 
 // P5-Q1a:AWQ(kU4 非对称)通路。b_zeros = marlin_zero_points 布局

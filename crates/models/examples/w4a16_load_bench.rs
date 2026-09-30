@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use owl_models::contract::Dtype;
+use owl_models::formats::w4a16::W4A16Source;
 use owl_models::module::WeightSource;
 
 fn main() {
@@ -24,7 +25,7 @@ fn main() {
     println!("[bench] dir={} 模式={}", dir.display(), if touch { "索引+全键物化" } else { "仅索引" });
 
     let t = Instant::now();
-    let src = owl_models::w4a16::W4A16Source::open_dir(&dir).expect("open_dir");
+    let src = W4A16Source::open_dir(&dir).expect("open_dir");
     println!("[bench] open_dir {:?}", t.elapsed());
     if !touch {
         return;

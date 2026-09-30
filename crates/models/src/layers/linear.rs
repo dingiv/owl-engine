@@ -8,7 +8,7 @@
 use crate::contract::Dtype;
 use crate::layers::narrow_strided;
 use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, QuantPlan, Weight};
-use crate::w4a16::marlin_n_pack;
+use crate::formats::w4a16::marlin_n_pack;
 use crate::TensorOps;
 use owl_kernels::marlin::{v2_workspace_len, GEMM_W4A16};
 
@@ -45,7 +45,7 @@ impl Linear {
             ws: None,
             ctmp: None,
         };
-        if plan == QuantPlan::W4A16 && crate::w4a16::marlin_eligible(out_dim, in_dim) {
+        if plan == QuantPlan::W4A16 && crate::formats::w4a16::marlin_eligible(out_dim, in_dim) {
             lin.quantize_g128();
         }
         lin
@@ -60,7 +60,7 @@ impl Linear {
     /// (foreign 通道),装载换三件套(qweight marlin-packed i32 / scales
     /// f16 / workspace 零初始化)。
     fn quantize_g128(&mut self) {
-        debug_assert!(crate::w4a16::marlin_eligible(self.out_dim, self.in_dim));
+        debug_assert!(crate::formats::w4a16::marlin_eligible(self.out_dim, self.in_dim));
         let g = 128usize;
         let n_pack = marlin_n_pack(self.out_dim); // 直通(eligible 保证 n%256==0)
         let key: &'static str = self.w.key();

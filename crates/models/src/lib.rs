@@ -25,7 +25,8 @@
 //! - [`module`]:层协议双面 —— Module/ForwardCtx(计算)+ Loadable/Weight/
 //!   Want/LoaderOps(装载)
 //! - [`layers`]:Qwen3.5 文本主干层(容器 + layout + forward)
-//! - [`loader`]:safetensors 权重源(通用;F32/BF16 → host f32)
+//! - [`formats`]:模型加载域(mmap 底座 / safetensors f16 基线源 /
+//!   W4A16 量化源 / 装载域解释器;2026-09-30 重组)
 //! - [`model`]:通用解码器主干(共有机制;embed + 层链 + norm + lm_head,
 //!   整模单树 C5 + C10 装载)
 //! - [`specs`]:模型规格集(每档一文件;纯参数事实 + 键名约定,拆分律见模块头)
@@ -42,14 +43,13 @@
 //! 调试:`OWL_DEBUG=1` 开启解释层发射日志(默认静默)。
 
 pub mod contract;
+pub mod formats;
 pub mod interpreters;
 pub mod kernel;
 pub mod layers;
-pub mod loader;
 pub mod model;
 pub mod module;
 pub mod ops;
-pub mod w4a16;
 pub mod reference;
 pub mod specs;
 pub mod tensor;

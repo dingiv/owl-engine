@@ -1,4 +1,5 @@
-//! 装载域解释器(与计算域 [`super::eval`] 对偶,互不依赖)。
+//! 装载域解释器(与计算域 [`crate::interpreters::eval`] 对偶,互不依赖;
+//! 2026-09-30 自 interpreters/ 迁入 formats/ —— 格式源与装载执行同域)。
 //!
 //! 三件套同构 eval 域:
 //! - **声明**:层侧 `Loadable::layout(ctx)` 产出 `LoaderOps`(Want 清单,

@@ -24,7 +24,7 @@
 //! U4B8 语义 W = (q-8) × scale。
 
 use crate::contract::{Dtype, ModelError};
-use crate::loader::{open_raw_index, Mmap, RawEntry};
+use crate::formats::mmap::{open_raw_index, Mmap, RawEntry};
 use crate::module::WeightSource;
 use owl_f16c::{bf16_bytes_to_f16_bytes, dequant_u4_affine_f16_bytes};
 use owl_kernels::marlin::repack::{

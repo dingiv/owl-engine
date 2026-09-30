@@ -19,7 +19,7 @@
 //! conv1d 为 3D `[6144,1,4]`(扁平直读)。visual/mtp 153 键不在最小路径。
 
 use crate::contract::{DeviceClient, ModelError};
-use crate::loader::SafeTensorsSource;
+use crate::formats::safetensors::SafeTensorsSource;
 use crate::model::{Model, ModelSpec};
 use crate::module::KeyConvention;
 use std::path::Path;
@@ -127,7 +127,7 @@ pub async fn load_0_8b_w4a16<D: DeviceClient + 'static>(
         Qwen35Convention::new("model.language_model"),
         crate::module::QuantPlan::W4A16,
     );
-    let src = crate::w4a16::W4A16Source::open_dir(dir)?;
+    let src = crate::formats::w4a16::W4A16Source::open_dir(dir)?;
     let ctx = crate::module::LoaderCtx { dtype: crate::contract::Dtype::F16, shard: 1 };
     crate::interpreters::eval_load(&model, face, &src, &ctx).await?;
     Ok(model)

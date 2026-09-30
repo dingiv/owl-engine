@@ -8,7 +8,7 @@
 //! | 变体 | 文件 | 职责 | 入口 |
 //! |---|---|---|---|
 //! | 计算(推理) | [`eval`] | TensorOps DAG 归约(CSE + 毒值落地 + C1 断言) | [`eval`] / [`eval_ops`] / [`eval_ops_tap`] |
-//! | 装载 | [`load`] | Loadable::layout → 取数/变换/物化(流式分块 + 并发流水) | [`eval_load`] |
+//! | 装载 | [`crate::formats::load`] | Loadable::layout → 取数/变换/物化(流式分块 + 并发流水) | [`eval_load`] |
 //! | 观测面(tap) | [`observe`] | 节点级单步调试的事件词汇与协议(挂在 eval 归约点) | [`observe::Tap`] / [`observe::StatsTap`] |
 //! | 生成 | [`generate`] | 步循环域:GenSpec 声明 + 逐 step 驱动整模单树(采样/停机) | [`eval_generate`] |
 //!
@@ -24,10 +24,12 @@
 
 pub mod eval;
 pub mod generate;
-pub mod load;
 pub mod observe;
 
 pub use eval::{eval, eval_ops, eval_ops_scoped, eval_ops_tap};
 pub use generate::{eval_generate, GenSpec, Sampling};
-pub use load::eval_load;
 pub use observe::{BlockRef, BlockStats, NodeEvent, StatRecord, StatsTap, Tap, Want};
+
+/// 装载域解释器已迁 [`crate::formats::load`](2026-09-30 加载域重组);
+/// 本 shim 保历史调用面(`crate::interpreters::eval_load`)不动。
+pub use crate::formats::load::eval_load;
