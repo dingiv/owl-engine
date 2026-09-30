@@ -31,6 +31,50 @@ pub fn bf16_bytes_to_f16_bytes(src: &[u8], dst: &mut [u8]) {
     }
 }
 
+/// U4 仿射反量化 → f16 字节(U4B8 语义:w = (q-8) × scale)。
+/// 行主序 [out, k];packed i32 [out, k/8](LSB-first 每 i32 8 nibble);
+/// scales f32 [out, k/128]。128 % 8 == 0 ⇒ 每个 i32 的 8 个 nibble
+/// 必落在同一 group(scale 每 i32 取一次,免逐元素除法)。
+/// rayon 按行组并行;整核在 opt 覆盖 crate(debug 档也 GB/s 级)。
+/// 治本案(2026-09-28)入此的理由:本质 = 量化字节→f16 字节转换,
+/// 且需 opt 覆盖;放置先例见 crate 根注释。
+pub fn dequant_u4_affine_f16_bytes(
+    packed: &[i32],
+    scales: &[f32],
+    out: usize,
+    k: usize,
+    dst: &mut [u8],
+) {
+    use rayon::prelude::*;
+    debug_assert_eq!(packed.len(), out * (k / 8));
+    debug_assert_eq!(scales.len(), out * (k / 128));
+    debug_assert!(dst.len() >= out * k * 2);
+    let groups = k / 128;
+    let kpr = k / 8;
+    const ROWS_PER_TASK: usize = 32;
+    dst.par_chunks_mut(k * 2 * ROWS_PER_TASK)
+        .enumerate()
+        .for_each(|(task, block)| {
+            // 行组级一次分配,组内各行复用(免逐行堆分配)
+            let mut tmp = vec![0f32; k];
+            for (ri, row) in block.chunks_mut(k * 2).enumerate() {
+                let r = task * ROWS_PER_TASK + ri;
+                let sc_row = &scales[r * groups..(r + 1) * groups];
+                let pk_row = &packed[r * kpr..(r + 1) * kpr];
+                for (ci, v) in pk_row.iter().enumerate() {
+                    let col0 = ci * 8;
+                    let sc = sc_row[col0 / 128];
+                    let v = *v as u32;
+                    for j in 0..8 {
+                        let q = ((v >> (4 * j)) & 0xF) as i32 - 8;
+                        tmp[col0 + j] = (q as f32) * sc;
+                    }
+                }
+                f32_slice_to_f16_bytes(&tmp, row);
+            }
+        });
+}
+
 /// f32 切片 → f16 字节(4 宽 F16C;回退标量 half)
 pub fn f32_slice_to_f16_bytes(src: &[f32], dst: &mut [u8]) {
     debug_assert!(dst.len() >= src.len() * 2);

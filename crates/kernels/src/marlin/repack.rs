@@ -557,3 +557,52 @@ pub fn pack_marlin_b_gather(q: &[u8], idx: &[u32], words: usize) -> Vec<i32> {
         });
     b
 }
+
+/// nibble 解包入复用缓冲(E3-ii 提速:消 per-linear 大块 mmap 分配;
+/// buf 预填 8 = U4B8 零权重,便于调用方 pad 行零贡献)。
+pub fn unpack_nibbles_into(
+    packed: &[i32],
+    out: usize,
+    k: usize,
+    buf: &mut Vec<u8>,
+) {
+    use rayon::prelude::*;
+    buf.clear();
+    buf.resize(out * k, 8);
+    let kpr = k / 8;
+    buf.par_chunks_mut(k)
+        .enumerate()
+        .take(out)
+        .for_each(|(r, row)| {
+            for ci in 0..kpr {
+                let v = packed[r * kpr + ci] as u32;
+                for nib in 0..8 {
+                    row[ci * 8 + nib] = ((v >> (4 * nib)) & 0xF) as u8;
+                }
+            }
+        });
+}
+
+/// gather 打包入复用缓冲(E3-ii 提速;同 pack_marlin_b_gather 语义)。
+pub fn pack_marlin_b_gather_into(
+    q: &[u8],
+    idx: &[u32],
+    words: usize,
+    buf: &mut Vec<i32>,
+) {
+    use rayon::prelude::*;
+    buf.clear();
+    buf.resize(words, 0);
+    buf.par_chunks_mut(4096)
+        .enumerate()
+        .for_each(|(task, out)| {
+            for (wi, word) in out.iter_mut().enumerate() {
+                let w = task * 4096 + wi;
+                let mut v = 0u32;
+                for j in 0..8 {
+                    v |= (q[idx[w * 8 + j] as usize] as u32) << (4 * j);
+                }
+                *word = v as i32;
+            }
+        });
+}

@@ -20,8 +20,6 @@ pub struct Linear {
     in_dim: usize,
     /// W4A16 量化组大小(Some = 已启用;None = f16 直读)
     quant_group: Option<usize>,
-    /// 打包 n(安全档 512×2^k ≥ out_dim;marlin 暗雷对策)
-    n_pack: usize,
     /// 量化三件套(qweight marlin-packed / scales / workspace;
     /// enable_w4a16 时构建,键 = `{w.key}.qweight/.scales/.ws`)
     qw: Option<Weight>,
@@ -37,7 +35,6 @@ impl Linear {
             w: Weight::new(key, vec![out_dim, in_dim]),
             out_dim,
             in_dim,
-            n_pack: out_dim,
             quant_group: None,
             qw: None,
             sc: None,
@@ -60,11 +57,12 @@ impl Linear {
         if self.quant_group.is_some() {
             return;
         }
-        if self.out_dim % 256 != 0 || self.in_dim % 128 != 0 {
-            return; // 小线性:f16 直读(反量化由装载源负责)
+        // g128 暗雷收紧版谓词(n = 512×2^k 才安全;与 w4a16.rs 同源)
+        if !crate::w4a16::marlin_eligible(self.out_dim, self.in_dim) {
+            return; // 小线性/非安全 n:f16 直读(反量化由装载源负责)
         }
         let g = 128usize;
-        let n_pack = marlin_n_pack(self.out_dim); // g128 暗雷:安全档
+        let n_pack = marlin_n_pack(self.out_dim); // 安全档原样打包
         let key: &'static str = self.w.key();
         self.qw = Some(Weight::new_typed_u32(
             key,
