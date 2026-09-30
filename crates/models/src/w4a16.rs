@@ -35,24 +35,23 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-/// marlin 可承载判定(**g128 暗雷收紧版**,2026-09-27 形状扫描实锤):
-/// .a 核仅对 **n = 512×2^k**(512/1024/2048/4096/8192…)的形状正确;
-/// 其余 n(1536/2560/3072/3584/4608/5120/5632/6144)→ NaN/垃圾/挂死
-/// (sweep 全录:marlin_shape_sweep)。不满足 → 反量化 f16。
-/// k(in)%128==0 照旧(分组对齐)。
+/// marlin 可承载判定(**g128 暗雷根治后放宽**,2026-09-30):暗雷真凶 =
+/// marlin_host 的 use_fp32_reduce=true + 4B c_tmp 占位(slice_count>1
+/// 形状 global_reduce_fp32 写穿 c_tmp 踩内存,呈「n=2^k 才安全」假象;
+/// 按 a_is_s8 分派修复后 sweep 全绿 512..17408 含全部非 2^k 档与 27B
+/// 维度族,m∈{1,32,4096})。判据回归 kernel/pack 真实约束:
+/// **n%256==0**(repack tile)且 **in%128==0**(g128 分组)。
 pub fn marlin_eligible(out_dim: usize, in_dim: usize) -> bool {
-    out_dim % 512 == 0 && out_dim.is_power_of_two() && in_dim % 128 == 0
+    out_dim % 256 == 0 && in_dim % 128 == 0
 }
 
-/// 打包 n 的安全档位(g128 暗雷对策):eligible 形状(n = 512×2^k)下
-/// 恒等于 n 本身(pad 路线已废:pad 到 2 次幂实测仍挂,根因在 .a 内部
-/// config);非安全 n 由 eligible 判定走 f16,不打包。
+/// 打包 n 档位(暗雷根治后 = **n 直通**):eligibility 已保证 n%256==0
+/// (repack tile 约束),历史 pad 路线(n → 512×2^k)系暗雷误诊产物,
+/// 已废(pad 实测仍挂;真凶 = use_fp32_reduce/c_tmp,见
+/// [`marlin_eligible`] 文档)。保留函数 = 语义锚点,防再引入 pad。
 pub fn marlin_n_pack(n: usize) -> usize {
-    let mut p = 512usize;
-    while p < n {
-        p *= 2;
-    }
-    p
+    debug_assert!(n % 256 == 0, "marlin pack 要求 n%256==0(得 {n})");
+    n
 }
 
 /// 懒物化缓存容量上限(字节;超出整表清空 —— 装载按层序推进,

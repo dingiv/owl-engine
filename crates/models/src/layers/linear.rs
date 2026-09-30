@@ -62,7 +62,7 @@ impl Linear {
     fn quantize_g128(&mut self) {
         debug_assert!(crate::w4a16::marlin_eligible(self.out_dim, self.in_dim));
         let g = 128usize;
-        let n_pack = marlin_n_pack(self.out_dim); // 安全档原样打包
+        let n_pack = marlin_n_pack(self.out_dim); // 直通(eligible 保证 n%256==0)
         let key: &'static str = self.w.key();
         self.qw = Some(Weight::new_typed_u32(
             key,
@@ -94,7 +94,7 @@ impl Module for Linear {
             self.quant_group, &self.qw, &self.sc, &self.ws, &self.ctmp,
         ) {
             let m: usize = xs.shape()[..xs.shape().len() - 1].iter().product();
-            // n_pack = 打包档(≥ out_dim;pad 列零贡献);输出窄切回 [m, n]
+            // n_pack = 打包档(= out_dim;pad 路线废案)
             let n_pack = marlin_n_pack(self.out_dim);
             let marlin = TensorOps::of(
                 crate::kernel::Kernel::new(GEMM_W4A16, "")

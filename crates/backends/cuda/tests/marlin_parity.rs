@@ -125,16 +125,41 @@ async fn run_case(client: &mut GpuClient, m: usize, n: usize, k: usize, g: usize
         .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
         .collect();
 
-    let c_ref = host_dequant_gemm(&a, &q, &s, m, n, k, g);
+    // 大 m 全量 host 参考 = O(m·n·k) 标量乘加(debug 下分钟级)→ 抽样 4 行
     let (mut sum_abs, mut max_abs, mut sum_sq) = (0f64, 0f32, 0f64);
-    for (x, r) in got.iter().zip(&c_ref) {
-        sum_abs += (*x as f64 - *r as f64).abs();
-        sum_sq += (*r as f64) * (*r as f64);
-        max_abs = max_abs.max((*x - *r).abs());
+    let mut n_elem = 0f64;
+    if m <= 256 {
+        let c_ref = host_dequant_gemm(&a, &q, &s, m, n, k, g);
+        for (x, r) in got.iter().zip(&c_ref) {
+            sum_abs += (*x as f64 - *r as f64).abs();
+            sum_sq += (*r as f64) * (*r as f64);
+            max_abs = max_abs.max((*x - *r).abs());
+        }
+        n_elem = (m * n) as f64;
+    } else {
+        // 行抽样:第 {0, m/4, m/2, 3m/4} 行全宽参考;全输出仅验有限性
+        let rows: Vec<usize> = (0..4).map(|i| i * m / 4).collect();
+        for &r in &rows {
+            for nn in 0..n {
+                let mut acc = 0f32;
+                for kk in 0..k {
+                    let nib = q[nn * k + kk];
+                    let w = (nib as f32 - 8.0) * s[nn * (k / g) + kk / g];
+                    acc += a[r * k + kk] * w;
+                }
+                let got_v = got[r * n + nn];
+                sum_abs += (got_v as f64 - acc as f64).abs();
+                sum_sq += (acc as f64) * (acc as f64);
+                max_abs = max_abs.max((got_v - acc).abs());
+                n_elem += 1.0;
+            }
+        }
+        for &v in &got {
+            assert!(v.is_finite(), "大 m 输出含非有限值");
+        }
     }
-    let n_elem = (m * n) as f64;
     let rms = (sum_sq / n_elem).sqrt().max(1e-6);
-    ((sum_abs / n_elem / rms), max_abs)
+    (sum_abs / n_elem / rms, max_abs)
 }
 
 #[tokio::test]
@@ -155,13 +180,74 @@ async fn marlin_w4a16_parity() {
     client.sync().await.expect("sync");
 }
 
+/// S1 暗雷根治探针:dump owl 打包字节(q + owlb + owls)供 vLLM 金标比对
+/// (金标端 = vllm marlin_utils_test.marlin_weights,python 侧比对;
+/// 判决目标:非 2^k n 的 repack 分歧 vs kernel selector 罪责二选一)
+#[tokio::test]
+async fn marlin_golden_dump() {
+    let mut client = assemble();
+    let dir = std::path::Path::new("/tmp/marlin_golden");
+    std::fs::create_dir_all(dir).expect("mkdir");
+    // 形状组:2^k 对照 + 非 2^k 暗雷档(27B 维度族)
+    let cases: Vec<(usize, usize, usize)> = vec![
+        (512, 512, 128),
+        (512, 3584, 128),
+        (512, 5120, 128),
+        (512, 6144, 128),
+        (512, 17408, 128),
+    ];
+    for (k, n, g) in cases {
+        let tag = format!("k{k}_n{n}");
+        let q: Vec<u8> = (0..n * k).map(|i| ((i * 7 + 3) % 16) as u8).collect();
+        let b_packed = owl_kernels::marlin::repack::pack_marlin_b(&q, k, n);
+        let s: Vec<f32> = (0..n * (k / g)).map(|i| 0.5 + ((i * 13) % 13) as f32 * 0.08).collect();
+        let s_packed = owl_kernels::marlin::repack::pack_marlin_s(&s, n, k / g);
+        std::fs::write(dir.join(format!("{tag}.q.bin")), &q).expect("q");
+        std::fs::write(dir.join(format!("{tag}.owlb.bin")), le_i32(&b_packed)).expect("b");
+        std::fs::write(dir.join(format!("{tag}.owls.bin")), le_u16(&s_packed)).expect("s");
+        let _ = &mut client; // assemble 仅保 face 生命周期(打包纯 host)
+        eprintln!("[golden-dump] {tag}: q={}B b={}i32 s={}u16", q.len(), b_packed.len(), s_packed.len());
+    }
+    client.sync().await.expect("sync");
+}
+
 /// E3 形状扫描(0.8B W4A16 实际形状;定位 marlin 挂起形状)
+/// 单案 memcheck 入口(compute-sanitizer 配套;OWL_SWEEP_CASE="m,n,k,g")
+#[tokio::test]
+async fn marlin_shape_case() {
+    let Ok(spec) = std::env::var("OWL_SWEEP_CASE") else {
+        eprintln!("skip: OWL_SWEEP_CASE 未设(m,n,k,g)");
+        return;
+    };
+    let parts: Vec<usize> = spec.split(',').map(|v| v.parse().unwrap()).collect();
+    let (m, n, k, g) = (parts[0], parts[1], parts[2], parts[3]);
+    let mut client = assemble();
+    let (noise_ratio, max_abs) = run_case(&mut client, m, n, k, g).await;
+    eprintln!("[case] m={m} n={n} k={k} g={g} → 噪声比 {noise_ratio:.6} max_abs={max_abs:.5}");
+    assert!(noise_ratio < 2e-2 && noise_ratio.is_finite(), "噪声比 {noise_ratio}");
+    client.sync().await.expect("sync");
+}
+
 #[tokio::test]
 async fn marlin_shape_sweep() {
     let mut client = assemble();
-    let cases: Vec<(usize, usize, usize, usize)> = (1..=12usize)
+    // 基础档(0.512k 网格)+ 27B 维度族(Qwen3.8-27B:5120/6144/10240/
+    // 14336/17408;暗雷根治后应全绿)
+    let mut cases: Vec<(usize, usize, usize, usize)> = (1..=12usize)
         .map(|step| (32usize, step * 512usize, 1024usize, 128usize))
         .collect();
+    for (m, n, k) in [
+        (1usize, 5120, 5120),
+        (1, 6144, 5120),
+        (1, 17408, 5120),
+        (1, 14336, 5120),
+        (1, 5120, 17408),
+        (32, 17408, 5120),
+        (4096, 17408, 5120),
+        (4096, 5120, 17408),
+    ] {
+        cases.push((m, n, k, 128));
+    }
     for (m, n, k, g) in cases {
         eprintln!("[sweep] try m={m} n={n} k={k} g={g}");
         let (noise_ratio, _max_abs) = run_case(&mut client, m, n, k, g).await;

@@ -317,6 +317,14 @@ int marlin_mm(const void* A, const void* B, void* C, void* c_tmp, void* b_s,
     int thread_k_blocks = thread_k / 16;
     int thread_n_blocks = thread_n / 16;
 
+    if (getenv("MARLIN_CONFIG_DEBUG"))
+        fprintf(stderr,
+                "[marlin-cfg] m=%d n=%d k=%d -> tk=%d tn=%d threads=%d "
+                "m_blocks=%d m8=%d g_blocks=%d blocks=%d par=%d\n",
+                prob_m, prob_n, prob_k, thread_k, thread_n, num_threads,
+                thread_m_blocks, (int)m_block_size_8, group_blocks, blocks,
+                max_par);
+
     if (!is_valid_config(thread_tfg, thread_m_blocks, prob_m_split, prob_n,
                          prob_k, num_bits, group_size, has_act_order,
                          is_k_full, has_zp, is_zp_float, is_a_8bit, stages,
@@ -334,8 +342,14 @@ int marlin_mm(const void* A, const void* B, void* C, void* c_tmp, void* b_s,
                          max_shared_mem_new);
 
     constexpr bool use_atomic_add = false;
-    // 上游 dense 默认 true;kS8 部分和是 int32 位型,f16 全局往返会得到 inf
-    constexpr bool use_fp32_reduce = true;
+    // use_fp32_reduce 按激活位宽分派(S1 暗雷根治定谳,2026-09-30):
+    // true 时 slice_count>1 的形状走 global_reduce_fp32 —— 部分和写穿
+    // c_tmp,而调用侧 c_tmp 恒 4B 占位 → 越界踩内存(NaN/垃圾/挂死三相,
+    // 非 2^k n 暗雷真凶;slice_count 激活依 (n,blocks,par) 组合故呈
+    // n 相关假象)。f16 I/O(u4b8/u4)走 fp16 全局 reduce:直接写 C,
+    // 零 c_tmp 依赖;kS8(W4A8,未接线)部分和 int32 位型,f16 往返 inf,
+    // 届时须 true + 正确尺寸 c_tmp。
+    const bool use_fp32_reduce = a_is_s8;
     bool part_use_atomic_add =
         use_atomic_add && div_ceil(prob_m_split, 64) * prob_n <= 2048;
 
