@@ -28,6 +28,8 @@ pub mod sys {
         CUdeviceptr, cuMemcpyDtoH_v2, cuMemcpyHtoD_v2, cuMemcpyDtoDAsync_v2, cuMemsetD8Async, cuMemsetD16Async, cuMemsetD32Async,
         // graph 捕获(M1 归入 graph 治理层)
         CUgraphInstantiate_flags, CUstreamCaptureMode,
+        // 图实例化零旗标入口(S1;见上方 graph 定谳注释)
+        cuGraphInstantiateWithFlags,
         // 图审计与枚举(哨兵③,M1;只读查询 API,零分配零懒状态——
         // 准入铁律通过,证据:cudarc 0.19.9 sys 绑定均为 load::<_F> 直通)
         CUDA_KERNEL_NODE_PARAMS, CUfunction, CUresult, CUgraph, CUgraphExec, CUgraphNode,
@@ -81,10 +83,12 @@ pub use cudarc::driver::sys::CUgraphInstantiate_flags;
 /// 捕获模式常量(ThreadLocal = 只锁本线程,不霸锁全进程)
 pub const CAPTURE_MODE_THREAD_LOCAL: CUstreamCaptureMode =
     CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
-/// 实例化 flag(cudarc 无 NONE 变体;AUTO_FREE 只作用于图内分配节点,
-/// 我们 slab 图外预分配,无影响)
-pub const INSTANTIATE_AUTO_FREE: CUgraphInstantiate_flags =
-    CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
+/// 实例化走裸 `cuGraphInstantiateWithFlags`(S1,2026-09-30 定谳改判):
+/// 旧档 AUTO_FREE_ON_LAUNCH 注释赌「只作用于图内分配节点,无影响」——
+/// 实测每次 cuGraphLaunch 恒定 **+4.45ms** 驱动侧 auto-free 处理(decode
+/// 40 tok/s 的主税)。cudarc safe end_capture 强绑该旗标(sys enum 无 0
+/// 变体,transmute 被运行时校验拒绝),零旗标只能裸调。
+/// 准入证据:cudarc 0.19.9 sys/mod.rs:10640(load 直通,与其他白名单项同款)
 
 /// 流序清零(非阻塞;可捕获 —— 图内 memset 节点 = 每次 replay 重清零)
 pub use cudarc::driver::result::memset_d8_async;

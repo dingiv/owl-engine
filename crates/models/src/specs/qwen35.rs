@@ -100,7 +100,11 @@ pub async fn load_0_8b<D: DeviceClient + 'static>(
     dir: &Path,
     face: &mut D,
 ) -> Result<Model, ModelError> {
-    let model = Model::new(&qwen3_5_0_8b(), Qwen35Convention::new("model.language_model"));
+    let model = Model::new(
+        &qwen3_5_0_8b(),
+        Qwen35Convention::new("model.language_model"),
+        crate::module::QuantPlan::F16,
+    );
     let src = SafeTensorsSource::open_dir(dir)?;
     // F16 直转装载(F5;权重 bf16 检查点 → f16 字节,不再 f32 设备中转)
     let ctx = crate::module::LoaderCtx { dtype: qwen3_5_0_8b().dtype, shard: 1 };
@@ -116,8 +120,13 @@ pub async fn load_0_8b_w4a16<D: DeviceClient + 'static>(
     face: &mut D,
 ) -> Result<Model, ModelError> {
     let spec = qwen3_5_0_8b();
-    let mut model = Model::new(&spec, Qwen35Convention::new("model.language_model"));
-    model.enable_w4a16();
+    // 量化计划构造期注入(禁 enable_* 可变后置):W4A16 臂在此定形,
+    // 尺寸门控(marlin_eligible)在 Linear 构造期完成,小线性自动落 f16。
+    let model = Model::new(
+        &spec,
+        Qwen35Convention::new("model.language_model"),
+        crate::module::QuantPlan::W4A16,
+    );
     let src = crate::w4a16::W4A16Source::open_dir(dir)?;
     let ctx = crate::module::LoaderCtx { dtype: crate::contract::Dtype::F16, shard: 1 };
     crate::interpreters::eval_load(&model, face, &src, &ctx).await?;
@@ -455,7 +464,7 @@ mod tests {
         // ── 装载(被测链;单次装载保留 manifest —— F5-2 前为重跑 load
         //    生成 manifest,双倍上传;F5-2 删)
         let mut gpu = crate::testkit::gpu_client().await;
-        let model = Model::new(&qwen3_5_0_8b(), Qwen35Convention::new("model.language_model"));
+        let model = Model::new(&qwen3_5_0_8b(), Qwen35Convention::new("model.language_model"), crate::module::QuantPlan::F16);
         let manifest = {
             let src = SafeTensorsSource::open_dir(&dir)?;
             let ctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1 };

@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn stays_outside_module_interface() {
         fn assert_impl<M: crate::module::Module>(_: &M) {}
-        assert_impl(&crate::layers::mlp::Mlp::new(2, 4)); // Mlp 在 Module 内
+        assert_impl(&crate::layers::mlp::Mlp::new(2, 4, crate::module::QuantPlan::F16)); // Mlp 在 Module 内
         // Rope 无 forward(&TensorOps, &ForwardCtx) 签名 —— 编译期即证不在 trait 内
         let rp = Rope::new(64, 8, 4, 10_000.0).expect("new");
         let pos = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[5.0]));

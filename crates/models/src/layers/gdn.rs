@@ -28,7 +28,7 @@ use crate::contract::Dtype;
 use crate::kernel;
 use crate::layers::linear::Linear;
 use crate::layers::{concat_rows, narrow_strided};
-use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, Weight};
+use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, QuantPlan, Weight};
 use crate::TensorOps;
 
 // ============================================================================
@@ -335,32 +335,24 @@ pub struct GatedDeltaNet {
 }
 
 impl GatedDeltaNet {
-    /// 准备容器(纯元数据;0.8B = nk 16/hk_dim 128/nv 16/hv_dim 128/hidden 1024)
-    pub fn new(nk: usize, hk_dim: usize, nv: usize, hv_dim: usize, hidden: usize, eps: f32) -> Self {
+    /// 准备容器(纯元数据;0.8B = nk 16/hk_dim 128/nv 16/hv_dim 128/hidden 1024;
+    /// `plan` = 量化计划构造期注入,尺寸门控在 Linear 内定形;conv/A_log/
+    /// dt_bias 保持高精度,不在量化面)
+    pub fn new(nk: usize, hk_dim: usize, nv: usize, hv_dim: usize, hidden: usize, eps: f32, plan: QuantPlan) -> Self {
         let (key_dim, value_dim) = (nk * hk_dim, nv * hv_dim);
         let conv_dim = 2 * key_dim + value_dim;
         GatedDeltaNet {
-            in_proj_qkv: Linear::new("in_proj_qkv", conv_dim, hidden),
-            in_proj_z: Linear::new("in_proj_z", value_dim, hidden),
-            in_proj_b: Linear::new("in_proj_b", nv, hidden),
-            in_proj_a: Linear::new("in_proj_a", nv, hidden),
-            out_proj: Linear::new("out_proj", hidden, value_dim),
+            in_proj_qkv: Linear::new("in_proj_qkv", conv_dim, hidden, plan),
+            in_proj_z: Linear::new("in_proj_z", value_dim, hidden, plan),
+            in_proj_b: Linear::new("in_proj_b", nv, hidden, plan),
+            in_proj_a: Linear::new("in_proj_a", nv, hidden, plan),
+            out_proj: Linear::new("out_proj", hidden, value_dim, plan),
             conv_w: Weight::new("conv1d", vec![conv_dim, 4]),
             a_log: Weight::new("A_log", vec![nv]),
             dt_bias: Weight::new("dt_bias", vec![nv]),
             norm_w: Weight::new("norm", vec![hv_dim]),
             nk, hk_dim, nv, hv_dim, hidden, eps,
         }
-    }
-
-    /// W4A16 化(E3):五投影量化臂(小投影尺寸门控自动落 f16;
-    /// conv/A_log/dt_bias 保持高精度)
-    pub fn enable_w4a16(&mut self) { // FIXME: 不基于可变范式，在对象创建的时候就把这个参数传进来。
-        self.in_proj_qkv.enable_w4a16();
-        self.in_proj_z.enable_w4a16();
-        self.in_proj_b.enable_w4a16();
-        self.in_proj_a.enable_w4a16();
-        self.out_proj.enable_w4a16();
     }
 
     fn key_dim(&self) -> usize {
@@ -1337,7 +1329,7 @@ mod tests {
     #[tokio::test]
     async fn layer_load_and_declaration() {
         let mut face = owl_cpu::CpuFace::new();
-        let layer = GatedDeltaNet::new(NK, HK_DIM, NV, HV_DIM, HIDDEN, 1e-6);
+        let layer = GatedDeltaNet::new(NK, HK_DIM, NV, HV_DIM, HIDDEN, 1e-6, QuantPlan::F16);
         crate::interpreters::eval_load(&layer, &mut face, &weight_src(), &Default::default())
             .await
             .expect("eval_load 九槽");
@@ -1496,7 +1488,7 @@ mod tests {
         let (key_dim, value_dim) = (NK * HK_DIM, NV * HV_DIM);
         let src = weight_src();
         let mut gpu = crate::testkit::gpu_client().await;
-        let layer = GatedDeltaNet::new(NK, HK_DIM, NV, HV_DIM, HIDDEN, 1e-6);
+        let layer = GatedDeltaNet::new(NK, HK_DIM, NV, HV_DIM, HIDDEN, 1e-6, QuantPlan::F16);
         crate::interpreters::eval_load(&layer, &mut gpu, &src, &Default::default())
             .await
             .expect("eval_load");
@@ -1654,7 +1646,7 @@ mod f16_tests {
         let value_dim = nv * hvd;
         let q = |v: &[f32]| -> Vec<f32> { v.iter().map(|f| half::f16::from_f32(*f).to_f32()).collect() };
 
-        let layer = GatedDeltaNet::new(nk, hkd, nv, hvd, hidden, 1e-6);
+        let layer = GatedDeltaNet::new(nk, hkd, nv, hvd, hidden, 1e-6, QuantPlan::F16);
         let src: std::collections::HashMap<String, Vec<f32>> =
             crate::layers::gdn::fixture::weights(nk, hkd, nv, hvd, hidden)
                 .into_iter()
@@ -1729,7 +1721,7 @@ mod f16_tests {
         let key_dim = nk * hkd;
         let value_dim = nv * hvd;
 
-        let layer = GatedDeltaNet::new(nk, hkd, nv, hvd, hidden, 1e-6);
+        let layer = GatedDeltaNet::new(nk, hkd, nv, hvd, hidden, 1e-6, QuantPlan::F16);
         let src: std::collections::HashMap<String, Vec<f32>> =
             crate::layers::gdn::fixture::weights(nk, hkd, nv, hvd, hidden)
                 .into_iter()
@@ -1799,7 +1791,7 @@ mod f16_tests {
         let value_dim = nv * hvd;
         let q = |v: &[f32]| -> Vec<f32> { v.iter().map(|f| half::f16::from_f32(*f).to_f32()).collect() };
 
-        let layer = GatedDeltaNet::new(nk, hkd, nv, hvd, hidden, 1e-6);
+        let layer = GatedDeltaNet::new(nk, hkd, nv, hvd, hidden, 1e-6, QuantPlan::F16);
         let src: std::collections::HashMap<String, Vec<f32>> =
             crate::layers::gdn::fixture::weights(nk, hkd, nv, hvd, hidden)
                 .into_iter()

@@ -4,7 +4,7 @@
 //! 层与解释器的全部接口面:
 //!
 //! ```rust,ignore
-//! let mut lin = Linear::new("w", 2, 3);   // new = 准备容器(空包指针,零数据)
+//! let mut lin = Linear::new("w", 2, 3, QuantPlan::F16); // new = 准备容器(空包指针,零数据;plan 构造期注入)
 //! eval_load(&lin, &mut face, &src, &ctx).await?; // 装载执行(驱动 layout)
 //! let out = lin.forward(&xs, &ctx);       // 计算声明(total;毒值随链)
 //! let y = eval(&lin, &xs, &mut face, &ctx).await?; // 计算执行
@@ -609,6 +609,18 @@ impl FromIterator<LoadEntry> for LoadManifest {
 // §5 LoaderCtx:装载语境(layout 的 ctx;形状切分/dtype 决策的词汇)
 // ============================================================================
 
+/// 量化计划(构造期定形,REQ-PRE-01):模型需要什么形态,在构造时
+/// 就传入 —— 禁 `enable_*` 可变后置范式(声明期定形,层容器零突变面)。
+/// 尺寸门控(marlin_eligible)在 Linear 构造期定形:不安全 n 自动落 f16
+/// (装载源同谓词,单一来源)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum QuantPlan {
+    /// f16 直读(基线)
+    F16,
+    /// W4A16 marlin(g128;W4A8 等后续档位在此扩展)
+    W4A16,
+}
+
 /// 装载语境(layout 钩子的 ctx;按值传递,Copy)
 /// 字段随域扩:并行切分 / dtype 决策 / 容量约束……起步只带两维。
 #[derive(Clone, Copy, Debug)]
@@ -821,7 +833,7 @@ mod tests {
     #[tokio::test]
     async fn load_weight_basic() {
         let mut face = owl_cpu::CpuFace::new();
-        let mut w = Linear::new("w", 2, 3).into_weight();
+        let mut w = Linear::new("w", 2, 3, QuantPlan::F16).into_weight();
         assert!(!w.is_loaded(), "初始未装载");
 
         let src = Src::from([("w".to_string(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])]);
@@ -840,7 +852,7 @@ mod tests {
         };
         assert!((got[0] - 4.5).abs() < 1e-6 && (got[1] - 9.0).abs() < 1e-6);
 
-        let mut w2 = Linear::new("w", 2, 3).into_weight();
+        let mut w2 = Linear::new("w", 2, 3, QuantPlan::F16).into_weight();
         let empty = Src::new();
         assert!(load_weight(&mut w2, &mut face, &empty).await.is_err(), "缺键应 Err");
         assert!(!w2.is_loaded(), "失败装载不应污染容器");
@@ -852,7 +864,7 @@ mod tests {
 
     #[tokio::test]
     async fn module_trait_polymorphism() {
-        let mlp = crate::layers::mlp::Mlp::new(4, 6);
+        let mlp = crate::layers::mlp::Mlp::new(4, 6, QuantPlan::F16);
         let src = Src::from([
             ("gate_proj".to_string(), vec![0.1; 24]),
             ("up_proj".to_string(), vec![0.2; 24]),

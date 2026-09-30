@@ -246,6 +246,7 @@ impl GpuServer {
             Command::MemsetZero { .. } => "MemsetZero",
             Command::Htod { .. } => "Htod",
             Command::HtodChunk { .. } => "HtodChunk",
+            Command::HtodChunks { .. } => "HtodChunks",
             Command::AllocPinned { .. } => "AllocPinned",
             Command::UploadPinned { .. } => "UploadPinned",
             Command::Dtoh { .. } => "Dtoh",
@@ -264,7 +265,7 @@ impl GpuServer {
         if self.ctx().capture_stream() {
             return match cmd {
                 Command::Launch { msg, ack } => self.handle_launch(msg, ack),
-                Command::Alloc { n_bytes, elems, ack } => self.handle_alloc(n_bytes, elems, ack),
+                Command::Alloc { n_bytes, elems, zero, ack } => self.handle_alloc(n_bytes, elems, zero, ack),
                 Command::MemsetZero { block, offset_bytes, len_bytes, ack } => {
                     self.handle_memset_zero(block, offset_bytes, len_bytes, ack)
                 }
@@ -275,11 +276,12 @@ impl GpuServer {
         }
 
         match cmd {
-            Command::Alloc { n_bytes, elems, ack } => self.handle_alloc(n_bytes, elems, ack),
+            Command::Alloc { n_bytes, elems, zero, ack } => self.handle_alloc(n_bytes, elems, zero, ack),
             Command::MemsetZero { block, offset_bytes, len_bytes, ack } => {
                 self.handle_memset_zero(block, offset_bytes, len_bytes, ack)
             }
             Command::Htod { data, ack } => self.handle_htod(data, ack),
+            Command::HtodChunks { writes, ack } => self.handle_htod_chunks(writes, ack),
             Command::HtodChunk { block, offset_bytes, data, ack } => {
                 self.handle_htod_chunk(block, offset_bytes, data, ack)
             }
@@ -320,6 +322,7 @@ impl GpuServer {
             Command::MemsetZero { ack, .. } => closed!(ack),
             Command::Htod { ack, .. } => closed!(ack),
             Command::HtodChunk { ack, .. } => closed!(ack),
+            Command::HtodChunks { ack, .. } => closed!(ack),
             Command::AllocPinned { ack, .. } => closed!(ack),
             Command::UploadPinned { ack, .. } => closed!(ack),
             Command::Dtoh { ack, .. } => closed!(ack),
@@ -343,6 +346,7 @@ impl GpuServer {
             Command::MemsetZero { .. } => "MemsetZero",
             Command::Htod { .. } => "Htod",
             Command::HtodChunk { .. } => "HtodChunk",
+            Command::HtodChunks { .. } => "HtodChunks",
             Command::AllocPinned { .. } => "AllocPinned",
             Command::UploadPinned { .. } => "UploadPinned",
             Command::Dtoh { .. } => "Dtoh",
@@ -361,6 +365,7 @@ impl GpuServer {
             Command::MemsetZero { ack, .. } => reject!(ack),
             Command::Htod { ack, .. } => reject!(ack),
             Command::HtodChunk { ack, .. } => reject!(ack),
+            Command::HtodChunks { ack, .. } => reject!(ack),
             Command::AllocPinned { ack, .. } => reject!(ack),
             Command::UploadPinned { ack, .. } => reject!(ack),
             Command::Dtoh { ack, .. } => reject!(ack),
@@ -372,23 +377,33 @@ impl GpuServer {
         }
     }
 
-    fn handle_alloc(&mut self, n_bytes: usize, elems: usize, ack: Ack<Result<Bytes, ModelError>>) {
+    fn handle_alloc(
+        &mut self,
+        n_bytes: usize,
+        elems: usize,
+        zero: bool,
+        ack: Ack<Result<Bytes, ModelError>>,
+    ) {
         // 捕获期:从 slab 切块(零 cudaMalloc;malloc 在捕获窗内非法)。
-        // 切完必须流序清零(N4):块内容 = slab 残留,不清零则 Zeros 语义
-        // / 部分写 kernel 静默踩垃圾;memset 可捕获 → replay 时重清零,
-        // 语义恒成立。
+        // zero = true 时切完流序清零(N4:Zeros 语义/部分写 kernel 防护;
+        // memset 可捕获 → replay 重清零);zero = false(uninit scratch,
+        // S1)免 memset —— kernel 全量覆写的输出块不烙 memset 节点
+        // (1207 节点 launch/GPU 双税定谳,2026-09-30)
         if self.ctx().capture_stream() {
             let result = (|| {
                 let id = self.ctx_mut().carve_block(n_bytes)?;
-                let stream = self.ctx().stream(STREAM_COMPUTE)?.clone();
-                let (dptr, _) = self.ctx().block_ptr(id, &stream)?;
-                unsafe { memset_d8_async(dptr, 0, n_bytes, stream.cu_stream()) }
-                    .map_err(|e| ModelError::Msg(format!("carve memset: {e:?}")))?;
+                if zero {
+                    let stream = self.ctx().stream(STREAM_COMPUTE)?.clone();
+                    let (dptr, _) = self.ctx().block_ptr(id, &stream)?;
+                    unsafe { memset_d8_async(dptr, 0, n_bytes, stream.cu_stream()) }
+                        .map_err(|e| ModelError::Msg(format!("carve memset: {e:?}")))?;
+                }
                 Ok(Bytes::new(id, elems))
             })();
             return ack.send(result);
         }
-        // 图外:路由 COMPUTE 流;alloc 后流序清零(契约:Zeros = 清零分配)
+        // 图外:路由 COMPUTE 流;zero = true 时流序清零(契约:Zeros = 清零
+        // 分配;uninit 免 memset —— eager 大量 scratch alloc 同税)
         let stream = match self.ctx().stream(STREAM_COMPUTE) {
             Ok(s) => s.clone(),
             Err(e) => return ack.send(Err(e)),
@@ -396,9 +411,11 @@ impl GpuServer {
         let result = unsafe { stream.alloc::<u8>(n_bytes) }
             .map_err(|e| ModelError::Msg(format!("alloc: {e:?}")))
             .and_then(|mut slice| {
-                stream
-                    .memset_zeros(&mut slice)
-                    .map_err(|e| ModelError::Msg(format!("alloc memset: {e:?}")))?;
+                if zero {
+                    stream
+                        .memset_zeros(&mut slice)
+                        .map_err(|e| ModelError::Msg(format!("alloc memset: {e:?}")))?;
+                }
                 // 诊断开关(OWL_LAUNCH_SYNC=1):alloc/memset 后同步归因
                 if std::env::var_os("OWL_LAUNCH_SYNC").is_some() {
                     if let Err(e) = stream.synchronize() {
@@ -569,6 +586,76 @@ impl GpuServer {
 
     /// 分块写入已 alloc 的块(流式装载):pinned 码头 + memcpyAsync
     /// 到 dst+offset;完成回调回执
+    /// 批量分块写入(S1):逐写池化码头 + H2D 流序 memcpy,末尾单
+    /// notify —— 一命令一往返,保序协议不变(ack = 全部写完)
+    fn handle_htod_chunks(
+        &mut self,
+        writes: Vec<(u64, usize, Vec<u8>)>,
+        ack: Ack<Result<(), ModelError>>,
+    ) {
+        let mut ack = Some(ack);
+        let stream = match self.ctx().stream(STREAM_H2D) {
+            Ok(s) => s.clone(),
+            Err(e) => return ack.take().unwrap().send(Err(e)),
+        };
+        let mut pending: Vec<Box<dyn owl_iface::contract::PinnedRegion + Send>> =
+            Vec::with_capacity(writes.len());
+        for (block, offset_bytes, data) in &writes {
+            let dptr_base = match self.ctx().block_ptr(*block, &stream) {
+                Ok((p, _)) => p,
+                Err(e) => {
+                    for b in pending {
+                        self.pool.put(b);
+                    }
+                    return ack.take().unwrap().send(Err(e));
+                }
+            };
+            let mut staging: Box<dyn owl_iface::contract::PinnedRegion + Send> =
+                match self.pool.take(data.len()) {
+                    Some(b) => b,
+                    None => match Staging::alloc(data.len()) {
+                        Ok(s) => Box::new(s),
+                        Err(e) => {
+                            for b in pending {
+                                self.pool.put(b);
+                            }
+                            return ack.take().unwrap().send(Err(e));
+                        }
+                    },
+                };
+            staging.slice_bytes_mut()[..data.len()].copy_from_slice(data);
+            if let Err(e) = unsafe {
+                memcpy_htod_async(
+                    dptr_base + (*offset_bytes as u64),
+                    &staging.as_bytes()[..data.len()],
+                    stream.cu_stream(),
+                )
+            }
+            .map_err(|e| ModelError::Msg(format!("htod chunks async: {e:?}")))
+            {
+                pending.push(staging);
+                for b in pending {
+                    self.pool.put(b);
+                }
+                return ack.take().unwrap().send(Err(e));
+            }
+            pending.push(staging);
+        }
+        // 单 notify:全部写到位后一次性回执(保序 = H2D 流序)
+        let mut cb_ack = ack.take();
+        let pool = self.pool.clone();
+        let finish: Finish = Box::new(move || {
+            for b in pending {
+                pool.put(b);
+            }
+            cb_ack.take().unwrap().send(Ok(()));
+        });
+        if let Err(e) = self.notify(&stream, finish) {
+            // notify 失败 = 断链(ack 已随闭包移交;与 handle_htod_chunk 同语义)
+            let _ = e;
+        }
+    }
+
     fn handle_htod_chunk(
         &mut self,
         block: u64,
@@ -585,15 +672,22 @@ impl GpuServer {
             Ok((p, _)) => p,
             Err(e) => return ack.take().unwrap().send(Err(e)),
         };
-        let mut staging = match Staging::alloc(data.len()) {
-            Ok(s) => s,
-            Err(e) => return ack.take().unwrap().send(Err(e)),
-        };
-        staging.slice_mut().copy_from_slice(&data);
+        // 码头池化(S1,2026-09-30):write_block 是 decode 每步 5 连发的
+        // 高频小写路径,per-call malloc_host/Free 实测 ~3.3ms/次(与
+        // try_htod 09-26 同病史;池 = PinnedPool,take>=len / finish 归还)
+        let mut staging: Box<dyn owl_iface::contract::PinnedRegion + Send> =
+            match self.pool.take(data.len()) {
+                Some(b) => b,
+                None => match Staging::alloc(data.len()) {
+                    Ok(s) => Box::new(s),
+                    Err(e) => return ack.take().unwrap().send(Err(e)),
+                },
+            };
+        staging.slice_bytes_mut()[..data.len()].copy_from_slice(&data);
         unsafe {
             memcpy_htod_async(
                 dptr_base + (offset_bytes as u64),
-                staging.slice(),
+                &staging.as_bytes()[..data.len()],
                 stream.cu_stream(),
             )
         }
@@ -605,10 +699,11 @@ impl GpuServer {
             }
         })
         .err();
-        // 码头随 finish 存活至搬运完成后由派发线程释放
+        // 码头随 finish 存活至搬运完成后归还池(派发线程执行)
         let mut cb_ack = ack.take();
+        let pool = self.pool.clone();
         let finish: Finish = Box::new(move || {
-            drop(staging);
+            pool.put(staging);
             cb_ack.take().unwrap().send(Ok(()));
         });
         if let Err(e) = self.notify(&stream, finish) {
@@ -642,11 +737,13 @@ impl GpuServer {
         let mut ack = Some(ack);
         match self.try_dtoh(&stream, id, want_bytes) {
             Ok(staging) => {
-                // 完成 → 码头字节直出(传输面字节口径)→ 回执 → 放掉码头
+                // 完成 → 码头字节直出(传输面字节口径)→ 回执 → 码头归还池
                 let mut cb_ack = ack.take();
+                let pool = self.pool.clone();
+                // 字节口径 = want_bytes(池码头容量 ≥ n,直出整段会超发)
                 let finish: Finish = Box::new(move || {
-                    let bytes = staging.slice().to_vec();
-                    drop(staging);
+                    let bytes = staging.as_bytes()[..want_bytes].to_vec();
+                    pool.put(staging);
                     cb_ack.take().unwrap().send(Ok(bytes));
                 });
                 if let Err(e) = self.notify(&stream, finish) {
@@ -664,7 +761,7 @@ impl GpuServer {
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
         id: u64,
         want_bytes: usize,
-    ) -> Result<Staging, ModelError> {
+    ) -> Result<Box<dyn owl_iface::contract::PinnedRegion + Send>, ModelError> {
         let n = self.ctx().block_len(id)?; // 块账本 = 字节(2026-09-26 f16 基线)
         if n != want_bytes {
             return Err(ModelError::Msg(format!(
@@ -672,9 +769,17 @@ impl GpuServer {
             )));
         }
         let (dptr, _) = self.ctx().block_ptr(id, stream)?;
-        let mut staging = Staging::alloc(n)?;
-        unsafe { memcpy_dtoh_async(staging.slice_mut(), dptr, stream.cu_stream()) }
-            .map_err(|e| ModelError::Msg(format!("dtoh async: {e:?}")))?;
+        // 码头池化(S1):收割路径同样高频(token 4B/步;logits 大块另计)
+        let mut staging: Box<dyn owl_iface::contract::PinnedRegion + Send> =
+            match self.pool.take(n) {
+                Some(b) => b,
+                None => Box::new(Staging::alloc(n)?),
+            };
+        // 拷贝长度钉死 n(池码头容量 ≥ n,整段拷会越读设备块)
+        unsafe {
+            memcpy_dtoh_async(&mut staging.slice_bytes_mut()[..n], dptr, stream.cu_stream())
+        }
+        .map_err(|e| ModelError::Msg(format!("dtoh async: {e:?}")))?;
         Ok(staging)
     }
 

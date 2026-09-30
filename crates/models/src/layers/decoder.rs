@@ -18,7 +18,7 @@ use crate::layers::attention::Attention;
 use crate::layers::gdn::GatedDeltaNet;
 use crate::layers::mlp::Mlp;
 use crate::layers::rmsnorm::RmsNorm;
-use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module};
+use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, QuantPlan};
 use crate::TensorOps;
 
 /// token mixer 枚举(layer_types 分派;同层二选一)
@@ -38,35 +38,26 @@ pub struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    /// full_attention 层容器
-    pub fn new_full(hq: usize, hkv: usize, hd: usize, hidden: usize, inter: usize, eps: f32) -> Self {
+    /// full_attention 层容器(`plan` = 量化计划构造期注入)
+    pub fn new_full(hq: usize, hkv: usize, hd: usize, hidden: usize, inter: usize, eps: f32, plan: QuantPlan) -> Self {
         DecoderLayer {
             input_ln: RmsNorm::new_add_one("input_layernorm", hidden, eps),
             post_ln: RmsNorm::new_add_one("post_attention_layernorm", hidden, eps),
-            mixer: TokenMixer::Full(Attention::new(hq, hkv, hd, hidden, eps)),
-            mlp: Mlp::new(hidden, inter),
+            mixer: TokenMixer::Full(Attention::new(hq, hkv, hd, hidden, eps, plan)),
+            mlp: Mlp::new(hidden, inter, plan),
             hidden,
         }
     }
 
-    /// linear_attention(GDN)层容器
-    pub fn new_gdn(nk: usize, hk_dim: usize, nv: usize, hv_dim: usize, hidden: usize, inter: usize, eps: f32) -> Self {
+    /// linear_attention(GDN)层容器(`plan` = 量化计划构造期注入)
+    pub fn new_gdn(nk: usize, hk_dim: usize, nv: usize, hv_dim: usize, hidden: usize, inter: usize, eps: f32, plan: QuantPlan) -> Self {
         DecoderLayer {
             input_ln: RmsNorm::new_add_one("input_layernorm", hidden, eps),
             post_ln: RmsNorm::new_add_one("post_attention_layernorm", hidden, eps),
-            mixer: TokenMixer::Gdn(GatedDeltaNet::new(nk, hk_dim, nv, hv_dim, hidden, eps)),
-            mlp: Mlp::new(hidden, inter),
+            mixer: TokenMixer::Gdn(GatedDeltaNet::new(nk, hk_dim, nv, hv_dim, hidden, eps, plan)),
+            mlp: Mlp::new(hidden, inter, plan),
             hidden,
         }
-    }
-
-    /// W4A16 化(E3):mixer + mlp 的全部 Linear
-    pub fn enable_w4a16(&mut self) { // FIXME: 不基于可变范式, 在对象创建的时候，就把这个参数传进来。
-        match &mut self.mixer {
-            TokenMixer::Full(a) => a.enable_w4a16(),
-            TokenMixer::Gdn(g) => g.enable_w4a16(),
-        }
-        self.mlp.enable_w4a16();
     }
 }
 
@@ -153,7 +144,7 @@ mod tests {
         let mut face = owl_cpu::CpuFace::new();
 
         // Full 分支(HQ=2 HKV=1 HD=4 hidden=3 inter=5)
-        let full = DecoderLayer::new_full(2, 1, 4, 3, 5, 1e-6);
+        let full = DecoderLayer::new_full(2, 1, 4, 3, 5, 1e-6, QuantPlan::F16);
         let full_src = src_map(&[
             ("input_layernorm", 3, 1.0),
             ("post_attention_layernorm", 3, 2.0),
@@ -172,7 +163,7 @@ mod tests {
             .expect("full 层 eval_load");
 
         // Gdn 分支(NK=2 HK=4 NV=2 HV=4 hidden=6 inter=5)
-        let gdn = DecoderLayer::new_gdn(2, 4, 2, 4, 6, 5, 1e-6);
+        let gdn = DecoderLayer::new_gdn(2, 4, 2, 4, 6, 5, 1e-6, QuantPlan::F16);
         let gdn_src = src_map(&[
             ("input_layernorm", 6, 1.0),
             ("post_attention_layernorm", 6, 2.0),
@@ -312,7 +303,7 @@ mod tests {
             return;
         }
         let (hq, hkv, hd, hidden, inter) = (2usize, 1usize, 4usize, 3usize, 5usize);
-        let layer = DecoderLayer::new_full(hq, hkv, hd, hidden, inter, EPS);
+        let layer = DecoderLayer::new_full(hq, hkv, hd, hidden, inter, EPS, QuantPlan::F16);
         let mut gpu = crate::testkit::gpu_client().await;
         let src = src_map(&[
             ("input_layernorm", hidden, 1.0),
@@ -443,7 +434,7 @@ mod tests {
         let key_dim = nk * hk_dim;
         let value_dim = nv * hv_dim;
         let conv_dim = 2 * key_dim + value_dim;
-        let layer = DecoderLayer::new_gdn(nk, hk_dim, nv, hv_dim, hidden, inter, EPS);
+        let layer = DecoderLayer::new_gdn(nk, hk_dim, nv, hv_dim, hidden, inter, EPS, QuantPlan::F16);
         eprintln!("[gdn] boot...");
         let mut gpu = crate::testkit::gpu_client().await;
         eprintln!("[gdn] booted; eval_load...");

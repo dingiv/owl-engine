@@ -33,6 +33,7 @@ use owl_iface::contract::{Bytes, DeviceClient, Dtype, ModelError};
 use crate::blocks::BlockManager;
 use crate::prefix_cache::PrefixCacheConfig;
 use crate::graph_plan::f32b;
+use crate::scheduler::{BeginPlan, SchedulerOutput, StepAction};
 use owl_models::interpreters::{eval_ops, eval_ops_scoped};
 use owl_models::layers::gdn::GdnBuffers;
 use owl_models::layers::rope::Rope;
@@ -355,8 +356,6 @@ struct ActiveTurn {
     id: u64,
     session_id: u64,
     ephemeral: bool,
-    /// GDN 状态格号(会话绑定;多会话各清各格、各续各态)
-    gdn_slot: usize,
     prompt_ids: Vec<u32>,
     max_new: usize,
     out: Vec<u32>,
@@ -538,16 +537,48 @@ impl<D: DeviceClient> RunningEngine<D> {
 
     /// 推进到下一个事件点(每调用 = 活跃 turn 的一个采样步,或 turn 的
     /// 启动切换;`Idle` = 队列排空且无活跃,调用方可安全挂起等新提交)。
+    /// 推进到下一个事件点(每调用 = 活跃 turn 的一个采样步,或 turn 的
+    /// 启动切换;`Idle` = 队列排空且无活跃,调用方可安全挂起等新提交)。
+    /// **S0 调度/执行分离**:本函数 = 调度(纯主机侧决策,零设备 IO)
+    /// + 执行(设备侧照办)—— 决策面可单测,执行器无决策权
+    /// (调度层铺开 §S0;对标 vLLM v1 schedule/execute 分离)。
     pub async fn pump(&mut self) -> Result<TurnEvent> {
-        // 无活跃 → 取队首开 turn:会话守卫(命中 = 跳过 GDN 重置 +
-        // 增量起步;失配/新会话 = 重置 + 全量),再推进到首个 Token 事件
+        let prof = std::env::var_os("OWL_STEP_PROFILE").is_some();
+        let t_sched = prof.then(std::time::Instant::now);
+        let out = self.schedule()?;
+        if prof {
+            eprintln!("[step-prof] schedule={:?}", t_sched.unwrap().elapsed());
+        }
+        match out {
+            SchedulerOutput::Idle => Ok(TurnEvent::Idle),
+            SchedulerOutput::Step { begin, action } => {
+                if let Some(b) = begin {
+                    self.execute_begin(b).await?;
+                }
+                match action {
+                    StepAction::Prefill { chunk_ids, base, is_last } => {
+                        self.execute_prefill(chunk_ids, base, is_last).await
+                    }
+                    StepAction::Decode { token, pos, kv_slot, gdn_slot, grew } => {
+                        self.execute_decode(token, pos, kv_slot, gdn_slot, grew).await
+                    }
+                }
+            }
+        }
+    }
+
+    /// 调度决策(纯主机侧):turn 启动判定(会话守卫/前缀匹配/快照
+    /// 边界)+ 相位决策(prefill chunk / decode 步,host 派生量备齐)。
+    /// 只动账(队列/会话账/块账房/活跃 turn),**零 await**。
+    fn schedule(&mut self) -> Result<SchedulerOutput> {
+        let mut begin = None;
         if self.active.is_none() {
             let Some(turn) = self.queue.pop_front() else {
-                return Ok(TurnEvent::Idle);
+                return Ok(SchedulerOutput::Idle);
             };
             // E2c 复用形态:GuardHit(同会话,块链/格态原样)/
             // PrefixHit(跨会话,块链复用 + 快照恢复)/ Fresh(全量)
-            let (cached_len, gdn_slot, prefix_key) = {
+            let (cached_len, gdn_slot, restore_key) = {
                 let s = self
                     .sessions
                     .get_mut(turn.session_id)
@@ -595,12 +626,6 @@ impl<D: DeviceClient> RunningEngine<D> {
                     (0, s.gdn_slot, None)
                 }
             };
-            if cached_len == 0 {
-                self.reset_gdn(gdn_slot).await?;
-            } else if let Some(key) = prefix_key {
-                // 前缀命中:恢复边界快照到会话格(免重灌;GDN 态对齐)
-                self.restore_gdn_snap(gdn_slot, key).await?;
-            }
             // E2b:块表确保覆盖 prompt(增量 turn 块链已存,只长新增段)
             {
                 let s = self
@@ -609,12 +634,16 @@ impl<D: DeviceClient> RunningEngine<D> {
                     .expect("submit 已建会话账");
                 self.blocks_m.ensure_for_len(&mut s.block_table, turn.prompt_ids.len())?;
             }
-            self.write_bt(turn.session_id).await?;
+            begin = Some(BeginPlan {
+                session_id: turn.session_id,
+                gdn_slot,
+                restore_key,
+                reset_gdn: cached_len == 0,
+            });
             self.active = Some(ActiveTurn {
                 id: turn.id,
                 session_id: turn.session_id,
                 ephemeral: turn.ephemeral,
-                gdn_slot,
                 prompt_ids: turn.prompt_ids,
                 max_new: turn.spec.max_new,
                 out: Vec::new(),
@@ -623,62 +652,28 @@ impl<D: DeviceClient> RunningEngine<D> {
             });
         }
 
-        // ── prompt 相位:一次 pump = 一个 chunk(块式 prefill;W1/PF1)──
-        {
-            // 先取标量(prompt 切片经 &self 借出后即刻拷走,避免与
-            // prefill_chunk 的 &mut self 相交)
-            let plan = {
-                let act = self.active.as_ref().expect("active 已保证");
-                if act.fed >= act.prompt_ids.len() {
-                    None
-                } else {
-                    let base = act.fed;
-                    let remaining = act.prompt_ids.len() - base;
-                    // 块长:配置块长 ∩ 剩余(E1 paged 核后无 256 窗钳制;
-                    // 全局注意力语义,长 ctx 安全)
-                    let chunk = remaining.min(self.cfg.prefill_chunk).max(1);
-                    Some((
-                        base,
-                        act.id,
-                        act.session_id,
-                        chunk,
-                        base + chunk >= act.prompt_ids.len(),
-                        act.prompt_ids[base..base + chunk].to_vec(),
-                    ))
-                }
+        // 相位决策:prompt 相位(块式 prefill;W1/PF1)优先
+        let act = self.active.as_ref().expect("begin 或已有活跃");
+        if act.fed < act.prompt_ids.len() {
+            let base = act.fed;
+            let remaining = act.prompt_ids.len() - base;
+            // 块长:配置块长 ∩ 剩余(E1 paged 核后无 256 窗钳制;
+            // 全局注意力语义,长 ctx 安全)
+            let chunk = remaining.min(self.cfg.prefill_chunk).max(1);
+            let action = StepAction::Prefill {
+                chunk_ids: act.prompt_ids[base..base + chunk].to_vec(),
+                base,
+                is_last: base + chunk >= act.prompt_ids.len(),
             };
-            if let Some((base, turn_id, sid, chunk, is_last_prompt, chunk_ids)) = plan {
-                let last_row = self
-                    .prefill_chunk(&chunk_ids, base, is_last_prompt)
-                    .await?;
-                // E2c:块边界跨越 → GDN 快照拍摄(可复用身份 = 链尾块)
-                let new_fed = base + chunk;
-                if self.paged && new_fed % self.page == 0 {
-                    self.capture_gdn_snap(sid, new_fed).await?;
-                }
-                    let act = self.active.as_mut().expect("active 已保证");
-                act.fed += chunk;
-                if !is_last_prompt {
-                    // 块落定,无文本产出 —— 不谎报 Idle
-                    return Ok(TurnEvent::Prefill {
-                        turn: turn_id,
-                        fed: act.fed,
-                        total: act.prompt_ids.len(),
-                    });
-                }
-                // 末块:末行采样(eos / 预算 / Token)
-                return self.sample_and_emit(last_row.expect("末块必有 logits")).await;
-            }
+            return Ok(SchedulerOutput::Step { begin, action });
         }
 
-        // ── 生成相位:decode 单步(捕获回放)+ 采样 ──
-        let (sid, tid, pos) = {
-            let act = self.active.as_ref().expect("active 已保证");
-            let tid = *act.out.last().expect("生成中");
-            (act.session_id, tid, act.fed)
+        // 生成相位:decode 单步(host 派生量备齐 —— 物理槽/跨页增长)
+        let (sid, token, pos) = {
+            let act = self.active.as_ref().expect("活跃");
+            (act.session_id, *act.out.last().expect("生成中"), act.fed)
         };
-        // E2b:物理槽 + 跨页增长(块链增长时重写持久块表)
-        let (kv_slot, gdn_slot_v, grew) = {
+        let (kv_slot, gdn_slot, grew) = {
             let s = self.sessions.get_mut(sid).expect("账在");
             let before = s.block_table.len();
             self.blocks_m.ensure_for_len(&mut s.block_table, pos + 1)?;
@@ -687,32 +682,94 @@ impl<D: DeviceClient> RunningEngine<D> {
             let b = s.block_table[pos / page];
             (b * page as u32 + (pos % page) as u32, s.gdn_slot, grew)
         };
+        Ok(SchedulerOutput::Step {
+            begin,
+            action: StepAction::Decode { token, pos, kv_slot, gdn_slot, grew },
+        })
+    }
+
+    /// turn 启动执行(设备侧照办):GDN 格重置 / 边界快照恢复 + 持久
+    /// 块表重写(write_bt;图烘焙 bt 指针,内容重写指针稳定图不重捕)
+    async fn execute_begin(&mut self, b: BeginPlan) -> Result<()> {
+        if b.reset_gdn {
+            self.reset_gdn(b.gdn_slot).await?;
+        } else if let Some(key) = b.restore_key {
+            // 前缀命中:恢复边界快照到会话格(免重灌;GDN 态对齐)
+            self.restore_gdn_snap(b.gdn_slot, key).await?;
+        }
+        self.write_bt(b.session_id).await
+    }
+
+    /// prefill chunk 执行(设备侧;块已在决策面切好)
+    async fn execute_prefill(
+        &mut self,
+        chunk_ids: Vec<u32>,
+        base: usize,
+        is_last: bool,
+    ) -> Result<TurnEvent> {
+        let (turn_id, sid) = {
+            let act = self.active.as_ref().expect("活跃");
+            (act.id, act.session_id)
+        };
+        let last_row = self.prefill_chunk(&chunk_ids, base, is_last).await?;
+        // E2c:块边界跨越 → GDN 快照拍摄(可复用身份 = 链尾块)
+        let new_fed = base + chunk_ids.len();
+        if self.paged && new_fed % self.page == 0 {
+            self.capture_gdn_snap(sid, new_fed).await?;
+        }
+        self.active.as_mut().expect("活跃").fed += chunk_ids.len();
+        if !is_last {
+            // 块落定,无文本产出 —— 不谎报 Idle
+            let act = self.active.as_ref().expect("活跃");
+            return Ok(TurnEvent::Prefill {
+                turn: turn_id,
+                fed: act.fed,
+                total: act.prompt_ids.len(),
+            });
+        }
+        // 末块:末行采样(eos / 预算 / Token)
+        self.sample_and_emit(last_row.expect("末块必有 logits")).await
+    }
+
+    /// decode 单步执行(设备侧;host 派生量由决策面备齐)
+    async fn execute_decode(
+        &mut self,
+        token: u32,
+        pos: usize,
+        kv_slot: u32,
+        gdn_slot: usize,
+        grew: bool,
+    ) -> Result<TurnEvent> {
+        let sid = self.active.as_ref().expect("活跃").session_id;
+        let prof = std::env::var_os("OWL_STEP_PROFILE").is_some();
+        let t0 = prof.then(std::time::Instant::now);
+        // E2b:块链跨页增长 → 重写持久块表(图烘焙 bt 指针)
         if grew {
             self.write_bt(sid).await?;
         }
         self.session
             .step(&[
-                ("frontier", &[tid as f32]),
+                ("frontier", &[token as f32]),
                 ("pos", &[pos as f32]),
                 ("kv_len", &[(pos + 1) as f32]),
                 ("kv_slot", &[kv_slot as f32]),
-                ("gdn_slot", &[gdn_slot_v as f32]),
+                ("gdn_slot", &[gdn_slot as f32]),
             ])
             .await?;
-
-        {
-            let act = self.active.as_mut().expect("active 已保证");
-            act.fed += 1;
+        if prof {
+            eprintln!("[step-prof] pos={pos} fill+launch={:?}", t0.unwrap().elapsed());
         }
+        self.active.as_mut().expect("活跃").fed += 1;
         // E2c:decode 跨页边界 → 快照拍摄(同流保序,先拍再采样)
         {
-            let act = self.active.as_ref().expect("active 已保证");
+            let act = self.active.as_ref().expect("活跃");
             if self.paged && act.fed % self.page == 0 {
                 self.capture_gdn_snap(act.session_id, act.fed).await?;
             }
         }
         // E3 设备采样:4B token 回读(旧 = 600KB logits dtoh + host argmax)。
         // OWL_HOST_ARGMAX=1 = 对照开关(host argmax 校准设备采样数值)
+        let t_dtoh = prof.then(std::time::Instant::now);
         let nt = if std::env::var_os("OWL_HOST_ARGMAX").is_some() {
             let logits = self.session.read_output_f32("logits").await?;
             logits.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |a, (i, &v)| {
@@ -723,9 +780,11 @@ impl<D: DeviceClient> RunningEngine<D> {
             let tok_f = self.session.read_output_f32("token").await?;
             tok_f[0] as u32
         };
+        if prof {
+            eprintln!("[step-prof] pos={pos} token-dtoh={:?}", t_dtoh.unwrap().elapsed());
+        }
         self.sample_and_emit(nt).await
     }
-
     /// 采样 + 事件产出(Greedy;E3 设备 argmax,token id 直入)。
     /// eos 命中或预算尽 → Completed;否则 Token(delta = 解码文本增量)。
     async fn sample_and_emit(&mut self, nt: u32) -> Result<TurnEvent> {
@@ -1104,6 +1163,111 @@ mod tests {
             "累计差分应是终文前缀:acc={acc:?} final={final_text:?}"
         );
         assert!(final_text.contains('🌟'), "终文应含拆跨字符");
+    }
+
+    /// S0 调度决策面单测(GPU 门控 boot,但**调度步零设备执行**):
+    /// Idle / Begin(Fresh)+ 首块切块 / 决策幂等 / decode 派生量 /
+    /// GuardHit 增量复用。执行器不跑 —— 推进用手工模拟(fed/out 直写)。
+    #[tokio::test]
+    async fn gpu_schedule_decision_surface() {
+        let Some(ordinal) = gpu_ordinal() else {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return;
+        };
+        let dir = asset_dir();
+        let mut engine =
+            Engine::new(EngineConfig { device_ordinal: ordinal, max_seq_tokens: 64, prefill_chunk: 4 })
+                .expect("构造");
+        let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
+        let mut eng = engine.run(loaded).await.expect("run");
+
+        // 空转:队列空且无活跃
+        assert!(matches!(eng.schedule().unwrap(), SchedulerOutput::Idle));
+
+        // 提交 → Begin(Fresh)+ 首块(chunk = min(prefill_chunk, 剩余))
+        let (sid, _tid) = eng.submit_session(None, "一二三四五六七八九十", 3).unwrap();
+        let n = match eng.schedule().unwrap() {
+            SchedulerOutput::Step { begin, action } => {
+                let b = begin.expect("首步必带 begin");
+                assert_eq!(b.session_id, sid);
+                assert!(b.reset_gdn, "Fresh 重置 GDN 格");
+                assert!(b.restore_key.is_none(), "无前缀命中");
+                match action {
+                    StepAction::Prefill { base, is_last, chunk_ids } => {
+                        assert_eq!(base, 0);
+                        assert_eq!(chunk_ids.len(), 4, "chunk = prefill_chunk");
+                        assert!(!is_last, "n>4 → 首块非末块");
+                    }
+                    _ => panic!("期望 Prefill"),
+                }
+                eng.active.as_ref().unwrap().prompt_ids.len()
+            }
+            _ => panic!("期望 Step"),
+        };
+        assert!(n > 4, "prompt 须超一块(token n={n})");
+
+        // 决策幂等:未执行再调度 → 同相位、不再 begin(执行器才推进 fed)
+        match eng.schedule().unwrap() {
+            SchedulerOutput::Step { begin, action } => {
+                assert!(begin.is_none(), "活跃中不再 begin");
+                assert!(matches!(action, StepAction::Prefill { base: 0, .. }));
+            }
+            _ => panic!("期望 Step"),
+        }
+
+        // 模拟执行器推进至 prompt 末 + 产出首 token → decode 派生量备齐
+        {
+            let act = eng.active.as_mut().unwrap();
+            act.fed = act.prompt_ids.len();
+            act.out.push(7);
+        }
+        let b0 = eng.sessions.get(sid).unwrap().block_table[0];
+        let page = eng.page;
+        match eng.schedule().unwrap() {
+            SchedulerOutput::Step { begin, action } => {
+                assert!(begin.is_none());
+                match action {
+                    StepAction::Decode { token, pos, kv_slot, gdn_slot, grew } => {
+                        assert_eq!(token, 7);
+                        assert_eq!(pos, n);
+                        assert_eq!(
+                            kv_slot as usize,
+                            b0 as usize * page + n % page,
+                            "物理槽 = 块链换算"
+                        );
+                        assert_eq!(gdn_slot, 0, "首会话格 0");
+                        assert!(!grew, "页内不跨页");
+                    }
+                    _ => panic!("期望 Decode"),
+                }
+            }
+            _ => panic!("期望 Step"),
+        }
+
+        // GuardHit:账本截短两 token(模拟客户端续发同前缀 prompt),
+        // 同会话续发 → 增量起步 + 不重置 GDN
+        {
+            let act = eng.active.take().unwrap();
+            let s = eng.sessions.get_mut(act.session_id).unwrap();
+            s.commit_turn(&act.prompt_ids, &[]);
+            s.cached_len -= 2;
+        }
+        eng.submit_session(Some(sid), "一二三四五六七八九十", 2).unwrap();
+        match eng.schedule().unwrap() {
+            SchedulerOutput::Step { begin, action } => {
+                let b = begin.expect("续 turn 带 begin");
+                assert!(!b.reset_gdn, "GuardHit 不重置");
+                assert!(b.restore_key.is_none(), "GuardHit 非前缀缓存路径");
+                match action {
+                    StepAction::Prefill { base, is_last, .. } => {
+                        assert_eq!(base, n - 2, "增量起步 = cached_len");
+                        assert!(is_last, "2 token 段一块即末块");
+                    }
+                    _ => panic!("期望 Prefill"),
+                }
+            }
+            _ => panic!("期望 Step"),
+        }
     }
 
     /// GPU 门控:双 turn 生命周期 —— submit 入队 / pump 事件流 / per-turn

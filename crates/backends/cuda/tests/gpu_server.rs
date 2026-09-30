@@ -251,10 +251,42 @@ async fn gpu_server_contract() {
     step_graph_capture_and_replay(&mut client, &x).await; // 5
     step_graph_guardrails(&mut client, &x).await; // 6
 
+    // ---- S1 探针:cuGraphLaunch host 成本(微型 vs 大图;零旗标已定谳无关)----
+    step_graph_launch_probe(&mut client, &x).await;
+
     // ---- 关机(最后;此后主 client 不可再用)----
     step_close_semantics(&mut client).await; // 7
 
     eprintln!("[t] 全部步骤完成");
+}
+
+/// S1 探针:小图(3 节点)与大图(~500 节点)各连发 100 次,分相计时。
+/// 判决:小图也 ms 级 = 系统性(驱动/环境);大图独有 = 节点规模税。
+async fn step_graph_launch_probe(client: &mut GpuClient, x: &Bytes) {
+    for (tag, launches) in [("小图", 1usize), ("大图", 500usize)] {
+        client.graph_begin().await.expect("begin");
+        let out = client.alloc(Dtype::F32, 4).await.expect("alloc");
+        for _ in 0..launches {
+            client.launch(scale_msg(x, &out, 1.0, 4)).await.expect("launch");
+        }
+        let gid = client.graph_end().await.expect("end");
+        // 预热 1 次(首启分配路径)
+        client.graph_launch(gid).await.expect("launch");
+        client.sync().await.expect("sync");
+        let t0 = std::time::Instant::now();
+        let n = 100usize;
+        for _ in 0..n {
+            client.graph_launch(gid).await.expect("launch");
+        }
+        client.sync().await.expect("sync");
+        eprintln!(
+            "[launch-probe] {tag}(~{} 节点)×{} 次:总 {:?} / 均 {:?}",
+            launches * 3 + 2,
+            n,
+            t0.elapsed(),
+            t0.elapsed() / n as u32
+        );
+    }
 }
 
 // ============================================================================

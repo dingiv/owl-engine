@@ -34,6 +34,7 @@ pub mod blocks;
 pub mod prefix_cache;
 pub mod engine;
 pub mod graph_plan;
+pub(crate) mod scheduler;
 pub mod session;
 pub mod turn;
 

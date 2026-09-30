@@ -176,7 +176,7 @@ async fn main() {
         .collect::<std::collections::HashMap<String, Vec<f32>>>();
 
     let mut client = GpuClient::spawn(DeviceSelector::Ordinal(test_device_ordinal())).expect("gpu server boot");
-    let layer = GatedDeltaNet::new(NK, HK_DIM, NV, HV_DIM, HIDDEN, 1e-6);
+    let layer = GatedDeltaNet::new(NK, HK_DIM, NV, HV_DIM, HIDDEN, 1e-6, owl_models::module::QuantPlan::F16);
     owl_models::interpreters::eval_load(&layer, &mut client, &src, &Default::default())
         .await
         .expect("eval_load 九槽");

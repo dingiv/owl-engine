@@ -7,7 +7,7 @@
 
 use crate::contract::Dtype;
 use crate::layers::narrow_strided;
-use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, Weight};
+use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, QuantPlan, Weight};
 use crate::w4a16::marlin_n_pack;
 use crate::TensorOps;
 use owl_kernels::marlin::{v2_workspace_len, GEMM_W4A16};
@@ -18,10 +18,10 @@ pub struct Linear {
     /// E3 量化臂尺寸(声明期常量)
     out_dim: usize,
     in_dim: usize,
-    /// W4A16 量化组大小(Some = 已启用;None = f16 直读)
+    /// W4A16 量化组大小(Some = 已启用;None = f16 直读;构造期定形)
     quant_group: Option<usize>,
     /// 量化三件套(qweight marlin-packed / scales / workspace;
-    /// enable_w4a16 时构建,键 = `{w.key}.qweight/.scales/.ws`)
+    /// W4A16 计划构造时构建,键 = `{w.key}.qweight/.scales/.ws`)
     qw: Option<Weight>,
     sc: Option<Weight>,
     ws: Option<Weight>,
@@ -29,9 +29,13 @@ pub struct Linear {
 }
 
 impl Linear {
-    /// 准备容器(`key` = 数据源槽键;零数据零副作用)
-    pub fn new(key: &'static str, out_dim: usize, in_dim: usize) -> Linear {
-        Linear {
+    /// 准备容器(`key` = 数据源槽键;`plan` = 量化计划构造期注入 ——
+    /// 零数据零副作用,零突变面)。W4A16 计划下按尺寸门控当场定形:
+    /// marlin tile 约束(n = 512×2^k 且 k%128==0,g128 暗雷收紧版谓词,
+    /// 与 w4a16.rs 装载源同源)不满足的小线性保持 f16 直读 —— 装载源
+    /// 侧对同款判定输出反量化 `.weight`。
+    pub fn new(key: &'static str, out_dim: usize, in_dim: usize, plan: QuantPlan) -> Linear {
+        let mut lin = Linear {
             w: Weight::new(key, vec![out_dim, in_dim]),
             out_dim,
             in_dim,
@@ -40,7 +44,11 @@ impl Linear {
             sc: None,
             ws: None,
             ctmp: None,
+        };
+        if plan == QuantPlan::W4A16 && crate::w4a16::marlin_eligible(out_dim, in_dim) {
+            lin.quantize_g128();
         }
+        lin
     }
 
     /// 取出权重槽(单权重基本函数 `load_weight` 的入口;消费层容器)
@@ -48,19 +56,11 @@ impl Linear {
         self.w
     }
 
-    /// W4A16 化(E3;REQ-PRE-01):forward 换 marlin GEMM(foreign
-    /// 通道),装载换三件套(qweight marlin-packed i32 / scales f16 /
-    /// workspace 零初始化)。**尺寸门控**:marlin tile 约束
-    /// (n%256==0 且 k%128==0)不满足的小线性保持 f16 直读 —— 装载源
-    /// 侧对同款判定输出反量化 `.weight`(w4a16.rs 同一谓词)。
-    pub fn enable_w4a16(&mut self) {
-        if self.quant_group.is_some() {
-            return;
-        }
-        // g128 暗雷收紧版谓词(n = 512×2^k 才安全;与 w4a16.rs 同源)
-        if !crate::w4a16::marlin_eligible(self.out_dim, self.in_dim) {
-            return; // 小线性/非安全 n:f16 直读(反量化由装载源负责)
-        }
+    /// W4A16 定形(E3;REQ-PRE-01,构造期私有):forward 换 marlin GEMM
+    /// (foreign 通道),装载换三件套(qweight marlin-packed i32 / scales
+    /// f16 / workspace 零初始化)。
+    fn quantize_g128(&mut self) {
+        debug_assert!(crate::w4a16::marlin_eligible(self.out_dim, self.in_dim));
         let g = 128usize;
         let n_pack = marlin_n_pack(self.out_dim); // 安全档原样打包
         let key: &'static str = self.w.key();
@@ -159,7 +159,7 @@ mod tests {
         }
 
         let mut face = owl_cpu::CpuFace::new();
-        let lin = Linear::new("w", 2, 3);
+        let lin = Linear::new("w", 2, 3, QuantPlan::F16);
         let src = HashMap::from([("w".to_string(), w)]);
         crate::interpreters::eval_load(&lin, &mut face, &src, &Default::default())
             .await
@@ -176,7 +176,7 @@ mod tests {
     #[tokio::test]
     async fn unloaded_slot_becomes_poison_at_boundary() {
         let mut face = owl_cpu::CpuFace::new();
-        let lin = Linear::new("w", 2, 3);
+        let lin = Linear::new("w", 2, 3, QuantPlan::F16);
         let xs = TensorOps::from_host(Dtype::F32, vec![1, 3], &f32b(&[1.0, 2.0, 3.0]));
 
         let out = lin.forward(&xs, &ForwardCtx::minimal(1));
@@ -192,7 +192,7 @@ mod tests {
             .unwrap_err();
         assert!(format!("{err:?}").contains("缺键"), "{err:?}");
 
-        let lin3 = Linear::new("w", 2, 3);
+        let lin3 = Linear::new("w", 2, 3, QuantPlan::F16);
         let bad_len = HashMap::from([("w".to_string(), vec![1.0; 5])]);
         let err = crate::interpreters::eval_load(&lin3, &mut face, &bad_len, &Default::default())
             .await
@@ -226,14 +226,14 @@ mod tests {
         for (face_tag, make) in [("cpu", None), ("gpu", Some(()))] {
             let (_, out) = if make.is_none() {
                 let mut face = owl_cpu::CpuFace::new();
-                let lin = Linear::new("w", out_dim, in_dim);
+                let lin = Linear::new("w", out_dim, in_dim, QuantPlan::F16);
                 let src = HashMap::from([("w".to_string(), w.clone())]);
                 crate::interpreters::eval_load(&lin, &mut face, &src, &Default::default())
                     .await.expect("eval_load");
                 ("cpu", harvest(&mut face, &lin.forward(&xs, &ctx)).await)
             } else {
                 let mut gpu = crate::testkit::gpu_client().await;
-                let lin = Linear::new("w", out_dim, in_dim);
+                let lin = Linear::new("w", out_dim, in_dim, QuantPlan::F16);
                 let src = HashMap::from([("w".to_string(), w.clone())]);
                 crate::interpreters::eval_load(&lin, &mut gpu, &src, &Default::default())
                     .await.expect("eval_load");

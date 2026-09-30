@@ -39,7 +39,7 @@ async fn mlp_pipeline<D: DeviceClient>(face: &mut D) -> Result<Vec<f32>, ModelEr
 
     // new = 准备容器(空包指针);layout = 唯一生命周期钩子(布局声明);
     // eval_load = 执行器(取数 → 物化 → 自动填空包)
-    let mlp = owl_models::layers::mlp::Mlp::new(hidden, intermediate);
+    let mlp = owl_models::layers::mlp::Mlp::new(hidden, intermediate, owl_models::module::QuantPlan::F16);
     let src = std::collections::HashMap::from([
         ("gate_proj".to_string(), vec![0.1; hidden * intermediate]),
         ("up_proj".to_string(), vec![0.2; hidden * intermediate]),

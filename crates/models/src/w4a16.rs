@@ -10,7 +10,7 @@
 //!   多分片仓通用);
 //! - **懒物化**:键首触才重排/反量化(装载域本就按窗口分块拉取);
 //!   per-key 字节缓存(容量上限清空驱逐,主机驻留 = 在途份 + cap 窗口);
-//! - eligible([`marlin_eligible`],与 Linear::enable_w4a16 判定单一来源)
+//! - eligible([`marlin_eligible`],与 Linear 构造期 QuantPlan 门控单一来源)
 //!   → ct packed+scale → unpack(rayon)→ gather-pack(rayon,索引表按形状
 //!   复用)→ `qweight` U32 + `scales` F16;`marlin_ws`/`marlin_ctmp` =
 //!   **零填充直写,零存储**;

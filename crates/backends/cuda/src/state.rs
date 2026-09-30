@@ -3,7 +3,7 @@
 //!
 //! 只被 actor 线程触碰(单线程所有权;零锁)。
 
-use crate::ffi::{device_get_count, free_host, malloc_host, CudaContext, CudaFunction, CudaGraph, CudaSlice, CudaStream, CAPTURE_MODE_THREAD_LOCAL, INSTANTIATE_AUTO_FREE};
+use crate::ffi::{device_get_count, free_host, malloc_host, CudaContext, CudaFunction, CudaSlice, CudaStream, CAPTURE_MODE_THREAD_LOCAL};
 use cudarc::nvrtc::safe::{compile_ptx_with_opts, CompileOptions};
 use owl_iface::contract::GraphId;
 use owl_iface::contract::ModelError;
@@ -97,8 +97,26 @@ struct CaptureState {
 /// CudaGraph 非 Send(cudarc 未标注);我们把它钉死在 actor 线程单一所有权
 /// 下使用(所有图操作都在 dispatch 线程序列化),跨线程移动 GpuServer 携带
 /// 它是安全的 —— 与 cudarc "须外部串行化" 的要求一致。
-struct GraphHolder(CudaGraph);
+/// 图持有(手搓实例化面;exec + 捕获流成对,Drop 双销毁。
+/// 为何不走 cudarc safe CudaGraph:见 ffi.rs graph 定谳注释 —— 其
+/// end_capture 强绑 AUTO_FREE_ON_LAUNCH,每 launch +4.45ms)
+struct GraphHolder {
+    exec: crate::ffi::sys::CUgraphExec,
+    /// 捕获期 CUgraph(exec 实例化后独立,但随 holder 销毁,保持
+    /// cudarc CudaGraph 同等资源语义)
+    cu_graph: crate::ffi::sys::CUgraph,
+    stream: std::sync::Arc<cudarc::driver::CudaStream>,
+}
 unsafe impl Send for GraphHolder {}
+
+impl Drop for GraphHolder {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = crate::ffi::graph_exec_destroy(self.exec);
+            let _ = crate::ffi::graph_destroy(self.cu_graph);
+        }
+    }
+}
 
 impl GpuCtx {
     pub(super) fn new(selector: &DeviceSelector) -> Result<Self, String> {
@@ -189,22 +207,57 @@ impl GpuCtx {
             .ok_or_else(|| ModelError::Msg("graph_end: 当前没有进行中的捕获".to_string()))?;
         // 哨兵③:空捕获窗(begin_capture 后一次发射都没有)
         if cap.launches == 0 {
-            // 仍须 end_capture 退出捕获态;空图被驱动以 None 返回
-            let _ = cap.stream.end_capture(INSTANTIATE_AUTO_FREE);
+            // 仍须 end_capture 退出捕获态;空图被驱动以 NULL 返回
+            let g = unsafe { crate::ffi::stream_end_capture(cap.stream.cu_stream()) }
+                .map_err(|e| ModelError::Msg(format!("graph_end: {e:?}")))?;
+            if !g.is_null() {
+                let _ = unsafe { crate::ffi::graph_destroy(g) };
+            }
             return Err(ModelError::Msg(
                 "graph_end: 空捕获窗(发射数 = 0;先在捕获期发射 ≥ 1 个 kernel)".to_string(),
             ));
         }
-        let graph = cap
-            .stream
-            .end_capture(INSTANTIATE_AUTO_FREE)
-            .map_err(|e| ModelError::Msg(format!("graph_end: {e:?}")))?
-            .ok_or_else(|| {
-                ModelError::Msg("graph_end: 空捕获窗(发射数 = 0;哨兵③)".to_string())
-            })?;
+        // 裸端捕获 + 零旗标实例化(AUTO_FREE_ON_LAUNCH 定谳见 ffi.rs;
+        // 图执行语义与 safe 版逐位一致 —— 同 cuGraphLaunch 入 COMPUTE 流)
+        let cu_graph = unsafe { crate::ffi::stream_end_capture(cap.stream.cu_stream()) }
+            .map_err(|e| ModelError::Msg(format!("graph_end: {e:?}")))?;
+        if cu_graph.is_null() {
+            return Err(ModelError::Msg(
+                "graph_end: 空捕获窗(发射数 = 0;哨兵③)".to_string(),
+            ));
+        }
+        let mut exec: crate::ffi::sys::CUgraphExec = std::ptr::null_mut();
+        unsafe { crate::ffi::sys::cuGraphInstantiateWithFlags(&mut exec, cu_graph, 0u64) }
+            .result()
+            .map_err(|e| ModelError::Msg(format!("graph_end: 实例化(零旗标): {e:?}")))?;
+        // 节点数/类型观测(S1 launch 税立案:探针判 0.33µs/节点,引擎图
+        // 实测 1.84µs/节点 —— 按类型分解找贵节点)
+        if std::env::var_os("OWL_SRV_TIMING").is_some() {
+            let mut n: usize = 0;
+            unsafe {
+                crate::ffi::sys::cuGraphGetNodes(cu_graph, std::ptr::null_mut(), &mut n);
+            }
+            let mut nodes = vec![std::ptr::null_mut(); n];
+            let mut got: usize = n;
+            unsafe {
+                crate::ffi::sys::cuGraphGetNodes(cu_graph, nodes.as_mut_ptr(), &mut got);
+            }
+            let mut kinds: std::collections::HashMap<i32, usize> = Default::default();
+            for nd in &nodes[..got] {
+                let mut t: crate::ffi::sys::CUgraphNodeType = unsafe { std::mem::zeroed() };
+                unsafe {
+                    crate::ffi::sys::cuGraphNodeGetType(*nd, &mut t);
+                }
+                *kinds.entry(t as i32).or_default() += 1;
+            }
+            eprintln!("[gl-prof] 图节点 = {got}(类型 {kinds:?};0=kernel 1=memcpy 2=memset 3=host 4=graph 5=empty)");
+        }
         let id = self.next_graph;
         self.next_graph += 1;
-        self.graphs.insert(id, GraphHolder(graph));
+        self.graphs.insert(
+            id,
+            GraphHolder { exec, cu_graph, stream: cap.stream.clone() },
+        );
         Ok(id)
     }
 
@@ -216,17 +269,27 @@ impl GpuCtx {
             ));
         }
         let stream = self.stream(STREAM_COMPUTE)?.clone();
-        self.graphs
-            .get(&gid)
-            .ok_or_else(|| ModelError::Msg(format!("graph_launch: 图 {gid} 不存在")))?
-            .0
-            .launch()
+        let prof = std::env::var_os("OWL_SRV_TIMING").is_some();
+        let t0 = prof.then(std::time::Instant::now);
+        let (exec, cu_stream) = {
+            let g = self
+                .graphs
+                .get(&gid)
+                .ok_or_else(|| ModelError::Msg(format!("graph_launch: 图 {gid} 不存在")))?;
+            (g.exec, g.stream.cu_stream())
+        };
+        unsafe { crate::ffi::graph_launch(exec, cu_stream) }
             .map_err(|e| ModelError::Msg(format!("graph_launch({gid}): {e:?}")))?;
+        if prof {
+            eprintln!("[gl-prof] gid={gid} launch={:?}", t0.unwrap().elapsed());
+        }
         // 诊断开关(OWL_LAUNCH_SYNC=1):回放后同步归因(烘焙指针消费者)
         if std::env::var_os("OWL_LAUNCH_SYNC").is_some() {
+            let t1 = std::time::Instant::now();
             stream
                 .synchronize()
                 .map_err(|e| ModelError::Msg(format!("graph-sync({gid}): {e:?}")))?;
+            eprintln!("[gl-prof] gid={gid} gpu-sync={:?}", t1.elapsed());
         }
         Ok(())
     }

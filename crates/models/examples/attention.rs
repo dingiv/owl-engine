@@ -189,7 +189,7 @@ async fn main() {
         .expect("gpu server boot");
 
     // 层容器 + 装载(六槽)
-    let attn = Attention::new(HQ, HKV, HD, HIDDEN, EPS);
+    let attn = Attention::new(HQ, HKV, HD, HIDDEN, EPS, owl_models::module::QuantPlan::F16);
     let src = std::collections::HashMap::from([
         ("q_proj".to_string(), wq.clone()),
         ("k_proj".to_string(), wk.clone()),

@@ -256,10 +256,12 @@ impl<D: DeviceClient> GraphPlan<D> {
 
     /// 槽装填:write_block 原位(指针稳定 —— 回放根基)
     async fn fill_slots(&mut self, fills: &[(&str, &[f32])]) -> Result<()> {
+        // S1:批量装填 —— 一次设备往返(校验全过才发;错误归因仍逐槽)
+        let mut writes: Vec<(&Bytes, usize, &[f32])> = Vec::with_capacity(fills.len());
         for (name, data) in fills {
             let slot = self
                 .inputs
-                .iter_mut()
+                .iter()
                 .find(|s| s.name == *name)
                 .ok_or_else(|| ModelError::Msg(format!("step: 未声明输入槽 {name}")))?;
             if data.len() != slot.len {
@@ -269,9 +271,9 @@ impl<D: DeviceClient> GraphPlan<D> {
                     slot.len
                 )));
             }
-            self.face.write_block_f32(&slot.block, 0, data).await?;
+            writes.push((&slot.block, 0, data));
         }
-        Ok(())
+        self.face.write_blocks_f32(&writes).await
     }
 
     /// 闭包声明 + 守卫:返回登记输出(名须在 out_specs)

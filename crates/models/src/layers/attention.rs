@@ -28,7 +28,7 @@ use crate::kernel;
 use crate::layers::linear::Linear;
 use crate::layers::{concat_rows_hier, narrow_strided};
 use crate::layers::rmsnorm::RmsNorm;
-use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, KvBuffers};
+use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, QuantPlan, KvBuffers};
 use crate::TensorOps;
 
 pub struct Attention {
@@ -48,13 +48,14 @@ pub struct Attention {
 }
 
 impl Attention {
-    /// 准备容器(0.8B:hq=8, hkv=2, hd=256 → q_proj out 4096 / kv out 512)
-    pub fn new(hq: usize, hkv: usize, hd: usize, hidden: usize, eps: f32) -> Attention {
+    /// 准备容器(0.8B:hq=8, hkv=2, hd=256 → q_proj out 4096 / kv out 512;
+    /// `plan` = 量化计划构造期注入,尺寸门控在 Linear 内定形)
+    pub fn new(hq: usize, hkv: usize, hd: usize, hidden: usize, eps: f32, plan: QuantPlan) -> Attention {
         Attention {
-            q_proj: Linear::new("q_proj", hq * hd * 2, hidden),
-            k_proj: Linear::new("k_proj", hkv * hd, hidden),
-            v_proj: Linear::new("v_proj", hkv * hd, hidden),
-            o_proj: Linear::new("o_proj", hidden, hq * hd),
+            q_proj: Linear::new("q_proj", hq * hd * 2, hidden, plan),
+            k_proj: Linear::new("k_proj", hkv * hd, hidden, plan),
+            v_proj: Linear::new("v_proj", hkv * hd, hidden, plan),
+            o_proj: Linear::new("o_proj", hidden, hq * hd, plan),
             q_norm: RmsNorm::new_add_one("q_norm", hd, eps),
             k_norm: RmsNorm::new_add_one("k_norm", hd, eps),
             hq,
@@ -62,14 +63,6 @@ impl Attention {
             hd,
             hidden,
         }
-    }
-
-    /// W4A16 化(E3):四投影量化臂(尺寸门控在 Linear 内)
-    pub fn enable_w4a16(&mut self) {
-        self.q_proj.enable_w4a16();
-        self.k_proj.enable_w4a16();
-        self.v_proj.enable_w4a16();
-        self.o_proj.enable_w4a16();
     }
 
     /// 计算声明(decode;xs [T, hidden],T = ctx.tokens;C4 后回归 Module)。
@@ -481,7 +474,7 @@ mod tests {
     async fn load_and_declaration_wellformed() {
         let (hq, hkv, hd, hidden) = (2usize, 1usize, 4usize, 3usize);
         let mut face = owl_cpu::CpuFace::new();
-        let attn = Attention::new(hq, hkv, hd, hidden, 1e-6);
+        let attn = Attention::new(hq, hkv, hd, hidden, 1e-6, QuantPlan::F16);
         crate::interpreters::eval_load(&attn, &mut face, &six_slots(hq, hkv, hd, hidden), &Default::default())
             .await
             .expect("eval_load 六槽");
@@ -520,7 +513,7 @@ mod tests {
         assert!(!out_d.is_poisoned(), "prefill 分派后 decode 路不破");
 
         // 毒值契约:未装载容器 → forward 声明立即带毒
-        let attn2 = Attention::new(hq, hkv, hd, hidden, 1e-6);
+        let attn2 = Attention::new(hq, hkv, hd, hidden, 1e-6, QuantPlan::F16);
         assert!(attn2.forward(&xs, &ctx).is_poisoned(), "未装载槽的声明应立即带毒");
 
         // 缺动态依赖的 ctx → 毒值(与未装载槽同构)
@@ -577,7 +570,7 @@ mod tests {
         }
         use crate::module::Module as _;
         let mut gpu = crate::testkit::gpu_client().await;
-        let attn = Attention::new(2, 1, 8, 3, 1e-6);
+        let attn = Attention::new(2, 1, 8, 3, 1e-6, QuantPlan::F16);
         crate::interpreters::eval_load(&attn, &mut gpu, &six_slots(2, 1, 8, 3), &Default::default())
             .await
             .expect("eval_load");
@@ -721,7 +714,7 @@ mod f16_tests {
         src.insert("o_proj".to_string(), (0..hidden * hq * hd).map(|i| ((i as f32 + 6.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
         src.insert("q_norm".to_string(), (0..hd).map(|i| ((i as f32 + 7.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
         src.insert("k_norm".to_string(), (0..hd).map(|i| ((i as f32 + 8.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
-        let attn = Attention::new(hq, hkv, hd, hidden, 1e-6);
+        let attn = Attention::new(hq, hkv, hd, hidden, 1e-6, QuantPlan::F16);
 
         let mut gpu = gpu_client().await;
         let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1 };
@@ -822,7 +815,7 @@ mod f16_tests {
         src.insert("o_proj".to_string(), (0..hidden * hq * hd).map(|i| ((i as f32 + 6.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
         src.insert("q_norm".to_string(), (0..hd).map(|i| ((i as f32 + 7.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
         src.insert("k_norm".to_string(), (0..hd).map(|i| ((i as f32 + 8.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
-        let attn = Attention::new(hq, hkv, hd, hidden, 1e-6);
+        let attn = Attention::new(hq, hkv, hd, hidden, 1e-6, QuantPlan::F16);
 
         let mut gpu = gpu_client().await;
         let lctx = crate::module::LoaderCtx { dtype: Dtype::F32, shard: 1 };

@@ -207,28 +207,28 @@ where
         Op::Block { id } => Bytes { id: *id, len: 0 },
         Op::Reshape => ins[0].clone(), // 纯元数据视图:透传父块(零拷贝)
         Op::Add => {
-            let out = ctx.face.alloc(dtype, n_elems).await?;
+            let out = ctx.face.alloc_uninit(dtype, n_elems).await?;
             ctx.arena.push(out.id);
             let msg = crate::ops::lower_add(&ins, &out, n_elems, dtype);
             ctx.face.launch(msg).await?;
             out
         }
         Op::Mul => {
-            let out = ctx.face.alloc(dtype, n_elems).await?;
+            let out = ctx.face.alloc_uninit(dtype, n_elems).await?;
             ctx.arena.push(out.id);
             let msg = crate::ops::lower_mul(&ins, &out, n_elems, dtype);
             ctx.face.launch(msg).await?;
             out
         }
         Op::Silu => {
-            let out = ctx.face.alloc(dtype, n_elems).await?;
+            let out = ctx.face.alloc_uninit(dtype, n_elems).await?;
             ctx.arena.push(out.id);
             let msg = crate::ops::lower_silu(&ins, &out, n_elems, dtype);
             ctx.face.launch(msg).await?;
             out
         }
         Op::Sigmoid => {
-            let out = ctx.face.alloc(dtype, n_elems).await?;
+            let out = ctx.face.alloc_uninit(dtype, n_elems).await?;
             ctx.arena.push(out.id);
             let msg = crate::ops::lower_sigmoid(&ins, &out, n_elems, dtype);
             ctx.face.launch(msg).await?;
@@ -239,7 +239,7 @@ where
             // k = 内维 = x 声明 shape 末维(C1:只读声明 shape;原取 ins[0].len
             // 在多行 [m,k] 时越界读 —— 此 bug 被"历届测试都单行"掩盖)
             let k = t.parents[0].shape.last().copied().unwrap_or(0);
-            let out = ctx.face.alloc(dtype, m * n).await?;
+            let out = ctx.face.alloc_uninit(dtype, m * n).await?;
             ctx.arena.push(out.id);
             if dtype == Dtype::F16 {
                 // f16 基线:foreign-kernel 通道(cuBLAS;nt = owl Linear 惯例)。
@@ -259,7 +259,7 @@ where
             out
         }
         Op::Rmsnorm { eps, w_off } => {
-            let out = ctx.face.alloc(dtype, n_elems).await?;
+            let out = ctx.face.alloc_uninit(dtype, n_elems).await?;
             ctx.arena.push(out.id);
             // 归一化宽度由 alpha 的声明 shape 定义(per-head 行归一化:
             // [T, H×HD] × alpha [HD])。不能取 ins[1].len —— Block 叶子 len=0。
@@ -283,7 +283,7 @@ where
                     )));
                 }
             }
-            let out = ctx.face.alloc(dtype, n_elems).await?;
+            let out = ctx.face.alloc_uninit(dtype, n_elems).await?;
             ctx.arena.push(out.id);
             let msg = crate::ops::lower_kernel(kernel, &t.args, &ins, &out, n_elems);
             ctx.face.launch(msg).await?;

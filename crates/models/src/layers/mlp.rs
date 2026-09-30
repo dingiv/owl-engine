@@ -6,7 +6,7 @@
 //! 容器 + LoaderOps 装载形态(子层描述 chain 聚合)。
 
 use super::linear::Linear;
-use crate::module::{Loadable, LoaderCtx, LoaderOps};
+use crate::module::{Loadable, LoaderCtx, LoaderOps, QuantPlan};
 use crate::module::{ForwardCtx, Module};
 use crate::TensorOps;
 
@@ -17,23 +17,15 @@ pub struct Mlp {
 }
 
 impl Mlp {
-    /// 准备容器(hidden = 1024, intermediate = 3584 —— 0.8B 实测配置)
-    pub fn new(hidden: usize, intermediate: usize) -> Mlp {
+    /// 准备容器(hidden = 1024, intermediate = 3584 —— 0.8B 实测配置;
+    /// `plan` = 量化计划构造期注入,尺寸门控在 Linear 内定形)
+    pub fn new(hidden: usize, intermediate: usize, plan: QuantPlan) -> Mlp {
         Mlp {
-            gate_proj: Linear::new("gate_proj", intermediate, hidden),
-            up_proj: Linear::new("up_proj", intermediate, hidden),
-            down_proj: Linear::new("down_proj", hidden, intermediate),
+            gate_proj: Linear::new("gate_proj", intermediate, hidden, plan),
+            up_proj: Linear::new("up_proj", intermediate, hidden, plan),
+            down_proj: Linear::new("down_proj", hidden, intermediate, plan),
         }
     }
-
-    /// W4A16 化(E3):三投影量化臂(尺寸门控在 Linear 内)
-    pub fn enable_w4a16(&mut self) {
-        self.gate_proj.enable_w4a16();
-        self.up_proj.enable_w4a16();
-        self.down_proj.enable_w4a16();
-    }
-
-
 }
 
 impl Module for Mlp {
@@ -72,7 +64,7 @@ mod tests {
         let x = vec![0.5, -0.25, 1.0, 0.0];
 
         let mut face = owl_cpu::CpuFace::new();
-        let layer = Mlp::new(hidden, intermediate);
+        let layer = Mlp::new(hidden, intermediate, QuantPlan::F16);
         let src = Src::from([
             ("gate_proj".to_string(), gate_w.clone()),
             ("up_proj".to_string(), up_w.clone()),
@@ -141,7 +133,7 @@ mod tests {
             }
             let (_, out) = if !on_gpu {
                 let mut face = owl_cpu::CpuFace::new();
-                let layer = Mlp::new(hidden, inter);
+                let layer = Mlp::new(hidden, inter, QuantPlan::F16);
                 let src = HashMap::from([
                     ("gate_proj".to_string(), gate_w.clone()),
                     ("up_proj".to_string(), up_w.clone()),
@@ -152,7 +144,7 @@ mod tests {
                 ("cpu", harvest(&mut face, &layer.forward(&xs, &ctx)).await)
             } else {
                 let mut gpu = crate::testkit::gpu_client().await;
-                let layer = Mlp::new(hidden, inter);
+                let layer = Mlp::new(hidden, inter, QuantPlan::F16);
                 let src = HashMap::from([
                     ("gate_proj".to_string(), gate_w.clone()),
                     ("up_proj".to_string(), up_w.clone()),

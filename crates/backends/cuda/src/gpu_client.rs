@@ -99,7 +99,12 @@ impl DeviceClient for GpuClient {
 
     async fn alloc(&mut self, dtype: Dtype, elems: usize) -> Result<Bytes, ModelError> {
         let n_bytes = elems * dtype.size_bytes();
-        self.submit(move |ack| Command::Alloc { n_bytes, elems, ack })?.await
+        self.submit(move |ack| Command::Alloc { n_bytes, elems, zero: true, ack })?.await
+    }
+
+    async fn alloc_uninit(&mut self, dtype: Dtype, elems: usize) -> Result<Bytes, ModelError> {
+        let n_bytes = elems * dtype.size_bytes();
+        self.submit(move |ack| Command::Alloc { n_bytes, elems, zero: false, ack })?.await
     }
 
     async fn alloc_pinned(
@@ -145,6 +150,25 @@ impl DeviceClient for GpuClient {
             ack,
         })?
         .await
+    }
+
+    /// 批量块内写入(S1):decode 每步多槽装填合一次命令/一次往返
+    async fn write_blocks_f32(
+        &mut self,
+        writes: &[(&Bytes, usize, &[f32])],
+    ) -> Result<(), ModelError> {
+        let writes: Vec<(u64, usize, Vec<u8>)> = writes
+            .iter()
+            .map(|(b, off, data)| {
+                let mut bytes = Vec::with_capacity(data.len() * 4);
+                for f in *data {
+                    bytes.extend_from_slice(&f.to_le_bytes());
+                }
+                (b.id, off * 4, bytes)
+            })
+            .collect();
+        self.submit(move |ack| Command::HtodChunks { writes, ack })?
+            .await
     }
 
     fn loader_faces(&self, k: usize) -> Option<Vec<Self>>

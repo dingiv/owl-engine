@@ -225,6 +225,24 @@ pub trait DeviceClient: Send {
     /// 返回 Bytes.len = **元素数**口径(C1 断言/账本不变)。
     fn alloc(&mut self, dtype: Dtype, elems: usize)
         -> impl Future<Output = Result<Bytes, ModelError>> + Send;
+
+    /// 未初始化分配(S1,2026-09-30):scratch 输出块 = 随后 kernel
+    /// **全量覆写**,不需要零化。GPU 后端覆写为无 memset 分配 ——
+    /// 捕获窗内不烙 memset 节点(S1 实测定谳:decode 图 1207 memset
+    /// 节点 = launch 税 + ~2ms GPU 时间双税),图外免流序清零。
+    /// 默认 = 委托 [`DeviceClient::alloc`](零化语义,保守正确)。
+    /// **契约**:调用方保证 kernel 全量覆写后才读;Zeros 语义走
+    /// [`DeviceClient::alloc`](零化)。
+    fn alloc_uninit(
+        &mut self,
+        dtype: Dtype,
+        elems: usize,
+    ) -> impl Future<Output = Result<Bytes, ModelError>> + Send
+    where
+        Self: Sized,
+    {
+        async move { self.alloc(dtype, elems).await }
+    }
     /// host 数据入块(H2D 流异步拷贝 + finish 回调携 ack):**回执即数据
     /// 落地**,后续 launch 跨流读安全(顺序语义,见 trait 级文档)
     fn htod(
@@ -310,6 +328,24 @@ pub trait DeviceClient: Send {
     ) -> impl Future<Output = Result<(), ModelError>> + Send {
         async {
             Err(ModelError::Msg("write_block_f32: 此后端未实现".into()))
+        }
+    }
+
+    /// 批量块内写入(S1,2026-09-30):decode 每步多槽装填合一次设备
+    /// 往返(单 ack 保序协议不变 —— ack = 全部写完)。默认 = 逐块循环
+    /// write_block_f32;GPU 后端覆写为批量命令(省 per-write 回执税)。
+    fn write_blocks_f32(
+        &mut self,
+        writes: &[(&Bytes, usize, &[f32])],
+    ) -> impl Future<Output = Result<(), ModelError>> + Send
+    where
+        Self: Sized,
+    {
+        async move {
+            for (dst, off, data) in writes {
+                self.write_block_f32(dst, *off, data).await?;
+            }
+            Ok(())
         }
     }
 

@@ -35,9 +35,12 @@ pub enum Command {
     },
     /// 清零分配(设备侧 memset,流序非阻塞;捕获期自动切 slab)。
     /// n_bytes = 清零/切块字节数;elems = Bytes 账长(元素口径,f16 ≠ bytes/4)
+    /// zero = false 时免 memset(S1:scratch 输出 kernel 全量覆写;
+    /// 捕获窗免烙 memset 节点 —— 1207 节点双税定谳)
     Alloc {
         n_bytes: usize,
         elems: usize,
+        zero: bool,
         ack: Ack<Result<Bytes, ModelError>>,
     },
     /// host → device(字节传输,f16 基线;Staging 字节码头 + 异步 memcpy)
@@ -59,6 +62,13 @@ pub enum Command {
         block: u64,
         offset_bytes: usize,
         data: Vec<u8>,
+        ack: Ack<Result<(), ModelError>>,
+    },
+    /// host → device **批量分块写入**(S1):decode 每步多槽装填合一次
+    /// 命令/一次往返 —— 保序协议不变(单 ack = 全部写完,launch 才发);
+    /// server 逐写池化码头 + H2D 流序,末尾单 notify
+    HtodChunks {
+        writes: Vec<(u64, usize, Vec<u8>)>,
         ack: Ack<Result<(), ModelError>>,
     },
     /// 分配 pinned 租约(流式装载 DMA 源;池优先,miss 才 cudaHostAlloc)
