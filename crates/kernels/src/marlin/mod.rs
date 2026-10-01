@@ -15,17 +15,24 @@
 //!   传空指针即可,长度公式 [`c_tmp_float_len_v2`] 留作升级用)
 //! - groupsize:`-1`(per-channel)或 `128`
 //!
-//! **发射通道**:server foreign-kernel(虚拟核名 [`GEMM_W4A16`],槽序契约
-//! 见下方常量文档)——与 cublas_gemm_f16 同款,Launch 即唯一执行命令。
+//! **发射通道**:server foreign-kernel(虚拟核名 [`GEMM_W4A16`]/
+//! [`GEMM_W4A16_AWQ`],槽序契约见下方常量文档)——与 cublas_gemm_f16
+//! 同款,Launch 即唯一执行命令。
 //!
-//! 固化范围:no act-order / no zp / no bias / use_atomic_add=false /
-//! use_fp32_reduce=false。AWQ(kU4 非对称)与 W4A8 变体在 .a 内保留,
-//! 封装未引(需要时照 gemm_v2_raw 模式加)。
+//! 固化范围:no act-order / no bias / use_atomic_add=false /
+//! use_fp32_reduce=false(g128 暗雷根治定谳,f16 全局 reduce 直写 C)。
+//! W4A8(s8 族)变体在 .a 内保留,封装未引(需要时照 gemm_v2_raw 模式加);
+//! AWQ(kU4 非对称,zp)已接([`gemm_v2_awq_raw`],2026-10-01 cyankiwi
+//! Qwen3.8-27B-AWQ-INT4 装载线)。
 
 use std::ffi::c_void;
 
 /// foreign-kernel 虚拟核名(server `is_foreign` 分派谓词的第二个臂)
 pub const GEMM_W4A16: &str = "marlin_gemm_w4a16";
+
+/// foreign-kernel 虚拟核名(AWQ kU4 非对称臂;槽序 = GEMM_W4A16 的
+/// scales 之后插 zeros,共 7 Block + 4 sz)
+pub const GEMM_W4A16_AWQ: &str = "marlin_gemm_w4a16_awq";
 
 /// 槽序契约(LaunchMsg.args;与 cublas.rs 文档同构):
 /// `[T a, T b, T out, T scales, T workspace, T c_tmp, sz m, sz k, sz n, sz groupsize]`
@@ -36,7 +43,7 @@ pub const GEMM_W4A16_SLOTS: &str =
 
 /// foreign 分派谓词(server handle_launch 前置检查;cublas 同款)
 pub fn is_foreign(name: &str) -> bool {
-    name == GEMM_W4A16
+    name == GEMM_W4A16 || name == GEMM_W4A16_AWQ
 }
 
 pub const V2_ERR_NO_CONFIG: i32 = 3;
@@ -121,6 +128,69 @@ extern "C" {
         dev: i32,
         stream: usize,
     ) -> i32;
+
+    // AWQ(kU4 非对称)臂:b_zeros = pack_marlin_z 产物((k/g, n/8) i32,
+    // scale_perm + n-interleave 已烘焙);其余契约与 gemm_v2_ffi 一致。
+    fn marlin_gemm_v2_awq_ffi(
+        a: *const c_void,
+        b: *const c_void,
+        c: *mut c_void,
+        c_tmp: *mut c_void,
+        b_scales: *const c_void,
+        b_zeros: *const c_void,
+        prob_m: i32,
+        prob_n: i32,
+        prob_k: i32,
+        workspace: *mut c_void,
+        group_size: i32,
+        dev: i32,
+        stream: usize,
+    ) -> i32;
+}
+
+/// AWQ(kU4 非对称)GEMM(裸指针)。b_zeros 布局契约见
+/// [`crate::marlin::repack::pack_marlin_z`];其余同 [`gemm_v2_raw`]。
+///
+/// # Safety
+/// 指针须指向合法且长度匹配布局契约的设备内存;workspace 须零初始化
+/// 且长度 ≥ [`v2_workspace_len(n)`];b_zeros 须 [`gemm_v2_awq_raw`] 契约
+/// 布局(kU4 模板 has_zp=true 无条件解引用 zp 指针,nullptr = 非法地址)。
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_v2_awq_raw(
+    a: *const u16,
+    b: *const i32,
+    c: *mut u16,
+    scales: *const u16,
+    zeros: *const i32,
+    c_tmp: *const c_void,
+    m: i32,
+    n: i32,
+    k: i32,
+    workspace: *mut i32,
+    groupsize: i32,
+    dev: i32,
+    stream: usize,
+) -> Result<(), i32> {
+    let err = marlin_gemm_v2_awq_ffi(
+        a as *const c_void,
+        b as *const c_void,
+        c as *mut c_void,
+        c_tmp as *mut c_void,
+        scales as *const c_void,
+        zeros as *const c_void,
+        m,
+        n,
+        k,
+        workspace as *mut c_void,
+        groupsize,
+        dev,
+        stream,
+    );
+    if err == 0 {
+        Ok(())
+    } else {
+        Err(err)
+    }
 }
 
 pub mod repack;

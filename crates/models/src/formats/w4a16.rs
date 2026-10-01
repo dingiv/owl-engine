@@ -398,10 +398,10 @@ impl WeightSource for W4A16Source {
 }
 
 // ============================================================================
-// 字节转换助手(rayon;对齐安全 from_le_bytes)
+// 字节转换助手(rayon;对齐安全 from_le_bytes)—— pub(crate):awq.rs 共享
 // ============================================================================
 
-fn i32s_par(bytes: &[u8]) -> Vec<i32> {
+pub(crate) fn i32s_par(bytes: &[u8]) -> Vec<i32> {
     use rayon::prelude::*;
     let n = bytes.len() / 4;
     let mut v = vec![0i32; n];
@@ -421,7 +421,7 @@ fn i32s_par(bytes: &[u8]) -> Vec<i32> {
     v
 }
 
-fn bf16_par(bytes: &[u8]) -> Vec<f32> {
+pub(crate) fn bf16_par(bytes: &[u8]) -> Vec<f32> {
     use rayon::prelude::*;
     let n = bytes.len() / 2;
     let mut v = vec![0f32; n];
@@ -451,10 +451,10 @@ fn f32_bytes_to_f16(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-fn i32s_le_bytes(v: &[i32]) -> Vec<u8> {
+pub(crate) fn i32s_le_bytes(v: &[i32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
-fn u16s_le_bytes(v: &[u16]) -> Vec<u8> {
+pub(crate) fn u16s_le_bytes(v: &[u16]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }

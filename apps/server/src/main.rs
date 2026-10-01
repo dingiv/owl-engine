@@ -50,6 +50,9 @@ async fn main() {
     let model_dir = std::env::var("OWL_MODEL_DIR").map(PathBuf::from).unwrap_or_else(|_| {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../crates/models/assets/Qwen3.5-0.8B")
     });
+    // 模型档位选择(2026-10-01):0.8b(缺省,f16)/ awq27b(Qwen3.8-27B
+    // AWQ-INT4;OWL_MODEL_DIR = 检查点目录,tokenizer 同目录)
+    let model_kind = env_or("OWL_MODEL_KIND", "0.8b".into());
 
     // ── engine actor:专属线程(构造+装载+泵全在内;RunningEngine 非 Send)──
     let (tx, rx) = mpsc::channel::<EngineReq>(64);
@@ -61,7 +64,7 @@ async fn main() {
                 .enable_all()
                 .build()
                 .expect("actor runtime");
-            rt.block_on(actor_main(model_dir, device, max_seq, chunk, rx, ready_tx));
+            rt.block_on(actor_main(model_dir, model_kind, device, max_seq, chunk, rx, ready_tx));
         })
         .expect("actor 线程");
 
@@ -91,6 +94,7 @@ async fn main() {
 /// actor 线程主:引擎生命周期 facade → 事件泵(actor::run_actor)
 async fn actor_main(
     model_dir: PathBuf,
+    model_kind: String,
     device: usize,
     max_seq: usize,
     chunk: usize,
@@ -105,7 +109,12 @@ async fn actor_main(
             prefill_chunk: chunk,
         })?;
         eprintln!("[boot] 设备绑定 {:.2}s", t0.elapsed().as_secs_f32());
-        let model = engine.loader().load_qwen35_0_8b(&model_dir).await?;
+        let model = match model_kind.as_str() {
+            "awq27b" => {
+                engine.loader().load_qwen38_27b_awq(&model_dir, &model_dir).await?
+            }
+            _ => engine.loader().load_qwen35_0_8b(&model_dir).await?,
+        };
         eprintln!("[boot] 权重/tokenizer/rope 装载 {:.2}s", t0.elapsed().as_secs_f32());
         let running = engine.run(model).await?;
         eprintln!("[boot] 引擎装配(run)总计 {:.2}s", t0.elapsed().as_secs_f32());

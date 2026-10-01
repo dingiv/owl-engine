@@ -60,6 +60,9 @@ pub struct ModelSpec {
     /// 分词器声明(家族特有事实:eos 族 + chat 文本格式;机制在
     /// [`crate::tokenizer`] —— 模型用什么分词器是声明,不是函数)
     pub tokenizer: crate::tokenizer::TokenizerSpec,
+    /// tie_word_embeddings(true = lm_head 复用 embed;tied 仓特例;
+    /// Qwen3.8-27B 等独立 lm_head 仓 = false)
+    pub tied: bool,
 }
 
 // ============================================================================
@@ -101,8 +104,13 @@ impl Model {
                 }
             })
             .collect();
+        let embed = if spec.tied {
+            Embedding::new(spec.vocab, spec.hidden)
+        } else {
+            Embedding::new_untied(spec.vocab, spec.hidden)
+        };
         Model {
-            embed: Embedding::new(spec.vocab, spec.hidden),
+            embed,
             layers,
             norm: RmsNorm::new_add_one("norm", spec.hidden, spec.eps),
             keys: Box::new(keys),
@@ -181,6 +189,10 @@ impl Loadable for Model {
     /// tied embedding 的双 Want(直读 + 转置)同键改写,天然保持同键。
     fn layout(&self, ctx: &LoaderCtx) -> LoaderOps {
         let mut ops = self.embed.layout(ctx).map_keys(|k| self.keys.embed_key(&k));
+        // untied lm_head:独立槽裸键(检查点顶层 `lm_head.weight`;零 map)
+        if let Some(lm) = self.embed.layout_lm_head(ctx) {
+            ops = ops.chain(lm);
+        }
         for (i, layer) in self.layers.iter().enumerate() {
             ops = ops.chain(layer.layout(ctx).map_keys(|k| self.keys.layer_key(i, &k)));
         }
@@ -244,6 +256,7 @@ mod tests {
                     suffix: String::new(),
                 },
             },
+            tied: true,
         }
     }
 

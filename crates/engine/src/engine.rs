@@ -39,7 +39,9 @@ use owl_models::layers::gdn::GdnBuffers;
 use owl_models::layers::rope::Rope;
 use owl_models::model::{Model, ModelSpec};
 use owl_models::module::{ForwardCtx, KvBuffers, Module};
-use owl_models::specs::{load_0_8b, load_0_8b_w4a16, load_tokenizer, qwen3_5_0_8b};
+use owl_models::specs::{
+    load_0_8b, load_0_8b_w4a16, load_27b_awq, load_tokenizer, qwen3_5_0_8b, qwen3_8_27b,
+};
 use owl_models::tokenizer::Tokenizer;
 use owl_models::{TensorOps};
 
@@ -101,6 +103,22 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
     ) -> Result<LoadedModel> {
         let spec = qwen3_5_0_8b();
         let model = Arc::new(load_0_8b_w4a16(dir, self.face).await?);
+        let tokenizer = load_tokenizer(tokenizer_dir)?;
+        let rope = Rope::new(262_144, 256, 64, 10_000_000.0)?;
+        let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1 };
+        owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
+        Ok(LoadedModel { model, tokenizer, rope, spec })
+    }
+
+    /// Qwen3.8-27B AWQ-INT4 装载(2026-10-01;cyankiwi g32-asym 检查点):
+    /// marlin kU4(has_zp)内核;rope 与 0.8B 同参(theta 1e7 + rotary 64)。
+    pub async fn load_qwen38_27b_awq(
+        &mut self,
+        dir: &Path,
+        tokenizer_dir: &Path,
+    ) -> Result<LoadedModel> {
+        let spec = qwen3_8_27b();
+        let model = Arc::new(load_27b_awq(dir, self.face).await?);
         let tokenizer = load_tokenizer(tokenizer_dir)?;
         let rope = Rope::new(262_144, 256, 64, 10_000_000.0)?;
         let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1 };
@@ -1528,6 +1546,50 @@ mod tests {
         let text = drive_turn(&mut running, t1).await;
         eprintln!("[bench] W4A16 16 tok @ {:?}({:.1} tok/s)", t0.elapsed(), 16.0 / t0.elapsed().as_secs_f64());
         eprintln!("[test] W4A16 答: {text}");
+        assert!(!text.trim().is_empty(), "产出非空");
+    }
+
+    /// GPU 门控:Qwen3.8-27B AWQ-INT4 全链冒烟(2026-10-01;cyankiwi
+    /// g32-asym 检查点)—— 装载(formats/awq.rs 懒物化 + marlin kU4
+    /// GEMM_W4A16_AWQ)+ 图捕获 + 生成。门控 OWL_AWQ27B_DIR = 检查点
+    /// 目录(models/cyankiwi/Qwen3.8-27B-AWQ-INT4);未设则 skip。
+    /// VRAM 预算:权重 ~17.5GB + KV/GDN 状态 ~1.3GB → 3090 Ti 24G。
+    #[tokio::test]
+    async fn gpu_awq27b_marlin_e2e() {
+        let Ok(dir) = std::env::var("OWL_AWQ27B_DIR") else {
+            eprintln!("skip: OWL_AWQ27B_DIR 未设(cyankiwi 检查点目录)");
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        if !dir.exists() {
+            eprintln!("skip: 检查点目录不存在({dir:?})");
+            return;
+        }
+        let ordinal = gpu_ordinal().expect("OWL_TEST_DEVICE");
+        let t0 = std::time::Instant::now();
+        let mut engine = Engine::new(EngineConfig {
+            device_ordinal: ordinal,
+            max_seq_tokens: 256,
+            prefill_chunk: 32,
+        })
+        .expect("构造");
+        let loaded = engine
+            .loader()
+            .load_qwen38_27b_awq(&dir, &dir)
+            .await
+            .expect("27B AWQ 装载");
+        eprintln!("[bench] 27B 装载(含 kU4 重排上卡){:.2}s", t0.elapsed().as_secs_f32());
+        let mut running = engine.run(loaded).await.expect("装配");
+        assert!(
+            matches!(running.capture_outcome, crate::graph_plan::PlanOutcome::Captured),
+            "27B decode 图应捕获成功,得 {:?}",
+            running.capture_outcome
+        );
+        let t1 = running
+            .submit("用一句话介绍长城。", 16)
+            .expect("submit");
+        let text = drive_turn(&mut running, t1).await;
+        eprintln!("[test] 27B AWQ 答: {text}");
         assert!(!text.trim().is_empty(), "产出非空");
     }
 

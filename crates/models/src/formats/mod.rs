@@ -16,11 +16,13 @@
 /// `marlin_eligible`/`marlin_n_pack`;`crate::interpreters::eval_load`
 /// 经 interpreters 模块 shim 转发(历史调用面不动)。
 
+pub mod awq;
 pub mod load;
 pub mod mmap;
 pub mod safetensors;
 pub mod w4a16;
 
+pub use awq::AwqSource;
 pub use load::eval_load;
 pub use safetensors::SafeTensorsSource;
 pub use w4a16::{marlin_eligible, marlin_n_pack, W4A16Source};

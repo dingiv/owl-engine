@@ -617,8 +617,12 @@ impl FromIterator<LoadEntry> for LoadManifest {
 pub enum QuantPlan {
     /// f16 直读(基线)
     F16,
-    /// W4A16 marlin(g128;W4A8 等后续档位在此扩展)
+    /// W4A16 marlin(g128-sym;ct pack-quantized U4B8)
     W4A16,
+    /// W4A16 marlin **AWQ 臂**(g32-asym + zp;ct pack-quantized kU4,
+    /// 2026-10-01 cyankiwi/Qwen3.8-27B-AWQ-INT4 装载线):GEMM 走
+    /// kU4(has_zp)内核,B 打包与 U4B8 同套,zp 单独烘焙 marlin 布局
+    W4A16Awq,
 }
 
 /// 装载语境(layout 钩子的 ctx;按值传递,Copy)

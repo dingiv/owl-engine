@@ -855,6 +855,9 @@ impl GpuServer {
         match msg.kernel.name.as_str() {
             name if name == owl_kernels::cublas::GEMM_F16 => self.handle_cublas_gemm(msg, ack),
             name if name == owl_kernels::marlin::GEMM_W4A16 => self.handle_marlin_gemm(msg, ack),
+            name if name == owl_kernels::marlin::GEMM_W4A16_AWQ => {
+                self.handle_marlin_gemm_awq(msg, ack)
+            }
             other => ack.send(Err(ModelError::Msg(format!(
                 "foreign kernel {other}: 无执行臂(owl_kernels::is_foreign_op 与分派表失配)"
             )))),
@@ -999,6 +1002,73 @@ impl GpuServer {
             Ok(()) => ack.send(Ok(Bytes::new(blocks[2], msg.out_elems))),
             Err(e) => ack.send(Err(ModelError::Msg(format!(
                 "marlin gemm err {e}: {}",
+                owl_kernels::marlin::v2_err_str(e)
+            )))),
+        }
+    }
+
+    /// Marlin AWQ(kU4 非对称)臂(2026-10-01 cyankiwi g32 装载线)。
+    /// 槽序:[T a, T b, T out, T scales, T zeros, T ws, T ctmp,
+    /// sz m, sz k, sz n, sz groupsize](7 Block + 4 sz);
+    /// zeros = pack_marlin_z 产物((k/g, n/8) i32)。
+    fn handle_marlin_gemm_awq(&mut self, msg: LaunchMsg, ack: Ack<Result<Bytes, ModelError>>) {
+        let mut blocks: Vec<u64> = Vec::new();
+        let mut scalars: Vec<u64> = Vec::new();
+        for a in &msg.args {
+            match a {
+                Arg::Block { id } => blocks.push(*id),
+                Arg::U64(v) => scalars.push(*v),
+                _ => {
+                    return ack.send(Err(ModelError::Msg(format!(
+                        "foreign kernel {} 槽序违约:仅 Block/U64(见 owl_kernels::marlin 契约)",
+                        msg.kernel.name
+                    ))))
+                }
+            }
+        }
+        if blocks.len() != 7 || scalars.len() != 4 {
+            return ack.send(Err(ModelError::Msg(format!(
+                "foreign kernel {} 槽序违约:7 Block + 4 U64,得 {}B/{}S",
+                msg.kernel.name,
+                blocks.len(),
+                scalars.len()
+            ))));
+        }
+        let (m, k, n, groupsize) =
+            (scalars[0] as usize, scalars[1] as usize, scalars[2] as usize, scalars[3] as i32);
+        let stream = match self.ctx().stream(STREAM_COMPUTE) {
+            Ok(s) => s.clone(),
+            Err(e) => return ack.send(Err(e)),
+        };
+        let mut ptrs = Vec::with_capacity(7);
+        for b in &blocks {
+            match self.ctx().block_ptr(*b, &stream) {
+                Ok((p, _)) => ptrs.push(p),
+                Err(e) => return ack.send(Err(e)),
+            }
+        }
+        let dev = self.ctx().device_ordinal() as i32;
+        let r = unsafe {
+            owl_kernels::marlin::gemm_v2_awq_raw(
+                ptrs[0] as *const u16,
+                ptrs[1] as *const i32,
+                ptrs[2] as *mut u16,
+                ptrs[3] as *const u16,
+                ptrs[4] as *const i32,
+                ptrs[6] as *const c_void,
+                m as i32,
+                n as i32,
+                k as i32,
+                ptrs[5] as *mut i32,
+                groupsize,
+                dev,
+                stream.cu_stream() as usize,
+            )
+        };
+        match r {
+            Ok(()) => ack.send(Ok(Bytes::new(blocks[2], msg.out_elems))),
+            Err(e) => ack.send(Err(ModelError::Msg(format!(
+                "marlin awq gemm err {e}: {}",
                 owl_kernels::marlin::v2_err_str(e)
             )))),
         }

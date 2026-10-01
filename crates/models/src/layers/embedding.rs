@@ -14,6 +14,8 @@ use crate::TensorOps;
 pub struct Embedding {
     /// [vocab, D](checkpoint 原布局;查表 + nt matmul 共用一份)
     w: Weight,
+    /// untied lm_head 独立槽([vocab, D];tied = None,nt matmul 复用 w)
+    lm_head: Option<Weight>,
     d_dim: usize,
 }
 
@@ -21,10 +23,24 @@ impl Embedding {
     /// 准备容器(局部键 "weight":C10 前缀源下 →
     /// `{base}.embed_tokens.weight`;单槽,tied 经 nt matmul 复用)
     pub fn new(vocab: usize, d_dim: usize) -> Embedding {
+        Embedding { w: Weight::new("weight", vec![vocab, d_dim]), lm_head: None, d_dim }
+    }
+
+    /// untied(lm_head 独立权重;键经 [`Embedding::layout_lm_head`])
+    pub fn new_untied(vocab: usize, d_dim: usize) -> Embedding {
         Embedding {
             w: Weight::new("weight", vec![vocab, d_dim]),
+            lm_head: Some(Weight::new("lm_head", vec![vocab, d_dim])),
             d_dim,
         }
+    }
+
+    /// untied lm_head 槽装载声明(键 = 检查点裸键 `lm_head.weight`;
+    /// tied = None)。调用方不加 map_keys —— 键已是最终形态。
+    pub fn layout_lm_head(&self, ctx: &LoaderCtx) -> Option<LoaderOps> {
+        self.lm_head
+            .as_ref()
+            .map(|w| w.layout_as("lm_head.weight", ctx))
     }
 
     /// 装载完备性
@@ -56,10 +72,13 @@ impl Embedding {
         .with_shape(dt, vec![tokens, self.d_dim])
     }
 
-    /// lm_head(tied):hidden [.., D] → logits [.., vocab]
-    /// nt 直读原始 [vocab, D] 布局(matmul_nt;零转置)
+    /// lm_head:hidden [.., D] → logits [.., vocab]
+    /// nt 直读原始 [vocab, D] 布局(matmul_nt;零转置;untied 用独立槽)
     pub fn lm_head_matmul(&self, hidden: &TensorOps) -> TensorOps {
-        hidden.matmul_nt(&self.w.decl())
+        match &self.lm_head {
+            Some(w) => hidden.matmul_nt(&w.decl()),
+            None => hidden.matmul_nt(&self.w.decl()),
+        }
     }
 }
 

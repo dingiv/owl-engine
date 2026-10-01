@@ -54,11 +54,14 @@ impl KeyConvention for Qwen35Convention {
         format!("{}.{}{}.weight", self.base, "", local)
     }
     fn layer_key(&self, i: usize, local: &str) -> String {
-        // E3 量化后缀:local 可带 `.qweight/.scales/.ws`(marlin 三件套)
-        // —— 剥离后按基名定子前缀,量化后缀替代 `.weight`
+        // E3 量化后缀:local 可带 `.qweight/.scales/.zeros/.ws`(marlin 套件
+        // —— AWQ 臂增 zeros)—— 剥离后按基名定子前缀,量化后缀替代 `.weight`
         let (local, qsuffix) = match local.rsplit_once('.') {
             Some((b, s))
-                if matches!(s, "qweight" | "scales" | "ws" | "marlin_ws" | "marlin_ctmp") =>
+                if matches!(
+                    s,
+                    "qweight" | "scales" | "zeros" | "ws" | "marlin_ws" | "marlin_ctmp"
+                ) =>
             {
                 (b, Some(format!(".{s}")))
             }
@@ -133,6 +136,32 @@ pub async fn load_0_8b_w4a16<D: DeviceClient + 'static>(
     Ok(model)
 }
 
+/// 装载 **Qwen3.8-27B AWQ-INT4**(2026-10-01;cyankiwi 检查点,
+/// compressed-tensors pack-quantized **g32-asym + zp**)—— 装载源
+/// formats/awq.rs:eligible 线性走 marlin kU4(has_zp)内核
+/// (GEMM_W4A16_AWQ),非门控线性/checkpoint ignore 项反量化或直读 f16。
+///
+/// 维度事实以**检查点实测**为准(config 的 24 头与张量形状不符):
+/// - full attention:q 48 头 ×256(q_proj [12288, 5120])/ kv 4 头 ×256
+///   (k/v_proj [1024, 5120]);
+/// - GDN:qk 16 头 ×128(in_proj_qkv [10240, 5120] = 2048+2048+6144)/
+///   v 48 头 ×128(in_proj_z [6144, 5120]);
+/// - 64 层 3:1 hybrid(layers i%4==3 为 full);vocab 248320 不 tied。
+pub async fn load_27b_awq<D: DeviceClient + 'static>(
+    dir: &Path,
+    face: &mut D,
+) -> Result<Model, ModelError> {
+    let model = Model::new(
+        &qwen3_8_27b(),
+        Qwen35Convention::new("model.language_model"),
+        crate::module::QuantPlan::W4A16Awq,
+    );
+    let src = crate::formats::awq::AwqSource::open_dir(dir)?;
+    let ctx = crate::module::LoaderCtx { dtype: crate::contract::Dtype::F16, shard: 1 };
+    crate::interpreters::eval_load(&model, face, &src, &ctx).await?;
+    Ok(model)
+}
+
 /// Qwen3.5 tokenizer 装配:机制在 tokenizer.rs,事实在 spec 声明
 /// (ModelSpec.tokenizer)—— 本函数只是两端的接线(jinja 全引擎挂账
 /// serving 层)
@@ -167,6 +196,37 @@ pub fn qwen3_5_0_8b() -> ModelSpec {
                 suffix: "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n".into(),
             },
         },
+        tied: true,
+    }
+}
+
+/// Qwen3.8-27B 真实维度(2026-10-01;cyankiwi AWQ-INT4 检查点张量实测):
+/// - full attention = **Qwen3Next 门控注意力**(vLLM qwen3_next.py 实证):
+///   q_proj [12288, 5120] = q(24×256) ⊕ output_gate(24×256) per-head
+///   [value|gate] 融合 —— owl Attention 层原生存(q_raw 2×Hq·HD 切分);
+///   o_proj [5120, 6144] = 24×256 ✓;kv 4×256(k/v_proj [1024, 5120]);
+/// - GDN:qk 16×128(in_proj_qkv [10240, 5120] = 2048+2048+6144)/
+///   v 48×128(in_proj_z [6144, 5120]);
+/// - 64 层 3:1 hybrid(i%4==3 为 full);vocab 248320 不 tied;
+/// - rope:theta 1e7 + partial 0.25(rotary dim 64)与 0.8B 同。
+pub fn qwen3_8_27b() -> ModelSpec {
+    ModelSpec {
+        vocab: 248320,
+        hidden: 5120,
+        inter: 17408,
+        dtype: crate::contract::Dtype::F16,
+        full_heads: (24, 4, 256),
+        gdn_heads: (16, 128, 48, 128),
+        eps: 1e-6,
+        layer_types: hybrid_3to1(64),
+        tokenizer: crate::tokenizer::TokenizerSpec {
+            eos_tokens: vec!["<|im_end|>", "<|endoftext|>"],
+            chat: crate::tokenizer::ChatFormat {
+                prefix: "<|im_start|>user\n".into(),
+                suffix: "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n".into(),
+            },
+        },
+        tied: false,
     }
 }
 

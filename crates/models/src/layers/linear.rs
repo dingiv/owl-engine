@@ -10,7 +10,7 @@ use crate::layers::narrow_strided;
 use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, QuantPlan, Weight};
 use crate::formats::w4a16::marlin_n_pack;
 use crate::TensorOps;
-use owl_kernels::marlin::{v2_workspace_len, GEMM_W4A16};
+use owl_kernels::marlin::{v2_workspace_len, GEMM_W4A16, GEMM_W4A16_AWQ};
 
 pub struct Linear {
     /// 权重槽 [out, in](检查点原生布局,零转置)
@@ -18,22 +18,22 @@ pub struct Linear {
     /// E3 量化臂尺寸(声明期常量)
     out_dim: usize,
     in_dim: usize,
-    /// W4A16 量化组大小(Some = 已启用;None = f16 直读;构造期定形)
+    /// 量化组大小(Some = 已启用;None = f16 直读;构造期定形)
     quant_group: Option<usize>,
-    /// 量化三件套(qweight marlin-packed / scales / workspace;
-    /// W4A16 计划构造时构建,键 = `{w.key}.qweight/.scales/.ws`)
+    /// 量化四件套(qweight marlin-packed / scales / zeros(仅 AWQ) /
+    /// workspace;键 = `{w.key}.qweight/.scales/.zeros/.ws`)
     qw: Option<Weight>,
     sc: Option<Weight>,
+    zs: Option<Weight>,
     ws: Option<Weight>,
     ctmp: Option<Weight>,
 }
 
 impl Linear {
     /// 准备容器(`key` = 数据源槽键;`plan` = 量化计划构造期注入 ——
-    /// 零数据零副作用,零突变面)。W4A16 计划下按尺寸门控当场定形:
-    /// marlin tile 约束(n = 512×2^k 且 k%128==0,g128 暗雷收紧版谓词,
-    /// 与 w4a16.rs 装载源同源)不满足的小线性保持 f16 直读 —— 装载源
-    /// 侧对同款判定输出反量化 `.weight`。
+    /// 零数据零副作用,零突变面)。量化计划下按尺寸门控当场定形:
+    /// marlin tile 约束(n%256==0 且 k%128==0,与装载源同源)不满足的
+    /// 小线性保持 f16 直读 —— 装载源侧对同款判定输出反量化 `.weight`。
     pub fn new(key: &'static str, out_dim: usize, in_dim: usize, plan: QuantPlan) -> Linear {
         let mut lin = Linear {
             w: Weight::new(key, vec![out_dim, in_dim]),
@@ -42,11 +42,15 @@ impl Linear {
             quant_group: None,
             qw: None,
             sc: None,
+            zs: None,
             ws: None,
             ctmp: None,
         };
-        if plan == QuantPlan::W4A16 && crate::formats::w4a16::marlin_eligible(out_dim, in_dim) {
-            lin.quantize_g128();
+        let eligible = crate::formats::w4a16::marlin_eligible(out_dim, in_dim);
+        match plan {
+            QuantPlan::W4A16 if eligible => lin.quantize_g128(),
+            QuantPlan::W4A16Awq if eligible => lin.quantize_awq32(),
+            _ => {}
         }
         lin
     }
@@ -81,6 +85,32 @@ impl Linear {
         self.ctmp = Some(Weight::new_typed_u32(key, vec![1]));
         self.quant_group = Some(g);
     }
+
+    /// AWQ g32-asym 定形(2026-10-01;构造期私有):与 g128 同 B 打包,
+    /// 增 zeros 槽(pack_marlin_z 产物 [in/g, out/8] U32),GEMM 换
+    /// kU4(has_zp)内核;组大小 32(group_blocks = 32/16 = 2 幂次合法)。
+    fn quantize_awq32(&mut self) {
+        debug_assert!(crate::formats::w4a16::marlin_eligible(self.out_dim, self.in_dim));
+        let g = 32usize;
+        let n_pack = marlin_n_pack(self.out_dim);
+        let key: &'static str = self.w.key();
+        self.qw = Some(Weight::new_typed_u32(
+            key,
+            vec![self.in_dim / 16, n_pack * 16 / 8],
+        ));
+        self.sc = Some(Weight::new_typed_f16(
+            key,
+            vec![self.in_dim / g, n_pack],
+        ));
+        // zeros:pack_marlin_z 产出 (groups, n/8) i32 —— 与 scales 同组轴
+        self.zs = Some(Weight::new_typed_u32(
+            key,
+            vec![self.in_dim / g, n_pack / 8],
+        ));
+        self.ws = Some(Weight::new_typed_u32(key, vec![v2_workspace_len(n_pack)]));
+        self.ctmp = Some(Weight::new_typed_u32(key, vec![1]));
+        self.quant_group = Some(g);
+    }
 }
 
 impl Module for Linear {
@@ -89,6 +119,8 @@ impl Module for Linear {
     /// W4A16 臂(E3):foreign GEMM_W4A16(6 Block + 4 sz;out 槽 2 ——
     /// sig 逃生舱 O 槽表达),ws 同块双槽(ws + c_tmp,use_fp32_reduce=false
     /// 不触碰 c_tmp)。
+    /// AWQ 臂(2026-10-01):同构但换 GEMM_W4A16_AWQ(7 Block = scales 后
+    /// 插 zeros 槽;kU4 has_zp 内核,组大小 32)。
     fn forward(&self, xs: &TensorOps, _ctx: &ForwardCtx) -> TensorOps {
         if let (Some(g), Some(qw), Some(sc), Some(ws), Some(ctmp)) = (
             self.quant_group, &self.qw, &self.sc, &self.ws, &self.ctmp,
@@ -96,20 +128,29 @@ impl Module for Linear {
             let m: usize = xs.shape()[..xs.shape().len() - 1].iter().product();
             // n_pack = 打包档(= out_dim;pad 路线废案)
             let n_pack = marlin_n_pack(self.out_dim);
-            let marlin = TensorOps::of(
-                crate::kernel::Kernel::new(GEMM_W4A16, "")
-                    .with_sig("T,T,O,T,T,T,sz,sz,sz,sz"),
-            )
-            .arg(xs)
-            .arg(&qw.decl())
-            .arg(&sc.decl())
-            .arg(&ws.decl())
-            .arg(&ctmp.decl()) // c_tmp 槽:独立小块(槽序契约 6 Block)
-            .arg_usize(m)
-            .arg_usize(self.in_dim)
-            .arg_usize(n_pack)
-            .arg_usize(g as usize)
-            .with_shape(Dtype::F16, vec![m, n_pack]);
+            let (name, sig, args): (&str, &str, Vec<TensorOps>) = match &self.zs {
+                // AWQ kU4 臂:scales 后插 zeros(槽序契约 7 Block)
+                Some(zs) => (
+                    GEMM_W4A16_AWQ,
+                    "T,T,O,T,T,T,T,sz,sz,sz,sz",
+                    vec![xs.clone(), qw.decl(), sc.decl(), zs.decl(), ws.decl(), ctmp.decl()],
+                ),
+                None => (
+                    GEMM_W4A16,
+                    "T,T,O,T,T,T,sz,sz,sz,sz",
+                    vec![xs.clone(), qw.decl(), sc.decl(), ws.decl(), ctmp.decl()],
+                ),
+            };
+            let mut marlin = TensorOps::of(crate::kernel::Kernel::new(name, "").with_sig(sig));
+            for a in &args {
+                marlin = marlin.arg(a);
+            }
+            let marlin = marlin
+                .arg_usize(m)
+                .arg_usize(self.in_dim)
+                .arg_usize(n_pack)
+                .arg_usize(g as usize)
+                .with_shape(Dtype::F16, vec![m, n_pack]);
             return narrow_strided(
                 &marlin,
                 m,
@@ -126,14 +167,20 @@ impl Module for Linear {
 impl Loadable for Linear {
     /// f16 臂:单 Want(w)。W4A16 臂:三 Want(qweight U32 / scales F16 /
     /// ws U32 零初始化)—— 键 = `{w.key}.qweight/.scales/.ws`,装载源
-    /// (w4a16.rs)按同款谓词供给。
+    /// (w4a16.rs)按同款谓词供给。AWQ 臂增 zeros Want(`{w.key}.zeros`,
+    /// pack_marlin_z 产物;源 awq.rs 供给)。
     fn layout(&self, ctx: &LoaderCtx) -> LoaderOps {
         match (self.quant_group, (&self.qw, &self.sc, &self.ws, &self.ctmp)) {
             (Some(_g), (Some(qw), Some(sc), Some(ws), Some(ctmp))) => {
                 let base = self.w.key();
-                qw.layout_as(format!("{base}.qweight"), ctx)
-                    .chain(sc.layout_as(format!("{base}.scales"), ctx))
-                    .chain(ws.layout_as(format!("{base}.marlin_ws"), ctx))
+                let ops = qw
+                    .layout_as(format!("{base}.qweight"), ctx)
+                    .chain(sc.layout_as(format!("{base}.scales"), ctx));
+                let ops = match &self.zs {
+                    Some(zs) => ops.chain(zs.layout_as(format!("{base}.zeros"), ctx)),
+                    None => ops,
+                };
+                ops.chain(ws.layout_as(format!("{base}.marlin_ws"), ctx))
                     .chain(ctmp.layout_as(format!("{base}.marlin_ctmp"), ctx))
             }
             _ => self.w.layout(ctx),

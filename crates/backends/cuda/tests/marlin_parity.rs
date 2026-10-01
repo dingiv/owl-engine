@@ -254,3 +254,159 @@ async fn marlin_shape_sweep() {
         eprintln!("[sweep] done m={m} n={n} k={k} → {noise_ratio:.6}");
     }
 }
+
+// ============================================================================
+// AWQ(kU4 非对称,zp)臂(2026-10-01 cyankiwi g32 装载线)
+// ============================================================================
+
+/// host dequant 参考(AWQ 非对称):W = (q − zp_group) × scale。
+/// zp 源布局 = ct out 主序:zp_packed[t, c] 的 nibble i = 行 8t+i。
+fn host_dequant_gemm_awq(
+    a: &[f32],
+    q: &[u8],
+    s: &[f32],
+    zp_packed: &[i32],
+    m: usize,
+    n: usize,
+    k: usize,
+    g: usize,
+) -> Vec<f32> {
+    let groups = k / g;
+    let mut c = vec![0f32; m * n];
+    for r in 0..m {
+        for nn in 0..n {
+            // zp 逐组:word = (nn/8)*groups + 组号 c = kk/g;nibble = nn%8
+            let mut acc = 0f32;
+            for kk in 0..k {
+                let z = ((zp_packed[(nn / 8) * groups + kk / g] as u32) >> (4 * (nn % 8))) & 0xF;
+                let nib = q[nn * k + kk];
+                let w = (nib as f32 - z as f32) * s[nn * groups + kk / g];
+                acc += a[r * k + kk] * w;
+            }
+            c[r * n + nn] = acc;
+        }
+    }
+    c
+}
+
+/// AWQ 外核启动消息(槽序契约:GEMM_W4A16_AWQ = scales 后插 zeros,
+/// 7 Block + 4 sz)
+fn marlin_awq_launch(
+    a: &owl_cuda::Bytes,
+    b: &owl_cuda::Bytes,
+    c: &owl_cuda::Bytes,
+    s: &owl_cuda::Bytes,
+    z: &owl_cuda::Bytes,
+    ws: &owl_cuda::Bytes,
+    ctmp: &owl_cuda::Bytes,
+    m: usize,
+    k: usize,
+    n: usize,
+    g: usize,
+) -> LaunchMsg {
+    LaunchMsg {
+        kernel: owl_cuda::KernelSpec {
+            name: owl_kernels::marlin::GEMM_W4A16_AWQ.into(),
+            source: String::new(),
+        },
+        args: vec![
+            Arg::Block { id: a.id },
+            Arg::Block { id: b.id },
+            Arg::Block { id: c.id },
+            Arg::Block { id: s.id },
+            Arg::Block { id: z.id },
+            Arg::Block { id: ws.id },
+            Arg::Block { id: ctmp.id },
+            Arg::U64(m as u64),
+            Arg::U64(k as u64),
+            Arg::U64(n as u64),
+            Arg::U64(g as u64),
+        ],
+        grid: (0, 0, 0),
+        block: (0, 0, 0),
+        shared_mem: 0,
+        out_elems: m * n,
+    }
+}
+
+async fn run_awq_case(client: &mut GpuClient, m: usize, n: usize, k: usize) -> (f64, f32) {
+    run_awq_case_g(client, m, n, k, 32).await
+}
+
+async fn run_awq_case_g(client: &mut GpuClient, m: usize, n: usize, k: usize, g: usize) -> (f64, f32) {
+    let groups = k / g;
+    let a: Vec<f32> = (0..m * k).map(|i| ((i as f32 * 0.31) - 4.0).sin() * 0.5).collect();
+    let q: Vec<u8> = (0..n * k).map(|i| ((i * 7 + 3) % 16) as u8).collect();
+    let s: Vec<f32> = (0..n * groups).map(|i| 0.02 + ((i * 13) % 13) as f32 * 0.004).collect();
+    // zp:非对称域 [0,15],伪随机;打包维 = out(word t 行 8t+i)
+    let zp_u8: Vec<u8> = (0..n * groups).map(|i| ((i * 5 + 2) % 16) as u8).collect();
+    let zp_packed: Vec<i32> = (0..(n / 8) * groups)
+        .map(|cell| {
+            let t = cell / groups;
+            let c = cell % groups;
+            (0..8)
+                .map(|i| ((zp_u8[(t * 8 + i) * groups + c] as u32) << (4 * i)))
+                .fold(0u32, |acc, v| acc | v) as i32
+        })
+        .collect();
+
+    let b_packed = owl_kernels::marlin::repack::pack_marlin_b(&q, k, n);
+    let s_packed = owl_kernels::marlin::repack::pack_marlin_s(&s, n, groups);
+    let z_packed = owl_kernels::marlin::repack::pack_marlin_z(&zp_u8, n, groups);
+    assert_eq!(z_packed.len(), groups * (n / 8));
+
+    let da = client.htod(Dtype::F16, &Shape::from(vec![m, k]), &le_u16(
+        &a.iter().map(|f| half::f16::from_f32(*f).to_bits()).collect::<Vec<_>>(),
+    )).await.expect("htod a");
+    let db = client.htod(Dtype::U32, &Shape::from(vec![b_packed.len()]), &le_i32(&b_packed)).await.expect("htod b");
+    let ds = client.htod(Dtype::F16, &Shape::from(vec![s_packed.len()]), &le_u16(&s_packed)).await.expect("htod s");
+    let dz = client.htod(Dtype::U32, &Shape::from(vec![z_packed.len()]), &le_i32(&z_packed)).await.expect("htod z");
+    let dws = client.alloc(Dtype::U32, owl_kernels::marlin::v2_workspace_len(n)).await.expect("alloc ws");
+    let dctmp = client.alloc(Dtype::U32, 1).await.expect("alloc ctmp");
+    let dc = client.alloc(Dtype::F16, m * n).await.expect("alloc c");
+    // 哨兵填充:-7.0(launch 后若残留 = 内核未写 C)
+    {
+        let sent: Vec<u8> = (0..m * n)
+            .flat_map(|_| half::f16::from_f32(-7.0).to_le_bytes())
+            .collect();
+        let dsent = client.htod(Dtype::F16, &Shape::from(vec![m * n]), &sent).await.expect("sent");
+        client.copy_block_at(&dsent, 0, &dc, 0, sent.len()).await.expect("sent copy");
+    }
+
+    client.launch(marlin_awq_launch(&da, &db, &dc, &ds, &dz, &dws, &dctmp, m, k, n, g)).await.expect("awq launch");
+
+    let mut buf = vec![0u8; m * n * 2];
+    client.dtoh(&dc, &mut buf).await.expect("dtoh");
+    let got: Vec<f32> = buf
+        .chunks_exact(2)
+        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+        .collect();
+    client.sync().await.expect("sync");
+
+    let c_ref = host_dequant_gemm_awq(&a, &q, &s, &zp_packed, m, n, k, g);
+    let (mut sum_abs, mut sum_sq) = (0f64, 0f64);
+    let mut max_abs = 0f32;
+    for (x, r) in got.iter().zip(&c_ref) {
+        sum_abs += (*x as f64 - *r as f64).abs();
+        sum_sq += (*r as f64) * (*r as f64);
+        max_abs = max_abs.max((*x - *r).abs());
+    }
+    let rms = (sum_sq / (m * n) as f64).sqrt().max(1e-6);
+    (sum_abs / (m * n) as f64 / rms, max_abs)
+}
+
+/// AWQ kU4 对拍(2026-10-01):非对称 (q−zp)×s,g=32;形状覆盖
+/// m8 路径(m=1,kv-proj 形状 n=1024)与多 m-block 路径(m=32,o-proj 形状)。
+#[tokio::test]
+async fn marlin_w4a16_awq_parity() {
+    let mut client = assemble();
+    for (m, n, k) in [(1usize, 1024usize, 5120usize), (32usize, 5120usize, 5120usize)] {
+        let (noise_ratio, max_abs) = run_awq_case(&mut client, m, n, k).await;
+        eprintln!("[awq] m={m} n={n} k={k} g=32 → 噪声/信号RMS={noise_ratio:.6} max_abs={max_abs:.5}");
+        assert!(
+            noise_ratio < 2e-2 && noise_ratio.is_finite(),
+            "awq 噪声比 {noise_ratio}"
+        );
+    }
+    client.sync().await.expect("sync");
+}
