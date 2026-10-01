@@ -12,6 +12,48 @@
 use crate::contract::{Arg, Bytes, KernelSpec, LaunchMsg};
 use crate::kernel::Kernel;
 
+pub use owl_kernels::driver::OpId;
+
+/// 语义算子词表(model 层语汇;**值 = 语义名空间,非 kernel 实现名**。
+/// 实现住 owl-kernels::driver 分派表,耦合由 models 侧 resolve 测试把门:
+/// 词表加票、driver 加臂,两侧不同票 = 单测红)
+pub mod ids {
+    use super::OpId;
+    pub const GDN_GATING: OpId = OpId("gdn.gating_g");
+    pub const GDN_L2NORM: OpId = OpId("gdn.l2norm");
+    pub const GDN_CONV_UPD: OpId = OpId("gdn.conv_upd");
+    pub const GDN_DELTA_DEC: OpId = OpId("gdn.delta_dec");
+    pub const GDN_CONV_FWD: OpId = OpId("gdn.conv_fwd");
+    pub const GDN_RECURRENCE: OpId = OpId("gdn.recurrence_varlen_gqa");
+    pub const GDN_NORM_ACT: OpId = OpId("gdn.norm_act");
+    pub const SIGMOID: OpId = OpId("ops.sigmoid");
+    pub const ATTN_K0_WRITE: OpId = OpId("attn.k0_write");
+    pub const ATTN_PAGED_DECODE: OpId = OpId("attn.paged_decode");
+    pub const ATTN_PAGED_PREFILL: OpId = OpId("attn.paged_prefill");
+    pub const ATTN_NAIVE_DECODE: OpId = OpId("attn.naive_decode");
+    pub const ATTN_GATE_MUL: OpId = OpId("attn.gate_mul");
+    pub const OPS_NARROW: OpId = OpId("ops.narrow");
+    pub const OPS_CONCAT: OpId = OpId("ops.concat");
+    pub const OPS_ROPE: OpId = OpId("ops.rope");
+    pub const OPS_EMBED: OpId = OpId("ops.embed");
+    pub const LOAD_CT_REPACK: OpId = OpId("load.ct_repack");
+}
+
+/// contract::Dtype → driver::DType(契约类型不过 kernels,转换住消费侧)
+pub(crate) fn ddt(dt: crate::contract::Dtype) -> Result<owl_kernels::driver::DType, crate::contract::ModelError> {
+    use owl_kernels::driver::DType;
+    Ok(match dt {
+        crate::contract::Dtype::F16 => DType::F16,
+        crate::contract::Dtype::F32 => DType::F32,
+        crate::contract::Dtype::U32 => DType::U32,
+        other => {
+            return Err(crate::contract::ModelError::Msg(format!(
+                "driver::resolve: dtype {other:?} 无拾取臂(词表族仅 f16/f32)"
+            )))
+        }
+    })
+}
+
 // ============================================================================
 // §1 Kernel 节点参数槽(有序;类型化)
 // ============================================================================
@@ -73,6 +115,13 @@ pub enum Op {
     PagedAttn,
     /// 形状重解释(纯元数据视图;元素数守恒;eval 透传父块,零拷贝)
     Reshape,
+
+    // ---- 语义调用(Driver 立项,2026-10-01):model 层只描述「要什么」
+    //      (OpId 语义词表)+ 张量 + 语义标量;名/变体/发射参数 = 解释器
+    //      执行期经 owl-kernels::driver::resolve(OpEnv 必传,被动律)拾取。
+    //      aux = 拾取推导常数(层语义几何:kd/vd/batch…;非核参数,不进
+    //      签名)。**model 层由此不再感知 kernel 层的存在**(S2' 定稿)。
+    Call { op: OpId, aux: Vec<usize> },
 
     // ---- Kernel 节点(2026-09-23 定稿:节点的本质形态,funio Pack 同源)----
     /// 携带核函数值(Kernel{name, source})+ 有序参数槽。

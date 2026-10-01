@@ -270,6 +270,47 @@ where
             ctx.face.launch(msg).await?;
             out
         }
+        Op::Call { op, aux } => {
+            // 硬件感知拾取(被动律):环境必传 —— hw 自 face(引擎感知),
+            // page 自页策略单源;kernels/解释器零探测。CPU face 无环境 =
+            // 结构化"需 GPU server"(与 Kernel 节点 CPU 口径同)。
+            let mut env = ctx.face.op_env().ok_or_else(|| {
+                ModelError::Msg(format!(
+                    "Op::Call({:?}) 需 GPU server 环境(CPU face 无 op_env)",
+                    op.0
+                ))
+            })?;
+            env.page = crate::module::kv_paged_policy(dtype).map(|p| p.page).unwrap_or(0);
+            let shapes: Vec<Vec<usize>> = t.parents.iter().map(|p| p.shape.clone()).collect();
+            let scalars: Vec<i64> = t.args.iter().filter_map(|a| match a {
+                crate::ops::KernelArg::Bits(v) => Some(*v as i64),
+                crate::ops::KernelArg::I32(v) => Some(*v as i64),
+                _ => None,
+            }).collect();
+            let pick = owl_kernels::driver::resolve(owl_kernels::driver::OpReq {
+                op: *op,
+                env: &env,
+                dt: crate::ops::ddt(dtype)?,
+                shapes: &shapes,
+                aux,
+                scalars: &scalars,
+            });
+            let kernel = crate::kernel::with_pick(pick);
+            // 以下与 Op::Kernel 臂同构(登记表 dtype 守门 + alloc + lower + launch)
+            if let Some(e) = crate::kernel::lookup(kernel.name) {
+                if e.dtype != dtype {
+                    return Err(ModelError::Msg(format!(
+                        "[dtype 守门] kernel \"{}\" 登记为 {:?},声明为 {:?}",
+                        kernel.name, e.dtype, dtype
+                    )));
+                }
+            }
+            let out = ctx.face.alloc_uninit(dtype, n_elems).await?;
+            ctx.arena.push(out.id);
+            let msg = crate::ops::lower_kernel(&kernel, &t.args, &ins, &out, n_elems);
+            ctx.face.launch(msg).await?;
+            out
+        }
         Op::Kernel { kernel } => {
             // f16 基线守门(2026-09-26):注册表 dtype 标注对账声明 dtype,
             // 不符 = 结构化报错 —— 堵死「f32 核读 f16 字节 = 静默垃圾」。

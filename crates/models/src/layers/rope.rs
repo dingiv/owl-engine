@@ -13,8 +13,6 @@
 //! kernel 源 = 注册表 `owl_rope_half_partial_f32`(owl-kernels cu/text)。
 
 use crate::contract::ModelError;
-use crate::kernel::Kernel;
-use crate::kernel;
 use crate::module::{Loadable, LoaderCtx, LoaderOps, Weight};
 use crate::tensor::Dtype;
 use crate::TensorOps;
@@ -82,10 +80,6 @@ impl Rope {
         ])
     }
 
-    fn launch_kernel(name: &'static str, tokens: usize) -> Kernel {
-        kernel::kernel_with(name, (tokens as u32, 1, 1), (128, 1, 1), 0)
-    }
-
     /// q 旋转:[T, Hq*HD] → [T, Hq*HD](前 rotary_dim 维转,余直通)
     pub fn forward_q(
         &self,
@@ -94,17 +88,9 @@ impl Rope {
         tokens: usize,
         q_heads: usize,
     ) -> TensorOps {
-        // 核名/输出 dtype 跟随 x 声明(F5;表 Weight 经 LoaderCtx 同 dtype)
+        // dtype 跟随 x 声明(F5;表 Weight 经 LoaderCtx 同 dtype)
         let dt = q.dtype;
-        let name = if dt == Dtype::F16 {
-            "owl_rope_half_partial_f16"
-        } else {
-            "owl_rope_half_partial_f32"
-        };
-        TensorOps::of(Self::launch_kernel(
-            name,
-            tokens,
-        ))
+        TensorOps::call(crate::ops::ids::OPS_ROPE).aux(&[tokens])
         .arg(q)
         .arg(&self.cos.decl())
         .arg(&self.sin.decl())
@@ -124,15 +110,7 @@ impl Rope {
         kv_heads: usize,
     ) -> TensorOps {
         let dt = k.dtype;
-        let name = if dt == Dtype::F16 {
-            "owl_rope_half_partial_f16"
-        } else {
-            "owl_rope_half_partial_f32"
-        };
-        TensorOps::of(Self::launch_kernel(
-            name,
-            tokens,
-        ))
+        TensorOps::call(crate::ops::ids::OPS_ROPE).aux(&[tokens])
         .arg(k)
         .arg(&self.cos.decl())
         .arg(&self.sin.decl())

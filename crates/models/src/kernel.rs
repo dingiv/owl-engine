@@ -243,6 +243,13 @@ pub fn kernel_with(name: &'static str, grid: (u32, u32, u32), block: (u32, u32, 
     Kernel::new(name, source(name)).with_launch(grid, block, shared_mem)
 }
 
+/// 构造 Kernel 值(driver 拾取形态;**新调用点一律走此入口**,名字/参数
+/// 由 owl-kernels::driver 单源推导 —— 字符串核名与手抄 grid/block/smem
+/// 在 models 层属遗留,迁移完归零,grep 审计入验收)
+pub fn with_pick(p: owl_kernels::driver::KernelPick) -> Kernel {
+    kernel_with(p.name, p.shape.grid, p.shape.block, p.shape.smem)
+}
+
 /// 发射配置便捷(与 kernel_with 同参,LaunchShape 形态)
 pub fn launch_shape(grid: (u32, u32, u32), block: (u32, u32, u32), shared_mem: u32) -> LaunchShape {
     LaunchShape { grid, block, shared_mem }
@@ -269,6 +276,32 @@ mod tests {
     fn lookup_known_and_unknown() {
         assert!(lookup("owl_add_f32").is_some());
         assert!(lookup("owl_not_registered").is_none());
+    }
+
+    /// driver ↔ 登记表耦合测试(漂移拦截):driver 产出的每个名字必须
+    /// ∈ 登记表 —— driver 改名/登记表删条,红灯在 CI,不在 GPU 上
+    #[test]
+    fn driver_picks_are_registered() {
+        use owl_kernels::driver::{self, DType};
+        let names = [
+            driver::gdn::gating_g(DType::F16).name,
+            driver::gdn::gating_g(DType::F32).name,
+            driver::gdn::l2norm(DType::F16, 1).name,
+            driver::gdn::l2norm(DType::F32, 1).name,
+            driver::gdn::conv_upd(DType::F16).name,
+            driver::gdn::conv_upd(DType::F32).name,
+            driver::gdn::delta_dec(DType::F16, 128, 1, 16, 128).name,
+            driver::gdn::delta_dec(DType::F32, 128, 1, 16, 128).name,
+            driver::gdn::conv_fwd(DType::F16, 6144).name,
+            driver::gdn::recurrence_varlen_gqa(DType::F16, 128, 16, 128).name,
+            driver::gdn::norm_act(DType::F16, 1, 2048, 128).name,
+            driver::gdn::norm_act(DType::F32, 1, 2048, 128).name,
+            driver::ops::sigmoid(DType::F16).name,
+            driver::ops::sigmoid(DType::F32).name,
+        ];
+        for n in names {
+            assert!(lookup(n).is_some(), "driver 拾取名未登记:{n}");
+        }
     }
 
     // ======================================================================

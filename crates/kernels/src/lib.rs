@@ -69,6 +69,10 @@ pub fn dispatch(arch: Arch) -> &'static str {
 
 pub mod sources;
 
+/// 硬件感知算子拾取(REQ-HW-01 落地;名字单源 + pick 产物 + 参数推导;
+/// 上层经具名函数描述「要什么」,本模块决定「用哪个、怎么发射」)
+pub mod driver;
+
 #[cfg(feature = "cuda")]
 pub mod cuda_ops;
 

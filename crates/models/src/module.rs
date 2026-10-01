@@ -521,8 +521,8 @@ pub enum Layout {
     /// want.shape(marlin 布局),原始块随即回收 —— CPU 重量排出热路径
     /// (141.7→37.0s 的 mat.ct 33s → GPU ~0.5s)
     DeviceRearrange {
-        /// registry 核名(owl_ct_repack_u32)
-        kernel: &'static str,
+        /// 语义算子(driver 词表;实现名执行期 resolve)
+        op: owl_kernels::driver::OpId,
         /// 原始 packed 行数(= out)
         rows: usize,
         /// 原始 packed u32 列数(= in/8)
@@ -810,7 +810,7 @@ impl Weight {
     pub(crate) fn layout_as_device_rearrange(
         &self,
         key: impl Into<String>,
-        kernel: &'static str,
+        op: owl_kernels::driver::OpId,
         rows: usize,
         cols: usize,
         ctx: &LoaderCtx,
@@ -821,7 +821,7 @@ impl Weight {
             key: key.into(),
             dtype,
             shape: vec![rows, cols],
-            layout: Layout::DeviceRearrange { kernel, rows, cols },
+            layout: Layout::DeviceRearrange { op, rows, cols },
             sink: Sink(self.cell.clone()),
         })
     }

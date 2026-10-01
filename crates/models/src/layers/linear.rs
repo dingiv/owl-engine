@@ -182,7 +182,7 @@ impl Loadable for Linear {
                     // 布局带核名与原始形状;DMA 上卡后 GPU 重排到 marlin 布局
                     qw.layout_as_device_rearrange(
                         format!("{base}.packed_raw"),
-                        "owl_ct_repack_u32",
+                        owl_kernels::driver::load::CT_REPACK,
                         self.out_dim,
                         self.in_dim / 8,
                         ctx,

@@ -85,6 +85,15 @@ impl GpuClient {
 }
 
 impl DeviceClient for GpuClient {
+    /// 执行环境提供(被动律:感知在本侧/boot,kernels 零探测)。
+    /// arch 占位 Sm86 —— boot 时从 driver API/CC 查询接真感知,接口零改动。
+    fn op_env(&self) -> Option<owl_kernels::driver::OpEnv> {
+        Some(owl_kernels::driver::OpEnv {
+            hw: owl_kernels::driver::Hw { arch: owl_kernels::Arch::Sm86 },
+            page: 0, // 页项由解释器从页策略单源补齐(kv_paged_policy)
+        })
+    }
+
     /// 能力自述:GPU 后端可发射设备 kernel(RepackPath 能力否决项 = true)
     fn device_kernels(&self) -> bool {
         true

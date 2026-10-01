@@ -204,6 +204,13 @@ pub struct LaunchMsg {
 ///   要求真实完成点;完成通知走 host 回调 cuLaunchHostFunc)
 /// - `sync`:栅栏,三条流此前全部工作落定(全设备语义屏障)
 pub trait DeviceClient: Send {
+    /// 执行环境提供(硬件感知;None = 无 GPU 环境,语义调用结构化拒绝)。
+    /// 感知发生在引擎/boot 侧(实现者可缓存);kernels/解释器零探测
+    /// (被动律)。page 项由解释器从页策略单源补齐,实现者可置 0。
+    fn op_env(&self) -> Option<owl_kernels::driver::OpEnv> {
+        None
+    }
+
     /// 能力自述:能否发射设备侧 kernel(Launch / DeviceRearrange 装载臂)。
     /// 默认 false(纯 host face);GPU 后端覆写 true。装载域 repack
     /// 路径裁决([`crate::module::RepackPath::resolve`] 在 models 侧)的

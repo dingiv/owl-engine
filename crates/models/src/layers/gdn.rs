@@ -25,7 +25,7 @@
 //! conv_dim = 2·key_dim + value_dim = 6144;hidden 1024;conv k=4 无 bias。
 
 use crate::contract::Dtype;
-use crate::kernel;
+use crate::ops::ids;
 use crate::layers::linear::Linear;
 use crate::layers::{concat_rows, narrow_strided};
 use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, QuantPlan, Weight};
@@ -64,12 +64,7 @@ pub fn gating_g(
     heads: usize,
 ) -> TensorOps {
     let dt = a.dtype;
-    TensorOps::of(kernel::kernel_with(
-        gname("owl_gdn_gating_g", dt),
-        (0, 0, 0),
-        (256, 1, 1),
-        0,
-    ))
+    TensorOps::call(ids::GDN_GATING)
     .arg(a_log)
     .arg(a)
     .arg(dt_bias)
@@ -87,12 +82,7 @@ pub fn gating_g(
 /// (decode:rows = tokens × heads,dim = head_k_dim 128;eps 1e-6)。
 pub fn l2norm(x: &TensorOps, rows: usize, dim: usize, eps: f32) -> TensorOps {
     let dt = x.dtype;
-    TensorOps::of(kernel::kernel_with(
-        gname("owl_gdn_l2norm", dt),
-        (rows as u32, 1, 1),
-        (256, 1, 1),
-        0,
-    ))
+    TensorOps::call(ids::GDN_L2NORM).aux(&[rows])
     .arg(x)
     .arg_usize(rows)
     .arg_usize(dim)
@@ -120,12 +110,7 @@ pub fn conv_upd(
     silu: bool,
 ) -> TensorOps {
     let dt = x.dtype;
-    TensorOps::of(kernel::kernel_with(
-        gname("owl_gdn_conv_upd", dt),
-        (0, 0, 0),
-        (256, 1, 1),
-        0,
-    ))
+    TensorOps::call(ids::GDN_CONV_UPD)
     .arg(x)
     .arg(w)
     .arg(state)
@@ -163,12 +148,9 @@ pub fn delta_dec(
     q_scale: f32,
 ) -> TensorOps {
     let dt = v.dtype;
-    TensorOps::of(kernel::kernel_with(
-        gname("owl_gdn_delta_dec", dt),
-        (((vd + 63) / 64) as u32, (batch * nv) as u32, 1),
-        (64, 1, 1),
-        (2 * 128 + 2) * 4,
-    ))
+    // aux = 拾取推导常数(层语义几何);smem 契约 = (2·kd+2)·4B 进
+    // driver 公式(原手抄 (2*128+2)*4 不看 kd 形参,变档静默越界)
+    TensorOps::call(ids::GDN_DELTA_DEC).aux(&[batch, nv, kd, vd])
     .arg(q)
     .arg(k)
     .arg(v)
@@ -203,12 +185,7 @@ pub(crate) fn conv_fwd(
     d: usize,
     silu: bool,
 ) -> TensorOps {
-    TensorOps::of(kernel::kernel_with(
-        "owl_gdn_conv_fwd_f16",
-        (1u32, ((d + 255) / 256) as u32, 1),
-        (256, 1, 1),
-        0,
-    ))
+    TensorOps::call(ids::GDN_CONV_FWD).aux(&[d])
     .arg(x)
     .arg(w)
     .arg(state)
@@ -240,12 +217,7 @@ pub(crate) fn recurrence_varlen(
     vd: usize,
     q_scale: f32,
 ) -> TensorOps {
-    TensorOps::of(kernel::kernel_with(
-        "owl_gdn_recurrence_varlen_gqa_f16",
-        (((vd + 7) / 8) as u32, nv as u32, 1),
-        (32, 8, 1),
-        ((4 * kd + 4) * 4) as u32,
-    ))
+    TensorOps::call(ids::GDN_RECURRENCE).aux(&[nv, kd, vd])
     .arg(q)
     .arg(k)
     .arg(v)
@@ -282,12 +254,7 @@ pub fn norm_act(
     act_silu: bool,
 ) -> TensorOps {
     let dt = x.dtype;
-    TensorOps::of(kernel::kernel_with(
-        gname("owl_gdn_norm_act", dt),
-        ((rows * value_dim / group_size) as u32, 1, 1),
-        (256, 1, 1),
-        0,
-    ))
+    TensorOps::call(ids::GDN_NORM_ACT).aux(&[rows, value_dim, group_size])
     .arg(x)
     .arg(z)
     .arg(gamma)
@@ -663,18 +630,6 @@ impl Loadable for GatedDeltaNet {
 
 /// GDN f16/f32 核名路由(F5 整模切换;输出 dtype 跟随激活声明,
 /// state 恒 f32 混合核 —— 输出口径守门,输入位宽由 .cu 源自证)
-fn gname(base: &str, dt: crate::tensor::Dtype) -> &'static str {
-    match dt {
-        crate::tensor::Dtype::F16 => leak_name(format!("{base}_f16")),
-        _ => leak_name(format!("{base}_f32")),
-    }
-}
-
-fn leak_name(s: String) -> &'static str {
-    // 封闭集合(GDN 五核 × 2 dtype),Box::leak 量级可忽略
-    Box::leak(s.into_boxed_str())
-}
-
 pub mod fixture {
     pub fn weights(nk: usize, hk_dim: usize, nv: usize, hv_dim: usize, hidden: usize) -> Vec<(String, usize)> {
         let (key_dim, value_dim) = (nk * hk_dim, nv * hv_dim);

@@ -194,8 +194,8 @@ async fn load_group<D: DeviceClient, S: WeightSource + ?Sized>(
         let entry = match w.layout {
             Layout::Transposed => load_transposed(face, w, src, n, tap).await?,
             Layout::Direct => load_direct(face, w, src, n, tap).await?,
-            Layout::DeviceRearrange { kernel, rows, cols } => {
-                load_device_rearrange(face, w, src, n, kernel, rows, cols, tap, deferred).await?
+            Layout::DeviceRearrange { op, rows, cols } => {
+                load_device_rearrange(face, w, src, n, op, rows, cols, tap, deferred).await?
             }
         };
         w.sink.deliver(crate::contract::Bytes::new(entry.block.id, n));
@@ -266,7 +266,7 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
     w: &crate::module::Want,
     src: &S,
     n: usize,
-    kernel: &'static str,
+    op: owl_kernels::driver::OpId,
     rows: usize,
     cols: usize,
     tap: Option<&Mutex<Box<dyn LoadTap>>>,
@@ -319,8 +319,8 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
             }
         }
     }
-    // 2) 重排核(registry 核,nvrtc;LaunchMsg 自带 source)
-    //    grid = (out/64, (k/8)/2),block 32(契约见 .cu 头注)
+    // 2) 重排核(语义拾取:driver::resolve(OpEnv 必传,被动律);
+    //    grid/block 契约公式住 driver(load::ct_repack))
     let out_block = face
         .alloc_uninit(crate::contract::Dtype::U32, n)
         .await
@@ -329,10 +329,21 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
     // host 留 packed 副本 + dtoh 对拍 —— 装载慢,仅排障用)
     {
         let _s = probe.span("repack");
+        let env = face.op_env().ok_or_else(|| {
+            ModelError::Msg(format!("Weight '{}': DeviceRearrange 需 GPU 环境", w.key))
+        })?;
+        let pick = owl_kernels::driver::resolve(owl_kernels::driver::OpReq {
+            op,
+            env: &env,
+            dt: owl_kernels::driver::DType::U32,
+            shapes: &[vec![rows, cols]],
+            aux: &[],
+            scalars: &[],
+        });
         face.launch(crate::contract::LaunchMsg {
             kernel: crate::contract::KernelSpec {
-                name: kernel.to_string(),
-                source: owl_kernels::sources::owl::CT_REPACK_U32.to_string(),
+                name: pick.name.to_string(),
+                source: crate::kernel::source(pick.name).to_string(),
             },
             args: vec![
                 crate::contract::Arg::Block { id: raw.id },
@@ -340,9 +351,9 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
                 crate::contract::Arg::U64(cols as u64),
                 crate::contract::Arg::Block { id: out_block.id },
             ],
-            grid: ((rows / 64) as u32, (cols / 2) as u32, 1),
-            block: (32, 1, 1),
-            shared_mem: 0,
+            grid: pick.shape.grid,
+            block: pick.shape.block,
+            shared_mem: pick.shape.smem,
             out_elems: n,
         })
         .await
@@ -380,7 +391,7 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
         key: w.key.clone(),
         dtype: w.dtype,
         shape: w.shape.clone(),
-        layout: Layout::DeviceRearrange { kernel, rows, cols },
+        layout: Layout::DeviceRearrange { op, rows, cols },
         block: crate::contract::Bytes::new(out_block.id, n),
     })
 }

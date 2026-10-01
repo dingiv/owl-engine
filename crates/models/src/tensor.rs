@@ -270,6 +270,33 @@ impl TensorOps {
         }
     }
 
+    /// 语义调用声明(**model 层面向解释器的唯一新语句**,Driver 立项):
+    /// `TensorOps::call(ops::ids::GDN_GATING).arg(..).with_shape(..)`
+    /// 零核名/零发射参数 —— 名/变体/grid/block/smem 由解释器执行期经
+    /// owl-kernels::driver::resolve(OpEnv 必传)拾取。
+    pub fn call(op: crate::ops::OpId) -> TensorOps {
+        TensorOps {
+            id: next_id(),
+            parents: vec![],
+            depth: 0,
+            op: crate::ops::Op::Call { op, aux: Vec::new() },
+            dtype: Dtype::F32,
+            shape: vec![],
+            args: vec![],
+            err: None,
+            label: None,
+        }
+    }
+
+    /// 拾取推导常数(层语义几何:kd/vd/batch/rows…;**非核参数**,不进
+    /// 签名 —— 序 = 各族 driver 文档;核签名标量仍走 arg_usize/arg_i32)
+    pub fn aux(mut self, v: &[usize]) -> TensorOps {
+        if let crate::ops::Op::Call { aux, .. } = &mut self.op {
+            aux.extend_from_slice(v);
+        }
+        self
+    }
+
     /// Kernel 节点输出形状标注(of 默认 F32 空形状;eval 按此 alloc 输出块)
     pub fn with_shape(mut self, dtype: Dtype, shape: Shape) -> TensorOps {
         self.dtype = dtype;

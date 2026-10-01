@@ -24,6 +24,8 @@
 //! `Module` trait;统一 ForwardCtx 随 runner 立项)。
 
 use crate::contract::Dtype;
+use owl_kernels::driver;
+use crate::ops::ids;
 use crate::kernel;
 use crate::layers::linear::Linear;
 use crate::layers::{concat_rows_hier, narrow_strided};
@@ -108,26 +110,14 @@ impl Attention {
         let force_naive = std::env::var_os("OWL_FORCE_NAIVE").is_some();
         if let Some(pol) = crate::module::kv_paged_policy(dt) {
             // paged 分派(K1):K0 写核 + v1 分页打分(vLLM classic 布局;
-            // 页/x/核名来自 kv_paged_policy,块表语义见 block_tables 头注。
-            // wrapper BLOCK_SIZE 必须与池页配对 —— v1_name 按 (hd,page)
-            // 单源裁决,不可达组合回退 naive,杜绝 wrapper×池页错配)
-            if !force_naive {
-                if let Some(v1) = v1_name(self.hd, pol.page) {
-                    return self.paged_decode_output(&q, &k, &v, &gate, kv, tokens, ctx, &pol, v1);
-                }
+            // 页/x 来自 kv_paged_policy,块表语义见 block_tables 头注。
+            // 页配对律住 driver(attn::paged_decode_ok / resolve 内 wrapper
+            // 选择)—— 谓词门控声明,执行期 env.page 终审)
+            if !force_naive && driver::attn::paged_decode_ok(self.hd, pol.page) {
+                return self.paged_decode_output(&q, &k, &v, &gate, kv, tokens, ctx, &pol);
             }
         }
-        let attn_name = if dt == Dtype::F16 {
-            "owl_naive_decode_attn_f16"
-        } else {
-            "owl_naive_decode_attn_f32"
-        };
-        let y = TensorOps::of(kernel::kernel_with(
-            attn_name,
-            (0, 0, 0), // 哨兵;核内有 bs 上界 guard
-            (256, 1, 1),
-            0,
-        ))
+        let y = TensorOps::call(ids::ATTN_NAIVE_DECODE) // 哨兵;核内有 bs 上界 guard
         .arg(&q)
         .arg(&k)
         .arg(&v)
@@ -147,12 +137,7 @@ impl Attention {
         // f32 路径:语义算子 sigmoid + mul(CPU 单元锚)
         let y = if dt == Dtype::F16 {
             let n = tokens * self.hq * self.hd;
-            TensorOps::of(kernel::kernel_with(
-                "owl_sigmoid_gate_mul_f16",
-                (0, 0, 0),
-                (256, 1, 1),
-                0,
-            ))
+            TensorOps::call(ids::ATTN_GATE_MUL)
             .arg(&gate)
             .arg(&y)
             .arg_usize(n)
@@ -176,18 +161,12 @@ impl Attention {
         tokens: usize,
         ctx: &ForwardCtx,
         pol: &crate::module::KvPagedPolicy,
-        v1: &'static str,
     ) -> TensorOps {
         let dt = q.dtype;
         let page = pol.page as i32;
         let x = pol.x;
         // ① K0 写池:本 token k/v 入池(slots [T] = 物理槽表)
-        let wr = TensorOps::of(kernel::kernel_with(
-            "vllm_reshape_and_cache_f16",
-            (tokens as u32, 1, 1),
-            (256, 1, 1),
-            0,
-        ))
+        let wr = TensorOps::call(ids::ATTN_K0_WRITE).aux(&[tokens])
         .arg(k)
         .arg(v)
         .arg(&kv.k_cache)
@@ -204,15 +183,10 @@ impl Attention {
         // 写核哑输出块接 alibi 槽(旗标 0 不解引用)⇒ 解释器先写后打分
         let scale = 1.0 / (self.hd as f32).sqrt();
         let nb = kv.block_tables.shape().last().cloned().unwrap_or(1);
-        // smem 由契约函数单源推导(2026-09-27 越界事故后禁手抄常量,
-        // 公式与事故记录见 paged_v1_smem / attention-kernel-port.md)
-        let v1_smem = paged_v1_smem(self.hd, nb, pol.page);
-        let y = TensorOps::of(kernel::kernel_with(
-            v1,
-            (self.hq as u32, 1, 1), // grid (num_heads, num_seqs, 1)
-            (128, 1, 1),            // NUM_THREADS=128(两档同)
-            v1_smem,
-        ))
+        // wrapper 页配对 + smem 契约公式 = driver 单源(env.page 终审;
+        // 原手抄 smem 越界事故与 bs16/32 错配案的结构性封点)
+        let y = TensorOps::call(ids::ATTN_PAGED_DECODE)
+            .aux(&[self.hd, self.hq, self.hkv, nb as usize])
         .arg(q)
         .arg(&kv.k_cache)
         .arg(&kv.v_cache)
@@ -231,12 +205,7 @@ impl Attention {
         .with_shape(dt, vec![tokens, self.hq * self.hd]);
         // ③ 输出门(f16 融合单发)+ 出投影(与 legacy 尾巴同)
         let n = tokens * self.hq * self.hd;
-        let y = TensorOps::of(kernel::kernel_with(
-            "owl_sigmoid_gate_mul_f16",
-            (0, 0, 0),
-            (256, 1, 1),
-            0,
-        ))
+        let y = TensorOps::call(ids::ATTN_GATE_MUL)
         .arg(gate)
         .arg(&y)
         .arg_usize(n)
@@ -271,12 +240,7 @@ impl Attention {
         // 槽/长度表单源 = ctx(与下方 naive 循环同源):KvBuffers.slots/
         // kv_lens 是 decode 步字段(尺寸 [B]),prefill 误读曾致 K0 grid=T
         // 越界读 + seq_lens 垃圾 → 输出全零/ILLEGAL_ADDRESS(2026-10-01)
-        let wr = TensorOps::of(kernel::kernel_with(
-            "vllm_reshape_and_cache_f16",
-            (tokens as u32, 1, 1),
-            (256, 1, 1),
-            0,
-        ))
+        let wr = TensorOps::call(ids::ATTN_K0_WRITE).aux(&[tokens])
         .arg(k)
         .arg(v)
         .arg(&kv.k_cache)
@@ -294,12 +258,10 @@ impl Attention {
         let qsl: Vec<u8> = [0.0f32, tokens as f32].iter().flat_map(|f| f.to_le_bytes()).collect();
         let scale = 1.0 / (self.hd as f32).sqrt();
         let nb = kv.block_tables.shape().last().cloned().unwrap_or(1);
-        let y = TensorOps::of(kernel::kernel_with(
-            prefill_name(self.hd),
-            ((self.hq / self.hkv) as u32, self.hkv as u32, (tokens as u32 + 255) / 256), // grid(头注释契约)
-            (256, 1, 1),
-            (64 + 2 * self.hd * page as usize * 2) as u32, // smem = 64 + 2·HD·BLOCK·2B
-        ))
+        // 名/网格/smem(bs32 契约)= driver 单源(env.page 终审)
+        let y = TensorOps::call(ids::ATTN_PAGED_PREFILL).aux(&[
+            self.hd, self.hkv, self.hq, tokens,
+        ])
         .arg(q)
         .arg(&kv.k_cache)
         .arg(&kv.v_cache)
@@ -325,12 +287,7 @@ impl Attention {
         .with_shape(dt, vec![tokens, self.hq * self.hd]);
         // 输出门(f16 融合单发)+ 出投影(与 legacy 同)
         let n = tokens * self.hq * self.hd;
-        let y = TensorOps::of(kernel::kernel_with(
-            "owl_sigmoid_gate_mul_f16",
-            (0, 0, 0),
-            (256, 1, 1),
-            0,
-        ))
+        let y = TensorOps::call(ids::ATTN_GATE_MUL)
         .arg(gate)
         .arg(&y)
         .arg_usize(n)
@@ -382,7 +339,7 @@ impl Attention {
                 // 契约 BLOCK∈{32,64}),仅页 32 池可进;页 16 池回退 naive
                 //(bs16 prefill 实例化 = 越契约,挂账)。smem 公式的 page 项
                 // 与核 BLOCK 同源,见 paged_prefill_output
-                if pol.page == 32 && (self.hd == 128 || self.hd == 256) {
+                if driver::attn::paged_prefill_ok(self.hd, pol.page) {
                     // 诊断二分开关保留(OWL_FORCE_NAIVE_PREFILL=1 走逐 token
                     // 对照;2026-10-01 撤销遗留的 if false 硬禁用 —— 它让
                     // 全部 prefill 注意力落 naive 逐 token 路径)
@@ -396,11 +353,6 @@ impl Attention {
         }
 
         // 逐 token 段:naive_attn 单发(bs=1;槽/kv_len 取表行 t 窄视图)
-        let attn_name = if dt == Dtype::F16 {
-            "owl_naive_decode_attn_f16"
-        } else {
-            "owl_naive_decode_attn_f32"
-        };
         let mut ys: Vec<TensorOps> = Vec::with_capacity(tokens);
         for t in 0..tokens {
             let q_t = narrow_strided(&q, 1, row_q, t * row_q, row_q, vec![1, row_q]);
@@ -408,12 +360,7 @@ impl Attention {
             let v_t = narrow_strided(&v, 1, row_kv, t * row_kv, row_kv, vec![1, row_kv]);
             let slot_t = narrow_strided(kv_slots, 1, 1, t, 1, vec![1]);
             let len_t = narrow_strided(kv_lens, 1, 1, t, 1, vec![1]);
-            let y_t = TensorOps::of(crate::kernel::kernel_with(
-                attn_name,
-                (0, 0, 0), // 哨兵;核内有 bs 上界 guard
-                (256, 1, 1),
-                0,
-            ))
+            let y_t = TensorOps::call(ids::ATTN_NAIVE_DECODE) // 哨兵;核内 bs 上界 guard
             .arg(&q_t)
             .arg(&k_t)
             .arg(&v_t)
@@ -1228,59 +1175,3 @@ mod naive_attn_f16_tests {
     }
 }
 
-/// v1 核入口名(nvrtc 按名寻址;registry 名为 'static 字面量)。
-/// 页配对律(2026-10-01 结案):wrapper 的 BLOCK_SIZE 模板实参必须与池页
-/// (kv_paged_policy 单源)一致 —— 错配 = 逻辑块地址换算全错(bs16 核读
-/// 页 32 池:行 16+ 系统性偏差,曾误判“v1 多块数值缺陷”立案三轮)。
-/// 页 32 = 生产档(prefill bs32 vendor 契约交集,TG=1);页 16 仅 decode
-/// 配对成立(prefill 分派另有页守卫,bs16 prefill 越契约挂账)。
-fn v1_name(hd: usize, page: usize) -> Option<&'static str> {
-    match (hd, page) {
-        (128, 32) => Some("vllm_paged_attention_v1_f16_hd128bs32"),
-        (256, 32) => Some("vllm_paged_attention_v1_f16_hd256bs32"),
-        (128, 16) => Some("vllm_paged_attention_v1_f16_hd128"),
-        (256, 16) => Some("vllm_paged_attention_v1_f16_hd256"),
-        _ => None,
-    }
-}
-
-/// v1 动态 smem 唯一合法来源(契约原文 = pagedattention_f16.cu 头注):
-/// `max(ceil(max_ctx,BLOCK)·BLOCK·4B, (NUM_WARPS/2)·HD·4B)`
-/// - 第一项 = 上下文项:logits f32,核内逐上下文 token 一格;max_ctx 取
-///   块表容量 nb·page(图捕获把 smem 烘焙进图,必须按容量上限给足);
-/// - 第二项 = 固定地板(NUM_THREADS=128 → 2 warp · hd · 4B)。
-/// 2026-09-27 事故:包装层手抄地板值 2048 漏掉上下文项 → decode
-/// kv_len > 512 即 smem 越界(图回放 ILLEGAL_ADDRESS)。纪律:**发射
-/// 参数由本函数推导,禁在调用点手写 smem 常量。**
-/// 上限 ≈ ctx 12k @HD256(>48KB 需 cudaFuncSetAttribute,launcher 扩展挂账)。
-pub(crate) fn paged_v1_smem(hd: usize, nb: usize, page: usize) -> u32 {
-    let num_warps: u32 = 128 / 32; // NUM_THREADS=128(与发射 block 同源)
-    let floor = (num_warps / 2) * hd as u32 * 4;
-    (nb * page * 4).max(floor as usize) as u32
-}
-
-#[cfg(test)]
-mod smem_contract_tests {
-    use super::paged_v1_smem;
-
-    #[test]
-    fn floor_dominates_small_nb() {
-        // s=64 档(nb=2):上下文项 256B < 地板 2048B
-        assert_eq!(paged_v1_smem(256, 2, 32), 2048);
-        assert_eq!(paged_v1_smem(128, 2, 32), 1024);
-    }
-
-    #[test]
-    fn context_dominates_large_nb() {
-        // 4k 档(nb=128):上下文项 16KB > 地板 —— 事故场景回归锚
-        assert_eq!(paged_v1_smem(256, 128, 32), 128 * 32 * 4);
-        assert_eq!(paged_v1_smem(128, 128, 32), 128 * 32 * 4);
-    }
-}
-fn prefill_name(hd: usize) -> &'static str {
-    match hd {
-        128 => "vllm_chunked_prefill_paged_attn_opt_f16_hd128",
-        256 => "vllm_chunked_prefill_paged_attn_opt_f16_hd256",
-        _ => unreachable!("paged 分派仅在 hd∈{{128,256}} 触发"),
-    }
-}
