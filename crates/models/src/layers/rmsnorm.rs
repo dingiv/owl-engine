@@ -25,6 +25,19 @@ impl RmsNorm {
         RmsNorm { w: Weight::new(key, vec![n]), eps, w_off: true }
     }
 
+    /// gamma 槽声明(融合核接线用;norm_rope 等跨模块融合读 w)
+    pub(crate) fn alpha_decl(&self) -> TensorOps {
+        self.w.decl()
+    }
+
+    pub(crate) fn eps(&self) -> f32 {
+        self.eps
+    }
+
+    pub(crate) fn w_off(&self) -> bool {
+        self.w_off
+    }
+
     /// 装载完备性
     pub fn is_loaded(&self) -> bool {
         self.w.is_loaded()

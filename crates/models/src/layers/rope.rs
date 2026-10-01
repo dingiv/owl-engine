@@ -12,9 +12,9 @@
 //! 取数(不经外部数据源);forward 常驻块引用。
 //! kernel 源 = 注册表 `owl_rope_half_partial_f32`(owl-kernels cu/text)。
 
+use crate::tensor::Dtype;
 use crate::contract::ModelError;
 use crate::module::{Loadable, LoaderCtx, LoaderOps, Weight};
-use crate::tensor::Dtype;
 use crate::TensorOps;
 
 #[derive(Clone)]
@@ -80,6 +80,16 @@ impl Rope {
         ])
     }
 
+    /// cos/sin 表槽声明(融合核接线;norm_rope 读表)
+    pub(crate) fn cos_sin_decl(&self) -> (TensorOps, TensorOps) {
+        (self.cos.decl(), self.sin.decl())
+    }
+
+    /// rotary half(= rotary_dim / 2;配对 (i, i+half))
+    pub(crate) fn rotary_half(&self) -> usize {
+        self.rotary_dim / 2
+    }
+
     /// q 旋转:[T, Hq*HD] → [T, Hq*HD](前 rotary_dim 维转,余直通)
     pub fn forward_q(
         &self,
@@ -134,8 +144,7 @@ impl Loadable for Rope {
 mod tests {
     use super::*;
     use crate::testkit::f32b;
-    use crate::tensor::Dtype;
-
+    
     #[tokio::test]
     async fn declaration_is_wellformed() {
         let (head_dim, rotary_dim, heads) = (8usize, 4usize, 2usize);
@@ -234,8 +243,7 @@ mod f16_tests {
     use super::*;
     use crate::contract::DeviceClient as _;
     use crate::testkit::{gpu_client, gpu_enabled};
-    use crate::tensor::Dtype;
-
+    
     fn half_le(f: f32) -> [u8; 2] {
         half::f16::from_f32(f).to_le_bytes()
     }

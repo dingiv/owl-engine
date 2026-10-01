@@ -5,10 +5,9 @@
 //! 零 host 转置、零第二份显存(2026-09-26 w_t 双槽形态作废)。
 //! 容器 + LoaderOps 装载形态。
 
-use crate::kernel;
+use crate::tensor::Dtype;
 use crate::module::{Loadable, LoaderCtx, LoaderOps, Weight};
 use crate::module::{ForwardCtx, Module};
-use crate::tensor::Dtype;
 use crate::TensorOps;
 
 pub struct Embedding {
@@ -92,8 +91,7 @@ impl Module for Embedding {
 mod tests {
     use super::*;
     use crate::testkit::{assert_close, f32b, harvest, hf_python, parity_enabled, skip_note, st_read, st_write, tmp_path, Src};
-    use crate::tensor::Dtype;
-
+    
     #[tokio::test]
     async fn declaration_is_wellformed() {
         let mut face = owl_cpu::CpuFace::new();
@@ -188,8 +186,7 @@ mod f16_tests {
     use super::*;
     use crate::testkit::{gpu_client, gpu_enabled};
     use crate::contract::DeviceClient as _;
-    use crate::tensor::Dtype;
-
+    
     fn half_le(f: f32) -> [u8; 2] {
         half::f16::from_f32(f).to_le_bytes()
     }

@@ -109,39 +109,35 @@ pub struct OpReq<'a> {
 /// (与登记表 `source()` 同纪律)。
 pub fn resolve(req: OpReq) -> KernelPick {
     let dt = req.dt;
+    let ax = |i: usize| -> usize {
+        *req.aux.get(i).unwrap_or_else(|| {
+            panic!(
+                "driver::resolve(\"{}\"): aux[{i}] 越界(aux len = {})",
+                req.op.0,
+                req.aux.len()
+            )
+        })
+    };
     match req.op.0 {
         "gdn.gating_g" => gdn::gating_g(dt),
-        "gdn.l2norm" => gdn::l2norm(dt, aux1(req.aux)),
+        "gdn.l2norm" => gdn::l2norm(dt, ax(0)),
         "gdn.conv_upd" => gdn::conv_upd(dt),
-        "gdn.delta_dec" => {
-            let (batch, nv, kd, vd) = (aux4(req.aux));
-            gdn::delta_dec(dt, vd, batch, nv, kd)
-        }
-        "gdn.conv_fwd" => gdn::conv_fwd(dt, aux1(req.aux)),
-        "gdn.recurrence_varlen_gqa" => {
-            let (nv, kd, vd) = aux3(req.aux);
-            gdn::recurrence_varlen_gqa(dt, vd, nv, kd)
-        }
-        "gdn.norm_act" => {
-            let (rows, value_dim, group_size) = aux3(req.aux);
-            gdn::norm_act(dt, rows, value_dim, group_size)
-        }
+        "gdn.delta_dec" => gdn::delta_dec(dt, ax(3), ax(0), ax(1), ax(2)), // aux = [batch, nv, kd, vd]
+        "gdn.conv_fwd" => gdn::conv_fwd(dt, ax(0)),
+        "gdn.recurrence_varlen_gqa" => gdn::recurrence_varlen_gqa(dt, ax(2), ax(0), ax(1)), // aux = [nv, kd, vd]
+        "gdn.norm_act" => gdn::norm_act(dt, ax(0), ax(1), ax(2)), // aux = [rows, value_dim, group_size]
         "ops.sigmoid" => ops::sigmoid(dt),
-        "attn.k0_write" => attn::k0_write(aux1(req.aux)),
-        "attn.paged_decode" => {
-            let (hd, hq, hkv, nb) = aux4(req.aux);
-            attn::paged_decode_v1(req.env, dt, hd, hq, hkv, nb)
-        }
-        "attn.paged_prefill" => {
-            let (hd, hkv, hq, tokens) = aux4(req.aux);
-            attn::paged_prefill(req.env, dt, hd, hkv, hq, tokens)
-        }
+        "attn.k0_write" => attn::k0_write(ax(0)),
+        "attn.paged_decode" => attn::paged_decode_v1(req.env, dt, ax(0), ax(1), ax(2), ax(3)), // aux = [hd, hq, hkv, nb]
+        "attn.paged_prefill" => attn::paged_prefill(req.env, dt, ax(0), ax(1), ax(2), ax(3)), // aux = [hd, hkv, hq, tokens]
         "attn.naive_decode" => attn::naive_decode(dt),
         "attn.gate_mul" => attn::gate_mul(dt),
         "ops.narrow" => elems::narrow(dt),
         "ops.concat" => elems::concat(dt),
-        "ops.rope" => elems::rope(dt, aux1(req.aux)),
-        "ops.embed" => elems::embed(dt, aux1(req.aux)),
+        "ops.rope" => elems::rope(dt, ax(0)),
+        "ops.embed" => elems::embed(dt, ax(0)),
+        "attn.norm_rope" => attn::norm_rope(dt, ax(0), ax(1), ax(2)), // aux = [tokens, heads, hd]
+        "mlp.silu_and_mul" => mlp::silu_and_mul(dt, ax(0)),
         "load.ct_repack" => {
             let rows = req.shapes.first().map(|s| s[0]).unwrap_or(0);
             let cols = req.shapes.first().map(|s| s.get(1).copied().unwrap_or(0)).unwrap_or(0);
@@ -156,17 +152,7 @@ pub fn resolve(req: OpReq) -> KernelPick {
 const fn aux1(a: &[usize]) -> usize {
     a[0]
 }
-const fn aux3(a: &[usize]) -> (usize, usize, usize) {
-    (a[0], a[1], a[2])
-}
-const fn aux4(a: &[usize]) -> (usize, usize, usize, usize) {
-    (a[0], a[1], a[2], a[3])
-}
 
-#[allow(dead_code)]
-const fn aux5(a: &[usize]) -> (usize, usize, usize, usize, usize) {
-    (a[0], a[1], a[2], a[3], a[4])
-}
 
 /// 一次拾取的产物:名字 + 发射配置(构造 [`Kernel`](crate::sources) 对应
 /// 的发射全部输入;grid 哨兵 (0,0,0) = 解释层按输出元素数自动 1D
@@ -412,9 +398,48 @@ pub mod attn {
         KernelPick { name: "owl_sigmoid_gate_mul_f16", shape: SENTINEL_1D }
     }
 
+    /// norm_rope 融合:qk-norm(×(1+w)^{w_off})+ rotate-half partial rope
+    /// (narrow+norm+rope 三发合一;strided 读 q_raw 的 per-head 半段)。
+    /// grid (tokens, heads, 1);block (hd,1,1);smem = hd·4B(行内归约)。
+    /// aux = [tokens, heads, hd];w_off/eps/stride/half 走核参数槽(层语义)。
+    pub fn norm_rope(dt: DType, tokens: usize, heads: usize, hd: usize) -> KernelPick {
+        assert!(matches!(dt, DType::F16), "owl_norm_rope 仅有 f16 变体(dt={dt:?})");
+        KernelPick {
+            name: "owl_norm_rope_f16",
+            shape: Shape {
+                grid: (tokens as u32, heads as u32, 1),
+                block: (hd as u32, 1, 1),
+                smem: (hd * 4) as u32,
+            },
+        }
+    }
+
     /// paged prefill 的 Hw 占位(谓词用;env 之外不可得时)
     pub fn hw_placeholder() -> Hw {
         Hw { arch: crate::Arch::Sm86 }
+    }
+}
+
+// ============================================================================
+// §4.4 MLP 门控族(C1)
+// ============================================================================
+
+pub mod mlp {
+    use super::{DType, KernelPick, Shape};
+
+    /// silu_and_mul:out = silu(g) ⊙ u(双输入单输出;half2 向量化)。
+    /// grid = ceil(n/512);block 256(每线程 2 元素)。
+    /// aux = [n](g/u 同形 [·, n])。
+    pub fn silu_and_mul(dt: DType, n: usize) -> KernelPick {
+        assert!(matches!(dt, DType::F16), "owl_silu_and_mul 仅有 f16 变体(dt={dt:?})");
+        KernelPick {
+            name: "owl_silu_and_mul_f16",
+            shape: Shape {
+                grid: ((((n + 1) / 2 + 255) / 256) as u32, 1, 1),
+                block: (256, 1, 1),
+                smem: 0,
+            },
+        }
     }
 }
 
@@ -477,7 +502,7 @@ pub mod elems {
 // ============================================================================
 
 pub mod load {
-    use super::{KernelPick, OpId, Shape};
+    use super::{KernelPick, Shape};
 
     /// ct packed → marlin B 重排(U32;**核签名形参即 rows/cols**,无 aux)。
     /// grid = (out/64, (k/8)/2),block 32(契约见 .cu 头注)。
@@ -492,7 +517,7 @@ pub mod load {
         }
     }
 
-    pub const CT_REPACK: super::OpId = super::OpId("load.ct_repack");
+    pub const CT_REPACK: super::OpId = super::OpId("load.ct_repack"); // OpId 全路径引用,免 import
 }
 
 // ============================================================================
@@ -573,6 +598,22 @@ mod tests {
         assert_eq!(p.name, "vllm_chunked_prefill_paged_attn_opt_f16_hd256");
         assert_eq!(p.shape.grid, (6, 4, 2)); // ceil(300/256)=2
         assert_eq!(p.shape.smem, (64 + 2 * 256 * 32 * 2) as u32);
+    }
+
+    #[test]
+    fn fused_norm_rope_and_silu_contract() {
+        use super::{attn, mlp};
+        // q 链(27B 档):grid (1, 24, 1) × block 256,smem 1KB
+        let p = attn::norm_rope(DType::F16, 1, 24, 256);
+        assert_eq!(p.name, "owl_norm_rope_f16");
+        assert_eq!(p.shape.grid, (1, 24, 1));
+        assert_eq!(p.shape.block, (256, 1, 1));
+        assert_eq!(p.shape.smem, 1024);
+        // silu_and_mul:inter 17408 → 34 对 block
+        let p = mlp::silu_and_mul(DType::F16, 17408);
+        assert_eq!(p.name, "owl_silu_and_mul_f16");
+        assert_eq!(p.shape.grid, ((((17408 + 1) / 2 + 255) / 256) as u32, 1, 1));
+        assert_eq!(p.shape.block, (256, 1, 1));
     }
 
     #[test]

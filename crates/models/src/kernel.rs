@@ -161,6 +161,13 @@ pub static REGISTRY: &[Entry] = &[
     Entry { name: "owl_gdn_recurrence_varlen_gqa_f16", source: text::GDN_F32, args: "T,T,T,T,T,T,T,T,sz,sz,sz,sz,sz,f32,T", dtype: crate::contract::Dtype::F16 },
     // ---- owl 移植位(工单 N;NInfer sigmoid_gate_mul,attention 门融合)----
     Entry { name: "owl_sigmoid_gate_mul_f16", source: sources::owl::SIGMOID_GATE_MUL_F16, args: "T,T,sz,T", dtype: crate::contract::Dtype::F16 },
+    // ---- 融合核族(C1;2026-10-01;Ampere-first,单输出 SSA 契约友好)----
+    // norm_rope:qk-norm(×(1+w)^{w_off})+ rotate-half partial rope 三发合一
+    // (narrow+norm+rope;strided 读 q_raw 的 per-head [value|gate] 半段)
+    Entry { name: "owl_norm_rope_f16", source: sources::owl::NORM_ROPE_F16, args: "T,T,T,T,T,f32,sz,sz,sz,i32,T", dtype: crate::contract::Dtype::F16 },
+    // silu_and_mul:SwiGLU 门控 silu(g)⊙u 双输入单输出(vLLM 语义 port;
+    // 替 gate.silu().mul(up) 两发,float 中间,中间量化消除)
+    Entry { name: "owl_silu_and_mul_f16", source: sources::owl::SILU_AND_MUL_F16, args: "T,T,sz,T", dtype: crate::contract::Dtype::F16 },
     // ---- ct packed → marlin B 设备重排(2026-10-01 装载提速;AWQ 装载线)----
     Entry { name: "owl_ct_repack_u32", source: sources::owl::CT_REPACK_U32, args: "T,sz,sz,T", dtype: crate::contract::Dtype::U32 },
     // ---- 文本主干(Qwen3.5 mini-demo;Kernel 节点路径,输出块末参)----

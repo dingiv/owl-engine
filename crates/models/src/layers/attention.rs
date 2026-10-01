@@ -24,9 +24,9 @@
 //! `Module` trait;统一 ForwardCtx 随 runner 立项)。
 
 use crate::contract::Dtype;
+use crate::kernel;
 use owl_kernels::driver;
 use crate::ops::ids;
-use crate::kernel;
 use crate::layers::linear::Linear;
 use crate::layers::{concat_rows_hier, narrow_strided};
 use crate::layers::rmsnorm::RmsNorm;
@@ -91,16 +91,53 @@ impl Attention {
         let k = self.k_proj.forward(xs, ctx); // [T, Hkv*HD]
         let v = self.v_proj.forward(xs, ctx); // [T, Hkv*HD]
 
-        // per-head [value|gate] 切分(两段同形 [T, Hq*HD])
-        let flat_shape = vec![tokens, self.hq * self.hd];
-        let q = narrow_strided(&q_raw, tokens * self.hq, self.hd * 2, 0, self.hd, flat_shape.clone());
-        let gate = narrow_strided(&q_raw, tokens * self.hq, self.hd * 2, self.hd, self.hd, flat_shape);
-
-        // qk-norm(per-head 行 = [T×H, HD];×(1+w))→ rope
-        let q = self.q_norm.forward(&q, ctx);
-        let k = self.k_norm.forward(&k, ctx);
-        let q = rope.forward_q(&q, pos, tokens, self.hq);
-        let k = rope.forward_k(&k, pos, tokens, self.hkv);
+        // per-head [value|gate] 切分(C1):value 半段由 norm_rope strided
+        // 直取(q 链 narrow+norm+rope 三发合一);gate 段仍 narrow(W2)
+        let dt_raw = q_raw.dtype;
+        let (q, gate, k) = if dt_raw == Dtype::F16 {
+            // 融合:qk-norm(×(1+w))+ rotate-half partial rope 单发;
+            // strided 读 q_raw(stride = q_raw 行长,head 步 = 2HD)
+            let (cos_d, sin_d) = rope.cos_sin_decl();
+            let gate = narrow_strided(&q_raw, tokens * self.hq, self.hd * 2, self.hd, self.hd,
+                vec![tokens, self.hq * self.hd]);
+            let q = TensorOps::call(ids::ATTN_NORM_ROPE)
+                .arg(&q_raw)
+                .arg(&self.q_norm.alpha_decl())
+                .arg(&cos_d)
+                .arg(&sin_d)
+                .arg(pos)
+                .arg_f32(self.q_norm.eps())
+                .arg_usize(self.hq * self.hd * 2) // row_stride(q_raw 行长)
+                .arg_usize(self.hd * 2)                     // head_stride
+                .arg_usize(rope.rotary_half())
+                .arg_i32(1)                                 // w_off = ×(1+w)
+                .aux(&[tokens, self.hq, self.hd])
+                .with_shape(Dtype::F16, vec![tokens, self.hq * self.hd]);
+            let k = TensorOps::call(ids::ATTN_NORM_ROPE)
+                .arg(&k)
+                .arg(&self.k_norm.alpha_decl())
+                .arg(&cos_d)
+                .arg(&sin_d)
+                .arg(pos)
+                .arg_f32(self.k_norm.eps())
+                .arg_usize(self.hkv * self.hd)     // row_stride(k 连续)
+                .arg_usize(self.hd)
+                .arg_usize(rope.rotary_half())
+                .arg_i32(1)
+                .aux(&[tokens, self.hkv, self.hd])
+                .with_shape(Dtype::F16, vec![tokens, self.hkv * self.hd]);
+            (q, gate, k)
+        } else {
+            // f32 语义锚链(CPU face / f32 全模;逐算子组合保持)
+            let flat_shape = vec![tokens, self.hq * self.hd];
+            let q = narrow_strided(&q_raw, tokens * self.hq, self.hd * 2, 0, self.hd, flat_shape.clone());
+            let gate = narrow_strided(&q_raw, tokens * self.hq, self.hd * 2, self.hd, self.hd, flat_shape);
+            let q = self.q_norm.forward(&q, ctx);
+            let k = self.k_norm.forward(&k, ctx);
+            let q = rope.forward_q(&q, pos, tokens, self.hq);
+            let k = rope.forward_k(&k, pos, tokens, self.hkv);
+            (q, gate, k)
+        };
 
         // naive decode attention(slot 直排;一线程一 (t, q_head));
         // 核名/输出 dtype 跟随 q 声明(F5 整模切换;KV cache f16)
@@ -322,15 +359,49 @@ impl Attention {
         let q_raw = self.q_proj.forward(xs, ctx); // [T, 2*Hq*HD]
         let k = self.k_proj.forward(xs, ctx); // [T, Hkv*HD]
         let v = self.v_proj.forward(xs, ctx); // [T, Hkv*HD]
-        let flat_shape = vec![tokens, row_q];
-        let q = narrow_strided(&q_raw, tokens * self.hq, self.hd * 2, 0, self.hd, flat_shape.clone());
-        let gate = narrow_strided(&q_raw, tokens * self.hq, self.hd * 2, self.hd, self.hd, flat_shape);
-
-        // qk-norm + rope(T 批量;pos [T] 表逐行)
-        let q = self.q_norm.forward(&q, ctx);
-        let k = self.k_norm.forward(&k, ctx);
-        let q = rope.forward_q(&q, pos, tokens, self.hq);
-        let k = rope.forward_k(&k, pos, tokens, self.hkv);
+        // C1 融合:同 decode 臂(norm_rope strided 直取 value 半段)
+        let dt_raw = q_raw.dtype;
+        let (q, gate, k) = if dt_raw == Dtype::F16 {
+            let (cos_d, sin_d) = rope.cos_sin_decl();
+            let gate = narrow_strided(&q_raw, tokens * self.hq, self.hd * 2, self.hd, self.hd,
+                vec![tokens, row_q]);
+            let q = TensorOps::call(ids::ATTN_NORM_ROPE)
+                .arg(&q_raw)
+                .arg(&self.q_norm.alpha_decl())
+                .arg(&cos_d)
+                .arg(&sin_d)
+                .arg(pos)
+                .arg_f32(self.q_norm.eps())
+                .arg_usize(self.hq * self.hd * 2)
+                .arg_usize(self.hd * 2)
+                .arg_usize(rope.rotary_half())
+                .arg_i32(1)
+                .aux(&[tokens, self.hq, self.hd])
+                .with_shape(Dtype::F16, vec![tokens, row_q]);
+            let k = TensorOps::call(ids::ATTN_NORM_ROPE)
+                .arg(&k)
+                .arg(&self.k_norm.alpha_decl())
+                .arg(&cos_d)
+                .arg(&sin_d)
+                .arg(pos)
+                .arg_f32(self.k_norm.eps())
+                .arg_usize(self.hkv * self.hd)
+                .arg_usize(self.hd)
+                .arg_usize(rope.rotary_half())
+                .arg_i32(1)
+                .aux(&[tokens, self.hkv, self.hd])
+                .with_shape(Dtype::F16, vec![tokens, self.hkv * self.hd]);
+            (q, gate, k)
+        } else {
+            let flat_shape = vec![tokens, row_q];
+            let q = narrow_strided(&q_raw, tokens * self.hq, self.hd * 2, 0, self.hd, flat_shape.clone());
+            let gate = narrow_strided(&q_raw, tokens * self.hq, self.hd * 2, self.hd, self.hd, flat_shape);
+            let q = self.q_norm.forward(&q, ctx);
+            let k = self.k_norm.forward(&k, ctx);
+            let q = rope.forward_q(&q, pos, tokens, self.hq);
+            let k = rope.forward_k(&k, pos, tokens, self.hkv);
+            (q, gate, k)
+        };
 
         let dt = q.dtype;
         if dt == Dtype::F16 {
@@ -381,12 +452,7 @@ impl Attention {
         let y_all = concat_rows_hier(&refs, row_q);
         let y = if dt == Dtype::F16 {
             let n = tokens * row_q;
-            TensorOps::of(crate::kernel::kernel_with(
-                "owl_sigmoid_gate_mul_f16",
-                (0, 0, 0),
-                (256, 1, 1),
-                0,
-            ))
+            TensorOps::call(ids::ATTN_GATE_MUL)
             .arg(&gate)
             .arg(&y_all)
             .arg_usize(n)
