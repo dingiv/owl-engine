@@ -173,12 +173,32 @@ impl Loadable for Linear {
         match (self.quant_group, (&self.qw, &self.sc, &self.ws, &self.ctmp)) {
             (Some(_g), (Some(qw), Some(sc), Some(ws), Some(ctmp))) => {
                 let base = self.w.key();
-                let ops = qw
-                    .layout_as(format!("{base}.qweight"), ctx)
-                    .chain(sc.layout_as(format!("{base}.scales"), ctx));
-                let ops = match &self.zs {
-                    Some(zs) => ops.chain(zs.layout_as(format!("{base}.zeros"), ctx)),
-                    None => ops,
+                // qweight 键:AWQ + ctx.device_repack → 设备重排
+                // (源供原始 packed,DMA 上卡后 GPU 重排到 marlin 布局);
+                // 否则经典键(CPU 懒物化)。
+                let device = self.zs.is_some() && ctx.device_repack;
+                let mut ops = if device {
+                    // 设备重排:want 键 = 原始 packed 源键(源零重排直拷),
+                    // 布局带核名与原始形状;DMA 上卡后 GPU 重排到 marlin 布局
+                    qw.layout_as_device_rearrange(
+                        format!("{base}.packed_raw"),
+                        "owl_ct_repack_u32",
+                        self.out_dim,
+                        self.in_dim / 8,
+                        ctx,
+                    )
+                } else {
+                    qw.layout_as(format!("{base}.qweight"), ctx)
+                };
+                let ops = ops.chain(sc.layout_as(format!("{base}.scales"), ctx));
+                let ops = match (&self.zs, device) {
+                    (Some(zs), true) => {
+                        // 设备重排:scales/zeros 暂留 CPU 懒物化(数据小;
+                        // 浮出为瓶颈再上 gather 核)
+                        ops.chain(zs.layout_as(format!("{base}.zeros"), ctx))
+                    }
+                    (Some(zs), false) => ops.chain(zs.layout_as(format!("{base}.zeros"), ctx)),
+                    (None, _) => ops,
                 };
                 ops.chain(ws.layout_as(format!("{base}.marlin_ws"), ctx))
                     .chain(ctmp.layout_as(format!("{base}.marlin_ctmp"), ctx))

@@ -20,6 +20,9 @@ pub mod owl {
     pub const SIGMOID_GATE_MUL_F16: &str = include_str!("../cu/owl/sigmoid_gate_mul_f16.cu");
     /// 设备侧贪心采样(E3;REQ-DEC-04)
     pub const ARGMAX_F16: &str = include_str!("../cu/owl/argmax_f16.cu");
+    /// ct packed → marlin B 设备重排(2026-10-01 装载提速;主源 =
+    /// attention.rs marlin_repack.cu gptq_repack_kernel,输入侧转置适配)
+    pub const CT_REPACK_U32: &str = include_str!("../cu/marlin_repack_ct.cu");
 }
 
 /// attention port 家族(K0 起步;vendor attention.rs rev c0f19f2,Apache-2.0,

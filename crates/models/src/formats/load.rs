@@ -34,7 +34,7 @@ const LOAD_WORKERS: usize = 4;
 /// 解释器自己调用层钩子并为它传递 LoaderCtx —— 使用者只给层与源。
 ///
 /// ```rust,ignore
-/// eval_load(&model, face, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1 }).await?;
+/// eval_load(&model, face, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false }).await?;
 /// ```
 pub async fn eval_load<M, D, S>(
     layer: &M,
@@ -49,10 +49,17 @@ where
 {
     let want = layer.layout(ctx); // 声明:层产出需求清单(ctx 引用透传)
     let tap = load_tap(); // 观测:OWL_LOAD_DEBUG 门控,缺省零开销
-    let manifest = eval_want(&want, face, src, tap.as_ref()).await?;
+    // 设备重排的原始块延迟回收清单(E2a 契约:回收前数据须已收割 ——
+    // repack 核异步读 raw,火后即 free 会踩;栅栏后统一回收)
+    let deferred: std::sync::Arc<Mutex<Vec<u64>>> = std::sync::Arc::default();
+    let manifest = eval_want(&want, face, src, tap.as_ref(), &deferred).await?;
     // 上载栅栏:全部 DMA 落定后方可进入计算域(upload_pinned 入队即回执,
     // 完成语义由本栅栏一次总代价兜底)
     face.sync().await?;
+    let ids = std::mem::take(&mut *deferred.lock().unwrap());
+    if !ids.is_empty() {
+        face.free(&ids).await?;
+    }
     Ok(manifest)
 }
 
@@ -61,18 +68,21 @@ where
 // ============================================================================
 
 /// 需求清单求值:face 具备并发句柄且 Want 多于一条 → 分桶流水;否则顺序。
+type Deferred = std::sync::Arc<Mutex<Vec<u64>>>;
+
 async fn eval_want<D: DeviceClient, S: WeightSource + ?Sized>(
     want: &LoaderOps,
     face: &mut D,
     src: &S,
     tap: Option<&Mutex<Box<dyn LoadTap>>>,
+    deferred: &Deferred,
 ) -> Result<LoadManifest, ModelError> {
     let handles = face.loader_faces(LOAD_WORKERS);
     let manifest = match handles {
         Some(handles) if handles.len() > 1 && want.wants().len() > 1 => {
-            eval_want_parallel(want, handles, src, tap).await?
+            eval_want_parallel(want, handles, src, tap, deferred).await?
         }
-        _ => eval_want_sequential(want, face, src, tap).await?,
+        _ => eval_want_sequential(want, face, src, tap, deferred).await?,
     };
     Ok(manifest)
 }
@@ -94,15 +104,26 @@ fn key_groups<'a>(wants: &'a [crate::module::Want]) -> Vec<Vec<&'a crate::module
 }
 
 /// 顺序路径(CpuFace / 单 Want / 无并发能力)
+const DEFERRED_FREE_COUNT: usize = 16; // raw 滞留 16 块批量回收一次(~1-2GB)
+
 async fn eval_want_sequential<D: DeviceClient, S: WeightSource + ?Sized>(
     want: &LoaderOps,
     face: &mut D,
     src: &S,
     tap: Option<&Mutex<Box<dyn LoadTap>>>,
+    deferred: &Deferred,
 ) -> Result<LoadManifest, ModelError> {
     let mut manifest = LoadManifest::default();
     for group in key_groups(want.wants()) {
-        manifest.0.extend(load_group(face, &group, src, tap).await?);
+        manifest.0.extend(load_group(face, &group, src, tap, deferred).await?);
+        // 批量回收:滞留 raw 超阈值 → sync(COMPUTE 排空,E2a 契约)+ free
+        if deferred.lock().unwrap().len() >= DEFERRED_FREE_COUNT {
+            face.sync().await?;
+            let ids = std::mem::take(&mut *deferred.lock().unwrap());
+            if !ids.is_empty() {
+                face.free(&ids).await?;
+            }
+        }
     }
     Ok(manifest)
 }
@@ -116,6 +137,7 @@ async fn eval_want_parallel<D: DeviceClient, S: WeightSource + ?Sized>(
     handles: Vec<D>,
     src: &S,
     tap: Option<&Mutex<Box<dyn LoadTap>>>,
+    deferred: &Deferred,
 ) -> Result<LoadManifest, ModelError> {
     let mut groups = key_groups(want.wants());
     groups.sort_by_key(|g| std::cmp::Reverse(g.iter().map(|w| want_bytes(w)).sum::<usize>()));
@@ -134,7 +156,15 @@ async fn eval_want_parallel<D: DeviceClient, S: WeightSource + ?Sized>(
     let futs = buckets.into_iter().map(|(mut face, bundles, _)| async move {
         let mut entries = Vec::new();
         for bundle in &bundles {
-            entries.extend(load_group(&mut face, bundle, src, tap).await?);
+            entries.extend(load_group(&mut face, bundle, src, tap, deferred).await?);
+            // 批量回收(并行桶;sync 任一句柄 = 全设备排空)
+            if deferred.lock().unwrap().len() >= DEFERRED_FREE_COUNT {
+                face.sync().await?;
+                let ids = std::mem::take(&mut *deferred.lock().unwrap());
+                if !ids.is_empty() {
+                    face.free(&ids).await?;
+                }
+            }
         }
         Ok::<_, ModelError>(entries)
     });
@@ -156,6 +186,7 @@ async fn load_group<D: DeviceClient, S: WeightSource + ?Sized>(
     group: &[&crate::module::Want],
     src: &S,
     tap: Option<&Mutex<Box<dyn LoadTap>>>,
+    deferred: &Deferred,
 ) -> Result<Vec<LoadEntry>, ModelError> {
     let mut manifest = Vec::new();
     for w in group {
@@ -163,6 +194,9 @@ async fn load_group<D: DeviceClient, S: WeightSource + ?Sized>(
         let entry = match w.layout {
             Layout::Transposed => load_transposed(face, w, src, n, tap).await?,
             Layout::Direct => load_direct(face, w, src, n, tap).await?,
+            Layout::DeviceRearrange { kernel, rows, cols } => {
+                load_device_rearrange(face, w, src, n, kernel, rows, cols, tap, deferred).await?
+            }
         };
         w.sink.deliver(crate::contract::Bytes::new(entry.block.id, n));
         manifest.push(entry);
@@ -218,6 +252,136 @@ async fn load_direct<D: DeviceClient, S: WeightSource + ?Sized>(
         shape: w.shape.clone(),
         layout: Layout::Direct,
         block: crate::contract::Bytes::new(b.id, n),
+    })
+}
+
+/// 设备重排臂(2026-10-01 AWQ 装载提速):源供**原始 packed** 字节
+/// (CPU 零重排)→ DMA 上卡 → registry 重排核就地生成 marlin 布局块
+/// → 原始块回收(Free 通道)。CPU 33s 重量排出热路径,重排在 GPU
+/// (显存带宽 ~900GB/s,哑 gather)。
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
+    face: &mut D,
+    w: &crate::module::Want,
+    src: &S,
+    n: usize,
+    kernel: &'static str,
+    rows: usize,
+    cols: usize,
+    tap: Option<&Mutex<Box<dyn LoadTap>>>,
+    deferred: &Deferred,
+) -> Result<LoadEntry, ModelError> {
+    let raw_elems = rows * cols;
+    let mut probe = KeyProbe::start(tap, &w.key, raw_elems * 4);
+    let verify = std::env::var_os("OWL_LOAD_VERIFY").is_some();
+    let mut packed_host = if verify {
+        Some(vec![0u8; raw_elems * 4])
+    } else {
+        None
+    };
+
+    // 1) 原始块上卡(经 pinned;raw > 128MB 自动分块循环)
+    let raw = face
+        .alloc_uninit(crate::contract::Dtype::U32, raw_elems)
+        .await
+        .map_err(|e| ModelError::Msg(format!("Weight '{}': raw alloc {e}", w.key)))?;
+    {
+        let chunk_elems = (CHUNK_BYTES / 4).max(1);
+        let mut off = 0usize;
+        while off < raw_elems {
+            let len = chunk_elems.min(raw_elems - off);
+            let mut lease = {
+                let _s = probe.span("pinned_alloc");
+                face.alloc_pinned(len * 4)
+                    .await
+                    .map_err(|e| ModelError::Msg(format!("Weight '{}': {e}", w.key)))?
+            };
+            {
+                let _s = probe.span("convert");
+                src.convert_chunk_into_bytes(w.key.as_str(), off, len, lease.slice_bytes_mut(), crate::contract::Dtype::U32)
+                    .ok_or_else(|| attribution(src, &w.key, raw_elems))?;
+            }
+            if let Some(ph) = &mut packed_host {
+                ph[off * 4..(off + len) * 4].copy_from_slice(&lease.slice_bytes_mut()[..len * 4]);
+            }
+            {
+                let _s = probe.span("htod");
+                face.upload_pinned(lease, &raw, off * 4, len * 4)
+                    .await
+                    .map_err(|e| ModelError::Msg(format!("Weight '{}': {e}", w.key)))?;
+            }
+            off += len;
+            // upload_pinned 异步语义契约:计算读前必 sync(load_direct 同款
+            // 纪律:每 4 块 + 尾;repack 核读 raw 前无栅栏 = 竞态读半截)
+            if off % (chunk_elems * 4) == 0 || off >= raw_elems {
+                face.sync().await?;
+            }
+        }
+    }
+    // 2) 重排核(registry 核,nvrtc;LaunchMsg 自带 source)
+    //    grid = (out/64, (k/8)/2),block 32(契约见 .cu 头注)
+    let out_block = face
+        .alloc_uninit(crate::contract::Dtype::U32, n)
+        .await
+        .map_err(|e| ModelError::Msg(format!("Weight '{}': out alloc {e}", w.key)))?;
+    // OWL_LOAD_VERIFY=1:逐层端到端数据校验(核输出 vs CPU fused 逐位;
+    // host 留 packed 副本 + dtoh 对拍 —— 装载慢,仅排障用)
+    {
+        let _s = probe.span("repack");
+        face.launch(crate::contract::LaunchMsg {
+            kernel: crate::contract::KernelSpec {
+                name: kernel.to_string(),
+                source: owl_kernels::sources::owl::CT_REPACK_U32.to_string(),
+            },
+            args: vec![
+                crate::contract::Arg::Block { id: raw.id },
+                crate::contract::Arg::U64(rows as u64),
+                crate::contract::Arg::U64(cols as u64),
+                crate::contract::Arg::Block { id: out_block.id },
+            ],
+            grid: ((rows / 64) as u32, (cols / 2) as u32, 1),
+            block: (32, 1, 1),
+            shared_mem: 0,
+            out_elems: n,
+        })
+        .await
+        .map_err(|e| ModelError::Msg(format!("Weight '{}': repack launch {e}", w.key)))?;
+        // 端到端校验(OWL_LOAD_VERIFY;前 4 层):GPU 重排输出 vs CPU fused 逐位
+        if let Some(ph) = &packed_host {
+            static VERIFY_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let vi = VERIFY_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if vi < 9999 {
+                face.sync().await?;
+                let mut gbuf = vec![0u8; n * 4];
+                face.dtoh(&out_block, &mut gbuf).await?;
+                let k = cols * 8;
+                let idx = owl_kernels::marlin::repack::marlin_fused_indices(k, rows);
+                let p32: Vec<i32> = ph
+                    .chunks_exact(4)
+                    .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                let mut b_ref: Vec<i32> = Vec::new();
+                owl_kernels::marlin::repack::pack_marlin_b_fused(&p32, &idx, rows * k / 8, &mut b_ref);
+                let mut bad = 0usize;
+                for (i, w) in gbuf.chunks_exact(4).enumerate() {
+                    let got = i32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+                    if got != b_ref[i] { bad += 1; }
+                }
+                eprintln!("[load-verify] {vi} {} 坏字 {bad}/{}", w.key, b_ref.len());
+                assert_eq!(bad, 0, "GPU repack 端到端校验失败: {}", w.key);
+            }
+        }
+    }
+    // 3) 原始块回收(E2a Free 通道;数据已进重排输出块)
+    face.free(&[raw.id]).await;
+    probe.done();
+    Ok(LoadEntry {
+        key: w.key.clone(),
+        dtype: w.dtype,
+        shape: w.shape.clone(),
+        layout: Layout::DeviceRearrange { kernel, rows, cols },
+        block: crate::contract::Bytes::new(out_block.id, n),
     })
 }
 

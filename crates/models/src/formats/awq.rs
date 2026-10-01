@@ -76,6 +76,9 @@ pub struct AwqSource {
     /// 全局单锁时 build 串行链 ≈ 装载墙钟主导,分片后 4 桶并发 build
     /// 与 DMA 流水重叠)
     build_locks: Vec<Mutex<()>>,
+    /// 设备重排模式(装载域 set;true = CPU 构建走轻路径:量化大键的
+    /// marlin B 由 GPU repack 产出,CPU 仅产 scales/zeros/packed_raw_ct)
+    device_repack: std::cell::Cell<bool>,
 }
 
 impl AwqSource {
@@ -95,7 +98,14 @@ impl AwqSource {
             cache: Mutex::new((HashMap::new(), 0)),
             idx_cache: Mutex::new(HashMap::new()),
             build_locks: (0..16).map(|_| Mutex::new(())).collect(),
+            device_repack: std::cell::Cell::new(false),
         })
+    }
+
+    /// 设备重排模式(装载域注入;必须在首键物化前设置):
+    /// true = CPU 构建轻路径(量化大键的 marlin B 由 GPU repack 产出)
+    pub fn set_device_repack(&self, on: bool) {
+        self.device_repack.set(on);
     }
 
     /// 诊断口:索引键全集(装载面排查/基准用)
@@ -143,6 +153,21 @@ impl AwqSource {
         // 的裸 .weight —— cyankiwi 的 ignore 逐层不同,同键可能两态)
         if let Some(e) = self.index.get(key) {
             return Some(Resolved::View(e.clone()));
+        }
+        // 设备重排原始键:{base}.packed_raw(CPU 零重排,重排在 GPU)
+        // - Ct 形态:weight_packed 原样(View 直拷 I32→U32)
+        // - F16 兜底形态:RTN nibbles 打包回 ct 布局(build 期一并产出;
+        //   使 ignore 层与量化层走同一 GPU 通路,免特判)
+        if let Some(base) = key.strip_suffix(".packed_raw") {
+            if let Some(pe) = self.index.get(&format!("{base}.weight_packed")) {
+                return Some(Resolved::View(pe.clone()));
+            }
+            if self.index.contains_key(&format!("{base}.weight")) {
+                return Some(Resolved::Bytes(
+                    self.linear_bytes_for(base, &format!("{base}.packed_raw_ct"))?,
+                    Dtype::U32,
+                ));
+            }
         }
         // 非门控线性反量化臂(Linear 与本源同谓词,该键只对 non-eligible 出现)
         if let Some(base) = key.strip_suffix(".weight") {
@@ -196,7 +221,69 @@ impl AwqSource {
         let groups = k / 32;
         let mut inserts: Vec<(String, Arc<[u8]>, usize)> = Vec::new();
         let mut form_ct = false;
-        if crate::formats::w4a16::marlin_eligible(out, k) {
+        let device = self.device_repack.get();
+        if crate::formats::w4a16::marlin_eligible(out, k) && device {
+            // ---- 轻路径(device):CPU 仅产 scales/zeros;qweight 的
+            //      marlin B 由 GPU repack 产出(load.rs 设备重排臂),
+            //      packed 原样 DMA —— CPU 44MB×3 的重排/拷贝全消 ----
+            let s_pack: Vec<u16>;
+            let z_buf: Vec<i32>;
+            match form {
+                QuantForm::Ct { se, ze, .. } => {
+                    form_ct = true;
+                    let scale_bytes = &self.maps[se.map_ix][se.start..se.start + se.nbytes];
+                    let scales_f32 = bf16_par(scale_bytes);
+                    let zp_bytes = &self.maps[ze.map_ix][ze.start..ze.start + ze.nbytes];
+                    let zp_i32 = i32s_par(zp_bytes);
+                    self.maps[se.map_ix].dontneed(se.start, se.nbytes);
+                    self.maps[ze.map_ix].dontneed(ze.start, ze.nbytes);
+                    s_pack = pack_marlin_s(&scales_f32, out, groups);
+                    let zp_u8 = unpack_zp_ct(&zp_i32, out, groups);
+                    z_buf = pack_marlin_z(&zp_u8, out, groups);
+                }
+                QuantForm::F16 { we } => {
+                    let wb = &self.maps[we.map_ix][we.start..we.start + we.nbytes];
+                    let w_f32: Vec<f32> = match we.dtype {
+                        safetensors::Dtype::BF16 => bf16_par(wb),
+                        safetensors::Dtype::F16 => wb
+                            .chunks_exact(2)
+                            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                            .collect(),
+                        safetensors::Dtype::F32 => wb
+                            .chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect(),
+                        _ => return Err(ModelError::Msg(format!("awq: {base} 裸权重 dtype 不支持"))),
+                    };
+                    self.maps[we.map_ix].dontneed(we.start, we.nbytes);
+                    let scales_f32 = rtn_g32_sym_scales(&w_f32, out, k);
+                    s_pack = pack_marlin_s(&scales_f32, out, groups);
+                    z_buf = pack_marlin_z(&vec![8u8; out * groups], out, groups);
+                    // packed_raw_ct(设备重排核的输入):RTN nibbles → ct i32
+                    let qb = rtn_g32_sym_packed(&w_f32, out, k);
+                    let mut packed_ct = vec![0i32; out * (k / 8)];
+                    for (idx, &nib) in qb.iter().enumerate() {
+                        packed_ct[idx / 8] |= (nib as i32) << (4 * (idx % 8));
+                    }
+                    inserts.push((
+                        format!("{base}.packed_raw_ct"),
+                        Arc::from(i32s_le_bytes(&packed_ct).into_boxed_slice()),
+                        packed_ct.len() * 4,
+                    ));
+                }
+            }
+            inserts.push((
+                format!("{base}.scales"),
+                Arc::from(u16s_le_bytes(&s_pack).into_boxed_slice()),
+                s_pack.len() * 2,
+            ));
+            inserts.push((
+                format!("{base}.zeros"),
+                Arc::from(i32s_le_bytes(&z_buf).into_boxed_slice()),
+                z_buf.len() * 4,
+            ));
+        } else if crate::formats::w4a16::marlin_eligible(out, k) {
+            // ---- 全路径(CPU repack 回退;OWL_LOAD_CPU_REPACK=1)----
             // B 打包与 U4B8 同套(q 原值,无 −8;dequant 在 kU4 内核内做)
             let s_pack: Vec<u16>;
             let z_buf: Vec<i32>;
@@ -246,7 +333,19 @@ impl AwqSource {
                     s_pack = pack_marlin_s(&scales_f32, out, groups);
                     z_buf = pack_marlin_z(&vec![8u8; out * groups], out, groups);
                     packed = Vec::new();
-                    q_buf = Some(rtn_g32_sym_packed(&w_f32, out, k));
+                    let qb = rtn_g32_sym_packed(&w_f32, out, k);
+                    // 设备重排原始键供给:RTN nibbles → ct i32 布局
+                    // ([out, k/8],LSB-first 沿 k —— 与 weight_packed 同构)
+                    let mut packed_ct = vec![0i32; out * (k / 8)];
+                    for (idx, &nib) in qb.iter().enumerate() {
+                        packed_ct[idx / 8] |= (nib as i32) << (4 * (idx % 8));
+                    }
+                    inserts.push((
+                        format!("{base}.packed_raw_ct"),
+                        Arc::from(i32s_le_bytes(&packed_ct).into_boxed_slice()),
+                        packed_ct.len() * 4,
+                    ));
+                    q_buf = Some(qb);
                 }
             }
             let words = out * k / 8;
@@ -415,6 +514,14 @@ impl WeightSource for AwqSource {
             }
             return Some(out * (k / 32));
         }
+        if let Some(base) = key.strip_suffix(".packed_raw") {
+            // 设备重排键:原始 packed 元素数(out × k/8;恒供,与 eligible 无关)
+            let (out, k, _) = self.linear_form(base)?;
+            if !self.index.contains_key(&format!("{base}.weight_packed")) {
+                return None; // 仅 ct 形态有原始 packed(F16 兜底层无)
+            }
+            return Some(out * (k / 8));
+        }
         if let Some(base) = key.strip_suffix(".zeros") {
             let (out, k, _) = self.linear_form(base)?;
             if !crate::formats::w4a16::marlin_eligible(out, k) {
@@ -480,6 +587,13 @@ impl WeightSource for AwqSource {
                 Some(())
             }
             Resolved::View(e) => {
+                // 设备重排原始键:I32 packed → U32 want(4B 同宽原样直拷)
+                if e.dtype == safetensors::Dtype::I32 && dtype == Dtype::U32 {
+                    let s = e.start + offset_elems * 4;
+                    dst[..need].copy_from_slice(&self.maps[e.map_ix][s..s + need]);
+                    self.maps[e.map_ix].dontneed(s, need);
+                    return Some(());
+                }
                 if dtype != Dtype::F16 {
                     return None;
                 }

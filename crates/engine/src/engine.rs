@@ -89,7 +89,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let model = Arc::new(load_0_8b(dir, self.face).await?);
         let tokenizer = load_tokenizer(dir)?;
         let rope = Rope::new(262_144, 256, 64, 10_000_000.0)?;
-        let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1 };
+        let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1, device_repack: false };
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
         Ok(LoadedModel { model, tokenizer, rope, spec })
     }
@@ -105,7 +105,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let model = Arc::new(load_0_8b_w4a16(dir, self.face).await?);
         let tokenizer = load_tokenizer(tokenizer_dir)?;
         let rope = Rope::new(262_144, 256, 64, 10_000_000.0)?;
-        let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1 };
+        let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1, device_repack: false };
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
         Ok(LoadedModel { model, tokenizer, rope, spec })
     }
@@ -126,7 +126,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let model = Arc::new(load_27b_awq(dir, self.face).await?);
         let tokenizer = load_tokenizer(tokenizer_dir)?;
         let rope = Rope::new(262_144, 256, 64, 10_000_000.0)?;
-        let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1 };
+        let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1, device_repack: false };
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
         owl_metrics::with_metrics_store(|s| {
             let _ = s.timer_end("load.27b.total", file!(), line!());

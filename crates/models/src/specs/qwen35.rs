@@ -61,6 +61,7 @@ impl KeyConvention for Qwen35Convention {
                 if matches!(
                     s,
                     "qweight" | "scales" | "zeros" | "ws" | "marlin_ws" | "marlin_ctmp"
+                        | "packed_raw"
                 ) =>
             {
                 (b, Some(format!(".{s}")))
@@ -110,7 +111,7 @@ pub async fn load_0_8b<D: DeviceClient + 'static>(
     );
     let src = SafeTensorsSource::open_dir(dir)?;
     // F16 直转装载(F5;权重 bf16 检查点 → f16 字节,不再 f32 设备中转)
-    let ctx = crate::module::LoaderCtx { dtype: qwen3_5_0_8b().dtype, shard: 1 };
+    let ctx = crate::module::LoaderCtx { dtype: qwen3_5_0_8b().dtype, shard: 1, device_repack: false };
     crate::interpreters::eval_load(&model, face, &src, &ctx).await?;
     Ok(model)
 }
@@ -131,7 +132,7 @@ pub async fn load_0_8b_w4a16<D: DeviceClient + 'static>(
         crate::module::QuantPlan::W4A16,
     );
     let src = crate::formats::w4a16::W4A16Source::open_dir(dir)?;
-    let ctx = crate::module::LoaderCtx { dtype: crate::contract::Dtype::F16, shard: 1 };
+    let ctx = crate::module::LoaderCtx { dtype: crate::contract::Dtype::F16, shard: 1, device_repack: false };
     crate::interpreters::eval_load(&model, face, &src, &ctx).await?;
     Ok(model)
 }
@@ -157,7 +158,14 @@ pub async fn load_27b_awq<D: DeviceClient + 'static>(
         crate::module::QuantPlan::W4A16Awq,
     );
     let src = crate::formats::awq::AwqSource::open_dir(dir)?;
-    let ctx = crate::module::LoaderCtx { dtype: crate::contract::Dtype::F16, shard: 1 };
+    // 设备重排装载(量化大键 GPU repack;OWL_LOAD_CPU_REPACK=1 回退 CPU)
+    let device_repack = std::env::var_os("OWL_LOAD_CPU_REPACK").is_none();
+    src.set_device_repack(device_repack);
+    let ctx = crate::module::LoaderCtx {
+        dtype: crate::contract::Dtype::F16,
+        shard: 1,
+        device_repack,
+    };
     crate::interpreters::eval_load(&model, face, &src, &ctx).await?;
     Ok(model)
 }
@@ -527,7 +535,7 @@ mod tests {
         let model = Model::new(&qwen3_5_0_8b(), Qwen35Convention::new("model.language_model"), crate::module::QuantPlan::F16);
         let manifest = {
             let src = SafeTensorsSource::open_dir(&dir)?;
-            let ctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1 };
+            let ctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false };
             crate::interpreters::eval_load(&model, &mut gpu, &src, &ctx).await?
         };
         eprintln!("[chk] manifest {} 条", manifest.entries().len());
@@ -672,7 +680,7 @@ mod tests {
         let model = load_0_8b(&dir, &mut gpu).await.expect("load_0_8b(真权重)");
         let rp = Rope::new(262_144, HD, 64, 10_000_000.0).expect("rope");
         crate::interpreters::eval_load(&rp, &mut gpu, &rp.tables(),
-            &crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1 })
+            &crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false })
             .await.expect("rope 表(f16 正确姿势)");
 
         // 常驻缓冲 ×2 套(ref / prefill;KV 8 槽,GDN 状态格用 0)

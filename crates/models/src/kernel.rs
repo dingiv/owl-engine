@@ -159,6 +159,8 @@ pub static REGISTRY: &[Entry] = &[
     Entry { name: "owl_gdn_recurrence_varlen_gqa_f16", source: text::GDN_F32, args: "T,T,T,T,T,T,T,T,sz,sz,sz,sz,sz,f32,T", dtype: crate::contract::Dtype::F16 },
     // ---- owl 移植位(工单 N;NInfer sigmoid_gate_mul,attention 门融合)----
     Entry { name: "owl_sigmoid_gate_mul_f16", source: sources::owl::SIGMOID_GATE_MUL_F16, args: "T,T,sz,T", dtype: crate::contract::Dtype::F16 },
+    // ---- ct packed → marlin B 设备重排(2026-10-01 装载提速;AWQ 装载线)----
+    Entry { name: "owl_ct_repack_u32", source: sources::owl::CT_REPACK_U32, args: "T,sz,sz,T", dtype: crate::contract::Dtype::U32 },
     // ---- 文本主干(Qwen3.5 mini-demo;Kernel 节点路径,输出块末参)----
     Entry { name: "owl_embed_f32", source: text::EMBED_F32, args: "T,T,sz,T", dtype: crate::contract::Dtype::F32 },
     Entry {

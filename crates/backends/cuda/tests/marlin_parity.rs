@@ -410,3 +410,57 @@ async fn marlin_w4a16_awq_parity() {
     }
     client.sync().await.expect("sync");
 }
+
+// ============================================================================
+// ct packed → marlin B 设备重排对拍(2026-10-01 GPU repack 装载线)
+// ============================================================================
+
+/// GPU owl_ct_repack_u32 输出 vs CPU pack_marlin_b_fused 逐 u32 一致。
+/// 形状覆盖 grid 两维(rows/64 × cols/2);ct packed 伪随机。
+#[tokio::test]
+async fn ct_repack_parity() {
+    let mut client = assemble();
+    for (out_dim, k) in [(1024usize, 5120usize), (5120usize, 5120usize), (17408usize, 5120usize)] {
+        let rows = out_dim;
+        let cols = k / 8;
+        let packed: Vec<i32> = (0..rows * cols).map(|i| (i as i32).wrapping_mul(0x9E3779B1_u32 as i32) ^ 0x1234_5678).collect();
+        // CPU 参照(fused)
+        let fused = owl_kernels::marlin::repack::marlin_fused_indices(k, out_dim);
+        let mut b_ref: Vec<i32> = Vec::new();
+        owl_kernels::marlin::repack::pack_marlin_b_fused(&packed, &fused, rows * k / 8, &mut b_ref);
+        assert_eq!(b_ref.len(), (k / 16) * (rows * 2));
+
+        // GPU
+        let dp = client.htod(Dtype::U32, &Shape::from(vec![packed.len()]), &le_i32(&packed)).await.expect("htod packed");
+        let dout = client.alloc(Dtype::U32, b_ref.len()).await.expect("alloc out");
+        let msg = LaunchMsg {
+            kernel: owl_cuda::KernelSpec {
+                name: "owl_ct_repack_u32".into(),
+                source: owl_kernels::sources::owl::CT_REPACK_U32.into(),
+            },
+            args: vec![
+                Arg::Block { id: dp.id },
+                Arg::U64(rows as u64),
+                Arg::U64(cols as u64),
+                Arg::Block { id: dout.id },
+            ],
+            // grid = (out/64, (k/8)/2);block 32(契约见 .cu 头注)
+            grid: ((rows / 64) as u32, (cols / 2) as u32, 1),
+            block: (32, 1, 1),
+            shared_mem: 0,
+            out_elems: b_ref.len(),
+        };
+        client.launch(msg).await.expect("repack launch");
+        let mut buf = vec![0u8; b_ref.len() * 4];
+        client.dtoh(&dout, &mut buf).await.expect("dtoh");
+        client.sync().await.expect("sync");
+
+        let mut bad = 0usize;
+        for (i, w) in buf.chunks_exact(4).enumerate() {
+            let got = i32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+            if got != b_ref[i] { bad += 1; }
+        }
+        eprintln!("[repack] out={out_dim} k={k}: 坏字 {}/{}", bad, b_ref.len());
+        assert_eq!(bad, 0, "GPU repack 必须 vs CPU fused 逐位一致");
+    }
+}

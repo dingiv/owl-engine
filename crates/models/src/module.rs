@@ -511,6 +511,18 @@ pub enum Layout {
     /// 源为 [shape[1], shape[0]] 行主序,装载时 host 转置
     /// (Linear 惯例:权重 safetensors 原生 [out,in],装载 [in,out])
     Transposed,
+    /// 设备重排(2026-10-01 AWQ 装载提速):源供**原始 packed** 字节
+    /// (线性 raw_elems,U32),DMA 上卡后 launch kernel 就地重排到
+    /// want.shape(marlin 布局),原始块随即回收 —— CPU 重量排出热路径
+    /// (141.7→37.0s 的 mat.ct 33s → GPU ~0.5s)
+    DeviceRearrange {
+        /// registry 核名(owl_ct_repack_u32)
+        kernel: &'static str,
+        /// 原始 packed 行数(= out)
+        rows: usize,
+        /// 原始 packed u32 列数(= in/8)
+        cols: usize,
+    },
 }
 
 /// 空包回填口(执行器写入;使用者零感知)
@@ -633,11 +645,14 @@ pub struct LoaderCtx {
     pub dtype: Dtype,
     /// 并行度(shard 形状切分的词汇;1 = 单卡;TP 随多卡立项)
     pub shard: usize,
+    /// 设备重排装载(AWQ 线;true = 量化大键走 GPU repack,CPU 懒物化
+    /// 仅兜底小键;env OWL_LOAD_CPU_REPACK=1 回退)
+    pub device_repack: bool,
 }
 
 impl Default for LoaderCtx {
     fn default() -> Self {
-        Self { dtype: Dtype::F32, shard: 1 }
+        Self { dtype: Dtype::F32, shard: 1, device_repack: false }
     }
 }
 
@@ -738,6 +753,29 @@ impl Weight {
             dtype,
             shape: self.shape.clone(),
             layout: if self.transposed { Layout::Transposed } else { Layout::Direct },
+            sink: Sink(self.cell.clone()),
+        })
+    }
+
+    /// 设备重排布局(2026-10-01 AWQ 装载线):want 键/形状/dtype 自定
+    /// (键 = 原始 packed 源键;shape = 原始 packed 形状;dtype 钉 U32),
+    /// Layout = DeviceRearrange;sink = 本槽(最终交付重排后 marlin 块)。
+    /// 调用方须已 new_typed_u32(槽 dtype = U32)。
+    pub(crate) fn layout_as_device_rearrange(
+        &self,
+        key: impl Into<String>,
+        kernel: &'static str,
+        rows: usize,
+        cols: usize,
+        ctx: &LoaderCtx,
+    ) -> LoaderOps {
+        let dtype = self.dtype_override.unwrap_or(ctx.dtype);
+        self.dtype.set(dtype);
+        LoaderOps::want(Want {
+            key: key.into(),
+            dtype,
+            shape: vec![rows, cols],
+            layout: Layout::DeviceRearrange { kernel, rows, cols },
             sink: Sink(self.cell.clone()),
         })
     }

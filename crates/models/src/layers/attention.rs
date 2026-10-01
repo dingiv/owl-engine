@@ -717,7 +717,7 @@ mod f16_tests {
         let attn = Attention::new(hq, hkv, hd, hidden, 1e-6, QuantPlan::F16);
 
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1 };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false };
         crate::interpreters::eval_load(&attn, &mut gpu, &src, &lctx)
             .await
             .expect("attention f16 装载");
@@ -818,7 +818,7 @@ mod f16_tests {
         let attn = Attention::new(hq, hkv, hd, hidden, 1e-6, QuantPlan::F16);
 
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F32, shard: 1 };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F32, shard: 1, device_repack: false };
         crate::interpreters::eval_load(&attn, &mut gpu, &src, &lctx)
             .await
             .expect("attention f32 装载");

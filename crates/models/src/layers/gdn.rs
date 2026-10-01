@@ -1655,7 +1655,7 @@ mod f16_tests {
                 .collect();
 
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1 };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false };
         crate::interpreters::eval_load(&layer, &mut gpu, &src, &lctx)
             .await
             .expect("层 f16 装载");
@@ -1730,7 +1730,7 @@ mod f16_tests {
                 .collect();
 
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F32, shard: 1 };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F32, shard: 1, device_repack: false };
         crate::interpreters::eval_load(&layer, &mut gpu, &src, &lctx)
             .await
             .expect("层 f32 装载");
@@ -1800,7 +1800,7 @@ mod f16_tests {
                 .collect();
 
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1 };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false };
         crate::interpreters::eval_load(&layer, &mut gpu, &src, &lctx)
             .await
             .expect("层 f16 装载");
