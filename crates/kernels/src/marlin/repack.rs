@@ -225,26 +225,28 @@ pub fn pack_marlin_b_a8(q: &[u8], k: usize, n: usize) -> Vec<i32> {
 /// scales(f32 行主序 out×groups)→ marlin s((groups, n) fp16 位型,n = out)。
 /// port upstream Layer.pack 的 s 段(flatten → (-1,64)[:, scale_perm] → 还原)。
 pub fn pack_marlin_s(scales: &[f32], out: usize, groups: usize) -> Vec<u16> {
+    use rayon::prelude::*;
     assert_eq!(scales.len(), out * groups);
     let sp = marlin_scale_perm();
     assert_eq!(sp.len(), 64);
 
-    // (out, groups) → 转置 (groups, out) → flatten(groups×out,out 连续)
-    let mut flat = vec![0f32; groups * out];
-    for o in 0..out {
-        for gi in 0..groups {
-            flat[gi * out + o] = scales[o * groups + gi];
-        }
-    }
-    // (-1, 64)[:, scale_perm]
-    assert_eq!(flat.len() % 64, 0);
-    for chunk in flat.chunks_mut(64) {
-        let orig = chunk.to_vec();
-        for (dst, src) in sp.iter().enumerate() {
-            chunk[dst] = orig[*src];
-        }
-    }
-    flat.iter().map(|v| f16::from_f32(*v).to_bits()).collect()
+    // 转置 + 64-chunk perm + f16 打包单遍融合(rayon 按 out 行并行;
+    // 原三步串行在 27B gate/up(9.5M 元素)上 ~33ms/层,融合后 ~8ms)
+    let mut packed: Vec<u16> = vec![0u16; groups * out];
+    packed
+        .par_chunks_mut(out)
+        .enumerate()
+        .for_each(|(gi, dst_row)| {
+            for (o, cell) in dst_row.iter_mut().enumerate() {
+                // 目标 flat 下标 gi*out+o;64-chunk perm:chunk = idx/64,槽 = idx%64
+                let idx = gi * out + o;
+                let src_idx = (idx / 64) * 64 + sp[idx % 64];
+                // src_idx = src_group*out + src_o(转置回查)
+                let (sg, so) = (src_idx / out, src_idx % out);
+                *cell = f16::from_f32(scales[so * groups + sg]).to_bits();
+            }
+        });
+    packed
 }
 
 /// scales(f32 行主序 out×groups)→ marlin s((groups, n) f32,未转 fp16)。
@@ -583,6 +585,47 @@ pub fn unpack_nibbles_into(
         });
 }
 
+/// 融合索引(u32 = packed_word 下标 << 3 | nibble shift;按 (k,n) 形状缓存
+/// 一次构建):配合 [`pack_marlin_b_fused`],unpack(q_buf 89MB 中转)+gather
+/// 两步合一步 —— 直接从 ct packed i32 提 nibble 写 marlin B(2026-10-01,
+/// 27B 装载瓶颈:unpack 28ms + gather 16ms → fused ~18ms/层)。
+pub fn marlin_fused_indices(k: usize, n: usize) -> Vec<u32> {
+    let base = marlin_gather_indices(k, n); // 元素 = o*k + i
+    let kpr = k / 8;
+    base.into_iter()
+        .map(|src| {
+            let o = src as usize / k;
+            let i = src as usize % k;
+            let word = o * kpr + i / 8;
+            let nib = i % 8;
+            ((word as u32) << 3) | nib as u32
+        })
+        .collect()
+}
+
+/// 融合打包:直接从 ct packed i32 提 nibble 写 marlin B(与
+/// unpack_nibbles_into + pack_marlin_b_gather_into 两步输出逐位一致;
+/// fused = [`marlin_fused_indices`] 产物)。
+pub fn pack_marlin_b_fused(packed: &[i32], fused: &[u32], words: usize, buf: &mut Vec<i32>) {
+    use rayon::prelude::*;
+    buf.clear();
+    buf.resize(words, 0);
+    buf.par_chunks_mut(4096)
+        .enumerate()
+        .for_each(|(task, out)| {
+            for (wi, word) in out.iter_mut().enumerate() {
+                let w = task * 4096 + wi;
+                let mut v = 0u32;
+                for j in 0..8 {
+                    let f = fused[w * 8 + j] as usize;
+                    let nib = ((packed[f >> 3] as u32) >> ((f & 7) * 4)) & 0xF;
+                    v |= nib << (4 * j);
+                }
+                *word = v as i32;
+            }
+        });
+}
+
 /// gather 打包入复用缓冲(E3-ii 提速;同 pack_marlin_b_gather 语义)。
 pub fn pack_marlin_b_gather_into(
     q: &[u8],
@@ -605,4 +648,25 @@ pub fn pack_marlin_b_gather_into(
                 *word = v as i32;
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    /// pack_marlin_s(rayon 融合版)与 pack_marlin_s_f32(串行参照)逐位对拍
+    #[test]
+    fn pack_marlin_s_matches_serial_ref() {
+        use super::*;
+        for (out, groups) in [(256usize, 4usize), (5120, 160), (17408, 136), (12288, 40)] {
+            let scales: Vec<f32> = (0..out * groups)
+                .map(|i| ((i % 97) as f32) * 0.013 - 0.6)
+                .collect();
+            let fast = pack_marlin_s(&scales, out, groups);
+            let refr = pack_marlin_s_f32(&scales, out, groups);
+            assert_eq!(fast.len(), refr.len(), "out={out} groups={groups}");
+            for (i, (a, b)) in fast.iter().zip(refr.iter()).enumerate() {
+                let expect = half::f16::from_f32(*b).to_bits();
+                assert_eq!(*a, expect, "idx={i} out={out} groups={groups}");
+            }
+        }
+    }
 }

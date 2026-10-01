@@ -6,6 +6,9 @@ license.workspace = true
 description = "Orchestration layer: session slots + step loop + graph tri-state + memory governance"
 
 [dependencies]
+# 统一性能 metrics(直用 API:装载分相打点;宏零开销仅热路径)
+owl-metrics = { path = "../metrics" }
+owl-shared = { path = "../shared" }
 # 唯一设备标准(iface contract:线格式/回执分级/顺序语义)
 owl-iface = { path = "../backends/iface" }
 # 声明式模型层(interpreters::eval_ops = 计算解释器)

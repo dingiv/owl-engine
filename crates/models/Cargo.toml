@@ -7,6 +7,8 @@ description = "Declarative Tensor model layer: pure-functional forward over a la
 
 
 [dependencies]
+# 统一性能 metrics(直用 API:装载分相打点;宏零开销仅热路径)
+owl-metrics = { path = "../metrics" }
 # 契约权威:线格式 + DeviceClient 能力契约(2026-09-25 下沉;后端不依赖前端)
 owl-iface = { path = "../backends/iface" }
 # kernel 源码之家(include_str 纯源,不拖 CUDA 链接 —— cudarc 已 feature 化)

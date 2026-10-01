@@ -118,11 +118,22 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         tokenizer_dir: &Path,
     ) -> Result<LoadedModel> {
         let spec = qwen3_8_27b();
+        // metrics 装载分相(直用 API 恒开;装载一次性路径,release 有数据)
+        let _ = owl_metrics::init_metrics(owl_metrics::MetricsStore::new());
+        owl_metrics::with_metrics_store(|s| {
+            s.timer_begin("load.27b.total", file!(), line!());
+        });
         let model = Arc::new(load_27b_awq(dir, self.face).await?);
         let tokenizer = load_tokenizer(tokenizer_dir)?;
         let rope = Rope::new(262_144, 256, 64, 10_000_000.0)?;
         let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1 };
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
+        owl_metrics::with_metrics_store(|s| {
+            let _ = s.timer_end("load.27b.total", file!(), line!());
+        });
+        owl_metrics::query_metrics(
+            &owl_metrics::MetricsFilter::new().tag_prefix("load."),
+        );
         Ok(LoadedModel { model, tokenizer, rope, spec })
     }
 }
@@ -562,10 +573,16 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// (调度层铺开 §S0;对标 vLLM v1 schedule/execute 分离)。
     pub async fn pump(&mut self) -> Result<TurnEvent> {
         let prof = std::env::var_os("OWL_STEP_PROFILE").is_some();
-        let t_sched = prof.then(std::time::Instant::now);
+        // metrics 框架接线(2026-10-01 合并示范):schedule 分相计时入
+        // owl_shared 全局 store(debug 展开/release 零开销);prof 时查询
+        // 打印。其余 STEP_PROFILE 打点保留原样(gl-prof/srv-timing 工具链
+        // 依赖其输出格式,逐点收编挂账)。
+        owl_shared::timer_start!("engine.pump.schedule");
         let out = self.schedule()?;
+        owl_shared::timer_end!("engine.pump.schedule");
         if prof {
-            eprintln!("[step-prof] schedule={:?}", t_sched.unwrap().elapsed());
+            owl_shared::metrics::query_metrics(&owl_shared::metrics::MetricsFilter::new()
+                .tag_prefix("engine.pump."));
         }
         match out {
             SchedulerOutput::Idle => Ok(TurnEvent::Idle),

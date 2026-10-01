@@ -30,16 +30,20 @@ use crate::formats::mmap::{open_raw_index, Mmap, RawEntry};
 use crate::formats::w4a16::{bf16_par, i32s_le_bytes, i32s_par, u16s_le_bytes};
 use crate::module::WeightSource;
 use owl_kernels::marlin::repack::{
-    marlin_gather_indices, pack_marlin_b_gather_into, pack_marlin_s, pack_marlin_z,
-    unpack_nibbles_into, unpack_zp_ct,
+    marlin_fused_indices, pack_marlin_b_fused, pack_marlin_b_gather_into, pack_marlin_s,
+    pack_marlin_z, unpack_zp_ct,
 };
 use owl_kernels::marlin::v2_workspace_len;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-/// 懒物化缓存容量上限(与 w4a16 同值;见其文档)。
-const CACHE_CAP_BYTES: usize = 512 << 20;
+/// 懒物化缓存容量上限(27B 专用档):同 base 三键(qweight/scales/zeros)
+/// 被 LPT 分桶拉到不同装载桶的不同位置,存活窗口 = 整个装载期 —— cap 必须
+/// 容下全模型物化态(~14GB;RAM 108GB),否则 clear 全清把先建键清掉,
+/// 后到键 3.3× 重复构建(2026-10-01 实测:512MB cap → 1183 次构建,
+/// 16GB → 355 次)。clear 计数入 dbg.cache_clear 盯防。
+const CACHE_CAP_BYTES: usize = 16 << 30;
 
 /// 量化线性源形态(见 [`AwqSource::linear_form`])
 enum QuantForm<'a> {
@@ -66,10 +70,12 @@ pub struct AwqSource {
     index: HashMap<String, RawEntry>,
     /// 懒物化字节缓存(键 → 字节;容量清空驱逐)
     cache: Mutex<(HashMap<String, Arc<[u8]>>, usize)>,
-    /// gather 索引表(按 (k, n) 形状复用;除法分解只算一次)
-    idx_cache: Mutex<HashMap<(usize, usize), Arc<Vec<u32>>>>,
-    /// 构建串行锁(重排内部 rayon 已饱和全核;并发双构建纯浪费)
-    build_lock: Mutex<()>,
+    /// gather/fused 索引表(按 (k, out, fused?) 形状复用;除法分解只算一次)
+    idx_cache: Mutex<HashMap<(usize, usize, bool), Arc<Vec<u32>>>>,
+    /// 构建分片锁(16 片按 base hash;同 base 互斥、异 base 并行 ——
+    /// 全局单锁时 build 串行链 ≈ 装载墙钟主导,分片后 4 桶并发 build
+    /// 与 DMA 流水重叠)
+    build_locks: Vec<Mutex<()>>,
 }
 
 impl AwqSource {
@@ -88,7 +94,7 @@ impl AwqSource {
             index,
             cache: Mutex::new((HashMap::new(), 0)),
             idx_cache: Mutex::new(HashMap::new()),
-            build_lock: Mutex::new(()),
+            build_locks: (0..16).map(|_| Mutex::new(())).collect(),
         })
     }
 
@@ -172,20 +178,37 @@ impl AwqSource {
         k: usize,
         form: QuantForm<'_>,
     ) -> Result<(), ModelError> {
-        let _g = self.build_lock.lock().unwrap();
+        // 分片锁:同 base 互斥(双检防重复构建),异 base 并行
+        let shard = base.bytes().map(|b| b as usize).sum::<usize>() % self.build_locks.len();
+        let _g = self.build_locks[shard].lock().unwrap();
+        // 双检(锁内):并发首触(同层 qweight/scales/zeros 落不同装载桶)
+        // 时先到者已填缓存 —— 重复构建直接短路(cap 16GB 后 clear=0,本路径
+        // 仅护并发窗口)
+        {
+            let cache = self.cache.lock().unwrap();
+            let built = cache.0.contains_key(&format!("{base}.qweight"))
+                || cache.0.contains_key(&format!("{base}.weight"));
+            if built {
+                return Ok(());
+            }
+        }
         let t0 = std::time::Instant::now();
         let groups = k / 32;
         let mut inserts: Vec<(String, Arc<[u8]>, usize)> = Vec::new();
+        let mut form_ct = false;
         if crate::formats::w4a16::marlin_eligible(out, k) {
             // B 打包与 U4B8 同套(q 原值,无 −8;dequant 在 kU4 内核内做)
-            let mut q_buf: Vec<u8> = Vec::new();
             let s_pack: Vec<u16>;
             let z_buf: Vec<i32>;
+            // B 打包双路径:Ct = fused(packed 直提 nibble,消 89MB 中转);
+            // F16 兜底 = unpacked u8 → 旧 gather(元素索引域,与 fused 分缓存)
+            let (packed, q_buf): (Vec<i32>, Option<Vec<u8>>);
             match form {
                 QuantForm::Ct { pe, se, ze } => {
+                    form_ct = true;
                     // 源视图:i32 packed / bf16 scales / i32 zp(rayon,对齐安全)
                     let packed_bytes = &self.maps[pe.map_ix][pe.start..pe.start + pe.nbytes];
-                    let packed = i32s_par(packed_bytes);
+                    packed = i32s_par(packed_bytes);
                     let scale_bytes = &self.maps[se.map_ix][se.start..se.start + se.nbytes];
                     let scales_f32 = bf16_par(scale_bytes);
                     let zp_bytes = &self.maps[ze.map_ix][ze.start..ze.start + ze.nbytes];
@@ -194,10 +217,14 @@ impl AwqSource {
                     self.maps[pe.map_ix].dontneed(pe.start, pe.nbytes);
                     self.maps[se.map_ix].dontneed(se.start, se.nbytes);
                     self.maps[ze.map_ix].dontneed(ze.start, ze.nbytes);
-                    unpack_nibbles_into(&packed, out, k, &mut q_buf);
+                    let t_step = std::time::Instant::now();
                     s_pack = pack_marlin_s(&scales_f32, out, groups);
                     let zp_u8 = unpack_zp_ct(&zp_i32, out, groups);
                     z_buf = pack_marlin_z(&zp_u8, out, groups);
+                    owl_metrics::with_metrics_store(|s| {
+                        s.timer_record_tag("load.mat.sz", t_step.elapsed(), file!(), line!())
+                    });
+                    q_buf = None;
                 }
                 QuantForm::F16 { we } => {
                     // 裸权重(bf16/f16)→ f32 → RTN g32-sym(zp ≡ 8)
@@ -215,22 +242,42 @@ impl AwqSource {
                         _ => return Err(ModelError::Msg(format!("awq: {base} 裸权重 dtype 不支持"))),
                     };
                     self.maps[we.map_ix].dontneed(we.start, we.nbytes);
-                    q_buf = rtn_g32_sym_packed(&w_f32, out, k);
                     let scales_f32 = rtn_g32_sym_scales(&w_f32, out, k);
                     s_pack = pack_marlin_s(&scales_f32, out, groups);
                     z_buf = pack_marlin_z(&vec![8u8; out * groups], out, groups);
+                    packed = Vec::new();
+                    q_buf = Some(rtn_g32_sym_packed(&w_f32, out, k));
                 }
             }
-            let idx = self
-                .idx_cache
-                .lock()
-                .unwrap()
-                .entry((k, out))
-                .or_insert_with(|| Arc::new(marlin_gather_indices(k, out)))
-                .clone();
             let words = out * k / 8;
             let mut b_buf: Vec<i32> = Vec::new();
-            pack_marlin_b_gather_into(&q_buf, &idx, words, &mut b_buf);
+            let t_gather = std::time::Instant::now();
+            if form_ct {
+                // Ct:融合索引(packed_word<<3|nib)直提 —— unpack+gather 两步合一
+                let idx = self
+                    .idx_cache
+                    .lock()
+                    .unwrap()
+                    .entry((k, out, true))
+                    .or_insert_with(|| Arc::new(marlin_fused_indices(k, out)))
+                    .clone();
+                pack_marlin_b_fused(&packed, &idx, words, &mut b_buf);
+            } else {
+                let idx = self
+                    .idx_cache
+                    .lock()
+                    .unwrap()
+                    .entry((k, out, false))
+                    .or_insert_with(|| {
+                        Arc::new(owl_kernels::marlin::repack::marlin_gather_indices(k, out))
+                    })
+                    .clone();
+                let q = q_buf.as_ref().expect("F16 臂 q_buf 必在");
+                pack_marlin_b_gather_into(q, &idx, words, &mut b_buf);
+            }
+            owl_metrics::with_metrics_store(|s| {
+                s.timer_record_tag("load.mat.gather", t_gather.elapsed(), file!(), line!())
+            });
             inserts.push((
                 format!("{base}.qweight"),
                 Arc::from(i32s_le_bytes(&b_buf).into_boxed_slice()),
@@ -282,6 +329,11 @@ impl AwqSource {
             cache.1 += nb;
         }
         drop(cache);
+        // metrics:物化分相落账(Ct 重排 / F16 现场量化,直用 API 恒开)
+        let tag = if form_ct { "load.mat.ct" } else { "load.mat.f16" };
+        owl_metrics::with_metrics_store(|s| {
+            s.timer_record_tag(tag, t0.elapsed(), file!(), line!())
+        });
         eprintln!("[awq] 物化 {base} (out={out}, k={k}) @ {:?}", t0.elapsed());
         Ok(())
     }

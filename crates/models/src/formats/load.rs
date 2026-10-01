@@ -409,6 +409,9 @@ impl<'a> KeyProbe<'a> {
     /// 键边界交付(总耗时 = 各相之和)
     fn done(mut self) {
         self.rec.total = self.rec.phases.iter().map(|(_, d)| *d).sum();
+        owl_metrics::with_metrics_store(|s| {
+            s.timer_record_tag("load.key", self.rec.total, file!(), line!())
+        });
         if let Some(t) = self.tap {
             t.lock().unwrap().on_key(&self.rec);
         }
@@ -425,6 +428,11 @@ struct SpanGuard<'p, 'a> {
 impl Drop for SpanGuard<'_, '_> {
     fn drop(&mut self) {
         let d = self.t0.elapsed();
+        // metrics 直用 API(非宏;装载一次性路径,release 恒开 —— 分相
+        // 瓶颈数据面,tag = load.{phase};开销 ~µs/段,对 134s 量级无感)
+        owl_metrics::with_metrics_store(|s| {
+            s.timer_record_tag(&format!("load.{}", self.name), d, file!(), line!())
+        });
         match self.probe.rec.phases.iter_mut().find(|(n, _)| *n == self.name) {
             Some(e) => e.1 += d,
             None => self.probe.rec.phases.push((self.name, d)),
