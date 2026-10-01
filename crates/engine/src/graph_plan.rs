@@ -213,6 +213,19 @@ impl<D: DeviceClient> GraphPlan<D> {
     /// 未提到的输入槽保持上步内容(典型:常量槽)。
     pub async fn step(&mut self, inputs: &[(&str, &[f32])]) -> Result<()> {
         self.fill_slots(inputs).await?;
+        // 诊断:槽回读(OWL_DEBUG;取证每步标量是否真落烘焙槽 ——
+        // 复读病理立案的仪表盘)
+        if std::env::var_os("OWL_DEBUG").is_some() {
+            for (name, vals) in inputs {
+                if let Some(slot) = self.inputs.iter().find(|s| s.name == *name) {
+                    let mut buf = vec![0u8; vals.len() * 4];
+                    self.face.dtoh(&slot.block, &mut buf).await?;
+                    let back: Vec<f32> =
+                        buf.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+                    eprintln!("[slot-dump] {name} = {back:?}");
+                }
+            }
+        }
         match self.mode {
             Mode::Captured { graph } => self.face.graph_launch(graph).await?,
             Mode::Eager => self.eval_current().await?,

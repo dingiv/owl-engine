@@ -92,7 +92,13 @@ impl<D: DeviceClient> RunningEngine<D> {
         let session = session.into();
         let prompt = prompt.into();
         let prompt_ids = {
-            let wrapped = self.tok.chat_wrap(&prompt);
+            // 诊断开关(OWL_RAW_COMPLETION=1):裸续写,绕过 chat 模板 ——
+            // 模型健康度鉴别(模板态病 vs 权重病)的 A/B 臂
+            let wrapped = if std::env::var_os("OWL_RAW_COMPLETION").is_some() {
+                prompt.clone()
+            } else {
+                self.tok.chat_wrap(&prompt)
+            };
             self.tok.encode(&wrapped)
         };
         if prompt_ids.is_empty() {

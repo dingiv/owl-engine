@@ -107,10 +107,14 @@ impl Attention {
         // 数值质量的 A/B 对照(2026-09-27 文本退化排查)
         let force_naive = std::env::var_os("OWL_FORCE_NAIVE").is_some();
         if let Some(pol) = crate::module::kv_paged_policy(dt) {
-            if !force_naive && (self.hd == 128 || self.hd == 256) {
-                // paged 分派(K1):K0 写核 + v1 分页打分(vLLM classic 布局;
-                // 页/x/核名来自 kv_paged_policy,块表语义见 block_tables 头注)
-                return self.paged_decode_output(&q, &k, &v, &gate, kv, tokens, ctx, &pol);
+            // paged 分派(K1):K0 写核 + v1 分页打分(vLLM classic 布局;
+            // 页/x/核名来自 kv_paged_policy,块表语义见 block_tables 头注。
+            // wrapper BLOCK_SIZE 必须与池页配对 —— v1_name 按 (hd,page)
+            // 单源裁决,不可达组合回退 naive,杜绝 wrapper×池页错配)
+            if !force_naive {
+                if let Some(v1) = v1_name(self.hd, pol.page) {
+                    return self.paged_decode_output(&q, &k, &v, &gate, kv, tokens, ctx, &pol, v1);
+                }
             }
         }
         let attn_name = if dt == Dtype::F16 {
@@ -172,6 +176,7 @@ impl Attention {
         tokens: usize,
         ctx: &ForwardCtx,
         pol: &crate::module::KvPagedPolicy,
+        v1: &'static str,
     ) -> TensorOps {
         let dt = q.dtype;
         let page = pol.page as i32;
@@ -203,7 +208,7 @@ impl Attention {
         // 公式与事故记录见 paged_v1_smem / attention-kernel-port.md)
         let v1_smem = paged_v1_smem(self.hd, nb, pol.page);
         let y = TensorOps::of(kernel::kernel_with(
-            v1_name(self.hd),
+            v1,
             (self.hq as u32, 1, 1), // grid (num_heads, num_seqs, 1)
             (128, 1, 1),            // NUM_THREADS=128(两档同)
             v1_smem,
@@ -256,11 +261,16 @@ impl Attention {
         tokens: usize,
         ctx: &ForwardCtx,
         pol: &crate::module::KvPagedPolicy,
+        kv_slots: &TensorOps,
+        kv_lens: &TensorOps,
     ) -> TensorOps {
         let dt = q.dtype;
         let page = pol.page as i32;
         let x = pol.x;
-        // ① K0 批量写池(slots [T] = 物理槽表;恒等分页下 = pos)
+        // ① K0 批量写池(slots [T] = 物理槽表;恒等分页下 = pos)。
+        // 槽/长度表单源 = ctx(与下方 naive 循环同源):KvBuffers.slots/
+        // kv_lens 是 decode 步字段(尺寸 [B]),prefill 误读曾致 K0 grid=T
+        // 越界读 + seq_lens 垃圾 → 输出全零/ILLEGAL_ADDRESS(2026-10-01)
         let wr = TensorOps::of(kernel::kernel_with(
             "vllm_reshape_and_cache_f16",
             (tokens as u32, 1, 1),
@@ -271,7 +281,7 @@ impl Attention {
         .arg(v)
         .arg(&kv.k_cache)
         .arg(&kv.v_cache)
-        .arg(&kv.slots)
+        .arg(kv_slots)
         .arg_i32(self.hkv as i32 * self.hd as i32)
         .arg_i32(self.hkv as i32 * self.hd as i32)
         .arg_i32(self.hkv as i32)
@@ -280,7 +290,7 @@ impl Attention {
         .arg_i32(x as i32)
         .with_shape(dt, vec![1]); // 哑输出(契约 4)
         // ② chunked prefill 批核(bs16;seq_lens [1] = kv_lens 末元;narrow 树序亦成立)
-        let seq_lens = narrow_strided(&kv.kv_lens, 1, 1, tokens - 1, 1, vec![1]);
+        let seq_lens = narrow_strided(kv_lens, 1, 1, tokens - 1, 1, vec![1]);
         let qsl: Vec<u8> = [0.0f32, tokens as f32].iter().flat_map(|f| f.to_le_bytes()).collect();
         let scale = 1.0 / (self.hd as f32).sqrt();
         let nb = kv.block_tables.shape().last().cloned().unwrap_or(1);
@@ -366,12 +376,20 @@ impl Attention {
         let k = rope.forward_k(&k, pos, tokens, self.hkv);
 
         let dt = q.dtype;
-        if false && dt == Dtype::F16 {
+        if dt == Dtype::F16 {
             if let Some(pol) = crate::module::kv_paged_policy(dt) {
-                if self.hd == 128 || self.hd == 256 {
-                    // 诊断二分:prefill paged 临时关闭
+                // 页守卫(2026-10-01 配对律):prefill 核 bs32 特化(vendor
+                // 契约 BLOCK∈{32,64}),仅页 32 池可进;页 16 池回退 naive
+                //(bs16 prefill 实例化 = 越契约,挂账)。smem 公式的 page 项
+                // 与核 BLOCK 同源,见 paged_prefill_output
+                if pol.page == 32 && (self.hd == 128 || self.hd == 256) {
+                    // 诊断二分开关保留(OWL_FORCE_NAIVE_PREFILL=1 走逐 token
+                    // 对照;2026-10-01 撤销遗留的 if false 硬禁用 —— 它让
+                    // 全部 prefill 注意力落 naive 逐 token 路径)
                     if !Self::force_naive_prefill() {
-                        return self.paged_prefill_output(&q, &k, &v, &gate, kv, tokens, ctx, &pol);
+                        return self.paged_prefill_output(
+                            &q, &k, &v, &gate, kv, tokens, ctx, &pol, kv_slots, kv_lens,
+                        );
                     }
                 }
             }
@@ -690,6 +708,191 @@ mod f16_tests {
         }
         gpu.close().await.expect("关机");
     }
+
+    /// v1 paged decode 隔离对拍(2026-10-01 立案;历史盲区:
+    /// 既有 decode 对照测试 hd=4 不进 paged 分派,v1 真实形态零覆盖)——
+    /// paged 池 + 真块表;参考臂 = paged prefill(bs32,vendor 契约档)。
+    /// **配对律结案(2026-10-01,三轮反转终审)**:曾判“v1 多块数值缺陷”
+    /// 的行 16+ 偏差 = 测试/层配置自伤两连 ——
+    /// ① wrapper×池页错配:v1_name 曾指向 bs16 wrapper 而池页 32,
+    ///   逻辑块(16 token)地址换算对不上物理块(32 token),行 16+ 全错;
+    /// ② prefill 参考臂 KvBuffers 传 1 元素 decode 步表:K0 grid=T 逐线程
+    ///   读 slots[t] 越界、seq_lens narrow 越界 → 垃圾 seq_len →
+    ///   valid_block 全灭 → 输出全零;T=4096 档直接 ILLEGAL_ADDRESS
+    ///   (即“paged_prefill 本体有病/4k 崩”立案的真凶)。
+    /// 修复后:页 32 生产档(policy 单源)+ v1_name(hd,page) 配对裁决,
+    /// 全矩阵收紧为硬门(无 allow_red)。
+    #[tokio::test]
+    async fn gpu_attn_v1_decode_matches_prefill_paged() {
+        if !gpu_enabled() {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return;
+        }
+        // 变因矩阵:hd × GQA(hkv)× 跨块;页 32 = policy 生产档,
+        // wrapper bs32 由 v1_name 页配对律裁决
+        v1_isolation_case(128, 2, 1, 8, 2).await;
+        v1_isolation_case(256, 2, 1, 8, 2).await;
+        v1_isolation_case(256, 8, 4, 8, 2).await; // GQA 单块
+        v1_isolation_case(256, 2, 1, 64, 2).await; // 跨 2 块(行 32 = 页边界首槽)
+        v1_isolation_case(256, 8, 4, 64, 2).await; // engine 全参档(GQA + 跨页)
+        // 规模档:真模型规模 T=4096/nb=128 单发射(4k e2e 同规模;
+        // 曾以越界 slots 表复现 ILLEGAL_ADDRESS,修复后应为绿)
+        v1_isolation_case(256, 2, 1, 4096, 128).await;
+        gpu_client_close().await;
+    }
+
+    async fn v1_isolation_case(hd: usize, hq: usize, hkv: usize, t_len: usize, nb: usize) {
+        v1_isolation_case_inner(hd, hq, hkv, t_len, nb, false).await;
+    }
+
+    async fn v1_isolation_case_inner(hd: usize, hq: usize, hkv: usize, t_len: usize, nb: usize, allow_red: bool) {
+        let hidden = 6usize;
+        let (page, x) = (32usize, 8usize); // 二分:暂回页 32
+        let row_q = hq * hd;
+        let halfb = |v: &[f32]| -> Vec<u8> {
+            v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect()
+        };
+
+        let mut src = std::collections::HashMap::new();
+        src.insert("q_proj".to_string(), (0..hq * hd * 2 * hidden).map(|i| ((i as f32 + 3.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
+        src.insert("k_proj".to_string(), (0..hkv * hd * hidden).map(|i| ((i as f32 + 4.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
+        src.insert("v_proj".to_string(), (0..hkv * hd * hidden).map(|i| ((i as f32 + 5.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
+        src.insert("o_proj".to_string(), (0..hidden * hq * hd).map(|i| ((i as f32 + 6.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
+        src.insert("q_norm".to_string(), (0..hd).map(|i| ((i as f32 + 7.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
+        src.insert("k_norm".to_string(), (0..hd).map(|i| ((i as f32 + 8.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
+        let attn = Attention::new(hq, hkv, hd, hidden, 1e-6, QuantPlan::F16);
+
+        let mut gpu = gpu_client().await;
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false };
+        crate::interpreters::eval_load(&attn, &mut gpu, &src, &lctx)
+            .await
+            .expect("attention f16 装载");
+        let rp = crate::layers::rope::Rope::new(t_len * 2, hd, 32, 10_000.0).expect("rope new");
+        crate::interpreters::eval_load(&rp, &mut gpu, &rp.tables(), &lctx)
+            .await
+            .expect("rope 表物化");
+
+        // paged 池(K0 classic 布局):kc [nb, hkv, hd/x, page, x] / vc [nb, hkv, hd, page]
+        let kc_b = crate::interpreters::eval_ops(
+            TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd / x, page, x]).step(), &mut gpu)
+            .await.expect("kc");
+        let vc_b = crate::interpreters::eval_ops(
+            TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd, page]).step(), &mut gpu)
+            .await.expect("vc");
+        // ⚠️ 块表必须 = 物理块号恒等表 [0,1,..,nb-1] —— 曾写成全零并
+        // 误注"零即真":全零 = 所有逻辑块映射物理块 0,v1 读回块 0 旧数据
+        // (2026-10-01 复读案真凶:测试 bug,非核 bug)
+        let bt = TensorOps::from_host(
+            Dtype::F32,
+            vec![1, nb],
+            &f32b(&(0..nb).map(|i| i as f32).collect::<Vec<_>>()),
+        );
+        let paged_kv = |slots: Vec<f32>, lens: Vec<f32>| KvBuffers {
+            k_cache: TensorOps::of_block(kc_b.id, Dtype::F16, vec![nb, hkv, hd / x, page, x]),
+            v_cache: TensorOps::of_block(vc_b.id, Dtype::F16, vec![nb, hkv, hd, page]),
+            slots: TensorOps::from_host(Dtype::F32, vec![slots.len()], &f32b(&slots)),
+            kv_lens: TensorOps::from_host(Dtype::F32, vec![lens.len()], &f32b(&lens)),
+            block_tables: bt.clone(),
+        };
+
+        let xs_f32: Vec<f32> = (0..t_len * hidden)
+            .map(|i| half::f16::from_f32(((i as f32) * 0.37 - 1.0).sin()).to_f32())
+            .collect();
+
+        // 参考臂:一次 prefill 块(paged;slots [0..T] / lens [1..T])
+        let xs_all = TensorOps::from_host(Dtype::F16, vec![t_len, hidden], &halfb(&xs_f32));
+        let pos_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&(0..t_len).map(|t| t as f32).collect::<Vec<_>>()));
+        let slots_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&(0..t_len).map(|t| t as f32).collect::<Vec<_>>()));
+        let lens_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&(0..t_len).map(|t| t as f32 + 1.0).collect::<Vec<_>>()));
+        // ⚠️ 参考臂 KvBuffers 的 slots/kv_lens 传 [T] 全量表(与 ctx 表
+        // 同内容,双保险):KvBuffers.slots/kv_lens 是 decode 步字段(尺寸
+        // [B]),曾致 paged_prefill 越界(现已层侧单源修复:prefill 读 ctx
+        // 表,见 paged_prefill_output 头注);测试侧仍传全量表防回归
+        let kv_p = paged_kv(
+            (0..t_len).map(|t| t as f32).collect::<Vec<_>>(),
+            (0..t_len).map(|t| t as f32 + 1.0).collect::<Vec<_>>(),
+        );
+        let decl_all = attn.forward(
+            &xs_all,
+            &ForwardCtx::attn_prefill(t_len, &pos_all, &kv_p, &rp, &slots_all, &lens_all),
+        );
+        let out_prefill = crate::testkit::harvest_f16(&mut gpu, &decl_all).await;
+        let mut bad = false;
+
+        // 被测臂:T × v1 decode 步(同一持久池;slots=[t] / lens=[t+1];
+        // K0 重写同槽同值 = 幂等,池内容与 prefill 后一致)
+        for t in 0..t_len {
+            let x_t = TensorOps::from_host(Dtype::F16, vec![1, hidden], &halfb(&xs_f32[t * hidden..(t + 1) * hidden]));
+            let pos_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32]));
+            let kv_t = paged_kv(vec![t as f32], vec![t as f32 + 1.0]);
+            let decl = attn.forward(&x_t, &ForwardCtx::decode(1, &pos_t, &kv_t, &rp));
+            let got = crate::testkit::harvest_f16(&mut gpu, &decl).await;
+            let want = &out_prefill[t * hidden..(t + 1) * hidden];
+            let maxd = got
+                .iter()
+                .zip(want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            if t == 16 || t == 32 && std::env::var_os("OWL_DEBUG").is_some() {
+                eprintln!(
+                    "[v1-isolation][r{t}] hd{hd} hq{hq} hkv{hkv} t{t_len}: got={:?} want={:?}",
+                    &got[..6], &want[..6]
+                );
+            }
+            if maxd > 2e-2 {
+                eprintln!(
+                    "[v1-isolation][RED] hd{hd} hq{hq} hkv{hkv} t{t_len} 行{t} 偏差 {maxd:.4}\n  got = {:?}\n  want= {:?}\n  |got|={:?}",
+                    &got[..6], &want[..6],
+                    got.iter().fold(0f32, |a, &b| f32::max(a, b))
+                );
+                bad = true;
+            }
+        }
+        if bad && !allow_red {
+            panic!("[v1-isolation] hd{hd} hq{hq} hkv{hkv} t{t_len} nb{nb} RED");
+        }
+        // ── 池内容取证:host 直算 V[t] = W_v × x_t(V 路径纯线性,无 norm/rope);
+        // vc 布局 [nb, hkv, hd, page]:b=s/32, 头 0, 元素 d*page + s%32 ──
+        {
+            let mut vpool = vec![0u8; nb * hkv * hd * page * 2];
+            let face = &mut gpu;
+            face.dtoh(&vc_b, &mut vpool).await.expect("vc dtoh");
+            let vf = |i: usize| -> f32 {
+                half::f16::from_le_bytes([vpool[i * 2], vpool[i * 2 + 1]]).to_f32()
+            };
+            let wv = &src["v_proj"]; // flat [hkv*hd, hidden]
+            let mut worst = (0f32, 0usize);
+            for t in [0usize, 31, 32, 33, 63].into_iter().filter(|&t| t < t_len) {
+                let (b, off) = (t / page, t % page);
+                for d in 0..hd.min(8) {
+                    let mut acc = 0f32;
+                    for c in 0..hidden {
+                        let w = wv[(d) * hidden + c];
+                        let xv = half::f16::from_f32(xs_f32[t * hidden + c]).to_f32();
+                        acc += w * xv;
+                    }
+                    let got = vf(((b * hkv + 0) * hd + d) * page + off);
+                    let dd = (got - acc).abs();
+                    if dd > worst.0 {
+                        worst = (dd, t);
+                    }
+                    if t == 32 && d < 3 {
+                        eprintln!("[vc-probe] t32 d{d}: pool={got:.4} host={acc:.4}");
+                    }
+                }
+                if worst.0 > 0.0 && t == 63 {
+                    eprintln!("[vc-probe] 最坏偏差 {worst:.2?}(容差域 = f16 装载量化)");
+                }
+            }
+        }
+        eprintln!("[v1-isolation] hd{hd} hq{hq} hkv{hkv} t{t_len} nb{nb} 全绿");
+    }
+
+    async fn gpu_client_close() {
+        let mut gpu = gpu_client().await;
+        gpu.close().await.expect("关机");
+    }
+
 
     /// 批P4 验收:T=8 prefill 块 == T×decode 逐步(输出行 + KV 终态位型;
     /// 表/槽/kv_len 均走 [T] 表的正确姿势 —— F16 ctx 装表)
@@ -1025,12 +1228,19 @@ mod naive_attn_f16_tests {
     }
 }
 
-/// paged 核入口名(nvrtc 按名寻址;registry 名为 'static 字面量)
-fn v1_name(hd: usize) -> &'static str {
-    match hd {
-        128 => "vllm_paged_attention_v1_f16_hd128bs32",
-        256 => "vllm_paged_attention_v1_f16_hd256bs32",
-        _ => unreachable!("paged 分派仅在 hd∈{{128,256}} 触发"),
+/// v1 核入口名(nvrtc 按名寻址;registry 名为 'static 字面量)。
+/// 页配对律(2026-10-01 结案):wrapper 的 BLOCK_SIZE 模板实参必须与池页
+/// (kv_paged_policy 单源)一致 —— 错配 = 逻辑块地址换算全错(bs16 核读
+/// 页 32 池:行 16+ 系统性偏差,曾误判“v1 多块数值缺陷”立案三轮)。
+/// 页 32 = 生产档(prefill bs32 vendor 契约交集,TG=1);页 16 仅 decode
+/// 配对成立(prefill 分派另有页守卫,bs16 prefill 越契约挂账)。
+fn v1_name(hd: usize, page: usize) -> Option<&'static str> {
+    match (hd, page) {
+        (128, 32) => Some("vllm_paged_attention_v1_f16_hd128bs32"),
+        (256, 32) => Some("vllm_paged_attention_v1_f16_hd256bs32"),
+        (128, 16) => Some("vllm_paged_attention_v1_f16_hd128"),
+        (256, 16) => Some("vllm_paged_attention_v1_f16_hd256"),
+        _ => None,
     }
 }
 

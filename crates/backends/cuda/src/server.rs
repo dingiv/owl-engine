@@ -785,6 +785,40 @@ impl GpuServer {
 
 
     fn handle_launch(&mut self, msg: LaunchMsg, ack: Ack<Result<Bytes, ModelError>>) {
+        // GPU 逐核归因探针(OWL_GPU_PROF=1;2026-10-01 50tok/s 分账立案):
+        // 每发射后同步 COMPUTE 流 → 本核隔离运行,host 计时 ≈ 核 GPU 纯时
+        // (含 ~10µs sync 往返底噪);动态 tag `gpu.{核名}` 入 owl-shared
+        // metrics(同进程线程,store 共享),测试侧 query(prefix "gpu.")
+        // 出热点分账。捕获期跳过 —— 图回放是整图单发射,逐核归因由
+        // OWL_NO_GRAPH eager 窗提供;与 OWL_LAUNCH_TIME(host 提交 µs)
+        // 互补:本探针答「GPU 时花在哪」,彼答「host 提交多贵」。
+        let gpu_prof = std::env::var_os("OWL_GPU_PROF").is_some();
+        if gpu_prof && !self.ctx().capture_stream() {
+            let name = msg.kernel.name.clone();
+            let t0 = std::time::Instant::now();
+            let r = self.handle_launch_inner(msg, ack);
+            if let Ok(stream) = self.ctx().stream(STREAM_COMPUTE) {
+                let _ = stream.synchronize(); // 归因同步(错误由 sticky 面另报)
+            }
+            let dt = t0.elapsed();
+            owl_shared::metrics::with_metrics_store(|s| {
+                s.timer_record_tag(&format!("gpu.{name}"), dt, file!(), 0);
+            });
+            return r;
+        }
+        // 逐发射计时(OWL_LAUNCH_TIME=1;捕获期 warmup = 全模型 eager 一遍,
+        // 一次跑完全谱;capture 回放期自动关闭 —— 回放是整图一发射)
+        if std::env::var_os("OWL_LAUNCH_TIME").is_some() && !self.ctx().capture_stream() {
+            let t = std::time::Instant::now();
+            let name = msg.kernel.name.clone();
+            let r = self.handle_launch_inner(msg, ack);
+            eprintln!("[launch-time] {:?} {}", t.elapsed(), name);
+            return r;
+        }
+        self.handle_launch_inner(msg, ack)
+    }
+
+    fn handle_launch_inner(&mut self, msg: LaunchMsg, ack: Ack<Result<Bytes, ModelError>>) {
         // foreign-kernel 通道(2026-09-26 合并:cuBLAS 不再另立命令,
         // 外部算子 = 虚拟核名走同一 Launch;谓词与槽序归 owl-kernels::cublas)
         if owl_kernels::is_foreign_op(&msg.kernel.name) {

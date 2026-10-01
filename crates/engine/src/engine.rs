@@ -172,7 +172,10 @@ impl<D: DeviceClient + 'static> Engine<D> {
                     OutputSlot { name: "logits", shape: vec![1, vocab], dtype: loaded.spec.dtype },
                     OutputSlot { name: "token", shape: vec![1], dtype: Dtype::F32 },
                 ],
-                capture: true,
+                // 逃生开关(C1 禁 graph 裁决配套):OWL_NO_GRAPH=1 → eager
+                // 直发(decode 逐步 eval,无捕获回放)—— 图内/图外行为
+                // A/B 的对照臂(2026-10-01 paged decode 质量案)
+                capture: std::env::var_os("OWL_NO_GRAPH").is_none(),
             },
             forward,
         )

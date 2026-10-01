@@ -142,6 +142,8 @@ pub static REGISTRY: &[Entry] = &[
     //      grid 契约显式:v1 (H, seq, 1) / v2 (H, seq, ceil(max_ctx/512)) /
     //      reduce (H, seq, 1);block (128,1,1);shared 契约见 .cu 头注)----
     Entry { name: "vllm_paged_attention_v1_f16_hd128bs32", source: sources::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "vllm_paged_attention_v1_f16_hd128", source: sources::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "vllm_paged_attention_v1_f16_hd256", source: sources::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "vllm_paged_attention_v1_f16_hd256bs32", source: sources::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "vllm_paged_attention_v2_f16_hd128bs32", source: sources::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "vllm_paged_attention_v2_f16_hd256bs32", source: sources::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },

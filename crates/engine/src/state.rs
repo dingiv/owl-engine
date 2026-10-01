@@ -43,9 +43,9 @@ struct GdnSnapSlot {
     bufs: Vec<BlockN>,
 }
 
-struct KvBlocks {
-    k_cache: BlockN,
-    v_cache: BlockN,
+pub(crate) struct KvBlocks {
+    pub(crate) k_cache: BlockN,
+    pub(crate) v_cache: BlockN,
 }
 
 struct GdnBlocks {
@@ -80,7 +80,7 @@ pub(crate) struct GdnLeaf {
 /// 治理对象(charter A1 味):S2 图档与执行器只经方法面触碰状态块,
 /// 不直摸块句柄。
 pub(crate) struct StatePool {
-    kvs: Vec<KvBlocks>,
+    pub(crate) kvs: Vec<KvBlocks>,
     gdns: Vec<GdnBlocks>,
     snaps: Vec<GdnSnapSlot>,
     snap_tick: u64,

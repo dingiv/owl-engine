@@ -43,6 +43,7 @@ pub(crate) mod engine;
 pub(crate) mod exec;
 pub(crate) mod loader;
 pub(crate) mod running;
+pub(crate) mod sampler;
 pub(crate) mod scheduler;
 pub(crate) mod state;
 #[cfg(test)]

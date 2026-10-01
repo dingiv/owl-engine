@@ -1128,7 +1128,6 @@ __device__ void paged_attention_kernel_f16(
         // Mask if token is causal future (token_idx >= seq_len) OR 
         // token is outside sliding window history (token_idx < global_start_token_idx)
         const bool mask = token_idx >= seq_len || token_idx < global_start_token_idx;
-        
         logits[token_idx - start_token_idx] = mask ? 0.f : qk;
         // Update the max value.
         qk_max = mask ? qk_max : fmaxf(qk_max, qk);

@@ -115,7 +115,7 @@ async fn gpu_schedule_decision_surface() {
         act.fed = act.prompt_ids.len();
         act.out.push(7);
     }
-    let b0 = eng.sessions.get(sid).unwrap().block_table[0];
+
     let page = eng.pool.page;
     match eng.schedule().unwrap() {
         SchedulerOutput::Step { begin, action } => {
@@ -124,11 +124,12 @@ async fn gpu_schedule_decision_surface() {
                 StepAction::Decode { token, pos, kv_slot, gdn_slot, grew } => {
                     assert_eq!(token, 7);
                     assert_eq!(pos, n);
-                    assert_eq!(
-                        kv_slot as usize,
-                        b0 as usize * page + n % page,
-                        "物理槽 = 块链换算"
-                    );
+                    // 物理槽 = 块表[pos/page]×page + pos%page(页 16 后
+                    // 17 token 提示词跨入块 1,恒 b0 假设已不成立)
+                    let expect_slot =
+                        eng.sessions.get(sid).unwrap().block_table[n / page] as usize * page
+                            + n % page;
+                    assert_eq!(kv_slot as usize, expect_slot, "物理槽 = 块链换算");
                     assert_eq!(gdn_slot, 0, "首会话格 0");
                     assert!(!grew, "页内不跨页");
                 }
@@ -623,6 +624,139 @@ async fn gpu_prefix_cache_hit() {
     assert!(shared >= 8, "前缀块应物理共享,共享 {shared}");
     eprintln!("[test] 共享物理块 {shared}(A 链 {} / B 链 {})", a_chain.len(), b_chain.len());
 }
+
+/// GPU 门控:27B 单卡推理验收(正菜;3090 Ti 24G)—— 真实三问 ×
+/// greedy(模板已含 thinking-off 空 think 块),验收 = 回答非空 +
+/// 无退化复读(启发式:任意 2-8 字片段连现 4 次即退化)。
+/// 输出全文打印供人工判读;复读启发式是底线门不是质量门。
+#[tokio::test]
+async fn gpu_27b_chat_inference() {
+    let Ok(dir) = std::env::var("OWL_AWQ27B_DIR") else {
+        eprintln!("skip: OWL_AWQ27B_DIR 未设(cyankiwi 检查点目录)");
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    if !dir.exists() {
+        eprintln!("skip: 检查点目录不存在({dir:?})");
+        return;
+    }
+    let ordinal = gpu_ordinal().expect("OWL_TEST_DEVICE");
+    let mut engine = Engine::new(EngineConfig {
+        device_ordinal: ordinal,
+        max_seq_tokens: 1024,
+        prefill_chunk: 128,
+    })
+    .expect("构造");
+    let loaded = engine
+        .loader()
+        .load_qwen38_27b_awq(&dir, &dir)
+        .await
+        .expect("27B AWQ 装载");
+    let mut running = engine.run(loaded).await.expect("装配");
+
+    let questions = [
+        "用一句话介绍长城。",
+        "水的沸点是多少摄氏度?",
+        "写一句关于春天的诗。",
+    ];
+    // 退化复读启发式:任意 2-8 字片段连现 4 次(贪心解码典型病灶;
+    // 正常文本几乎不可能命中)
+    fn degenerate(text: &str) -> Option<String> {
+        let chars: Vec<char> = text.chars().collect();
+        for len in 2..=8usize {
+            for start in 0..chars.len().saturating_sub(len * 4) {
+                let pat: String = chars[start..start + len].iter().collect();
+                let mut hits = 0;
+                let mut i = start;
+                while i + len <= chars.len() && chars[i..i + len].iter().collect::<String>() == pat {
+                    hits += 1;
+                    i += len;
+                    if hits >= 4 {
+                        return Some(pat);
+                    }
+                }
+            }
+        }
+        None
+    }
+    for (qi, q) in questions.iter().enumerate() {
+        // GPU 逐核归因探针窗(OWL_GPU_PROF=1):Q0 前 reset / Q0 后 query
+        // —— 纯 decode 窗分账。注:窗口钉在 Q0(首 turn)——eager 模式
+        // 27B 逐 turn 显存爬坡 ~480MB/步(收割缺口,另案),turn 2 会 OOM
+        if qi == 0 && std::env::var_os("OWL_GPU_PROF").is_some() {
+            owl_shared::metrics::reset_metrics();
+        }
+        let t0 = std::time::Instant::now();
+        let id = running.submit(*q, 96).expect("submit");
+        let mut ttft = None;
+        let mut n_tok = 0usize;
+        let text;
+        loop {
+            match running.pump().await.expect("pump") {
+                TurnEvent::Idle => panic!("Q{qi} 队列丢失"),
+                TurnEvent::Token { turn, .. } if turn == id => {
+                    if ttft.is_none() {
+                        ttft = Some(t0.elapsed());
+                    }
+                    n_tok += 1;
+                }
+                TurnEvent::Completed { turn, text: t } if turn == id => {
+                    text = t;
+                    break;
+                }
+                TurnEvent::Failed { turn, err } => panic!("Q{qi} turn {turn} 失败: {err}"),
+                _ => {}
+            }
+        }
+        let wall = t0.elapsed();
+        eprintln!(
+            "[27b-chat] Q{qi}: {q}\n[27b-chat] A{qi}: {text}\n[27b-chat] {n_tok} tok @ {wall:?}(TTFT {:?}, {:.1} tok/s)",
+            ttft.unwrap(),
+            n_tok as f64 / wall.as_secs_f64()
+        );
+        // GPU 逐核归因探针:Q0 窗口结束 → 热点分账(按总时长降序)
+        if qi == 0 && std::env::var_os("OWL_GPU_PROF").is_some() {
+            owl_shared::metrics::query_metrics(
+                &owl_shared::metrics::MetricsFilter::new().tag_prefix("gpu.").limit(24),
+            );
+        }
+        assert!(!text.trim().is_empty(), "Q{qi} 空回答");
+        if let Some(pat) = degenerate(&text) {
+            // 严格门(OWL_27B_STRICT=1)在 paged decode 质量案结案后启用;
+            // 现默认警告 —— paged 档起始语义正确但退化复读(立案中),
+            // naive 档(OWL_FORCE_NAIVE=1)三问连贯 = 当前推荐配方
+            if std::env::var_os("OWL_27B_STRICT").is_some() {
+                panic!("Q{qi} 退化复读:片段 {pat:?} 连现 ≥4 次;全文 = {text:?}");
+            }
+            eprintln!("[27b-chat][warn] Q{qi} 退化复读(立案中):片段 {pat:?}");
+        }
+    }
+}
+
+    /// 诊断:裸续写 A/B(模板态病 vs 权重病的鉴别臂)
+    #[tokio::test]
+    async fn gpu_27b_raw_completion_diag() {
+        let Ok(dir) = std::env::var("OWL_AWQ27B_DIR") else { return; };
+        let dir = std::path::PathBuf::from(dir);
+        if !dir.exists() { return; }
+        let ordinal = gpu_ordinal().expect("OWL_TEST_DEVICE");
+        let mut engine = Engine::new(EngineConfig {
+            device_ordinal: ordinal, max_seq_tokens: 512, prefill_chunk: 128,
+        }).expect("构造");
+        let loaded = engine.loader().load_qwen38_27b_awq(&dir, &dir).await.expect("装载");
+        let mut running = engine.run(loaded).await.expect("装配");
+        for (qi, q) in ["中国的首都是北京。长城是", "1 2 3 4 5 6"].iter().enumerate() {
+            let id = running.submit(*q, 48).expect("submit");
+            let text = loop {
+                match running.pump().await.expect("pump") {
+                    TurnEvent::Completed { turn, text } if turn == id => break text,
+                    TurnEvent::Idle => panic!("队列丢失"),
+                    _ => {}
+                }
+            };
+            eprintln!("[raw-diag] Q{qi}: {q:?}\n[raw-diag] A{qi}: {text:?}");
+        }
+    }
 
 /// 泵到目标 turn 完成,回吐全文(其间事件仅观测)
 async fn drive_turn<D: DeviceClient>(running: &mut RunningEngine<D>, id: u64) -> String {

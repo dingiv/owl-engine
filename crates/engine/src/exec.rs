@@ -94,6 +94,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if prof {
             eprintln!("[step-prof] pos={pos} fill+launch={:?}", t0.unwrap().elapsed());
         }
+        if prof {
+            let total = t0.unwrap().elapsed();
+            eprintln!("[step-prof] pos={pos} step-total={total:?}");
+        }
         self.active.as_mut().expect("活跃").fed += 1;
         // E2c:decode 跨页边界 → 快照拍摄(同流保序,先拍再采样)
         {
@@ -103,10 +107,89 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
         }
         // E3 设备采样:4B token 回读(旧 = 600KB logits dtoh + host argmax)。
-        // OWL_HOST_ARGMAX=1 = 对照开关(host argmax 校准设备采样数值)
+        // OWL_HOST_ARGMAX=1 = 对照开关(host argmax 校准设备采样数值)。
+        // S3-b 采样(v1 host 侧,sampler.rs):默认开 —— greedy 在
+        // instruct 模型上嚌进复读吸引子(2026-10-01 27B 实测);cost =
+        // 每步 logits dtoh(~1MB);device 采样核留 E4 靶面。
         let t_dtoh = prof.then(std::time::Instant::now);
-        let nt = if std::env::var_os("OWL_HOST_ARGMAX").is_some() {
-            let logits = self.session.read_output_f32("logits").await?;
+        let nt = if crate::sampler::enabled() {
+            let mut logits = self.session.read_output_f32("logits").await?;
+            // 诊断:分布形状(绝对尺度 / top1-top2 gap / 候选词面)——
+            // 复读病理定位的仪表盘(OWL_DEBUG 门控,前 16 步)
+            let (turn_id, step) = {
+                let act = self.active.as_ref().expect("活跃");
+                (act.id, act.out.len() as u64)
+            };
+            // 诊断:KV 池回读(取证图内 K0 写是否落盘)—— 槽 2 = prompt
+            // (eager prefill 写);槽 pos = 本步 K0(图内写)。layout
+            // [nb,hkv,hd/x,page,x]:b=0 头 0 组 0 → 元素 s*8。
+            if std::env::var_os("OWL_DEBUG").is_some() && step < 16 {
+                let kv0 = &self.pool.kvs[0].k_cache;
+                let mut whole = vec![0u8; kv0.1 * 2];
+                let face = self.session.face_mut();
+                face.dtoh(&kv0.0, &mut whole).await?;
+                let probe = |slot: usize| -> usize {
+                    whole[slot * 8 * 2..slot * 8 * 2 + 16]
+                        .chunks_exact(2)
+                        .filter(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32() != 0.0)
+                        .count()
+                };
+                let pos_now = pos;
+                eprintln!(
+                    "[kv-dump] pos={pos_now} 槽2非零={}/8 槽{pos_now}非零={}/8 槽{}非零={}/8",
+                    probe(2),
+                    probe(pos_now),
+                    pos_now.saturating_sub(1),
+                    probe(pos_now.saturating_sub(1))
+                );
+            }
+            if std::env::var_os("OWL_DEBUG").is_some() && step < 16 {
+                let mut top: Vec<(f32, u32)> = logits
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &v)| v.is_finite())
+                    .map(|(i, &v)| (v, i as u32))
+                    .collect();
+                top.select_nth_unstable_by(7, |a, b| b.0.partial_cmp(&a.0).unwrap());
+                top.truncate(8);
+                top.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                let pretty: Vec<String> = top
+                    .iter()
+                    .map(|(v, i)| {
+                        format!("{:.2}:'{}'", v, self.tok.decode(&[*i]).replace('\n', "\\n"))
+                    })
+                    .collect();
+                eprintln!("[logits-dump] t{turn_id} s{step}: {}", pretty.join(" | "));
+            }
+            // RNG seed = turn id ⊕ 步数(同 turn 重放确定性,跨 turn 独立)
+            let mut rng = turn_id.wrapping_mul(0x9E3779B97F4A7C15)
+                ^ step.wrapping_mul(0xBF58476D1CE4E5B9);
+            // 惩罚集 = prompt 尾(64)+ 已生成(反循环;llama.cpp 同语义)
+            let history: Vec<u32> = {
+                let act = self.active.as_ref().expect("活跃");
+                let tail = act.prompt_ids.len().saturating_sub(64);
+                act.prompt_ids[tail..]
+                    .iter()
+                    .chain(act.out.iter())
+                    .copied()
+                    .collect()
+            };
+            let t_sample = prof.then(std::time::Instant::now);
+            let nt = crate::sampler::sample(
+                &mut logits,
+                &crate::sampler::SamplerCfg::from_env(),
+                &mut rng,
+                &history,
+            );
+            if prof {
+                eprintln!("[step-prof] pos={pos} host-sample={:?}", t_sample.unwrap().elapsed());
+            }
+            if std::env::var_os("OWL_DEBUG").is_some() {
+                eprintln!("[sample-dump] t{turn_id} s{step}: sampled={nt} hist={} pen={}", history.len(), std::env::var("OWL_REP_PENALTY").unwrap_or_else(|_| "d".into()));
+            }
+            nt
+        } else if std::env::var_os("OWL_HOST_ARGMAX").is_some() {
+            let mut logits = self.session.read_output_f32("logits").await?;
             logits.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |a, (i, &v)| {
                 if v > a.1 { (i, v) } else { a }
             })

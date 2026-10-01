@@ -251,7 +251,12 @@ pub struct KvPagedPolicy {
 /// flatten + registry 随 KV 量化立项;bf16 同理)
 pub fn kv_paged_policy(dt: Dtype) -> Option<KvPagedPolicy> {
     match dt {
-        // f16:16B / 2B = 8 向量宽
+        // f16:16B / 2B = 8 向量宽。页 32 = 生产档定谳(2026-10-01 配对律
+        // 结案):页 = decode v1 wrapper × prefill 核的交集 —— prefill 核
+        // bs32 特化(vendor 契约 BLOCK∈{32,64}),decode 取 bs32 wrapper
+        // (TG=1;bs16/TG=2 曾误判“跨块错值”,实为 wrapper×池页错配,
+        // 三轮立案,详见 attention.rs v1_name 注)。页 16 需 bs16 prefill
+        // 实例化(越契约)方可启,届时只改此处。
         Dtype::F16 => Some(KvPagedPolicy { page: 32, x: 8 }),
         _ => None,
     }
