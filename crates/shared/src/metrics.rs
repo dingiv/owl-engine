@@ -516,7 +516,7 @@ fn fmt_dur(d: Duration) -> String {
 macro_rules! timer_start {
     ($tag:expr) => {
         #[cfg(debug_assertions)]
-        $crate::__timer_start($tag, file!(), line!(), column!());
+        $crate::metrics::__timer_start($tag, file!(), line!(), column!());
     };
 }
 
@@ -525,7 +525,7 @@ macro_rules! timer_start {
 macro_rules! timer_end {
     ($tag:expr) => {
         #[cfg(debug_assertions)]
-        $crate::__timer_end($tag, file!(), line!(), column!());
+        $crate::metrics::__timer_end($tag, file!(), line!(), column!());
     };
 }
 
@@ -534,10 +534,10 @@ macro_rules! timer_end {
 macro_rules! timer_scope {
     ($tag:expr, $body:expr) => {{
         #[cfg(debug_assertions)]
-        $crate::__timer_start($tag, file!(), line!(), column!());
+        $crate::metrics::__timer_start($tag, file!(), line!(), column!());
         let __owl_m_val = $body;
         #[cfg(debug_assertions)]
-        $crate::__timer_end($tag, file!(), line!(), column!());
+        $crate::metrics::__timer_end($tag, file!(), line!(), column!());
         __owl_m_val
     }};
 }
@@ -547,7 +547,7 @@ macro_rules! timer_scope {
 macro_rules! counter_inc {
     ($tag:expr) => {
         #[cfg(debug_assertions)]
-        $crate::__counter_add($tag, 1, file!(), line!());
+        $crate::metrics::__counter_add($tag, 1, file!(), line!());
     };
 }
 
@@ -556,7 +556,7 @@ macro_rules! counter_inc {
 macro_rules! counter_add {
     ($tag:expr, $n:expr) => {
         #[cfg(debug_assertions)]
-        $crate::__counter_add($tag, $n, file!(), line!());
+        $crate::metrics::__counter_add($tag, $n, file!(), line!());
     };
 }
 
@@ -565,7 +565,7 @@ macro_rules! counter_add {
 macro_rules! event {
     ($tag:expr) => {
         #[cfg(debug_assertions)]
-        $crate::__counter_add($tag, 1, file!(), line!());
+        $crate::metrics::__counter_add($tag, 1, file!(), line!());
     };
 }
 
@@ -574,7 +574,7 @@ macro_rules! event {
 macro_rules! timer_record {
     ($tag:expr, $dur:expr) => {
         #[cfg(debug_assertions)]
-        $crate::__timer_record($tag, $dur, file!(), line!());
+        $crate::metrics::__timer_record($tag, $dur, file!(), line!());
     };
 }
 
@@ -644,9 +644,14 @@ mod tests {
         let r = &reps[0];
         assert!(r.count >= 1, "至少一条样本");
         assert!(dur_ms(r.min) >= 1.5, "时长应覆盖 sleep: {:?}", r.min);
-        // 位置 = 本测试文件(宏展开点);metrics 拆独立 crate 后测试
-        // 驻 lib.rs(断言随搬家订正,原 "metrics.rs" 系 shared 时代文件名)
-        assert!(r.last_file.ends_with("lib.rs"), "file = {}", r.last_file);
+        // 位置 = 本测试文件(宏展开点);断言对文件名鲁棒 —— 本模块
+        // 历经 shared/metrics.rs → owl-metrics/lib.rs → shared/metrics.rs
+        // 三次搬家(2026-10-01 定档独立模块),只锁尾部文件名不锁全路径
+        assert!(
+            r.last_file.ends_with("metrics.rs") || r.last_file.ends_with("lib.rs"),
+            "file = {}",
+            r.last_file
+        );
         assert!(r.last_line > 0);
         assert_eq!(r.orphan_ends, 0);
     }

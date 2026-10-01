@@ -22,7 +22,7 @@ use std::sync::Mutex;
 
 // 转换热路径(独立微 crate;debug 档 profile 覆盖 opt-level=3,
 // 见 crate 根注释与 workspace Cargo.toml)
-use owl_f16c::{bf16_bytes_to_f16_bytes, f32_slice_to_f16_bytes};
+use crate::f16c::{bf16_bytes_to_f16_bytes, f32_slice_to_f16_bytes};
 
 /// 流式权重源:mmap + 条目索引(堆上 KB 级),数据按需转换、取走即弃。
 pub struct SafeTensorsSource {
@@ -175,7 +175,7 @@ impl WeightSource for SafeTensorsSource {
     }
 
     /// 分块转换直写字节租约(F16 基线):mmap 直解码单 pass 直写 dst
-    /// (owl-f16c F16C 通道),零中间 Vec、零手写线程;块页读毕 DONTNEED
+    /// (crate::f16c F16C 通道),零中间 Vec、零手写线程;块页读毕 DONTNEED
     /// (读一点装一点,RSS 恒定在在途块量级)。主路径(直接臂)专用。
     fn convert_chunk_into_bytes(
         &self,

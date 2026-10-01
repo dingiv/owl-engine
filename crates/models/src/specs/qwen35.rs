@@ -158,8 +158,10 @@ pub async fn load_27b_awq<D: DeviceClient + 'static>(
         crate::module::QuantPlan::W4A16Awq,
     );
     let src = crate::formats::awq::AwqSource::open_dir(dir)?;
-    // 设备重排装载(量化大键 GPU repack;OWL_LOAD_CPU_REPACK=1 回退 CPU)
-    let device_repack = std::env::var_os("OWL_LOAD_CPU_REPACK").is_none();
+    // repack 路径裁决(唯一收口:module::RepackPath::resolve ——
+    // 默认 GPU;host face 能力否决自动回退;OWL_LOAD_CPU_REPACK env 强制)
+    let device_repack =
+        crate::module::RepackPath::resolve(None, face.device_kernels()).is_device();
     src.set_device_repack(device_repack);
     let ctx = crate::module::LoaderCtx {
         dtype: crate::contract::Dtype::F16,

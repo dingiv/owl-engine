@@ -283,7 +283,7 @@ impl AwqSource {
                 z_buf.len() * 4,
             ));
         } else if crate::formats::w4a16::marlin_eligible(out, k) {
-            // ---- 全路径(CPU repack 回退;OWL_LOAD_CPU_REPACK=1)----
+            // ---- 全路径(Host 臂;裁决唯一产地 = module::RepackPath::resolve)----
             // B 打包与 U4B8 同套(q 原值,无 −8;dequant 在 kU4 内核内做)
             let s_pack: Vec<u16>;
             let z_buf: Vec<i32>;
@@ -308,7 +308,7 @@ impl AwqSource {
                     s_pack = pack_marlin_s(&scales_f32, out, groups);
                     let zp_u8 = unpack_zp_ct(&zp_i32, out, groups);
                     z_buf = pack_marlin_z(&zp_u8, out, groups);
-                    owl_metrics::with_metrics_store(|s| {
+                    owl_shared::metrics::with_metrics_store(|s| {
                         s.timer_record_tag("load.mat.sz", t_step.elapsed(), file!(), line!())
                     });
                     q_buf = None;
@@ -374,7 +374,7 @@ impl AwqSource {
                 let q = q_buf.as_ref().expect("F16 臂 q_buf 必在");
                 pack_marlin_b_gather_into(q, &idx, words, &mut b_buf);
             }
-            owl_metrics::with_metrics_store(|s| {
+            owl_shared::metrics::with_metrics_store(|s| {
                 s.timer_record_tag("load.mat.gather", t_gather.elapsed(), file!(), line!())
             });
             inserts.push((
@@ -430,7 +430,7 @@ impl AwqSource {
         drop(cache);
         // metrics:物化分相落账(Ct 重排 / F16 现场量化,直用 API 恒开)
         let tag = if form_ct { "load.mat.ct" } else { "load.mat.f16" };
-        owl_metrics::with_metrics_store(|s| {
+        owl_shared::metrics::with_metrics_store(|s| {
             s.timer_record_tag(tag, t0.elapsed(), file!(), line!())
         });
         eprintln!("[awq] 物化 {base} (out={out}, k={k}) @ {:?}", t0.elapsed());
@@ -448,7 +448,7 @@ impl AwqSource {
                 match e.dtype {
                     safetensors::Dtype::F16 => out.copy_from_slice(src),
                     safetensors::Dtype::BF16 => {
-                        owl_f16c::bf16_bytes_to_f16_bytes(src, &mut out)
+                        crate::f16c::bf16_bytes_to_f16_bytes(src, &mut out)
                     }
                     safetensors::Dtype::F32 => out = f32_bytes_to_f16(src),
                     _ => return None, // weight_shape 等元数据键不可取
@@ -607,7 +607,7 @@ impl WeightSource for AwqSource {
                 match e.dtype {
                     safetensors::Dtype::F16 => dst[..need].copy_from_slice(win),
                     safetensors::Dtype::BF16 => {
-                        owl_f16c::bf16_bytes_to_f16_bytes(win, &mut dst[..need])
+                        crate::f16c::bf16_bytes_to_f16_bytes(win, &mut dst[..need])
                     }
                     safetensors::Dtype::F32 => {
                         // F32 passthrough 仅 GDN 标量小张量,标量循环足够

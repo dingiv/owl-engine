@@ -7,8 +7,9 @@ description = "Declarative Tensor model layer: pure-functional forward over a la
 
 
 [dependencies]
-# 统一性能 metrics(直用 API:装载分相打点;宏零开销仅热路径)
-owl-metrics = { path = "../metrics" }
+# 共用横切层(metrics 计时刻度 + signal/testkit;零后端 —— 本 crate
+# 零后端依赖纪律的合法上界,2026-10-01 metrics 并入 shared 后接入)
+owl-shared = { path = "../shared" }
 # 契约权威:线格式 + DeviceClient 能力契约(2026-09-25 下沉;后端不依赖前端)
 owl-iface = { path = "../backends/iface" }
 # kernel 源码之家(include_str 纯源,不拖 CUDA 链接 —— cudarc 已 feature 化)
@@ -26,7 +27,6 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 # 换段从 debug 标量 ~22MB/s 回到内存带宽级(2026-09-26 装载探针定谳:
 # 转换段 45ms/MB 是装载慢的主因,非 DMA/非排队)
 half = "2"
-owl-f16c = { path = "../f16c" }
 tokio = { version = "1", features = ["rt"] }
 
 [dev-dependencies]

@@ -14,7 +14,7 @@
 //!   → ct packed+scale → unpack(rayon)→ gather-pack(rayon,索引表按形状
 //!   复用)→ `qweight` U32 + `scales` F16;`marlin_ws`/`marlin_ctmp` =
 //!   **零填充直写,零存储**;
-//! - 非门控 → rayon 反量化 F16(核在 owl_f16c,opt 覆盖 debug 免疫;
+//! - 非门控 → rayon 反量化 F16(核在 crate::f16c(原 opt 覆盖 crate,2026-10-01 并入);
 //!   每 i32 的 8 nibble 同 group,scale 每 i32 取一次零除法);
 //! - passthrough → mmap 视图 F16C 单 pass 直写 dst(bf16/f32→f16)或
 //!   memcpy(f16),窗口消费完 DONTNEED 还页。
@@ -26,7 +26,7 @@
 use crate::contract::{Dtype, ModelError};
 use crate::formats::mmap::{open_raw_index, Mmap, RawEntry};
 use crate::module::WeightSource;
-use owl_f16c::{bf16_bytes_to_f16_bytes, dequant_u4_affine_f16_bytes};
+use crate::f16c::{bf16_bytes_to_f16_bytes, dequant_u4_affine_f16_bytes};
 use owl_kernels::marlin::repack::{
     marlin_gather_indices, pack_marlin_b_gather_into, pack_marlin_s, unpack_nibbles_into,
 };

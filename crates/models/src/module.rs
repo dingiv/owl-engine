@@ -397,7 +397,7 @@ impl WeightSource for TableSource<'_> {
         self.entries.iter().find(|(k, _)| *k == key).map(|(_, v)| v.len())
     }
 
-    /// 表即 host f32:直接切片转写字节 —— F16 走 owl-f16c(F16C 单
+    /// 表即 host f32:直接切片转写字节 —— F16 走 crate::f16c(F16C 单
     /// pass;默认逐元素 from_f32 实现是 debug 档标量税,rope 表 67MB
     /// 曾付 ~0.5s,F5-4 收口时实测定谳)
     fn convert_chunk_into_bytes(
@@ -415,7 +415,7 @@ impl WeightSource for TableSource<'_> {
                 if dst.len() < len * 2 {
                     return None;
                 }
-                owl_f16c::f32_slice_to_f16_bytes(src, &mut dst[..len * 2]);
+                crate::f16c::f32_slice_to_f16_bytes(src, &mut dst[..len * 2]);
                 Some(())
             }
             Dtype::F32 => {
@@ -645,9 +645,50 @@ pub struct LoaderCtx {
     pub dtype: Dtype,
     /// 并行度(shard 形状切分的词汇;1 = 单卡;TP 随多卡立项)
     pub shard: usize,
-    /// 设备重排装载(AWQ 线;true = 量化大键走 GPU repack,CPU 懒物化
-    /// 仅兜底小键;env OWL_LOAD_CPU_REPACK=1 回退)
+    /// 设备重排装载(AWQ 线;**已裁决结果,唯一产地 =
+    /// [`RepackPath::resolve`]** —— 能力否决/env 强制/显式参数/默认 GPU;
+    /// 本字段不再承载决策,消费点 = linear layout + awq source 物化)
     pub device_repack: bool,
+}
+
+/// repack 路径(装载域**唯一收口**;2026-10-01 用户裁决:默认 GPU 优先,
+/// 无 GPU 能力回退 CPU)—— CPU/GPU 两条 repack 臂的决策唯一产地。
+/// 算法本体互为镜像:host = kernels/src/marlin/repack.rs(pack_marlin_b_fused
+/// 等,rayon);device = kernels/cu/marlin_repack_ct.cu(owl_ct_repack_u32,
+/// nvrtc);对拍锚 = cuda/tests/marlin_parity.rs(逐 u32 一致)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepackPath {
+    /// GPU kernel 重排(量化大键;CPU 仅产 scales/zeros 轻路径)
+    Device,
+    /// CPU rayon 打包(回退;host face / env 强制)
+    Host,
+}
+
+impl RepackPath {
+    /// 唯一裁决点。裁决序(**高 → 低**):
+    /// 1. **能力否决**:`device_capable = false`(CpuFace 等纯 host face)
+    ///    → Host,其余参数不看 —— GPU 不在场,自动回退;
+    /// 2. **env 强制**:`OWL_LOAD_CPU_REPACK` 在场 → Host(运维 A/B,
+    ///    免改码强制回退);
+    /// 3. **显式参数**:`Some(false)` → Host;
+    /// 4. **默认**:Device(GPU 优先)。
+    pub fn resolve(explicit: impl Into<Option<bool>>, device_capable: bool) -> Self {
+        if !device_capable {
+            return Self::Host;
+        }
+        if std::env::var_os("OWL_LOAD_CPU_REPACK").is_some() {
+            return Self::Host;
+        }
+        match explicit.into() {
+            Some(false) => Self::Host,
+            _ => Self::Device,
+        }
+    }
+
+    /// Device 臂判定(linear layout / source 物化的唯一谓词)
+    pub fn is_device(self) -> bool {
+        self == Self::Device
+    }
 }
 
 impl Default for LoaderCtx {
@@ -871,6 +912,22 @@ mod tests {
     use super::*;
     use crate::layers::linear::Linear;
     use crate::testkit::{f32b, f32_of, Src};
+
+    /// RepackPath 裁决序单测(收口唯一性;env 支不入进程内单测 ——
+    /// env 是全局态,并行测试互扰;该支由 specs 装载路径 + 运维 A/B 人工覆盖)
+    #[test]
+    fn repack_path_resolve_order() {
+        use RepackPath::{Device, Host};
+        // 1. 能力否决(最高):host face 无论显式参数一律 Host(自动回退)
+        assert_eq!(RepackPath::resolve(None, false), Host);
+        assert_eq!(RepackPath::resolve(Some(true), false), Host);
+        // 3. 显式参数:false → Host;true/None → 默认
+        assert_eq!(RepackPath::resolve(Some(false), true), Host);
+        // 4. 默认 GPU 优先
+        assert_eq!(RepackPath::resolve(None, true), Device);
+        assert_eq!(RepackPath::resolve(Some(true), true), Device);
+        assert!(Device.is_device() && !Host.is_device());
+    }
 
     #[tokio::test]
     async fn load_weight_basic() {

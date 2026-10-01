@@ -3,9 +3,9 @@ name = "owl-shared"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "共用基建:signal 依赖追踪(re-export)+ testkit 算子对拍框架"
+description = "共用基建:signal 依赖追踪(re-export)+ testkit 算子对拍框架 + metrics 计时刻度"
 
 [dependencies]
-owl-cuda = { path = "../backends/cuda" }
-owl-metrics = { path = "../metrics" }
+# 后端无关的依赖追踪(signal 实体;iface 零后端契约,不拖 CUDA 链 ——
+# models 依赖本 crate 的前提,2026-10-01 vestigial owl-cuda 依赖切除)
 owl-iface = { path = "../backends/iface" }

@@ -204,6 +204,14 @@ pub struct LaunchMsg {
 ///   要求真实完成点;完成通知走 host 回调 cuLaunchHostFunc)
 /// - `sync`:栅栏,三条流此前全部工作落定(全设备语义屏障)
 pub trait DeviceClient: Send {
+    /// 能力自述:能否发射设备侧 kernel(Launch / DeviceRearrange 装载臂)。
+    /// 默认 false(纯 host face);GPU 后端覆写 true。装载域 repack
+    /// 路径裁决([`crate::module::RepackPath::resolve`] 在 models 侧)的
+    /// 能力否决项由此驱动:false 时量化键自动回退 CPU 打包,无需 env。
+    fn device_kernels(&self) -> bool {
+        false
+    }
+
     /// 图捕获开始:进入捕获模式(此后 Launch 进图;
     /// Alloc 从捕获 slab 切块,零 cudaMalloc)。护栏:
     /// - 不可嵌套/并发捕获;捕获期 Htod/Dtoh/Sync/GraphLaunch 拒绝

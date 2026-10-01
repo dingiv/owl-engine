@@ -12,7 +12,7 @@
 //! 数据单副本流动律:take_range / convert_chunk_into_bytes 查到才实体化,
 //! pinned 租约 move 进消息,DMA 直读,用毕即弃(主机驻留 = 在途份)。
 //!
-//! 性能定谳(2026-09-26,F5-4):转换走 [`owl_f16c`](F16C 单 pass)+
+//! 性能定谳(2026-09-26,F5-4):转换走 [`crate::f16c`](F16C 单 pass)+
 //! 微 crate profile 覆盖后,装载已 **DMA-bound**(0.8B 模型 1.75GB ≈
 //! 0.72s;server 全程仅 ~355ms,详见 roadmap.local/f5-switch-workorder.md)。
 
@@ -431,7 +431,7 @@ async fn load_transposed<D: DeviceClient, S: WeightSource + ?Sized>(
 }
 
 // ============================================================================
-// §4 host 变换(转置臂专用;主路径转换在源侧 owl-f16c 直写租约)
+// §4 host 变换(转置臂专用;主路径转换在源侧 crate::f16c 直写租约)
 // ============================================================================
 
 /// TILE² 分块转置 → 新 Vec(源 [rows, cols] → 目标 [cols, rows] f32)。
@@ -487,7 +487,7 @@ fn transpose_into_vec(data: &[f32], w: &crate::module::Want, n: usize) -> Result
 /// f32 切片 → f16 字节(F16C 单 pass;舍入与 from_f32 一致,checksum 门可证)
 fn to_f16_bytes(v: &[f32]) -> Vec<u8> {
     let mut dst = vec![0u8; v.len() * 2];
-    owl_f16c::f32_slice_to_f16_bytes(v, &mut dst);
+    crate::f16c::f32_slice_to_f16_bytes(v, &mut dst);
     dst
 }
 
@@ -573,7 +573,7 @@ impl<'a> KeyProbe<'a> {
     /// 键边界交付(总耗时 = 各相之和)
     fn done(mut self) {
         self.rec.total = self.rec.phases.iter().map(|(_, d)| *d).sum();
-        owl_metrics::with_metrics_store(|s| {
+        owl_shared::metrics::with_metrics_store(|s| {
             s.timer_record_tag("load.key", self.rec.total, file!(), line!())
         });
         if let Some(t) = self.tap {
@@ -594,7 +594,7 @@ impl Drop for SpanGuard<'_, '_> {
         let d = self.t0.elapsed();
         // metrics 直用 API(非宏;装载一次性路径,release 恒开 —— 分相
         // 瓶颈数据面,tag = load.{phase};开销 ~µs/段,对 134s 量级无感)
-        owl_metrics::with_metrics_store(|s| {
+        owl_shared::metrics::with_metrics_store(|s| {
             s.timer_record_tag(&format!("load.{}", self.name), d, file!(), line!())
         });
         match self.probe.rec.phases.iter_mut().find(|(n, _)| *n == self.name) {

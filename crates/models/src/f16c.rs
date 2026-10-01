@@ -1,20 +1,26 @@
-//! f16 装载转换热路径。
+//! f16 装载转换热路径(2026-10-01 自 owl-f16c 独立 crate 收编入 models;
+//! 唯一消费者本就是本 crate 的 formats 装载链)。
 //!
-//! 为什么独立成 crate:std::arch intrinsic 是 `#[inline]` 小包装,debug 档
-//! 不内联 —— 每 4 元素 5 次调用税,裸循环也只剩 ~80MB/s(微基准定谳,
-//! 2026-09-26);而装载测试跑 debug。workspace 对本 crate 单独
-//! `opt-level=3`(见根 Cargo.toml profile 覆盖),调试构建下转换段回到
-//! GB/s 级,其余 crate 保持快速编译迭代。
+//! 历史与补偿(原 crate 头注释):std::arch intrinsic 是 `#[inline]`
+//! 小包装,debug 档不内联 —— 每 4 元素 5 次调用税,裸循环也只剩
+//! ~80MB/s(微基准定谳,2026-09-26);而装载测试跑 debug。原方案 =
+//! 独立 crate + workspace `opt-level=3` 覆盖;并入 models 后覆盖失效,
+//! 补偿 = 外层入口每 buffer 仅一次调用(无调用税)+ std arch
+//! intrinsic 自带 `#[inline(always)]` 在 O0 就地展开,**吞吐由微基准
+//! 门验收**(`tests::bench_throughput_note`;若回退 ~80MB/s 则重启
+//! 独立 crate 方案再议)。
 //!
 //! 舍入语义:vcvtps2ph imm=0(RNE)与 `half::f16::from_f32` 一致,
 //! checksum 逐位门可证;bf16→f32 为零舍入精确展宽。
 
+/// f16c 运行时探测(OnceLock 缓存)
 fn has_f16c() -> bool {
     static DET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DET.get_or_init(|| std::arch::is_x86_feature_detected!("f16c"))
 }
 
 /// bf16 字节 → f16 字节(4 宽 F16C;非 x86 / 无 f16c 回退标量 half)
+#[inline]
 pub fn bf16_bytes_to_f16_bytes(src: &[u8], dst: &mut [u8]) {
     debug_assert!(dst.len() >= src.len());
     #[cfg(target_arch = "x86_64")]
@@ -35,9 +41,9 @@ pub fn bf16_bytes_to_f16_bytes(src: &[u8], dst: &mut [u8]) {
 /// 行主序 [out, k];packed i32 [out, k/8](LSB-first 每 i32 8 nibble);
 /// scales f32 [out, k/128]。128 % 8 == 0 ⇒ 每个 i32 的 8 个 nibble
 /// 必落在同一 group(scale 每 i32 取一次,免逐元素除法)。
-/// rayon 按行组并行;整核在 opt 覆盖 crate(debug 档也 GB/s 级)。
-/// 治本案(2026-09-28)入此的理由:本质 = 量化字节→f16 字节转换,
-/// 且需 opt 覆盖;放置先例见 crate 根注释。
+/// rayon 按行组并行;吞吐依赖下方 f32_slice_to_f16_bytes 的 SIMD 路径
+/// (原 opt 覆盖 crate 时代治本案 2026-09-28 的放置先例)。
+#[inline]
 pub fn dequant_u4_affine_f16_bytes(
     packed: &[i32],
     scales: &[f32],
@@ -76,6 +82,7 @@ pub fn dequant_u4_affine_f16_bytes(
 }
 
 /// f32 切片 → f16 字节(4 宽 F16C;回退标量 half)
+#[inline]
 pub fn f32_slice_to_f16_bytes(src: &[f32], dst: &mut [u8]) {
     debug_assert!(dst.len() >= src.len() * 2);
     #[cfg(target_arch = "x86_64")]
@@ -91,6 +98,9 @@ pub fn f32_slice_to_f16_bytes(src: &[f32], dst: &mut [u8]) {
     }
 }
 
+// ⚠️ 下方两个 SIMD 环不能 #[inline(always)] —— E0755:inline(always)
+// 与 #[target_feature] 互斥。调用税已被「每 buffer 一次调用」摊薄,
+// 环体性能 = std arch intrinsic 的 O0 就地展开效果,微基准门验收。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "f16c")]
 unsafe fn bf16_to_f16_f16c(src: &[u8], dst: &mut [u8]) {
@@ -179,5 +189,32 @@ mod tests {
             let want = half::f16::from_f32(*f).to_le_bytes();
             assert_eq!(&got[i * 2..i * 2 + 2], &want, "elem {i} ({f})");
         }
+    }
+
+    /// 微基准门(并入 models 的 inline 保速验收;头注释「历史与补偿」):
+    /// debug 档下 bf16/f32 转换吞吐须 ≫ 80MB/s 原病线(目标数百 MB/s 级;
+    /// 原 opt-3 独立 crate 时代 = GB/s 级,本门是回退线不是冲刺线)。
+    /// 恒打印;吞掉断言风险为零(只测吞吐,数值正确性归上两用例)。
+    #[test]
+    fn bench_throughput_note() {
+        let n = 32 << 20; // 32M 元素(f32 128MB / bf16 64MB)
+        let src: Vec<f32> = (0..n).map(|i| (i % 65536) as f32).collect();
+        let mut dst = vec![0u8; n * 2];
+
+        let t = std::time::Instant::now();
+        f32_slice_to_f16_bytes(&src, &mut dst);
+        let f32_gbps = (n * 4) as f64 / t.elapsed().as_secs_f64() / 1e9;
+        eprintln!("[f16c bench] f32→f16 debug 吞吐 = {f32_gbps:.2} GB/s");
+
+        let src_bf16: Vec<u8> = dst.clone(); // 产物回喂(bf16 位型)
+        let t = std::time::Instant::now();
+        bf16_bytes_to_f16_bytes(&src_bf16, &mut dst);
+        let bf16_gbps = src_bf16.len() as f64 / t.elapsed().as_secs_f64() / 1e9;
+        eprintln!("[f16c bench] bf16→f16 debug 吞吐 = {bf16_gbps:.2} GB/s");
+
+        // 门:≥ 0.4 GB/s(原病线 80MB/s 的 5×;原 opt-3 时代 GB/s 级。
+        // CI 机差异敏感 → 门放宽到「量级正确」,数值细节看打印趋势)
+        assert!(f32_gbps > 0.4, "f32→f16 debug 吞吐 {f32_gbps:.2} GB/s 过病线");
+        assert!(bf16_gbps > 0.4, "bf16→f16 debug 吞吐 {bf16_gbps:.2} GB/s 过病线");
     }
 }

@@ -85,6 +85,11 @@ impl GpuClient {
 }
 
 impl DeviceClient for GpuClient {
+    /// 能力自述:GPU 后端可发射设备 kernel(RepackPath 能力否决项 = true)
+    fn device_kernels(&self) -> bool {
+        true
+    }
+
     async fn graph_begin(&mut self) -> Result<(), ModelError> {
         self.submit(move |ack| Command::GraphBegin { ack })?.await
     }

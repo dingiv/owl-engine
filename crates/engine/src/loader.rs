@@ -6,7 +6,7 @@
 //!
 //! metrics 装载分相 = **直用 API 恒开**(装载一次性路径,release 有
 //! 数据;区别于热路径宏 debug 展开/release 零开销的双轨纪律,见
-//! owl-metrics)。
+//! owl-shared metrics 模块)。
 
 use std::path::Path;
 use std::sync::Arc;
@@ -79,8 +79,8 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
     ) -> Result<LoadedModel> {
         let spec = qwen3_8_27b();
         // metrics 装载分相(直用 API 恒开;装载一次性路径,release 有数据)
-        let _ = owl_metrics::init_metrics(owl_metrics::MetricsStore::new());
-        owl_metrics::with_metrics_store(|s| {
+        let _ = owl_shared::metrics::init_metrics(owl_shared::metrics::MetricsStore::new());
+        owl_shared::metrics::with_metrics_store(|s| {
             s.timer_begin("load.27b.total", file!(), line!());
         });
         let model = Arc::new(load_27b_awq(dir, self.face).await?);
@@ -88,11 +88,11 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let rope = Rope::new(262_144, 256, 64, 10_000_000.0)?;
         let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1, device_repack: false };
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
-        owl_metrics::with_metrics_store(|s| {
+        owl_shared::metrics::with_metrics_store(|s| {
             let _ = s.timer_end("load.27b.total", file!(), line!());
         });
-        owl_metrics::query_metrics(
-            &owl_metrics::MetricsFilter::new().tag_prefix("load."),
+        owl_shared::metrics::query_metrics(
+            &owl_shared::metrics::MetricsFilter::new().tag_prefix("load."),
         );
         Ok(LoadedModel { model, tokenizer, rope, spec })
     }

@@ -8,7 +8,6 @@ members = [
     "crates/models",
     "crates/backends/iface",
     "crates/shared",
-    "crates/f16c",
     "crates/engine",
     "apps/server",
     "apps/cli",
@@ -34,5 +33,5 @@ rayon = "1.12.0"
 tracing = "0.1.40"
 bincode = "1.3.3"
 
-[profile.dev.package.owl-f16c]
+[profile.dev.package.owl-models]
 opt-level = 3

@@ -43,6 +43,7 @@
 //! 调试:`OWL_DEBUG=1` 开启解释层发射日志(默认静默)。
 
 pub mod contract;
+pub mod f16c;
 pub mod formats;
 pub mod interpreters;
 pub mod kernel;
