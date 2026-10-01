@@ -1,14 +1,22 @@
-//! 调度决策词汇(S0,2026-09-30 调度层铺开立项施工)。
+//! 调度决策词汇 + 决策逻辑(S0,2026-09-30 调度层铺开立项施工;
+//! 2026-10-01 拆分:`schedule()` 自 engine.rs 收编至此,决策词汇与
+//! 决策逻辑同屋)。
 //!
 //! **决策/执行分离**(对标 vLLM v1 `Scheduler::schedule() → SchedulerOutput`):
-//! - **决策**([`RunningEngine::schedule`],engine.rs):只动主机侧账
+//! - **决策**([`RunningEngine::schedule`],本模块):只动主机侧账
 //!   (队列/会话账/块账房/活跃 turn),**零设备 IO**,同步可单测 ——
 //!   输出 = 本 pump 步的完整计划;
-//! - **执行**(engine.rs async 面):设备侧照办(reset/快照恢复/write_bt/
+//! - **执行**(exec.rs async 面):设备侧照办(reset/快照恢复/write_bt/
 //!   prefill chunk/decode step/采样),无决策权。
 //!
 //! ≤8 并发收缩口径(需求 §二):无抢占、无优先级、无换出 ——
 //! continuous batching 值得搬的只有档位拼批(S3)。
+
+use owl_iface::contract::{DeviceClient, ModelError};
+
+use crate::running::RunningEngine;
+
+type Result<T> = std::result::Result<T, ModelError>;
 
 /// 一次 pump 的调度决策(执行器照办的完整计划)
 pub(crate) enum SchedulerOutput {
@@ -54,4 +62,127 @@ pub(crate) enum StepAction {
         /// 块链跨页增长 → 执行器重写持久块表(write_bt)
         grew: bool,
     },
+}
+
+impl<D: DeviceClient> RunningEngine<D> {
+    /// 调度决策(纯主机侧):turn 启动判定(会话守卫/前缀匹配/快照
+    /// 边界)+ 相位决策(prefill chunk / decode 步,host 派生量备齐)。
+    /// 只动账(队列/会话账/块账房/活跃 turn),**零 await**。
+    pub(crate) fn schedule(&mut self) -> Result<SchedulerOutput> {
+        let mut begin = None;
+        if self.active.is_none() {
+            let Some(turn) = self.queue.pop_front() else {
+                return Ok(SchedulerOutput::Idle);
+            };
+            // E2c 复用形态:GuardHit(同会话,块链/格态原样)/
+            // PrefixHit(跨会话,块链复用 + 快照恢复)/ Fresh(全量)
+            let (cached_len, gdn_slot, restore_key) = {
+                let s = self
+                    .sessions
+                    .get_mut(turn.session_id)
+                    .expect("submit 已建会话账");
+                // ⚠️ 新会话(空账)guard 恒真 —— cached_len == 0 必须落到
+                // 前缀匹配分支(跨会话内容复用正是新会话的场景)
+                if s.guard(&turn.prompt_ids) && s.cached_len > 0 {
+                    (s.cached_len, s.gdn_slot, None)
+                } else if self.pool.paged {
+                    // 前缀缓存匹配(先匹配后释放旧链;内容寻址 = 跨会话)
+                    let (mut m, chain) = self.blocks_m.match_prefix(&turn.prompt_ids);
+                    if std::env::var_os("OWL_DEBUG").is_some() {
+                        eprintln!("[dbg prefix] match = {m} blocks / chain = {chain:?}");
+                    }
+                    if m > 0 && m * self.pool.page == turn.prompt_ids.len() {
+                        m -= 1; // 完全对齐保留末块重算(非空 prefill;xinfer 同语义)
+                    }
+                    while m > 0 {
+                        let key = chain[m - 1];
+                        if self.pool.has_snap(key) {
+                            break;
+                        }
+                        m -= 1; // 无快照的边界不可复用(GDN 态对不上)
+                    }
+                    if m > 0 {
+                        for &b in &chain[..m] {
+                            self.blocks_m.incref(b);
+                        }
+                        let mut old = std::mem::take(&mut s.block_table);
+                        self.blocks_m.release_table(&mut old);
+                        s.block_table = chain[..m].to_vec();
+                        s.reset();
+                        s.cached_len = m * self.pool.page;
+                        (m * self.pool.page, s.gdn_slot, Some(chain[m - 1]))
+                    } else {
+                        let mut table = std::mem::take(&mut s.block_table);
+                        self.blocks_m.release_table(&mut table);
+                        s.reset();
+                        (0, s.gdn_slot, None)
+                    }
+                } else {
+                    let mut table = std::mem::take(&mut s.block_table);
+                    self.blocks_m.release_table(&mut table);
+                    s.reset();
+                    (0, s.gdn_slot, None)
+                }
+            };
+            // E2b:块表确保覆盖 prompt(增量 turn 块链已存,只长新增段)
+            {
+                let s = self
+                    .sessions
+                    .get_mut(turn.session_id)
+                    .expect("submit 已建会话账");
+                self.blocks_m.ensure_for_len(&mut s.block_table, turn.prompt_ids.len())?;
+            }
+            begin = Some(BeginPlan {
+                session_id: turn.session_id,
+                gdn_slot,
+                restore_key,
+                reset_gdn: cached_len == 0,
+            });
+            self.active = Some(crate::running::ActiveTurn {
+                id: turn.id,
+                session_id: turn.session_id,
+                ephemeral: turn.ephemeral,
+                prompt_ids: turn.prompt_ids,
+                max_new: turn.spec.max_new,
+                out: Vec::new(),
+                fed: cached_len,
+                decoded: String::new(),
+            });
+        }
+
+        // 相位决策:prompt 相位(块式 prefill;W1/PF1)优先
+        let act = self.active.as_ref().expect("begin 或已有活跃");
+        if act.fed < act.prompt_ids.len() {
+            let base = act.fed;
+            let remaining = act.prompt_ids.len() - base;
+            // 块长:配置块长 ∩ 剩余(E1 paged 核后无 256 窗钳制;
+            // 全局注意力语义,长 ctx 安全)
+            let chunk = remaining.min(self.cfg.prefill_chunk).max(1);
+            let action = StepAction::Prefill {
+                chunk_ids: act.prompt_ids[base..base + chunk].to_vec(),
+                base,
+                is_last: base + chunk >= act.prompt_ids.len(),
+            };
+            return Ok(SchedulerOutput::Step { begin, action });
+        }
+
+        // 生成相位:decode 单步(host 派生量备齐 —— 物理槽/跨页增长)
+        let (sid, token, pos) = {
+            let act = self.active.as_ref().expect("活跃");
+            (act.session_id, *act.out.last().expect("生成中"), act.fed)
+        };
+        let (kv_slot, gdn_slot, grew) = {
+            let s = self.sessions.get_mut(sid).expect("账在");
+            let before = s.block_table.len();
+            self.blocks_m.ensure_for_len(&mut s.block_table, pos + 1)?;
+            let grew = s.block_table.len() != before;
+            let page = self.pool.page;
+            let b = s.block_table[pos / page];
+            (b * page as u32 + (pos % page) as u32, s.gdn_slot, grew)
+        };
+        Ok(SchedulerOutput::Step {
+            begin,
+            action: StepAction::Decode { token, pos, kv_slot, gdn_slot, grew },
+        })
+    }
 }

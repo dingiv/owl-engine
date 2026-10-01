@@ -32,13 +32,25 @@
 
 pub mod blocks;
 pub mod prefix_cache;
-pub mod engine;
 pub mod graph_plan;
-pub(crate) mod scheduler;
 pub mod session;
 pub mod turn;
 
-pub use engine::{Engine, EngineConfig, LoadedModel, ModelLoader, RunningEngine};
+// engine 面(2026-10-01 拆分:原单文件 1782 行 → 六户;对外路径经
+// re-export 保持不变 —— owl_engine::{Engine, EngineConfig,
+// LoadedModel, ModelLoader, RunningEngine})
+pub(crate) mod engine;
+pub(crate) mod exec;
+pub(crate) mod loader;
+pub(crate) mod running;
+pub(crate) mod scheduler;
+pub(crate) mod state;
+#[cfg(test)]
+mod tests;
+
+pub use engine::{Engine, EngineConfig};
+pub use loader::{LoadedModel, ModelLoader};
+pub use running::RunningEngine;
 pub use graph_plan::{GraphPlan, GraphPlanDesc, PlanOutcome};
 pub use session::{AgentSession, SessionTable};
 pub use turn::{TurnEvent, TurnSpec};

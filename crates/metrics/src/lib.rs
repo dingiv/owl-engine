@@ -644,8 +644,9 @@ mod tests {
         let r = &reps[0];
         assert!(r.count >= 1, "至少一条样本");
         assert!(dur_ms(r.min) >= 1.5, "时长应覆盖 sleep: {:?}", r.min);
-        // 位置 = 本测试文件(宏展开点)
-        assert!(r.last_file.ends_with("metrics.rs"), "file = {}", r.last_file);
+        // 位置 = 本测试文件(宏展开点);metrics 拆独立 crate 后测试
+        // 驻 lib.rs(断言随搬家订正,原 "metrics.rs" 系 shared 时代文件名)
+        assert!(r.last_file.ends_with("lib.rs"), "file = {}", r.last_file);
         assert!(r.last_line > 0);
         assert_eq!(r.orphan_ends, 0);
     }
