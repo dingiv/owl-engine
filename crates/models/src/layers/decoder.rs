@@ -62,15 +62,36 @@ impl DecoderLayer {
 }
 
 impl Module for DecoderLayer {
-    /// 双残差声明(h = x + mixer(ln1(x));out = h + mlp(ln2(h)))
+    /// 双残差声明(C1 融合):h = x + mixer(ln1(x));
+    /// n2 = rmsnorm(h)·w2【fused_add_rmsnorm 单发,残差原地副作用】;
+    /// out = h + mlp(n2)(尾残差无 norm 可融,独立 add)
     fn forward(&self, xs: &TensorOps, ctx: &ForwardCtx) -> TensorOps {
         let n1 = self.input_ln.forward(xs, ctx);
         let mixed = match &self.mixer {
             TokenMixer::Full(a) => a.forward(&n1, ctx),
             TokenMixer::Gdn(g) => g.forward(&n1, ctx),
         };
-        let h = xs.add(&mixed);
-        let n2 = self.post_ln.forward(&h, ctx);
+        // C1-W2:fused_add_rmsnorm(残差原地 += mixed;out = rmsnorm·w2,
+        // 副作用律 conv_upd 同款)—— h = xs 块(原地求和后);
+        // OWL_QKV_FUSE 未覆盖 ln 族前此为默认路径(0.8B/27B 全绿态回退)
+        let (h, n2) = if mixed.dtype == crate::tensor::Dtype::F16 {
+            let rows: usize = mixed.shape()[0];
+            let n: usize = mixed.shape()[1];
+            let n2 = TensorOps::call(crate::ops::ids::LN_FUSED_ADD_RMSNORM)
+                .arg(&mixed)
+                .arg(xs)
+                .arg(&self.post_ln.alpha_decl())
+                .arg_f32(self.post_ln.eps())
+                .arg_usize(n)
+                .arg_i32(self.post_ln.w_off() as i32)
+                .aux(&[rows, n])
+                .with_shape(mixed.dtype, mixed.shape().to_vec());
+            (xs.clone(), n2)
+        } else {
+            let h = xs.add(&mixed);
+            let n2 = self.post_ln.forward(&h, ctx);
+            (h, n2)
+        };
         let mlp_out = self.mlp.forward(&n2, ctx);
         h.add(&mlp_out)
     }

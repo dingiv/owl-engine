@@ -90,6 +90,11 @@ impl Rope {
         self.rotary_dim / 2
     }
 
+    /// f32 锚链直发(Call 通路 f32 对拍挂账期间保留)
+    fn launch_kernel_f32(tokens: usize) -> crate::kernel::Kernel {
+        crate::kernel::kernel_with("owl_rope_half_partial_f32", (tokens as u32, 1, 1), (128, 1, 1), 0)
+    }
+
     /// q 旋转:[T, Hq*HD] → [T, Hq*HD](前 rotary_dim 维转,余直通)
     pub fn forward_q(
         &self,
@@ -100,6 +105,18 @@ impl Rope {
     ) -> TensorOps {
         // dtype 跟随 x 声明(F5;表 Weight 经 LoaderCtx 同 dtype)
         let dt = q.dtype;
+        if dt != Dtype::F16 {
+            // f32 语义锚链:Kernel 直发(f32 Call 通路对拍挂账)
+            return TensorOps::of(Self::launch_kernel_f32(tokens))
+            .arg(q)
+            .arg(&self.cos.decl())
+            .arg(&self.sin.decl())
+            .arg(pos)
+            .arg_usize(q_heads)
+            .arg_usize(self.head_dim)
+            .arg_usize(self.rotary_dim / 2)
+            .with_shape(dt, vec![tokens, q_heads * self.head_dim]);
+        }
         TensorOps::call(crate::ops::ids::OPS_ROPE).aux(&[tokens])
         .arg(q)
         .arg(&self.cos.decl())
@@ -120,6 +137,18 @@ impl Rope {
         kv_heads: usize,
     ) -> TensorOps {
         let dt = k.dtype;
+        if dt != Dtype::F16 {
+            // f32 语义锚链:Kernel 直发
+            return TensorOps::of(Self::launch_kernel_f32(tokens))
+            .arg(k)
+            .arg(&self.cos.decl())
+            .arg(&self.sin.decl())
+            .arg(pos)
+            .arg_usize(kv_heads)
+            .arg_usize(self.head_dim)
+            .arg_usize(self.rotary_dim / 2)
+            .with_shape(dt, vec![tokens, kv_heads * self.head_dim]);
+        }
         TensorOps::call(crate::ops::ids::OPS_ROPE).aux(&[tokens])
         .arg(k)
         .arg(&self.cos.decl())

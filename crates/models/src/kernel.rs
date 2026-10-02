@@ -168,6 +168,12 @@ pub static REGISTRY: &[Entry] = &[
     // silu_and_mul:SwiGLU 门控 silu(g)⊙u 双输入单输出(vLLM 语义 port;
     // 替 gate.silu().mul(up) 两发,float 中间,中间量化消除)
     Entry { name: "owl_silu_and_mul_f16", source: sources::owl::SILU_AND_MUL_F16, args: "T,T,sz,T", dtype: crate::contract::Dtype::F16 },
+    // fused_add_rmsnorm:residual 原地 += mixed(副作用律)+ rmsnorm·w 单输出
+    // (vLLM layernorm_kernels.cu fused_add_rms_norm port;decoder 双残差之一)
+    Entry { name: "owl_fused_add_rmsnorm_f16", source: sources::owl::FUSED_ADD_RMSNORM_F16, args: "T,T,T,f32,sz,i32,T", dtype: crate::contract::Dtype::F16 },
+    // qknorm_rope_kv_insert:q norm+rope → q_out;k norm+rope → key_cache 散写;
+    // v → value_cache(minimax_m3 同款 (token,head-slot) 结构,三发合一)
+    Entry { name: "owl_qknorm_rope_kv_insert_f16", source: sources::owl::QKNORM_ROPE_KV_INSERT_F16, args: "T,T,T,T,T,T,T,T,T,T,T,f32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     // ---- ct packed → marlin B 设备重排(2026-10-01 装载提速;AWQ 装载线)----
     Entry { name: "owl_ct_repack_u32", source: sources::owl::CT_REPACK_U32, args: "T,sz,sz,T", dtype: crate::contract::Dtype::U32 },
     // ---- 文本主干(Qwen3.5 mini-demo;Kernel 节点路径,输出块末参)----

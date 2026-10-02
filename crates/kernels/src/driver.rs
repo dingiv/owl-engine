@@ -109,6 +109,9 @@ pub struct OpReq<'a> {
 /// (与登记表 `source()` 同纪律)。
 pub fn resolve(req: OpReq) -> KernelPick {
     let dt = req.dt;
+    if std::env::var_os("OWL_RESOLVE_TRACE").is_some() {
+        let _ = &req;
+    }
     let ax = |i: usize| -> usize {
         *req.aux.get(i).unwrap_or_else(|| {
             panic!(
@@ -137,6 +140,14 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "ops.rope" => elems::rope(dt, ax(0)),
         "ops.embed" => elems::embed(dt, ax(0)),
         "attn.norm_rope" => attn::norm_rope(dt, ax(0), ax(1), ax(2)), // aux = [tokens, heads, hd]
+        "attn.qkv_norm_rope_insert" => {
+            let (tokens, hq, hkv, hd, half) = (ax(0), ax(1), ax(2), ax(3), ax(4));
+            attn::qkv_norm_rope_insert(dt, tokens, hq, hkv, hd, half) // aux = [tokens, hq, hkv, hd, half]
+        }
+                "ln.fused_add_rmsnorm" => {
+            let (rows, n) = (ax(0), ax(1));
+            ln::fused_add_rmsnorm(dt, rows, n)
+        }
         "mlp.silu_and_mul" => mlp::silu_and_mul(dt, ax(0)),
         "load.ct_repack" => {
             let rows = req.shapes.first().map(|s| s[0]).unwrap_or(0);
@@ -414,6 +425,31 @@ pub mod attn {
         }
     }
 
+    /// qkv norm+rope+KV 插入(Wave-2 头号;minimax_m3 (token,head-slot)
+    /// 结构 port,适配 gated 布局与 classic cache 寻址):
+    /// q 头 → q_out(norm+rope);k 头 → norm+rope → key_cache 散写;
+    /// 同块捎带 v → value_cache。替 norm_rope×2 + K0 三发。
+    /// grid (T, Hq+Hkv, 1);block (hd,1,1);smem = hd·4B。
+    /// aux = [tokens, hq, hkv, hd, half];page/hkv/half 为核运行参数(寻址)。
+    pub fn qkv_norm_rope_insert(
+        dt: DType,
+        tokens: usize,
+        hq: usize,
+        hkv: usize,
+        hd: usize,
+        _half: usize,
+    ) -> KernelPick {
+        assert!(matches!(dt, DType::F16), "owl_qknorm_rope_kv_insert 仅有 f16 变体");
+        KernelPick {
+            name: "owl_qknorm_rope_kv_insert_f16",
+            shape: Shape {
+                grid: (tokens as u32, (hq + hkv) as u32, 1),
+                block: (hd as u32, 1, 1),
+                smem: (hd * 4) as u32,
+            },
+        }
+    }
+
     /// paged prefill 的 Hw 占位(谓词用;env 之外不可得时)
     pub fn hw_placeholder() -> Hw {
         Hw { arch: crate::Arch::Sm86 }
@@ -421,7 +457,26 @@ pub mod attn {
 }
 
 // ============================================================================
-// §4.4 MLP 门控族(C1)
+// §4.4 layernorm 融合族(C1;vLLM fused_add_rms_norm port)
+// ============================================================================
+
+pub mod ln {
+    use super::{DType, KernelPick, Shape};
+
+    /// fused_add_rmsnorm:residual 原地 += mixed;out = rmsnorm(residual)·w。
+    /// grid (rows,1,1);block 256;smem 256·4B(行分段归约)。
+    /// aux = [rows, n]。**副作用律**:residual 块原地写(conv_upd 同款)。
+    pub fn fused_add_rmsnorm(dt: DType, rows: usize, _n: usize) -> KernelPick {
+        assert!(matches!(dt, DType::F16), "owl_fused_add_rmsnorm 仅有 f16 变体");
+        KernelPick {
+            name: "owl_fused_add_rmsnorm_f16",
+            shape: Shape { grid: (rows as u32, 1, 1), block: (256, 1, 1), smem: (256 * 4) as u32 },
+        }
+    }
+}
+
+// ============================================================================
+// §4.5 MLP 门控族(C1)
 // ============================================================================
 
 pub mod mlp {

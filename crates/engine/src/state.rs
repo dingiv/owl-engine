@@ -26,13 +26,19 @@ pub(crate) type BlockN = (Bytes, usize); // (块句柄, 元素数;重置分块�
 
 /// GDN 快照池深度(E2c;每份 ~19.4MB 设备侧,LRU 覆盖写)。
 /// 复用边界 = 有快照的最深块边界;短于最近边界的匹配回退全量(一档取舍)。
-const SNAP_MAX: usize = 4;
+/// OWL_SNAP_MAX 可调(27B 单卡贴顶场景降到 1 省 ~300MB;默认 4)。
+fn snap_max() -> usize {
+    std::env::var("OWL_SNAP_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(4)
+}
 
 /// GDN 状态格容量(**与会话数绑定,与 max_seq_tokens 解耦**)。
 /// 格语义 = 每会话一格(SessionTable 分配/释放);按位分配是历史包袱:
 /// s=4096 时 rec(1 MiB/格/层 × 18 层)将达 72 GB,而真实需求 = 格数。
 /// 8 = 覆盖需求并发上限(§二 并发 ≤8);会话 close 即释放格号。
-pub(crate) const GDN_SLOTS: usize = 8;
+/// OWL_GDN_SLOTS 可调(27B 单卡贴顶场景降到 2 省 ~300MB;默认 8)。
+pub(crate) fn gdn_slots() -> usize {
+    std::env::var("OWL_GDN_SLOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(8)
+}
 
 /// GDN 快照槽(E2c):key = 链尾物理块 id(内容身份);bufs = 逐层逐块
 /// 行宽副本(与 gdns 同序同构,行宽 = elems / GDN_SLOTS)。池静态
@@ -132,16 +138,16 @@ impl StatePool {
         };
         let mut gdns: Vec<GdnBlocks> = Vec::new();
         for _ in 0..n_gdn {
-            let conv_q = zero_block(face, GDN_SLOTS * dims.nk * dims.hk * 3).await?;
-            let conv_k = zero_block(face, GDN_SLOTS * dims.nv * dims.hv * 3).await?;
-            let conv_v = zero_block(face, GDN_SLOTS * dims.nv * dims.hv * 3).await?;
-            let rec = zero_block(face, GDN_SLOTS * dims.nv * dims.hk * dims.hv).await?;
+            let conv_q = zero_block(face, gdn_slots() * dims.nk * dims.hk * 3).await?;
+            let conv_k = zero_block(face, gdn_slots() * dims.nv * dims.hv * 3).await?;
+            let conv_v = zero_block(face, gdn_slots() * dims.nv * dims.hv * 3).await?;
+            let rec = zero_block(face, gdn_slots() * dims.nv * dims.hk * dims.hv).await?;
             gdns.push(GdnBlocks { conv_q, conv_k, conv_v, rec });
         }
         // GDN 快照池(E2c):行宽副本 × SNAP_MAX 份;仅 paged 形态
         let mut snaps: Vec<GdnSnapSlot> = Vec::new();
         if paged {
-            for _ in 0..SNAP_MAX {
+            for _ in 0..snap_max() {
                 let mut bufs: Vec<BlockN> = Vec::new();
                 for _ in 0..n_gdn {
                     bufs.push(zero_block(face, dims.nk * dims.hk * 3).await?);
@@ -203,10 +209,10 @@ impl StatePool {
         self.gdns
             .iter()
             .map(|g| GdnLeaf {
-                conv_q: block_leaf(&g.conv_q.0, vec![GDN_SLOTS, d.nk * d.hk, 3]),
-                conv_k: block_leaf(&g.conv_k.0, vec![GDN_SLOTS, d.nv * d.hv, 3]),
-                conv_v: block_leaf(&g.conv_v.0, vec![GDN_SLOTS, d.nv * d.hv, 3]),
-                rec: block_leaf(&g.rec.0, vec![GDN_SLOTS, d.nv, d.hk, d.hv]),
+                conv_q: block_leaf(&g.conv_q.0, vec![gdn_slots(), d.nk * d.hk, 3]),
+                conv_k: block_leaf(&g.conv_k.0, vec![gdn_slots(), d.nv * d.hv, 3]),
+                conv_v: block_leaf(&g.conv_v.0, vec![gdn_slots(), d.nv * d.hv, 3]),
+                rec: block_leaf(&g.rec.0, vec![gdn_slots(), d.nv, d.hk, d.hv]),
             })
             .collect()
     }
@@ -249,7 +255,7 @@ impl StatePool {
                 (&g.rec.0, g.rec.1),
             ];
             for (bn, elems) in blocks {
-                let row = elems / GDN_SLOTS;
+                let row = elems / gdn_slots();
                 face.memset_zero_at(bn, gdn_slot * row * 4, row * 4).await?;
             }
         }
@@ -290,7 +296,7 @@ impl StatePool {
                 (&g.rec.0, g.rec.1),
             ];
             for (j, (src, elems)) in quads.iter().enumerate() {
-                let row = elems / GDN_SLOTS;
+                let row = elems / gdn_slots();
                 let dst = &self.snaps[idx].bufs[li * 4 + j];
                 face.copy_block_at(src, gdn_slot * row * 4, &dst.0, 0, row * 4).await?;
             }
@@ -323,7 +329,7 @@ impl StatePool {
                 (&g.rec.0, g.rec.1),
             ];
             for (j, (dst, elems)) in quads.iter().enumerate() {
-                let row = elems / GDN_SLOTS;
+                let row = elems / gdn_slots();
                 let src = &self.snaps[idx].bufs[li * 4 + j];
                 face.copy_block_at(&src.0, 0, dst, gdn_slot * row * 4, row * 4).await?;
             }

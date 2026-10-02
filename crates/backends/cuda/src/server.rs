@@ -409,7 +409,7 @@ impl GpuServer {
             Err(e) => return ack.send(Err(e)),
         };
         let result = unsafe { stream.alloc::<u8>(n_bytes) }
-            .map_err(|e| ModelError::Msg(format!("alloc: {e:?}")))
+            .map_err(|e| ModelError::Msg(format!("alloc({n_bytes}B / {:.1}MiB): {e:?}", n_bytes as f64 / 1048576.0)))
             .and_then(|mut slice| {
                 if zero {
                     stream

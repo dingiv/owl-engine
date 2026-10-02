@@ -142,6 +142,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     pos_now.saturating_sub(1),
                     probe(pos_now.saturating_sub(1))
                 );
+                // 取证(C1-W2 融合核 27B 案):当前槽 k 值 hex(头 0,维 0..8)
+                let hex: String = whole[pos_now * 16..pos_now * 16 + 16]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                eprintln!("[kv-hex] 槽{pos_now} k[0..8] = {hex}");
             }
             if std::env::var_os("OWL_DEBUG").is_some() && step < 16 {
                 let mut top: Vec<(f32, u32)> = logits

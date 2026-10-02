@@ -57,17 +57,30 @@ pub(super) fn issue_launch(
     // 2. 懒编译(缓存命中直返)
     let func = kernels.ensure_kernel(&ctx.ctx, &msg.kernel.name, &msg.kernel.source)?;
 
-    // 2.5 硬顶守卫:动态 smem 超设备 opt-in 上限 → 结构化拒绝(提前到
+    // 2.4 硬顶守卫:动态 smem 超设备 opt-in 上限 → 结构化拒绝(提前到
     // 发射前,而非驱动层泛化 INVALID_VALUE)。开销 = 一次字段比较
     // (~ns;boot 时查一次设备属性缓存,不逐发射调 CUDA)。decode 热路径
-    // 走图回放不经此处;捕获期发射会被本守卫覆盖一次。上 artifact:
-    // >48KB 需 cudaFuncSetAttribute 通道(launcher 扩展挂账)。
+    // 走图回放不经此处;捕获期发射会被本守卫覆盖一次。
     if msg.shared_mem as usize > ctx.smem_optin() {
         return Err(ModelError::Msg(format!(
             "launch({}): 动态 smem {}B 超设备 opt-in 上限 {}B —— \
-             检查 smem 契约推导;>48KB 走 cudaFuncSetAttribute 通道(挂账)",
+             检查 smem 契约推导(长 ctx 候选:v2 分块核,vLLM 同款弃 v1)",
             msg.kernel.name, msg.shared_mem, ctx.smem_optin()
         )));
+    }
+
+    // 2.5 opt-in 通道(2026-10-02 接通,原挂账):动态 smem > 默认顶 48KB
+    // 时设 MAX_DYNAMIC_SHARED_SIZE_BYTES(守卫已保证 ≤ 设备 opt-in 上限)。
+    // 长 ctx paged v1 的 logits smem 契约(8B/token)在 ctx > 6k 后即越
+    // 48KB;属性按函数持久,重复 set 幂等(仅非热路径发射经过此处,
+    // 图回放不经)
+    if msg.shared_mem as usize > 49152 {
+        use cudarc::driver::sys::CUfunction_attribute_enum as Attr;
+        func.set_attribute(Attr::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            msg.shared_mem as i32)
+            .map_err(|e| ModelError::Msg(format!(
+                "launch({}): cudaFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE, {}) 失败: {e:?}",
+                msg.kernel.name, msg.shared_mem)))?;
     }
 
     // 3. 发射(非阻塞:提交进流即返回)

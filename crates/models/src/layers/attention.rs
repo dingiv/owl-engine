@@ -94,6 +94,44 @@ impl Attention {
         // per-head [value|gate] 切分(C1):value 半段由 norm_rope strided
         // 直取(q 链 narrow+norm+rope 三发合一);gate 段仍 narrow(W2)
         let dt_raw = q_raw.dtype;
+        // C1-W2 融合分派(默认关,挂案:27B 真权重域 k 值偏差立案中):
+        // OWL_QKV_FUSE=1 → qkv_norm_rope_insert 单发(norm+rope+KV 插入)
+        let pol = crate::module::kv_paged_policy(dt_raw);
+        let page_ok = pol.as_ref()
+            .map(|p| driver::attn::paged_decode_ok(self.hd, p.page))
+            .unwrap_or(false);
+        let force_naive = std::env::var_os("OWL_FORCE_NAIVE").is_some();
+        let use_fused_insert = dt_raw == Dtype::F16
+            && !force_naive
+            && std::env::var_os("OWL_QKV_FUSE").is_some()
+            && page_ok;
+        if use_fused_insert {
+            let page = pol.as_ref().unwrap().page;
+            let (cos_d, sin_d) = rope.cos_sin_decl();
+            let gate = narrow_strided(&q_raw, tokens * self.hq, self.hd * 2, self.hd, self.hd,
+                vec![tokens, self.hq * self.hd]);
+            let q = TensorOps::call(ids::ATTN_QKV_NORM_ROPE_INSERT)
+                .arg(&q_raw)
+                .arg(&k)
+                .arg(&v)
+                .arg(&kv.k_cache)
+                .arg(&kv.v_cache)
+                .arg(&kv.slots)
+                .arg(&self.q_norm.alpha_decl())
+                .arg(&self.k_norm.alpha_decl())
+                .arg(&cos_d)
+                .arg(&sin_d)
+                .arg(pos)
+                .arg_f32(self.q_norm.eps())
+                .arg_i32(self.hkv as i32)
+                .arg_i32(rope.rotary_half() as i32)
+                .arg_i32(page as i32)
+                .arg_i32(1)                                 // w_off = ×(1+w)
+                .aux(&[tokens, self.hq, self.hkv, self.hd, rope.rotary_half()])
+                .with_shape(Dtype::F16, vec![tokens, self.hq * self.hd]);
+            // 融合分派:v1 免 K0(cache 已由融合核写;树序:q 为 v1 父)
+            return self.paged_decode_v1(&q, &gate, kv, tokens, ctx, pol.as_ref().unwrap());
+        }
         let (q, gate, k) = if dt_raw == Dtype::F16 {
             // 融合:qk-norm(×(1+w))+ rotate-half partial rope 单发;
             // strided 读 q_raw(stride = q_raw 行长,head 步 = 2HD)
@@ -151,7 +189,22 @@ impl Attention {
             // 页配对律住 driver(attn::paged_decode_ok / resolve 内 wrapper
             // 选择)—— 谓词门控声明,执行期 env.page 终审)
             if !force_naive && driver::attn::paged_decode_ok(self.hd, pol.page) {
-                return self.paged_decode_output(&q, &k, &v, &gate, kv, tokens, ctx, &pol);
+                // 可达性:use_fused_insert 已覆盖同谓词;防御臂(理论不可达)
+                // —— K0 形态保留以防 future 分派变化
+                let wr = TensorOps::call(ids::ATTN_K0_WRITE).aux(&[tokens])
+                .arg(&k)
+                .arg(&v)
+                .arg(&kv.k_cache)
+                .arg(&kv.v_cache)
+                .arg(&kv.slots)
+                .arg_i32(self.hkv as i32 * self.hd as i32)
+                .arg_i32(self.hkv as i32 * self.hd as i32)
+                .arg_i32(self.hkv as i32)
+                .arg_i32(self.hd as i32)
+                .arg_i32(pol.page as i32)
+                .arg_i32(pol.x as i32)
+                .with_shape(dt, vec![1]);
+                return self.paged_decode_v1_k0(&q, &gate, &wr, kv, tokens, ctx, &pol);
             }
         }
         let y = TensorOps::call(ids::ATTN_NAIVE_DECODE) // 哨兵;核内有 bs 上界 guard
@@ -185,15 +238,26 @@ impl Attention {
         self.o_proj.forward(&y, ctx)
     }
 
-    /// paged decode(K1;F16 hd∈{128,256}):K0 写核(本 token k/v 入池)
-    /// + v1 分页打分。物理槽 = slots 表(恒等分页下 = 逻辑 pos);
-    /// context_lens = kv_lens 表。naive 路径保留为回退(小 hd/f32 锚链)。
-    fn paged_decode_output(
+    /// v1 分页打分(融合核变体;KV 写入已由融合核完成)。
+    fn paged_decode_v1(
         &self,
         q: &TensorOps,
-        k: &TensorOps,
-        v: &TensorOps,
         gate: &TensorOps,
+        kv: &KvBuffers,
+        tokens: usize,
+        ctx: &ForwardCtx,
+        pol: &crate::module::KvPagedPolicy,
+    ) -> TensorOps {
+        let wr = q.clone();
+        self.paged_decode_v1_k0(q, gate, &wr, kv, tokens, ctx, pol)
+    }
+
+    /// v1 分页打分(K0 形态;alibi 槽 = K0 哑输出,树序依赖边)
+    fn paged_decode_v1_k0(
+        &self,
+        q: &TensorOps,
+        gate: &TensorOps,
+        wr: &TensorOps,
         kv: &KvBuffers,
         tokens: usize,
         ctx: &ForwardCtx,
@@ -201,23 +265,7 @@ impl Attention {
     ) -> TensorOps {
         let dt = q.dtype;
         let page = pol.page as i32;
-        let x = pol.x;
-        // ① K0 写池:本 token k/v 入池(slots [T] = 物理槽表)
-        let wr = TensorOps::call(ids::ATTN_K0_WRITE).aux(&[tokens])
-        .arg(k)
-        .arg(v)
-        .arg(&kv.k_cache)
-        .arg(&kv.v_cache)
-        .arg(&kv.slots)
-        .arg_i32(self.hkv as i32 * self.hd as i32)
-        .arg_i32(self.hkv as i32 * self.hd as i32)
-        .arg_i32(self.hkv as i32)
-        .arg_i32(self.hd as i32)
-        .arg_i32(page)
-        .arg_i32(x as i32)
-        .with_shape(dt, vec![1]); // 哑输出(契约 4;双池就地写)
-        // ② v1 分页打分(不写 cache;context_lens = kv_lens)。树序依赖:
-        // 写核哑输出块接 alibi 槽(旗标 0 不解引用)⇒ 解释器先写后打分
+        // v1 分页打分(不写 cache;context_lens = kv_lens)
         let scale = 1.0 / (self.hd as f32).sqrt();
         let nb = kv.block_tables.shape().last().cloned().unwrap_or(1);
         // wrapper 页配对 + smem 契约公式 = driver 单源(env.page 终审;
@@ -229,7 +277,7 @@ impl Attention {
         .arg(&kv.v_cache)
         .arg(&kv.block_tables)
         .arg(&kv.kv_lens) // context_lens
-        .arg(&wr) // alibi 槽 = 写核输出块(树序依赖边;旗标 0 不解引用)
+        .arg(wr) // alibi 槽 = 写核输出块(树序依赖边;旗标 0 不解引用)
         .arg_i32(self.hkv as i32)
         .arg_f32(scale)
         .arg_i32(nb as i32)
@@ -742,15 +790,17 @@ mod f16_tests {
             return;
         }
         // 变因矩阵:hd × GQA(hkv)× 跨块;页 32 = policy 生产档,
-        // wrapper bs32 由 v1_name 页配对律裁决
-        v1_isolation_case(128, 2, 1, 8, 2).await;
-        v1_isolation_case(256, 2, 1, 8, 2).await;
-        v1_isolation_case(256, 8, 4, 8, 2).await; // GQA 单块
-        v1_isolation_case(256, 2, 1, 64, 2).await; // 跨 2 块(行 32 = 页边界首槽)
-        v1_isolation_case(256, 8, 4, 64, 2).await; // engine 全参档(GQA + 跨页)
+        // wrapper bs32 由 v1_name 页配对律裁决。
+        // (2026-10-02 W2 融合核 k 支转置案结案:allow_red 立案拐杖撤除,
+        // 全档硬门;融合核写池金标另见 gpu_w2_fused_kprobe)
+        v1_isolation_case_inner(128, 2, 1, 8, 2, false).await;
+        v1_isolation_case_inner(256, 2, 1, 8, 2, false).await;
+        v1_isolation_case_inner(256, 8, 4, 8, 2, false).await; // GQA 单块
+        v1_isolation_case_inner(256, 2, 1, 64, 2, false).await; // 跨 2 块(行 32 = 页边界首槽)
+        v1_isolation_case_inner(256, 8, 4, 64, 2, false).await; // engine 全参档(GQA + 跨页)
         // 规模档:真模型规模 T=4096/nb=128 单发射(4k e2e 同规模;
         // 曾以越界 slots 表复现 ILLEGAL_ADDRESS,修复后应为绿)
-        v1_isolation_case(256, 2, 1, 4096, 128).await;
+        v1_isolation_case_inner(256, 2, 1, 4096, 128, false).await;
         gpu_client_close().await;
     }
 
@@ -846,14 +896,15 @@ mod f16_tests {
                 .zip(want)
                 .map(|(a, b)| (a - b).abs())
                 .fold(0f32, f32::max);
-            if t == 16 || t == 32 && std::env::var_os("OWL_DEBUG").is_some() {
+            if std::env::var_os("OWL_RESOLVE_TRACE").is_some() {
                 eprintln!(
                     "[v1-isolation][r{t}] hd{hd} hq{hq} hkv{hkv} t{t_len}: got={:?} want={:?}",
                     &got[..6], &want[..6]
                 );
             }
             if maxd > 2e-2 {
-                eprintln!(
+                eprintln!(  // 诊断期:RED 全量打印(定位 hd128 档)
+                
                     "[v1-isolation][RED] hd{hd} hq{hq} hkv{hkv} t{t_len} 行{t} 偏差 {maxd:.4}\n  got = {:?}\n  want= {:?}\n  |got|={:?}",
                     &got[..6], &want[..6],
                     got.iter().fold(0f32, |a, &b| f32::max(a, b))
@@ -904,6 +955,228 @@ mod f16_tests {
     async fn gpu_client_close() {
         let mut gpu = gpu_client().await;
         gpu.close().await.expect("关机");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // W2 融合核 KV 写池金标门(k-probe;2026-10-02 立案→结案转正):
+    // 三臂 × host f32 金标 ——
+    //   A 臂 = 默认 decode 分派(norm_rope ×2 + K0;pos=t)
+    //   B 臂 = 融合分派(owl_qknorm_rope_kv_insert;pos=t)
+    //   C 臂 = 融合分派 + pos≡0(θ=0 → 池内容 = 纯 norm,norm/rope 解耦)
+    //   G/N = host 金标(f16 输入/权重 → f32 线性 → rmsnorm(1+w) → rope /
+    //         纯 norm;cos/sin 过 f16 量化 = 设备表同口径)
+    // 硬门:|A−G|/|B−G|/|C−N|/|A−B| ≤ 3e-2(f16 噪声 + cublas 累序容差)。
+    // 立案战果:融合核 k 支 [half,2half) 转置(n[d−h]·cos + n[d]·sin),
+    // pos=0 时整段写 n[d−h] —— 引擎 kv-hex 3-4% 偏差唯一现行犯
+    // (2026-10-02 一行修复,详见 fused.cu 同日头注)。
+    // ⚠️ 教训双条:金标自身曾有两处病(p×cos(freq) 运算优先级 /
+    // 转置式与被告同构)—— 判决前必须先证金标清白(A 臂双锚 + 直通维)。
+    // ═══════════════════════════════════════════════════════════════════
+    #[tokio::test]
+    async fn gpu_w2_fused_kprobe() {
+        if !gpu_enabled() {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return;
+        }
+        kprobe_case(128, 2, 1, 32).await;
+        kprobe_case(256, 2, 1, 32).await;
+        kprobe_case(256, 24, 4, 64).await; // 27B 全参档
+        gpu_client_close().await;
+    }
+
+    async fn kprobe_case(hd: usize, hq: usize, hkv: usize, rotary: usize) {
+        const TOL: f32 = 3e-2;
+        let hidden = 6usize;
+        let (page, x) = (32usize, 8usize);
+        let t_len = 8usize;
+        let nb = 1usize; // t_len=8 < page=32 → 单块
+        let half = rotary / 2;
+        let theta = 10_000.0f32;
+        let eps = 1e-6f32;
+        let halfb = |v: &[f32]| -> Vec<u8> {
+            v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect()
+        };
+        let f16r = |v: f32| -> f32 { half::f16::from_f32(v).to_f32() };
+
+        // 权重(同隔离档确定式;f16 装载)
+        let mut src = std::collections::HashMap::new();
+        src.insert("q_proj".to_string(), (0..hq * hd * 2 * hidden).map(|i| ((i as f32 + 3.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
+        src.insert("k_proj".to_string(), (0..hkv * hd * hidden).map(|i| ((i as f32 + 4.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
+        src.insert("v_proj".to_string(), (0..hkv * hd * hidden).map(|i| ((i as f32 + 5.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
+        src.insert("o_proj".to_string(), (0..hidden * hq * hd).map(|i| ((i as f32 + 6.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
+        src.insert("q_norm".to_string(), (0..hd).map(|i| ((i as f32 + 7.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
+        src.insert("k_norm".to_string(), (0..hd).map(|i| ((i as f32 + 8.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
+        let attn = Attention::new(hq, hkv, hd, hidden, eps, QuantPlan::F16);
+
+        let mut gpu = gpu_client().await;
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false };
+        crate::interpreters::eval_load(&attn, &mut gpu, &src, &lctx)
+            .await
+            .expect("attention f16 装载");
+        let rp = crate::layers::rope::Rope::new(t_len * 2, hd, rotary, 10_000.0).expect("rope new");
+        crate::interpreters::eval_load(&rp, &mut gpu, &rp.tables(), &lctx)
+            .await
+            .expect("rope 表物化");
+
+        // 双臂独立池(classic 布局)
+        let kc_a = crate::interpreters::eval_ops(
+            TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd / x, page, x]).step(), &mut gpu)
+            .await.expect("kc_a");
+        let vc_a = crate::interpreters::eval_ops(
+            TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd, page]).step(), &mut gpu)
+            .await.expect("vc_a");
+        let kc_b = crate::interpreters::eval_ops(
+            TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd / x, page, x]).step(), &mut gpu)
+            .await.expect("kc_b");
+        let vc_b = crate::interpreters::eval_ops(
+            TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd, page]).step(), &mut gpu)
+            .await.expect("vc_b");
+
+        // 输入(f16 位型量化)
+        let xs_f32: Vec<f32> = (0..t_len * hidden)
+            .map(|i| half::f16::from_f32(((i as f32) * 0.37 - 1.0).sin()).to_f32())
+            .collect();
+        let xs_bytes = halfb(&xs_f32);
+
+        // ── A 臂:默认分派(norm_rope + K0;pos=t)──
+        std::env::remove_var("OWL_QKV_FUSE");
+        std::env::remove_var("OWL_FORCE_NAIVE");
+        let kc_shape = vec![nb, hkv, hd / x, page, x];
+        let pool_a = kprobe_run_arm(&attn, &rp, &xs_bytes, t_len, hidden, hkv, hd, page,
+            false, &kc_a, &vc_a, &kc_shape, &mut gpu).await;
+        // ── B 臂:融合分派(pos=t)──
+        std::env::set_var("OWL_QKV_FUSE", "1");
+        let pool_b = kprobe_run_arm(&attn, &rp, &xs_bytes, t_len, hidden, hkv, hd, page,
+            false, &kc_b, &vc_b, &kc_shape, &mut gpu).await;
+        // ── C 臂:融合分派 + pos≡0(θ=0 → 池内容 = 纯 norm 输出,与 rope 解耦)──
+        let kc_c = crate::interpreters::eval_ops(
+            TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd / x, page, x]).step(), &mut gpu)
+            .await.expect("kc_c");
+        let vc_c = crate::interpreters::eval_ops(
+            TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd, page]).step(), &mut gpu)
+            .await.expect("vc_c");
+        let pool_c = kprobe_run_arm(&attn, &rp, &xs_bytes, t_len, hidden, hkv, hd, page,
+            true, &kc_c, &vc_c, &kc_shape, &mut gpu).await;
+        std::env::remove_var("OWL_QKV_FUSE");
+
+        // ── host 金标 G ──
+        let kw: Vec<f32> = src["k_proj"].iter().map(|&v| f16r(v)).collect();
+        let alpha: Vec<f32> = src["k_norm"].iter().map(|&v| f16r(v)).collect();
+        let xsr: Vec<f32> = xs_f32.iter().map(|&v| f16r(v)).collect();
+        let mut gold = vec![0f32; t_len * hkv * hd];
+        let mut gold_n = vec![0f32; t_len * hkv * hd]; // 纯 norm 期望(C 臂,θ=0)
+        for t in 0..t_len {
+            for kh in 0..hkv {
+                let mut k = vec![0f32; hd];
+                for d in 0..hd {
+                    let mut acc = 0f32;
+                    for c in 0..hidden {
+                        acc += kw[(kh * hd + d) * hidden + c] * xsr[t * hidden + c];
+                    }
+                    k[d] = acc;
+                }
+                let sum: f32 = k.iter().map(|v| v * v).sum();
+                let inv = 1.0 / (sum / hd as f32 + eps).sqrt();
+                let n: Vec<f32> = (0..hd).map(|d| k[d] * inv * (alpha[d] + 1.0)).collect();
+                let p = t as f32;
+                for d in 0..hd {
+                    let g = if d < half {
+                        let ang = p * theta.powf(-(2.0 * d as f32) / rotary as f32);
+                        let (cf, sf) = (f16r(ang.cos()), f16r(ang.sin()));
+                        n[d] * cf - n[d + half] * sf
+                    } else if d < 2 * half {
+                        let dd = d - half;
+                        let ang = p * theta.powf(-(2.0 * dd as f32) / rotary as f32);
+                        let (cf, sf) = (f16r(ang.cos()), f16r(ang.sin()));
+                        // HF rotate-half:out[i+h] = x[i+h]·cos + x[i]·sin(基值 = 自己)
+                        n[d] * cf + n[dd] * sf
+                    } else {
+                        n[d]
+                    };
+                    gold[(t * hkv + kh) * hd + d] = f16r(g);
+                    gold_n[(t * hkv + kh) * hd + d] = f16r(n[d]);
+                }
+            }
+        }
+
+        // ── 池提取(classic 寻址)+ 三方对拍(硬门)──
+        let vf = |pool: &[u8], t: usize, kh: usize, d: usize| -> f32 {
+            let b = t / page;
+            let off = t % page;
+            let i = (((b * hkv + kh) * (hd / x) + d / x) * page * x + off * x + d % x) * 2;
+            half::f16::from_le_bytes([pool[i], pool[i + 1]]).to_f32()
+        };
+        let g_at = |t: usize, kh: usize, d: usize| gold[(t * hkv + kh) * hd + d];
+        let (mut w_a, mut w_b, mut w_ab, mut w_c) = (0f32, 0f32, 0f32, 0f32);
+        let (mut rot_b, mut pass_b) = (0f32, 0f32); // 结构判据(旋转/直通分账,失败时定位用)
+        let mut worst = (0f32, 0usize, 0usize, 0usize); // (dev, t, kh, d)
+        for t in 0..t_len {
+            for kh in 0..hkv {
+                for d in 0..hd {
+                    let (a, b, g) = (vf(&pool_a, t, kh, d), vf(&pool_b, t, kh, d), g_at(t, kh, d));
+                    let c = vf(&pool_c, t, kh, d);
+                    w_c = w_c.max((c - gold_n[(t * hkv + kh) * hd + d]).abs());
+                    w_a = w_a.max((a - g).abs());
+                    w_b = w_b.max((b - g).abs());
+                    w_ab = w_ab.max((a - b).abs());
+                    if d < 2 * half {
+                        rot_b = rot_b.max((b - g).abs());
+                    } else {
+                        pass_b = pass_b.max((b - g).abs());
+                    }
+                    if (b - g).abs() > worst.0 {
+                        worst = ((b - g).abs(), t, kh, d);
+                    }
+                }
+            }
+        }
+        let r0 = 2 * half;
+        eprintln!(
+            "[k-probe hd{hd} r{rotary}] |A−G|={w_a:.4} |B−G|={w_b:.4} |C−N|={w_c:.4} |A−B|={w_ab:.4} \
+             (B 旋转维={rot_b:.4} 直通维={pass_b:.4} 最坏点 t={} kh={} d={})",
+            worst.1, worst.2, worst.3,
+        );
+        assert!(w_a <= TOL && w_b <= TOL && w_c <= TOL,
+            "[k-probe hd{hd} r{rotary}] 金标超差:A={w_a:.4} B={w_b:.4} C={w_c:.4}(门 {TOL})");
+        assert!(w_ab <= TOL,
+            "[k-probe hd{hd} r{rotary}] 融合/默认分派漂移:A−B={w_ab:.4}(门 {TOL})");
+    }
+
+    /// k-probe 单臂:逐 token decode 写池 → dtoh 终态 k 池(字节)
+    async fn kprobe_run_arm<D: crate::contract::DeviceClient>(
+        attn: &Attention,
+        rp: &crate::layers::rope::Rope,
+        xs_bytes: &[u8],
+        t_len: usize,
+        hidden: usize,
+        hkv: usize,
+        hd: usize,
+        page: usize,
+        pos_zero: bool,
+        kc: &crate::contract::Bytes,
+        vc: &crate::contract::Bytes,
+        kc_shape: &[usize],
+        gpu: &mut D,
+    ) -> Vec<u8> {
+        for t in 0..t_len {
+            let x_t = TensorOps::from_host(Dtype::F16, vec![1, hidden],
+                &xs_bytes[t * hidden * 2..(t + 1) * hidden * 2]);
+            let pv = if pos_zero { 0.0f32 } else { t as f32 };
+            let pos_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[pv]));
+            let kv = KvBuffers {
+                k_cache: TensorOps::of_block(kc.id, Dtype::F16, kc_shape.to_vec()),
+                v_cache: TensorOps::of_block(vc.id, Dtype::F16,
+                    vec![kc_shape[0], hkv, hd, page]),
+                slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32])),
+                kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32 + 1.0])),
+                block_tables: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0])),
+            };
+            let decl = attn.forward(&x_t, &ForwardCtx::decode(1, &pos_t, &kv, rp));
+            let _ = crate::testkit::harvest_f16(gpu, &decl).await;
+        }
+        let mut pool = vec![0u8; kc_shape.iter().product::<usize>() * 2];
+        gpu.dtoh(kc, &mut pool).await.expect("kc dtoh");
+        pool
     }
 
 

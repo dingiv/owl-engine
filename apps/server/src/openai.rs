@@ -73,7 +73,14 @@ pub fn session_id(key: &str) -> u64 {
     h.finish()
 }
 
-pub fn completion_json(id: &str, model: &str, text: &str, finish_reason: &str) -> Value {
+pub fn completion_json(
+    id: &str,
+    model: &str,
+    text: &str,
+    finish_reason: &str,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+) -> Value {
     json!({
         "id": id,
         "object": "chat.completion",
@@ -84,8 +91,13 @@ pub fn completion_json(id: &str, model: &str, text: &str, finish_reason: &str) -
             "message": {"role": "assistant", "content": text},
             "finish_reason": finish_reason,
         }],
-        // TODO: usage 真账(引擎事件面回吐 token 计数后接通)
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        // usage 真账(2026-10-02):prompt_tokens = 引擎 Prefill 事件 total;
+        // completion_tokens = Token 事件计数(1 事件 = 1 采样步 = 1 token)
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
     })
 }
 

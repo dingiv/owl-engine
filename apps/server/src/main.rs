@@ -206,9 +206,13 @@ async fn chat<W: tokio::io::AsyncWrite + Unpin>(
         return http::respond_json(w, 503, &openai::error_json("引擎退役")).await;
     }
     // 首笔:受理确认 / 提交拒绝(预算越界等,submit 边界落地)
+    // usage 真账:Accepted 捎带 prompt 数;Token 事件计数 = completion 数
+    let mut completion_tokens = 0usize;
+    let mut prompt_tokens = 0usize;
     let turn = match sink_rx.recv().await {
-        Some(SinkEvent::Accepted { session, turn }) => {
+        Some(SinkEvent::Accepted { session, turn, prompt_tokens: pt }) => {
             eprintln!("[chat] 受理 session {session:#x} turn {turn}(stream={stream_mode})");
+            prompt_tokens = pt;
             Some((session, turn))
         }
         Some(SinkEvent::Rejected { err }) => {
@@ -220,13 +224,21 @@ async fn chat<W: tokio::io::AsyncWrite + Unpin>(
     let id = openai::completion_id();
     if stream_mode {
         // ── SSE:role 首帧 → Token 逐帧 → finish + [DONE] ──
+        // (2026-10-02:role 帧延到首个 Token —— 提前发会让测速端把
+        // HTTP 往返当 TTFT,长 prompt 的 prefill 全被藏进首帧延迟)
         http::respond_sse_head(w).await?;
-        let first =
-            openai::chunk_json(&id, model_name, json!({"role": "assistant", "content": ""}), None);
-        http::sse_data(w, &serde_json::to_string(&first).unwrap_or_default()).await?;
+        let mut role_sent = false;
         loop {
             match sink_rx.recv().await {
                 Some(SinkEvent::Turn(TurnEvent::Token { delta, .. })) => {
+                    if !role_sent {
+                        let first = openai::chunk_json(
+                            &id, model_name, json!({"role": "assistant", "content": ""}), None,
+                        );
+                        http::sse_data(w, &serde_json::to_string(&first).unwrap_or_default()).await?;
+                        role_sent = true;
+                    }
+                    completion_tokens += 1;
                     let chunk =
                         openai::chunk_json(&id, model_name, json!({"content": delta}), None);
                     http::sse_data(w, &serde_json::to_string(&chunk).unwrap_or_default()).await?;
@@ -248,7 +260,10 @@ async fn chat<W: tokio::io::AsyncWrite + Unpin>(
                     let _ = http::sse_data(w, "[DONE]").await;
                     break;
                 }
-                // Prefill 进度帧(架子不外吐;留作 SSE event 扩展位)
+                // Prefill 进度帧(末笔 total = prompt token 数,入 usage)
+                Some(SinkEvent::Turn(TurnEvent::Prefill { total, .. })) => {
+                    prompt_tokens = total;
+                }
                 Some(SinkEvent::Turn(_)) => {}
                 _ => break,
             }
@@ -257,11 +272,19 @@ async fn chat<W: tokio::io::AsyncWrite + Unpin>(
         // ── 非流式:攒全文整包 ──
         loop {
             match sink_rx.recv().await {
+                Some(SinkEvent::Turn(TurnEvent::Token { .. })) => {
+                    completion_tokens += 1;
+                }
+                Some(SinkEvent::Turn(TurnEvent::Prefill { total, .. })) => {
+                    prompt_tokens = total;
+                }
                 Some(SinkEvent::Turn(TurnEvent::Completed { text, .. })) => {
                     return http::respond_json(
                         w,
                         200,
-                        &openai::completion_json(&id, model_name, &text, "stop"),
+                        &openai::completion_json(
+                            &id, model_name, &text, "stop", prompt_tokens, completion_tokens,
+                        ),
                     )
                     .await;
                 }

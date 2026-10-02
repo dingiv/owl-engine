@@ -295,6 +295,10 @@ where
                 aux,
                 scalars: &scalars,
             });
+            if std::env::var_os("OWL_RESOLVE_TRACE").is_some() {
+                eprintln!("[call] {} -> {} grid={:?} block={:?} smem={} n_elems={}",
+                    op.0, pick.name, pick.shape.grid, pick.shape.block, pick.shape.smem, n_elems);
+            }
             let kernel = crate::kernel::with_pick(pick);
             // 以下与 Op::Kernel 臂同构(登记表 dtype 守门 + alloc + lower + launch)
             if let Some(e) = crate::kernel::lookup(kernel.name) {

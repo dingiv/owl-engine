@@ -23,7 +23,7 @@ use crate::engine::EngineConfig;
 use crate::graph_plan::GraphPlan;
 use crate::scheduler::{SchedulerOutput, StepAction};
 use crate::session::SessionTable;
-use crate::state::{GDN_SLOTS, StatePool};
+use crate::state::{gdn_slots, StatePool};
 use crate::turn::{TurnEvent, TurnSpec};
 
 type Result<T> = std::result::Result<T, ModelError>;
@@ -122,8 +122,8 @@ impl<D: DeviceClient> RunningEngine<D> {
             )));
         }
         let (session_id, ephemeral) = match session {
-            Some(id) => (self.sessions.get_or_create(Some(id), GDN_SLOTS)?.0, false),
-            None => (self.sessions.get_or_create(None, GDN_SLOTS)?.0, true),
+            Some(id) => (self.sessions.get_or_create(Some(id), gdn_slots())?.0, false),
+            None => (self.sessions.get_or_create(None, gdn_slots())?.0, true),
         };
         let id = self.next_id;
         self.next_id += 1;
@@ -149,6 +149,21 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 会话账观测(已入 KV 的 token 数;None = 会话不存在)
     pub fn session_len(&self, id: u64) -> Option<usize> {
         self.sessions.get(id).map(|s| s.cached_len)
+    }
+
+    /// 提交后的 prompt token 数(turn 尚在队列/活跃期内有效;usage 真账
+    /// 单源 —— 服务层在 submit 后即刻取用,终了后 turn 已焚,返回 None)
+    pub fn turn_prompt_len(&self, turn: u64) -> Option<usize> {
+        self.queue
+            .iter()
+            .find(|t| t.id == turn)
+            .map(|t| t.prompt_ids.len())
+            .or_else(|| {
+                self.active
+                    .as_ref()
+                    .filter(|a| a.id == turn)
+                    .map(|a| a.prompt_ids.len())
+            })
     }
 
     /// 推进到下一个事件点(每调用 = 活跃 turn 的一个采样步,或 turn 的

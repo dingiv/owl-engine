@@ -67,6 +67,7 @@ extern "C" __global__ void owl_norm_rope_f16(
     const float n = xf * inv * (w_off ? (wf + 1.0f) : wf);
     const size_t p = (size_t)pos[t];
     const size_t base = (t * gridDim.y + h) * hd;
+
     if (d < half) {
         // 配对 (d, d+half):伙伴侧 n 值就地重算(strided 读已入 L2)
         const float xb = __half2float(xs[d + half]);
@@ -104,4 +105,166 @@ extern "C" __global__ void owl_silu_and_mul_f16(
         r.y = (gf.y / (1.0f + expf(-gf.y))) * uf.y;
         *reinterpret_cast<__half2*>(out + i) = __floats2half2_rn(r.x, r.y);
     }
+}
+
+// ----------------------------------------------------------------------------
+// owl_fused_add_rmsnorm_f16(vLLM layernorm_kernels.cu fused_add_rms_norm port;
+// 双原地语义 —— residual 块原地 += mixed(已知副作用,GDN conv_upd 同款
+// 单流保序律),out = rmsnorm(residual)·w^{w_off} 单输出)。
+// 替 decoder 层 [残差 add + post_ln rmsnorm] 两发;grid (rows,1,1),
+// block (256,1,1),smem 256·4B(行归约;n = hidden 5120,行内分段循环)。
+// ----------------------------------------------------------------------------
+extern "C" __global__ void owl_fused_add_rmsnorm_f16(
+    const __half* __restrict__ mixed,       // mixer 输出(只读)
+    __half* __restrict__ residual,          // in/out:+= mixed(原地副作用)
+    const __half* __restrict__ w,           // [n]
+    float eps,
+    size_t n,
+    int w_off,
+    __half* __restrict__ out)               // [rows, n] = rmsnorm(residual)·w
+{
+    const size_t row = blockIdx.x;
+    const size_t base = row * n;
+    __half* r = residual + base;
+    const __half* m = mixed + base;
+    __shared__ float smem[256];
+
+    float local = 0.0f;
+    for (size_t i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = __half2float(m[i]) + __half2float(r[i]);
+        r[i] = __float2half(v);            // 原地写(回收前根已收割,单流序)
+        local += v * v;
+    }
+    smem[threadIdx.x] = local;
+    __syncthreads();
+    for (size_t s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) {
+        if (threadIdx.x < s2) smem[threadIdx.x] += smem[threadIdx.x + s2];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(smem[0] / (float)n + eps);
+    for (size_t i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = __half2float(r[i]);
+        const float wf = __half2float(w[i]);
+        out[base + i] = __float2half(v * inv * (w_off ? (wf + 1.0f) : wf));
+    }
+}
+
+// ----------------------------------------------------------------------------
+// owl_qknorm_rope_kv_insert_f16(Wave-2 头号;port 源 = vLLM
+// fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu 的 (token, head-slot)
+// warp 结构,适配 owl gated 布局与 classic cache 寻址):
+//
+//   q 头:blockIdx.y ∈ [0, Hq)     —— q_raw 的 value 半段 strided 读 →
+//                                    qk-norm(×(1+w)^{w_off})+ rope → q_out
+//   k 头:blockIdx.y ∈ [Hq, Hq+Hkv) —— k 的 qk-norm + rope → **key_cache
+//                                    slot 散写**;同块捎带 v → value_cache
+//
+// 替三发:norm_rope(q)+ norm_rope(k)+ reshape_and_cache(k,v)。
+// q_out = 尾参(v1 注意力输入;cache 写 = 原地副作用,单流保序 ——
+// v1 为本核输出块的消费者,树序天然后置)。
+// cache 寻址 = reshape_and_cache 逐字(classic:kc [nb,Hkv,D/x,page,x],
+// vc [nb,Hkv,D,page];slot<0 = padding 跳写,k 头仍出 q…… k 头 return
+// 前 q_out 与本核无关,直接 return 安全)。
+// grid (T, Hq+Hkv, 1);block (hd, 1, 1);smem = hd·4B(行归约)。
+// ----------------------------------------------------------------------------
+extern "C" __global__ void owl_qknorm_rope_kv_insert_f16(
+    const __half* __restrict__ q_raw,   // [T, Hq·2HD](per-head [value|gate])
+    const __half* __restrict__ k,       // [T, Hkv·HD]
+    const __half* __restrict__ v,       // [T, Hkv·HD]
+    __half* __restrict__ key_cache,     // [nb, Hkv, hd/x, page, x]
+    __half* __restrict__ value_cache,   // [nb, Hkv, hd, page]
+    const float* __restrict__ slots,    // [T]
+    const __half* __restrict__ q_w,     // [hd]
+    const __half* __restrict__ k_w,     // [hd]
+    const __half* __restrict__ cos_t,   // [max_pos, half]
+    const __half* __restrict__ sin_t,   // [max_pos, half]
+    const float* __restrict__ pos,      // [T]
+    float eps,
+    int hkv, int half, int page, int w_off,
+    __half* __restrict__ q_out)         // [T, Hq·hd](尾参契约 4)
+{
+    const size_t t = blockIdx.x;
+    const size_t head = blockIdx.y;
+    const size_t d = threadIdx.x;
+    const size_t hd = blockDim.x;
+    const size_t hq = gridDim.y - (size_t)hkv;
+    const long long slot = (long long)slots[t];
+
+    if (head < hq) {
+        // ---- q:value 半段 strided 读 + norm + rope → q_out ----
+        const size_t row_stride = hq * 2 * hd;
+        const __half* xs = q_raw + t * row_stride + head * 2 * hd;
+        extern __shared__ float smem[];
+        const float xf = __half2float(xs[d]);
+        smem[d] = xf * xf;
+        __syncthreads();
+        for (size_t s2 = hd / 2; s2 > 0; s2 >>= 1) {
+            if (d < s2) smem[d] += smem[d + s2];
+            __syncthreads();
+        }
+        const float inv = rsqrtf(smem[0] / (float)hd + eps);
+        const float wf = __half2float(q_w[d]);
+        const float n = xf * inv * (w_off ? (wf + 1.0f) : wf);
+        const size_t p = (size_t)pos[t];
+        const size_t base = (t * hq + head) * hd;
+        if (d < (size_t)half) {
+            const float xb = __half2float(xs[d + half]);
+            const float wb = __half2float(q_w[d + half]);
+            const float nb = xb * inv * (w_off ? (wb + 1.0f) : wb);
+            const float cf = __half2float(cos_t[p * half + d]);
+            const float sf = __half2float(sin_t[p * half + d]);
+            q_out[base + d] = __float2half(n * cf - nb * sf);
+            q_out[base + d + half] = __float2half(nb * cf + n * sf);
+        } else if (d >= 2 * (size_t)half) {
+            q_out[base + d] = __float2half(n);
+        }
+            return;
+    }
+
+    // ---- k 头:qk-norm + rope → key_cache;捎带 v → value_cache ----
+    if (slot < 0) return;   // padding 跳写(K0 契约)
+    const size_t kh = head - hq;
+    const __half* ks = k + t * (size_t)hkv * hd + kh * hd;
+    extern __shared__ float smem[];
+    const float kf = __half2float(ks[d]);
+    smem[d] = kf * kf;
+    __syncthreads();
+    for (size_t s2 = hd / 2; s2 > 0; s2 >>= 1) {
+        if (d < s2) smem[d] += smem[d + s2];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(smem[0] / (float)hd + eps);
+    const float wf = __half2float(k_w[d]);
+    float n = kf * inv * (w_off ? (wf + 1.0f) : wf);
+    const size_t p = (size_t)pos[t];
+    if (d < (size_t)half) {
+        // 配对 (d, d+half):每 thread 只写自己的 d 位(伙伴位由 d+half 写)
+        const float xb = __half2float(ks[d + half]);
+        const float wb = __half2float(k_w[d + half]);
+        const float nb = xb * inv * (w_off ? (wb + 1.0f) : wb);
+        const float cf = __half2float(cos_t[p * half + d]);
+        const float sf = __half2float(sin_t[p * half + d]);
+        n = n * cf - nb * sf;
+    } else if (d >= 2 * (size_t)half) {
+        // partial 维直通(n 已是 norm 值)
+    } else {
+        // d ∈ [half, 2half):伙伴 = d - half(基值 = 自己 n[d],旋转伙伴 n[d-half]
+        // —— 2026-10-02 转置案修复:曾写 nb*cf + n*sf(基/伙伴互换,pos=0 时
+        // 直接写 n[d-half],引擎 kv-hex 3-4% 偏差真凶)
+        const float xb = __half2float(ks[d - half]);
+        const float wb = __half2float(k_w[d - half]);
+        const float nb = xb * inv * (w_off ? (wb + 1.0f) : wb);
+        const float cf = __half2float(cos_t[p * half + d - half]);
+        const float sf = __half2float(sin_t[p * half + d - half]);
+        n = n * cf + nb * sf;
+    }
+    // 诊断(隔离 hd128 档 slot 2 取证):分段值打印
+    const int block_idx = (int)(slot / page);
+    const int off = (int)(slot % page);
+    const size_t kk = ((block_idx * (size_t)hkv + kh) * (hd / 8) + d / 8) * page * 8
+                    + off * 8 + d % 8;
+    key_cache[kk] = __float2half(n);
+    // v 捎带拷贝(线性寻址)
+    const size_t vi = ((block_idx * (size_t)hkv + kh) * hd + d) * page + off;
+    value_cache[vi] = v[t * (size_t)hkv * hd + kh * hd + d];
 }

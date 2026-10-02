@@ -39,6 +39,8 @@ pub mod ids {
     pub const LOAD_CT_REPACK: OpId = OpId("load.ct_repack");
     pub const ATTN_NORM_ROPE: OpId = OpId("attn.norm_rope");
     pub const MLP_SILU_AND_MUL: OpId = OpId("mlp.silu_and_mul");
+    pub const LN_FUSED_ADD_RMSNORM: OpId = OpId("ln.fused_add_rmsnorm");
+    pub const ATTN_QKV_NORM_ROPE_INSERT: OpId = OpId("attn.qkv_norm_rope_insert");
 }
 
 /// contract::Dtype → driver::DType(契约类型不过 kernels,转换住消费侧)

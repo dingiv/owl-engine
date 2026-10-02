@@ -31,7 +31,7 @@ pub enum EngineReq {
 /// actor → 请求方事件(首笔必为 Accepted/Rejected,其后 Turn 流)
 #[derive(Clone, Debug)]
 pub enum SinkEvent {
-    Accepted { session: u64, turn: u64 },
+    Accepted { session: u64, turn: u64, prompt_tokens: usize },
     Rejected { err: String },
     Turn(TurnEvent),
 }
@@ -84,8 +84,12 @@ async fn accept<D: DeviceClient>(
     let EngineReq::Chat { session, prompt, max_new, sink } = req;
     match running.submit_session(session, prompt, max_new) {
         Ok((sid, tid)) => {
+            // usage 真账:prompt token 数 = 队列/活跃 turn 的 prompt_ids
+            // 长度(末块 prefill 不发 Prefill 事件,短 prompt 场景事件面
+            // 拿不到 —— submit 后即刻取用,单源)
+            let pt = running.turn_prompt_len(tid).unwrap_or(0);
             sinks.insert(tid, sink.clone());
-            let _ = sink.send(SinkEvent::Accepted { session: sid, turn: tid }).await;
+            let _ = sink.send(SinkEvent::Accepted { session: sid, turn: tid, prompt_tokens: pt }).await;
         }
         Err(e) => {
             let _ = sink.send(SinkEvent::Rejected { err: e.to_string() }).await;
