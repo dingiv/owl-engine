@@ -8,7 +8,7 @@
 //! 状态块触碰一律经 StatePool(state.rs),不直摸块句柄。
 
 use owl_iface::contract::{DeviceClient, Dtype, ModelError};
-use owl_models::interpreters::eval_ops_scoped;
+use owl_models::interpreters::{eval_ops_scoped, eval_ops_scoped_env};
 use owl_models::layers::gdn::GdnBuffers;
 use owl_models::module::{FiPrefillCtx, ForwardCtx, KvBuffers, Module};
 use owl_models::tokenizer::Tokenizer;
@@ -194,7 +194,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 eprintln!("[sample-dump] t{turn_id} s{step}: sampled={nt} hist={} pen={}", history.len(), std::env::var("OWL_REP_PENALTY").unwrap_or_else(|_| "d".into()));
             }
             nt
-        } else if std::env::var_os("OWL_HOST_ARGMAX").is_some() {
+        } else if self.env.diag.host_argmax {
             let mut logits = self.session.read_output_f32("logits").await?;
             logits.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |a, (i, &v)| {
                 if v > a.1 { (i, v) } else { a }
@@ -362,9 +362,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         } else {
             None
         };
-        let ctx = ForwardCtx::model_prefill(
+        let mut ctx = ForwardCtx::model_prefill(
             t, &pos_t, &kvs_step, &self.rope, &gdns_step, &slots_t, &lens_t, &gdn_slot, base, fi,
         );
+        ctx.env = self.env;
         let face = self.session.face_mut();
         let vocab = self.model.vocab_size();
         if is_last {
@@ -373,7 +374,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // logits [1,V] 而非 [T,V](大 chunk 内存/算力双省)
             let tree = self.model.forward_last(&ids_t, &ctx);
             let tok = owl_models::ops::argmax_f32idx(&tree, vocab, 0);
-            let (b, arena) = eval_ops_scoped(tok.step(), face).await?;
+            let (b, arena) = eval_ops_scoped_env(tok.step(), face, self.env).await?;
             let mut buf = [0u8; 4];
             face.dtoh(&b, &mut buf).await?;
             face.free(&arena).await?; // E2a:根已收割,中间块归池
@@ -382,7 +383,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         } else {
             // 中间块:last_hidden 根(状态推进完整;lm_head 免算)
             let tree = self.model.last_hidden(&ids_t, &ctx);
-            let (b, arena) = eval_ops_scoped(tree.step(), face).await?;
+            let (b, arena) = eval_ops_scoped_env(tree.step(), face, self.env).await?;
             let esz = if d.dtype == Dtype::F16 { 2 } else { 4 };
             let mut buf = vec![0u8; t * d.hidden * esz];
             face.dtoh(&b, &mut buf).await?;

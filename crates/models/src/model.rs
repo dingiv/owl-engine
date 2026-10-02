@@ -151,6 +151,7 @@ impl Model {
             ctx_base: ctx.ctx_base,
             fi: ctx.fi.clone(),
             fi_kvi: kvi,
+            env: ctx.env,
         }
     }
 

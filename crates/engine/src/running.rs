@@ -69,6 +69,8 @@ pub struct RunningEngine<D: DeviceClient> {
     pub(crate) rope: Rope,
     /// KV 物理块账房(E2b;块链按会话分派,池内 ref 计数)
     pub(crate) blocks_m: BlockManager,
+    /// 解释器执行环境(EnvProvider;逐 chunk/step 注入 ctx)
+    pub(crate) env: owl_models::env::EnvProvider,
 }
 
 impl<D: DeviceClient> RunningEngine<D> {

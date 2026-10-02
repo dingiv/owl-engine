@@ -132,6 +132,7 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "ops.sigmoid" => ops::sigmoid(dt),
         "attn.k0_write" => attn::k0_write(ax(0)),
         "attn.k0_dual" => attn::k0_dual(ax(0)),
+        "attn.k0_dual_fp8kv" => attn::k0_dual_fp8kv(ax(0)),
         "attn.paged_decode" => attn::paged_decode_v1(req.env, dt, ax(0), ax(1), ax(2), ax(3)), // aux = [hd, hq, hkv, nb]
         "attn.paged_prefill" => attn::paged_prefill(req.env, dt, ax(0), ax(1), ax(2), ax(3)), // aux = [hd, hkv, hq, tokens]
         "attn.prefill_split" => {
@@ -323,10 +324,18 @@ pub mod attn {
         }
     }
 
-    /// K0-dual(FlashInfer 配套;classic K/V + kHND K 影子一次发射)
+    /// K0-dual(FlashInfer 配套;classic K/V + kNHD K/V 影子一次发射)
     pub fn k0_dual(tokens: usize) -> KernelPick {
         KernelPick {
             name: "owl_reshape_and_cache_dual_f16",
+            shape: Shape { grid: (tokens as u32, 1, 1), block: (256, 1, 1), smem: 0 },
+        }
+    }
+
+    /// K0-dual fp8 KV(K/V 影子写 e4m3;classic f16 照写)
+    pub fn k0_dual_fp8kv(tokens: usize) -> KernelPick {
+        KernelPick {
+            name: "owl_reshape_and_cache_dual_f16_fp8kv",
             shape: Shape { grid: (tokens as u32, 1, 1), block: (256, 1, 1), smem: 0 },
         }
     }

@@ -821,6 +821,28 @@ impl GpuServer {
         let gpu_prof = std::env::var_os("OWL_GPU_PROF").is_some();
         if gpu_prof && !self.ctx().capture_stream() {
             let name = msg.kernel.name.clone();
+            // 形状特化 tag:marlin 按 m×n×k 拆账(双峰形状定位,2026-10-03)
+            let shape_tag = match msg.kernel.name.as_str() { // v2
+                n if n == owl_kernels::marlin::GEMM_W4A16
+                    || n == owl_kernels::marlin::GEMM_W4A16_AWQ =>
+                {
+                    let mut dims: Vec<u64> = Vec::new();
+                    for a in &msg.args {
+                        if let Arg::U64(v) = a {
+                            dims.push(*v);
+                        }
+                    }
+                    // 槽序:[T a, T b, T out, T (scales/zs/ws/ctmp)..., sz m, sz k, sz n, sz gs]
+                    // m/k/n = 末 4 sz 的前三个
+                    if dims.len() >= 3 {
+                        let (m, k, nn) = (dims[dims.len() - 4], dims[dims.len() - 3], dims[dims.len() - 2]);
+                        format!("gpu.marlin.{m}x{nn}x{k}")
+                    } else {
+                        format!("gpu.{name}")
+                    }
+                }
+                _ => format!("gpu.{name}"),
+            };
             let t0 = std::time::Instant::now();
             let r = self.handle_launch_inner(msg, ack);
             if let Ok(stream) = self.ctx().stream(STREAM_COMPUTE) {
@@ -828,6 +850,7 @@ impl GpuServer {
             }
             let dt = t0.elapsed();
             owl_shared::metrics::with_metrics_store(|s| {
+                s.timer_record_tag(&shape_tag, dt, file!(), 0);
                 s.timer_record_tag(&format!("gpu.{name}"), dt, file!(), 0);
             });
             return r;
@@ -918,7 +941,11 @@ impl GpuServer {
             name if name == owl_kernels::marlin::GEMM_W4A16_AWQ => {
                 self.handle_marlin_gemm_awq(msg, ack)
             }
-            name if name == owl_kernels::flashinfer::PREFILL_FI => self.handle_fi_prefill(msg, ack),
+            name if name == owl_kernels::flashinfer::PREFILL_FI
+                || name == owl_kernels::flashinfer::PREFILL_FI_FP8KV =>
+            {
+                self.handle_fi_prefill(msg, ack)
+            }
             other => ack.send(Err(ModelError::Msg(format!(
                 "foreign kernel {other}: 无执行臂(owl_kernels::is_foreign_op 与分派表失配)"
             )))),
@@ -1212,28 +1239,52 @@ impl GpuServer {
         }
         let _ = (_cta, _split);
         let plan15 = self.fi.as_ref().unwrap().plan.as_ref().unwrap().plan15;
-        let fi_run_t0 = std::time::Instant::now(); // v2
+        let fi_run_t0 = std::time::Instant::now();
+        let fp8kv = msg.kernel.name == owl_kernels::flashinfer::PREFILL_FI_FP8KV;
         let r = unsafe {
-            owl_kernels::flashinfer::owl_fi_prefill_run(
-                ptrs[0] as *const c_void,
-                ptrs[1] as *const c_void,
-                ptrs[2] as *const c_void,
-                ptrs[8] as *mut c_void,
-                ptrs[3] as *mut i32,
-                ptrs[4] as *mut i32,
-                ptrs[5] as *mut i32,
-                ptrs[6] as *mut i32,
-                plan15.as_ptr(),
-                int_ws_ptr,
-                int_ws_len,
-                float_ws_ptr,
-                float_ws_len,
-                1, // batch
-                hq as i32, hkv as i32, hd as i32, page as i32,
-                total_rows as i32,
-                sm_scale,
-                stream.cu_stream() as *mut c_void,
-            )
+            if fp8kv {
+                owl_kernels::flashinfer::owl_fi_prefill_run_fp8kv(
+                    ptrs[0] as *const c_void,
+                    ptrs[1] as *const c_void,
+                    ptrs[2] as *const c_void,
+                    ptrs[8] as *mut c_void,
+                    ptrs[3] as *mut i32,
+                    ptrs[4] as *mut i32,
+                    ptrs[5] as *mut i32,
+                    ptrs[6] as *mut i32,
+                    plan15.as_ptr(),
+                    int_ws_ptr,
+                    int_ws_len,
+                    float_ws_ptr,
+                    float_ws_len,
+                    1, // batch
+                    hq as i32, hkv as i32, hd as i32, page as i32,
+                    total_rows as i32,
+                    sm_scale,
+                    stream.cu_stream() as *mut c_void,
+                )
+            } else {
+                owl_kernels::flashinfer::owl_fi_prefill_run(
+                    ptrs[0] as *const c_void,
+                    ptrs[1] as *const c_void,
+                    ptrs[2] as *const c_void,
+                    ptrs[8] as *mut c_void,
+                    ptrs[3] as *mut i32,
+                    ptrs[4] as *mut i32,
+                    ptrs[5] as *mut i32,
+                    ptrs[6] as *mut i32,
+                    plan15.as_ptr(),
+                    int_ws_ptr,
+                    int_ws_len,
+                    float_ws_ptr,
+                    float_ws_len,
+                    1, // batch
+                    hq as i32, hkv as i32, hd as i32, page as i32,
+                    total_rows as i32,
+                    sm_scale,
+                    stream.cu_stream() as *mut c_void,
+                )
+            }
         };
         owl_shared::metrics::with_metrics_store(|m| {
             m.timer_record_tag("fi.run", fi_run_t0.elapsed(), file!(), line!())

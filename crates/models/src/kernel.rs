@@ -135,6 +135,7 @@ pub static REGISTRY: &[Entry] = &[
     //      vLLM classic 布局,K1/K2 paged_attention 同款;适配认领见 .cu 头注)----
     Entry { name: "vllm_reshape_and_cache_f16", source: sources::attention::RESHAPE_AND_CACHE_F16, args: "T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_reshape_and_cache_dual_f16", source: sources::attention::RESHAPE_AND_CACHE_DUAL_F16, args: "T,T,T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "owl_reshape_and_cache_dual_f16_fp8kv", source: sources::attention::RESHAPE_AND_CACHE_DUAL_F16_FP8KV, args: "T,T,T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     // prefill bs16 变体(池页 16,与 decode v1/v2 同池;hd256 = qwen3.5-0.8B 档)
     // prefill 主条目 = bs32(vendor 契约 BLOCK∈{32,64};bs16 越契约已废)
     Entry { name: "vllm_chunked_prefill_paged_attn_opt_f16_hd128", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },

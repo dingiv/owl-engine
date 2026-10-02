@@ -91,10 +91,12 @@ pub struct ForwardCtx<'a> {
     /// prefill:chunk 绝对起点(块首 token 的绝对 pos;split attention 的
     /// partition 网格声明需要 max_ctx = ctx_base + tokens;builder 缺省 0)
     pub ctx_base: usize,
-    /// FlashInfer prefill 面(None = 走旧分派;engine 按 OWL_FLASHINFER 注入)
+    /// FlashInfer prefill 面(None = 走旧分派;engine 按 env.attn.fi 注入)
     pub fi: Option<FiPrefillCtx<'a>>,
     /// 本层注意力序号(layer_ctx 派生;fi 影子切片下标)
     pub fi_kvi: usize,
+    /// 解释器执行环境(EnvProvider;engine/测试构造定制,构造器取默认)
+    pub env: crate::env::EnvProvider,
 }
 
 impl<'a> ForwardCtx<'a> {
@@ -115,6 +117,7 @@ impl<'a> ForwardCtx<'a> {
             ctx_base: 0,
             fi: None,
             fi_kvi: 0,
+            env: crate::env::EnvProvider::default(),
         }
     }
 
@@ -140,6 +143,7 @@ impl<'a> ForwardCtx<'a> {
             ctx_base: 0,
             fi: None,
             fi_kvi: 0,
+            env: crate::env::EnvProvider::default(),
         }
     }
 
@@ -160,6 +164,7 @@ impl<'a> ForwardCtx<'a> {
             ctx_base: 0,
             fi: None,
             fi_kvi: 0,
+            env: crate::env::EnvProvider::default(),
         }
     }
 
@@ -184,6 +189,7 @@ impl<'a> ForwardCtx<'a> {
             ctx_base: 0,
             fi: None,
             fi_kvi: 0,
+            env: crate::env::EnvProvider::default(),
         }
     }
 
@@ -211,6 +217,7 @@ impl<'a> ForwardCtx<'a> {
             ctx_base: 0,
             fi: None,
             fi_kvi: 0,
+            env: crate::env::EnvProvider::default(),
         }
     }
 
@@ -238,6 +245,7 @@ impl<'a> ForwardCtx<'a> {
             ctx_base: 0,
             fi: None,
             fi_kvi: 0,
+            env: crate::env::EnvProvider::default(),
         }
     }
 
@@ -271,6 +279,7 @@ impl<'a> ForwardCtx<'a> {
             ctx_base,
             fi,
             fi_kvi: 0,
+            env: crate::env::EnvProvider::default(),
         }
     }
 }
@@ -680,9 +689,10 @@ impl FromIterator<LoadEntry> for LoadManifest {
 /// 就传入 —— 禁 `enable_*` 可变后置范式(声明期定形,层容器零突变面)。
 /// 尺寸门控(marlin_eligible)在 Linear 构造期定形:不安全 n 自动落 f16
 /// (装载源同谓词,单一来源)。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum QuantPlan {
-    /// f16 直读(基线)
+    /// f16 直读(基线;默认)
+    #[default]
     F16,
     /// W4A16 marlin(g128-sym;ct pack-quantized U4B8)
     W4A16,

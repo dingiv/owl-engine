@@ -29,6 +29,8 @@ pub struct LoadedModel {
     pub(crate) tokenizer: Tokenizer,
     pub(crate) rope: Rope,
     pub(crate) spec: ModelSpec,
+    /// 量化方案(环境真值;EnvProvider.quant 注入源)
+    pub(crate) quant_plan: owl_models::module::QuantPlan,
 }
 
 /// 面向上层的模型加载器(经引擎的 face;spec 声明驱动)
@@ -49,9 +51,11 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let model = Arc::new(load_0_8b(dir, self.face).await?);
         let tokenizer = load_tokenizer(dir)?;
         let rope = Rope::new(262_144, 256, 64, 10_000_000.0)?;
+        let quant_plan = owl_models::module::QuantPlan::F16;
         let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1, device_repack: false };
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
-        Ok(LoadedModel { model, tokenizer, rope, spec })
+        Ok(LoadedModel { model, tokenizer, rope, spec, quant_plan })
+
     }
 
     /// W4A16 装载(E3;llm-compressor 产物目录):装载期重排到 marlin
@@ -65,9 +69,11 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let model = Arc::new(load_0_8b_w4a16(dir, self.face).await?);
         let tokenizer = load_tokenizer(tokenizer_dir)?;
         let rope = Rope::new(262_144, 256, 64, 10_000_000.0)?;
+        let quant_plan = owl_models::module::QuantPlan::W4A16;
         let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1, device_repack: false };
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
-        Ok(LoadedModel { model, tokenizer, rope, spec })
+        Ok(LoadedModel { model, tokenizer, rope, spec, quant_plan })
+
     }
 
     /// Qwen3.8-27B AWQ-INT4 装载(2026-10-01;cyankiwi g32-asym 检查点):
@@ -88,12 +94,14 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let rope = Rope::new(262_144, 256, 64, 10_000_000.0)?;
         let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1, device_repack: false };
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
+        let quant_plan = owl_models::module::QuantPlan::W4A16Awq;
         owl_shared::metrics::with_metrics_store(|s| {
             let _ = s.timer_end("load.27b.total", file!(), line!());
         });
         owl_shared::metrics::query_metrics(
             &owl_shared::metrics::MetricsFilter::new().tag_prefix("load."),
         );
-        Ok(LoadedModel { model, tokenizer, rope, spec })
+        Ok(LoadedModel { model, tokenizer, rope, spec, quant_plan })
+
     }
 }

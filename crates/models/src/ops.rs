@@ -29,6 +29,7 @@ pub mod ids {
     pub const SIGMOID: OpId = OpId("ops.sigmoid");
     pub const ATTN_K0_WRITE: OpId = OpId("attn.k0_write");
     pub const ATTN_K0_DUAL: OpId = OpId("attn.k0_dual");
+    pub const ATTN_K0_DUAL_FP8KV: OpId = OpId("attn.k0_dual_fp8kv");
     pub const ATTN_PAGED_DECODE: OpId = OpId("attn.paged_decode");
     pub const ATTN_PAGED_PREFILL: OpId = OpId("attn.paged_prefill");
     pub const ATTN_PREFILL_SPLIT: OpId = OpId("attn.prefill_split");

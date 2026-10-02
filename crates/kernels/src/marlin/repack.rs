@@ -651,7 +651,7 @@ pub fn pack_marlin_b_gather_into(
 }
 
 #[cfg(test)]
-mod tests {
+mod tests_fused_s {
     /// pack_marlin_s(rayon 融合版)与 pack_marlin_s_f32(串行参照)逐位对拍
     #[test]
     fn pack_marlin_s_matches_serial_ref() {

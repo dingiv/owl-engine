@@ -31,8 +31,10 @@
 
 use std::ffi::c_void;
 
-/// foreign-kernel 虚拟核名(server `is_foreign` 分派臂)
+/// foreign-kernel 虚拟核名(server `is_foreign` 分派臂;f16 KV)
 pub const PREFILL_FI: &str = "flashinfer_prefill_paged_f16";
+/// fp8 KV 变体(e4m3 KV + half Q/Out;槽序同 PREFILL_FI)
+pub const PREFILL_FI_FP8KV: &str = "flashinfer_prefill_paged_fp8kv";
 
 /// 槽序契约(LaunchMsg.args):
 /// `[T q, T k_fi, T v_fi, T q_cu_seqlens, T indices, T indptr, T last_len,
@@ -55,7 +57,7 @@ pub const FI_HOST_STAGING_BYTES: usize = 32 * 1024 * 1024;
 
 /// foreign 分派谓词(server handle_launch 前置检查)
 pub fn is_foreign(name: &str) -> bool {
-    name == PREFILL_FI
+    name == PREFILL_FI || name == PREFILL_FI_FP8KV
 }
 
 extern "C" {
@@ -73,6 +75,27 @@ extern "C" {
         batch_size: i32,
         num_qo_heads: i32, num_kv_heads: i32,
         head_dim: i32, page_size: i32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    /// fp8 KV paged prefill(e4m3 KV + half Q/Out;scale 隐式 1.0)
+    pub fn owl_fi_prefill_run_fp8kv(
+        q_ptr: *const c_void,
+        k_data: *const c_void,
+        v_data: *const c_void,
+        out_ptr: *mut c_void,
+        q_cu_seqlens: *mut i32,
+        indices: *mut i32,
+        indptr: *mut i32,
+        last_len: *mut i32,
+        plan15: *const i64,
+        int_ws: *mut c_void, int_ws_size: usize,
+        float_ws: *mut c_void, float_ws_size: usize,
+        batch_size: i32,
+        num_qo_heads: i32, num_kv_heads: i32,
+        head_dim: i32, page_size: i32,
+        total_num_rows: i32,
+        sm_scale: f32,
         stream: *mut c_void,
     ) -> i32;
 

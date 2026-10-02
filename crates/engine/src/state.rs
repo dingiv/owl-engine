@@ -87,10 +87,12 @@ pub(crate) struct GdnLeaf {
 /// 不直摸块句柄。
 pub(crate) struct StatePool {
     pub(crate) kvs: Vec<KvBlocks>,
-    /// FlashInfer K/V 影子池(owl_reshape_and_cache_dual_f16 写;kNHD
-    /// [nb,page,Hkv,hd];OWL_FLASHINFER=1 时分配,否则空)
+    /// FlashInfer K/V 影子池(owl_reshape_and_cache_dual_f16(_fp8kv) 写;
+    /// OWL_FLASHINFER=1 时分配,否则空)
     pub(crate) k_fis: Vec<BlockN>,
     pub(crate) v_fis: Vec<BlockN>,
+    /// 影子量化档(None = f16 双宽;Fp8E4M3 = e4m3 单宽)
+    pub(crate) fi_quant: Option<owl_models::env::KvQuant>,
     gdns: Vec<GdnBlocks>,
     snaps: Vec<GdnSnapSlot>,
     snap_tick: u64,
@@ -108,13 +110,14 @@ impl StatePool {
     /// 分配全部状态块(零初始化;GDN 段每 turn 开始按格重置)。
     /// `pool_tokens` = 块池 token 口径容量(E2b:默认 2 × 单会话容量,
     /// OWL_POOL_TOKENS 可覆写;调用方读 env,本函数只管取整到页)。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn alloc<D: DeviceClient>(
         face: &mut D,
         dims: ModelDims,
         layer_types: &[bool],
         seq_tokens: usize,
         pool_tokens: usize,
-        fi_enabled: bool,
+        fi: Option<owl_models::env::KvQuant>,
     ) -> Result<StatePool> {
         let t = std::time::Instant::now();
         let n_full = layer_types.iter().filter(|&&f| f).count();
@@ -136,11 +139,23 @@ impl StatePool {
             let v_cache = zero_block_dt(face, nb * dims.hkv * dims.hd * page, dims.dtype).await?;
             kvs.push(KvBlocks { k_cache, v_cache });
         }
-        if fi_enabled {
-            for _ in 0..n_full {
-                // kNHD 影子 [nb, page, Hkv, hd](K/V 各一;与 classic 同尺寸)
-                k_fis.push(zero_block_dt(face, nb * dims.hkv * dims.hd * page, dims.dtype).await?);
-                v_fis.push(zero_block_dt(face, nb * dims.hkv * dims.hd * page, dims.dtype).await?);
+        if let Some(kq) = fi {
+            // 影子池 [nb, page, Hkv, hd]:f16 = 2B/elem;fp8 = 1B/elem
+            // (U32 块承载字节:elems = bytes/4,page 32 因子保证 4 整除)
+            match kq {
+                owl_models::env::KvQuant::None => {
+                    for _ in 0..n_full {
+                        k_fis.push(zero_block_dt(face, nb * dims.hkv * dims.hd * page, dims.dtype).await?);
+                        v_fis.push(zero_block_dt(face, nb * dims.hkv * dims.hd * page, dims.dtype).await?);
+                    }
+                }
+                owl_models::env::KvQuant::Fp8E4M3 => {
+                    for _ in 0..n_full {
+                        let n_u32 = nb * dims.hkv * dims.hd * page / 4;
+                        k_fis.push(zero_block_dt(face, n_u32, Dtype::U32).await?);
+                        v_fis.push(zero_block_dt(face, n_u32, Dtype::U32).await?);
+                    }
+                }
             }
         }
         // 块表持久块(E2b):内容 = 活跃会话块链,turn 切换/增长时重写
@@ -179,7 +194,7 @@ impl StatePool {
             gdns.len(),
             seq_tokens
         );
-        Ok(StatePool { kvs, k_fis, v_fis, gdns, snaps, snap_tick: 0, bt, page, nb, paged, x, dims })
+        Ok(StatePool { kvs, k_fis, v_fis, fi_quant: fi, gdns, snaps, snap_tick: 0, bt, page, nb, paged, x, dims })
     }
 
     /// KV 池形状(模式相关;与层分派同源策略)
@@ -216,19 +231,38 @@ impl StatePool {
             .collect()
     }
 
-    /// FlashInfer K/V 影子叶子(kNHD;OWL_FLASHINFER=1 时非空)
+    /// FlashInfer K/V 影子叶子(kNHD;OWL_FLASHINFER=1 时非空)。
+    /// fp8 档:块为 U32 字节承载,leaf = 扁平 [bytes/4](FI 只吃指针,
+    /// leaf shape 仅为账长;f16 档:真实几何 [nb, page, Hkv, hd])
     pub(crate) fn kv_fi_leaves(&self) -> Vec<(TensorOps, TensorOps)> {
-        let shape = vec![self.nb, self.page, self.dims.hkv, self.dims.hd];
-        self.k_fis
-            .iter()
-            .zip(self.v_fis.iter())
-            .map(|(k, v)| {
-                (
-                    block_leaf_dt(&k.0, shape.clone(), self.dims.dtype),
-                    block_leaf_dt(&v.0, shape.clone(), self.dims.dtype),
-                )
-            })
-            .collect()
+        match self.fi_quant {
+            Some(owl_models::env::KvQuant::Fp8E4M3) => {
+                let shape = vec![self.nb * self.page * self.dims.hkv * self.dims.hd / 4];
+                self.k_fis
+                    .iter()
+                    .zip(self.v_fis.iter())
+                    .map(|(k, v)| {
+                        (
+                            block_leaf_dt(&k.0, shape.clone(), Dtype::U32),
+                            block_leaf_dt(&v.0, shape.clone(), Dtype::U32),
+                        )
+                    })
+                    .collect()
+            }
+            _ => {
+                let shape = vec![self.nb, self.page, self.dims.hkv, self.dims.hd];
+                self.k_fis
+                    .iter()
+                    .zip(self.v_fis.iter())
+                    .map(|(k, v)| {
+                        (
+                            block_leaf_dt(&k.0, shape.clone(), self.dims.dtype),
+                            block_leaf_dt(&v.0, shape.clone(), self.dims.dtype),
+                        )
+                    })
+                    .collect()
+            }
+        }
     }
 
     /// 逐层 GDN 状态叶子四件套(conv_q/conv_k/conv_v/rec;slots 由

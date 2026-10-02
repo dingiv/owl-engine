@@ -43,6 +43,9 @@
 //! 调试:`OWL_DEBUG=1` 开启解释层发射日志(默认静默)。
 
 pub mod contract;
+
+/// 解释器执行环境(EnvProvider;硬件/量化/KV/分派/诊断 完备描述)
+pub mod env;
 pub mod f16c;
 pub mod formats;
 pub mod interpreters;

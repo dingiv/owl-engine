@@ -74,12 +74,24 @@ pub fn eval_ops<'a, D>(
 where
     D: crate::contract::DeviceClient + 'a,
 {
+    eval_ops_env(t, face, crate::env::EnvProvider::default())
+}
+
+/// 带环境的求值(EnvProvider;engine 供给,Call 臂按 hw/page/trace 执行)
+pub fn eval_ops_env<'a, D>(
+    t: &'a TensorOps,
+    face: &'a mut D,
+    env: crate::env::EnvProvider,
+) -> Pin<Box<dyn Future<Output = Result<Bytes, ModelError>> + Send + 'a>>
+where
+    D: crate::contract::DeviceClient + 'a,
+{
     Box::pin(async move {
         let mut ctx =
             EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new(),
                 arena_set: std::collections::HashSet::new(),
                 block_users: std::collections::HashMap::new(),
-                pending: std::collections::HashMap::new(), reclaim: false };
+                pending: std::collections::HashMap::new(), reclaim: false, env };
         let root = _eval_rec(t, &mut ctx).await?;
         // 非 scoped 口径:竞技场原样丢弃(块常驻,历史行为不变)
         Ok(root)
@@ -109,12 +121,24 @@ pub fn eval_ops_scoped<'a, D>(
 where
     D: crate::contract::DeviceClient + 'a,
 {
+    eval_ops_scoped_env(t, face, crate::env::EnvProvider::default())
+}
+
+/// 带环境的 scoped 求值(EnvProvider;engine 供给)
+pub fn eval_ops_scoped_env<'a, D>(
+    t: &'a TensorOps,
+    face: &'a mut D,
+    env: crate::env::EnvProvider,
+) -> Pin<Box<dyn Future<Output = Result<(Bytes, Vec<u64>), ModelError>> + Send + 'a>>
+where
+    D: crate::contract::DeviceClient + 'a,
+{
     Box::pin(async move {
         let mut ctx =
             EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new(),
                 arena_set: std::collections::HashSet::new(),
                 block_users: std::collections::HashMap::new(),
-                pending: count_pending(t), reclaim: true };
+                pending: count_pending(t), reclaim: true, env };
         let root = _eval_rec(t, &mut ctx).await?;
         let mut candidates = std::mem::take(&mut ctx.arena);
         candidates.retain(|id| *id != root.id && ctx.arena_set.contains(id));
@@ -135,7 +159,7 @@ where
 {
     Box::pin(async move {
         let mut ctx =
-            EvalCtx { face, memo: std::collections::HashMap::new(), tap: Some(tap), arena: Vec::new(),
+            EvalCtx { face, memo: std::collections::HashMap::new(), tap: Some(tap), arena: Vec::new(), env: crate::env::EnvProvider::default(),
                 arena_set: std::collections::HashSet::new(),
                 block_users: std::collections::HashMap::new(),
                 pending: std::collections::HashMap::new(), reclaim: false };
@@ -161,6 +185,9 @@ struct EvalCtx<'a, D> {
     pending: std::collections::HashMap<u64, usize>,
     /// 活性中途回收开关(scoped = true;plain/tap 保历史语义)
     reclaim: bool,
+    /// 解释器执行环境(EnvProvider;默认 = Cpu + 生产基线 —— Call 臂
+    /// 对 Cpu 回退 face.op_env() 旧径,存量调用点零迁移)
+    env: crate::env::EnvProvider,
 }
 
 impl<'a, D> EvalCtx<'a, D> {
@@ -361,7 +388,7 @@ where
                 aux,
                 scalars: &scalars,
             });
-            if std::env::var_os("OWL_RESOLVE_TRACE").is_some() {
+            if ctx.env.diag.resolve_trace {
                 eprintln!("[call] {} -> {} grid={:?} block={:?} smem={} n_elems={}",
                     op.0, pick.name, pick.shape.grid, pick.shape.block, pick.shape.smem, n_elems);
             }

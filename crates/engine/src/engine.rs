@@ -105,12 +105,27 @@ impl<D: DeviceClient + 'static> Engine<D> {
             .unwrap_or(2 * s);
         // FlashInfer prefill 面(OWL_FLASHINFER=1;E1.5):K 影子池 + 每
         // chunk 表四件套(ForwardCtx.fi)。f16 + paged 才有意义。
-        let fi_enabled = pool_tokens > 0
-            && std::env::var_os("OWL_FLASHINFER").is_some()
-            && loaded.spec.dtype == owl_models::tensor::Dtype::F16;
-        let pool = StatePool::alloc(&mut self.face, dims, &loaded.spec.layer_types, s, pool_tokens, fi_enabled).await?;
-        if fi_enabled {
-            eprintln!("[boot] FlashInfer prefill 面启用(K 影子池 ×{})", pool.k_fis.len());
+        // 解释器执行环境(EnvProvider;E1.5 抽象):from_env 兼容面 +
+        // 硬件档自 iface op_env 合入(被动律:引擎 = 环境事实来源)
+        let mut env = owl_models::env::EnvProvider::from_env();
+        if let Some(oe) = self.face.op_env() {
+            env.hw = owl_models::env::HwEnv::Cuda(oe.hw.arch);
+        }
+        env.quant = loaded.quant_plan;
+        let fi_quant = if env.attn.fi
+            && loaded.spec.dtype == owl_models::tensor::Dtype::F16
+        {
+            Some(env.kv.quant)
+        } else {
+            None
+        };
+        let pool = StatePool::alloc(&mut self.face, dims, &loaded.spec.layer_types, s, pool_tokens, fi_quant).await?;
+        if fi_quant.is_some() {
+            eprintln!(
+                "[boot] FlashInfer prefill 面启用(影子池 ×{},quant={:?})",
+                pool.k_fis.len(),
+                fi_quant.unwrap()
+            );
         }
 
         // 块账房(E2b)+ E2c 前缀缓存启用(容量 = 池半;OWL_PREFIX_CACHE=0 关闭)
@@ -158,7 +173,8 @@ impl<D: DeviceClient + 'static> Engine<D> {
                     slots: gdn_slot.clone(),
                 })
                 .collect();
-            let ctx = ForwardCtx::model_decode(1, &pos, &kvs_step, &rp, &gdns_step);
+            let mut ctx = ForwardCtx::model_decode(1, &pos, &kvs_step, &rp, &gdns_step);
+            ctx.env = env; // 捕获期烘焙(图闭包 env 定格;回放沿用)
             let tree = model.forward(&ids, &ctx);
             // E3 设备采样:token = argmax(logits)(f32 数值过线,契约 5)
             let tok = owl_models::ops::argmax_f32idx(&tree, vocab, 0);
@@ -206,6 +222,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
             model: loaded.model,
             rope: loaded.rope,
             blocks_m,
+            env,
         })
     }
 }

@@ -17,6 +17,7 @@
 // ============================================================================
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <vector>
 #include <algorithm>
 #include <sstream>
@@ -206,3 +207,103 @@ extern "C" int owl_fi_prefill_run(
     return -102;
   }
 }
+
+// ============================================================================
+// fp8 KV 臂(2026-10-03;REQ-CTX-03;port from attention.rs
+// flashinfer_prefill_fp8_fa2.cu —— DTypeKV=__nv_fp8_e4m3 + DTypeQ/Out=half
+// 的 FA2 paged prefill,消费卡 hd256 fp8 KV 生产路径;scale 走隐式 1.0,
+// BatchPrefillPagedParams 的 sf_stride 全零契约)。K/V 影子 = e4m3 字节,
+// 写核 = reshape_and_cache_dual_fp8kv.cu(nvrtc 独立编译,本文件外)。
+// 编译门:-DFLASHINFER_ENABLE_FP8_E4M3(sm86 = 软件 fp8,无硬件 fp8)。
+// ============================================================================
+
+#ifdef FLASHINFER_ENABLE_FP8_E4M3
+// fp8 KV paged prefill(FA2;paged_kv_t<__nv_fp8_e4m3> kNHD;causal)
+extern "C" int owl_fi_prefill_run_fp8kv(
+    const void* q_ptr,        // [T, Hq, hd] half
+    const void* k_data,       // k_fi [nb, page, hkv, hd] e4m3
+    const void* v_data,       // v_fi [nb, page, hkv, hd] e4m3
+    void* out_ptr,            // [T, Hq, hd] half
+    int32_t* q_cu_seqlens,
+    int32_t* indices,
+    int32_t* indptr,
+    int32_t* last_len,
+    const int64_t* plan15,
+    void* int_ws, size_t int_ws_size,
+    void* float_ws, size_t float_ws_size,
+    int32_t batch_size,
+    int32_t num_qo_heads, int32_t num_kv_heads,
+    int32_t head_dim, int32_t page_size,
+    int32_t total_num_rows,
+    float sm_scale,
+    cudaStream_t stream) {
+  try {
+    using DTypeQ = half;
+    using DTypeKV = __nv_fp8_e4m3;
+    using DTypeOut = half;
+    using IdType = int32_t;
+    using AttentionType = OwlFiAttention<false, false, false, false>;
+    using ParamsType = BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
+
+    PrefillPlanInfo plan_info;
+    std::vector<int64_t> vec(plan15, plan15 + 15);
+    plan_info.FromVector(vec);
+    if (plan_info.total_num_rows_offset >= (int64_t)int_ws_size ||
+        plan_info.v_offset >= (int64_t)float_ws_size ||
+        plan_info.s_offset >= (int64_t)float_ws_size) {
+      return -201;
+    }
+
+    paged_kv_t<DTypeKV, IdType> paged_kv(
+        (uint32_t)num_kv_heads, (uint32_t)page_size, (uint32_t)head_dim,
+        (uint32_t)batch_size, QKVLayout::kNHD,
+        (DTypeKV*)k_data, (DTypeKV*)v_data,
+        indices, indptr, last_len);
+
+    ParamsType params(
+        (DTypeQ*)q_ptr, paged_kv, /*custom_mask=*/nullptr,
+        q_cu_seqlens,
+        /*qo_indptr=*/nullptr, /*kv_indptr=*/nullptr,
+        (DTypeOut*)out_ptr, /*lse=*/nullptr, /*merge_lse=*/nullptr,
+        (uint32_t)num_qo_heads, (uint32_t)(num_qo_heads * head_dim), (uint32_t)head_dim,
+        /*window_left=*/-1, /*logits_soft_cap=*/0.f, sm_scale,
+        /*rope_scale=*/1.0f, /*rope_theta=*/10000.0f);
+
+    params.request_indices = GetPtrFromBaseOffset<IdType>(int_ws, plan_info.request_indices_offset);
+    params.qo_tile_indices = GetPtrFromBaseOffset<IdType>(int_ws, plan_info.qo_tile_indices_offset);
+    params.kv_tile_indices = GetPtrFromBaseOffset<IdType>(int_ws, plan_info.kv_tile_indices_offset);
+    params.o_indptr = GetPtrFromBaseOffset<IdType>(int_ws, plan_info.o_indptr_offset);
+    params.kv_chunk_size_ptr = GetPtrFromBaseOffset<IdType>(int_ws, plan_info.kv_chunk_size_ptr_offset);
+    params.max_total_num_rows = plan_info.total_num_rows;
+    params.padded_batch_size = plan_info.padded_batch_size;
+    params.partition_kv = plan_info.split_kv;
+    params.merge_indptr = nullptr;
+    params.block_valid_mask = nullptr;
+    params.total_num_rows = nullptr;
+    if (plan_info.split_kv) {
+      params.merge_indptr = GetPtrFromBaseOffset<IdType>(int_ws, plan_info.merge_indptr_offset);
+    }
+
+    DTypeOut* tmp_v = nullptr;
+    float* tmp_s = nullptr;
+    if (plan_info.split_kv) {
+      tmp_v = GetPtrFromBaseOffset<DTypeOut>(float_ws, plan_info.v_offset);
+      tmp_s = GetPtrFromBaseOffset<float>(float_ws, plan_info.s_offset);
+    }
+
+    cudaError_t st = cudaSuccess;
+    DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
+      DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+        st = BatchPrefillWithPagedKVCacheDispatched<
+            CTA_TILE_Q, HEAD_DIM, HEAD_DIM,
+            PosEncodingMode::kNone, false, MaskMode::kCausal,
+            AttentionType, ParamsType>(params, tmp_v, tmp_s, /*enable_pdl=*/false, stream);
+      });
+    });
+    return (int)st;
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[owl-fi][run_fp8kv] %s\n", e.what());
+    return -103;
+  }
+}
+#endif  // FLASHINFER_ENABLE_FP8_E4M3

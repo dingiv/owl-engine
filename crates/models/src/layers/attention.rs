@@ -100,11 +100,9 @@ impl Attention {
         let page_ok = pol.as_ref()
             .map(|p| driver::attn::paged_decode_ok(self.hd, p.page))
             .unwrap_or(false);
-        let force_naive = std::env::var_os("OWL_FORCE_NAIVE").is_some();
-        let use_fused_insert = dt_raw == Dtype::F16
-            && !force_naive
-            && std::env::var_os("OWL_QKV_FUSE").is_some()
-            && page_ok;
+        let force_naive = ctx.env.attn.force_naive_prefill;
+        let use_fused_insert =
+            dt_raw == Dtype::F16 && !force_naive && ctx.env.attn.qkv_fuse && page_ok;
         if use_fused_insert {
             let page = pol.as_ref().unwrap().page;
             let (cos_d, sin_d) = rope.cos_sin_decl();
@@ -182,8 +180,8 @@ impl Attention {
         let dt = q.dtype;
         // 诊断开关(OWL_FORCE_NAIVE=1):强制 naive 回退路径 —— paged 核
         // 数值质量的 A/B 对照(2026-09-27 文本退化排查)
-        let force_naive = std::env::var_os("OWL_FORCE_NAIVE").is_some();
-        if let Some(pol) = crate::module::kv_paged_policy(dt) {
+        let force_naive = ctx.env.attn.force_naive_prefill;
+        if let Some(pol) = ctx.env.kv.policy() {
             // paged 分派(K1):K0 写核 + v1 分页打分(vLLM classic 布局;
             // 页/x 来自 kv_paged_policy,块表语义见 block_tables 头注。
             // 页配对律住 driver(attn::paged_decode_ok / resolve 内 wrapper
@@ -298,9 +296,7 @@ impl Attention {
         self.o_proj.forward(&y, ctx)
     }
 
-    fn force_naive_prefill() -> bool {
-        std::env::var_os("OWL_FORCE_NAIVE").is_some()
-    }
+
 
     /// paged prefill(PF1 终;F16 hd∈{128,256}):K0 批量写池(T 行散写)
     /// + chunked prefill 批核(bs16 特化;因果语义 = 查询 token t 看
@@ -479,8 +475,10 @@ impl Attention {
     ) -> TensorOps {
         let dt = q.dtype;
         let page = pol.page as i32;
-        // ① K0-dual:classic K/V + kNHD K/V 影子(slots [T] = 物理槽表)
-        let wr = TensorOps::call(ids::ATTN_K0_DUAL).aux(&[tokens])
+        let fp8kv = ctx.env.kv.quant == crate::env::KvQuant::Fp8E4M3;
+        // ① K0-dual:classic K/V + kNHD K/V 影子(f16 或 e4m3;slots = 物理槽表)
+        let wr = TensorOps::call(if fp8kv { ids::ATTN_K0_DUAL_FP8KV } else { ids::ATTN_K0_DUAL })
+            .aux(&[tokens])
             .arg(k)
             .arg(v)
             .arg(&kv.k_cache)
@@ -498,8 +496,11 @@ impl Attention {
         // ② FI prefill(q 已是 [T, Hq*hd] 投影+norm+rope 后;out [T, Hq*hd])
         let ctx_total = ctx.ctx_base + tokens;
         let y = TensorOps::of(
-            crate::kernel::Kernel::new("flashinfer_prefill_paged_f16", "")
-                .with_sig("T,T,T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz,sz,sz"),
+            crate::kernel::Kernel::new(
+                if fp8kv { "flashinfer_prefill_paged_fp8kv" } else { "flashinfer_prefill_paged_f16" },
+                "",
+            )
+            .with_sig("T,T,T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz,sz,sz"),
         )
         .arg(q)
         .arg(&fi.kcs[ctx.fi_kvi])
@@ -610,7 +611,7 @@ impl Attention {
                     // 诊断二分开关保留(OWL_FORCE_NAIVE_PREFILL=1 走逐 token
                     // 对照;2026-10-01 撤销遗留的 if false 硬禁用 —— 它让
                     // 全部 prefill 注意力落 naive 逐 token 路径)
-                    if !Self::force_naive_prefill() {
+                    if !ctx.env.attn.force_naive_prefill {
                         // FlashInfer prefill(E1.5;OWL_FLASHINFER=1 → engine
                         // 注入 ForwardCtx.fi):FA2 级 tensor-core,主臂
                         if let Some(fi) = &ctx.fi {
@@ -623,10 +624,7 @@ impl Attention {
                         // 挂账)—— W3 结案:两雷已清,默认仍 opt-in(引擎实测
                         // 后裁决翻默认)
                         let nparts = (ctx.ctx_base + tokens).div_ceil(512);
-                        if nparts >= 4
-                            && self.hd == 256
-                            && std::env::var_os("OWL_PREFILL_SPLIT").is_some()
-                        {
+                        if nparts >= 4 && self.hd == 256 && ctx.env.attn.prefill_split {
                             return self.paged_prefill_split_output(
                                 &q, &k, &v, &gate, kv, tokens, ctx, &pol, kv_slots, nparts,
                             );
@@ -1207,15 +1205,12 @@ mod f16_tests {
         let xs_bytes = halfb(&xs_f32);
 
         // ── A 臂:默认分派(norm_rope + K0;pos=t)──
-        std::env::remove_var("OWL_QKV_FUSE");
-        std::env::remove_var("OWL_FORCE_NAIVE");
         let kc_shape = vec![nb, hkv, hd / x, page, x];
         let pool_a = kprobe_run_arm(&attn, &rp, &xs_bytes, t_len, hidden, hkv, hd, page,
-            false, &kc_a, &vc_a, &kc_shape, &mut gpu).await;
+            false, false, &kc_a, &vc_a, &kc_shape, &mut gpu).await;
         // ── B 臂:融合分派(pos=t)──
-        std::env::set_var("OWL_QKV_FUSE", "1");
         let pool_b = kprobe_run_arm(&attn, &rp, &xs_bytes, t_len, hidden, hkv, hd, page,
-            false, &kc_b, &vc_b, &kc_shape, &mut gpu).await;
+            false, true, &kc_b, &vc_b, &kc_shape, &mut gpu).await;
         // ── C 臂:融合分派 + pos≡0(θ=0 → 池内容 = 纯 norm 输出,与 rope 解耦)──
         let kc_c = crate::interpreters::eval_ops(
             TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd / x, page, x]).step(), &mut gpu)
@@ -1224,8 +1219,7 @@ mod f16_tests {
             TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd, page]).step(), &mut gpu)
             .await.expect("vc_c");
         let pool_c = kprobe_run_arm(&attn, &rp, &xs_bytes, t_len, hidden, hkv, hd, page,
-            true, &kc_c, &vc_c, &kc_shape, &mut gpu).await;
-        std::env::remove_var("OWL_QKV_FUSE");
+            true, true, &kc_c, &vc_c, &kc_shape, &mut gpu).await;
 
         // ── host 金标 G ──
         let kw: Vec<f32> = src["k_proj"].iter().map(|&v| f16r(v)).collect();
@@ -1311,6 +1305,7 @@ mod f16_tests {
     }
 
     /// k-probe 单臂:逐 token decode 写池 → dtoh 终态 k 池(字节)
+    #[allow(clippy::too_many_arguments)]
     async fn kprobe_run_arm<D: crate::contract::DeviceClient>(
         attn: &Attention,
         rp: &crate::layers::rope::Rope,
@@ -1321,6 +1316,7 @@ mod f16_tests {
         hd: usize,
         page: usize,
         pos_zero: bool,
+        qkv_fuse: bool,
         kc: &crate::contract::Bytes,
         vc: &crate::contract::Bytes,
         kc_shape: &[usize],
@@ -1339,7 +1335,9 @@ mod f16_tests {
                 kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32 + 1.0])),
                 block_tables: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0])),
             };
-            let decl = attn.forward(&x_t, &ForwardCtx::decode(1, &pos_t, &kv, rp));
+            let mut ctx = ForwardCtx::decode(1, &pos_t, &kv, rp);
+            ctx.env.attn.qkv_fuse = qkv_fuse;
+            let decl = attn.forward(&x_t, &ctx);
             let _ = crate::testkit::harvest_f16(gpu, &decl).await;
         }
         let mut pool = vec![0u8; kc_shape.iter().product::<usize>() * 2];
@@ -1864,6 +1862,7 @@ mod split_probe_tests {
         use crate::contract::DeviceClient as _;
         if !crate::testkit::gpu_enabled() { return; }
         // 引擎全参档(27B:24/4/256;chunk=page=32;双 chunk = 跨 chunk K0)
+        let fp8kv = std::env::var_os("FI_FP8").is_some();
         let (hq, hkv, hd, page, x) = (24usize, 4usize, 256usize, 32usize, 8usize);
         let nb = 2usize;
         let ctx_total = nb * page;     // 64 = 两个 chunk
@@ -1886,14 +1885,33 @@ mod split_probe_tests {
             TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd / x, page, x]).step(), &mut gpu).await.unwrap();
         let vc = crate::interpreters::eval_ops(
             TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd, page]).step(), &mut gpu).await.unwrap();
-        let kfi = crate::interpreters::eval_ops(
-            TensorOps::zeros(Dtype::F16, vec![nb, page, hkv, hd]).step(), &mut gpu).await.unwrap();
-        let vfi = crate::interpreters::eval_ops(
-            TensorOps::zeros(Dtype::F16, vec![nb, page, hkv, hd]).step(), &mut gpu).await.unwrap();
         let kc_t = TensorOps::of_block(kc.id, Dtype::F16, vec![nb, hkv, hd / x, page, x]);
         let vc_t = TensorOps::of_block(vc.id, Dtype::F16, vec![nb, hkv, hd, page]);
-        let kfi_t = TensorOps::of_block(kfi.id, Dtype::F16, vec![nb, page, hkv, hd]);
-        let vfi_t = TensorOps::of_block(vfi.id, Dtype::F16, vec![nb, page, hkv, hd]);
+        let (kfi, vfi, kfi_t, vfi_t) = if fp8kv {
+            // e4m3 字节池(U32 承载:elems = bytes/4)
+            let n_u32 = nb * page * hkv * hd / 4;
+            let kf = crate::interpreters::eval_ops(
+                TensorOps::zeros(Dtype::U32, vec![n_u32]).step(), &mut gpu).await.unwrap();
+            let vf = crate::interpreters::eval_ops(
+                TensorOps::zeros(Dtype::U32, vec![n_u32]).step(), &mut gpu).await.unwrap();
+            (
+                kf.clone(),
+                vf.clone(),
+                TensorOps::of_block(kf.id, Dtype::U32, vec![n_u32]),
+                TensorOps::of_block(vf.id, Dtype::U32, vec![n_u32]),
+            )
+        } else {
+            let kf = crate::interpreters::eval_ops(
+                TensorOps::zeros(Dtype::F16, vec![nb, page, hkv, hd]).step(), &mut gpu).await.unwrap();
+            let vf = crate::interpreters::eval_ops(
+                TensorOps::zeros(Dtype::F16, vec![nb, page, hkv, hd]).step(), &mut gpu).await.unwrap();
+            (
+                kf.clone(),
+                vf.clone(),
+                TensorOps::of_block(kf.id, Dtype::F16, vec![nb, page, hkv, hd]),
+                TensorOps::of_block(vf.id, Dtype::F16, vec![nb, page, hkv, hd]),
+            )
+        };
 
         // K0-dual:全 ctx 一次灌池(slots = 0..ctx_total;恒等页表)
         let slots = TensorOps::from_host(Dtype::F32, vec![ctx_total], &f32b(&(0..ctx_total).map(|i| i as f32).collect::<Vec<_>>()));
@@ -1905,9 +1923,9 @@ mod split_probe_tests {
             .arg_i32(hkv as i32).arg_i32(hd as i32).arg_i32(page as i32).arg_i32(x as i32)
             .with_shape(Dtype::F16, vec![1]);
         let _ = crate::interpreters::eval_ops(k0.step(), &mut gpu).await.unwrap();
-        {
+        if !fp8kv {
             // 影子池取证(观测窗内:k0 eval 后立即读;kNHD [nb, page, hkv, hd];
-            // K0-dual 写入与 FI 消费双把关)
+            // K0-dual 写入与 FI 消费双把关;fp8 = e4m3 字节池,金标换算另案)
             use crate::contract::DeviceClient as _;
             let n1 = ctx_total * hkv * hd;
             let mut kb = vec![0u8; n1 * 2];
@@ -1945,14 +1963,18 @@ mod split_probe_tests {
         let last_len = TensorOps::of_block(ll_b.id, Dtype::U32, vec![1]);
 
         // FI 虚拟核(生产同款槽序;wr 依赖边 = 已完成的 k0)
-        let wr = TensorOps::call(ids::ATTN_K0_DUAL).aux(&[ctx_total])
+        let wr = TensorOps::call(if fp8kv { ids::ATTN_K0_DUAL_FP8KV } else { ids::ATTN_K0_DUAL })
+            .aux(&[ctx_total])
             .arg(&k_all).arg(&v_all).arg(&kc_t).arg(&vc_t).arg(&kfi_t).arg(&vfi_t).arg(&slots)
             .arg_i32((hkv * hd) as i32).arg_i32((hkv * hd) as i32)
             .arg_i32(hkv as i32).arg_i32(hd as i32).arg_i32(page as i32).arg_i32(x as i32)
             .with_shape(Dtype::F16, vec![1]);
         let y = TensorOps::of(
-            crate::kernel::Kernel::new("flashinfer_prefill_paged_f16", "")
-                .with_sig("T,T,T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz,sz,sz"),
+            crate::kernel::Kernel::new(
+                if fp8kv { "flashinfer_prefill_paged_fp8kv" } else { "flashinfer_prefill_paged_f16" },
+                "",
+            )
+            .with_sig("T,T,T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz,sz,sz"),
         )
         .arg(&q).arg(&kfi_t).arg(&vfi_t)
         .arg(&q_cu).arg(&indices).arg(&indptr).arg(&last_len)
@@ -2036,7 +2058,8 @@ mod split_probe_tests {
             eprintln!("[fi-probe] scale={cand} → t0 worst {w:.4}");
         }
         eprintln!("[fi-probe] worst |dev| = {worst:.4}");
-        assert!(worst < 5e-2, "FlashInfer prefill 偏差 {worst}");
+        let tol = if fp8kv { 9e-2 } else { 5e-2 }; // e4m3 KV 量化噪声(实测 ~0.05-0.08)
+        assert!(worst < tol, "FlashInfer prefill 偏差 {worst}(fp8kv={fp8kv})");
         // 双断言:K0-dual 影子写入与 FI 消费各自把关(见影子池对照打印)
     }
 
