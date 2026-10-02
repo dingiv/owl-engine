@@ -39,6 +39,13 @@ pub(super) fn issue_launch(
     }
 
     if std::env::var_os("OWL_DEBUG").is_some() {
+        let addrs: Vec<String> = slots.iter().map(|s| match s {
+            Slot::Ptr(v) => format!("ptr {v:#x}"),
+            Slot::U(v) => format!("u64 {v}"),
+            Slot::I(v) => format!("i32 {v}"),
+            Slot::F(v) => format!("f32 {v}"),
+        }).collect();
+        eprintln!("[dbg launch-ptr] {} = {addrs:?}", msg.kernel.name);
         eprintln!(
             "[dbg launch] {} slots = {:?}",
             msg.kernel.name,
@@ -76,11 +83,14 @@ pub(super) fn issue_launch(
     // 图回放不经)
     if msg.shared_mem as usize > 49152 {
         use cudarc::driver::sys::CUfunction_attribute_enum as Attr;
-        func.set_attribute(Attr::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-            msg.shared_mem as i32)
-            .map_err(|e| ModelError::Msg(format!(
-                "launch({}): cudaFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE, {}) 失败: {e:?}",
-                msg.kernel.name, msg.shared_mem)))?;
+        let r = func.set_attribute(Attr::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            msg.shared_mem as i32);
+        eprintln!("[dbg optin] {} smem={} set_attr={r:?} max_dyn_attr={:?}",
+            msg.kernel.name, msg.shared_mem,
+            func.get_attribute(Attr::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES));
+        r.map_err(|e| ModelError::Msg(format!(
+            "launch({}): cudaFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE, {}) 失败: {e:?}",
+            msg.kernel.name, msg.shared_mem)))?;
     }
 
     // 3. 发射(非阻塞:提交进流即返回)

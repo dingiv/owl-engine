@@ -380,6 +380,154 @@ impl Attention {
         self.o_proj.forward(&y, ctx)
     }
 
+    /// 长 ctx split attention(flash-decoding;2026-10-02;prefill 主案):
+    /// nparts = ceil(max_ctx/512) ≥ 4(max_ctx > 2048)即走;K0 写池 →
+    /// K1 分块在线 softmax(partial + (m,l) 入 scratch)→ K2 归一化合并。
+    /// 块数 ×nparts(occupancy 主升),scratch 由活性回收随 chunk 归池。
+    fn paged_prefill_split_output(
+        &self,
+        q: &TensorOps,
+        k: &TensorOps,
+        v: &TensorOps,
+        gate: &TensorOps,
+        kv: &KvBuffers,
+        tokens: usize,
+        ctx: &ForwardCtx,
+        pol: &crate::module::KvPagedPolicy,
+        kv_slots: &TensorOps,
+        nparts: usize,
+    ) -> TensorOps {
+        let dt = q.dtype;
+        let page = pol.page as i32;
+        // ① K0 批量写池(本 chunk k/v 先入池;slots [T] = 物理槽表,engine 单源)
+        let wr = TensorOps::call(ids::ATTN_K0_WRITE).aux(&[tokens])
+        .arg(k)
+        .arg(v)
+        .arg(&kv.k_cache)
+        .arg(&kv.v_cache)
+        .arg(kv_slots)
+        .arg_i32(self.hkv as i32 * self.hd as i32)
+        .arg_i32(self.hkv as i32 * self.hd as i32)
+        .arg_i32(self.hkv as i32)
+        .arg_i32(self.hd as i32)
+        .arg_i32(page)
+        .arg_i32(pol.x as i32)
+        .with_shape(dt, vec![1]); // 哑输出(契约 4)
+        // ② K1 分块在线 softmax(partial + (m,l) 入 scratch;wr = 树序依赖边)
+        let scr_out = TensorOps::zeros(dt, vec![tokens * self.hq * nparts * self.hd]);
+        let scr_stat = TensorOps::zeros(Dtype::F32, vec![tokens * self.hq * nparts * 2]);
+        let scale = 1.0 / (self.hd as f32).sqrt();
+        let sp = TensorOps::call(ids::ATTN_PREFILL_SPLIT)
+        .arg(q)
+        .arg(&kv.k_cache)
+        .arg(&kv.v_cache)
+        .arg(&kv.block_tables)
+        .arg(&scr_out)
+        .arg(&scr_stat)
+        .arg(&wr) // 树序依赖边(K0 先于分块读池;核不解引用)
+        .arg_f32(scale)
+        .arg_i32(self.hkv as i32)
+        .arg_i32(tokens as i32)
+        .arg_i32(ctx.ctx_base as i32)
+        .arg_i32(nparts as i32)
+        .arg_i32(self.hkv as i32 * self.hd as i32 * page) // kv_block_stride
+        .arg_i32(self.hd as i32 * page) // kv_head_stride
+        .arg_i32(page)
+        .arg_i32(self.hq as i32)
+        .aux(&[self.hd, self.hkv, self.hq, tokens, nparts])
+        .with_shape(dt, vec![1]); // 哑输出(真输出 = reduce)
+        // ③ K2 归一化合并(split 哑输出 = 树序依赖边;out [T, Hq*hd])
+        let y = TensorOps::call(ids::ATTN_PREFILL_SPLIT_REDUCE)
+        .arg(&sp)
+        .arg(&scr_out)
+        .arg(&scr_stat)
+        .arg_i32(nparts as i32)
+        .arg_i32(self.hq as i32)
+        .arg_i32(self.hd as i32)
+        .arg_i32(tokens as i32)
+        .aux(&[tokens, self.hq])
+        .with_shape(dt, vec![tokens, self.hq * self.hd]);
+        // ④ 输出门(f16 融合单发)+ 出投影(与旧路径同)
+        let n = tokens * self.hq * self.hd;
+        let y = TensorOps::call(ids::ATTN_GATE_MUL)
+        .arg(gate)
+        .arg(&y)
+        .arg_usize(n)
+        .with_shape(dt, vec![tokens, self.hq * self.hd]);
+        self.o_proj.forward(&y, ctx)
+    }
+
+    /// FlashInfer paged prefill(E1.5;OWL_FLASHINFER=1,engine 注入
+    /// ForwardCtx.fi):K0-dual 写池(classic + kHND 影子)→ FI 虚拟核
+    /// (server plan 缓存 + run;FA2 级 tensor-core,causal chunked 语义
+    /// = q 对齐 kv 尾部,与 K0 先行的池读序配套)。
+    /// 槽序契约:7 Block + O + 8 sz(owl_kernels::flashinfer::PREFILL_FI_SLOTS;
+    /// 字面量对齐 —— models 不开 kernels feature,marlin 先例)。
+    #[allow(clippy::too_many_arguments)]
+    fn paged_prefill_fi_output(
+        &self,
+        q: &TensorOps,
+        k: &TensorOps,
+        v: &TensorOps,
+        gate: &TensorOps,
+        kv: &KvBuffers,
+        tokens: usize,
+        ctx: &ForwardCtx,
+        pol: &crate::module::KvPagedPolicy,
+        kv_slots: &TensorOps,
+        fi: &crate::module::FiPrefillCtx<'_>,
+    ) -> TensorOps {
+        let dt = q.dtype;
+        let page = pol.page as i32;
+        // ① K0-dual:classic K/V + kNHD K/V 影子(slots [T] = 物理槽表)
+        let wr = TensorOps::call(ids::ATTN_K0_DUAL).aux(&[tokens])
+            .arg(k)
+            .arg(v)
+            .arg(&kv.k_cache)
+            .arg(&kv.v_cache)
+            .arg(&fi.kcs[ctx.fi_kvi])
+            .arg(&fi.vcs[ctx.fi_kvi])
+            .arg(kv_slots)
+            .arg_i32(self.hkv as i32 * self.hd as i32)
+            .arg_i32(self.hkv as i32 * self.hd as i32)
+            .arg_i32(self.hkv as i32)
+            .arg_i32(self.hd as i32)
+            .arg_i32(page)
+            .arg_i32(pol.x as i32)
+            .with_shape(dt, vec![1]); // 哑输出(契约 4)
+        // ② FI prefill(q 已是 [T, Hq*hd] 投影+norm+rope 后;out [T, Hq*hd])
+        let ctx_total = ctx.ctx_base + tokens;
+        let y = TensorOps::of(
+            crate::kernel::Kernel::new("flashinfer_prefill_paged_f16", "")
+                .with_sig("T,T,T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz,sz,sz"),
+        )
+        .arg(q)
+        .arg(&fi.kcs[ctx.fi_kvi])
+        .arg(&fi.vcs[ctx.fi_kvi])
+        .arg(fi.q_cu)
+        .arg(fi.indices)
+        .arg(fi.indptr)
+        .arg(fi.last_len)
+        .arg(&wr) // 树序依赖边(K0 先于分块读池;FI 不解引用)
+        .arg_usize(tokens)          // total_rows(本 chunk q 行)
+        .arg_usize(ctx_total)       // kv_indptr host 端点
+        .arg_usize(tokens)          // T
+        .arg_usize(self.hq)
+        .arg_usize(self.hkv)
+        .arg_usize(self.hd)
+        .arg_usize(pol.page)
+        .arg_usize((1.0f32 / (self.hd as f32).sqrt()).to_bits() as usize)
+        .with_shape(dt, vec![tokens, self.hq * self.hd]);
+        // ③ 输出门(f16 融合单发)+ 出投影(与旧路径同)
+        let n = tokens * self.hq * self.hd;
+        let y = TensorOps::call(ids::ATTN_GATE_MUL)
+            .arg(gate)
+            .arg(&y)
+            .arg_usize(n)
+            .with_shape(dt, vec![tokens, self.hq * self.hd]);
+        self.o_proj.forward(&y, ctx)
+    }
+
     /// prefill 展开声明(PF1a;批P4):投影/qk-norm/rope/gate T 批量单发
 
 
@@ -463,6 +611,26 @@ impl Attention {
                     // 对照;2026-10-01 撤销遗留的 if false 硬禁用 —— 它让
                     // 全部 prefill 注意力落 naive 逐 token 路径)
                     if !Self::force_naive_prefill() {
+                        // FlashInfer prefill(E1.5;OWL_FLASHINFER=1 → engine
+                        // 注入 ForwardCtx.fi):FA2 级 tensor-core,主臂
+                        if let Some(fi) = &ctx.fi {
+                            return self.paged_prefill_fi_output(
+                                &q, &k, &v, &gate, kv, tokens, ctx, &pol, kv_slots, fi,
+                            );
+                        }
+                        // 长 ctx split(flash-decoding;2026-10-02):nparts ≥ 4
+                        // (max_ctx > 2048)走分块路径;仅 hd256 核(hd128 变体
+                        // 挂账)—— W3 结案:两雷已清,默认仍 opt-in(引擎实测
+                        // 后裁决翻默认)
+                        let nparts = (ctx.ctx_base + tokens).div_ceil(512);
+                        if nparts >= 4
+                            && self.hd == 256
+                            && std::env::var_os("OWL_PREFILL_SPLIT").is_some()
+                        {
+                            return self.paged_prefill_split_output(
+                                &q, &k, &v, &gate, kv, tokens, ctx, &pol, kv_slots, nparts,
+                            );
+                        }
                         return self.paged_prefill_output(
                             &q, &k, &v, &gate, kv, tokens, ctx, &pol, kv_slots, kv_lens,
                         );
@@ -1514,3 +1682,362 @@ mod naive_attn_f16_tests {
     }
 }
 
+
+
+
+#[cfg(test)]
+mod split_probe_tests {
+    use super::*;
+
+    // W3 结案硬门(2026-10-02):split attention 小规模真权重对拍 + host 金标。
+    // 曾两雷:① store 隐式转换截断 ② 在线 softmax 漏 acc 重缩放 —— 本门
+    // 双双拦截(单 token 档护 ①,多 token 档护 ②)。
+    #[tokio::test]
+    async fn gpu_split_probe() {
+    use crate::contract::DeviceClient as _;
+    if !crate::testkit::gpu_enabled() { return; }
+    let (hq, hkv, hd, t, ctx_base, nparts) = (2usize, 1usize, 256usize, 8usize, 0usize, 1usize);
+    let page = 32usize; let x = 8usize; let nb = 1usize;
+    let mut gpu = crate::testkit::gpu_client().await;
+
+    // 输入
+    let qr: Vec<f32> = (0..t * hq * hd).map(|i| ((i * 7 % 23) as f32 - 11.0) * 0.13).collect();
+    let kr: Vec<f32> = (0..t * hkv * hd).map(|i| ((i * 11 % 19) as f32 - 9.0) * 0.17).collect();
+    let vr: Vec<f32> = (0..t * hkv * hd).map(|i| ((i * 13 % 17) as f32 - 8.0) * 0.19).collect();
+    let halfb = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect() };
+    let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+
+    let q = TensorOps::from_host(Dtype::F16, vec![t, hq * hd], &halfb(&qr));
+    let k = TensorOps::from_host(Dtype::F16, vec![t, hkv * hd], &halfb(&kr));
+    let v = TensorOps::from_host(Dtype::F16, vec![t, hkv * hd], &halfb(&vr));
+    let kc = crate::interpreters::eval_ops(
+        TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd / x, page, x]).step(), &mut gpu).await.unwrap();
+    let vc = crate::interpreters::eval_ops(
+        TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd, page]).step(), &mut gpu).await.unwrap();
+    let bt = TensorOps::from_host(Dtype::F32, vec![1, nb], &f32b(&(0..nb).map(|i| i as f32).collect::<Vec<_>>()));
+    let slots = TensorOps::from_host(Dtype::F32, vec![t], &f32b(&(0..t).map(|i| i as f32).collect::<Vec<_>>()));
+    let scr_out_b = crate::interpreters::eval_ops(
+        TensorOps::zeros(Dtype::F16, vec![t * hq * nparts * hd]).step(), &mut gpu).await.unwrap();
+    let scr_stat_b = crate::interpreters::eval_ops(
+        TensorOps::zeros(Dtype::F32, vec![t * hq * nparts * 2]).step(), &mut gpu).await.unwrap();
+    let scr_out = TensorOps::of_block(scr_out_b.id, Dtype::F16, vec![t * hq * nparts * hd]);
+    let scr_stat = TensorOps::of_block(scr_stat_b.id, Dtype::F32, vec![t * hq * nparts * 2]);
+
+    // K0 写池
+    let wr = TensorOps::call(ids::ATTN_K0_WRITE).aux(&[t])
+        .arg(&k).arg(&v)
+        .arg(&TensorOps::of_block(kc.id, Dtype::F16, vec![nb, hkv, hd / x, page, x]))
+        .arg(&TensorOps::of_block(vc.id, Dtype::F16, vec![nb, hkv, hd, page]))
+        .arg(&slots)
+        .arg_i32((hkv * hd) as i32).arg_i32((hkv * hd) as i32)
+        .arg_i32(hkv as i32).arg_i32(hd as i32).arg_i32(page as i32).arg_i32(x as i32)
+        .with_shape(Dtype::F16, vec![1]);
+    let _ = crate::interpreters::eval_ops(wr.step(), &mut gpu).await.unwrap();
+
+    // split + reduce
+    let sp = TensorOps::call(ids::ATTN_PREFILL_SPLIT)
+        .arg(&q)
+        .arg(&TensorOps::of_block(kc.id, Dtype::F16, vec![nb, hkv, hd / x, page, x]))
+        .arg(&TensorOps::of_block(vc.id, Dtype::F16, vec![nb, hkv, hd, page]))
+        .arg(&bt)
+        .arg(&scr_out).arg(&scr_stat)
+        .arg(&wr)
+        .arg_f32(1.0 / (hd as f32).sqrt())
+        .arg_i32(hkv as i32).arg_i32(t as i32).arg_i32(ctx_base as i32)
+        .arg_i32(nparts as i32)
+        .arg_i32((hkv * hd * page) as i32).arg_i32((hd * page) as i32).arg_i32(page as i32)
+        .arg_i32(hq as i32)
+        .aux(&[hd, hkv, hq, t, nparts])
+        .with_shape(Dtype::F16, vec![1]);
+    let y = TensorOps::call(ids::ATTN_PREFILL_SPLIT_REDUCE)
+        .arg(&sp).arg(&scr_out).arg(&scr_stat)
+        .arg_i32(nparts as i32).arg_i32(hq as i32).arg_i32(hd as i32).arg_i32(t as i32)
+        .aux(&[t, hq])
+        .with_shape(Dtype::F16, vec![t, hq * hd]);
+    let got = crate::testkit::harvest_f16(&mut gpu, &y).await;
+    {
+        use crate::contract::DeviceClient as _;
+        let mut sb = vec![0u8; 128];
+        gpu.dtoh(&scr_stat_b, &mut sb).await.expect("stat dtoh");
+        let sv: Vec<f32> = sb.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        eprintln!("[split-probe] scr_stat(m,l): {sv:?}");
+        let mut ob = vec![0u8; 8192];
+        gpu.dtoh(&scr_out_b, &mut ob).await.expect("scr_out dtoh");
+        let nz: usize = ob.chunks_exact(2).filter(|c| *c != [0, 0]).count();
+        eprintln!("[split-probe] scr_out 非零 halves = {nz}/4096");
+        let hf16 = |b: &[u8], i: usize| half::f16::from_le_bytes([b[i * 2], b[i * 2 + 1]]).to_f32();
+        // 诊断:scr_out 按 (tok,head) 槽 × g 段(64 dims)非零分布
+        for tok in 0..t {
+            for h in 0..hq {
+                let base = (tok * hq + h) * nparts * hd;
+                let seg: Vec<String> = (0..4).map(|g| {
+                    let nz = (0..64).filter(|&d| ob[(base + g * 64 + d) * 2..] != [0, 0]).count();
+                    format!("g{g}:{nz}")
+                }).collect();
+                eprintln!("[split-probe] scr_out t{tok}h{h} [{}]", seg.join(" "));
+            }
+        }
+        let vr0: Vec<f32> = (0..256usize).map(|d| ((d * 13 % 17) as f32 - 8.0) * 0.19).collect();
+        for slot in 0..2usize {
+            let lo = slot * 256;
+            let nz_s = ob[lo * 2..(lo + 256) * 2].chunks_exact(2).filter(|c| *c != [0, 0]).count();
+                let d0: Vec<String> = (0..8).map(|d| format!("{d}:{:.5}", hf16(&ob, lo + d))).collect();
+            eprintln!("[split-probe] slot{slot}[0..8]={:?} (金标 vr[0..8][0]=-1.52)", &d0);
+        }
+        eprintln!("[split-probe] v0 金标[0..12]: {:?}", &vr0[..12]);
+        // vc 池取证:V 写入 = d×32 + kt
+        let mut vcb = vec![0u8; 16384];
+        gpu.dtoh(&vc, &mut vcb).await.expect("vc dtoh");
+        let hf16v = |b: &[u8], i: usize| half::f16::from_le_bytes([b[i * 2], b[i * 2 + 1]]).to_f32();
+        let nz_v = vcb.chunks_exact(2).filter(|c| *c != [0, 0]).count();
+        eprintln!("[split-probe] vc 非零 halves = {nz_v}/8192");
+        for db in 0..4usize {
+            let mut nzr = 0usize; let mut totr = 0usize;
+            for d in db * 64..(db + 1) * 64 {
+                for kt in 0..8usize {
+                    totr += 1;
+                    let i = (d * 32 + kt) * 2;
+                    if vcb[i..i + 2] != [0, 0] { nzr += 1; }
+                }
+            }
+            eprintln!("[split-probe] vc d[{},{}) 非零 {nzr}/{totr}", db * 64, (db + 1) * 64);
+        }
+        for kt in [0usize, 3] {
+            let row: Vec<String> = (0..6).map(|d| format!("d{d}={:.3}", hf16v(&vcb, d * 32 + kt))).collect();
+            eprintln!("[split-probe] vc kt{kt}: {:?}(金标 v[kt×256+d])", &row);
+        }
+    }
+
+    gpu.close().await.expect("close");
+
+    // host 金标
+    let hf = |b: &[u8], i: usize| half::f16::from_le_bytes([b[i * 2], b[i * 2 + 1]]).to_f32();
+    let kb = halfb(&kr); let vb = halfb(&vr); let qb = halfb(&qr);
+    let scale = 1.0 / (hd as f32).sqrt();
+    let mut worst = 0f32;
+    for tok in 0..t {
+        for h in 0..hq {
+            let mut m = f32::MIN; let mut scores = vec![0f32; tok + 1];
+            for kt in 0..=tok {
+                let mut dot = 0f32;
+                for d in 0..hd {
+                    dot += hf(&qb, (tok * hq + h) * hd + d) * hf(&kb, kt * hd + d);
+                }
+                let s = dot * scale; scores[kt] = s; m = m.max(s);
+            }
+            let mut l = 0f32;
+            for kt in 0..=tok { scores[kt] = (scores[kt] - m).exp(); l += scores[kt]; }
+            for d in 0..hd {
+                let mut acc = 0f32;
+                for kt in 0..=tok { acc += scores[kt] * hf(&vb, kt * hd + d); }
+                let want = half::f16::from_f32(acc / l).to_f32();
+                let got_v = got[(tok * hq + h) * hd + d];
+                worst = worst.max((want - got_v).abs());
+            }
+        }
+    }
+    eprintln!("[split-probe] worst |dev| = {worst:.4}");
+    for (tok, h) in [(0usize, 0usize), (0, 1), (3, 0), (7, 1)] {
+        for d in [0usize, 64, 128, 192] {
+            let g = got[(tok * hq + h) * hd + d];
+            let mut m = f32::MIN; let mut sc = vec![0f32; tok + 1];
+            for kt in 0..=tok {
+                let mut dot = 0f32;
+                for dd in 0..hd { dot += hf(&qb, (tok*hq+h)*hd + dd) * hf(&kb, kt*hd + dd); }
+                let sv = dot * scale; sc[kt] = sv; m = m.max(sv);
+            }
+            let mut l = 0f32;
+            for kt in 0..=tok { sc[kt] = (sc[kt] - m).exp(); l += sc[kt]; }
+            let mut acc = 0f32;
+            for kt in 0..=tok { acc += sc[kt] * hf(&vb, kt*hd + d); }
+            eprintln!("[split-probe] t{tok} h{h} d{d}: got={g:.5} want={:.5}", acc / l);
+        }
+    }
+    assert!(worst < 5e-2, "split attention 偏差 {worst}");
+}
+
+    // FlashInfer paged prefill 对拍(E1.5 硬门;真数据 + host 金标):
+    // 全 ctx 一次 K0-dual 灌池(classic + kHND 影子),q = 末 T token,
+    // FI causal chunked 语义 = q[i] attend [0, ctx_total-T+i]。
+    #[tokio::test]
+    async fn gpu_fi_prefill_probe() {
+        use crate::contract::DeviceClient as _;
+        if !crate::testkit::gpu_enabled() { return; }
+        // 引擎全参档(27B:24/4/256;chunk=page=32;双 chunk = 跨 chunk K0)
+        let (hq, hkv, hd, page, x) = (24usize, 4usize, 256usize, 32usize, 8usize);
+        let nb = 2usize;
+        let ctx_total = nb * page;     // 64 = 两个 chunk
+        let t = 32usize;               // 末 32 token 为 q(chunk 2)
+        let ctx_base = ctx_total - t;
+        let mut gpu = crate::testkit::gpu_client().await;
+
+        // 输入(确定性伪随机;q 取末 t 行)
+        let qr: Vec<f32> = (0..t * hq * hd).map(|i| ((i * 7 % 23) as f32 - 11.0) * 0.13).collect();
+        let kr: Vec<f32> = (0..ctx_total * hkv * hd).map(|i| ((i * 11 % 19) as f32 - 9.0) * 0.17).collect();
+        let vr: Vec<f32> = (0..ctx_total * hkv * hd).map(|i| ((i * 13 % 17) as f32 - 8.0) * 0.19).collect();
+        let halfb = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect() };
+        let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+        let i32b = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+
+        let q = TensorOps::from_host(Dtype::F16, vec![t, hq * hd], &halfb(&qr));
+        let k_all = TensorOps::from_host(Dtype::F16, vec![ctx_total, hkv * hd], &halfb(&kr));
+        let v_all = TensorOps::from_host(Dtype::F16, vec![ctx_total, hkv * hd], &halfb(&vr));
+        let kc = crate::interpreters::eval_ops(
+            TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd / x, page, x]).step(), &mut gpu).await.unwrap();
+        let vc = crate::interpreters::eval_ops(
+            TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd, page]).step(), &mut gpu).await.unwrap();
+        let kfi = crate::interpreters::eval_ops(
+            TensorOps::zeros(Dtype::F16, vec![nb, page, hkv, hd]).step(), &mut gpu).await.unwrap();
+        let vfi = crate::interpreters::eval_ops(
+            TensorOps::zeros(Dtype::F16, vec![nb, page, hkv, hd]).step(), &mut gpu).await.unwrap();
+        let kc_t = TensorOps::of_block(kc.id, Dtype::F16, vec![nb, hkv, hd / x, page, x]);
+        let vc_t = TensorOps::of_block(vc.id, Dtype::F16, vec![nb, hkv, hd, page]);
+        let kfi_t = TensorOps::of_block(kfi.id, Dtype::F16, vec![nb, page, hkv, hd]);
+        let vfi_t = TensorOps::of_block(vfi.id, Dtype::F16, vec![nb, page, hkv, hd]);
+
+        // K0-dual:全 ctx 一次灌池(slots = 0..ctx_total;恒等页表)
+        let slots = TensorOps::from_host(Dtype::F32, vec![ctx_total], &f32b(&(0..ctx_total).map(|i| i as f32).collect::<Vec<_>>()));
+        let k0 = TensorOps::call(ids::ATTN_K0_DUAL).aux(&[ctx_total])
+            .arg(&k_all).arg(&v_all)
+            .arg(&kc_t).arg(&vc_t).arg(&kfi_t).arg(&vfi_t)
+            .arg(&slots)
+            .arg_i32((hkv * hd) as i32).arg_i32((hkv * hd) as i32)
+            .arg_i32(hkv as i32).arg_i32(hd as i32).arg_i32(page as i32).arg_i32(x as i32)
+            .with_shape(Dtype::F16, vec![1]);
+        let _ = crate::interpreters::eval_ops(k0.step(), &mut gpu).await.unwrap();
+        {
+            // 影子池取证(观测窗内:k0 eval 后立即读;kNHD [nb, page, hkv, hd];
+            // K0-dual 写入与 FI 消费双把关)
+            use crate::contract::DeviceClient as _;
+            let n1 = ctx_total * hkv * hd;
+            let mut kb = vec![0u8; n1 * 2];
+            gpu.dtoh(&kfi, &mut kb).await.expect("kfi dtoh");
+            let mut vb = vec![0u8; n1 * 2];
+            gpu.dtoh(&vfi, &mut vb).await.expect("vfi dtoh");
+            let hf = |b: &[u8], i: usize| half::f16::from_le_bytes([b[i * 2], b[i * 2 + 1]]).to_f32();
+            let mut wk = 0f32; let mut wv = 0f32; let mut nz_v = 0usize;
+            for tok in 0..ctx_total {
+                for hh in 0..hkv {
+                    for d in 0..hd {
+                        let off = tok * hkv * hd + hh * hd + d;
+                        wk = wk.max((hf(&kb, off) - kr[off]).abs());
+                        wv = wv.max((hf(&vb, off) - vr[off]).abs());
+                        if vb[off * 2..] != [0, 0] { nz_v += 1; }
+                    }
+                }
+            }
+            eprintln!("[fi-probe] 影子池对照:kfi worst {wk:.5} / vfi worst {wv:.5} / vfi 非零 {nz_v}/{}", n1);
+        }
+
+        // FI 表四件套(i32;预物化块 + of_block 引用,杀 from_host 时序变量)
+        let q_cu_b = crate::interpreters::eval_ops(
+            TensorOps::from_host(Dtype::U32, vec![2], &i32b(&[0, t as i32])).step(), &mut gpu).await.unwrap();
+        let idx_b = crate::interpreters::eval_ops(
+            TensorOps::from_host(Dtype::U32, vec![nb], &i32b(&(0..nb as i32).collect::<Vec<_>>())).step(), &mut gpu).await.unwrap();
+        let ind_b = crate::interpreters::eval_ops(
+            TensorOps::from_host(Dtype::U32, vec![2], &i32b(&[0, nb as i32])).step(), &mut gpu).await.unwrap();
+        let ll_b = crate::interpreters::eval_ops(
+            TensorOps::from_host(Dtype::U32, vec![1],
+                &i32b(&[(ctx_total - (ctx_total.div_ceil(page) - 1) * page) as i32])).step(), &mut gpu).await.unwrap();
+        let q_cu = TensorOps::of_block(q_cu_b.id, Dtype::U32, vec![2]);
+        let indices = TensorOps::of_block(idx_b.id, Dtype::U32, vec![nb]);
+        let indptr = TensorOps::of_block(ind_b.id, Dtype::U32, vec![2]);
+        let last_len = TensorOps::of_block(ll_b.id, Dtype::U32, vec![1]);
+
+        // FI 虚拟核(生产同款槽序;wr 依赖边 = 已完成的 k0)
+        let wr = TensorOps::call(ids::ATTN_K0_DUAL).aux(&[ctx_total])
+            .arg(&k_all).arg(&v_all).arg(&kc_t).arg(&vc_t).arg(&kfi_t).arg(&vfi_t).arg(&slots)
+            .arg_i32((hkv * hd) as i32).arg_i32((hkv * hd) as i32)
+            .arg_i32(hkv as i32).arg_i32(hd as i32).arg_i32(page as i32).arg_i32(x as i32)
+            .with_shape(Dtype::F16, vec![1]);
+        let y = TensorOps::of(
+            crate::kernel::Kernel::new("flashinfer_prefill_paged_f16", "")
+                .with_sig("T,T,T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz,sz,sz"),
+        )
+        .arg(&q).arg(&kfi_t).arg(&vfi_t)
+        .arg(&q_cu).arg(&indices).arg(&indptr).arg(&last_len)
+        .arg(&wr)
+        .arg_usize(t).arg_usize(ctx_total).arg_usize(t)
+        .arg_usize(hq).arg_usize(hkv).arg_usize(hd).arg_usize(page)
+        .arg_usize((1.0f32 / (hd as f32).sqrt()).to_bits() as usize)
+        .with_shape(Dtype::F16, vec![t, hq * hd]);
+        let got = crate::testkit::harvest_f16(&mut gpu, &y).await;
+                gpu.close().await.expect("close");
+
+        // host 金标:q[i](绝对 ctx_base+i)attend kv[0..=ctx_base+i]
+        let hf = |b: &[u8], i: usize| half::f16::from_le_bytes([b[i * 2], b[i * 2 + 1]]).to_f32();
+        let kb = halfb(&kr); let vb = halfb(&vr); let qb = halfb(&qr);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let mut worst = 0f32;
+        for tok in 0..t {
+            let abs = ctx_base + tok;
+            for h in 0..hq {
+                let kvh = h / (hq / hkv); // GQA:q 头 → kv 头
+                let mut m = f32::MIN; let mut scores = vec![0f32; abs + 1];
+                for kt in 0..=abs {
+                    let mut dot = 0f32;
+                    for d in 0..hd {
+                        dot += hf(&qb, (tok * hq + h) * hd + d)
+                            * hf(&kb, kt * hkv * hd + kvh * hd + d);
+                    }
+                    let s = dot * scale; scores[kt] = s; m = m.max(s);
+                }
+                let mut l = 0f32;
+                for kt in 0..=abs { scores[kt] = (scores[kt] - m).exp(); l += scores[kt]; }
+                for d in 0..hd {
+                    let mut acc = 0f32;
+                    for kt in 0..=abs { acc += scores[kt] * hf(&vb, kt * hkv * hd + kvh * hd + d); }
+                    let want = half::f16::from_f32(acc / l).to_f32();
+                    let got_v = got[(tok * hq + h) * hd + d];
+                    worst = worst.max((want - got_v).abs());
+                }
+            }
+        }
+        // 分 token/head 偏差分布(定位用)
+        let mut per_tok = vec![0f32; t];
+        for tok in 0..t {
+            let abs = ctx_base + tok;
+            for h in 0..hq {
+                let mut m = f32::MIN; let mut sc = vec![0f32; abs + 1];
+                for kt in 0..=abs {
+                    let mut dot = 0f32;
+                    for d in 0..hd { dot += hf(&qb, (tok*hq+h)*hd + d) * hf(&kb, kt*hd + d); }
+                    let sv = dot * scale; sc[kt] = sv; m = m.max(sv);
+                }
+                let mut l = 0f32;
+                for kt in 0..=abs { sc[kt] = (sc[kt] - m).exp(); l += sc[kt]; }
+                for d in 0..hd {
+                    let mut acc = 0f32;
+                    for kt in 0..=abs { acc += sc[kt] * hf(&vb, kt*hd + d); }
+                    let want = half::f16::from_f32(acc / l).to_f32();
+                    let got_v = got[(tok*hq+h)*hd + d];
+                    per_tok[tok] = per_tok[tok].max((want - got_v).abs());
+                }
+            }
+        }
+        let pairs: Vec<String> = (0..6).map(|d| {
+            let abs = ctx_base; let mut m = f32::MIN; let mut sc = vec![0f32; abs+1];
+            for kt in 0..=abs { let mut dot = 0f32; for dd in 0..hd { dot += hf(&qb, dd) * hf(&kb, kt*hd + dd); } let sv = dot*scale; sc[kt]=sv; m=m.max(sv); }
+            let mut l = 0f32; for kt in 0..=abs { sc[kt]=(sc[kt]-m).exp(); l+=sc[kt]; }
+            let mut acc = 0f32; for kt in 0..=abs { acc += sc[kt]*hf(&vb, kt*hd+d); }
+            format!("{}: got={:.5} want={:.5}", d, got[d], acc/l)
+        }).collect();
+        eprintln!("[fi-probe] t0h0[0..6] {:?}", pairs);
+        // 对照:got 的 t0 行是否更接近「无 scale」或「2× scale」?
+        for cand in [0.03125f32, 0.0625, 0.125] {
+            let mut w = 0f32;
+            for d in 0..hd {
+                let abs = ctx_base; let mut m = f32::MIN; let mut sc = vec![0f32; abs+1];
+                for kt in 0..=abs { let mut dot = 0f32; for dd in 0..hd { dot += hf(&qb, dd) * hf(&kb, kt*hd+dd); } let sv = dot*cand; sc[kt]=sv; m=m.max(sv); }
+                let mut l = 0f32; for kt in 0..=abs { sc[kt]=(sc[kt]-m).exp(); l+=sc[kt]; }
+                let mut acc = 0f32; for kt in 0..=abs { acc += sc[kt]*hf(&vb, kt*hd+d); }
+                w = w.max((got[d] - acc/l).abs());
+            }
+            eprintln!("[fi-probe] scale={cand} → t0 worst {w:.4}");
+        }
+        eprintln!("[fi-probe] worst |dev| = {worst:.4}");
+        assert!(worst < 5e-2, "FlashInfer prefill 偏差 {worst}");
+        // 双断言:K0-dual 影子写入与 FI 消费各自把关(见影子池对照打印)
+    }
+
+}

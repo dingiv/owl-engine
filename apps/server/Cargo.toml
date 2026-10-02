@@ -11,6 +11,8 @@ owl-engine = { path = "../../crates/engine" }
 # GPU 绑定(Engine::new 的 GpuClient 特化;actor 泛型界见 iface)
 owl-cuda = { path = "../../crates/backends/cuda" }
 owl-iface = { path = "../../crates/backends/iface" }
+# 诊断:/debug/metrics 读 GPU 逐核归因分账(OWL_GPU_PROF 写入同进程 store)
+owl-shared = { path = "../../crates/shared" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # 手写 HTTP/1.1 + SSE(架子零重依赖;axum/hyper 迁移挂账,见 http.rs 模块头)

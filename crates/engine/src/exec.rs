@@ -10,7 +10,7 @@
 use owl_iface::contract::{DeviceClient, Dtype, ModelError};
 use owl_models::interpreters::eval_ops_scoped;
 use owl_models::layers::gdn::GdnBuffers;
-use owl_models::module::{ForwardCtx, KvBuffers, Module};
+use owl_models::module::{FiPrefillCtx, ForwardCtx, KvBuffers, Module};
 use owl_models::tokenizer::Tokenizer;
 use owl_models::TensorOps;
 
@@ -321,15 +321,58 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         };
         let lens_t = TensorOps::from_host(Dtype::F32, vec![t], &f32seq(base + 1, t));
         let gdn_slot = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[gdn_slot_v as f32]));
+        // FlashInfer 表四件套(i32 设备;OWL_FLASHINFER=1 时非空,E1.5):
+        // q_cu=[0,T] / indices=块链 / indptr=[0,nb] / last_len=末页有效数。
+        // ⚠️ 预物化(eval 往返同步)而非 from_host 叶子:Htod 在 H2D 流、
+        // FI 核在 COMPUTE 流,无跨流序 —— 异步竞态会让 FI 偶发读到半写入
+        // 表(渐进腐败案,2026-10-03;09-28 upload_pinned 同病史)。
+        let i32le = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let fi_tensors;
+        let fi = if !self.pool.k_fis.is_empty() {
+            let page = self.pool.page;
+            let ctx_total = base + t;
+            let nb = bt_chain.len();
+            let k_fi_leaf = self.pool.kv_fi_leaves();
+            let face = self.session.face_mut();
+            let q_cu_b = owl_models::interpreters::eval_ops(
+                TensorOps::from_host(Dtype::U32, vec![2], &i32le(&[0, t as i32])).step(), face).await?;
+            let idx_b = owl_models::interpreters::eval_ops(
+                TensorOps::from_host(Dtype::U32, vec![nb],
+                    &i32le(&bt_chain.iter().map(|&b| b as i32).collect::<Vec<_>>())).step(), face).await?;
+            let ind_b = owl_models::interpreters::eval_ops(
+                TensorOps::from_host(Dtype::U32, vec![2], &i32le(&[0, nb as i32])).step(), face).await?;
+            let ll_b = owl_models::interpreters::eval_ops(
+                TensorOps::from_host(Dtype::U32, vec![1],
+                    &i32le(&[(ctx_total - nb * page + page) as i32])).step(), face).await?;
+            let q_cu = TensorOps::of_block(q_cu_b.id, Dtype::U32, vec![2]);
+            let indices = TensorOps::of_block(idx_b.id, Dtype::U32, vec![nb]);
+            let indptr = TensorOps::of_block(ind_b.id, Dtype::U32, vec![2]);
+            let last_len = TensorOps::of_block(ll_b.id, Dtype::U32, vec![1]);
+            let (kcs, vcs): (Vec<TensorOps>, Vec<TensorOps>) =
+                k_fi_leaf.iter().map(|(k, v)| (k.clone(), v.clone())).unzip();
+            fi_tensors = (kcs, vcs, q_cu, indices, indptr, last_len);
+            Some(FiPrefillCtx {
+                kcs: &fi_tensors.0,
+                vcs: &fi_tensors.1,
+                q_cu: &fi_tensors.2,
+                indices: &fi_tensors.3,
+                indptr: &fi_tensors.4,
+                last_len: &fi_tensors.5,
+            })
+        } else {
+            None
+        };
         let ctx = ForwardCtx::model_prefill(
-            t, &pos_t, &kvs_step, &self.rope, &gdns_step, &slots_t, &lens_t, &gdn_slot,
+            t, &pos_t, &kvs_step, &self.rope, &gdns_step, &slots_t, &lens_t, &gdn_slot, base, fi,
         );
         let face = self.session.face_mut();
         let vocab = self.model.vocab_size();
         if is_last {
-            // E3:末行设备 argmax(4B 回读,免 [T,V] 大 dtoh)
-            let tree = self.model.forward(&ids_t, &ctx);
-            let tok = owl_models::ops::argmax_f32idx(&tree, vocab, (t - 1) * vocab);
+            // E3:末行设备 argmax(4B 回读,免 [T,V] 大 dtoh);
+            // 2026-10-02 forward_last:hidden 先窄末行再 lm_head ——
+            // logits [1,V] 而非 [T,V](大 chunk 内存/算力双省)
+            let tree = self.model.forward_last(&ids_t, &ctx);
+            let tok = owl_models::ops::argmax_f32idx(&tree, vocab, 0);
             let (b, arena) = eval_ops_scoped(tok.step(), face).await?;
             let mut buf = [0u8; 4];
             face.dtoh(&b, &mut buf).await?;
@@ -343,6 +386,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let esz = if d.dtype == Dtype::F16 { 2 } else { 4 };
             let mut buf = vec![0u8; t * d.hidden * esz];
             face.dtoh(&b, &mut buf).await?;
+            if std::env::var_os("OWL_PREFILL_CKSUM").is_some() {
+                // 临时取证:每 chunk 隐层校验和(FI 开/关对比找第一分歧)
+                let cks: f32 = buf.chunks_exact(2)
+                    .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32().abs())
+                    .sum();
+                eprintln!("[cksum] chunk base={base} t={t} sum|x|={cks:.4}");
+            }
             face.free(&arena).await?; // E2a:中间块归池(每 chunk 零净增)
             Ok(None)
         }

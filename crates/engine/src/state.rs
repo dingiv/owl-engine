@@ -87,6 +87,10 @@ pub(crate) struct GdnLeaf {
 /// 不直摸块句柄。
 pub(crate) struct StatePool {
     pub(crate) kvs: Vec<KvBlocks>,
+    /// FlashInfer K/V 影子池(owl_reshape_and_cache_dual_f16 写;kNHD
+    /// [nb,page,Hkv,hd];OWL_FLASHINFER=1 时分配,否则空)
+    pub(crate) k_fis: Vec<BlockN>,
+    pub(crate) v_fis: Vec<BlockN>,
     gdns: Vec<GdnBlocks>,
     snaps: Vec<GdnSnapSlot>,
     snap_tick: u64,
@@ -110,6 +114,7 @@ impl StatePool {
         layer_types: &[bool],
         seq_tokens: usize,
         pool_tokens: usize,
+        fi_enabled: bool,
     ) -> Result<StatePool> {
         let t = std::time::Instant::now();
         let n_full = layer_types.iter().filter(|&&f| f).count();
@@ -124,10 +129,19 @@ impl StatePool {
         let nb = paged.then(|| pool_tokens.div_ceil(page)).unwrap_or(nb).max(nb);
 
         let mut kvs: Vec<KvBlocks> = Vec::new();
+        let mut k_fis: Vec<BlockN> = Vec::new();
+        let mut v_fis: Vec<BlockN> = Vec::new();
         for _ in 0..n_full {
             let k_cache = zero_block_dt(face, nb * dims.hkv * dims.hd * page, dims.dtype).await?;
             let v_cache = zero_block_dt(face, nb * dims.hkv * dims.hd * page, dims.dtype).await?;
             kvs.push(KvBlocks { k_cache, v_cache });
+        }
+        if fi_enabled {
+            for _ in 0..n_full {
+                // kNHD 影子 [nb, page, Hkv, hd](K/V 各一;与 classic 同尺寸)
+                k_fis.push(zero_block_dt(face, nb * dims.hkv * dims.hd * page, dims.dtype).await?);
+                v_fis.push(zero_block_dt(face, nb * dims.hkv * dims.hd * page, dims.dtype).await?);
+            }
         }
         // 块表持久块(E2b):内容 = 活跃会话块链,turn 切换/增长时重写
         // (write_bt;图烘焙 bt 指针,指针稳定图不重捕);legacy = 哑表
@@ -165,7 +179,7 @@ impl StatePool {
             gdns.len(),
             seq_tokens
         );
-        Ok(StatePool { kvs, gdns, snaps, snap_tick: 0, bt, page, nb, paged, x, dims })
+        Ok(StatePool { kvs, k_fis, v_fis, gdns, snaps, snap_tick: 0, bt, page, nb, paged, x, dims })
     }
 
     /// KV 池形状(模式相关;与层分派同源策略)
@@ -197,6 +211,21 @@ impl StatePool {
                 (
                     block_leaf_dt(&b.k_cache.0, k_shape.clone(), self.dims.dtype),
                     block_leaf_dt(&b.v_cache.0, v_shape.clone(), self.dims.dtype),
+                )
+            })
+            .collect()
+    }
+
+    /// FlashInfer K/V 影子叶子(kNHD;OWL_FLASHINFER=1 时非空)
+    pub(crate) fn kv_fi_leaves(&self) -> Vec<(TensorOps, TensorOps)> {
+        let shape = vec![self.nb, self.page, self.dims.hkv, self.dims.hd];
+        self.k_fis
+            .iter()
+            .zip(self.v_fis.iter())
+            .map(|(k, v)| {
+                (
+                    block_leaf_dt(&k.0, shape.clone(), self.dims.dtype),
+                    block_leaf_dt(&v.0, shape.clone(), self.dims.dtype),
                 )
             })
             .collect()

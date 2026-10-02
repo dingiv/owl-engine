@@ -164,6 +164,27 @@ async fn serve(
         ("POST", "/v1/chat/completions") => {
             chat(&mut stream, &req.body, tx, &model_name).await?;
         }
+        // 诊断分账出口(OWL_GPU_PROF=1 时 store 非空)—— 逐核 GPU 时
+        // 总账降序;TagReport 无 Serialize,手工投影(总 ms 计)
+        ("GET", "/debug/metrics") => {
+            let mut rows: Vec<serde_json::Value> = owl_shared::metrics::collect_metrics(
+                &owl_shared::metrics::MetricsFilter::new().limit(128),
+            )
+            .into_iter()
+            .map(|r| json!({
+                "tag": r.tag, "count": r.count,
+                "total_ms": r.total.as_secs_f64() * 1e3,
+                "avg_ms": r.avg.as_secs_f64() * 1e3,
+                "p50_ms": r.p50.as_secs_f64() * 1e3,
+                "p99_ms": r.p99.as_secs_f64() * 1e3,
+            }))
+            .collect();
+            rows.sort_by(|a, b| {
+                let f = |v: &serde_json::Value| v["total_ms"].as_f64().unwrap_or(0.0);
+                f(b).partial_cmp(&f(a)).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            http::respond_json(&mut stream, 200, &json!({"rows": rows})).await?;
+        }
         _ => {
             http::respond_json(
                 &mut stream,

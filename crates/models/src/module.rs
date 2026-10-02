@@ -38,6 +38,25 @@ pub enum StepKind {
 /// runner 每步构造,层只透传不自取(async-runtime §4.3 grab-bag);
 /// 无动态依赖的层(mlp/rmsnorm/…)忽略字段。借用结构,无 Default ——
 /// 测试用 [`ForwardCtx::minimal`]。
+/// FlashInfer prefill 面(OWL_FLASHINFER=1;engine 每 chunk 构造):
+/// K 影子池(kHND)+ 表四件套(i32 设备;契约见 owl_kernels::flashinfer)。
+#[derive(Clone, Copy)]
+pub struct FiPrefillCtx<'a> {
+    /// K 影子池**逐注意力层**([nb, page, Hkv, hd] kNHD;层间不可共享 ——
+    /// 共享 = 后层 K0-dual 覆写前层前缀,渐进腐败案 2026-10-03)
+    pub kcs: &'a [TensorOps],
+    /// V 影子池(逐注意力层)
+    pub vcs: &'a [TensorOps],
+    /// q_cu_seqlens i32 [B+1] = [0, T]
+    pub q_cu: &'a TensorOps,
+    /// 页表 i32 [nb](物理页 id)
+    pub indices: &'a TensorOps,
+    /// 页 indptr i32 [B+1] = [0, nb]
+    pub indptr: &'a TensorOps,
+    /// 末页有效 token 数 i32 [B] = ctx_total % page
+    pub last_len: &'a TensorOps,
+}
+
 pub struct ForwardCtx<'a> {
     /// 本步 token 数(decode = 1;prefill = 块长)
     pub tokens: usize,
@@ -69,6 +88,13 @@ pub struct ForwardCtx<'a> {
     pub kv_lens: Option<&'a TensorOps>,
     /// prefill:GDN 序列状态格 [1](全块恒定;decode 走 gdn.slots [bs])
     pub gdn_slot: Option<&'a TensorOps>,
+    /// prefill:chunk 绝对起点(块首 token 的绝对 pos;split attention 的
+    /// partition 网格声明需要 max_ctx = ctx_base + tokens;builder 缺省 0)
+    pub ctx_base: usize,
+    /// FlashInfer prefill 面(None = 走旧分派;engine 按 OWL_FLASHINFER 注入)
+    pub fi: Option<FiPrefillCtx<'a>>,
+    /// 本层注意力序号(layer_ctx 派生;fi 影子切片下标)
+    pub fi_kvi: usize,
 }
 
 impl<'a> ForwardCtx<'a> {
@@ -86,6 +112,9 @@ impl<'a> ForwardCtx<'a> {
             kv_slots: None,
             kv_lens: None,
             gdn_slot: None,
+            ctx_base: 0,
+            fi: None,
+            fi_kvi: 0,
         }
     }
 
@@ -108,6 +137,9 @@ impl<'a> ForwardCtx<'a> {
             kv_slots: None,
             kv_lens: None,
             gdn_slot: None,
+            ctx_base: 0,
+            fi: None,
+            fi_kvi: 0,
         }
     }
 
@@ -125,6 +157,9 @@ impl<'a> ForwardCtx<'a> {
             kv_slots: None,
             kv_lens: None,
             gdn_slot: None,
+            ctx_base: 0,
+            fi: None,
+            fi_kvi: 0,
         }
     }
 
@@ -146,6 +181,9 @@ impl<'a> ForwardCtx<'a> {
             kv_slots: None,
             kv_lens: None,
             gdn_slot: Some(gdn_slot),
+            ctx_base: 0,
+            fi: None,
+            fi_kvi: 0,
         }
     }
 
@@ -170,6 +208,9 @@ impl<'a> ForwardCtx<'a> {
             kv_slots: Some(kv_slots),
             kv_lens: Some(kv_lens),
             gdn_slot: None,
+            ctx_base: 0,
+            fi: None,
+            fi_kvi: 0,
         }
     }
 
@@ -194,11 +235,15 @@ impl<'a> ForwardCtx<'a> {
             kv_slots: None,
             kv_lens: None,
             gdn_slot: None,
+            ctx_base: 0,
+            fi: None,
+            fi_kvi: 0,
         }
     }
 
     /// 整模 prefill ctx(PF1a;批P5):单序列 T-token 块,
-    /// 槽表/kv_len 表 [T] + GDN 状态格 [1]。
+    /// 槽表/kv_len 表 [T] + GDN 状态格 [1]。fi = FlashInfer 面(engine
+    /// 按 OWL_FLASHINFER 注入;None = 旧分派)。
     pub fn model_prefill(
         tokens: usize,
         pos: &'a TensorOps,
@@ -208,6 +253,8 @@ impl<'a> ForwardCtx<'a> {
         kv_slots: &'a TensorOps,
         kv_lens: &'a TensorOps,
         gdn_slot: &'a TensorOps,
+        ctx_base: usize,
+        fi: Option<FiPrefillCtx<'a>>,
     ) -> Self {
         Self {
             tokens,
@@ -221,6 +268,9 @@ impl<'a> ForwardCtx<'a> {
             kv_slots: Some(kv_slots),
             kv_lens: Some(kv_lens),
             gdn_slot: Some(gdn_slot),
+            ctx_base,
+            fi,
+            fi_kvi: 0,
         }
     }
 }

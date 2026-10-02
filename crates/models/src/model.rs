@@ -148,6 +148,9 @@ impl Model {
             kv_slots: ctx.kv_slots,
             kv_lens: ctx.kv_lens,
             gdn_slot: ctx.gdn_slot,
+            ctx_base: ctx.ctx_base,
+            fi: ctx.fi.clone(),
+            fi_kvi: kvi,
         }
     }
 
@@ -179,6 +182,22 @@ impl Module for Model {
         self.embed
             .lm_head_matmul(&self.last_hidden(ids, ctx))
             .tag("logits")
+    }
+}
+
+impl Model {
+    /// Prefill 末行头(2026-10-02;末块专用):last_hidden 窄到末行再
+    /// lm_head —— logits [1,V] 而非 [T,V](chunk 1024 @248320 词表:
+    /// 508MB → 0.5MB,GEMM 2.6 TFLOP → 2.6 GFLOP;prefill 采样只吃
+    /// 末行)。中间 chunk 本就免算(last_hidden 直根)。
+    pub fn forward_last(&self, ids: &TensorOps, ctx: &ForwardCtx) -> TensorOps {
+        let hidden = self.last_hidden(ids, ctx);
+        let t = ctx.tokens;
+        let d = hidden.shape[1];
+        let last = crate::layers::narrow_strided(
+            &hidden, 1, d, (t - 1) * d, d, vec![1, d],
+        );
+        self.embed.lm_head_matmul(&last).tag("logits_last")
     }
 }
 
@@ -824,7 +843,7 @@ mod tests {
         let slots_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&(0..t_len).map(|t| t as f32).collect::<Vec<_>>()));
         let lens_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&(0..t_len).map(|t| t as f32 + 1.0).collect::<Vec<_>>()));
         let gdn_slot = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0]));
-        let ctx = ForwardCtx::model_prefill(t_len, &pos_all, &kvs_b, &rp, &gdns_b, &slots_all, &lens_all, &gdn_slot);
+        let ctx = ForwardCtx::model_prefill(t_len, &pos_all, &kvs_b, &rp, &gdns_b, &slots_all, &lens_all, &gdn_slot, 0, None);
         let pre_hidden = crate::testkit::harvest(&mut gpu, &model.last_hidden(&ids_all, &ctx)).await;
         for t in 0..t_len {
             let d: f32 = pre_hidden[t * HIDDEN..(t + 1) * HIDDEN]
@@ -837,7 +856,7 @@ mod tests {
 
         // ── logits 根(缓冲套 C)+ host 锚 ──
         let (kvs_c, gdns_c) = model_bufs(&mut gpu, 1, 3).await;
-        let ctx_c = ForwardCtx::model_prefill(t_len, &pos_all, &kvs_c, &rp, &gdns_c, &slots_all, &lens_all, &gdn_slot);
+        let ctx_c = ForwardCtx::model_prefill(t_len, &pos_all, &kvs_c, &rp, &gdns_c, &slots_all, &lens_all, &gdn_slot, 0, None);
         let got_all = crate::testkit::harvest(&mut gpu, &model.forward(&ids_all, &ctx_c)).await;
         let mut host2 = HostModel::new(checkpoint_src());
         for t in 0..t_len {

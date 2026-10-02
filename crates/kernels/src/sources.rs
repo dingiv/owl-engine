@@ -35,10 +35,14 @@ pub mod owl {
 pub mod attention {
     /// KV cache 散写(vLLM classic 布局;K1/K2 paged_attention 同款布局)
     pub const RESHAPE_AND_CACHE_F16: &str = include_str!("../cu/attention/reshape_and_cache.cu");
+    pub const RESHAPE_AND_CACHE_DUAL_F16: &str = include_str!("../cu/attention/reshape_and_cache_dual.cu");
     /// paged attention decode 家族(v1 / v2 分片 / v2 reduce;K1/K2)
     pub const PAGED_ATTENTION_F16: &str = include_str!("../cu/attention/pagedattention_f16.cu");
     /// chunked prefill paged attention(在线 softmax + 滑窗;smem tile)
     pub const PREFILL_PAGED_ATTN_F16: &str = include_str!("../cu/attention/prefill_paged_attn_f16.cu");
+    /// prefill split attention(flash-decoding 式 context 分块 + reduce;
+    /// 2026-10-02 C1 自研序,长 ctx prefill 主案)
+    pub const PREFILL_SPLIT_F16: &str = include_str!("../cu/attention/prefill_split_f16.cu");
 }
 
 /// 文本主干 kernel(models layers 消费)

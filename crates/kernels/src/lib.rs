@@ -13,6 +13,10 @@ pub mod cublas;
 #[cfg(feature = "marlin")]
 pub mod marlin;
 
+/// FlashInfer prefill(foreign-kernel 通道;预编 .a;feature "flashinfer")
+#[cfg(feature = "flashinfer")]
+pub mod flashinfer;
+
 /// foreign-kernel 总分派谓词(server handle_launch 前置;外部算子总表)。
 /// 新外部库 = 各自模块 is_foreign + 此处加一行(命令面零新增)。
 pub fn is_foreign_op(name: &str) -> bool {
@@ -22,6 +26,10 @@ pub fn is_foreign_op(name: &str) -> bool {
     }
     #[cfg(feature = "marlin")]
     if marlin::is_foreign(name) {
+        return true;
+    }
+    #[cfg(feature = "flashinfer")]
+    if flashinfer::is_foreign(name) {
         return true;
     }
     false

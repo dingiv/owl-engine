@@ -765,7 +765,7 @@ mod tests {
             &f32b(&(0..t_len).map(|t| t as f32 + 1.0).collect::<Vec<_>>()));
         let gdn_slot = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0]));
         let ctx = ForwardCtx::model_prefill(t_len, &pos_all, &kvs_pre, &rp, &gdns_pre,
-            &slots_all, &lens_all, &gdn_slot);
+            &slots_all, &lens_all, &gdn_slot, 0, None);
         let all = crate::testkit::harvest_f16(&mut gpu, &model.forward(&ids_all, &ctx)).await;
 
         // 逐行等价(路径等价 = PF1a 契约):T 批 cuBLAS(m=8)vs 逐步

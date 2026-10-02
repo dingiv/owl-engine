@@ -26,6 +26,7 @@
 //! 原语带流 id —— 流内保序(依赖维),流间并发。
 
 use crate::ffi::{launch_host_function, memcpy_dtoh_async, memcpy_htod_async, memset_d8_async};
+use cudarc::driver::DevicePtr;
 use crate::command::{Ack, Command};
 use crate::launch::issue_launch;
 use crate::state::{DeviceSelector, GpuCtx, KernelCache, Staging};
@@ -49,6 +50,27 @@ pub(super) struct PinnedPool {
     free: std::sync::Mutex<Vec<Box<dyn owl_iface::contract::PinnedRegion + Send>>>,
 }
 
+/// FlashInfer prefill 句柄(E1.5):设备 workspace(float/int)+ host
+/// 暂冲 + 1 项 plan 缓存(全层同参;key = 形状七元组)。
+struct FiState {
+    float_ws: cudarc::driver::CudaSlice<u8>,
+    int_ws: cudarc::driver::CudaSlice<u8>,
+    /// 裸指针缓存(device_ptr 的 SyncOnDrop 每调用同步流 —— 发射期禁调;
+    /// init 时流空零成本取一次)
+    float_ws_ptr: u64,
+    int_ws_ptr: u64,
+    host_staging: Vec<u8>,
+    plan: Option<FiPlanCache>,
+}
+
+/// plan 缓存项:形状键 + plan15 + tile/split
+struct FiPlanCache {
+    key: (usize, usize, usize, usize, usize, usize, usize),
+    plan15: [i64; 15],
+    cta_tile_q: i32,
+    split_kv: i32,
+}
+
 impl PinnedPool {
     fn take(&self, min_bytes: usize) -> Option<Box<dyn owl_iface::contract::PinnedRegion + Send>> {
         let mut v = self.free.lock().unwrap();
@@ -70,6 +92,9 @@ pub struct GpuServer {
     kernels: KernelCache,
     /// cuBLAS 封装(foreign-kernel 通道;算子之家 owl-kernels::cublas,懒初始化)
     blas: Option<owl_kernels::cublas::OwlCublas>,
+    /// FlashInfer prefill 句柄(foreign-kernel 通道;workspace + plan 缓存,
+    /// 懒初始化 —— owl-kernels::flashinfer)
+    fi: Option<FiState>,
     /// 完成派发出口(host 回调只投递;派发线程执行真正的 finish)
     dispatch: Option<mpsc::Sender<Finish>>,
     /// 逐命令计时账本(OWL_SRV_TIMING;name / count / total_ns / max_ns)
@@ -98,6 +123,7 @@ impl GpuServer {
             ctx: None,
             kernels: KernelCache::new(),
             blas: None,
+            fi: None,
             dispatch: None,
             timings: Vec::new(),
         }
@@ -892,6 +918,7 @@ impl GpuServer {
             name if name == owl_kernels::marlin::GEMM_W4A16_AWQ => {
                 self.handle_marlin_gemm_awq(msg, ack)
             }
+            name if name == owl_kernels::flashinfer::PREFILL_FI => self.handle_fi_prefill(msg, ack),
             other => ack.send(Err(ModelError::Msg(format!(
                 "foreign kernel {other}: 无执行臂(owl_kernels::is_foreign_op 与分派表失配)"
             )))),
@@ -1038,6 +1065,182 @@ impl GpuServer {
                 "marlin gemm err {e}: {}",
                 owl_kernels::marlin::v2_err_str(e)
             )))),
+        }
+    }
+
+
+    /// FlashInfer paged prefill 臂(E1.5)。槽序契约:
+    /// [T q, T kc_fi, T vc, T q_cu, T indices, T indptr, T last_len, T wr,
+    ///  O out, sz total_rows, sz ctx_total, sz T, sz hq, sz hkv, sz hd,
+    ///  sz page, sz sm_scale_bits, sz nb](8 Block + 8 sz;wr 依赖边)。
+    /// plan(host,每 chunk 一次)1 项缓存;run 每层一次。批 = 1。
+    /// 捕获窗拒绝态同 cublas(FI prefill 现役仅 eager;解码图不含它)。
+    fn handle_fi_prefill(&mut self, msg: LaunchMsg, ack: Ack<Result<Bytes, ModelError>>) {
+        if self.fi.is_none() {
+            if self.ctx.as_ref().map(|c| c.capture_stream()).unwrap_or(false) {
+                return ack.send(Err(ModelError::Msg(
+                    "flashinfer_prefill 捕获内首次初始化(需先 eager warmup)".into(),
+                )));
+            }
+            let stream = match self.ctx().stream(STREAM_COMPUTE) {
+                Ok(s) => s.clone(),
+                Err(e) => return ack.send(Err(e)),
+            };
+            let float_ws = stream
+                .alloc_zeros::<u8>(owl_kernels::flashinfer::FI_FLOAT_WS_BYTES)
+                .map_err(|e| ModelError::Msg(format!("fi ws alloc: {e:?}")));
+            let int_ws = stream
+                .alloc_zeros::<u8>(owl_kernels::flashinfer::FI_INT_WS_BYTES)
+                .map_err(|e| ModelError::Msg(format!("fi ws alloc: {e:?}")));
+            let (float_ws, int_ws) = match (float_ws, int_ws) {
+                (Ok(a), Ok(b)) => (a, b),
+                (Err(e), _) | (_, Err(e)) => return ack.send(Err(e)),
+            };
+            use cudarc::driver::DevicePtr;
+            // 空流快照:此时无排队内核,SyncOnDrop 守卫就地丢弃零成本
+            let float_ws_ptr = {
+                let (p, _g) = DevicePtr::<u8>::device_ptr(&float_ws, &stream);
+                p
+            };
+            let int_ws_ptr = {
+                let (p, _g) = DevicePtr::<u8>::device_ptr(&int_ws, &stream);
+                p
+            };
+            self.fi = Some(FiState {
+                float_ws,
+                int_ws,
+                float_ws_ptr,
+                int_ws_ptr,
+                host_staging: vec![0u8; owl_kernels::flashinfer::FI_HOST_STAGING_BYTES],
+                plan: None,
+            });
+        }
+        let mut blocks: Vec<u64> = Vec::new();
+        let mut scalars: Vec<u64> = Vec::new();
+        for a in &msg.args {
+            match a {
+                Arg::Block { id } => blocks.push(*id),
+                Arg::U64(v) => scalars.push(*v),
+                _ => {
+                    return ack.send(Err(ModelError::Msg(format!(
+                        "foreign kernel {} 槽序违约:仅 Block/U64(见 owl_kernels::flashinfer 契约)",
+                        msg.kernel.name
+                    ))))
+                }
+            }
+        }
+        if blocks.len() != 9 || scalars.len() != 8 {
+            return ack.send(Err(ModelError::Msg(format!(
+                "foreign kernel {} 槽序违约:9 Block + 8 sz,得 {}B/{}S",
+                msg.kernel.name,
+                blocks.len(),
+                scalars.len()
+            ))));
+        }
+        let (total_rows, ctx_total, t, hq, hkv, hd, page, sm_bits) = (
+            scalars[0] as usize, scalars[1] as usize, scalars[2] as usize,
+            scalars[3] as usize, scalars[4] as usize, scalars[5] as usize,
+            scalars[6] as usize, scalars[7] as u32,
+        );
+        let sm_scale = f32::from_bits(sm_bits);
+        let stream = match self.ctx().stream(STREAM_COMPUTE) {
+            Ok(s) => s.clone(),
+            Err(e) => return ack.send(Err(e)),
+        };
+        let mut ptrs = Vec::with_capacity(9);
+        for b in &blocks {
+            match self.ctx().block_ptr(*b, &stream) {
+                Ok((p, _)) => ptrs.push(p),
+                Err(e) => return ack.send(Err(e)),
+            }
+        }
+        // workspace 指针/长度(init 时缓存的裸指针;发射期零同步)
+        let (int_ws_ptr, int_ws_len, float_ws_ptr, float_ws_len, staging_ptr, staging_len) = {
+            let fi = self.fi.as_mut().unwrap();
+            (
+                fi.int_ws_ptr as *mut c_void,
+                fi.int_ws.len(),
+                fi.float_ws_ptr as *mut c_void,
+                fi.float_ws.len(),
+                fi.host_staging.as_mut_ptr() as *mut c_void,
+                fi.host_staging.len(),
+            )
+        };
+        // plan 缓存(键 = 形状七元组 + total_rows)
+        let key = (total_rows, ctx_total, t, hq, hkv, hd, page);
+        let need_plan = self.fi.as_ref().unwrap().plan.as_ref().map(|c| c.key != key).unwrap_or(true);
+        let fi_plan_t0 = std::time::Instant::now();
+        let plan_result: Result<_, String> = (|| {
+            let qo_indptr = [0i32, t as i32];
+            let kv_indptr = [0i32, ctx_total as i32];
+            let (mut plan15, mut cta_tile_q, mut split_kv) = ([0i64; 15], 0i32, 0i32);
+            let r = unsafe {
+                owl_kernels::flashinfer::owl_fi_prefill_plan(
+                    float_ws_ptr,
+                    float_ws_len,
+                    int_ws_ptr,
+                    int_ws_len,
+                    staging_ptr,
+                    staging_len,
+                    plan15.as_mut_ptr(),
+                    &mut cta_tile_q,
+                    &mut split_kv,
+                    qo_indptr.as_ptr(),
+                    kv_indptr.as_ptr(),
+                    total_rows as i32,
+                    1, // batch = 1(owl 单会话)
+                    hq as i32, hkv as i32, hd as i32, page as i32,
+                    stream.cu_stream() as *mut c_void,
+                )
+            };
+            if r != 0 {
+                return Err(format!(
+                    "flashinfer_prefill_plan err {r}(hd={hd} page={page} T={t} ctx={ctx_total})"
+                ));
+            }
+            Ok((plan15, cta_tile_q, split_kv))
+        })();
+        owl_shared::metrics::with_metrics_store(|m| {
+            m.timer_record_tag("fi.plan", fi_plan_t0.elapsed(), file!(), line!())
+        });
+        let (mut plan15, _cta, _split) = match plan_result {
+            Ok(v) => v,
+            Err(e) => return ack.send(Err(ModelError::Msg(e))),
+        };
+        if let Some(fi) = self.fi.as_mut() {
+            fi.plan = Some(FiPlanCache { key, plan15, cta_tile_q: _cta, split_kv: _split });
+        }
+        let _ = (_cta, _split);
+        let plan15 = self.fi.as_ref().unwrap().plan.as_ref().unwrap().plan15;
+        let fi_run_t0 = std::time::Instant::now(); // v2
+        let r = unsafe {
+            owl_kernels::flashinfer::owl_fi_prefill_run(
+                ptrs[0] as *const c_void,
+                ptrs[1] as *const c_void,
+                ptrs[2] as *const c_void,
+                ptrs[8] as *mut c_void,
+                ptrs[3] as *mut i32,
+                ptrs[4] as *mut i32,
+                ptrs[5] as *mut i32,
+                ptrs[6] as *mut i32,
+                plan15.as_ptr(),
+                int_ws_ptr,
+                int_ws_len,
+                float_ws_ptr,
+                float_ws_len,
+                1, // batch
+                hq as i32, hkv as i32, hd as i32, page as i32,
+                total_rows as i32,
+                sm_scale,
+                stream.cu_stream() as *mut c_void,
+            )
+        };
+        owl_shared::metrics::with_metrics_store(|m| {
+            m.timer_record_tag("fi.run", fi_run_t0.elapsed(), file!(), line!())
+        });
+        match r {
+            0 => ack.send(Ok(Bytes::new(blocks[8], msg.out_elems))),
+            e => ack.send(Err(ModelError::Msg(format!("flashinfer_prefill_run err {e}")))),
         }
     }
 

@@ -76,7 +76,10 @@ where
 {
     Box::pin(async move {
         let mut ctx =
-            EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new() };
+            EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new(),
+                arena_set: std::collections::HashSet::new(),
+                block_users: std::collections::HashMap::new(),
+                pending: std::collections::HashMap::new(), reclaim: false };
         let root = _eval_rec(t, &mut ctx).await?;
         // 非 scoped 口径:竞技场原样丢弃(块常驻,历史行为不变)
         Ok(root)
@@ -89,6 +92,16 @@ where
 /// 归还设备池 —— 不再引用即焚,消除 eval 中间块零回收的线性累积
 /// (4k 双 turn ~24GB OOM 立案见 roadmap E2)。安全前提:free 前根
 /// 已 dtoh(COMPUTE 排空);图捕获期禁用(捕获块 = slab 切片)。
+///
+/// **活性中途回收(2026-10-02;scoped 独占)**:整 chunk SSA 图宽问题
+/// —— 27B prefill chunk 的全 64 层中间块同时存活(峰值 ~4GB),chunk
+/// 被内存封顶在 128,发射摊薄锁死(prefill 差 vLLM 1.76× 主根因)。本
+/// 口径在预过波里给每节点记剩余消费者数(+1 = 调用方持根),每个节点
+/// 执行完后递减各父节点;计零 = 节点死亡 → 块归属减一,归零且竞技场
+/// 原生 → 立即 `face.free`(流序 free:消费 kernel 已入队,同流保序。
+/// 透传臂 Reshape/SlotWrite 与父共享块 → 块归属按块计数,不按节点。
+/// scoped 结束时候选表 = 仍存活者(通常仅根外的零星),逐层收割后
+/// 图宽 = 峰值活跃集,chunk 可提至 ≥1024。)
 pub fn eval_ops_scoped<'a, D>(
     t: &'a TensorOps,
     face: &'a mut D,
@@ -98,10 +111,13 @@ where
 {
     Box::pin(async move {
         let mut ctx =
-            EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new() };
+            EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new(),
+                arena_set: std::collections::HashSet::new(),
+                block_users: std::collections::HashMap::new(),
+                pending: count_pending(t), reclaim: true };
         let root = _eval_rec(t, &mut ctx).await?;
         let mut candidates = std::mem::take(&mut ctx.arena);
-        candidates.retain(|id| *id != root.id);
+        candidates.retain(|id| *id != root.id && ctx.arena_set.contains(id));
         Ok((root, candidates))
     })
 }
@@ -119,7 +135,10 @@ where
 {
     Box::pin(async move {
         let mut ctx =
-            EvalCtx { face, memo: std::collections::HashMap::new(), tap: Some(tap), arena: Vec::new() };
+            EvalCtx { face, memo: std::collections::HashMap::new(), tap: Some(tap), arena: Vec::new(),
+                arena_set: std::collections::HashSet::new(),
+                block_users: std::collections::HashMap::new(),
+                pending: std::collections::HashMap::new(), reclaim: false };
         _eval_rec(t, &mut ctx).await
     })
 }
@@ -133,6 +152,53 @@ struct EvalCtx<'a, D> {
     /// 本求值新建块 id 表(E2a 竞技场;Htod/Alloc/launch 输出在创建时登记,
     /// CSE 命中/Reshape 透传/Block 叶不登记)。scoped 口径下回收候选源。
     arena: Vec<u64>,
+    /// 竞技场成员速查(中途回收/free 守卫;与 arena 同内容)
+    arena_set: std::collections::HashSet<u64>,
+    /// 每块被存活节点引用计数(track_new=1;透传臂 +1;节点死亡 -1,
+    /// 归零且竞技场原生 → 中途 free)
+    block_users: std::collections::HashMap<u64, usize>,
+    /// 每节点剩余消费者数(预波;scoped 独占,reclaim=false 时为空)
+    pending: std::collections::HashMap<u64, usize>,
+    /// 活性中途回收开关(scoped = true;plain/tap 保历史语义)
+    reclaim: bool,
+}
+
+impl<'a, D> EvalCtx<'a, D> {
+    /// 新块登记:竞技场 + 成员速查 + 块归属 = 1
+    fn track_new(&mut self, id: u64) {
+        self.arena.push(id);
+        self.arena_set.insert(id);
+        *self.block_users.entry(id).or_insert(0) += 1;
+    }
+
+    /// 透传别名登记(Reshape/SlotWrite:节点共享父块;仅竞技场原生块)
+    fn track_alias(&mut self, id: u64) {
+        if self.arena_set.contains(&id) {
+            *self.block_users.entry(id).or_insert(0) += 1;
+        }
+    }
+}
+
+/// 预波:每节点剩余消费者计数(每条入边 +1;根 +1 = 调用方持根)。
+/// 迭代显式栈(DAG 可数千节点深,避开递归深度);visited 保证每节点
+/// 处理一次,每条边在其消费节点的访问时计一次。
+fn count_pending(root: &TensorOps) -> std::collections::HashMap<u64, usize> {
+    let mut pending: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut stack = vec![root];
+    *pending.entry(root.id).or_insert(0) += 1;
+    while let Some(n) = stack.pop() {
+        if !visited.insert(n.id) {
+            continue;
+        }
+        for p in &n.parents {
+            *pending.entry(p.id).or_insert(0) += 1;
+            if !visited.contains(&p.id) {
+                stack.push(p);
+            }
+        }
+    }
+    pending
 }
 
 /// DAG 求值入口(装箱:async 递归要求;'b 短借用 reborrow)。
@@ -196,40 +262,40 @@ where
     let out: Bytes = match &t.op {
         Op::Htod { bytes } => {
             let b = ctx.face.htod(dtype, &shape, bytes).await?;
-            ctx.arena.push(b.id);
+            ctx.track_new(b.id);
             b
         }
         Op::Zeros => {
             let b = ctx.face.alloc(dtype, n_elems).await?;
-            ctx.arena.push(b.id);
+            ctx.track_new(b.id);
             b
         }
         Op::Block { id } => Bytes { id: *id, len: 0 },
-        Op::Reshape => ins[0].clone(), // 纯元数据视图:透传父块(零拷贝)
+        Op::Reshape => { ctx.track_alias(ins[0].id); ins[0].clone() } // 纯元数据视图:透传父块(零拷贝)
         Op::Add => {
             let out = ctx.face.alloc_uninit(dtype, n_elems).await?;
-            ctx.arena.push(out.id);
+            ctx.track_new(out.id);
             let msg = crate::ops::lower_add(&ins, &out, n_elems, dtype);
             ctx.face.launch(msg).await?;
             out
         }
         Op::Mul => {
             let out = ctx.face.alloc_uninit(dtype, n_elems).await?;
-            ctx.arena.push(out.id);
+            ctx.track_new(out.id);
             let msg = crate::ops::lower_mul(&ins, &out, n_elems, dtype);
             ctx.face.launch(msg).await?;
             out
         }
         Op::Silu => {
             let out = ctx.face.alloc_uninit(dtype, n_elems).await?;
-            ctx.arena.push(out.id);
+            ctx.track_new(out.id);
             let msg = crate::ops::lower_silu(&ins, &out, n_elems, dtype);
             ctx.face.launch(msg).await?;
             out
         }
         Op::Sigmoid => {
             let out = ctx.face.alloc_uninit(dtype, n_elems).await?;
-            ctx.arena.push(out.id);
+            ctx.track_new(out.id);
             let msg = crate::ops::lower_sigmoid(&ins, &out, n_elems, dtype);
             ctx.face.launch(msg).await?;
             out
@@ -240,7 +306,7 @@ where
             // 在多行 [m,k] 时越界读 —— 此 bug 被"历届测试都单行"掩盖)
             let k = t.parents[0].shape.last().copied().unwrap_or(0);
             let out = ctx.face.alloc_uninit(dtype, m * n).await?;
-            ctx.arena.push(out.id);
+            ctx.track_new(out.id);
             if dtype == Dtype::F16 {
                 // f16 基线:foreign-kernel 通道(cuBLAS;nt = owl Linear 惯例)。
                 // gemm 侧 cm 约定:m = n_out(权重行)/ n = T(2026-09-26 修正:
@@ -260,7 +326,7 @@ where
         }
         Op::Rmsnorm { eps, w_off } => {
             let out = ctx.face.alloc_uninit(dtype, n_elems).await?;
-            ctx.arena.push(out.id);
+            ctx.track_new(out.id);
             // 归一化宽度由 alpha 的声明 shape 定义(per-head 行归一化:
             // [T, H×HD] × alpha [HD])。不能取 ins[1].len —— Block 叶子 len=0。
             let alpha_shape = t.parents[1].shape.clone();
@@ -310,7 +376,7 @@ where
                 }
             }
             let out = ctx.face.alloc_uninit(dtype, n_elems).await?;
-            ctx.arena.push(out.id);
+            ctx.track_new(out.id);
             let msg = crate::ops::lower_kernel(&kernel, &t.args, &ins, &out, n_elems);
             ctx.face.launch(msg).await?;
             out
@@ -329,15 +395,41 @@ where
                 }
             }
             let out = ctx.face.alloc_uninit(dtype, n_elems).await?;
-            ctx.arena.push(out.id);
+            ctx.track_new(out.id);
             let msg = crate::ops::lower_kernel(kernel, &t.args, &ins, &out, n_elems);
             ctx.face.launch(msg).await?;
             out
         }
-        Op::SlotWrite => ins[0].clone(),
+        Op::SlotWrite => { ctx.track_alias(ins[0].id); ins[0].clone() }
         other => return Err(ModelError::Msg(format!("eval 未覆盖: {other:?}"))),
     };
     ctx.memo.insert(t.id, out.clone());
+    // ── 活性中途回收(2026-10-02;scoped 独占;在 Tap 窗口后 —— 观测窗
+    // 律要求父输入窗口内存活)── 逐父递减剩余消费者数;计零 = 节点死亡
+    // → memo 摘除 + 块归属减一;归零且竞技场原生且非本节点输出(透传
+    // 别名防误焚)→ 立即 free。流序安全:消费 kernel 已入队,free 同流
+    // 排在其后;根带 +1 永不中途回收。
+    if ctx.reclaim {
+        for (p, b) in t.parents.iter().zip(ins.iter()) {
+            let cnt = ctx.pending.entry(p.id).or_insert(0);
+            if *cnt > 0 {
+                *cnt -= 1;
+            }
+            if *cnt == 0 {
+                ctx.memo.remove(&p.id);
+                let bid = b.id;
+                if let Some(u) = ctx.block_users.get_mut(&bid) {
+                    if *u > 0 {
+                        *u -= 1;
+                    }
+                    if *u == 0 && bid != out.id && ctx.arena_set.contains(&bid) {
+                        ctx.arena_set.remove(&bid);
+                        ctx.face.free(&[bid]).await?;
+                    }
+                }
+            }
+        }
+    }
     // ── Tap:After 窗口(输出已入 memo;父输入仍在 memo 存活)──
     // 观测窗口律:数据读取由解释器代执行并在窗口内完成;窗口外读块
     // 未定义(scratch 块 eval 结束后可被池复用)。tap 无 launch/alloc
@@ -370,6 +462,57 @@ where
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+    use crate::contract::DeviceClient as _;
+    use crate::tensor::TensorOps;
+    use crate::testkit::f32b;
+
+    /// 深链(128 级 Add):活性中途回收 → 中间节点逐个死亡,
+    /// scoped 候选表应空(历史行为 = 128 块全落候选);根数据收割
+    /// 不受影响(值 = 1+128)。CpuFace::free = 无操作,验的是记账面
+    /// (候选裁剪 / 归属归零),GPU 域真 free 由引擎 prefill 链路覆盖。
+    #[tokio::test]
+    async fn scoped_liveness_chain_reclaimed() {
+        let mut face = owl_cpu::CpuFace::new();
+        let mut x = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0]));
+        let c = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0]));
+        for _ in 0..128 {
+            x = x.add(&c);
+        }
+        let (root, candidates) = eval_ops_scoped(&x, &mut face).await.expect("scoped eval");
+        assert!(
+            candidates.is_empty(),
+            "中途回收后候选表应为空,得 {} 块",
+            candidates.len()
+        );
+        let mut buf = vec![0u8; 4];
+        face.dtoh(&root, &mut buf).await.expect("根 dtoh");
+        let v = f32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        assert!((v - 129.0).abs() < 1e-5, "链值应 129.0,得 {v}");
+    }
+
+    /// 菱形 + 透传别名:x 被四方引用(mul 两参 + reshape 透传 + mul 右参)
+    /// → 块归属按块计数;候选空且无双重 free(若误焚,host 值读回即花);
+    /// 值 = x⁴ = 81(x=3:mul(x,x)=9;reshape 透传;9×3=27… 改:root =
+    /// sq.mul(&r) = 9×3 = 27;r 的块 = x 的块(透传),值 3 → 27)。
+    #[tokio::test]
+    async fn scoped_liveness_diamond_and_alias() {
+        let mut face = owl_cpu::CpuFace::new();
+        let x = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[3.0]));
+        let sq = x.mul(&x); // x 两次出现
+        let r = x.reshape(vec![1]); // 透传别名(与 x 同块)
+        let root = sq.mul(&r); // x 第三次出现
+        let (root, candidates) = eval_ops_scoped(&root, &mut face).await.expect("scoped eval");
+        assert!(candidates.is_empty(), "菱形/别名候选表应为空");
+        let mut buf = vec![0u8; 4];
+        face.dtoh(&root, &mut buf).await.expect("根 dtoh");
+        let v = f32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        assert!((v - 27.0).abs() < 1e-5, "应 27.0,得 {v}");
+    }
 }
 
 #[cfg(test)]

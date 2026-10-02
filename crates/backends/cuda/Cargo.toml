@@ -18,7 +18,7 @@ cudarc = { version = "0.19", default-features = false, features = [
 ] }
 owl-iface = { path = "../iface" }
 # 契约权威已下沉 owl-iface::contract(2026-09-25):后端不依赖前端
-owl-kernels = { path = "../../kernels", features = ["cublas", "marlin"] }
+owl-kernels = { path = "../../kernels", features = ["cublas", "marlin", "flashinfer"] }
 # GPU 逐核归因探针(OWL_GPU_PROF):动态 tag 入共享 metrics store
 # (shared 零后端依赖,方向无环;server 与 engine 同进程线程,store 共享)
 owl-shared = { path = "../../shared" }

@@ -14,6 +14,8 @@ description = "Operator dispatch + unified kernel home: .cu sources, nvrtc compi
 "cublas" = ["dep:cudarc"]
 # Marlin W4A16(f16 激活 × u4 权重;build.rs nvcc/预编 .a + foreign-kernel)
 "marlin" = ["dep:rayon", "dep:half"]
+# FlashInfer prefill(预编 .a + foreign-kernel;E1.5 工作包)
+"flashinfer" = []
 
 [dependencies]
 # 官方 cudarc:仅本 crate 的 cuda_ops 使用(kernel 编译与发射;feature 化,

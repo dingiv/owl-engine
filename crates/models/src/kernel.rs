@@ -134,6 +134,7 @@ pub static REGISTRY: &[Entry] = &[
     // ---- attention port 家族(K0;vendor attention.rs rev c0f19f2,Apache-2.0;
     //      vLLM classic 布局,K1/K2 paged_attention 同款;适配认领见 .cu 头注)----
     Entry { name: "vllm_reshape_and_cache_f16", source: sources::attention::RESHAPE_AND_CACHE_F16, args: "T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "owl_reshape_and_cache_dual_f16", source: sources::attention::RESHAPE_AND_CACHE_DUAL_F16, args: "T,T,T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     // prefill bs16 变体(池页 16,与 decode v1/v2 同池;hd256 = qwen3.5-0.8B 档)
     // prefill 主条目 = bs32(vendor 契约 BLOCK∈{32,64};bs16 越契约已废)
     Entry { name: "vllm_chunked_prefill_paged_attn_opt_f16_hd128", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
@@ -153,6 +154,11 @@ pub static REGISTRY: &[Entry] = &[
     //      (Hq/Hkv, Hkv, ceil(tokens/256));block (256,1,1) = TOKEN_CHUNK)----
     Entry { name: "vllm_chunked_prefill_paged_attn_opt_f16_hd128", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "vllm_chunked_prefill_paged_attn_opt_f16_hd256", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    // ---- prefill split attention(flash-decoding;2026-10-02 长 ctx 主案)----
+    // K1 = context 分块在线 softmax(未归一化 partial + (m,l) 入 scratch);
+    // K2 = partition 归一化合并。smem 64KB(>48KB 走发射器 opt-in 通道)
+    Entry { name: "owl_prefill_split_f16_hd256", source: sources::attention::PREFILL_SPLIT_F16, args: "T,T,T,T,T,T,T,f32,i32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "owl_prefill_split_reduce_f16_hd256", source: sources::attention::PREFILL_SPLIT_F16, args: "T,T,T,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     // ---- PF1a 栈核(concat_rows;arity 8,展开路径测试锚专用)----
     Entry { name: "owl_concat_rows_f16", source: text::CONCAT_F32, args: "T,T,T,T,T,T,T,T,sz,sz,sz,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_concat_rows_f32", source: text::CONCAT_F32, args: "T,T,T,T,T,T,T,T,sz,sz,sz,T", dtype: crate::contract::Dtype::F32 },

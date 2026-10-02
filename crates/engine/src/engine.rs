@@ -103,7 +103,15 @@ impl<D: DeviceClient + 'static> Engine<D> {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(2 * s);
-        let pool = StatePool::alloc(&mut self.face, dims, &loaded.spec.layer_types, s, pool_tokens).await?;
+        // FlashInfer prefill 面(OWL_FLASHINFER=1;E1.5):K 影子池 + 每
+        // chunk 表四件套(ForwardCtx.fi)。f16 + paged 才有意义。
+        let fi_enabled = pool_tokens > 0
+            && std::env::var_os("OWL_FLASHINFER").is_some()
+            && loaded.spec.dtype == owl_models::tensor::Dtype::F16;
+        let pool = StatePool::alloc(&mut self.face, dims, &loaded.spec.layer_types, s, pool_tokens, fi_enabled).await?;
+        if fi_enabled {
+            eprintln!("[boot] FlashInfer prefill 面启用(K 影子池 ×{})", pool.k_fis.len());
+        }
 
         // 块账房(E2b)+ E2c 前缀缓存启用(容量 = 池半;OWL_PREFIX_CACHE=0 关闭)
         let mut blocks_m = BlockManager::new(pool.nb, pool.page);

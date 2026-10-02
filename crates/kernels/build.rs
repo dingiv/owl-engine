@@ -141,4 +141,53 @@ fn build_marlin() {
         println!("cargo:rustc-link-lib=dylib=stdc++");
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", cuda_lib.display());
     }
+
+    // ------------------------------------------------------------------
+    // FlashInfer prefill(预编 .a 入库;foreign-kernel 通道;E1.5 工作包)
+    // FLASHINFER_FORCE_BUILD=1 重编:nvcc -arch=sm_86 -I<flashinfer>/include
+    // (fork 检出:~/.cudaforge/git/checkouts/flashinfer-0f06c2305a276bcb;
+    //  裁剪面见 cu/flashinfer/owl_fi_attention.cu 头注)
+    // ------------------------------------------------------------------
+    if std::env::var_os("CARGO_FEATURE_FLASHINFER").is_some() {
+        println!("cargo:rerun-if-changed=cu/flashinfer/prebuilt/libowl_flashinfer.a");
+        println!("cargo:rerun-if-env-changed=FLASHINFER_FORCE_BUILD");
+        let fi_prebuilt = PathBuf::from("cu/flashinfer/prebuilt/libowl_flashinfer.a");
+        let force = env::var("FLASHINFER_FORCE_BUILD").ok().as_deref() == Some("1");
+        let fi_dir = out_dir.join("flashinfer");
+        std::fs::create_dir_all(&fi_dir).unwrap();
+        if fi_prebuilt.exists() && !force {
+            let dest = fi_dir.join("libowl_flashinfer.a");
+            std::fs::copy(&fi_prebuilt, &dest).expect("copy prebuilt libowl_flashinfer.a");
+            println!("cargo:warning=owl-kernels: using prebuilt {}", fi_prebuilt.display());
+        } else {
+            let fi_include = env::var("FLASHINFER_INCLUDE").unwrap_or_else(|_| {
+                "/home/div/.cudaforge/git/checkouts/flashinfer-0f06c2305a276bcb/include".into()
+            });
+            let nvcc_m = env::var("FLASHINFER_NVCC").unwrap_or_else(|_| "nvcc".into());
+            let src = PathBuf::from("cu/flashinfer/owl_fi_attention.cu");
+            let obj = fi_dir.join("owl_fi_attention.o");
+            let status = std::process::Command::new(nvcc_m)
+                .args(["-O3", "-std=c++17", "-arch=sm_86"])
+                .arg(format!("-I{}", fi_include))
+                .arg("-c").arg(&src).arg("-o").arg(&obj)
+                .status()
+                .expect("flashinfer: failed to spawn nvcc");
+            assert!(status.success(), "flashinfer: nvcc failed");
+            let ar = env::var("AR").unwrap_or_else(|_| "ar".into());
+            let status = std::process::Command::new(ar)
+                .args(["rcs"]).arg(fi_dir.join("libowl_flashinfer.a")).arg(&obj)
+                .status()
+                .expect("flashinfer: failed to spawn ar");
+            assert!(status.success(), "flashinfer: ar failed");
+            println!("cargo:warning=owl-kernels: built libowl_flashinfer.a from source");
+        }
+        println!("cargo:rustc-link-search=native={}", fi_dir.display());
+        println!("cargo:rustc-link-lib=static=owl_flashinfer");
+        println!("cargo:rustc-link-lib=dylib=cudart");
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+        let cuda_lib = env::var("CUDA_HOME")
+            .map(|h| PathBuf::from(h).join("lib64"))
+            .unwrap_or_else(|_| PathBuf::from("/usr/local/cuda/lib64"));
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", cuda_lib.display());
+    }
 }

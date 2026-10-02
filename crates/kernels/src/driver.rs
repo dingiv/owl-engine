@@ -131,8 +131,18 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "gdn.norm_act" => gdn::norm_act(dt, ax(0), ax(1), ax(2)), // aux = [rows, value_dim, group_size]
         "ops.sigmoid" => ops::sigmoid(dt),
         "attn.k0_write" => attn::k0_write(ax(0)),
+        "attn.k0_dual" => attn::k0_dual(ax(0)),
         "attn.paged_decode" => attn::paged_decode_v1(req.env, dt, ax(0), ax(1), ax(2), ax(3)), // aux = [hd, hq, hkv, nb]
         "attn.paged_prefill" => attn::paged_prefill(req.env, dt, ax(0), ax(1), ax(2), ax(3)), // aux = [hd, hkv, hq, tokens]
+        "attn.prefill_split" => {
+            // aux = [hd, hkv, hq, tokens, nparts](ctx_base 走核参数槽,层侧传入)
+            let (hd, hkv, hq, tokens, nparts) = (ax(0), ax(1), ax(2), ax(3), ax(4));
+            attn::prefill_split(req.env, dt, hd, hkv, hq, tokens, nparts)
+        }
+        "attn.prefill_split_reduce" => {
+            // aux = [tokens, hq]
+            attn::prefill_split_reduce(dt, ax(0), ax(1))
+        }
         "attn.naive_decode" => attn::naive_decode(dt),
         "attn.gate_mul" => attn::gate_mul(dt),
         "ops.narrow" => elems::narrow(dt),
@@ -313,6 +323,14 @@ pub mod attn {
         }
     }
 
+    /// K0-dual(FlashInfer 配套;classic K/V + kHND K 影子一次发射)
+    pub fn k0_dual(tokens: usize) -> KernelPick {
+        KernelPick {
+            name: "owl_reshape_and_cache_dual_f16",
+            shape: Shape { grid: (tokens as u32, 1, 1), block: (256, 1, 1), smem: 0 },
+        }
+    }
+
     /// 页配对谓词(decode;声明期门控用 —— 执行期 resolve 同律 panic,
     /// 谓词与分派单源于此,调用点不可能配错页)。**(hd,page) 联合裁决**
     /// —— legacy 小头测试(hd∉{128,256})由 None 回退 naive 的历史行为
@@ -387,6 +405,51 @@ pub mod attn {
                 grid: ((hq / hkv) as u32, hkv as u32, ((tokens + 255) / 256) as u32),
                 block: (256, 1, 1),
                 smem: (64 + 2 * hd * env.page * 2) as u32,
+            },
+        }
+    }
+
+    /// prefill split(flash-decoding;长 ctx 主案 2026-10-02):
+    /// grid (Hq/Hkv, Hkv, qchunks × nparts),qchunks = ceil(tokens/64);
+    /// block 256(TG=4,64 query/block);smem = 64 tok × hd × 2B × 2(K+V)
+    /// = 64KB(hd256;>48KB 走发射器 opt-in 通道)。nparts 由层侧
+    /// max_ctx = ctx_base + tokens 推得(≥4 才走 split)。
+    pub fn prefill_split(
+        env: &OpEnv,
+        dt: DType,
+        hd: usize,
+        hkv: usize,
+        hq: usize,
+        tokens: usize,
+        nparts: usize,
+    ) -> KernelPick {
+        assert!(matches!(dt, DType::F16), "prefill split 仅有 f16 变体(dt={dt:?})");
+        assert!(env.page == 32, "prefill split 页 32 契约,得 {}", env.page);
+        let name = match hd {
+            256 => "owl_prefill_split_f16_hd256",
+            other => panic!("prefill split 仅 hd256,得 {other}"),
+        };
+        let qchunks = (tokens + 63) / 64;
+        KernelPick {
+            name,
+            shape: Shape {
+                grid: ((hq / hkv) as u32, hkv as u32, (qchunks * nparts) as u32),
+                block: (256, 1, 1),
+                smem: (64 * hd * 2 * 2) as u32,
+            },
+        }
+    }
+
+    /// prefill split reduce(每 thread 一 (token, head) 合并 nparts;
+    /// hd 仅 hd256 核名 —— hd 校验由核名/登记表承担)
+    pub fn prefill_split_reduce(dt: DType, tokens: usize, hq: usize) -> KernelPick {
+        assert!(matches!(dt, DType::F16), "prefill split reduce 仅有 f16 变体");
+        KernelPick {
+            name: "owl_prefill_split_reduce_f16_hd256",
+            shape: Shape {
+                grid: ((((tokens * hq) + 255) / 256) as u32, 1, 1),
+                block: (256, 1, 1),
+                smem: 0,
             },
         }
     }
