@@ -147,6 +147,7 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "attn.naive_decode" => attn::naive_decode(dt),
         "attn.gate_mul" => attn::gate_mul(dt),
         "ops.narrow" => elems::narrow(dt),
+        "elems.cast_f16_f32" => elems::cast_f16_f32(dt),
         "ops.concat" => elems::concat(dt),
         "ops.rope" => elems::rope(dt, ax(0)),
         "ops.embed" => elems::embed(dt, ax(0)),
@@ -575,6 +576,12 @@ pub mod mlp {
 // ============================================================================
 
 pub mod elems {
+    /// f16→f32 设备 cast(GDN chunked 编排配套;哨兵 1D;节点 dtype = F32 出)
+    pub fn cast_f16_f32(dt: DType) -> KernelPick {
+        assert!(matches!(dt, DType::F32), "cast_f16_f32 出 f32,得 {dt:?}");
+        KernelPick { name: "owl_cast_f16_f32", shape: SENTINEL_1D }
+    }
+
     use super::{DType, KernelPick, Shape, SENTINEL_1D};
 
     fn dt_name(base: &str, dt: DType) -> &'static str {

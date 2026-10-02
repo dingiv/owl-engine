@@ -50,8 +50,6 @@ fn main() {
         panic!("build.rs: nvcc 预编译 cu/ops.cu 失败(arch={arch})");
     }
     println!("cargo:rustc-env=OWL_OPS_PTX_PATH={}", ptx.display());
-
-
 }
 
 

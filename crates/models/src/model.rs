@@ -152,6 +152,7 @@ impl Model {
             fi: ctx.fi.clone(),
             fi_kvi: kvi,
             env: ctx.env,
+            gdn_slot_host: ctx.gdn_slot_host,
         }
     }
 

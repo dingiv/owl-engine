@@ -91,9 +91,20 @@ pub struct DiagEnv {
     pub host_argmax: bool,
 }
 
+/// GDN 分派旋钮
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GdnEnv {
+    /// chunked delta rule(FLA AOT 五核;prefill;默认关)
+    pub chunked: bool,
+    /// 标量门 chunked(lmdeploy pre_sm90 port 单核;prefill;默认关;
+    /// 与 chunked 同开时 scalar 优先 —— 层臂三分序 scalar > chunked > recurrence)
+    pub scalar: bool,
+}
+
 /// 解释器执行环境完备描述(默认 = 生产基线 + 无硬件环境)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EnvProvider {
+    pub gdn: GdnEnv,
     pub hw: HwEnv,
     /// 量化方案(F16 / W4A16 / W4A16Awq;W4A8 = REQ-CTX-01 一 flag 宿主)
     pub quant: QuantPlan,
@@ -131,6 +142,7 @@ impl EnvProvider {
                 force_naive_prefill: has("OWL_FORCE_NAIVE"),
                 fi: has("OWL_FLASHINFER"),
             },
+            gdn: GdnEnv { chunked: has("OWL_GDN_CHUNKED"), scalar: has("OWL_GDN_SCALAR") },
             kv: KvEnv { quant: if has("OWL_KV_FP8") { KvQuant::Fp8E4M3 } else { KvQuant::None }, ..KvEnv::default() },
             diag: DiagEnv {
                 resolve_trace: has("OWL_RESOLVE_TRACE"),

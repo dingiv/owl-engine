@@ -97,6 +97,8 @@ pub struct ForwardCtx<'a> {
     pub fi_kvi: usize,
     /// 解释器执行环境(EnvProvider;engine/测试构造定制,构造器取默认)
     pub env: crate::env::EnvProvider,
+    /// GDN 状态槽号(host 侧真值;chunked 臂发射标量用)
+    pub gdn_slot_host: usize,
 }
 
 impl<'a> ForwardCtx<'a> {
@@ -118,6 +120,7 @@ impl<'a> ForwardCtx<'a> {
             fi: None,
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
+            gdn_slot_host: 0,
         }
     }
 
@@ -144,6 +147,7 @@ impl<'a> ForwardCtx<'a> {
             fi: None,
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
+            gdn_slot_host: 0,
         }
     }
 
@@ -165,6 +169,7 @@ impl<'a> ForwardCtx<'a> {
             fi: None,
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
+            gdn_slot_host: 0,
         }
     }
 
@@ -190,6 +195,7 @@ impl<'a> ForwardCtx<'a> {
             fi: None,
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
+            gdn_slot_host: 0,
         }
     }
 
@@ -218,6 +224,7 @@ impl<'a> ForwardCtx<'a> {
             fi: None,
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
+            gdn_slot_host: 0,
         }
     }
 
@@ -246,6 +253,7 @@ impl<'a> ForwardCtx<'a> {
             fi: None,
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
+            gdn_slot_host: 0,
         }
     }
 
@@ -280,6 +288,7 @@ impl<'a> ForwardCtx<'a> {
             fi,
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
+            gdn_slot_host: 0,
         }
     }
 }

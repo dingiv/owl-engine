@@ -17,6 +17,13 @@ pub mod marlin;
 #[cfg(feature = "flashinfer")]
 pub mod flashinfer;
 
+/// GDN chunked delta rule(foreign-kernel 通道;FLA AOT cubin)
+pub mod gdn_chunked;
+
+/// GDN 标量门 chunked 前向(foreign-kernel 通道;lmdeploy pre_sm90 port,
+/// 单核替代五核流水;cubin 预编入库,免 feature 门)
+pub mod gdn_scalar;
+
 /// foreign-kernel 总分派谓词(server handle_launch 前置;外部算子总表)。
 /// 新外部库 = 各自模块 is_foreign + 此处加一行(命令面零新增)。
 pub fn is_foreign_op(name: &str) -> bool {
@@ -30,6 +37,12 @@ pub fn is_foreign_op(name: &str) -> bool {
     }
     #[cfg(feature = "flashinfer")]
     if flashinfer::is_foreign(name) {
+        return true;
+    }
+    if gdn_chunked::is_foreign(name) {
+        return true;
+    }
+    if gdn_scalar::is_foreign(name) {
         return true;
     }
     false

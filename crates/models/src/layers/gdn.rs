@@ -405,23 +405,110 @@ impl GatedDeltaNet {
         let g = gating_g(&self.a_log.decl(), &a, &self.dt_bias.decl(), tokens, self.nv);
         let beta = b.sigmoid();
 
-        // varlen 递推批核(单发射;state 原地进出)
-        let y = recurrence_varlen(
-            &q_n.reshape(vec![tokens, self.nk, self.hk_dim]),
-            &k_n.reshape(vec![tokens, self.nk, self.hk_dim]),
-            &v_c.reshape(vec![tokens, self.nv, self.hv_dim]),
-            &g,
-            &beta,
-            &gdn.rec,
-            gdn_slot,
-            &cu,
-            tokens,
-            self.nv,
-            self.nk,
-            self.hk_dim,
-            self.hv_dim,
-            1.0 / (self.hk_dim as f32).sqrt(),
-        );
+        // GDN prefill 三分臂(env 选路;scalar > chunked > recurrence):
+        // - scalar:lmdeploy pre_sm90 port 单核(cast ×5 → 单 Call)
+        // - chunked:FLA AOT 五核(fwd_h 旧案冻结,对照臂)
+        // - recurrence:现役 varlen 递推批核(基线)
+        if std::env::var_os("OWL_TRACE_GATE").is_some() {
+            eprintln!("[gdn-gate] scalar={} chunked={} T={}", ctx.env.gdn.scalar, ctx.env.gdn.chunked, tokens);
+        }
+        let y = if ctx.env.gdn.scalar {
+            let q_f = TensorOps::call(crate::ops::ids::CAST_F16_F32)
+                .arg(&q_n.reshape(vec![tokens, self.nk, self.hk_dim]))
+                .arg_i32((tokens * self.nk * self.hk_dim) as i32)
+                .with_shape(Dtype::F32, vec![tokens, self.nk, self.hk_dim]);
+            let k_f = TensorOps::call(crate::ops::ids::CAST_F16_F32)
+                .arg(&k_n.reshape(vec![tokens, self.nk, self.hk_dim]))
+                .arg_i32((tokens * self.nk * self.hk_dim) as i32)
+                .with_shape(Dtype::F32, vec![tokens, self.nk, self.hk_dim]);
+            let v_f = TensorOps::call(crate::ops::ids::CAST_F16_F32)
+                .arg(&v_c.reshape(vec![tokens, self.nv, self.hv_dim]))
+                .arg_i32((tokens * self.nv * self.hv_dim) as i32)
+                .with_shape(Dtype::F32, vec![tokens, self.nv, self.hv_dim]);
+            let g_f = TensorOps::call(crate::ops::ids::CAST_F16_F32)
+                .arg(&g)
+                .arg_i32((tokens * self.nv) as i32)
+                .with_shape(Dtype::F32, vec![tokens, self.nv]);
+            let beta_f = TensorOps::call(crate::ops::ids::CAST_F16_F32)
+                .arg(&beta)
+                .arg_i32((tokens * self.nv) as i32)
+                .with_shape(Dtype::F32, vec![tokens, self.nv]);
+            TensorOps::of(
+                crate::kernel::Kernel::new(owl_kernels::gdn_scalar::GDN_SCALAR_FWD, "")
+                    .with_sig("T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz,sz"),
+            )
+            .arg(&q_f)
+            .arg(&k_f)
+            .arg(&v_f)
+            .arg(&g_f)
+            .arg(&beta_f)
+            .arg(&gdn.rec)
+            .arg_usize(tokens)
+            .arg_usize(ctx.gdn_slot_host)
+            .arg_usize(1) // ns:单序列(prefill;varlen 并发批 M2 接)
+            .arg_usize(self.nv)
+            .arg_usize(self.nk)
+            .arg_usize(self.hk_dim)
+            .arg_usize((1.0f32 / (self.hk_dim as f32).sqrt()).to_bits() as usize)
+            .with_shape(Dtype::F16, vec![tokens, self.nv, self.hv_dim])
+        } else if ctx.env.gdn.chunked {
+            let q_f = TensorOps::call(crate::ops::ids::CAST_F16_F32)
+                .arg(&q_n.reshape(vec![tokens, self.nk, self.hk_dim]))
+                .arg_i32((tokens * self.nk * self.hk_dim) as i32)
+                .with_shape(Dtype::F32, vec![tokens, self.nk, self.hk_dim]);
+            let k_f = TensorOps::call(crate::ops::ids::CAST_F16_F32)
+                .arg(&k_n.reshape(vec![tokens, self.nk, self.hk_dim]))
+                .arg_i32((tokens * self.nk * self.hk_dim) as i32)
+                .with_shape(Dtype::F32, vec![tokens, self.nk, self.hk_dim]);
+            let v_f = TensorOps::call(crate::ops::ids::CAST_F16_F32)
+                .arg(&v_c.reshape(vec![tokens, self.nv, self.hv_dim]))
+                .arg_i32((tokens * self.nv * self.hv_dim) as i32)
+                .with_shape(Dtype::F32, vec![tokens, self.nv, self.hv_dim]);
+            let g_f = TensorOps::call(crate::ops::ids::CAST_F16_F32)
+                .arg(&g)
+                .arg_i32((tokens * self.nv) as i32)
+                .with_shape(Dtype::F32, vec![tokens, self.nv]);
+            let beta_f = TensorOps::call(crate::ops::ids::CAST_F16_F32)
+                .arg(&beta)
+                .arg_i32((tokens * self.nv) as i32)
+                .with_shape(Dtype::F32, vec![tokens, self.nv]);
+            let y = TensorOps::of(
+                crate::kernel::Kernel::new("gdn_chunked_delta_rule_fwd", "")
+                    .with_sig("T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz"),
+            )
+            .arg(&q_f)
+            .arg(&k_f)
+            .arg(&v_f)
+            .arg(&g_f)
+            .arg(&beta_f)
+            .arg(&gdn.rec)
+            .arg_usize(tokens)
+            .arg_usize(ctx.gdn_slot_host)
+            .arg_usize(self.nv)
+            .arg_usize(self.nk)
+            .arg_usize(self.hk_dim)
+            .arg_usize((1.0f32 / (self.hk_dim as f32).sqrt()).to_bits() as usize)
+            .with_shape(Dtype::F16, vec![tokens, self.nv, self.hv_dim]);
+            y
+        } else {
+            // varlen 递推批核(单发射;state 原地进出)
+            recurrence_varlen(
+                &q_n.reshape(vec![tokens, self.nk, self.hk_dim]),
+                &k_n.reshape(vec![tokens, self.nk, self.hk_dim]),
+                &v_c.reshape(vec![tokens, self.nv, self.hv_dim]),
+                &g,
+                &beta,
+                &gdn.rec,
+                gdn_slot,
+                &cu,
+                tokens,
+                self.nv,
+                self.nk,
+                self.hk_dim,
+                self.hv_dim,
+                1.0 / (self.hk_dim as f32).sqrt(),
+            )
+        };
 
         // 门控归一化(T 批量)+ 出投影
         let gated = norm_act(

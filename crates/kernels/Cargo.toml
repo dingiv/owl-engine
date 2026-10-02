@@ -17,6 +17,13 @@ description = "Operator dispatch + unified kernel home: .cu sources, nvrtc compi
 # FlashInfer prefill(预编 .a + foreign-kernel;E1.5 工作包)
 "flashinfer" = []
 
+[dev-dependencies]
+# GDN chunked cubin 金标对拍测试(测试域直用 cudarc;lib 零依赖律不破)
+cudarc = { version = "0.19", default-features = false, features = [
+    "std", "driver", "nvrtc", "cuda-version-from-build-system", "dynamic-loading",
+] }
+half = { version = "2.7.1" }
+
 [dependencies]
 # 官方 cudarc:仅本 crate 的 cuda_ops 使用(kernel 编译与发射;feature 化,
 # A4 纪律:非后端 crate 引源码之家时不拖 CUDA 链接)
