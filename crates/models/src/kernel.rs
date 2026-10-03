@@ -130,6 +130,9 @@ pub static REGISTRY: &[Entry] = &[
     Entry { name: "owl_gdn_conv_upd_f16", source: text::GDN_F32, args: "T,T,T,T,sz,sz,sz,i32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_gdn_delta_dec_f16", source: text::GDN_F32, args: "T,T,T,T,T,T,T,sz,sz,sz,sz,sz,f32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_gdn_norm_act_f16", source: text::GDN_F32, args: "T,T,T,sz,sz,sz,f32,i32,T", dtype: crate::contract::Dtype::F16 },
+    // D1:decode 整链融合(v-conv + l2norm×2 + gating + sigmoid + delta + norm_act;
+    // 输出末参)
+    Entry { name: "owl_gdn_decode_step_f16", source: text::GDN_F32, args: "T,T,T,T,T,T,T,T,T,T,T,T,T,sz,sz,sz,sz,sz,f32,f32,f32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_naive_decode_attn_f16", source: text::ATTENTION_F32, args: "T,T,T,T,T,T,T,sz,sz,sz,sz,T", dtype: crate::contract::Dtype::F16 },
     // ---- attention port 家族(K0;vendor attention.rs rev c0f19f2,Apache-2.0;
     //      vLLM classic 布局,K1/K2 paged_attention 同款;适配认领见 .cu 头注)----
@@ -281,6 +284,7 @@ pub fn launch_shape(grid: (u32, u32, u32), block: (u32, u32, u32), shared_mem: u
 mod tests {
     use super::*;
     use crate::contract::Bytes;
+    use owl_iface::contract::Arg;
 
     #[test]
     fn registry_entries_have_sources() {
@@ -440,7 +444,7 @@ mod tests {
             crate::ops::KernelArg::Bits(4),
             crate::ops::KernelArg::Bits(5),
         ];
-        let ins = vec![Bytes::new(1, 0)];
+        let ins = vec![Arg::Block { id: 1 }];
         let out = Bytes::new(9, 0);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = crate::ops::lower_kernel(&k, &scalars, &ins, &out, 0);
@@ -458,7 +462,7 @@ mod tests {
             crate::ops::KernelArg::Bits(3),
             crate::ops::KernelArg::Bits(4),
         ];
-        let ins = vec![Bytes::new(1, 0), Bytes::new(2, 0)]; // 应为 1 个父
+        let ins = vec![Arg::Block { id: 1 }, Arg::Block { id: 2 }]; // 应为 1 个父
         let out = Bytes::new(9, 0);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = crate::ops::lower_kernel(&k, &scalars, &ins, &out, 0);
@@ -476,7 +480,7 @@ mod tests {
             crate::ops::KernelArg::Bits(30),
             crate::ops::KernelArg::Bits(40),
         ];
-        let ins = vec![Bytes::new(7, 0)];
+        let ins = vec![Arg::Block { id: 7 }];
         let out = Bytes::new(9, 8);
         let msg = crate::ops::lower_kernel(&k, &scalars, &ins, &out, 8);
         assert_eq!(msg.args.len(), 6); // T + sz×4 + out

@@ -24,13 +24,18 @@ pub(super) fn issue_launch(
     kernels: &mut KernelCache,
     msg: &LaunchMsg,
 ) -> Result<u64, ModelError> {
-    // 1. 参数槽装配:Block → 设备指针;标量按类型入槽
+    // 1. 参数槽装配:Block → 设备指针;BlockSlice → 块首 + 字节偏移;
+    //    标量按类型入槽
     let mut slots: Vec<Slot> = Vec::with_capacity(msg.args.len());
     for a in &msg.args {
         match a {
             Arg::Block { id } => {
                 let (p, _len) = ctx.block_ptr(*id, stream)?;
                 slots.push(Slot::Ptr(p));
+            }
+            Arg::BlockSlice { id, byte_offset, .. } => {
+                let (p, _len) = ctx.block_ptr(*id, stream)?;
+                slots.push(Slot::Ptr(p + byte_offset));
             }
             Arg::U64(v) => slots.push(Slot::U(*v)),
             Arg::I32(v) => slots.push(Slot::I(*v)),
@@ -53,6 +58,9 @@ pub(super) fn issue_launch(
                 .iter()
                 .map(|a| match a {
                     Arg::Block { id } => format!("Block({id})"),
+                    Arg::BlockSlice { id, byte_offset, elems } => {
+                        format!("Slice({id}+{byte_offset}B,{elems}e)")
+                    }
                     Arg::U64(v) => format!("U64({v})"),
                     Arg::I32(v) => format!("I32({v})"),
                     Arg::F32(v) => format!("F32({v})"),
@@ -113,14 +121,14 @@ pub(super) fn issue_launch(
             .map_err(|e| ModelError::Msg(format!("launch({}): {e}", msg.kernel.name)))?;
     }
 
-    // 4. 输出块句柄(槽序契约:最后一个 Block)
+    // 4. 输出块句柄(槽序契约:最后一个 Block;BlockSlice 仅入参不参与)
     let out_id = msg
         .args
         .iter()
         .rev()
         .find_map(|a| match a {
             Arg::Block { id } => Some(*id),
-            Arg::U64(_) | Arg::I32(_) | Arg::F32(_) => None,
+            Arg::BlockSlice { .. } | Arg::U64(_) | Arg::I32(_) | Arg::F32(_) => None,
         })
         .ok_or_else(|| ModelError::Msg("launch: args 中无输出块".to_string()))?;
     Ok(out_id)

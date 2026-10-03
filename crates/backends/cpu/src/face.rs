@@ -122,6 +122,23 @@ impl DeviceClient for CpuFace {
                             .ok_or(ModelError::DeadBlock { id: *id })?,
                     )
                 }
+                Arg::BlockSlice { id, byte_offset, elems } => {
+                    // 刀1:连续切片视图 —— host 真值直接切片(CPU 面零指针;
+                    // byte_offset 字节 ÷ 4 = f32 元素偏移,F32 单一执行面)
+                    let full = self
+                        .blocks
+                        .get(id)
+                        .cloned()
+                        .ok_or(ModelError::DeadBlock { id: *id })?;
+                    let off = (byte_offset / 4) as usize;
+                    let n = (*elems) as usize;
+                    let mut v = full;
+                    if off + n <= v.f32.len() {
+                        v.f32 = v.f32[off..off + n].to_vec();
+                    }
+                    v.shape = vec![n];
+                    vals.push(v);
+                }
                 Arg::U64(v) => u64s.push(*v),
                 Arg::I32(v) => i32s.push(*v),
                 Arg::F32(v) => f32s.push(*v),

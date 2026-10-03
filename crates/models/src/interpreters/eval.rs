@@ -10,6 +10,7 @@
 //! 但互不依赖 —— 新变体(图捕获回放、量化装载、其他平台)另起文件。
 
 use crate::contract::{Bytes, Dtype, ModelError};
+use owl_iface::contract::Arg;
 use crate::ops::Op;
 use crate::tensor::TensorOps;
 use std::future::Future;
@@ -146,6 +147,32 @@ where
     })
 }
 
+/// 多根共享 memo 求值(刀1.6,2026-10-03):**捕获窗单次执行多输出树**
+/// —— 修复「每输出一棵独立整模重执行」的图内重复(捕获图含 2.64×
+/// 整模内核,回放税翻倍的历史包袱一次性清除)。roots 各自归约,共享
+/// CSE 备忘录(同 id 单次求值);语义与逐根 eval_ops 完全一致,
+/// 仅消除跨根重复执行。竞技场/回收 = plain 口径(块常驻,图捕获用)。
+pub fn eval_ops_multi<'a, D>(
+    roots: &'a [&'a TensorOps],
+    face: &'a mut D,
+) -> Pin<Box<dyn Future<Output = Result<Vec<Bytes>, ModelError>> + Send + 'a>>
+where
+    D: crate::contract::DeviceClient + 'a,
+{
+    Box::pin(async move {
+        let mut ctx =
+            EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new(),
+                arena_set: std::collections::HashSet::new(),
+                block_users: std::collections::HashMap::new(),
+                pending: std::collections::HashMap::new(), reclaim: false, env: crate::env::EnvProvider::default() };
+        let mut out = Vec::with_capacity(roots.len());
+        for r in roots {
+            out.push(_eval_rec(r, &mut ctx).await?);
+        }
+        Ok(out)
+    })
+}
+
 /// 带观测的求值(interpreter-tap.md §4.2):归约语义与 [`eval_ops`]
 /// 完全一致,仅在每个节点 After 窗口发事件 —— 数据读取(Stats/Bytes)
 /// 由解释器代执行,tap 零执行权(观测窗口律,候选 §四 律 25)。
@@ -262,15 +289,32 @@ where
         }
         return Err(ModelError::Msg(detail));
     }
-    let mut ins: Vec<Bytes> = Vec::with_capacity(t.parents.len());
+    let mut vals: Vec<Bytes> = Vec::with_capacity(t.parents.len());
+    let mut ins: Vec<Arg> = Vec::with_capacity(t.parents.len());
     for p in &t.parents {
-        ins.push(_eval_rec(p, ctx).await?);
+        let b = _eval_rec(p, ctx).await?;
+        // 刀1:切片视图父 → Arg::BlockSlice(ptr = 块首 + offset·esz);
+        // 其余 → Arg::Block。偏移在节点声明期已含父链合成。
+        let a = match &p.op {
+            Op::SliceView { offset_elems } => Arg::BlockSlice {
+                id: b.id,
+                byte_offset: (offset_elems * p.dtype.size_bytes()) as u64,
+                elems: p.shape.iter().product::<usize>() as u64,
+            },
+            _ => Arg::Block { id: b.id },
+        };
+        vals.push(b);
+        ins.push(a);
     }
 
     // C1 边界断言:非 Block 父节点的块账长 = 声明元素数(Block 叶子 len=0 无
-    // 语义)。维度推导一律不用 len(见下方各分支);此处只在 debug 构建拦账变。
+    // 语义;SliceView 父 = 块首切片,账长 = 父块全长,不在此检)。维度推导
+    // 一律不用 len(见下方各分支);此处只在 debug 构建拦账变。
     if cfg!(debug_assertions) {
-        for (i, (p, b)) in t.parents.iter().zip(&ins).enumerate() {
+        for (i, (p, b)) in t.parents.iter().zip(&vals).enumerate() {
+            if matches!(p.op, Op::SliceView { .. }) {
+                continue;
+            }
             let want: usize = p.shape.iter().product();
             if b.len != 0 && b.len != want {
                 panic!(
@@ -298,7 +342,10 @@ where
             b
         }
         Op::Block { id } => Bytes { id: *id, len: 0 },
-        Op::Reshape => { ctx.track_alias(ins[0].id); ins[0].clone() } // 纯元数据视图:透传父块(零拷贝)
+        Op::Reshape => { ctx.track_alias(vals[0].id); vals[0].clone() } // 纯元数据视图:透传父块(零拷贝)
+        // 刀1:连续切片视图(与 Reshape 同族透传;偏移在消费面由节点 op
+        // 合成 Arg::BlockSlice,此处块句柄 = 父块全长 —— CSE/回收按块计)
+        Op::SliceView { .. } => { ctx.track_alias(vals[0].id); vals[0].clone() }
         Op::Add => {
             let out = ctx.face.alloc_uninit(dtype, n_elems).await?;
             ctx.track_new(out.id);
@@ -427,7 +474,7 @@ where
             ctx.face.launch(msg).await?;
             out
         }
-        Op::SlotWrite => { ctx.track_alias(ins[0].id); ins[0].clone() }
+        Op::SlotWrite => { ctx.track_alias(vals[0].id); vals[0].clone() }
         other => return Err(ModelError::Msg(format!("eval 未覆盖: {other:?}"))),
     };
     ctx.memo.insert(t.id, out.clone());
@@ -437,7 +484,7 @@ where
     // 别名防误焚)→ 立即 free。流序安全:消费 kernel 已入队,free 同流
     // 排在其后;根带 +1 永不中途回收。
     if ctx.reclaim {
-        for (p, b) in t.parents.iter().zip(ins.iter()) {
+        for (p, b) in t.parents.iter().zip(vals.iter()) {
             let cnt = ctx.pending.entry(p.id).or_insert(0);
             if *cnt > 0 {
                 *cnt -= 1;

@@ -92,11 +92,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             ])
             .await?;
         if prof {
-            eprintln!("[step-prof] pos={pos} fill+launch={:?}", t0.unwrap().elapsed());
+            eprintln!("[step-prof] pos={pos} fill+launch={:?} wall={}", t0.unwrap().elapsed(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100000);
         }
         if prof {
             let total = t0.unwrap().elapsed();
-            eprintln!("[step-prof] pos={pos} step-total={total:?}");
+            eprintln!("[step-prof] pos={pos} step-total={total:?} wall2={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100000);
         }
         self.active.as_mut().expect("活跃").fed += 1;
         // E2c:decode 跨页边界 → 快照拍摄(同流保序,先拍再采样)
@@ -104,6 +104,19 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let act = self.active.as_ref().expect("活跃");
             if self.pool.paged && act.fed % self.pool.page == 0 {
                 self.capture_gdn_snap(act.session_id, act.fed).await?;
+            }
+        }
+        // D1 取证:GDN 状态格画像(OWL_GDN_DUMP;前 6 步,首末层 conv_v/rec)
+        if std::env::var_os("OWL_GDN_DUMP").is_some() {
+            let step = self.active.as_ref().expect("活跃").out.len() as u64;
+            if step < 6 {
+                let lines = {
+                    let face = self.session.face_mut();
+                    self.pool.gdn_slot_profile(face, gdn_slot, step).await?
+                };
+                for l in lines {
+                    eprintln!("{l}");
+                }
             }
         }
         // E3 设备采样:4B token 回读(旧 = 600KB logits dtoh + host argmax)。
@@ -188,7 +201,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 &history,
             );
             if prof {
-                eprintln!("[step-prof] pos={pos} host-sample={:?}", t_sample.unwrap().elapsed());
+                eprintln!("[step-prof] pos={pos} host-sample={:?} wall3={}", t_sample.unwrap().elapsed(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100000);
             }
             if std::env::var_os("OWL_DEBUG").is_some() {
                 eprintln!("[sample-dump] t{turn_id} s{step}: sampled={nt} hist={} pen={}", history.len(), std::env::var("OWL_REP_PENALTY").unwrap_or_else(|_| "d".into()));
@@ -201,6 +214,33 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             })
             .0 as u32
         } else {
+            // D1 取证:greedy 路径 logits 形状仪表(OWL_DEBUG;前 16 步,与
+            // 采样分支同格式 —— 基线/融合 A/B 对比用)
+            if std::env::var_os("OWL_DEBUG").is_some() {
+                let (turn_id, step) = {
+                    let act = self.active.as_ref().expect("活跃");
+                    (act.id, act.out.len() as u64)
+                };
+                if step < 16 {
+                    let mut logits = self.session.read_output_f32("logits").await?;
+                    let mut top: Vec<(f32, u32)> = logits
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, &v)| v.is_finite())
+                        .map(|(i, &v)| (v, i as u32))
+                        .collect();
+                    top.select_nth_unstable_by(7, |a, b| b.0.partial_cmp(&a.0).unwrap());
+                    top.truncate(8);
+                    top.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                    let pretty: Vec<String> = top
+                        .iter()
+                        .map(|(v, i)| {
+                            format!("{:.2}:'{}'", v, self.tok.decode(&[*i]).replace('\n', "\\n"))
+                        })
+                        .collect();
+                    eprintln!("[logits-dump] t{turn_id} s{step}: {}", pretty.join(" | "));
+                }
+            }
             let tok_f = self.session.read_output_f32("token").await?;
             tok_f[0] as u32
         };

@@ -188,8 +188,7 @@ mod tests {
         let gdn_src = src_map(&[
             ("input_layernorm", 6, 1.0),
             ("post_attention_layernorm", 6, 2.0),
-            ("in_proj_qkv", (2 * 8 + 8) * 6, 3.0),
-            ("in_proj_z", 8 * 6, 4.0),
+            ("in_proj_qkvz", (2 * 8 + 2 * 8) * 6, 3.0),
             ("in_proj_b", 2 * 6, 5.0),
             ("in_proj_a", 2 * 6, 6.0),
             ("out_proj", 6 * 8, 7.0),
@@ -462,8 +461,7 @@ mod tests {
         let src = src_map(&[
             ("input_layernorm", hidden, 1.0),
             ("post_attention_layernorm", hidden, 2.0),
-            ("in_proj_qkv", conv_dim * hidden, 3.0),
-            ("in_proj_z", value_dim * hidden, 4.0),
+            ("in_proj_qkvz", (conv_dim + value_dim) * hidden, 3.0),
             ("in_proj_b", nv * hidden, 5.0),
             ("in_proj_a", nv * hidden, 6.0),
             ("out_proj", hidden * value_dim, 7.0),
@@ -509,8 +507,9 @@ mod tests {
                 .collect::<Vec<f32>>()
         };
         let n1 = host_ln(&xs, &src["input_layernorm"], hidden, 0);
-        let qkv = lin(&n1, &src["in_proj_qkv"], conv_dim, hidden);
-        let z = lin(&n1, &src["in_proj_z"], value_dim, hidden);
+        let qkvz = lin(&n1, &src["in_proj_qkvz"], conv_dim + value_dim, hidden);
+        let qkv = &qkvz[..conv_dim];
+        let z = &qkvz[conv_dim..];
         let b_v = lin(&n1, &src["in_proj_b"], nv, hidden);
         let _a_v = lin(&n1, &src["in_proj_a"], nv, hidden);
         let segs = [&qkv[0..key_dim], &qkv[key_dim..2 * key_dim], &qkv[2 * key_dim..]];

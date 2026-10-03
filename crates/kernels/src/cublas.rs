@@ -38,6 +38,11 @@ pub struct OwlCublas {
 }
 
 impl OwlCublas {
+    /// 裸句柄(刀1.5:server 侧 cublasSetWorkspace 预绑用)
+    pub fn sys_handle(&self) -> &sys::cublasHandle_t {
+        self.blas.handle()
+    }
+
     /// 句柄创建并绑流(cublasSetStream;GEMM 与该流上 kernel 同序)
     pub fn new(stream: Arc<cudarc::driver::CudaStream>) -> Result<Self, String> {
         CudaBlas::new(stream).map(|blas| Self { blas }).map_err(|e| format!("cublas init: {e:?}"))

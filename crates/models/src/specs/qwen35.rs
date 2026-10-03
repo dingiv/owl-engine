@@ -73,8 +73,9 @@ impl KeyConvention for Qwen35Convention {
             "input_layernorm" | "post_attention_layernorm" => ("", ".weight"),
             // mlp
             "gate_proj" | "up_proj" | "down_proj" => ("mlp.", ".weight"),
-            // GDN mixer(norm = 层内门控归一化,非 final norm)
-            "in_proj_qkv" | "in_proj_z" | "in_proj_b" | "in_proj_a" | "out_proj" | "conv1d"
+            // GDN mixer(norm = 层内门控归一化,非 final norm;刀2:qkvz
+            // 虚拟合并键 → linear_attn.in_proj_qkvz,由装载源合成)
+            "in_proj_qkvz" | "in_proj_b" | "in_proj_a" | "out_proj" | "conv1d"
             | "norm" => ("linear_attn.", ".weight"),
             // GDN 裸键(全仓仅有的无 .weight 后缀特例)
             "A_log" | "dt_bias" => ("linear_attn.", ""),
@@ -267,8 +268,8 @@ mod tests {
         let c = Qwen35Convention::new("model.language_model");
         // GDN 层(linear_attn 子前缀)
         assert_eq!(
-            c.layer_key(0, "in_proj_qkv"),
-            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight"
+            c.layer_key(0, "in_proj_qkvz"),
+            "model.language_model.layers.0.linear_attn.in_proj_qkvz.weight"
         );
         assert_eq!(
             c.layer_key(0, "conv1d"),
@@ -546,10 +547,29 @@ mod tests {
         let mut bad = 0usize;
         for (i, e) in manifest.entries().iter().enumerate() {
             let n: usize = e.shape.iter().product();
-            let (dtype, off, nbytes) = anchor[&e.key];
-            let raw_slice = &raw[off..off + nbytes];
+            // 刀2:合并键锚 = 两子键解码行堆叠(检查点无合并条目)
+            let merged_anchor: Option<Vec<f32>> = e
+                .key
+                .strip_suffix(".weight")
+                .and_then(crate::formats::split_qkvz)
+                .map(|(b1, b2)| {
+                    let mut v = Vec::new();
+                    for b in [format!("{b1}.weight"), format!("{b2}.weight")] {
+                        let (dtype, off, nbytes) = anchor[&b];
+                        let mut tmp = Vec::new();
+                        anchor_decode(dtype, &raw[off..off + nbytes], &mut tmp);
+                        v.extend(tmp);
+                    }
+                    v
+                });
             let mut want = Vec::new();
-            anchor_decode(dtype, raw_slice, &mut want);
+            if let Some(v) = merged_anchor {
+                want = v;
+            } else {
+                let (dtype, off, nbytes) = anchor[&e.key];
+                let raw_slice = &raw[off..off + nbytes];
+                anchor_decode(dtype, raw_slice, &mut want);
+            }
             if e.layout == Layout::Transposed {
                 // 源 [out, in] → 声明 [in, out]:朴素转置
                 let (cols, rows) = (e.shape[0], e.shape[1]);

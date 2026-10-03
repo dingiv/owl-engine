@@ -155,6 +155,10 @@ pub struct KernelSpec {
 #[derive(Clone, Debug)]
 pub enum Arg {
     Block { id: u64 },
+    /// 刀1:块内连续切片视图(发射 ptr = block_ptr(id) + byte_offset;
+    /// elems = 元素数,供 CPU 面切片与校验;kernel ABI 不感知 —— 尺寸
+    /// 标量已由槽序携带)。输出槽恒为全块 Block,BlockSlice 仅入参。
+    BlockSlice { id: u64, byte_offset: u64, elems: u64 },
     U64(u64),
     I32(i32),
     F32(f32),

@@ -54,6 +54,22 @@ impl Entry {
 
 
 impl SafeTensorsSource {
+    /// 刀2 虚拟合并键面:in_proj_qkvz.weight = row-stack(in_proj_qkv.weight,
+    /// in_proj_z.weight)。返回 (子键1, 元素数1, 子键2, 元素数2);非合并键 None。
+    fn merged_parts(&self, key: &str) -> Option<(String, usize, String, usize)> {
+        let base = key.strip_suffix(".weight")?;
+        let (b1, b2) = crate::formats::split_qkvz(base)?;
+        let idx = self.index.lock().unwrap();
+        let e1 = idx.get(&format!("{b1}.weight"))?;
+        let e2 = idx.get(&format!("{b2}.weight"))?;
+        Some((
+            format!("{b1}.weight"),
+            e1.nbytes / e1.esz(),
+            format!("{b2}.weight"),
+            e2.nbytes / e2.esz(),
+        ))
+    }
+
     /// 打开目录下全部 `*.safetensors`(共享底座 [`open_raw_index`]),
     /// 叠加 f16 基线的 dtype 校验(F32/BF16)。只建映射 + 索引,零数据拷贝。
     pub fn open_dir(dir: &Path) -> Result<Self, ModelError> {
@@ -152,6 +168,9 @@ impl SafeTensorsSource {
 
 impl WeightSource for SafeTensorsSource {
     fn elem_len(&self, key: &str) -> Option<usize> {
+        if let Some((_, n1, _, n2)) = self.merged_parts(key) {
+            return Some(n1 + n2);
+        }
         let e = self.index.lock().unwrap().get(key).cloned()?;
         Some(e.nbytes / e.esz())
     }
@@ -159,6 +178,11 @@ impl WeightSource for SafeTensorsSource {
     /// 整取(F32 直读 / BF16 升位),条目即从索引移除。
     /// 流式装载主路径走 `take_range`(分块,条目保留)。
     fn take(&self, key: &str) -> Option<Vec<f32>> {
+        if let Some((k1, _, k2, _)) = self.merged_parts(key) {
+            let mut v = self.take(&k1)?;
+            v.extend(self.take(&k2)?);
+            return Some(v);
+        }
         let e = self.index.lock().unwrap().remove(key)?;
         // 元素数按条目真实位宽(F5 修:原 /4 硬编码对 bf16 条目
         // 返回一半元素 —— 直转路径首次踩中;分块路径按 len 显式未暴露)
@@ -167,6 +191,20 @@ impl WeightSource for SafeTensorsSource {
 
     /// 区间转换(mmap 直读,**不移除条目** —— 分块上传同键多块重复取)
     fn take_range(&self, key: &str, offset_elems: usize, len: usize) -> Option<Vec<f32>> {
+        if let Some((k1, n1, k2, _)) = self.merged_parts(key) {
+            // 行堆叠拼接:子1 元素区 [0,n1),子2 [n1,n1+n2)
+            if offset_elems + len <= n1 {
+                return self.take_range(&k1, offset_elems, len);
+            }
+            if offset_elems >= n1 {
+                return self.take_range(&k2, offset_elems - n1, len);
+            }
+            let head = self.take_range(&k1, offset_elems, n1 - offset_elems)?;
+            let tail = self.take_range(&k2, 0, offset_elems + len - n1)?;
+            let mut v = head;
+            v.extend(tail);
+            return Some(v);
+        }
         let e = self.index.lock().unwrap().get(key).cloned()?;
         if (offset_elems + len) * e.esz() > e.nbytes {
             return None;
@@ -185,6 +223,24 @@ impl WeightSource for SafeTensorsSource {
         dst: &mut [u8],
         dtype: crate::contract::Dtype,
     ) -> Option<()> {
+        // 刀2 合并键面:跨界块拆两子键分别直写(行堆叠拼接)
+        if let Some((k1, n1, k2, _)) = self.merged_parts(key) {
+            let out_esz = match dtype {
+                crate::contract::Dtype::F32 => 4,
+                crate::contract::Dtype::F16 => 2,
+                _ => return None,
+            };
+            if offset_elems + len <= n1 {
+                return self.convert_chunk_into_bytes(&k1, offset_elems, len, dst, dtype);
+            }
+            if offset_elems >= n1 {
+                return self.convert_chunk_into_bytes(&k2, offset_elems - n1, len, dst, dtype);
+            }
+            let head_elems = n1 - offset_elems;
+            let head_bytes = head_elems * out_esz;
+            self.convert_chunk_into_bytes(&k1, offset_elems, head_elems, &mut dst[..head_bytes], dtype)?;
+            return self.convert_chunk_into_bytes(&k2, 0, len - head_elems, &mut dst[head_bytes..], dtype);
+        }
         let e = match self.index.lock().unwrap().get(key).cloned() {
             Some(e) => e,
             None => {

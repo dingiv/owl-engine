@@ -153,6 +153,7 @@ impl Model {
             fi_kvi: kvi,
             env: ctx.env,
             gdn_slot_host: ctx.gdn_slot_host,
+            ts_buf: ctx.ts_buf.clone(),
         }
     }
 
@@ -162,6 +163,14 @@ impl Model {
         // 的声明者;tag 是纯标注(同 id 不变,CSE memo 不受影响),是观测
         // 面 tap 曲线/golden 指纹的定位键。
         let mut xs = self.embed.forward(ids, ctx).tag("embed");
+        // 刀D 取证:层间 clock64 时间戳(OWL_TS_PROBE;embed 后/每层后/
+        // final_norm 后各一拍,回放后 dtoh ts_buf 读原生层间时间线)
+        let ts = ctx.ts_buf.clone().filter(|_| ctx.env.diag.ts_probe);
+        let mut ti = 0usize;
+        if let Some(buf) = &ts {
+            xs = ts_stamp(&xs, buf, ti);
+            ti += 1;
+        }
         let (mut kvi, mut gi) = (0usize, 0usize);
         for (li, layer) in self.layers.iter().enumerate() {
             let sub = self.layer_ctx(ctx, kvi, gi);
@@ -173,8 +182,16 @@ impl Model {
             } else {
                 gi += 1;
             }
+            if let Some(buf) = &ts {
+                xs = ts_stamp(&xs, buf, ti);
+                ti += 1;
+            }
         }
-        self.norm.forward(&xs, ctx).tag("final_norm")
+        let xs = self.norm.forward(&xs, ctx).tag("final_norm");
+        match &ts {
+            Some(buf) => ts_stamp(&xs, buf, ti),
+            None => xs,
+        }
     }
 }
 
@@ -185,6 +202,37 @@ impl Module for Model {
             .lm_head_matmul(&self.last_hidden(ids, ctx))
             .tag("logits")
     }
+}
+
+/// 刀D 取证:层间时间戳内核(OWL_TS_PROBE)。拷贝 in→out(链式接续)+
+/// thread(0,0) 写 clock64 到 ts_buf[idx]。发射 = 哨兵自动网格;
+/// 逃生舱直带 sig(非注册,组合期跳过 dtype 守门)。
+const TS_CU: &str = r#"
+#include <cuda_fp16.h>
+extern "C" __global__ void probe_ts_f16(
+    const __half* in, unsigned long long* ts, const size_t idx, const size_t n,
+    __half* out) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < (int)n) { out[i] = in[i]; }
+    if (blockIdx.x == 0 && threadIdx.x == 0) { ts[idx] = clock64(); }
+}
+"#;
+
+fn ts_stamp(xs: &TensorOps, buf: &TensorOps, idx: usize) -> TensorOps {
+    let shape = xs.shape.clone();
+    let n: usize = shape.iter().product();
+    let k = crate::kernel::Kernel {
+        name: "probe_ts_f16",
+        source: TS_CU,
+        launch: crate::kernel::LaunchShape::default(),
+        sig: "T,T,sz,sz,T",
+    };
+    TensorOps::of(k)
+        .arg(xs)
+        .arg(buf)
+        .arg_usize(idx)
+        .arg_usize(n)
+        .with_shape(xs.dtype, shape)
 }
 
 impl Model {
@@ -304,8 +352,7 @@ mod tests {
                 // GDN 层
                 let key_dim = NK * HK_DIM;
                 let value_dim = NV * HV_DIM;
-                p("in_proj_qkv", (2 * key_dim + value_dim) * HIDDEN, 3.0);
-                p("in_proj_z", value_dim * HIDDEN, 4.0);
+                p("in_proj_qkvz", (2 * key_dim + 2 * value_dim) * HIDDEN, 3.0);
                 p("in_proj_b", NV * HIDDEN, 5.0);
                 p("in_proj_a", NV * HIDDEN, 6.0);
                 p("out_proj", HIDDEN * value_dim, 7.0);
@@ -530,8 +577,9 @@ mod tests {
             let key_dim = NK * HK_DIM;
             let value_dim = NV * HV_DIM;
             let conv_dim = 2 * key_dim + value_dim;
-            let qkv = self.lin(n1, self.s(i, "in_proj_qkv"), conv_dim, HIDDEN);
-            let z = self.lin(n1, self.s(i, "in_proj_z"), value_dim, HIDDEN);
+            let qkvz = self.lin(n1, self.s(i, "in_proj_qkvz"), conv_dim + value_dim, HIDDEN);
+            let qkv = &qkvz[..conv_dim];
+            let z = &qkvz[conv_dim..];
             let b_v = self.lin(n1, self.s(i, "in_proj_b"), NV, HIDDEN);
             let a_v = self.lin(n1, self.s(i, "in_proj_a"), NV, HIDDEN);
             let segs = [&qkv[0..key_dim], &qkv[key_dim..2 * key_dim], &qkv[2 * key_dim..]];

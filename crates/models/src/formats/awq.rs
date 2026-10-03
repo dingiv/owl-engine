@@ -27,6 +27,7 @@
 
 use crate::contract::{Dtype, ModelError};
 use crate::formats::mmap::{open_raw_index, Mmap, RawEntry};
+use crate::formats::split_qkvz;
 use crate::formats::w4a16::{bf16_par, i32s_le_bytes, i32s_par, u16s_le_bytes};
 use crate::module::WeightSource;
 use owl_kernels::marlin::repack::{
@@ -159,6 +160,19 @@ impl AwqSource {
         // - F16 兜底形态:RTN nibbles 打包回 ct 布局(build 期一并产出;
         //   使 ignore 层与量化层走同一 GPU 通路,免特判)
         if let Some(base) = key.strip_suffix(".packed_raw") {
+            // 刀2 虚拟合并:in_proj_qkvz.packed_raw = 两子基 weight_packed
+            // 行堆叠(同 k,字节拼接;要求两子均 Ct 形态 —— cyankiwi 满足)
+            if let Some((b1, b2)) = split_qkvz(base) {
+                if let (Some(e1), Some(e2)) = (
+                    self.index.get(&format!("{b1}.weight_packed")),
+                    self.index.get(&format!("{b2}.weight_packed")),
+                ) {
+                    let mut buf = Vec::with_capacity(e1.nbytes + e2.nbytes);
+                    buf.extend_from_slice(&self.maps[e1.map_ix][e1.start..e1.start + e1.nbytes]);
+                    buf.extend_from_slice(&self.maps[e2.map_ix][e2.start..e2.start + e2.nbytes]);
+                    return Some(Resolved::Bytes(buf.into(), Dtype::U32));
+                }
+            }
             if let Some(pe) = self.index.get(&format!("{base}.weight_packed")) {
                 return Some(Resolved::View(pe.clone()));
             }
@@ -181,6 +195,89 @@ impl AwqSource {
     /// 量化线性物化(键首触才建;qweight/scales/zeros/weight 四键共享
     /// 一次构建)。双检缓存 + build_lock 串行(w4a16 同款)。
     fn linear_bytes_for(&self, base: &str, key: &str) -> Option<Arc<[u8]>> {
+        // 刀2 虚拟合并:in_proj_qkvz = row-stack(in_proj_qkv, in_proj_z)。
+        // **源域合并后一次构建**(marlin s/z 是全 flat 64-chunk 置换,
+        // 构建产物域内拼接错序;源域 packed/scales/zp 均行主序,concat
+        // 合法)。要求两子均 Ct 形态(cyankiwi 满足;F16 兜底混态不支持)。
+        if let Some((b1, b2)) = split_qkvz(base) {
+            let suffix = &key[base.len()..];
+            let (n1, k1, f1) = self.linear_form(&b1)?;
+            let (n2, k2, f2) = self.linear_form(&b2)?;
+            let (QuantForm::Ct { se: se1, ze: ze1, .. }, QuantForm::Ct { se: se2, ze: ze2, .. }) = (&f1, &f2) else {
+                return None;
+            };
+            if k1 != k2 {
+                return None;
+            }
+            {
+                let cache = self.cache.lock().unwrap();
+                if let Some(b) = cache.0.get(key) {
+                    return Some(b.clone());
+                }
+            }
+            let shard = base.bytes().map(|b| b as usize).sum::<usize>() % self.build_locks.len();
+            let _g = self.build_locks[shard].lock().unwrap();
+            // 双检(锁内)
+            {
+                let cache = self.cache.lock().unwrap();
+                if let Some(b) = cache.0.get(key) {
+                    return Some(b.clone());
+                }
+            }
+            let out = n1 + n2;
+            let k = k1;
+            let groups = k / 32;
+            // 源域行堆叠:scales/zp 展开 concat([out, groups] 行主序)
+            let sb1 = &self.maps[se1.map_ix][se1.start..se1.start + se1.nbytes];
+            let sb2 = &self.maps[se2.map_ix][se2.start..se2.start + se2.nbytes];
+            let mut scales_f32 = bf16_par(sb1);
+            scales_f32.extend(bf16_par(sb2));
+            let zb1 = &self.maps[ze1.map_ix][ze1.start..ze1.start + ze1.nbytes];
+            let zb2 = &self.maps[ze2.map_ix][ze2.start..ze2.start + ze2.nbytes];
+            let mut zp_u8 = unpack_zp_ct(&i32s_par(zb1), n1, groups);
+            zp_u8.extend(unpack_zp_ct(&i32s_par(zb2), n2, groups));
+            self.maps[se1.map_ix].dontneed(se1.start, se1.nbytes);
+            self.maps[se2.map_ix].dontneed(se2.start, se2.nbytes);
+            self.maps[ze1.map_ix].dontneed(ze1.start, ze1.nbytes);
+            self.maps[ze2.map_ix].dontneed(ze2.start, ze2.nbytes);
+            let bytes: Vec<u8> = match suffix {
+                ".scales" => u16s_le_bytes(&pack_marlin_s(&scales_f32, out, groups)),
+                ".zeros" => i32s_le_bytes(&pack_marlin_z(&zp_u8, out, groups)),
+                ".qweight" | ".packed_raw" => {
+                    // packed 源域 [n, k/8] i32 行主序,flat concat 合法
+                    let (pe1, pe2) = match (&f1, &f2) {
+                        (QuantForm::Ct { pe: p1, .. }, QuantForm::Ct { pe: p2, .. }) => (p1, p2),
+                        _ => return None,
+                    };
+                    let pb1 = &self.maps[pe1.map_ix][pe1.start..pe1.start + pe1.nbytes];
+                    let pb2 = &self.maps[pe2.map_ix][pe2.start..pe2.start + pe2.nbytes];
+                    let mut packed = i32s_par(pb1);
+                    packed.extend(i32s_par(pb2));
+                    self.maps[pe1.map_ix].dontneed(pe1.start, pe1.nbytes);
+                    self.maps[pe2.map_ix].dontneed(pe2.start, pe2.nbytes);
+                    if suffix == ".packed_raw" {
+                        i32s_le_bytes(&packed)
+                    } else {
+                        // host 路径:融合索引 gather(与 build_linear Ct 臂同管)
+                        let words = out * k / 8;
+                        let idx = self
+                            .idx_cache
+                            .lock()
+                            .unwrap()
+                            .entry((k, out, true))
+                            .or_insert_with(|| Arc::new(marlin_fused_indices(k, out)))
+                            .clone();
+                        let mut b_buf: Vec<i32> = Vec::new();
+                        pack_marlin_b_fused(&packed, &idx, words, &mut b_buf);
+                        i32s_le_bytes(&b_buf)
+                    }
+                }
+                _ => return None,
+            };
+            let mut cache = self.cache.lock().unwrap();
+            cache.0.insert(key.to_string(), Arc::from(bytes.into_boxed_slice()));
+            return cache.0.get(key).cloned();
+        }
         let (out, k, form) = self.linear_form(base)?;
         {
             let cache = self.cache.lock().unwrap();

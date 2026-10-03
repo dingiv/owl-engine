@@ -22,6 +22,15 @@ pub mod mmap;
 pub mod safetensors;
 pub mod w4a16;
 
+/// 刀2 虚拟合并键:{base}in_proj_qkvz = row-stack({base}in_proj_qkv,
+/// {base}in_proj_z)。装载期列拼接(vLLM 同款 in_proj_qkvz 单投影);
+/// 两源同 k,行堆叠 = 字节拼接,零数值风险。各源(awq/safetensors)
+/// 在自身键面上合成,层侧声明单合并 Linear。
+pub(crate) fn split_qkvz(base: &str) -> Option<(String, String)> {
+    let prefix = base.strip_suffix("in_proj_qkvz")?;
+    Some((format!("{prefix}in_proj_qkv"), format!("{prefix}in_proj_z")))
+}
+
 pub use awq::AwqSource;
 pub use load::eval_load;
 pub use safetensors::SafeTensorsSource;

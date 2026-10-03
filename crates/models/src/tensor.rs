@@ -350,6 +350,23 @@ impl TensorOps {
         self.join(Op::Reshape, None, (self.dtype, shape), vec![])
     }
 
+    /// 刀1:块内连续切片视图(零内核零节点派发;消费面发射
+    /// Arg::BlockSlice)。offset = 平铺元素偏移(声明期含父链合成:
+    /// 视图的视图相加,父仍链式保留);shape = 切片后声明形状。
+    /// 仅连续切片入此臂(narrow_strided 快路守门),非连续仍物化。
+    pub fn slice_view(&self, offset_elems: usize, shape: Shape) -> TensorOps {
+        let base = match &self.op {
+            Op::SliceView { offset_elems: prev } => *prev,
+            _ => 0,
+        };
+        self.join(
+            Op::SliceView { offset_elems: base + offset_elems },
+            None,
+            (self.dtype, shape),
+            vec![],
+        )
+    }
+
     // ======================================================================
     // 链式运算(声明;total——毒传播,永不失败)
     // ======================================================================

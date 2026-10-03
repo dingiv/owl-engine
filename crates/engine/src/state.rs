@@ -265,6 +265,64 @@ impl StatePool {
         }
     }
 
+    /// D1 取证:会话格 GDN 状态画像(整块回读 → 活跃格行 maxabs/sum/首值。
+    /// OWL_GDN_DUMP_ALL=1 → 全层 cv 扫描(定位首个分歧层);否则首末层
+    /// cv+rec)。调试仪表,正常路径零调用。27B rec 整块 ~25MB/层,dtoh
+    /// 有感 —— 仅取证轮启用。
+    pub(crate) async fn gdn_slot_profile<D: DeviceClient>(
+        &self,
+        face: &mut D,
+        gdn_slot: usize,
+        step: u64,
+    ) -> Result<Vec<String>> {
+        let nl = self.gdns.len();
+        let all = std::env::var_os("OWL_GDN_DUMP_ALL").is_some();
+        let mut out = Vec::new();
+        for (li, g) in self.gdns.iter().enumerate() {
+            let last = li + 1 == nl;
+            // 全层扫 = 仅 cv;默认 = 首末层 cv+rec
+            if all && !last {
+                let line = Self::profile_block(face, li, "cv", &g.conv_v, gdn_slot, step, false).await?;
+                out.push(line);
+                continue;
+            }
+            if !all && li != 0 && !last {
+                continue;
+            }
+            for (name, bn) in [("cv", &g.conv_v), ("rec", &g.rec)] {
+                let line = Self::profile_block(face, li, name, bn, gdn_slot, step, true).await?;
+                out.push(line);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn profile_block<D: DeviceClient>(
+        face: &mut D,
+        li: usize,
+        name: &str,
+        bn: &BlockN,
+        gdn_slot: usize,
+        step: u64,
+        verbose: bool,
+    ) -> Result<String> {
+        let row = bn.1 / gdn_slots();
+        let mut buf = vec![0u8; bn.1 * 4];
+        face.dtoh(&bn.0, &mut buf).await?;
+        let floats: Vec<f32> = buf[gdn_slot * row * 4..(gdn_slot + 1) * row * 4]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let maxabs = floats.iter().fold(0f32, |m, &v| m.max(v.abs()));
+        let sum: f32 = floats.iter().take(4096).sum();
+        let head: Vec<String> = floats.iter().take(3).map(|v| format!("{v:.4}")).collect();
+        Ok(format!(
+            "[gdn] s{step} L{li}/{name} n={} max|.|={maxabs:.4e} sum4k={sum:.4}{}",
+            floats.len(),
+            if verbose { format!(" head={}", head.join(",")) } else { String::new() },
+        ))
+    }
+
     /// 逐层 GDN 状态叶子四件套(conv_q/conv_k/conv_v/rec;slots 由
     /// 调用方按步注入:图闭包注输入槽,prefill 注 from_host)
     pub(crate) fn gdn_caches(&self) -> Vec<GdnLeaf> {

@@ -99,6 +99,9 @@ pub struct ForwardCtx<'a> {
     pub env: crate::env::EnvProvider,
     /// GDN 状态槽号(host 侧真值;chunked 臂发射标量用)
     pub gdn_slot_host: usize,
+    /// 刀D 取证:时间戳探针缓冲块(OWL_TS_PROBE;None = 关。U32 [4096]
+    /// 输入槽,ts 内核逐层 clock64 原地写,回放后 dtoh 读原生时间线)
+    pub ts_buf: Option<TensorOps>,
 }
 
 impl<'a> ForwardCtx<'a> {
@@ -121,6 +124,7 @@ impl<'a> ForwardCtx<'a> {
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
             gdn_slot_host: 0,
+            ts_buf: None,
         }
     }
 
@@ -148,6 +152,7 @@ impl<'a> ForwardCtx<'a> {
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
             gdn_slot_host: 0,
+            ts_buf: None,
         }
     }
 
@@ -170,6 +175,7 @@ impl<'a> ForwardCtx<'a> {
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
             gdn_slot_host: 0,
+            ts_buf: None,
         }
     }
 
@@ -196,6 +202,7 @@ impl<'a> ForwardCtx<'a> {
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
             gdn_slot_host: 0,
+            ts_buf: None,
         }
     }
 
@@ -225,6 +232,7 @@ impl<'a> ForwardCtx<'a> {
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
             gdn_slot_host: 0,
+            ts_buf: None,
         }
     }
 
@@ -254,6 +262,7 @@ impl<'a> ForwardCtx<'a> {
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
             gdn_slot_host: 0,
+            ts_buf: None,
         }
     }
 
@@ -289,6 +298,7 @@ impl<'a> ForwardCtx<'a> {
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
             gdn_slot_host: 0,
+            ts_buf: None,
         }
     }
 }

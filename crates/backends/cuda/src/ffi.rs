@@ -35,6 +35,10 @@ pub mod sys {
         CUDA_KERNEL_NODE_PARAMS, CUfunction, CUresult, CUgraph, CUgraphExec, CUgraphNode,
         CUgraphNodeType, CUkernel, cuGraphGetNodes, cuGraphKernelNodeGetParams_v2, cuGraphNodeGetType, cuGraphUpload,
         cuKernelGetParamInfo,
+        // 刀1 取证:MEM_ALLOC/FREE/MEMCPY 节点参数(派发税立案;只读查询)
+        CUDA_MEM_ALLOC_NODE_PARAMS, cuGraphMemAllocNodeGetParams, cuGraphMemFreeNodeGetParams,
+        CUDA_MEMCPY_NODE_PARAMS, cuGraphMemcpyNodeGetParams,
+        cuFuncGetName,
     };
 
     /// cuBLAS FFI(matmul/workspace/stream 重绑)

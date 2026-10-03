@@ -23,6 +23,8 @@ pub mod ids {
     pub const GDN_L2NORM: OpId = OpId("gdn.l2norm");
     pub const GDN_CONV_UPD: OpId = OpId("gdn.conv_upd");
     pub const GDN_DELTA_DEC: OpId = OpId("gdn.delta_dec");
+    /// D1:decode 整链融合(v-conv + l2norm×2 + gating + sigmoid + delta + norm_act)
+    pub const GDN_DECODE_STEP: OpId = OpId("gdn.decode_step");
     pub const GDN_CONV_FWD: OpId = OpId("gdn.conv_fwd");
     pub const GDN_RECURRENCE: OpId = OpId("gdn.recurrence_varlen_gqa");
     pub const GDN_NORM_ACT: OpId = OpId("gdn.norm_act");
@@ -124,6 +126,11 @@ pub enum Op {
     PagedAttn,
     /// 形状重解释(纯元数据视图;元素数守恒;eval 透传父块,零拷贝)
     Reshape,
+    /// 刀1:块内连续切片视图(零内核零节点派发;eval 透传父块,
+    /// 消费面发射 `Arg::BlockSlice{id, byte_offset: offset·esz}`)。
+    /// 节点偏移在声明期已含父链合成(slice_of_slice);仅连续切片
+    /// (narrow 的 outer==1 ∨ src_dim==out_dim)入此臂,非连续仍物化。
+    SliceView { offset_elems: usize },
 
     // ---- 语义调用(Driver 立项,2026-10-01):model 层只描述「要什么」
     //      (OpId 语义词表)+ 张量 + 语义标量;名/变体/发射参数 = 解释器
@@ -225,7 +232,7 @@ fn ceil_1d(n: usize) -> (u32, u32, u32) {
 /// server 按名分派到 owl-kernels::cublas(非 nvrtc 注册表;source 空)。
 /// 槽序契约:[T a, T b, T out, sz m, sz k, sz n, sz nt](cublas.rs 文档)。
 pub fn lower_gemm(
-    ins: &[Bytes],
+    ins: &[Arg],
     out: &Bytes,
     m: usize,
     k: usize,
@@ -240,8 +247,8 @@ pub fn lower_gemm(
             source: String::new(),
         },
         args: vec![
-            Arg::Block { id: ins[0].id },
-            Arg::Block { id: ins[1].id },
+            ins[0].clone(),
+            ins[1].clone(),
             Arg::Block { id: out.id },
             Arg::U64(m as u64),
             Arg::U64(k as u64),
@@ -255,12 +262,12 @@ pub fn lower_gemm(
     }
 }
 
-pub fn lower_add(ins: &[Bytes], out: &Bytes, n: usize, dtype: crate::contract::Dtype) -> LaunchMsg {
+pub fn lower_add(ins: &[Arg], out: &Bytes, n: usize, dtype: crate::contract::Dtype) -> LaunchMsg {
     LaunchMsg {
         kernel: spec(dname("owl_add", dtype)),
         args: vec![
-            Arg::Block { id: ins[0].id },
-            Arg::Block { id: ins[1].id },
+            ins[0].clone(),
+            ins[1].clone(),
             Arg::Block { id: out.id },
             Arg::U64(n as u64),
         ],
@@ -273,10 +280,10 @@ pub fn lower_add(ins: &[Bytes], out: &Bytes, n: usize, dtype: crate::contract::D
 
 /// lower:Mul(同形逐元素乘)
 /// n = 声明元素数(C1 维度源头单一律:只读声明 shape,不读块账长)
-pub fn lower_mul(ins: &[Bytes], out: &Bytes, n: usize, dtype: crate::contract::Dtype) -> LaunchMsg {
+pub fn lower_mul(ins: &[Arg], out: &Bytes, n: usize, dtype: crate::contract::Dtype) -> LaunchMsg {
     LaunchMsg {
         kernel: spec(dname("owl_mul", dtype)),
-        args: vec![Arg::Block { id: ins[0].id }, Arg::Block { id: ins[1].id }, Arg::Block { id: out.id }, Arg::U64(n as u64)],
+        args: vec![ins[0].clone(), ins[1].clone(), Arg::Block { id: out.id }, Arg::U64(n as u64)],
         grid: ceil_1d(n),
         block: (256, 1, 1),
         shared_mem: 0,
@@ -286,10 +293,10 @@ pub fn lower_mul(ins: &[Bytes], out: &Bytes, n: usize, dtype: crate::contract::D
 
 /// lower:Silu(一元)
 /// n = 声明元素数(C1 维度源头单一律:只读声明 shape,不读块账长)
-pub fn lower_silu(ins: &[Bytes], out: &Bytes, n: usize, dtype: crate::contract::Dtype) -> LaunchMsg {
+pub fn lower_silu(ins: &[Arg], out: &Bytes, n: usize, dtype: crate::contract::Dtype) -> LaunchMsg {
     LaunchMsg {
         kernel: spec(dname("owl_silu", dtype)),
-        args: vec![Arg::Block { id: ins[0].id }, Arg::Block { id: out.id }, Arg::U64(n as u64)],
+        args: vec![ins[0].clone(), Arg::Block { id: out.id }, Arg::U64(n as u64)],
         grid: ceil_1d(n),
         block: (256, 1, 1),
         shared_mem: 0,
@@ -299,10 +306,10 @@ pub fn lower_silu(ins: &[Bytes], out: &Bytes, n: usize, dtype: crate::contract::
 
 /// lower:Sigmoid(一元;attn_output_gate 门 / GDN beta 同族)
 /// n = 声明元素数(C1 维度源头单一律:只读声明 shape,不读块账长)
-pub fn lower_sigmoid(ins: &[Bytes], out: &Bytes, n: usize, dtype: crate::contract::Dtype) -> LaunchMsg {
+pub fn lower_sigmoid(ins: &[Arg], out: &Bytes, n: usize, dtype: crate::contract::Dtype) -> LaunchMsg {
     LaunchMsg {
         kernel: spec(dname("owl_sigmoid", dtype)),
-        args: vec![Arg::Block { id: ins[0].id }, Arg::Block { id: out.id }, Arg::U64(n as u64)],
+        args: vec![ins[0].clone(), Arg::Block { id: out.id }, Arg::U64(n as u64)],
         grid: ceil_1d(n),
         block: (256, 1, 1),
         shared_mem: 0,
@@ -311,12 +318,12 @@ pub fn lower_sigmoid(ins: &[Bytes], out: &Bytes, n: usize, dtype: crate::contrac
 }
 
 /// lower:Matmul([m,k]×[k,n];m/k/n 全部来自声明 shape(C1))
-pub fn lower_matmul(ins: &[Bytes], out: &Bytes, m: usize, k: usize, n: usize) -> LaunchMsg {
+pub fn lower_matmul(ins: &[Arg], out: &Bytes, m: usize, k: usize, n: usize) -> LaunchMsg {
     LaunchMsg {
         kernel: spec("owl_matmul_f32"),
         args: vec![
-            Arg::Block { id: ins[0].id },
-            Arg::Block { id: ins[1].id },
+            ins[0].clone(),
+            ins[1].clone(),
             Arg::Block { id: out.id },
             Arg::I32(m as i32),
             Arg::I32(k as i32),
@@ -330,12 +337,12 @@ pub fn lower_matmul(ins: &[Bytes], out: &Bytes, m: usize, k: usize, n: usize) ->
 }
 
 /// nt 变体:内核按 B [n,k] 直读(见 owl_matmul_nt_f32);网格同款
-pub fn lower_matmul_nt(ins: &[Bytes], out: &Bytes, m: usize, k: usize, n: usize) -> LaunchMsg {
+pub fn lower_matmul_nt(ins: &[Arg], out: &Bytes, m: usize, k: usize, n: usize) -> LaunchMsg {
     LaunchMsg {
         kernel: spec("owl_matmul_nt_f32"),
         args: vec![
-            Arg::Block { id: ins[0].id },
-            Arg::Block { id: ins[1].id },
+            ins[0].clone(),
+            ins[1].clone(),
             Arg::Block { id: out.id },
             Arg::I32(m as i32),
             Arg::I32(k as i32),
@@ -349,12 +356,12 @@ pub fn lower_matmul_nt(ins: &[Bytes], out: &Bytes, m: usize, k: usize, n: usize)
 }
 
 /// lower:Rmsnorm([rows, cols];per-channel alpha([cols] 广播);w_off = ×(1+w))
-pub fn lower_rmsnorm(ins: &[Bytes], eps: f32, w_off: bool, out: &Bytes, rows: usize, cols: usize, dtype: crate::contract::Dtype) -> LaunchMsg {
+pub fn lower_rmsnorm(ins: &[Arg], eps: f32, w_off: bool, out: &Bytes, rows: usize, cols: usize, dtype: crate::contract::Dtype) -> LaunchMsg {
     LaunchMsg {
         kernel: spec(dname("owl_rmsnorm", dtype)),
         args: vec![
-            Arg::Block { id: ins[0].id },
-            Arg::Block { id: ins[1].id },
+            ins[0].clone(),
+            ins[1].clone(),
             Arg::Block { id: out.id },
             Arg::I32(cols as i32),
             Arg::F32(eps),
@@ -387,7 +394,7 @@ pub fn lower_rmsnorm(ins: &[Bytes], eps: f32, w_off: bool, out: &Bytes, rows: us
 pub fn lower_kernel(
     kernel: &crate::kernel::Kernel,
     scalars: &[KernelArg],
-    ins: &[Bytes],
+    ins: &[Arg],
     out: &Bytes,
     out_elems: usize,
 ) -> LaunchMsg {
@@ -438,7 +445,7 @@ pub fn lower_kernel(
             "T" if is_out => args.push(Arg::Block { id: out.id }),
             "O" => args.push(Arg::Block { id: out.id }),
             "T" => {
-                args.push(Arg::Block { id: ins[pi].id });
+                args.push(ins[pi].clone());
                 pi += 1;
             }
             "sz" => match &scalars[si] {

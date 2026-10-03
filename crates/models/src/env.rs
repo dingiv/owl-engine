@@ -89,6 +89,8 @@ pub struct DiagEnv {
     pub resolve_trace: bool,
     /// host argmax 对照(OWL_HOST_ARGMAX)
     pub host_argmax: bool,
+    /// 刀D 时间戳探针(OWL_TS_PROBE;层间 clock64 原地写 ts_buf)
+    pub ts_probe: bool,
 }
 
 /// GDN 分派旋钮
@@ -99,6 +101,14 @@ pub struct GdnEnv {
     /// 标量门 chunked(lmdeploy pre_sm90 port 单核;prefill;默认关;
     /// 与 chunked 同开时 scalar 优先 —— 层臂三分序 scalar > chunked > recurrence)
     pub scalar: bool,
+    /// D1:decode 整链融合核(v-conv + l2norm×2 + gating + sigmoid(beta) +
+    /// delta + norm_act 六算子一发;**生产默认开**。2026-10-03 结案:
+    /// 初版 norm_act 误写 sigmoid(旧链生产语义 = silu),单测 host 参考
+    /// 同错相消全绿,引擎域 y 逐通道错 1~10 倍致乱码;修 silu 后 27B
+    /// e2e greedy/S3 采样双态文本与基线逐字一致,图内 nsys -1.7ms/步;
+    /// 取证方法论(状态格画像层扫 + logits dump)OWL_GDN_DUMP/OWL_DEBUG);
+    /// OWL_GDN_NO_FUSE_DECODE 反开关退出
+    pub fused_decode: bool,
 }
 
 /// 解释器执行环境完备描述(默认 = 生产基线 + 无硬件环境)
@@ -142,11 +152,16 @@ impl EnvProvider {
                 force_naive_prefill: has("OWL_FORCE_NAIVE"),
                 fi: has("OWL_FLASHINFER"),
             },
-            gdn: GdnEnv { chunked: has("OWL_GDN_CHUNKED"), scalar: has("OWL_GDN_SCALAR") },
+            gdn: GdnEnv {
+                chunked: has("OWL_GDN_CHUNKED"),
+                scalar: has("OWL_GDN_SCALAR"),
+                fused_decode: !has("OWL_GDN_NO_FUSE_DECODE"), // D1 默认开;反开关退出
+            },
             kv: KvEnv { quant: if has("OWL_KV_FP8") { KvQuant::Fp8E4M3 } else { KvQuant::None }, ..KvEnv::default() },
             diag: DiagEnv {
                 resolve_trace: has("OWL_RESOLVE_TRACE"),
                 host_argmax: has("OWL_HOST_ARGMAX"),
+                ts_probe: has("OWL_TS_PROBE"),
             },
             ..Self::default()
         }

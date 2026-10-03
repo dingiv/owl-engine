@@ -141,6 +141,17 @@ impl W4A16Source {
     /// 量化线性物化(键首触才建;qweight/scales 成对,weight 独立)。
     /// 双检缓存(快路径锁内查;构建在 build_lock 串行内,防并发双建)。
     fn linear_bytes_for(&self, base: &str, key: &str) -> Option<Arc<[u8]>> {
+        // 刀2 虚拟合并:in_proj_qkvz = row-stack(in_proj_qkv, in_proj_z)
+        // (同 k 行堆叠 = 字节拼接;两子基各自走完整建管)
+        if let Some((b1, b2)) = crate::formats::split_qkvz(base) {
+            let suffix = &key[base.len()..];
+            let s1 = self.linear_bytes_for(&b1, &format!("{b1}{suffix}"))?;
+            let s2 = self.linear_bytes_for(&b2, &format!("{b2}{suffix}"))?;
+            let mut buf = Vec::with_capacity(s1.len() + s2.len());
+            buf.extend_from_slice(&s1);
+            buf.extend_from_slice(&s2);
+            return Some(buf.into());
+        }
         let (out, k, pe, se) = self.linear_dims(base)?;
         {
             let cache = self.cache.lock().unwrap();

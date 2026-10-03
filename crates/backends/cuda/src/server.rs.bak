@@ -119,11 +119,6 @@ pub struct GpuServer {
     kernels: KernelCache,
     /// cuBLAS 封装(foreign-kernel 通道;算子之家 owl-kernels::cublas,懒初始化)
     blas: Option<owl_kernels::cublas::OwlCublas>,
-    /// 刀1.5:server 私有 cublas 工作区(4MB;SetWorkspace 预绑,捕获期
-    /// gemv splitK 不再走池分配烙 MEM_ALLOC/FREE 节点)。**每 server 独享**
-    /// —— 全局单例在并行 server 下两句柄并发写同一缓冲 = ILLEGAL_ADDRESS
-    /// (2026-10-03 实测);生命周期随 server(同 ctx,指针恒有效)。
-    blas_ws: Option<std::sync::Arc<cudarc::driver::CudaSlice<u8>>>,
     /// FlashInfer prefill 句柄(foreign-kernel 通道;workspace + plan 缓存,
     /// 懒初始化 —— owl-kernels::flashinfer)
     fi: Option<FiState>,
@@ -206,7 +201,6 @@ impl GpuServer {
             ctx: None,
             kernels: KernelCache::new(),
             blas: None,
-            blas_ws: None,
             fi: None,
             gdn_chunked: None,
             gdn_scalar: None,
@@ -507,9 +501,6 @@ impl GpuServer {
                 if zero {
                     let stream = self.ctx().stream(STREAM_COMPUTE)?.clone();
                     let (dptr, _) = self.ctx().block_ptr(id, &stream)?;
-                    if std::env::var_os("OWL_CAP_PROF").is_some() {
-                        eprintln!("[cap-prof] carve-memset {}B", n_bytes);
-                    }
                     unsafe { memset_d8_async(dptr, 0, n_bytes, stream.cu_stream()) }
                         .map_err(|e| ModelError::Msg(format!("carve memset: {e:?}")))?;
                 }
@@ -557,9 +548,6 @@ impl GpuServer {
             Ok(s) => s.clone(),
             Err(e) => return ack.send(Err(e)),
         };
-        if self.ctx().capture_stream() && std::env::var_os("OWL_CAP_PROF").is_some() {
-            eprintln!("[cap-prof] memset_zero {}B block{block}", len_bytes);
-        }
         let result = (|| {
             let (dptr, _) = self.ctx().block_ptr(block, &stream)?;
             unsafe {
@@ -994,9 +982,6 @@ impl GpuServer {
         // (在下次 dtoh/sync 收割)。不挂 host 回调 —— decode 百级 launch
         // 零回调,流水线不被驱动唤醒打断,并为 CUDA Graph 捕获铺路。
         let capturing = ctx.capture_stream();
-        if capturing && std::env::var_os("OWL_CAP_PROF").is_some() {
-            eprintln!("[cap-prof] native launch {} out={}", msg.kernel.name, msg.out_elems);
-        }
         match issue_launch(ctx, &stream, kernels, &msg) {
             Ok(out_id) => {
                 self.ctx_mut().note_launch();
@@ -1069,33 +1054,9 @@ impl GpuServer {
                 Ok(s) => s.clone(),
                 Err(e) => return ack.send(Err(e)),
             };
-            match owl_kernels::cublas::OwlCublas::new(stream.clone()) {
+            match owl_kernels::cublas::OwlCublas::new(stream) {
                 Ok(h) => self.blas = Some(h),
                 Err(e) => return ack.send(Err(ModelError::Msg(e))),
-            }
-            // 刀1.5:server 私有 4MB 工作区(捕获前分配;SetWorkspace 预绑
-            // —— 捕获期 gemv splitK 不走池分配,免 MEM_ALLOC/FREE 节点)。
-            // 并行 server 各享各的,零共享零竞争(全局单例实证会炸)。
-            const BLAS_WS_BYTES: usize = 4 << 20;
-            match unsafe { stream.alloc::<u8>(BLAS_WS_BYTES) } {
-                Ok(buf) => {
-                    use cudarc::driver::DevicePtr;
-                    let arc = std::sync::Arc::new(buf);
-                    let ptr = match arc.device_ptr(&stream) {
-                        (p, _sync) => p as u64,
-                    };
-                    let handle = *self.blas.as_ref().unwrap().sys_handle();
-                    let r = unsafe {
-                        crate::ffi::sys::cublas::cublasSetWorkspace_v2(handle, ptr as *mut _, BLAS_WS_BYTES)
-                    };
-                    if r == crate::ffi::sys::cublas::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-                        eprintln!("[blas-ws] 私有工作区 {BLAS_WS_BYTES}B @ {ptr:#x}");
-                        self.blas_ws = Some(arc);
-                    } else {
-                        eprintln!("[blas-ws] SetWorkspace 失败 r={r:?}(启发式回退池分配)");
-                    }
-                }
-                Err(e) => eprintln!("[blas-ws] 分配失败 {e:?}(回退池分配)"),
             }
         }
         // 槽序:[T a, T b, T out, sz m, sz k, sz n, sz nt]
@@ -1107,6 +1068,7 @@ impl GpuServer {
                 Arg::BlockSlice { id, byte_offset, .. } => blocks.push((*id, *byte_offset)),
                 Arg::U64(v) => scalars.push(*v),
                 other => {
+                    eprintln!("[cublas-reject] {:?} arg={other:?}", msg.kernel.name);
                     return ack.send(Err(ModelError::Msg(format!(
                         "foreign kernel {} 槽序违约:仅 Block/U64(见 cublas.rs 契约)",
                         msg.kernel.name
@@ -1127,7 +1089,7 @@ impl GpuServer {
         if std::env::var_os("OWL_DEBUG").is_some() {
             eprintln!(
                 "[dbg foreign] {} a=Block({}) b=Block({}) out=Block({}) m={n_out} k={k} n={n_tok} nt={nt}",
-                msg.kernel.name, blocks[0].0, blocks[1].0, blocks[2].0, n_out = m, n_tok = n
+                msg.kernel.name, blocks[0], blocks[1], blocks[2], n_out = m, n_tok = n
             );
         }
         let blas = self.blas.as_ref().unwrap();
@@ -1135,16 +1097,16 @@ impl GpuServer {
             Ok(s) => s.clone(),
             Err(e) => return ack.send(Err(e)),
         };
-        let (a_ptr, _) = match self.ctx().block_ptr(blocks[0].0, &stream) {
-            Ok(p) => (p.0 + blocks[0].1, p.1),
+        let (a_ptr, _) = match self.ctx().block_ptr(blocks[0], &stream) {
+            Ok(p) => p,
             Err(e) => return ack.send(Err(e)),
         };
-        let (b_ptr, _) = match self.ctx().block_ptr(blocks[1].0, &stream) {
-            Ok(p) => (p.0 + blocks[1].1, p.1),
+        let (b_ptr, _) = match self.ctx().block_ptr(blocks[1], &stream) {
+            Ok(p) => p,
             Err(e) => return ack.send(Err(e)),
         };
-        let (out_ptr, _) = match self.ctx().block_ptr(blocks[2].0, &stream) {
-            Ok(p) => (p.0 + blocks[2].1, p.1),
+        let (out_ptr, _) = match self.ctx().block_ptr(blocks[2], &stream) {
+            Ok(p) => p,
             Err(e) => return ack.send(Err(e)),
         };
         let capturing = self.ctx().capture_stream();
@@ -1158,7 +1120,7 @@ impl GpuServer {
                         ))));
                     }
                 }
-                ack.send(Ok(Bytes::new(blocks[2].0, msg.out_elems)))
+                ack.send(Ok(Bytes::new(blocks[2], msg.out_elems)))
             }
             Err(e) => ack.send(Err(ModelError::Msg(e))),
         }
@@ -1198,9 +1160,9 @@ impl GpuServer {
             Err(e) => return ack.send(Err(e)),
         };
         let mut ptrs = Vec::with_capacity(6);
-        for (b, off) in &blocks {
+        for b in &blocks {
             match self.ctx().block_ptr(*b, &stream) {
-                Ok((p, _)) => ptrs.push(p + off),
+                Ok((p, _)) => ptrs.push(p),
                 Err(e) => return ack.send(Err(e)),
             }
         }
@@ -1223,7 +1185,7 @@ impl GpuServer {
             )
         };
         match r {
-            Ok(()) => ack.send(Ok(Bytes::new(blocks[2].0, msg.out_elems))),
+            Ok(()) => ack.send(Ok(Bytes::new(blocks[2], msg.out_elems))),
             Err(e) => ack.send(Err(ModelError::Msg(format!(
                 "marlin gemm err {e}: {}",
                 owl_kernels::marlin::v2_err_str(e)
@@ -1312,9 +1274,9 @@ impl GpuServer {
             Err(e) => return ack.send(Err(e)),
         };
         let mut ptrs = Vec::with_capacity(9);
-        for (b, off) in &blocks {
+        for b in &blocks {
             match self.ctx().block_ptr(*b, &stream) {
-                Ok((p, _)) => ptrs.push(p + off),
+                Ok((p, _)) => ptrs.push(p),
                 Err(e) => return ack.send(Err(e)),
             }
         }
@@ -1427,7 +1389,7 @@ impl GpuServer {
             m.timer_record_tag("fi.run", fi_run_t0.elapsed(), file!(), line!())
         });
         match r {
-            0 => ack.send(Ok(Bytes::new(blocks[8].0, msg.out_elems))),
+            0 => ack.send(Ok(Bytes::new(blocks[8], msg.out_elems))),
             e => ack.send(Err(ModelError::Msg(format!("flashinfer_prefill_run err {e}")))),
         }
     }
@@ -1571,9 +1533,9 @@ impl GpuServer {
             Err(e) => return ack.send(Err(e)),
         };
         let mut ptrs = Vec::with_capacity(7);
-        for (b, off) in &blocks {
+        for b in &blocks {
             match self.ctx().block_ptr(*b, &stream) {
-                Ok((p, _)) => ptrs.push(p + off),
+                Ok((p, _)) => ptrs.push(p),
                 Err(e) => return ack.send(Err(e)),
             }
         }
@@ -1612,9 +1574,6 @@ impl GpuServer {
         let state_p = ptrs[5] + (slot * hv * kd * vd * 4) as u64; // f32 → 字节
         // host 表 htod(COMPUTE 流,先于 FLA 核):cu=[0,T] / idx=[(0,i)×NT] / coff=[0,NT]
         let idx_host: Vec<i64> = (0..nt).flat_map(|i| [0i64, i as i64]).collect();
-        if std::env::var_os("OWL_CAP_PROF").is_some() {
-            eprintln!("[cap-prof] gdn-chunked cu/idx/coff htod x3 (T={t})");
-        }
         if let Err(e) = unsafe { memcpy_htod_async(cu_p, &[0i64, t as i64], stream.cu_stream()) } {
             return ack.send(Err(ModelError::Msg(format!("gdn cu htod: {e:?}"))));
         }
@@ -1768,7 +1727,7 @@ impl GpuServer {
                 return ack.send(Err(e));
             }
         }
-        ack.send(Ok(Bytes::new(blocks[6].0, msg.out_elems)))
+        ack.send(Ok(Bytes::new(blocks[6], msg.out_elems)))
     }
 
     /// GDN scalar 臂(lmdeploy pre_sm90 port 单核;2026-10-03)。
@@ -1878,9 +1837,9 @@ impl GpuServer {
             Err(e) => return ack.send(Err(e)),
         };
         let mut ptrs = Vec::with_capacity(7);
-        for (b, off) in &blocks {
+        for b in &blocks {
             match self.ctx().block_ptr(*b, &stream) {
-                Ok((p, _)) => ptrs.push(p + off),
+                Ok((p, _)) => ptrs.push(p),
                 Err(e) => return ack.send(Err(e)),
             }
         }
@@ -1952,7 +1911,7 @@ impl GpuServer {
                 return ack.send(Err(e));
             }
         }
-        ack.send(Ok(Bytes::new(blocks[6].0, msg.out_elems)))
+        ack.send(Ok(Bytes::new(blocks[6], msg.out_elems)))
     }
 
     /// Marlin AWQ(kU4 非对称)臂(2026-10-01 cyankiwi g32 装载线)。
@@ -1990,9 +1949,9 @@ impl GpuServer {
             Err(e) => return ack.send(Err(e)),
         };
         let mut ptrs = Vec::with_capacity(7);
-        for (b, off) in &blocks {
+        for b in &blocks {
             match self.ctx().block_ptr(*b, &stream) {
-                Ok((p, _)) => ptrs.push(p + off),
+                Ok((p, _)) => ptrs.push(p),
                 Err(e) => return ack.send(Err(e)),
             }
         }
@@ -2015,7 +1974,7 @@ impl GpuServer {
             )
         };
         match r {
-            Ok(()) => ack.send(Ok(Bytes::new(blocks[2].0, msg.out_elems))),
+            Ok(()) => ack.send(Ok(Bytes::new(blocks[2], msg.out_elems))),
             Err(e) => ack.send(Err(ModelError::Msg(format!(
                 "marlin awq gemm err {e}: {}",
                 owl_kernels::marlin::v2_err_str(e)

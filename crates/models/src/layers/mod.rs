@@ -52,6 +52,13 @@ pub(crate) fn narrow_strided(
     out_dim: usize,
     shape: crate::contract::Shape,
 ) -> TensorOps {
+    // 刀1 快路:连续切片 → SliceView(零内核零节点派发)。平铺位置
+    // r·src_dim + start + d 连续 ⟺ outer==1(单行)∨ src_dim==out_dim
+    // (无跨行间隙)——两者平铺域同为 [start, start + outer·out_dim)。
+    // decode T=1 的全部 narrow 命中此臂;非连续(prefill 批量)仍物化。
+    if outer == 1 || src_dim == out_dim {
+        return src.slice_view(start, shape);
+    }
     let dt = src.dtype;
     if dt == crate::tensor::Dtype::F16 {
         return TensorOps::call(crate::ops::ids::OPS_NARROW) // 哨兵:逐元素核,自动 1D ceil/256

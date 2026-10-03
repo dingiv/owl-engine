@@ -122,6 +122,60 @@ pub fn conv_upd(
     .with_shape(dt, vec![batch, dim])
 }
 
+/// D1:decode 整链融合(v-conv + l2norm×2 + gating + sigmoid + delta + norm_act
+/// 六算子一发;2026-10-03)。q/k conv_upd 保留独立发射(GVA 跨块同写 conv
+/// state 的读改写序不可保证,见核内头注),本核吃其产物 + v 段原始投影。
+/// 发射 = (B·HV,1,1) × (kd,1,1),kd==vd∈{64,128} 守卫;动态 smem = 0。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_step_fused(
+    q_c: &TensorOps,
+    k_c: &TensorOps,
+    v_raw: &TensorOps,
+    z: &TensorOps,
+    b_gate: &TensorOps,
+    a_gate: &TensorOps,
+    w: &TensorOps,
+    conv_v: &TensorOps,
+    a_log: &TensorOps,
+    dt_bias: &TensorOps,
+    rec: &TensorOps,
+    slots: &TensorOps,
+    norm_w: &TensorOps,
+    batch: usize,
+    nv: usize,
+    nk: usize,
+    kd: usize,
+    vd: usize,
+    eps_l2: f32,
+    eps_norm: f32,
+    q_scale: f32,
+) -> TensorOps {
+    TensorOps::call(ids::GDN_DECODE_STEP)
+    .aux(&[batch, nv, kd, vd])
+    .arg(q_c)
+    .arg(k_c)
+    .arg(v_raw)
+    .arg(z)
+    .arg(b_gate)
+    .arg(a_gate)
+    .arg(w)
+    .arg(conv_v)
+    .arg(a_log)
+    .arg(dt_bias)
+    .arg(rec)
+    .arg(slots)
+    .arg(norm_w)
+    .arg_usize(batch)
+    .arg_usize(nv)
+    .arg_usize(nk)
+    .arg_usize(kd)
+    .arg_usize(vd)
+    .arg_f32(eps_l2)
+    .arg_f32(eps_norm)
+    .arg_f32(q_scale)
+    .with_shape(Dtype::F16, vec![batch, nv, vd])
+}
+
 // ============================================================================
 // 批4:gated delta rule decode(单步;slot 寻址;GQA)
 // ============================================================================
@@ -277,17 +331,18 @@ pub fn norm_act(
 /// decode 数据流:
 /// ```text
 /// xs [T, hidden]
-///   ├ in_proj_qkv → [T, 2K+V] ─ narrow 三段 → q/k/v
-///   ├ in_proj_z → z [T, V];in_proj_b/a → b/a [T, HV]
+///   ├ in_proj_qkvz → [T, 2K+2V] ─ narrow 四段 → q/k/v/z(刀2 列合并)
+///   ├ in_proj_b/a → b/a [T, HV]
 ///   ├ conv_upd(q/k/v 三段独立发射;state 滑窗 + silu)→ q'/k'/v'
 ///   ├ l2norm(q',k' per-head)→ g/beta 门控 → delta_dec(单步;rec 原地)
 ///   ├ norm_act(×w 非零中心 × silu(z) per-head)→ out_proj → [T, hidden]
 /// ```
 pub struct GatedDeltaNet {
-    in_proj_qkv: Linear, // [2K+V, hidden]
-    in_proj_z: Linear,   // [V, hidden]
-    in_proj_b: Linear,   // [HV, hidden]
-    in_proj_a: Linear,   // [HV, hidden]
+    /// 刀2:qkv+z 列合并单投影([2K+2V, hidden];装载期行堆叠合成,
+    /// n%256==0 marlin tile 完美;qkv 段偏移不变,z 段 narrow 切出)
+    in_proj_qkvz: Linear, // [2K+2V, hidden]
+    in_proj_b: Linear,    // [HV, hidden]
+    in_proj_a: Linear,    // [HV, hidden]
     out_proj: Linear,    // [hidden, V]
     conv_w: Weight,      // [conv_dim, 4](checkpoint [conv_dim,1,4] 同布局直读)
     a_log: Weight,       // [HV]
@@ -309,8 +364,7 @@ impl GatedDeltaNet {
         let (key_dim, value_dim) = (nk * hk_dim, nv * hv_dim);
         let conv_dim = 2 * key_dim + value_dim;
         GatedDeltaNet {
-            in_proj_qkv: Linear::new("in_proj_qkv", conv_dim, hidden, plan),
-            in_proj_z: Linear::new("in_proj_z", value_dim, hidden, plan),
+            in_proj_qkvz: Linear::new("in_proj_qkvz", conv_dim + value_dim, hidden, plan),
             in_proj_b: Linear::new("in_proj_b", nv, hidden, plan),
             in_proj_a: Linear::new("in_proj_a", nv, hidden, plan),
             out_proj: Linear::new("out_proj", hidden, value_dim, plan),
@@ -360,14 +414,15 @@ impl GatedDeltaNet {
         let value_dim = self.value_dim();
         let conv_dim = 2 * key_dim + value_dim;
 
-        // T 批量投影
-        let qkv = self.in_proj_qkv.forward(xs, ctx); // [T, 2K+V]
-        let z = self.in_proj_z.forward(xs, ctx); // [T, V]
+        // T 批量投影(刀2:qkvz 列合并单投影;z 段 narrow)
+        let qkvz = self.in_proj_qkvz.forward(xs, ctx); // [T, 2K+2V]
         let b = self.in_proj_b.forward(xs, ctx); // [T, HV]
         let a = self.in_proj_a.forward(xs, ctx); // [T, HV]
-        let q = narrow_strided(&qkv, tokens, conv_dim, 0, key_dim, vec![tokens, key_dim]);
-        let k = narrow_strided(&qkv, tokens, conv_dim, key_dim, key_dim, vec![tokens, key_dim]);
-        let v = narrow_strided(&qkv, tokens, conv_dim, 2 * key_dim, value_dim, vec![tokens, value_dim]);
+        let qkv_w = conv_dim + value_dim;
+        let q = narrow_strided(&qkvz, tokens, qkv_w, 0, key_dim, vec![tokens, key_dim]);
+        let k = narrow_strided(&qkvz, tokens, qkv_w, key_dim, key_dim, vec![tokens, key_dim]);
+        let v = narrow_strided(&qkvz, tokens, qkv_w, 2 * key_dim, value_dim, vec![tokens, value_dim]);
+        let z = narrow_strided(&qkvz, tokens, qkv_w, conv_dim, value_dim, vec![tokens, value_dim]);
 
         // cu_seqlens = [0, T](单序列;vLLM 契约形态,M2 packed 直用)
         let cu = TensorOps::from_host(Dtype::F32, vec![2], &{
@@ -541,19 +596,21 @@ impl GatedDeltaNet {
         let value_dim = self.value_dim();
         let conv_dim = 2 * key_dim + value_dim;
 
-        // T 批量投影(SplitQkvZa 同 decode;T 无关算子单发即批量)
-        let qkv = self.in_proj_qkv.forward(xs, ctx); // [T, 2K+V]
-        let z = self.in_proj_z.forward(xs, ctx); // [T, V]
+        // T 批量投影(SplitQkvZa 同 decode;T 无关算子单发即批量;
+        // 刀2:qkvz 列合并单投影,z 段整段 narrow)
+        let qkvz = self.in_proj_qkvz.forward(xs, ctx); // [T, 2K+2V]
         let b = self.in_proj_b.forward(xs, ctx); // [T, HV]
         let a = self.in_proj_a.forward(xs, ctx); // [T, HV]
+        let qkv_w = conv_dim + value_dim;
+        let z = narrow_strided(&qkvz, tokens, qkv_w, conv_dim, value_dim, vec![tokens, value_dim]);
 
         // 逐 token 段(conv 滑窗 / rec 递推链式;slot 恒 gdn_slot)
         let mut ys: Vec<TensorOps> = Vec::with_capacity(tokens);
         for t in 0..tokens {
             // 读侧行窄切(直接从 [T,·] 投影读,start = 行基址)
-            let q_t = narrow_strided(&qkv, 1, conv_dim, t * conv_dim, key_dim, vec![1, key_dim]);
-            let k_t = narrow_strided(&qkv, 1, conv_dim, t * conv_dim + key_dim, key_dim, vec![1, key_dim]);
-            let v_t = narrow_strided(&qkv, 1, conv_dim, t * conv_dim + 2 * key_dim, value_dim, vec![1, value_dim]);
+            let q_t = narrow_strided(&qkvz, 1, qkv_w, t * qkv_w, key_dim, vec![1, key_dim]);
+            let k_t = narrow_strided(&qkvz, 1, qkv_w, t * qkv_w + key_dim, key_dim, vec![1, key_dim]);
+            let v_t = narrow_strided(&qkvz, 1, qkv_w, t * qkv_w + 2 * key_dim, value_dim, vec![1, value_dim]);
             let a_t = narrow_strided(&a, 1, self.nv, t * self.nv, self.nv, vec![1, self.nv]);
             let b_t = narrow_strided(&b, 1, self.nv, t * self.nv, self.nv, vec![1, self.nv]);
 
@@ -625,21 +682,53 @@ impl GatedDeltaNet {
         };
         let (key_dim, value_dim, conv_dim) = (self.key_dim(), self.value_dim(), 2 * self.key_dim() + self.value_dim());
 
-        // 投影(SplitQkvZa:qkv 融合单投影 + z/b/a 独立)
-        let qkv = self.in_proj_qkv.forward(xs, ctx); // [T, 2K+V]
-        let z = self.in_proj_z.forward(xs, ctx); // [T, V]
+        // 投影(刀2:qkvz 列合并单投影 + b/a 独立)
+        let qkvz = self.in_proj_qkvz.forward(xs, ctx); // [T, 2K+2V]
         let b = self.in_proj_b.forward(xs, ctx); // [T, HV]
         let a = self.in_proj_a.forward(xs, ctx); // [T, HV]
 
-        // qkv 列切分(narrow;conv 权重不切 —— 段基址走 w_offset 标量)
-        let q = narrow_strided(&qkv, tokens, conv_dim, 0, key_dim, vec![tokens, key_dim]);
-        let k = narrow_strided(&qkv, tokens, conv_dim, key_dim, key_dim, vec![tokens, key_dim]);
-        let v = narrow_strided(&qkv, tokens, conv_dim, 2 * key_dim, value_dim, vec![tokens, value_dim]);
+        // qkvz 段切分(narrow;conv 权重不切 —— 段基址走 w_offset 标量;
+        // q/k/v 段偏移与分立时代一致,z 段接在 conv_dim 之后)
+        let qkv_w = conv_dim + value_dim;
+        let q = narrow_strided(&qkvz, tokens, qkv_w, 0, key_dim, vec![tokens, key_dim]);
+        let k = narrow_strided(&qkvz, tokens, qkv_w, key_dim, key_dim, vec![tokens, key_dim]);
+        let v = narrow_strided(&qkvz, tokens, qkv_w, 2 * key_dim, value_dim, vec![tokens, value_dim]);
+        let z = narrow_strided(&qkvz, tokens, qkv_w, conv_dim, value_dim, vec![tokens, value_dim]);
 
         // conv 三段独立发射(零拼接算子;state 原地滑窗;段基址 = w_offset)
+        // D1 融合臂(env.gdn.fused_decode):v 段之后的六算子合一(v-conv +
+        // l2norm×2 + gating + sigmoid + delta + norm_act);q/k conv_upd 保留
+        // (GVA 跨块同写 state 竞态,见核内头注)。层发射 17 → 11。
+        let fused_decode = ctx.env.gdn.fused_decode;
         let q_c = conv_upd(&q, &self.conv_w.decl(), &gdn.conv_q, &gdn.slots, tokens, key_dim, 0, true);
         let k_c = conv_upd(&k, &self.conv_w.decl(), &gdn.conv_k, &gdn.slots, tokens, key_dim, key_dim, true);
-        let v_c = conv_upd(&v, &self.conv_w.decl(), &gdn.conv_v, &gdn.slots, tokens, value_dim, 2 * key_dim, true);
+        let gated = if fused_decode {
+            let y = decode_step_fused(
+                &q_c,
+                &k_c,
+                &v,
+                &z,
+                &b,
+                &a,
+                &self.conv_w.decl(),
+                &gdn.conv_v,
+                &self.a_log.decl(),
+                &self.dt_bias.decl(),
+                &gdn.rec,
+                &gdn.slots,
+                &self.norm_w.decl(),
+                tokens,
+                self.nv,
+                self.nk,
+                self.hk_dim,
+                self.hv_dim,
+                1e-6,
+                self.eps,
+                1.0 / (self.hk_dim as f32).sqrt(),
+            );
+            y.reshape(vec![tokens, value_dim])
+        } else {
+            let v_c = conv_upd(&v, &self.conv_w.decl(), &gdn.conv_v, &gdn.slots, tokens, value_dim, 2 * key_dim, true);
 
         // qk l2norm(per-head 行;HF use_qk_l2norm_in_kernel=True)
         let q_n = l2norm(
@@ -676,17 +765,18 @@ impl GatedDeltaNet {
             1.0 / (self.hk_dim as f32).sqrt(),
         );
 
-        // 门控归一化(×w 非零中心 × silu(z);per-head 组)+ 出投影
-        let gated = norm_act(
-            &y.reshape(vec![tokens, value_dim]),
-            &z,
-            &self.norm_w.decl(),
-            tokens,
-            value_dim,
-            self.hv_dim,
-            self.eps,
-            true,
-        );
+        // 门控归一化(×w 非零中心 × silu(z);per-head 组)
+            norm_act(
+                &y.reshape(vec![tokens, value_dim]),
+                &z,
+                &self.norm_w.decl(),
+                tokens,
+                value_dim,
+                self.hv_dim,
+                self.eps,
+                true,
+            )
+        };
         self.out_proj.forward(&gated, ctx)
     }
 }
@@ -699,8 +789,7 @@ impl Module for GatedDeltaNet {
 
 impl Loadable for GatedDeltaNet {
     fn layout(&self, ctx: &LoaderCtx) -> LoaderOps {
-        self.in_proj_qkv.layout(ctx)
-            .chain(self.in_proj_z.layout(ctx))
+        self.in_proj_qkvz.layout(ctx)
             .chain(self.in_proj_b.layout(ctx))
             .chain(self.in_proj_a.layout(ctx))
             .chain(self.out_proj.layout(ctx))
@@ -722,8 +811,7 @@ pub mod fixture {
         let (key_dim, value_dim) = (nk * hk_dim, nv * hv_dim);
         let conv_dim = 2 * key_dim + value_dim;
         vec![
-            ("in_proj_qkv".to_string(), conv_dim * hidden),
-            ("in_proj_z".to_string(), value_dim * hidden),
+            ("in_proj_qkvz".to_string(), (conv_dim + value_dim) * hidden),
             ("in_proj_b".to_string(), nv * hidden),
             ("in_proj_a".to_string(), nv * hidden),
             ("out_proj".to_string(), hidden * value_dim),
@@ -742,7 +830,7 @@ pub mod fixture {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::{f32b, harvest, gpu_client, gpu_enabled};
+    use crate::testkit::{f32b, harvest, harvest_f16, gpu_client, gpu_enabled};
 
     /// host 参考(g 臂;与核同式独立副本)
     pub(crate) fn host_gating_g(
@@ -782,7 +870,220 @@ mod tests {
     }
 
     /// GPU vs host(门控 OWL_TEST_DEVICE)
+    /// D1 融合核 GPU vs host(v-conv + l2norm×2 + gating + sigmoid + delta +
+    /// norm_act 六算子全链独立副本;q/k conv 产物以 f16 域给定;两步 +
+    /// padding 槽;state 跨步持久。门控 OWL_TEST_DEVICE)
     #[tokio::test]
+    async fn gpu_decode_step_fused_matches_host() {
+        if !gpu_enabled() {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return;
+        }
+        use crate::contract::DeviceClient;
+        let r16 = |x: f32| half::f16::from_f32(x).to_f32();
+        let hbytes = |v: &[f32]| -> Vec<u8> {
+            v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect()
+        };
+        // 双形状:0.8B(kv_group=1)与 27B(kv_group=3,nv=48/nk=16/kd=128)
+        for (max_slots, nv, nk, kd) in [(4usize, 16usize, 16usize, 128usize), (8usize, 48usize, 16usize, 128usize)] {
+        let vd = kd;
+        let vd = kd;
+        let key_dim = nk * kd;
+        let value_dim = nv * vd;
+        let conv_dim = 2 * key_dim + value_dim;
+        let gen = |n: usize, seed: f32| {
+            (0..n).map(|i| ((i as f32 + seed) * 0.17).sin() * 0.8).collect::<Vec<f32>>()
+        };
+        let eps_l2 = 1e-6f32;
+        let eps_norm = 1e-5f32;
+        let q_scale = 1.0 / (kd as f32).sqrt();
+
+        // 两步输入(slot [1,3] → [1,-1];第二步覆盖 padding 路径 + state 续步)
+        let w = gen(conv_dim * 4, 1.0);
+        let a_log = gen(nv, 2.0);
+        let dt_bias = gen(nv, 3.0);
+        let norm_w = gen(vd, 4.0);
+        // 现实幅度(真权重域模拟):v/z 大幅度、beta 全域、g 大跨度
+        let conv_v0 = gen(max_slots * value_dim * 3, 5.0);
+        let rec0 = gen(max_slots * nv * kd * vd, 6.0);
+        // 32 步递推(交替 slot 0/1,beta/g 全域幅度,步间数据演化)
+        let n_steps = 32usize;
+        let mut steps: Vec<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> = Vec::new();
+        for st in 0..n_steps {
+            let sd = 10.0 + st as f32 * 7.0;
+            steps.push((
+                (0..2 * nk * kd).map(|i| ((i as f32 + sd) * 0.11).sin() * (1.0 + (st % 4) as f32)).collect(),
+                (0..2 * nk * kd).map(|i| ((i as f32 + sd + 1.0) * 0.13).sin() * (1.0 + (st % 3) as f32)).collect(),
+                (0..2 * value_dim).map(|i| ((i as f32 + sd + 2.0) * 0.19).sin() * (2.0 + (st % 5) as f32)).collect(),
+                (0..2 * value_dim).map(|i| ((i as f32 + sd + 3.0) * 0.23).sin() * (2.0 + (st % 3) as f32)).collect(),
+                (0..2 * nv).map(|i| ((i as f32 + sd + 4.0) * 0.29).sin() * (2.0 + (st % 7) as f32)).collect(), // b: sigmoid 全域
+                (0..2 * nv).map(|i| ((i as f32 + sd + 5.0) * 0.31).sin() * (3.0 + (st % 4) as f32)).collect(), // a: g 大跨度
+                if st % 2 == 0 { vec![1.0f32, 3.0] } else { vec![3.0f32, 1.0] },
+            ));
+        }
+        let steps = steps.iter().map(|(a, b, c, d, e, f, g)| (a.as_slice(), b.as_slice(), c.as_slice(), d.as_slice(), e.as_slice(), f.as_slice(), g.as_slice())).collect::<Vec<_>>();
+
+        // host 独立副本(全 f32;输入按 f16 舍入对齐 GPU 域)
+        #[allow(clippy::too_many_arguments)]
+        #[allow(clippy::too_many_arguments)]
+        let host_step = |q_c: &[f32], k_c: &[f32], v_raw: &[f32], z: &[f32], b_gate: &[f32], a_gate: &[f32], slots: &[f32], conv_st: &mut Vec<f32>, rec: &mut Vec<f32>| -> Vec<f32> {
+            let batch = slots.len();
+            let mut out_all = vec![0.0f32; batch * nv * vd];
+            for bi in 0..batch {
+                let slot = slots[bi] as i32;
+                for h in 0..nv {
+                    let kh = h / (nv / nk);
+                    let mut v_c = [0.0f32; 128];
+                    for t in 0..vd {
+                        if slot < 0 {
+                            break;
+                        }
+                        let ch = h * vd + t;
+                        let sbase = (slot as usize * value_dim + ch) * 3;
+                        let hist = [conv_st[sbase], conv_st[sbase + 1], conv_st[sbase + 2]];
+                        let wbase = (2 * key_dim + ch) * 4;
+                        let xt = r16(v_raw[bi * value_dim + ch]);
+                        let mut sum = xt * r16(w[wbase + 3]);
+                        for kk in 0..3 {
+                            sum += hist[kk] * r16(w[wbase + kk]);
+                        }
+                        sum /= 1.0 + (-sum).exp();
+                        conv_st[sbase] = hist[1];
+                        conv_st[sbase + 1] = hist[2];
+                        conv_st[sbase + 2] = xt;
+                        v_c[t] = sum;
+                    }
+                    // l2norm q/k(kd 行)
+                    let mut sq = 0.0f32;
+                    let mut sk = 0.0f32;
+                    for j in 0..kd {
+                        let qv = r16(q_c[bi * key_dim + kh * kd + j]);
+                        let kv = r16(k_c[bi * key_dim + kh * kd + j]);
+                        sq += qv * qv;
+                        sk += kv * kv;
+                    }
+                    let inv_q = 1.0 / (sq.max(0.0) + eps_l2).sqrt();
+                    let inv_k = 1.0 / (sk.max(0.0) + eps_l2).sqrt();
+                    // gating + beta
+                    let gi = bi * nv + h;
+                    let gx = r16(a_gate[gi]) + r16(dt_bias[h]);
+                    let spv = if gx <= 20.0 { gx.exp().ln_1p() } else { gx };
+                    let decay = (-r16(a_log[h]).exp() * spv).exp();
+                    let beta_h = 1.0 / (1.0 + (-r16(b_gate[gi])).exp());
+                    // delta(列序 = 核内 tid 序)
+                    let sbase = if slot >= 0 {
+                        Some((slot as usize * nv + h) * kd * vd)
+                    } else {
+                        None
+                    };
+                    let mut y = vec![0.0f32; vd];
+                    for t in 0..vd {
+                        let mut s_buf = [0.0f32; 128];
+                        for j in 0..kd {
+                            s_buf[j] = match sbase {
+                                Some(sb) => rec[sb + j * vd + t],
+                                None => 0.0,
+                            };
+                        }
+                        let mut kv_mem = 0.0f32;
+                        for j in 0..kd {
+                            s_buf[j] *= decay;
+                            kv_mem += s_buf[j] * r16(k_c[bi * key_dim + kh * kd + j]) * inv_k;
+                        }
+                        let delta = (v_c[t] - kv_mem) * beta_h;
+                        let mut yr = 0.0f32;
+                        for j in 0..kd {
+                            s_buf[j] += r16(k_c[bi * key_dim + kh * kd + j]) * inv_k * delta;
+                            yr += s_buf[j] * (r16(q_c[bi * key_dim + kh * kd + j]) * inv_q) * q_scale;
+                        }
+                        if let Some(sb) = sbase {
+                            for j in 0..kd {
+                                rec[sb + j * vd + t] = s_buf[j];
+                            }
+                        }
+                        y[t] = yr;
+                    }
+                    // norm_act(×w 非零中心 × silu(z);2026-10-03 立案定谳:
+                    // 旧链 norm_act act_silu=true = silu;本参考曾同融合核
+                    // 一起误写 sigmoid,同错相消致单测全绿盲区)
+                    let nsum: f32 = y.iter().map(|v| v * v).sum();
+                    let ninv = 1.0 / ((nsum / vd as f32).max(0.0) + eps_norm).sqrt();
+                    for t in 0..vd {
+                        let zv = r16(z[bi * value_dim + h * vd + t]);
+                        let actv = zv / (1.0 + (-zv).exp());
+                        out_all[(bi * nv + h) * vd + t] = y[t] * ninv * r16(norm_w[t]) * actv;
+                    }
+                }
+            }
+            out_all
+        };
+
+        let mut host_conv = conv_v0.clone();
+        let mut host_rec = rec0.clone();
+        let mut gpu = gpu_client().await;
+        let cblock = alloc_and_fill(&mut gpu, &conv_v0).await;
+        let rblock = alloc_and_fill(&mut gpu, &rec0).await;
+        for (si, (q_c, k_c, v_raw, z, b_gate, a_gate, slots)) in steps.iter().enumerate() {
+            let batch = slots.len();
+            let host_out = host_step(
+                &q_c.iter().map(|x| r16(*x)).collect::<Vec<_>>(),
+                &k_c.iter().map(|x| r16(*x)).collect::<Vec<_>>(),
+                &v_raw.iter().map(|x| r16(*x)).collect::<Vec<_>>(),
+                &z.iter().map(|x| r16(*x)).collect::<Vec<_>>(),
+                &b_gate.iter().map(|x| r16(*x)).collect::<Vec<_>>(),
+                &a_gate.iter().map(|x| r16(*x)).collect::<Vec<_>>(),
+                slots,
+                &mut host_conv,
+                &mut host_rec,
+            );
+            let decl = decode_step_fused(
+                &TensorOps::from_host(Dtype::F16, vec![batch, key_dim], &hbytes(q_c)),
+                &TensorOps::from_host(Dtype::F16, vec![batch, key_dim], &hbytes(k_c)),
+                &TensorOps::from_host(Dtype::F16, vec![batch, value_dim], &hbytes(v_raw)),
+                &TensorOps::from_host(Dtype::F16, vec![batch, value_dim], &hbytes(z)),
+                &TensorOps::from_host(Dtype::F16, vec![batch, nv], &hbytes(b_gate)),
+                &TensorOps::from_host(Dtype::F16, vec![batch, nv], &hbytes(a_gate)),
+                &TensorOps::from_host(Dtype::F16, vec![conv_dim, 4], &hbytes(&w)),
+                &TensorOps::of_block(cblock.id, Dtype::F32, vec![max_slots, value_dim, 3]),
+                &TensorOps::from_host(Dtype::F16, vec![nv], &hbytes(&a_log)),
+                &TensorOps::from_host(Dtype::F16, vec![nv], &hbytes(&dt_bias)),
+                &TensorOps::of_block(rblock.id, Dtype::F32, vec![max_slots, nv, kd, vd]),
+                &TensorOps::from_host(Dtype::F32, vec![batch], &f32b(slots)),
+                &TensorOps::from_host(Dtype::F16, vec![vd], &hbytes(&norm_w)),
+                batch, nv, nk, kd, vd, eps_l2, eps_norm, q_scale,
+            );
+            let got = harvest_f16(&mut gpu, &decl).await;
+
+            for bi in 0..batch {
+                if slots[bi] < 0.0 {
+                    continue;
+                }
+                crate::testkit::assert_close(
+                    &got[bi * nv * vd..(bi + 1) * nv * vd],
+                    &host_out[bi * nv * vd..(bi + 1) * nv * vd],
+                    2e-2,
+                    &format!("decode_step_fused step{si} b{bi}"),
+                );
+            }
+        }
+        let mut cbuf = vec![0u8; max_slots * value_dim * 3 * 4];
+        gpu.dtoh(&cblock, &mut cbuf).await.expect("dtoh conv");
+        let got_conv: Vec<f32> = cbuf
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        crate::testkit::assert_close(&got_conv, &host_conv, 1e-4, "decode_step_fused conv 终态");
+        let mut sbuf = vec![0u8; max_slots * nv * kd * vd * 4];
+        gpu.dtoh(&rblock, &mut sbuf).await.expect("dtoh rec");
+        let got_rec: Vec<f32> = sbuf
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        crate::testkit::assert_close(&got_rec, &host_rec, 1e-4, "decode_step_fused rec 终态");
+        gpu.close().await.expect("server 关机");
+        }
+    }
+
     async fn gpu_gating_g_matches_host() {
         if !gpu_enabled() {
             eprintln!("skip: OWL_TEST_DEVICE 未设");
@@ -1412,8 +1713,7 @@ mod tests {
         let (key_dim, value_dim) = (NK * HK_DIM, NV * HV_DIM);
         let conv_dim = 2 * key_dim + value_dim;
         let batch = slots.len();
-        let wqkv = &src["in_proj_qkv"];
-        let wz = &src["in_proj_z"];
+        let wqkvz = &src["in_proj_qkvz"];
         let wb = &src["in_proj_b"];
         let wa = &src["in_proj_a"];
         let wo = &src["out_proj"];
@@ -1428,8 +1728,9 @@ mod tests {
         for t in 0..batch {
             let slot = slots[t] as i32;
             let x = &xs[t * HIDDEN..(t + 1) * HIDDEN];
-            let qkv = lin(x, wqkv, conv_dim, HIDDEN);
-            let z = lin(x, wz, value_dim, HIDDEN);
+            let qkvz = lin(x, wqkvz, conv_dim + value_dim, HIDDEN);
+            let qkv = &qkvz[..conv_dim];
+            let z = &qkvz[conv_dim..];
             let b_v = lin(x, wb, NV, HIDDEN);
             let a_v = lin(x, wa, NV, HIDDEN);
             let segs = [&qkv[0..key_dim], &qkv[key_dim..2 * key_dim], &qkv[2 * key_dim..]];

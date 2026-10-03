@@ -32,7 +32,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use owl_iface::contract::{Bytes, DeviceClient, Dtype, GraphId, ModelError};
-use owl_models::interpreters::eval_ops;
+use owl_models::interpreters::{eval_ops, eval_ops_multi};
 use owl_models::ops::{Op, PlanNode};
 use owl_models::TensorOps;
 
@@ -118,6 +118,12 @@ impl PlanCtx {
             .cloned()
             .ok_or_else(|| ModelError::Msg(format!("step: 未声明输入槽 {name}")))
     }
+
+    /// 可选输入槽(刀D 取证面:探针槽缺省 = None,不违约)
+    pub fn input_opt(&self, name: &str) -> Result<Option<TensorOps>> {
+        Ok(self.inputs.get(name).cloned())
+    }
+
 
     /// 输出登记:该声明树即本步输出(解释器归约;块生命周期归会话)
     pub fn output(&self, name: &'static str, t: &TensorOps) -> Result<()> {
@@ -233,6 +239,18 @@ impl<D: DeviceClient> GraphPlan<D> {
         Ok(())
     }
 
+
+    /// 刀D 取证:输入槽原始字节回读(ts_buf 时间线;同步后调用)
+    pub async fn read_input_slot_bytes(&mut self, name: &str) -> Result<Vec<u8>> {
+        let slot = self
+            .inputs
+            .iter()
+            .find(|s| s.name == name)
+            .ok_or_else(|| ModelError::Msg(format!("read_input_slot: 无 {name}")))?;
+        let mut buf = vec![0u8; slot.len * 4];
+        self.face.dtoh(&slot.block, &mut buf).await?;
+        Ok(buf)
+    }
     /// 输出收割(读语义;块 = 最近一次 step/捕获的归约产物)
     pub async fn read_output_f32(&mut self, name: &str) -> Result<Vec<f32>> {
         let out = self
@@ -342,28 +360,30 @@ impl<D: DeviceClient> GraphPlan<D> {
             return Ok(fallback(&format!("face 无图能力: {e}")));
         }
 
-        // 捕获窗:launch 入图 / alloc 走 slab;输出块 id 捕获期即定
-        let mut blocks: Vec<(&'static str, Bytes, usize, Dtype)> = Vec::new();
+        // 捕获窗:launch 入图 / alloc 走 slab;输出块 id 捕获期即定。
+        // 刀1.6:**多根共享 memo 单次归约** —— 输出树共享模型子树(同
+        // 节点 id),逐根独立 eval 会把整模捕获 2+ 遍(图内 2.64× 整模
+        // 内核,回放税 ~2× 的历史包袱,2026-10-03 派发税立案定谳)。
+        let trees: Vec<&TensorOps> = outs.iter().map(|(_, t)| t).collect();
         let mut win_err: Option<ModelError> = None;
-        for (name, tree) in outs {
-            let want = self.out_specs[&name];
-            match eval_ops(tree.step(), &mut self.face).await {
-                Ok(b) if b.len == 0 || b.len == want => {
-                    let dtype = self.out_dt[&name];
-                    blocks.push((name, b, want, dtype))
-                }
-                Ok(b) => {
-                    win_err = Some(ModelError::Msg(format!(
-                        "capture: 输出 {name} 归约 {} 元素 ≠ 声明 {want}",
-                        b.len
-                    )));
-                    break;
-                }
-                Err(e) => {
-                    win_err = Some(e);
-                    break;
+        let mut blocks: Vec<(&'static str, Bytes, usize, Dtype)> = Vec::new();
+        match eval_ops_multi(&trees, &mut self.face).await {
+            Ok(results) => {
+                for ((name, _), b) in outs.iter().zip(results) {
+                    let want = self.out_specs[name];
+                    if b.len == 0 || b.len == want {
+                        let dtype = self.out_dt[name];
+                        blocks.push((name, b, want, dtype));
+                    } else {
+                        win_err = Some(ModelError::Msg(format!(
+                            "capture: 输出 {name} 归约 {} 元素 ≠ 声明 {want}",
+                            b.len
+                        )));
+                        break;
+                    }
                 }
             }
+            Err(e) => win_err = Some(e),
         }
         let gid = self.face.graph_end().await;
 

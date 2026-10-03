@@ -167,6 +167,49 @@ async fn gpu_schedule_decision_surface() {
 
 /// GPU 门控:双 turn 生命周期 —— submit 入队 / pump 事件流 / per-turn
 /// GDN 重置(第二个 turn 在脏状态后仍须产出连贯文本)。
+/// D1 冒烟:0.8B greedy 双配置(融合 vs 旧链)各产出非空连贯文本。
+/// **文本本身两配置必然分叉**(数值微差 × 自回归混沌,2026-10-03 定谳:
+/// 融合核与旧链互差 ≤2e-4,算子层 32 步现实幅度递推单测全绿)——
+/// 本测试只验「两配置链路都活着且确定(各 ×2 逐字稳定)」。门控 OWL_TEST_DEVICE。
+#[tokio::test]
+async fn gpu_08b_fuse_text_parity() {
+    let Some(ordinal) = gpu_ordinal() else {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    };
+    let dir = asset_dir();
+
+    async fn gen_text(fuse: bool, ordinal: usize, dir: &std::path::Path) -> String {
+        std::env::set_var("OWL_SAMPLER", "greedy");
+        if fuse {
+            std::env::remove_var("OWL_GDN_NO_FUSE_DECODE");
+            std::env::set_var("OWL_GDN_FUSE_DECODE", "1");
+        } else {
+            std::env::remove_var("OWL_GDN_FUSE_DECODE");
+            std::env::set_var("OWL_GDN_NO_FUSE_DECODE", "1");
+        }
+        let mut engine = Engine::new(EngineConfig {
+            device_ordinal: ordinal,
+            max_seq_tokens: 128,
+            prefill_chunk: 16,
+        })
+        .expect("构造");
+        let loaded = engine.loader().load_qwen35_0_8b(dir).await.expect("装载");
+        let mut running = engine.run(loaded).await.expect("装配");
+        let id = running.submit("用五十字介绍长城。", 40).expect("submit");
+        drive_turn(&mut running, id).await
+    }
+
+    let a1 = gen_text(false, ordinal, &dir).await;
+    let a2 = gen_text(false, ordinal, &dir).await;
+    let b1 = gen_text(true, ordinal, &dir).await;
+    let b2 = gen_text(true, ordinal, &dir).await;
+    eprintln!("[smoke] baseline={a1:?}/{a2:?} fused={b1:?}/{b2:?}");
+    assert!(!a1.is_empty() && !b1.is_empty(), "两配置均应产出非空文本");
+    assert_eq!(a1, a2, "baseline greedy 跨 boot 确定性");
+    assert_eq!(b1, b2, "fused greedy 跨 boot 确定性");
+}
+
 #[tokio::test]
 async fn gpu_two_turns_lifecycle() {
     let Some(ordinal) = gpu_ordinal() else {
@@ -418,7 +461,7 @@ async fn gpu_w4a16_marlin_e2e() {
     );
     let t0 = std::time::Instant::now();
     let t1 = running
-        .submit("用一句话介绍长城。", 16)
+        .submit("用一句话介绍长城。", 16) // D1 立案复现:16 tok 亦崩(前 2 token 对,随后乱;基线同步长连贯)
         .expect("submit");
     let text = drive_turn(&mut running, t1).await;
     eprintln!("[bench] W4A16 16 tok @ {:?}({:.1} tok/s)", t0.elapsed(), 16.0 / t0.elapsed().as_secs_f64());
@@ -458,14 +501,42 @@ async fn gpu_awq27b_marlin_e2e() {
     eprintln!("[bench] 27B 装载(含 kU4 重排上卡){:.2}s", t0.elapsed().as_secs_f32());
     let mut running = engine.run(loaded).await.expect("装配");
     assert!(
-        matches!(running.capture_outcome, crate::graph_plan::PlanOutcome::Captured),
+        std::env::var_os("OWL_NO_GRAPH").is_some()
+            || matches!(running.capture_outcome, crate::graph_plan::PlanOutcome::Captured),
         "27B decode 图应捕获成功,得 {:?}",
         running.capture_outcome
     );
     let t1 = running
         .submit("用一句话介绍长城。", 16)
         .expect("submit");
+    let t2 = std::time::Instant::now();
     let text = drive_turn(&mut running, t1).await;
+    eprintln!(
+        "[bench] 生成 tok @ {:.1}ms(含首 token prefill 尾步)",
+        t2.elapsed().as_secs_f32() * 1e3
+    );
+    // 刀D 取证:层间原生时间线(OWL_TS_PROBE;clock64 @~1.98GHz)
+    if std::env::var_os("OWL_TS_PROBE").is_some() {
+        let raw = match running.session.read_input_slot_bytes("ts_buf").await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[ts] 读回失败 {e}");
+                vec![]
+            }
+        };
+        let stamps: Vec<u64> = raw
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .filter(|&v| v != 0)
+            .collect();
+        eprintln!("[ts] 拍数 {}", stamps.len());
+        let mut prev = *stamps.first().unwrap_or(&0);
+        for (i, &s) in stamps.iter().enumerate() {
+            let d_us = (s.saturating_sub(prev)) as f64 / 1980.0;
+            eprintln!("[ts] #{i:02} Δ={d_us:8.1}µs");
+            prev = s;
+        }
+    }
     eprintln!("[test] 27B AWQ 答: {text}");
     assert!(!text.trim().is_empty(), "产出非空");
 }

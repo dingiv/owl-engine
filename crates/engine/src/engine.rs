@@ -153,6 +153,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
             let kv_len = sc.input("kv_len")?;
             let kv_slot = sc.input("kv_slot")?;
             let gdn_slot = sc.input("gdn_slot")?;
+            let ts_buf = sc.input_opt("ts_buf")?;
             let kvs_step: Vec<KvBuffers> = kv_caches
                 .iter()
                 .map(|(k, v)| KvBuffers {
@@ -175,6 +176,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
                 .collect();
             let mut ctx = ForwardCtx::model_decode(1, &pos, &kvs_step, &rp, &gdns_step);
             ctx.env = env; // 捕获期烘焙(图闭包 env 定格;回放沿用)
+            ctx.ts_buf = ts_buf; // 刀D 时间戳探针(None = 关)
             let tree = model.forward(&ids, &ctx);
             // E3 设备采样:token = argmax(logits)(f32 数值过线,契约 5)
             let tok = owl_models::ops::argmax_f32idx(&tree, vocab, 0);
@@ -185,13 +187,19 @@ impl<D: DeviceClient + 'static> Engine<D> {
         let (session, capture_outcome) = GraphPlan::plan(
             self.face,
             GraphPlanDesc {
-                inputs: vec![
-                    InputSlot::f32("frontier", 1),
-                    InputSlot::f32("pos", 1),
-                    InputSlot::f32("kv_len", 1),
-                    InputSlot::f32("kv_slot", 1),
-                    InputSlot::f32("gdn_slot", 1).init(vec![0.0]),
-                ],
+                inputs: {
+                    let mut v = vec![
+                        InputSlot::f32("frontier", 1),
+                        InputSlot::f32("pos", 1),
+                        InputSlot::f32("kv_len", 1),
+                        InputSlot::f32("kv_slot", 1),
+                        InputSlot::f32("gdn_slot", 1).init(vec![0.0]),
+                    ];
+                    if std::env::var_os("OWL_TS_PROBE").is_some() {
+                        v.push(InputSlot::f32("ts_buf", 4096));
+                    }
+                    v
+                },
                 outputs: vec![
                     OutputSlot { name: "logits", shape: vec![1, vocab], dtype: loaded.spec.dtype },
                     OutputSlot { name: "token", shape: vec![1], dtype: Dtype::F32 },

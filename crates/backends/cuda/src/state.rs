@@ -227,9 +227,12 @@ impl GpuCtx {
             ));
         }
         let mut exec: crate::ffi::sys::CUgraphExec = std::ptr::null_mut();
-        unsafe { crate::ffi::sys::cuGraphInstantiateWithFlags(&mut exec, cu_graph, 0u64) }
+        // 刀D:实例化旗标 A/B 门(UPLOAD=2 预热 / DEVICE_LAUNCH=4 设备侧
+        // 派发;派发税 10.8µs/节点 vs vLLM ~1.4 立案的根因排查面)
+        let flags: u64 = std::env::var("OWL_GRAPH_FLAGS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        unsafe { crate::ffi::sys::cuGraphInstantiateWithFlags(&mut exec, cu_graph, flags) }
             .result()
-            .map_err(|e| ModelError::Msg(format!("graph_end: 实例化(零旗标): {e:?}")))?;
+            .map_err(|e| ModelError::Msg(format!("graph_end: 实例化(flags={flags}): {e:?}")))?;
         // 节点数/类型观测(S1 launch 税立案:探针判 0.33µs/节点,引擎图
         // 实测 1.84µs/节点 —— 按类型分解找贵节点)
         if std::env::var_os("OWL_SRV_TIMING").is_some() {
@@ -243,14 +246,91 @@ impl GpuCtx {
                 crate::ffi::sys::cuGraphGetNodes(cu_graph, nodes.as_mut_ptr(), &mut got);
             }
             let mut kinds: std::collections::HashMap<i32, usize> = Default::default();
+            let mut alloc_sizes: std::collections::HashMap<usize, usize> = Default::default();
+            let mut cpy_sizes: std::collections::HashMap<(&str, usize), usize> = Default::default();
+            let mut kern_names: std::collections::HashMap<String, usize> = Default::default();
             for nd in &nodes[..got] {
                 let mut t: crate::ffi::sys::CUgraphNodeType = unsafe { std::mem::zeroed() };
                 unsafe {
                     crate::ffi::sys::cuGraphNodeGetType(*nd, &mut t);
                 }
                 *kinds.entry(t as i32).or_default() += 1;
+                // 刀1 取证:MEM_ALLOC 节点尺寸分布(派发税定位;真枚举:
+                // 0=EMPTY 1=KERNEL 2=MEMCPY 3=MEMSET 4=HOST 5=GRAPH
+                // 10=MEM_ALLOC 11=MEM_FREE)
+                if t as u32 == 0 {
+                    // 刀D:内核名清单(图材料单;派发税定位)
+                    let mut params: crate::ffi::sys::CUDA_KERNEL_NODE_PARAMS =
+                        unsafe { std::mem::zeroed() };
+                    let r = unsafe {
+                        crate::ffi::sys::cuGraphKernelNodeGetParams_v2(*nd, &mut params)
+                    };
+                    if r == crate::ffi::sys::CUresult::CUDA_SUCCESS {
+                        let mut name: *const std::ffi::c_char = std::ptr::null();
+                        let rn = unsafe {
+                            crate::ffi::sys::cuFuncGetName(&mut name, params.func)
+                        };
+                        if rn == crate::ffi::sys::CUresult::CUDA_SUCCESS {
+                            let cname = unsafe { std::ffi::CStr::from_ptr(name) };
+                            let sname = cname.to_string_lossy().to_string();
+                            *kern_names.entry(sname).or_default() += 1;
+                        }
+                    }
+                }
+                if t as u32 == 10 {
+                    let mut params: crate::ffi::sys::CUDA_MEM_ALLOC_NODE_PARAMS =
+                        unsafe { std::mem::zeroed() };
+                    let r = unsafe {
+                        crate::ffi::sys::cuGraphMemAllocNodeGetParams(*nd, &mut params)
+                    };
+                    if r == crate::ffi::sys::CUresult::CUDA_SUCCESS {
+                        *alloc_sizes.entry(params.bytesize).or_default() += 1;
+                    }
+                }
+                if t as u32 == 1 {
+                    let mut params: crate::ffi::sys::CUDA_MEMCPY_NODE_PARAMS =
+                        unsafe { std::mem::zeroed() };
+                    let r = unsafe {
+                        crate::ffi::sys::cuGraphMemcpyNodeGetParams(*nd, &mut params.copyParams)
+                    };
+                    if r == crate::ffi::sys::CUresult::CUDA_SUCCESS {
+                        // 3D 拷贝参数:宽度字节 = WidthInBytes;srcMemoryType/
+                        // dstMemoryType 1=host 2=device(判方向)
+                        let cp = &params.copyParams;
+                        let kind = match (cp.srcMemoryType as u32, cp.dstMemoryType as u32) {
+                            (1, 2) => "H2D",
+                            (2, 1) => "D2H",
+                            (2, 2) => "D2D",
+                            _ => "?",
+                        };
+                        *cpy_sizes
+                            .entry((kind, cp.WidthInBytes as usize))
+                            .or_default() += 1;
+                    }
+                }
             }
-            eprintln!("[gl-prof] 图节点 = {got}(类型 {kinds:?};0=kernel 1=memcpy 2=memset 3=host 4=graph 5=empty)");
+            eprintln!("[gl-prof] 图节点 = {got}(类型 {kinds:?};真枚举 0=EMPTY 1=KERNEL 2=MEMCPY 3=MEMSET 4=HOST 10=MEM_ALLOC 11=MEM_FREE)");
+            if !alloc_sizes.is_empty() {
+                let mut rows: Vec<_> = alloc_sizes.into_iter().collect();
+                rows.sort_by(|a, b| b.0.cmp(&a.0));
+                for (sz, n) in rows.iter().take(12) {
+                    eprintln!("[gl-prof]   MEM_ALLOC {sz}B × {n}");
+                }
+            }
+            if !kern_names.is_empty() {
+                let mut rows: Vec<_> = kern_names.into_iter().collect();
+                rows.sort_by(|a, b| b.1.cmp(&a.1));
+                for (name, n) in rows.iter().take(40) {
+                    eprintln!("[gl-prof]   K {name} × {n}");
+                }
+            }
+            if !cpy_sizes.is_empty() {
+                let mut rows: Vec<_> = cpy_sizes.into_iter().collect();
+                rows.sort_by(|a, b| b.0.cmp(&a.0));
+                for (sz, n) in rows.iter().take(12) {
+                    eprintln!("[gl-prof]   MEMCPY {:?} × {n}", sz);
+                }
+            }
         }
         let id = self.next_graph;
         self.next_graph += 1;
@@ -317,6 +397,9 @@ impl GpuCtx {
         // v1 paged 核 MISALIGNED_ADDRESS 定谳)。无对齐需求的 2B 哑块也
         // 不会破坏后续块基底。
         const CARVE_ALIGN: usize = 256;
+        if std::env::var_os("OWL_CAP_PROF").is_some() {
+            eprintln!("[cap-prof] carve {}B", n);
+        }
         let used = cap.used.div_ceil(CARVE_ALIGN) * CARVE_ALIGN;
         if used + n > CAPTURE_SLAB_BYTES {
             return Err(ModelError::Msg(format!(

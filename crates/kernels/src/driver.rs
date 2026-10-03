@@ -126,6 +126,7 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "gdn.l2norm" => gdn::l2norm(dt, ax(0)),
         "gdn.conv_upd" => gdn::conv_upd(dt),
         "gdn.delta_dec" => gdn::delta_dec(dt, ax(3), ax(0), ax(1), ax(2)), // aux = [batch, nv, kd, vd]
+        "gdn.decode_step" => gdn::decode_step(dt, ax(0), ax(1), ax(2), ax(3)), // aux = [batch, nv, kd, vd]
         "gdn.conv_fwd" => gdn::conv_fwd(dt, ax(0)),
         "gdn.recurrence_varlen_gqa" => gdn::recurrence_varlen_gqa(dt, ax(2), ax(0), ax(1)), // aux = [nv, kd, vd]
         "gdn.norm_act" => gdn::norm_act(dt, ax(0), ax(1), ax(2)), // aux = [rows, value_dim, group_size]
@@ -241,6 +242,22 @@ pub mod gdn {
                 block: (64, 1, 1),
                 smem: ((2 * kd + 2) * 4) as u32,
             },
+        }
+    }
+
+    /// decode_step:D1 整链融合(**仅 f16 变体**)。aux = [batch, nv, kd, vd];
+    /// grid = (batch·nv,1,1),block = (kd,1,1)(kd==vd 守卫),动态 smem = 0
+    /// (静态 warp_sums + q/k smem 在核内)。
+    pub fn decode_step(dt: DType, batch: usize, nv: usize, kd: usize, vd: usize) -> KernelPick {
+        assert!(
+            matches!(dt, DType::F16),
+            "owl_gdn_decode_step 仅有 f16 变体(dt={dt:?})"
+        );
+        assert_eq!(kd, vd, "decode_step 融合核要求 kd==vd(头方阵);得 {kd}/{vd}");
+        assert!(kd <= 128 && kd % 32 == 0, "decode_step 融合核要求 kd≤128 且 32 对齐,得 {kd}");
+        KernelPick {
+            name: "owl_gdn_decode_step_f16",
+            shape: Shape { grid: ((batch * nv) as u32, 1, 1), block: (kd as u32, 1, 1), smem: 0 },
         }
     }
 
