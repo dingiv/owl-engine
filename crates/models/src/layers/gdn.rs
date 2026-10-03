@@ -149,8 +149,10 @@ pub(crate) fn decode_step_fused(
     eps_l2: f32,
     eps_norm: f32,
     q_scale: f32,
+    v2: bool,
 ) -> TensorOps {
-    TensorOps::call(ids::GDN_DECODE_STEP)
+    let op = if v2 { ids::GDN_DECODE_STEP_V2 } else { ids::GDN_DECODE_STEP };
+    TensorOps::call(op)
     .aux(&[batch, nv, kd, vd])
     .arg(q_c)
     .arg(k_c)
@@ -684,8 +686,29 @@ impl GatedDeltaNet {
 
         // 投影(刀2:qkvz 列合并单投影 + b/a 独立)
         let qkvz = self.in_proj_qkvz.forward(xs, ctx); // [T, 2K+2V]
-        let b = self.in_proj_b.forward(xs, ctx); // [T, HV]
-        let a = self.in_proj_a.forward(xs, ctx); // [T, HV]
+        // 刀3a'(2026-10-04):b/a 双权 GEMV 单发(自研 owl_gemv_dual_f16,
+        // warp-per-row;杀 cublas gemvx + splitKreduce 各 ×48 = -96 节点
+        // + 免 splitK 核时间;decode 专用 f16 臂 —— f32 语义锚链保持
+        // Linear/cublas。输出 [T, 2·HV] 行堆叠,T=1 时列切 = 连续切片 →
+        // BlockSlice 免费视图(刀1))。
+        let (b, a) = if xs.dtype == Dtype::F16 {
+            let hidden_gdn = xs.shape().last().cloned().unwrap_or(0);
+            let ba = TensorOps::call(ids::ELEMS_GEMV_DUAL)
+                .arg(&self.in_proj_b.weight_decl()) // [HV, hidden] f16
+                .arg(&self.in_proj_a.weight_decl()) // [HV, hidden] f16
+                .arg(xs)                            // [T, hidden]
+                .arg_i32(self.nv as i32)            // rows_b
+                .arg_i32(self.nv as i32)            // rows_a
+                .arg_i32(hidden_gdn as i32)         // cols
+                .aux(&[self.nv, self.nv, hidden_gdn, tokens])
+                .with_shape(xs.dtype, vec![tokens, 2 * self.nv]);
+            (
+                narrow_strided(&ba, tokens, 2 * self.nv, 0, self.nv, vec![tokens, self.nv]),
+                narrow_strided(&ba, tokens, 2 * self.nv, self.nv, self.nv, vec![tokens, self.nv]),
+            )
+        } else {
+            (self.in_proj_b.forward(xs, ctx), self.in_proj_a.forward(xs, ctx))
+        };
 
         // qkvz 段切分(narrow;conv 权重不切 —— 段基址走 w_offset 标量;
         // q/k/v 段偏移与分立时代一致,z 段接在 conv_dim 之后)
@@ -700,8 +723,35 @@ impl GatedDeltaNet {
         // l2norm×2 + gating + sigmoid + delta + norm_act);q/k conv_upd 保留
         // (GVA 跨块同写 state 竞态,见核内头注)。层发射 17 → 11。
         let fused_decode = ctx.env.gdn.fused_decode;
-        let q_c = conv_upd(&q, &self.conv_w.decl(), &gdn.conv_q, &gdn.slots, tokens, key_dim, 0, true);
-        let k_c = conv_upd(&k, &self.conv_w.decl(), &gdn.conv_k, &gdn.slots, tokens, key_dim, key_dim, true);
+        // 刀3b(2026-10-04):q/k 双段 conv 单发(-48 节点/步;发射收敛);
+        // f32 语义锚链保持分立。输出 [T, 2K] 单块,q_c/k_c = 免费列切
+        // (T=1 连续 → BlockSlice;两段 state/权重独立,核内分段寻址)。
+        let (q_c, k_c) = if xs.dtype == Dtype::F16 {
+            let qc_kc = TensorOps::call(ids::GDN_CONV_UPD_DUAL)
+                .arg(&q)
+                .arg(&k)
+                .arg(&self.conv_w.decl()) // q 段行 [0, key_dim)(核从行 0 读)
+                // k 段行 [key_dim, 2·key_dim)= 同块偏移切片视图(outer=key_dim,
+                // src_dim==out_dim=4 → 连续 → BlockSlice,元素偏移 key_dim·4)
+                .arg(&narrow_strided(&self.conv_w.decl(), key_dim, 4, key_dim * 4, 4, vec![key_dim, 4]))
+                .arg(&gdn.conv_q)
+                .arg(&gdn.conv_k)
+                .arg(&gdn.slots)
+                .arg_i32(key_dim as i32)
+                .arg_i32(key_dim as i32)
+                .arg_i32(tokens as i32)
+                .arg_i32(1)
+                .with_shape(xs.dtype, vec![tokens, 2 * key_dim]);
+            (
+                narrow_strided(&qc_kc, tokens, 2 * key_dim, 0, key_dim, vec![tokens, key_dim]),
+                narrow_strided(&qc_kc, tokens, 2 * key_dim, key_dim, key_dim, vec![tokens, key_dim]),
+            )
+        } else {
+            (
+                conv_upd(&q, &self.conv_w.decl(), &gdn.conv_q, &gdn.slots, tokens, key_dim, 0, true),
+                conv_upd(&k, &self.conv_w.decl(), &gdn.conv_k, &gdn.slots, tokens, key_dim, key_dim, true),
+            )
+        };
         let gated = if fused_decode {
             let y = decode_step_fused(
                 &q_c,
@@ -725,6 +775,7 @@ impl GatedDeltaNet {
                 1e-6,
                 self.eps,
                 1.0 / (self.hk_dim as f32).sqrt(),
+                ctx.env.gdn.fused_decode_v2,
             );
             y.reshape(vec![tokens, value_dim])
         } else {
@@ -879,6 +930,11 @@ mod tests {
             eprintln!("skip: OWL_TEST_DEVICE 未设");
             return;
         }
+        decode_step_fused_case(false).await; // D1 v1(列并行 4B 装载)
+        decode_step_fused_case(true).await; // D1-v2(float4 行组合并装载;sglang 刺探产物)
+    }
+
+    async fn decode_step_fused_case(v2: bool) {
         use crate::contract::DeviceClient;
         let r16 = |x: f32| half::f16::from_f32(x).to_f32();
         let hbytes = |v: &[f32]| -> Vec<u8> {
@@ -1051,6 +1107,7 @@ mod tests {
                 &TensorOps::from_host(Dtype::F32, vec![batch], &f32b(slots)),
                 &TensorOps::from_host(Dtype::F16, vec![vd], &hbytes(&norm_w)),
                 batch, nv, nk, kd, vd, eps_l2, eps_norm, q_scale,
+                v2,
             );
             let got = harvest_f16(&mut gpu, &decl).await;
 

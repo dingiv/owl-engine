@@ -22,9 +22,13 @@ pub mod ids {
     pub const GDN_GATING: OpId = OpId("gdn.gating_g");
     pub const GDN_L2NORM: OpId = OpId("gdn.l2norm");
     pub const GDN_CONV_UPD: OpId = OpId("gdn.conv_upd");
+    /// 刀3b:q/k 双段 conv 槽更新单发(aux 无;标量 dq/dk/batch/silu 入参)
+    pub const GDN_CONV_UPD_DUAL: OpId = OpId("gdn.conv_upd_dual");
     pub const GDN_DELTA_DEC: OpId = OpId("gdn.delta_dec");
     /// D1:decode 整链融合(v-conv + l2norm×2 + gating + sigmoid + delta + norm_act)
     pub const GDN_DECODE_STEP: OpId = OpId("gdn.decode_step");
+    /// D1-v2:delta 相 float4 行组重写(同契约;sglang 刺探产物)
+    pub const GDN_DECODE_STEP_V2: OpId = OpId("gdn.decode_step_v2");
     pub const GDN_CONV_FWD: OpId = OpId("gdn.conv_fwd");
     pub const GDN_RECURRENCE: OpId = OpId("gdn.recurrence_varlen_gqa");
     pub const GDN_NORM_ACT: OpId = OpId("gdn.norm_act");
@@ -34,11 +38,18 @@ pub mod ids {
     pub const ATTN_K0_DUAL_FP8KV: OpId = OpId("attn.k0_dual_fp8kv");
     pub const CAST_F16_F32: OpId = OpId("elems.cast_f16_f32");
     pub const ATTN_PAGED_DECODE: OpId = OpId("attn.paged_decode");
+    /// v2 分页 decode 在线 softmax 主核(分块 PARTITION=512;aux =
+    /// [hd, hq, hkv, nb, nparts];输出 = 未归一化 partials [1,hq·nparts·hd])
+    pub const ATTN_PAGED_DECODE_V2: OpId = OpId("attn.paged_decode_v2");
+    /// v2 LSE 归并(exp_sums/max_logits/tmp_out → out;aux = [hd, hq, nparts])
+    pub const ATTN_PAGED_V2_REDUCE: OpId = OpId("attn.paged_v2_reduce");
     pub const ATTN_PAGED_PREFILL: OpId = OpId("attn.paged_prefill");
     pub const ATTN_PREFILL_SPLIT: OpId = OpId("attn.prefill_split");
     pub const ATTN_PREFILL_SPLIT_REDUCE: OpId = OpId("attn.prefill_split_reduce");
     pub const ATTN_NAIVE_DECODE: OpId = OpId("attn.naive_decode");
     pub const ATTN_GATE_MUL: OpId = OpId("attn.gate_mul");
+    /// 刀3a':双权 GEMV 单发(b/a 投影;aux = [rows_b, rows_a, cols, tokens])
+    pub const ELEMS_GEMV_DUAL: OpId = OpId("elems.gemv_dual");
     pub const OPS_NARROW: OpId = OpId("ops.narrow");
     pub const OPS_CONCAT: OpId = OpId("ops.concat");
     pub const OPS_ROPE: OpId = OpId("ops.rope");

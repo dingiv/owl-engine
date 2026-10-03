@@ -348,6 +348,43 @@ extern "C" __global__ void owl_gdn_conv_upd_f16(
     out[idx] = gdn16_from_float(sum);
 }
 
+// ---- 刀3b(2026-10-04,E-decode 冲 45):q/k 双段 conv 槽更新单发 ——
+// 替 owl_gdn_conv_upd_f16 ×2(q/k 各一; cublas 无涉,纯发射收敛 -48 节点/步)。
+// 两段各自独立 state/权重,逻辑平面 [batch, dq+dk];输出单块 [batch, dq+dk]
+// (SSA 单出;消费侧 T=1 时列切 = 连续 BlockSlice 免费视图)。契约同族:
+// 7 Block(x_q,x_k,w_q,w_k,state_q,state_k,slots)+ 4 i32(dq,dk,batch,silu)+ out。
+extern "C" __global__ void owl_gdn_conv_upd_dual_f16(
+    const __half *__restrict__ x_q,      // [batch, dq]
+    const __half *__restrict__ x_k,      // [batch, dk]
+    const __half *__restrict__ w_q,      // [dq, 4]
+    const __half *__restrict__ w_k,      // [dk, 4]
+    float *__restrict__ state_q,         // [max_slots, dq, 3]
+    float *__restrict__ state_k,         // [max_slots, dk, 3]
+    const float *__restrict__ slots,     // [batch](负 = padding)
+    const int dq, const int dk, const int batch, const int silu,
+    __half *__restrict__ out) {          // [batch, dq + dk](末参 = 输出)
+    unsigned long long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int seg = dq + dk;
+    if ((size_t)idx >= (size_t)batch * seg) return;
+    const size_t b = idx / seg;
+    const size_t i = idx % seg;
+    const int slot = (int)slots[b];
+    if (slot < 0) return;
+    const bool is_q = i < (size_t)dq;
+    const size_t ch = is_q ? i : i - dq;
+    const __half *x_ptr = (is_q ? x_q : x_k);
+    const __half *w_ptr = (is_q ? w_q : w_k) + ch * 4;
+    float *state_ptr = (is_q ? state_q : state_k) + ((size_t)slot * (is_q ? dq : dk) + ch) * 3;
+    const float x_t = gdn16_to_float(x_ptr[b * (is_q ? dq : dk) + ch]);
+    float sum = x_t * gdn16_to_float(w_ptr[3]);
+    for (int k = 0; k < 3; ++k) sum = __fmaf_rn(state_ptr[k], gdn16_to_float(w_ptr[k]), sum);
+    if (silu) sum /= (1.0f + __expf(-sum));
+    state_ptr[0] = state_ptr[1];
+    state_ptr[1] = state_ptr[2];
+    state_ptr[2] = x_t;
+    out[idx] = gdn16_from_float(sum);
+}
+
 // ---- gated delta rule decode f16(上游 decode_slots_gqa_kernel<T,BV,BK>
 // BK=128 档展开;g/beta half 入参(上游 float,适配 owl 块词汇);slots f32;
 // out 重排至末参(槽序契约 4));state 恒 f32;s_buf float 寄存器分片)----
@@ -475,9 +512,9 @@ extern "C" __global__ void owl_gdn_norm_act_f16(
                                       : (1.0f / (1.0f + __expf(-zv)));
         out_row[i] = gdn16_from_float(nx * actv);
     }
-    if (blockIdx.x == 0 && tid < 3)
-        printf("[N] g%u out=%f x=%f inv=%f\n", (unsigned)row_group,
-               gdn16_to_float(out_row[tid]), gdn16_to_float(x_row[tid]), inv);
+    // (2026-10-04 清撤:D1 取证期残留的无条件设备端 printf —— 每次
+    // norm_act 发射 3 行 trap+flush 串行化,基线测速含此税;核内调试
+    // 打印纪律:取证完必须撤,不留无门控残留)
 }
 
 // ============================================================================
@@ -815,6 +852,202 @@ extern "C" __global__ void owl_gdn_decode_step_f16(
     // 1~10 倍,状态写全对而文本乱码——「状态对而 y 错」定位于此)
     // 归约按实际 warp 数(blockDim 可为 32/64 —— warp_sums 高槽残留 l2norm
     // 的 k 行平方和,读满 8 槽即污染;教训:nwarps 数进公式,勿抄 8 槽常量)
+    float nsq = y_reg * y_reg;
+    for (int off = 16; off > 0; off >>= 1)
+        nsq += __shfl_down_sync(0xffffffffu, nsq, off);
+    const unsigned int nwarps = blockDim.x / 32;
+    if (lane_id == 0) warp_sums[warp_id] = nsq;
+    __syncthreads();
+    if (tid == 0) {
+        float ntotal = 0.0f;
+        for (unsigned int wI = 0; wI < nwarps; ++wI) ntotal += warp_sums[wI];
+        warp_sums[0] = ntotal;
+    }
+    __syncthreads();
+    const float ninv = rsqrtf(fmaxf(warp_sums[0] / (float)vd, 0.0f) + eps_norm);
+    const float zv = gdn16_to_float(z[b * value_dim + h * vd + tid]);
+    const float actv = zv / (1.0f + __expf(-zv));
+    out[(b * nv + h) * vd + tid] =
+        gdn16_from_float(y_reg * ninv * gdn16_to_float(norm_w[tid]) * actv);
+}
+
+// ============================================================================
+// D1-v2:decode 融合核 v2(2026-10-04 sglang 刺探产物;delta 相重写)
+// ----------------------------------------------------------------------------
+// v1 病灶(实测 28.4µs = 221 GB/s):状态列映射「线程 owning VD 列」,
+// 每线程 128 次串行 4B 装载(列步进 512B),装载发射率受限 → 延迟饥饿。
+// sglang Triton 同形核实测 7.5µs(844 GB/s)→ 3.8× 差距 × 48 层 = 1.0ms/步。
+//
+// v2 映射:warp w = 行组 {w, w+4, ..., w+124}(32 行),lane = float4 列组
+// (4 列;32 lane × 4 = vd)—— 装载 16B/lane 合并 512B/warp,装载指令数 /4;
+// 跨 warp 的 (kS)_c 部分和经 shared [4][vd] 归并(delta 需全行和,数学同
+// delta_dec:kv_mem = Σ_j S[j][c]·k[j] 列点积,decay 先行);y 同法归并。
+// v-conv / qk-l2norm / gating / norm_act 数学逐式镜像 v1(公式零改动)。
+// 契约与 v1 完全一致(13 Block + 5 sz + 3 f32 + out);smem ≈ 5KB 免 opt-in。
+// ----
+extern "C" __global__ void owl_gdn_decode_step_v2_f16(
+    const __half *__restrict__ q_c,
+    const __half *__restrict__ k_c,
+    const __half *__restrict__ v_raw,
+    const __half *__restrict__ z,
+    const __half *__restrict__ b_gate,
+    const __half *__restrict__ a_gate,
+    const __half *__restrict__ w,
+    float *__restrict__ conv_v_state,
+    const __half *__restrict__ a_log,
+    const __half *__restrict__ dt_bias,
+    float *__restrict__ rec_state,
+    const float *__restrict__ slots,
+    const __half *__restrict__ norm_w,
+    size_t batch, size_t nv, size_t nk, size_t kd, size_t vd,
+    float eps_l2, float eps_norm, float q_scale,
+    __half *__restrict__ out) {
+    const unsigned int d = (unsigned int)vd;
+    if (d != blockDim.x || kd != vd || d == 0 || d > 128 || (d & 3)) return;
+    const size_t bh = blockIdx.x;
+    const size_t b = bh / nv;
+    const size_t h = bh % nv;
+    const size_t kv_group = nv / nk;
+    const size_t kh = h / kv_group;
+    const int slot = (int)slots[b];
+    const bool valid = slot >= 0;
+    const unsigned int tid = threadIdx.x;
+    const size_t key_dim = kd * nk;
+    const size_t value_dim = vd * nv;
+    const size_t conv_dim = 2 * key_dim + value_dim;
+    const unsigned int warp_id = tid / 32;
+    const unsigned int lane_id = tid % 32;
+    const size_t c0 = (size_t)lane_id * 4;   // 本 lane 的 4 连列
+
+    __shared__ float warp_sums[8];
+    __shared__ float q_smem[128];
+    __shared__ float k_smem[128];
+    __shared__ float part[4][128];  // (kS)_c 跨 warp 部分和
+    __shared__ float v_smem[128];   // v-conv 产物(delta 相按列组读)
+
+    // ---- v 段 conv(线程 tid = 头内通道;与 v1 逐式同源)----
+    {
+        const size_t ch = h * vd + tid;
+        float vc = 0.0f;
+        if (valid) {
+            float *sp = conv_v_state + ((size_t)slot * value_dim + ch) * 3;
+            const float hist[3] = {sp[0], sp[1], sp[2]};
+            const __half *wp = w + (2 * key_dim + ch) * 4;
+            const float xt = gdn16_to_float(v_raw[b * value_dim + ch]);
+            float sum = xt * gdn16_to_float(wp[3]);
+            for (int k = 0; k < 3; ++k) sum = __fmaf_rn(hist[k], gdn16_to_float(wp[k]), sum);
+            sum /= (1.0f + __expf(-sum));
+            sp[0] = hist[1];
+            sp[1] = hist[2];
+            sp[2] = xt;
+            vc = sum;
+        }
+        v_smem[tid] = vc;
+    }
+
+    // ---- q/k l2norm(与 v1 同式;两行独立归约一趟 sync)----
+    const float qv = gdn16_to_float(q_c[b * key_dim + kh * kd + tid]);
+    const float kv_ = gdn16_to_float(k_c[b * key_dim + kh * kd + tid]);
+    float sum_q = qv * qv;
+    float sum_k = kv_ * kv_;
+    for (int off = 16; off > 0; off >>= 1) {
+        sum_q += __shfl_down_sync(0xffffffffu, sum_q, off);
+        sum_k += __shfl_down_sync(0xffffffffu, sum_k, off);
+    }
+    if (lane_id == 0) {
+        warp_sums[warp_id] = sum_q;
+        warp_sums[warp_id + 4] = sum_k;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float tq = 0.0f, tk = 0.0f;
+        for (unsigned int wI = 0; wI < blockDim.x / 32; ++wI) {
+            tq += warp_sums[wI];
+            tk += warp_sums[wI + 4];
+        }
+        warp_sums[0] = tq;
+        warp_sums[1] = tk;
+    }
+    __syncthreads();
+    const float inv_q = rsqrtf(fmaxf(warp_sums[0], 0.0f) + eps_l2);
+    const float inv_k = rsqrtf(fmaxf(warp_sums[1], 0.0f) + eps_l2);
+    q_smem[tid] = qv * inv_q;
+    k_smem[tid] = kv_ * inv_k;
+    __syncthreads();
+
+    // ---- gating g + beta(寄存器冗余;公式 = gating_g_f16)----
+    const size_t gi = b * nv + h;
+    const float gx = gdn16_to_float(a_gate[gi]) + gdn16_to_float(dt_bias[h]);
+    const float sp = (gx <= 20.0f) ? log1pf(expf(gx)) : gx;
+    const float decay = expf(-expf(gdn16_to_float(a_log[h])) * sp);
+    const float bv = gdn16_to_float(b_gate[gi]);
+    const float beta_h = 1.0f / (1.0f + __expf(-bv));
+
+    // ---- delta 相 v2:行组 warp × float4 列组 ----
+    float *state_head = valid ? rec_state + ((size_t)slot * nv + h) * kd * vd : nullptr;
+    float4 s_reg[32];
+    float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
+    if (valid) {
+        const float4 *sp4 = reinterpret_cast<const float4 *>(state_head + c0);
+#pragma unroll
+        for (int r = 0; r < 32; ++r) {
+            const size_t j = (size_t)(warp_id + r * 4);
+            float4 s = *(sp4 + (size_t)j * (vd >> 2));
+            s.x *= decay; s.y *= decay; s.z *= decay; s.w *= decay;
+            s_reg[r] = s;
+            const float kj = k_smem[j];
+            p0 = __fmaf_rn(s.x, kj, p0);
+            p1 = __fmaf_rn(s.y, kj, p1);
+            p2 = __fmaf_rn(s.z, kj, p2);
+            p3 = __fmaf_rn(s.w, kj, p3);
+        }
+    }
+    part[warp_id][c0 + 0] = p0;
+    part[warp_id][c0 + 1] = p1;
+    part[warp_id][c0 + 2] = p2;
+    part[warp_id][c0 + 3] = p3;
+    __syncthreads();
+    const float kv0 = part[0][c0 + 0] + part[1][c0 + 0] + part[2][c0 + 0] + part[3][c0 + 0];
+    const float kv1 = part[0][c0 + 1] + part[1][c0 + 1] + part[2][c0 + 1] + part[3][c0 + 1];
+    const float kv2 = part[0][c0 + 2] + part[1][c0 + 2] + part[2][c0 + 2] + part[3][c0 + 2];
+    const float kv3 = part[0][c0 + 3] + part[1][c0 + 3] + part[2][c0 + 3] + part[3][c0 + 3];
+    const float d0 = (v_smem[c0 + 0] - kv0) * beta_h;
+    const float d1 = (v_smem[c0 + 1] - kv1) * beta_h;
+    const float d2 = (v_smem[c0 + 2] - kv2) * beta_h;
+    const float d3 = (v_smem[c0 + 3] - kv3) * beta_h;
+
+    // 更新 + 写回 + y 累加(寄存器;行组内 y 部分和)
+    float y0 = 0.0f, y1 = 0.0f, y2 = 0.0f, y3 = 0.0f;
+    __shared__ float y_part[4][128];
+    if (valid) {
+        const float4 *sp4 = reinterpret_cast<const float4 *>(state_head + c0);
+        float4 *dp4 = reinterpret_cast<float4 *>(state_head + c0);
+#pragma unroll
+        for (int r = 0; r < 32; ++r) {
+            const size_t j = (size_t)(warp_id + r * 4);
+            const float kj = k_smem[j];
+            const float qj = q_smem[j] * q_scale;
+            float4 s = s_reg[r];
+            s.x = __fmaf_rn(kj, d0, s.x);
+            s.y = __fmaf_rn(kj, d1, s.y);
+            s.z = __fmaf_rn(kj, d2, s.z);
+            s.w = __fmaf_rn(kj, d3, s.w);
+            s_reg[r] = s;
+            y0 = __fmaf_rn(s.x, qj, y0);
+            y1 = __fmaf_rn(s.y, qj, y1);
+            y2 = __fmaf_rn(s.z, qj, y2);
+            y3 = __fmaf_rn(s.w, qj, y3);
+            *(dp4 + (size_t)j * (vd >> 2)) = s;
+        }
+    }
+    y_part[warp_id][c0 + 0] = valid ? y0 : 0.0f;
+    y_part[warp_id][c0 + 1] = valid ? y1 : 0.0f;
+    y_part[warp_id][c0 + 2] = valid ? y2 : 0.0f;
+    y_part[warp_id][c0 + 3] = valid ? y3 : 0.0f;
+    __syncthreads();
+
+    // ---- norm_act(列线程 c 读全和 y;归约/ninv/门控与 v1 同式)----
+    const float y_reg = y_part[0][tid] + y_part[1][tid] + y_part[2][tid] + y_part[3][tid];
     float nsq = y_reg * y_reg;
     for (int off = 16; off > 0; off >>= 1)
         nsq += __shfl_down_sync(0xffffffffu, nsq, off);

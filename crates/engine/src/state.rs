@@ -64,6 +64,7 @@ struct GdnBlocks {
 /// prefill 块构造所需维度账(run 期从 spec 提取;Copy 免 Clone 传播)
 #[derive(Clone, Copy)]
 pub(crate) struct ModelDims {
+    pub(crate) hq: usize,
     pub(crate) hkv: usize,
     pub(crate) hd: usize,
     pub(crate) nk: usize,
@@ -97,6 +98,9 @@ pub(crate) struct StatePool {
     snaps: Vec<GdnSnapSlot>,
     snap_tick: u64,
     bt: Bytes,
+    /// v2 分页 decode scratch(E-decode 2026-10-04;paged 时恒分配,
+    /// None = legacy/无页策略;引擎注入 ctx → 层走 v2 + LSE 归并)
+    pub(crate) attn_v2: Option<owl_models::module::AttnV2Scratch>,
     /// paged 池几何(页;legacy 模式 page = 容量,nb = 1)
     pub(crate) page: usize,
     pub(crate) nb: usize,
@@ -165,6 +169,23 @@ impl StatePool {
         } else {
             eval_ops(TensorOps::zeros(Dtype::F32, vec![1]).step(), face).await?
         };
+        // v2 decode scratch(E-decode):exp_sums/max_logits [1,hq,nparts]
+        // f32 + tmp_out [hq·nparts·hd] f16;nparts = ceil(nb·page/512)
+        // (PARTITION=512;boot 一次性持久块,不进竞技场收割面,图安全同 bt)
+        let attn_v2 = if paged {
+            let nparts = (nb * page + 511) / 512;
+            let es = zero_block_dt(face, dims.hq * nparts, Dtype::F32).await?;
+            let ml = zero_block_dt(face, dims.hq * nparts, Dtype::F32).await?;
+            let to = zero_block_dt(face, dims.hq * nparts * dims.hd, dims.dtype).await?;
+            Some(owl_models::module::AttnV2Scratch {
+                exp_sums: block_leaf(&es.0, vec![1, dims.hq * nparts]),
+                max_logits: block_leaf(&ml.0, vec![1, dims.hq * nparts]),
+                tmp_out: block_leaf_dt(&to.0, vec![dims.hq * nparts * dims.hd], dims.dtype),
+                nparts,
+            })
+        } else {
+            None
+        };
         let mut gdns: Vec<GdnBlocks> = Vec::new();
         for _ in 0..n_gdn {
             let conv_q = zero_block(face, gdn_slots() * dims.nk * dims.hk * 3).await?;
@@ -194,7 +215,12 @@ impl StatePool {
             gdns.len(),
             seq_tokens
         );
-        Ok(StatePool { kvs, k_fis, v_fis, fi_quant: fi, gdns, snaps, snap_tick: 0, bt, page, nb, paged, x, dims })
+        Ok(StatePool { kvs, k_fis, v_fis, fi_quant: fi, gdns, snaps, snap_tick: 0, bt, attn_v2, page, nb, paged, x, dims })
+    }
+
+    /// v2 scratch 叶子(None = legacy;引擎按步注入 ctx.attn_v2)
+    pub(crate) fn attn_v2_scratch(&self) -> Option<owl_models::module::AttnV2Scratch> {
+        self.attn_v2.clone()
     }
 
     /// KV 池形状(模式相关;与层分派同源策略)

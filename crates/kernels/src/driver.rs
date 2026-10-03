@@ -125,8 +125,10 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "gdn.gating_g" => gdn::gating_g(dt),
         "gdn.l2norm" => gdn::l2norm(dt, ax(0)),
         "gdn.conv_upd" => gdn::conv_upd(dt),
+        "gdn.conv_upd_dual" => gdn::conv_upd_dual(dt),
         "gdn.delta_dec" => gdn::delta_dec(dt, ax(3), ax(0), ax(1), ax(2)), // aux = [batch, nv, kd, vd]
         "gdn.decode_step" => gdn::decode_step(dt, ax(0), ax(1), ax(2), ax(3)), // aux = [batch, nv, kd, vd]
+        "gdn.decode_step_v2" => gdn::decode_step_v2(dt, ax(0), ax(1), ax(2), ax(3)),
         "gdn.conv_fwd" => gdn::conv_fwd(dt, ax(0)),
         "gdn.recurrence_varlen_gqa" => gdn::recurrence_varlen_gqa(dt, ax(2), ax(0), ax(1)), // aux = [nv, kd, vd]
         "gdn.norm_act" => gdn::norm_act(dt, ax(0), ax(1), ax(2)), // aux = [rows, value_dim, group_size]
@@ -135,6 +137,14 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "attn.k0_dual" => attn::k0_dual(ax(0)),
         "attn.k0_dual_fp8kv" => attn::k0_dual_fp8kv(ax(0)),
         "attn.paged_decode" => attn::paged_decode_v1(req.env, dt, ax(0), ax(1), ax(2), ax(3)), // aux = [hd, hq, hkv, nb]
+        "attn.paged_decode_v2" => {
+            // aux = [hd, hq, hkv, nb, nparts];页配对律同 v1(谓词单源)
+            attn::paged_decode_v2(req.env, dt, ax(0), ax(1), ax(2), ax(3), ax(4))
+        }
+        "attn.paged_v2_reduce" => {
+            // aux = [hd, hq, nparts]
+            attn::paged_v2_reduce(dt, ax(0), ax(1), ax(2))
+        }
         "attn.paged_prefill" => attn::paged_prefill(req.env, dt, ax(0), ax(1), ax(2), ax(3)), // aux = [hd, hkv, hq, tokens]
         "attn.prefill_split" => {
             // aux = [hd, hkv, hq, tokens, nparts](ctx_base 走核参数槽,层侧传入)
@@ -147,6 +157,10 @@ pub fn resolve(req: OpReq) -> KernelPick {
         }
         "attn.naive_decode" => attn::naive_decode(dt),
         "attn.gate_mul" => attn::gate_mul(dt),
+        "elems.gemv_dual" => {
+            // aux = [rows_b, rows_a, cols, tokens]
+            elems::gemv_dual(dt, ax(0), ax(1), ax(2), ax(3))
+        }
         "ops.narrow" => elems::narrow(dt),
         "elems.cast_f16_f32" => elems::cast_f16_f32(dt),
         "ops.concat" => elems::concat(dt),
@@ -227,6 +241,13 @@ pub mod gdn {
         }, shape: SENTINEL_1D }
     }
 
+    /// 刀3b(2026-10-04):q/k 双段 conv 槽更新单发(哨兵 1D,平面 =
+    /// batch·(dq+dk);输出单块 [batch, dq+dk],消费侧列切 = 免费视图)
+    pub fn conv_upd_dual(dt: DType) -> KernelPick {
+        assert!(matches!(dt, DType::F16), "conv_upd_dual 仅有 f16 变体");
+        KernelPick { name: "owl_gdn_conv_upd_dual_f16", shape: SENTINEL_1D }
+    }
+
     /// delta_dec:单步递推(批 4)。shared 契约 = `(2·kd + 2)·4B`(kd 项
     /// 进公式 —— 曾硬编码 128,非 128 kd 即静默越界;收编后公式单源)。
     /// grid = (ceil(vd/64), batch·nv, 1),block (64,1,1)。
@@ -258,6 +279,22 @@ pub mod gdn {
         KernelPick {
             name: "owl_gdn_decode_step_f16",
             shape: Shape { grid: ((batch * nv) as u32, 1, 1), block: (kd as u32, 1, 1), smem: 0 },
+        }
+    }
+
+    /// D1-v2(2026-10-04 sglang 刺探):delta 相 float4 行组重写(同契约;
+    /// 4 warp = 4 行组 × lane float4 列组,跨 warp 部分和经 shared 归并;
+    /// sglang 同形实测 7.5µs = 844 GB/s,owl v1 28.4µs → 靶 ≤10µs)
+    pub fn decode_step_v2(dt: DType, batch: usize, nv: usize, kd: usize, vd: usize) -> KernelPick {
+        assert!(
+            matches!(dt, DType::F16),
+            "owl_gdn_decode_step_v2 仅有 f16 变体(dt={dt:?})"
+        );
+        assert_eq!(kd, vd, "decode_step v2 要求 kd==vd(头方阵);得 {kd}/{vd}");
+        assert!(kd <= 128 && kd % 32 == 0 && vd % 4 == 0, "decode_step v2 要求 kd≤128 32 对齐且 vd/4,得 {kd}/{vd}");
+        KernelPick {
+            name: "owl_gdn_decode_step_v2_f16",
+            shape: Shape { grid: ((batch * nv) as u32, 1, 1), block: (vd as u32, 1, 1), smem: 0 },
         }
     }
 
@@ -401,6 +438,64 @@ pub mod attn {
                 grid: (hq as u32, 1, 1),
                 block: (128, 1, 1),
                 smem: ((nb * page * 4) as u32).max(floor),
+            },
+        }
+    }
+
+    /// v2 分页打分(在线 softmax 分块;E-decode 长 ctx 衰减主修
+    /// 2026-10-04)。PARTITION=512:每 CTA ≤512 token,logits smem 恒
+    /// 2KB(与 out_smem 复用同块,公式 = max(512·4B, floor));grid
+    /// (hq, 1, nparts) z = nparts = ceil(nb·page/512)(核从 gridDim.z 读
+    /// max_num_partitions;设备侧 seq_len 守卫早退,图安全)。页配对律
+    /// 同 v1 单源(bs32 wrapper = <hd,32,128,512>)。输出 = 未归一化
+    /// partials,归并交 reduce(两发;ctx ≤512 时归并退化为直拷)。
+    pub fn paged_decode_v2(
+        env: &OpEnv,
+        dt: DType,
+        hd: usize,
+        hq: usize,
+        _hkv: usize,
+        _nb: usize,
+        nparts: usize,
+    ) -> KernelPick {
+        assert!(matches!(dt, DType::F16), "paged v2 仅有 f16 变体(dt={dt:?})");
+        let page = env.page;
+        let name = match (hd, page) {
+            (128, 32) => "vllm_paged_attention_v2_f16_hd128bs32",
+            (256, 32) => "vllm_paged_attention_v2_f16_hd256bs32",
+            (128, 16) => "vllm_paged_attention_v2_f16_hd128",
+            (256, 16) => "vllm_paged_attention_v2_f16_hd256",
+            other => panic!(
+                "paged v2: (hd,page) {other:?} 无配对 wrapper(谓词 paged_decode_ok 应已拦截)"
+            ),
+        };
+        let floor = (128u32 / 32 / 2) * hd as u32 * 4; // (NUM_WARPS/2)·HD·4B
+        KernelPick {
+            name,
+            shape: Shape {
+                grid: (hq as u32, 1, nparts as u32),
+                block: (128, 1, 1),
+                smem: 2048u32.max(floor), // PARTITION_SIZE·4B vs out_smem floor
+            },
+        }
+    }
+
+    /// v2 LSE 归并(模板无 BLOCK/页参数 —— 单 wrapper 通用两页;reduce
+    /// smem = 2·nparts·4B(shared_max_logits + shared_exp_sums);
+    /// grid (hq,1,1),block 128;ctx ≤512 时核内退化为 tmp_out 直拷)。
+    pub fn paged_v2_reduce(dt: DType, hd: usize, hq: usize, nparts: usize) -> KernelPick {
+        assert!(matches!(dt, DType::F16), "paged v2 reduce 仅有 f16 变体");
+        let name = match hd {
+            128 => "vllm_paged_attention_v2_reduce_f16_hd128",
+            256 => "vllm_paged_attention_v2_reduce_f16_hd256",
+            other => panic!("paged v2 reduce 仅 hd∈{{128,256}},得 {other}"),
+        };
+        KernelPick {
+            name,
+            shape: Shape {
+                grid: (hq as u32, 1, 1),
+                block: (128, 1, 1),
+                smem: (2 * nparts * 4) as u32,
             },
         }
     }
@@ -624,6 +719,22 @@ pub mod elems {
     /// 跨步窄切视图(q/gate 切分等;哨兵 1D)
     pub fn narrow(dt: DType) -> KernelPick {
         KernelPick { name: dt_name("narrow", dt), shape: SENTINEL_1D }
+    }
+
+    /// 刀3a'(2026-10-04):双权 GEMV 单发(b/a 投影;warp-per-row,
+    /// half2 主路 + fp32 累加;decode m=1 专用)。grid (ceil(rows/4), m)
+    /// × block 128(4 warp/块 = 4 行/块)。
+    pub fn gemv_dual(dt: DType, rows_b: usize, rows_a: usize, _cols: usize, tokens: usize) -> KernelPick {
+        assert!(matches!(dt, DType::F16), "gemv_dual 仅有 f16 变体");
+        let rows = (rows_b + rows_a) as u32;
+        KernelPick {
+            name: "owl_gemv_dual_f16",
+            shape: Shape {
+                grid: (rows.div_ceil(4), tokens as u32, 1),
+                block: (128, 1, 1),
+                smem: 0,
+            },
+        }
     }
 
     /// 行栈 concat(arity ≤ 8;哨兵 1D)

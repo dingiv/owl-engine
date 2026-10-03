@@ -18,6 +18,8 @@ pub const OPS_F16: &str = include_str!("../cu/ops_pair.cu");
 /// owl 移植位(工单 N;NInfer 等外部引擎核的 owl 契约改写)
 pub mod owl {
     pub const SIGMOID_GATE_MUL_F16: &str = include_str!("../cu/owl/sigmoid_gate_mul_f16.cu");
+    /// 刀3a'(2026-10-04):双权 GEMV 单发(b/a 投影;杀 cublas gemvx+splitK)
+    pub const GEMV_DUAL_F16: &str = include_str!("../cu/owl/gemv_dual_f16.cu");
     /// 设备侧贪心采样(E3;REQ-DEC-04)
     pub const ARGMAX_F16: &str = include_str!("../cu/owl/argmax_f16.cu");
     // ---- 融合核族(C1;2026-10-01;Ampere-first 准则见 .cu 头注)----

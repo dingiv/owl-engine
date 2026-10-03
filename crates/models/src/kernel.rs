@@ -128,11 +128,15 @@ pub static REGISTRY: &[Entry] = &[
     Entry { name: "owl_gdn_gating_g_f16", source: text::GDN_F32, args: "T,T,T,sz,sz,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_gdn_l2norm_f16", source: text::GDN_F32, args: "T,sz,sz,f32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_gdn_conv_upd_f16", source: text::GDN_F32, args: "T,T,T,T,sz,sz,sz,i32,T", dtype: crate::contract::Dtype::F16 },
+    // 刀3b(2026-10-04):q/k 双段 conv 单发(发射收敛;输出 [batch, dq+dk] 单块)
+    Entry { name: "owl_gdn_conv_upd_dual_f16", source: text::GDN_F32, args: "T,T,T,T,T,T,T,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_gdn_delta_dec_f16", source: text::GDN_F32, args: "T,T,T,T,T,T,T,sz,sz,sz,sz,sz,f32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_gdn_norm_act_f16", source: text::GDN_F32, args: "T,T,T,sz,sz,sz,f32,i32,T", dtype: crate::contract::Dtype::F16 },
     // D1:decode 整链融合(v-conv + l2norm×2 + gating + sigmoid + delta + norm_act;
     // 输出末参)
     Entry { name: "owl_gdn_decode_step_f16", source: text::GDN_F32, args: "T,T,T,T,T,T,T,T,T,T,T,T,T,sz,sz,sz,sz,sz,f32,f32,f32,T", dtype: crate::contract::Dtype::F16 },
+    // D1-v2(2026-10-04 sglang 刺探):delta 相 float4 行组重写(同契约)
+    Entry { name: "owl_gdn_decode_step_v2_f16", source: text::GDN_F32, args: "T,T,T,T,T,T,T,T,T,T,T,T,T,sz,sz,sz,sz,sz,f32,f32,f32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_naive_decode_attn_f16", source: text::ATTENTION_F32, args: "T,T,T,T,T,T,T,sz,sz,sz,sz,T", dtype: crate::contract::Dtype::F16 },
     // ---- attention port 家族(K0;vendor attention.rs rev c0f19f2,Apache-2.0;
     //      vLLM classic 布局,K1/K2 paged_attention 同款;适配认领见 .cu 头注)----
@@ -173,6 +177,8 @@ pub static REGISTRY: &[Entry] = &[
     Entry { name: "owl_gdn_recurrence_varlen_gqa_f16", source: text::GDN_F32, args: "T,T,T,T,T,T,T,T,sz,sz,sz,sz,sz,f32,T", dtype: crate::contract::Dtype::F16 },
     // ---- owl 移植位(工单 N;NInfer sigmoid_gate_mul,attention 门融合)----
     Entry { name: "owl_sigmoid_gate_mul_f16", source: sources::owl::SIGMOID_GATE_MUL_F16, args: "T,T,sz,T", dtype: crate::contract::Dtype::F16 },
+    // 刀3a'(2026-10-04):双权 GEMV(b/a 投影单发;grid (ceil(rows/4), m))
+    Entry { name: "owl_gemv_dual_f16", source: sources::owl::GEMV_DUAL_F16, args: "T,T,T,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     // ---- 融合核族(C1;2026-10-01;Ampere-first,单输出 SSA 契约友好)----
     // norm_rope:qk-norm(×(1+w)^{w_off})+ rotate-half partial rope 三发合一
     // (narrow+norm+rope;strided 读 q_raw 的 per-head [value|gate] 半段)

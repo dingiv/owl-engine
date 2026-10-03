@@ -778,8 +778,8 @@ impl GpuServer {
                 Err(e) => return ack.send(Err(e)),
             };
         }
-        // 槽序解析:7 Block + 7 sz
-        let (blocks, scalars) = match Self::parse_foreign_slots(&msg, 7, 6) {
+        // 槽序解析:7 Block + 7 sz(q/k/v/g/beta/state/out + T/slot/ns/hv/nk/kd/scale_bits)
+        let (blocks, scalars) = match Self::parse_foreign_slots(&msg, 7, 7) {
             Ok(v) => v,
             Err(e) => return ack.send(Err(e)),
         };

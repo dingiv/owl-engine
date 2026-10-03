@@ -154,6 +154,7 @@ impl Model {
             env: ctx.env,
             gdn_slot_host: ctx.gdn_slot_host,
             ts_buf: ctx.ts_buf.clone(),
+            attn_v2: ctx.attn_v2.clone(),
         }
     }
 

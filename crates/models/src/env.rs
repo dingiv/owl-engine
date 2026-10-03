@@ -109,6 +109,10 @@ pub struct GdnEnv {
     /// 取证方法论(状态格画像层扫 + logits dump)OWL_GDN_DUMP/OWL_DEBUG);
     /// OWL_GDN_NO_FUSE_DECODE 反开关退出
     pub fused_decode: bool,
+    /// D1-v2:delta 相 float4 行组重写(2026-10-04 sglang 刺探;同契约同
+    /// 数学,状态装载 16B/lane 合并;实测靶 ≤10µs vs v1 28.4µs。opt-in
+    /// 验证后翻默认)
+    pub fused_decode_v2: bool,
 }
 
 /// 解释器执行环境完备描述(默认 = 生产基线 + 无硬件环境)
@@ -147,7 +151,9 @@ impl EnvProvider {
         let has = |k: &str| std::env::var_os(k).is_some();
         Self {
             attn: AttnEnv {
-                qkv_fuse: has("OWL_QKV_FUSE"),
+                // W2 qkv 融合:**生产默认开**(2026-10-04;k-probe 硬门 +
+                // 27B e2e 逐字一致后与 D1 同律翻默认;反开关退出)
+                qkv_fuse: !has("OWL_QKV_NO_FUSE"),
                 prefill_split: has("OWL_PREFILL_SPLIT"),
                 force_naive_prefill: has("OWL_FORCE_NAIVE"),
                 fi: has("OWL_FLASHINFER"),
@@ -156,6 +162,9 @@ impl EnvProvider {
                 chunked: has("OWL_GDN_CHUNKED"),
                 scalar: has("OWL_GDN_SCALAR"),
                 fused_decode: !has("OWL_GDN_NO_FUSE_DECODE"), // D1 默认开;反开关退出
+                // D1-v2 默认开(2026-10-04 深夜:金标 + 27B 金标逐字一致 +
+                // 步时 23.8→23.3ms 三重验证后翻;反开关退出)
+                fused_decode_v2: !has("OWL_GDN_NO_FUSE_DECODE_V2"),
             },
             kv: KvEnv { quant: if has("OWL_KV_FP8") { KvQuant::Fp8E4M3 } else { KvQuant::None }, ..KvEnv::default() },
             diag: DiagEnv {

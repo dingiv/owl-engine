@@ -89,10 +89,10 @@ impl<D: DeviceClient + 'static> Engine<D> {
     pub async fn run(mut self, loaded: LoadedModel) -> Result<RunningEngine<D>> {
         let t_run = std::time::Instant::now();
         let s = self.cfg.max_seq_tokens;
-        let (_, hkv, hd) = loaded.spec.full_heads;
+        let (hq, hkv, hd) = loaded.spec.full_heads;
         let (nk, hk, nv, hv) = loaded.spec.gdn_heads;
         let dims = ModelDims {
-            hkv, hd, nk, hk, nv, hv,
+            hq, hkv, hd, nk, hk, nv, hv,
             hidden: loaded.spec.hidden, dtype: loaded.spec.dtype,
         };
 
@@ -147,6 +147,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
         let kv_caches = pool.kv_caches();
         let gdn_caches = pool.gdn_caches();
         let bt_leaf = pool.bt_leaf();
+        let attn_v2 = pool.attn_v2_scratch();
         let forward = move |sc: &PlanCtx| -> Result<()> {
             let ids = sc.input("frontier")?;
             let pos = sc.input("pos")?;
@@ -177,6 +178,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
             let mut ctx = ForwardCtx::model_decode(1, &pos, &kvs_step, &rp, &gdns_step);
             ctx.env = env; // 捕获期烘焙(图闭包 env 定格;回放沿用)
             ctx.ts_buf = ts_buf; // 刀D 时间戳探针(None = 关)
+            ctx.attn_v2 = attn_v2.clone(); // v2 分页 decode scratch(None = v1)
             let tree = model.forward(&ids, &ctx);
             // E3 设备采样:token = argmax(logits)(f32 数值过线,契约 5)
             let tok = owl_models::ops::argmax_f32idx(&tree, vocab, 0);

@@ -347,6 +347,13 @@ impl TensorOps {
                 detail: format!("reshape: 元素数不符 {have}({:?}) → {want}({:?})", self.shape, shape),
             });
         }
+        // 刀3b 修正(2026-10-04):SliceView 父的重解释 = 声明期合成的新
+        // SliceView(offset 保留,形状换新)—— 若走 Op::Reshape 透传节点,
+        // eval 侧父匹配非 SliceView → Arg::Block **丢偏移**(消费核读到块首
+        // 而非切片;C1 账长断言仅 debug 构建可见,release 静默错值)。
+        if let Op::SliceView { .. } = &self.op {
+            return self.slice_view(0, shape);
+        }
         self.join(Op::Reshape, None, (self.dtype, shape), vec![])
     }
 

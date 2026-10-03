@@ -94,8 +94,10 @@ impl Attention {
         // per-head [value|gate] 切分(C1):value 半段由 norm_rope strided
         // 直取(q 链 narrow+norm+rope 三发合一);gate 段仍 narrow(W2)
         let dt_raw = q_raw.dtype;
-        // C1-W2 融合分派(默认关,挂案:27B 真权重域 k 值偏差立案中):
-        // OWL_QKV_FUSE=1 → qkv_norm_rope_insert 单发(norm+rope+KV 插入)
+        // C1-W2 融合分派(**生产默认开**;2026-10-04 翻默认:k-probe 硬门
+        // 三级验证全绿 + 27B e2e 逐字一致后与 D1 同律;OWL_QKV_NO_FUSE
+        // 反开关退出)→ qkv_norm_rope_insert 单发(norm+rope+KV 插入,
+        // 替 norm_rope×2 + K0 三发)
         let pol = crate::module::kv_paged_policy(dt_raw);
         let page_ok = pol.as_ref()
             .map(|p| driver::attn::paged_decode_ok(self.hd, p.page))
@@ -127,7 +129,11 @@ impl Attention {
                 .arg_i32(1)                                 // w_off = ×(1+w)
                 .aux(&[tokens, self.hq, self.hkv, self.hd, rope.rotary_half()])
                 .with_shape(Dtype::F16, vec![tokens, self.hq * self.hd]);
-            // 融合分派:v1 免 K0(cache 已由融合核写;树序:q 为 v1 父)
+            // 融合分派:v2 优先( scratch 在场 → 在线 softmax 分块 + LSE
+            // 归并,wr = q 同款哑槽)否则 v1;均免 K0(cache 已由融合核写)
+            if ctx.attn_v2.is_some() {
+                return self.paged_decode_v2_k0(&q, &gate, &q, kv, tokens, ctx, pol.as_ref().unwrap());
+            }
             return self.paged_decode_v1(&q, &gate, kv, tokens, ctx, pol.as_ref().unwrap());
         }
         let (q, gate, k) = if dt_raw == Dtype::F16 {
@@ -202,6 +208,12 @@ impl Attention {
                 .arg_i32(pol.page as i32)
                 .arg_i32(pol.x as i32)
                 .with_shape(dt, vec![1]);
+                // v2 分派(E-decode 长 ctx 衰减主修 2026-10-04):scratch
+                // 在场 → 在线 softmax 分块(v2)+ LSE 归并;None = v1 既有
+                // (存量测试/无 scratch 构造点零迁移;页配对律同源 driver)
+                if ctx.attn_v2.is_some() {
+                    return self.paged_decode_v2_k0(&q, &gate, &wr, kv, tokens, ctx, &pol);
+                }
                 return self.paged_decode_v1_k0(&q, &gate, &wr, kv, tokens, ctx, &pol);
             }
         }
@@ -237,6 +249,9 @@ impl Attention {
     }
 
     /// v1 分页打分(融合核变体;KV 写入已由融合核完成)。
+    /// 注:W2 融合分派现走 v1(v2 接线后未同步;OWL_QKV_FUSE 为 opt-in
+    /// 默认关,长 ctx 场景勿与 QKV_FUSE 同开 —— 归并平化不生效,待后续
+    /// 统一分派)。
     fn paged_decode_v1(
         &self,
         q: &TensorOps,
@@ -297,6 +312,71 @@ impl Attention {
     }
 
 
+
+    /// v2 分页打分(K0 形态;在线 softmax 分块 PARTITION=512 + LSE 归并;
+    /// 长 ctx 平坦化 —— v1 串行块遍历在 8k = 256 块线性扫,实测 decode
+    /// 512→8192 衰 40→29 t/s 而 vLLM 平坦,2026-10-04 立案)。scratch
+    /// 三件套 = ctx.attn_v2(引擎捕获前持久块,指针烘焙图安全;None 走
+    /// v1)。exp_sums/max_logits 为 arg 兼写目标(K0 持久块副作用律同款);
+    /// 主核输出 = 未归一化 partials [1, hq·nparts·hd],归并出最终 y。
+    fn paged_decode_v2_k0(
+        &self,
+        q: &TensorOps,
+        gate: &TensorOps,
+        wr: &TensorOps,
+        kv: &KvBuffers,
+        tokens: usize,
+        ctx: &ForwardCtx,
+        pol: &crate::module::KvPagedPolicy,
+    ) -> TensorOps {
+        let s2 = ctx.attn_v2.as_ref().expect(
+            "paged v2: ctx.attn_v2 scratch 缺失(引擎应预分配注入;层分派已判 is_some)",
+        );
+        let dt = q.dtype;
+        let page = pol.page as i32;
+        let scale = 1.0 / (self.hd as f32).sqrt();
+        let nb = kv.block_tables.shape().last().cloned().unwrap_or(1);
+        let nparts = s2.nparts;
+        // 主核:partials 写节点输出(布局 [head][partition][dim]);
+        // 未激活 partition 早退不写,归并按设备侧 ctx 限界不读垃圾槽
+        let partial = TensorOps::call(ids::ATTN_PAGED_DECODE_V2)
+            .aux(&[self.hd, self.hq, self.hkv, nb as usize, nparts])
+            .arg(q)
+            .arg(&kv.k_cache)
+            .arg(&kv.v_cache)
+            .arg(&kv.block_tables)
+            .arg(&kv.kv_lens) // context_lens(设备侧动态;图安全守卫在核内)
+            .arg(wr) // alibi 槽 = 写核输出块(树序依赖边;旗标 0 不解引用)
+            .arg(&s2.exp_sums)
+            .arg(&s2.max_logits)
+            .arg_i32(self.hkv as i32)
+            .arg_f32(scale)
+            .arg_i32(nb as i32)
+            .arg_i32(self.hq as i32 * self.hd as i32) // q_stride
+            .arg_i32(self.hkv as i32 * self.hd as i32 * page) // kv_block_stride
+            .arg_i32(self.hd as i32 * page) // kv_head_stride
+            .arg_f32(1.0) // softscapping 直通
+            .arg_i32(-1) // sliding_window 关
+            .arg_i32(0) // use_alibi 关
+            .with_shape(dt, vec![self.hq * nparts * self.hd]);
+        // LSE 归并 → 最终 y([tokens, hq·hd];ctx ≤512 时核内退化直拷)
+        let y = TensorOps::call(ids::ATTN_PAGED_V2_REDUCE)
+            .aux(&[self.hd, self.hq, nparts])
+            .arg(&s2.exp_sums)
+            .arg(&s2.max_logits)
+            .arg(&partial)
+            .arg(&kv.kv_lens)
+            .arg_i32(nparts as i32)
+            .with_shape(dt, vec![tokens, self.hq * self.hd]);
+        // ③ 输出门(f16 融合单发)+ 出投影(与 v1 同尾)
+        let n = tokens * self.hq * self.hd;
+        let y = TensorOps::call(ids::ATTN_GATE_MUL)
+            .arg(gate)
+            .arg(&y)
+            .arg_usize(n)
+            .with_shape(dt, vec![tokens, self.hq * self.hd]);
+        self.o_proj.forward(&y, ctx)
+    }
 
     /// paged prefill(PF1 终;F16 hd∈{128,256}):K0 批量写池(T 行散写)
     /// + chunked prefill 批核(bs16 特化;因果语义 = 查询 token t 看
@@ -959,22 +1039,40 @@ mod f16_tests {
         // wrapper bs32 由 v1_name 页配对律裁决。
         // (2026-10-02 W2 融合核 k 支转置案结案:allow_red 立案拐杖撤除,
         // 全档硬门;融合核写池金标另见 gpu_w2_fused_kprobe)
-        v1_isolation_case_inner(128, 2, 1, 8, 2, false).await;
-        v1_isolation_case_inner(256, 2, 1, 8, 2, false).await;
-        v1_isolation_case_inner(256, 8, 4, 8, 2, false).await; // GQA 单块
-        v1_isolation_case_inner(256, 2, 1, 64, 2, false).await; // 跨 2 块(行 32 = 页边界首槽)
-        v1_isolation_case_inner(256, 8, 4, 64, 2, false).await; // engine 全参档(GQA + 跨页)
+        v1_isolation_case_inner(128, 2, 1, 8, 2, false, false).await;
+        v1_isolation_case_inner(256, 2, 1, 8, 2, false, false).await;
+        v1_isolation_case_inner(256, 8, 4, 8, 2, false, false).await; // GQA 单块
+        v1_isolation_case_inner(256, 2, 1, 64, 2, false, false).await; // 跨 2 块(行 32 = 页边界首槽)
+        v1_isolation_case_inner(256, 8, 4, 64, 2, false, false).await; // engine 全参档(GQA + 跨页)
         // 规模档:真模型规模 T=4096/nb=128 单发射(4k e2e 同规模;
         // 曾以越界 slots 表复现 ILLEGAL_ADDRESS,修复后应为绿)
-        v1_isolation_case_inner(256, 2, 1, 4096, 128, false).await;
+        v1_isolation_case_inner(256, 2, 1, 4096, 128, false, false).await;
+        gpu_client_close().await;
+    }
+
+    /// v2 paged decode 隔离对拍(E-decode 2026-10-04):在线 softmax 分块
+    /// (PARTITION=512)+ LSE 归并 vs prefill 参考(三方同 v1 案;多分区
+    /// 归并路径 = 本测主靶,nparts=1 时核内退化直拷)。矩阵含跨分区边界
+    /// (t=600 → 分区2 首 token)与 engine 全参档 GQA。
+    #[tokio::test]
+    async fn gpu_attn_v2_decode_matches_prefill_paged() {
+        if !gpu_enabled() {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return;
+        }
+        v1_isolation_case_inner(256, 2, 1, 200, 8, false, true).await; // nparts=1(归并=直拷臂)
+        v1_isolation_case_inner(128, 2, 1, 600, 32, false, true).await; // nparts=2(hd128)
+        v1_isolation_case_inner(256, 2, 1, 600, 32, false, true).await; // nparts=2(hd256;跨分区边界)
+        v1_isolation_case_inner(256, 8, 4, 1120, 40, false, true).await; // engine 全参档 GQA,跨分区中部
+        v1_isolation_case_inner(256, 2, 1, 4096, 128, false, true).await; // 规模档 nparts=8
         gpu_client_close().await;
     }
 
     async fn v1_isolation_case(hd: usize, hq: usize, hkv: usize, t_len: usize, nb: usize) {
-        v1_isolation_case_inner(hd, hq, hkv, t_len, nb, false).await;
+        v1_isolation_case_inner(hd, hq, hkv, t_len, nb, false, false).await;
     }
 
-    async fn v1_isolation_case_inner(hd: usize, hq: usize, hkv: usize, t_len: usize, nb: usize, allow_red: bool) {
+    async fn v1_isolation_case_inner(hd: usize, hq: usize, hkv: usize, t_len: usize, nb: usize, allow_red: bool, use_v2: bool) {
         let hidden = 6usize;
         let (page, x) = (32usize, 8usize); // 二分:暂回页 32
         let row_q = hq * hd;
@@ -1050,11 +1148,35 @@ mod f16_tests {
 
         // 被测臂:T × v1 decode 步(同一持久池;slots=[t] / lens=[t+1];
         // K0 重写同槽同值 = 幂等,池内容与 prefill 后一致)
+        // v2 臂(use_v2):在线 softmax 分块 + LSE 归并;scratch 三件套
+        // 持久块(与引擎 alloc 同构:nparts = ceil(nb·page/512))
+        let v2_scratch = if use_v2 {
+            let nparts = (nb * page + 511) / 512;
+            let es = crate::interpreters::eval_ops(
+                TensorOps::zeros(Dtype::F32, vec![1, hq * nparts]).step(), &mut gpu)
+                .await.expect("v2 exp_sums");
+            let ml = crate::interpreters::eval_ops(
+                TensorOps::zeros(Dtype::F32, vec![1, hq * nparts]).step(), &mut gpu)
+                .await.expect("v2 max_logits");
+            let to = crate::interpreters::eval_ops(
+                TensorOps::zeros(Dtype::F16, vec![hq * nparts * hd]).step(), &mut gpu)
+                .await.expect("v2 tmp_out");
+            Some(crate::module::AttnV2Scratch {
+                exp_sums: TensorOps::of_block(es.id, Dtype::F32, vec![1, hq * nparts]),
+                max_logits: TensorOps::of_block(ml.id, Dtype::F32, vec![1, hq * nparts]),
+                tmp_out: TensorOps::of_block(to.id, Dtype::F16, vec![hq * nparts * hd]),
+                nparts,
+            })
+        } else {
+            None
+        };
         for t in 0..t_len {
             let x_t = TensorOps::from_host(Dtype::F16, vec![1, hidden], &halfb(&xs_f32[t * hidden..(t + 1) * hidden]));
             let pos_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32]));
             let kv_t = paged_kv(vec![t as f32], vec![t as f32 + 1.0]);
-            let decl = attn.forward(&x_t, &ForwardCtx::decode(1, &pos_t, &kv_t, &rp));
+            let mut ctx = ForwardCtx::decode(1, &pos_t, &kv_t, &rp);
+            ctx.attn_v2 = v2_scratch.clone();
+            let decl = attn.forward(&x_t, &ctx);
             let got = crate::testkit::harvest_f16(&mut gpu, &decl).await;
             let want = &out_prefill[t * hidden..(t + 1) * hidden];
             let maxd = got

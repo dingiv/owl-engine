@@ -102,6 +102,9 @@ pub struct ForwardCtx<'a> {
     /// 刀D 取证:时间戳探针缓冲块(OWL_TS_PROBE;None = 关。U32 [4096]
     /// 输入槽,ts 内核逐层 clock64 原地写,回放后 dtoh 读原生时间线)
     pub ts_buf: Option<TensorOps>,
+    /// v2 分页 decode scratch(None = v1 既有路径;engine 预分配注入,
+    /// per-layer 子 ctx 透传 —— 同 ts_buf 形态)
+    pub attn_v2: Option<AttnV2Scratch>,
 }
 
 impl<'a> ForwardCtx<'a> {
@@ -125,6 +128,7 @@ impl<'a> ForwardCtx<'a> {
             env: crate::env::EnvProvider::default(),
             gdn_slot_host: 0,
             ts_buf: None,
+            attn_v2: None,
         }
     }
 
@@ -153,6 +157,7 @@ impl<'a> ForwardCtx<'a> {
             env: crate::env::EnvProvider::default(),
             gdn_slot_host: 0,
             ts_buf: None,
+            attn_v2: None,
         }
     }
 
@@ -176,6 +181,7 @@ impl<'a> ForwardCtx<'a> {
             env: crate::env::EnvProvider::default(),
             gdn_slot_host: 0,
             ts_buf: None,
+            attn_v2: None,
         }
     }
 
@@ -203,6 +209,7 @@ impl<'a> ForwardCtx<'a> {
             env: crate::env::EnvProvider::default(),
             gdn_slot_host: 0,
             ts_buf: None,
+            attn_v2: None,
         }
     }
 
@@ -233,6 +240,7 @@ impl<'a> ForwardCtx<'a> {
             env: crate::env::EnvProvider::default(),
             gdn_slot_host: 0,
             ts_buf: None,
+            attn_v2: None,
         }
     }
 
@@ -263,6 +271,7 @@ impl<'a> ForwardCtx<'a> {
             env: crate::env::EnvProvider::default(),
             gdn_slot_host: 0,
             ts_buf: None,
+            attn_v2: None,
         }
     }
 
@@ -299,6 +308,7 @@ impl<'a> ForwardCtx<'a> {
             env: crate::env::EnvProvider::default(),
             gdn_slot_host: 0,
             ts_buf: None,
+            attn_v2: None,
         }
     }
 }
@@ -349,6 +359,21 @@ pub struct KvBuffers {
     /// 后续 FlashInfer 共用)。恒等表 = 单序列连续分配(物理块 = 逻辑块)。
     /// naive 旧核不解引用(测试/回退路径可填哑表)。
     pub block_tables: TensorOps,
+}
+
+/// v2 分页 decode scratch(在线 softmax 分块 + LSE 归并;E-decode 主攻
+/// 2026-10-04)。引擎捕获前持久块(指针烘焙图安全);None = 层走 v1 既有
+/// 路径(全部存量测试/构造点零迁移)。
+/// - `exp_sums` / `max_logits`:[1, hq, nparts] f32,v2 主核写、reduce 读;
+/// - `tmp_out`:[1, hq·nparts·hd] f16(v2 节点输出写同布局,reduce 读;
+///   核内 stride = max_nparts = 声明 nparts);
+/// - `nparts` = ceil(nb·page/512),launch grid z = nparts(核从 gridDim.z 读)。
+#[derive(Clone)]
+pub struct AttnV2Scratch {
+    pub exp_sums: TensorOps,
+    pub max_logits: TensorOps,
+    pub tmp_out: TensorOps,
+    pub nparts: usize,
 }
 
 /// KV 动态上下文:每步由 runner 构造。(注:decode 直排路径暂走

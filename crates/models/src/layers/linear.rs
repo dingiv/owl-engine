@@ -30,6 +30,12 @@ pub struct Linear {
 }
 
 impl Linear {
+    /// 权重槽叶子声明(刀3a':gdn b/a 直发自研 gemv 需绕过 Linear::forward
+    /// 的 cublas 臂;仅 f16 直读态合法 —— 量化态调用方须走 forward)
+    pub fn weight_decl(&self) -> TensorOps {
+        self.w.decl()
+    }
+
     /// 准备容器(`key` = 数据源槽键;`plan` = 量化计划构造期注入 ——
     /// 零数据零副作用,零突变面)。量化计划下按尺寸门控当场定形:
     /// marlin tile 约束(n%256==0 且 k%128==0,与装载源同源)不满足的
