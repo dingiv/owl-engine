@@ -23,6 +23,7 @@ pub(super) fn issue_launch(
     stream: &Arc<CudaStream>,
     kernels: &mut KernelCache,
     msg: &LaunchMsg,
+    debug: bool,
 ) -> Result<u64, ModelError> {
     // 1. 参数槽装配:Block → 设备指针;BlockSlice → 块首 + 字节偏移;
     //    标量按类型入槽
@@ -43,7 +44,7 @@ pub(super) fn issue_launch(
         }
     }
 
-    if std::env::var_os("OWL_DEBUG").is_some() {
+    if debug {
         let addrs: Vec<String> = slots.iter().map(|s| match s {
             Slot::Ptr(v) => format!("ptr {v:#x}"),
             Slot::U(v) => format!("u64 {v}"),

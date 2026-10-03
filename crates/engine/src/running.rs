@@ -51,7 +51,35 @@ pub(crate) struct ActiveTurn {
 }
 
 /// 执行态引擎(请求入口)
+/// 刀1.6 结构清理(P0.3):步级探针开关,boot 一次性解析(进程内不变)。
+/// 热路径零 `var_os`;新增探针必须在此登记,禁止 exec 每步读 env。
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct StepProbes {
+    /// OWL_STEP_PROFILE(逐相计时)
+    pub step_profile: bool,
+    /// OWL_GDN_DUMP(GDN 状态格画像)
+    pub gdn_dump: bool,
+    /// OWL_DEBUG(通用诊断:kv-dump/logits-dump/sample-dump)
+    pub debug: bool,
+    /// OWL_PREFILL_CKSUM(prefill 校验和)
+    pub prefill_cksum: bool,
+}
+
+impl StepProbes {
+    pub(crate) fn from_env() -> Self {
+        let has = |k: &str| std::env::var_os(k).is_some();
+        Self {
+            step_profile: has("OWL_STEP_PROFILE"),
+            gdn_dump: has("OWL_GDN_DUMP"),
+            debug: has("OWL_DEBUG"),
+            prefill_cksum: has("OWL_PREFILL_CKSUM"),
+        }
+    }
+}
+
 pub struct RunningEngine<D: DeviceClient> {
+    /// 步级探针(boot 解析;不可变)
+    pub(crate) probes: StepProbes,
     pub(crate) session: GraphPlan<D>,
     pub(crate) tok: Tokenizer,
     pub(crate) cfg: EngineConfig,

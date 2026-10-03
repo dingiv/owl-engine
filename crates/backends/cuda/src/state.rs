@@ -84,6 +84,9 @@ pub(super) struct GpuCtx {
     /// 动态 smem 每块上限(CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK
     /// _OPTIN;发射前硬顶守卫,超限结构化拒绝 —— 2026-09-27 v1 smem 事故)
     smem_optin: usize,
+    /// 刀1.6:探针开关(boot 解析;热路径零 env 查询)
+    pub(super) srv_timing: bool,
+    pub(super) cap_prof: bool,
 }
 
 /// 捕获会话:目标流 + 切块 slab + 发射计数(空窗哨兵用)
@@ -141,6 +144,8 @@ impl GpuCtx {
             ctx,
             streams,
             ordinal,
+            srv_timing: std::env::var_os("OWL_SRV_TIMING").is_some(),
+            cap_prof: std::env::var_os("OWL_CAP_PROF").is_some(),
             capture: None,
             graphs: HashMap::new(),
             next_graph: 1,
@@ -235,7 +240,7 @@ impl GpuCtx {
             .map_err(|e| ModelError::Msg(format!("graph_end: 实例化(flags={flags}): {e:?}")))?;
         // 节点数/类型观测(S1 launch 税立案:探针判 0.33µs/节点,引擎图
         // 实测 1.84µs/节点 —— 按类型分解找贵节点)
-        if std::env::var_os("OWL_SRV_TIMING").is_some() {
+        if self.srv_timing {
             let mut n: usize = 0;
             unsafe {
                 crate::ffi::sys::cuGraphGetNodes(cu_graph, std::ptr::null_mut(), &mut n);
@@ -349,7 +354,7 @@ impl GpuCtx {
             ));
         }
         let stream = self.stream(STREAM_COMPUTE)?.clone();
-        let prof = std::env::var_os("OWL_SRV_TIMING").is_some();
+        let prof = self.srv_timing;
         let t0 = prof.then(std::time::Instant::now);
         let (exec, cu_stream) = {
             let g = self
@@ -397,7 +402,7 @@ impl GpuCtx {
         // v1 paged 核 MISALIGNED_ADDRESS 定谳)。无对齐需求的 2B 哑块也
         // 不会破坏后续块基底。
         const CARVE_ALIGN: usize = 256;
-        if std::env::var_os("OWL_CAP_PROF").is_some() {
+        if self.cap_prof {
             eprintln!("[cap-prof] carve {}B", n);
         }
         let used = cap.used.div_ceil(CARVE_ALIGN) * CARVE_ALIGN;

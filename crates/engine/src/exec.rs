@@ -76,7 +76,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         grew: bool,
     ) -> Result<TurnEvent> {
         let sid = self.active.as_ref().expect("活跃").session_id;
-        let prof = std::env::var_os("OWL_STEP_PROFILE").is_some();
+        let prof = self.probes.step_profile;
         let t0 = prof.then(std::time::Instant::now);
         // E2b:块链跨页增长 → 重写持久块表(图烘焙 bt 指针)
         if grew {
@@ -107,17 +107,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
         }
         // D1 取证:GDN 状态格画像(OWL_GDN_DUMP;前 6 步,首末层 conv_v/rec)
-        if std::env::var_os("OWL_GDN_DUMP").is_some() {
+        if self.probes.gdn_dump {
             let step = self.active.as_ref().expect("活跃").out.len() as u64;
-            if step < 6 {
-                let lines = {
-                    let face = self.session.face_mut();
-                    self.pool.gdn_slot_profile(face, gdn_slot, step).await?
-                };
-                for l in lines {
-                    eprintln!("{l}");
-                }
-            }
+            self.probe_gdn_dump(gdn_slot, step).await?;
         }
         // E3 设备采样:4B token 回读(旧 = 600KB logits dtoh + host argmax)。
         // OWL_HOST_ARGMAX=1 = 对照开关(host argmax 校准设备采样数值)。
@@ -136,7 +128,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // 诊断:KV 池回读(取证图内 K0 写是否落盘)—— 槽 2 = prompt
             // (eager prefill 写);槽 pos = 本步 K0(图内写)。layout
             // [nb,hkv,hd/x,page,x]:b=0 头 0 组 0 → 元素 s*8。
-            if std::env::var_os("OWL_DEBUG").is_some() && step < 16 {
+            if self.probes.debug && step < 16 {
                 let kv0 = &self.pool.kvs[0].k_cache;
                 let mut whole = vec![0u8; kv0.1 * 2];
                 let face = self.session.face_mut();
@@ -162,7 +154,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     .collect();
                 eprintln!("[kv-hex] 槽{pos_now} k[0..8] = {hex}");
             }
-            if std::env::var_os("OWL_DEBUG").is_some() && step < 16 {
+            if self.probes.debug && step < 16 {
                 let mut top: Vec<(f32, u32)> = logits
                     .iter()
                     .enumerate()
@@ -203,7 +195,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             if prof {
                 eprintln!("[step-prof] pos={pos} host-sample={:?} wall3={}", t_sample.unwrap().elapsed(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100000);
             }
-            if std::env::var_os("OWL_DEBUG").is_some() {
+            if self.probes.debug {
                 eprintln!("[sample-dump] t{turn_id} s{step}: sampled={nt} hist={} pen={}", history.len(), std::env::var("OWL_REP_PENALTY").unwrap_or_else(|_| "d".into()));
             }
             nt
@@ -216,7 +208,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         } else {
             // D1 取证:greedy 路径 logits 形状仪表(OWL_DEBUG;前 16 步,与
             // 采样分支同格式 —— 基线/融合 A/B 对比用)
-            if std::env::var_os("OWL_DEBUG").is_some() {
+            if self.probes.debug {
                 let (turn_id, step) = {
                     let act = self.active.as_ref().expect("活跃");
                     (act.id, act.out.len() as u64)
@@ -248,6 +240,30 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             eprintln!("[step-prof] pos={pos} token-dtoh={:?}", t_dtoh.unwrap().elapsed());
         }
         self.sample_and_emit(nt).await
+    }
+
+    // ====================================================================
+    // 取证探针(P1.5:仪表从 execute_decode 抽出;全部 probes 门控,
+    // 正常路径零开销。TS 探针在声明层,见 model.rs last_hidden)
+    // ====================================================================
+
+    /// GDN 状态格画像(首末层 conv_v/rec;owl_gdn_slot_profile 委托)
+    async fn probe_gdn_dump(
+        &mut self,
+        gdn_slot: usize,
+        step: u64,
+    ) -> Result<()> {
+        if step >= 6 {
+            return Ok(());
+        }
+        let lines = {
+            let face = self.session.face_mut();
+            self.pool.gdn_slot_profile(face, gdn_slot, step).await?
+        };
+        for l in lines {
+            eprintln!("{l}");
+        }
+        Ok(())
     }
 
     /// 采样 + 事件产出(Greedy;E3 设备 argmax,token id 直入)。
@@ -427,7 +443,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let esz = if d.dtype == Dtype::F16 { 2 } else { 4 };
             let mut buf = vec![0u8; t * d.hidden * esz];
             face.dtoh(&b, &mut buf).await?;
-            if std::env::var_os("OWL_PREFILL_CKSUM").is_some() {
+            if self.probes.prefill_cksum {
                 // 临时取证:每 chunk 隐层校验和(FI 开/关对比找第一分歧)
                 let cks: f32 = buf.chunks_exact(2)
                     .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32().abs())

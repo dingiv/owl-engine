@@ -218,6 +218,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
         eprintln!("[boot] GraphPlan plan(warmup+捕获) {:.2}s", t_run.elapsed().as_secs_f32());
 
         Ok(RunningEngine {
+            probes: crate::running::StepProbes::from_env(),
             session,
             tok: loaded.tokenizer,
             cfg: self.cfg,
