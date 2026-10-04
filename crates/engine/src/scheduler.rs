@@ -62,6 +62,15 @@ pub(crate) enum StepAction {
         /// 块链跨页增长 → 执行器重写持久块表(write_bt)
         grew: bool,
     },
+    /// 投机轮(E5-M2;spec_depth > 0 时替代 Decode):块 = [anchor,
+    /// d1..d_depth],槽位 depth+1 个(pos..pos+depth)
+    SpecRound {
+        token: u32,
+        pos: usize,
+        kv_slots: [u32; 4],
+        gdn_slot: usize,
+        grew: bool,
+    },
 }
 
 impl<D: DeviceClient> RunningEngine<D> {
@@ -166,23 +175,42 @@ impl<D: DeviceClient> RunningEngine<D> {
             return Ok(SchedulerOutput::Step { begin, action });
         }
 
-        // 生成相位:decode 单步(host 派生量备齐 —— 物理槽/跨页增长)
+        // 生成相位:decode 单步 / 投机轮(host 派生量备齐 —— 物理槽/跨页增长)
         let (sid, token, pos) = {
             let act = self.active.as_ref().expect("活跃");
             (act.session_id, *act.out.last().expect("生成中"), act.fed)
         };
-        let (kv_slot, gdn_slot, grew) = {
+        let spec = self.spec_depth;
+        let (kv_slot, kv_slots, gdn_slot, grew) = {
             let s = self.sessions.get_mut(sid).expect("账在");
+            let need = if spec > 0 { pos + spec + 1 } else { pos + 1 };
             let before = s.block_table.len();
-            self.blocks_m.ensure_for_len(&mut s.block_table, pos + 1)?;
+            self.blocks_m.ensure_for_len(&mut s.block_table, need)?;
             let grew = s.block_table.len() != before;
             let page = self.pool.page;
-            let b = s.block_table[pos / page];
-            (b * page as u32 + (pos % page) as u32, s.gdn_slot, grew)
+            let slot_at = |p: usize| {
+                let b = s.block_table[p / page];
+                b * page as u32 + (p % page) as u32
+            };
+            if spec > 0 {
+                let mut kv_slots = [0u32; 4];
+                for (i, sl) in kv_slots.iter_mut().enumerate() {
+                    *sl = slot_at(pos + i);
+                }
+                (slot_at(pos), Some(kv_slots), s.gdn_slot, grew)
+            } else {
+                (slot_at(pos), None, s.gdn_slot, grew)
+            }
         };
-        Ok(SchedulerOutput::Step {
-            begin,
-            action: StepAction::Decode { token, pos, kv_slot, gdn_slot, grew },
-        })
+        match kv_slots {
+            Some(kv_slots) => Ok(SchedulerOutput::Step {
+                begin,
+                action: StepAction::SpecRound { token, pos, kv_slots, gdn_slot, grew },
+            }),
+            None => Ok(SchedulerOutput::Step {
+                begin,
+                action: StepAction::Decode { token, pos, kv_slot, gdn_slot, grew },
+            }),
+        }
     }
 }

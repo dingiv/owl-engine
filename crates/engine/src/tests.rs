@@ -829,6 +829,69 @@ async fn gpu_27b_chat_inference() {
         }
     }
 
+
+    /// E5-M2 恒等门:greedy 下 spec 轮输出 ≡ 无 spec 输出(逐 token)。
+    /// 任意草稿(哑草稿 = anchor 重复)下机制必须恒等 —— 接受是恒等
+    /// 变换,分红只影响速度。双 boot × 双 prompt × 会话 token 账逐位
+    /// 比对(第二 prompt 同引擎续 turn = 跨 turn 状态连续性一并覆盖)。
+    #[tokio::test]
+    async fn gpu_spec_identity_gate() {
+        let Some(ordinal) = gpu_ordinal() else {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return;
+        };
+        let dir = asset_dir();
+        const PROMPTS: [&str; 2] = ["用五十字介绍长城。", "水的沸点是多少度?"];
+
+        async fn gen(
+            spec: bool,
+            ordinal: usize,
+            dir: &std::path::Path,
+        ) -> Vec<(String, Vec<u32>)> {
+            std::env::set_var("OWL_SAMPLER", "greedy");
+            std::env::remove_var("OWL_REP_PENALTY");
+            if spec {
+                std::env::set_var("OWL_SPEC_DEPTH", "3");
+            } else {
+                std::env::remove_var("OWL_SPEC_DEPTH");
+            }
+            let mut engine = Engine::new(EngineConfig {
+                device_ordinal: ordinal,
+                max_seq_tokens: 128,
+                prefill_chunk: 16,
+            })
+            .expect("构造");
+            let loaded = engine.loader().load_qwen35_0_8b(dir).await.expect("装载");
+            let mut running = engine.run(loaded).await.expect("装配");
+            let mut out = Vec::new();
+            for (i, p) in PROMPTS.iter().enumerate() {
+                let (sid, id) = running
+                    .submit_session(Some(100 + i as u64), *p, 48)
+                    .expect("submit");
+                let text = drive_turn(&mut running, id).await;
+                let toks = running
+                    .sessions
+                    .get(sid)
+                    .map(|s| s.tokens.clone())
+                    .unwrap_or_default();
+                out.push((text, toks));
+            }
+            out
+        }
+
+        let base = gen(false, ordinal, &dir).await; // 基线
+        let spec = gen(true, ordinal, &dir).await; // spec(哑草稿)
+        for (i, ((ta, ta_tokens), (tb, tb_tokens))) in base.iter().zip(&spec).enumerate() {
+            eprintln!(
+                "[spec-gate] p{i} baseline({}tok)={ta:?}\n[spec-gate] p{i} spec({}tok)={tb:?}",
+                ta_tokens.len(),
+                tb_tokens.len()
+            );
+            assert_eq!(ta, tb, "恒等门 p{i}:greedy spec 文本 ≡ 无 spec");
+            assert_eq!(ta_tokens, tb_tokens, "恒等门 p{i}:token 账逐位一致");
+        }
+    }
+
 /// 泵到目标 turn 完成,回吐全文(其间事件仅观测)
 async fn drive_turn<D: DeviceClient>(running: &mut RunningEngine<D>, id: u64) -> String {
     loop {

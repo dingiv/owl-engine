@@ -8,7 +8,7 @@
 //! 状态块触碰一律经 StatePool(state.rs),不直摸块句柄。
 
 use owl_iface::contract::{DeviceClient, Dtype, ModelError};
-use owl_models::interpreters::{eval_ops_scoped, eval_ops_scoped_env};
+use owl_models::interpreters::eval_ops_scoped_env;
 use owl_models::layers::gdn::GdnBuffers;
 use owl_models::module::{FiPrefillCtx, ForwardCtx, KvBuffers, Module};
 use owl_models::tokenizer::Tokenizer;
@@ -240,6 +240,250 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             eprintln!("[step-prof] pos={pos} token-dtoh={:?}", t_dtoh.unwrap().elapsed());
         }
         self.sample_and_emit(nt).await
+    }
+
+    // ====================================================================
+    // E5-M2:投机轮(哑草稿版;草稿 = 3 × anchor 重复)
+    // 轮不变量:轮首 GDN = state@F-1(F = fed = anchor 位;anchor KV 未写
+    // —— 由本轮行 0 补写),快照 = state@F-1。部分接受 → restore(不变量
+    // 保持,pending 延续);全接受 → 状态直落 state@F+k = 下轮不变量。
+    // ====================================================================
+
+    /// 投机轮执行:快照 → 草稿 → verify(4 行 prefill 通道)→ 接受 →
+    /// (restore)→ 提交发射。发射 m+1 token(接受 drafts + bonus),
+    /// 事件入 pending_events 队列(pump 逐个出)。
+    pub(crate) async fn execute_spec_round(
+        &mut self,
+        token: u32,
+        pos: usize,
+        kv_slots: [u32; 4],
+        gdn_slot: usize,
+        grew: bool,
+    ) -> Result<TurnEvent> {
+        let sid = self.active.as_ref().expect("active 已保证").session_id;
+        if grew {
+            self.write_bt(sid).await?;
+        }
+        let prof = self.probes.step_profile;
+        let t0 = prof.then(std::time::Instant::now);
+
+        // ① 快照(轮首;恢复后仍有效 → 只在失效时拍)
+        if !self.spec_snap_valid {
+            let face = self.session.face_mut();
+            self.pool.capture_spec_snap(face, gdn_slot).await?;
+            self.spec_snap_valid = true;
+        }
+
+        // ② 草稿(M2a 哑草稿 = 3 × anchor 重复;M2b = MTP 头 propose 接入)
+        let drafts = [token, token, token];
+
+        // ③ verify 块 [anchor, d1..d3] @ pos..pos+3(prefill 通道 T=4)
+        let block: Vec<u32> = std::iter::once(token).chain(drafts).collect();
+        let ids = self.verify_forward(&block, pos, gdn_slot).await?;
+        if prof {
+            eprintln!("[spec-prof] pos={pos} verify={:?}", t0.unwrap().elapsed());
+        }
+
+        // ④ greedy 接受:行 i argmax vs draft i;i < 3
+        let m = (0..3).take_while(|&i| drafts[i] == ids[i]).count();
+        let bonus = ids[m];
+
+        // ⑤ 部分接受 → GDN 回滚 + 已接受前缀重放(v1 窗口重处理,施工
+        // 方案 §四.4);快照无条件失效(下轮轮首重拍)。
+        // 轮不变量(本轮修正):restore 只回到 state@F-1,而下一轮需要
+        // state@fed'-1 = state@F+m —— [anchor, d1..dm] 的贡献在 verify
+        // 中已推进、被 restore 回滚,必须重放补回(已接受行 KV 覆写幂等
+        // —— 同快照同输入确定性同值)。m=0 也要重放 anchor 一行。
+        // 快照失效原因:restore+重放后 live = state@F+m ≠ 快照内容;
+        // 全接受后 live = state@F+3 亦越过快照 —— 留守旧值 = 下轮再
+        // restore 二次丢账(本恒等门首战红案的根因)。
+        if m < 3 {
+            {
+                let face = self.session.face_mut();
+                self.pool.restore_spec_snap(face, gdn_slot).await?;
+            }
+            let replay: Vec<u32> = std::iter::once(token)
+                .chain(drafts[..m].iter().copied())
+                .collect();
+            let _ = self.verify_forward(&replay, pos, gdn_slot).await?;
+        }
+        self.spec_snap_valid = false;
+
+        // ⑥ 提交:fed = bonus 位(F');发射 = 接受 drafts + bonus(m+1)
+        let toks: Vec<u32> = drafts[..m].to_vec();
+        let mut toks = toks;
+        toks.push(bonus);
+        {
+            let act = self.active.as_mut().expect("活跃");
+            act.fed = pos + m + 1;
+        }
+
+        // ⑦ 逐 token 发射(eos/预算;事件入队,pump 逐个出)
+        let mut evq = std::collections::VecDeque::new();
+        for &t in &toks {
+            let ev = self.sample_and_emit(t).await?;
+            let done = matches!(ev, TurnEvent::Completed { .. });
+            evq.push_back(ev);
+            if done {
+                break; // eos/预算:余段作废
+            }
+        }
+        self.pending_events = evq;
+        self.pending_events
+            .pop_front()
+            .ok_or_else(|| owl_models::ModelError::Msg("spec 轮零事件(空块?)".into()))
+    }
+
+    /// verify 块前向(E5-M2):prefill 通道 T = 块长(base = F,FI 表四件套
+    /// 同款;last_hidden → lm_head → 逐行 argmax → 行栈单根)。返回各行
+    /// argmax(= 各位置的贪心提名)。
+    async fn verify_forward(
+        &mut self,
+        block: &[u32],
+        base: usize,
+        gdn_slot: usize,
+    ) -> Result<Vec<u32>> {
+        let t = block.len();
+        let (bt_chain, _) = {
+            let act = self.active.as_ref().expect("active 已保证");
+            let s = self.sessions.get(act.session_id).expect("账在");
+            (s.block_table.clone(), s.gdn_slot)
+        };
+        let kv_caches = self.pool.kv_caches();
+        let kvs_step: Vec<KvBuffers> = {
+            let page = self.pool.page;
+            let phys: Vec<f32> = (base..base + t)
+                .map(|p| {
+                    let b = bt_chain[p / page];
+                    (b * page as u32 + (p % page) as u32) as f32
+                })
+                .collect();
+            let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+            kv_caches
+                .iter()
+                .map(|(k, v)| KvBuffers {
+                    k_cache: k.clone(),
+                    v_cache: v.clone(),
+                    slots: TensorOps::from_host(Dtype::F32, vec![t], &f32b(&phys)),
+                    kv_lens: TensorOps::from_host(
+                        Dtype::F32,
+                        vec![t],
+                        &f32b(&((base + 1..=base + t).map(|v| v as f32).collect::<Vec<_>>())),
+                    ),
+                    block_tables: self.pool.bt_leaf_flat(),
+                })
+                .collect()
+        };
+        let gdns_step: Vec<GdnBuffers> = {
+            let gdn_caches = self.pool.gdn_caches();
+            gdn_caches
+                .iter()
+                .map(|g| GdnBuffers {
+                    conv_q: g.conv_q.clone(),
+                    conv_k: g.conv_k.clone(),
+                    conv_v: g.conv_v.clone(),
+                    rec: g.rec.clone(),
+                    slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[gdn_slot as f32])),
+                })
+                .collect()
+        };
+        let ids_t = TensorOps::from_host(
+            Dtype::F32,
+            vec![t],
+            &block.iter().flat_map(|v| (*v as f32).to_le_bytes()).collect::<Vec<u8>>(),
+        );
+        let pos_t = TensorOps::from_host(
+            Dtype::F32,
+            vec![t],
+            &f32b(&(base..base + t).map(|v| v as f32).collect::<Vec<_>>()),
+        );
+        let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+        let slots_t = TensorOps::from_host(
+            Dtype::F32,
+            vec![t],
+            &f32b(&{
+                let page = self.pool.page;
+                (base..base + t)
+                    .map(|p| {
+                        let b = bt_chain[p / page];
+                        (b * page as u32 + (p % page) as u32) as f32
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        );
+        let lens_t = TensorOps::from_host(
+            Dtype::F32,
+            vec![t],
+            &f32b(&((base + 1..=base + t).map(|v| v as f32).collect::<Vec<_>>())),
+        );
+        let gdn_slot_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[gdn_slot as f32]));
+
+        // FI 表四件套(与 prefill_chunk 同款;ctx_total = base + t)
+        let i32le = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let fi_tensors;
+        let fi = if !self.pool.k_fis.is_empty() {
+            let page = self.pool.page;
+            let ctx_total = base + t;
+            let nb = bt_chain.len();
+            let k_fi_leaf = self.pool.kv_fi_leaves();
+            let face = self.session.face_mut();
+            let q_cu_b = owl_models::interpreters::eval_ops(
+                TensorOps::from_host(Dtype::U32, vec![2], &i32le(&[0, t as i32])).step(), face)
+                .await?;
+            let idx_b = owl_models::interpreters::eval_ops(
+                TensorOps::from_host(Dtype::U32, vec![nb],
+                    &i32le(&bt_chain.iter().map(|&b| b as i32).collect::<Vec<_>>())).step(), face)
+                .await?;
+            let ind_b = owl_models::interpreters::eval_ops(
+                TensorOps::from_host(Dtype::U32, vec![2], &i32le(&[0, nb as i32])).step(), face)
+                .await?;
+            let ll_b = owl_models::interpreters::eval_ops(
+                TensorOps::from_host(Dtype::U32, vec![1],
+                    &i32le(&[(ctx_total - nb * page + page) as i32])).step(), face)
+                .await?;
+            let q_cu = TensorOps::of_block(q_cu_b.id, Dtype::U32, vec![2]);
+            let indices = TensorOps::of_block(idx_b.id, Dtype::U32, vec![nb]);
+            let indptr = TensorOps::of_block(ind_b.id, Dtype::U32, vec![2]);
+            let last_len = TensorOps::of_block(ll_b.id, Dtype::U32, vec![1]);
+            let (kcs, vcs): (Vec<TensorOps>, Vec<TensorOps>) =
+                k_fi_leaf.iter().map(|(k, v)| (k.clone(), v.clone())).unzip();
+            fi_tensors = (kcs, vcs, q_cu, indices, indptr, last_len);
+            Some(FiPrefillCtx {
+                kcs: &fi_tensors.0,
+                vcs: &fi_tensors.1,
+                q_cu: &fi_tensors.2,
+                indices: &fi_tensors.3,
+                indptr: &fi_tensors.4,
+                last_len: &fi_tensors.5,
+            })
+        } else {
+            None
+        };
+
+        let mut ctx = owl_models::module::ForwardCtx::model_prefill(
+            t, &pos_t, &kvs_step, &self.rope, &gdns_step, &slots_t, &lens_t, &gdn_slot_t, base, fi,
+        );
+        ctx.env = self.env;
+        let face = self.session.face_mut();
+        let vocab = self.model.vocab_size();
+        let hidden = self.model.last_hidden(&ids_t, &ctx);
+        let logits = self.model.embed.lm_head_matmul(&hidden);
+        let rows: Vec<TensorOps> =
+            (0..t).map(|r| owl_models::ops::argmax_f32idx(&logits, vocab, r * vocab)).collect();
+        let refs: Vec<&TensorOps> = rows.iter().collect();
+        let mut root = TensorOps::call(owl_models::ops::ids::OPS_CONCAT);
+        for i in 0..8 {
+            root = root.arg(refs.get(i).copied().unwrap_or(refs[0]));
+        }
+        let root = root.arg_usize(t).arg_usize(1).arg_usize(1).with_shape(Dtype::F32, vec![t, 1]);
+        let (b, _arena) =
+            owl_models::interpreters::eval_ops_scoped_env(root.step(), face, self.env).await?;
+        let mut buf = vec![0u8; 4 * t];
+        face.dtoh(&b, &mut buf).await?;
+        Ok(buf
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
+            .collect())
     }
 
     // ====================================================================

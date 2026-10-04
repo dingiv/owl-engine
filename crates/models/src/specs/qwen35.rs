@@ -21,7 +21,7 @@
 use crate::contract::{DeviceClient, ModelError};
 use crate::formats::safetensors::SafeTensorsSource;
 use crate::model::{Model, ModelSpec};
-use crate::module::KeyConvention;
+use crate::module::{KeyConvention, Loadable, LoaderCtx, LoaderOps};
 use std::path::Path;
 
 // ============================================================================
@@ -149,6 +149,57 @@ pub async fn load_0_8b_w4a16<D: DeviceClient + 'static>(
 /// - GDN:qk 16 头 ×128(in_proj_qkv [10240, 5120] = 2048+2048+6144)/
 ///   v 48 头 ×128(in_proj_z [6144, 5120]);
 /// - 64 层 3:1 hybrid(layers i%4==3 为 full);vocab 248320 不 tied。
+/// MTP 头装载(E5-M0;cyankiwi 检查点自带 15 个 mtp.* 键全 BF16 ——
+/// 结构 = vLLM Qwen3NextMultiTokenPredictor 同构,见 layers/mtp.rs)。
+/// 返回 (组件, 装载清单);键集断言(15 键)由测试做。
+pub async fn load_27b_mtp<D: DeviceClient + 'static>(
+    dir: &Path,
+    face: &mut D,
+) -> Result<(crate::layers::mtp::MtpPredictor, crate::module::LoadManifest), ModelError> {
+    let s = qwen3_8_27b();
+    let mtp = crate::layers::mtp::MtpPredictor::new(
+        s.hidden,
+        s.inter,
+        s.full_heads.0,
+        s.full_heads.1,
+        s.full_heads.2,
+        s.eps,
+    );
+    let src = crate::formats::awq::AwqSource::open_dir(dir)?;
+    let device_repack =
+        crate::module::RepackPath::resolve(None, face.device_kernels()).is_device();
+    let ctx = crate::module::LoaderCtx {
+        dtype: crate::contract::Dtype::F16,
+        shard: 1,
+        device_repack,
+    };
+    let manifest = crate::interpreters::eval_load(&mtp, face, &src, &ctx).await?;
+    Ok((mtp, manifest))
+}
+
+/// MTP 头键映射(layout 期改写;与 Qwen35Convention::layer_key 同式,
+/// base = "mtp",层序号恒 0 —— 键约定住 specs 家规的落点)。
+impl Loadable for crate::layers::mtp::MtpPredictor {
+    fn layout(&self, ctx: &LoaderCtx) -> LoaderOps {
+        let keys = Qwen35Convention::new("mtp");
+        self.fc()
+            .layout(ctx)
+            .map_keys(|k| format!("mtp.{k}.weight"))
+            .chain(self.layer().layout(ctx).map_keys(|k| keys.layer_key(0, &k)))
+            .chain(
+                self.pre_fc_norm_hidden()
+                    .layout(ctx)
+                    .map_keys(|k| format!("mtp.{k}.weight")),
+            )
+            .chain(
+                self.pre_fc_norm_embedding()
+                    .layout(ctx)
+                    .map_keys(|k| format!("mtp.{k}.weight")),
+            )
+            .chain(self.norm_head().layout(ctx).map_keys(|k| format!("mtp.{k}.weight")))
+    }
+}
+
 pub async fn load_27b_awq<D: DeviceClient + 'static>(
     dir: &Path,
     face: &mut D,

@@ -99,6 +99,12 @@ pub struct RunningEngine<D: DeviceClient> {
     pub(crate) blocks_m: BlockManager,
     /// 解释器执行环境(EnvProvider;逐 chunk/step 注入 ctx)
     pub(crate) env: owl_models::env::EnvProvider,
+    /// E5-M2:投机轮深(0 = 关;>0 = 每轮草稿数,调度发 SpecRound)
+    pub(crate) spec_depth: usize,
+    /// spec 快照有效性(轮首拍;恢复后仍有效,全接受后失效重拍)
+    pub(crate) spec_snap_valid: bool,
+    /// 多 token 轮的事件队列(pump 逐个出;SpecRound 一轮 m+1 token)
+    pub(crate) pending_events: std::collections::VecDeque<TurnEvent>,
 }
 
 impl<D: DeviceClient> RunningEngine<D> {
@@ -202,6 +208,11 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// + 执行(设备侧照办)—— 决策面可单测,执行器无决策权
     /// (调度层铺开 §S0;对标 vLLM v1 schedule/execute 分离)。
     pub async fn pump(&mut self) -> Result<TurnEvent> {
+        // E5-M2:spec 轮多 token 事件队列优先排空(schedule 前 —— 事件序
+        // 不可与下一轮调度交织)
+        if let Some(ev) = self.pending_events.pop_front() {
+            return Ok(ev);
+        }
         let prof = std::env::var_os("OWL_STEP_PROFILE").is_some();
         // metrics 框架接线(2026-10-01 合并示范):schedule 分相计时入
         // owl_shared 全局 store(debug 展开/release 零开销);prof 时查询
@@ -226,6 +237,9 @@ impl<D: DeviceClient> RunningEngine<D> {
                     }
                     StepAction::Decode { token, pos, kv_slot, gdn_slot, grew } => {
                         self.execute_decode(token, pos, kv_slot, gdn_slot, grew).await
+                    }
+                    StepAction::SpecRound { token, pos, kv_slots, gdn_slot, grew } => {
+                        self.execute_spec_round(token, pos, kv_slots, gdn_slot, grew).await
                     }
                 }
             }

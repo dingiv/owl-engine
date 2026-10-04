@@ -119,7 +119,14 @@ impl<D: DeviceClient + 'static> Engine<D> {
         } else {
             None
         };
-        let pool = StatePool::alloc(&mut self.face, dims, &loaded.spec.layer_types, s, pool_tokens, fi_quant).await?;
+        // E5-M2:投机轮深(OWL_SPEC_DEPTH;0 = 关;草稿器 M2b 接入前 =
+        // 哑草稿轮 —— 机制/恒等门先行)
+        let spec_depth = std::env::var("OWL_SPEC_DEPTH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&d| d > 0)
+            .unwrap_or(0);
+        let pool = StatePool::alloc(&mut self.face, dims, &loaded.spec.layer_types, s, pool_tokens, fi_quant, spec_depth > 0).await?;
         if fi_quant.is_some() {
             eprintln!(
                 "[boot] FlashInfer prefill 面启用(影子池 ×{},quant={:?})",
@@ -234,6 +241,9 @@ impl<D: DeviceClient + 'static> Engine<D> {
             rope: loaded.rope,
             blocks_m,
             env,
+            spec_depth,
+            spec_snap_valid: false,
+            pending_events: std::collections::VecDeque::new(),
         })
     }
 }

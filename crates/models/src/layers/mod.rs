@@ -31,6 +31,7 @@ pub mod embedding;
 pub mod gdn;
 pub mod linear;
 pub mod mlp;
+pub mod mtp;
 pub mod rmsnorm;
 pub mod rope;
 

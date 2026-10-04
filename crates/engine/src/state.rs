@@ -101,6 +101,9 @@ pub(crate) struct StatePool {
     /// v2 分页 decode scratch(E-decode 2026-10-04;paged 时恒分配,
     /// None = legacy/无页策略;引擎注入 ctx → 层走 v2 + LSE 归并)
     pub(crate) attn_v2: Option<owl_models::module::AttnV2Scratch>,
+    /// spec 快照(E5-M2:投机轮回滚缓冲;OWL_SPEC_DEPTH>0 时分配,
+    /// 内容 = 轮首 GDN 态 state@B-1;restore 后仍有效,全接受后失效重拍)
+    pub(crate) spec_snap: Option<GdnSnapSlot>,
     /// paged 池几何(页;legacy 模式 page = 容量,nb = 1)
     pub(crate) page: usize,
     pub(crate) nb: usize,
@@ -122,6 +125,7 @@ impl StatePool {
         seq_tokens: usize,
         pool_tokens: usize,
         fi: Option<owl_models::env::KvQuant>,
+        spec: bool,
     ) -> Result<StatePool> {
         let t = std::time::Instant::now();
         let n_full = layer_types.iter().filter(|&&f| f).count();
@@ -215,7 +219,20 @@ impl StatePool {
             gdns.len(),
             seq_tokens
         );
-        Ok(StatePool { kvs, k_fis, v_fis, fi_quant: fi, gdns, snaps, snap_tick: 0, bt, attn_v2, page, nb, paged, x, dims })
+        // spec 快照(E5-M2):专用缓冲(独立于 E2c 前缀快照池,免 LRU 逐出)
+        let spec_snap = if spec && paged {
+            let mut bufs = Vec::new();
+            for _ in 0..n_gdn {
+                bufs.push(zero_block(face, dims.nk * dims.hk * 3).await?);
+                bufs.push(zero_block(face, dims.nv * dims.hv * 3).await?);
+                bufs.push(zero_block(face, dims.nv * dims.hv * 3).await?);
+                bufs.push(zero_block(face, dims.nv * dims.hk * dims.hv).await?);
+            }
+            Some(GdnSnapSlot { key: None, last_use: 0, bufs })
+        } else {
+            None
+        };
+        Ok(StatePool { kvs, k_fis, v_fis, fi_quant: fi, gdns, snaps, snap_tick: 0, bt, spec_snap, attn_v2, page, nb, paged, x, dims })
     }
 
     /// v2 scratch 叶子(None = legacy;引擎按步注入 ctx.attn_v2)
@@ -478,6 +495,59 @@ impl StatePool {
             for (j, (dst, elems)) in quads.iter().enumerate() {
                 let row = elems / gdn_slots();
                 let src = &self.snaps[idx].bufs[li * 4 + j];
+                face.copy_block_at(&src.0, 0, dst, gdn_slot * row * 4, row * 4).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// spec 快照拍摄(E5-M2;轮首/全接受后):会话格 → 专用缓冲。
+    /// 与 E2c 前缀快照分池(spec 缓冲不参与 LRU,恢复后仍有效)。
+    pub(crate) async fn capture_spec_snap<D: DeviceClient>(
+        &mut self,
+        face: &mut D,
+        gdn_slot: usize,
+    ) -> Result<()> {
+        let snap = self
+            .spec_snap
+            .as_mut()
+            .ok_or_else(|| ModelError::Msg("spec 快照缓冲未分配(OWL_SPEC_DEPTH 未开)".into()))?;
+        for (li, g) in self.gdns.iter().enumerate() {
+            let quads = [
+                (&g.conv_q.0, g.conv_q.1),
+                (&g.conv_k.0, g.conv_k.1),
+                (&g.conv_v.0, g.conv_v.1),
+                (&g.rec.0, g.rec.1),
+            ];
+            for (j, (src, elems)) in quads.iter().enumerate() {
+                let row = elems / gdn_slots();
+                let dst = &snap.bufs[li * 4 + j];
+                face.copy_block_at(src, gdn_slot * row * 4, &dst.0, 0, row * 4).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// spec 快照恢复(E5-M2;部分接受后):专用缓冲 → 会话格(反向 D2D)。
+    pub(crate) async fn restore_spec_snap<D: DeviceClient>(
+        &mut self,
+        face: &mut D,
+        gdn_slot: usize,
+    ) -> Result<()> {
+        let snap = self
+            .spec_snap
+            .as_ref()
+            .ok_or_else(|| ModelError::Msg("spec 快照缓冲未分配".into()))?;
+        for (li, g) in self.gdns.iter().enumerate() {
+            let quads = [
+                (&g.conv_q.0, g.conv_q.1),
+                (&g.conv_k.0, g.conv_k.1),
+                (&g.conv_v.0, g.conv_v.1),
+                (&g.rec.0, g.rec.1),
+            ];
+            for (j, (dst, elems)) in quads.iter().enumerate() {
+                let row = elems / gdn_slots();
+                let src = &snap.bufs[li * 4 + j];
                 face.copy_block_at(&src.0, 0, dst, gdn_slot * row * 4, row * 4).await?;
             }
         }
