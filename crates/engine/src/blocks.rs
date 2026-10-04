@@ -135,8 +135,9 @@ impl BlockManager {
         let delta = need - have;
         if self.free_block_ids.len() < delta {
             return Err(ModelError::Msg(format!(
-                "KV 块池耗尽:需 {need} 块,空闲 {} —— 降低并发/上下文(E2c 驱逐另接)",
-                self.free_block_ids.len()
+                "KV 块池耗尽:需 {need} 块,空闲 {},table={} —— 降低并发/上下文(E2c 驱逐另接)",
+                self.free_block_ids.len(),
+                table.len()
             )));
         }
         for _ in 0..delta {

@@ -106,6 +106,8 @@ pub(crate) struct StatePool {
     pub(crate) spec_snap: Option<GdnSnapSlot>,
     /// MTP 草稿链 KV 池(E5-M2b;独立页池,1 层;mtp 模式分配)
     pub(crate) mtp_kvs: Option<KvBlocks>,
+    /// DFlash2 草稿 KV 池(E5-DF2;独立页池,5 层草稿几何 8/128)
+    pub(crate) dflash_kvs: Option<Vec<KvBlocks>>,
     /// MTP 链持久块表槽(E5-M5 propose 图烘焙;[1, nb] f32,每轮重写)
     pub(crate) bt_mtp: Option<Bytes>,
     /// paged 池几何(页;legacy 模式 page = 容量,nb = 1)
@@ -131,6 +133,7 @@ impl StatePool {
         fi: Option<owl_models::env::KvQuant>,
         spec: bool,
         mtp: bool,
+        dflash: bool,
     ) -> Result<StatePool> {
         let t = std::time::Instant::now();
         let n_full = layer_types.iter().filter(|&&f| f).count();
@@ -160,6 +163,21 @@ impl StatePool {
                 k_cache: zero_block_dt(face, nb * dims.hkv * dims.hd * page, dims.dtype).await?,
                 v_cache: zero_block_dt(face, nb * dims.hkv * dims.hd * page, dims.dtype).await?,
             })
+        } else {
+            None
+        };
+        // DFlash2 草稿池(E5-DF2):5 层 × 草稿几何(8 KV 头 × hd128;
+        // z-lab 检查点家族定形),容量同 pool_tokens。仅 paged。
+        let dflash_kvs = if dflash && paged {
+            let (dkv, dhd, dlayers) = (8usize, 128usize, 5usize);
+            let mut ks = Vec::with_capacity(dlayers);
+            for _ in 0..dlayers {
+                ks.push(KvBlocks {
+                    k_cache: zero_block_dt(face, nb * dkv * dhd * page, dims.dtype).await?,
+                    v_cache: zero_block_dt(face, nb * dkv * dhd * page, dims.dtype).await?,
+                });
+            }
+            Some(ks)
         } else {
             None
         };
@@ -235,11 +253,14 @@ impl StatePool {
             }
         }
         eprintln!(
-            "[boot] 状态块分配 {:.2}s(kv f16 ×{} / gdn ×{},槽位 {})",
+            "[boot] 状态块分配 {:.2}s(kv f16 ×{} / gdn ×{},槽位 {},nb = {nb},page = {page},dflash = {df})",
             t.elapsed().as_secs_f32(),
             kvs.len(),
             gdns.len(),
-            seq_tokens
+            seq_tokens,
+            nb = nb,
+            page = page,
+            df = dflash_kvs.is_some()
         );
         // spec 快照(E5-M2):专用缓冲(独立于 E2c 前缀快照池,免 LRU 逐出)
         let spec_snap = if spec && paged {
@@ -254,7 +275,7 @@ impl StatePool {
         } else {
             None
         };
-        Ok(StatePool { kvs, k_fis, v_fis, fi_quant: fi, gdns, snaps, snap_tick: 0, bt, bt_mtp, spec_snap, mtp_kvs, attn_v2, page, nb, paged, x, dims })
+        Ok(StatePool { kvs, k_fis, v_fis, fi_quant: fi, gdns, snaps, snap_tick: 0, bt, bt_mtp, spec_snap, mtp_kvs, dflash_kvs, attn_v2, page, nb, paged, x, dims })
     }
 
     /// MTP 链块表叶子(propose 图烘焙;None = 未启用)
@@ -291,6 +312,29 @@ impl StatePool {
     /// GDN 层数(fold 记录槽计数用)
     pub(crate) fn gdn_count(&self) -> usize {
         self.gdns.len()
+    }
+
+    /// DFlash2 草稿 KV 叶子组(dflash 模式;5 层 × (k, v);None = 未启用)
+    pub(crate) fn dflash_kv_leaves(&self) -> Option<Vec<(TensorOps, TensorOps)>> {
+        let ks = self.dflash_kvs.as_ref()?;
+        let (dkv, dhd) = (8usize, 128usize);
+        Some(ks
+            .iter()
+            .map(|kb| {
+                (
+                    block_leaf_dt(
+                        &kb.k_cache.0,
+                        vec![self.nb, dkv, dhd / self.x, self.page, self.x],
+                        self.dims.dtype,
+                    ),
+                    block_leaf_dt(
+                        &kb.v_cache.0,
+                        vec![self.nb, dkv, dhd, self.page],
+                        self.dims.dtype,
+                    ),
+                )
+            })
+            .collect())
     }
 
     /// MTP 草稿链 KV 叶子对(mtp 模式;None = 未启用)

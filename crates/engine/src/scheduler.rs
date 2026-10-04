@@ -67,7 +67,7 @@ pub(crate) enum StepAction {
     SpecRound {
         token: u32,
         pos: usize,
-        kv_slots: [u32; 4],
+        kv_slots: [u32; 9],
         gdn_slot: usize,
         grew: bool,
     },
@@ -203,9 +203,13 @@ impl<D: DeviceClient> RunningEngine<D> {
                 b * page as u32 + (p % page) as u32
             };
             if spec > 0 {
-                let mut kv_slots = [0u32; 4];
+                // 槽表 = verify 块位(pos..pos+spec);余槽补 0(消费面
+                // 自算物理槽,此表仅 decode 回退臂消费 depth+1 个)
+                let mut kv_slots = [0u32; 9];
                 for (i, sl) in kv_slots.iter_mut().enumerate() {
-                    *sl = slot_at(pos + i);
+                    if i <= spec {
+                        *sl = slot_at(pos + i);
+                    }
                 }
                 (slot_at(pos), Some(kv_slots), s.gdn_slot, grew)
             } else {

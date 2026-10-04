@@ -946,7 +946,7 @@ async fn gpu_27b_chat_inference() {
                 std::env::set_var("OWL_SPEC_DEPTH", "3");
                 // verify 捕获实需 ~100MB(T=4 × 64 层 × m=4 激活;cap-prof
                 // 直方图定谳);decode 臂保持默认 64
-                std::env::set_var("OWL_CAPTURE_SLAB_MB", "128");
+                std::env::set_var("OWL_CAPTURE_SLAB_MB", "160");
             } else {
                 std::env::remove_var("OWL_SPEC_DEPTH");
             }
@@ -992,6 +992,95 @@ async fn gpu_27b_chat_inference() {
             "OWL_GDN_SLOTS",
             "OWL_SNAP_MAX",
             "OWL_PREFIX_CACHE",
+        ] {
+            std::env::remove_var(v);
+        }
+    }
+
+    /// E5-DF3 恒等门(27B AWQ target + DFlash2 草稿):greedy spec 文本
+    /// ≡ 无 spec 逐位。门控 OWL_TEST_DEVICE + OWL_AWQ27B_DIR +
+    /// OWL_DFLASH2_DIR。**20G 卡贴顶**(target ~13.7G + draft 3.85G +
+    /// 池)—— OOM 时降 max_seq_tokens/挪 24G 卡。
+    #[tokio::test]
+    async fn gpu_dflash2_identity_gate_27b() {
+        let Some(ordinal) = gpu_ordinal() else {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return;
+        };
+        let Ok(dir) = std::env::var("OWL_AWQ27B_DIR") else {
+            eprintln!("skip: OWL_AWQ27B_DIR 未设(cyankiwi 检查点目录)");
+            return;
+        };
+        let Ok(ddir) = std::env::var("OWL_DFLASH2_DIR") else {
+            eprintln!("skip: OWL_DFLASH2_DIR 未设(DFlash2 草稿目录)");
+            return;
+        };
+        let prompt = "用五十字介绍长城。";
+
+        async fn gen(
+            spec: bool,
+            ordinal: usize,
+            dir: &str,
+            ddir: &str,
+            prompt: &str,
+        ) -> (String, Vec<u32>) {
+            std::env::set_var("OWL_SAMPLER", "greedy");
+            std::env::remove_var("OWL_REP_PENALTY");
+            std::env::set_var("OWL_GDN_SLOTS", "1");
+            std::env::set_var("OWL_SNAP_MAX", "1");
+            std::env::set_var("OWL_PREFIX_CACHE", "0");
+            std::env::set_var("OWL_DFLASH2_DIR", ddir);
+            if spec {
+                std::env::set_var("OWL_SPEC_DEPTH", "7");
+                std::env::set_var("OWL_CAPTURE_SLAB_MB", "160");
+            } else {
+                std::env::remove_var("OWL_SPEC_DEPTH");
+                std::env::remove_var("OWL_DFLASH2_DIR");
+            }
+            let mut engine = Engine::new(EngineConfig {
+                device_ordinal: ordinal,
+                max_seq_tokens: 192,
+                prefill_chunk: 32,
+            })
+            .expect("构造");
+            let loaded = engine
+                .loader()
+                .load_qwen38_27b_awq(std::path::Path::new(dir), std::path::Path::new(dir))
+                .await
+                .expect("装载");
+            let mut running = engine.run(loaded).await.expect("装配");
+            let (sid, id) = running.submit_session(Some(7), prompt, 40).expect("submit");
+            let text = drive_turn(&mut running, id).await;
+            let toks = running
+                .sessions
+                .get(sid)
+                .map(|s| s.tokens.clone())
+                .unwrap_or_default();
+            let st = running.spec_stats;
+            let al = if st.rounds > 0 { st.sum_m as f64 / st.rounds as f64 } else { 0.0 };
+            eprintln!(
+                "[dflash-gate] spec={spec} rounds={} sum_m={} AL={al:.2}",
+                st.rounds, st.sum_m
+            );
+            (text, toks)
+        }
+
+        let (ta, ta_tokens) = gen(false, ordinal, &dir, &ddir, prompt).await;
+        let (tb, tb_tokens) = gen(true, ordinal, &dir, &ddir, prompt).await;
+        eprintln!(
+            "[dflash-gate] baseline({}tok)={ta:?}\n[dflash-gate] spec({}tok)={tb:?}",
+            ta_tokens.len(),
+            tb_tokens.len()
+        );
+        assert_eq!(ta, tb, "恒等门 DFlash2:greedy 真草稿 spec 文本 ≡ 无 spec");
+        assert_eq!(ta_tokens, tb_tokens, "恒等门 DFlash2:token 账逐位一致");
+        for v in [
+            "OWL_SPEC_DEPTH",
+            "OWL_CAPTURE_SLAB_MB",
+            "OWL_GDN_SLOTS",
+            "OWL_SNAP_MAX",
+            "OWL_PREFIX_CACHE",
+            "OWL_DFLASH2_DIR",
         ] {
             std::env::remove_var(v);
         }

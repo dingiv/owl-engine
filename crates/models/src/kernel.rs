@@ -179,6 +179,16 @@ pub static REGISTRY: &[Entry] = &[
     Entry { name: "owl_sigmoid_gate_mul_f16", source: sources::owl::SIGMOID_GATE_MUL_F16, args: "T,T,sz,T", dtype: crate::contract::Dtype::F16 },
     // 刀3a'(2026-10-04):双权 GEMV(b/a 投影单发;grid (ceil(rows/4), m))
     Entry { name: "owl_gemv_dual_f16", source: sources::owl::GEMV_DUAL_F16, args: "T,T,T,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    // ---- DFlash2 草稿特有核族(E5-DF1;2026-10-07;语义锚 = sglang dflash.py)----
+    // 分组动态深度 2-tap 卷积(delta [T,2,2,G] side-major + base [2,2,H];
+    // 位置掩码 t%block;group=16 烘焙;propose T=8 定形,extend 不走本核)
+    Entry { name: "owl_dflash_conv_f16", source: sources::owl::DFLASH2_F16, args: "T,T,T,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    // 逐行 top-16(单缓冲 [rows, 32]:值半区降序 + 索引半区,双 f32)
+    Entry { name: "owl_topk16_f16", source: sources::owl::DFLASH2_F16, args: "T,i32,T", dtype: crate::contract::Dtype::F32 },
+    // selector 格打分 + 贪心 walk 融合(单缓冲 [S·(K·K+1)]:toks + scores)
+    Entry { name: "owl_dflash_select_f16", source: sources::owl::DFLASH2_F16, args: "T,T,T,T,T,T,i32,i32,i32,T", dtype: crate::contract::Dtype::F32 },
+    // 非因果块 attention(自块直读 + 前缀池;classic 寻址同 reshape_and_cache)
+    Entry { name: "owl_naive_attn_nc_f16", source: sources::owl::DFLASH2_F16, args: "T,T,T,T,T,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     // ---- 融合核族(C1;2026-10-01;Ampere-first,单输出 SSA 契约友好)----
     // norm_rope:qk-norm(×(1+w)^{w_off})+ rotate-half partial rope 三发合一
     // (narrow+norm+rope;strided 读 q_raw 的 per-head [value|gate] 半段)

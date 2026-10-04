@@ -135,33 +135,66 @@ impl<D: DeviceClient + 'static> Engine<D> {
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&d| d > 0)
             .unwrap_or(0);
+        let dflash2_dir = std::env::var("OWL_DFLASH2_DIR").ok();
         let spec_mode = if spec_depth_raw == 0 {
             crate::running::SpecMode::Off
+        } else if dflash2_dir.is_some() {
+            crate::running::SpecMode::DFlash2
         } else if loaded.mtp_dir.is_some() {
             crate::running::SpecMode::Mtp
         } else if std::env::var_os("OWL_SPEC_DUMB").is_some() {
             crate::running::SpecMode::Dumb
         } else {
-            eprintln!("[boot] OWL_SPEC_DEPTH>0 但无草稿器(非 mtp 检查点)→ C7 回落 DecodeBatch");
+            eprintln!("[boot] OWL_SPEC_DEPTH>0 但无草稿器(非 mtp/dflash2 检查点)→ C7 回落 DecodeBatch");
             crate::running::SpecMode::Off
         };
-        let spec_depth = if spec_mode == crate::running::SpecMode::Off { 0 } else { spec_depth_raw.min(3) };
+        let spec_depth = if spec_mode == crate::running::SpecMode::Off {
+            0
+        } else if spec_mode == crate::running::SpecMode::DFlash2 {
+            // DFlash2:block_size 8 = 1 锚 + 7 草稿(检查点家族定形)
+            spec_depth_raw.min(7)
+        } else {
+            spec_depth_raw.min(3)
+        };
         if spec_mode != crate::running::SpecMode::Off {
             eprintln!(
                 "[boot] spec 模式 = {:?} depth={spec_depth}(注:spec 轮恒 greedy,采样 parity 挂 D4 device accept)",
                 spec_mode
             );
         }
-        // MTP 草稿头装载(mtp 模式;embed/lm_head 共享 target)
-        let drafter = if spec_mode == crate::running::SpecMode::Mtp {
-            let dir = loaded.mtp_dir.as_ref().expect("mtp_dir");
-            let (mtp, _) = owl_models::specs::qwen35::load_27b_mtp(dir, &mut self.face).await?;
-            eprintln!("[boot] MTP 草稿头装载(spec depth={spec_depth})");
-            Some(std::sync::Arc::new(mtp))
-        } else {
-            None
+        // 草稿器装载(C7;embed/lm_head 均共享 target)
+        let drafter = match spec_mode {
+            crate::running::SpecMode::Mtp => {
+                let dir = loaded.mtp_dir.as_ref().expect("mtp_dir");
+                let (mtp, _) = owl_models::specs::qwen35::load_27b_mtp(dir, &mut self.face).await?;
+                eprintln!("[boot] MTP 草稿头装载(spec depth={spec_depth})");
+                Some(crate::running::Drafter::Mtp(std::sync::Arc::new(mtp)))
+            }
+            crate::running::SpecMode::DFlash2 => {
+                let dir = dflash2_dir.as_ref().expect("dflash2_dir");
+                let (d2, _) = owl_models::specs::qwen35::load_27b_dflash2(std::path::Path::new(dir), &mut self.face).await?;
+                eprintln!("[boot] DFlash2 草稿装载(depth={spec_depth};1.92B f16)");
+                Some(crate::running::Drafter::DFlash2(std::sync::Arc::new(d2)))
+            }
+            _ => None,
         };
-        let pool = StatePool::alloc(&mut self.face, dims, &loaded.spec.layer_types, s, pool_tokens, fi_quant, spec_depth > 0, spec_mode == crate::running::SpecMode::Mtp).await?;
+        // DFlash2 草稿 rope(θ 1e7,rotary 全维 128;z-lab 检查点家族)
+        let draft_rope = match &drafter {
+            Some(crate::running::Drafter::DFlash2(_)) => {
+                let dr = owl_models::layers::rope::Rope::new(262_144, 128, 128, 1.0e7)?;
+                {
+                    let ctx = owl_models::module::LoaderCtx {
+                        dtype: owl_models::contract::Dtype::F16,
+                        shard: 1,
+                        device_repack: false,
+                    };
+                    owl_models::interpreters::eval_load(&dr, &mut self.face, &dr.tables(), &ctx).await?;
+                }
+                Some(std::sync::Arc::new(dr))
+            }
+            _ => None,
+        };
+        let pool = StatePool::alloc(&mut self.face, dims, &loaded.spec.layer_types, s, pool_tokens, fi_quant, spec_depth > 0, spec_mode == crate::running::SpecMode::Mtp, spec_mode == crate::running::SpecMode::DFlash2).await?;
         if fi_quant.is_some() {
             eprintln!(
                 "[boot] FlashInfer prefill 面启用(影子池 ×{},quant={:?})",
@@ -293,6 +326,13 @@ impl<D: DeviceClient + 'static> Engine<D> {
                 OutputSlot { name: "tok".into(), shape: vec![depth1, 1], dtype: Dtype::F32 },
                 OutputSlot { name: "hid".into(), shape: vec![depth1, dims.hidden], dtype: dims.dtype },
             ];
+            // DFlash2 target taps(E5-DF2;层输出残差流,sglang capture 同语义)
+            let dflash_taps = matches!(spec_mode, crate::running::SpecMode::DFlash2);
+            if dflash_taps {
+                for i in 0..5 {
+                    vouts.push(OutputSlot { name: format!("tap{i}"), shape: vec![depth1, dims.hidden], dtype: dims.dtype });
+                }
+            }
             for i in 0..gdn_caches.len() * 8 {
                 let (gi, f) = (i / 8, i % 8);
                 let shape = match f {
@@ -355,7 +395,17 @@ impl<D: DeviceClient + 'static> Engine<D> {
                         std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
                     ctx.gdn_tap = Some(tap.clone());
                     let vocab = model_v.vocab_size();
-                    let hidden = model_v.last_hidden(&ids, &ctx);
+                    let (hidden, taps) = if dflash_taps {
+                        let (h, t) = model_v.tapped_hidden(&ids, &ctx, &[5, 19, 33, 47, 61]);
+                        for (i, t) in t.iter().enumerate() {
+                            sc.output(format!("tap{i}"), t)?;
+                        }
+                        (h, t)
+                    } else {
+                        let h = model_v.last_hidden(&ids, &ctx);
+                        (h.clone(), vec![h])
+                    };
+                    let _ = &taps;
                     let logits = model_v.embed.lm_head_matmul(&hidden);
                     let rows: Vec<owl_models::tensor::TensorOps> = (0..depth1)
                         .map(|r| owl_models::ops::argmax_f32idx(&logits, vocab, r * vocab))
@@ -486,7 +536,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
             // E5-M5:propose 桶形图族(index = m ∈ 0..=depth —— 全接受
             // m=depth 也要出下轮草稿;extend m+1 行 + k-1 链步;
             // hidden = verify hid 槽前缀视图;lm_head/链全部入图)。
-            if let Some(mtp) = drafter.as_ref() {
+            if let Some(crate::running::Drafter::Mtp(mtp)) = drafter.as_ref() {
                 let dd = dims;
                 let key_dim = dims.nk * dims.hk;
                 let value_dim = dims.nv * dims.hv;
@@ -603,6 +653,8 @@ impl<D: DeviceClient + 'static> Engine<D> {
             fold_graphs,
             propose_graphs,
             spec_drafts_host: None,
+            draft_rope,
+            dflash_tap_count: if matches!(spec_mode, crate::running::SpecMode::DFlash2) { 5 } else { 0 },
             spec_seed_hidden: None,
             spec_stats: crate::running::SpecStats::default(),
             spec_snap_valid: false,

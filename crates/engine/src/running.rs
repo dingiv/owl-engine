@@ -106,7 +106,7 @@ pub struct RunningEngine<D: DeviceClient> {
     pub(crate) spec_mode: SpecMode,
     /// MTP 草稿头(mtp 模式;embed/lm_head 共享 target 不持有;Arc =
     /// propose 图闭包共享)
-    pub(crate) drafter: Option<std::sync::Arc<owl_models::layers::mtp::MtpPredictor>>,
+    pub(crate) drafter: Option<Drafter>,
     /// MTP 链页账房(E5-M2b;独立页池,无前缀缓存)
     pub(crate) blocks_mtp: BlockManager,
     /// verify 桶形图(E5-M4;T = depth+1 定形,输出 tok/hid + fold 记录;
@@ -125,6 +125,10 @@ pub struct RunningEngine<D: DeviceClient> {
     /// prefill 末行 hidden(device 块 [1,hidden];首轮 propose 的
     /// anchor_hidden;消费后置 None)
     pub(crate) spec_seed_hidden: Option<owl_iface::contract::Bytes>,
+    /// DFlash2 草稿 rope(θ 1e7;dfflash 模式 Some)
+    pub(crate) draft_rope: Option<std::sync::Arc<owl_models::layers::rope::Rope>>,
+    /// DFlash2 target taps 数(dflash 模式 = 5;其余 0)
+    pub(crate) dflash_tap_count: usize,
     /// spec 接受账(M2b 恒等门覆盖断言:三路 m 分布 + 账目闭合)
     pub(crate) spec_stats: SpecStats,
     /// spec 快照有效性(轮首拍;恢复后仍有效,全接受后失效重拍)
@@ -141,6 +145,14 @@ pub(crate) enum SpecMode {
     Off,
     Dumb,
     Mtp,
+    /// DFlash2 码本选择器草稿(E5-DF;OWL_DFLASH2_DIR)
+    DFlash2,
+}
+
+/// 草稿器枚举(E5-DF;MTP 链式 / DFlash2 噪声块式双族)
+pub(crate) enum Drafter {
+    Mtp(std::sync::Arc<owl_models::layers::mtp::MtpPredictor>),
+    DFlash2(std::sync::Arc<owl_models::layers::dflash2::DFlash2Draft>),
 }
 
 /// spec 接受账(轮级;恒等门/接受率观测面)

@@ -159,12 +159,24 @@ pub fn eval_ops_multi<'a, D>(
 where
     D: crate::contract::DeviceClient + 'a,
 {
+    eval_ops_multi_env(roots, face, crate::env::EnvProvider::default())
+}
+
+/// 多根 + 环境(E5-DF2;prefill taps 同树多根,层声明 env 与执行 env 双通)
+pub fn eval_ops_multi_env<'a, D>(
+    roots: &'a [&'a TensorOps],
+    face: &'a mut D,
+    env: crate::env::EnvProvider,
+) -> Pin<Box<dyn Future<Output = Result<Vec<Bytes>, ModelError>> + Send + 'a>>
+where
+    D: crate::contract::DeviceClient + 'a,
+{
     Box::pin(async move {
         let mut ctx =
             EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new(),
                 arena_set: std::collections::HashSet::new(),
                 block_users: std::collections::HashMap::new(),
-                pending: std::collections::HashMap::new(), reclaim: false, env: crate::env::EnvProvider::default() };
+                pending: std::collections::HashMap::new(), reclaim: false, env };
         let mut out = Vec::with_capacity(roots.len());
         for r in roots {
             out.push(_eval_rec(r, &mut ctx).await?);

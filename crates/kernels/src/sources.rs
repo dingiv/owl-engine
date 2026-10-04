@@ -22,6 +22,8 @@ pub mod owl {
     pub const GEMV_DUAL_F16: &str = include_str!("../cu/owl/gemv_dual_f16.cu");
     /// 设备侧贪心采样(E3;REQ-DEC-04)
     pub const ARGMAX_F16: &str = include_str!("../cu/owl/argmax_f16.cu");
+    /// DFlash2 草稿特有核族(E5-DF1;conv/topk16/selector/naive-NC-attn)
+    pub const DFLASH2_F16: &str = include_str!("../cu/owl/dflash2.cu");
     // ---- 融合核族(C1;2026-10-01;Ampere-first 准则见 .cu 头注)----
     pub const NORM_ROPE_F16: &str = include_str!("../cu/owl/fused.cu");
     pub const SILU_AND_MUL_F16: &str = include_str!("../cu/owl/fused.cu");

@@ -177,6 +177,92 @@ pub async fn load_27b_mtp<D: DeviceClient + 'static>(
     Ok((mtp, manifest))
 }
 
+/// 装载 **Qwen3.8-27B DFlash2 草稿**(2026-10-07;E5-DF1,
+/// z-lab/Qwen3.8-27B-DFlash2,BF16 81 张量 1.92B —— 结构见
+/// layers/dflash2.rs 头注;键约定 = 检查点原生命名直映)。
+/// 全 F16 直转装载(BF16 源 → f16;fc 走 Transposed 臂,装载期 host
+/// 转置 —— W^T 行连续 = 列块,消费面逐 tap slice_view;设备重排优化挂账)。
+pub async fn load_27b_dflash2<D: DeviceClient + 'static>(
+    dir: &Path,
+    face: &mut D,
+) -> Result<(crate::layers::dflash2::DFlash2Draft, crate::module::LoadManifest), ModelError> {
+    let draft = crate::layers::dflash2::DFlash2Draft::new(5120, 17408, 32, 8, 128, 5, 1e-6, 248320);
+    let src = SafeTensorsSource::open_dir(dir)?;
+    let ctx = crate::module::LoaderCtx {
+        dtype: crate::contract::Dtype::F16,
+        shard: 1,
+        device_repack: false,
+    };
+    let manifest = crate::interpreters::eval_load(&draft, face, &src, &ctx).await?;
+    Ok((draft, manifest))
+}
+
+/// DFlash2 草稿键映射(检查点原生命名;conv 的 base_kernel 无 .weight
+/// 后缀、codebook 两键亦然 —— 三特例在闭包内分流)。
+impl Loadable for crate::layers::dflash2::DFlash2Draft {
+    fn layout(&self, ctx: &LoaderCtx) -> LoaderOps {
+        let w = |k: &str| format!("{k}.weight");
+        let mut ops = self
+            .fc()
+            .layout(ctx)
+            .map_keys(|k| format!("{k}.weight"))
+            .chain(self.hidden_norm().layout(ctx).map_keys(w));
+        for (i, layer) in self.layers().iter().enumerate() {
+            let conv_tail = |k: &str| {
+                if k == "base_kernel" { k.to_string() } else { format!("{k}.weight") }
+            };
+            ops = ops
+                .chain(
+                    layer
+                        .input_ln()
+                        .layout(ctx)
+                        .map_keys(|k| format!("layers.{i}.{k}.weight")),
+                )
+                .chain(
+                    layer
+                        .attn_conv()
+                        .layout(ctx)
+                        .map_keys(move |k| format!("layers.{i}.attention_conv.{}", conv_tail(k))),
+                )
+                .chain(
+                    layer
+                        .attn()
+                        .layout(ctx)
+                        .map_keys(|k| format!("layers.{i}.self_attn.{k}.weight")),
+                )
+                .chain(
+                    layer
+                        .post_ln()
+                        .layout(ctx)
+                        .map_keys(|k| format!("layers.{i}.{k}.weight")),
+                )
+                .chain({
+                    let conv_tail = |k: &str| {
+                        if k == "base_kernel" { k.to_string() } else { format!("{k}.weight") }
+                    };
+                    layer
+                        .mlp_conv()
+                        .layout(ctx)
+                        .map_keys(move |k| format!("layers.{i}.mlp_conv.{}", conv_tail(k)))
+                })
+                .chain(
+                    layer
+                        .mlp()
+                        .layout(ctx)
+                        .map_keys(|k| format!("layers.{i}.mlp.{k}.weight")),
+                );
+        }
+        ops.chain(self.norm_head().layout(ctx).map_keys(w)).chain(
+            self.selector()
+                .layout(ctx)
+                .map_keys(|k| match k {
+                    "hidden_projection" => "candidate_selector.hidden_projection.weight".into(),
+                    other => format!("candidate_selector.{other}"),
+                }),
+        )
+    }
+}
+
 /// MTP 头键映射(layout 期改写;与 Qwen35Convention::layer_key 同式,
 /// base = "mtp",层序号恒 0 —— 键约定住 specs 家规的落点)。
 impl Loadable for crate::layers::mtp::MtpPredictor {
@@ -1023,4 +1109,145 @@ mod tests {
         }
         gpu.close().await.expect("关机");
     }
+    /// E5-DF1 验收:DFlash2 检查点装载(81 键)+ fc 采样对拍 +
+    /// encode/selector 真几何冒烟。门控 OWL_TEST_DEVICE + OWL_DFLASH2_DIR
+    /// (z-lab/Qwen3.8-27B-DFlash2 目录)。
+    #[tokio::test]
+    async fn gpu_dflash2_27b_loads_and_smokes() {
+        if !crate::testkit::gpu_enabled() {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return;
+        }
+        let Ok(dir) = std::env::var("OWL_DFLASH2_DIR") else {
+            eprintln!("skip: OWL_DFLASH2_DIR 未设(DFlash2 检查点目录)");
+            return;
+        };
+        let dir = std::path::Path::new(&dir);
+        let mut gpu = crate::testkit::gpu_client().await;
+        let (draft, manifest) = load_27b_dflash2(dir, &mut gpu)
+            .await
+            .expect("DFlash2 装载");
+        assert_eq!(draft.hidden(), 5120);
+
+        // 键集断言:81 键,fc/hidden_norm/norm/selector + 5 层全件
+        let keys: Vec<String> = manifest.entries().iter().map(|e| e.key.clone()).collect();
+        assert_eq!(keys.len(), 81, "键数实际 {}", keys.len());
+        for expect in [
+            "fc.weight",
+            "hidden_norm.weight",
+            "norm.weight",
+            "candidate_selector.hidden_projection.weight",
+            "candidate_selector.predecessor_codebook",
+            "candidate_selector.successor_codebook",
+            "layers.0.attention_conv.base_kernel",
+            "layers.4.mlp_conv.kernel_projection.weight",
+            "layers.4.self_attn.k_norm.weight",
+            "layers.4.mlp.down_proj.weight",
+        ] {
+            assert!(keys.iter().any(|k| k == expect), "缺键 {expect}");
+        }
+
+        // fc 采样对拍:y[o] = Σ_k tap[k]·W[o][k](W [5120, 25600] 行主序;
+        // 采样 8 个输出元全量内积 —— 免 262M 全量 MAC)
+        use crate::module::WeightSource;
+        let mut src = crate::formats::safetensors::SafeTensorsSource::open_dir(dir).unwrap();
+        let w_fc = src.take("fc.weight").expect("fc 源");
+        let hn = src.take("hidden_norm.weight").expect("hn 源");
+        let fan = 5 * 5120usize;
+        let (hidden_d, row_n) = (5120usize, 5120usize);
+        let row: Vec<f32> = (0..row_n)
+            .map(|i| half::f16::from_f32(((i as f32) * 0.13).sin() * 0.4).to_f32())
+            .collect();
+        let row_t = crate::TensorOps::from_host(
+            crate::contract::Dtype::F16,
+            vec![1, row_n],
+            &row.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>(),
+        );
+        let ctx = crate::module::ForwardCtx::minimal(1);
+        let mem = draft.project_memory(&[row_t.clone(), row_t.clone(), row_t.clone(), row_t.clone(), row_t.clone()], &ctx);
+        let got = crate::testkit::harvest_f16(&mut gpu, &mem).await;
+        let r16 = |x: f32| half::f16::from_f32(x).to_f32();
+        // 完整行 host 重建(1 行 fc = 131M MAC;debug 逐元素循环偏慢属预期)
+        let mut fc_out = vec![0f32; hidden_d];
+        for (o, out) in fc_out.iter_mut().enumerate() {
+            // 五 taps 恒等 → y[o] = Σ_{j<fan} row[j % 5120]·W[o][j](全列块)
+            let mut acc = 0f32;
+            for j in 0..fan {
+                acc += row[j % row_n] * r16(w_fc[o * fan + j]);
+            }
+            *out = acc;
+        }
+        let ms: f32 = fc_out.iter().map(|&v| v * v).sum::<f32>() / 5120.0;
+        let inv = 1.0 / (ms + 1e-6).sqrt();
+        let mut want = vec![0f32; 5120];
+        for c in 0..5120 {
+            want[c] = fc_out[c] * inv * (1.0 + r16(hn[c]));
+        }
+        crate::testkit::assert_close(&got, &want, 5e-2, "project_memory(fc+hidden_norm)");
+
+        // selector 真几何冒烟:logits [7, 248320](host 随机)→ topk →
+        // lattice + walk;锚 = 输出有限 + token 落词表内
+        let vocab = 248320usize;
+        let rows = crate::layers::dflash2::DEPTH;
+        let logits: Vec<f32> = (0..rows * vocab)
+            .map(|i| half::f16::from_f32(((i as f32) * 0.017).sin() * 8.0).to_f32())
+            .collect();
+        let logits_t = crate::TensorOps::from_host(
+            crate::contract::Dtype::F16,
+            vec![rows, vocab],
+            &logits.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>(),
+        );
+        let topk = crate::TensorOps::of(crate::kernel::kernel_with(
+            "owl_topk16_f16", (rows as u32, 1, 1), (256, 1, 1), 0,
+        ))
+        .arg(&logits_t)
+        .arg_i32(vocab as i32)
+        .with_shape(crate::contract::Dtype::F32, vec![rows, 32]);
+        let topk_full = crate::testkit::harvest(&mut gpu, &topk).await;
+        let cand: Vec<f32> = (0..rows)
+            .flat_map(|r| topk_full[r * 32 + 16..(r + 1) * 32].to_vec())
+            .collect();
+        let unary: Vec<f32> = (0..rows)
+            .flat_map(|r| topk_full[r * 32..r * 32 + 16].to_vec())
+            .collect();
+        // proj = hidden_projection(hidden)[rows, 256];hidden 随机 f16
+        let hidden: Vec<f32> = (0..(rows + 1) * 5120)
+            .map(|i| half::f16::from_f32(((i as f32) * 0.019).cos() * 0.3).to_f32())
+            .collect();
+        let hidden_t = crate::TensorOps::from_host(
+            crate::contract::Dtype::F16,
+            vec![rows + 1, 5120],
+            &hidden.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>(),
+        );
+        let pred = hidden_t.slice_view(5120, vec![rows, 5120]);
+        let proj = crate::interpreters::eval_ops(
+            draft.selector().proj().forward(&pred, &ctx).step(), &mut gpu)
+            .await
+            .expect("proj eval");
+        let proj_t = crate::TensorOps::of_block(proj.id, crate::contract::Dtype::F16, vec![rows, 256]);
+        let anchor_t = crate::TensorOps::from_host(
+            crate::contract::Dtype::F32, vec![1], &crate::testkit::f32b(&[42.0]),
+        );
+        let sel_out = crate::TensorOps::of(crate::kernel::kernel_with(
+            "owl_dflash_select_f16", (1, 1, 1), (256, 1, 1), 0,
+        ))
+        .arg(&crate::TensorOps::from_host(crate::contract::Dtype::F32, vec![rows, 16], &crate::testkit::f32b(&cand)))
+        .arg(&crate::TensorOps::from_host(crate::contract::Dtype::F32, vec![rows, 16], &crate::testkit::f32b(&unary)))
+        .arg(&proj_t)
+        .arg(&anchor_t)
+        .arg(&draft.selector().a_code().decl())
+        .arg(&draft.selector().b_code().decl())
+        .arg_i32(rows as i32)
+        .arg_i32(16)
+        .arg_i32(256)
+        .with_shape(crate::contract::Dtype::F32, vec![rows * (16 * 16 + 1)]);
+        let sel_full = crate::testkit::harvest(&mut gpu, &sel_out).await;
+        for (e, &tok) in sel_full[..rows].iter().enumerate() {
+            assert!(tok >= 0.0 && tok < vocab as f32, "walk token 越界 e{e} = {tok}");
+            assert!(tok.fract() == 0.0, "walk token 非整 e{e} = {tok}");
+        }
+        eprintln!("[dflash2] 27B 装载 + fc 对拍 + selector 冒烟全绿(81 键)");
+        gpu.close().await.expect("关机");
+    }
+
 }

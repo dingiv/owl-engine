@@ -26,6 +26,7 @@
 //! vision ViT、MTP、chunked prefill、量化。
 
 pub mod attention;
+pub mod dflash2;
 pub mod decoder;
 pub mod embedding;
 pub mod gdn;
