@@ -89,7 +89,7 @@ pub(crate) fn narrow_strided(
 /// → [n·r, d]。n ≤ 8(展开路径 = 测试锚封顶;生产 prefill 走 PF1b 批核
 /// varlen 核,大 T 不经此核)。n < 8 多余指针位重复首块(核内防读)。
 /// dtype 跟随首输入(f16)。
-pub(crate) fn concat_rows(inputs: &[&TensorOps], r: usize, d: usize) -> TensorOps {
+pub fn concat_rows(inputs: &[&TensorOps], r: usize, d: usize) -> TensorOps {
     let n = inputs.len();
     assert!((1..=8).contains(&n), "concat_rows: arity 封顶 8,得 {n}");
     let dt = inputs[0].dtype;

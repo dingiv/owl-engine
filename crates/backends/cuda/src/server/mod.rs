@@ -401,6 +401,7 @@ impl GpuServer {
             Command::Dtoh { .. } => "Dtoh",
             Command::Free { .. } => "Free",
             Command::CopyBlock { .. } => "CopyBlock",
+            Command::CopyBatch { .. } => "CopyBatch",
             Command::Sync { .. } => "Sync",
             Command::Launch { .. } => "Launch",
             Command::Close { .. } => "Close",
@@ -443,6 +444,7 @@ impl GpuServer {
             Command::CopyBlock { src, src_off_bytes, dst, dst_off_bytes, len_bytes, ack } => {
                 self.handle_copy_block(src, src_off_bytes, dst, dst_off_bytes, len_bytes, ack)
             }
+            Command::CopyBatch { copies, ack } => self.handle_copy_batch(copies, ack),
             Command::Launch { msg, ack } => self.handle_launch(msg, ack),
             Command::Sync { ack } => self.handle_sync(ack),
             Command::GraphBegin { ack } => ack.send(self.ctx_mut().graph_begin()),
@@ -477,6 +479,7 @@ impl GpuServer {
             Command::Dtoh { ack, .. } => closed!(ack),
             Command::Free { ack, .. } => closed!(ack),
             Command::CopyBlock { ack, .. } => closed!(ack),
+            Command::CopyBatch { ack, .. } => closed!(ack),
             Command::Launch { ack, .. } => closed!(ack),
             Command::Sync { ack, .. } => closed!(ack),
             Command::GraphBegin { ack, .. } => closed!(ack),
@@ -501,6 +504,7 @@ impl GpuServer {
             Command::Dtoh { .. } => "Dtoh",
             Command::Free { .. } => "Free",
             Command::CopyBlock { .. } => "CopyBlock",
+            Command::CopyBatch { .. } => "CopyBatch",
             Command::Sync { .. } => "Sync",
             Command::Launch { .. } => "Launch",
             Command::Close { .. } => "Close",
@@ -521,6 +525,7 @@ impl GpuServer {
             Command::Sync { ack, .. } => reject!(ack),
             Command::Free { ack, .. } => reject!(ack),
             Command::CopyBlock { ack, .. } => reject!(ack),
+            Command::CopyBatch { ack, .. } => reject!(ack),
             Command::Launch { ack, .. } => reject!(ack),
             Command::Close { ack } => ack.send(Ok(())), // 幂等
         }
@@ -752,6 +757,36 @@ impl GpuServer {
                 )
             }
             .map_err(|e| ModelError::Msg(format!("copy_block: {e:?}")))
+        })();
+        ack.send(result);
+    }
+
+    /// 批量块拷贝(E5-M4):单命令逐条入 COMPUTE 流,单 ack 兜底;
+    /// 任一失败即短路回执(账房错误语义与单条一致)
+    fn handle_copy_batch(
+        &mut self,
+        copies: Vec<(u64, usize, u64, usize, usize)>,
+        ack: Ack<Result<(), ModelError>>,
+    ) {
+        let stream = match self.ctx().stream(STREAM_COMPUTE) {
+            Ok(s) => s.clone(),
+            Err(e) => return ack.send(Err(e)),
+        };
+        let result = (|| {
+            for (src, src_off, dst, dst_off, len) in &copies {
+                let (sptr, _) = self.ctx().block_ptr(*src, &stream)?;
+                let (dptr, _) = self.ctx().block_ptr(*dst, &stream)?;
+                unsafe {
+                    crate::ffi::memcpy_dtod_async(
+                        dptr + *dst_off as u64,
+                        sptr + *src_off as u64,
+                        *len,
+                        stream.cu_stream(),
+                    )
+                }
+                .map_err(|e| ModelError::Msg(format!("copy_batch: {e:?}")))?;
+            }
+            Ok(())
         })();
         ack.send(result);
     }

@@ -104,13 +104,24 @@ pub struct RunningEngine<D: DeviceClient> {
     /// E5-M2b:spec 模式三态(Mtp = 真草稿头;Dumb = 哑草稿诊断;
     /// Off = 回落 DecodeBatch —— spec_depth 恒 0)
     pub(crate) spec_mode: SpecMode,
-    /// MTP 草稿头(mtp 模式;embed/lm_head 共享 target 不持有)
-    pub(crate) drafter: Option<owl_models::layers::mtp::MtpPredictor>,
+    /// MTP 草稿头(mtp 模式;embed/lm_head 共享 target 不持有;Arc =
+    /// propose 图闭包共享)
+    pub(crate) drafter: Option<std::sync::Arc<owl_models::layers::mtp::MtpPredictor>>,
     /// MTP 链页账房(E5-M2b;独立页池,无前缀缓存)
     pub(crate) blocks_mtp: BlockManager,
-    /// 已 propose 草稿(device 块 [k,1] f32;轮首消费轮末替换,
-    /// 替换时旧块显式 free;首轮由 prefill seed propose 填充)
-    pub(crate) spec_drafts: Option<owl_iface::contract::Bytes>,
+    /// verify 桶形图(E5-M4;T = depth+1 定形,输出 tok/hid + fold 记录;
+    /// None = eager fallback 走旧 verify+重放路)
+    pub(crate) verify_graph: Option<GraphPlan<D>>,
+    /// fold 桶形图族(E5-M5;index = m,状态 = spec 快照 buf 就地,
+    /// slot 恒 0;重放后 restore 回写会话格)
+    pub(crate) fold_graphs: Vec<GraphPlan<D>>,
+    /// propose 桶形图族(E5-M5;index = m,extend m+1 行 + k-1 链步,
+    /// 输出 drafts;首轮 propose_first 保持 eager)
+    pub(crate) propose_graphs: Vec<GraphPlan<D>>,
+    /// 已 propose 草稿(host 账;轮末 propose 图/eager dtoh 产出,
+    /// 轮首消费。E5-M5:Bytes 账改 host —— 图态草稿出图即 dtoh,
+    /// 免跨轮设备块所有权)
+    pub(crate) spec_drafts_host: Option<Vec<u32>>,
     /// prefill 末行 hidden(device 块 [1,hidden];首轮 propose 的
     /// anchor_hidden;消费后置 None)
     pub(crate) spec_seed_hidden: Option<owl_iface::contract::Bytes>,

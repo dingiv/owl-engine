@@ -54,6 +54,7 @@ pub mod layers;
 pub mod model;
 pub mod module;
 pub mod ops;
+pub mod spec;
 pub mod reference;
 pub mod specs;
 pub mod tensor;

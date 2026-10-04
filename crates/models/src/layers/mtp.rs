@@ -157,6 +157,7 @@ impl MtpPredictor {
         extend_kv: &KvBuffers,
         extend_slots: &TensorOps,
         extend_lens: &TensorOps,
+        seq_cu: &TensorOps,
         chain: &[(&TensorOps, &KvBuffers)],
         embed: &Embedding,
         rope: &Rope,
@@ -170,6 +171,7 @@ impl MtpPredictor {
             m1, extend_pos, extend_kv, rope, extend_slots, extend_lens,
         );
         ctx.env = env;
+        ctx.seq_cu = Some(seq_cu);
         let emb = embed.embed(tokens, m1);
         let x = self.fc_path(&emb, hiddens, &ctx);
         let x = self.layer().forward(&x, &ctx);
@@ -192,6 +194,36 @@ impl MtpPredictor {
         }
         let refs: Vec<&TensorOps> = drafts.iter().collect();
         crate::layers::concat_rows(&refs, 1, 1)
+    }
+
+    /// prefill extend 块(E5-M5;sglang _append_target_hidden_to_draft_kv
+    /// 同语义 —— xinfer 自评的「draft KV 物化正解」):prefill 逐 chunk 把
+    /// (h_p, emb(t_{p+1})) 对 @ 位置 p 批量写 mtp KV,草稿链从此看得见
+    /// 提示词全上下文。无 argmax 无链(纯 KV 供给;输出弃,状态副作用)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn extend_block(
+        &self,
+        tokens: &TensorOps,
+        hiddens: &TensorOps,
+        pos: &TensorOps,
+        kv: &KvBuffers,
+        slots: &TensorOps,
+        lens: &TensorOps,
+        seq_cu: &TensorOps,
+        embed: &Embedding,
+        rope: &Rope,
+        env: crate::env::EnvProvider,
+    ) -> TensorOps {
+        let t = hiddens.shape()[0];
+        let mut ctx = crate::module::ForwardCtx::attn_prefill(
+            t, pos, kv, rope, slots, lens,
+        );
+        ctx.env = env;
+        ctx.seq_cu = Some(seq_cu);
+        let emb = embed.embed(tokens, t);
+        let x = self.fc_path(&emb, hiddens, &ctx);
+        let x = self.layer().forward(&x, &ctx);
+        self.norm(&x, &ctx)
     }
 
     /// 装载面访问器(specs 侧 Loadable layout 用;pub(crate) 同 crate)

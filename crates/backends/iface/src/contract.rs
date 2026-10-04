@@ -394,6 +394,33 @@ pub trait DeviceClient: Send {
         }
     }
 
+    /// 面句柄克隆(E5-M4:verify 图第二个 GraphPlan 需要独立 face 句柄;
+    /// 仅可安全克隆的句柄后端覆写 —— GpuClient = actor 发送端 Arc,CPU
+    /// 面不可克隆)。默认 = None(引擎侧回落 eager verify 路)。
+    fn face_clone(&self) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
+    /// 设备内批量块→块拷贝(E5-M4:spec 快照 capture/restore 的 192 次
+    /// 逐块往返收敛为一次命令;单 ack = 全部已入流)。默认 = 逐条
+    /// copy_block_at(CPU face / 未覆写后端语义等价)。
+    fn copy_batch(
+        &mut self,
+        copies: &[(Bytes, usize, Bytes, usize, usize)],
+    ) -> impl Future<Output = Result<(), ModelError>> + Send {
+        let mut it: std::vec::IntoIter<(Bytes, usize, Bytes, usize, usize)> =
+            copies.to_vec().into_iter();
+        async move {
+            for (src, so, dst, doff, len) in it.by_ref() {
+                self.copy_block_at(&src, so, &dst, doff, len).await?;
+            }
+            Ok(())
+        }
+    }
+
     /// 带偏移的块清零(E2b:GDN 状态按格重置 —— 格 = 块内等分行,
     /// offset_bytes = 格号 × 行字节;多会话各清各格,互不踩)。默认 =
     /// 委托整块 memset_zero(offset = 0 时语义等价)

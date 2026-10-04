@@ -40,6 +40,9 @@ use crate::openai::ChatRequest;
 
 #[tokio::main]
 async fn main() {
+    // metrics 全局仓(E5-M5 spec 分相探针消费面;/debug/metrics 查询;
+    // 重复 init = AlreadyInit 保首个,loader 侧 init 幂等兼容)
+    let _ = owl_shared::metrics::init_metrics(owl_shared::metrics::MetricsStore::new());
     let bind = env_or("OWL_BIND", "127.0.0.1:8135".into());
     let model_name = env_or("OWL_MODEL_NAME", "qwen3.5-0.8b".into());
     let device: usize = env_or("OWL_DEVICE", "0".into()).parse().unwrap_or(0);

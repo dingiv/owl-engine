@@ -253,6 +253,89 @@ pub(crate) fn conv_fwd(
     .with_shape(Dtype::F16, vec![tokens, d])
 }
 
+/// fold 单层重放(E5-M4;§四.4 v2):部分接受后从快照态 state@F-1
+/// 重放已接受前缀 m+1 行 —— **零整模前向**,复用现役 prefill 核:
+/// conv_fwd ×3(raw 记录 + 快照 conv 态 → conv@F+m)+ 递推核
+/// (post-conv 记录 + 快照 rec 态 → rec@F+m)。记录 = verify 图 tap
+/// 推入序每层 8 件([0..3] conv raw / [3..8] 递推输入),已前缀切片。
+/// 返回 4 个副作用根(输出弃;状态原地;multi-root eval 消费)。
+#[allow(clippy::too_many_arguments)]
+pub fn fold_layer(
+    net: &GatedDeltaNet,
+    rec8: &[TensorOps],
+    conv: &GdnBuffers,
+    slots: &TensorOps,
+    slot_host: usize,
+    cu: &TensorOps,
+    m1: usize,
+    scalar: bool,
+) -> Vec<TensorOps> {
+    let key_dim = net.nk * net.hk_dim;
+    let value_dim = net.nv * net.hv_dim;
+    let w_decl = net.conv_w.decl();
+    let w_q = narrow_strided(&w_decl, key_dim, 4, 0, 4, vec![key_dim, 4]);
+    let w_k = narrow_strided(&w_decl, key_dim, 4, key_dim * 4, 4, vec![key_dim, 4]);
+    let w_v = narrow_strided(&w_decl, value_dim, 4, 2 * key_dim * 4, 4, vec![value_dim, 4]);
+    let mut roots = Vec::with_capacity(4);
+    // conv 三段重放(状态副作用;输出弃 —— 递推吃记录,不消费重放输出)
+    roots.push(conv_fwd(&rec8[0], &w_q, &conv.conv_q, slots, cu, m1, key_dim, true));
+    roots.push(conv_fwd(&rec8[1], &w_k, &conv.conv_k, slots, cu, m1, key_dim, true));
+    roots.push(conv_fwd(&rec8[2], &w_v, &conv.conv_v, slots, cu, m1, value_dim, true));
+    if scalar {
+        // scalar 核(f32 cast ×5 同 verify 臂;位型一致性由同源记录保证)
+        let cast = |x: &TensorOps| {
+            let n: usize = x.shape().iter().product();
+            TensorOps::call(crate::ops::ids::CAST_F16_F32)
+                .arg(x)
+                .arg_i32(n as i32)
+                .with_shape(Dtype::F32, x.shape().to_vec())
+        };
+        let q_f = cast(&rec8[3]);
+        let k_f = cast(&rec8[4]);
+        let v_f = cast(&rec8[5]);
+        let g_f = cast(&rec8[6]);
+        let beta_f = cast(&rec8[7]);
+        roots.push(
+            TensorOps::of(
+                crate::kernel::Kernel::new(owl_kernels::gdn_scalar::GDN_SCALAR_FWD, "")
+                    .with_sig("T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz,sz"),
+            )
+            .arg(&q_f)
+            .arg(&k_f)
+            .arg(&v_f)
+            .arg(&g_f)
+            .arg(&beta_f)
+            .arg(&conv.rec)
+            .arg_usize(m1)
+            .arg_usize(slot_host)
+            .arg_usize(1)
+            .arg_usize(net.nv)
+            .arg_usize(net.nk)
+            .arg_usize(net.hk_dim)
+            .arg_usize((1.0f32 / (net.hk_dim as f32).sqrt()).to_bits() as usize)
+            .with_shape(Dtype::F16, vec![m1, net.nv, net.hv_dim]),
+        );
+    } else {
+        roots.push(recurrence_varlen(
+            &rec8[3],
+            &rec8[4],
+            &rec8[5],
+            &rec8[6],
+            &rec8[7],
+            &conv.rec,
+            slots,
+            cu,
+            m1,
+            net.nv,
+            net.nk,
+            net.hk_dim,
+            net.hv_dim,
+            1.0 / (net.hk_dim as f32).sqrt(),
+        ));
+    }
+    roots
+}
+
 /// gated delta rule varlen 递推(批核):q/k/v/g/beta [T, ·] 单发射,
 /// t 循环核内;state 槽寻址进出(读初态写终态同格,原地律同族);
 /// cu_seqlens [0,T](vLLM 契约保真,M2 packed 直用)。
@@ -426,13 +509,21 @@ impl GatedDeltaNet {
         let v = narrow_strided(&qkvz, tokens, qkv_w, 2 * key_dim, value_dim, vec![tokens, value_dim]);
         let z = narrow_strided(&qkvz, tokens, qkv_w, conv_dim, value_dim, vec![tokens, value_dim]);
 
-        // cu_seqlens = [0, T](单序列;vLLM 契约形态,M2 packed 直用)
-        let cu = TensorOps::from_host(Dtype::F32, vec![2], &{
-            let mut v = Vec::with_capacity(8);
-            v.extend_from_slice(&0.0f32.to_le_bytes());
-            v.extend_from_slice(&(tokens as f32).to_le_bytes());
-            v
-        });
+        // cu_seqlens = [0, T](单序列;vLLM 契约形态,M2 packed 直用)。
+        // E5-M4:verify 图注入(捕获期禁 Htod);eager 路自建不变。
+        let cu_own;
+        let cu: &TensorOps = match ctx.seq_cu {
+            Some(c) => c,
+            None => {
+                cu_own = TensorOps::from_host(Dtype::F32, vec![2], &{
+                    let mut v = Vec::with_capacity(8);
+                    v.extend_from_slice(&0.0f32.to_le_bytes());
+                    v.extend_from_slice(&(tokens as f32).to_le_bytes());
+                    v
+                });
+                &cu_own
+            }
+        };
 
         // conv 三段批核(单发射;state 槽 = gdn_slot)。批核无 w_offset
         // 参数 —— 权重行按段窄切后传入(rows [0..K][K..2K][2K..])
@@ -468,6 +559,20 @@ impl GatedDeltaNet {
         // - recurrence:现役 varlen 递推批核(基线)
         if std::env::var_os("OWL_TRACE_GATE").is_some() {
             eprintln!("[gdn-gate] scalar={} chunked={} T={}", ctx.env.gdn.scalar, ctx.env.gdn.chunked, tokens);
+        }
+        // E5-M4 fold 记录(verify 图 tap;生产路径 None 零开销):每层 8 件
+        // 依序推入 —— conv 重放三 raw(q/k/v)+ 递推重放五件(post-conv/
+        // norm/gating:q_n/k_n/v_c/g/beta)。层序 = 推入序,fold 按序消费。
+        if let Some(tap) = &ctx.gdn_tap {
+            let mut b = tap.borrow_mut();
+            b.push(q.clone());
+            b.push(k.clone());
+            b.push(v.clone());
+            b.push(q_n.reshape(vec![tokens, self.nk, self.hk_dim]));
+            b.push(k_n.reshape(vec![tokens, self.nk, self.hk_dim]));
+            b.push(v_c.reshape(vec![tokens, self.nv, self.hv_dim]));
+            b.push(g.clone());
+            b.push(beta.clone());
         }
         let y = if ctx.env.gdn.scalar {
             let q_f = TensorOps::call(crate::ops::ids::CAST_F16_F32)

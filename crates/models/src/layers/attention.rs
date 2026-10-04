@@ -416,7 +416,17 @@ impl Attention {
         .with_shape(dt, vec![1]); // 哑输出(契约 4)
         // ② chunked prefill 批核(bs16;seq_lens [1] = kv_lens 末元;narrow 树序亦成立)
         let seq_lens = narrow_strided(kv_lens, 1, 1, tokens - 1, 1, vec![1]);
-        let qsl: Vec<u8> = [0.0f32, tokens as f32].iter().flat_map(|f| f.to_le_bytes()).collect();
+        // E5-M4:qsl 注入(verify 图捕获期禁 Htod;与 GDN cu 同值 [0,T])
+        let qsl_own;
+        let qsl_t: &TensorOps = match ctx.seq_cu {
+            Some(c) => c,
+            None => {
+                qsl_own = TensorOps::from_host(Dtype::F32, vec![2], &{
+                    [0.0f32, tokens as f32].iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>()
+                });
+                &qsl_own
+            }
+        };
         let scale = 1.0 / (self.hd as f32).sqrt();
         let nb = kv.block_tables.shape().last().cloned().unwrap_or(1);
         // 名/网格/smem(bs32 契约)= driver 单源(env.page 终审)
@@ -428,7 +438,7 @@ impl Attention {
         .arg(&kv.v_cache)
         .arg(&kv.block_tables)
         .arg(&seq_lens)
-        .arg(&TensorOps::from_host(Dtype::F32, vec![2], &qsl)) // query_start_len(急切路径,from_host 合法)
+        .arg(qsl_t) // query_start_len(急切路径 from_host;verify 图走 ctx 注入)
         .arg(&wr)       // alibi 槽 = 写核输出(树序依赖;旗标 0 不解引用)
         .arg(&kv.slots) // sinks 槽(旗标 0 不解引用)
         .arg_i32(self.hkv as i32)

@@ -46,7 +46,7 @@ type Result<T> = std::result::Result<T, ModelError>;
 /// 捕获回放的根基;decode:frontier/positions/slots…)
 #[derive(Clone, Debug)]
 pub struct InputSlot {
-    pub name: &'static str,
+    pub name: String,
     /// 容量(元素;M0.5 步数据须等长,档位 narrow 视图随 batching 引入)
     pub len: usize,
     /// 初始数据(warmup dry 执行用;缺省全零)
@@ -54,8 +54,8 @@ pub struct InputSlot {
 }
 
 impl InputSlot {
-    pub fn f32(name: &'static str, len: usize) -> Self {
-        Self { name, len, init: Vec::new() }
+    pub fn f32(name: impl Into<String>, len: usize) -> Self {
+        Self { name: name.into(), len, init: Vec::new() }
     }
 
     pub fn init(mut self, v: Vec<f32>) -> Self {
@@ -67,7 +67,7 @@ impl InputSlot {
 /// 输出槽:闭包登记的声明树,解释器归约后按名收割
 #[derive(Clone, Debug)]
 pub struct OutputSlot {
-    pub name: &'static str,
+    pub name: String,
     /// 声明形状(收割量守卫)
     pub shape: Vec<usize>,
     /// 收割 dtype(f16 基线:logits f16;read_output_f32 按此解码)
@@ -76,12 +76,12 @@ pub struct OutputSlot {
 
 impl OutputSlot {
     pub fn f32(name: &'static str, shape: &[usize]) -> Self {
-        Self { name, shape: shape.to_vec(), dtype: Dtype::F32 }
+        Self { name: name.to_string(), shape: shape.to_vec(), dtype: Dtype::F32 }
     }
 
     /// f16 输出(F5 整模切换;read_output_f32 自动解码回 f32)
     pub fn f16(name: &'static str, shape: &[usize]) -> Self {
-        Self { name, shape: shape.to_vec(), dtype: Dtype::F16 }
+        Self { name: name.to_string(), shape: shape.to_vec(), dtype: Dtype::F16 }
     }
 }
 
@@ -106,8 +106,8 @@ pub enum PlanOutcome {
 // ============================================================================
 
 pub struct PlanCtx {
-    inputs: HashMap<&'static str, TensorOps>,
-    outputs: RefCell<Vec<(&'static str, TensorOps)>>,
+    inputs: HashMap<String, TensorOps>,
+    outputs: RefCell<Vec<(String, TensorOps)>>,
 }
 
 impl PlanCtx {
@@ -125,14 +125,15 @@ impl PlanCtx {
     }
 
 
-    /// 输出登记:该声明树即本步输出(解释器归约;块生命周期归会话)
-    pub fn output(&self, name: &'static str, t: &TensorOps) -> Result<()> {
-        self.outputs.borrow_mut().push((name, t.clone()));
+    /// 输出登记:该声明树即本步输出(解释器归约;块生命周期归会话)。
+    /// E5-M4:String 名(verify 图的 fold 记录槽 = 每层 × 8 动态名)
+    pub fn output(&self, name: impl Into<String>, t: &TensorOps) -> Result<()> {
+        self.outputs.borrow_mut().push((name.into(), t.clone()));
         Ok(())
     }
 
     /// 取登记(会话在闭包返回后收割;消费即清空)
-    fn take_outputs(&self) -> Vec<(&'static str, TensorOps)> {
+    fn take_outputs(&self) -> Vec<(String, TensorOps)> {
         self.outputs.borrow_mut().split_off(0)
     }
 }
@@ -142,7 +143,7 @@ impl PlanCtx {
 // ============================================================================
 
 struct InSlotDev {
-    name: &'static str,
+    name: String,
     len: usize,
     block: Bytes,
 }
@@ -162,9 +163,9 @@ enum Mode {
 pub struct GraphPlan<D: DeviceClient> {
     face: D,
     inputs: Vec<InSlotDev>,
-    out_specs: HashMap<&'static str, usize>, // name → 元素数
-    out_dt: HashMap<&'static str, Dtype>,   // name → 收割 dtype(F5 logits f16)
-    last: HashMap<&'static str, OutVal>,
+    out_specs: HashMap<String, usize>, // name → 元素数
+    out_dt: HashMap<String, Dtype>,    // name → 收割 dtype(F5 logits f16)
+    last: HashMap<String, OutVal>,
     mode: Mode,
     forward: Box<dyn Fn(&PlanCtx) -> Result<()>>,
 }
@@ -192,12 +193,12 @@ impl<D: DeviceClient> GraphPlan<D> {
             out_specs: desc
                 .outputs
                 .iter()
-                .map(|o| (o.name, o.shape.iter().product::<usize>()))
+                .map(|o| (o.name.clone(), o.shape.iter().product::<usize>()))
                 .collect(),
             out_dt: desc
                 .outputs
                 .iter()
-                .map(|o| (o.name, o.dtype))
+                .map(|o| (o.name.clone(), o.dtype))
                 .collect(),
             last: HashMap::new(),
             mode: Mode::Eager,
@@ -251,6 +252,12 @@ impl<D: DeviceClient> GraphPlan<D> {
         self.face.dtoh(&slot.block, &mut buf).await?;
         Ok(buf)
     }
+    /// 输出块句柄(E5-M4:设备侧消费 —— fold 记录/hidden 上游;
+    /// 块 = 最近一次 step/捕获的归约产物,指针在捕获态恒定)
+    pub fn output_block(&self, name: &str) -> Option<Bytes> {
+        self.last.get(name).map(|o| o.block.clone())
+    }
+
     /// 输出收割(读语义;块 = 最近一次 step/捕获的归约产物)
     pub async fn read_output_f32(&mut self, name: &str) -> Result<Vec<f32>> {
         let out = self
@@ -308,11 +315,11 @@ impl<D: DeviceClient> GraphPlan<D> {
     }
 
     /// 闭包声明 + 守卫:返回登记输出(名须在 out_specs)
-    fn declare_outputs(&self) -> Result<Vec<(&'static str, TensorOps)>> {
+    fn declare_outputs(&self) -> Result<Vec<(String, TensorOps)>> {
         let mut inputs = HashMap::new();
         for s in &self.inputs {
             inputs.insert(
-                s.name,
+                s.name.clone(),
                 TensorOps::of_block(s.block.id, Dtype::F32, vec![1, s.len]),
             );
         }
@@ -329,17 +336,24 @@ impl<D: DeviceClient> GraphPlan<D> {
 
     /// eager 归约:全输出 eval 入 last(读序由 dtoh 读语义保证)
     async fn eval_current(&mut self) -> Result<()> {
-        for (name, tree) in self.declare_outputs()? {
-            let want = self.out_specs[&name];
-            let block = eval_ops(tree.step(), &mut self.face).await?;
+        // E5-M4:**多根共享 memo 单次归约**(eval_ops_multi)—— 逐根
+        // eval_ops 会把共享子树(整模前向)每根重执行一遍:verify 图
+        // 389 根(384 记录 = 整模内部节点)实测 warmup 387 次整模前向
+        // ≈ 19GB 中间块泄漏 + 分钟级耗时(刀 1.6 同款病,warmup/inline
+        // 路径补修;捕获窗 eval_ops_multi 早已正确)
+        let outs = self.declare_outputs()?;
+        let trees: Vec<&TensorOps> = outs.iter().map(|(_, t)| t).collect();
+        let results = eval_ops_multi(&trees, &mut self.face).await?;
+        for ((name, _), block) in outs.iter().zip(results) {
+            let want = self.out_specs[name];
             if block.len != 0 && block.len != want {
                 return Err(ModelError::Msg(format!(
                     "step: 输出 {name} 归约 {} 元素 ≠ 声明 {want}",
                     block.len
                 )));
             }
-            let dtype = self.out_dt[&name];
-            self.last.insert(name, OutVal { block, len: want, dtype });
+            let dtype = self.out_dt[name];
+            self.last.insert(name.clone(), OutVal { block, len: want, dtype });
         }
         Ok(())
     }
@@ -366,14 +380,14 @@ impl<D: DeviceClient> GraphPlan<D> {
         // 内核,回放税 ~2× 的历史包袱,2026-10-03 派发税立案定谳)。
         let trees: Vec<&TensorOps> = outs.iter().map(|(_, t)| t).collect();
         let mut win_err: Option<ModelError> = None;
-        let mut blocks: Vec<(&'static str, Bytes, usize, Dtype)> = Vec::new();
+        let mut blocks: Vec<(String, Bytes, usize, Dtype)> = Vec::new();
         match eval_ops_multi(&trees, &mut self.face).await {
             Ok(results) => {
                 for ((name, _), b) in outs.iter().zip(results) {
                     let want = self.out_specs[name];
                     if b.len == 0 || b.len == want {
                         let dtype = self.out_dt[name];
-                        blocks.push((name, b, want, dtype));
+                        blocks.push((name.clone(), b, want, dtype));
                     } else {
                         win_err = Some(ModelError::Msg(format!(
                             "capture: 输出 {name} 归约 {} 元素 ≠ 声明 {want}",

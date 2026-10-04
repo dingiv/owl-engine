@@ -7,7 +7,7 @@
 //! (sample_and_emit/complete)+ prefill_chunk(树根装配与执行)。
 //! 状态块触碰一律经 StatePool(state.rs),不直摸块句柄。
 
-use owl_iface::contract::{DeviceClient, Dtype, ModelError};
+use owl_iface::contract::{Bytes, DeviceClient, Dtype, ModelError};
 use owl_models::interpreters::eval_ops_scoped_env;
 use owl_models::layers::gdn::GdnBuffers;
 use owl_models::module::{FiPrefillCtx, ForwardCtx, KvBuffers, Module};
@@ -17,6 +17,19 @@ use owl_models::TensorOps;
 use crate::graph_plan::f32b;
 use crate::scheduler::BeginPlan;
 use crate::turn::TurnEvent;
+
+
+/// E5-M5 spec 分相探针(owl-metrics 直用 API:release 恒开,热路径每轮
+/// ~8 条环形推入 ≈ µs 级;/debug/metrics 查询。宏是 debug-only,装载域
+/// 「直用 API」双轨纪律的 server 侧复刻)
+fn mrec(tag: &str, dur: std::time::Duration) {
+    owl_shared::metrics::with_metrics_store(|s| {
+        s.timer_record_tag(tag, dur, file!(), line!());
+    });
+}
+fn mcnt(tag: &str, n: u64) {
+    owl_shared::metrics::with_metrics_store(|s| s.counter_add(tag, n, file!(), line!()));
+}
 
 type Result<T> = std::result::Result<T, ModelError>;
 
@@ -78,6 +91,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let sid = self.active.as_ref().expect("活跃").session_id;
         let prof = self.probes.step_profile;
         let t0 = prof.then(std::time::Instant::now);
+        let t_step = std::time::Instant::now();
         // E2b:块链跨页增长 → 重写持久块表(图烘焙 bt 指针)
         if grew {
             self.write_bt(sid).await?;
@@ -239,6 +253,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if prof {
             eprintln!("[step-prof] pos={pos} token-dtoh={:?}", t_dtoh.unwrap().elapsed());
         }
+        mrec("decode.step", t_step.elapsed());
         self.sample_and_emit(nt).await
     }
 
@@ -268,41 +283,77 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         let prof = self.probes.step_profile;
         let t0 = prof.then(std::time::Instant::now);
+        let t_round = std::time::Instant::now();
+        let mut t_snap = std::time::Duration::ZERO;
+        let mut t_verify = std::time::Duration::ZERO;
+        let mut t_rollback = std::time::Duration::ZERO;
+        let mut t_propose = std::time::Duration::ZERO;
         let depth = self.spec_depth;
 
         // ① 快照(轮首;恢复后仍有效 → 只在失效时拍)
         if !self.spec_snap_valid {
+            let ts = std::time::Instant::now();
             let face = self.session.face_mut();
             self.pool.capture_spec_snap(face, gdn_slot).await?;
             self.spec_snap_valid = true;
+            t_snap = ts.elapsed();
         }
 
-        // ② 草稿到位(轮首消费上一轮末持久;首轮 = prefill seed propose;
-        // Dumb 模式无草稿器,恒哑草稿 = anchor 重复)
-        if self.spec_drafts.is_none() && self.drafter.is_some() {
+        // ② 草稿到位(host 账;轮末 propose 图/eager dtoh 产出。首轮 =
+        // prefill seed propose(eager);Dumb = anchor 重复)
+        let drafts: Vec<u32> = if let Some(d) = self.spec_drafts_host.take() {
+            d
+        } else if self.drafter.is_some() {
+            let ts = std::time::Instant::now();
             self.propose_first(token, pos).await?;
-        }
-        let old_drafts = self.spec_drafts.take();
-        let drafts: Vec<u32> = match &old_drafts {
-            Some(b) => {
-                let mut buf = vec![0u8; 4 * depth];
-                let face = self.session.face_mut();
-                face.dtoh(b, &mut buf).await?;
-                buf.chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
-                    .collect()
-            }
-            None => vec![token; depth], // Dumb:哑草稿 = anchor 重复
+            t_propose += ts.elapsed();
+            self.spec_drafts_host.take().expect("propose_first 产出")
+        } else {
+            vec![token; depth] // Dumb:哑草稿 = anchor 重复
         };
-        // 旧 drafts 块归还(dtoh 后即焚;Dumb 无块)
-        if let Some(b) = old_drafts {
-            let face = self.session.face_mut();
-            face.free(&[b.id]).await?;
-        }
 
-        // ③ verify 块 [anchor, d1..dk] @ pos..pos+depth(prefill 通道)
+        // ③ verify 块 [anchor, d1..dk] @ pos..pos+depth:图态(一次 replay
+        // + fold 记录)或 eager fallback(旧 verify_forward)。fold 记录
+        // = 每层 8 件(conv 三 raw + 递推五件)。
         let block: Vec<u32> = std::iter::once(token).chain(drafts.iter().copied()).collect();
-        let (ids, hidden) = self.verify_forward(&block, pos, gdn_slot).await?;
+        let (ids, hidden, records, hidden_owned) = if self.verify_graph.is_some() {
+            let ts = std::time::Instant::now();
+            let vg = self.verify_graph.as_mut().expect("verify_graph");
+            let page = self.pool.page;
+            let bt_chain = {
+                let s = self.sessions.get(sid).expect("账在");
+                s.block_table.clone()
+            };
+            let ids_f: Vec<f32> = block.iter().map(|&v| v as f32).collect();
+            let pos_f: Vec<f32> =
+                (pos..pos + block.len()).map(|p| p as f32).collect();
+            let slots_f: Vec<f32> = (pos..pos + block.len())
+                .map(|p| (bt_chain[p / page] * page as u32 + (p % page) as u32) as f32)
+                .collect();
+            let lens_f: Vec<f32> = ((pos + 1)..=(pos + block.len())).map(|p| p as f32).collect();
+            vg.step(&[
+                ("ids", ids_f.as_slice()),
+                ("pos", pos_f.as_slice()),
+                ("kv_slots", slots_f.as_slice()),
+                ("kv_lens", lens_f.as_slice()),
+                ("gdn_slot", &[gdn_slot as f32]),
+            ])
+            .await?;
+            let tok_f = vg.read_output_f32("tok").await?;
+            let ids: Vec<u32> = tok_f.iter().map(|&v| v as u32).collect();
+            let hidden = vg.output_block("hid").expect("hid 输出槽");
+            let n_rec = self.pool.gdn_count() * 8;
+            let records: Vec<Bytes> = (0..n_rec)
+                .map(|i| vg.output_block(&format!("r{i}")).expect("fold 记录槽"))
+                .collect();
+            t_verify = ts.elapsed();
+            (ids, hidden, records, false) // 图输出槽:持久,不 free
+        } else {
+            let ts = std::time::Instant::now();
+            let (ids, hidden) = self.verify_forward(&block, pos, gdn_slot).await?;
+            t_verify = ts.elapsed();
+            (ids, hidden, Vec::new(), true)
+        };
         if prof {
             eprintln!("[spec-prof] pos={pos} verify={:?}", t0.unwrap().elapsed());
         }
@@ -317,17 +368,139 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // = state@F+m —— [anchor, d1..dm] 的贡献在 verify 中已推进、被
         // restore 回滚,必须重放补回(已接受行 KV 覆写幂等 —— 同快照同
         // 输入确定性同值)。m=0 也要重放 anchor 一行。
+        // ⑤ extend + propose(同迭代消费 verify hidden;产出下轮草稿
+        // host 账)。图态 = 桶 m 一发;eager fallback = propose_round。
+        // (先于 fold:fold 图发射后的设备排队会与 eager alloc/launch
+        // 交织放大 —— M5 实测 eager propose 52.8ms ← 8.5ms,换序复原)
+        let toks: Vec<u32> = {
+            let mut t = drafts[..m].to_vec();
+            t.push(bonus);
+            t
+        };
+        if !self.propose_graphs.is_empty() && std::env::var_os("OWL_PROPOSE_EAGER").is_none() {
+            let ts = std::time::Instant::now();
+            let d = self.propose_graph_step(m, &toks, pos).await?;
+            t_propose += ts.elapsed();
+            self.spec_drafts_host = Some(d);
+        } else if self.drafter.is_some() {
+            let ts = std::time::Instant::now();
+            let nd = self.propose_round(&hidden, m, &toks, pos).await?;
+            t_propose += ts.elapsed();
+            // 块 → host(轮首消费;块即焚)
+            let mut buf = vec![0u8; 4 * depth];
+            {
+                let face = self.session.face_mut();
+                face.dtoh(&nd, &mut buf).await?;
+                face.free(&[nd.id]).await?;
+            }
+            self.spec_drafts_host = Some(
+                buf.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
+                    .collect(),
+            );
+        }
+        if hidden_owned {
+            // eager 路的 hidden = 竞技场根块,收割后归池;图态 = 图输出槽
+            // (持久复用,free = 炸图,M4 立案注记)
+            let face = self.session.face_mut();
+            face.free(&[hidden.id]).await?;
+        }
+        // ⑥ fold(尾部:图发射异步,restore 单命令;下一轮 verify 流序
+        // 排其后,GPU ~1ms 藏于前端)
         if m < depth {
+            let ts = std::time::Instant::now();
+            if !self.fold_graphs.is_empty() {
+                // 图态 fold(E5-M5):快照 buf 就地重放(state@F-1 →
+                // state@F+m;slot 恒 0)→ restore 回写会话格。单 graph_launch。
+                let fg = &mut self.fold_graphs[m];
+                fg.step(&[("slots", &[0.0f32])]).await?;
+                {
+                    let face = self.session.face_mut();
+                    self.pool.restore_spec_snap(face, gdn_slot).await?;
+                }
+                t_rollback = ts.elapsed();
+            } else {
             {
                 let face = self.session.face_mut();
                 self.pool.restore_spec_snap(face, gdn_slot).await?;
             }
-            let replay: Vec<u32> = std::iter::once(token)
-                .chain(drafts[..m].iter().copied())
-                .collect();
-            let (_, replay_hidden) = self.verify_forward(&replay, pos, gdn_slot).await?;
-            let face = self.session.face_mut();
-            face.free(&[replay_hidden.id]).await?;
+            if records.len() == self.pool.gdn_count() * 8 {
+                // fold(E5-M4):快照态 + verify 记录前缀 → state@F+m,
+                // **零整模前向**(96 副作用根一次 multi-root eval)
+                let m1 = m + 1;
+                let d = self.pool.dims;
+                let key_dim = d.nk * d.hk;
+                let value_dim = d.nv * d.hv;
+                let views: Vec<TensorOps> = records
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| {
+                        let shape = match i % 8 {
+                            0 | 1 => vec![m1, key_dim],
+                            2 => vec![m1, value_dim],
+                            3 | 4 => vec![m1, d.nk, d.hk],
+                            5 => vec![m1, d.nv, d.hv],
+                            _ => vec![m1, d.nv],
+                        };
+                        TensorOps::of_block(b.id, d.dtype, shape)
+                    })
+                    .collect();
+                let slots_t = TensorOps::from_host(
+                    Dtype::F32,
+                    vec![1],
+                    &[gdn_slot as f32]
+                        .iter()
+                        .flat_map(|f| f.to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                );
+                let gdns: Vec<owl_models::layers::gdn::GdnBuffers> = self
+                    .pool
+                    .gdn_caches()
+                    .into_iter()
+                    .map(|l| owl_models::layers::gdn::GdnBuffers {
+                        conv_q: l.conv_q,
+                        conv_k: l.conv_k,
+                        conv_v: l.conv_v,
+                        rec: l.rec,
+                        slots: slots_t.clone(),
+                    })
+                    .collect();
+                let cu_t = TensorOps::from_host(
+                    Dtype::F32,
+                    vec![2],
+                    &[0.0f32, m1 as f32]
+                        .iter()
+                        .flat_map(|f| f.to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                );
+                let roots = owl_models::spec::fold_tree(
+                    &self.model,
+                    &views,
+                    &gdns,
+                    &slots_t,
+                    &cu_t,
+                    gdn_slot,
+                    m,
+                    self.env.gdn.scalar,
+                )?;
+                {
+                    let face = self.session.face_mut();
+                    let refs: Vec<&TensorOps> = roots.iter().collect();
+                    owl_models::interpreters::eval_ops_multi(&refs, face).await?;
+                }
+                t_rollback = ts.elapsed();
+            } else {
+                // eager fallback:旧路 —— 前缀重放(整模前向,已接受行
+                // KV 覆写幂等;m=0 也重放 anchor 一行)
+                let replay: Vec<u32> = std::iter::once(token)
+                    .chain(drafts[..m].iter().copied())
+                    .collect();
+                let (_, replay_hidden) = self.verify_forward(&replay, pos, gdn_slot).await?;
+                let face = self.session.face_mut();
+                face.free(&[replay_hidden.id]).await?;
+                t_rollback = ts.elapsed();
+            }
+            }
         }
         self.spec_snap_valid = false;
 
@@ -340,12 +513,33 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             act.fed = pos + m + 1;
         }
 
-        // ⑦ extend + propose(同迭代消费 verify hidden;产出下轮草稿块)
-        if self.drafter.is_some() {
+        // ⑦ extend + propose(同迭代消费 verify hidden;产出下轮草稿
+        // host 账)。图态 = 桶 m 一发;eager fallback = propose_round。
+        if !self.propose_graphs.is_empty() && std::env::var_os("OWL_PROPOSE_EAGER").is_none() {
+            let ts = std::time::Instant::now();
+            let d = self.propose_graph_step(m, &toks, pos).await?;
+            t_propose += ts.elapsed();
+            self.spec_drafts_host = Some(d);
+        } else if self.drafter.is_some() {
+            let ts = std::time::Instant::now();
             let nd = self.propose_round(&hidden, m, &toks, pos).await?;
-            self.spec_drafts = Some(nd);
+            t_propose += ts.elapsed();
+            // 块 → host(轮首消费;块即焚)
+            let mut buf = vec![0u8; 4 * depth];
+            {
+                let face = self.session.face_mut();
+                face.dtoh(&nd, &mut buf).await?;
+                face.free(&[nd.id]).await?;
+            }
+            self.spec_drafts_host = Some(
+                buf.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
+                    .collect(),
+            );
         }
-        {
+        if hidden_owned {
+            // eager 路的 hidden = 竞技场根块,收割后归池;图态 = 图输出槽
+            // (持久复用,free = 炸图,M4 立案注记)
             let face = self.session.face_mut();
             face.free(&[hidden.id]).await?;
         }
@@ -360,6 +554,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         } else {
             self.spec_stats.partial += 1;
         }
+        let ts = std::time::Instant::now();
         let mut evq = std::collections::VecDeque::new();
         for &t in &toks {
             let ev = self.sample_and_emit(t).await?;
@@ -369,7 +564,34 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 break; // eos/预算:余段作废
             }
         }
+        mrec("spec.emit", ts.elapsed());
         self.pending_events = evq;
+        // E5-M5:spec 分相落账(/debug/metrics;与 spec_stats 同源双面)
+        let t_all = t_round.elapsed();
+        mrec("spec.round", t_all);
+        mrec("spec.verify", t_verify);
+        if t_snap > std::time::Duration::ZERO {
+            mrec("spec.snap", t_snap);
+        }
+        if t_rollback > std::time::Duration::ZERO {
+            let tag = if records.len() == self.pool.gdn_count() * 8 {
+                "spec.fold"
+            } else {
+                "spec.replay"
+            };
+            mrec(tag, t_rollback);
+        }
+        if t_propose > std::time::Duration::ZERO {
+            mrec("spec.propose", t_propose);
+        }
+        mcnt("spec.rounds", 1);
+        mcnt("spec.tokens", (m + 1) as u64);
+        mcnt("spec.accepted", m as u64);
+        if prof {
+            eprintln!(
+                "[spec-prof] pos={pos} total={t_all:?} verify={t_verify:?} rollback={t_rollback:?} propose={t_propose:?} snap={t_snap:?} m={m}"
+            );
+        }
         self.pending_events
             .pop_front()
             .ok_or_else(|| owl_models::ModelError::Msg("spec 轮零事件(空块?)".into()))
@@ -431,8 +653,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let face = self.session.face_mut();
             face.free(&arena).await?;
             face.free(&[seed.id]).await?; // seed 块已消费,归还
+            let mut buf = vec![0u8; 4 * depth];
+            face.dtoh(&b, &mut buf).await?;
+            face.free(&[b.id]).await?;
+            self.spec_drafts_host = Some(
+                buf.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
+                    .collect(),
+            );
         }
-        self.spec_drafts = Some(b);
         Ok(())
     }
 
@@ -497,6 +726,16 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         let chain_refs: Vec<(&TensorOps, &KvBuffers)> =
             chain.iter().map(|(p, k)| (p, k)).collect();
+        let ts_build = std::time::Instant::now();
+        // cu(E5-M5:eager 路自建合法;图态走 propose_graph_step 的输入槽)
+        let cu_t = TensorOps::from_host(
+            Dtype::F32,
+            vec![2],
+            &[0.0f32, (pos + m + 1) as f32]
+                .iter()
+                .flat_map(|f| f.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        );
         let drafts = {
             let env = self.env;
             let vocab = self.model.vocab_size();
@@ -504,18 +743,166 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let mtp = self.drafter.as_ref().expect("drafter");
             mtp.propose_ext(
                 &tokens_t, &hiddens, &extend_pos, &extend_kv, &extend_slots, &extend_lens,
-                &chain_refs, &self.model.embed, &rope, vocab, env,
+                &cu_t, &chain_refs, &self.model.embed, &rope, vocab, env,
             )
         };
+        mrec("spec.propose.build", ts_build.elapsed());
+        let ts_eval = std::time::Instant::now();
         let (b, arena) = {
             let face = self.session.face_mut();
             owl_models::interpreters::eval_ops_scoped_env(drafts.step(), face, self.env).await?
         };
+        mrec("spec.propose.eval", ts_eval.elapsed());
         {
             let face = self.session.face_mut();
             face.free(&arena).await?;
         }
         Ok(b)
+    }
+
+    /// prefill extend(E5-M5;sglang _append_target_hidden_to_draft_kv
+    /// 同语义):chunk 的 (h_p, emb(t_{p+1})) 对 @ 位置 p 写 mtp KV,
+    /// 草稿链看得见提示词。行数 = t_rows(= T-1;末行配对归下一 chunk /
+    /// propose_first)。eager from_host 表(每 chunk 一次;非图)。
+    async fn prefill_extend(
+        &mut self,
+        hid: &Bytes,
+        t_rows: usize,
+        ids: &[u32],
+        base: usize,
+    ) -> Result<()> {
+        let t_all = std::time::Instant::now();
+        let d = self.pool.dims;
+        let page = self.pool.page;
+        let bt = {
+            let sid = self.active.as_ref().expect("active 已保证").session_id;
+            let s = self.sessions.get_mut(sid).expect("账在");
+            self.blocks_mtp.ensure_for_len(&mut s.mtp_block_table, base + t_rows)?;
+            s.mtp_block_table.clone()
+        };
+        let (kc, vc) = self.pool.mtp_kv_leaf().expect("mtp 池");
+        let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+        let tokens: Vec<u32> = ids[1..=t_rows].to_vec();
+        let tok_t = TensorOps::from_host(
+            Dtype::F32,
+            vec![t_rows],
+            &tokens.iter().flat_map(|v| (*v as f32).to_le_bytes()).collect::<Vec<u8>>(),
+        );
+        let hid_view = TensorOps::of_block(hid.id, d.dtype, vec![t_rows, d.hidden]);
+        let pos_t = TensorOps::from_host(
+            Dtype::F32,
+            vec![t_rows],
+            &f32b(&(base..base + t_rows).map(|p| p as f32).collect::<Vec<_>>()),
+        );
+        let slots_t = TensorOps::from_host(
+            Dtype::F32,
+            vec![t_rows],
+            &f32b(
+                &(base..base + t_rows)
+                    .map(|p| (bt[p / page] * page as u32 + (p % page) as u32) as f32)
+                    .collect::<Vec<_>>(),
+            ),
+        );
+        let lens_t = TensorOps::from_host(
+            Dtype::F32,
+            vec![t_rows],
+            &f32b(&((base + 1)..=base + t_rows).map(|p| p as f32).collect::<Vec<_>>()),
+        );
+        let cu_t = TensorOps::from_host(
+            Dtype::F32,
+            vec![2],
+            &f32b(&[0.0, t_rows as f32]),
+        );
+        let kv = owl_models::module::KvBuffers {
+            k_cache: kc.clone(),
+            v_cache: vc.clone(),
+            slots: slots_t.clone(),
+            kv_lens: lens_t.clone(),
+            block_tables: TensorOps::from_host(
+                Dtype::F32,
+                vec![1, bt.len()],
+                &f32b(&bt.iter().map(|&b| b as f32).collect::<Vec<_>>()),
+            ),
+        };
+        mrec("spec.extend.pre", t_all.elapsed());
+        let ts_eval = std::time::Instant::now();
+        let mtp = self.drafter.as_ref().expect("drafter");
+        let root = mtp.extend_block(
+            &tok_t, &hid_view, &pos_t, &kv, &slots_t, &lens_t, &cu_t,
+            &self.model.embed, &self.rope, self.env,
+        );
+        let (_b, arena) = {
+            let face = self.session.face_mut();
+            owl_models::interpreters::eval_ops_scoped_env(root.step(), face, self.env).await?
+        };
+        mrec("spec.extend.eval", ts_eval.elapsed());
+        mrec("spec.extend", t_all.elapsed());
+        {
+            let face = self.session.face_mut();
+            face.free(&arena).await?;
+        }
+        Ok(())
+    }
+
+    /// propose 图步(E5-M5;桶 m):装填 extend/链表 + bt_mtp 持久槽
+    /// 重写 → 单 graph_launch → drafts dtoh(host 账)。
+    async fn propose_graph_step(
+        &mut self,
+        m: usize,
+        toks: &[u32],
+        pos: usize,
+    ) -> Result<Vec<u32>> {
+        let depth = self.spec_depth;
+        let page = self.pool.page;
+        let bt = {
+            let sid = self.active.as_ref().expect("active 已保证").session_id;
+            let s = self.sessions.get_mut(sid).expect("账在");
+            self.blocks_mtp.ensure_for_len(&mut s.mtp_block_table, pos + m + depth)?;
+            s.mtp_block_table.clone()
+        };
+        {
+            let ts_w = std::time::Instant::now();
+            let face = self.session.face_mut();
+            self.pool.write_bt_mtp(face, &bt).await?;
+            mrec("spec.propose.btwt", ts_w.elapsed());
+        }
+        let fp = pos + m + 1;
+        let slot_at =
+            |p: usize| (bt[p / page] * page as u32 + (p % page) as u32) as f32;
+        let tok_f: Vec<f32> = toks.iter().map(|&v| v as f32).collect();
+        let pos_f: Vec<f32> = (pos..pos + m + 1).map(|p| p as f32).collect();
+        let slots_f: Vec<f32> = (pos..pos + m + 1).map(slot_at).collect();
+        let lens_f: Vec<f32> = ((pos + 1)..=(pos + m + 1)).map(|p| p as f32).collect();
+        let mut ins: Vec<(&str, &[f32])> = vec![
+            ("tok_ext", tok_f.as_slice()),
+            ("pos_ext", pos_f.as_slice()),
+            ("slots_ext", slots_f.as_slice()),
+            ("lens_ext", lens_f.as_slice()),
+        ];
+        let mut chain_bufs: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> = Vec::new();
+        for j in 1..depth {
+            let p = fp + j - 1;
+            chain_bufs.push((
+                vec![p as f32],
+                vec![slot_at(p)],
+                vec![(p + 1) as f32],
+            ));
+        }
+        let names: Vec<String> =
+            (0..chain_bufs.len()).flat_map(|j| [format!("c{j}_pos"), format!("c{j}_slots"), format!("c{j}_lens")]).collect();
+        for (j, (a, b, c)) in chain_bufs.iter().enumerate() {
+            ins.push((names[j * 3].as_str(), a.as_slice()));
+            ins.push((names[j * 3 + 1].as_str(), b.as_slice()));
+            ins.push((names[j * 3 + 2].as_str(), c.as_slice()));
+        }
+        let pg = &mut self.propose_graphs[m];
+        let t1 = std::time::Instant::now();
+        pg.step(&ins).await?;
+        let t_step = t1.elapsed();
+        let d = pg.read_output_f32("drafts").await?;
+        mrec("spec.propose.step", t_step);
+        mrec("spec.propose.read", t1.elapsed() - t_step);
+        Ok(d.iter().map(|&v| v as u32).collect())
     }
 
     /// mtp 链表 ensure(E5-M2b;propose eager 路径用 from_host 表,非持久
@@ -773,6 +1160,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         base: usize,
         is_last: bool,
     ) -> Result<Option<u32>> {
+        let t_chunk = std::time::Instant::now();
+        let mut t_ext = std::time::Duration::ZERO;
         let d = self.pool.dims;
         let t = ids.len();
         // E2b:活跃会话块链 + GDN 格(逻辑位 → 物理槽由块表换算)
@@ -877,58 +1266,97 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let face = self.session.face_mut();
         let vocab = self.model.vocab_size();
         if is_last {
-            // E3:末行设备 argmax(4B 回读,免 [T,V] 大 dtoh);
-            // 2026-10-02 forward_last:hidden 先窄末行再 lm_head ——
-            // logits [1,V] 而非 [T,V](大 chunk 内存/算力双省)。
-            // E5-M2b:双树拆分 —— 树一 = 末行 hidden 根(mtp 模式
-            // harvest 为首轮 propose 的 seed;非 mtp 一样求值,仅不持久);
-            // 树二 = lm_head → argmax(引用树一根,不重建整模前向)。
+            // E3:末行设备 argmax(4B 回读,免 [T,V] 大 dtoh)。
+            // E5-M5:树一 = hidden_full 根([T, hidden] 存活 → prefill
+            // extend 消费行 0..T-1);树二 = 末行物化(OPS_NARROW,spec
+            // 模式转正为 seed)+ lm_head → argmax。
             let hidden_full = self.model.last_hidden(&ids_t, &ctx);
             let d_model = hidden_full.shape()[1];
-            // 末行窄切 **物化**(OPS_NARROW 语义调用):SliceView 作根透传
-            // 父块,偏移只在被消费时生效 —— 根必须真块(刀 3b 同族教训:
-            // 视图作根丢偏移,读行 0 = 首 token hidden → argmax 垃圾)
+            let (hfb, arena1) = {
+                let face = self.session.face_mut();
+                eval_ops_scoped_env(hidden_full.step(), face, self.env).await?
+            };
+            let hview = TensorOps::of_block(hfb.id, d.dtype, vec![t, d_model]);
+            // 末行窄切 **物化**(OPS_NARROW):SliceView 作根透传父块丢偏移
+            // (刀 3b 同族),根必须真块
             let last = TensorOps::call(owl_models::ops::ids::OPS_NARROW)
-                .arg(&hidden_full)
+                .arg(&hview)
                 .arg_usize(1)
                 .arg_usize(d_model)
                 .arg_usize((t - 1) * d_model)
                 .arg_usize(d_model)
                 .with_shape(d.dtype, vec![1, d_model]);
-            let (hb, arena1) = eval_ops_scoped_env(last.step(), face, self.env).await?;
+            let (hb, arena2) = {
+                let face = self.session.face_mut();
+                eval_ops_scoped_env(last.step(), face, self.env).await?
+            };
             let hb_view = TensorOps::of_block(hb.id, d.dtype, vec![1, d_model]);
-            let logits = self.model.embed.lm_head_matmul(&hb_view);
-            let tok = owl_models::ops::argmax_f32idx(&logits, vocab, 0);
-            let (b, arena2) = eval_ops_scoped_env(tok.step(), face, self.env).await?;
-            let mut buf = [0u8; 4];
-            face.dtoh(&b, &mut buf).await?;
-            // E2a + M2b 泄漏修复:argmax 根 + 两树中间块显式归还
-            // (hidden 根 hb 随 Drop 泄漏 10KB —— mtp 模式转正为 seed)
-            face.free(&[b.id]).await?;
-            face.free(&arena2).await?;
-            if self.drafter.is_some() {
-                self.spec_seed_hidden = Some(hb);
-            } else {
-                face.free(&[hb.id]).await?;
+            let (b, arena3) = {
+                let face = self.session.face_mut();
+                let logits = self.model.embed.lm_head_matmul(&hb_view);
+                let tok = owl_models::ops::argmax_f32idx(&logits, vocab, 0);
+                eval_ops_scoped_env(tok.step(), face, self.env).await?
+            };
+            if self.drafter.is_some() && t > 1 {
+                // prefill extend(E5-M5):本 chunk 行 0..T-1 的 mtp KV
+                // (行 T-1 的配对需下一 chunk 首 token,由其 extend 补;
+                // 末位 P-1 由首轮 propose_first 的 extend 行补)
+                self.prefill_extend(&hfb, t - 1, ids, base).await?;
             }
-            face.free(&arena1).await?; // E2a:中间块归池(每 chunk 零净增)
+            let buf: [u8; 4];
+            {
+                let face = self.session.face_mut();
+                let mut buf_t = [0u8; 4];
+                face.dtoh(&b, &mut buf_t).await?;
+                face.free(&[b.id]).await?;
+                face.free(&arena3).await?;
+                face.free(&arena2).await?;
+                if self.drafter.is_some() {
+                    self.spec_seed_hidden = Some(hb);
+                } else {
+                    face.free(&[hb.id]).await?;
+                }
+                face.free(&[hfb.id]).await?;
+                face.free(&arena1).await?; // E2a:中间块归池(每 chunk 零净增)
+                buf = buf_t;
+            }
             let nt = f32::from_le_bytes(buf) as u32;
             Ok(Some(nt))
         } else {
             // 中间块:last_hidden 根(状态推进完整;lm_head 免算)
             let tree = self.model.last_hidden(&ids_t, &ctx);
-            let (b, arena) = eval_ops_scoped_env(tree.step(), face, self.env).await?;
-            let esz = if d.dtype == Dtype::F16 { 2 } else { 4 };
-            let mut buf = vec![0u8; t * d.hidden * esz];
-            face.dtoh(&b, &mut buf).await?;
-            if self.probes.prefill_cksum {
-                // 临时取证:每 chunk 隐层校验和(FI 开/关对比找第一分歧)
-                let cks: f32 = buf.chunks_exact(2)
-                    .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32().abs())
-                    .sum();
-                eprintln!("[cksum] chunk base={base} t={t} sum|x|={cks:.4}");
+            let (b, arena) = {
+                let face = self.session.face_mut();
+                eval_ops_scoped_env(tree.step(), face, self.env).await?
+            };
+            {
+                let face = self.session.face_mut();
+                let esz = if d.dtype == Dtype::F16 { 2 } else { 4 };
+                let mut buf = vec![0u8; t * d.hidden * esz];
+                face.dtoh(&b, &mut buf).await?;
+                if self.probes.prefill_cksum {
+                    // 临时取证:每 chunk 隐层校验和(FI 开/关对比找第一分歧)
+                    let cks: f32 = buf.chunks_exact(2)
+                        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32().abs())
+                        .sum();
+                    eprintln!("[cksum] chunk base={base} t={t} sum|x|={cks:.4}");
+                }
+                drop(face);
+                // prefill extend(E5-M5):行 0..T-1 的 mtp KV(行 T-1 配对需
+                // 下一 chunk 首 token,由其 extend 补)
+                if self.drafter.is_some() && t > 1 {
+                    let ts = std::time::Instant::now();
+                    self.prefill_extend(&b, t - 1, ids, base).await?;
+                    t_ext += ts.elapsed();
+                }
+                let face = self.session.face_mut();
+                face.free(&[b.id]).await?;
+                face.free(&arena).await?; // E2a:中间块归池(每 chunk 零净增)
             }
-            face.free(&arena).await?; // E2a:中间块归池(每 chunk 零净增)
+            mrec("prefill.chunk", t_chunk.elapsed());
+            if t_ext > std::time::Duration::ZERO {
+                mrec("prefill.extend", t_ext);
+            }
             Ok(None)
         }
     }
@@ -938,10 +1366,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // spec 态清理(E5-M2b):陈旧草稿块作废( Continuation 已变,
         // 下一 turn 由 prefill seed 重新 propose;草稿只影响速度,不清也
         // 恒等 —— 但清了省 dtoh + free 账目干净)
-        if let Some(b) = self.spec_drafts.take() {
-            let face = self.session.face_mut();
-            face.free(&[b.id]).await?;
-        }
+        self.spec_drafts_host = None;
         // 会话账落地(S1 收口):KV 此刻 = prompt 全量 + 生成段;GDN 状态
         // 跨 turn 连续。临时会话终了即焚(表不随 turn 数无界增长)
         if let Some(s) = self.sessions.get_mut(act.session_id) {

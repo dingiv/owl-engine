@@ -106,6 +106,8 @@ pub(crate) struct StatePool {
     pub(crate) spec_snap: Option<GdnSnapSlot>,
     /// MTP 草稿链 KV 池(E5-M2b;独立页池,1 层;mtp 模式分配)
     pub(crate) mtp_kvs: Option<KvBlocks>,
+    /// MTP 链持久块表槽(E5-M5 propose 图烘焙;[1, nb] f32,每轮重写)
+    pub(crate) bt_mtp: Option<Bytes>,
     /// paged 池几何(页;legacy 模式 page = 容量,nb = 1)
     pub(crate) page: usize,
     pub(crate) nb: usize,
@@ -187,6 +189,12 @@ impl StatePool {
         } else {
             eval_ops(TensorOps::zeros(Dtype::F32, vec![1]).step(), face).await?
         };
+        // MTP 链持久块表槽(E5-M5;propose 图烘焙;mtp 模式)
+        let bt_mtp = if mtp && paged {
+            Some(eval_ops(TensorOps::zeros(Dtype::F32, vec![1, nb]).step(), face).await?)
+        } else {
+            None
+        };
         // v2 decode scratch(E-decode):exp_sums/max_logits [1,hq,nparts]
         // f32 + tmp_out [hq·nparts·hd] f16;nparts = ceil(nb·page/512)
         // (PARTITION=512;boot 一次性持久块,不进竞技场收割面,图安全同 bt)
@@ -246,7 +254,43 @@ impl StatePool {
         } else {
             None
         };
-        Ok(StatePool { kvs, k_fis, v_fis, fi_quant: fi, gdns, snaps, snap_tick: 0, bt, spec_snap, mtp_kvs, attn_v2, page, nb, paged, x, dims })
+        Ok(StatePool { kvs, k_fis, v_fis, fi_quant: fi, gdns, snaps, snap_tick: 0, bt, bt_mtp, spec_snap, mtp_kvs, attn_v2, page, nb, paged, x, dims })
+    }
+
+    /// MTP 链块表叶子(propose 图烘焙;None = 未启用)
+    pub(crate) fn bt_mtp_leaf(&self) -> Option<TensorOps> {
+        self.bt_mtp
+            .as_ref()
+            .map(|b| TensorOps::of_block(b.id, Dtype::F32, vec![1, self.nb]))
+    }
+
+    /// MTP 链块表槽重写(每轮 propose 前;内容 = 会话 mtp 链)
+    pub(crate) async fn write_bt_mtp<D: DeviceClient>(
+        &self,
+        face: &mut D,
+        table: &[u32],
+    ) -> Result<()> {
+        let b = self.bt_mtp.as_ref().expect("bt_mtp 未分配(mtp 模式)");
+        let mut v = vec![0f32; self.nb];
+        for (i, x) in table.iter().enumerate() {
+            v[i] = *x as f32;
+        }
+        face.write_block_f32(b, 0, &v).await
+    }
+
+    /// spec 快照缓冲句柄组(E5-M5 fold 图烘焙:状态 args = 快照 buf
+    /// 就地,slot 恒 0;fold 后 restore 回写会话格)。序 = 层 × 4
+    /// (conv_q/k/v/rec),与 capture/restore 同构。
+    pub(crate) fn spec_snap_bufs(&self) -> Vec<BlockN> {
+        self.spec_snap
+            .as_ref()
+            .map(|s| s.bufs.clone())
+            .unwrap_or_default()
+    }
+
+    /// GDN 层数(fold 记录槽计数用)
+    pub(crate) fn gdn_count(&self) -> usize {
+        self.gdns.len()
     }
 
     /// MTP 草稿链 KV 叶子对(mtp 模式;None = 未启用)
@@ -531,10 +575,13 @@ impl StatePool {
         face: &mut D,
         gdn_slot: usize,
     ) -> Result<()> {
+        let n = self.gdns.len();
         let snap = self
             .spec_snap
             .as_mut()
             .ok_or_else(|| ModelError::Msg("spec 快照缓冲未分配(OWL_SPEC_DEPTH 未开)".into()))?;
+        // E5-M4:批量通道(192 次 actor 往返 → 1;单 ack 保序)
+        let mut copies: Vec<(owl_iface::Bytes, usize, owl_iface::Bytes, usize, usize)> = Vec::with_capacity(n * 4);
         for (li, g) in self.gdns.iter().enumerate() {
             let quads = [
                 (&g.conv_q.0, g.conv_q.1),
@@ -545,9 +592,11 @@ impl StatePool {
             for (j, (src, elems)) in quads.iter().enumerate() {
                 let row = elems / gdn_slots();
                 let dst = &snap.bufs[li * 4 + j];
-                face.copy_block_at(src, gdn_slot * row * 4, &dst.0, 0, row * 4).await?;
+                copies.push(((*src).clone(), gdn_slot * row * 4, dst.0.clone(), 0usize, row * 4));
             }
         }
+        face.copy_batch(copies.as_slice()).await?;
+        let _ = n;
         Ok(())
     }
 
@@ -557,10 +606,13 @@ impl StatePool {
         face: &mut D,
         gdn_slot: usize,
     ) -> Result<()> {
+        let n = self.gdns.len();
         let snap = self
             .spec_snap
             .as_ref()
             .ok_or_else(|| ModelError::Msg("spec 快照缓冲未分配".into()))?;
+        // E5-M4:批量通道(同 capture)
+        let mut copies: Vec<(owl_iface::Bytes, usize, owl_iface::Bytes, usize, usize)> = Vec::with_capacity(n * 4);
         for (li, g) in self.gdns.iter().enumerate() {
             let quads = [
                 (&g.conv_q.0, g.conv_q.1),
@@ -571,9 +623,11 @@ impl StatePool {
             for (j, (dst, elems)) in quads.iter().enumerate() {
                 let row = elems / gdn_slots();
                 let src = &snap.bufs[li * 4 + j];
-                face.copy_block_at(&src.0, 0, dst, gdn_slot * row * 4, row * 4).await?;
+                copies.push((src.0.clone(), 0usize, (*dst).clone(), gdn_slot * row * 4, row * 4));
             }
         }
+        face.copy_batch(copies.as_slice()).await?;
+        let _ = n;
         Ok(())
     }
 

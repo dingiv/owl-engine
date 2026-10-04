@@ -10,8 +10,17 @@ use owl_iface::contract::ModelError;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// 捕获 slab 容量(64 MiB;图内 Alloc 从 slab 切块,零 cudaMalloc)
-pub(super) const CAPTURE_SLAB_BYTES: usize = 64 << 20;
+/// 捕获 slab 容量(默认 64 MiB;图内 Alloc 从 slab 切块,零 cudaMalloc)。
+/// E5-M4:env 可调(OWL_CAPTURE_SLAB_MB)—— 24G 贴顶的 27B + spec
+/// 双图(decode + verify)场景,verify 图按需调小。
+pub(super) fn capture_slab_bytes() -> usize {
+    std::env::var("OWL_CAPTURE_SLAB_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(64)
+        << 20
+}
 
 // 流身份证(server 内部路由键;客户端不可见 —— 三固定流是 server 策略)
 pub(super) type StreamId = u64;
@@ -194,7 +203,8 @@ impl GpuCtx {
         stream
             .synchronize()
             .map_err(|e| ModelError::Msg(format!("graph_begin: 预排空失败 {e:?}")))?;
-        let slab = unsafe { stream.alloc::<u8>(CAPTURE_SLAB_BYTES) }
+        let slab_cap = capture_slab_bytes();
+        let slab = unsafe { stream.alloc::<u8>(slab_cap) }
             .map_err(|e| ModelError::Msg(format!("graph_begin: 捕获 slab 分配失败 {e:?}")))?;
         let slab = Arc::new(slab);
         stream
@@ -406,11 +416,10 @@ impl GpuCtx {
             eprintln!("[cap-prof] carve {}B", n);
         }
         let used = cap.used.div_ceil(CARVE_ALIGN) * CARVE_ALIGN;
-        if used + n > CAPTURE_SLAB_BYTES {
+        let slab_cap = capture_slab_bytes();
+        if used + n > slab_cap {
             return Err(ModelError::Msg(format!(
-                "捕获 slab 耗尽:已用 {} + 对齐后需 {n} > {}(提高 CAPTURE_SLAB_BYTES)",
-                used,
-                CAPTURE_SLAB_BYTES
+                "捕获 slab 耗尽:已用 {used} + 对齐后需 {n} > {slab_cap}(OWL_CAPTURE_SLAB_MB 调大)"
             )));
         }
         let id = self.next_block;

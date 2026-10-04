@@ -59,6 +59,13 @@ pub struct EngineConfig {
     pub prefill_chunk: usize,
 }
 
+/// E5-M5:fold 图的状态叶子(flat 单槽行;slot 恒 0 = 基指针;
+/// 自由函数 —— 图闭包 move 语义不可借 self)
+fn leaf_flat(b: &crate::state::BlockN) -> owl_models::tensor::TensorOps {
+    let n = b.1;
+    owl_models::tensor::TensorOps::of_block(b.0.id, owl_iface::contract::Dtype::F32, vec![n])
+}
+
 pub struct Engine<D: DeviceClient> {
     face: D,
     cfg: EngineConfig,
@@ -150,7 +157,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
             let dir = loaded.mtp_dir.as_ref().expect("mtp_dir");
             let (mtp, _) = owl_models::specs::qwen35::load_27b_mtp(dir, &mut self.face).await?;
             eprintln!("[boot] MTP 草稿头装载(spec depth={spec_depth})");
-            Some(mtp)
+            Some(std::sync::Arc::new(mtp))
         } else {
             None
         };
@@ -177,6 +184,9 @@ impl<D: DeviceClient + 'static> Engine<D> {
             pool.page,
         );
 
+        let vface = self.face.face_clone();
+        // E5-M5:fold/propose 桶形图族的 face 句柄(depth × 2)
+        let mut extra_faces: Vec<D> = (0..2 * spec_depth.max(1) + 2).filter_map(|_| self.face.face_clone()).collect();
         // Session 闭包:槽 → 整模单树(状态句柄捕获;模型 Arc 共享)。
         // 捕获期禁 Htod:常量标量走持久槽;KV/GDN 双槽分立 ——
         // KV 槽 = 本 token 自己的格子(窗 = [slot-kv_len+1, slot],随步进;
@@ -244,8 +254,8 @@ impl<D: DeviceClient + 'static> Engine<D> {
                     v
                 },
                 outputs: vec![
-                    OutputSlot { name: "logits", shape: vec![1, vocab], dtype: loaded.spec.dtype },
-                    OutputSlot { name: "token", shape: vec![1], dtype: Dtype::F32 },
+                    OutputSlot { name: "logits".into(), shape: vec![1, vocab], dtype: loaded.spec.dtype },
+                    OutputSlot { name: "token".into(), shape: vec![1], dtype: Dtype::F32 },
                 ],
                 // 逃生开关(C1 禁 graph 裁决配套):OWL_NO_GRAPH=1 → eager
                 // 直发(decode 逐步 eval,无捕获回放)—— 图内/图外行为
@@ -259,6 +269,316 @@ impl<D: DeviceClient + 'static> Engine<D> {
             eprintln!("[engine] 捕获降级为 eager:{reason}");
         }
         eprintln!("[boot] GraphPlan plan(warmup+捕获) {:.2}s", t_run.elapsed().as_secs_f32());
+
+        // E5-M4:verify 桶形图(T = depth+1 定形;spec 模式专用)—— 消
+        // 投机轮的整模 eager 发射税(~830 发 × ~25µs)。FI 不入图(T=4
+        // attention 成本可忽略;回避 plan-in-graph);输出 = tok/hid +
+        // **GDN fold 记录**(每层 8 件,tap 收集 → 多根共享 memo 单次归约,
+        // 刀 1.6 语义)。捕获失败 → None → 执行器落旧 eager verify+重放路。
+        let verify_graph = if spec_depth > 0
+            && vface.is_some()
+            && matches!(capture_outcome, crate::graph_plan::PlanOutcome::Captured)
+        {
+            let vface = vface.unwrap();
+            let depth1 = spec_depth + 1;
+            let model_v = Arc::clone(&loaded.model);
+            let rp_v = loaded.rope.clone();
+            let kv_caches = pool.kv_caches();
+            let gdn_caches = pool.gdn_caches();
+            let bt_leaf = pool.bt_leaf_flat();
+            let env_v = env;
+            let key_dim = dims.nk * dims.hk;
+            let value_dim = dims.nv * dims.hv;
+            let mut vouts = vec![
+                OutputSlot { name: "tok".into(), shape: vec![depth1, 1], dtype: Dtype::F32 },
+                OutputSlot { name: "hid".into(), shape: vec![depth1, dims.hidden], dtype: dims.dtype },
+            ];
+            for i in 0..gdn_caches.len() * 8 {
+                let (gi, f) = (i / 8, i % 8);
+                let shape = match f {
+                    0 | 1 => vec![depth1, key_dim],
+                    2 => vec![depth1, value_dim],
+                    3 | 4 => vec![depth1, dims.nk, dims.hk],
+                    5 => vec![depth1, dims.nv, dims.hv],
+                    _ => vec![depth1, dims.nv],
+                };
+                vouts.push(OutputSlot { name: format!("r{i}") , shape, dtype: dims.dtype });
+            }
+            let (mut vg, voutcome) = GraphPlan::plan(
+                vface,
+                GraphPlanDesc {
+                    inputs: vec![
+                        InputSlot::f32("ids", depth1),
+                        InputSlot::f32("pos", depth1),
+                        InputSlot::f32("kv_slots", depth1),
+                        InputSlot::f32("kv_lens", depth1),
+                        InputSlot::f32("gdn_slot", 1),
+                        InputSlot::f32("gdn_cu", 2).init(vec![0.0, depth1 as f32]),
+                    ],
+                    outputs: vouts,
+                    capture: std::env::var_os("OWL_NO_GRAPH").is_none(),
+                },
+                move |sc: &PlanCtx| -> Result<()> {
+                    let ids = sc.input("ids")?;
+                    let pos = sc.input("pos")?;
+                    let slots_in = sc.input("kv_slots")?;
+                    let lens_in = sc.input("kv_lens")?;
+                    let gdn_slot = sc.input("gdn_slot")?;
+                    let gdn_cu = sc.input("gdn_cu")?;
+                    let kvs_step: Vec<KvBuffers> = kv_caches
+                        .iter()
+                        .map(|(k, v)| KvBuffers {
+                            k_cache: k.clone(),
+                            v_cache: v.clone(),
+                            slots: slots_in.clone(),
+                            kv_lens: lens_in.clone(),
+                            block_tables: bt_leaf.clone(),
+                        })
+                        .collect();
+                    let gdns_step: Vec<GdnBuffers> = gdn_caches
+                        .iter()
+                        .map(|g| GdnBuffers {
+                            conv_q: g.conv_q.clone(),
+                            conv_k: g.conv_k.clone(),
+                            conv_v: g.conv_v.clone(),
+                            rec: g.rec.clone(),
+                            slots: gdn_slot.clone(),
+                        })
+                        .collect();
+                    let mut ctx = ForwardCtx::model_prefill(
+                        depth1, &pos, &kvs_step, &rp_v, &gdns_step, &slots_in, &lens_in,
+                        &gdn_slot, 0, None,
+                    );
+                    ctx.seq_cu = Some(&gdn_cu);
+                    ctx.env = env_v;
+                    let tap: std::rc::Rc<std::cell::RefCell<Vec<owl_models::tensor::TensorOps>>> =
+                        std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+                    ctx.gdn_tap = Some(tap.clone());
+                    let vocab = model_v.vocab_size();
+                    let hidden = model_v.last_hidden(&ids, &ctx);
+                    let logits = model_v.embed.lm_head_matmul(&hidden);
+                    let rows: Vec<owl_models::tensor::TensorOps> = (0..depth1)
+                        .map(|r| owl_models::ops::argmax_f32idx(&logits, vocab, r * vocab))
+                        .collect();
+                    let mut root = owl_models::tensor::TensorOps::call(owl_models::ops::ids::OPS_CONCAT);
+                    for i in 0..8 {
+                        root = root.arg(rows.get(i).unwrap_or(&rows[0]));
+                    }
+                    let root = root
+                        .arg_usize(depth1)
+                        .arg_usize(1)
+                        .arg_usize(1)
+                        .with_shape(Dtype::F32, vec![depth1, 1]);
+                    sc.output("tok", &root)?;
+                    sc.output("hid", &hidden)?;
+                    for (i, t) in tap.borrow().iter().enumerate() {
+                        sc.output(format!("r{i}"), t)?;
+                    }
+                    Ok(())
+                },
+            )
+            .await?;
+            match voutcome {
+                crate::graph_plan::PlanOutcome::Captured => {
+                    eprintln!("[boot] verify 桶形图捕获(T={depth1})");
+                    Some(vg)
+                }
+                other => {
+                    eprintln!("[boot] verify 图降级({other:?})→ eager verify+重放路");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // E5-M5:fold 桶形图族(index = m;状态 = spec 快照 buf 就地,
+        // slot 恒 0 —— 快照即工作缓冲,fold 后 restore 回写会话格;
+        // 记录 = verify 图输出块前缀视图,指针捕获期烘焙)。96 发射的
+        // eager fold → 单 graph_launch。
+        let mut fold_graphs = Vec::new();
+        let mut propose_graphs = Vec::new();
+        if let Some(vg) = verify_graph.as_ref() {
+            let n_rec = pool.gdn_count() * 8;
+            let hid_blk = vg.output_block("hid").expect("hid 输出槽");
+            let rec_blks: Vec<owl_iface::contract::Bytes> = (0..n_rec)
+                .map(|i| vg.output_block(&format!("r{i}")).expect("fold 记录槽"))
+                .collect();
+            let snap_bufs = pool.spec_snap_bufs();
+            let n_roots = pool.gdn_count() * 4;
+            for m in 0..spec_depth {
+                let m1 = m + 1;
+                let model_f = Arc::clone(&loaded.model);
+                let gdn_caches = pool.gdn_caches();
+                let snap = snap_bufs.clone();
+                let rec_blks = rec_blks.clone();
+                let scalar = env.gdn.scalar;
+                let d = dims;
+                let mut fouts = Vec::with_capacity(n_roots);
+                for i in 0..n_roots {
+                    let shape = match i % 4 {
+                        0 => vec![m1, d.nk * d.hk],
+                        1 => vec![m1, d.nk * d.hk],
+                        2 => vec![m1, d.nv * d.hv],
+                        _ => vec![m1, d.nv, d.hv],
+                    };
+                    fouts.push(OutputSlot { name: format!("f{i}"), shape, dtype: Dtype::F16 });
+                }
+                let Some(fface) = extra_faces.pop() else {
+                    eprintln!("[boot] fold 图 face 耗尽 → eager fold");
+                    break;
+                };
+                let (fg, fout) = GraphPlan::plan(
+                    fface,
+                    GraphPlanDesc {
+                        inputs: vec![
+                            InputSlot::f32("slots", 1).init(vec![0.0]),
+                            InputSlot::f32("cu", 2).init(vec![0.0, m1 as f32]),
+                        ],
+                        outputs: fouts,
+                        capture: std::env::var_os("OWL_NO_GRAPH").is_none(),
+                    },
+                    move |sc: &PlanCtx| -> Result<()> {
+                        let slots = sc.input("slots")?;
+                        let cu = sc.input("cu")?;
+                        let rec_views: Vec<owl_models::tensor::TensorOps> = rec_blks
+                            .iter()
+                            .enumerate()
+                            .map(|(i, b)| {
+                                let shape = match i % 8 {
+                                    0 | 1 => vec![m1, d.nk * d.hk],
+                                    2 => vec![m1, d.nv * d.hv],
+                                    3 | 4 => vec![m1, d.nk, d.hk],
+                                    5 => vec![m1, d.nv, d.hv],
+                                    _ => vec![m1, d.nv],
+                                };
+                                owl_models::tensor::TensorOps::of_block(b.id, d.dtype, shape)
+                            })
+                            .collect();
+                        let gdns: Vec<owl_models::layers::gdn::GdnBuffers> = (0..gdn_caches.len())
+                            .map(|li| owl_models::layers::gdn::GdnBuffers {
+                                conv_q: leaf_flat(&snap[li * 4]),
+                                conv_k: leaf_flat(&snap[li * 4 + 1]),
+                                conv_v: leaf_flat(&snap[li * 4 + 2]),
+                                rec: leaf_flat(&snap[li * 4 + 3]),
+                                slots: slots.clone(),
+                            })
+                            .collect();
+                        let roots = owl_models::spec::fold_tree(
+                            &model_f, &rec_views, &gdns, &slots, &cu, 0, m, scalar,
+                        )?;
+                        for (i, r) in roots.iter().enumerate() {
+                            sc.output(format!("f{i}"), r)?;
+                        }
+                        Ok(())
+                    },
+                )
+                .await?;
+                match fout {
+                    crate::graph_plan::PlanOutcome::Captured => {
+                        eprintln!("[boot] fold 桶形图捕获(m={m})");
+                        fold_graphs.push(fg);
+                    }
+                    other => eprintln!("[boot] fold 图降级(m={m},{other:?})→ eager fold"),
+                }
+            }
+
+            // E5-M5:propose 桶形图族(index = m ∈ 0..=depth —— 全接受
+            // m=depth 也要出下轮草稿;extend m+1 行 + k-1 链步;
+            // hidden = verify hid 槽前缀视图;lm_head/链全部入图)。
+            if let Some(mtp) = drafter.as_ref() {
+                let dd = dims;
+                let key_dim = dims.nk * dims.hk;
+                let value_dim = dims.nv * dims.hv;
+                for m in 0..=spec_depth {
+                    let m1 = m + 1;
+                    let model_p = Arc::clone(&loaded.model);
+                    let mtp = std::sync::Arc::clone(mtp);
+                    let rp_p = loaded.rope.clone();
+                    let kv_leaf = pool.mtp_kv_leaf().expect("mtp 池");
+                    let bt_leaf = pool.bt_mtp_leaf().expect("bt_mtp 槽");
+                    let hid = hid_blk.clone();
+                    let env_p = env;
+                    let vocab = loaded.model.vocab_size();
+                    let nb = pool.nb;
+                    let mut pins = vec![InputSlot::f32("tok_ext", m1), InputSlot::f32("pos_ext", m1), InputSlot::f32("slots_ext", m1), InputSlot::f32("lens_ext", m1)];
+                    for j in 0..spec_depth - 1 {
+                        pins.push(InputSlot::f32(format!("c{j}_pos"), 1));
+                        pins.push(InputSlot::f32(format!("c{j}_slots"), 1));
+                        pins.push(InputSlot::f32(format!("c{j}_lens"), 1));
+                    }
+                    pins.push(InputSlot::f32("seq_cu", 2).init(vec![0.0, m1 as f32]));
+                    let pface = extra_faces.pop().expect("extra face");
+                    let (pg, pout) = GraphPlan::plan(
+                        pface,
+                        GraphPlanDesc {
+                            inputs: pins,
+                            outputs: vec![OutputSlot { name: "drafts".into(), shape: vec![spec_depth, 1], dtype: Dtype::F32 }],
+                            capture: std::env::var_os("OWL_NO_GRAPH").is_none(),
+                        },
+                        move |sc: &PlanCtx| -> Result<()> {
+                            // PlanCtx 输入声明形 [1, len] → flatten(行主前缀)
+                            let tok_ext = sc.input("tok_ext")?.reshape(vec![m1]);
+                            let pos_ext = sc.input("pos_ext")?.reshape(vec![m1]);
+                            let slots_ext = sc.input("slots_ext")?.reshape(vec![m1]);
+                            let lens_ext = sc.input("lens_ext")?.reshape(vec![m1]);
+                            let seq_cu = sc.input("seq_cu")?;
+                            let bt = bt_leaf.clone();
+                            let kv_ext = owl_models::module::KvBuffers {
+                                k_cache: kv_leaf.0.clone(),
+                                v_cache: kv_leaf.1.clone(),
+                                slots: slots_ext.clone(),
+                                kv_lens: lens_ext.clone(),
+                                block_tables: bt.clone(),
+                            };
+                            let hid_view =
+                                owl_models::tensor::TensorOps::of_block(hid.id, dd.dtype, vec![m1, dd.hidden]);
+                            let mut chain: Vec<(owl_models::tensor::TensorOps, owl_models::module::KvBuffers)> = Vec::new();
+                            for j in 0..spec_depth - 1 {
+                                let pos_c = sc.input(&format!("c{j}_pos"))?;
+                                let slots_c = sc.input(&format!("c{j}_slots"))?;
+                                let lens_c = sc.input(&format!("c{j}_lens"))?;
+                                chain.push((
+                                    pos_c,
+                                    owl_models::module::KvBuffers {
+                                        k_cache: kv_leaf.0.clone(),
+                                        v_cache: kv_leaf.1.clone(),
+                                        slots: slots_c.clone(),
+                                        kv_lens: lens_c.clone(),
+                                        block_tables: bt.clone(),
+                                    },
+                                ));
+                            }
+                            let chain_refs: Vec<(&owl_models::tensor::TensorOps, &owl_models::module::KvBuffers)> =
+                                chain.iter().map(|(p, k)| (p, k)).collect();
+                            let droot = mtp.propose_ext(
+                                &tok_ext,
+                                &hid_view,
+                                &pos_ext,
+                                &kv_ext,
+                                &slots_ext,
+                                &lens_ext,
+                                &seq_cu,
+                                &chain_refs,
+                                &model_p.embed,
+                                &rp_p,
+                                vocab,
+                                env_p,
+                            );
+                            sc.output("drafts", &droot)
+                        },
+                    )
+                    .await?;
+                    match pout {
+                        crate::graph_plan::PlanOutcome::Captured => {
+                            eprintln!("[boot] propose 桶形图捕获(m={m})");
+                            propose_graphs.push(pg);
+                        }
+                        other => eprintln!("[boot] propose 图降级(m={m},{other:?})→ eager propose"),
+                    }
+                }
+            }
+        };
 
         Ok(RunningEngine {
             probes: crate::running::StepProbes::from_env(),
@@ -279,7 +599,10 @@ impl<D: DeviceClient + 'static> Engine<D> {
             spec_mode,
             drafter,
             blocks_mtp,
-            spec_drafts: None,
+            verify_graph,
+            fold_graphs,
+            propose_graphs,
+            spec_drafts_host: None,
             spec_seed_hidden: None,
             spec_stats: crate::running::SpecStats::default(),
             spec_snap_valid: false,

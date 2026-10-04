@@ -207,6 +207,21 @@ impl DeviceClient for GpuClient {
         .await
     }
 
+    fn face_clone(&self) -> Option<Self> {
+        Some(self.clone())
+    }
+
+    async fn copy_batch(
+        &mut self,
+        copies: &[(Bytes, usize, Bytes, usize, usize)],
+    ) -> Result<(), ModelError> {
+        let flat: Vec<(u64, usize, u64, usize, usize)> = copies
+            .iter()
+            .map(|(s, so, d, doff, l)| (s.id, *so, d.id, *doff, *l))
+            .collect();
+        self.submit(move |ack| Command::CopyBatch { copies: flat, ack })?.await
+    }
+
     async fn memset_zero(&mut self, dst: &Bytes, len_bytes: usize) -> Result<(), ModelError> {
         let block = dst.id;
         self.submit(move |ack| Command::MemsetZero { block, offset_bytes: 0, len_bytes, ack })?.await

@@ -105,6 +105,14 @@ pub struct ForwardCtx<'a> {
     /// v2 分页 decode scratch(None = v1 既有路径;engine 预分配注入,
     /// per-layer 子 ctx 透传 —— 同 ts_buf 形态)
     pub attn_v2: Option<AttnV2Scratch>,
+    /// 序列 cu_seqlens/query_start_len 注入(E5-M4 verify 图:捕获期禁
+    /// Htod,层内 from_host 的 [0,T] 表由图输入槽供给 —— GDN cu 与
+    /// attention qsl 同值语义双消费;None = 层内自建,eager 路不变)
+    pub seq_cu: Option<&'a TensorOps>,
+    /// E5-M4 fold 记录面(verify 图专用):GDN 层把 fold 重放所需张量
+    /// 依层序推入(每层 8:q/k/v raw → conv 重放;q_n/k_n/v_c/g/beta →
+    /// 递推重放)。None = 零开销(生产 decode/prefill 不设)。
+    pub gdn_tap: Option<std::rc::Rc<std::cell::RefCell<Vec<TensorOps>>>>,
 }
 
 impl<'a> ForwardCtx<'a> {
@@ -129,6 +137,8 @@ impl<'a> ForwardCtx<'a> {
             gdn_slot_host: 0,
             ts_buf: None,
             attn_v2: None,
+            seq_cu: None,
+            gdn_tap: None,
         }
     }
 
@@ -158,6 +168,8 @@ impl<'a> ForwardCtx<'a> {
             gdn_slot_host: 0,
             ts_buf: None,
             attn_v2: None,
+            seq_cu: None,
+            gdn_tap: None,
         }
     }
 
@@ -182,6 +194,8 @@ impl<'a> ForwardCtx<'a> {
             gdn_slot_host: 0,
             ts_buf: None,
             attn_v2: None,
+            seq_cu: None,
+            gdn_tap: None,
         }
     }
 
@@ -210,6 +224,8 @@ impl<'a> ForwardCtx<'a> {
             gdn_slot_host: 0,
             ts_buf: None,
             attn_v2: None,
+            seq_cu: None,
+            gdn_tap: None,
         }
     }
 
@@ -241,6 +257,8 @@ impl<'a> ForwardCtx<'a> {
             gdn_slot_host: 0,
             ts_buf: None,
             attn_v2: None,
+            seq_cu: None,
+            gdn_tap: None,
         }
     }
 
@@ -272,6 +290,8 @@ impl<'a> ForwardCtx<'a> {
             gdn_slot_host: 0,
             ts_buf: None,
             attn_v2: None,
+            seq_cu: None,
+            gdn_tap: None,
         }
     }
 
@@ -309,6 +329,8 @@ impl<'a> ForwardCtx<'a> {
             gdn_slot_host: 0,
             ts_buf: None,
             attn_v2: None,
+            seq_cu: None,
+            gdn_tap: None,
         }
     }
 }

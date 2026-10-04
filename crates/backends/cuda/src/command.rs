@@ -109,6 +109,13 @@ pub enum Command {
         len_bytes: usize,
         ack: Ack<Result<(), ModelError>>,
     },
+    /// 设备内批量块→块拷贝(E5-M4):spec 快照 capture/restore 的
+    /// 192 次 copy_block_at actor 往返收敛为一次命令(单 ack = 全部
+    /// 拷贝已入 COMPUTE 流;流序保序语义与逐条 CopyBlock 一致)
+    CopyBatch {
+        copies: Vec<(u64, usize, u64, usize, usize)>,
+        ack: Ack<Result<(), ModelError>>,
+    },
     /// kernel 发射(非阻塞;fire-and-forget)
     Launch {
         msg: LaunchMsg,

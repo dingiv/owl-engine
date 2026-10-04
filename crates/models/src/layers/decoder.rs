@@ -122,6 +122,14 @@ impl DecoderLayer {
         matches!(self.mixer, TokenMixer::Full(_))
     }
 
+    /// GDN mixer 访问器(E5-M4 fold 构树;spec 模块同 crate 消费)
+    pub(crate) fn gdn_mixer(&self) -> Option<&crate::layers::gdn::GatedDeltaNet> {
+        match &self.mixer {
+            TokenMixer::Gdn(g) => Some(g),
+            _ => None,
+        }
+    }
+
     /// 测试专用:分段收割(层树内 mixed / n2 / mlp_out 的声明,非公开 API)。
     #[cfg(test)]
     pub(crate) fn forward_stages<'a>(

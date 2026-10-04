@@ -151,6 +151,8 @@ impl Model {
             ctx_base: ctx.ctx_base,
             fi: ctx.fi.clone(),
             fi_kvi: kvi,
+            seq_cu: ctx.seq_cu,
+            gdn_tap: ctx.gdn_tap.clone(),
             env: ctx.env,
             gdn_slot_host: ctx.gdn_slot_host,
             ts_buf: ctx.ts_buf.clone(),

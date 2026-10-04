@@ -900,6 +900,18 @@ async fn gpu_27b_chat_inference() {
             assert_eq!(ta, tb, "恒等门 p{i}:greedy spec 文本 ≡ 无 spec");
             assert_eq!(ta_tokens, tb_tokens, "恒等门 p{i}:token 账逐位一致");
         }
+        // env 泄漏防护(spec vars 是进程全局;残留 = 后续测试被动进 spec 模
+        // 式 —— two_turns 事件序列案 2026-10-06)
+        for v in [
+            "OWL_SPEC_DEPTH",
+            "OWL_SPEC_DUMB",
+            "OWL_CAPTURE_SLAB_MB",
+            "OWL_GDN_SLOTS",
+            "OWL_SNAP_MAX",
+            "OWL_PREFIX_CACHE",
+        ] {
+            std::env::remove_var(v);
+        }
     }
 
     /// E5-M2b 恒等门(真草稿臂,27B + MTP 头):真草稿下 greedy spec 输出
@@ -926,8 +938,15 @@ async fn gpu_27b_chat_inference() {
         ) -> (String, Vec<u32>) {
             std::env::set_var("OWL_SAMPLER", "greedy");
             std::env::remove_var("OWL_REP_PENALTY");
+            // 24G 贴顶三旋钮(单会话门不需要多格/多快照/前缀缓存)
+            std::env::set_var("OWL_GDN_SLOTS", "1");
+            std::env::set_var("OWL_SNAP_MAX", "1");
+            std::env::set_var("OWL_PREFIX_CACHE", "0");
             if spec {
                 std::env::set_var("OWL_SPEC_DEPTH", "3");
+                // verify 捕获实需 ~100MB(T=4 × 64 层 × m=4 激活;cap-prof
+                // 直方图定谳);decode 臂保持默认 64
+                std::env::set_var("OWL_CAPTURE_SLAB_MB", "128");
             } else {
                 std::env::remove_var("OWL_SPEC_DEPTH");
             }
@@ -967,6 +986,15 @@ async fn gpu_27b_chat_inference() {
         );
         assert_eq!(ta, tb, "恒等门 27B:greedy 真草稿 spec 文本 ≡ 无 spec");
         assert_eq!(ta_tokens, tb_tokens, "恒等门 27B:token 账逐位一致");
+        for v in [
+            "OWL_SPEC_DEPTH",
+            "OWL_CAPTURE_SLAB_MB",
+            "OWL_GDN_SLOTS",
+            "OWL_SNAP_MAX",
+            "OWL_PREFIX_CACHE",
+        ] {
+            std::env::remove_var(v);
+        }
     }
 
 /// 泵到目标 turn 完成,回吐全文(其间事件仅观测)
