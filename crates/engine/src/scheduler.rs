@@ -117,18 +117,28 @@ impl<D: DeviceClient> RunningEngine<D> {
                         let mut old = std::mem::take(&mut s.block_table);
                         self.blocks_m.release_table(&mut old);
                         s.block_table = chain[..m].to_vec();
+                        // MTP 链同步重置(E5-M2b):保留前缀的 mtp 条目虽
+                        // 语义可复用(同 token 同 hidden 确定性),但 M2b
+                        // 无 prefill extend,重建面 = 0 起步(草稿质量降,
+                        // 恒等不受影响 —— 草稿只影响速度)
+                        let mut mold = std::mem::take(&mut s.mtp_block_table);
+                        self.blocks_mtp.release_table(&mut mold);
                         s.reset();
                         s.cached_len = m * self.pool.page;
                         (m * self.pool.page, s.gdn_slot, Some(chain[m - 1]))
                     } else {
                         let mut table = std::mem::take(&mut s.block_table);
                         self.blocks_m.release_table(&mut table);
+                        let mut mold = std::mem::take(&mut s.mtp_block_table);
+                        self.blocks_mtp.release_table(&mut mold);
                         s.reset();
                         (0, s.gdn_slot, None)
                     }
                 } else {
                     let mut table = std::mem::take(&mut s.block_table);
                     self.blocks_m.release_table(&mut table);
+                    let mut mold = std::mem::take(&mut s.mtp_block_table);
+                    self.blocks_mtp.release_table(&mut mold);
                     s.reset();
                     (0, s.gdn_slot, None)
                 }

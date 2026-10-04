@@ -249,9 +249,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     // 保持,pending 延续);全接受 → 状态直落 state@F+k = 下轮不变量。
     // ====================================================================
 
-    /// 投机轮执行:快照 → 草稿 → verify(4 行 prefill 通道)→ 接受 →
-    /// (restore)→ 提交发射。发射 m+1 token(接受 drafts + bonus),
-    /// 事件入 pending_events 队列(pump 逐个出)。
+    /// 投机轮执行(E5-M2b;施工方案 §9.2):快照 → 草稿到位 → verify
+    /// (depth+1 行 prefill 通道,返回 ids + hidden 块)→ greedy 接受 →
+    /// (restore+重放)→ **extend+propose(同迭代,零跨轮 hidden 持久)**
+    /// → 提交发射。发射 m+1 token(接受 drafts + bonus),事件入
+    /// pending_events 队列(pump 逐个出)。
     pub(crate) async fn execute_spec_round(
         &mut self,
         token: u32,
@@ -266,6 +268,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         let prof = self.probes.step_profile;
         let t0 = prof.then(std::time::Instant::now);
+        let depth = self.spec_depth;
 
         // ① 快照(轮首;恢复后仍有效 → 只在失效时拍)
         if !self.spec_snap_valid {
@@ -274,30 +277,47 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             self.spec_snap_valid = true;
         }
 
-        // ② 草稿(M2a 哑草稿 = 3 × anchor 重复;M2b = MTP 头 propose 接入)
-        let drafts = [token, token, token];
+        // ② 草稿到位(轮首消费上一轮末持久;首轮 = prefill seed propose;
+        // Dumb 模式无草稿器,恒哑草稿 = anchor 重复)
+        if self.spec_drafts.is_none() && self.drafter.is_some() {
+            self.propose_first(token, pos).await?;
+        }
+        let old_drafts = self.spec_drafts.take();
+        let drafts: Vec<u32> = match &old_drafts {
+            Some(b) => {
+                let mut buf = vec![0u8; 4 * depth];
+                let face = self.session.face_mut();
+                face.dtoh(b, &mut buf).await?;
+                buf.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
+                    .collect()
+            }
+            None => vec![token; depth], // Dumb:哑草稿 = anchor 重复
+        };
+        // 旧 drafts 块归还(dtoh 后即焚;Dumb 无块)
+        if let Some(b) = old_drafts {
+            let face = self.session.face_mut();
+            face.free(&[b.id]).await?;
+        }
 
-        // ③ verify 块 [anchor, d1..d3] @ pos..pos+3(prefill 通道 T=4)
-        let block: Vec<u32> = std::iter::once(token).chain(drafts).collect();
-        let ids = self.verify_forward(&block, pos, gdn_slot).await?;
+        // ③ verify 块 [anchor, d1..dk] @ pos..pos+depth(prefill 通道)
+        let block: Vec<u32> = std::iter::once(token).chain(drafts.iter().copied()).collect();
+        let (ids, hidden) = self.verify_forward(&block, pos, gdn_slot).await?;
         if prof {
             eprintln!("[spec-prof] pos={pos} verify={:?}", t0.unwrap().elapsed());
         }
 
-        // ④ greedy 接受:行 i argmax vs draft i;i < 3
-        let m = (0..3).take_while(|&i| drafts[i] == ids[i]).count();
+        // ④ greedy 接受:行 i argmax vs draft i;i < depth
+        let m = (0..depth).take_while(|&i| drafts[i] == ids[i]).count();
         let bonus = ids[m];
 
         // ⑤ 部分接受 → GDN 回滚 + 已接受前缀重放(v1 窗口重处理,施工
         // 方案 §四.4);快照无条件失效(下轮轮首重拍)。
-        // 轮不变量(本轮修正):restore 只回到 state@F-1,而下一轮需要
-        // state@fed'-1 = state@F+m —— [anchor, d1..dm] 的贡献在 verify
-        // 中已推进、被 restore 回滚,必须重放补回(已接受行 KV 覆写幂等
-        // —— 同快照同输入确定性同值)。m=0 也要重放 anchor 一行。
-        // 快照失效原因:restore+重放后 live = state@F+m ≠ 快照内容;
-        // 全接受后 live = state@F+3 亦越过快照 —— 留守旧值 = 下轮再
-        // restore 二次丢账(本恒等门首战红案的根因)。
-        if m < 3 {
+        // 轮不变量:restore 只回到 state@F-1,而下一轮需要 state@fed'-1
+        // = state@F+m —— [anchor, d1..dm] 的贡献在 verify 中已推进、被
+        // restore 回滚,必须重放补回(已接受行 KV 覆写幂等 —— 同快照同
+        // 输入确定性同值)。m=0 也要重放 anchor 一行。
+        if m < depth {
             {
                 let face = self.session.face_mut();
                 self.pool.restore_spec_snap(face, gdn_slot).await?;
@@ -305,7 +325,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let replay: Vec<u32> = std::iter::once(token)
                 .chain(drafts[..m].iter().copied())
                 .collect();
-            let _ = self.verify_forward(&replay, pos, gdn_slot).await?;
+            let (_, replay_hidden) = self.verify_forward(&replay, pos, gdn_slot).await?;
+            let face = self.session.face_mut();
+            face.free(&[replay_hidden.id]).await?;
         }
         self.spec_snap_valid = false;
 
@@ -318,7 +340,26 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             act.fed = pos + m + 1;
         }
 
-        // ⑦ 逐 token 发射(eos/预算;事件入队,pump 逐个出)
+        // ⑦ extend + propose(同迭代消费 verify hidden;产出下轮草稿块)
+        if self.drafter.is_some() {
+            let nd = self.propose_round(&hidden, m, &toks, pos).await?;
+            self.spec_drafts = Some(nd);
+        }
+        {
+            let face = self.session.face_mut();
+            face.free(&[hidden.id]).await?;
+        }
+
+        // ⑧ 逐 token 发射(eos/预算;事件入队,pump 逐个出)
+        self.spec_stats.rounds += 1;
+        self.spec_stats.sum_m += m;
+        if m == depth {
+            self.spec_stats.full += 1;
+        } else if m == 0 {
+            self.spec_stats.zero += 1;
+        } else {
+            self.spec_stats.partial += 1;
+        }
         let mut evq = std::collections::VecDeque::new();
         for &t in &toks {
             let ev = self.sample_and_emit(t).await?;
@@ -334,15 +375,169 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             .ok_or_else(|| owl_models::ModelError::Msg("spec 轮零事件(空块?)".into()))
     }
 
-    /// verify 块前向(E5-M2):prefill 通道 T = 块长(base = F,FI 表四件套
-    /// 同款;last_hidden → lm_head → 逐行 argmax → 行栈单根)。返回各行
-    /// argmax(= 各位置的贪心提名)。
+    /// 首轮 propose(E5-M2b;m=0 特例):pair (h_{pos-1}, emb(anchor)) @
+    /// 位置 pos-1 = M1 propose 本尊;seed hidden = prefill 末块 harvest。
+    /// 产出 k 草稿块持久(spec_drafts)。
+    async fn propose_first(&mut self, anchor: u32, pos: usize) -> Result<()> {
+        let depth = self.spec_depth;
+        let seed = self
+            .spec_seed_hidden
+            .take()
+            .ok_or_else(|| owl_models::ModelError::Msg(
+                "spec seed 缺失(prefill 末块 harvest 未落;mtp 模式要求)".into(),
+            ))?;
+        // mtp 链表:覆盖 pos-1(extend 行)+ pos..pos+depth-2(链步)
+        let bt = self.mtp_chain_bt(pos + depth - 1)?;
+        let (kc, vc) = self.pool.mtp_kv_leaf().expect("mtp 池");
+        let page = self.pool.page;
+        let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+        let bt_t = TensorOps::from_host(
+            Dtype::F32,
+            vec![1, bt.len()],
+            &f32b(&bt.iter().map(|&b| b as f32).collect::<Vec<_>>()),
+        );
+        // 步 i:位置 pos-1+i,kv_len = pos+i(含自身)
+        let mut kvs = Vec::new();
+        let mut pos_ts = Vec::new();
+        for i in 0..depth {
+            let p = pos - 1 + i;
+            kvs.push(KvBuffers {
+                k_cache: kc.clone(),
+                v_cache: vc.clone(),
+                slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[(bt[p / page] * page as u32 + (p % page) as u32) as f32])),
+                kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[(p + 1) as f32])),
+                block_tables: bt_t.clone(),
+            });
+            pos_ts.push(TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[p as f32])));
+        }
+        let anchor_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[anchor as f32]));
+        let seed_view =
+            TensorOps::of_block(seed.id, self.pool.dims.dtype, vec![1, self.pool.dims.hidden]);
+        let drafts = {
+            let env = self.env;
+            let vocab = self.model.vocab_size();
+            let rope = self.rope.clone();
+            let mtp = self.drafter.as_ref().expect("drafter");
+            mtp.propose(
+                &anchor_t, &seed_view, depth, &self.model.embed, &rope, &kvs, &pos_ts,
+                vocab, env,
+            )
+        };
+        let (b, arena) = {
+            let face = self.session.face_mut();
+            owl_models::interpreters::eval_ops_scoped_env(drafts.step(), face, self.env).await?
+        };
+        {
+            let face = self.session.face_mut();
+            face.free(&arena).await?;
+            face.free(&[seed.id]).await?; // seed 块已消费,归还
+        }
+        self.spec_drafts = Some(b);
+        Ok(())
+    }
+
+    /// 轮末 propose(E5-M2b;§9.2):extend 行 = (h_{F+i}, emb(t_{F+i+1}))
+    /// @ F..F+m(hiddens = verify hidden 块行 0..m 前缀视图,tokens =
+    /// [d1..dm, bonus])+ 链步 @ F'..F'+k-2 → 下轮草稿块。
+    async fn propose_round(
+        &mut self,
+        hidden: &owl_iface::contract::Bytes,
+        m: usize,
+        toks: &[u32],
+        pos: usize,
+    ) -> Result<owl_iface::contract::Bytes> {
+        let depth = self.spec_depth;
+        // mtp 链表覆盖:extend F..F+m + 链 F'..F'+depth-2(F' = F+m+1)
+        let fp = pos + m + 1;
+        // 链步最远位 = fp+depth-2 → 链表需覆盖 token 数 fp+depth-1
+        let bt = self.mtp_chain_bt(fp + depth - 1)?;
+        let (kc, vc) = self.pool.mtp_kv_leaf().expect("mtp 池");
+        let page = self.pool.page;
+        let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+        let bt_t = TensorOps::from_host(
+            Dtype::F32,
+            vec![1, bt.len()],
+            &f32b(&bt.iter().map(|&b| b as f32).collect::<Vec<_>>()),
+        );
+        let slot_at = |p: usize| -> f32 { (bt[p / page] * page as u32 + (p % page) as u32) as f32 };
+        // extend 批行建表([M+1])
+        let slots_x: Vec<f32> = (0..=m).map(|i| slot_at(pos + i)).collect();
+        let lens_x: Vec<f32> = (0..=m).map(|i| (pos + i + 1) as f32).collect();
+        let pos_x: Vec<f32> = (0..=m).map(|i| (pos + i) as f32).collect();
+        let extend_kv = KvBuffers {
+            k_cache: kc.clone(),
+            v_cache: vc.clone(),
+            slots: TensorOps::from_host(Dtype::F32, vec![m + 1], &f32b(&slots_x)),
+            kv_lens: TensorOps::from_host(Dtype::F32, vec![m + 1], &f32b(&lens_x)),
+            block_tables: bt_t.clone(),
+        };
+        let tokens_t = TensorOps::from_host(
+            Dtype::F32,
+            vec![m + 1],
+            &f32b(&toks.iter().map(|&v| v as f32).collect::<Vec<_>>()),
+        );
+        let hiddens =
+            TensorOps::of_block(hidden.id, self.pool.dims.dtype, vec![m + 1, self.pool.dims.hidden]);
+        let extend_pos = TensorOps::from_host(Dtype::F32, vec![m + 1], &f32b(&pos_x));
+        let extend_slots = TensorOps::from_host(Dtype::F32, vec![m + 1], &f32b(&slots_x));
+        let extend_lens = TensorOps::from_host(Dtype::F32, vec![m + 1], &f32b(&lens_x));
+        // 链步建表(k-1 步 @ F'..F'+depth-2)
+        let mut chain = Vec::new();
+        for j in 1..depth {
+            let p = fp + j - 1;
+            let kv = KvBuffers {
+                k_cache: kc.clone(),
+                v_cache: vc.clone(),
+                slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot_at(p)])),
+                kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[(p + 1) as f32])),
+                block_tables: bt_t.clone(),
+            };
+            let pt = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[p as f32]));
+            chain.push((pt, kv));
+        }
+        let chain_refs: Vec<(&TensorOps, &KvBuffers)> =
+            chain.iter().map(|(p, k)| (p, k)).collect();
+        let drafts = {
+            let env = self.env;
+            let vocab = self.model.vocab_size();
+            let rope = self.rope.clone();
+            let mtp = self.drafter.as_ref().expect("drafter");
+            mtp.propose_ext(
+                &tokens_t, &hiddens, &extend_pos, &extend_kv, &extend_slots, &extend_lens,
+                &chain_refs, &self.model.embed, &rope, vocab, env,
+            )
+        };
+        let (b, arena) = {
+            let face = self.session.face_mut();
+            owl_models::interpreters::eval_ops_scoped_env(drafts.step(), face, self.env).await?
+        };
+        {
+            let face = self.session.face_mut();
+            face.free(&arena).await?;
+        }
+        Ok(b)
+    }
+
+    /// mtp 链表 ensure(E5-M2b;propose eager 路径用 from_host 表,非持久
+    /// bt 块 —— 图不烘焙 mtp 链)。返回 host 块链副本。
+    fn mtp_chain_bt(&mut self, cover: usize) -> Result<Vec<u32>> {
+        let sid = self.active.as_ref().expect("active 已保证").session_id;
+        let s = self.sessions.get_mut(sid).expect("账在");
+        self.blocks_mtp.ensure_for_len(&mut s.mtp_block_table, cover)?;
+        Ok(s.mtp_block_table.clone())
+    }
+
+    /// verify 块前向(E5-M2b):prefill 通道 T = 块长(base = F,FI 表四件套
+    /// 同款)。双树求值:树一 = last_hidden(根块存活返回 —— extend 同迭代
+    /// 消费);树二 = lm_head → 逐行 argmax → 行栈(引用树一根)。返回
+    /// (各行 argmax = 各位置贪心提名,hidden 块 [t, hidden];调用方在
+    /// extend 后显式 free)。
     async fn verify_forward(
         &mut self,
         block: &[u32],
         base: usize,
         gdn_slot: usize,
-    ) -> Result<Vec<u32>> {
+    ) -> Result<(Vec<u32>, owl_iface::contract::Bytes)> {
         let t = block.len();
         let (bt_chain, _) = {
             let act = self.active.as_ref().expect("active 已保证");
@@ -466,8 +661,16 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         ctx.env = self.env;
         let face = self.session.face_mut();
         let vocab = self.model.vocab_size();
+        // 树一:hidden 根([t, hidden];E5-M2b:extend 同迭代消费 → 根块
+        // 存活返回,中间块即焚)。原单树版的 argmax 根与 _arena 均 drop 未
+        // free(每轮泄漏 verify 全部中间块 —— M2a 存量雷,本轮修复)。
         let hidden = self.model.last_hidden(&ids_t, &ctx);
-        let logits = self.model.embed.lm_head_matmul(&hidden);
+        let hd = hidden.shape()[1];
+        let (hb, arena1) =
+            owl_models::interpreters::eval_ops_scoped_env(hidden.step(), face, self.env).await?;
+        // 树二:lm_head + 逐行 argmax(引用树一根块,不重建整模前向)
+        let hview = TensorOps::of_block(hb.id, self.pool.dims.dtype, vec![t, hd]);
+        let logits = self.model.embed.lm_head_matmul(&hview);
         let rows: Vec<TensorOps> =
             (0..t).map(|r| owl_models::ops::argmax_f32idx(&logits, vocab, r * vocab)).collect();
         let refs: Vec<&TensorOps> = rows.iter().collect();
@@ -476,14 +679,19 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             root = root.arg(refs.get(i).copied().unwrap_or(refs[0]));
         }
         let root = root.arg_usize(t).arg_usize(1).arg_usize(1).with_shape(Dtype::F32, vec![t, 1]);
-        let (b, _arena) =
+        let (b, arena2) =
             owl_models::interpreters::eval_ops_scoped_env(root.step(), face, self.env).await?;
         let mut buf = vec![0u8; 4 * t];
         face.dtoh(&b, &mut buf).await?;
-        Ok(buf
+        // 显式归还:argmax 根 + 两树中间块(hidden 根 hb 存活,随返回值)
+        face.free(&[b.id]).await?;
+        face.free(&arena2).await?;
+        face.free(&arena1).await?;
+        let ids: Vec<u32> = buf
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
-            .collect())
+            .collect();
+        Ok((ids, hb))
     }
 
     // ====================================================================
@@ -671,13 +879,39 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if is_last {
             // E3:末行设备 argmax(4B 回读,免 [T,V] 大 dtoh);
             // 2026-10-02 forward_last:hidden 先窄末行再 lm_head ——
-            // logits [1,V] 而非 [T,V](大 chunk 内存/算力双省)
-            let tree = self.model.forward_last(&ids_t, &ctx);
-            let tok = owl_models::ops::argmax_f32idx(&tree, vocab, 0);
-            let (b, arena) = eval_ops_scoped_env(tok.step(), face, self.env).await?;
+            // logits [1,V] 而非 [T,V](大 chunk 内存/算力双省)。
+            // E5-M2b:双树拆分 —— 树一 = 末行 hidden 根(mtp 模式
+            // harvest 为首轮 propose 的 seed;非 mtp 一样求值,仅不持久);
+            // 树二 = lm_head → argmax(引用树一根,不重建整模前向)。
+            let hidden_full = self.model.last_hidden(&ids_t, &ctx);
+            let d_model = hidden_full.shape()[1];
+            // 末行窄切 **物化**(OPS_NARROW 语义调用):SliceView 作根透传
+            // 父块,偏移只在被消费时生效 —— 根必须真块(刀 3b 同族教训:
+            // 视图作根丢偏移,读行 0 = 首 token hidden → argmax 垃圾)
+            let last = TensorOps::call(owl_models::ops::ids::OPS_NARROW)
+                .arg(&hidden_full)
+                .arg_usize(1)
+                .arg_usize(d_model)
+                .arg_usize((t - 1) * d_model)
+                .arg_usize(d_model)
+                .with_shape(d.dtype, vec![1, d_model]);
+            let (hb, arena1) = eval_ops_scoped_env(last.step(), face, self.env).await?;
+            let hb_view = TensorOps::of_block(hb.id, d.dtype, vec![1, d_model]);
+            let logits = self.model.embed.lm_head_matmul(&hb_view);
+            let tok = owl_models::ops::argmax_f32idx(&logits, vocab, 0);
+            let (b, arena2) = eval_ops_scoped_env(tok.step(), face, self.env).await?;
             let mut buf = [0u8; 4];
             face.dtoh(&b, &mut buf).await?;
-            face.free(&arena).await?; // E2a:根已收割,中间块归池
+            // E2a + M2b 泄漏修复:argmax 根 + 两树中间块显式归还
+            // (hidden 根 hb 随 Drop 泄漏 10KB —— mtp 模式转正为 seed)
+            face.free(&[b.id]).await?;
+            face.free(&arena2).await?;
+            if self.drafter.is_some() {
+                self.spec_seed_hidden = Some(hb);
+            } else {
+                face.free(&[hb.id]).await?;
+            }
+            face.free(&arena1).await?; // E2a:中间块归池(每 chunk 零净增)
             let nt = f32::from_le_bytes(buf) as u32;
             Ok(Some(nt))
         } else {
@@ -701,6 +935,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
 
     async fn complete(&mut self) -> Result<TurnEvent> {
         let act = self.active.take().expect("active");
+        // spec 态清理(E5-M2b):陈旧草稿块作废( Continuation 已变,
+        // 下一 turn 由 prefill seed 重新 propose;草稿只影响速度,不清也
+        // 恒等 —— 但清了省 dtoh + free 账目干净)
+        if let Some(b) = self.spec_drafts.take() {
+            let face = self.session.face_mut();
+            face.free(&[b.id]).await?;
+        }
         // 会话账落地(S1 收口):KV 此刻 = prompt 全量 + 生成段;GDN 状态
         // 跨 turn 连续。临时会话终了即焚(表不随 turn 数无界增长)
         if let Some(s) = self.sessions.get_mut(act.session_id) {
@@ -715,6 +956,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             if let Some(s) = self.sessions.get_mut(act.session_id) {
                 let mut table = std::mem::take(&mut s.block_table);
                 self.blocks_m.release_table(&mut table);
+                // MTP 链第二链同步归还(E5-M2b)
+                let mut mtp_table = std::mem::take(&mut s.mtp_block_table);
+                self.blocks_mtp.release_table(&mut mtp_table);
             }
             self.sessions.close(act.session_id).ok();
         }

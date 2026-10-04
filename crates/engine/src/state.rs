@@ -104,6 +104,8 @@ pub(crate) struct StatePool {
     /// spec 快照(E5-M2:投机轮回滚缓冲;OWL_SPEC_DEPTH>0 时分配,
     /// 内容 = 轮首 GDN 态 state@B-1;restore 后仍有效,全接受后失效重拍)
     pub(crate) spec_snap: Option<GdnSnapSlot>,
+    /// MTP 草稿链 KV 池(E5-M2b;独立页池,1 层;mtp 模式分配)
+    pub(crate) mtp_kvs: Option<KvBlocks>,
     /// paged 池几何(页;legacy 模式 page = 容量,nb = 1)
     pub(crate) page: usize,
     pub(crate) nb: usize,
@@ -126,6 +128,7 @@ impl StatePool {
         pool_tokens: usize,
         fi: Option<owl_models::env::KvQuant>,
         spec: bool,
+        mtp: bool,
     ) -> Result<StatePool> {
         let t = std::time::Instant::now();
         let n_full = layer_types.iter().filter(|&&f| f).count();
@@ -147,6 +150,17 @@ impl StatePool {
             let v_cache = zero_block_dt(face, nb * dims.hkv * dims.hd * page, dims.dtype).await?;
             kvs.push(KvBlocks { k_cache, v_cache });
         }
+        // MTP 草稿链 KV(E5-M2b):独立页池(1 层,几何 = full 层同款,
+        // 容量同 pool_tokens);不接前缀缓存 —— mtp KV 依赖 hidden,
+        // 不可 token 哈希。仅 paged(链吃块表)。
+        let mtp_kvs = if mtp && paged {
+            Some(KvBlocks {
+                k_cache: zero_block_dt(face, nb * dims.hkv * dims.hd * page, dims.dtype).await?,
+                v_cache: zero_block_dt(face, nb * dims.hkv * dims.hd * page, dims.dtype).await?,
+            })
+        } else {
+            None
+        };
         if let Some(kq) = fi {
             // 影子池 [nb, page, Hkv, hd]:f16 = 2B/elem;fp8 = 1B/elem
             // (U32 块承载字节:elems = bytes/4,page 32 因子保证 4 整除)
@@ -232,7 +246,16 @@ impl StatePool {
         } else {
             None
         };
-        Ok(StatePool { kvs, k_fis, v_fis, fi_quant: fi, gdns, snaps, snap_tick: 0, bt, spec_snap, attn_v2, page, nb, paged, x, dims })
+        Ok(StatePool { kvs, k_fis, v_fis, fi_quant: fi, gdns, snaps, snap_tick: 0, bt, spec_snap, mtp_kvs, attn_v2, page, nb, paged, x, dims })
+    }
+
+    /// MTP 草稿链 KV 叶子对(mtp 模式;None = 未启用)
+    pub(crate) fn mtp_kv_leaf(&self) -> Option<(TensorOps, TensorOps)> {
+        let mk = self.mtp_kvs.as_ref()?;
+        Some((
+            block_leaf_dt(&mk.k_cache.0, self.k_shape(), self.dims.dtype),
+            block_leaf_dt(&mk.v_cache.0, self.v_shape(), self.dims.dtype),
+        ))
     }
 
     /// v2 scratch 叶子(None = legacy;引擎按步注入 ctx.attn_v2)

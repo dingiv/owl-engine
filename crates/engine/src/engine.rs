@@ -119,14 +119,42 @@ impl<D: DeviceClient + 'static> Engine<D> {
         } else {
             None
         };
-        // E5-M2:投机轮深(OWL_SPEC_DEPTH;0 = 关;草稿器 M2b 接入前 =
-        // 哑草稿轮 —— 机制/恒等门先行)
-        let spec_depth = std::env::var("OWL_SPEC_DEPTH")
+        // E5-M2b/C7:spec 模式三态裁决 —— depth>0 且检查点有 mtp.* →
+        // Mtp(真草稿);OWL_SPEC_DUMB=1 → Dumb(哑草稿诊断面);否则
+        // Off(spec_depth 归零,调度回落 DecodeBatch —— 无草稿器不白发
+        // verify 税)。depth 上限 3(kv_slots [u32;4] 契约)。
+        let spec_depth_raw = std::env::var("OWL_SPEC_DEPTH")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&d| d > 0)
             .unwrap_or(0);
-        let pool = StatePool::alloc(&mut self.face, dims, &loaded.spec.layer_types, s, pool_tokens, fi_quant, spec_depth > 0).await?;
+        let spec_mode = if spec_depth_raw == 0 {
+            crate::running::SpecMode::Off
+        } else if loaded.mtp_dir.is_some() {
+            crate::running::SpecMode::Mtp
+        } else if std::env::var_os("OWL_SPEC_DUMB").is_some() {
+            crate::running::SpecMode::Dumb
+        } else {
+            eprintln!("[boot] OWL_SPEC_DEPTH>0 但无草稿器(非 mtp 检查点)→ C7 回落 DecodeBatch");
+            crate::running::SpecMode::Off
+        };
+        let spec_depth = if spec_mode == crate::running::SpecMode::Off { 0 } else { spec_depth_raw.min(3) };
+        if spec_mode != crate::running::SpecMode::Off {
+            eprintln!(
+                "[boot] spec 模式 = {:?} depth={spec_depth}(注:spec 轮恒 greedy,采样 parity 挂 D4 device accept)",
+                spec_mode
+            );
+        }
+        // MTP 草稿头装载(mtp 模式;embed/lm_head 共享 target)
+        let drafter = if spec_mode == crate::running::SpecMode::Mtp {
+            let dir = loaded.mtp_dir.as_ref().expect("mtp_dir");
+            let (mtp, _) = owl_models::specs::qwen35::load_27b_mtp(dir, &mut self.face).await?;
+            eprintln!("[boot] MTP 草稿头装载(spec depth={spec_depth})");
+            Some(mtp)
+        } else {
+            None
+        };
+        let pool = StatePool::alloc(&mut self.face, dims, &loaded.spec.layer_types, s, pool_tokens, fi_quant, spec_depth > 0, spec_mode == crate::running::SpecMode::Mtp).await?;
         if fi_quant.is_some() {
             eprintln!(
                 "[boot] FlashInfer prefill 面启用(影子池 ×{},quant={:?})",
@@ -142,6 +170,12 @@ impl<D: DeviceClient + 'static> Engine<D> {
         {
             blocks_m.enable_prefix_cache((pool.nb / 2).max(1));
         }
+        // MTP 链页账房(E5-M2b):独立页池同几何;无前缀缓存。
+        // 非 mtp 模式 0 块 —— 误用 = 结构化报错(池耗尽语义)。
+        let blocks_mtp = BlockManager::new(
+            if spec_mode == crate::running::SpecMode::Mtp { pool.nb } else { 0 },
+            pool.page,
+        );
 
         // Session 闭包:槽 → 整模单树(状态句柄捕获;模型 Arc 共享)。
         // 捕获期禁 Htod:常量标量走持久槽;KV/GDN 双槽分立 ——
@@ -242,6 +276,12 @@ impl<D: DeviceClient + 'static> Engine<D> {
             blocks_m,
             env,
             spec_depth,
+            spec_mode,
+            drafter,
+            blocks_mtp,
+            spec_drafts: None,
+            spec_seed_hidden: None,
+            spec_stats: crate::running::SpecStats::default(),
             spec_snap_valid: false,
             pending_events: std::collections::VecDeque::new(),
         })

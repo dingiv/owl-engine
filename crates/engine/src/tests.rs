@@ -429,10 +429,12 @@ async fn gpu_longctx_4k_prefix_qa() {
 /// (GDN in_proj_z/b/a)反量化 f16 直读。
 #[tokio::test]
 async fn gpu_w4a16_marlin_e2e() {
-    // let Some(ordinal) = gpu_ordinal() else {
-    //     eprintln!("skip: OWL_TEST_DEVICE 未设");
-    //     return;
-    // };
+    // 套件统一约定(OWL_TEST_DEVICE):曾硬钉 ordinal 2 —— 与现役
+    // vLLM 生产服务器(3080 对)撞卡时 OOM at capture slab(2026-10-06)
+    let Some(ordinal) = gpu_ordinal() else {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    };
     let dir = asset_dir(); // 转换产物与 f16 同目录约定:../Qwen3.5-0.8B-W4A16
     let w4a16_dir = dir
         .parent()
@@ -443,7 +445,7 @@ async fn gpu_w4a16_marlin_e2e() {
         return;
     }
     let mut engine = Engine::new(EngineConfig {
-        device_ordinal: 2,
+        device_ordinal: ordinal,
         max_seq_tokens: 256,
         prefill_chunk: 32,
     })
@@ -830,10 +832,11 @@ async fn gpu_27b_chat_inference() {
     }
 
 
-    /// E5-M2 恒等门:greedy 下 spec 轮输出 ≡ 无 spec 输出(逐 token)。
-    /// 任意草稿(哑草稿 = anchor 重复)下机制必须恒等 —— 接受是恒等
-    /// 变换,分红只影响速度。双 boot × 双 prompt × 会话 token 账逐位
-    /// 比对(第二 prompt 同引擎续 turn = 跨 turn 状态连续性一并覆盖)。
+    /// E5-M2 恒等门(机制臂,0.8B + 哑草稿):greedy 下 spec 轮输出 ≡ 无
+    /// spec 输出(逐 token)。任意草稿(哑草稿 = anchor 重复)下机制必须
+    /// 恒等 —— 接受是恒等变换,分红只影响速度。双 boot × 双 prompt ×
+    /// 会话 token 账逐位比对(第二 prompt 同引擎续 turn = 跨 turn 状态
+    /// 连续性一并覆盖)。哑草稿需 OWL_SPEC_DUMB=1(C7:无草稿器回落)。
     #[tokio::test]
     async fn gpu_spec_identity_gate() {
         let Some(ordinal) = gpu_ordinal() else {
@@ -852,8 +855,10 @@ async fn gpu_27b_chat_inference() {
             std::env::remove_var("OWL_REP_PENALTY");
             if spec {
                 std::env::set_var("OWL_SPEC_DEPTH", "3");
+                std::env::set_var("OWL_SPEC_DUMB", "1");
             } else {
                 std::env::remove_var("OWL_SPEC_DEPTH");
+                std::env::remove_var("OWL_SPEC_DUMB");
             }
             let mut engine = Engine::new(EngineConfig {
                 device_ordinal: ordinal,
@@ -876,6 +881,11 @@ async fn gpu_27b_chat_inference() {
                     .unwrap_or_default();
                 out.push((text, toks));
             }
+            let st = running.spec_stats;
+            eprintln!(
+                "[spec-gate] stats: rounds={} sum_m={} full={} partial={} zero={}",
+                st.rounds, st.sum_m, st.full, st.partial, st.zero
+            );
             out
         }
 
@@ -890,6 +900,73 @@ async fn gpu_27b_chat_inference() {
             assert_eq!(ta, tb, "恒等门 p{i}:greedy spec 文本 ≡ 无 spec");
             assert_eq!(ta_tokens, tb_tokens, "恒等门 p{i}:token 账逐位一致");
         }
+    }
+
+    /// E5-M2b 恒等门(真草稿臂,27B + MTP 头):真草稿下 greedy spec 输出
+    /// ≡ 无 spec 输出(逐 token)。同时验证 m>0 真接受路径(部分/全接受)
+    /// 与 spec_stats 账目闭合(Σ(m_i+1) = 发射 token 数)。门控
+    /// OWL_AWQ27B_DIR。
+    #[tokio::test]
+    async fn gpu_spec_identity_gate_27b() {
+        let Some(ordinal) = gpu_ordinal() else {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return;
+        };
+        let Ok(dir) = std::env::var("OWL_AWQ27B_DIR") else {
+            eprintln!("skip: OWL_AWQ27B_DIR 未设(cyankiwi 检查点目录)");
+            return;
+        };
+        let prompt = "用五十字介绍长城。";
+
+        async fn gen(
+            spec: bool,
+            ordinal: usize,
+            dir: &str,
+            prompt: &str,
+        ) -> (String, Vec<u32>) {
+            std::env::set_var("OWL_SAMPLER", "greedy");
+            std::env::remove_var("OWL_REP_PENALTY");
+            if spec {
+                std::env::set_var("OWL_SPEC_DEPTH", "3");
+            } else {
+                std::env::remove_var("OWL_SPEC_DEPTH");
+            }
+            let mut engine = Engine::new(EngineConfig {
+                device_ordinal: ordinal,
+                max_seq_tokens: 256,
+                prefill_chunk: 64,
+            })
+            .expect("构造");
+            let loaded = engine
+                .loader()
+                .load_qwen38_27b_awq(std::path::Path::new(dir), std::path::Path::new(dir))
+                .await
+                .expect("装载");
+            let mut running = engine.run(loaded).await.expect("装配");
+            let (sid, id) = running.submit_session(Some(7), prompt, 40).expect("submit");
+            let text = drive_turn(&mut running, id).await;
+            let toks = running
+                .sessions
+                .get(sid)
+                .map(|s| s.tokens.clone())
+                .unwrap_or_default();
+            let st = running.spec_stats;
+            eprintln!(
+                "[spec-gate-27b] spec={spec} stats: rounds={} sum_m={} full={} partial={} zero={}",
+                st.rounds, st.sum_m, st.full, st.partial, st.zero
+            );
+            (text, toks)
+        }
+
+        let (ta, ta_tokens) = gen(false, ordinal, &dir, prompt).await;
+        let (tb, tb_tokens) = gen(true, ordinal, &dir, prompt).await;
+        eprintln!(
+            "[spec-gate-27b] baseline({}tok)={ta:?}\n[spec-gate-27b] spec({}tok)={tb:?}",
+            ta_tokens.len(),
+            tb_tokens.len()
+        );
+        assert_eq!(ta, tb, "恒等门 27B:greedy 真草稿 spec 文本 ≡ 无 spec");
+        assert_eq!(ta_tokens, tb_tokens, "恒等门 27B:token 账逐位一致");
     }
 
 /// 泵到目标 turn 完成,回吐全文(其间事件仅观测)

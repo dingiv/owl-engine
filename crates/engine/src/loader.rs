@@ -31,6 +31,8 @@ pub struct LoadedModel {
     pub(crate) spec: ModelSpec,
     /// 量化方案(环境真值;EnvProvider.quant 注入源)
     pub(crate) quant_plan: owl_models::module::QuantPlan,
+    /// MTP 头检查点目录(E5-M2b;Some = 检查点自带 mtp.*,spec 可选真草稿)
+    pub(crate) mtp_dir: Option<std::path::PathBuf>,
 }
 
 /// 面向上层的模型加载器(经引擎的 face;spec 声明驱动)
@@ -54,7 +56,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let quant_plan = owl_models::module::QuantPlan::F16;
         let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1, device_repack: false };
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
-        Ok(LoadedModel { model, tokenizer, rope, spec, quant_plan })
+        Ok(LoadedModel { model, tokenizer, rope, spec, quant_plan, mtp_dir: None })
 
     }
 
@@ -72,7 +74,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let quant_plan = owl_models::module::QuantPlan::W4A16;
         let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1, device_repack: false };
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
-        Ok(LoadedModel { model, tokenizer, rope, spec, quant_plan })
+        Ok(LoadedModel { model, tokenizer, rope, spec, quant_plan, mtp_dir: None })
 
     }
 
@@ -101,7 +103,14 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         owl_shared::metrics::query_metrics(
             &owl_shared::metrics::MetricsFilter::new().tag_prefix("load."),
         );
-        Ok(LoadedModel { model, tokenizer, rope, spec, quant_plan })
+        Ok(LoadedModel {
+            model,
+            tokenizer,
+            rope,
+            spec,
+            quant_plan,
+            mtp_dir: Some(dir.to_path_buf()),
+        })
 
     }
 }

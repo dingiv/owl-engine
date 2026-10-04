@@ -47,6 +47,9 @@ pub struct AgentSession {
     /// 物理块链(E2b 真块表):逻辑块序 → 物理块 id;块池共享,
     /// 跨 turn 存续(会话存活期间块不归还)
     pub block_table: Vec<u32>,
+    /// MTP 草稿链块链(E5-M2b):独立页池的第二链;mtp 模式由
+    /// propose 路径 ensure_for_len,与 target 链同步跨 turn 存续
+    pub mtp_block_table: Vec<u32>,
     /// GDN 状态格号(E2b 多会话隔离;格 = 每会话一格,容量 GDN_SLOTS)
     pub gdn_slot: usize,
 }
@@ -60,6 +63,7 @@ impl AgentSession {
             slot_base,
             tokens: Vec::new(),
             block_table: Vec::new(),
+            mtp_block_table: Vec::new(),
             gdn_slot,
         }
     }

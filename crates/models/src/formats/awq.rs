@@ -136,6 +136,42 @@ impl AwqSource {
         }
     }
 
+    /// fc 列半拆物化(E5-M2b;键首触才建,双检缓存 + build_lock 同款):
+    /// 读物理键 mtp.fc.weight(bf16 [out, 2h])→ 逐行 bf16→f16 + 取前/后
+    /// 半 → [out, h] f16 连续。rayon 行并行(行长 2 字节对齐,安全)。
+    fn fc_half_bytes(&self, high: bool) -> Option<Arc<[u8]>> {
+        let vkey = if high { "mtp.fc_h.weight" } else { "mtp.fc_e.weight" };
+        {
+            let cache = self.cache.lock().unwrap();
+            if let Some(b) = cache.0.get(vkey) {
+                return Some(b.clone());
+            }
+        }
+        let we = self.index.get("mtp.fc.weight")?;
+        let out = *we.shape.first()?;
+        let din = *we.shape.get(1)?;
+        let half = din / 2;
+        let src = &self.maps[we.map_ix][we.start..we.start + we.nbytes];
+        let mut dst = vec![0u8; out * half * 2];
+        {
+            use rayon::prelude::*;
+            let skip = if high { half * 2 } else { 0 };
+            dst.par_chunks_mut(half * 2).enumerate().for_each(|(r, row)| {
+                let base = r * din * 2 + skip;
+                crate::f16c::bf16_bytes_to_f16_bytes(
+                    &src[base..base + half * 2],
+                    &mut row[..half * 2],
+                );
+            });
+        }
+        let b: Arc<[u8]> = dst.into();
+        {
+            let mut cache = self.cache.lock().unwrap();
+            cache.0.insert(vkey.to_string(), b.clone());
+        }
+        Some(b)
+    }
+
     /// 键解析(唯一入口;懒物化在此触发)
     fn resolve(&self, key: &str) -> Option<Resolved> {
         if key.ends_with(".marlin_ws") || key.ends_with(".marlin_ctmp") {
@@ -149,6 +185,15 @@ impl AwqSource {
         }
         if let Some(base) = key.strip_suffix(".zeros") {
             return Some(Resolved::Bytes(self.linear_bytes_for(base, key)?, Dtype::U32));
+        }
+        // E5-M2b fc 列半拆:mtp.fc_{e,h}.weight = mtp.fc.weight 的 in 维
+        // 前/后半(W [out, 2h] 行主序 → 行内去交织,装载一次性 rayon;
+        // bf16→f16 归一)。MTP 头双子 Linear 消费,消每轮 narrow 物化。
+        if key == "mtp.fc_e.weight" || key == "mtp.fc_h.weight" {
+            return Some(Resolved::Bytes(
+                self.fc_half_bytes(key.ends_with("_h.weight"))?,
+                Dtype::F16,
+            ));
         }
         // passthrough 优先(norm/conv/embed 等原生存量键;含非量化线性
         // 的裸 .weight —— cyankiwi 的 ignore 逐层不同,同键可能两态)

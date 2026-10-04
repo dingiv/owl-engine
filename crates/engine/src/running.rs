@@ -101,10 +101,45 @@ pub struct RunningEngine<D: DeviceClient> {
     pub(crate) env: owl_models::env::EnvProvider,
     /// E5-M2:投机轮深(0 = 关;>0 = 每轮草稿数,调度发 SpecRound)
     pub(crate) spec_depth: usize,
+    /// E5-M2b:spec 模式三态(Mtp = 真草稿头;Dumb = 哑草稿诊断;
+    /// Off = 回落 DecodeBatch —— spec_depth 恒 0)
+    pub(crate) spec_mode: SpecMode,
+    /// MTP 草稿头(mtp 模式;embed/lm_head 共享 target 不持有)
+    pub(crate) drafter: Option<owl_models::layers::mtp::MtpPredictor>,
+    /// MTP 链页账房(E5-M2b;独立页池,无前缀缓存)
+    pub(crate) blocks_mtp: BlockManager,
+    /// 已 propose 草稿(device 块 [k,1] f32;轮首消费轮末替换,
+    /// 替换时旧块显式 free;首轮由 prefill seed propose 填充)
+    pub(crate) spec_drafts: Option<owl_iface::contract::Bytes>,
+    /// prefill 末行 hidden(device 块 [1,hidden];首轮 propose 的
+    /// anchor_hidden;消费后置 None)
+    pub(crate) spec_seed_hidden: Option<owl_iface::contract::Bytes>,
+    /// spec 接受账(M2b 恒等门覆盖断言:三路 m 分布 + 账目闭合)
+    pub(crate) spec_stats: SpecStats,
     /// spec 快照有效性(轮首拍;恢复后仍有效,全接受后失效重拍)
     pub(crate) spec_snap_valid: bool,
     /// 多 token 轮的事件队列(pump 逐个出;SpecRound 一轮 m+1 token)
     pub(crate) pending_events: std::collections::VecDeque<TurnEvent>,
+}
+
+/// E5-M2b:spec 模式三态(C7 回退挂钩)。裁决在 boot:
+/// depth>0 且检查点有 mtp.* → Mtp;OWL_SPEC_DUMB=1 → Dumb(诊断面,
+/// 哑草稿 = anchor 重复);否则 Off(无草稿器不白发 verify 税)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SpecMode {
+    Off,
+    Dumb,
+    Mtp,
+}
+
+/// spec 接受账(轮级;恒等门/接受率观测面)
+#[derive(Default, Debug, Clone, Copy)]
+pub(crate) struct SpecStats {
+    pub rounds: usize,
+    pub sum_m: usize,
+    pub full: usize,
+    pub partial: usize,
+    pub zero: usize,
 }
 
 impl<D: DeviceClient> RunningEngine<D> {

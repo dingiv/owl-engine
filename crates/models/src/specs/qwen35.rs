@@ -182,9 +182,10 @@ pub async fn load_27b_mtp<D: DeviceClient + 'static>(
 impl Loadable for crate::layers::mtp::MtpPredictor {
     fn layout(&self, ctx: &LoaderCtx) -> LoaderOps {
         let keys = Qwen35Convention::new("mtp");
-        self.fc()
+        self.fc_e()
             .layout(ctx)
             .map_keys(|k| format!("mtp.{k}.weight"))
+            .chain(self.fc_h().layout(ctx).map_keys(|k| format!("mtp.{k}.weight")))
             .chain(self.layer().layout(ctx).map_keys(|k| keys.layer_key(0, &k)))
             .chain(
                 self.pre_fc_norm_hidden()
