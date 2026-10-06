@@ -1024,6 +1024,11 @@ async fn gpu_27b_chat_inference() {
         // 换域对照,缺省恒 = 原 42tok 长城门)
         let prompt = std::env::var("OWL_GATE_PROMPT")
             .unwrap_or_else(|_| "用五十字介绍长城。".to_string());
+        // E5 性能:长生成旋钮(AL/吞吐稳态剖析;默认 40 = 恒等门口径)
+        let max_new: usize = std::env::var("OWL_GATE_MAX_NEW")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(40);
 
         async fn gen(
             spec: bool,
@@ -1031,6 +1036,7 @@ async fn gpu_27b_chat_inference() {
             dir: &str,
             ddir: &str,
             prompt: &str,
+            max_new: usize,
         ) -> (String, Vec<u32>) {
             let prompt_len = prompt.chars().count(); // 近似(测试口径)
             std::env::set_var("OWL_SAMPLER", "greedy");
@@ -1040,7 +1046,9 @@ async fn gpu_27b_chat_inference() {
             std::env::set_var("OWL_PREFIX_CACHE", "0");
             std::env::set_var("OWL_DFLASH2_DIR", ddir);
             if spec {
-                std::env::set_var("OWL_SPEC_DEPTH", "7");
+                // E5 性能:深度可覆写(满收轮直方图 49% m=7 → 加深白拿)
+                let d = std::env::var("OWL_SPEC_DEPTH").unwrap_or_else(|_| "7".into());
+                std::env::set_var("OWL_SPEC_DEPTH", d);
                 std::env::set_var("OWL_CAPTURE_SLAB_MB", "160");
             } else {
                 std::env::remove_var("OWL_SPEC_DEPTH");
@@ -1048,7 +1056,7 @@ async fn gpu_27b_chat_inference() {
             }
             let mut engine = Engine::new(EngineConfig {
                 device_ordinal: ordinal,
-                max_seq_tokens: 192,
+                max_seq_tokens: 320.max(max_new + 64),
                 prefill_chunk: 32,
             })
             .expect("构造");
@@ -1058,7 +1066,7 @@ async fn gpu_27b_chat_inference() {
                 .await
                 .expect("装载");
             let mut running = engine.run(loaded).await.expect("装配");
-            let (sid, id) = running.submit_session(Some(7), prompt, 40).expect("submit");
+            let (sid, id) = running.submit_session(Some(7), prompt, max_new).expect("submit");
             let tg = std::time::Instant::now();
             let text = drive_turn(&mut running, id).await;
             let t_gen = tg.elapsed();
@@ -1088,7 +1096,7 @@ async fn gpu_27b_chat_inference() {
         }
 
         let t0 = std::time::Instant::now();
-        let (ta, ta_tokens) = gen(false, ordinal, &dir, &ddir, &prompt).await;
+        let (ta, ta_tokens) = gen(false, ordinal, &dir, &ddir, &prompt, max_new).await;
         let t_base = t0.elapsed();
         // E5-DF4:b1 事实 dump(prefill bisect 层 checksum / pf.last / emit)
         owl_shared::metrics::query_metrics(
@@ -1104,7 +1112,7 @@ async fn gpu_27b_chat_inference() {
         .collect();
         owl_shared::metrics::reset_metrics();
         let t1 = std::time::Instant::now();
-        let (tb, tb_tokens) = gen(true, ordinal, &dir, &ddir, &prompt).await;
+        let (tb, tb_tokens) = gen(true, ordinal, &dir, &ddir, &prompt, max_new).await;
         let t_spec = t1.elapsed();
         let l2: std::collections::HashMap<String, u64> = owl_shared::metrics::collect_metrics(
             &owl_shared::metrics::MetricsFilter::new().tag_prefix("loadv."),
@@ -1160,6 +1168,10 @@ async fn gpu_27b_chat_inference() {
         owl_shared::metrics::query_metrics(
             &owl_shared::metrics::MetricsFilter::new().tag_prefix("b2."),
         );
+        // E5 性能:spec 轮逐相汇总(长生成轮账;gap = round − Σparts)
+        owl_shared::metrics::query_metrics(
+            &owl_shared::metrics::MetricsFilter::new().tag_prefix("spec."),
+        );
         assert_eq!(ta, tb, "恒等门 DFlash2:greedy 真草稿 spec 文本 ≡ 无 spec");
         assert_eq!(ta_tokens, tb_tokens, "恒等门 DFlash2:token 账逐位一致");
         for v in [
@@ -1186,5 +1198,66 @@ async fn drive_turn<D: DeviceClient>(running: &mut RunningEngine<D>, id: u64) ->
             TurnEvent::Failed { turn, err } => panic!("t{turn} 失败: {err}"),
             _ => {}
         }
+    }
+}
+
+/// decode 边际速率差分基准(E5 性能会战终版口径,2026-10-08):
+/// 同配置双 boot(16 / 128 token 上限),**边际 ms/tok = Δwall/Δtokens**
+/// —— 固定成本(prefill 尾步/首步杂项/事件泵)与 EOS 点全部在差分中
+/// 消掉。旧 e2e 的 wall÷max_new 与 gate 生成段 wall÷实际tok 两把尺子
+/// 分别虚高/虚低(差分实测:4d21122 24.3ms vs HEAD 24.8ms = 无回退,
+/// 当年"45 tok/s"是朴素口径虚高)。门控 OWL_AWQ27B_DIR + OWL_TEST_DEVICE。
+#[tokio::test]
+async fn gpu_decode_marginal_bench() {
+    let Some(ordinal) = gpu_ordinal() else {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    };
+    let Ok(dir) = std::env::var("OWL_AWQ27B_DIR") else {
+        eprintln!("skip: OWL_AWQ27B_DIR 未设");
+        return;
+    };
+    // 口径与恒等门一致(greedy 单会话三旋钮)
+    std::env::set_var("OWL_SAMPLER", "greedy");
+    std::env::remove_var("OWL_REP_PENALTY");
+    std::env::set_var("OWL_GDN_SLOTS", "1");
+    std::env::set_var("OWL_SNAP_MAX", "1");
+    std::env::set_var("OWL_PREFIX_CACHE", "0");
+
+    async fn gen(ordinal: usize, dir: &str, max_new: usize) -> (f64, usize) {
+        let mut engine = Engine::new(EngineConfig {
+            device_ordinal: ordinal,
+            max_seq_tokens: 256,
+            prefill_chunk: 32,
+        })
+        .expect("构造");
+        let loaded = engine
+            .loader()
+            .load_qwen38_27b_awq(std::path::Path::new(dir), std::path::Path::new(dir))
+            .await
+            .expect("装载");
+        let mut running = engine.run(loaded).await.expect("装配");
+        let (sid, id) = running
+            .submit_session(Some(7), "用五十字介绍长城。", max_new)
+            .expect("submit");
+        let t0 = std::time::Instant::now();
+        let _text = drive_turn(&mut running, id).await;
+        let wall = t0.elapsed().as_secs_f64();
+        let n = running.sessions.get(7).map(|v| v.tokens.len()).unwrap_or(0);
+        drop(running);
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        (wall, n)
+    }
+
+    let (w1, n1) = gen(ordinal, &dir, 16).await;
+    let (w2, n2) = gen(ordinal, &dir, 128).await;
+    let dn = (n2 as i64 - n1 as i64).max(1) as f64;
+    let marginal = (w2 - w1) * 1e3 / dn;
+    eprintln!(
+        "[marginal] turn1 {w1:.3}s/{n1}tok; turn2 {w2:.3}s/{n2}tok; 边际 = {marginal:.2} ms/tok = {:.1} tok/s",
+        1e3 / marginal
+    );
+    for v in ["OWL_SAMPLER", "OWL_GDN_SLOTS", "OWL_SNAP_MAX", "OWL_PREFIX_CACHE"] {
+        std::env::remove_var(v);
     }
 }

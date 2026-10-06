@@ -731,3 +731,96 @@ BF16 化后首跑恒等门:恒等绿(42tok 逐位)但 **AL 仍 0.00**。三连�
   &[0,t])` 用**栈上临时**做 async H2D 源,捕获后 replay 读死栈地址
   → 垃圾 seq_off。对照臂存量雷(从未与图同用过),b1(eager prefill)
   不受影响;修复待办(要么 pinned 暂存,要么图外预传)。
+
+### 6.21 性能会战:verify 全分解 + b/a gemv 收口(2026-10-08 同日)
+
+- **分相仪表定谳**(OWL_STEP_PROFILE;verify 分相三件套 step/read/pure
+  打点):round = verify 30.2 + propose 8.3(含 pure_gpu 6.5)+ snap/
+  rollback 1.6 ≈ 40ms(m=0);spec-gen 52.8 tok/s(math,AL=1.80)。
+- **nsys 三连(坑)**:①默认 trace 不展开图节点(全程 11393 核全
+  Regular,1584 个 decode 内核"消失"= 图内不可见,险些误判"图回退
+  eager");②`--cuda-graph-trace=graph` = 聚合单记录(更不可见);
+  ③`=node` 才展开(70460 核 / 59067 图节点)。
+- **verify 轮 30.2ms 完全分解**(1436 核,图内零空隙 gap=0.02ms):
+  marlin ×320 = 16.93(56%)/ cublas lm_head 2.73(9%,地板)/
+  **cutlass wmma ×96 = 2.34(GDN b/a 小 GEMM n=48 不满 marlin 资格
+  掉 cublas 16×16 小 tile)**/ recurrence ×48 = 2.15 / paged attn
+  ×16 = 1.95 / 其余小核 ≈ 3.5。
+- **marlin 微基准**(marlin_bw_bench,真实形状 m=1/8 事件墙钟):
+  34816×5120 86% / down 82% / qkvz 81% / out_proj 70% 峰值带宽 ——
+  **marlin 本体近地板,16.93ms 无大水分**;MARLIN_NO_M8/NO_OVERRIDE
+  扫参无增益(override {128,64,128} 反而在帮忙)。GEMM 全家
+  (19.7ms)在 83-93% 峰值 = **verify 已贴近该权重足迹的硬件地板**。
+- **b/a gemv 收口(已落)**:forward_prefill_batch 的 in_proj_b/a
+  T≤16 走 owl_gemv_dual_f16(刀3a' decode 同款;权重 0.5MB×2 全在
+  L2,T≤16 读放大无痛)→ **verify pure 30.2 → 27.1ms(−10.3%)**;
+  回归 116+33 全绿。
+- **图 propose 质量判别**(OWL_DFLASH_EAGER A/B):AL 1.80 vs 1.80
+  完全一致,图版快 3.6 tok/s —— m 塌陷(m=7,6 后恒 0-1)是提示词
+  动力学(首轮确定性续写好接受,推理段高熵),非图 bug。
+- **剩余杠杆地图**(全部小而烦,无 2× 级):
+  ① verify ids 槽设备填充(copy_block 替 host write_block)→ 提议
+  读回退到 verify 后,省一次 sync 串行 ≈ 2.4ms/轮(6%);
+  ② snap/rollback 1.6ms 审计;③ argmax 8 发融 1 发 ≈ 0.3ms;
+  ④ lm_head int4 ≈ −2ms(质量风险,恒等门不设防但质量设防);
+  ⑤ 自适应 spec-skip(m=0 连击降级裸 decode)—— **草稿 KV 窗口
+  数据流未审计,跳过位留 MASK 洞是否随窗老化未定谳,独立立案**;
+  ⑥ 装载线 owl_ct_repack_u32 124ms/704 发(s3-load 式收编候选)。
+
+### 6.22 长生成 AL 剖析 + 速率模型定谳(2026-10-08 性能会战Ⅱ)
+
+- **decode 边际差分基准入库**(`gpu_decode_marginal_bench`):同配置双
+  boot(16/128 上限),边际 = Δwall/Δtokens —— 固定成本/EOS 点全消。
+  实测 21.6-24.8ms/tok ≈ 40-46 tok/s;**确认无历史回退**(4d21122
+  24.3 vs HEAD 24.8ms/tok;"当年 45"= 朴素口径 wall÷max_new 虚高)。
+  另:gate 加 OWL_GATE_MAX_NEW 旋钮 + max_seq_tokens 随 max_new 放宽。
+- **长生成 AL 剖析**(math 258 tok):裸 decode **40.2 tok/s**(边际
+  口径互证);spec **117.0 tok/s(2.91×)**,rounds=51,AL=4.10,
+  轮均 43.1ms。恒等门 258 tok 全程逐位一致 ✓。短生成的 AL=1.8 是
+  截断伪影(尾段高熵拉低),**真实负载画像 AL≈4**。
+- **速率模型定谳**:rate = (AL+1)/(V 27.1 + P 8.3 + O 1.6 + gap
+  ~6.5) ≈ (AL+1)/43.1ms。三域对照:math AL=4.1 → 117(2.91×);
+  prose AL=0.79 → 50.8(1.56×,EOS 33 tok 自然短)。
+- **"接受率 vs verify"定谳**:verify T=8 与 decode T=1 同为全权重
+  读取(27.1ms 已地板,T 无关)= **verify 不是额外成本**;每轮真
+  额外税 = propose+gap+开销 ≈ 15ms 固定。杠杆表(AL=4.1 基准):
+  +1.0 AL → +28 tok/s(草稿权重定,不可训练);V −5ms(极难)→
+  +17;**轮间固定税 15ms → 压缩是最大可动杠杆**(gap 6.5(emit/
+  scheduler 泵)+ propose 8.3(设备填充消 read 串行 −2.4 / draft
+  地板余量 ~1.5));⑤自适应降级(prose AL<1 域保底不输裸 decode)
+  仍待草稿 KV 窗口审计。
+- **上限推演**:AL=4.1 且固定税全免 → 5.1 tok/28.7ms = 178 tok/s
+  理论顶;现实分阶段:117 →(gap 压缩)→ 132 →(propose 减税)→
+  143 →(lm_head int4 等激进)→ ~150。低 AL 域(prose)天花板 =
+  裸 decode 本身。
+
+### 6.23 m 直方图 + 深度探针 + 下一步立项依据(2026-10-08 性能会战Ⅲ)
+
+- **轮账精确化**(长生成 51 轮,metrics 汇总):round 39.6ms 均值 =
+  verify 30.0(75.8%,含 read 同步与 ctx 增长,p50 29.3/max 33.5)+
+  propose 8.2 + snap 0.69 + fold 0.83(30/51 轮)+ emit 0.18 ≈ 100%;
+  轮间 schedule/pump ≈ 3.5ms(轮外)。**轮内无隐藏 fat,此前"gap
+  6.5ms"估计修正为 schedule 3.5ms**。
+- **m 直方图**(43 记录轮):**m=7 × 21 轮(49% 满收!)**、m=0 × 8、
+  m=1..6 × 14。双峰显著:满收轮 ~178 tok/s,m=0 轮 ~23 tok/s(输裸
+  decode)。均值 AL 4.10(4.86 over 记录轮)。
+- **深度探针**:SPEC_DEPTH=10 被 `spec_depth_raw.min(7)` 钳制
+  (engine.rs;DFlash2 检查点家族 block=8 = 1 锚 + 7 草稿,草稿 NC
+  窗口/卷积掩码 8 行原生,加深 = 草稿出分布)→ AL/吞吐与 depth=7
+  完全相同(51/209/4.10/117.0)。**朴素加深死路**。
+- **两立项**(按 ROI):
+  ① **多块链式起草**(block-chaining):满收轮 49% 说明确定性延伸段
+  草稿 7/7 全对 → 第二块(以第一块预测为锚再链 7 草稿)在这些段
+  大概率续对;verify T=15 权重成本不变,propose 第二块 ≈ +4-5ms。
+  AL 4.86 → ~7.4,速率 8.4 tok/49ms ≈ 171(+46%)。工程面:propose
+  图内 token 设备反馈(block1 drafts → block2 输入边)、kv_slots
+  [u32;9]→[16]、捕获 slab 扩容、fold 记录行数——真项目(1-2 天)。
+  ② **自适应降级 + 对齐轮修复**:m=0/低 AL 轮降级裸 decode(23→40
+  tok/s 底线保障);草稿 KV 洞可修 = **encode 全行幂等**性质 → 重入
+  spec 时用一次对齐轮(enc 窗口回扫洞区 [hole_start, +8))重物化
+  memory。前置 = DFlash2 数据流审计(encode memory 源 = verify hid
+  taps 的图内路由确认)。半 day 审计 + 半天施工。
+- **本日合计**:裸 decode 40.2(差分口径)、spec 117(2.91×)、
+  AL=4.10;逐相仪表 + marginal bench + gate 旋钮入库;剩余可动
+  (轮内)= schedule 3.5 + propose host 1.7 ≈ 3-5ms(+7%),大头
+  在上面两立项。

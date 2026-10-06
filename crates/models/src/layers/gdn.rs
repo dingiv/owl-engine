@@ -501,8 +501,28 @@ impl GatedDeltaNet {
 
         // T 批量投影(刀2:qkvz 列合并单投影;z 段 narrow)
         let qkvz = self.in_proj_qkvz.forward(xs, ctx); // [T, 2K+2V]
-        let b = self.in_proj_b.forward(xs, ctx); // [T, HV]
-        let a = self.in_proj_a.forward(xs, ctx); // [T, HV]
+        // 刀3a' 同款接 verify(2026-10-08 性能会战):T=8 verify 的 b/a
+        // 曾落 cublas wmma 16x16 小 tile(96 发 × 24.4µs = 2.34ms/轮,
+        // nsys 定谳);gemv_dual 权重 0.5MB×2 全在 L2,T≤16 的读放大
+        // 无痛。T>16 保持 cublas(真 GEMM 区)。
+        let (b, a) = if tokens <= 16 {
+            let hidden_gdn = xs.shape().last().cloned().unwrap_or(0);
+            let ba = TensorOps::call(ids::ELEMS_GEMV_DUAL)
+                .arg(&self.in_proj_b.weight_decl()) // [HV, hidden] f16
+                .arg(&self.in_proj_a.weight_decl()) // [HV, hidden] f16
+                .arg(xs)                            // [T, hidden]
+                .arg_i32(self.nv as i32)            // rows_b
+                .arg_i32(self.nv as i32)            // rows_a
+                .arg_i32(hidden_gdn as i32)         // cols
+                .aux(&[self.nv, self.nv, hidden_gdn, tokens])
+                .with_shape(xs.dtype, vec![tokens, 2 * self.nv]);
+            (
+                narrow_strided(&ba, tokens, 2 * self.nv, 0, self.nv, vec![tokens, self.nv]),
+                narrow_strided(&ba, tokens, 2 * self.nv, self.nv, self.nv, vec![tokens, self.nv]),
+            )
+        } else {
+            (self.in_proj_b.forward(xs, ctx), self.in_proj_a.forward(xs, ctx))
+        };
         let qkv_w = conv_dim + value_dim;
         let q = narrow_strided(&qkvz, tokens, qkv_w, 0, key_dim, vec![tokens, key_dim]);
         let k = narrow_strided(&qkvz, tokens, qkv_w, key_dim, key_dim, vec![tokens, key_dim]);

@@ -360,6 +360,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .map(|p| (bt_chain[p / page] * page as u32 + (p % page) as u32) as f32)
                 .collect();
             let lens_f: Vec<f32> = ((pos + 1)..=(pos + block.len())).map(|p| p as f32).collect();
+            let t_step_v = std::time::Instant::now();
             vg.step(&[
                 ("ids", ids_f.as_slice()),
                 ("pos", pos_f.as_slice()),
@@ -368,7 +369,21 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 ("gdn_slot", &[gdn_slot as f32]),
             ])
             .await?;
+            let t_read_v = std::time::Instant::now();
             let tok_f = vg.read_output_f32("tok").await?;
+            // E5 性能:verify 分相(step=上传+launch;read=同步+回读;
+            // pure=同步后裸 replay+read = 图独占 GPU 时间)
+            if self.probes.step_profile {
+                let t_v1 = std::time::Instant::now();
+                vg.replay().await?;
+                let _ = vg.read_output_f32("tok").await?;
+                eprintln!(
+                    "[verify-prof] step={:?} read={:?} pure={:?}",
+                    t_read_v - t_step_v,
+                    t_v1 - t_read_v,
+                    t_v1.elapsed()
+                );
+            }
             let ids: Vec<u32> = tok_f.iter().map(|&v| v as u32).collect();
             let hidden = vg.output_block("hid").expect("hid 输出槽");
             let n_rec = self.pool.gdn_count() * 8;

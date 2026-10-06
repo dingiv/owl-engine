@@ -477,7 +477,11 @@ impl GpuCtx {
         let any_owned = ids
             .iter()
             .any(|id| self.blocks.get(id).is_some_and(|(b, _)| matches!(b, Block::Owned(_))));
-        if any_owned && self.capture.is_none() {
+        // OWL_FREE_LEGACY=1:旁路事件钉序(崩坏案 A/B 判别;性能画像用)
+        if any_owned
+            && self.capture.is_none()
+            && std::env::var_os("OWL_FREE_LEGACY").is_none()
+        {
             if let (Ok(comp), Ok(h2d), Ok(d2h)) = (
                 self.stream(STREAM_COMPUTE),
                 self.stream(STREAM_H2D),
