@@ -67,6 +67,10 @@ pub(crate) struct StepProbes {
     /// 每轮 ×9 个动态 tag 无限增殖(metrics tag 爆炸 + 每轮 host 开销),
     /// 案结后默认关,2026-10-10 A1 复测踩中)
     pub fact_probe: bool,
+    /// B4:OWL_SPEC_DEGRADE_AFTER(m=0 连击降级阈值;0 = 禁用)
+    pub degrade_after: usize,
+    /// B4:OWL_SPEC_PROBE_EVERY(降级期探测周期 token 数,失败 ×2 退避)
+    pub probe_every: usize,
 }
 
 impl StepProbes {
@@ -78,6 +82,15 @@ impl StepProbes {
             debug: has("OWL_DEBUG"),
             prefill_cksum: has("OWL_PREFILL_CKSUM"),
             fact_probe: has("OWL_FACT_PROBE"),
+            degrade_after: std::env::var("OWL_SPEC_DEGRADE_AFTER")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(6),
+            probe_every: std::env::var("OWL_SPEC_PROBE_EVERY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(64)
+                .max(1),
         }
     }
 }
@@ -154,6 +167,14 @@ pub struct RunningEngine<D: DeviceClient> {
     pub(crate) spec_snap_valid: bool,
     /// 多 token 轮的事件队列(pump 逐个出;SpecRound 一轮 m+1 token)
     pub(crate) pending_events: std::collections::VecDeque<TurnEvent>,
+    /// B4 自适应降级:m=0 连击计数(成功轮归零)
+    pub(crate) spec_zero_streak: usize,
+    /// B4:降级态(true = 调度发裸 Decode;草稿池逐 token 同步)
+    pub(crate) spec_degraded: bool,
+    /// B4:降级以来 decode 步数(探测周期判定)
+    pub(crate) spec_steps_degraded: usize,
+    /// B4:当前探测周期(失败 ×2 退避,上限 512)
+    pub(crate) spec_probe_every: usize,
 }
 
 /// E5-M2b:spec 模式三态(C7 回退挂钩)。裁决在 boot:

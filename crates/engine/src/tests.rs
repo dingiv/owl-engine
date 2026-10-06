@@ -7,6 +7,7 @@
 
 use crate::engine::{Engine, EngineConfig};
 use crate::exec::decode_delta;
+use crate::exec::spec_degrade_transition;
 use crate::running::RunningEngine;
 use crate::scheduler::{SchedulerOutput, StepAction};
 use crate::turn::TurnEvent;
@@ -1260,4 +1261,29 @@ async fn gpu_decode_marginal_bench() {
     for v in ["OWL_SAMPLER", "OWL_GDN_SLOTS", "OWL_SNAP_MAX", "OWL_PREFIX_CACHE"] {
         std::env::remove_var(v);
     }
+}
+
+// B4 自适应降级态机(§6.24):纯转移函数逐分支
+#[test]
+fn spec_degrade_transition_branches() {
+    use crate::exec::spec_degrade_transition;
+use crate::running::RunningEngine;
+    // 成功轮:三账全复位(含降级态/退避)
+    let (s, d, p) = spec_degrade_transition(3, true, 256, 2, 6, 64);
+    assert_eq!((s, d, p), (0, false, 64));
+    // 非降级连击未达阈值:streak 累加,态不变
+    let (s, d, p) = spec_degrade_transition(0, false, 64, 0, 6, 64);
+    assert_eq!((s, d, p), (1, false, 64));
+    // 达阈值 → 入降级(探测周期 = 初值)
+    let (s, d, p) = spec_degrade_transition(5, false, 64, 0, 6, 64);
+    assert_eq!((s, d, p), (6, true, 64));
+    // 降级态探测失败 → 退避 ×2
+    let (s, d, p) = spec_degrade_transition(7, true, 64, 0, 6, 64);
+    assert_eq!((s, d, p), (8, true, 128));
+    // 退避封顶 512
+    let (s, d, p) = spec_degrade_transition(9, true, 400, 0, 6, 64);
+    assert_eq!((s, d, p), (10, true, 512));
+    // threshold=0 = 禁用(永不入降级)
+    let (s, d, p) = spec_degrade_transition(9, false, 64, 0, 0, 64);
+    assert_eq!((s, d, p), (10, false, 64));
 }

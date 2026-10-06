@@ -190,7 +190,19 @@ impl<D: DeviceClient> RunningEngine<D> {
             let act = self.active.as_ref().expect("活跃");
             (act.session_id, *act.out.last().expect("生成中"), act.fed)
         };
-        let spec = self.spec_depth;
+        // B4 自适应降级(§6.24):降级态发裸 Decode(草稿池逐 token 同步);
+        // 每 probe_every 步发一轮真 SpecRound 探测(m≥1 → 解除降级,
+        // 见 execute_spec_round 尾态机)。非降级 = 原调度,零变化
+        let spec = if self.spec_depth == 0 {
+            0
+        } else if !self.spec_degraded {
+            self.spec_depth
+        } else if self.spec_steps_degraded >= self.spec_probe_every {
+            self.spec_steps_degraded = 0;
+            self.spec_depth
+        } else {
+            0
+        };
         let (kv_slot, kv_slots, gdn_slot, grew) = {
             let s = self.sessions.get_mut(sid).expect("账在");
             let need = if spec > 0 { pos + spec + 1 } else { pos + 1 };

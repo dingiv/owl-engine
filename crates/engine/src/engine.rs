@@ -235,6 +235,11 @@ impl<D: DeviceClient + 'static> Engine<D> {
         let gdn_caches = pool.gdn_caches();
         let bt_leaf = pool.bt_leaf();
         let attn_v2 = pool.attn_v2_scratch();
+        // B4:decode 图 taps(DFlash2 降级期逐 token 草稿同步的取数面;
+        // OWL_DFLASH_NOTAPS 同款逃生开关)。tapped_hidden 零额外计算,
+        // 仅多 5 个 [1,hidden] 输出槽写;非 dflash 走原 forward(拓扑不变)
+        let decode_taps = matches!(spec_mode, crate::running::SpecMode::DFlash2)
+            && std::env::var_os("OWL_DFLASH_NOTAPS").is_none();
         let forward = move |sc: &PlanCtx| -> Result<()> {
             let ids = sc.input("frontier")?;
             let pos = sc.input("pos")?;
@@ -266,7 +271,17 @@ impl<D: DeviceClient + 'static> Engine<D> {
             ctx.env = env; // 捕获期烘焙(图闭包 env 定格;回放沿用)
             ctx.ts_buf = ts_buf; // 刀D 时间戳探针(None = 关)
             ctx.attn_v2 = attn_v2.clone(); // v2 分页 decode scratch(None = v1)
-            let tree = model.forward(&ids, &ctx);
+            // B4:降级期取数面 —— tapped_hidden 拿末层 hidden + 5 层 taps
+            // (零额外前向;l m_head 与 forward 同式)。非 dflash 原路(位等价)
+            let tree = if decode_taps {
+                let (hidden, taps) = model.tapped_hidden(&ids, &ctx, &[5, 19, 33, 47, 61]);
+                for (i, t) in taps.iter().enumerate() {
+                    sc.output(format!("tap{i}"), t)?;
+                }
+                model.embed.lm_head_matmul(&hidden)
+            } else {
+                model.forward(&ids, &ctx)
+            };
             // E3 设备采样:token = argmax(logits)(f32 数值过线,契约 5)
             let tok = owl_models::ops::argmax_f32idx(&tree, vocab, 0);
             sc.output("token", &tok);
@@ -289,10 +304,22 @@ impl<D: DeviceClient + 'static> Engine<D> {
                     }
                     v
                 },
-                outputs: vec![
-                    OutputSlot { name: "logits".into(), shape: vec![1, vocab], dtype: loaded.spec.dtype },
-                    OutputSlot { name: "token".into(), shape: vec![1], dtype: Dtype::F32 },
-                ],
+                outputs: {
+                    let mut o = vec![
+                        OutputSlot { name: "logits".into(), shape: vec![1, vocab], dtype: loaded.spec.dtype },
+                        OutputSlot { name: "token".into(), shape: vec![1], dtype: Dtype::F32 },
+                    ];
+                    if decode_taps {
+                        for i in 0..5 {
+                            o.push(OutputSlot {
+                                name: format!("tap{i}"),
+                                shape: vec![1, dims.hidden],
+                                dtype: dims.dtype,
+                            });
+                        }
+                    }
+                    o
+                },
                 // 逃生开关(C1 禁 graph 裁决配套):OWL_NO_GRAPH=1 → eager
                 // 直发(decode 逐步 eval,无捕获回放)—— 图内/图外行为
                 // A/B 的对照臂(2026-10-01 paged decode 质量案)
@@ -743,8 +770,11 @@ impl<D: DeviceClient + 'static> Engine<D> {
             }
         };
 
+        // B4:探针 boot 解析一次(E3 纪律);探测周期初值传入态机字段
+        let probes = crate::running::StepProbes::from_env();
+        let probe_every0 = probes.probe_every;
         Ok(RunningEngine {
-            probes: crate::running::StepProbes::from_env(),
+            probes,
             session,
             tok: loaded.tokenizer,
             cfg: self.cfg,
@@ -785,6 +815,10 @@ impl<D: DeviceClient + 'static> Engine<D> {
             spec_stats: crate::running::SpecStats::default(),
             spec_snap_valid: false,
             pending_events: std::collections::VecDeque::new(),
+            spec_zero_streak: 0,
+            spec_degraded: false,
+            spec_steps_degraded: 0,
+            spec_probe_every: probe_every0,
         })
     }
 }

@@ -824,3 +824,79 @@ BF16 化后首跑恒等门:恒等绿(42tok 逐位)但 **AL 仍 0.00**。三连�
   AL=4.10;逐相仪表 + marginal bench + gate 旋钮入库;剩余可动
   (轮内)= schedule 3.5 + propose host 1.7 ≈ 3-5ms(+7%),大头
   在上面两立项。
+
+### 6.24 A3 数据流审计:MASK 洞定谳 + B4 降级设计(2026-10-10)
+
+> A3 工单(roadmap P1):DFlash2 轮级数据流全文走查,产出数据流图 +
+> MASK 洞结论(可修/不可修)。exec.rs execute_spec_round/execute_decode/
+> dflash_encode/dflash_propose/dflash_graph_round + scheduler.rs 全文过。
+
+**轮级数据流(spec 轮,图态)**
+
+```
+轮首 pos=P(=上轮 fed),drafts[0..7](上轮⑦ host 账)
+① 快照 GDN state@P-1 → snap buf(仅失效时拍)
+② 草稿到位(spec_drafts_host)
+③ verify 图 replay:[anchor,d1..d7] @ P..P+8
+   → tok / hid / tap0..4(L5,19,33,47,61)/ r0..r383(fold 记录)
+④ greedy 接受:m = |{i<7 : drafts[i]==ids[i]}|;bonus = ids[m]
+⑥ m<7 → fold 图:快照 + 记录前缀 → GDN state@P+m(restore 回写)
+⑥' 提交 fed' = P+m+1;发射 m+1 token
+⑦ DFlash2 propose(产下轮草稿):
+   encode:verify taps → project_memory → 草稿 5 层 kv-only 写
+     图态 = 8 行全编 @ P..P+8 / eager = min(m+2,8) 行 @ P..
+   propose:噪声块 [bonus, MASK×7] @ fed'..fed'+7,读窗 [0, fed'+8)
+     = 前缀草稿 KV(全历史)+ 自块 8 行
+```
+
+**覆盖链与洞定谳**
+
+- 图态每轮 encode 写 `[P, P+8) ⊇ [P, fed'+7]`;读窗 `[0, fed'+8)` 中
+  `[fed', fed'+7]` 由本轮 encode 新鲜覆写 → **轮内读窗全鲜,无洞**。
+- eager 链式同样无缝(encode 写 `[P, P+m+2)`,下轮读窗 ⊆ 已写 ∪ 本轮)。
+- "encode 全 8 行幂等"(§6.19)的机制本质 = **下一轮全编覆盖上一轮
+  被拒行的草稿 KV**;多编行不是浪费而是自愈。
+- **洞的唯一来源 = 降级期**:裸 decode 不产 taps、不编码 →
+  毒化带 `[fed, pos+8)`(图态 8 行全编遗留的被拒草稿 KV)+
+  零带 `[pos+8, 重入点)`(从未写)。重入后毒化带在读窗 `[0, fp)` 内
+  **永久可见**(草稿出分布上下文 → AL 拖累,幅度未测;目标输出不受
+  影响——verify 兜底正确性,纯质量/速度税)。
+- 草稿 KV 跨 turn 不存续(每 turn prefill 全量重建)→ 降级语义只需
+  turn 内闭合。
+- 修复窗口三选一:
+  **(A) 降级期逐 token 同步**(decode 图加 taps,1 行 encode/token,
+  ~0.3-0.6ms ≈ 40 tok/s 预算的 2%)→ 毒化带 ≤8 token 即被覆写,
+  重入零损,探测自由 【采纳,B4 v1】
+  (B) 重入自愈:零成本,毒化带永久读,AL 拖累未知(候选 v2 对照)
+  (C) 窗口重定位:破坏位置/RoPE 语义,死路。
+
+**B4 施工设计(v1,本节同日落地)**
+
+- 态机(engine 字段):`spec_zero_streak` / `spec_degraded` /
+  `spec_steps_degraded` / `spec_probe_every`(退避 ×2,上限 512)。
+- 触发:streak ≥ `OWL_SPEC_DEGRADE_AFTER`(默认 6;0 = 禁用)。
+- 降级臂:scheduler `spec=0` → 既有 Decode 臂(裸 decode ~40 tok/s);
+  execute_decode 逐 token `prefill_dflash_encode`(1 行,taps 来自
+  decode 图新输出 tap0..4)同步草稿池。
+- 重入:降级每 `probe_every` token 发一轮真 SpecRound 探测;m≥1 →
+  解除降级(重置退避);m=0 → 退避翻倍。探测轮即普通 spec 轮
+  (恒等路径),毒化已被 (A) 清除 → 重入无损。
+- 恒等性:两臂皆恒等路径(decode 臂 = no-spec 同码;spec 轮原样),
+  降级/探测不触碰采样 → 恒等门保持。
+- 旋钮(StepProbes boot 解析,E3 纪律):`OWL_SPEC_DEGRADE_AFTER` /
+  `OWL_SPEC_PROBE_EVERY`。
+
+**B4 实测(同日;server 单 3090,27B AWQ+draft,池 4352/MAX_SEQ 2560)**
+
+| 域 | B4 前 | B4 后 | 判决 |
+|---|---:|---:|---|
+| std 随机词池(高熵) | 19.8 tok/s | **38.2(36.7-40.2)** | +93%,贴 40 底线 ✓ |
+| word-problem math | 27-28 tok/s | **37.0** | +33%(该域 spec 本净亏,降级 = 正确裁决)|
+| 恢复分支(DEGRADE_AFTER=1 强制)| — | 探测命中 m=3 → 恢复 spec | E2E ✓(草案同步有效,重入无损)|
+| 恒等门 | 绿 | 绿(55.8s)| ✓ |
+
+- 旋钮默认:DEGRADE_AFTER=6 / PROBE_EVERY=64(退避 ×2,封顶 512);
+  阈值 1 时健康域可见抖动(降→探测→恢复循环),吞吐仍 37.7 —— 默认阈值
+  下抖动被阻尼。
+- 教训:探测重入验证需"保证低熵段"的提示词;"随机词+重复"类提示会被
+  模型格式漂移搅局(输出本身失控),不能作为高 AL 段的可靠构造。

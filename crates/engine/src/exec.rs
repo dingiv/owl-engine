@@ -16,6 +16,31 @@ use owl_models::TensorOps;
 
 use crate::graph_plan::f32b;
 use crate::scheduler::BeginPlan;
+
+/// B4 降级态机转移(纯函数;§6.24)。返回 (streak, degraded, probe_every)。
+/// m≥1 = 成功轮:三账全复位;
+/// m=0:streak+1;非降级态达阈值 → 入降级(探测周期 = 初值);
+/// 降级态探测失败 → 周期 ×2 退避(上限 512)。
+pub(crate) fn spec_degrade_transition(
+    streak: usize,
+    degraded: bool,
+    probe_every: usize,
+    m: usize,
+    threshold: usize,
+    probe_floor: usize,
+) -> (usize, bool, usize) {
+    if m >= 1 {
+        return (0, false, probe_floor);
+    }
+    let streak = streak + 1;
+    if degraded {
+        (streak, true, (probe_every * 2).min(512))
+    } else if threshold > 0 && streak >= threshold {
+        (streak, true, probe_floor)
+    } else {
+        (streak, false, probe_every)
+    }
+}
 use crate::turn::TurnEvent;
 
 
@@ -274,6 +299,20 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             eprintln!("[step-prof] pos={pos} token-dtoh={:?}", t_dtoh.unwrap().elapsed());
         }
         mrec("decode.step", t_step.elapsed());
+        // B4 降级期草稿同步(§6.24 方案 A):decode 图 taps → 1 行 encode。
+        // 毒化带 ≤8 token 即被覆写,探测重入零损;成本 ≈ 0.5ms/tok(2%)
+        if self.spec_degraded && self.dflash_tap_count > 0 {
+            let dtype = self.pool.dims.dtype;
+            let hidden = self.pool.dims.hidden;
+            let taps: Vec<TensorOps> = (0..self.dflash_tap_count)
+                .filter_map(|i| self.session.output_block(&format!("tap{i}")))
+                .map(|b| TensorOps::of_block(b.id, dtype, vec![1, hidden]))
+                .collect();
+            if taps.len() == self.dflash_tap_count {
+                self.prefill_dflash_encode(&taps, pos).await?;
+            }
+            self.spec_steps_degraded += 1;
+        }
         self.sample_and_emit(nt).await
     }
 
@@ -405,6 +444,31 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // ④ greedy 接受:行 i argmax vs draft i;i < depth
         let m = (0..depth).take_while(|&i| drafts[i] == ids[i]).count();
         let bonus = ids[m];
+        // B4 自适应降级态机(§6.24;DFlash2 专属 —— 同步机制走 dflash encode)
+        if self.dflash_tap_count > 0 && self.probes.degrade_after > 0 {
+            let (streak, degraded, probe_every) = spec_degrade_transition(
+                self.spec_zero_streak,
+                self.spec_degraded,
+                self.spec_probe_every,
+                m,
+                self.probes.degrade_after,
+                self.probes.probe_every,
+            );
+            if degraded && !self.spec_degraded {
+                eprintln!(
+                    "[spec-degrade] m=0×{streak} → 降级裸 decode(probe 每 {probe_every} tok)"
+                );
+                mcnt("spec.degrade", 1);
+                // 降级前的下轮草稿作废(位置已过时;探测轮 ② 自产新草稿)
+                self.spec_drafts_host = None;
+            } else if !degraded && self.spec_degraded {
+                eprintln!("[spec-degrade] 探测命中 m={m} → 恢复 spec");
+                mcnt("spec.undegrad", 1);
+            }
+            self.spec_zero_streak = streak;
+            self.spec_degraded = degraded;
+            self.spec_probe_every = probe_every;
+        }
         // 对齐探针(E5-DF3 AL=0 排查):drafts vs 目标验证行逐位对照 ——
         // 附近命中(drafts[i]==ids[i±1]) = 位移对齐 bug;全散 = 分布质量
         if std::env::var_os("OWL_DFLASH_PROBE").is_some() {
