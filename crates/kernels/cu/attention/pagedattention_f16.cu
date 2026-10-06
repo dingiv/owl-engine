@@ -28,6 +28,11 @@
 //   block_tables [num_seqs, max_num_blocks_per_seq](f32 过线,物理块号)
 //   out/q        [num_seqs, num_heads, head_size]
 //
+// B6:fp8 e4m3 KV 臂需要 f16/fp8 设备类型(原 port ③ 为纯 uint16_t
+// 位型零头文件;fp8 臂恢复标准头,nvrtc include 路径由发射方给)
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+
 // grid / shared_mem 契约(发射方计算;禁哨兵自动 grid,见 K0 头注):
 //   v1     grid (num_heads, num_seqs, 1)
 //   v2     grid (num_heads, num_seqs, max_num_partitions),
@@ -942,7 +947,9 @@ inline __device__ float fast_tanh(float x) {
 // ---- kernel 体(f16 特化;vendor 逐字,见头注认领)----
 namespace vllm {
 template <int HEAD_SIZE, int BLOCK_SIZE, int NUM_THREADS,
-          int PARTITION_SIZE = 0>  // Zero means no partitioning.
+          int PARTITION_SIZE = 0,  // Zero means no partitioning.
+          bool KV_FP8 = false>     // B6:KV 存储为 e4m3(1B/elem,同逻辑布局;
+                                   // 读入即转 half,dot/累加全复用 f16 路径)
 __device__ void paged_attention_kernel_f16(
     float* __restrict__ exp_sums,  // [num_seqs, num_heads, max_num_partitions]
     float* __restrict__ max_logits,  // [num_seqs, num_heads,
@@ -1099,15 +1106,32 @@ __device__ void paged_attention_kernel_f16(
       K_vec k_vecs[NUM_VECS_PER_THREAD];
 
       for (int j = 0; j < NUM_VECS_PER_THREAD; j++) {
-        const uint16_t* k_ptr =
-            k_cache + physical_block_number * kv_block_stride +
-            kv_head_idx * kv_head_stride + physical_block_offset * x;
         const int vec_idx = thread_group_offset + j * THREAD_GROUP_SIZE;
         const int offset1 = (vec_idx * VEC_SIZE) / x;
         const int offset2 = (vec_idx * VEC_SIZE) % x;
-
+        if constexpr (KV_FP8) {
+          // B6:fp8 e4m3 读入(1B/elem,同逻辑布局;标量 u8 读,
+          // warp 内按 offset 相邻合曲);stride 均为元素序(f16 侧传
+          // 元素 stride,fp8 侧 host 传减半后的元素 stride)
+          const unsigned char* k_ptr8 =
+              reinterpret_cast<const unsigned char*>(k_cache) +
+              physical_block_number * kv_block_stride +
+              kv_head_idx * kv_head_stride + physical_block_offset * x;
+          __half kt[VEC_SIZE];
+#pragma unroll
+          for (int t = 0; t < VEC_SIZE; t++) {
+            __nv_fp8_e4m3 e;
+            e.__x = k_ptr8[offset1 * BLOCK_SIZE * x + offset2 + t];
+            kt[t] = __half(__nv_cvt_fp8_to_halfraw(e.__x, __NV_E4M3));
+          }
+          k_vecs[j] = *reinterpret_cast<const K_vec*>(kt);
+        } else {
+          const uint16_t* k_ptr =
+              k_cache + physical_block_number * kv_block_stride +
+              kv_head_idx * kv_head_stride + physical_block_offset * x;
           k_vecs[j] = *reinterpret_cast<const K_vec*>(
               k_ptr + offset1 * BLOCK_SIZE * x + offset2);
+        }
       }
 
       // Compute dot product.
@@ -1220,12 +1244,28 @@ __device__ void paged_attention_kernel_f16(
                                                            start_token_idx);                                                 
     const uint16_t* v_ptr = v_cache + physical_block_number * kv_block_stride +
                            kv_head_idx * kv_head_stride;
+    const unsigned char* v_ptr8 = reinterpret_cast<const unsigned char*>(v_cache) +
+                            physical_block_number * kv_block_stride +
+                            kv_head_idx * kv_head_stride;
     for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
       const int row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
       if (row_idx < HEAD_SIZE) {
         const int offset = row_idx * BLOCK_SIZE + physical_block_offset;
         V_vec v_vec;
+        if constexpr (KV_FP8) {
+          // B6:fp8 e4m3 读入(标量 u8;V 布局 [hd, block] 行连续,
+          // warp 内 lane 相邻 = token 相邻 = 字节相邻,合曲)
+          __half vt[V_VEC_SIZE];
+#pragma unroll
+          for (int j = 0; j < V_VEC_SIZE; j++) {
+            __nv_fp8_e4m3 e;
+            e.__x = v_ptr8[offset + j];
+            vt[j] = __half(__nv_cvt_fp8_to_halfraw(e.__x, __NV_E4M3));
+          }
+          v_vec = *reinterpret_cast<const V_vec*>(vt);
+        } else {
           v_vec = *reinterpret_cast<const V_vec*>(v_ptr + offset);
+        }
         if (block_idx == num_seq_blocks - 1) {
           // NOTE(woosuk): When v_vec contains the tokens that are out of the
           // context, we should explicitly zero out the values since they may
@@ -1677,6 +1717,115 @@ extern "C" __global__ void vllm_paged_attention_v2_f16_hd256bs32(
     const int use_alibi,
     uint16_t* __restrict__ tmp_out) {
   vllm::paged_attention_v2_kernel_f16<256, 32, 128, 512>(
+      exp_sums, max_logits, tmp_out, q, k_cache, v_cache, num_kv_heads, scale,
+      block_tables, context_lens, max_num_blocks_per_seq, alibi_slopes, use_alibi,
+      q_stride, kv_block_stride, kv_head_stride, softscapping, sliding_window);
+}
+
+// ---- B6:fp8 e4m3 KV 读变体(v2;4 形状)----
+extern "C" __global__ void vllm_paged_attention_v2_fp8_hd128(
+    const uint16_t* __restrict__ q,
+    const uint16_t* __restrict__ k_cache,
+    const uint16_t* __restrict__ v_cache,
+    const float* __restrict__ block_tables,
+    const float* __restrict__ context_lens,
+    const float* __restrict__ alibi_slopes,
+    float* __restrict__ exp_sums,
+    float* __restrict__ max_logits,
+    const int num_kv_heads,
+    const float scale,
+    const int max_num_blocks_per_seq,
+    const int q_stride,
+    const int kv_block_stride,
+    const int kv_head_stride,
+    const float softscapping,
+    const int sliding_window,
+    const int use_alibi,
+    uint16_t* __restrict__ tmp_out) {
+  // B6:fp8 e4m3 KV 读变体(存储 1B/elem 同逻辑布局;读入即转 half;
+  // stride 语义不变,host 传元素序 stride)
+  vllm::paged_attention_kernel_f16<128, 16, 128, 512, true>(
+      exp_sums, max_logits, tmp_out, q, k_cache, v_cache, num_kv_heads, scale,
+      block_tables, context_lens, max_num_blocks_per_seq, alibi_slopes, use_alibi,
+      q_stride, kv_block_stride, kv_head_stride, softscapping, sliding_window);
+}
+
+extern "C" __global__ void vllm_paged_attention_v2_fp8_hd128bs32(
+    const uint16_t* __restrict__ q,
+    const uint16_t* __restrict__ k_cache,
+    const uint16_t* __restrict__ v_cache,
+    const float* __restrict__ block_tables,
+    const float* __restrict__ context_lens,
+    const float* __restrict__ alibi_slopes,
+    float* __restrict__ exp_sums,
+    float* __restrict__ max_logits,
+    const int num_kv_heads,
+    const float scale,
+    const int max_num_blocks_per_seq,
+    const int q_stride,
+    const int kv_block_stride,
+    const int kv_head_stride,
+    const float softscapping,
+    const int sliding_window,
+    const int use_alibi,
+    uint16_t* __restrict__ tmp_out) {
+  // B6:fp8 e4m3 KV 读变体(存储 1B/elem 同逻辑布局;读入即转 half;
+  // stride 语义不变,host 传元素序 stride)
+  vllm::paged_attention_kernel_f16<128, 32, 128, 512, true>(
+      exp_sums, max_logits, tmp_out, q, k_cache, v_cache, num_kv_heads, scale,
+      block_tables, context_lens, max_num_blocks_per_seq, alibi_slopes, use_alibi,
+      q_stride, kv_block_stride, kv_head_stride, softscapping, sliding_window);
+}
+
+extern "C" __global__ void vllm_paged_attention_v2_fp8_hd256(
+    const uint16_t* __restrict__ q,
+    const uint16_t* __restrict__ k_cache,
+    const uint16_t* __restrict__ v_cache,
+    const float* __restrict__ block_tables,
+    const float* __restrict__ context_lens,
+    const float* __restrict__ alibi_slopes,
+    float* __restrict__ exp_sums,
+    float* __restrict__ max_logits,
+    const int num_kv_heads,
+    const float scale,
+    const int max_num_blocks_per_seq,
+    const int q_stride,
+    const int kv_block_stride,
+    const int kv_head_stride,
+    const float softscapping,
+    const int sliding_window,
+    const int use_alibi,
+    uint16_t* __restrict__ tmp_out) {
+  // B6:fp8 e4m3 KV 读变体(存储 1B/elem 同逻辑布局;读入即转 half;
+  // stride 语义不变,host 传元素序 stride)
+  vllm::paged_attention_kernel_f16<256, 16, 128, 512, true>(
+      exp_sums, max_logits, tmp_out, q, k_cache, v_cache, num_kv_heads, scale,
+      block_tables, context_lens, max_num_blocks_per_seq, alibi_slopes, use_alibi,
+      q_stride, kv_block_stride, kv_head_stride, softscapping, sliding_window);
+}
+
+extern "C" __global__ void vllm_paged_attention_v2_fp8_hd256bs32(
+    const uint16_t* __restrict__ q,
+    const uint16_t* __restrict__ k_cache,
+    const uint16_t* __restrict__ v_cache,
+    const float* __restrict__ block_tables,
+    const float* __restrict__ context_lens,
+    const float* __restrict__ alibi_slopes,
+    float* __restrict__ exp_sums,
+    float* __restrict__ max_logits,
+    const int num_kv_heads,
+    const float scale,
+    const int max_num_blocks_per_seq,
+    const int q_stride,
+    const int kv_block_stride,
+    const int kv_head_stride,
+    const float softscapping,
+    const int sliding_window,
+    const int use_alibi,
+    uint16_t* __restrict__ tmp_out) {
+  // B6:fp8 e4m3 KV 读变体(存储 1B/elem 同逻辑布局;读入即转 half;
+  // stride 语义不变,host 传元素序 stride)
+  vllm::paged_attention_kernel_f16<256, 32, 128, 512, true>(
       exp_sums, max_logits, tmp_out, q, k_cache, v_cache, num_kv_heads, scale,
       block_tables, context_lens, max_num_blocks_per_seq, alibi_slopes, use_alibi,
       q_stride, kv_block_stride, kv_head_stride, softscapping, sliding_window);
