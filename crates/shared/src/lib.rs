@@ -11,4 +11,5 @@ pub use owl_iface::signal;
 
 pub mod metrics;
 pub mod slab_hint;
+pub mod vram;
 pub mod testkit;

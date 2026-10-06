@@ -142,6 +142,54 @@ impl StatePool {
         let t = std::time::Instant::now();
         let n_full = layer_types.iter().filter(|&&f| f).count();
         let n_gdn = layer_types.len() - n_full;
+        eprintln!("[boot] StatePool::alloc 进入(n_full={n_full} kv_fp8={})", std::env::var_os("OWL_KV_FP8").is_some());
+
+        // B6.5 显存硬预算治理(2026-10-10):池容量 =
+        // min(手工上限, (target×total − live − reserve)/每 token 字节)。
+        // target 默认 0.97;reserve 默认 1024MB(盖 CUDA ctx ~430MB + 逐 turn 瞬态 +
+        // async 池惰性保留;实测 300MB 在连续 turn 下瞬态 OOM)
+        // + 捕获瞬态 + 非追踪惰性保留。OWL_VRAM_TARGET/OWL_VRAM_RESERVE_MB
+        // 可调;TOTAL 未落账(=0)或 OWL_VRAM_TARGET=0 → 治理禁用。
+        let per_tok_bytes = (n_full * 2 * dims.hkv * dims.hd) * if kv_fp8 { 1 } else { 2 }
+            + if dflash { 5 * 2 * 8 * 128 * 2 } else { 0 }; // 草稿池按 token 线性(页取整后略同)
+        // 治理器之后的固定分配(GDN 格/快照 f32 同式;图 slab + ctx + 杂项 flat)
+        let gdn_slot_elems = dims.nk * dims.hk * 3 + dims.nv * dims.hv * 3 + dims.nv * dims.hk * dims.hv;
+        let fixed_after = n_gdn * gdn_slots() * gdn_slot_elems * 4
+            + snap_max() * n_gdn * gdn_slot_elems * 4
+            + (400 << 20); // 图 slab + CUDA ctx + warmup 瞬态 + 杂项
+        let vram_target = std::env::var("OWL_VRAM_TARGET")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.97);
+        let vram_reserve = (std::env::var("OWL_VRAM_RESERVE_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1024))
+            << 20;
+        let vram_total = owl_shared::vram::total_bytes();
+        let pool_cap = if vram_target > 0.0 && vram_target < 1.0 && vram_total > 0 {
+            let budget = (vram_total as f64 * vram_target) as i64
+                - vram_reserve as i64
+                - fixed_after as i64
+                - owl_shared::vram::live_bytes() as i64;
+            let cap = (budget.max(0) as u64 / per_tok_bytes.max(1) as u64) as usize;
+            eprintln!(
+                "[boot] vram 治理:total={:.1}G live={:.1}G target={:.0}% reserve={}MB → 池上限 {} tok(manual={})",
+                vram_total as f64 / 1073741824.0,
+                owl_shared::vram::live_bytes() as f64 / 1073741824.0,
+                vram_target * 100.0,
+                vram_reserve >> 20,
+                cap,
+                pool_tokens
+            );
+            Some(cap)
+        } else {
+            None
+        };
+        let pool_tokens = match pool_cap {
+            Some(cap) => pool_tokens.min(cap),
+            None => pool_tokens,
+        };
 
         let pol = kv_paged_policy(dims.dtype);
         let (page, x, nb, paged) = match &pol {

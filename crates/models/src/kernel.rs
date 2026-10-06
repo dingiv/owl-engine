@@ -160,6 +160,9 @@ pub static REGISTRY: &[Entry] = &[
     // prefill 主条目 = bs32(vendor 契约 BLOCK∈{32,64};bs16 越契约已废)
     Entry { name: "vllm_chunked_prefill_paged_attn_opt_f16_hd128", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "vllm_chunked_prefill_paged_attn_opt_f16_hd256", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    // ---- B6.3:fp8 e4m3 KV 读变体(chunked prefill;签名同 f16)----
+    Entry { name: "vllm_chunked_prefill_paged_attn_opt_fp8_hd128", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "vllm_chunked_prefill_paged_attn_opt_fp8_hd256", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     // ---- paged attention decode(K1/K2;vendor pagedattention.cuh + v1/v2.cu;
     //      grid 契约显式:v1 (H, seq, 1) / v2 (H, seq, ceil(max_ctx/512)) /
     //      reduce (H, seq, 1);block (128,1,1);shared 契约见 .cu 头注)----
@@ -169,12 +172,20 @@ pub static REGISTRY: &[Entry] = &[
     Entry { name: "vllm_paged_attention_v1_f16_hd256bs32", source: sources::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "vllm_paged_attention_v2_f16_hd128bs32", source: sources::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "vllm_paged_attention_v2_f16_hd256bs32", source: sources::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    // ---- B6:fp8 e4m3 KV 读变体(v2;签名同 f16,KV 存储侧 1B/elem)----
+    Entry { name: "vllm_paged_attention_v2_fp8_hd128", source: sources::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "vllm_paged_attention_v2_fp8_hd256", source: sources::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "vllm_paged_attention_v2_fp8_hd128bs32", source: sources::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "vllm_paged_attention_v2_fp8_hd256bs32", source: sources::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "vllm_paged_attention_v2_reduce_f16_hd128", source: sources::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,i32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "vllm_paged_attention_v2_reduce_f16_hd256", source: sources::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,i32,T", dtype: crate::contract::Dtype::F16 },
     // ---- chunked prefill paged attention(在线 softmax + 滑窗;grid 契约:
     //      (Hq/Hkv, Hkv, ceil(tokens/256));block (256,1,1) = TOKEN_CHUNK)----
     Entry { name: "vllm_chunked_prefill_paged_attn_opt_f16_hd128", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "vllm_chunked_prefill_paged_attn_opt_f16_hd256", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    // ---- B6.3:fp8 e4m3 KV 读变体(chunked prefill;签名同 f16)----
+    Entry { name: "vllm_chunked_prefill_paged_attn_opt_fp8_hd128", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "vllm_chunked_prefill_paged_attn_opt_fp8_hd256", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     // ---- prefill split attention(flash-decoding;2026-10-02 长 ctx 主案)----
     // K1 = context 分块在线 softmax(未归一化 partial + (m,l) 入 scratch);
     // K2 = partition 归一化合并。smem 64KB(>48KB 走发射器 opt-in 通道)

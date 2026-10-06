@@ -571,6 +571,8 @@ impl GpuServer {
                 // warmup 计量(slab 定量:owl_shared::slab_hint;仅真分配,
                 // carve 分支不计 —— 捕获窗用 slab 不产生新账)
                 owl_shared::slab_hint::meter_add(n_bytes as u64);
+                // B6.5:live 分配音账(释放侧 = free_blocks)
+                owl_shared::vram::live_add(n_bytes as i64);
                 if zero {
                     stream
                         .memset_zeros(&mut slice)

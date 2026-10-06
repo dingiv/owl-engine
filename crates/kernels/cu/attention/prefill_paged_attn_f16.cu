@@ -1138,8 +1138,10 @@ __global__ void chunked_prefill_paged_attention_opt_f16(
                         int gx = d % X;
                         long long k_idx = k_base + b * X + gy * (BLOCK_SIZE * X) + gx;
                         if constexpr (KV_FP8) {
-                            // B6.3:fp8 e4m3 读入转 half(元素序同布局)
-                            const unsigned char* k8 = reinterpret_cast<const unsigned char*>(&k_cache[k_idx]);
+                            // B6.3:fp8 e4m3 读入转 half(元素序 = 字节序;
+                            // 基址转 u8* 后按元素偏移 —— 勿用 &cache[idx]
+                            // u16 编址,那是 2× 字节偏移 = 越界读)
+                            const unsigned char* k8 = reinterpret_cast<const unsigned char*>(k_cache) + k_idx;
                             __half kt[VEC_SIZE];
                             #pragma unroll
                             for (int t = 0; t < VEC_SIZE; t++) {
@@ -1183,7 +1185,7 @@ __global__ void chunked_prefill_paged_attention_opt_f16(
             L += acc_lane;
 
             for (int k = 0; k < HEAD_SIZE; ++k) {
-                const unsigned char* v_row8 = reinterpret_cast<const unsigned char*>(&v_cache[v_base + (long long)k * BLOCK_SIZE]);
+                const unsigned char* v_row8 = reinterpret_cast<const unsigned char*>(v_cache) + v_base + (long long)k * BLOCK_SIZE;
                 const uint16_t* v_row = &v_cache[v_base + (long long)k * BLOCK_SIZE];
                 for (int bv = 0; bv < NUM_BLOCK_VECS; bv++) {
                     Float_vec v_val;
@@ -1411,31 +1413,33 @@ extern "C" __global__ void vllm_chunked_prefill_paged_attn_opt_f16_hd256(
       kv_block_stride, kv_head_stride);
 }
 
-// ---- B6.3:fp8 e4m3 KV 读变体(chunked prefill;hd128/256)----
-extern "C" __global__ void vllm_chunked_prefill_paged_attn_opt_fp8_hd128(
-    uint16_t* __restrict__ out,
-    const uint16_t* __restrict__ q,
-    const uint16_t* __restrict__ k_cache,
-    const uint16_t* __restrict__ v_cache,
-    int32_t num_kv_heads,
-    float sm_scale,
-    const float* __restrict__ block_tables,
-    const float* __restrict__ seq_lens,
-    int32_t block_table_stride,
-    int32_t num_seqs,
-    int32_t num_query_heads,
-    int32_t num_query_tokens,
-    float softscapping,
-    int32_t o_stride_tokens,
-    const float* __restrict__ query_start_len,
-    const float* __restrict__ alibi_slopes,
-    const float* __restrict__ sinks,
-    const int use_alibi_flag, const int use_sinks_flag,
-    int32_t sliding_window,
-    int32_t total_num_blocks,
-    int32_t kv_block_stride,
-    int32_t kv_head_stride) {
-  chunked_prefill_paged_attention_opt_f16<128, 32, 256, true>(
+// ---- B6.3:fp8 e4m3 KV 读变体(签名逐字同 f16;模板尾参 true)----
+
+extern "C" __global__ void vllm_chunked_prefill_paged_attn_opt_fp8_hd256(
+    const uint16_t* __restrict__ q,              // [num_query_tokens, Hq, hd]
+    const uint16_t* __restrict__ k_cache,        // [num_blocks, Hkv, hd/8, 32, 8]
+    const uint16_t* __restrict__ v_cache,        // [num_blocks, Hkv, hd, 32]
+    const float* __restrict__ block_tables,      // [num_seqs, block_table_stride]
+    const float* __restrict__ seq_lens,          // [num_seqs]
+    const float* __restrict__ query_start_len,   // [num_seqs+1]
+    const float* __restrict__ alibi_slopes,      // use_alibi_flag=0 不解引用
+    const float* __restrict__ sinks,             // use_sinks_flag=0 不解引用
+    const int num_kv_heads,
+    const float sm_scale,
+    const int block_table_stride,
+    const int num_seqs,
+    const int num_query_heads,
+    const int num_query_tokens,
+    const float softscapping,
+    const int o_stride_tokens,
+    const int sliding_window,
+    const int total_num_blocks,
+    const int kv_block_stride,
+    const int kv_head_stride,
+    const int use_alibi_flag,
+    const int use_sinks_flag,
+    uint16_t* __restrict__ out) {                // OUT(末参,契约 4)
+  chunked_prefill_paged_attention_opt_f16<256, 32, 256, true>(
       out, q, k_cache, v_cache, num_kv_heads, sm_scale, block_tables, seq_lens,
       block_table_stride, num_seqs, num_query_heads, num_query_tokens,
       softscapping, o_stride_tokens, query_start_len, alibi_slopes, sinks,
@@ -1443,30 +1447,31 @@ extern "C" __global__ void vllm_chunked_prefill_paged_attn_opt_fp8_hd128(
       kv_block_stride, kv_head_stride);
 }
 
-extern "C" __global__ void vllm_chunked_prefill_paged_attn_opt_fp8_hd256(
-    uint16_t* __restrict__ out,
-    const uint16_t* __restrict__ q,
-    const uint16_t* __restrict__ k_cache,
-    const uint16_t* __restrict__ v_cache,
-    int32_t num_kv_heads,
-    float sm_scale,
-    const float* __restrict__ block_tables,
-    const float* __restrict__ seq_lens,
-    int32_t block_table_stride,
-    int32_t num_seqs,
-    int32_t num_query_heads,
-    int32_t num_query_tokens,
-    float softscapping,
-    int32_t o_stride_tokens,
-    const float* __restrict__ query_start_len,
-    const float* __restrict__ alibi_slopes,
-    const float* __restrict__ sinks,
-    const int use_alibi_flag, const int use_sinks_flag,
-    int32_t sliding_window,
-    int32_t total_num_blocks,
-    int32_t kv_block_stride,
-    int32_t kv_head_stride) {
-  chunked_prefill_paged_attention_opt_f16<256, 32, 256, true>(
+extern "C" __global__ void vllm_chunked_prefill_paged_attn_opt_fp8_hd128(
+    const uint16_t* __restrict__ q,              // [num_query_tokens, Hq, hd]
+    const uint16_t* __restrict__ k_cache,        // [num_blocks, Hkv, hd/8, 32, 8]
+    const uint16_t* __restrict__ v_cache,        // [num_blocks, Hkv, hd, 32]
+    const float* __restrict__ block_tables,      // [num_seqs, block_table_stride]
+    const float* __restrict__ seq_lens,          // [num_seqs]
+    const float* __restrict__ query_start_len,   // [num_seqs+1]
+    const float* __restrict__ alibi_slopes,      // use_alibi_flag=0 不解引用
+    const float* __restrict__ sinks,             // use_sinks_flag=0 不解引用
+    const int num_kv_heads,
+    const float sm_scale,
+    const int block_table_stride,
+    const int num_seqs,
+    const int num_query_heads,
+    const int num_query_tokens,
+    const float softscapping,
+    const int o_stride_tokens,
+    const int sliding_window,
+    const int total_num_blocks,
+    const int kv_block_stride,
+    const int kv_head_stride,
+    const int use_alibi_flag,
+    const int use_sinks_flag,
+    uint16_t* __restrict__ out) {                // OUT(末参,契约 4)
+  chunked_prefill_paged_attention_opt_f16<128, 32, 256, true>(
       out, q, k_cache, v_cache, num_kv_heads, sm_scale, block_tables, seq_lens,
       block_table_stride, num_seqs, num_query_heads, num_query_tokens,
       softscapping, o_stride_tokens, query_start_len, alibi_slopes, sinks,

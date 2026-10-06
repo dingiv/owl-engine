@@ -139,6 +139,13 @@ impl GpuCtx {
         let ordinal = selector.resolve()?;
         let ctx = CudaContext::new(ordinal).map_err(|e| format!("{e:?}"))?;
         ctx.bind_to_thread().map_err(|e| format!("{e:?}"))?;
+        // B6.5:设备总显存落账(vram 治理面;一次)
+        match unsafe { cudarc::driver::result::device::get(ordinal as i32) }
+            .and_then(|dev| unsafe { cudarc::driver::result::device::total_mem(dev) })
+        {
+            Ok(bytes) => owl_shared::vram::total_set(bytes as u64),
+            Err(e) => eprintln!("[boot] vram total 查询失败(治理禁用): {e:?}"),
+        }
         // G0 护栏:关 event-tracking(坑 A)。多流 + event tracking 会让
         // safe 层在块读写上插事件,污染图捕获(CAPTURE_ISOLATION/图内事件节点)
         unsafe { ctx.disable_event_tracking() };
@@ -220,6 +227,7 @@ impl GpuCtx {
         };
         let slab = unsafe { stream.alloc::<u8>(slab_cap) }
             .map_err(|e| ModelError::Msg(format!("graph_begin: 捕获 slab 分配失败({}MiB) {e:?}", slab_cap >> 20)))?;
+        owl_shared::vram::live_add(slab_cap as i64); // B6.5(直配不走 handle_alloc)
         let slab = Arc::new(slab);
         stream
             .begin_capture(CAPTURE_MODE_THREAD_LOCAL)
@@ -511,15 +519,23 @@ impl GpuCtx {
             }
         }
         let mut n = 0;
+        let mut freed_bytes: i64 = 0;
         for id in ids {
             let owned = self
                 .blocks
                 .get(id)
                 .is_some_and(|(b, _)| matches!(b, Block::Owned(_)));
-            if owned && self.blocks.remove(id).is_some() {
-                n += 1; // drop 链 = free_async(块自身流;已按上律钉序)
+            if owned {
+                if let Some((b, _)) = self.blocks.remove(id) {
+                    if let Block::Owned(slice) = &b {
+                        freed_bytes += slice.len() as i64; // B6.5 live 记账
+                    }
+                    drop(b); // free_async(块自身流;已按上律钉序)
+                    n += 1;
+                }
             }
         }
+        owl_shared::vram::live_add(-freed_bytes);
         n
     }
 }
