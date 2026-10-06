@@ -63,6 +63,19 @@ fn build_marlin() {
     // ------------------------------------------------------------------
     if std::env::var_os("CARGO_FEATURE_MARLIN").is_some() {
         println!("cargo:rerun-if-changed=cu/marlin/prebuilt/libmarlin.a");
+        // .h 追踪(E5-DF3 同日十二:selector 改动不触发重编 → host .o 落后
+        // 一代 → 新旧分支混链 undefined)
+        for h in [
+            "cu/marlin/vllm_marlin/kernel.h",
+            "cu/marlin/vllm_marlin/kernel_selector.h",
+            "cu/marlin/vllm_marlin/kernel_selector_full.upstream.h",
+            "cu/marlin/vllm_marlin/marlin_template.h",
+            "cu/marlin/vllm_marlin/marlin_dtypes.cuh",
+            "cu/marlin/vllm_marlin/marlin_mma.h",
+            "cu/marlin/vllm_marlin/dequant.h",
+        ] {
+            println!("cargo:rerun-if-changed={}", h);
+        }
         println!("cargo:rerun-if-env-changed=MARLIN_FORCE_BUILD");
         println!("cargo:rerun-if-env-changed=MARLIN_CUDA_ARCH");
         println!("cargo:rerun-if-env-changed=MARLIN_NVCC");
@@ -82,6 +95,7 @@ fn build_marlin() {
                 base.join("marlin_host.cu"),
                 base.join("vllm_marlin/sm80_kernel_float16_u4_float16.cu"),   // AWQ 非对称(kU4)
                 base.join("vllm_marlin/sm80_kernel_float16_u4b8_float16.cu"), // GPTQ 对称(kU4B8)
+                base.join("vllm_marlin/sm80_kernel_bfloat16_u4b8_bfloat16.cu"), // BF16 激活变体(E5-DF3 草稿 BF16 化)
             ];
             let includes = [base.join("vllm_marlin"), base.join("vllm_marlin/shim")];
             let mut objs = Vec::new();

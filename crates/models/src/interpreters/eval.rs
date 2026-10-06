@@ -393,12 +393,13 @@ where
             let k = t.parents[0].shape.last().copied().unwrap_or(0);
             let out = ctx.face.alloc_uninit(dtype, m * n).await?;
             ctx.track_new(out.id);
-            if dtype == Dtype::F16 {
-                // f16 基线:foreign-kernel 通道(cuBLAS;nt = owl Linear 惯例)。
+            if dtype == Dtype::F16 || dtype == Dtype::BF16 {
+                // f16/bf16:foreign-kernel 通道(cuBLAS;nt = owl Linear 惯例)。
                 // gemm 侧 cm 约定:m = n_out(权重行)/ n = T(2026-09-26 修正:
                 // 原误传 (m=T, n=n_out),T=1 即 B 操作数越界读 → ILLEGAL_ADDRESS)
+                // bf16 臂(E5-DF3 同日十四;DFlash2 草稿非量化投影)
                 let nt = matches!(t.op, Op::MatmulNt);
-                let msg = crate::ops::lower_gemm(&ins, &out, n, k, m, nt);
+                let msg = crate::ops::lower_gemm(&ins, &out, n, k, m, nt, dtype == Dtype::BF16);
                 ctx.face.launch(msg).await?;
             } else {
                 let msg = if matches!(t.op, Op::MatmulNt) {

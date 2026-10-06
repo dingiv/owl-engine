@@ -166,6 +166,13 @@ impl SafeTensorsSource {
     }
 }
 
+impl SafeTensorsSource {
+    /// 索引键存在性(源族探测用;E5-DF3.5)
+    pub fn has_key(&self, key: &str) -> bool {
+        self.index.lock().unwrap().contains_key(key)
+    }
+}
+
 impl WeightSource for SafeTensorsSource {
     fn elem_len(&self, key: &str) -> Option<usize> {
         if let Some((_, n1, _, n2)) = self.merged_parts(key) {
@@ -285,6 +292,22 @@ impl WeightSource for SafeTensorsSource {
                     return None;
                 }
                 bf16_bytes_to_f16_bytes(bytes, &mut dst[..len * 2]);
+            }
+            // BF16 源 → BF16 目标：直拷零转换(E5-DF3 同日十四;DFlash2 草稿
+            // BF16 全程 —— passthrough 权重原生直载,sglang 同位)
+            (safetensors::Dtype::BF16, crate::contract::Dtype::BF16) => {
+                if dst.len() < len * 2 {
+                    return None;
+                }
+                dst[..len * 2].copy_from_slice(bytes);
+            }
+            // F16 源 → BF16 目标:值转换(E5-DF3 同日十四安全网;主路径 =
+            // BF16 原生源直拷)
+            (safetensors::Dtype::F16, crate::contract::Dtype::BF16) => {
+                if dst.len() < len * 2 {
+                    return None;
+                }
+                crate::f16c::f16_bytes_to_bf16_bytes(bytes, &mut dst[..len * 2]);
             }
             // BF16 源 → f32 目标（f32 链回退路径）：批量展开
             (safetensors::Dtype::BF16, crate::contract::Dtype::F32) => {

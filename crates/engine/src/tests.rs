@@ -928,7 +928,11 @@ async fn gpu_27b_chat_inference() {
             eprintln!("skip: OWL_AWQ27B_DIR 未设(cyankiwi 检查点目录)");
             return;
         };
-        let prompt = "用五十字介绍长城。";
+        // 域参数化(E5-DF3 AL 排查:PROSE 域 = DFlash2 结构性最差域,
+        // xinfer p5 实测 accept 1.9%/AL 1.13;MATH 域 AL 4.49 —— OWL_GATE_PROMPT
+        // 换域对照,缺省恒 = 原 42tok 长城门)
+        let prompt = std::env::var("OWL_GATE_PROMPT")
+            .unwrap_or_else(|_| "用五十字介绍长城。".to_string());
 
         async fn gen(
             spec: bool,
@@ -977,8 +981,8 @@ async fn gpu_27b_chat_inference() {
             (text, toks)
         }
 
-        let (ta, ta_tokens) = gen(false, ordinal, &dir, prompt).await;
-        let (tb, tb_tokens) = gen(true, ordinal, &dir, prompt).await;
+        let (ta, ta_tokens) = gen(false, ordinal, &dir, &prompt).await;
+        let (tb, tb_tokens) = gen(true, ordinal, &dir, &prompt).await;
         eprintln!(
             "[spec-gate-27b] baseline({}tok)={ta:?}\n[spec-gate-27b] spec({}tok)={tb:?}",
             ta_tokens.len(),
@@ -1015,7 +1019,11 @@ async fn gpu_27b_chat_inference() {
             eprintln!("skip: OWL_DFLASH2_DIR 未设(DFlash2 草稿目录)");
             return;
         };
-        let prompt = "用五十字介绍长城。";
+        // 域参数化(E5-DF3 AL 排查:PROSE 域 = DFlash2 结构性最差域,
+        // xinfer p5 实测 accept 1.9%/AL 1.13;MATH 域 AL 4.49 —— OWL_GATE_PROMPT
+        // 换域对照,缺省恒 = 原 42tok 长城门)
+        let prompt = std::env::var("OWL_GATE_PROMPT")
+            .unwrap_or_else(|_| "用五十字介绍长城。".to_string());
 
         async fn gen(
             spec: bool,
@@ -1024,6 +1032,7 @@ async fn gpu_27b_chat_inference() {
             ddir: &str,
             prompt: &str,
         ) -> (String, Vec<u32>) {
+            let prompt_len = prompt.chars().count(); // 近似(测试口径)
             std::env::set_var("OWL_SAMPLER", "greedy");
             std::env::remove_var("OWL_REP_PENALTY");
             std::env::set_var("OWL_GDN_SLOTS", "1");
@@ -1050,23 +1059,52 @@ async fn gpu_27b_chat_inference() {
                 .expect("装载");
             let mut running = engine.run(loaded).await.expect("装配");
             let (sid, id) = running.submit_session(Some(7), prompt, 40).expect("submit");
+            let tg = std::time::Instant::now();
             let text = drive_turn(&mut running, id).await;
+            let t_gen = tg.elapsed();
             let toks = running
                 .sessions
                 .get(sid)
                 .map(|s| s.tokens.clone())
                 .unwrap_or_default();
+            let gen_n = toks.len().saturating_sub(prompt_len);
             let st = running.spec_stats;
             let al = if st.rounds > 0 { st.sum_m as f64 / st.rounds as f64 } else { 0.0 };
+            eprintln!(
+                "[dflash-gate] 生成段: {} tok / {t_gen:.1?} = {:.1} tok/s(spec={spec})",
+                gen_n,
+                gen_n as f64 / t_gen.as_secs_f64(),
+            );
             eprintln!(
                 "[dflash-gate] spec={spec} rounds={} sum_m={} AL={al:.2}",
                 st.rounds, st.sum_m
             );
+            // 实例收尾屏障:drop 后等 server 线程退出 + CUDA ctx 析构
+            // (异步;下一实例 17G 分配会与释放赛跑 → 2026-10-07 baseline
+            // 非确定性定谳)
+            drop(running);
+            std::thread::sleep(std::time::Duration::from_secs(3));
             (text, toks)
         }
 
-        let (ta, ta_tokens) = gen(false, ordinal, &dir, &ddir, prompt).await;
-        let (tb, tb_tokens) = gen(true, ordinal, &dir, &ddir, prompt).await;
+        let t0 = std::time::Instant::now();
+        let (ta, ta_tokens) = gen(false, ordinal, &dir, &ddir, &prompt).await;
+        let t_base = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let (tb, tb_tokens) = gen(true, ordinal, &dir, &ddir, &prompt).await;
+        let t_spec = t1.elapsed();
+        // 吞吐面:生成 tok 数 / gen 墙钟(含装载+prefill;粗口径,门内自证)
+        let gen_n = |t: &[u32]| t.len().saturating_sub(18);
+        eprintln!(
+            "[dflash-gate] 吞吐 baseline: {} gen-tok / {t_base:.1?} = {:.1} tok/s(含装载)",
+            gen_n(&ta_tokens),
+            gen_n(&ta_tokens) as f64 / t_base.as_secs_f64(),
+        );
+        eprintln!(
+            "[dflash-gate] 吞吐 spec:     {} gen-tok / {t_spec:.1?} = {:.1} tok/s(含装载)",
+            gen_n(&tb_tokens),
+            gen_n(&tb_tokens) as f64 / t_spec.as_secs_f64(),
+        );
         eprintln!(
             "[dflash-gate] baseline({}tok)={ta:?}\n[dflash-gate] spec({}tok)={tb:?}",
             ta_tokens.len(),

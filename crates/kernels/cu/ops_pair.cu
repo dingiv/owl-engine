@@ -82,17 +82,22 @@ extern "C" __global__ void NAME PARAMS { \
     } \
 }
 
-// ---- 实例化(f32 / f16;实例行第三参 = 类型化形参,C2 互证按行解析)----
+// ---- 实例化(f32 / f16 / bf16;实例行第三参 = 类型化形参,C2 互证按行解析)----
+// bf16 臂(E5-DF3 同日十四):DFlash2 草稿路径 BF16 化消费(fc 部分和累加
+// owl_add_bf16 + hidden_norm/qk-norm owl_rmsnorm_bf16;桥已预留在上)。
 OWL_ADD_KERNEL(owl_add_f32, float, (const float* a, const float* b, float* out, const size_t n))
 OWL_ADD_KERNEL(owl_add_f16, __half, (const __half* a, const __half* b, __half* out, const size_t n))
+OWL_ADD_KERNEL(owl_add_bf16, __nv_bfloat16, (const __nv_bfloat16* a, const __nv_bfloat16* b, __nv_bfloat16* out, const size_t n))
 OWL_MUL_KERNEL(owl_mul_f32, float, (const float* a, const float* b, float* out, const size_t n))
 OWL_MUL_KERNEL(owl_mul_f16, __half, (const __half* a, const __half* b, __half* out, const size_t n))
+OWL_MUL_KERNEL(owl_mul_bf16, __nv_bfloat16, (const __nv_bfloat16* a, const __nv_bfloat16* b, __nv_bfloat16* out, const size_t n))
 OWL_SILU_KERNEL(owl_silu_f32, float, (const float* x, float* out, const size_t n))
 OWL_SILU_KERNEL(owl_silu_f16, __half, (const __half* x, __half* out, const size_t n))
 OWL_SIGMOID_KERNEL(owl_sigmoid_f32, float, (const float* x, float* out, const size_t n))
 OWL_SIGMOID_KERNEL(owl_sigmoid_f16, __half, (const __half* x, __half* out, const size_t n))
 OWL_RMSNORM_KERNEL(owl_rmsnorm_f32, float, (const float* x, const float* alpha, float* out, const int n, const float eps, const int w_off))
 OWL_RMSNORM_KERNEL(owl_rmsnorm_f16, __half, (const __half* x, const __half* alpha, __half* out, const int n, const float eps, const int w_off))
+OWL_RMSNORM_KERNEL(owl_rmsnorm_bf16, __nv_bfloat16, (const __nv_bfloat16* x, const __nv_bfloat16* alpha, __nv_bfloat16* out, const int n, const float eps, const int w_off))
 
 // ---- matmul f32 手写核(单元锚保留;[m,k]×[k,n] 行主序,grid 二维)----
 // f16 基线 matmul 走 cuBLAS foreign 通道(eval dtype 路由),不养手写变体。

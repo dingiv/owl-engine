@@ -442,6 +442,22 @@ int marlin_gemm_v2_ffi(const void* A, const void* B, void* C, void* c_tmp,
                    (cudaStream_t)stream, -1, -1, sms, /*is_bf16=*/false);
 }
 
+// BF16 激活/输出变体(E5-DF3 同日十二:草稿路径 BF16 化,对齐 sglang。
+// 同 u4b8 B,激活/输出 = __nv_bfloat16;selector 走 kBFloat16 三族分支)
+int marlin_gemm_v2_bf16_ffi(const void* A, const void* B, void* C, void* c_tmp,
+                            const void* b_scales, int prob_m, int prob_n,
+                            int prob_k, void* workspace, int group_size, int dev,
+                            uintptr_t stream) {
+  int sms = 0;
+  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+  int num_groups = (group_size == -1) ? 1 : prob_k / group_size;
+  return marlin_mm(A, B, C, c_tmp, const_cast<void*>(b_scales),
+                   /*a_s=*/nullptr, /*a_is_s8=*/false, /*b_z=*/nullptr,
+                   /*use_zp=*/false, prob_m, prob_n, prob_k, prob_k,
+                   workspace, num_groups, group_size, dev,
+                   (cudaStream_t)stream, -1, -1, sms, /*is_bf16=*/true);
+}
+
 // W4A8 变体:A = int8(已量化),a_scales = fp32 [M,1](per-token)。
 // 其余契约与 marlin_gemm_v2_ffi 完全一致(B/scales/workspace 不变)。
 int marlin_gemm_v2_w4a8_ffi(const void* A, const void* B, void* C,

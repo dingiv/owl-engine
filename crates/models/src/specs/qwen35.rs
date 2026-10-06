@@ -186,27 +186,102 @@ pub async fn load_27b_dflash2<D: DeviceClient + 'static>(
     dir: &Path,
     face: &mut D,
 ) -> Result<(crate::layers::dflash2::DFlash2Draft, crate::module::LoadManifest), ModelError> {
-    let draft = crate::layers::dflash2::DFlash2Draft::new(5120, 17408, 32, 8, 128, 5, 1e-6, 248320);
-    let src = SafeTensorsSource::open_dir(dir)?;
+    // 源族自动探测(fc.weight_scale 在 = compressed-tensors W4A16 g128;
+    // 缺 = BF16 原生)。W4A16 = 1.28GB(BF16 3.85GB)—— 24G 恒等门前置。
+    // 裸索引探测(SafeTensorsSource::open_dir 的 F32/BF16 校验会拒收
+    // W4A16 文件的 I32/F16 条目;open_raw_index 无过滤零拷贝)
+    let (_, raw) = crate::formats::mmap::open_raw_index(dir)?;
+    let is_q = raw.contains_key("fc.weight_packed");
+    drop(raw);
     let ctx = crate::module::LoaderCtx {
-        dtype: crate::contract::Dtype::F16,
+        // BF16(E5-DF3 同日十四;sglang 对齐):草稿路径 BF16 全程 ——
+        // 检查点 passthrough 权重(norms/conv 投影/codebooks)原生 BF16
+        // 直载零转换;marlin scales 钉 F16(dtype_override);激活/池全 bf16
+        dtype: crate::contract::Dtype::BF16,
         shard: 1,
         device_repack: false,
     };
+    if is_q {
+        let draft = crate::layers::dflash2::DFlash2Draft::new_with_plan_dt(
+            5120,
+            17408,
+            32,
+            8,
+            128,
+            5,
+            1e-6,
+            248320,
+            crate::module::QuantPlan::W4A16,
+            crate::contract::Dtype::BF16,
+        );
+        let src = crate::formats::w4a16::W4A16Source::open_dir(dir)?;
+        let manifest = crate::interpreters::eval_load(&draft, face, &src, &ctx).await?;
+        return Ok((draft, manifest));
+    }
+    let draft = crate::layers::dflash2::DFlash2Draft::new_with_plan_dt(
+        5120,
+        17408,
+        32,
+        8,
+        128,
+        5,
+        1e-6,
+        248320,
+        crate::module::QuantPlan::F16,
+        crate::contract::Dtype::BF16,
+    );
+    let src = SafeTensorsSource::open_dir(dir)?;
     let manifest = crate::interpreters::eval_load(&draft, face, &src, &ctx).await?;
     Ok((draft, manifest))
 }
 
+/// fc 形态标记(Loadable 分派用;借用拆分)
+pub(crate) enum FcShape {
+    Q,
+    F16T,
+}
+
 /// DFlash2 草稿键映射(检查点原生命名;conv 的 base_kernel 无 .weight
 /// 后缀、codebook 两键亦然 —— 三特例在闭包内分流)。
+impl crate::layers::dflash2::DFlash2Draft {
+    pub(crate) fn fc_shape(&self) -> FcShape {
+        if self.is_quant() {
+            FcShape::Q
+        } else {
+            FcShape::F16T
+        }
+    }
+}
+
 impl Loadable for crate::layers::dflash2::DFlash2Draft {
     fn layout(&self, ctx: &LoaderCtx) -> LoaderOps {
         let w = |k: &str| format!("{k}.weight");
-        let mut ops = self
-            .fc()
-            .layout(ctx)
-            .map_keys(|k| format!("{k}.weight"))
-            .chain(self.hidden_norm().layout(ctx).map_keys(w));
+        // 键尾规则(双源通用):量化槽(qweight/scales/ws/marlin_ctmp)后缀
+        // 已内含 → 前缀直拼;其余(norm 裸键 / f16 回落 Linear .weight)补
+        // .weight(两源检查点的 norm 键均带 .weight)。
+        let lin_tail = |k: &str| {
+            if k.ends_with(".qweight")
+                || k.ends_with(".scales")
+                || k.ends_with(".ws")
+                || k.ends_with(".marlin_ctmp")
+                || k.ends_with(".marlin_ws")
+            {
+                k.to_string()
+            } else {
+                format!("{k}.weight")
+            }
+        };
+        let mut ops = match self.fc_shape() {
+            FcShape::Q => {
+                let mut o = self.fc_q()[0].layout(ctx);
+                for l in &self.fc_q()[1..] {
+                    o = o.chain(l.layout(ctx));
+                }
+                o
+            }
+            FcShape::F16T => self.fc_t().layout(ctx).map_keys(|k| format!("{k}.weight")),
+        };
+        ops = ops.chain(self.hidden_norm().layout(ctx).map_keys(w));
         for (i, layer) in self.layers().iter().enumerate() {
             let conv_tail = |k: &str| {
                 if k == "base_kernel" { k.to_string() } else { format!("{k}.weight") }
@@ -228,7 +303,7 @@ impl Loadable for crate::layers::dflash2::DFlash2Draft {
                     layer
                         .attn()
                         .layout(ctx)
-                        .map_keys(|k| format!("layers.{i}.self_attn.{k}.weight")),
+                        .map_keys(|k| format!("layers.{i}.self_attn.{}", lin_tail(k))),
                 )
                 .chain(
                     layer
@@ -249,7 +324,7 @@ impl Loadable for crate::layers::dflash2::DFlash2Draft {
                     layer
                         .mlp()
                         .layout(ctx)
-                        .map_keys(|k| format!("layers.{i}.mlp.{k}.weight")),
+                        .map_keys(|k| format!("layers.{i}.mlp.{}", lin_tail(k))),
                 );
         }
         ops.chain(self.norm_head().layout(ctx).map_keys(w)).chain(
@@ -1129,29 +1204,57 @@ mod tests {
             .expect("DFlash2 装载");
         assert_eq!(draft.hidden(), 5120);
 
-        // 键集断言:81 键,fc/hidden_norm/norm/selector + 5 层全件
+        // 键集断言:BF16 = 81 键;W4A16 = 量化三槽 × 41 线性 + passthrough
         let keys: Vec<String> = manifest.entries().iter().map(|e| e.key.clone()).collect();
-        assert_eq!(keys.len(), 81, "键数实际 {}", keys.len());
-        for expect in [
-            "fc.weight",
-            "hidden_norm.weight",
-            "norm.weight",
-            "candidate_selector.hidden_projection.weight",
-            "candidate_selector.predecessor_codebook",
-            "candidate_selector.successor_codebook",
-            "layers.0.attention_conv.base_kernel",
-            "layers.4.mlp_conv.kernel_projection.weight",
-            "layers.4.self_attn.k_norm.weight",
-            "layers.4.mlp.down_proj.weight",
-        ] {
-            assert!(keys.iter().any(|k| k == expect), "缺键 {expect}");
+        let is_q = keys.iter().any(|k| k.ends_with(".qweight"));
+        if is_q {
+            assert!(
+                keys.len() > 120 && keys.len() < 260,
+                "W4A16 键数异常 {}",
+                keys.len()
+            );
+        } else {
+            assert_eq!(keys.len(), 81, "键数实际 {}", keys.len());
+        }
+        if is_q {
+            for expect in [
+                "fc_0.qweight",
+                "fc_4.scales",
+                "hidden_norm.weight",
+                "norm.weight",
+                "candidate_selector.hidden_projection.weight",
+                "candidate_selector.predecessor_codebook",
+                "candidate_selector.successor_codebook",
+                "layers.0.attention_conv.base_kernel",
+                "layers.0.self_attn.q_proj.qweight",
+                "layers.4.mlp.down_proj.qweight",
+                "layers.4.self_attn.k_norm.weight",
+            ] {
+                assert!(keys.iter().any(|k| k == expect), "缺键 {expect}");
+            }
+        } else {
+            for expect in [
+                "fc.weight",
+                "hidden_norm.weight",
+                "norm.weight",
+                "candidate_selector.hidden_projection.weight",
+                "candidate_selector.predecessor_codebook",
+                "candidate_selector.successor_codebook",
+                "layers.0.attention_conv.base_kernel",
+                "layers.4.mlp_conv.kernel_projection.weight",
+                "layers.4.self_attn.k_norm.weight",
+                "layers.4.mlp.down_proj.weight",
+            ] {
+                assert!(keys.iter().any(|k| k == expect), "缺键 {expect}");
+            }
         }
 
         // fc 采样对拍:y[o] = Σ_k tap[k]·W[o][k](W [5120, 25600] 行主序;
         // 采样 8 个输出元全量内积 —— 免 262M 全量 MAC)
         use crate::module::WeightSource;
-        let mut src = crate::formats::safetensors::SafeTensorsSource::open_dir(dir).unwrap();
-        let w_fc = src.take("fc.weight").expect("fc 源");
+        // host 参考:fc 反量化值(W4A16Source 反量化臂;BF16 源同键直读)
+        let mut src = crate::formats::w4a16::W4A16Source::open_dir(dir).unwrap();
+        let w_fc = src.dequant_linear("fc").expect("fc 源(反量化)");
         let hn = src.take("hidden_norm.weight").expect("hn 源");
         let fan = 5 * 5120usize;
         let (hidden_d, row_n) = (5120usize, 5120usize);
@@ -1246,7 +1349,7 @@ mod tests {
             assert!(tok >= 0.0 && tok < vocab as f32, "walk token 越界 e{e} = {tok}");
             assert!(tok.fract() == 0.0, "walk token 非整 e{e} = {tok}");
         }
-        eprintln!("[dflash2] 27B 装载 + fc 对拍 + selector 冒烟全绿(81 键)");
+        eprintln!("[dflash2] 27B 装载 + fc 对拍 + selector 冒烟全绿({} 键,W4A16 = {is_q})", keys.len());
         gpu.close().await.expect("关机");
     }
 

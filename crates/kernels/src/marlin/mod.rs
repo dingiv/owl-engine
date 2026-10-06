@@ -34,6 +34,11 @@ pub const GEMM_W4A16: &str = "marlin_gemm_w4a16";
 /// scales 之后插 zeros,共 7 Block + 4 sz)
 pub const GEMM_W4A16_AWQ: &str = "marlin_gemm_w4a16_awq";
 
+/// foreign-kernel 虚拟核名(BF16 激活/输出 W4A16 臂;E5-DF3 同日十二:
+/// 草稿路径 BF16 化,对齐 sglang 的 BF16 激活跑法。槽序与 GEMM_W4A16 一致,
+/// is_bf16=true 走 kBFloat16 三族实例)
+pub const GEMM_W4A16_BF16: &str = "marlin_gemm_w4a16_bf16";
+
 /// 槽序契约(LaunchMsg.args;与 cublas.rs 文档同构):
 /// `[T a, T b, T out, T scales, T workspace, T c_tmp, sz m, sz k, sz n, sz groupsize]`
 /// workspace 须零初始化(≥ [`v2_workspace_len(n)] i32);c_tmp 可传零容量块
@@ -43,7 +48,7 @@ pub const GEMM_W4A16_SLOTS: &str =
 
 /// foreign 分派谓词(server handle_launch 前置检查;cublas 同款)
 pub fn is_foreign(name: &str) -> bool {
-    name == GEMM_W4A16 || name == GEMM_W4A16_AWQ
+    name == GEMM_W4A16 || name == GEMM_W4A16_AWQ || name == GEMM_W4A16_BF16
 }
 
 pub const V2_ERR_NO_CONFIG: i32 = 3;
@@ -112,9 +117,65 @@ pub unsafe fn gemm_v2_raw(
     }
 }
 
+/// BF16 激活/输出变体(同 [`gemm_v2_raw`],is_bf16=true;E5-DF3 同日十二:
+/// 草稿路径 BF16 化,对齐 sglang 的 BF16 激活跑法)。
+///
+/// # Safety
+/// 同 [`gemm_v2_raw`]。
+pub unsafe fn gemm_v2_raw_bf16(
+    a: *const u16,
+    b: *const i32,
+    c: *mut u16,
+    scales: *const u16,
+    c_tmp: *const c_void,
+    m: i32,
+    n: i32,
+    k: i32,
+    workspace: *mut i32,
+    groupsize: i32,
+    dev: i32,
+    stream: usize,
+) -> Result<(), i32> {
+    let err = marlin_gemm_v2_bf16_ffi(
+        a as *const c_void,
+        b as *const c_void,
+        c as *mut c_void,
+        c_tmp as *mut c_void,
+        scales as *const c_void,
+        m,
+        n,
+        k,
+        workspace as *mut c_void,
+        groupsize,
+        dev,
+        stream,
+    );
+    if err == 0 {
+        Ok(())
+    } else {
+        Err(err)
+    }
+}
+
 extern "C" {
     // csrc/marlin/marlin_host.cu(裸指针发射器;C ABI,零 torch)
     fn marlin_gemm_v2_ffi(
+        a: *const c_void,
+        b: *const c_void,
+        c: *mut c_void,
+        c_tmp: *mut c_void,
+        b_scales: *const c_void,
+        prob_m: i32,
+        prob_n: i32,
+        prob_k: i32,
+        workspace: *mut c_void,
+        group_size: i32,
+        dev: i32,
+        stream: usize,
+    ) -> i32;
+
+    // BF16 激活/输出臂(同 gemm_v2_ffi,is_bf16=true;E5-DF3 同日十二)
+    fn marlin_gemm_v2_bf16_ffi(
         a: *const c_void,
         b: *const c_void,
         c: *mut c_void,

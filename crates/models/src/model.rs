@@ -222,8 +222,11 @@ impl Model {
                 taps[pos] = Some(xs.clone().tag(format!("tap{li}")));
             }
         }
+        // final norm(与 last_hidden 对齐;调用方 tok/hid 消费同一口径 ——
+        // 2026-10-07 恒等门分歧根因:pre-norm hidden 进 lm_head = tok 全错)
+        let fin = self.norm.forward(&xs, ctx).tag("final_norm");
         (
-            xs,
+            fin,
             taps.into_iter().map(|t| t.expect("tap_ids 层号非法")).collect(),
         )
     }

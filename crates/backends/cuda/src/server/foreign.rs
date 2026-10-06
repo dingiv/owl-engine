@@ -60,10 +60,14 @@ impl GpuServer {
             ))));
         }
         match msg.kernel.name.as_str() {
-            name if name == owl_kernels::cublas::GEMM_F16 => self.handle_cublas_gemm(msg, ack),
+            name if name == owl_kernels::cublas::GEMM_F16 => self.handle_cublas_gemm(msg, ack, false),
+            name if name == owl_kernels::cublas::GEMM_BF16 => self.handle_cublas_gemm(msg, ack, true),
             name if name == owl_kernels::marlin::GEMM_W4A16 => self.handle_marlin_gemm(msg, ack),
             name if name == owl_kernels::marlin::GEMM_W4A16_AWQ => {
                 self.handle_marlin_gemm_awq(msg, ack)
+            }
+            name if name == owl_kernels::marlin::GEMM_W4A16_BF16 => {
+                self.handle_marlin_gemm_bf16(msg, ack)
             }
             name if name == owl_kernels::flashinfer::PREFILL_FI
                 || name == owl_kernels::flashinfer::PREFILL_FI_FP8KV =>
@@ -82,8 +86,9 @@ impl GpuServer {
         }
     }
 
-    /// cuBLAS f16 GEMM 臂(槽序:[T a, T b, T out, sz m, sz k, sz n, sz nt])
-    pub(super) fn handle_cublas_gemm(&mut self, msg: LaunchMsg, ack: Ack<Result<Bytes, ModelError>>) {
+    /// cuBLAS GEMM 臂(槽序:[T a, T b, T out, sz m, sz k, sz n, sz nt])。
+    /// bf16 = true → CUDA_R_16BF 三参(E5-DF3 同日十四;DFlash2 草稿非量化投影)
+    pub(super) fn handle_cublas_gemm(&mut self, msg: LaunchMsg, ack: Ack<Result<Bytes, ModelError>>, bf16: bool) {
         if self.blas.is_none() {
             let stream = match self.ctx().stream(STREAM_COMPUTE) {
                 Ok(s) => s.clone(),
@@ -149,7 +154,12 @@ impl GpuServer {
             Err(e) => return ack.send(Err(e)),
         };
         let capturing = self.ctx().capture_stream();
-        match blas.gemm_f16(a_ptr, b_ptr, out_ptr, m, k, n, nt) {
+        let gemm_r = if bf16 {
+            blas.gemm_bf16(a_ptr, b_ptr, out_ptr, m, k, n, nt)
+        } else {
+            blas.gemm_f16(a_ptr, b_ptr, out_ptr, m, k, n, nt)
+        };
+        match gemm_r {
             Ok(()) => {
                 // 诊断开关(同 handle_launch;捕获期跳过)
                 if self.probes.launch_sync && !capturing {
@@ -162,6 +172,56 @@ impl GpuServer {
                 ack.send(Ok(Bytes::new(blocks[2].0, msg.out_elems)))
             }
             Err(e) => ack.send(Err(ModelError::Msg(e))),
+        }
+    }
+
+    /// Marlin W4A16 **BF16 激活/输出**臂(E5-DF3 同日十二;槽序同上,
+    /// is_bf16=true 走 kBFloat16 三族实例)。
+    pub(super) fn handle_marlin_gemm_bf16(
+        &mut self,
+        msg: LaunchMsg,
+        ack: Ack<Result<Bytes, ModelError>>,
+    ) {
+        let (blocks, scalars) = match Self::parse_foreign_slots(&msg, 6, 4) {
+            Ok(v) => v,
+            Err(e) => return ack.send(Err(e)),
+        };
+        let (m, k, n, groupsize) =
+            (scalars[0] as usize, scalars[1] as usize, scalars[2] as usize, scalars[3] as i32);
+        let stream = match self.ctx().stream(STREAM_COMPUTE) {
+            Ok(s) => s.clone(),
+            Err(e) => return ack.send(Err(e)),
+        };
+        let mut ptrs = Vec::with_capacity(6);
+        for (b, off) in &blocks {
+            match self.ctx().block_ptr(*b, &stream) {
+                Ok((p, _)) => ptrs.push(p + off),
+                Err(e) => return ack.send(Err(e)),
+            }
+        }
+        let dev = self.ctx().device_ordinal() as i32;
+        let r = unsafe {
+            owl_kernels::marlin::gemm_v2_raw_bf16(
+                ptrs[0] as *const u16,
+                ptrs[1] as *const i32,
+                ptrs[2] as *mut u16,
+                ptrs[3] as *const u16,
+                ptrs[5] as *const c_void,
+                m as i32,
+                n as i32,
+                k as i32,
+                ptrs[4] as *mut i32,
+                groupsize,
+                dev,
+                stream.cu_stream() as usize,
+            )
+        };
+        match r {
+            Ok(()) => ack.send(Ok(Bytes::new(blocks[2].0, msg.out_elems))),
+            Err(code) => ack.send(Err(ModelError::Msg(format!(
+                "marlin bf16: err={code}({})",
+                owl_kernels::marlin::v2_err_str(code)
+            )))),
         }
     }
 

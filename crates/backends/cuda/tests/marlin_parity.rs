@@ -63,10 +63,11 @@ fn marlin_launch(
     k: usize,
     n: usize,
     g: usize,
+    is_bf16: bool,
 ) -> LaunchMsg {
     LaunchMsg {
         kernel: owl_cuda::KernelSpec {
-            name: "marlin_gemm_w4a16".into(),
+            name: if is_bf16 { "marlin_gemm_w4a16_bf16" } else { "marlin_gemm_w4a16" }.into(),
             source: String::new(),
         },
         args: vec![
@@ -88,7 +89,14 @@ fn marlin_launch(
     }
 }
 
-async fn run_case(client: &mut GpuClient, m: usize, n: usize, k: usize, g: usize) -> (f64, f32) {
+async fn run_case(
+    client: &mut GpuClient,
+    m: usize,
+    n: usize,
+    k: usize,
+    g: usize,
+    is_bf16: bool,
+) -> (f64, f32) {
     // host 数据(f16 可表值域:×0.25 压幅)
     let a: Vec<f32> = (0..m * k).map(|i| ((i as f32 * 0.31) - 4.0).sin() * 0.5).collect();
     // 源布局 out 主序:q [n, k]、scales [n, k/g]
@@ -99,14 +107,41 @@ async fn run_case(client: &mut GpuClient, m: usize, n: usize, k: usize, g: usize
 
     // owl repack(compressed-tensors → marlin 布局)
     let b_packed = owl_kernels::marlin::repack::pack_marlin_b(&q, k, n);
-    let s_packed = owl_kernels::marlin::repack::pack_marlin_s(&s, n, k / g);
+    let s_packed_f16 = owl_kernels::marlin::repack::pack_marlin_s(&s, n, k / g);
+    // bf16 内核的 s_type = BF16:scales 位型 f16 → bf16(与装载器同转换)
+    let s_packed: Vec<u16> = if is_bf16 {
+        s_packed_f16
+            .iter()
+            .map(|&bits| half::bf16::from_f32(half::f16::from_bits(bits).to_f32()).to_bits())
+            .collect()
+    } else {
+        s_packed_f16
+    };
     assert_eq!(b_packed.len(), (k / 16) * (n * 16 / 8));
     assert_eq!(s_packed.len(), (k / g) * n);
 
-    // 上卡
-    let da = client.htod(Dtype::F16, &Shape::from(vec![m, k]), &le_u16(
-        &a.iter().map(|f| half::f16::from_f32(*f).to_bits()).collect::<Vec<_>>(),
-    )).await.expect("htod a");
+    // 上卡(bf16 模式:A/C 走 BF16 位型;参考用同位型回读值)
+    let (act_name, a_ref) = if is_bf16 {
+        (
+            "marlin_gemm_w4a16_bf16",
+            a.iter()
+                .map(|f| half::bf16::from_f32(*f).to_f32())
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        (
+            "marlin_gemm_w4a16",
+            a.iter()
+                .map(|f| half::f16::from_f32(*f).to_f32())
+                .collect::<Vec<_>>(),
+        )
+    };
+    let a_bits: Vec<u16> = if is_bf16 {
+        a_ref.iter().map(|f| half::bf16::from_f32(*f).to_bits()).collect()
+    } else {
+        a_ref.iter().map(|f| half::f16::from_f32(*f).to_bits()).collect()
+    };
+    let da = client.htod(Dtype::F16, &Shape::from(vec![m, k]), &le_u16(&a_bits)).await.expect("htod a");
     // u16 位序 = f16 LE ✓(f16::to_bits 是 u16 表示,LE 字节序正确)
     let db = client.htod(Dtype::U32, &Shape::from(vec![b_packed.len()]), &le_i32(&b_packed)).await.expect("htod b");
     let ds = client.htod(Dtype::F16, &Shape::from(vec![s_packed.len()]), &le_u16(&s_packed)).await.expect("htod s");
@@ -116,20 +151,32 @@ async fn run_case(client: &mut GpuClient, m: usize, n: usize, k: usize, g: usize
     let dctmp = client.alloc(Dtype::U32, 1).await.expect("alloc ctmp");
     let dc = client.alloc(Dtype::F16, m * n).await.expect("alloc c");
 
-    client.launch(marlin_launch(&da, &db, &dc, &ds, &dws, &dctmp, m, k, n, g)).await.expect("marlin launch");
+    client
+        .launch(marlin_launch(
+            &da, &db, &dc, &ds, &dws, &dctmp, m, k, n, g, is_bf16,
+        ))
+        .await
+        .expect("marlin launch");
 
     let mut buf = vec![0u8; m * n * 2];
     client.dtoh(&dc, &mut buf).await.expect("dtoh");
-    let got: Vec<f32> = buf
-        .chunks_exact(2)
-        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
-        .collect();
+    let got: Vec<f32> = if is_bf16 {
+        buf.chunks_exact(2)
+            .map(|c| {
+                half::bf16::from_le_bytes([c[0], c[1]]).to_f32()
+            })
+            .collect()
+    } else {
+        buf.chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect()
+    };
 
     // 大 m 全量 host 参考 = O(m·n·k) 标量乘加(debug 下分钟级)→ 抽样 4 行
     let (mut sum_abs, mut max_abs, mut sum_sq) = (0f64, 0f32, 0f64);
     let mut n_elem = 0f64;
     if m <= 256 {
-        let c_ref = host_dequant_gemm(&a, &q, &s, m, n, k, g);
+        let c_ref = host_dequant_gemm(&a_ref, &q, &s, m, n, k, g);
         for (x, r) in got.iter().zip(&c_ref) {
             sum_abs += (*x as f64 - *r as f64).abs();
             sum_sq += (*r as f64) * (*r as f64);
@@ -145,7 +192,7 @@ async fn run_case(client: &mut GpuClient, m: usize, n: usize, k: usize, g: usize
                 for kk in 0..k {
                     let nib = q[nn * k + kk];
                     let w = (nib as f32 - 8.0) * s[nn * (k / g) + kk / g];
-                    acc += a[r * k + kk] * w;
+                    acc += a_ref[r * k + kk] * w;
                 }
                 let got_v = got[r * n + nn];
                 sum_abs += (got_v as f64 - acc as f64).abs();
@@ -168,10 +215,25 @@ async fn marlin_w4a16_parity() {
     // 形状矩阵:decode(m=1)+ 短 prefill(m=64);k/n 满足 v2 约束(k%16==0)
     // 形状约束(pack/upstream Layer 校验):k%128==0、n%256==0、g ∈ {64,128,-1}
     for (m, n, k, g) in [(1usize, 256usize, 256usize, 64usize), (64, 256, 256, 64), (8, 512, 512, 128)] {
-        let (noise_ratio, max_abs) = run_case(&mut client, m, n, k, g).await;
+        let (noise_ratio, max_abs) = run_case(&mut client, m, n, k, g, false).await;
         eprintln!("[marlin] m={m} n={n} k={k} g={g} → 噪声/信号RMS={noise_ratio:.6} max_abs={max_abs:.5}");
         // 判据 = 噪声/信号 RMS < 2%(W4A16 + f16 I/O 的物理噪声地板;
         // 随机 q 的对称抵消会让 mean(|C|) 缩水,比值判据假阳性)
+        assert!(
+            noise_ratio < 2e-2 && noise_ratio.is_finite(),
+            "m={m}: 噪声比 {noise_ratio}"
+        );
+    }
+    client.sync().await.expect("sync");
+}
+
+/// BF16 激活 W4A16 parity(E5-DF3 同日十二:草稿路径 BF16 化;fc 形状)
+#[tokio::test]
+async fn marlin_w4a16_bf16_parity() {
+    let mut client = assemble();
+    for (m, n, k, g) in [(20usize, 5120usize, 5120usize, 128usize), (8, 5120, 5120, 128), (64, 512, 512, 128)] {
+        let (noise_ratio, max_abs) = run_case(&mut client, m, n, k, g, true).await;
+        eprintln!("[marlin-bf16] m={m} n={n} k={k} g={g} → 噪声/信号RMS={noise_ratio:.6} max_abs={max_abs:.5}");
         assert!(
             noise_ratio < 2e-2 && noise_ratio.is_finite(),
             "m={m}: 噪声比 {noise_ratio}"
@@ -222,7 +284,7 @@ async fn marlin_shape_case() {
     let parts: Vec<usize> = spec.split(',').map(|v| v.parse().unwrap()).collect();
     let (m, n, k, g) = (parts[0], parts[1], parts[2], parts[3]);
     let mut client = assemble();
-    let (noise_ratio, max_abs) = run_case(&mut client, m, n, k, g).await;
+    let (noise_ratio, max_abs) = run_case(&mut client, m, n, k, g, false).await;
     eprintln!("[case] m={m} n={n} k={k} g={g} → 噪声比 {noise_ratio:.6} max_abs={max_abs:.5}");
     assert!(noise_ratio < 2e-2 && noise_ratio.is_finite(), "噪声比 {noise_ratio}");
     client.sync().await.expect("sync");
@@ -250,7 +312,7 @@ async fn marlin_shape_sweep() {
     }
     for (m, n, k, g) in cases {
         eprintln!("[sweep] try m={m} n={n} k={k} g={g}");
-        let (noise_ratio, _max_abs) = run_case(&mut client, m, n, k, g).await;
+        let (noise_ratio, _max_abs) = run_case(&mut client, m, n, k, g, false).await;
         eprintln!("[sweep] done m={m} n={n} k={k} → {noise_ratio:.6}");
     }
 }

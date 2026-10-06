@@ -168,13 +168,15 @@ impl StatePool {
         };
         // DFlash2 草稿池(E5-DF2):5 层 × 草稿几何(8 KV 头 × hd128;
         // z-lab 检查点家族定形),容量同 pool_tokens。仅 paged。
+        // dtype = BF16(E5-DF3 同日十四;草稿路径 BF16 全程,独立于目标池
+        // dims.dtype —— 同 2B/elem,几何 page/x 不变)
         let dflash_kvs = if dflash && paged {
             let (dkv, dhd, dlayers) = (8usize, 128usize, 5usize);
             let mut ks = Vec::with_capacity(dlayers);
             for _ in 0..dlayers {
                 ks.push(KvBlocks {
-                    k_cache: zero_block_dt(face, nb * dkv * dhd * page, dims.dtype).await?,
-                    v_cache: zero_block_dt(face, nb * dkv * dhd * page, dims.dtype).await?,
+                    k_cache: zero_block_dt(face, nb * dkv * dhd * page, Dtype::BF16).await?,
+                    v_cache: zero_block_dt(face, nb * dkv * dhd * page, Dtype::BF16).await?,
                 });
             }
             Some(ks)

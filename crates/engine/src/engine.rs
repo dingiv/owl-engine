@@ -173,7 +173,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
             crate::running::SpecMode::DFlash2 => {
                 let dir = dflash2_dir.as_ref().expect("dflash2_dir");
                 let (d2, _) = owl_models::specs::qwen35::load_27b_dflash2(std::path::Path::new(dir), &mut self.face).await?;
-                eprintln!("[boot] DFlash2 草稿装载(depth={spec_depth};1.92B f16)");
+                eprintln!("[boot] DFlash2 草稿装载(depth={spec_depth};1.92B BF16 激活,sglang 对齐)");
                 Some(crate::running::Drafter::DFlash2(std::sync::Arc::new(d2)))
             }
             _ => None,
@@ -327,7 +327,14 @@ impl<D: DeviceClient + 'static> Engine<D> {
                 OutputSlot { name: "hid".into(), shape: vec![depth1, dims.hidden], dtype: dims.dtype },
             ];
             // DFlash2 target taps(E5-DF2;层输出残差流,sglang capture 同语义)
-            let dflash_taps = matches!(spec_mode, crate::running::SpecMode::DFlash2);
+            // OWL_DFLASH_NOTAPS=1 → 退回 last_hidden(排查开关:隔离 taps 图)
+            let dflash_taps = matches!(spec_mode, crate::running::SpecMode::DFlash2)
+                && std::env::var_os("OWL_DFLASH_NOTAPS").is_none();
+            // TAPDECL:声明期 tapped(收集)但不挂输出槽 —— 二分「tap 节点
+            // 本身」vs「输出槽机制」(2026-10-07 恒等门排查)
+            let dflash_tap_decl = dflash_taps
+                || (matches!(spec_mode, crate::running::SpecMode::DFlash2)
+                    && std::env::var_os("OWL_DFLASH_TAPDECL").is_some());
             if dflash_taps {
                 for i in 0..5 {
                     vouts.push(OutputSlot { name: format!("tap{i}"), shape: vec![depth1, dims.hidden], dtype: dims.dtype });
@@ -395,10 +402,12 @@ impl<D: DeviceClient + 'static> Engine<D> {
                         std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
                     ctx.gdn_tap = Some(tap.clone());
                     let vocab = model_v.vocab_size();
-                    let (hidden, taps) = if dflash_taps {
+                    let (hidden, taps) = if dflash_tap_decl {
                         let (h, t) = model_v.tapped_hidden(&ids, &ctx, &[5, 19, 33, 47, 61]);
-                        for (i, t) in t.iter().enumerate() {
-                            sc.output(format!("tap{i}"), t)?;
+                        if dflash_taps {
+                            for (i, t) in t.iter().enumerate() {
+                                sc.output(format!("tap{i}"), t)?;
+                            }
                         }
                         (h, t)
                     } else {
@@ -654,7 +663,16 @@ impl<D: DeviceClient + 'static> Engine<D> {
             propose_graphs,
             spec_drafts_host: None,
             draft_rope,
-            dflash_tap_count: if matches!(spec_mode, crate::running::SpecMode::DFlash2) { 5 } else { 0 },
+            dflash_tap_count: if matches!(spec_mode, crate::running::SpecMode::DFlash2)
+                && std::env::var_os("OWL_DFLASH_NOTAPS").is_none()
+            {
+                5
+            } else {
+                0
+            },
+            dflash_mem_dumped: false,
+            dflash_mem_dumped2: false,
+            dflash_hid_dumped: false,
             spec_seed_hidden: None,
             spec_stats: crate::running::SpecStats::default(),
             spec_snap_valid: false,

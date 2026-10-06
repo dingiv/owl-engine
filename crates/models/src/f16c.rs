@@ -37,6 +37,19 @@ pub fn bf16_bytes_to_f16_bytes(src: &[u8], dst: &mut [u8]) {
     }
 }
 
+/// f16 字节 → bf16 字节(E5-DF3 同日十四;装载器 BF16 want 安全网 ——
+/// W4A16/BF16 检查点 passthrough 权重原生 BF16,直拷臂为主路径,本
+/// 转换只服务 f16 源testdata/小权重)。f16→f32 精确展宽,f32→bf16 =
+/// half::bf16 RNE 舍入(尾数 10→7 位截断,与 sglang .to(bf16) 同式)。
+#[inline]
+pub fn f16_bytes_to_bf16_bytes(src: &[u8], dst: &mut [u8]) {
+    debug_assert!(dst.len() >= src.len());
+    for (i, c) in src.chunks_exact(2).enumerate() {
+        let f = half::f16::from_le_bytes([c[0], c[1]]).to_f32();
+        dst[i * 2..i * 2 + 2].copy_from_slice(&half::bf16::from_f32(f).to_le_bytes());
+    }
+}
+
 /// U4 仿射反量化 → f16 字节(U4B8 语义:w = (q-8) × scale)。
 /// 行主序 [out, k];packed i32 [out, k/8](LSB-first 每 i32 8 nibble);
 /// scales f32 [out, k/128]。128 % 8 == 0 ⇒ 每个 i32 的 8 个 nibble

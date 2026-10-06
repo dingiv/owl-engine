@@ -99,6 +99,22 @@ impl W4A16Source {
         })
     }
 
+    /// 反量化口(测试/对拍用):量化基线性 → f32(dequant_u4 精确展宽)
+    pub fn dequant_linear(&self, base: &str) -> Option<Vec<f32>> {
+        let (out, k, pe, se) = self.linear_dims(base)?;
+        let packed_bytes = &self.maps[pe.map_ix][pe.start..pe.start + pe.nbytes];
+        let packed = i32s_par(packed_bytes);
+        let scale_bytes = &self.maps[se.map_ix][se.start..se.start + se.nbytes];
+        let scales_f32 = scales_par(se.dtype, scale_bytes);
+        let mut dst = vec![0u8; out * k * 2];
+        dequant_u4_affine_f16_bytes(&packed, &scales_f32, out, k, &mut dst);
+        Some(
+            dst.chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect(),
+        )
+    }
+
     /// 诊断口:索引键全集(装载面排查/基准用;不含派生键 qweight/scales/ws)
     pub fn keys(&self) -> Vec<String> {
         self.index.keys().cloned().collect()
@@ -119,6 +135,19 @@ impl W4A16Source {
         if key.ends_with(".marlin_ws") || key.ends_with(".marlin_ctmp") {
             return Some(Resolved::Zeroed);
         }
+        // DFlash2 fc 列块五拆派生(E5-DF3.5):`fc_{i}.qweight/.scales` =
+        // fc.weight_packed/scale 列块 i(in 维 [i*5120,(i+1)*5120);
+        // packed [out, k/8] 列连续 ↔ in 连续,块宽 640/40)
+        if let Some(base) = key.strip_suffix(".qweight") {
+            if let Some(i) = fc_block_index(base) {
+                return Some(Resolved::Bytes(self.fc_block_bytes(i, false)?, Dtype::U32));
+            }
+        }
+        if let Some(base) = key.strip_suffix(".scales") {
+            if let Some(i) = fc_block_index(base) {
+                return Some(Resolved::Bytes(self.fc_block_bytes(i, true)?, Dtype::F16));
+            }
+        }
         if let Some(base) = key.strip_suffix(".qweight") {
             return Some(Resolved::Bytes(self.linear_bytes_for(base, key)?, Dtype::U32));
         }
@@ -136,6 +165,69 @@ impl W4A16Source {
             }
         }
         None
+    }
+
+    /// fc 列块物化(E5-DF3.5):fc.weight_packed [5120, 3200] I32 列子阵
+    /// + fc.weight_scale [5120, 200] F16 列子阵 → (out=5120, k=5120) 走
+    /// 与 build_linear 同式的 marlin 重排(qweight U32 / scales F16)。
+    /// 列块恒 eligible(n=5120 % 256 == 0,k=5120 % 128 == 0)。
+    fn fc_block_bytes(&self, blk: usize, scales_side: bool) -> Option<Arc<[u8]>> {
+        let vkey = format!("fc_block_{blk}_{}", if scales_side { "s" } else { "q" });
+        {
+            let cache = self.cache.lock().unwrap();
+            if let Some(b) = cache.0.get(&vkey) {
+                return Some(b.clone());
+            }
+        }
+        let pe = self.index.get("fc.weight_packed")?;
+        let se = self.index.get("fc.weight_scale")?;
+        let out = *pe.shape.first()?;
+        let packed_cols = *pe.shape.get(1)?; // k_all / 8 = 3200
+        let n_fc = 5usize;
+        let cols = packed_cols / n_fc; // 640
+        let scol = *se.shape.get(1)? / n_fc; // 40
+        let _g = self.build_lock.lock().unwrap();
+        let packed_bytes = &self.maps[pe.map_ix][pe.start..pe.start + pe.nbytes];
+        let packed_all = i32s_par(packed_bytes);
+        let scale_bytes = &self.maps[se.map_ix][se.start..se.start + se.nbytes];
+        let scales_all = scales_par(se.dtype, scale_bytes);
+        // 列子阵提取(packed 行主序 [out, 3200] → 行内 [blk*640, +640))
+        let k = cols * 8 / n_fc * n_fc / n_fc; // 5120 = cols*8(单块)
+        let k_blk = cols * 8; // = 5120
+        let _ = k;
+        let mut packed = Vec::with_capacity(out * cols);
+        for r in 0..out {
+            packed.extend_from_slice(&packed_all[r * packed_cols + blk * cols..r * packed_cols + (blk + 1) * cols]);
+        }
+        let mut scales = Vec::with_capacity(out * scol);
+        for r in 0..out {
+            scales.extend_from_slice(&scales_all[r * (scol * n_fc) + blk * scol..r * (scol * n_fc) + (blk + 1) * scol]);
+        }
+        let out_b = out as u32;
+        let _ = out_b;
+        let buf: Arc<[u8]> = if scales_side {
+            let s = pack_marlin_s(&scales, out, k_blk / 128);
+            // BF16 激活 marlin 要求 s_type = BF16:f16 位型字节 → bf16 位型
+            Arc::from(f16_bytes_to_bf16_bytes(&u16s_le_bytes(&s)).into_boxed_slice())
+        } else {
+            let mut q_buf: Vec<u8> = Vec::new();
+            unpack_nibbles_into(&packed, out, k_blk, &mut q_buf);
+            let idx = self
+                .idx_cache
+                .lock()
+                .unwrap()
+                .entry((k_blk, out))
+                .or_insert_with(|| Arc::new(marlin_gather_indices(k_blk, out)))
+                .clone();
+            let words = out * k_blk / 8;
+            let mut b_buf: Vec<i32> = Vec::new();
+            pack_marlin_b_gather_into(&q_buf, &idx, words, &mut b_buf);
+            Arc::from(i32s_le_bytes(&b_buf).into_boxed_slice())
+        };
+        let mut cache = self.cache.lock().unwrap();
+        cache.0.insert(vkey.clone(), buf.clone());
+        cache.1 += buf.len();
+        Some(buf)
     }
 
     /// 量化线性物化(键首触才建;qweight/scales 成对,weight 独立)。
@@ -178,7 +270,7 @@ impl W4A16Source {
         let packed_bytes = &self.maps[pe.map_ix][pe.start..pe.start + pe.nbytes];
         let packed = i32s_par(packed_bytes);
         let scale_bytes = &self.maps[se.map_ix][se.start..se.start + se.nbytes];
-        let scales_f32 = bf16_par(scale_bytes);
+        let scales_f32 = scales_par(se.dtype, scale_bytes);
         // 源页消费完毕即还(DONTNEED;file-backed clean page 再访重新缺页)
         self.maps[pe.map_ix].dontneed(pe.start, pe.nbytes);
         self.maps[se.map_ix].dontneed(se.start, se.nbytes);
@@ -205,7 +297,8 @@ impl W4A16Source {
             ));
             inserts.push((
                 format!("{base}.scales"),
-                Arc::from(u16s_le_bytes(&s).into_boxed_slice()),
+                // BF16 激活 marlin:s_type = BF16(位型转换,见 f16_bytes_to_bf16_bytes)
+                Arc::from(f16_bytes_to_bf16_bytes(&u16s_le_bytes(&s)).into_boxed_slice()),
                 s.len() * 2,
             ));
         } else {
@@ -280,6 +373,23 @@ impl WeightSource for W4A16Source {
         // 元数据键(I64 [out,in])owl 不消费,拒绝可取化
         if key.ends_with(".weight_shape") {
             return None;
+        }
+        // fc 列块派生(E5-DF3.5):fc_{i}.qweight = out*640 U32 /
+        // fc_{i}.scales = out*40 F16;fc_{i}.weight = out*5120 F16(反量化)
+        if let Some(base) = key.strip_suffix(".qweight") {
+            if fc_block_index(base).is_some() {
+                return Some(5120 * 640);
+            }
+        }
+        if let Some(base) = key.strip_suffix(".scales") {
+            if fc_block_index(base).is_some() {
+                return Some(5120 * 40);
+            }
+        }
+        if let Some(base) = key.strip_suffix(".weight") {
+            if fc_block_index(base).is_some() {
+                return Some(5120 * 5120);
+            }
         }
         // 派生键:尺寸由基线性形状推导;谓词门控(eligible → qweight/scales/
         // ws/ctmp;non-eligible → weight),错位键报 None 免误消费
@@ -370,7 +480,10 @@ impl WeightSource for W4A16Source {
                 Some(())
             }
             Resolved::View(e) => {
-                if dtype != Dtype::F16 {
+                // F16 want(存量主路径)/ BF16 want(E5-DF3 同日十四;DFlash2
+                // 草稿 BF16 化 —— passthrough 权重原生 BF16,直拷零转换,
+                // sglang .to(bf16) 同位)
+                if dtype != Dtype::F16 && dtype != Dtype::BF16 {
                     return None;
                 }
                 let src_esz = match e.dtype {
@@ -380,15 +493,29 @@ impl WeightSource for W4A16Source {
                 };
                 let s = e.start + offset_elems * src_esz;
                 let win = &self.maps[e.map_ix][s..s + len * src_esz];
-                match e.dtype {
-                    safetensors::Dtype::F16 => dst[..need].copy_from_slice(win),
-                    safetensors::Dtype::BF16 => bf16_bytes_to_f16_bytes(win, &mut dst[..need]),
-                    safetensors::Dtype::F32 => {
+                match (e.dtype, dtype) {
+                    (safetensors::Dtype::F16, Dtype::F16) => dst[..need].copy_from_slice(win),
+                    (safetensors::Dtype::BF16, Dtype::F16) => {
+                        bf16_bytes_to_f16_bytes(win, &mut dst[..need])
+                    }
+                    (safetensors::Dtype::F16, Dtype::BF16) => {
+                        let conv = f16_bytes_to_bf16_bytes(win);
+                        dst[..need].copy_from_slice(&conv);
+                    }
+                    (safetensors::Dtype::BF16, Dtype::BF16) => dst[..need].copy_from_slice(win),
+                    (safetensors::Dtype::F32, Dtype::F16) => {
                         // F32 passthrough 仅 GDN 标量小张量,标量循环足够
                         for (i, c) in win.chunks_exact(4).enumerate() {
                             let f = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
                             dst[i * 2..i * 2 + 2]
                                 .copy_from_slice(&half::f16::from_f32(f).to_le_bytes());
+                        }
+                    }
+                    (safetensors::Dtype::F32, Dtype::BF16) => {
+                        for (i, c) in win.chunks_exact(4).enumerate() {
+                            let f = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                            dst[i * 2..i * 2 + 2]
+                                .copy_from_slice(&half::bf16::from_f32(f).to_le_bytes());
                         }
                     }
                     _ => return None,
@@ -432,6 +559,19 @@ pub(crate) fn i32s_par(bytes: &[u8]) -> Vec<i32> {
     v
 }
 
+/// f16 位型字节 → BF16 位型字节(E5-DF3 同日十二:syvai W4A16 的 scales
+/// = F16,而 BF16 激活的 marlin 实例要求 s_type = BF16;值经 f32 中转,
+/// 尾数 10→7 位 ≈ 0.4% 相对误差,远小于量化噪声)。
+fn f16_bytes_to_bf16_bytes(bytes: &[u8]) -> Vec<u8> {
+    bytes
+        .chunks_exact(2)
+        .map(|c| {
+            half::bf16::from_f32(half::f16::from_le_bytes([c[0], c[1]]).to_f32()).to_le_bytes()
+        })
+        .flatten()
+        .collect::<Vec<u8>>()
+}
+
 pub(crate) fn bf16_par(bytes: &[u8]) -> Vec<f32> {
     use rayon::prelude::*;
     let n = bytes.len() / 2;
@@ -447,6 +587,34 @@ pub(crate) fn bf16_par(bytes: &[u8]) -> Vec<f32> {
             }
         });
     v
+}
+
+/// F16 平行读(2026-10-07 E5-DF3 定谳:syvai W4A16 的 weight_scale = F16
+/// 标注 + F16 字节,曾全走 bf16_par 按 BF16 位型读 → 草稿全部 W4A16 权重
+/// = 噪声 → 草稿前向废 → AL=0。scale 读法必须按 index 声明 dtype 分派。
+/// 对照检验:两种读法对 z-lab BF16 源 fc 权重做相关,F16 读 0.977 /
+/// BF16 读 0.016。)
+pub(crate) fn f16_par(bytes: &[u8]) -> Vec<f32> {
+    use rayon::prelude::*;
+    let n = bytes.len() / 2;
+    let mut v = vec![0f32; n];
+    v.par_chunks_mut(1 << 16)
+        .enumerate()
+        .for_each(|(t, chunk)| {
+            for (i, cell) in chunk.iter_mut().enumerate() {
+                let o = (t * (1 << 16) + i) * 2;
+                *cell = half::f16::from_le_bytes([bytes[o], bytes[o + 1]]).to_f32();
+            }
+        });
+    v
+}
+
+/// scale 平行读分派:按 RawEntry 声明 dtype 选 F16/BF16 位型
+pub(crate) fn scales_par(dt: safetensors::Dtype, bytes: &[u8]) -> Vec<f32> {
+    match dt {
+        safetensors::Dtype::F16 => f16_par(bytes),
+        _ => bf16_par(bytes),
+    }
 }
 
 fn f32_bytes_to_f16(bytes: &[u8]) -> Vec<u8> {
@@ -468,4 +636,14 @@ pub(crate) fn i32s_le_bytes(v: &[i32]) -> Vec<u8> {
 
 pub(crate) fn u16s_le_bytes(v: &[u16]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+/// DFlash2 fc 列块键解析:`fc_{i}`(i < 5)→ Some(i);其余 None。
+fn fc_block_index(base: &str) -> Option<usize> {
+    let idx = base.strip_prefix("fc_")?;
+    if idx.len() != 1 || !idx.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let i = idx.parse::<usize>().ok()?;
+    (i < 5).then_some(i)
 }

@@ -118,6 +118,10 @@ pub static REGISTRY: &[Entry] = &[
     Entry { name: "owl_sigmoid_f16", source: sources::OPS_F16, args: "T,T,sz", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_silu_f16", source: sources::OPS_F16, args: "T,T,sz", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_rmsnorm_f16", source: sources::OPS_F16, args: "T,T,T,i32,f32,i32", dtype: crate::contract::Dtype::F16 },
+    // bf16 语义算子(E5-DF3 同日十四;fc 部分和累加 add_bf16 + 各 norm rmsnorm_bf16)
+    Entry { name: "owl_add_bf16", source: sources::OPS_F16, args: "T,T,T,sz", dtype: crate::contract::Dtype::BF16 },
+    Entry { name: "owl_mul_bf16", source: sources::OPS_F16, args: "T,T,T,sz", dtype: crate::contract::Dtype::BF16 },
+    Entry { name: "owl_rmsnorm_bf16", source: sources::OPS_F16, args: "T,T,T,i32,f32,i32", dtype: crate::contract::Dtype::BF16 },
     // ---- 模型琐核 f16 变体(F3;embed/rope 同源文件追加,narrow 在 attention.cu)----
     Entry { name: "owl_embed_f16", source: text::EMBED_F32, args: "T,T,sz,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_rope_half_partial_f16", source: text::ROPE_HALF_PARTIAL_F32, args: "T,T,T,T,sz,sz,sz,T", dtype: crate::contract::Dtype::F16 },
@@ -143,8 +147,13 @@ pub static REGISTRY: &[Entry] = &[
     Entry { name: "vllm_reshape_and_cache_f16", source: sources::attention::RESHAPE_AND_CACHE_F16, args: "T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_reshape_and_cache_dual_f16", source: sources::attention::RESHAPE_AND_CACHE_DUAL_F16, args: "T,T,T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_reshape_and_cache_dual_f16_fp8kv", source: sources::attention::RESHAPE_AND_CACHE_DUAL_F16_FP8KV, args: "T,T,T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    // K0 BF16(DFlash2 草稿池;同日十四)
+    Entry { name: "vllm_reshape_and_cache_bf16", source: sources::attention::RESHAPE_AND_CACHE_F16, args: "T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::BF16 },
     Entry { name: "owl_cast_f16_f32", source: sources::attention::CAST, args: "T,i32,T", dtype: crate::contract::Dtype::F32 },
     Entry { name: "owl_cast_f32_f16", source: sources::attention::CAST, args: "T,i32,T", dtype: crate::contract::Dtype::F16 },
+    // f16 <-> bf16 铸边界(E5-DF3 同日十四;embed 后入草稿 / lm_head 前出草稿)
+    Entry { name: "owl_cast_f16_bf16", source: sources::attention::CAST, args: "T,i32,T", dtype: crate::contract::Dtype::BF16 },
+    Entry { name: "owl_cast_bf16_f16", source: sources::attention::CAST, args: "T,i32,T", dtype: crate::contract::Dtype::F16 },
     // prefill bs16 变体(池页 16,与 decode v1/v2 同池;hd256 = qwen3.5-0.8B 档)
     // prefill 主条目 = bs32(vendor 契约 BLOCK∈{32,64};bs16 越契约已废)
     Entry { name: "vllm_chunked_prefill_paged_attn_opt_f16_hd128", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
@@ -183,22 +192,32 @@ pub static REGISTRY: &[Entry] = &[
     // 分组动态深度 2-tap 卷积(delta [T,2,2,G] side-major + base [2,2,H];
     // 位置掩码 t%block;group=16 烘焙;propose T=8 定形,extend 不走本核)
     Entry { name: "owl_dflash_conv_f16", source: sources::owl::DFLASH2_F16, args: "T,T,T,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    // 逐行 top-16(单缓冲 [rows, 32]:值半区降序 + 索引半区,双 f32)
+    // BF16 变体(同日十四;草稿路径 BF16 化,权重原生 BF16)
+    Entry { name: "owl_dflash_conv_bf16", source: sources::owl::DFLASH2_F16, args: "T,T,T,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::BF16 },
+    // 逐行 top-16(单缓冲 [rows, 32]:值半区降序 + 索引半区,双 f32;
+    // 无 bf16 变体 —— lm_head 铸边界前 logits 恒 f16)
     Entry { name: "owl_topk16_f16", source: sources::owl::DFLASH2_F16, args: "T,i32,T", dtype: crate::contract::Dtype::F32 },
     // selector 格打分 + 贪心 walk 融合(单缓冲 [S·(K·K+1)]:toks + scores)
     Entry { name: "owl_dflash_select_f16", source: sources::owl::DFLASH2_F16, args: "T,T,T,T,T,T,i32,i32,i32,T", dtype: crate::contract::Dtype::F32 },
+    // selector BF16 变体(proj/a_tab/b_tab bf16,码本原生 BF16;cand/unary/out f32)
+    Entry { name: "owl_dflash_select_bf16", source: sources::owl::DFLASH2_F16, args: "T,T,T,T,T,T,i32,i32,i32,T", dtype: crate::contract::Dtype::F32 },
     // 非因果块 attention(自块直读 + 前缀池;classic 寻址同 reshape_and_cache)
     Entry { name: "owl_naive_attn_nc_f16", source: sources::owl::DFLASH2_F16, args: "T,T,T,T,T,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "owl_naive_attn_nc_bf16", source: sources::owl::DFLASH2_F16, args: "T,T,T,T,T,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::BF16 },
     // ---- 融合核族(C1;2026-10-01;Ampere-first,单输出 SSA 契约友好)----
     // norm_rope:qk-norm(×(1+w)^{w_off})+ rotate-half partial rope 三发合一
     // (narrow+norm+rope;strided 读 q_raw 的 per-head [value|gate] 半段)
     Entry { name: "owl_norm_rope_f16", source: sources::owl::NORM_ROPE_F16, args: "T,T,T,T,T,f32,sz,sz,sz,i32,T", dtype: crate::contract::Dtype::F16 },
+    // norm_rope BF16(x/w/out bf16,cos/sin f16 共享表;同日十四)
+    Entry { name: "owl_norm_rope_bf16", source: sources::owl::NORM_ROPE_F16, args: "T,T,T,T,T,f32,sz,sz,sz,i32,T", dtype: crate::contract::Dtype::BF16 },
     // silu_and_mul:SwiGLU 门控 silu(g)⊙u 双输入单输出(vLLM 语义 port;
     // 替 gate.silu().mul(up) 两发,float 中间,中间量化消除)
     Entry { name: "owl_silu_and_mul_f16", source: sources::owl::SILU_AND_MUL_F16, args: "T,T,sz,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "owl_silu_and_mul_bf16", source: sources::owl::SILU_AND_MUL_F16, args: "T,T,sz,T", dtype: crate::contract::Dtype::BF16 },
     // fused_add_rmsnorm:residual 原地 += mixed(副作用律)+ rmsnorm·w 单输出
     // (vLLM layernorm_kernels.cu fused_add_rms_norm port;decoder 双残差之一)
     Entry { name: "owl_fused_add_rmsnorm_f16", source: sources::owl::FUSED_ADD_RMSNORM_F16, args: "T,T,T,f32,sz,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "owl_fused_add_rmsnorm_bf16", source: sources::owl::FUSED_ADD_RMSNORM_F16, args: "T,T,T,f32,sz,i32,T", dtype: crate::contract::Dtype::BF16 },
     // qknorm_rope_kv_insert:q norm+rope → q_out;k norm+rope → key_cache 散写;
     // v → value_cache(minimax_m3 同款 (token,head-slot) 结构,三发合一)
     Entry { name: "owl_qknorm_rope_kv_insert_f16", source: sources::owl::QKNORM_ROPE_KV_INSERT_F16, args: "T,T,T,T,T,T,T,T,T,T,T,f32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },

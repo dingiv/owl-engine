@@ -62,6 +62,8 @@ pub struct Hw {
 pub enum DType {
     F16,
     F32,
+    /// BF16(E5-DF3 同日十四;DFlash2 草稿路径 BF16 化分派臂)
+    BF16,
     /// 装载域 ct packed(U32;owl_ct_repack_u32)
     U32,
 }
@@ -133,7 +135,7 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "gdn.recurrence_varlen_gqa" => gdn::recurrence_varlen_gqa(dt, ax(2), ax(0), ax(1)), // aux = [nv, kd, vd]
         "gdn.norm_act" => gdn::norm_act(dt, ax(0), ax(1), ax(2)), // aux = [rows, value_dim, group_size]
         "ops.sigmoid" => ops::sigmoid(dt),
-        "attn.k0_write" => attn::k0_write(ax(0)),
+        "attn.k0_write" => attn::k0_write(dt, ax(0)),
         "attn.k0_dual" => attn::k0_dual(ax(0)),
         "attn.k0_dual_fp8kv" => attn::k0_dual_fp8kv(ax(0)),
         "attn.paged_decode" => attn::paged_decode_v1(req.env, dt, ax(0), ax(1), ax(2), ax(3)), // aux = [hd, hq, hkv, nb]
@@ -216,7 +218,7 @@ pub mod gdn {
         KernelPick { name: match dt {
             DType::F16 => "owl_gdn_gating_g_f16",
             DType::F32 => "owl_gdn_gating_g_f32",
-            DType::U32 => unimplemented!("GDN 族无 U32 变体"),
+            DType::BF16 | DType::U32 => unimplemented!("GDN 族无 U32 变体"),
         }, shape: SENTINEL_1D }
     }
 
@@ -226,7 +228,7 @@ pub mod gdn {
             name: match dt {
                 DType::F16 => "owl_gdn_l2norm_f16",
                 DType::F32 => "owl_gdn_l2norm_f32",
-                DType::U32 => unimplemented!("GDN 族无 U32 变体"),
+                DType::BF16 | DType::U32 => unimplemented!("GDN 族无 U32 变体"),
             },
             shape: Shape { grid: (rows as u32, 1, 1), ..SENTINEL_1D },
         }
@@ -237,7 +239,7 @@ pub mod gdn {
         KernelPick { name: match dt {
             DType::F16 => "owl_gdn_conv_upd_f16",
             DType::F32 => "owl_gdn_conv_upd_f32",
-            DType::U32 => unimplemented!("GDN 族无 U32 变体"),
+            DType::BF16 | DType::U32 => unimplemented!("GDN 族无 U32 变体"),
         }, shape: SENTINEL_1D }
     }
 
@@ -256,7 +258,7 @@ pub mod gdn {
             name: match dt {
                 DType::F16 => "owl_gdn_delta_dec_f16",
                 DType::F32 => "owl_gdn_delta_dec_f32",
-                DType::U32 => unimplemented!("GDN 族无 U32 变体"),
+                DType::BF16 | DType::U32 => unimplemented!("GDN 族无 U32 变体"),
             },
             shape: Shape {
                 grid: (((vd + 63) / 64) as u32, (batch * nv) as u32, 1),
@@ -334,7 +336,7 @@ pub mod gdn {
             name: match dt {
                 DType::F16 => "owl_gdn_norm_act_f16",
                 DType::F32 => "owl_gdn_norm_act_f32",
-                DType::U32 => unimplemented!("GDN 族无 U32 变体"),
+                DType::BF16 | DType::U32 => unimplemented!("GDN 族无 U32 变体"),
             },
             shape: Shape {
                 grid: ((rows * value_dim / group_size) as u32, 1, 1),
@@ -357,7 +359,7 @@ pub mod ops {
             name: match dt {
                 DType::F16 => "owl_sigmoid_f16",
                 DType::F32 => "owl_sigmoid_f32",
-                DType::U32 => unimplemented!("sigmoid 无 U32 变体"),
+                DType::BF16 | DType::U32 => unimplemented!("sigmoid 无 U32 变体"),
             },
             shape: SENTINEL_1D,
         }
@@ -371,10 +373,15 @@ pub mod ops {
 pub mod attn {
     use super::{DType, Hw, KernelPick, OpEnv, Shape, SENTINEL_1D};
 
-    /// K0 批量写池(reshape_and_cache;grid (tokens,1,1),block 256)
-    pub fn k0_write(tokens: usize) -> KernelPick {
+    /// K0 批量写池(reshape_and_cache;grid (tokens,1,1),block 256)。
+    /// dt 分派(E5-DF3 同日十四):F16 → f16 核;BF16 → bf16 核(草稿池)。
+    pub fn k0_write(dt: DType, tokens: usize) -> KernelPick {
         KernelPick {
-            name: "vllm_reshape_and_cache_f16",
+            name: match dt {
+                DType::F16 => "vllm_reshape_and_cache_f16",
+                DType::BF16 => "vllm_reshape_and_cache_bf16",
+                other => unimplemented!("k0_write 无 {other:?} 变体"),
+            },
             shape: Shape { grid: (tokens as u32, 1, 1), block: (256, 1, 1), smem: 0 },
         }
     }
@@ -582,7 +589,7 @@ pub mod attn {
             name: match dt {
                 DType::F16 => "owl_naive_decode_attn_f16",
                 DType::F32 => "owl_naive_decode_attn_f32",
-                DType::U32 => unimplemented!("naive attn 无 U32 变体"),
+                DType::BF16 | DType::U32 => unimplemented!("naive attn 无 U32 变体"),
             },
             shape: SENTINEL_1D,
         }
@@ -598,10 +605,15 @@ pub mod attn {
     /// (narrow+norm+rope 三发合一;strided 读 q_raw 的 per-head 半段)。
     /// grid (tokens, heads, 1);block (hd,1,1);smem = hd·4B(行内归约)。
     /// aux = [tokens, heads, hd];w_off/eps/stride/half 走核参数槽(层语义)。
+    /// BF16 臂(E5-DF3 同日十四):x/w/out bf16,cos/sin 表 f16 共享。
     pub fn norm_rope(dt: DType, tokens: usize, heads: usize, hd: usize) -> KernelPick {
-        assert!(matches!(dt, DType::F16), "owl_norm_rope 仅有 f16 变体(dt={dt:?})");
+        let name = match dt {
+            DType::F16 => "owl_norm_rope_f16",
+            DType::BF16 => "owl_norm_rope_bf16",
+            other => panic!("owl_norm_rope 无 {other:?} 变体"),
+        };
         KernelPick {
-            name: "owl_norm_rope_f16",
+            name,
             shape: Shape {
                 grid: (tokens as u32, heads as u32, 1),
                 block: (hd as u32, 1, 1),
@@ -651,10 +663,15 @@ pub mod ln {
     /// fused_add_rmsnorm:residual 原地 += mixed;out = rmsnorm(residual)·w。
     /// grid (rows,1,1);block 256;smem 256·4B(行分段归约)。
     /// aux = [rows, n]。**副作用律**:residual 块原地写(conv_upd 同款)。
+    /// BF16 臂(E5-DF3 同日十四;DFlash2 草稿层残差流)。
     pub fn fused_add_rmsnorm(dt: DType, rows: usize, _n: usize) -> KernelPick {
-        assert!(matches!(dt, DType::F16), "owl_fused_add_rmsnorm 仅有 f16 变体");
+        let name = match dt {
+            DType::F16 => "owl_fused_add_rmsnorm_f16",
+            DType::BF16 => "owl_fused_add_rmsnorm_bf16",
+            other => panic!("owl_fused_add_rmsnorm 无 {other:?} 变体"),
+        };
         KernelPick {
-            name: "owl_fused_add_rmsnorm_f16",
+            name,
             shape: Shape { grid: (rows as u32, 1, 1), block: (256, 1, 1), smem: (256 * 4) as u32 },
         }
     }
@@ -667,15 +684,18 @@ pub mod ln {
 pub mod mlp {
     use super::{DType, KernelPick, Shape};
 
-    /// silu_and_mul:out = silu(g) ⊙ u(双输入单输出;half2 向量化)。
-    /// grid = ceil(n/512);block 256(每线程 2 元素)。
-    /// aux = [n](g/u 同形 [·, n])。
+    /// silu_and_mul:out = silu(g) ⊙ u(双输入单输出;f16 half2 向量化,
+    /// bf16 标量)。aux = [n](g/u 同形 [·, n])。
     pub fn silu_and_mul(dt: DType, n: usize) -> KernelPick {
-        assert!(matches!(dt, DType::F16), "owl_silu_and_mul 仅有 f16 变体(dt={dt:?})");
+        let name = match dt {
+            DType::F16 => "owl_silu_and_mul_f16",
+            DType::BF16 => "owl_silu_and_mul_bf16",
+            other => panic!("owl_silu_and_mul 无 {other:?} 变体(dt={dt:?})"),
+        };
         KernelPick {
-            name: "owl_silu_and_mul_f16",
+            name,
             shape: Shape {
-                grid: ((((n + 1) / 2 + 255) / 256) as u32, 1, 1),
+                grid: if matches!(dt, DType::F16) { ((((n + 1) / 2 + 255) / 256) as u32, 1, 1) } else { (((n + 255) / 256) as u32, 1, 1) },
                 block: (256, 1, 1),
                 smem: 0,
             },

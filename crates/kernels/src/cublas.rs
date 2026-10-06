@@ -28,9 +28,13 @@ use std::sync::Arc;
 /// `[T a, T b, T out, sz m, sz k, sz n, sz nt]`(nt: 1 = owl Linear nt 形)。
 pub const GEMM_F16: &str = "cublas_gemm_f16";
 
+/// BF16 GEMM 外来核名(E5-DF3 同日十四;DFlash2 草稿非量化投影
+/// kernel_projection/hidden_projection 消费;槽序契约同 GEMM_F16)
+pub const GEMM_BF16: &str = "cublas_gemm_bf16";
+
 /// foreign 分派谓词(server handle_launch 前置检查)
 pub fn is_foreign(name: &str) -> bool {
-    name == GEMM_F16
+    name == GEMM_F16 || name == GEMM_BF16
 }
 
 pub struct OwlCublas {
@@ -100,5 +104,51 @@ impl OwlCublas {
             )
         };
         r.map_err(|e| format!("gemm_ex: {e:?}"))
+    }
+
+    /// BF16 GEMM(E5-DF3 同日十四):与 gemm_f16 同式,A/B/out =
+    /// CUDA_R_16BF,累计 CUBLAS_COMPUTE_32F(sglang bf16 同款口径)。
+    pub fn gemm_bf16(
+        &self,
+        a: u64,
+        b: u64,
+        out: u64,
+        m: usize,
+        k: usize,
+        n: usize,
+        nt: bool,
+    ) -> Result<(), String> {
+        let (transa, lda) = if nt {
+            (sys::cublasOperation_t::CUBLAS_OP_T, k as i32)
+        } else {
+            (sys::cublasOperation_t::CUBLAS_OP_N, m as i32)
+        };
+        let b_ptr = b;
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        let r = unsafe {
+            cb::gemm_ex(
+                *self.blas.handle(),
+                transa,
+                sys::cublasOperation_t::CUBLAS_OP_N,
+                m as i32,
+                n as i32,
+                k as i32,
+                &alpha as *const f32 as *const _,
+                b_ptr as *const _,
+                sys::cudaDataType::CUDA_R_16BF,
+                lda,
+                a as *const _,
+                sys::cudaDataType::CUDA_R_16BF,
+                k as i32,
+                &beta as *const f32 as *const _,
+                out as *mut _,
+                sys::cudaDataType::CUDA_R_16BF,
+                m as i32,
+                sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )
+        };
+        r.map_err(|e| format!("gemm_ex bf16: {e:?}"))
     }
 }

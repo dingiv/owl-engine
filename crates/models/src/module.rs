@@ -470,6 +470,16 @@ pub trait WeightSource {
                 }
                 Some(())
             }
+            Dtype::BF16 => {
+                // BF16 want(E5-DF3 同日十四;DFlash2 草稿 BF16 面测试源)
+                if dst.len() < len * 2 {
+                    return None;
+                }
+                for (i, f) in v.iter().enumerate() {
+                    dst[i * 2..i * 2 + 2].copy_from_slice(&half::bf16::from_f32(*f).to_le_bytes());
+                }
+                Some(())
+            }
             _ => None,
         }
     }

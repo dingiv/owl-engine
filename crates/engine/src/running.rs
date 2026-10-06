@@ -129,6 +129,12 @@ pub struct RunningEngine<D: DeviceClient> {
     pub(crate) draft_rope: Option<std::sync::Arc<owl_models::layers::rope::Rope>>,
     /// DFlash2 target taps 数(dflash 模式 = 5;其余 0)
     pub(crate) dflash_tap_count: usize,
+    /// taps/memory 探针落盘一次性门(OWL_DFLASH_PROBE;AL=0 排查)
+    pub(crate) dflash_mem_dumped: bool,
+    /// concat 父块落盘一次性门(同上)
+    pub(crate) dflash_mem_dumped2: bool,
+    /// propose hidden 落盘一次性门(同上)
+    pub(crate) dflash_hid_dumped: bool,
     /// spec 接受账(M2b 恒等门覆盖断言:三路 m 分布 + 账目闭合)
     pub(crate) spec_stats: SpecStats,
     /// spec 快照有效性(轮首拍;恢复后仍有效,全接受后失效重拍)

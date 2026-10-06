@@ -66,13 +66,9 @@ pub(crate) fn ddt(dt: crate::contract::Dtype) -> Result<owl_kernels::driver::DTy
     use owl_kernels::driver::DType;
     Ok(match dt {
         crate::contract::Dtype::F16 => DType::F16,
+        crate::contract::Dtype::BF16 => DType::BF16,
         crate::contract::Dtype::F32 => DType::F32,
         crate::contract::Dtype::U32 => DType::U32,
-        other => {
-            return Err(crate::contract::ModelError::Msg(format!(
-                "driver::resolve: dtype {other:?} 无拾取臂(词表族仅 f16/f32)"
-            )))
-        }
     })
 }
 
@@ -217,7 +213,9 @@ fn dname(base: &str, dtype: crate::contract::Dtype) -> &'static str {
     match dtype {
         crate::contract::Dtype::F32 => to_static(concat_op(base, "f32")),
         crate::contract::Dtype::F16 => to_static(concat_op(base, "f16")),
-        other => panic!("dname: 语义算子不支持 {other:?}(f16 基线:仅 F32/F16)"),
+        // bf16 臂(E5-DF3 同日十四;owl_add_bf16/owl_mul_bf16/owl_rmsnorm_bf16)
+        crate::contract::Dtype::BF16 => to_static(concat_op(base, "bf16")),
+        other => panic!("dname: 语义算子不支持 {other:?}(f16 基线:仅 F32/F16/BF16)"),
     }
 }
 
@@ -249,12 +247,13 @@ pub fn lower_gemm(
     k: usize,
     n: usize,
     nt: bool,
+    bf16: bool,
 ) -> LaunchMsg {
     LaunchMsg {
-        // 核名 = 线契约常量(权威定义 owl-kernels::cublas::GEMM_F16;
+        // 核名 = 线契约常量(权威定义 owl-kernels::cublas::GEMM_F16 / GEMM_BF16;
         // models 不开 cublas feature,此处字面量对齐,测试互证)
         kernel: KernelSpec {
-            name: "cublas_gemm_f16".to_string(),
+            name: if bf16 { "cublas_gemm_bf16".to_string() } else { "cublas_gemm_f16".to_string() },
             source: String::new(),
         },
         args: vec![

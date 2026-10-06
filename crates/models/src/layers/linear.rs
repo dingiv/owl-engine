@@ -10,7 +10,7 @@ use crate::layers::narrow_strided;
 use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, QuantPlan, Weight};
 use crate::formats::w4a16::marlin_n_pack;
 use crate::TensorOps;
-use owl_kernels::marlin::{v2_workspace_len, GEMM_W4A16, GEMM_W4A16_AWQ};
+use owl_kernels::marlin::{v2_workspace_len, GEMM_W4A16, GEMM_W4A16_AWQ, GEMM_W4A16_BF16};
 
 pub struct Linear {
     /// 权重槽 [out, in](检查点原生布局,零转置)
@@ -134,19 +134,29 @@ impl Module for Linear {
             let m: usize = xs.shape()[..xs.shape().len() - 1].iter().product();
             // n_pack = 打包档(= out_dim;pad 路线废案)
             let n_pack = marlin_n_pack(self.out_dim);
-            let (name, sig, args): (&str, &str, Vec<TensorOps>) = match &self.zs {
+            // 激活 dtype 决定臂:F16 → GEMM_W4A16;BF16 → GEMM_W4A16_BF16
+            // (E5-DF3 同日十二:草稿路径 BF16 化,scales 保持 F16 装载,
+            // a/c=BF16 的 marlin 实例;s_type = F16 两族一致)
+            let bf16_act = xs.dtype == Dtype::BF16;
+            let (name, sig, args): (&str, &str, Vec<TensorOps>) = match (&self.zs, bf16_act) {
                 // AWQ kU4 臂:scales 后插 zeros(槽序契约 7 Block)
-                Some(zs) => (
+                (Some(zs), _) => (
                     GEMM_W4A16_AWQ,
                     "T,T,O,T,T,T,T,sz,sz,sz,sz",
                     vec![xs.clone(), qw.decl(), sc.decl(), zs.decl(), ws.decl(), ctmp.decl()],
                 ),
-                None => (
+                (None, true) => (
+                    GEMM_W4A16_BF16,
+                    "T,T,O,T,T,T,sz,sz,sz,sz",
+                    vec![xs.clone(), qw.decl(), sc.decl(), ws.decl(), ctmp.decl()],
+                ),
+                (None, false) => (
                     GEMM_W4A16,
                     "T,T,O,T,T,T,sz,sz,sz,sz",
                     vec![xs.clone(), qw.decl(), sc.decl(), ws.decl(), ctmp.decl()],
                 ),
             };
+            let out_dtype = if bf16_act { Dtype::BF16 } else { Dtype::F16 };
             let mut marlin = TensorOps::of(crate::kernel::Kernel::new(name, "").with_sig(sig));
             for a in &args {
                 marlin = marlin.arg(a);
@@ -156,7 +166,7 @@ impl Module for Linear {
                 .arg_usize(self.in_dim)
                 .arg_usize(n_pack)
                 .arg_usize(g as usize)
-                .with_shape(Dtype::F16, vec![m, n_pack]);
+                .with_shape(out_dtype, vec![m, n_pack]);
             return narrow_strided(
                 &marlin,
                 m,

@@ -33,15 +33,16 @@ impl Module for Mlp {
         let gate = self.gate_proj.forward(xs, ctx);
         let up = self.up_proj.forward(xs, ctx);
         // silu(gate) * up(门控)—— C1 融合:silu_and_mul 单发(float 中间,
-        // 双发中间量化消除);f32 语义组合保留(CPU 锚)
-        let h = if gate.dtype == crate::tensor::Dtype::F16 {
+        // 双发中间量化消除);f32 语义组合保留(CPU 锚)。BF16 臂(E5-DF3
+        // 同日十四;DFlash2 草稿 MLP)同吃融合核(owl_silu_and_mul_bf16)
+        let h = if gate.dtype == crate::tensor::Dtype::F16 || gate.dtype == crate::tensor::Dtype::BF16 {
             let n: usize = gate.shape().iter().product();
             TensorOps::call(crate::ops::ids::MLP_SILU_AND_MUL)
                 .aux(&[n])
                 .arg(&gate)
                 .arg(&up)
                 .arg_usize(n)
-                .with_shape(crate::tensor::Dtype::F16, gate.shape().to_vec())
+                .with_shape(gate.dtype, gate.shape().to_vec())
         } else {
             gate.silu().mul(&up)
         };

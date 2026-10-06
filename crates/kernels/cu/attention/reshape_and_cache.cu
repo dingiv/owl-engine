@@ -74,3 +74,55 @@ extern "C" __global__ void vllm_reshape_and_cache_f16(
         value_cache[tgt_value_idx] = value[src_value_idx];
     }
 }
+
+// ---- BF16 变体(E5-DF3 同日十四;DFlash2 草稿池 BF16)----
+// 全 bf16(key/value/cache 同型;slots f32 / 标量契约不变)。数学无算术,
+// 纯搬运 —— 与 f16 版仅指针类型差。
+#include <cuda_bf16.h>
+
+extern "C" __global__ void vllm_reshape_and_cache_bf16(
+    const __nv_bfloat16* __restrict__ key,
+    const __nv_bfloat16* __restrict__ value,
+    __nv_bfloat16* __restrict__ key_cache,
+    __nv_bfloat16* __restrict__ value_cache,
+    const float* __restrict__ slot_mapping,
+    const int key_stride,
+    const int value_stride,
+    const int num_heads,
+    const int head_size,
+    const int block_size,
+    const int x,
+    __nv_bfloat16* __restrict__ out) {
+    (void)out;
+    const long long token_idx = blockIdx.x;
+    const long long slot_idx = (long long)slot_mapping[token_idx];
+    if (slot_idx < 0) {
+        return;
+    }
+
+    const long long block_idx = slot_idx / block_size;
+    const long long block_offset = slot_idx % block_size;
+
+    const int n = num_heads * head_size;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const long long src_key_idx = token_idx * key_stride + i;
+        const long long src_value_idx = token_idx * value_stride + i;
+
+        const int head_idx = i / head_size;
+        const int head_offset = i % head_size;
+        const int x_idx = head_offset / x;
+        const int x_offset = head_offset % x;
+
+        const long long tgt_key_idx = block_idx * num_heads * (head_size / x) * block_size * x
+                                    + head_idx * (head_size / x) * block_size * x
+                                    + x_idx * block_size * x
+                                    + block_offset * x
+                                    + x_offset;
+        const long long tgt_value_idx = block_idx * num_heads * head_size * block_size
+                                      + head_idx * head_size * block_size
+                                      + head_offset * block_size
+                                      + block_offset;
+        key_cache[tgt_key_idx] = key[src_key_idx];
+        value_cache[tgt_value_idx] = value[src_value_idx];
+    }
+}
