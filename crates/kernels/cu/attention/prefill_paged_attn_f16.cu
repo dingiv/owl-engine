@@ -890,9 +890,12 @@ inline __device__ float fast_tanh_opt(float x) {
 
 // 适配⑧:helper 全集在 namespace vllm(本文件 §前奏);核体全局域经
 // using 指令取用(extern "C" 入口必须留在全局域供 nvrtc 按名寻址)
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+
 using namespace vllm;
 
-template<int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_CHUNK_SIZE>
+template<int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_CHUNK_SIZE, bool KV_FP8 = false>
 __global__ void chunked_prefill_paged_attention_opt_f16(
     uint16_t* __restrict__ out,              
     const uint16_t* __restrict__ q,          
@@ -1134,7 +1137,19 @@ __global__ void chunked_prefill_paged_attention_opt_f16(
                         int gy = d / X;
                         int gx = d % X;
                         long long k_idx = k_base + b * X + gy * (BLOCK_SIZE * X) + gx;
-                        k_vec_local[k] = *reinterpret_cast<const K_vec*>(&k_cache[k_idx]);
+                        if constexpr (KV_FP8) {
+                            // B6.3:fp8 e4m3 读入转 half(元素序同布局)
+                            const unsigned char* k8 = reinterpret_cast<const unsigned char*>(&k_cache[k_idx]);
+                            __half kt[VEC_SIZE];
+                            #pragma unroll
+                            for (int t = 0; t < VEC_SIZE; t++) {
+                                __nv_fp8_e4m3 e; e.__x = k8[t];
+                                kt[t] = __half(__nv_cvt_fp8_to_halfraw(e.__x, __NV_E4M3));
+                            }
+                            k_vec_local[k] = *reinterpret_cast<const K_vec*>(kt);
+                        } else {
+                            k_vec_local[k] = *reinterpret_cast<const K_vec*>(&k_cache[k_idx]);
+                        }
                     }
                     float qk = Qk_dot<uint16_t, THREAD_GROUP_SIZE>::dot(q_vec, k_vec_local) * sm_scale;
                     if (softscapping != 1.0) qk = fast_tanh_opt(qk / softscapping) * softscapping;
@@ -1168,10 +1183,23 @@ __global__ void chunked_prefill_paged_attention_opt_f16(
             L += acc_lane;
 
             for (int k = 0; k < HEAD_SIZE; ++k) {
+                const unsigned char* v_row8 = reinterpret_cast<const unsigned char*>(&v_cache[v_base + (long long)k * BLOCK_SIZE]);
                 const uint16_t* v_row = &v_cache[v_base + (long long)k * BLOCK_SIZE];
                 for (int bv = 0; bv < NUM_BLOCK_VECS; bv++) {
                     Float_vec v_val;
-                    v_val = to_float(*reinterpret_cast<const K_vec*>(v_row + bv * VEC_SIZE));
+                    if constexpr (KV_FP8) {
+                        // B6.3:fp8 V 行读入转 half
+                        __half vt[VEC_SIZE];
+                        const unsigned char* vp = v_row8 + bv * VEC_SIZE;
+                        #pragma unroll
+                        for (int t = 0; t < VEC_SIZE; t++) {
+                            __nv_fp8_e4m3 e; e.__x = vp[t];
+                            vt[t] = __half(__nv_cvt_fp8_to_halfraw(e.__x, __NV_E4M3));
+                        }
+                        v_val = to_float(*reinterpret_cast<const K_vec*>(vt));
+                    } else {
+                        v_val = to_float(*reinterpret_cast<const K_vec*>(v_row + bv * VEC_SIZE));
+                    }
                     acc_vec[k] += dot(p_vec[bv], v_val);
                 }
             }
@@ -1205,6 +1233,17 @@ __global__ void chunked_prefill_paged_attention_opt_f16(
         // ALL threads cooperatively load KV into shared memory
         if (valid_block) {
             const long long k_base = (long long)physical_block * kv_block_stride + (long long)kv_head_idx * kv_head_stride;
+            if constexpr (KV_FP8) {
+                // B6.3:fp8 → f16 转换拷贝(smem 宽度不变,读侧算术复用)
+                const unsigned char* k_src8 = reinterpret_cast<const unsigned char*>(k_cache) + k_base;
+                const unsigned char* v_src8 = reinterpret_cast<const unsigned char*>(v_cache) + k_base;
+                for (int i = tid; i < elems_per_block; i += block_dim) {
+                    __nv_fp8_e4m3 ke; ke.__x = k_src8[i];
+                    __nv_fp8_e4m3 ve; ve.__x = v_src8[i];
+                    k_smem[i] = __half(__nv_cvt_fp8_to_halfraw(ke.__x, __NV_E4M3));
+                    v_smem[i] = __half(__nv_cvt_fp8_to_halfraw(ve.__x, __NV_E4M3));
+                }
+            } else {
             const uint16_t* k_src = k_cache + k_base;
             for (int i = tid; i < elems_per_block; i += block_dim) {
                 k_smem[i] = k_src[i];
@@ -1212,6 +1251,7 @@ __global__ void chunked_prefill_paged_attention_opt_f16(
             const uint16_t* v_src = v_cache + k_base;
             for (int i = tid; i < elems_per_block; i += block_dim) {
                 v_smem[i] = v_src[i];
+            }
             }
         }
         
@@ -1364,6 +1404,69 @@ extern "C" __global__ void vllm_chunked_prefill_paged_attn_opt_f16_hd256(
     const int use_sinks_flag,
     uint16_t* __restrict__ out) {                // OUT(末参,契约 4)
   chunked_prefill_paged_attention_opt_f16<256, 32, 256>(
+      out, q, k_cache, v_cache, num_kv_heads, sm_scale, block_tables, seq_lens,
+      block_table_stride, num_seqs, num_query_heads, num_query_tokens,
+      softscapping, o_stride_tokens, query_start_len, alibi_slopes, sinks,
+      use_alibi_flag, use_sinks_flag, sliding_window, total_num_blocks,
+      kv_block_stride, kv_head_stride);
+}
+
+// ---- B6.3:fp8 e4m3 KV 读变体(chunked prefill;hd128/256)----
+extern "C" __global__ void vllm_chunked_prefill_paged_attn_opt_fp8_hd128(
+    uint16_t* __restrict__ out,
+    const uint16_t* __restrict__ q,
+    const uint16_t* __restrict__ k_cache,
+    const uint16_t* __restrict__ v_cache,
+    int32_t num_kv_heads,
+    float sm_scale,
+    const float* __restrict__ block_tables,
+    const float* __restrict__ seq_lens,
+    int32_t block_table_stride,
+    int32_t num_seqs,
+    int32_t num_query_heads,
+    int32_t num_query_tokens,
+    float softscapping,
+    int32_t o_stride_tokens,
+    const float* __restrict__ query_start_len,
+    const float* __restrict__ alibi_slopes,
+    const float* __restrict__ sinks,
+    const int use_alibi_flag, const int use_sinks_flag,
+    int32_t sliding_window,
+    int32_t total_num_blocks,
+    int32_t kv_block_stride,
+    int32_t kv_head_stride) {
+  chunked_prefill_paged_attention_opt_f16<128, 32, 256, true>(
+      out, q, k_cache, v_cache, num_kv_heads, sm_scale, block_tables, seq_lens,
+      block_table_stride, num_seqs, num_query_heads, num_query_tokens,
+      softscapping, o_stride_tokens, query_start_len, alibi_slopes, sinks,
+      use_alibi_flag, use_sinks_flag, sliding_window, total_num_blocks,
+      kv_block_stride, kv_head_stride);
+}
+
+extern "C" __global__ void vllm_chunked_prefill_paged_attn_opt_fp8_hd256(
+    uint16_t* __restrict__ out,
+    const uint16_t* __restrict__ q,
+    const uint16_t* __restrict__ k_cache,
+    const uint16_t* __restrict__ v_cache,
+    int32_t num_kv_heads,
+    float sm_scale,
+    const float* __restrict__ block_tables,
+    const float* __restrict__ seq_lens,
+    int32_t block_table_stride,
+    int32_t num_seqs,
+    int32_t num_query_heads,
+    int32_t num_query_tokens,
+    float softscapping,
+    int32_t o_stride_tokens,
+    const float* __restrict__ query_start_len,
+    const float* __restrict__ alibi_slopes,
+    const float* __restrict__ sinks,
+    const int use_alibi_flag, const int use_sinks_flag,
+    int32_t sliding_window,
+    int32_t total_num_blocks,
+    int32_t kv_block_stride,
+    int32_t kv_head_stride) {
+  chunked_prefill_paged_attention_opt_f16<256, 32, 256, true>(
       out, q, k_cache, v_cache, num_kv_heads, sm_scale, block_tables, seq_lens,
       block_table_stride, num_seqs, num_query_heads, num_query_tokens,
       softscapping, o_stride_tokens, query_start_len, alibi_slopes, sinks,

@@ -34,6 +34,9 @@ pub mod ids {
     pub const GDN_NORM_ACT: OpId = OpId("gdn.norm_act");
     pub const SIGMOID: OpId = OpId("ops.sigmoid");
     pub const ATTN_K0_WRITE: OpId = OpId("attn.k0_write");
+    pub const ATTN_K0_WRITE_FP8: OpId = OpId("attn.k0_write_fp8");
+    pub const ATTN_PAGED_DECODE_V2_FP8: OpId = OpId("attn.paged_decode_v2_fp8");
+    pub const ATTN_PAGED_PREFILL_FP8: OpId = OpId("attn.paged_prefill_fp8");
     pub const ATTN_K0_DUAL: OpId = OpId("attn.k0_dual");
     pub const ATTN_K0_DUAL_FP8KV: OpId = OpId("attn.k0_dual_fp8kv");
     pub const CAST_F16_F32: OpId = OpId("elems.cast_f16_f32");

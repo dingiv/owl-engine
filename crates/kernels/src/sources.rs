@@ -44,6 +44,8 @@ pub mod attention {
     pub const CAST: &str = include_str!("../cu/owl/cast.cu");
     /// fp8 KV 变体(nvrtc 独立核文件;FI adapter 本体含 flashinfer 头不可 nvrtc)
     pub const RESHAPE_AND_CACHE_DUAL_F16_FP8KV: &str = include_str!("../cu/flashinfer/reshape_and_cache_dual_fp8kv.cu");
+    /// B6.2:K0 批量写池 fp8 变体(f16 输入 → e4m3 池;主池 fp8 承载配套)
+    pub const RESHAPE_AND_CACHE_FP8KV: &str = include_str!("../cu/attention/reshape_and_cache_fp8kv.cu");
     /// paged attention decode 家族(v1 / v2 分片 / v2 reduce;K1/K2)
     pub const PAGED_ATTENTION_F16: &str = include_str!("../cu/attention/pagedattention_f16.cu");
     /// chunked prefill paged attention(在线 softmax + 滑窗;smem tile)

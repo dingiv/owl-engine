@@ -197,7 +197,12 @@ impl<D: DeviceClient + 'static> Engine<D> {
             }
             _ => None,
         };
-        let pool = StatePool::alloc(&mut self.face, dims, &loaded.spec.layer_types, s, pool_tokens, fi_quant, spec_depth > 0, spec_mode == crate::running::SpecMode::Mtp, spec_mode == crate::running::SpecMode::DFlash2).await?;
+        // B6.2:主 KV 池 fp8 承载(OWL_KV_FP8 → env.kv.quant = Fp8E4M3)
+        let kv_fp8 = env.kv.quant == owl_models::env::KvQuant::Fp8E4M3;
+        if kv_fp8 {
+            eprintln!("[boot] KV 池 fp8 e4m3(容量减半/ctx 翻倍;读核 *_fp8 变体)");
+        }
+        let pool = StatePool::alloc(&mut self.face, dims, &loaded.spec.layer_types, s, pool_tokens, fi_quant, kv_fp8, spec_depth > 0, spec_mode == crate::running::SpecMode::Mtp, spec_mode == crate::running::SpecMode::DFlash2).await?;
         if fi_quant.is_some() {
             eprintln!(
                 "[boot] FlashInfer prefill 面启用(影子池 ×{},quant={:?})",

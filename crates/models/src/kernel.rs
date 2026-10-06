@@ -147,6 +147,8 @@ pub static REGISTRY: &[Entry] = &[
     Entry { name: "vllm_reshape_and_cache_f16", source: sources::attention::RESHAPE_AND_CACHE_F16, args: "T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_reshape_and_cache_dual_f16", source: sources::attention::RESHAPE_AND_CACHE_DUAL_F16, args: "T,T,T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_reshape_and_cache_dual_f16_fp8kv", source: sources::attention::RESHAPE_AND_CACHE_DUAL_F16_FP8KV, args: "T,T,T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    // B6.2:K0 批量写池 fp8 变体(f16 输入,e4m3 池;形状无关单核)
+    Entry { name: "owl_reshape_and_cache_fp8kv", source: sources::attention::RESHAPE_AND_CACHE_FP8KV, args: "T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     // K0 BF16(DFlash2 草稿池;同日十四)
     Entry { name: "vllm_reshape_and_cache_bf16", source: sources::attention::RESHAPE_AND_CACHE_F16, args: "T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::BF16 },
     Entry { name: "owl_cast_f16_f32", source: sources::attention::CAST, args: "T,i32,T", dtype: crate::contract::Dtype::F32 },

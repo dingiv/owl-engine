@@ -195,7 +195,13 @@ impl Attention {
             if !force_naive && driver::attn::paged_decode_ok(self.hd, pol.page) {
                 // 可达性:use_fused_insert 已覆盖同谓词;防御臂(理论不可达)
                 // —— K0 形态保留以防 future 分派变化
-                let wr = TensorOps::call(ids::ATTN_K0_WRITE).aux(&[tokens])
+                // B6.2:fp8 池 → K0 转换写(f16 输入 → e4m3 池)
+        let k0_op = if ctx.env.kv.quant == crate::env::KvQuant::Fp8E4M3 {
+            ids::ATTN_K0_WRITE_FP8
+        } else {
+            ids::ATTN_K0_WRITE
+        };
+        let wr = TensorOps::call(k0_op).aux(&[tokens])
                 .arg(&k)
                 .arg(&v)
                 .arg(&kv.k_cache)
@@ -339,7 +345,13 @@ impl Attention {
         let nparts = s2.nparts;
         // 主核:partials 写节点输出(布局 [head][partition][dim]);
         // 未激活 partition 早退不写,归并按设备侧 ctx 限界不读垃圾槽
-        let partial = TensorOps::call(ids::ATTN_PAGED_DECODE_V2)
+        // B6.2:fp8 池 → fp8 读变体(env.kv.quant 单源;stride 元素序不变)
+        let decode_op = if ctx.env.kv.quant == crate::env::KvQuant::Fp8E4M3 {
+            ids::ATTN_PAGED_DECODE_V2_FP8
+        } else {
+            ids::ATTN_PAGED_DECODE_V2
+        };
+        let partial = TensorOps::call(decode_op)
             .aux(&[self.hd, self.hq, self.hkv, nb as usize, nparts])
             .arg(q)
             .arg(&kv.k_cache)
@@ -430,7 +442,13 @@ impl Attention {
         let scale = 1.0 / (self.hd as f32).sqrt();
         let nb = kv.block_tables.shape().last().cloned().unwrap_or(1);
         // 名/网格/smem(bs32 契约)= driver 单源(env.page 终审)
-        let y = TensorOps::call(ids::ATTN_PAGED_PREFILL).aux(&[
+        // B6.3:fp8 池 → chunked prefill fp8 读变体
+        let prefill_op = if ctx.env.kv.quant == crate::env::KvQuant::Fp8E4M3 {
+            ids::ATTN_PAGED_PREFILL_FP8
+        } else {
+            ids::ATTN_PAGED_PREFILL
+        };
+        let y = TensorOps::call(prefill_op).aux(&[
             self.hd, self.hkv, self.hq, tokens,
         ])
         .arg(q)

@@ -136,6 +136,7 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "gdn.norm_act" => gdn::norm_act(dt, ax(0), ax(1), ax(2)), // aux = [rows, value_dim, group_size]
         "ops.sigmoid" => ops::sigmoid(dt),
         "attn.k0_write" => attn::k0_write(dt, ax(0)),
+        "attn.k0_write_fp8" => attn::k0_write_fp8(ax(0)), // B6.2:f16 入 → e4m3 池(ax=tokens)
         "attn.k0_dual" => attn::k0_dual(ax(0)),
         "attn.k0_dual_fp8kv" => attn::k0_dual_fp8kv(ax(0)),
         "attn.paged_decode" => attn::paged_decode_v1(req.env, dt, ax(0), ax(1), ax(2), ax(3)), // aux = [hd, hq, hkv, nb]
@@ -143,11 +144,16 @@ pub fn resolve(req: OpReq) -> KernelPick {
             // aux = [hd, hq, hkv, nb, nparts];页配对律同 v1(谓词单源)
             attn::paged_decode_v2(req.env, dt, ax(0), ax(1), ax(2), ax(3), ax(4))
         }
+        "attn.paged_decode_v2_fp8" => {
+            // B6.1:fp8 e4m3 KV 读变体(形状契约同 f16;页配对律同源)
+            attn::paged_decode_v2_fp8(req.env, dt, ax(0), ax(1), ax(2), ax(3), ax(4))
+        }
         "attn.paged_v2_reduce" => {
             // aux = [hd, hq, nparts]
             attn::paged_v2_reduce(dt, ax(0), ax(1), ax(2))
         }
         "attn.paged_prefill" => attn::paged_prefill(req.env, dt, ax(0), ax(1), ax(2), ax(3)), // aux = [hd, hkv, hq, tokens]
+        "attn.paged_prefill_fp8" => attn::paged_prefill_fp8(req.env, dt, ax(0), ax(1), ax(2), ax(3)), // B6.3 fp8 读变体
         "attn.prefill_split" => {
             // aux = [hd, hkv, hq, tokens, nparts](ctx_base 走核参数槽,层侧传入)
             let (hd, hkv, hq, tokens, nparts) = (ax(0), ax(1), ax(2), ax(3), ax(4));
@@ -383,6 +389,72 @@ pub mod attn {
                 other => unimplemented!("k0_write 无 {other:?} 变体"),
             },
             shape: Shape { grid: (tokens as u32, 1, 1), block: (256, 1, 1), smem: 0 },
+        }
+    }
+
+    /// B6.2:K0 写池 fp8 变体(f16 输入 → e4m3 池;形状无关单核)
+    pub fn k0_write_fp8(tokens: usize) -> KernelPick {
+        KernelPick {
+            name: "owl_reshape_and_cache_fp8kv",
+            shape: Shape { grid: (tokens as u32, 1, 1), block: (256, 1, 1), smem: 0 },
+        }
+    }
+
+    /// B6.1:decode v2 fp8 e4m3 KV 读(形状契约同 f16;页配对律同源)
+    pub fn paged_decode_v2_fp8(
+        env: &OpEnv,
+        _dt: DType,
+        hd: usize,
+        hq: usize,
+        _hkv: usize,
+        _nb: usize,
+        nparts: usize,
+    ) -> KernelPick {
+        let page = env.page;
+        let name = match (hd, page) {
+            (128, 32) => "vllm_paged_attention_v2_fp8_hd128bs32",
+            (256, 32) => "vllm_paged_attention_v2_fp8_hd256bs32",
+            (128, 16) => "vllm_paged_attention_v2_fp8_hd128",
+            (256, 16) => "vllm_paged_attention_v2_fp8_hd256",
+            other => panic!("paged v2 fp8: (hd,page) {other:?} 无配对 wrapper"),
+        };
+        let floor = (128u32 / 32 / 2) * hd as u32 * 4;
+        KernelPick {
+            name,
+            shape: Shape {
+                grid: (hq as u32, 1, nparts as u32),
+                block: (128, 1, 1),
+                smem: 2048u32.max(floor),
+            },
+        }
+    }
+
+    /// B6.3:chunked prefill fp8 e4m3 KV 读(形状/网格契约同 f16)
+    pub fn paged_prefill_fp8(
+        env: &OpEnv,
+        _dt: DType,
+        hd: usize,
+        hkv: usize,
+        hq: usize,
+        tokens: usize,
+    ) -> KernelPick {
+        assert!(
+            env.page == 32,
+            "chunked prefill bs32 契约:页 {} 非法",
+            env.page
+        );
+        let name = match hd {
+            128 => "vllm_chunked_prefill_paged_attn_opt_fp8_hd128",
+            256 => "vllm_chunked_prefill_paged_attn_opt_fp8_hd256",
+            other => panic!("chunked prefill fp8 仅 hd∈{{128,256}},得 {other}"),
+        };
+        KernelPick {
+            name,
+            shape: Shape {
+                grid: ((hq / hkv) as u32, hkv as u32, ((tokens + 255) / 256) as u32),
+                block: (256, 1, 1),
+                smem: (64 + 2 * hd * env.page * 2) as u32,
+            },
         }
     }
 

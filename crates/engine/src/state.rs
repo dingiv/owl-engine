@@ -94,6 +94,9 @@ pub(crate) struct StatePool {
     pub(crate) v_fis: Vec<BlockN>,
     /// 影子量化档(None = f16 双宽;Fp8E4M3 = e4m3 单宽)
     pub(crate) fi_quant: Option<owl_models::env::KvQuant>,
+    /// B6.2:主 KV 池 fp8 e4m3 承载(true = 池块 U32 字节承载 1B/elem;
+    /// 读核走 *_fp8 变体,写核 K0 转换写)
+    pub(crate) kv_fp8: bool,
     gdns: Vec<GdnBlocks>,
     snaps: Vec<GdnSnapSlot>,
     snap_tick: u64,
@@ -131,6 +134,7 @@ impl StatePool {
         seq_tokens: usize,
         pool_tokens: usize,
         fi: Option<owl_models::env::KvQuant>,
+        kv_fp8: bool,
         spec: bool,
         mtp: bool,
         dflash: bool,
@@ -151,8 +155,20 @@ impl StatePool {
         let mut k_fis: Vec<BlockN> = Vec::new();
         let mut v_fis: Vec<BlockN> = Vec::new();
         for _ in 0..n_full {
-            let k_cache = zero_block_dt(face, nb * dims.hkv * dims.hd * page, dims.dtype).await?;
-            let v_cache = zero_block_dt(face, nb * dims.hkv * dims.hd * page, dims.dtype).await?;
+            // B6.2:fp8 池 = U32 字节承载 1B/elem(元素数不变,块大小减半);
+            // 读核 *_fp8 变体读入即转 half,写核 K0 转换写
+            let (k_elems, k_dt) = if kv_fp8 {
+                (nb * dims.hkv * dims.hd * page / 4, Dtype::U32)
+            } else {
+                (nb * dims.hkv * dims.hd * page, dims.dtype)
+            };
+            let (v_elems, v_dt) = if kv_fp8 {
+                (nb * dims.hkv * dims.hd * page / 4, Dtype::U32)
+            } else {
+                (nb * dims.hkv * dims.hd * page, dims.dtype)
+            };
+            let k_cache = zero_block_dt(face, k_elems, k_dt).await?;
+            let v_cache = zero_block_dt(face, v_elems, v_dt).await?;
             kvs.push(KvBlocks { k_cache, v_cache });
         }
         // MTP 草稿链 KV(E5-M2b):独立页池(1 层,几何 = full 层同款,
@@ -277,7 +293,8 @@ impl StatePool {
         } else {
             None
         };
-        Ok(StatePool { kvs, k_fis, v_fis, fi_quant: fi, gdns, snaps, snap_tick: 0, bt, bt_mtp, spec_snap, mtp_kvs, dflash_kvs, attn_v2, page, nb, paged, x, dims })
+        Ok(StatePool { kvs, k_fis, v_fis, fi_quant: fi,
+            kv_fp8, gdns, snaps, snap_tick: 0, bt, bt_mtp, spec_snap, mtp_kvs, dflash_kvs, attn_v2, page, nb, paged, x, dims })
     }
 
     /// MTP 链块表叶子(propose 图烘焙;None = 未启用)
@@ -374,6 +391,21 @@ impl StatePool {
     /// 逐层 KV cache 叶子句柄((k, v);slots/kv_lens/block_tables 由
     /// 调用方按步注入 —— 图闭包注输入槽,prefill 注 from_host 标量行)
     pub(crate) fn kv_caches(&self) -> Vec<(TensorOps, TensorOps)> {
+        // B6.2:fp8 池 = U32 扁平字节账叶(指针面;读核按元素序自寻址,
+        // FI 影子池 fp8 档同款)
+        if self.kv_fp8 {
+            let shape = vec![self.nb * self.dims.hkv * self.dims.hd * self.page / 4];
+            return self
+                .kvs
+                .iter()
+                .map(|b| {
+                    (
+                        block_leaf_dt(&b.k_cache.0, shape.clone(), Dtype::U32),
+                        block_leaf_dt(&b.v_cache.0, shape.clone(), Dtype::U32),
+                    )
+                })
+                .collect();
+        }
         let k_shape = self.k_shape();
         let v_shape = self.v_shape();
         self.kvs
