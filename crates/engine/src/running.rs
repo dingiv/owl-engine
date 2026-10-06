@@ -256,8 +256,8 @@ impl<D: DeviceClient> RunningEngine<D> {
             )));
         }
         let (session_id, ephemeral) = match session {
-            Some(id) => (self.sessions.get_or_create(Some(id), gdn_slots())?.0, false),
-            None => (self.sessions.get_or_create(None, gdn_slots())?.0, true),
+            Some(id) => (self.get_or_create_evicting(Some(id))?, false),
+            None => (self.get_or_create_evicting(None)?, true),
         };
         let id = self.next_id;
         self.next_id += 1;
@@ -269,6 +269,44 @@ impl<D: DeviceClient> RunningEngine<D> {
             prompt_ids,
         });
         Ok((session_id, id))
+    }
+
+    /// E5:取或建 + 格耗尽 LRU 逐出重试(提交与泵不相交,无活跃 turn,
+    /// 全部存活会话皆可逐;块链归账房,格随 close 回收)。键控与
+    /// ephemeral 两臂共用 —— ephemeral 流量为主的服务面,老键控会话
+    /// 必须让位(2026-10-10 sweep 实录:8 个键控会话存活时全部
+    /// ephemeral 请求 400)
+    fn get_or_create_evicting(&mut self, id: Option<u64>) -> Result<u64> {
+        match self.sessions.get_or_create(id, gdn_slots()) {
+            Ok(x) => Ok(x.0),
+            Err(e) if format!("{e}").contains("GDN 状态格耗尽") => {
+                let mut last = e;
+                loop {
+                    let Some(victim) = self.sessions.lru_victim() else {
+                        return Err(last);
+                    };
+                    if let Some(s) = self.sessions.get_mut(victim) {
+                        let mut t = std::mem::take(&mut s.block_table);
+                        self.blocks_m.release_table(&mut t);
+                        let mut mt = std::mem::take(&mut s.mtp_block_table);
+                        self.blocks_mtp.release_table(&mut mt);
+                    }
+                    self.sessions.close(victim).ok();
+                    owl_shared::metrics::with_metrics_store(|m| {
+                        m.counter_add("session.evict", 1, file!(), line!())
+                    });
+                    eprintln!("[session] LRU 逐出 #{victim}(GDN 格回收)→ 重试");
+                    match self.sessions.get_or_create(id, gdn_slots()) {
+                        Ok(x) => return Ok(x.0),
+                        Err(e2) if format!("{e2}").contains("GDN 状态格耗尽") => {
+                            last = e2;
+                        }
+                        Err(e2) => return Err(e2),
+                    }
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// 显式关会话(客户端声明不再续;账本清票,块链归还账房)

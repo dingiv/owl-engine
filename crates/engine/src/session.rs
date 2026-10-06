@@ -47,11 +47,14 @@ pub struct AgentSession {
     /// 物理块链(E2b 真块表):逻辑块序 → 物理块 id;块池共享,
     /// 跨 turn 存续(会话存活期间块不归还)
     pub block_table: Vec<u32>,
+    /// E5:LRU 逐出账(SessionTable.tick 触达时间;越小越老)
     /// MTP 草稿链块链(E5-M2b):独立页池的第二链;mtp 模式由
     /// propose 路径 ensure_for_len,与 target 链同步跨 turn 存续
     pub mtp_block_table: Vec<u32>,
     /// GDN 状态格号(E2b 多会话隔离;格 = 每会话一格,容量 GDN_SLOTS)
     pub gdn_slot: usize,
+    /// E5:LRU 触达时间(SessionTable.tick;越小越老,逐出候选)
+    pub last_use: u64,
 }
 
 impl AgentSession {
@@ -65,6 +68,7 @@ impl AgentSession {
             block_table: Vec::new(),
             mtp_block_table: Vec::new(),
             gdn_slot,
+            last_use: 0,
         }
     }
 
@@ -115,6 +119,8 @@ impl AgentSession {
 pub struct SessionTable {
     sessions: std::collections::HashMap<u64, AgentSession>,
     next_id: u64,
+    /// E5:LRU 触达时钟(get_or_create 递增;会话账 last_use)
+    tick: u64,
 }
 
 impl SessionTable {
@@ -124,7 +130,9 @@ impl SessionTable {
 
     /// 取或建(首次 submit 隐式建会话;session_id = 0 起步)。
     /// GDN 格分配 = 扫描首个未被存活会话占用的格号;格耗尽报错
-    /// (并发上限 = GDN_SLOTS,需求 ≤8 会话)
+    /// (并发上限 = GDN_SLOTS,需求 ≤8 会话;引擎层 LRU 逐出后重试)。
+    /// 已存在的会话直接复用(不占新格;旧实现先扫格后查存在,
+    /// 格满时重提交既有会话被误拒 —— 2026-10-10 实录修复)
     pub fn get_or_create(
         &mut self,
         id: Option<u64>,
@@ -135,6 +143,16 @@ impl SessionTable {
             self.next_id += 1;
             id
         });
+        self.tick += 1;
+        let tick = self.tick;
+        if self.sessions.contains_key(&id) {
+            // 已存在会话直接复用(不占新格;last_use 触达 = LRU 新鲜度)
+            if let Some(s) = self.sessions.get_mut(&id) {
+                s.last_use = tick;
+                return Ok((id, s));
+            }
+            unreachable!("contains_key 已判定");
+        }
         let next = self.next_id;
         let used: std::collections::HashSet<usize> =
             self.sessions.values().map(|s| s.gdn_slot).collect();
@@ -149,8 +167,18 @@ impl SessionTable {
             .sessions
             .entry(id)
             .or_insert_with(|| AgentSession::new(id, 0, gdn_slot));
+        s.last_use = tick;
         self.next_id = next.max(id + 1);
         Ok((id, s))
+    }
+
+    /// E5:LRU 逐出候选(最老触达;调用方保证无活跃 turn ——
+    /// actor 纪律:submit 与 pump 不相交)。None = 表空
+    pub fn lru_victim(&self) -> Option<u64> {
+        self.sessions
+            .values()
+            .min_by_key(|s| s.last_use)
+            .map(|s| s.id)
     }
 
     pub fn get(&self, id: u64) -> Option<&AgentSession> {
@@ -239,5 +267,26 @@ mod tests {
         let (_, s) = st.get_or_create(Some(7), 2).expect("复活");
         assert_eq!(s.cached_len, 0);
         assert_eq!(s.gdn_slot, 0, "7 号 close 已释放 0 号格");
+    }
+    /// E5:LRU 逐出候选 + 已存在会话复用不占格(2026-10-10 实录修复)
+    #[test]
+    fn session_lru_victim_and_reuse() {
+        let mut st = SessionTable::new();
+        for i in 0..4u64 {
+            st.get_or_create(Some(100 + i), 4).expect("建");
+        }
+        // 触达 100 与 102(变新鲜);100 是最老 → 候选
+        st.get_or_create(Some(100), 4).expect("复用");
+        st.get_or_create(Some(102), 4).expect("复用");
+        assert_eq!(st.lru_victim(), Some(101), "101 未再触达 = 最老");
+        // 复用不占新格:格满时重提交既有会话必须成功(旧实现误拒)
+        st.get_or_create(Some(103), 4).expect("第 4 格");
+        let err = st.get_or_create(Some(999), 4).unwrap_err();
+        assert!(format!("{err}").contains("GDN 状态格耗尽"), "新会话仍受格上限");
+        st.get_or_create(Some(102), 4).expect("格满复用既有会话 = 成功");
+        // 逐出后新会话可入
+        let v = st.lru_victim().expect("有候选");
+        st.close(v).expect("close");
+        st.get_or_create(Some(999), 4).expect("逐出后可建");
     }
 }
