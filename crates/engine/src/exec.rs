@@ -471,7 +471,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         // 对齐探针(E5-DF3 AL=0 排查):drafts vs 目标验证行逐位对照 ——
         // 附近命中(drafts[i]==ids[i±1]) = 位移对齐 bug;全散 = 分布质量
-        if std::env::var_os("OWL_DFLASH_PROBE").is_some() {
+        if self.probes.dflash_probe {
             let hits: Vec<String> = (0..depth)
                 .map(|i| {
                     let near = if i > 0 && drafts[i] == ids[i - 1] {
@@ -511,7 +511,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         };
         if d2_arc.is_none() {
             // skip(⑦ 统一 encode + propose)
-        } else if !self.propose_graphs.is_empty() && std::env::var_os("OWL_PROPOSE_EAGER").is_none() {
+        } else if !self.propose_graphs.is_empty() && !self.probes.propose_eager {
             let ts = std::time::Instant::now();
             let d = self.propose_graph_step(m, &toks, pos).await?;
             t_propose += ts.elapsed();
@@ -658,12 +658,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let ts = std::time::Instant::now();
             // E5-DF4:图态优先(单图一轮 encode+propose;eager 回退 =
             // OWL_DFLASH_EAGER=1 或图降级)
-            if self.dflash_graph.is_some() && std::env::var_os("OWL_DFLASH_EAGER").is_none() {
+            if self.dflash_graph.is_some() && !self.probes.dflash_eager {
                 let d = self.dflash_graph_round(m, pos, toks[m]).await?;
                 t_propose += ts.elapsed();
                 self.spec_drafts_host = Some(d);
             } else {
-            let noencode = std::env::var_os("OWL_DFLASH_NOENCODE").is_some();
+            let noencode = self.probes.dflash_noencode;
             let taps: Vec<owl_iface::contract::Bytes> = (0..self.dflash_tap_count)
                 .map(|i| {
                     self.verify_graph
@@ -679,14 +679,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let fp = pos + m + 1;
             let bonus = toks[m];
             let d = self.dflash_propose(bonus, fp).await?;
-            if std::env::var_os("OWL_DFLASH_PROBE").is_some() && self.spec_stats.rounds < 3 {
+            if self.probes.dflash_probe && self.spec_stats.rounds < 3 {
                 let toks_txt = self.tok.decode(&d);
                 eprintln!("[dflash-probe] pos={fp} bonus={bonus} drafts={d:?} txt={toks_txt:?}");
             }
             t_propose += ts.elapsed();
             self.spec_drafts_host = Some(d);
             }
-        } else if !self.propose_graphs.is_empty() && std::env::var_os("OWL_PROPOSE_EAGER").is_none() {
+        } else if !self.propose_graphs.is_empty() && !self.probes.propose_eager {
             let ts = std::time::Instant::now();
             let d = self.propose_graph_step(m, &toks, pos).await?;
             t_propose += ts.elapsed();
@@ -741,6 +741,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         } else {
             self.spec_stats.partial += 1;
         }
+        // E4:m 直方图进 metrics(tag 有界 0..=7;/debug/metrics 直读,
+        // 免日志 grep;AL 均值 = spec.accepted/spec.rounds 同源可算)
+        mcnt(&format!("spec.m{m}"), 1);
         let ts = std::time::Instant::now();
         let mut evq = std::collections::VecDeque::new();
         for &t in &toks {
@@ -847,7 +850,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             eprintln!("[dflash-prof] pure_gpu={:?}", t2.elapsed());
         }
         if let (Some(a), Some(b)) = (t0, t1) {
-            eprintln!("[dflash-prof] fill={:?} launch={:?} read={:?}", a.elapsed(), b - a, b.elapsed());
+            // E2 语义勘误(原 fill/launch/read 误导):total = 轮内全程;
+            // step = 装填+发射段;read_extra = 首读段(含队列排水);
+            // pure_gpu(上行)= 同步后裸 replay = 图独占 GPU 时间
+            eprintln!(
+                "[dflash-prof] total={:?} step={:?} read_extra={:?}",
+                a.elapsed(),
+                b - a,
+                b.elapsed()
+            );
         }
         Ok(out[..7].iter().map(|&v| v as u32).collect())
     }
@@ -912,7 +923,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         // 探针:首回合 memory 落盘(python 重算 fc 对拍;真块 dtoh 合法。
         // taps 由调用方从 concat 父块整块落盘 —— 切片视图 dtoh 整父块契约)
-        if std::env::var_os("OWL_DFLASH_PROBE").is_some() && !self.dflash_mem_dumped {
+        if self.probes.dflash_probe && !self.dflash_mem_dumped {
             self.dflash_mem_dumped = true;
             let face = self.session.face_mut();
             let refs: Vec<&TensorOps> = std::iter::once(&memory).collect();
@@ -978,7 +989,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let s = self.sessions.get(act.session_id).expect("账在");
             (s.block_table.clone(), s.gdn_slot)
         };
-        if std::env::var_os("OWL_DFLASH_PROBE").is_some() {
+        if self.probes.dflash_probe {
             eprintln!("[dflash-probe] propose pos={pos} bt_len={} page={page}", bt_chain.len());
         }
         let self_slots: Vec<f32> = (0..8usize)
@@ -1001,7 +1012,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         ctx.env = self.env;
         // 探针:草稿池 K 前缀行 NaN 检查(定谳 encode vs NC 核;解析 dtype
         // 随草稿池 —— 同日十四后 = BF16)
-        if std::env::var_os("OWL_DFLASH_PROBE").is_some() {
+        if self.probes.dflash_probe {
             let parse2: fn([u8; 2]) -> f32 = if d2.dtype() == Dtype::BF16 {
                 |c| half::bf16::from_le_bytes(c).to_f32()
             } else {
@@ -1042,11 +1053,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 前向)—— 隔离「草稿值泄漏」vs「轮管线污染」(2026-10-07 恒等门
         // AL=0 分歧排查;正式开关挂 C7)
         // OWL_DFLASH_DUMB=1:零副作用哑草稿(不进 GPU;② 直接 host 表)
-        if std::env::var_os("OWL_DFLASH_DUMB").is_some() {
+        if self.probes.dflash_dumb {
             return Ok(vec![anchor; 7]);
         }
         let mut probe_roots: Vec<TensorOps> = Vec::new();
-        let probe_on = std::env::var_os("OWL_DFLASH_PROBE").is_some();
+        let probe_on = self.probes.dflash_probe;
         let kv_len_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[(pos + 8) as f32]));
         let (hidden, drafts, _scores, logits) = d2.propose_block(
             &toks_t, &pos_t, &anchor_t, &kvs, &rope, &self.model.embed, &kv_len_t, &ctx,
@@ -1055,7 +1066,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 探针:首个 propose 的 hidden + 全部探针根落盘(python 逐阶段对拍;
         // **逐根独立 eval** —— multi 后段会把早根块回收复用,dtoh 读到陈旧
         // 块(root0 曾读出 1e6 级垃圾假象);单链重执行确定性,值可信)
-        if std::env::var_os("OWL_DFLASH_PROBE").is_some() && !self.dflash_hid_dumped {
+        if self.probes.dflash_probe && !self.dflash_hid_dumped {
             self.dflash_hid_dumped = true;
             for (i, r) in probe_roots.iter().enumerate() {
                 let face = self.session.face_mut();
@@ -1079,7 +1090,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         let _ = hidden;
         // 探针:logits 前 4 值 f16(NaN 定位;OWL_DFLASH_PROBE)
-        let logits_probe = if std::env::var_os("OWL_DFLASH_PROBE").is_some() {
+        let logits_probe = if self.probes.dflash_probe {
             Some(logits.clone())
         } else {
             None
@@ -1166,7 +1177,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .collect::<Vec<_>>()
         };
         let _ = b;
-        if std::env::var_os("OWL_DFLASH_PROBE").is_some() {
+        if self.probes.dflash_probe {
             eprintln!("[dflash-probe] pos={pos} anchor={anchor} drafts={out:?}");
         }
         Ok(out)
@@ -2205,7 +2216,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 let face = self.session.face_mut();
                 let logits = self.model.embed.lm_head_matmul(&hb_view);
                 // 崩坏排查:末行 logits top-2(id+值)——近局翻转判别
-                if std::env::var_os("OWL_DFLASH_PROBE").is_some() {
+                if self.probes.dflash_probe {
                     let bs_seq = self.boot_seq;
                     let lb = owl_models::interpreters::eval_ops(logits.step(), face).await?;
                     let mut lbuf = vec![0u8; vocab * 2];
@@ -2346,18 +2357,25 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// 会话滞留 → GDN 格泄漏 → 2 格两轮耗尽)。与 complete 同构的清理,
     /// 但**不 commit_turn/不进前缀缓存**(引擎错误后账面不可信;ephemeral
     /// 直接焚,键控会话保留账本 —— 前缀守卫失配自动回退全量重算,安全)。
+    /// E1:ephemeral 会话终了焚毁(块链/MTP 链归账房 + 表移除释放格)。
+    /// complete 与 abandon 共用 —— 两路径的清理原 ~20 行双写。
+    fn burn_ephemeral(&mut self, session_id: u64) {
+        if let Some(s) = self.sessions.get_mut(session_id) {
+            let mut table = std::mem::take(&mut s.block_table);
+            self.blocks_m.release_table(&mut table);
+            // MTP 链第二链同步归还(E5-M2b;DFlash2 模式表空归零账)
+            let mut mtp_table = std::mem::take(&mut s.mtp_block_table);
+            self.blocks_mtp.release_table(&mut mtp_table);
+        }
+        self.sessions.close(session_id).ok();
+    }
+
     pub async fn abandon(&mut self, err: String) -> TurnEvent {
         let turn_id = self.active.as_ref().map(|a| a.id).unwrap_or(0);
         if let Some(act) = self.active.take() {
             self.spec_drafts_host = None;
             if act.ephemeral {
-                if let Some(s) = self.sessions.get_mut(act.session_id) {
-                    let mut table = std::mem::take(&mut s.block_table);
-                    self.blocks_m.release_table(&mut table);
-                    let mut mtp_table = std::mem::take(&mut s.mtp_block_table);
-                    self.blocks_mtp.release_table(&mut mtp_table);
-                }
-                self.sessions.close(act.session_id).ok();
+                self.burn_ephemeral(act.session_id);
             }
         }
         TurnEvent::Failed { turn: turn_id, err }
@@ -2380,14 +2398,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         if act.ephemeral {
             // 终了即焚:块链归还账房 + 会话表移除(GDN 格随之释放)
-            if let Some(s) = self.sessions.get_mut(act.session_id) {
-                let mut table = std::mem::take(&mut s.block_table);
-                self.blocks_m.release_table(&mut table);
-                // MTP 链第二链同步归还(E5-M2b)
-                let mut mtp_table = std::mem::take(&mut s.mtp_block_table);
-                self.blocks_mtp.release_table(&mut mtp_table);
-            }
-            self.sessions.close(act.session_id).ok();
+            self.burn_ephemeral(act.session_id);
         }
         let text = self.tok.decode(&act.out);
         Ok(TurnEvent::Completed { turn: act.id, text })

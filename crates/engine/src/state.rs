@@ -255,7 +255,7 @@ impl StatePool {
             }
         }
         eprintln!(
-            "[boot] 状态块分配 {:.2}s(kv f16 ×{} / gdn ×{},槽位 {},nb = {nb},page = {page},dflash = {df})",
+            "[boot] 状态块分配 {:.2}s(kv f16 ×{} / gdn ×{},会话容量 {},池 {} 页 × {page} tok,页表 nb = {nb},dflash = {df})",
             t.elapsed().as_secs_f32(),
             kvs.len(),
             gdns.len(),

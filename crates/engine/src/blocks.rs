@@ -126,6 +126,9 @@ impl BlockManager {
 
     /// 增长块表至覆盖 target_len tokens(只增不减;幂等;事务性 ——
     /// 池不足时整单拒绝,不留半截块表,调用方可安全重试/失败)。
+    /// E2c 压力驱逐(2026-10-10 落地):自由度不足时先逐前缀缓存叶
+    /// (LRU,容量驱逐同款机制)补自由度,再判定真耗尽 —— 缓存块
+    /// 被活跃会话持引时 decref 不出自由块,逐出循环自动补量。
     pub fn ensure_for_len(&mut self, table: &mut Vec<u32>, target_len: usize) -> Result<()> {
         let need = self.blocks_for(target_len);
         let have = table.len();
@@ -134,8 +137,25 @@ impl BlockManager {
         }
         let delta = need - have;
         if self.free_block_ids.len() < delta {
+            let mut passes = 0;
+            while self.free_block_ids.len() < delta && passes < 4 {
+                let Some(cache) = self.prefix_cache.as_mut() else {
+                    break;
+                };
+                let shortage = delta - self.free_block_ids.len();
+                let evicted = cache.evict_blocks(shortage);
+                if evicted.is_empty() {
+                    break; // 缓存已空/无可逐叶
+                }
+                for id in evicted {
+                    self.decref(id as u32);
+                }
+                passes += 1;
+            }
+        }
+        if self.free_block_ids.len() < delta {
             return Err(ModelError::Msg(format!(
-                "KV 块池耗尽:需 {need} 块,空闲 {},table={} —— 降低并发/上下文(E2c 驱逐另接)",
+                "KV 块池耗尽:需 {need} 块,空闲 {},table={} —— 缓存压力驱逐后仍不足 = 真实容量不足(降并发/上下文,或调 OWL_POOL_TOKENS)",
                 self.free_block_ids.len(),
                 table.len()
             )));
@@ -219,5 +239,27 @@ mod tests {
         assert_eq!(m.free_blocks(), 3);
         m.decref(shared); // B 释放 → ref 0,回池
         assert_eq!(m.free_blocks(), 4);
+    }
+    /// E2c 压力驱逐:缓存占块时大会话 ensure_for_len 应逐缓存页放行;
+    /// 无缓存可逐时仍真耗尽报错(2026-10-10 4096 会话实录)
+    #[test]
+    fn ensure_for_len_pressure_evicts_cache() {
+        let mut m = BlockManager::new(8, 32);
+        m.enable_prefix_cache(8);
+        // 会话 A:8 块满链,收口登记缓存(缓存持引用)
+        let mut ta = Vec::new();
+        m.ensure_for_len(&mut ta, 8 * 32).expect("A 建链");
+        let toks: Vec<u32> = (0..8 * 32).collect();
+        m.cache_seq(&toks, &ta);
+        // 归还 A(缓存持引 → 块不回自由队列)
+        m.release_table(&mut ta);
+        assert_eq!(m.free_blocks(), 0, "缓存应持有全部 8 块");
+        // 会话 B:同尺寸大链 → 逐缓存放行
+        let mut tb = Vec::new();
+        m.ensure_for_len(&mut tb, 8 * 32).expect("压力驱逐后放行");
+        assert_eq!(tb.len(), 8, "B 拿满 8 块");
+        // 真耗尽:B 持链时不释放,再要 1 块(池已无自由、缓存已空)
+        let err = m.ensure_for_len(&mut tb, 9 * 32).unwrap_err();
+        assert!(format!("{err}").contains("真实容量不足"), "{err}");
     }
 }

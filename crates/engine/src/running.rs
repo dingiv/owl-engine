@@ -71,6 +71,12 @@ pub(crate) struct StepProbes {
     pub degrade_after: usize,
     /// B4:OWL_SPEC_PROBE_EVERY(降级期探测周期 token 数,失败 ×2 退避)
     pub probe_every: usize,
+    /// E3 收编(原热路径散落 var_os;boot 解析一次):DFlash2 诊断/回退族
+    pub dflash_probe: bool,
+    pub propose_eager: bool,
+    pub dflash_eager: bool,
+    pub dflash_noencode: bool,
+    pub dflash_dumb: bool,
 }
 
 impl StepProbes {
@@ -91,6 +97,11 @@ impl StepProbes {
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(64)
                 .max(1),
+            dflash_probe: has("OWL_DFLASH_PROBE"),
+            propose_eager: has("OWL_PROPOSE_EAGER"),
+            dflash_eager: has("OWL_DFLASH_EAGER"),
+            dflash_noencode: has("OWL_DFLASH_NOENCODE"),
+            dflash_dumb: has("OWL_DFLASH_DUMB"),
         }
     }
 }
