@@ -118,6 +118,9 @@ pub struct RunningEngine<D: DeviceClient> {
     /// propose 桶形图族(E5-M5;index = m,extend m+1 行 + k-1 链步,
     /// 输出 drafts;首轮 propose_first 保持 eager)
     pub(crate) propose_graphs: Vec<GraphPlan<D>>,
+    /// DFlash2 propose 单图(E5-DF4;encode 全 8 行 + 噪声块 + selector,
+    /// 固定几何;None = eager 回退)
+    pub(crate) dflash_graph: Option<GraphPlan<D>>,
     /// 已 propose 草稿(host 账;轮末 propose 图/eager dtoh 产出,
     /// 轮首消费。E5-M5:Bytes 账改 host —— 图态草稿出图即 dtoh,
     /// 免跨轮设备块所有权)

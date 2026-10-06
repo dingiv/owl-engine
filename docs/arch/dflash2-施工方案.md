@@ -539,3 +539,34 @@ BF16 化后首跑恒等门:恒等绿(42tok 逐位)但 **AL 仍 0.00**。三连�
 
 **余下(DF-4)**:propose 图化(eager → 图回放,-20ms 级)+ fold 批量
 + 分域净增益验收(std/MATH × on/off;净增转正线 = AL×(1/轮成本) 折算)。
+
+### 6.19 同日十五续:DF-4 propose 单图落地 —— 数学域 +103% 净增益
+
+- **轮账(profile 实测,AL=2.9)**:verify 30.5ms(图回放;target 前向
+  23ms 带宽墙附近)+ propose 20.5ms(eager ~130 发射的 actor 往返税)
+  + fold/snap 1.5ms;基线 decode 29-32 tok/s
+- **DFlash2 propose 单图(E5-DF4;比 MTP 桶图更优 —— 固定几何单图
+  覆盖,无需 m 桶)**:
+  - 前置改造:NC 核 prefix_len 去烘焙(`owl_naive_attn_nc_{f16,bf16}`
+    签名 `i32 prefix_len` → `T kv_len_ptr`,核内 prefix = kv_len − T;
+    契约 5 f32 过线同 slots/pos)—— fp 每轮变,宿主标量烘图必错;
+  - **encode 行数钉 8**(verify 块全行):多编行(被拒 draft 行)下轮
+    被自块写/重编覆盖,幂等安全;附带修 eager 路 m=7 时 rows=m+2=9
+    超 taps 块 8 行的越界读(min(8));
+  - 图 = memory(5×fc marlin)→ 5 层 encode_kv(K0 写,输出槽触发执行)
+    → 噪声块 5 层 → lm_head cublas → topk16 → select;输入槽 7 个
+    (tokens/anchor/enc_pos/enc_slots/prop_pos/prop_slots/kv_len),
+    烘焙叶 = verify taps 槽 + 草稿池叶 + bt 叶;输出 = drafts(select
+    缓冲 offset 0,形状 = 整缓冲遵守 dtoh 整父块契约)+ encode 哑根
+    e0..e4(BF16 [1],触发 K0 写入 DAG);
+  - 回退链:捕获降级/OWL_DFLASH_EAGER=1 → eager 路(验收一致);
+- **验收(math 域,AL 2.90)**:**59.6 tok/s vs baseline 29.4(+103%)**;
+  prose 域(AL 0.79)**42.6 vs ~32(+29%)**;双域恒等门逐位一致;
+  eager 回退验收一致(AL 1.08);回归 models 115 / kernels 8 / engine 33 /
+  marlin_parity 7 全绿;
+- **分相细账(dflash-prof)**:graph_launch = **150µs**(回放本身);
+  read dtoh 同步等流排空 = 18ms(verify GPU 尾部 + propose 图 GPU);
+  下一刀需要 nsys 级深挖:①propose 图 GPU 构成(理论 ~5ms:草稿权重
+  1.1GB 带宽 1.3ms + lm_head 2.4GB 2.8ms + 小 GEMM,实测 ~18ms 差 3×);
+  ②verify 30ms 里的 host 交织;理论轮下限 ~36ms → math ~108 tok/s。
+  注:60 tok/s = 超越 vLLM decode 基线(43)+ xinfer 157 参照同量级。

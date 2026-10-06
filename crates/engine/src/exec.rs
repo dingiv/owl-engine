@@ -557,6 +557,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         };
         if let Some(d2) = d2_arc7 {
             let ts = std::time::Instant::now();
+            // E5-DF4:图态优先(单图一轮 encode+propose;eager 回退 =
+            // OWL_DFLASH_EAGER=1 或图降级)
+            if self.dflash_graph.is_some() && std::env::var_os("OWL_DFLASH_EAGER").is_none() {
+                let d = self.dflash_graph_round(m, pos, toks[m]).await?;
+                t_propose += ts.elapsed();
+                self.spec_drafts_host = Some(d);
+            } else {
             let noencode = std::env::var_os("OWL_DFLASH_NOENCODE").is_some();
             let taps: Vec<owl_iface::contract::Bytes> = (0..self.dflash_tap_count)
                 .map(|i| {
@@ -579,6 +586,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
             t_propose += ts.elapsed();
             self.spec_drafts_host = Some(d);
+            }
         } else if !self.propose_graphs.is_empty() && std::env::var_os("OWL_PROPOSE_EAGER").is_none() {
             let ts = std::time::Instant::now();
             let d = self.propose_graph_step(m, &toks, pos).await?;
@@ -659,6 +667,66 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         self.pending_events
             .pop_front()
             .ok_or_else(|| owl_models::ModelError::Msg("spec 轮零事件(空块?)".into()))
+    }
+
+    /// DFlash2 propose 单图一轮(E5-DF4):输入槽装填(tokens/anchor/
+    /// enc_pos/enc_slots/prop_pos/prop_slots/kv_len)→ replay → drafts
+    /// 回读(select 缓冲前 7)。bt 覆盖自保同 eager 路(ensure + write_bt
+    /// 同步律);图不消费 bt(草稿池 slots 直写),但槽号换算需要块链。
+    async fn dflash_graph_round(
+        &mut self,
+        m: usize,
+        pos: usize,
+        bonus: u32,
+    ) -> Result<Vec<u32>> {
+        let fp = pos + m + 1;
+        let page = self.pool.page;
+        {
+            let act = self.active.as_ref().expect("active 已保证");
+            let s = self.sessions.get_mut(act.session_id).expect("账在");
+            let before = s.block_table.len();
+            self.blocks_m.ensure_for_len(&mut s.block_table, fp + 8)?;
+            if s.block_table.len() != before {
+                let sid = act.session_id;
+                self.write_bt(sid).await?;
+            }
+        }
+        let (bt_chain, _) = {
+            let act = self.active.as_ref().expect("active 已保证");
+            let s = self.sessions.get(act.session_id).expect("账在");
+            (s.block_table.clone(), s.gdn_slot)
+        };
+        let slot_at =
+            |p: usize| (bt_chain[p / page] * page as u32 + (p % page) as u32) as f32;
+        let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+        let tokens_f: Vec<f32> = (0..8)
+            .map(|i| if i == 0 { bonus as f32 } else { owl_models::layers::dflash2::MASK_TOKEN_ID as f32 })
+            .collect();
+        let enc_pos: Vec<f32> = (0..8).map(|i| (pos + i) as f32).collect();
+        let enc_slots: Vec<f32> = (0..8).map(|i| slot_at(pos + i)).collect();
+        let prop_pos: Vec<f32> = (0..8).map(|i| (fp + i) as f32).collect();
+        let prop_slots: Vec<f32> = (0..8).map(|i| slot_at(fp + i)).collect();
+        let kv_len = vec![(fp + 8) as f32];
+        let anchor = vec![bonus as f32];
+        let pg = self.dflash_graph.as_mut().expect("dflash_graph");
+        let prof = self.probes.step_profile;
+        let t0 = prof.then(std::time::Instant::now);
+        pg.step(&[
+            ("tokens", tokens_f.as_slice()),
+            ("anchor", anchor.as_slice()),
+            ("enc_pos", enc_pos.as_slice()),
+            ("enc_slots", enc_slots.as_slice()),
+            ("prop_pos", prop_pos.as_slice()),
+            ("prop_slots", prop_slots.as_slice()),
+            ("kv_len", kv_len.as_slice()),
+        ])
+        .await?;
+        let t1 = prof.then(std::time::Instant::now);
+        let out = pg.read_output_f32("drafts").await?;
+        if let (Some(a), Some(b)) = (t0, t1) {
+            eprintln!("[dflash-prof] fill={:?} launch={:?} read={:?}", a.elapsed(), b - a, b.elapsed());
+        }
+        Ok(out[..7].iter().map(|&v| v as u32).collect())
     }
 
     /// DFlash2 prefill encode(prefill chunk 全行草稿 KV 物化):taps
@@ -856,8 +924,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         let mut probe_roots: Vec<TensorOps> = Vec::new();
         let probe_on = std::env::var_os("OWL_DFLASH_PROBE").is_some();
+        let kv_len_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[(pos + 8) as f32]));
         let (hidden, drafts, _scores, logits) = d2.propose_block(
-            &toks_t, &pos_t, &anchor_t, &kvs, &rope, &self.model.embed, pos + 8, &ctx,
+            &toks_t, &pos_t, &anchor_t, &kvs, &rope, &self.model.embed, &kv_len_t, &ctx,
             if probe_on { Some(&mut probe_roots) } else { None },
         );
         // 探针:首个 propose 的 hidden + 全部探针根落盘(python 逐阶段对拍;
@@ -993,7 +1062,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         m: usize,
         pos: usize,
     ) -> Result<()> {
-        let rows = m + 2;
+        // 行数钉 8(verify 块全行;taps 块仅 8 行,m=7 时 m+2=9 越界读 ——
+        // 多编行下轮被自块写/重编覆盖,幂等安全;E5-DF4 与图路径同式)
+        let rows = (m + 2).min(8);
         let rope = self.draft_rope.as_ref().expect("draft rope").clone();
         let dtype = self.pool.dims.dtype;
         let views: Vec<TensorOps> = taps

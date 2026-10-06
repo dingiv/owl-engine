@@ -329,8 +329,10 @@ extern "C" __global__ void owl_naive_attn_nc_f16(
     const __half* __restrict__ v_self, // 同上
     const __half* __restrict__ kc,     // classic 前缀 [nb, Hkv, hd/x, page, x]
     const __half* __restrict__ vc,     // classic 前缀 [nb, Hkv, hd, page]
+    const float* __restrict__ kv_len_p, // [1] 全窗 = 前缀 + T(契约 5 f32 过线;
+                                       // E5-DF4 图化:prefix 曾为宿主烘焙标量,
+                                       // 每轮 fp 变 → 图化必须运行时读)
     int q_tokens,                      // T(哨兵哨界 = T*Hq)
-    int prefix_len,                    // 池内前缀行数
     int q_heads, int kv_heads, int d_dim,
     int page, int x,
     __half* __restrict__ out) {        // [T, Hq, D]
@@ -340,7 +342,8 @@ extern "C" __global__ void owl_naive_attn_nc_f16(
     const int h = idx % q_heads;
     const int kvh = h / (q_heads / kv_heads);
     const int hd_x = d_dim / x;
-    const int kv_len = prefix_len + q_tokens;
+    const int kv_len = (int)kv_len_p[0];
+    const int prefix_len = kv_len - q_tokens;
 
     const __half* qs = q + (long long)t * q_heads * d_dim + (long long)h * d_dim;
     const float scale = rsqrtf((float)d_dim);
@@ -391,8 +394,8 @@ extern "C" __global__ void owl_naive_attn_nc_bf16(
     const __nv_bfloat16* __restrict__ v_self, // 同上
     const __nv_bfloat16* __restrict__ kc,     // classic 前缀 [nb, Hkv, hd/x, page, x]
     const __nv_bfloat16* __restrict__ vc,     // classic 前缀 [nb, Hkv, hd, page]
+    const float* __restrict__ kv_len_p,       // [1] 全窗(契约 5;同 f16 版)
     int q_tokens,
-    int prefix_len,
     int q_heads, int kv_heads, int d_dim,
     int page, int x,
     __nv_bfloat16* __restrict__ out) {        // [T, Hq, D]
@@ -402,7 +405,8 @@ extern "C" __global__ void owl_naive_attn_nc_bf16(
     const int h = idx % q_heads;
     const int kvh = h / (q_heads / kv_heads);
     const int hd_x = d_dim / x;
-    const int kv_len = prefix_len + q_tokens;
+    const int kv_len = (int)kv_len_p[0];
+    const int prefix_len = kv_len - q_tokens;
 
     const __nv_bfloat16* qs = q + (long long)t * q_heads * d_dim + (long long)h * d_dim;
     const float scale = rsqrtf((float)d_dim);

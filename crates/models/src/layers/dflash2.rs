@@ -268,7 +268,8 @@ impl DfAttn {
     /// propose 臂:xs [T, hidden](T = 8 噪声块)→ q/k/v → norm+rope →
     /// 自块写槽(K0;slots = kv.slots 尾段)→ 非因果块注意力(kv =
     /// 池 [0, kv_len) 全可见;ENCODER_ONLY)→ o_proj。
-    /// `kv_len` = 前缀 + T(host 标量;图态化时换输入槽,DF-4)。
+    /// `kv_len_t` = [1] f32 全窗张量(契约 5;E5-DF4 图化:prefix 曾为
+    /// 宿主烘焙标量,每轮 fp 变 → 图化必须运行时读)。
     #[allow(clippy::too_many_arguments)]
     pub fn propose_attn(
         &self,
@@ -277,7 +278,7 @@ impl DfAttn {
         kv: &KvBuffers,
         rope: &Rope,
         eps: f32,
-        kv_len: usize,
+        kv_len_t: &TensorOps,
         ctx: &ForwardCtx,
     ) -> TensorOps {
         let t = xs.shape()[0];
@@ -310,8 +311,8 @@ impl DfAttn {
         .arg(&v)
         .arg(&kv.k_cache)
         .arg(&kv.v_cache)
+        .arg(kv_len_t)
         .arg_i32(t as i32)
-        .arg_i32((kv_len - t) as i32) // prefix_len = 窗口 - 自块
         .arg_i32(self.hq as i32)
         .arg_i32(self.hkv as i32)
         .arg_i32(self.hd as i32)
@@ -415,7 +416,7 @@ impl DfLayer {
         kv: &KvBuffers,
         rope: &Rope,
         eps: f32,
-        kv_len: usize,
+        kv_len_t: &TensorOps,
         ctx: &ForwardCtx,
         mut probe: Option<&mut Vec<TensorOps>>,
     ) -> (TensorOps, TensorOps) {
@@ -429,7 +430,7 @@ impl DfLayer {
         if let Some(p) = probe.as_deref_mut() {
             p.push(conv_in.clone().tag("probe.conv_in"));
         }
-        let attn_out = self.attn.propose_attn(&conv_in, pos, kv, rope, eps, kv_len, ctx);
+        let attn_out = self.attn.propose_attn(&conv_in, pos, kv, rope, eps, kv_len_t, ctx);
         if let Some(p) = probe.as_deref_mut() {
             p.push(attn_out.clone().tag("probe.attn_raw"));
         }
@@ -784,7 +785,7 @@ impl DFlash2Draft {
     /// propose 块(8 行噪声块 backbone + selector;全设备零 host 往返)。
     /// tokens = [anchor, MASK×7](f32 [BLOCK]);pos = 位置 [BLOCK];
     /// kvs[i].slots = 自块槽表 [BLOCK](前缀尾段 + 8 scratch 槽);
-    /// `kv_len` = 前缀 + BLOCK(全可见窗口)。返回 (hidden [BLOCK, hidden]
+    /// `kv_len_t` = [1] f32 全窗 = 前缀 + BLOCK(图化运行时读,契约 5)。返回 (hidden [BLOCK, hidden]
     /// post-norm, drafts [DEPTH] f32, scores 对拍观测面)。
     #[allow(clippy::too_many_arguments)]
     pub fn propose_block(
@@ -795,7 +796,7 @@ impl DFlash2Draft {
         kvs: &[KvBuffers],
         rope: &Rope,
         embed: &crate::layers::embedding::Embedding,
-        kv_len: usize,
+        kv_len_t: &TensorOps,
         ctx: &ForwardCtx,
         mut probe_layers: Option<&mut Vec<TensorOps>>,
     ) -> (TensorOps, TensorOps, TensorOps, TensorOps) {
@@ -820,7 +821,7 @@ impl DFlash2Draft {
                 &kvs[i],
                 rope,
                 self.eps,
-                kv_len,
+                kv_len_t,
                 ctx,
                 layer_probe,
             );
@@ -1385,8 +1386,9 @@ mod tests {
 
         // propose(probe_roots)
         let mut probe_roots: Vec<TensorOps> = Vec::new();
+        let kv_len_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b2(&[(19 + BLOCK) as f32]));
         let (hidden_t, drafts_t, _scores, logits_t) = draft.propose_block(
-            &ids_t, &pos_t, &anchor_t, &kvs, &rope, &embed, 19 + BLOCK, &ctx,
+            &ids_t, &pos_t, &anchor_t, &kvs, &rope, &embed, &kv_len_t, &ctx,
             Some(&mut probe_roots),
         );
         let _ = &_scores;
