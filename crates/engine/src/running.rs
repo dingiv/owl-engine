@@ -101,6 +101,9 @@ pub struct RunningEngine<D: DeviceClient> {
     pub(crate) env: owl_models::env::EnvProvider,
     /// E5-M2:投机轮深(0 = 关;>0 = 每轮草稿数,调度发 SpecRound)
     pub(crate) spec_depth: usize,
+    /// E5 性能:schedule 累计账(轮间 host 成本剖析)
+    pub(crate) sched_acc_ns: u64,
+    pub(crate) sched_cnt: usize,
     /// E5-M2b:spec 模式三态(Mtp = 真草稿头;Dumb = 哑草稿诊断;
     /// Off = 回落 DecodeBatch —— spec_depth 恒 0)
     pub(crate) spec_mode: SpecMode,
@@ -288,7 +291,21 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 打印。其余 STEP_PROFILE 打点保留原样(gl-prof/srv-timing 工具链
         // 依赖其输出格式,逐点收编挂账)。
         owl_shared::timer_start!("engine.pump.schedule");
+        let t_sched = (prof || true).then(std::time::Instant::now);
         let out = self.schedule()?;
+        if let Some(ts) = t_sched {
+            let d = ts.elapsed();
+            self.sched_acc_ns += d.as_nanos() as u64;
+            self.sched_cnt += 1;
+            if self.sched_cnt % 16 == 0 {
+                eprintln!(
+                    "[sched] n={} avg={:.2}ms last={:.2}ms",
+                    self.sched_cnt,
+                    self.sched_acc_ns as f64 / self.sched_cnt as f64 / 1e6,
+                    d.as_secs_f64() * 1e3
+                );
+            }
+        }
         owl_shared::timer_end!("engine.pump.schedule");
         if prof {
             owl_shared::metrics::query_metrics(&owl_shared::metrics::MetricsFilter::new()

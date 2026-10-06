@@ -57,16 +57,23 @@ pub async fn run_actor<D: DeviceClient>(
                 Ok(TurnEvent::Idle) => break,
                 Ok(ev) => dispatch(&mut sinks, ev).await,
                 Err(e) => {
-                    // 引擎错误(架子):广播 + 清桌。挂账:turn abort 原语
-                    // 落地后此处应烧毁 active turn 而非滞留
+                    // 引擎错误(架子):烧毁 active turn(E5 性能会战:
+                    // 弃置滞留 = GDN 格泄漏 → 2 格两轮耗尽)+ 广播
                     eprintln!("[actor] pump 错误: {e}");
-                    for (_, sink) in sinks.drain() {
-                        let _ = sink
-                            .send(SinkEvent::Turn(TurnEvent::Failed {
-                                turn: 0,
-                                err: format!("engine: {e}"),
-                            }))
-                            .await;
+                    let failed = running.abandon(format!("engine: {e}")).await;
+                    let failed_turn = match &failed {
+                        TurnEvent::Failed { turn, .. } => *turn,
+                        _ => 0,
+                    };
+                    match sinks.remove(&failed_turn) {
+                        Some(sink) => {
+                            let _ = sink.send(SinkEvent::Turn(failed)).await;
+                        }
+                        None => {
+                            for (_, sink) in sinks.drain() {
+                                let _ = sink.send(SinkEvent::Turn(failed.clone())).await;
+                            }
+                        }
                     }
                     break;
                 }

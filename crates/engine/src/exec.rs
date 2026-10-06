@@ -2274,6 +2274,27 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
     }
 
+    /// turn 烧毁(E5 性能会战:server 泵错误路径的原先弃置会让 active
+    /// 会话滞留 → GDN 格泄漏 → 2 格两轮耗尽)。与 complete 同构的清理,
+    /// 但**不 commit_turn/不进前缀缓存**(引擎错误后账面不可信;ephemeral
+    /// 直接焚,键控会话保留账本 —— 前缀守卫失配自动回退全量重算,安全)。
+    pub async fn abandon(&mut self, err: String) -> TurnEvent {
+        let turn_id = self.active.as_ref().map(|a| a.id).unwrap_or(0);
+        if let Some(act) = self.active.take() {
+            self.spec_drafts_host = None;
+            if act.ephemeral {
+                if let Some(s) = self.sessions.get_mut(act.session_id) {
+                    let mut table = std::mem::take(&mut s.block_table);
+                    self.blocks_m.release_table(&mut table);
+                    let mut mtp_table = std::mem::take(&mut s.mtp_block_table);
+                    self.blocks_mtp.release_table(&mut mtp_table);
+                }
+                self.sessions.close(act.session_id).ok();
+            }
+        }
+        TurnEvent::Failed { turn: turn_id, err }
+    }
+
     async fn complete(&mut self) -> Result<TurnEvent> {
         let act = self.active.take().expect("active");
         // spec 态清理(E5-M2b):陈旧草稿块作废( Continuation 已变,

@@ -759,6 +759,8 @@ impl<D: DeviceClient + 'static> Engine<D> {
             blocks_m,
             env,
             spec_depth,
+            sched_acc_ns: 0,
+            sched_cnt: 0,
             spec_mode,
             drafter,
             blocks_mtp,

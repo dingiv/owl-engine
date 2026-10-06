@@ -216,6 +216,24 @@ pub async fn load_27b_dflash2<D: DeviceClient + 'static>(
         );
         let src = crate::formats::w4a16::W4A16Source::open_dir(dir)?;
         let manifest = crate::interpreters::eval_load(&draft, face, &src, &ctx).await?;
+        // E5 内存账:草稿装载分类账(按 dtype×layout 聚合元素数与字节)
+        {
+            let mut agg: std::collections::BTreeMap<String, (u64, u64)> = Default::default();
+            for e in manifest.entries() {
+                let bytes: u64 = e.shape.iter().map(|&d| d as u64).product::<u64>()
+                    * match e.dtype {
+                        crate::contract::Dtype::F16 | crate::contract::Dtype::BF16 => 2,
+                        crate::contract::Dtype::F32 | crate::contract::Dtype::U32 => 4,
+                    };
+                let key = format!("{:?}/{:?}", e.dtype, e.layout);
+                let e2 = agg.entry(key).or_insert((0, 0));
+                e2.0 += 1;
+                e2.1 += bytes;
+            }
+            for (k, (n, b)) in agg {
+                eprintln!("[draft-mem] {k}: {n} 项 {b} ({:.2} GB)", b as f64 / 1e9);
+            }
+        }
         return Ok((draft, manifest));
     }
     let draft = crate::layers::dflash2::DFlash2Draft::new_with_plan_dt(
