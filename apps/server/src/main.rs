@@ -168,14 +168,20 @@ async fn serve(
             chat(&mut stream, &req.body, tx, &model_name).await?;
         }
         // 诊断分账出口(OWL_GPU_PROF=1 时 store 非空)—— 逐核 GPU 时
-        // 总账降序;TagReport 无 Serialize,手工投影(总 ms 计)
-        ("GET", "/debug/metrics") => {
-            let mut rows: Vec<serde_json::Value> = owl_shared::metrics::collect_metrics(
-                &owl_shared::metrics::MetricsFilter::new().limit(128),
-            )
+        // 总账降序;TagReport 无 Serialize,手工投影(总 ms 计);
+        // /debug/metrics/<prefix> = tag 前缀过滤(spec./load. …),
+        // 无前缀 = 全量(512 上限;动态 tag 增殖面已由 OWL_FACT_PROBE 门控)
+        ("GET", p) if p == "/debug/metrics" || p.starts_with("/debug/metrics/") => {
+            let prefix = p.strip_prefix("/debug/metrics/").unwrap_or("");
+            let mut filter = owl_shared::metrics::MetricsFilter::new().limit(512);
+            if !prefix.is_empty() {
+                filter = filter.tag_prefix(prefix);
+            }
+            let mut rows: Vec<serde_json::Value> = owl_shared::metrics::collect_metrics(&filter)
             .into_iter()
             .map(|r| json!({
                 "tag": r.tag, "count": r.count,
+                "counter": r.counter,
                 "total_ms": r.total.as_secs_f64() * 1e3,
                 "avg_ms": r.avg.as_secs_f64() * 1e3,
                 "p50_ms": r.p50.as_secs_f64() * 1e3,

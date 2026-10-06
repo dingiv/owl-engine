@@ -63,6 +63,10 @@ pub(crate) struct StepProbes {
     pub debug: bool,
     /// OWL_PREFILL_CKSUM(prefill 校验和)
     pub prefill_cksum: bool,
+    /// OWL_FACT_PROBE(逐轮事实值 mfact;UAF 案取证遗留 —— 无门控时
+    /// 每轮 ×9 个动态 tag 无限增殖(metrics tag 爆炸 + 每轮 host 开销),
+    /// 案结后默认关,2026-10-10 A1 复测踩中)
+    pub fact_probe: bool,
 }
 
 impl StepProbes {
@@ -73,6 +77,7 @@ impl StepProbes {
             gdn_dump: has("OWL_GDN_DUMP"),
             debug: has("OWL_DEBUG"),
             prefill_cksum: has("OWL_PREFILL_CKSUM"),
+            fact_probe: has("OWL_FACT_PROBE"),
         }
     }
 }

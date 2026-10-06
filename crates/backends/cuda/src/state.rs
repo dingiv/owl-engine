@@ -104,6 +104,10 @@ struct CaptureState {
     slab: Arc<CudaSlice<u8>>,
     used: usize,
     launches: usize,
+    /// 本图实际 slab 容量(warmup 计量定量或 env 固定档;carve 校验
+    /// 与 graph_begin 分配必须同口 —— 旧实现 carve 校验读 env,与
+    /// hint 定量的 slab 脱口,2026-10-10)
+    cap: usize,
 }
 
 /// CudaGraph 非 Send(cudarc 未标注);我们把它钉死在 actor 线程单一所有权
@@ -203,14 +207,24 @@ impl GpuCtx {
         stream
             .synchronize()
             .map_err(|e| ModelError::Msg(format!("graph_begin: 预排空失败 {e:?}")))?;
-        let slab_cap = capture_slab_bytes();
+        // slab 容量三档:env 显式 = 固定档(兼容);缺省 = warmup 计量
+        // hint(见 owl_shared::slab_hint;满额 × 图数 = VRAM 爆的工程债);
+        // hint 缺席 = 64MiB 兜底
+        let env_mb = std::env::var("OWL_CAPTURE_SLAB_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0);
+        let slab_cap = match env_mb {
+            Some(mb) => mb << 20,
+            None => owl_shared::slab_hint::take_hint().unwrap_or(64 << 20),
+        };
         let slab = unsafe { stream.alloc::<u8>(slab_cap) }
-            .map_err(|e| ModelError::Msg(format!("graph_begin: 捕获 slab 分配失败 {e:?}")))?;
+            .map_err(|e| ModelError::Msg(format!("graph_begin: 捕获 slab 分配失败({}MiB) {e:?}", slab_cap >> 20)))?;
         let slab = Arc::new(slab);
         stream
             .begin_capture(CAPTURE_MODE_THREAD_LOCAL)
             .map_err(|e| ModelError::Msg(format!("graph_begin: {e:?}")))?;
-        self.capture = Some(CaptureState { stream, slab, used: 0, launches: 0 });
+        self.capture = Some(CaptureState { stream, slab, used: 0, launches: 0, cap: slab_cap });
         Ok(())
     }
 
@@ -416,10 +430,10 @@ impl GpuCtx {
             eprintln!("[cap-prof] carve {}B", n);
         }
         let used = cap.used.div_ceil(CARVE_ALIGN) * CARVE_ALIGN;
-        let slab_cap = capture_slab_bytes();
+        let slab_cap = cap.cap;
         if used + n > slab_cap {
             return Err(ModelError::Msg(format!(
-                "捕获 slab 耗尽:已用 {used} + 对齐后需 {n} > {slab_cap}(OWL_CAPTURE_SLAB_MB 调大)"
+                "捕获 slab 耗尽:已用 {used} + 对齐后需 {n} > {slab_cap}(warmup 计量失准或 OWL_CAPTURE_SLAB_MB 固定档过小)"
             )));
         }
         let id = self.next_block;

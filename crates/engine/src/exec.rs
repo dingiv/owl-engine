@@ -654,14 +654,18 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // ⑧ 逐 token 发射(eos/预算;事件入队,pump 逐个出)
         {
             // 崩坏排查打点(E5-DF4):per-boot per-round 事实值
-            let bs = self.boot_seq;
-            let rn = self.spec_stats.rounds;
-            mfact(bs, &format!("r{rn}.pos"), pos as u64);
-            mfact(bs, &format!("r{rn}.m"), m as u64);
-            mfact(bs, &format!("r{rn}.bonus"), bonus as u64);
-            for (i, (&dv, &iv)) in drafts.iter().zip(ids.iter()).take(depth).enumerate() {
-                mfact(bs, &format!("r{rn}.d{i}"), dv as u64);
-                mfact(bs, &format!("r{rn}.i{i}"), iv as u64);
+            // (OWL_FACT_PROBE 门控;案结后默认关 —— 动态 tag 每轮 ×9
+            // 无限增殖,metrics tag 爆炸 + 512 上限挤掉真账,2026-10-10)
+            if self.probes.fact_probe {
+                let bs = self.boot_seq;
+                let rn = self.spec_stats.rounds;
+                mfact(bs, &format!("r{rn}.pos"), pos as u64);
+                mfact(bs, &format!("r{rn}.m"), m as u64);
+                mfact(bs, &format!("r{rn}.bonus"), bonus as u64);
+                for (i, (&dv, &iv)) in drafts.iter().zip(ids.iter()).take(depth).enumerate() {
+                    mfact(bs, &format!("r{rn}.d{i}"), dv as u64);
+                    mfact(bs, &format!("r{rn}.i{i}"), iv as u64);
+                }
             }
         }
         self.spec_stats.rounds += 1;

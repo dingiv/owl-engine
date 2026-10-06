@@ -206,13 +206,28 @@ impl<D: DeviceClient> GraphPlan<D> {
         };
 
         // ── warmup(姿势 6 lite):init 数据全链 eager dry 一遍 ──
+        // slab 定量(E8→A1,2026-10-10):warmup 前弃旧账,后取闭包真
+        // 分配字节 → hint = ×1.15 + 1MiB。env 显式设 OWL_CAPTURE_SLAB_MB
+        // 时固定档优先(state 侧裁决),此处不置 hint 兼容旧档位。
+        let _ = owl_shared::slab_hint::meter_take();
         sess.fill_slots(&[]).await?;
         sess.eval_current().await?;
         sess.face.sync().await?;
         sess.last.clear();
+        let metered = owl_shared::slab_hint::meter_take() as usize;
+        if std::env::var_os("OWL_CAPTURE_SLAB_MB").is_none() {
+            owl_shared::slab_hint::set_hint(metered + metered / 8 + (1 << 20));
+        }
 
         // ── 捕获(两道预检;窗内硬错直接上抛)──
-        let outcome = if desc.capture { sess.try_capture().await? } else { fallback("未请求捕获") };
+        let outcome = if desc.capture {
+            let r = sess.try_capture().await;
+            // 收尾:graph_begin 已消费 hint;失败路径防陈旧 hint 污染下一图
+            owl_shared::slab_hint::clear_hint();
+            r?
+        } else {
+            fallback("未请求捕获")
+        };
         Ok((sess, outcome))
     }
 

@@ -568,6 +568,9 @@ impl GpuServer {
         let result = unsafe { stream.alloc::<u8>(n_bytes) }
             .map_err(|e| ModelError::Msg(format!("alloc({n_bytes}B / {:.1}MiB): {e:?}", n_bytes as f64 / 1048576.0)))
             .and_then(|mut slice| {
+                // warmup 计量(slab 定量:owl_shared::slab_hint;仅真分配,
+                // carve 分支不计 —— 捕获窗用 slab 不产生新账)
+                owl_shared::slab_hint::meter_add(n_bytes as u64);
                 if zero {
                     stream
                         .memset_zeros(&mut slice)
