@@ -185,6 +185,7 @@ pub async fn load_27b_mtp<D: DeviceClient + 'static>(
 pub async fn load_27b_dflash2<D: DeviceClient + 'static>(
     dir: &Path,
     face: &mut D,
+    kv_fp8: bool,
 ) -> Result<(crate::layers::dflash2::DFlash2Draft, crate::module::LoadManifest), ModelError> {
     // 源族自动探测(fc.weight_scale 在 = compressed-tensors W4A16 g128;
     // 缺 = BF16 原生)。W4A16 = 1.28GB(BF16 3.85GB)—— 24G 恒等门前置。
@@ -213,6 +214,7 @@ pub async fn load_27b_dflash2<D: DeviceClient + 'static>(
             248320,
             crate::module::QuantPlan::W4A16,
             crate::contract::Dtype::BF16,
+        kv_fp8,
         );
         let src = crate::formats::w4a16::W4A16Source::open_dir(dir)?;
         let manifest = crate::interpreters::eval_load(&draft, face, &src, &ctx).await?;
@@ -247,6 +249,7 @@ pub async fn load_27b_dflash2<D: DeviceClient + 'static>(
         248320,
         crate::module::QuantPlan::F16,
         crate::contract::Dtype::BF16,
+        kv_fp8,
     );
     let src = SafeTensorsSource::open_dir(dir)?;
     let manifest = crate::interpreters::eval_load(&draft, face, &src, &ctx).await?;
@@ -1217,7 +1220,7 @@ mod tests {
         };
         let dir = std::path::Path::new(&dir);
         let mut gpu = crate::testkit::gpu_client().await;
-        let (draft, manifest) = load_27b_dflash2(dir, &mut gpu)
+        let (draft, manifest) = load_27b_dflash2(dir, &mut gpu, false)
             .await
             .expect("DFlash2 装载");
         assert_eq!(draft.hidden(), 5120);

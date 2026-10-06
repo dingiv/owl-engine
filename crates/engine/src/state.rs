@@ -97,6 +97,7 @@ pub(crate) struct StatePool {
     /// B6.2:主 KV 池 fp8 e4m3 承载(true = 池块 U32 字节承载 1B/elem;
     /// 读核走 *_fp8 变体,写核 K0 转换写)
     pub(crate) kv_fp8: bool,
+    pub(crate) dflash_fp8: bool,
     gdns: Vec<GdnBlocks>,
     snaps: Vec<GdnSnapSlot>,
     snap_tick: u64,
@@ -135,6 +136,7 @@ impl StatePool {
         pool_tokens: usize,
         fi: Option<owl_models::env::KvQuant>,
         kv_fp8: bool,
+        dflash_fp8: bool,
         spec: bool,
         mtp: bool,
         dflash: bool,
@@ -236,11 +238,17 @@ impl StatePool {
         // dims.dtype —— 同 2B/elem,几何 page/x 不变)
         let dflash_kvs = if dflash && paged {
             let (dkv, dhd, dlayers) = (8usize, 128usize, 5usize);
+            // B6 偷显存:草稿池 e4m3(OWL_DFLASH_KV_FP8;1B/elem,U32 字节承载)
+            let (df_elems, df_dt) = if dflash_fp8 {
+                (nb * dkv * dhd * page / 4, Dtype::U32)
+            } else {
+                (nb * dkv * dhd * page, Dtype::BF16)
+            };
             let mut ks = Vec::with_capacity(dlayers);
             for _ in 0..dlayers {
                 ks.push(KvBlocks {
-                    k_cache: zero_block_dt(face, nb * dkv * dhd * page, Dtype::BF16).await?,
-                    v_cache: zero_block_dt(face, nb * dkv * dhd * page, Dtype::BF16).await?,
+                    k_cache: zero_block_dt(face, df_elems, df_dt).await?,
+                    v_cache: zero_block_dt(face, df_elems, df_dt).await?,
                 });
             }
             Some(ks)
@@ -342,7 +350,7 @@ impl StatePool {
             None
         };
         Ok(StatePool { kvs, k_fis, v_fis, fi_quant: fi,
-            kv_fp8, gdns, snaps, snap_tick: 0, bt, bt_mtp, spec_snap, mtp_kvs, dflash_kvs, attn_v2, page, nb, paged, x, dims })
+            kv_fp8, dflash_fp8, gdns, snaps, snap_tick: 0, bt, bt_mtp, spec_snap, mtp_kvs, dflash_kvs, attn_v2, page, nb, paged, x, dims })
     }
 
     /// MTP 链块表叶子(propose 图烘焙;None = 未启用)
@@ -385,6 +393,19 @@ impl StatePool {
     pub(crate) fn dflash_kv_leaves(&self) -> Option<Vec<(TensorOps, TensorOps)>> {
         let ks = self.dflash_kvs.as_ref()?;
         let (dkv, dhd) = (8usize, 128usize);
+        // B6:fp8 草稿池 = U32 扁平字节账(主池同款)
+        if self.dflash_fp8 {
+            let shape = vec![self.nb * dkv * dhd * self.page / 4];
+            return Some(ks
+                .iter()
+                .map(|kb| {
+                    (
+                        block_leaf_dt(&kb.k_cache.0, shape.clone(), Dtype::U32),
+                        block_leaf_dt(&kb.v_cache.0, shape.clone(), Dtype::U32),
+                    )
+                })
+                .collect());
+        }
         Some(ks
             .iter()
             .map(|kb| {

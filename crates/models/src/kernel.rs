@@ -218,6 +218,9 @@ pub static REGISTRY: &[Entry] = &[
     // v2 签名(E5-DF4):去 q_tokens(grid.y=T 承担);kv_len 张量读
     Entry { name: "owl_naive_attn_nc_f16", source: sources::owl::DFLASH2_F16, args: "T,T,T,T,T,T,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_naive_attn_nc_bf16", source: sources::owl::DFLASH2_F16, args: "T,T,T,T,T,T,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::BF16 },
+    // ---- B6 偷显存:fp8kv 变体(前缀池 e4m3;自块/出 = 原 dtype)----
+    Entry { name: "owl_naive_attn_nc_fp8kv_f16", source: sources::owl::DFLASH2_F16, args: "T,T,T,T,T,T,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "owl_naive_attn_nc_fp8kv_bf16", source: sources::owl::DFLASH2_F16, args: "T,T,T,T,T,T,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::BF16 },
     // ---- 融合核族(C1;2026-10-01;Ampere-first,单输出 SSA 契约友好)----
     // norm_rope:qk-norm(×(1+w)^{w_off})+ rotate-half partial rope 三发合一
     // (narrow+norm+rope;strided 读 q_raw 的 per-head [value|gate] 半段)

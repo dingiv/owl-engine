@@ -175,7 +175,9 @@ impl<D: DeviceClient + 'static> Engine<D> {
             }
             crate::running::SpecMode::DFlash2 => {
                 let dir = dflash2_dir.as_ref().expect("dflash2_dir");
-                let (d2, _) = owl_models::specs::qwen35::load_27b_dflash2(std::path::Path::new(dir), &mut self.face).await?;
+                // B6 偷显存:草稿池 e4m3(可配;默认关 —— AL 有损需 A/B)
+                let draft_kv_fp8 = std::env::var_os("OWL_DFLASH_KV_FP8").is_some();
+                let (d2, _) = owl_models::specs::qwen35::load_27b_dflash2(std::path::Path::new(dir), &mut self.face, draft_kv_fp8).await?;
                 eprintln!("[boot] DFlash2 草稿装载(depth={spec_depth};1.92B BF16 激活,sglang 对齐)");
                 Some(crate::running::Drafter::DFlash2(std::sync::Arc::new(d2)))
             }
@@ -202,7 +204,9 @@ impl<D: DeviceClient + 'static> Engine<D> {
         if kv_fp8 {
             eprintln!("[boot] KV 池 fp8 e4m3(容量减半/ctx 翻倍;读核 *_fp8 变体)");
         }
-        let pool = StatePool::alloc(&mut self.face, dims, &loaded.spec.layer_types, s, pool_tokens, fi_quant, kv_fp8, spec_depth > 0, spec_mode == crate::running::SpecMode::Mtp, spec_mode == crate::running::SpecMode::DFlash2).await?;
+        // B6 偷显存:草稿池 e4m3(与草稿装载同旗标)
+        let dflash_fp8 = std::env::var_os("OWL_DFLASH_KV_FP8").is_some();
+        let pool = StatePool::alloc(&mut self.face, dims, &loaded.spec.layer_types, s, pool_tokens, fi_quant, kv_fp8, dflash_fp8, spec_depth > 0, spec_mode == crate::running::SpecMode::Mtp, spec_mode == crate::running::SpecMode::DFlash2).await?;
         if fi_quant.is_some() {
             eprintln!(
                 "[boot] FlashInfer prefill 面启用(影子池 ×{},quant={:?})",

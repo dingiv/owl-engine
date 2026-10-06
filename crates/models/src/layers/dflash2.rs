@@ -173,10 +173,12 @@ pub struct DfAttn {
     hidden: usize,
     /// 激活/池 dtype(同日十四;池叶子由引擎侧同 dtype 分配)
     dt: Dtype,
+    /// B6 偷显存:前缀池 e4m3(写/读走 fp8kv 变体;默认 false)
+    kv_fp8: bool,
 }
 
 impl DfAttn {
-    pub fn new(hq: usize, hkv: usize, hd: usize, hidden: usize, eps: f32, plan: QuantPlan, dt: Dtype) -> Self {
+    pub fn new(hq: usize, hkv: usize, hd: usize, hidden: usize, eps: f32, plan: QuantPlan, dt: Dtype, kv_fp8: bool) -> Self {
         Self {
             q_proj: Linear::new("q_proj", hq * hd, hidden, plan),
             k_proj: Linear::new("k_proj", hkv * hd, hidden, plan),
@@ -192,13 +194,22 @@ impl DfAttn {
             hd,
             hidden,
             dt,
+            kv_fp8,
         }
     }
 
     /// classic 池几何(页宽 / interleave 因子;叶子 shape [nb, hkv, hd/x, page, x])
     fn pool_geom(kv: &KvBuffers) -> (usize, usize) {
+        // B6:fp8 扁平账叶(len 1)无几何 —— 走 kv_paged_policy 单源
+        // (draft 池 BF16 档;非扁平叶仍从形状读,双保险)
         let sh = kv.k_cache.shape();
-        (sh[3], sh[4])
+        if sh.len() >= 5 {
+            (sh[3], sh[4])
+        } else {
+            let pol = crate::module::kv_paged_policy(Dtype::F16)
+                .expect("draft 池几何:F16 策略");
+            (pol.page, pol.x)
+        }
     }
 
     /// norm+rope(ATTN_NORM_ROPE plain 布局:row_stride = 行全长,
@@ -370,11 +381,12 @@ impl DfLayer {
         block_size: usize,
         plan: QuantPlan,
         dt: Dtype,
+        kv_fp8: bool,
     ) -> Self {
         Self {
             input_ln: RmsNorm::new("input_layernorm", hidden, eps),
             attn_conv: GroupedConv::new(hidden, block_size, dt),
-            attn: DfAttn::new(hq, hkv, hd, hidden, eps, plan, dt),
+            attn: DfAttn::new(hq, hkv, hd, hidden, eps, plan, dt, kv_fp8),
             post_ln: RmsNorm::new("post_attention_layernorm", hidden, eps),
             mlp_conv: GroupedConv::new(hidden, block_size, dt),
             mlp: Mlp::new(hidden, inter, plan),
@@ -590,6 +602,8 @@ pub struct DFlash2Draft {
     hidden: usize,
     eps: f32,
     vocab: usize,
+    /// B6 偷显存:草稿池 e4m3(encode 写/NC 读走 fp8kv;默认 false)
+    pub(crate) kv_fp8: bool,
     /// 草稿激活 dtype(F16 存量测试面 / BF16 生产,sglang 对齐 ——
     /// 真实权重激活超 f16 范围,E5-DF3 同日十四定谳)
     dt: Dtype,
@@ -608,6 +622,7 @@ impl DFlash2Draft {
         n_layers: usize,
         eps: f32,
         vocab: usize,
+        kv_fp8: bool,
     ) -> Self {
         Self::new_with_plan_dt(
             hidden,
@@ -620,6 +635,7 @@ impl DFlash2Draft {
             vocab,
             QuantPlan::F16,
             Dtype::F16,
+            kv_fp8,
         )
     }
 
@@ -635,8 +651,9 @@ impl DFlash2Draft {
         eps: f32,
         vocab: usize,
         plan: QuantPlan,
+        kv_fp8: bool,
     ) -> Self {
-        Self::new_with_plan_dt(hidden, inter, hq, hkv, hd, n_layers, eps, vocab, plan, Dtype::F16)
+        Self::new_with_plan_dt(hidden, inter, hq, hkv, hd, n_layers, eps, vocab, plan, Dtype::F16, kv_fp8)
     }
 
     /// 全参数构造(dt 显式;生产 = BF16,sglang 对齐,E5-DF3 同日十四:
@@ -653,6 +670,7 @@ impl DFlash2Draft {
         vocab: usize,
         plan: QuantPlan,
         dt: Dtype,
+        kv_fp8: bool,
     ) -> Self {
         let fc = match plan {
             QuantPlan::W4A16 => DraftFc::Q((0..n_layers)
@@ -677,7 +695,7 @@ impl DFlash2Draft {
             fc,
             hidden_norm: RmsNorm::new("hidden_norm", hidden, eps),
             layers: (0..n_layers)
-                .map(|_| DfLayer::new(hq, hkv, hd, hidden, inter, eps, BLOCK, plan, dt))
+                .map(|_| DfLayer::new(hq, hkv, hd, hidden, inter, eps, BLOCK, plan, dt, kv_fp8))
                 .collect(),
             norm: RmsNorm::new("norm", hidden, eps),
             selector: CandidateSelector::new(hidden, vocab, RANK, dt),
@@ -685,6 +703,7 @@ impl DFlash2Draft {
             eps,
             vocab,
             dt,
+            kv_fp8,
         }
     }
 

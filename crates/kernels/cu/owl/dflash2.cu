@@ -24,6 +24,9 @@
 // ============================================================================
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #ifdef __CUDACC_RTC__
 typedef int int32_t;
@@ -335,12 +338,13 @@ extern "C" __global__ void owl_dflash_select_bf16(
 //   一维(acc 单寄存器)。v1 一 thread 一行 + acc[512] 溢出 local memory +
 //   全程单 block(82 SM 占用 1.2%),实测 804µs/次。每 kv 行一次块内
 //   归约(q·k);m/l/p 行标量住 shared,thread-0 独写。
-extern "C" __global__ void owl_naive_attn_nc_f16(
+// ---- B6 偷显存:fp8kv 变体(前缀池 e4m3 读入即转;自块直读保持原 dtype)----
+extern "C" __global__ void owl_naive_attn_nc_fp8kv_f16(
     const __half* __restrict__ q,      // [T, Hq, D]
     const __half* __restrict__ k_self, // [T, Hkv, D](自块直读)
     const __half* __restrict__ v_self, // 同上
-    const __half* __restrict__ kc,     // classic 前缀 [nb, Hkv, hd/x, page, x]
-    const __half* __restrict__ vc,     // classic 前缀 [nb, Hkv, hd, page]
+    const unsigned char* __restrict__ kc,     // classic 前缀 [nb, Hkv, hd/x, page, x](e4m3)
+    const unsigned char* __restrict__ vc,     // classic 前缀 [nb, Hkv, hd, page](e4m3)
     const float* __restrict__ kv_len_p, // [1] 全窗 = 前缀 + T(契约 5;
                                        // E5-DF4 图化:运行时读,曾宿主烘焙)
     int q_heads, int kv_heads, int d_dim,
@@ -371,8 +375,10 @@ extern "C" __global__ void owl_naive_attn_nc_f16(
         if (srow < prefix_len) {
             const int b = srow / page;
             const int off = srow % page;
-            kv = __half2float(kc[((long long)b * kv_heads + kvh) * hd_x * page * x
-                                 + (long long)(d / x) * page * x + off * x + d % x]);
+            // B6 偷显存:前缀池 e4m3 读入即转(元素序 = 字节序)
+            __nv_fp8_e4m3 ke; ke.__x = kc[((long long)b * kv_heads + kvh) * hd_x * page * x
+                                 + (long long)(d / x) * page * x + off * x + d % x];
+            kv = __half2float(__half(ke));
         } else {
             const int st = srow - prefix_len;
             kv = __half2float(k_self[((long long)st * kv_heads + kvh) * d_dim + d]);
@@ -398,8 +404,9 @@ extern "C" __global__ void owl_naive_attn_nc_f16(
         if (srow < prefix_len) {
             const int b = srow / page;
             const int off = srow % page;
-            p *= __half2float(vc[((long long)b * kv_heads + kvh) * d_dim * page
-                                 + (long long)d * page + off]);
+            __nv_fp8_e4m3 ve; ve.__x = vc[((long long)b * kv_heads + kvh) * d_dim * page
+                                 + (long long)d * page + off];
+            p *= __half2float(__half(ve));
         } else {
             const int st = srow - prefix_len;
             p *= __half2float(v_self[((long long)st * kv_heads + kvh) * d_dim + d]);
@@ -483,4 +490,82 @@ extern "C" __global__ void owl_naive_attn_nc_bf16(
         __syncthreads();
     }
     out[((long long)t * q_heads + h) * d_dim + d] = __float2bfloat16(acc / s_l);
+}
+
+extern "C" __global__ void owl_naive_attn_nc_fp8kv_bf16(
+    const __nv_bfloat16* __restrict__ q,      // [T, Hq, D]
+    const __nv_bfloat16* __restrict__ k_self, // [T, Hkv, D](自块直读)
+    const __nv_bfloat16* __restrict__ v_self, // 同上
+    const unsigned char* __restrict__ kc,     // classic 前缀 [nb, Hkv, hd/x, page, x](e4m3)
+    const unsigned char* __restrict__ vc,     // classic 前缀 [nb, Hkv, hd, page](e4m3)
+    const float* __restrict__ kv_len_p, // [1] 全窗 = 前缀 + T(契约 5;
+                                       // E5-DF4 图化:运行时读,曾宿主烘焙)
+    int q_heads, int kv_heads, int d_dim,
+    int page, int x,
+    __nv_bfloat16* __restrict__ out) {        // [T, Hq, D]
+    const int t = blockIdx.x;
+    const int h = blockIdx.y;
+    const int d = threadIdx.x;
+    const int hd = blockDim.x;
+    const int kvh = h / (q_heads / kv_heads);
+    const int hd_x = d_dim / x;
+    const int kv_len = (int)kv_len_p[0];
+    const int prefix_len = kv_len - gridDim.x;
+
+    const __nv_bfloat16* qs = q + ((long long)t * q_heads + h) * d_dim;
+    const float scale = rsqrtf((float)d_dim);
+
+    __shared__ float red[512];  // 块内归约(hd ≤ 512:draft 128 / target 256)
+    __shared__ float s_m, s_l, s_resc, s_p;
+
+    const float qd = __bfloat162float(qs[d]);
+    float acc = 0.0f;
+    if (d == 0) { s_m = -3.0e38f; s_l = 0.0f; }
+    __syncthreads();
+
+    for (int srow = 0; srow < kv_len; ++srow) {
+        float kv;
+        if (srow < prefix_len) {
+            const int b = srow / page;
+            const int off = srow % page;
+            // B6 偷显存:前缀池 e4m3 读入即转(元素序 = 字节序)
+            __nv_fp8_e4m3 ke; ke.__x = kc[((long long)b * kv_heads + kvh) * hd_x * page * x
+                                 + (long long)(d / x) * page * x + off * x + d % x];
+            kv = __bfloat162float(__float2bfloat16_rn(float(ke)));
+        } else {
+            const int st = srow - prefix_len;
+            kv = __bfloat162float(k_self[((long long)st * kv_heads + kvh) * d_dim + d]);
+        }
+        red[d] = qd * kv;
+        __syncthreads();
+        for (int s2 = hd / 2; s2 > 0; s2 >>= 1) {
+            if (d < s2) red[d] += red[d + s2];
+            __syncthreads();
+        }
+        if (d == 0) {
+            const float dot = red[0] * scale;
+            const float m_new = fmaxf(s_m, dot);
+            const float resc = __expf(s_m - m_new);
+            const float p = __expf(dot - m_new);
+            s_l = s_l * resc + p;
+            s_resc = resc;
+            s_p = p;
+            s_m = m_new;
+        }
+        __syncthreads();
+        float p = s_p;
+        if (srow < prefix_len) {
+            const int b = srow / page;
+            const int off = srow % page;
+            __nv_fp8_e4m3 ve; ve.__x = vc[((long long)b * kv_heads + kvh) * d_dim * page
+                                 + (long long)d * page + off];
+            p *= __bfloat162float(__float2bfloat16_rn(float(ve)));
+        } else {
+            const int st = srow - prefix_len;
+            p *= __bfloat162float(v_self[((long long)st * kv_heads + kvh) * d_dim + d]);
+        }
+        acc = acc * s_resc + p;
+        __syncthreads();
+    }
+    out[((long long)t * q_heads + h) * d_dim + d] = __float2bfloat16_rn(acc / s_l);
 }
