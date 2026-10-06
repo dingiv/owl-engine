@@ -465,7 +465,33 @@ impl GpuCtx {
     /// 中间块回收(E2a):移除 Owned 块(CudaSlice drop → 流序
     /// free_async 归还设备池);Carved 块(slab 切片)跳过不删;
     /// 未知 id 容错跳过(幂等)。返回实际回收数。
+    /// **E5 跨流回收律(2026-10-08 崩坏案修正)**:free_async 落在块自身
+    /// 分配流(htod 块 = H2D,队列浅,free 立即归池),而 COMPUTE 可能
+    /// 还压着该块的在途读者(65 层深队列)——设备池把同址发给下一个
+    /// alloc 即成跨流 UAF。旧注“流序安全”仅对同流复用成立。修法:drop
+    /// 前 COMPUTE 记事件,H2D/D2H wait 之 —— free 被钉在读者排空后,任意
+    /// 流复用皆安全;COMPUTE 同流复用本就保序不受影响。指纹全吻合:
+    /// dtoh 排空掩蔽 / bisect 0/10 / GDN 臂无关 / 冷 boot 首选(与塔零
+    /// 案同病,当时只修了 dtoh 侧)。捕获期跳过(事件会被烤进图)。
     pub(super) fn free_blocks(&mut self, ids: &[u64]) -> usize {
+        let any_owned = ids
+            .iter()
+            .any(|id| self.blocks.get(id).is_some_and(|(b, _)| matches!(b, Block::Owned(_))));
+        if any_owned && self.capture.is_none() {
+            if let (Ok(comp), Ok(h2d), Ok(d2h)) = (
+                self.stream(STREAM_COMPUTE),
+                self.stream(STREAM_H2D),
+                self.stream(STREAM_D2H),
+            ) {
+                match comp.record_event(None) {
+                    Ok(ev) => {
+                        let _ = h2d.wait(&ev);
+                        let _ = d2h.wait(&ev);
+                    }
+                    Err(_) => {} // 事件失败回旧语义(不让回收路径崩)
+                }
+            }
+        }
         let mut n = 0;
         for id in ids {
             let owned = self
@@ -473,7 +499,7 @@ impl GpuCtx {
                 .get(id)
                 .is_some_and(|(b, _)| matches!(b, Block::Owned(_)));
             if owned && self.blocks.remove(id).is_some() {
-                n += 1; // drop 链 = free_async(块自身流,流序安全)
+                n += 1; // drop 链 = free_async(块自身流;已按上律钉序)
             }
         }
         n

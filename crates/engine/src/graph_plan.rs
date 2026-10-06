@@ -241,6 +241,16 @@ impl<D: DeviceClient> GraphPlan<D> {
     }
 
 
+    /// 裸回放(E5-DF4 性能判别:不装填输入,纯 launch + 同步由调用方;
+    /// 用于测量图独占 GPU 时间 —— 队列排水污染排查)
+    pub async fn replay(&mut self) -> Result<()> {
+        match self.mode {
+            Mode::Captured { graph } => self.face.graph_launch(graph).await?,
+            Mode::Eager => self.eval_current().await?,
+        }
+        Ok(())
+    }
+
     /// 刀D 取证:输入槽原始字节回读(ts_buf 时间线;同步后调用)
     pub async fn read_input_slot_bytes(&mut self, name: &str) -> Result<Vec<u8>> {
         let slot = self

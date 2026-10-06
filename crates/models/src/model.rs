@@ -160,6 +160,53 @@ impl Model {
         }
     }
 
+    /// E5-DF4 崩坏排查:逐层 bisect + 指定层五站 stage tap(非 dflash
+    /// 诊断路;与 forward_stages 同式非原地展开,自洽即可)。调用方
+    /// multi eval 后自行收割 checksum;gdn 层的 ctx.gdn_tap 若设,
+    /// stage 层的 8 件(gdn 前向内部节点)一并带出。
+    /// 返回 (fin, [(名, 节点)]):名 = embed / l{i} / s{L}.{n1|mixed|h|n2|mlp|out|g{j}.f} / fin。
+    pub fn prefill_bisect(
+        &self,
+        ids: &TensorOps,
+        ctx: &ForwardCtx,
+        stage_layer: Option<usize>,
+    ) -> (TensorOps, Vec<(String, TensorOps)>) {
+        let mut nodes: Vec<(String, TensorOps)> = Vec::new();
+        let mut xs = self.embed.forward(ids, ctx).tag("embed");
+        nodes.push(("embed".into(), xs.clone()));
+        let (mut kvi, mut gi) = (0usize, 0usize);
+        for (li, layer) in self.layers.iter().enumerate() {
+            let sub = self.layer_ctx(ctx, kvi, gi);
+            if Some(li) == stage_layer {
+                // 六站展开(与 forward_stages 逐式同源;gdn_tap 若设,
+                // mixer 内自推 8 件 → 层后收割)
+                let st = layer.forward_bisect_stages(&xs, &sub);
+                let names = ["n1", "mixed", "h", "n2", "mlp", "out"];
+                for (j, n) in st.iter().enumerate() {
+                    nodes.push((format!("s{li}.{}", names[j]), n.clone()));
+                }
+                if let Some(tap) = &sub.gdn_tap {
+                    let gdn_fields = ["q", "k", "v", "qn", "kn", "vc", "g", "beta"];
+                    for (j, n) in tap.borrow_mut().drain(..).enumerate() {
+                        nodes.push((format!("s{li}.g{}", gdn_fields[j % 8]), n));
+                    }
+                }
+                xs = st[5].clone();
+            } else {
+                xs = layer.forward(&xs, &sub);
+            }
+            if layer.is_full() {
+                kvi += 1;
+            } else {
+                gi += 1;
+            }
+            nodes.push((format!("l{li}"), xs.clone()));
+        }
+        let fin = self.norm.forward(&xs, ctx);
+        nodes.push(("fin".into(), fin.clone()));
+        (fin, nodes)
+    }
+
     /// 主干声明至 last hidden(pre-lm_head;MTP/深栈支线的挂点)
     pub fn last_hidden(&self, ids: &TensorOps, ctx: &ForwardCtx) -> TensorOps {
         // 层根自动打标(interpreter-tap.md §3.2):Model 是唯一知道层坐标

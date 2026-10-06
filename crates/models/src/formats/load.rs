@@ -56,6 +56,8 @@ where
     // 上载栅栏:全部 DMA 落定后方可进入计算域(upload_pinned 入队即回执,
     // 完成语义由本栅栏一次总代价兜底)
     face.sync().await?;
+    // 装载校验(OWL_LOAD_VERIFY 门控):整块回读 vs staged 校验和
+    verify_loaded(&manifest, face).await?;
     let ids = std::mem::take(&mut *deferred.lock().unwrap());
     if !ids.is_empty() {
         face.free(&ids).await?;
@@ -204,6 +206,81 @@ async fn load_group<D: DeviceClient, S: WeightSource + ?Sized>(
     Ok(manifest)
 }
 
+// ============================================================================
+// §3.1 装载校验(E5-DF4;OWL_LOAD_VERIFY 门控):staged FNV-1a 64 →
+// 装载后整块回读对比。抓:DMA 半成品/池污染/装载后覆写;metrics 标签
+// `loadv.{key}` = 校验和(双 boot 对比定位被写坏的具体键)。
+// ============================================================================
+
+/// FNV-1a 64(字批量混入)
+fn fnv1a(data: &[u8], init: u64) -> u64 {
+    let mut h = init;
+    let mut chunks = data.chunks_exact(8);
+    for c in &mut chunks {
+        let w = u64::from_le_bytes(c.try_into().unwrap());
+        h = (h ^ w).wrapping_mul(0x100000001b3);
+    }
+    for b in chunks.remainder() {
+        h = (h ^ (*b as u64)).wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+fn load_verify_enabled() -> bool {
+    std::env::var_os("OWL_LOAD_VERIFY").is_some()
+}
+
+/// 装载后回读校验(eval_load 栅栏后调用;OWL_LOAD_VERIFY 门控):
+/// 每键整块 dtoh 重哈希对比 staged 校验和;metrics 标签 `loadv.{key}`;
+/// 失配 = 结构化错误(列出键)。DeviceRearrange 臂(csum=0)跳读。
+pub async fn verify_loaded<D: DeviceClient>(
+    manifest: &LoadManifest,
+    face: &mut D,
+) -> Result<(), ModelError> {
+    if !load_verify_enabled() {
+        return Ok(());
+    }
+    let t0 = std::time::Instant::now();
+    let mut bad: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+    for e in manifest.entries() {
+        if e.csum == 0 {
+            continue; // 重排臂/未校验
+        }
+        let n: usize = e.shape.iter().product();
+        let esz = e.dtype.size_bytes();
+        let total = n * esz;
+        let mut h = 0xcbf29ce484222325u64;
+        // dtoh 整块契约:缓冲必须等大(分块回读会被拒)
+        let mut buf = vec![0u8; total];
+        face.dtoh(&e.block, &mut buf)
+            .await
+            .map_err(|err| ModelError::Msg(format!("verify '{}': {err}", e.key)))?;
+        h = fnv1a(&buf, h);
+        owl_shared::metrics::with_metrics_store(|s| {
+            s.counter_add(&format!("loadv.{}", e.key), h & 0x7fff_ffff_ffff_ffff, file!(), line!());
+        });
+        if h != e.csum {
+            bad.push(e.key.clone());
+        }
+        checked += 1;
+    }
+    let skipped = manifest.entries().len() - checked;
+    eprintln!(
+        "[load-verify] checked={checked} skipped(rearrange)={skipped} mismatch={} {:.2}s",
+        bad.len(),
+        t0.elapsed().as_secs_f64()
+    );
+    if !bad.is_empty() {
+        return Err(ModelError::Msg(format!(
+            "装载校验失配 {} 键:{}",
+            bad.len(),
+            bad.iter().take(8).cloned().collect::<Vec<_>>().join(", ")
+        )));
+    }
+    Ok(())
+}
+
 /// 直接臂(主路径):设备块 → [pinned 租约 → 源直写字节 → DMA] × N 块。
 /// 大张量自动多块,每 4 块排空一次(租约回池,码头零 churn)。
 async fn load_direct<D: DeviceClient, S: WeightSource + ?Sized>(
@@ -221,6 +298,8 @@ async fn load_direct<D: DeviceClient, S: WeightSource + ?Sized>(
         .map_err(|e| ModelError::Msg(format!("Weight '{}': {e}", w.key)))?;
     let chunk_elems = (CHUNK_BYTES / esz).max(1);
     let mut off = 0usize;
+    let verify = load_verify_enabled();
+    let mut csum = 0xcbf29ce484222325u64;
     while off < n {
         let len = chunk_elems.min(n - off);
         let mut lease = {
@@ -233,6 +312,9 @@ async fn load_direct<D: DeviceClient, S: WeightSource + ?Sized>(
             let _s = probe.span("convert");
             src.convert_chunk_into_bytes(&w.key, off, len, lease.slice_bytes_mut(), w.dtype)
                 .ok_or_else(|| attribution(src, &w.key, n))?;
+        }
+        if verify {
+            csum = fnv1a(&lease.slice_bytes_mut()[..len * esz], csum);
         }
         {
             let _s = probe.span("htod");
@@ -252,6 +334,7 @@ async fn load_direct<D: DeviceClient, S: WeightSource + ?Sized>(
         shape: w.shape.clone(),
         layout: Layout::Direct,
         block: crate::contract::Bytes::new(b.id, n),
+        csum: if verify { csum } else { 0 },
     })
 }
 
@@ -393,6 +476,7 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
         shape: w.shape.clone(),
         layout: Layout::DeviceRearrange { op, rows, cols },
         block: crate::contract::Bytes::new(out_block.id, n),
+        csum: 0, // staged = raw 而块 = 重排后:回读不可比,深校验挂账
     })
 }
 
@@ -438,6 +522,7 @@ async fn load_transposed<D: DeviceClient, S: WeightSource + ?Sized>(
         shape: w.shape.clone(),
         layout: Layout::Transposed,
         block: crate::contract::Bytes::new(b.id, n),
+        csum: if load_verify_enabled() { fnv1a(&bytes, 0xcbf29ce484222325) } else { 0 },
     })
 }
 

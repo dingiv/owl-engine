@@ -138,6 +138,8 @@ pub struct RunningEngine<D: DeviceClient> {
     pub(crate) dflash_mem_dumped2: bool,
     /// propose hidden 落盘一次性门(同上)
     pub(crate) dflash_hid_dumped: bool,
+    /// boot 序号(metrics 打点命名空间;进程内自增,b1/b2…)
+    pub(crate) boot_seq: u64,
     /// spec 接受账(M2b 恒等门覆盖断言:三路 m 分布 + 账目闭合)
     pub(crate) spec_stats: SpecStats,
     /// spec 快照有效性(轮首拍;恢复后仍有效,全接受后失效重拍)

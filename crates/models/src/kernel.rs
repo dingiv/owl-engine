@@ -202,8 +202,9 @@ pub static REGISTRY: &[Entry] = &[
     // selector BF16 变体(proj/a_tab/b_tab bf16,码本原生 BF16;cand/unary/out f32)
     Entry { name: "owl_dflash_select_bf16", source: sources::owl::DFLASH2_F16, args: "T,T,T,T,T,T,i32,i32,i32,T", dtype: crate::contract::Dtype::F32 },
     // 非因果块 attention(自块直读 + 前缀池;classic 寻址同 reshape_and_cache)
-    Entry { name: "owl_naive_attn_nc_f16", source: sources::owl::DFLASH2_F16, args: "T,T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_naive_attn_nc_bf16", source: sources::owl::DFLASH2_F16, args: "T,T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::BF16 },
+    // v2 签名(E5-DF4):去 q_tokens(grid.y=T 承担);kv_len 张量读
+    Entry { name: "owl_naive_attn_nc_f16", source: sources::owl::DFLASH2_F16, args: "T,T,T,T,T,T,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "owl_naive_attn_nc_bf16", source: sources::owl::DFLASH2_F16, args: "T,T,T,T,T,T,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::BF16 },
     // ---- 融合核族(C1;2026-10-01;Ampere-first,单输出 SSA 契约友好)----
     // norm_rope:qk-norm(×(1+w)^{w_off})+ rotate-half partial rope 三发合一
     // (narrow+norm+rope;strided 读 q_raw 的 per-head [value|gate] 半段)

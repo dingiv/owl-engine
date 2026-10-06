@@ -1083,16 +1083,62 @@ async fn gpu_27b_chat_inference() {
             // (异步;下一实例 17G 分配会与释放赛跑 → 2026-10-07 baseline
             // 非确定性定谳)
             drop(running);
-            std::thread::sleep(std::time::Duration::from_secs(3));
+            std::thread::sleep(std::time::Duration::from_secs(10)); // E5-DF4:交接排空 3s→10s(非确定性崩排查)
             (text, toks)
         }
 
         let t0 = std::time::Instant::now();
         let (ta, ta_tokens) = gen(false, ordinal, &dir, &ddir, &prompt).await;
         let t_base = t0.elapsed();
+        // E5-DF4:b1 事实 dump(prefill bisect 层 checksum / pf.last / emit)
+        owl_shared::metrics::query_metrics(
+            &owl_shared::metrics::MetricsFilter::new().tag_prefix("b1."),
+        );
+        // E5-DF4 装载校验快照(b1;OWL_LOAD_VERIFY=1 时 loader 回读对比 +
+        // metrics 记 `loadv.{key}` = 校验和)
+        let l1: std::collections::HashMap<String, u64> = owl_shared::metrics::collect_metrics(
+            &owl_shared::metrics::MetricsFilter::new().tag_prefix("loadv."),
+        )
+        .into_iter()
+        .map(|r| (r.tag.clone(), r.counter))
+        .collect();
+        owl_shared::metrics::reset_metrics();
         let t1 = std::time::Instant::now();
         let (tb, tb_tokens) = gen(true, ordinal, &dir, &ddir, &prompt).await;
         let t_spec = t1.elapsed();
+        let l2: std::collections::HashMap<String, u64> = owl_shared::metrics::collect_metrics(
+            &owl_shared::metrics::MetricsFilter::new().tag_prefix("loadv."),
+        )
+        .into_iter()
+        .map(|r| (r.tag.clone(), r.counter))
+        .collect();
+        // 双 boot 按键校验和 diff(类 1 装载非确定的决定性仪表):
+        // 共有键校验和不同 = 装载竞态实锤;l2 独有 = 草稿键(b2 专属,预期)
+        {
+            let mut diff = 0usize;
+            let mut only2 = 0usize;
+            for (k, v1) in &l1 {
+                match l2.get(k) {
+                    Some(v2) if v2 == v1 => {}
+                    other => {
+                        diff += 1;
+                        if diff <= 8 {
+                            eprintln!("[load-diff] {k}: {v1:#018x} vs {:?} ", other);
+                        }
+                    }
+                }
+            }
+            for k in l2.keys() {
+                if !l1.contains_key(k) {
+                    only2 += 1;
+                }
+            }
+            eprintln!(
+                "[load-diff] b1_keys={} b2_keys={} mismatch={diff} l2_only(draft 预期)={only2}",
+                l1.len(),
+                l2.len()
+            );
+        }
         // 吞吐面:生成 tok 数 / gen 墙钟(含装载+prefill;粗口径,门内自证)
         let gen_n = |t: &[u32]| t.len().saturating_sub(18);
         eprintln!(
@@ -1109,6 +1155,10 @@ async fn gpu_27b_chat_inference() {
             "[dflash-gate] baseline({}tok)={ta:?}\n[dflash-gate] spec({}tok)={tb:?}",
             ta_tokens.len(),
             tb_tokens.len()
+        );
+        // E5-DF4 崩坏排查:b2 事实全量 dump(好/坏跑对比;b1 已在 reset 前 dump)
+        owl_shared::metrics::query_metrics(
+            &owl_shared::metrics::MetricsFilter::new().tag_prefix("b2."),
         );
         assert_eq!(ta, tb, "恒等门 DFlash2:greedy 真草稿 spec 文本 ≡ 无 spec");
         assert_eq!(ta_tokens, tb_tokens, "恒等门 DFlash2:token 账逐位一致");

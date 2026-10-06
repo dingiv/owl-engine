@@ -71,6 +71,9 @@ pub struct Engine<D: DeviceClient> {
     cfg: EngineConfig,
 }
 
+/// boot 序号(metrics 打点命名空间;进程内自增,b1/b2…)
+static BOOT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl Engine<GpuClient> {
     /// 常规构造:按 cfg 绑定 GPU(ordinal)
     pub fn new(cfg: EngineConfig) -> Result<Self> {
@@ -775,6 +778,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
             dflash_mem_dumped: false,
             dflash_mem_dumped2: false,
             dflash_hid_dumped: false,
+            boot_seq: BOOT_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1,
             spec_seed_hidden: None,
             spec_stats: crate::running::SpecStats::default(),
             spec_snap_valid: false,

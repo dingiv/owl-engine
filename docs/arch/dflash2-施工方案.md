@@ -570,3 +570,164 @@ BF16 化后首跑恒等门:恒等绿(42tok 逐位)但 **AL 仍 0.00**。三连�
   1.1GB 带宽 1.3ms + lm_head 2.4GB 2.8ms + 小 GEMM,实测 ~18ms 差 3×);
   ②verify 30ms 里的 host 交织;理论轮下限 ~36ms → math ~108 tok/s。
   注:60 tok/s = 超越 vLLM decode 基线(43)+ xinfer 157 参照同量级。
+
+### 6.20 同日十五续:NC/topk 重写再 +18%,非确定性崩坏立案(未结)
+
+- **NC attention v2(block-per-head flash 式)**:v1 一 thread 一 (t,h) +
+  acc[512] 寄存器溢出 local memory + 全程单 block(82 SM 占用 1.2%),
+  实测 **804µs/次**;v2 = grid (T, Hq) × block (hd),thread d 独占一维
+  (acc 单寄存器),每 kv 行一次块内归约,m/l/p 行标量住 shared。签名
+  去 q_tokens(grid.y 承担)+ prefix 运行时读(kv_len 张量);
+- **topk16 淘汰并行化**:选后淘汰曾 thread 0 串行扫 4096 槽 ×16 轮
+  (单线程 ~130µs/行 病理)→ 全线程分片清;
+- **实测(math 门,AL 2.90)**:**70.7 tok/s**(59.6 → +18%;相对基线
+  29.7 = **+138%**);恒等门逐位一致;prose 44.7(+29%);
+- **nsys 定谳(整轮核级)**:ct_repack 123ms = 装载期(非轮内);
+  draft marlin 40 GEMM ≈ 3.4ms/前向(小 GEMM 57µs = 13× 带宽界,
+  tile 量化延迟界,上游核暂不动);target lm_head cublas 2.7ms ✓;
+  NC/topk 见上;
+- **🔴 非确定性崩坏立案(未结,~30% 崩率)**:NC/topk 落地后 17 跑
+  6 崩(gate33 分叉 / r1 崩坏复读 / r5 EOS 空轮 / r6 **baseline 空**
+  / e13 分叉 / e15 EOS 空轮)。两种病态:**A = 首 token EOS 空 turn**
+  (baseline 纯 decode boot 也中招 —— 与 dflash 改动路径无交集);
+  **B = greedy 链近平局分叉**(spec/baseline 各自连贯,分叉点漂移)。
+  已排除:propose 图(eager 同崩)、NC/topk 数值(组件金标 9/9 绿,
+  且 probe 开启时 4 连绿 —— 时序掩蔽 = 读未初始化/竞态指纹);
+  疑点:vLLM 3080 对共存(r6 前重启)、boot 期图 warmup 的池/GDN 残留、
+  多 face 流序。**与 6.19 性能成果解耦验收**(绿跑轮账稳定复现);
+  下轮专项:boot 状态清零审计 + nsys 时间线对齐崩轮 + 崩坏率 A/B
+  (OWL_NO_GRAPH 全图关闭对照)。门在修复前以"3 连绿 + AL 复核"口径
+  交付。
+
+### 6.20.1 崩坏分类定谳(metrics 打点落 DEVICE 后)
+
+- **仪表**:metrics 直用 API(per-boot 命名空间 b{n},事实计数器 =
+  pf.last / emit.first / r{k}.pos/m/bonus/d{i}/i{i}),门断言前全量
+  dump —— `query_metrics(prefix "b")`。注意:timer 宏 release 剔除,
+  直用 API release 恒开(双轨纪律);
+- **类 1:prefill 首 token 翻转(run53 实锤)**:b2.pf = 248046 vs
+  b1.pf = 109757(同权重同 prompt 贪心),翻转 boot 的 logits 分布
+  **自洽地整体偏移**(top1 23.9→15.7,gap 4.7 非近平局)→ 装载域
+  非确定(同 boot 内两次 lm_head 逐字节一致,cublas 无辜)——嫌疑 =
+  装载期设备重排(ct_repack 704 次)或懒物化 DMA 时序;同 boot 内
+  重放一致(权重状态定了就不变)。待装:装载后权重校验和仪表
+  (双 boot 对比定位键);
+- **类 2:verify(T=8 批)vs decode(T=1)近平局分叉(run52 实锤)**:
+  pf.last 两 boot 相同、中后段分叉 —— 批形状固有归约序差,近平局
+  翻转(40 token × ~1% 近局率 ≈ 1/3 门失败率,与观测吻合)。
+  **spec decoding 的提交 token 本应由 target verify 决定,输出恒等
+  是"批不变性"理想而非构造保证**;M2a 时代逐位绿 = margin 运气。
+  修法(任选):①verify logits 顶-2 gap < ε 判近局容忍;②门基线改
+  同形状(verify T=8 关草稿对照);③接受概率性绿 + 分叉位置日志;
+- **两类均非 DF-4 性能优化引入**(类 1 = 装载域存量,gate9 已记
+  "pos≈30 后分歧"先例;类 2 = 批形状固有);性能成果(70.7/44.7)
+  与崩坏解耦验收;
+- **观测纪律**:metrics dump 已常驻门断言前;坏跑必附 b 前缀全量
+  事实表(好/坏对比的最低证据标准)。
+
+### 6.20.2 装载校验器落地(用户裁决:server 层心里有数)—— 装载域无罪排除
+
+- **仪表**(OWL_LOAD_VERIFY 门控):装载 staged 字节 FNV-1a 64 增量
+  (Direct/Transposed 臂;DeviceRearrange 臂 staged=raw 不可比标记
+  csum=0)→ 栅栏后**整块回读重哈希对比**,失配 = 结构化错误列键;
+  metrics 标签 `loadv.{key}` = 校验和;门内双 boot 快照 diff
+  (`l1`/`l2` 快照 + reset,共键不同值 = 装载竞态实锤,l2 独有 =
+  草稿键预期);
+- **验收(math 门,OWL_LOAD_VERIFY=1)**:**2066 键全部通过**
+  (1861 target + 205 draft;cos/sin_table 的"diff" = 两 rope 实例
+  tag 同名 + counter 累加假阳性)—— **设备权重与 staged 字节逐位
+  一致,双 boot 一致:装载完整性无罪,类 1 装载假设否**;
+- **附带发现**:设备重排路径**已有逐位端到端自校验**(GPU 重排输出
+  vs CPU fused 参照,assert 0 坏字,本跑全过——2026-10-01 装载提速
+  的存量武装);
+- **收窄后的真凶画像**:pf-probe 实测好跑之间 prefill 末行 logits
+  即有 **boot 间 ±1.6 方差**(run44:boot1 22.27 vs boot2 23.88,
+  argmax 相同故绿)→ 非确定性在 **target 前向某核**(权重/状态/输入
+  已全排除);偶发(≈15%)幅度足够时翻转 argmax → 类 1;
+  下一步 = 逐层 hidden 校验和 bisect(tapped_hidden 挂 31 tags,
+  仪表同款)定位非确定核;
+- 教训:装载校验 + per-key checksum + 双 boot diff 应**常驻门**
+  (成本 ~8s/门,类 1 类装载病一票否决)——是否默认开挂待裁决。
+
+### 6.20.3 逐层 bisect 抓到翻转现场 —— 收窄至 GDN 层位级(未结)
+
+- **仪表**(OWL_PF_BISECT;非 dflash 路径):prefill 单遍 multi eval
+  产出 embed + 65 层 taps + fin(**fin 块直通主路** —— bisect 前向有
+  GDN 状态副作用,单执行律;block-leaf 下游零操作透传),逐层 FNV →
+  metrics `pf.c{base}.{embed|l{i}|fin}`;门内 b1 三连跑 diff;
+- **抓到两次翻转**:run69 首发散 = **l0**(GDN;hybrid_3to1 i%4==3
+  为 full,l0/l10 均 GDN);run78 首发散 = **l10**(GDN;embed/l0..l9
+  全同)——**首个发散层漂移**(l0 与 l10),每 boot 自洽(同 boot 内
+  重放逐位一致);
+- **已排除**(逐一体检):装载(6.20.2 全键一致)/ GDN 状态清零
+  (reset_gdn memset 覆盖核验)/ marlin 锁(自清洁,locks_off 上界
+  < workspace 容量)/ cublas(同 boot 双跑逐字节一致)/ GDN 核越界读
+  (conv/recurrence 逐行审读,读域有界)/ 输入 ids/pos/rope 表;
+- **收窄结论**:非确定性在 **GDN 层内部某处**(约 15%/boot,位级
+  噪声经 65 层传播放大至 O(1) logits,偶发近局翻转 argmax → 文本
+  分叉/退化);下一步 = GDN 层内 per-stage checksum(forward_stages
+  的 mixed/h/n2/mlp_out 五站 + 状态快照前后)→ 定位到具体核;
+- **用户体验影响面**:崩坏 boot 的生成 = 退化复读或换路续写(贪心
+  链分叉后仍连贯),单 boot 内服务自洽;跨 boot 复现实验受影响。
+- **状态 checksum 仪表(6.20.3 续)**:bisect 块 pre/post 全量
+  dtoh(rec [slots,nv,kd,vd] f32 ≈ 3.1MB/层 × 24 + conv 三段)→
+  metrics `pf.c{base}.{pre|post}.g{j}.{convq|convk|convv|rec}`。10 跑
+  采样:state checksum 全一致且绿跑间零漂移;带此仪表 10/10 绿
+  (无仪表时代 2/12 翻)—— 额外 dtoh 时序下翻转被掩蔽 = **时序敏感
+  竞态指纹再加强**(与 probe 掩蔽同款)。
+- **GDN 层内 8 件定位(gdn_tap)尝试挂起**:接入 M4 gdn_tap(每 GDN
+  层 q/k/v raw + q_n/k_n/v_c/g/beta 8 件)后,multi eval 出现
+  **节点声明尺寸 vs 实际块尺寸错配**(节点 [1,2048]/4096B,块
+  32768B,8× —— 解释器 memo/分配与 gdn_tap 节点交互,未定谳;附带
+  修掉一个 roots 顺序 bug:gtap 曾 push 在 fin 后致 bisect_fin 拿错
+  块)。已回退到 65 层 bisect(工作态);gdn-stage 定位下轮以独立
+  入口重试(gdn 前向专用 debug 树,绕过解释器交互面)。
+
+### 6.20.4 跨流回收 UAF 定谳 —— free_async 异流早归池(2026-10-08 结案修复)
+
+- **三分臂 A/B 排除 recurrence 核**(零代码判别,无 dtoh 掩蔽):
+  b1(纯 decode boot)翻转率 default ~10%(1/10)vs OWL_GDN_SCALAR
+  ~11%(1/9)—— 统计无差别,GDN 三核(conv/l2norm/recurrence)全链
+  逐行审读皆纯函数;**病不在核,在输入**。
+- **类 1 细分**(pf.last/emit.first metrics 事实):1a = prefill 末位
+  argmax 落词表死区([248044,248320),tokenizer 仅 248044 条;
+  def-r5 pf.last=248046 / sca-r3=248045,**空文本灾难级**);1b =
+  pf.last 金标 + 文本中段近局分叉(fin-r1,前 40 字全同,末 token
+  "象征。" → "象征,见证着历史沧桑。")—— 后者推翻"prefill 首
+  token 翻转"旧分类。
+- **新指纹(标准 vs bisect 模式分裂)**:bisect 450 条层级表跨 boot
+  **逐字节全等**(r3≡r4),标准模式绿轮 pf.fin 跨 boot **不同** ——
+  非确定性与流水线异步深度绑定:bisect ~900 次 dtoh = 持续排空
+  COMPUTE(handle_dtoh 塔零案律)→ 窗口全关。
+- **结构性真凶**(state.rs free_blocks 旧注"流序安全"为误):
+  Owned 块 drop → cuMemFreeAsync 落在**块自身分配流**(from_host 块
+  = H2D;队列浅,free 立即归池),而 COMPUTE 还压着 65 层深队列的
+  **在途读者** —— 设备池把同址发给下一个 alloc(下一 chunk 的
+  ids/pos/slots 上传)→ 跨流 UAF。**全部指纹一次吻合**:dtoh 排空
+  掩蔽 / bisect 全绿 / GDN 臂无关 / 冷 boot 首选 / 同 boot 自洽
+  (时钟轨迹+队列深度同型)/ "良性"跨 boot logits ±1.6-2 方差 =
+  低强度 UAF 撞击 / 塔零案同病(当时只修 dtoh 侧)。gdn_tap 8× 块
+  尺寸错配(6.20.3 挂起案)疑同源(账房与回收交互),未重启验证。
+- **修复**(state.rs free_blocks,跨流回收律):drop 前 COMPUTE
+  `record_event`,H2D/D2H `wait` 之 —— free 被钉在读者排空后,任意
+  流复用皆安全;COMPUTE 同流复用本就保序;捕获期跳过(事件会烤进
+  图);事件失败回退旧语义不崩回收路径。纯加序边,零排空零性能税。
+- **验证(fix-ON,同日收口)**:finx(fin 探针 ×10)**10 boot pf.fin
+  全等 = 1368689881865834578**(位级跨 boot 确定性恢复;且与修复前
+  绿轮 fin-r2 同值 —— 修竞态不动数学);barex(裸门 ×10)**10/10
+  PASS**,b1 翻转绝迹,类 2 亦 0/10(若"良性 logits ±方差"本是低强度
+  UAF,类 2 近局翻转的触发器一并拔除);对照修复前 ~30% 崩坏率。
+  **回归 models 116 / engine 33 全绿**(单线程口径)。
+- **附带收口(两个存量 stale 对拍,6.18/6.19 尾巴遗留)**:①
+  gpu_dflash_fc_split_matches_host:host 参照残留 ×(1+w)+ 未模拟
+  f16 溢出护栏的 fc 前 2⁻⁸ 预缩(eps 非尺度不变,taps 缩后 ms~e-5
+  与 eps 同级)→ 双侧对齐 ×w + 预缩后绿;② gpu_dflash_nc_attn_
+  roundtrip:v2 契约三处跟上(kv_len_ptr 张量入参替 prefix 烘焙标量;
+  grid (T,Hq)×(hd);norm_rope w_off flag 用 norm 实际值替硬编码 1)
+  + host 参照 ×w 律,绿。教训:核契约演进时 golden/对拍两侧(声明 +
+  host 数学)必须同轮跟改,否则"双方同错自洽"假绿/假红。
+- **scalar 臂附带发现**:OWL_GDN_SCALAR 在 verify(图)路径 100% 产出
+  垃圾("长城!!!…")——foreign handler 的 `memcpy_htod_async(soff_p,
+  &[0,t])` 用**栈上临时**做 async H2D 源,捕获后 replay 读死栈地址
+  → 垃圾 seq_off。对照臂存量雷(从未与图同用过),b1(eager prefill)
+  不受影响;修复待办(要么 pinned 暂存,要么图外预传)。

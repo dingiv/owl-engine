@@ -130,8 +130,26 @@ impl DecoderLayer {
         }
     }
 
-    /// 测试专用:分段收割(层树内 mixed / n2 / mlp_out 的声明,非公开 API)。
-    #[cfg(test)]
+    /// E5-DF4 崩坏排查:六站 bisect 展开(n1/mixed/h/n2/mlp/out;
+    /// 与 forward_stages 同式非原地,自洽即可;gdn_tap 若设随层带出)。
+    pub(crate) fn forward_bisect_stages<'a>(
+        &self,
+        xs: &TensorOps,
+        ctx: &ForwardCtx<'a>,
+    ) -> [TensorOps; 6] {
+        let n1 = self.input_ln.forward(xs, ctx);
+        let mixed = match &self.mixer {
+            TokenMixer::Full(a) => a.forward(&n1, ctx),
+            TokenMixer::Gdn(g) => g.forward(&n1, ctx),
+        };
+        // gdn_tap 若设:mixer 的 gdn forward 自行推 8 件(q/k/v raw +
+        // q_n/k_n/v_c/g/beta),调用方(bisect)在层后统一收割
+        let h = xs.add(&mixed);
+        let n2 = self.post_ln.forward(&h, ctx);
+        let mlp_out = self.mlp.forward(&n2, ctx);
+        [n1, mixed, h.clone(), n2, mlp_out.clone(), h.add(&mlp_out)]
+    }
+
     pub(crate) fn forward_stages<'a>(
         &self,
         xs: &TensorOps,

@@ -736,6 +736,9 @@ pub struct LoadEntry {
     pub shape: Shape,
     pub layout: Layout,
     pub block: Bytes,
+    /// staged 字节 FNV-1a 校验和(E5-DF4 装载校验;0 = 未校验:
+    /// DeviceRearrange 臂 staged = raw 而块 = 重排后,回读不可比)
+    pub csum: u64,
 }
 
 /// 装载清单(顺序 = Want 清单顺序)

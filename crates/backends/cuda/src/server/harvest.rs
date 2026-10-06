@@ -325,9 +325,11 @@ impl GpuServer {
         want_bytes: usize,
     ) -> Result<Box<dyn owl_iface::contract::PinnedRegion + Send>, ModelError> {
         let n = self.ctx().block_len(id)?; // 块账本 = 字节(2026-09-26 f16 基线)
-        if n != want_bytes {
+        // 前缀读取放行(E5-DF4:池复用块 > 声明尺寸,诊断收割取前缀;
+        // 超读仍拒 —— 真错)。等大读路径不变。
+        if want_bytes > n {
             return Err(ModelError::Msg(format!(
-                "dtoh: 块 {id} 字节 {n} != 收割 {want_bytes}"
+                "dtoh: 块 {id} 字节 {n} < 收割 {want_bytes}"
             )));
         }
         let (dptr, _) = self.ctx().block_ptr(id, stream)?;
