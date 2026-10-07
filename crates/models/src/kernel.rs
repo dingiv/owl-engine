@@ -239,6 +239,8 @@ pub static REGISTRY: &[Entry] = &[
     // qknorm_rope_kv_insert:q norm+rope → q_out;k norm+rope → key_cache 散写;
     // v → value_cache(minimax_m3 同款 (token,head-slot) 结构,三发合一)
     Entry { name: "owl_qknorm_rope_kv_insert_f16", source: sources::owl::QKNORM_ROPE_KV_INSERT_F16, args: "T,T,T,T,T,T,T,T,T,T,T,f32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    // B6.3:fp8 主池变体(签名逐字同 f16;cache 形参 u8 寻址 1B/elem)
+    Entry { name: "owl_qknorm_rope_kv_insert_f16_fp8kv", source: sources::owl::QKNORM_ROPE_KV_INSERT_F16_FP8KV, args: "T,T,T,T,T,T,T,T,T,T,T,f32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     // ---- ct packed → marlin B 设备重排(2026-10-01 装载提速;AWQ 装载线)----
     Entry { name: "owl_ct_repack_u32", source: sources::owl::CT_REPACK_U32, args: "T,sz,sz,T", dtype: crate::contract::Dtype::U32 },
     // ---- 文本主干(Qwen3.5 mini-demo;Kernel 节点路径,输出块末参)----

@@ -63,6 +63,8 @@ pub mod ids {
     pub const MLP_SILU_AND_MUL: OpId = OpId("mlp.silu_and_mul");
     pub const LN_FUSED_ADD_RMSNORM: OpId = OpId("ln.fused_add_rmsnorm");
     pub const ATTN_QKV_NORM_ROPE_INSERT: OpId = OpId("attn.qkv_norm_rope_insert");
+    /// B6.3:fp8 e4m3 主池变体(decode 融合插池路;池写 1B e4m3)
+    pub const ATTN_QKV_NORM_ROPE_INSERT_FP8KV: OpId = OpId("attn.qkv_norm_rope_insert_fp8kv");
 }
 
 /// contract::Dtype → driver::DType(契约类型不过 kernels,转换住消费侧)

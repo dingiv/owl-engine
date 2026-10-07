@@ -900,3 +900,20 @@ BF16 化后首跑恒等门:恒等绿(42tok 逐位)但 **AL 仍 0.00**。三连�
   下抖动被阻尼。
 - 教训:探测重入验证需"保证低熵段"的提示词;"随机词+重复"类提示会被
   模型格式漂移搅局(输出本身失控),不能作为高 AL 段的可靠构造。
+
+### 6.25 B6.3 收口:NC f16 核恢复 + 主池 fp8 双 bug 破案交叉录(2026-10-10 深夜)
+
+- **owl_naive_attn_nc_f16 恢复**:fb1e453(草稿池 fp8 轮)把 f16 NC 核直接
+  改名为 owl_naive_attn_nc_fp8kv_f16(前缀读语义改 e4m3),未留 f16 体
+  → (F16,false) 悬空,spec + f16 草稿池(默认生产档)propose 首轮必炸
+  CUDA_ERROR_NOT_FOUND。本节 = pre-fb1e453 原体逐字回植进 dflash2.cu
+  (registry 签名门 registry_sig_matches_cu_signatures 与
+  gpu_dflash_nc_attn_roundtrip 双测转绿;models 116/116 为该轮后首次可跑)。
+  教训:**改名 = 删旧符号,分派表/登记表/测试三处引用必须同轮清点**。
+- **主池 fp8 双 bug(B6.3 主案,全文见 roadmap 补录 Ⅲ)**:①chunked fp8
+  读核 smem 拷贝 __half 数值截断(修 = __half_as_ushort;探针升 host 参考
+  三线硬门);②decode 融合插池核无 fp8 臂(修 = _fp8kv 变体五件套)。
+  E2E 终验:spec depth=7 + 主池 fp8 短 6/6 逐字一致、长 4/4 连贯、
+  ≈88 tok/s;主池 fp8 红灯摘除(opt-in 不变)。
+- **通用教训入 pitfall**:A/B 对拍验不出转换/布局错误(两边同错抵消),
+  核正确性门必须 host 参考;池 dtype 改造先穷举池的全部写者。

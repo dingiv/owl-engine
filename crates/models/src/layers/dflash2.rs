@@ -1212,7 +1212,7 @@ mod tests {
         }
         let (hidden, n) = (32usize, 4usize);
         let fan = n * hidden;
-        let draft = DFlash2Draft::new(hidden, hidden, 2, 1, 16, n, 1e-6, 23);
+        let draft = DFlash2Draft::new(hidden, hidden, 2, 1, 16, n, 1e-6, 23, false);
         let mut src: HashMap<String, Vec<f32>> = HashMap::new();
         let w_fc: Vec<f32> = (0..hidden * fan)
             .map(|i| half::f16::from_f32(((i as f32) * 0.11).sin() * 0.5).to_f32())
@@ -1314,7 +1314,7 @@ mod tests {
 
         let (hidden, inter, hq, hkv, hd, nl) = (5120usize, 17408usize, 32usize, 8usize, 128usize, 5usize);
         let (vocab, topk) = (248320usize, 16usize);
-        let mut draft = DFlash2Draft::new_with_plan(hidden, inter, hq, hkv, hd, nl, 1e-6, vocab, QuantPlan::W4A16);
+        let mut draft = DFlash2Draft::new_with_plan(hidden, inter, hq, hkv, hd, nl, 1e-6, vocab, QuantPlan::W4A16, false);
 
         // 公式 E/LM(f16 网格;与 python 同式)→ Embedding 装载
         let gen = |n: usize, seed: f64| -> Vec<f32> {
@@ -1342,7 +1342,7 @@ mod tests {
 
         // 草稿装载(W4A16)
         let draft = {
-            let d = DFlash2Draft::new_with_plan(hidden, inter, hq, hkv, hd, nl, 1e-6, vocab, QuantPlan::W4A16);
+            let d = DFlash2Draft::new_with_plan(hidden, inter, hq, hkv, hd, nl, 1e-6, vocab, QuantPlan::W4A16, false);
             let src = crate::formats::w4a16::W4A16Source::open_dir(std::path::Path::new(&dir)).unwrap();
             crate::interpreters::eval_load(&d, &mut gpu, &src, &lctx).await.expect("draft 装载");
             d
@@ -1676,7 +1676,7 @@ mod tests {
         let mut gpu = gpu_client().await;
         let lctx = LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false };
         let draft = DFlash2Draft::new_with_plan(
-            5120, 17408, 32, 8, 128, 5, 1e-6, 248320, QuantPlan::W4A16,
+            5120, 17408, 32, 8, 128, 5, 1e-6, 248320, QuantPlan::W4A16, false,
         );
         let src = crate::formats::w4a16::W4A16Source::open_dir(std::path::Path::new(&dir))
             .expect("源打开");
@@ -1932,7 +1932,7 @@ mod tests {
         }
         let (hq, hkv, hd, hidden) = (4usize, 2usize, 16usize, 32usize);
         let eps = 1e-6f32;
-        let attn = DfAttn::new(hq, hkv, hd, hidden, eps, QuantPlan::F16, Dtype::F16);
+        let attn = DfAttn::new(hq, hkv, hd, hidden, eps, QuantPlan::F16, Dtype::F16, false);
         let mut src: HashMap<String, Vec<f32>> = HashMap::new();
         src.insert("k_proj".into(), gen(hkv * hd * hidden, 21.0));
         src.insert("v_proj".into(), gen(hkv * hd * hidden, 22.0));
@@ -2427,7 +2427,7 @@ mod tests {
         let mut gpu = gpu_client().await;
         let lctx = LoaderCtx { dtype: Dtype::BF16, shard: 1, device_repack: false };
         let draft = DFlash2Draft::new_with_plan_dt(
-            5120, 17408, 32, 8, 128, 5, 1e-6, 248320, QuantPlan::W4A16, Dtype::BF16,
+            5120, 17408, 32, 8, 128, 5, 1e-6, 248320, QuantPlan::W4A16, Dtype::BF16, false,
         );
         let src = crate::formats::w4a16::W4A16Source::open_dir(std::path::Path::new(&dir))
             .expect("源打开");

@@ -29,6 +29,8 @@ pub mod owl {
     pub const SILU_AND_MUL_F16: &str = include_str!("../cu/owl/fused.cu");
     pub const FUSED_ADD_RMSNORM_F16: &str = include_str!("../cu/owl/fused.cu");
     pub const QKNORM_ROPE_KV_INSERT_F16: &str = include_str!("../cu/owl/fused.cu");
+    /// B6.3:fp8 e4m3 主池变体(同文件;decode 融合插池路的 e4m3 池写)
+    pub const QKNORM_ROPE_KV_INSERT_F16_FP8KV: &str = include_str!("../cu/owl/fused.cu");
     /// ct packed → marlin B 设备重排(2026-10-01 装载提速;主源 =
     /// attention.rs marlin_repack.cu gptq_repack_kernel,输入侧转置适配)
     pub const CT_REPACK_U32: &str = include_str!("../cu/marlin_repack_ct.cu");

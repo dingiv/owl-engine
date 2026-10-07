@@ -147,3 +147,28 @@
   slots=2 够 2 并发);f16 化 GDN 状态 = −3GB 候选(需恒等门,未做)。
 - 旧账勘误:昨日"杂项 ~1.9G"实为 snap 318 + slab 246 + dflash 92 +
   misc 之和;"draft + 8704 池共存 23.2G"含满额 slab 浪费。
+
+## 14. 池 dtype 改造的写者穷举律(B6.3 双 bug,2026-10-10)
+
+- **律**:把池从 f16 改 1B/elem(e4m3 等)前,先列出该池的**全部写者与
+  全部读者**,逐一对账字节宽度。B6.2 改造覆盖了 K0/chunked 读/v2 读三路,
+  漏了 **decode 融合插池核 owl_qknorm_rope_kv_insert**(f16 2B 池写落
+  2× 字节偏移 = 真槽区永不落笔 + 毒液洒 2s 槽区;E2E 表现为 decode 崩坏
+  而 prefill 正常,kv-dump 探针实证)。写者清单:K0 写(三条分派)/
+  chunked 读 / v2 读 / FI dual / 融合插池 / NC 自块直读。
+- **`__half` 赋 uint16_t 槽 = 数值截断不是位拷贝**(`k_smem[i] = __half(x)`
+  隐式走 float 截断;值<1→0、负→UB)。CUDAB 侧位拷贝一律
+  `__half_as_ushort/__ushort_as_half`,或经 `__half*` 视图存取。
+  探针层面:f16 vs fp8 的 A/B 对拍验不出转换/布局错误(两边同错抵消),
+  **核正确性门必须 host 参考**(gpu vs host 同输入同布局逐式)。
+- **探针 debug 溢出假失败**:`i as u32 * 常数` 在 debug profile overflow
+  panic → 测试从未真正运行("37/37 绿"可能是套件根本没跑到)。
+  hash 类 lcg 一律 wrapping_mul。本次两探针(B6.1 v2 fp8 / B5.0 gdn 批)
+  修后首次真跑即绿 —— 假失败掩蔽真覆盖。
+- **改名 = 删旧符号**:CUDA 核改名时,分派表 match 臂 / registry Entry /
+  引用它的测试三处必须同轮清点(fb1e453 改名 owl_naive_attn_nc_f16
+  留悬空臂,spec 默认档首轮必炸,潜伏两轮才被抓)。
+- **真 PID 判据(运维)**:`$!` 与 `pgrep -f | head -1` 都可能是包装进程;
+  唯一可靠 = `nvidia-smi --query-compute-apps` × `/proc/pid/exe` 双验。
+  僵尸 server 占端口会让 A/B 测试打到旧二进制(f16 查询打到 fp8 僵尸
+  = "fp8 与 f16 同崩"假象,白查一小时)。

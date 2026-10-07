@@ -26,6 +26,7 @@
 // ---- nvrtc 序言(同 ops_pair 族:cuda_fp16 提供 __half;float 中间)----
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 
 // ----------------------------------------------------------------------------
 // owl_norm_rope_f16:out[t,h,d] = rope( rmsnorm(x[t,h,·]) ×(1+w)^{w_off} )[d]
@@ -275,6 +276,116 @@ extern "C" __global__ void owl_qknorm_rope_kv_insert_f16(
     // v 捎带拷贝(线性寻址)
     const size_t vi = ((block_idx * (size_t)hkv + kh) * hd + d) * page + off;
     value_cache[vi] = v[t * (size_t)hkv * hd + kh * hd + d];
+}
+
+// ----------------------------------------------------------------------------
+// owl_qknorm_rope_kv_insert_f16_fp8kv(B6.3 收口;2026-10-10):fp8 e4m3
+// 主池变体。数学逐式同 f16 版(同一 norm/rope);差异仅池写 ——
+//   key_cache/value_cache = e4m3 1B/elem(u8 寻址,元素序不变),
+//   池写 = __nv_fp8_e4m3(value) SATFINITE(与 K0 写核同转换)。
+// 背景:fp8 池下 f16 版 2B 存储落在 2× 字节偏移 —— 真槽区永不落笔
+// (kv-dump 实证 decode 槽全零)+ f16 位型毒液洒 2s 槽区 = decode 崩坏
+// 真凶(B6.2 曾覆盖 K0/chunked/v2 读三路,独漏此融合插池路)。
+// ----------------------------------------------------------------------------
+extern "C" __global__ void owl_qknorm_rope_kv_insert_f16_fp8kv(
+    const __half* __restrict__ q_raw,   // [T, Hq·2HD](per-head [value|gate])
+    const __half* __restrict__ k,       // [T, Hkv·HD]
+    const __half* __restrict__ v,       // [T, Hkv·HD]
+    unsigned char* __restrict__ key_cache,   // e4m3 [nb, Hkv, hd/x, page, x]
+    unsigned char* __restrict__ value_cache, // e4m3 [nb, Hkv, hd, page]
+    const float* __restrict__ slots,    // [T]
+    const __half* __restrict__ q_w,     // [hd]
+    const __half* __restrict__ k_w,     // [hd]
+    const __half* __restrict__ cos_t,   // [max_pos, half]
+    const __half* __restrict__ sin_t,   // [max_pos, half]
+    const float* __restrict__ pos,      // [T]
+    float eps,
+    int hkv, int half, int page, int w_off,
+    __half* __restrict__ q_out)         // [T, Hq·hd](尾参契约 4)
+{
+    const size_t t = blockIdx.x;
+    const size_t head = blockIdx.y;
+    const size_t d = threadIdx.x;
+    const size_t hd = blockDim.x;
+    const size_t hq = gridDim.y - (size_t)hkv;
+    const long long slot = (long long)slots[t];
+
+    if (head < hq) {
+        // ---- q:value 半段 strided 读 + norm + rope → q_out ----
+        const size_t row_stride = hq * 2 * hd;
+        const __half* xs = q_raw + t * row_stride + head * 2 * hd;
+        extern __shared__ float smem[];
+        const float xf = __half2float(xs[d]);
+        smem[d] = xf * xf;
+        __syncthreads();
+        for (size_t s2 = hd / 2; s2 > 0; s2 >>= 1) {
+            if (d < s2) smem[d] += smem[d + s2];
+            __syncthreads();
+        }
+        const float inv = rsqrtf(smem[0] / (float)hd + eps);
+        const float wf = __half2float(q_w[d]);
+        const float n = xf * inv * (w_off ? (wf + 1.0f) : wf);
+        const size_t p = (size_t)pos[t];
+        const size_t base = (t * hq + head) * hd;
+        if (d < (size_t)half) {
+            const float xb = __half2float(xs[d + half]);
+            const float wb = __half2float(q_w[d + half]);
+            const float nb = xb * inv * (w_off ? (wb + 1.0f) : wb);
+            const float cf = __half2float(cos_t[p * half + d]);
+            const float sf = __half2float(sin_t[p * half + d]);
+            q_out[base + d] = __float2half(n * cf - nb * sf);
+            q_out[base + d + half] = __float2half(nb * cf + n * sf);
+        } else if (d >= 2 * (size_t)half) {
+            q_out[base + d] = __float2half(n);
+        }
+            return;
+    }
+
+    // ---- k 头:qk-norm + rope → key_cache;捎带 v → value_cache ----
+    if (slot < 0) return;   // padding 跳写(K0 契约)
+    const size_t kh = head - hq;
+    const __half* ks = k + t * (size_t)hkv * hd + kh * hd;
+    extern __shared__ float smem[];
+    const float kf = __half2float(ks[d]);
+    smem[d] = kf * kf;
+    __syncthreads();
+    for (size_t s2 = hd / 2; s2 > 0; s2 >>= 1) {
+        if (d < s2) smem[d] += smem[d + s2];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(smem[0] / (float)hd + eps);
+    const float wf = __half2float(k_w[d]);
+    float n = kf * inv * (w_off ? (wf + 1.0f) : wf);
+    const size_t p = (size_t)pos[t];
+    if (d < (size_t)half) {
+        // 配对 (d, d+half):每 thread 只写自己的 d 位(伙伴位由 d+half 写)
+        const float xb = __half2float(ks[d + half]);
+        const float wb = __half2float(k_w[d + half]);
+        const float nb = xb * inv * (w_off ? (wb + 1.0f) : wb);
+        const float cf = __half2float(cos_t[p * half + d]);
+        const float sf = __half2float(sin_t[p * half + d]);
+        n = n * cf - nb * sf;
+    } else if (d >= 2 * (size_t)half) {
+        // partial 维直通(n 已是 norm 值)
+    } else {
+        // d ∈ [half, 2half):伙伴 = d - half(基值 = 自己 n[d],旋转伙伴 n[d-half]
+        // —— 2026-10-02 转置案修复:曾写 nb*cf + n*sf(基/伙伴互换,pos=0 时
+        // 直接写 n[d-half],引擎 kv-hex 3-4% 偏差真凶)
+        const float xb = __half2float(ks[d - half]);
+        const float wb = __half2float(k_w[d - half]);
+        const float nb = xb * inv * (w_off ? (wb + 1.0f) : wb);
+        const float cf = __half2float(cos_t[p * half + d - half]);
+        const float sf = __half2float(sin_t[p * half + d - half]);
+        n = n * cf + nb * sf;
+    }
+    const int block_idx = (int)(slot / page);
+    const int off = (int)(slot % page);
+    const size_t kk = ((block_idx * (size_t)hkv + kh) * (hd / 8) + d / 8) * page * 8
+                    + off * 8 + d % 8;
+    key_cache[kk] = __nv_fp8_e4m3(n).__x;
+    // v 捎带拷贝(线性寻址;e4m3 转换)
+    const size_t vi = ((block_idx * (size_t)hkv + kh) * hd + d) * page + off;
+    value_cache[vi] = __nv_fp8_e4m3(__half2float(v[t * (size_t)hkv * hd + kh * hd + d])).__x;
 }
 
 // ----------------------------------------------------------------------------

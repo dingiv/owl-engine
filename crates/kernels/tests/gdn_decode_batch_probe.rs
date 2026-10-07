@@ -28,7 +28,7 @@ const MAX_SLOTS: usize = 8;
 fn lcg_f16_bits(seq: u32, i: usize) -> u16 {
     let x = seq
         .wrapping_mul(0x9E37_79B9)
-        .wrapping_add(i as u32 * 0x85EB_CA6B);
+        .wrapping_add((i as u32).wrapping_mul(0x85EB_CA6B));
     // f16 正数 [1.0, 2.0) 区间位型:指数 15,尾数取低 10 位(免 denormal/inf)
     0x3C00u16 | ((x >> 6) & 0x03FF) as u16
 }

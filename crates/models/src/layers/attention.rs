@@ -110,7 +110,14 @@ impl Attention {
             let (cos_d, sin_d) = rope.cos_sin_decl();
             let gate = narrow_strided(&q_raw, tokens * self.hq, self.hd * 2, self.hd, self.hd,
                 vec![tokens, self.hq * self.hd]);
-            let q = TensorOps::call(ids::ATTN_QKV_NORM_ROPE_INSERT)
+            // B6.3:fp8 主池 → 融合插池核 e4m3 变体(env.kv.quant 单源;
+            // f16 版 2B 池写在 1B/elem 池 = 真槽区零写 + 2s 槽区毒化)
+            let insert_op = if ctx.env.kv.quant == crate::env::KvQuant::Fp8E4M3 {
+                ids::ATTN_QKV_NORM_ROPE_INSERT_FP8KV
+            } else {
+                ids::ATTN_QKV_NORM_ROPE_INSERT
+            };
+            let q = TensorOps::call(insert_op)
                 .arg(&q_raw)
                 .arg(&k)
                 .arg(&v)

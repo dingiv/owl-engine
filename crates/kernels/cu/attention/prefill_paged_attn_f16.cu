@@ -1242,8 +1242,11 @@ __global__ void chunked_prefill_paged_attention_opt_f16(
                 for (int i = tid; i < elems_per_block; i += block_dim) {
                     __nv_fp8_e4m3 ke; ke.__x = k_src8[i];
                     __nv_fp8_e4m3 ve; ve.__x = v_src8[i];
-                    k_smem[i] = __half(__nv_cvt_fp8_to_halfraw(ke.__x, __NV_E4M3));
-                    v_smem[i] = __half(__nv_cvt_fp8_to_halfraw(ve.__x, __NV_E4M3));
+                    // 位拷贝(__half_as_ushort):k_smem 是 uint16_t 槽,
+                    // 直接赋 __half 会经 float 数值截断(值<1→0,负→UB)
+                    // = 99.6% 零输出真凶(B6.3)
+                    k_smem[i] = __half_as_ushort(__nv_cvt_fp8_to_halfraw(ke.__x, __NV_E4M3));
+                    v_smem[i] = __half_as_ushort(__nv_cvt_fp8_to_halfraw(ve.__x, __NV_E4M3));
                 }
             } else {
             const uint16_t* k_src = k_cache + k_base;

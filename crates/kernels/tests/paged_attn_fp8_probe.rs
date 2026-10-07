@@ -63,7 +63,7 @@ fn lcg_f16_vec(n: usize, seed: u32) -> Vec<u16> {
         .map(|i| {
             let x = seed
                 .wrapping_mul(0x9E37_79B9)
-                .wrapping_add(i as u32 * 0x85EB_CA6B);
+                .wrapping_add((i as u32).wrapping_mul(0x85EB_CA6B));
             let f = ((x & 0xFFFF) as f32 / 65535.0 - 0.5) * 4.0;
             half_bits(f)
         })

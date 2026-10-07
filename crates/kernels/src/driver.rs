@@ -180,6 +180,11 @@ pub fn resolve(req: OpReq) -> KernelPick {
             let (tokens, hq, hkv, hd, half) = (ax(0), ax(1), ax(2), ax(3), ax(4));
             attn::qkv_norm_rope_insert(dt, tokens, hq, hkv, hd, half) // aux = [tokens, hq, hkv, hd, half]
         }
+        "attn.qkv_norm_rope_insert_fp8kv" => {
+            // B6.3:fp8 主池变体(几何同 f16;池写 e4m3 1B)
+            let (tokens, hq, hkv, hd, half) = (ax(0), ax(1), ax(2), ax(3), ax(4));
+            attn::qkv_norm_rope_insert_fp8kv(tokens, hq, hkv, hd, half)
+        }
                 "ln.fused_add_rmsnorm" => {
             let (rows, n) = (ax(0), ax(1));
             ln::fused_add_rmsnorm(dt, rows, n)
@@ -720,6 +725,24 @@ pub mod attn {
         assert!(matches!(dt, DType::F16), "owl_qknorm_rope_kv_insert 仅有 f16 变体");
         KernelPick {
             name: "owl_qknorm_rope_kv_insert_f16",
+            shape: Shape {
+                grid: (tokens as u32, (hq + hkv) as u32, 1),
+                block: (hd as u32, 1, 1),
+                smem: (hd * 4) as u32,
+            },
+        }
+    }
+
+    /// B6.3:fp8 e4m3 主池变体(几何逐字同 f16;cache 形参 u8 寻址)
+    pub fn qkv_norm_rope_insert_fp8kv(
+        tokens: usize,
+        hq: usize,
+        hkv: usize,
+        hd: usize,
+        _half: usize,
+    ) -> KernelPick {
+        KernelPick {
+            name: "owl_qknorm_rope_kv_insert_f16_fp8kv",
             shape: Shape {
                 grid: (tokens as u32, (hq + hkv) as u32, 1),
                 block: (hd as u32, 1, 1),

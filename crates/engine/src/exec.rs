@@ -187,31 +187,48 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // 诊断:KV 池回读(取证图内 K0 写是否落盘)—— 槽 2 = prompt
             // (eager prefill 写);槽 pos = 本步 K0(图内写)。layout
             // [nb,hkv,hd/x,page,x]:b=0 头 0 组 0 → 元素 s*8。
+            // B6.3:fp8 池字节域同序(1B/elem,e4m3);A/B 池对拍仪表
+            // (f16 boot 半值 vs fp8 boot 字节,host RNE 桥对)
             if self.probes.debug && step < 16 {
+                let fp8 = self.pool.kv_fp8;
+                let esz = if fp8 { 1usize } else { 2usize };
                 let kv0 = &self.pool.kvs[0].k_cache;
-                let mut whole = vec![0u8; kv0.1 * 2];
+                let mut whole = vec![0u8; kv0.1 * esz];
                 let face = self.session.face_mut();
                 face.dtoh(&kv0.0, &mut whole).await?;
                 let probe = |slot: usize| -> usize {
-                    whole[slot * 8 * 2..slot * 8 * 2 + 16]
-                        .chunks_exact(2)
-                        .filter(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32() != 0.0)
-                        .count()
+                    let base = slot * 8 * esz;
+                    if fp8 {
+                        whole[base..base + 8].iter().filter(|&&b| b != 0).count()
+                    } else {
+                        whole[base..base + 16]
+                            .chunks_exact(2)
+                            .filter(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32() != 0.0)
+                            .count()
+                    }
                 };
                 let pos_now = pos;
                 eprintln!(
-                    "[kv-dump] pos={pos_now} 槽2非零={}/8 槽{pos_now}非零={}/8 槽{}非零={}/8",
+                    "[kv-dump] fp8={fp8} pos={pos_now} 槽2非零={}/8 槽{pos_now}非零={}/8 槽{}非零={}/8",
                     probe(2),
                     probe(pos_now),
                     pos_now.saturating_sub(1),
                     probe(pos_now.saturating_sub(1))
                 );
-                // 取证(C1-W2 融合核 27B 案):当前槽 k 值 hex(头 0,维 0..8)
-                let hex: String = whole[pos_now * 16..pos_now * 16 + 16]
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect();
-                eprintln!("[kv-hex] 槽{pos_now} k[0..8] = {hex}");
+                // 取证:当前槽 k 值(f16 半值 / fp8 原始字节,头 0,维 0..8)
+                if fp8 {
+                    let hex: String = whole[pos_now * 8..pos_now * 8 + 8]
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
+                    eprintln!("[kv-hex] fp8 槽{pos_now} k[0..8] = {hex}");
+                } else {
+                    let hex: String = whole[pos_now * 16..pos_now * 16 + 16]
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
+                    eprintln!("[kv-hex] 槽{pos_now} k[0..8] = {hex}");
+                }
             }
             if self.probes.debug && step < 16 {
                 let mut top: Vec<(f32, u32)> = logits
