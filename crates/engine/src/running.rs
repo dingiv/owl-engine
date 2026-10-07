@@ -48,6 +48,31 @@ pub(crate) struct ActiveTurn {
     /// KV/prompt 推进指针(会话 turn 从 `cached_len` 起步 = 增量 prefill)
     pub(crate) fed: usize,
     pub(crate) decoded: String,
+    /// spec 轮机器状态(**turn 生命周期**:随 ActiveTurn 创建、随 turn
+    /// 终了销毁)。历史教训:这七件曾寄存引擎级,跨 turn 残留 ——
+    /// spec_snap_valid 残留 true = 新 turn 用上 turn 快照折叠(GDN 污染,
+    /// AL 2.97→0.49);B4 降级三态残留 = 下 turn 带病起步。生命周期卡对
+    /// 后此类跨 turn 污染结构性消失(2026-10-10)。
+    pub(crate) spec: TurnSpecState,
+}
+
+/// turn 域 spec 状态(生命周期 = ActiveTurn;见上)
+#[derive(Default)]
+pub(crate) struct TurnSpecState {
+    /// spec 快照有效性(轮首拍;fold 后失效重拍;全接受轮保持)
+    pub(crate) spec_snap_valid: bool,
+    /// 已 propose 草稿(host 账;轮末产出轮首消费)
+    pub(crate) spec_drafts_host: Option<Vec<u32>>,
+    /// B4:m=0 连击计数(成功轮归零)
+    pub(crate) spec_zero_streak: usize,
+    /// B4:降级态(true = 调度发裸 Decode;草稿池逐 token 同步)
+    pub(crate) spec_degraded: bool,
+    /// B4:降级以来 decode 步数(探测周期判定)
+    pub(crate) spec_steps_degraded: usize,
+    /// B4:当前探测周期(失败 ×2 退避,上限 512)
+    pub(crate) spec_probe_every: usize,
+    /// prefill 末行 hidden(首轮 propose 的 anchor_hidden;消费后置 None)
+    pub(crate) spec_seed_hidden: Option<owl_iface::contract::Bytes>,
 }
 
 /// 执行态引擎(请求入口)
@@ -153,13 +178,6 @@ pub struct RunningEngine<D: DeviceClient> {
     /// DFlash2 propose 单图(E5-DF4;encode 全 8 行 + 噪声块 + selector,
     /// 固定几何;None = eager 回退)
     pub(crate) dflash_graph: Option<GraphPlan<D>>,
-    /// 已 propose 草稿(host 账;轮末 propose 图/eager dtoh 产出,
-    /// 轮首消费。E5-M5:Bytes 账改 host —— 图态草稿出图即 dtoh,
-    /// 免跨轮设备块所有权)
-    pub(crate) spec_drafts_host: Option<Vec<u32>>,
-    /// prefill 末行 hidden(device 块 [1,hidden];首轮 propose 的
-    /// anchor_hidden;消费后置 None)
-    pub(crate) spec_seed_hidden: Option<owl_iface::contract::Bytes>,
     /// DFlash2 草稿 rope(θ 1e7;dfflash 模式 Some)
     pub(crate) draft_rope: Option<std::sync::Arc<owl_models::layers::rope::Rope>>,
     /// DFlash2 target taps 数(dflash 模式 = 5;其余 0)
@@ -174,18 +192,8 @@ pub struct RunningEngine<D: DeviceClient> {
     pub(crate) boot_seq: u64,
     /// spec 接受账(M2b 恒等门覆盖断言:三路 m 分布 + 账目闭合)
     pub(crate) spec_stats: SpecStats,
-    /// spec 快照有效性(轮首拍;恢复后仍有效,全接受后失效重拍)
-    pub(crate) spec_snap_valid: bool,
     /// 多 token 轮的事件队列(pump 逐个出;SpecRound 一轮 m+1 token)
     pub(crate) pending_events: std::collections::VecDeque<TurnEvent>,
-    /// B4 自适应降级:m=0 连击计数(成功轮归零)
-    pub(crate) spec_zero_streak: usize,
-    /// B4:降级态(true = 调度发裸 Decode;草稿池逐 token 同步)
-    pub(crate) spec_degraded: bool,
-    /// B4:降级以来 decode 步数(探测周期判定)
-    pub(crate) spec_steps_degraded: usize,
-    /// B4:当前探测周期(失败 ×2 退避,上限 512)
-    pub(crate) spec_probe_every: usize,
 }
 
 /// E5-M2b:spec 模式三态(C7 回退挂钩)。裁决在 boot:
@@ -219,6 +227,19 @@ pub(crate) struct SpecStats {
 impl<D: DeviceClient> RunningEngine<D> {
     /// 提交 turn(临时会话:每 turn 独立,终了即焚;行为同 M0.5)。
     /// 预算越界 fail-fast:prompt + 生成 ≤ max_seq_tokens(= KV 槽位)。
+    /// turn 域 spec 状态(turn 生命周期;仅活跃 turn 可触 —— 轮执行期
+    /// active 恒在;turn 外触碰 = 调用序错误)
+    pub(crate) fn tspec(&mut self) -> &mut TurnSpecState {
+        &mut self
+            .active
+            .as_mut()
+            .expect("turn 域 spec 状态:无活跃 turn")
+            .spec
+    }
+    pub(crate) fn tspec_ref(&self) -> &TurnSpecState {
+        &self.active.as_ref().expect("turn 域 spec 状态:无活跃 turn").spec
+    }
+
     pub fn submit(&mut self, prompt: impl Into<String>, max_new: usize) -> Result<u64> {
         self.submit_session(None, prompt, max_new).map(|(_, t)| t)
     }
@@ -272,20 +293,6 @@ impl<D: DeviceClient> RunningEngine<D> {
         };
         let id = self.next_id;
         self.next_id += 1;
-        // B6.3 后泄漏案姊妹修(2026-10-10):跨 turn 快照有效性重置。
-        // spec_snap_valid 若带 true 进新 turn(上 turn 末轮全接受无 fold
-        // 时不失效),新 turn 首个部分接受轮会用上 turn 的陈旧快照折叠
-        // → GDN 状态永久污染 → 草稿/目标全漂 → AL 崩塌(实测 turn2 起
-        // AL 2.97→0.49;新 boot 首 turn 恒健康 = 同指纹)。新 turn =
-        // 新状态序列,快照无条件失效。
-        self.spec_snap_valid = false;
-        // 同族:B4 降级态(streak/degraded/退避)是“本 turn 内”的让路,
-        // 不是会话/引擎属性 —— 残留则下 turn 带病起步(退避已 ×2 多次,
-        // 探测要数十 token 才回一次,整轮趴在裸档)。上 turn 尾段高熵
-        // 降级 ≠ 下 turn 开头也该降级。三态归零 = 回到初始探测节奏。
-        self.spec_zero_streak = 0;
-        self.spec_degraded = false;
-        self.spec_probe_every = self.probes.probe_every;
         self.queue.push_back(Turn {
             id,
             session_id,

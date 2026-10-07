@@ -172,3 +172,17 @@
   唯一可靠 = `nvidia-smi --query-compute-apps` × `/proc/pid/exe` 双验。
   僵尸 server 占端口会让 A/B 测试打到旧二进制(f16 查询打到 fp8 僵尸
   = "fp8 与 f16 同崩"假象,白查一小时)。
+
+## 15. 僵尸 server 的 "(deleted)" 隐身(2026-10-10)
+
+- **律**:kill 循环按 `/proc/pid/exe` 精确匹配二进制路径时,必须剥掉
+  ` (deleted)` 后缀(rebuild 后在跑的老进程 exe 全带此后缀)——否则
+  永远漏杀,僵尸占卡占端口,A/B 测试打到旧二进制出假数。
+- 事故链:rebuild → 老 server 变 "(deleted)" → 精确匹配漏杀 → 新 boot
+  OOM 或打到旧代码 → 假信号(f16 查询打到 fp8 僵尸 = "f16 也崩")。
+- **正解**:`case "$exe" in *owl/target/release/server*) kill -9 $p;; esac`
+  (glob 前缀匹配,天然兼容 deleted 后缀);杀完 `ss -tlnp` 验端口、
+  `nvidia-smi` 验卡。
+- **套件级联 OOM 假回归**:单跑全绿、连跑 OOM = 前一测试进程的
+  设备内存未释放(B6.5 治理下 27B gate 驻留 ~23G,teardown 异步赛跑)。
+  不是被测代码回归;单跑逐个验证 + 清卡后再下判决。

@@ -785,7 +785,6 @@ impl<D: DeviceClient + 'static> Engine<D> {
 
         // B4:探针 boot 解析一次(E3 纪律);探测周期初值传入态机字段
         let probes = crate::running::StepProbes::from_env();
-        let probe_every0 = probes.probe_every;
         Ok(RunningEngine {
             probes,
             session,
@@ -811,7 +810,6 @@ impl<D: DeviceClient + 'static> Engine<D> {
             fold_graphs,
             propose_graphs,
             dflash_graph,
-            spec_drafts_host: None,
             draft_rope,
             dflash_tap_count: if matches!(spec_mode, crate::running::SpecMode::DFlash2)
                 && std::env::var_os("OWL_DFLASH_NOTAPS").is_none()
@@ -824,14 +822,8 @@ impl<D: DeviceClient + 'static> Engine<D> {
             dflash_mem_dumped2: false,
             dflash_hid_dumped: false,
             boot_seq: BOOT_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1,
-            spec_seed_hidden: None,
             spec_stats: crate::running::SpecStats::default(),
-            spec_snap_valid: false,
             pending_events: std::collections::VecDeque::new(),
-            spec_zero_streak: 0,
-            spec_degraded: false,
-            spec_steps_degraded: 0,
-            spec_probe_every: probe_every0,
         })
     }
 }

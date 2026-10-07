@@ -391,6 +391,33 @@ impl StatePool {
     }
 
     /// DFlash2 草稿 KV 叶子组(dflash 模式;5 层 × (k, v);None = 未启用)
+    // ── DFlash2 草稿池寻址权威(唯一出口;slot≥1 案配套,2026-10-10)──
+    // 草稿池 = **线性逻辑寻址**:NC 核签名无块表参数,前缀读 [0, kv_len)
+    // 从池基址直排;encode 写槽 = 逻辑位。写者(exec encode)与读者
+    // (propose 图/NC)禁止各自推槽 —— 两套语言曾分叉(bt 物理写 vs 线性
+    // 读),首 session 巧合重合,后续 session 全崩(slot≥1 案)。
+    // 并发多 turn(B5 batch)共享线性空间会互踩 → B5 需 per-session 分区。
+
+    /// encode 行 i(基址 base)的草稿 K/V 槽(K0 写入位)
+    pub(crate) fn draft_encode_slot(base: usize, i: usize) -> f32 {
+        (base + i) as f32
+    }
+
+    /// propose 噪声块自槽(块内行 i;K/V 核输入直读,不入池)
+    pub(crate) fn draft_self_slot(pos: usize, i: usize) -> f32 {
+        (pos + i) as f32
+    }
+
+    /// propose 前缀读窗:逻辑位 p(NC 线性直排)
+    pub(crate) fn draft_prefix_slot(p: usize) -> f32 {
+        p as f32
+    }
+
+    /// propose 读窗长(fp = 下轮 fed 位)
+    pub(crate) fn draft_kv_len(fp: usize) -> f32 {
+        (fp + 8) as f32
+    }
+
     pub(crate) fn dflash_kv_leaves(&self) -> Option<Vec<(TensorOps, TensorOps)>> {
         let ks = self.dflash_kvs.as_ref()?;
         let (dkv, dhd) = (8usize, 128usize);
@@ -645,6 +672,63 @@ impl StatePool {
     /// GDN 快照拍摄(E2c;块边界跨越时调用):会话格状态 → 槽位缓冲
     /// (D2D;每层 4 块按行宽拷贝)。同 key 覆盖写;池满 LRU 换 key。
     /// (key 解析 = 边界覆盖块,由调用方从会话块链取;见 exec.rs)
+    /// 泄漏案探针(2026-10-10):指定 slot 的 GDN 状态区逐块 FNV。
+    /// turn(slot0) 前后对比 slot1 指纹 —— 变了 = 跨 slot 写实锤。
+    pub(crate) async fn gdn_slot_fingerprint<D: DeviceClient>(
+        &self,
+        face: &mut D,
+        slot: usize,
+    ) -> Result<Vec<u64>> {
+        let mut out = Vec::new();
+        for g in &self.gdns {
+            for (bn, elems) in [
+                (&g.conv_q.0, g.conv_q.1),
+                (&g.conv_k.0, g.conv_k.1),
+                (&g.conv_v.0, g.conv_v.1),
+                (&g.rec.0, g.rec.1),
+            ] {
+                let row = elems / gdn_slots();
+                let mut buf = vec![0u8; elems * 4]; // 整块回读(f32)
+                face.dtoh(bn, &mut buf).await?;
+                let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+                for &b in &buf[slot * row * 4..(slot + 1) * row * 4] {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(0x100_0000_01b3);
+                }
+                out.push(h);
+            }
+        }
+        Ok(out)
+    }
+
+    /// 泄漏案探针第二步:reset_gdn(slot) 后回读该 slot 是否全零。
+    /// 返回 slot 区非零字节数(0 = reset 生效)。
+    pub(crate) async fn gdn_slot_zero_check<D: DeviceClient>(
+        &mut self,
+        face: &mut D,
+        slot: usize,
+    ) -> Result<usize> {
+        self.reset_gdn(face, slot).await?;
+        let mut nonzero = 0usize;
+        for g in &self.gdns {
+            for (bn, elems) in [
+                (&g.conv_q.0, g.conv_q.1),
+                (&g.conv_k.0, g.conv_k.1),
+                (&g.conv_v.0, g.conv_v.1),
+                (&g.rec.0, g.rec.1),
+            ] {
+                let row = elems / gdn_slots();
+                let mut buf = vec![0u8; elems * 4]; // 整块回读(f32)
+                face.dtoh(bn, &mut buf).await?;
+                nonzero += buf[slot * row * 4..(slot + 1) * row * 4]
+                    .iter()
+                    .filter(|&&b| b != 0)
+                    .count();
+            }
+        }
+        Ok(nonzero)
+    }
+
     pub(crate) async fn capture_snap<D: DeviceClient>(
         &mut self,
         face: &mut D,

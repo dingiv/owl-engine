@@ -166,6 +166,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 out: Vec::new(),
                 fed: cached_len,
                 decoded: String::new(),
+                spec: crate::running::TurnSpecState::default(),
             });
         }
 
@@ -192,13 +193,16 @@ impl<D: DeviceClient> RunningEngine<D> {
         };
         // B4 自适应降级(§6.24):降级态发裸 Decode(草稿池逐 token 同步);
         // 每 probe_every 步发一轮真 SpecRound 探测(m≥1 → 解除降级,
-        // 见 execute_spec_round 尾态机)。非降级 = 原调度,零变化
+        // 见 execute_spec_round 尾态机)。非降级 = 原调度,零变化。
+        // B4 三态在 ActiveTurn.spec(turn 生命周期;2026-10-10 收口)
         let spec = if self.spec_depth == 0 {
             0
-        } else if !self.spec_degraded {
+        } else if !self.active.as_ref().expect("活跃").spec.spec_degraded {
             self.spec_depth
-        } else if self.spec_steps_degraded >= self.spec_probe_every {
-            self.spec_steps_degraded = 0;
+        } else if self.active.as_ref().expect("活跃").spec.spec_steps_degraded
+            >= self.active.as_ref().expect("活跃").spec.spec_probe_every
+        {
+            self.active.as_mut().expect("活跃").spec.spec_steps_degraded = 0;
             self.spec_depth
         } else {
             0

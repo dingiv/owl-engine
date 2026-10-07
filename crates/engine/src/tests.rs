@@ -1208,6 +1208,66 @@ async fn drive_turn<D: DeviceClient>(running: &mut RunningEngine<D>, id: u64) ->
 /// 消掉。旧 e2e 的 wall÷max_new 与 gate 生成段 wall÷实际tok 两把尺子
 /// 分别虚高/虚低(差分实测:4d21122 24.3ms vs HEAD 24.8ms = 无回退,
 /// 当年"45 tok/s"是朴素口径虚高)。门控 OWL_AWQ27B_DIR + OWL_TEST_DEVICE。
+
+/// 泄漏案探针(2026-10-10 深夜;slot≥1 崩塌案首刀):
+/// GDN_SLOTS=2 下,turn(slot0) 前后对比 slot1 状态区指纹 ——
+/// slot1 变 = 跨 slot 写实锤;不变 = 病在 slot1 核索引/复用路径。
+/// 附:reset_gdn(slot1) 后回读验零(reset 生效性直接判)。
+/// 门控 OWL_TEST_DEVICE。诊断打印,不做硬断言(判决先看数)。
+#[tokio::test]
+async fn gpu_gdn_slot_cross_probe() {
+    let Some(ordinal) = gpu_ordinal() else {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    };
+    std::env::set_var("OWL_GDN_SLOTS", "2");
+    std::env::set_var("OWL_PREFIX_CACHE", "0");
+    let mut engine = Engine::new(EngineConfig {
+        device_ordinal: ordinal,
+        max_seq_tokens: 512,
+        prefill_chunk: 32,
+    })
+    .expect("构造");
+    let dir = asset_dir();
+    let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
+    let mut running = engine.run(loaded).await.expect("装配");
+
+    fn fnv(b: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &x in b {
+            h ^= x as u64;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+        h
+    }
+
+    // ① boot 后初始态:双 slot 指纹 + slot1 非零字节数(alloc 应已清零)
+    let s1_0 = running.pool.gdn_slot_fingerprint(running.session.face_mut(), 1).await.unwrap();
+    let nz0 = running.pool.gdn_slot_zero_check(running.session.face_mut(), 1).await.unwrap();
+    eprintln!("[slot-probe] boot 后 slot1 非零字节 = {nz0}(期望 0 = alloc 清零生效)");
+
+    // ② turn(slot0,新 session)
+    let (sid, id) = running
+        .submit_session(Some(7), "用五十字介绍长城。", 40)
+        .expect("submit");
+    let _ = drive_turn(&mut running, id).await;
+    let _ = sid;
+
+    // ③ turn 后双 slot 指纹
+    let s1_1 = running.pool.gdn_slot_fingerprint(running.session.face_mut(), 1).await.unwrap();
+    let s0_1 = running.pool.gdn_slot_fingerprint(running.session.face_mut(), 0).await.unwrap();
+    let s1_nz = running.pool.gdn_slot_zero_check(running.session.face_mut(), 1).await.unwrap();
+    eprintln!("[slot-probe] turn 后 slot1 非零字节 = {s1_nz}(>0 = turn(slot0) 跨写了 slot1)");
+    let same1 = s1_0 == s1_1;
+    eprintln!("[slot-probe] slot1 指纹 turn 前后相同 = {same1}(false = 跨 slot 写实锤)");
+    let _ = s0_1;
+
+    // ④ reset 生效性:slot0 填垃圾验证?——零检查已覆盖 slot1;slot0 的
+    //    reset 由健康 turn 隐证。此处仅回收清理。
+    std::env::remove_var("OWL_GDN_SLOTS");
+    std::env::remove_var("OWL_PREFIX_CACHE");
+}
+
 #[tokio::test]
 async fn gpu_decode_marginal_bench() {
     let Some(ordinal) = gpu_ordinal() else {
