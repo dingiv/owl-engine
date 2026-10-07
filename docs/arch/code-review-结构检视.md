@@ -367,3 +367,140 @@ DispatchCfg 字段改正语义(qkv_fuse/gdn_fused_decode/gdn_fused_decode_v2,
   (kv-manifest Fp8E4M3+fi ✓);GPU 清零
 - 附记:awq27b 档缺检查点目录时 loader panic 逃逸(actor 线程 expect)
   —— boot 失败路径结构化挂账,非本轮
+
+
+---
+
+## 九、性能验证 + spec 配方立案(2026-10-10 深夜Ⅸ,clean-code 轮闭环)
+
+> 起点 = 用户指令:重构后跑引擎看性能正不正常(llm_speedtest)。
+> 硬件:单 3090 Ti(vLLM 生产在 3080 对)。
+
+### 性能判决(重构后无回归)
+
+| 档 | 指标 | 实测 | 基线 | 判决 |
+|---|---|---|---|---|
+| 0.8B dev | prefill@2048 / decode / TTFT | 8128 t/s / 251.7 t/s / 246ms | —(首立台账) | 量级正常 |
+| 27B greedy 裸 decode | decode@512 | **45.15 t/s** | 底线 40 / marginal 42.7 | ✓ 无回归略优 |
+| 27B + DFlash2 d7 + fp8 主池 | decode@512 | **34.56 t/s** | perf-roadmap 首测 35.16(同口径) | ✓ 吻合(-1.7% 噪声) |
+
+全程 Captured / 账闭合 / GPU 清零。
+
+### spec 配方立案(两案实测定谳,flavor 已固化)
+
+1. **GDN 格预算案**:slots=8 的 fixed_after = 1.70G(48 层 × 8 格),27B
+   +草稿 21.3G 驻留后 budget = −0.18G → 池 0 → OOM。slots=1 → fixed
+   0.68G → budget 0.84G → 池 16846 tok。**贴顶形态 slots 必须为 1**
+   (单会话门本就单并发)。
+2. **slab 固定档案**:capture_slab_mb=160 × ~10 图族 = 1.6G,6 图降级后
+   0.1MiB 都分不出。**切 hint 定量(warmup 计量)= 零降级** —— A1 设计
+   的正解,固定档只属于非贴顶诊断形态。
+3. 治理可观测性:boot 日志补 fixed_after/budget/per_tok 三数(立案工具)。
+
+### flavor 修正
+
+spec-dflash 配方整体替换为实测版(d7 + fp8 主池 + slots1 + hint slab +
+钉池 4352 + vram_target 0.99);health 应答名误导案(忘配 model.name →
+回退 0.8b 名)入 flavor 注释。
+
+### boot panic 收口修复
+
+actor 线程 catch_unwind 包裹(AssertUnwindSafe)→ 装配深路径 panic
+收口为 ready Err → main 干净 exit(1)。实测:坏检查点目录 = 结构化
+"读目录 No such file" 而非 panic。附:kill 时再证 pitfall #15
+(exe 带 "(deleted)" 后缀,glob 前缀匹配兜住)。
+
+### 回归
+
+- shared **27/27**(flavor 新配方断言)/ workspace --all-targets 绿
+- --flavor spec-dflash 端到端:health/速度全通,残留 0
+
+
+---
+
+## 十、根因定谳:草稿检查点家族错配(2026-10-10 深夜Ⅹ,AL=0 案结)
+
+> §九 遗留:27B+spec AL=1.000 恒 m0(三域/双 dtype 主池同象)。二分
+> 考古(HEAD/727ca7a/09ad2a1/09ad2a1^ 全 AL=0)排除未提交回归;golden
+> 测试"数据源缺键 qweight"一击定谳。
+
+### 根因
+
+**草稿检查点家族错配** —— `dflash2_dir` 被配成 `z-lab/Qwen3.8-27B-DFlash2`
+(**BF16 未量化源**,golden 参考系),而生产草稿 = `syvai/Qwen3.8-27B-DFlash2-W4A16`
+(W4A16 量化家族,weight_packed/scale/shape 三件套)。引擎 `load_27b_dflash2`
+双家族自动探测:z-lab 走 **BF16 原生直载分支**(合法家族,不报错),但该
+分支的草稿在 27B+draft 服务形态**实测全拒**(装上 ≠ 能用)。
+
+### 证据链
+
+| 步 | 观察 | 推论 |
+|---|---|---|
+| spec.m 直方图 | m0 恒定,AL=1.000(三域) | 草稿全拒,域无关 |
+| eager 臂对照 | 同样 m0 | propose 图无罪 |
+| FACT_PROBE | drafts='ChronB (user - F' junk | 草稿前向输出垃圾 |
+| golden 测试 | "缺键 qweight" | z-lab 无量化键(家族错配实锤) |
+| 换 syvai | **AL=4.345,数学 157 t/s** | 一发入魂 |
+
+### 正确配方的性能(24G 单卡,27B+DFlash2 d7+fp8 主池)
+
+| 域 | decode t/s | 对照 |
+|---|---:|---|
+| 多步数学(健康域) | **157.5** | 历史 92-115(超) |
+| 竖式乘法 | **101.2** | >100 ✓ |
+| prose 长城 | 44.5(短输出) | — |
+| 随机词池(speedtest) | 34.56 | 首测 35.16 同口径 ✓(随机域净亏已知) |
+
+错配→正确 = **4.3×**(36.6 → 157.5)。
+
+### 防再犯(三层)
+
+1. **装载期家族嗅探**(w4a16.rs W4A16Source::open_dir):缺 weight_packed
+   = 结构化拒启并指路(拦 W4A16Source 误喂 BF16;golden 测试同款);
+2. **BF16 分支警示日志**(load_27b_dflash2 else 臂):提醒该分支实测全拒,
+   生产用 W4A16,分支死活另案;
+3. **配置件警示**(owl.example.toml / config 总账 / flavor 注释):
+   dflash2_dir 须 W4A16 家族。
+
+### 挂账
+
+- **z-lab BF16 分支死活另案**(装载合法但草稿全拒;golden 参考系不阻塞
+  生产;修复方向 = BF16 激活溢出 §6.14 同族或 fp8 草稿池交互);
+- 健康域 92-115(历史)vs 157(今日)口径差待考(可能 = slots1+fp8 主池
+  正确配方 vs 旧 slots8 组合;正差异不追)。
+
+
+---
+
+## 十一、PoolPlan 参数对象(2026-10-10 深夜ⅩⅠ,布尔和稀泥清零)
+
+> 用户裁决:alloc 的 `kv_fp8/dflash_fp8/spec/mtp/dflash/dump_all` 布尔群
+> 改枚举 —— spec/mtp/dflash 是同一互斥态的展开,量化该用枚举。
+
+- **`PoolPlan`**(state.rs;池装配计划参数对象):alloc 16 参 → 4 参
+  `(face, dims, layer_types, &PoolPlan)`。
+- 量化 = `KvQuant` 枚举(kv/draft_kv/fi 三处同风格);投机形态 =
+  `SpecMode` 枚举(Off/Dumb/Mtp/DFlash2,快照/MTP 链/草稿池三件由 mode
+  派生 —— 互斥语义由派生保证,调用点零自洽负担)。
+- 遗留独立布尔仅 `dump_all`(诊断开关,非互斥态,语义独立保留)。
+- 回归:engine **38/38**(串行)/ workspace --all-targets 绿。
+
+
+---
+
+## 十二、DraftCfg 草稿域收编(2026-10-10 深夜ⅩⅡ,量化布尔废除)
+
+> 用户裁决:knobs 里 draft 的六散字段该单独抽模块;草稿量化该用 dtype
+> 表示,不是 bool。
+
+- **`DraftCfg`**(engine.rs;草稿域子结构,收编 knobs 顶层六散字段):
+  `depth`(投机深度)/ `dumb`(哑草稿)/ `dflash2_dir`(W4A16 家族目录)/
+  **`kv_quant: KvQuant`**(草稿池存储量化,None=f16 / Fp8E4M3=偷显存档;
+  原 `draft_kv_fp8: bool` 布尔废除)/ `notaps` / `tapdecl`。
+- 量化选 `KvQuant` 而非 iface `Dtype`:Dtype 契约(F32/BF16/F16/U32)无
+  fp8 变体,KvQuant(None/Fp8E4M3)即 KV 存储 dtype 语义(与
+  PoolPlan.draft_kv 同型零映射);iface Dtype 扩 fp8 变体挂账(契约层
+  变更,影响面大)。
+- 消费点:run()(spec 三态/草稿装载/dflash taps)、PoolPlan.draft_kv、
+  gate 测试 ×4 —— 全部 knobs.draft.* 直达。
+- 回归:engine **38/38**(串行)/ shared 27/27 / workspace 绿。

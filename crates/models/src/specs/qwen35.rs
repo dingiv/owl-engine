@@ -242,6 +242,13 @@ pub async fn load_27b_dflash2<D: DeviceClient + 'static>(
         }
         return Ok((draft, manifest));
     }
+    // ⚠️ BF16 原生家族(z-lab)分支警示(2026-10-10 立案):本分支草稿
+    // 在 27B+draft 服务形态实测全拒(AL=1.000 恒 m0,三域/双 dtype 主池
+    // 同象)→ spec 退化为裸 decode−税(数学域 36 vs W4A16 家族 157 t/s)。
+    // 生产一律用 W4A16(syvai);本分支死活另案(golden 参考/对照臂用途)。
+    eprintln!(
+        "[boot] ⚠️ DFlash2 草稿 = BF16 原生家族:实测草稿全拒(AL=1.0),\n         生产请用 W4A16 家族(syvai/...-DFlash2-W4A16);分支死活另案"
+    );
     let draft = crate::layers::dflash2::DFlash2Draft::new_with_plan_dt(
         5120,
         17408,

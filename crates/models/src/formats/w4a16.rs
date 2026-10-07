@@ -85,6 +85,18 @@ impl W4A16Source {
     pub fn open_dir(dir: &Path) -> Result<Self, ModelError> {
         let t0 = std::time::Instant::now();
         let (maps, index) = open_raw_index(dir)?;
+        // 家族嗅探(2026-10-10 立案):本源只吃 W4A16 量化家族
+        // (weight_packed/scale/shape 三件套;syvai 系)。BF16 未量化源
+        // (z-lab golden 参考系)喂进来 = 全部权重噪声 → drafts junk →
+        // AL=0 全拒(实测立案:数学域 36 → 157 t/s 的 4.3×)。缺
+        // weight_packed = 结构化拒启并指路,不静默。
+        if !index.keys().any(|k| k.ends_with(".weight_packed")) {
+            return Err(ModelError::Msg(format!(
+                "{} 缺 weight_packed 量化键:疑似未量化源(BF16/F16 golden 参考系)。\n\
+                 DFlash2 草稿须用 W4A16 量化家族(e.g. syvai/Qwen3.8-27B-DFlash2-W4A16)",
+                dir.display()
+            )));
+        }
         eprintln!(
             "[w4a16] v2 mmap 索引 {} 项 @ {:?}(懒物化,无缓存)",
             index.len(),

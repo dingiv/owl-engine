@@ -20,7 +20,12 @@
 # dir  = ""                     # 检查点目录(缺省 = workspace 资产 0.8B)
 # name = ""                     # 对外模型名(缺省 qwen3.5-0.8b)
 # awq27b_dir  = ""              # 27B AWQ 检查点(测试/E2E 门控)
-# dflash2_dir = ""              # DFlash2 草稿检查点(spec.depth>0 必配)
+# dflash2_dir = ""              # DFlash2 草稿检查点(spec.depth>0 必配)。
+#                               # ⚠️ 必须 W4A16 量化家族
+#                               # (syvai/Qwen3.8-27B-DFlash2-W4A16);
+#                               # BF16 未量化源(z-lab)是 golden 参考系,
+#                               # 喂引擎 = 草稿全噪声 → AL=0 全拒
+#                               # (装载期家族嗅探会结构化拒启)。
 
 [pool]
 # pool_tokens = 0               # 块池容量覆写(缺省 = 2×单会话)

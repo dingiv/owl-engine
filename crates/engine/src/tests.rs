@@ -860,8 +860,8 @@ async fn gpu_27b_chat_inference() {
             let mut knobs = EngineKnobs::default();
             knobs.sampler_enabled = false; // greedy(恒等门口径)
             if spec {
-                knobs.spec_depth = 3;
-                knobs.spec_dumb = true;
+                knobs.draft.depth = 3;
+                knobs.draft.dumb = true;
             }
             let mut engine = Engine::new(EngineConfig {
                 device_ordinal: ordinal,
@@ -940,7 +940,7 @@ async fn gpu_27b_chat_inference() {
             knobs.snap_max = 1;
             knobs.prefix_cache = false;
             if spec {
-                knobs.spec_depth = 3;
+                knobs.draft.depth = 3;
                 // verify 捕获实需 ~160MB 固定档(T=4 × 64 层 × m=4 激活;
                 // cap-prof 直方图定谳);decode 臂保持默认 64
                 knobs.cuda.capture_slab_mb = Some(160);
@@ -1027,11 +1027,11 @@ async fn gpu_27b_chat_inference() {
             if spec {
                 // E5 性能:深度可覆写(满收轮直方图 49% m=7 → 加深白拿;
                 // 深度 = 入口侧 OWL_SPEC_DEPTH 读数,缺省 7)
-                knobs.spec_depth = owl_shared::env_reader::parse_or("OWL_SPEC_DEPTH", 7);
+                knobs.draft.depth = owl_shared::env_reader::parse_or("OWL_SPEC_DEPTH", 7);
                 // verify 捕获实需 ~160MB 固定档(cuda 域旋钮)
                 knobs.cuda.capture_slab_mb = Some(160);
             }
-            knobs.dflash2_dir = Some(ddir.to_string());
+            knobs.draft.dflash2_dir = Some(ddir.to_string());
             let mut engine = Engine::new(EngineConfig {
                 device_ordinal: ordinal,
                 max_seq_tokens: 320.max(max_new + 64),

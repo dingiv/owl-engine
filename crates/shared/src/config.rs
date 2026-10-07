@@ -32,7 +32,9 @@
 //! | runtime | server_url | Option<String> / None(cli,不入 toml) |
 //! | model | kind | ModelKind 枚举("0.8b"\\|"awq27b")/ 0.8b |
 //! | model | dir / name | Option / None(workspace 资产缺省) |
-//! | model | awq27b_dir / dflash2_dir | Option<String> / None(检查点) |
+//! | model | awq27b_dir | Option<String> / None(27B AWQ 检查点门控) |
+//! | model | dflash2_dir | Option<String>(⚠️ W4A16 量化家族 syvai 系;
+//! |   |   | BF16 源(z-lab)喂引擎 = 草稿全噪声 AL=0,装载期嗅探拒启) |
 //! | pool | pool_tokens | Option<usize> / None(=2×单会话) |
 //! | pool | gdn_slots / snap_max | usize / 8、4 |
 //! | pool | vram_target / vram_reserve_mb | f64、u64 / 0.97、1024 |
@@ -141,7 +143,8 @@ pub struct ModelCfg {
     pub name: Option<String>,
     /// 27B AWQ 检查点目录(测试/E2E 门控)
     pub awq27b_dir: Option<String>,
-    /// DFlash2 草稿检查点目录
+    /// DFlash2 草稿检查点目录(⚠️ 须 W4A16 量化家族 syvai 系;BF16 源
+    /// (z-lab)喂引擎 = 草稿全噪声 AL=0;装载期家族嗅探拒启)
     pub dflash2_dir: Option<String>,
 }
 
@@ -401,28 +404,42 @@ mode = "greedy"
 "#,
     ),
     (
-        // 27B + DFlash2 真草稿档(E5-DF3 恒等门口径):depth 3 =
-        // kv_slots [u32;4] 契约上限;verify 图捕获实需 ~160MB 固定档
-        // (cap-prof 直方图定谳,缺省 hint 定量在 spec 形态偏小)。
-        // 需配套:model.dflash2_dir(草稿检查点)
+        // 27B + DFlash2 真草稿生产档(2026-10-10 实测配方;24G 单卡贴顶):
+        // decode 34.56@512(对照 perf-roadmap 首测 fp8 主池+d7 = 35.16,同口径
+        // 吻合)、Captured 零降级、装配 16.6s。
+        // 锁"必须成套":
+        // - d7 + fp8 主池(perf-roadmap 首测口径);
+        // - slots=1(单会话门;slots=8 的 GDN 格 = fixed_after 1.7G,
+        //   budget 直接负 → 池 0 → OOM,实测立案);
+        // - capture_slab 用 hint 定量(**勿设固定档**:160MB × ~10 图族
+        //   = 1.6G,贴顶必死,实测立案);
+        // - vram_target 0.99 + 钉池 4352(治理只做护栏,池由显式钉值定)。
+        // 需配套:model.dir + model.dflash2_dir(检查点目录);
+        // 建议 model.name 显式给(缺省应答名是 0.8b 的,health 会误导)。
         "spec-dflash",
         r#"
 [model]
 kind = "awq27b"
 
+[runtime]
+max_seq = 2560
+
 [spec]
-depth = 3
+depth = 7
 
 [pool]
+pool_tokens = 4352
+vram_target = 0.99
+vram_reserve_mb = 512
 gdn_slots = 1
 snap_max = 1
 prefix_cache = false
 
+[dispatch]
+kv_fp8 = true
+
 [sampling]
 mode = "greedy"
-
-[cuda]
-capture_slab_mb = 160
 "#,
     ),
     (
@@ -556,12 +573,14 @@ mod tests {
                 .unwrap_or_else(|e| panic!("flavor {name} 应可解析: {e}"));
             let _ = c;
         }
-        // spec-dflash:三档叠加(depth/slab/greedy)
+        // spec-dflash(2026-10-10 实测配方):d7 + fp8 主池 + 贴顶池预算 +
+        // hint slab(勿设固定档,160MB × 图族贴顶必死)
         let c = OwlConfig::from_toml_str(flavor_toml("spec-dflash").expect("存在")).expect("解析");
-        assert_eq!(c.spec.depth, 3);
-        assert_eq!(c.cuda.capture_slab_mb, Some(160));
+        assert_eq!(c.spec.depth, 7);
         assert_eq!(c.sampling.mode, SamplerMode::Greedy);
         assert_eq!(c.model.kind, ModelKind::Awq27b);
+        assert!(c.dispatch.kv_fp8);
+        assert!(c.cuda.capture_slab_mb.is_none(), "slab 走 hint 定量");
     }
 
     #[test]
@@ -569,11 +588,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("owl_cfg_test_{}", std::process::id()));
         file_loader::create_dir_all(&dir).expect("mkdir");
         let p = dir.join("owl.toml");
-        file_loader::write(&p, "[spec]\ndepth = 7\n[sampling]\nmode = \"greedy\"\n").expect("write");
+        file_loader::write(&p, "[spec]\ndepth = 5\n").expect("write");
         let c = OwlConfig::load(Some("spec-dflash"), Some(&p)).expect("load");
-        assert_eq!(c.spec.depth, 7, "文件覆盖 flavor");
-        assert_eq!(c.cuda.capture_slab_mb, Some(160), "flavor 未覆盖处保留");
-        assert_eq!(c.sampling.mode, SamplerMode::Greedy);
+        assert_eq!(c.spec.depth, 5, "文件覆盖 flavor");
+        assert_eq!(c.sampling.mode, SamplerMode::Greedy, "flavor 未覆盖处保留");
         let _ = std::fs::remove_dir_all(&dir);
 
         assert!(OwlConfig::load(Some("nope"), None).is_err(), "未知 flavor 拒");

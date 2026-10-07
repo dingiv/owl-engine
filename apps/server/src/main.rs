@@ -95,7 +95,7 @@ async fn main() {
                 .enable_all()
                 .build()
                 .expect("actor runtime");
-            rt.block_on(actor_main(config, rx, ready_tx));
+            rt.block_on(actor_main(config, rx, &ready_tx));
         })
         .expect("actor 线程");
 
@@ -134,7 +134,7 @@ async fn main() {
 async fn actor_main(
     config: ServerConfig,
     rx: mpsc::Receiver<EngineReq>,
-    ready: std::sync::mpsc::Sender<Result<String, String>>,
+    ready: &std::sync::mpsc::Sender<Result<String, String>>,
 ) {
     let built: owl_engine::Result<_> = async {
         let t0 = std::time::Instant::now();

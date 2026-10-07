@@ -78,6 +78,35 @@ pub(crate) struct GdnLeaf {
 /// 设备状态块池(KV paged 池 / GDN 状态格 / 快照池 / 持久块表)。
 /// 治理对象(charter A1 味):S2 图档与执行器只经方法面触碰状态块,
 /// 不直摸块句柄。
+/// 池装配计划(engine run 从 knobs/spec_mode 派生;显式依赖律的
+/// 参数对象 —— 原散列布尔/数值参数群收编:量化 = KvQuant 枚举,
+/// 投机形态 = SpecMode 枚举,互斥语义由派生保证,调用点零自洽负担)
+#[derive(Clone, Debug)]
+pub(crate) struct PoolPlan {
+    /// 单会话容量(= max_seq_tokens)
+    pub seq_tokens: usize,
+    /// 池容量(治理/钉值定谳后的 token 数)
+    pub pool_tokens: usize,
+    /// 主池 KV 量化
+    pub kv: owl_models::env::KvQuant,
+    /// FlashInfer K/V 影子池量化(None = 无 FI 面)
+    pub fi: Option<owl_models::env::KvQuant>,
+    /// 草稿池量化
+    pub draft_kv: owl_models::env::KvQuant,
+    /// 投机形态(快照/MTP 链/草稿池三件的唯一事实来源)
+    pub spec_mode: crate::running::SpecMode,
+    /// GDN 状态格容量
+    pub gdn_slots: usize,
+    /// spec 快照池深度
+    pub snap_max: usize,
+    /// VRAM 预算目标占比(0 = 治理禁用)
+    pub vram_target: f64,
+    /// VRAM 预留 MiB
+    pub vram_reserve_mb: u64,
+    /// GDN 画像 dump 全槽
+    pub dump_all: bool,
+}
+
 pub(crate) struct StatePool {
     /// GDN 状态格容量(knobs.gdn_slots,boot 定谳;原自由函数 gdn_slots())
     pub(crate) gdn_slots: usize,
@@ -128,20 +157,21 @@ impl StatePool {
         face: &mut D,
         dims: ModelDims,
         layer_types: &[bool],
-        seq_tokens: usize,
-        pool_tokens: usize,
-        fi: Option<owl_models::env::KvQuant>,
-        kv_fp8: bool,
-        dflash_fp8: bool,
-        spec: bool,
-        mtp: bool,
-        dflash: bool,
-        gdn_slots: usize,
-        snap_max: usize,
-        vram_target: f64,
-        vram_reserve_mb: u64,
-        dump_all: bool,
+        plan: &PoolPlan,
     ) -> Result<StatePool> {
+        let seq_tokens = plan.seq_tokens;
+        let pool_tokens = plan.pool_tokens;
+        // 布尔和稀泥废除(2026-10-10):量化 = KvQuant 枚举,投机形态 =
+        // SpecMode 枚举(快照/MTP 链/草稿池三件由 mode 派生,互斥不再靠
+        // 调用点自洽)
+        let kv_fp8 = plan.kv == owl_models::env::KvQuant::Fp8E4M3;
+        let dflash_fp8 = plan.draft_kv == owl_models::env::KvQuant::Fp8E4M3;
+        let spec = plan.spec_mode != crate::running::SpecMode::Off;
+        let mtp = plan.spec_mode == crate::running::SpecMode::Mtp;
+        let dflash = plan.spec_mode == crate::running::SpecMode::DFlash2;
+        let gdn_slots = plan.gdn_slots;
+        let snap_max = plan.snap_max;
+        let dump_all = plan.dump_all;
         let t = std::time::Instant::now();
         let n_full = layer_types.iter().filter(|&&f| f).count();
         let n_gdn = layer_types.len() - n_full;
@@ -153,6 +183,7 @@ impl StatePool {
         // async 池惰性保留;实测 300MB 在连续 turn 下瞬态 OOM)
         // + 捕获瞬态 + 非追踪惰性保留。OWL_VRAM_TARGET/OWL_VRAM_RESERVE_MB
         // 可调;TOTAL 未落账(=0)或 OWL_VRAM_TARGET=0 → 治理禁用。
+        // FIXME: 大量的硬编码
         let per_tok_bytes = (n_full * 2 * dims.hkv * dims.hd) * if kv_fp8 { 1 } else { 2 }
             + if dflash { 5 * 2 * 8 * 128 * 2 } else { 0 }; // 草稿池按 token 线性(页取整后略同)
         // 治理器之后的固定分配(GDN 格/快照 f32 同式;图 slab + ctx + 杂项 flat)
@@ -160,21 +191,24 @@ impl StatePool {
         let fixed_after = n_gdn * gdn_slots * gdn_slot_elems * 4
             + snap_max * n_gdn * gdn_slot_elems * 4
             + (400 << 20); // 图 slab + CUDA ctx + warmup 瞬态 + 杂项
-        let vram_reserve = vram_reserve_mb << 20;
+        let vram_reserve = plan.vram_reserve_mb << 20;
         let vram_total = owl_shared::vram::total_bytes();
-        let pool_cap = if vram_target > 0.0 && vram_target < 1.0 && vram_total > 0 {
-            let budget = (vram_total as f64 * vram_target) as i64
+        let pool_cap = if plan.vram_target > 0.0 && plan.vram_target < 1.0 && vram_total > 0 {
+            let budget = (vram_total as f64 * plan.vram_target) as i64
                 - vram_reserve as i64
                 - fixed_after as i64
                 - owl_shared::vram::live_bytes() as i64;
             let cap = (budget.max(0) as u64 / per_tok_bytes.max(1) as u64) as usize;
             eprintln!(
-                "[boot] vram 治理:total={:.1}G free={:.2}G live={:.1}G target={:.0}% reserve={}MB → 池上限 {} tok(manual={})",
+                "[boot] vram 治理:total={:.1}G free={:.2}G live={:.1}G target={:.0}% reserve={}MB fixed_after={:.2}G budget={:.2}G per_tok={}B → 池上限 {} tok(manual={})",
                 vram_total as f64 / 1073741824.0,
                 owl_shared::vram::free_bytes() as f64 / 1073741824.0,
                 owl_shared::vram::live_bytes() as f64 / 1073741824.0,
-                vram_target * 100.0,
+                plan.vram_target * 100.0,
                 vram_reserve >> 20,
+                fixed_after as f64 / 1073741824.0,
+                budget as f64 / 1073741824.0,
+                per_tok_bytes,
                 cap,
                 pool_tokens
             );
@@ -249,7 +283,7 @@ impl StatePool {
         } else {
             None
         };
-        if let Some(kq) = fi {
+        if let Some(kq) = plan.fi {
             // 影子池 [nb, page, Hkv, hd]:f16 = 2B/elem;fp8 = 1B/elem
             // (U32 块承载字节:elems = bytes/4,page 32 因子保证 4 整除)
             match kq {
@@ -343,7 +377,7 @@ impl StatePool {
         } else {
             None
         };
-        Ok(StatePool { gdn_slots, dump_all, kvs, k_fis, v_fis, fi_quant: fi,
+        Ok(StatePool { gdn_slots, dump_all, kvs, k_fis, v_fis, fi_quant: plan.fi,
             kv_fp8, dflash_fp8, gdns, snaps, snap_tick: 0, bt, bt_mtp, spec_snap, mtp_kvs, dflash_kvs, attn_v2, page, nb, paged, x, dims })
     }
 
