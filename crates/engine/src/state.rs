@@ -176,8 +176,9 @@ impl StatePool {
                 - owl_shared::vram::live_bytes() as i64;
             let cap = (budget.max(0) as u64 / per_tok_bytes.max(1) as u64) as usize;
             eprintln!(
-                "[boot] vram 治理:total={:.1}G live={:.1}G target={:.0}% reserve={}MB → 池上限 {} tok(manual={})",
+                "[boot] vram 治理:total={:.1}G free={:.2}G live={:.1}G target={:.0}% reserve={}MB → 池上限 {} tok(manual={})",
                 vram_total as f64 / 1073741824.0,
+                owl_shared::vram::free_bytes() as f64 / 1073741824.0,
                 owl_shared::vram::live_bytes() as f64 / 1073741824.0,
                 vram_target * 100.0,
                 vram_reserve >> 20,

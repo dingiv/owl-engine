@@ -251,6 +251,7 @@ pub async fn load_27b_dflash2<D: DeviceClient + 'static>(
         crate::contract::Dtype::BF16,
         kv_fp8,
     );
+    eprintln!("[boot] dflash draft-pool kv_fp8 = {kv_fp8}");
     let src = SafeTensorsSource::open_dir(dir)?;
     let manifest = crate::interpreters::eval_load(&draft, face, &src, &ctx).await?;
     Ok((draft, manifest))

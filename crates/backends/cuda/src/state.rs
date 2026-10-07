@@ -146,6 +146,9 @@ impl GpuCtx {
             Ok(bytes) => owl_shared::vram::total_set(bytes as u64),
             Err(e) => eprintln!("[boot] vram total 查询失败(治理禁用): {e:?}"),
         }
+        if let Ok((free, _)) = cudarc::driver::result::mem_get_info() {
+            owl_shared::vram::free_set(free as u64);
+        }
         // G0 护栏:关 event-tracking(坑 A)。多流 + event tracking 会让
         // safe 层在块读写上插事件,污染图捕获(CAPTURE_ISOLATION/图内事件节点)
         unsafe { ctx.disable_event_tracking() };

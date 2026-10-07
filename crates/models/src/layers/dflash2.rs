@@ -260,7 +260,16 @@ impl DfAttn {
         let k = self.norm_rope(&k_raw, &self.k_norm, t, self.hkv, pos, rope, eps);
         let (page, x) = Self::pool_geom(kv);
         let row_kv = self.hkv * self.hd;
-        TensorOps::call(crate::ops::ids::ATTN_K0_WRITE)
+        // B6 偷显存:fp8 池 → K0 转换写(按输入 dtype 选 f16/bf16 变体)
+        static DBG: std::sync::Once = std::sync::Once::new();
+        DBG.call_once(|| eprintln!("[boot] DfAttn dt={:?} kv_fp8={}", self.dt, self.kv_fp8));
+        let k0_op = match (self.dt, self.kv_fp8) {
+            (_, false) => crate::ops::ids::ATTN_K0_WRITE,
+            (Dtype::F16, true) => crate::ops::ids::ATTN_K0_WRITE_FP8,
+            (Dtype::BF16, true) => crate::ops::ids::ATTN_K0_WRITE_FP8_BF16,
+            other => panic!("K0 fp8 无 {other:?} 变体"),
+        };
+        TensorOps::call(k0_op)
             .aux(&[t])
             .arg(&k)
             .arg(&v)
@@ -305,9 +314,12 @@ impl DfAttn {
         // 非因果块注意力(naive NC 核:自块直读零 launch 内依赖;生产 FI
         // kNonCausal 变体挂 DF-4,KV 全走池 + wr 依赖边)
         // v2:grid (T, Hq) × block (hd) —— block-per-head flash 式
-        let nc_name = match self.dt {
-            Dtype::F16 => "owl_naive_attn_nc_f16",
-            Dtype::BF16 => "owl_naive_attn_nc_bf16",
+        // B6 偷显存:fp8 池 → NC fp8kv 变体(前缀 e4m3 读;自块原 dtype)
+        let nc_name = match (self.dt, self.kv_fp8) {
+            (Dtype::F16, false) => "owl_naive_attn_nc_f16",
+            (Dtype::F16, true) => "owl_naive_attn_nc_fp8kv_f16",
+            (Dtype::BF16, false) => "owl_naive_attn_nc_bf16",
+            (Dtype::BF16, true) => "owl_naive_attn_nc_fp8kv_bf16",
             other => panic!("owl_naive_attn_nc 无 {other:?} 变体"),
         };
         let y = TensorOps::of(crate::kernel::kernel_with(

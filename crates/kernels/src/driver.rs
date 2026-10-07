@@ -137,6 +137,7 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "ops.sigmoid" => ops::sigmoid(dt),
         "attn.k0_write" => attn::k0_write(dt, ax(0)),
         "attn.k0_write_fp8" => attn::k0_write_fp8(ax(0)), // B6.2:f16 入 → e4m3 池(ax=tokens)
+        "attn.k0_write_fp8_bf16" => attn::k0_write_fp8_bf16(ax(0)), // B6:bf16 入 → e4m3 池
         "attn.k0_dual" => attn::k0_dual(ax(0)),
         "attn.k0_dual_fp8kv" => attn::k0_dual_fp8kv(ax(0)),
         "attn.paged_decode" => attn::paged_decode_v1(req.env, dt, ax(0), ax(1), ax(2), ax(3)), // aux = [hd, hq, hkv, nb]
@@ -392,10 +393,18 @@ pub mod attn {
         }
     }
 
-    /// B6.2:K0 写池 fp8 变体(f16 输入 → e4m3 池;形状无关单核)
+    /// B6.2:K0 写池 fp8 变体(f16/bf16 输入 → e4m3 池;形状无关单核)
     pub fn k0_write_fp8(tokens: usize) -> KernelPick {
         KernelPick {
             name: "owl_reshape_and_cache_fp8kv",
+            shape: Shape { grid: (tokens as u32, 1, 1), block: (256, 1, 1), smem: 0 },
+        }
+    }
+
+    /// B6:K0 写池 fp8 变体(bf16 输入;草稿侧)
+    pub fn k0_write_fp8_bf16(tokens: usize) -> KernelPick {
+        KernelPick {
+            name: "owl_reshape_and_cache_fp8kv_bf16",
             shape: Shape { grid: (tokens as u32, 1, 1), block: (256, 1, 1), smem: 0 },
         }
     }

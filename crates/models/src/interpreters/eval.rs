@@ -457,8 +457,9 @@ where
             if let Some(e) = crate::kernel::lookup(kernel.name) {
                 if e.dtype != dtype {
                     return Err(ModelError::Msg(format!(
-                        "[dtype 守门] kernel \"{}\" 登记为 {:?},声明为 {:?}",
-                        kernel.name, e.dtype, dtype
+                        "[dtype 守门] kernel \"{}\" 登记为 {:?},声明为 {:?}\n{}",
+                        kernel.name, e.dtype, dtype,
+                        std::backtrace::Backtrace::force_capture()
                     )));
                 }
             }

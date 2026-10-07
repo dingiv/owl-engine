@@ -13,7 +13,7 @@ use cudarc::driver::{CudaContext, DevicePtr, LaunchConfig, PushKernelArg};
 
 const HD: usize = 256;
 const PAGE: usize = 32;
-const X: usize = 16;
+const X: usize = 8;
 const NUM_HEADS: usize = 8;
 const NUM_KV_HEADS: usize = 2;
 const NUM_BLOCKS: usize = 128;

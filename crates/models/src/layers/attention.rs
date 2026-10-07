@@ -413,7 +413,13 @@ impl Attention {
         // 槽/长度表单源 = ctx(与下方 naive 循环同源):KvBuffers.slots/
         // kv_lens 是 decode 步字段(尺寸 [B]),prefill 误读曾致 K0 grid=T
         // 越界读 + seq_lens 垃圾 → 输出全零/ILLEGAL_ADDRESS(2026-10-01)
-        let wr = TensorOps::call(ids::ATTN_K0_WRITE).aux(&[tokens])
+        // B6.2:fp8 池 → K0 转换写(env.kv.quant 单源)
+        let k0_op = if ctx.env.kv.quant == crate::env::KvQuant::Fp8E4M3 {
+            ids::ATTN_K0_WRITE_FP8
+        } else {
+            ids::ATTN_K0_WRITE
+        };
+        let wr = TensorOps::call(k0_op).aux(&[tokens])
         .arg(k)
         .arg(v)
         .arg(&kv.k_cache)
@@ -504,7 +510,13 @@ impl Attention {
         let dt = q.dtype;
         let page = pol.page as i32;
         // ① K0 批量写池(本 chunk k/v 先入池;slots [T] = 物理槽表,engine 单源)
-        let wr = TensorOps::call(ids::ATTN_K0_WRITE).aux(&[tokens])
+        // B6.2:fp8 池 → K0 转换写(env.kv.quant 单源)
+        let k0_op = if ctx.env.kv.quant == crate::env::KvQuant::Fp8E4M3 {
+            ids::ATTN_K0_WRITE_FP8
+        } else {
+            ids::ATTN_K0_WRITE
+        };
+        let wr = TensorOps::call(k0_op).aux(&[tokens])
         .arg(k)
         .arg(v)
         .arg(&kv.k_cache)

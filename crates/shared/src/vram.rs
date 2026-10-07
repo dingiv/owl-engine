@@ -37,3 +37,14 @@ pub fn live_add(delta: i64) {
 pub fn live_bytes() -> u64 {
     LIVE.load(Ordering::Relaxed).max(0) as u64
 }
+
+static FREE: AtomicU64 = AtomicU64::new(0);
+
+/// 设备线程:free 显存落账(cuMemGetInfo;boot 后每次调用覆盖)。
+pub fn free_set(bytes: u64) {
+    FREE.store(bytes, Ordering::Relaxed);
+}
+
+pub fn free_bytes() -> u64 {
+    FREE.load(Ordering::Relaxed)
+}
