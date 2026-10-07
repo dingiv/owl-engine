@@ -46,7 +46,130 @@ use crate::state::{ModelDims, StatePool};
 
 type Result<T> = std::result::Result<T, ModelError>;
 
-/// 引擎构造参数(纯资源面,零模型语义)
+/// boot 旋钮(显式依赖律,2026-10-10:环境变量是隐式依赖,引擎内部
+/// **零 env 读取** —— env 派生数据由入口(server config)/ 测试用例经
+/// 本结构显式传入;[`EngineKnobs::from_env`] 是唯一的入口侧构造器,
+/// [`Default`] = 生产基线)。
+#[derive(Clone, Debug)]
+pub struct EngineKnobs {
+    /// 步级探针(诊断面;Default = 全关)
+    pub probes: crate::running::StepProbes,
+    /// 块池容量覆写(None = 2 × 单会话容量;原 OWL_POOL_TOKENS)
+    pub pool_tokens: Option<usize>,
+    /// spec 深度(0 = off;上限 3 / DFlash2 7;原 OWL_SPEC_DEPTH)
+    pub spec_depth: usize,
+    /// 哑草稿诊断面(无草稿器时;原 OWL_SPEC_DUMB)
+    pub spec_dumb: bool,
+    /// DFlash2 草稿检查点目录(原 OWL_DFLASH2_DIR)
+    pub dflash2_dir: Option<String>,
+    /// 草稿池 e4m3 影子(原 OWL_DFLASH_KV_FP8)
+    pub draft_kv_fp8: bool,
+    /// 前缀缓存(缺省开;原 OWL_PREFIX_CACHE≠"0")
+    pub prefix_cache: bool,
+    /// eager 直发,跳过图捕获(原 OWL_NO_GRAPH)
+    pub no_graph: bool,
+    /// TS 探针槽(原 OWL_TS_PROBE)
+    pub ts_probe: bool,
+    /// GDN 槽数覆写(缺省 8;原 OWL_GDN_SLOTS)
+    pub gdn_slots: usize,
+    /// spec 快照轮回滚缓冲槽数(缺省 4;原 OWL_SNAP_MAX)
+    pub snap_max: usize,
+    /// VRAM 预算目标占比(缺省 0.97;原 OWL_VRAM_TARGET)
+    pub vram_target: f64,
+    /// VRAM 预留 MiB(缺省 1024;原 OWL_VRAM_RESERVE_MB)
+    pub vram_reserve_mb: u64,
+    /// 裸续写输出,绕过 chat 模板(原 OWL_RAW_COMPLETION)
+    pub raw_completion: bool,
+    /// 采样开关(缺省开;OWL_SAMPLER=greedy → false)
+    pub sampler_enabled: bool,
+    /// 采样参数(temp/topk/topp/rep;缺省 = 反循环服务档)
+    pub sampler: crate::sampler::SamplerCfg,
+    /// GDN 画像 dump 全槽(原 OWL_GDN_DUMP_ALL)
+    pub gdn_dump_all: bool,
+    /// prefill 逐层 checksum 二分(原 OWL_PF_BISECT)
+    pub pf_bisect: bool,
+    /// prefill 指定层五站 stage tap(原 OWL_PF_STAGES)
+    pub pf_stages: Option<usize>,
+    /// prefill 尾块校验(原 OWL_PF_FIN_CHECK)
+    pub pf_fin_check: bool,
+    /// 设备诊断/调优选项(srv_timing/cap_prof/launch_sync/free_legacy/
+    /// graph_flags/capture_slab_mb/nvrtc_include;原散点 OWL_* 直读 →
+    /// owl_cuda::DiagOpts 一体携带,入口经 DiagOpts::from_env 填充)
+    pub cuda: owl_cuda::DiagOpts,
+    /// DFlash2 target taps 退回 last_hidden(原 OWL_DFLASH_NOTAPS)
+    pub dflash_notaps: bool,
+    /// TAPDECL 二分臂:声明期 tapped 但不挂输出槽(原 OWL_DFLASH_TAPDECL)
+    pub dflash_tapdecl: bool,
+    /// 解释器执行环境(硬件档/KV 策略/量化/分派旋钮;Default = 生产基线)
+    pub env: owl_models::env::EnvProvider,
+}
+
+impl Default for EngineKnobs {
+    fn default() -> Self {
+        Self {
+            probes: crate::running::StepProbes::default(),
+            pool_tokens: None,
+            spec_depth: 0,
+            spec_dumb: false,
+            dflash2_dir: None,
+            draft_kv_fp8: false,
+            prefix_cache: true,
+            no_graph: false,
+            ts_probe: false,
+            gdn_slots: 8,
+            snap_max: 4,
+            vram_target: 0.97,
+            vram_reserve_mb: 1024,
+            raw_completion: false,
+            sampler_enabled: true,
+            sampler: crate::sampler::SamplerCfg::default(),
+            gdn_dump_all: false,
+            pf_bisect: false,
+            pf_stages: None,
+            pf_fin_check: false,
+            cuda: owl_cuda::DiagOpts::default(),
+            dflash_notaps: false,
+            dflash_tapdecl: false,
+            env: owl_models::env::EnvProvider::default(),
+        }
+    }
+}
+
+impl EngineKnobs {
+    /// **入口侧构造器**(server config / 测试用例专用;引擎内部零 env
+    /// 读取 —— 本函数是全引擎 env → 旋钮的唯一映射点,新增旋钮在
+    /// 此登记)
+    pub fn from_env() -> Self {
+        Self {
+            probes: crate::running::StepProbes::from_env(),
+            pool_tokens: owl_shared::env_reader::parse("OWL_POOL_TOKENS"),
+            spec_depth: owl_shared::env_reader::parse_or("OWL_SPEC_DEPTH", 0),
+            spec_dumb: owl_shared::env_reader::flag("OWL_SPEC_DUMB"),
+            dflash2_dir: owl_shared::env_reader::str("OWL_DFLASH2_DIR"),
+            draft_kv_fp8: owl_shared::env_reader::flag("OWL_DFLASH_KV_FP8"),
+            prefix_cache: owl_shared::env_reader::str("OWL_PREFIX_CACHE").map(|v| v != "0").unwrap_or(true),
+            no_graph: owl_shared::env_reader::flag("OWL_NO_GRAPH"),
+            ts_probe: owl_shared::env_reader::flag("OWL_TS_PROBE"),
+            gdn_slots: owl_shared::env_reader::parse_or("OWL_GDN_SLOTS", 8),
+            snap_max: owl_shared::env_reader::parse_or("OWL_SNAP_MAX", 4),
+            vram_target: owl_shared::env_reader::parse_or("OWL_VRAM_TARGET", 0.97),
+            vram_reserve_mb: owl_shared::env_reader::parse_or("OWL_VRAM_RESERVE_MB", 1024u64),
+            raw_completion: owl_shared::env_reader::flag("OWL_RAW_COMPLETION"),
+            sampler_enabled: crate::sampler::enabled(),
+            sampler: crate::sampler::SamplerCfg::from_env(),
+            gdn_dump_all: owl_shared::env_reader::flag("OWL_GDN_DUMP_ALL"),
+            pf_bisect: owl_shared::env_reader::flag("OWL_PF_BISECT"),
+            pf_stages: owl_shared::env_reader::parse("OWL_PF_STAGES"),
+            pf_fin_check: owl_shared::env_reader::flag("OWL_PF_FIN_CHECK"),
+            cuda: owl_cuda::DiagOpts::from_env(),
+            dflash_notaps: owl_shared::env_reader::flag("OWL_DFLASH_NOTAPS"),
+            dflash_tapdecl: owl_shared::env_reader::flag("OWL_DFLASH_TAPDECL"),
+            env: owl_models::env::EnvProvider::from_env(),
+        }
+    }
+}
+
+/// 引擎构造参数(纯资源面 + boot 旋钮,零模型语义)
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
     /// 设备序(GpuClient Ordinal;UUID 钉卡 A2.6 挂账)
@@ -57,6 +180,8 @@ pub struct EngineConfig {
     /// (块基址 + 块长)≤ OWL_MAX_KV=256(attention 窗寄存器上限);
     /// 默认 128。长 ctx 批核另案(§五.3)
     pub prefill_chunk: usize,
+    /// boot 旋钮(显式依赖;入口/测试填充,Default = 生产基线)
+    pub knobs: EngineKnobs,
 }
 
 /// E5-M5:fold 图的状态叶子(flat 单槽行;slot 恒 0 = 基指针;
@@ -77,7 +202,10 @@ static BOOT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 impl Engine<GpuClient> {
     /// 常规构造:按 cfg 绑定 GPU(ordinal)
     pub fn new(cfg: EngineConfig) -> Result<Self> {
-        let face = GpuClient::spawn(DeviceSelector::Ordinal(cfg.device_ordinal))
+        let face = GpuClient::spawn_with(
+            DeviceSelector::Ordinal(cfg.device_ordinal),
+            cfg.knobs.cuda.clone(),
+        )
             .map_err(|e| ModelError::Msg(format!("engine: gpu 绑定失败 {e:?}")))?;
         Self::on(cfg, face)
     }
@@ -108,16 +236,13 @@ impl<D: DeviceClient + 'static> Engine<D> {
 
         // 状态块(StatePool::alloc,零初始化;GDN 段每 turn 开始按格重置)。
         // KV 布局表驱动(kv_paged_policy;REQ-HW-01);块池容量 E2b:
-        // 默认 = 2 × 单会话容量(两会话满载共存),OWL_POOL_TOKENS 覆写
-        let pool_tokens = std::env::var("OWL_POOL_TOKENS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(2 * s);
-        // FlashInfer prefill 面(OWL_FLASHINFER=1;E1.5):K 影子池 + 每
+        // 默认 = 2 × 单会话容量(两会话满载共存),knobs.pool_tokens 覆写
+        let pool_tokens = self.cfg.knobs.pool_tokens.unwrap_or(2 * s);
+        // FlashInfer prefill 面(E1.5):K 影子池 + 每
         // chunk 表四件套(ForwardCtx.fi)。f16 + paged 才有意义。
-        // 解释器执行环境(EnvProvider;E1.5 抽象):from_env 兼容面 +
-        // 硬件档自 iface op_env 合入(被动律:引擎 = 环境事实来源)
-        let mut env = owl_models::env::EnvProvider::from_env();
+        // 解释器执行环境(EnvProvider;E1.5 抽象):旋钮携带(入口经
+        // from_env 填充)+ 硬件档自 iface op_env 合入(被动律:引擎 = 环境事实来源)
+        let mut env = self.cfg.knobs.env;
         if let Some(oe) = self.face.op_env() {
             env.hw = owl_models::env::HwEnv::Cuda(oe.hw.arch);
         }
@@ -130,22 +255,18 @@ impl<D: DeviceClient + 'static> Engine<D> {
             None
         };
         // E5-M2b/C7:spec 模式三态裁决 —— depth>0 且检查点有 mtp.* →
-        // Mtp(真草稿);OWL_SPEC_DUMB=1 → Dumb(哑草稿诊断面);否则
+        // Mtp(真草稿);knobs.spec_dumb → Dumb(哑草稿诊断面);否则
         // Off(spec_depth 归零,调度回落 DecodeBatch —— 无草稿器不白发
         // verify 税)。depth 上限 3(kv_slots [u32;4] 契约)。
-        let spec_depth_raw = std::env::var("OWL_SPEC_DEPTH")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&d| d > 0)
-            .unwrap_or(0);
-        let dflash2_dir = std::env::var("OWL_DFLASH2_DIR").ok();
+        let spec_depth_raw = self.cfg.knobs.spec_depth;
+        let dflash2_dir = self.cfg.knobs.dflash2_dir.clone();
         let spec_mode = if spec_depth_raw == 0 {
             crate::running::SpecMode::Off
         } else if dflash2_dir.is_some() {
             crate::running::SpecMode::DFlash2
         } else if loaded.mtp_dir.is_some() {
             crate::running::SpecMode::Mtp
-        } else if std::env::var_os("OWL_SPEC_DUMB").is_some() {
+        } else if self.cfg.knobs.spec_dumb {
             crate::running::SpecMode::Dumb
         } else {
             eprintln!("[boot] OWL_SPEC_DEPTH>0 但无草稿器(非 mtp/dflash2 检查点)→ C7 回落 DecodeBatch");
@@ -176,7 +297,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
             crate::running::SpecMode::DFlash2 => {
                 let dir = dflash2_dir.as_ref().expect("dflash2_dir");
                 // B6 偷显存:草稿池 e4m3(可配;默认关 —— AL 有损需 A/B)
-                let draft_kv_fp8 = std::env::var_os("OWL_DFLASH_KV_FP8").is_some();
+                let draft_kv_fp8 = self.cfg.knobs.draft_kv_fp8;
                 let (d2, _) = owl_models::specs::qwen35::load_27b_dflash2(std::path::Path::new(dir), &mut self.face, draft_kv_fp8).await?;
                 eprintln!("[boot] DFlash2 草稿装载(depth={spec_depth};1.92B BF16 激活,sglang 对齐)");
                 Some(crate::running::Drafter::DFlash2(std::sync::Arc::new(d2)))
@@ -192,6 +313,8 @@ impl<D: DeviceClient + 'static> Engine<D> {
                         dtype: owl_models::contract::Dtype::F16,
                         shard: 1,
                         device_repack: false,
+                        verify: false,
+                        debug_tap: false,
                     };
                     owl_models::interpreters::eval_load(&dr, &mut self.face, &dr.tables(), &ctx).await?;
                 }
@@ -209,8 +332,16 @@ impl<D: DeviceClient + 'static> Engine<D> {
             eprintln!("[boot] KV 池 fp8 e4m3(容量减半/ctx 翻倍;读核 *_fp8 变体)");
         }
         // B6 偷显存:草稿池 e4m3(与草稿装载同旗标)
-        let dflash_fp8 = std::env::var_os("OWL_DFLASH_KV_FP8").is_some();
-        let pool = StatePool::alloc(&mut self.face, dims, &loaded.spec.layer_types, s, pool_tokens, fi_quant, kv_fp8, dflash_fp8, spec_depth > 0, spec_mode == crate::running::SpecMode::Mtp, spec_mode == crate::running::SpecMode::DFlash2).await?;
+        let dflash_fp8 = self.cfg.knobs.draft_kv_fp8;
+        let pool = StatePool::alloc(
+            &mut self.face, dims, &loaded.spec.layer_types, s, pool_tokens, fi_quant, kv_fp8,
+            dflash_fp8, spec_depth > 0, spec_mode == crate::running::SpecMode::Mtp,
+            spec_mode == crate::running::SpecMode::DFlash2,
+            self.cfg.knobs.gdn_slots, self.cfg.knobs.snap_max,
+            self.cfg.knobs.vram_target, self.cfg.knobs.vram_reserve_mb,
+            self.cfg.knobs.gdn_dump_all,
+        )
+        .await?;
         if fi_quant.is_some() {
             eprintln!(
                 "[boot] FlashInfer prefill 面启用(影子池 ×{},quant={:?})",
@@ -219,19 +350,19 @@ impl<D: DeviceClient + 'static> Engine<D> {
             );
         }
 
-        // 块账房(E2b)+ E2c 前缀缓存启用(容量 = 池半;OWL_PREFIX_CACHE=0 关闭)
+        // 块账房(E2b)+ E2c 前缀缓存启用(容量 = 池半;knobs.prefix_cache 关闭)
         let mut blocks_m = BlockManager::new(pool.nb, pool.page);
-        if pool.paged
-            && std::env::var("OWL_PREFIX_CACHE").map(|v| v != "0").unwrap_or(true)
-        {
+        blocks_m.debug = self.cfg.knobs.probes.debug;
+        if pool.paged && self.cfg.knobs.prefix_cache {
             blocks_m.enable_prefix_cache((pool.nb / 2).max(1));
         }
         // MTP 链页账房(E5-M2b):独立页池同几何;无前缀缓存。
         // 非 mtp 模式 0 块 —— 误用 = 结构化报错(池耗尽语义)。
-        let blocks_mtp = BlockManager::new(
+        let mut blocks_mtp = BlockManager::new(
             if spec_mode == crate::running::SpecMode::Mtp { pool.nb } else { 0 },
             pool.page,
         );
+        blocks_mtp.debug = self.cfg.knobs.probes.debug;
 
         let vface = self.face.face_clone();
         // E5-M5:fold/propose 桶形图族的 face 句柄(depth × 2)
@@ -252,7 +383,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
         // OWL_DFLASH_NOTAPS 同款逃生开关)。tapped_hidden 零额外计算,
         // 仅多 5 个 [1,hidden] 输出槽写;非 dflash 走原 forward(拓扑不变)
         let decode_taps = matches!(spec_mode, crate::running::SpecMode::DFlash2)
-            && std::env::var_os("OWL_DFLASH_NOTAPS").is_none();
+            && !self.cfg.knobs.dflash_notaps;
         let forward = move |sc: &PlanCtx| -> Result<()> {
             let ids = sc.input("frontier")?;
             let pos = sc.input("pos")?;
@@ -312,7 +443,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
                         InputSlot::f32("kv_slot", 1),
                         InputSlot::f32("gdn_slot", 1).init(vec![0.0]),
                     ];
-                    if std::env::var_os("OWL_TS_PROBE").is_some() {
+                    if self.cfg.knobs.ts_probe {
                         v.push(InputSlot::f32("ts_buf", 4096));
                     }
                     v
@@ -333,10 +464,12 @@ impl<D: DeviceClient + 'static> Engine<D> {
                     }
                     o
                 },
-                // 逃生开关(C1 禁 graph 裁决配套):OWL_NO_GRAPH=1 → eager
+                // 逃生开关(C1 禁 graph 裁决配套):knobs.no_graph → eager
                 // 直发(decode 逐步 eval,无捕获回放)—— 图内/图外行为
                 // A/B 的对照臂(2026-10-01 paged decode 质量案)
-                capture: std::env::var_os("OWL_NO_GRAPH").is_none(),
+                capture: !self.cfg.knobs.no_graph,
+                slab_fixed: self.cfg.knobs.cuda.capture_slab_mb.is_some(),
+                debug_probe: self.cfg.knobs.probes.debug,
             },
             forward,
         )
@@ -372,12 +505,12 @@ impl<D: DeviceClient + 'static> Engine<D> {
             // DFlash2 target taps(E5-DF2;层输出残差流,sglang capture 同语义)
             // OWL_DFLASH_NOTAPS=1 → 退回 last_hidden(排查开关:隔离 taps 图)
             let dflash_taps = matches!(spec_mode, crate::running::SpecMode::DFlash2)
-                && std::env::var_os("OWL_DFLASH_NOTAPS").is_none();
+                && !self.cfg.knobs.dflash_notaps;
             // TAPDECL:声明期 tapped(收集)但不挂输出槽 —— 二分「tap 节点
             // 本身」vs「输出槽机制」(2026-10-07 恒等门排查)
             let dflash_tap_decl = dflash_taps
                 || (matches!(spec_mode, crate::running::SpecMode::DFlash2)
-                    && std::env::var_os("OWL_DFLASH_TAPDECL").is_some());
+                    && self.cfg.knobs.dflash_tapdecl);
             if dflash_taps {
                 for i in 0..5 {
                     vouts.push(OutputSlot { name: format!("tap{i}"), shape: vec![depth1, dims.hidden], dtype: dims.dtype });
@@ -406,7 +539,9 @@ impl<D: DeviceClient + 'static> Engine<D> {
                         InputSlot::f32("gdn_cu", 2).init(vec![0.0, depth1 as f32]),
                     ],
                     outputs: vouts,
-                    capture: std::env::var_os("OWL_NO_GRAPH").is_none(),
+                    capture: !self.cfg.knobs.no_graph,
+                    slab_fixed: self.cfg.knobs.cuda.capture_slab_mb.is_some(),
+                    debug_probe: self.cfg.knobs.probes.debug,
                 },
                 move |sc: &PlanCtx| -> Result<()> {
                     let ids = sc.input("ids")?;
@@ -539,7 +674,9 @@ impl<D: DeviceClient + 'static> Engine<D> {
                             InputSlot::f32("cu", 2).init(vec![0.0, m1 as f32]),
                         ],
                         outputs: fouts,
-                        capture: std::env::var_os("OWL_NO_GRAPH").is_none(),
+                        capture: !self.cfg.knobs.no_graph,
+                        slab_fixed: self.cfg.knobs.cuda.capture_slab_mb.is_some(),
+                        debug_probe: self.cfg.knobs.probes.debug,
                     },
                     move |sc: &PlanCtx| -> Result<()> {
                         let slots = sc.input("slots")?;
@@ -623,7 +760,9 @@ impl<D: DeviceClient + 'static> Engine<D> {
                                     OutputSlot { name: "e3".into(), shape: vec![1], dtype: Dtype::BF16 },
                                     OutputSlot { name: "e4".into(), shape: vec![1], dtype: Dtype::BF16 },
                                 ],
-                                capture: std::env::var_os("OWL_NO_GRAPH").is_none(),
+                                capture: !self.cfg.knobs.no_graph,
+                                slab_fixed: self.cfg.knobs.cuda.capture_slab_mb.is_some(),
+                                debug_probe: self.cfg.knobs.probes.debug,
                             },
                             move |sc: &PlanCtx| -> Result<()> {
                                 let taps: Vec<owl_models::tensor::TensorOps> = tap_blks
@@ -717,7 +856,9 @@ impl<D: DeviceClient + 'static> Engine<D> {
                         GraphPlanDesc {
                             inputs: pins,
                             outputs: vec![OutputSlot { name: "drafts".into(), shape: vec![spec_depth, 1], dtype: Dtype::F32 }],
-                            capture: std::env::var_os("OWL_NO_GRAPH").is_none(),
+                            capture: !self.cfg.knobs.no_graph,
+                            slab_fixed: self.cfg.knobs.cuda.capture_slab_mb.is_some(),
+                            debug_probe: self.cfg.knobs.probes.debug,
                         },
                         move |sc: &PlanCtx| -> Result<()> {
                             // PlanCtx 输入声明形 [1, len] → flatten(行主前缀)
@@ -784,7 +925,8 @@ impl<D: DeviceClient + 'static> Engine<D> {
         };
 
         // B4:探针 boot 解析一次(E3 纪律);探测周期初值传入态机字段
-        let probes = crate::running::StepProbes::from_env();
+        let probes = self.cfg.knobs.probes;
+        let dflash_notaps = self.cfg.knobs.dflash_notaps;
         Ok(RunningEngine {
             probes,
             session,
@@ -812,7 +954,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
             dflash_graph,
             draft_rope,
             dflash_tap_count: if matches!(spec_mode, crate::running::SpecMode::DFlash2)
-                && std::env::var_os("OWL_DFLASH_NOTAPS").is_none()
+                && !dflash_notaps
             {
                 5
             } else {

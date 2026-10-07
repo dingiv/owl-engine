@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 /// mmap 只读映射(Linux,MAP_PRIVATE;Drop = munmap)。
-/// 页缓存支撑、零堆拷贝 —— 替代 std::fs::read 的整文件堆读;
+/// 页缓存支撑、零堆拷贝 —— 替代整文件堆读(file_loader::read)的 mmap 形态;
 /// 页为 file-backed clean page,内存压力下内核可直接回收。
 pub(crate) struct Mmap {
     ptr: std::ptr::NonNull<u8>,
@@ -19,7 +19,7 @@ pub(crate) struct Mmap {
 impl Mmap {
     pub(crate) fn open(path: &Path) -> Result<Self, ModelError> {
         use std::os::unix::io::AsRawFd;
-        let file = std::fs::File::open(path)
+        let file = owl_shared::file_loader::open(path)
             .map_err(|e| ModelError::Msg(format!("mmap: open {path:?}: {e}")))?;
         let len = file
             .metadata()
@@ -110,7 +110,7 @@ pub(crate) struct RawEntry {
 pub(crate) fn open_raw_index(
     dir: &Path,
 ) -> Result<(Vec<Mmap>, HashMap<String, RawEntry>), ModelError> {
-    let mut paths: Vec<_> = std::fs::read_dir(dir)
+    let mut paths: Vec<_> = owl_shared::file_loader::read_dir(dir)
         .map_err(|e| ModelError::Msg(format!("safetensors: 读目录 {dir:?}: {e}")))?
         .filter_map(|e| e.ok())
         .map(|e| e.path())

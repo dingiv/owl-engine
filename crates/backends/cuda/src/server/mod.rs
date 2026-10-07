@@ -127,7 +127,7 @@ struct ServerProbes {
 
 impl ServerProbes {
     fn from_env() -> Self {
-        let has = |k: &str| std::env::var_os(k).is_some();
+        let has = |k: &str| owl_shared::env_reader::flag(k);
         Self {
             gpu_prof: has("OWL_GPU_PROF"),
             launch_time: has("OWL_LAUNCH_TIME"),
@@ -146,6 +146,10 @@ mod harvest;
 pub struct GpuServer {
     rx: mpsc::Receiver<Command>,
     selector: DeviceSelector,
+    /// 设备诊断/调优选项(入口显式传入;Default = 全关。显式依赖律:
+    /// 原 OWL_SRV_TIMING/CAP_PROF/LAUNCH_SYNC/FREE_LEGACY/GRAPH_FLAGS/
+    /// CAPTURE_SLAB_MB/CUDA_HOME 散点直读 → DiagOpts 一体携带)
+    diag: crate::state::DiagOpts,
     pool: std::sync::Arc<PinnedPool>,
     /// 上线握手(可选;便捷组装路径用它回传设备上线结果)
     boot: Option<mpsc::Sender<Result<(), String>>>,
@@ -234,13 +238,24 @@ impl GpuServer {
         selector: DeviceSelector,
         boot: Option<mpsc::Sender<Result<(), String>>>,
     ) -> Self {
+        Self::with_diag(rx, selector, boot, crate::state::DiagOpts::default())
+    }
+
+    /// 带设备诊断选项构造(显式依赖律入口;`new` = Default 便捷糖)
+    pub fn with_diag(
+        rx: mpsc::Receiver<Command>,
+        selector: DeviceSelector,
+        boot: Option<mpsc::Sender<Result<(), String>>>,
+        diag: crate::state::DiagOpts,
+    ) -> Self {
         Self {
             rx,
             selector,
             pool: std::sync::Arc::new(PinnedPool::default()),
             boot,
             ctx: None,
-            kernels: KernelCache::new(),
+            kernels: KernelCache::new(diag.nvrtc_include.clone()),
+// (diag 自身随 Self 移动,克隆 include 后置)
             blas: None,
             blas_ws: None,
             fi: None,
@@ -249,13 +264,14 @@ impl GpuServer {
             dispatch: None,
             timings: Vec::new(),
             probes: ServerProbes::from_env(),
+            diag,
         }
     }
 
     /// 事件循环主入口(server 线程生命周期 = 循环生命周期)。
     /// 首行上线设备(本线程 bind_to_thread 一次到位)+ 起派发线程。
     pub fn run(mut self) -> Result<(), String> {
-        let ctx = GpuCtx::new(&self.selector);
+        let ctx = GpuCtx::new(&self.selector, self.diag.clone());
         match ctx {
             Ok(c) => {
                 if let Some(boot) = self.boot.take() {

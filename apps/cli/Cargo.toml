@@ -7,3 +7,5 @@ description = "owl 交互客户端(终端 REPL → owl server SSE 流式;多轮�
 
 [dependencies]
 serde_json = { workspace = true }
+# 环境变量统一读取面(env reader;OWL_SERVER_URL)
+owl-shared = { path = "../../crates/shared" }

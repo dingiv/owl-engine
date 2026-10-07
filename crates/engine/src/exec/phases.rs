@@ -101,7 +101,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // instruct 模型上嚌进复读吸引子(2026-10-01 27B 实测);cost =
         // 每步 logits dtoh(~1MB);device 采样核留 E4 靶面。
         let t_dtoh = prof.then(std::time::Instant::now);
-        let nt = if crate::sampler::enabled() {
+        let nt = if self.cfg.knobs.sampler_enabled {
             let mut logits = self.session.read_output_f32("logits").await?;
             // 诊断:分布形状(绝对尺度 / top1-top2 gap / 候选词面)——
             // 复读病理定位的仪表盘(OWL_DEBUG 门控,前 16 步)
@@ -187,17 +187,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     .collect()
             };
             let t_sample = prof.then(std::time::Instant::now);
-            let nt = crate::sampler::sample(
-                &mut logits,
-                &crate::sampler::SamplerCfg::from_env(),
-                &mut rng,
-                &history,
-            );
+            let nt = crate::sampler::sample(&mut logits, &self.cfg.knobs.sampler, &mut rng, &history);
             if prof {
                 eprintln!("[step-prof] pos={pos} host-sample={:?} wall3={}", t_sample.unwrap().elapsed(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100000);
             }
             if self.probes.debug {
-                eprintln!("[sample-dump] t{turn_id} s{step}: sampled={nt} hist={} pen={}", history.len(), std::env::var("OWL_REP_PENALTY").unwrap_or_else(|_| "d".into()));
+                eprintln!("[sample-dump] t{turn_id} s{step}: sampled={nt} hist={} pen={}", history.len(), self.cfg.knobs.sampler.rep_penalty);
             }
             nt
         } else if self.env.diag.host_argmax {
@@ -277,7 +272,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         let lines = {
             let face = self.session.face_mut();
-            self.pool.gdn_slot_profile(face, gdn_slot, step).await?
+            self.pool.gdn_slot_profile(face, gdn_slot, step, self.cfg.knobs.gdn_dump_all).await?
         };
         for l in lines {
             eprintln!("{l}");

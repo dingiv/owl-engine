@@ -191,19 +191,15 @@ fn reduce_rec(
 // §3 CpuInterpreter:同步 CPU 解释器(朴素实现;对拍锚)
 // ============================================================================
 
-/// 调试门控:OWL_DEBUG=1 开启解释层发射日志
-fn dbg_on() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("OWL_DEBUG").is_some())
-}
-
 /// CPU 参考解释器(朴素实现;**永不优化** —— 它的存在意义就是对拍
 /// 后端实现:`owl-cpu::CpuFace` / `owl-cuda::GpuClient`。两侧算子实现
 /// 互为独立副本,禁止互相引用,否则对拍失效)。
 pub struct CpuInterpreter {
     /// Block 叶子登记表(id → 值;rt::Tensor 物化时由绑定方注册)
     blocks: std::collections::HashMap<u64, Value>,
+    /// 解释层发射日志(对拍调试;显式依赖律,原 OWL_DEBUG OnceLock 直读
+    /// —— 测试/入口构造时传,缺省关)
+    pub debug: bool,
 }
 
 impl Default for CpuInterpreter {
@@ -214,7 +210,7 @@ impl Default for CpuInterpreter {
 
 impl CpuInterpreter {
     pub fn new() -> Self {
-        Self { blocks: std::collections::HashMap::new() }
+        Self { blocks: std::collections::HashMap::new(), debug: false }
     }
 
     /// 登记 Block 叶子的数据(id = rt::Tensor 的全局 id)
@@ -239,7 +235,7 @@ impl Interpreter for CpuInterpreter {
         _dtype: Dtype,
         shape: &Shape,
     ) -> Result<Value, ModelError> {
-        if dbg_on() {
+        if self.debug {
             eprintln!("[dbg mm] a.shape={:?} a.len={} b.shape={:?} b.len={} shape={:?}", a.shape, a.f32.len(), b.shape, b.f32.len(), shape);
         }
         // k = 内维 = a 的元素数 / m(行主序)

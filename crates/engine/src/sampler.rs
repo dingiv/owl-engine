@@ -11,8 +11,10 @@
 //! dtoh + host softmax(debug 档不可见;release ~10% 步时)。device
 //! 采样核(每步零 D2H 律)留 E4 靶面,本模块 API 面按可搬迁设计。
 //!
-//! **控制面(env,每步可变)**:`OWL_SAMPLER=greedy` 关采样(回 argmax
-//! 快路);`OWL_TEMP`(1.0)/ `OWL_TOPK`(20)/ `OWL_TOPP`(0.95)。
+//! **控制面(显式依赖,2026-10-10)**:参数经 [`SamplerCfg`] 随
+//! EngineKnobs 传入(入口/测试构造;`OWL_SAMPLER=greedy` 关采样、
+//! `OWL_TEMP`/`OWL_TOPK`/`OWL_TOPP` 映射在 `EngineKnobs::from_env`
+//! 唯一登记)—— 引擎热路径零 env 读取(原"每步 from_env"已废除)。
 //!
 //! **RNG 契约**:xorshift64*,seed 由调用方从 (turn id, step) 派生 ——
 //! 同 turn 重放确定性(测试可复现),跨 turn 不同。
@@ -29,11 +31,19 @@ pub struct SamplerCfg {
     pub rep_penalty: f32,
 }
 
+impl Default for SamplerCfg {
+    /// 缺省 = 反循环服务档(generation_config 同款)
+    fn default() -> Self {
+        SamplerCfg { temp: 1.0, topk: 20, topp: 0.95, rep_penalty: 1.15 }
+    }
+}
+
 impl SamplerCfg {
-    /// env 读取(每步调用可承受;未设 = 反循环服务档)
+    /// **入口侧构造器**(server config / 测试用例专用;引擎内部经
+    /// EngineKnobs.sampler 显式携带,热路径零 env 读取)
     pub fn from_env() -> Self {
         let f = |k: &str, d: f32| -> f32 {
-            std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+            owl_shared::env_reader::parse_or(k, d)
         };
         SamplerCfg {
             temp: f("OWL_TEMP", 1.0),
@@ -44,9 +54,10 @@ impl SamplerCfg {
     }
 }
 
-/// 采样开关(默认开 = 成功推理的默认姿势;OWL_SAMPLER=greedy 关)
+/// 采样开关映射(默认开 = 成功推理的默认姿势;OWL_SAMPLER=greedy 关)。
+/// **入口侧构造器**:引擎内部经 EngineKnobs.sampler_enabled 显式携带。
 pub fn enabled() -> bool {
-    std::env::var("OWL_SAMPLER").map(|v| v != "greedy").unwrap_or(true)
+    owl_shared::env_reader::str("OWL_SAMPLER").map(|v| v != "greedy").unwrap_or(true)
 }
 
 /// xorshift64* 步进(返回 64 位;调用方持有 state)

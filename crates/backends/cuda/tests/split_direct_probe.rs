@@ -6,8 +6,8 @@ use cudarc::nvrtc::CompileOptions;
 
 fn src() -> String {
     let s = include_str!("../../../kernels/cu/attention/prefill_split_f16.cu").to_string();
-    match std::env::var("SPLIT_SKIP").as_deref() {
-        Ok("qload") => s.replace(
+    match owl_shared::env_reader::str("SPLIT_SKIP").as_deref() {
+        Some("qload") => s.replace(
             "    #pragma unroll\n    for (int v = 0; v < VQ; ++v) {\n        const uint4 raw = *reinterpret_cast<const uint4*>(\n            q + q_off + v * VEC);\n        const uint16_t* h = reinterpret_cast<const uint16_t*>(&raw);\n        #pragma unroll\n        for (int e = 0; e < VEC; ++e) qv[v][e] = __half2float(\n            *reinterpret_cast<const __half*>(&h[e]));\n    }",
             "    // q load skipped"),
         _ => s,
@@ -54,7 +54,7 @@ fn split_direct_launch() {
     let (ihkv, it, icb, inp) = (hkv as i32, t as i32, 0i32, nparts as i32);
     let (kbs, khs, pg, ihq) = ((hkv * hd * 32) as i32, (hd * 32) as i32, 32i32, hq as i32);
 
-    let smem: u32 = std::env::var("SPLIT_SMEM").ok().and_then(|v| v.parse().ok()).unwrap_or(65536);
+    let smem: u32 = owl_shared::env_reader::parse_or("SPLIT_SMEM", 65536);
     let cfg = LaunchConfig {
         grid_dim: ((hq / hkv) as u32, hkv as u32, 1),
         block_dim: (256, 1, 1),

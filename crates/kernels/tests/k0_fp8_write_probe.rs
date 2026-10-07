@@ -69,7 +69,7 @@ fn f16_to_f32(h: u16) -> f32 {
 
 #[test]
 fn k0_fp8_write_readback() {
-    if std::env::var_os("OWL_TEST_DEVICE").is_none() {
+    if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
     }

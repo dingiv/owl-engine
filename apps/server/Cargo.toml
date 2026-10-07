@@ -16,4 +16,4 @@ owl-shared = { path = "../../crates/shared" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # 手写 HTTP/1.1 + SSE(架子零重依赖;axum/hyper 迁移挂账,见 http.rs 模块头)
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }

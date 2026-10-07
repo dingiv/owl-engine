@@ -100,7 +100,7 @@ fn f16_bits_to_f32(h: u16) -> f32 {
 
 #[test]
 fn paged_attn_v2_fp8_matches_f16() {
-    if std::env::var_os("OWL_TEST_DEVICE").is_none() {
+    if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
     }
@@ -117,7 +117,7 @@ fn paged_attn_v2_fp8_matches_f16() {
     )
     .expect("nvrtc compile pagedattention");
         if let Some(bytes) = ptx.as_bytes() {
-        std::fs::write("/tmp/b6.ptx", bytes).ok();
+        owl_shared::file_loader::write("/tmp/b6.ptx", bytes).ok();
     }
     let m = ctx.load_module(ptx).expect("module");
 

@@ -577,7 +577,7 @@ impl GatedDeltaNet {
         // - scalar:lmdeploy pre_sm90 port 单核(cast ×5 → 单 Call)
         // - chunked:FLA AOT 五核(fwd_h 旧案冻结,对照臂)
         // - recurrence:现役 varlen 递推批核(基线)
-        if std::env::var_os("OWL_TRACE_GATE").is_some() {
+        if ctx.trace_gate {
             eprintln!("[gdn-gate] scalar={} chunked={} T={}", ctx.env.gdn.scalar, ctx.env.gdn.chunked, tokens);
         }
         // E5-M4 fold 记录(verify 图 tap;生产路径 None 零开销):每层 8 件
@@ -1335,8 +1335,8 @@ mod tests {
 
         assert_close(&got_g, &want_g, 1e-6, "gating-g-hf");
         assert_close(&got_beta, &want_beta, 1e-6, "gating-beta-hf");
-        std::fs::remove_file(&inp).ok();
-        std::fs::remove_file(&outp).ok();
+        owl_shared::file_loader::remove_file(&inp).ok();
+        owl_shared::file_loader::remove_file(&outp).ok();
     }
 
     // ======================================================================
@@ -1421,8 +1421,8 @@ mod tests {
         gpu.close().await.expect("server 关机");
 
         assert_close(&got, &want, 1e-6, "l2norm-hf");
-        std::fs::remove_file(&inp).ok();
-        std::fs::remove_file(&outp).ok();
+        owl_shared::file_loader::remove_file(&inp).ok();
+        owl_shared::file_loader::remove_file(&outp).ok();
     }
 
     // ======================================================================
@@ -1566,8 +1566,8 @@ mod tests {
 
         assert_close(&got_y, &want_y, 1e-6, "conv_upd-hf");
         assert_close(&got_state, &want_state, 1e-6, "conv_upd-state-hf");
-        std::fs::remove_file(&inp).ok();
-        std::fs::remove_file(&outp).ok();
+        owl_shared::file_loader::remove_file(&inp).ok();
+        owl_shared::file_loader::remove_file(&outp).ok();
     }
 
     // ======================================================================
@@ -1735,8 +1735,8 @@ mod tests {
 
         assert_close(&got_out, &want_out, 1e-5, "delta_dec-hf");
         assert_close(&got_state, &want_state, 1e-5, "delta_dec-state-hf");
-        std::fs::remove_file(&inp).ok();
-        std::fs::remove_file(&outp).ok();
+        owl_shared::file_loader::remove_file(&inp).ok();
+        owl_shared::file_loader::remove_file(&outp).ok();
     }
 
     // ======================================================================
@@ -1826,8 +1826,8 @@ mod tests {
         gpu.close().await.expect("server 关机");
 
         assert_close(&got, &want, 1e-6, "norm_act-hf");
-        std::fs::remove_file(&inp).ok();
-        std::fs::remove_file(&outp).ok();
+        owl_shared::file_loader::remove_file(&inp).ok();
+        owl_shared::file_loader::remove_file(&outp).ok();
     }
 
     // ======================================================================
@@ -2180,7 +2180,7 @@ mod f16_tests {
                 .collect();
 
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false };
         crate::interpreters::eval_load(&layer, &mut gpu, &src, &lctx)
             .await
             .expect("层 f16 装载");
@@ -2255,7 +2255,7 @@ mod f16_tests {
                 .collect();
 
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F32, shard: 1, device_repack: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F32, shard: 1, device_repack: false, verify: false, debug_tap: false };
         crate::interpreters::eval_load(&layer, &mut gpu, &src, &lctx)
             .await
             .expect("层 f32 装载");
@@ -2325,7 +2325,7 @@ mod f16_tests {
                 .collect();
 
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false };
         crate::interpreters::eval_load(&layer, &mut gpu, &src, &lctx)
             .await
             .expect("层 f16 装载");

@@ -262,7 +262,7 @@ mod tests {
             eprintln!("skip: OWL_TEST_DEVICE 未设");
             return;
         }
-        let Ok(dir) = std::env::var("OWL_AWQ27B_DIR") else {
+        let Some(dir) = owl_shared::env_reader::str("OWL_AWQ27B_DIR") else {
             eprintln!("skip: OWL_AWQ27B_DIR 未设(cyankiwi 检查点目录)");
             return;
         };
@@ -410,7 +410,7 @@ mod wiring_tests {
         src.insert("mtp.pre_fc_norm_embedding.weight".into(), gen(hidden, 14.0));
 
         let mut gpu = gpu_client().await;
-        let lctx = LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false };
+        let lctx = LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false };
 
         let mtp = MtpPredictor::new(hidden, inter, hq, hkv, hd, eps);
         crate::interpreters::eval_load(&mtp, &mut gpu, &src, &lctx).await.expect("mtp 装载");

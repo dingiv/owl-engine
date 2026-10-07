@@ -62,9 +62,14 @@ impl GpuClient {
     /// thread::spawn(move || server.run());
     /// ```
     pub fn spawn(selector: DeviceSelector) -> Result<Self, String> {
+        Self::spawn_with(selector, crate::state::DiagOpts::default())
+    }
+
+    /// 带设备诊断选项组装(显式依赖律入口;engine 经 EngineKnobs.cuda 传入)
+    pub fn spawn_with(selector: DeviceSelector, diag: crate::state::DiagOpts) -> Result<Self, String> {
         let (tx, rx) = mpsc::channel::<Command>();
         let (boot_tx, boot_rx) = mpsc::channel::<Result<(), String>>();
-        let server = GpuServer::new(rx, selector, Some(boot_tx));
+        let server = GpuServer::with_diag(rx, selector, Some(boot_tx), diag);
         std::thread::Builder::new()
             .spawn(move || {
                 // server 收摊 → 账房/图注册表随 ctx 析构,派发线程排空后退出

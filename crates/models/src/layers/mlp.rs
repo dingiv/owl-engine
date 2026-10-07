@@ -170,7 +170,7 @@ mod tests {
             };
             assert_close(&out, &want, 1e-4, &format!("mlp-{face_tag}"));
         }
-        std::fs::remove_file(&inp).ok();
-        std::fs::remove_file(&outp).ok();
+        owl_shared::file_loader::remove_file(&inp).ok();
+        owl_shared::file_loader::remove_file(&outp).ok();
     }
 }

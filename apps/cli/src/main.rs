@@ -41,7 +41,7 @@ struct Cfg {
 }
 
 fn parse_args() -> Cfg {
-    let base = std::env::var("OWL_SERVER_URL").unwrap_or_else(|_| DEFAULT_URL.into());
+    let base = owl_shared::env_reader::str_or("OWL_SERVER_URL", DEFAULT_URL);
     let mut cfg = Cfg {
         host: base
             .trim_start_matches("http://")

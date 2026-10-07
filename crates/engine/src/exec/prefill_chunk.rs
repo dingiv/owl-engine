@@ -115,21 +115,19 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             t, &pos_t, &kvs_step, &self.rope, &gdns_step, &slots_t, &lens_t, &gdn_slot, base, fi,
         );
         ctx.env = self.env;
+        ctx.trace_gate = self.cfg.knobs.probes.trace_gate;
         let vocab = self.model.vocab_size();
         // E5-DF4 逐层 bisect(OWL_PF_BISECT;非 dflash 路径):单遍 multi
         // eval 产出 48 层 taps + fin —— **fin 块直接作为主路输出**(bisect
         // 前向有 GDN 状态副作用,双执行会双推进;单执行 + 逐层 checksum
         // → metrics `pf.c{base}.l{i}`,双 boot/双跑 diff = 首个发散层)。
         // fin block-leaf 下游 eval = 零操作透传。
-        let pf_bisect = std::env::var_os("OWL_PF_BISECT").is_some()
-            && self.dflash_tap_count == 0;
+        let pf_bisect = self.cfg.knobs.pf_bisect && self.dflash_tap_count == 0;
         // GDN 状态 checksum(pre/post;崩坏排查:状态脏 = reset 病,状态净
         // 而输出异 = 核病)。rec [slots,nv,kd,vd] f32 全量 dtoh ≈ 3.1MB/层。
         let pf_state_check = pf_bisect;
         // 指定层五站 stage tap(OWL_PF_STAGES=层号;配合 BISECT 定位层内核)
-        let pf_stage_layer: Option<usize> = std::env::var("OWL_PF_STAGES")
-            .ok()
-            .and_then(|v| v.parse().ok());
+        let pf_stage_layer: Option<usize> = self.cfg.knobs.pf_stages;
         let mut bisect_fin_block: Option<(TensorOps, owl_iface::contract::Bytes)> = None;
         let mut bisect_fin_blk: Option<owl_iface::contract::Bytes> = None;
         if pf_bisect {
@@ -137,10 +135,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             if pf_state_check {
                 for (j, g) in gdn_leaves.iter().enumerate() {
                     for (sn, buf, nb) in [
-                        ("convq", &g.conv_q, crate::state::gdn_slots() * d.nk * d.hk * 3),
-                        ("convk", &g.conv_k, crate::state::gdn_slots() * d.nv * d.hv * 3),
-                        ("convv", &g.conv_v, crate::state::gdn_slots() * d.nv * d.hv * 3),
-                        ("rec", &g.rec, crate::state::gdn_slots() * d.nv * d.hk * d.hv),
+                        ("convq", &g.conv_q, self.pool.gdn_slots * d.nk * d.hk * 3),
+                        ("convk", &g.conv_k, self.pool.gdn_slots * d.nv * d.hv * 3),
+                        ("convv", &g.conv_v, self.pool.gdn_slots * d.nv * d.hv * 3),
+                        ("rec", &g.rec, self.pool.gdn_slots * d.nv * d.hk * d.hv),
                     ] {
                         let mut sb = vec![0u8; nb * 4];
                         {
@@ -206,10 +204,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             if pf_state_check {
                 for (j, g) in gdn_leaves.iter().enumerate() {
                     for (sn, buf, nb) in [
-                        ("convq", &g.conv_q, crate::state::gdn_slots() * d.nk * d.hk * 3),
-                        ("convk", &g.conv_k, crate::state::gdn_slots() * d.nv * d.hv * 3),
-                        ("convv", &g.conv_v, crate::state::gdn_slots() * d.nv * d.hv * 3),
-                        ("rec", &g.rec, crate::state::gdn_slots() * d.nv * d.hk * d.hv),
+                        ("convq", &g.conv_q, self.pool.gdn_slots * d.nk * d.hk * 3),
+                        ("convk", &g.conv_k, self.pool.gdn_slots * d.nv * d.hv * 3),
+                        ("convv", &g.conv_v, self.pool.gdn_slots * d.nv * d.hv * 3),
+                        ("rec", &g.rec, self.pool.gdn_slots * d.nv * d.hk * d.hv),
                     ] {
                         let mut sb = vec![0u8; nb * 4];
                         {
@@ -272,7 +270,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // E5 崩坏排查·轻探针(OWL_PF_FIN_CHECK;bisect 900 dtoh 强掩蔽
             // 0/10,本探针仅 1 dtoh —— 近零扰判决:fin 翻 = 前向内部腐坏;
             // fin 绿而 pf.last 翻 = lm_head/argmax 面腐坏)
-            if std::env::var_os("OWL_PF_FIN_CHECK").is_some() && !pf_bisect {
+            if self.cfg.knobs.pf_fin_check && !pf_bisect {
                 let n_fin = t * d_model;
                 let mut fb = vec![0u8; n_fin * 2];
                 {
@@ -297,12 +295,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     .collect();
                 self.prefill_dflash_encode(&tap_views, base).await?;
                 // 探针:concat 父块整块落盘(python 对拍 taps;真块 dtoh)
-                if std::env::var_os("OWL_DFLASH_PROBE").is_some() && !self.dflash_mem_dumped2 {
+                if self.probes.dflash_probe && !self.dflash_mem_dumped2 {
                     self.dflash_mem_dumped2 = true;
                     let face = self.session.face_mut();
                     let mut rbuf = vec![0u8; (n_tp + 1) * t * d_model * 2];
                     face.dtoh(&hfb, &mut rbuf).await?;
-                    std::fs::write("/tmp/owl_dflash_root.bin", &rbuf).ok();
+                    owl_shared::file_loader::write("/tmp/owl_dflash_root.bin", &rbuf).ok();
                     eprintln!("[dflash-probe] concat 父块落盘 /tmp/owl_dflash_root.bin t={t}");
                 }
                 eprintln!("[dflash] prefill encode {t} rows @{} {:?}", base, ts.elapsed());

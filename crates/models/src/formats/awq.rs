@@ -881,7 +881,7 @@ mod tests {
         out: usize,
         k: usize,
     ) {
-        std::fs::create_dir_all(dir).expect("mkdir");
+        owl_shared::file_loader::create_dir_all(dir).expect("mkdir");
         let mut header = String::from("{");
         let mut blobs: Vec<Vec<u8>> = Vec::new();
         let mut offset = 0usize;
@@ -912,7 +912,7 @@ mod tests {
         for b in blobs {
             file.extend_from_slice(&b);
         }
-        std::fs::write(dir.join("model.safetensors"), file).expect("写 ct 检查点");
+        owl_shared::file_loader::write(dir.join("model.safetensors"), file).expect("写 ct 检查点");
     }
 
     fn f32_to_bf16_bytes(v: &[f32]) -> Vec<u8> {

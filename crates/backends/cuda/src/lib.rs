@@ -35,6 +35,7 @@ pub mod ffi;
 
 pub use command::Command;
 pub use gpu_client::GpuClient;
+pub use state::DiagOpts;
 pub use server::GpuServer;
 pub use state::DeviceSelector;
 
@@ -48,8 +49,5 @@ pub use owl_iface::contract::{Dtype, Shape};
 
 /// 测试/示例的设备序号(OWL_TEST_DEVICE,默认 0)
 pub fn test_device_ordinal() -> usize {
-    std::env::var("OWL_TEST_DEVICE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0)
+    owl_shared::env_reader::parse_or("OWL_TEST_DEVICE", 0)
 }

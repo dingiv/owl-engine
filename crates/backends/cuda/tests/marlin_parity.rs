@@ -145,7 +145,7 @@ async fn run_case(
     // u16 位序 = f16 LE ✓(f16::to_bits 是 u16 表示,LE 字节序正确)
     let db = client.htod(Dtype::U32, &Shape::from(vec![b_packed.len()]), &le_i32(&b_packed)).await.expect("htod b");
     let ds = client.htod(Dtype::F16, &Shape::from(vec![s_packed.len()]), &le_u16(&s_packed)).await.expect("htod s");
-    let ws_mul: usize = std::env::var("OWL_WS_MUL").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let ws_mul: usize = owl_shared::env_reader::parse_or("OWL_WS_MUL", 1);
     let ws_len = owl_kernels::marlin::v2_workspace_len(n).max(n / 128 * 16) * ws_mul;
     let dws = client.alloc(Dtype::U32, ws_len).await.expect("alloc ws");
     let dctmp = client.alloc(Dtype::U32, 1).await.expect("alloc ctmp");
@@ -249,7 +249,7 @@ async fn marlin_w4a16_bf16_parity() {
 async fn marlin_golden_dump() {
     let mut client = assemble();
     let dir = std::path::Path::new("/tmp/marlin_golden");
-    std::fs::create_dir_all(dir).expect("mkdir");
+    owl_shared::file_loader::create_dir_all(dir).expect("mkdir");
     // 形状组:2^k 对照 + 非 2^k 暗雷档(27B 维度族)
     let cases: Vec<(usize, usize, usize)> = vec![
         (512, 512, 128),
@@ -264,9 +264,9 @@ async fn marlin_golden_dump() {
         let b_packed = owl_kernels::marlin::repack::pack_marlin_b(&q, k, n);
         let s: Vec<f32> = (0..n * (k / g)).map(|i| 0.5 + ((i * 13) % 13) as f32 * 0.08).collect();
         let s_packed = owl_kernels::marlin::repack::pack_marlin_s(&s, n, k / g);
-        std::fs::write(dir.join(format!("{tag}.q.bin")), &q).expect("q");
-        std::fs::write(dir.join(format!("{tag}.owlb.bin")), le_i32(&b_packed)).expect("b");
-        std::fs::write(dir.join(format!("{tag}.owls.bin")), le_u16(&s_packed)).expect("s");
+        owl_shared::file_loader::write(dir.join(format!("{tag}.q.bin")), &q).expect("q");
+        owl_shared::file_loader::write(dir.join(format!("{tag}.owlb.bin")), le_i32(&b_packed)).expect("b");
+        owl_shared::file_loader::write(dir.join(format!("{tag}.owls.bin")), le_u16(&s_packed)).expect("s");
         let _ = &mut client; // assemble 仅保 face 生命周期(打包纯 host)
         eprintln!("[golden-dump] {tag}: q={}B b={}i32 s={}u16", q.len(), b_packed.len(), s_packed.len());
     }
@@ -277,7 +277,7 @@ async fn marlin_golden_dump() {
 /// 单案 memcheck 入口(compute-sanitizer 配套;OWL_SWEEP_CASE="m,n,k,g")
 #[tokio::test]
 async fn marlin_shape_case() {
-    let Ok(spec) = std::env::var("OWL_SWEEP_CASE") else {
+    let Some(spec) = owl_shared::env_reader::str("OWL_SWEEP_CASE") else {
         eprintln!("skip: OWL_SWEEP_CASE 未设(m,n,k,g)");
         return;
     };

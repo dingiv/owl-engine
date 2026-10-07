@@ -498,10 +498,7 @@ fn eval_gpu(
 fn demo5_gpu_executor() {
     use gpu_exec::GpuExecutor;
     println!("== demo5:GPU 执行器(同一棵归约树,逐节点真发射) ==");
-    let ordinal = std::env::var("OWL_TEST_DEVICE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    let ordinal = owl_shared::env_reader::parse_or("OWL_TEST_DEVICE", 0);
     let ex = GpuExecutor::new(ordinal).expect("GpuExecutor::new");
     println!("   device: {}", ex.ctx.name().unwrap());
 

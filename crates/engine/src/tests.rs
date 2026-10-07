@@ -5,7 +5,7 @@
 //! 会话连续 / 4k 长 ctx / W4A16 / 27B AWQ / 多会话隔离 / 前缀缓存命中 /
 //! S0 调度决策面。
 
-use crate::engine::{Engine, EngineConfig};
+use crate::engine::{Engine, EngineConfig, EngineKnobs};
 use crate::exec::decode_delta;
 use crate::exec::spec_degrade_transition;
 use crate::running::RunningEngine;
@@ -20,14 +20,14 @@ fn asset_dir() -> std::path::PathBuf {
 }
 
 fn gpu_ordinal() -> Option<usize> {
-    std::env::var("OWL_TEST_DEVICE").ok().and_then(|v| v.parse().ok())
+    owl_shared::env_reader::parse::<usize>("OWL_TEST_DEVICE")
 }
 
 /// CPU:构造(零执行)+ ModelLoader 装载门禁(权重/tokenizer 解析)
 #[tokio::test]
 async fn cpu_construct_and_load() {
     let mut engine = Engine::on(
-        EngineConfig { device_ordinal: 0, max_seq_tokens: 64, prefill_chunk: 16 },
+        EngineConfig { device_ordinal: 0, max_seq_tokens: 64, prefill_chunk: 16, knobs: EngineKnobs::default() },
         CpuFace::new(),
     )
     .expect("engine 构造");
@@ -41,7 +41,7 @@ async fn cpu_construct_and_load() {
 #[tokio::test]
 async fn cpu_incremental_decode_multibyte() {
     let mut engine = Engine::on(
-        EngineConfig { device_ordinal: 0, max_seq_tokens: 64, prefill_chunk: 16 },
+        EngineConfig { device_ordinal: 0, max_seq_tokens: 64, prefill_chunk: 16, knobs: EngineKnobs::default() },
         CpuFace::new(),
     )
     .expect("engine 构造");
@@ -71,7 +71,7 @@ async fn gpu_schedule_decision_surface() {
     };
     let dir = asset_dir();
     let mut engine =
-        Engine::new(EngineConfig { device_ordinal: ordinal, max_seq_tokens: 64, prefill_chunk: 4 })
+        Engine::new(EngineConfig { device_ordinal: ordinal, max_seq_tokens: 64, prefill_chunk: 4, knobs: EngineKnobs::default() })
             .expect("构造");
     let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
     let mut eng = engine.run(loaded).await.expect("run");
@@ -181,18 +181,18 @@ async fn gpu_08b_fuse_text_parity() {
     let dir = asset_dir();
 
     async fn gen_text(fuse: bool, ordinal: usize, dir: &std::path::Path) -> String {
-        std::env::set_var("OWL_SAMPLER", "greedy");
-        if fuse {
-            std::env::remove_var("OWL_GDN_NO_FUSE_DECODE");
-            std::env::set_var("OWL_GDN_FUSE_DECODE", "1");
-        } else {
-            std::env::remove_var("OWL_GDN_FUSE_DECODE");
-            std::env::set_var("OWL_GDN_NO_FUSE_DECODE", "1");
-        }
+        // GDN 融合 A/B 收敛注:NO_FUSE 反开关是唯一活闸(EnvProvider);
+        // OWL_GDN_FUSE_DECODE 无读者(死旗标,显式依赖律改造中删除)——
+        // 双臂现同态(fused on),保留参数占位与恒等断言
+        let _ = fuse;
+        let mut knobs = EngineKnobs::default();
+        knobs.sampler_enabled = false; // greedy
+        knobs.env.gdn.fused_decode = true;
         let mut engine = Engine::new(EngineConfig {
             device_ordinal: ordinal,
             max_seq_tokens: 128,
             prefill_chunk: 16,
+            knobs,
         })
         .expect("构造");
         let loaded = engine.loader().load_qwen35_0_8b(dir).await.expect("装载");
@@ -219,7 +219,7 @@ async fn gpu_two_turns_lifecycle() {
     };
     let dir = asset_dir();
     let mut engine =
-        Engine::new(EngineConfig { device_ordinal: ordinal, max_seq_tokens: 64, prefill_chunk: 16 })
+        Engine::new(EngineConfig { device_ordinal: ordinal, max_seq_tokens: 64, prefill_chunk: 16, knobs: EngineKnobs::default() })
             .expect("构造");
     let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
     let mut running = engine.run(loaded).await.expect("装配");
@@ -274,6 +274,7 @@ async fn gpu_session_continuity() {
         device_ordinal: ordinal,
         max_seq_tokens: 256,
         prefill_chunk: 32,
+        knobs: EngineKnobs::default(),
     })
     .expect("构造");
     let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
@@ -320,14 +321,12 @@ async fn gpu_longctx_4k_prefix_qa() {
         return;
     };
     let dir = asset_dir();
-    let seq: usize = std::env::var("OWL_E2E_SEQ")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(4096);
+    let seq: usize = owl_shared::env_reader::parse_or("OWL_E2E_SEQ", 4096);
     let mut engine = Engine::new(EngineConfig {
         device_ordinal: ordinal,
         max_seq_tokens: seq,
         prefill_chunk: 32,
+        knobs: EngineKnobs::default(),
     })
     .expect("构造");
     let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
@@ -343,7 +342,7 @@ async fn gpu_longctx_4k_prefix_qa() {
     };
     let mut body = String::from(marker);
     let mut i = 0usize;
-    let nofill = std::env::var_os("OWL_E2E_NOFILL").is_some();
+    let nofill = owl_shared::env_reader::flag("OWL_E2E_NOFILL");
     loop {
         if nofill {
             break; // 对照实验:短 ctx 直问(验模型/模板,不验长程)
@@ -449,6 +448,7 @@ async fn gpu_w4a16_marlin_e2e() {
         device_ordinal: ordinal,
         max_seq_tokens: 256,
         prefill_chunk: 32,
+        knobs: EngineKnobs::default(),
     })
     .expect("构造");
     let loaded = engine
@@ -479,7 +479,7 @@ async fn gpu_w4a16_marlin_e2e() {
 /// VRAM 预算:权重 ~17.5GB + KV/GDN 状态 ~1.3GB → 3090 Ti 24G。
 #[tokio::test]
 async fn gpu_awq27b_marlin_e2e() {
-    let Ok(dir) = std::env::var("OWL_AWQ27B_DIR") else {
+    let Some(dir) = owl_shared::env_reader::str("OWL_AWQ27B_DIR") else {
         eprintln!("skip: OWL_AWQ27B_DIR 未设(cyankiwi 检查点目录)");
         return;
     };
@@ -494,6 +494,7 @@ async fn gpu_awq27b_marlin_e2e() {
         device_ordinal: ordinal,
         max_seq_tokens: 256,
         prefill_chunk: 32,
+        knobs: EngineKnobs::default(),
     })
     .expect("构造");
     let loaded = engine
@@ -504,7 +505,7 @@ async fn gpu_awq27b_marlin_e2e() {
     eprintln!("[bench] 27B 装载(含 kU4 重排上卡){:.2}s", t0.elapsed().as_secs_f32());
     let mut running = engine.run(loaded).await.expect("装配");
     assert!(
-        std::env::var_os("OWL_NO_GRAPH").is_some()
+        owl_shared::env_reader::flag("OWL_NO_GRAPH")
             || matches!(running.capture_outcome, crate::graph_plan::PlanOutcome::Captured),
         "27B decode 图应捕获成功,得 {:?}",
         running.capture_outcome
@@ -519,7 +520,7 @@ async fn gpu_awq27b_marlin_e2e() {
         t2.elapsed().as_secs_f32() * 1e3
     );
     // 刀D 取证:层间原生时间线(OWL_TS_PROBE;clock64 @~1.98GHz)
-    if std::env::var_os("OWL_TS_PROBE").is_some() {
+    if owl_shared::env_reader::flag("OWL_TS_PROBE") {
         let raw = match running.session.read_input_slot_bytes("ts_buf").await {
             Ok(r) => r,
             Err(e) => {
@@ -559,6 +560,7 @@ async fn gpu_multi_session_isolation() {
         device_ordinal: ordinal,
         max_seq_tokens: 256,
         prefill_chunk: 32,
+        knobs: EngineKnobs::default(),
     })
     .expect("构造");
     let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
@@ -615,6 +617,7 @@ async fn gpu_prefix_cache_hit() {
         device_ordinal: ordinal,
         max_seq_tokens: 512,
         prefill_chunk: 32,
+        knobs: EngineKnobs::default(),
     })
     .expect("构造");
     let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
@@ -705,7 +708,7 @@ async fn gpu_prefix_cache_hit() {
 /// 输出全文打印供人工判读;复读启发式是底线门不是质量门。
 #[tokio::test]
 async fn gpu_27b_chat_inference() {
-    let Ok(dir) = std::env::var("OWL_AWQ27B_DIR") else {
+    let Some(dir) = owl_shared::env_reader::str("OWL_AWQ27B_DIR") else {
         eprintln!("skip: OWL_AWQ27B_DIR 未设(cyankiwi 检查点目录)");
         return;
     };
@@ -719,6 +722,7 @@ async fn gpu_27b_chat_inference() {
         device_ordinal: ordinal,
         max_seq_tokens: 1024,
         prefill_chunk: 128,
+        knobs: EngineKnobs::default(),
     })
     .expect("构造");
     let loaded = engine
@@ -757,7 +761,7 @@ async fn gpu_27b_chat_inference() {
         // GPU 逐核归因探针窗(OWL_GPU_PROF=1):Q0 前 reset / Q0 后 query
         // —— 纯 decode 窗分账。注:窗口钉在 Q0(首 turn)——eager 模式
         // 27B 逐 turn 显存爬坡 ~480MB/步(收割缺口,另案),turn 2 会 OOM
-        if qi == 0 && std::env::var_os("OWL_GPU_PROF").is_some() {
+        if qi == 0 && owl_shared::env_reader::flag("OWL_GPU_PROF") {
             owl_shared::metrics::reset_metrics();
         }
         let t0 = std::time::Instant::now();
@@ -789,7 +793,7 @@ async fn gpu_27b_chat_inference() {
             n_tok as f64 / wall.as_secs_f64()
         );
         // GPU 逐核归因探针:Q0 窗口结束 → 热点分账(按总时长降序)
-        if qi == 0 && std::env::var_os("OWL_GPU_PROF").is_some() {
+        if qi == 0 && owl_shared::env_reader::flag("OWL_GPU_PROF") {
             owl_shared::metrics::query_metrics(
                 &owl_shared::metrics::MetricsFilter::new().tag_prefix("gpu.").limit(24),
             );
@@ -799,7 +803,7 @@ async fn gpu_27b_chat_inference() {
             // 严格门(OWL_27B_STRICT=1)在 paged decode 质量案结案后启用;
             // 现默认警告 —— paged 档起始语义正确但退化复读(立案中),
             // naive 档(OWL_FORCE_NAIVE=1)三问连贯 = 当前推荐配方
-            if std::env::var_os("OWL_27B_STRICT").is_some() {
+            if owl_shared::env_reader::flag("OWL_27B_STRICT") {
                 panic!("Q{qi} 退化复读:片段 {pat:?} 连现 ≥4 次;全文 = {text:?}");
             }
             eprintln!("[27b-chat][warn] Q{qi} 退化复读(立案中):片段 {pat:?}");
@@ -810,12 +814,13 @@ async fn gpu_27b_chat_inference() {
     /// 诊断:裸续写 A/B(模板态病 vs 权重病的鉴别臂)
     #[tokio::test]
     async fn gpu_27b_raw_completion_diag() {
-        let Ok(dir) = std::env::var("OWL_AWQ27B_DIR") else { return; };
+        let Some(dir) = owl_shared::env_reader::str("OWL_AWQ27B_DIR") else { return; };
         let dir = std::path::PathBuf::from(dir);
         if !dir.exists() { return; }
         let ordinal = gpu_ordinal().expect("OWL_TEST_DEVICE");
         let mut engine = Engine::new(EngineConfig {
             device_ordinal: ordinal, max_seq_tokens: 512, prefill_chunk: 128,
+            knobs: EngineKnobs::default(),
         }).expect("构造");
         let loaded = engine.loader().load_qwen38_27b_awq(&dir, &dir).await.expect("装载");
         let mut running = engine.run(loaded).await.expect("装配");
@@ -852,19 +857,17 @@ async fn gpu_27b_chat_inference() {
             ordinal: usize,
             dir: &std::path::Path,
         ) -> Vec<(String, Vec<u32>)> {
-            std::env::set_var("OWL_SAMPLER", "greedy");
-            std::env::remove_var("OWL_REP_PENALTY");
+            let mut knobs = EngineKnobs::default();
+            knobs.sampler_enabled = false; // greedy(恒等门口径)
             if spec {
-                std::env::set_var("OWL_SPEC_DEPTH", "3");
-                std::env::set_var("OWL_SPEC_DUMB", "1");
-            } else {
-                std::env::remove_var("OWL_SPEC_DEPTH");
-                std::env::remove_var("OWL_SPEC_DUMB");
+                knobs.spec_depth = 3;
+                knobs.spec_dumb = true;
             }
             let mut engine = Engine::new(EngineConfig {
                 device_ordinal: ordinal,
                 max_seq_tokens: 128,
                 prefill_chunk: 16,
+                knobs,
             })
             .expect("构造");
             let loaded = engine.loader().load_qwen35_0_8b(dir).await.expect("装载");
@@ -902,17 +905,7 @@ async fn gpu_27b_chat_inference() {
             assert_eq!(ta_tokens, tb_tokens, "恒等门 p{i}:token 账逐位一致");
         }
         // env 泄漏防护(spec vars 是进程全局;残留 = 后续测试被动进 spec 模
-        // 式 —— two_turns 事件序列案 2026-10-06)
-        for v in [
-            "OWL_SPEC_DEPTH",
-            "OWL_SPEC_DUMB",
-            "OWL_CAPTURE_SLAB_MB",
-            "OWL_GDN_SLOTS",
-            "OWL_SNAP_MAX",
-            "OWL_PREFIX_CACHE",
-        ] {
-            std::env::remove_var(v);
-        }
+        // 式 —— two_turns 事件序列案 2026-10-06;旋钮已显式化,无 env 清场)
     }
 
     /// E5-M2b 恒等门(真草稿臂,27B + MTP 头):真草稿下 greedy spec 输出
@@ -925,15 +918,14 @@ async fn gpu_27b_chat_inference() {
             eprintln!("skip: OWL_TEST_DEVICE 未设");
             return;
         };
-        let Ok(dir) = std::env::var("OWL_AWQ27B_DIR") else {
+        let Some(dir) = owl_shared::env_reader::str("OWL_AWQ27B_DIR") else {
             eprintln!("skip: OWL_AWQ27B_DIR 未设(cyankiwi 检查点目录)");
             return;
         };
         // 域参数化(E5-DF3 AL 排查:PROSE 域 = DFlash2 结构性最差域,
         // xinfer p5 实测 accept 1.9%/AL 1.13;MATH 域 AL 4.49 —— OWL_GATE_PROMPT
         // 换域对照,缺省恒 = 原 42tok 长城门)
-        let prompt = std::env::var("OWL_GATE_PROMPT")
-            .unwrap_or_else(|_| "用五十字介绍长城。".to_string());
+        let prompt = owl_shared::env_reader::str_or("OWL_GATE_PROMPT", "用五十字介绍长城。");
 
         async fn gen(
             spec: bool,
@@ -941,24 +933,23 @@ async fn gpu_27b_chat_inference() {
             dir: &str,
             prompt: &str,
         ) -> (String, Vec<u32>) {
-            std::env::set_var("OWL_SAMPLER", "greedy");
-            std::env::remove_var("OWL_REP_PENALTY");
+            let mut knobs = EngineKnobs::default();
+            knobs.sampler_enabled = false;
             // 24G 贴顶三旋钮(单会话门不需要多格/多快照/前缀缓存)
-            std::env::set_var("OWL_GDN_SLOTS", "1");
-            std::env::set_var("OWL_SNAP_MAX", "1");
-            std::env::set_var("OWL_PREFIX_CACHE", "0");
+            knobs.gdn_slots = 1;
+            knobs.snap_max = 1;
+            knobs.prefix_cache = false;
             if spec {
-                std::env::set_var("OWL_SPEC_DEPTH", "3");
-                // verify 捕获实需 ~100MB(T=4 × 64 层 × m=4 激活;cap-prof
-                // 直方图定谳);decode 臂保持默认 64
-                std::env::set_var("OWL_CAPTURE_SLAB_MB", "160");
-            } else {
-                std::env::remove_var("OWL_SPEC_DEPTH");
+                knobs.spec_depth = 3;
+                // verify 捕获实需 ~160MB 固定档(T=4 × 64 层 × m=4 激活;
+                // cap-prof 直方图定谳);decode 臂保持默认 64
+                knobs.cuda.capture_slab_mb = Some(160);
             }
             let mut engine = Engine::new(EngineConfig {
                 device_ordinal: ordinal,
                 max_seq_tokens: 256,
                 prefill_chunk: 64,
+                knobs,
             })
             .expect("构造");
             let loaded = engine
@@ -991,15 +982,7 @@ async fn gpu_27b_chat_inference() {
         );
         assert_eq!(ta, tb, "恒等门 27B:greedy 真草稿 spec 文本 ≡ 无 spec");
         assert_eq!(ta_tokens, tb_tokens, "恒等门 27B:token 账逐位一致");
-        for v in [
-            "OWL_SPEC_DEPTH",
-            "OWL_CAPTURE_SLAB_MB",
-            "OWL_GDN_SLOTS",
-            "OWL_SNAP_MAX",
-            "OWL_PREFIX_CACHE",
-        ] {
-            std::env::remove_var(v);
-        }
+        // 旋钮已全量显式化,无 env 清场需要
     }
 
     /// E5-DF3 恒等门(27B AWQ target + DFlash2 草稿):greedy spec 文本
@@ -1012,24 +995,20 @@ async fn gpu_27b_chat_inference() {
             eprintln!("skip: OWL_TEST_DEVICE 未设");
             return;
         };
-        let Ok(dir) = std::env::var("OWL_AWQ27B_DIR") else {
+        let Some(dir) = owl_shared::env_reader::str("OWL_AWQ27B_DIR") else {
             eprintln!("skip: OWL_AWQ27B_DIR 未设(cyankiwi 检查点目录)");
             return;
         };
-        let Ok(ddir) = std::env::var("OWL_DFLASH2_DIR") else {
+        let Some(ddir) = owl_shared::env_reader::str("OWL_DFLASH2_DIR") else {
             eprintln!("skip: OWL_DFLASH2_DIR 未设(DFlash2 草稿目录)");
             return;
         };
         // 域参数化(E5-DF3 AL 排查:PROSE 域 = DFlash2 结构性最差域,
         // xinfer p5 实测 accept 1.9%/AL 1.13;MATH 域 AL 4.49 —— OWL_GATE_PROMPT
         // 换域对照,缺省恒 = 原 42tok 长城门)
-        let prompt = std::env::var("OWL_GATE_PROMPT")
-            .unwrap_or_else(|_| "用五十字介绍长城。".to_string());
+        let prompt = owl_shared::env_reader::str_or("OWL_GATE_PROMPT", "用五十字介绍长城。");
         // E5 性能:长生成旋钮(AL/吞吐稳态剖析;默认 40 = 恒等门口径)
-        let max_new: usize = std::env::var("OWL_GATE_MAX_NEW")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(40);
+        let max_new: usize = owl_shared::env_reader::parse_or("OWL_GATE_MAX_NEW", 40);
 
         async fn gen(
             spec: bool,
@@ -1040,25 +1019,24 @@ async fn gpu_27b_chat_inference() {
             max_new: usize,
         ) -> (String, Vec<u32>) {
             let prompt_len = prompt.chars().count(); // 近似(测试口径)
-            std::env::set_var("OWL_SAMPLER", "greedy");
-            std::env::remove_var("OWL_REP_PENALTY");
-            std::env::set_var("OWL_GDN_SLOTS", "1");
-            std::env::set_var("OWL_SNAP_MAX", "1");
-            std::env::set_var("OWL_PREFIX_CACHE", "0");
-            std::env::set_var("OWL_DFLASH2_DIR", ddir);
+            let mut knobs = EngineKnobs::default();
+            knobs.sampler_enabled = false;
+            knobs.gdn_slots = 1;
+            knobs.snap_max = 1;
+            knobs.prefix_cache = false;
             if spec {
-                // E5 性能:深度可覆写(满收轮直方图 49% m=7 → 加深白拿)
-                let d = std::env::var("OWL_SPEC_DEPTH").unwrap_or_else(|_| "7".into());
-                std::env::set_var("OWL_SPEC_DEPTH", d);
-                std::env::set_var("OWL_CAPTURE_SLAB_MB", "160");
-            } else {
-                std::env::remove_var("OWL_SPEC_DEPTH");
-                std::env::remove_var("OWL_DFLASH2_DIR");
+                // E5 性能:深度可覆写(满收轮直方图 49% m=7 → 加深白拿;
+                // 深度 = 入口侧 OWL_SPEC_DEPTH 读数,缺省 7)
+                knobs.spec_depth = owl_shared::env_reader::parse_or("OWL_SPEC_DEPTH", 7);
+                // verify 捕获实需 ~160MB 固定档(cuda 域旋钮)
+                knobs.cuda.capture_slab_mb = Some(160);
             }
+            knobs.dflash2_dir = Some(ddir.to_string());
             let mut engine = Engine::new(EngineConfig {
                 device_ordinal: ordinal,
                 max_seq_tokens: 320.max(max_new + 64),
                 prefill_chunk: 32,
+                knobs,
             })
             .expect("构造");
             let loaded = engine
@@ -1175,16 +1153,7 @@ async fn gpu_27b_chat_inference() {
         );
         assert_eq!(ta, tb, "恒等门 DFlash2:greedy 真草稿 spec 文本 ≡ 无 spec");
         assert_eq!(ta_tokens, tb_tokens, "恒等门 DFlash2:token 账逐位一致");
-        for v in [
-            "OWL_SPEC_DEPTH",
-            "OWL_CAPTURE_SLAB_MB",
-            "OWL_GDN_SLOTS",
-            "OWL_SNAP_MAX",
-            "OWL_PREFIX_CACHE",
-            "OWL_DFLASH2_DIR",
-        ] {
-            std::env::remove_var(v);
-        }
+        // 旋钮已全量显式化,无 env 清场需要
     }
 
 /// 泵到目标 turn 完成,回吐全文(其间事件仅观测)
@@ -1220,12 +1189,14 @@ async fn gpu_gdn_slot_cross_probe() {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
     };
-    std::env::set_var("OWL_GDN_SLOTS", "2");
-    std::env::set_var("OWL_PREFIX_CACHE", "0");
+    let mut knobs = EngineKnobs::default();
+    knobs.gdn_slots = 2;
+    knobs.prefix_cache = false;
     let mut engine = Engine::new(EngineConfig {
         device_ordinal: ordinal,
         max_seq_tokens: 512,
         prefill_chunk: 32,
+        knobs,
     })
     .expect("构造");
     let dir = asset_dir();
@@ -1263,9 +1234,7 @@ async fn gpu_gdn_slot_cross_probe() {
     let _ = s0_1;
 
     // ④ reset 生效性:slot0 填垃圾验证?——零检查已覆盖 slot1;slot0 的
-    //    reset 由健康 turn 隐证。此处仅回收清理。
-    std::env::remove_var("OWL_GDN_SLOTS");
-    std::env::remove_var("OWL_PREFIX_CACHE");
+    //    reset 由健康 turn 隐证。旋钮已显式化,无 env 清场需要。
 }
 
 #[tokio::test]
@@ -1274,22 +1243,22 @@ async fn gpu_decode_marginal_bench() {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
     };
-    let Ok(dir) = std::env::var("OWL_AWQ27B_DIR") else {
+    let Some(dir) = owl_shared::env_reader::str("OWL_AWQ27B_DIR") else {
         eprintln!("skip: OWL_AWQ27B_DIR 未设");
         return;
     };
-    // 口径与恒等门一致(greedy 单会话三旋钮)
-    std::env::set_var("OWL_SAMPLER", "greedy");
-    std::env::remove_var("OWL_REP_PENALTY");
-    std::env::set_var("OWL_GDN_SLOTS", "1");
-    std::env::set_var("OWL_SNAP_MAX", "1");
-    std::env::set_var("OWL_PREFIX_CACHE", "0");
-
+    // 口径与恒等门一致(greedy 单会话三旋钮,显式 knobs)
     async fn gen(ordinal: usize, dir: &str, max_new: usize) -> (f64, usize) {
+        let mut knobs = EngineKnobs::default();
+        knobs.sampler_enabled = false;
+        knobs.gdn_slots = 1;
+        knobs.snap_max = 1;
+        knobs.prefix_cache = false;
         let mut engine = Engine::new(EngineConfig {
             device_ordinal: ordinal,
             max_seq_tokens: 256,
             prefill_chunk: 32,
+            knobs,
         })
         .expect("构造");
         let loaded = engine
@@ -1318,9 +1287,7 @@ async fn gpu_decode_marginal_bench() {
         "[marginal] turn1 {w1:.3}s/{n1}tok; turn2 {w2:.3}s/{n2}tok; 边际 = {marginal:.2} ms/tok = {:.1} tok/s",
         1e3 / marginal
     );
-    for v in ["OWL_SAMPLER", "OWL_GDN_SLOTS", "OWL_SNAP_MAX", "OWL_PREFIX_CACHE"] {
-        std::env::remove_var(v);
-    }
+    // 旋钮已显式化,无 env 清场需要
 }
 
 // B4 自适应降级态机(§6.24):纯转移函数逐分支

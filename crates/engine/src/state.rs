@@ -24,21 +24,13 @@ type Result<T> = std::result::Result<T, ModelError>;
 
 pub(crate) type BlockN = (Bytes, usize); // (块句柄, 元素数;重置分块写用)
 
-/// GDN 快照池深度(E2c;每份 ~19.4MB 设备侧,LRU 覆盖写)。
-/// 复用边界 = 有快照的最深块边界;短于最近边界的匹配回退全量(一档取舍)。
-/// OWL_SNAP_MAX 可调(27B 单卡贴顶场景降到 1 省 ~300MB;默认 4)。
-fn snap_max() -> usize {
-    std::env::var("OWL_SNAP_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(4)
-}
+
 
 /// GDN 状态格容量(**与会话数绑定,与 max_seq_tokens 解耦**)。
 /// 格语义 = 每会话一格(SessionTable 分配/释放);按位分配是历史包袱:
 /// s=4096 时 rec(1 MiB/格/层 × 18 层)将达 72 GB,而真实需求 = 格数。
 /// 8 = 覆盖需求并发上限(§二 并发 ≤8);会话 close 即释放格号。
-/// OWL_GDN_SLOTS 可调(27B 单卡贴顶场景降到 2 省 ~300MB;默认 8)。
-pub(crate) fn gdn_slots() -> usize {
-    std::env::var("OWL_GDN_SLOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(8)
-}
+/// 槽数 = EngineKnobs.gdn_slots(显式传入;原 OWL_GDN_SLOTS,缺省 8)。
 
 /// GDN 快照槽(E2c):key = 链尾物理块 id(内容身份);bufs = 逐层逐块
 /// 行宽副本(与 gdns 同序同构,行宽 = elems / GDN_SLOTS)。池静态
@@ -87,6 +79,10 @@ pub(crate) struct GdnLeaf {
 /// 治理对象(charter A1 味):S2 图档与执行器只经方法面触碰状态块,
 /// 不直摸块句柄。
 pub(crate) struct StatePool {
+    /// GDN 状态格容量(knobs.gdn_slots,boot 定谳;原自由函数 gdn_slots())
+    pub(crate) gdn_slots: usize,
+    /// GDN 画像 dump 全槽(knobs.gdn_dump_all)
+    pub(crate) dump_all: bool,
     pub(crate) kvs: Vec<KvBlocks>,
     /// FlashInfer K/V 影子池(owl_reshape_and_cache_dual_f16(_fp8kv) 写;
     /// OWL_FLASHINFER=1 时分配,否则空)
@@ -140,11 +136,16 @@ impl StatePool {
         spec: bool,
         mtp: bool,
         dflash: bool,
+        gdn_slots: usize,
+        snap_max: usize,
+        vram_target: f64,
+        vram_reserve_mb: u64,
+        dump_all: bool,
     ) -> Result<StatePool> {
         let t = std::time::Instant::now();
         let n_full = layer_types.iter().filter(|&&f| f).count();
         let n_gdn = layer_types.len() - n_full;
-        eprintln!("[boot] StatePool::alloc 进入(n_full={n_full} kv_fp8={})", std::env::var_os("OWL_KV_FP8").is_some());
+        eprintln!("[boot] StatePool::alloc 进入(n_full={n_full} kv_fp8={kv_fp8})");
 
         // B6.5 显存硬预算治理(2026-10-10):池容量 =
         // min(手工上限, (target×total − live − reserve)/每 token 字节)。
@@ -156,18 +157,10 @@ impl StatePool {
             + if dflash { 5 * 2 * 8 * 128 * 2 } else { 0 }; // 草稿池按 token 线性(页取整后略同)
         // 治理器之后的固定分配(GDN 格/快照 f32 同式;图 slab + ctx + 杂项 flat)
         let gdn_slot_elems = dims.nk * dims.hk * 3 + dims.nv * dims.hv * 3 + dims.nv * dims.hk * dims.hv;
-        let fixed_after = n_gdn * gdn_slots() * gdn_slot_elems * 4
-            + snap_max() * n_gdn * gdn_slot_elems * 4
+        let fixed_after = n_gdn * gdn_slots * gdn_slot_elems * 4
+            + snap_max * n_gdn * gdn_slot_elems * 4
             + (400 << 20); // 图 slab + CUDA ctx + warmup 瞬态 + 杂项
-        let vram_target = std::env::var("OWL_VRAM_TARGET")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.97);
-        let vram_reserve = (std::env::var("OWL_VRAM_RESERVE_MB")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(1024))
-            << 20;
+        let vram_reserve = vram_reserve_mb << 20;
         let vram_total = owl_shared::vram::total_bytes();
         let pool_cap = if vram_target > 0.0 && vram_target < 1.0 && vram_total > 0 {
             let budget = (vram_total as f64 * vram_target) as i64
@@ -307,16 +300,16 @@ impl StatePool {
         };
         let mut gdns: Vec<GdnBlocks> = Vec::new();
         for _ in 0..n_gdn {
-            let conv_q = zero_block(face, gdn_slots() * dims.nk * dims.hk * 3).await?;
-            let conv_k = zero_block(face, gdn_slots() * dims.nv * dims.hv * 3).await?;
-            let conv_v = zero_block(face, gdn_slots() * dims.nv * dims.hv * 3).await?;
-            let rec = zero_block(face, gdn_slots() * dims.nv * dims.hk * dims.hv).await?;
+            let conv_q = zero_block(face, gdn_slots * dims.nk * dims.hk * 3).await?;
+            let conv_k = zero_block(face, gdn_slots * dims.nv * dims.hv * 3).await?;
+            let conv_v = zero_block(face, gdn_slots * dims.nv * dims.hv * 3).await?;
+            let rec = zero_block(face, gdn_slots * dims.nv * dims.hk * dims.hv).await?;
             gdns.push(GdnBlocks { conv_q, conv_k, conv_v, rec });
         }
         // GDN 快照池(E2c):行宽副本 × SNAP_MAX 份;仅 paged 形态
         let mut snaps: Vec<GdnSnapSlot> = Vec::new();
         if paged {
-            for _ in 0..snap_max() {
+            for _ in 0..snap_max {
                 let mut bufs: Vec<BlockN> = Vec::new();
                 for _ in 0..n_gdn {
                     bufs.push(zero_block(face, dims.nk * dims.hk * 3).await?);
@@ -350,7 +343,7 @@ impl StatePool {
         } else {
             None
         };
-        Ok(StatePool { kvs, k_fis, v_fis, fi_quant: fi,
+        Ok(StatePool { gdn_slots, dump_all, kvs, k_fis, v_fis, fi_quant: fi,
             kv_fp8, dflash_fp8, gdns, snaps, snap_tick: 0, bt, bt_mtp, spec_snap, mtp_kvs, dflash_kvs, attn_v2, page, nb, paged, x, dims })
     }
 
@@ -559,15 +552,15 @@ impl StatePool {
         face: &mut D,
         gdn_slot: usize,
         step: u64,
+        all: bool,
     ) -> Result<Vec<String>> {
         let nl = self.gdns.len();
-        let all = std::env::var_os("OWL_GDN_DUMP_ALL").is_some();
         let mut out = Vec::new();
         for (li, g) in self.gdns.iter().enumerate() {
             let last = li + 1 == nl;
             // 全层扫 = 仅 cv;默认 = 首末层 cv+rec
             if all && !last {
-                let line = Self::profile_block(face, li, "cv", &g.conv_v, gdn_slot, step, false).await?;
+                let line = self.profile_block(face, li, "cv", &g.conv_v, gdn_slot, step, false).await?;
                 out.push(line);
                 continue;
             }
@@ -575,7 +568,7 @@ impl StatePool {
                 continue;
             }
             for (name, bn) in [("cv", &g.conv_v), ("rec", &g.rec)] {
-                let line = Self::profile_block(face, li, name, bn, gdn_slot, step, true).await?;
+                let line = self.profile_block(face, li, name, bn, gdn_slot, step, true).await?;
                 out.push(line);
             }
         }
@@ -583,6 +576,7 @@ impl StatePool {
     }
 
     async fn profile_block<D: DeviceClient>(
+        &self,
         face: &mut D,
         li: usize,
         name: &str,
@@ -591,7 +585,7 @@ impl StatePool {
         step: u64,
         verbose: bool,
     ) -> Result<String> {
-        let row = bn.1 / gdn_slots();
+        let row = bn.1 / self.gdn_slots;
         let mut buf = vec![0u8; bn.1 * 4];
         face.dtoh(&bn.0, &mut buf).await?;
         let floats: Vec<f32> = buf[gdn_slot * row * 4..(gdn_slot + 1) * row * 4]
@@ -615,10 +609,10 @@ impl StatePool {
         self.gdns
             .iter()
             .map(|g| GdnLeaf {
-                conv_q: block_leaf(&g.conv_q.0, vec![gdn_slots(), d.nk * d.hk, 3]),
-                conv_k: block_leaf(&g.conv_k.0, vec![gdn_slots(), d.nv * d.hv, 3]),
-                conv_v: block_leaf(&g.conv_v.0, vec![gdn_slots(), d.nv * d.hv, 3]),
-                rec: block_leaf(&g.rec.0, vec![gdn_slots(), d.nv, d.hk, d.hv]),
+                conv_q: block_leaf(&g.conv_q.0, vec![self.gdn_slots, d.nk * d.hk, 3]),
+                conv_k: block_leaf(&g.conv_k.0, vec![self.gdn_slots, d.nv * d.hv, 3]),
+                conv_v: block_leaf(&g.conv_v.0, vec![self.gdn_slots, d.nv * d.hv, 3]),
+                rec: block_leaf(&g.rec.0, vec![self.gdn_slots, d.nv, d.hk, d.hv]),
             })
             .collect()
     }
@@ -661,7 +655,7 @@ impl StatePool {
                 (&g.rec.0, g.rec.1),
             ];
             for (bn, elems) in blocks {
-                let row = elems / gdn_slots();
+                let row = elems / self.gdn_slots;
                 face.memset_zero_at(bn, gdn_slot * row * 4, row * 4).await?;
             }
         }
@@ -687,7 +681,7 @@ impl StatePool {
                 (&g.conv_v.0, g.conv_v.1),
                 (&g.rec.0, g.rec.1),
             ] {
-                let row = elems / gdn_slots();
+                let row = elems / self.gdn_slots;
                 let mut buf = vec![0u8; elems * 4]; // 整块回读(f32)
                 face.dtoh(bn, &mut buf).await?;
                 let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -717,7 +711,7 @@ impl StatePool {
                 (&g.conv_v.0, g.conv_v.1),
                 (&g.rec.0, g.rec.1),
             ] {
-                let row = elems / gdn_slots();
+                let row = elems / self.gdn_slots;
                 let mut buf = vec![0u8; elems * 4]; // 整块回读(f32)
                 face.dtoh(bn, &mut buf).await?;
                 nonzero += buf[slot * row * 4..(slot + 1) * row * 4]
@@ -759,7 +753,7 @@ impl StatePool {
                 (&g.rec.0, g.rec.1),
             ];
             for (j, (src, elems)) in quads.iter().enumerate() {
-                let row = elems / gdn_slots();
+                let row = elems / self.gdn_slots;
                 let dst = &self.snaps[idx].bufs[li * 4 + j];
                 face.copy_block_at(src, gdn_slot * row * 4, &dst.0, 0, row * 4).await?;
             }
@@ -792,7 +786,7 @@ impl StatePool {
                 (&g.rec.0, g.rec.1),
             ];
             for (j, (dst, elems)) in quads.iter().enumerate() {
-                let row = elems / gdn_slots();
+                let row = elems / self.gdn_slots;
                 let src = &self.snaps[idx].bufs[li * 4 + j];
                 face.copy_block_at(&src.0, 0, dst, gdn_slot * row * 4, row * 4).await?;
             }
@@ -822,7 +816,7 @@ impl StatePool {
                 (&g.rec.0, g.rec.1),
             ];
             for (j, (src, elems)) in quads.iter().enumerate() {
-                let row = elems / gdn_slots();
+                let row = elems / self.gdn_slots;
                 let dst = &snap.bufs[li * 4 + j];
                 copies.push(((*src).clone(), gdn_slot * row * 4, dst.0.clone(), 0usize, row * 4));
             }
@@ -853,7 +847,7 @@ impl StatePool {
                 (&g.rec.0, g.rec.1),
             ];
             for (j, (dst, elems)) in quads.iter().enumerate() {
-                let row = elems / gdn_slots();
+                let row = elems / self.gdn_slots;
                 let src = &snap.bufs[li * 4 + j];
                 copies.push((src.0.clone(), 0usize, (*dst).clone(), gdn_slot * row * 4, row * 4));
             }

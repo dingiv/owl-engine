@@ -35,10 +35,7 @@ extern "C" __global__ void saxpy_f32(
 "#;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ordinal: usize = std::env::var("OWL_TEST_DEVICE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    let ordinal: usize = owl_shared::env_reader::parse_or("OWL_TEST_DEVICE", 0);
 
     // ---- 1. 上下文与流(cudarc 每卡一个 CudaContext;clone = Arc 克隆)----
     let ctx = CudaContext::new(ordinal)?;

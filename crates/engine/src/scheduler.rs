@@ -97,7 +97,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 } else if self.pool.paged {
                     // 前缀缓存匹配(先匹配后释放旧链;内容寻址 = 跨会话)
                     let (mut m, chain) = self.blocks_m.match_prefix(&turn.prompt_ids);
-                    if std::env::var_os("OWL_DEBUG").is_some() {
+                    if self.blocks_m.debug {
                         eprintln!("[dbg prefix] match = {m} blocks / chain = {chain:?}");
                     }
                     if m > 0 && m * self.pool.page == turn.prompt_ids.len() {

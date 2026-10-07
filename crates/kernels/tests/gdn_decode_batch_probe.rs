@@ -67,7 +67,7 @@ fn dev_u16(s: &std::sync::Arc<cudarc::driver::CudaStream>, n: usize) -> cudarc::
 
 #[test]
 fn gdn_decode_step_batch2_equals_serial() {
-    if std::env::var_os("OWL_TEST_DEVICE").is_none() {
+    if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
     }

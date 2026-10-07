@@ -112,7 +112,7 @@ pub async fn load_0_8b<D: DeviceClient + 'static>(
     );
     let src = SafeTensorsSource::open_dir(dir)?;
     // F16 直转装载(F5;权重 bf16 检查点 → f16 字节,不再 f32 设备中转)
-    let ctx = crate::module::LoaderCtx { dtype: qwen3_5_0_8b().dtype, shard: 1, device_repack: false };
+    let ctx = crate::module::LoaderCtx { dtype: qwen3_5_0_8b().dtype, shard: 1, device_repack: false, verify: false, debug_tap: false };
     crate::interpreters::eval_load(&model, face, &src, &ctx).await?;
     Ok(model)
 }
@@ -133,7 +133,7 @@ pub async fn load_0_8b_w4a16<D: DeviceClient + 'static>(
         crate::module::QuantPlan::W4A16,
     );
     let src = crate::formats::w4a16::W4A16Source::open_dir(dir)?;
-    let ctx = crate::module::LoaderCtx { dtype: crate::contract::Dtype::F16, shard: 1, device_repack: false };
+    let ctx = crate::module::LoaderCtx { dtype: crate::contract::Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false };
     crate::interpreters::eval_load(&model, face, &src, &ctx).await?;
     Ok(model)
 }
@@ -172,6 +172,8 @@ pub async fn load_27b_mtp<D: DeviceClient + 'static>(
         dtype: crate::contract::Dtype::F16,
         shard: 1,
         device_repack,
+        verify: false,
+        debug_tap: false,
     };
     let manifest = crate::interpreters::eval_load(&mtp, face, &src, &ctx).await?;
     Ok((mtp, manifest))
@@ -201,6 +203,8 @@ pub async fn load_27b_dflash2<D: DeviceClient + 'static>(
         dtype: crate::contract::Dtype::BF16,
         shard: 1,
         device_repack: false,
+        verify: false,
+        debug_tap: false,
     };
     if is_q {
         let draft = crate::layers::dflash2::DFlash2Draft::new_with_plan_dt(
@@ -403,6 +407,8 @@ pub async fn load_27b_awq<D: DeviceClient + 'static>(
         dtype: crate::contract::Dtype::F16,
         shard: 1,
         device_repack,
+        verify: false,
+        debug_tap: false,
     };
     crate::interpreters::eval_load(&model, face, &src, &ctx).await?;
     Ok(model)
@@ -740,7 +746,7 @@ mod tests {
         let path = dir.join("model.safetensors-00001-of-00001.safetensors");
 
         // ── 独立锚:一次性自读文件 → 键 → (dtype, 字节区间视图)
-        let raw_buf = std::fs::read(&path).map_err(|e| ModelError::Msg(format!("{e}")))?;
+        let raw_buf = owl_shared::file_loader::read(&path).map_err(|e| ModelError::Msg(format!("{e}")))?;
         let raw = std::sync::Arc::new(raw_buf);
         let st = safetensors::SafeTensors::deserialize(&raw)
             .map_err(|e| ModelError::Msg(format!("锚解析: {e}")))?;
@@ -773,7 +779,7 @@ mod tests {
         let model = Model::new(&qwen3_5_0_8b(), Qwen35Convention::new("model.language_model"), crate::module::QuantPlan::F16);
         let manifest = {
             let src = SafeTensorsSource::open_dir(&dir)?;
-            let ctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false };
+            let ctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false };
             crate::interpreters::eval_load(&model, &mut gpu, &src, &ctx).await?
         };
         eprintln!("[chk] manifest {} 条", manifest.entries().len());
@@ -937,7 +943,7 @@ mod tests {
         let model = load_0_8b(&dir, &mut gpu).await.expect("load_0_8b(真权重)");
         let rp = Rope::new(262_144, HD, 64, 10_000_000.0).expect("rope");
         crate::interpreters::eval_load(&rp, &mut gpu, &rp.tables(),
-            &crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false })
+            &crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false })
             .await.expect("rope 表(f16 正确姿势)");
 
         // 常驻缓冲 ×2 套(ref / prefill;KV 8 槽,GDN 状态格用 0)
@@ -1102,7 +1108,7 @@ mod tests {
         // 实际字节量从文件取(禁硬编码口径 —— 3.9GB f32 是 f32 时代残留,
         // bf16 检查点 1.7GB,f16 装载后同为 1.7GB)
         let mut ckpt_bytes = 0u64;
-        for e in std::fs::read_dir(&dir).expect("读目录") {
+        for e in owl_shared::file_loader::read_dir(&dir).expect("读目录") {
             let p = e.expect("dir entry").path();
             if p.extension().is_some_and(|x| x == "safetensors") {
                 ckpt_bytes += p.metadata().expect("meta").len();
@@ -1215,7 +1221,7 @@ mod tests {
             eprintln!("skip: OWL_TEST_DEVICE 未设");
             return;
         }
-        let Ok(dir) = std::env::var("OWL_DFLASH2_DIR") else {
+        let Some(dir) = owl_shared::env_reader::str("OWL_DFLASH2_DIR") else {
             eprintln!("skip: OWL_DFLASH2_DIR 未设(DFlash2 检查点目录)");
             return;
         };

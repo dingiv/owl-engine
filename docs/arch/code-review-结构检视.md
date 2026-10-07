@@ -153,3 +153,112 @@ embed → 48×(GDN|attn 层:投影 marlin → conv → 门控/递推/归一 → 
 **过程教训**:a. bash 正则改码先打印后落盘(awq 臂被误伤残留括号,编译期即拦);b.
 `| head` 管道会在 --nocapture 大模型测试中途 SIGPIPE 杀进程 → server 线程带 18.8GB 成
 僵尸 → 后续测试 ALLOC/EXECUTION 假回归——**先查 compute-apps 僵尸再怀疑代码**。
+
+
+---
+
+## 五、执行实录(2026-10-10 深夜Ⅴ,clean-code 轮:入口检视 + 双统一基建)
+
+> 起点 = 用户指令:从应用入口 `apps/server/src/main.rs` 开始 clean code 排查;
+> 追加指令:新增 **env reader**(全 workspace 环境变量统一读取面,含测试域)
+> 与 **file loader**(全应用文件 I/O 统一入口)两模块,落 `owl_shared`。
+
+### 检视结论(main.rs 344 行)
+
+- 进程层:main() 混三职(env 解析/actor 装配/accept 循环);配置无对象
+  (7 位置参数进 actor_main);`model_kind` 魔串分派藏在引擎线程 ——
+  打错字静默落 0.8b 基线(真隐患);env 解析 `parse().unwrap_or` 静默吞错。
+- 模块层:chat() 130 行协议状态机住在 main.rs;流式/非流式双 loop 重复;
+  usage 账本散写两处;`/debug/metrics` 40 行投影内联路由臂。
+- 代码层:魔数(通道 64/预览 60/行数 512)、env_or 签名、排序反转技巧。
+
+### 落地
+
+| 项 | 状态 | 结果 |
+|---|---|---|
+| owl_shared::env_reader | ✅ | flag/str/str_or/parse/parse_or + set/remove + **EnvGuard**(RAII 恢复,测试防踩踏);parse 失败 eprintln 可见(降级≠无声) |
+| owl_shared::file_loader | ✅ | read/read_to_string/write/create_dir_all/remove_file/metadata/exists/read_dir/open/join 薄包装;未来统一控制点(记账/沙箱)留口 |
+| server config.rs | ✅ | ServerConfig::from_env 唯一 env 读取点;ModelKind 枚举,非法档位 boot fail-fast;坏值降级 eprintln |
+| main.rs 瘦身 | ✅ | 344→193 行:只留编排(fail-fast → actor spawn → ready 门 → accept 循环);accept 失败 100ms 退避(防错误风暴忙旋) |
+| openai.rs 收编 chat | ✅ | 双 loop 合一(单折叠循环 + ReplyMode 出口策略);Usage 账本单源;None 断流行为保持原差异(流式静默/非流式 503) |
+| debug.rs | ✅ | /debug/metrics 投影纯函数化;路由只转发;Ordering 语义直写 |
+| workspace sweep | ✅ | 153 处 env::var* + 47 处 fs::* → 196 处统一调用面(47 文件);sed 批量 + 手工修类型形态(let Ok→let Some、Option.ok 链→parse、unwrap_or_else 闭包 arity) |
+
+### 设计决策
+
+1. **build.rs 构建期例外**:kernels/build.rs 18 处 env 保留 std::env ——
+   构建期基础设施不经运行时读取面(引 owl-shared 做构建依赖得不偿失)。
+2. **kernels lib 零依赖律例外**:driver.rs `OWL_RESOLVE_TRACE` 探针保留
+   std::env(lib 不引 owl-shared);测试域经 dev-dependencies 收编。
+3. **shared 内部自引用**:crate 内用 `crate::` 路径,非自名外引。
+4. **全限定调用面**:sweep 一律 `owl_shared::env_reader::xxx` 全路径,
+   免 import 变更、调用点自解释(grep 可审计)。
+5. **tokio "time" feature**:server 新增(accept 退避 sleep;零重量级依赖)。
+
+### 回归
+
+- **shared 21/21**(新 5:env_reader 3 + file_loader 2)
+- **kernels lib 8/8**;gdn_scalar_golden ✓;split_direct_probe ✓;
+  gdn_chunked_golden_stage_by_stage ✗ = 存量案(ILLEGAL_ADDRESS 同点位,
+  干净树复现,早于本轮)
+- **engine 38/38**(串行 83s);**models 116/116**(串行 35s)
+- server 六端点冒烟对等:health/models/chat 流式+非流式(usage 23/17 token
+  正确)/debug/metrics/404/400;boot 时序日志同形
+- workspace `cargo check --all-targets` 绿
+- **附案(pitfall #16)**:批量 GPU 测试默认并行 = 多上下文同卡捕获竞争,
+  失败集逐轮漂移;git stash 干净树复跑定谳存量,`--test-threads=1` 全绿。
+  新纪律:GPU 套件一律串行跑门。
+
+### 新纪律(入册)
+
+- 新 env 读取一律 `owl_shared::env_reader`(禁止散点 std::env::var*);
+  测试写 env 用 EnvGuard;热路径禁律不放松(boot 一次解析)。
+- 新文件 I/O 一律 `owl_shared::file_loader`(禁止散点 std::fs::*;
+  mmap 经 open 取句柄;网络 IO 不属此模块)。
+
+
+---
+
+## 六、执行实录(2026-10-10 深夜Ⅵ,显式依赖律:env 隐式依赖 → 显式参数)
+
+> 起点 = 用户裁决:env_reader 收口只是散点收口,不是终态。**环境变量 =
+> 隐式依赖;除程序入口(config 构造)与测试用例外,任何函数不得读 env
+> —— env 派生数据必须显式变参数/配置结构传下去。**
+
+### 终态结构(生产路径零 env 读取)
+
+| 域 | 载体 | 收编 |
+|---|---|---|
+| engine | **`EngineKnobs`**(EngineConfig.knobs;24 字段 = probes + pool/spec/dflash 族 + gdn/snap/vram + sampler + raw_completion + pf 族 + cuda:DiagOpts + env:EnvProvider) | engine.rs 16 + running.rs 5(含 **OWL_STEP_PROFILE 每步热违例**) + state.rs 6 + sampler.rs 2(**每步 from_env 热违例废除**) + scheduler/blocks/graph_plan/exec 8 |
+| cuda | **`DiagOpts`**(srv_timing/cap_prof/launch_sync/free_legacy/graph_flags/capture_slab_mb/nvrtc_include;GpuCtx.diag + GpuServer.with_diag + GpuClient::spawn_with) | state.rs 7(含 **OWL_LAUNCH_SYNC 热违例**)+ CUDA_HOME/CUDA_PATH |
+| models | LoaderCtx.{verify,debug_tap} + ForwardCtx.trace_gate + CpuInterpreter.debug + RepackPath::resolve 去 env 臂 | load.rs 3 + module.rs 1 + reference.rs 1 + gdn.rs 1(**forward 热路径**) |
+
+### 入口侧构造器(唯一合法 env 读取面,全部文档化)
+
+`ServerConfig::from_env`(server)→ `EngineKnobs::from_env` →
+`StepProbes::from_env` / `SamplerCfg::from_env`+`sampler::enabled` /
+`EnvProvider::from_env`(被动律原样)/ `DiagOpts::from_env` / `ServerProbes::from_env`。
+**新增旋钮 = 结构体加字段 + 对应 from_env 登记 + 调用点显式传**,禁止回生散点直读。
+
+### 关键裁决
+
+1. **StatePool 几何 boot 定谳**:snap_max()/gdn_slots() 自由函数删除 →
+   pool 字段(gdn_slots)+ alloc 参数(snap_max/vram 族);运行期读 =
+   self.gdn_slots(跨 boot 不变,进程内冻结语义显式化)。
+2. **GDN 融合 A/B 收敛**:OWL_GDN_FUSE_DECODE 全工程零读者(死旗标)删除;
+   唯一活闸 = EnvProvider.gdn.fused_decode 反开关。
+3. **热路径违例三连清**:OWL_STEP_PROFILE(pump 每步)/ SamplerCfg::from_env
+   (采样每步)/ OWL_LAUNCH_SYNC(每次图回放)/ OWL_TRACE_GATE(每层
+   forward)→ 全部 boot 一次解析进 knobs/probes。
+4. **LoaderCtx 扩容而非旁路**:verify/debug_tap 进 ctx(33 处字面量机械
+   补字段);装载域校验/观测与 ctx 同生命周期。
+5. **server.rs.bak 残留发现**:P0.1 删 bak 轮漏网(cargo 不编译,无害),
+   待下轮清理。
+
+### 回归
+
+- engine **38/38**(串行 88s)/ models **116/116**(串行 35s)/
+  shared 21/21 / kernels lib 8/8 / workspace `--all-targets` 绿
+- server 冒烟:health/chat 非流式(usage 15/17)+ 流式 [DONE] ✓,GPU 清零
+- 生产面 env 直读清点:**0 处**(仅入口构造器 + 测试域 + build.rs/driver.rs
+  两例外)

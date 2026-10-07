@@ -23,6 +23,8 @@ cudarc = { version = "0.19", default-features = false, features = [
     "std", "driver", "nvrtc", "cuda-version-from-build-system", "dynamic-loading",
 ] }
 half = { version = "2.7.1" }
+# 测试探针旋钮统一读取面(env reader;lib 零依赖律不破 —— 仅 dev 侧)
+owl-shared = { path = "../shared" }
 
 [dependencies]
 # 官方 cudarc:仅本 crate 的 cuda_ops 使用(kernel 编译与发射;feature 化,

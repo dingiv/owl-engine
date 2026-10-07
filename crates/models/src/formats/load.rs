@@ -34,7 +34,7 @@ const LOAD_WORKERS: usize = 4;
 /// 解释器自己调用层钩子并为它传递 LoaderCtx —— 使用者只给层与源。
 ///
 /// ```rust,ignore
-/// eval_load(&model, face, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false }).await?;
+/// eval_load(&model, face, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false }).await?;
 /// ```
 pub async fn eval_load<M, D, S>(
     layer: &M,
@@ -48,16 +48,16 @@ where
     S: WeightSource + ?Sized,
 {
     let want = layer.layout(ctx); // 声明:层产出需求清单(ctx 引用透传)
-    let tap = load_tap(); // 观测:OWL_LOAD_DEBUG 门控,缺省零开销
+    let tap = if ctx.debug_tap { Some(std::sync::Mutex::new(Box::new(StderrTap) as Box<dyn LoadTap>)) } else { None }; // 观测:ctx.debug_tap 门控,缺省零开销
     // 设备重排的原始块延迟回收清单(E2a 契约:回收前数据须已收割 ——
     // repack 核异步读 raw,火后即 free 会踩;栅栏后统一回收)
     let deferred: std::sync::Arc<Mutex<Vec<u64>>> = std::sync::Arc::default();
-    let manifest = eval_want(&want, face, src, tap.as_ref(), &deferred).await?;
+    let manifest = eval_want(&want, face, src, tap.as_ref(), &deferred, ctx.verify).await?;
     // 上载栅栏:全部 DMA 落定后方可进入计算域(upload_pinned 入队即回执,
     // 完成语义由本栅栏一次总代价兜底)
     face.sync().await?;
     // 装载校验(OWL_LOAD_VERIFY 门控):整块回读 vs staged 校验和
-    verify_loaded(&manifest, face).await?;
+    verify_loaded(&manifest, face, ctx.verify).await?;
     let ids = std::mem::take(&mut *deferred.lock().unwrap());
     if !ids.is_empty() {
         face.free(&ids).await?;
@@ -78,13 +78,14 @@ async fn eval_want<D: DeviceClient, S: WeightSource + ?Sized>(
     src: &S,
     tap: Option<&Mutex<Box<dyn LoadTap>>>,
     deferred: &Deferred,
+    verify: bool,
 ) -> Result<LoadManifest, ModelError> {
     let handles = face.loader_faces(LOAD_WORKERS);
     let manifest = match handles {
         Some(handles) if handles.len() > 1 && want.wants().len() > 1 => {
-            eval_want_parallel(want, handles, src, tap, deferred).await?
+            eval_want_parallel(want, handles, src, tap, deferred, verify).await?
         }
-        _ => eval_want_sequential(want, face, src, tap, deferred).await?,
+        _ => eval_want_sequential(want, face, src, tap, deferred, verify).await?,
     };
     Ok(manifest)
 }
@@ -114,10 +115,11 @@ async fn eval_want_sequential<D: DeviceClient, S: WeightSource + ?Sized>(
     src: &S,
     tap: Option<&Mutex<Box<dyn LoadTap>>>,
     deferred: &Deferred,
+    verify: bool,
 ) -> Result<LoadManifest, ModelError> {
     let mut manifest = LoadManifest::default();
     for group in key_groups(want.wants()) {
-        manifest.0.extend(load_group(face, &group, src, tap, deferred).await?);
+        manifest.0.extend(load_group(face, &group, src, tap, deferred, verify).await?);
         // 批量回收:滞留 raw 超阈值 → sync(COMPUTE 排空,E2a 契约)+ free
         if deferred.lock().unwrap().len() >= DEFERRED_FREE_COUNT {
             face.sync().await?;
@@ -140,6 +142,7 @@ async fn eval_want_parallel<D: DeviceClient, S: WeightSource + ?Sized>(
     src: &S,
     tap: Option<&Mutex<Box<dyn LoadTap>>>,
     deferred: &Deferred,
+    verify: bool,
 ) -> Result<LoadManifest, ModelError> {
     let mut groups = key_groups(want.wants());
     groups.sort_by_key(|g| std::cmp::Reverse(g.iter().map(|w| want_bytes(w)).sum::<usize>()));
@@ -158,7 +161,7 @@ async fn eval_want_parallel<D: DeviceClient, S: WeightSource + ?Sized>(
     let futs = buckets.into_iter().map(|(mut face, bundles, _)| async move {
         let mut entries = Vec::new();
         for bundle in &bundles {
-            entries.extend(load_group(&mut face, bundle, src, tap, deferred).await?);
+            entries.extend(load_group(&mut face, bundle, src, tap, deferred, verify).await?);
             // 批量回收(并行桶;sync 任一句柄 = 全设备排空)
             if deferred.lock().unwrap().len() >= DEFERRED_FREE_COUNT {
                 face.sync().await?;
@@ -189,15 +192,16 @@ async fn load_group<D: DeviceClient, S: WeightSource + ?Sized>(
     src: &S,
     tap: Option<&Mutex<Box<dyn LoadTap>>>,
     deferred: &Deferred,
+    verify: bool,
 ) -> Result<Vec<LoadEntry>, ModelError> {
     let mut manifest = Vec::new();
     for w in group {
         let n: usize = w.shape.iter().product();
         let entry = match w.layout {
-            Layout::Transposed => load_transposed(face, w, src, n, tap).await?,
-            Layout::Direct => load_direct(face, w, src, n, tap).await?,
+            Layout::Transposed => load_transposed(face, w, src, n, tap, verify).await?,
+            Layout::Direct => load_direct(face, w, src, n, tap, verify).await?,
             Layout::DeviceRearrange { op, rows, cols } => {
-                load_device_rearrange(face, w, src, n, op, rows, cols, tap, deferred).await?
+                load_device_rearrange(face, w, src, n, op, rows, cols, tap, deferred, verify).await?
             }
         };
         w.sink.deliver(crate::contract::Bytes::new(entry.block.id, n));
@@ -226,18 +230,15 @@ fn fnv1a(data: &[u8], init: u64) -> u64 {
     h
 }
 
-fn load_verify_enabled() -> bool {
-    std::env::var_os("OWL_LOAD_VERIFY").is_some()
-}
-
 /// 装载后回读校验(eval_load 栅栏后调用;OWL_LOAD_VERIFY 门控):
 /// 每键整块 dtoh 重哈希对比 staged 校验和;metrics 标签 `loadv.{key}`;
 /// 失配 = 结构化错误(列出键)。DeviceRearrange 臂(csum=0)跳读。
 pub async fn verify_loaded<D: DeviceClient>(
     manifest: &LoadManifest,
     face: &mut D,
+    verify: bool,
 ) -> Result<(), ModelError> {
-    if !load_verify_enabled() {
+    if !verify {
         return Ok(());
     }
     let t0 = std::time::Instant::now();
@@ -289,6 +290,7 @@ async fn load_direct<D: DeviceClient, S: WeightSource + ?Sized>(
     src: &S,
     n: usize,
     tap: Option<&Mutex<Box<dyn LoadTap>>>,
+    verify: bool,
 ) -> Result<LoadEntry, ModelError> {
     let esz = w.dtype.size_bytes();
     let mut probe = KeyProbe::start(tap, &w.key, n * esz);
@@ -298,7 +300,7 @@ async fn load_direct<D: DeviceClient, S: WeightSource + ?Sized>(
         .map_err(|e| ModelError::Msg(format!("Weight '{}': {e}", w.key)))?;
     let chunk_elems = (CHUNK_BYTES / esz).max(1);
     let mut off = 0usize;
-    let verify = load_verify_enabled();
+    
     let mut csum = 0xcbf29ce484222325u64;
     while off < n {
         let len = chunk_elems.min(n - off);
@@ -354,10 +356,10 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
     cols: usize,
     tap: Option<&Mutex<Box<dyn LoadTap>>>,
     deferred: &Deferred,
+    verify: bool,
 ) -> Result<LoadEntry, ModelError> {
     let raw_elems = rows * cols;
     let mut probe = KeyProbe::start(tap, &w.key, raw_elems * 4);
-    let verify = std::env::var_os("OWL_LOAD_VERIFY").is_some();
     let mut packed_host = if verify {
         Some(vec![0u8; raw_elems * 4])
     } else {
@@ -488,6 +490,7 @@ async fn load_transposed<D: DeviceClient, S: WeightSource + ?Sized>(
     src: &S,
     n: usize,
     tap: Option<&Mutex<Box<dyn LoadTap>>>,
+    verify: bool,
 ) -> Result<LoadEntry, ModelError> {
     let mut probe = KeyProbe::start(tap, &w.key, n * w.dtype.size_bytes());
     let data = {
@@ -522,7 +525,7 @@ async fn load_transposed<D: DeviceClient, S: WeightSource + ?Sized>(
         shape: w.shape.clone(),
         layout: Layout::Transposed,
         block: crate::contract::Bytes::new(b.id, n),
-        csum: if load_verify_enabled() { fnv1a(&bytes, 0xcbf29ce484222325) } else { 0 },
+        csum: if verify { fnv1a(&bytes, 0xcbf29ce484222325) } else { 0 },
     })
 }
 
@@ -625,15 +628,6 @@ impl LoadTap for StderrTap {
             rec.total.as_secs_f64() * 1e3,
             detail.join(" ")
         );
-    }
-}
-
-/// 观测装配:OWL_LOAD_DEBUG 门控;缺省 None = 零开销
-fn load_tap() -> Option<Mutex<Box<dyn LoadTap>>> {
-    if std::env::var_os("OWL_LOAD_DEBUG").is_some() {
-        Some(Mutex::new(Box::new(StderrTap)))
-    } else {
-        None
     }
 }
 

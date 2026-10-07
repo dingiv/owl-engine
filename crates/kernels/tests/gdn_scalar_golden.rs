@@ -36,7 +36,7 @@ struct Case {
 
 fn read_bin(dir: &str, name: &str) -> Vec<f32> {
     let p = format!("{dir}/{name}.bin");
-    let bytes = std::fs::read(&p).unwrap_or_else(|e| panic!("{p}: {e}"));
+    let bytes = owl_shared::file_loader::read(&p).unwrap_or_else(|e| panic!("{p}: {e}"));
     bytes
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -45,7 +45,7 @@ fn read_bin(dir: &str, name: &str) -> Vec<f32> {
 
 fn load_case(dir: &str, tag: &str, _t: usize) -> Case {
     let rd = |n: &str| read_bin(dir, &format!("{tag}.{n}"));
-    let has_s0 = std::fs::metadata(format!("{dir}/{tag}.s0.bin")).is_ok();
+    let has_s0 = owl_shared::file_loader::metadata(format!("{dir}/{tag}.s0.bin")).is_ok();
     Case {
         q: rd("q"),
         k: rd("k"),
@@ -73,7 +73,7 @@ fn max_dev(a: &[f32], b: &[f32]) -> (usize, f32) {
 
 #[test]
 fn gdn_scalar_golden() {
-    if std::env::var_os("OWL_TEST_DEVICE").is_none() {
+    if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
     }

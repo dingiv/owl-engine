@@ -21,6 +21,8 @@ use std::collections::VecDeque;
 /// KV 物理块账房(单实例;RunningEngine 持有)
 pub struct BlockManager {
     block_size: usize,
+    /// 诊断打印开关(EngineKnobs.probes.debug,boot 注入;显式依赖律)
+    pub(crate) debug: bool,
     /// ref_count[i] = 物理块 i 的引用数;0 = 空闲,1 = 会话独占,
     /// ≥2 = 前缀共享(缓存持一份 + 会话各持一份)
     ref_counts: Vec<u32>,
@@ -35,7 +37,13 @@ pub struct BlockManager {
 impl BlockManager {
     /// 全池空闲起步(num_blocks = 池块容量;block_size = 页大小)
     pub fn new(num_blocks: usize, block_size: usize) -> Self {
+        Self::with_debug(num_blocks, block_size, false)
+    }
+
+    /// 带诊断开关构造(engine boot 注入 probes.debug)
+    pub(crate) fn with_debug(num_blocks: usize, block_size: usize, debug: bool) -> Self {
         Self {
+            debug,
             block_size,
             ref_counts: vec![0; num_blocks],
             free_block_ids: (0..num_blocks as u32).collect(),
@@ -85,7 +93,7 @@ impl BlockManager {
         }
         let blocks: Vec<usize> = table[..full].iter().map(|&b| b as usize).collect();
         let PrefixCacheUpdate { inserted, evicted } = cache.insert_prefix(tokens, &blocks);
-        if std::env::var_os("OWL_DEBUG").is_some() {
+        if self.debug {
             eprintln!(
                 "[dbg prefix] cache_seq: full={} inserted={} evicted={} 表块={}",
                 full,

@@ -113,6 +113,9 @@ pub struct ForwardCtx<'a> {
     /// 依层序推入(每层 8:q/k/v raw → conv 重放;q_n/k_n/v_c/g/beta →
     /// 递推重放)。None = 零开销(生产 decode/prefill 不设)。
     pub gdn_tap: Option<std::rc::Rc<std::cell::RefCell<Vec<TensorOps>>>>,
+    /// GDN 分派门控打印(EngineKnobs.probes.trace_gate 注入;显式依赖律,
+    /// 原 OWL_TRACE_GATE 层内直读 —— 热路径零 env)
+    pub trace_gate: bool,
 }
 
 impl<'a> ForwardCtx<'a> {
@@ -136,6 +139,7 @@ impl<'a> ForwardCtx<'a> {
             env: crate::env::EnvProvider::default(),
             gdn_slot_host: 0,
             ts_buf: None,
+            trace_gate: false,
             attn_v2: None,
             seq_cu: None,
             gdn_tap: None,
@@ -167,6 +171,7 @@ impl<'a> ForwardCtx<'a> {
             env: crate::env::EnvProvider::default(),
             gdn_slot_host: 0,
             ts_buf: None,
+            trace_gate: false,
             attn_v2: None,
             seq_cu: None,
             gdn_tap: None,
@@ -193,6 +198,7 @@ impl<'a> ForwardCtx<'a> {
             env: crate::env::EnvProvider::default(),
             gdn_slot_host: 0,
             ts_buf: None,
+            trace_gate: false,
             attn_v2: None,
             seq_cu: None,
             gdn_tap: None,
@@ -223,6 +229,7 @@ impl<'a> ForwardCtx<'a> {
             env: crate::env::EnvProvider::default(),
             gdn_slot_host: 0,
             ts_buf: None,
+            trace_gate: false,
             attn_v2: None,
             seq_cu: None,
             gdn_tap: None,
@@ -256,6 +263,7 @@ impl<'a> ForwardCtx<'a> {
             env: crate::env::EnvProvider::default(),
             gdn_slot_host: 0,
             ts_buf: None,
+            trace_gate: false,
             attn_v2: None,
             seq_cu: None,
             gdn_tap: None,
@@ -289,6 +297,7 @@ impl<'a> ForwardCtx<'a> {
             env: crate::env::EnvProvider::default(),
             gdn_slot_host: 0,
             ts_buf: None,
+            trace_gate: false,
             attn_v2: None,
             seq_cu: None,
             gdn_tap: None,
@@ -328,6 +337,7 @@ impl<'a> ForwardCtx<'a> {
             env: crate::env::EnvProvider::default(),
             gdn_slot_host: 0,
             ts_buf: None,
+            trace_gate: false,
             attn_v2: None,
             seq_cu: None,
             gdn_tap: None,
@@ -790,9 +800,14 @@ pub struct LoaderCtx {
     /// 并行度(shard 形状切分的词汇;1 = 单卡;TP 随多卡立项)
     pub shard: usize,
     /// 设备重排装载(AWQ 线;**已裁决结果,唯一产地 =
-    /// [`RepackPath::resolve`]** —— 能力否决/env 强制/显式参数/默认 GPU;
+    /// [`RepackPath::resolve`]** —— 能力否决/显式参数/默认 GPU;
     /// 本字段不再承载决策,消费点 = linear layout + awq source 物化)
     pub device_repack: bool,
+    /// 装载校验(整块回读 vs staged 校验和;原 OWL_LOAD_VERIFY env 直读
+    /// —— 显式依赖律:入口/测试经本字段传,缺省关)
+    pub verify: bool,
+    /// 装载观测 tap(stderr 逐键打印;原 OWL_LOAD_DEBUG env 直读)
+    pub debug_tap: bool,
 }
 
 /// repack 路径(装载域**唯一收口**;2026-10-01 用户裁决:默认 GPU 优先,
@@ -812,15 +827,12 @@ impl RepackPath {
     /// 唯一裁决点。裁决序(**高 → 低**):
     /// 1. **能力否决**:`device_capable = false`(CpuFace 等纯 host face)
     ///    → Host,其余参数不看 —— GPU 不在场,自动回退;
-    /// 2. **env 强制**:`OWL_LOAD_CPU_REPACK` 在场 → Host(运维 A/B,
-    ///    免改码强制回退);
-    /// 3. **显式参数**:`Some(false)` → Host;
-    /// 4. **默认**:Device(GPU 优先)。
+    /// 2. **显式参数**:`Some(false)` → Host(运维 A/B 走入口显式传参;
+    ///    原 OWL_LOAD_CPU_REPACK env 强制臂已随显式依赖律移除 ——
+    ///    调用方自 knobs 读后传入);
+    /// 3. **默认**:Device(GPU 优先)。
     pub fn resolve(explicit: impl Into<Option<bool>>, device_capable: bool) -> Self {
         if !device_capable {
-            return Self::Host;
-        }
-        if std::env::var_os("OWL_LOAD_CPU_REPACK").is_some() {
             return Self::Host;
         }
         match explicit.into() {
@@ -837,7 +849,7 @@ impl RepackPath {
 
 impl Default for LoaderCtx {
     fn default() -> Self {
-        Self { dtype: Dtype::F32, shard: 1, device_repack: false }
+        Self { dtype: Dtype::F32, shard: 1, device_repack: false, verify: false, debug_tap: false }
     }
 }
 

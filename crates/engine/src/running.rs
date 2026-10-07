@@ -23,7 +23,7 @@ use crate::engine::EngineConfig;
 use crate::graph_plan::GraphPlan;
 use crate::scheduler::{SchedulerOutput, StepAction};
 use crate::session::SessionTable;
-use crate::state::{gdn_slots, StatePool};
+use crate::state::StatePool;
 use crate::turn::{TurnEvent, TurnSpec};
 
 type Result<T> = std::result::Result<T, ModelError>;
@@ -75,11 +75,12 @@ pub(crate) struct TurnSpecState {
     pub(crate) spec_seed_hidden: Option<owl_iface::contract::Bytes>,
 }
 
-/// 执行态引擎(请求入口)
-/// 刀1.6 结构清理(P0.3):步级探针开关,boot 一次性解析(进程内不变)。
-/// 热路径零 `var_os`;新增探针必须在此登记,禁止 exec 每步读 env。
+/// 步级探针开关(诊断面;结构纯数据,Default = 全关)。
+/// **入口侧构造器** = [`StepProbes::from_env`](server config/测试用例
+/// 专用);引擎内部零 env 读取,经 EngineKnobs.probes 显式传入。
+/// 新增探针在此登记,禁止 exec 每步读 env。
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct StepProbes {
+pub struct StepProbes {
     /// OWL_STEP_PROFILE(逐相计时)
     pub step_profile: bool,
     /// OWL_GDN_DUMP(GDN 状态格画像)
@@ -96,6 +97,8 @@ pub(crate) struct StepProbes {
     pub degrade_after: usize,
     /// B4:OWL_SPEC_PROBE_EVERY(降级期探测周期 token 数,失败 ×2 退避)
     pub probe_every: usize,
+    /// GDN 分派门控打印(原 OWL_TRACE_GATE 层内直读 → ForwardCtx 注入)
+    pub trace_gate: bool,
     /// E3 收编(原热路径散落 var_os;boot 解析一次):DFlash2 诊断/回退族
     pub dflash_probe: bool,
     pub propose_eager: bool,
@@ -105,23 +108,19 @@ pub(crate) struct StepProbes {
 }
 
 impl StepProbes {
-    pub(crate) fn from_env() -> Self {
-        let has = |k: &str| std::env::var_os(k).is_some();
+    /// **入口侧构造器**(server config / 测试用例专用;引擎内部零 env)
+    pub fn from_env() -> Self {
+        let has = |k: &str| owl_shared::env_reader::flag(k);
         Self {
             step_profile: has("OWL_STEP_PROFILE"),
             gdn_dump: has("OWL_GDN_DUMP"),
             debug: has("OWL_DEBUG"),
             prefill_cksum: has("OWL_PREFILL_CKSUM"),
             fact_probe: has("OWL_FACT_PROBE"),
-            degrade_after: std::env::var("OWL_SPEC_DEGRADE_AFTER")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(6),
-            probe_every: std::env::var("OWL_SPEC_PROBE_EVERY")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(64)
+            degrade_after: owl_shared::env_reader::parse_or("OWL_SPEC_DEGRADE_AFTER", 6),
+            probe_every: owl_shared::env_reader::parse_or("OWL_SPEC_PROBE_EVERY", 64)
                 .max(1),
+            trace_gate: has("OWL_TRACE_GATE"),
             dflash_probe: has("OWL_DFLASH_PROBE"),
             propose_eager: has("OWL_PROPOSE_EAGER"),
             dflash_eager: has("OWL_DFLASH_EAGER"),
@@ -258,9 +257,9 @@ impl<D: DeviceClient> RunningEngine<D> {
         let session = session.into();
         let prompt = prompt.into();
         let prompt_ids = {
-            // 诊断开关(OWL_RAW_COMPLETION=1):裸续写,绕过 chat 模板 ——
+            // 诊断开关(knobs.raw_completion):裸续写,绕过 chat 模板 ——
             // 模型健康度鉴别(模板态病 vs 权重病)的 A/B 臂
-            let wrapped = if std::env::var_os("OWL_RAW_COMPLETION").is_some() {
+            let wrapped = if self.cfg.knobs.raw_completion {
                 prompt.clone()
             } else {
                 self.tok.chat_wrap(&prompt)
@@ -309,7 +308,7 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 必须让位(2026-10-10 sweep 实录:8 个键控会话存活时全部
     /// ephemeral 请求 400)
     fn get_or_create_evicting(&mut self, id: Option<u64>) -> Result<u64> {
-        match self.sessions.get_or_create(id, gdn_slots()) {
+        match self.sessions.get_or_create(id, self.cfg.knobs.gdn_slots) {
             Ok(x) => Ok(x.0),
             Err(e) if format!("{e}").contains("GDN 状态格耗尽") => {
                 let mut last = e;
@@ -328,7 +327,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                         m.counter_add("session.evict", 1, file!(), line!())
                     });
                     eprintln!("[session] LRU 逐出 #{victim}(GDN 格回收)→ 重试");
-                    match self.sessions.get_or_create(id, gdn_slots()) {
+                    match self.sessions.get_or_create(id, self.cfg.knobs.gdn_slots) {
                         Ok(x) => return Ok(x.0),
                         Err(e2) if format!("{e2}").contains("GDN 状态格耗尽") => {
                             last = e2;
@@ -381,7 +380,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         if let Some(ev) = self.pending_events.pop_front() {
             return Ok(ev);
         }
-        let prof = std::env::var_os("OWL_STEP_PROFILE").is_some();
+        let prof = self.cfg.knobs.probes.step_profile;
         // metrics 框架接线(2026-10-01 合并示范):schedule 分相计时入
         // owl_shared 全局 store(debug 展开/release 零开销);prof 时查询
         // 打印。其余 STEP_PROFILE 打点保留原样(gl-prof/srv-timing 工具链

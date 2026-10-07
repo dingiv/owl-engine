@@ -1113,7 +1113,7 @@ mod f16_tests {
         let attn = Attention::new(hq, hkv, hd, hidden, 1e-6, QuantPlan::F16);
 
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false };
         crate::interpreters::eval_load(&attn, &mut gpu, &src, &lctx)
             .await
             .expect("attention f16 装载");
@@ -1207,7 +1207,7 @@ mod f16_tests {
                 .zip(want)
                 .map(|(a, b)| (a - b).abs())
                 .fold(0f32, f32::max);
-            if std::env::var_os("OWL_RESOLVE_TRACE").is_some() {
+            if owl_shared::env_reader::flag("OWL_RESOLVE_TRACE") {
                 eprintln!(
                     "[v1-isolation][r{t}] hd{hd} hq{hq} hkv{hkv} t{t_len}: got={:?} want={:?}",
                     &got[..6], &want[..6]
@@ -1320,7 +1320,7 @@ mod f16_tests {
         let attn = Attention::new(hq, hkv, hd, hidden, eps, QuantPlan::F16);
 
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false };
         crate::interpreters::eval_load(&attn, &mut gpu, &src, &lctx)
             .await
             .expect("attention f16 装载");
@@ -1517,7 +1517,7 @@ mod f16_tests {
         let attn = Attention::new(hq, hkv, hd, hidden, 1e-6, QuantPlan::F16);
 
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false };
         crate::interpreters::eval_load(&attn, &mut gpu, &src, &lctx)
             .await
             .expect("attention f16 装载");
@@ -1618,7 +1618,7 @@ mod f16_tests {
         let attn = Attention::new(hq, hkv, hd, hidden, 1e-6, QuantPlan::F16);
 
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F32, shard: 1, device_repack: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F32, shard: 1, device_repack: false, verify: false, debug_tap: false };
         crate::interpreters::eval_load(&attn, &mut gpu, &src, &lctx)
             .await
             .expect("attention f32 装载");
@@ -2007,7 +2007,7 @@ mod split_probe_tests {
         use crate::contract::DeviceClient as _;
         if !crate::testkit::gpu_enabled() { return; }
         // 引擎全参档(27B:24/4/256;chunk=page=32;双 chunk = 跨 chunk K0)
-        let fp8kv = std::env::var_os("FI_FP8").is_some();
+        let fp8kv = owl_shared::env_reader::flag("FI_FP8");
         let (hq, hkv, hd, page, x) = (24usize, 4usize, 256usize, 32usize, 8usize);
         let nb = 2usize;
         let ctx_total = nb * page;     // 64 = 两个 chunk

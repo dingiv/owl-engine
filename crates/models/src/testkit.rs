@@ -107,7 +107,7 @@ pub fn st_write(path: &Path, tensors: &[(&str, &[f32], Vec<usize>)]) {
 
 /// safetensors 文件 → 具名 f32 张量
 pub fn st_read(path: &Path, name: &str) -> Vec<f32> {
-    let buf = std::fs::read(path).expect("safetensors 读入");
+    let buf = owl_shared::file_loader::read(path).expect("safetensors 读入");
     let st = safetensors::SafeTensors::deserialize(&buf).expect("safetensors 解析");
     let t = st.tensor(name).expect("张量名");
     assert_eq!(t.dtype(), safetensors::Dtype::F32, "{name} 应为 F32");
@@ -138,7 +138,7 @@ pub fn hf_python(script: &str, args: &[&str]) -> String {
 
 /// HF parity 门控(OWL_HF_PARITY=1;平时 cargo test 零 python 依赖)
 pub fn parity_enabled() -> bool {
-    std::env::var("OWL_HF_PARITY")
+    owl_shared::env_reader::str("OWL_HF_PARITY")
         .map(|v| v == "1")
         .unwrap_or(false)
 }
@@ -149,7 +149,7 @@ pub fn skip_note() {
 
 /// GPU 后端门控(OWL_TEST_DEVICE 已设;与 owl-cuda 测试同一约定)
 pub fn gpu_enabled() -> bool {
-    std::env::var_os("OWL_TEST_DEVICE").is_some()
+    owl_shared::env_reader::flag("OWL_TEST_DEVICE")
 }
 
 /// GPU face(owl-cuda actor;门控已过才调用)

@@ -207,7 +207,7 @@ impl EnvProvider {
     /// env-var 兼容构造(ops 工作流;组件内部禁止直读环境变量)。
     /// 硬件档不在 env(引擎 boot 从 iface `op_env()` 合入)。
     pub fn from_env() -> Self {
-        let has = |k: &str| std::env::var_os(k).is_some();
+        let has = |k: &str| owl_shared::env_reader::flag(k);
         Self {
             attn: AttnEnv {
                 // W2 qkv 融合:**生产默认开**(2026-10-04;k-probe 硬门 +

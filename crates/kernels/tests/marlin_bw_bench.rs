@@ -101,9 +101,7 @@ fn bench_shape(
 
 #[test]
 fn marlin_bandwidth_27b_shapes() {
-    let Some(dev) = std::env::var("OWL_TEST_DEVICE")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
+    let Some(dev) = owl_shared::env_reader::parse::<usize>("OWL_TEST_DEVICE")
     else {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;

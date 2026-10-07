@@ -92,6 +92,11 @@ pub struct GraphPlanDesc {
     pub outputs: Vec<OutputSlot>,
     /// 捕获三态开关(true = 尝试捕获,预检不过自动 EagerFallback)
     pub capture: bool,
+    /// 捕获 slab 固定档占用中(knobs.capture_slab_mb.is_some();true =
+    /// 跳过 warmup 计量 hint,用固定档 —— 测试/诊断兼容臂)
+    pub slab_fixed: bool,
+    /// 槽回读诊断打印(knobs.probes.debug;显式依赖律,原 OWL_DEBUG)
+    pub debug_probe: bool,
 }
 
 /// plan 结果(A1.4:预检失败 = EagerFallback,同闭包直发)
@@ -162,6 +167,8 @@ enum Mode {
 
 pub struct GraphPlan<D: DeviceClient> {
     face: D,
+    /// 槽回读诊断打印(desc.debug_probe;显式依赖律)
+    debug_probe: bool,
     inputs: Vec<InSlotDev>,
     out_specs: HashMap<String, usize>, // name → 元素数
     out_dt: HashMap<String, Dtype>,    // name → 收割 dtype(F5 logits f16)
@@ -189,6 +196,7 @@ impl<D: DeviceClient> GraphPlan<D> {
 
         let mut sess = Self {
             face,
+            debug_probe: desc.debug_probe,
             inputs: ins,
             out_specs: desc
                 .outputs
@@ -215,7 +223,7 @@ impl<D: DeviceClient> GraphPlan<D> {
         sess.face.sync().await?;
         sess.last.clear();
         let metered = owl_shared::slab_hint::meter_take() as usize;
-        if std::env::var_os("OWL_CAPTURE_SLAB_MB").is_none() {
+        if !desc.slab_fixed {
             owl_shared::slab_hint::set_hint(metered + metered / 8 + (1 << 20));
         }
 
@@ -235,9 +243,9 @@ impl<D: DeviceClient> GraphPlan<D> {
     /// 未提到的输入槽保持上步内容(典型:常量槽)。
     pub async fn step(&mut self, inputs: &[(&str, &[f32])]) -> Result<()> {
         self.fill_slots(inputs).await?;
-        // 诊断:槽回读(OWL_DEBUG;取证每步标量是否真落烘焙槽 ——
+        // 诊断:槽回读(desc.debug_probe;取证每步标量是否真落烘焙槽 ——
         // 复读病理立案的仪表盘)
-        if std::env::var_os("OWL_DEBUG").is_some() {
+        if self.debug_probe {
             for (name, vals) in inputs {
                 if let Some(slot) = self.inputs.iter().find(|s| s.name == *name) {
                     let mut buf = vec![0u8; vals.len() * 4];
@@ -475,6 +483,8 @@ mod tests {
             ],
             outputs: vec![OutputSlot::f32("s", &[1, 4])],
             capture: false,
+            slab_fixed: false,
+            debug_probe: false,
         };
         let (mut sess, outcome) = GraphPlan::plan(
             face,
@@ -508,6 +518,8 @@ mod tests {
             inputs: vec![InputSlot::f32("a", 4), InputSlot::f32("b", 3)],
             outputs: vec![OutputSlot::f32("s", &[1, 4])],
             capture: true,
+            slab_fixed: false,
+            debug_probe: false,
         };
         let r = GraphPlan::plan(face, desc, |sc: &PlanCtx| -> Result<()> {
             let a = sc.input("a")?;
@@ -537,6 +549,8 @@ mod tests {
             inputs: vec![InputSlot::f32("x", 4)],
             outputs: vec![OutputSlot::f32("s", &[1, 4])],
             capture: true,
+            slab_fixed: false,
+            debug_probe: false,
         };
         let (mut sess, outcome) = GraphPlan::plan(
             face,
@@ -561,9 +575,7 @@ mod tests {
     /// 权重块化(捕获期禁 Htod);同卡双 actor,纯函数树无状态污染。
     #[tokio::test]
     async fn gpu_capture_matches_eager() {
-        let Some(ordinal) =
-            std::env::var("OWL_TEST_DEVICE").ok().and_then(|v| v.parse::<usize>().ok())
-        else {
+        let Some(ordinal) = owl_shared::env_reader::parse::<usize>("OWL_TEST_DEVICE") else {
             eprintln!("skip: OWL_TEST_DEVICE 未设");
             return;
         };
@@ -586,6 +598,8 @@ mod tests {
             inputs: vec![InputSlot::f32("x", 4), InputSlot::f32("y", 4)],
             outputs: vec![OutputSlot::f32("s", &[1, 4])],
             capture,
+            slab_fixed: false,
+            debug_probe: false,
         };
 
         // eager 锚

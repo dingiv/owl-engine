@@ -54,7 +54,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let tokenizer = load_tokenizer(dir)?;
         let rope = Rope::new(262_144, 256, 64, 10_000_000.0)?;
         let quant_plan = owl_models::module::QuantPlan::F16;
-        let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1, device_repack: false };
+        let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1, device_repack: false, verify: false, debug_tap: false };
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
         Ok(LoadedModel { model, tokenizer, rope, spec, quant_plan, mtp_dir: None })
 
@@ -72,7 +72,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let tokenizer = load_tokenizer(tokenizer_dir)?;
         let rope = Rope::new(262_144, 256, 64, 10_000_000.0)?;
         let quant_plan = owl_models::module::QuantPlan::W4A16;
-        let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1, device_repack: false };
+        let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1, device_repack: false, verify: false, debug_tap: false };
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
         Ok(LoadedModel { model, tokenizer, rope, spec, quant_plan, mtp_dir: None })
 
@@ -94,7 +94,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let model = Arc::new(load_27b_awq(dir, self.face).await?);
         let tokenizer = load_tokenizer(tokenizer_dir)?;
         let rope = Rope::new(262_144, 256, 64, 10_000_000.0)?;
-        let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1, device_repack: false };
+        let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1, device_repack: false, verify: false, debug_tap: false };
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
         let quant_plan = owl_models::module::QuantPlan::W4A16Awq;
         owl_shared::metrics::with_metrics_store(|s| {

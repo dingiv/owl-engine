@@ -144,7 +144,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let n: usize = memory.shape().iter().product();
             let mut buf = vec![0u8; n * 2];
             face.dtoh(&outs[0], &mut buf).await?;
-            std::fs::write("/tmp/owl_dflash_mem.bin", &buf).ok();
+            owl_shared::file_loader::write("/tmp/owl_dflash_mem.bin", &buf).ok();
             eprintln!("[dflash-probe] memory 落盘 /tmp/owl_dflash_mem.bin t={t}");
         }
         Ok(())
@@ -244,7 +244,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 face.dtoh(&kb, &mut kbuf).await?;
             }
             if pos <= 18 {
-                std::fs::write("/tmp/owl_dflash_kpool.bin", &kbuf).ok();
+                owl_shared::file_loader::write("/tmp/owl_dflash_kpool.bin", &kbuf).ok();
                 eprintln!("[dflash-probe] 草稿 K 池首块落盘 /tmp/owl_dflash_kpool.bin pos={pos}");
             }
             for r in 0..nrow {
@@ -286,18 +286,18 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 let n: usize = r.shape().iter().product();
                 let mut blk = vec![0u8; n * 2];
                 face.dtoh(&b, &mut blk).await?;
-                std::fs::write(format!("/tmp/owl_p{i}.bin"), &blk).ok();
+                owl_shared::file_loader::write(format!("/tmp/owl_p{i}.bin"), &blk).ok();
             }
             let face = self.session.face_mut();
             let b = owl_models::interpreters::eval_ops(hidden.step(), face).await?;
             let n: usize = hidden.shape().iter().product();
             let mut hbuf = vec![0u8; n * 2];
             face.dtoh(&b, &mut hbuf).await?;
-            std::fs::write("/tmp/owl_dflash_hid.bin", &hbuf).ok();
+            owl_shared::file_loader::write("/tmp/owl_dflash_hid.bin", &hbuf).ok();
             let mut m = Vec::new();
             m.extend_from_slice(&(pos as u32).to_le_bytes());
             m.extend_from_slice(&(anchor as u32).to_le_bytes());
-            std::fs::write("/tmp/owl_dflash_meta.bin", &m).ok();
+            owl_shared::file_loader::write("/tmp/owl_dflash_meta.bin", &m).ok();
             eprintln!("[dflash-probe] {} probe roots + hidden 落盘(逐根独立 eval)pos={pos} anchor={anchor}", probe_roots.len());
         }
         let _ = hidden;
@@ -454,7 +454,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 三段 bisect(E5-DF3 同日十一):①memory 独立 eval ②multi 根=[memory]
         // ③encode multi → 各自读回行 0 |max|/池非零计,定位“in-multi 零、
         // standalone 有限”的分裂点(OWL_DFLASH_PROBE)
-        let probe = std::env::var_os("OWL_DFLASH_PROBE").is_some();
+        let probe = self.probes.dflash_probe;
         if probe {
             let b1 = {
                 let face = self.session.face_mut();

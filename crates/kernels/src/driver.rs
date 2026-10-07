@@ -111,6 +111,8 @@ pub struct OpReq<'a> {
 /// (与登记表 `source()` 同纪律)。
 pub fn resolve(req: OpReq) -> KernelPick {
     let dt = req.dt;
+    // 探针例外:lib 零依赖律(见 Cargo.toml)优先于 env 统一读取面 ——
+    // 本 crate 不依赖 owl-shared,直呼 std::env(测试域已收编 env_reader)
     if std::env::var_os("OWL_RESOLVE_TRACE").is_some() {
         let _ = &req;
     }

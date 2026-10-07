@@ -40,10 +40,7 @@ async fn run(client: &mut GpuClient, decl: &TensorOps) -> Vec<f32> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ordinal = std::env::var("OWL_TEST_DEVICE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    let ordinal = owl_shared::env_reader::parse_or("OWL_TEST_DEVICE", 0);
     // 手工组装:管道外部创建,server/client 各拿一端
     let (tx, rx) = std::sync::mpsc::channel::<Command>();
     let server = GpuServer::new(rx, DeviceSelector::Ordinal(ordinal), None);

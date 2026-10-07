@@ -996,7 +996,7 @@ mod tests {
         src.insert("kernel_projection".into(), gen(2 * TAPS * groups * hidden, 1.0));
 
         let mut gpu = gpu_client().await;
-        crate::interpreters::eval_load(&conv, &mut gpu, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false })
+        crate::interpreters::eval_load(&conv, &mut gpu, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false })
             .await
             .expect("conv 装载");
 
@@ -1073,7 +1073,7 @@ mod tests {
         src.insert("successor_codebook".into(), b_tab.clone());
 
         let mut gpu = gpu_client().await;
-        crate::interpreters::eval_load(&sel, &mut gpu, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false })
+        crate::interpreters::eval_load(&sel, &mut gpu, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false })
             .await
             .expect("selector 装载");
 
@@ -1239,7 +1239,7 @@ mod tests {
                 fc.chain(self.0.hidden_norm().layout(_ctx))
             }
         }
-        crate::interpreters::eval_load(&FcOnly(&draft), &mut gpu, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false })
+        crate::interpreters::eval_load(&FcOnly(&draft), &mut gpu, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false })
             .await
             .expect("fc 装载");
 
@@ -1304,7 +1304,7 @@ mod tests {
             eprintln!("skip: OWL_TEST_DEVICE 未设");
             return;
         }
-        let Ok(dir) = std::env::var("OWL_DFLASH2_DIR") else {
+        let Some(dir) = owl_shared::env_reader::str("OWL_DFLASH2_DIR") else {
             eprintln!("skip: OWL_DFLASH2_DIR 未设");
             return;
         };
@@ -1334,7 +1334,7 @@ mod tests {
                 self.0.layout(ctx).chain(self.0.layout_lm_head(ctx).unwrap())
             }
         }
-        let lctx = LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false };
+        let lctx = LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false };
         let mut gpu = gpu_client().await;
         crate::interpreters::eval_load(&EmbLoad(&embed), &mut gpu, &esrc, &lctx)
             .await
@@ -1667,14 +1667,14 @@ mod tests {
             eprintln!("skip: OWL_TEST_DEVICE 未设");
             return;
         }
-        let Ok(dir) = std::env::var("OWL_DFLASH2_DIR") else {
+        let Some(dir) = owl_shared::env_reader::str("OWL_DFLASH2_DIR") else {
             eprintln!("skip: OWL_DFLASH2_DIR 未设");
             return;
         };
         use crate::module::{LoaderCtx, Loadable};
         use owl_iface::DeviceClient as _;
         let mut gpu = gpu_client().await;
-        let lctx = LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false };
+        let lctx = LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false };
         let draft = DFlash2Draft::new_with_plan(
             5120, 17408, 32, 8, 128, 5, 1e-6, 248320, QuantPlan::W4A16, false,
         );
@@ -1898,7 +1898,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             path.replace("testdata", "../../testdata")
         );
-        let bytes = std::fs::read(&full).expect("golden 读");
+        let bytes = owl_shared::file_loader::read(&full).expect("golden 读");
         // 正规解析(safetensors crate;手写扫描器会被 __metadata__ 吞掉
         // 头部前几个键 —— 2026-10-07 对拍乱象根源之一)
         let st = safetensors::SafeTensors::deserialize(&bytes).expect("golden 头解析");
@@ -1942,7 +1942,7 @@ mod tests {
         src.insert("q_norm".into(), gen(hd, 26.0));
 
         let mut gpu = gpu_client().await;
-        crate::interpreters::eval_load(&attn, &mut gpu, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false })
+        crate::interpreters::eval_load(&attn, &mut gpu, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false })
             .await
             .expect("attn 装载");
 
@@ -1964,7 +1964,7 @@ mod tests {
             block_tables: bt,
         };
         let rope = Rope::new(64, hd, hd, 10_000.0).expect("rope");
-        crate::interpreters::eval_load(&rope, &mut gpu, &rope.tables(), &LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false })
+        crate::interpreters::eval_load(&rope, &mut gpu, &rope.tables(), &LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false })
             .await
             .expect("rope 表");
 
@@ -2243,7 +2243,7 @@ mod tests {
         let mut src: HashMap<String, Vec<f32>> = HashMap::new();
         src.insert("base_kernel".into(), base.clone());
         src.insert("kernel_projection".into(), w_proj.clone());
-        crate::interpreters::eval_load(&conv, &mut gpu, &src, &LoaderCtx { dtype: Dtype::BF16, shard: 1, device_repack: false })
+        crate::interpreters::eval_load(&conv, &mut gpu, &src, &LoaderCtx { dtype: Dtype::BF16, shard: 1, device_repack: false, verify: false, debug_tap: false })
             .await
             .expect("conv bf16 装载");
 
@@ -2326,7 +2326,7 @@ mod tests {
         src2.insert("hidden_projection".into(), w2.clone());
         src2.insert("predecessor_codebook".into(), a_tab.clone());
         src2.insert("successor_codebook".into(), b_tab.clone());
-        crate::interpreters::eval_load(&sel, &mut gpu, &src2, &LoaderCtx { dtype: Dtype::BF16, shard: 1, device_repack: false })
+        crate::interpreters::eval_load(&sel, &mut gpu, &src2, &LoaderCtx { dtype: Dtype::BF16, shard: 1, device_repack: false, verify: false, debug_tap: false })
             .await
             .expect("selector bf16 装载");
         let hidden_h = gen((rows + 1) * rank, 6.0);
@@ -2418,14 +2418,14 @@ mod tests {
             eprintln!("skip: OWL_TEST_DEVICE 未设");
             return Ok(());
         }
-        let Ok(dir) = std::env::var("OWL_DFLASH2_DIR") else {
+        let Some(dir) = owl_shared::env_reader::str("OWL_DFLASH2_DIR") else {
             eprintln!("skip: OWL_DFLASH2_DIR 未设");
             return Ok(());
         };
         use crate::module::{LoaderCtx, Loadable};
         use owl_iface::DeviceClient as _;
         let mut gpu = gpu_client().await;
-        let lctx = LoaderCtx { dtype: Dtype::BF16, shard: 1, device_repack: false };
+        let lctx = LoaderCtx { dtype: Dtype::BF16, shard: 1, device_repack: false, verify: false, debug_tap: false };
         let draft = DFlash2Draft::new_with_plan_dt(
             5120, 17408, 32, 8, 128, 5, 1e-6, 248320, QuantPlan::W4A16, Dtype::BF16, false,
         );
@@ -2447,7 +2447,7 @@ mod tests {
         };
         let (hq, hkv, hd, hidden) = (32usize, 8usize, 128usize, 5120usize);
         let rope = Rope::new(262_144, hd, hd, 1.0e7).expect("rope");
-        crate::interpreters::eval_load(&rope, &mut gpu, &rope.tables(), &LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false })
+        crate::interpreters::eval_load(&rope, &mut gpu, &rope.tables(), &LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false })
             .await
             .expect("rope 表");
 

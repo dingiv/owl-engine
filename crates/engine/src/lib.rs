@@ -49,7 +49,7 @@ pub(crate) mod state;
 #[cfg(test)]
 mod tests;
 
-pub use engine::{Engine, EngineConfig};
+pub use engine::{Engine, EngineConfig, EngineKnobs};
 pub use loader::{LoadedModel, ModelLoader};
 pub use running::RunningEngine;
 pub use graph_plan::{GraphPlan, GraphPlanDesc, PlanOutcome};

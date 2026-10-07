@@ -18,16 +18,18 @@ async fn main() {
         .cloned()
         .unwrap_or_else(|| "请用一句话介绍你自己。".into());
     let max_new: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(24);
-    let ordinal: usize = std::env::var("OWL_TEST_DEVICE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    let ordinal: usize = owl_shared::env_reader::parse_or("OWL_TEST_DEVICE", 0);
 
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../models/assets/Qwen3.5-0.8B");
 
     // ── 生命周期:构造(不执行)→ 装载 → run(进入执行态)→ 提交/泵 ──
     let t0 = std::time::Instant::now();
-    let mut engine = Engine::new(EngineConfig { device_ordinal: ordinal, max_seq_tokens: 64, prefill_chunk: 32 })
+    let mut engine = Engine::new(EngineConfig {
+        device_ordinal: ordinal,
+        max_seq_tokens: 64,
+        prefill_chunk: 32,
+        knobs: owl_engine::EngineKnobs::default(),
+    })
         .expect("engine 构造");
     let model = engine
         .loader()

@@ -154,6 +154,7 @@ impl Model {
             seq_cu: ctx.seq_cu,
             gdn_tap: ctx.gdn_tap.clone(),
             env: ctx.env,
+            trace_gate: ctx.trace_gate,
             gdn_slot_host: ctx.gdn_slot_host,
             ts_buf: ctx.ts_buf.clone(),
             attn_v2: ctx.attn_v2.clone(),

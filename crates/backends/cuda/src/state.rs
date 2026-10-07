@@ -10,16 +10,56 @@ use owl_iface::contract::ModelError;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// 捕获 slab 容量(默认 64 MiB;图内 Alloc 从 slab 切块,零 cudaMalloc)。
-/// E5-M4:env 可调(OWL_CAPTURE_SLAB_MB)—— 24G 贴顶的 27B + spec
-/// 双图(decode + verify)场景,verify 图按需调小。
-pub(super) fn capture_slab_bytes() -> usize {
-    std::env::var("OWL_CAPTURE_SLAB_MB")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(64)
-        << 20
+/// 设备上下文诊断/调优选项(**显式依赖律,2026-10-10**:env 派生数据由
+/// 入口/测试经本结构显式传入,设备路径零 env 读取)。
+/// [`DiagOpts::from_env`] 是入口侧构造器(server config / 测试用例)。
+#[derive(Clone, Debug, Default)]
+pub struct DiagOpts {
+    /// 逐命令/图节点计时(原 OWL_SRV_TIMING)
+    pub srv_timing: bool,
+    /// 捕获期插桩(原 OWL_CAP_PROF)
+    pub cap_prof: bool,
+    /// 图回放后同步归因(原 OWL_LAUNCH_SYNC;诊断用,性能杀手勿常开)
+    pub launch_sync: bool,
+    /// 旁路事件钉序(原 OWL_FREE_LEGACY;崩坏案 A/B 判别)
+    pub free_legacy: bool,
+    /// 图实例化旗标(原 OWL_GRAPH_FLAGS;UPLOAD=2 / DEVICE_LAUNCH=4)
+    pub graph_flags: u64,
+    /// 捕获 slab 固定档 MiB(None = warmup 计量定量;原 OWL_CAPTURE_SLAB_MB
+    /// —— 24G 贴顶的 27B + spec 双图场景,verify 图按需调小)
+    pub capture_slab_mb: Option<usize>,
+    /// nvrtc include 目录(None = 缺省 /usr/local/cuda/include;
+    /// 入口自 CUDA_HOME/CUDA_PATH 解析)
+    pub nvrtc_include: Option<std::path::PathBuf>,
+}
+
+impl DiagOpts {
+    /// **入口侧构造器**(server config / 测试用例专用;设备路径零 env)
+    pub fn from_env() -> Self {
+        Self {
+            srv_timing: owl_shared::env_reader::flag("OWL_SRV_TIMING"),
+            cap_prof: owl_shared::env_reader::flag("OWL_CAP_PROF"),
+            launch_sync: owl_shared::env_reader::flag("OWL_LAUNCH_SYNC"),
+            free_legacy: owl_shared::env_reader::flag("OWL_FREE_LEGACY"),
+            graph_flags: owl_shared::env_reader::parse_or("OWL_GRAPH_FLAGS", 0),
+            capture_slab_mb: owl_shared::env_reader::parse("OWL_CAPTURE_SLAB_MB"),
+            nvrtc_include: None, // CUDA_HOME 解析见下方 env 兼容帮助函数
+        }
+        .with_nvrtc_from_env()
+    }
+
+    /// CUDA_HOME/CUDA_PATH → nvrtc include(入口构造器专用)
+    fn with_nvrtc_from_env(mut self) -> Self {
+        if self.nvrtc_include.is_none() {
+            if let Some(home) = owl_shared::env_reader::str("CUDA_HOME")
+                .or_else(|| owl_shared::env_reader::str("CUDA_PATH"))
+            {
+                self.nvrtc_include =
+                    Some(std::path::PathBuf::from(home).join("include"));
+            }
+        }
+        self
+    }
 }
 
 // 流身份证(server 内部路由键;客户端不可见 —— 三固定流是 server 策略)
@@ -79,6 +119,8 @@ pub(super) enum Block {
 
 pub(super) struct GpuCtx {
     pub ctx: Arc<CudaContext>,
+    /// 诊断/调优选项(入口显式传入;显式依赖律)
+    pub(super) diag: DiagOpts,
     /// 流注册表:三固定流(H2D/COMPUTE/D2H;客户端不可自创)
     streams: HashMap<StreamId, Arc<CudaStream>>,
     /// 图捕获状态机(见 graph_begin/end 的护栏注释)
@@ -135,7 +177,7 @@ impl Drop for GraphHolder {
 }
 
 impl GpuCtx {
-    pub(super) fn new(selector: &DeviceSelector) -> Result<Self, String> {
+    pub(super) fn new(selector: &DeviceSelector, diag: DiagOpts) -> Result<Self, String> {
         let ordinal = selector.resolve()?;
         let ctx = CudaContext::new(ordinal).map_err(|e| format!("{e:?}"))?;
         ctx.bind_to_thread().map_err(|e| format!("{e:?}"))?;
@@ -165,10 +207,11 @@ impl GpuCtx {
         }
         Ok(Self {
             ctx,
+            diag: diag.clone(),
             streams,
             ordinal,
-            srv_timing: std::env::var_os("OWL_SRV_TIMING").is_some(),
-            cap_prof: std::env::var_os("OWL_CAP_PROF").is_some(),
+            srv_timing: diag.srv_timing,
+            cap_prof: diag.cap_prof,
             capture: None,
             graphs: HashMap::new(),
             next_graph: 1,
@@ -217,13 +260,10 @@ impl GpuCtx {
         stream
             .synchronize()
             .map_err(|e| ModelError::Msg(format!("graph_begin: 预排空失败 {e:?}")))?;
-        // slab 容量三档:env 显式 = 固定档(兼容);缺省 = warmup 计量
+        // slab 容量三档:diag 固定档(兼容);缺省 = warmup 计量
         // hint(见 owl_shared::slab_hint;满额 × 图数 = VRAM 爆的工程债);
         // hint 缺席 = 64MiB 兜底
-        let env_mb = std::env::var("OWL_CAPTURE_SLAB_MB")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&v| v > 0);
+        let env_mb = self.diag.capture_slab_mb.filter(|&v| v > 0);
         let slab_cap = match env_mb {
             Some(mb) => mb << 20,
             None => owl_shared::slab_hint::take_hint().unwrap_or(64 << 20),
@@ -269,7 +309,7 @@ impl GpuCtx {
         let mut exec: crate::ffi::sys::CUgraphExec = std::ptr::null_mut();
         // 刀D:实例化旗标 A/B 门(UPLOAD=2 预热 / DEVICE_LAUNCH=4 设备侧
         // 派发;派发税 10.8µs/节点 vs vLLM ~1.4 立案的根因排查面)
-        let flags: u64 = std::env::var("OWL_GRAPH_FLAGS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let flags: u64 = self.diag.graph_flags;
         unsafe { crate::ffi::sys::cuGraphInstantiateWithFlags(&mut exec, cu_graph, flags) }
             .result()
             .map_err(|e| ModelError::Msg(format!("graph_end: 实例化(flags={flags}): {e:?}")))?;
@@ -403,8 +443,8 @@ impl GpuCtx {
         if prof {
             eprintln!("[gl-prof] gid={gid} launch={:?}", t0.unwrap().elapsed());
         }
-        // 诊断开关(OWL_LAUNCH_SYNC=1):回放后同步归因(烘焙指针消费者)
-        if std::env::var_os("OWL_LAUNCH_SYNC").is_some() {
+        // 诊断开关(diag.launch_sync):回放后同步归因(烘焙指针消费者)
+        if self.diag.launch_sync {
             let t1 = std::time::Instant::now();
             stream
                 .synchronize()
@@ -502,11 +542,8 @@ impl GpuCtx {
         let any_owned = ids
             .iter()
             .any(|id| self.blocks.get(id).is_some_and(|(b, _)| matches!(b, Block::Owned(_))));
-        // OWL_FREE_LEGACY=1:旁路事件钉序(崩坏案 A/B 判别;性能画像用)
-        if any_owned
-            && self.capture.is_none()
-            && std::env::var_os("OWL_FREE_LEGACY").is_none()
-        {
+        // diag.free_legacy:旁路事件钉序(崩坏案 A/B 判别;性能画像用)
+        if any_owned && self.capture.is_none() && !self.diag.free_legacy {
             if let (Ok(comp), Ok(h2d), Ok(d2h)) = (
                 self.stream(STREAM_COMPUTE),
                 self.stream(STREAM_H2D),
@@ -549,11 +586,13 @@ impl GpuCtx {
 
 pub(super) struct KernelCache {
     compiled: HashMap<String, CudaFunction>,
+    /// nvrtc include 目录(DiagOpts.nvrtc_include,boot 注入;显式依赖律)
+    nvrtc_include: Option<std::path::PathBuf>,
 }
 
 impl KernelCache {
-    pub(super) fn new() -> Self {
-        Self { compiled: HashMap::new() }
+    pub(super) fn new(nvrtc_include: Option<std::path::PathBuf>) -> Self {
+        Self { compiled: HashMap::new(), nvrtc_include }
     }
 
     /// 懒编译:CUDA C 源 → nvrtc → PTX → module → function(命中缓存直返)
@@ -568,10 +607,10 @@ impl KernelCache {
         }
         // include 路径:cuda_fp16.h 等 CUDA 头(f16 基线 F2;nvrtc 默认
         // 搜索表为空,需显式给 toolkit include 目录)
-        let cuda_include = std::env::var("CUDA_HOME")
-            .or_else(|_| std::env::var("CUDA_PATH"))
-            .map(|h| std::path::PathBuf::from(h).join("include"))
-            .unwrap_or_else(|_| std::path::PathBuf::from("/usr/local/cuda/include"));
+        let cuda_include = self
+            .nvrtc_include
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("/usr/local/cuda/include"));
         let opts = CompileOptions {
             arch: Some("compute_86"),
             include_paths: vec![cuda_include.to_string_lossy().into_owned()],
