@@ -6,13 +6,17 @@
 //!   debug 展开 / release 零开销)—— 2026-10-01 自 owl-metrics 独立
 //!   crate 收编回本 crate(减 crate 面;宏经 `#[macro_export]` 落本
 //!   crate 根,`owl_shared::timer_start!` 调用路径不变)。
-//! - [`env_reader`]:环境变量统一读取面(全 workspace 唯一 std::env
-//!   访问口;解析失败降级可见 + EnvGuard 测试防踩踏;build.rs 例外);
+//! - [`config`]:**全量配置总账 + 统一 loader**(OwlConfig 十 module
+//!   强类型;枚举严格 fail-fast;入口一次加载,消费方 from_config 零
+//!   env 直读 —— 显式依赖律终点,2026-10-10);
+//! - [`env_reader`]:环境变量读取原语(flag/str/parse + EnvGuard;
+//!   config loader 的底层;应用代码勿直用 —— 走 [`config`]);
 //! - [`file_loader`]:文件读写统一入口(std::fs 薄包装,未来统一
 //!   控制点留口;应用运行时文件 I/O 一律经此;build.rs 例外)。
 
 pub use owl_iface::signal;
 
+pub mod config;
 pub mod env_reader;
 pub mod file_loader;
 pub mod metrics;

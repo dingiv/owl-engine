@@ -126,16 +126,16 @@ struct ServerProbes {
 }
 
 impl ServerProbes {
-    fn from_env() -> Self {
-        let has = |k: &str| owl_shared::env_reader::flag(k);
+    /// **入口侧组装器**:设备旗标自 DiagOpts 一体搬运,debug 自引擎探针
+    fn from_parts(diag: &crate::state::DiagOpts, debug: bool) -> Self {
         Self {
-            gpu_prof: has("OWL_GPU_PROF"),
-            launch_time: has("OWL_LAUNCH_TIME"),
-            launch_sync: has("OWL_LAUNCH_SYNC"),
-            d2h_prof: has("OWL_D2H_PROF"),
-            cap_prof: has("OWL_CAP_PROF"),
-            srv_timing: has("OWL_SRV_TIMING"),
-            debug: has("OWL_DEBUG"),
+            gpu_prof: diag.gpu_prof,
+            launch_time: diag.launch_time,
+            launch_sync: diag.launch_sync,
+            d2h_prof: diag.d2h_prof,
+            cap_prof: diag.cap_prof,
+            srv_timing: diag.srv_timing,
+            debug,
         }
     }
 }
@@ -238,15 +238,17 @@ impl GpuServer {
         selector: DeviceSelector,
         boot: Option<mpsc::Sender<Result<(), String>>>,
     ) -> Self {
-        Self::with_diag(rx, selector, boot, crate::state::DiagOpts::default())
+        Self::with_diag(rx, selector, boot, crate::state::DiagOpts::default(), false)
     }
 
-    /// 带设备诊断选项构造(显式依赖律入口;`new` = Default 便捷糖)
+    /// 带设备诊断选项构造(显式依赖律入口;`new` = Default 便捷糖;
+    /// debug = 引擎探针侧通用诊断旗标)
     pub fn with_diag(
         rx: mpsc::Receiver<Command>,
         selector: DeviceSelector,
         boot: Option<mpsc::Sender<Result<(), String>>>,
         diag: crate::state::DiagOpts,
+        debug: bool,
     ) -> Self {
         Self {
             rx,
@@ -263,7 +265,7 @@ impl GpuServer {
             gdn_scalar: None,
             dispatch: None,
             timings: Vec::new(),
-            probes: ServerProbes::from_env(),
+            probes: ServerProbes::from_parts(&diag, debug),
             diag,
         }
     }

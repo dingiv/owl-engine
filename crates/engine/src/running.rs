@@ -108,24 +108,23 @@ pub struct StepProbes {
 }
 
 impl StepProbes {
-    /// **入口侧构造器**(server config / 测试用例专用;引擎内部零 env)
-    pub fn from_env() -> Self {
-        let has = |k: &str| owl_shared::env_reader::flag(k);
+    /// **入口侧组装器**:自全量配置对象显式组装(引擎内部零 env 读取)
+    pub fn from_config(cfg: &owl_shared::config::OwlConfig) -> Self {
+        let p = &cfg.probes;
         Self {
-            step_profile: has("OWL_STEP_PROFILE"),
-            gdn_dump: has("OWL_GDN_DUMP"),
-            debug: has("OWL_DEBUG"),
-            prefill_cksum: has("OWL_PREFILL_CKSUM"),
-            fact_probe: has("OWL_FACT_PROBE"),
-            degrade_after: owl_shared::env_reader::parse_or("OWL_SPEC_DEGRADE_AFTER", 6),
-            probe_every: owl_shared::env_reader::parse_or("OWL_SPEC_PROBE_EVERY", 64)
-                .max(1),
-            trace_gate: has("OWL_TRACE_GATE"),
-            dflash_probe: has("OWL_DFLASH_PROBE"),
-            propose_eager: has("OWL_PROPOSE_EAGER"),
-            dflash_eager: has("OWL_DFLASH_EAGER"),
-            dflash_noencode: has("OWL_DFLASH_NOENCODE"),
-            dflash_dumb: has("OWL_DFLASH_DUMB"),
+            step_profile: p.step_profile,
+            gdn_dump: p.gdn_dump,
+            debug: p.debug,
+            prefill_cksum: p.prefill_cksum,
+            fact_probe: p.fact_probe,
+            degrade_after: cfg.spec.degrade_after,
+            probe_every: cfg.spec.probe_every,
+            trace_gate: p.trace_gate,
+            dflash_probe: p.dflash_probe,
+            propose_eager: p.propose_eager,
+            dflash_eager: p.dflash_eager,
+            dflash_noencode: p.dflash_noencode,
+            dflash_dumb: p.dflash_dumb,
         }
     }
 }

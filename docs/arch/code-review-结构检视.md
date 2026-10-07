@@ -262,3 +262,57 @@ embed → 48×(GDN|attn 层:投影 marlin → conv → 门控/递推/归一 → 
 - server 冒烟:health/chat 非流式(usage 15/17)+ 流式 [DONE] ✓,GPU 清零
 - 生产面 env 直读清点:**0 处**(仅入口构造器 + 测试域 + build.rs/driver.rs
   两例外)
+
+
+---
+
+## 七、执行实录(2026-10-10 深夜Ⅶ,显式配置模块:全量总账 + 统一 loader)
+
+> 起点 = 用户裁决:配置读取收敛后还要消灭**配置定义散点** —— 全量配置
+> 约定总量一处登记,loader 一函数加载返回强类型对象;对象展开为多个
+> config module,每 module 管一个功能域;枚举严格枚举,不许 String
+> 和稀泥;消费点硬编码配置散点全部消灭。
+
+### 终态:`owl_shared::config`
+
+- **`OwlConfig`** 十 module:`runtime`(device/max_seq/chunk/test_device/
+  server_url/bind)/ `model`(kind 枚举/dir/name/awq27b_dir/dflash2_dir)/
+  `pool`(池几何 + vram 预算 + prefix_cache)/ `spec`(三态/草稿量化/
+  B4 参数/tap 诊断)/ `sampling`(mode 枚举 + 三维 + rep)/ `load`/
+  `dispatch`(解释器分派 12 旋钮,EnvProvider 组装源)/ `probes`(16 旗标)/
+  `cuda`(7 诊断旗标 + graph_flags 枚举 + slab + nvrtc)/ `graph`(no_graph)。
+- **总账**:模块 doc 全键登记表(键/类型/缺省/module)—— 新键必须登记,
+  禁止账外键;测试私有旋钮与构建期键显式列为账外。
+- **唯一 loader**:`OwlConfig::from_env()`;**严格枚举 fail-fast**:
+  ModelKind/SamplerMode/GraphInstantiateFlags 非法值 = Err 拒启(消息带
+  合法值);数值解析失败 = warn + 缺省(env_reader 降级可见)。
+  `bool_strict`:PREFIX_CACHE 的 `!= "0"` 和稀泥解析废除(0/false/off/
+  1/true/on 白名单)。
+
+### 类型严格化三案(和稀泥清零)
+
+| 键 | 原形态 | 终态 |
+|---|---|---|
+| OWL_MODEL_KIND | server 私有枚举 | `ModelKind` 枚举(总账;非法拒启) |
+| OWL_SAMPLER | `v != "greedy"` 字符串和稀泥(打错字静默采样) | `SamplerMode` 枚举(非法拒启) |
+| OWL_GRAPH_FLAGS | 裸 u64 魔数(2/4) | `GraphInstantiateFlags` 位面枚举(to_bits 唯一出口) |
+
+### 消费方组装链(全部 from_config,零散点 parse)
+
+```
+main → ServerConfig::from_env
+         └─ OwlConfig::from_env()(唯一 loader)
+             ├─ EngineKnobs::from_config(&cfg)   ← StepProbes/SamplerCfg/DiagOpts 同源
+             │     └─ EnvProvider::from_dispatch(&cfg.dispatch)
+             └─ app 面(bind/model_dir/kind/name/device/max_seq/chunk)
+```
+
+原 `EngineKnobs/StepProbes/SamplerCfg/DiagOpts/ServerProbes/EnvProvider`
+六个 from_env 散点构造器全部删除;`sampler::enabled()` 删除(mode 枚举)。
+
+### 回归
+
+- shared **25/25**(config 4 新测:缺省/枚举拒启/合法值/布尔白名单)
+- engine **38/38** / models **116/116**(串行)/ workspace --all-targets 绿
+- server 冒烟:health/chat(usage 15/15)✓,GPU 清零
+- 生产面 env 直读终态:**config loader 一处**(tests/build.rs/driver.rs 例外不变)

@@ -39,26 +39,14 @@ impl Default for SamplerCfg {
 }
 
 impl SamplerCfg {
-    /// **入口侧构造器**(server config / 测试用例专用;引擎内部经
-    /// EngineKnobs.sampler 显式携带,热路径零 env 读取)
-    pub fn from_env() -> Self {
-        let f = |k: &str, d: f32| -> f32 {
-            owl_shared::env_reader::parse_or(k, d)
-        };
-        SamplerCfg {
-            temp: f("OWL_TEMP", 1.0),
-            topk: f("OWL_TOPK", 20.0) as usize,
-            topp: f("OWL_TOPP", 0.95),
-            rep_penalty: f("OWL_REP_PENALTY", 1.15),
-        }
+    /// **入口侧组装器**:自全量配置 sampling module 显式搬运
+    /// (引擎内部经 EngineKnobs.sampler 携带,热路径零 env 读取)
+    pub fn from_sampling(s: &owl_shared::config::SamplingCfg) -> Self {
+        SamplerCfg { temp: s.temp, topk: s.topk, topp: s.topp, rep_penalty: s.rep_penalty }
     }
 }
 
-/// 采样开关映射(默认开 = 成功推理的默认姿势;OWL_SAMPLER=greedy 关)。
-/// **入口侧构造器**:引擎内部经 EngineKnobs.sampler_enabled 显式携带。
-pub fn enabled() -> bool {
-    owl_shared::env_reader::str("OWL_SAMPLER").map(|v| v != "greedy").unwrap_or(true)
-}
+
 
 /// xorshift64* 步进(返回 64 位;调用方持有 state)
 fn xorshift(state: &mut u64) -> u64 {

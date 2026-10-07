@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 /// 设备上下文诊断/调优选项(**显式依赖律,2026-10-10**:env 派生数据由
 /// 入口/测试经本结构显式传入,设备路径零 env 读取)。
-/// [`DiagOpts::from_env`] 是入口侧构造器(server config / 测试用例)。
+/// [`DiagOpts::from_config`] 是入口侧组装器(server config / 测试用例)。
 #[derive(Clone, Debug, Default)]
 pub struct DiagOpts {
     /// 逐命令/图节点计时(原 OWL_SRV_TIMING)
@@ -23,7 +23,14 @@ pub struct DiagOpts {
     pub launch_sync: bool,
     /// 旁路事件钉序(原 OWL_FREE_LEGACY;崩坏案 A/B 判别)
     pub free_legacy: bool,
-    /// 图实例化旗标(原 OWL_GRAPH_FLAGS;UPLOAD=2 / DEVICE_LAUNCH=4)
+    /// server 提交计时(server probes 面;DiagOpts 一体携带免双参)
+    pub launch_time: bool,
+    /// dtoh 分相(server probes 面)
+    pub d2h_prof: bool,
+    /// 逐核归因(server probes 面)
+    pub gpu_prof: bool,
+    /// 图实例化旗标(原 OWL_GRAPH_FLAGS;UPLOAD=2 / DEVICE_LAUNCH=4;
+    /// 类型化位面经 OwlConfig.cuda.graph_flags → to_bits())
     pub graph_flags: u64,
     /// 捕获 slab 固定档 MiB(None = warmup 计量定量;原 OWL_CAPTURE_SLAB_MB
     /// —— 24G 贴顶的 27B + spec 双图场景,verify 图按需调小)
@@ -34,31 +41,21 @@ pub struct DiagOpts {
 }
 
 impl DiagOpts {
-    /// **入口侧构造器**(server config / 测试用例专用;设备路径零 env)
-    pub fn from_env() -> Self {
+    /// **入口侧组装器**:自全量配置对象显式组装(设备路径零 env 读取)
+    pub fn from_config(cfg: &owl_shared::config::OwlConfig) -> Self {
+        let c = &cfg.cuda;
         Self {
-            srv_timing: owl_shared::env_reader::flag("OWL_SRV_TIMING"),
-            cap_prof: owl_shared::env_reader::flag("OWL_CAP_PROF"),
-            launch_sync: owl_shared::env_reader::flag("OWL_LAUNCH_SYNC"),
-            free_legacy: owl_shared::env_reader::flag("OWL_FREE_LEGACY"),
-            graph_flags: owl_shared::env_reader::parse_or("OWL_GRAPH_FLAGS", 0),
-            capture_slab_mb: owl_shared::env_reader::parse("OWL_CAPTURE_SLAB_MB"),
-            nvrtc_include: None, // CUDA_HOME 解析见下方 env 兼容帮助函数
+            srv_timing: c.srv_timing,
+            cap_prof: c.cap_prof,
+            launch_sync: c.launch_sync,
+            free_legacy: c.free_legacy,
+            launch_time: c.launch_time,
+            d2h_prof: c.d2h_prof,
+            gpu_prof: c.gpu_prof,
+            graph_flags: c.graph_flags.to_bits(),
+            capture_slab_mb: c.capture_slab_mb,
+            nvrtc_include: c.nvrtc_include.clone(),
         }
-        .with_nvrtc_from_env()
-    }
-
-    /// CUDA_HOME/CUDA_PATH → nvrtc include(入口构造器专用)
-    fn with_nvrtc_from_env(mut self) -> Self {
-        if self.nvrtc_include.is_none() {
-            if let Some(home) = owl_shared::env_reader::str("CUDA_HOME")
-                .or_else(|| owl_shared::env_reader::str("CUDA_PATH"))
-            {
-                self.nvrtc_include =
-                    Some(std::path::PathBuf::from(home).join("include"));
-            }
-        }
-        self
     }
 }
 

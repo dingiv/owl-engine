@@ -136,35 +136,41 @@ impl Default for EngineKnobs {
 }
 
 impl EngineKnobs {
-    /// **入口侧构造器**(server config / 测试用例专用;引擎内部零 env
-    /// 读取 —— 本函数是全引擎 env → 旋钮的唯一映射点,新增旋钮在
-    /// 此登记)
-    pub fn from_env() -> Self {
+    /// **入口侧组装器**(server config / 测试用例专用):自全量配置对象
+    /// [`owl_shared::config::OwlConfig`] 显式组装,引擎内部零 env 读取。
+    /// env → OwlConfig 的映射统一在 config loader(总账唯一登记点);
+    /// 本函数只做 module → 旋钮的字段搬运。
+    pub fn from_config(cfg: &owl_shared::config::OwlConfig) -> Self {
         Self {
-            probes: crate::running::StepProbes::from_env(),
-            pool_tokens: owl_shared::env_reader::parse("OWL_POOL_TOKENS"),
-            spec_depth: owl_shared::env_reader::parse_or("OWL_SPEC_DEPTH", 0),
-            spec_dumb: owl_shared::env_reader::flag("OWL_SPEC_DUMB"),
-            dflash2_dir: owl_shared::env_reader::str("OWL_DFLASH2_DIR"),
-            draft_kv_fp8: owl_shared::env_reader::flag("OWL_DFLASH_KV_FP8"),
-            prefix_cache: owl_shared::env_reader::str("OWL_PREFIX_CACHE").map(|v| v != "0").unwrap_or(true),
-            no_graph: owl_shared::env_reader::flag("OWL_NO_GRAPH"),
-            ts_probe: owl_shared::env_reader::flag("OWL_TS_PROBE"),
-            gdn_slots: owl_shared::env_reader::parse_or("OWL_GDN_SLOTS", 8),
-            snap_max: owl_shared::env_reader::parse_or("OWL_SNAP_MAX", 4),
-            vram_target: owl_shared::env_reader::parse_or("OWL_VRAM_TARGET", 0.97),
-            vram_reserve_mb: owl_shared::env_reader::parse_or("OWL_VRAM_RESERVE_MB", 1024u64),
-            raw_completion: owl_shared::env_reader::flag("OWL_RAW_COMPLETION"),
-            sampler_enabled: crate::sampler::enabled(),
-            sampler: crate::sampler::SamplerCfg::from_env(),
-            gdn_dump_all: owl_shared::env_reader::flag("OWL_GDN_DUMP_ALL"),
-            pf_bisect: owl_shared::env_reader::flag("OWL_PF_BISECT"),
-            pf_stages: owl_shared::env_reader::parse("OWL_PF_STAGES"),
-            pf_fin_check: owl_shared::env_reader::flag("OWL_PF_FIN_CHECK"),
-            cuda: owl_cuda::DiagOpts::from_env(),
-            dflash_notaps: owl_shared::env_reader::flag("OWL_DFLASH_NOTAPS"),
-            dflash_tapdecl: owl_shared::env_reader::flag("OWL_DFLASH_TAPDECL"),
-            env: owl_models::env::EnvProvider::from_env(),
+            probes: crate::running::StepProbes::from_config(cfg),
+            pool_tokens: cfg.pool.pool_tokens,
+            spec_depth: cfg.spec.depth,
+            spec_dumb: cfg.spec.dumb,
+            dflash2_dir: cfg.model.dflash2_dir.clone(),
+            draft_kv_fp8: cfg.spec.draft_kv_fp8,
+            prefix_cache: cfg.pool.prefix_cache,
+            no_graph: cfg.graph.no_graph,
+            ts_probe: cfg.dispatch.ts_probe,
+            gdn_slots: cfg.pool.gdn_slots,
+            snap_max: cfg.pool.snap_max,
+            vram_target: cfg.pool.vram_target,
+            vram_reserve_mb: cfg.pool.vram_reserve_mb,
+            raw_completion: cfg.probes.raw_completion,
+            sampler_enabled: cfg.sampling.mode == owl_shared::config::SamplerMode::Sampling,
+            sampler: crate::sampler::SamplerCfg {
+                temp: cfg.sampling.temp,
+                topk: cfg.sampling.topk,
+                topp: cfg.sampling.topp,
+                rep_penalty: cfg.sampling.rep_penalty,
+            },
+            gdn_dump_all: cfg.probes.gdn_dump_all,
+            pf_bisect: cfg.probes.pf_bisect,
+            pf_stages: cfg.probes.pf_stages,
+            pf_fin_check: cfg.probes.pf_fin_check,
+            cuda: owl_cuda::DiagOpts::from_config(cfg),
+            dflash_notaps: cfg.spec.notaps,
+            dflash_tapdecl: cfg.spec.tapdecl,
+            env: owl_models::env::EnvProvider::from_dispatch(&cfg.dispatch),
         }
     }
 }
@@ -205,6 +211,7 @@ impl Engine<GpuClient> {
         let face = GpuClient::spawn_with(
             DeviceSelector::Ordinal(cfg.device_ordinal),
             cfg.knobs.cuda.clone(),
+            cfg.knobs.probes.debug,
         )
             .map_err(|e| ModelError::Msg(format!("engine: gpu 绑定失败 {e:?}")))?;
         Self::on(cfg, face)

@@ -7,7 +7,8 @@
 //! 解释器按它执行。
 //!
 //! **被动律**(charter A):环境必传参,kernels/解释器零探测 —— 本对象是
-//! 「引擎 = 事实来源」的载体;std::env 读取**只**发生在 [`EnvProvider::from_env`]
+//! 「引擎 = 事实来源」的载体;env 读取统一在 owl_shared::config loader,
+//! 本对象经 [`EnvProvider::from_dispatch`] 显式组装
 //! (ops 工作流兼容面),组件内部禁止直读环境变量。
 //!
 //! **单一来源**:
@@ -204,32 +205,32 @@ impl EnvProvider {
         Self { hw: HwEnv::Cuda(arch), ..Self::default() }
     }
 
-    /// env-var 兼容构造(ops 工作流;组件内部禁止直读环境变量)。
-    /// 硬件档不在 env(引擎 boot 从 iface `op_env()` 合入)。
-    pub fn from_env() -> Self {
-        let has = |k: &str| owl_shared::env_reader::flag(k);
+    /// **入口侧组装器**:自全量配置 dispatch module 显式组装
+    /// (owl_shared::config::OwlConfig;组件内部禁止直读环境变量)。
+    /// 硬件档不在 config(引擎 boot 从 iface `op_env()` 合入)。
+    /// 分派缺省:D1/D1-v2/qkv 融合生产默认开(2026-10-04 定谳)。
+    pub fn from_dispatch(d: &owl_shared::config::DispatchCfg) -> Self {
         Self {
             attn: AttnEnv {
-                // W2 qkv 融合:**生产默认开**(2026-10-04;k-probe 硬门 +
-                // 27B e2e 逐字一致后与 D1 同律翻默认;反开关退出)
-                qkv_fuse: !has("OWL_QKV_NO_FUSE"),
-                prefill_split: has("OWL_PREFILL_SPLIT"),
-                force_naive_prefill: has("OWL_FORCE_NAIVE"),
-                fi: has("OWL_FLASHINFER"),
+                qkv_fuse: !d.qkv_fuse_off,
+                prefill_split: d.prefill_split,
+                force_naive_prefill: d.force_naive_prefill,
+                fi: d.flashinfer,
             },
             gdn: GdnEnv {
-                chunked: has("OWL_GDN_CHUNKED"),
-                scalar: has("OWL_GDN_SCALAR"),
-                fused_decode: !has("OWL_GDN_NO_FUSE_DECODE"), // D1 默认开;反开关退出
-                // D1-v2 默认开(2026-10-04 深夜:金标 + 27B 金标逐字一致 +
-                // 步时 23.8→23.3ms 三重验证后翻;反开关退出)
-                fused_decode_v2: !has("OWL_GDN_NO_FUSE_DECODE_V2"),
+                chunked: d.gdn_chunked,
+                scalar: d.gdn_scalar,
+                fused_decode: !d.gdn_no_fuse_decode,
+                fused_decode_v2: !d.gdn_no_fuse_decode_v2,
             },
-            kv: KvEnv { quant: if has("OWL_KV_FP8") { KvQuant::Fp8E4M3 } else { KvQuant::None }, ..KvEnv::default() },
+            kv: KvEnv {
+                quant: if d.kv_fp8 { KvQuant::Fp8E4M3 } else { KvQuant::None },
+                ..KvEnv::default()
+            },
             diag: DiagEnv {
-                resolve_trace: has("OWL_RESOLVE_TRACE"),
-                host_argmax: has("OWL_HOST_ARGMAX"),
-                ts_probe: has("OWL_TS_PROBE"),
+                resolve_trace: d.resolve_trace,
+                host_argmax: d.host_argmax,
+                ts_probe: d.ts_probe,
             },
             ..Self::default()
         }

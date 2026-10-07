@@ -68,7 +68,7 @@ async fn main() {
     let _ = owl_shared::metrics::init_metrics(owl_shared::metrics::MetricsStore::new());
 
     // ── engine actor:专属线程(构造+装载+泵全在内;RunningEngine 非 Send)──
-    // HTTP 侧留 bind/model_name 副本(其余配置随线程移动)
+    // HTTP 侧留 bind/model_name 副本(model_name 回退服务端缺省)
     let (bind, model_name) = (config.bind.clone(), config.model_name.clone());
     let (tx, rx) = mpsc::channel::<EngineReq>(CHANNEL_CAPACITY);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<String, String>>();
