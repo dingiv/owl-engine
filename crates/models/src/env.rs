@@ -212,7 +212,7 @@ impl EnvProvider {
     pub fn from_dispatch(d: &owl_shared::config::DispatchCfg) -> Self {
         Self {
             attn: AttnEnv {
-                qkv_fuse: !d.qkv_fuse_off,
+                qkv_fuse: d.qkv_fuse,
                 prefill_split: d.prefill_split,
                 force_naive_prefill: d.force_naive_prefill,
                 fi: d.flashinfer,
@@ -220,8 +220,8 @@ impl EnvProvider {
             gdn: GdnEnv {
                 chunked: d.gdn_chunked,
                 scalar: d.gdn_scalar,
-                fused_decode: !d.gdn_no_fuse_decode,
-                fused_decode_v2: !d.gdn_no_fuse_decode_v2,
+                fused_decode: d.gdn_fused_decode,
+                fused_decode_v2: d.gdn_fused_decode_v2,
             },
             kv: KvEnv {
                 quant: if d.kv_fp8 { KvQuant::Fp8E4M3 } else { KvQuant::None },

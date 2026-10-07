@@ -1,0 +1,101 @@
+# owl.toml.example —— owl 引擎配置模板(2026-10-10)
+#
+# 用法:owl-server owl.toml          # 显式指定
+#       owl-server --flavor awq27b   # 内置预设(owl-server --list-flavors 查全表)
+#       OWL_CONFIG=owl.toml owl-server
+#
+# 四层叠加:代码缺省 → flavor 预设 → 本文件 → CLI 启动参数。
+# 注释掉/缺省的字段 = 用内置缺省;**账外键(打错字)直接拒启**,不静默忽略。
+# 全量键总账:crates/shared/src/config.rs 模块头。
+# env 已退出正式配置链(唯一遗留:OWL_CONFIG 路径兜底)。
+
+[runtime]
+# bind = "127.0.0.1:8135"
+# device = 0                    # CUDA ordinal(测试域另有 test_device,不入 toml)
+# max_seq = 4096                # 单 turn token 预算(KV 直排槽位)
+# prefill_chunk = 512           # 预填块长(2026-10-10 提档;1024+ 收益递减)
+
+[model]
+# kind = "0.8b"                 # 严格枚举: "0.8b" | "awq27b"(写错拒启)
+# dir  = ""                     # 检查点目录(缺省 = workspace 资产 0.8B)
+# name = ""                     # 对外模型名(缺省 qwen3.5-0.8b)
+# awq27b_dir  = ""              # 27B AWQ 检查点(测试/E2E 门控)
+# dflash2_dir = ""              # DFlash2 草稿检查点(spec.depth>0 必配)
+
+[pool]
+# pool_tokens = 0               # 块池容量覆写(缺省 = 2×单会话)
+# gdn_slots = 8                 # GDN 状态格容量(24G 贴顶单会话档 = 1,省 ~300MB)
+# snap_max = 4                  # spec 快照池深度(贴顶档 = 1)
+# vram_target = 0.97            # 显存预算目标占比(0 = 治理禁用)
+# vram_reserve_mb = 1024        # 图 slab + CUDA ctx + 瞬态预留
+# prefix_cache = true           # 前缀缓存(跨会话前缀复用)
+
+[spec]
+# depth = 0                     # 投机深度(0 = off;上限 3,DFlash2 7)
+# dumb = false                  # 哑草稿诊断面
+# draft_kv_fp8 = false          # 草稿池 e4m3(AL 有损,需 A/B)
+# notaps = false                # verify taps 退回 last_hidden(排查)
+# tapdecl = false               # TAPDECL 二分臂
+# degrade_after = 6             # B4:m=0 连击降级阈值(0 = 禁用)
+# probe_every = 64              # 降级期探测周期(失败 ×2 退避)
+
+[sampling]
+# mode = "sampling"             # 严格枚举: "greedy" | "sampling"
+# temp = 1.0
+# topk = 20
+# topp = 0.95
+# rep_penalty = 1.15            # 反循环服务档(>1 压制已现 token)
+
+[load]
+# verify = false                # 装载校验(整块回读 vs staged 校验和)
+# debug_tap = false             # 装载观测(stderr 逐键)
+
+[dispatch]                      # 解释器分派(正语义:true = 开)
+# qkv_fuse = true               # W2 qkv 融合(反开关 NO_FUSE 是 env 遗留,不入 toml)
+# prefill_split = false
+# force_naive_prefill = false
+# flashinfer = false            # FlashInfer prefill 面
+# gdn_chunked = false
+# gdn_scalar = false
+# gdn_fused_decode = true       # D1
+# gdn_fused_decode_v2 = true    # D1-v2
+# kv_fp8 = false                # KV 池 e4m3(ctx 翻倍/容量减半)
+# resolve_trace = false
+# host_argmax = false
+# ts_probe = false
+
+[probes]                        # 诊断探针(boot 一次解析,热路径零 env)
+# debug = false
+# step_profile = false
+# gdn_dump = false
+# prefill_cksum = false
+# fact_probe = false            # 动态 tag 增殖面,案结恒关
+# trace_gate = false
+# dflash_probe = false
+# propose_eager = false
+# dflash_eager = false
+# dflash_noencode = false
+# dflash_dumb = false
+# gdn_dump_all = false
+# pf_bisect = false             # prefill 逐层 checksum 二分
+# pf_stages = 0                 # 指定层五站 stage tap(层号)
+# pf_fin_check = false
+# raw_completion = false        # 裸续写输出(绕过 chat 模板,健康度 A/B)
+
+[cuda]
+# srv_timing = false
+# cap_prof = false
+# launch_sync = false           # 每次图回放后同步(性能杀手,勿常开)
+# launch_time = false
+# d2h_prof = false
+# gpu_prof = false              # 逐核归因(/debug/metrics 消费)
+# free_legacy = false           # 旁路事件钉序(崩坏案 A/B)
+# capture_slab_mb = 0           # 捕获 slab 固定档(缺省 = warmup 计量定量;spec verify 实需 ~160)
+# nvrtc_include = ""            # 缺省 /usr/local/cuda/include
+
+[cuda.graph_flags]
+# upload = false                # 实例化旗标 UPLOAD=0b10
+# device_launch = false         # 设备侧派发 0b100(派发税排查面)
+
+[graph]
+# no_graph = false              # eager 直发(图内/图外 A/B 对照臂)

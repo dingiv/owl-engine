@@ -14,9 +14,10 @@
 //! - [`debug`]:`/debug/metrics` 投影(纯函数,路由只转发);
 //! - [`http`]:HTTP 帧解析/回写(协议无关)。
 //!
-//! 本文件只留编排:config fail-fast → actor 线程 spawn → ready 门 →
-//! accept 循环。环境变量一律经 `owl_shared::env_reader`,文件 I/O 一律
-//! 经 `owl_shared::file_loader`(全 workspace 统一读取面)。
+//! 本文件只留编排:CLI 解析 → config 四层叠加(Default → Flavor →
+//! 文件 → CLI)fail-fast → actor 线程 spawn → ready 门 → accept 循环。
+//! env 已退出正式配置链(唯一遗留 = OWL_CONFIG 路径兜底);文件 I/O
+//! 一律经 `owl_shared::file_loader`。
 //!
 //! 用法:
 //! ```text
@@ -54,8 +55,23 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 #[tokio::main]
 async fn main() {
-    // 配置:boot 边界一次解析,非法即拒(env 读取/分派全在 config)
-    let config = match ServerConfig::from_env() {
+    // CLI:唯一参数面(配置文件路径 + flavor;手写解析,未知参数拒启)
+    let args = match crate::config::CliArgs::parse(std::env::args().skip(1)) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("[boot] {e}");
+            std::process::exit(1);
+        }
+    };
+    if args.list_flavors {
+        eprintln!("可用 flavor:");
+        for n in owl_shared::config::flavor_names() {
+            eprintln!("  {n}");
+        }
+        return;
+    }
+    // 配置:四层叠加(Default → Flavor → 文件 → CLI),非法即拒
+    let config = match ServerConfig::load(args.flavor.as_deref(), args.config.as_deref()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("[boot] 配置非法: {e}");

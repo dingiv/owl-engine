@@ -316,3 +316,54 @@ main → ServerConfig::from_env
 - engine **38/38** / models **116/116**(串行)/ workspace --all-targets 绿
 - server 冒烟:health/chat(usage 15/15)✓,GPU 清零
 - 生产面 env 直读终态:**config loader 一处**(tests/build.rs/driver.rs 例外不变)
+
+
+---
+
+## 八、执行实录(2026-10-10 深夜Ⅷ,配置文件 + flavor 预设)
+
+> 起点 = 用户裁决:其他引擎启动参数爆炸难用;走配置文件;TOML;
+> **缺省 < 文件 = env(隐藏键) < 启动参数**;env 太多要砍 —— env 只能
+> 作隐藏参数(配置文件没有的键);参考 vllm flavors.py 三层律。
+
+### 终态:四层叠加配置面
+
+```text
+Default(代码) → Flavor(内置预设) → 用户文件(toml) → CLI 启动参数
+```
+
+- **flavor 机制**(移植 flavors.py 三层律):每 flavor = TOML patch 常量
+  (与用户文件同一 serde 路径,零额外机制);只锁"必须成套"的旋钮;
+  每档注释 = 为什么。现役五档:`dev-08b`/`awq27b`(贴顶三旋钮+greedy)/
+  `spec-dflash`(depth3+slab160,需配 dflash2_dir)/`fi-kv8`/`eager-debug`。
+  `--flavor <N>` 激活 / `--list-flavors` 查表。
+- **TOML 面**:owl.toml 直接镜像 OwlConfig 十 module(模板
+  owl.toml.example);`deny_unknown_fields` 全 module —— **账外键拒启**
+  (实测 kindz → unknown field 报错);枚举严格同样生效(awq27bb 拒)。
+- **merge**:toml::Value 深合并(表递归,标量覆盖)→ 最终反序列化
+  一次过 deny/枚举门。
+- **CLI**:手写解析零 clap:`owl-server [CONFIG] [--flavor N]
+  [--list-flavors]`;未知参数拒启;OWL_CONFIG = 路径兜底隐藏键。
+
+### env 缩编(主见裁决)
+
+正式配置链 env = **0**:原 60 键 env 面全废,OWL_* 业务键不再被任何
+生产代码读取。遗留:OWL_CONFIG(路径兜底)+ 测试域账外自读(测试入口
+合法)+ build.rs/driver.rs 既有例外。隐藏键若将来需要(临时 A/B),走
+env_reader 原语 + 入口自读,不回正式链。
+
+### dispatch 正语义
+
+DispatchCfg 字段改正语义(qkv_fuse/gdn_fused_decode/gdn_fused_decode_v2,
+缺省真)—— env 面的 NO_FUSE 反开关不入 toml;from_dispatch 直映射。
+
+### 回归
+
+- shared **27/27**(config 6 新测:缺省/枚举拒/账外拒/正语义/flavor 全表
+  可解析+叠加/load 文件覆盖 flavor)
+- engine **38/38** / models **116/116**(串行)/ workspace --all-targets 绿
+- 冒烟五连:--list-flavors ✓ / 未知 flavor 拒 ✓ / 账外键拒 ✓ /
+  文件启动(bind 8136/name/容量 128 全生效)✓ / --flavor fi-kv8
+  (kv-manifest Fp8E4M3+fi ✓);GPU 清零
+- 附记:awq27b 档缺检查点目录时 loader panic 逃逸(actor 线程 expect)
+  —— boot 失败路径结构化挂账,非本轮

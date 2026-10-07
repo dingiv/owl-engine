@@ -1,128 +1,92 @@
 //! 全量配置总账 + 统一 loader(2026-10-10 显式配置模块;显式依赖律终点)。
 //!
 //! **定位**:全 workspace 唯一的配置**定义面** —— 每个配置键在此登记
-//! (键名/类型/缺省/归属 module),[`OwlConfig::from_env`] 是唯一 loader
-//! (一次读齐 → 强类型对象返回)。消费方(engine/cuda/models/server)
-//! 一律 `from_config(&OwlConfig)` 组装各自的 knobs/options,**零 env 直读、
-//! 零散点 parse**;入口(server config/测试用例)构造 OwlConfig 后显式下传。
+//! (键名/类型/缺省/归属 module),[`OwlConfig::load`] 是唯一 loader。
+//! 消费方(engine/cuda/models/server)一律 `from_config(&OwlConfig)`
+//! 组装各自的 knobs/options,**零 env 直读、零散点 parse**。
 //!
-//! **类型纪律**:枚举语义严格枚举(ModelKind/SamplerMode/
-//! GraphInstantiateFlags)—— 非法值 = `Err` fail-fast(消息带合法值),
-//! 不许 String 和稀泥;数值解析失败 = warn + 缺省(env_reader 降级可见)。
+//! **四层叠加**(flavor 机制,2026-10-10;参考 vllm flavors.py 三层律):
+//!
+//! ```text
+//! Default(代码缺省) → Flavor(内置命名预设) → 用户文件(toml) → CLI 启动参数
+//! ```
+//!
+//! flavor 只锁"**必须成套**"的旋钮(避免手拼组合踩约束,如 spec depth
+//! 无草稿目录空转、verify 图撞缺省 slab);实验旋钮在用户文件临时改即可,
+//! 无需绕预设。**env 彻底退出正式配置链**(缩编裁决:env 只剩 OWL_CONFIG
+//! 路径兜底等隐藏键 + 测试域账外自读)。
+//!
+//! **类型纪律**:枚举严格(ModelKind/SamplerMode —— 反序列化非法值直接
+//! 报错;GraphInstantiateFlags 结构化布尔位面),不许 String 和稀泥;
+//! **`deny_unknown_fields` 全 module** —— 键名打错字拒启,不静默忽略。
 //!
 //! **全量配置总账**(键 → module;新键必须在此登记,禁止账外键):
 //!
 //! | module | 键 | 类型/缺省 |
 //! |---|---|---|
-//! | runtime | OWL_DEVICE | usize / 0 |
-//! | runtime | OWL_MAX_SEQ | usize / 4096 |
-//! | runtime | OWL_PREFILL_CHUNK | usize / 512 |
-//! | runtime | OWL_TEST_DEVICE | Option<usize> / None(测试域) |
-//! | runtime | OWL_SERVER_URL | Option<String> / None(cli) |
-//! | runtime | OWL_BIND | String / 127.0.0.1:8135(server) |
-//! | model | OWL_MODEL_KIND | ModelKind 枚举 / Qwen35_08b |
-//! | model | OWL_MODEL_DIR | Option<PathBuf> / None |
-//! | model | OWL_MODEL_NAME | Option<String> / None |
-//! | model | OWL_AWQ27B_DIR | Option<String> / None(27B 资产门控) |
-//! | model | OWL_DFLASH2_DIR | Option<String> / None(草稿检查点) |
-//! | pool | OWL_POOL_TOKENS | Option<usize> / None(=2×单会话) |
-//! | pool | OWL_GDN_SLOTS | usize / 8 |
-//! | pool | OWL_SNAP_MAX | usize / 4 |
-//! | pool | OWL_VRAM_TARGET | f64 / 0.97 |
-//! | pool | OWL_VRAM_RESERVE_MB | u64 / 1024 |
-//! | pool | OWL_PREFIX_CACHE | bool(严格 0/1/off/on)/ true |
-//! | spec | OWL_SPEC_DEPTH | usize / 0(off) |
-//! | spec | OWL_SPEC_DUMB | flag / false |
-//! | spec | OWL_DFLASH_KV_FP8 | flag / false |
-//! | spec | OWL_DFLASH_NOTAPS | flag / false |
-//! | spec | OWL_DFLASH_TAPDECL | flag / false |
-//! | spec | OWL_SPEC_DEGRADE_AFTER | usize / 6 |
-//! | spec | OWL_SPEC_PROBE_EVERY | usize / 64 |
-//! | sampling | OWL_SAMPLER | SamplerMode 枚举 / Sampling |
-//! | sampling | OWL_TEMP | f32 / 1.0 |
-//! | sampling | OWL_TOPK | usize / 20 |
-//! | sampling | OWL_TOPP | f32 / 0.95 |
-//! | sampling | OWL_REP_PENALTY | f32 / 1.15 |
-//! | load | OWL_LOAD_VERIFY | flag / false |
-//! | load | OWL_LOAD_DEBUG | flag / false |
-//! | dispatch | OWL_QKV_NO_FUSE | 反 flag(qkv_fuse 缺省真) |
-//! | dispatch | OWL_PREFILL_SPLIT | flag / false |
-//! | dispatch | OWL_FORCE_NAIVE | flag / false |
-//! | dispatch | OWL_FLASHINFER | flag / false |
-//! | dispatch | OWL_GDN_CHUNKED | flag / false |
-//! | dispatch | OWL_GDN_SCALAR | flag / false |
-//! | dispatch | OWL_GDN_NO_FUSE_DECODE | 反 flag(缺省真) |
-//! | dispatch | OWL_GDN_NO_FUSE_DECODE_V2 | 反 flag(缺省真) |
-//! | dispatch | OWL_KV_FP8 | flag / false(→ KvQuant::Fp8E4M3) |
-//! | dispatch | OWL_RESOLVE_TRACE | flag / false |
-//! | dispatch | OWL_HOST_ARGMAX | flag / false |
-//! | dispatch | OWL_TS_PROBE | flag / false |
-//! | probes | OWL_STEP_PROFILE | flag / false |
-//! | probes | OWL_GDN_DUMP | flag / false |
-//! | probes | OWL_DEBUG | flag / false |
-//! | probes | OWL_PREFILL_CKSUM | flag / false |
-//! | probes | OWL_FACT_PROBE | flag / false |
-//! | probes | OWL_TRACE_GATE | flag / false |
-//! | probes | OWL_DFLASH_PROBE | flag / false |
-//! | probes | OWL_PROPOSE_EAGER | flag / false |
-//! | probes | OWL_DFLASH_EAGER | flag / false |
-//! | probes | OWL_DFLASH_NOENCODE | flag / false |
-//! | probes | OWL_DFLASH_DUMB | flag / false |
-//! | probes | OWL_GDN_DUMP_ALL | flag / false |
-//! | probes | OWL_PF_BISECT | flag / false |
-//! | probes | OWL_PF_STAGES | Option<usize> / None |
-//! | probes | OWL_PF_FIN_CHECK | flag / false |
-//! | probes | OWL_RAW_COMPLETION | flag / false |
-//! | cuda | OWL_SRV_TIMING | flag / false |
-//! | cuda | OWL_CAP_PROF | flag / false |
-//! | cuda | OWL_LAUNCH_SYNC | flag / false |
-//! | cuda | OWL_LAUNCH_TIME | flag / false |
-//! | cuda | OWL_D2H_PROF | flag / false |
-//! | cuda | OWL_GPU_PROF | flag / false |
-//! | cuda | OWL_FREE_LEGACY | flag / false |
-//! | cuda | OWL_GRAPH_FLAGS | GraphInstantiateFlags 枚举 / 空 |
-//! | cuda | OWL_CAPTURE_SLAB_MB | Option<usize> / None(hint 定量) |
-//! | cuda | CUDA_HOME / CUDA_PATH | Option<PathBuf>(nvrtc include) |
-//! | graph | OWL_NO_GRAPH | flag / false(capture = !no_graph) |
+//! | runtime | bind | String / "127.0.0.1:8135" |
+//! | runtime | device | usize / 0 |
+//! | runtime | max_seq | usize / 4096 |
+//! | runtime | prefill_chunk | usize / 512 |
+//! | runtime | test_device | Option<usize> / None(测试域,不入 toml) |
+//! | runtime | server_url | Option<String> / None(cli,不入 toml) |
+//! | model | kind | ModelKind 枚举("0.8b"\\|"awq27b")/ 0.8b |
+//! | model | dir / name | Option / None(workspace 资产缺省) |
+//! | model | awq27b_dir / dflash2_dir | Option<String> / None(检查点) |
+//! | pool | pool_tokens | Option<usize> / None(=2×单会话) |
+//! | pool | gdn_slots / snap_max | usize / 8、4 |
+//! | pool | vram_target / vram_reserve_mb | f64、u64 / 0.97、1024 |
+//! | pool | prefix_cache | bool / true |
+//! | spec | depth / dumb / draft_kv_fp8 | usize 0(off)、flag、flag |
+//! | spec | notaps / tapdecl | flag / false(verify 图诊断) |
+//! | spec | degrade_after / probe_every | usize / 6、64 |
+//! | sampling | mode | SamplerMode 枚举("greedy"\\|"sampling")/ sampling |
+//! | sampling | temp / topk / topp / rep_penalty | 1.0 / 20 / 0.95 / 1.15 |
+//! | load | verify / debug_tap | flag / false |
+//! | dispatch | qkv_fuse / gdn_fused_decode / gdn_fused_decode_v2 | bool / 全真(**正语义**) |
+//! | dispatch | prefill_split / force_naive / flashinfer | flag / false |
+//! | dispatch | gdn_chunked / gdn_scalar / kv_fp8 | flag / false |
+//! | dispatch | resolve_trace / host_argmax / ts_probe | flag / false |
+//! | probes | step_profile / gdn_dump / debug / prefill_cksum / fact_probe | flag / false |
+//! | probes | trace_gate / dflash_probe / propose_eager | flag / false |
+//! | probes | dflash_eager / dflash_noencode / dflash_dumb | flag / false |
+//! | probes | gdn_dump_all / pf_bisect / pf_fin_check / raw_completion | flag / false |
+//! | probes | pf_stages | Option<usize> / None |
+//! | cuda | srv_timing / cap_prof / launch_sync / launch_time | flag / false |
+//! | cuda | d2h_prof / gpu_prof / free_legacy | flag / false |
+//! | cuda | graph_flags | { upload, device_launch } / 全 false |
+//! | cuda | capture_slab_mb | Option<usize> / None(hint 定量) |
+//! | cuda | nvrtc_include | Option<PathBuf>(toml 面直给;env CUDA_HOME 废) |
+//! | graph | no_graph | flag / false |
 //!
 //! 账外键(不入公共面):测试私有旋钮(OWL_GATE_*/OWL_E2E_*/OWL_SWEEP_*/
 //! OWL_WS_MUL/SPLIT_*/MARLIN_*/FI_DEBUG/OWL_27B_STRICT/OWL_HF_PARITY ——
-//! 测试用例自由直读)与构建期键(OWL_CUDA_ARCH/OWL_NVCC/OUT_DIR/AR ——
-//! build.rs 例外)。
+//! 测试用例自由直读)、构建期键(build.rs 例外)、OWL_CONFIG(loader 路径
+//! 兜底,server 入口读)。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::env_reader;
+use serde::Deserialize;
+
+use crate::file_loader;
 
 // ============================================================================
-// §1 枚举类型(严格枚举;非法值 fail-fast,不许 String 和稀泥)
+// §1 枚举与位面(严格类型;非法值反序列化即报错,不许 String 和稀泥)
 // ============================================================================
 
-/// 模型档位(OWL_MODEL_KIND)
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// 模型档位(model.kind)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 pub enum ModelKind {
-    /// Qwen3.5-0.8B f16(开发基线)
+    #[serde(rename = "0.8b")]
     #[default]
     Qwen35_08b,
-    /// Qwen3.8-27B AWQ-INT4(生产档)
+    #[serde(rename = "awq27b")]
     Awq27b,
 }
 
-impl ModelKind {
-    fn parse(raw: &str) -> Result<Self, String> {
-        match raw {
-            "0.8b" => Ok(Self::Qwen35_08b),
-            "awq27b" => Ok(Self::Awq27b),
-            other => Err(format!(
-                "OWL_MODEL_KIND={other:?} 非法(合法:0.8b | awq27b)"
-            )),
-        }
-    }
-}
-
-/// 采样模式(OWL_SAMPLER;原 `!= "greedy"` 字符串和稀泥废除 —— 未知值
-/// 静默当采样的隐患收口)
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// 采样模式(sampling.mode;原 `!= "greedy"` 字符串和稀泥废除)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SamplerMode {
     /// 贪心(恒等门/测试口径)
     Greedy,
@@ -131,69 +95,50 @@ pub enum SamplerMode {
     Sampling,
 }
 
-impl SamplerMode {
-    fn parse(raw: &str) -> Result<Self, String> {
-        match raw {
-            "greedy" => Ok(Self::Greedy),
-            "sampling" | "1" => Ok(Self::Sampling),
-            other => Err(format!(
-                "OWL_SAMPLER={other:?} 非法(合法:greedy | sampling)"
-            )),
-        }
-    }
-}
-
-/// 图实例化旗标(OWL_GRAPH_FLAGS;原裸 u64 魔数 2/4 收口)
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// 图实例化旗标(cuda.graph_flags;原裸 u64 魔数 2/4 收口为结构化位面)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct GraphInstantiateFlags {
-    /// UPLOAD=2(实例化后预热上传)
+    /// UPLOAD=0b10(实例化后预热上传)
     pub upload: bool,
-    /// DEVICE_LAUNCH=4(设备侧派发;10.8µs/节点派发税排查面)
+    /// DEVICE_LAUNCH=0b100(设备侧派发;派发税排查面)
     pub device_launch: bool,
 }
 
 impl GraphInstantiateFlags {
-    fn parse(raw: &str) -> Result<Self, String> {
-        let bits: u64 = raw
-            .parse()
-            .map_err(|_| format!("OWL_GRAPH_FLAGS={raw:?} 非法(合法:0 | 2 | 4 | 6)"))?;
-        if bits & !0b110 != 0 {
-            return Err(format!("OWL_GRAPH_FLAGS={raw:?} 含未定位(合法:0 | 2 | 4 | 6)"));
-        }
-        Ok(Self { upload: bits & 0b10 != 0, device_launch: bits & 0b100 != 0 })
-    }
-
-    /// cuda GraphInstantiateWithFlags 位面(唯一出口;UPLOAD=0b10 /
-    /// DEVICE_LAUNCH=0b100,与解析同尺)
+    /// cuda GraphInstantiateWithFlags 位面(唯一出口;与位定义同尺)
     pub fn to_bits(self) -> u64 {
         ((self.upload as u64) << 1) | ((self.device_launch as u64) << 2)
     }
 }
 
 // ============================================================================
-// §2 config modules(每 module 管一个功能域;字段 = 强类型,见总账)
+// §2 config modules(每 module 管一个功能域;deny_unknown = 键名打错拒启)
 // ============================================================================
 
-/// 进程装配面(设备/窗口/块长/测试设备/cli 端点)
-#[derive(Clone, Debug, PartialEq)]
+/// 进程装配面
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct RuntimeCfg {
-    /// server 监听地址
     pub bind: String,
     pub device: usize,
     pub max_seq: usize,
     pub prefill_chunk: usize,
-    /// 测试域设备序(None = 测试跳过)
+    /// 测试域设备序(不入 toml;测试入口自填)
+    #[serde(skip)]
     pub test_device: Option<usize>,
-    /// cli 上行端点
+    /// cli 上行端点(不入 toml;cli 入口自填)
+    #[serde(skip)]
     pub server_url: Option<String>,
 }
 
-/// 模型资产面(档位/目录/名/检查点门控)
-#[derive(Clone, Debug, PartialEq)]
+/// 模型资产面
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ModelCfg {
     pub kind: ModelKind,
-    pub model_dir: Option<PathBuf>,
-    pub model_name: Option<String>,
+    pub dir: Option<PathBuf>,
+    pub name: Option<String>,
     /// 27B AWQ 检查点目录(测试/E2E 门控)
     pub awq27b_dir: Option<String>,
     /// DFlash2 草稿检查点目录
@@ -201,7 +146,8 @@ pub struct ModelCfg {
 }
 
 /// 池几何与显存预算(engine StatePool)
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct PoolCfg {
     pub pool_tokens: Option<usize>,
     pub gdn_slots: usize,
@@ -212,7 +158,8 @@ pub struct PoolCfg {
 }
 
 /// 投机解码(spec 三态/草稿池量化/B4 降级参数/verify 图诊断)
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct SpecCfg {
     pub depth: usize,
     pub dumb: bool,
@@ -225,8 +172,9 @@ pub struct SpecCfg {
     pub probe_every: usize,
 }
 
-/// 采样参数(mode 枚举 + generation_config 同款三维 + 反循环惩罚)
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// 采样参数
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct SamplingCfg {
     pub mode: SamplerMode,
     pub temp: f32,
@@ -236,29 +184,30 @@ pub struct SamplingCfg {
 }
 
 /// 装载域(校验/观测)
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct LoadCfg {
-    /// 装载校验(整块回读 vs staged 校验和)
     pub verify: bool,
-    /// 装载观测 tap(stderr 逐键)
     pub debug_tap: bool,
 }
 
-/// 解释器分派面(models EnvProvider 组装源;被动律:引擎 = 环境事实来源)
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// 解释器分派面(models EnvProvider 组装源;**正语义** —— true = 开,
+/// env 面的 NO_FUSE 反开关是兼容遗留,不入 toml)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct DispatchCfg {
-    /// W2 qkv 融合(缺省真;反开关退出)
-    pub qkv_fuse_off: bool,
+    /// W2 qkv 融合(缺省真;2026-10-04 k-probe 硬门定谳)
+    pub qkv_fuse: bool,
     pub prefill_split: bool,
     pub force_naive_prefill: bool,
     /// FlashInfer prefill 面
     pub flashinfer: bool,
     pub gdn_chunked: bool,
     pub gdn_scalar: bool,
-    /// GDN decode 融合(缺省真;反开关退出)
-    pub gdn_no_fuse_decode: bool,
-    /// D1-v2(缺省真;反开关退出)
-    pub gdn_no_fuse_decode_v2: bool,
+    /// GDN decode 融合 D1(缺省真)
+    pub gdn_fused_decode: bool,
+    /// D1-v2(缺省真;2026-10-04 三重验证后翻)
+    pub gdn_fused_decode_v2: bool,
     /// KV 池 fp8(→ KvQuant::Fp8E4M3)
     pub kv_fp8: bool,
     pub resolve_trace: bool,
@@ -267,7 +216,8 @@ pub struct DispatchCfg {
 }
 
 /// 诊断探针族(全域布尔;boot 一次解析,热路径零 env)
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ProbesCfg {
     pub step_profile: bool,
     pub gdn_dump: bool,
@@ -287,8 +237,9 @@ pub struct ProbesCfg {
     pub raw_completion: bool,
 }
 
-/// CUDA 设备面(诊断旗标 + 图实例化枚举 + slab 定档 + nvrtc 工具链)
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// CUDA 设备面(诊断旗标 + 图实例化位面 + slab 定档 + nvrtc 工具链)
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct CudaCfg {
     pub srv_timing: bool,
     pub cap_prof: bool,
@@ -300,23 +251,25 @@ pub struct CudaCfg {
     pub graph_flags: GraphInstantiateFlags,
     /// 捕获 slab 固定档 MiB(None = warmup 计量定量)
     pub capture_slab_mb: Option<usize>,
-    /// nvrtc include(入口自 CUDA_HOME/CUDA_PATH 解析)
+    /// nvrtc include(None = 缺省 /usr/local/cuda/include)
     pub nvrtc_include: Option<PathBuf>,
 }
 
 /// 图装配面(engine GraphPlanDesc)
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct GraphCfg {
     /// eager 直发,跳过图捕获
     pub no_graph: bool,
 }
 
 // ============================================================================
-// §3 总对象 + 统一 loader
+// §3 总对象
 // ============================================================================
 
 /// 全量配置对象(loader 唯一产物;进程内冻结,只读下传)
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct OwlConfig {
     pub runtime: RuntimeCfg,
     pub model: ModelCfg,
@@ -328,18 +281,6 @@ pub struct OwlConfig {
     pub probes: ProbesCfg,
     pub cuda: CudaCfg,
     pub graph: GraphCfg,
-}
-
-/// 严格布尔(值语义开关;flag 族用 env_reader::flag,不入此)
-fn bool_strict(key: &str, default: bool) -> Result<bool, String> {
-    match env_reader::str(key).as_deref() {
-        None => Ok(default),
-        Some("0" | "false" | "off") => Ok(false),
-        Some("1" | "true" | "on") => Ok(true),
-        Some(other) => Err(format!(
-            "{key}={other:?} 非法布尔(合法:0 | false | off | 1 | true | on)"
-        )),
-    }
 }
 
 impl Default for RuntimeCfg {
@@ -357,196 +298,285 @@ impl Default for RuntimeCfg {
 
 impl Default for ModelCfg {
     fn default() -> Self {
-        Self { kind: ModelKind::default(), model_dir: None, model_name: None, awq27b_dir: None, dflash2_dir: None }
+        Self {
+            kind: ModelKind::default(),
+            dir: None,
+            name: None,
+            awq27b_dir: None,
+            dflash2_dir: None,
+        }
     }
 }
 
 impl Default for PoolCfg {
     fn default() -> Self {
-        Self { pool_tokens: None, gdn_slots: 8, snap_max: 4, vram_target: 0.97, vram_reserve_mb: 1024, prefix_cache: true }
+        Self {
+            pool_tokens: None,
+            gdn_slots: 8,
+            snap_max: 4,
+            vram_target: 0.97,
+            vram_reserve_mb: 1024,
+            prefix_cache: true,
+        }
     }
 }
 
 impl Default for SpecCfg {
     fn default() -> Self {
-        Self { depth: 0, dumb: false, draft_kv_fp8: false, notaps: false, tapdecl: false, degrade_after: 6, probe_every: 64 }
+        Self {
+            depth: 0,
+            dumb: false,
+            draft_kv_fp8: false,
+            notaps: false,
+            tapdecl: false,
+            degrade_after: 6,
+            probe_every: 64,
+        }
+    }
+}
+
+impl Default for DispatchCfg {
+    /// 分派缺省:三大融合生产默认开(2026-10-04 k-probe/金标/步时定谳)
+    fn default() -> Self {
+        Self {
+            qkv_fuse: true,
+            prefill_split: false,
+            force_naive_prefill: false,
+            flashinfer: false,
+            gdn_chunked: false,
+            gdn_scalar: false,
+            gdn_fused_decode: true,
+            gdn_fused_decode_v2: true,
+            kv_fp8: false,
+            resolve_trace: false,
+            host_argmax: false,
+            ts_probe: false,
+        }
     }
 }
 
 impl Default for SamplingCfg {
     fn default() -> Self {
-        Self { mode: SamplerMode::default(), temp: 1.0, topk: 20, topp: 0.95, rep_penalty: 1.15 }
+        Self {
+            mode: SamplerMode::default(),
+            temp: 1.0,
+            topk: 20,
+            topp: 0.95,
+            rep_penalty: 1.15,
+        }
+    }
+}
+
+// ============================================================================
+// §4 flavor 预设(只锁"必须成套"的旋钮;每档注释 = 为什么)
+// ============================================================================
+
+/// 内置 flavor 表(name → TOML patch;与用户文件同一 serde 解析路径,
+/// 零额外机制)。`--flavor <name>` 激活;文件在其上覆盖。
+pub const FLAVORS: &[(&str, &str)] = &[
+    (
+        // 0.8B 开发基线(dev 面;= 代码缺省 + bind 明示。CI/冒烟快捷档)
+        "dev-08b",
+        r#"
+[runtime]
+bind = "127.0.0.1:8135"
+"#,
+    ),
+    (
+        // 27B AWQ 生产档(24G 贴顶三旋钮:单会话门不需要多格/多快照/
+        // 前缀缓存 —— 实测各省 ~300MB;greedy = 恒等门口径)
+        // 需配套:model.dir(检查点目录)
+        "awq27b",
+        r#"
+[model]
+kind = "awq27b"
+
+[pool]
+gdn_slots = 1
+snap_max = 1
+prefix_cache = false
+
+[sampling]
+mode = "greedy"
+"#,
+    ),
+    (
+        // 27B + DFlash2 真草稿档(E5-DF3 恒等门口径):depth 3 =
+        // kv_slots [u32;4] 契约上限;verify 图捕获实需 ~160MB 固定档
+        // (cap-prof 直方图定谳,缺省 hint 定量在 spec 形态偏小)。
+        // 需配套:model.dflash2_dir(草稿检查点)
+        "spec-dflash",
+        r#"
+[model]
+kind = "awq27b"
+
+[spec]
+depth = 3
+
+[pool]
+gdn_slots = 1
+snap_max = 1
+prefix_cache = false
+
+[sampling]
+mode = "greedy"
+
+[cuda]
+capture_slab_mb = 160
+"#,
+    ),
+    (
+        // FlashInfer prefill + fp8 KV 池(E1.5/E2 面;f16+paged 才有意义,
+        // kind 锁 0.8b 基线 —— 27B FI 面挂账):prefill 1102@8192 实测档
+        "fi-kv8",
+        r#"
+[dispatch]
+flashinfer = true
+kv_fp8 = true
+"#,
+    ),
+    (
+        // eager 诊断档(图内/图外行为 A/B 的对照臂;C1 禁 graph 配套)
+        "eager-debug",
+        r#"
+[graph]
+no_graph = true
+
+[probes]
+debug = true
+"#,
+    ),
+];
+
+/// 可用 flavor 名(──list-flavors 消费面)
+pub fn flavor_names() -> impl Iterator<Item = &'static str> {
+    FLAVORS.iter().map(|(n, _)| *n)
+}
+
+fn flavor_toml(name: &str) -> Option<&'static str> {
+    FLAVORS.iter().find(|(n, _)| *n == name).map(|(_, t)| *t)
+}
+
+// ============================================================================
+// §5 统一 loader(四层叠加;deny_unknown 在最终反序列化生效)
+// ============================================================================
+
+/// TOML Value 深合并(覆盖层写回基座;表递归,标量/数组整体覆盖)
+fn merge(base: &mut toml::Value, over: toml::Value) {
+    match (base, over) {
+        (toml::Value::Table(b), toml::Value::Table(o)) => {
+            for (k, v) in o {
+                match b.get_mut(&k) {
+                    Some(bv) if bv.is_table() && v.is_table() => merge(bv, v),
+                    _ => {
+                        b.insert(k, v);
+                    }
+                }
+            }
+        }
+        (b, o) => *b = o,
     }
 }
 
 impl OwlConfig {
-    /// **统一 loader**(全 workspace 唯一多键读取点;入口调用一次,
-    /// 强类型对象返回后进程内冻结)。枚举非法 = Err(fail-fast);
-    /// 数值解析失败 = warn + 缺省(env_reader 降级可见)。
-    pub fn from_env() -> Result<Self, String> {
-        let flag = |k: &str| env_reader::flag(k);
-        Ok(Self {
-            runtime: RuntimeCfg {
-                bind: env_reader::str_or("OWL_BIND", "127.0.0.1:8135"),
-                device: env_reader::parse_or("OWL_DEVICE", 0),
-                max_seq: env_reader::parse_or("OWL_MAX_SEQ", 4096),
-                prefill_chunk: env_reader::parse_or("OWL_PREFILL_CHUNK", 512),
-                test_device: env_reader::parse("OWL_TEST_DEVICE"),
-                server_url: env_reader::str("OWL_SERVER_URL"),
-            },
-            model: ModelCfg {
-                kind: match env_reader::str("OWL_MODEL_KIND") {
-                    None => ModelKind::default(),
-                    Some(raw) => ModelKind::parse(&raw)?,
-                },
-                model_dir: env_reader::str("OWL_MODEL_DIR").map(PathBuf::from),
-                model_name: env_reader::str("OWL_MODEL_NAME"),
-                awq27b_dir: env_reader::str("OWL_AWQ27B_DIR"),
-                dflash2_dir: env_reader::str("OWL_DFLASH2_DIR"),
-            },
-            pool: PoolCfg {
-                pool_tokens: env_reader::parse("OWL_POOL_TOKENS"),
-                gdn_slots: env_reader::parse_or("OWL_GDN_SLOTS", 8),
-                snap_max: env_reader::parse_or("OWL_SNAP_MAX", 4),
-                vram_target: env_reader::parse_or("OWL_VRAM_TARGET", 0.97),
-                vram_reserve_mb: env_reader::parse_or("OWL_VRAM_RESERVE_MB", 1024u64),
-                prefix_cache: bool_strict("OWL_PREFIX_CACHE", true)?,
-            },
-            spec: SpecCfg {
-                depth: env_reader::parse_or("OWL_SPEC_DEPTH", 0),
-                dumb: flag("OWL_SPEC_DUMB"),
-                draft_kv_fp8: flag("OWL_DFLASH_KV_FP8"),
-                notaps: flag("OWL_DFLASH_NOTAPS"),
-                tapdecl: flag("OWL_DFLASH_TAPDECL"),
-                degrade_after: env_reader::parse_or("OWL_SPEC_DEGRADE_AFTER", 6),
-                probe_every: env_reader::parse_or("OWL_SPEC_PROBE_EVERY", 64).max(1),
-            },
-            sampling: SamplingCfg {
-                mode: match env_reader::str("OWL_SAMPLER") {
-                    None => SamplerMode::default(),
-                    Some(raw) => SamplerMode::parse(&raw)?,
-                },
-                temp: env_reader::parse_or("OWL_TEMP", 1.0),
-                topk: env_reader::parse_or("OWL_TOPK", 20usize),
-                topp: env_reader::parse_or("OWL_TOPP", 0.95),
-                rep_penalty: env_reader::parse_or("OWL_REP_PENALTY", 1.15),
-            },
-            load: LoadCfg {
-                verify: flag("OWL_LOAD_VERIFY"),
-                debug_tap: flag("OWL_LOAD_DEBUG"),
-            },
-            dispatch: DispatchCfg {
-                qkv_fuse_off: flag("OWL_QKV_NO_FUSE"),
-                prefill_split: flag("OWL_PREFILL_SPLIT"),
-                force_naive_prefill: flag("OWL_FORCE_NAIVE"),
-                flashinfer: flag("OWL_FLASHINFER"),
-                gdn_chunked: flag("OWL_GDN_CHUNKED"),
-                gdn_scalar: flag("OWL_GDN_SCALAR"),
-                gdn_no_fuse_decode: flag("OWL_GDN_NO_FUSE_DECODE"),
-                gdn_no_fuse_decode_v2: flag("OWL_GDN_NO_FUSE_DECODE_V2"),
-                kv_fp8: flag("OWL_KV_FP8"),
-                resolve_trace: flag("OWL_RESOLVE_TRACE"),
-                host_argmax: flag("OWL_HOST_ARGMAX"),
-                ts_probe: flag("OWL_TS_PROBE"),
-            },
-            probes: ProbesCfg {
-                step_profile: flag("OWL_STEP_PROFILE"),
-                gdn_dump: flag("OWL_GDN_DUMP"),
-                debug: flag("OWL_DEBUG"),
-                prefill_cksum: flag("OWL_PREFILL_CKSUM"),
-                fact_probe: flag("OWL_FACT_PROBE"),
-                trace_gate: flag("OWL_TRACE_GATE"),
-                dflash_probe: flag("OWL_DFLASH_PROBE"),
-                propose_eager: flag("OWL_PROPOSE_EAGER"),
-                dflash_eager: flag("OWL_DFLASH_EAGER"),
-                dflash_noencode: flag("OWL_DFLASH_NOENCODE"),
-                dflash_dumb: flag("OWL_DFLASH_DUMB"),
-                gdn_dump_all: flag("OWL_GDN_DUMP_ALL"),
-                pf_bisect: flag("OWL_PF_BISECT"),
-                pf_stages: env_reader::parse("OWL_PF_STAGES"),
-                pf_fin_check: flag("OWL_PF_FIN_CHECK"),
-                raw_completion: flag("OWL_RAW_COMPLETION"),
-            },
-            cuda: CudaCfg {
-                srv_timing: flag("OWL_SRV_TIMING"),
-                cap_prof: flag("OWL_CAP_PROF"),
-                launch_sync: flag("OWL_LAUNCH_SYNC"),
-                launch_time: flag("OWL_LAUNCH_TIME"),
-                d2h_prof: flag("OWL_D2H_PROF"),
-                gpu_prof: flag("OWL_GPU_PROF"),
-                free_legacy: flag("OWL_FREE_LEGACY"),
-                graph_flags: match env_reader::str("OWL_GRAPH_FLAGS") {
-                    None => GraphInstantiateFlags::default(),
-                    Some(raw) => GraphInstantiateFlags::parse(&raw)?,
-                },
-                capture_slab_mb: env_reader::parse("OWL_CAPTURE_SLAB_MB"),
-                nvrtc_include: env_reader::str("CUDA_HOME")
-                    .or_else(|| env_reader::str("CUDA_PATH"))
-                    .map(|h| PathBuf::from(h).join("include")),
-            },
-            graph: GraphCfg { no_graph: flag("OWL_NO_GRAPH") },
-        })
+    /// **统一 loader**(四层叠加:Default → flavor → 文件;CLI 由入口
+    /// 决定前两者的取值)。`deny_unknown_fields` 在最终反序列化生效 ——
+    /// 文件/flavor 里任何账外键、枚举非法值 = Err 拒启。
+    pub fn load(flavor: Option<&str>, file: Option<&Path>) -> Result<Self, String> {
+        let mut v = toml::Value::Table(toml::map::Map::new());
+        if let Some(name) = flavor {
+            let patch = flavor_toml(name)
+                .ok_or_else(|| format!("未知 flavor {name:?}(可用:{:?})", flavor_names().collect::<Vec<_>>()))?;
+            let pv: toml::Value =
+                toml::from_str(patch).map_err(|e| format!("内置 flavor {name:?} 解析失败: {e}"))?;
+            merge(&mut v, pv);
+        }
+        if let Some(p) = file {
+            let raw = file_loader::read_to_string(p)
+                .map_err(|e| format!("配置文件 {} 读取失败: {e}", p.display()))?;
+            let fv: toml::Value = toml::from_str(&raw)
+                .map_err(|e| format!("配置文件 {} 解析失败: {e}", p.display()))?;
+            merge(&mut v, fv);
+        }
+        v.try_into()
+            .map_err(|e| format!("配置反序列化失败(账外键或非法枚举值): {e}"))
     }
 
-    /// 缺省装配(测试便捷;= 全缺省值,零 env 读取)
-    pub fn test_defaults() -> Self {
-        Self::default()
+    /// TOML 字符串直载(测试/ops 便捷;与 load 同一反序列化面)
+    pub fn from_toml_str(s: &str) -> Result<Self, String> {
+        toml::from_str(s).map_err(|e| format!("配置解析失败(账外键或非法枚举值): {e}"))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::env_reader::EnvGuard;
-    use std::sync::{Mutex, MutexGuard};
-
-    fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
 
     #[test]
-    fn default_全缺省零env() {
-        let c = OwlConfig::test_defaults();
-        assert_eq!(c.runtime.device, 0);
+    fn default_全缺省() {
+        let c = OwlConfig::default();
+        assert_eq!(c.runtime.bind, "127.0.0.1:8135");
+        assert_eq!(c.runtime.max_seq, 4096);
         assert_eq!(c.model.kind, ModelKind::Qwen35_08b);
         assert!(c.pool.prefix_cache);
         assert_eq!(c.sampling.mode, SamplerMode::Sampling);
-        assert_eq!(c.sampling.rep_penalty, 1.15);
+        assert!(c.dispatch.qkv_fuse && c.dispatch.gdn_fused_decode);
         assert!(!c.cuda.graph_flags.upload);
         assert!(!c.graph.no_graph);
     }
 
     #[test]
-    fn 枚举严格解析_非法fail_fast() {
-        let _g = env_lock();
-        let _k = EnvGuard::set("OWL_MODEL_KIND", "awq27bb");
-        assert!(OwlConfig::from_env().is_err(), "档位打错字必须拒启");
-        let _k2 = EnvGuard::set("OWL_SAMPLER", "greedy1");
-        let _k3 = EnvGuard::set("OWL_MODEL_KIND", "0.8b");
-        assert!(OwlConfig::from_env().is_err(), "采样模式和稀泥必须拒启");
+    fn 枚举严格_非法值拒() {
+        assert!(OwlConfig::from_toml_str("[model]\nkind = \"awq27bb\"").is_err());
+        assert!(OwlConfig::from_toml_str("[sampling]\nmode = \"greedy1\"").is_err());
+        assert!(OwlConfig::from_toml_str("[pool]\nprefix_cache = \"nope\"").is_err());
     }
 
     #[test]
-    fn 枚举合法值与旗标位面() {
-        let _g = env_lock();
-        let _k = EnvGuard::set("OWL_MODEL_KIND", "awq27b");
-        let _k2 = EnvGuard::set("OWL_SAMPLER", "greedy");
-        let _k3 = EnvGuard::set("OWL_GRAPH_FLAGS", "6");
-        let _k4 = EnvGuard::set("OWL_PREFIX_CACHE", "0");
-        let c = OwlConfig::from_env().expect("合法值应通过");
-        assert_eq!(c.model.kind, ModelKind::Awq27b);
+    fn 账外键拒_deny_unknown() {
+        assert!(OwlConfig::from_toml_str("[model]\nkindz = \"awq27b\"").is_err());
+        assert!(OwlConfig::from_toml_str("[no such module]\nx = 1").is_err());
+    }
+
+    #[test]
+    fn 正语义分派与合法文件() {
+        let c = OwlConfig::from_toml_str(
+            "[dispatch]\nqkv_fuse = false\ngdn_fused_decode_v2 = false\n[pool]\ngdn_slots = 1\n",
+        )
+        .expect("合法文件应通过");
+        assert!(!c.dispatch.qkv_fuse);
+        assert!(!c.dispatch.gdn_fused_decode_v2);
+        assert_eq!(c.pool.gdn_slots, 1);
+    }
+
+    #[test]
+    fn flavor_全表可解析且叠加生效() {
+        for (name, patch) in FLAVORS {
+            let c = OwlConfig::from_toml_str(patch)
+                .unwrap_or_else(|e| panic!("flavor {name} 应可解析: {e}"));
+            let _ = c;
+        }
+        // spec-dflash:三档叠加(depth/slab/greedy)
+        let c = OwlConfig::from_toml_str(flavor_toml("spec-dflash").expect("存在")).expect("解析");
+        assert_eq!(c.spec.depth, 3);
+        assert_eq!(c.cuda.capture_slab_mb, Some(160));
         assert_eq!(c.sampling.mode, SamplerMode::Greedy);
-        assert_eq!(c.cuda.graph_flags.to_bits(), 0b110);
-        assert!(!c.pool.prefix_cache);
+        assert_eq!(c.model.kind, ModelKind::Awq27b);
     }
 
     #[test]
-    fn prefix_cache_布尔和稀泥值拒收() {
-        let _g = env_lock();
-        let _k = EnvGuard::set("OWL_PREFIX_CACHE", "off");
-        assert!(OwlConfig::from_env().is_ok());
-        let _k2 = EnvGuard::set("OWL_PREFIX_CACHE", "nope");
-        assert!(OwlConfig::from_env().is_err());
+    fn load_文件覆盖_flavor_文件优先() {
+        let dir = std::env::temp_dir().join(format!("owl_cfg_test_{}", std::process::id()));
+        file_loader::create_dir_all(&dir).expect("mkdir");
+        let p = dir.join("owl.toml");
+        file_loader::write(&p, "[spec]\ndepth = 7\n[sampling]\nmode = \"greedy\"\n").expect("write");
+        let c = OwlConfig::load(Some("spec-dflash"), Some(&p)).expect("load");
+        assert_eq!(c.spec.depth, 7, "文件覆盖 flavor");
+        assert_eq!(c.cuda.capture_slab_mb, Some(160), "flavor 未覆盖处保留");
+        assert_eq!(c.sampling.mode, SamplerMode::Greedy);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(OwlConfig::load(Some("nope"), None).is_err(), "未知 flavor 拒");
+        assert!(OwlConfig::load(None, Some(Path::new("/nonexistent/owl.toml"))).is_err());
     }
 }

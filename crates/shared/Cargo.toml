@@ -9,3 +9,7 @@ description = "共用基建:signal 依赖追踪(re-export)+ testkit 算子对拍
 # 后端无关的依赖追踪(signal 实体;iface 零后端契约,不拖 CUDA 链 ——
 # models 依赖本 crate 的前提,2026-10-01 vestigial owl-cuda 依赖切除)
 owl-iface = { path = "../backends/iface" }
+# 配置文件面(owl.toml / flavor 预设;TOML = Cargo 同款,A4 治理:
+# 纯 Rust 链 toml→toml_edit→winnow,零系统依赖)
+serde = { workspace = true }
+toml = { version = "0.8", default-features = false, features = ["parse", "display"] }

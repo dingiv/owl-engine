@@ -157,12 +157,7 @@ impl EngineKnobs {
             vram_reserve_mb: cfg.pool.vram_reserve_mb,
             raw_completion: cfg.probes.raw_completion,
             sampler_enabled: cfg.sampling.mode == owl_shared::config::SamplerMode::Sampling,
-            sampler: crate::sampler::SamplerCfg {
-                temp: cfg.sampling.temp,
-                topk: cfg.sampling.topk,
-                topp: cfg.sampling.topp,
-                rep_penalty: cfg.sampling.rep_penalty,
-            },
+            sampler: crate::sampler::SamplerCfg::from_sampling(&cfg.sampling),
             gdn_dump_all: cfg.probes.gdn_dump_all,
             pf_bisect: cfg.probes.pf_bisect,
             pf_stages: cfg.probes.pf_stages,
