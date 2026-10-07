@@ -1,8 +1,13 @@
 // ============================================================================
 // reshape_and_cache dual fp8 KV(2026-10-03;REQ-CTX-03 fp8 KV 线)
 //
-// owl_reshape_and_cache_dual_f16(同族)的 fp8 KV 影子变体:classic f16 K/V
-// 照写(v1 decode 不动),K/V 影子写 **e4m3 字节**(kNHD [nb,page,Hkv,hd])。
+// B6.3 收口(2026-10-10):**双臂全 e4m3**。本核仅在主池=fp8 时被选中
+// (attention.rs fp8kv 分派;f16 主池走 K0_DUAL 原版),故 classic 臂
+// 必须 e4m3 1B/elem —— 原版 classic f16 2B 存储落在 1B 池 = 真槽区零写
+// + 毒液洒 2s 槽区(与融合插池同型;FI-decode 案真凶,探针同族补)
+//
+// owl_reshape_and_cache_dual_f16(同族)的 fp8 KV 变体:classic e4m3
+// (v2 fp8 decode 读),K/V 影子写 e4m3 字节(kNHD [nb,page,Hkv,hd])。
 // FI fp8 prefill(DTypeKV=__nv_fp8_e4m3,scale 隐式 1.0)消费影子池。
 // e4m3 转换 = cuda_fp8.h __nv_fp8_e4m3(sem86 软件,无硬件 fp8;写侧一次性
 // 摊销)。nvrtc 独立编译(FI adapter 本体含 flashinfer 头,nvrtc 啃不动)。
@@ -14,8 +19,8 @@
 extern "C" __global__ void owl_reshape_and_cache_dual_f16_fp8kv(
     const __half* __restrict__ key,            // [num_tokens, num_heads, head_size]
     const __half* __restrict__ value,          // 同上
-    __half* __restrict__ key_cache,            // classic f16 [nb, Hkv, hd/x, bs, x]
-    __half* __restrict__ value_cache,          // classic f16 [nb, Hkv, hd, bs]
+    unsigned char* __restrict__ key_cache,     // classic e4m3 [nb, Hkv, hd/x, bs, x]
+    unsigned char* __restrict__ value_cache,   // classic e4m3 [nb, Hkv, hd, bs]
     __nv_fp8_e4m3* __restrict__ key_fi,        // kNHD fp8 [nb, bs, Hkv, hd]
     __nv_fp8_e4m3* __restrict__ value_fi,      // kNHD fp8 [nb, bs, Hkv, hd]
     const float* __restrict__ slot_mapping,    // [num_tokens]
@@ -54,8 +59,8 @@ extern "C" __global__ void owl_reshape_and_cache_dual_f16_fp8kv(
                                       + head_idx * head_size * block_size
                                       + head_offset * block_size
                                       + block_offset;
-        key_cache[tgt_key_idx] = key[src_key_idx];
-        value_cache[tgt_value_idx] = value[src_value_idx];
+        key_cache[tgt_key_idx] = __nv_fp8_e4m3(__half2float(key[src_key_idx])).__x;
+        value_cache[tgt_value_idx] = __nv_fp8_e4m3(__half2float(value[src_value_idx])).__x;
         const long long tgt_fi_idx = block_idx * block_size * num_heads * head_size
                                    + block_offset * num_heads * head_size
                                    + head_idx * head_size

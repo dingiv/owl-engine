@@ -112,11 +112,7 @@ impl Attention {
                 vec![tokens, self.hq * self.hd]);
             // B6.3:fp8 主池 → 融合插池核 e4m3 变体(env.kv.quant 单源;
             // f16 版 2B 池写在 1B/elem 池 = 真槽区零写 + 2s 槽区毒化)
-            let insert_op = if ctx.env.kv.quant == crate::env::KvQuant::Fp8E4M3 {
-                ids::ATTN_QKV_NORM_ROPE_INSERT_FP8KV
-            } else {
-                ids::ATTN_QKV_NORM_ROPE_INSERT
-            };
+            let insert_op = ctx.env.kv.fused_insert_op();
             let q = TensorOps::call(insert_op)
                 .arg(&q_raw)
                 .arg(&k)
@@ -203,11 +199,7 @@ impl Attention {
                 // 可达性:use_fused_insert 已覆盖同谓词;防御臂(理论不可达)
                 // —— K0 形态保留以防 future 分派变化
                 // B6.2:fp8 池 → K0 转换写(f16 输入 → e4m3 池)
-        let k0_op = if ctx.env.kv.quant == crate::env::KvQuant::Fp8E4M3 {
-            ids::ATTN_K0_WRITE_FP8
-        } else {
-            ids::ATTN_K0_WRITE
-        };
+        let k0_op = ctx.env.kv.k0_write_op();
         let wr = TensorOps::call(k0_op).aux(&[tokens])
                 .arg(&k)
                 .arg(&v)
@@ -353,11 +345,7 @@ impl Attention {
         // 主核:partials 写节点输出(布局 [head][partition][dim]);
         // 未激活 partition 早退不写,归并按设备侧 ctx 限界不读垃圾槽
         // B6.2:fp8 池 → fp8 读变体(env.kv.quant 单源;stride 元素序不变)
-        let decode_op = if ctx.env.kv.quant == crate::env::KvQuant::Fp8E4M3 {
-            ids::ATTN_PAGED_DECODE_V2_FP8
-        } else {
-            ids::ATTN_PAGED_DECODE_V2
-        };
+        let decode_op = ctx.env.kv.decode_v2_op();
         let partial = TensorOps::call(decode_op)
             .aux(&[self.hd, self.hq, self.hkv, nb as usize, nparts])
             .arg(q)
@@ -421,11 +409,7 @@ impl Attention {
         // kv_lens 是 decode 步字段(尺寸 [B]),prefill 误读曾致 K0 grid=T
         // 越界读 + seq_lens 垃圾 → 输出全零/ILLEGAL_ADDRESS(2026-10-01)
         // B6.2:fp8 池 → K0 转换写(env.kv.quant 单源)
-        let k0_op = if ctx.env.kv.quant == crate::env::KvQuant::Fp8E4M3 {
-            ids::ATTN_K0_WRITE_FP8
-        } else {
-            ids::ATTN_K0_WRITE
-        };
+        let k0_op = ctx.env.kv.k0_write_op();
         let wr = TensorOps::call(k0_op).aux(&[tokens])
         .arg(k)
         .arg(v)
@@ -456,11 +440,7 @@ impl Attention {
         let nb = kv.block_tables.shape().last().cloned().unwrap_or(1);
         // 名/网格/smem(bs32 契约)= driver 单源(env.page 终审)
         // B6.3:fp8 池 → chunked prefill fp8 读变体
-        let prefill_op = if ctx.env.kv.quant == crate::env::KvQuant::Fp8E4M3 {
-            ids::ATTN_PAGED_PREFILL_FP8
-        } else {
-            ids::ATTN_PAGED_PREFILL
-        };
+        let prefill_op = ctx.env.kv.prefill_paged_attn_op();
         let y = TensorOps::call(prefill_op).aux(&[
             self.hd, self.hkv, self.hq, tokens,
         ])
@@ -518,11 +498,7 @@ impl Attention {
         let page = pol.page as i32;
         // ① K0 批量写池(本 chunk k/v 先入池;slots [T] = 物理槽表,engine 单源)
         // B6.2:fp8 池 → K0 转换写(env.kv.quant 单源)
-        let k0_op = if ctx.env.kv.quant == crate::env::KvQuant::Fp8E4M3 {
-            ids::ATTN_K0_WRITE_FP8
-        } else {
-            ids::ATTN_K0_WRITE
-        };
+        let k0_op = ctx.env.kv.k0_write_op();
         let wr = TensorOps::call(k0_op).aux(&[tokens])
         .arg(k)
         .arg(v)
@@ -602,9 +578,9 @@ impl Attention {
     ) -> TensorOps {
         let dt = q.dtype;
         let page = pol.page as i32;
-        let fp8kv = ctx.env.kv.quant == crate::env::KvQuant::Fp8E4M3;
+        let fp8kv = ctx.env.kv.is_fp8();
         // ① K0-dual:classic K/V + kNHD K/V 影子(f16 或 e4m3;slots = 物理槽表)
-        let wr = TensorOps::call(if fp8kv { ids::ATTN_K0_DUAL_FP8KV } else { ids::ATTN_K0_DUAL })
+        let wr = TensorOps::call(ctx.env.kv.k0_dual_op())
             .aux(&[tokens])
             .arg(k)
             .arg(v)
@@ -624,7 +600,7 @@ impl Attention {
         let ctx_total = ctx.ctx_base + tokens;
         let y = TensorOps::of(
             crate::kernel::Kernel::new(
-                if fp8kv { "flashinfer_prefill_paged_fp8kv" } else { "flashinfer_prefill_paged_f16" },
+                ctx.env.kv.fi_prefill_name(),
                 "",
             )
             .with_sig("T,T,T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz,sz,sz"),
@@ -2140,6 +2116,7 @@ mod split_probe_tests {
             .with_shape(Dtype::F16, vec![1]);
         let y = TensorOps::of(
             crate::kernel::Kernel::new(
+                // 测试局部选择(生产走 ctx.env.kv.fi_prefill_name() 收口)
                 if fp8kv { "flashinfer_prefill_paged_fp8kv" } else { "flashinfer_prefill_paged_f16" },
                 "",
             )

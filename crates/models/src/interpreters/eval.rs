@@ -185,6 +185,46 @@ where
     })
 }
 
+/// 多根 + 竞技场回收(B6.3 后泄漏案,2026-10-10):roots 各自归约共享
+/// CSE;pending = 各根 count_pending 合并(共享子树用户数累加);求值
+/// 完成后 candidates = arena − 根集就地 face.free(流序 free:消费
+/// kernel 已入队,同流保序 —— 与 scoped 单根同一法律)。
+/// 用途:运行期副作用树(K0 写哑根/encode 等)——roots 仅触发执行,
+/// 中间块不再被引用;捕获窗仍必须用 plain eval_ops_multi_env(块常驻)。
+pub fn eval_ops_multi_scoped_env<'a, D>(
+    roots: &'a [&'a TensorOps],
+    face: &'a mut D,
+    env: crate::env::EnvProvider,
+) -> Pin<Box<dyn Future<Output = Result<Vec<Bytes>, ModelError>> + Send + 'a>>
+where
+    D: crate::contract::DeviceClient + 'a,
+{
+    Box::pin(async move {
+        let mut pending: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        for r in roots {
+            for (id, c) in count_pending(r) {
+                *pending.entry(id).or_insert(0) += c;
+            }
+        }
+        let mut ctx =
+            EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new(),
+                arena_set: std::collections::HashSet::new(),
+                block_users: std::collections::HashMap::new(),
+                pending, reclaim: true, env };
+        let mut out = Vec::with_capacity(roots.len());
+        for r in roots {
+            out.push(_eval_rec(r, &mut ctx).await?);
+        }
+        let root_ids: std::collections::HashSet<u64> = out.iter().map(|b| b.id).collect();
+        let mut candidates: Vec<u64> = std::mem::take(&mut ctx.arena);
+        candidates.retain(|id| !root_ids.contains(id) && ctx.arena_set.contains(id));
+        if !candidates.is_empty() {
+            ctx.face.free(&candidates).await?;
+        }
+        Ok(out)
+    })
+}
+
 /// 带观测的求值(interpreter-tap.md §4.2):归约语义与 [`eval_ops`]
 /// 完全一致,仅在每个节点 After 窗口发事件 —— 数据读取(Stats/Bytes)
 /// 由解释器代执行,tap 零执行权(观测窗口律,候选 §四 律 25)。

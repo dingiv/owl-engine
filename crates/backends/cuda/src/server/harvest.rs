@@ -285,6 +285,11 @@ impl GpuServer {
         {
             return ack.send(Err(e));
         }
+        // 取证(B6.3 后泄漏案):每次收割刷新设备余量账(engine 侧逐 turn 打印;
+        // cuMemGetInfo µs 级,收割频度下零税)
+        if let Ok((free, _)) = cudarc::driver::result::mem_get_info() {
+            owl_shared::vram::free_set(free as u64);
+        }
         if let Some(t) = t_d2h {
             eprintln!("[d2h-prof] sync={:?} n={want_bytes}", t.elapsed());
         }

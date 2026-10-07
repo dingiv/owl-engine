@@ -272,6 +272,20 @@ impl<D: DeviceClient> RunningEngine<D> {
         };
         let id = self.next_id;
         self.next_id += 1;
+        // B6.3 后泄漏案姊妹修(2026-10-10):跨 turn 快照有效性重置。
+        // spec_snap_valid 若带 true 进新 turn(上 turn 末轮全接受无 fold
+        // 时不失效),新 turn 首个部分接受轮会用上 turn 的陈旧快照折叠
+        // → GDN 状态永久污染 → 草稿/目标全漂 → AL 崩塌(实测 turn2 起
+        // AL 2.97→0.49;新 boot 首 turn 恒健康 = 同指纹)。新 turn =
+        // 新状态序列,快照无条件失效。
+        self.spec_snap_valid = false;
+        // 同族:B4 降级态(streak/degraded/退避)是“本 turn 内”的让路,
+        // 不是会话/引擎属性 —— 残留则下 turn 带病起步(退避已 ×2 多次,
+        // 探测要数十 token 才回一次,整轮趴在裸档)。上 turn 尾段高熵
+        // 降级 ≠ 下 turn 开头也该降级。三态归零 = 回到初始探测节奏。
+        self.spec_zero_streak = 0;
+        self.spec_degraded = false;
+        self.spec_probe_every = self.probes.probe_every;
         self.queue.push_back(Turn {
             id,
             session_id,

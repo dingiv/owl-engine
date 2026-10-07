@@ -60,6 +60,65 @@ impl KvEnv {
         Self { quant: KvQuant::None, dtype: Dtype::F16, page: 32, x: 8, paged: true }
     }
 
+    // ── KV 内核选择唯一出口(收口律,2026-10-10)─────────────────
+    // 主池/影子的每个写者/读者族一个具名方法;分派点零分支调用。
+    // 病史:融合插池 f16 臂 / K0-DUAL classic 臂 / NC 悬空名三次漏网,
+    // 根因 = 分派点散布 `if quant == ...`;新增写者 = 新增方法 + 登记表
+    // 行 + 清单门(kv_manifest_gate)三件套,禁止在分派点手写分支。
+
+    /// K0 批量写(classic 池;naive decode / chunked prefill / naive prefill 共用)
+    pub fn k0_write_op(&self) -> crate::ops::OpId {
+        match self.quant {
+            KvQuant::Fp8E4M3 => crate::ops::ids::ATTN_K0_WRITE_FP8,
+            KvQuant::None => crate::ops::ids::ATTN_K0_WRITE,
+        }
+    }
+
+    /// K0 双写(classic + FI kNHD 影子;两臂随 quant 同 dtype)
+    pub fn k0_dual_op(&self) -> crate::ops::OpId {
+        match self.quant {
+            KvQuant::Fp8E4M3 => crate::ops::ids::ATTN_K0_DUAL_FP8KV,
+            KvQuant::None => crate::ops::ids::ATTN_K0_DUAL,
+        }
+    }
+
+    /// chunked paged prefill 批读
+    pub fn prefill_paged_attn_op(&self) -> crate::ops::OpId {
+        match self.quant {
+            KvQuant::Fp8E4M3 => crate::ops::ids::ATTN_PAGED_PREFILL_FP8,
+            KvQuant::None => crate::ops::ids::ATTN_PAGED_PREFILL,
+        }
+    }
+
+    /// v2 分页 decode 打分
+    pub fn decode_v2_op(&self) -> crate::ops::OpId {
+        match self.quant {
+            KvQuant::Fp8E4M3 => crate::ops::ids::ATTN_PAGED_DECODE_V2_FP8,
+            KvQuant::None => crate::ops::ids::ATTN_PAGED_DECODE_V2,
+        }
+    }
+
+    /// decode 融合插池(qk-norm+rope+K/V 插池三合一)
+    pub fn fused_insert_op(&self) -> crate::ops::OpId {
+        match self.quant {
+            KvQuant::Fp8E4M3 => crate::ops::ids::ATTN_QKV_NORM_ROPE_INSERT_FP8KV,
+            KvQuant::None => crate::ops::ids::ATTN_QKV_NORM_ROPE_INSERT,
+        }
+    }
+
+    /// FI paged prefill 虚核名(Kernel::new 直名族)
+    pub fn fi_prefill_name(&self) -> &'static str {
+        match self.quant {
+            KvQuant::Fp8E4M3 => "flashinfer_prefill_paged_fp8kv",
+            KvQuant::None => "flashinfer_prefill_paged_f16",
+        }
+    }
+
+    /// 主池是否 e4m3 字节承载(池账/几何消费;非内核选择)
+    pub fn is_fp8(&self) -> bool {
+        self.quant == KvQuant::Fp8E4M3
+    }
+
     /// classic 布局策略(层/引擎几何消费;None = legacy 回退)
     pub fn policy(&self) -> Option<KvPagedPolicy> {
         if !self.paged {

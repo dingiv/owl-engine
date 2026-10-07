@@ -26,7 +26,7 @@ pub mod eval;
 pub mod generate;
 pub mod observe;
 
-pub use eval::{eval, eval_ops, eval_ops_multi, eval_ops_multi_env, eval_ops_env, eval_ops_scoped, eval_ops_scoped_env, eval_ops_tap};
+pub use eval::{eval, eval_ops, eval_ops_multi, eval_ops_multi_env, eval_ops_multi_scoped_env, eval_ops_env, eval_ops_scoped, eval_ops_scoped_env, eval_ops_tap};
 pub use generate::{eval_generate, GenSpec, Sampling};
 pub use observe::{BlockRef, BlockStats, NodeEvent, StatRecord, StatsTap, Tap, Want};
 

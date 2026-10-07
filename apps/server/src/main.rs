@@ -9,7 +9,7 @@
 //!
 //! 环境:OWL_BIND(默认 127.0.0.1:8135)/ OWL_DEVICE(ordinal,默认 0)/
 //! OWL_MODEL_DIR(默认 workspace 内 Qwen3.5-0.8B)/ OWL_MODEL_NAME /
-//! OWL_MAX_SEQ(默认 4096;attention 窗上限,E1 后 paged 布局解除 256 顶)/ OWL_PREFILL_CHUNK(默认 32)。
+//! OWL_MAX_SEQ(默认 4096;attention 窗上限,E1 后 paged 布局解除 256 顶)/ OWL_PREFILL_CHUNK(默认 512,2026-10-10 提档)。
 //!
 //! 用法:
 //! ```text
@@ -49,7 +49,9 @@ async fn main() {
     // 4k 默认(E1 收尾:paged 布局 + carve 对齐落地后解除 256 顶;
     // 旧 naive 回退路径仍受核自身限制,层分派表自动选路)
     let max_seq: usize = env_or("OWL_MAX_SEQ", "4096".into()).parse().unwrap_or(4096);
-    let chunk: usize = env_or("OWL_PREFILL_CHUNK", "32".into()).parse().unwrap_or(32);
+    // chunk 512(2026-10-10 提档:32→512,host 发射摊销;speedtest 实测
+    // 2048 点 347→953 / 8192 点 688 t/s;chunk 1024+ 收益递减待测)
+    let chunk: usize = env_or("OWL_PREFILL_CHUNK", "512".into()).parse().unwrap_or(512);
     let model_dir = std::env::var("OWL_MODEL_DIR").map(PathBuf::from).unwrap_or_else(|_| {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../crates/models/assets/Qwen3.5-0.8B")
     });

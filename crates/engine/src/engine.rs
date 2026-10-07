@@ -201,6 +201,10 @@ impl<D: DeviceClient + 'static> Engine<D> {
         };
         // B6.2:主 KV 池 fp8 承载(OWL_KV_FP8 → env.kv.quant = Fp8E4M3)
         let kv_fp8 = env.kv.quant == owl_models::env::KvQuant::Fp8E4M3;
+        // KV 写者/读者清单门(收口律机器门):按活跃 quant 逐族校验内核
+        // 在登记表与 .cu 源在场;缺族/缺名 = 装配失败(池 dtype 改造漏网
+        // 即启动即拦,不等 E2E 红灯)
+        owl_models::kernel::kv_manifest_gate(env.kv.quant, env.attn.fi)?;
         if kv_fp8 {
             eprintln!("[boot] KV 池 fp8 e4m3(容量减半/ctx 翻倍;读核 *_fp8 变体)");
         }

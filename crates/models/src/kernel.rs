@@ -335,6 +335,76 @@ pub fn launch_shape(grid: (u32, u32, u32), block: (u32, u32, u32), shared_mem: u
     LaunchShape { grid, block, shared_mem }
 }
 
+// ======================================================================
+// KV 写者/读者清单门(收口律配套;pitfall §14 机器化,2026-10-10)
+// ======================================================================
+
+/// 按活跃 KV quant 声明每族的内核名,boot 逐名校验:名字不在登记表、
+/// 或 .cu 源里无同名定义 = 装配失败。三次漏网(decode 融合插池 f16 臂 /
+/// K0-DUAL classic 臂 / NC 悬空名)的机器拦截:新增池写者/读者 =
+/// 登记表行 + KvEnv 选择子 + 本清单,三处缺一启动即拦。
+pub fn kv_manifest_gate(
+    quant: crate::env::KvQuant,
+    fi_on: bool,
+) -> Result<(), crate::contract::ModelError> {
+    let fp8: &[&str] = &[
+        "owl_reshape_and_cache_fp8kv",                   // K0 写(classic)
+        "owl_reshape_and_cache_dual_f16_fp8kv",          // K0 双写(classic+影子,双臂 e4m3)
+        "vllm_chunked_prefill_paged_attn_opt_fp8_hd128", // chunked 读 hd128
+        "vllm_chunked_prefill_paged_attn_opt_fp8_hd256", // chunked 读 hd256
+        "vllm_paged_attention_v2_fp8_hd128bs32",         // v2 decode hd128
+        "vllm_paged_attention_v2_fp8_hd256bs32",         // v2 decode hd256
+        "owl_qknorm_rope_kv_insert_f16_fp8kv",           // decode 融合插池
+        "owl_naive_attn_nc_f16",                         // 草稿池 f16 NC
+        "owl_naive_attn_nc_fp8kv_f16",                   // 草稿池 fp8 NC
+    ];
+    let f16: &[&str] = &[
+        "vllm_reshape_and_cache_f16",                    // K0 写(classic)
+        "owl_reshape_and_cache_dual_f16",                // K0 双写(classic+影子)
+        "vllm_chunked_prefill_paged_attn_opt_f16_hd128",
+        "vllm_chunked_prefill_paged_attn_opt_f16_hd256",
+        "vllm_paged_attention_v2_f16_hd128bs32",
+        "vllm_paged_attention_v2_f16_hd256bs32",
+        "owl_qknorm_rope_kv_insert_f16",                 // decode 融合插池
+        "owl_naive_attn_nc_f16",                         // 草稿池 f16 NC
+        "owl_naive_attn_nc_bf16",                        // 草稿池 bf16 NC
+    ];
+    let mut family: Vec<&str> = match quant {
+        crate::env::KvQuant::Fp8E4M3 => fp8.to_vec(),
+        crate::env::KvQuant::None => f16.to_vec(),
+    };
+    // FI prefill 虚核**不入本清单**:FI 走 server plan 缓存路径(适配器
+    // 自校验 is_fi),不在 models 登记表(零 kernels 依赖律)。仅信息行。
+    if fi_on {
+        let fi_name = match quant {
+            crate::env::KvQuant::Fp8E4M3 => "flashinfer_prefill_paged_fp8kv",
+            _ => "flashinfer_prefill_paged_f16",
+        };
+        eprintln!("[kv-manifest] FI prefill = {fi_name}(server plan 路径,适配器自校验)");
+    }
+    let mut bad: Vec<&str> = Vec::new();
+    for name in &family {
+        let Some(e) = REGISTRY.iter().find(|e| e.name == *name) else {
+            bad.push(name);
+            continue;
+        };
+        // .cu 源里必须有同名 extern 入口(登记表行在而源缺定义 = 悬空名)
+        if !e.source.contains(&format!("extern \"C\" __global__ void {name}")) {
+            bad.push(name);
+        }
+    }
+    if !bad.is_empty() {
+        return Err(crate::contract::ModelError::Msg(format!(
+            "kv_manifest_gate(quant={quant:?}): 清单内核缺失或 .cu 源无定义: {bad:?} —— 池 dtype 改造漏网(pitfall §14 写者穷举律)"
+        )));
+    }
+    eprintln!(
+        "[kv-manifest] quant={quant:?} fi={fi_on}:{} 族内核全部在场 ✓",
+        family.len()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

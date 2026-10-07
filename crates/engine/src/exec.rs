@@ -637,7 +637,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 {
                     let face = self.session.face_mut();
                     let refs: Vec<&TensorOps> = roots.iter().collect();
-                    owl_models::interpreters::eval_ops_multi(&refs, face).await?;
+                    owl_models::interpreters::eval_ops_multi_scoped_env(&refs, face, self.env).await?;
                 }
                 t_rollback = ts.elapsed();
             } else {
@@ -936,7 +936,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         {
             let face = self.session.face_mut();
             let refs: Vec<&TensorOps> = roots.iter().collect();
-            owl_models::interpreters::eval_ops_multi(&refs, face).await?;
+            owl_models::interpreters::eval_ops_multi_scoped_env(&refs, face, self.env).await?;
         }
         // 探针:首回合 memory 落盘(python 重算 fc 对拍;真块 dtoh 合法。
         // taps 由调用方从 concat 父块整块落盘 —— 切片视图 dtoh 整父块契约)
@@ -1309,7 +1309,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         {
             let face = self.session.face_mut();
             let refs: Vec<&TensorOps> = roots.iter().collect();
-            owl_models::interpreters::eval_ops_multi(&refs, face).await?;
+            owl_models::interpreters::eval_ops_multi_scoped_env(&refs, face, self.env).await?;
         }
         if probe {
             let (k0, _) = &leaves[0];
@@ -2400,6 +2400,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
 
     async fn complete(&mut self) -> Result<TurnEvent> {
         let act = self.active.take().expect("active");
+        // 取证(B6.3 后泄漏案):每 turn 设备余量打点(free 账由 cuda 侧 dtoh
+        // 收割刷新;泄漏 = 线性下降)
+        eprintln!("[vram-trace] turn end: free={:.0}MiB out={}",
+                  owl_shared::vram::free_bytes() as f64 / 1024.0 / 1024.0, act.out.len());
         // spec 态清理(E5-M2b):陈旧草稿块作废( Continuation 已变,
         // 下一 turn 由 prefill seed 重新 propose;草稿只影响速度,不清也
         // 恒等 —— 但清了省 dtoh + free 账目干净)
