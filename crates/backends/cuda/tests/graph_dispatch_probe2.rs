@@ -39,8 +39,8 @@ async fn marlin_graph_dispatch_probe() {
     let q: Vec<u8> = (0..n * k).map(|i| ((i * 7 + 3) % 16) as u8).collect();
     let s: Vec<f32> = (0..n * (k / g)).map(|i| 0.5 + ((i * 13) % 13) as f32 * 0.08).collect();
     let t0 = Instant::now();
-    let b_packed = owl_kernels::marlin::repack::pack_marlin_b(&q, k, n);
-    let s_packed = owl_kernels::marlin::repack::pack_marlin_s(&s, n, k / g);
+    let b_packed = owl_kernels::family::marlin::repack::pack_marlin_b(&q, k, n);
+    let s_packed = owl_kernels::family::marlin::repack::pack_marlin_s(&s, n, k / g);
     eprintln!("[m-probe] repack {:.1}s", t0.elapsed().as_secs_f32());
 
     let da = client
@@ -51,7 +51,7 @@ async fn marlin_graph_dispatch_probe() {
         .expect("htod a");
     let db = client.htod(Dtype::U32, &Shape::from(vec![b_packed.len()]), &le_i32(&b_packed)).await.expect("htod b");
     let ds = client.htod(Dtype::F16, &Shape::from(vec![s_packed.len()]), &le_u16(&s_packed)).await.expect("htod s");
-    let ws_len = owl_kernels::marlin::v2_workspace_len(n).max(n / 128 * 16);
+    let ws_len = owl_kernels::family::marlin::v2_workspace_len(n).max(n / 128 * 16);
     let dws = client.alloc(Dtype::U32, ws_len).await.expect("ws");
     let dctmp = client.alloc(Dtype::U32, 1).await.expect("ctmp");
     let dc = client.alloc(Dtype::F16, m * n).await.expect("c");

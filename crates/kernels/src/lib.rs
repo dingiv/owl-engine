@@ -5,48 +5,37 @@
 //! 直接接线;attention = attention-rs 快照;这里只定义**契约与分发表**,
 //! 不实现 kernel(REQ-DESIGN-03:自研是最后手段)。
 
-/// cuBLAS 封装(f16 GEMM 通道;feature "cublas",server 侧消费)
-#[cfg(feature = "cublas")]
-pub mod cublas;
+/// 契约面(类型权威:Dtype/线格式/Bytes/LaunchMsg/OpError/OpId;
+/// 2026-10-12 M2 自 owl-iface::contract 迁入 —— iface 依赖 kernels,
+/// kernels 不依赖 iface,契约老家即此;iface 经 re-export 续用旧路径)
+pub mod contract;
 
-/// Marlin W4A16(f16 激活 × u4 权重;feature "marlin",foreign-kernel 通道)
-#[cfg(feature = "marlin")]
-pub mod marlin;
+/// native kernel 登记表 + Kernel 值(2026-10-12 自 models::kernel 迁入;
+/// 登记表与 driver 同 crate,driver_picks_are_registered 耦合测试随迁)
+pub mod native;
 
-/// FlashInfer prefill(foreign-kernel 通道;预编 .a;feature "flashinfer")
-#[cfg(feature = "flashinfer")]
-pub mod flashinfer;
+/// 家族底座(资产/FFI/ABI:两平面共用的单源 —— cubins/OwlCublas/marlin
+/// FFI/flashinfer FFI;cublas/marlin/flashinfer 随各自 FFI feature 门)
+pub mod family;
 
-/// GDN chunked delta rule(foreign-kernel 通道;FLA AOT cubin)
-pub mod gdn_chunked;
+/// ── 算子两平面(按家族拆分;P0 名字无关的两个住址)──
+/// 客户端平面(类型化 Call builder + 线格式单源;models 视角,
+/// 零 cudarc 依赖 —— 随 lib 全 feature 可用)
+pub mod client;
+/// 服务端平面(家族 runtime:FamilyRuntime 实现;feature=device ——
+/// FamilyRuntime 签名引用 device::Exec)
+#[cfg(feature = "device")]
+pub mod server;
 
-/// GDN 标量门 chunked 前向(foreign-kernel 通道;lmdeploy pre_sm90 port,
-/// 单核替代五核流水;cubin 预编入库,免 feature 门)
-pub mod gdn_scalar;
+/// 服务端面原语(DeviceRes 资源面 trait + Exec 执行引擎;feature=device,
+/// 纯 cudarc driver/nvrtc —— 勿挂 "cuda":其 ops.cu 预编链为存量断链)
+#[cfg(feature = "device")]
+pub mod device;
 
-/// foreign-kernel 总分派谓词(server handle_launch 前置;外部算子总表)。
-/// 新外部库 = 各自模块 is_foreign + 此处加一行(命令面零新增)。
-pub fn is_foreign_op(name: &str) -> bool {
-    #[cfg(feature = "cublas")]
-    if cublas::is_foreign(name) {
-        return true;
-    }
-    #[cfg(feature = "marlin")]
-    if marlin::is_foreign(name) {
-        return true;
-    }
-    #[cfg(feature = "flashinfer")]
-    if flashinfer::is_foreign(name) {
-        return true;
-    }
-    if gdn_chunked::is_foreign(name) {
-        return true;
-    }
-    if gdn_scalar::is_foreign(name) {
-        return true;
-    }
-    false
-}
+/// 算子注册表(OpId 唯一住址 + FamilyRuntime 面 + OpRegistry;
+/// 同属服务端面 —— FamilyRuntime 签名引用 device::Exec,随 device 门)
+#[cfg(feature = "device")]
+pub mod registry;
 
 /// Arch 分发表键(REQ-HW-01):业务代码禁止写死 arch,一律经此查询。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

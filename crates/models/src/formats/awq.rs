@@ -30,11 +30,11 @@ use crate::formats::mmap::{open_raw_index, Mmap, RawEntry};
 use crate::formats::split_qkvz;
 use crate::formats::w4a16::{bf16_par, i32s_le_bytes, i32s_par, u16s_le_bytes};
 use crate::module::WeightSource;
-use owl_kernels::marlin::repack::{
+use owl_kernels::family::marlin::repack::{
     marlin_fused_indices, pack_marlin_b_fused, pack_marlin_b_gather_into, pack_marlin_s,
     pack_marlin_z, unpack_zp_ct,
 };
-use owl_kernels::marlin::v2_workspace_len;
+use owl_kernels::family::marlin::v2_workspace_len;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -510,7 +510,7 @@ impl AwqSource {
                     .unwrap()
                     .entry((k, out, false))
                     .or_insert_with(|| {
-                        Arc::new(owl_kernels::marlin::repack::marlin_gather_indices(k, out))
+                        Arc::new(owl_kernels::family::marlin::repack::marlin_gather_indices(k, out))
                     })
                     .clone();
                 let q = q_buf.as_ref().expect("F16 臂 q_buf 必在");
@@ -976,7 +976,7 @@ mod tests {
         assert_eq!(src.elem_len("l.zeros"), Some(groups * (out / 8)));
         assert_eq!(
             src.elem_len("l.marlin_ws"),
-            Some(owl_kernels::marlin::v2_workspace_len(out))
+            Some(owl_kernels::family::marlin::v2_workspace_len(out))
         );
         assert_eq!(src.elem_len("l.marlin_ctmp"), Some(1));
         // zeros 键可取(U32 位型;字节级正确性由 GPU 对拍核内验证)

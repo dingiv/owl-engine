@@ -39,7 +39,7 @@ pub const GDN_SCALAR_SLOTS: &str = "[T q, T k, T v, T g, T beta, T state, O out,
 /// 构建零 nvcc;源改动重编一条命令,见 assets/gdn_scalar/build.sh)
 pub mod cubin {
     /// owl_gdn_chunk_scalar_f32(f32 金标通道;f16/bf16 引擎通道接线时加)
-    pub const CHUNK_SCALAR_F32: &[u8] = include_bytes!("../assets/gdn_scalar/chunk_scalar_f32.cubin");
+    pub const CHUNK_SCALAR_F32: &[u8] = include_bytes!("../../assets/gdn_scalar/chunk_scalar_f32.cubin");
 
     /// 内核符号名(extern "C",名稳)
     pub const KERNEL_F32: &str = "owl_gdn_chunk_scalar_f32";

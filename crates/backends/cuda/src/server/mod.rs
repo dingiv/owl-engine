@@ -25,7 +25,11 @@
 //! **流语义**:客户端可要求签发新流(NewStream → StreamId);此后每条
 //! 原语带流 id —— 流内保序(依赖维),流间并发。
 
-use crate::ffi::{launch_host_function, memcpy_dtoh_async, memcpy_htod_async, memset_d8_async, PushKernelArg};
+use crate::ffi::{
+    launch_host_function, memcpy_dtoh_async, memcpy_htod_async, memset_d8_async, PushKernelArg,
+    CudaContext, CudaSlice, CudaStream,
+};
+use std::sync::Arc;
 use cudarc::driver::DevicePtr;
 use crate::command::{Ack, Command};
 use crate::launch::issue_launch;
@@ -44,78 +48,6 @@ type Finish = Box<dyn FnOnce() + Send>;
 #[derive(Default)]
 pub(super) struct PinnedPool {
     free: std::sync::Mutex<Vec<Box<dyn owl_iface::contract::PinnedRegion + Send>>>,
-}
-
-/// FlashInfer prefill 句柄(E1.5):设备 workspace(float/int)+ host
-/// 暂冲 + 1 项 plan 缓存(全层同参;key = 形状七元组)。
-struct FiState {
-    float_ws: cudarc::driver::CudaSlice<u8>,
-    int_ws: cudarc::driver::CudaSlice<u8>,
-    /// 裸指针缓存(device_ptr 的 SyncOnDrop 每调用同步流 —— 发射期禁调;
-    /// init 时流空零成本取一次)
-    float_ws_ptr: u64,
-    int_ws_ptr: u64,
-    host_staging: Vec<u8>,
-    plan: Option<FiPlanCache>,
-}
-
-/// GDN chunked 句柄(FLA AOT cubin 五核 + f32 scratch + cast 模块)
-struct GdnChunkedState {
-    cumsum: std::sync::Arc<cudarc::driver::CudaFunction>,
-    kkt: std::sync::Arc<cudarc::driver::CudaFunction>,
-    /// solve_tril(BT=64 单核形态 = merge_16x16_to_64x64_inverse)
-    merge: std::sync::Arc<cudarc::driver::CudaFunction>,
-    wu: std::sync::Arc<cudarc::driver::CudaFunction>,
-    h: std::sync::Arc<cudarc::driver::CudaFunction>,
-    o: std::sync::Arc<cudarc::driver::CudaFunction>,
-    /// 状态转置核(CAST nvrtc 同模块):owl 池 [HV,K,V] ↔ fork [HV,V,K]
-    trans_kv_vk: std::sync::Arc<cudarc::driver::CudaFunction>,
-    trans_vk_kv: std::sync::Arc<cudarc::driver::CudaFunction>,
-    /// dtype 统一律(2026-10-11Ⅵ):bf16/f32 铸全在 handler 内,层侧纯 f16
-    cast_f16_bf16: std::sync::Arc<cudarc::driver::CudaFunction>,
-    cast_bf16_f16: std::sync::Arc<cudarc::driver::CudaFunction>,
-    cast_f16_f32: std::sync::Arc<cudarc::driver::CudaFunction>,
-    /// 输入 bf16 镜像(q/k/v/beta)+ g f32 镜像 + 输出 bf16 scratch
-    in_q: cudarc::driver::CudaSlice<u16>,
-    in_k: cudarc::driver::CudaSlice<u16>,
-    in_v: cudarc::driver::CudaSlice<u16>,
-    in_beta: cudarc::driver::CudaSlice<u16>,
-    in_g: cudarc::driver::CudaSlice<f32>,
-    o_b16: cudarc::driver::CudaSlice<u16>,
-    // 2026-10-11 fork-bf16 全家桶中间量(g 恒 f32;q/k/v/beta bf16 层侧铸):
-    /// g_cum [T*hv] f32(cumsum 出)
-    g_cum: cudarc::driver::CudaSlice<f32>,
-    /// A(kkt 出)/ Ai(merge 出)[T*hv*64] f32 ×2
-    a_buf: cudarc::driver::CudaSlice<f32>,
-    ai_buf: cudarc::driver::CudaSlice<f32>,
-    /// w [T*hv*kd] / u [T*hv*vd] bf16(以 u16 承载)
-    w: cudarc::driver::CudaSlice<u16>,
-    u: cudarc::driver::CudaSlice<u16>,
-    /// h_buf [nt*hv*vd*kd] bf16(fork 布局 V 行 K 列)
-    h_buf: cudarc::driver::CudaSlice<u16>,
-    /// v_new [T*hv*vd] bf16(h 核出,o 核入)
-    v_new: cudarc::driver::CudaSlice<u16>,
-    /// 转置后状态 [hv*kd*vd] f32(固定尺寸,init 分配);h0 入态
-    state_t: cudarc::driver::CudaSlice<f32>,
-    /// ht 出态(与 h0 分离 —— fork 探针姿势为两张量;别名行为未证)
-    state_out_t: cudarc::driver::CudaSlice<f32>,
-    /// varlen 元数据驻留(2026-10-11:vLLM 同款姿势 —— cu/idx/coff 按
-    /// (T,NT) 键一次构建永驻,削掉每 call 3 个 pageable htod)
-    meta_cache: std::collections::HashMap<(usize, usize), usize>,
-    /// 驻留表仓库(键序:cu[2] + coff[2] + idx[NT*2];按 meta_cache 索引)
-    meta_bufs: Vec<cudarc::driver::CudaSlice<i64>>,
-    t_cap: usize,
-    hv_dim: usize,
-    kd_dim: usize,
-    vd_dim: usize,
-}
-
-/// plan 缓存项:形状键 + plan15 + tile/split
-struct FiPlanCache {
-    key: (usize, usize, usize, usize, usize, usize, usize),
-    plan15: [i64; 15],
-    cta_tile_q: i32,
-    split_kv: i32,
 }
 
 impl PinnedPool {
@@ -164,7 +96,6 @@ impl ServerProbes {
     }
 }
 
-mod foreign;
 mod harvest;
 
 pub struct GpuServer {
@@ -179,82 +110,19 @@ pub struct GpuServer {
     boot: Option<mpsc::Sender<Result<(), String>>>,
     ctx: Option<GpuCtx>,
     kernels: KernelCache,
-    /// cuBLAS 封装(foreign-kernel 通道;算子之家 owl-kernels::cublas,懒初始化)
-    blas: Option<owl_kernels::cublas::OwlCublas>,
-    /// 刀1.5:server 私有 cublas 工作区(4MB;SetWorkspace 预绑,捕获期
-    /// gemv splitK 不再走池分配烙 MEM_ALLOC/FREE 节点)。**每 server 独享**
-    /// —— 全局单例在并行 server 下两句柄并发写同一缓冲 = ILLEGAL_ADDRESS
-    /// (2026-10-03 实测);生命周期随 server(同 ctx,指针恒有效)。
-    blas_ws: Option<std::sync::Arc<cudarc::driver::CudaSlice<u8>>>,
-    /// FlashInfer prefill 句柄(foreign-kernel 通道;workspace + plan 缓存,
-    /// 懒初始化 —— owl-kernels::flashinfer)
-    fi: Option<FiState>,
-    /// GDN chunked 句柄(FLA AOT cubin 五核;懒初始化)
-    gdn_chunked: Option<GdnChunkedState>,
-    /// GDN scalar 句柄(lmdeploy pre_sm90 port 单核;懒初始化)
-    gdn_scalar: Option<GdnScalarState>,
+    /// 算子注册表(M4 cutover:foreign 分派唯一入口;boot 装配,P4 门)
+    registry: Option<owl_kernels::registry::OpRegistry>,
+    /// 执行引擎(kernels::device;LaunchVal 值表发射 + 装载缓存)
+    exec: owl_kernels::device::Exec,
+    /// scratch 物理账本(家族 runtime 的 alloc 落此;append-only,
+    /// 释放 = server 销毁 —— 家族 grave 是逻辑侧,这里是物理侧)
+    scratch_ledger: Vec<(u64, CudaSlice<u8>)>,
     /// 完成派发出口(host 回调只投递;派发线程执行真正的 finish)
     dispatch: Option<mpsc::Sender<Finish>>,
     /// 逐命令计时账本(OWL_SRV_TIMING;name / count / total_ns / max_ns)
     timings: Vec<(&'static str, u64, u128, u128)>,
     /// 探针开关(构造期解析;热路径零 env 查询)
     probes: ServerProbes,
-}
-
-fn gdn_dptr<T>(s: &mut cudarc::driver::CudaSlice<T>, stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> u64 {
-    use cudarc::driver::DevicePtr;
-    let (p, _g) = s.device_ptr(stream);
-    p
-}
-
-/// GDN chunked scratch 扩容(逐 slice alloc;Result 化供 ? 链)
-#[allow(clippy::too_many_arguments)]
-fn gdn_chunked_realloc(
-    st: &mut GdnChunkedState,
-    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
-    t: usize,
-    nt: usize,
-    hv: usize,
-    nk: usize,
-    kd: usize,
-    vd: usize,
-) -> Result<(), ModelError> {
-    // fork-bf16 配方(2026-10-11):g 链 f32;q/k/v/beta/w/u/h/v_new bf16(u16)
-    st.g_cum = stream.alloc_zeros::<f32>(t * hv).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
-    st.a_buf = stream.alloc_zeros::<f32>(t * hv * 64).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
-    st.ai_buf = stream.alloc_zeros::<f32>(t * hv * 64).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
-    st.w = stream.alloc_zeros::<u16>(t * hv * kd).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
-    st.u = stream.alloc_zeros::<u16>(t * hv * vd).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
-    st.h_buf = stream.alloc_zeros::<u16>(nt * hv * vd * kd).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
-    st.v_new = stream.alloc_zeros::<u16>(t * hv * vd).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
-    // dtype 统一律镜像(handler 内铸的 bf16/f32 副本)
-    st.in_q = stream.alloc_zeros::<u16>(t * nk * kd).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
-    st.in_k = stream.alloc_zeros::<u16>(t * nk * kd).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
-    st.in_v = stream.alloc_zeros::<u16>(t * hv * vd).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
-    st.in_beta = stream.alloc_zeros::<u16>(t * hv).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
-    st.in_g = stream.alloc_zeros::<f32>(t * hv).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
-    st.o_b16 = stream.alloc_zeros::<u16>(t * hv * vd).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
-    st.t_cap = t;
-    Ok(())
-}
-
-/// GDN scalar 臂状态(lmdeploy pre_sm90 port 单核):内核 + f16 cast + 私有
-/// scratch(o_f32 / seq_off)。无中间张量 —— q/k/v/g/beta 直用层侧 cast 产物块。
-struct GdnScalarState {
-    k: std::sync::Arc<cudarc::driver::CudaFunction>,
-    cast_f32_f16: std::sync::Arc<cudarc::driver::CudaFunction>,
-    o_f32: cudarc::driver::CudaSlice<f32>,
-    /// 捕获图安全(2026-10-11 立案即结案):旧代 o_f32 **坟场保活** ——
-    /// 图持有捕获时指针,扩容换新块后旧块不可释放(A1.7 租约语义;史前
-    /// 版本直接 drop → verify 图回放悬空指针 = ILLEGAL_ADDRESS,仅当
-    /// scalar × 捕获图同跑时引爆)。容量单调涨,坟场总量有界(≤ 最大代)。
-    o_f32_grave: Vec<cudarc::driver::CudaSlice<f32>>,
-    /// soff htod staging 按 T 键保活:**栈临时发起的 memcpy 在捕获窗内
-    /// = 回放读死栈**(同案第二违例);每 T 一份永不互改的 [0,T] 盒,
-    /// 捕获节点与 eager 调用各自引用自己的不变源。
-    soff_staging: std::collections::HashMap<usize, Box<[i32; 2]>>,
-    soff: cudarc::driver::CudaSlice<i32>,
-    t_cap: usize,
 }
 
 impl GpuServer {
@@ -291,11 +159,9 @@ impl GpuServer {
             ctx: None,
             kernels: KernelCache::new(diag.nvrtc_include.clone()),
 // (diag 自身随 Self 移动,克隆 include 后置)
-            blas: None,
-            blas_ws: None,
-            fi: None,
-            gdn_chunked: None,
-            gdn_scalar: None,
+            registry: None,
+            exec: owl_kernels::device::Exec::new(),
+            scratch_ledger: Vec::new(),
             dispatch: None,
             timings: Vec::new(),
             probes: ServerProbes::from_parts(&diag, debug),
@@ -313,11 +179,20 @@ impl GpuServer {
                     let _ = boot.send(Ok(()));
                 }
                 self.ctx = Some(c);
-                // C1(2026-10-11):cuBLAS 句柄/工作区构造期急切预钉
-                // (lm_head 量化后 warmup 期可能无 cublas 首发路径,惰性
-                // 初始化的捕获窗前置条件不能靠碰运氻 warmup)
-                if let Err(e) = self.ensure_blas() {
-                    eprintln!("[blas-ws] 构造期预钉失败 {e:?}(回退惰性首初始化)");
+                // M4 cutover:算子注册表 boot 装配(P4 装配门;捕获窗前 ——
+                // "捕获内首次初始化"事故类结构性消灭)。失败 = 拒启。
+                {
+                    let mut res = GpuRes {
+                        ctx: self.ctx.as_ref().expect("ctx 上线"),
+                        scratch: &mut self.scratch_ledger,
+                    };
+                    let mut exec = std::mem::take(&mut self.exec);
+                    let r = owl_kernels::registry::OpRegistry::boot(&mut res, &mut exec);
+                    self.exec = exec;
+                    match r {
+                        Ok(reg) => self.registry = Some(reg),
+                        Err(e) => return Err(format!("算子注册表装配失败(拒启): {e}")),
+                    }
                 }
             }
             Err(e) => {
@@ -392,10 +267,12 @@ impl GpuServer {
     /// Closing 收尾:设备栅栏(三条流全部落定,在飞搬运/kernel 不悬空)
     /// → 关派发通道(派发线程排完在飞 finish 后自然退出)。
     fn shutdown_fence(&mut self) {
-        // cublas 句柄先于上下文消亡(2026-09-26 定谳:字段声明序 ctx 先于
-        // blas 掉,teardown 时 cublasDestroy 撞已拆上下文 → libcublasLt
-        // SIGSEGV;显式 take = 句柄在活上下文内销毁,gdb bt 实证)
-        drop(self.blas.take());
+        // cublas 句柄先于上下文消亡(2026-09-26 定谳:teardown 时
+        // cublasDestroy 撞已拆上下文 → libcublasLt SIGSEGV;显式 take =
+        // 句柄在活上下文内销毁,gdb bt 实证)。M4 后句柄住 registry
+        // (cublas runtime 内),同律 = registry 整体先于 ctx 掉。
+        drop(self.registry.take());
+        self.scratch_ledger.clear();
         if let Some(ctx) = &self.ctx {
             for sid in [STREAM_H2D, STREAM_COMPUTE, STREAM_D2H] {
                 if let Ok(s) = ctx.stream(sid) {
@@ -686,8 +563,8 @@ impl GpuServer {
             let name = msg.kernel.name.clone();
             // 形状特化 tag:marlin 按 m×n×k 拆账(双峰形状定位,2026-10-03)
             let shape_tag = match msg.kernel.name.as_str() { // v2
-                n if n == owl_kernels::marlin::GEMM_W4A16
-                    || n == owl_kernels::marlin::GEMM_W4A16_AWQ =>
+                n if n == owl_kernels::family::marlin::GEMM_W4A16
+                    || n == owl_kernels::family::marlin::GEMM_W4A16_AWQ =>
                 {
                     let mut dims: Vec<u64> = Vec::new();
                     for a in &msg.args {
@@ -731,10 +608,22 @@ impl GpuServer {
     }
 
     fn handle_launch_inner(&mut self, msg: LaunchMsg, ack: Ack<Result<Bytes, ModelError>>) {
-        // foreign-kernel 通道(2026-09-26 合并:cuBLAS 不再另立命令,
-        // 外部算子 = 虚拟核名走同一 Launch;谓词与槽序归 owl-kernels::cublas)
-        if owl_kernels::is_foreign_op(&msg.kernel.name) {
-            return self.handle_foreign_launch(msg, ack);
+        // foreign-kernel 通道(M4 cutover:算子注册表唯一入口 —— 名字分派
+        // 在注册表内部,server 主循环零算子知识;旧 handle_foreign_launch
+        // 已退役,见 ops/ 模块)
+        if owl_kernels::registry::is_foreign_name(&msg.kernel.name) {
+            let out = (|| -> Result<Bytes, String> {
+                let ctx = self.ctx.as_ref().ok_or("server 未上线")?;
+                let mut res = GpuRes { ctx, scratch: &mut self.scratch_ledger };
+                let mut env = owl_kernels::registry::RunEnv::new(&mut res, &mut self.exec);
+                self.registry
+                    .as_mut()
+                    .ok_or("算子注册表未装配")?
+                    .execute(&msg, &mut env)
+                    .map_err(|e| e.to_string())
+            })()
+            .map_err(ModelError::Msg);
+            return ack.send(out);
         }
         let mut ack = Some(ack);
         // 字段级解构:ctx(不可变)与 kernels(可变)借用不相交
@@ -901,4 +790,91 @@ impl GpuServer {
 unsafe extern "C" fn trampoline(data: *mut std::ffi::c_void) {
     let boxed = Box::from_raw(data as *mut Box<dyn FnOnce() + Send>);
     boxed();
+}
+
+// ============================================================================
+// GpuRes —— DeviceRes 服务端实现(M4;状态 = GpuCtx 治理面 + scratch 账本)
+// ============================================================================
+//
+/// 算子域资源面视图:ctx(不可变治理面)+ scratch 物理账本(可变)。
+/// 家族 runtime 经 kernels::device::DeviceRes 使用;解析/分配/上传/
+/// 捕获查询全部对准 GpuCtx 既有机制(与旧 handler 同一机制,零新面)。
+pub(crate) struct GpuRes<'a> {
+    pub ctx: &'a crate::state::GpuCtx,
+    pub scratch: &'a mut Vec<(u64, CudaSlice<u8>)>,
+}
+
+const OP_RES: &str = "server.res";
+
+use owl_kernels::contract::OpError;
+use owl_kernels::device::ScratchBuf;
+
+impl owl_kernels::device::DeviceRes for GpuRes<'_> {
+    fn context(&self) -> Result<Arc<CudaContext>, OpError> {
+        Ok(self.ctx.ctx.clone())
+    }
+    fn stream(&self) -> Result<Arc<CudaStream>, OpError> {
+        self.ctx
+            .stream(crate::state::STREAM_COMPUTE)
+            .map_err(|e| OpError::Launch { op: OP_RES.into(), stage: owl_kernels::contract::Stage::Load, detail: format!("stream: {e:?}") })
+            .cloned()
+    }
+    fn resolve(&self, b: &Bytes) -> Result<u64, OpError> {
+        let stream = self.stream()?;
+        let (p, _) = self
+            .ctx
+            .block_ptr(b.id, &stream)
+            .map_err(|e| OpError::Contract { op: OP_RES.into(), field: "resolve", expect: "块在册".into(), got: b.id.to_string() })?;
+        Ok(p)
+    }
+    fn alloc(&mut self, bytes: usize, _tag: &'static str) -> Result<ScratchBuf, OpError> {
+        // 与旧 handler 同机制:stream.alloc_zeros(cudarc 直分配;捕获窗内
+        // 由家族 grave 律保证不再分配 —— A1.7)。append-only 账本,物理
+        // 释放 = server 销毁。
+        let stream = self.stream()?;
+        let mut d = unsafe { stream.alloc_zeros::<u8>(bytes) }
+            .map_err(|e| OpError::Launch { op: OP_RES.into(), stage: owl_kernels::contract::Stage::Load, detail: format!("scratch alloc: {e:?}") })?;
+        use cudarc::driver::DevicePtr;
+        let ptr = d.device_ptr(&stream).0;
+        self.scratch.push((ptr, d));
+        Ok(ScratchBuf { ptr, bytes })
+    }
+    fn capturing(&self) -> Result<bool, OpError> {
+        Ok(self.ctx.capture_stream())
+    }
+    fn record_capture(&mut self, _note: owl_kernels::device::LaunchNote) -> Result<(), OpError> {
+        // 捕获登记 = CUDA stream capture 原生节点(旧 handler 同款零显式
+        // 登记);A1.6 数据结构化随 graph 治理层立项(挂账)
+        Ok(())
+    }
+    fn upload(&mut self, dst: u64, src: &[u8]) -> Result<(), OpError> {
+        let stream = self.stream()?;
+        let capturing = self.ctx.capture_stream();
+        let target = self
+            .scratch
+            .iter()
+            .find(|(p, _)| *p == dst)
+            .map(|(_, s)| s.clone())
+            .ok_or_else(|| OpError::Contract {
+                op: OP_RES.into(),
+                field: "upload",
+                expect: "指针在 scratch 账本".into(),
+                got: format!("{dst:#x}"),
+            })?;
+        if capturing {
+            // 捕获窗:async 节点(回放重放 memcpy;不变盒语义由家族保证)
+            // 捕获窗:async 节点(回放重放 memcpy;不变盒语义由家族保证)
+            // SAFETY:dst ∈ scratch 账本(本 impl 分配并持有);src 不变盒
+            unsafe { crate::ffi::memcpy_htod_async(dst, src, stream.cu_stream()) };
+            Ok(())
+        } else {
+            let mut target = target;
+            stream
+                .memcpy_htod(src, &mut target)
+                .map_err(|e| OpError::Launch { op: OP_RES.into(), stage: owl_kernels::contract::Stage::Store, detail: format!("upload: {e:?}") })
+        }
+    }
+    fn device_ordinal(&self) -> Result<i32, OpError> {
+        Ok(self.ctx.device_ordinal() as i32)
+    }
 }

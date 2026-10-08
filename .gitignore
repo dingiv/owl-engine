@@ -7,4 +7,14 @@ target
 __pycache__
 crates/*-bak
 dev_log
-testdata
+# testdata:bins 大件忽略,但金标生成脚本 + manifest(可复现配方)必须进版本
+# (M1 教训:资产/金标无版本 = 哨兵失明;operator-contract 设计 §4.9)
+testdata/*
+!testdata/gdn_fla/
+testdata/gdn_fla/*
+!testdata/gdn_fla/gen.py
+!testdata/gdn_fla/gen_c5_deep.py
+!testdata/gdn_fla/harvest_fork.py
+!testdata/gdn_fla/cases/
+testdata/gdn_fla/cases/*
+!testdata/gdn_fla/cases/*.json

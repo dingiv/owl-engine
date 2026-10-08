@@ -16,6 +16,9 @@ description = "Operator dispatch + unified kernel home: .cu sources, nvrtc compi
 "marlin" = ["dep:rayon", "dep:half"]
 # FlashInfer prefill(预编 .a + foreign-kernel;E1.5 工作包)
 "flashinfer" = []
+# 服务端面执行原语(device.rs:DeviceRes + Exec;纯 cudarc driver/nvrtc,
+# 零 build.rs nvcc 面 —— "cuda" feature 的 ops.cu 预编链为存量断链,勿挂)
+"device" = ["dep:cudarc"]
 
 [dev-dependencies]
 # GDN chunked cubin 金标对拍测试(测试域直用 cudarc;lib 零依赖律不破)

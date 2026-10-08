@@ -12,17 +12,32 @@
 //! 4. h:k/v/w/u/g + h0 → h [NT,HV,KD,VD], v_new, ht(终态)
 //! 5. o:q/k/v_new/h/g → o [T,HV,VD] f32(scale = kd^-0.5)
 //!
+//! **六核流水**(fork 六核;kkt/solve 分立):
+//! 1. cumsum:g [T,HV] f32 → g_cum(**nats 域**局部累计;RCP_LN2 烘核内不施放)
+//! 2. kkt:k/beta/**g_cum** → A [T,HV,64] f32(下三角 WY 系数)
+//!    ⚠️ **g 语义律**(2026-10-11 终案):kkt/h/o 的 "g" 参数全部吃 **cumsum
+//!    产物**;喂 raw g = exp(±24) 爆炸(案录:perf-roadmap 补录Ⅷ/Ⅸ,坑册 §17)
+//! 3. merge:solve_tril(BT=64)A → Ai(**bf16 字节**;生产链 output=k.dtype)
+//! 4. wu:k/v/beta/Ai/**g_cum** → w,u [T,HV,KD] bf16
+//! 5. h:k/u/w/**g_cum** + h0 → h [NT,HV,VD,KD](**V 主**), v_new, ht(f32)
+//!    实参序 = SASS 审计(gk 被 triton 剪参);grid 二维 (cdiv(VD,BV), HV)
+//! 6. o:q/k/v_new/h/**g_cum** → o [T,HV,VD] bf16(scale = kd^-0.5)
+//!
 //! **ABI**(triton 3.7 cubin;参数序 = tt.func 声明序;global_scratch=0 无尾参;
-//! NV=48/KD=VD=128/BT=64 已烘 constexpr;T 运行时标量):
+//! NV=48/KD=VD=128/BT=64 已烘 constexpr;T 运行时标量;dtype 配方 =
+//! q/k/v/beta bf16 + g/g_cum/A f32 + Ai/w/u/h/v_new/o bf16 + state f32):
 //! ```text
-//! cumsum (s,o:*f32, scale:f32, cu:i64*, idx:i64*, T:i32)      grid (NT, HV)
-//! kkt    (k,g,beta,A:*f32, cu, idx, T)                         grid (NT, HV)
-//! wu     (k,v,beta,w,u,A,g:*f32, cu, idx, T)                   grid (NT, HV)
-//! h      (k,v,w,v_new,g,h,ht?:*f32, h0?:*f32, cu, coff:i64*, T) grid (cdiv(VD,BV)*HV,)
-//! o      (q,k,v,h,g,o:*f32, cu, idx, scale:f32, T:i32)         grid (BV组, NT, HV)
+//! cumsum (s,o:*f32, cu:i64*, idx:i64*, T:i32)                grid (NT, HV)
+//! kkt    (k,beta,g_cum,A:*f32, cu, idx, T)                    grid (NT, HV)
+//! merge  (A,Ai:*f32, cu, idx, T)                              grid (NT, HV)
+//! wu     (k,v,beta,w,u,Ai,g_cum:*f32, cu, idx, T)             grid (NT, HV)
+//! h      (k,v,w,v_new,g_cum,h,ht?:*f32, h0?:*f32, cu, coff:i64*, T) grid (cdiv(VD,BV), HV)
+//! o      (q,k,v_new,h,g_cum,o:*f32, cu, idx, scale:f32, T:i32)    grid (BV组, NT, HV)
 //! ```
-//! h 臂取 **h0 变体**(shared 24576,warps 4)—— 引擎恒带初态(首 turn 传
-//! 零块);ht(终态)= 写回 state 槽。
+//! h 臂取 **h0 变体**(shared 49412,warps 4)—— 引擎恒带初态(首 turn 传
+//! 零块);ht(终态)= 写回 state 槽。h0/ht/h_buf 布局 = [V,K](与池
+//! [K,V] 互转由 handler 转置核承担);金标对拍见 tests/gdn_chunked_golden.rs
+//! (c1-c4 pip-fla [K,V] 需转置,c5 fork [V,K] 直比——布局代际律)。
 //!
 //! **发射通道**:server foreign-kernel 单臂([`GDN_CHUNKED_FWD`]);handler
 //! 持有 cubin 模块句柄 + 持久 scratch(按 max_chunk 预分配),逐 chunk 复用。
@@ -49,21 +64,21 @@ pub fn is_foreign(name: &str) -> bool {
 /// AOT 资产(cubin 内嵌;sm86 / triton 3.7.1 产出)
 pub mod cubins {
     pub const CUMSUM: &[u8] =
-        include_bytes!("../assets/gdn_chunked/cumsum.cubin");
+        include_bytes!("../../assets/gdn_chunked/cumsum.cubin");
     pub const KKT: &[u8] =
-        include_bytes!("../assets/gdn_chunked/kkt.cubin");
+        include_bytes!("../../assets/gdn_chunked/kkt.cubin");
     pub const WU: &[u8] =
-        include_bytes!("../assets/gdn_chunked/wu.cubin");
+        include_bytes!("../../assets/gdn_chunked/wu.cubin");
     pub const H: &[u8] =
-        include_bytes!("../assets/gdn_chunked/h.cubin");
+        include_bytes!("../../assets/gdn_chunked/h.cubin");
     /// 无初态变体(参数表无 h0;fresh 序列;shared 98564 / w4 / BV=64)
     pub const H_NOH0: &[u8] =
-        include_bytes!("../assets/gdn_chunked/h_noh0.cubin");
+        include_bytes!("../../assets/gdn_chunked/h_noh0.cubin");
     pub const O: &[u8] =
-        include_bytes!("../assets/gdn_chunked/o.cubin");
+        include_bytes!("../../assets/gdn_chunked/o.cubin");
     /// solve_tril(BT=64)单核形态:merge_16x16_to_64x64_inverse
     pub const MERGE: &[u8] =
-        include_bytes!("../assets/gdn_chunked/merge.cubin");
+        include_bytes!("../../assets/gdn_chunked/merge.cubin");
 
     /// 发射常量(2026-10-11 fork-bf16 重采集:torch profiler 实测指纹,
     /// 采集于 T=1024/NK16/NV48/KD=VD=128/g-f32 配方;变体 = autotune 选中)

@@ -452,13 +452,13 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
                 let mut gbuf = vec![0u8; n * 4];
                 face.dtoh(&out_block, &mut gbuf).await?;
                 let k = cols * 8;
-                let idx = owl_kernels::marlin::repack::marlin_fused_indices(k, rows);
+                let idx = owl_kernels::family::marlin::repack::marlin_fused_indices(k, rows);
                 let p32: Vec<i32> = ph
                     .chunks_exact(4)
                     .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect();
                 let mut b_ref: Vec<i32> = Vec::new();
-                owl_kernels::marlin::repack::pack_marlin_b_fused(&p32, &idx, rows * k / 8, &mut b_ref);
+                owl_kernels::family::marlin::repack::pack_marlin_b_fused(&p32, &idx, rows * k / 8, &mut b_ref);
                 let mut bad = 0usize;
                 for (i, w) in gbuf.chunks_exact(4).enumerate() {
                     let got = i32::from_le_bytes([w[0], w[1], w[2], w[3]]);

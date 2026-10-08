@@ -29,7 +29,7 @@ fn bench_shape(
     let c_h: Vec<u16> = vec![0u16; m * n];
     let s_h: Vec<u16> = vec![f16_one(); (k / G as usize) * n]; // scales 全 1.0
     let z_h: Vec<i32> = vec![0_i32; (k / G as usize) * (n / 8) + 16]; // zp=0 位型
-    let ws_len = owl_kernels::marlin::v2_workspace_len(n);
+    let ws_len = owl_kernels::family::marlin::v2_workspace_len(n);
     let ws_h: Vec<i32> = vec![0_i32; ws_len];
     let tmp_h: Vec<u8> = vec![0u8; 64 << 20]; // c_tmp 64MB(上游 par 归约余量)
 
@@ -60,7 +60,7 @@ fn bench_shape(
     let cu_stream = stream.cu_stream() as usize;
 
     let launch = |a_p, b_p, c_p, s_p, z_p, ws_p, tmp_p| unsafe {
-        owl_kernels::marlin::gemm_v2_awq_raw(
+        owl_kernels::family::marlin::gemm_v2_awq_raw(
             a_p as *const u16,
             b_p as *const i32,
             c_p as *mut u16,

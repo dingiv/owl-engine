@@ -20,35 +20,11 @@ use std::future::Future;
 
 // ============================================================================
 // 标注词汇:Dtype + Shape(线格式的元数据维)
+// —— 2026-10-12 M2 迁往 owl-kernels::contract(契约老家;iface 依赖
+//    kernels 方向不变)。下方 re-export 保旧路径全量可用,零破坏。
 // ============================================================================
 
-/// 数据类型
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Dtype {
-    F32,
-    BF16,
-    F16,
-    U32,
-}
-
-impl Dtype {
-    /// 字节宽(server 的分配只认字节;宽是 client 侧换算用的)
-    pub fn size_bytes(self) -> usize {
-        match self {
-            Dtype::F32 => 4,
-            Dtype::BF16 | Dtype::F16 => 2,
-            Dtype::U32 => 4,
-        }
-    }
-}
-
-/// 形状(行主序;一维 = vec![n])
-pub type Shape = Vec<usize>;
-
-/// 元素总数
-pub fn numel(shape: &[usize]) -> usize {
-    shape.iter().product()
-}
+pub use owl_kernels::contract::{numel, Arg, Bytes, Dtype, GraphId, KernelSpec, LaunchMsg, Shape};
 
 // ============================================================================
 // 错误面:server 回执族(词汇权威在 iface;后端必须能表达)
@@ -105,9 +81,6 @@ impl std::error::Error for ModelError {}
 // 线格式:发射消息 + 池块句柄
 // ============================================================================
 
-/// 图身份证(server 签发;graph_end 成功后可 graph_launch 重放)
-pub type GraphId = u64;
-
 /// pinned 主机缓冲(DMA 源;流式装载租约的统一视图)。
 /// **字节口径**(2026-09-26 f16 基线尾批:装载流水恢复)—— 租约不绑
 /// 元素位宽,f16/f32 装载路径同一条流水;位宽语义归数据源写入侧。
@@ -128,51 +101,6 @@ impl PinnedRegion for HeapRegion {
     }
 }
 
-/// 池块句柄:server 签发的身份证(id → server 账房 → 显存)。
-#[derive(Clone, Debug)]
-pub struct Bytes {
-    pub id: u64,
-    /// 元素数(f32)
-    pub len: usize,
-}
-
-impl Bytes {
-    pub fn new(id: u64, len: usize) -> Self {
-        Self { id, len }
-    }
-}
-
-/// kernel 描述:入口名 + 源码。后端按 (源码哈希, 名) 懒编译缓存。
-#[derive(Clone, Debug)]
-pub struct KernelSpec {
-    pub name: String,
-    pub source: String,
-}
-
-/// 发射参数槽(有序;与 kernel 签名严格对位)
-/// 类型化:标量按 kernel 形参宽度入槽(CUDA 参数空间自然对齐,
-/// 8 字节槽顶 4 字节形参会错位读参 —— 坑 I)
-#[derive(Clone, Debug)]
-pub enum Arg {
-    Block { id: u64 },
-    /// 刀1:块内连续切片视图(发射 ptr = block_ptr(id) + byte_offset;
-    /// elems = 元素数,供 CPU 面切片与校验;kernel ABI 不感知 —— 尺寸
-    /// 标量已由槽序携带)。输出槽恒为全块 Block,BlockSlice 仅入参。
-    BlockSlice { id: u64, byte_offset: u64, elems: u64 },
-    U64(u64),
-    I32(i32),
-    F32(f32),
-}
-
-/// 发射消息
-pub struct LaunchMsg {
-    pub kernel: KernelSpec,
-    pub args: Vec<Arg>,
-    pub grid: (u32, u32, u32),
-    pub block: (u32, u32, u32),
-    pub shared_mem: u32,
-    pub out_elems: usize,
-}
 
 // ============================================================================
 // 能力契约:DeviceClient(五原语 + 图三原语;全异步)

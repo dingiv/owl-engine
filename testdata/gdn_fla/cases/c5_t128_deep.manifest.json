@@ -1,0 +1,142 @@
+{
+ "tag": "c5_t128_deep",
+ "T": 128,
+ "NK": 16,
+ "NV": 48,
+ "KD": 128,
+ "VD": 128,
+ "chunk": 64,
+ "scale": 0.08838834764831845,
+ "cu_seqlens": [
+  0,
+  128
+ ],
+ "init_state": true,
+ "recipe": "fork-bf16+g-f32(\u5f15\u64ce\u751f\u4ea7\u914d\u65b9)",
+ "tensors": [
+  {
+   "name": "c5_t128_deep.q",
+   "shape": [
+    1,
+    128,
+    16,
+    128
+   ]
+  },
+  {
+   "name": "c5_t128_deep.k",
+   "shape": [
+    1,
+    128,
+    16,
+    128
+   ]
+  },
+  {
+   "name": "c5_t128_deep.v",
+   "shape": [
+    1,
+    128,
+    48,
+    128
+   ]
+  },
+  {
+   "name": "c5_t128_deep.beta",
+   "shape": [
+    1,
+    128,
+    48
+   ]
+  },
+  {
+   "name": "c5_t128_deep.g",
+   "shape": [
+    1,
+    128,
+    48
+   ]
+  },
+  {
+   "name": "c5_t128_deep.s0",
+   "shape": [
+    1,
+    48,
+    128,
+    128
+   ]
+  },
+  {
+   "name": "c5_t128_deep.g_cum",
+   "shape": [
+    1,
+    128,
+    48
+   ]
+  },
+  {
+   "name": "c5_t128_deep.A",
+   "shape": [
+    1,
+    128,
+    48,
+    64
+   ]
+  },
+  {
+   "name": "c5_t128_deep.w",
+   "shape": [
+    1,
+    128,
+    48,
+    128
+   ]
+  },
+  {
+   "name": "c5_t128_deep.u",
+   "shape": [
+    1,
+    128,
+    48,
+    128
+   ]
+  },
+  {
+   "name": "c5_t128_deep.h",
+   "shape": [
+    1,
+    2,
+    48,
+    128,
+    128
+   ]
+  },
+  {
+   "name": "c5_t128_deep.v_new",
+   "shape": [
+    1,
+    128,
+    48,
+    128
+   ]
+  },
+  {
+   "name": "c5_t128_deep.o",
+   "shape": [
+    1,
+    128,
+    48,
+    128
+   ]
+  },
+  {
+   "name": "c5_t128_deep.final",
+   "shape": [
+    1,
+    48,
+    128,
+    128
+   ]
+  }
+ ]
+}

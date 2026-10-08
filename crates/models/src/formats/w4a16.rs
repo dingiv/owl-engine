@@ -27,10 +27,10 @@ use crate::contract::{Dtype, ModelError};
 use crate::formats::mmap::{open_raw_index, Mmap, RawEntry};
 use crate::module::WeightSource;
 use crate::f16c::{bf16_bytes_to_f16_bytes, dequant_u4_affine_f16_bytes};
-use owl_kernels::marlin::repack::{
+use owl_kernels::family::marlin::repack::{
     marlin_gather_indices, pack_marlin_b_gather_into, pack_marlin_s, unpack_nibbles_into,
 };
-use owl_kernels::marlin::v2_workspace_len;
+use owl_kernels::family::marlin::v2_workspace_len;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};

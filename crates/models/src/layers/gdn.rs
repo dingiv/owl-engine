@@ -32,6 +32,117 @@ use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, QuantPla
 use crate::TensorOps;
 
 // ============================================================================
+// gdn_chunked 客户端面装配(M3 旁路链 models 切换;face = kernels::op)
+// ============================================================================
+
+/// chunked 臂装配 —— 槽序/标量编码/名字字面量全部 face 单源
+/// (kernels::op::gdn_chunked),调用点只供语义张量。
+/// builder 失配 = 内部不变量破坏(shape 全由 self/ctx 推导,非运行时
+/// 输入)→ A5.4 fail-fast。
+pub(crate) fn gdn_chunked_node(
+    q: &TensorOps,
+    k: &TensorOps,
+    v: &TensorOps,
+    beta: &TensorOps,
+    gate: &TensorOps,
+    state: &TensorOps,
+    slot: usize,
+    shape: owl_kernels::client::gdn_chunked::GdnShape,
+) -> TensorOps {
+    use owl_kernels::client::gdn_chunked as face;
+    fn bytes_of(t: &TensorOps) -> owl_kernels::contract::Bytes {
+        owl_kernels::contract::Bytes { id: t.id, len: t.shape.iter().product() }
+    }
+    let call = face::GdnChunkedCall::builder(shape)
+        .q(&bytes_of(q))
+        .and_then(|b| b.k(&bytes_of(k)))
+        .and_then(|b| b.v(&bytes_of(v)))
+        .and_then(|b| b.beta(&bytes_of(beta)))
+        .and_then(|b| b.gate_raw(&bytes_of(gate)))
+        .and_then(|b| b.state(&bytes_of(state), slot as u32))
+        .and_then(|b| b.build())
+        .unwrap_or_else(|e| panic!("gdn_chunked face 装配失败(内部不变量): {e}"));
+    TensorOps::of(crate::kernel::Kernel::new(face::GDN_CHUNKED, "").with_sig(face::SIG))
+        .arg(q)
+        .arg(k)
+        .arg(v)
+        .arg(beta)
+        .arg(gate)
+        .arg(state)
+        .arg_usize(call.scalar_u64s()[0] as usize)
+        .arg_usize(call.scalar_u64s()[1] as usize)
+        .arg_usize(call.scalar_u64s()[2] as usize)
+        .arg_usize(call.scalar_u64s()[3] as usize)
+        .arg_usize(call.scalar_u64s()[4] as usize)
+        .arg_usize(call.scalar_u64s()[5] as usize)
+        .with_shape(Dtype::F16, vec![shape.t as usize, shape.nv as usize, shape.kd as usize])
+}
+
+#[cfg(test)]
+mod gdn_chunked_face_lock {
+    //! 胶水↔face 锁:装配序/标量序/名字与 face 契约逐一比对
+    //! (face 漂移或胶水手滑 = 此测试红;线格式第三重保险)。
+    use super::*;
+    use owl_kernels::contract::Arg;
+    use owl_kernels::client::gdn_chunked as face;
+
+    #[test]
+    fn node_wire_matches_face() {
+        let shape = face::GdnShape { t: 64, nv: 48, nk: 16, kd: 128 };
+        let q = TensorOps::of_block(1, Dtype::F16, vec![64, 16, 128]);
+        let k = TensorOps::of_block(2, Dtype::F16, vec![64, 16, 128]);
+        let v = TensorOps::of_block(3, Dtype::F16, vec![64, 48, 128]);
+        let beta = TensorOps::of_block(4, Dtype::F16, vec![64, 48]);
+        let gate = TensorOps::of_block(5, Dtype::F16, vec![64, 48]);
+        let state = TensorOps::of_block(6, Dtype::F32, vec![8, 48, 128, 128]);
+        let node = gdn_chunked_node(&q, &k, &v, &beta, &gate, &state, 3, shape);
+
+        // root = Kernel{名字+sig 来自 face 常量}
+        let name = match &node.op {
+            crate::ops::Op::Kernel { kernel } => {
+                assert_eq!(kernel.sig, face::SIG, "sig 漂移");
+                kernel.name.clone()
+            }
+            other => panic!("root 非 Kernel: {other:?}"),
+        };
+        assert_eq!(name, face::GDN_CHUNKED, "名字字面量泄漏(应经 face 常量)");
+
+        // parents 序 = face ins 序(q/k/v/beta/gate/state)
+        // (id 值取叶子自身——全局分配器被套件内其他测试消费,勿硬编码)
+        let want_ids: Vec<u64> = [&q, &k, &v, &beta, &gate, &state]
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        let ids: Vec<u64> = node.parents.iter().map(|p| p.id).collect();
+        assert_eq!(ids, want_ids, "ins 序漂移");
+
+        // 标量 = face scalar_u64s(t/slot/nv/nk/kd/scale_bits)
+        let got: Vec<u64> = node
+            .args
+            .iter()
+            .map(|a| match a {
+                crate::ops::KernelArg::Bits(v) => *v,
+                other => panic!("标量槽非 Bits: {other:?}"),
+            })
+            .collect();
+        let call = face::GdnChunkedCall::builder(shape)
+            .q(&owl_kernels::contract::Bytes { id: 1, len: 64 * 16 * 128 })
+            .and_then(|b| b.k(&owl_kernels::contract::Bytes { id: 2, len: 64 * 16 * 128 }))
+            .and_then(|b| b.v(&owl_kernels::contract::Bytes { id: 3, len: 64 * 48 * 128 }))
+            .and_then(|b| b.beta(&owl_kernels::contract::Bytes { id: 4, len: 64 * 48 }))
+            .and_then(|b| b.gate_raw(&owl_kernels::contract::Bytes { id: 5, len: 64 * 48 }))
+            .and_then(|b| b.state(&owl_kernels::contract::Bytes { id: 6, len: 48 * 128 * 128 }, 3))
+            .and_then(|b| b.build())
+            .expect("face 构造");
+        assert_eq!(got, call.scalar_u64s().to_vec(), "标量序/编码漂移");
+        assert_eq!(node.dtype, Dtype::F16);
+        assert_eq!(node.shape, vec![64, 48, 128]);
+        // Arg 词汇面仅为完整性核对(消未用告警)
+        let _ = Arg::U64(0);
+    }
+}
+
+// ============================================================================
 // GDN 常驻状态(runner 词汇;块归 runner,层零所有权 —— KvBuffers 同构)
 // ============================================================================
 
@@ -297,7 +408,7 @@ pub fn fold_layer(
         let beta_f = cast(&rec8[7]);
         roots.push(
             TensorOps::of(
-                crate::kernel::Kernel::new(owl_kernels::gdn_scalar::GDN_SCALAR_FWD, "")
+                crate::kernel::Kernel::new(owl_kernels::family::gdn_scalar::GDN_SCALAR_FWD, "")
                     .with_sig("T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz,sz"),
             )
             .arg(&q_f)
@@ -619,7 +730,7 @@ impl GatedDeltaNet {
                 .arg_i32((tokens * self.nv) as i32)
                 .with_shape(Dtype::F32, vec![tokens, self.nv]);
             TensorOps::of(
-                crate::kernel::Kernel::new(owl_kernels::gdn_scalar::GDN_SCALAR_FWD, "")
+                crate::kernel::Kernel::new(owl_kernels::family::gdn_scalar::GDN_SCALAR_FWD, "")
                     .with_sig("T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz,sz"),
             )
             .arg(&q_f)
@@ -645,23 +756,19 @@ impl GatedDeltaNet {
             // 活性回收/块池域引入新 dtype(层 3+ inf 毒化),同型于
             // B6.3/FI-decode 配置不一致前科。同形基准 383µs/层chunk vs
             // 自研链 ~2100µs(5.5×)。大 T 限定(与 scalar 同纪律)。
-            TensorOps::of(
-                crate::kernel::Kernel::new("gdn_chunked_delta_rule_fwd", "")
-                    .with_sig("T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz"),
+            // 客户端面(kernels::op::gdn_chunked;M3 旁路链 models 切换):
+            // 槽序/标量编码/名字字面量全部 face 单源,调用点零手撸。
+            // shape 全由 self/ctx 推导,builder 失配 = 内部不变量破坏(编程错,
+            // A5.4 fail-fast;非运行时输入)。
+            gdn_chunked_node(
+                &q_n, &k_n, &v_c, &beta, &g, &gdn.rec, ctx.gdn_slot_host,
+                owl_kernels::client::gdn_chunked::GdnShape {
+                    t: tokens as u32,
+                    nv: self.nv as u32,
+                    nk: self.nk as u32,
+                    kd: self.hk_dim as u32,
+                },
             )
-            .arg(&q_n.reshape(vec![tokens, self.nk, self.hk_dim]))
-            .arg(&k_n.reshape(vec![tokens, self.nk, self.hk_dim]))
-            .arg(&v_c.reshape(vec![tokens, self.nv, self.hv_dim]))
-            .arg(&beta)
-            .arg(&g)
-            .arg(&gdn.rec)
-            .arg_usize(tokens)
-            .arg_usize(ctx.gdn_slot_host)
-            .arg_usize(self.nv)
-            .arg_usize(self.nk)
-            .arg_usize(self.hk_dim)
-            .arg_usize((1.0f32 / (self.hk_dim as f32).sqrt()).to_bits() as usize)
-            .with_shape(Dtype::F16, vec![tokens, self.nv, self.hv_dim])
         } else {
             // varlen 递推批核(单发射;state 原地进出)
             recurrence_varlen(

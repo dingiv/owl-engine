@@ -10,7 +10,7 @@ use crate::layers::narrow_strided;
 use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, QuantPlan, Weight};
 use crate::formats::w4a16::marlin_n_pack;
 use crate::TensorOps;
-use owl_kernels::marlin::{v2_workspace_len, GEMM_W4A16, GEMM_W4A16_AWQ, GEMM_W4A16_BF16};
+use owl_kernels::family::marlin::{v2_workspace_len, GEMM_W4A16, GEMM_W4A16_AWQ, GEMM_W4A16_BF16};
 
 pub struct Linear {
     /// 权重槽 [out, in](检查点原生布局,零转置)

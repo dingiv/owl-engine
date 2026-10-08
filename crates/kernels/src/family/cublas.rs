@@ -42,6 +42,16 @@ pub struct OwlCublas {
 }
 
 impl OwlCublas {
+    /// 私有工作区预绑(C1 刀1.5 律:捕获期 gemv splitK 不走池分配,
+    /// 免 MEM_ALLOC/FREE 节点;调用方保证 ws 生命周期 ≥ 句柄)
+    pub fn set_workspace(&self, ptr: u64, bytes: usize) -> Result<(), String> {
+        let r = unsafe { sys::cublasSetWorkspace_v2(*self.sys_handle(), ptr as *mut _, bytes) };
+        if r != sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(format!("SetWorkspace r={r:?}"));
+        }
+        Ok(())
+    }
+
     /// 裸句柄(刀1.5:server 侧 cublasSetWorkspace 预绑用)
     pub fn sys_handle(&self) -> &sys::cublasHandle_t {
         self.blas.handle()

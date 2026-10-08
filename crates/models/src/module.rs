@@ -39,7 +39,7 @@ pub enum StepKind {
 /// 无动态依赖的层(mlp/rmsnorm/…)忽略字段。借用结构,无 Default ——
 /// 测试用 [`ForwardCtx::minimal`]。
 /// FlashInfer prefill 面(OWL_FLASHINFER=1;engine 每 chunk 构造):
-/// K 影子池(kHND)+ 表四件套(i32 设备;契约见 owl_kernels::flashinfer)。
+/// K 影子池(kHND)+ 表四件套(i32 设备;契约见 owl_kernels::family::flashinfer)。
 #[derive(Clone, Copy)]
 pub struct FiPrefillCtx<'a> {
     /// K 影子池**逐注意力层**([nb, page, Hkv, hd] kNHD;层间不可共享 ——

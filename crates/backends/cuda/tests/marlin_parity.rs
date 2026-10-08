@@ -51,7 +51,7 @@ fn host_dequant_gemm(a: &[f32], q: &[u8], s: &[f32], m: usize, n: usize, k: usiz
     c
 }
 
-/// 外部核启动消息(槽序契约:owl_kernels::marlin::GEMM_W4A16_SLOTS)
+/// 外部核启动消息(槽序契约:owl_kernels::family::marlin::GEMM_W4A16_SLOTS)
 fn marlin_launch(
     a: &owl_cuda::Bytes,
     b: &owl_cuda::Bytes,
@@ -106,8 +106,8 @@ async fn run_case(
     let s: Vec<f32> = (0..n * (k / g)).map(|i| 0.5 + ((i * 13) % 13) as f32 * 0.08).collect();
 
     // owl repack(compressed-tensors → marlin 布局)
-    let b_packed = owl_kernels::marlin::repack::pack_marlin_b(&q, k, n);
-    let s_packed_f16 = owl_kernels::marlin::repack::pack_marlin_s(&s, n, k / g);
+    let b_packed = owl_kernels::family::marlin::repack::pack_marlin_b(&q, k, n);
+    let s_packed_f16 = owl_kernels::family::marlin::repack::pack_marlin_s(&s, n, k / g);
     // bf16 内核的 s_type = BF16:scales 位型 f16 → bf16(与装载器同转换)
     let s_packed: Vec<u16> = if is_bf16 {
         s_packed_f16
@@ -146,7 +146,7 @@ async fn run_case(
     let db = client.htod(Dtype::U32, &Shape::from(vec![b_packed.len()]), &le_i32(&b_packed)).await.expect("htod b");
     let ds = client.htod(Dtype::F16, &Shape::from(vec![s_packed.len()]), &le_u16(&s_packed)).await.expect("htod s");
     let ws_mul: usize = owl_shared::env_reader::parse_or("OWL_WS_MUL", 1);
-    let ws_len = owl_kernels::marlin::v2_workspace_len(n).max(n / 128 * 16) * ws_mul;
+    let ws_len = owl_kernels::family::marlin::v2_workspace_len(n).max(n / 128 * 16) * ws_mul;
     let dws = client.alloc(Dtype::U32, ws_len).await.expect("alloc ws");
     let dctmp = client.alloc(Dtype::U32, 1).await.expect("alloc ctmp");
     let dc = client.alloc(Dtype::F16, m * n).await.expect("alloc c");
@@ -261,9 +261,9 @@ async fn marlin_golden_dump() {
     for (k, n, g) in cases {
         let tag = format!("k{k}_n{n}");
         let q: Vec<u8> = (0..n * k).map(|i| ((i * 7 + 3) % 16) as u8).collect();
-        let b_packed = owl_kernels::marlin::repack::pack_marlin_b(&q, k, n);
+        let b_packed = owl_kernels::family::marlin::repack::pack_marlin_b(&q, k, n);
         let s: Vec<f32> = (0..n * (k / g)).map(|i| 0.5 + ((i * 13) % 13) as f32 * 0.08).collect();
-        let s_packed = owl_kernels::marlin::repack::pack_marlin_s(&s, n, k / g);
+        let s_packed = owl_kernels::family::marlin::repack::pack_marlin_s(&s, n, k / g);
         owl_shared::file_loader::write(dir.join(format!("{tag}.q.bin")), &q).expect("q");
         owl_shared::file_loader::write(dir.join(format!("{tag}.owlb.bin")), le_i32(&b_packed)).expect("b");
         owl_shared::file_loader::write(dir.join(format!("{tag}.owls.bin")), le_u16(&s_packed)).expect("s");
@@ -368,7 +368,7 @@ fn marlin_awq_launch(
 ) -> LaunchMsg {
     LaunchMsg {
         kernel: owl_cuda::KernelSpec {
-            name: owl_kernels::marlin::GEMM_W4A16_AWQ.into(),
+            name: owl_kernels::family::marlin::GEMM_W4A16_AWQ.into(),
             source: String::new(),
         },
         args: vec![
@@ -412,9 +412,9 @@ async fn run_awq_case_g(client: &mut GpuClient, m: usize, n: usize, k: usize, g:
         })
         .collect();
 
-    let b_packed = owl_kernels::marlin::repack::pack_marlin_b(&q, k, n);
-    let s_packed = owl_kernels::marlin::repack::pack_marlin_s(&s, n, groups);
-    let z_packed = owl_kernels::marlin::repack::pack_marlin_z(&zp_u8, n, groups);
+    let b_packed = owl_kernels::family::marlin::repack::pack_marlin_b(&q, k, n);
+    let s_packed = owl_kernels::family::marlin::repack::pack_marlin_s(&s, n, groups);
+    let z_packed = owl_kernels::family::marlin::repack::pack_marlin_z(&zp_u8, n, groups);
     assert_eq!(z_packed.len(), groups * (n / 8));
 
     let da = client.htod(Dtype::F16, &Shape::from(vec![m, k]), &le_u16(
@@ -423,7 +423,7 @@ async fn run_awq_case_g(client: &mut GpuClient, m: usize, n: usize, k: usize, g:
     let db = client.htod(Dtype::U32, &Shape::from(vec![b_packed.len()]), &le_i32(&b_packed)).await.expect("htod b");
     let ds = client.htod(Dtype::F16, &Shape::from(vec![s_packed.len()]), &le_u16(&s_packed)).await.expect("htod s");
     let dz = client.htod(Dtype::U32, &Shape::from(vec![z_packed.len()]), &le_i32(&z_packed)).await.expect("htod z");
-    let dws = client.alloc(Dtype::U32, owl_kernels::marlin::v2_workspace_len(n)).await.expect("alloc ws");
+    let dws = client.alloc(Dtype::U32, owl_kernels::family::marlin::v2_workspace_len(n)).await.expect("alloc ws");
     let dctmp = client.alloc(Dtype::U32, 1).await.expect("alloc ctmp");
     let dc = client.alloc(Dtype::F16, m * n).await.expect("alloc c");
     // 哨兵填充:-7.0(launch 后若残留 = 内核未写 C)
@@ -487,9 +487,9 @@ async fn ct_repack_parity() {
         let cols = k / 8;
         let packed: Vec<i32> = (0..rows * cols).map(|i| (i as i32).wrapping_mul(0x9E3779B1_u32 as i32) ^ 0x1234_5678).collect();
         // CPU 参照(fused)
-        let fused = owl_kernels::marlin::repack::marlin_fused_indices(k, out_dim);
+        let fused = owl_kernels::family::marlin::repack::marlin_fused_indices(k, out_dim);
         let mut b_ref: Vec<i32> = Vec::new();
-        owl_kernels::marlin::repack::pack_marlin_b_fused(&packed, &fused, rows * k / 8, &mut b_ref);
+        owl_kernels::family::marlin::repack::pack_marlin_b_fused(&packed, &fused, rows * k / 8, &mut b_ref);
         assert_eq!(b_ref.len(), (k / 16) * (rows * 2));
 
         // GPU

@@ -81,12 +81,12 @@ fn gdn_scalar_golden() {
     ctx.bind_to_thread().expect("bind");
     let stream = ctx.default_stream();
 
-    let cubin = owl_kernels::gdn_scalar::cubin::CHUNK_SCALAR_F32;
+    let cubin = owl_kernels::family::gdn_scalar::cubin::CHUNK_SCALAR_F32;
     let m = ctx
         .load_module(cudarc::nvrtc::Ptx::from_binary(cubin.to_vec()))
         .expect("load gdn_chunk_scalar cubin");
     let f = m
-        .load_function(owl_kernels::gdn_scalar::cubin::KERNEL_F32)
+        .load_function(owl_kernels::family::gdn_scalar::cubin::KERNEL_F32)
         .expect("fn owl_gdn_chunk_scalar_f32");
 
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/gdn_fla/cases");
@@ -143,8 +143,8 @@ fn gdn_scalar_golden() {
                 .arg(&scale);
             let cfg = LaunchConfig {
                 grid_dim: (1, NV as u32, 1),
-                block_dim: (owl_kernels::gdn_scalar::cubin::BLOCK, 1, 1),
-                shared_mem_bytes: owl_kernels::gdn_scalar::cubin::SMEM_D128,
+                block_dim: (owl_kernels::family::gdn_scalar::cubin::BLOCK, 1, 1),
+                shared_mem_bytes: owl_kernels::family::gdn_scalar::cubin::SMEM_D128,
             };
             unsafe { b.launch(cfg) }.expect("owl_gdn_chunk_scalar_f32 launch");
         }

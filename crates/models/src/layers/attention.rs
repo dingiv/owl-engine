@@ -560,7 +560,7 @@ impl Attention {
     /// ForwardCtx.fi):K0-dual 写池(classic + kHND 影子)→ FI 虚拟核
     /// (server plan 缓存 + run;FA2 级 tensor-core,causal chunked 语义
     /// = q 对齐 kv 尾部,与 K0 先行的池读序配套)。
-    /// 槽序契约:7 Block + O + 8 sz(owl_kernels::flashinfer::PREFILL_FI_SLOTS;
+    /// 槽序契约:7 Block + O + 8 sz(owl_kernels::family::flashinfer::PREFILL_FI_SLOTS;
     /// 字面量对齐 —— models 不开 kernels feature,marlin 先例)。
     #[allow(clippy::too_many_arguments)]
     fn paged_prefill_fi_output(

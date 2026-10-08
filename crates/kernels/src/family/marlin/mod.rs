@@ -210,7 +210,7 @@ extern "C" {
 }
 
 /// AWQ(kU4 非对称)GEMM(裸指针)。b_zeros 布局契约见
-/// [`crate::marlin::repack::pack_marlin_z`];其余同 [`gemm_v2_raw`]。
+/// [`crate::family::marlin::repack::pack_marlin_z`];其余同 [`gemm_v2_raw`]。
 ///
 /// # Safety
 /// 指针须指向合法且长度匹配布局契约的设备内存;workspace 须零初始化
