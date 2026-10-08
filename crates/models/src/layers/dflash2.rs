@@ -37,6 +37,7 @@ use crate::layers::mlp::Mlp;
 use crate::layers::rmsnorm::RmsNorm;
 use crate::layers::rope::Rope;
 use crate::module::{ForwardCtx, KvBuffers, Module, QuantPlan, Weight};
+use crate::ops::SemanticKernel;
 use crate::TensorOps;
 
 // ---- 检查点家族定形常量(dflash_config 实测;z-lab/Qwen3.8-27B-DFlash2)----
@@ -61,15 +62,14 @@ pub(crate) fn ensure_dt(x: &TensorOps, dt: Dtype) -> TensorOps {
     if x.dtype == dt {
         return x.clone();
     }
-    let name = match (x.dtype, dt) {
-        (Dtype::F16, Dtype::BF16) => "owl_cast_f16_bf16",
-        (Dtype::BF16, Dtype::F16) => "owl_cast_bf16_f16",
+    let variant = match (x.dtype, dt) {
+        (Dtype::F16, Dtype::BF16) => SemanticKernel::CastF16Bf16,
+        (Dtype::BF16, Dtype::F16) => SemanticKernel::CastBf16F16,
         other => panic!("ensure_dt: 无 cast 臂 {other:?}(草稿路径仅 f16/bf16)"),
     };
     let shape = x.shape().to_vec();
     let n: usize = shape.iter().product();
-    let (gx, _, _) = crate::ops::auto_grid(n);
-    TensorOps::of(crate::kernel::kernel_with(name, (gx, 1, 1), (256, 1, 1), 0))
+    TensorOps::call(variant)
         .arg(x)
         .arg_i32(n as i32)
         .with_shape(dt, shape)
@@ -115,13 +115,12 @@ impl GroupedConv {
         let _ = ctx;
         let t = x.shape()[0];
         let n = t * self.hidden;
-        let (gx, _, _) = crate::ops::auto_grid(n);
-        let name = match self.dt {
-            Dtype::F16 => "owl_dflash_conv_f16",
-            Dtype::BF16 => "owl_dflash_conv_bf16",
+        let _ = n;
+        TensorOps::call(match self.dt {
+            Dtype::F16 => SemanticKernel::DflashConv,
+            Dtype::BF16 => SemanticKernel::DflashConv,
             other => panic!("owl_dflash_conv 无 {other:?} 变体"),
-        };
-        TensorOps::of(crate::kernel::kernel_with(name, (gx, 1, 1), (256, 1, 1), 0))
+        })
             .arg(x)
             .arg(delta)
             .arg(&self.base.decl())
@@ -315,19 +314,13 @@ impl DfAttn {
         // kNonCausal 变体挂 DF-4,KV 全走池 + wr 依赖边)
         // v2:grid (T, Hq) × block (hd) —— block-per-head flash 式
         // B6 偷显存:fp8 池 → NC fp8kv 变体(前缀 e4m3 读;自块原 dtype)
-        let nc_name = match (self.dt, self.kv_fp8) {
-            (Dtype::F16, false) => "owl_naive_attn_nc_f16",
-            (Dtype::F16, true) => "owl_naive_attn_nc_fp8kv_f16",
-            (Dtype::BF16, false) => "owl_naive_attn_nc_bf16",
-            (Dtype::BF16, true) => "owl_naive_attn_nc_fp8kv_bf16",
+        let y = TensorOps::call(match (self.dt, self.kv_fp8) {
+            (Dtype::F16, false) => SemanticKernel::NaiveAttnNc,
+            (Dtype::F16, true) => SemanticKernel::NaiveAttnNcFp8kv,
+            (Dtype::BF16, false) => SemanticKernel::NaiveAttnNc,
+            (Dtype::BF16, true) => SemanticKernel::NaiveAttnNcFp8kv,
             other => panic!("owl_naive_attn_nc 无 {other:?} 变体"),
-        };
-        let y = TensorOps::of(crate::kernel::kernel_with(
-            nc_name,
-            (t as u32, self.hq as u32, 1),
-            (self.hd as u32, 1, 1),
-            0,
-        ))
+        })
         .arg(&q)
         .arg(&k)
         .arg(&v)
@@ -540,13 +533,9 @@ impl CandidateSelector {
         let rows = h - 1; // DEPTH
         let dim = hidden.shape()[1];
         let pred = hidden.slice_view(dim, vec![rows, dim]); // 行 1..(连续视图)
-        let topk = TensorOps::of(crate::kernel::kernel_with(
-            "owl_topk16_f16",
-            (rows as u32, 1, 1),
-            (256, 1, 1),
-            0,
-        ))
-        .arg(&logits)
+        let topk = TensorOps::call(SemanticKernel::Topk16)
+            .aux(&[rows])
+            .arg(&logits)
         .arg_i32(self.vocab as i32)
         .with_shape(Dtype::F32, vec![2 * rows * TOP_K]); // 值区 + 索引区(两段连续)
         let cand = topk.slice_view(rows * TOP_K, vec![rows, TOP_K]); // 索引区
@@ -555,17 +544,8 @@ impl CandidateSelector {
         let proj = self.proj.forward(&pred, ctx);
         // ③ 格打分 + 贪心 walk(单块融合核;单缓冲 toks + scores)
         // BF16 变体:proj/码本 bf16(同日十四);topk/格打分输出 f32 契约不变
-        let sel_name = match self.dt {
-            Dtype::F16 => "owl_dflash_select_f16",
-            Dtype::BF16 => "owl_dflash_select_bf16",
-            other => panic!("owl_dflash_select 无 {other:?} 变体"),
-        };
-        let sel = TensorOps::of(crate::kernel::kernel_with(
-            sel_name,
-            (1, 1, 1),
-            (256, 1, 1),
-            0,
-        ))
+        let sel = TensorOps::call(SemanticKernel::DflashSelect)
+            .aux(&[(self.dt == Dtype::BF16) as usize])
         .arg(&cand)
         .arg(&vals)
         .arg(&proj)
@@ -1120,10 +1100,9 @@ mod tests {
         }
         // device 侧:同一 logits 从 host 送(嵌入路径由 wiring 测试另证)
         let logits_t = TensorOps::from_host(Dtype::F16, vec![rows, vocab], &f16b(&logits));
-        let topk = TensorOps::of(crate::kernel::kernel_with(
-            "owl_topk16_f16", (rows as u32, 1, 1), (256, 1, 1), 0,
-        ))
-        .arg(&logits_t)
+        let topk = TensorOps::call(SemanticKernel::Topk16)
+            .aux(&[rows])
+            .arg(&logits_t)
         .arg_i32(vocab as i32)
         .with_shape(Dtype::F32, vec![rows, 2 * TOP_K]);
         let topk_full = harvest(&mut gpu, &topk).await; // slice dtoh = 整父块,host 切分
@@ -1181,9 +1160,8 @@ mod tests {
         let cand_t = TensorOps::from_host(Dtype::F32, vec![rows, TOP_K], &f32b(&cand_h));
         let vals_t = TensorOps::from_host(Dtype::F32, vec![rows, TOP_K], &f32b(&unary_h));
         let proj_t = TensorOps::from_host(Dtype::F16, vec![rows, rank], &f16b(&proj));
-        let sel_out = TensorOps::of(crate::kernel::kernel_with(
-            "owl_dflash_select_f16", (1, 1, 1), (256, 1, 1), 0,
-        ))
+        let sel_out = TensorOps::call(SemanticKernel::DflashSelect)
+            .aux(&[0])
         .arg(&cand_t)
         .arg(&vals_t)
         .arg(&proj_t)
@@ -2057,9 +2035,7 @@ mod tests {
         // grid (T, Hq) × block (hd) —— block-per-head flash 式;窗口 =
         // 全可见 5(前缀 3 + 自块 2,slots [0..5) 连续直排)
         let kv_len_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[5.0]));
-        let y_nc = TensorOps::of(crate::kernel::kernel_with(
-            "owl_naive_attn_nc_f16", (2, hq as u32, 1), (hd as u32, 1, 1), 0,
-        ))
+        let y_nc = TensorOps::call(SemanticKernel::NaiveAttnNc)
         .arg(&q_self2)
         .arg(&k_self2)
         .arg(&v_self2)
@@ -2297,16 +2273,11 @@ mod tests {
         // ---- ② cast 往返(f16 → bf16 → f16;bf16 尾数 7 位,值域内损失 ≤ 0.4%)----
         let vals = gen(1024, 9.0);
         let v_f16 = TensorOps::from_host(Dtype::F16, vec![1024], &f16b(&vals));
-        let (gx, _, _) = crate::ops::auto_grid(1024);
-        let v_bf16 = TensorOps::of(crate::kernel::kernel_with(
-            "owl_cast_f16_bf16", (gx, 1, 1), (256, 1, 1), 0,
-        ))
+        let v_bf16 = TensorOps::call(SemanticKernel::CastF16Bf16)
         .arg(&v_f16)
         .arg_i32(1024)
         .with_shape(Dtype::BF16, vec![1024]);
-        let round = TensorOps::of(crate::kernel::kernel_with(
-            "owl_cast_bf16_f16", (gx, 1, 1), (256, 1, 1), 0,
-        ))
+        let round = TensorOps::call(SemanticKernel::CastBf16F16)
         .arg(&v_bf16)
         .arg_i32(1024)
         .with_shape(Dtype::F16, vec![1024]);

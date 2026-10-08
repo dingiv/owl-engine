@@ -168,25 +168,47 @@ fn reduce_rec(
             };
             itp.rmsnorm(&ins[0], &ins[1], eps, w_off)
         }
+        // 其余动作(gdn/attn/ln/mlp/dflash/marlin/fi…)= GPU/引擎路径;
+        // CPU 参考面结构化拒绝,绝不静默
+        Op::Call { op, .. } => Err(ModelError::Msg(format!(
+            "CPU 参考解释器未覆盖动作 {op:?}(server/引擎路径实现)"
+        ))),
         Op::SlotWrite => itp.slot_write(&ins[0]),
         Op::Reshape => Ok(Value { f32: ins[0].f32.clone(), shape: t.shape.clone() }),
+        Op::SliceView { .. } => Ok(Value { f32: ins[0].f32.clone(), shape: t.shape.clone() }),
         Op::Block { id } => itp.block(*id, t.dtype, &t.shape),
-        // 逃逸舱:client 侧闭包就地执行(不经 GpuFace;server 派发表不见它)
-        Op::Kernel { kernel, .. } => Err(ModelError::Msg(format!(
-            "Kernel 节点 \"{}\" 需 GPU server 执行(后端编译 + 发射;CPU 参考解释器不支持)",
-            kernel.name
-        ))),
-        // 胖算子:CPU 参考面不执行,但 validate 强制(毒参数在参考链同样拦截)
-        Op::Spec { spec } => {
-            spec.validate().map_err(|e| ModelError::Msg(format!("[spec] {e}")))?;
-            Err(ModelError::Msg(format!(
-                "Spec 节点 \"{}\" 需 GPU server 执行(CPU 参考解释器不支持)",
-                spec.name()
-            )))
+        // 语义算子 Call 臂(CPU 参考面):纯算子落 host 实现(动作词表的
+        // CPU 面);其余动作 = 结构化"CPU 未覆盖"(GPU/引擎路径覆盖)
+        Op::Call { op: SemanticKernel::Add, .. } => itp.add(&ins[0], &ins[1]),
+        Op::Call { op: SemanticKernel::Mul, .. } => itp.mul(&ins[0], &ins[1]),
+        Op::Call { op: SemanticKernel::Silu, .. } => itp.silu(&ins[0]),
+        Op::Call { op: SemanticKernel::Sigmoid, .. } => itp.sigmoid(&ins[0]),
+        Op::Call { op: SemanticKernel::Rmsnorm, .. } => {
+            let eps = match t.args.get(1) {
+                Some(KernelArg::F32(v)) => *v,
+                other => panic!("rmsnorm 标量槽 1 期望 f32 eps,实得 {other:?}"),
+            };
+            let w_off = match t.args.get(2) {
+                Some(KernelArg::I32(v)) => *v != 0,
+                other => panic!("rmsnorm 标量槽 2 期望 i32 w_off,实得 {other:?}"),
+            };
+            itp.rmsnorm(&ins[0], &ins[1], eps, w_off)
         }
-        other => Err(ModelError::Msg(format!(
-            "CPU 参考解释器未覆盖: {other:?}(server 侧实现)"
-        ))),
+        Op::Call { op: SemanticKernel::Narrow, .. } => {
+            // dst[r·out_dim + d] = src[r·src_dim + start + d](.cu 契约)
+            let sc = &ins[0].f32;
+            let (outer, src_dim, start, out_dim) = match (t.args.get(0), t.args.get(1), t.args.get(2), t.args.get(3)) {
+                (Some(KernelArg::Bits(o)), Some(KernelArg::Bits(sd)), Some(KernelArg::Bits(st)), Some(KernelArg::Bits(od))) => (*o as usize, *sd as usize, *st as usize, *od as usize),
+                _ => panic!("narrow 标量槽期望 outer/src_dim/start/out_dim"),
+            };
+            let mut out = vec![0f32; outer * out_dim];
+            for r in 0..outer {
+                for d in 0..out_dim {
+                    out[r * out_dim + d] = sc[r * src_dim + start + d];
+                }
+            }
+            Ok(Value { f32: out, shape: t.shape.clone() })
+        }
     }?;
     // ── Tap:After 窗口(CPU 无池块,block_id = NO_POOL 哨兵)──
     if let Some(tp) = tap.as_deref_mut() {

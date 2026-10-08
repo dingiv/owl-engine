@@ -1,57 +1,18 @@
-//! 构建期预编译:cu/ops.cu → PTX(nvcc);marlin W4A16 → .a(nvcc,feature "marlin")。
-//!
-//! 产物经 OUT_DIR/ops.ptx 被 include_str! 内嵌进二进制,运行时零编译
-//! (驱动 load_module 时对该设备 JIT)。
-//!
-//! 环境变量:
-//! - `OWL_CUDA_ARCH`:目标虚拟架构(默认 compute_86;PTX 前向兼容,
-//!   高卡由驱动 JIT;换卡/换架构 = 改此值重编)。
-//! - `OWL_NVCC`:nvcc 可执行文件(默认 "nvcc")。
+//! 构建期预编译:marlin W4A16 → .a(nvcc,feature "marlin")。
+//! (旧 cu/ops.cu → PTX 预编链随 cuda_ops 退役删除,2026-10-12;
+//!  现役内核编译 = server nvrtc 懒编译 + AOT cubin 资产,零 build.rs PTX 面。)
 
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    // PTX 预编面仅 cuda feature 需要;marlin 段仅 marlin feature 需要
-    // (纯源码之家消费方零 nvcc 依赖)
-    if std::env::var_os("CARGO_FEATURE_MARLIN").is_some() {
-        build_marlin();
-    }
-    let has_cuda = std::env::var_os("CARGO_FEATURE_CUDA").is_some();
-    if !has_cuda {
+    // 仅 marlin feature 需要 nvcc(纯源码之家消费方零 nvcc 依赖)
+    if std::env::var_os("CARGO_FEATURE_MARLIN").is_none() {
         return;
     }
-    println!("cargo:rerun-if-changed=cu/ops.cu");
-    println!("cargo:rerun-if-env-changed=OWL_CUDA_ARCH");
-    println!("cargo:rerun-if-env-changed=OWL_NVCC");
-
-    let arch = env::var("OWL_CUDA_ARCH").unwrap_or_else(|_| "compute_86".into());
-    let nvcc = env::var("OWL_NVCC").unwrap_or_else(|_| "nvcc".into());
-
-    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
-    let ptx = out_dir.join("ops.ptx");
-
-    let src = PathBuf::from("cu/ops.cu");
-    println!("cargo:rerun-if-changed={}", src.display());
-
-    let status = Command::new(&nvcc)
-        .args([
-            format!("--gpu-architecture={arch}"),
-            "--ptx".into(),
-            src.display().to_string(),
-            "-o".into(),
-            ptx.display().to_string(),
-        ])
-        .status()
-        .unwrap_or_else(|e| panic!("build.rs: 无法启动 {nvcc:?}(需要 CUDA toolkit 在 PATH): {e}"));
-
-    if !status.success() {
-        panic!("build.rs: nvcc 预编译 cu/ops.cu 失败(arch={arch})");
-    }
-    println!("cargo:rustc-env=OWL_OPS_PTX_PATH={}", ptx.display());
+    build_marlin();
 }
-
 
 fn build_marlin() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));

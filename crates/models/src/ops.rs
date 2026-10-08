@@ -7,7 +7,8 @@
 //!
 //! kernel 源**不住这里** —— 经 [`crate::kernel`] 注册表按名取用(源码之家
 //! = owl-kernels cu/;2026-09-25 垫子层裁决)。用户自定义 kernel 走
-//! `TensorOps::of(Kernel)` 直带源码(不经注册表,组合面逃生舱)。
+//! 非注册内核 = 加源 + 登记表一条 + 语义变体 + driver 臂(逃生舱收编)。
+//! (2026-10-12 用户律:Kernel/Spec 节点消灭,唯一算子节点 = Call。)
 
 use crate::contract::{Arg, Bytes, Dtype, KernelSource, LaunchMsg};
 use crate::kernel::Kernel;
@@ -122,6 +123,30 @@ pub enum SemanticKernel {
     SiluAndMul,
     /// ct packed → marlin B 设备重排(U32;核签名形参即 rows/cols)
     CtRepack,
+    /// 刀D 层间时间戳探针(链式拷贝 + clock64;标量槽 = idx/n)
+    TsStamp,
+    /// f16 → bf16 铸边界(草稿装载)
+    CastF16Bf16,
+    /// bf16 → f16 铸边界(草稿采样前)
+    CastBf16F16,
+    /// 设备侧贪心 argmax(采样;输出 [1] f32 索引数值)
+    Argmax,
+    /// 逐行 top-16(值半区 + 索引半区双 f32;aux = [rows])
+    Topk16,
+    /// DFlash2 格打分 + 贪心 walk 融合(单块;输出 [rows·(K·K+1)])
+    DflashSelect,
+    /// DFlash2 分组动态深度 2-tap 卷积
+    DflashConv,
+    /// 非因果块 attention(草稿;自块直读 + 前缀池)
+    NaiveAttnNc,
+    /// 同上 fp8kv 前缀池变体
+    NaiveAttnNcFp8kv,
+    /// marlin W4A16 GEMM(三名同 runtime:AWQ 7 父 / bf16 dt / f16,driver 路由)
+    MarlinW4A16,
+    /// FlashInfer paged prefill(f16 KV)
+    FiPrefill,
+    /// FlashInfer paged prefill(e4m3 KV)
+    FiPrefillFp8kv,
 }
 
 impl SemanticKernel {
@@ -174,6 +199,18 @@ impl SemanticKernel {
             SemanticKernel::FusedAddRmsnorm => "ln.fused_add_rmsnorm",
             SemanticKernel::SiluAndMul => "mlp.silu_and_mul",
             SemanticKernel::CtRepack => "load.ct_repack",
+            SemanticKernel::TsStamp => "ops.ts_stamp",
+            SemanticKernel::CastF16Bf16 => "elems.cast_f16_bf16",
+            SemanticKernel::CastBf16F16 => "elems.cast_bf16_f16",
+            SemanticKernel::Argmax => "ops.argmax",
+            SemanticKernel::Topk16 => "ops.topk16",
+            SemanticKernel::DflashSelect => "dflash.select",
+            SemanticKernel::DflashConv => "dflash.conv",
+            SemanticKernel::NaiveAttnNc => "attn.naive_nc",
+            SemanticKernel::NaiveAttnNcFp8kv => "attn.naive_nc_fp8kv",
+            SemanticKernel::MarlinW4A16 => "marlin.w4a16",
+            SemanticKernel::FiPrefill => "attn.fi_prefill",
+            SemanticKernel::FiPrefillFp8kv => "attn.fi_prefill_fp8kv",
         })
     }
 }
@@ -208,121 +245,6 @@ pub enum KernelArg {
     I32(i32),
     /// 4 字节浮点
     F32(f32),
-}
-
-// ============================================================================
-// §1.5 KernelCall —— 声明期槽序状态机(E1/E2 缺口闭环,2026-10-12)
-// ============================================================================
-//
-// sig 来自登记表(单源;**零 sig 字面量**),逐 token 消费:
-// - .t()  消费一个 T 槽(挂张量父;out 槽自动跳过)
-// - .sz()/.i32()/.f32() 消费对应宽度标量槽(E1 宽度错位:方法即宽度)
-// - build():全消费断言(缺项/溢出 = 声明期 panic,非 eval 期)
-//
-// 配对要求(E1/E2 的杜绝)从「人眼对 sig」变成「状态机不放行」。
-
-/// 进行中的 native kernel 声明(槽序状态机)
-pub struct KernelCall {
-    node: crate::tensor::TensorOps,
-    toks: Vec<&'static str>,
-    pos: usize,
-    out_pos: usize,
-    name: &'static str,
-}
-
-fn kernel_call_launch(name: &'static str, launch: crate::kernel::Kernel) -> KernelCall {
-    let e = crate::kernel::lookup(name).unwrap_or_else(|| panic!("kernel_call: {name} 未登记"));
-    let toks: Vec<&'static str> = e.args.split(',').collect();
-    // out 保留位:显式 O,或(无 O 时)末位 T
-    let out_pos = toks
-        .iter()
-        .position(|t| *t == "O")
-        .unwrap_or(toks.len().saturating_sub(1));
-    KernelCall {
-        node: crate::tensor::TensorOps::of(launch),
-        toks,
-        pos: 0,
-        out_pos,
-        name: e.name,
-    }
-}
-
-/// 登记表 kernel 声明(自动 1D 网格)
-pub fn kernel_call(name: &'static str) -> KernelCall {
-    kernel_call_launch(name, crate::kernel::kernel(name))
-}
-
-/// 登记表 kernel 声明(显式网格;行核 embed/rope/attn 等)
-pub fn kernel_call_with(
-    name: &'static str,
-    grid: (u32, u32, u32),
-    block: (u32, u32, u32),
-    shared_mem: u32,
-) -> KernelCall {
-    kernel_call_launch(name, crate::kernel::kernel_with(name, grid, block, shared_mem))
-}
-
-impl KernelCall {
-    fn consume(&mut self, kind: &str) {
-        if self.pos == self.out_pos {
-            self.pos += 1; // out 槽由 eval 追加,自动跳过
-        }
-        let tok = self
-            .toks
-            .get(self.pos)
-            .unwrap_or_else(|| panic!("{}: 槽序溢出(已消费 {} 个,期望 {kind})", self.name, self.pos));
-        assert!(
-            *tok == kind,
-            "{}: 第 {} 槽期望 {kind} 实得 {tok}(E1 宽度/类型错位,声明期拦截)",
-            self.name,
-            self.pos + 1
-        );
-        self.pos += 1;
-    }
-
-    /// T 槽(张量父;设备指针)
-    pub fn t(mut self, t: &crate::tensor::TensorOps) -> Self {
-        self.consume("T");
-        self.node = self.node.arg(t);
-        self
-    }
-
-    /// sz 标量(8B;size_t 形参)
-    pub fn sz(mut self, v: usize) -> Self {
-        self.consume("sz");
-        self.node = self.node.arg_usize(v);
-        self
-    }
-
-    /// i32 标量(4B)
-    pub fn i32(mut self, v: i32) -> Self {
-        self.consume("i32");
-        self.node = self.node.arg_i32(v);
-        self
-    }
-
-    /// f32 标量(4B)
-    pub fn f32(mut self, v: f32) -> Self {
-        self.consume("f32");
-        self.node = self.node.arg_f32(v);
-        self
-    }
-
-    /// 全消费断言(out 槽由 eval 追加,不计)+ 产出节点
-    pub fn build(self) -> crate::tensor::TensorOps {
-        let mut pos = self.pos;
-        if pos == self.out_pos {
-            pos += 1;
-        }
-        assert!(
-            pos == self.toks.len(),
-            "{}: 声明未消费完(pos {}/{};E2 断链类,声明期拦截)",
-            self.name,
-            pos,
-            self.toks.len()
-        );
-        self.node
-    }
 }
 
 // ============================================================================
@@ -366,14 +288,6 @@ pub enum Op {
     //      kd/vd/batch…;非核参数,不进签名)。**model 层由此不感知任何
     //      硬件算子的存在**(S2' 定稿;枚举 = 硬件无关动作契约)。
     Call { op: SemanticKernel, aux: Vec<usize> },
-
-    // ---- Kernel 节点(2026-09-23 定稿:节点的本质形态,funio Pack 同源)----
-    /// 携带核函数值(Kernel{name, source})+ 有序参数槽。
-    /// 解释器:CPU = 结构化"需 GPU server";GPU = 懒编译(源哈希缓存)+ 发射。
-    /// 参数槽有序:T(张量依赖)/ 标量;归约时张量参数先入账。
-    Kernel { kernel: Kernel },
-    /// 胖算子(kernels 侧 struct;validate/wire 由算子自带,interpreter 强制)
-    Spec { spec: std::sync::Arc<dyn owl_kernels::contract::OpSpec> },
 
     // ---- 状态节点(唯一显式副作用;SSA 外形,物理原地由 server 解释)----
     /// KV 写槽:声明"本节目写 kv manager 的这些格"——
@@ -643,12 +557,7 @@ pub fn auto_grid(out_elems: usize) -> (u32, u32, u32) {
 /// [T,V] 传 (T-1)·V;decode T=1 传 0)。
 pub fn argmax_f32idx(x: &crate::tensor::TensorOps, n: usize, offset: usize) -> crate::tensor::TensorOps {
     use crate::contract::Dtype;
-    crate::tensor::TensorOps::of(crate::kernel::kernel_with(
-        "owl_argmax_f32idx_f16",
-        (1, 1, 1),
-        (256, 1, 1),
-        0,
-    ))
+    crate::tensor::TensorOps::call(SemanticKernel::Argmax)
     .arg(x)
     .arg_i32(n as i32)
     .arg_i32(offset as i32)
@@ -666,106 +575,22 @@ pub fn argmax_f32idx(x: &crate::tensor::TensorOps, n: usize, offset: usize) -> c
 /// 登记表无 foreign 条目,sig 住 client face 单源。gdn 两臂 Call 通道的
 /// 桥:driver 拾取名 → 本表 → lower_kernel 对位装配)
 pub(crate) fn foreign_sig(name: &str) -> Option<&'static str> {
-    if name == owl_kernels::family::gdn_chunked::GDN_CHUNKED_FWD {
-        Some(owl_kernels::client::gdn_chunked::SIG)
-    } else if name == owl_kernels::family::gdn_scalar::GDN_SCALAR_FWD {
-        Some(owl_kernels::client::gdn_scalar::SIG)
-    } else {
-        None
+    use owl_kernels::contract::names as n;
+    match name {
+        x if x == owl_kernels::family::gdn_chunked::GDN_CHUNKED_FWD => Some(owl_kernels::client::gdn_chunked::SIG),
+        x if x == owl_kernels::family::gdn_scalar::GDN_SCALAR_FWD => Some(owl_kernels::client::gdn_scalar::SIG),
+        x if x == n::GEMM_W4A16 => Some(owl_kernels::client::marlin::SIG),
+        x if x == n::GEMM_W4A16_AWQ => Some(owl_kernels::client::marlin::SIG_AWQ),
+        x if x == n::GEMM_W4A16_BF16 => Some(owl_kernels::client::marlin::SIG),
+        x if x == n::PREFILL_FI => Some(owl_kernels::client::fi_sig::SIG),
+        x if x == n::PREFILL_FI_FP8KV => Some(owl_kernels::client::fi_sig::SIG),
+        _ => None,
     }
-}
-
-/// marlin W4A16 臂装配(AWQ 7 块 / f16·bf16 6 块;签名/名字 face 单源)
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn marlin_node(
-    xs: &TensorOps,
-    qw: &TensorOps,
-    sc: &TensorOps,
-    ws: &TensorOps,
-    ctmp: &TensorOps,
-    zs: Option<&TensorOps>,
-    m: usize,
-    in_dim: usize,
-    n_pack: usize,
-    group: usize,
-    bf16_act: bool,
-) -> TensorOps {
-    use owl_kernels::family::marlin;
-    let (name, sig): (&'static str, &'static str) = match zs {
-        Some(_) => (marlin::GEMM_W4A16_AWQ, owl_kernels::client::marlin::SIG_AWQ),
-        None if bf16_act => (marlin::GEMM_W4A16_BF16, owl_kernels::client::marlin::SIG),
-        None => (marlin::GEMM_W4A16, owl_kernels::client::marlin::SIG),
-    };
-    let node = TensorOps::of(Kernel::new(name, "").with_sig(sig))
-        .arg(xs)
-        .arg(qw)
-        .arg(sc);
-    let node = match zs {
-        Some(z) => node.arg(z),
-        None => node,
-    };
-    node.arg(ws)
-        .arg(ctmp)
-        .arg_usize(m)
-        .arg_usize(in_dim)
-        .arg_usize(n_pack)
-        .arg_usize(group)
-        .with_shape(if bf16_act { Dtype::BF16 } else { Dtype::F16 }, vec![m, n_pack])
 }
 
 /// marlin workspace 长度(i32 个数;装载域 Want 计尺,层零 kernels 知识)
 pub(crate) fn marlin_ws_elems(n: usize) -> usize {
     owl_kernels::family::marlin::v2_workspace_len(n)
-}
-
-/// FI paged prefill 臂装配(9 Block + 8 sz;签名/scale 编码 face 单源。
-/// name 由调用方给 = env.fi_prefill_name() 收口)
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn fi_prefill_node(
-    name: &'static str,
-    q: &TensorOps,
-    kcs: &TensorOps,
-    vcs: &TensorOps,
-    q_cu: &TensorOps,
-    indices: &TensorOps,
-    indptr: &TensorOps,
-    last_len: &TensorOps,
-    wr: &TensorOps,
-    total_rows: usize,
-    ctx_total: usize,
-    hq: usize,
-    hkv: usize,
-    hd: usize,
-    page: usize,
-) -> TensorOps {
-    TensorOps::of(Kernel::new(name, "").with_sig(owl_kernels::client::fi_sig::SIG))
-        .arg(q)
-        .arg(kcs)
-        .arg(vcs)
-        .arg(q_cu)
-        .arg(indices)
-        .arg(indptr)
-        .arg(last_len)
-        .arg(wr) // 树序依赖边(K0 先于分块读池;FI 不解引用)
-        .arg_usize(total_rows)
-        .arg_usize(ctx_total)
-        .arg_usize(total_rows)
-        .arg_usize(hq)
-        .arg_usize(hkv)
-        .arg_usize(hd)
-        .arg_usize(page)
-        .arg_usize(owl_kernels::client::fi_sig::scale_bits(hd) as usize)
-        .with_shape(q.dtype, vec![total_rows, hq * hd])
-}
-
-/// FI 虚核名选择(models 侧唯一出口;测试域消费,FI Call 化挂账复用)
-#[cfg(test)]
-pub(crate) fn fi_name(fp8kv: bool) -> &'static str {
-    if fp8kv {
-        owl_kernels::contract::names::PREFILL_FI_FP8KV
-    } else {
-        owl_kernels::contract::names::PREFILL_FI
-    }
 }
 
 /// 页配对谓词(decode;driver 单源的层侧出口,层零 driver 知识)
@@ -776,41 +601,6 @@ pub(crate) fn paged_decode_ok(hd: usize, page: usize) -> bool {
 /// 页配对谓词(prefill;bs32 契约)
 pub(crate) fn paged_prefill_ok(hd: usize, page: usize) -> bool {
     owl_kernels::driver::attn::paged_prefill_ok(hd, page)
-}
-
-#[cfg(test)]
-mod semantic_kernel_vocab_lock {
-    //! 动作词表锁:全变体 op_id 非空且唯一(枚举 ↔ 命名空间一一映射;
-    //! 漏臂/复制粘贴重名 = 此测试红)。driver 侧臂覆盖由使用路径 +
-    //! foreign_call_lock 兜底。
-    use super::*;
-
-    #[test]
-    fn op_ids_are_unique_and_total() {
-        let all = [
-            SemanticKernel::GdnGatingG, SemanticKernel::GdnL2Norm, SemanticKernel::GdnConvUpd,
-            SemanticKernel::GdnConvUpdDual, SemanticKernel::GdnDeltaDec, SemanticKernel::GdnDecodeStep,
-            SemanticKernel::GdnDecodeStepV2, SemanticKernel::GdnConvFwd, SemanticKernel::GdnRecurrence,
-            SemanticKernel::GdnNormAct, SemanticKernel::GdnChunkedDelta, SemanticKernel::GdnScalarDelta,
-            SemanticKernel::Sigmoid, SemanticKernel::Narrow, SemanticKernel::Concat, SemanticKernel::Rope,
-            SemanticKernel::Embed, SemanticKernel::CastF16F32, SemanticKernel::GemvDual,
-            SemanticKernel::K0Write, SemanticKernel::K0WriteFp8, SemanticKernel::K0WriteFp8Bf16,
-            SemanticKernel::K0Dual, SemanticKernel::K0DualFp8kv, SemanticKernel::PagedDecode,
-            SemanticKernel::PagedDecodeV2, SemanticKernel::PagedDecodeV2Fp8, SemanticKernel::PagedV2Reduce,
-            SemanticKernel::PagedPrefill, SemanticKernel::PagedPrefillFp8, SemanticKernel::PrefillSplit,
-            SemanticKernel::PrefillSplitReduce, SemanticKernel::NaiveDecode, SemanticKernel::GateMul,
-            SemanticKernel::NormRope, SemanticKernel::QkvNormRopeInsert,
-            SemanticKernel::QkvNormRopeInsertFp8kv, SemanticKernel::FusedAddRmsnorm,
-            SemanticKernel::SiluAndMul, SemanticKernel::CtRepack,
-        ];
-        let mut seen = std::collections::HashSet::new();
-        for v in all {
-            let id = v.op_id();
-            assert!(!id.0.is_empty(), "{v:?} 空命名空间");
-            assert!(seen.insert(id.0), "{v:?} 命名空间重复: {}", id.0);
-        }
-        assert_eq!(seen.len(), all.len(), "枚举变体数与映射数不一致");
-    }
 }
 
 #[cfg(test)]
@@ -940,68 +730,5 @@ mod foreign_call_lock {
         assert_eq!(call.shape().nv, 8);
         assert_eq!(call.shape().nk, 4);
         assert_eq!(call.shape().kd, 64);
-    }
-}
-
-#[cfg(test)]
-mod kernel_call_lock {
-    //! 声明期状态机锁(E1 宽度错位 / E2 断链)+ 与手摆链同构互证。
-
-    use super::*;
-    use crate::tensor::TensorOps;
-
-    #[test]
-    fn wire_matches_legacy_chain() {
-        // owl_narrow_strided_f16 sig = "T,sz,sz,sz,sz,T"
-        let q = TensorOps::of_block(1, crate::contract::Dtype::F16, vec![64]);
-        let kc = TensorOps::of_block(2, crate::contract::Dtype::F16, vec![64]);
-
-        // out 槽(末位 T)由 eval 追加,调用链不含
-        let new_node = kernel_call("owl_narrow_strided_f16")
-            .t(&q)
-            .sz(8)
-            .sz(4)
-            .sz(32)
-            .sz(2)
-            .build()
-            .with_shape(crate::contract::Dtype::F16, vec![64]);
-
-        let legacy = TensorOps::of(crate::kernel::Kernel::new("owl_narrow_strided_f16", ""))
-            .arg(&q)
-            .arg_usize(8)
-            .arg_usize(4)
-            .arg_usize(32)
-            .arg_usize(2)
-            .with_shape(crate::contract::Dtype::F16, vec![64]);
-
-        assert_eq!(new_node.parents.len(), legacy.parents.len(), "T 槽数漂移");
-        for (a, b) in new_node.parents.iter().zip(&legacy.parents) {
-            assert_eq!(a.id, b.id, "T 槽序漂移");
-        }
-        assert_eq!(new_node.args.len(), legacy.args.len(), "标量槽数漂移");
-        for (a, b) in new_node.args.iter().zip(&legacy.args) {
-            assert_eq!(format!("{a:?}"), format!("{b:?}"), "标量漂移");
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "第 2 槽期望 i32 实得 sz(E1")]
-    fn width_mismatch_panics_at_declaration() {
-        // E1:sz 槽用 i32 顶(4B 顶 8B,参数空间错位类)—— 声明期拦截
-        let q = TensorOps::of_block(1, crate::contract::Dtype::F16, vec![64]);
-        let _ = kernel_call("owl_narrow_strided_f16").t(&q).i32(7);
-    }
-
-    #[test]
-    #[should_panic(expected = "声明未消费完")]
-    fn missing_slot_panics_at_build() {
-        // E2 断链类:少喂一个 sz 槽,build() 全消费断言拦
-        let q = TensorOps::of_block(1, crate::contract::Dtype::F16, vec![64]);
-        let _ = kernel_call("owl_narrow_strided_f16")
-            .t(&q)
-            .sz(8)
-            .sz(4)
-            .sz(32)
-            .build();
     }
 }

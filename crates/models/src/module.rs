@@ -813,7 +813,7 @@ pub struct LoaderCtx {
 /// repack 路径(装载域**唯一收口**;2026-10-01 用户裁决:默认 GPU 优先,
 /// 无 GPU 能力回退 CPU)—— CPU/GPU 两条 repack 臂的决策唯一产地。
 /// 算法本体互为镜像:host = kernels/src/marlin/repack.rs(pack_marlin_b_fused
-/// 等,rayon);device = kernels/cu/marlin_repack_ct.cu(owl_ct_repack_u32,
+/// 等,rayon);device = kernels/cu/marlin/marlin_repack_ct.cu(owl_ct_repack_u32,
 /// nvrtc);对拍锚 = cuda/tests/marlin_parity.rs(逐 u32 一致)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepackPath {

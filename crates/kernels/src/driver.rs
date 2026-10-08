@@ -181,6 +181,19 @@ pub fn resolve(req: OpReq) -> KernelPick {
             elems::gemv_dual(dt, ax(0), ax(1), ax(2), ax(3))
         }
         "ops.narrow" => elems::narrow(dt),
+        "ops.ts_stamp" => ops::ts_stamp(),
+        "ops.argmax" => ops::argmax(),
+        "ops.topk16" => ops::topk16(ax(0)),
+        "ops.sigmoid_gate_mul" => attn::gate_mul(dt),
+        "elems.cast_f16_bf16" => elems::cast_dir(false),
+        "elems.cast_bf16_f16" => elems::cast_dir(true),
+        "dflash.select" => dflash::select(ax(0) != 0), // aux = [bf16](输入侧;输出恒 f32)
+        "dflash.conv" => dflash::conv(dt),
+        "attn.naive_nc" => attn::naive_nc(dt, false, req.shapes, req.scalars),
+        "attn.naive_nc_fp8kv" => attn::naive_nc(dt, true, req.shapes, req.scalars),
+        "marlin.w4a16" => marlin::w4a16(req.shapes, dt),
+        "attn.fi_prefill" => attn::fi_prefill(false),
+        "attn.fi_prefill_fp8kv" => attn::fi_prefill(true),
         "elems.cast_f16_f32" => elems::cast_f16_f32(dt),
         "ops.concat" => elems::concat(dt),
         "ops.rope" => elems::rope(dt, ax(0)),
@@ -436,6 +449,27 @@ pub mod ops {
         }
     }
 
+    /// 刀D 层间时间戳探针(链式拷贝 + clock64;哨兵 1D)
+    pub fn ts_stamp() -> KernelPick {
+        KernelPick { name: "probe_ts_f16", shape: SENTINEL_1D }
+    }
+
+    /// 设备侧贪心 argmax(单块两段规约;fixed (1,1,1) × 256)
+    pub fn argmax() -> KernelPick {
+        KernelPick {
+            name: "owl_argmax_f32idx_f16",
+            shape: Shape { grid: (1, 1, 1), block: (256, 1, 1), smem: 0 },
+        }
+    }
+
+    /// 逐行 top-16(单缓冲 [rows, 32]:值半区降序 + 索引半区;aux = [rows])
+    pub fn topk16(rows: usize) -> KernelPick {
+        KernelPick {
+            name: "owl_topk16_f16",
+            shape: Shape { grid: (rows as u32, 1, 1), block: (256, 1, 1), smem: 0 },
+        }
+    }
+
     /// rmsnorm:一 block 一行(×(1+w) 同核,w_off 入参;rows 从形状推导:
     /// x_total / cols,alpha 末维 = cols)
     pub fn rmsnorm(dt: DType, shapes: &[Vec<usize>]) -> KernelPick {
@@ -456,11 +490,41 @@ pub mod ops {
 }
 
 // ============================================================================
+// §3.x DFlash2 草稿族(E5-DF1;语义锚 = sglang dflash.py)
+// ============================================================================
+
+pub mod dflash {
+    use super::{DType, KernelPick, Shape, SENTINEL_1D};
+
+    /// 格打分 + 贪心 walk 融合(单块;fixed (1,1,1) × 256)。
+    /// ⚠️ 输入侧 f16/bf16(aux = [bf16]),输出恒 f32 —— 节点 dt 是输出,
+    /// 路由不吃 req.dt
+    pub fn select(bf16: bool) -> KernelPick {
+        KernelPick {
+            name: if bf16 { "owl_dflash_select_bf16" } else { "owl_dflash_select_f16" },
+            shape: Shape { grid: (1, 1, 1), block: (256, 1, 1), smem: 0 },
+        }
+    }
+
+    /// 分组动态深度 2-tap 卷积(哨兵 1D)
+    pub fn conv(dt: DType) -> KernelPick {
+        KernelPick {
+            name: match dt {
+                DType::F16 => "owl_dflash_conv_f16",
+                DType::BF16 => "owl_dflash_conv_bf16",
+                DType::F32 | DType::U32 => unimplemented!("dflash_conv 仅 f16/bf16"),
+            },
+            shape: SENTINEL_1D,
+        }
+    }
+}
+
+// ============================================================================
 // §4.1 attention 族(vLLM port 家族;页配对律的 env 侧宿主)
 // ============================================================================
 
 pub mod attn {
-    use super::{DType, Hw, KernelPick, OpEnv, Shape, SENTINEL_1D};
+    use super::{DType, Hw, KernelPick, OpEnv, Shape, FOREIGN, SENTINEL_1D};
 
     /// K0 批量写池(reshape_and_cache;grid (tokens,1,1),block 256)。
     /// dt 分派(E5-DF3 同日十四):F16 → f16 核;BF16 → bf16 核(草稿池)。
@@ -764,6 +828,42 @@ pub mod attn {
         KernelPick { name: "owl_sigmoid_gate_mul_f16", shape: SENTINEL_1D }
     }
 
+    /// 非因果块 attention(DFlash2 草稿;自块直读 + 前缀池;v2 签名:
+    /// grid (T, Hq) × block (hd);t 自 shapes[0][0],hq/hd 自标量槽 0/2)
+    pub fn naive_nc(
+        dt: DType,
+        fp8kv: bool,
+        shapes: &[Vec<usize>],
+        scalars: &[i64],
+    ) -> KernelPick {
+        let t = shapes.first().and_then(|s| s.first().copied()).unwrap_or(1) as u32;
+        let hq = scalars.first().copied().unwrap_or(1) as u32;
+        let hd = scalars.get(2).copied().unwrap_or(128) as u32;
+        let name = match (dt, fp8kv) {
+            (DType::F16, false) => "owl_naive_attn_nc_f16",
+            (DType::BF16, false) => "owl_naive_attn_nc_bf16",
+            (DType::F16, true) => "owl_naive_attn_nc_fp8kv_f16",
+            (DType::BF16, true) => "owl_naive_attn_nc_fp8kv_bf16",
+            (DType::F32, _) | (DType::U32, _) => unimplemented!("naive_nc 仅 f16/bf16"),
+        };
+        KernelPick {
+            name,
+            shape: Shape { grid: (t, hq, 1), block: (hd.max(1), 1, 1), smem: 0 },
+        }
+    }
+
+    /// FlashInfer paged prefill(foreign 家族臂;plan 缓存 + run 在家族 runtime)
+    pub fn fi_prefill(fp8kv: bool) -> KernelPick {
+        KernelPick {
+            name: if fp8kv {
+                crate::contract::names::PREFILL_FI_FP8KV
+            } else {
+                crate::contract::names::PREFILL_FI
+            },
+            shape: FOREIGN,
+        }
+    }
+
     /// norm_rope 融合:qk-norm(×(1+w)^{w_off})+ rotate-half partial rope
     /// (narrow+norm+rope 三发合一;strided 读 q_raw 的 per-head 半段)。
     /// grid (tokens, heads, 1);block (hd,1,1);smem = hd·4B(行内归约)。
@@ -890,6 +990,14 @@ pub mod mlp {
 
 pub mod elems {
     /// f16→f32 设备 cast(GDN chunked 编排配套;哨兵 1D;节点 dtype = F32 出)
+    /// f16↔bf16 铸边界(哨兵 1D;to_bf16 = false → f16→bf16)
+    pub fn cast_dir(to_f16: bool) -> KernelPick {
+        KernelPick {
+            name: if to_f16 { "owl_cast_bf16_f16" } else { "owl_cast_f16_bf16" },
+            shape: SENTINEL_1D,
+        }
+    }
+
     pub fn cast_f16_f32(dt: DType) -> KernelPick {
         assert!(matches!(dt, DType::F32), "cast_f16_f32 出 f32,得 {dt:?}");
         KernelPick { name: "owl_cast_f16_f32", shape: SENTINEL_1D }
@@ -1092,5 +1200,26 @@ mod tests {
         assert_eq!(p.shape.grid, (5120 / 8 * 4 / 64, 32, 1));
         assert_eq!(p.shape.block, (32, 1, 1));
         assert_eq!(load::CT_REPACK.0, "load.ct_repack");
+    }
+}
+
+// ============================================================================
+// §6 marlin 家族臂(foreign;2026-10-12 Kernel 节点消灭收编)
+// ============================================================================
+
+pub mod marlin {
+    use super::{DType, KernelPick, FOREIGN};
+
+    /// W4A16 GEMM(三名同 runtime;shapes.len = **父数(out 不算)**:
+    /// AWQ 6 父(xs,qw,sc,zs,ws,c_tmp)/ f16·bf16 5 父;bf16 由 dt 路由)
+    pub fn w4a16(shapes: &[Vec<usize>], dt: DType) -> KernelPick {
+        let name = if shapes.len() == 6 {
+            crate::contract::names::GEMM_W4A16_AWQ
+        } else if dt == DType::BF16 {
+            crate::contract::names::GEMM_W4A16_BF16
+        } else {
+            crate::contract::names::GEMM_W4A16
+        };
+        KernelPick { name, shape: FOREIGN }
     }
 }

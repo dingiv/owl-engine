@@ -1,9 +1,10 @@
 //! models 视图的 native kernel 登记表垫子(2026-10-12 M4 目录治理:
-//! 本体已迁 owl_kernels::native —— 登记表/lookup/Kernel 值是 kernels 语义;
+//! 本体已迁 owl_kernels::list(原 native.rs,2026-10-12 更名)——
+//! 登记表/lookup/Kernel 值是 kernels 语义;
 //! 本文件只剩 re-export 与 boot 胶水(kv_manifest_gate:KvQuant/ModelError
 //! 是 models 词汇)。旧路径 `crate::kernel::*` 全量续用,调用点零改动。
 
-pub use owl_kernels::native::{
+pub use owl_kernels::list::{
     kernel, kernel_with, launch_shape, lookup, source, with_pick, Entry, Kernel, LaunchShape,
     REGISTRY,
 };

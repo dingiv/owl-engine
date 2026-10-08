@@ -9,6 +9,7 @@
 //!   哨兵自动 1D 会越界读 slot_mapping,禁用 —— port 头注第 3 条)。
 
 use crate::contract::DeviceClient as _;
+use crate::ops::SemanticKernel;
 use crate::kernel::kernel_with;
 use crate::testkit::{f32b, gpu_client, gpu_enabled};
 use crate::tensor::Dtype;
@@ -71,12 +72,7 @@ async fn gpu_reshape_and_cache_f16_matches_host() {
     .expect("vc 池");
 
     // 发射(显式 grid = T;契约 5 槽表 f32)
-    let decl = TensorOps::of(kernel_with(
-        "vllm_reshape_and_cache_f16",
-        (t_len as u32, 1, 1),
-        (256, 1, 1),
-        0,
-    ))
+    let decl = TensorOps::call(SemanticKernel::K0Write).aux(&[t_len])
     .arg(&TensorOps::from_host(Dtype::F16, vec![t_len, hkv, hd], &halfb(&key)))
     .arg(&TensorOps::from_host(Dtype::F16, vec![t_len, hkv, hd], &halfb(&value)))
     .arg(&TensorOps::of_block(kc_b.id, Dtype::F16, vec![nb, hkv, hd / x, p, x]))
@@ -173,8 +169,7 @@ async fn setup_paged_fixture(
         TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd, p]).step(), gpu)
         .await.expect("vc 池");
     let slots: Vec<f32> = (0..t_ctx).map(|t| t as f32).collect();
-    let wr = TensorOps::of(kernel_with(
-        "vllm_reshape_and_cache_f16", (t_ctx as u32, 1, 1), (256, 1, 1), 0))
+    let wr = TensorOps::call(SemanticKernel::K0Write).aux(&[t_ctx])
         .arg(&TensorOps::from_host(Dtype::F16, vec![t_ctx, hkv, hd], &halfb(&key)))
         .arg(&TensorOps::from_host(Dtype::F16, vec![t_ctx, hkv, hd], &halfb(&value)))
         .arg(&TensorOps::of_block(kc_b.id, Dtype::F16, vec![nb, hkv, hd / x, p, x]))
@@ -259,12 +254,7 @@ async fn gpu_prefill_paged_attn_f16_hd256_impl(t_ctx: usize) {
     let q8 = |v: f32| half::f16::from_f32(v).to_f32();
     let qb = |v: &[f32]| v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>();
 
-    let decl = TensorOps::of(kernel_with(
-        "vllm_chunked_prefill_paged_attn_opt_f16_hd256",
-        (hq as u32 / hkv as u32, hkv as u32, (t_ctx as u32 + 255) / 256),
-        (256, 1, 1),
-        smem,
-    ))
+    let decl = TensorOps::call(SemanticKernel::PagedPrefill).aux(&[hd, hkv, hq, t_ctx])
     .arg(&TensorOps::from_host(Dtype::F16, vec![t_ctx, hq, hd], &qb(&q)))
     .arg(&TensorOps::of_block(kc_b.id, Dtype::F16, vec![nb, hkv, hd / 8, p, 8]))
     .arg(&TensorOps::of_block(vc_b.id, Dtype::F16, vec![nb, hkv, hd, p]))
@@ -345,8 +335,7 @@ async fn gpu_paged_attention_v1_f16_smoke() {
     let scale = 1.0 / (hd as f32).sqrt();
     let shared = ((t_ctx + p - 1) / p * p * 4).max((4 / 2) * hd * 4) as u32; // NUM_WARPS=4
 
-    let decl = TensorOps::of(kernel_with(
-        "vllm_paged_attention_v1_f16_hd128bs32", (hq as u32, 1, 1), (128, 1, 1), shared))
+    let decl = TensorOps::call(SemanticKernel::PagedDecode).aux(&[hd, hq, hkv, nb])
         .arg(&TensorOps::from_host(Dtype::F16, vec![1, hq, hd],
             &q.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>()))
         .arg(&TensorOps::of_block(kc_b.id, Dtype::F16, vec![nb, hkv, hd / 8, p, 8]))
@@ -398,12 +387,7 @@ async fn gpu_paged_attention_v1_f16_hd256_smoke() {
     let shared = ((t_ctx + p - 1) / p * p * 4).max((4 / 2) * hd * 4) as u32;
     let qb = |v: &[f32]| v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>();
 
-    let decl = TensorOps::of(kernel_with(
-        "vllm_paged_attention_v1_f16_hd256bs32",
-        (hq as u32, 1, 1),
-        (128, 1, 1),
-        shared,
-    ))
+    let decl = TensorOps::call(SemanticKernel::PagedDecode).aux(&[hd, hq, hkv, nb])
     .arg(&TensorOps::from_host(Dtype::F16, vec![1, hq, hd], &qb(&q)))
     .arg(&TensorOps::of_block(kc_b.id, Dtype::F16, vec![nb, hkv, hd / 8, p, 8]))
     .arg(&TensorOps::of_block(vc_b.id, Dtype::F16, vec![nb, hkv, hd, p]))
@@ -477,8 +461,7 @@ async fn gpu_paged_attention_v2_reduce_f16_smoke() {
         TensorOps::zeros(Dtype::F32, vec![1, hq, 1]).step(), &mut gpu).await.expect("es");
     let ml_b = crate::interpreters::eval_ops(
         TensorOps::zeros(Dtype::F32, vec![1, hq, 1]).step(), &mut gpu).await.expect("ml");
-    let v2 = TensorOps::of(kernel_with(
-        "vllm_paged_attention_v2_f16_hd128bs32", (hq as u32, 1, 1), (128, 1, 1), shared))
+    let v2 = TensorOps::call(SemanticKernel::PagedDecodeV2).aux(&[hd, hq, hkv, nb, 1])
         .arg(&TensorOps::from_host(Dtype::F16, vec![1, hq, hd], &qb(&q)))
         .arg(&TensorOps::of_block(kc_b.id, Dtype::F16, vec![nb, hkv, hd / 8, p, 8]))
         .arg(&TensorOps::of_block(vc_b.id, Dtype::F16, vec![nb, hkv, hd, p]))
@@ -500,8 +483,7 @@ async fn gpu_paged_attention_v2_reduce_f16_smoke() {
     let tmp = crate::interpreters::eval_ops(v2.step(), &mut gpu).await.expect("v2 eval");
 
     // reduce:分片归约 → 终出
-    let rd = TensorOps::of(kernel_with(
-        "vllm_paged_attention_v2_reduce_f16_hd128", (hq as u32, 1, 1), (128, 1, 1), 8))
+    let rd = TensorOps::call(SemanticKernel::PagedV2Reduce).aux(&[hd, hq, 1])
         .arg(&TensorOps::of_block(es_b.id, Dtype::F32, vec![1, hq, 1]))
         .arg(&TensorOps::of_block(ml_b.id, Dtype::F32, vec![1, hq, 1]))
         .arg(&TensorOps::of_block(tmp.id, Dtype::F16, vec![1, hq, hd]))
@@ -545,12 +527,7 @@ async fn gpu_prefill_paged_attn_f16_smoke() {
     let q8 = |v: f32| half::f16::from_f32(v).to_f32();
     let qb = |v: &[f32]| v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>();
 
-    let decl = TensorOps::of(kernel_with(
-        "vllm_chunked_prefill_paged_attn_opt_f16_hd128",
-        (hq as u32 / hkv as u32, hkv as u32, (t_ctx as u32 + 255) / 256),
-        (256, 1, 1),
-        smem,
-    ))
+    let decl = TensorOps::call(SemanticKernel::PagedPrefill).aux(&[hd, hkv, hq, t_ctx])
     .arg(&TensorOps::from_host(Dtype::F16, vec![t_ctx, hq, hd], &qb(&q)))
     .arg(&TensorOps::of_block(kc_b.id, Dtype::F16, vec![nb, hkv, hd / 8, p, 8]))
     .arg(&TensorOps::of_block(vc_b.id, Dtype::F16, vec![nb, hkv, hd, p]))

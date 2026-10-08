@@ -2446,9 +2446,7 @@ mod f16_tests {
             TensorOps::of_block(da.id, Dtype::F16, vec![total]),
             TensorOps::of_block(dd.id, Dtype::F16, vec![heads]),
         );
-        let decl = TensorOps::of(crate::kernel::kernel_with(
-            "owl_gdn_gating_g_f16", (0, 0, 0), (256, 1, 1), 0,
-        )).arg(&l).arg(&a_).arg(&d_).arg_usize(total).arg_usize(heads)
+        let decl = TensorOps::call(SemanticKernel::GdnGatingG).arg(&l).arg(&a_).arg(&d_).arg_usize(total).arg_usize(heads)
         .with_shape(Dtype::F16, vec![total]);
         let out = crate::interpreters::eval_ops(decl.step(), &mut gpu).await.unwrap();
         let mut buf = vec![0u8; total * 2];
@@ -2472,9 +2470,7 @@ mod f16_tests {
         let mut gpu = gpu_client().await;
         let dx = gpu.htod(Dtype::F16, &crate::contract::Shape::from(vec![rows, dim]), &hbytes(&x)).await.unwrap();
         let x_decl = TensorOps::of_block(dx.id, Dtype::F16, vec![rows, dim]);
-        let decl = TensorOps::of(crate::kernel::kernel_with(
-            "owl_gdn_l2norm_f16", (rows as u32, 1, 1), (256, 1, 1), 0,
-        )).arg(&x_decl).arg_usize(rows).arg_usize(dim).arg_f32(1e-6)
+        let decl = TensorOps::call(SemanticKernel::GdnL2Norm).aux(&[rows]).arg(&x_decl).arg_usize(rows).arg_usize(dim).arg_f32(1e-6)
         .with_shape(Dtype::F16, vec![rows, dim]);
         let out = crate::interpreters::eval_ops(decl.step(), &mut gpu).await.unwrap();
         let mut buf = vec![0u8; rows * dim * 2];
@@ -2514,10 +2510,7 @@ mod f16_tests {
             TensorOps::of_block(dzi.id, Dtype::F16, vec![rows, vd]),
             TensorOps::of_block(dgi.id, Dtype::F16, vec![gs]),
         );
-        let decl = TensorOps::of(crate::kernel::kernel_with(
-            "owl_gdn_norm_act_f16",
-            ((rows * vd / gs) as u32, 1, 1), (256, 1, 1), 0,
-        )).arg(&x_).arg(&z_).arg(&g_)
+        let decl = TensorOps::call(SemanticKernel::GdnNormAct).aux(&[rows, vd, gs]).arg(&x_).arg(&z_).arg(&g_)
         .arg_usize(rows).arg_usize(vd).arg_usize(gs).arg_f32(1e-6).arg_i32(0)
         .with_shape(Dtype::F16, vec![rows, vd]);
         let out = crate::interpreters::eval_ops(decl.step(), &mut gpu).await.unwrap();
@@ -2561,9 +2554,7 @@ mod f16_tests {
             let x_decl = TensorOps::of_block(dxi.id, Dtype::F16, vec![batch, d]);
             let sl = TensorOps::from_host(Dtype::F32, vec![batch], &f32b(&slots));
             // conv_upd(q 段,w_offset=0)
-            let conv = TensorOps::of(crate::kernel::kernel_with(
-                "owl_gdn_conv_upd_f16", (0, 0, 0), (256, 1, 1), 0,
-            )).arg(&x_decl).arg(&w_decl).arg(&conv_state).arg(&sl)
+            let conv = TensorOps::call(SemanticKernel::GdnConvUpd).arg(&x_decl).arg(&w_decl).arg(&conv_state).arg(&sl)
             .arg_usize(batch * d).arg_usize(d).arg_usize(0).arg_i32(1)
             .with_shape(Dtype::F16, vec![batch, d]);
             let cout = crate::interpreters::eval_ops(conv.step(), &mut gpu).await.unwrap();
@@ -2614,13 +2605,7 @@ mod f16_tests {
                 TensorOps::of_block(db.id, Dtype::F16, vec![batch, nv]),
             );
             let sl2 = TensorOps::from_host(Dtype::F32, vec![batch], &f32b(&slots));
-            let decl = TensorOps::of(crate::kernel::kernel_with(
-                "owl_gdn_delta_dec_f16",
-                (((vd + 63) / 64) as u32, (batch * nv) as u32, 1), (64, 1, 1),
-                // 核内 k/q_smem 按 OWL_GDN16_MAX_KD=128 偏移寻址 —— smem 恒按
-                // 128 档给足(kd 参数仅约束装载循环;照 f32 wrapper 同款)
-                ((2 * 128 + 2) * 4) as u32,
-            )).arg(&q_).arg(&k_).arg(&v_).arg(&g_).arg(&b_)
+            let decl = TensorOps::call(SemanticKernel::GdnDeltaDec).aux(&[batch, nv, nk, kd, vd]).arg(&q_).arg(&k_).arg(&v_).arg(&g_).arg(&b_)
             .arg(&rec).arg(&sl2)
             .arg_usize(batch).arg_usize(nv).arg_usize(nk).arg_usize(kd).arg_usize(vd)
             .arg_f32(1.0 / (kd as f32).sqrt())
@@ -2678,9 +2663,7 @@ mod f16_tests {
         let x_decl = TensorOps::of_block(dxb.id, Dtype::F16, vec![t, d]);
         let sl = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot as f32]));
         let cu = TensorOps::from_host(Dtype::F32, vec![2], &f32b(&[0.0, t as f32]));
-        let fwd = TensorOps::of(crate::kernel::kernel_with(
-            "owl_gdn_conv_fwd_f16", (1u32, ((d + 255) / 256) as u32, 1), (256, 1, 1), 0,
-        )).arg(&x_decl).arg(&w_decl).arg(&st_a).arg(&sl).arg(&cu)
+        let fwd = TensorOps::call(SemanticKernel::GdnConvFwd).aux(&[d]).arg(&x_decl).arg(&w_decl).arg(&st_a).arg(&sl).arg(&cu)
         .arg_i32(1).arg_i32(d as i32).arg_i32(1)
         .with_shape(Dtype::F16, vec![t, d]);
         let out_a = crate::interpreters::eval_ops(fwd.step(), &mut gpu).await.unwrap();
@@ -2694,9 +2677,7 @@ mod f16_tests {
             let one = gpu.htod(Dtype::F16, &sh(vec![1, d]), &hbytes(&x[tk * d..(tk + 1) * d])).await.unwrap();
             let one_decl = TensorOps::of_block(one.id, Dtype::F16, vec![1, d]);
             let sl1 = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot as f32]));
-            let c = TensorOps::of(crate::kernel::kernel_with(
-                "owl_gdn_conv_upd_f16", (0, 0, 0), (256, 1, 1), 0,
-            )).arg(&one_decl).arg(&w_decl).arg(&st_b).arg(&sl1)
+            let c = TensorOps::call(SemanticKernel::GdnConvUpd).arg(&one_decl).arg(&w_decl).arg(&st_b).arg(&sl1)
             .arg_usize(d).arg_usize(d).arg_usize(0).arg_i32(1)
             .with_shape(Dtype::F16, vec![1, d]);
             let o = crate::interpreters::eval_ops(c.step(), &mut gpu).await.unwrap();
@@ -2752,11 +2733,7 @@ mod f16_tests {
         );
         let sl = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot as f32]));
         let cu = TensorOps::from_host(Dtype::F32, vec![2], &f32b(&[0.0, t as f32]));
-        let fwd = TensorOps::of(crate::kernel::kernel_with(
-            "owl_gdn_recurrence_varlen_gqa_f16",
-            (((vd + 7) / 8) as u32, (nv) as u32, 1), (32, 8, 1),
-            ((4 * kd + 4) * 4) as u64 as u32,
-        )).arg(&q_).arg(&k_).arg(&v_).arg(&g_).arg(&b_)
+        let fwd = TensorOps::call(SemanticKernel::GdnRecurrence).aux(&[nv, kd, vd]).arg(&q_).arg(&k_).arg(&v_).arg(&g_).arg(&b_)
         .arg(&st_a).arg(&sl).arg(&cu)
         .arg_usize(1).arg_usize(nv).arg_usize(nk).arg_usize(kd).arg_usize(vd)
         .arg_f32(q_scale)
@@ -2784,11 +2761,7 @@ mod f16_tests {
                 TensorOps::of_block(rb.id, Dtype::F16, vec![1, nv]),
             );
             let sl1 = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot as f32]));
-            let d = TensorOps::of(crate::kernel::kernel_with(
-                "owl_gdn_delta_dec_f16",
-                (((vd + 63) / 64) as u32, (nv) as u32, 1), (64, 1, 1),
-                ((2 * 128 + 2) * 4) as u32,
-            )).arg(&q_).arg(&k_).arg(&v_).arg(&g_).arg(&b_)
+            let d = TensorOps::call(SemanticKernel::GdnDeltaDec).aux(&[1, nv, nk, kd, vd]).arg(&q_).arg(&k_).arg(&v_).arg(&g_).arg(&b_)
             .arg(&st_b).arg(&sl1)
             .arg_usize(1).arg_usize(nv).arg_usize(nk).arg_usize(kd).arg_usize(vd)
             .arg_f32(q_scale)

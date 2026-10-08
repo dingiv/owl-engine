@@ -71,7 +71,6 @@
 //! 时,为它扩充新能力即可(历次扩项:Reshape/Kernel 节点/CSE/DAG)。
 
 use crate::contract::Shape;
-use crate::kernel::Kernel;
 use crate::ops::{KernelArg, Op, SemanticKernel};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -253,39 +252,6 @@ impl TensorOps {
             err: None,
             label: None,
         }
-    }
-
-    /// Kernel 节点声明:`TensorOps::of(kernel).arg(..).arg(..)`
-    /// 参数按序入槽;参数与真实 kernel 签名的一致性由后端最终裁决
-    /// (INVALID_VALUE = 结构化报错)。
-    pub fn of(kernel: Kernel) -> TensorOps {
-        TensorOps {
-            id: next_id(),
-            parents: vec![],
-            depth: 0,
-            op: Op::Kernel { kernel },
-            dtype: Dtype::F32,
-            shape: vec![],
-            args: vec![],
-            err: None,
-            label: None,
-        }
-    }
-
-    /// 胖算子声明(kernels::contract::OpSpec;validate 由 interpreter
-    /// 发射前强制,失败 = interpreter 层结构化报错)
-    pub fn spec(
-        spec: std::sync::Arc<dyn owl_kernels::contract::OpSpec>,
-        parents: Vec<TensorOps>,
-        dtype: Dtype,
-        shape: Shape,
-    ) -> TensorOps {
-        let mut out = Self::of_block(0, dtype, shape.clone());
-        out.op = crate::ops::Op::Spec { spec };
-        for p in &parents {
-            out = out.arg(p);
-        }
-        out.with_shape(dtype, shape)
     }
 
     /// 语义调用声明(**model 层面向解释器的唯一新语句**,Driver 立项):

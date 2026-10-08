@@ -10,9 +10,10 @@
 /// kernels 不依赖 iface,契约老家即此;iface 经 re-export 续用旧路径)
 pub mod contract;
 
-/// native kernel 登记表 + Kernel 值(2026-10-12 自 models::kernel 迁入;
-/// 登记表与 driver 同 crate,driver_picks_are_registered 耦合测试随迁)
-pub mod native;
+/// 登记表(list:native kernel 名字 → 源 + 槽序契约 + dtype 标注;
+/// 2026-10-12 自 models::kernel 迁入,同日由 native.rs 更名 list.rs ——
+/// "登记表"才是它的本体,native/foreign 之别交给 driver/registry)
+pub mod list;
 
 /// 家族底座(资产/FFI/ABI:两平面共用的单源 —— cubins/OwlCublas/marlin
 /// FFI/flashinfer FFI;cublas/marlin/flashinfer 随各自 FFI feature 门)
@@ -28,7 +29,8 @@ pub mod client;
 pub mod server;
 
 /// 服务端面原语(DeviceRes 资源面 trait + Exec 执行引擎;feature=device,
-/// 纯 cudarc driver/nvrtc —— 勿挂 "cuda":其 ops.cu 预编链为存量断链)
+/// 纯 cudarc driver/nvrtc;旧 "cuda" feature(cuda_ops PTX 预编链)已随
+/// 三形态归一退役删除,勿复活)
 #[cfg(feature = "device")]
 pub mod device;
 
@@ -83,8 +85,3 @@ pub mod sources;
 /// 上层经具名函数描述「要什么」,本模块决定「用哪个、怎么发射」)
 pub mod driver;
 
-#[cfg(feature = "cuda")]
-pub mod cuda_ops;
-
-#[cfg(feature = "cuda")]
-pub use cuda_ops::KernelFn;

@@ -71,13 +71,8 @@ pub(crate) fn narrow_strided(
             .arg_usize(out_dim)
             .with_shape(dt, shape);
     }
-    // f32 语义锚链:Kernel 节点直发(Call 通路 f32 对拍挂账,见台账)
-    TensorOps::of(crate::kernel::kernel_with(
-        "owl_narrow_strided_f32",
-        (0, 0, 0),
-        (256, 1, 1),
-        0,
-    ))
+    // f32 语义锚链同通道(名字 = driver 按 dt 单源)
+    TensorOps::call(crate::ops::SemanticKernel::Narrow)
     .arg(src)
     .arg_usize(outer)
     .arg_usize(src_dim)
@@ -97,13 +92,8 @@ pub fn concat_rows(inputs: &[&TensorOps], r: usize, d: usize) -> TensorOps {
     let mut k = if dt == crate::tensor::Dtype::F16 {
         TensorOps::call(crate::ops::SemanticKernel::Concat) // 哨兵:逐元素核,自动 1D ceil/256
     } else {
-        // f32 语义锚链:Kernel 直发(f32 Call 通路对拍挂账)
-        TensorOps::of(crate::kernel::kernel_with(
-            "owl_concat_rows_f32",
-            (0, 0, 0),
-            (256, 1, 1),
-            0,
-        ))
+        // f32 语义锚链同通道
+        TensorOps::call(crate::ops::SemanticKernel::Concat)
     };
     for i in 0..8 {
         k = k.arg(inputs.get(i).copied().unwrap_or(inputs[0]));

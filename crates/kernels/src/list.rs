@@ -1,5 +1,8 @@
-//! native kernel 登记表 + Kernel 值(2026-10-12 自 models::kernel 迁入;
+//! 登记表(list)+ Kernel 值(2026-10-12 自 models::kernel 迁入;
 //! 用户裁决:登记表是 kernels 语义,models 留 re-export 垫子)。
+//! 更名注记:native.rs → list.rs —— 本模块本体 = **封闭登记表**
+//! (名字 → 源/签名/dtype 的唯一权威表),"native" 只是表中条目的
+//! 属性之一(native/foreign 之别住 driver 分派与 registry 路由)。
 //!
 //! ```text
 //! sources.rs(.cu 源码之家,include_str)
@@ -235,6 +238,8 @@ pub static REGISTRY: &[Entry] = &[
     Entry { name: "owl_qknorm_rope_kv_insert_f16", source: sources::owl::QKNORM_ROPE_KV_INSERT_F16, args: "T,T,T,T,T,T,T,T,T,T,T,f32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     // B6.3:fp8 主池变体(签名逐字同 f16;cache 形参 u8 寻址 1B/elem)
     Entry { name: "owl_qknorm_rope_kv_insert_f16_fp8kv", source: sources::owl::QKNORM_ROPE_KV_INSERT_F16_FP8KV, args: "T,T,T,T,T,T,T,T,T,T,T,f32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    // ---- 刀D 层间时间戳探针(2026-10-12 自 models 逃生舱收编;链式拷贝 + clock64)----
+    Entry { name: "probe_ts_f16", source: sources::owl::TS_PROBE, args: "T,T,sz,sz,T", dtype: crate::contract::Dtype::F16 },
     // ---- ct packed → marlin B 设备重排(2026-10-01 装载提速;AWQ 装载线)----
     Entry { name: "owl_ct_repack_u32", source: sources::owl::CT_REPACK_U32, args: "T,sz,sz,T", dtype: crate::contract::Dtype::U32 },
     // ---- 文本主干(Qwen3.5 mini-demo;Kernel 节点路径,输出块末参)----

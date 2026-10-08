@@ -6,6 +6,7 @@
 //! 全删;旧"装载期转置"是 naive-matmul 时代产物)。
 
 use crate::contract::Dtype;
+use crate::ops::SemanticKernel;
 use crate::layers::narrow_strided;
 use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, QuantPlan, Weight};
 use crate::formats::w4a16::marlin_n_pack;
@@ -145,21 +146,29 @@ impl Linear {
             // (E5-DF3 同日十二:草稿路径 BF16 化,scales 保持 F16 装载,
             // a/c=BF16 的 marlin 实例;s_type = F16 两族一致)
             let bf16_act = xs.dtype == Dtype::BF16;
-            // marlin 臂装配 = crate::ops::§6(2026-10-12 用户律:层零 kernels
-            // 知识 —— 名字/签名/AWQ 插槽全在动作表单源)
-            let marlin = crate::ops::marlin_node(
-                xs,
-                &qw.decl(),
-                &sc.decl(),
-                &ws.decl(),
-                &ctmp.decl(),
-                self.zs.as_ref().map(|z| z.decl()).as_ref(),
-                m,
-                self.in_dim,
-                n_pack,
-                g as usize,
-                bf16_act,
-            );
+            // marlin 臂(2026-10-12 三形态归一 Call):语义动作声明,
+            // 名字路由归 driver(zs 在场 = AWQ 7 父;dt = BF16 → bf16 臂)
+            let marlin = match self.zs.as_ref() {
+                Some(z) => TensorOps::call(SemanticKernel::MarlinW4A16)
+                    .arg(xs)
+                    .arg(&qw.decl())
+                    .arg(&sc.decl())
+                    .arg(&z.decl())
+                    .arg(&ws.decl())
+                    .arg(&ctmp.decl()),
+                None => TensorOps::call(SemanticKernel::MarlinW4A16)
+                    .arg(xs)
+                    .arg(&qw.decl())
+                    .arg(&sc.decl())
+                    .arg(&ws.decl())
+                    .arg(&ctmp.decl()),
+            };
+            let marlin = marlin
+                .arg_usize(m)
+                .arg_usize(self.in_dim)
+                .arg_usize(n_pack)
+                .arg_usize(g as usize)
+                .with_shape(if bf16_act { Dtype::BF16 } else { Dtype::F16 }, vec![m, n_pack]);
             return narrow_strided(
                 &marlin,
                 m,

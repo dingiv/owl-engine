@@ -1349,9 +1349,8 @@ mod tests {
             vec![rows, vocab],
             &logits.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>(),
         );
-        let topk = crate::TensorOps::of(crate::kernel::kernel_with(
-            "owl_topk16_f16", (rows as u32, 1, 1), (256, 1, 1), 0,
-        ))
+        let topk = crate::TensorOps::call(crate::ops::SemanticKernel::Topk16)
+            .aux(&[rows])
         .arg(&logits_t)
         .arg_i32(vocab as i32)
         .with_shape(crate::contract::Dtype::F32, vec![rows, 32]);
@@ -1380,9 +1379,8 @@ mod tests {
         let anchor_t = crate::TensorOps::from_host(
             crate::contract::Dtype::F32, vec![1], &crate::testkit::f32b(&[42.0]),
         );
-        let sel_out = crate::TensorOps::of(crate::kernel::kernel_with(
-            "owl_dflash_select_f16", (1, 1, 1), (256, 1, 1), 0,
-        ))
+        let sel_out = crate::TensorOps::call(crate::ops::SemanticKernel::DflashSelect)
+            .aux(&[0])
         .arg(&crate::TensorOps::from_host(crate::contract::Dtype::F32, vec![rows, 16], &crate::testkit::f32b(&cand)))
         .arg(&crate::TensorOps::from_host(crate::contract::Dtype::F32, vec![rows, 16], &crate::testkit::f32b(&unary)))
         .arg(&proj_t)

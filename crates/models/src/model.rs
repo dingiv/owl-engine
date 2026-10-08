@@ -294,33 +294,15 @@ impl Module for Model {
 }
 
 /// 刀D 取证:层间时间戳内核(OWL_TS_PROBE)。拷贝 in→out(链式接续)+
-/// thread(0,0) 写 clock64 到 ts_buf[idx]。发射 = 哨兵自动网格;
-/// 逃生舱直带 sig(非注册,组合期跳过 dtype 守门)。
-const TS_CU: &str = r#"
-#include <cuda_fp16.h>
-extern "C" __global__ void probe_ts_f16(
-    const __half* in, unsigned long long* ts, const size_t idx, const size_t n,
-    __half* out) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < (int)n) { out[i] = in[i]; }
-    if (blockIdx.x == 0 && threadIdx.x == 0) { ts[idx] = clock64(); }
-}
-"#;
-
-fn ts_stamp(xs: &TensorOps, buf: &TensorOps, idx: usize) -> TensorOps {
+/// thread(0,0) 写 clock64 到 ts_buf[idx]。发射 = 哨兵自动网格
+/// (2026-10-12 源收编 kernels cu/owl/ts_probe.cu + 登记表;三形态归一 Call)。
+fn ts_stamp(xs: &TensorOps, buf: &TensorOps, idx: usize) -> TensorOps{
     let shape = xs.shape.clone();
-    let n: usize = shape.iter().product();
-    let k = crate::kernel::Kernel {
-        name: "probe_ts_f16",
-        source: TS_CU,
-        launch: crate::kernel::LaunchShape::default(),
-        sig: "T,T,sz,sz,T",
-    };
-    TensorOps::of(k)
+    TensorOps::call(crate::ops::SemanticKernel::TsStamp)
         .arg(xs)
         .arg(buf)
         .arg_usize(idx)
-        .arg_usize(n)
+        .arg_usize(shape.iter().product::<usize>())
         .with_shape(xs.dtype, shape)
 }
 

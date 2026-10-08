@@ -5,15 +5,17 @@
 //! 直接内嵌/直引源码(2026-09-25 用户裁决:kernel 源与业务层解耦,
 //! 中间垫 = models::kernels 注册表)。
 //!
-//! 后端语义:cu/text/ = 文本主干(Qwen3.5 mini-demo);cu/ops.cu = 语义
+//! 后端语义:cu/owl/ = owl 自研/移植位(文本主干/融合/dflash/时间戳等);
+//! cu/ops_pair.cu = 语义算子对(matmul 除外)
 //! 算子动作表母本;cu/gdn/ 等随各域立项迁入。launcher(nvrtc 编译/发射)
 //! 在后端(owl-cuda server),本 crate 的 cuda feature(build.rs nvcc 预编
 //! PTX 面)与源码之家无关。
 
 /// 语义算子动作表母本(F5 模板统一:单源双 dtype 宏展开;matmul 除外
-/// —— f16 走 cuBLAS foreign 通道,f32 手写核保留单元锚)
-pub const OPS_F32: &str = include_str!("../cu/ops_pair.cu");
-pub const OPS_F16: &str = include_str!("../cu/ops_pair.cu");
+/// —— f16 走 cuBLAS foreign 通道,f32 手写核保留单元锚。
+/// 2026-10-12 归编 cu/owl/ —— owl 自研语义算子位)
+pub const OPS_F32: &str = include_str!("../cu/owl/ops_pair.cu");
+pub const OPS_F16: &str = include_str!("../cu/owl/ops_pair.cu");
 
 /// owl 移植位(工单 N;NInfer 等外部引擎核的 owl 契约改写)
 pub mod owl {
@@ -22,6 +24,8 @@ pub mod owl {
     pub const GEMV_DUAL_F16: &str = include_str!("../cu/owl/gemv_dual_f16.cu");
     /// 设备侧贪心采样(E3;REQ-DEC-04)
     pub const ARGMAX_F16: &str = include_str!("../cu/owl/argmax_f16.cu");
+    /// 刀D 层间时间戳探针(2026-10-12 自 models 逃生舱收编)
+    pub const TS_PROBE: &str = include_str!("../cu/owl/ts_probe.cu");
     /// DFlash2 草稿特有核族(E5-DF1;conv/topk16/selector/naive-NC-attn)
     pub const DFLASH2_F16: &str = include_str!("../cu/owl/dflash2.cu");
     // ---- 融合核族(C1;2026-10-01;Ampere-first 准则见 .cu 头注)----
@@ -32,8 +36,9 @@ pub mod owl {
     /// B6.3:fp8 e4m3 主池变体(同文件;decode 融合插池路的 e4m3 池写)
     pub const QKNORM_ROPE_KV_INSERT_F16_FP8KV: &str = include_str!("../cu/owl/fused.cu");
     /// ct packed → marlin B 设备重排(2026-10-01 装载提速;主源 =
-    /// attention.rs marlin_repack.cu gptq_repack_kernel,输入侧转置适配)
-    pub const CT_REPACK_U32: &str = include_str!("../cu/marlin_repack_ct.cu");
+    /// attention.rs marlin_repack.cu gptq_repack_kernel,输入侧转置适配;
+    /// 2026-10-12 归编 cu/marlin/ —— marlin 家族源码同目录)
+    pub const CT_REPACK_U32: &str = include_str!("../cu/marlin/marlin_repack_ct.cu");
 }
 
 /// attention port 家族(K0 起步;vendor attention.rs rev c0f19f2,Apache-2.0,
@@ -57,16 +62,17 @@ pub mod attention {
     pub const PREFILL_SPLIT_F16: &str = include_str!("../cu/attention/prefill_split_f16.cu");
 }
 
-/// 文本主干 kernel(models layers 消费)
+/// 文本主干 kernel(2026-10-12 归编 cu/owl/ —— owl 自研/移植位,不再
+/// 单设 text 目录;mod 名保留 = 消费方零改动)
 pub mod text {
     /// embedding 查表
-    pub const EMBED_F32: &str = include_str!("../cu/text/embed_f32.cu");
+    pub const EMBED_F32: &str = include_str!("../cu/owl/embed_f32.cu");
     /// rope(interleaved partial)
-    pub const ROPE_HALF_PARTIAL_F32: &str = include_str!("../cu/text/rope_f32.cu");
+    pub const ROPE_HALF_PARTIAL_F32: &str = include_str!("../cu/owl/rope_f32.cu");
     /// full-attention(narrow 窄切物化 + naive decode slot 直排)
-    pub const ATTENTION_F32: &str = include_str!("../cu/text/attention.cu");
+    pub const ATTENTION_F32: &str = include_str!("../cu/owl/attention.cu");
     /// GDN 线性注意力(gating g 臂;后续批:l2norm/conv_upd/delta_dec/norm_act)
-    pub const GDN_F32: &str = include_str!("../cu/text/gdn.cu");
+    pub const GDN_F32: &str = include_str!("../cu/owl/gdn.cu");
     /// PF1a 栈核(concat_rows;arity 8,展开路径测试锚专用)
-    pub const CONCAT_F32: &str = include_str!("../cu/text/concat.cu");
+    pub const CONCAT_F32: &str = include_str!("../cu/owl/concat.cu");
 }

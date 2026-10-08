@@ -61,10 +61,10 @@ MMQ 可用(MMQ 移植领地 = decode 小批;大批 llama.cpp 自己都 dequant �
 | `cu/ops.cu` | `owl_matmul_f32` / `owl_matmul_nt_f32`(**裸三重循环,🎯 cuBLAS 替换为目标**)| ✅ |
 | | `owl_add/mul/silu/sigmoid_f32` | ✅ |
 | | `owl_rmsnorm_f32`(w_off) | ✅ |
-| `cu/text/embed_f32.cu` | `owl_embed_f32` | ✅ |
-| `cu/text/rope_f32.cu` | `owl_rope_half_partial_f32` | ✅ |
-| `cu/text/attention.cu` | `owl_naive_decode_attn_f32` | ✅ |
-| `cu/text/gdn.cu` | GDN decode 五核(gating_g/l2norm/conv_upd/delta_dec/norm_act) | ✅ |
+| `cu/owl/embed_f32.cu` | `owl_embed_f32` | ✅ |
+| `cu/owl/rope_f32.cu` | `owl_rope_half_partial_f32` | ✅ |
+| `cu/owl/attention.cu` | `owl_naive_decode_attn_f32` | ✅ |
+| `cu/owl/gdn.cu` | GDN decode 五核(gating_g/l2norm/conv_upd/delta_dec/norm_act) | ✅ |
 
 ## 五、目标(按序立住)
 

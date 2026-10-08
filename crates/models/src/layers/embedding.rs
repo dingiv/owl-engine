@@ -6,6 +6,8 @@
 //! 容器 + LoaderOps 装载形态。
 
 #[cfg(test)]
+use crate::ops::SemanticKernel;
+#[cfg(test)]
 use crate::tensor::Dtype;
 use crate::module::{Loadable, LoaderCtx, LoaderOps, QuantPlan, Weight};
 use crate::module::{ForwardCtx, Module};
@@ -231,9 +233,7 @@ mod f16_tests {
         // htod 块 → Block 叶子声明(f16 链不走 CpuFace 的 from_host)
         let w_decl = TensorOps::of_block(dw.id, Dtype::F16, vec![vocab, d]);
         let i_decl = TensorOps::of_block(di.id, Dtype::F32, vec![tokens]);
-        let decl = TensorOps::of(crate::kernel::kernel_with(
-            "owl_embed_f16", (tokens as u32, 1, 1), (128, 1, 1), 0,
-        ))
+        let decl = TensorOps::call(SemanticKernel::Embed).aux(&[tokens])
         .arg(&w_decl)
         .arg(&i_decl)
         .arg_usize(d)

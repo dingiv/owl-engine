@@ -619,3 +619,81 @@ actor 线程 catch_unwind 包裹(AssertUnwindSafe)→ 装配深路径 panic
 - 回归:models 121/121(带 GPU)/ kernels 23/23 / engine 38/38 /
   facedir 2/2 / workspace 绿 / gdn 金标 GPU 绿;llm_speedtest std 复测
   prefill avg **1166.0**(基线带,零回归)。
+
+---
+
+## 十七、三形态归一 Call(2026-10-12,用户律五番:Kernel/Spec 节点消灭)
+
+> 用户裁决:`Call / Kernel / Spec` 三个算子节点形态合一 —— 不是包一层,
+> 是把其中形式**彻底消灭**。
+
+- **消灭 `Op::Spec`**:胖算子路径零生产消费(样例 NarrowStrided 与
+  `SemanticKernel::Narrow` 重复);contract::OpSpec trait /
+  client/native.rs / TensorOps::spec / eval Spec 臂 / spec_arm_tests
+  全删。值域校验职责 = driver 臂(契约公式)+ 登记表 O 标记 + family
+  face parse 三层承接,E1-E15 防线不缩水。
+- **消灭 `Op::Kernel`**:全部 ~50 发射点迁移 Call ——
+  ① native 测试守卫(gdn 逐核 ×9 / attention ×3 / embedding / rope);
+  ② 生产(dflash2 草稿链 ×10 / rope f32 臂 ×2 / specs topk·select /
+  model argmax / mod narrow·concat f32 / argmax helper);
+  ③ foreign(marlin 三臂 / FI 两臂 → `MarlinW4A16` / `FiPrefill{,Fp8kv}`
+  + driver FOREIGN 臂 + foreign_sig 扩容);
+  ④ **逃生舱收编**:ts_stamp 探针(刀D)源入
+  kernels cu/owl/ts_probe.cu + 登记 + `SemanticKernel::TsStamp` ——
+  非注册内核的合法入口从"内联源+手撸 sig"回归"加源+登记+变体+臂"。
+- **driver 新臂 12**:ops.ts_stamp/argmax/topk16/sigmoid_gate_mul、
+  elems.cast_{f16_bf16,bf16_f16}、dflash.{select,conv}、
+  attn.naive_nc{,_fp8kv}(grid 自 shapes+标量槽推导)、marlin.w4a16
+  (**父数路由:AWQ 6 父 / f16·bf16 5 父;boot 案:误判 7 块致 AWQ 走
+  f16 槽 5≠6 panic,已修**)、attn.fi_prefill{,_fp8kv}。
+  ⚠️ dflash.select 输入侧 f16/bf16(aux 路由)而输出恒 f32 —— 变体
+  路由不吃 req.dt 的首个反例。
+- **eval Call 臂 env 占位**:CPU face(测试域)无 op_env = Sm86 占位,
+  纯语义臂不消费 env;硬件感知臂在 CPU face 不可达(launch 面拒)。
+- **Op 终态 9 变体**:源(Htod/Zeros/Block)+ 视图(Reshape/SliceView)+
+  复合(Matmul/MatmulNt)+ **Call(唯一算子形态)** + 状态(SlotWrite)。
+- **事故录**:gdn.rs 曾被批量脚本截断为 0 行 —— git HEAD 恢复
+  (SemanticKernel 轮已提交,零损失),本轮测试站 call 化在恢复版上
+  重放。教训:批量替换脚本必须逐文件写后立即 `wc -l` 自检。
+- 回归:models 115/115(GPU 全套,含迁移守卫)/ kernels 19/19 /
+  engine 38/38 / facedir 2/2 / workspace 绿;llm_speedtest std 复测
+  prefill avg **1154.9**(基线带,零回归;boot 期 AWQ 路由案在
+  smoke 中暴露并修复)。
+
+---
+
+## 十八、cuda_ops 退役(2026-10-12,存量断链清理)
+
+- `crates/kernels/src/cuda_ops.rs`(+180 行)删除:早期"crate 自持发射"
+  架构残骸(KernelFn 自描述发射包 + build.rs nvcc 预编 PTX),三重死亡
+  —— cu/ops.cu 已不存在(预编必失败)/ 实现全注释化 / 零消费方。
+  职能早已被现役三层取代:server nvrtc 懒编译 / AOT cubin 资产 /
+  marlin·FI 静态 FFI。
+- 连带:build.rs PTX 预编段删除(仅剩 marlin .a 段)、Cargo.toml
+  "cuda" feature 删除(device 保留 = 现役 Exec)、lib.rs re-export 清理、
+  device.rs 头注同步。**非注册内核合法入口 = 加源 + 登记 + 语义变体 +
+  driver 臂**(§十七收编律),零 build.rs PTX 面。
+- 回归:kernels 19/19 / models 115/115 / engine 38/38 / workspace 绿。
+
+---
+
+## 十九、登记表更名 list(2026-10-12)
+
+- `kernels/src/native.rs` → **`list.rs`**(git mv 保历史):本模块本体 =
+  **封闭登记表**(名字 → 源/槽序契约/dtype 的唯一权威表),"native"
+  只是条目属性之一(native/foreign 之别住 driver 分派与 registry 路由)
+  —— 模块名让位本体。models::kernel 垫子 re-export 路径随更名。
+- 回归:kernels 19/19 / models 115/115 / workspace 绿。
+
+---
+
+## 二十、cu/ 目录收编(2026-10-12,孤文件归位)
+
+- `cu/text/`(5 文件:embed/rope/attention/gdn/concat)→ **`cu/owl/`**
+  (owl 自研/移植位;文本主干不再单设目录,mod 名保留 = 消费方零改动);
+- `cu/ops_pair.cu` → **`cu/owl/`**(owl 自研语义算子对,F5 双 dtype 宏桥);
+- `cu/marlin_repack_ct.cu` → **`cu/marlin/`**(marlin 家族源码同目录);
+- `cu/` 根目录清零:剩 5 个域目录(attention/flashinfer/gdn/marlin/owl),
+  无孤文件。sources.rs include 路径 + README 表 + 4 处文档提及随更;
+  workorder 历史档案按惯例不改写。
+- 回归:kernels 19/19 / models 115/115 / engine 38/38 / workspace 绿。

@@ -10,7 +10,7 @@
 //! P3 无例外:资源获取/状态读取/副作用一律 `Result`;裸返回仅限纯且全
 //! 函数。零 `()`、零 log-and-continue、零 ack 侧信道。
 //!
-//! feature = "cuda"(cudarc driver/nvrtc;与 cuda_ops 同门)。
+//! feature = "device"(cudarc driver/nvrtc;独立于已退役的 cuda_ops 预编链)。
 
 use crate::contract::{FieldStats, InvariantBox, Law, OpError, OpId, Stage};
 use cudarc::driver::{CudaContext, CudaFunction, CudaStream};

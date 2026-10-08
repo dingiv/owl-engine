@@ -4,8 +4,6 @@
 //! models 只 `use` 本平面,不拼名字字符串、不摆参数槽。
 //! 对偶面 = [`crate::server`](家族 runtime;DeviceRes 由后端实现)。
 
-/// native 语义算子胖算子(样例:NarrowStrided;值域校验内嵌)
-pub mod native;
 /// GDN chunked(face;零门)
 pub mod gdn_chunked;
 /// GDN scalar(face;零门)

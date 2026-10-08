@@ -24,9 +24,15 @@
 //! `Module` trait;统一 ForwardCtx 随 runner 立项)。
 
 use crate::contract::Dtype;
+use crate::ops::SemanticKernel;
+
+/// attention scale 的 f32 位型(sz 槽过 U64;纯数学,零 kernels 知识)
+fn fi_scale_bits(hd: usize) -> u64 {
+    (1.0f32 / (hd as f32).sqrt()).to_bits() as u64
+}
 #[cfg(test)]
 use crate::kernel;
-use crate::ops::SemanticKernel;
+
 use crate::layers::linear::Linear;
 use crate::layers::{concat_rows_hier, narrow_strided};
 use crate::layers::rmsnorm::RmsNorm;
@@ -595,27 +601,32 @@ impl Attention {
             .arg_i32(page)
             .arg_i32(pol.x as i32)
             .with_shape(dt, vec![1]); // 哑输出(契约 4)
-        // ② FI prefill(q 已是 [T, Hq*hd] 投影+norm+rope 后;out [T, Hq*hd])
-        // 装配 = crate::ops::fi_prefill_node(2026-10-12 用户律:层零 kernels
-        // 知识 —— 槽序签名/scale 位型全在动作表单源)
+        // ② FI prefill(q 已是 [T, Hq*hd] 投影+norm+rope 后;out [T, Hq*hd];
+        // 2026-10-12 三形态归一 Call —— fp8kv = KV 策略选变体,名字/网格归
+        // driver,槽序 sig 归家族线契约)
         let ctx_total = ctx.ctx_base + tokens;
-        let y = crate::ops::fi_prefill_node(
-            ctx.env.kv.fi_prefill_name(),
-            q,
-            &fi.kcs[ctx.fi_kvi],
-            &fi.vcs[ctx.fi_kvi],
-            fi.q_cu,
-            fi.indices,
-            fi.indptr,
-            fi.last_len,
-            &wr,
-            tokens,     // total_rows(本 chunk q 行)
-            ctx_total,  // kv_indptr host 端点
-            self.hq,
-            self.hkv,
-            self.hd,
-            pol.page,
-        );
+        let y = TensorOps::call(if ctx.env.kv.is_fp8() {
+            SemanticKernel::FiPrefillFp8kv
+        } else {
+            SemanticKernel::FiPrefill
+        })
+        .arg(q)
+        .arg(&fi.kcs[ctx.fi_kvi])
+        .arg(&fi.vcs[ctx.fi_kvi])
+        .arg(fi.q_cu)
+        .arg(fi.indices)
+        .arg(fi.indptr)
+        .arg(fi.last_len)
+        .arg(&wr) // 树序依赖边(K0 先于分块读池;FI 不解引用)
+        .arg_usize(tokens)          // total_rows(本 chunk q 行)
+        .arg_usize(ctx_total)       // kv_indptr host 端点
+        .arg_usize(tokens)          // T
+        .arg_usize(self.hq)
+        .arg_usize(self.hkv)
+        .arg_usize(self.hd)
+        .arg_usize(pol.page)
+        .arg_usize(fi_scale_bits(self.hd) as usize)
+        .with_shape(dt, vec![tokens, self.hq * self.hd]);
         // ③ 输出门(f16 融合单发)+ 出投影(与旧路径同)
         let n = tokens * self.hq * self.hd;
         let y = TensorOps::call(SemanticKernel::GateMul)
@@ -882,12 +893,7 @@ mod tests {
 
         let mut gpu = crate::testkit::gpu_client().await;
         let src = TensorOps::from_host(Dtype::F32, vec![2, 32], &f32b(&q_raw));
-        let decl = TensorOps::of(kernel::kernel_with(
-            "owl_narrow_strided_f32",
-            (0, 0, 0),
-            (256, 1, 1),
-            0,
-        ))
+        let decl = TensorOps::call(SemanticKernel::Narrow)
         .arg(&src)
         .arg_usize(outer)
         .arg_usize(src_dim)
@@ -946,12 +952,7 @@ mod tests {
             let (ck, cv) = cur(s);
             let kc = TensorOps::from_host(Dtype::F32, vec![4, 1, 2], &f32b(&k_cache));
             let vc = TensorOps::from_host(Dtype::F32, vec![4, 1, 2], &f32b(&v_cache));
-            TensorOps::of(kernel::kernel_with(
-                "owl_naive_decode_attn_f32",
-                (0, 0, 0),
-                (256, 1, 1),
-                0,
-            ))
+            TensorOps::call(SemanticKernel::NaiveDecode)
             .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1, 2], &f32b(&q)))
             .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1, 2], &f32b(&ck)))
             .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1, 2], &f32b(&cv)))
@@ -1012,9 +1013,7 @@ mod f16_tests {
         let ds = gpu.htod(Dtype::F16, &crate::contract::Shape::from(vec![2, 16]),
             &src.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>()).await.expect("htod");
         let s_decl = TensorOps::of_block(ds.id, Dtype::F16, vec![2, 16]);
-        let decl = TensorOps::of(crate::kernel::kernel_with(
-            "owl_narrow_strided_f16", (0, 0, 0), (256, 1, 1), 0,
-        ))
+        let decl = TensorOps::call(SemanticKernel::Narrow)
         .arg(&s_decl)
         .arg_usize(outer)
         .arg_usize(src_dim)
@@ -1697,9 +1696,7 @@ mod owl_port_tests {
         let dout = gpu.alloc(Dtype::F16, n).await.expect("alloc");
         let g_decl = TensorOps::of_block(dg.id, Dtype::F16, vec![n]);
         let x_decl = TensorOps::of_block(dxx.id, Dtype::F16, vec![n]);
-        let decl = TensorOps::of(crate::kernel::kernel_with(
-            "owl_sigmoid_gate_mul_f16", (0, 0, 0), (256, 1, 1), 0,
-        ))
+        let decl = TensorOps::call(SemanticKernel::GateMul)
         .arg(&g_decl).arg(&x_decl).arg_usize(n)
         .with_shape(Dtype::F16, vec![n]);
         let out = crate::interpreters::eval_ops(decl.step(), &mut gpu).await.expect("eval");
@@ -1768,9 +1765,7 @@ mod naive_attn_f16_tests {
             );
             let kc_d = TensorOps::of_block(kc.id, Dtype::F16, vec![slots_n, hkv, hd]);
             let vc_d = TensorOps::of_block(vc.id, Dtype::F16, vec![slots_n, hkv, hd]);
-            let decl = TensorOps::of(crate::kernel::kernel_with(
-                "owl_naive_decode_attn_f16", (0, 0, 0), (256, 1, 1), 0,
-            ))
+            let decl = TensorOps::call(SemanticKernel::NaiveDecode)
             .arg(&q_t).arg(&k_t).arg(&v_t).arg(&kc_d).arg(&vc_d)
             .arg(&TensorOps::from_host(Dtype::F32, vec![1], &sl.to_le_bytes().to_vec()))
             .arg(&TensorOps::from_host(Dtype::F32, vec![1], &kl.to_le_bytes().to_vec()))
@@ -2108,15 +2103,18 @@ mod split_probe_tests {
             .arg_i32((hkv * hd) as i32).arg_i32((hkv * hd) as i32)
             .arg_i32(hkv as i32).arg_i32(hd as i32).arg_i32(page as i32).arg_i32(x as i32)
             .with_shape(Dtype::F16, vec![1]);
-        let y = crate::ops::fi_prefill_node(
-            // 测试局部选择(生产走 ctx.env.kv.fi_prefill_name() 收口)
-            crate::ops::fi_name(fp8kv),
-            &q, &kfi_t, &vfi_t,
-            &q_cu, &indices, &indptr, &last_len,
-            &wr,
-            t, ctx_total,
-            hq, hkv, hd, page,
-        );
+        let y = TensorOps::call(if fp8kv {
+            SemanticKernel::FiPrefillFp8kv
+        } else {
+            SemanticKernel::FiPrefill
+        })
+        .arg(&q).arg(&kfi_t).arg(&vfi_t)
+        .arg(&q_cu).arg(&indices).arg(&indptr).arg(&last_len)
+        .arg(&wr)
+        .arg_usize(t).arg_usize(ctx_total).arg_usize(t)
+        .arg_usize(hq).arg_usize(hkv).arg_usize(hd).arg_usize(page)
+        .arg_usize(fi_scale_bits(hd) as usize)
+        .with_shape(Dtype::F16, vec![t, hq * hd]);
         let got = crate::testkit::harvest_f16(&mut gpu, &y).await;
                 gpu.close().await.expect("close");
 

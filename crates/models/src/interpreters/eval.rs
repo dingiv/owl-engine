@@ -11,7 +11,7 @@
 
 use crate::contract::{Bytes, Dtype, ModelError};
 use owl_iface::contract::Arg;
-use crate::ops::Op;
+use crate::ops::{Op, SemanticKernel};
 use crate::tensor::TensorOps;
 use std::future::Future;
 use std::pin::Pin;
@@ -460,7 +460,7 @@ where
                 Some(sig) => crate::kernel::Kernel::new(pick.name, "").with_sig(sig),
                 None => crate::kernel::with_pick(pick),
             };
-            // 以下与 Op::Kernel 臂同构(登记表 dtype 守门 + alloc + lower + launch)
+            // 以下 = 统一发射面(登记表 dtype 守门 + alloc + lower + launch)
             if let Some(e) = crate::kernel::lookup(kernel.name) {
                 if e.dtype != dtype {
                     return Err(ModelError::Msg(format!(
@@ -473,44 +473,6 @@ where
             let out = ctx.face.alloc_uninit(dtype, n_elems).await?;
             ctx.track_new(out.id);
             let msg = crate::ops::lower_kernel(&kernel, &t.args, &ins, &out, n_elems);
-            ctx.face.launch(msg).await?;
-            out
-        }
-        Op::Kernel { kernel } => {
-            // f16 基线守门(2026-09-26):注册表 dtype 标注对账声明 dtype,
-            // 不符 = 结构化报错 —— 堵死「f32 核读 f16 字节 = 静默垃圾」。
-            // 逃生舱(非注册,带 sig)跳过(仅测试域)。
-            if let Some(e) = crate::kernel::lookup(kernel.name) {
-                if e.dtype != dtype {
-                    return Err(ModelError::Msg(format!(
-                        "[dtype 守门] kernel \"{}\" 登记为 {:?},声明为 {:?} \
-                         —— f16 变体未注册(F2-F4 迁移中)",
-                        kernel.name, e.dtype, dtype
-                    )));
-                }
-            }
-            let out = ctx.face.alloc_uninit(dtype, n_elems).await?;
-            ctx.track_new(out.id);
-            let msg = crate::ops::lower_kernel(kernel, &t.args, &ins, &out, n_elems);
-            ctx.face.launch(msg).await?;
-            out
-        }
-        Op::Spec { spec } => {
-            // 胖算子(2026-10-12 review A 案接线):发射前强制 validate ——
-            // 毒参数在此结构化报错,到不了 GPU(E1-E15 台账的 interpreter 闸门)。
-            spec.validate().map_err(|e| ModelError::Msg(format!("[spec] {e}")))?;
-            // out 声明对账:spec.out()(算子权威)vs 节点标注(C1 单源);
-            // 不符 = 声明内部矛盾,结构化报错
-            let (spec_dt, spec_shape) = spec.out();
-            if spec_dt != dtype || spec_shape != shape {
-                return Err(ModelError::Msg(format!(
-                    "[spec 守门] {} out 声明 {:?} {:?} != 节点标注 {:?} {:?}",
-                    spec.name(), spec_dt, spec_shape, dtype, shape
-                )));
-            }
-            let out = ctx.face.alloc_uninit(dtype, n_elems).await?;
-            ctx.track_new(out.id);
-            let msg = spec.wire(&ins, &out);
             ctx.face.launch(msg).await?;
             out
         }
@@ -576,54 +538,6 @@ where
         }
     }
     Ok(out)
-}
-
-#[cfg(test)]
-mod spec_arm_tests {
-    //! Op::Spec 臂(2026-10-12 review A 案接线):胖算子 validate 强制。
-    use super::*;
-    use crate::tensor::TensorOps;
-    use owl_kernels::client::native::NarrowStrided;
-
-    fn spec_node(outer: usize, start: usize, id: u64) -> TensorOps {
-        let spec = NarrowStrided {
-            outer,
-            src_dim: 32,
-            start,
-            out_dim: 16,
-            src: owl_kernels::contract::Bytes { id, len: outer * 32 },
-        };
-        TensorOps::spec(
-            std::sync::Arc::new(spec),
-            vec![TensorOps::of_block(id, Dtype::F16, vec![outer, 32])],
-            Dtype::F16,
-            vec![outer * 16],
-        )
-    }
-
-    /// 毒参数(validate 拒):窗口越界在 interpreter 层结构化报错,
-    /// 到不了 face(GPU/CPU 皆然)—— E1-E15 台账的 interpreter 闸门
-    #[tokio::test]
-    async fn spec_validates_before_launch() {
-        let mut face = owl_cpu::CpuFace::new();
-        let err = eval_ops(spec_node(4, 20, 701).step(), &mut face)
-            .await
-            .unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("[spec]"), "应为 spec validate 错: {msg}");
-    }
-
-    /// 合法参数:闸门放行 → 推进到发射,CPU 面无 GPU 结构化拒
-    /// (证明第二条不是测试哑火 —— 错误必须来自发射面而非 validate)
-    #[tokio::test]
-    async fn spec_valid_params_reach_launch() {
-        let mut face = owl_cpu::CpuFace::new();
-        let err = eval_ops(spec_node(4, 0, 702).step(), &mut face)
-            .await
-            .unwrap_err();
-        let msg = format!("{err}");
-        assert!(!msg.contains("[spec]"), "validate 不应拦合法参数: {msg}");
-    }
 }
 
 #[cfg(test)]
@@ -702,27 +616,24 @@ mod dtype_guard_tests {
         );
     }
 
-    /// f16 基线守门:注册核(f32 条目)遇 f16 声明 = 结构化报错
+    /// Call 通道的 dtype 错位防护(2026-10-12 瘦身后语义升级):名字由
+    /// driver 按声明 dt 单源(f16 → f16 核)—— 错位类错误在源头结构性
+    /// 消失;CPU 面不能执行 → 必须结构化拒绝(绝不静默错值)
     #[tokio::test]
     async fn f16_registered_kernel_is_rejected() {
         let mut face = owl_cpu::CpuFace::new();
-        // narrow_strided 登记 F32;f16 声明 → 守门拦截
         let src = TensorOps::of_block(903, Dtype::F16, vec![4]);
-        let decl = TensorOps::of(crate::kernel::kernel_with(
-            "owl_narrow_strided_f32",
-            (0, 0, 0),
-            (256, 1, 1),
-            0,
-        ))
+        let decl = TensorOps::call(SemanticKernel::Narrow)
         .arg(&src)
         .arg_usize(1)
         .arg_usize(4)
         .arg_usize(0)
         .arg_usize(2)
         .with_shape(Dtype::F16, vec![2]);
-        let err = eval_ops(decl.step(), &mut face).await.unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("dtype 守门") && msg.contains("owl_narrow_strided_f32"), "{msg}");
+        assert!(
+            eval_ops(decl.step(), &mut face).await.is_err(),
+            "CPU 面执行 f16 narrow 必须显式报错,不得静默"
+        );
     }
 
     /// GPU:f16 语义五算子 vs host f32 参考(F2 收口锚;OWL_TEST_DEVICE 门控)

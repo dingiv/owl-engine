@@ -257,30 +257,10 @@ impl InvariantBox {
 
 
 // ============================================================================
-// 胖算子契约(E1-E15 错误台账的代码级杜绝;2026-10-12 用户设计)
+// 胖算子契约(历史注记,2026-10-12 用户律:三形态归一 Call 后退役)
 // ============================================================================
-//
-// 每个**在用**算子在 kernels 里显式声明一个 struct(字段即参数,自带
-// 值域/配对校验逻辑),实现本 trait。interpreter 在发射前强制调用
-// [`OpSpec::validate`],不通过 = interpreter 层结构化报错 —— model
-// 层使用者无感知,但毒参数到不了 GPU。
-//
-// ⚠️ 命名(2026-10-12 review B 案):本 trait 与 registry::KernelSpec
-// (服务端 runtime 原子单位,用户裁决名)曾同名相撞 —— 客户端胖算子
-// 规格改名 **OpSpec**,registry 侧保持 KernelSpec 不动。
-
-/// 胖算子契约(实现者须 Debug;Op 节点 Clone/Debug 派生需要)
-pub trait OpSpec: Send + Sync + std::fmt::Debug {
-    /// 线格式名(server 分派键;= 登记表登记名)
-    fn name(&self) -> &'static str;
-
-    /// 参数校验:值域/形状/正交位(interpreter 发射前强制)。
-    /// 违例 = `OpError::Contract`(带字段名与越界值)。
-    fn validate(&self) -> Result<(), OpError>;
-
-    /// 输出声明(dtype + shape;eval 按此 alloc 输出块)
-    fn out(&self) -> (Dtype, Shape);
-
-    /// 线格式组装(ins = T 槽,序 = 签名序;out 已由 eval 分配)
-    fn wire(&self, ins: &[Arg], out: &Bytes) -> LaunchMsg;
-}
+// 原 OpSpec trait(name/validate/out/wire,struct 即算子)随 Op::Spec 节点
+// 一并退役 —— 值域校验由 driver 臂(契约公式进代码)+ 登记表 O 标记 +
+// family face parse 三层承接;样例 NarrowStrided 与 SemanticKernel::Narrow
+// 重复,已删。E1-E15 台账的代码级防线 = KernelCall 时代遗产 + 现役
+// lower_kernel C2 对拍 + 家族 face 校验,不受影响。
