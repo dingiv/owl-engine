@@ -68,7 +68,7 @@ impl Embedding {
     pub fn embed(&self, ids: &TensorOps, tokens: usize) -> TensorOps {
         // 输出 dtype 跟随表 Weight(F5;LoaderCtx 自动跟随)
         let dt = self.w.dtype();
-        TensorOps::call(crate::ops::ids::OPS_EMBED).aux(&[tokens])
+        TensorOps::call(crate::ops::SemanticKernel::Embed).aux(&[tokens])
         .arg(&self.w.decl())
         .arg(ids)
         .arg_usize(self.d_dim)

@@ -398,34 +398,6 @@ where
         // 刀1:连续切片视图(与 Reshape 同族透传;偏移在消费面由节点 op
         // 合成 Arg::BlockSlice,此处块句柄 = 父块全长 —— CSE/回收按块计)
         Op::SliceView { .. } => { ctx.track_alias(vals[0].id); vals[0].clone() }
-        Op::Add => {
-            let out = ctx.face.alloc_uninit(dtype, n_elems).await?;
-            ctx.track_new(out.id);
-            let msg = crate::ops::lower_add(&ins, &out, n_elems, dtype);
-            ctx.face.launch(msg).await?;
-            out
-        }
-        Op::Mul => {
-            let out = ctx.face.alloc_uninit(dtype, n_elems).await?;
-            ctx.track_new(out.id);
-            let msg = crate::ops::lower_mul(&ins, &out, n_elems, dtype);
-            ctx.face.launch(msg).await?;
-            out
-        }
-        Op::Silu => {
-            let out = ctx.face.alloc_uninit(dtype, n_elems).await?;
-            ctx.track_new(out.id);
-            let msg = crate::ops::lower_silu(&ins, &out, n_elems, dtype);
-            ctx.face.launch(msg).await?;
-            out
-        }
-        Op::Sigmoid => {
-            let out = ctx.face.alloc_uninit(dtype, n_elems).await?;
-            ctx.track_new(out.id);
-            let msg = crate::ops::lower_sigmoid(&ins, &out, n_elems, dtype);
-            ctx.face.launch(msg).await?;
-            out
-        }
         Op::Matmul | Op::MatmulNt => {
             let (m, n) = (shape[0], shape[1]);
             // k = 内维 = x 声明 shape 末维(C1:只读声明 shape;原取 ins[0].len
@@ -451,28 +423,17 @@ where
             }
             out
         }
-        Op::Rmsnorm { eps, w_off } => {
-            let out = ctx.face.alloc_uninit(dtype, n_elems).await?;
-            ctx.track_new(out.id);
-            // 归一化宽度由 alpha 的声明 shape 定义(per-head 行归一化:
-            // [T, H×HD] × alpha [HD])。不能取 ins[1].len —— Block 叶子 len=0。
-            let alpha_shape = t.parents[1].shape.clone();
-            let cols: usize = alpha_shape.iter().product::<usize>().max(1);
-            let rows = shape.iter().product::<usize>() / cols;
-            let msg = crate::ops::lower_rmsnorm(&ins, *eps, *w_off, &out, rows, cols, dtype);
-            ctx.face.launch(msg).await?;
-            out
-        }
         Op::Call { op, aux } => {
             // 硬件感知拾取(被动律):环境必传 —— hw 自 face(引擎感知),
             // page 自页策略单源;kernels/解释器零探测。CPU face 无环境 =
             // 结构化"需 GPU server"(与 Kernel 节点 CPU 口径同)。
-            let mut env = ctx.face.op_env().ok_or_else(|| {
-                ModelError::Msg(format!(
-                    "Op::Call({:?}) 需 GPU server 环境(CPU face 无 op_env)",
-                    op.0
-                ))
-            })?;
+            // 环境必传(被动律);face 无环境(CPU face,测试域)= Sm86
+            // 占位 —— 纯语义臂(add/mul/silu/sigmoid/rmsnorm)不消费 env,
+            // 硬件感知臂在 CPU face 上本就不可达(launch 面结构化拒)
+            let mut env = ctx.face.op_env().unwrap_or(owl_kernels::driver::OpEnv {
+                hw: owl_kernels::driver::Hw { arch: owl_kernels::Arch::Sm86 },
+                page: 0,
+            });
             env.page = crate::module::kv_paged_policy(dtype).map(|p| p.page).unwrap_or(0);
             let shapes: Vec<Vec<usize>> = t.parents.iter().map(|p| p.shape.clone()).collect();
             let scalars: Vec<i64> = t.args.iter().filter_map(|a| match a {
@@ -481,7 +442,7 @@ where
                 _ => None,
             }).collect();
             let pick = owl_kernels::driver::resolve(owl_kernels::driver::OpReq {
-                op: *op,
+                op: op.op_id(),
                 env: &env,
                 dt: crate::ops::ddt(dtype)?,
                 shapes: &shapes,
@@ -489,8 +450,8 @@ where
                 scalars: &scalars,
             });
             if ctx.env.diag.resolve_trace {
-                eprintln!("[call] {} -> {} grid={:?} block={:?} smem={} n_elems={}",
-                    op.0, pick.name, pick.shape.grid, pick.shape.block, pick.shape.smem, n_elems);
+                eprintln!("[call] {:?} -> {} grid={:?} block={:?} smem={} n_elems={}",
+                    op, pick.name, pick.shape.grid, pick.shape.block, pick.shape.smem, n_elems);
             }
             // foreign 家族臂(2026-10-12 用户律:gdn 两臂入词表):名字不在
             // native 登记表(无 .cu 源,server 按名分派家族 runtime);

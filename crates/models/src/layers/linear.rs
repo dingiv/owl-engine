@@ -191,7 +191,7 @@ impl Loadable for Linear {
                     // 布局带核名与原始形状;DMA 上卡后 GPU 重排到 marlin 布局
                     qw.layout_as_device_rearrange(
                         format!("{base}.packed_raw"),
-                        crate::ops::CT_REPACK,
+                        crate::ops::SemanticKernel::CtRepack,
                         self.out_dim,
                         self.in_dim / 8,
                         ctx,

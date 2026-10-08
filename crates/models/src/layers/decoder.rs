@@ -77,7 +77,7 @@ impl Module for DecoderLayer {
         let (h, n2) = if mixed.dtype == crate::tensor::Dtype::F16 {
             let rows: usize = mixed.shape()[0];
             let n: usize = mixed.shape()[1];
-            let n2 = TensorOps::call(crate::ops::ids::LN_FUSED_ADD_RMSNORM)
+            let n2 = TensorOps::call(crate::ops::SemanticKernel::FusedAddRmsnorm)
                 .arg(&mixed)
                 .arg(xs)
                 .arg(&self.post_ln.alpha_decl())

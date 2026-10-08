@@ -226,7 +226,7 @@ impl DfAttn {
     ) -> TensorOps {
         let (cos_d, sin_d) = rope.cos_sin_decl();
         let row = heads * self.hd;
-        TensorOps::call(crate::ops::ids::ATTN_NORM_ROPE)
+        TensorOps::call(crate::ops::SemanticKernel::NormRope)
             .arg(x)
             .arg(&norm.alpha_decl())
             .arg(&cos_d)
@@ -264,9 +264,9 @@ impl DfAttn {
         static DBG: std::sync::Once = std::sync::Once::new();
         DBG.call_once(|| eprintln!("[boot] DfAttn dt={:?} kv_fp8={}", self.dt, self.kv_fp8));
         let k0_op = match (self.dt, self.kv_fp8) {
-            (_, false) => crate::ops::ids::ATTN_K0_WRITE,
-            (Dtype::F16, true) => crate::ops::ids::ATTN_K0_WRITE_FP8,
-            (Dtype::BF16, true) => crate::ops::ids::ATTN_K0_WRITE_FP8_BF16,
+            (_, false) => crate::ops::SemanticKernel::K0Write,
+            (Dtype::F16, true) => crate::ops::SemanticKernel::K0WriteFp8,
+            (Dtype::BF16, true) => crate::ops::SemanticKernel::K0WriteFp8Bf16,
             other => panic!("K0 fp8 无 {other:?} 变体"),
         };
         TensorOps::call(k0_op)
@@ -415,7 +415,7 @@ impl DfLayer {
     ) -> TensorOps {
         let rows = mixed.shape()[0];
         let n = mixed.shape()[1];
-        TensorOps::call(crate::ops::ids::LN_FUSED_ADD_RMSNORM)
+        TensorOps::call(crate::ops::SemanticKernel::FusedAddRmsnorm)
             .arg(mixed)
             .arg(residual)
             .arg(&norm.alpha_decl())
@@ -2006,7 +2006,7 @@ mod tests {
         let v_self2 = attn.v_proj().forward(&self2, &ctx);
         let q_self2 = {
             let (cos_d, sin_d) = rope.cos_sin_decl();
-            TensorOps::call(crate::ops::ids::ATTN_NORM_ROPE)
+            TensorOps::call(crate::ops::SemanticKernel::NormRope)
                 .arg(&q_raw_self2)
                 .arg(&attn.q_norm().alpha_decl())
                 .arg(&cos_d)
@@ -2022,7 +2022,7 @@ mod tests {
         };
         let k_self2 = {
             let (cos_d, sin_d) = rope.cos_sin_decl();
-            TensorOps::call(crate::ops::ids::ATTN_NORM_ROPE)
+            TensorOps::call(crate::ops::SemanticKernel::NormRope)
                 .arg(&k_raw_self2)
                 .arg(&attn.k_norm().alpha_decl())
                 .arg(&cos_d)
@@ -2038,7 +2038,7 @@ mod tests {
         };
         // v2 语义:写-后-打分 —— 自块 k/v 先 K0 写池 slots [3,4],
         // NC 全窗 [0..5) 纯池读(生产流同式:encode/propose 前置写槽)
-        let k0_write = TensorOps::call(crate::ops::ids::ATTN_K0_WRITE)
+        let k0_write = TensorOps::call(crate::ops::SemanticKernel::K0Write)
             .aux(&[2])
             .arg(&k_self2)
             .arg(&v_self2)

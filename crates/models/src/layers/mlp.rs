@@ -37,7 +37,7 @@ impl Module for Mlp {
         // 同日十四;DFlash2 草稿 MLP)同吃融合核(owl_silu_and_mul_bf16)
         let h = if gate.dtype == crate::tensor::Dtype::F16 || gate.dtype == crate::tensor::Dtype::BF16 {
             let n: usize = gate.shape().iter().product();
-            TensorOps::call(crate::ops::ids::MLP_SILU_AND_MUL)
+            TensorOps::call(crate::ops::SemanticKernel::SiluAndMul)
                 .aux(&[n])
                 .arg(&gate)
                 .arg(&up)

@@ -1001,7 +1001,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let rows: Vec<TensorOps> =
             (0..t).map(|r| owl_models::ops::argmax_f32idx(&logits, vocab, r * vocab)).collect();
         let refs: Vec<&TensorOps> = rows.iter().collect();
-        let mut root = TensorOps::call(owl_models::ops::ids::OPS_CONCAT);
+        let mut root = TensorOps::call(owl_models::ops::SemanticKernel::Concat);
         for i in 0..8 {
             root = root.arg(refs.get(i).copied().unwrap_or(refs[0]));
         }

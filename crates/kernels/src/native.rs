@@ -106,23 +106,23 @@ pub struct Entry {
 pub static REGISTRY: &[Entry] = &[
     // ---- 语义算子动作表(ops.cu 母本;lower_* 一一对应;
     //      此族经 lower_* 硬编码装配,out 位置随 .cu 签名)----
-    Entry { name: "owl_add_f32", source: sources::OPS_F32, args: "T,T,T,sz", dtype: crate::contract::Dtype::F32 },
-    Entry { name: "owl_mul_f32", source: sources::OPS_F32, args: "T,T,T,sz", dtype: crate::contract::Dtype::F32 },
-    Entry { name: "owl_sigmoid_f32", source: sources::OPS_F32, args: "T,T,sz", dtype: crate::contract::Dtype::F32 },
-    Entry { name: "owl_silu_f32", source: sources::OPS_F32, args: "T,T,sz", dtype: crate::contract::Dtype::F32 },
+    Entry { name: "owl_add_f32", source: sources::OPS_F32, args: "T,T,O,sz", dtype: crate::contract::Dtype::F32 },
+    Entry { name: "owl_mul_f32", source: sources::OPS_F32, args: "T,T,O,sz", dtype: crate::contract::Dtype::F32 },
+    Entry { name: "owl_sigmoid_f32", source: sources::OPS_F32, args: "T,O,sz", dtype: crate::contract::Dtype::F32 },
+    Entry { name: "owl_silu_f32", source: sources::OPS_F32, args: "T,O,sz", dtype: crate::contract::Dtype::F32 },
     Entry { name: "owl_matmul_f32", source: sources::OPS_F32, args: "T,T,T,i32,i32,i32", dtype: crate::contract::Dtype::F32 },
     Entry { name: "owl_matmul_nt_f32", source: sources::OPS_F32, args: "T,T,T,i32,i32,i32", dtype: crate::contract::Dtype::F32 },
-    Entry { name: "owl_rmsnorm_f32", source: sources::OPS_F32, args: "T,T,T,i32,f32,i32", dtype: crate::contract::Dtype::F32 },
+    Entry { name: "owl_rmsnorm_f32", source: sources::OPS_F32, args: "T,T,O,i32,f32,i32", dtype: crate::contract::Dtype::F32 },
     // ---- f16 基线变体(F2;桥宏:读 half 算 float 写 half;matmul 无 f16 = cuBLAS)----
-    Entry { name: "owl_add_f16", source: sources::OPS_F16, args: "T,T,T,sz", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_mul_f16", source: sources::OPS_F16, args: "T,T,T,sz", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_sigmoid_f16", source: sources::OPS_F16, args: "T,T,sz", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_silu_f16", source: sources::OPS_F16, args: "T,T,sz", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_rmsnorm_f16", source: sources::OPS_F16, args: "T,T,T,i32,f32,i32", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "owl_add_f16", source: sources::OPS_F16, args: "T,T,O,sz", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "owl_mul_f16", source: sources::OPS_F16, args: "T,T,O,sz", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "owl_sigmoid_f16", source: sources::OPS_F16, args: "T,O,sz", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "owl_silu_f16", source: sources::OPS_F16, args: "T,O,sz", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "owl_rmsnorm_f16", source: sources::OPS_F16, args: "T,T,O,i32,f32,i32", dtype: crate::contract::Dtype::F16 },
     // bf16 语义算子(E5-DF3 同日十四;fc 部分和累加 add_bf16 + 各 norm rmsnorm_bf16)
-    Entry { name: "owl_add_bf16", source: sources::OPS_F16, args: "T,T,T,sz", dtype: crate::contract::Dtype::BF16 },
-    Entry { name: "owl_mul_bf16", source: sources::OPS_F16, args: "T,T,T,sz", dtype: crate::contract::Dtype::BF16 },
-    Entry { name: "owl_rmsnorm_bf16", source: sources::OPS_F16, args: "T,T,T,i32,f32,i32", dtype: crate::contract::Dtype::BF16 },
+    Entry { name: "owl_add_bf16", source: sources::OPS_F16, args: "T,T,O,sz", dtype: crate::contract::Dtype::BF16 },
+    Entry { name: "owl_mul_bf16", source: sources::OPS_F16, args: "T,T,O,sz", dtype: crate::contract::Dtype::BF16 },
+    Entry { name: "owl_rmsnorm_bf16", source: sources::OPS_F16, args: "T,T,O,i32,f32,i32", dtype: crate::contract::Dtype::BF16 },
     // ---- 模型琐核 f16 变体(F3;embed/rope 同源文件追加,narrow 在 attention.cu)----
     Entry { name: "owl_embed_f16", source: text::EMBED_F32, args: "T,T,sz,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_rope_half_partial_f16", source: text::ROPE_HALF_PARTIAL_F32, args: "T,T,T,T,sz,sz,sz,T", dtype: crate::contract::Dtype::F16 },
@@ -474,11 +474,25 @@ mod tests {
         for e in REGISTRY {
             let actual = parse_cu_sig(e.source, e.name)
                 .unwrap_or_else(|| panic!("{}: .cu 源里找不到同名核", e.name));
+            // O 标记(2026-10-12 瘦身:纯算子族经 lower_kernel 装配,输出槽
+            // 显式化)—— 归一 T 后与 .cu 实签名对位;O 位必须是 .cu 指针槽
+            let o_count = e.args.matches("O").count();
+            assert!(o_count <= 1, "{}: O 标记至多一个", e.name);
+            let normalized = e.args.replace("O", "T");
             assert_eq!(
-                actual, e.args,
+                normalized, actual,
                 "{}: 登记签名与 .cu 实签名不符(改签名须同步登记表)",
                 e.name
             );
+            if o_count == 1 {
+                let pos = e.args.split(',').position(|t| t == "O").unwrap();
+                let cu_toks: Vec<&str> = actual.split(',').collect();
+                assert_eq!(
+                    cu_toks[pos], "T",
+                    "{}: O 槽必须是 .cu 指针位(输出块)",
+                    e.name
+                );
+            }
             // Kernel 节点路径(text/ 域四核)输出块必须末参;语义算子族
             // (lower_* 硬编码装配)out 位置随 .cu 签名,不受此限
             if matches!(

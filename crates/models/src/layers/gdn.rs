@@ -25,7 +25,7 @@
 //! conv_dim = 2·key_dim + value_dim = 6144;hidden 1024;conv k=4 无 bias。
 
 use crate::contract::Dtype;
-use crate::ops::ids;
+use crate::ops::SemanticKernel;
 use crate::layers::linear::Linear;
 use crate::layers::{concat_rows, narrow_strided};
 use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, QuantPlan, Weight};
@@ -57,7 +57,7 @@ pub(crate) fn chunked_delta(
     nk: usize,
     kd: usize,
 ) -> TensorOps {
-    TensorOps::call(crate::ops::ids::GDN_CHUNKED)
+    TensorOps::call(crate::ops::SemanticKernel::GdnChunkedDelta)
         .arg(q)
         .arg(k)
         .arg(v)
@@ -89,7 +89,7 @@ pub(crate) fn scalar_delta(
     nk: usize,
     kd: usize,
 ) -> TensorOps {
-    TensorOps::call(crate::ops::ids::GDN_SCALAR)
+    TensorOps::call(crate::ops::SemanticKernel::GdnScalarDelta)
         .arg(q)
         .arg(k)
         .arg(v)
@@ -138,7 +138,7 @@ pub fn gating_g(
     heads: usize,
 ) -> TensorOps {
     let dt = a.dtype;
-    TensorOps::call(ids::GDN_GATING)
+    TensorOps::call(SemanticKernel::GdnGatingG)
     .arg(a_log)
     .arg(a)
     .arg(dt_bias)
@@ -156,7 +156,7 @@ pub fn gating_g(
 /// (decode:rows = tokens × heads,dim = head_k_dim 128;eps 1e-6)。
 pub fn l2norm(x: &TensorOps, rows: usize, dim: usize, eps: f32) -> TensorOps {
     let dt = x.dtype;
-    TensorOps::call(ids::GDN_L2NORM).aux(&[rows])
+    TensorOps::call(SemanticKernel::GdnL2Norm).aux(&[rows])
     .arg(x)
     .arg_usize(rows)
     .arg_usize(dim)
@@ -184,7 +184,7 @@ pub fn conv_upd(
     silu: bool,
 ) -> TensorOps {
     let dt = x.dtype;
-    TensorOps::call(ids::GDN_CONV_UPD)
+    TensorOps::call(SemanticKernel::GdnConvUpd)
     .arg(x)
     .arg(w)
     .arg(state)
@@ -225,7 +225,7 @@ pub(crate) fn decode_step_fused(
     q_scale: f32,
     v2: bool,
 ) -> TensorOps {
-    let op = if v2 { ids::GDN_DECODE_STEP_V2 } else { ids::GDN_DECODE_STEP };
+    let op = if v2 { SemanticKernel::GdnDecodeStepV2 } else { SemanticKernel::GdnDecodeStep };
     TensorOps::call(op)
     .aux(&[batch, nv, kd, vd])
     .arg(q_c)
@@ -280,7 +280,7 @@ pub fn delta_dec(
     let dt = v.dtype;
     // aux = 拾取推导常数(层语义几何);smem 契约 = (2·kd+2)·4B 进
     // driver 公式(原手抄 (2*128+2)*4 不看 kd 形参,变档静默越界)
-    TensorOps::call(ids::GDN_DELTA_DEC).aux(&[batch, nv, kd, vd])
+    TensorOps::call(SemanticKernel::GdnDeltaDec).aux(&[batch, nv, kd, vd])
     .arg(q)
     .arg(k)
     .arg(v)
@@ -315,7 +315,7 @@ pub(crate) fn conv_fwd(
     d: usize,
     silu: bool,
 ) -> TensorOps {
-    TensorOps::call(ids::GDN_CONV_FWD).aux(&[d])
+    TensorOps::call(SemanticKernel::GdnConvFwd).aux(&[d])
     .arg(x)
     .arg(w)
     .arg(state)
@@ -359,7 +359,7 @@ pub fn fold_layer(
         // scalar 核(f32 cast ×5 同 verify 臂;位型一致性由同源记录保证)
         let cast = |x: &TensorOps| {
             let n: usize = x.shape().iter().product();
-            TensorOps::call(crate::ops::ids::CAST_F16_F32)
+            TensorOps::call(crate::ops::SemanticKernel::CastF16F32)
                 .arg(x)
                 .arg_i32(n as i32)
                 .with_shape(Dtype::F32, x.shape().to_vec())
@@ -423,7 +423,7 @@ pub(crate) fn recurrence_varlen(
     vd: usize,
     q_scale: f32,
 ) -> TensorOps {
-    TensorOps::call(ids::GDN_RECURRENCE).aux(&[nv, kd, vd])
+    TensorOps::call(SemanticKernel::GdnRecurrence).aux(&[nv, kd, vd])
     .arg(q)
     .arg(k)
     .arg(v)
@@ -460,7 +460,7 @@ pub fn norm_act(
     act_silu: bool,
 ) -> TensorOps {
     let dt = x.dtype;
-    TensorOps::call(ids::GDN_NORM_ACT).aux(&[rows, value_dim, group_size])
+    TensorOps::call(SemanticKernel::GdnNormAct).aux(&[rows, value_dim, group_size])
     .arg(x)
     .arg(z)
     .arg(gamma)
@@ -574,7 +574,7 @@ impl GatedDeltaNet {
         // 无痛。T>16 保持 cublas(真 GEMM 区)。
         let (b, a) = if tokens <= 16 {
             let hidden_gdn = xs.shape().last().cloned().unwrap_or(0);
-            let ba = TensorOps::call(ids::ELEMS_GEMV_DUAL)
+            let ba = TensorOps::call(SemanticKernel::GemvDual)
                 .arg(&self.in_proj_b.weight_decl()) // [HV, hidden] f16
                 .arg(&self.in_proj_a.weight_decl()) // [HV, hidden] f16
                 .arg(xs)                            // [T, hidden]
@@ -665,23 +665,23 @@ impl GatedDeltaNet {
         let y = if ctx.env.gdn.scalar && !ctx.env.gdn.chunked && tokens >= 64 {
             // scalar 臂(lmdeploy 单核;T 分臂:仅大 T —— 小 T(verify/
             // propose=8/decode=1)回 recurrence,每层 5 cast 核在小 T 纯开销)
-            let q_f = TensorOps::call(crate::ops::ids::CAST_F16_F32)
+            let q_f = TensorOps::call(crate::ops::SemanticKernel::CastF16F32)
                 .arg(&q_n.reshape(vec![tokens, self.nk, self.hk_dim]))
                 .arg_i32((tokens * self.nk * self.hk_dim) as i32)
                 .with_shape(Dtype::F32, vec![tokens, self.nk, self.hk_dim]);
-            let k_f = TensorOps::call(crate::ops::ids::CAST_F16_F32)
+            let k_f = TensorOps::call(crate::ops::SemanticKernel::CastF16F32)
                 .arg(&k_n.reshape(vec![tokens, self.nk, self.hk_dim]))
                 .arg_i32((tokens * self.nk * self.hk_dim) as i32)
                 .with_shape(Dtype::F32, vec![tokens, self.nk, self.hk_dim]);
-            let v_f = TensorOps::call(crate::ops::ids::CAST_F16_F32)
+            let v_f = TensorOps::call(crate::ops::SemanticKernel::CastF16F32)
                 .arg(&v_c.reshape(vec![tokens, self.nv, self.hv_dim]))
                 .arg_i32((tokens * self.nv * self.hv_dim) as i32)
                 .with_shape(Dtype::F32, vec![tokens, self.nv, self.hv_dim]);
-            let g_f = TensorOps::call(crate::ops::ids::CAST_F16_F32)
+            let g_f = TensorOps::call(crate::ops::SemanticKernel::CastF16F32)
                 .arg(&g)
                 .arg_i32((tokens * self.nv) as i32)
                 .with_shape(Dtype::F32, vec![tokens, self.nv]);
-            let beta_f = TensorOps::call(crate::ops::ids::CAST_F16_F32)
+            let beta_f = TensorOps::call(crate::ops::SemanticKernel::CastF16F32)
                 .arg(&beta)
                 .arg_i32((tokens * self.nv) as i32)
                 .with_shape(Dtype::F32, vec![tokens, self.nv]);
@@ -858,7 +858,7 @@ impl GatedDeltaNet {
         // BlockSlice 免费视图(刀1))。
         let (b, a) = if xs.dtype == Dtype::F16 {
             let hidden_gdn = xs.shape().last().cloned().unwrap_or(0);
-            let ba = TensorOps::call(ids::ELEMS_GEMV_DUAL)
+            let ba = TensorOps::call(SemanticKernel::GemvDual)
                 .arg(&self.in_proj_b.weight_decl()) // [HV, hidden] f16
                 .arg(&self.in_proj_a.weight_decl()) // [HV, hidden] f16
                 .arg(xs)                            // [T, hidden]
@@ -892,7 +892,7 @@ impl GatedDeltaNet {
         // f32 语义锚链保持分立。输出 [T, 2K] 单块,q_c/k_c = 免费列切
         // (T=1 连续 → BlockSlice;两段 state/权重独立,核内分段寻址)。
         let (q_c, k_c) = if xs.dtype == Dtype::F16 {
-            let qc_kc = TensorOps::call(ids::GDN_CONV_UPD_DUAL)
+            let qc_kc = TensorOps::call(SemanticKernel::GdnConvUpdDual)
                 .arg(&q)
                 .arg(&k)
                 .arg(&self.conv_w.decl()) // q 段行 [0, key_dim)(核从行 0 读)

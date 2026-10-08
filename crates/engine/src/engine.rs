@@ -630,7 +630,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
                     let rows: Vec<owl_models::tensor::TensorOps> = (0..depth1)
                         .map(|r| owl_models::ops::argmax_f32idx(&logits, vocab, r * vocab))
                         .collect();
-                    let mut root = owl_models::tensor::TensorOps::call(owl_models::ops::ids::OPS_CONCAT);
+                    let mut root = owl_models::tensor::TensorOps::call(owl_models::ops::SemanticKernel::Concat);
                     for i in 0..8 {
                         root = root.arg(rows.get(i).unwrap_or(&rows[0]));
                     }

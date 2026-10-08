@@ -63,7 +63,7 @@ pub(crate) fn narrow_strided(
     }
     let dt = src.dtype;
     if dt == crate::tensor::Dtype::F16 {
-        return TensorOps::call(crate::ops::ids::OPS_NARROW) // 哨兵:逐元素核,自动 1D ceil/256
+        return TensorOps::call(crate::ops::SemanticKernel::Narrow) // 哨兵:逐元素核,自动 1D ceil/256
             .arg(src)
             .arg_usize(outer)
             .arg_usize(src_dim)
@@ -95,7 +95,7 @@ pub fn concat_rows(inputs: &[&TensorOps], r: usize, d: usize) -> TensorOps {
     assert!((1..=8).contains(&n), "concat_rows: arity 封顶 8,得 {n}");
     let dt = inputs[0].dtype;
     let mut k = if dt == crate::tensor::Dtype::F16 {
-        TensorOps::call(crate::ops::ids::OPS_CONCAT) // 哨兵:逐元素核,自动 1D ceil/256
+        TensorOps::call(crate::ops::SemanticKernel::Concat) // 哨兵:逐元素核,自动 1D ceil/256
     } else {
         // f32 语义锚链:Kernel 直发(f32 Call 通路对拍挂账)
         TensorOps::of(crate::kernel::kernel_with(

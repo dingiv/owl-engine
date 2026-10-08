@@ -242,7 +242,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 (decl, None)
             } else if self.dflash_tap_count > 0 {
                 let (h, tp) = self.model.tapped_hidden(&ids_t, &ctx, &[5, 19, 33, 47, 61]);
-                let mut c = TensorOps::call(owl_models::ops::ids::OPS_CONCAT).arg(&h);
+                let mut c = TensorOps::call(owl_models::ops::SemanticKernel::Concat).arg(&h);
                 for t in &tp {
                     c = c.arg(t);
                 }
@@ -308,7 +308,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let hview = TensorOps::of_block(hfb.id, d.dtype, vec![t, d_model]);
             // 末行窄切 **物化**(OPS_NARROW):SliceView 作根透传父块丢偏移
             // (刀 3b 同族),根必须真块
-            let last = TensorOps::call(owl_models::ops::ids::OPS_NARROW)
+            let last = TensorOps::call(owl_models::ops::SemanticKernel::Narrow)
                 .arg(&hview)
                 .arg_usize(1)
                 .arg_usize(d_model)
@@ -395,7 +395,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 (decl, None)
             } else if self.dflash_tap_count > 0 {
                 let (h, tp) = self.model.tapped_hidden(&ids_t, &ctx, &[5, 19, 33, 47, 61]);
-                let mut c = TensorOps::call(owl_models::ops::ids::OPS_CONCAT).arg(&h);
+                let mut c = TensorOps::call(owl_models::ops::SemanticKernel::Concat).arg(&h);
                 for tt in &tp {
                     c = c.arg(tt);
                 }

@@ -26,7 +26,7 @@
 use crate::contract::Dtype;
 #[cfg(test)]
 use crate::kernel;
-use crate::ops::ids;
+use crate::ops::SemanticKernel;
 use crate::layers::linear::Linear;
 use crate::layers::{concat_rows_hier, narrow_strided};
 use crate::layers::rmsnorm::RmsNorm;
@@ -145,7 +145,7 @@ impl Attention {
             let (cos_d, sin_d) = rope.cos_sin_decl();
             let gate = narrow_strided(&q_raw, tokens * self.hq, self.hd * 2, self.hd, self.hd,
                 vec![tokens, self.hq * self.hd]);
-            let q = TensorOps::call(ids::ATTN_NORM_ROPE)
+            let q = TensorOps::call(SemanticKernel::NormRope)
                 .arg(&q_raw)
                 .arg(&self.q_norm.alpha_decl())
                 .arg(&cos_d)
@@ -158,7 +158,7 @@ impl Attention {
                 .arg_i32(1)                                 // w_off = ×(1+w)
                 .aux(&[tokens, self.hq, self.hd])
                 .with_shape(Dtype::F16, vec![tokens, self.hq * self.hd]);
-            let k = TensorOps::call(ids::ATTN_NORM_ROPE)
+            let k = TensorOps::call(SemanticKernel::NormRope)
                 .arg(&k)
                 .arg(&self.k_norm.alpha_decl())
                 .arg(&cos_d)
@@ -222,7 +222,7 @@ impl Attention {
                 return self.paged_decode_v1_k0(&q, &gate, &wr, kv, tokens, ctx, &pol);
             }
         }
-        let y = TensorOps::call(ids::ATTN_NAIVE_DECODE) // 哨兵;核内有 bs 上界 guard
+        let y = TensorOps::call(SemanticKernel::NaiveDecode) // 哨兵;核内有 bs 上界 guard
         .arg(&q)
         .arg(&k)
         .arg(&v)
@@ -242,7 +242,7 @@ impl Attention {
         // f32 路径:语义算子 sigmoid + mul(CPU 单元锚)
         let y = if dt == Dtype::F16 {
             let n = tokens * self.hq * self.hd;
-            TensorOps::call(ids::ATTN_GATE_MUL)
+            TensorOps::call(SemanticKernel::GateMul)
             .arg(&gate)
             .arg(&y)
             .arg_usize(n)
@@ -288,7 +288,7 @@ impl Attention {
         let nb = kv.block_tables.shape().last().cloned().unwrap_or(1);
         // wrapper 页配对 + smem 契约公式 = driver 单源(env.page 终审;
         // 原手抄 smem 越界事故与 bs16/32 错配案的结构性封点)
-        let y = TensorOps::call(ids::ATTN_PAGED_DECODE)
+        let y = TensorOps::call(SemanticKernel::PagedDecode)
             .aux(&[self.hd, self.hq, self.hkv, nb as usize])
         .arg(q)
         .arg(&kv.k_cache)
@@ -308,7 +308,7 @@ impl Attention {
         .with_shape(dt, vec![tokens, self.hq * self.hd]);
         // ③ 输出门(f16 融合单发)+ 出投影(与 legacy 尾巴同)
         let n = tokens * self.hq * self.hd;
-        let y = TensorOps::call(ids::ATTN_GATE_MUL)
+        let y = TensorOps::call(SemanticKernel::GateMul)
         .arg(gate)
         .arg(&y)
         .arg_usize(n)
@@ -367,7 +367,7 @@ impl Attention {
             .arg_i32(0) // use_alibi 关
             .with_shape(dt, vec![self.hq * nparts * self.hd]);
         // LSE 归并 → 最终 y([tokens, hq·hd];ctx ≤512 时核内退化直拷)
-        let y = TensorOps::call(ids::ATTN_PAGED_V2_REDUCE)
+        let y = TensorOps::call(SemanticKernel::PagedV2Reduce)
             .aux(&[self.hd, self.hq, nparts])
             .arg(&s2.exp_sums)
             .arg(&s2.max_logits)
@@ -377,7 +377,7 @@ impl Attention {
             .with_shape(dt, vec![tokens, self.hq * self.hd]);
         // ③ 输出门(f16 融合单发)+ 出投影(与 v1 同尾)
         let n = tokens * self.hq * self.hd;
-        let y = TensorOps::call(ids::ATTN_GATE_MUL)
+        let y = TensorOps::call(SemanticKernel::GateMul)
             .arg(gate)
             .arg(&y)
             .arg_usize(n)
@@ -469,7 +469,7 @@ impl Attention {
         .with_shape(dt, vec![tokens, self.hq * self.hd]);
         // 输出门(f16 融合单发)+ 出投影(与 legacy 同)
         let n = tokens * self.hq * self.hd;
-        let y = TensorOps::call(ids::ATTN_GATE_MUL)
+        let y = TensorOps::call(SemanticKernel::GateMul)
         .arg(gate)
         .arg(&y)
         .arg_usize(n)
@@ -516,7 +516,7 @@ impl Attention {
         let scr_out = TensorOps::zeros(dt, vec![tokens * self.hq * nparts * self.hd]);
         let scr_stat = TensorOps::zeros(Dtype::F32, vec![tokens * self.hq * nparts * 2]);
         let scale = 1.0 / (self.hd as f32).sqrt();
-        let sp = TensorOps::call(ids::ATTN_PREFILL_SPLIT)
+        let sp = TensorOps::call(SemanticKernel::PrefillSplit)
         .arg(q)
         .arg(&kv.k_cache)
         .arg(&kv.v_cache)
@@ -536,7 +536,7 @@ impl Attention {
         .aux(&[self.hd, self.hkv, self.hq, tokens, nparts])
         .with_shape(dt, vec![1]); // 哑输出(真输出 = reduce)
         // ③ K2 归一化合并(split 哑输出 = 树序依赖边;out [T, Hq*hd])
-        let y = TensorOps::call(ids::ATTN_PREFILL_SPLIT_REDUCE)
+        let y = TensorOps::call(SemanticKernel::PrefillSplitReduce)
         .arg(&sp)
         .arg(&scr_out)
         .arg(&scr_stat)
@@ -548,7 +548,7 @@ impl Attention {
         .with_shape(dt, vec![tokens, self.hq * self.hd]);
         // ④ 输出门(f16 融合单发)+ 出投影(与旧路径同)
         let n = tokens * self.hq * self.hd;
-        let y = TensorOps::call(ids::ATTN_GATE_MUL)
+        let y = TensorOps::call(SemanticKernel::GateMul)
         .arg(gate)
         .arg(&y)
         .arg_usize(n)
@@ -618,7 +618,7 @@ impl Attention {
         );
         // ③ 输出门(f16 融合单发)+ 出投影(与旧路径同)
         let n = tokens * self.hq * self.hd;
-        let y = TensorOps::call(ids::ATTN_GATE_MUL)
+        let y = TensorOps::call(SemanticKernel::GateMul)
             .arg(gate)
             .arg(&y)
             .arg_usize(n)
@@ -659,7 +659,7 @@ impl Attention {
             let (cos_d, sin_d) = rope.cos_sin_decl();
             let gate = narrow_strided(&q_raw, tokens * self.hq, self.hd * 2, self.hd, self.hd,
                 vec![tokens, row_q]);
-            let q = TensorOps::call(ids::ATTN_NORM_ROPE)
+            let q = TensorOps::call(SemanticKernel::NormRope)
                 .arg(&q_raw)
                 .arg(&self.q_norm.alpha_decl())
                 .arg(&cos_d)
@@ -672,7 +672,7 @@ impl Attention {
                 .arg_i32(1)
                 .aux(&[tokens, self.hq, self.hd])
                 .with_shape(Dtype::F16, vec![tokens, row_q]);
-            let k = TensorOps::call(ids::ATTN_NORM_ROPE)
+            let k = TensorOps::call(SemanticKernel::NormRope)
                 .arg(&k)
                 .arg(&self.k_norm.alpha_decl())
                 .arg(&cos_d)
@@ -742,7 +742,7 @@ impl Attention {
             let v_t = narrow_strided(&v, 1, row_kv, t * row_kv, row_kv, vec![1, row_kv]);
             let slot_t = narrow_strided(kv_slots, 1, 1, t, 1, vec![1]);
             let len_t = narrow_strided(kv_lens, 1, 1, t, 1, vec![1]);
-            let y_t = TensorOps::call(ids::ATTN_NAIVE_DECODE) // 哨兵;核内 bs 上界 guard
+            let y_t = TensorOps::call(SemanticKernel::NaiveDecode) // 哨兵;核内 bs 上界 guard
             .arg(&q_t)
             .arg(&k_t)
             .arg(&v_t)
@@ -763,7 +763,7 @@ impl Attention {
         let y_all = concat_rows_hier(&refs, row_q);
         let y = if dt == Dtype::F16 {
             let n = tokens * row_q;
-            TensorOps::call(ids::ATTN_GATE_MUL)
+            TensorOps::call(SemanticKernel::GateMul)
             .arg(&gate)
             .arg(&y_all)
             .arg_usize(n)
@@ -1861,7 +1861,7 @@ mod split_probe_tests {
     let scr_stat = TensorOps::of_block(scr_stat_b.id, Dtype::F32, vec![t * hq * nparts * 2]);
 
     // K0 写池
-    let wr = TensorOps::call(ids::ATTN_K0_WRITE).aux(&[t])
+    let wr = TensorOps::call(SemanticKernel::K0Write).aux(&[t])
         .arg(&k).arg(&v)
         .arg(&TensorOps::of_block(kc.id, Dtype::F16, vec![nb, hkv, hd / x, page, x]))
         .arg(&TensorOps::of_block(vc.id, Dtype::F16, vec![nb, hkv, hd, page]))
@@ -1872,7 +1872,7 @@ mod split_probe_tests {
     let _ = crate::interpreters::eval_ops(wr.step(), &mut gpu).await.unwrap();
 
     // split + reduce
-    let sp = TensorOps::call(ids::ATTN_PREFILL_SPLIT)
+    let sp = TensorOps::call(SemanticKernel::PrefillSplit)
         .arg(&q)
         .arg(&TensorOps::of_block(kc.id, Dtype::F16, vec![nb, hkv, hd / x, page, x]))
         .arg(&TensorOps::of_block(vc.id, Dtype::F16, vec![nb, hkv, hd, page]))
@@ -1886,7 +1886,7 @@ mod split_probe_tests {
         .arg_i32(hq as i32)
         .aux(&[hd, hkv, hq, t, nparts])
         .with_shape(Dtype::F16, vec![1]);
-    let y = TensorOps::call(ids::ATTN_PREFILL_SPLIT_REDUCE)
+    let y = TensorOps::call(SemanticKernel::PrefillSplitReduce)
         .arg(&sp).arg(&scr_out).arg(&scr_stat)
         .arg_i32(nparts as i32).arg_i32(hq as i32).arg_i32(hd as i32).arg_i32(t as i32)
         .aux(&[t, hq])
@@ -2054,7 +2054,7 @@ mod split_probe_tests {
 
         // K0-dual:全 ctx 一次灌池(slots = 0..ctx_total;恒等页表)
         let slots = TensorOps::from_host(Dtype::F32, vec![ctx_total], &f32b(&(0..ctx_total).map(|i| i as f32).collect::<Vec<_>>()));
-        let k0 = TensorOps::call(ids::ATTN_K0_DUAL).aux(&[ctx_total])
+        let k0 = TensorOps::call(SemanticKernel::K0Dual).aux(&[ctx_total])
             .arg(&k_all).arg(&v_all)
             .arg(&kc_t).arg(&vc_t).arg(&kfi_t).arg(&vfi_t)
             .arg(&slots)
@@ -2102,7 +2102,7 @@ mod split_probe_tests {
         let last_len = TensorOps::of_block(ll_b.id, Dtype::U32, vec![1]);
 
         // FI 虚拟核(生产同款槽序;wr 依赖边 = 已完成的 k0)
-        let wr = TensorOps::call(if fp8kv { ids::ATTN_K0_DUAL_FP8KV } else { ids::ATTN_K0_DUAL })
+        let wr = TensorOps::call(if fp8kv { SemanticKernel::K0DualFp8kv } else { SemanticKernel::K0Dual })
             .aux(&[ctx_total])
             .arg(&k_all).arg(&v_all).arg(&kc_t).arg(&vc_t).arg(&kfi_t).arg(&vfi_t).arg(&slots)
             .arg_i32((hkv * hd) as i32).arg_i32((hkv * hd) as i32)

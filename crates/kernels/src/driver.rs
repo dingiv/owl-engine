@@ -141,6 +141,10 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "gdn.chunked_delta" => gdn::chunked_delta(),
         "gdn.scalar_delta" => gdn::scalar_delta(),
         "ops.sigmoid" => ops::sigmoid(dt),
+        "ops.add" => ops::add(dt),
+        "ops.mul" => ops::mul(dt),
+        "ops.silu" => ops::silu(dt),
+        "ops.rmsnorm" => ops::rmsnorm(dt, req.shapes),
         "attn.k0_write" => attn::k0_write(dt, ax(0)),
         "attn.k0_write_fp8" => attn::k0_write_fp8(ax(0)), // B6.2:f16 入 → e4m3 池(ax=tokens)
         "attn.k0_write_fp8_bf16" => attn::k0_write_fp8_bf16(ax(0)), // B6:bf16 入 → e4m3 池
@@ -202,7 +206,7 @@ pub fn resolve(req: OpReq) -> KernelPick {
             load::ct_repack(rows, cols)
         }
         other => panic!(
-            "driver::resolve(\"{other}\"): 未登记的语义算子 —— 词表住              models::ops::ids,实现住本模块分派表(两侧须同票)"
+            "driver::resolve(\"{other}\"): 未登记的语义算子命名空间 —— 动作词表住 models::ops::SemanticKernel(op_id 落本表),实现住本模块分派表(两侧须同票)"
         ),
     }
 }
@@ -380,7 +384,7 @@ pub mod gdn {
 // ============================================================================
 
 pub mod ops {
-    use super::{DType, KernelPick, SENTINEL_1D};
+    use super::{DType, KernelPick, Shape, SENTINEL_1D};
 
     /// sigmoid:逐元素(beta 臂 = sigmoid(b);M-b 同款律;哨兵 1D)
     pub fn sigmoid(dt: DType) -> KernelPick {
@@ -388,9 +392,65 @@ pub mod ops {
             name: match dt {
                 DType::F16 => "owl_sigmoid_f16",
                 DType::F32 => "owl_sigmoid_f32",
-                DType::BF16 | DType::U32 => unimplemented!("sigmoid 无 U32 变体"),
+                DType::BF16 | DType::U32 => unimplemented!("sigmoid 无 BF16/U32 变体"),
             },
             shape: SENTINEL_1D,
+        }
+    }
+
+    /// add:同形逐元素加(残差;哨兵 1D)
+    pub fn add(dt: DType) -> KernelPick {
+        KernelPick {
+            name: match dt {
+                DType::F32 => "owl_add_f32",
+                DType::F16 => "owl_add_f16",
+                DType::BF16 => "owl_add_bf16",
+                DType::U32 => unimplemented!("add 无 U32 变体"),
+            },
+            shape: SENTINEL_1D,
+        }
+    }
+
+    /// mul:同形逐元素乘(门控;哨兵 1D)
+    pub fn mul(dt: DType) -> KernelPick {
+        KernelPick {
+            name: match dt {
+                DType::F32 => "owl_mul_f32",
+                DType::F16 => "owl_mul_f16",
+                DType::BF16 => "owl_mul_bf16",
+                DType::U32 => unimplemented!("mul 无 U32 变体"),
+            },
+            shape: SENTINEL_1D,
+        }
+    }
+
+    /// silu:一元激活(哨兵 1D;BF16 无独立变体 —— MLP 走 silu_and_mul 融合)
+    pub fn silu(dt: DType) -> KernelPick {
+        KernelPick {
+            name: match dt {
+                DType::F32 => "owl_silu_f32",
+                DType::F16 => "owl_silu_f16",
+                DType::BF16 | DType::U32 => unimplemented!("silu 无 BF16/U32 变体(MLP 走 silu_and_mul)"),
+            },
+            shape: SENTINEL_1D,
+        }
+    }
+
+    /// rmsnorm:一 block 一行(×(1+w) 同核,w_off 入参;rows 从形状推导:
+    /// x_total / cols,alpha 末维 = cols)
+    pub fn rmsnorm(dt: DType, shapes: &[Vec<usize>]) -> KernelPick {
+        let name = match dt {
+            DType::F32 => "owl_rmsnorm_f32",
+            DType::F16 => "owl_rmsnorm_f16",
+            DType::BF16 => "owl_rmsnorm_bf16",
+            DType::U32 => unimplemented!("rmsnorm 无 U32 变体"),
+        };
+        let x_total: usize = shapes.first().map(|s| s.iter().product()).unwrap_or(0);
+        let cols: usize = shapes.get(1).map(|s| s.iter().product()).unwrap_or(1);
+        let rows = if cols == 0 { 0 } else { x_total / cols };
+        KernelPick {
+            name,
+            shape: Shape { grid: (rows as u32, 1, 1), block: (256, 1, 1), smem: 256 * 4 },
         }
     }
 }

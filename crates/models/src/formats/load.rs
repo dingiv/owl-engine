@@ -351,7 +351,7 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
     w: &crate::module::Want,
     src: &S,
     n: usize,
-    op: owl_kernels::driver::OpId,
+    op: crate::ops::SemanticKernel,
     rows: usize,
     cols: usize,
     tap: Option<&Mutex<Box<dyn LoadTap>>>,
@@ -418,7 +418,7 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
             ModelError::Msg(format!("Weight '{}': DeviceRearrange 需 GPU 环境", w.key))
         })?;
         let pick = owl_kernels::driver::resolve(owl_kernels::driver::OpReq {
-            op,
+            op: op.op_id(),
             env: &env,
             dt: owl_kernels::driver::DType::U32,
             shapes: &[vec![rows, cols]],

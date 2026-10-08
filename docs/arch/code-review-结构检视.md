@@ -557,3 +557,65 @@ actor 线程 catch_unwind 包裹(AssertUnwindSafe)→ 装配深路径 panic
 - 回归:models 120/120 / kernels 23/23 / engine 38/38 / facedir 2/2 /
   workspace 绿 / gdn 金标 + 新链 E2E GPU 绿;llm_speedtest std 复测
   prefill avg **1161.5**(基线带内,零回归)。
+
+---
+
+## 十五、动作词表枚举化(2026-10-12,用户律三番:层面向动作,不面向实现)
+
+> 用户裁决:解释层与模型声明解耦的下一刀 —— ids 字符串词表是实现分派
+> 键的泄漏(现役全落 NVIDIA 算子);层应该说「对张量做什么」,硬件归
+> 解释器/驱动关注。**ids 全废,改枚举。**
+
+- **`SemanticKernel`**(models::ops;40 变体动作词表,Debug/Clone/Copy/
+  PartialEq/Eq/Hash):`Op::Call { op: SemanticKernel, aux }` —— 层侧唯一
+  算子词汇。命名 = 语义动作去域前缀(GdnGatingG / PagedDecodeV2 /
+  SiluAndMul / CtRepack…),域归属只留注释分组。
+- **`SemanticKernel::op_id(self) -> OpId`**:语义动作 → 命名空间身份证的
+  **CUDA 解释器现役 lowering**(穷尽 match,加变体不映射 = 编译红);
+  值 = 语义名空间("gdn.gating_g"),非 kernel 实现名 —— 实现名由
+  driver 按 env 推导不变。**CPU/AMD 解释器不走此表**:直接 match 枚举
+  落自有实现 —— 枚举 = 硬件无关动作契约,OpId+driver 退化为 CUDA 域
+  内部细节,模型层零 NVIDIA 词汇。
+- **全消费点切换**(14 文件):layers ×8 / env(5 个 _op() 返回值)/
+  module(Layout::DeviceRearrange)/ formats/load(装载域重排)/
+  tensor(TensorOps::call)/ eval(Call 臂 + trace)/ engine ×5;
+  `pub use OpId` 转私有(模型公共面零 OpId)。
+- **机器锁**:`semantic_op_vocab_lock::op_ids_are_unique_and_total`
+  (40 变体 op_id 非空唯一 + 总数一致)+ foreign_call_lock 同步枚举化。
+- driver 分派表报错文案随更新(词表住 SemanticKernel);driver 本体零改动
+  (仍吃 OpId 字符串 —— 它只是 CUDA lowering 的内部键)。
+- 回归:models 121/121 / engine 38/38 / facedir 2/2 / workspace 绿 /
+  gdn 金标 GPU 绿;llm_speedtest std 复测 prefill avg **1160.8**
+  (基线带 1153~1161,零回归;同日另有 1127 一轮 = 运行方差)。
+
+---
+
+## 十六、Op 瘦身(2026-10-12,用户律四番:纯算子不再单独搞)
+
+> 用户裁决:`pub enum Op` 里纯算子变体与 SemanticKernel 词表双重记账
+> —— 同一动作两套词汇/两条 lower/两个 eval 臂。**纯算子折叠进 Call。**
+
+- **Op 删 8 变体**:Add / Mul / Silu / Sigmoid / Rmsnorm{eps,w_off}
+  (折叠进 `Op::Call`;TensorOps 五方法签名不变,内部改发 Call 节点,
+  标量槽 = 线契约:sz n 或 cols/eps/w_off)+ Rope{theta_base} /
+  Embedding / PagedAttn(**死变体**,零构造点,eval 本就无臂)。
+  Op 剩 11 变体:源(Htod/Zeros/Block)+ 视图(Reshape/SliceView)+
+  复合(Matmul/MatmulNt:dtypes 分派 cublas/native + cm 映射,非单一
+  kernel 语义)+ 统一通道(Call)+ 逃生舱(Kernel/Spec)+ 状态
+  (SlotWrite)。
+- **driver +4 臂**:ops.add / ops.mul / ops.silu(BF16 无独立变体,
+  unimplemented 指路 silu_and_mul)/ ops.rmsnorm(rows 从形状推导:
+  x_total/cols,grid (rows,1,1) smem 1K)。
+- **登记表 O 标记**:纯算子族 .cu 输出块在中间槽(add 第 3 / sigmoid
+  第 2),lower_kernel 直连需要显式输出位 —— Entry.args "T,T,T,sz" →
+  "T,T,O,sz"(sigmoid/silu "T,O,sz";rmsnorm "T,T,O,i32,f32,i32");
+  C2 测试 O 归一化对拍 + O 位必须是 .cu 指针槽。
+- **CPU 面**:reference 解释器 match 同一枚举落 host 实现
+  (Call{Add/Mul/Silu/Sigmoid/Rmsnorm} 臂;Rmsnorm 参数从标量槽按线
+  契约解码)—— **动作词表的 CPU 面第一次成型**。eval Call 臂 env 缺省
+  (CPU face 测试域)= Sm86 占位,纯语义臂不消费 env。
+- 删 lower_add/mul/silu/sigmoid/rmsnorm + dname/concat_op/to_static
+  (dtype 路由命名随双词汇一起退役;lower_matmul/nt/gemm 留守 Matmul)。
+- 回归:models 121/121(带 GPU)/ kernels 23/23 / engine 38/38 /
+  facedir 2/2 / workspace 绿 / gdn 金标 GPU 绿;llm_speedtest std 复测
+  prefill avg **1166.0**(基线带,零回归)。

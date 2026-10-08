@@ -68,42 +68,42 @@ impl KvEnv {
     // 行 + 清单门(kv_manifest_gate)三件套,禁止在分派点手写分支。
 
     /// K0 批量写(classic 池;naive decode / chunked prefill / naive prefill 共用)
-    pub fn k0_write_op(&self) -> crate::ops::OpId {
+    pub fn k0_write_op(&self) -> crate::ops::SemanticKernel {
         match self.quant {
-            KvQuant::Fp8E4M3 => crate::ops::ids::ATTN_K0_WRITE_FP8,
-            KvQuant::None => crate::ops::ids::ATTN_K0_WRITE,
+            KvQuant::Fp8E4M3 => crate::ops::SemanticKernel::K0WriteFp8,
+            KvQuant::None => crate::ops::SemanticKernel::K0Write,
         }
     }
 
     /// K0 双写(classic + FI kNHD 影子;两臂随 quant 同 dtype)
-    pub fn k0_dual_op(&self) -> crate::ops::OpId {
+    pub fn k0_dual_op(&self) -> crate::ops::SemanticKernel {
         match self.quant {
-            KvQuant::Fp8E4M3 => crate::ops::ids::ATTN_K0_DUAL_FP8KV,
-            KvQuant::None => crate::ops::ids::ATTN_K0_DUAL,
+            KvQuant::Fp8E4M3 => crate::ops::SemanticKernel::K0DualFp8kv,
+            KvQuant::None => crate::ops::SemanticKernel::K0Dual,
         }
     }
 
     /// chunked paged prefill 批读
-    pub fn prefill_paged_attn_op(&self) -> crate::ops::OpId {
+    pub fn prefill_paged_attn_op(&self) -> crate::ops::SemanticKernel {
         match self.quant {
-            KvQuant::Fp8E4M3 => crate::ops::ids::ATTN_PAGED_PREFILL_FP8,
-            KvQuant::None => crate::ops::ids::ATTN_PAGED_PREFILL,
+            KvQuant::Fp8E4M3 => crate::ops::SemanticKernel::PagedPrefillFp8,
+            KvQuant::None => crate::ops::SemanticKernel::PagedPrefill,
         }
     }
 
     /// v2 分页 decode 打分
-    pub fn decode_v2_op(&self) -> crate::ops::OpId {
+    pub fn decode_v2_op(&self) -> crate::ops::SemanticKernel {
         match self.quant {
-            KvQuant::Fp8E4M3 => crate::ops::ids::ATTN_PAGED_DECODE_V2_FP8,
-            KvQuant::None => crate::ops::ids::ATTN_PAGED_DECODE_V2,
+            KvQuant::Fp8E4M3 => crate::ops::SemanticKernel::PagedDecodeV2Fp8,
+            KvQuant::None => crate::ops::SemanticKernel::PagedDecodeV2,
         }
     }
 
     /// decode 融合插池(qk-norm+rope+K/V 插池三合一)
-    pub fn fused_insert_op(&self) -> crate::ops::OpId {
+    pub fn fused_insert_op(&self) -> crate::ops::SemanticKernel {
         match self.quant {
-            KvQuant::Fp8E4M3 => crate::ops::ids::ATTN_QKV_NORM_ROPE_INSERT_FP8KV,
-            KvQuant::None => crate::ops::ids::ATTN_QKV_NORM_ROPE_INSERT,
+            KvQuant::Fp8E4M3 => crate::ops::SemanticKernel::QkvNormRopeInsertFp8kv,
+            KvQuant::None => crate::ops::SemanticKernel::QkvNormRopeInsert,
         }
     }
 

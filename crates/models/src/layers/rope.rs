@@ -117,7 +117,7 @@ impl Rope {
             .arg_usize(self.rotary_dim / 2)
             .with_shape(dt, vec![tokens, q_heads * self.head_dim]);
         }
-        TensorOps::call(crate::ops::ids::OPS_ROPE).aux(&[tokens])
+        TensorOps::call(crate::ops::SemanticKernel::Rope).aux(&[tokens])
         .arg(q)
         .arg(&self.cos.decl())
         .arg(&self.sin.decl())
@@ -149,7 +149,7 @@ impl Rope {
             .arg_usize(self.rotary_dim / 2)
             .with_shape(dt, vec![tokens, kv_heads * self.head_dim]);
         }
-        TensorOps::call(crate::ops::ids::OPS_ROPE).aux(&[tokens])
+        TensorOps::call(crate::ops::SemanticKernel::Rope).aux(&[tokens])
         .arg(k)
         .arg(&self.cos.decl())
         .arg(&self.sin.decl())

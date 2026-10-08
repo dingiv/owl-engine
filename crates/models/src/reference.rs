@@ -15,7 +15,7 @@
 use crate::contract::{ModelError, Shape};
 use crate::contract::numel;
 use crate::interpreters::observe::{BlockRef, BlockStats, NodeEvent, Tap, Want};
-use crate::ops::Op;
+use crate::ops::{KernelArg, Op, SemanticKernel};
 use crate::tensor::{Dtype, TensorOps};
 
 // ============================================================================
@@ -150,11 +150,24 @@ fn reduce_rec(
         Op::Zeros => itp.zeros(t.dtype, &t.shape),
         Op::Matmul => itp.matmul(&ins[0], &ins[1], t.dtype, &t.shape),
         Op::MatmulNt => itp.matmul_nt(&ins[0], &ins[1], t.dtype, &t.shape),
-        Op::Add => itp.add(&ins[0], &ins[1]),
-        Op::Mul => itp.mul(&ins[0], &ins[1]),
-        Op::Silu => itp.silu(&ins[0]),
-        Op::Sigmoid => itp.sigmoid(&ins[0]),
-        Op::Rmsnorm { eps, w_off } => itp.rmsnorm(&ins[0], &ins[1], *eps, *w_off),
+        // 纯算子动作(2026-10-12 瘦身):Op::Call 枚举臂 —— CPU 解释器
+        // match 同一词表落 host 实现(硬件无关动作契约的 CPU 面)
+        Op::Call { op: SemanticKernel::Add, .. } => itp.add(&ins[0], &ins[1]),
+        Op::Call { op: SemanticKernel::Mul, .. } => itp.mul(&ins[0], &ins[1]),
+        Op::Call { op: SemanticKernel::Silu, .. } => itp.silu(&ins[0]),
+        Op::Call { op: SemanticKernel::Sigmoid, .. } => itp.sigmoid(&ins[0]),
+        Op::Call { op: SemanticKernel::Rmsnorm, .. } => {
+            // 标量槽序 = 线契约:cols(i32)/ eps(f32)/ w_off(i32)
+            let eps = match t.args.get(1) {
+                Some(KernelArg::F32(v)) => *v,
+                other => panic!("rmsnorm 标量槽 1 期望 f32 eps,实得 {other:?}"),
+            };
+            let w_off = match t.args.get(2) {
+                Some(KernelArg::I32(v)) => *v != 0,
+                other => panic!("rmsnorm 标量槽 2 期望 i32 w_off,实得 {other:?}"),
+            };
+            itp.rmsnorm(&ins[0], &ins[1], eps, w_off)
+        }
         Op::SlotWrite => itp.slot_write(&ins[0]),
         Op::Reshape => Ok(Value { f32: ins[0].f32.clone(), shape: t.shape.clone() }),
         Op::Block { id } => itp.block(*id, t.dtype, &t.shape),

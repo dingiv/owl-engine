@@ -72,7 +72,7 @@
 
 use crate::contract::Shape;
 use crate::kernel::Kernel;
-use crate::ops::{KernelArg, Op};
+use crate::ops::{KernelArg, Op, SemanticKernel};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // ============================================================================
@@ -289,10 +289,10 @@ impl TensorOps {
     }
 
     /// 语义调用声明(**model 层面向解释器的唯一新语句**,Driver 立项):
-    /// `TensorOps::call(ops::ids::GDN_GATING).arg(..).with_shape(..)`
+    /// `TensorOps::call(ops::SemanticKernel::GdnGatingG).arg(..).with_shape(..)`
     /// 零核名/零发射参数 —— 名/变体/grid/block/smem 由解释器执行期经
     /// owl-kernels::driver::resolve(OpEnv 必传)拾取。
-    pub fn call(op: crate::ops::OpId) -> TensorOps {
+    pub fn call(op: crate::ops::SemanticKernel) -> TensorOps {
         TensorOps {
             id: next_id(),
             parents: vec![],
@@ -428,8 +428,14 @@ impl TensorOps {
         if let Some(e) = self.shape_rule(b, "add", |a, b| a == b) {
             return self.poisoned_local(e);
         }
+        let n: usize = self.shape.iter().product();
         let meta = (self.dtype, self.shape.clone());
-        self.join(Op::Add, Some(b), meta, vec![])
+        self.join(
+            Op::Call { op: SemanticKernel::Add, aux: vec![] },
+            Some(b),
+            meta,
+            vec![KernelArg::Bits(n as u64)],
+        )
     }
 
     /// 同形逐元素乘(MLP 门控 / 注意力输出门)
@@ -437,19 +443,37 @@ impl TensorOps {
         if let Some(e) = self.shape_rule(b, "mul", |a, b| a == b) {
             return self.poisoned_local(e);
         }
+        let n: usize = self.shape.iter().product();
         let meta = (self.dtype, self.shape.clone());
-        self.join(Op::Mul, Some(b), meta, vec![])
+        self.join(
+            Op::Call { op: SemanticKernel::Mul, aux: vec![] },
+            Some(b),
+            meta,
+            vec![KernelArg::Bits(n as u64)],
+        )
     }
 
     pub fn silu(&self) -> TensorOps {
+        let n: usize = self.shape.iter().product();
         let meta = (self.dtype, self.shape.clone());
-        self.join(Op::Silu, None, meta, vec![])
+        self.join(
+            Op::Call { op: SemanticKernel::Silu, aux: vec![] },
+            None,
+            meta,
+            vec![KernelArg::Bits(n as u64)],
+        )
     }
 
     /// 逐元素 sigmoid(注意力输出门;GDN beta 同族)
     pub fn sigmoid(&self) -> TensorOps {
+        let n: usize = self.shape.iter().product();
         let meta = (self.dtype, self.shape.clone());
-        self.join(Op::Sigmoid, None, meta, vec![])
+        self.join(
+            Op::Call { op: SemanticKernel::Sigmoid, aux: vec![] },
+            None,
+            meta,
+            vec![KernelArg::Bits(n as u64)],
+        )
     }
 
     /// ×(1+w) 语义(w_off = true;use_norm_offset)
@@ -465,12 +489,18 @@ impl TensorOps {
         }) {
             return self.poisoned_local(e);
         }
+        let cols: usize = alpha.shape.iter().product();
         let meta = (self.dtype, self.shape.clone());
         self.join(
-            Op::Rmsnorm { eps, w_off },
+            Op::Call { op: SemanticKernel::Rmsnorm, aux: vec![] },
             Some(alpha),
             meta,
-            vec![],
+            // 标量槽序 = 线契约:cols(i32)/ eps(f32)/ w_off(i32)
+            vec![
+                KernelArg::I32(cols as i32),
+                KernelArg::F32(eps),
+                KernelArg::I32(w_off as i32),
+            ],
         )
     }
 

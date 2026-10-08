@@ -13,63 +13,169 @@ use crate::contract::{Arg, Bytes, Dtype, KernelSource, LaunchMsg};
 use crate::kernel::Kernel;
 use crate::tensor::TensorOps;
 
-pub use owl_kernels::driver::OpId;
+use owl_kernels::driver::OpId;
 
-/// 语义算子词表(model 层语汇;**值 = 语义名空间,非 kernel 实现名**。
-/// 实现住 owl-kernels::driver 分派表,耦合由 models 侧 resolve 测试把门:
-/// 词表加票、driver 加臂,两侧不同票 = 单测红)
-pub mod ids {
-    use super::OpId;
-    pub const GDN_GATING: OpId = OpId("gdn.gating_g");
-    pub const GDN_L2NORM: OpId = OpId("gdn.l2norm");
-    pub const GDN_CONV_UPD: OpId = OpId("gdn.conv_upd");
-    /// 刀3b:q/k 双段 conv 槽更新单发(aux 无;标量 dq/dk/batch/silu 入参)
-    pub const GDN_CONV_UPD_DUAL: OpId = OpId("gdn.conv_upd_dual");
-    pub const GDN_DELTA_DEC: OpId = OpId("gdn.delta_dec");
+/// 语义算子动作词表(2026-10-12 用户律:层面向**抽象动作**,不面向实现
+/// —— 层只描述「对张量做什么」,硬件归解释器/驱动关注。枚举变体 = 层侧
+/// 唯一算子词汇;CUDA 域经 [`SemanticKernel::op_id`] 落 driver 分派表,CPU/
+/// AMD 解释器直接 match 本枚举落自有实现,**零 NVIDIA 词汇入层**)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SemanticKernel {
+    // ---- gdn.*(aux 序 = driver 族函数文档)----
+    /// g = -exp(A_log)·softplus(a + dt_bias) 门控
+    GdnGatingG,
+    /// 末维 L2 归一
+    GdnL2Norm,
+    /// conv 状态滑更新
+    GdnConvUpd,
+    /// 刀3b:q/k 双段 conv 槽更新单发(标量 dq/dk/batch/silu 入参)
+    GdnConvUpdDual,
+    /// decode 单步 delta 递推
+    GdnDeltaDec,
     /// D1:decode 整链融合(v-conv + l2norm×2 + gating + sigmoid + delta + norm_act)
-    pub const GDN_DECODE_STEP: OpId = OpId("gdn.decode_step");
+    GdnDecodeStep,
     /// D1-v2:delta 相 float4 行组重写(同契约;sglang 刺探产物)
-    pub const GDN_DECODE_STEP_V2: OpId = OpId("gdn.decode_step_v2");
-    pub const GDN_CONV_FWD: OpId = OpId("gdn.conv_fwd");
-    pub const GDN_RECURRENCE: OpId = OpId("gdn.recurrence_varlen_gqa");
-    pub const GDN_NORM_ACT: OpId = OpId("gdn.norm_act");
-    /// foreign 家族臂(2026-10-12 用户律:gdn 两臂入词表,与 native 同一
-    /// Call 通道;名字/发射配置归 driver,槽序 sig 归家族线契约单源)
-    pub const GDN_CHUNKED: OpId = OpId("gdn.chunked_delta");
-    pub const GDN_SCALAR: OpId = OpId("gdn.scalar_delta");
-    pub const SIGMOID: OpId = OpId("ops.sigmoid");
-    pub const ATTN_K0_WRITE: OpId = OpId("attn.k0_write");
-    pub const ATTN_K0_WRITE_FP8: OpId = OpId("attn.k0_write_fp8");
-    pub const ATTN_K0_WRITE_FP8_BF16: OpId = OpId("attn.k0_write_fp8_bf16");
-    pub const ATTN_PAGED_DECODE_V2_FP8: OpId = OpId("attn.paged_decode_v2_fp8");
-    pub const ATTN_PAGED_PREFILL_FP8: OpId = OpId("attn.paged_prefill_fp8");
-    pub const ATTN_K0_DUAL: OpId = OpId("attn.k0_dual");
-    pub const ATTN_K0_DUAL_FP8KV: OpId = OpId("attn.k0_dual_fp8kv");
-    pub const CAST_F16_F32: OpId = OpId("elems.cast_f16_f32");
-    pub const ATTN_PAGED_DECODE: OpId = OpId("attn.paged_decode");
+    GdnDecodeStepV2,
+    /// conv 前向(记录臂)
+    GdnConvFwd,
+    /// varlen GQA 递推批核(aux = [nv, kd, vd])
+    GdnRecurrence,
+    /// 门控归一化 + T 批量(aux = [rows, value_dim, group_size])
+    GdnNormAct,
+    /// foreign 家族臂:chunked 六核编排(FLA fork-bf16;slot 寻址状态池。
+    /// 名字/发射配置归 driver,槽序 sig 归家族线契约单源)
+    GdnChunkedDelta,
+    /// foreign 家族臂:scalar 单核(lmdeploy pre_sm90 port)
+    GdnScalarDelta,
+
+    // ---- ops.* ----
+    /// 逐元素 sigmoid(attn_output_gate 门 / GDN beta 同族)
+    Sigmoid,
+    /// 同形逐元素加(残差)
+    Add,
+    /// 同形逐元素乘(门控)
+    Mul,
+    /// 一元激活(独立 silu 核;MLP 走 SiluAndMul 融合)
+    Silu,
+    /// ×(1+w) rmsnorm(行归一,cols 由 alpha 定义;标量槽 = cols/eps/w_off)
+    Rmsnorm,
+    /// 窄切物化拷贝(outer/src_dim/start/out_dim)
+    Narrow,
+    /// 行拼接
+    Concat,
+    /// partial rope
+    Rope,
+    /// embedding 查表
+    Embed,
+
+    // ---- elems.* ----
+    /// f16 → f32 铸(GDN scalar/chunked 臂层侧预铸)
+    CastF16F32,
+    /// 刀3a':双权 GEMV 单发(b/a 投影;aux = [rows_b, rows_a, cols, tokens])
+    GemvDual,
+
+    // ---- attn.*(aux 序见各变体)----
+    /// KV 散写(classic 布局;aux = [tokens])
+    K0Write,
+    /// KV 散写 e4m3 池变体(aux = [tokens])
+    K0WriteFp8,
+    /// 同上 bf16 入(K0)
+    K0WriteFp8Bf16,
+    /// K0 双写(classic + kNHD 影子;aux = [tokens])
+    K0Dual,
+    /// K0 双写 e4m3 影子
+    K0DualFp8kv,
+    /// 分页 decode v1(aux = [hd, hq, hkv, nb])
+    PagedDecode,
     /// v2 分页 decode 在线 softmax 主核(分块 PARTITION=512;aux =
     /// [hd, hq, hkv, nb, nparts];输出 = 未归一化 partials [1,hq·nparts·hd])
-    pub const ATTN_PAGED_DECODE_V2: OpId = OpId("attn.paged_decode_v2");
+    PagedDecodeV2,
+    /// B6.1:v2 fp8 e4m3 KV 读变体(形状契约同 f16)
+    PagedDecodeV2Fp8,
     /// v2 LSE 归并(exp_sums/max_logits/tmp_out → out;aux = [hd, hq, nparts])
-    pub const ATTN_PAGED_V2_REDUCE: OpId = OpId("attn.paged_v2_reduce");
-    pub const ATTN_PAGED_PREFILL: OpId = OpId("attn.paged_prefill");
-    pub const ATTN_PREFILL_SPLIT: OpId = OpId("attn.prefill_split");
-    pub const ATTN_PREFILL_SPLIT_REDUCE: OpId = OpId("attn.prefill_split_reduce");
-    pub const ATTN_NAIVE_DECODE: OpId = OpId("attn.naive_decode");
-    pub const ATTN_GATE_MUL: OpId = OpId("attn.gate_mul");
-    /// 刀3a':双权 GEMV 单发(b/a 投影;aux = [rows_b, rows_a, cols, tokens])
-    pub const ELEMS_GEMV_DUAL: OpId = OpId("elems.gemv_dual");
-    pub const OPS_NARROW: OpId = OpId("ops.narrow");
-    pub const OPS_CONCAT: OpId = OpId("ops.concat");
-    pub const OPS_ROPE: OpId = OpId("ops.rope");
-    pub const OPS_EMBED: OpId = OpId("ops.embed");
-    pub const LOAD_CT_REPACK: OpId = OpId("load.ct_repack");
-    pub const ATTN_NORM_ROPE: OpId = OpId("attn.norm_rope");
-    pub const MLP_SILU_AND_MUL: OpId = OpId("mlp.silu_and_mul");
-    pub const LN_FUSED_ADD_RMSNORM: OpId = OpId("ln.fused_add_rmsnorm");
-    pub const ATTN_QKV_NORM_ROPE_INSERT: OpId = OpId("attn.qkv_norm_rope_insert");
-    /// B6.3:fp8 e4m3 主池变体(decode 融合插池路;池写 1B e4m3)
-    pub const ATTN_QKV_NORM_ROPE_INSERT_FP8KV: OpId = OpId("attn.qkv_norm_rope_insert_fp8kv");
+    PagedV2Reduce,
+    /// chunked prefill 在线 softmax(aux = [hd, hkv, hq, tokens])
+    PagedPrefill,
+    /// B6.3:chunked prefill fp8 KV 读变体
+    PagedPrefillFp8,
+    /// prefill split(flash-decoding;aux = [hd, hkv, hq, tokens, nparts];
+    /// ctx_base 走核参数槽,层侧传入)
+    PrefillSplit,
+    /// prefill split 归并(aux = [tokens, hq])
+    PrefillSplitReduce,
+    /// naive decode(slot 直排)
+    NaiveDecode,
+    /// 注意力输出门(y *= sigmoid(g))
+    GateMul,
+    /// norm_rope 融合:qk-norm + rotate-half partial rope 三发合一
+    /// (aux = [tokens, heads, hd])
+    NormRope,
+    /// qk-norm+rope+K/V 插池三合一(aux = [tokens, hq, hkv, hd, half])
+    QkvNormRopeInsert,
+    /// B6.3:fp8 e4m3 主池变体(几何同 f16;池写 1B e4m3)
+    QkvNormRopeInsertFp8kv,
+
+    // ---- ln./mlp./load.* ----
+    /// fused_add_rmsnorm:residual 原地 += mixed + rmsnorm·w(aux = [rows, n])
+    FusedAddRmsnorm,
+    /// SwiGLU 门控 silu(g)⊙u(aux = [n])
+    SiluAndMul,
+    /// ct packed → marlin B 设备重排(U32;核签名形参即 rows/cols)
+    CtRepack,
+}
+
+impl SemanticKernel {
+    /// 语义动作 → 命名空间身份证(**CUDA 解释器现役 lowering 的分派键**;
+    /// 值 = 语义名空间,非 kernel 实现名 —— 实现名由 driver 按 env 推导)。
+    /// CPU/AMD 解释器不走此表:直接 match 本枚举落自有实现。
+    pub fn op_id(self) -> OpId {
+        OpId(match self {
+            SemanticKernel::GdnGatingG => "gdn.gating_g",
+            SemanticKernel::GdnL2Norm => "gdn.l2norm",
+            SemanticKernel::GdnConvUpd => "gdn.conv_upd",
+            SemanticKernel::GdnConvUpdDual => "gdn.conv_upd_dual",
+            SemanticKernel::GdnDeltaDec => "gdn.delta_dec",
+            SemanticKernel::GdnDecodeStep => "gdn.decode_step",
+            SemanticKernel::GdnDecodeStepV2 => "gdn.decode_step_v2",
+            SemanticKernel::GdnConvFwd => "gdn.conv_fwd",
+            SemanticKernel::GdnRecurrence => "gdn.recurrence_varlen_gqa",
+            SemanticKernel::GdnNormAct => "gdn.norm_act",
+            SemanticKernel::GdnChunkedDelta => "gdn.chunked_delta",
+            SemanticKernel::GdnScalarDelta => "gdn.scalar_delta",
+            SemanticKernel::Sigmoid => "ops.sigmoid",
+            SemanticKernel::Add => "ops.add",
+            SemanticKernel::Mul => "ops.mul",
+            SemanticKernel::Silu => "ops.silu",
+            SemanticKernel::Rmsnorm => "ops.rmsnorm",
+            SemanticKernel::Narrow => "ops.narrow",
+            SemanticKernel::Concat => "ops.concat",
+            SemanticKernel::Rope => "ops.rope",
+            SemanticKernel::Embed => "ops.embed",
+            SemanticKernel::CastF16F32 => "elems.cast_f16_f32",
+            SemanticKernel::GemvDual => "elems.gemv_dual",
+            SemanticKernel::K0Write => "attn.k0_write",
+            SemanticKernel::K0WriteFp8 => "attn.k0_write_fp8",
+            SemanticKernel::K0WriteFp8Bf16 => "attn.k0_write_fp8_bf16",
+            SemanticKernel::K0Dual => "attn.k0_dual",
+            SemanticKernel::K0DualFp8kv => "attn.k0_dual_fp8kv",
+            SemanticKernel::PagedDecode => "attn.paged_decode",
+            SemanticKernel::PagedDecodeV2 => "attn.paged_decode_v2",
+            SemanticKernel::PagedDecodeV2Fp8 => "attn.paged_decode_v2_fp8",
+            SemanticKernel::PagedV2Reduce => "attn.paged_v2_reduce",
+            SemanticKernel::PagedPrefill => "attn.paged_prefill",
+            SemanticKernel::PagedPrefillFp8 => "attn.paged_prefill_fp8",
+            SemanticKernel::PrefillSplit => "attn.prefill_split",
+            SemanticKernel::PrefillSplitReduce => "attn.prefill_split_reduce",
+            SemanticKernel::NaiveDecode => "attn.naive_decode",
+            SemanticKernel::GateMul => "attn.gate_mul",
+            SemanticKernel::NormRope => "attn.norm_rope",
+            SemanticKernel::QkvNormRopeInsert => "attn.qkv_norm_rope_insert",
+            SemanticKernel::QkvNormRopeInsertFp8kv => "attn.qkv_norm_rope_insert_fp8kv",
+            SemanticKernel::FusedAddRmsnorm => "ln.fused_add_rmsnorm",
+            SemanticKernel::SiluAndMul => "mlp.silu_and_mul",
+            SemanticKernel::CtRepack => "load.ct_repack",
+        })
+    }
 }
 
 /// contract::Dtype → driver::DType(契约类型不过 kernels,转换住消费侧)
@@ -236,27 +342,15 @@ pub enum Op {
     /// eval 时零操作(数据已在),仅把"真数据"接进声明图的叶子。
     Block { id: u64 },
 
-    // ---- 计算节点 ----
+    // ---- 计算节点(2026-10-12 瘦身:纯算子动作全部折叠进 Call ——
+    //      Add/Mul/Silu/Sigmoid/Rmsnorm 已入 SemanticKernel 词表,双词汇
+    //      时代结束;Matmul/MatmulNt 留守 = 多策略复合(dtypes 分派
+    //      cublas/native + cm 映射),非单一 kernel 语义)----
     /// [m,k] × [k,n]
     Matmul,
     /// [m,k] × (B 以 [n,k] 行主序直读)→ [m,n](nt = B 非转置存储;
     /// lm_head/tied 形态:权重保持 checkpoint 原布局,免 host 转置)
     MatmulNt,
-    Add,
-    /// 同形逐元素乘(MLP 门控 / 注意力输出门)
-    Mul,
-    Silu,
-    /// 逐元素 sigmoid(attn_output_gate 门;GDN beta 同族)
-    Sigmoid,
-    /// w_off = ×(1+w) 语义(use_norm_offset);归一化宽度由 alpha 定义
-    /// (x 任意前导维折叠为行)。**C8 权威定案**:本变体 + owl_rmsnorm_f32
-    /// (ops.cu)为该语义唯一权威,reference.rs / owl-cpu ops 为对拍副本;
-    /// **C12 定案**:w_off 留 flag 不拆 op(qk-norm 是唯一 add_one 用户)。
-    Rmsnorm { eps: f32, w_off: bool },
-    Rope { theta_base: f64 },
-    Embedding,
-    /// paged attention(带槽位;server 侧 kernel 从 attention-rs port)
-    PagedAttn,
     /// 形状重解释(纯元数据视图;元素数守恒;eval 透传父块,零拷贝)
     Reshape,
     /// 刀1:块内连续切片视图(零内核零节点派发;eval 透传父块,
@@ -265,12 +359,13 @@ pub enum Op {
     /// (narrow 的 outer==1 ∨ src_dim==out_dim)入此臂,非连续仍物化。
     SliceView { offset_elems: usize },
 
-    // ---- 语义调用(Driver 立项,2026-10-01):model 层只描述「要什么」
-    //      (OpId 语义词表)+ 张量 + 语义标量;名/变体/发射参数 = 解释器
-    //      执行期经 owl-kernels::driver::resolve(OpEnv 必传,被动律)拾取。
-    //      aux = 拾取推导常数(层语义几何:kd/vd/batch…;非核参数,不进
-    //      签名)。**model 层由此不再感知 kernel 层的存在**(S2' 定稿)。
-    Call { op: OpId, aux: Vec<usize> },
+    // ---- 语义调用(Driver 立项,2026-10-01;2026-10-12 枚举化):model 层
+    //      只描述「要什么」(SemanticKernel 动作词表)+ 张量 + 语义标量;名/
+    //      变体/发射参数 = 解释器执行期拾取(CUDA 域 = op_id → driver
+    //      resolve,OpEnv 必传被动律)。aux = 拾取推导常数(层语义几何:
+    //      kd/vd/batch…;非核参数,不进签名)。**model 层由此不感知任何
+    //      硬件算子的存在**(S2' 定稿;枚举 = 硬件无关动作契约)。
+    Call { op: SemanticKernel, aux: Vec<usize> },
 
     // ---- Kernel 节点(2026-09-23 定稿:节点的本质形态,funio Pack 同源)----
     /// 携带核函数值(Kernel{name, source})+ 有序参数槽。
@@ -313,15 +408,15 @@ impl PlanNode for crate::tensor::TensorOps {
     /// 草稿语义:join = 相加(map = silu);正式组合子随声明式算子面扩展
     fn join(&self, another: &Self, op: Op) -> Self {
         match op {
-            Op::Add => self.add(another),
+            Op::Call { op: SemanticKernel::Add, .. } => self.add(another),
             _ => self.add(another),
         }
     }
 
     fn map(&self, op: Op) -> Self {
         match op {
-            Op::Silu => self.silu(),
-            Op::Sigmoid => self.sigmoid(),
+            Op::Call { op: SemanticKernel::Silu, .. } => self.silu(),
+            Op::Call { op: SemanticKernel::Sigmoid, .. } => self.sigmoid(),
             _ => self.clone(),
         }
     }
@@ -333,28 +428,6 @@ impl PlanNode for crate::tensor::TensorOps {
 
 fn spec(name: &'static str) -> KernelSource {
     KernelSource { name: name.to_string(), source: crate::kernel::source(name).to_string() }
-}
-
-/// dtype 路由名(f16 基线 F2):`owl_<op>_<f32|f16>`;注册表缺条目 =
-/// source panic(编程错误口径 —— 守门已在 eval 前置,此处对齐注册表)
-fn dname(base: &str, dtype: crate::contract::Dtype) -> &'static str {
-    match dtype {
-        crate::contract::Dtype::F32 => to_static(concat_op(base, "f32")),
-        crate::contract::Dtype::F16 => to_static(concat_op(base, "f16")),
-        // bf16 臂(E5-DF3 同日十四;owl_add_bf16/owl_mul_bf16/owl_rmsnorm_bf16)
-        crate::contract::Dtype::BF16 => to_static(concat_op(base, "bf16")),
-        other => panic!("dname: 语义算子不支持 {other:?}(f16 基线:仅 F32/F16/BF16)"),
-    }
-}
-
-fn concat_op(base: &str, suffix: &str) -> String {
-    format!("{base}_{suffix}")
-}
-
-fn to_static(s: String) -> &'static str {
-    // 路由名来自封闭集合(f32/f16 后缀),注册表键为 'static;
-    // 用 Box::leak 承载(进程生命周期,量级 = 语义算子数 × 2,可忽略)
-    Box::leak(s.into_boxed_str())
 }
 
 fn ceil_1d(n: usize) -> (u32, u32, u32) {
@@ -404,61 +477,12 @@ pub fn lower_gemm(
     }
 }
 
-pub fn lower_add(ins: &[Arg], out: &Bytes, n: usize, dtype: crate::contract::Dtype) -> LaunchMsg {
-    LaunchMsg {
-        kernel: spec(dname("owl_add", dtype)),
-        args: vec![
-            ins[0].clone(),
-            ins[1].clone(),
-            Arg::Block { id: out.id },
-            Arg::U64(n as u64),
-        ],
-        grid: ceil_1d(n),
-        block: (256, 1, 1),
-        shared_mem: 0,
-        out_elems: n,
-    }
-}
-
 /// lower:Mul(同形逐元素乘)
 /// n = 声明元素数(C1 维度源头单一律:只读声明 shape,不读块账长)
-pub fn lower_mul(ins: &[Arg], out: &Bytes, n: usize, dtype: crate::contract::Dtype) -> LaunchMsg {
-    LaunchMsg {
-        kernel: spec(dname("owl_mul", dtype)),
-        args: vec![ins[0].clone(), ins[1].clone(), Arg::Block { id: out.id }, Arg::U64(n as u64)],
-        grid: ceil_1d(n),
-        block: (256, 1, 1),
-        shared_mem: 0,
-        out_elems: n,
-    }
-}
-
 /// lower:Silu(一元)
 /// n = 声明元素数(C1 维度源头单一律:只读声明 shape,不读块账长)
-pub fn lower_silu(ins: &[Arg], out: &Bytes, n: usize, dtype: crate::contract::Dtype) -> LaunchMsg {
-    LaunchMsg {
-        kernel: spec(dname("owl_silu", dtype)),
-        args: vec![ins[0].clone(), Arg::Block { id: out.id }, Arg::U64(n as u64)],
-        grid: ceil_1d(n),
-        block: (256, 1, 1),
-        shared_mem: 0,
-        out_elems: n,
-    }
-}
-
 /// lower:Sigmoid(一元;attn_output_gate 门 / GDN beta 同族)
 /// n = 声明元素数(C1 维度源头单一律:只读声明 shape,不读块账长)
-pub fn lower_sigmoid(ins: &[Arg], out: &Bytes, n: usize, dtype: crate::contract::Dtype) -> LaunchMsg {
-    LaunchMsg {
-        kernel: spec(dname("owl_sigmoid", dtype)),
-        args: vec![ins[0].clone(), Arg::Block { id: out.id }, Arg::U64(n as u64)],
-        grid: ceil_1d(n),
-        block: (256, 1, 1),
-        shared_mem: 0,
-        out_elems: n,
-    }
-}
-
 /// lower:Matmul([m,k]×[k,n];m/k/n 全部来自声明 shape(C1))
 pub fn lower_matmul(ins: &[Arg], out: &Bytes, m: usize, k: usize, n: usize) -> LaunchMsg {
     LaunchMsg {
@@ -494,26 +518,6 @@ pub fn lower_matmul_nt(ins: &[Arg], out: &Bytes, m: usize, k: usize, n: usize) -
         block: (16, 16, 1),
         shared_mem: 0,
         out_elems: m * n,
-    }
-}
-
-/// lower:Rmsnorm([rows, cols];per-channel alpha([cols] 广播);w_off = ×(1+w))
-pub fn lower_rmsnorm(ins: &[Arg], eps: f32, w_off: bool, out: &Bytes, rows: usize, cols: usize, dtype: crate::contract::Dtype) -> LaunchMsg {
-    LaunchMsg {
-        kernel: spec(dname("owl_rmsnorm", dtype)),
-        args: vec![
-            ins[0].clone(),
-            ins[1].clone(),
-            Arg::Block { id: out.id },
-            Arg::I32(cols as i32),
-            Arg::F32(eps),
-            Arg::I32(w_off as i32),
-        ],
-        // 一 block 一行(owl_rmsnorm_f32:row = blockIdx.x)
-        grid: (rows as u32, 1, 1),
-        block: (256, 1, 1),
-        shared_mem: 256 * 4,
-        out_elems: rows * cols,
     }
 }
 
@@ -658,12 +662,6 @@ pub fn argmax_f32idx(x: &crate::tensor::TensorOps, n: usize, offset: usize) -> c
 // 张量与纯标量,装配细节 = 解释层动作表职责)
 // ============================================================================
 
-use owl_kernels::client::gdn_chunked as fc_chunked;
-use owl_kernels::client::gdn_scalar as fc_scalar;
-
-/// foreign 名字(层侧唯一出口;字面量住址 = owl_kernels::contract::names)
-pub use owl_kernels::driver::load::CT_REPACK;
-
 /// foreign 家族臂线格式(名字 → 槽序 sig;解释器 Call 臂消费 —— native
 /// 登记表无 foreign 条目,sig 住 client face 单源。gdn 两臂 Call 通道的
 /// 桥:driver 拾取名 → 本表 → lower_kernel 对位装配)
@@ -760,7 +758,8 @@ pub(crate) fn fi_prefill_node(
         .with_shape(q.dtype, vec![total_rows, hq * hd])
 }
 
-/// FI 虚核名选择(models 侧唯一出口;测试/层共用)
+/// FI 虚核名选择(models 侧唯一出口;测试域消费,FI Call 化挂账复用)
+#[cfg(test)]
 pub(crate) fn fi_name(fp8kv: bool) -> &'static str {
     if fp8kv {
         owl_kernels::contract::names::PREFILL_FI_FP8KV
@@ -780,11 +779,48 @@ pub(crate) fn paged_prefill_ok(hd: usize, page: usize) -> bool {
 }
 
 #[cfg(test)]
+mod semantic_kernel_vocab_lock {
+    //! 动作词表锁:全变体 op_id 非空且唯一(枚举 ↔ 命名空间一一映射;
+    //! 漏臂/复制粘贴重名 = 此测试红)。driver 侧臂覆盖由使用路径 +
+    //! foreign_call_lock 兜底。
+    use super::*;
+
+    #[test]
+    fn op_ids_are_unique_and_total() {
+        let all = [
+            SemanticKernel::GdnGatingG, SemanticKernel::GdnL2Norm, SemanticKernel::GdnConvUpd,
+            SemanticKernel::GdnConvUpdDual, SemanticKernel::GdnDeltaDec, SemanticKernel::GdnDecodeStep,
+            SemanticKernel::GdnDecodeStepV2, SemanticKernel::GdnConvFwd, SemanticKernel::GdnRecurrence,
+            SemanticKernel::GdnNormAct, SemanticKernel::GdnChunkedDelta, SemanticKernel::GdnScalarDelta,
+            SemanticKernel::Sigmoid, SemanticKernel::Narrow, SemanticKernel::Concat, SemanticKernel::Rope,
+            SemanticKernel::Embed, SemanticKernel::CastF16F32, SemanticKernel::GemvDual,
+            SemanticKernel::K0Write, SemanticKernel::K0WriteFp8, SemanticKernel::K0WriteFp8Bf16,
+            SemanticKernel::K0Dual, SemanticKernel::K0DualFp8kv, SemanticKernel::PagedDecode,
+            SemanticKernel::PagedDecodeV2, SemanticKernel::PagedDecodeV2Fp8, SemanticKernel::PagedV2Reduce,
+            SemanticKernel::PagedPrefill, SemanticKernel::PagedPrefillFp8, SemanticKernel::PrefillSplit,
+            SemanticKernel::PrefillSplitReduce, SemanticKernel::NaiveDecode, SemanticKernel::GateMul,
+            SemanticKernel::NormRope, SemanticKernel::QkvNormRopeInsert,
+            SemanticKernel::QkvNormRopeInsertFp8kv, SemanticKernel::FusedAddRmsnorm,
+            SemanticKernel::SiluAndMul, SemanticKernel::CtRepack,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for v in all {
+            let id = v.op_id();
+            assert!(!id.0.is_empty(), "{v:?} 空命名空间");
+            assert!(seen.insert(id.0), "{v:?} 命名空间重复: {}", id.0);
+        }
+        assert_eq!(seen.len(), all.len(), "枚举变体数与映射数不一致");
+    }
+}
+
+#[cfg(test)]
 mod foreign_call_lock {
     //! gdn foreign 两臂 Call 通道锁(2026-10-12 用户律二番:具名算子入
     //! 词表):ids ↔ driver 臂 ↔ foreign sig ↔ server parse 四点同票 ——
     //! 层声明 → lower_kernel → client face parse 逐位对拍。
     use super::*;
+    use owl_kernels::client::gdn_chunked as fc_chunked;
+    use owl_kernels::client::gdn_scalar as fc_scalar;
     use owl_kernels::driver::{OpEnv, OpReq};
 
     fn env() -> OpEnv {
@@ -797,7 +833,7 @@ mod foreign_call_lock {
         gate: &TensorOps, state: &TensorOps, slot: usize,
         t: usize, nv: usize, nk: usize, kd: usize,
     ) -> TensorOps {
-        TensorOps::call(ids::GDN_CHUNKED)
+        TensorOps::call(SemanticKernel::GdnChunkedDelta)
             .arg(q).arg(k).arg(v).arg(beta).arg(gate).arg(state)
             .arg_usize(t).arg_usize(slot).arg_usize(nv).arg_usize(nk).arg_usize(kd)
             .arg_bits((1.0f32 / (kd as f32).sqrt()).to_bits() as u64)
@@ -808,11 +844,11 @@ mod foreign_call_lock {
     fn ids_resolve_to_foreign_families() {
         // 词表 ↔ driver 分派表同票(加票不加臂 = 此处红)
         for (op, want) in [
-            (ids::GDN_CHUNKED, owl_kernels::family::gdn_chunked::GDN_CHUNKED_FWD),
-            (ids::GDN_SCALAR, owl_kernels::family::gdn_scalar::GDN_SCALAR_FWD),
+            (SemanticKernel::GdnChunkedDelta, owl_kernels::family::gdn_chunked::GDN_CHUNKED_FWD),
+            (SemanticKernel::GdnScalarDelta, owl_kernels::family::gdn_scalar::GDN_SCALAR_FWD),
         ] {
             let pick = owl_kernels::driver::resolve(OpReq {
-                op, env: &env(), dt: owl_kernels::driver::DType::F16,
+                op: op.op_id(), env: &env(), dt: owl_kernels::driver::DType::F16,
                 shapes: &[], aux: &[], scalars: &[],
             });
             assert_eq!(pick.name, want);
@@ -837,7 +873,7 @@ mod foreign_call_lock {
 
         // 解释器 Call 臂同款:pick → foreign sig kernel → lower_kernel
         let pick = owl_kernels::driver::resolve(OpReq {
-            op: ids::GDN_CHUNKED, env: &env(), dt: owl_kernels::driver::DType::F16,
+            op: SemanticKernel::GdnChunkedDelta.op_id(), env: &env(), dt: owl_kernels::driver::DType::F16,
             shapes: &[], aux: &[], scalars: &[],
         });
         let kernel = crate::kernel::Kernel::new(pick.name, "")
@@ -876,7 +912,7 @@ mod foreign_call_lock {
         let g = TensorOps::of_block(4, Dtype::F32, vec![32, 8]);
         let beta = TensorOps::of_block(5, Dtype::F32, vec![32, 8]);
         let state = TensorOps::of_block(6, Dtype::F32, vec![2, 8, 64, 64]);
-        let node = TensorOps::call(ids::GDN_SCALAR)
+        let node = TensorOps::call(SemanticKernel::GdnScalarDelta)
             .arg(&q).arg(&k).arg(&v).arg(&g).arg(&beta).arg(&state)
             .arg_usize(32).arg_usize(1).arg_usize(1)
             .arg_usize(8).arg_usize(4).arg_usize(64)
@@ -884,7 +920,7 @@ mod foreign_call_lock {
             .with_shape(Dtype::F16, vec![32, 8, 64]);
 
         let pick = owl_kernels::driver::resolve(OpReq {
-            op: ids::GDN_SCALAR, env: &env(), dt: owl_kernels::driver::DType::F32,
+            op: SemanticKernel::GdnScalarDelta.op_id(), env: &env(), dt: owl_kernels::driver::DType::F32,
             shapes: &[], aux: &[], scalars: &[],
         });
         let kernel = crate::kernel::Kernel::new(pick.name, "")
