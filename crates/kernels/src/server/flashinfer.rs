@@ -6,13 +6,13 @@
 
 use crate::contract::{Bytes, LaunchMsg, OpError, OpId};
 use crate::device::{LaunchVal, ScratchBuf};
-use crate::registry::RunEnv;
+
 use crate::family::flashinfer::{
     owl_fi_prefill_plan, owl_fi_prefill_run, owl_fi_prefill_run_fp8kv,
     FI_FLOAT_WS_BYTES, FI_HOST_STAGING_BYTES, FI_INT_WS_BYTES,
 };
 use crate::client::flashinfer::{parse_prefill, PREFILL_FI};
-use crate::registry::FamilyRuntime;
+use crate::registry::KernelSpec;
 
 #[derive(Clone, Copy, PartialEq)]
 struct PlanKey {
@@ -48,7 +48,7 @@ impl FiRuntime {
     pub const N_FP8KV: &'static str = "flashinfer_prefill_paged_fp8kv";
 }
 
-impl FamilyRuntime for FiRuntime {
+impl KernelSpec for FiRuntime {
     fn id(&self) -> OpId {
         OpId(PREFILL_FI)
     }
@@ -61,19 +61,20 @@ impl FamilyRuntime for FiRuntime {
         crate::contract::Linkage::StaticLib
     }
 
-    fn init(&mut self, env: &mut RunEnv) -> Result<(), OpError> {
+    fn validate(&self) -> Result<(), OpError> { Ok(()) }
+    fn init(&mut self, res: &mut dyn crate::device::DeviceRes, exec: &mut crate::device::Exec) -> Result<(), OpError> {
         if self.float_ws.is_some() {
             return Ok(());
         }
-        self.float_ws = Some(env.res.alloc(FI_FLOAT_WS_BYTES, "fi.float_ws")?);
-        self.int_ws = Some(env.res.alloc(FI_INT_WS_BYTES, "fi.int_ws")?);
+        self.float_ws = Some(res.alloc(FI_FLOAT_WS_BYTES, "fi.float_ws")?);
+        self.int_ws = Some(res.alloc(FI_INT_WS_BYTES, "fi.int_ws")?);
         Ok(())
     }
 
-    fn run(&mut self, msg: &LaunchMsg, env: &mut RunEnv) -> Result<Bytes, OpError> {
+    fn run(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {
         let call = parse_prefill(msg)?;
         let r = |b: &crate::client::flashinfer::BlockRef| {
-            env.res.resolve(&Bytes { id: b.id, len: 0 }).map(|p| p + b.byte_offset)
+            res.resolve(&Bytes { id: b.id, len: 0 }).map(|p| p + b.byte_offset)
         };
         let q = r(&call.q)?;
         let kc = r(&call.kc_fi)?;
@@ -92,7 +93,7 @@ impl FamilyRuntime for FiRuntime {
             op: PREFILL_FI.into(),
             detail: "workspace 未装配".into(),
         })?;
-        let stream = env.res.stream()?;
+        let stream = res.stream()?;
 
         // plan(host,每形状一次;键 = 形状七元组)
         let key = PlanKey {

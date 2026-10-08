@@ -129,7 +129,7 @@ fn cublas_runtime_matches_host_matmul() {
 
     let scale = (1.0f64 / hidden as f64).to_bits() as u64;
     let msg = LaunchMsg {
-        kernel: owl_kernels::contract::KernelSpec {
+        kernel: owl_kernels::contract::KernelSource {
             name: owl_kernels::client::cublas::GEMM_F16.to_string(),
             source: String::new(),
         },

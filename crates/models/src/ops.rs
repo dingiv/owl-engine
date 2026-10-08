@@ -9,7 +9,7 @@
 //! = owl-kernels cu/;2026-09-25 垫子层裁决)。用户自定义 kernel 走
 //! `TensorOps::of(Kernel)` 直带源码(不经注册表,组合面逃生舱)。
 
-use crate::contract::{Arg, Bytes, KernelSpec, LaunchMsg};
+use crate::contract::{Arg, Bytes, KernelSource, LaunchMsg};
 use crate::kernel::Kernel;
 
 pub use owl_kernels::driver::OpId;
@@ -100,6 +100,121 @@ pub enum KernelArg {
 }
 
 // ============================================================================
+// §1.5 KernelCall —— 声明期槽序状态机(E1/E2 缺口闭环,2026-10-12)
+// ============================================================================
+//
+// sig 来自登记表(单源;**零 sig 字面量**),逐 token 消费:
+// - .t()  消费一个 T 槽(挂张量父;out 槽自动跳过)
+// - .sz()/.i32()/.f32() 消费对应宽度标量槽(E1 宽度错位:方法即宽度)
+// - build():全消费断言(缺项/溢出 = 声明期 panic,非 eval 期)
+//
+// 配对要求(E1/E2 的杜绝)从「人眼对 sig」变成「状态机不放行」。
+
+/// 进行中的 native kernel 声明(槽序状态机)
+pub struct KernelCall {
+    node: crate::tensor::TensorOps,
+    toks: Vec<&'static str>,
+    pos: usize,
+    out_pos: usize,
+    name: &'static str,
+}
+
+fn kernel_call_launch(name: &'static str, launch: crate::kernel::Kernel) -> KernelCall {
+    let e = crate::kernel::lookup(name).unwrap_or_else(|| panic!("kernel_call: {name} 未登记"));
+    let toks: Vec<&'static str> = e.args.split(',').collect();
+    // out 保留位:显式 O,或(无 O 时)末位 T
+    let out_pos = toks
+        .iter()
+        .position(|t| *t == "O")
+        .unwrap_or(toks.len().saturating_sub(1));
+    KernelCall {
+        node: crate::tensor::TensorOps::of(launch),
+        toks,
+        pos: 0,
+        out_pos,
+        name: e.name,
+    }
+}
+
+/// 登记表 kernel 声明(自动 1D 网格)
+pub fn kernel_call(name: &'static str) -> KernelCall {
+    kernel_call_launch(name, crate::kernel::kernel(name))
+}
+
+/// 登记表 kernel 声明(显式网格;行核 embed/rope/attn 等)
+pub fn kernel_call_with(
+    name: &'static str,
+    grid: (u32, u32, u32),
+    block: (u32, u32, u32),
+    shared_mem: u32,
+) -> KernelCall {
+    kernel_call_launch(name, crate::kernel::kernel_with(name, grid, block, shared_mem))
+}
+
+impl KernelCall {
+    fn consume(&mut self, kind: &str) {
+        if self.pos == self.out_pos {
+            self.pos += 1; // out 槽由 eval 追加,自动跳过
+        }
+        let tok = self
+            .toks
+            .get(self.pos)
+            .unwrap_or_else(|| panic!("{}: 槽序溢出(已消费 {} 个,期望 {kind})", self.name, self.pos));
+        assert!(
+            *tok == kind,
+            "{}: 第 {} 槽期望 {kind} 实得 {tok}(E1 宽度/类型错位,声明期拦截)",
+            self.name,
+            self.pos + 1
+        );
+        self.pos += 1;
+    }
+
+    /// T 槽(张量父;设备指针)
+    pub fn t(mut self, t: &crate::tensor::TensorOps) -> Self {
+        self.consume("T");
+        self.node = self.node.arg(t);
+        self
+    }
+
+    /// sz 标量(8B;size_t 形参)
+    pub fn sz(mut self, v: usize) -> Self {
+        self.consume("sz");
+        self.node = self.node.arg_usize(v);
+        self
+    }
+
+    /// i32 标量(4B)
+    pub fn i32(mut self, v: i32) -> Self {
+        self.consume("i32");
+        self.node = self.node.arg_i32(v);
+        self
+    }
+
+    /// f32 标量(4B)
+    pub fn f32(mut self, v: f32) -> Self {
+        self.consume("f32");
+        self.node = self.node.arg_f32(v);
+        self
+    }
+
+    /// 全消费断言(out 槽由 eval 追加,不计)+ 产出节点
+    pub fn build(self) -> crate::tensor::TensorOps {
+        let mut pos = self.pos;
+        if pos == self.out_pos {
+            pos += 1;
+        }
+        assert!(
+            pos == self.toks.len(),
+            "{}: 声明未消费完(pos {}/{};E2 断链类,声明期拦截)",
+            self.name,
+            pos,
+            self.toks.len()
+        );
+        self.node
+    }
+}
+
+// ============================================================================
 // §2 语义 Op 枚举
 // ============================================================================
 
@@ -157,6 +272,8 @@ pub enum Op {
     /// 解释器:CPU = 结构化"需 GPU server";GPU = 懒编译(源哈希缓存)+ 发射。
     /// 参数槽有序:T(张量依赖)/ 标量;归约时张量参数先入账。
     Kernel { kernel: Kernel },
+    /// 胖算子(kernels 侧 struct;validate/wire 由算子自带,interpreter 强制)
+    Spec { spec: std::sync::Arc<dyn owl_kernels::contract::KernelSpec> },
 
     // ---- 状态节点(唯一显式副作用;SSA 外形,物理原地由 server 解释)----
     /// KV 写槽:声明"本节目写 kv manager 的这些格"——
@@ -209,8 +326,8 @@ impl PlanNode for crate::tensor::TensorOps {
 // §4 lower 动作表:具名算子 → LaunchMsg(唯一翻译通道)
 // ============================================================================
 
-fn spec(name: &'static str) -> KernelSpec {
-    KernelSpec { name: name.to_string(), source: crate::kernel::source(name).to_string() }
+fn spec(name: &'static str) -> KernelSource {
+    KernelSource { name: name.to_string(), source: crate::kernel::source(name).to_string() }
 }
 
 /// dtype 路由名(f16 基线 F2):`owl_<op>_<f32|f16>`;注册表缺条目 =
@@ -258,7 +375,7 @@ pub fn lower_gemm(
     LaunchMsg {
         // 核名 = 线契约常量(权威定义 owl-kernels::cublas::GEMM_F16 / GEMM_BF16;
         // models 不开 cublas feature,此处字面量对齐,测试互证)
-        kernel: KernelSpec {
+        kernel: KernelSource {
             name: if bf16 { "cublas_gemm_bf16".to_string() } else { "cublas_gemm_f16".to_string() },
             source: String::new(),
         },
@@ -488,7 +605,7 @@ pub fn lower_kernel(
         (kernel.launch.grid, kernel.launch.block, kernel.launch.shared_mem)
     };
     LaunchMsg {
-        kernel: KernelSpec { name: kernel.name.to_string(), source: kernel.source.to_string() },
+        kernel: KernelSource { name: kernel.name.to_string(), source: kernel.source.to_string() },
         args,
         grid,
         block,
@@ -523,4 +640,68 @@ pub fn argmax_f32idx(x: &crate::tensor::TensorOps, n: usize, offset: usize) -> c
     .arg_i32(n as i32)
     .arg_i32(offset as i32)
     .with_shape(Dtype::F32, vec![1])
+}
+
+
+#[cfg(test)]
+mod kernel_call_lock {
+    //! 声明期状态机锁(E1 宽度错位 / E2 断链)+ 与手摆链同构互证。
+
+    use super::*;
+    use crate::tensor::TensorOps;
+
+    #[test]
+    fn wire_matches_legacy_chain() {
+        // owl_narrow_strided_f16 sig = "T,sz,sz,sz,sz,T"
+        let q = TensorOps::of_block(1, crate::contract::Dtype::F16, vec![64]);
+        let kc = TensorOps::of_block(2, crate::contract::Dtype::F16, vec![64]);
+
+        // out 槽(末位 T)由 eval 追加,调用链不含
+        let new_node = kernel_call("owl_narrow_strided_f16")
+            .t(&q)
+            .sz(8)
+            .sz(4)
+            .sz(32)
+            .sz(2)
+            .build()
+            .with_shape(crate::contract::Dtype::F16, vec![64]);
+
+        let legacy = TensorOps::of(crate::kernel::Kernel::new("owl_narrow_strided_f16", ""))
+            .arg(&q)
+            .arg_usize(8)
+            .arg_usize(4)
+            .arg_usize(32)
+            .arg_usize(2)
+            .with_shape(crate::contract::Dtype::F16, vec![64]);
+
+        assert_eq!(new_node.parents.len(), legacy.parents.len(), "T 槽数漂移");
+        for (a, b) in new_node.parents.iter().zip(&legacy.parents) {
+            assert_eq!(a.id, b.id, "T 槽序漂移");
+        }
+        assert_eq!(new_node.args.len(), legacy.args.len(), "标量槽数漂移");
+        for (a, b) in new_node.args.iter().zip(&legacy.args) {
+            assert_eq!(format!("{a:?}"), format!("{b:?}"), "标量漂移");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "第 2 槽期望 i32 实得 sz(E1")]
+    fn width_mismatch_panics_at_declaration() {
+        // E1:sz 槽用 i32 顶(4B 顶 8B,参数空间错位类)—— 声明期拦截
+        let q = TensorOps::of_block(1, crate::contract::Dtype::F16, vec![64]);
+        let _ = kernel_call("owl_narrow_strided_f16").t(&q).i32(7);
+    }
+
+    #[test]
+    #[should_panic(expected = "声明未消费完")]
+    fn missing_slot_panics_at_build() {
+        // E2 断链类:少喂一个 sz 槽,build() 全消费断言拦
+        let q = TensorOps::of_block(1, crate::contract::Dtype::F16, vec![64]);
+        let _ = kernel_call("owl_narrow_strided_f16")
+            .t(&q)
+            .sz(8)
+            .sz(4)
+            .sz(32)
+            .build();
+    }
 }

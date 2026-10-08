@@ -11,7 +11,7 @@
 //! owl-backends(服务端面:DeviceRes 实现 + 算子 runtime)
 //! ```
 //!
-//! 迁入物 = 跨 crate 线格式(Dtype/Shape/GraphId/Bytes/KernelSpec/Arg/
+//! 迁入物 = 跨 crate 线格式(Dtype/Shape/GraphId/Bytes/KernelSource/Arg/
 //! LaunchMsg);留守 iface = 能力契约族(ModelError/PinnedRegion/
 //! DeviceClient —— 经 re-export 引用本模块,零破坏)。
 //!
@@ -74,7 +74,7 @@ impl Bytes {
 
 /// kernel 描述:入口名 + 源码。后端按 (源码哈希, 名) 懒编译缓存。
 #[derive(Clone, Debug)]
-pub struct KernelSpec {
+pub struct KernelSource {
     pub name: String,
     pub source: String,
 }
@@ -96,7 +96,7 @@ pub enum Arg {
 
 /// 发射消息
 pub struct LaunchMsg {
-    pub kernel: KernelSpec,
+    pub kernel: KernelSource,
     pub args: Vec<Arg>,
     pub grid: (u32, u32, u32),
     pub block: (u32, u32, u32),
@@ -226,4 +226,30 @@ impl InvariantBox {
     pub fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }
+}
+
+
+// ============================================================================
+// 胖算子契约(E1-E15 错误台账的代码级杜绝;2026-10-12 用户设计)
+// ============================================================================
+//
+// 每个**在用**算子在 kernels 里显式声明一个 struct(字段即参数,自带
+// 值域/配对校验逻辑),实现本 trait。interpreter 在发射前强制调用
+// [`KernelSpec::validate`],不通过 = interpreter 层结构化报错 —— model
+// 层使用者无感知,但毒参数到不了 GPU。
+
+/// 胖算子契约(实现者须 Debug;Op 节点 Clone/Debug 派生需要)
+pub trait KernelSpec: Send + Sync + std::fmt::Debug {
+    /// 线格式名(server 分派键;= 登记表登记名)
+    fn name(&self) -> &'static str;
+
+    /// 参数校验:值域/形状/正交位(interpreter 发射前强制)。
+    /// 违例 = `OpError::Contract`(带字段名与越界值)。
+    fn validate(&self) -> Result<(), OpError>;
+
+    /// 输出声明(dtype + shape;eval 按此 alloc 输出块)
+    fn out(&self) -> (Dtype, Shape);
+
+    /// 线格式组装(ins = T 槽,序 = 签名序;out 已由 eval 分配)
+    fn wire(&self, ins: &[Arg], out: &Bytes) -> LaunchMsg;
 }

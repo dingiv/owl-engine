@@ -57,7 +57,7 @@ async fn marlin_graph_dispatch_probe() {
     let dc = client.alloc(Dtype::F16, m * n).await.expect("c");
 
     let msg = |a: &owl_cuda::Bytes| LaunchMsg {
-        kernel: owl_cuda::KernelSpec { name: "marlin_gemm_w4a16".into(), source: String::new() },
+        kernel: owl_cuda::KernelSource { name: "marlin_gemm_w4a16".into(), source: String::new() },
         args: vec![
             Arg::Block { id: a.id },
             Arg::Block { id: db.id },
@@ -100,7 +100,7 @@ async fn marlin_graph_dispatch_probe() {
     let sentinel_out = client.alloc(Dtype::F32, 4).await.expect("sentinel out");
     let sentinel_in = client.alloc(Dtype::F32, 4).await.expect("sentinel in");
     client.launch(LaunchMsg {
-        kernel: owl_cuda::KernelSpec { name: "probe_add_f32".into(), source: r#"
+        kernel: owl_cuda::KernelSource { name: "probe_add_f32".into(), source: r#"
 extern "C" __global__ void probe_add_f32(
     const float* a, const float* b, float* out, const size_t n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -148,7 +148,7 @@ async fn cublas_graph_dispatch_probe() {
     let dc = client.alloc(Dtype::F16, nn * mm).await.expect("c");
 
     let msg = |a: &owl_cuda::Bytes| LaunchMsg {
-        kernel: owl_cuda::KernelSpec { name: "cublas_gemm_f16".into(), source: String::new() },
+        kernel: owl_cuda::KernelSource { name: "cublas_gemm_f16".into(), source: String::new() },
         args: vec![
             Arg::Block { id: x.id },
             Arg::Block { id: w.id },
@@ -186,7 +186,7 @@ extern "C" __global__ void probe_scale_f32(
     client.graph_begin().await.expect("graph_begin");
     let sentinel_out = client.alloc(Dtype::F32, 4).await.expect("sentinel out");
     client.launch(LaunchMsg {
-        kernel: owl_cuda::KernelSpec { name: "probe_scale_f32".into(), source: SCALE_CU.into() },
+        kernel: owl_cuda::KernelSource { name: "probe_scale_f32".into(), source: SCALE_CU.into() },
         args: vec![
             Arg::Block { id: x.id },
             Arg::F32(2.0),

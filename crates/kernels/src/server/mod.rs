@@ -18,10 +18,10 @@ pub mod gdn_scalar;
 #[cfg(feature = "marlin")]
 pub mod marlin;
 
-use crate::registry::FamilyRuntime;
+use crate::registry::KernelSpec;
 
 /// 全家族装配表(名字→runtime 的唯一住址;M5 manifest 门挂各家族 init)
-pub fn all_families() -> Vec<Box<dyn FamilyRuntime>> {
+pub fn all_families() -> Vec<Box<dyn KernelSpec>> {
     vec![
         Box::new(gdn_chunked::GdnChunkedRuntime::default()),
         Box::new(gdn_scalar::GdnScalarRuntime::default()),

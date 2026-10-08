@@ -615,11 +615,10 @@ impl GpuServer {
             let out = (|| -> Result<Bytes, String> {
                 let ctx = self.ctx.as_ref().ok_or("server 未上线")?;
                 let mut res = GpuRes { ctx, scratch: &mut self.scratch_ledger };
-                let mut env = owl_kernels::registry::RunEnv::new(&mut res, &mut self.exec);
                 self.registry
                     .as_mut()
                     .ok_or("算子注册表未装配")?
-                    .execute(&msg, &mut env)
+                    .execute(&msg, &mut res, &mut self.exec)
                     .map_err(|e| e.to_string())
             })()
             .map_err(ModelError::Msg);

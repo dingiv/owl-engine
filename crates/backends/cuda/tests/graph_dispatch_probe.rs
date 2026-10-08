@@ -9,7 +9,7 @@
 //! 另测同链 eager(host 直发)对照。
 
 use owl_cuda::{test_device_ordinal, DeviceClient as _, DeviceSelector, Dtype, GpuClient, GpuServer};
-use owl_iface::contract::{Arg, Bytes, KernelSpec, LaunchMsg, Shape};
+use owl_iface::contract::{Arg, Bytes, KernelSource, LaunchMsg, Shape};
 use std::time::Instant;
 
 const ADD_CU: &str = r#"
@@ -22,7 +22,7 @@ extern "C" __global__ void probe_add_f32(
 
 fn add_msg(a: &Bytes, b: &Bytes, out: &Bytes, n: usize) -> LaunchMsg {
     LaunchMsg {
-        kernel: KernelSpec { name: "probe_add_f32".into(), source: ADD_CU.into() },
+        kernel: KernelSource { name: "probe_add_f32".into(), source: ADD_CU.into() },
         args: vec![
             Arg::Block { id: a.id },
             Arg::Block { id: b.id },
@@ -38,7 +38,7 @@ fn add_msg(a: &Bytes, b: &Bytes, out: &Bytes, n: usize) -> LaunchMsg {
 
 fn add_msg_owned(a: &Bytes, b: &Bytes, out_id: u64, n: usize) -> LaunchMsg {
     LaunchMsg {
-        kernel: KernelSpec { name: "probe_add_f32".into(), source: ADD_CU.into() },
+        kernel: KernelSource { name: "probe_add_f32".into(), source: ADD_CU.into() },
         args: vec![
             Arg::Block { id: a.id },
             Arg::Block { id: b.id },
@@ -145,7 +145,7 @@ async fn graph_dispatch_rate_probe() {
         let nxt = alloc(&mut client, elems).await;
         let ki = i % k;
         let msg = LaunchMsg {
-            kernel: KernelSpec { name: format!("probe_add_d{ki}"), source: sources[ki].clone() },
+            kernel: KernelSource { name: format!("probe_add_d{ki}"), source: sources[ki].clone() },
             args: vec![
                 Arg::Block { id: cur.id },
                 Arg::Block { id: b.id },

@@ -66,7 +66,7 @@ fn marlin_launch(
     is_bf16: bool,
 ) -> LaunchMsg {
     LaunchMsg {
-        kernel: owl_cuda::KernelSpec {
+        kernel: owl_cuda::KernelSource {
             name: if is_bf16 { "marlin_gemm_w4a16_bf16" } else { "marlin_gemm_w4a16" }.into(),
             source: String::new(),
         },
@@ -367,7 +367,7 @@ fn marlin_awq_launch(
     g: usize,
 ) -> LaunchMsg {
     LaunchMsg {
-        kernel: owl_cuda::KernelSpec {
+        kernel: owl_cuda::KernelSource {
             name: owl_kernels::family::marlin::GEMM_W4A16_AWQ.into(),
             source: String::new(),
         },
@@ -496,7 +496,7 @@ async fn ct_repack_parity() {
         let dp = client.htod(Dtype::U32, &Shape::from(vec![packed.len()]), &le_i32(&packed)).await.expect("htod packed");
         let dout = client.alloc(Dtype::U32, b_ref.len()).await.expect("alloc out");
         let msg = LaunchMsg {
-            kernel: owl_cuda::KernelSpec {
+            kernel: owl_cuda::KernelSource {
                 name: "owl_ct_repack_u32".into(),
                 source: owl_kernels::sources::owl::CT_REPACK_U32.into(),
             },

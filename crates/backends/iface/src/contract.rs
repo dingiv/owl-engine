@@ -24,7 +24,7 @@ use std::future::Future;
 //    kernels 方向不变)。下方 re-export 保旧路径全量可用,零破坏。
 // ============================================================================
 
-pub use owl_kernels::contract::{numel, Arg, Bytes, Dtype, GraphId, KernelSpec, LaunchMsg, Shape};
+pub use owl_kernels::contract::{numel, Arg, Bytes, Dtype, GraphId, KernelSource, LaunchMsg, Shape};
 
 // ============================================================================
 // 错误面:server 回执族(词汇权威在 iface;后端必须能表达)

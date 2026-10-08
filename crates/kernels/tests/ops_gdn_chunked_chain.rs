@@ -16,7 +16,7 @@ use owl_kernels::server::gdn_chunked::GdnChunkedRuntime;
 use owl_kernels::contract::{Bytes, LaunchMsg, OpId};
 use owl_kernels::device::{DeviceRes, Exec, LaunchVal, ScratchBuf};
 use owl_kernels::client::gdn_chunked::GdnChunkedCall;
-use owl_kernels::registry::{FamilyRuntime, RunEnv};
+use owl_kernels::registry::KernelSpec;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use cudarc::driver::DevicePtrMut;
@@ -296,11 +296,8 @@ fn gdn_chunked_new_chain_matches_golden() {
         let msg: LaunchMsg = call.to_launch(out_b.clone());
 
         // ── 新链执行(init + run;Result 全链)──
-        {
-            let mut env = RunEnv::new(&mut res, &mut exec);
-            rt.init(&mut env).expect("runtime init");
-            rt.run(&msg, &mut env).expect("runtime run");
-        }
+        rt.init(&mut res, &mut exec).expect("runtime init");
+        rt.run(&msg, &mut res, &mut exec).expect("runtime run");
         res.stream.synchronize().expect("sync");
 
         // ── 对拍(o;宽/紧分级同金标测试)──

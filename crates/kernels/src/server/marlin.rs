@@ -3,10 +3,10 @@
 
 use crate::contract::{Bytes, LaunchMsg, OpError, OpId, Stage};
 use crate::device::LaunchVal;
-use crate::registry::RunEnv;
+
 use crate::family::marlin;
 use crate::client::marlin::{parse_gemm, GEMM_W4A16};
-use crate::registry::FamilyRuntime;
+use crate::registry::KernelSpec;
 
 /// marlin 家族(f16/AWQ/bf16 三名;一个 runtime 实例按名分派)
 #[derive(Default)]
@@ -18,7 +18,7 @@ impl MarlinRuntime {
     pub const N_BF16: &'static str = "marlin_gemm_w4a16_bf16";
 }
 
-impl FamilyRuntime for MarlinRuntime {
+impl KernelSpec for MarlinRuntime {
     fn id(&self) -> OpId {
         OpId(GEMM_W4A16)
     }
@@ -31,18 +31,19 @@ impl FamilyRuntime for MarlinRuntime {
         crate::contract::Linkage::StaticLib
     }
 
-    fn init(&mut self, _env: &mut RunEnv) -> Result<(), OpError> {
+    fn validate(&self) -> Result<(), OpError> { Ok(()) }
+    fn init(&mut self, _env: &mut dyn crate::device::DeviceRes, exec: &mut crate::device::Exec) -> Result<(), OpError> {
         Ok(()) // 纯 FFI 零句柄;链接期已解析
     }
 
-    fn run(&mut self, msg: &LaunchMsg, env: &mut RunEnv) -> Result<Bytes, OpError> {
+    fn run(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {
         // AWQ 臂:kU4 has_zp,7 块(独立 FFI);f16/bf16 走 6 块通用臂
         if msg.kernel.name == Self::N_AWQ {
-            return self.run_awq(msg, env);
+            return self.run_awq(msg, res, exec);
         }
         let call = parse_gemm(msg, msg.kernel.name == marlin::GEMM_W4A16_BF16)?;
         let r = |b: &crate::client::marlin::BlockRef| {
-            env.res.resolve(&Bytes { id: b.id, len: 0 }).map(|p| p + b.byte_offset)
+            res.resolve(&Bytes { id: b.id, len: 0 }).map(|p| p + b.byte_offset)
         };
         let a = r(&call.a)?;
         let b = r(&call.b)?;
@@ -50,8 +51,8 @@ impl FamilyRuntime for MarlinRuntime {
         let scales = r(&call.scales)?;
         let ws = r(&call.ws)?;
         let c_tmp = r(&call.c_tmp)?;
-        let dev = env.res.device_ordinal()?;
-        let stream = env.res.stream()?;
+        let dev = res.device_ordinal()?;
+        let stream = res.stream()?;
         // 排队即回执(fire-and-forget;marlin host launcher 入 COMPUTE 流)
         let rr = if call.bf16 {
             unsafe {
@@ -89,10 +90,10 @@ impl FamilyRuntime for MarlinRuntime {
 
 impl MarlinRuntime {
     /// AWQ kU4 臂(7 块;zeros 槽 FFI 实参位 4,ws 位 5,c_tmp 位 6)
-    fn run_awq(&mut self, msg: &LaunchMsg, env: &mut RunEnv) -> Result<Bytes, OpError> {
+    fn run_awq(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {
         let call = crate::client::marlin::parse_gemm_awq(msg)?;
         let r = |b: &crate::client::marlin::BlockRef| {
-            env.res.resolve(&Bytes { id: b.id, len: 0 }).map(|p| p + b.byte_offset)
+            res.resolve(&Bytes { id: b.id, len: 0 }).map(|p| p + b.byte_offset)
         };
         let a = r(&call.a)?;
         let b = r(&call.b)?;
@@ -106,8 +107,8 @@ impl MarlinRuntime {
         })?)?;
         let ws = r(&call.ws)?;
         let c_tmp = r(&call.c_tmp)?;
-        let dev = env.res.device_ordinal()?;
-        let stream = env.res.stream()?;
+        let dev = res.device_ordinal()?;
+        let stream = res.stream()?;
         let rr = unsafe {
             marlin::gemm_v2_awq_raw(
                 a as *const u16, b as *const i32, out as *mut u16,

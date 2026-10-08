@@ -20,7 +20,7 @@
 
 use owl_cuda::{
     test_device_ordinal, Arg, Bytes, Command, DeviceClient as _, DeviceSelector, Dtype, GpuClient,
-    GpuServer, KernelSpec, LaunchMsg, ModelError, Shape,
+    GpuServer, KernelSource, LaunchMsg, ModelError, Shape,
 };
 
 const SCALE_CU: &str = r#"
@@ -77,7 +77,7 @@ fn assert_all_close(got: &[f32], want: f32, ctx: &str) {
 /// 手工装配 scale 发射(槽序契约:标量按声明序,输出块固定最后)
 fn scale_msg(x: &Bytes, out: &Bytes, k: f32, n: usize) -> LaunchMsg {
     LaunchMsg {
-        kernel: KernelSpec { name: "owl_scale_f32".into(), source: SCALE_CU.into() },
+        kernel: KernelSource { name: "owl_scale_f32".into(), source: SCALE_CU.into() },
         args: vec![
             Arg::Block { id: x.id },
             Arg::F32(k),
@@ -326,7 +326,7 @@ async fn gpu_gemm_f16_matches_host() {
     let dw = client.htod(Dtype::F16, &Shape::from(vec![n, k]), &le_f16(&w)).await.expect("htod w");
     let dout = client.alloc(Dtype::F16, t * n).await.expect("alloc out");
     let msg = LaunchMsg {
-        kernel: KernelSpec { name: "cublas_gemm_f16".into(), source: String::new() },
+        kernel: KernelSource { name: "cublas_gemm_f16".into(), source: String::new() },
         args: vec![
             Arg::Block { id: da.id },
             Arg::Block { id: dw.id },

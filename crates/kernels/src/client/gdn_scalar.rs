@@ -123,7 +123,7 @@ impl GdnScalarCall {
             args.push(Arg::U64(v));
         }
         LaunchMsg {
-            kernel: crate::contract::KernelSpec { name: GDN_SCALAR.to_string(), source: String::new() },
+            kernel: crate::contract::KernelSource { name: GDN_SCALAR.to_string(), source: String::new() },
             args,
             grid: (0, 0, 0),
             block: (0, 0, 0),

@@ -19,11 +19,11 @@
 use cudarc::driver::{CudaFunction, PushKernelArg};
 use crate::contract::{Bytes, LaunchMsg, OpError, OpId};
 use crate::device::{DeviceRes, Exec, LaunchVal, ScratchBuf};
-use crate::registry::RunEnv;
+
 use crate::family::gdn_chunked::cubins;
 use crate::family::gdn_chunked::cubins::launch as LC;
 use crate::client::gdn_chunked::{GdnChunkedCall, GDN_CHUNKED};
-use crate::registry::FamilyRuntime;
+use crate::registry::KernelSpec;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -97,7 +97,7 @@ pub struct GdnChunkedRuntime {
     scratch: Scratch,
 }
 
-impl FamilyRuntime for GdnChunkedRuntime {
+impl KernelSpec for GdnChunkedRuntime {
     fn id(&self) -> OpId {
         OP
     }
@@ -107,7 +107,8 @@ impl FamilyRuntime for GdnChunkedRuntime {
     }
 
     /// boot 装配:六 cubin(符号逐一校验 = P4 门)+ cast nvrtc + setattr
-    fn init(&mut self, env: &mut RunEnv) -> Result<(), OpError> {
+    fn validate(&self) -> Result<(), OpError> { Ok(()) }
+    fn init(&mut self, res: &mut dyn crate::device::DeviceRes, exec: &mut crate::device::Exec) -> Result<(), OpError> {
         if self.loaded {
             return Ok(());
         }
@@ -120,7 +121,7 @@ impl FamilyRuntime for GdnChunkedRuntime {
             ("o", cubins::O, "chunk_fwd_kernel_o"),
         ];
         for (name, bytes, symbol) in table {
-            let f = env.exec.load_cubin(env.res, ASSET, bytes, symbol, OP)?;
+            let f = exec.load_cubin(res, ASSET, bytes, symbol, OP)?;
             self.fns.insert(name, f);
         }
         for sym in [
@@ -130,9 +131,8 @@ impl FamilyRuntime for GdnChunkedRuntime {
             "owl_state_kv_to_vk",
             "owl_state_vk_to_kv",
         ] {
-            let f = env
-                .exec
-                .load_nvrtc(env.res, CAST, crate::sources::attention::CAST, sym, OP)?;
+            let f = exec
+                .load_nvrtc(res, CAST, crate::sources::attention::CAST, sym, OP)?;
             self.fns.insert(sym, f);
         }
         for (name, sz) in [
@@ -147,7 +147,7 @@ impl FamilyRuntime for GdnChunkedRuntime {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn run(&mut self, msg: &LaunchMsg, env: &mut RunEnv) -> Result<Bytes, OpError> {
+    fn run(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {
         let (call, out) = GdnChunkedCall::parse(msg)?;
         let shape = call.shape();
         let t = shape.t as usize;
@@ -158,7 +158,6 @@ impl FamilyRuntime for GdnChunkedRuntime {
         let nt = t.div_ceil(64);
 
         // 拆借:res / exec / self 字段三方独立可变借
-        let RunEnv { res, exec } = env;
         let Self {
             fns,
             scratch: st,
@@ -172,29 +171,29 @@ impl FamilyRuntime for GdnChunkedRuntime {
         };
 
         // ── scratch 容量(扩容 = 坟场;几何 = 生产 realloc 同款)──
-        let g_cum = ensure_one(&mut st.g_cum, &mut st.grave, *res, t * hv * 4, "gdn.g_cum")?;
-        let a_buf = ensure_one(&mut st.a_buf, &mut st.grave, *res, t * hv * 64 * 4, "gdn.a")?;
-        let ai_buf = ensure_one(&mut st.ai_buf, &mut st.grave, *res, t * hv * 64 * 2, "gdn.ai")?;
-        let w = ensure_one(&mut st.w, &mut st.grave, *res, t * hv * kd * 2, "gdn.w")?;
-        let u = ensure_one(&mut st.u, &mut st.grave, *res, t * hv * vd * 2, "gdn.u")?;
+        let g_cum = ensure_one(&mut st.g_cum, &mut st.grave, res, t * hv * 4, "gdn.g_cum")?;
+        let a_buf = ensure_one(&mut st.a_buf, &mut st.grave, res, t * hv * 64 * 4, "gdn.a")?;
+        let ai_buf = ensure_one(&mut st.ai_buf, &mut st.grave, res, t * hv * 64 * 2, "gdn.ai")?;
+        let w = ensure_one(&mut st.w, &mut st.grave, res, t * hv * kd * 2, "gdn.w")?;
+        let u = ensure_one(&mut st.u, &mut st.grave, res, t * hv * vd * 2, "gdn.u")?;
         let h_buf =
-            ensure_one(&mut st.h_buf, &mut st.grave, *res, nt * hv * vd * kd * 2, "gdn.h_buf")?;
+            ensure_one(&mut st.h_buf, &mut st.grave, res, nt * hv * vd * kd * 2, "gdn.h_buf")?;
         let v_new =
-            ensure_one(&mut st.v_new, &mut st.grave, *res, t * hv * vd * 2, "gdn.v_new")?;
+            ensure_one(&mut st.v_new, &mut st.grave, res, t * hv * vd * 2, "gdn.v_new")?;
         if st.state_t.is_none() {
             st.state_t = Some(res.alloc(hv * kd * vd * 4, "gdn.state_t")?);
             st.state_out_t = Some(res.alloc(hv * kd * vd * 4, "gdn.state_out")?);
         }
         let state_t = st.state_t.as_ref().unwrap().ptr;
         let state_out = st.state_out_t.as_ref().unwrap().ptr;
-        let in_q = ensure_one(&mut st.in_q, &mut st.grave, *res, t * nk * kd * 2, "gdn.in_q")?;
-        let in_k = ensure_one(&mut st.in_k, &mut st.grave, *res, t * nk * kd * 2, "gdn.in_k")?;
-        let in_v = ensure_one(&mut st.in_v, &mut st.grave, *res, t * hv * vd * 2, "gdn.in_v")?;
+        let in_q = ensure_one(&mut st.in_q, &mut st.grave, res, t * nk * kd * 2, "gdn.in_q")?;
+        let in_k = ensure_one(&mut st.in_k, &mut st.grave, res, t * nk * kd * 2, "gdn.in_k")?;
+        let in_v = ensure_one(&mut st.in_v, &mut st.grave, res, t * hv * vd * 2, "gdn.in_v")?;
         let in_beta =
-            ensure_one(&mut st.in_beta, &mut st.grave, *res, t * hv * 2, "gdn.in_beta")?;
-        let in_g = ensure_one(&mut st.in_g, &mut st.grave, *res, t * hv * 4, "gdn.in_g")?;
+            ensure_one(&mut st.in_beta, &mut st.grave, res, t * hv * 2, "gdn.in_beta")?;
+        let in_g = ensure_one(&mut st.in_g, &mut st.grave, res, t * hv * 4, "gdn.in_g")?;
         let o_b16 =
-            ensure_one(&mut st.o_b16, &mut st.grave, *res, t * hv * vd * 2, "gdn.o_b16")?;
+            ensure_one(&mut st.o_b16, &mut st.grave, res, t * hv * vd * 2, "gdn.o_b16")?;
         st.t_cap = st.t_cap.max(t);
 
         // ── 输入解析(块句柄 → 设备指针)──
@@ -215,11 +214,11 @@ impl FamilyRuntime for GdnChunkedRuntime {
         let f16bf16 = f("owl_cast_f16_bf16")?;
         let bf16f16 = f("owl_cast_bf16_f16")?;
         let f16f32 = f("owl_cast_f16_f32")?;
-        cast_exec(*res, exec, &f16bf16, q_p, t * nk * kd, in_q)?;
-        cast_exec(*res, exec, &f16bf16, k_p, t * nk * kd, in_k)?;
-        cast_exec(*res, exec, &f16bf16, v_p, t * hv * vd, in_v)?;
-        cast_exec(*res, exec, &f16bf16, beta_p, t * hv, in_beta)?;
-        cast_exec(*res, exec, &f16f32, g_p, t * hv, in_g)?;
+        cast_exec(res, exec, &f16bf16, q_p, t * nk * kd, in_q)?;
+        cast_exec(res, exec, &f16bf16, k_p, t * nk * kd, in_k)?;
+        cast_exec(res, exec, &f16bf16, v_p, t * hv * vd, in_v)?;
+        cast_exec(res, exec, &f16bf16, beta_p, t * hv, in_beta)?;
+        cast_exec(res, exec, &f16f32, g_p, t * hv, in_g)?;
 
         // ── meta 表驻留((T,NT) 键;handler 同款布局 [cu|coff|idx])──
         let (cu_p, coff_p, idx_p) = {
@@ -244,7 +243,7 @@ impl FamilyRuntime for GdnChunkedRuntime {
         let vk_kv = f("owl_state_vk_to_kv")?;
         {
             exec.launch(
-                *res, OP, &kv_vk, "state_kv_to_vk", (vd as u32, hv as u32, 1),
+                res, OP, &kv_vk, "state_kv_to_vk", (vd as u32, hv as u32, 1),
                 (kd as u32, 1, 1), 0,
                 &[LaunchVal::Ptr(state_slot_p), LaunchVal::Ptr(state_t),
                   LaunchVal::I32(kd as i32), LaunchVal::I32(vd as i32)],
@@ -254,7 +253,7 @@ impl FamilyRuntime for GdnChunkedRuntime {
         // ── 1. cumsum:raw g(f32 镜像)→ g_cum ──
         let f_cum = f("cumsum")?;
         exec.launch(
-            *res, OP, &f_cum, "cumsum", (nt as u32, hv as u32, 1),
+            res, OP, &f_cum, "cumsum", (nt as u32, hv as u32, 1),
             (32 * LC::CUMSUM_WARPS, 1, 1), LC::CUMSUM_SHARED,
             &[LaunchVal::Ptr(in_g), LaunchVal::Ptr(g_cum), LaunchVal::Ptr(cu_p),
               LaunchVal::Ptr(idx_p), LaunchVal::I32(ti),
@@ -264,7 +263,7 @@ impl FamilyRuntime for GdnChunkedRuntime {
         // ── 2. kkt:k/beta/g_cum → A(f32)【g 语义律:吃 cumsum 产物】──
         let f_kkt = f("kkt")?;
         exec.launch(
-            *res, OP, &f_kkt, "kkt", (nt as u32, hv as u32, 1),
+            res, OP, &f_kkt, "kkt", (nt as u32, hv as u32, 1),
             (32 * LC::KKT_WARPS, 1, 1), LC::KKT_SHARED,
             &[LaunchVal::Ptr(in_k), LaunchVal::Ptr(in_beta), LaunchVal::Ptr(g_cum),
               LaunchVal::Ptr(a_buf), LaunchVal::Ptr(cu_p), LaunchVal::Ptr(idx_p),
@@ -274,7 +273,7 @@ impl FamilyRuntime for GdnChunkedRuntime {
         // ── 3. merge:solve_tril A → Ai(bf16 字节)──
         let f_merge = f("merge")?;
         exec.launch(
-            *res, OP, &f_merge, "merge", (nt as u32, hv as u32, 1),
+            res, OP, &f_merge, "merge", (nt as u32, hv as u32, 1),
             (32 * LC::MERGE_WARPS, 1, 1), LC::MERGE_SHARED,
             &[LaunchVal::Ptr(a_buf), LaunchVal::Ptr(ai_buf), LaunchVal::Ptr(cu_p),
               LaunchVal::Ptr(idx_p), LaunchVal::I32(ti),
@@ -284,7 +283,7 @@ impl FamilyRuntime for GdnChunkedRuntime {
         // ── 4. wu:k/v/beta/Ai/g_cum → w/u(bf16)──
         let f_wu = f("wu")?;
         exec.launch(
-            *res, OP, &f_wu, "wu", (nt as u32, hv as u32, 1),
+            res, OP, &f_wu, "wu", (nt as u32, hv as u32, 1),
             (32 * LC::WU_WARPS, 1, 1), LC::WU_SHARED,
             &[LaunchVal::Ptr(in_k), LaunchVal::Ptr(in_v), LaunchVal::Ptr(in_beta),
               LaunchVal::Ptr(w), LaunchVal::Ptr(u), LaunchVal::Ptr(ai_buf),
@@ -295,7 +294,7 @@ impl FamilyRuntime for GdnChunkedRuntime {
         // ── 5. h(SASS 审计序;grid 二维)──
         let f_h = f("h")?;
         exec.launch(
-            *res, OP, &f_h, "h", ((vd as u32).div_ceil(LC::H_BV), hv as u32, 1),
+            res, OP, &f_h, "h", ((vd as u32).div_ceil(LC::H_BV), hv as u32, 1),
             (32 * LC::H_WARPS, 1, 1), LC::H_SHARED,
             &[LaunchVal::Ptr(in_k), LaunchVal::Ptr(u), LaunchVal::Ptr(w),
               LaunchVal::Ptr(v_new), LaunchVal::Ptr(g_cum), LaunchVal::Ptr(h_buf),
@@ -307,7 +306,7 @@ impl FamilyRuntime for GdnChunkedRuntime {
         // ── 6. 状态转置回:fork [V,K] → 池 [K,V] ──
         {
             exec.launch(
-                *res, OP, &vk_kv, "state_vk_to_kv", (vd as u32, hv as u32, 1),
+                res, OP, &vk_kv, "state_vk_to_kv", (vd as u32, hv as u32, 1),
                 (kd as u32, 1, 1), 0,
                 &[LaunchVal::Ptr(state_out), LaunchVal::Ptr(state_slot_p),
                   LaunchVal::I32(kd as i32), LaunchVal::I32(vd as i32)],
@@ -317,7 +316,7 @@ impl FamilyRuntime for GdnChunkedRuntime {
         // ── 7. o:q/k/v_new/h_buf/g_cum → o_b16(bf16)──
         let f_o = f("o")?;
         exec.launch(
-            *res, OP, &f_o, "o", ((vd as u32).div_ceil(LC::O_BV), nt as u32, hv as u32),
+            res, OP, &f_o, "o", ((vd as u32).div_ceil(LC::O_BV), nt as u32, hv as u32),
             (32 * LC::O_WARPS, 1, 1), LC::O_SHARED,
             &[LaunchVal::Ptr(in_q), LaunchVal::Ptr(in_k), LaunchVal::Ptr(v_new),
               LaunchVal::Ptr(h_buf), LaunchVal::Ptr(g_cum), LaunchVal::Ptr(o_b16),
@@ -326,7 +325,7 @@ impl FamilyRuntime for GdnChunkedRuntime {
         )?;
 
         // ── 8. cast-out:o(bf16)→ out(f16;层侧纯 f16 契约)──
-        cast_exec(*res, exec, &bf16f16, o_b16, t * hv * vd, out_p)?;
+        cast_exec(res, exec, &bf16f16, o_b16, t * hv * vd, out_p)?;
 
         Ok(out)
     }

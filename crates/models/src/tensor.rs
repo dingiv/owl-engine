@@ -270,6 +270,22 @@ impl TensorOps {
         }
     }
 
+    /// 胖算子声明(kernels::contract::KernelSpec;validate 由 interpreter
+    /// 发射前强制,失败 = interpreter 层结构化报错)
+    pub fn spec(
+        spec: std::sync::Arc<dyn owl_kernels::contract::KernelSpec>,
+        parents: Vec<TensorOps>,
+        dtype: Dtype,
+        shape: Shape,
+    ) -> TensorOps {
+        let mut out = Self::of_block(0, dtype, shape.clone());
+        out.op = crate::ops::Op::Spec { spec };
+        for p in &parents {
+            out = out.arg(p);
+        }
+        out.with_shape(dtype, shape)
+    }
+
     /// 语义调用声明(**model 层面向解释器的唯一新语句**,Driver 立项):
     /// `TensorOps::call(ops::ids::GDN_GATING).arg(..).with_shape(..)`
     /// 零核名/零发射参数 —— 名/变体/grid/block/smem 由解释器执行期经

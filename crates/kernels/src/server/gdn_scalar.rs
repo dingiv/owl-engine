@@ -5,10 +5,10 @@
 
 use crate::contract::{Bytes, InvariantBox, LaunchMsg, OpError, OpId, Stage};
 use crate::device::{LaunchVal, ScratchBuf};
-use crate::registry::RunEnv;
+
 use crate::family::gdn_scalar::cubin;
 use crate::client::gdn_scalar::{GdnScalarCall, GDN_SCALAR};
-use crate::registry::FamilyRuntime;
+use crate::registry::KernelSpec;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -28,7 +28,7 @@ pub struct GdnScalarRuntime {
     t_cap: usize,
 }
 
-impl FamilyRuntime for GdnScalarRuntime {
+impl KernelSpec for GdnScalarRuntime {
     fn id(&self) -> OpId {
         OP
     }
@@ -37,27 +37,27 @@ impl FamilyRuntime for GdnScalarRuntime {
         crate::contract::Linkage::AotCubin
     }
 
-    fn init(&mut self, env: &mut RunEnv) -> Result<(), OpError> {
+    fn validate(&self) -> Result<(), OpError> { Ok(()) }
+    fn init(&mut self, res: &mut dyn crate::device::DeviceRes, exec: &mut crate::device::Exec) -> Result<(), OpError> {
         if self.loaded {
             return Ok(());
         }
         self.k = Some(
-            env.exec.load_cubin(env.res, ASSET, cubin::CHUNK_SCALAR_F32, cubin::KERNEL_F32, OP)?,
+            exec.load_cubin(res, ASSET, cubin::CHUNK_SCALAR_F32, cubin::KERNEL_F32, OP)?,
         );
-        self.cast_f32_f16 = Some(env.exec.load_nvrtc(
-            env.res, CAST,
+        self.cast_f32_f16 = Some(exec.load_nvrtc(
+            res, CAST,
             crate::sources::attention::CAST,
             "owl_cast_f32_f16", OP,
         )?);
-        self.soff = Some(env.res.alloc(2 * 4, "gdn_scalar.soff")?);
+        self.soff = Some(res.alloc(2 * 4, "gdn_scalar.soff")?);
         self.loaded = true;
         Ok(())
     }
 
-    fn run(&mut self, msg: &LaunchMsg, env: &mut RunEnv) -> Result<Bytes, OpError> {
+    fn run(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {
         let (call, out) = GdnScalarCall::parse(msg)?;
         // 拆借置顶(res/exec 之后全走局部;env 不再触碰)
-        let RunEnv { res, exec } = env;
         let shape = call.shape();
         let t = shape.t as usize;
         let hv = shape.nv as usize;

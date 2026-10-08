@@ -17,7 +17,7 @@
 //! ⚠️ g 语义律:本面只产 **raw gate**;cumsum 产物是运行时私有态,
 //! 客户端不可达(类型面堵死 raw/cumsum 混喂)。
 
-use crate::contract::{Arg, Bytes, LaunchMsg, OpError, KernelSpec};
+use crate::contract::{Arg, Bytes, LaunchMsg, OpError, KernelSource};
 
 /// 家族名(全库唯一字面量住址;models 经 [`GDN_CHUNKED`] 引用)
 pub const GDN_CHUNKED: &str = "gdn_chunked_delta_rule_fwd";
@@ -173,7 +173,7 @@ impl GdnChunkedCall {
         args.push(Arg::Block { id: out.id });
         args.extend(self.scalar_args());
         LaunchMsg {
-            kernel: KernelSpec { name: GDN_CHUNKED.to_string(), source: String::new() },
+            kernel: KernelSource { name: GDN_CHUNKED.to_string(), source: String::new() },
             args,
             grid: (0, 0, 0), // foreign 面:grid/block 由 runtime 单源(核内常量)
             block: (0, 0, 0),

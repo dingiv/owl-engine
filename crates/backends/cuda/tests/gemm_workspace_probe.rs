@@ -7,7 +7,7 @@ use owl_cuda::{test_device_ordinal, Arg, DeviceClient as _, DeviceSelector, Dtyp
 /// 槽序契约(cublas.rs):[T a, T b, T out, sz m, sz k, sz n, sz nt]
 fn gemm_launch(a: &owl_cuda::Bytes, w: &owl_cuda::Bytes, o: &owl_cuda::Bytes, tokens: usize, k: usize, feats: usize, nt: bool) -> LaunchMsg {
     LaunchMsg {
-        kernel: owl_cuda::KernelSpec { name: "cublas_gemm_f16".into(), source: String::new() },
+        kernel: owl_cuda::KernelSource { name: "cublas_gemm_f16".into(), source: String::new() },
         args: vec![
             Arg::Block { id: a.id },
             Arg::Block { id: w.id },

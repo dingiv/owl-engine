@@ -426,7 +426,7 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
             scalars: &[],
         });
         face.launch(crate::contract::LaunchMsg {
-            kernel: crate::contract::KernelSpec {
+            kernel: crate::contract::KernelSource {
                 name: pick.name.to_string(),
                 source: crate::kernel::source(pick.name).to_string(),
             },

@@ -36,7 +36,7 @@ pub mod signal;
 
 // 契约面顶层再导出(前后端共同依赖;见 contract 模块文档)
 pub use contract::{
-    numel, Arg, Bytes, DeviceClient, Dtype, GraphId, KernelSpec, LaunchMsg, ModelError, Shape,
+    numel, Arg, Bytes, DeviceClient, Dtype, GraphId, KernelSource, LaunchMsg, ModelError, Shape,
 };
 
 /// 缓冲令牌:(id, generation) 二元组。词汇权威在 iface(A1:

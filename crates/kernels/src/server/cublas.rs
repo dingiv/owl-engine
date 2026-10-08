@@ -5,9 +5,9 @@
 
 use crate::contract::{Bytes, LaunchMsg, OpError, OpId};
 use crate::device::LaunchVal;
-use crate::registry::RunEnv;
+
 use crate::client::cublas::{parse_gemm, GEMM_BF16, GEMM_F16};
-use crate::registry::FamilyRuntime;
+use crate::registry::KernelSpec;
 use crate::family::cublas::OwlCublas;
 
 
@@ -21,7 +21,7 @@ impl Default for CublasRuntime {
     }
 }
 
-impl FamilyRuntime for CublasRuntime {
+impl KernelSpec for CublasRuntime {
     fn id(&self) -> OpId {
         OpId(GEMM_F16)
     }
@@ -34,30 +34,31 @@ impl FamilyRuntime for CublasRuntime {
         crate::contract::Linkage::StaticLib
     }
 
-    fn init(&mut self, env: &mut RunEnv) -> Result<(), OpError> {
+    fn validate(&self) -> Result<(), OpError> { Ok(()) }
+    fn init(&mut self, res: &mut dyn crate::device::DeviceRes, exec: &mut crate::device::Exec) -> Result<(), OpError> {
         if self.blas.is_some() {
             return Ok(());
         }
-        let stream = env.res.stream()?;
+        let stream = res.stream()?;
         let blas = OwlCublas::new(stream.clone())
             .map_err(|e| OpError::Asset { op: GEMM_F16.into(), detail: format!("cublas handle: {e}") })?;
         // C1 刀1.5 律随迁:私有 4MB 工作区 SetWorkspace 预绑(捕获期 gemv
         // splitK 不走池分配,免 MEM_ALLOC/FREE 节点);账本经 res.alloc。
         const BLAS_WS_BYTES: usize = 4 << 20;
-        let ws = env.res.alloc(BLAS_WS_BYTES, "cublas.ws")?;
+        let ws = res.alloc(BLAS_WS_BYTES, "cublas.ws")?;
         // [诊断] 临时禁用:SetWorkspace 是否为 k-probe 毒源
         let _ = ws;
         self.blas = Some(blas);
         Ok(())
     }
 
-    fn run(&mut self, msg: &LaunchMsg, env: &mut RunEnv) -> Result<Bytes, OpError> {
+    fn run(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {
         // 变体(f16/bf16)按【核名】路由;线内 nt sz = cublas 转置标志
         let bf16 = msg.kernel.name == GEMM_BF16;
         let call = parse_gemm(msg)?;
-        let a = env.res.resolve(&Bytes { id: call.a.id, len: 0 })? + call.a.byte_offset;
-        let b = env.res.resolve(&Bytes { id: call.b.id, len: 0 })? + call.b.byte_offset;
-        let out = env.res.resolve(&Bytes { id: call.out.id, len: 0 })? + call.out.byte_offset;
+        let a = res.resolve(&Bytes { id: call.a.id, len: 0 })? + call.a.byte_offset;
+        let b = res.resolve(&Bytes { id: call.b.id, len: 0 })? + call.b.byte_offset;
+        let out = res.resolve(&Bytes { id: call.out.id, len: 0 })? + call.out.byte_offset;
         let blas = self.blas.as_ref().ok_or_else(|| OpError::Asset {
             op: GEMM_F16.into(),
             detail: "cublas 句柄未装配".into(),
