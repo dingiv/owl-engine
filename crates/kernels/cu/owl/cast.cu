@@ -30,3 +30,23 @@ extern "C" __global__ void owl_cast_bf16_f16(const __nv_bfloat16 *__restrict__ x
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = __float2half(__bfloat162float(x[i]));
 }
+
+// GDN 状态转置(2026-10-11 fork-bf16 全家桶配套):owl 池 [HV,K,V] ↔
+// fork h0/ht [HV,V,K](f32;KD=VD=128)。grid (v_dim, hv),block (k_dim):
+// 写侧合并，读侧列距 —— 半保守转置，3.1MB 双向 ~30µs 量级(672 次/请求
+// ≈ 20ms,对应省下的 5.5× GDN 核时间可忽略)。
+extern "C" __global__ void owl_state_kv_to_vk(const float *__restrict__ in,
+                                            float *__restrict__ out,
+                                            int k_dim, int v_dim) {
+    // out[(hv*V + v)*K + k] = in[(hv*K + k)*V + v]
+    out[(blockIdx.y * v_dim + blockIdx.x) * k_dim + threadIdx.x] =
+        in[(blockIdx.y * k_dim + threadIdx.x) * v_dim + blockIdx.x];
+}
+
+extern "C" __global__ void owl_state_vk_to_kv(const float *__restrict__ in,
+                                            float *__restrict__ out,
+                                            int k_dim, int v_dim) {
+    // 逆:in [HV,V,K] → out [HV,K,V]
+    out[(blockIdx.y * k_dim + threadIdx.x) * v_dim + blockIdx.x] =
+        in[(blockIdx.y * v_dim + blockIdx.x) * k_dim + threadIdx.x];
+}

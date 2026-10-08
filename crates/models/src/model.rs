@@ -85,11 +85,15 @@ impl Model {
     /// 准备容器(纯元数据;零数据零副作用)。keys = 检查点键名约定
     /// (默认 [`LlamaFamily`];Qwen3.5 等特有约定由 specs 传入)。
     /// `plan` = 量化计划构造期注入(禁 enable_* 可变后置范式);
-    /// **embed/lm_head(tied)不量化**(质量敏感;输出头保持 f16)。
+    /// `head_plan` = untied lm_head 量化计划(C1,2026-10-11:HyperQwen
+    /// 实证 int4 lm_head +0.6%PPL/GSM8K 不变,推翻旧“输出头不量化”
+    /// 裁决;embed 表恒 f16 —— 查表增益微小,int8 化另立项)。tied
+    /// 模型 head_plan 无效(lm_head 复用 w)。
     pub fn new(
         spec: &ModelSpec,
         keys: impl KeyConvention + Send + Sync + 'static,
         plan: QuantPlan,
+        head_plan: QuantPlan,
     ) -> Model {
         let layers = spec
             .layer_types
@@ -107,7 +111,7 @@ impl Model {
         let embed = if spec.tied {
             Embedding::new(spec.vocab, spec.hidden)
         } else {
-            Embedding::new_untied(spec.vocab, spec.hidden)
+            Embedding::new_untied_quant(spec.vocab, spec.hidden, head_plan)
         };
         Model {
             embed,
@@ -490,7 +494,12 @@ mod tests {
     #[tokio::test]
     async fn loads_checkpoint_keys_and_declares() {
         let mut face = owl_cpu::CpuFace::new();
-        let model = Model::new(&spec(), LlamaFamily::new("model.language_model"), QuantPlan::F16);
+        let model = Model::new(
+            &spec(),
+            LlamaFamily::new("model.language_model"),
+            QuantPlan::F16,
+            QuantPlan::F16,
+        );
         crate::interpreters::eval_load(&model, &mut face, &checkpoint_src(), &Default::default())
             .await
             .expect("model.eval_load(C10 声明路径)");
@@ -806,7 +815,12 @@ mod tests {
             skip_note();
             return;
         }
-        let model = Model::new(&spec(), LlamaFamily::new("model.language_model"), QuantPlan::F16);
+        let model = Model::new(
+            &spec(),
+            LlamaFamily::new("model.language_model"),
+            QuantPlan::F16,
+            QuantPlan::F16,
+        );
         let src = checkpoint_src();
         let mut gpu = gpu_client().await;
         crate::interpreters::eval_load(&model, &mut gpu, &src, &Default::default())
@@ -925,7 +939,12 @@ mod tests {
             return;
         }
         let t_len = 4usize;
-        let model = Model::new(&spec(), LlamaFamily::new("model.language_model"), QuantPlan::F16);
+        let model = Model::new(
+            &spec(),
+            LlamaFamily::new("model.language_model"),
+            QuantPlan::F16,
+            QuantPlan::F16,
+        );
         let src = checkpoint_src();
         let mut gpu = gpu_client().await;
         crate::interpreters::eval_load(&model, &mut gpu, &src, &Default::default())

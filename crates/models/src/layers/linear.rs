@@ -127,7 +127,15 @@ impl Module for Linear {
     /// 不触碰 c_tmp)。
     /// AWQ 臂(2026-10-01):同构但换 GEMM_W4A16_AWQ(7 Block = scales 后
     /// 插 zeros 槽;kU4 has_zp 内核,组大小 32)。
-    fn forward(&self, xs: &TensorOps, _ctx: &ForwardCtx) -> TensorOps {
+    fn forward(&self, xs: &TensorOps, ctx: &ForwardCtx) -> TensorOps {
+        let _ = ctx;
+        self.forward_inner(xs)
+    }
+}
+
+impl Linear {
+    /// ctx 无关前向(Embedding::lm_head_matmul 复用;14 个调用点零改动)。
+    pub(crate) fn forward_inner(&self, xs: &TensorOps) -> TensorOps {
         if let (Some(g), Some(qw), Some(sc), Some(ws), Some(ctmp)) = (
             self.quant_group, &self.qw, &self.sc, &self.ws, &self.ctmp,
         ) {

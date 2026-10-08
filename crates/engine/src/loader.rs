@@ -80,10 +80,14 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
 
     /// Qwen3.8-27B AWQ-INT4 装载(2026-10-01;cyankiwi g32-asym 检查点):
     /// marlin kU4(has_zp)内核;rope 与 0.8B 同参(theta 1e7 + rotary 64)。
+    /// `head_plan`(C1,2026-10-11):untied lm_head 量化计划(唯一映射点
+    /// owl_shared::config::HeadQuant → owl_models QuantPlan;量化方案
+    /// = 配置枚举,loader 零硬编码)。
     pub async fn load_qwen38_27b_awq(
         &mut self,
         dir: &Path,
         tokenizer_dir: &Path,
+        head_plan: owl_models::module::QuantPlan,
     ) -> Result<LoadedModel> {
         let spec = qwen3_8_27b();
         // metrics 装载分相(直用 API 恒开;装载一次性路径,release 有数据)
@@ -91,7 +95,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         owl_shared::metrics::with_metrics_store(|s| {
             s.timer_begin("load.27b.total", file!(), line!());
         });
-        let model = Arc::new(load_27b_awq(dir, self.face).await?);
+        let model = Arc::new(load_27b_awq(dir, self.face, head_plan).await?);
         let tokenizer = load_tokenizer(tokenizer_dir)?;
         let rope = Rope::new(262_144, 256, 64, 10_000_000.0)?;
         let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1, device_repack: false, verify: false, debug_tap: false };

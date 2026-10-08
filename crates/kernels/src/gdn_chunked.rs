@@ -61,20 +61,28 @@ pub mod cubins {
         include_bytes!("../assets/gdn_chunked/h_noh0.cubin");
     pub const O: &[u8] =
         include_bytes!("../assets/gdn_chunked/o.cubin");
+    /// solve_tril(BT=64)单核形态:merge_16x16_to_64x64_inverse
+    pub const MERGE: &[u8] =
+        include_bytes!("../assets/gdn_chunked/merge.cubin");
 
-    /// 发射常量(shared/warps;与 AOT 特化一致)
+    /// 发射常量(2026-10-11 fork-bf16 重采集:torch profiler 实测指纹,
+    /// 采集于 T=1024/NK16/NV48/KD=VD=128/g-f32 配方;变体 = autotune 选中)
     pub mod launch {
         pub const CUMSUM_SHARED: u32 = 8;
-        pub const CUMSUM_WARPS: u32 = 2;
-        pub const KKT_SHARED: u32 = 8192;
-        pub const KKT_WARPS: u32 = 4;
-        pub const WU_SHARED: u32 = 81920;
+        pub const CUMSUM_WARPS: u32 = 4;
+        pub const KKT_SHARED: u32 = 24576;
+        pub const KKT_WARPS: u32 = 8; // block 256!
+        pub const MERGE_SHARED: u32 = 10240;
+        pub const MERGE_WARPS: u32 = 2;
+        pub const WU_SHARED: u32 = 32768;
         pub const WU_WARPS: u32 = 4;
-        pub const H_SHARED: u32 = 32768;
-        pub const H_WARPS: u32 = 2;
-        pub const H_NOH0_SHARED: u32 = 98564;
-        pub const H_NOH0_WARPS: u32 = 4;
-        pub const O_SHARED: u32 = 98304;
+        pub const H_SHARED: u32 = 49412;
+        pub const H_WARPS: u32 = 4;
+        /// h/o 核 grid 轴 0 的 BV(选中变体:grid (cdiv(V,64), ...) = 2)
+        pub const H_BV: u32 = 64;
+        pub const O_BV: u32 = 64;
+        pub const O_SHARED: u32 = 24576;
         pub const O_WARPS: u32 = 4;
+        // 旧 pip-fla f32 时代常量已随资产备份(assets/gdn_chunked_pipfla_f32)
     }
 }

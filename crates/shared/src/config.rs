@@ -35,6 +35,8 @@
 //! | model | awq27b_dir | Option<String> / None(27B AWQ 检查点门控) |
 //! | model | dflash2_dir | Option<String>(⚠️ W4A16 量化家族 syvai 系;
 //! |   |   | BF16 源(z-lab)喂引擎 = 草稿全噪声 AL=0,装载期嗅探拒启) |
+//! | model | head_quant | HeadQuant 枚举("off"\|"rtn-int4-g32")/ off(C1;|
+//! |   |   | 竖式/gate 质量门后转正) |
 //! | pool | pool_tokens | Option<usize> / None(=2×单会话) |
 //! | pool | gdn_slots / snap_max | usize / 8、4 |
 //! | pool | vram_target / vram_reserve_mb | f64、u64 / 0.97、1024 |
@@ -97,6 +99,23 @@ pub enum SamplerMode {
     Sampling,
 }
 
+/// lm_head 量化方案(model.head_quant;2026-10-11 由 bool 升格:
+/// 量化方案是一等配置面,新增方案 = 加枚举值 + loader 映射,
+/// 禁回生字符串/布尔和稀泥)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HeadQuant {
+    /// 关闭(untied lm_head 保持 f16 直读;对照系)
+    #[default]
+    Off,
+    /// 装载期现场 RTN int4 g32 对称(zp≡8,marlin kU4;检查点不动)。
+    /// 质量†:HyperQwen GPTQ 口径 +0.6%PPL/GSM8K 不变;本地 RTN g32
+    /// 口径 A/B 恒等门已过(prose/数学逐字同,竖式同错=模型固有)
+    RtnInt4G32,
+    // 预留:GptqInt4G128(需自采 hidden states 产量化,另案)、
+    // RtnInt8G128(中间档)——加值时同步 loader 映射与质量门台账
+}
+
 /// 图实例化旗标(cuda.graph_flags;原裸 u64 魔数 2/4 收口为结构化位面)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -146,6 +165,9 @@ pub struct ModelCfg {
     /// DFlash2 草稿检查点目录(⚠️ 须 W4A16 量化家族 syvai 系;BF16 源
     /// (z-lab)喂引擎 = 草稿全噪声 AL=0;装载期家族嗅探拒启)
     pub dflash2_dir: Option<String>,
+    /// C1(2026-10-11):untied lm_head 头部量化方案(枚举严格;映射点
+    /// 在 engine loader:HeadQuant → QuantPlan)。质量门台账见枚举值注。
+    pub head_quant: HeadQuant,
 }
 
 /// 池几何与显存预算(engine StatePool)
@@ -307,6 +329,7 @@ impl Default for ModelCfg {
             name: None,
             awq27b_dir: None,
             dflash2_dir: None,
+            head_quant: HeadQuant::default(),
         }
     }
 }
@@ -420,6 +443,9 @@ mode = "greedy"
         r#"
 [model]
 kind = "awq27b"
+# C1(2026-10-11):lm_head int4 装载期现场 RTN(marlin kU4);质量门
+# 已过(prose/数学 A/B 逐字同,竖式同错=模型固有),数学域 159→177
+head_quant = "rtn-int4-g32"
 
 [runtime]
 max_seq = 2560
@@ -437,6 +463,11 @@ prefix_cache = false
 
 [dispatch]
 kv_fp8 = true
+# GDN prefill 臂(2026-10-11 终版):fork-bf16 全家桶转正 —— g 语义律
+# 修复(kkt/h/o 必须吃 cumsum 而非 raw g;raw g 在深谷 -24 时
+# exp(±24)=e²⁴ 爆炸)。恒等门:四域 vs recurrence 逐位一致;std 矩阵
+# prefill 1299(超 scalar 1294)。fork 六核 bf16 配方全在 handler 肠内。
+gdn_chunked = true
 
 [sampling]
 mode = "greedy"
@@ -579,6 +610,7 @@ mod tests {
         assert_eq!(c.spec.depth, 7);
         assert_eq!(c.sampling.mode, SamplerMode::Greedy);
         assert_eq!(c.model.kind, ModelKind::Awq27b);
+        assert_eq!(c.model.head_quant, HeadQuant::RtnInt4G32, "C1 int4 头(2026-10-11 固化)");
         assert!(c.dispatch.kv_fp8);
         assert!(c.cuda.capture_slab_mb.is_none(), "slab 走 hint 定量");
     }

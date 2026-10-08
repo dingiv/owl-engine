@@ -6,15 +6,19 @@
 //! 容器 + LoaderOps 装载形态。
 
 use crate::tensor::Dtype;
-use crate::module::{Loadable, LoaderCtx, LoaderOps, Weight};
+use crate::module::{Loadable, LoaderCtx, LoaderOps, QuantPlan, Weight};
 use crate::module::{ForwardCtx, Module};
+use crate::layers::linear::Linear;
 use crate::TensorOps;
 
 pub struct Embedding {
     /// [vocab, D](checkpoint 原布局;查表 + nt matmul 共用一份)
     w: Weight,
-    /// untied lm_head 独立槽([vocab, D];tied = None,nt matmul 复用 w)
-    lm_head: Option<Weight>,
+    /// untied lm_head 独立槽(tied = None,nt matmul 复用 w)。
+    /// C1(2026-10-11):槽体 = Linear —— f16 直读或量化臂
+    /// (W4A16Awq:装载源 F16 兕底 = 现场RTN int4;HyperQwen 实证
+    /// lm_head int4 +0.6%PPL/GSM8K 不变,推翻旧“输出头不量化”裁决)
+    lm_head: Option<Linear>,
     d_dim: usize,
 }
 
@@ -25,21 +29,30 @@ impl Embedding {
         Embedding { w: Weight::new("weight", vec![vocab, d_dim]), lm_head: None, d_dim }
     }
 
-    /// untied(lm_head 独立权重;键经 [`Embedding::layout_lm_head`])
+    /// untied(lm_head 独立权重;f16 直读;测试 fixture/mtp/dflash2 同构)
     pub fn new_untied(vocab: usize, d_dim: usize) -> Embedding {
+        Embedding::new_untied_quant(vocab, d_dim, QuantPlan::F16)
+    }
+
+    /// untied + 头部量化计划(C1:生产入口;plan 量化且 eligible 时
+    /// lm_head 走 marlin 臂,否则 f16 直读)
+    pub fn new_untied_quant(vocab: usize, d_dim: usize, plan: QuantPlan) -> Embedding {
         Embedding {
             w: Weight::new("weight", vec![vocab, d_dim]),
-            lm_head: Some(Weight::new("lm_head", vec![vocab, d_dim])),
+            lm_head: Some(Linear::new("lm_head", vocab, d_dim, plan)),
             d_dim,
         }
     }
 
-    /// untied lm_head 槽装载声明(键 = 检查点裸键 `lm_head.weight`;
-    /// tied = None)。调用方不加 map_keys —— 键已是最终形态。
+    /// untied lm_head 槽装载声明(键 = 检查点裸键 `lm_head.weight`,
+    /// 量化套件键 `lm_head.qweight/...` 直通;tied = None)。调用方
+    /// 不加 map_keys —— 键已是最终形态。
     pub fn layout_lm_head(&self, ctx: &LoaderCtx) -> Option<LoaderOps> {
-        self.lm_head
-            .as_ref()
-            .map(|w| w.layout_as("lm_head.weight", ctx))
+        self.lm_head.as_ref().map(|lin| {
+            lin.layout(ctx).map_keys(|k| {
+                if k == "lm_head" { "lm_head.weight".to_string() } else { k.to_string() }
+            })
+        })
     }
 
     /// 装载完备性
@@ -62,10 +75,12 @@ impl Embedding {
     }
 
     /// lm_head:hidden [.., D] → logits [.., vocab]
-    /// nt 直读原始 [vocab, D] 布局(matmul_nt;零转置;untied 用独立槽)
+    /// nt 直读原始 [vocab, D] 布局(matmul_nt;零转置;untied 用独立槽)。
+    /// C1:untied 量化臂经 Linear::forward_inner(marlin GEMV/GEMM;
+    /// f16 臂 = 原语义 matmul_nt,零行为变更)
     pub fn lm_head_matmul(&self, hidden: &TensorOps) -> TensorOps {
         match &self.lm_head {
-            Some(w) => hidden.matmul_nt(&w.decl()),
+            Some(lin) => lin.forward_inner(hidden),
             None => hidden.matmul_nt(&self.w.decl()),
         }
     }

@@ -63,27 +63,51 @@ struct FiState {
 struct GdnChunkedState {
     cumsum: std::sync::Arc<cudarc::driver::CudaFunction>,
     kkt: std::sync::Arc<cudarc::driver::CudaFunction>,
+    /// solve_tril(BT=64 单核形态 = merge_16x16_to_64x64_inverse)
+    merge: std::sync::Arc<cudarc::driver::CudaFunction>,
     wu: std::sync::Arc<cudarc::driver::CudaFunction>,
     h: std::sync::Arc<cudarc::driver::CudaFunction>,
     o: std::sync::Arc<cudarc::driver::CudaFunction>,
-    cast_f32_f16: std::sync::Arc<cudarc::driver::CudaFunction>,
+    /// 状态转置核(CAST nvrtc 同模块):owl 池 [HV,K,V] ↔ fork [HV,V,K]
+    trans_kv_vk: std::sync::Arc<cudarc::driver::CudaFunction>,
+    trans_vk_kv: std::sync::Arc<cudarc::driver::CudaFunction>,
+    /// dtype 统一律(2026-10-11Ⅵ):bf16/f32 铸全在 handler 内,层侧纯 f16
+    cast_f16_bf16: std::sync::Arc<cudarc::driver::CudaFunction>,
+    cast_bf16_f16: std::sync::Arc<cudarc::driver::CudaFunction>,
     cast_f16_f32: std::sync::Arc<cudarc::driver::CudaFunction>,
-    q_f: cudarc::driver::CudaSlice<f32>,
-    k_f: cudarc::driver::CudaSlice<f32>,
-    v_f: cudarc::driver::CudaSlice<f32>,
-    g_f: cudarc::driver::CudaSlice<f32>,
-    beta_f: cudarc::driver::CudaSlice<f32>,
+    /// 输入 bf16 镜像(q/k/v/beta)+ g f32 镜像 + 输出 bf16 scratch
+    in_q: cudarc::driver::CudaSlice<u16>,
+    in_k: cudarc::driver::CudaSlice<u16>,
+    in_v: cudarc::driver::CudaSlice<u16>,
+    in_beta: cudarc::driver::CudaSlice<u16>,
+    in_g: cudarc::driver::CudaSlice<f32>,
+    o_b16: cudarc::driver::CudaSlice<u16>,
+    // 2026-10-11 fork-bf16 全家桶中间量(g 恒 f32;q/k/v/beta bf16 层侧铸):
+    /// g_cum [T*hv] f32(cumsum 出)
     g_cum: cudarc::driver::CudaSlice<f32>,
-    a: cudarc::driver::CudaSlice<f32>,
-    w: cudarc::driver::CudaSlice<f32>,
-    u: cudarc::driver::CudaSlice<f32>,
-    h_buf: cudarc::driver::CudaSlice<f32>,
-    v_new: cudarc::driver::CudaSlice<f32>,
-    o_f32: cudarc::driver::CudaSlice<f32>,
-    idx: cudarc::driver::CudaSlice<i64>,
-    coff: cudarc::driver::CudaSlice<i64>,
-    cu: cudarc::driver::CudaSlice<i64>,
+    /// A(kkt 出)/ Ai(merge 出)[T*hv*64] f32 ×2
+    a_buf: cudarc::driver::CudaSlice<f32>,
+    ai_buf: cudarc::driver::CudaSlice<f32>,
+    /// w [T*hv*kd] / u [T*hv*vd] bf16(以 u16 承载)
+    w: cudarc::driver::CudaSlice<u16>,
+    u: cudarc::driver::CudaSlice<u16>,
+    /// h_buf [nt*hv*vd*kd] bf16(fork 布局 V 行 K 列)
+    h_buf: cudarc::driver::CudaSlice<u16>,
+    /// v_new [T*hv*vd] bf16(h 核出,o 核入)
+    v_new: cudarc::driver::CudaSlice<u16>,
+    /// 转置后状态 [hv*kd*vd] f32(固定尺寸,init 分配);h0 入态
+    state_t: cudarc::driver::CudaSlice<f32>,
+    /// ht 出态(与 h0 分离 —— fork 探针姿势为两张量;别名行为未证)
+    state_out_t: cudarc::driver::CudaSlice<f32>,
+    /// varlen 元数据驻留(2026-10-11:vLLM 同款姿势 —— cu/idx/coff 按
+    /// (T,NT) 键一次构建永驻,削掉每 call 3 个 pageable htod)
+    meta_cache: std::collections::HashMap<(usize, usize), usize>,
+    /// 驻留表仓库(键序:cu[2] + coff[2] + idx[NT*2];按 meta_cache 索引)
+    meta_bufs: Vec<cudarc::driver::CudaSlice<i64>>,
     t_cap: usize,
+    hv_dim: usize,
+    kd_dim: usize,
+    vd_dim: usize,
 }
 
 /// plan 缓存项:形状键 + plan15 + tile/split
@@ -195,21 +219,21 @@ fn gdn_chunked_realloc(
     kd: usize,
     vd: usize,
 ) -> Result<(), ModelError> {
-    st.q_f = stream.alloc_zeros::<f32>(t * nk * kd).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
-    st.k_f = stream.alloc_zeros::<f32>(t * nk * kd).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
-    st.v_f = stream.alloc_zeros::<f32>(t * hv * vd).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
-    st.g_f = stream.alloc_zeros::<f32>(t * hv).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
-    st.beta_f = stream.alloc_zeros::<f32>(t * hv).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
+    // fork-bf16 配方(2026-10-11):g 链 f32;q/k/v/beta/w/u/h/v_new bf16(u16)
     st.g_cum = stream.alloc_zeros::<f32>(t * hv).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
-    st.a = stream.alloc_zeros::<f32>(t * hv * 64).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
-    st.w = stream.alloc_zeros::<f32>(t * hv * kd).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
-    st.u = stream.alloc_zeros::<f32>(t * hv * kd).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
-    st.h_buf = stream.alloc_zeros::<f32>(nt * hv * kd * vd).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
-    st.v_new = stream.alloc_zeros::<f32>(t * hv * vd).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
-    st.o_f32 = stream.alloc_zeros::<f32>(t * hv * vd).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
-    st.idx = stream.alloc_zeros::<i64>(nt * 2).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
-    st.coff = stream.alloc_zeros::<i64>(2).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
-    st.cu = stream.alloc_zeros::<i64>(2).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
+    st.a_buf = stream.alloc_zeros::<f32>(t * hv * 64).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
+    st.ai_buf = stream.alloc_zeros::<f32>(t * hv * 64).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
+    st.w = stream.alloc_zeros::<u16>(t * hv * kd).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
+    st.u = stream.alloc_zeros::<u16>(t * hv * vd).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
+    st.h_buf = stream.alloc_zeros::<u16>(nt * hv * vd * kd).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
+    st.v_new = stream.alloc_zeros::<u16>(t * hv * vd).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
+    // dtype 统一律镜像(handler 内铸的 bf16/f32 副本)
+    st.in_q = stream.alloc_zeros::<u16>(t * nk * kd).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
+    st.in_k = stream.alloc_zeros::<u16>(t * nk * kd).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
+    st.in_v = stream.alloc_zeros::<u16>(t * hv * vd).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
+    st.in_beta = stream.alloc_zeros::<u16>(t * hv).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
+    st.in_g = stream.alloc_zeros::<f32>(t * hv).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
+    st.o_b16 = stream.alloc_zeros::<u16>(t * hv * vd).map_err(|e| ModelError::Msg(format!("{e:?}")))?;
     st.t_cap = t;
     Ok(())
 }
@@ -220,6 +244,15 @@ struct GdnScalarState {
     k: std::sync::Arc<cudarc::driver::CudaFunction>,
     cast_f32_f16: std::sync::Arc<cudarc::driver::CudaFunction>,
     o_f32: cudarc::driver::CudaSlice<f32>,
+    /// 捕获图安全(2026-10-11 立案即结案):旧代 o_f32 **坟场保活** ——
+    /// 图持有捕获时指针,扩容换新块后旧块不可释放(A1.7 租约语义;史前
+    /// 版本直接 drop → verify 图回放悬空指针 = ILLEGAL_ADDRESS,仅当
+    /// scalar × 捕获图同跑时引爆)。容量单调涨,坟场总量有界(≤ 最大代)。
+    o_f32_grave: Vec<cudarc::driver::CudaSlice<f32>>,
+    /// soff htod staging 按 T 键保活:**栈临时发起的 memcpy 在捕获窗内
+    /// = 回放读死栈**(同案第二违例);每 T 一份永不互改的 [0,T] 盒,
+    /// 捕获节点与 eager 调用各自引用自己的不变源。
+    soff_staging: std::collections::HashMap<usize, Box<[i32; 2]>>,
     soff: cudarc::driver::CudaSlice<i32>,
     t_cap: usize,
 }
@@ -280,6 +313,12 @@ impl GpuServer {
                     let _ = boot.send(Ok(()));
                 }
                 self.ctx = Some(c);
+                // C1(2026-10-11):cuBLAS 句柄/工作区构造期急切预钉
+                // (lm_head 量化后 warmup 期可能无 cublas 首发路径,惰性
+                // 初始化的捕获窗前置条件不能靠碰运氻 warmup)
+                if let Err(e) = self.ensure_blas() {
+                    eprintln!("[blas-ws] 构造期预钉失败 {e:?}(回退惰性首初始化)");
+                }
             }
             Err(e) => {
                 if let Some(boot) = self.boot.take() {

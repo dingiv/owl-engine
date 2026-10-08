@@ -573,10 +573,11 @@ impl GatedDeltaNet {
         let g = gating_g(&self.a_log.decl(), &a, &self.dt_bias.decl(), tokens, self.nv);
         let beta = b.sigmoid();
 
-        // GDN prefill 三分臂(env 选路;scalar > chunked > recurrence):
-        // - scalar:lmdeploy pre_sm90 port 单核(cast ×5 → 单 Call)
-        // - chunked:FLA AOT 五核(fwd_h 旧案冻结,对照臂)
-        // - recurrence:现役 varlen 递推批核(基线)
+        // GDN prefill 三分臂(env 选路;chunked > scalar > recurrence,
+        // 2026-10-11 优先级重排:FLA 五核断链修复后置顶):
+        // - chunked:FLA AOT 五核(vLLM 同款;断链修复后转正)
+        // - scalar:lmdeploy pre_sm90 port 单核(cast ×5 → 单 Call;对照臂)
+        // - recurrence:现役 varlen 递推批核(基线/小 T)
         if ctx.trace_gate {
             eprintln!("[gdn-gate] scalar={} chunked={} T={}", ctx.env.gdn.scalar, ctx.env.gdn.chunked, tokens);
         }
@@ -594,7 +595,9 @@ impl GatedDeltaNet {
             b.push(g.clone());
             b.push(beta.clone());
         }
-        let y = if ctx.env.gdn.scalar {
+        let y = if ctx.env.gdn.scalar && !ctx.env.gdn.chunked && tokens >= 64 {
+            // scalar 臂(lmdeploy 单核;T 分臂:仅大 T —— 小 T(verify/
+            // propose=8/decode=1)回 recurrence,每层 5 cast 核在小 T 纯开销)
             let q_f = TensorOps::call(crate::ops::ids::CAST_F16_F32)
                 .arg(&q_n.reshape(vec![tokens, self.nk, self.hk_dim]))
                 .arg_i32((tokens * self.nk * self.hk_dim) as i32)
@@ -633,36 +636,24 @@ impl GatedDeltaNet {
             .arg_usize(self.hk_dim)
             .arg_usize((1.0f32 / (self.hk_dim as f32).sqrt()).to_bits() as usize)
             .with_shape(Dtype::F16, vec![tokens, self.nv, self.hv_dim])
-        } else if ctx.env.gdn.chunked {
-            let q_f = TensorOps::call(crate::ops::ids::CAST_F16_F32)
-                .arg(&q_n.reshape(vec![tokens, self.nk, self.hk_dim]))
-                .arg_i32((tokens * self.nk * self.hk_dim) as i32)
-                .with_shape(Dtype::F32, vec![tokens, self.nk, self.hk_dim]);
-            let k_f = TensorOps::call(crate::ops::ids::CAST_F16_F32)
-                .arg(&k_n.reshape(vec![tokens, self.nk, self.hk_dim]))
-                .arg_i32((tokens * self.nk * self.hk_dim) as i32)
-                .with_shape(Dtype::F32, vec![tokens, self.nk, self.hk_dim]);
-            let v_f = TensorOps::call(crate::ops::ids::CAST_F16_F32)
-                .arg(&v_c.reshape(vec![tokens, self.nv, self.hv_dim]))
-                .arg_i32((tokens * self.nv * self.hv_dim) as i32)
-                .with_shape(Dtype::F32, vec![tokens, self.nv, self.hv_dim]);
-            let g_f = TensorOps::call(crate::ops::ids::CAST_F16_F32)
-                .arg(&g)
-                .arg_i32((tokens * self.nv) as i32)
-                .with_shape(Dtype::F32, vec![tokens, self.nv]);
-            let beta_f = TensorOps::call(crate::ops::ids::CAST_F16_F32)
-                .arg(&beta)
-                .arg_i32((tokens * self.nv) as i32)
-                .with_shape(Dtype::F32, vec![tokens, self.nv]);
-            let y = TensorOps::of(
+        } else if ctx.env.gdn.chunked && tokens >= 64 {
+            // FLA chunked 六核(2026-10-11 fork-bf16 全家桶;优先级置顶):
+            // vLLM third_party fork 同源 cubin。**dtype 统一律(同日Ⅵ)**:
+            // bf16/f32 配方全关在 handler 肚内 —— 层侧纯 f16 进出
+            // (q/k/v/beta/g 原块直传,O = f16),interpreter 域零新 dtype
+            // 面。史前版把 5 个 bf16 cast 块放进 SSA 树 = 向全 F16 的
+            // 活性回收/块池域引入新 dtype(层 3+ inf 毒化),同型于
+            // B6.3/FI-decode 配置不一致前科。同形基准 383µs/层chunk vs
+            // 自研链 ~2100µs(5.5×)。大 T 限定(与 scalar 同纪律)。
+            TensorOps::of(
                 crate::kernel::Kernel::new("gdn_chunked_delta_rule_fwd", "")
                     .with_sig("T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz"),
             )
-            .arg(&q_f)
-            .arg(&k_f)
-            .arg(&v_f)
-            .arg(&g_f)
-            .arg(&beta_f)
+            .arg(&q_n.reshape(vec![tokens, self.nk, self.hk_dim]))
+            .arg(&k_n.reshape(vec![tokens, self.nk, self.hk_dim]))
+            .arg(&v_c.reshape(vec![tokens, self.nv, self.hv_dim]))
+            .arg(&beta)
+            .arg(&g)
             .arg(&gdn.rec)
             .arg_usize(tokens)
             .arg_usize(ctx.gdn_slot_host)
@@ -670,8 +661,7 @@ impl GatedDeltaNet {
             .arg_usize(self.nk)
             .arg_usize(self.hk_dim)
             .arg_usize((1.0f32 / (self.hk_dim as f32).sqrt()).to_bits() as usize)
-            .with_shape(Dtype::F16, vec![tokens, self.nv, self.hv_dim]);
-            y
+            .with_shape(Dtype::F16, vec![tokens, self.nv, self.hv_dim])
         } else {
             // varlen 递推批核(单发射;state 原地进出)
             recurrence_varlen(

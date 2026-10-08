@@ -499,7 +499,7 @@ async fn gpu_awq27b_marlin_e2e() {
     .expect("构造");
     let loaded = engine
         .loader()
-        .load_qwen38_27b_awq(&dir, &dir)
+        .load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16)
         .await
         .expect("27B AWQ 装载");
     eprintln!("[bench] 27B 装载(含 kU4 重排上卡){:.2}s", t0.elapsed().as_secs_f32());
@@ -727,7 +727,7 @@ async fn gpu_27b_chat_inference() {
     .expect("构造");
     let loaded = engine
         .loader()
-        .load_qwen38_27b_awq(&dir, &dir)
+        .load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16)
         .await
         .expect("27B AWQ 装载");
     let mut running = engine.run(loaded).await.expect("装配");
@@ -822,7 +822,7 @@ async fn gpu_27b_chat_inference() {
             device_ordinal: ordinal, max_seq_tokens: 512, prefill_chunk: 128,
             knobs: EngineKnobs::default(),
         }).expect("构造");
-        let loaded = engine.loader().load_qwen38_27b_awq(&dir, &dir).await.expect("装载");
+        let loaded = engine.loader().load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16).await.expect("装载");
         let mut running = engine.run(loaded).await.expect("装配");
         for (qi, q) in ["中国的首都是北京。长城是", "1 2 3 4 5 6"].iter().enumerate() {
             let id = running.submit(*q, 48).expect("submit");
@@ -954,7 +954,7 @@ async fn gpu_27b_chat_inference() {
             .expect("构造");
             let loaded = engine
                 .loader()
-                .load_qwen38_27b_awq(std::path::Path::new(dir), std::path::Path::new(dir))
+                .load_qwen38_27b_awq(std::path::Path::new(dir), std::path::Path::new(dir), owl_models::module::QuantPlan::F16)
                 .await
                 .expect("装载");
             let mut running = engine.run(loaded).await.expect("装配");
@@ -1041,7 +1041,7 @@ async fn gpu_27b_chat_inference() {
             .expect("构造");
             let loaded = engine
                 .loader()
-                .load_qwen38_27b_awq(std::path::Path::new(dir), std::path::Path::new(dir))
+                .load_qwen38_27b_awq(std::path::Path::new(dir), std::path::Path::new(dir), owl_models::module::QuantPlan::F16)
                 .await
                 .expect("装载");
             let mut running = engine.run(loaded).await.expect("装配");
@@ -1263,7 +1263,7 @@ async fn gpu_decode_marginal_bench() {
         .expect("构造");
         let loaded = engine
             .loader()
-            .load_qwen38_27b_awq(std::path::Path::new(dir), std::path::Path::new(dir))
+            .load_qwen38_27b_awq(std::path::Path::new(dir), std::path::Path::new(dir), owl_models::module::QuantPlan::F16)
             .await
             .expect("装载");
         let mut running = engine.run(loaded).await.expect("装配");

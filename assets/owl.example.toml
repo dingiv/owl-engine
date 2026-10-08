@@ -26,6 +26,10 @@
 #                               # BF16 未量化源(z-lab)是 golden 参考系,
 #                               # 喂引擎 = 草稿全噪声 → AL=0 全拒
 #                               # (装载期家族嗅探会结构化拒启)。
+# head_quant = "rtn-int4-g32"  # C1:lm_head 量化方案枚举
+#                               # ("off" | "rtn-int4-g32";预留 GPTQ 档)。
+#                               # 收益:verify 轮带宽 −2ms 级 + 固定面
+#                               # −1.8G。质量门:竖式/gate A/B 已过
 
 [pool]
 # pool_tokens = 0               # 块池容量覆写(缺省 = 2×单会话)

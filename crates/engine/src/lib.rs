@@ -51,6 +51,17 @@ mod tests;
 
 pub use engine::{Engine, EngineConfig, EngineKnobs};
 pub use loader::{LoadedModel, ModelLoader};
+
+/// lm_head 量化方案映射(**唯一点**:配置枚举 → owl_models QuantPlan;
+/// app 层不直接触碰 owl_models,新方案 = 加枚举值 + 此处加臂 +
+/// loader 质量门台账)
+pub fn head_plan_of(hq: owl_shared::config::HeadQuant) -> owl_models::module::QuantPlan {
+    use owl_models::module::QuantPlan;
+    match hq {
+        owl_shared::config::HeadQuant::Off => QuantPlan::F16,
+        owl_shared::config::HeadQuant::RtnInt4G32 => QuantPlan::W4A16Awq,
+    }
+}
 pub use running::RunningEngine;
 pub use graph_plan::{GraphPlan, GraphPlanDesc, PlanOutcome};
 pub use session::{AgentSession, SessionTable};

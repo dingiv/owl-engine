@@ -109,6 +109,7 @@ pub async fn load_0_8b<D: DeviceClient + 'static>(
         &qwen3_5_0_8b(),
         Qwen35Convention::new("model.language_model"),
         crate::module::QuantPlan::F16,
+        crate::module::QuantPlan::F16,
     );
     let src = SafeTensorsSource::open_dir(dir)?;
     // F16 直转装载(F5;权重 bf16 检查点 → f16 字节,不再 f32 设备中转)
@@ -131,6 +132,7 @@ pub async fn load_0_8b_w4a16<D: DeviceClient + 'static>(
         &spec,
         Qwen35Convention::new("model.language_model"),
         crate::module::QuantPlan::W4A16,
+        crate::module::QuantPlan::F16,
     );
     let src = crate::formats::w4a16::W4A16Source::open_dir(dir)?;
     let ctx = crate::module::LoaderCtx { dtype: crate::contract::Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false };
@@ -398,11 +400,18 @@ impl Loadable for crate::layers::mtp::MtpPredictor {
 pub async fn load_27b_awq<D: DeviceClient + 'static>(
     dir: &Path,
     face: &mut D,
+    head_plan: crate::module::QuantPlan,
 ) -> Result<Model, ModelError> {
     let model = Model::new(
         &qwen3_8_27b(),
         Qwen35Convention::new("model.language_model"),
         crate::module::QuantPlan::W4A16Awq,
+        // C1 lm_head 头部量化计划(2026-10-11):量化方案由配置枚举映射
+        // (HeadQuant → QuantPlan,engine loader 唯一点);W4A16Awq 下
+        // bf16 裸 lm_head 由装载源 F16 兕底臂现场 RTN int4(g32 sym,
+        // zp≡8;marlin kU4 通路)—— 零拼装,检查点不动。质量门:竖式/
+        // gate greedy A/B 已过。
+        head_plan,
     );
     let src = crate::formats::awq::AwqSource::open_dir(dir)?;
     // repack 路径裁决(唯一收口:module::RepackPath::resolve ——
@@ -783,7 +792,12 @@ mod tests {
         // ── 装载(被测链;单次装载保留 manifest —— F5-2 前为重跑 load
         //    生成 manifest,双倍上传;F5-2 删)
         let mut gpu = crate::testkit::gpu_client().await;
-        let model = Model::new(&qwen3_5_0_8b(), Qwen35Convention::new("model.language_model"), crate::module::QuantPlan::F16);
+        let model = Model::new(
+            &qwen3_5_0_8b(),
+            Qwen35Convention::new("model.language_model"),
+            crate::module::QuantPlan::F16,
+            crate::module::QuantPlan::F16,
+        );
         let manifest = {
             let src = SafeTensorsSource::open_dir(&dir)?;
             let ctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false };

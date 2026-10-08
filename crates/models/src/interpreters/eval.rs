@@ -139,7 +139,7 @@ where
             EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new(),
                 arena_set: std::collections::HashSet::new(),
                 block_users: std::collections::HashMap::new(),
-                pending: count_pending(t), reclaim: true, env };
+                pending: count_pending(t), reclaim: std::env::var("OWL_NO_RECLAIM").is_err(), env };
         let root = _eval_rec(t, &mut ctx).await?;
         let mut candidates = std::mem::take(&mut ctx.arena);
         candidates.retain(|id| *id != root.id && ctx.arena_set.contains(id));

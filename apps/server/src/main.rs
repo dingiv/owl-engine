@@ -146,10 +146,14 @@ async fn actor_main(
         })?;
         eprintln!("[boot] 设备绑定 {:.2}s", t0.elapsed().as_secs_f32());
         let model = match config.model_kind {
-            ModelKind::Awq27b => engine
-                .loader()
-                .load_qwen38_27b_awq(&config.model_dir, &config.model_dir)
-                .await?,
+            ModelKind::Awq27b => {
+                // 量化方案映射(唯一点 owl_engine::head_plan_of)
+                let head_plan = owl_engine::head_plan_of(config.head_quant);
+                engine
+                    .loader()
+                    .load_qwen38_27b_awq(&config.model_dir, &config.model_dir, head_plan)
+                    .await?
+            }
             ModelKind::Qwen35_08b => engine.loader().load_qwen35_0_8b(&config.model_dir).await?,
         };
         eprintln!("[boot] 权重/tokenizer/rope 装载 {:.2}s", t0.elapsed().as_secs_f32());

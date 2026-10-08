@@ -86,42 +86,51 @@ impl GpuServer {
         }
     }
 
+    /// cuBLAS 句柄 + 私有工作区预钉(幂等)。原为 handle_cublas_gemm
+    /// 惰性首初始化;C1(2026-10-11)lm_head 量化后 warmup 期可能无任何
+    /// cublas 首发路径,隐藏假设失效 → run() 构造期急切预钉(捕获窗
+    /// 守卫 foreign.rs 捕获内首次初始化拒绝的前置条件,A5.2 池外预钉)。
+    pub(super) fn ensure_blas(&mut self) -> Result<(), ModelError> {
+        if self.blas.is_some() {
+            return Ok(());
+        }
+        let stream = self.ctx().stream(STREAM_COMPUTE)?.clone();
+        match owl_kernels::cublas::OwlCublas::new(stream.clone()) {
+            Ok(h) => self.blas = Some(h),
+            Err(e) => return Err(ModelError::Msg(e)),
+        }
+        // 刀1.5:server 私有 4MB 工作区(捕获前分配;SetWorkspace 预绑
+        // —— 捕获期 gemv splitK 不走池分配,免 MEM_ALLOC/FREE 节点)。
+        // 并行 server 各享各的,零共享零竞争(全局单例实证会炸)。
+        const BLAS_WS_BYTES: usize = 4 << 20;
+        match unsafe { stream.alloc::<u8>(BLAS_WS_BYTES) } {
+            Ok(buf) => {
+                use cudarc::driver::DevicePtr;
+                let arc = std::sync::Arc::new(buf);
+                let ptr = match arc.device_ptr(&stream) {
+                    (p, _sync) => p as u64,
+                };
+                let handle = *self.blas.as_ref().unwrap().sys_handle();
+                let r = unsafe {
+                    crate::ffi::sys::cublas::cublasSetWorkspace_v2(handle, ptr as *mut _, BLAS_WS_BYTES)
+                };
+                if r == crate::ffi::sys::cublas::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                    eprintln!("[blas-ws] 私有工作区 {BLAS_WS_BYTES}B @ {ptr:#x}(构造期预钉)");
+                    self.blas_ws = Some(arc);
+                } else {
+                    eprintln!("[blas-ws] SetWorkspace 失败 r={r:?}(启发式回退池分配)");
+                }
+            }
+            Err(e) => eprintln!("[blas-ws] 分配失败 {e:?}(回退池分配)"),
+        }
+        Ok(())
+    }
+
     /// cuBLAS GEMM 臂(槽序:[T a, T b, T out, sz m, sz k, sz n, sz nt])。
     /// bf16 = true → CUDA_R_16BF 三参(E5-DF3 同日十四;DFlash2 草稿非量化投影)
     pub(super) fn handle_cublas_gemm(&mut self, msg: LaunchMsg, ack: Ack<Result<Bytes, ModelError>>, bf16: bool) {
-        if self.blas.is_none() {
-            let stream = match self.ctx().stream(STREAM_COMPUTE) {
-                Ok(s) => s.clone(),
-                Err(e) => return ack.send(Err(e)),
-            };
-            match owl_kernels::cublas::OwlCublas::new(stream.clone()) {
-                Ok(h) => self.blas = Some(h),
-                Err(e) => return ack.send(Err(ModelError::Msg(e))),
-            }
-            // 刀1.5:server 私有 4MB 工作区(捕获前分配;SetWorkspace 预绑
-            // —— 捕获期 gemv splitK 不走池分配,免 MEM_ALLOC/FREE 节点)。
-            // 并行 server 各享各的,零共享零竞争(全局单例实证会炸)。
-            const BLAS_WS_BYTES: usize = 4 << 20;
-            match unsafe { stream.alloc::<u8>(BLAS_WS_BYTES) } {
-                Ok(buf) => {
-                    use cudarc::driver::DevicePtr;
-                    let arc = std::sync::Arc::new(buf);
-                    let ptr = match arc.device_ptr(&stream) {
-                        (p, _sync) => p as u64,
-                    };
-                    let handle = *self.blas.as_ref().unwrap().sys_handle();
-                    let r = unsafe {
-                        crate::ffi::sys::cublas::cublasSetWorkspace_v2(handle, ptr as *mut _, BLAS_WS_BYTES)
-                    };
-                    if r == crate::ffi::sys::cublas::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-                        eprintln!("[blas-ws] 私有工作区 {BLAS_WS_BYTES}B @ {ptr:#x}");
-                        self.blas_ws = Some(arc);
-                    } else {
-                        eprintln!("[blas-ws] SetWorkspace 失败 r={r:?}(启发式回退池分配)");
-                    }
-                }
-                Err(e) => eprintln!("[blas-ws] 分配失败 {e:?}(回退池分配)"),
-            }
+        if let Err(e) = self.ensure_blas() {
+            return ack.send(Err(e));
         }
         // 槽序:[T a, T b, T out, sz m, sz k, sz n, sz nt]
         let (blocks, scalars) = match Self::parse_foreign_slots(&msg, 3, 4) {
@@ -467,6 +476,11 @@ impl GpuServer {
     /// = 6 Block + 1 O + 6 sz。state = 槽寻址 f32 [slots, HV, KD, VD]。
     /// 编排 = FLA chunk.py fwd 序:cumsum → kkt → wu → h → o → cast。
     pub(super) fn handle_gdn_chunked(&mut self, msg: LaunchMsg, ack: Ack<Result<Bytes, ModelError>>) {
+        // 2026-10-11 fork-bf16 全家桶重写:vLLM third_party FLA fork 六核
+        // (cumsum/kkt/merge(solve_tril BT=64 单核)/wu/h/o),配方 =
+        // q/k/v/beta bf16(层侧铸)+ g f32(vLLM 生产配方,exp 域硬要求)
+        // + state f32 [HV,V,K](owl 池 [HV,K,V] 转置进/出)。史前 pip-fla
+        // f32 五核资产备份于 assets/gdn_chunked_pipfla_f32。
         let init = || -> Result<GdnChunkedState, ModelError> {
             if self.ctx.as_ref().map(|c| c.capture_stream()).unwrap_or(false) {
                 return Err(ModelError::Msg(
@@ -487,17 +501,23 @@ impl GpuServer {
             };
             use owl_kernels::gdn_chunked::cubins::launch as LC;
             let cumsum = load(owl_kernels::gdn_chunked::cubins::CUMSUM, "chunk_local_cumsum_scalar_kernel")?;
-            let kkt = load(owl_kernels::gdn_chunked::cubins::KKT, "chunk_gated_delta_rule_fwd_kkt_solve_kernel")?;
+            let kkt = load(owl_kernels::gdn_chunked::cubins::KKT, "chunk_scaled_dot_kkt_fwd_kernel")?;
+            let merge = load(owl_kernels::gdn_chunked::cubins::MERGE, "merge_16x16_to_64x64_inverse_kernel")?;
             let wu = load(owl_kernels::gdn_chunked::cubins::WU, "recompute_w_u_fwd_kernel")?;
             let h = load(owl_kernels::gdn_chunked::cubins::H, "chunk_gated_delta_rule_fwd_kernel_h_blockdim64")?;
             let o = load(owl_kernels::gdn_chunked::cubins::O, "chunk_fwd_kernel_o")?;
-            // shared opt-in(wu 81920 / o 98304 > 48KB)
-            for (f, sz) in [(&wu, LC::WU_SHARED as i32), (&o, LC::O_SHARED as i32)] {
+            // shared opt-in(>48KB 默认顶的核;fork 选中变体里 h=49412,
+            // wu/o 虽 <48K 一并预置免变体漂移)
+            for (f, sz) in [
+                (&wu, LC::WU_SHARED as i32),
+                (&h, LC::H_SHARED as i32),
+                (&o, LC::O_SHARED as i32),
+            ] {
                 use cudarc::driver::sys::CUfunction_attribute_enum as Attr;
                 f.set_attribute(Attr::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, sz)
                     .map_err(|e| ModelError::Msg(format!("gdn_chunked setattr: {e:?}")))?;
             }
-            // cast 模块(nvrtc;f16<->f32 双向)
+            // CAST nvrtc 模块:转置核(owl 池 [K,V] ↔ fork [V,K])同源
             use cudarc::nvrtc::CompileOptions;
             let ptx = cudarc::nvrtc::compile_ptx_with_opts(
                 owl_kernels::sources::attention::CAST,
@@ -512,40 +532,66 @@ impl GpuServer {
                 .ctx
                 .load_module(cudarc::nvrtc::Ptx::from_src(ptx.to_src()))
                 .map_err(|e| ModelError::Msg(format!("gdn_chunked cast load: {e:?}")))?;
+            let trans_kv_vk = std::sync::Arc::new(
+                cast_m
+                    .load_function("owl_state_kv_to_vk")
+                    .map_err(|e| ModelError::Msg(format!("gdn_chunked trans kv_vk: {e:?}")))?,
+            );
+            // dtype 统一律(2026-10-11Ⅵ):bf16/f32 配方关进 handler —— 层侧
+            // f16 直入,此处铸 bf16 ×4 + f32 ×1,输出 bf16 scratch → f16 out
+            let cast_f16_bf16 = std::sync::Arc::new(
+                cast_m
+                    .load_function("owl_cast_f16_bf16")
+                    .map_err(|e| ModelError::Msg(format!("gdn_chunked cast f16bf16: {e:?}")))?,
+            );
+            let cast_bf16_f16 = std::sync::Arc::new(
+                cast_m
+                    .load_function("owl_cast_bf16_f16")
+                    .map_err(|e| ModelError::Msg(format!("gdn_chunked cast bf16f16: {e:?}")))?,
+            );
             let cast_f16_f32 = std::sync::Arc::new(
                 cast_m
                     .load_function("owl_cast_f16_f32")
-                    .map_err(|e| ModelError::Msg(format!("gdn_chunked cast fn: {e:?}")))?,
+                    .map_err(|e| ModelError::Msg(format!("gdn_chunked cast f16f32: {e:?}")))?,
             );
-            let cast_f32_f16 = std::sync::Arc::new(
+            let trans_vk_kv = std::sync::Arc::new(
                 cast_m
-                    .load_function("owl_cast_f32_f16")
-                    .map_err(|e| ModelError::Msg(format!("gdn_chunked cast fn: {e:?}")))?,
+                    .load_function("owl_state_vk_to_kv")
+                    .map_err(|e| ModelError::Msg(format!("gdn_chunked trans vk_kv: {e:?}")))?,
             );
             Ok(GdnChunkedState {
                 cumsum,
                 kkt,
+                merge,
                 wu,
                 h,
                 o,
+                trans_kv_vk,
+                trans_vk_kv,
+                cast_f16_bf16,
+                cast_bf16_f16,
                 cast_f16_f32,
-                cast_f32_f16,
-                q_f: stream.alloc_zeros::<f32>(1).map_err(|e| ModelError::Msg(format!("{e:?}")))?,
-                k_f: stream.alloc_zeros::<f32>(1).map_err(|e| ModelError::Msg(format!("{e:?}")))?,
-                v_f: stream.alloc_zeros::<f32>(1).map_err(|e| ModelError::Msg(format!("{e:?}")))?,
-                g_f: stream.alloc_zeros::<f32>(1).map_err(|e| ModelError::Msg(format!("{e:?}")))?,
-                beta_f: stream.alloc_zeros::<f32>(1).map_err(|e| ModelError::Msg(format!("{e:?}")))?,
                 g_cum: stream.alloc_zeros::<f32>(1).map_err(|e| ModelError::Msg(format!("{e:?}")))?,
-                a: stream.alloc_zeros::<f32>(1).map_err(|e| ModelError::Msg(format!("{e:?}")))?,
-                w: stream.alloc_zeros::<f32>(1).map_err(|e| ModelError::Msg(format!("{e:?}")))?,
-                u: stream.alloc_zeros::<f32>(1).map_err(|e| ModelError::Msg(format!("{e:?}")))?,
-                h_buf: stream.alloc_zeros::<f32>(1).map_err(|e| ModelError::Msg(format!("{e:?}")))?,
-                v_new: stream.alloc_zeros::<f32>(1).map_err(|e| ModelError::Msg(format!("{e:?}")))?,
-                o_f32: stream.alloc_zeros::<f32>(1).map_err(|e| ModelError::Msg(format!("{e:?}")))?,
-                idx: stream.alloc_zeros::<i64>(1).map_err(|e| ModelError::Msg(format!("{e:?}")))?,
-                coff: stream.alloc_zeros::<i64>(1).map_err(|e| ModelError::Msg(format!("{e:?}")))?,
-                cu: stream.alloc_zeros::<i64>(1).map_err(|e| ModelError::Msg(format!("{e:?}")))?,
+                a_buf: stream.alloc_zeros::<f32>(1).map_err(|e| ModelError::Msg(format!("{e:?}")))?,
+                ai_buf: stream.alloc_zeros::<f32>(1).map_err(|e| ModelError::Msg(format!("{e:?}")))?,
+                w: stream.alloc_zeros::<u16>(1).map_err(|e| ModelError::Msg(format!("{e:?}")))?,
+                u: stream.alloc_zeros::<u16>(1).map_err(|e| ModelError::Msg(format!("{e:?}")))?,
+                h_buf: stream.alloc_zeros::<u16>(1).map_err(|e| ModelError::Msg(format!("{e:?}")))?,
+                v_new: stream.alloc_zeros::<u16>(1).map_err(|e| ModelError::Msg(format!("{e:?}")))?,
+                state_t: stream.alloc_zeros::<f32>(1).map_err(|e| ModelError::Msg(format!("{e:?}")))?,
+                state_out_t: stream.alloc_zeros::<f32>(1).map_err(|e| ModelError::Msg(format!("{e:?}")))?,
+                in_q: stream.alloc_zeros::<u16>(1).map_err(|e| ModelError::Msg(format!("{e:?}")))?,
+                in_k: stream.alloc_zeros::<u16>(1).map_err(|e| ModelError::Msg(format!("{e:?}")))?,
+                in_v: stream.alloc_zeros::<u16>(1).map_err(|e| ModelError::Msg(format!("{e:?}")))?,
+                in_beta: stream.alloc_zeros::<u16>(1).map_err(|e| ModelError::Msg(format!("{e:?}")))?,
+                in_g: stream.alloc_zeros::<f32>(1).map_err(|e| ModelError::Msg(format!("{e:?}")))?,
+                o_b16: stream.alloc_zeros::<u16>(1).map_err(|e| ModelError::Msg(format!("{e:?}")))?,
+                meta_cache: std::collections::HashMap::new(),
+                meta_bufs: Vec::new(),
                 t_cap: 0,
+                hv_dim: 0,
+                kd_dim: 0,
+                vd_dim: 0,
             })
         };
         if self.gdn_chunked.is_none() {
@@ -554,12 +600,13 @@ impl GpuServer {
                 Err(e) => return ack.send(Err(e)),
             };
         }
-        // 槽序解析
+        // 槽序解析:7 Block(q/k/v/beta bf16 + g f32 + state f32)+ O out(bf16)
+        // + 6 sz(T/slot/hv/nk/kd/scale_bits)
         let (blocks, scalars) = match Self::parse_foreign_slots(&msg, 7, 6) {
             Ok(v) => v,
             Err(e) => return ack.send(Err(e)),
         };
- let (t, slot, hv, nk, kd, scale_bits) = (
+        let (t, slot, hv, _nk, kd, scale_bits) = (
             scalars[0] as usize,
             scalars[1] as usize,
             scalars[2] as usize,
@@ -568,8 +615,8 @@ impl GpuServer {
             scalars[5] as u32,
         );
         let scale = f32::from_bits(scale_bits);
+        let vd = kd; // GDN:KD == VD(27B = 128)
         let nt = t.div_ceil(64);
-        let vd = kd; // GDN: KD == VD(27B = 128)
         let stream = match self.ctx().stream(STREAM_COMPUTE) {
             Ok(s) => s.clone(),
             Err(e) => return ack.send(Err(e)),
@@ -582,62 +629,136 @@ impl GpuServer {
             }
         }
         let st = self.gdn_chunked.as_mut().unwrap();
-        // 扩容(T 超容量)
-        if t > st.t_cap {
-            if let Err(e) = gdn_chunked_realloc(st, &stream, t, nt, hv, nk, kd, vd) {
+        // 扩容(T 超容量)+ 首次定维(state_t 固定尺寸)
+        let first_dims = st.hv_dim == 0;
+        if t > st.t_cap || first_dims {
+            if let Err(e) = gdn_chunked_realloc(st, &stream, t, nt, hv, _nk, kd, vd) {
                 return ack.send(Err(e));
             }
         }
-        // (层侧已 emit owl_cast_f16_f32 ×5 SSA 节点 —— q/k/v/g/beta 进来即 f32;
-        //  此处不再二次 cast。)
-        let (q_p, k_p, v_p, g_p, beta_p) = (
-            gdn_dptr(&mut st.q_f, &stream),
-            gdn_dptr(&mut st.k_f, &stream),
-            gdn_dptr(&mut st.v_f, &stream),
-            gdn_dptr(&mut st.g_f, &stream),
-            gdn_dptr(&mut st.beta_f, &stream),
-        );
-        let (gcum_p, a_p, w_p, u_p, h_p) = (
+        if first_dims {
+            st.state_t = match stream.alloc_zeros::<f32>(hv * kd * vd) {
+                Ok(v) => v,
+                Err(e) => return ack.send(Err(ModelError::Msg(format!("{e:?}")))),
+            };
+            st.state_out_t = match stream.alloc_zeros::<f32>(hv * kd * vd) {
+                Ok(v) => v,
+                Err(e) => return ack.send(Err(ModelError::Msg(format!("{e:?}")))),
+            };
+            st.hv_dim = hv;
+            st.kd_dim = kd;
+            st.vd_dim = vd;
+        }
+        // dtype 统一律(2026-10-11Ⅵ):层侧 f16 原块 → 此处铸 bf16 ×4 +
+        // f32 ×1 进私有镜像(fork 配方全在 handler 肚内,interpreter 零感知)
+        let (q_p, k_p, v_p, beta_p, g_p, state_slot_p) = {
+            let n_qk = t * _nk * kd;
+            let n_v = t * hv * vd;
+            let n_h = t * hv;
+            let iq = gdn_dptr(&mut st.in_q, &stream);
+            let ik = gdn_dptr(&mut st.in_k, &stream);
+            let iv = gdn_dptr(&mut st.in_v, &stream);
+            let ib = gdn_dptr(&mut st.in_beta, &stream);
+            let ig = gdn_dptr(&mut st.in_g, &stream);
+            for (f, src, dst, n) in [
+                (&st.cast_f16_bf16, ptrs[0], iq, n_qk),
+                (&st.cast_f16_bf16, ptrs[1], ik, n_qk),
+                (&st.cast_f16_bf16, ptrs[2], iv, n_v),
+                (&st.cast_f16_bf16, ptrs[3], ib, n_h),
+                (&st.cast_f16_f32, ptrs[4], ig, n_h),
+            ] {
+                let ni = n as i32;
+                let mut b = stream.launch_builder(f);
+                b.arg(&src).arg(&ni).arg(&dst);
+                let cfg = cudarc::driver::LaunchConfig {
+                    grid_dim: (n.div_ceil(256) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                if let Err(e) = unsafe { b.launch(cfg) } {
+                    return ack.send(Err(ModelError::Msg(format!("gdn cast-in: {e:?}"))));
+                }
+            }
+            (iq, ik, iv, ib, ig, ptrs[5])
+        };
+        let out_p = ptrs[6];
+        let out_b16_p = gdn_dptr(&mut st.o_b16, &stream);
+        // host 表驻留(2026-10-11:vLLM 同款姿势):(T,NT) 键首次构建后永驻
+        let meta_ix = {
+            let key = (t, nt);
+            if let Some(ix) = st.meta_cache.get(&key) {
+                *ix
+            } else {
+                let mut host: Vec<i64> = Vec::with_capacity(4 + nt * 2);
+                host.extend_from_slice(&[0i64, t as i64]); // cu
+                host.extend_from_slice(&[0i64, nt as i64]); // coff
+                host.extend((0..nt).flat_map(|i| [0i64, i as i64])); // idx
+                let mut dev = match stream.alloc_zeros::<i64>(host.len()) {
+                    Ok(v) => v,
+                    Err(e) => return ack.send(Err(ModelError::Msg(format!("gdn meta alloc: {e:?}")))),
+                };
+                let dp = gdn_dptr(&mut dev, &stream);
+                if let Err(e) = unsafe { memcpy_htod_async(dp, &host[..], stream.cu_stream()) } {
+                    return ack.send(Err(ModelError::Msg(format!("gdn meta htod: {e:?}"))));
+                }
+                if let Err(e) = stream.synchronize() {
+                    return ack.send(Err(ModelError::Msg(format!("gdn meta sync: {e:?}"))));
+                }
+                st.meta_bufs.push(dev);
+                let ix = st.meta_bufs.len() - 1;
+                st.meta_cache.insert(key, ix);
+                ix
+            }
+        };
+        let (cu_p, coff_p, idx_p) = {
+            let b = &mut st.meta_bufs[meta_ix];
+            let base = gdn_dptr(b, &stream);
+            (base, base + 16, base + 32)
+        };
+        let (gcum_p, a_p, ai_p) = (
             gdn_dptr(&mut st.g_cum, &stream),
-            gdn_dptr(&mut st.a, &stream),
+            gdn_dptr(&mut st.a_buf, &stream),
+            gdn_dptr(&mut st.ai_buf, &stream),
+        );
+        let (w_p, u_p, hsc_p, vnew_p) = (
             gdn_dptr(&mut st.w, &stream),
             gdn_dptr(&mut st.u, &stream),
             gdn_dptr(&mut st.h_buf, &stream),
-        );
-        let (vnew_p, of32_p) = (
             gdn_dptr(&mut st.v_new, &stream),
-            gdn_dptr(&mut st.o_f32, &stream),
         );
-        let (idx_p, coff_p, cu_p) = (
-            gdn_dptr(&mut st.idx, &stream),
-            gdn_dptr(&mut st.coff, &stream),
-            gdn_dptr(&mut st.cu, &stream),
-        );
-        let state_p = ptrs[5] + (slot * hv * kd * vd * 4) as u64; // f32 → 字节
-        // host 表 htod(COMPUTE 流,先于 FLA 核):cu=[0,T] / idx=[(0,i)×NT] / coff=[0,NT]
-        let idx_host: Vec<i64> = (0..nt).flat_map(|i| [0i64, i as i64]).collect();
-        if self.probes.cap_prof {
-            eprintln!("[cap-prof] gdn-chunked cu/idx/coff htod x3 (T={t})");
-        }
-        if let Err(e) = unsafe { memcpy_htod_async(cu_p, &[0i64, t as i64], stream.cu_stream()) } {
-            return ack.send(Err(ModelError::Msg(format!("gdn cu htod: {e:?}"))));
-        }
-        if let Err(e) = unsafe { memcpy_htod_async(idx_p, &idx_host, stream.cu_stream()) } {
-            return ack.send(Err(ModelError::Msg(format!("gdn idx htod: {e:?}"))));
-        }
-        if let Err(e) = unsafe { memcpy_htod_async(coff_p, &[0i64, nt as i64], stream.cu_stream()) } {
-            return ack.send(Err(ModelError::Msg(format!("gdn coff htod: {e:?}"))));
-        }
+        let state_t_p = gdn_dptr(&mut st.state_t, &stream);
+        let state_out_p = gdn_dptr(&mut st.state_out_t, &stream);
+        let state_src = state_slot_p + (slot * hv * kd * vd * 4) as u64;
         let hv_u = hv as u32;
-        // 1. cumsum:grid (NT, HV)
+        let ti = t as i32;
+        let scratch: u64 = 0;
+        use owl_kernels::gdn_chunked::cubins::launch as LC;
+
+        // ⚠️ g 语义律(2026-10-11 终案):fork orchestrator 首行
+        // g = chunk_local_cumsum(g) 重绑后喂全部下游核 —— kkt/h/o/wu 的
+        // "g" 参数全部是 CUMSUM(cumsum 差恒 ≤0 → exp ≤1 有界);史前版
+        // 喂 raw g = exp(±24) = e²⁴ 爆炸(层 4 g 深谷案真根;engine 与
+        // 探针同错对拍互相掩盖,f64 朴素真值才拆穿)。
+        // 0. 状态转置入:owl 池 [HV,K,V] → fork [HV,V,K]
+        {
+            let kdi = kd as i32;
+            let vdi = vd as i32;
+            let mut b = stream.launch_builder(&st.trans_kv_vk);
+            b.arg(&state_src).arg(&state_t_p).arg(&kdi).arg(&vdi);
+            let cfg = cudarc::driver::LaunchConfig {
+                grid_dim: (vd as u32, hv_u, 1),
+                block_dim: (kd as u32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            if let Err(e) = unsafe { b.launch(cfg) }.map_err(|e| ModelError::Msg(format!("gdn trans-in: {e:?}"))) {
+                return ack.send(Err(e));
+            }
+        }
+        // 1. cumsum:raw g(f32 镜像)→ g_cum
         {
             let mut b = stream.launch_builder(&st.cumsum);
-            let ti = t as i32;
-            let ln2 = 1.4426950408889634f32;
-            let scratch: u64 = 0;
             b.arg(&g_p)
                 .arg(&gcum_p)
-                .arg(&ln2)
                 .arg(&cu_p)
                 .arg(&idx_p)
                 .arg(&ti)
@@ -645,21 +766,19 @@ impl GpuServer {
                 .arg(&scratch);
             let cfg = cudarc::driver::LaunchConfig {
                 grid_dim: (nt as u32, hv_u, 1),
-                block_dim: (32 * owl_kernels::gdn_chunked::cubins::launch::CUMSUM_WARPS, 1, 1),
-                shared_mem_bytes: owl_kernels::gdn_chunked::cubins::launch::CUMSUM_SHARED,
+                block_dim: (32 * LC::CUMSUM_WARPS, 1, 1),
+                shared_mem_bytes: LC::CUMSUM_SHARED,
             };
             if let Err(e) = unsafe { b.launch(cfg) }.map_err(|e| ModelError::Msg(format!("gdn cumsum: {e:?}"))) {
                 return ack.send(Err(e));
             }
         }
-        // 2. kkt:grid (NT, HV)
+        // 2. kkt:k/beta/g_cum → A;grid (NT, HV), block 256
         {
             let mut b = stream.launch_builder(&st.kkt);
-            let ti = t as i32;
-            let scratch: u64 = 0;
             b.arg(&k_p)
-                .arg(&gcum_p)
                 .arg(&beta_p)
+                .arg(&gcum_p)
                 .arg(&a_p)
                 .arg(&cu_p)
                 .arg(&idx_p)
@@ -668,24 +787,41 @@ impl GpuServer {
                 .arg(&scratch);
             let cfg = cudarc::driver::LaunchConfig {
                 grid_dim: (nt as u32, hv_u, 1),
-                block_dim: (32 * owl_kernels::gdn_chunked::cubins::launch::KKT_WARPS, 1, 1),
-                shared_mem_bytes: owl_kernels::gdn_chunked::cubins::launch::KKT_SHARED,
+                block_dim: (32 * LC::KKT_WARPS, 1, 1),
+                shared_mem_bytes: LC::KKT_SHARED,
             };
             if let Err(e) = unsafe { b.launch(cfg) }.map_err(|e| ModelError::Msg(format!("gdn kkt: {e:?}"))) {
                 return ack.send(Err(e));
             }
         }
-        // 3. wu:grid (NT, HV)
+        // 3. solve_tril(BT=64 单核 merge):A → Ai
+        {
+            let mut b = stream.launch_builder(&st.merge);
+            b.arg(&a_p)
+                .arg(&ai_p)
+                .arg(&cu_p)
+                .arg(&idx_p)
+                .arg(&ti)
+                .arg(&scratch)
+                .arg(&scratch);
+            let cfg = cudarc::driver::LaunchConfig {
+                grid_dim: (nt as u32, hv_u, 1),
+                block_dim: (32 * LC::MERGE_WARPS, 1, 1),
+                shared_mem_bytes: LC::MERGE_SHARED,
+            };
+            if let Err(e) = unsafe { b.launch(cfg) }.map_err(|e| ModelError::Msg(format!("gdn merge: {e:?}"))) {
+                return ack.send(Err(e));
+            }
+        }
+        // 4. wu:k/v/beta/Ai/g_cum → w/u;grid (NT, HV), block 128
         {
             let mut b = stream.launch_builder(&st.wu);
-            let ti = t as i32;
-            let scratch: u64 = 0;
             b.arg(&k_p)
                 .arg(&v_p)
                 .arg(&beta_p)
                 .arg(&w_p)
                 .arg(&u_p)
-                .arg(&a_p)
+                .arg(&ai_p)
                 .arg(&gcum_p)
                 .arg(&cu_p)
                 .arg(&idx_p)
@@ -694,53 +830,64 @@ impl GpuServer {
                 .arg(&scratch);
             let cfg = cudarc::driver::LaunchConfig {
                 grid_dim: (nt as u32, hv_u, 1),
-                block_dim: (32 * owl_kernels::gdn_chunked::cubins::launch::WU_WARPS, 1, 1),
-                shared_mem_bytes: owl_kernels::gdn_chunked::cubins::launch::WU_SHARED,
+                block_dim: (32 * LC::WU_WARPS, 1, 1),
+                shared_mem_bytes: LC::WU_SHARED,
             };
             if let Err(e) = unsafe { b.launch(cfg) }.map_err(|e| ModelError::Msg(format!("gdn wu: {e:?}"))) {
                 return ack.send(Err(e));
             }
         }
-        // 4. h:grid (cdiv(VD,BV) × HV)(BV 烘焙;探针迭代定值,起步 32)
+        // 5. h:k/u/w → h_buf/v_new/ht;grid (cdiv(V,BV), HV) 二维!
+        //    实参序 = SASS 审计(gk 被 triton 剪参):k, v=u, w, v_new,
+        //    g_cum, h, h0, ht, cu, coff, T = 10 ptr + T(u32) + 2 尾参
         {
-            const H_BV: u32 = 64;
             let mut b = stream.launch_builder(&st.h);
-            let ti = t as i32;
-            let scratch: u64 = 0;
             b.arg(&k_p)
-                .arg(&v_p)
+                .arg(&u_p)
                 .arg(&w_p)
                 .arg(&vnew_p)
                 .arg(&gcum_p)
-                .arg(&h_p)
-                .arg(&state_p)
-                .arg(&state_p)
+                .arg(&hsc_p)
+                .arg(&state_t_p)
+                .arg(&state_out_p)
                 .arg(&cu_p)
                 .arg(&coff_p)
                 .arg(&ti)
                 .arg(&scratch)
                 .arg(&scratch);
             let cfg = cudarc::driver::LaunchConfig {
-                grid_dim: ((vd as u32).div_ceil(H_BV) * hv_u, 1, 1),
-                block_dim: (32 * owl_kernels::gdn_chunked::cubins::launch::H_WARPS, 1, 1),
-                shared_mem_bytes: owl_kernels::gdn_chunked::cubins::launch::H_SHARED,
+                grid_dim: ((vd as u32).div_ceil(LC::H_BV), hv_u, 1),
+                block_dim: (32 * LC::H_WARPS, 1, 1),
+                shared_mem_bytes: LC::H_SHARED,
             };
             if let Err(e) = unsafe { b.launch(cfg) }.map_err(|e| ModelError::Msg(format!("gdn h: {e:?}"))) {
                 return ack.send(Err(e));
             }
         }
-        // 5. o:grid (cdiv(VD,BV2), NT, HV)(BV2 起步 32,探针迭代)
+        // 6. 状态转置回:fork [HV,V,K] → owl 池 [HV,K,V]
         {
-            const O_BV: u32 = 64;
+            let kdi = kd as i32;
+            let vdi = vd as i32;
+            let mut b = stream.launch_builder(&st.trans_vk_kv);
+            b.arg(&state_out_p).arg(&state_src).arg(&kdi).arg(&vdi);
+            let cfg = cudarc::driver::LaunchConfig {
+                grid_dim: (vd as u32, hv_u, 1),
+                block_dim: (kd as u32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            if let Err(e) = unsafe { b.launch(cfg) }.map_err(|e| ModelError::Msg(format!("gdn trans-out: {e:?}"))) {
+                return ack.send(Err(e));
+            }
+        }
+        // 7. o:q/k/v_new/h_buf/g_cum → out(bf16);grid (cdiv(V,BV), NT, HV)
+        {
             let mut b = stream.launch_builder(&st.o);
-            let ti = t as i32;
-            let scratch: u64 = 0;
             b.arg(&q_p)
                 .arg(&k_p)
                 .arg(&vnew_p)
-                .arg(&h_p)
+                .arg(&hsc_p)
                 .arg(&gcum_p)
-                .arg(&of32_p)
+                .arg(&out_b16_p)
                 .arg(&cu_p)
                 .arg(&idx_p)
                 .arg(&scale)
@@ -748,21 +895,20 @@ impl GpuServer {
                 .arg(&scratch)
                 .arg(&scratch);
             let cfg = cudarc::driver::LaunchConfig {
-                grid_dim: ((vd as u32).div_ceil(O_BV), nt as u32, hv_u),
-                block_dim: (32 * owl_kernels::gdn_chunked::cubins::launch::O_WARPS, 1, 1),
-                shared_mem_bytes: owl_kernels::gdn_chunked::cubins::launch::O_SHARED,
+                grid_dim: ((vd as u32).div_ceil(LC::O_BV), nt as u32, hv_u),
+                block_dim: (32 * LC::O_WARPS, 1, 1),
+                shared_mem_bytes: LC::O_SHARED,
             };
             if let Err(e) = unsafe { b.launch(cfg) }.map_err(|e| ModelError::Msg(format!("gdn o: {e:?}"))) {
                 return ack.send(Err(e));
             }
         }
-        // 6. cast o_f32 → out(f16)
+        // 8. o:bf16 scratch → out(f16;层侧纯 f16 契约,dtype 统一律)
         {
             let n_out = t * hv * vd;
-            let out_p = ptrs[6] as u64;
             let n_out_i = n_out as i32;
-            let mut b = stream.launch_builder(&st.cast_f32_f16);
-            b.arg(&of32_p).arg(&n_out_i).arg(&out_p);
+            let mut b = stream.launch_builder(&st.cast_bf16_f16);
+            b.arg(&out_b16_p).arg(&n_out_i).arg(&out_p);
             let cfg = cudarc::driver::LaunchConfig {
                 grid_dim: (n_out.div_ceil(256) as u32, 1, 1),
                 block_dim: (256, 1, 1),
@@ -774,6 +920,7 @@ impl GpuServer {
         }
         ack.send(Ok(Bytes::new(blocks[6].0, msg.out_elems)))
     }
+
 
     /// GDN scalar 臂(lmdeploy pre_sm90 port 单核;2026-10-03)。
     /// 槽序:[T q, T k, T v, T g, T beta, T state, O out,
@@ -826,6 +973,8 @@ impl GpuServer {
                 o_f32: stream
                     .alloc_zeros::<f32>(1)
                     .map_err(|e| ModelError::Msg(format!("{e:?}")))?,
+                o_f32_grave: Vec::new(),
+                soff_staging: std::collections::HashMap::new(),
                 soff: stream
                     .alloc_zeros::<i32>(2)
                     .map_err(|e| ModelError::Msg(format!("{e:?}")))?,
@@ -873,15 +1022,20 @@ impl GpuServer {
         if t > st.t_cap {
             match stream.alloc_zeros::<f32>(t * hv * kd) {
                 Ok(v) => {
-                    st.o_f32 = v;
+                    // 旧代入坟场(捕获图回放仍持旧指针;A1.7 租约 ——
+                    // 物理回收只发生在 server 销毁后)
+                    st.o_f32_grave.push(std::mem::replace(&mut st.o_f32, v));
                     st.t_cap = t;
                 }
                 Err(e) => return ack.send(Err(ModelError::Msg(format!("{e:?}")))),
             }
         }
-        // seq_off htod(COMPUTE 流,先于内核):单序列 [0, T]
+        // seq_off htod(COMPUTE 流,先于内核):单序列 [0, T]。
+        // staging 按 T 键取不变盒(捕获窗内从栈临时发起 = 回放读死栈,
+        // 2026-10-11 案第二违例;盒内容永不互改 → 捕获节点回放恒正确)
+        let staging: &[i32; 2] = st.soff_staging.entry(t).or_insert_with(|| Box::new([0i32, t as i32]));
         let soff_p = gdn_dptr(&mut st.soff, &stream);
-        if let Err(e) = unsafe { memcpy_htod_async(soff_p, &[0i32, t as i32], stream.cu_stream()) } {
+        if let Err(e) = unsafe { memcpy_htod_async(soff_p, staging, stream.cu_stream()) } {
             return ack.send(Err(ModelError::Msg(format!("gdn_scalar soff htod: {e:?}"))));
         }
         // 内核发射:直接在层侧 f32 块指针上(q/k/v/g/beta = ptrs[0..5],
