@@ -163,6 +163,14 @@ fn reduce_rec(
             "Kernel 节点 \"{}\" 需 GPU server 执行(后端编译 + 发射;CPU 参考解释器不支持)",
             kernel.name
         ))),
+        // 胖算子:CPU 参考面不执行,但 validate 强制(毒参数在参考链同样拦截)
+        Op::Spec { spec } => {
+            spec.validate().map_err(|e| ModelError::Msg(format!("[spec] {e}")))?;
+            Err(ModelError::Msg(format!(
+                "Spec 节点 \"{}\" 需 GPU server 执行(CPU 参考解释器不支持)",
+                spec.name()
+            )))
+        }
         other => Err(ModelError::Msg(format!(
             "CPU 参考解释器未覆盖: {other:?}(server 侧实现)"
         ))),

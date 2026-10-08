@@ -355,7 +355,7 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
     rows: usize,
     cols: usize,
     tap: Option<&Mutex<Box<dyn LoadTap>>>,
-    deferred: &Deferred,
+    _deferred: &Deferred,
     verify: bool,
 ) -> Result<LoadEntry, ModelError> {
     let raw_elems = rows * cols;
@@ -469,8 +469,10 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
             }
         }
     }
-    // 3) 原始块回收(E2a Free 通道;数据已进重排输出块)
-    face.free(&[raw.id]).await;
+    // 3) 原始块回收(E2a Free 通道;数据已进重排输出块)。尽力而为:
+    // 回收失败不阻断装载(后续 alloc 压力会暴露),显式丢弃 —— Result 全链
+    // 纪律下的明示弃置(2026-10-12 review I-7 案)
+    let _ = face.free(&[raw.id]).await;
     probe.done();
     Ok(LoadEntry {
         key: w.key.clone(),

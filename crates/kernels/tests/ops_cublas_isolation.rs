@@ -6,8 +6,8 @@
 
 use owl_kernels::server::cublas::CublasRuntime;
 use owl_kernels::contract::{Bytes, LaunchMsg, OpError};
-use owl_kernels::device::{DeviceRes, Exec, LaunchVal, ScratchBuf};
-use owl_kernels::registry::{FamilyRuntime, RunEnv};
+use owl_kernels::device::{DeviceRes, Exec, ScratchBuf};
+use owl_kernels::registry::KernelSpec;
 use std::collections::HashMap;
 use std::sync::Arc;
 use cudarc::driver::{CudaSlice, DevicePtr};
@@ -70,7 +70,7 @@ impl DeviceRes for TestRes {
             .find(|(_, s)| s.device_ptr(&self.stream).0 == dst)
             .map(|(id, _)| *id);
         if let Some(id) = target {
-            let mut view = self.blocks.get_mut(&id).expect("在册");
+            let view = self.blocks.get_mut(&id).expect("在册");
             cudarc::driver::CudaStream::memcpy_htod(&self.stream, src, view)
                 .expect("htod");
             return Ok(());
@@ -92,10 +92,7 @@ fn cublas_runtime_matches_host_matmul() {
     let mut res = TestRes::new(dev);
     let mut exec = Exec::new();
     let mut rt = CublasRuntime::default();
-    {
-        let mut env = RunEnv::new(&mut res, &mut exec);
-        rt.init(&mut env).expect("init");
-    }
+    rt.init(&mut res, &mut exec).expect("init");
 
     // C[2,3] = A[2,6] × W[3,6]^T(nt=true;owl Linear 形态)
     let (t, hidden, n_out) = (2usize, 6usize, 3usize);
@@ -127,7 +124,6 @@ fn cublas_runtime_matches_host_matmul() {
     };
     let out_b = Bytes { id: out_id, len: t * n_out };
 
-    let scale = (1.0f64 / hidden as f64).to_bits() as u64;
     let msg = LaunchMsg {
         kernel: owl_kernels::contract::KernelSource {
             name: owl_kernels::client::cublas::GEMM_F16.to_string(),
@@ -147,11 +143,7 @@ fn cublas_runtime_matches_host_matmul() {
         shared_mem: 0,
         out_elems: t * n_out,
     };
-    let _ = scale;
-    {
-        let mut env = RunEnv::new(&mut res, &mut exec);
-        rt.run(&msg, &mut env).expect("cublas run");
-    }
+    rt.run(&msg, &mut res, &mut exec).expect("cublas run");
     res.stream.synchronize().expect("sync");
 
     for (id, s) in &res.blocks {

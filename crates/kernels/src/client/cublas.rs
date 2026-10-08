@@ -15,7 +15,6 @@ pub struct BlockRef {
 
 pub const GEMM_F16: &str = crate::family::cublas::GEMM_F16;
 pub const GEMM_BF16: &str = crate::family::cublas::GEMM_BF16;
-
 #[derive(Clone, Copy, Debug)]
 pub struct GemmCall {
     pub a: BlockRef,

@@ -610,14 +610,15 @@ impl GpuServer {
     fn handle_launch_inner(&mut self, msg: LaunchMsg, ack: Ack<Result<Bytes, ModelError>>) {
         // foreign-kernel 通道(M4 cutover:算子注册表唯一入口 —— 名字分派
         // 在注册表内部,server 主循环零算子知识;旧 handle_foreign_launch
-        // 已退役,见 ops/ 模块)
-        if owl_kernels::registry::is_foreign_name(&msg.kernel.name) {
+        // 已退役,见 ops/ 模块)。路由判定 = 注册表 knows(boot 表自洽,
+        // 零第二份清单;旧 is_foreign_name 硬编码枚举已删,2026-10-12 review D 案)
+        if self.registry.as_ref().is_some_and(|r| r.knows(&msg.kernel.name)) {
             let out = (|| -> Result<Bytes, String> {
                 let ctx = self.ctx.as_ref().ok_or("server 未上线")?;
                 let mut res = GpuRes { ctx, scratch: &mut self.scratch_ledger };
                 self.registry
                     .as_mut()
-                    .ok_or("算子注册表未装配")?
+                    .expect("knows 已查非 None")
                     .execute(&msg, &mut res, &mut self.exec)
                     .map_err(|e| e.to_string())
             })()

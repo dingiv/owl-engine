@@ -2,21 +2,16 @@
 //! 三名同构:f16 / AWQ / bf16(名路由 → gemm_v2_raw / gemm_v2_raw_bf16)。
 
 use crate::contract::{Bytes, LaunchMsg, OpError, OpId, Stage};
-use crate::device::LaunchVal;
 
+use crate::client::marlin::{parse_gemm, GEMM_W4A16, GEMM_W4A16_AWQ, GEMM_W4A16_BF16};
 use crate::family::marlin;
-use crate::client::marlin::{parse_gemm, GEMM_W4A16};
 use crate::registry::KernelSpec;
 
-/// marlin 家族(f16/AWQ/bf16 三名;一个 runtime 实例按名分派)
+/// marlin 家族(f16/AWQ/bf16 三名;一个 runtime 实例按名分派。
+/// 名字 = client face re-export(contract::names 单源),零本地字面量
+/// —— 2026-10-12 review I-10 案)
 #[derive(Default)]
 pub struct MarlinRuntime;
-
-impl MarlinRuntime {
-    pub const N_F16: &'static str = "marlin_gemm_w4a16";
-    pub const N_AWQ: &'static str = "marlin_gemm_w4a16_awq";
-    pub const N_BF16: &'static str = "marlin_gemm_w4a16_bf16";
-}
 
 impl KernelSpec for MarlinRuntime {
     fn id(&self) -> OpId {
@@ -24,7 +19,7 @@ impl KernelSpec for MarlinRuntime {
     }
 
     fn names(&self) -> Vec<&'static str> {
-        vec![Self::N_F16, Self::N_AWQ, Self::N_BF16]
+        vec![GEMM_W4A16, GEMM_W4A16_AWQ, GEMM_W4A16_BF16]
     }
 
     fn linkage(&self) -> crate::contract::Linkage {
@@ -32,13 +27,13 @@ impl KernelSpec for MarlinRuntime {
     }
 
     fn validate(&self) -> Result<(), OpError> { Ok(()) }
-    fn init(&mut self, _env: &mut dyn crate::device::DeviceRes, exec: &mut crate::device::Exec) -> Result<(), OpError> {
+    fn init(&mut self, _res: &mut dyn crate::device::DeviceRes, _exec: &mut crate::device::Exec) -> Result<(), OpError> {
         Ok(()) // 纯 FFI 零句柄;链接期已解析
     }
 
     fn run(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {
         // AWQ 臂:kU4 has_zp,7 块(独立 FFI);f16/bf16 走 6 块通用臂
-        if msg.kernel.name == Self::N_AWQ {
+        if msg.kernel.name == GEMM_W4A16_AWQ {
             return self.run_awq(msg, res, exec);
         }
         let call = parse_gemm(msg, msg.kernel.name == marlin::GEMM_W4A16_BF16)?;
@@ -90,7 +85,7 @@ impl KernelSpec for MarlinRuntime {
 
 impl MarlinRuntime {
     /// AWQ kU4 臂(7 块;zeros 槽 FFI 实参位 4,ws 位 5,c_tmp 位 6)
-    fn run_awq(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {
+    fn run_awq(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, _exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {
         let call = crate::client::marlin::parse_gemm_awq(msg)?;
         let r = |b: &crate::client::marlin::BlockRef| {
             res.resolve(&Bytes { id: b.id, len: 0 }).map(|p| p + b.byte_offset)

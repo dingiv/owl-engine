@@ -5,13 +5,13 @@
 //! (f16/fp8kv 按名路由)。
 
 use crate::contract::{Bytes, LaunchMsg, OpError, OpId};
-use crate::device::{LaunchVal, ScratchBuf};
+use crate::device::ScratchBuf;
 
+use crate::client::flashinfer::{parse_prefill, PREFILL_FI, PREFILL_FI_FP8KV};
 use crate::family::flashinfer::{
     owl_fi_prefill_plan, owl_fi_prefill_run, owl_fi_prefill_run_fp8kv,
     FI_FLOAT_WS_BYTES, FI_HOST_STAGING_BYTES, FI_INT_WS_BYTES,
 };
-use crate::client::flashinfer::{parse_prefill, PREFILL_FI};
 use crate::registry::KernelSpec;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -44,8 +44,8 @@ impl Default for FiRuntime {
 }
 
 impl FiRuntime {
-    pub const N_F16: &'static str = "flashinfer_prefill_paged_f16";
-    pub const N_FP8KV: &'static str = "flashinfer_prefill_paged_fp8kv";
+    // 名字 = client face re-export(contract::names 单源),零本地字面量
+    // —— 2026-10-12 review I-10 案(旧 N_F16/N_FP8KV 已删)
 }
 
 impl KernelSpec for FiRuntime {
@@ -54,7 +54,7 @@ impl KernelSpec for FiRuntime {
     }
 
     fn names(&self) -> Vec<&'static str> {
-        vec![Self::N_F16, Self::N_FP8KV]
+        vec![PREFILL_FI, PREFILL_FI_FP8KV]
     }
 
     fn linkage(&self) -> crate::contract::Linkage {
@@ -62,7 +62,7 @@ impl KernelSpec for FiRuntime {
     }
 
     fn validate(&self) -> Result<(), OpError> { Ok(()) }
-    fn init(&mut self, res: &mut dyn crate::device::DeviceRes, exec: &mut crate::device::Exec) -> Result<(), OpError> {
+    fn init(&mut self, res: &mut dyn crate::device::DeviceRes, _exec: &mut crate::device::Exec) -> Result<(), OpError> {
         if self.float_ws.is_some() {
             return Ok(());
         }
@@ -71,7 +71,7 @@ impl KernelSpec for FiRuntime {
         Ok(())
     }
 
-    fn run(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {
+    fn run(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, _exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {
         let call = parse_prefill(msg)?;
         let r = |b: &crate::client::flashinfer::BlockRef| {
             res.resolve(&Bytes { id: b.id, len: 0 }).map(|p| p + b.byte_offset)
@@ -85,6 +85,7 @@ impl KernelSpec for FiRuntime {
         let last_len = r(&call.last_len)?;
         let out_ref = crate::client::flashinfer::BlockRef { id: call.out.id, byte_offset: 0 };
         let out_ptr = r(&out_ref)?;
+        // 就地解包( locals 贯穿 plan/run;None = init 未跑,Asset 拒)
         let float_ws = self.float_ws.as_ref().ok_or_else(|| OpError::Asset {
             op: PREFILL_FI.into(),
             detail: "workspace 未装配".into(),
@@ -111,10 +112,10 @@ impl KernelSpec for FiRuntime {
             let (mut plan15, mut cta_tile_q, mut split_kv) = ([0i64; 15], 0i32, 0i32);
             let rc = unsafe {
                 owl_fi_prefill_plan(
-                    self.float_ws.unwrap().ptr as *mut std::ffi::c_void,
-                    self.float_ws.unwrap().bytes,
-                    self.int_ws.unwrap().ptr as *mut std::ffi::c_void,
-                    self.int_ws.unwrap().bytes,
+                    float_ws.ptr as *mut std::ffi::c_void,
+                    float_ws.bytes,
+                    int_ws.ptr as *mut std::ffi::c_void,
+                    int_ws.bytes,
                     self.host_staging.as_mut_ptr() as *mut std::ffi::c_void,
                     self.host_staging.len(),
                     plan15.as_mut_ptr(),
@@ -161,10 +162,10 @@ impl KernelSpec for FiRuntime {
                 indptr as *mut i32,
                 last_len as *mut i32,
                 plan15.as_ptr(),
-                self.int_ws.unwrap().ptr as *mut std::ffi::c_void,
-                self.int_ws.unwrap().bytes,
-                self.float_ws.unwrap().ptr as *mut std::ffi::c_void,
-                self.float_ws.unwrap().bytes,
+                int_ws.ptr as *mut std::ffi::c_void,
+                int_ws.bytes,
+                float_ws.ptr as *mut std::ffi::c_void,
+                float_ws.bytes,
                 1, // batch
                 call.hq as i32,
                 call.hkv as i32,

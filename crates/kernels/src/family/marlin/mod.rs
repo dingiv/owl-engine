@@ -27,17 +27,18 @@
 
 use std::ffi::c_void;
 
-/// foreign-kernel 虚拟核名(server `is_foreign` 分派谓词的第二个臂)
-pub const GEMM_W4A16: &str = "marlin_gemm_w4a16";
+/// foreign-kernel 虚拟核名(字面量住址 = contract::names;本模块与
+/// client face/server runtime 一律经此 re-export 引用)
+pub const GEMM_W4A16: &str = crate::contract::names::GEMM_W4A16;
 
 /// foreign-kernel 虚拟核名(AWQ kU4 非对称臂;槽序 = GEMM_W4A16 的
 /// scales 之后插 zeros,共 7 Block + 4 sz)
-pub const GEMM_W4A16_AWQ: &str = "marlin_gemm_w4a16_awq";
+pub const GEMM_W4A16_AWQ: &str = crate::contract::names::GEMM_W4A16_AWQ;
 
 /// foreign-kernel 虚拟核名(BF16 激活/输出 W4A16 臂;E5-DF3 同日十二:
 /// 草稿路径 BF16 化,对齐 sglang 的 BF16 激活跑法。槽序与 GEMM_W4A16 一致,
 /// is_bf16=true 走 kBFloat16 三族实例)
-pub const GEMM_W4A16_BF16: &str = "marlin_gemm_w4a16_bf16";
+pub const GEMM_W4A16_BF16: &str = crate::contract::names::GEMM_W4A16_BF16;
 
 /// 槽序契约(LaunchMsg.args;与 cublas.rs 文档同构):
 /// `[T a, T b, T out, T scales, T workspace, T c_tmp, sz m, sz k, sz n, sz groupsize]`

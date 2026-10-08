@@ -3,7 +3,7 @@
 //! M4 落地:fold 树构建(§四.4 v2)—— 部分接受后从快照态重放已接受
 //! 前缀,**零整模前向**(复用现役 prefill 核消费 verify 图的 GDN 记录)。
 
-use crate::contract::{Dtype, ModelError};
+use crate::contract::ModelError;
 use crate::layers::gdn::{fold_layer, GdnBuffers};
 use crate::model::Model;
 use crate::tensor::TensorOps;

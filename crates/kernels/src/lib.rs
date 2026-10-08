@@ -22,8 +22,8 @@ pub mod family;
 /// 客户端平面(类型化 Call builder + 线格式单源;models 视角,
 /// 零 cudarc 依赖 —— 随 lib 全 feature 可用)
 pub mod client;
-/// 服务端平面(家族 runtime:FamilyRuntime 实现;feature=device ——
-/// FamilyRuntime 签名引用 device::Exec)
+/// 服务端平面(家族 runtime:registry::KernelSpec 实现;feature=device ——
+/// KernelSpec 签名引用 device::Exec)
 #[cfg(feature = "device")]
 pub mod server;
 
@@ -32,8 +32,8 @@ pub mod server;
 #[cfg(feature = "device")]
 pub mod device;
 
-/// 算子注册表(OpId 唯一住址 + FamilyRuntime 面 + OpRegistry;
-/// 同属服务端面 —— FamilyRuntime 签名引用 device::Exec,随 device 门)
+/// 算子注册表(OpId 唯一住址 + KernelSpec 面 + OpRegistry;
+/// 同属服务端面 —— KernelSpec 签名引用 device::Exec,随 device 门)
 #[cfg(feature = "device")]
 pub mod registry;
 

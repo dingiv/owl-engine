@@ -1,8 +1,8 @@
 //! server 侧名字面量门(P0 收官;operator-contract 设计 §4.1)。
 //!
 //! **server 主循环零算子知识**:`server/` 子树不得含任何算子名字字面量
-//! —— 名字分派在 kernels::registry(is_foreign_name/execute),家族名
-//! 经各 face 常量引用。违例 = 本测试红。
+//! —— 名字分派在 kernels::registry(knows/execute),家族名经各 face
+//! 常量引用。违例 = 本测试红。
 //! (backends/cuda::ops 的 runtime 面经 face 常量引名,亦零字面量。)
 
 use std::path::Path;

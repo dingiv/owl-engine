@@ -42,7 +42,7 @@ pub fn kv_manifest_gate(
         "owl_naive_attn_nc_f16",                         // 草稿池 f16 NC
         "owl_naive_attn_nc_bf16",                        // 草稿池 bf16 NC
     ];
-    let mut family: Vec<&str> = match quant {
+    let family: Vec<&str> = match quant {
         crate::env::KvQuant::Fp8E4M3 => fp8.to_vec(),
         crate::env::KvQuant::None => f16.to_vec(),
     };

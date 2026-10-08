@@ -19,8 +19,8 @@
 
 use crate::contract::{Arg, Bytes, LaunchMsg, OpError, KernelSource};
 
-/// 家族名(全库唯一字面量住址;models 经 [`GDN_CHUNKED`] 引用)
-pub const GDN_CHUNKED: &str = "gdn_chunked_delta_rule_fwd";
+/// 家族名(全库唯一字面量住址 = contract::names;models 经本常量引用)
+pub const GDN_CHUNKED: &str = crate::contract::names::GDN_CHUNKED;
 /// 槽序签名(lower_kernel 对位;O = 输出槽)
 pub const SIG: &str = "T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz";
 
@@ -122,29 +122,32 @@ impl GdnChunkedCall {
 
     /// 反序列化唯一点:server 面从此读(错位/错数 = 结构化 Err,
     /// 不再按数量盲切)。out = 解释器追加的输出块(O 槽,第 7 块)。
+    /// BlockSlice 仅认零偏移(eval slice_view(0,..) 合法产物;非零偏移
+    /// 本面不适用 —— 与 gdn_scalar 面同一口径,2026-10-12 review I-6 统一)。
     pub fn parse(msg: &LaunchMsg) -> Result<(Self, Bytes), OpError> {
-        const OP: &str = GDN_CHUNKED;
-        let op = || OpId_of(OP);
         let mut blocks: Vec<Bytes> = Vec::new();
         let mut scalars: Vec<u64> = Vec::new();
         for a in &msg.args {
             match a {
                 Arg::Block { id } => blocks.push(Bytes { id: *id, len: 0 }),
-                Arg::BlockSlice { .. } => {
-                    return Err(contract_err(op(), "args", "Block", "BlockSlice(切片视图不适用本面)"))
+                Arg::BlockSlice { id, byte_offset, .. } => {
+                    if *byte_offset != 0 {
+                        return Err(contract_err("args", "Block(零偏移)", "非零偏移 BlockSlice"));
+                    }
+                    blocks.push(Bytes { id: *id, len: 0 });
                 }
                 Arg::U64(v) => scalars.push(*v),
                 Arg::I32(v) => scalars.push(*v as u64),
                 Arg::F32(_) => {
-                    return Err(contract_err(op(), "args", "sz", "F32 标量(本面标量全 sz/U64)"))
+                    return Err(contract_err("args", "sz", "F32 标量(本面标量全 sz/U64)"));
                 }
             }
         }
         if blocks.len() != 7 {
-            return Err(contract_err(op(), "blocks", "7", &blocks.len().to_string()));
+            return Err(contract_err("blocks", "7", &blocks.len().to_string()));
         }
         if scalars.len() != 6 {
-            return Err(contract_err(op(), "scalars", "6", &scalars.len().to_string()));
+            return Err(contract_err("scalars", "6", &scalars.len().to_string()));
         }
         let shape = GdnShape {
             t: scalars[0] as u32,
@@ -178,7 +181,8 @@ impl GdnChunkedCall {
             grid: (0, 0, 0), // foreign 面:grid/block 由 runtime 单源(核内常量)
             block: (0, 0, 0),
             shared_mem: 0,
-            out_elems: self.shape.t as usize * self.shape.nv as usize * 128,
+            // vd = kd(GDN 家族律,server 同式推导;零字面量 —— 2026-10-12 review G 案)
+            out_elems: self.shape.t as usize * self.shape.nv as usize * self.shape.kd as usize,
         }
     }
 
@@ -192,13 +196,13 @@ impl GdnChunkedCall {
     pub fn shape(&self) -> GdnShape { self.shape }
 }
 
-fn contract_err(op: &'static str, field: &'static str, expect: &str, got: &str) -> OpError {
-    OpError::Contract { op: op.to_string(), field, expect: expect.to_string(), got: got.to_string() }
-}
-
-/// OpId 简写(避免循环 import 面膨胀;registry::OpId 为同一类型)
-fn OpId_of(s: &'static str) -> &'static str {
-    s
+fn contract_err(field: &'static str, expect: &str, got: &str) -> OpError {
+    OpError::Contract {
+        op: GDN_CHUNKED.to_string(),
+        field,
+        expect: expect.to_string(),
+        got: got.to_string(),
+    }
 }
 
 /// builder(字段名即契约;类型不对编译不过,长度不对构造期结构化报错)
@@ -240,7 +244,8 @@ impl GdnChunkedCallBuilder {
     }
 
     pub fn v(mut self, b: &Bytes) -> Result<Self, OpError> {
-        self.check(b, self.shape.t as usize * self.shape.nv as usize * 128, "v")?;
+        // vd = kd(GDN 家族律;零字面量,变架构随 GdnShape 单源)
+        self.check(b, self.shape.t as usize * self.shape.nv as usize * self.shape.kd as usize, "v")?;
         self.v = Some(b.clone());
         Ok(self)
     }
@@ -259,9 +264,27 @@ impl GdnChunkedCallBuilder {
     }
 
     pub fn state(mut self, pool: &Bytes, slot: u32) -> Result<Self, OpError> {
-        if pool.len != 0 && pool.len != 48 * 128 * 128 {
-            // 池账长 = slots·HV·KD·VD 的 f32 口径;HV/KD/VD 由形状单源推
-            // (27B = 48/128/128;变架构时此常数随家族配置单源化,M4)
+        // 池账长 = slots·HV·KD·VD(f32 口径;VD = kd 家族律)。slots 不入
+        // 契约,以整除性 + slot 越界两道校验替代(2026-10-12 review G 案:
+        // 原空体 if 为死校验,静默放行已删除)。
+        let slot_stride = self.shape.nv as usize * self.shape.kd as usize * self.shape.kd as usize;
+        if pool.len != 0 {
+            if pool.len % slot_stride != 0 {
+                return Err(OpError::Contract {
+                    op: GDN_CHUNKED.to_string(),
+                    field: "state",
+                    expect: format!("池长为 slot_stride({slot_stride}) 的整倍数"),
+                    got: pool.len.to_string(),
+                });
+            }
+            if slot as usize >= pool.len / slot_stride {
+                return Err(OpError::Contract {
+                    op: GDN_CHUNKED.to_string(),
+                    field: "slot",
+                    expect: format!("< {}(池长/stride)", pool.len / slot_stride),
+                    got: slot.to_string(),
+                });
+            }
         }
         self.state = Some(StateSlot { pool: pool.clone(), slot });
         Ok(self)

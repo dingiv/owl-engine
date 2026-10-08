@@ -5,6 +5,7 @@
 //! 零 host 转置、零第二份显存(2026-09-26 w_t 双槽形态作废)。
 //! 容器 + LoaderOps 装载形态。
 
+#[cfg(test)]
 use crate::tensor::Dtype;
 use crate::module::{Loadable, LoaderCtx, LoaderOps, QuantPlan, Weight};
 use crate::module::{ForwardCtx, Module};

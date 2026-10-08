@@ -310,7 +310,7 @@ impl DfAttn {
         // 自块写槽(写-后-打分;slots 表 = kv.slots [T])
         let (page, x) = Self::pool_geom(kv);
         let row_q = self.hq * self.hd;
-        let row_kv = self.hkv * self.hd;
+        let _row_kv = self.hkv * self.hd;
         // 非因果块注意力(naive NC 核:自块直读零 launch 内依赖;生产 FI
         // kNonCausal 变体挂 DF-4,KV 全走池 + wr 依赖边)
         // v2:grid (T, Hq) × block (hd) —— block-per-head flash 式

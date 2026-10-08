@@ -9,6 +9,13 @@ pub use crate::family::marlin::GEMM_W4A16;
 pub use crate::family::marlin::GEMM_W4A16_AWQ;
 pub use crate::family::marlin::GEMM_W4A16_BF16;
 
+/// 槽序签名(f16/bf16 通用臂;6 Block + 4 sz,O = 输出槽。
+/// 槽序单源 —— models 调用点经本常量声明,禁止手撸 —— 2026-10-12 review H 案)
+pub const SIG: &str = "T,T,O,T,T,T,sz,sz,sz,sz";
+
+/// AWQ 臂签名(kU4 has_zp:scales 后插 zeros,7 Block + 4 sz)
+pub const SIG_AWQ: &str = "T,T,O,T,T,T,T,sz,sz,sz,sz";
+
 /// 块引用(id + 字节偏移;BlockSlice 兼容;与 cublas 面同构)
 #[derive(Clone, Copy, Debug)]
 pub struct BlockRef {

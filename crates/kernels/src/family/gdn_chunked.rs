@@ -44,8 +44,8 @@
 //! 中间张量(g_cum/A/w/u/h/v_new/chunk 表)全为 handler 私有 scratch,
 //! 账外不回流 SSA(与 FI 工作空间同纪律)。
 
-/// foreign-kernel 虚拟核名(server `is_foreign` 分派臂)
-pub const GDN_CHUNKED_FWD: &str = "gdn_chunked_delta_rule_fwd";
+/// foreign-kernel 虚拟核名(server 分派臂;字面量住址 = contract::names)
+pub const GDN_CHUNKED_FWD: &str = crate::contract::names::GDN_CHUNKED;
 
 /// 槽序契约(LaunchMsg.args):
 /// `[T q, T k, T v, T g, T beta, T state(in/out f32 槽块), O out, T o_f32(scratch 出),

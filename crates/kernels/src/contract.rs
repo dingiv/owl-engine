@@ -94,6 +94,33 @@ pub enum Arg {
     F32(f32),
 }
 
+// ============================================================================
+// foreign 虚拟核名(线契约身份;全库唯一字面量住址,2026-10-12 review
+// D/I-10 案收口)—— family(FFI 面)/client(face)/server(runtime)/
+// models(零 feature 消费方)一律经此引用,禁止再写裸字面量。
+// server_name_lint 的清单 = 本表(两侧互证)。
+// ============================================================================
+pub mod names {
+    /// cuBLAS f16 GEMM(f16 基线 F1)
+    pub const GEMM_F16: &str = "cublas_gemm_f16";
+    /// cuBLAS BF16 GEMM(E5-DF3;DFlash2 草稿投影)
+    pub const GEMM_BF16: &str = "cublas_gemm_bf16";
+    /// GDN chunked 六核编排(FLA fork-bf16)
+    pub const GDN_CHUNKED: &str = "gdn_chunked_delta_rule_fwd";
+    /// GDN scalar 单核臂(lmdeploy pre_sm90 port)
+    pub const GDN_SCALAR: &str = "gdn_scalar_delta_rule_fwd";
+    /// Marlin W4A16 f16 臂
+    pub const GEMM_W4A16: &str = "marlin_gemm_w4a16";
+    /// Marlin AWQ(kU4 非对称)臂
+    pub const GEMM_W4A16_AWQ: &str = "marlin_gemm_w4a16_awq";
+    /// Marlin BF16 激活/输出臂
+    pub const GEMM_W4A16_BF16: &str = "marlin_gemm_w4a16_bf16";
+    /// FlashInfer paged prefill(f16 KV)
+    pub const PREFILL_FI: &str = "flashinfer_prefill_paged_f16";
+    /// FlashInfer paged prefill(fp8 e4m3 KV)
+    pub const PREFILL_FI_FP8KV: &str = "flashinfer_prefill_paged_fp8kv";
+}
+
 /// 发射消息
 pub struct LaunchMsg {
     pub kernel: KernelSource,
@@ -235,11 +262,15 @@ impl InvariantBox {
 //
 // 每个**在用**算子在 kernels 里显式声明一个 struct(字段即参数,自带
 // 值域/配对校验逻辑),实现本 trait。interpreter 在发射前强制调用
-// [`KernelSpec::validate`],不通过 = interpreter 层结构化报错 —— model
+// [`OpSpec::validate`],不通过 = interpreter 层结构化报错 —— model
 // 层使用者无感知,但毒参数到不了 GPU。
+//
+// ⚠️ 命名(2026-10-12 review B 案):本 trait 与 registry::KernelSpec
+// (服务端 runtime 原子单位,用户裁决名)曾同名相撞 —— 客户端胖算子
+// 规格改名 **OpSpec**,registry 侧保持 KernelSpec 不动。
 
 /// 胖算子契约(实现者须 Debug;Op 节点 Clone/Debug 派生需要)
-pub trait KernelSpec: Send + Sync + std::fmt::Debug {
+pub trait OpSpec: Send + Sync + std::fmt::Debug {
     /// 线格式名(server 分派键;= 登记表登记名)
     fn name(&self) -> &'static str;
 

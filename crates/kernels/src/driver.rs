@@ -136,6 +136,10 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "gdn.conv_fwd" => gdn::conv_fwd(dt, ax(0)),
         "gdn.recurrence_varlen_gqa" => gdn::recurrence_varlen_gqa(dt, ax(2), ax(0), ax(1)), // aux = [nv, kd, vd]
         "gdn.norm_act" => gdn::norm_act(dt, ax(0), ax(1), ax(2)), // aux = [rows, value_dim, group_size]
+        // foreign 家族臂(2026-10-12 用户律:gdn 两臂入词表,与 native 同一
+        // Call 通道;名字 = family 单源,发射配置 = FOREIGN 哨兵直通)
+        "gdn.chunked_delta" => gdn::chunked_delta(),
+        "gdn.scalar_delta" => gdn::scalar_delta(),
         "ops.sigmoid" => ops::sigmoid(dt),
         "attn.k0_write" => attn::k0_write(dt, ax(0)),
         "attn.k0_write_fp8" => attn::k0_write_fp8(ax(0)), // B6.2:f16 入 → e4m3 池(ax=tokens)
@@ -203,11 +207,6 @@ pub fn resolve(req: OpReq) -> KernelPick {
     }
 }
 
-const fn aux1(a: &[usize]) -> usize {
-    a[0]
-}
-
-
 /// 一次拾取的产物:名字 + 发射配置(构造 [`Kernel`](crate::sources) 对应
 /// 的发射全部输入;grid 哨兵 (0,0,0) = 解释层按输出元素数自动 1D
 /// ceil/256,同登记表约)
@@ -220,12 +219,28 @@ pub struct KernelPick {
 /// 哨兵 1D 发射形态(逐元素/批量核的公共形态)
 pub const SENTINEL_1D: Shape = Shape { grid: (0, 0, 0), block: (256, 1, 1), smem: 0 };
 
+/// foreign 家族臂发射形态(2026-10-12 用户律:具名算子入词表):grid/
+/// block 由 server 家族 runtime 单源,发射配置层/解释层零感知 ——
+/// (0,0,0) 直通,server 按名分派后自算网格
+pub const FOREIGN: Shape = Shape { grid: (0, 0, 0), block: (0, 0, 0), smem: 0 };
+
 // ============================================================================
 // §3 算子族(GDN;F5 批 1-5 核 + 工单 G 批核,2026-09-25 语义)
 // ============================================================================
 
 pub mod gdn {
-    use super::{DType, KernelPick, Shape, SENTINEL_1D};
+    use super::{DType, KernelPick, Shape, FOREIGN, SENTINEL_1D};
+
+    /// gdn_chunked 六核编排(FLA fork-bf16;foreign 家族臂):名字 =
+    /// family 单源,发射配置 = FOREIGN 哨兵(server 家族 runtime 自算网格)
+    pub fn chunked_delta() -> KernelPick {
+        KernelPick { name: crate::family::gdn_chunked::GDN_CHUNKED_FWD, shape: FOREIGN }
+    }
+
+    /// gdn_scalar 单核臂(lmdeploy pre_sm90 port;foreign 家族臂同上)
+    pub fn scalar_delta() -> KernelPick {
+        KernelPick { name: crate::family::gdn_scalar::GDN_SCALAR_FWD, shape: FOREIGN }
+    }
 
     /// gating_g:g = softplus(a_log) + dt_bias 门(批 1;哨兵 1D)
     pub fn gating_g(dt: DType) -> KernelPick {

@@ -492,7 +492,13 @@ where
                 eprintln!("[call] {} -> {} grid={:?} block={:?} smem={} n_elems={}",
                     op.0, pick.name, pick.shape.grid, pick.shape.block, pick.shape.smem, n_elems);
             }
-            let kernel = crate::kernel::with_pick(pick);
+            // foreign 家族臂(2026-10-12 用户律:gdn 两臂入词表):名字不在
+            // native 登记表(无 .cu 源,server 按名分派家族 runtime);
+            // 槽序 sig = 家族线契约单源(owl_kernels::client face)
+            let kernel = match crate::ops::foreign_sig(pick.name) {
+                Some(sig) => crate::kernel::Kernel::new(pick.name, "").with_sig(sig),
+                None => crate::kernel::with_pick(pick),
+            };
             // 以下与 Op::Kernel 臂同构(登记表 dtype 守门 + alloc + lower + launch)
             if let Some(e) = crate::kernel::lookup(kernel.name) {
                 if e.dtype != dtype {
@@ -525,6 +531,25 @@ where
             let out = ctx.face.alloc_uninit(dtype, n_elems).await?;
             ctx.track_new(out.id);
             let msg = crate::ops::lower_kernel(kernel, &t.args, &ins, &out, n_elems);
+            ctx.face.launch(msg).await?;
+            out
+        }
+        Op::Spec { spec } => {
+            // 胖算子(2026-10-12 review A 案接线):发射前强制 validate ——
+            // 毒参数在此结构化报错,到不了 GPU(E1-E15 台账的 interpreter 闸门)。
+            spec.validate().map_err(|e| ModelError::Msg(format!("[spec] {e}")))?;
+            // out 声明对账:spec.out()(算子权威)vs 节点标注(C1 单源);
+            // 不符 = 声明内部矛盾,结构化报错
+            let (spec_dt, spec_shape) = spec.out();
+            if spec_dt != dtype || spec_shape != shape {
+                return Err(ModelError::Msg(format!(
+                    "[spec 守门] {} out 声明 {:?} {:?} != 节点标注 {:?} {:?}",
+                    spec.name(), spec_dt, spec_shape, dtype, shape
+                )));
+            }
+            let out = ctx.face.alloc_uninit(dtype, n_elems).await?;
+            ctx.track_new(out.id);
+            let msg = spec.wire(&ins, &out);
             ctx.face.launch(msg).await?;
             out
         }
@@ -590,6 +615,54 @@ where
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod spec_arm_tests {
+    //! Op::Spec 臂(2026-10-12 review A 案接线):胖算子 validate 强制。
+    use super::*;
+    use crate::tensor::TensorOps;
+    use owl_kernels::client::native::NarrowStrided;
+
+    fn spec_node(outer: usize, start: usize, id: u64) -> TensorOps {
+        let spec = NarrowStrided {
+            outer,
+            src_dim: 32,
+            start,
+            out_dim: 16,
+            src: owl_kernels::contract::Bytes { id, len: outer * 32 },
+        };
+        TensorOps::spec(
+            std::sync::Arc::new(spec),
+            vec![TensorOps::of_block(id, Dtype::F16, vec![outer, 32])],
+            Dtype::F16,
+            vec![outer * 16],
+        )
+    }
+
+    /// 毒参数(validate 拒):窗口越界在 interpreter 层结构化报错,
+    /// 到不了 face(GPU/CPU 皆然)—— E1-E15 台账的 interpreter 闸门
+    #[tokio::test]
+    async fn spec_validates_before_launch() {
+        let mut face = owl_cpu::CpuFace::new();
+        let err = eval_ops(spec_node(4, 20, 701).step(), &mut face)
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("[spec]"), "应为 spec validate 错: {msg}");
+    }
+
+    /// 合法参数:闸门放行 → 推进到发射,CPU 面无 GPU 结构化拒
+    /// (证明第二条不是测试哑火 —— 错误必须来自发射面而非 validate)
+    #[tokio::test]
+    async fn spec_valid_params_reach_launch() {
+        let mut face = owl_cpu::CpuFace::new();
+        let err = eval_ops(spec_node(4, 0, 702).step(), &mut face)
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(!msg.contains("[spec]"), "validate 不应拦合法参数: {msg}");
+    }
 }
 
 #[cfg(test)]

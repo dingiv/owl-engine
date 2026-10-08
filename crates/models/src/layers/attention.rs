@@ -24,8 +24,8 @@
 //! `Module` trait;统一 ForwardCtx 随 runner 立项)。
 
 use crate::contract::Dtype;
+#[cfg(test)]
 use crate::kernel;
-use owl_kernels::driver;
 use crate::ops::ids;
 use crate::layers::linear::Linear;
 use crate::layers::{concat_rows_hier, narrow_strided};
@@ -100,7 +100,7 @@ impl Attention {
         // 替 norm_rope×2 + K0 三发)
         let pol = crate::module::kv_paged_policy(dt_raw);
         let page_ok = pol.as_ref()
-            .map(|p| driver::attn::paged_decode_ok(self.hd, p.page))
+            .map(|p| crate::ops::paged_decode_ok(self.hd, p.page))
             .unwrap_or(false);
         let force_naive = ctx.env.attn.force_naive_prefill;
         let use_fused_insert =
@@ -195,7 +195,7 @@ impl Attention {
             // 页/x 来自 kv_paged_policy,块表语义见 block_tables 头注。
             // 页配对律住 driver(attn::paged_decode_ok / resolve 内 wrapper
             // 选择)—— 谓词门控声明,执行期 env.page 终审)
-            if !force_naive && driver::attn::paged_decode_ok(self.hd, pol.page) {
+            if !force_naive && crate::ops::paged_decode_ok(self.hd, pol.page) {
                 // 可达性:use_fused_insert 已覆盖同谓词;防御臂(理论不可达)
                 // —— K0 形态保留以防 future 分派变化
                 // B6.2:fp8 池 → K0 转换写(f16 输入 → e4m3 池)
@@ -560,8 +560,8 @@ impl Attention {
     /// ForwardCtx.fi):K0-dual 写池(classic + kHND 影子)→ FI 虚拟核
     /// (server plan 缓存 + run;FA2 级 tensor-core,causal chunked 语义
     /// = q 对齐 kv 尾部,与 K0 先行的池读序配套)。
-    /// 槽序契约:7 Block + O + 8 sz(owl_kernels::family::flashinfer::PREFILL_FI_SLOTS;
-    /// 字面量对齐 —— models 不开 kernels feature,marlin 先例)。
+    /// 槽序契约:8 Block + O + 8 sz(权威 = crate::ops::fi_prefill_node,
+    /// 2026-10-12 用户律:层不越解释层直触 kernels)。
     #[allow(clippy::too_many_arguments)]
     fn paged_prefill_fi_output(
         &self,
@@ -578,7 +578,6 @@ impl Attention {
     ) -> TensorOps {
         let dt = q.dtype;
         let page = pol.page as i32;
-        let fp8kv = ctx.env.kv.is_fp8();
         // ① K0-dual:classic K/V + kNHD K/V 影子(f16 或 e4m3;slots = 物理槽表)
         let wr = TensorOps::call(ctx.env.kv.k0_dual_op())
             .aux(&[tokens])
@@ -597,31 +596,26 @@ impl Attention {
             .arg_i32(pol.x as i32)
             .with_shape(dt, vec![1]); // 哑输出(契约 4)
         // ② FI prefill(q 已是 [T, Hq*hd] 投影+norm+rope 后;out [T, Hq*hd])
+        // 装配 = crate::ops::fi_prefill_node(2026-10-12 用户律:层零 kernels
+        // 知识 —— 槽序签名/scale 位型全在动作表单源)
         let ctx_total = ctx.ctx_base + tokens;
-        let y = TensorOps::of(
-            crate::kernel::Kernel::new(
-                ctx.env.kv.fi_prefill_name(),
-                "",
-            )
-            .with_sig("T,T,T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz,sz,sz"),
-        )
-        .arg(q)
-        .arg(&fi.kcs[ctx.fi_kvi])
-        .arg(&fi.vcs[ctx.fi_kvi])
-        .arg(fi.q_cu)
-        .arg(fi.indices)
-        .arg(fi.indptr)
-        .arg(fi.last_len)
-        .arg(&wr) // 树序依赖边(K0 先于分块读池;FI 不解引用)
-        .arg_usize(tokens)          // total_rows(本 chunk q 行)
-        .arg_usize(ctx_total)       // kv_indptr host 端点
-        .arg_usize(tokens)          // T
-        .arg_usize(self.hq)
-        .arg_usize(self.hkv)
-        .arg_usize(self.hd)
-        .arg_usize(pol.page)
-        .arg_usize((1.0f32 / (self.hd as f32).sqrt()).to_bits() as usize)
-        .with_shape(dt, vec![tokens, self.hq * self.hd]);
+        let y = crate::ops::fi_prefill_node(
+            ctx.env.kv.fi_prefill_name(),
+            q,
+            &fi.kcs[ctx.fi_kvi],
+            &fi.vcs[ctx.fi_kvi],
+            fi.q_cu,
+            fi.indices,
+            fi.indptr,
+            fi.last_len,
+            &wr,
+            tokens,     // total_rows(本 chunk q 行)
+            ctx_total,  // kv_indptr host 端点
+            self.hq,
+            self.hkv,
+            self.hd,
+            pol.page,
+        );
         // ③ 输出门(f16 融合单发)+ 出投影(与旧路径同)
         let n = tokens * self.hq * self.hd;
         let y = TensorOps::call(ids::ATTN_GATE_MUL)
@@ -710,7 +704,7 @@ impl Attention {
                 // 契约 BLOCK∈{32,64}),仅页 32 池可进;页 16 池回退 naive
                 //(bs16 prefill 实例化 = 越契约,挂账)。smem 公式的 page 项
                 // 与核 BLOCK 同源,见 paged_prefill_output
-                if driver::attn::paged_prefill_ok(self.hd, pol.page) {
+                if crate::ops::paged_prefill_ok(self.hd, pol.page) {
                     // 诊断二分开关保留(OWL_FORCE_NAIVE_PREFILL=1 走逐 token
                     // 对照;2026-10-01 撤销遗留的 if false 硬禁用 —— 它让
                     // 全部 prefill 注意力落 naive 逐 token 路径)
@@ -2114,21 +2108,15 @@ mod split_probe_tests {
             .arg_i32((hkv * hd) as i32).arg_i32((hkv * hd) as i32)
             .arg_i32(hkv as i32).arg_i32(hd as i32).arg_i32(page as i32).arg_i32(x as i32)
             .with_shape(Dtype::F16, vec![1]);
-        let y = TensorOps::of(
-            crate::kernel::Kernel::new(
-                // 测试局部选择(生产走 ctx.env.kv.fi_prefill_name() 收口)
-                if fp8kv { "flashinfer_prefill_paged_fp8kv" } else { "flashinfer_prefill_paged_f16" },
-                "",
-            )
-            .with_sig("T,T,T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz,sz,sz"),
-        )
-        .arg(&q).arg(&kfi_t).arg(&vfi_t)
-        .arg(&q_cu).arg(&indices).arg(&indptr).arg(&last_len)
-        .arg(&wr)
-        .arg_usize(t).arg_usize(ctx_total).arg_usize(t)
-        .arg_usize(hq).arg_usize(hkv).arg_usize(hd).arg_usize(page)
-        .arg_usize((1.0f32 / (hd as f32).sqrt()).to_bits() as usize)
-        .with_shape(Dtype::F16, vec![t, hq * hd]);
+        let y = crate::ops::fi_prefill_node(
+            // 测试局部选择(生产走 ctx.env.kv.fi_prefill_name() 收口)
+            crate::ops::fi_name(fp8kv),
+            &q, &kfi_t, &vfi_t,
+            &q_cu, &indices, &indptr, &last_len,
+            &wr,
+            t, ctx_total,
+            hq, hkv, hd, page,
+        );
         let got = crate::testkit::harvest_f16(&mut gpu, &y).await;
                 gpu.close().await.expect("close");
 

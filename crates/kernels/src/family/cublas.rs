@@ -26,11 +26,11 @@ use std::sync::Arc;
 /// **槽序契约**(LaunchMsg.args,与 .cu 核同构 —— 输出块固定末参前的
 /// Block 序 + 类型化标量):
 /// `[T a, T b, T out, sz m, sz k, sz n, sz nt]`(nt: 1 = owl Linear nt 形)。
-pub const GEMM_F16: &str = "cublas_gemm_f16";
+pub const GEMM_F16: &str = crate::contract::names::GEMM_F16;
 
 /// BF16 GEMM 外来核名(E5-DF3 同日十四;DFlash2 草稿非量化投影
 /// kernel_projection/hidden_projection 消费;槽序契约同 GEMM_F16)
-pub const GEMM_BF16: &str = "cublas_gemm_bf16";
+pub const GEMM_BF16: &str = crate::contract::names::GEMM_BF16;
 
 /// foreign 分派谓词(server handle_launch 前置检查)
 pub fn is_foreign(name: &str) -> bool {

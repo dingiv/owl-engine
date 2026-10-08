@@ -10,7 +10,6 @@ use crate::layers::narrow_strided;
 use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, QuantPlan, Weight};
 use crate::formats::w4a16::marlin_n_pack;
 use crate::TensorOps;
-use owl_kernels::family::marlin::{v2_workspace_len, GEMM_W4A16, GEMM_W4A16_AWQ, GEMM_W4A16_BF16};
 
 pub struct Linear {
     /// 权重槽 [out, in](检查点原生布局,零转置)
@@ -84,7 +83,7 @@ impl Linear {
         ));
         self.ws = Some(Weight::new_typed_u32(
             key,
-            vec![v2_workspace_len(n_pack)],
+            vec![crate::ops::marlin_ws_elems(n_pack)],
         ));
         // c_tmp 独立小块(use_fp32_reduce=false 不触碰,但槽位契约要求
         // 独立指针 —— 不可与 ws alias)
@@ -113,7 +112,7 @@ impl Linear {
             key,
             vec![self.in_dim / g, n_pack / 8],
         ));
-        self.ws = Some(Weight::new_typed_u32(key, vec![v2_workspace_len(n_pack)]));
+        self.ws = Some(Weight::new_typed_u32(key, vec![crate::ops::marlin_ws_elems(n_pack)]));
         self.ctmp = Some(Weight::new_typed_u32(key, vec![1]));
         self.quant_group = Some(g);
     }
@@ -146,35 +145,21 @@ impl Linear {
             // (E5-DF3 同日十二:草稿路径 BF16 化,scales 保持 F16 装载,
             // a/c=BF16 的 marlin 实例;s_type = F16 两族一致)
             let bf16_act = xs.dtype == Dtype::BF16;
-            let (name, sig, args): (&str, &str, Vec<TensorOps>) = match (&self.zs, bf16_act) {
-                // AWQ kU4 臂:scales 后插 zeros(槽序契约 7 Block)
-                (Some(zs), _) => (
-                    GEMM_W4A16_AWQ,
-                    "T,T,O,T,T,T,T,sz,sz,sz,sz",
-                    vec![xs.clone(), qw.decl(), sc.decl(), zs.decl(), ws.decl(), ctmp.decl()],
-                ),
-                (None, true) => (
-                    GEMM_W4A16_BF16,
-                    "T,T,O,T,T,T,sz,sz,sz,sz",
-                    vec![xs.clone(), qw.decl(), sc.decl(), ws.decl(), ctmp.decl()],
-                ),
-                (None, false) => (
-                    GEMM_W4A16,
-                    "T,T,O,T,T,T,sz,sz,sz,sz",
-                    vec![xs.clone(), qw.decl(), sc.decl(), ws.decl(), ctmp.decl()],
-                ),
-            };
-            let out_dtype = if bf16_act { Dtype::BF16 } else { Dtype::F16 };
-            let mut marlin = TensorOps::of(crate::kernel::Kernel::new(name, "").with_sig(sig));
-            for a in &args {
-                marlin = marlin.arg(a);
-            }
-            let marlin = marlin
-                .arg_usize(m)
-                .arg_usize(self.in_dim)
-                .arg_usize(n_pack)
-                .arg_usize(g as usize)
-                .with_shape(out_dtype, vec![m, n_pack]);
+            // marlin 臂装配 = crate::ops::§6(2026-10-12 用户律:层零 kernels
+            // 知识 —— 名字/签名/AWQ 插槽全在动作表单源)
+            let marlin = crate::ops::marlin_node(
+                xs,
+                &qw.decl(),
+                &sc.decl(),
+                &ws.decl(),
+                &ctmp.decl(),
+                self.zs.as_ref().map(|z| z.decl()).as_ref(),
+                m,
+                self.in_dim,
+                n_pack,
+                g as usize,
+                bf16_act,
+            );
             return narrow_strided(
                 &marlin,
                 m,
@@ -201,12 +186,12 @@ impl Loadable for Linear {
                 // (源供原始 packed,DMA 上卡后 GPU 重排到 marlin 布局);
                 // 否则经典键(CPU 懒物化)。
                 let device = self.zs.is_some() && ctx.device_repack;
-                let mut ops = if device {
+                let ops = if device {
                     // 设备重排:want 键 = 原始 packed 源键(源零重排直拷),
                     // 布局带核名与原始形状;DMA 上卡后 GPU 重排到 marlin 布局
                     qw.layout_as_device_rearrange(
                         format!("{base}.packed_raw"),
-                        owl_kernels::driver::load::CT_REPACK,
+                        crate::ops::CT_REPACK,
                         self.out_dim,
                         self.in_dim / 8,
                         ctx,

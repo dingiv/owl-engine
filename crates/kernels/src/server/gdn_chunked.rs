@@ -16,7 +16,7 @@
 //! ⚠️ **ai_buf 字节池注**:merge 核写 bf16 字节、wu 按 bf16 读;历史
 //! Rust 视角 f32 仅为字节池标注(新链 ScratchBuf 无 dtype 假装)。
 
-use cudarc::driver::{CudaFunction, PushKernelArg};
+use cudarc::driver::CudaFunction;
 use crate::contract::{Bytes, LaunchMsg, OpError, OpId};
 use crate::device::{DeviceRes, Exec, LaunchVal, ScratchBuf};
 
@@ -30,9 +30,8 @@ use std::sync::Arc;
 const OP: OpId = OpId(GDN_CHUNKED);
 const ASSET: &str = "gdn_chunked";
 const CAST: &str = "owl_cast";
-
-const HV27: usize = 48; // 27B GDN 头数(家族配置;变架构随契约单源化)
-const D128: usize = 128;
+// 家族几何(HV/KD/VD)随调用 shape 单源(GdnShape);server 零字面量
+// —— 旧 HV27/D128 常量声明后未用已删(2026-10-12 review G 案)
 
 /// 私有 scratch(几何 = 生产 realloc 同款;ptr 句柄,账本在 res 侧)
 #[derive(Default)]
@@ -54,7 +53,6 @@ struct Scratch {
     o_b16: Option<ScratchBuf>,       // t*hv*vd bf16
     meta: HashMap<(usize, usize), ScratchBuf>, // (T,NT) 键 i64 表驻留
     grave: Vec<ScratchBuf>,          // A1.7 坟场
-    t_cap: usize,
 }
 
 /// cast 发射(block 256;handler 同款;自由函数免长借用)
@@ -180,12 +178,12 @@ impl KernelSpec for GdnChunkedRuntime {
             ensure_one(&mut st.h_buf, &mut st.grave, res, nt * hv * vd * kd * 2, "gdn.h_buf")?;
         let v_new =
             ensure_one(&mut st.v_new, &mut st.grave, res, t * hv * vd * 2, "gdn.v_new")?;
-        if st.state_t.is_none() {
-            st.state_t = Some(res.alloc(hv * kd * vd * 4, "gdn.state_t")?);
-            st.state_out_t = Some(res.alloc(hv * kd * vd * 4, "gdn.state_out")?);
-        }
-        let state_t = st.state_t.as_ref().unwrap().ptr;
-        let state_out = st.state_out_t.as_ref().unwrap().ptr;
+        // 状态转置缓冲:与其他 scratch 同一 ensure 律(扩容 = 坟场;
+        // 2026-10-12 review E 案:原一次性定容不随形状扩,换 hv/kd 即 OOB)
+        let state_t =
+            ensure_one(&mut st.state_t, &mut st.grave, res, hv * kd * vd * 4, "gdn.state_t")?;
+        let state_out =
+            ensure_one(&mut st.state_out_t, &mut st.grave, res, hv * kd * vd * 4, "gdn.state_out")?;
         let in_q = ensure_one(&mut st.in_q, &mut st.grave, res, t * nk * kd * 2, "gdn.in_q")?;
         let in_k = ensure_one(&mut st.in_k, &mut st.grave, res, t * nk * kd * 2, "gdn.in_k")?;
         let in_v = ensure_one(&mut st.in_v, &mut st.grave, res, t * hv * vd * 2, "gdn.in_v")?;
@@ -194,7 +192,6 @@ impl KernelSpec for GdnChunkedRuntime {
         let in_g = ensure_one(&mut st.in_g, &mut st.grave, res, t * hv * 4, "gdn.in_g")?;
         let o_b16 =
             ensure_one(&mut st.o_b16, &mut st.grave, res, t * hv * vd * 2, "gdn.o_b16")?;
-        st.t_cap = st.t_cap.max(t);
 
         // ── 输入解析(块句柄 → 设备指针)──
         let q_p = res.resolve(call.q())?;

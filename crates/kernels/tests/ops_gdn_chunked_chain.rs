@@ -13,13 +13,12 @@
 
 use cudarc::driver::{CudaContext, CudaSlice, DevicePtr};
 use owl_kernels::server::gdn_chunked::GdnChunkedRuntime;
-use owl_kernels::contract::{Bytes, LaunchMsg, OpId};
-use owl_kernels::device::{DeviceRes, Exec, LaunchVal, ScratchBuf};
+use owl_kernels::contract::{Bytes, LaunchMsg};
+use owl_kernels::device::{DeviceRes, Exec, ScratchBuf};
 use owl_kernels::client::gdn_chunked::GdnChunkedCall;
 use owl_kernels::registry::KernelSpec;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use cudarc::driver::DevicePtrMut;
 use std::sync::Arc;
 
 // ── 测试资源面:CudaContext 直挂(生产 server 的同构最小实现)──

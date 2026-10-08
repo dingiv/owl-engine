@@ -11,6 +11,8 @@ use crate::contract::{Arg, Bytes, LaunchMsg, OpError};
 pub const PREFILL_FI: &str = crate::family::flashinfer::PREFILL_FI;
 pub const PREFILL_FI_FP8KV: &str = crate::family::flashinfer::PREFILL_FI_FP8KV;
 
+pub use super::fi_sig::{scale_bits, SIG};
+
 #[derive(Clone, Copy, Debug)]
 pub struct BlockRef {
     pub id: u64,

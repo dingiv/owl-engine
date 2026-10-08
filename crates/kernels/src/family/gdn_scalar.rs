@@ -15,8 +15,8 @@
 //! 五核臂 [`crate::gdn_chunked`] 并存为对照臂,env 选路)。
 //! 中间张量零个 —— 状态即全部,账外 scratch 仅 o_f32(引擎侧 cast 用)。
 
-/// foreign-kernel 虚拟核名(server `is_foreign` 分派臂)
-pub const GDN_SCALAR_FWD: &str = "gdn_scalar_delta_rule_fwd";
+/// foreign-kernel 虚拟核名(server 分派臂;字面量住址 = contract::names)
+pub const GDN_SCALAR_FWD: &str = crate::contract::names::GDN_SCALAR;
 
 /// foreign 分派谓词
 pub fn is_foreign(name: &str) -> bool {

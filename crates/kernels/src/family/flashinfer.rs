@@ -31,10 +31,10 @@
 
 use std::ffi::c_void;
 
-/// foreign-kernel 虚拟核名(server `is_foreign` 分派臂;f16 KV)
-pub const PREFILL_FI: &str = "flashinfer_prefill_paged_f16";
+/// foreign-kernel 虚拟核名(server 分派臂;f16 KV;字面量住址 = contract::names)
+pub const PREFILL_FI: &str = crate::contract::names::PREFILL_FI;
 /// fp8 KV 变体(e4m3 KV + half Q/Out;槽序同 PREFILL_FI)
-pub const PREFILL_FI_FP8KV: &str = "flashinfer_prefill_paged_fp8kv";
+pub const PREFILL_FI_FP8KV: &str = crate::contract::names::PREFILL_FI_FP8KV;
 
 /// 槽序契约(LaunchMsg.args):
 /// `[T q, T k_fi, T v_fi, T q_cu_seqlens, T indices, T indptr, T last_len,

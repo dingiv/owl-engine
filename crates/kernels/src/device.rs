@@ -191,8 +191,10 @@ impl Exec {
             .map_err(|e| OpError::Asset { op: OpId("exec").0.to_string(), detail: format!("setattr {bytes}: {e:?}") })
     }
 
-    /// 捕获窗守卫 + 登记的统一入口(横切纪律一次写成):
-    /// 捕获窗内 = 记 [`LaunchNote`] 交 res;窗外 = 直发。
+    /// 捕获窗守卫 + 登记的统一入口(横切纪律一次写成)。
+    /// 两路都**真实发射**:捕获窗内由驱动把发射写进图(CUDA stream
+    /// capture 原生语义),同时记 [`LaunchNote`] 交 res 账面(A1.6;是否
+    /// 结构化 CaptureRecord 归 graph 治理层立项);窗外 = 纯直发。
     /// 参数 = **owned 值表**([`LaunchVal`]):HRTB 闭包与 cudarc arg 的
     /// 值生命周期相克(E0597,首试教训);owned 值表零生命周期参数,
     /// 调用点也不再需要 builder 闭包样板。

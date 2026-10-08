@@ -27,10 +27,12 @@
 //! 2026-09-26 重复求值案的语义根因(见下)。
 //!
 //! **值形态与两个后果**:
-//! 1. `Clone` = 深拷贝整棵子树;**id 字段原样保留,不重新分配**。
+//! **值形态与两个后果**(2026-10-12 修订:parents 已改 Arc 共享 ——
+//! `Clone` = 浅拷贝 O(1),物理 DAG;"深拷贝树形展开"为历史描述,已废):
+//! 1. `Clone` = 浅拷贝(parents 为 `Arc` 共享);**id 字段原样保留,不重新分配**。
 //!    ⇒ 同一逻辑节点无论被克隆多少份、嵌在树的多少个位置,id 相同
 //!    ⇒ "同 id = 同节点 = 同值",这是全组件最重要的不变量;
-//! 2. 由于深拷贝,共享节点在声明树里**物理存在多份**(DAG 的树形展开)。
+//! 2. 共享节点在声明树里**物理只有一份**(真 DAG;flatten 按 id 去重)。
 //!
 //! **⚠️ 重复求值陷阱(2026-09-26 实录,勿再踩)**:
 //! 解释器若无 CSE,按树递归求值会把共享节点**执行多次**:
@@ -56,8 +58,8 @@
 //!    64 账长块)。块 id 只存在 `Op::Block{id}` 数据字段里。
 //!
 //! **结构定稿**:
-//! - 值语义:深拷贝输入子树(配置面一次性成本;执行期由 memo 保证
-//!   DAG 语义,见上);
+//! - Arc 物理 DAG:arg/join 均浅挂共享(配置面一次性;执行期由 memo 保证
+//!   DAG 语义,见上)。
 //! - 无 Arc、无 Tx、无共享别名——纯值世界;
 //! - 每节点携带全局唯一自增 id(跨线程;server 对账/缓存键),声明链
 //!   与运行时张量共用同一套进程级身份证。
@@ -270,10 +272,10 @@ impl TensorOps {
         }
     }
 
-    /// 胖算子声明(kernels::contract::KernelSpec;validate 由 interpreter
+    /// 胖算子声明(kernels::contract::OpSpec;validate 由 interpreter
     /// 发射前强制,失败 = interpreter 层结构化报错)
     pub fn spec(
-        spec: std::sync::Arc<dyn owl_kernels::contract::KernelSpec>,
+        spec: std::sync::Arc<dyn owl_kernels::contract::OpSpec>,
         parents: Vec<TensorOps>,
         dtype: Dtype,
         shape: Shape,
@@ -542,7 +544,7 @@ impl TensorOps {
         }
     }
 
-    /// append:深拷贝输入子树进新节点(值语义;配置面一次性成本)
+    /// append:新节点浅挂输入(parents Arc 共享;同 id 不变量的根基)
     fn join(&self, op: Op, rhs: Option<&TensorOps>, meta: (Dtype, Shape), args: Vec<KernelArg>) -> TensorOps {
         let mut parents = vec![std::sync::Arc::new(self.clone())];
         if let Some(r) = rhs {

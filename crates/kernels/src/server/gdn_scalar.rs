@@ -3,8 +3,8 @@
 //! 移植自 handle_gdn_scalar:o_f32 坟场(A1.7)+ soff 不变盒按 T 键
 //! (捕获回放读死栈案第二违例的解法)+ cast-out f32→f16。
 
-use crate::contract::{Bytes, InvariantBox, LaunchMsg, OpError, OpId, Stage};
-use crate::device::{LaunchVal, ScratchBuf};
+use crate::contract::{Bytes, InvariantBox, LaunchMsg, OpError, OpId};
+use crate::device::ScratchBuf;
 
 use crate::family::gdn_scalar::cubin;
 use crate::client::gdn_scalar::{GdnScalarCall, GDN_SCALAR};

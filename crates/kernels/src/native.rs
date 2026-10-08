@@ -158,13 +158,6 @@ pub static REGISTRY: &[Entry] = &[
     // f16 <-> bf16 铸边界(E5-DF3 同日十四;embed 后入草稿 / lm_head 前出草稿)
     Entry { name: "owl_cast_f16_bf16", source: sources::attention::CAST, args: "T,i32,T", dtype: crate::contract::Dtype::BF16 },
     Entry { name: "owl_cast_bf16_f16", source: sources::attention::CAST, args: "T,i32,T", dtype: crate::contract::Dtype::F16 },
-    // prefill bs16 变体(池页 16,与 decode v1/v2 同池;hd256 = qwen3.5-0.8B 档)
-    // prefill 主条目 = bs32(vendor 契约 BLOCK∈{32,64};bs16 越契约已废)
-    Entry { name: "vllm_chunked_prefill_paged_attn_opt_f16_hd128", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "vllm_chunked_prefill_paged_attn_opt_f16_hd256", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    // ---- B6.3:fp8 e4m3 KV 读变体(chunked prefill;签名同 f16)----
-    Entry { name: "vllm_chunked_prefill_paged_attn_opt_fp8_hd128", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "vllm_chunked_prefill_paged_attn_opt_fp8_hd256", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     // ---- paged attention decode(K1/K2;vendor pagedattention.cuh + v1/v2.cu;
     //      grid 契约显式:v1 (H, seq, 1) / v2 (H, seq, ceil(max_ctx/512)) /
     //      reduce (H, seq, 1);block (128,1,1);shared 契约见 .cu 头注)----
@@ -358,6 +351,16 @@ mod tests {
     fn lookup_known_and_unknown() {
         assert!(lookup("owl_add_f32").is_some());
         assert!(lookup("owl_not_registered").is_none());
+    }
+
+    /// 登记名全库唯一(2026-10-12 review F 案:chunked prefill 四条目
+    /// 曾重复登记两次,lookup 首中掩盖;封闭登记表的唯一性不变量机器锁)
+    #[test]
+    fn registry_names_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for e in REGISTRY {
+            assert!(seen.insert(e.name), "{} 重复登记", e.name);
+        }
     }
 
     /// driver ↔ 登记表耦合测试(漂移拦截):driver 产出的每个名字必须

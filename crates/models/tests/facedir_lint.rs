@@ -46,3 +46,35 @@ fn models_shall_not_touch_server_face() {
         hits.join("\n")
     );
 }
+
+/// 用户律(2026-10-12):**层不越解释层直触 kernels** —— layers/ 子树
+/// 不得含任何 kernels 直引(face builder/名字/签名/谓词知识一律收编
+/// crate::ops §6 动作表;crate::kernel 垫子与 ops::kernel_call 为层侧
+/// 唯一合法声明面)。违例 = 本测试红,不等 code review 人眼。
+#[test]
+fn layers_shall_not_touch_kernels() {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let src = Path::new(manifest).join("../models/src/layers");
+    let mut hits = Vec::new();
+    walk_literal(&src, "owl_kernels", &mut hits);
+    assert!(
+        hits.is_empty(),
+        "layers 直触 kernels(应经 crate::ops §6 / crate::kernel 垫子):\n{}",
+        hits.join("\n")
+    );
+}
+
+fn walk_literal(dir: &Path, literal: &str, hits: &mut Vec<String>) {
+    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            walk_literal(&p, literal, hits);
+        } else if p.extension().is_some_and(|x| x == "rs") {
+            let Ok(src) = std::fs::read_to_string(&p) else { continue };
+            if src.contains(literal) {
+                hits.push(format!("{}: 含 `{literal}`", p.display()));
+            }
+        }
+    }
+}

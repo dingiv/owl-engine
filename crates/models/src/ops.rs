@@ -9,8 +9,9 @@
 //! = owl-kernels cu/;2026-09-25 垫子层裁决)。用户自定义 kernel 走
 //! `TensorOps::of(Kernel)` 直带源码(不经注册表,组合面逃生舱)。
 
-use crate::contract::{Arg, Bytes, KernelSource, LaunchMsg};
+use crate::contract::{Arg, Bytes, Dtype, KernelSource, LaunchMsg};
 use crate::kernel::Kernel;
+use crate::tensor::TensorOps;
 
 pub use owl_kernels::driver::OpId;
 
@@ -32,6 +33,10 @@ pub mod ids {
     pub const GDN_CONV_FWD: OpId = OpId("gdn.conv_fwd");
     pub const GDN_RECURRENCE: OpId = OpId("gdn.recurrence_varlen_gqa");
     pub const GDN_NORM_ACT: OpId = OpId("gdn.norm_act");
+    /// foreign 家族臂(2026-10-12 用户律:gdn 两臂入词表,与 native 同一
+    /// Call 通道;名字/发射配置归 driver,槽序 sig 归家族线契约单源)
+    pub const GDN_CHUNKED: OpId = OpId("gdn.chunked_delta");
+    pub const GDN_SCALAR: OpId = OpId("gdn.scalar_delta");
     pub const SIGMOID: OpId = OpId("ops.sigmoid");
     pub const ATTN_K0_WRITE: OpId = OpId("attn.k0_write");
     pub const ATTN_K0_WRITE_FP8: OpId = OpId("attn.k0_write_fp8");
@@ -273,7 +278,7 @@ pub enum Op {
     /// 参数槽有序:T(张量依赖)/ 标量;归约时张量参数先入账。
     Kernel { kernel: Kernel },
     /// 胖算子(kernels 侧 struct;validate/wire 由算子自带,interpreter 强制)
-    Spec { spec: std::sync::Arc<dyn owl_kernels::contract::KernelSpec> },
+    Spec { spec: std::sync::Arc<dyn owl_kernels::contract::OpSpec> },
 
     // ---- 状态节点(唯一显式副作用;SSA 外形,物理原地由 server 解释)----
     /// KV 写槽:声明"本节目写 kv manager 的这些格"——
@@ -373,10 +378,14 @@ pub fn lower_gemm(
     bf16: bool,
 ) -> LaunchMsg {
     LaunchMsg {
-        // 核名 = 线契约常量(权威定义 owl-kernels::cublas::GEMM_F16 / GEMM_BF16;
-        // models 不开 cublas feature,此处字面量对齐,测试互证)
+        // 核名 = 线契约常量(唯一字面量住址 owl_kernels::contract::names;
+        // models 零 cublas feature 也经此引用 —— 字面量全库只写一次)
         kernel: KernelSource {
-            name: if bf16 { "cublas_gemm_bf16".to_string() } else { "cublas_gemm_f16".to_string() },
+            name: if bf16 {
+                owl_kernels::contract::names::GEMM_BF16.to_string()
+            } else {
+                owl_kernels::contract::names::GEMM_F16.to_string()
+            },
             source: String::new(),
         },
         args: vec![
@@ -642,6 +651,261 @@ pub fn argmax_f32idx(x: &crate::tensor::TensorOps, n: usize, offset: usize) -> c
     .with_shape(Dtype::F32, vec![1])
 }
 
+
+// ============================================================================
+// §6 层↔kernels 隔离面(2026-10-12 用户律:**layers 禁触 owl_kernels**;
+// face builder/名字/槽序签名/OK 谓词知识全部收编本文件 —— 层只供语义
+// 张量与纯标量,装配细节 = 解释层动作表职责)
+// ============================================================================
+
+use owl_kernels::client::gdn_chunked as fc_chunked;
+use owl_kernels::client::gdn_scalar as fc_scalar;
+
+/// foreign 名字(层侧唯一出口;字面量住址 = owl_kernels::contract::names)
+pub use owl_kernels::driver::load::CT_REPACK;
+
+/// foreign 家族臂线格式(名字 → 槽序 sig;解释器 Call 臂消费 —— native
+/// 登记表无 foreign 条目,sig 住 client face 单源。gdn 两臂 Call 通道的
+/// 桥:driver 拾取名 → 本表 → lower_kernel 对位装配)
+pub(crate) fn foreign_sig(name: &str) -> Option<&'static str> {
+    if name == owl_kernels::family::gdn_chunked::GDN_CHUNKED_FWD {
+        Some(owl_kernels::client::gdn_chunked::SIG)
+    } else if name == owl_kernels::family::gdn_scalar::GDN_SCALAR_FWD {
+        Some(owl_kernels::client::gdn_scalar::SIG)
+    } else {
+        None
+    }
+}
+
+/// marlin W4A16 臂装配(AWQ 7 块 / f16·bf16 6 块;签名/名字 face 单源)
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn marlin_node(
+    xs: &TensorOps,
+    qw: &TensorOps,
+    sc: &TensorOps,
+    ws: &TensorOps,
+    ctmp: &TensorOps,
+    zs: Option<&TensorOps>,
+    m: usize,
+    in_dim: usize,
+    n_pack: usize,
+    group: usize,
+    bf16_act: bool,
+) -> TensorOps {
+    use owl_kernels::family::marlin;
+    let (name, sig): (&'static str, &'static str) = match zs {
+        Some(_) => (marlin::GEMM_W4A16_AWQ, owl_kernels::client::marlin::SIG_AWQ),
+        None if bf16_act => (marlin::GEMM_W4A16_BF16, owl_kernels::client::marlin::SIG),
+        None => (marlin::GEMM_W4A16, owl_kernels::client::marlin::SIG),
+    };
+    let node = TensorOps::of(Kernel::new(name, "").with_sig(sig))
+        .arg(xs)
+        .arg(qw)
+        .arg(sc);
+    let node = match zs {
+        Some(z) => node.arg(z),
+        None => node,
+    };
+    node.arg(ws)
+        .arg(ctmp)
+        .arg_usize(m)
+        .arg_usize(in_dim)
+        .arg_usize(n_pack)
+        .arg_usize(group)
+        .with_shape(if bf16_act { Dtype::BF16 } else { Dtype::F16 }, vec![m, n_pack])
+}
+
+/// marlin workspace 长度(i32 个数;装载域 Want 计尺,层零 kernels 知识)
+pub(crate) fn marlin_ws_elems(n: usize) -> usize {
+    owl_kernels::family::marlin::v2_workspace_len(n)
+}
+
+/// FI paged prefill 臂装配(9 Block + 8 sz;签名/scale 编码 face 单源。
+/// name 由调用方给 = env.fi_prefill_name() 收口)
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fi_prefill_node(
+    name: &'static str,
+    q: &TensorOps,
+    kcs: &TensorOps,
+    vcs: &TensorOps,
+    q_cu: &TensorOps,
+    indices: &TensorOps,
+    indptr: &TensorOps,
+    last_len: &TensorOps,
+    wr: &TensorOps,
+    total_rows: usize,
+    ctx_total: usize,
+    hq: usize,
+    hkv: usize,
+    hd: usize,
+    page: usize,
+) -> TensorOps {
+    TensorOps::of(Kernel::new(name, "").with_sig(owl_kernels::client::fi_sig::SIG))
+        .arg(q)
+        .arg(kcs)
+        .arg(vcs)
+        .arg(q_cu)
+        .arg(indices)
+        .arg(indptr)
+        .arg(last_len)
+        .arg(wr) // 树序依赖边(K0 先于分块读池;FI 不解引用)
+        .arg_usize(total_rows)
+        .arg_usize(ctx_total)
+        .arg_usize(total_rows)
+        .arg_usize(hq)
+        .arg_usize(hkv)
+        .arg_usize(hd)
+        .arg_usize(page)
+        .arg_usize(owl_kernels::client::fi_sig::scale_bits(hd) as usize)
+        .with_shape(q.dtype, vec![total_rows, hq * hd])
+}
+
+/// FI 虚核名选择(models 侧唯一出口;测试/层共用)
+pub(crate) fn fi_name(fp8kv: bool) -> &'static str {
+    if fp8kv {
+        owl_kernels::contract::names::PREFILL_FI_FP8KV
+    } else {
+        owl_kernels::contract::names::PREFILL_FI
+    }
+}
+
+/// 页配对谓词(decode;driver 单源的层侧出口,层零 driver 知识)
+pub(crate) fn paged_decode_ok(hd: usize, page: usize) -> bool {
+    owl_kernels::driver::attn::paged_decode_ok(hd, page)
+}
+
+/// 页配对谓词(prefill;bs32 契约)
+pub(crate) fn paged_prefill_ok(hd: usize, page: usize) -> bool {
+    owl_kernels::driver::attn::paged_prefill_ok(hd, page)
+}
+
+#[cfg(test)]
+mod foreign_call_lock {
+    //! gdn foreign 两臂 Call 通道锁(2026-10-12 用户律二番:具名算子入
+    //! 词表):ids ↔ driver 臂 ↔ foreign sig ↔ server parse 四点同票 ——
+    //! 层声明 → lower_kernel → client face parse 逐位对拍。
+    use super::*;
+    use owl_kernels::driver::{OpEnv, OpReq};
+
+    fn env() -> OpEnv {
+        OpEnv { hw: owl_kernels::driver::Hw { arch: owl_kernels::Arch::Sm86 }, page: 0 }
+    }
+
+    /// 层声明形态(chunked;与 layers/gdn.rs 逐字同构)
+    fn declare_chunked(
+        q: &TensorOps, k: &TensorOps, v: &TensorOps, beta: &TensorOps,
+        gate: &TensorOps, state: &TensorOps, slot: usize,
+        t: usize, nv: usize, nk: usize, kd: usize,
+    ) -> TensorOps {
+        TensorOps::call(ids::GDN_CHUNKED)
+            .arg(q).arg(k).arg(v).arg(beta).arg(gate).arg(state)
+            .arg_usize(t).arg_usize(slot).arg_usize(nv).arg_usize(nk).arg_usize(kd)
+            .arg_bits((1.0f32 / (kd as f32).sqrt()).to_bits() as u64)
+            .with_shape(Dtype::F16, vec![t, nv, kd])
+    }
+
+    #[test]
+    fn ids_resolve_to_foreign_families() {
+        // 词表 ↔ driver 分派表同票(加票不加臂 = 此处红)
+        for (op, want) in [
+            (ids::GDN_CHUNKED, owl_kernels::family::gdn_chunked::GDN_CHUNKED_FWD),
+            (ids::GDN_SCALAR, owl_kernels::family::gdn_scalar::GDN_SCALAR_FWD),
+        ] {
+            let pick = owl_kernels::driver::resolve(OpReq {
+                op, env: &env(), dt: owl_kernels::driver::DType::F16,
+                shapes: &[], aux: &[], scalars: &[],
+            });
+            assert_eq!(pick.name, want);
+            assert_eq!(
+                (pick.shape.grid, pick.shape.block, pick.shape.smem),
+                ((0, 0, 0), (0, 0, 0), 0),
+                "foreign 臂发射配置应直通"
+            );
+            assert!(foreign_sig(pick.name).is_some(), "driver 拾取名必须有家族 sig");
+        }
+    }
+
+    #[test]
+    fn chunked_call_wire_survives_server_parse() {
+        let q = TensorOps::of_block(1, Dtype::F16, vec![64, 16, 128]);
+        let k = TensorOps::of_block(2, Dtype::F16, vec![64, 16, 128]);
+        let v = TensorOps::of_block(3, Dtype::F16, vec![64, 48, 128]);
+        let beta = TensorOps::of_block(4, Dtype::F16, vec![64, 48]);
+        let gate = TensorOps::of_block(5, Dtype::F16, vec![64, 48]);
+        let state = TensorOps::of_block(6, Dtype::F32, vec![8, 48, 128, 128]);
+        let node = declare_chunked(&q, &k, &v, &beta, &gate, &state, 3, 64, 48, 16, 128);
+
+        // 解释器 Call 臂同款:pick → foreign sig kernel → lower_kernel
+        let pick = owl_kernels::driver::resolve(OpReq {
+            op: ids::GDN_CHUNKED, env: &env(), dt: owl_kernels::driver::DType::F16,
+            shapes: &[], aux: &[], scalars: &[],
+        });
+        let kernel = crate::kernel::Kernel::new(pick.name, "")
+            .with_sig(foreign_sig(pick.name).expect("foreign sig"));
+        let out = Bytes::new(99, 64 * 48 * 128);
+        let ins: Vec<Arg> = [&q, &k, &v, &beta, &gate, &state]
+            .iter().map(|t| Arg::Block { id: t.id }).collect();
+        let msg = lower_kernel(&kernel, &node.args, &ins, &out, 64 * 48 * 128);
+
+        // server 面 parse 逐位对拍(线格式四点锁的最后一环)
+        let (call, out2) = fc_chunked::GdnChunkedCall::parse(&msg).expect("server parse");
+        assert_eq!(out2.id, 99);
+        // 块句柄 = 叶子节点 id(全局计数器;与套件其他测试共存,勿硬编码)
+        assert_eq!(call.q().id, q.id);
+        assert_eq!(call.k().id, k.id);
+        assert_eq!(call.v().id, v.id);
+        assert_eq!(call.beta().id, beta.id);
+        assert_eq!(call.gate().0.id, gate.id);
+        assert_eq!(call.state().pool.id, state.id);
+        assert_eq!(call.state().slot, 3);
+        assert_eq!(call.shape().t, 64);
+        assert_eq!(call.shape().nv, 48);
+        assert_eq!(call.shape().nk, 16);
+        assert_eq!(call.shape().kd, 128);
+        // 槽序数:7 Block + 6 sz(lower_kernel 对位 sig 全额)
+        let blocks = msg.args.iter().filter(|a| matches!(a, Arg::Block { .. })).count();
+        assert_eq!(blocks, 7);
+        assert_eq!(msg.args.len(), 13);
+    }
+
+    #[test]
+    fn scalar_call_wire_survives_server_parse() {
+        let q = TensorOps::of_block(1, Dtype::F32, vec![32, 4, 64]);
+        let k = TensorOps::of_block(2, Dtype::F32, vec![32, 4, 64]);
+        let v = TensorOps::of_block(3, Dtype::F32, vec![32, 8, 64]);
+        let g = TensorOps::of_block(4, Dtype::F32, vec![32, 8]);
+        let beta = TensorOps::of_block(5, Dtype::F32, vec![32, 8]);
+        let state = TensorOps::of_block(6, Dtype::F32, vec![2, 8, 64, 64]);
+        let node = TensorOps::call(ids::GDN_SCALAR)
+            .arg(&q).arg(&k).arg(&v).arg(&g).arg(&beta).arg(&state)
+            .arg_usize(32).arg_usize(1).arg_usize(1)
+            .arg_usize(8).arg_usize(4).arg_usize(64)
+            .arg_bits((1.0f32 / (64f32).sqrt()).to_bits() as u64)
+            .with_shape(Dtype::F16, vec![32, 8, 64]);
+
+        let pick = owl_kernels::driver::resolve(OpReq {
+            op: ids::GDN_SCALAR, env: &env(), dt: owl_kernels::driver::DType::F32,
+            shapes: &[], aux: &[], scalars: &[],
+        });
+        let kernel = crate::kernel::Kernel::new(pick.name, "")
+            .with_sig(foreign_sig(pick.name).expect("foreign sig"));
+        let out = Bytes::new(99, 32 * 8 * 64);
+        let ins: Vec<Arg> = [&q, &k, &v, &g, &beta, &state]
+            .iter().map(|t| Arg::Block { id: t.id }).collect();
+        let msg = lower_kernel(&kernel, &node.args, &ins, &out, 32 * 8 * 64);
+
+        let (call, out2) = fc_scalar::GdnScalarCall::parse(&msg).expect("server parse");
+        assert_eq!(out2.id, 99);
+        assert_eq!(call.q().id, q.id);
+        assert_eq!(call.state().id, state.id);
+        assert_eq!(call.slot(), 1);
+        assert_eq!(call.shape().t, 32);
+        assert_eq!(call.shape().ns, 1);
+        assert_eq!(call.shape().nv, 8);
+        assert_eq!(call.shape().nk, 4);
+        assert_eq!(call.shape().kd, 64);
+    }
+}
 
 #[cfg(test)]
 mod kernel_call_lock {

@@ -504,3 +504,56 @@ actor 线程 catch_unwind 包裹(AssertUnwindSafe)→ 装配深路径 panic
 - 消费点:run()(spec 三态/草稿装载/dflash taps)、PoolPlan.draft_kv、
   gate 测试 ×4 —— 全部 knobs.draft.* 直达。
 - 回归:engine **38/38**(串行)/ shared 27/27 / workspace 绿。
+
+---
+
+## 十三、层↔kernels 隔离律(2026-10-12,用户律:layers 禁触 owl_kernels)
+
+> 用户裁决:`impl GdnScalarCall` 出现在 layers/ = 越界。**层不越解释层
+> 直触 kernels** —— face builder/名字/槽序签名/OK 谓词知识一律收编解释
+> 层动作表(crate::ops),层侧只供语义张量与纯标量。
+
+- **ops §6 层↔kernels 隔离面**(新立):`gdn_chunked_node` /
+  `gdn_scalar_node`(原 layers/gdn.rs 收编;签名改纯标量 t/nv/nk/kd,
+  GdnShape 构造内化)/ `marlin_node`(原 linear.rs 手撸 sig 三臂收编;
+  AWQ 7 块/f16·bf16 6 块路由内化)/ `marlin_ws_elems`(装载域计尺)/
+  `fi_prefill_node` + `fi_name`(原 attention.rs 手撸 sig/scale_bits/
+  names 收编)/ `paged_decode_ok` / `paged_prefill_ok`(driver 谓词的
+  层侧出口)/ `CT_REPACK` re-export(设备重排 Want 键)。
+- **机器门**:facedir_lint 新增 `layers_shall_not_touch_kernels` ——
+  layers/ 子树含 `owl_kernels` 字面量即红(crate::kernel 垫子与
+  ops::kernel_call 为层侧唯一合法声明面)。
+- 层调用点形态:全为 `crate::ops::xxx_node(语义张量…, 纯标量…)` ——
+  装配失败 panic 语义不变(A5.4 fail-fast,shape 全由 self/ctx 推导)。
+- 回归:models 119/119(含 §6 双 face 锁测试,自 gdn.rs 迁 ops)/
+  engine 38/38 / facedir_lint 2/2 / workspace check 绿 /
+  gdn_chunked_golden GPU 绿;llm_speedtest std 复测 prefill avg
+  **1154.8**(基线 1153.6,零回归),9/15(4096/8192 超 max_seq 预期)。
+
+---
+
+## 十四、gdn foreign 两臂入词表(2026-10-12,用户律二番:不做特殊面)
+
+> 用户质询:`impl GdnScalarCall` 式的特殊面为什么存在?gdn 应当入
+> `ids` 具名算子枚举,与 native 同一 Call 通道。
+
+- **ids += 两票**:`GDN_CHUNKED = OpId("gdn.chunked_delta")` /
+  `GDN_SCALAR = OpId("gdn.scalar_delta")`(语义词表,非实现名)。
+- **driver 两臂**:`gdn::chunked_delta()` / `scalar_delta()`,名字 =
+  family 单源,发射配置 = **`FOREIGN` 哨兵**(新立:grid/block 全零直通,
+  server 家族 runtime 自算网格)—— resolve 分派表 +2 行。
+- **解释器 Call 臂桥**:`ops::foreign_sig(name) -> Option<sig>` ——
+  foreign 名不在 native 登记表(无 .cu 源),槽序 sig 住 client face
+  单源;Call 臂 `foreign_sig → Kernel::new+with_sig`,否则 `with_pick`
+  原径。dtype 守门对 foreign 自然跳过(lookup None)。
+- **层侧**:`chunked_delta` / `scalar_delta` 声明函数(纯 models 词汇:
+  `TensorOps::call(ids::…)` + 语义标量;scale = kd^-0.5 语义量,f32
+  位型编码 = 局部纯数学 fn)—— 与 gating_g 同一形态,§6 的 gdn 特殊
+  face 节点删除。
+- **四点锁测试**(foreign_call_lock):ids ↔ driver 臂同票 / FOREIGN
+  直通 / foreign_sig 全覆盖 / 层声明 → lower_kernel → client face
+  parse 逐位对拍(chunked+scalar 双臂)。
+- marlin/FI 仍走 §6 装配面(变体路由依赖 dt/zs/env,Call 化挂账)。
+- 回归:models 120/120 / kernels 23/23 / engine 38/38 / facedir 2/2 /
+  workspace 绿 / gdn 金标 + 新链 E2E GPU 绿;llm_speedtest std 复测
+  prefill avg **1161.5**(基线带内,零回归)。
