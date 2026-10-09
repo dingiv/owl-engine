@@ -806,6 +806,10 @@ impl Attention {
                     // decoding 形态,grid (Hq, seqs, nparts) 并行。触发 =
                     // ctx.v2_bt8 在(仅 verify 图)+ scratch.seqs == tokens
                     // (防 decode/verify scratch 误配)。
+                    // 无 ctx 下限(§三十二·补订正):此前"短 ctx 半崩"的
+                    // 观测实为 chunked 老路径的崩(86ms 延迟特征),v2 探针
+                    // 已证 2-partition 形态数值正确(softcap=1.0 修正后
+                    // PASS,误差 1e-4)。全 ctx 走 v2 臂。
                     if tokens <= 16 {
                         if let (Some(s2), Some(bt8)) =
                             (ctx.attn_v2.as_ref(), ctx.v2_bt8.as_ref())

@@ -268,11 +268,26 @@ impl<D: DeviceClient> RunningEngine<D> {
         let prompt_ids = {
             // 诊断开关(knobs.raw_completion):裸续写,绕过 chat 模板 ——
             // 模型健康度鉴别(模板态病 vs 权重病)的 A/B 臂
-            let wrapped = if self.cfg.knobs.raw_completion {
+            // §三十二:含 im_start = 上层已渲染完整 chat 模板(OpenAI 多轮
+            // 面),跳过单轮 chat_wrap(整段历史塞单 user 消息 = 多轮崩根因)
+            let wrapped = if self.cfg.knobs.raw_completion || prompt.contains("<|im_start|>") {
                 prompt.clone()
             } else {
                 self.tok.chat_wrap(&prompt)
             };
+            // 诊断:最终 prompt 落盘(OWL_PROMPT_DUMP=1;§三十六 多轮"无记忆"
+            // 幻觉定位面 —— dump 渲染+wrap 后送模型的完整 prompt 字节)
+            if std::env::var("OWL_PROMPT_DUMP").is_ok() {
+                let ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let path = format!("/tmp/owl-prompt-{ms}.txt");
+                match std::fs::write(&path, &wrapped) {
+                    Ok(_) => eprintln!("[prompt-dump] {path} ({}B)", wrapped.len()),
+                    Err(e) => eprintln!("[prompt-dump] 落盘失败 {e}"),
+                }
+            }
             self.tok.encode(&wrapped)
         };
         if prompt_ids.is_empty() {

@@ -71,11 +71,27 @@ impl ChatMessage {
 /// 一般不逐字节相等 → 引擎前缀守卫失配回退全量重算(正确性保住,
 /// 缓存命中待模板落地;信息不丢,记忆可通)
 pub fn render_prompt(msgs: &[ChatMessage]) -> String {
-    msgs.iter()
-        .map(|m| m.text())
-        .filter(|t| !t.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+    // 多轮 Qwen chat 模板渲染(2026-10-13;§三十二:naive 拼接 + chat_wrap
+    // 单轮包裹 = 多轮幻觉/指令服从崩坏根因,raw A/B 臂定谳)。
+    // 挂账:家族模板串通用化(经 tokenizer ChatFormat/jinja,现 Qwen 硬编码)。
+    let mut out = String::new();
+    for m in msgs {
+        let text = m.text();
+        if text.trim().is_empty() {
+            continue;
+        }
+        let role = m.role.as_str();
+        let tag = match role {
+            "system" => "system",
+            "assistant" => "assistant",
+            _ => "user",
+        };
+        out += &format!("<|im_start|>{tag}\n{text}<|im_end|>\n");
+    }
+    // assistant 起手 + <think> 开块(27B = thinking 模型:模型自己续写
+    // 推理;空 think 预填 = 非思考调法,thinking 模型在错误上下文生成 →
+    // 输出退化/答案段损坏 —— §三十三 AL 案 + §三十五 L3 同源实证)
+    out + "<|im_start|>assistant\n<think>\n"
 }
 
 /// OpenAI 协议会话键 → 引擎 u64 会话 id(进程内哈希;同键同 id)

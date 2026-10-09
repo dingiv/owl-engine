@@ -1,8 +1,0 @@
-# 本地性能验收配置(配合 --flavor spec-dflash;深合并只补 model 路径与设备)
-[model]
-dir = "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
-dflash2_dir = "/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16"
-name = "qwen3.8-27b"
-
-[runtime]
-device = 1

@@ -81,6 +81,8 @@ pub struct ServerConfig {
     pub prefill_chunk: usize,
     /// lm_head 头部量化方案(model.head_quant;C1 2026-10-11;枚举严格)
     pub head_quant: owl_shared::config::HeadQuant,
+    /// 最大并发请求(server.max_concurrency;默认 8;须 ≤ knobs.gdn_slots)
+    pub max_concurrency: usize,
 }
 
 impl ServerConfig {
@@ -110,6 +112,7 @@ impl ServerConfig {
             max_seq: cfg.runtime.max_seq,
             prefill_chunk: cfg.runtime.prefill_chunk,
             head_quant: cfg.model.head_quant,
+            max_concurrency: cfg.server.max_concurrency,
         }
     }
 }

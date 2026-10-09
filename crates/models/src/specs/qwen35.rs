@@ -467,6 +467,10 @@ pub fn qwen3_5_0_8b() -> ModelSpec {
                 // chat_template add_generation_prompt 分支实证);缺它模型需
                 // 自己生成空 think 块,greedy 会紧跟 eos 答空(2026-09-26 实测)。
                 suffix: "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n".into(),
+                im_open: "<|im_start|>".into(),
+                im_close: "<|im_end|>\n".into(),
+                assistant_open: "<|im_start|>assistant\n".into(),
+                think_prefill: "<think>\n\n</think>\n\n".into(),
             },
         },
         tied: true,
@@ -502,6 +506,10 @@ pub fn qwen3_8_27b() -> ModelSpec {
                 //    在错误上下文生成 → 输出退化 + DFlash AL 1.45 vs vLLM 2.61)
                 prefix: "<|im_start|>system\nReasoning effort is set to medium. Think through the task at a moderate depth: cover the key steps and verify the result, but keep the reasoning concise.<|im_end|>\n<|im_start|>user\n".into(),
                 suffix: "<|im_end|>\n<|im_start|>assistant\n<think>\n".into(),
+                im_open: "<|im_start|>".into(),
+                im_close: "<|im_end|>\n".into(),
+                assistant_open: "<|im_start|>assistant\n".into(),
+                think_prefill: "<think>\n".into(),
             },
         },
         tied: false,

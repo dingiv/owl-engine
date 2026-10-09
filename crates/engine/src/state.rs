@@ -722,6 +722,16 @@ impl StatePool {
             }
         }
         face.sync().await?;
+        // 临时诊断(§三十二 会话污染定位;OWL_GDN_DBG=1 启用,收口后删)
+        if std::env::var("OWL_GDN_DBG").is_ok() {
+            let g = &self.gdns[0];
+            let row_elems = g.rec.1 / self.gdn_slots;
+            let mut buf = vec![0u8; g.rec.1 * 4];
+            face.dtoh(&g.rec.0, &mut buf).await?;
+            let seg = &buf[gdn_slot * row_elems * 4..(gdn_slot + 1) * row_elems * 4];
+            let nz = seg.iter().filter(|&&b| b != 0).count();
+            eprintln!("[gdn-dbg] reset_gdn slot={gdn_slot} rec非零字节={nz}/{}", seg.len());
+        }
         Ok(())
     }
 

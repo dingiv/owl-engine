@@ -288,6 +288,22 @@ pub struct GraphCfg {
     pub no_graph: bool,
 }
 
+/// 本地服务面(并发/排队;owl 定位 = 本地单机,不做对外高并发)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServerCfg {
+    /// 最大并发请求数(在跑 + 排队;超出者排队等待)。
+    /// 默认 8;须 ≤ pool 的 GDN 状态格数(knobs.gdn_slots,每并发会话
+    /// 占一格)—— 启动校验不足即拒。本地多副本 agent 各占一并发。
+    pub max_concurrency: usize,
+}
+
+impl Default for ServerCfg {
+    fn default() -> Self {
+        Self { max_concurrency: 8 }
+    }
+}
+
 // ============================================================================
 // §3 总对象
 // ============================================================================
@@ -306,6 +322,7 @@ pub struct OwlConfig {
     pub probes: ProbesCfg,
     pub cuda: CudaCfg,
     pub graph: GraphCfg,
+    pub server: ServerCfg,
 }
 
 impl Default for RuntimeCfg {

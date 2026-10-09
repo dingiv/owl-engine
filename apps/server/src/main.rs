@@ -85,6 +85,21 @@ async fn main() {
 
     // ── engine actor:专属线程(构造+装载+泵全在内;RunningEngine 非 Send)──
     // HTTP 侧留 bind/model_name 副本(model_name 回退服务端缺省)
+    // 并发上限守卫(§三十五 server 上层):GDN 状态格 = 每并发会话一格,
+    // max_concurrency 超格数 = 第 N+1 会话状态格耗尽(LRU 逐出活跃会话)
+    // → 跨会话状态污染。不足即拒启(账外组合不静默)。
+    let gdn_slots = config.knobs.gdn_slots;
+    let max_concurrency = config.max_concurrency;
+    if gdn_slots < max_concurrency {
+        eprintln!(
+            "[boot] ❌ max_concurrency({max_concurrency}) > GDN 状态格数({gdn_slots})—— 每并发会话占一格,请调 knobs.gdn_slots ≥ max_concurrency 或降低并发"
+        );
+        std::process::exit(1);
+    }
+    eprintln!(
+        "[boot] 并发上限 {max_concurrency}(GDN 格 {gdn_slots};本地服务,排队超出请求)"
+    );
+
     let (bind, model_name) = (config.bind.clone(), config.model_name.clone());
     let (tx, rx) = mpsc::channel::<EngineReq>(CHANNEL_CAPACITY);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<String, String>>();
@@ -108,6 +123,12 @@ async fn main() {
         }
     }
 
+    // 并发上限守卫(§三十五 server 上层):GDN 状态格 = 每并发会话一格,
+    // max_concurrency 超格数 = 第 N+1 会话状态格耗尽(LRU 逐出活跃会话)
+    // → 跨会话状态污染。不足即拒启(账外组合不静默)。
+    // 并发闸门(permit = max_concurrency;在跑 + 排队 ≤ 上限,超出排队等待)
+    let concurrency_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrency));
+
     let listener = TcpListener::bind(&bind).await.expect("bind");
     eprintln!("[boot] 监听 http://{bind}(OpenAI 兼容;model={model_name})");
     loop {
@@ -115,7 +136,11 @@ async fn main() {
             Ok((stream, _peer)) => {
                 let tx = tx.clone();
                 let model_name = model_name.clone();
+                let gate = concurrency_gate.clone();
                 tokio::spawn(async move {
+                    // 并发闸门:permit 获取排队(超出 max_concurrency 等待);
+                    // 获取后持有至该连接服务完毕(长连接 = 占一并发位)
+                    let _permit = gate.acquire().await;
                     if let Err(e) = serve(stream, tx, model_name).await {
                         eprintln!("[conn] {e}");
                     }

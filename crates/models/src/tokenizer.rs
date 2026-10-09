@@ -12,14 +12,42 @@
 use crate::contract::ModelError;
 use std::path::Path;
 
-/// chat 文本路径格式(前后缀对;数据而非代码 —— 任何家族可表达)。
-/// jinja 多轮/系统消息/视觉宏归 serving 层,不在本结构。
+/// chat 文本路径格式(前后缀对 + 多轮模板;数据而非代码 —— 任何家族可表达)。
+/// jinja 视觉宏归 serving 层;多轮渲染经 [`ChatFormat::render_chat`]。
 #[derive(Clone, Debug)]
 pub struct ChatFormat {
     /// 用户内容前缀(如 Qwen:`<|im_start|>user\n`)
     pub prefix: String,
     /// 用户内容后缀 + 助手起手(如 Qwen:`<|im_end|>\n<|im_start|>assistant\n`)
     pub suffix: String,
+    /// 多轮:消息开启(如 Qwen:`<|im_start|>`;role + 换行由渲染拼接)
+    pub im_open: String,
+    /// 多轮:消息收尾(如 Qwen:`<|im_end|>\n`)
+    pub im_close: String,
+    /// 多轮:assistant 起手(如 Qwen:`<|im_start|>assistant\n`)
+    pub assistant_open: String,
+    /// 非思考模式的空 think 预填(如 Qwen:`<think>\n\n</think>\n\n`;
+    /// §三十二/三十三:格式约束任务缺它 = N/A/答案段损坏;"" = 思考模式)
+    pub think_prefill: String,
+}
+
+impl ChatFormat {
+    /// 多轮渲染:(role, text) 序列 → 家族模板;thinking = false 时尾填
+    /// 空 think 块(Qwen3 非思考模式;缺它格式约束任务答 N/A/空)。
+    pub fn render_chat(&self, msgs: &[(&str, &str)], thinking: bool) -> String {
+        let mut out = String::new();
+        for (role, text) in msgs {
+            out += &format!(
+                "{}{}\n{text}{}\n",
+                self.im_open, role, self.im_close
+            );
+        }
+        out += &self.assistant_open;
+        if !thinking {
+            out += &self.think_prefill;
+        }
+        out
+    }
 }
 
 /// 分词器声明(家族特有事实的**数据形态**;住 `ModelSpec.tokenizer`,
