@@ -159,6 +159,14 @@ pub fn resolve(req: OpReq) -> KernelPick {
             // B6.1:fp8 e4m3 KV 读变体(形状契约同 f16;页配对律同源)
             attn::paged_decode_v2_fp8(req.env, dt, ax(0), ax(1), ax(2), ax(3), ax(4))
         }
+        "attn.paged_decode_v2_fp8_seq" => {
+            // §三十一:verify 8 伪序列(grid.y = seqs;aux 末位 = seqs)
+            attn::paged_decode_v2_fp8_seq(req.env, dt, ax(0), ax(1), ax(2), ax(3), ax(4), ax(5))
+        }
+        "attn.paged_decode_v2_seq" => {
+            // f16 兑底臂(seqs 参数化;同上)
+            attn::paged_decode_v2_seq(req.env, dt, ax(0), ax(1), ax(2), ax(3), ax(4), ax(5))
+        }
         "attn.paged_v2_reduce" => {
             // aux = [hd, hq, nparts]
             attn::paged_v2_reduce(dt, ax(0), ax(1), ax(2))
@@ -169,6 +177,11 @@ pub fn resolve(req: OpReq) -> KernelPick {
             // aux = [hd, hkv, hq, tokens, nparts](ctx_base 走核参数槽,层侧传入)
             let (hd, hkv, hq, tokens, nparts) = (ax(0), ax(1), ax(2), ax(3), ax(4));
             attn::prefill_split(req.env, dt, hd, hkv, hq, tokens, nparts)
+        }
+        "attn.prefill_split_fp8kv" => {
+            // aux 同 prefill_split;fp8 e4m3 KV 直读(2026-10-12 修雷 + 读量减半)
+            let (hd, hkv, hq, tokens, nparts) = (ax(0), ax(1), ax(2), ax(3), ax(4));
+            attn::prefill_split_fp8kv(req.env, dt, hd, hkv, hq, tokens, nparts)
         }
         "attn.prefill_split_reduce" => {
             // aux = [tokens, hq]
@@ -561,9 +574,23 @@ pub mod attn {
         _dt: DType,
         hd: usize,
         hq: usize,
+        hkv: usize,
+        nb: usize,
+        nparts: usize,
+    ) -> KernelPick {
+        paged_decode_v2_fp8_seq(env, _dt, hd, hq, hkv, nb, nparts, 1)
+    }
+
+    /// §三十一:伪序列变体(grid.y = seqs;decode = 1,verify = depth1)
+    pub fn paged_decode_v2_fp8_seq(
+        env: &OpEnv,
+        _dt: DType,
+        hd: usize,
+        hq: usize,
         _hkv: usize,
         _nb: usize,
         nparts: usize,
+        seqs: usize,
     ) -> KernelPick {
         let page = env.page;
         let name = match (hd, page) {
@@ -577,7 +604,7 @@ pub mod attn {
         KernelPick {
             name,
             shape: Shape {
-                grid: (hq as u32, 1, nparts as u32),
+                grid: (hq as u32, seqs as u32, nparts as u32),
                 block: (128, 1, 1),
                 smem: 2048u32.max(floor),
             },
@@ -598,15 +625,17 @@ pub mod attn {
             "chunked prefill bs32 契约:页 {} 非法",
             env.page
         );
-        let name = match hd {
-            128 => "vllm_chunked_prefill_paged_attn_opt_fp8_hd128",
-            256 => "vllm_chunked_prefill_paged_attn_opt_fp8_hd256",
+        // TG=4 变体(2026-10-10 性能刀):hd256 走 64-token×4 线程组分摊核
+        // (原核 acc[256]/线程 = 寄存器 spill,~2% 峰值);hd128 走旧核
+        let (name, tokens_per_block) = match hd {
+            128 => ("vllm_chunked_prefill_paged_attn_opt_fp8_hd128", 256usize),
+            256 => ("vllm_chunked_prefill_paged_attn_opt_fp8_hd256", 256usize),
             other => panic!("chunked prefill fp8 仅 hd∈{{128,256}},得 {other}"),
         };
         KernelPick {
             name,
             shape: Shape {
-                grid: ((hq / hkv) as u32, hkv as u32, ((tokens + 255) / 256) as u32),
+                grid: ((hq / hkv) as u32, hkv as u32, ((tokens + tokens_per_block - 1) / tokens_per_block) as u32),
                 block: (256, 1, 1),
                 smem: (64 + 2 * hd * env.page * 2) as u32,
             },
@@ -688,9 +717,23 @@ pub mod attn {
         dt: DType,
         hd: usize,
         hq: usize,
+        hkv: usize,
+        nb: usize,
+        nparts: usize,
+    ) -> KernelPick {
+        paged_decode_v2_seq(env, dt, hd, hq, hkv, nb, nparts, 1)
+    }
+
+    /// §三十一:伪序列变体(grid.y = seqs)
+    pub fn paged_decode_v2_seq(
+        env: &OpEnv,
+        dt: DType,
+        hd: usize,
+        hq: usize,
         _hkv: usize,
         _nb: usize,
         nparts: usize,
+        seqs: usize,
     ) -> KernelPick {
         assert!(matches!(dt, DType::F16), "paged v2 仅有 f16 变体(dt={dt:?})");
         let page = env.page;
@@ -707,7 +750,7 @@ pub mod attn {
         KernelPick {
             name,
             shape: Shape {
-                grid: (hq as u32, 1, nparts as u32),
+                grid: (hq as u32, seqs as u32, nparts as u32),
                 block: (128, 1, 1),
                 smem: 2048u32.max(floor), // PARTITION_SIZE·4B vs out_smem floor
             },
@@ -781,6 +824,9 @@ pub mod attn {
     ) -> KernelPick {
         assert!(matches!(dt, DType::F16), "prefill split 仅有 f16 变体(dt={dt:?})");
         assert!(env.page == 32, "prefill split 页 32 契约,得 {}", env.page);
+        // 变体由 models ops 层按 KV 池档位分派(fp8 池必须走 fp8kv 直读:
+        // f16 核读 e4m3 字节池 = 字节错位,§二十八埋雷实录);此处名字由
+        // 调用点 op 字符串决定(见 resolve 分支,chunked 同款)
         let name = match hd {
             256 => "owl_prefill_split_f16_hd256",
             other => panic!("prefill split 仅 hd256,得 {other}"),
@@ -794,6 +840,22 @@ pub mod attn {
                 smem: (64 * hd * 2 * 2) as u32,
             },
         }
+    }
+
+    /// fp8 KV 直读变体(e4m3 字节池;pick 名 = owl_prefill_split_fp8kv_hd256;
+    /// 几何与 f16 完全同式 —— stride index 同数学,单位 1B)
+    pub fn prefill_split_fp8kv(
+        env: &OpEnv,
+        dt: DType,
+        hd: usize,
+        hkv: usize,
+        hq: usize,
+        tokens: usize,
+        nparts: usize,
+    ) -> KernelPick {
+        let mut p = prefill_split(env, dt, hd, hkv, hq, tokens, nparts);
+        p.name = "owl_prefill_split_fp8kv_hd256";
+        p
     }
 
     /// prefill split reduce(每 thread 一 (token, head) 合并 nparts;

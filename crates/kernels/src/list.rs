@@ -184,10 +184,15 @@ pub static REGISTRY: &[Entry] = &[
     // ---- B6.3:fp8 e4m3 KV 读变体(chunked prefill;签名同 f16)----
     Entry { name: "vllm_chunked_prefill_paged_attn_opt_fp8_hd128", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "vllm_chunked_prefill_paged_attn_opt_fp8_hd256", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    // TG=4 线程组分摊变体(2026-10-10 性能刀;grid.z = ceil(tokens/64))
+    Entry { name: "vllm_chunked_prefill_paged_attn_opt_fp8_hd256_tg4", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     // ---- prefill split attention(flash-decoding;2026-10-02 长 ctx 主案)----
     // K1 = context 分块在线 softmax(未归一化 partial + (m,l) 入 scratch);
     // K2 = partition 归一化合并。smem 64KB(>48KB 走发射器 opt-in 通道)
     Entry { name: "owl_prefill_split_f16_hd256", source: sources::attention::PREFILL_SPLIT_F16, args: "T,T,T,T,T,T,T,f32,i32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    // fp8 e4m3 KV 直读变体(2026-10-12;签名同 f16,K/V = 字节池):
+    // ① 修雷:fp8 池 + f16 核 = 字节错位(§二十八埋雷实录);② 读量减半
+    Entry { name: "owl_prefill_split_fp8kv_hd256", source: sources::attention::PREFILL_SPLIT_F16, args: "T,T,T,T,T,T,T,f32,i32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_prefill_split_reduce_f16_hd256", source: sources::attention::PREFILL_SPLIT_F16, args: "T,T,T,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     // ---- PF1a 栈核(concat_rows;arity 8,展开路径测试锚专用)----
     Entry { name: "owl_concat_rows_f16", source: text::CONCAT_F32, args: "T,T,T,T,T,T,T,T,sz,sz,sz,T", dtype: crate::contract::Dtype::F16 },

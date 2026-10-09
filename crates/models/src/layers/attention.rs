@@ -391,6 +391,89 @@ impl Attention {
         self.o_proj.forward(&y, ctx)
     }
 
+    /// verify v2 臂(§三十一):8 伪序列单次 v2 发射 + reduce。
+    /// bt8 = [seqs×nb] 页链平铺(engine 每轮写入);kv_lens = 图输入递增表
+    /// ([ctx+1 .. ctx+seqs]);scratch = ctx.attn_v2(seqs 倍)。语义 =
+    /// 每 token attend [0, pos_t](前缀截断即 chunk 内 causal)。
+    #[allow(clippy::too_many_arguments)]
+    fn verify_v2_arm(
+        &self,
+        q: &TensorOps,
+        k: &TensorOps,
+        v: &TensorOps,
+        gate: &TensorOps,
+        kv: &KvBuffers,
+        tokens: usize,
+        ctx: &ForwardCtx,
+        pol: &crate::module::KvPagedPolicy,
+        kv_slots: &TensorOps,
+        kv_lens: &TensorOps,
+        bt8: &TensorOps,
+        s2: &crate::module::AttnV2Scratch,
+    ) -> TensorOps {
+        let dt = q.dtype;
+        let page = pol.page as i32;
+        let scale = 1.0 / (self.hd as f32).sqrt();
+        let nb = bt8.shape().iter().product::<usize>() / s2.seqs;
+        let nparts = s2.nparts;
+        // ① K0 写本 chunk KV(与各 prefill 臂同款;slots = 图输入槽表)
+        let k0_op = ctx.env.kv.k0_write_op();
+        let wr = TensorOps::call(k0_op)
+            .aux(&[tokens])
+            .arg(k)
+            .arg(v)
+            .arg(&kv.k_cache)
+            .arg(&kv.v_cache)
+            .arg(kv_slots)
+            .arg_i32(self.hkv as i32 * self.hd as i32)
+            .arg_i32(self.hkv as i32 * self.hd as i32)
+            .arg_i32(self.hkv as i32)
+            .arg_i32(self.hd as i32)
+            .arg_i32(page)
+            .arg_i32(pol.x as i32)
+            .with_shape(dt, vec![1]);
+        // ② v2 主核(grid (Hq, seqs, nparts);partial [seq][head][part][dim];
+        //    seq 变体:grid.y = seqs(8 伪序列),decode 单发版 grid.y = 1)
+        let decode_op = ctx.env.kv.decode_v2_seq_op();
+        let partial = TensorOps::call(decode_op)
+            .aux(&[self.hd, self.hq, self.hkv, nb, nparts, s2.seqs])
+            .arg(q)
+            .arg(&kv.k_cache)
+            .arg(&kv.v_cache)
+            .arg(bt8)
+            .arg(kv_lens)
+            .arg(&wr)
+            .arg(&s2.exp_sums)
+            .arg(&s2.max_logits)
+            .arg_i32(self.hkv as i32)
+            .arg_f32(scale)
+            .arg_i32(nb as i32)
+            .arg_i32(self.hq as i32 * self.hd as i32)
+            .arg_i32(self.hkv as i32 * self.hd as i32 * page)
+            .arg_i32(self.hd as i32 * page)
+            .arg_f32(1.0)
+            .arg_i32(-1)
+            .arg_i32(0)
+            .with_shape(dt, vec![self.hq * nparts * self.hd]);
+        // ③ LSE 归并([seqs, hq·hd];核内 num_partitions 按 lens 限界)
+        let y = TensorOps::call(SemanticKernel::PagedV2Reduce)
+            .aux(&[self.hd, self.hq, nparts])
+            .arg(&s2.exp_sums)
+            .arg(&s2.max_logits)
+            .arg(&partial)
+            .arg(kv_lens)
+            .arg_i32(nparts as i32)
+            .with_shape(dt, vec![tokens, self.hq * self.hd]);
+        // ④ 输出门 + 出投影(与其余臂同尾)
+        let n = tokens * self.hq * self.hd;
+        let y = TensorOps::call(SemanticKernel::GateMul)
+            .arg(gate)
+            .arg(&y)
+            .arg_usize(n)
+            .with_shape(dt, vec![tokens, self.hq * self.hd]);
+        self.o_proj.forward(&y, ctx)
+    }
+
     /// paged prefill(PF1 终;F16 hd∈{128,256}):K0 批量写池(T 行散写)
     /// + chunked prefill 批核(bs16 特化;因果语义 = 查询 token t 看
     /// [0, seq_start+t])。naive 逐 token 路径保留为回退。
@@ -522,7 +605,8 @@ impl Attention {
         let scr_out = TensorOps::zeros(dt, vec![tokens * self.hq * nparts * self.hd]);
         let scr_stat = TensorOps::zeros(Dtype::F32, vec![tokens * self.hq * nparts * 2]);
         let scale = 1.0 / (self.hd as f32).sqrt();
-        let sp = TensorOps::call(SemanticKernel::PrefillSplit)
+        // 核按 KV 池档位选(fp8 池 → fp8kv 直读;f16 核读 e4m3 字节池 = 错位雷)
+        let sp = TensorOps::call(ctx.env.kv.prefill_split_op())
         .arg(q)
         .arg(&kv.k_cache)
         .arg(&kv.v_cache)
@@ -716,21 +800,48 @@ impl Attention {
                 //(bs16 prefill 实例化 = 越契约,挂账)。smem 公式的 page 项
                 // 与核 BLOCK 同源,见 paged_prefill_output
                 if crate::ops::paged_prefill_ok(self.hd, pol.page) {
+                    // verify v2 臂(§三十一;2026-10-12):T=8 大 KV 下
+                    // chunked/split/FI 三核全为延迟灾难(593ms/轮);v2 核
+                    // 8 伪序列(bill 表 = bt8)+ partition 维 = flash-
+                    // decoding 形态,grid (Hq, seqs, nparts) 并行。触发 =
+                    // ctx.v2_bt8 在(仅 verify 图)+ scratch.seqs == tokens
+                    // (防 decode/verify scratch 误配)。
+                    if tokens <= 16 {
+                        if let (Some(s2), Some(bt8)) =
+                            (ctx.attn_v2.as_ref(), ctx.v2_bt8.as_ref())
+                        {
+                            if s2.seqs == tokens {
+                                eprintln!("[verify-v2] 臂触发 tokens={tokens} nparts={} nb={}", s2.nparts, bt8.shape().iter().product::<usize>() / s2.seqs);
+                                return self.verify_v2_arm(
+                                    &q, &k, &v, &gate, kv, tokens, ctx, &pol, kv_slots, kv_lens, bt8, s2,
+                                );
+                            }
+                        }
+                    }
                     // 诊断二分开关保留(OWL_FORCE_NAIVE_PREFILL=1 走逐 token
                     // 对照;2026-10-01 撤销遗留的 if false 硬禁用 —— 它让
                     // 全部 prefill 注意力落 naive 逐 token 路径)
                     if !ctx.env.attn.force_naive_prefill {
                         // FlashInfer prefill(E1.5;OWL_FLASHINFER=1 → engine
-                        // 注入 ForwardCtx.fi):FA2 级 tensor-core,主臂
+                        // 注入 ForwardCtx.fi):FA2 级 tensor-core,主臂。
+                        // 门槛分派(2026-10-12 A1 定性):FI 对小 qo(T=8
+                        // verify)形状低效且随 ctx 线性放大(mt 阶梯实测
+                        // 18→36ms/tok;split 同形状平坦 ~14-17)—— 大 chunk
+                        // 走 FI 吃 tensor-core 收益(prefill −25%),小 T 回落
+                        // chunked_opt(读 classic 主池,零影子依赖)。
+                        const FI_MIN_TOKENS: usize = 128;
                         if let Some(fi) = &ctx.fi {
-                            return self.paged_prefill_fi_output(
-                                &q, &k, &v, &gate, kv, tokens, ctx, &pol, kv_slots, fi,
-                            );
+                            if tokens >= FI_MIN_TOKENS {
+                                return self.paged_prefill_fi_output(
+                                    &q, &k, &v, &gate, kv, tokens, ctx, &pol, kv_slots, fi,
+                                );
+                            }
                         }
                         // 长 ctx split(flash-decoding;2026-10-02):nparts ≥ 4
                         // (max_ctx > 2048)走分块路径;仅 hd256 核(hd128 变体
-                        // 挂账)—— W3 结案:两雷已清,默认仍 opt-in(引擎实测
-                        // 后裁决翻默认)
+                        // 挂账)。2026-10-12:核按池档位直读主池(f16/fp8kv
+                        // 变体,env 单源)—— 零影子依赖,FI 模式小 T 同样可走
+                        // (fp8 影子与主池双写并存,读主池免型转换税)
                         let nparts = (ctx.ctx_base + tokens).div_ceil(512);
                         if nparts >= 4 && self.hd == 256 && ctx.env.attn.prefill_split {
                             return self.paged_prefill_split_output(

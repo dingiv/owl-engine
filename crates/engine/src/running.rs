@@ -76,6 +76,11 @@ pub(crate) struct TurnSpecState {
     /// < 盈亏线(3.6 tok/轮)即降级,不看连击
     pub(crate) recent_rounds: u32,
     pub(crate) recent_tokens: u32,
+    /// B4 动态盈亏线(2026-10-09):滚动轮成本 / 裸步成本 ewma(ms)。
+    /// 盈亏平衡 avg = round_cost/bare_cost(常数 1.2 曾远低于真线 ~4,
+    /// AL 1.2~4 区间亏本跑 spec = 9.4 t/s 案)
+    pub(crate) round_cost_ewma_ms: f32,
+    pub(crate) bare_cost_ewma_ms: f32,
     /// prefill 末行 hidden(首轮 propose 的 anchor_hidden;消费后置 None)
     pub(crate) spec_seed_hidden: Option<owl_iface::contract::Bytes>,
 }

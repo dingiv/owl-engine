@@ -368,6 +368,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
                 owl_models::env::KvQuant::None
             },
             spec_mode,
+            spec_depth,
             gdn_slots: self.cfg.knobs.gdn_slots,
             snap_max: self.cfg.knobs.snap_max,
             vram_target: self.cfg.knobs.vram_target,
@@ -528,6 +529,8 @@ impl<D: DeviceClient + 'static> Engine<D> {
             let kv_caches = pool.kv_caches();
             let gdn_caches = pool.gdn_caches();
             let bt_leaf = pool.bt_leaf_flat();
+            let bt_leaf_nb = *bt_leaf.shape().last().unwrap_or(&1);
+            let verify_attn_v2 = pool.verify_attn_v2_scratch();
             let env_v = env;
             let key_dim = dims.nk * dims.hk;
             let value_dim = dims.nv * dims.hv;
@@ -570,6 +573,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
                         InputSlot::f32("kv_lens", depth1),
                         InputSlot::f32("gdn_slot", 1),
                         InputSlot::f32("gdn_cu", 2).init(vec![0.0, depth1 as f32]),
+                        InputSlot::f32("bt8", depth1 * bt_leaf_nb),
                     ],
                     outputs: vouts,
                     capture: !self.cfg.knobs.no_graph,
@@ -583,6 +587,10 @@ impl<D: DeviceClient + 'static> Engine<D> {
                     let lens_in = sc.input("kv_lens")?;
                     let gdn_slot = sc.input("gdn_slot")?;
                     let gdn_cu = sc.input("gdn_cu")?;
+                    let bt8_in = sc.input("bt8")?;
+                    // §三十一:v2 臂在(seqs=depth1)→ 页表 = bt8([8×nb]);
+                    // 回退(无 scratch)→ 单表 bt_leaf(split/chunked 语义不变)
+                    let kv_bt = if verify_attn_v2.is_some() { bt8_in.clone() } else { bt_leaf.clone() };
                     let kvs_step: Vec<KvBuffers> = kv_caches
                         .iter()
                         .map(|(k, v)| KvBuffers {
@@ -590,7 +598,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
                             v_cache: v.clone(),
                             slots: slots_in.clone(),
                             kv_lens: lens_in.clone(),
-                            block_tables: bt_leaf.clone(),
+                            block_tables: kv_bt.clone(),
                         })
                         .collect();
                     let gdns_step: Vec<GdnBuffers> = gdn_caches
@@ -609,6 +617,10 @@ impl<D: DeviceClient + 'static> Engine<D> {
                     );
                     ctx.seq_cu = Some(&gdn_cu);
                     ctx.env = env_v;
+                    // §三十一:verify v2 臂(8 伪序列 partition 并行;scratch
+                    // = depth1 倍;bt8 = 8× 页链平铺,engine 每轮 host 写入)
+                    ctx.attn_v2 = verify_attn_v2.clone();
+                    ctx.v2_bt8 = Some(&bt8_in);
                     let tap: std::rc::Rc<std::cell::RefCell<Vec<owl_models::tensor::TensorOps>>> =
                         std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
                     ctx.gdn_tap = Some(tap.clone());
@@ -767,6 +779,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
                     .collect();
                 let kv_leaves = pool.dflash_kv_leaves().expect("dflash 池");
                 let bt_leaf = pool.bt_leaf_flat();
+            let bt_leaf_nb = *bt_leaf.shape().last().unwrap_or(&1);
                 let model_df = Arc::clone(&loaded.model);
                 let rp_df = draft_rope.as_ref().expect("draft rope").clone();
                 let d2g = Arc::clone(d2);

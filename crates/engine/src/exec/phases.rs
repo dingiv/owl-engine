@@ -253,6 +253,16 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
             mrec("decode.sync", t_syn.elapsed());
             self.tspec().spec_steps_degraded += 1;
+            // 滚动裸步成本 ewma(动态盈亏线分母;α=0.15)
+            {
+                let bc = t_step.elapsed().as_secs_f32() * 1000.0;
+                let spec = self.tspec();
+                spec.bare_cost_ewma_ms = if spec.bare_cost_ewma_ms > 0.0 {
+                    spec.bare_cost_ewma_ms * 0.85 + bc * 0.15
+                } else {
+                    bc
+                };
+            }
             mrec("decode.step.deg", t_step.elapsed());
         }
         self.sample_and_emit(nt).await

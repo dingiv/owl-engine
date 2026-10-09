@@ -988,3 +988,330 @@ repack 路径);④ 查 cyankiwi 检查点完好性(外部 sha/他引擎跑同文
   sync 或用同步 API;②`testkit::harvest_*` 的 env 缺省陷阱(带臂选路
   的对拍必须 `eval_ops_env`);③"金标绿"只覆盖金标的输入域(浅 g/
   整块 T/金标上传路径),**handler 生产路径需 handler 级上传链测试**。
+
+## 二十七、修复后重测:stream 计时假象 + AL 随 ctx 衰减 + B4 盈亏线失配(2026-10-09)
+
+用户令重测性能并追问"修复后 min 还是 9?"。三连发现:
+
+### 1. speedtest 流式计时扭曲(9.4/7.05 假象)
+
+llm_speedtest decode 走 `stream=True`,t/s = 末/首 chunk 时间戳差;spec 轮
+**批量 emit**(一轮 m+1 tok 一次到达)→ chunk 粒度扭曲分母:同 prompt
+三轮 9.45/139/139 交替(512 点)、101/104.6/7.05(1024 点)。**非流式
+墙钟口径(真实)**:512 → 93.3/83.8;1024 → 45.1/41.1;2048 → 28.1/35.2
+(全健康语义,零降级触发)。speedtest 的 decode t/s 仅作相对参考,
+**绝对值以非流式墙钟为准**。
+
+### 2. 真实 AL 随 ctx 衰减(下一个速度杠杆)
+
+同域 AL:512 → **6.1/5.4**;1024 → **3.9/3.5**;2048 → **3.8/5.2**;
+m0 同步上升(6/7 → 14/19)。长 ctx 草稿与主模型分歧增大。嫌疑:
+①fp8 KV × chunked prefill 残留数值面(§二十三 重审,upload 修复后
+重新 A/B);②草稿 fc 长 ctx 固有衰减。AL 回 6 则 1024/2048 点 t/s 翻倍。
+
+### 3. B4 盈亏线失配(策略层,9.4 t/s 的真身)
+
+实测分相:spec 轮 ~97ms(verify 68.6 + propose 12.9 + snap/fold/emit)、
+裸步 ~24.5ms → **盈亏平衡 AL = 97/24.5 ≈ 4**。当前 window_starved 阈值
+常数 **1.2** → AL 1.2~4 区间亏本跑 spec(9.4 t/s = AL≈1.1 段 97ms 产
+1 tok;裸步可 40 t/s)。且降级路径实测为零触发 —— 阈值形同虚设。
+
+**优化项**:①B4 阈值动态化(按滚动实测轮成本/裸步成本算盈亏线);
+②AL-ctx 衰减诊断(kv_fp8 A/B)。
+
+### 优化落地(同日)
+
+1. **B4 盈亏线动态化**(running.rs TurnSpecState + spec.rs + phases.rs):
+   TurnSpecState 加 `round_cost_ewma_ms/bare_cost_ewma_ms`(α=0.15 滚动,
+   轮成本在 B4 窗口段更新 —— 轮尾 tspec 可能已随 complete 消失,P0 同款);
+   window_starved 阈值 = `(round_ewma/bare_ewma).clamp(2.0, 6.0)`,缺省
+   回落 1.2;降级 eprintln 带实时盈亏线。**注**:原代码注释"盈亏线 3.6"
+   与实现常数 1.2 脱节已久。
+2. **回归(非流式墙钟,6 请求)**:1024 点 45.1/41.1 → **64.9/57.0
+   (+40%)**;总吞吐 +6%;深谷点(9.4/7.05)消失。
+3. **AL-ctx 衰减诊断(kv_fp8 A/B)**:off 后 1024 AL 4.45/4.47(vs on
+   6.12/5.22,波动内)、2048 AL 3.84-4.41,且 t/s 更慢(f16 KV 带宽税)
+   —— **kv_fp8 无罪,AL 衰减主因 = 草稿 fc 固有长 ctx 质量衰减**
+   (模型/训练面,草稿训练另案;非数值 bug)。
+4. **观察存疑**:同 prompt 跨请求 AL 波动大(512 seed0:6.10 vs 3.45,
+   跨 boot)—— spec 链路存在非确定性(跨请求状态/归约序?),影响
+   单点对比可信度,立案待查。
+
+### §二十七·勘误:AL-ctx 衰减撤案(用户裁决"衰减不正常",多 seed 复测)
+
+§二十七 第 2 条(AL 随 ctx 衰减 6.1→3.5)**是小样本波动假象**(每点
+1-2 seed)。多 seed 曲线(每点 4 seed,随机英文域):
+
+| len | AL 均值 | ±σ |
+|---|---|---|
+| 512 | 4.64 | ±1.23 |
+| 1024 | 4.52 | ±1.38 |
+| 1536 | **5.16** | ±0.89 |
+| 2048 | 4.23 | ±0.54 |
+
+**平坦,无衰减**(2048 略低在噪声内);kv_fp8 A/B 亦无罪(off 更慢)。
+请求间 σ≈1.2 的波动是随机域文本 accept 起伏(正常)。**t/s 随 ctx 下降
+= 物理成本**(verify read 随 ctx 线性涨 §二十四 + KV 带宽),与 vLLM
+同方向、同带宽比例,非病态。下一个真杠杆回到 §二十四 三正解之首:
+verify read 的同步等待(2.3k ctx ~90ms/轮)。
+
+### §二十七·再勘误(僵尸 CUDA 进程案):AL"波动"的真身与健康基线确认
+
+多 seed 曲线的"请求间 σ≈1.2 波动"与"语义健康请求偶发乱码"的追查,
+揪出**环境真凶**:tg4 probe 的 IMA 挂死进程被 timeout 杀时**未死透**
+(卡在损坏的 CUDA 上下文里,324MiB 挂在 GPU 1)—— owl server 与之共卡
+期间,请求输出退化为多语言乱码吸引子("ölfölf"、"支支支"),GPU util
+**0%**(非 spin,是病态等待)。`kill -9` 清僵尸后**立即全面健康**。
+
+- **多 seed AL"波动"(σ≈1.2)实为僵尸干扰污染的测量**;健康环境下
+  同组数据:512 → 55.6/92.5(AL 3.45/6.02)、1024 → 65.2/57.2
+  (AL 6.12/5.22)、2048 → 33.1/30.6(AL 4.65/4.28)—— 语义全部健康;
+- **教科书级教训入册**:CUDA 挂死进程 timeout/kill -TERM 后**必须核对
+  `nvidia-smi --query-compute-apps` 确认清空**,僵尸上下文会静默毒化
+  同卡后续进程(与"杀进程用 PID 列表"同族,第 N 次踩坑升级);
+- tg4 变体本身:**IMA 真 bug**(sanitizer 复现于干净 probe),已回滚
+  立案(probe + 侦探链留存,`OWL_TG4_PROBE=1` 显式启用);修好后
+  预期 prefill 一半时间回收(当前核 ~2% 峰值);
+- §二十七 第 2 条(AL-ctx 衰减)撤案维持;kv_fp8 无罪维持;
+- **当前健康基线(非流式墙钟,含 TTFT)**:512 → 55~93;1024 → 57~65;
+  2048 → 31~33;math 域峰值 145.6。
+
+### §二十七·性能刀回执:prefill_split 上生产(用户指令"猛猛优化")
+
+1. **核路线裁决(用户律:不自研算子,vLLM 移植集内盘点)**:tg4 自研
+   分摊重写(挂死 = shfl 在分支 continue 后的 warp 收敛破坏;数值 =
+   TG 段错位)—— **回滚弃用**,IMA 证据链留存于
+   attention_tg4_probe.rs(skip 门保护);
+2. **prefill_split(flash-decoding,K1 分块在线 softmax + K2 归并)
+   上生产**:非流式墙钟 A/B(僵尸清后的干净环境)—— 512/1024 持平,
+   **2048 → 36.3/46.3(旧核 33.1/30.6,+10%/+51%),2048 seed1 AL
+   7.43(近上限 8)**;verify(T=8)同通道受益(flash-decoding 正是
+   小 T 大 kv 的专用形状);FI 复测确认更慢(57.8/23.2,弃);
+3. **speedtest 流式口径正式弃用于 decode 评估**(§二十七 计时假象),
+   一律非流式墙钟 + /debug/metrics AL 差分;
+4. **当前基线(非流式墙钟,含 TTFT)**:512 → 56~93;1024 → 57~65;
+   2048 → 36~46;math 域峰值 **145.6 t/s**;
+5. 遗留刀位:①tg4 分摊(重写需专注轮,shfl 收敛 + 段对拍,潜力
+   prefill 一半时间);②T=1 底座带宽(551GB/s → 峰值 70%+);③4096/
+   8192 的 submit 预算 2560 门(矩阵不完整,另案调)。
+
+### §二十七·FI 分相复测(同日,用户问"为什么不用 FlashInfer")
+
+FI prefill.chunk p50 = **390ms**(opt 核 494,-21%,且含影子池开销)→ FI 核
+本身快;但非流式墙钟全矩阵(干净环境):FI 均值 61.8 vs split 58.9 —— **持平,
+FI 波动大**(512 点 110.7/69.8)。裁决:**split 保持生产**,FI 作为 dispatch
+配置项保留(语义健康已验证);FI prefill 快 21% 被 decode/emit 面开销吃掉
+的机制(影子池 per-turn 成本)另案。prefill chunk 分布(4×512 块):
+p50 494/p99 602ms,块间平坦;逐核:GEMM 35%(57-70% 峰值,正常)、
+attention opt 核 24%(2% 峰值,唯一重病号)、GDN 15%、小核 17%。
+
+### §二十八·FI 定性翻案 + 门槛分派(2026-10-12,A 线性能轮)
+
+背景:§二十七"FI 核快 21% 但墙钟持平 + 波动大,弃"。本轮社区调研
+(flashampere = 3090 专项 attention 后端;repos/flashinfer 0.7.0;vLLM
+_vllm_fa2_C.abi3.so 导出 half_t hd256 全套符号)+ 实测定性。
+
+**四连定谳(mt 阶梯行为学 + spec 面板差分,2048 词,AL≈2.9 域)**:
+
+1. **plan 无罪**:FI run 被 CUDA 图捕获,plan(host)仅捕获期跑
+   (launch_time 日志零 fi_prefill 发射;PlanKey 含 ctx_total 的每步
+   miss 假设不成立 —— 回放期无 host 面)。
+2. **"波动大"翻案 = AL 域波动**:同 ctx 快慢请求差一倍(3.8 vs 7.4s),
+   差分显示每轮成本恒定(72.5 vs 73.4ms/轮),轮数 40 vs 88 = **AL 6.4
+   vs 2.9** —— prompt 生成域决定接受率,与通道无关。§二十七"512 点
+   110.7/69.8 波动"同机制。矩阵墙钟 t/s 跨 seed 不可直接比(域污染)。
+3. **FI 输 verify(T=8)形状**:小 qo 下 FI 核低效且随 ctx 线性放大
+   (decode 边际 18→36ms/tok 递增;split 核同形状平坦)。每轮 verify:
+   **split 核(f16 影子)39ms < chunked(fp8 主池)54ms < FI(fp8 影子)
+   85ms**。
+4. **FI 赢 prefill**:mt=8 点(prefill 主导)FI 1.86s vs split 2.47s
+   (**−25%**),tensor-core 收益真实。
+
+**门槛分派落地**(attention.rs,FI_MIN_TOKENS=128):大 chunk 走 FI,
+小 T 回落 chunked_opt(读 classic 主池零影子依赖);FI 模式独占
+(split 臂需 f16 影子,FI 只写 fp8 影子,禁)。实测 2048 mt=256:
+9.34 → 6.90s(decode 恶化修掉大半;仍微亏 split 5.92,因 chunked
+verify 比慢 split 核 15ms/轮)。
+
+**新格局与下一刀**:全赢组合 = **prefill FI + verify split 核**。卡点
+= split 核仅 f16 变体(f16 影子 9.2G 与 FI 的 fp8 影子 4.6G 互斥,
+双影子爆显存)→ **split 核 fp8 KV 读变体提前立项**(原遗留刀位 ③):
+模板加 e4m3 dequant 读 fp8 影子,与 FI 共用 k0_dual_fp8kv 单写。预估
+2048 AL2.9 域 ≈ 4.8s(vs split 5.92,−19%);fp8 读量减半 verify 或
+再快(39 → 25-30ms/轮)。A3(FI fp16 PV,flashampere sm86 先例)降级
+为 prefill 锦上添花。
+
+### §二十九·split-fp8 修雷落地 + 轮数污染大勘误(2026-10-12 同日)
+
+**修雷(重大正确性)**:`owl_prefill_split_fp8kv_hd256` 落地(模板
+KV_FP8,e4m3 字节池直读,smem 前转 f16,chunked B6.3 同式)。**埋雷
+实锤:生产 split 配置(kv_fp8 + prefill_split)下 ctx≥1536 的输出一直
+是垃圾**(2048 词 → "olata, } } }…";f16 核读 U32 字节池 = 字节错位)。
+§七 fp8 纯度审计漏环:k0_write_op 在 split 模式是 **K0WriteFp8 单写**,
+"f16 影子"不存在。修复后 2048 输出连贯 ✓。布局注:split 核读 classic
+主池(非 kNHD),index 数学 fp8/f16 同式仅单位 1B/2B。
+NVRTC 坑:RTC typedef 块需补 uint8_t。
+
+**轮数污染大勘误(方法论级)**:§二十八 的"每轮 verify 39<54<85ms"
+**作废** —— 那是用"255 tok ÷ AL2.9 = 88 轮"一个假设轮数除各配置墙钟
+的假账。真差分(spec.round/verify 计数器):**各通道每轮 105~108ms
+无差**(CHUNKED 108/89,FI-MIX 106/88),verify 走 chunked 还是
+split-fp8 对 decode **无感**。mt 阶梯的"递增 ms/tok" = AL 随生成进度
+自然衰减 + 配置间输出域分叉(同 prompt 各配置贪心链分叉 → 轮数 71 vs
+78),非通道病。**跨配置墙钟对比必须配 spec 差分,单看墙钟 = 域轮盘**。
+
+**存活的真实结论**:
+1. prefill FI −24%(mt=8 同口径:1.86 vs chunked 2.46 vs split-fp8
+   2.26)—— dispatch flashinfer=true 净赢,无 decode 代价;
+2. split-fp8 = 正确性补丁(non-FI 大 ctx 路径从垃圾变正确),性能上
+   被 FI 覆盖(prefill 场景)或与 chunked 持平(verify 场景);
+3. decode 每轮 ~105ms 的构成(round − verify ≈ 17ms;verify 89ms 内核
+   时间 vs host 面占比)未拆,是下一个定性目标 —— 但与 attention 读
+   通道无关(四通道无差已证)。
+
+### §二十九·补一:UB 雷完整定谳 + 探针收口(同日)
+
+**split-fp8 探针**(`attention_split_fp8_probe.rs`,chunked fp8 探针同款
+三门:host f32 全局 softmax 参考 + e4m3 位型近似编码;np1/np2/np3 三
+形状;④ 同核分区对拍;⑤ stat 分相)PASS 全绿:② max 1.2e-3,④ 分区
+合并 vs np1 max 4.9e-4(f16 scratch 精度),⑤ mismatch=0。
+
+**§二十九 正文之外的第三颗雷:K1 分区早退 __syncthreads UB**(f16/fp8
+同病,寿险级潜伏):
+- 旧代码 `if (ps >= ctx_end || !active) return;` —— **ctx_end 依赖
+  tok**,同 block(64 tok)内 tok 跨分区边界时部分线程早退、部分继续,
+  后续双 `__syncthreads()` UB(违反本文件 2026-10-02 块统一律,该律
+  只修了循环上界,早退分支漏网);
+- 症状:探针 np>1 时 t≥P(P=ceil(ctx/nparts))的输出全错(max 0.49),
+  t<P 全对(整块早退恰好安全);核内 printf 锁定 k_smem 装载 UB;
+- **生产掩蔽机制**:t0 = part×P 恰为 64(TILE)倍数时装载槽映射巧合
+  一致(2048 ctx → P=512),UB 症状被数据掩蔽;探针 P=22(非 64 倍数)
+  一发入魂;
+- **修法**:①块统一早退仅保留 `ps >= max_ctx`(整分区对全 token 空,
+  判定不含 tok,合法);②per-token 中性(ps≥ctx_end)不再早退,走循环
+  由 in_ctx 掩码自然产出中性值,写 partial 加 active 门(尾块 tok≥T
+  防越界)。修后 np2/np3 全绿,④ max 4.9e-4。
+
+**勘误再勘误(⑤ 的假阳性)**:⑤ 首版把 l 公式写成"未减 m 的 exp 和"
+(Σexp(s)),与核的在线 softmax l(Σexp(s−m))不同式 —— 首批
+mismatch=64/496 全是该假阳性,修公式后归零。教训:对拍探针的 host
+参考公式必须与核的**中间量语义**逐式同源,不能只对最终 out。
+
+**端到端回归**:修复后 512/1024/2048 三点语义连贯;墙钟与 FI 配置同
+域点一致(域主导,差异 <2%)。生产裁决不变:flashinfer=true 净赢
+(prefill −24%),split 通道保留为 non-FI 正确性路径。
+
+**探针方法学沉淀**(第三次验证):host 参考公式必须与核的**中间量
+语义逐式同源**(本次 l 的减 m 语义);位型近似编码的 decode 公式
+(subnormal = m_int×2^-9)写错会伪装成"核误差孤点";UB 类核 bug 的
+指纹 = "误差从某个边界值起全错、边界前全对"(本例 t≥P)。
+
+### §三十·decode 分相定谳 + std 五点全绿(2026-10-12,驱动恢复后)
+
+**环境**:unattended-upgrade 第四次上演(10-07 顶内核 7.0.0-38 + 官方 595 包,
+10-09 重启后 align3p 失联 NVML mismatch)。已处置:updater 四层根除(timer
+disable+mask / conf 全 0 / 删包 / 内核+官方 nvidia 包 hold);重编
+**noprobe 生产弹药** `modules-615-align3p-noprobe` md5 `91684e00`(e0609f7d
+默认构建,探针剔除;构建坑 = nv-kernel.o 增量残留致 modpost undefined,
+make clean 后一次通过;细节见 p2p-build/README.md 弹药表)。
+
+**decode 每轮 105ms 分相定谳**(2048 慢域,spec 差分 + step_profile 探针):
+- **verify.read 88.4ms/轮(83%)= verify 图 GPU 执行纯时**(step_profile:
+  step=0.2ms(上传+launch)、read≈pure=86ms(图独占时间),host 面零嫌疑);
+- propose(草稿 d7)17.2ms/轮(16%);fold/snap/调度 ~2ms;
+- read 的名字有误导:**它不是 KV 读**(KV 流量 ~0.1ms),而是"同步+回读
+  logits"= 等图跑完;主体 = T=8 主模型 forward 图内算子(GDN 串行递推
+  + marlin 小批 + attention),理论 FLOPs 下限 ~6ms,当前 86ms 差 14×
+  —— **下钻需捕获期插桩(cap_prof 逐算子),下一轮**;verify 通道选择
+  (chunked/split/FI)已证无感(§二十九),刀位不在 attention。
+
+**std 五点全绿**:`run-8k.toml`(max_seq=8448 + pool_tokens=8704,继承
+split 生产档;vram 治理池上限 94024 内,boot 无贴顶)。15/15 成功:
+| len | prefill t/s | TTFT |
+|---|---|---|
+| 512 | 1230 | 418ms |
+| 1024 | 1164 | 882ms |
+| 2048 | 1088 | 1884ms |
+| 4096 | 945 | 4338ms |
+| 8192 | 747 | 10962ms |
+4096/8192 语义抽查连贯 ✓(词汤标准 prompt);拼接病态 prompt 的单词
+输出为模型行为非引擎问题。decode 列流式轮盘照旧(6.6~128.7 t/s),
+可信口径 = 非流式墙钟 + spec 差分。
+
+### §三十·补二:prefill 曲线定谳——FI 平坦曲线实测 + 两处结论修正(同日)
+
+用户对照表(vLLM/sglang std 五点)推翻 §三十 前文两处说法,实测重定谳:
+
+1. **"vLLM prefill 也在降"——错**。同模型同卡 std:vLLM 1365→1361、
+   sglang 1367→1346(**全平坦**);O(T²) 的常数在 FA2 mma 路径下小到无感。
+2. **"attention 理想 1835ms(T²/2×KV 字节)"——模型错**。那是不带 Q-block
+   复用的读模型;FA2 的 KV 块被 Q 块共享(tile_q 复用)+ QK/PV 走 tensor
+   core,attention 在大 ctx 下只占个位数 ms/chunk。
+
+**真凶(自家核)**:split/fp8 attention 核每 512-chunk ~118ms(§二十七
+逐核 24%)且**随 ctx 线性涨**(读全前缀 KV 必然),8192 时放大 4×+——
+prefill 曲线掉 40% 全是它;vLLM/sglang 的 FA2 核同位置 ~5-14ms/chunk
+(差 10-20×),故平坦。
+
+**修法已在本仓:FI 门槛通道**(§二十七 落地:prefill≥128 走 FI/FA2,小 T
+回 chunked)。`run-8k.toml`(max_seq=8448 + pool 8704 + flashinfer)std
+**15/15 全绿且平坦**:512→8192 = 1321/1280/1295/1270/1238(三轮均值,
+**8192 仅 -7%**,split 版掉 40%;TTFT@8192 10.96s → 6.64s,-39%)。
+与 vLLM/sglang 差 3~9%,其余 gap 在 GDN/marlin 线性项(模型结构税)。
+
+**生产行动项**:flashinfer=true 应转正为生产默认(prefill_split 保留为
+FI fallback);run-8k.toml 随附。FI 影子池显存账(f16 9.2G)与 8k 池并存
+已验证可 boot(vram 治理 94024 上限内)。
+
+### §三十一·20k 长上下文实测:prefill 温和、decode 雷爆(2026-10-12 深夜)
+
+`run-20k.toml`(max_seq=20480 + pool 20736 + FI;boot 池 94024 上限内)。
+
+**prefill 曲线修正**:20k 全程 40s 里 decode 占 21.1s(30 轮)——prefill
+实际 **17.9s = 1122 t/s**(vs 8192 的 1236,-9%,温和;此前"595 t/s 掉
+一半"是 prefill+decode 混账)。chunked prefill 一直开着(39×512)。
+
+**decode 雷爆**:spec.round **704ms/轮 @20k**(vs 2048 的 107ms)= verify
+593 + propose 110。verify 随 ctx **严格线性**(593 ≈ 122.8×20480/4096,
+与补录Ⅴ同源)。
+
+**593ms 定谳(三核同病,一轮排除法)**:
+- ctx 线性项分解(2048=86 vs 20480=593):X≈30ms(GEMM 19.7 T=8 同价 +
+  GDN 残余)+ **Y≈563ms = attention 核读 20k KV**(理论流量仅 240-250MB,
+  低效 ~2000×);
+- **nth=256 装载修复无效**(589 vs 592)——装载并发不是瓶颈;
+- 定谳 = **T=8 大 KV 形态下三核全为延迟灾难**:在线 softmax 递推依赖链
+  无法流水,每 KV 迭代 ~97µs(97µs = HBM 往返 + shfl 链,无重叠);
+  chunked(24 blocks 串行)/ split(960 blocks 但 8/64 query 活跃)/
+  FI(split-kv 被 fork bug 禁用)三核同病;
+- **下一刀(下轮)**:verify 改 **v2 fp8 核逐 token 发射**(T=8 = 8 次
+  vllm_paged_attention_v2_fp8_hd256bs32,每次 1 token partition 并行读
+  全 ctx;理想 8.8ms,预期 20-40ms = **15-20× 提速**;需 spec.rs verify
+  图构造改动 + 语义对拍)。propose 110ms(草稿读窗全历史)同族问题,
+  次优先。
+- agent 20k~100k 场景结论:prefill 1122 t/s 温和可用;**decode 1.4 tok/s
+  不可用**——长上下文的刀全在 verify。
+
+### §三十二·verify v2 伪序列臂:14× 提速落地 + nb=136 半崩回归(2026-10-12 深夜)
+
+**verify v2 臂落地**(§三十一 立项当日完工):8 token = 8 伪序列单次 v2
+发射(grid (Hq, seqs, nparts),partition 维 = flash-decoding);bt8 =
+页链×depth1 图输入(engine 每轮 host 写入);verify_attn_v2 scratch
+(seqs=depth1 倍,展平 [seq][head][part] 与 vLLM 核同构);链路 = state
+分配 + engine 图闭包注入 + ForwardCtx.v2_bt8 透传(model.rs 逐字段构造
+漏透传曾致臂不触发)+ attention 层臂(seqs==tokens 防误配)。
+
+**实测**:20k verify **592 → 143ms(4.1×)**、轮 700 → 259ms;2048 verify
+86 → 28ms(**3×**)、轮 107 → 48ms;语义健康(8k/20k/2048@8k)。
+
+**修掉的网格级 bug**:v2 pick 的 `grid.y = 1` 硬编码(decode B=1 遗留)
+—— 核内 seq_idx = blockIdx.y 恒 0,8 伪序列全用 seq0 槽,seq1..7 的
+reduce 读空槽 → 输出垃圾。修复 = pick seqs 参数化(decode=1/verify=8)。
+
+**遗留(最高优先):nb=136 半崩回归**。512@生产配置(run-bench,max_seq
+2560/pool 4352/nb=136)输出尾段退化("and, and, and"),verify 56ms;
+同池同臂 max_seq 8448(nb=264)正常(28ms);**v2 关臂更崩(85ms 全乱)
+→ 非 v2 臂引入,chunked/split 老路径同病**;nb=136 唯一低于 144,144/
+192/264/272/648 全正常。nb 与语义的耦合机制未定位(nparts=9 双方相同,
+排除;max_seq 仅 submit 门,排除)——下一轮首案,二分 nb(136~144)或
+bt8 尺寸敏感面。**生产缓解**:max_seq ≥ 8192 即绕开(池照旧)。

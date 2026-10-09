@@ -36,12 +36,14 @@
 // **翻默认前置件已就绪,门 OWL_PREFILL_SPLIT 待引擎实测后裁决。**
 // ============================================================================
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 // nvrtc 极简头集需自备 typedef;离线 nvcc 检查走 <cstdint>(带 RTC 守卫)
 #ifdef __CUDACC_RTC__
 typedef int int32_t;
 typedef unsigned int uint32_t;
 typedef unsigned short uint16_t;
+typedef unsigned char uint8_t;
 typedef long long int64_t;
 typedef unsigned long long uint64_t;
 #else
@@ -60,11 +62,15 @@ typedef unsigned long long uint64_t;
 #endif
 
 // ---- K1:split 主核 -------------------------------------------------------
+// 模板体(2026-10-12 fp8 直读变体):KV_FP8=true 时 K/V 从 e4m3 字节池
+// 读入,smem 前转 f16(chunked 核 B6.3 同式 —— smem 宽度不变,QK/PV
+// 数学零改动);smem 恒 f16。classic 寻址 index 数学同式(fp8 = 1B 单位)。
 // q [T, Hq, hd];scr_out f16 [T, Hq, nparts, hd];scr_stat f32 [T, Hq, nparts, 2]
 // dummy 尾参 = 契约 4(真输出 = reduce 核;本核纯副作用写 scratch)
-extern "C" __global__ void owl_prefill_split_f16_hd256(
+template <bool KV_FP8>
+__device__ void split_k1_body(
     const uint16_t* __restrict__ q,            // [T, Hq, hd]
-    const uint16_t* __restrict__ k_cache,      // classic
+    const uint16_t* __restrict__ k_cache,      // classic(f16 视角;fp8 = 字节池 reinterpret)
     const uint16_t* __restrict__ v_cache,      // classic
     const float* __restrict__ block_tables,    // [nb](单序列恒等/块链)
     uint16_t* __restrict__ scr_out,            // [T, Hq, nparts, hd]
@@ -105,8 +111,15 @@ extern "C" __global__ void owl_prefill_split_f16_hd256(
 
     const bool active = (tok < T);
 
-    // ---- 分区空 / token 越界:写中性值并退出(不得早退 —— __syncthreads!)----
-    if (ps >= ctx_end || !active) {
+    // ---- 分区空处理(2026-10-12 探针 ⑤ 定谳的 UB 雷)----
+    // 旧版:if (ps >= ctx_end || !active) return; —— ctx_end 依赖 tok,
+    // 同 block 内部分线程早退、部分继续 → 后续 __syncthreads UB(违反
+    // 本文件 2026-10-02 块统一律;np>1 且 token 跨分区边界时输出错,
+    // f16/fp8 同病;生产 t0 恰为 64 倍数掩盖多年)。
+    // 修法:①块统一早退仅保留 ps ≥ max_ctx(整个分区对所有 token 空);
+    // ②per-token 中性(ps ≥ ctx_end)不再早退,走循环由 in_ctx 掩码
+    //   自然产出中性值(M=-INF, L=0, acc=0),写 partial 用 active 门。
+    if (ps >= max_ctx) {
         if (active) {
             const long long b = ((long long)tok * hq + head) * nparts + part;
             scr_stat[b * 2 + 0] = -INFINITY;
@@ -162,10 +175,11 @@ extern "C" __global__ void owl_prefill_split_f16_hd256(
 
     // ⚠️ 循环上界必须块统一(ps..pe;每线程 causal 差 ≤64 由 in_ctx 掩码)——
     // 曾用每线程 ctx_hi = 发散 __syncthreads = UB/trap(2026-10-02)
-    // 装载步长 = 活跃线程数 nth(⚠️ 2026-10-02 定谳:block 256 线程中 tok ≥ T
-    // 者早退,若步长恒 256,vg = e/64 的工人缺 3/4 → K/V smem 3/4 全零 →
-    // acc ±0;步长 = nth 后 32 线程 × 64 轮全覆盖)
-    const int nth = MIN(256, MAX(0, T - qchunk * QUERIES_PER_BLOCK) * TG);
+    // 装载步长 = 恒 blockDim(2026-10-12:旧 nth=MIN(256, 活跃tok×TG) 是
+    // 「tok≥T 早退」时代的配套;UB 修复后全线程走完全程,恒 256 全覆盖,
+    // 尾块/小 T(verify T=8)装载并发不再随活跃 tok 数坍缩 —— 后者曾致
+    // 20k ctx verify 592ms/轮(与 chunked 同烂,flash-decoding 形态失效))
+    const int nth = 256;
     for (int t0 = ps; t0 < pe; t0 += TILE) {
         const int tlen = MIN(TILE, pe - t0);
         __syncthreads();   // 上一轮消费完毕
@@ -179,10 +193,33 @@ extern "C" __global__ void owl_prefill_split_f16_hd256(
             const int d = vg * VEC;
             const int gt = t0 + kt;
             if (gt < max_ctx) {
-                *reinterpret_cast<uint4*>(k_smem + kt * HD + d) =
-                    *reinterpret_cast<const uint4*>(k_cache + kc_index(gt, d));
-                for (int vv = 0; vv < VEC; ++vv) {
-                    v_smem[kt * HD + d + vv] = v_cache[vc_index(gt, d + vv)];
+                if constexpr (KV_FP8) {
+                    // e4m3 字节池(1B/elem):index 数学同 classic,单位 1B。
+                    // K 的 x 段 8 连字节(d=8 倍数 → off·8 字节,8B 对齐)
+                    // → uint2 一次读;V 标量逐字节。smem 恒 f16。
+                    const uint8_t* k8 = reinterpret_cast<const uint8_t*>(k_cache);
+                    const uint8_t* v8 = reinterpret_cast<const uint8_t*>(v_cache);
+                    const uint2 kraw = *reinterpret_cast<const uint2*>(
+                        k8 + kc_index(gt, d));
+                    const __nv_fp8_e4m3* kb = reinterpret_cast<const __nv_fp8_e4m3*>(&kraw);
+                    uint4 kh;
+                    __half* kh16 = reinterpret_cast<__half*>(&kh);
+                    #pragma unroll
+                    for (int e2 = 0; e2 < VEC; ++e2)
+                        kh16[e2] = __half(__nv_cvt_fp8_to_halfraw(kb[e2].__x, __NV_E4M3));
+                    *reinterpret_cast<uint4*>(k_smem + kt * HD + d) = kh;
+                    for (int vv = 0; vv < VEC; ++vv) {
+                        __nv_fp8_e4m3 ve;
+                        ve.__x = v8[vc_index(gt, d + vv)];
+                        v_smem[kt * HD + d + vv] = __half_as_ushort(
+                            __half(__nv_cvt_fp8_to_halfraw(ve.__x, __NV_E4M3)));
+                    }
+                } else {
+                    *reinterpret_cast<uint4*>(k_smem + kt * HD + d) =
+                        *reinterpret_cast<const uint4*>(k_cache + kc_index(gt, d));
+                    for (int vv = 0; vv < VEC; ++vv) {
+                        v_smem[kt * HD + d + vv] = v_cache[vc_index(gt, d + vv)];
+                    }
                 }
             } else {
                 *reinterpret_cast<uint4*>(k_smem + kt * HD + d) = make_uint4(0, 0, 0, 0);
@@ -240,22 +277,63 @@ extern "C" __global__ void owl_prefill_split_f16_hd256(
         __syncthreads();   // acc 消费完毕再覆写 tile(保守;load 前亦有屏障)
     }
 
-    // ---- 写 partial(未归一化 acc + (M, L))----
+    // ---- 写 partial(未归一化 acc + (M, L);active 门:尾块 tok≥T 不越界)----
 
-    const long long b = ((long long)tok * hq + head) * nparts + part;
-    scr_stat[b * 2 + 0] = M;
-    scr_stat[b * 2 + 1] = L;
+    if (active) {
+        const long long b = ((long long)tok * hq + head) * nparts + part;
+        scr_stat[b * 2 + 0] = M;
+        scr_stat[b * 2 + 1] = L;
 // ⚠️ 定谳(2026-10-02 结案):初版 scr_out 全零的真凶不是 nvrtc —— 是本行
 // 隐式转换:`o[u16] = __float2half(acc)` 走 __half::operator float() 再向
 // uint16_t 截断(位型指纹 = 值 ≥1 的 acc 全变 1、负数全变 0)。修复 =
 // vLLM from_float/float_to_half 同款位精确 store(reinterpret __half*,本
 // 文件 reduce 核与 fused.cu 全族同式;fused 族 out 形参本就是 __half* 无罪)。
 // 另撤除 scr_stat[16..32) 诊断转储(T>4 时污染真实 M/L)。
-    uint16_t* o = scr_out + b * HD;
-    #pragma unroll
-    for (int d = 0; d < DIM_PER_TH; ++d) {
-        reinterpret_cast<__half*>(o)[g * DIM_PER_TH + d] = __float2half(acc[d]);
+        uint16_t* o = scr_out + b * HD;
+        #pragma unroll
+        for (int d = 0; d < DIM_PER_TH; ++d) {
+            reinterpret_cast<__half*>(o)[g * DIM_PER_TH + d] = __float2half(acc[d]);
+        }
     }
+}
+
+// ---- K1 双入口(f16 / fp8kv;签名逐字同,fp8 的 K/V 字节池载体)----------
+extern "C" __global__ void owl_prefill_split_f16_hd256(
+    const uint16_t* __restrict__ q,
+    const uint16_t* __restrict__ k_cache,
+    const uint16_t* __restrict__ v_cache,
+    const float* __restrict__ block_tables,
+    uint16_t* __restrict__ scr_out,
+    float* __restrict__ scr_stat,
+    const uint16_t* __restrict__ k0_alibi,
+    float scale,
+    int32_t hkv, int32_t T, int32_t ctx_base, int32_t nparts,
+    int32_t kv_block_stride, int32_t kv_head_stride, int32_t page,
+    int32_t hq,
+    uint16_t* __restrict__ dummy)
+{
+    split_k1_body<false>(q, k_cache, v_cache, block_tables, scr_out, scr_stat,
+                         k0_alibi, scale, hkv, T, ctx_base, nparts,
+                         kv_block_stride, kv_head_stride, page, hq, dummy);
+}
+
+extern "C" __global__ void owl_prefill_split_fp8kv_hd256(
+    const uint16_t* __restrict__ q,
+    const uint16_t* __restrict__ k_cache,      // e4m3 字节池(1B/elem)
+    const uint16_t* __restrict__ v_cache,
+    const float* __restrict__ block_tables,
+    uint16_t* __restrict__ scr_out,
+    float* __restrict__ scr_stat,
+    const uint16_t* __restrict__ k0_alibi,
+    float scale,
+    int32_t hkv, int32_t T, int32_t ctx_base, int32_t nparts,
+    int32_t kv_block_stride, int32_t kv_head_stride, int32_t page,
+    int32_t hq,
+    uint16_t* __restrict__ dummy)
+{
+    split_k1_body<true>(q, k_cache, v_cache, block_tables, scr_out, scr_stat,
+                        k0_alibi, scale, hkv, T, ctx_base, nparts,
+                        kv_block_stride, kv_head_stride, page, hq, dummy);
 }
 
 // ---- K2:partition 归一化合并 --------------------------------------------

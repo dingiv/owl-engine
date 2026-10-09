@@ -95,6 +95,8 @@ pub(crate) struct PoolPlan {
     pub draft_kv: owl_models::env::KvQuant,
     /// 投机形态(快照/MTP 链/草稿池三件的唯一事实来源)
     pub spec_mode: crate::running::SpecMode,
+    /// 投机深度(verify 块 = depth+1;verify v2 scratch 定形用;0 = off)
+    pub spec_depth: usize,
     /// GDN 状态格容量
     pub gdn_slots: usize,
     /// spec 快照池深度
@@ -130,6 +132,8 @@ pub(crate) struct StatePool {
     /// v2 分页 decode scratch(E-decode 2026-10-04;paged 时恒分配,
     /// None = legacy/无页策略;引擎注入 ctx → 层走 v2 + LSE 归并)
     pub(crate) attn_v2: Option<owl_models::module::AttnV2Scratch>,
+    /// verify v2 scratch(seqs=depth1;§三十一)
+    pub(crate) verify_attn_v2: Option<owl_models::module::AttnV2Scratch>,
     /// spec 快照(E5-M2:投机轮回滚缓冲;OWL_SPEC_DEPTH>0 时分配,
     /// 内容 = 轮首 GDN 态 state@B-1;restore 后仍有效,全接受后失效重拍)
     pub(crate) spec_snap: Option<GdnSnapSlot>,
@@ -328,6 +332,25 @@ impl StatePool {
                 max_logits: block_leaf(&ml.0, vec![1, dims.hq * nparts]),
                 tmp_out: block_leaf_dt(&to.0, vec![dims.hq * nparts * dims.hd], dims.dtype),
                 nparts,
+                seqs: 1,
+            })
+        } else {
+            None
+        };
+        // verify v2 scratch(§三十一:8 伪序列 partition 并行;seqs=depth1;
+        // 形状 = decode 版 × depth1,展平 [seq][head][part] 与 vLLM 核同构)
+        let verify_attn_v2 = if paged && plan.spec_depth > 0 {
+            let nparts = (nb * page + 511) / 512;
+            let seqs = plan.spec_depth + 1;
+            let es = zero_block_dt(face, seqs * dims.hq * nparts, Dtype::F32).await?;
+            let ml = zero_block_dt(face, seqs * dims.hq * nparts, Dtype::F32).await?;
+            let to = zero_block_dt(face, seqs * dims.hq * nparts * dims.hd, dims.dtype).await?;
+            Some(owl_models::module::AttnV2Scratch {
+                exp_sums: block_leaf(&es.0, vec![seqs, dims.hq * nparts]),
+                max_logits: block_leaf(&ml.0, vec![seqs, dims.hq * nparts]),
+                tmp_out: block_leaf_dt(&to.0, vec![seqs * dims.hq * nparts * dims.hd], dims.dtype),
+                nparts,
+                seqs,
             })
         } else {
             None
@@ -377,7 +400,7 @@ impl StatePool {
         } else {
             None
         };
-        Ok(StatePool { gdn_slots, dump_all, kvs, k_fis, v_fis, fi_quant: plan.fi,
+        Ok(StatePool { gdn_slots, dump_all, kvs, k_fis, v_fis, fi_quant: plan.fi, verify_attn_v2,
             kv_fp8, dflash_fp8, gdns, snaps, snap_tick: 0, bt, bt_mtp, spec_snap, mtp_kvs, dflash_kvs, attn_v2, page, nb, paged, x, dims })
     }
 
@@ -492,6 +515,11 @@ impl StatePool {
     /// v2 scratch 叶子(None = legacy;引擎按步注入 ctx.attn_v2)
     pub(crate) fn attn_v2_scratch(&self) -> Option<owl_models::module::AttnV2Scratch> {
         self.attn_v2.clone()
+    }
+
+    /// verify v2 scratch(seqs=depth1;§三十一)
+    pub(crate) fn verify_attn_v2_scratch(&self) -> Option<owl_models::module::AttnV2Scratch> {
+        self.verify_attn_v2.clone()
     }
 
     /// KV 池形状(模式相关;与层分派同源策略)

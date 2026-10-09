@@ -93,6 +93,9 @@ pub enum SemanticKernel {
     PagedDecodeV2,
     /// B6.1:v2 fp8 e4m3 KV 读变体(形状契约同 f16)
     PagedDecodeV2Fp8,
+    /// §三十一:verify 8 伪序列变体(grid.y = seqs;aux 末位 = seqs)
+    PagedDecodeV2Fp8Seq,
+    PagedDecodeV2Seq,
     /// v2 LSE 归并(exp_sums/max_logits/tmp_out → out;aux = [hd, hq, nparts])
     PagedV2Reduce,
     /// chunked prefill 在线 softmax(aux = [hd, hkv, hq, tokens])
@@ -102,6 +105,8 @@ pub enum SemanticKernel {
     /// prefill split(flash-decoding;aux = [hd, hkv, hq, tokens, nparts];
     /// ctx_base 走核参数槽,层侧传入)
     PrefillSplit,
+    /// B6.3 同族:split fp8 e4m3 KV 直读(2026-10-12;修雷 + 读量减半)
+    PrefillSplitFp8kv,
     /// prefill split 归并(aux = [tokens, hq])
     PrefillSplitReduce,
     /// naive decode(slot 直排)
@@ -185,11 +190,14 @@ impl SemanticKernel {
             SemanticKernel::K0DualFp8kv => "attn.k0_dual_fp8kv",
             SemanticKernel::PagedDecode => "attn.paged_decode",
             SemanticKernel::PagedDecodeV2 => "attn.paged_decode_v2",
+            SemanticKernel::PagedDecodeV2Seq => "attn.paged_decode_v2_seq",
             SemanticKernel::PagedDecodeV2Fp8 => "attn.paged_decode_v2_fp8",
+            SemanticKernel::PagedDecodeV2Fp8Seq => "attn.paged_decode_v2_fp8_seq",
             SemanticKernel::PagedV2Reduce => "attn.paged_v2_reduce",
             SemanticKernel::PagedPrefill => "attn.paged_prefill",
             SemanticKernel::PagedPrefillFp8 => "attn.paged_prefill_fp8",
             SemanticKernel::PrefillSplit => "attn.prefill_split",
+            SemanticKernel::PrefillSplitFp8kv => "attn.prefill_split_fp8kv",
             SemanticKernel::PrefillSplitReduce => "attn.prefill_split_reduce",
             SemanticKernel::NaiveDecode => "attn.naive_decode",
             SemanticKernel::GateMul => "attn.gate_mul",

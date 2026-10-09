@@ -91,11 +91,28 @@ impl KvEnv {
         }
     }
 
+    /// prefill split 读(flash-decoding;fp8 池必须走 fp8kv 直读 —— f16 核
+    /// 读 e4m3 字节池 = 字节错位,2026-10-12 埋雷实录)
+    pub fn prefill_split_op(&self) -> crate::ops::SemanticKernel {
+        match self.quant {
+            KvQuant::Fp8E4M3 => crate::ops::SemanticKernel::PrefillSplitFp8kv,
+            KvQuant::None => crate::ops::SemanticKernel::PrefillSplit,
+        }
+    }
+
     /// v2 分页 decode 打分
     pub fn decode_v2_op(&self) -> crate::ops::SemanticKernel {
         match self.quant {
             KvQuant::Fp8E4M3 => crate::ops::SemanticKernel::PagedDecodeV2Fp8,
             KvQuant::None => crate::ops::SemanticKernel::PagedDecodeV2,
+        }
+    }
+
+    /// verify 伪序列变体(grid.y = seqs;§三十一)
+    pub fn decode_v2_seq_op(&self) -> crate::ops::SemanticKernel {
+        match self.quant {
+            KvQuant::Fp8E4M3 => crate::ops::SemanticKernel::PagedDecodeV2Fp8Seq,
+            KvQuant::None => crate::ops::SemanticKernel::PagedDecodeV2Seq,
         }
     }
 

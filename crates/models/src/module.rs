@@ -109,6 +109,8 @@ pub struct ForwardCtx<'a> {
     /// Htod,层内 from_host 的 [0,T] 表由图输入槽供给 —— GDN cu 与
     /// attention qsl 同值语义双消费;None = 层内自建,eager 路不变)
     pub seq_cu: Option<&'a TensorOps>,
+    /// verify v2 伪序列页表([seqs×nb];§三十一 verify 臂;None = 非 verify 图)
+    pub v2_bt8: Option<&'a TensorOps>,
     /// E5-M4 fold 记录面(verify 图专用):GDN 层把 fold 重放所需张量
     /// 依层序推入(每层 8:q/k/v raw → conv 重放;q_n/k_n/v_c/g/beta →
     /// 递推重放)。None = 零开销(生产 decode/prefill 不设)。
@@ -142,6 +144,7 @@ impl<'a> ForwardCtx<'a> {
             trace_gate: false,
             attn_v2: None,
             seq_cu: None,
+            v2_bt8: None,
             gdn_tap: None,
         }
     }
@@ -174,6 +177,7 @@ impl<'a> ForwardCtx<'a> {
             trace_gate: false,
             attn_v2: None,
             seq_cu: None,
+            v2_bt8: None,
             gdn_tap: None,
         }
     }
@@ -201,6 +205,7 @@ impl<'a> ForwardCtx<'a> {
             trace_gate: false,
             attn_v2: None,
             seq_cu: None,
+            v2_bt8: None,
             gdn_tap: None,
         }
     }
@@ -232,6 +237,7 @@ impl<'a> ForwardCtx<'a> {
             trace_gate: false,
             attn_v2: None,
             seq_cu: None,
+            v2_bt8: None,
             gdn_tap: None,
         }
     }
@@ -266,6 +272,7 @@ impl<'a> ForwardCtx<'a> {
             trace_gate: false,
             attn_v2: None,
             seq_cu: None,
+            v2_bt8: None,
             gdn_tap: None,
         }
     }
@@ -300,6 +307,7 @@ impl<'a> ForwardCtx<'a> {
             trace_gate: false,
             attn_v2: None,
             seq_cu: None,
+            v2_bt8: None,
             gdn_tap: None,
         }
     }
@@ -340,6 +348,7 @@ impl<'a> ForwardCtx<'a> {
             trace_gate: false,
             attn_v2: None,
             seq_cu: None,
+            v2_bt8: None,
             gdn_tap: None,
         }
     }
@@ -406,6 +415,9 @@ pub struct AttnV2Scratch {
     pub max_logits: TensorOps,
     pub tmp_out: TensorOps,
     pub nparts: usize,
+    /// 伪序列数(§三十一:decode=1;verify=depth1,8 token 当 8 伪序列,
+    /// grid.y 并行 + partition 维 = flash-decoding 形态;层臂按此防误配)
+    pub seqs: usize,
 }
 
 /// KV 动态上下文:每步由 runner 构造。(注:decode 直排路径暂走

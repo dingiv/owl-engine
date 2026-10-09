@@ -85,6 +85,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .map(|p| (bt_chain[p / page] * page as u32 + (p % page) as u32) as f32)
                 .collect();
             let lens_f: Vec<f32> = ((pos + 1)..=(pos + block.len())).map(|p| p as f32).collect();
+            // §三十一:bt8 = 页链 × depth1 平铺(8 伪序列共享页链;v2 臂用);
+            // 补零到池 nb(会话链短于池时尾部补无效页 0,kv_lens 限界不读)
+            let nb_total = self.pool.nb.max(bt_chain.len());
+            let bt8_f: Vec<f32> = (0..block.len())
+                .flat_map(|_| {
+                    bt_chain.iter().map(|&b| b as f32)
+                        .chain(std::iter::repeat(0f32).take(nb_total - bt_chain.len()))
+                })
+                .collect();
             let t_step_v = std::time::Instant::now();
             vg.step(&[
                 ("ids", ids_f.as_slice()),
@@ -92,6 +101,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 ("kv_slots", slots_f.as_slice()),
                 ("kv_lens", lens_f.as_slice()),
                 ("gdn_slot", &[gdn_slot as f32]),
+                ("bt8", bt8_f.as_slice()),
             ])
             .await?;
             let t_read_v = std::time::Instant::now();
@@ -149,18 +159,28 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 degrade_after,
                 probe_every0,
             );
+            // 动态盈亏线(2026-10-09):threshold = 滚动轮成本/裸步成本
+            // (夹 [2.0, 6.0];常数 1.2 曾低于真线 ~4 → AL 1.2~4 亏本区)
+            let (rc, bc) = (spec.round_cost_ewma_ms, spec.bare_cost_ewma_ms);
+            let break_even = if rc > 0.0 && bc > 0.0 { (rc / bc).clamp(2.0, 6.0) } else { 1.2 };
             let window_starved = if spec.recent_rounds >= 16 {
                 let avg = spec.recent_tokens as f32 / spec.recent_rounds as f32;
                 spec.recent_rounds = 0;
                 spec.recent_tokens = 0;
-                avg < 1.2
+                let starved = avg < break_even;
+                if starved {
+                    eprintln!(
+                        "[spec-degrade] 窗口 AL={avg:.2} < 盈亏线 {break_even:.2}(轮 {rc:.0}ms/裸 {bc:.0}ms)"
+                    );
+                }
+                starved
             } else {
                 false
             };
             let degraded = degraded0 || window_starved;
             if degraded && !spec.spec_degraded {
                 eprintln!(
-                    "[spec-degrade] m=0×{streak} win_starved={window_starved} → 降级裸 decode(probe 每 {probe_every} tok)"
+                    "[spec-degrade] m=0×{streak} win_starved={window_starved} 盈亏线={break_even:.2} → 降级裸 decode(probe 每 {probe_every} tok)"
                 );
                 mcnt("spec.degrade", 1);
                 spec.spec_drafts_host = None;
@@ -171,6 +191,16 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             spec.spec_zero_streak = streak;
             spec.spec_degraded = degraded;
             spec.spec_probe_every = probe_every;
+            // 滚动轮成本 ewma(动态盈亏线分子;α=0.15;emit 前 —— 轮尾
+            // tspec 可能已随 complete 消失,P0 同款)
+            {
+                let rc = t_round.elapsed().as_secs_f32() * 1000.0;
+                spec.round_cost_ewma_ms = if spec.round_cost_ewma_ms > 0.0 {
+                    spec.round_cost_ewma_ms * 0.85 + rc * 0.15
+                } else {
+                    rc
+                };
+            }
             // 滚动 AL gauge(窗口均值 ×100;/debug/metrics 一屏可见盈亏)
             mcnt("spec.al.win", u64::from(spec.recent_tokens * 100 / spec.recent_rounds.max(1)));
             degraded_now = degraded;
