@@ -662,7 +662,12 @@ impl GatedDeltaNet {
             b.push(g.clone());
             b.push(beta.clone());
         }
-        let y = if ctx.env.gdn.scalar && !ctx.env.gdn.chunked && tokens >= 64 {
+        // 形状守卫(2026-10-09 语义崩案):chunked cubin 烘 constexpr
+        // NV=48/KD=VD=128(BT=64),scalar cubin d 仅支持 128 —— 形状不配
+        // 的档位(0.8B NV=16)强制回落 varlen,防核静默写飞
+        let chunked_shape_ok = self.nv == 48 && self.nk == 16 && self.hk_dim == 128 && self.hv_dim == 128;
+        let scalar_shape_ok = self.hk_dim == 128 && self.hv_dim == 128;
+        let y = if ctx.env.gdn.scalar && !ctx.env.gdn.chunked && tokens >= 64 && scalar_shape_ok {
             // scalar 臂(lmdeploy 单核;T 分臂:仅大 T —— 小 T(verify/
             // propose=8/decode=1)回 recurrence,每层 5 cast 核在小 T 纯开销)
             let q_f = TensorOps::call(crate::ops::SemanticKernel::CastF16F32)
@@ -698,7 +703,7 @@ impl GatedDeltaNet {
                 self.nk,
                 self.hk_dim,
             )
-        } else if ctx.env.gdn.chunked && tokens >= 64 {
+        } else if ctx.env.gdn.chunked && tokens >= 64 && chunked_shape_ok {
             // FLA chunked 六核(2026-10-11 fork-bf16 全家桶;优先级置顶):
             // vLLM third_party fork 同源 cubin。**dtype 统一律(同日Ⅵ)**:
             // bf16/f32 配方全关在 handler 肚内 —— 层侧纯 f16 进出

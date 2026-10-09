@@ -239,6 +239,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // B4 降级期草稿同步(§6.24 方案 A):decode 图 taps → 1 行 encode。
         // 毒化带 ≤8 token 即被覆写,探测重入零损;成本 ≈ 0.5ms/tok(2%)
         if self.tspec_ref().spec_degraded && self.dflash_tap_count > 0 {
+            // 降级步分相(2026-10-12 探针完善):sync encode 单独计时 ——
+            // 9.3 t/s 案的 80ms/步嫌疑犯,一屏定谳
+            let t_syn = std::time::Instant::now();
             let dtype = self.pool.dims.dtype;
             let hidden = self.pool.dims.hidden;
             let taps: Vec<TensorOps> = (0..self.dflash_tap_count)
@@ -248,7 +251,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             if taps.len() == self.dflash_tap_count {
                 self.prefill_dflash_encode(&taps, pos).await?;
             }
+            mrec("decode.sync", t_syn.elapsed());
             self.tspec().spec_steps_degraded += 1;
+            mrec("decode.step.deg", t_step.elapsed());
         }
         self.sample_and_emit(nt).await
     }

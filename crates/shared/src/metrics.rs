@@ -324,6 +324,16 @@ impl MetricsStore {
         e.2 = line;
     }
 
+    /// gauge:置当前值(覆盖语义;AL 窗口/pos/配置开关等"现在多少"类,
+    /// 与 counter 的累计语义区分;/debug/metrics 的 counter 字段直读)
+    pub fn counter_set(&self, tag: &str, v: u64, file: &'static str, line: u32) {
+        let mut inner = self.inner.lock().unwrap();
+        let e = inner.counters.entry(tag.to_string()).or_insert((0, file, line));
+        e.0 = v;
+        e.1 = file;
+        e.2 = line;
+    }
+
     /// 聚合 + 过滤(query 数据面)
     pub fn collect(&self, filter: &MetricsFilter) -> Vec<TagReport> {
         let inner = self.inner.lock().unwrap();

@@ -34,8 +34,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             .collect();
         let enc_pos: Vec<f32> = (0..8).map(|i| (pos + i) as f32).collect();
         let enc_slots: Vec<f32> = (0..8).map(|i| slot_at(pos + i)).collect();
+        // 逐行可见长(含自身;eager dflash_encode 同式 —— AL 劣化案修复)
+        let enc_kv_lens: Vec<f32> = (0..8).map(|i| (pos + i + 1) as f32).collect();
         let prop_pos: Vec<f32> = (0..8).map(|i| (fp + i) as f32).collect();
         let prop_slots: Vec<f32> = (0..8).map(|i| slot_at(fp + i)).collect();
+        // propose 噪声块逐行可见长(eager dflash_propose 同式 fp+1+i)
+        let prop_kv_lens: Vec<f32> = (0..8).map(|i| (fp + 1 + i) as f32).collect();
         let kv_len = vec![(fp + 8) as f32];
         let anchor = vec![bonus as f32];
         let pg = self.dflash_graph.as_mut().expect("dflash_graph");
@@ -46,8 +50,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             ("anchor", anchor.as_slice()),
             ("enc_pos", enc_pos.as_slice()),
             ("enc_slots", enc_slots.as_slice()),
+            ("enc_kv_lens", enc_kv_lens.as_slice()),
             ("prop_pos", prop_pos.as_slice()),
             ("prop_slots", prop_slots.as_slice()),
+            ("prop_kv_lens", prop_kv_lens.as_slice()),
             ("kv_len", kv_len.as_slice()),
         ])
         .await?;

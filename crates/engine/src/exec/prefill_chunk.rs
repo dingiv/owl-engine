@@ -342,6 +342,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     top.select_nth_unstable_by(1, |a, b| b.0.partial_cmp(&a.0).unwrap());
                     top.truncate(2);
                     top.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                    owl_shared::metrics::with_metrics_store(|s| {
+                        s.counter_set("prefill.top1", u64::from(top[0].1), file!(), line!());
+                        s.counter_set(
+                            "prefill.top1.gap100",
+                            ((top[0].0 - top[1].0) * 100.0) as u64,
+                            file!(),
+                            line!(),
+                        );
+                    });
                     eprintln!(
                         "[pf-probe] boot{} argmax(top2)={} gap={:.5} top=({} {:.4}) ({:.4})",
                         bs_seq,

@@ -51,7 +51,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
     pub async fn load_qwen35_0_8b(&mut self, dir: &Path) -> Result<LoadedModel> {
         let spec = qwen3_5_0_8b();
         let model = Arc::new(load_0_8b(dir, self.face).await?);
-        let tokenizer = load_tokenizer(dir)?;
+        let tokenizer = load_tokenizer(dir, &spec.tokenizer)?;
         let rope = Rope::new(262_144, 256, 64, 10_000_000.0)?;
         let quant_plan = owl_models::module::QuantPlan::F16;
         let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1, device_repack: false, verify: false, debug_tap: false };
@@ -69,7 +69,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
     ) -> Result<LoadedModel> {
         let spec = qwen3_5_0_8b();
         let model = Arc::new(load_0_8b_w4a16(dir, self.face).await?);
-        let tokenizer = load_tokenizer(tokenizer_dir)?;
+        let tokenizer = load_tokenizer(tokenizer_dir, &spec.tokenizer)?;
         let rope = Rope::new(262_144, 256, 64, 10_000_000.0)?;
         let quant_plan = owl_models::module::QuantPlan::W4A16;
         let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1, device_repack: false, verify: false, debug_tap: false };
@@ -96,7 +96,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
             s.timer_begin("load.27b.total", file!(), line!());
         });
         let model = Arc::new(load_27b_awq(dir, self.face, head_plan).await?);
-        let tokenizer = load_tokenizer(tokenizer_dir)?;
+        let tokenizer = load_tokenizer(tokenizer_dir, &spec.tokenizer)?;
         let rope = Rope::new(262_144, 256, 64, 10_000_000.0)?;
         let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1, device_repack: false, verify: false, debug_tap: false };
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;

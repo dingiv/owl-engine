@@ -781,8 +781,10 @@ impl<D: DeviceClient + 'static> Engine<D> {
                                     InputSlot::f32("anchor", 1),
                                     InputSlot::f32("enc_pos", 8),
                                     InputSlot::f32("enc_slots", 8),
+                                    InputSlot::f32("enc_kv_lens", 8),
                                     InputSlot::f32("prop_pos", 8),
                                     InputSlot::f32("prop_slots", 8),
+                                    InputSlot::f32("prop_kv_lens", 8),
                                     InputSlot::f32("kv_len", 1),
                                 ],
                                 outputs: vec![
@@ -806,8 +808,14 @@ impl<D: DeviceClient + 'static> Engine<D> {
                                 let anchor = sc.input("anchor")?;
                                 let enc_pos = sc.input("enc_pos")?;
                                 let enc_slots = sc.input("enc_slots")?;
+                                // 逐行可见长(含自身;eager dflash_encode 同式
+                                // pos+i+1 —— 原绑 enc_pos 缺自身 = AL 劣化根因)
+                                let enc_kv_lens = sc.input("enc_kv_lens")?;
                                 let prop_pos = sc.input("prop_pos")?;
                                 let prop_slots = sc.input("prop_slots")?;
+                                // propose 噪声块逐行可见长(fp+1+i;原绑标量
+                                // kv_len,1 值槽供 8 行读 = 1~7 行越界垃圾)
+                                let prop_kv_lens = sc.input("prop_kv_lens")?;
                                 let kv_len = sc.input("kv_len")?;
                                 let bt = bt_leaf.clone();
                                 let enc_kvs: Vec<owl_models::module::KvBuffers> = kv_leaves
@@ -816,7 +824,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
                                         k_cache: k.clone(),
                                         v_cache: v.clone(),
                                         slots: enc_slots.clone(),
-                                        kv_lens: enc_pos.clone(),
+                                        kv_lens: enc_kv_lens.clone(),
                                         block_tables: bt.clone(),
                                     })
                                     .collect();
@@ -826,7 +834,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
                                         k_cache: k.clone(),
                                         v_cache: v.clone(),
                                         slots: prop_slots.clone(),
-                                        kv_lens: kv_len.clone(),
+                                        kv_lens: prop_kv_lens.clone(),
                                         block_tables: bt.clone(),
                                     })
                                     .collect();

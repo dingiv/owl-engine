@@ -17,7 +17,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     ) -> Result<TurnEvent> {
         let sid = self.active.as_ref().expect("active 已保证").session_id;
         if grew {
+            let ts_bt = std::time::Instant::now();
             self.write_bt(sid).await?;
+            mrec("spec.bt", ts_bt.elapsed());
         }
         let prof = self.probes.step_profile;
         let t0 = prof.then(std::time::Instant::now);
@@ -39,7 +41,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
 
         // ② 草稿到位(host 账;轮末 propose 图/eager dtoh 产出。首轮 =
         // prefill seed propose(eager);Dumb = anchor 重复)
-        let drafts: Vec<u32> = if let Some(d) = self.tspec().spec_drafts_host.take() {
+        let drafts: Vec<u32> = if let Some(mut d) = self.tspec().spec_drafts_host.take() {
+            // depth 联动截断(2026-10-09 depth=3 案):⑦ propose 恒产 7
+            // 草稿,depth<7 时下轮 block=1+7 行装不进 T=depth+1 捕获图
+            // (ids 8≠4 装填拒,pump 退役)。与轮首直调分支的
+            // d.truncate(depth) 同款,收口在消费点单处。
+            d.truncate(depth);
             d
         } else if let Some(crate::running::Drafter::DFlash2(_)) = self.drafter.as_ref() {
             let ts = std::time::Instant::now();
@@ -102,6 +109,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     t_v1.elapsed()
                 );
             }
+            mrec("spec.verify.step", t_read_v - t_step_v);
+            mrec("spec.verify.read", t_read_v.elapsed());
             let ids: Vec<u32> = tok_f.iter().map(|&v| v as u32).collect();
             let hidden = vg.output_block("hid").expect("hid 输出槽");
             let n_rec = self.pool.gdn_count() * 8;
@@ -124,10 +133,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let m = (0..depth).take_while(|&i| drafts[i] == ids[i]).count();
         let bonus = ids[m];
         // B4 自适应降级态机(§6.24;DFlash2 专属 —— 同步机制走 dflash encode)
+        // 2026-10-12 深夜重放 + 滚动 AL 窗口:连击 streak 会被"偶发 m=1"
+        // 破解(随机域 AL≈1.1 时 9.3 t/s 案),窗口均值 < 盈亏线即降级
+        let mut degraded_now;
         if self.dflash_tap_count > 0 && self.probes.degrade_after > 0 {
             let (degrade_after, probe_every0) = (self.probes.degrade_after, self.probes.probe_every);
             let spec = self.tspec();
-            let (streak, degraded, probe_every) = spec_degrade_transition(
+            spec.recent_rounds += 1;
+            spec.recent_tokens += (m + 1) as u32;
+            let (streak, degraded0, probe_every) = spec_degrade_transition(
                 spec.spec_zero_streak,
                 spec.spec_degraded,
                 spec.spec_probe_every,
@@ -135,12 +149,20 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 degrade_after,
                 probe_every0,
             );
+            let window_starved = if spec.recent_rounds >= 16 {
+                let avg = spec.recent_tokens as f32 / spec.recent_rounds as f32;
+                spec.recent_rounds = 0;
+                spec.recent_tokens = 0;
+                avg < 1.2
+            } else {
+                false
+            };
+            let degraded = degraded0 || window_starved;
             if degraded && !spec.spec_degraded {
                 eprintln!(
-                    "[spec-degrade] m=0×{streak} → 降级裸 decode(probe 每 {probe_every} tok)"
+                    "[spec-degrade] m=0×{streak} win_starved={window_starved} → 降级裸 decode(probe 每 {probe_every} tok)"
                 );
                 mcnt("spec.degrade", 1);
-                // 降级前的下轮草稿作废(位置已过时;探测轮 ② 自产新草稿)
                 spec.spec_drafts_host = None;
             } else if !degraded && spec.spec_degraded {
                 eprintln!("[spec-degrade] 探测命中 m={m} → 恢复 spec");
@@ -149,7 +171,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             spec.spec_zero_streak = streak;
             spec.spec_degraded = degraded;
             spec.spec_probe_every = probe_every;
+            // 滚动 AL gauge(窗口均值 ×100;/debug/metrics 一屏可见盈亏)
+            mcnt("spec.al.win", u64::from(spec.recent_tokens * 100 / spec.recent_rounds.max(1)));
+            degraded_now = degraded;
+        } else {
+            degraded_now = self.tspec_ref().spec_degraded;
         }
+        // P0 修(2026-10-12):降级态在 emit 循环前定格 —— 预算/EOS 会在
+        // 循环内 complete()(active 被取走),循环后触 tspec() = panic
+        // mcnt("spec.pos.last", ...) 在 metrics 段(pos+m+1 gauge)
         // 对齐探针(E5-DF3 AL=0 排查):drafts vs 目标验证行逐位对照 ——
         // 附近命中(drafts[i]==ids[i±1]) = 位移对齐 bug;全散 = 分布质量
         if self.probes.dflash_probe {
@@ -458,9 +488,16 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         mcnt("spec.rounds", 1);
         mcnt("spec.tokens", (m + 1) as u64);
         mcnt("spec.accepted", m as u64);
+        mcnt("spec.pos.last", (pos + m + 1) as u64);
+        if degraded_now {
+            mcnt("spec.deg.rounds", 1);
+            mrec("spec.round.deg", t_all);
+        } else {
+            mrec("spec.round.spec", t_all);
+        }
         if prof {
             eprintln!(
-                "[spec-prof] pos={pos} total={t_all:?} verify={t_verify:?} rollback={t_rollback:?} propose={t_propose:?} snap={t_snap:?} m={m}"
+                "[spec-prof] pos={pos} total={t_all:?} verify={t_verify:?} rollback={t_rollback:?} propose={t_propose:?} snap={t_snap:?} m={m} deg={degraded_now}"
             );
         }
         self.pending_events

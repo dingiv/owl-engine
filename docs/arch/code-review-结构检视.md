@@ -697,3 +697,294 @@ actor 线程 catch_unwind 包裹(AssertUnwindSafe)→ 装配深路径 panic
   无孤文件。sources.rs include 路径 + README 表 + 4 处文档提及随更;
   workorder 历史档案按惯例不改写。
 - 回归:kernels 19/19 / models 115/115 / engine 38/38 / workspace 绿。
+
+---
+
+## 二十一、vLLM 对照案:AL 劣化 + 模板缺失 + spec 图态正确性(2026-10-12 深夜立案)
+
+> 用户对照实锤:同模型同草稿同词池,vLLM+DFlash(3080 对)decode avg
+> **113.1 / min 66.3(15/15)**,owl **43.7 / min 9.3**。"实现有问题"成立。
+
+- **质量账(AL)**:vLLM Prometheus AL=**2.61**(pos0 命中 80%,健康衰减);
+  owl **1.45**(半数轮 m=0)。同 DFlash2 家族草稿,接受率差 44% = 实现级。
+- **根因链三层**(逐层二分,每层都有 A/B 实证):
+  1. **模板注入缺失(已修)**:owl chat 包装 = 手写前后缀对,**从未渲染
+     chat_template.jinja**(0.8B 时代挂账欠至今)。froggeric v22.5
+     thinking 模板正确注入 = system 段(reasoning effort medium)+ user +
+     `<|im_start|>assistant\n<think>\n`(开 think),prompt **84** tok;
+     owl 旧形态 = 49 tok(缺 system + 错预填空 think 块)。修:27B 档
+     ChatFormat 数据化更正(jinja 渲染实证);**load_tokenizer 两参化**
+     (原恒用 0.8B 档 spec,27B 档从未消费)。修后裸 decode 输出恢复正常
+     推理(此前 49 形态下"、"+EOS 与"诗意重复句"皆为错上下文产物)。
+  2. **spec 图态正确性 bug(新立案)**:新模板下裸 decode 正常、spec d7
+     输出 "a a a" 崩坏;**eager 臂(OWL_DFLASH_EAGER=1)与 bare 逐字一致**
+     → 定位 `dflash_graph`(图态 encode+propose 单图)。图捕获语义排查
+     (anchor 绑定/m 桶/taps 指针)待战役展开。
+  3. **B4 连击判据失效(已修)**:随机域 AL≈1.1 时"偶发 m=1"重置连击 →
+     永不降级 → 104ms 冷轮 × 1.1 tok = 9.3 t/s。改**滚动 AL 窗口**
+     (16 轮均值 < 盈亏线即降级);阈值标定四轮:3.6→40.9 / 1.5→14.2 /
+     **1.2→43.7**(1.5 错杀盈利 spec:稳态轮 38.5ms 下 AL1.45=63 t/s
+     在盈利侧)。稳态/冷轮之别为本轮探针新知。
+- **P0(本轮探针补丁引入,当场抓获修复)**:预算/EOS 恰落 spec 轮
+  bonus 位 → complete() 后触 tspec() → "无活跃 turn" panic → 引擎退役。
+  降级态捕获移至 emit 循环前。
+- **探针面固化**:spec.m0..m7 直方图 / spec.round.{spec,deg} 分账 /
+  spec.deg.rounds·tokens;对照工具 = vLLM /metrics per-pos 接受计数差分。
+- **残余挂账**:①dflash_graph 图语义战役(P0 级,spec 正确性);
+  ②降级态每步 dflash encode 同步开销(~20ms/步,残差);
+  ③阈值在线自适应;④verify 8 行 = 2.9× 裸步(38.5ms 轮的构成主体)。
+- 回归:engine 38/38 / models 115/115 / kernels 19/19 / workspace 绿。
+  vLLM 对照数字:113.1 avg / 66.3 min(15/15,3080 对 TP2)。
+
+### §二十一·修复回执(同日)
+
+- **根因修 = 图态 kv_lens 双绑错**:
+  ①encode `kv_lens` 误绑 `enc_pos`(pos+i,**每行注意力缺自身**)→ 绑
+  `enc_kv_lens`(pos+i+1,eager 同式);
+  ②propose `kvs.kv_lens` 误绑**标量** `kv_len`(fp+8,1 值槽供 8 行读
+  越界垃圾)→ 绑 `prop_kv_lens`(fp+1+i 逐行,eager 同式)。
+  图/ eager 双臂逐参数 diff 定位(数据流/槽表/slots 全同,唯 kv_lens)。
+- **修复验证**:词表复述 AL **1.45 → 4.38(反超 vLLM 2.61)**;spec 输出
+  与 bare 逐字一致;llm_speedtest std decode avg **43.7 → 66.1(+51%)**,
+  prefill 1155 持平。
+- **对照结论更新**:AL 已反超;decode avg 66.1(单 3090 Ti)vs vLLM
+  113.1(3080 对 TP2)残差 = ①硬件(TP2 每步 ~2× 带宽)②min 8.4 段
+  (2048 长随机域,草稿分布真实短板,m0 十连非 bug;lookup drafting
+  摘樱候选)。B4 滚动窗口(1.2)兜底生效。
+
+---
+
+## 二十二、2048"9.3 t/s 案"结案 + dflash 图 kv_lens 修复(2026-10-12 深夜)
+
+> 用户挑战"修好了怎么还是 8"→ 复测发现 **8.8 那轮是脏测量**:新实例
+> bind 失败静默退出,8135 被上一实例占用,llm_speedtest 打到旧引擎。
+> 测量纪律立案:boot 后必须 `grep 引擎就绪` + 端口进程核验才可发压。
+
+- **干净环境终测(2048 单点 ×2)**:decode **67.3/67.32**(逐位一致,
+  修复前 9.3 → **+623%**);全 std:decode avg **73.5**,prefill **1167.6**,
+  9/15(flavor max_seq 锁定,预期)。
+- **AL 终值**:**5.82**(vLLM 2.61 的 2.2 倍);m 直方图双峰 = m7 全接受
+  124 轮(62%,可预测段吃满)+ m0~2 散布(随机段);verify 83.5ms /
+  propose 15.3ms(2048 ctx)。
+- **根因链终版**:
+  1. ~~草稿分布短板~~ **撤销** —— 真 bug = 图态 kv_lens 双绑(encode 绑
+     enc_pos 缺自身;propose 绑标量供 8 行越界),eager 臂正确故金标全绿;
+  2. ~~B4 判据~~ 降为次要(干净环境下 2048 深亏不复现;窗口机制保留
+     兜底,阈值 1.2);
+  3. 模板注入缺失(49 vs 84)独立成立,已修。
+- **教训入册**:①性能归因前必须验证"测的是哪个进程"(端口/进程/日志
+  三验);②"分布不利"结论必须有同草稿同分布的对照(vLLM per-pos
+  Prometheus 差分一把就够,三周前就该做);③图捕获闭包的槽绑定是
+  AL 类语义错的温床,graph/eager 逐位 parity 门立项(本轮人工 diff
+  已替代一次,门未固化)。
+- vLLM 对照更新:decode 113.1(3080 对 TP2)vs owl 73.5(单 3090 Ti)
+  —— 按 TP2 带宽 ~1.5× 折算,单卡口径 owl **已持平略优**;prefill
+  1167.6 vs 1653(TP2 同折算后 owl 1750+,反超)。
+
+---
+
+## 二十三、m0 连段二分定谳:kv_fp8 × gdn_chunked 交互(2026-10-12 深夜续)
+
+> 2048 随机词池 prompt 上 19% 轮 m0(11 t/s 龟速段)。矩阵二分(300 词
+> 英文流 + 散文后缀,prompt=384):
+
+| 配置 | 输出 |
+|---|---|
+| fp8=F chunked=F depth=0 | 正常推理 ✓ |
+| fp8=F chunked=T depth=0 | 正常推理 ✓ |
+| fp8=T chunked=F depth=0 | 正常推理 ✓ |
+| **fp8=T chunked=T depth=0** | **'safety'+EOS 崩(首 token 即歪)** |
+| 生产档(+d7) | ' 数据.' 循环 |
+
+- **定谳:fp8 主池 × gdn_chunked prefill 的交互数值劣化** —— 单独各自
+  均正常,合用即崩。机制候选:chunked 六核的输出 f16 精度写入 + fp8
+  KV 读出的量化误差在 24 层 GDN 混合架构上逐层放大(matmul 全注意力
+  层无罪——fp8 单独全绿)。注:此 prompt 的 vLLM 贪心输出也是不可控
+  文本(英文流+哲学散文 = 边缘分布),'safety' 与 'The user's...'
+  均属"分歧后各自连续"——分歧点在 prefill 首/早期轮的数值面。
+- **影响面**:随机域 std 的 min 9.4 段即此(2048 prompt 触发 24 GDN
+  层 × 8 chunk 的 chunked 前向,fp8 KV 读出参与 chunked 输入链)。
+  数学域(AL 高)与词表复述不受影响。
+- **修复方向(立案)**:①chunked 前向的输入端校验(层 0 的 q/k/v 走
+  f16 直读,层间链上 fp8 KV 读出经 v2 读核—— suspected 在 v2 读核
+  与 chunked 输入的 dtype/精度交接);②金标:2048 prompt 的 m 序列
+  与 sglang 对拍(已有 testdata/gdn_fla 金标管线可复用)。
+- **非问题排除**:B4 窗口(1.2 阈值未触发于健康段)、模板(84=84 对
+  齐)、分词(337=337)、dflash 图 kv_lens(已修,词表复述 AL 4.38)。
+
+### §二十一·探针面完善回执(同日,用户批评"日志舍不得多加")
+
+- metrics.rs + `counter_set`(gauge 语义:当前值;/debug/metrics counter
+  字段直读)—— AL 窗口/pos/配置开关类"现在多少"量有正经落点。
+- spec 轮全相记录(恒开,µs 级):verify 拆 step(上传+launch)/
+  read(同步+回读)—— **read=67ms 是 verify 82ms 的主体**(图执行后
+  的同步+回读,非 GPU 计算),优化指向 = tok 读的旁路/重叠;
+  `spec.bt`(write_bt)/`spec.al.win`(滚动 AL×100)/`spec.pos.last`
+  (fp 定位)/`spec.round.{spec,deg}` 分账/m0..m7 直方图。
+- 降级裸步分相:`decode.sync`(草稿 KV 同步 encode 单独计时)+
+  `decode.step.deg` —— 9.3 案的 80ms/步嫌疑犯自此一屏定谳。
+- prefill 侧:`prefill.top1`/`prefill.top1.gap100` gauge(首 token
+  id 与 top1-‐top2 差距,跨引擎逐位对照的落点)。
+- 实测回收(std 全程):spec 轮 80.3ms = verify 67.1(step 0.1 +
+  **read 67.0**)+ propose 12.5 + fold 0.6;AL=5.80,tok/轮 6.80;
+  ~~read 67ms = 下一个优化主目标(read_output_f32 的同步等待 ——
+  图 replay 异步排队后首读承担全队列排水;与 emit 重叠/拆分可回收
+  ~2/3 轮时间)~~ **⚠️ 本节两条结论(「非 GPU 计算」「重叠可回收 2/3」)
+  已被 §二十四 实测推翻** —— read 阻塞就是 verify 图的 GPU 执行本身。
+
+## 二十四、read 阻塞定谳:verify 图 GPU 执行本身,"排水税"翻案(2026-10-09)
+
+用户令查「read 为什么阻塞那么长」。control 实验 + 代码链路双证,**§二十一
+的"首读承担全队列排水"推断错误**,当庭翻案:
+
+**机制链**(代码定谳):
+- `graph_launch` = 异步火后不理(state.rs:cuGraphLaunch 入 COMPUTE 流即回)→
+  step 只计提交延迟(~0.1ms);
+- `Dtoh`(harvest.rs handle_dtoh)第一步 = `STREAM_COMPUTE.synchronize()`
+  —— **栅栏等的就是 verify 图算完**;之后 D2H memcpy(n=32B)+ host 回调,
+  回读本身 ~20µs(d2h-prof:sync≈issue)。
+- 所以 read 时间 ≡ COMPUTE 流上在队工作的 GPU 执行时间。read 是「首个
+  阻塞点」,不是「排水税」。
+
+**control 实验**(run-depth*.toml + step_profile + d2h_prof,随机域短
+prompt,engine 单卡 3090 Ti):
+
+| 点 | T(depth+1) | ctx | read | pure(replay+read) |
+|---|---|---|---|---|
+| depth=7 | 8 | ~500 | 43.2ms | 43.2ms(差 0.04ms) |
+| depth=3 | 4 | ~500 | 35.5ms | 35.7ms |
+| depth=0 | 1 | ~500 | 24.5ms/步 | —(decode 图) |
+| depth=7 | 8 | ~2356 | 90.8ms | 90.7ms |
+
+**read ≡ pure 全程成立(40+ 轮样本)**:首读排掉的队列里只有 verify 图
+自己(上轮 ⑦ dflash propose 自带 read 已排干)→ **阻塞 = verify 图的
+真实 GPU 执行**,与 host/队列/回读无关。
+
+**verify 图时间构成**(depth 扫描回归):
+- **权重流底座 ≈ 24.5ms**(T=1;27B AWQ int4 ~13.5GB → 有效带宽
+  ~551GB/s,3090 Ti 峰值 1008 的 ~55% —— marlin/访存效率有 1:1 杠杆);
+- **行边际 ≈ +2.3~2.7ms/行**(T 无关权重的部分:GDN 逐行递归/conv
+  逐行副标题 + attention + 每行小核;depth=7 时合计 ~16ms ≈ 37%);
+- **KV 项随 ctx 线性 × 行数**:T=8 时 ~25.7µs/ctx-token(500→2356 ctx
+  贡献 +47.6ms)—— paged attention 每行独立读全 KV,T 大长 ctx 被此吃掉
+  (std 矩阵长点 read 100ms+ 即此;67ms = 五点平均的解释)。
+
+**结论修正(替代 §二十一 优化指向)**:
+1. ~~读旁路/重叠回收 2/3~~ **作废** —— 重叠只能藏 host 段(~0.1ms),
+   关键路径下界 = verify 图 GPU 时间,重叠不产生任何token;
+2. 正解三杠杆:① T=1 底座(权重流 55% 峰值带宽,marlin/访存效率);
+   ② 行边际(GDN 多行批处理化 —— verify 行间 GDN 递归本就串行,
+   chunked 化可摊平);③ KV 共享读(attention 一次读 KV 服务全查询行,
+   vLLM paged attn 本就如此,核对 per-row 循环与否另案核对)。
+3. depth 经济学定价:每加一行 depth 花 (2.3ms + KV 项),买 ~AL 行 token
+   —— AL>2 才有净赚,与 B4 窗口盈亏线互证。
+
+**探针纪律注**:gpu_prof 逐核分账与图回放**互斥污染** —— graph_launch
+不走 gpu_prof 同步,其后首个被探针的 launch 会替图背 40ms 级黑锅
+(topk16 p50=40.9ms 假象);图内分账必须走 no_graph eager 窗。
+另:杀 owl server 现行犯两连 —— nohup+& 的 `$!` = 包装子 shell pid
+(真身要用 ps/proc 双验),`pgrep -f` 模式匹配自身命令行自杀两次
+(括号 trick 或 ps+grep "[x]" 规避)。
+
+### §二十四·数据质量补账(同日,用户问「你测的接受率是多少」)
+
+depth 扫描各点接受率事后反推:短ctx depth=7 主点(43.2ms)= 退化复述
+域 "a a a",7.08 tok/轮 ≈ m6 饱和,零降级;长ctx 90.8ms 点 = 词沙拉域,
+m=0×6 → B4 降级(全部样本来自 m=0 轮)。read≡pure 在高低 AL 两域都
+成立 → 机制结论双向加固;行边际剔脏点后用 T=1/T=8 两点 = 2.67ms/行。
+**depth=3 点作废**:第二轮即崩 —— ⑦ 统一 propose 恒产 7 草稿不随 depth
+截断 → ids 8≠4 装填拒,pump 退役。修复(消费点单处截断,spec.rs ②
+`d.truncate(depth)`)已落,depth 开区间 (0,7) 档位自此可用(待重验)。
+
+## 二十五、27B 语义崩案立案:"a a a" 吸引子,全天验收盲区(2026-10-09)
+
+用户令重跑健康数学域 depth 扫描(选案②),执行中撞破大案:**27B 主模型
+语义输出已崩**,数学域健康样本在本构建上不存在,② 不可达:
+
+**症状**:清晰中文指令(「请连续写加法算式 a+b=c」)greedy 输出
+"a a a"×N 吸引子;数字流+英文指令 → 1-2 token 即 EOS("──"/"=the")
+或数字雪崩("= 100000…");温度 0/0.7 同症状。
+
+**判别链(逐层排除)**:
+1. fp8 KV 关 → 同坏(非 §二十三 数值劣化族);
+2. 全参考位(无图 eager + gdn_scalar + fp16 KV + 无 spec)→ 同坏 →
+   **图/fp8/chunked/spec/采样全部无罪**;
+3. **0.8B 同引擎链 greedy 完全健康**("10 + 50 = 60\n98 - 42 = ? →
+   Wait, I cannot write this…" —— 真实模型行为)→ 引擎模板/prefill/
+   解码循环/采样无罪 → **27B 特有路径**;
+4. 27B 唯一独有路径 = **cyankiwi AWQ-INT4 装载/repack/marlin GEMM 链**
+   (0.8B 走 BF16 不经此链)。
+
+**嫌疑定位**:M1-M5 算子契约重构(kernels registry/LaunchVal 值表/
+GdnChunkedCall 客户端面)最可疑 —— 回归门全是金标/单元(engine 38/models
+117/kernels 19),**没有全模型语义 E2E**;单形状标量错值可漏网。
+时间线佐证:§十(重构前夜)数学域 157 t/s + AL 4.345 = 模型语义尚活;
+今日全部数据(含 43.7/66.1/55.3 bench 与 AL 5.8)的输出全是 "a a a"
+—— **全天验收只看接受率/速度,无人看过一条语义输出,语义崩穿无人察觉**。
+
+**波及面**:① 全天 spec/速度数据在崩坏模型上测得 —— 时序结论(read≡pure、
+时间构成)不受影响,但 AL/接受率类数据的「模型健康」前提不成立;
+② §二十一 vLLM 对照(同 prompt 给哲学散文,owl 给 a a a 循环)当时就
+是本案的可见症状,被误读为「垃圾进垃圾出」;
+③ 「数学域不受影响」(§二十三)作废 —— 数学域 EOS 即本案症状。
+
+**下一步(待拍板)**:① AWQ 装载/repack parity 刀(marlin GEMM 对拍
+逐形状,重点 M1-M5 动过的 LaunchVal 值表);② 金标扩全模型语义 E2E
+(固定 prompt → 固定输出逐位,入 CI);③ 0.8B 加 AWQ 臂对拍(隔离
+repack 路径);④ 查 cyankiwi 检查点完好性(外部 sha/他引擎跑同文件)。
+
+
+## 二十六、语义崩案结案:GpuRes::upload 异步 memcpy 静默不写(2026-10-09)
+
+用户令 worktree 回滚 bisect(§二十五 的下一步)。**当日结案,凶器落网:**
+
+### 定位链(worktree 对照 + 逐层 checksum + 指针侦探)
+
+1. worktree @ HEAD(9f876c2)短 prompt"健康" = **假信号**(真凶与提交无关);
+2. 同二进制垫长 prompt(43→89 tok)即崩 → **长度触发**,边界精确 = 64
+   (59 健康/67 崩;GDN 大 T 分臂 `tokens>=64`,prefill_chunk=512 单块);
+3. 0.8B 同样崩(85 tok 乱码)→ 与 AWQ/27B 无关;scalar 与 chunked 崩法
+   **逐字节相同** → 共享根因;
+4. pf_bisect 逐层 checksum(chunked on/off 双 boot):**`post.g*.rec`
+   18 层同一常数 = 状态池 rec 全零** —— h 核终态未写回;
+5. **引擎内对拍 test 三臂"逐位相同"是假象**:`testkit::harvest_f16` 走
+   `eval_ops`(env 缺省 = Cpu/gdn 全关)→ 三臂全走 varlen。修正
+   `eval_ops_env` 后臂选路生效 —— 但 test 的 attention 输入(kv 池手搭)
+   与 server 不可比,弃 test 路线,转 server 指针侦探;
+6. handler 内侦探:in_k/in_g 合理非零,**state_out(ht)/v_new/h_buf 全零**
+   → h 核空转;meta 表侦探:**cu=[0,0],应为 [0,T]** → upload 后读回全零
+   → **`GpuRes::upload` 非捕获分支的 cudarc `stream.memcpy_htod(src,&mut
+   target)` 返回 Ok 但数据未落** —— 六核 cu 全零 → 全部 early-return
+   → y 零 + rec 零 → "a a a" 吸引子。
+
+### 修复(三件)
+
+1. **server/mod.rs `GpuRes::upload`**:非捕获分支弃 async
+   `memcpy_htod`,改 `result::memcpy_htod_sync(dst, src)` 同步直写
+   (捕获窗 async 分支保留);
+2. **gdn.rs 形状守卫**:chunked cubin 烘 constexpr NV=48/KD=VD=128、
+   scalar d=128 —— `chunked_shape_ok/scalar_shape_ok` 不配强制回落
+   varlen(0.8B NV=16 结构性不适用,曾直接写飞);
+3. (前案已落)spec.rs depth 联动 truncate。
+
+### 修复后回归
+
+- 27B:chunked@35/51/67/83、scalar@67、varlen 全健康;spec d7 全管线
+  语义正常(竖式/思考链);AL 反推 ≈3.5(数学域真实值,非崩坏假 5.8);
+  verify read 27.8ms @ 短 ctx;
+- 0.8B:chunked 请求守卫回落 varlen 健康;
+- 测试资产:`crates/kernels/tests/gdn_big_t_arms_parity.rs`(合成双臂
+  对拍,浅/深/混合 g 域 Δ~1e-7,入 git)。
+
+### 波及面改判
+
+- **今天全部性能/AL 数据重定性**:read≡pure 等时序结论仍成立,但
+  AL 5.8/55.3 t/s 等为崩坏吸引子上的假值,须全量重测;
+- §二十三"数学域不受影响"作废(数学域 EOS 即本案);fp8×chunked
+  交互案待重审(真凶是 upload + 形状,fp8 或为无辜共犯);
+- §二十一 vLLM 对照的"owl 给 a a a"即本案症状;
+- **方法论教训**:①async memcpy 排队 + 无 sync = 静默不写,handler
+  内所有 `GpuRes::upload` 消费方(soff/meta 表)全受累 —— 上传后必须
+  sync 或用同步 API;②`testkit::harvest_*` 的 env 缺省陷阱(带臂选路
+  的对拍必须 `eval_ops_env`);③"金标绿"只覆盖金标的输入域(浅 g/
+  整块 T/金标上传路径),**handler 生产路径需 handler 级上传链测试**。

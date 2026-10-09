@@ -868,10 +868,14 @@ impl owl_kernels::device::DeviceRes for GpuRes<'_> {
             unsafe { crate::ffi::memcpy_htod_async(dst, src, stream.cu_stream()) };
             Ok(())
         } else {
-            let mut target = target;
-            stream
-                .memcpy_htod(src, &mut target)
-                .map_err(|e| OpError::Launch { op: OP_RES.into(), stage: owl_kernels::contract::Stage::Store, detail: format!("upload: {e:?}") })
+            // 2026-10-09 崩案修复试刀:async memcpy_htod 静默不写(meta 表读回全零)
+            // → 改同步 result API 直写
+            unsafe {
+                cudarc::driver::result::memcpy_htod_sync(dst, src)
+            }
+            .map_err(|e| OpError::Launch { op: OP_RES.into(), stage: owl_kernels::contract::Stage::Store, detail: format!("upload sync: {e:?}") })?;
+            let mut target = target; // 保留账本句柄(析构语义不变)
+            Ok(())
         }
     }
     fn device_ordinal(&self) -> Result<i32, OpError> {

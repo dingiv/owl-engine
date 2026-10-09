@@ -71,6 +71,11 @@ pub(crate) struct TurnSpecState {
     pub(crate) spec_steps_degraded: usize,
     /// B4:当前探测周期(失败 ×2 退避,上限 512)
     pub(crate) spec_probe_every: usize,
+    /// B4 滚动 AL 窗口(2026-10-12):轮数 / 产出 token 数 —— 连击 streak
+    /// 会被"偶发 m=1"破解(随机域 AL≈1.1 时 9.3 t/s 案),窗口均值
+    /// < 盈亏线(3.6 tok/轮)即降级,不看连击
+    pub(crate) recent_rounds: u32,
+    pub(crate) recent_tokens: u32,
     /// prefill 末行 hidden(首轮 propose 的 anchor_hidden;消费后置 None)
     pub(crate) spec_seed_hidden: Option<owl_iface::contract::Bytes>,
 }

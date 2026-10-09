@@ -21,3 +21,4 @@ testdata/gdn_fla/cases/*
 
 # kernels build 中间物(链接面 = prebuilt/*.a;.o 为 FORCE_BUILD 中间产物)
 crates/kernels/cu/flashinfer/*.o
+/*.toml

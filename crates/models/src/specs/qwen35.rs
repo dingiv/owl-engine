@@ -433,8 +433,13 @@ pub async fn load_27b_awq<D: DeviceClient + 'static>(
 /// Qwen3.5 tokenizer 装配:机制在 tokenizer.rs,事实在 spec 声明
 /// (ModelSpec.tokenizer)—— 本函数只是两端的接线(jinja 全引擎挂账
 /// serving 层)
-pub fn load_tokenizer(dir: &Path) -> Result<crate::tokenizer::Tokenizer, ModelError> {
-    crate::tokenizer::Tokenizer::from_spec(dir, &qwen3_5_0_8b().tokenizer)
+pub fn load_tokenizer(
+    dir: &Path,
+    spec: &crate::tokenizer::TokenizerSpec,
+) -> Result<crate::tokenizer::Tokenizer, ModelError> {
+    // 2026-10-12 两参化(原恒用 0.8B 档):chat 前后缀是模型档事实 ——
+    // 27B froggeric(thinking)与 0.8B 的注入面完全不同(AL 案根因之二)
+    crate::tokenizer::Tokenizer::from_spec(dir, spec)
 }
 
 /// 3:1 周期(G,G,G,F)铺满 n 层(Qwen3.5 hybrid 惯例;
@@ -490,8 +495,13 @@ pub fn qwen3_8_27b() -> ModelSpec {
         tokenizer: crate::tokenizer::TokenizerSpec {
             eos_tokens: vec!["<|im_end|>", "<|endoftext|>"],
             chat: crate::tokenizer::ChatFormat {
-                prefix: "<|im_start|>user\n".into(),
-                suffix: "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n".into(),
+                // 27B(froggeric v22.5,thinking 模型)正确注入形态:
+                // jinja add_generation_prompt 渲染实证(2026-10-12 AL 案)——
+                // ① system 段 = reasoning effort 注入(模板默认 medium);
+                // ② suffix 开 <think> 不预填空块(空块 = 非思考调法,模型
+                //    在错误上下文生成 → 输出退化 + DFlash AL 1.45 vs vLLM 2.61)
+                prefix: "<|im_start|>system\nReasoning effort is set to medium. Think through the task at a moderate depth: cover the key steps and verify the result, but keep the reasoning concise.<|im_end|>\n<|im_start|>user\n".into(),
+                suffix: "<|im_end|>\n<|im_start|>assistant\n<think>\n".into(),
             },
         },
         tied: false,
@@ -1068,7 +1078,8 @@ mod tests {
         }
 
         // 生成冒烟:prefill 喂 prompt → 末行 greedy → decode 4 步 → 文本打印
-        let tok = load_tokenizer(&dir).expect("tokenizer");
+        // 测试档 = 27B(两参化;0.8B 档另有调用点)
+        let tok = load_tokenizer(&dir, &qwen3_8_27b().tokenizer).expect("tokenizer");
         let mut gen_ids: Vec<u32> = Vec::new();
         let mut next = all[(t_len - 1) * VOCAB..t_len * VOCAB]
             .iter()
