@@ -84,6 +84,7 @@ async fn time_replays(client: &mut GpuClient, n_nodes: usize, elems: usize, tag:
     );
 }
 
+#[ignore = "probe: 图节点派发税裸速率(刀D 立案)"]
 #[tokio::test]
 async fn graph_dispatch_rate_probe() {
     let (tx, rx) = std::sync::mpsc::channel::<owl_cuda::Command>();

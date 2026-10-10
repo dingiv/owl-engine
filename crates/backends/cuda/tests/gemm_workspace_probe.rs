@@ -32,6 +32,7 @@ fn vram_used_mib() -> usize {
     String::from_utf8_lossy(&out.stdout).lines().next().unwrap().trim().parse().unwrap()
 }
 
+#[ignore = "probe: cuBLAS 账外显存实测(F1 治理)"]
 #[tokio::test]
 async fn gemm_workspace_footprint() {
     let (tx, rx) = std::sync::mpsc::channel::<owl_cuda::Command>();

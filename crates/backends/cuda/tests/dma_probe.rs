@@ -3,6 +3,7 @@
 use owl_cuda::{test_device_ordinal, DeviceClient as _, DeviceSelector, Dtype, GpuClient, GpuServer, Shape};
 use std::time::Instant;
 
+#[ignore = "bench: DMA/pinned 微基准(装载提速口径)"]
 #[tokio::test]
 async fn dma_microbench() {
     const MB: usize = 8 * 1024 * 1024; // 8MB 块(CHUNK_BYTES 量级)

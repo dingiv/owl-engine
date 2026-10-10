@@ -30,6 +30,7 @@ fn le_i32(v: &[i32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
+#[ignore = "probe: 外来大核图内派发税(刀D 立案②)"]
 #[tokio::test]
 async fn marlin_graph_dispatch_probe() {
     let mut client = assemble();
@@ -137,6 +138,7 @@ extern "C" __global__ void probe_add_f32(
     );
 }
 
+#[ignore = "probe: 外来大核图内派发税(刀D 立案②)"]
 #[tokio::test]
 async fn cublas_graph_dispatch_probe() {
     let mut client = assemble();

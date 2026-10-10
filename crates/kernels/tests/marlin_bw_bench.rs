@@ -99,6 +99,7 @@ fn bench_shape(
     (us, gbs)
 }
 
+#[ignore = "bench: marlin 带宽微基准(E5 性能会战)"]
 #[test]
 fn marlin_bandwidth_27b_shapes() {
     let Some(dev) = owl_shared::env_reader::parse::<usize>("OWL_TEST_DEVICE")

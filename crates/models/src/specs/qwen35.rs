@@ -1304,8 +1304,11 @@ mod tests {
             ref_rows.push(crate::testkit::harvest_f16(&mut gpu, &logits).await);
         }
 
-        // 被测:一次 prefill T=8
-        let ids_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&prompt));
+        // 被测:一次 prefill T=t_len(与下方 ref_rows / pos_all / slots_all
+        // 同口径 —— 2026-10-13 修:`vec![t_len]` 形状必须配 `prompt[..t_len]`
+        // 数据,原直接传 8 元素 prompt → from_host 字节断言先炸(8≠32),
+        // 测试根本跑不到自己的断言;注释里的 "T=8" 是更早版本的残留)
+        let ids_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&prompt[..t_len]));
         let pos_all = TensorOps::from_host(Dtype::F32, vec![t_len],
             &f32b(&(0..t_len).map(|t| t as f32).collect::<Vec<_>>()));
         let slots_all = TensorOps::from_host(Dtype::F32, vec![t_len],

@@ -46,8 +46,11 @@ pub(crate) mod running;
 pub(crate) mod sampler;
 pub(crate) mod scheduler;
 pub(crate) mod state;
-#[cfg(test)]
-mod tests;
+// 测试分层(test-architecture.md):单元测试走 cfg(test);
+// e2e 场景面(源文件里的 pub async fn,无 #[test])走 feature `e2e`,
+// 由 crates/engine/tests/engine.e2e.rs 手动调用。
+#[cfg(any(test, feature = "e2e"))]
+pub mod tests;
 
 pub use engine::{Engine, EngineConfig, EngineKnobs};
 pub use loader::{LoadedModel, ModelLoader};

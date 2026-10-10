@@ -21,3 +21,18 @@ half = "2"
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 owl-cpu = { path = "../backends/cpu" }
+
+[features]
+# E2E 场景面(docs/arch/test-architecture.md §三):集成测试经
+# `--features e2e` 导入源文件里的场景函数;生产构建零改动(整块 cfg 剔除)。
+e2e = []
+
+# E2E 入口(docs/arch/test-architecture.md §二:每 crate 唯一 e2e 入口)。
+# 文件名按约定带点(`<域>.e2e.rs`),而 cargo 目标名必须合法标识符 →
+# 显式登记 path/name 两件套。
+[[test]]
+name = "engine_e2e"
+path = "tests/engine.e2e.rs"
+# 无 `e2e` feature 时**不构建**该目标(场景面由 feature 门控;
+# 否则 `cargo test` 裸跑会因 lib 无 `tests` 模块而编译失败)
+required-features = ["e2e"]

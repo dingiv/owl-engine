@@ -1,6 +1,12 @@
 //! 引擎测试(2026-10-01 拆分自 engine.rs §5;用例逐字保真,仅私有
 //! 字段访问改 StatePool 路径)。
 //!
+//! **测试分层(2026-10-13,见 docs/arch/test-architecture.md)**:本文件只留**单元测试**
+//! (CPU/无装载,`cargo test -p owl-engine --lib`);涉及**模型装载**的场景
+//! (下方 `pub async fn gpu_*`,**无 `#[test]`**)由唯一 e2e 入口
+//! `crates/engine/tests/engine.e2e.rs` 手动调用(`--features e2e --test engine_e2e`)。
+//! 装载只做一次:`boot_08b`/`boot_27b_default` 是共享装载工厂(装载本身即一步测试)。
+//!
 //! CPU:构造/装载门禁;GPU 门控(OWL_TEST_DEVICE):双 turn 生命周期 /
 //! 会话连续 / 4k 长 ctx / W4A16 / 27B AWQ / 多会话隔离 / 前缀缓存命中 /
 //! S0 调度决策面。
@@ -11,7 +17,8 @@ use crate::exec::spec_degrade_transition;
 use crate::running::RunningEngine;
 use crate::scheduler::{SchedulerOutput, StepAction};
 use crate::turn::TurnEvent;
-use owl_cpu::CpuFace;
+#[cfg(test)]
+use owl_cpu::CpuFace; // dev-dep:仅 cfg(test) 单元档可用
 use owl_iface::contract::DeviceClient;
 
 fn asset_dir() -> std::path::PathBuf {
@@ -24,6 +31,7 @@ fn gpu_ordinal() -> Option<usize> {
 }
 
 /// CPU:构造(零执行)+ ModelLoader 装载门禁(权重/tokenizer 解析)
+#[cfg(test)] // dev-dep(tokio)门控:单元档专用
 #[tokio::test]
 async fn cpu_construct_and_load() {
     let mut engine = Engine::on(
@@ -38,6 +46,7 @@ async fn cpu_construct_and_load() {
 
 /// CPU:增量解码多字节字符跨 token(🌟 4 字节;逐 token 喂入,
 /// 差分不得 panic 且终态与前缀累计一致)
+#[cfg(test)] // dev-dep(tokio)门控:单元档专用
 #[tokio::test]
 async fn cpu_incremental_decode_multibyte() {
     let mut engine = Engine::on(
@@ -63,8 +72,11 @@ async fn cpu_incremental_decode_multibyte() {
 /// S0 调度决策面单测(GPU 门控 boot,但**调度步零设备执行**):
 /// Idle / Begin(Fresh)+ 首块切块 / 决策幂等 / decode 派生量 /
 /// GuardHit 增量复用。执行器不跑 —— 推进用手工模拟(fed/out 直写)。
-#[tokio::test]
-async fn gpu_schedule_decision_surface() {
+/// S0 调度决策面单测(GPU 门控 boot,但**调度步零设备执行**):
+/// Idle / Begin(Fresh)+ 首块切块 / 决策幂等 / decode 派生量 / GuardHit 增量复用。
+/// ⚠️ **不进 0.8B 共享装载组**(2026-10-13):本测依赖 `max_seq=64/chunk=4`
+/// 的切块语义,而共享档是 `4096/32` → 实测红。切块敏感的用例一律自带装载。
+pub async fn gpu_schedule_decision_surface() {
     let Some(ordinal) = gpu_ordinal() else {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
@@ -172,8 +184,7 @@ async fn gpu_schedule_decision_surface() {
 /// **文本本身两配置必然分叉**(数值微差 × 自回归混沌,2026-10-03 定谳:
 /// 融合核与旧链互差 ≤2e-4,算子层 32 步现实幅度递推单测全绿)——
 /// 本测试只验「两配置链路都活着且确定(各 ×2 逐字稳定)」。门控 OWL_TEST_DEVICE。
-#[tokio::test]
-async fn gpu_08b_fuse_text_parity() {
+pub async fn gpu_08b_fuse_text_parity() {
     let Some(ordinal) = gpu_ordinal() else {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
@@ -211,18 +222,25 @@ async fn gpu_08b_fuse_text_parity() {
     assert_eq!(b1, b2, "fused greedy 跨 boot 确定性");
 }
 
-#[tokio::test]
-async fn gpu_two_turns_lifecycle() {
+pub async fn gpu_two_turns_lifecycle(shared: Option<&mut RunningEngine<owl_cuda::GpuClient>>) {
     let Some(ordinal) = gpu_ordinal() else {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
     };
     let dir = asset_dir();
-    let mut engine =
-        Engine::new(EngineConfig { device_ordinal: ordinal, max_seq_tokens: 64, prefill_chunk: 16, knobs: EngineKnobs::default() })
-            .expect("构造");
-    let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
-    let mut running = engine.run(loaded).await.expect("装配");
+    // 共享装载(§四.1);None = 单跑自带装载
+    let mut own;
+    let running: &mut RunningEngine<owl_cuda::GpuClient> = match shared {
+        Some(r) => r,
+        None => {
+        let mut engine =
+            Engine::new(EngineConfig { device_ordinal: ordinal, max_seq_tokens: 64, prefill_chunk: 16, knobs: EngineKnobs::default() })
+                .expect("构造");
+        let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
+            own = engine.run(loaded).await.expect("装配");
+            &mut own
+        }
+    };
     assert!(
         matches!(running.capture_outcome, crate::graph_plan::PlanOutcome::Captured),
         "真模型捕获应成功(回放态),得 {:?}",
@@ -263,29 +281,36 @@ async fn gpu_two_turns_lifecycle() {
 /// GPU 门控:同会话连续 turn(S0 验收)—— turn2 应命中账本
 /// (跳过 GDN 重置,只 prefill 增量段);临时会话路径由生命周期
 /// 测试覆盖,此处验 Some(id) 连续性 + 收口账推进。
-#[tokio::test]
-async fn gpu_session_continuity() {
+pub async fn gpu_session_continuity(shared: Option<&mut RunningEngine<owl_cuda::GpuClient>>) {
     let Some(ordinal) = gpu_ordinal() else {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
     };
     let dir = asset_dir();
-    let mut engine = Engine::new(EngineConfig {
-        device_ordinal: ordinal,
-        max_seq_tokens: 256,
-        prefill_chunk: 32,
-        knobs: EngineKnobs::default(),
-    })
-    .expect("构造");
-    let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
-    let mut running = engine.run(loaded).await.expect("装配");
+    // 共享装载(§四.1);None = 单跑自带装载
+    let mut own;
+    let running: &mut RunningEngine<owl_cuda::GpuClient> = match shared {
+        Some(r) => r,
+        None => {
+        let mut engine = Engine::new(EngineConfig {
+            device_ordinal: ordinal,
+            max_seq_tokens: 256,
+            prefill_chunk: 32,
+            knobs: EngineKnobs::default(),
+        })
+        .expect("构造");
+        let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
+            own = engine.run(loaded).await.expect("装配");
+            &mut own
+        }
+    };
 
     // turn1:建立会话账(显式 id;None = 临时会话终了即焚,不归此测)
     let (sid, t1) = running
         .submit_session(Some(42), "请记住:我最喜欢的数字是七。", 16)
         .expect("t1");
     assert_eq!(sid, 42);
-    let text1 = drive_turn(&mut running, t1).await;
+    let text1 = drive_turn(&mut *running, t1).await;
     eprintln!("[test] t{t1}(session {sid}): {text1}");
     assert!(!text1.trim().is_empty());
     assert!(running.session_len(sid).unwrap_or(0) > 0, "turn1 收口账非零");
@@ -299,7 +324,7 @@ async fn gpu_session_continuity() {
         )
         .expect("t2");
     assert_eq!(sid2, sid, "同会话归队");
-    let text2 = drive_turn(&mut running, t2).await;
+    let text2 = drive_turn(&mut *running, t2).await;
     eprintln!("[test] t{t2}(session {sid2}): {text2}");
     assert!(!text2.trim().is_empty());
 
@@ -314,22 +339,30 @@ async fn gpu_session_continuity() {
 /// 旧 OWL_MAX_KV=256 滑窗截断下物理不可过(暗号在窗外)。兼验收:
 /// 4k 预算守卫、分页 prefill 百级 chunk、v1 decode 长程、同会话
 /// turn2(前缀失配回退全量路径 @4k)。
-#[tokio::test]
-async fn gpu_longctx_4k_prefix_qa() {
+pub async fn gpu_longctx_4k_prefix_qa(shared: Option<&mut RunningEngine<owl_cuda::GpuClient>>) {
     let Some(ordinal) = gpu_ordinal() else {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
     };
     let dir = asset_dir();
     let seq: usize = owl_shared::env_reader::parse_or("OWL_E2E_SEQ", 4096);
-    let mut engine = Engine::new(EngineConfig {
-        device_ordinal: ordinal,
-        max_seq_tokens: seq,
-        prefill_chunk: 32,
-        knobs: EngineKnobs::default(),
-    })
-    .expect("构造");
-    let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
+    // 共享装载(§四.1);None = 单跑自带装载
+    let mut own;
+    let running: &mut RunningEngine<owl_cuda::GpuClient> = match shared {
+        Some(r) => r,
+        None => {
+        let mut engine = Engine::new(EngineConfig {
+            device_ordinal: ordinal,
+            max_seq_tokens: seq,
+            prefill_chunk: 32,
+            knobs: EngineKnobs::default(),
+        })
+        .expect("构造");
+        let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
+            own = engine.run(loaded).await.expect("装配");
+            &mut own
+        }
+    };
 
     // 组装:暗号开头 + 中性填充 + 补全式探针收尾(裸 LM 无 chat 模板,
     // 问答式会退化成文本续写 —— 探针改为让模型续写暗号本体)
@@ -349,21 +382,20 @@ async fn gpu_longctx_4k_prefix_qa() {
         }
         let cand = format!("{body}{}", filler(i));
         let full = format!("{cand}{question}");
-        if loaded.tokenizer.encode(&full).len() + 32 > seq {
+        if running.tok.encode(&full).len() + 32 > seq {
             break; // 留 32 token 生成余量(turn2 预算同享)
         }
         body = cand;
         i += 1;
     }
     let prompt_t1 = format!("{body}{question}");
-    let n_tok = loaded.tokenizer.encode(&prompt_t1).len();
+    let n_tok = running.tok.encode(&prompt_t1).len();
     eprintln!("[test] 长 ctx prompt = {n_tok} tok(填充 {i} 条)");
     assert!(
         nofill || n_tok > seq * 4 / 5,
         "长文应填满窗口 ≥80%,得 {n_tok}/{seq}"
     );
 
-    let mut running = engine.run(loaded).await.expect("装配");
     let t0 = std::time::Instant::now();
     let (sid, t1) = running
         .submit_session(Some(7), prompt_t1.as_str(), 16)
@@ -415,7 +447,7 @@ async fn gpu_longctx_4k_prefix_qa() {
             .submit_session(Some(sid), format!("{body}再重复一遍:暗号是「"), 16)
             .expect("t2 应在预算内");
         let t0b = std::time::Instant::now();
-        let text2 = drive_turn(&mut running, t2).await;
+        let text2 = drive_turn(&mut *running, t2).await;
         eprintln!("[bench] t{t2} 全量回退重灌 + 生成 @ {:?}", t0b.elapsed());
         eprintln!("[test] t{t2} 答: {text2}");
         assert!(!text2.trim().is_empty(), "t{t2} 产出非空");
@@ -427,8 +459,7 @@ async fn gpu_longctx_4k_prefix_qa() {
 /// llm-compressor 转换的 0.8B W4A16 检查点装载(装载期 ct→marlin
 /// 重排)+ 生成:eligible Linear 走 foreign marlin GEMM,小线性
 /// (GDN in_proj_z/b/a)反量化 f16 直读。
-#[tokio::test]
-async fn gpu_w4a16_marlin_e2e() {
+pub async fn gpu_w4a16_marlin_e2e() {
     // 套件统一约定(OWL_TEST_DEVICE):曾硬钉 ordinal 2 —— 与现役
     // vLLM 生产服务器(3080 对)撞卡时 OOM at capture slab(2026-10-06)
     let Some(ordinal) = gpu_ordinal() else {
@@ -477,8 +508,7 @@ async fn gpu_w4a16_marlin_e2e() {
 /// GEMM_W4A16_AWQ)+ 图捕获 + 生成。门控 OWL_AWQ27B_DIR = 检查点
 /// 目录(models/cyankiwi/Qwen3.8-27B-AWQ-INT4);未设则 skip。
 /// VRAM 预算:权重 ~17.5GB + KV/GDN 状态 ~1.3GB → 3090 Ti 24G。
-#[tokio::test]
-async fn gpu_awq27b_marlin_e2e() {
+pub async fn gpu_awq27b_marlin_e2e(shared: Option<&mut RunningEngine<owl_cuda::GpuClient>>) {
     let Some(dir) = owl_shared::env_reader::str("OWL_AWQ27B_DIR") else {
         eprintln!("skip: OWL_AWQ27B_DIR 未设(cyankiwi 检查点目录)");
         return;
@@ -490,20 +520,27 @@ async fn gpu_awq27b_marlin_e2e() {
     }
     let ordinal = gpu_ordinal().expect("OWL_TEST_DEVICE");
     let t0 = std::time::Instant::now();
-    let mut engine = Engine::new(EngineConfig {
-        device_ordinal: ordinal,
-        max_seq_tokens: 256,
-        prefill_chunk: 32,
-        knobs: EngineKnobs::default(),
-    })
-    .expect("构造");
-    let loaded = engine
-        .loader()
-        .load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16)
-        .await
-        .expect("27B AWQ 装载");
-    eprintln!("[bench] 27B 装载(含 kU4 重排上卡){:.2}s", t0.elapsed().as_secs_f32());
-    let mut running = engine.run(loaded).await.expect("装配");
+    // 共享装载(§四.1);None = 单跑自带装载
+    let mut own;
+    let running: &mut RunningEngine<owl_cuda::GpuClient> = match shared {
+        Some(r) => r,
+        None => {
+        let mut engine = Engine::new(EngineConfig {
+            device_ordinal: ordinal,
+            max_seq_tokens: 256,
+            prefill_chunk: 32,
+            knobs: EngineKnobs::default(),
+        })
+        .expect("构造");
+        let loaded = engine
+            .loader()
+            .load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16)
+            .await
+            .expect("27B AWQ 装载");
+            own = engine.run(loaded).await.expect("装配");
+            &mut own
+        }
+    };
     assert!(
         owl_shared::env_reader::flag("OWL_NO_GRAPH")
             || matches!(running.capture_outcome, crate::graph_plan::PlanOutcome::Captured),
@@ -514,7 +551,7 @@ async fn gpu_awq27b_marlin_e2e() {
         .submit("用一句话介绍长城。", 16)
         .expect("submit");
     let t2 = std::time::Instant::now();
-    let text = drive_turn(&mut running, t1).await;
+    let text = drive_turn(&mut *running, t1).await;
     eprintln!(
         "[bench] 生成 tok @ {:.1}ms(含首 token prefill 尾步)",
         t2.elapsed().as_secs_f32() * 1e3
@@ -549,27 +586,34 @@ async fn gpu_awq27b_marlin_e2e() {
 /// ① B 的 turn 前后,A 的块链/账本逐字节不受扰;② A/B 物理块互异
 /// (无前缀缓存时零共享);③ 双会话产出非空。隔离 = 块管理器的
 /// 直接行为证据(块链不同 ⇒ KV 物理槽不同)。
-#[tokio::test]
-async fn gpu_multi_session_isolation() {
+pub async fn gpu_multi_session_isolation(shared: Option<&mut RunningEngine<owl_cuda::GpuClient>>) {
     let Some(ordinal) = gpu_ordinal() else {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
     };
     let dir = asset_dir();
-    let mut engine = Engine::new(EngineConfig {
-        device_ordinal: ordinal,
-        max_seq_tokens: 256,
-        prefill_chunk: 32,
-        knobs: EngineKnobs::default(),
-    })
-    .expect("构造");
-    let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
-    let mut running = engine.run(loaded).await.expect("装配");
+    // 共享装载(§四.1);None = 单跑自带装载
+    let mut own;
+    let running: &mut RunningEngine<owl_cuda::GpuClient> = match shared {
+        Some(r) => r,
+        None => {
+        let mut engine = Engine::new(EngineConfig {
+            device_ordinal: ordinal,
+            max_seq_tokens: 256,
+            prefill_chunk: 32,
+            knobs: EngineKnobs::default(),
+        })
+        .expect("构造");
+        let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
+            own = engine.run(loaded).await.expect("装配");
+            &mut own
+        }
+    };
 
     let (_, ta1) = running
         .submit_session(Some(101), "我的代号是阿尔法。", 12)
         .expect("A1");
-    let ta1_text = drive_turn(&mut running, ta1).await;
+    let ta1_text = drive_turn(&mut *running, ta1).await;
     eprintln!("[test] A1: {ta1_text}");
     assert!(!ta1_text.trim().is_empty());
     let a_table_1 = running.sessions.get(101).expect("A 账在").block_table.clone();
@@ -579,7 +623,7 @@ async fn gpu_multi_session_isolation() {
     let (_, tb1) = running
         .submit_session(Some(202), "我的代号是贝塔。", 12)
         .expect("B1");
-    let tb1_text = drive_turn(&mut running, tb1).await;
+    let tb1_text = drive_turn(&mut *running, tb1).await;
     eprintln!("[test] B1: {tb1_text}");
     assert!(!tb1_text.trim().is_empty());
 
@@ -596,7 +640,7 @@ async fn gpu_multi_session_isolation() {
     let (_, ta2) = running
         .submit_session(Some(101), "我的代号是阿尔法。我的代号是什么?", 12)
         .expect("A2");
-    let ta2_text = drive_turn(&mut running, ta2).await;
+    let ta2_text = drive_turn(&mut *running, ta2).await;
     eprintln!("[test] A2: {ta2_text}");
     assert!(!ta2_text.trim().is_empty());
     assert!(running.session_len(101).unwrap_or(0) >= a_len_1, "A 账本推进");
@@ -606,21 +650,29 @@ async fn gpu_multi_session_isolation() {
 /// 二轮:A 建档(块链 + 快照登记),B 同前缀 + 异尾 → 块链复用 +
 /// 快照恢复,prefill 只算尾部。机械断言:B 的 prefill chunk 数 ≪ A;
 /// B 块链前缀与 A 物理共享;TTFT 可测下降。
-#[tokio::test]
-async fn gpu_prefix_cache_hit() {
+pub async fn gpu_prefix_cache_hit(shared: Option<&mut RunningEngine<owl_cuda::GpuClient>>) {
     let Some(ordinal) = gpu_ordinal() else {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
     };
     let dir = asset_dir();
-    let mut engine = Engine::new(EngineConfig {
-        device_ordinal: ordinal,
-        max_seq_tokens: 512,
-        prefill_chunk: 32,
-        knobs: EngineKnobs::default(),
-    })
-    .expect("构造");
-    let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
+    // 共享装载(§四.1);None = 单跑自带装载
+    let mut own;
+    let running: &mut RunningEngine<owl_cuda::GpuClient> = match shared {
+        Some(r) => r,
+        None => {
+        let mut engine = Engine::new(EngineConfig {
+            device_ordinal: ordinal,
+            max_seq_tokens: 512,
+            prefill_chunk: 32,
+            knobs: EngineKnobs::default(),
+        })
+        .expect("构造");
+        let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
+            own = engine.run(loaded).await.expect("装配");
+            &mut own
+        }
+    };
 
     // A:marker + filler(~320 tok,跨 ≥1 块边界 → 快照可拍)
     let marker = "本会话暗号:「蓝鲸二十一号」。\n\n";
@@ -631,17 +683,16 @@ async fn gpu_prefix_cache_hit() {
     };
     let mut body = String::from(marker);
     let mut i = 0usize;
-    while loaded.tokenizer.encode(&format!("{body}{}", filler(i))).len() < 300 {
+    while running.tok.encode(&format!("{body}{}", filler(i))).len() < 300 {
         body = format!("{body}{}", filler(i));
         i += 1;
     }
     let prompt_a = format!("{body}清单结束。按约定,暗号重复一遍:暗号是「");
     let prompt_b = format!("{body}这次换个问题:暗号里出现了什么动物?");
-    let n_a = loaded.tokenizer.encode(&prompt_a).len();
-    let n_b = loaded.tokenizer.encode(&prompt_b).len();
+    let n_a = running.tok.encode(&prompt_a).len();
+    let n_b = running.tok.encode(&prompt_b).len();
     eprintln!("[test] A prompt = {n_a} tok / B prompt = {n_b} tok(前缀共享)");
 
-    let mut running = engine.run(loaded).await.expect("装配");
     let t0 = std::time::Instant::now();
     let (sid_a, ta1) = running.submit_session(Some(101), prompt_a.as_str(), 12).expect("A");
     let mut a_prefill_chunks = 0usize;
@@ -706,8 +757,7 @@ async fn gpu_prefix_cache_hit() {
 /// greedy(模板已含 thinking-off 空 think 块),验收 = 回答非空 +
 /// 无退化复读(启发式:任意 2-8 字片段连现 4 次即退化)。
 /// 输出全文打印供人工判读;复读启发式是底线门不是质量门。
-#[tokio::test]
-async fn gpu_27b_chat_inference() {
+pub async fn gpu_27b_chat_inference(shared: Option<&mut RunningEngine<owl_cuda::GpuClient>>) {
     let Some(dir) = owl_shared::env_reader::str("OWL_AWQ27B_DIR") else {
         eprintln!("skip: OWL_AWQ27B_DIR 未设(cyankiwi 检查点目录)");
         return;
@@ -718,19 +768,27 @@ async fn gpu_27b_chat_inference() {
         return;
     }
     let ordinal = gpu_ordinal().expect("OWL_TEST_DEVICE");
-    let mut engine = Engine::new(EngineConfig {
-        device_ordinal: ordinal,
-        max_seq_tokens: 1024,
-        prefill_chunk: 128,
-        knobs: EngineKnobs::default(),
-    })
-    .expect("构造");
-    let loaded = engine
-        .loader()
-        .load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16)
-        .await
-        .expect("27B AWQ 装载");
-    let mut running = engine.run(loaded).await.expect("装配");
+    // 共享装载(§四.1);None = 单跑自带装载
+    let mut own;
+    let running: &mut RunningEngine<owl_cuda::GpuClient> = match shared {
+        Some(r) => r,
+        None => {
+        let mut engine = Engine::new(EngineConfig {
+            device_ordinal: ordinal,
+            max_seq_tokens: 1024,
+            prefill_chunk: 128,
+            knobs: EngineKnobs::default(),
+        })
+        .expect("构造");
+        let loaded = engine
+            .loader()
+            .load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16)
+            .await
+            .expect("27B AWQ 装载");
+            own = engine.run(loaded).await.expect("装配");
+            &mut own
+        }
+    };
 
     let questions = [
         "用一句话介绍长城。",
@@ -811,9 +869,65 @@ async fn gpu_27b_chat_inference() {
     }
 }
 
-    /// 诊断:裸续写 A/B(模板态病 vs 权重病的鉴别臂)
-    #[tokio::test]
-    async fn gpu_27b_raw_completion_diag() {
+    /// **0.8B 默认档共享装载**(e2e 唯一装载点之一;6 步共用:
+/// schedule_decision_surface / two_turns_lifecycle / session_continuity /
+/// multi_session_isolation / prefix_cache_hit / longctx_4k_prefix_qa)。
+/// 装载本身即一步测试(构造+装载+装配+捕获态断言+计时)。
+pub async fn boot_08b(max_seq: usize) -> RunningEngine<owl_cuda::GpuClient> {
+    let ordinal = gpu_ordinal().expect("OWL_TEST_DEVICE");
+    let dir = asset_dir();
+    let t0 = std::time::Instant::now();
+    let mut engine = Engine::new(EngineConfig {
+        device_ordinal: ordinal,
+        max_seq_tokens: max_seq,
+        prefill_chunk: 32,
+        knobs: EngineKnobs::default(),
+    })
+    .expect("构造");
+    let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
+    let running = engine.run(loaded).await.expect("装配");
+    assert!(
+        matches!(running.capture_outcome, crate::graph_plan::PlanOutcome::Captured),
+        "0.8B 装载应捕获成功(回放态),得 {:?}",
+        running.capture_outcome
+    );
+    eprintln!("[e2e] 0.8B 默认档装载完成 {:?}(max_seq={max_seq})", t0.elapsed());
+    running
+}
+
+/// **27B 默认档共享装载**(chat_inference / awq27b_marlin_e2e 共用;
+/// 27B 装载 ~24-32s/次,重复装载 = 纯浪费)。
+pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
+    let dir = std::path::PathBuf::from(
+        owl_shared::env_reader::str("OWL_AWQ27B_DIR").expect("OWL_AWQ27B_DIR"),
+    );
+    assert!(dir.exists(), "检查点目录不存在: {dir:?}");
+    let ordinal = gpu_ordinal().expect("OWL_TEST_DEVICE");
+    let t0 = std::time::Instant::now();
+    let mut engine = Engine::new(EngineConfig {
+        device_ordinal: ordinal,
+        max_seq_tokens: 1024,
+        prefill_chunk: 128,
+        knobs: EngineKnobs::default(),
+    })
+    .expect("构造");
+    let loaded = engine
+        .loader()
+        .load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16)
+        .await
+        .expect("27B AWQ 装载");
+    let running = engine.run(loaded).await.expect("装配");
+    assert!(
+        matches!(running.capture_outcome, crate::graph_plan::PlanOutcome::Captured),
+        "27B 装载应捕获成功(回放态),得 {:?}",
+        running.capture_outcome
+    );
+    eprintln!("[e2e] 27B 默认档装载完成 {:?}", t0.elapsed());
+    running
+}
+
+/// 诊断:裸续写 A/B(模板态病 vs 权重病的鉴别臂)
+    pub async fn gpu_27b_raw_completion_diag() {
         let Some(dir) = owl_shared::env_reader::str("OWL_AWQ27B_DIR") else { return; };
         let dir = std::path::PathBuf::from(dir);
         if !dir.exists() { return; }
@@ -843,8 +957,7 @@ async fn gpu_27b_chat_inference() {
     /// 恒等 —— 接受是恒等变换,分红只影响速度。双 boot × 双 prompt ×
     /// 会话 token 账逐位比对(第二 prompt 同引擎续 turn = 跨 turn 状态
     /// 连续性一并覆盖)。哑草稿需 OWL_SPEC_DUMB=1(C7:无草稿器回落)。
-    #[tokio::test]
-    async fn gpu_spec_identity_gate() {
+    pub async fn gpu_spec_identity_gate() {
         let Some(ordinal) = gpu_ordinal() else {
             eprintln!("skip: OWL_TEST_DEVICE 未设");
             return;
@@ -912,8 +1025,7 @@ async fn gpu_27b_chat_inference() {
     /// ≡ 无 spec 输出(逐 token)。同时验证 m>0 真接受路径(部分/全接受)
     /// 与 spec_stats 账目闭合(Σ(m_i+1) = 发射 token 数)。门控
     /// OWL_AWQ27B_DIR。
-    #[tokio::test]
-    async fn gpu_spec_identity_gate_27b() {
+    pub async fn gpu_spec_identity_gate_27b() {
         let Some(ordinal) = gpu_ordinal() else {
             eprintln!("skip: OWL_TEST_DEVICE 未设");
             return;
@@ -927,24 +1039,17 @@ async fn gpu_27b_chat_inference() {
         // 换域对照,缺省恒 = 原 42tok 长城门)
         let prompt = owl_shared::env_reader::str_or("OWL_GATE_PROMPT", "用五十字介绍长城。");
 
-        async fn gen(
-            spec: bool,
-            ordinal: usize,
-            dir: &str,
-            prompt: &str,
-        ) -> (String, Vec<u32>) {
+        /// **装载一次**(带 MTP 草稿;2026-10-13 用户令:不再每轮重载)
+        async fn boot_gate_engine(ordinal: usize, dir: &str) -> RunningEngine<owl_cuda::GpuClient> {
             let mut knobs = EngineKnobs::default();
             knobs.sampler_enabled = false;
             // 24G 贴顶三旋钮(单会话门不需要多格/多快照/前缀缓存)
             knobs.gdn_slots = 1;
             knobs.snap_max = 1;
             knobs.prefix_cache = false;
-            if spec {
-                knobs.draft.depth = 3;
-                // verify 捕获实需 ~160MB 固定档(T=4 × 64 层 × m=4 激活;
-                // cap-prof 直方图定谳);decode 臂保持默认 64
-                knobs.cuda.capture_slab_mb = Some(160);
-            }
+            // 草稿档一律按投机配置 boot;baseline 轮靠运行时 spec_depth=0 回落
+            knobs.draft.depth = 3;
+            knobs.cuda.capture_slab_mb = Some(160);
             let mut engine = Engine::new(EngineConfig {
                 device_ordinal: ordinal,
                 max_seq_tokens: 256,
@@ -957,9 +1062,19 @@ async fn gpu_27b_chat_inference() {
                 .load_qwen38_27b_awq(std::path::Path::new(dir), std::path::Path::new(dir), owl_models::module::QuantPlan::F16)
                 .await
                 .expect("装载");
-            let mut running = engine.run(loaded).await.expect("装配");
+            engine.run(loaded).await.expect("装配")
+        }
+
+        /// 单轮(`spec_depth = 0` = 不投机;>0 = 投机)
+        async fn round(
+            running: &mut RunningEngine<owl_cuda::GpuClient>,
+            spec_depth: usize,
+            prompt: &str,
+            tag: &str,
+        ) -> (String, Vec<u32>) {
+            running.spec_depth = spec_depth;
             let (sid, id) = running.submit_session(Some(7), prompt, 40).expect("submit");
-            let text = drive_turn(&mut running, id).await;
+            let text = drive_turn(running, id).await;
             let toks = running
                 .sessions
                 .get(sid)
@@ -967,14 +1082,16 @@ async fn gpu_27b_chat_inference() {
                 .unwrap_or_default();
             let st = running.spec_stats;
             eprintln!(
-                "[spec-gate-27b] spec={spec} stats: rounds={} sum_m={} full={} partial={} zero={}",
+                "[spec-gate-27b] {tag} spec_depth={spec_depth} stats: rounds={} sum_m={} full={} partial={} zero={}",
                 st.rounds, st.sum_m, st.full, st.partial, st.zero
             );
             (text, toks)
         }
 
-        let (ta, ta_tokens) = gen(false, ordinal, &dir, &prompt).await;
-        let (tb, tb_tokens) = gen(true, ordinal, &dir, &prompt).await;
+        // ── 装载**一次**,两轮:① 不投机 baseline ② 投机(用户令 2026-10-13) ──
+        let mut running = boot_gate_engine(ordinal, &dir).await;
+        let (ta, ta_tokens) = round(&mut running, 0, &prompt, "baseline").await;
+        let (tb, tb_tokens) = round(&mut running, 3, &prompt, "spec").await;
         eprintln!(
             "[spec-gate-27b] baseline({}tok)={ta:?}\n[spec-gate-27b] spec({}tok)={tb:?}",
             ta_tokens.len(),
@@ -983,14 +1100,16 @@ async fn gpu_27b_chat_inference() {
         assert_eq!(ta, tb, "恒等门 27B:greedy 真草稿 spec 文本 ≡ 无 spec");
         assert_eq!(ta_tokens, tb_tokens, "恒等门 27B:token 账逐位一致");
         // 旋钮已全量显式化,无 env 清场需要
+    
+        drop(running);
+        std::thread::sleep(std::time::Duration::from_secs(10));
     }
 
     /// E5-DF3 恒等门(27B AWQ target + DFlash2 草稿):greedy spec 文本
     /// ≡ 无 spec 逐位。门控 OWL_TEST_DEVICE + OWL_AWQ27B_DIR +
     /// OWL_DFLASH2_DIR。**20G 卡贴顶**(target ~13.7G + draft 3.85G +
     /// 池)—— OOM 时降 max_seq_tokens/挪 24G 卡。
-    #[tokio::test]
-    async fn gpu_dflash2_identity_gate_27b() {
+    pub async fn gpu_dflash2_identity_gate_27b() {
         let Some(ordinal) = gpu_ordinal() else {
             eprintln!("skip: OWL_TEST_DEVICE 未设");
             return;
@@ -1010,27 +1129,23 @@ async fn gpu_27b_chat_inference() {
         // E5 性能:长生成旋钮(AL/吞吐稳态剖析;默认 40 = 恒等门口径)
         let max_new: usize = owl_shared::env_reader::parse_or("OWL_GATE_MAX_NEW", 40);
 
-        async fn gen(
-            spec: bool,
+        /// **装载一次**(带草稿;2026-10-13 用户令:不再每轮重载)。
+        /// 单次装载两轮复用:一轮不投机(spec_depth=0)、一轮投机。
+        async fn boot_gate_engine(
             ordinal: usize,
             dir: &str,
             ddir: &str,
-            prompt: &str,
             max_new: usize,
-        ) -> (String, Vec<u32>) {
-            let prompt_len = prompt.chars().count(); // 近似(测试口径)
+        ) -> RunningEngine<owl_cuda::GpuClient> {
             let mut knobs = EngineKnobs::default();
             knobs.sampler_enabled = false;
             knobs.gdn_slots = 1;
             knobs.snap_max = 1;
             knobs.prefix_cache = false;
-            if spec {
-                // E5 性能:深度可覆写(满收轮直方图 49% m=7 → 加深白拿;
-                // 深度 = 入口侧 OWL_SPEC_DEPTH 读数,缺省 7)
-                knobs.draft.depth = owl_shared::env_reader::parse_or("OWL_SPEC_DEPTH", 7);
-                // verify 捕获实需 ~160MB 固定档(cuda 域旋钮)
-                knobs.cuda.capture_slab_mb = Some(160);
-            }
+            // 草稿档一律按**投机**配置 boot(深度 + verify 捕获档);
+            // 不投机的 baseline 轮靠运行时 `spec_depth = 0` 回落,不重载。
+            knobs.draft.depth = owl_shared::env_reader::parse_or("OWL_SPEC_DEPTH", 7);
+            knobs.cuda.capture_slab_mb = Some(160);
             knobs.draft.dflash2_dir = Some(ddir.to_string());
             // E19 定位开关(2026-10-13):knhd×fp8 池×int4 头×spec 语义回归
             // 复现(缺省关 = 原口径不变)。三项同开才复现 —— 单开任一项均绿:
@@ -1046,12 +1161,21 @@ async fn gpu_27b_chat_inference() {
             } else {
                 owl_models::module::QuantPlan::F16
             };
+            knobs.draft.dflash2_dir = Some(ddir.to_string());
+            // E19 定位开关(2026-10-13):knhd×fp8 池×int4 头×spec 语义回归复现(缺省关)
+            if owl_shared::env_reader::flag("OWL_GATE_FP8") {
+                knobs.env.kv.quant = owl_models::env::KvQuant::Fp8E4M3;
+            }
+            if let Some(p) = owl_shared::env_reader::parse::<usize>("OWL_GATE_POOL") {
+                knobs.pool_tokens = Some(p);
+            }
+            let head_plan = if owl_shared::env_reader::flag("OWL_GATE_INT4HEAD") {
+                owl_models::module::QuantPlan::W4A16Awq
+            } else {
+                owl_models::module::QuantPlan::F16
+            };
             let mut engine = Engine::new(EngineConfig {
                 device_ordinal: ordinal,
-                // E19(2026-10-13):几何可覆写 —— 缺省 320 → nb=10 →
-                // **nparts=1** → v2 核退化为直拷,多分区在线 softmax +
-                // LSE 归并路径(= reduce/E15/E16 的真正受控面)**零覆盖**;
-                // 服务器 nb=272 → nparts=17 才跑到。复现需同几何。
                 max_seq_tokens: owl_shared::env_reader::parse_or(
                     "OWL_GATE_MAXSEQ",
                     320.max(max_new + 64),
@@ -1065,10 +1189,29 @@ async fn gpu_27b_chat_inference() {
                 .load_qwen38_27b_awq(std::path::Path::new(dir), std::path::Path::new(dir), head_plan)
                 .await
                 .expect("装载");
-            let mut running = engine.run(loaded).await.expect("装配");
+            let running = engine.run(loaded).await.expect("装配");
+            assert!(
+                matches!(running.capture_outcome, crate::graph_plan::PlanOutcome::Captured),
+                "带草稿装载应捕获成功,得 {:?}",
+                running.capture_outcome
+            );
+            running
+        }
+
+        /// 单轮(`spec_depth = 0` = 不投机 baseline;>0 = 投机)。
+        /// spec_depth 是 `pub(crate)` 运行时可切字段(exec/spec.rs 每轮读)。
+        async fn round(
+            running: &mut RunningEngine<owl_cuda::GpuClient>,
+            spec_depth: usize,
+            prompt: &str,
+            max_new: usize,
+            tag: &str,
+        ) -> (String, Vec<u32>) {
+            let prompt_len = prompt.chars().count(); // 近似(测试口径)
+            running.spec_depth = spec_depth;
             let (sid, id) = running.submit_session(Some(7), prompt, max_new).expect("submit");
             let tg = std::time::Instant::now();
-            let text = drive_turn(&mut running, id).await;
+            let text = drive_turn(running, id).await;
             let t_gen = tg.elapsed();
             let toks = running
                 .sessions
@@ -1079,24 +1222,22 @@ async fn gpu_27b_chat_inference() {
             let st = running.spec_stats;
             let al = if st.rounds > 0 { st.sum_m as f64 / st.rounds as f64 } else { 0.0 };
             eprintln!(
-                "[dflash-gate] 生成段: {} tok / {t_gen:.1?} = {:.1} tok/s(spec={spec})",
+                "[dflash-gate] 生成段: {} tok / {t_gen:.1?} = {:.1} tok/s({tag})",
                 gen_n,
                 gen_n as f64 / t_gen.as_secs_f64(),
             );
             eprintln!(
-                "[dflash-gate] spec={spec} rounds={} sum_m={} AL={al:.2}",
+                "[dflash-gate] {tag} spec_depth={spec_depth} rounds={} sum_m={} AL={al:.2}",
                 st.rounds, st.sum_m
             );
-            // 实例收尾屏障:drop 后等 server 线程退出 + CUDA ctx 析构
-            // (异步;下一实例 17G 分配会与释放赛跑 → 2026-10-07 baseline
-            // 非确定性定谳)
-            drop(running);
-            std::thread::sleep(std::time::Duration::from_secs(10)); // E5-DF4:交接排空 3s→10s(非确定性崩排查)
             (text, toks)
         }
 
+        // ── 装载**一次**,两轮:① 不投机 baseline ② 投机(用户令 2026-10-13) ──
+        let depth: usize = owl_shared::env_reader::parse_or("OWL_SPEC_DEPTH", 7);
+        let mut running = boot_gate_engine(ordinal, &dir, &ddir, max_new).await;
         let t0 = std::time::Instant::now();
-        let (ta, ta_tokens) = gen(false, ordinal, &dir, &ddir, &prompt, max_new).await;
+        let (ta, ta_tokens) = round(&mut running, 0, &prompt, max_new, "baseline").await;
         let t_base = t0.elapsed();
         // E5-DF4:b1 事实 dump(prefill bisect 层 checksum / pf.last / emit)
         owl_shared::metrics::query_metrics(
@@ -1112,7 +1253,7 @@ async fn gpu_27b_chat_inference() {
         .collect();
         owl_shared::metrics::reset_metrics();
         let t1 = std::time::Instant::now();
-        let (tb, tb_tokens) = gen(true, ordinal, &dir, &ddir, &prompt, max_new).await;
+        let (tb, tb_tokens) = round(&mut running, depth, &prompt, max_new, "spec").await;
         let t_spec = t1.elapsed();
         let l2: std::collections::HashMap<String, u64> = owl_shared::metrics::collect_metrics(
             &owl_shared::metrics::MetricsFilter::new().tag_prefix("loadv."),
@@ -1175,6 +1316,11 @@ async fn gpu_27b_chat_inference() {
         assert_eq!(ta, tb, "恒等门 DFlash2:greedy 真草稿 spec 文本 ≡ 无 spec");
         assert_eq!(ta_tokens, tb_tokens, "恒等门 DFlash2:token 账逐位一致");
         // 旋钮已全量显式化,无 env 清场需要
+    
+        // 实例收尾屏障:drop 后等 server 线程退出 + CUDA ctx 析构(异步;
+        // 下一实例的 17G 分配会与释放赛跑 —— 2026-10-07 非确定性定谳)
+        drop(running);
+        std::thread::sleep(std::time::Duration::from_secs(10));
     }
 
 /// 泵到目标 turn 完成,回吐全文(其间事件仅观测)
@@ -1204,8 +1350,7 @@ async fn drive_turn<D: DeviceClient>(running: &mut RunningEngine<D>, id: u64) ->
 /// slot1 变 = 跨 slot 写实锤;不变 = 病在 slot1 核索引/复用路径。
 /// 附:reset_gdn(slot1) 后回读验零(reset 生效性直接判)。
 /// 门控 OWL_TEST_DEVICE。诊断打印,不做硬断言(判决先看数)。
-#[tokio::test]
-async fn gpu_gdn_slot_cross_probe() {
+pub async fn gpu_gdn_slot_cross_probe() {
     let Some(ordinal) = gpu_ordinal() else {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
@@ -1258,8 +1403,7 @@ async fn gpu_gdn_slot_cross_probe() {
     //    reset 由健康 turn 隐证。旋钮已显式化,无 env 清场需要。
 }
 
-#[tokio::test]
-async fn gpu_decode_marginal_bench() {
+pub async fn gpu_decode_marginal_bench() {
     let Some(ordinal) = gpu_ordinal() else {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
