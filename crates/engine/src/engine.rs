@@ -322,8 +322,9 @@ impl<D: DeviceClient + 'static> Engine<D> {
                 let dir = dflash2_dir.as_ref().expect("dflash2_dir");
                 // B6 偷显存:草稿池 e4m3(可配;默认关 —— AL 有损需 A/B)
                 let draft_kv_fp8 = self.cfg.knobs.draft.kv_quant == owl_models::env::KvQuant::Fp8E4M3;
+                let t_draft = std::time::Instant::now();
                 let (d2, _) = owl_models::specs::qwen35::load_27b_dflash2(std::path::Path::new(dir), &mut self.face, draft_kv_fp8).await?;
-                eprintln!("[boot] DFlash2 草稿装载(depth={spec_depth};1.92B BF16 激活,sglang 对齐)");
+                eprintln!("[boot] DFlash2 草稿装载(depth={spec_depth};1.92B BF16 激活,sglang 对齐) {:.2}s", t_draft.elapsed().as_secs_f32());
                 Some(crate::running::Drafter::DFlash2(std::sync::Arc::new(d2)))
             }
             _ => None,
@@ -662,7 +663,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
             .await?;
             match voutcome {
                 crate::graph_plan::PlanOutcome::Captured => {
-                    eprintln!("[boot] verify 桶形图捕获(T={depth1})");
+                    eprintln!("[boot] verify 桶形图捕获(T={depth1}) +{:.2}s", t_run.elapsed().as_secs_f32());
                     Some(vg)
                 }
                 other => {
@@ -761,7 +762,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
                 .await?;
                 match fout {
                     crate::graph_plan::PlanOutcome::Captured => {
-                        eprintln!("[boot] fold 桶形图捕获(m={m})");
+                        eprintln!("[boot] fold 桶形图捕获(m={m}) +{:.2}s", t_run.elapsed().as_secs_f32());
                         fold_graphs.push(fg);
                     }
                     other => eprintln!("[boot] fold 图降级(m={m},{other:?})→ eager fold"),
@@ -869,7 +870,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
                         .await?;
                         match dout {
                             crate::graph_plan::PlanOutcome::Captured => {
-                                eprintln!("[boot] dflash propose 图捕获(encode+propose 单图,固定 8 行)");
+                                eprintln!("[boot] dflash propose 图捕获(encode+propose 单图,固定 8 行) +{:.2}s", t_run.elapsed().as_secs_f32());
                                 dflash_graph = Some(dg);
                             }
                             other => eprintln!("[boot] dflash propose 图降级({other:?})→ eager propose"),

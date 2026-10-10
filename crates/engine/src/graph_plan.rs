@@ -213,18 +213,28 @@ impl<D: DeviceClient> GraphPlan<D> {
             forward: Box::new(forward),
         };
 
+        // 输入槽装填(init 值落位;捕获/eager 两路都要)
+        sess.fill_slots(&[]).await?;
         // ── warmup(姿势 6 lite):init 数据全链 eager dry 一遍 ──
+        // **仅捕获前需要**(2026-10-13 定谳):预热唯二产出 = ①slab 定量 hint
+        // ②声明树门禁 —— 两者都只服务捕获窗。无捕获(no_graph/eager 档)时
+        // 它是纯浪费:27B 实测 26s = 32 次 eager 整模前向(fold 桶 m=0..6
+        // 的 m 步链占 ~28 次;每次 ~0.8s = eager 逐算子发射开销,图回放同
+        // 规模仅 ~14ms),而捕获本身 ≈0(no_graph 对照 26.25s vs 正常 26.18s)。
+        // 跳过预热 → 该档启动立省 26s;声明错误改在首次推理时暴露
+        // (no_graph 本就是诊断档,取舍成立)。
         // slab 定量(E8→A1,2026-10-10):warmup 前弃旧账,后取闭包真
         // 分配字节 → hint = ×1.15 + 1MiB。env 显式设 OWL_CAPTURE_SLAB_MB
         // 时固定档优先(state 侧裁决),此处不置 hint 兼容旧档位。
-        let _ = owl_shared::slab_hint::meter_take();
-        sess.fill_slots(&[]).await?;
-        sess.eval_current().await?;
-        sess.face.sync().await?;
-        sess.last.clear();
-        let metered = owl_shared::slab_hint::meter_take() as usize;
-        if !desc.slab_fixed {
-            owl_shared::slab_hint::set_hint(metered + metered / 8 + (1 << 20));
+        if desc.capture {
+            let _ = owl_shared::slab_hint::meter_take();
+            sess.eval_current().await?;
+            sess.face.sync().await?;
+            sess.last.clear();
+            let metered = owl_shared::slab_hint::meter_take() as usize;
+            if !desc.slab_fixed {
+                owl_shared::slab_hint::set_hint(metered + metered / 8 + (1 << 20));
+            }
         }
 
         // ── 捕获(两道预检;窗内硬错直接上抛)──

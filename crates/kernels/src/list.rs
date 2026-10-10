@@ -194,7 +194,8 @@ pub static REGISTRY: &[Entry] = &[
     Entry { name: "vllm_chunked_prefill_paged_attn_opt_fp8_hd128", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "vllm_chunked_prefill_paged_attn_opt_fp8_hd256", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     // TG=4 线程组分摊变体(2026-10-10 性能刀;grid.z = ceil(tokens/64))
-    Entry { name: "vllm_chunked_prefill_paged_attn_opt_fp8_hd256_tg4", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    // (tg4 变体条目 2026-10-13 删除:自研核已回滚,源码无同名核,登记表不留孤儿;
+    //  attention_tg4_probe.rs 仍挂 skip 门存案,WIP 重启时一并回归)
     // ---- prefill split attention(flash-decoding;2026-10-02 长 ctx 主案)----
     // K1 = context 分块在线 softmax(未归一化 partial + (m,l) 入 scratch);
     // K2 = partition 归一化合并。smem 64KB(>48KB 走发射器 opt-in 通道)
@@ -328,6 +329,50 @@ pub fn lookup(name: &str) -> Option<&'static Entry> {
     REGISTRY.iter().find(|e| e.name == name)
 }
 
+/// `.cu` 源里是否有该核的**定义**。两种形态都认(2026-10-13 判据收口):
+/// 1. 字面核:`extern "C" __global__ void <name>(`;
+/// 2. 单层宏实例化核:`<MACRO>(<name>, …)` 且 `#define <MACRO>(<首形参>, …)`
+///    定义体里有 `void <首形参>(`(如 chunked KNHD 族 `CHUNKED_KNHD_ENTRY`)。
+/// 运行时门(models `kv_manifest_gate`)与测试门共用本判据 —— 宏形态不许
+/// 两处各写一遍(否则两道门会各说各话)。
+pub fn source_defines(source: &str, name: &str) -> bool {
+    // 剥行注释 + 折叠宏续行(宏体形参住在续行里)
+    let clean: String = source
+        .lines()
+        .map(|l| l.split("//").next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace("\\\n", " ");
+    if clean.contains(&format!("__global__ void {name}(")) {
+        return true;
+    }
+    clean.lines().any(|line| {
+        let t = line.trim();
+        let Some((mac, rest)) = t.split_once('(') else { return false };
+        if mac.is_empty() || !mac.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return false;
+        }
+        if rest.split(',').next().map(str::trim) != Some(name) {
+            return false;
+        }
+        let def_anchor = format!("#define {mac}(");
+        let Some(d) = clean.find(&def_anchor) else { return false };
+        let formal = clean[d + def_anchor.len()..]
+            .split(',')
+            .next()
+            .map(str::trim)
+            .unwrap_or("");
+        if formal.is_empty() {
+            return false;
+        }
+        // 定义体里的核声明两种写法:
+        //   `void <首形参>(…)`(chunked kNHD 族;形参表在定义里)
+        //   `void <首形参> <PARAMS>`(ops_pair 族;形参表由实例传入)
+        clean[d..].contains(&format!("void {formal}("))
+            || clean[d..].contains(&format!("void {formal} "))
+    })
+}
+
 /// 按名取源(未登记 = 编程错误,panic 提示登记表位置)
 pub fn source(name: &str) -> &'static str {
     match lookup(name) {
@@ -373,10 +418,62 @@ mod tests {
             assert!(!e.source.is_empty(), "{} 空源", e.name);
             assert!(e.source.contains("extern \"C\" __global__"), "{} 源缺核", e.name);
             assert!(
-                e.source.contains(e.name),
-                "{} 源里找不到同名核(名字与源不符)", e.name
+                super::source_defines(e.source, e.name),
+                "{} 源里找不到同名核(名字与源不符;字面/单层宏形态都算)", e.name
             );
         }
+    }
+
+    /// kNHD 翻转不变量(2026-10-13,P1 迁移收尾):每个登记的 `*_knhd*` 核
+    /// 必须有 classic 伙伴(去 `_knhd` 标记仍能查到),且 **args 与源逐位相同**。
+    /// 锁住“翻转 = 只换核名,不改发射实参表”这条全部接线的前提 ——
+    /// 一旦 kNHD 变体换了签名,本门先红,不让翻转在 GPU 上爆。
+    #[test]
+    fn knhd_variants_mirror_classic_signature() {
+        // kNHD 侧**独有**条目(classic 无对偶;纯新增)。每加一条必须登
+        // 在此并写理由 —— 否则下面循环会把它当“换签名”报红,谁也别想混过去。
+        const KNHD_ONLY: &[(&str, &str)] = &[
+            (
+                "vllm_paged_attention_v2_f16_knhd_hd256",
+                "KNHD 侧新增:f16 无 bs32 以外的 classic v2 对偶(fp8 档才有)",
+            ),
+            (
+                "vllm_paged_attention_v2_f16_knhd_hd128",
+                "同上",
+            ),
+        ];
+        let mut paired = 0usize;
+        for e in REGISTRY {
+            if !e.name.contains("_knhd") {
+                continue;
+            }
+            if KNHD_ONLY.iter().any(|(n, _)| *n == e.name) {
+                continue;
+            }
+            let classic = e.name.replace("_knhd", "");
+            let Some(c) = REGISTRY.iter().find(|x| x.name == classic.as_str()) else {
+                panic!(
+                    "{}: 无 classic 伙伴 `{classic}` —— 要么补对偶,要么登进 KNHD_ONLY 并写理由",
+                    e.name
+                );
+            };
+            assert_eq!(
+                c.args, e.args,
+                "{}: args 与 classic 伙伴不符 —— 翻转须只换名(实参表同一)",
+                e.name
+            );
+            assert_eq!(c.source, e.source, "{}: 与 classic 伙伴不同源", e.name);
+            paired += 1;
+        }
+        // 覆盖锁:18 = 2026-10-13 实况对数(登记新增 kNHD 核时同步上调)
+        assert_eq!(paired, 18, "配对 kNHD 变体数异常(实 {paired})—— 漏登记或误删?");
+        for (n, why) in KNHD_ONLY {
+            assert!(
+                REGISTRY.iter().any(|e| e.name == *n),
+                "KNHD_ONLY 条目 `{n}` 已不在登记表({why}),请清理白名单"
+            );
+        }
+        eprintln!("[knhd] {paired} 个 kNHD 变体与 classic 伙伴签名逐位相同 ✓(另有 {} 条 kNHD 独有,已登记理由)", KNHD_ONLY.len());
     }
 
     #[test]
@@ -428,60 +525,17 @@ mod tests {
 
     /// 解析 .cu 源里 `extern "C" __global__ void <name>(...)` 的形参序列,
     /// 映射为 Entry.args 同构字符串(无 regex,朴素扫描)。
-    fn parse_cu_sig(source: &str, name: &str) -> Option<String> {
-        // 先全文剥行注释(形参注记含逗号/括号,会干扰边界与切分)
-        let clean: String = source
-            .lines()
-            .map(|l| l.split("//").next().unwrap_or(""))
-            .collect::<Vec<_>>()
-            .join("\n");
-        // 宏展开核(F5 ops_pair):实例行 `OWL_<FAMILY>_KERNEL(<name>, <T>, PARAMS)`
-        // —— PARAMS 自带类型化形参,机器对账以实例为准(C2 不弱化)
-        for line in clean.lines() {
-            let t = line.trim();
-            if t.starts_with("OWL_") && t.contains("KERNEL(") {
-                if let Some(rest) = t.splitn(2, '(').nth(1) {
-                    let mut parts = rest.splitn(3, ',');
-                    if let Some(n) = parts.next().map(|x| x.trim()) {
-                        if n == name {
-                            let params = parts
-                                .nth(1)
-                                .and_then(|p| p.trim().strip_prefix('('))
-                                .and_then(|p| p.strip_suffix(')'))
-                                .unwrap_or("");
-                            return Some(
-                                params
-                                    .split(',')
-                                    .map(|p| {
-                                        let p = p.replace("const ", "").replace("__restrict__ ", "").trim().to_string();
-                                        if p.contains('*') {
-                                            "T".to_string()
-                                        } else if p.contains("size_t") || p.contains("unsigned long long") {
-                                            "sz".to_string()
-                                        } else if p.contains("float") {
-                                            "f32".to_string()
-                                        } else if p.contains("int") {
-                                            assert!(!p.contains("unsigned"), "{name}: 禁止 unsigned int 形参");
-                                            "i32".to_string()
-                                        } else {
-                                            panic!("{name}: 无法识别的宏形参 `{p}`(args 词表:T/sz/i32/f32)");
-                                        }
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join(","),
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        let anchor = format!("__global__ void {name}(");
-        let start = clean.find(&anchor)? + anchor.len();
-        let end = clean[start..].find(')')? + start;
-        let params = clean[start..end]
+    /// 形参序列 → Entry.args 词表字符串(T/sz/i32/f32;三种核形态共用)
+    fn map_params(params: &str, name: &str, kind: &str) -> String {
+        params
             .split(',')
             .map(|p| {
-                let p = p.replace("const ", "").trim().to_string();
+                let p = p
+                    .replace("const ", "")
+                    .replace("__restrict__ ", "")
+                    .replace('\\', " ")
+                    .trim()
+                    .to_string();
                 if p.contains('*') {
                     "T".to_string()
                 } else if p.contains("size_t") || p.contains("unsigned long long") {
@@ -493,12 +547,69 @@ mod tests {
                     assert!(!p.contains("unsigned"), "{name}: 禁止 unsigned int 形参(用 size_t;Arg::U64 8 字节对位)");
                     "i32".to_string()
                 } else {
-                    panic!("{name}: 无法识别的形参 `{p}`(args 词表:T/sz/i32/f32)");
+                    panic!("{name}: 无法识别的{kind}形参 `{p}`(args 词表:T/sz/i32/f32)");
                 }
             })
             .collect::<Vec<_>>()
-            .join(",");
-        Some(params)
+            .join(",")
+    }
+
+    /// 从 `text[start..]` 截到首个 `)` 的形参串 → 词表
+    fn params_at(text: &str, start: usize, name: &str, kind: &str) -> Option<String> {
+        let end = text[start..].find(')')? + start;
+        Some(map_params(&text[start..end], name, kind))
+    }
+
+    fn parse_cu_sig(source: &str, name: &str) -> Option<String> {
+        // 剥行注释(形参注记含逗号/括号,会干扰边界与切分)+ **折叠宏续行**
+        // (`\` + 换行 → 空格:宏体形参住在续行里,不折叠则形参串被反斜杠污染)
+        let clean: String = source
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .replace("\\\n", " ");
+        // 形态 1:宏展开核(F5 ops_pair):实例行 `OWL_<FAMILY>_KERNEL(<name>, <T>, PARAMS)`
+        // —— PARAMS 自带类型化形参,机器对账以实例为准(C2 不弱化)
+        for line in clean.lines() {
+            let t = line.trim();
+            if t.starts_with("OWL_") && t.contains("KERNEL(") {
+                if let Some(rest) = t.splitn(2, '(').nth(1) {
+                    let mut parts = rest.splitn(3, ',');
+                    if parts.next().map(|x| x.trim()) == Some(name) {
+                        let params = parts
+                            .nth(1)
+                            .and_then(|p| p.trim().strip_prefix('('))
+                            .and_then(|p| p.strip_suffix(')'))
+                            .unwrap_or("");
+                        return Some(map_params(params, name, "宏"));
+                    }
+                }
+            }
+        }
+        // 形态 2:单层宏实例化核(chunked KNHD 族:`CHUNKED_KNHD_ENTRY(<name>, <hd>, <kv_fp8>)`)
+        // — 实例行只带实参,形参住在 `#define <MACRO>(<首形参>, …)` 的定义体
+        //   `void <首形参>(…)` 里:按定义体取参,与字面核同口径(名字门不弱化)
+        for line in clean.lines() {
+            let t = line.trim();
+            let Some((mac, rest)) = t.split_once('(') else { continue };
+            if mac.is_empty() || !mac.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                continue;
+            }
+            if rest.split(',').next().map(str::trim) != Some(name) {
+                continue;
+            }
+            let def_anchor = format!("#define {mac}(");
+            let Some(d) = clean.find(&def_anchor) else { continue };
+            let formal = clean[d + def_anchor.len()..].split(',').next()?.trim().to_string();
+            let body_anchor = format!("void {formal}(");
+            let Some(s) = clean[d..].find(&body_anchor) else { continue };
+            return params_at(&clean[d..], s + body_anchor.len(), name, "宏");
+        }
+        // 形态 3:字面核 `extern "C" __global__ void <name>(…)`
+        let anchor = format!("__global__ void {name}(");
+        let start = clean.find(&anchor)? + anchor.len();
+        params_at(&clean, start, name, "")
     }
 
     #[test]

@@ -374,7 +374,9 @@ impl Attention {
             .with_shape(dt, vec![self.hq * nparts * self.hd]);
         // LSE 归并 → 最终 y([tokens, hq·hd];ctx ≤512 时核内退化直拷)
         let y = TensorOps::call(SemanticKernel::PagedV2Reduce)
-            .aux(&[self.hd, self.hq, nparts])
+            // seqs 入 aux(E16:核 seq_idx=blockIdx.y,grid.y 须 = seqs;
+            // decode 单序 = 1)
+            .aux(&[self.hd, self.hq, nparts, 1])
             .arg(&s2.exp_sums)
             .arg(&s2.max_logits)
             .arg(&partial)
@@ -454,10 +456,19 @@ impl Attention {
             .arg_f32(1.0)
             .arg_i32(-1)
             .arg_i32(0)
-            .with_shape(dt, vec![self.hq * nparts * self.hd]);
+            // E15 根治(spec 回归,2026-10-13):partial 形状漏 seqs 维 ——
+            // 声明 [hq,np,hd] 只有单序尺寸,核实写 [seqs,hq,np,hd] →
+            // seqs>1 时 4× 溢出写进相邻块(行选择性腐化 + 确定性);
+            // 单元探针自配全尺寸缓冲故永不暴露。恒等门红案首元凶。
+            .with_shape(dt, vec![s2.seqs * self.hq * nparts * self.hd]);
         // ③ LSE 归并([seqs, hq·hd];核内 num_partitions 按 lens 限界)
         let y = TensorOps::call(SemanticKernel::PagedV2Reduce)
-            .aux(&[self.hd, self.hq, nparts])
+            // E16 根治二(spec 回归,2026-10-13):reduce 亦须 seqs ——
+            // 核内 seq_idx=blockIdx.y,原 driver 硬发 grid.y=1 → 只归并
+            // seq0,y 行 1..seqs-1 从未写出(未初始化显存读 → 错 bonus/
+            // AL 塌/数字幻觉,且同布局两次跑不同);§三十一集成时主核
+            // 加了 seqs、reduce 忘了;单元探针自建 grid (hq,S,1) 故一直绿
+            .aux(&[self.hd, self.hq, nparts, s2.seqs])
             .arg(&s2.exp_sums)
             .arg(&s2.max_logits)
             .arg(&partial)
@@ -1145,40 +1156,18 @@ mod f16_tests {
         gpu.close().await.expect("关机");
     }
 
-    /// v1 paged decode 隔离对拍(2026-10-01 立案;历史盲区:
-    /// 既有 decode 对照测试 hd=4 不进 paged 分派,v1 真实形态零覆盖)——
-    /// paged 池 + 真块表;参考臂 = paged prefill(bs32,vendor 契约档)。
-    /// **配对律结案(2026-10-01,三轮反转终审)**:曾判“v1 多块数值缺陷”
-    /// 的行 16+ 偏差 = 测试/层配置自伤两连 ——
-    /// ① wrapper×池页错配:v1_name 曾指向 bs16 wrapper 而池页 32,
-    ///   逻辑块(16 token)地址换算对不上物理块(32 token),行 16+ 全错;
-    /// ② prefill 参考臂 KvBuffers 传 1 元素 decode 步表:K0 grid=T 逐线程
-    ///   读 slots[t] 越界、seq_lens narrow 越界 → 垃圾 seq_len →
-    ///   valid_block 全灭 → 输出全零;T=4096 档直接 ILLEGAL_ADDRESS
-    ///   (即“paged_prefill 本体有病/4k 崩”立案的真凶)。
-    /// 修复后:页 32 生产档(policy 单源)+ v1_name(hd,page) 配对裁决,
-    /// 全矩阵收紧为硬门(无 allow_red)。
-    #[tokio::test]
-    async fn gpu_attn_v1_decode_matches_prefill_paged() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
-        // 变因矩阵:hd × GQA(hkv)× 跨块;页 32 = policy 生产档,
-        // wrapper bs32 由 v1_name 页配对律裁决。
-        // (2026-10-02 W2 融合核 k 支转置案结案:allow_red 立案拐杖撤除,
-        // 全档硬门;融合核写池金标另见 gpu_w2_fused_kprobe)
-        v1_isolation_case_inner(128, 2, 1, 8, 2, false, false).await;
-        v1_isolation_case_inner(256, 2, 1, 8, 2, false, false).await;
-        v1_isolation_case_inner(256, 8, 4, 8, 2, false, false).await; // GQA 单块
-        v1_isolation_case_inner(256, 2, 1, 64, 2, false, false).await; // 跨 2 块(行 32 = 页边界首槽)
-        v1_isolation_case_inner(256, 8, 4, 64, 2, false, false).await; // engine 全参档(GQA + 跨页)
-        // 规模档:真模型规模 T=4096/nb=128 单发射(4k e2e 同规模;
-        // 曾以越界 slots 表复现 ILLEGAL_ADDRESS,修复后应为绿)
-        v1_isolation_case_inner(256, 2, 1, 4096, 128, false, false).await;
-        gpu_client_close().await;
-    }
-
+    /// v1 paged decode 隔离对拍 —— **已随 kNHD 统一布局退役**(2026-10-13)。
+    ///
+    /// 退役理由(结构性,不是修不好的 bug):v1 只有 classic 变体
+    /// (`vllm_paged_attention_v1_*`),而主池已统一为 kNHD(env.kv.layout
+    /// 单源)→ v1 核读 kNHD 池 = 寻址错位。而 v1 在 paged 模式下**本就
+    /// 不可达**(`ctx.attn_v2.is_some()` 恒真 → 总走 v2),P6 清场会连
+    /// v1 核一起删。原测试曾立下大功(配对律三反转终审:wrapper×池页错配
+    /// + prefill 参考臂 1 元素 slots 表 → 4k ILLEGAL_ADDRESS 真凶),
+    /// 其变因矩阵(hd × GQA × 跨块)已由 v2 版全量承接:
+    /// 见 [`gpu_attn_v2_decode_matches_prefill_paged`]。
+    /// 台账出处:roadmap.local/kv布局统一契约-立项设计与施工.md §十。
+    ///
     /// v2 paged decode 隔离对拍(E-decode 2026-10-04):在线 softmax 分块
     /// (PARTITION=512)+ LSE 归并 vs prefill 参考(三方同 v1 案;多分区
     /// 归并路径 = 本测主靶,nparts=1 时核内退化直拷)。矩阵含跨分区边界
@@ -1197,11 +1186,9 @@ mod f16_tests {
         gpu_client_close().await;
     }
 
-    async fn v1_isolation_case(hd: usize, hq: usize, hkv: usize, t_len: usize, nb: usize) {
-        v1_isolation_case_inner(hd, hq, hkv, t_len, nb, false, false).await;
-    }
-
     async fn v1_isolation_case_inner(hd: usize, hq: usize, hkv: usize, t_len: usize, nb: usize, allow_red: bool, use_v2: bool) {
+        // v1 臂已退役(kNHD 单池;v1 无 kNHD 变体)—— 只服务 v2 变因矩阵
+        assert!(use_v2, "v1 隔离臂已随 kNHD 统一布局退役:见 gpu_attn_v2_decode_matches_prefill_paged 头注");
         let hidden = 6usize;
         let (page, x) = (32usize, 8usize); // 二分:暂回页 32
         let row_q = hq * hd;
@@ -1513,11 +1500,21 @@ mod f16_tests {
             }
         }
 
-        // ── 池提取(classic 寻址)+ 三方对拍(硬门)──
+        // ── 池提取(布局单源寻址)+ 三方对拍(硬门)──
+        // 2026-10-13 翻转:原硬编码 classic 寻址,而写核走 env 选择器
+        // 已翻 kNHD → 探针自伤(A/B 两臂自洽但都偏离 G)。回读偏移必须
+        // 与写核同源(env.kv.layout),否则本门测的是探针不是核。
+        let lay = crate::env::KvEnv::default().layout;
         let vf = |pool: &[u8], t: usize, kh: usize, d: usize| -> f32 {
-            let b = t / page;
-            let off = t % page;
-            let i = (((b * hkv + kh) * (hd / x) + d / x) * page * x + off * x + d % x) * 2;
+            let e = match lay {
+                crate::env::KvLayout::Classic => {
+                    crate::env::KvLayout::classic_k_offset(t, kh, d, hkv, hd, page, x)
+                }
+                crate::env::KvLayout::Knhd => {
+                    crate::env::KvLayout::knhd_offset(t, kh, d, hkv, hd, page)
+                }
+            };
+            let i = e * 2;
             half::f16::from_le_bytes([pool[i], pool[i + 1]]).to_f32()
         };
         let g_at = |t: usize, kh: usize, d: usize| gold[(t * hkv + kh) * hd + d];

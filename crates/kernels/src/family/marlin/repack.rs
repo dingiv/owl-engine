@@ -256,18 +256,20 @@ pub fn pack_marlin_s_f32(scales: &[f32], out: usize, groups: usize) -> Vec<f32> 
     assert_eq!(scales.len(), out * groups);
     let sp = marlin_scale_perm();
 
+    use rayon::prelude::*;
     let mut flat = vec![0f32; groups * out];
-    for o in 0..out {
-        for gi in 0..groups {
-            flat[gi * out + o] = scales[o * groups + gi];
+    flat.par_chunks_mut(out).enumerate().for_each(|(gi, row)| {
+        for (o, cell) in row.iter_mut().enumerate() {
+            *cell = scales[o * groups + gi];
         }
-    }
-    for chunk in flat.chunks_mut(64) {
-        let orig = chunk.to_vec();
+    });
+    flat.par_chunks_mut(64).for_each(|chunk| {
+        let mut orig = [0f32; 64];
+        orig.copy_from_slice(chunk);
         for (dst, src) in sp.iter().enumerate() {
             chunk[dst] = orig[*src];
         }
-    }
+    });
     flat
 }
 
@@ -422,6 +424,109 @@ mod tests {
         assert_eq!(marlin_perm().len(), 1024);
         assert_eq!(marlin_scale_perm().len(), 64);
     }
+
+    // 2026-10-12 装载提速:unpack_zp_ct / pack_marlin_z / pack_marlin_s_f32
+    // 由全串行改为 rayon 并行(装载期 p50 198ms→);本测试把**改前的
+    // 串行算法原文**留作参考实现,逐字节对拍 —— 并行化不变量机器锁。
+    fn unpack_zp_ct_ref(packed: &[i32], out: usize, groups: usize) -> Vec<u8> {
+        let mut z = vec![0u8; out * groups];
+        for t in 0..out / 8 {
+            for c in 0..groups {
+                let v = packed[t * groups + c] as u32;
+                for nib in 0..8 {
+                    z[(t * 8 + nib) * groups + c] = ((v >> (4 * nib)) & 0xF) as u8;
+                }
+            }
+        }
+        z
+    }
+
+    fn pack_marlin_z_ref(zp: &[u8], out: usize, groups: usize) -> Vec<i32> {
+        let sp = marlin_scale_perm();
+        let mut z = vec![0u8; groups * out];
+        for o in 0..out {
+            for g in 0..groups {
+                z[g * out + o] = zp[o * groups + g];
+            }
+        }
+        for chunk in z.chunks_mut(64) {
+            let orig = chunk.to_vec();
+            for (dst, src) in sp.iter().enumerate() {
+                chunk[dst] = orig[*src];
+            }
+        }
+        const IL: [usize; 8] = [0, 2, 4, 6, 1, 3, 5, 7];
+        let mut il = vec![0u8; z.len()];
+        for (blk, ch) in z.chunks(8).enumerate() {
+            for (dst, src) in IL.iter().enumerate() {
+                il[blk * 8 + dst] = ch[*src];
+            }
+        }
+        let n = out;
+        let mut packed = vec![0i32; groups * (n / 8)];
+        for g in 0..groups {
+            for jc in 0..n / 8 {
+                let mut v: u32 = 0;
+                for nib in 0..8 {
+                    v |= (il[g * n + jc * 8 + nib] as u32) << (4 * nib);
+                }
+                packed[g * (n / 8) + jc] = v as i32;
+            }
+        }
+        packed
+    }
+
+    fn pack_marlin_s_f32_ref(scales: &[f32], out: usize, groups: usize) -> Vec<f32> {
+        let sp = marlin_scale_perm();
+        let mut flat = vec![0f32; groups * out];
+        for o in 0..out {
+            for gi in 0..groups {
+                flat[gi * out + o] = scales[o * groups + gi];
+            }
+        }
+        for chunk in flat.chunks_mut(64) {
+            let orig = chunk.to_vec();
+            for (dst, src) in sp.iter().enumerate() {
+                chunk[dst] = orig[*src];
+            }
+        }
+        flat
+    }
+
+    /// 伪随机序列(无依赖;确定性 —— 失败可复现)
+    fn lcg(seed: &mut u64) -> u64 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *seed
+    }
+
+    #[test]
+    fn zp_parallel_matches_serial_reference() {
+        // 形状:真实 27B 量级(out=17408, groups=160)用小尺寸等比覆盖 +
+        // 边界(groups=1)、非 2 幂(blocks % 64 == 0 约束下)
+        for &(out, groups) in &[(17408usize, 160usize), (64, 64), (128, 32), (512, 8), (4096, 8)] {
+            let mut seed = 0x243F_6A88_85A3_08D3u64;
+            let packed: Vec<i32> = (0..(out / 8) * groups)
+                .map(|_| (lcg(&mut seed) & 0xFFFF_FFFF) as i32)
+                .collect();
+            let got = unpack_zp_ct(&packed, out, groups);
+            assert_eq!(got, unpack_zp_ct_ref(&packed, out, groups), "unpack_zp_ct {out}x{groups}");
+            let want_z = pack_marlin_z_ref(&got, out, groups);
+            assert_eq!(
+                pack_marlin_z(&got, out, groups),
+                want_z,
+                "pack_marlin_z {out}x{groups}"
+            );
+            let scales: Vec<f32> = (0..out * groups)
+                .map(|i| (i as f32) * 1e-3 - 3.0)
+                .collect();
+            let a = pack_marlin_s_f32(&scales, out, groups);
+            let b = pack_marlin_s_f32_ref(&scales, out, groups);
+            assert_eq!(a.len(), b.len());
+            for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                assert_eq!(x.to_bits(), y.to_bits(), "pack_marlin_s_f32 {out}x{groups} @{i}");
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -442,62 +547,76 @@ mod tests {
 
 /// ct zero_point((out/8, groups) i32)→ zp(out, groups)u8。
 pub fn unpack_zp_ct(packed: &[i32], out: usize, groups: usize) -> Vec<u8> {
+    use rayon::prelude::*;
     assert_eq!(packed.len(), (out / 8) * groups, "zp packed len mismatch");
     let mut z = vec![0u8; out * groups];
-    for t in 0..out / 8 {
-        for c in 0..groups {
-            let v = packed[t * groups + c] as u32;
-            for nib in 0..8 {
-                z[(t * 8 + nib) * groups + c] = ((v >> (4 * nib)) & 0xF) as u8;
+    // 2026-10-12 装载提速:原全串行标量散射(2.78M 次 stride=groups 写)
+    // ≈150ms/层 → 按 t 块并行(每 t 专属 8×groups 连续区;块内写序与
+    // 原式逐字节一致,只是并行分块 —— 结果位不变)
+    z.par_chunks_mut(8 * groups)
+        .enumerate()
+        .for_each(|(t, blk)| {
+            let src = &packed[t * groups..(t + 1) * groups];
+            for (c, w) in src.iter().enumerate() {
+                let v = *w as u32;
+                for nib in 0..8 {
+                    blk[nib * groups + c] = ((v >> (4 * nib)) & 0xF) as u8;
+                }
             }
-        }
-    }
+        });
     z
 }
 
 /// zp(out, groups)u8 → marlin zeros((k/g, n/8) i32),n = out。
 /// port upstream marlin_zero_points(逐段;不含 is_a_8bit 分支)。
 pub fn pack_marlin_z(zp: &[u8], out: usize, groups: usize) -> Vec<i32> {
+    use rayon::prelude::*;
     assert_eq!(zp.len(), out * groups);
     let sp = marlin_scale_perm();
 
     // (out, groups) → 转置 (groups, n=out)
+    // 2026-10-12 装载提速:四段(转置/perm/interleave/nibble)原全串行,
+    // 且 perm 段每 64B 一次 `to_vec()` 堆分配(≈43.5k 次/层)→ 全 rayon =
+    // 写连续、栈数组置换;各段逐元素语义与原式一致(结果位不变)。
     let mut z = vec![0u8; groups * out];
-    for o in 0..out {
-        for g in 0..groups {
-            z[g * out + o] = zp[o * groups + g];
+    z.par_chunks_mut(out).enumerate().for_each(|(g, row)| {
+        for (o, cell) in row.iter_mut().enumerate() {
+            *cell = zp[o * groups + g];
         }
-    }
-    // flat 64-chunk scale_perm
+    });
+    // flat 64-chunk scale_perm(栈上 [u8;64] 暂存,零堆分配)
     assert_eq!(z.len() % 64, 0, "groups*n % 64 != 0");
-    for chunk in z.chunks_mut(64) {
-        let orig = chunk.to_vec();
+    z.par_chunks_mut(64).for_each(|chunk| {
+        let mut orig = [0u8; 64];
+        orig.copy_from_slice(chunk);
         for (dst, src) in sp.iter().enumerate() {
             chunk[dst] = orig[*src];
         }
-    }
+    });
     // n-interleave [0,2,4,6,1,3,5,7]
     const IL: [usize; 8] = [0, 2, 4, 6, 1, 3, 5, 7];
     let mut il = vec![0u8; z.len()];
-    for (blk, ch) in z.chunks(8).enumerate() {
+    il.par_chunks_mut(8).enumerate().for_each(|(blk, out8)| {
+        let src8 = &z[blk * 8..blk * 8 + 8];
         for (dst, src) in IL.iter().enumerate() {
-            il[blk * 8 + dst] = ch[*src];
+            out8[dst] = src8[*src];
         }
-    }
+    });
     // 沿 n 打包 8 nibble/i32 LSB-first → (groups, out/8)
     let n = out;
     assert_eq!(il.len(), groups * n);
     assert!(n % 8 == 0, "n % 8 != 0");
     let mut packed = vec![0i32; groups * (n / 8)];
-    for g in 0..groups {
-        for jc in 0..n / 8 {
+    packed.par_chunks_mut(n / 8).enumerate().for_each(|(g, row)| {
+        let src = &il[g * n..(g + 1) * n];
+        for (jc, cell) in row.iter_mut().enumerate() {
             let mut v: u32 = 0;
             for nib in 0..8 {
-                v |= (il[g * n + jc * 8 + nib] as u32) << (4 * nib);
+                v |= (src[jc * 8 + nib] as u32) << (4 * nib);
             }
-            packed[g * (n / 8) + jc] = v as i32;
+            *cell = v as i32;
         }
-    }
+    });
     packed
 }
 

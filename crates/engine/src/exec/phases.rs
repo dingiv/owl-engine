@@ -110,8 +110,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 (act.id, act.out.len() as u64)
             };
             // 诊断:KV 池回读(取证图内 K0 写是否落盘)—— 槽 2 = prompt
-            // (eager prefill 写);槽 pos = 本步 K0(图内写)。layout
-            // [nb,hkv,hd/x,page,x]:b=0 头 0 组 0 → 元素 s*8。
+            // (eager prefill 写);槽 pos = 本步 K0(图内写)。
+            // 回读偏移走**布局单源**(env.kv.layout × 索引数学静态函数;
+            // 2026-10-13 翻转:原硬编码 classic `s*x` 只在 b=0 成立,
+            // 翻 kNHD 后指向错位 —— 诊断仪表不许说谎)。头 0 / 维 0..8。
             // B6.3:fp8 池字节域同序(1B/elem,e4m3);A/B 池对拍仪表
             // (f16 boot 半值 vs fp8 boot 字节,host RNE 桥对)
             if self.probes.debug && step < 16 {
@@ -121,8 +123,22 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 let mut whole = vec![0u8; kv0.1 * esz];
                 let face = self.session.face_mut();
                 face.dtoh(&kv0.0, &mut whole).await?;
+                let (hkv, hd) = (self.pool.dims.hkv, self.pool.dims.hd);
+                let page = self.pool.page;
+                let layout = self.env.kv.layout;
+                let x = self.env.kv.x;
+                let k_off = |slot: usize, d: usize| -> usize {
+                    match layout {
+                        owl_models::env::KvLayout::Classic => {
+                            owl_models::env::KvLayout::classic_k_offset(slot, 0, d, hkv, hd, page, x)
+                        }
+                        owl_models::env::KvLayout::Knhd => {
+                            owl_models::env::KvLayout::knhd_offset(slot, 0, d, hkv, hd, page)
+                        }
+                    }
+                };
                 let probe = |slot: usize| -> usize {
-                    let base = slot * 8 * esz;
+                    let base = k_off(slot, 0) * esz;
                     if fp8 {
                         whole[base..base + 8].iter().filter(|&&b| b != 0).count()
                     } else {
@@ -141,14 +157,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     probe(pos_now.saturating_sub(1))
                 );
                 // 取证:当前槽 k 值(f16 半值 / fp8 原始字节,头 0,维 0..8)
+                let base_now = k_off(pos_now, 0) * esz;
                 if fp8 {
-                    let hex: String = whole[pos_now * 8..pos_now * 8 + 8]
+                    let hex: String = whole[base_now..base_now + 8]
                         .iter()
                         .map(|b| format!("{b:02x}"))
                         .collect();
                     eprintln!("[kv-hex] fp8 槽{pos_now} k[0..8] = {hex}");
                 } else {
-                    let hex: String = whole[pos_now * 16..pos_now * 16 + 16]
+                    let hex: String = whole[base_now..base_now + 16]
                         .iter()
                         .map(|b| format!("{b:02x}"))
                         .collect();

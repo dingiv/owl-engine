@@ -191,6 +191,17 @@ pub async fn load_27b_dflash2<D: DeviceClient + 'static>(
     face: &mut D,
     kv_fp8: bool,
 ) -> Result<(crate::layers::dflash2::DFlash2Draft, crate::module::LoadManifest), ModelError> {
+    load_27b_dflash2_with(dir, face, kv_fp8, None).await
+}
+
+/// repack 路径可显式覆写(A/B 与单测用;None = 能力自述裁决)。
+/// 生产入口 [`load_27b_dflash2`] 走 None,行为与历史一致。
+pub async fn load_27b_dflash2_with<D: DeviceClient + 'static>(
+    dir: &Path,
+    face: &mut D,
+    kv_fp8: bool,
+    device_repack: Option<bool>,
+) -> Result<(crate::layers::dflash2::DFlash2Draft, crate::module::LoadManifest), ModelError> {
     // 源族自动探测(fc.weight_scale 在 = compressed-tensors W4A16 g128;
     // 缺 = BF16 原生)。W4A16 = 1.28GB(BF16 3.85GB)—— 24G 恒等门前置。
     // 裸索引探测(SafeTensorsSource::open_dir 的 F32/BF16 校验会拒收
@@ -204,7 +215,10 @@ pub async fn load_27b_dflash2<D: DeviceClient + 'static>(
         // 直载零转换;marlin scales 钉 F16(dtype_override);激活/池全 bf16
         dtype: crate::contract::Dtype::BF16,
         shard: 1,
-        device_repack: false,
+        // 设备重排裁决(唯一产地 = RepackPath::resolve;2026-10-13 DFlash2
+        // 草稿提速):草稿原写死 false → CPU 两步 unpack+gather 66 张量
+        // ≈24.6s;改走 GPU repack(owl_ct_repack_u32,与 AWQ 同核同 B 布局)。
+        device_repack: crate::module::RepackPath::resolve(device_repack, face.device_kernels()).is_device(),
         verify: false,
         debug_tap: false,
     };
@@ -223,6 +237,7 @@ pub async fn load_27b_dflash2<D: DeviceClient + 'static>(
         kv_fp8,
         );
         let src = crate::formats::w4a16::W4A16Source::open_dir(dir)?;
+        src.set_device_repack(ctx.device_repack);
         let manifest = crate::interpreters::eval_load(&draft, face, &src, &ctx).await?;
         // E5 内存账:草稿装载分类账(按 dtype×layout 聚合元素数与字节)
         {
@@ -300,6 +315,10 @@ impl Loadable for crate::layers::dflash2::DFlash2Draft {
                 || k.ends_with(".ws")
                 || k.ends_with(".marlin_ctmp")
                 || k.ends_with(".marlin_ws")
+                // 设备重排原始键(2026-10-13 DFlash2 草稿提速):`.packed_raw`
+                // 已内含后缀,与 qweight 同款直拼 —— 原白名单漏它 → 被补成
+                // `{base}.packed_raw.weight` → 源缺键(装载失败)。
+                || k.ends_with(".packed_raw")
             {
                 k.to_string()
             } else {
@@ -535,6 +554,236 @@ mod tests {
         let s = qwen3_5_0_8b();
         assert_eq!(s.layer_types, lt);
         assert_eq!(s.vocab, 248320);
+    }
+
+    /// DFlash2 草稿装载独立基准 + 设备重排逐 u32 对拍(2026-10-13 提速立案)
+    ///
+    /// **只装草稿**:不装主模型、不建图、不起服务器 —— 草稿装载路径的快速
+    /// 迭代台。两件事:
+    /// ① 生产姿势(设备重排 = GPU repack)装载计时(改前 CPU 两步
+    ///    unpack+gather 66 张量 ≈ 24.6s);
+    /// ② **真实草稿权重**上 CPU(host `pack_marlin_b_fused`)vs GPU
+    ///    (`owl_ct_repack_u32`)重排 **逐 u32 一致** —— 接线正确性硬门。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gpu_dflash2_draft_load_bench() {
+        if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return;
+        }
+        let Some(dir) = owl_shared::env_reader::str("OWL_DFLASH2_DIR") else {
+            eprintln!("skip: OWL_DFLASH2_DIR 未设");
+            return;
+        };
+        let mut gpu = crate::testkit::gpu_client().await;
+
+        // ① 生产姿势装载(设备重排臂)计时
+        let t0 = std::time::Instant::now();
+        let (draft_dev, manifest) =
+            load_27b_dflash2_with(std::path::Path::new(&dir), &mut gpu, false, Some(true))
+                .await
+                .expect("草稿装载(设备重排)");
+        eprintln!(
+            "[draft-bench] 装载(设备重排) {:?};manifest {} 项",
+            t0.elapsed(),
+            manifest.entries().len()
+        );
+
+        // ② 逐位对拍:挑 3 个真实张量
+        use crate::module::WeightSource as _;
+        let src = crate::formats::w4a16::W4A16Source::open_dir(std::path::Path::new(&dir))
+            .expect("源");
+        let all: Vec<_> = manifest
+            .entries()
+            .iter()
+            .filter(|e| e.key.ends_with(".packed_raw"))
+            .cloned()
+            .collect();
+        // 抽样门(快):普通张量 2 个 + fc 列块 2 个(覆盖两条派生路);
+        // 全量 40 项对拍走 OWL_DRAFT_AB=1(慢,~60s)
+        let picks: Vec<_> = if owl_shared::env_reader::flag("OWL_DRAFT_AB") {
+            all.clone()
+        } else {
+            let mut v: Vec<_> = all.iter().take(2).cloned().collect();
+            v.extend(all.iter().filter(|e| e.key.starts_with("fc_")).take(2).cloned());
+            v
+        };
+        assert!(!picks.is_empty(), "manifest 里应有 .packed_raw 条目(设备重排臂)");
+        eprintln!("[draft-bench] 逐位对拍 {} 项设备重排张量", picks.len());
+        let mut checked = 0usize;
+        for e in &picks {
+            let base = e.key.strip_suffix(".packed_raw").expect("后缀");
+            let rows = e.shape[0];
+            let cols = e.shape[1];
+            let k = cols * 8;
+            // CPU 参考:原始 packed → host fused 重排
+            let mut ph = vec![0u8; rows * cols * 4];
+            src.convert_chunk_into_bytes(&e.key, 0, rows * cols, &mut ph, Dtype::U32)
+                .expect("源取 packed_raw");
+            let p32: Vec<i32> = ph
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let idx = owl_kernels::family::marlin::repack::marlin_fused_indices(k, rows);
+            let mut b_ref: Vec<i32> = Vec::new();
+            owl_kernels::family::marlin::repack::pack_marlin_b_fused(
+                &p32, &idx, rows * k / 8, &mut b_ref,
+            );
+            // 引擎旧路(gather 两步)vs 新路(fused 单遍)对拍 —— 若此处不等,
+            // 则“字节对拍”的参考选错了(旧路才是生产基线)
+            let idx_g = owl_kernels::family::marlin::repack::marlin_gather_indices(k, rows);
+            let mut q_buf: Vec<u8> = Vec::new();
+            owl_kernels::family::marlin::repack::unpack_nibbles_into(&p32, rows, k, &mut q_buf);
+            let mut b_g: Vec<i32> = Vec::new();
+            owl_kernels::family::marlin::repack::pack_marlin_b_gather_into(
+                &q_buf, &idx_g, rows * k / 8, &mut b_g,
+            );
+            let d_gf = b_g.iter().zip(b_ref.iter()).filter(|(a, b)| a != b).count();
+            eprintln!("[draft-bench] {base}: host gather-vs-fused 差 {d_gf}/{}", b_ref.len());
+            // GPU 臂:上传原始 packed → owl_ct_repack_u32 → 回读
+            let raw = gpu.htod(Dtype::U32, &vec![rows, cols], &ph).await.expect("htod raw");
+            let out_b = gpu.alloc_uninit(Dtype::U32, rows * k / 8).await.expect("alloc out");
+            let env = gpu.op_env().expect("GPU env");
+            let pick = owl_kernels::driver::resolve(owl_kernels::driver::OpReq {
+                op: owl_kernels::driver::load::CT_REPACK,
+                env: &env,
+                dt: owl_kernels::driver::DType::U32,
+                shapes: &[vec![rows, cols]],
+                aux: &[],
+                scalars: &[],
+            });
+            gpu.launch(crate::contract::LaunchMsg {
+                kernel: crate::contract::KernelSource {
+                    name: pick.name.to_string(),
+                    source: crate::kernel::source(pick.name).to_string(),
+                },
+                args: vec![
+                    crate::contract::Arg::Block { id: raw.id },
+                    crate::contract::Arg::U64(rows as u64),
+                    crate::contract::Arg::U64(cols as u64),
+                    crate::contract::Arg::Block { id: out_b.id },
+                ],
+                grid: pick.shape.grid,
+                block: pick.shape.block,
+                shared_mem: pick.shape.smem,
+                out_elems: rows * k / 8,
+            })
+            .await
+            .expect("CtRepack launch");
+            gpu.sync().await.expect("sync");
+            let mut gbuf = vec![0u8; rows * k / 8 * 4];
+            gpu.dtoh(&out_b, &mut gbuf).await.expect("dtoh");
+            let mut bad = 0usize;
+            for (i, w) in gbuf.chunks_exact(4).enumerate() {
+                if i32::from_le_bytes([w[0], w[1], w[2], w[3]]) != b_ref[i] {
+                    bad += 1;
+                }
+            }
+            eprintln!(
+                "[draft-bench] {base}: {rows}x{cols} CPU-vs-GPU 坏字 {bad}/{}",
+                b_ref.len()
+            );
+            assert_eq!(bad, 0, "{base}: 设备重排与 host fused 不逐位一致");
+            checked += 1;
+        }
+        eprintln!("[draft-bench] 逐位对拍完成 {checked} 项,全绿");
+
+        // ③ 行为对拍:CPU 臂 vs 设备臂,同一 taps 的草稿 memory 输出逐位一致
+        // 设备臂输出**先算**(排除两次装载互相干扰的假象)
+        let mk0 = |k: f32| -> Vec<u8> {
+            vec![0.01 * k; 2 * 5120]
+                .iter()
+                .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+                .collect()
+        };
+        let fctx0 = ForwardCtx::minimal(2);
+        let taps_d0: Vec<TensorOps> = (0..5)
+            .map(|i| TensorOps::from_host(Dtype::F16, vec![2, 5120], &mk0(i as f32 + 1.0)))
+            .collect();
+        let mem_d0 = draft_dev.project_memory(&taps_d0, &fctx0);
+        let got_d0 = crate::testkit::harvest_f16(&mut gpu, &mem_d0).await;
+        eprintln!(
+            "[draft-bench] 设备臂 memory 前 4 值 = {:?}",
+            &got_d0[..4.min(got_d0.len())]
+        );
+        if !owl_shared::env_reader::flag("OWL_DRAFT_AB") {
+            eprintln!("[draft-bench] (CPU 臂行为对拍跳过;OWL_DRAFT_AB=1 开启)");
+            gpu.close().await.ok();
+            return;
+        }
+        let t_cpu = std::time::Instant::now();
+        let (draft_cpu, _m2) =
+            load_27b_dflash2_with(std::path::Path::new(&dir), &mut gpu, false, Some(false))
+                .await
+                .expect("草稿装载(CPU 臂)");
+        eprintln!("[draft-bench] CPU 臂装载(对照) {:?}", t_cpu.elapsed());
+        let mk = |k: f32| -> Vec<u8> {
+            vec![0.01 * k; 2 * 5120]
+                .iter()
+                .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+                .collect()
+        };
+        let taps_d: Vec<TensorOps> = (0..5)
+            .map(|i| TensorOps::from_host(Dtype::F16, vec![2, 5120], &mk(i as f32 + 1.0)))
+            .collect();
+        let taps_c: Vec<TensorOps> = (0..5)
+            .map(|i| TensorOps::from_host(Dtype::F16, vec![2, 5120], &mk(i as f32 + 1.0)))
+            .collect();
+        let fctx = ForwardCtx::minimal(2);
+        let mem_d = draft_dev.project_memory(&taps_d, &fctx);
+        let got_d = crate::testkit::harvest_f16(&mut gpu, &mem_d).await;
+        let mem_c = draft_cpu.project_memory(&taps_c, &fctx);
+        let got_c = crate::testkit::harvest_f16(&mut gpu, &mem_c).await;
+        let d_bad = got_d
+            .iter()
+            .zip(got_c.iter())
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        let d_bad0 = got_d0
+            .iter()
+            .zip(got_c.iter())
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        eprintln!("[draft-bench] 设备臂(先算)vs CPU 臂 差 {d_bad0}/{}", got_c.len());
+        eprintln!("[draft-bench] CPU 臂 memory 前 4 值 = {:?}", &got_c[..4.min(got_c.len())]);
+        eprintln!(
+            "[draft-bench] memory 输出 CPU-vs-DEV 差 {d_bad}/{}",
+            got_c.len()
+        );
+        assert_eq!(d_bad, 0, "草稿 memory 输出两臂不一致(设备重排臂行为错)");
+
+        // ③ scales 对拍:CPU 臂 vs 设备臂的 .scales 字节(唯一未被 ② 覆盖的量)
+        let src_cpu = crate::formats::w4a16::W4A16Source::open_dir(std::path::Path::new(&dir))
+            .expect("源 cpu");
+        src_cpu.set_device_repack(false);
+        let src_dev = crate::formats::w4a16::W4A16Source::open_dir(std::path::Path::new(&dir))
+            .expect("源 dev");
+        src_dev.set_device_repack(true);
+        let scale_picks: Vec<_> = manifest
+            .entries()
+            .iter()
+            .filter(|e| e.key.ends_with(".scales"))
+            .take(4)
+            .cloned()
+            .collect();
+        for e in &scale_picks {
+            let elems: usize = e.shape.iter().product();
+            let mut a = vec![0u8; elems * 2];
+            let mut b = vec![0u8; elems * 2];
+            let ok_a = src_cpu
+                .convert_chunk_into_bytes(&e.key, 0, elems, &mut a, Dtype::F16)
+                .is_some();
+            let ok_b = src_dev
+                .convert_chunk_into_bytes(&e.key, 0, elems, &mut b, Dtype::F16)
+                .is_some();
+            let bad = a.iter().zip(b.iter()).filter(|(x, y)| x != y).count();
+            eprintln!(
+                "[draft-bench] {}: scales CPU-vs-DEV 差 {bad}/{} (取到 {ok_a}/{ok_b})",
+                e.key,
+                elems * 2
+            );
+            assert_eq!(bad, 0, "{}: scales 两臂不一致", e.key);
+        }
+        gpu.close().await.ok();
     }
 
     /// 键名约定 vs 检查点实测(488 张量逐键核对过的样例)

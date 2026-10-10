@@ -1032,16 +1032,37 @@ async fn gpu_27b_chat_inference() {
                 knobs.cuda.capture_slab_mb = Some(160);
             }
             knobs.draft.dflash2_dir = Some(ddir.to_string());
+            // E19 定位开关(2026-10-13):knhd×fp8 池×int4 头×spec 语义回归
+            // 复现(缺省关 = 原口径不变)。三项同开才复现 —— 单开任一项均绿:
+            // 疑为“knHD 多序(seqs>1)读非位等”在窄边际下的贪心翻转。
+            if owl_shared::env_reader::flag("OWL_GATE_FP8") {
+                knobs.env.kv.quant = owl_models::env::KvQuant::Fp8E4M3;
+            }
+            if let Some(p) = owl_shared::env_reader::parse::<usize>("OWL_GATE_POOL") {
+                knobs.pool_tokens = Some(p);
+            }
+            let head_plan = if owl_shared::env_reader::flag("OWL_GATE_INT4HEAD") {
+                owl_models::module::QuantPlan::W4A16Awq
+            } else {
+                owl_models::module::QuantPlan::F16
+            };
             let mut engine = Engine::new(EngineConfig {
                 device_ordinal: ordinal,
-                max_seq_tokens: 320.max(max_new + 64),
+                // E19(2026-10-13):几何可覆写 —— 缺省 320 → nb=10 →
+                // **nparts=1** → v2 核退化为直拷,多分区在线 softmax +
+                // LSE 归并路径(= reduce/E15/E16 的真正受控面)**零覆盖**;
+                // 服务器 nb=272 → nparts=17 才跑到。复现需同几何。
+                max_seq_tokens: owl_shared::env_reader::parse_or(
+                    "OWL_GATE_MAXSEQ",
+                    320.max(max_new + 64),
+                ),
                 prefill_chunk: 32,
                 knobs,
             })
             .expect("构造");
             let loaded = engine
                 .loader()
-                .load_qwen38_27b_awq(std::path::Path::new(dir), std::path::Path::new(dir), owl_models::module::QuantPlan::F16)
+                .load_qwen38_27b_awq(std::path::Path::new(dir), std::path::Path::new(dir), head_plan)
                 .await
                 .expect("装载");
             let mut running = engine.run(loaded).await.expect("装配");

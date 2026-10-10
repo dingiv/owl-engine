@@ -76,10 +76,14 @@ impl GpuServer {
         // 池取（内部单次加锁；容量 ≥ 请求即命中，逻辑长度由调用方界定）
         if let Some(b) = self.pool.take(bytes) {
             // 容量不可截，整块交出（调用方只用前 bytes）
+            owl_shared::counter_inc!("srv.pinned_hit");
             ack.send(Ok(b));
             return;
         }
-        match Staging::alloc(bytes) {
+        // miss 才 cudaHostAlloc（页锁定；大块 ~300ms —— 装载期主要成本之一）
+        owl_shared::counter_inc!("srv.pinned_miss");
+        owl_shared::counter_add!("srv.pinned_miss_bytes", bytes as u64);
+        match owl_shared::timer_scope!("srv.pinned_alloc", Staging::alloc(bytes)) {
             Ok(s) => ack.send(Ok(Box::new(s))),
             Err(e) => ack.send(Err(e)),
         }
@@ -103,13 +107,17 @@ impl GpuServer {
             Ok((p, _)) => p,
             Err(e) => return ack.take().unwrap().send(Err(e)),
         };
-        if let Err(e) = unsafe {
+        let t_dma = std::time::Instant::now();
+        let dma = unsafe {
             memcpy_htod_async(
                 dptr_base + (offset_bytes as u64),
                 &buf.as_bytes()[..len_bytes],
                 stream.cu_stream(),
             )
-        } {
+        };
+        owl_shared::timer_record!("srv.dma_enqueue", t_dma.elapsed());
+        owl_shared::counter_add!("srv.dma_bytes", len_bytes as u64);
+        if let Err(e) = dma {
             // 建场失败:未入队任何 DMA,finish 不得投递 —— 租约回池 + 回执错误
             let e = ModelError::Msg(format!("upload_pinned async: {e:?}"));
             self.pool.put(buf);

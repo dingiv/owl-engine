@@ -191,10 +191,12 @@ impl Loadable for Linear {
         match (self.quant_group, (&self.qw, &self.sc, &self.ws, &self.ctmp)) {
             (Some(_g), (Some(qw), Some(sc), Some(ws), Some(ctmp))) => {
                 let base = self.w.key();
-                // qweight 键:AWQ + ctx.device_repack → 设备重排
-                // (源供原始 packed,DMA 上卡后 GPU 重排到 marlin 布局);
-                // 否则经典键(CPU 懒物化)。
-                let device = self.zs.is_some() && ctx.device_repack;
+                // qweight 键:设备重排 → 原始 packed,DMA 上卡后 GPU 重排到
+                // marlin 布局(AWQ kU4 与 W4A16 对称共用同核同 B 字节布局;
+                // 2026-10-13 放开 zs 限制 —— W4A16 无 zeros want,原条件
+                // `zs.is_some()` 把草稿钉在 CPU 两步重排 ≈24.6s);否则
+                // 经典键(CPU 懒物化)。
+                let device = ctx.device_repack;
                 let ops = if device {
                     // 设备重排:want 键 = 原始 packed 源键(源零重排直拷),
                     // 布局带核名与原始形状;DMA 上卡后 GPU 重排到 marlin 布局

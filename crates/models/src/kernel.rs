@@ -22,27 +22,29 @@ pub fn kv_manifest_gate(
     fi_on: bool,
 ) -> Result<(), crate::contract::ModelError> {
     let fp8: &[&str] = &[
-        "owl_reshape_and_cache_fp8kv",                   // K0 写(classic)
-        "owl_reshape_and_cache_dual_f16_fp8kv",          // K0 双写(classic+影子,双臂 e4m3)
-        "vllm_chunked_prefill_paged_attn_opt_fp8_hd128", // chunked 读 hd128
-        "vllm_chunked_prefill_paged_attn_opt_fp8_hd256", // chunked 读 hd256
-        "vllm_paged_attention_v2_fp8_hd128bs32",         // v2 decode hd128
-        "vllm_paged_attention_v2_fp8_hd256bs32",         // v2 decode hd256
-        "owl_qknorm_rope_kv_insert_f16_fp8kv",           // decode 融合插池
-        "owl_naive_attn_nc_f16",                         // 草稿池 f16 NC
-        "owl_naive_attn_nc_fp8kv_f16",                   // 草稿池 fp8 NC
+        "owl_reshape_and_cache_fp8kv_knhd",              // K0 写(kNHD 单池)
+        "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd128", // chunked 读 hd128
+        "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256", // chunked 读 hd256
+        "vllm_paged_attention_v2_fp8_knhd_hd128bs32",    // v2 decode hd128
+        "vllm_paged_attention_v2_fp8_knhd_hd256bs32",    // v2 decode hd256
+        "owl_qknorm_rope_kv_insert_f16_fp8kv_knhd",      // decode 融合插池
+        "owl_naive_attn_nc_f16",                         // 草稿池 f16 NC(classic 岛,D5)
+        "owl_naive_attn_nc_fp8kv_f16",                   // 草稿池 fp8 NC(classic 岛,D5)
     ];
     let f16: &[&str] = &[
-        "vllm_reshape_and_cache_f16",                    // K0 写(classic)
-        "owl_reshape_and_cache_dual_f16",                // K0 双写(classic+影子)
-        "vllm_chunked_prefill_paged_attn_opt_f16_hd128",
-        "vllm_chunked_prefill_paged_attn_opt_f16_hd256",
-        "vllm_paged_attention_v2_f16_hd128bs32",
-        "vllm_paged_attention_v2_f16_hd256bs32",
-        "owl_qknorm_rope_kv_insert_f16",                 // decode 融合插池
-        "owl_naive_attn_nc_f16",                         // 草稿池 f16 NC
-        "owl_naive_attn_nc_bf16",                        // 草稿池 bf16 NC
+        "vllm_reshape_and_cache_f16_knhd",               // K0 写(kNHD 单池)
+        "vllm_chunked_prefill_paged_attn_opt_f16_knhd_hd128",
+        "vllm_chunked_prefill_paged_attn_opt_f16_knhd_hd256",
+        "vllm_paged_attention_v2_f16_knhd_hd128bs32",
+        "vllm_paged_attention_v2_f16_knhd_hd256bs32",
+        "owl_qknorm_rope_kv_insert_f16_knhd",            // decode 融合插池
+        "owl_naive_attn_nc_f16",                         // 草稿池 f16 NC(classic 岛,D5)
+        "owl_naive_attn_nc_bf16",                        // 草稿池 bf16 NC(classic 岛,D5)
     ];
+    // 注(kv布局统一契约 2026-10-13 翻转):主池条目已从 classic 名换成
+    // kNHD 名(布局单源 = KvEnv.layout);影子双写核 `owl_reshape_and_cache_dual_*`
+    // 随影子池删除退出本清单(核本体待 P5/P6 清场)。草稿池按 D5 独立留 classic,
+    // 其写核(硬编码 K0Write)+ 读核(NaiveAttnNc)自成闭环不入 kNHD 列。
     let family: Vec<&str> = match quant {
         crate::env::KvQuant::Fp8E4M3 => fp8.to_vec(),
         crate::env::KvQuant::None => f16.to_vec(),
@@ -62,8 +64,9 @@ pub fn kv_manifest_gate(
             bad.push(name);
             continue;
         };
-        // .cu 源里必须有同名 extern 入口(登记表行在而源缺定义 = 悬空名)
-        if !e.source.contains(&format!("extern \"C\" __global__ void {name}")) {
+        // .cu 源里必须有该核定义(字面 or 单层宏实例化;判据单源 =
+        // owl_kernels::list::source_defines —— chunked kNHD 族走宏)
+        if !owl_kernels::list::source_defines(e.source, name) {
             bad.push(name);
         }
     }

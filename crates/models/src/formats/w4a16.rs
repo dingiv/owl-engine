@@ -77,6 +77,11 @@ pub struct W4A16Source {
     idx_cache: Mutex<HashMap<(usize, usize), Arc<Vec<u32>>>>,
     /// 构建串行锁(重排内部 rayon 已饱和全核;并发双构建纯浪费)
     build_lock: Mutex<()>,
+    /// 设备重排模式(装载域注入;须在首键物化前设置):true = CPU 仅产
+    /// scales,量化大键的 marlin B 由 **GPU repack**(owl_ct_repack_u32)产出
+    /// —— DFlash2 草稿提速(2026-10-13):草稿原被钉在 CPU 两步
+    /// unpack+gather(66 张量 × ~0.68s ≈ 24.6s)。
+    device_repack: std::cell::Cell<bool>,
 }
 
 impl W4A16Source {
@@ -108,7 +113,14 @@ impl W4A16Source {
             cache: Mutex::new((HashMap::new(), 0)),
             idx_cache: Mutex::new(HashMap::new()),
             build_lock: Mutex::new(()),
+            device_repack: std::cell::Cell::new(false),
         })
+    }
+
+    /// 设备重排模式(装载域注入;须在首键物化前设置)
+    /// —— 与 awq.rs 同款接口(裁决唯一产地 = module::RepackPath::resolve)
+    pub fn set_device_repack(&self, on: bool) {
+        self.device_repack.set(on);
     }
 
     /// 反量化口(测试/对拍用):量化基线性 → f32(dequant_u4 精确展宽)
@@ -147,6 +159,17 @@ impl W4A16Source {
         if key.ends_with(".marlin_ws") || key.ends_with(".marlin_ctmp") {
             return Some(Resolved::Zeroed);
         }
+        // 设备重排原始键(2026-10-13 DFlash2 草稿提速):`{base}.packed_raw`
+        // = 检查点原始 ct packed i32 原样(CPU 零重排;重排交 GPU
+        // owl_ct_repack_u32 —— 该核 (in,rows,cols,out) 无 zp 参数、纯布局
+        // 变换,与 AWQ kU4 同核同 B 字节布局,故 W4A16 直接复用)。
+        // 零拷贝 View 优先;fc 列块五拆 / qkvz 合并走 linear_bytes_for。
+        if let Some(base) = key.strip_suffix(".packed_raw") {
+            // 原始 ct packed i32 → **U32 字节**(零重排)。注意:不可用
+            // `Resolved::View` —— 它走 passthrough 归一 F16(I32 条目落
+            // `_ => None` → 缺键);此处一律 Bytes/U32。
+            return Some(Resolved::Bytes(self.linear_bytes_for(base, key)?, Dtype::U32));
+        }
         // DFlash2 fc 列块五拆派生(E5-DF3.5):`fc_{i}.qweight/.scales` =
         // fc.weight_packed/scale 列块 i(in 维 [i*5120,(i+1)*5120);
         // packed [out, k/8] 列连续 ↔ in 连续,块宽 640/40)
@@ -183,6 +206,37 @@ impl W4A16Source {
     /// + fc.weight_scale [5120, 200] F16 列子阵 → (out=5120, k=5120) 走
     /// 与 build_linear 同式的 marlin 重排(qweight U32 / scales F16)。
     /// 列块恒 eligible(n=5120 % 256 == 0,k=5120 % 128 == 0)。
+    /// fc 列块**原始 ct packed** 字节(设备重排核的输入;不做 marlin 重排)
+    /// —— 与 [`Self::fc_block_bytes`] 的区别:后者返回的是**已重排的 marlin B**
+    /// (CPU 臂产物),喂给 GPU CtRepack 会二次重排 = 垃圾(2026-10-13 立案)。
+    fn fc_block_raw_bytes(&self, blk: usize) -> Option<Arc<[u8]>> {
+        let vkey = format!("fc_block_{blk}_raw");
+        {
+            let cache = self.cache.lock().unwrap();
+            if let Some(b) = cache.0.get(&vkey) {
+                return Some(b.clone());
+            }
+        }
+        let pe = self.index.get("fc.weight_packed")?;
+        let out = *pe.shape.first()?;
+        let packed_cols = *pe.shape.get(1)?;
+        let n_fc = 5usize;
+        let cols = packed_cols / n_fc;
+        let packed_bytes = &self.maps[pe.map_ix][pe.start..pe.start + pe.nbytes];
+        let packed_all = i32s_par(packed_bytes);
+        let mut packed = Vec::with_capacity(out * cols);
+        for r in 0..out {
+            packed.extend_from_slice(
+                &packed_all[r * packed_cols + blk * cols..r * packed_cols + (blk + 1) * cols],
+            );
+        }
+        let buf: Arc<[u8]> = Arc::from(i32s_le_bytes(&packed).into_boxed_slice());
+        let mut cache = self.cache.lock().unwrap();
+        cache.1 += buf.len();
+        cache.0.insert(vkey, buf.clone());
+        Some(buf)
+    }
+
     fn fc_block_bytes(&self, blk: usize, scales_side: bool) -> Option<Arc<[u8]>> {
         let vkey = format!("fc_block_{blk}_{}", if scales_side { "s" } else { "q" });
         {
@@ -256,6 +310,21 @@ impl W4A16Source {
             buf.extend_from_slice(&s2);
             return Some(buf.into());
         }
+        // 设备重排原始键(2026-10-13 DFlash2 草稿提速):必须在
+        // `linear_dims` **之前** —— fc 列块(`fc_0..4`)是派生键,没有
+        // `fc_i.weight_packed`,linear_dims 会先 `?` 掉。
+        if let Some(b) = key.strip_suffix(".packed_raw") {
+            if let Some(i) = fc_block_index(b) {
+                // **原始** ct packed(非 marlin B) —— 设备重排核的输入
+                return self.fc_block_raw_bytes(i);
+            }
+            if let Some(pe) = self.index.get(&format!("{b}.weight_packed")) {
+                return Some(Arc::from(
+                    self.maps[pe.map_ix][pe.start..pe.start + pe.nbytes].to_vec(),
+                ));
+            }
+            return None;
+        }
         let (out, k, pe, se) = self.linear_dims(base)?;
         {
             let cache = self.cache.lock().unwrap();
@@ -288,7 +357,18 @@ impl W4A16Source {
         self.maps[se.map_ix].dontneed(se.start, se.nbytes);
 
         let mut inserts: Vec<(String, Arc<[u8]>, usize)> = Vec::new();
-        if marlin_eligible(out, k) {
+        let device = self.device_repack.get();
+        if marlin_eligible(out, k) && device {
+            // ---- 轻路径(device):CPU 仅产 scales;qweight 的 marlin B 由
+            //      GPU repack 产出(load.rs 设备重排臂;与 awq.rs 同款)----
+            let s = pack_marlin_s(&scales_f32, out, k / 128);
+            inserts.push((
+                format!("{base}.scales"),
+                // BF16 激活 marlin:s_type = BF16(位型转换,见 f16_bytes_to_bf16_bytes)
+                Arc::from(f16_bytes_to_bf16_bytes(&u16s_le_bytes(&s)).into_boxed_slice()),
+                s.len() * 2,
+            ));
+        } else if marlin_eligible(out, k) {
             let mut q_buf: Vec<u8> = Vec::new();
             unpack_nibbles_into(&packed, out, k, &mut q_buf);
             let idx = self

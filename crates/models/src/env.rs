@@ -104,11 +104,17 @@ impl KvLayout {
 }
 
 impl KvEnv {
-    /// 生产档:f16 paged 页 32(配对律定谳;layout = Knhd 统一契约现役)
+    /// 生产档:f16 paged 页 32(配对律定谳)
+    ///
+    /// **2026-10-13 翻转**:`layout = Knhd` —— 统一契约的“大爆炸切换”
+    /// (roadmap.local/kv布局统一契约 §2.2 D1:不留双臂)。此前本字段唯一
+    /// 赋值点是 Classic,导致 6 个选择器的 Knhd 分支全不可达、生产实际
+    /// 跑 classic(台账 §十“翻转 ✅”未落地,已回写更正)。
+    /// boot 静态定形,禁运行时切换(REQ-PRE-01)。
     pub fn f16_paged() -> Self {
         Self {
             quant: KvQuant::None,
-            layout: KvLayout::Classic,
+            layout: KvLayout::Knhd,
             dtype: Dtype::F16,
             page: 32,
             x: 8,

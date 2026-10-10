@@ -482,8 +482,8 @@ async fn gpu_paged_attention_v2_reduce_f16_smoke() {
         .with_shape(Dtype::F16, vec![1, hq, hd]);
     let tmp = crate::interpreters::eval_ops(v2.step(), &mut gpu).await.expect("v2 eval");
 
-    // reduce:分片归约 → 终出
-    let rd = TensorOps::call(SemanticKernel::PagedV2Reduce).aux(&[hd, hq, 1])
+    // reduce:分片归约 → 终出(aux = [hd, hq, nparts, seqs];E16 seqs 入参)
+    let rd = TensorOps::call(SemanticKernel::PagedV2Reduce).aux(&[hd, hq, 1, 1])
         .arg(&TensorOps::of_block(es_b.id, Dtype::F32, vec![1, hq, 1]))
         .arg(&TensorOps::of_block(ml_b.id, Dtype::F32, vec![1, hq, 1]))
         .arg(&TensorOps::of_block(tmp.id, Dtype::F16, vec![1, hq, hd]))

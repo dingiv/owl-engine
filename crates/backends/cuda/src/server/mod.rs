@@ -53,7 +53,16 @@ pub(super) struct PinnedPool {
 impl PinnedPool {
     fn take(&self, min_bytes: usize) -> Option<Box<dyn owl_iface::contract::PinnedRegion + Send>> {
         let mut v = self.free.lock().unwrap();
-        let i = v.iter().position(|b| b.as_bytes().len() >= min_bytes)?;
+        // 2026-10-12 装载定谳:原策略 = 首个 `len >= 请求` 的桶 —— 小请求
+        // (norm/小线性)会抢走 44MB 大桶,随后大权重请求无桶可用 → miss →
+        // cudaHostAlloc(44MB) ≈ 300ms/次(装载期 ~100 次 miss = 30s)。
+        // 改 best-fit:取满足条件的最小桶,大桶留给大请求。
+        let i = v
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.as_bytes().len() >= min_bytes)
+            .min_by_key(|(_, b)| b.as_bytes().len())
+            .map(|(i, _)| i)?;
         Some(v.swap_remove(i))
     }
     fn put(&self, b: Box<dyn owl_iface::contract::PinnedRegion + Send>) {

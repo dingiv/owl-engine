@@ -182,8 +182,9 @@ pub fn resolve(req: OpReq) -> KernelPick {
             attn::paged_decode_v2_seq_knhd(req.env, dt, ax(0), ax(1), ax(2), ax(3), ax(4), ax(5))
         }
         "attn.paged_v2_reduce" => {
-            // aux = [hd, hq, nparts]
-            attn::paged_v2_reduce(dt, ax(0), ax(1), ax(2))
+            // aux = [hd, hq, nparts, seqs](E16:核 seq_idx=blockIdx.y,
+            // grid.y = seqs;decode 单序 = 1)
+            attn::paged_v2_reduce(dt, ax(0), ax(1), ax(2), ax(3))
         }
         "attn.paged_prefill" => attn::paged_prefill(req.env, dt, ax(0), ax(1), ax(2), ax(3)), // aux = [hd, hkv, hq, tokens]
         "attn.paged_prefill_fp8" => attn::paged_prefill_fp8(req.env, dt, ax(0), ax(1), ax(2), ax(3)), // B6.3 fp8 读变体
@@ -876,8 +877,10 @@ pub mod attn {
 
     /// v2 LSE 归并(模板无 BLOCK/页参数 —— 单 wrapper 通用两页;reduce
     /// smem = 2·nparts·4B(shared_max_logits + shared_exp_sums);
-    /// grid (hq,1,1),block 128;ctx ≤512 时核内退化为 tmp_out 直拷)。
-    pub fn paged_v2_reduce(dt: DType, hd: usize, hq: usize, nparts: usize) -> KernelPick {
+    /// **grid (hq, seqs, 1)**(E16 根治:核 seq_idx=blockIdx.y —— 原硬发
+    /// y=1 只归并 seq0,verify 多序行 1.. 从未写出;ctx ≤512 时核内退化
+    /// 为 tmp_out 直拷)。
+    pub fn paged_v2_reduce(dt: DType, hd: usize, hq: usize, nparts: usize, seqs: usize) -> KernelPick {
         assert!(matches!(dt, DType::F16), "paged v2 reduce 仅有 f16 变体");
         let name = match hd {
             128 => "vllm_paged_attention_v2_reduce_f16_hd128",
@@ -887,7 +890,7 @@ pub mod attn {
         KernelPick {
             name,
             shape: Shape {
-                grid: (hq as u32, 1, 1),
+                grid: (hq as u32, seqs as u32, 1),
                 block: (128, 1, 1),
                 smem: (2 * nparts * 4) as u32,
             },

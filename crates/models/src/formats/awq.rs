@@ -373,15 +373,30 @@ impl AwqSource {
             match form {
                 QuantForm::Ct { se, ze, .. } => {
                     form_ct = true;
-                    let scale_bytes = &self.maps[se.map_ix][se.start..se.start + se.nbytes];
-                    let scales_f32 = bf16_par(scale_bytes);
-                    let zp_bytes = &self.maps[ze.map_ix][ze.start..ze.start + ze.nbytes];
-                    let zp_i32 = i32s_par(zp_bytes);
+                    // 设备臂分相(2026-10-12 装载提速):原只有 load.mat.ct
+                    // 总账(198ms/层)—— 拆到五段,定谳真凶住哪段。
+                    let scales_f32 = owl_shared::timer_scope!("load.zp.sread", {
+                        let b = &self.maps[se.map_ix][se.start..se.start + se.nbytes];
+                        bf16_par(b)
+                    });
+                    let zp_i32 = owl_shared::timer_scope!("load.zp.zread", {
+                        let b = &self.maps[ze.map_ix][ze.start..ze.start + ze.nbytes];
+                        i32s_par(b)
+                    });
                     self.maps[se.map_ix].dontneed(se.start, se.nbytes);
                     self.maps[ze.map_ix].dontneed(ze.start, ze.nbytes);
-                    s_pack = pack_marlin_s(&scales_f32, out, groups);
-                    let zp_u8 = unpack_zp_ct(&zp_i32, out, groups);
-                    z_buf = pack_marlin_z(&zp_u8, out, groups);
+                    s_pack = owl_shared::timer_scope!(
+                        "load.zp.spack",
+                        pack_marlin_s(&scales_f32, out, groups)
+                    );
+                    let zp_u8 = owl_shared::timer_scope!(
+                        "load.zp.unpack",
+                        unpack_zp_ct(&zp_i32, out, groups)
+                    );
+                    z_buf = owl_shared::timer_scope!(
+                        "load.zp.pack",
+                        pack_marlin_z(&zp_u8, out, groups)
+                    );
                 }
                 QuantForm::F16 { we } => {
                     let wb = &self.maps[we.map_ix][we.start..we.start + we.nbytes];
