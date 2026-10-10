@@ -863,6 +863,33 @@ mod tests {
         TensorOps::of_block(b.id, Dtype::F16, shape)
     }
 
+    /// v2 decode scratch(**生产 decode 臂必需**;台账 §11.8):v1 分页核无
+    /// kNHD 变体,拿它读 kNHD 池 = 静默读错(层侧已有 fail-fast 守卫)。
+    /// `nparts = ceil(nb·page/512)` 与 engine StatePool 同式(PARTITION=512)。
+    async fn v2_scratch(
+        client: &mut owl_cuda::GpuClient,
+        hq: usize,
+        hd: usize,
+        nb: usize,
+        page: usize,
+    ) -> crate::module::AttnV2Scratch {
+        let nparts = (nb * page + 511) / 512;
+        crate::module::AttnV2Scratch {
+            exp_sums: zero_block(client, hq * nparts, vec![1, hq * nparts]).await,
+            max_logits: zero_block(client, hq * nparts, vec![1, hq * nparts]).await,
+            tmp_out: zero_block_f16(client, hq * nparts * hd, vec![hq * nparts * hd]).await,
+            nparts,
+            seqs: 1,
+        }
+    }
+
+    /// decode ctx 装配**生产面**(v2 scratch + qkv 融合插池;与 engine
+    /// 发射同构)。README:只动 attn 面 —— GDN 档不在本工单范围。
+    fn prod_decode_attn(ctx: &mut ForwardCtx, scratch: &crate::module::AttnV2Scratch) {
+        ctx.attn_v2 = Some(scratch.clone());
+        ctx.env.attn.qkv_fuse = true;
+    }
+
     /// CPU face 真权重装载(非门控;验源/约定/内存,不验 CUDA)
     #[tokio::test]
     async fn cpu_real_weights_load() {
@@ -921,6 +948,8 @@ mod tests {
         }
         let kvs = mk_kvs;
         let gdns = mk_gdns;
+        // 生产 decode 面(v2 scratch + qkv 融合;台账 §11.8)
+        let scratch = v2_scratch(&mut gpu, 8, 256, 1, 32).await;
 
         // (装载即校验已有专测 gpu_vram_manifest_checksum;此处二次装载
         //  在 f16 时代 = F32 ctx 污染权重 + 双倍耗时,F5-2 删)
@@ -973,7 +1002,8 @@ mod tests {
                     slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot])),
                 })
                 .collect();
-            let base_ctx = ForwardCtx::model_decode(1, &pos_t, &kvs_step, &rp, &gdns_step);
+            let mut base_ctx = ForwardCtx::model_decode(1, &pos_t, &kvs_step, &rp, &gdns_step);
+            prod_decode_attn(&mut base_ctx, &scratch);
             // ── 律 25(候选):带状态观测禁重放 —— 整模单树**单遍**归约,
             // tap 层根曲线代替旧逐层 harvest(旧法每层整链重放,GDN 状态
             // 被观测行为污染,读数不可信 —— interpreter-tap.md §一)。
@@ -1274,6 +1304,12 @@ mod tests {
         let prompt: Vec<f32> = [985.0, 4123.0, 711.0, 2023.0, 1546.0, 884.0, 3001.0, 4195.0]
             .iter().map(|v| *v).collect();
 
+        // 参考臂 = **生产 decode 面**(v2 scratch + qkv 融合插池;与 engine
+        // 发射同构)。⚠️ 此前本臂走 v1(`attn_v2 = None`)= 参考自身错:
+        // v1 核只有 classic 实例化,读 kNHD 池 = 静态读错元素,实测差 2×
+        // (台账 §11.8 定谳;层侧已加 fail-fast 守卫)。
+        let scratch = v2_scratch(&mut gpu, 8, HD, 1, 32).await;
+
         // 参考:T 次 decode 步(单序列:gdn 恒 0,kv 行 = t)
         let mut ref_rows: Vec<Vec<f32>> = Vec::new();
         for t in 0..t_len {
@@ -1299,7 +1335,8 @@ mod tests {
                     slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
                 })
                 .collect();
-            let ctx = ForwardCtx::model_decode(1, &pos_t, &kvs_step, &rp, &gdns_step);
+            let mut ctx = ForwardCtx::model_decode(1, &pos_t, &kvs_step, &rp, &gdns_step);
+            prod_decode_attn(&mut ctx, &scratch);
             let logits = model.forward(&ids, &ctx);
             ref_rows.push(crate::testkit::harvest_f16(&mut gpu, &logits).await);
         }
@@ -1375,7 +1412,8 @@ mod tests {
                     slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
                 })
                 .collect();
-            let ctx = ForwardCtx::model_decode(1, &pos_t, &kvs_step, &rp, &gdns_step);
+            let mut ctx = ForwardCtx::model_decode(1, &pos_t, &kvs_step, &rp, &gdns_step);
+            prod_decode_attn(&mut ctx, &scratch);
             let logits = model.forward(&ids1, &ctx);
             let row = crate::testkit::harvest_f16(&mut gpu, &logits).await;
             next = row.iter().enumerate()
@@ -1440,8 +1478,10 @@ mod tests {
             let mut v = Vec::new();
             for _ in 0..6 {
                 v.push(KvBuffers {
-                    k_cache: zero_block(&mut gpu, kv_len, vec![nb, HKV, HD / 8, 32, 8]).await,
-                    v_cache: zero_block(&mut gpu, kv_len, vec![nb, HKV, HD, 32]).await,
+                    // ⚠️ f16 池(KV/attn 核契约 = f16;原 f32 `zero_block`
+                    // 让 v1 读半字 = 全零池 → 冒烟只证“不崩”不证“算对”)
+                    k_cache: zero_block_f16(&mut gpu, kv_len, vec![nb, HKV, HD / 8, 32, 8]).await,
+                    v_cache: zero_block_f16(&mut gpu, kv_len, vec![nb, HKV, HD, 32]).await,
                     slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
                     kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0])),
                     block_tables: TensorOps::of_block(bt.id, Dtype::F32, vec![1, nb]),
@@ -1465,6 +1505,9 @@ mod tests {
         };
 
         eprintln!("[smoke] buffers ok; 两步 decode...");
+        // 生产 decode 面(v2 scratch + qkv 融合;台账 §11.8:v1 臂无 kNHD
+        // 变体,层侧已加 fail-fast 守卫)
+        let scratch = v2_scratch(&mut gpu, 8, HD, nb, 32).await;
         // 两步 decode(tokenizer 未接,任意合法 id;验证数值健康与状态推进)
         let steps = [(985.0f32, 0.0f32, 0.0f32, 1.0f32), (4123.0, 1.0, 1.0, 2.0)];
         let mut prev_top: Option<usize> = None;
@@ -1491,7 +1534,8 @@ mod tests {
                     slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot])),
                 })
                 .collect();
-            let ctx = ForwardCtx::model_decode(1, &pos_t, &kvs_step, &rp, &gdns_step);
+            let mut ctx = ForwardCtx::model_decode(1, &pos_t, &kvs_step, &rp, &gdns_step);
+            prod_decode_attn(&mut ctx, &scratch);
             let logits = model.forward(&ids, &ctx);
             assert_eq!(logits.shape(), &[1, VOCAB]);
             // f16 logits(F5 整模切换):harvest_f16 解码回 f32(top 判读口径不变)

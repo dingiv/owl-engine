@@ -12,7 +12,6 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -20,20 +19,8 @@ const PORT: u16 = 8135;
 const HEALTH_TIMEOUT_SECS: u64 = 180;
 const REQ_TIMEOUT_SECS: u64 = 300;
 
-const CONFIG: &str = r#"
-[model]
-dir = "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
-dflash2_dir = "/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16"
-name = "qwen3.8-27b"
-[runtime]
-device = 1
-max_seq = 8448
-[pool]
-pool_tokens = 8704
-gdn_slots = 8
-[dispatch]
-prefill_split = true
-"#;
+/// server 配置(testdata/server/e2e-27b.toml;口径来由见该文件头注)
+const CONFIG: &str = include_str!("../../../testdata/server/e2e-27b.toml");
 
 struct ServerGuard {
     _child: Child, // Drop 时 kill
@@ -166,6 +153,7 @@ fn e2e_server_suite() {
         c.to_lowercase().contains("paris"),
         "常识 Paris content 应含 Paris:{c}"
     );
+    let paris_c = c.clone(); // L3 判据用本应答(原误用后续多轮应答)
     println!("[L2] 常识 Paris PASS");
 
     // 算术:2+2 —— 已知问题记录(§三十三):短 prompt 下 think 混乱
@@ -208,7 +196,7 @@ fn e2e_server_suite() {
     // ============ L3 最终答案面(已知 bug 记录:xfail)============
     // `</think>` 后的最终答案当前损坏(N/A/"[";§三十二):think 推理正确
     // (含 Paris)但最终答案段不含。修复后本断言转正。
-    let after_think = c
+    let after_think = paris_c
         .split_once("</think>")
         .map(|(_, tail)| tail.to_string())
         .unwrap_or_default();
@@ -224,6 +212,11 @@ fn e2e_server_suite() {
 
     // ============ 会话隔离(自含 codeword;owl 服务端 session = KV 复用键,
     // 历史由客户端拼 → 跨 session 天然隔离;此用例测独立 session 应答正确性)
+    // ⚠️ 2026-10-13 修正(原轮 2 只发新句 = 违反契约,必红):服务端**不存
+    // 对话历史**(瘦服务端,见 docs/arch/server-多会话并发设计.md §2.2;
+    // session.rs 头注:"引擎感知 session" = KV cache 区域 + 会话 token 账,
+    // 不是服务端记忆)→ 多轮必须按 OpenAI 惯例**客户端拼全量 messages**;
+    // 引擎仅按 token 账前缀守卫做增量 prefill(失配回退全量,S1)。
     let (_, v) = chat(
         "e2e-iso-a",
         "The magic word is PURPLE. What is the magic word? Answer with just the word.",
@@ -241,11 +234,22 @@ fn e2e_server_suite() {
     );
     assert_eq!(st, 200, "隔离 B 轮1 200");
     assert!(!content_of(&v).is_empty(), "隔离 B 轮1 非空");
-    let (_, v) = chat(
-        "e2e-iso-b",
-        "What was the magic word I told you? Answer with just the word.",
-        256,
-    );
+    // 轮 2:契约姿势 —— 全量历史重发(assistant 段原样回填轮 1 应答,
+    // = 真实 OpenAI 客户端行为);同 session 保 GDN 格/KV 块连续性
+    let turn1 = content_of(&v);
+    let body = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "The magic word is ORANGE. Say READY."},
+            {"role": "assistant", "content": turn1},
+            {"role": "user", "content": "What was the magic word I told you? Answer with just the word."}
+        ],
+        "max_tokens": 256,
+        "session": "e2e-iso-b"
+    });
+    let (status, resp) = http_post("/v1/chat/completions", &body.to_string());
+    let v: serde_json::Value = serde_json::from_str(&resp)
+        .unwrap_or_else(|e| panic!("隔离 B 轮2 响应非法 JSON({status}): {e}"));
+    assert_eq!(status, 200, "隔离 B 轮2 HTTP 200");
     let cb = content_of(&v);
     assert!(
         cb.to_lowercase().contains("orange"),
@@ -280,6 +284,25 @@ fn e2e_server_suite() {
         assert!(ok, "并发 {i} 应答应含魔数 {}", 1000 + i);
     }
     println!("[并发] 8 线程并发独立 session 全 PASS(闸门/隔离回归)");
+
+    // ============ 诊断面(非判据):前缀复用命中统计 ============
+    // 服务端 `[dflash] prefill encode N rows @M`:M>0 = 会话守卫命中 →
+    // 增量 prefill(新 KV 架构的 block 复用 + 快照 + 跨轮 GDN 连续路径)。
+    // 只打印不进断言(命中取决于重发前缀是否逐字节相等 + 页粒度)。
+    if let Ok(log) = std::fs::read_to_string(std::env::temp_dir().join("owl-e2e-server.log")) {
+        let (mut hit, mut full) = (0usize, 0usize);
+        for l in log.lines().filter(|l| l.contains("prefill encode")) {
+            match l
+                .rsplit_once('@')
+                .and_then(|(_, r)| r.split_whitespace().next())
+                .and_then(|n| n.parse::<usize>().ok())
+            {
+                Some(0) | None => full += 1,
+                Some(_) => hit += 1,
+            }
+        }
+        println!("[前缀复用] 全量 prefill {full} 次 / 增量 prefill(复用命中) {hit} 次");
+    }
 
     println!("\nE2E 套件 RUN:L1 协议面 = 回归防护(强断言);L2/L3/多轮 = 语义判据记录(已知问题清单见上,修复后逐条转 assert)");
 }

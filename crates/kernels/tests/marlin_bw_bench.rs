@@ -5,6 +5,12 @@
 //! 图内空隙 —— 微基准脱离图/发射器,单核直测。
 //! 垃圾位型:qweight/zeros 全 0x某常数(nibble 定值,dequant 数值
 //! 不发散即可;计时与数值无关)。无 GPU 跳过(OWL_TEST_DEVICE)。
+//!
+//! ⚠️ 编译门(2026-10-13):本文件引 `family::marlin`,该模块受
+//! `marlin` feature 门控 —— 缺此 `cfg` 则默认 `cargo test -p owl-kernels`
+//! (features = [])在**编译期**报 E0433(与 `#[ignore]` 无关:ignore 只跳
+//! 运行,不跳编译)。同 `ops_*_isolation` 的 `feature = "device"` 先例。
+#![cfg(feature = "marlin")]
 
 use cudarc::driver::{CudaContext, DevicePtr};
 

@@ -242,3 +242,40 @@
   两套手写编排必然漂移(本案 golden 喂 gcum、handler 喂 raw g 能各自为政
   正是平行实现的锅)→ 终态 = 金标跑**真实 runtime**(operator-contract
   设计 §4.10)。
+
+## 20. `#[ignore]` 不跳编译 —— feature 门控模块的测试文件要文件级 `#![cfg]`(2026-10-13)
+
+- **案**:`crates/kernels/tests/marlin_bw_bench.rs` 引 `family::marlin`,而该
+  模块受 `feature = "marlin"` 门控;`owl-kernels` 默认 features = `[]` →
+  **整个 `cargo test -p owl-kernels` 在编译期 E0433**(与文件里那行
+  `#[ignore = "bench: …"]` 无关)。
+- **律**:`#[ignore]` 只影响**运行**筛选,文件仍进编译面;测试文件引
+  feature 门控模块时,首行必须 `#![cfg(feature = "…")]`(先例:
+  `ops_cublas_isolation.rs` / `ops_gdn_chunked_chain.rs` 的 `feature = "device"`)。
+- 危害等级高:带 `--features X` 跑的人看不到,只有默认档整包红。
+
+## 21. 测试构造的 ctx ≠ 生产 ctx = 静默错值高危区(2026-10-13,kNHD §11.8)
+
+- **案**:`gpu_real_weights_prefill` 用 `ForwardCtx::model_decode(…)`(即
+  `EnvProvider::default()` = **全 opt-in 关** 基线)当"参考臂",而生产
+  `DispatchCfg` 默认 `qkv_fuse / gdn_fused_decode / gdn_fused_decode_v2` **全真**。
+  于是测试的 decode 落到防御臂 `paged_decode_v1_k0`,而 **v1 分页核没有
+  kNHD 变体**(4 个 v1 名全是 classic 取址;8 个 `_knhd` 全在 v2)→ 拿 classic
+  交错地址读 kNHD 池 = 静默读错元素(logits 差 ~2×),一整个轮次被当成
+  "prefill 路径不等价"立案。
+- **律**:凡「测试跑 A 臂、生产跑 B 臂」的断言,先核**参考臂是不是生产臂**;
+  ctx 装配应走与 engine 同形的构造器/helper(本仓 = `prod_decode_attn`:
+  `attn_v2` + `qkv_fuse`),不要把 `EnvProvider::default()` 当生产基线。
+- **配套**:层侧对「已无变体的臂」加 fail-fast 断言(kNHD + v1 → panic),
+  把静默错值升级为响错 —— 不能被静默炸第二回。
+
+## 22. 归因二选一时,"参考臂自身可疑"必须是候选(2026-10-13;与 §18 同源)
+
+- **案**:§11.8 观测「classic 绿 / knhd 红」,当时只在**被测侧**(prefill 臂)
+  找原因;而该观测同样兼容「参考侧(decode 臂)在 knhd 下坏掉」。实验一击
+  定谳:注入生产 `AttnV2Scratch` 后本门转绿 → 参考才是真凶。
+- **律**:A/B 判别出「布局相关」之后,先问**两侧谁在布局下会变**;被测物与
+  参考物都可能布局敏感(尤其参考物复用了同一条产品代码路径)。
+- 注意区分 §18(同源对拍对不出双错):本条不是"双错互证",而是**单侧错、
+  且错在参考侧** —— 症状与"被测错"完全同形。对拍前的第一句永远是
+  **「先证参考清白」**(2026-10-02 k-probe 头注已立此律,本轮二度应验)。

@@ -288,6 +288,21 @@ impl Attention {
         pol: &crate::module::KvPagedPolicy,
     ) -> TensorOps {
         let dt = q.dtype;
+        // ── 布局守卫(2026-10-13,kNHD 翻转收尾;台账 §11.8)─────────
+        // v1 核**只有 classic 实例化**:`.cu` 里 `vllm_paged_attention_v1_f16_*`
+        // 四个全是 classic 取址([hkv, hd/x, page, x] 交错),而八个 `_knhd`
+        // 变体**全在 v2**(`grep 'v1.*knhd'` = 0 命中;v1 核体虽带 KNHD 模板
+        // 参,宿主无条件选 classic 名)。拿 v1 读 kNHD 池(host 传
+        // head_stride = hd) = 静默读错元素,实测 logits 差 ~2×、窄边际必翻。
+        // 生产由 engine 恒注入 `ctx.attn_v2`(engine.rs:452 / state.rs:301)
+        // → 本臂不可达;本断言把「将来某路径忘注入 scratch」从**静默错值**
+        // 改成**响错**(那天 §11.8 就是被这个静默炸给自己人埋了一轮)。
+        assert_eq!(
+            ctx.env.kv.layout,
+            crate::env::KvLayout::Classic,
+            "paged decode v1 臂无 kNHD 变体(仅 v2 有);kNHD 池必须在 \
+             ctx.attn_v2 注入 AttnV2Scratch 走 v2 —— engine 生产路径恒注入"
+        );
         let page = pol.page as i32;
         // v1 分页打分(不写 cache;context_lens = kv_lens)
         let scale = 1.0 / (self.hd as f32).sqrt();
@@ -1444,12 +1459,34 @@ mod f16_tests {
         let xs_bytes = halfb(&xs_f32);
 
         // ── A 臂:默认分派(norm_rope + K0;pos=t)──
+        // ⚠️ 读面统一走**生产 v2**(2026-10-13,台账 §11.8):v1 分页核无
+        // kNHD 变体,而本门是**写核**门(A/B 差只应由写核贡献),读侧跟着
+        // 走 v1 = 两个错对消的假绿 + 层侧 fail-fast 守卫会先炸。
+        let scratch = {
+            let nparts = (nb * page + 511) / 512;
+            let es = crate::interpreters::eval_ops(
+                TensorOps::zeros(Dtype::F32, vec![1, hq * nparts]).step(), &mut gpu)
+                .await.expect("v2 exp_sums");
+            let ml = crate::interpreters::eval_ops(
+                TensorOps::zeros(Dtype::F32, vec![1, hq * nparts]).step(), &mut gpu)
+                .await.expect("v2 max_logits");
+            let to = crate::interpreters::eval_ops(
+                TensorOps::zeros(Dtype::F16, vec![hq * nparts * hd]).step(), &mut gpu)
+                .await.expect("v2 tmp_out");
+            crate::module::AttnV2Scratch {
+                exp_sums: TensorOps::of_block(es.id, Dtype::F32, vec![1, hq * nparts]),
+                max_logits: TensorOps::of_block(ml.id, Dtype::F32, vec![1, hq * nparts]),
+                tmp_out: TensorOps::of_block(to.id, Dtype::F16, vec![hq * nparts * hd]),
+                nparts,
+                seqs: 1,
+            }
+        };
         let kc_shape = vec![nb, hkv, hd / x, page, x];
         let pool_a = kprobe_run_arm(&attn, &rp, &xs_bytes, t_len, hidden, hkv, hd, page,
-            false, false, &kc_a, &vc_a, &kc_shape, &mut gpu).await;
+            false, false, &kc_a, &vc_a, &kc_shape, &scratch, &mut gpu).await;
         // ── B 臂:融合分派(pos=t)──
         let pool_b = kprobe_run_arm(&attn, &rp, &xs_bytes, t_len, hidden, hkv, hd, page,
-            false, true, &kc_b, &vc_b, &kc_shape, &mut gpu).await;
+            false, true, &kc_b, &vc_b, &kc_shape, &scratch, &mut gpu).await;
         // ── C 臂:融合分派 + pos≡0(θ=0 → 池内容 = 纯 norm 输出,与 rope 解耦)──
         let kc_c = crate::interpreters::eval_ops(
             TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd / x, page, x]).step(), &mut gpu)
@@ -1458,7 +1495,7 @@ mod f16_tests {
             TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd, page]).step(), &mut gpu)
             .await.expect("vc_c");
         let pool_c = kprobe_run_arm(&attn, &rp, &xs_bytes, t_len, hidden, hkv, hd, page,
-            true, true, &kc_c, &vc_c, &kc_shape, &mut gpu).await;
+            true, true, &kc_c, &vc_c, &kc_shape, &scratch, &mut gpu).await;
 
         // ── host 金标 G ──
         let kw: Vec<f32> = src["k_proj"].iter().map(|&v| f16r(v)).collect();
@@ -1569,6 +1606,7 @@ mod f16_tests {
         kc: &crate::contract::Bytes,
         vc: &crate::contract::Bytes,
         kc_shape: &[usize],
+        scratch: &crate::module::AttnV2Scratch,
         gpu: &mut D,
     ) -> Vec<u8> {
         for t in 0..t_len {
@@ -1586,6 +1624,7 @@ mod f16_tests {
             };
             let mut ctx = ForwardCtx::decode(1, &pos_t, &kv, rp);
             ctx.env.attn.qkv_fuse = qkv_fuse;
+            ctx.attn_v2 = Some(scratch.clone()); // 读面 = 生产 v2(§11.8)
             let decl = attn.forward(&x_t, &ctx);
             let _ = crate::testkit::harvest_f16(gpu, &decl).await;
         }

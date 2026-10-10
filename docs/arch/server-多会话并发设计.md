@@ -94,3 +94,18 @@ gdn_slots = 8          # GDN 状态格(= 活跃会话上限;生产 flavor 锁 1 
   字段)已落,server 消费迁移挂账。
 - **`</think>` 后答案段偶发空/N/A**(L3 known-bug):格式约束任务的
   模型行为,判据已分级(soft 断言);深挖另案。
+- **🔴 前缀复用零命中(2026-10-13 立案,上层挂账)**:e2e 17 个请求
+  **全部全量 prefill(`@0`)**,三条路分开的账:
+  - *同会话守卫*:**结构性命中不了** —— `render_prompt` 给末尾注入
+    `<|im_start|>assistant\n<think>\n` 预填,而该 `<think>` 不在 API 返回的
+    `content` 里;客户端原样回填 assistant 后渲染出
+    `<|im_start|>assistant\n{content}…`,从 assistant 轮起点起与进 KV 的
+    token 逐 id 不同 → `guard()` 必失配 → S1 全量重算。修法 A/B/C 见
+    `apps/server/src/openai.rs::render_prompt` 头注 FIXME。
+  - *跨会话块级缓存*:**只是配置关着** —— `pool.prefix_cache` 默认 true,
+    但 `awq27b`/`spec-dflash` flavor 锁 false → `enable_prefix_cache()`
+    不被调。开它 + 补「长共享前缀命中 + 输出与全量重算逐字一致」等价门。
+  - *机制本体*:**已验**——`crates/engine/src/tests.rs::gpu_prefix_cache_hit`
+    (300 tok 共享前缀跨会话:块链物理共享 + B 的 prefill chunk ≪ A)。
+  - 诊断面:e2e 末尾已打 `[前缀复用] 全量 N / 增量 M`;服务端可开
+    `[probes] debug = true`(`[dbg prefix] match = N blocks`)+ `OWL_PROMPT_DUMP=1`。

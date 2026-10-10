@@ -70,6 +70,36 @@ impl ChatMessage {
 /// **TODO(正式模板)**:多轮 chat template 渲染 —— 现状跨 turn 前缀
 /// 一般不逐字节相等 → 引擎前缀守卫失配回退全量重算(正确性保住,
 /// 缓存命中待模板落地;信息不丢,记忆可通)
+// ════════════════════════════════════════════════════════════════════
+// FIXME(prefix-reuse, 2026-10-13 立案,**上层挂账 —— 不阻塞下层 KV 布局工单**):
+// 渲染**非对称** → 同会话前缀守卫结构性命中不了(实测 e2e 17/17 全 `@0`):
+//   ① 本函数给末尾起手注入 `<|im_start|>assistant\n<think>\n` 预填;
+//   ② 该 `<think>` **不在 API 返回的 content 里**(生成从它之后开始);
+//   ③ 客户端按 OpenAI 惯例原样回填 assistant 后,渲染出
+//      `<|im_start|>assistant\n{content}…` —— 从 assistant 轮起点起就与
+//      轮 1 进 KV 的 token(`<think>`/`\n`/正文)逐 id 不同
+//      → `AgentSession::guard()` 必失配 → S1 全量重算。
+// 影响:同 session 多轮**永远零增量 prefill**(§三十五“前缀缓存红利”未兜现)。
+//
+// 注:三条路分开的账(别混):
+//   · 同会话守卫 = 本 FIXME(渲染对齐);
+//   · 跨会话块级缓存 = **只是配置**:`pool.prefix_cache` 默认 true 但
+//     `awq27b`/`spec-dflash` flavor 锁 false → `enable_prefix_cache()` 不调;
+//     消除开它 + 补“长共享前缀命中 + 输出与全量重算逐字一致”等价门(真值门);
+//   · 机制本体 **已验**(`crates/engine/src/tests.rs::gpu_prefix_cache_hit`
+//     300 tok 共享前缀跨会话,块链物理共享 + prefill chunk ≪ 全量)。
+//
+// 候选修法(优先序):
+//   A. 历史 assistant 段改成 `<|im_start|>assistant\n<think>\n{text}<|im_end|>\n`
+//      (把预填的 think 开块还原回去 = Qwen 官方模板 `preserve_thinking` 语义,
+//      与 vLLM 侧 chat_template.jinja 补丁同源)—— 需同时验“content 重编码
+//      逐 id == 生成 id”(tokenizer 往返);
+//   B. 响应回传 `prompt_token_ids`/`token_ids`(vLLM 扩展),客户端原样带回;
+//   C. 不改同会话,只把复用主战场放跨会话块级缓存(见上一段)。
+// 定谳实验(未做):`OWL_PROMPT_DUMP=1` 起 server → 两轮(轮 2 原样回填 content)
+//   → 比两份 `/tmp/owl-prompt-*.txt` 的 token 前缀,把失配点钉到字节。
+// ════════════════════════════════════════════════════════════════════
+/// OpenAI messages → 单字符串 prompt(Qwen chat 模板 + 末尾 assistant 起手)。
 pub fn render_prompt(msgs: &[ChatMessage]) -> String {
     // 多轮 Qwen chat 模板渲染(2026-10-13;§三十二:naive 拼接 + chat_wrap
     // 单轮包裹 = 多轮幻觉/指令服从崩坏根因,raw A/B 臂定谳)。

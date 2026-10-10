@@ -92,6 +92,13 @@ impl<D: DeviceClient> RunningEngine<D> {
                     .expect("submit 已建会话账");
                 // ⚠️ 新会话(空账)guard 恒真 —— cached_len == 0 必须落到
                 // 前缀匹配分支(跨会话内容复用正是新会话的场景)
+                // TODO(prefix-reuse, 2026-10-13):同会话 guard 经 OpenAI
+                // 协议**结构性命中不了** —— server 渲染注入的 `<think>`
+                // 预填不在回填的 content 里,前缀从 assistant 轮起点即错位
+                // (实测 e2e 17/17 全 `@0`)。账与修法见
+                // `apps/server/src/openai.rs::render_prompt` 头注 FIXME
+                // (上层挂账,不阻塞 KV 布局工单 —— 守卫本体是好的:
+                // 直连引擎 / token 级续写的调用方仍能命中)。
                 if s.guard(&turn.prompt_ids) && s.cached_len > 0 {
                     (s.cached_len, s.gdn_slot, None)
                 } else if self.pool.paged {
