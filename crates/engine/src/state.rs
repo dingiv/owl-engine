@@ -115,12 +115,8 @@ pub(crate) struct StatePool {
     /// GDN 画像 dump 全槽(knobs.gdn_dump_all)
     pub(crate) dump_all: bool,
     pub(crate) kvs: Vec<KvBlocks>,
-    /// FlashInfer K/V 影子池(owl_reshape_and_cache_dual_f16(_fp8kv) 写;
-    /// OWL_FLASHINFER=1 时分配,否则空)
-    pub(crate) k_fis: Vec<BlockN>,
-    pub(crate) v_fis: Vec<BlockN>,
-    /// 影子量化档(None = f16 双宽;Fp8E4M3 = e4m3 单宽)
-    pub(crate) fi_quant: Option<owl_models::env::KvQuant>,
+    /// FI 直读旗标(统一契约 P3:影子池删除,FI 直读主池 kNHD 叶子)
+    pub(crate) fi_face: bool,
     /// B6.2:主 KV 池 fp8 e4m3 承载(true = 池块 U32 字节承载 1B/elem;
     /// 读核走 *_fp8 变体,写核 K0 转换写)
     pub(crate) kv_fp8: bool,
@@ -234,8 +230,6 @@ impl StatePool {
         let nb = paged.then(|| pool_tokens.div_ceil(page)).unwrap_or(nb).max(nb);
 
         let mut kvs: Vec<KvBlocks> = Vec::new();
-        let mut k_fis: Vec<BlockN> = Vec::new();
-        let mut v_fis: Vec<BlockN> = Vec::new();
         for _ in 0..n_full {
             // B6.2:fp8 池 = U32 字节承载 1B/elem(元素数不变,块大小减半);
             // 读核 *_fp8 变体读入即转 half,写核 K0 转换写
@@ -287,25 +281,7 @@ impl StatePool {
         } else {
             None
         };
-        if let Some(kq) = plan.fi {
-            // 影子池 [nb, page, Hkv, hd]:f16 = 2B/elem;fp8 = 1B/elem
-            // (U32 块承载字节:elems = bytes/4,page 32 因子保证 4 整除)
-            match kq {
-                owl_models::env::KvQuant::None => {
-                    for _ in 0..n_full {
-                        k_fis.push(zero_block_dt(face, nb * dims.hkv * dims.hd * page, dims.dtype).await?);
-                        v_fis.push(zero_block_dt(face, nb * dims.hkv * dims.hd * page, dims.dtype).await?);
-                    }
-                }
-                owl_models::env::KvQuant::Fp8E4M3 => {
-                    for _ in 0..n_full {
-                        let n_u32 = nb * dims.hkv * dims.hd * page / 4;
-                        k_fis.push(zero_block_dt(face, n_u32, Dtype::U32).await?);
-                        v_fis.push(zero_block_dt(face, n_u32, Dtype::U32).await?);
-                    }
-                }
-            }
-        }
+        // 影子池已删(统一契约 P3:kNHD 单池,FI 直读主池叶子)
         // 块表持久块(E2b):内容 = 活跃会话块链,turn 切换/增长时重写
         // (write_bt;图烘焙 bt 指针,指针稳定图不重捕);legacy = 哑表
         let bt = if paged {
@@ -400,7 +376,7 @@ impl StatePool {
         } else {
             None
         };
-        Ok(StatePool { gdn_slots, dump_all, kvs, k_fis, v_fis, fi_quant: plan.fi, verify_attn_v2,
+        Ok(StatePool { gdn_slots, dump_all, kvs, fi_face: plan.fi.is_some(), verify_attn_v2,
             kv_fp8, dflash_fp8, gdns, snaps, snap_tick: 0, bt, bt_mtp, spec_snap, mtp_kvs, dflash_kvs, attn_v2, page, nb, paged, x, dims })
     }
 
@@ -571,38 +547,11 @@ impl StatePool {
             .collect()
     }
 
-    /// FlashInfer K/V 影子叶子(kNHD;OWL_FLASHINFER=1 时非空)。
-    /// fp8 档:块为 U32 字节承载,leaf = 扁平 [bytes/4](FI 只吃指针,
-    /// leaf shape 仅为账长;f16 档:真实几何 [nb, page, Hkv, hd])
+    /// FlashInfer K/V 叶子(统一契约 P3:影子池删除,直读主池 kNHD;
+    /// 签名保持 = FI 通道上层零改动;fp8 档 = U32 扁平字节账叶,FI 只吃指针)
     pub(crate) fn kv_fi_leaves(&self) -> Vec<(TensorOps, TensorOps)> {
-        match self.fi_quant {
-            Some(owl_models::env::KvQuant::Fp8E4M3) => {
-                let shape = vec![self.nb * self.page * self.dims.hkv * self.dims.hd / 4];
-                self.k_fis
-                    .iter()
-                    .zip(self.v_fis.iter())
-                    .map(|(k, v)| {
-                        (
-                            block_leaf_dt(&k.0, shape.clone(), Dtype::U32),
-                            block_leaf_dt(&v.0, shape.clone(), Dtype::U32),
-                        )
-                    })
-                    .collect()
-            }
-            _ => {
-                let shape = vec![self.nb, self.page, self.dims.hkv, self.dims.hd];
-                self.k_fis
-                    .iter()
-                    .zip(self.v_fis.iter())
-                    .map(|(k, v)| {
-                        (
-                            block_leaf_dt(&k.0, shape.clone(), self.dims.dtype),
-                            block_leaf_dt(&v.0, shape.clone(), self.dims.dtype),
-                        )
-                    })
-                    .collect()
-            }
-        }
+        self.kv_caches()
+
     }
 
     /// D1 取证:会话格 GDN 状态画像(整块回读 → 活跃格行 maxabs/sum/首值。

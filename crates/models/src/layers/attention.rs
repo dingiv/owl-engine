@@ -307,7 +307,7 @@ impl Attention {
         .arg_i32(nb as i32)
         .arg_i32(self.hq as i32 * self.hd as i32) // q_stride
         .arg_i32(self.hkv as i32 * self.hd as i32 * page) // kv_block_stride
-        .arg_i32(self.hd as i32 * page) // kv_head_stride
+        .arg_i32(ctx.env.kv.kv_head_stride(self.hd, page)) // kv_head_stride(布局单源)
         .arg_f32(1.0) // softscapping 直通
         .arg_i32(-1) // sliding_window 关
         .arg_i32(0) // use_alibi 关
@@ -367,7 +367,7 @@ impl Attention {
             .arg_i32(nb as i32)
             .arg_i32(self.hq as i32 * self.hd as i32) // q_stride
             .arg_i32(self.hkv as i32 * self.hd as i32 * page) // kv_block_stride
-            .arg_i32(self.hd as i32 * page) // kv_head_stride
+            .arg_i32(ctx.env.kv.kv_head_stride(self.hd, page)) // kv_head_stride(布局单源)
             .arg_f32(1.0) // softscapping 直通
             .arg_i32(-1) // sliding_window 关
             .arg_i32(0) // use_alibi 关
@@ -450,7 +450,7 @@ impl Attention {
             .arg_i32(nb as i32)
             .arg_i32(self.hq as i32 * self.hd as i32)
             .arg_i32(self.hkv as i32 * self.hd as i32 * page)
-            .arg_i32(self.hd as i32 * page)
+            .arg_i32(ctx.env.kv.kv_head_stride(self.hd, page))
             .arg_f32(1.0)
             .arg_i32(-1)
             .arg_i32(0)
@@ -552,7 +552,7 @@ impl Attention {
         .arg_i32(-1) // sliding_window 关
         .arg_i32(nb as i32) // total_num_blocks
         .arg_i32(self.hkv as i32 * self.hd as i32 * page) // kv_block_stride
-        .arg_i32(self.hd as i32 * page) // kv_head_stride
+        .arg_i32(ctx.env.kv.kv_head_stride(self.hd, page)) // kv_head_stride(布局单源)
         .arg_i32(0) // use_alibi 关
         .arg_i32(0) // use_sinks 关
         .with_shape(dt, vec![tokens, self.hq * self.hd]);
@@ -620,7 +620,7 @@ impl Attention {
         .arg_i32(ctx.ctx_base as i32)
         .arg_i32(nparts as i32)
         .arg_i32(self.hkv as i32 * self.hd as i32 * page) // kv_block_stride
-        .arg_i32(self.hd as i32 * page) // kv_head_stride
+        .arg_i32(ctx.env.kv.kv_head_stride(self.hd, page)) // kv_head_stride(布局单源)
         .arg_i32(page)
         .arg_i32(self.hq as i32)
         .aux(&[self.hd, self.hkv, self.hq, tokens, nparts])
@@ -668,15 +668,13 @@ impl Attention {
     ) -> TensorOps {
         let dt = q.dtype;
         let page = pol.page as i32;
-        // ① K0-dual:classic K/V + kNHD K/V 影子(f16 或 e4m3;slots = 物理槽表)
-        let wr = TensorOps::call(ctx.env.kv.k0_dual_op())
+        // ① K0 单写主池(统一契约 P3:影子池删除,FI 直读主池;slots = 物理槽表)
+        let wr = TensorOps::call(ctx.env.kv.k0_write_op())
             .aux(&[tokens])
             .arg(k)
             .arg(v)
             .arg(&kv.k_cache)
             .arg(&kv.v_cache)
-            .arg(&fi.kcs[ctx.fi_kvi])
-            .arg(&fi.vcs[ctx.fi_kvi])
             .arg(kv_slots)
             .arg_i32(self.hkv as i32 * self.hd as i32)
             .arg_i32(self.hkv as i32 * self.hd as i32)
@@ -1297,6 +1295,7 @@ mod f16_tests {
                 max_logits: TensorOps::of_block(ml.id, Dtype::F32, vec![1, hq * nparts]),
                 tmp_out: TensorOps::of_block(to.id, Dtype::F16, vec![hq * nparts * hd]),
                 nparts,
+                seqs: 1,
             })
         } else {
             None

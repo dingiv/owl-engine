@@ -895,7 +895,7 @@ inline __device__ float fast_tanh_opt(float x) {
 
 using namespace vllm;
 
-template<int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_CHUNK_SIZE, bool KV_FP8 = false>
+template<int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_CHUNK_SIZE, bool KV_FP8 = false, bool KNHD = false>
 __global__ void chunked_prefill_paged_attention_opt_f16(
     uint16_t* __restrict__ out,              
     const uint16_t* __restrict__ q,          
@@ -1136,7 +1136,13 @@ __global__ void chunked_prefill_paged_attention_opt_f16(
                         int d = k * VEC_SIZE;
                         int gy = d / X;
                         int gx = d % X;
-                        long long k_idx = k_base + b * X + gy * (BLOCK_SIZE * X) + gx;
+                        long long k_idx;
+                        if constexpr (KNHD) {
+                            // 统一契约 P2:页内 [page,hkv,hd] 连续 → d 连续
+                            k_idx = k_base + (long long)b * (kv_block_stride / BLOCK_SIZE) + d;
+                        } else {
+                            k_idx = k_base + b * X + gy * (BLOCK_SIZE * X) + gx;
+                        }
                         if constexpr (KV_FP8) {
                             // B6.3:fp8 e4m3 读入转 half(元素序 = 字节序;
                             // 基址转 u8* 后按元素偏移 —— 勿用 &cache[idx]
@@ -1185,11 +1191,27 @@ __global__ void chunked_prefill_paged_attention_opt_f16(
             L += acc_lane;
 
             for (int k = 0; k < HEAD_SIZE; ++k) {
+                // kNHD:v(b,k) 基址随 token 跨 hkv·hd
+                const long long v_kn_b = v_base + (long long)k;
                 const unsigned char* v_row8 = reinterpret_cast<const unsigned char*>(v_cache) + v_base + (long long)k * BLOCK_SIZE;
                 const uint16_t* v_row = &v_cache[v_base + (long long)k * BLOCK_SIZE];
                 for (int bv = 0; bv < NUM_BLOCK_VECS; bv++) {
                     Float_vec v_val;
-                    if constexpr (KV_FP8) {
+                    if constexpr (KNHD) {
+                        // 统一契约 P2:token 维 gather(kNHD [page,hkv,hd])
+                        __half vt[VEC_SIZE];
+                        #pragma unroll
+                        for (int t = 0; t < VEC_SIZE; t++) {
+                            const long long vi = v_kn_b + (long long)(bv * VEC_SIZE + t) * (kv_block_stride / BLOCK_SIZE);
+                            if constexpr (KV_FP8) {
+                                __nv_fp8_e4m3 e; e.__x = reinterpret_cast<const unsigned char*>(v_cache)[vi];
+                                vt[t] = __half(__nv_cvt_fp8_to_halfraw(e.__x, __NV_E4M3));
+                            } else {
+                                vt[t] = __ushort_as_half(reinterpret_cast<const uint16_t*>(v_cache)[vi]);
+                            }
+                        }
+                        v_val = to_float(*reinterpret_cast<const K_vec*>(vt));
+                    } else if constexpr (KV_FP8) {
                         // B6.3:fp8 V 行读入转 half
                         __half vt[VEC_SIZE];
                         const unsigned char* vp = v_row8 + bv * VEC_SIZE;
@@ -1219,6 +1241,14 @@ __global__ void chunked_prefill_paged_attention_opt_f16(
         for (int k = 0; k < NUM_VECS; k++) {
             *reinterpret_cast<O_vec*>(out + o_off + k * VEC_SIZE) = o_vec[k];
         }
+        if constexpr (KNHD) {
+            if (blockIdx.x == 0 && o_off < 8)
+                printf("[knhd-chunked-W] o_off=%lld o0=%04x o1=%04x L=%f acc=%f\n",
+                       (long long)o_off,
+                       (unsigned)reinterpret_cast<const uint16_t*>(&o_vec[0])[0],
+                       (unsigned)reinterpret_cast<const uint16_t*>(&o_vec[0])[1],
+                       L, acc_vec[0]);
+        }
     }
 
     // Boundary threads are done; they still participate in __syncthreads below
@@ -1235,7 +1265,30 @@ __global__ void chunked_prefill_paged_attention_opt_f16(
         // ALL threads cooperatively load KV into shared memory
         if (valid_block) {
             const long long k_base = (long long)physical_block * kv_block_stride + (long long)kv_head_idx * kv_head_stride;
-            if constexpr (KV_FP8) {
+            if constexpr (KNHD) {
+                // 统一契约 P2:knhd 头板 = [page][hkv,hd](token stride = hkv·hd
+                // = kv_block_stride/BLOCK_SIZE)→ 按目标 smem 布局 [page][hd] 重排
+                const int ts = kv_block_stride / BLOCK_SIZE;
+                if constexpr (KV_FP8) {
+                    const unsigned char* k_src8 = reinterpret_cast<const unsigned char*>(k_cache) + k_base;
+                    const unsigned char* v_src8 = reinterpret_cast<const unsigned char*>(v_cache) + k_base;
+                    for (int i = tid; i < elems_per_block; i += block_dim) {
+                        const int b = i / HEAD_SIZE, d = i % HEAD_SIZE;
+                        __nv_fp8_e4m3 ke; ke.__x = k_src8[(long long)b * ts + d];
+                        __nv_fp8_e4m3 ve; ve.__x = v_src8[(long long)b * ts + d];
+                        k_smem[i] = __half_as_ushort(__nv_cvt_fp8_to_halfraw(ke.__x, __NV_E4M3));
+                        v_smem[i] = __half_as_ushort(__nv_cvt_fp8_to_halfraw(ve.__x, __NV_E4M3));
+                    }
+                } else {
+                    const uint16_t* k_src = k_cache + k_base;
+                    const uint16_t* v_src = v_cache + k_base;
+                    for (int i = tid; i < elems_per_block; i += block_dim) {
+                        const int b = i / HEAD_SIZE, d = i % HEAD_SIZE;
+                        k_smem[i] = k_src[(long long)b * ts + d];
+                        v_smem[i] = v_src[(long long)b * ts + d];
+                    }
+                }
+            } else if constexpr (KV_FP8) {
                 // B6.3:fp8 → f16 转换拷贝(smem 宽度不变,读侧算术复用)
                 const unsigned char* k_src8 = reinterpret_cast<const unsigned char*>(k_cache) + k_base;
                 const unsigned char* v_src8 = reinterpret_cast<const unsigned char*>(v_cache) + k_base;
@@ -1282,7 +1335,12 @@ __global__ void chunked_prefill_paged_attention_opt_f16(
                         int d = k * VEC_SIZE;
                         int gy = d / X;
                         int gx = d % X;
-                        int smem_idx = b * X + gy * (BLOCK_SIZE * X) + gx;
+                        int smem_idx;
+                        if constexpr (KNHD) {
+                            smem_idx = b * HEAD_SIZE + d;
+                        } else {
+                            smem_idx = b * X + gy * (BLOCK_SIZE * X) + gx;
+                        }
                         k_vec_local[k] = *reinterpret_cast<const K_vec*>(&k_smem[smem_idx]);
                     }
                     float qk = Qk_dot<uint16_t, THREAD_GROUP_SIZE>::dot(q_vec, k_vec_local) * sm_scale;
@@ -1320,12 +1378,27 @@ __global__ void chunked_prefill_paged_attention_opt_f16(
                 L += acc_lane;
 
                 for (int k = 0; k < HEAD_SIZE; ++k) {
-                    const uint16_t* v_row_ptr = &v_smem[(long long)k * BLOCK_SIZE];
-                    for (int b_vec = 0; b_vec < NUM_BLOCK_VECS; b_vec++) {
-                        const uint16_t* src = v_row_ptr + b_vec * VEC_SIZE;
-                        Float_vec v_val_vec;
-                        v_val_vec = to_float(*reinterpret_cast<const K_vec*>(src));
-                        acc_vec[k] += dot(p_vec[b_vec], v_val_vec);
+                    if constexpr (KNHD) {
+                        // kNHD smem:[page][hd] token 主序 → 固定 dim 的 token 聚集
+                        // (半位收集后必须 to_float —— 直写 Float_vec 位槽 = 位型当
+                        // 浮点点积 = NaN,2026-10-12 探针实录)
+                        for (int b_vec = 0; b_vec < NUM_BLOCK_VECS; b_vec++) {
+                            K_vec v_bits;
+                            #pragma unroll
+                            for (int t = 0; t < VEC_SIZE; t++) {
+                                const int b = b_vec * VEC_SIZE + t;
+                                reinterpret_cast<uint16_t*>(&v_bits)[t] = v_smem[b * HEAD_SIZE + k];
+                            }
+                            acc_vec[k] += dot(p_vec[b_vec], to_float(v_bits));
+                        }
+                    } else {
+                        const uint16_t* v_row_ptr = &v_smem[(long long)k * BLOCK_SIZE];
+                        for (int b_vec = 0; b_vec < NUM_BLOCK_VECS; b_vec++) {
+                            const uint16_t* src = v_row_ptr + b_vec * VEC_SIZE;
+                            Float_vec v_val_vec;
+                            v_val_vec = to_float(*reinterpret_cast<const K_vec*>(src));
+                            acc_vec[k] += dot(p_vec[b_vec], v_val_vec);
+                        }
                     }
                 }
             }
@@ -1336,6 +1409,7 @@ __global__ void chunked_prefill_paged_attention_opt_f16(
 
     // Write dominant-thread output
     if (!in_boundary_seq && head_active && lane_active) {
+
         using O_vec = typename Vec<uint16_t, VEC_SIZE>::Type;
         O_vec o_vec[NUM_VECS];
         #pragma unroll
@@ -1481,3 +1555,37 @@ extern "C" __global__ void vllm_chunked_prefill_paged_attn_opt_fp8_hd128(
       use_alibi_flag, use_sinks_flag, sliding_window, total_num_blocks,
       kv_block_stride, kv_head_stride);
 }
+
+
+// ---- kNHD 变体(kv布局统一契约 P2):模板尾参 KNHD=true(签名与 classic 同)----
+
+#define CHUNKED_KNHD_ENTRY(NAME, HEAD_SIZE_EXPR, KV_FP8_EXPR)                          \
+    extern "C" __global__ void NAME(                                                   \
+        const uint16_t* __restrict__ q,                                                \
+        const uint16_t* __restrict__ k_cache,                                          \
+        const uint16_t* __restrict__ v_cache,                                          \
+        const float* __restrict__ block_tables,                                        \
+        const float* __restrict__ seq_lens,                                            \
+        const float* __restrict__ query_start_len,                                     \
+        const float* __restrict__ alibi_slopes,                                        \
+        const float* __restrict__ sinks,                                               \
+        const int num_kv_heads, const float sm_scale,                                  \
+        const int block_table_stride, const int num_seqs,                              \
+        const int num_query_heads, const int num_query_tokens,                         \
+        const float softscapping, const int o_stride_tokens,                           \
+        const int sliding_window, const int total_num_blocks,                          \
+        const int kv_block_stride, const int kv_head_stride,                           \
+        const int use_alibi_flag, const int use_sinks_flag,                            \
+        uint16_t* __restrict__ out) {                                                  \
+      chunked_prefill_paged_attention_opt_f16<HEAD_SIZE_EXPR, 32, 256, KV_FP8_EXPR, true>(\
+          out, q, k_cache, v_cache, num_kv_heads, sm_scale, block_tables, seq_lens,    \
+          block_table_stride, num_seqs, num_query_heads, num_query_tokens,             \
+          softscapping, o_stride_tokens, query_start_len, alibi_slopes, sinks,         \
+          use_alibi_flag, use_sinks_flag, sliding_window, total_num_blocks,            \
+          kv_block_stride, kv_head_stride);                                            \
+    }
+
+CHUNKED_KNHD_ENTRY(vllm_chunked_prefill_paged_attn_opt_f16_knhd_hd256, 256, false)
+CHUNKED_KNHD_ENTRY(vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256, 256, true)
+CHUNKED_KNHD_ENTRY(vllm_chunked_prefill_paged_attn_opt_f16_knhd_hd128, 128, false)
+CHUNKED_KNHD_ENTRY(vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd128, 128, true)

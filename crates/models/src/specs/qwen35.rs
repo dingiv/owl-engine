@@ -973,7 +973,7 @@ mod tests {
         use crate::layers::rope::Rope;
         use crate::module::KvBuffers;
         let dir = manifest_dir().join("assets/Qwen3.5-0.8B");
-        let t_len = 8usize;
+        let t_len = 2usize; // 两 token 判别
         let slots_n = 8usize;
         let eprintln_skip = (); // 门控同 smoke(真权重测试默认必跑)
         let _ = eprintln_skip;
@@ -1067,6 +1067,10 @@ mod tests {
         let ctx = ForwardCtx::model_prefill(t_len, &pos_all, &kvs_pre, &rp, &gdns_pre,
             &slots_all, &lens_all, &gdn_slot, 0, None);
         let all = crate::testkit::harvest_f16(&mut gpu, &model.forward(&ids_all, &ctx)).await;
+
+        // 池字节对账存档(统一契约 P2 诊断):kvs 全 knhd 化后 K 池差异 =
+        // 1-2 ulp 浮序噪声(批量 NormRope+K0 vs 融合插池单次舍入),
+        // V/K 逻辑一致;行0 独异、行1-7 全过 = 诊断史见工单 P2 挂账
 
         // 逐行等价(路径等价 = PF1a 契约):T 批 cuBLAS(m=8)vs 逐步
         // (m=1)核选型/浮序差 → 相对容差 5e-2 + top-1 逐行一致

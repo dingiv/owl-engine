@@ -45,20 +45,75 @@ pub enum KvQuant {
 pub struct KvEnv {
     /// KV 存储量化(None = f16;Fp8E4M3 = e4m3 字节池/影子)
     pub quant: KvQuant,
+    /// KV 页内布局(2026-10-12 统一契约立项;boot 静态定形,禁运行时切换。
+    /// Classic = vLLM x-block 交错 [nb,hkv,hd/x,page,x];Knhd = 页内连续
+    /// [nb,page,hkv,hd](FlashInfer 原生)。过渡期双臂共存(P1-P5),
+    /// P6 大爆炸删 Classic 臂与本枚举——终态单布局零枚举,见
+    /// roadmap.local/kv布局统一契约-立项设计与施工.md)
+    pub layout: KvLayout,
     /// Q/Out dtype(F16 现役;KV 量化不改 Q/Out 精度)
     pub dtype: Dtype,
     /// 页宽(tokens/block;0 = legacy 直排)
     pub page: usize,
-    /// K 向量宽(16B / sizeof(dtype))
+    /// K 向量宽(16B / sizeof(dtype))= classic 布局专参(P6 随 Classic 臂退役)
     pub x: usize,
     /// paged(false = legacy 直排)
     pub paged: bool,
 }
 
+/// KV 页内布局契约(算子盘点 §八 + kv布局统一契约工单 §2)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvLayout {
+    /// vLLM classic:K `[nb,hkv,hd/x,page,x]` / V `[nb,hkv,hd,page]`
+    /// (x-block 交错,自研 v1/v2 核原生;现役)
+    Classic,
+    /// kNHD:K/V `[nb,page,hkv,hd]` 页内连续(FlashInfer 原生;
+    /// 统一契约目标态 —— 影子池结构性消灭)
+    Knhd,
+}
+
+impl KvLayout {
+    /// 池元素数(两布局同积异排;分配面扁平计数,与布局无关的证明锚)
+    pub fn pool_elems(&self, nb: usize, hkv: usize, hd: usize, page: usize) -> usize {
+        let _ = self;
+        nb * hkv * hd * page
+    }
+
+    /// classic K 池内元素偏移:[nb, hkv, hd/x, page, x]
+    /// slot = 全局槽位(block = slot/page,p = slot%page)
+    pub fn classic_k_offset(slot: usize, h: usize, d: usize, hkv: usize, hd: usize, page: usize, x: usize) -> usize {
+        let b = slot / page;
+        let p = slot % page;
+        let hdx = hd / x;
+        (((b * hkv + h) * hdx + d / x) * page + p) * x + d % x
+    }
+
+    /// classic V 池内元素偏移:[nb, hkv, hd, page]
+    pub fn classic_v_offset(slot: usize, h: usize, d: usize, hkv: usize, hd: usize, page: usize) -> usize {
+        let b = slot / page;
+        let p = slot % page;
+        ((b * hkv + h) * hd + d) * page + p
+    }
+
+    /// kNHD K/V 池内元素偏移:[nb, page, hkv, hd]
+    pub fn knhd_offset(slot: usize, h: usize, d: usize, hkv: usize, hd: usize, page: usize) -> usize {
+        let b = slot / page;
+        let p = slot % page;
+        ((b * page + p) * hkv + h) * hd + d
+    }
+}
+
 impl KvEnv {
-    /// 生产档:f16 paged 页 32(配对律定谳;x = 16B/2B = 8)
+    /// 生产档:f16 paged 页 32(配对律定谳;layout = Knhd 统一契约现役)
     pub fn f16_paged() -> Self {
-        Self { quant: KvQuant::None, dtype: Dtype::F16, page: 32, x: 8, paged: true }
+        Self {
+            quant: KvQuant::None,
+            layout: KvLayout::Classic,
+            dtype: Dtype::F16,
+            page: 32,
+            x: 8,
+            paged: true,
+        }
     }
 
     // ── KV 内核选择唯一出口(收口律,2026-10-10)─────────────────
@@ -69,9 +124,11 @@ impl KvEnv {
 
     /// K0 批量写(classic 池;naive decode / chunked prefill / naive prefill 共用)
     pub fn k0_write_op(&self) -> crate::ops::SemanticKernel {
-        match self.quant {
-            KvQuant::Fp8E4M3 => crate::ops::SemanticKernel::K0WriteFp8,
-            KvQuant::None => crate::ops::SemanticKernel::K0Write,
+        match (self.quant, self.layout) {
+            (KvQuant::Fp8E4M3, KvLayout::Classic) => crate::ops::SemanticKernel::K0WriteFp8,
+            (KvQuant::None, KvLayout::Classic) => crate::ops::SemanticKernel::K0Write,
+            (KvQuant::Fp8E4M3, KvLayout::Knhd) => crate::ops::SemanticKernel::K0WriteFp8Knhd,
+            (KvQuant::None, KvLayout::Knhd) => crate::ops::SemanticKernel::K0WriteKnhd,
         }
     }
 
@@ -85,42 +142,52 @@ impl KvEnv {
 
     /// chunked paged prefill 批读
     pub fn prefill_paged_attn_op(&self) -> crate::ops::SemanticKernel {
-        match self.quant {
-            KvQuant::Fp8E4M3 => crate::ops::SemanticKernel::PagedPrefillFp8,
-            KvQuant::None => crate::ops::SemanticKernel::PagedPrefill,
+        match (self.quant, self.layout) {
+            (KvQuant::Fp8E4M3, KvLayout::Classic) => crate::ops::SemanticKernel::PagedPrefillFp8,
+            (KvQuant::None, KvLayout::Classic) => crate::ops::SemanticKernel::PagedPrefill,
+            (KvQuant::Fp8E4M3, KvLayout::Knhd) => crate::ops::SemanticKernel::PagedPrefillFp8Knhd,
+            (KvQuant::None, KvLayout::Knhd) => crate::ops::SemanticKernel::PagedPrefillKnhd,
         }
     }
 
     /// prefill split 读(flash-decoding;fp8 池必须走 fp8kv 直读 —— f16 核
     /// 读 e4m3 字节池 = 字节错位,2026-10-12 埋雷实录)
     pub fn prefill_split_op(&self) -> crate::ops::SemanticKernel {
-        match self.quant {
-            KvQuant::Fp8E4M3 => crate::ops::SemanticKernel::PrefillSplitFp8kv,
-            KvQuant::None => crate::ops::SemanticKernel::PrefillSplit,
+        match (self.quant, self.layout) {
+            (KvQuant::Fp8E4M3, KvLayout::Classic) => crate::ops::SemanticKernel::PrefillSplitFp8kv,
+            (KvQuant::None, KvLayout::Classic) => crate::ops::SemanticKernel::PrefillSplit,
+            (KvQuant::Fp8E4M3, KvLayout::Knhd) => crate::ops::SemanticKernel::PrefillSplitFp8kvKnhd,
+            (KvQuant::None, KvLayout::Knhd) => crate::ops::SemanticKernel::PrefillSplitKnhd,
         }
     }
 
     /// v2 分页 decode 打分
     pub fn decode_v2_op(&self) -> crate::ops::SemanticKernel {
-        match self.quant {
-            KvQuant::Fp8E4M3 => crate::ops::SemanticKernel::PagedDecodeV2Fp8,
-            KvQuant::None => crate::ops::SemanticKernel::PagedDecodeV2,
+        match (self.quant, self.layout) {
+            (KvQuant::Fp8E4M3, KvLayout::Classic) => crate::ops::SemanticKernel::PagedDecodeV2Fp8,
+            (KvQuant::None, KvLayout::Classic) => crate::ops::SemanticKernel::PagedDecodeV2,
+            (KvQuant::Fp8E4M3, KvLayout::Knhd) => crate::ops::SemanticKernel::PagedDecodeV2Fp8Knhd,
+            (KvQuant::None, KvLayout::Knhd) => crate::ops::SemanticKernel::PagedDecodeV2Knhd,
         }
     }
 
     /// verify 伪序列变体(grid.y = seqs;§三十一)
     pub fn decode_v2_seq_op(&self) -> crate::ops::SemanticKernel {
-        match self.quant {
-            KvQuant::Fp8E4M3 => crate::ops::SemanticKernel::PagedDecodeV2Fp8Seq,
-            KvQuant::None => crate::ops::SemanticKernel::PagedDecodeV2Seq,
+        match (self.quant, self.layout) {
+            (KvQuant::Fp8E4M3, KvLayout::Classic) => crate::ops::SemanticKernel::PagedDecodeV2Fp8Seq,
+            (KvQuant::None, KvLayout::Classic) => crate::ops::SemanticKernel::PagedDecodeV2Seq,
+            (KvQuant::Fp8E4M3, KvLayout::Knhd) => crate::ops::SemanticKernel::PagedDecodeV2Fp8SeqKnhd,
+            (KvQuant::None, KvLayout::Knhd) => crate::ops::SemanticKernel::PagedDecodeV2SeqKnhd,
         }
     }
 
     /// decode 融合插池(qk-norm+rope+K/V 插池三合一)
     pub fn fused_insert_op(&self) -> crate::ops::SemanticKernel {
-        match self.quant {
-            KvQuant::Fp8E4M3 => crate::ops::SemanticKernel::QkvNormRopeInsertFp8kv,
-            KvQuant::None => crate::ops::SemanticKernel::QkvNormRopeInsert,
+        match (self.quant, self.layout) {
+            (KvQuant::Fp8E4M3, KvLayout::Classic) => crate::ops::SemanticKernel::QkvNormRopeInsertFp8kv,
+            (KvQuant::None, KvLayout::Classic) => crate::ops::SemanticKernel::QkvNormRopeInsert,
+            (KvQuant::Fp8E4M3, KvLayout::Knhd) => crate::ops::SemanticKernel::QkvNormRopeInsertFp8kvKnhd,
+            (KvQuant::None, KvLayout::Knhd) => crate::ops::SemanticKernel::QkvNormRopeInsertKnhd,
         }
     }
 
@@ -131,6 +198,18 @@ impl KvEnv {
             KvQuant::Fp8E4M3 => owl_kernels::contract::names::PREFILL_FI_FP8KV,
             KvQuant::None => owl_kernels::contract::names::PREFILL_FI,
         }
+    }
+
+    /// KV 池 stride(布局单源):block stride 两布局同值;head stride
+    /// classic = hd·page(x 交错),knhd = hd(页内 [page,hkv,hd] 连续)
+    pub fn kv_head_stride(&self, hd: usize, page: i32) -> i32 {
+        match self.layout {
+            KvLayout::Classic => hd as i32 * page,
+            KvLayout::Knhd => hd as i32,
+        }
+    }
+    pub fn kv_block_stride(&self, hkv: usize, hd: usize, page: i32) -> i32 {
+        hkv as i32 * hd as i32 * page
     }
 
     /// 主池是否 e4m3 字节承载(池账/几何消费;非内核选择)
@@ -264,5 +343,85 @@ impl EnvProvider {
                 page: if self.kv.paged { self.kv.page } else { 0 },
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    //! KvLayout 契约数学门(P0;探针 oracle 单源 = env,核层零字面量索引)
+
+    use super::*;
+
+    #[test]
+    fn pool_elems_两布局同积() {
+        // 字节账等价证明锚:classic 同积异排,FI-off 档内存零 delta
+        for &(nb, hkv, hd, page) in &[(136usize, 4usize, 256usize, 32usize), (7, 16, 128, 32), (1, 4, 256, 32)] {
+            assert_eq!(
+                KvLayout::Classic.pool_elems(nb, hkv, hd, page),
+                KvLayout::Knhd.pool_elems(nb, hkv, hd, page)
+            );
+        }
+    }
+
+    #[test]
+    fn 偏移映射_双射性() {
+        // 同一逻辑元素集 (slot,h,d) 两布局各得唯一偏移且互不碰撞
+        let (hkv, hd, page, slots) = (4usize, 256usize, 32usize, 96usize);
+        let n = slots * hkv * hd;
+        let mut seen_c = vec![false; n];
+        let mut seen_n = vec![false; n];
+        for slot in 0..slots {
+            for h in 0..hkv {
+                for d in 0..hd {
+                    let c = KvLayout::classic_k_offset(slot, h, d, hkv, hd, page, 8);
+                    let k = KvLayout::knhd_offset(slot, h, d, hkv, hd, page);
+                    assert!(c < n && !seen_c[c], "classic 偏移碰撞 off={c}");
+                    assert!(k < n && !seen_n[k], "knhd 偏移碰撞 off={k}");
+                    seen_c[c] = true;
+                    seen_n[k] = true;
+                }
+            }
+        }
+        assert!(seen_c.iter().all(|&v| v) && seen_n.iter().all(|&v| v));
+    }
+
+    #[test]
+    fn 重排往返_经典写经映射读knhd_值不变() {
+        // P1 写核 parity 的 host oracle:值跟逻辑元素走,不跟偏移走
+        let (hkv, hd, page, slots) = (2usize, 16usize, 8usize, 16usize);
+        let n = slots * hkv * hd;
+        let mut pool_c = vec![0f32; n];
+        let mut pool_n = vec![0f32; n];
+        for slot in 0..slots {
+            for h in 0..hkv {
+                for d in 0..hd {
+                    let v = (slot * 977 + h * 31 + d) as f32 * 0.25 - 7.0;
+                    pool_c[KvLayout::classic_k_offset(slot, h, d, hkv, hd, page, 8)] = v;
+                    pool_n[KvLayout::knhd_offset(slot, h, d, hkv, hd, page)] = v;
+                }
+            }
+        }
+        for slot in 0..slots {
+            for h in 0..hkv {
+                for d in 0..hd {
+                    let vc = pool_c[KvLayout::classic_k_offset(slot, h, d, hkv, hd, page, 8)];
+                    let vn = pool_n[KvLayout::knhd_offset(slot, h, d, hkv, hd, page)];
+                    assert_eq!(vc, vn, "slot={slot} h={h} d={d}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn v_偏移经典布局_页维最内() {
+        // classic V [nb,hkv,hd,page]:同 (b,h,d) 相邻 slot 偏移差 1(页最内)
+        let (hkv, hd, page) = (4usize, 256usize, 32usize);
+        let o0 = KvLayout::classic_v_offset(0, 1, 7, hkv, hd, page);
+        let o1 = KvLayout::classic_v_offset(1, 1, 7, hkv, hd, page);
+        assert_eq!(o1 - o0, 1);
+        // kNHD [nb,page,hkv,hd]:同 (b,h,d) 相邻 slot 偏移差 hkv*hd
+        let k0 = KvLayout::knhd_offset(0, 1, 7, hkv, hd, page);
+        let k1 = KvLayout::knhd_offset(1, 1, 7, hkv, hd, page);
+        assert_eq!(k1 - k0, hkv * hd);
     }
 }

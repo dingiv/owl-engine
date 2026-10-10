@@ -108,3 +108,81 @@ extern "C" __global__ void owl_reshape_and_cache_fp8kv_bf16(
             __nv_fp8_e4m3(__bfloat162float(value[src_value_idx])).__x;
     }
 }
+
+// ---- kNHD 变体(kv布局统一契约 P1):f16/bf16 输入 → e4m3 kNHD 池。
+// K/V 同构 [nb, block_size, num_heads, head_size];RNE 量化与 classic 版
+// 同式(__nv_fp8_e4m3 SATFINITE)→ 写值逐位一致(parity 门 = bitwise)。
+
+extern "C" __global__ void owl_reshape_and_cache_fp8kv_knhd(
+    const __half* __restrict__ key,
+    const __half* __restrict__ value,
+    unsigned char* __restrict__ key_cache,     // e4m3 [nb, block_size, num_heads, head_size]
+    unsigned char* __restrict__ value_cache,
+    const float* __restrict__ slot_mapping,
+    const int key_stride,
+    const int value_stride,
+    const int num_heads,
+    const int head_size,
+    const int block_size,
+    const int x,
+    __half* __restrict__ out) {
+    (void)out; (void)x;
+    const long long token_idx = blockIdx.x;
+    const long long slot_idx = (long long)slot_mapping[token_idx];
+    if (slot_idx < 0) {
+        return;
+    }
+    const long long block_idx = slot_idx / block_size;
+    const long long block_offset = slot_idx % block_size;
+
+    const int n = num_heads * head_size;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const long long src_key_idx = token_idx * key_stride + i;
+        const long long src_value_idx = token_idx * value_stride + i;
+        const int head_idx = i / head_size;
+        const int head_offset = i % head_size;
+        const long long tgt = block_idx * num_heads * head_size * block_size
+                            + block_offset * num_heads * head_size
+                            + head_idx * head_size
+                            + head_offset;
+        key_cache[tgt] = __nv_fp8_e4m3(__half2float(key[src_key_idx])).__x;
+        value_cache[tgt] = __nv_fp8_e4m3(__half2float(value[src_value_idx])).__x;
+    }
+}
+
+extern "C" __global__ void owl_reshape_and_cache_fp8kv_bf16_knhd(
+    const __nv_bfloat16* __restrict__ key,
+    const __nv_bfloat16* __restrict__ value,
+    unsigned char* __restrict__ key_cache,
+    unsigned char* __restrict__ value_cache,
+    const float* __restrict__ slot_mapping,
+    const int key_stride,
+    const int value_stride,
+    const int num_heads,
+    const int head_size,
+    const int block_size,
+    const int x,
+    __nv_bfloat16* __restrict__ out) {
+    (void)out; (void)x;
+    const long long token_idx = blockIdx.x;
+    const long long slot_idx = (long long)slot_mapping[token_idx];
+    if (slot_idx < 0) {
+        return;
+    }
+    const long long block_idx = slot_idx / block_size;
+    const long long block_offset = slot_idx % block_size;
+
+    const int n = num_heads * head_size;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const long long src_key_idx = token_idx * key_stride + i;
+        const long long src_value_idx = token_idx * value_stride + i;
+        const int head_idx = i / head_size;
+        const int head_offset = i % head_size;
+        const long long tgt = block_idx * num_heads * head_size * block_size
+                            + block_offset * num_heads * head_size
+                            + head_idx * head_size
+                            + head_offset;
+        key_cache[tgt] = __nv_fp8_e4m3(__bfloat162float(key[src_key_idx])).__x;
+        value_cache[tgt] = __nv_fp8_e4m3(__bfloat162float(value[src_value_idx])).__x;
+    }
+}

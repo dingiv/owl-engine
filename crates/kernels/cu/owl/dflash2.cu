@@ -647,3 +647,305 @@ extern "C" __global__ void owl_naive_attn_nc_fp8kv_bf16(
     }
     out[((long long)t * q_heads + h) * d_dim + d] = __float2bfloat16_rn(acc / s_l);
 }
+
+// ---- kNHD 变体(kv布局统一契约 P2):前缀池 [nb,page,hkv,hd],K/V 同式;自块直读不变 ----
+extern "C" __global__ void owl_naive_attn_nc_f16_knhd(
+    const __half* __restrict__ q,      // [T, Hq, D]
+    const __half* __restrict__ k_self, // [T, Hkv, D](自块直读)
+    const __half* __restrict__ v_self, // 同上
+    const __half* __restrict__ kc,     // classic 前缀 [nb, Hkv, hd/x, page, x]
+    const __half* __restrict__ vc,     // classic 前缀 [nb, Hkv, hd, page]
+    const float* __restrict__ kv_len_p, // [1] 全窗 = 前缀 + T(契约 5;
+                                       // E5-DF4 图化:运行时读,曾宿主烘焙)
+    int q_heads, int kv_heads, int d_dim,
+    int page, int x,
+    __half* __restrict__ out) {        // [T, Hq, D]
+    const int t = blockIdx.x;
+    const int h = blockIdx.y;
+    const int d = threadIdx.x;
+    const int hd = blockDim.x;
+    const int kvh = h / (q_heads / kv_heads);
+    const int hd_x = d_dim / x;
+    const int kv_len = (int)kv_len_p[0];
+    const int prefix_len = kv_len - gridDim.x;
+
+    const __half* qs = q + ((long long)t * q_heads + h) * d_dim;
+    const float scale = rsqrtf((float)d_dim);
+
+    __shared__ float red[512];  // 块内归约(hd ≤ 512:draft 128 / target 256)
+    __shared__ float s_m, s_l, s_resc, s_p;
+
+    const float qd = __half2float(qs[d]);
+    float acc = 0.0f;
+    if (d == 0) { s_m = -3.0e38f; s_l = 0.0f; }
+    __syncthreads();
+
+    for (int srow = 0; srow < kv_len; ++srow) {
+        float kv;
+        if (srow < prefix_len) {
+            const int b = srow / page;
+            const int off = srow % page;
+            kv = __half2float(kc[((long long)(b * page + off) * kv_heads + kvh) * d_dim + d]);
+        } else {
+            const int st = srow - prefix_len;
+            kv = __half2float(k_self[((long long)st * kv_heads + kvh) * d_dim + d]);
+        }
+        red[d] = qd * kv;
+        __syncthreads();
+        for (int s2 = hd / 2; s2 > 0; s2 >>= 1) {
+            if (d < s2) red[d] += red[d + s2];
+            __syncthreads();
+        }
+        if (d == 0) {
+            const float dot = red[0] * scale;
+            const float m_new = fmaxf(s_m, dot);
+            const float resc = __expf(s_m - m_new);
+            const float p = __expf(dot - m_new);
+            s_l = s_l * resc + p;
+            s_resc = resc;
+            s_p = p;
+            s_m = m_new;
+        }
+        __syncthreads();
+        float p = s_p;
+        if (srow < prefix_len) {
+            const int b = srow / page;
+            const int off = srow % page;
+            p *= __half2float(vc[((long long)(b * page + off) * kv_heads + kvh) * d_dim + d]);
+        } else {
+            const int st = srow - prefix_len;
+            p *= __half2float(v_self[((long long)st * kv_heads + kvh) * d_dim + d]);
+        }
+        acc = acc * s_resc + p;
+        __syncthreads();
+    }
+    out[((long long)t * q_heads + h) * d_dim + d] = __float2half(acc / s_l);
+}
+
+
+extern "C" __global__ void owl_naive_attn_nc_fp8kv_f16_knhd(
+    const __half* __restrict__ q,      // [T, Hq, D]
+    const __half* __restrict__ k_self, // [T, Hkv, D](自块直读)
+    const __half* __restrict__ v_self, // 同上
+    const unsigned char* __restrict__ kc,     // classic 前缀 [nb, Hkv, hd/x, page, x](e4m3)
+    const unsigned char* __restrict__ vc,     // classic 前缀 [nb, Hkv, hd, page](e4m3)
+    const float* __restrict__ kv_len_p, // [1] 全窗 = 前缀 + T(契约 5;
+                                       // E5-DF4 图化:运行时读,曾宿主烘焙)
+    int q_heads, int kv_heads, int d_dim,
+    int page, int x,
+    __half* __restrict__ out) {        // [T, Hq, D]
+    const int t = blockIdx.x;
+    const int h = blockIdx.y;
+    const int d = threadIdx.x;
+    const int hd = blockDim.x;
+    const int kvh = h / (q_heads / kv_heads);
+    const int hd_x = d_dim / x;
+    const int kv_len = (int)kv_len_p[0];
+    const int prefix_len = kv_len - gridDim.x;
+
+    const __half* qs = q + ((long long)t * q_heads + h) * d_dim;
+    const float scale = rsqrtf((float)d_dim);
+
+    __shared__ float red[512];  // 块内归约(hd ≤ 512:draft 128 / target 256)
+    __shared__ float s_m, s_l, s_resc, s_p;
+
+    const float qd = __half2float(qs[d]);
+    float acc = 0.0f;
+    if (d == 0) { s_m = -3.0e38f; s_l = 0.0f; }
+    __syncthreads();
+
+    for (int srow = 0; srow < kv_len; ++srow) {
+        float kv;
+        if (srow < prefix_len) {
+            const int b = srow / page;
+            const int off = srow % page;
+            // B6 偷显存:前缀池 e4m3 读入即转(元素序 = 字节序)
+            __nv_fp8_e4m3 ke; ke.__x = kc[((long long)(b * page + off) * kv_heads + kvh) * d_dim + d];
+            kv = __half2float(__half(ke));
+        } else {
+            const int st = srow - prefix_len;
+            kv = __half2float(k_self[((long long)st * kv_heads + kvh) * d_dim + d]);
+        }
+        red[d] = qd * kv;
+        __syncthreads();
+        for (int s2 = hd / 2; s2 > 0; s2 >>= 1) {
+            if (d < s2) red[d] += red[d + s2];
+            __syncthreads();
+        }
+        if (d == 0) {
+            const float dot = red[0] * scale;
+            const float m_new = fmaxf(s_m, dot);
+            const float resc = __expf(s_m - m_new);
+            const float p = __expf(dot - m_new);
+            s_l = s_l * resc + p;
+            s_resc = resc;
+            s_p = p;
+            s_m = m_new;
+        }
+        __syncthreads();
+        float p = s_p;
+        if (srow < prefix_len) {
+            const int b = srow / page;
+            const int off = srow % page;
+            __nv_fp8_e4m3 ve; ve.__x = vc[((long long)(b * page + off) * kv_heads + kvh) * d_dim + d];
+            p *= __half2float(__half(ve));
+        } else {
+            const int st = srow - prefix_len;
+            p *= __half2float(v_self[((long long)st * kv_heads + kvh) * d_dim + d]);
+        }
+        acc = acc * s_resc + p;
+        __syncthreads();
+    }
+    out[((long long)t * q_heads + h) * d_dim + d] = __float2half(acc / s_l);
+}
+
+// ---- BF16 v2(同款 block-per-head flash 式;池/出 bf16)----
+
+extern "C" __global__ void owl_naive_attn_nc_bf16_knhd(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k_self,
+    const __nv_bfloat16* __restrict__ v_self,
+    const __nv_bfloat16* __restrict__ kc,
+    const __nv_bfloat16* __restrict__ vc,
+    const float* __restrict__ kv_len_p,
+    int q_heads, int kv_heads, int d_dim,
+    int page, int x,
+    __nv_bfloat16* __restrict__ out) {
+    const int t = blockIdx.x;
+    const int h = blockIdx.y;
+    const int d = threadIdx.x;
+    const int hd = blockDim.x;
+    const int kvh = h / (q_heads / kv_heads);
+    const int hd_x = d_dim / x;
+    const int kv_len = (int)kv_len_p[0];
+    const int prefix_len = kv_len - gridDim.x;
+
+    const __nv_bfloat16* qs = q + ((long long)t * q_heads + h) * d_dim;
+    const float scale = rsqrtf((float)d_dim);
+
+    __shared__ float red[512];
+    __shared__ float s_m, s_l, s_resc, s_p;
+
+    const float qd = __bfloat162float(qs[d]);
+    float acc = 0.0f;
+    if (d == 0) { s_m = -3.0e38f; s_l = 0.0f; }
+    __syncthreads();
+
+    for (int srow = 0; srow < kv_len; ++srow) {
+        float kv;
+        if (srow < prefix_len) {
+            const int b = srow / page;
+            const int off = srow % page;
+            kv = __bfloat162float(kc[((long long)(b * page + off) * kv_heads + kvh) * d_dim + d]);
+        } else {
+            const int st = srow - prefix_len;
+            kv = __bfloat162float(k_self[((long long)st * kv_heads + kvh) * d_dim + d]);
+        }
+        red[d] = qd * kv;
+        __syncthreads();
+        for (int s2 = hd / 2; s2 > 0; s2 >>= 1) {
+            if (d < s2) red[d] += red[d + s2];
+            __syncthreads();
+        }
+        if (d == 0) {
+            const float dot = red[0] * scale;
+            const float m_new = fmaxf(s_m, dot);
+            const float resc = __expf(s_m - m_new);
+            const float p = __expf(dot - m_new);
+            s_l = s_l * resc + p;
+            s_resc = resc;
+            s_p = p;
+            s_m = m_new;
+        }
+        __syncthreads();
+        float p = s_p;
+        if (srow < prefix_len) {
+            const int b = srow / page;
+            const int off = srow % page;
+            p *= __bfloat162float(vc[((long long)(b * page + off) * kv_heads + kvh) * d_dim + d]);
+        } else {
+            const int st = srow - prefix_len;
+            p *= __bfloat162float(v_self[((long long)st * kv_heads + kvh) * d_dim + d]);
+        }
+        acc = acc * s_resc + p;
+        __syncthreads();
+    }
+    out[((long long)t * q_heads + h) * d_dim + d] = __float2bfloat16(acc / s_l);
+}
+
+
+extern "C" __global__ void owl_naive_attn_nc_fp8kv_bf16_knhd(
+    const __nv_bfloat16* __restrict__ q,      // [T, Hq, D]
+    const __nv_bfloat16* __restrict__ k_self, // [T, Hkv, D](自块直读)
+    const __nv_bfloat16* __restrict__ v_self, // 同上
+    const unsigned char* __restrict__ kc,     // classic 前缀 [nb, Hkv, hd/x, page, x](e4m3)
+    const unsigned char* __restrict__ vc,     // classic 前缀 [nb, Hkv, hd, page](e4m3)
+    const float* __restrict__ kv_len_p, // [1] 全窗 = 前缀 + T(契约 5;
+                                       // E5-DF4 图化:运行时读,曾宿主烘焙)
+    int q_heads, int kv_heads, int d_dim,
+    int page, int x,
+    __nv_bfloat16* __restrict__ out) {        // [T, Hq, D]
+    const int t = blockIdx.x;
+    const int h = blockIdx.y;
+    const int d = threadIdx.x;
+    const int hd = blockDim.x;
+    const int kvh = h / (q_heads / kv_heads);
+    const int hd_x = d_dim / x;
+    const int kv_len = (int)kv_len_p[0];
+    const int prefix_len = kv_len - gridDim.x;
+
+    const __nv_bfloat16* qs = q + ((long long)t * q_heads + h) * d_dim;
+    const float scale = rsqrtf((float)d_dim);
+
+    __shared__ float red[512];  // 块内归约(hd ≤ 512:draft 128 / target 256)
+    __shared__ float s_m, s_l, s_resc, s_p;
+
+    const float qd = __bfloat162float(qs[d]);
+    float acc = 0.0f;
+    if (d == 0) { s_m = -3.0e38f; s_l = 0.0f; }
+    __syncthreads();
+
+    for (int srow = 0; srow < kv_len; ++srow) {
+        float kv;
+        if (srow < prefix_len) {
+            const int b = srow / page;
+            const int off = srow % page;
+            // B6 偷显存:前缀池 e4m3 读入即转(元素序 = 字节序)
+            __nv_fp8_e4m3 ke; ke.__x = kc[((long long)(b * page + off) * kv_heads + kvh) * d_dim + d];
+            kv = __bfloat162float(__float2bfloat16_rn(float(ke)));
+        } else {
+            const int st = srow - prefix_len;
+            kv = __bfloat162float(k_self[((long long)st * kv_heads + kvh) * d_dim + d]);
+        }
+        red[d] = qd * kv;
+        __syncthreads();
+        for (int s2 = hd / 2; s2 > 0; s2 >>= 1) {
+            if (d < s2) red[d] += red[d + s2];
+            __syncthreads();
+        }
+        if (d == 0) {
+            const float dot = red[0] * scale;
+            const float m_new = fmaxf(s_m, dot);
+            const float resc = __expf(s_m - m_new);
+            const float p = __expf(dot - m_new);
+            s_l = s_l * resc + p;
+            s_resc = resc;
+            s_p = p;
+            s_m = m_new;
+        }
+        __syncthreads();
+        float p = s_p;
+        if (srow < prefix_len) {
+            const int b = srow / page;
+            const int off = srow % page;
+            __nv_fp8_e4m3 ve; ve.__x = vc[((long long)(b * page + off) * kv_heads + kvh) * d_dim + d];
+            p *= __bfloat162float(__float2bfloat16_rn(float(ve)));
+        } else {
+            const int st = srow - prefix_len;
+            p *= __bfloat162float(v_self[((long long)st * kv_heads + kvh) * d_dim + d]);
+        }
+        acc = acc * s_resc + p;
+        __syncthreads();
+    }
+    out[((long long)t * q_heads + h) * d_dim + d] = __float2bfloat16_rn(acc / s_l);
+}

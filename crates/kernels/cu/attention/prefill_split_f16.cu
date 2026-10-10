@@ -67,7 +67,7 @@ typedef unsigned long long uint64_t;
 // 数学零改动);smem 恒 f16。classic 寻址 index 数学同式(fp8 = 1B 单位)。
 // q [T, Hq, hd];scr_out f16 [T, Hq, nparts, hd];scr_stat f32 [T, Hq, nparts, 2]
 // dummy 尾参 = 契约 4(真输出 = reduce 核;本核纯副作用写 scratch)
-template <bool KV_FP8>
+template <bool KV_FP8, bool KNHD = false>
 __device__ void split_k1_body(
     const uint16_t* __restrict__ q,            // [T, Hq, hd]
     const uint16_t* __restrict__ k_cache,      // classic(f16 视角;fp8 = 字节池 reinterpret)
@@ -158,9 +158,16 @@ __device__ void split_k1_body(
     uint16_t* v_smem = k_smem + TILE * HD;    // [TILE, HD]
 
     // classic 寻址:K = [d/x][page][x] 转置;V = [d][page] 直排
+    // kNHD(统一契约 P2):(phys·page + off)·hkv·hd + head·hd + d,
+    // K/V 同式;host 传 kv_block_stride = page·hkv·hd、kv_head_stride = hd
     auto kc_index = [&](int kt, int d) -> long long {
         const int phys = (int)block_tables[kt / page];
         const int off = kt % page;
+        if constexpr (KNHD) {
+            return (long long)phys * kv_block_stride
+                 + (long long)kv_head * kv_head_stride
+                 + (long long)off * (kv_block_stride / page) + d;
+        }
         return (long long)phys * kv_block_stride
              + (long long)kv_head * kv_head_stride
              + (long long)(d / VEC) * page * VEC + off * VEC + (d % VEC);
@@ -168,6 +175,11 @@ __device__ void split_k1_body(
     auto vc_index = [&](int kt, int d) -> long long {
         const int phys = (int)block_tables[kt / page];
         const int off = kt % page;
+        if constexpr (KNHD) {
+            return (long long)phys * kv_block_stride
+                 + (long long)kv_head * kv_head_stride
+                 + (long long)off * (kv_block_stride / page) + d;
+        }
         return (long long)phys * kv_block_stride
              + (long long)kv_head * kv_head_stride
              + (long long)d * page + off;
@@ -334,6 +346,46 @@ extern "C" __global__ void owl_prefill_split_fp8kv_hd256(
     split_k1_body<true>(q, k_cache, v_cache, block_tables, scr_out, scr_stat,
                         k0_alibi, scale, hkv, T, ctx_base, nparts,
                         kv_block_stride, kv_head_stride, page, hq, dummy);
+}
+
+// ---- kNHD 变体(kv布局统一契约 P2):页内 [page,hkv,hd] 连续,K/V 同址;
+// host 传 kv_block_stride = page·hkv·hd、kv_head_stride = hd ----
+extern "C" __global__ void owl_prefill_split_f16_knhd_hd256(
+    const uint16_t* __restrict__ q,
+    const uint16_t* __restrict__ k_cache,
+    const uint16_t* __restrict__ v_cache,
+    const float* __restrict__ block_tables,
+    uint16_t* __restrict__ scr_out,
+    float* __restrict__ scr_stat,
+    const uint16_t* __restrict__ k0_alibi,
+    float scale,
+    int32_t hkv, int32_t T, int32_t ctx_base, int32_t nparts,
+    int32_t kv_block_stride, int32_t kv_head_stride, int32_t page,
+    int32_t hq,
+    uint16_t* __restrict__ dummy)
+{
+    split_k1_body<false, true>(q, k_cache, v_cache, block_tables, scr_out, scr_stat,
+                               k0_alibi, scale, hkv, T, ctx_base, nparts,
+                               kv_block_stride, kv_head_stride, page, hq, dummy);
+}
+
+extern "C" __global__ void owl_prefill_split_fp8kv_knhd_hd256(
+    const uint16_t* __restrict__ q,
+    const uint16_t* __restrict__ k_cache,      // e4m3 字节池(1B/elem)
+    const uint16_t* __restrict__ v_cache,
+    const float* __restrict__ block_tables,
+    uint16_t* __restrict__ scr_out,
+    float* __restrict__ scr_stat,
+    const uint16_t* __restrict__ k0_alibi,
+    float scale,
+    int32_t hkv, int32_t T, int32_t ctx_base, int32_t nparts,
+    int32_t kv_block_stride, int32_t kv_head_stride, int32_t page,
+    int32_t hq,
+    uint16_t* __restrict__ dummy)
+{
+    split_k1_body<true, true>(q, k_cache, v_cache, block_tables, scr_out, scr_stat,
+                              k0_alibi, scale, hkv, T, ctx_base, nparts,
+                              kv_block_stride, kv_head_stride, page, hq, dummy);
 }
 
 // ---- K2:partition 归一化合并 --------------------------------------------

@@ -495,3 +495,192 @@ extern "C" __global__ void owl_fused_add_rmsnorm_bf16(
         out[base + i] = __float2bfloat16(v * inv * (w_off ? (wf + 1.0f) : wf));
     }
 }
+
+// ----------------------------------------------------------------------------
+// owl_qknorm_rope_kv_insert_f16_knhd / _f16_fp8kv_knhd(kv布局统一契约 P1)。
+// 数学逐式同 classic 版(同一 norm/rope/捎带 v);唯一差异 = 池写寻址:
+//   kNHD:K/V 同构 [nb, page, Hkv, hd] → off = (block·page + off_in_page)
+//         ·Hkv·hd + kh·hd + d(K/V 同址,classic 的双式寻址合一线)。
+// x 交错退役;parity 门 = q_out 与两池映射回读逐位一致。
+// ----------------------------------------------------------------------------
+extern "C" __global__ void owl_qknorm_rope_kv_insert_f16_knhd(
+    const __half* __restrict__ q_raw,
+    const __half* __restrict__ k,
+    const __half* __restrict__ v,
+    __half* __restrict__ key_cache,     // [nb, page, Hkv, hd]
+    __half* __restrict__ value_cache,   // [nb, page, Hkv, hd]
+    const float* __restrict__ slots,
+    const __half* __restrict__ q_w,
+    const __half* __restrict__ k_w,
+    const __half* __restrict__ cos_t,
+    const __half* __restrict__ sin_t,
+    const float* __restrict__ pos,
+    float eps,
+    int hkv, int half, int page, int w_off,
+    __half* __restrict__ q_out)
+{
+    const size_t t = blockIdx.x;
+    const size_t head = blockIdx.y;
+    const size_t d = threadIdx.x;
+    const size_t hd = blockDim.x;
+    const size_t hq = gridDim.y - (size_t)hkv;
+    const long long slot = (long long)slots[t];
+
+    if (head < hq) {
+        const size_t row_stride = hq * 2 * hd;
+        const __half* xs = q_raw + t * row_stride + head * 2 * hd;
+        extern __shared__ float smem[];
+        const float xf = __half2float(xs[d]);
+        smem[d] = xf * xf;
+        __syncthreads();
+        for (size_t s2 = hd / 2; s2 > 0; s2 >>= 1) {
+            if (d < s2) smem[d] += smem[d + s2];
+            __syncthreads();
+        }
+        const float inv = rsqrtf(smem[0] / (float)hd + eps);
+        const float wf = __half2float(q_w[d]);
+        const float n = xf * inv * (w_off ? (wf + 1.0f) : wf);
+        const size_t p = (size_t)pos[t];
+        const size_t base = (t * hq + head) * hd;
+        if (d < (size_t)half) {
+            const float xb = __half2float(xs[d + half]);
+            const float wb = __half2float(q_w[d + half]);
+            const float nb = xb * inv * (w_off ? (wb + 1.0f) : wb);
+            const float cf = __half2float(cos_t[p * half + d]);
+            const float sf = __half2float(sin_t[p * half + d]);
+            q_out[base + d] = __float2half(n * cf - nb * sf);
+            q_out[base + d + half] = __float2half(nb * cf + n * sf);
+        } else if (d >= 2 * (size_t)half) {
+            q_out[base + d] = __float2half(n);
+        }
+            return;
+    }
+
+    if (slot < 0) return;
+    const size_t kh = head - hq;
+    const __half* ks = k + t * (size_t)hkv * hd + kh * hd;
+    extern __shared__ float smem[];
+    const float kf = __half2float(ks[d]);
+    smem[d] = kf * kf;
+    __syncthreads();
+    for (size_t s2 = hd / 2; s2 > 0; s2 >>= 1) {
+        if (d < s2) smem[d] += smem[d + s2];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(smem[0] / (float)hd + eps);
+    const float wf = __half2float(k_w[d]);
+    float n = kf * inv * (w_off ? (wf + 1.0f) : wf);
+    const size_t p = (size_t)pos[t];
+    if (d < (size_t)half) {
+        const float xb = __half2float(ks[d + half]);
+        const float wb = __half2float(k_w[d + half]);
+        const float nb = xb * inv * (w_off ? (wb + 1.0f) : wb);
+        const float cf = __half2float(cos_t[p * half + d]);
+        const float sf = __half2float(sin_t[p * half + d]);
+        n = n * cf - nb * sf;
+    } else if (d >= 2 * (size_t)half) {
+    } else {
+        const float xb = __half2float(ks[d - half]);
+        const float wb = __half2float(k_w[d - half]);
+        const float nb = xb * inv * (w_off ? (wb + 1.0f) : wb);
+        const float cf = __half2float(cos_t[p * half + d - half]);
+        const float sf = __half2float(sin_t[p * half + d - half]);
+        n = n * cf + nb * sf;
+    }
+    const int block_idx = (int)(slot / page);
+    const int off = (int)(slot % page);
+    const size_t kk = ((block_idx * (size_t)page + off) * (size_t)hkv + kh) * hd + d;
+    key_cache[kk] = __float2half(n);
+    value_cache[kk] = v[t * (size_t)hkv * hd + kh * hd + d];
+}
+
+extern "C" __global__ void owl_qknorm_rope_kv_insert_f16_fp8kv_knhd(
+    const __half* __restrict__ q_raw,
+    const __half* __restrict__ k,
+    const __half* __restrict__ v,
+    unsigned char* __restrict__ key_cache,     // e4m3 [nb, page, Hkv, hd]
+    unsigned char* __restrict__ value_cache,
+    const float* __restrict__ slots,
+    const __half* __restrict__ q_w,
+    const __half* __restrict__ k_w,
+    const __half* __restrict__ cos_t,
+    const __half* __restrict__ sin_t,
+    const float* __restrict__ pos,
+    float eps,
+    int hkv, int half, int page, int w_off,
+    __half* __restrict__ q_out)
+{
+    const size_t t = blockIdx.x;
+    const size_t head = blockIdx.y;
+    const size_t d = threadIdx.x;
+    const size_t hd = blockDim.x;
+    const size_t hq = gridDim.y - (size_t)hkv;
+    const long long slot = (long long)slots[t];
+
+    if (head < hq) {
+        const size_t row_stride = hq * 2 * hd;
+        const __half* xs = q_raw + t * row_stride + head * 2 * hd;
+        extern __shared__ float smem[];
+        const float xf = __half2float(xs[d]);
+        smem[d] = xf * xf;
+        __syncthreads();
+        for (size_t s2 = hd / 2; s2 > 0; s2 >>= 1) {
+            if (d < s2) smem[d] += smem[d + s2];
+            __syncthreads();
+        }
+        const float inv = rsqrtf(smem[0] / (float)hd + eps);
+        const float wf = __half2float(q_w[d]);
+        const float n = xf * inv * (w_off ? (wf + 1.0f) : wf);
+        const size_t p = (size_t)pos[t];
+        const size_t base = (t * hq + head) * hd;
+        if (d < (size_t)half) {
+            const float xb = __half2float(xs[d + half]);
+            const float wb = __half2float(q_w[d + half]);
+            const float nb = xb * inv * (w_off ? (wb + 1.0f) : wb);
+            const float cf = __half2float(cos_t[p * half + d]);
+            const float sf = __half2float(sin_t[p * half + d]);
+            q_out[base + d] = __float2half(n * cf - nb * sf);
+            q_out[base + d + half] = __float2half(nb * cf + n * sf);
+        } else if (d >= 2 * (size_t)half) {
+            q_out[base + d] = __float2half(n);
+        }
+            return;
+    }
+
+    if (slot < 0) return;
+    const size_t kh = head - hq;
+    const __half* ks = k + t * (size_t)hkv * hd + kh * hd;
+    extern __shared__ float smem[];
+    const float kf = __half2float(ks[d]);
+    smem[d] = kf * kf;
+    __syncthreads();
+    for (size_t s2 = hd / 2; s2 > 0; s2 >>= 1) {
+        if (d < s2) smem[d] += smem[d + s2];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(smem[0] / (float)hd + eps);
+    const float wf = __half2float(k_w[d]);
+    float n = kf * inv * (w_off ? (wf + 1.0f) : wf);
+    const size_t p = (size_t)pos[t];
+    if (d < (size_t)half) {
+        const float xb = __half2float(ks[d + half]);
+        const float wb = __half2float(k_w[d + half]);
+        const float nb = xb * inv * (w_off ? (wb + 1.0f) : wb);
+        const float cf = __half2float(cos_t[p * half + d]);
+        const float sf = __half2float(sin_t[p * half + d]);
+        n = n * cf - nb * sf;
+    } else if (d >= 2 * (size_t)half) {
+    } else {
+        const float xb = __half2float(ks[d - half]);
+        const float wb = __half2float(k_w[d - half]);
+        const float nb = xb * inv * (w_off ? (wb + 1.0f) : wb);
+        const float cf = __half2float(cos_t[p * half + d - half]);
+        const float sf = __half2float(sin_t[p * half + d - half]);
+        n = n * cf + nb * sf;
+    }
+    const int block_idx = (int)(slot / page);
+    const int off = (int)(slot % page);
+    const size_t kk = ((block_idx * (size_t)page + off) * (size_t)hkv + kh) * hd + d;
+    key_cache[kk] = __nv_fp8_e4m3(n).__x;
+    value_cache[kk] = __nv_fp8_e4m3(__half2float(v[t * (size_t)hkv * hd + kh * hd + d])).__x;
+}

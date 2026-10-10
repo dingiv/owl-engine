@@ -948,8 +948,12 @@ inline __device__ float fast_tanh(float x) {
 namespace vllm {
 template <int HEAD_SIZE, int BLOCK_SIZE, int NUM_THREADS,
           int PARTITION_SIZE = 0,  // Zero means no partitioning.
-          bool KV_FP8 = false>     // B6:KV 存储为 e4m3(1B/elem,同逻辑布局;
+          bool KV_FP8 = false,     // B6:KV 存储为 e4m3(1B/elem,同逻辑布局;
                                    // 读入即转 half,dot/累加全复用 f16 路径)
+          bool KNHD = false>       // kv布局统一契约 P2:页内 [page,hkv,hd] 连续
+                                   // (host 传 kv_block_stride=page·hkv·hd、
+                                   // kv_head_stride=hd;逻辑 d→线程映射不变,
+                                   // 输出与 classic 位等)
 __device__ void paged_attention_kernel_f16(
     float* __restrict__ exp_sums,  // [num_seqs, num_heads, max_num_partitions]
     float* __restrict__ max_logits,  // [num_seqs, num_heads,
@@ -1109,7 +1113,28 @@ __device__ void paged_attention_kernel_f16(
         const int vec_idx = thread_group_offset + j * THREAD_GROUP_SIZE;
         const int offset1 = (vec_idx * VEC_SIZE) / x;
         const int offset2 = (vec_idx * VEC_SIZE) % x;
-        if constexpr (KV_FP8) {
+        if constexpr (KNHD) {
+          // 统一契约 P2:页内 [page,hkv,hd] 连续 → vec 连续直读;
+          // kv_block_stride/BLOCK_SIZE = hkv·hd(host 契约)
+          const long long kn = physical_block_number * kv_block_stride
+                             + kv_head_idx * kv_head_stride
+                             + (long long)physical_block_offset * (kv_block_stride / BLOCK_SIZE);
+          if constexpr (KV_FP8) {
+            const unsigned char* k_ptr8 =
+                reinterpret_cast<const unsigned char*>(k_cache) + kn + vec_idx * VEC_SIZE;
+            __half kt[VEC_SIZE];
+#pragma unroll
+            for (int t = 0; t < VEC_SIZE; t++) {
+              __nv_fp8_e4m3 e;
+              e.__x = k_ptr8[t];
+              kt[t] = __half(__nv_cvt_fp8_to_halfraw(e.__x, __NV_E4M3));
+            }
+            k_vecs[j] = *reinterpret_cast<const K_vec*>(kt);
+          } else {
+            k_vecs[j] = *reinterpret_cast<const K_vec*>(
+                k_cache + kn + vec_idx * VEC_SIZE);
+          }
+        } else if constexpr (KV_FP8) {
           // B6:fp8 e4m3 读入(1B/elem,同逻辑布局;标量 u8 读,
           // warp 内按 offset 相邻合曲);stride 均为元素序(f16 侧传
           // 元素 stride,fp8 侧 host 传减半后的元素 stride)
@@ -1247,12 +1272,33 @@ __device__ void paged_attention_kernel_f16(
     const unsigned char* v_ptr8 = reinterpret_cast<const unsigned char*>(v_cache) +
                             physical_block_number * kv_block_stride +
                             kv_head_idx * kv_head_stride;
+    // kNHD:元素 (pbn, pbo+j, h, row_idx) 基址(页内 token 维 stride = hkv·hd)
+    const long long v_kn_base = physical_block_number * kv_block_stride
+                              + kv_head_idx * kv_head_stride
+                              + (long long)physical_block_offset * (kv_block_stride / BLOCK_SIZE);
     for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
       const int row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
       if (row_idx < HEAD_SIZE) {
         const int offset = row_idx * BLOCK_SIZE + physical_block_offset;
         V_vec v_vec;
-        if constexpr (KV_FP8) {
+        if constexpr (KNHD) {
+          // 统一契约 P2:token 维跨 hkv·hd 聚集(gather);值序不变 → 位等
+          __half vt[V_VEC_SIZE];
+#pragma unroll
+          for (int j = 0; j < V_VEC_SIZE; j++) {
+            if constexpr (KV_FP8) {
+              __nv_fp8_e4m3 e;
+              e.__x = reinterpret_cast<const unsigned char*>(v_cache)[v_kn_base
+                  + j * (kv_block_stride / BLOCK_SIZE) + row_idx];
+              vt[j] = __half(__nv_cvt_fp8_to_halfraw(e.__x, __NV_E4M3));
+            } else {
+              vt[j] = __ushort_as_half(
+                  reinterpret_cast<const uint16_t*>(v_cache)[v_kn_base
+                      + j * (kv_block_stride / BLOCK_SIZE) + row_idx]);
+            }
+          }
+          v_vec = *reinterpret_cast<const V_vec*>(vt);
+        } else if constexpr (KV_FP8) {
           // B6:fp8 e4m3 读入(标量 u8;V 布局 [hd, block] 行连续,
           // warp 内 lane 相邻 = token 相邻 = 字节相邻,合曲)
           __half vt[V_VEC_SIZE];
@@ -1826,6 +1872,130 @@ extern "C" __global__ void vllm_paged_attention_v2_fp8_hd256bs32(
   // B6:fp8 e4m3 KV 读变体(存储 1B/elem 同逻辑布局;读入即转 half;
   // stride 语义不变,host 传元素序 stride)
   vllm::paged_attention_kernel_f16<256, 32, 128, 512, true>(
+      exp_sums, max_logits, tmp_out, q, k_cache, v_cache, num_kv_heads, scale,
+      block_tables, context_lens, max_num_blocks_per_seq, alibi_slopes, use_alibi,
+      q_stride, kv_block_stride, kv_head_stride, softscapping, sliding_window);
+}
+
+// ---- kNHD 变体(kv布局统一契约 P2;模板尾参 KNHD=true)----
+// host 传 kv_block_stride = page·hkv·hd、kv_head_stride = hd(元素序,
+// fp8 = 字节序同式);d→线程映射与 classic 一致 → 输出位等。
+
+extern "C" __global__ void vllm_paged_attention_v2_f16_knhd_hd256bs32(
+    const uint16_t* __restrict__ q, const uint16_t* __restrict__ k_cache,
+    const uint16_t* __restrict__ v_cache, const float* __restrict__ block_tables,
+    const float* __restrict__ context_lens, const float* __restrict__ alibi_slopes,
+    float* __restrict__ exp_sums, float* __restrict__ max_logits,
+    const int num_kv_heads, const float scale, const int max_num_blocks_per_seq,
+    const int q_stride, const int kv_block_stride, const int kv_head_stride,
+    const float softscapping, const int sliding_window, const int use_alibi,
+    uint16_t* __restrict__ tmp_out) {
+  vllm::paged_attention_kernel_f16<256, 32, 128, 512, false, true>(
+      exp_sums, max_logits, tmp_out, q, k_cache, v_cache, num_kv_heads, scale,
+      block_tables, context_lens, max_num_blocks_per_seq, alibi_slopes, use_alibi,
+      q_stride, kv_block_stride, kv_head_stride, softscapping, sliding_window);
+}
+
+extern "C" __global__ void vllm_paged_attention_v2_f16_knhd_hd256(
+    const uint16_t* __restrict__ q, const uint16_t* __restrict__ k_cache,
+    const uint16_t* __restrict__ v_cache, const float* __restrict__ block_tables,
+    const float* __restrict__ context_lens, const float* __restrict__ alibi_slopes,
+    float* __restrict__ exp_sums, float* __restrict__ max_logits,
+    const int num_kv_heads, const float scale, const int max_num_blocks_per_seq,
+    const int q_stride, const int kv_block_stride, const int kv_head_stride,
+    const float softscapping, const int sliding_window, const int use_alibi,
+    uint16_t* __restrict__ tmp_out) {
+  vllm::paged_attention_kernel_f16<256, 16, 128, 512, false, true>(
+      exp_sums, max_logits, tmp_out, q, k_cache, v_cache, num_kv_heads, scale,
+      block_tables, context_lens, max_num_blocks_per_seq, alibi_slopes, use_alibi,
+      q_stride, kv_block_stride, kv_head_stride, softscapping, sliding_window);
+}
+
+extern "C" __global__ void vllm_paged_attention_v2_fp8_knhd_hd256bs32(
+    const uint16_t* __restrict__ q, const uint16_t* __restrict__ k_cache,
+    const uint16_t* __restrict__ v_cache, const float* __restrict__ block_tables,
+    const float* __restrict__ context_lens, const float* __restrict__ alibi_slopes,
+    float* __restrict__ exp_sums, float* __restrict__ max_logits,
+    const int num_kv_heads, const float scale, const int max_num_blocks_per_seq,
+    const int q_stride, const int kv_block_stride, const int kv_head_stride,
+    const float softscapping, const int sliding_window, const int use_alibi,
+    uint16_t* __restrict__ tmp_out) {
+  vllm::paged_attention_kernel_f16<256, 32, 128, 512, true, true>(
+      exp_sums, max_logits, tmp_out, q, k_cache, v_cache, num_kv_heads, scale,
+      block_tables, context_lens, max_num_blocks_per_seq, alibi_slopes, use_alibi,
+      q_stride, kv_block_stride, kv_head_stride, softscapping, sliding_window);
+}
+
+extern "C" __global__ void vllm_paged_attention_v2_fp8_knhd_hd256(
+    const uint16_t* __restrict__ q, const uint16_t* __restrict__ k_cache,
+    const uint16_t* __restrict__ v_cache, const float* __restrict__ block_tables,
+    const float* __restrict__ context_lens, const float* __restrict__ alibi_slopes,
+    float* __restrict__ exp_sums, float* __restrict__ max_logits,
+    const int num_kv_heads, const float scale, const int max_num_blocks_per_seq,
+    const int q_stride, const int kv_block_stride, const int kv_head_stride,
+    const float softscapping, const int sliding_window, const int use_alibi,
+    uint16_t* __restrict__ tmp_out) {
+  vllm::paged_attention_kernel_f16<256, 16, 128, 512, true, true>(
+      exp_sums, max_logits, tmp_out, q, k_cache, v_cache, num_kv_heads, scale,
+      block_tables, context_lens, max_num_blocks_per_seq, alibi_slopes, use_alibi,
+      q_stride, kv_block_stride, kv_head_stride, softscapping, sliding_window);
+}
+
+extern "C" __global__ void vllm_paged_attention_v2_f16_knhd_hd128bs32(
+    const uint16_t* __restrict__ q, const uint16_t* __restrict__ k_cache,
+    const uint16_t* __restrict__ v_cache, const float* __restrict__ block_tables,
+    const float* __restrict__ context_lens, const float* __restrict__ alibi_slopes,
+    float* __restrict__ exp_sums, float* __restrict__ max_logits,
+    const int num_kv_heads, const float scale, const int max_num_blocks_per_seq,
+    const int q_stride, const int kv_block_stride, const int kv_head_stride,
+    const float softscapping, const int sliding_window, const int use_alibi,
+    uint16_t* __restrict__ tmp_out) {
+  vllm::paged_attention_kernel_f16<128, 32, 128, 512, false, true>(
+      exp_sums, max_logits, tmp_out, q, k_cache, v_cache, num_kv_heads, scale,
+      block_tables, context_lens, max_num_blocks_per_seq, alibi_slopes, use_alibi,
+      q_stride, kv_block_stride, kv_head_stride, softscapping, sliding_window);
+}
+
+extern "C" __global__ void vllm_paged_attention_v2_f16_knhd_hd128(
+    const uint16_t* __restrict__ q, const uint16_t* __restrict__ k_cache,
+    const uint16_t* __restrict__ v_cache, const float* __restrict__ block_tables,
+    const float* __restrict__ context_lens, const float* __restrict__ alibi_slopes,
+    float* __restrict__ exp_sums, float* __restrict__ max_logits,
+    const int num_kv_heads, const float scale, const int max_num_blocks_per_seq,
+    const int q_stride, const int kv_block_stride, const int kv_head_stride,
+    const float softscapping, const int sliding_window, const int use_alibi,
+    uint16_t* __restrict__ tmp_out) {
+  vllm::paged_attention_kernel_f16<128, 16, 128, 512, false, true>(
+      exp_sums, max_logits, tmp_out, q, k_cache, v_cache, num_kv_heads, scale,
+      block_tables, context_lens, max_num_blocks_per_seq, alibi_slopes, use_alibi,
+      q_stride, kv_block_stride, kv_head_stride, softscapping, sliding_window);
+}
+
+extern "C" __global__ void vllm_paged_attention_v2_fp8_knhd_hd128bs32(
+    const uint16_t* __restrict__ q, const uint16_t* __restrict__ k_cache,
+    const uint16_t* __restrict__ v_cache, const float* __restrict__ block_tables,
+    const float* __restrict__ context_lens, const float* __restrict__ alibi_slopes,
+    float* __restrict__ exp_sums, float* __restrict__ max_logits,
+    const int num_kv_heads, const float scale, const int max_num_blocks_per_seq,
+    const int q_stride, const int kv_block_stride, const int kv_head_stride,
+    const float softscapping, const int sliding_window, const int use_alibi,
+    uint16_t* __restrict__ tmp_out) {
+  vllm::paged_attention_kernel_f16<128, 32, 128, 512, true, true>(
+      exp_sums, max_logits, tmp_out, q, k_cache, v_cache, num_kv_heads, scale,
+      block_tables, context_lens, max_num_blocks_per_seq, alibi_slopes, use_alibi,
+      q_stride, kv_block_stride, kv_head_stride, softscapping, sliding_window);
+}
+
+extern "C" __global__ void vllm_paged_attention_v2_fp8_knhd_hd128(
+    const uint16_t* __restrict__ q, const uint16_t* __restrict__ k_cache,
+    const uint16_t* __restrict__ v_cache, const float* __restrict__ block_tables,
+    const float* __restrict__ context_lens, const float* __restrict__ alibi_slopes,
+    float* __restrict__ exp_sums, float* __restrict__ max_logits,
+    const int num_kv_heads, const float scale, const int max_num_blocks_per_seq,
+    const int q_stride, const int kv_block_stride, const int kv_head_stride,
+    const float softscapping, const int sliding_window, const int use_alibi,
+    uint16_t* __restrict__ tmp_out) {
+  vllm::paged_attention_kernel_f16<128, 16, 128, 512, true, true>(
       exp_sums, max_logits, tmp_out, q, k_cache, v_cache, num_kv_heads, scale,
       block_tables, context_lens, max_num_blocks_per_seq, alibi_slopes, use_alibi,
       q_stride, kv_block_stride, kv_head_stride, softscapping, sliding_window);

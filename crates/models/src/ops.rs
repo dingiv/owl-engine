@@ -82,6 +82,8 @@ pub enum SemanticKernel {
     K0WriteFp8,
     /// 同上 bf16 入(K0)
     K0WriteFp8Bf16,
+    K0WriteKnhd,
+    K0WriteFp8Knhd,
     /// K0 双写(classic + kNHD 影子;aux = [tokens])
     K0Dual,
     /// K0 双写 e4m3 影子
@@ -96,17 +98,25 @@ pub enum SemanticKernel {
     /// §三十一:verify 8 伪序列变体(grid.y = seqs;aux 末位 = seqs)
     PagedDecodeV2Fp8Seq,
     PagedDecodeV2Seq,
+    PagedDecodeV2Knhd,
+    PagedDecodeV2Fp8Knhd,
+    PagedDecodeV2SeqKnhd,
+    PagedDecodeV2Fp8SeqKnhd,
     /// v2 LSE 归并(exp_sums/max_logits/tmp_out → out;aux = [hd, hq, nparts])
     PagedV2Reduce,
     /// chunked prefill 在线 softmax(aux = [hd, hkv, hq, tokens])
     PagedPrefill,
     /// B6.3:chunked prefill fp8 KV 读变体
     PagedPrefillFp8,
+    PagedPrefillKnhd,
+    PagedPrefillFp8Knhd,
     /// prefill split(flash-decoding;aux = [hd, hkv, hq, tokens, nparts];
     /// ctx_base 走核参数槽,层侧传入)
     PrefillSplit,
     /// B6.3 同族:split fp8 e4m3 KV 直读(2026-10-12;修雷 + 读量减半)
     PrefillSplitFp8kv,
+    PrefillSplitKnhd,
+    PrefillSplitFp8kvKnhd,
     /// prefill split 归并(aux = [tokens, hq])
     PrefillSplitReduce,
     /// naive decode(slot 直排)
@@ -120,6 +130,8 @@ pub enum SemanticKernel {
     QkvNormRopeInsert,
     /// B6.3:fp8 e4m3 主池变体(几何同 f16;池写 1B e4m3)
     QkvNormRopeInsertFp8kv,
+    QkvNormRopeInsertKnhd,
+    QkvNormRopeInsertFp8kvKnhd,
 
     // ---- ln./mlp./load.* ----
     /// fused_add_rmsnorm:residual 原地 += mixed + rmsnorm·w(aux = [rows, n])
@@ -184,6 +196,8 @@ impl SemanticKernel {
             SemanticKernel::CastF16F32 => "elems.cast_f16_f32",
             SemanticKernel::GemvDual => "elems.gemv_dual",
             SemanticKernel::K0Write => "attn.k0_write",
+            SemanticKernel::K0WriteKnhd => "attn.k0_write_knhd",
+            SemanticKernel::K0WriteFp8Knhd => "attn.k0_write_fp8_knhd",
             SemanticKernel::K0WriteFp8 => "attn.k0_write_fp8",
             SemanticKernel::K0WriteFp8Bf16 => "attn.k0_write_fp8_bf16",
             SemanticKernel::K0Dual => "attn.k0_dual",
@@ -191,19 +205,29 @@ impl SemanticKernel {
             SemanticKernel::PagedDecode => "attn.paged_decode",
             SemanticKernel::PagedDecodeV2 => "attn.paged_decode_v2",
             SemanticKernel::PagedDecodeV2Seq => "attn.paged_decode_v2_seq",
+            SemanticKernel::PagedDecodeV2Knhd => "attn.paged_decode_v2_knhd",
+            SemanticKernel::PagedDecodeV2Fp8Knhd => "attn.paged_decode_v2_fp8_knhd",
+            SemanticKernel::PagedDecodeV2SeqKnhd => "attn.paged_decode_v2_seq_knhd",
+            SemanticKernel::PagedDecodeV2Fp8SeqKnhd => "attn.paged_decode_v2_fp8_seq_knhd",
             SemanticKernel::PagedDecodeV2Fp8 => "attn.paged_decode_v2_fp8",
             SemanticKernel::PagedDecodeV2Fp8Seq => "attn.paged_decode_v2_fp8_seq",
             SemanticKernel::PagedV2Reduce => "attn.paged_v2_reduce",
             SemanticKernel::PagedPrefill => "attn.paged_prefill",
             SemanticKernel::PagedPrefillFp8 => "attn.paged_prefill_fp8",
+            SemanticKernel::PagedPrefillKnhd => "attn.chunked_prefill_knhd",
+            SemanticKernel::PagedPrefillFp8Knhd => "attn.chunked_prefill_fp8_knhd",
             SemanticKernel::PrefillSplit => "attn.prefill_split",
             SemanticKernel::PrefillSplitFp8kv => "attn.prefill_split_fp8kv",
+            SemanticKernel::PrefillSplitKnhd => "attn.prefill_split_knhd",
+            SemanticKernel::PrefillSplitFp8kvKnhd => "attn.prefill_split_fp8_knhd",
             SemanticKernel::PrefillSplitReduce => "attn.prefill_split_reduce",
             SemanticKernel::NaiveDecode => "attn.naive_decode",
             SemanticKernel::GateMul => "attn.gate_mul",
             SemanticKernel::NormRope => "attn.norm_rope",
             SemanticKernel::QkvNormRopeInsert => "attn.qkv_norm_rope_insert",
             SemanticKernel::QkvNormRopeInsertFp8kv => "attn.qkv_norm_rope_insert_fp8kv",
+            SemanticKernel::QkvNormRopeInsertKnhd => "attn.qkv_norm_rope_insert_knhd",
+            SemanticKernel::QkvNormRopeInsertFp8kvKnhd => "attn.qkv_norm_rope_insert_fp8kv_knhd",
             SemanticKernel::FusedAddRmsnorm => "ln.fused_add_rmsnorm",
             SemanticKernel::SiluAndMul => "mlp.silu_and_mul",
             SemanticKernel::CtRepack => "load.ct_repack",

@@ -154,6 +154,11 @@ pub static REGISTRY: &[Entry] = &[
     // B6.2:K0 批量写池 fp8 变体(f16 输入,e4m3 池;形状无关单核)
     Entry { name: "owl_reshape_and_cache_fp8kv", source: sources::attention::RESHAPE_AND_CACHE_FP8KV, args: "T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_reshape_and_cache_fp8kv_bf16", source: sources::attention::RESHAPE_AND_CACHE_FP8KV, args: "T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::BF16 },
+    // ---- kNHD 变体(kv布局统一契约 P1;寻址见 cu 头注,x 形参占位)----
+    Entry { name: "vllm_reshape_and_cache_f16_knhd", source: sources::attention::RESHAPE_AND_CACHE_F16, args: "T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "vllm_reshape_and_cache_bf16_knhd", source: sources::attention::RESHAPE_AND_CACHE_F16, args: "T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::BF16 },
+    Entry { name: "owl_reshape_and_cache_fp8kv_knhd", source: sources::attention::RESHAPE_AND_CACHE_FP8KV, args: "T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "owl_reshape_and_cache_fp8kv_bf16_knhd", source: sources::attention::RESHAPE_AND_CACHE_FP8KV, args: "T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::BF16 },
     // K0 BF16(DFlash2 草稿池;同日十四)
     Entry { name: "vllm_reshape_and_cache_bf16", source: sources::attention::RESHAPE_AND_CACHE_F16, args: "T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::BF16 },
     Entry { name: "owl_cast_f16_f32", source: sources::attention::CAST, args: "T,i32,T", dtype: crate::contract::Dtype::F32 },
@@ -180,6 +185,10 @@ pub static REGISTRY: &[Entry] = &[
     // ---- chunked prefill paged attention(在线 softmax + 滑窗;grid 契约:
     //      (Hq/Hkv, Hkv, ceil(tokens/256));block (256,1,1) = TOKEN_CHUNK)----
     Entry { name: "vllm_chunked_prefill_paged_attn_opt_f16_hd128", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "vllm_chunked_prefill_paged_attn_opt_f16_knhd_hd256", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "vllm_chunked_prefill_paged_attn_opt_f16_knhd_hd128", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd128", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "vllm_chunked_prefill_paged_attn_opt_f16_hd256", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     // ---- B6.3:fp8 e4m3 KV 读变体(chunked prefill;签名同 f16)----
     Entry { name: "vllm_chunked_prefill_paged_attn_opt_fp8_hd128", source: sources::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
@@ -193,6 +202,17 @@ pub static REGISTRY: &[Entry] = &[
     // fp8 e4m3 KV 直读变体(2026-10-12;签名同 f16,K/V = 字节池):
     // ① 修雷:fp8 池 + f16 核 = 字节错位(§二十八埋雷实录);② 读量减半
     Entry { name: "owl_prefill_split_fp8kv_hd256", source: sources::attention::PREFILL_SPLIT_F16, args: "T,T,T,T,T,T,T,f32,i32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    // ---- kNHD 变体(kv布局统一契约 P2;签名与 classic 同)----
+    Entry { name: "vllm_paged_attention_v2_f16_knhd_hd256bs32", source: sources::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "vllm_paged_attention_v2_f16_knhd_hd256", source: sources::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "vllm_paged_attention_v2_f16_knhd_hd128bs32", source: sources::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "vllm_paged_attention_v2_f16_knhd_hd128", source: sources::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "vllm_paged_attention_v2_fp8_knhd_hd256bs32", source: sources::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "vllm_paged_attention_v2_fp8_knhd_hd256", source: sources::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "vllm_paged_attention_v2_fp8_knhd_hd128bs32", source: sources::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "vllm_paged_attention_v2_fp8_knhd_hd128", source: sources::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "owl_prefill_split_f16_knhd_hd256", source: sources::attention::PREFILL_SPLIT_F16, args: "T,T,T,T,T,T,T,f32,i32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "owl_prefill_split_fp8kv_knhd_hd256", source: sources::attention::PREFILL_SPLIT_F16, args: "T,T,T,T,T,T,T,f32,i32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_prefill_split_reduce_f16_hd256", source: sources::attention::PREFILL_SPLIT_F16, args: "T,T,T,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     // ---- PF1a 栈核(concat_rows;arity 8,展开路径测试锚专用)----
     Entry { name: "owl_concat_rows_f16", source: text::CONCAT_F32, args: "T,T,T,T,T,T,T,T,sz,sz,sz,T", dtype: crate::contract::Dtype::F16 },
@@ -243,6 +263,8 @@ pub static REGISTRY: &[Entry] = &[
     Entry { name: "owl_qknorm_rope_kv_insert_f16", source: sources::owl::QKNORM_ROPE_KV_INSERT_F16, args: "T,T,T,T,T,T,T,T,T,T,T,f32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     // B6.3:fp8 主池变体(签名逐字同 f16;cache 形参 u8 寻址 1B/elem)
     Entry { name: "owl_qknorm_rope_kv_insert_f16_fp8kv", source: sources::owl::QKNORM_ROPE_KV_INSERT_F16_FP8KV, args: "T,T,T,T,T,T,T,T,T,T,T,f32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "owl_qknorm_rope_kv_insert_f16_knhd", source: sources::owl::QKNORM_ROPE_KV_INSERT_F16, args: "T,T,T,T,T,T,T,T,T,T,T,f32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
+    Entry { name: "owl_qknorm_rope_kv_insert_f16_fp8kv_knhd", source: sources::owl::QKNORM_ROPE_KV_INSERT_F16_FP8KV, args: "T,T,T,T,T,T,T,T,T,T,T,f32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     // ---- 刀D 层间时间戳探针(2026-10-12 自 models 逃生舱收编;链式拷贝 + clock64)----
     Entry { name: "probe_ts_f16", source: sources::owl::TS_PROBE, args: "T,T,sz,sz,T", dtype: crate::contract::Dtype::F16 },
     // ---- ct packed → marlin B 设备重排(2026-10-01 装载提速;AWQ 装载线)----

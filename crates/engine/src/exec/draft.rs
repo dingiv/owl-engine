@@ -949,7 +949,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // FI 表四件套(与 prefill_chunk 同款;ctx_total = base + t)
         let i32le = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
         let fi_tensors;
-        let fi = if !self.pool.k_fis.is_empty() {
+        let fi = if self.pool.fi_face {
             let page = self.pool.page;
             let ctx_total = base + t;
             let nb = bt_chain.len();

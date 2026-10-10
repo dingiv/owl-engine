@@ -395,6 +395,10 @@ mod tests {
                 chat: crate::tokenizer::ChatFormat {
                     prefix: String::new(),
                     suffix: String::new(),
+                    im_open: String::new(),
+                    im_close: String::new(),
+                    assistant_open: String::new(),
+                    think_prefill: String::new(),
                 },
             },
             tied: true,

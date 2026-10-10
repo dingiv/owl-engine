@@ -379,7 +379,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
         if fi_quant.is_some() {
             eprintln!(
                 "[boot] FlashInfer prefill 面启用(影子池 ×{},quant={:?})",
-                pool.k_fis.len(),
+                pool.fi_face as usize,
                 fi_quant.unwrap()
             );
         }

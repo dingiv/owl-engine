@@ -147,6 +147,8 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "ops.rmsnorm" => ops::rmsnorm(dt, req.shapes),
         "attn.k0_write" => attn::k0_write(dt, ax(0)),
         "attn.k0_write_fp8" => attn::k0_write_fp8(ax(0)), // B6.2:f16 入 → e4m3 池(ax=tokens)
+        "attn.k0_write_knhd" => attn::k0_write_knhd(dt, ax(0)),
+        "attn.k0_write_fp8_knhd" => attn::k0_write_fp8_knhd(ax(0)),
         "attn.k0_write_fp8_bf16" => attn::k0_write_fp8_bf16(ax(0)), // B6:bf16 入 → e4m3 池
         "attn.k0_dual" => attn::k0_dual(ax(0)),
         "attn.k0_dual_fp8kv" => attn::k0_dual_fp8kv(ax(0)),
@@ -167,12 +169,26 @@ pub fn resolve(req: OpReq) -> KernelPick {
             // f16 兑底臂(seqs 参数化;同上)
             attn::paged_decode_v2_seq(req.env, dt, ax(0), ax(1), ax(2), ax(3), ax(4), ax(5))
         }
+        "attn.paged_decode_v2_knhd" => {
+            attn::paged_decode_v2_knhd(req.env, dt, ax(0), ax(1), ax(2), ax(3), ax(4))
+        }
+        "attn.paged_decode_v2_fp8_knhd" => {
+            attn::paged_decode_v2_fp8_knhd(req.env, dt, ax(0), ax(1), ax(2), ax(3), ax(4))
+        }
+        "attn.paged_decode_v2_fp8_seq_knhd" => {
+            attn::paged_decode_v2_fp8_seq_knhd(req.env, dt, ax(0), ax(1), ax(2), ax(3), ax(4), ax(5))
+        }
+        "attn.paged_decode_v2_seq_knhd" => {
+            attn::paged_decode_v2_seq_knhd(req.env, dt, ax(0), ax(1), ax(2), ax(3), ax(4), ax(5))
+        }
         "attn.paged_v2_reduce" => {
             // aux = [hd, hq, nparts]
             attn::paged_v2_reduce(dt, ax(0), ax(1), ax(2))
         }
         "attn.paged_prefill" => attn::paged_prefill(req.env, dt, ax(0), ax(1), ax(2), ax(3)), // aux = [hd, hkv, hq, tokens]
         "attn.paged_prefill_fp8" => attn::paged_prefill_fp8(req.env, dt, ax(0), ax(1), ax(2), ax(3)), // B6.3 fp8 读变体
+        "attn.chunked_prefill_knhd" => attn::paged_prefill_knhd(req.env, dt, ax(0), ax(1), ax(2), ax(3)),
+        "attn.chunked_prefill_fp8_knhd" => attn::paged_prefill_fp8_knhd(req.env, dt, ax(0), ax(1), ax(2), ax(3)),
         "attn.prefill_split" => {
             // aux = [hd, hkv, hq, tokens, nparts](ctx_base 走核参数槽,层侧传入)
             let (hd, hkv, hq, tokens, nparts) = (ax(0), ax(1), ax(2), ax(3), ax(4));
@@ -182,6 +198,14 @@ pub fn resolve(req: OpReq) -> KernelPick {
             // aux 同 prefill_split;fp8 e4m3 KV 直读(2026-10-12 修雷 + 读量减半)
             let (hd, hkv, hq, tokens, nparts) = (ax(0), ax(1), ax(2), ax(3), ax(4));
             attn::prefill_split_fp8kv(req.env, dt, hd, hkv, hq, tokens, nparts)
+        }
+        "attn.prefill_split_knhd" => {
+            let (hd, hkv, hq, tokens, nparts) = (ax(0), ax(1), ax(2), ax(3), ax(4));
+            attn::prefill_split_knhd(req.env, dt, hd, hkv, hq, tokens, nparts)
+        }
+        "attn.prefill_split_fp8_knhd" => {
+            let (hd, hkv, hq, tokens, nparts) = (ax(0), ax(1), ax(2), ax(3), ax(4));
+            attn::prefill_split_fp8kv_knhd(req.env, dt, hd, hkv, hq, tokens, nparts)
         }
         "attn.prefill_split_reduce" => {
             // aux = [tokens, hq]
@@ -220,6 +244,14 @@ pub fn resolve(req: OpReq) -> KernelPick {
             // B6.3:fp8 主池变体(几何同 f16;池写 e4m3 1B)
             let (tokens, hq, hkv, hd, half) = (ax(0), ax(1), ax(2), ax(3), ax(4));
             attn::qkv_norm_rope_insert_fp8kv(tokens, hq, hkv, hd, half)
+        }
+        "attn.qkv_norm_rope_insert_knhd" => {
+            let (tokens, hq, hkv, hd, half) = (ax(0), ax(1), ax(2), ax(3), ax(4));
+            attn::qkv_norm_rope_insert_knhd(dt, tokens, hq, hkv, hd, half)
+        }
+        "attn.qkv_norm_rope_insert_fp8kv_knhd" => {
+            let (tokens, hq, hkv, hd, half) = (ax(0), ax(1), ax(2), ax(3), ax(4));
+            attn::qkv_norm_rope_insert_fp8kv_knhd(tokens, hq, hkv, hd, half)
         }
                 "ln.fused_add_rmsnorm" => {
             let (rows, n) = (ax(0), ax(1));
@@ -642,6 +674,31 @@ pub mod attn {
         }
     }
 
+    /// kNHD 变体(统一契约 P2;签名/网格同 classic,kernel 名 _knhd)
+    pub fn paged_prefill_knhd(
+        env: &OpEnv, dt: DType, hd: usize, hkv: usize, hq: usize, tokens: usize,
+    ) -> KernelPick {
+        let mut p = paged_prefill(env, dt, hd, hkv, hq, tokens);
+        p.name = match hd {
+            128 => "vllm_chunked_prefill_paged_attn_opt_f16_knhd_hd128",
+            256 => "vllm_chunked_prefill_paged_attn_opt_f16_knhd_hd256",
+            other => panic!("chunked knhd 仅 hd∈{{128,256}},得 {other}"),
+        };
+        p
+    }
+
+    pub fn paged_prefill_fp8_knhd(
+        env: &OpEnv, dt: DType, hd: usize, hkv: usize, hq: usize, tokens: usize,
+    ) -> KernelPick {
+        let mut p = paged_prefill(env, dt, hd, hkv, hq, tokens);
+        p.name = match hd {
+            128 => "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd128",
+            256 => "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256",
+            other => panic!("chunked fp8 knhd 仅 hd∈{{128,256}},得 {other}"),
+        };
+        p
+    }
+
     /// K0-dual(FlashInfer 配套;classic K/V + kNHD K/V 影子一次发射)
     pub fn k0_dual(tokens: usize) -> KernelPick {
         KernelPick {
@@ -757,6 +814,66 @@ pub mod attn {
         }
     }
 
+    /// kNHD 变体(统一契约 P2;签名同 classic,kernel 名 _knhd)
+    pub fn paged_decode_v2_knhd(
+        env: &OpEnv, dt: DType, hd: usize, hq: usize, hkv: usize, nb: usize, nparts: usize,
+    ) -> KernelPick {
+        paged_decode_v2_seq_knhd(env, dt, hd, hq, hkv, nb, nparts, 1)
+    }
+
+    pub fn paged_decode_v2_seq_knhd(
+        env: &OpEnv, dt: DType, hd: usize, hq: usize, _hkv: usize, _nb: usize,
+        nparts: usize, seqs: usize,
+    ) -> KernelPick {
+        assert!(matches!(dt, DType::F16), "paged v2 knhd 仅有 f16 变体(dt={dt:?})");
+        let page = env.page;
+        let name = match (hd, page) {
+            (128, 32) => "vllm_paged_attention_v2_f16_knhd_hd128bs32",
+            (256, 32) => "vllm_paged_attention_v2_f16_knhd_hd256bs32",
+            (128, 16) => "vllm_paged_attention_v2_f16_knhd_hd128",
+            (256, 16) => "vllm_paged_attention_v2_f16_knhd_hd256",
+            other => panic!("paged v2 knhd: (hd,page) {other:?} 无配对 wrapper"),
+        };
+        let floor = (128u32 / 32 / 2) * hd as u32 * 4;
+        KernelPick {
+            name,
+            shape: Shape {
+                grid: (hq as u32, seqs as u32, nparts as u32),
+                block: (128, 1, 1),
+                smem: 2048u32.max(floor),
+            },
+        }
+    }
+
+    pub fn paged_decode_v2_fp8_knhd(
+        env: &OpEnv, dt: DType, hd: usize, hq: usize, hkv: usize, nb: usize, nparts: usize,
+    ) -> KernelPick {
+        paged_decode_v2_fp8_seq_knhd(env, dt, hd, hq, hkv, nb, nparts, 1)
+    }
+
+    pub fn paged_decode_v2_fp8_seq_knhd(
+        env: &OpEnv, _dt: DType, hd: usize, hq: usize, _hkv: usize, _nb: usize,
+        nparts: usize, seqs: usize,
+    ) -> KernelPick {
+        let page = env.page;
+        let name = match (hd, page) {
+            (128, 32) => "vllm_paged_attention_v2_fp8_knhd_hd128bs32",
+            (256, 32) => "vllm_paged_attention_v2_fp8_knhd_hd256bs32",
+            (128, 16) => "vllm_paged_attention_v2_fp8_knhd_hd128",
+            (256, 16) => "vllm_paged_attention_v2_fp8_knhd_hd256",
+            other => panic!("paged v2 fp8 knhd: (hd,page) {other:?} 无配对 wrapper"),
+        };
+        let floor = (128u32 / 32 / 2) * hd as u32 * 4;
+        KernelPick {
+            name,
+            shape: Shape {
+                grid: (hq as u32, seqs as u32, nparts as u32),
+                block: (128, 1, 1),
+                smem: 2048u32.max(floor),
+            },
+        }
+    }
+
     /// v2 LSE 归并(模板无 BLOCK/页参数 —— 单 wrapper 通用两页;reduce
     /// smem = 2·nparts·4B(shared_max_logits + shared_exp_sums);
     /// grid (hq,1,1),block 128;ctx ≤512 时核内退化为 tmp_out 直拷)。
@@ -856,6 +973,48 @@ pub mod attn {
         let mut p = prefill_split(env, dt, hd, hkv, hq, tokens, nparts);
         p.name = "owl_prefill_split_fp8kv_hd256";
         p
+    }
+
+    /// kNHD 变体(统一契约 P2;签名/class 同,kernel 名 _knhd;
+    /// host stride = page·hkv·hd / hd 由调用侧 op-env 投影,res 元数据不变)
+    pub fn prefill_split_knhd(
+        env: &OpEnv, dt: DType, hd: usize, hkv: usize, hq: usize, tokens: usize, nparts: usize,
+    ) -> KernelPick {
+        assert!(matches!(dt, DType::F16), "prefill split knhd 仅有 f16 变体");
+        assert!(env.page == 32, "prefill split 页 32 契约,得 {}", env.page);
+        let name = match hd {
+            256 => "owl_prefill_split_f16_knhd_hd256",
+            other => panic!("prefill split knhd 仅 hd256,得 {other}"),
+        };
+        let qchunks = (tokens + 63) / 64;
+        KernelPick {
+            name,
+            shape: Shape {
+                grid: ((hq / hkv) as u32, hkv as u32, (qchunks * nparts) as u32),
+                block: (256, 1, 1),
+                smem: (64 * hd * 2 * 2) as u32,
+            },
+        }
+    }
+
+    pub fn prefill_split_fp8kv_knhd(
+        env: &OpEnv, dt: DType, hd: usize, hkv: usize, hq: usize, tokens: usize, nparts: usize,
+    ) -> KernelPick {
+        assert!(matches!(dt, DType::F16), "prefill split fp8 knhd 输入 f16(dt={dt:?})");
+        assert!(env.page == 32, "prefill split 页 32 契约,得 {}", env.page);
+        let name = match hd {
+            256 => "owl_prefill_split_fp8kv_knhd_hd256",
+            other => panic!("prefill split fp8 knhd 仅 hd256,得 {other}"),
+        };
+        let qchunks = (tokens + 63) / 64;
+        KernelPick {
+            name,
+            shape: Shape {
+                grid: ((hq / hkv) as u32, hkv as u32, (qchunks * nparts) as u32),
+                block: (256, 1, 1),
+                smem: (64 * hd * 2 * 2) as u32,
+            },
+        }
     }
 
     /// prefill split reduce(每 thread 一 (token, head) 合并 nparts;
@@ -972,6 +1131,43 @@ pub mod attn {
         }
     }
 
+    /// kNHD 变体(统一契约 P1):q 出/w 写面与 classic 版逐式一致
+    pub fn qkv_norm_rope_insert_knhd(
+        dt: DType,
+        tokens: usize,
+        hq: usize,
+        hkv: usize,
+        hd: usize,
+        _half: usize,
+    ) -> KernelPick {
+        assert!(matches!(dt, DType::F16), "owl_qknorm_rope_kv_insert_knhd 仅有 f16 变体");
+        KernelPick {
+            name: "owl_qknorm_rope_kv_insert_f16_knhd",
+            shape: Shape {
+                grid: (tokens as u32, (hq + hkv) as u32, 1),
+                block: (hd as u32, 1, 1),
+                smem: (hd * 4) as u32,
+            },
+        }
+    }
+
+    pub fn qkv_norm_rope_insert_fp8kv_knhd(
+        tokens: usize,
+        hq: usize,
+        hkv: usize,
+        hd: usize,
+        _half: usize,
+    ) -> KernelPick {
+        KernelPick {
+            name: "owl_qknorm_rope_kv_insert_f16_fp8kv_knhd",
+            shape: Shape {
+                grid: (tokens as u32, (hq + hkv) as u32, 1),
+                block: (hd as u32, 1, 1),
+                smem: (hd * 4) as u32,
+            },
+        }
+    }
+
     /// B6.3:fp8 e4m3 主池变体(几何逐字同 f16;cache 形参 u8 寻址)
     pub fn qkv_norm_rope_insert_fp8kv(
         tokens: usize,
@@ -987,6 +1183,25 @@ pub mod attn {
                 block: (hd as u32, 1, 1),
                 smem: (hd * 4) as u32,
             },
+        }
+    }
+
+    /// kNHD 变体(kv布局统一契约 P1):K/V 同构 [nb,page,hkv,hd],x 形参占位不参与寻址
+    pub fn k0_write_knhd(dt: DType, tokens: usize) -> KernelPick {
+        KernelPick {
+            name: match dt {
+                DType::F16 => "vllm_reshape_and_cache_f16_knhd",
+                DType::BF16 => "vllm_reshape_and_cache_bf16_knhd",
+                other => unimplemented!("k0_write_knhd 无 {other:?} 变体"),
+            },
+            shape: Shape { grid: (tokens as u32, 1, 1), block: (256, 1, 1), smem: 0 },
+        }
+    }
+
+    pub fn k0_write_fp8_knhd(tokens: usize) -> KernelPick {
+        KernelPick {
+            name: "owl_reshape_and_cache_fp8kv_knhd",
+            shape: Shape { grid: (tokens as u32, 1, 1), block: (256, 1, 1), smem: 0 },
         }
     }
 
