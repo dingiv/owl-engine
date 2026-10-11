@@ -21,7 +21,7 @@ const NK: usize = 16;
 const NV: usize = 48;
 const KD: usize = 128;
 const VD: usize = 128;
-const SCALE: f32 = 0.08838834764831845; // 1/sqrt(128)
+const SCALE: f32 = 0.088_388_346; // 1/sqrt(128)
 
 struct Case {
     q: Vec<f32>,
@@ -150,8 +150,8 @@ fn gdn_scalar_golden() {
         }
         stream.synchronize().expect("sync");
 
-        let o_host = stream.memcpy_dtov(&o).expect("dtoh o");
-        let st_host = stream.memcpy_dtov(&state).expect("dtoh state");
+        let o_host = stream.clone_dtoh(&o).expect("dtoh o");
+        let st_host = stream.clone_dtoh(&state).expect("dtoh state");
         let (oi, doo) = max_dev(&o_host, &case.o);
         let (si, dst) = max_dev(&st_host, &case.final_state);
         eprintln!("[{tag}] o={doo:.3e}@{oi} state={dst:.3e}@{si}");

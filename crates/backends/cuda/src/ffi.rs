@@ -93,7 +93,7 @@ pub const CAPTURE_MODE_THREAD_LOCAL: CUstreamCaptureMode =
 /// 40 tok/s 的主税)。cudarc safe end_capture 强绑该旗标(sys enum 无 0
 /// 变体,transmute 被运行时校验拒绝),零旗标只能裸调。
 /// 准入证据:cudarc 0.19.9 sys/mod.rs:10640(load 直通,与其他白名单项同款)
-
+///
 /// 流序清零(非阻塞;可捕获 —— 图内 memset 节点 = 每次 replay 重清零)
 pub use cudarc::driver::result::memset_d8_async;
 

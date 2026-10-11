@@ -248,6 +248,9 @@ impl<D: DeviceClient + 'static> Engine<D> {
 
     /// 模型交引擎:状态块/槽/Session 组建 + warmup —— 仍不跑任何 turn,
     /// 返回执行态引擎(请求入口)。
+    // A3 同步隔离:引擎单线程模型(每卡一线程);Arc 仅作共享句柄,
+    // 不跨线程发送 —— clippy 的 Send+Sync 建议不适用。
+    #[allow(clippy::arc_with_non_send_sync)]
     pub async fn run(mut self, loaded: LoadedModel) -> Result<RunningEngine<D>> {
         let t_run = std::time::Instant::now();
         let s = self.cfg.max_seq_tokens;
@@ -361,7 +364,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
             eprintln!("[boot] KV 池 fp8 e4m3(容量减半/ctx 翻倍;读核 *_fp8 变体)");
         }
         // B6 偷显存:草稿池 e4m3(与草稿装载同旗标)
-        let dflash_fp8 = self.cfg.knobs.draft.kv_quant == owl_models::env::KvQuant::Fp8E4M3;
+        let _dflash_fp8 = self.cfg.knobs.draft.kv_quant == owl_models::env::KvQuant::Fp8E4M3;
         let plan = crate::state::PoolPlan {
             seq_tokens: s,
             pool_tokens,
@@ -383,10 +386,10 @@ impl<D: DeviceClient + 'static> Engine<D> {
             dump_all: self.cfg.knobs.gdn_dump_all,
         };
         let pool = StatePool::alloc(&mut self.face, dims, &loaded.spec.layer_types, &plan).await?;
-        if fi_quant.is_some() {
+        if let Some(q) = fi_quant {
             eprintln!(
                 "[boot] FlashInfer prefill 面启用(FI 直读主池 kNHD 单池;quant={:?})",
-                fi_quant.unwrap()
+                q
             );
         }
 
@@ -555,7 +558,10 @@ impl<D: DeviceClient + 'static> Engine<D> {
             && vface.is_some()
             && matches!(capture_outcome, crate::graph_plan::PlanOutcome::Captured)
         {
-            let vface = vface.unwrap();
+            let vface = match vface {
+                Some(v) => v,
+                None => unreachable!("vface.is_some() 已守门"),
+            };
             let depth1 = spec_depth + 1;
             let model_v = Arc::clone(&loaded.model);
             let rp_v = loaded.rope.clone();
@@ -573,7 +579,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
                 .collect();
             let xqa_sem_n = xqa_pool_ctx.as_ref().map(|x| x.semaphores.shape().iter().product::<usize>()).unwrap_or(0);
             let xqa_mask_init: Vec<f32> = (0..depth1)
-                .map(|i| f32::from_bits(((1u32 << (i + 1)) - 1) as u32))
+                .map(|i| f32::from_bits((1u32 << (i + 1)) - 1))
                 .collect();
             let env_v = env;
             let key_dim = dims.nk * dims.hk;
@@ -597,7 +603,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
                 }
             }
             for i in 0..gdn_caches.len() * 8 {
-                let (gi, f) = (i / 8, i % 8);
+                let (_gi, f) = (i / 8, i % 8);
                 let shape = match f {
                     0 | 1 => vec![depth1, key_dim],
                     2 => vec![depth1, value_dim],
@@ -607,7 +613,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
                 };
                 vouts.push(OutputSlot { name: format!("r{i}") , shape, dtype: dims.dtype });
             }
-            let (mut vg, voutcome) = GraphPlan::plan(
+            let (vg, voutcome) = GraphPlan::plan(
                 vface,
                 GraphPlanDesc {
                     inputs: vec![
@@ -855,7 +861,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
                     .collect();
                 let kv_leaves = pool.dflash_kv_leaves().expect("dflash 池");
                 let bt_leaf = pool.bt_leaf_flat();
-            let bt_leaf_nb = *bt_leaf.shape().last().unwrap_or(&1);
+            let _bt_leaf_nb = *bt_leaf.shape().last().unwrap_or(&1);
                 let model_df = Arc::clone(&loaded.model);
                 let rp_df = draft_rope.as_ref().expect("draft rope").clone();
                 let d2g = Arc::clone(d2);
@@ -960,8 +966,8 @@ impl<D: DeviceClient + 'static> Engine<D> {
             // hidden = verify hid 槽前缀视图;lm_head/链全部入图)。
             if let Some(crate::running::Drafter::Mtp(mtp)) = drafter.as_ref() {
                 let dd = dims;
-                let key_dim = dims.nk * dims.hk;
-                let value_dim = dims.nv * dims.hv;
+                let _key_dim = dims.nk * dims.hk;
+                let _value_dim = dims.nv * dims.hv;
                 // 链步 decode 读核 scratch(seqs=1;与 draft.rs eager 路同源):
                 // kNHD 池落 v1 = 布局错位 → 草稿垃圾(2026-10-13 守卫捕获)
                 let attn_v2_pool = pool.attn_v2_scratch();
@@ -977,7 +983,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
                     let hid = hid_blk.clone();
                     let env_p = env;
                     let vocab = loaded.model.vocab_size();
-                    let nb = pool.nb;
+                    let _nb = pool.nb;
                     let mut pins = vec![InputSlot::f32("tok_ext", m1), InputSlot::f32("pos_ext", m1), InputSlot::f32("slots_ext", m1), InputSlot::f32("lens_ext", m1)];
                     for j in 0..spec_depth - 1 {
                         pins.push(InputSlot::f32(format!("c{j}_pos"), 1));

@@ -31,7 +31,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let last_row = self.prefill_chunk(&chunk_ids, base, is_last).await?;
         // E2c:块边界跨越 → GDN 快照拍摄(可复用身份 = 链尾块)
         let new_fed = base + chunk_ids.len();
-        if self.pool.paged && new_fed % self.pool.page == 0 {
+        if self.pool.paged && new_fed.is_multiple_of(self.pool.page) {
             self.capture_gdn_snap(sid, new_fed).await?;
         }
         self.active.as_mut().expect("活跃").fed += chunk_ids.len();
@@ -96,7 +96,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // E2c:decode 跨页边界 → 快照拍摄(同流保序,先拍再采样)
         {
             let act = self.active.as_ref().expect("活跃");
-            if self.pool.paged && act.fed % self.pool.page == 0 {
+            if self.pool.paged && act.fed.is_multiple_of(self.pool.page) {
                 self.capture_gdn_snap(act.session_id, act.fed).await?;
             }
         }
@@ -133,7 +133,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 let face = self.session.face_mut();
                 face.dtoh(&kv0.0, &mut whole).await?;
                 let (hkv, hd) = (self.pool.dims.hkv, self.pool.dims.hd);
-                let page = self.pool.page;
+                let _page = self.pool.page;
                 let k_off =
                     |slot: usize, d: usize| -> usize { owl_models::env::knhd_offset(slot, 0, d, hkv, hd) };
                 let probe = |slot: usize| -> usize {
@@ -212,7 +212,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
             nt
         } else if self.env.diag.host_argmax {
-            let mut logits = self.session.read_output_f32("logits").await?;
+            let logits = self.session.read_output_f32("logits").await?;
             logits.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |a, (i, &v)| {
                 if v > a.1 { (i, v) } else { a }
             })
@@ -226,7 +226,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     (act.id, act.out.len() as u64)
                 };
                 if step < 16 {
-                    let mut logits = self.session.read_output_f32("logits").await?;
+                    let logits = self.session.read_output_f32("logits").await?;
                     let mut top: Vec<(f32, u32)> = logits
                         .iter()
                         .enumerate()

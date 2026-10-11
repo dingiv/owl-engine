@@ -269,7 +269,7 @@ impl GdnChunkedCallBuilder {
         // 原空体 if 为死校验,静默放行已删除)。
         let slot_stride = self.shape.nv as usize * self.shape.kd as usize * self.shape.kd as usize;
         if pool.len != 0 {
-            if pool.len % slot_stride != 0 {
+            if !pool.len.is_multiple_of(slot_stride) {
                 return Err(OpError::Contract {
                     op: GDN_CHUNKED.to_string(),
                     field: "state",

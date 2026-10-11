@@ -70,8 +70,10 @@ pub struct AwqSource {
     maps: Vec<Mmap>,
     index: HashMap<String, RawEntry>,
     /// 懒物化字节缓存(键 → 字节;容量清空驱逐)
+    #[allow(clippy::type_complexity)] // 行块缓存(字节镜像 + 计数)
     cache: Mutex<(HashMap<String, Arc<[u8]>>, usize)>,
     /// gather/fused 索引表(按 (k, out, fused?) 形状复用;除法分解只算一次)
+    #[allow(clippy::type_complexity)] // 索引缓存(键 → 列序)
     idx_cache: Mutex<HashMap<(usize, usize, bool), Arc<Vec<u32>>>>,
     /// 构建分片锁(16 片按 base hash;同 base 互斥、异 base 并行 ——
     /// 全局单锁时 build 串行链 ≈ 装载墙钟主导,分片后 4 桶并发 build
@@ -649,8 +651,7 @@ impl WeightSource for AwqSource {
             }
             return Some(v2_workspace_len(out));
         }
-        if key.ends_with(".marlin_ctmp") {
-            let base = &key[..key.len() - ".marlin_ctmp".len()];
+        if let Some(base) = key.strip_suffix(".marlin_ctmp") {
             let (out, k, _) = self.linear_form(base)?;
             if !crate::formats::w4a16::marlin_eligible(out, k) {
                 return None;
@@ -900,7 +901,7 @@ mod tests {
         let mut header = String::from("{");
         let mut blobs: Vec<Vec<u8>> = Vec::new();
         let mut offset = 0usize;
-        let mut entry = |header: &mut String, name: &str, dtype: &str, shape: &[usize], bytes: Vec<u8>, offset: &mut usize| {
+        let entry = |header: &mut String, name: &str, dtype: &str, shape: &[usize], bytes: Vec<u8>, offset: &mut usize| {
             let n = bytes.len();
             header.push_str(&format!(
                 "{}\"{}\": {{\"dtype\": \"{}\", \"shape\": [{}], \"data_offsets\": [{}, {}]}}",

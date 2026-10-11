@@ -222,6 +222,7 @@ async fn main() {
     // 两步 decode:
     // A:bs=2,异序列异窗位(seq0 窗 [0,1),seq1 窗 [4,6) —— 基址非零,行 4 为零行)
     // B:seq0 续步,窗 [0,2) 读回 A 步写入的 row 0(跨步缓存读)
+    #[allow(clippy::type_complexity)] // 四段切片表(host 期望值)
     let steps: [(&[f32], &[f32], &[f32], &[f32]); 2] = [
         (
             &[0.5, -0.25, 1.0, -0.6, 0.4, 0.9], // xs(bs=2 × hidden)

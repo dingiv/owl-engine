@@ -95,6 +95,7 @@ fn host_attn_ref(q: &[u16], kcache: &[u8], vcache: &[u8], kv_fp8: bool) -> Vec<f
     for t in 0..T {
         for h in 0..H {
             let kvh = h / (H / HKV);
+            #[allow(clippy::needless_range_loop)]
             for b in 0..=t {
                 let pb = b / PAGE;
                 let bb = b % PAGE;
@@ -111,6 +112,7 @@ fn host_attn_ref(q: &[u16], kcache: &[u8], vcache: &[u8], kv_fp8: bool) -> Vec<f
             let l: f32 = qk[..=t].iter().map(|&x| (x - m).exp()).sum();
             for d in 0..HD {
                 let mut acc = 0f32;
+                #[allow(clippy::needless_range_loop)]
                 for b in 0..=t {
                     let pb = b / PAGE;
                     let bb = b % PAGE;
@@ -211,7 +213,7 @@ fn run_case(
             .arg(&page)
             .arg(&hq)
             .arg(&dm_p);
-        let qchunks = (T + 63) / 64;
+        let qchunks = T.div_ceil(64);
         let cfg = LaunchConfig {
             grid_dim: ((H / HKV) as u32, HKV as u32, (qchunks * nparts) as u32),
             block_dim: (256, 1, 1),
@@ -235,7 +237,7 @@ fn run_case(
             .arg(&t_i)
             .arg(&o_p);
         let cfg2 = LaunchConfig {
-            grid_dim: (((T * H + 255) / 256) as u32, 1, 1),
+            grid_dim: ((T * H).div_ceil(256) as u32, 1, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -319,9 +321,9 @@ fn run_case(
     for &(i, ..) in &hot {
         *dh.entry(i % HD).or_insert(0) += 1;
     }
-    println!("   ts={:?} d_hist={:?}", &ts, &dh);
+    println!("   ts={:?} d_hist={:?}", ts, dh);
     for &(i, g, r, e) in hot.iter().take(4) {
-        let (tt, hh, dd) = (i / (H * HD), (i / HD) % H, i % HD);
+        let (_tt, hh, dd) = (i / (H * HD), (i / HD) % H, i % HD);
         let kvh = hh / (H / HKV);
         let vidx = kvh * (HD * PAGE) + dd * PAGE; // phys=0,off=0(gt=0)
         println!(
@@ -354,7 +356,7 @@ fn run_case(
                 let kvh = h / (H / HKV);
                 let ctx_end = t + 1;
                 let max_ctx = T;
-                let p_len = (max_ctx + nparts - 1) / nparts;
+                let p_len = max_ctx.div_ceil(nparts);
                 for p in 0..nparts {
                     let ps = p * p_len;
                     let pe = std::cmp::min((p + 1) * p_len, max_ctx);

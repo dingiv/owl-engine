@@ -1,7 +1,7 @@
 //! F1 治理探针:cuBLAS 账外显存占用实测(handle 创建 / 首个 gemm /
 //! 换形状 gemm 三个时点的 nvidia-smi used 差值)。
 
-use owl_cuda::{test_device_ordinal, Arg, DeviceClient as _, DeviceSelector, Dtype, GpuClient, GpuServer, LaunchMsg, Shape};
+use owl_cuda::{test_device_ordinal, Arg, DeviceClient as _, DeviceSelector, Dtype, GpuClient, GpuServer, LaunchMsg};
 
 /// foreign-kernel 通道:Launch + 虚拟核名 cublas_gemm_f16
 /// 槽序契约(cublas.rs):[T a, T b, T out, sz m, sz k, sz n, sz nt]

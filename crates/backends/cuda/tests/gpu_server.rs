@@ -61,7 +61,7 @@ fn le_to_f32(buf: &[u8]) -> Vec<f32> {
 async fn harvest(client: &mut GpuClient, out: &Bytes, n: usize) -> Vec<f32> {
     client.sync().await.expect("sync 栅栏");
     let mut buf = vec![0u8; n * 4];
-    client.dtoh(&out, &mut buf).await.expect("dtoh");
+    client.dtoh(out, &mut buf).await.expect("dtoh");
     le_to_f32(&buf)
 }
 
@@ -84,7 +84,7 @@ fn scale_msg(x: &Bytes, out: &Bytes, k: f32, n: usize) -> LaunchMsg {
             Arg::U64(n as u64),
             Arg::Block { id: out.id },
         ],
-        grid: (((n as u32) + 255) / 256, 1, 1),
+        grid: ((n as u32).div_ceil(256), 1, 1),
         block: (256, 1, 1),
         shared_mem: 0,
         out_elems: n,
@@ -176,7 +176,7 @@ async fn step_graph_capture_and_replay(client: &mut GpuClient, x: &Bytes) {
 async fn step_graph_guardrails(client: &mut GpuClient, x: &Bytes) {
     // a) graph_begin 后做 dtoh → Err
     client.graph_begin().await.expect("graph_begin");
-    let r = client.dtoh(x, &mut vec![0u8; 16]).await;
+    let r = client.dtoh(x, &mut [0u8; 16]).await;
     assert!(r.is_err(), "捕获期 dtoh 应被拒,实得 {r:?}");
 
     // b) 嵌套 graph_begin → Err

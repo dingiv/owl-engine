@@ -179,7 +179,7 @@ impl GpuCtx {
         let ctx = CudaContext::new(ordinal).map_err(|e| format!("{e:?}"))?;
         ctx.bind_to_thread().map_err(|e| format!("{e:?}"))?;
         // B6.5:设备总显存落账(vram 治理面;一次)
-        match unsafe { cudarc::driver::result::device::get(ordinal as i32) }
+        match cudarc::driver::result::device::get(ordinal as i32)
             .and_then(|dev| unsafe { cudarc::driver::result::device::total_mem(dev) })
         {
             Ok(bytes) => owl_shared::vram::total_set(bytes as u64),
@@ -389,14 +389,14 @@ impl GpuCtx {
             eprintln!("[gl-prof] 图节点 = {got}(类型 {kinds:?};真枚举 0=EMPTY 1=KERNEL 2=MEMCPY 3=MEMSET 4=HOST 10=MEM_ALLOC 11=MEM_FREE)");
             if !alloc_sizes.is_empty() {
                 let mut rows: Vec<_> = alloc_sizes.into_iter().collect();
-                rows.sort_by(|a, b| b.0.cmp(&a.0));
+                rows.sort_by_key(|b| std::cmp::Reverse(b.0));
                 for (sz, n) in rows.iter().take(12) {
                     eprintln!("[gl-prof]   MEM_ALLOC {sz}B × {n}");
                 }
             }
             if !kern_names.is_empty() {
                 let mut rows: Vec<_> = kern_names.into_iter().collect();
-                rows.sort_by(|a, b| b.1.cmp(&a.1));
+                rows.sort_by_key(|b| std::cmp::Reverse(b.1));
                 for (name, n) in rows.iter().take(40) {
                     eprintln!("[gl-prof]   K {name} × {n}");
                 }
@@ -502,12 +502,12 @@ impl GpuCtx {
         match &self.blocks.get(&id).ok_or(ModelError::DeadBlock { id })?.0 {
             Block::Owned(slice) => {
                 let (p, _) = slice.device_ptr(stream);
-                Ok((p as u64, slice.len()))
+                Ok((p, slice.len()))
             }
             Block::Carved { slab, off, n } => {
                 let view = slab.slice(*off..*off + *n);
                 let (p, _) = view.device_ptr(stream);
-                Ok((p as u64, *n))
+                Ok((p, *n))
             }
         }
     }
@@ -546,13 +546,10 @@ impl GpuCtx {
                 self.stream(STREAM_H2D),
                 self.stream(STREAM_D2H),
             ) {
-                match comp.record_event(None) {
-                    Ok(ev) => {
-                        let _ = h2d.wait(&ev);
-                        let _ = d2h.wait(&ev);
-                    }
-                    Err(_) => {} // 事件失败回旧语义(不让回收路径崩)
-                }
+                if let Ok(ev) = comp.record_event(None) {
+                    let _ = h2d.wait(&ev);
+                    let _ = d2h.wait(&ev);
+                } // 事件失败回旧语义(不让回收路径崩)
             }
         }
         let mut n = 0;
@@ -659,7 +656,7 @@ impl Staging {
         // FIXME(2026-10-13):cudarc 的 `malloc_host` 对失败/零尺寸可能回 Ok(null)
         // ——这里是裸 assert,拿不到任何上下文。先带上尺寸与原因(下同)。
         assert!(
-            ptr.is_null() == false,
+            !ptr.is_null(),
             "Staging::alloc[{label}]: malloc_host(n={n}B) 返回空指针(锁页内存耗尽?n=0 = 零长块写,上游形状错)"
         );
         Ok(Self { ptr, len: n })

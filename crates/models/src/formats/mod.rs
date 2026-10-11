@@ -13,8 +13,8 @@
 //! 契约另起子模块,勿塞进既有源。
 //!
 //! 兼容出口:crate 根再导出 `SafeTensorsSource`/`W4A16Source`/
-/// `marlin_eligible`/`marlin_n_pack`;`crate::interpreters::eval_load`
-/// 经 interpreters 模块 shim 转发(历史调用面不动)。
+//! `marlin_eligible`/`marlin_n_pack`;`crate::interpreters::eval_load`
+//! 经 interpreters 模块 shim 转发(历史调用面不动)。
 
 pub mod awq;
 pub mod load;

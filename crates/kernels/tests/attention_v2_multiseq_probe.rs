@@ -6,7 +6,6 @@
 //! 门:gpu vs host max < 1e-2;另附 per-seq 误差(定位某 seq 独崩)。
 //! 无 GPU 跳过(OWL_TEST_DEVICE)。
 
-use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, DevicePtr, LaunchConfig, PushKernelArg};
 
@@ -99,6 +98,7 @@ fn host_ref_impl(q: &[u16], kc: &[u8], vc: &[u8], lens: &[usize], kv_fp8: bool, 
         for h in 0..H {
             let kvh = h / (H / HKV);
             let mut qk = vec![0f32; len];
+            #[allow(clippy::needless_range_loop)]
             for b in 0..len {
                 let pb = b / PAGE;
                 let bb = b % PAGE;
@@ -118,6 +118,7 @@ fn host_ref_impl(q: &[u16], kc: &[u8], vc: &[u8], lens: &[usize], kv_fp8: bool, 
             let l: f32 = qk.iter().map(|&x| (x - m).exp()).sum();
             for d in 0..HD {
                 let mut acc = 0f32;
+                #[allow(clippy::needless_range_loop)]
                 for b in 0..len {
                     let pb = b / PAGE;
                     let bb = b % PAGE;
@@ -175,7 +176,7 @@ fn v2_multiseq_case(knhd: bool) {
     } else {
         (0..S).map(|i| CTX0 + i).collect()
     };
-    let max_len = CTX0 + S - 1;
+    let _max_len = CTX0 + S - 1;
     let pool_elems = NB * HKV * HD * PAGE;
     let k_f16 = lcg(pool_elems, 701);
     let v_f16 = lcg(pool_elems, 702);
@@ -210,7 +211,7 @@ fn v2_multiseq_case(knhd: bool) {
     } else { dev_u8(&v_fp8) };
     // 页表 [S, NB]:每 seq 同一恒等链(0..NB)
     let bt8: Vec<f32> = (0..S)
-        .flat_map(|s| (0..NB).map(move |b| b as f32))
+        .flat_map(|_s| (0..NB).map(move |b| b as f32))
         .collect();
     let d_bt8 = dev_f32(&bt8);
     let d_lens = dev_f32(&lens.iter().map(|&l| l as f32).collect::<Vec<_>>());
@@ -230,7 +231,7 @@ fn v2_multiseq_case(knhd: bool) {
             (true, true) => "vllm_paged_attention_v2_f16_knhd_hd256bs32",
         })
         .expect("load v2");
-    let (q_p, k_p, v_p, bt_p, ln_p, ab_p) = (
+    let (q_p, k_p, v_p, bt_p, ln_p, _ab_p) = (
         d_q.device_ptr(&stream).0,
         d_k8.device_ptr(&stream).0,
         d_v8.device_ptr(&stream).0,
@@ -311,7 +312,7 @@ fn v2_multiseq_case(knhd: bool) {
         let mut pa_h = vec![0u16; S * H * NP * HD];
         stream.memcpy_dtoh(&d_partial, &mut pa_h).unwrap();
         let f = |i: usize| f16_to_f32(pa_h[i]);
-        let base = 0 * H * NP * HD; // s0
+        let base = 0; // s0(原 `0 * H * NP * HD`;常量 0 触发 clippy::erasing_op)
         println!("[diag] p0 d0..3 = {:.4} {:.4} {:.4} {:.4}", f(base), f(base+1), f(base+2), f(base+3));
         println!("[diag] p1 d0..3 = {:.4} {:.4} {:.4} {:.4}", f(base+NP*HD), f(base+NP*HD+1), f(base+NP*HD+2), f(base+NP*HD+3));
     }

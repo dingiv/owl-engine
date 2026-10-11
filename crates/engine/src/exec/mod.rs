@@ -7,7 +7,7 @@
 use owl_iface::contract::{Bytes, DeviceClient, Dtype, ModelError};
 use owl_models::interpreters::eval_ops_scoped_env;
 use owl_models::layers::gdn::GdnBuffers;
-use owl_models::module::{FiPrefillCtx, ForwardCtx, KvBuffers, Module};
+use owl_models::module::{FiPrefillCtx, ForwardCtx, KvBuffers};
 use owl_models::tokenizer::Tokenizer;
 use owl_models::TensorOps;
 

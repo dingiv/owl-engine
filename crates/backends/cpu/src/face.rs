@@ -84,7 +84,7 @@ impl DeviceClient for CpuFace {
         let v = self
             .blocks
             .get(&b.id)
-            .ok_or_else(|| ModelError::DeadBlock { id: b.id })?;
+            .ok_or(ModelError::DeadBlock { id: b.id })?;
         let bytes: Vec<u8> = v
             .f32
             .iter()

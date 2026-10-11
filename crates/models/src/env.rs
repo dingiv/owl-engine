@@ -24,7 +24,9 @@ use owl_kernels::Arch;
 
 /// 硬件环境(被动律:不供给 = [`HwEnv::Cpu`],Call op 结构化拒绝)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Default)]
 pub enum HwEnv {
+    #[default]
     Cpu,
     Cuda(Arch),
 }
@@ -239,11 +241,6 @@ pub struct EnvProvider {
     pub diag: DiagEnv,
 }
 
-impl Default for HwEnv {
-    fn default() -> Self {
-        HwEnv::Cpu
-    }
-}
 
 impl Default for KvEnv {
     fn default() -> Self {

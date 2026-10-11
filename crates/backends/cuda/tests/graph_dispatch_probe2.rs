@@ -46,7 +46,7 @@ async fn marlin_graph_dispatch_probe() {
 
     let da = client
         .htod(Dtype::F16, &Shape::from(vec![m, k]), &le_u16(
-            &(0..m * k).map(|i| half::f16::from_f32(0.1).to_bits()).collect::<Vec<_>>(),
+            &(0..m * k).map(|_i| half::f16::from_f32(0.1).to_bits()).collect::<Vec<_>>(),
         ))
         .await
         .expect("htod a");
@@ -149,7 +149,7 @@ async fn cublas_graph_dispatch_probe() {
     let x = client.alloc(Dtype::F16, nn * kk).await.expect("x");
     let dc = client.alloc(Dtype::F16, nn * mm).await.expect("c");
 
-    let msg = |a: &owl_cuda::Bytes| LaunchMsg {
+    let msg = |_a: &owl_cuda::Bytes| LaunchMsg {
         kernel: owl_cuda::KernelSource { name: "cublas_gemm_f16".into(), source: String::new() },
         args: vec![
             Arg::Block { id: x.id },

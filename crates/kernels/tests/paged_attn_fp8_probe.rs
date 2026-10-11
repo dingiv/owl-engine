@@ -200,6 +200,7 @@ fn paged_attn_v2_fp8_matches_f16() {
                      out: &cudarc::driver::CudaSlice<u16>| {
         let kf = m.load_function(k_name).expect("v2 fn");
         let rf = m.load_function(r_name).expect("reduce fn");
+        #[allow(clippy::needless_range_loop)]
         for s in 0..num_seqs {
             let seqlen = seq_lens[s];
             let my_nparts = seqlen.div_ceil(512);

@@ -61,7 +61,7 @@ impl Mmap {
     pub fn dontneed(&self, start: usize, len: usize) {
         let page = 4096usize;
         let s = start / page * page;
-        let e = ((start + len) + page - 1) / page * page;
+        let e = (start + len).div_ceil(page) * page;
         let (a, b) = (s.min(self.len), e.min(self.len));
         if a < b {
             unsafe {

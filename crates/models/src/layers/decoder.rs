@@ -50,6 +50,7 @@ impl DecoderLayer {
     }
 
     /// linear_attention(GDN)层容器(`plan` = 量化计划构造期注入)
+    #[allow(clippy::too_many_arguments)]
     pub fn new_gdn(nk: usize, hk_dim: usize, nv: usize, hv_dim: usize, hidden: usize, inter: usize, eps: f32, plan: QuantPlan) -> Self {
         DecoderLayer {
             input_ln: RmsNorm::new_add_one("input_layernorm", hidden, eps),
@@ -150,6 +151,7 @@ impl DecoderLayer {
         [n1, mixed, h.clone(), n2, mlp_out.clone(), h.add(&mlp_out)]
     }
 
+    #[allow(dead_code)] // 仅 decoder 单元测试消费(非生产路径)
     pub(crate) fn forward_stages<'a>(
         &self,
         xs: &TensorOps,
@@ -196,8 +198,8 @@ mod tests {
             ("input_layernorm", 3, 1.0),
             ("post_attention_layernorm", 3, 2.0),
             ("q_proj", 2 * 4 * 2 * 3, 3.0),
-            ("k_proj", 1 * 4 * 3, 4.0),
-            ("v_proj", 1 * 4 * 3, 5.0),
+            ("k_proj", 4 * 3, 4.0),
+            ("v_proj", 4 * 3, 5.0),
             ("o_proj", 3 * 2 * 4, 6.0),
             ("q_norm", 4, 7.0),
             ("k_norm", 4, 8.0),
@@ -565,6 +567,7 @@ mod tests {
         let beta_v: Vec<f32> = b_v.iter().map(|v| 1.0 / (1.0 + (-v).exp())).collect();
         let q_scale = 1.0 / (hk_dim as f32).sqrt();
         let mut y = vec![0.0f32; value_dim];
+        #[allow(clippy::needless_range_loop)]
         for vh in 0..nv {
             let kh = vh / (nv / nk);
             let qoff = kh * hk_dim;

@@ -10,9 +10,7 @@
 //! 非注册内核 = 加源 + 登记表一条 + 语义变体 + driver 臂(逃生舱收编)。
 //! (2026-10-12 用户律:Kernel/Spec 节点消灭,唯一算子节点 = Call。)
 
-use crate::contract::{Arg, Bytes, Dtype, KernelSource, LaunchMsg};
-use crate::kernel::Kernel;
-use crate::tensor::TensorOps;
+use crate::contract::{Arg, Bytes, KernelSource, LaunchMsg};
 
 use owl_kernels::driver::OpId;
 
@@ -334,7 +332,7 @@ pub enum Op {
 /// 计划节点能力(草稿):
 /// - `op()`:节点语义(server dispatch 的键);
 /// - join/map:链式组合子(声明式运算的动词)。
-/// Tensor 是首个实现;将来别的节点形态(如捕获烘焙产物)也可实现。
+///   Tensor 是首个实现;将来别的节点形态(如捕获烘焙产物)也可实现。
 pub trait PlanNode {
     /// 节点语义
     fn op(&self) -> &Op;
@@ -377,13 +375,13 @@ fn spec(name: &'static str) -> KernelSource {
 }
 
 fn ceil_1d(n: usize) -> (u32, u32, u32) {
-    ((n as u32 + 255) / 256, 1, 1)
+    ((n as u32).div_ceil(256), 1, 1)
 }
 
 /// lower:Add(同形二元;a/b 块等长由 server 账长校验兜底)
 /// lower:Add(同形二元;a/b 块等长由 server 账长校验兜底)
 /// n = 声明元素数(C1 维度源头单一律:只读声明 shape,不读块账长)
-
+///
 /// f16 GEMM(foreign-kernel 通道,2026-09-26):核名 = cublas 虚拟核,
 /// server 按名分派到 owl-kernels::cublas(非 nvrtc 注册表;source 空)。
 /// 槽序契约:[T a, T b, T out, sz m, sz k, sz n, sz nt](cublas.rs 文档)。
@@ -441,7 +439,7 @@ pub fn lower_matmul(ins: &[Arg], out: &Bytes, m: usize, k: usize, n: usize) -> L
             Arg::I32(k as i32),
             Arg::I32(n as i32),
         ],
-        grid: ((m as u32 + 15) / 16, (n as u32 + 15) / 16, 1),
+        grid: ((m as u32).div_ceil(16), (n as u32).div_ceil(16), 1),
         block: (16, 16, 1),
         shared_mem: 0,
         out_elems: m * n,
@@ -460,7 +458,7 @@ pub fn lower_matmul_nt(ins: &[Arg], out: &Bytes, m: usize, k: usize, n: usize) -
             Arg::I32(k as i32),
             Arg::I32(n as i32),
         ],
-        grid: ((m as u32 + 15) / 16, (n as u32 + 15) / 16, 1),
+        grid: ((m as u32).div_ceil(16), (n as u32).div_ceil(16), 1),
         block: (16, 16, 1),
         shared_mem: 0,
         out_elems: m * n,
@@ -643,6 +641,9 @@ mod foreign_call_lock {
     //! 词表):ids ↔ driver 臂 ↔ foreign sig ↔ server parse 四点同票 ——
     //! 层声明 → lower_kernel → client face parse 逐位对拍。
     use super::*;
+    use crate::contract::Dtype;
+    
+    use crate::tensor::TensorOps;
     use owl_kernels::client::gdn_chunked as fc_chunked;
     use owl_kernels::client::gdn_scalar as fc_scalar;
     use owl_kernels::driver::{OpEnv, OpReq};
@@ -652,6 +653,7 @@ mod foreign_call_lock {
     }
 
     /// 层声明形态(chunked;与 layers/gdn.rs 逐字同构)
+    #[allow(clippy::too_many_arguments)]
     fn declare_chunked(
         q: &TensorOps, k: &TensorOps, v: &TensorOps, beta: &TensorOps,
         gate: &TensorOps, state: &TensorOps, slot: usize,

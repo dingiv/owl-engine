@@ -198,6 +198,7 @@ impl Exec {
     /// 参数 = **owned 值表**([`LaunchVal`]):HRTB 闭包与 cudarc arg 的
     /// 值生命周期相克(E0597,首试教训);owned 值表零生命周期参数,
     /// 调用点也不再需要 builder 闭包样板。
+    #[allow(clippy::too_many_arguments)]
     pub fn launch(
         &mut self,
         res: &mut dyn DeviceRes,

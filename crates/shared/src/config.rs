@@ -157,6 +157,7 @@ pub struct RuntimeCfg {
 /// 模型资产面
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[derive(Default)]
 pub struct ModelCfg {
     pub kind: ModelKind,
     pub dir: Option<PathBuf>,
@@ -354,18 +355,6 @@ impl Default for RuntimeCfg {
     }
 }
 
-impl Default for ModelCfg {
-    fn default() -> Self {
-        Self {
-            kind: ModelKind::default(),
-            dir: None,
-            name: None,
-            awq27b_dir: None,
-            dflash2_dir: None,
-            head_quant: HeadQuant::default(),
-        }
-    }
-}
 
 impl Default for PoolCfg {
     fn default() -> Self {

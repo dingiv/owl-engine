@@ -125,8 +125,9 @@ impl HostRef {
                 let sb = (slot as usize * NV + vh) * HK_DIM * HV_DIM;
                 let qoff = kh * HK_DIM;
                 let voff = vh * HV_DIM;
-                let mut kv_mem = vec![0.0f32; HV_DIM];
+                let mut kv_mem = [0.0f32; HV_DIM];
                 for j in 0..HK_DIM {
+                    #[allow(clippy::needless_range_loop)]
                     for d in 0..HV_DIM {
                         let idx = sb + j * HV_DIM + d;
                         self.rec[idx] *= decay;

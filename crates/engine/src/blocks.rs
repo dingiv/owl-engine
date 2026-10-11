@@ -10,8 +10,8 @@
 //!
 //! 契约(与 kernels 层对齐):物理槽 = block_table[逻辑块]·block_size
 //! + 块内偏移;K0 写核吃 slot_mapping(物理槽),v1/prefill 吃
-//! block_tables(块表)—— 两表均由引擎按本账房状态装配(f32 过线,
-//! 契约 5,物理槽 < 2²⁴ 恒成立)。
+//!   block_tables(块表)—— 两表均由引擎按本账房状态装配(f32 过线,
+//!   契约 5,物理槽 < 2²⁴ 恒成立)。
 
 use crate::prefix_cache::{PrefixCache, PrefixCacheConfig, PrefixCacheUpdate};
 use crate::Result;
@@ -241,7 +241,7 @@ mod tests {
         let shared = a[0];
         // 前缀共享(E2c 形态):B 复用 A 的块 0,ref = 2
         m.ref_counts[shared as usize] = 2;
-        let b = vec![shared];
+        let _b = [shared];
         a.clear();
         m.decref(shared); // A 释放 → ref 1,块不回池
         assert_eq!(m.free_blocks(), 3);

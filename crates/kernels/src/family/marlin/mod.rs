@@ -83,6 +83,7 @@ pub fn v2_err_str(err: i32) -> &'static str {
 /// # Safety
 /// 指针须指向合法且长度匹配布局契约的设备内存;workspace 须零初始化
 /// 且长度 ≥ [`v2_workspace_len(n)`]。
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn gemm_v2_raw(
     a: *const u16,
     b: *const i32,
@@ -123,6 +124,7 @@ pub unsafe fn gemm_v2_raw(
 ///
 /// # Safety
 /// 同 [`gemm_v2_raw`]。
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn gemm_v2_raw_bf16(
     a: *const u16,
     b: *const i32,

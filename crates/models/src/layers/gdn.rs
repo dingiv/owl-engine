@@ -173,6 +173,7 @@ pub fn l2norm(x: &TensorOps, rows: usize, dim: usize, eps: f32) -> TensorOps {
 /// q=0 / k=key_dim / v=2·key_dim);state [max_slots, dim, 3] 常驻块;
 /// slots [batch] f32(负 = padding:跳写 state 与 out);silu 恒 true。
 /// **已知副作用**:state 原地更新(C7 同族;块归 runner,单流保序)。
+#[allow(clippy::too_many_arguments)]
 pub fn conv_upd(
     x: &TensorOps,
     w: &TensorOps,
@@ -262,6 +263,7 @@ pub(crate) fn decode_step_fused(
 /// state [max_slots, HV, kd, vd] 常驻块原地更新(已知副作用,C7 同族);
 /// slots [batch] f32(负 = padding:跳写 state 与 out)。
 /// 发射 = (ceil(vd/64), B·HV) × (64,1,1),shared (128+128+2)·4。
+#[allow(clippy::too_many_arguments)]
 pub fn delta_dec(
     q: &TensorOps,
     k: &TensorOps,
@@ -305,6 +307,7 @@ pub fn delta_dec(
 /// state 槽寻址原地滑窗;slots [1] + cu_seqlens [0,T](单序列)。
 /// f16 生产核(f32 锚链走展开降级路)。**无 w_offset 参数** —— 三段
 /// 各传窄切后的权重行(段基址在层侧完成)。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn conv_fwd(
     x: &TensorOps,
     w: &TensorOps,
@@ -449,6 +452,7 @@ pub(crate) fn recurrence_varlen(
 /// x/z [rows, value_dim];gamma [group_size](×w 非零中心);
 /// act_silu = true(Qwen3.5)/ false = sigmoid(Qwen4 预留)。
 /// 发射 = (rows·value_dim/group_size,1,1) × (256,1,1)。
+#[allow(clippy::too_many_arguments)]
 pub fn norm_act(
     x: &TensorOps,
     z: &TensorOps,
@@ -618,9 +622,9 @@ impl GatedDeltaNet {
         let w_q = narrow_strided(&w_decl, key_dim, 4, 0, 4, vec![key_dim, 4]);
         let w_k = narrow_strided(&w_decl, key_dim, 4, key_dim * 4, 4, vec![key_dim, 4]);
         let w_v = narrow_strided(&w_decl, value_dim, 4, 2 * key_dim * 4, 4, vec![value_dim, 4]);
-        let q_c = conv_fwd(&q, &w_q, &gdn.conv_q, gdn_slot, &cu, tokens, key_dim, true);
-        let k_c = conv_fwd(&k, &w_k, &gdn.conv_k, gdn_slot, &cu, tokens, key_dim, true);
-        let v_c = conv_fwd(&v, &w_v, &gdn.conv_v, gdn_slot, &cu, tokens, value_dim, true);
+        let q_c = conv_fwd(&q, &w_q, &gdn.conv_q, gdn_slot, cu, tokens, key_dim, true);
+        let k_c = conv_fwd(&k, &w_k, &gdn.conv_k, gdn_slot, cu, tokens, key_dim, true);
+        let v_c = conv_fwd(&v, &w_v, &gdn.conv_v, gdn_slot, cu, tokens, value_dim, true);
 
         // qk l2norm(per-head 行,T 批量)
         let q_n = l2norm(
@@ -727,7 +731,7 @@ impl GatedDeltaNet {
                 &beta,
                 &gdn.rec,
                 gdn_slot,
-                &cu,
+                cu,
                 tokens,
                 self.nv,
                 self.nk,
@@ -1024,7 +1028,7 @@ impl Loadable for GatedDeltaNet {
 /// 测试/示例公共件:确定性权重源(权重公式 + 生成器;测试与 examples
 /// 共用,保证两者输入逐位一致 —— 对拍锚纪律的独立副本指 host 参考算法,
 /// 不指输入数据)
-
+///
 /// GDN f16/f32 核名路由(F5 整模切换;输出 dtype 跟随激活声明,
 /// state 恒 f32 混合核 —— 输出口径守门,输入位宽由 .cu 源自证)
 pub mod fixture {
@@ -1054,6 +1058,7 @@ mod tests {
     use crate::testkit::{f32b, harvest, harvest_f16, gpu_client, gpu_enabled};
 
     /// host 参考(g 臂;与核同式独立副本)
+    #[allow(dead_code)] // 门控测试辅助(host 参考门 / 其 GPU 对拍门现未注册 test)
     pub(crate) fn host_gating_g(
         a_log: &[f32],
         a: &[f32],
@@ -1112,7 +1117,7 @@ mod tests {
         };
         // 双形状:0.8B(kv_group=1)与 27B(kv_group=3,nv=48/nk=16/kd=128)
         for (max_slots, nv, nk, kd) in [(4usize, 16usize, 16usize, 128usize), (8usize, 48usize, 16usize, 128usize)] {
-        let vd = kd;
+        let _vd = kd;
         let vd = kd;
         let key_dim = nk * kd;
         let value_dim = nv * vd;
@@ -1134,6 +1139,7 @@ mod tests {
         let rec0 = gen(max_slots * nv * kd * vd, 6.0);
         // 32 步递推(交替 slot 0/1,beta/g 全域幅度,步间数据演化)
         let n_steps = 32usize;
+        #[allow(clippy::type_complexity)] // 六站解码链元组(host 对照)
         let mut steps: Vec<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> = Vec::new();
         for st in 0..n_steps {
             let sd = 10.0 + st as f32 * 7.0;
@@ -1160,6 +1166,7 @@ mod tests {
                 for h in 0..nv {
                     let kh = h / (nv / nk);
                     let mut v_c = [0.0f32; 128];
+                    #[allow(clippy::needless_range_loop)]
                     for t in 0..vd {
                         if slot < 0 {
                             break;
@@ -1311,6 +1318,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)] // 待注册的 GPU 对拍门(现无 #[tokio::test] 属性)
     async fn gpu_gating_g_matches_host() {
         if !gpu_enabled() {
             eprintln!("skip: OWL_TEST_DEVICE 未设");
@@ -1620,6 +1628,7 @@ mod tests {
     // ======================================================================
 
     /// host 参考(单步;与核同式独立副本;返回 out,padding 行 NaN)
+    #[allow(clippy::too_many_arguments)]
     fn host_delta_dec(
         q: &[f32], k: &[f32], v: &[f32], g: &[f32], beta: &[f32],
         state: &mut [f32], slots: &[f32],
@@ -1640,6 +1649,7 @@ mod tests {
                 let voff = (b * nv + vh) * vd;
                 let mut kv_mem = vec![0.0f32; vd];
                 for j in 0..kd {
+                    #[allow(clippy::needless_range_loop)]
                     for d in 0..vd {
                         let idx = sbase + j * vd + d;
                         state[idx] *= decay;
@@ -1678,6 +1688,7 @@ mod tests {
         let b0 = gen(2 * nv, 5.0);
         let state0 = gen(max_slots * nv * kd * vd, 6.0);
         // 步 A:slot 2/7;步 B:slot 2 续步 + slot -1 padding
+        #[allow(clippy::type_complexity)] // 六站切片元组表(host 对照)
         let steps: [(&[f32], &[f32], &[f32], &[f32], &[f32], &[f32]); 2] = [
             (&q0, &k0, &v0, &g0, &b0, &[2.0, 7.0]),
             (
@@ -2010,8 +2021,9 @@ mod tests {
                 let sbase = (slot as usize * NV + vh) * HK_DIM * HV_DIM;
                 let qoff = kh * HK_DIM;
                 let voff = vh * HV_DIM;
-                let mut kv_mem = vec![0.0f32; HV_DIM];
+                let mut kv_mem = [0.0f32; HV_DIM];
                 for j in 0..HK_DIM {
+                    #[allow(clippy::needless_range_loop)]
                     for d in 0..HV_DIM {
                         let idx = sbase + j * HV_DIM + d;
                         rec[idx] *= decay;
@@ -2168,6 +2180,7 @@ mod f16_tests {
     }
 
     /// 零态 GdnBuffers(conv f32 / rec f32;新序列零态起步语义)
+    #[allow(clippy::too_many_arguments)]
     async fn zero_gdn_bufs(
         gpu: &mut owl_cuda::GpuClient, slots_n: usize,
         key_dim: usize, value_dim: usize, nv: usize, hkd: usize, hvd: usize,
@@ -2230,7 +2243,7 @@ mod f16_tests {
             .await
             .expect("层 f16 装载");
 
-        let mut ref_buf = zero_gdn_bufs(&mut gpu, 4, key_dim, value_dim, nv, hkd, hvd, slot).await;
+        let ref_buf = zero_gdn_bufs(&mut gpu, 4, key_dim, value_dim, nv, hkd, hvd, slot).await;
         let pre_buf = zero_gdn_bufs(&mut gpu, 4, key_dim, value_dim, nv, hkd, hvd, slot).await;
 
         // 输入(f16 位型量化后的 f32,host/device 逐位一致)
@@ -2305,7 +2318,7 @@ mod f16_tests {
             .await
             .expect("层 f32 装载");
 
-        let mut ref_buf = zero_gdn_bufs(&mut gpu, 4, key_dim, value_dim, nv, hkd, hvd, slot).await;
+        let ref_buf = zero_gdn_bufs(&mut gpu, 4, key_dim, value_dim, nv, hkd, hvd, slot).await;
         let pre_buf = zero_gdn_bufs(&mut gpu, 4, key_dim, value_dim, nv, hkd, hvd, slot).await;
 
         let xs_f32: Vec<f32> =
@@ -2375,7 +2388,7 @@ mod f16_tests {
             .await
             .expect("层 f16 装载");
 
-        let mut ref_buf = zero_gdn_bufs(&mut gpu, 4, key_dim, value_dim, nv, hkd, hvd, slot).await;
+        let ref_buf = zero_gdn_bufs(&mut gpu, 4, key_dim, value_dim, nv, hkd, hvd, slot).await;
         let pre_buf = zero_gdn_bufs(&mut gpu, 4, key_dim, value_dim, nv, hkd, hvd, slot).await;
 
         let xs_f32: Vec<f32> = q(
@@ -2550,8 +2563,8 @@ mod f16_tests {
         let dal = gpu.htod(Dtype::F16, &sh(vec![nv]), &hbytes(&a_log)).await.unwrap();
         let ddt = gpu.htod(Dtype::F16, &sh(vec![nv]), &hbytes(&dt)).await.unwrap();
         let w_decl = TensorOps::of_block(dwb.id, Dtype::F16, vec![d, 4]);
-        let al_decl = TensorOps::of_block(dal.id, Dtype::F16, vec![nv]);
-        let dt_decl = TensorOps::of_block(ddt.id, Dtype::F16, vec![nv]);
+        let _al_decl = TensorOps::of_block(dal.id, Dtype::F16, vec![nv]);
+        let _dt_decl = TensorOps::of_block(ddt.id, Dtype::F16, vec![nv]);
 
         for step in 0..2u32 {
             let x: Vec<f32> = q(&(0..batch * d).map(|i| ((i as f32 + step as f32 * 7.0) * 0.31).sin()).collect::<Vec<_>>());
@@ -2569,11 +2582,11 @@ mod f16_tests {
             for b in 0..batch {
                 if slots[b] < 0.0 { continue; }
                 for ch in 0..d {
-                    let sp = slots[b] as usize;
+                    let _sp = slots[b] as usize;
                     let hist = [0.0f32; 3]; // 首步 state=0;两步间由设备块持久(下方直接验终态)
                     let _ = hist;
                     let x_t = x[b * d + ch];
-                    let mut sum = x_t * w[(0 + ch) * 4 + 3];
+                    let mut sum = x_t * w[ch * 4 + 3];
                     // host 只验首步(step0 state=0);step1 的 state 由设备持久,
                     // host 不复算(连续性由 conv_fwd 对拍 G-6 交叉验证)
                     if step == 0 {

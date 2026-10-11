@@ -153,9 +153,9 @@ impl MtpPredictor {
     /// - 末行输出 = 链种子 hidden',argmax = d1(预测 t_{F+M+2});
     /// - 链步 j = 1..k-1:(emb(d_j), h'_prev) @ 位置 F+M+j(decode 形
     ///   ctx,先写后打分)→ d_{j+1}。
-    /// 返回 [k, 1] f32 草稿(行 i = d_{i+1})。调用方建表契约:
-    /// extend slots/lens = [M+1](物理槽 F..F+M / kv_len F+1..F+M+1),
-    /// chain 第 j 步 slots/lens = [1](物理槽 F+M+j / kv_len F+M+j+1)。
+    ///   返回 [k, 1] f32 草稿(行 i = d_{i+1})。调用方建表契约:
+    ///   extend slots/lens = [M+1](物理槽 F..F+M / kv_len F+1..F+M+1),
+    ///   chain 第 j 步 slots/lens = [1](物理槽 F+M+j / kv_len F+M+j+1)。
     #[allow(clippy::too_many_arguments)]
     pub fn propose_ext(
         &self,
@@ -257,7 +257,7 @@ impl MtpPredictor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::module::Loadable;
+    
     use crate::tensor::Dtype;
     use crate::testkit::{assert_close, gpu_client, gpu_enabled, harvest_f16};
     use std::path::Path;
@@ -376,7 +376,7 @@ mod tests {
 mod wiring_tests {
     use super::*;
     use crate::tensor::Dtype;
-    use crate::module::{Loadable, LoaderCtx};
+    use crate::module::LoaderCtx;
     use crate::testkit::{f32b, gpu_client, gpu_enabled};
     use std::collections::HashMap;
 

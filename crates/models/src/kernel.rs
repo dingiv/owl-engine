@@ -88,7 +88,7 @@ pub fn kv_manifest_gate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ops::{lower_kernel, KernelArg};
+    
     use owl_iface::contract::Arg;
     use owl_kernels::contract::Bytes;
 

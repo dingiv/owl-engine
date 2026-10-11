@@ -77,7 +77,7 @@ pub fn marlin_scale_perm_single() -> Vec<usize> {
 ///    `frag_c += frag_c_tmp * (int16)scale_bits`,输出段再 int2float × a_scales);
 /// 3. 全局因子 max/4096 不进内核(该内核 global_scale_ptr 仅 nvfp4 读),由调用方
 ///    折进 a_scales:apply_gptq_marlin_linear `a_scales = act_scale * input_global_scale`。
-/// 返回 (位型 u16 序列(= i16 LE 字节即上卡字节), 全局因子)。max==0 时全零 + 0.0。
+///    返回 (位型 u16 序列(= i16 LE 字节即上卡字节), 全局因子)。max==0 时全零 + 0.0。
 pub fn pack_marlin_s_a8(scales: &[f32], out: usize, groups: usize) -> (Vec<u16>, f32) {
     assert_eq!(scales.len(), out * groups);
     let sp = marlin_scale_perm_single();
@@ -137,7 +137,7 @@ pub fn unpack_nibbles(packed: &[i32], out: usize, k: usize) -> Vec<u8> {
 ///   src=perm[dst] → res 下标 R → (kb,nb,t1,t2) → w[i*n+o] → q[o*k+i]
 /// 纯 gather,输出与四遍版逐字节一致(repack_parity.rs 黄金对拍验证)。
 pub fn pack_marlin_b(q: &[u8], k: usize, n: usize) -> Vec<i32> {
-    assert!(k % 128 == 0 && n % 256 == 0, "k%128==0 n%256==0 required");
+    assert!(k.is_multiple_of(128) && n.is_multiple_of(256), "k%128==0 n%256==0 required");
     assert_eq!(q.len(), k * n);
 
     let perm = marlin_perm();
@@ -183,7 +183,7 @@ pub fn pack_marlin_b(q: &[u8], k: usize, n: usize) -> Vec<i32> {
 ///   (tc_row = (th%4)*4)——与探针判决“词内同 n,k={bk..bk+3,bk+16..bk+19}”一致。
 /// 探针黄金数据:tests/data_repack/vllm.b_marlin_a8.i32.bin(gen_a8_bmap_probe 判决)。
 pub fn pack_marlin_b_a8(q: &[u8], k: usize, n: usize) -> Vec<i32> {
-    assert!(k % 32 == 0 && n % 64 == 0, "k%32==0 n%64==0 required (a8 repack tile)");
+    assert!(k.is_multiple_of(32) && n.is_multiple_of(64), "k%32==0 n%64==0 required (a8 repack tile)");
     assert_eq!(q.len(), k * n);
 
     // w(in, out=n) 行主序:q 是 (out, k) → 转置(S3-P2:按 i 行并行,分区无交叉写)
@@ -307,6 +307,7 @@ pub struct MoeRepacked {
     pub w2_s: Vec<f32>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn repack_moe(
     gate_q: &[Vec<u8>],
     up_q: &[Vec<u8>],
@@ -322,10 +323,11 @@ pub fn repack_moe(
     assert!(e > 0 && up_q.len() == e && down_q.len() == e);
     assert!(gate_s.len() == e && up_s.len() == e && down_s.len() == e);
     let k = hidden;
-    assert!(k % 128 == 0 && intermediate % 128 == 0,
+    assert!(k.is_multiple_of(128) && intermediate.is_multiple_of(128),
         "moe marlin: k%128==0 and intermediate%128==0 required (got k={k}, i={intermediate})");
 
     // S3-P2:专家级并行(每专家独立打包,按序扁平化,输出与串行版一致)
+    #[allow(clippy::type_complexity)] // 专家 moe 打包产物四元组(串/并行同构)
     let packed: Vec<(Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>)> = (0..e)
         .into_par_iter()
         .map(|x| {
@@ -389,6 +391,7 @@ pub fn moe_align_block_size(
     let mut sorted_token_ids = vec![sentinel; total_padded];
     let mut expert_ids = vec![num_experts as i32; total_padded.div_ceil(block_size)];
     let mut seg_start = 0usize;
+    #[allow(clippy::needless_range_loop)]
     for exp in 0..num_experts {
         let cnt = counts[exp];
         let padded = cnt.div_ceil(block_size) * block_size;
@@ -403,6 +406,7 @@ pub fn moe_align_block_size(
             }
         }
         debug_assert_eq!(written, cnt);
+        #[allow(clippy::needless_range_loop)]
         for b in seg_start / block_size..(seg_start + padded) / block_size {
             expert_ids[b] = exp as i32;
         }
@@ -605,7 +609,7 @@ pub fn pack_marlin_z(zp: &[u8], out: usize, groups: usize) -> Vec<i32> {
     // 沿 n 打包 8 nibble/i32 LSB-first → (groups, out/8)
     let n = out;
     assert_eq!(il.len(), groups * n);
-    assert!(n % 8 == 0, "n % 8 != 0");
+    assert!(n.is_multiple_of(8), "n % 8 != 0");
     let mut packed = vec![0i32; groups * (n / 8)];
     packed.par_chunks_mut(n / 8).enumerate().for_each(|(g, row)| {
         let src = &il[g * n..(g + 1) * n];

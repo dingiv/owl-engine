@@ -92,6 +92,7 @@ fn host_ref_knhd(q: &[u16], kc: &[u8], vc: &[u8], len: usize) -> Vec<f32> {
     for h in 0..H {
         let kvh = h / (H / HKV);
         let mut qk = vec![0f32; len];
+        #[allow(clippy::needless_range_loop)]
         for b in 0..len {
             let (pb, bb) = (b / PAGE, b % PAGE);
             let mut acc = 0f32;
@@ -105,6 +106,7 @@ fn host_ref_knhd(q: &[u16], kc: &[u8], vc: &[u8], len: usize) -> Vec<f32> {
         let l: f32 = qk.iter().map(|&x| (x - m).exp()).sum();
         for d in 0..HD {
             let mut acc = 0f32;
+            #[allow(clippy::needless_range_loop)]
             for b in 0..len {
                 let (pb, bb) = (b / PAGE, b % PAGE);
                 let vidx = pb * kbs + bb * (HKV * HD) + kvh * HD + d;

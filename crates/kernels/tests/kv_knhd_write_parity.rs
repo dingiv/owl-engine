@@ -91,7 +91,7 @@ fn reshape_and_cache_knhd_parity() {
             stream.memset_zeros(&mut d_vc).unwrap();
             let mut d_slots = unsafe { stream.alloc::<f32>(slots.len()) }.unwrap();
             stream.memcpy_htod(&slots, &mut d_slots).unwrap();
-            let mut d_out = unsafe { stream.alloc::<u16>(1) }.unwrap();
+            let d_out = unsafe { stream.alloc::<u16>(1) }.unwrap();
             let (kp, vp, kcp, vcp, slp, op) = (
                 d_k.device_ptr(&stream).0,
                 d_v.device_ptr(&stream).0,
@@ -176,7 +176,7 @@ fn reshape_and_cache_knhd_parity() {
             stream.memset_zeros(&mut d_vc).unwrap();
             let mut d_slots = unsafe { stream.alloc::<f32>(slots.len()) }.unwrap();
             stream.memcpy_htod(&slots, &mut d_slots).unwrap();
-            let mut d_out = unsafe { stream.alloc::<u16>(1) }.unwrap();
+            let d_out = unsafe { stream.alloc::<u16>(1) }.unwrap();
             let (kp, vp, kcp, vcp, slp, op) = (
                 d_k.device_ptr(&stream).0,
                 d_v.device_ptr(&stream).0,
@@ -261,7 +261,7 @@ fn reshape_and_cache_knhd_parity() {
             stream.memset_zeros(&mut d_vc).unwrap();
             let mut d_slots = unsafe { stream.alloc::<f32>(slots.len()) }.unwrap();
             stream.memcpy_htod(&slots, &mut d_slots).unwrap();
-            let mut d_out = unsafe { stream.alloc::<u16>(1) }.unwrap();
+            let d_out = unsafe { stream.alloc::<u16>(1) }.unwrap();
             let (kp, vp, kcp, vcp, slp, op) = (
                 d_k.device_ptr(&stream).0,
                 d_v.device_ptr(&stream).0,
@@ -407,7 +407,7 @@ fn fused_insert_knhd_parity() {
             stream.memcpy_htod(&sin_t, &mut d_sin).unwrap();
             let mut d_pos = unsafe { stream.alloc::<f32>(pos.len()) }.unwrap();
             stream.memcpy_htod(&pos, &mut d_pos).unwrap();
-            let mut d_qo = unsafe { stream.alloc::<u16>(T * HQ * HD) }.unwrap();
+            let d_qo = unsafe { stream.alloc::<u16>(T * HQ * HD) }.unwrap();
             let (q, kp, vp, kcp, vcp, slp, qw, kw, co, si, po, qo) = (
                 d_q.device_ptr(&stream).0,
                 d_k.device_ptr(&stream).0,

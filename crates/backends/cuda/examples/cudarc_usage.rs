@@ -378,7 +378,7 @@ extern "C" __global__ void owl_matmul_f32(
 
         fn cfg_1d(n: usize) -> LaunchConfig {
             LaunchConfig {
-                grid_dim: ((n as u32 + 255) / 256, 1, 1),
+                grid_dim: ((n as u32).div_ceil(256), 1, 1),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             }
@@ -452,7 +452,7 @@ extern "C" __global__ void owl_matmul_f32(
                     .arg(&(k as i32))
                     .arg(&(n as i32))
                     .launch(LaunchConfig {
-                        grid_dim: ((m as u32 + 15) / 16, (n as u32 + 15) / 16, 1),
+                        grid_dim: ((m as u32).div_ceil(16), (n as u32).div_ceil(16), 1),
                         block_dim: (16, 16, 1),
                         shared_mem_bytes: 0,
                     })?;

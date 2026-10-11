@@ -151,9 +151,9 @@ pub async fn load_0_8b_w4a16<D: DeviceClient + 'static>(
 /// - GDN:qk 16 头 ×128(in_proj_qkv [10240, 5120] = 2048+2048+6144)/
 ///   v 48 头 ×128(in_proj_z [6144, 5120]);
 /// - 64 层 3:1 hybrid(layers i%4==3 为 full);vocab 248320 不 tied。
-/// MTP 头装载(E5-M0;cyankiwi 检查点自带 15 个 mtp.* 键全 BF16 ——
-/// 结构 = vLLM Qwen3NextMultiTokenPredictor 同构,见 layers/mtp.rs)。
-/// 返回 (组件, 装载清单);键集断言(15 键)由测试做。
+///   MTP 头装载(E5-M0;cyankiwi 检查点自带 15 个 mtp.* 键全 BF16 ——
+///   结构 = vLLM Qwen3NextMultiTokenPredictor 同构,见 layers/mtp.rs)。
+///   返回 (组件, 装载清单);键集断言(15 键)由测试做。
 pub async fn load_27b_mtp<D: DeviceClient + 'static>(
     dir: &Path,
     face: &mut D,
@@ -401,7 +401,7 @@ impl Loadable for crate::layers::mtp::MtpPredictor {
             .layout(ctx)
             .map_keys(|k| format!("mtp.{k}.weight"))
             .chain(self.fc_h().layout(ctx).map_keys(|k| format!("mtp.{k}.weight")))
-            .chain(self.layer().layout(ctx).map_keys(|k| keys.layer_key(0, &k)))
+            .chain(self.layer().layout(ctx).map_keys(|k| keys.layer_key(0, k)))
             .chain(
                 self.pre_fc_norm_hidden()
                     .layout(ctx)
@@ -873,7 +873,7 @@ mod tests {
         nb: usize,
         page: usize,
     ) -> crate::module::AttnV2Scratch {
-        let nparts = (nb * page + 511) / 512;
+        let nparts = (nb * page).div_ceil(512);
         crate::module::AttnV2Scratch {
             exp_sums: zero_block(client, hq * nparts, vec![1, hq * nparts]).await,
             max_logits: zero_block(client, hq * nparts, vec![1, hq * nparts]).await,
@@ -1254,9 +1254,6 @@ mod tests {
         let dir = manifest_dir().join("assets/Qwen3.5-0.8B");
         let t_len = 2usize; // 两 token 判别
         let slots_n = 8usize;
-        let eprintln_skip = (); // 门控同 smoke(真权重测试默认必跑)
-        let _ = eprintln_skip;
-
         let mut gpu = crate::testkit::gpu_client().await;
         let model = load_0_8b(&dir, &mut gpu).await.expect("load_0_8b(真权重)");
         let rp = Rope::new(262_144, HD, 64, 10_000_000.0).expect("rope");
@@ -1269,7 +1266,7 @@ mod tests {
             gpu: &mut owl_cuda::GpuClient, slots_n: usize, hd: usize, hkv: usize,
         ) -> (Vec<KvBuffers>, Vec<GdnBuffers>) {
             // paged 布局(页 32 = 层分派契约;恒等块表)
-            let nb = (slots_n + 31) / 32;
+            let nb = slots_n.div_ceil(32);
             let kv_len = nb * hkv * hd * 32;
             let bt_data: Vec<u8> = (0..nb).flat_map(|i| (i as f32).to_le_bytes()).collect();
             let bt = crate::interpreters::eval_ops(
@@ -1301,8 +1298,7 @@ mod tests {
         let (kvs_pre, gdns_pre) = mk(&mut gpu, slots_n, HD, HKV).await;
 
         // prompt:8 token(合法 id;语义无关 —— 验的是路径等价)
-        let prompt: Vec<f32> = [985.0, 4123.0, 711.0, 2023.0, 1546.0, 884.0, 3001.0, 4195.0]
-            .iter().map(|v| *v).collect();
+        let prompt: Vec<f32> = [985.0, 4123.0, 711.0, 2023.0, 1546.0, 884.0, 3001.0, 4195.0].to_vec();
 
         // 参考臂 = **生产 decode 面**(v2 scratch + qkv 融合插池;与 engine
         // 发射同构)。⚠️ 此前本臂走 v1(`attn_v2 = None`)= 参考自身错:
@@ -1312,6 +1308,7 @@ mod tests {
 
         // 参考:T 次 decode 步(单序列:gdn 恒 0,kv 行 = t)
         let mut ref_rows: Vec<Vec<f32>> = Vec::new();
+        #[allow(clippy::needless_range_loop)]
         for t in 0..t_len {
             let ids = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[prompt[t]]));
             let pos_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32]));
@@ -1468,7 +1465,7 @@ mod tests {
         eprintln!("[smoke] rope ok; 分配常驻缓冲...");
 
         // 常驻缓冲:6 full 层 KV + 18 gdn 层状态(真维度;全零起步)
-        let nb = (SLOTS + 31) / 32; // paged 池(页 32 = 层分派契约)
+        let nb = SLOTS.div_ceil(32); // paged 池(页 32 = 层分派契约)
         let kv_len = nb * HKV * HD * 32;
         let bt_data: Vec<u8> = (0..nb).flat_map(|i| (i as f32).to_le_bytes()).collect();
         let bt = crate::interpreters::eval_ops(
@@ -1621,7 +1618,7 @@ mod tests {
         // 采样 8 个输出元全量内积 —— 免 262M 全量 MAC)
         use crate::module::WeightSource;
         // host 参考:fc 反量化值(W4A16Source 反量化臂;BF16 源同键直读)
-        let mut src = crate::formats::w4a16::W4A16Source::open_dir(dir).unwrap();
+        let src = crate::formats::w4a16::W4A16Source::open_dir(dir).unwrap();
         let w_fc = src.dequant_linear("fc").expect("fc 源(反量化)");
         let hn = src.take("hidden_norm.weight").expect("hn 源");
         let fan = 5 * 5120usize;

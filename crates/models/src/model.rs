@@ -1,9 +1,9 @@
 //! 通用解码器主干(批8,2026-09-26 拆分):embed + N×DecoderLayer
 //! + final norm + tied lm_head —— **所有模型共有**的机制,凡本主干
-//! 词汇表内(Full|Gdn 双 mixer)的 hybrid / dense 解码器共用。
-//! 旧世界 `Qwen3_5ForCausalLM`(engine/src/models/qwen3_5.rs)的
-//! 声明式重铸 —— 砍掉的是命令式缓存管理/MTP/DFlash 支线,留下的是
-//! 主干数据流。
+//!   词汇表内(Full|Gdn 双 mixer)的 hybrid / dense 解码器共用。
+//!   旧世界 `Qwen3_5ForCausalLM`(engine/src/models/qwen3_5.rs)的
+//!   声明式重铸 —— 砍掉的是命令式缓存管理/MTP/DFlash 支线,留下的是
+//!   主干数据流。
 //!
 //! **拆分律(2026-09-26 用户裁决)**:
 //! - 本文件只住**共有机制**(主干结构/单树求值/序列 ctx 派生/C10
@@ -153,7 +153,7 @@ impl Model {
             kv_lens: ctx.kv_lens,
             gdn_slot: ctx.gdn_slot,
             ctx_base: ctx.ctx_base,
-            fi: ctx.fi.clone(),
+            fi: ctx.fi,
             fi_kvi: kvi,
             seq_cu: ctx.seq_cu,
             gdn_tap: ctx.gdn_tap.clone(),
@@ -330,15 +330,15 @@ impl Loadable for Model {
     /// 发生在声明期,Want 清单里已是最终键,解释器零约定感知。
     /// tied embedding 的双 Want(直读 + 转置)同键改写,天然保持同键。
     fn layout(&self, ctx: &LoaderCtx) -> LoaderOps {
-        let mut ops = self.embed.layout(ctx).map_keys(|k| self.keys.embed_key(&k));
+        let mut ops = self.embed.layout(ctx).map_keys(|k| self.keys.embed_key(k));
         // untied lm_head:独立槽裸键(检查点顶层 `lm_head.weight`;零 map)
         if let Some(lm) = self.embed.layout_lm_head(ctx) {
             ops = ops.chain(lm);
         }
         for (i, layer) in self.layers.iter().enumerate() {
-            ops = ops.chain(layer.layout(ctx).map_keys(|k| self.keys.layer_key(i, &k)));
+            ops = ops.chain(layer.layout(ctx).map_keys(|k| self.keys.layer_key(i, k)));
         }
-        ops.chain(self.norm.layout(ctx).map_keys(|k| self.keys.norm_key(&k)))
+        ops.chain(self.norm.layout(ctx).map_keys(|k| self.keys.norm_key(k)))
     }
 }
 
@@ -419,6 +419,7 @@ mod tests {
         };
         put(format!("{base}.embed_tokens.weight"), VOCAB * HIDDEN, 100.0);
         let pat = layer_pattern();
+        #[allow(clippy::needless_range_loop)]
         for i in 0..pat.len() {
             let mut p = |k: &str, n: usize, seed: f32| {
                 put(format!("{base}.layers.{i}.{k}.weight"), n, seed);
@@ -600,7 +601,7 @@ mod tests {
             let q_raw = self.lin(n1, self.s(i, "q_proj"), HQ * HD * 2, HIDDEN);
             let k_raw = self.lin(n1, self.s(i, "k_proj"), HKV * HD, HIDDEN);
             let v_raw = self.lin(n1, self.s(i, "v_proj"), HKV * HD, HIDDEN);
-            let mut q = vec![0.0; HQ * HD];
+            let mut q = [0.0; HQ * HD];
             let mut gate = vec![0.0; HQ * HD];
             for h in 0..HQ {
                 for d in 0..HD {
@@ -717,8 +718,9 @@ mod tests {
                 let sb = (slot * NV + vh) * HK_DIM * HV_DIM;
                 let qoff = kh * HK_DIM;
                 let voff = vh * HV_DIM;
-                let mut kv_mem = vec![0.0f32; HV_DIM];
+                let mut kv_mem = [0.0f32; HV_DIM];
                 for j in 0..HK_DIM {
+                    #[allow(clippy::needless_range_loop)]
                     for d in 0..HV_DIM {
                         let idx = sb + j * HV_DIM + d;
                         self.gdn_rec[gi][idx] *= decay;
@@ -820,7 +822,7 @@ mod tests {
             .expect("rope 表");
 
         // 常驻缓冲:1 full 层 KV + 3 gdn 层状态(全零起步)
-        let kv_zero = vec![0.0f32; KV_ROWS * HKV * HD];
+        let kv_zero = [0.0f32; KV_ROWS * HKV * HD];
         let kvs: Vec<KvBuffers> = {
             let mut v = Vec::new();
             for _ in 0..1 {
@@ -890,7 +892,7 @@ mod tests {
 
     /// 常驻缓冲一套(full 1 KV + gdn 3 状态;全零起步)
     async fn model_bufs(gpu: &mut owl_cuda::GpuClient, n_full: usize, n_gdn: usize) -> (Vec<KvBuffers>, Vec<GdnBuffers>) {
-        let kv_zero = vec![0.0f32; KV_ROWS * HKV * HD];
+        let kv_zero = [0.0f32; KV_ROWS * HKV * HD];
         let mut kvs = Vec::new();
         for _ in 0..n_full {
             kvs.push(KvBuffers {
@@ -949,6 +951,7 @@ mod tests {
         // ── 参考:T 次 decode 步,单根 = last_hidden(缓冲套 A)──
         let (kvs_a, gdns_a) = model_bufs(&mut gpu, 1, 3).await;
         let mut ref_hidden: Vec<Vec<f32>> = Vec::new();
+        #[allow(clippy::needless_range_loop)]
         for t in 0..t_len {
             let ids_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[ids[t]]));
             let pos_t = pos_of(t);
@@ -1003,7 +1006,7 @@ mod tests {
         let mut host2 = HostModel::new(checkpoint_src());
         for t in 0..t_len {
             let want = host2.step2(ids[t], t as f32, t, t + 1, 0);
-            eprintln!("[dbg] logits 行{t}: prefill {:?} host {:?}", &got_all[t * VOCAB..(t + 1) * VOCAB], &want);
+            eprintln!("[dbg] logits 行{t}: prefill {:?} host {:?}", &got_all[t * VOCAB..(t + 1) * VOCAB], want);
             assert_close(
                 &got_all[t * VOCAB..(t + 1) * VOCAB],
                 &want,

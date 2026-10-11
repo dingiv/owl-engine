@@ -31,11 +31,11 @@ pub(crate) type BlockN = (Bytes, usize); // (块句柄, 元素数;重置分块�
 /// s=4096 时 rec(1 MiB/格/层 × 18 层)将达 72 GB,而真实需求 = 格数。
 /// 8 = 覆盖需求并发上限(§二 并发 ≤8);会话 close 即释放格号。
 /// 槽数 = EngineKnobs.gdn_slots(显式传入;原 OWL_GDN_SLOTS,缺省 8)。
-
+///
 /// GDN 快照槽(E2c):key = 链尾物理块 id(内容身份);bufs = 逐层逐块
 /// 行宽副本(与 gdns 同序同构,行宽 = elems / GDN_SLOTS)。池静态
 /// 预分配,驱逐 = 换 key 覆盖写(零 alloc/free 往返)。
-struct GdnSnapSlot {
+pub(crate) struct GdnSnapSlot {
     key: Option<u32>,
     last_use: u64,
     bufs: Vec<BlockN>,
@@ -119,6 +119,7 @@ pub(crate) struct StatePool {
     /// GDN 状态格容量(knobs.gdn_slots,boot 定谳;原自由函数 gdn_slots())
     pub(crate) gdn_slots: usize,
     /// GDN 画像 dump 全槽(knobs.gdn_dump_all)
+    #[allow(dead_code)] // 诊断面字段(写入后当前无读者)
     pub(crate) dump_all: bool,
     pub(crate) kvs: Vec<KvBlocks>,
     /// FI 直读旗标(统一契约 P3:影子池删除,FI 直读主池 kNHD 叶子)
@@ -234,11 +235,11 @@ impl StatePool {
 
         let pol = kv_paged_policy(dims.dtype);
         let (page, x, nb, paged) = match &pol {
-            Some(p) => (p.page, p.x, (seq_tokens + p.page - 1) / p.page, true),
+            Some(p) => (p.page, p.x, seq_tokens.div_ceil(p.page), true),
             None => (seq_tokens, 1usize, 1usize, false),
         };
         // E2b 块池容量:pool_tokens 向上取整到页;不低于单会话容量
-        let nb = paged.then(|| pool_tokens.div_ceil(page)).unwrap_or(nb).max(nb);
+        let nb = if paged { pool_tokens.div_ceil(page) } else { nb }.max(nb);
 
         let mut kvs: Vec<KvBlocks> = Vec::new();
         for _ in 0..n_full {
@@ -310,7 +311,7 @@ impl StatePool {
         // f32 + tmp_out [hq·nparts·hd] f16;nparts = ceil(nb·page/512)
         // (PARTITION=512;boot 一次性持久块,不进竞技场收割面,图安全同 bt)
         let attn_v2 = if paged {
-            let nparts = (nb * page + 511) / 512;
+            let nparts = (nb * page).div_ceil(512);
             let es = zero_block_dt(face, dims.hq * nparts, Dtype::F32).await?;
             let ml = zero_block_dt(face, dims.hq * nparts, Dtype::F32).await?;
             let to = zero_block_dt(face, dims.hq * nparts * dims.hd, dims.dtype).await?;
@@ -327,7 +328,7 @@ impl StatePool {
         // verify v2 scratch(§三十一:8 伪序列 partition 并行;seqs=depth1;
         // 形状 = decode 版 × depth1,展平 [seq][head][part] 与 vLLM 核同构)
         let verify_attn_v2 = if paged && plan.spec_depth > 0 {
-            let nparts = (nb * page + 511) / 512;
+            let nparts = (nb * page).div_ceil(512);
             let seqs = plan.spec_depth + 1;
             let es = zero_block_dt(face, seqs * dims.hq * nparts, Dtype::F32).await?;
             let ml = zero_block_dt(face, seqs * dims.hq * nparts, Dtype::F32).await?;
@@ -364,7 +365,7 @@ impl StatePool {
             // 因果 = (1<<(i+1))-1(含自身);q=1 只读 index 0(= 1)
             let seqs = (plan.spec_depth + 1).max(1);
             let mask: Vec<f32> = (0..seqs)
-                .map(|i| f32::from_bits(((1u32 << (i + 1)) - 1) as u32))
+                .map(|i| f32::from_bits((1u32 << (i + 1)) - 1))
                 .collect();
             let mkb = face.alloc(Dtype::F32, seqs).await?;
             face.write_block_f32(&mkb, 0, &mask).await?;
@@ -424,7 +425,7 @@ impl StatePool {
             owl_models::env::KvQuant::None => "kv f16",
         };
         eprintln!(
-            "[boot] 状态块分配 {:.2}s({kv_label} ×{} / gdn ×{},会话容量 {},池 {} 页 × {page} tok,页表 nb = {nb},dflash = {df})",
+            "[boot] 状态块分配 {:.2}s({kv_label} ×{} / gdn ×{},会话容量 {},池 {nb} 页 × {page} tok,页表 nb = {nb},dflash = {df})",
             t.elapsed().as_secs_f32(),
             kvs.len(),
             gdns.len(),
@@ -486,7 +487,7 @@ impl StatePool {
         self.gdns.len()
     }
 
-    /// DFlash2 草稿 KV 叶子组(dflash 模式;5 层 × (k, v);None = 未启用)
+    // DFlash2 草稿 KV 叶子组(dflash 模式;5 层 × (k, v);None = 未启用)
     // ── DFlash2 草稿池寻址权威(唯一出口;slot≥1 案配套,2026-10-10)──
     // 草稿池 = **线性逻辑寻址**:NC 核签名无块表参数,前缀读 [0, kv_len)
     // 从池基址直排;encode 写槽 = 逻辑位。写者(exec encode)与读者
@@ -510,6 +511,7 @@ impl StatePool {
     }
 
     /// propose 读窗长(fp = 下轮 fed 位)
+    #[allow(dead_code)] // 草稿面预测助手(现无读者,保留供 NC v2 路径)
     pub(crate) fn draft_kv_len(fp: usize) -> f32 {
         (fp + 8) as f32
     }
@@ -582,6 +584,7 @@ impl StatePool {
     }
 
     /// XQA semaphores 块 + 字节数(每轮发射前清零用)
+    #[allow(dead_code)] // XQA sem 清零助手(半接入,保留)
     pub(crate) fn xqa_sem_zero(&self) -> Option<(owl_iface::contract::Bytes, usize)> {
         let x = self.xqa.as_ref()?;
         let n = x.semaphores.shape().iter().product::<usize>();
@@ -676,6 +679,7 @@ impl StatePool {
         Ok(out)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn profile_block<D: DeviceClient>(
         &self,
         face: &mut D,
@@ -779,6 +783,7 @@ impl StatePool {
     /// (key 解析 = 边界覆盖块,由调用方从会话块链取;见 exec.rs)
     /// 泄漏案探针(2026-10-10):指定 slot 的 GDN 状态区逐块 FNV。
     /// turn(slot0) 前后对比 slot1 指纹 —— 变了 = 跨 slot 写实锤。
+    #[allow(dead_code)] // 泄漏案探针,仅单测消费
     pub(crate) async fn gdn_slot_fingerprint<D: DeviceClient>(
         &self,
         face: &mut D,
@@ -808,6 +813,7 @@ impl StatePool {
 
     /// 泄漏案探针第二步:reset_gdn(slot) 后回读该 slot 是否全零。
     /// 返回 slot 区非零字节数(0 = reset 生效)。
+    #[allow(dead_code)] // 泄漏案探针,仅单测消费
     pub(crate) async fn gdn_slot_zero_check<D: DeviceClient>(
         &mut self,
         face: &mut D,

@@ -36,8 +36,6 @@ fn fi_scale_bits(hd: usize) -> u64 {
 fn xqa_q_scale_bits(hd: usize) -> u64 {
     ((1.0f32 / (hd as f32).sqrt()) * (hd as f32).sqrt()).to_bits() as u64
 }
-#[cfg(test)]
-use crate::kernel;
 
 use crate::layers::linear::Linear;
 use crate::layers::{concat_rows_hier, narrow_strided};
@@ -286,6 +284,8 @@ impl Attention {
     // P6-B 将连同 v1 臂与 `vllm_paged_attention_v1_*` 四核一起删除:
     // 现函数体首行即 panic(退役),后续实参自然未用 —— 显式 allow 免噪声
     #[allow(unused_variables)]
+    #[allow(unreachable_code)]
+    #[allow(clippy::too_many_arguments)]
     fn paged_decode_v1_k0(
         &self,
         q: &TensorOps,
@@ -321,7 +321,7 @@ impl Attention {
         // wrapper 页配对 + smem 契约公式 = driver 单源(env.page 终审;
         // 原手抄 smem 越界事故与 bs16/32 错配案的结构性封点)
         let y = TensorOps::call(SemanticKernel::PagedDecode)
-            .aux(&[self.hd, self.hq, self.hkv, nb as usize])
+            .aux(&[self.hd, self.hq, self.hkv, nb])
         .arg(q)
         .arg(&kv.k_cache)
         .arg(&kv.v_cache)
@@ -356,6 +356,7 @@ impl Attention {
     /// 三件套 = ctx.attn_v2(引擎捕获前持久块,指针烘焙图安全;None 走
     /// v1)。exp_sums/max_logits 为 arg 兼写目标(K0 持久块副作用律同款);
     /// 主核输出 = 未归一化 partials [1, hq·nparts·hd],归并出最终 y。
+    #[allow(clippy::too_many_arguments)]
     fn paged_decode_v2_k0(
         &self,
         q: &TensorOps,
@@ -386,7 +387,7 @@ impl Attention {
         // B6.2:fp8 池 → fp8 读变体(env.kv.quant 单源;stride 元素序不变)
         let decode_op = ctx.env.kv.decode_v2_op();
         let partial = TensorOps::call(decode_op)
-            .aux(&[self.hd, self.hq, self.hkv, nb as usize, nparts])
+            .aux(&[self.hd, self.hq, self.hkv, nb, nparts])
             .arg(q)
             .arg(&kv.k_cache)
             .arg(&kv.v_cache)
@@ -500,6 +501,7 @@ impl Attention {
         self.o_proj.forward(&y, ctx)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn verify_xqa_arm(
         &self,
         q: &TensorOps,
@@ -564,6 +566,7 @@ impl Attention {
         self.o_proj.forward(&y, ctx)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn verify_v2_arm(
         &self,
         q: &TensorOps,
@@ -653,7 +656,8 @@ impl Attention {
 
     /// paged prefill(PF1 终;F16 hd∈{128,256}):K0 批量写池(T 行散写)
     /// + chunked prefill 批核(bs16 特化;因果语义 = 查询 token t 看
-    /// [0, seq_start+t])。naive 逐 token 路径保留为回退。
+    ///   [0, seq_start+t])。naive 逐 token 路径保留为回退。
+    #[allow(clippy::too_many_arguments)]
     fn paged_prefill_output(
         &self,
         q: &TensorOps,
@@ -747,6 +751,7 @@ impl Attention {
     /// nparts = ceil(max_ctx/512) ≥ 4(max_ctx > 2048)即走;K0 写池 →
     /// K1 分块在线 softmax(partial + (m,l) 入 scratch)→ K2 归一化合并。
     /// 块数 ×nparts(occupancy 主升),scratch 由活性回收随 chunk 归池。
+    #[allow(clippy::too_many_arguments)]
     fn paged_prefill_split_output(
         &self,
         q: &TensorOps,
@@ -897,8 +902,8 @@ impl Attention {
     }
 
     /// prefill 展开声明(PF1a;批P4):投影/qk-norm/rope/gate T 批量单发
-
-
+    ///
+    ///
     /// (rope grid=(tokens,1,1) 逐行读 pos[t],T 就绪);唯逐 token 段 =
     /// naive_attn(写-打分同 launch 的跨 token 竞态 ⇒ 不批;槽/kv_len 取
     /// [T] 表行 t 窄视图)。语义 = T 次 decode 步(验收锚,批P4 对拍)。
@@ -1371,7 +1376,7 @@ mod f16_tests {
         assert!(use_v2, "v1 隔离臂已随 kNHD 统一布局退役:见 gpu_attn_v2_decode_matches_prefill_paged 头注");
         let hidden = 6usize;
         let (page, x) = (32usize, 8usize); // 二分:暂回页 32
-        let row_q = hq * hd;
+        let _row_q = hq * hd;
         let halfb = |v: &[f32]| -> Vec<u8> {
             v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect()
         };
@@ -1447,7 +1452,7 @@ mod f16_tests {
         // v2 臂(use_v2):在线 softmax 分块 + LSE 归并;scratch 三件套
         // 持久块(与引擎 alloc 同构:nparts = ceil(nb·page/512))
         let v2_scratch = if use_v2 {
-            let nparts = (nb * page + 511) / 512;
+            let nparts = (nb * page).div_ceil(512);
             let es = crate::interpreters::eval_ops(
                 TensorOps::zeros(Dtype::F32, vec![1, hq * nparts]).step(), &mut gpu)
                 .await.expect("v2 exp_sums");
@@ -1520,7 +1525,7 @@ mod f16_tests {
                         let xv = half::f16::from_f32(xs_f32[t * hidden + c]).to_f32();
                         acc += w * xv;
                     }
-                    let got = vf(((b * hkv + 0) * hd + d) * page + off);
+                    let got = vf(((b * hkv) * hd + d) * page + off);
                     let dd = (got - acc).abs();
                     if dd > worst.0 {
                         worst = (dd, t);
@@ -1538,7 +1543,7 @@ mod f16_tests {
     }
 
     async fn gpu_client_close() {
-        let mut gpu = gpu_client().await;
+        let gpu = gpu_client().await;
         gpu.close().await.expect("关机");
     }
 
@@ -1628,7 +1633,7 @@ mod f16_tests {
         // kNHD 变体,而本门是**写核**门(A/B 差只应由写核贡献),读侧跟着
         // 走 v1 = 两个错对消的假绿 + 层侧 fail-fast 守卫会先炸。
         let scratch = {
-            let nparts = (nb * page + 511) / 512;
+            let nparts = (nb * page).div_ceil(512);
             let es = crate::interpreters::eval_ops(
                 TensorOps::zeros(Dtype::F32, vec![1, hq * nparts]).step(), &mut gpu)
                 .await.expect("v2 exp_sums");
@@ -1736,7 +1741,7 @@ mod f16_tests {
                 }
             }
         }
-        let r0 = 2 * half;
+        let _r0 = 2 * half;
         eprintln!(
             "[k-probe hd{hd} r{rotary}] |A−G|={w_a:.4} |B−G|={w_b:.4} |C−N|={w_c:.4} |A−B|={w_ab:.4} \
              (B 旋转维={rot_b:.4} 直通维={pass_b:.4} 最坏点 t={} kh={} d={})",
@@ -1802,7 +1807,7 @@ mod f16_tests {
         }
         let (hq, hkv, hd, hidden) = (2usize, 1usize, 4usize, 6usize);
         let t_len = 8usize;
-        let row_q = hq * hd;
+        let _row_q = hq * hd;
         let halfb = |v: &[f32]| -> Vec<u8> {
             v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect()
         };
@@ -1892,7 +1897,7 @@ mod f16_tests {
             buf
         };
         let mut wrote = 0usize;
-        for (i, ch) in read_kc.chunks_exact(2).enumerate() {
+        for ch in read_kc.chunks_exact(2) {
             let v = half::f16::from_le_bytes([ch[0], ch[1]]).to_f32();
             if v != 0.0 { wrote += 1; }
         }
@@ -2079,11 +2084,10 @@ mod owl_port_tests {
             Dtype::F16,
             vec![t_len, hidden],
             &(0..t_len * hidden)
-                .map(|i| {
+                .flat_map(|i| {
                     half::f16::from_f32(((i as f32) * 0.37 - 1.0).sin())
                         .to_le_bytes()
                 })
-                .flatten()
                 .collect::<Vec<u8>>(),
         );
         let pos = TensorOps::from_host(
@@ -2171,13 +2175,13 @@ mod owl_port_tests {
             seq_lens: TensorOps::from_host(
                 Dtype::U32,
                 vec![1],
-                &(ctx_total as u32).to_le_bytes().to_vec(),
+                (ctx_total as u32).to_le_bytes().as_ref(),
             ),
             mask: TensorOps::from_host(
                 Dtype::U32,
                 vec![1, t_len],
                 &(0..t_len)
-                    .map(|i| ((1u32 << (i + 1)) - 1))
+                    .map(|i| (1u32 << (i + 1)) - 1)
                     .flat_map(|v| v.to_le_bytes())
                     .collect::<Vec<u8>>(),
             ),
@@ -2278,7 +2282,7 @@ mod owl_port_tests {
         let sh = crate::contract::Shape::from(vec![n]);
         let dg = gpu.htod(Dtype::F16, &sh, &gate.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>()).await.expect("gate");
         let dxx = gpu.htod(Dtype::F16, &sh, &x.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>()).await.expect("x");
-        let dout = gpu.alloc(Dtype::F16, n).await.expect("alloc");
+        let _dout = gpu.alloc(Dtype::F16, n).await.expect("alloc");
         let g_decl = TensorOps::of_block(dg.id, Dtype::F16, vec![n]);
         let x_decl = TensorOps::of_block(dxx.id, Dtype::F16, vec![n]);
         let decl = TensorOps::call(SemanticKernel::GateMul)
@@ -2325,9 +2329,9 @@ mod naive_attn_f16_tests {
         let mut gpu = gpu_client().await;
         let sh = crate::contract::Shape::from;
         let hb = |v: &[f32]| v.iter().flat_map(|f| hle(*f)).collect::<Vec<u8>>();
-        let dq = gpu.htod(Dtype::F16, &sh(vec![2, hq, hd]), &hb(&q)).await.unwrap();
-        let dk = gpu.htod(Dtype::F16, &sh(vec![2, hkv, hd]), &hb(&k)).await.unwrap();
-        let dv = gpu.htod(Dtype::F16, &sh(vec![2, hkv, hd]), &hb(&v)).await.unwrap();
+        let _dq = gpu.htod(Dtype::F16, &sh(vec![2, hq, hd]), &hb(&q)).await.unwrap();
+        let _dk = gpu.htod(Dtype::F16, &sh(vec![2, hkv, hd]), &hb(&k)).await.unwrap();
+        let _dv = gpu.htod(Dtype::F16, &sh(vec![2, hkv, hd]), &hb(&v)).await.unwrap();
         let kc = gpu.alloc(Dtype::F16, slots_n * hkv * hd).await.unwrap();
         let vc = gpu.alloc(Dtype::F16, slots_n * hkv * hd).await.unwrap();
 
@@ -2352,12 +2356,12 @@ mod naive_attn_f16_tests {
             let vc_d = TensorOps::of_block(vc.id, Dtype::F16, vec![slots_n, hkv, hd]);
             let decl = TensorOps::call(SemanticKernel::NaiveDecode)
             .arg(&q_t).arg(&k_t).arg(&v_t).arg(&kc_d).arg(&vc_d)
-            .arg(&TensorOps::from_host(Dtype::F32, vec![1], &sl.to_le_bytes().to_vec()))
-            .arg(&TensorOps::from_host(Dtype::F32, vec![1], &kl.to_le_bytes().to_vec()))
+            .arg(&TensorOps::from_host(Dtype::F32, vec![1], sl.to_le_bytes().as_ref()))
+            .arg(&TensorOps::from_host(Dtype::F32, vec![1], kl.to_le_bytes().as_ref()))
             .arg_usize(1).arg_usize(hq).arg_usize(hkv).arg_usize(hd)
             .with_shape(Dtype::F16, vec![1, hq * hd]);
             let o = crate::interpreters::eval_ops(decl.step(), &mut gpu).await.unwrap();
-            let mut b = vec![0u8; 1 * hq * hd * 2];
+            let mut b = vec![0u8; hq * hd * 2];
             gpu.dtoh(&o, &mut b).await.unwrap();
             outs.push(b);
         }
@@ -2411,7 +2415,6 @@ mod split_probe_tests {
     // 双双拦截(单 token 档护 ①,多 token 档护 ②)。
     #[tokio::test]
     async fn gpu_split_probe() {
-    use crate::contract::DeviceClient as _;
     if !crate::testkit::gpu_enabled() { return; }
     let (hq, hkv, hd, t, ctx_base, nparts) = (2usize, 1usize, 256usize, 8usize, 0usize, 1usize);
     let page = 32usize; let x = 8usize; let nb = 1usize;
@@ -2422,7 +2425,7 @@ mod split_probe_tests {
     let kr: Vec<f32> = (0..t * hkv * hd).map(|i| ((i * 11 % 19) as f32 - 9.0) * 0.17).collect();
     let vr: Vec<f32> = (0..t * hkv * hd).map(|i| ((i * 13 % 17) as f32 - 8.0) * 0.19).collect();
     let halfb = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect() };
-    let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+    let _f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
 
     let q = TensorOps::from_host(Dtype::F16, vec![t, hq * hd], &halfb(&qr));
     let k = TensorOps::from_host(Dtype::F16, vec![t, hkv * hd], &halfb(&kr));
@@ -2497,9 +2500,9 @@ mod split_probe_tests {
         let vr0: Vec<f32> = (0..256usize).map(|d| ((d * 13 % 17) as f32 - 8.0) * 0.19).collect();
         for slot in 0..2usize {
             let lo = slot * 256;
-            let nz_s = ob[lo * 2..(lo + 256) * 2].chunks_exact(2).filter(|c| *c != [0, 0]).count();
+            let _nz_s = ob[lo * 2..(lo + 256) * 2].chunks_exact(2).filter(|c| *c != [0, 0]).count();
                 let d0: Vec<String> = (0..8).map(|d| format!("{d}:{:.5}", hf16(&ob, lo + d))).collect();
-            eprintln!("[split-probe] slot{slot}[0..8]={:?} (金标 vr[0..8][0]=-1.52)", &d0);
+            eprintln!("[split-probe] slot{slot}[0..8]={:?} (金标 vr[0..8][0]=-1.52)", d0);
         }
         eprintln!("[split-probe] v0 金标[0..12]: {:?}", &vr0[..12]);
         // vc 池取证:V 写入 = d×32 + kt
@@ -2521,7 +2524,7 @@ mod split_probe_tests {
         }
         for kt in [0usize, 3] {
             let row: Vec<String> = (0..6).map(|d| format!("d{d}={:.3}", hf16v(&vcb, d * 32 + kt))).collect();
-            eprintln!("[split-probe] vc kt{kt}: {:?}(金标 v[kt×256+d])", &row);
+            eprintln!("[split-probe] vc kt{kt}: {:?}(金标 v[kt×256+d])", row);
         }
     }
 
@@ -2535,6 +2538,7 @@ mod split_probe_tests {
     for tok in 0..t {
         for h in 0..hq {
             let mut m = f32::MIN; let mut scores = vec![0f32; tok + 1];
+            #[allow(clippy::needless_range_loop)]
             for kt in 0..=tok {
                 let mut dot = 0f32;
                 for d in 0..hd {
@@ -2543,9 +2547,11 @@ mod split_probe_tests {
                 let s = dot * scale; scores[kt] = s; m = m.max(s);
             }
             let mut l = 0f32;
+            #[allow(clippy::needless_range_loop)]
             for kt in 0..=tok { scores[kt] = (scores[kt] - m).exp(); l += scores[kt]; }
             for d in 0..hd {
                 let mut acc = 0f32;
+                #[allow(clippy::needless_range_loop)]
                 for kt in 0..=tok { acc += scores[kt] * hf(&vb, kt * hd + d); }
                 let want = half::f16::from_f32(acc / l).to_f32();
                 let got_v = got[(tok * hq + h) * hd + d];
@@ -2558,14 +2564,17 @@ mod split_probe_tests {
         for d in [0usize, 64, 128, 192] {
             let g = got[(tok * hq + h) * hd + d];
             let mut m = f32::MIN; let mut sc = vec![0f32; tok + 1];
+            #[allow(clippy::needless_range_loop)]
             for kt in 0..=tok {
                 let mut dot = 0f32;
                 for dd in 0..hd { dot += hf(&qb, (tok*hq+h)*hd + dd) * hf(&kb, kt*hd + dd); }
                 let sv = dot * scale; sc[kt] = sv; m = m.max(sv);
             }
             let mut l = 0f32;
+            #[allow(clippy::needless_range_loop)]
             for kt in 0..=tok { sc[kt] = (sc[kt] - m).exp(); l += sc[kt]; }
             let mut acc = 0f32;
+            #[allow(clippy::needless_range_loop)]
             for kt in 0..=tok { acc += sc[kt] * hf(&vb, kt*hd + d); }
             eprintln!("[split-probe] t{tok} h{h} d{d}: got={g:.5} want={:.5}", acc / l);
         }

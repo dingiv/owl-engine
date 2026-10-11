@@ -170,6 +170,7 @@ pub struct RunningEngine<D: DeviceClient> {
     pub(crate) sched_cnt: usize,
     /// E5-M2b:spec 模式三态(Mtp = 真草稿头;Dumb = 哑草稿诊断;
     /// Off = 回落 DecodeBatch —— spec_depth 恒 0)
+    #[allow(dead_code)] // 诊断面字段(写入后当前无读者)
     pub(crate) spec_mode: SpecMode,
     /// MTP 草稿头(mtp 模式;embed/lm_head 共享 target 不持有;Arc =
     /// propose 图闭包共享)
@@ -416,7 +417,7 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 启动切换;`Idle` = 队列排空且无活跃,调用方可安全挂起等新提交)。
     /// **S0 调度/执行分离**:本函数 = 调度(纯主机侧决策,零设备 IO)
     /// + 执行(设备侧照办)—— 决策面可单测,执行器无决策权
-    /// (调度层铺开 §S0;对标 vLLM v1 schedule/execute 分离)。
+    ///   (调度层铺开 §S0;对标 vLLM v1 schedule/execute 分离)。
     pub async fn pump(&mut self) -> Result<TurnEvent> {
         // E5-M2:spec 轮多 token 事件队列优先排空(schedule 前 —— 事件序
         // 不可与下一轮调度交织)
@@ -435,7 +436,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             let d = ts.elapsed();
             self.sched_acc_ns += d.as_nanos() as u64;
             self.sched_cnt += 1;
-            if self.sched_cnt % 16 == 0 {
+            if self.sched_cnt.is_multiple_of(16) {
                 eprintln!(
                     "[sched] n={} avg={:.2}ms last={:.2}ms",
                     self.sched_cnt,

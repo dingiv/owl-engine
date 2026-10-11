@@ -13,7 +13,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         bonus: u32,
     ) -> Result<Vec<u32>> {
         let fp = pos + m + 1;
-        let page = self.pool.page;
+        let _page = self.pool.page;
         {
             let act = self.active.as_ref().expect("active 已保证");
             let s = self.sessions.get_mut(act.session_id).expect("账在");
@@ -27,7 +27,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 草稿池寻址一律经 StatePool 权威(slot≥1 案配套;分派点零推槽)
         use crate::state::StatePool as SP;
         let slot_at = |p: usize| SP::draft_prefix_slot(p);
-        let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+        let _f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
         let tokens_f: Vec<f32> = (0..8)
             .map(|i| if i == 0 { bonus as f32 } else { owl_models::layers::dflash2::MASK_TOKEN_ID as f32 })
             .collect();
@@ -103,12 +103,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         );
         // 草稿池线性逻辑寻址(slot = 逻辑位;NC 前缀读 [0, prefix) 直排;
         // bt 物理槽仅首 session 重合 —— slot≥1 案修,2026-10-10)
-        let (bt_chain, _) = {
+        let (_bt_chain, _) = {
             let act = self.active.as_ref().expect("active 已保证");
             let s = self.sessions.get(act.session_id).expect("账在");
             (s.block_table.clone(), s.gdn_slot)
         };
-        let page = self.pool.page;
+        let _page = self.pool.page;
         let leaves = self.pool.dflash_kv_leaves().expect("dflash 池");
         let bt = self.pool.bt_leaf_flat();
         let kvs: Vec<KvBuffers> = leaves
@@ -184,7 +184,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 残写,永久污染窗口头部 → AL=0 案真凶,2026-10-08 定谳)
         let leaves = self.pool.dflash_kv_leaves().expect("dflash 池");
         let bt = self.pool.bt_leaf_flat();
-        let (bt_chain, _) = {
+        let (_bt_chain, _) = {
             let act = self.active.as_ref().expect("active 已保证");
             let s = self.sessions.get(act.session_id).expect("账在");
             (s.block_table.clone(), s.gdn_slot)
@@ -309,7 +309,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
             let mut m = Vec::new();
             m.extend_from_slice(&(pos as u32).to_le_bytes());
-            m.extend_from_slice(&(anchor as u32).to_le_bytes());
+            m.extend_from_slice(&anchor.to_le_bytes());
             if let Err(e) = owl_shared::file_loader::write("/tmp/owl_dflash_meta.bin", &m) {
                 eprintln!("[dump] 落盘失败(诊断面不许静默): {e}");
             }
@@ -438,7 +438,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             &f32b(&(0..rows).map(|i| (pos + i) as f32).collect::<Vec<_>>()),
         );
         // 编码槽表 = 线性逻辑位(pos..pos+rows;草稿池线性寻址,同 ②)
-        let page = self.pool.page;
+        let _page = self.pool.page;
         let leaves = self.pool.dflash_kv_leaves().expect("dflash 池");
         let bt = self.pool.bt_leaf_flat();
         let kvs: Vec<KvBuffers> = leaves

@@ -90,13 +90,14 @@ fn host_attn_ref_knhd(q: &[u16], kcache: &[u8], vcache: &[u8], kv_fp8: bool, hd:
         }
     };
     let kbs = PAGE * NUM_KV_HEADS * hd; // 元素 stride(两布局同值)
-    let khs = hd; // kNHD head stride
+    let _khs = hd; // kNHD head stride
     let scale = 1.0 / (hd as f32).sqrt();
     let mut out = vec![0f32; T * NUM_HEADS * hd];
     for t in 0..T {
         for h in 0..NUM_HEADS {
             let kvh = h / (NUM_HEADS / NUM_KV_HEADS);
             let mut qk = [0f32; SEQ_LEN];
+            #[allow(clippy::needless_range_loop)]
             for b in 0..=t {
                 let pb = b / PAGE;
                 let bb = b % PAGE;
@@ -111,6 +112,7 @@ fn host_attn_ref_knhd(q: &[u16], kcache: &[u8], vcache: &[u8], kv_fp8: bool, hd:
             let l: f32 = qk[..=t].iter().map(|&x| (x - m).exp()).sum();
             for d in 0..hd {
                 let mut acc = 0f32;
+                #[allow(clippy::needless_range_loop)]
                 for b in 0..=t {
                     let pb = b / PAGE;
                     let bb = b % PAGE;
@@ -129,8 +131,8 @@ fn run_case(stream: &Arc<cudarc::driver::CudaStream>, m: &Arc<cudarc::driver::Cu
     let k_f16 = lcg(pool_elems, 101 + hd as u32);
     let v_f16 = lcg(pool_elems, 202 + hd as u32);
     let q_f16 = lcg(T * NUM_HEADS * hd, 303 + hd as u32);
-    let k_fp8: Vec<u8> = k_f16.iter().map(|&h| e4m3_encode(f16_to_f32(h))).collect();
-    let v_fp8: Vec<u8> = v_f16.iter().map(|&h| e4m3_encode(f16_to_f32(h))).collect();
+    let _k_fp8: Vec<u8> = k_f16.iter().map(|&h| e4m3_encode(f16_to_f32(h))).collect();
+    let _v_fp8: Vec<u8> = v_f16.iter().map(|&h| e4m3_encode(f16_to_f32(h))).collect();
 
     // kNHD 落位:pool_n[knhd_off] = 值(classic 线性数组直接按 knhd 序排)
     let knhd_arrange = |lin: &[u16]| -> Vec<u16> {

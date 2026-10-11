@@ -35,7 +35,7 @@
 //! **执行面(解释器)**
 //! - [`interpreters`]:解释器集合(计算 eval/装载 load/观测 tap/生成
 //!   generate;face 注入;变体见模块头)
-//! - [`reference`]:同步参考解释器(reduce/CpuInterpreter;对拍锚,永不优化)
+//! - [`reference`][]:同步参考解释器(reduce/CpuInterpreter;对拍锚,永不优化)
 //!
 //! 设计文档:docs/arch/async-runtime.md、docs/arch/qwen3-mini-demo.md、
 //! roadmap.local/api-stabilize-plan.md(API 稳定化挂账)。

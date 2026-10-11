@@ -339,6 +339,10 @@ pub trait DeviceClient: Send {
         &mut self,
         copies: &[(Bytes, usize, Bytes, usize, usize)],
     ) -> impl Future<Output = Result<(), ModelError>> + Send {
+        // FIXME(clippy::unnecessary_to_owned):此处不能改 `copies.iter().cloned()` ——
+        // 返回的 future 在 2021 edition RPIT 下不捕获 `copies` 的生命周期,
+        // 必须先 clone 成 owned 迭代器才能移入 async 块。allow 而非改写。
+        #[allow(clippy::unnecessary_to_owned)]
         let mut it: std::vec::IntoIter<(Bytes, usize, Bytes, usize, usize)> =
             copies.to_vec().into_iter();
         async move {

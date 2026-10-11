@@ -66,6 +66,7 @@ impl OwlCublas {
     /// nt=false:C[T,n] = A[T,k]×B[k,n]。A/B/out = 设备地址(u64)。
     /// 参数口径:m = n_out(权重行)/ n = T(token 数;cm 映射的 C 列)。
     /// fire-and-forget(排队即返回;COMPUTE 流保序)。
+    #[allow(clippy::too_many_arguments)]
     pub fn gemm_f16(
         &self,
         a: u64,
@@ -118,6 +119,7 @@ impl OwlCublas {
 
     /// BF16 GEMM(E5-DF3 同日十四):与 gemm_f16 同式,A/B/out =
     /// CUDA_R_16BF,累计 CUBLAS_COMPUTE_32F(sglang bf16 同款口径)。
+    #[allow(clippy::too_many_arguments)]
     pub fn gemm_bf16(
         &self,
         a: u64,

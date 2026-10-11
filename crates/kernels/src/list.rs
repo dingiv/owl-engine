@@ -335,8 +335,8 @@ pub fn lookup(name: &str) -> Option<&'static Entry> {
 /// 1. 字面核:`extern "C" __global__ void <name>(`;
 /// 2. 单层宏实例化核:`<MACRO>(<name>, …)` 且 `#define <MACRO>(<首形参>, …)`
 ///    定义体里有 `void <首形参>(`(如 chunked KNHD 族 `CHUNKED_KNHD_ENTRY`)。
-/// 运行时门(models `kv_manifest_gate`)与测试门共用本判据 —— 宏形态不许
-/// 两处各写一遍(否则两道门会各说各话)。
+///    运行时门(models `kv_manifest_gate`)与测试门共用本判据 —— 宏形态不许
+///    两处各写一遍(否则两道门会各说各话)。
 pub fn source_defines(source: &str, name: &str) -> bool {
     // 剥行注释 + 折叠宏续行(宏体形参住在续行里)
     let clean: String = source
@@ -412,7 +412,7 @@ pub fn launch_shape(grid: (u32, u32, u32), block: (u32, u32, u32), shared_mem: u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::Bytes;
+    
 
     #[test]
     fn registry_entries_have_sources() {
@@ -576,7 +576,7 @@ mod tests {
         for line in clean.lines() {
             let t = line.trim();
             if t.starts_with("OWL_") && t.contains("KERNEL(") {
-                if let Some(rest) = t.splitn(2, '(').nth(1) {
+                if let Some(rest) = t.split_once('(').map(|x| x.1) {
                     let mut parts = rest.splitn(3, ',');
                     if parts.next().map(|x| x.trim()) == Some(name) {
                         let params = parts

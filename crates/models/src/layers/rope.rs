@@ -13,7 +13,6 @@
 //! kernel 源 = 注册表 `owl_rope_half_partial_f32`(owl-kernels cu/owl)。
 
 use crate::ops::SemanticKernel;
-use crate::tensor::Dtype;
 use crate::contract::ModelError;
 use crate::module::{Loadable, LoaderCtx, LoaderOps, Weight};
 use crate::TensorOps;
@@ -41,7 +40,7 @@ impl Rope {
         rotary_dim: usize,
         theta: f32,
     ) -> Result<Rope, ModelError> {
-        if rotary_dim % 2 != 0 || rotary_dim > head_dim {
+        if !rotary_dim.is_multiple_of(2) || rotary_dim > head_dim {
             return Err(ModelError::Msg(format!(
                 "Rope::new: rotary_dim {rotary_dim} 非法(须偶数且 ≤ head_dim {head_dim})"
             )));
@@ -92,7 +91,7 @@ impl Rope {
     }
 
     /// f32 锚链直发(Call 通路 f32 对拍挂账期间保留)
-
+    ///
     /// q 旋转:[T, Hq*HD] → [T, Hq*HD](前 rotary_dim 维转,余直通)
     pub fn forward_q(
         &self,
@@ -147,6 +146,7 @@ impl Loadable for Rope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tensor::Dtype;
     use crate::testkit::f32b;
     
     #[tokio::test]
@@ -183,7 +183,7 @@ mod tests {
         let rp = Rope::new(64, 8, 4, 10_000.0).expect("new");
         let pos = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[5.0]));
         let _ = rp.forward_q(
-            &TensorOps::from_host(Dtype::F32, vec![1, 16], &f32b(&vec![0.3; 16])),
+            &TensorOps::from_host(Dtype::F32, vec![1, 16], &f32b(&[0.3; 16])),
             &pos,
             1,
             2,
@@ -246,6 +246,7 @@ mod tests {
 mod f16_tests {
     use super::*;
     use crate::contract::DeviceClient as _;
+    use crate::tensor::Dtype;
     use crate::testkit::{gpu_client, gpu_enabled};
     
     fn half_le(f: f32) -> [u8; 2] {

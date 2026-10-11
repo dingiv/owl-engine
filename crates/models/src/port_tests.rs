@@ -10,7 +10,6 @@
 
 use crate::contract::DeviceClient as _;
 use crate::ops::SemanticKernel;
-use crate::kernel::kernel_with;
 use crate::testkit::{f32b, gpu_client, gpu_enabled};
 use crate::tensor::Dtype;
 use crate::TensorOps;
@@ -139,7 +138,7 @@ async fn gpu_reshape_and_cache_f16_matches_host() {
 /// (布局自洽),q = token0 key 行;返回(池句柄, 分页表, 序长表)。
 async fn setup_paged_fixture(
     gpu: &mut owl_cuda::GpuClient,
-    hq: usize, hkv: usize, hd: usize, p: usize, nb: usize, t_ctx: usize,
+    _hq: usize, hkv: usize, hd: usize, p: usize, nb: usize, t_ctx: usize,
 ) -> (crate::contract::Bytes, crate::contract::Bytes, Vec<f32>, Vec<f32>, Vec<f32>) {
     let x = 8usize;
     let halfb = |v: &[f32]| -> Vec<u8> {
@@ -189,6 +188,7 @@ async fn setup_paged_fixture(
 }
 
 /// host 参照:token-major 语义注意力(f16 量化值;分页索引由核验)
+#[allow(clippy::too_many_arguments)]
 fn host_attn_ref(
     q_row: &[f32], key: &[f32], value: &[f32], h: usize, kvh_map: &[usize],
     hkv: usize, hd: usize, t_ctx: usize, scale: f32,
@@ -205,6 +205,7 @@ fn host_attn_ref(
         maxs = maxs.max(scores[s]);
     }
     let (mut denom, mut out) = (0f32, vec![0f32; hd]);
+    #[allow(clippy::needless_range_loop)]
     for s in 0..t_ctx {
         scores[s] = (scores[s] - maxs).exp();
         denom += scores[s];
@@ -250,7 +251,7 @@ async fn gpu_prefill_paged_attn_f16_hd256_impl(t_ctx: usize) {
         }
     }
     let scale = 1.0 / (hd as f32).sqrt();
-    let smem = (64 + 2 * hd * p * 2) as u32;
+    let _smem = (64 + 2 * hd * p * 2) as u32;
     let q8 = |v: f32| half::f16::from_f32(v).to_f32();
     let qb = |v: &[f32]| v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>();
 
@@ -293,6 +294,7 @@ async fn gpu_prefill_paged_attn_f16_hd256_impl(t_ctx: usize) {
             maxs = maxs.max(scores[s]);
         }
         let (mut denom, mut want) = (0f32, vec![0f32; hd]);
+        #[allow(clippy::needless_range_loop)]
         for s in 0..=t {
             scores[s] = (scores[s] - maxs).exp();
             denom += scores[s];
@@ -333,7 +335,7 @@ async fn gpu_paged_attention_v1_f16_smoke() {
     // q = token0 key 行(hq 行同值,覆盖 GQA 两条映射)
     let q: Vec<f32> = key[..hd].iter().chain(key[..hd].iter()).cloned().collect();
     let scale = 1.0 / (hd as f32).sqrt();
-    let shared = ((t_ctx + p - 1) / p * p * 4).max((4 / 2) * hd * 4) as u32; // NUM_WARPS=4
+    let _shared = (t_ctx.div_ceil(p) * p * 4).max((4 / 2) * hd * 4) as u32; // NUM_WARPS=4
 
     let decl = TensorOps::call(SemanticKernel::PagedDecode).aux(&[hd, hq, hkv, nb])
         .arg(&TensorOps::from_host(Dtype::F16, vec![1, hq, hd],
@@ -375,16 +377,17 @@ async fn gpu_paged_attention_v1_f16_hd256_smoke() {
     let (hq, hkv, hd, p, nb, t_ctx) = (8usize, 2usize, 256usize, 32usize, 1usize, 8usize);
     let kvh_map: Vec<usize> = (0..hq).map(|h| h / (hq / hkv)).collect();
     let mut gpu = gpu_client().await;
-    let (kc_b, vc_b, key, value, tables) =
+    let (kc_b, vc_b, key, value, _tables) =
         setup_paged_fixture(&mut gpu, hq, hkv, hd, p, nb, t_ctx).await;
 
     let mut q: Vec<f32> = Vec::with_capacity(hq * hd);
+    #[allow(clippy::needless_range_loop)]
     for h in 0..hq {
         let kvh = kvh_map[h];
         q.extend(key[kvh * hd..kvh * hd + hd].iter().cloned());
     }
     let scale = 1.0 / (hd as f32).sqrt();
-    let shared = ((t_ctx + p - 1) / p * p * 4).max((4 / 2) * hd * 4) as u32;
+    let _shared = (t_ctx.div_ceil(p) * p * 4).max((4 / 2) * hd * 4) as u32;
     let qb = |v: &[f32]| v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>();
 
     let decl = TensorOps::call(SemanticKernel::PagedDecode).aux(&[hd, hq, hkv, nb])
@@ -421,6 +424,7 @@ async fn gpu_paged_attention_v1_f16_hd256_smoke() {
             maxs = maxs.max(scores[s]);
         }
         let (mut denom, mut out) = (0f32, vec![0f32; hd]);
+        #[allow(clippy::needless_range_loop)]
         for s in 0..t_ctx {
             scores[s] = (scores[s] - maxs).exp();
             denom += scores[s];
@@ -453,7 +457,7 @@ async fn gpu_paged_attention_v2_reduce_f16_smoke() {
 
     let q: Vec<f32> = key[..hd].iter().chain(key[..hd].iter()).cloned().collect();
     let scale = 1.0 / (hd as f32).sqrt();
-    let shared = ((t_ctx + p - 1) / p * p * 4).max((4 / 2) * hd * 4) as u32;
+    let _shared = (t_ctx.div_ceil(p) * p * 4).max((4 / 2) * hd * 4) as u32;
     let qb = |v: &[f32]| v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>();
 
     // v2:exp_sums/max_logits 为 ins 就地写,tmp_out = 末位新分配
@@ -523,7 +527,7 @@ async fn gpu_prefill_paged_attn_f16_smoke() {
         }
     }
     let scale = 1.0 / (hd as f32).sqrt();
-    let smem = (64 + 2 * hd * p * 2) as u32; // 头注契约
+    let _smem = (64 + 2 * hd * p * 2) as u32; // 头注契约
     let q8 = |v: f32| half::f16::from_f32(v).to_f32();
     let qb = |v: &[f32]| v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>();
 
@@ -567,6 +571,7 @@ async fn gpu_prefill_paged_attn_f16_smoke() {
             maxs = maxs.max(scores[s]);
         }
         let (mut denom, mut want) = (0f32, vec![0f32; hd]);
+        #[allow(clippy::needless_range_loop)]
         for s in 0..=t {
             scores[s] = (scores[s] - maxs).exp();
             denom += scores[s];

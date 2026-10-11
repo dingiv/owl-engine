@@ -2,19 +2,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 
 #[derive(Clone, Debug)]
+#[derive(Default)]
 pub struct PrefixCacheConfig {
     pub enabled: bool,
     pub max_cached_blocks: usize,
 }
 
-impl Default for PrefixCacheConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            max_cached_blocks: 0,
-        }
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct PrefixMatch {
@@ -96,7 +89,7 @@ impl PrefixCache {
         let mut last_hash = None;
         for (i, block_tokens) in tokens.chunks(self.block_size).take(full_blocks).enumerate() {
             if let Some(s) = seed {
-                if seed_block.map_or(false, |sb| i == sb) {
+                if seed_block == Some(i) {
                     parent_hash = Self::mix_seed(parent_hash, s);
                 }
             }
@@ -165,7 +158,7 @@ impl PrefixCache {
         let mut last_hash = None;
         for (i, block_tokens) in tokens.chunks(self.block_size).take(full_blocks).enumerate() {
             if let Some(s) = seed {
-                if seed_block.map_or(false, |sb| i == sb) {
+                if seed_block == Some(i) {
                     parent_hash = Self::mix_seed(parent_hash, s);
                 }
             }
@@ -213,7 +206,7 @@ impl PrefixCache {
         {
             let mut base = parent_hash.unwrap_or(0);
             if let Some(s) = seed {
-                if seed_block.map_or(false, |sb| i == sb) {
+                if seed_block == Some(i) {
                     base = Self::mix_seed(base, s);
                 }
             }
@@ -223,7 +216,7 @@ impl PrefixCache {
                 let content_match = self
                     .entries
                     .get(&hash)
-                    .map_or(false, |e| e.content_hash == fingerprint);
+                    .is_some_and(|e| e.content_hash == fingerprint);
                 if !content_match {
                     break;
                 }

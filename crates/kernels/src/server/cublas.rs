@@ -10,15 +10,11 @@ use crate::registry::KernelSpec;
 use crate::family::cublas::OwlCublas;
 
 
+#[derive(Default)]
 pub struct CublasRuntime {
     blas: Option<OwlCublas>,
 }
 
-impl Default for CublasRuntime {
-    fn default() -> Self {
-        Self { blas: None }
-    }
-}
 
 impl KernelSpec for CublasRuntime {
     fn id(&self) -> OpId {

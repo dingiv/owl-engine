@@ -39,7 +39,7 @@ fn bench_shape(
     let ws_h: Vec<i32> = vec![0_i32; ws_len];
     let tmp_h: Vec<u8> = vec![0u8; 64 << 20]; // c_tmp 64MB(上游 par 归约余量)
 
-    let (mut a, mut b, mut c, mut s, mut z, mut ws, mut tmp);
+    let (mut a, mut b, mut c, mut s, mut z, mut ws, tmp);
     unsafe {
         a = stream.alloc::<u16>(a_h.len()).unwrap();
         b = stream.alloc::<i32>(b_h.len()).unwrap();
@@ -56,13 +56,13 @@ fn bench_shape(
     stream.memcpy_htod(&z_h, &mut z).unwrap();
     stream.memcpy_htod(&ws_h, &mut ws).unwrap();
 
-    let (a_p, _) = a.device_ptr(&stream);
-    let (b_p, _) = b.device_ptr(&stream);
-    let (c_p, _) = c.device_ptr(&stream);
-    let (s_p, _) = s.device_ptr(&stream);
-    let (z_p, _) = z.device_ptr(&stream);
-    let (ws_p, _) = ws.device_ptr(&stream);
-    let (tmp_p, _) = tmp.device_ptr(&stream);
+    let (a_p, _) = a.device_ptr(stream);
+    let (b_p, _) = b.device_ptr(stream);
+    let (c_p, _) = c.device_ptr(stream);
+    let (s_p, _) = s.device_ptr(stream);
+    let (z_p, _) = z.device_ptr(stream);
+    let (ws_p, _) = ws.device_ptr(stream);
+    let (tmp_p, _) = tmp.device_ptr(stream);
     let cu_stream = stream.cu_stream() as usize;
 
     let launch = |a_p, b_p, c_p, s_p, z_p, ws_p, tmp_p| unsafe {

@@ -175,8 +175,8 @@ fn gdn_decode_step_batch2_equals_serial() {
 
     let fresh_states = || {
         (
-            unsafe { stream.alloc_zeros::<f32>(conv_state_len).unwrap() },
-            unsafe { stream.alloc_zeros::<f32>(rec_state_len).unwrap() },
+            stream.alloc_zeros::<f32>(conv_state_len).unwrap(),
+            stream.alloc_zeros::<f32>(rec_state_len).unwrap(),
         )
     };
 

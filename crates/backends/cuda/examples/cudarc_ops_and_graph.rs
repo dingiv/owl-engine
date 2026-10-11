@@ -91,7 +91,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // arg 返回 &mut Self 链式;标量 = DeviceRepr 值参数(无 htod;裁决 3① 同源思想)
         // 一维网格:ceil-div;256 线程/块(与 owl LaunchConfig 同构)
         let cfg = LaunchConfig {
-            grid_dim: ((N as u32 + 255) / 256, 1, 1),
+            grid_dim: ((N as u32).div_ceil(256), 1, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -147,7 +147,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .arg(&mut out)
             .arg(&N)
             .launch(LaunchConfig {
-            grid_dim: ((N as u32 + 255) / 256, 1, 1),
+            grid_dim: ((N as u32).div_ceil(256), 1, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         })?;

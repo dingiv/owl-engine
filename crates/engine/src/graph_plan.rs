@@ -23,7 +23,7 @@
 //! 1. 树审计——输出树含 `Htod` 即降级(捕获期 Htod 禁;运行期装填一律
 //!    write_block 原位,不再 htod 重绑);
 //! 2. face 能力——`graph_begin` Err(如 CpuFace)即 EagerFallback。
-//! 捕获窗内 Err = 硬错(窗已脏;graph abort 原语挂账 iface)。
+//!    捕获窗内 Err = 硬错(窗已脏;graph abort 原语挂账 iface)。
 //!
 //! warmup = 姿势 6 lite:init 数据 eager dry 一遍(声明违约 plan 边界即
 //! 暴露;捕获不执行 kernel,状态不被捕获推进)。
@@ -32,7 +32,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use owl_iface::contract::{Bytes, DeviceClient, Dtype, GraphId, ModelError};
-use owl_models::interpreters::{eval_ops, eval_ops_multi};
+use owl_models::interpreters::eval_ops_multi;
 use owl_models::ops::{Op, PlanNode};
 use owl_models::TensorOps;
 
@@ -174,6 +174,7 @@ pub struct GraphPlan<D: DeviceClient> {
     out_dt: HashMap<String, Dtype>,    // name → 收割 dtype(F5 logits f16)
     last: HashMap<String, OutVal>,
     mode: Mode,
+    #[allow(clippy::type_complexity)] // 捕获闭包(crate 内部契约)
     forward: Box<dyn Fn(&PlanCtx) -> Result<()>>,
 }
 
@@ -491,9 +492,10 @@ pub(crate) fn f32b(v: &[f32]) -> Vec<u8> {
 mod tests {
     use super::*;
     use owl_cpu::CpuFace;
+    use owl_models::interpreters::eval_ops;
 
     fn ones_w() -> TensorOps {
-        let bytes: Vec<u8> = vec![1.0f32; 16].iter().flat_map(|f| f.to_le_bytes()).collect();
+        let bytes: Vec<u8> = [1.0f32; 16].iter().flat_map(|f| f.to_le_bytes()).collect();
         TensorOps::from_host(Dtype::F32, vec![4, 4], &bytes)
     }
 
@@ -566,7 +568,7 @@ mod tests {
         // CPU face 无图能力:capture=true 须结构化降级,闭环不受影响。
         // W 块化(否则被预检 1 的 Htod 审计先拦,测不到能力预检)
         let mut face = CpuFace::new();
-        let w_bytes: Vec<u8> = vec![1.0f32; 16].iter().flat_map(|f| f.to_le_bytes()).collect();
+        let w_bytes: Vec<u8> = [1.0f32; 16].iter().flat_map(|f| f.to_le_bytes()).collect();
         let w_b = eval_ops(TensorOps::from_host(Dtype::F32, vec![4, 4], &w_bytes).step(), &mut face)
             .await
             .expect("W 块化");

@@ -91,6 +91,8 @@ pub struct GroupedConv {
     dt: Dtype,
 }
 
+// accessor 面(base/proj/q_proj/… 部分仅 specs/测试消费,当前臂未引用)
+#[allow(dead_code)]
 impl GroupedConv {
     pub fn new(hidden: usize, block_size: usize, dt: Dtype) -> Self {
         let groups = hidden / GROUP;
@@ -176,7 +178,10 @@ pub struct DfAttn {
     kv_fp8: bool,
 }
 
+// accessor 面(q_proj/k_proj/v_proj/o_proj/q_norm/k_norm 当前臂未引用)
+#[allow(dead_code)]
 impl DfAttn {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(hq: usize, hkv: usize, hd: usize, hidden: usize, eps: f32, plan: QuantPlan, dt: Dtype, kv_fp8: bool) -> Self {
         Self {
             q_proj: Linear::new("q_proj", hq * hd, hidden, plan),
@@ -213,6 +218,7 @@ impl DfAttn {
 
     /// norm+rope(ATTN_NORM_ROPE plain 布局:row_stride = 行全长,
     /// head_stride = hd —— 融合核 k 链同款寻址)
+    #[allow(clippy::too_many_arguments)]
     fn norm_rope(
         &self,
         x: &TensorOps,
@@ -376,6 +382,7 @@ pub struct DfLayer {
 }
 
 impl DfLayer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         hq: usize,
         hkv: usize,
@@ -462,7 +469,7 @@ impl DfLayer {
         }
         let h2 = self.mlp.forward(&conv_in2, ctx);
         let h2 = self.mlp_conv.finish(&h2, &delta2, ctx);
-        if let Some(p) = probe.as_deref_mut() {
+        if let Some(p) = probe {
             p.push(h2.clone().tag("probe.mlp_out"));
         }
         (h2, residual)
@@ -508,6 +515,8 @@ pub struct CandidateSelector {
     dt: Dtype,
 }
 
+// accessor 面(proj/a_code/b_code 当前臂未引用)
+#[allow(dead_code)]
 impl CandidateSelector {
     /// `rank` = selector_rank(检查点家族 = RANK 256;tiny 测试参数化)。
     pub fn new(hidden: usize, vocab: usize, rank: usize, dt: Dtype) -> Self {
@@ -535,7 +544,7 @@ impl CandidateSelector {
         let pred = hidden.slice_view(dim, vec![rows, dim]); // 行 1..(连续视图)
         let topk = TensorOps::call(SemanticKernel::Topk16)
             .aux(&[rows])
-            .arg(&logits)
+            .arg(logits)
         .arg_i32(self.vocab as i32)
         .with_shape(Dtype::F32, vec![2 * rows * TOP_K]); // 值区 + 索引区(两段连续)
         let cand = topk.slice_view(rows * TOP_K, vec![rows, TOP_K]); // 索引区
@@ -593,8 +602,10 @@ pub struct DFlash2Draft {
     selector: CandidateSelector,
     hidden: usize,
     eps: f32,
+    #[allow(dead_code)]
     vocab: usize,
     /// B6 偷显存:草稿池 e4m3(encode 写/NC 读走 fp8kv;默认 false)
+    #[allow(dead_code)]
     pub(crate) kv_fp8: bool,
     /// 草稿激活 dtype(F16 存量测试面 / BF16 生产,sglang 对齐 ——
     /// 真实权重激活超 f16 范围,E5-DF3 同日十四定谳)
@@ -605,6 +616,7 @@ impl DFlash2Draft {
     /// 几何 = 检查点 config(5 层 32H/8KV/128;hidden 5120;inter 17408;
     /// eps 1e-6;vocab 248320)。plan 恒 F16(检查点全 BF16,装载源
     /// bf16→f16 归一;W4A16 版 = 二期)。dt = F16(存量测试面)。
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         hidden: usize,
         inter: usize,
@@ -633,6 +645,7 @@ impl DFlash2Draft {
 
     /// plan 参数化构造(W4A16:attn/mlp/fc 走量化计划,norms/conv 投影
     /// /codebooks 恒 F16 直读 —— 检查点 ignore 清单同构)。dt = F16。
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_plan(
         hidden: usize,
         inter: usize,
@@ -651,6 +664,7 @@ impl DFlash2Draft {
     /// 全参数构造(dt 显式;生产 = BF16,sglang 对齐,E5-DF3 同日十四:
     /// 草稿路径 BF16 全程 —— 权重原生 BF16 直载,激活 f16 溢出免疫;
     /// 池叶子由引擎侧同 dtype 分配)
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_plan_dt(
         hidden: usize,
         inter: usize,
@@ -968,7 +982,7 @@ mod tests {
         // base [2, 2, hidden](tap0 ≈ 1 + 小扰动;tap1 小值)
         let base: Vec<f32> = (0..2 * TAPS * hidden)
             .map(|i| {
-                let (s, tap, d) = (i / (TAPS * hidden), (i / hidden) % TAPS, i % hidden);
+                let (_s, tap, d) = (i / (TAPS * hidden), (i / hidden) % TAPS, i % hidden);
                 if tap == 0 { 1.0 + (d as f32 * 0.01).sin() * 0.1 } else { ((i % 7) as f32 - 3.0) * 0.05 }
             })
             .collect();
@@ -1060,7 +1074,7 @@ mod tests {
         // hidden [1+rows, rank] 随机;anchor token
         let hidden = gen((rows + 1) * rank, 6.0);
         let anchor = 3.0f32;
-        let hidden_t = TensorOps::from_host(Dtype::F16, vec![rows + 1, rank], &f16b(&hidden));
+        let _hidden_t = TensorOps::from_host(Dtype::F16, vec![rows + 1, rank], &f16b(&hidden));
         let anchor_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[anchor]));
 
         // 共享 embed(lm_head 直接以张量喂 topk —— 不走 Embedding 装载,
@@ -1291,8 +1305,8 @@ mod tests {
         use std::collections::HashMap;
 
         let (hidden, inter, hq, hkv, hd, nl) = (5120usize, 17408usize, 32usize, 8usize, 128usize, 5usize);
-        let (vocab, topk) = (248320usize, 16usize);
-        let mut draft = DFlash2Draft::new_with_plan(hidden, inter, hq, hkv, hd, nl, 1e-6, vocab, QuantPlan::W4A16, false);
+        let (vocab, _topk) = (248320usize, 16usize);
+        let _draft = DFlash2Draft::new_with_plan(hidden, inter, hq, hkv, hd, nl, 1e-6, vocab, QuantPlan::W4A16, false);
 
         // 公式 E/LM(f16 网格;与 python 同式)→ Embedding 装载
         let gen = |n: usize, seed: f64| -> Vec<f32> {
@@ -1329,7 +1343,7 @@ mod tests {
         // 输入(ids/taps;E/LM 同式)
         let ids_v: Vec<f32> = [108820.0f32]
             .iter()
-            .chain(std::iter::repeat(&(MASK_TOKEN_ID as f32)).take(7))
+            .chain(std::iter::repeat_n(&(MASK_TOKEN_ID as f32), 7))
             .copied()
             .collect();
         let genf = |n: usize, seed: f64| -> Vec<f32> { gen(n, seed) };
@@ -1451,7 +1465,7 @@ mod tests {
                 eprintln!("[golden] {key}: 金标缺失");
                 return;
             };
-            let wf: Vec<f32> = want.iter().copied().collect();
+            let wf: Vec<f32> = want.to_vec();
             // f16 溢出容差(2026-10-07):真实权量下 L0 起激活 >65504,owl 与
             // python 同样写 inf —— 同号 inf 视为一致(根修 = 权重预缩放,另案)
             let ok = |g: &f32, w: &f32| {
@@ -1517,17 +1531,17 @@ mod tests {
                 );
             }
             if let Some(want) = golden.get("logits_head") {
-                let wf: Vec<f32> = want.iter().copied().collect();
+                let wf: Vec<f32> = want.to_vec();
                 let lbad = lw
                     .iter()
                     .zip(&wf)
-                    .filter(|(g, w)| !((**g - **w).abs() <= 4e-3 * w.abs() + 1.0))
+                    .filter(|(g, w)| (**g - **w).abs() > 4e-3 * w.abs() + 1.0)
                     .count();
                 let samples: Vec<String> = lw
                     .iter()
                     .zip(&wf)
                     .enumerate()
-                    .filter(|(_, (g, w))| !((**g - **w).abs() <= 4e-3 * w.abs() + 1.0))
+                    .filter(|(_, (g, w))| (**g - **w).abs() > 4e-3 * w.abs() + 1.0)
                     .take(3)
                     .map(|(j, (g, w))| format!("[{j}]{g:.1}vs{w:.1}"))
                     .collect();
@@ -1536,7 +1550,7 @@ mod tests {
             // drafts(打印 + 一致计数)
             let dt = &harvested[i + 2];
             if let Some(dw) = golden.get("drafts") {
-                let dwf: Vec<f32> = dw.iter().copied().collect();
+                let dwf: Vec<f32> = dw.to_vec();
                 let dmatch = dt
                     .iter()
                     .zip(&dwf)
@@ -1557,7 +1571,7 @@ mod tests {
         {
             let l_full = embed.lm_head_matmul(&hidden_t); // [8, vocab] 无切片
             let l_zs =
-                embed.lm_head_matmul(&hidden_t.slice_view(5120 * 0, vec![7, 5120]));
+                embed.lm_head_matmul(&hidden_t.slice_view(0, vec![7, 5120]));
             let variants: [(String, TensorOps); 3] = [
                 ("full[8]".into(), l_full),
                 ("slice0[7]".into(), l_zs),
@@ -1589,8 +1603,8 @@ mod tests {
                 eprintln!(
                     "[gemm-diag] {name}: rows={rows} 行j-vs-行0 最大差={worst:?} 块id={} 行0[:3]={:?} 行1[:3]={:?}",
                     o.id,
-                    &(0..3).map(|c| at(0, c)).collect::<Vec<_>>(),
-                    &(0..3).map(|c| at(1.min(rows - 1), c)).collect::<Vec<_>>(),
+                    (0..3).map(|c| at(0, c)).collect::<Vec<_>>(),
+                    (0..3).map(|c| at(1.min(rows - 1), c)).collect::<Vec<_>>(),
                 );
             }
             // eval1(主求值)与 eval2 的 hidden 头值对账
@@ -1623,11 +1637,11 @@ mod tests {
                 eprintln!(
                     "[gemm-diag] eval3 hidden 块id={} [0,:3]={:?} [1,:3]={:?}; logits 块id={} 行0[:3]={:?} 行1[:3]={:?} 行差={}",
                     hb.id,
-                    &(0..3).map(|c| h_at(c)).collect::<Vec<_>>(),
-                    &(0..3).map(|c| h_at(5120 + c)).collect::<Vec<_>>(),
+                    (0..3).map(&h_at).collect::<Vec<_>>(),
+                    (0..3).map(|c| h_at(5120 + c)).collect::<Vec<_>>(),
                     lb.id,
-                    &(0..3).map(|c| l_at(0, c)).collect::<Vec<_>>(),
-                    &(0..3).map(|c| l_at(1, c)).collect::<Vec<_>>(),
+                    (0..3).map(|c| l_at(0, c)).collect::<Vec<_>>(),
+                    (0..3).map(|c| l_at(1, c)).collect::<Vec<_>>(),
                     (0..248320).map(|c| (l_at(1, c) - l_at(0, c)).abs()).fold(0f32, f32::max),
                 );
             }
@@ -1649,7 +1663,7 @@ mod tests {
             eprintln!("skip: OWL_DFLASH2_DIR 未设");
             return;
         };
-        use crate::module::{LoaderCtx, Loadable};
+        use crate::module::LoaderCtx;
         use owl_iface::DeviceClient as _;
         let mut gpu = gpu_client().await;
         let lctx = LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false };
@@ -1665,13 +1679,12 @@ mod tests {
         // 公式输入(f16 字节;golden 同式 seed=30)
         let genb = |n: usize, seed: f64| -> Vec<u8> {
             (0..n)
-                .map(|i| {
+                .flat_map(|i| {
                     half::f16::from_f32(
                         ((((i as f64 + seed) * 0.23).sin()) as f32) * 0.7,
                     )
                     .to_le_bytes()
                 })
-                .flatten()
                 .collect::<Vec<u8>>()
         };
         let ctx = ForwardCtx::minimal(20);
@@ -1684,13 +1697,12 @@ mod tests {
         ) -> Vec<u8> {
             let genb = |n: usize, seed: f64| -> Vec<u8> {
                 (0..n)
-                    .map(|i| {
+                    .flat_map(|i| {
                         half::f16::from_f32(
                             ((((i as f64 + seed) * 0.23).sin()) as f32) * 0.7,
                         )
                         .to_le_bytes()
                     })
-                    .flatten()
                     .collect::<Vec<u8>>()
             };
             let taps =
@@ -1837,6 +1849,7 @@ mod tests {
                 .collect();
             let pm = draft.project_memory(&taps_all, &ctx);
             let mut roots: Vec<TensorOps> = vec![pm];
+            #[allow(clippy::needless_range_loop)]
             for i in 0..5 {
                 roots.push(draft.debug_fci(i, &taps_all[i], &ctx));
             }
@@ -2114,8 +2127,8 @@ mod tests {
         // 次序 = 核同款:投影 → per-head norm → rope
         let k_all = norm_rope(&proj(&xs32, 5, hidden, &wk, hkv * hd), 5, hkv, &wkn, &pos_h);
         let v_all = proj(&xs32, 5, hidden, &wv, hkv * hd);
-        let q_raw_self_h = proj(&xs32[3 * hidden..].to_vec(), 2, hidden, &wq, hq * hd);
-        let k_raw_self_h = proj(&xs32, 5, hidden, &wk, hkv * hd)[3 * hkv * hd..].to_vec();
+        let q_raw_self_h = proj(&xs32[3 * hidden..], 2, hidden, &wq, hq * hd);
+        let _k_raw_self_h = proj(&xs32, 5, hidden, &wk, hkv * hd)[3 * hkv * hd..].to_vec();
         let q_self = norm_rope(&q_raw_self_h, 2, hq, &wqn, &pos_h[3..]);
         // 分相:池内前缀 k/v 直读对拍(encode 写入 vs host classic 布局)
         // k_cache [nb, hkv, hd/x, page, x] f16 整块收割
@@ -2166,7 +2179,7 @@ mod tests {
         for r in 0..2 {
             for h in 0..hq {
                 let kvh = h / (hq / hkv);
-                let mut scores = vec![0f32; 5];
+                let mut scores = [0f32; 5];
                 for s in 0..5 {
                     let mut dot = 0f32;
                     for d in 0..hd {
@@ -2211,7 +2224,7 @@ mod tests {
         let conv = GroupedConv::new(hidden, block, Dtype::BF16);
         let base: Vec<f32> = (0..2 * TAPS * hidden)
             .map(|i| {
-                let (s, tap, d) = (i / (TAPS * hidden), (i / hidden) % TAPS, i % hidden);
+                let (_s, tap, d) = (i / (TAPS * hidden), (i / hidden) % TAPS, i % hidden);
                 if tap == 0 { 1.0 + (d as f32 * 0.01).sin() * 0.1 } else { ((i % 7) as f32 - 3.0) * 0.05 }
             })
             .collect();
@@ -2393,7 +2406,7 @@ mod tests {
             eprintln!("skip: OWL_DFLASH2_DIR 未设");
             return Ok(());
         };
-        use crate::module::{LoaderCtx, Loadable};
+        use crate::module::LoaderCtx;
         use owl_iface::DeviceClient as _;
         let mut gpu = gpu_client().await;
         let lctx = LoaderCtx { dtype: Dtype::BF16, shard: 1, device_repack: false, verify: false, debug_tap: false };
@@ -2416,7 +2429,7 @@ mod tests {
         let gen = |n: usize, seed: f64| -> Vec<f32> {
             (0..n).map(|i| (((i as f64 + seed) * 0.23).sin() as f32) * 20.0).collect()
         };
-        let (hq, hkv, hd, hidden) = (32usize, 8usize, 128usize, 5120usize);
+        let (_hq, hkv, hd, hidden) = (32usize, 8usize, 128usize, 5120usize);
         let rope = Rope::new(262_144, hd, hd, 1.0e7).expect("rope");
         crate::interpreters::eval_load(&rope, &mut gpu, &rope.tables(), &LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false })
             .await
@@ -2427,8 +2440,8 @@ mod tests {
             .map(|i| TensorOps::from_host(Dtype::F16, vec![8, hidden], &f16b(&gen(8 * hidden, 30.0 + i as f64))))
             .collect();
         let pos_t = TensorOps::from_host(Dtype::F32, vec![8], &f32b(&(0..8).map(|i| i as f32).collect::<Vec<_>>()));
-        let ids_t = TensorOps::from_host(Dtype::F32, vec![8], &f32b(&[109757.0, 248070.0, 248070.0, 248070.0, 248070.0, 248070.0, 248070.0, 248070.0]));
-        let anchor_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[109757.0]));
+        let _ids_t = TensorOps::from_host(Dtype::F32, vec![8], &f32b(&[109757.0, 248070.0, 248070.0, 248070.0, 248070.0, 248070.0, 248070.0, 248070.0]));
+        let _anchor_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[109757.0]));
         let kv_len_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[18.0]));
 
         // 池(单块 12 页几何同引擎)

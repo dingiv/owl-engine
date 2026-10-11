@@ -324,6 +324,7 @@ impl<'a> ForwardCtx<'a> {
     /// 整模 prefill ctx(PF1a;批P5):单序列 T-token 块,
     /// 槽表/kv_len 表 [T] + GDN 状态格 [1]。fi = FlashInfer 面(engine
     /// 按 OWL_FLASHINFER 注入;None = 旧分派)。
+    #[allow(clippy::too_many_arguments)]
     pub fn model_prefill(
         tokens: usize,
         pos: &'a TensorOps,
@@ -370,13 +371,13 @@ impl<'a> ForwardCtx<'a> {
 ///   [max_slots, Hkv, HD] f32,块只增不减;
 /// - `slots` / `kv_lens`:[bs] f32 数值过线(契约 5;核内 cast);
 ///   **kv_lens 含本步**(kernel 先写 cache 后打分,caller 传 past+1)。
-/// (2026-09-26 C4 重组:自 layers/attention 归位协议层 —— 它是 runner
-/// 与层之间的动态依赖词汇,非层私有。)
-/// KV paged 核集策略(REQ-HW-01 表驱动;dtype → 布局/核名几何)。
-/// None = 该 KV dtype 暂无 paged 核集 → 层/引擎走 legacy 回退
-/// (naive slot 直排 + token-major 池)。新增 dtype = 补表行 +
-/// flatten 对应 vendor 模板臂(vendor 核 cache_t 本就参数化)+
-/// REGISTRY 登记,调用点零改动(operator-matrix Q0 激活域跟随者律)。
+///   (2026-09-26 C4 重组:自 layers/attention 归位协议层 —— 它是 runner
+///   与层之间的动态依赖词汇,非层私有。)
+///   KV paged 核集策略(REQ-HW-01 表驱动;dtype → 布局/核名几何)。
+///   None = 该 KV dtype 暂无 paged 核集 → 层/引擎走 legacy 回退
+///   (naive slot 直排 + token-major 池)。新增 dtype = 补表行 +
+///   flatten 对应 vendor 模板臂(vendor 核 cache_t 本就参数化)+
+///   REGISTRY 登记,调用点零改动(operator-matrix Q0 激活域跟随者律)。
 #[derive(Clone, Copy, Debug)]
 pub struct KvPagedPolicy {
     /// 池页大小(tokens/block;decode v1/v2 bs32 特化 + prefill 契约交集)
@@ -1172,7 +1173,7 @@ mod tests {
             .await
             .expect("eval_load");
 
-        let x = crate::TensorOps::from_host(crate::contract::Dtype::F32, vec![1, 4], &f32b(&vec![0.5; 4]));
+        let x = crate::TensorOps::from_host(crate::contract::Dtype::F32, vec![1, 4], &f32b(&[0.5; 4]));
         let ctx = ForwardCtx::minimal(1);
         let a = crate::testkit::harvest(&mut face, &run_through(&mlp, &x, &ctx)).await;
         let layers: Vec<&dyn Module> = vec![&mlp];

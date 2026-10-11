@@ -34,22 +34,22 @@ const NV: usize = 48;
 const KD: usize = 128;
 const VD: usize = 128;
 const BT: usize = 64;
-const SCALE: f32 = 0.08838834764831845; // 1/sqrt(128)
-const RCP_LN2: f32 = 1.4426950408889634;
+const SCALE: f32 = 0.088388346; // 1/sqrt(128)
+const RCP_LN2: f32 = std::f32::consts::LOG2_E;
 
 /// **g_cum 域律**(M1 首跑定谳):fork cumsum 核输出 **nats 域**(RCP_LN2 烘
 /// 核内不施放);pip-fla 金标(c1-c4)= **log2 域**(gen.py 显式 scale=
 /// RCP_LN2)。下游 exp(Δ) 两域同值,故仅 g_cum 对拍需换算:want_nats =
 /// golden_log2 / RCP_LN2。c5(fork 权威)同为 nats,直比。
-
+///
 /// **布局律(M1 首跑定谳)**:fork h 核的 h_buf/ht/ht0 排布 = [.., HV, V, K]
 /// (V 主;wrapper new_empty(B,NT,H,V,K) 同款;handler 的
 /// owl_state_kv_to_vk/vk_to_kv 与池 [HV,K,V] 互转即此)。
 /// 两代金标约定不同 → 比较方式分层:
 /// - c1-c4(pip-fla 0.6.0 golden,[.., K,V] FLA 习惯):**需转置**后比;
 /// - c5(fork 权威 golden,[.., V,K]):**直比**。
-/// (c5 首跑曾现"chunk0 需转置 chunk1 不需"奇象 = gen 喂 s0 未转置 +
-///  深谷 chunk 边界 exp 下溢精确抹零 s0 贡献的合谋,gen 已修为 [V,K] 喂入。)
+///   (c5 首跑曾现"chunk0 需转置 chunk1 不需"奇象 = gen 喂 s0 未转置 +
+///   深谷 chunk 边界 exp 下溢精确抹零 s0 贡献的合谋,gen 已修为 [V,K] 喂入。)
 fn needs_transpose(tight: bool) -> bool { !tight }
 
 struct Case {
@@ -78,7 +78,7 @@ fn read_bin(dir: &str, name: &str) -> Vec<f32> {
         .collect()
 }
 
-fn load_case(dir: &str, tag: &str, t: usize) -> Case {
+fn load_case(dir: &str, tag: &str, _t: usize) -> Case {
     let rd = |n: &str| read_bin(dir, &format!("{tag}.{n}"));
     let has_s0 = owl_shared::file_loader::metadata(format!("{dir}/{tag}.s0.bin")).is_ok();
     Case {
@@ -240,7 +240,7 @@ fn gdn_chunked_golden_stage_by_stage() {
             d
         };
         let up_u8 = |v: &[u8]| {
-            let mut d = unsafe { stream.alloc_zeros::<u8>(v.len()) }.unwrap();
+            let mut d = stream.alloc_zeros::<u8>(v.len()).unwrap();
             stream.memcpy_htod(v, &mut d).unwrap();
             d
         };
@@ -252,20 +252,20 @@ fn gdn_chunked_golden_stage_by_stage() {
         let stated = up_f32(&state_in);
         let gcum = stream.alloc_zeros::<f32>(t * NV).unwrap();
         let a = stream.alloc_zeros::<f32>(t * NV * BT).unwrap();
-        let ai = unsafe { stream.alloc_zeros::<u8>(t * NV * BT * 2) }.unwrap(); // bf16 字节
-let w = unsafe { stream.alloc_zeros::<u8>(t * NV * KD * 2) }.unwrap();
-        let u = unsafe { stream.alloc_zeros::<u8>(t * NV * VD * 2) }.unwrap();
-        let h = unsafe { stream.alloc_zeros::<u8>(nt * NV * VD * KD * 2) }.unwrap();
-        let v_new = unsafe { stream.alloc_zeros::<u8>(t * NV * VD * 2) }.unwrap();
+        let ai = stream.alloc_zeros::<u8>(t * NV * BT * 2).unwrap(); // bf16 字节
+let w = stream.alloc_zeros::<u8>(t * NV * KD * 2).unwrap();
+        let u = stream.alloc_zeros::<u8>(t * NV * VD * 2).unwrap();
+        let h = stream.alloc_zeros::<u8>(nt * NV * VD * KD * 2).unwrap();
+        let v_new = stream.alloc_zeros::<u8>(t * NV * VD * 2).unwrap();
         let state_out = stream.alloc_zeros::<f32>(NV * KD * VD).unwrap();
-        let o = unsafe { stream.alloc_zeros::<u8>(t * NV * VD * 2) }.unwrap();
+        let o = stream.alloc_zeros::<u8>(t * NV * VD * 2).unwrap();
         // meta 表(handler 同款):[cu(2) | coff(2) | idx(2NT)]
         let mut meta_h: Vec<i64> = Vec::with_capacity(4 + nt * 2);
         meta_h.extend_from_slice(&[0i64, *t as i64]);
         meta_h.extend_from_slice(&[0i64, nt as i64]);
         meta_h.extend((0..nt).flat_map(|i| [0i64, i as i64]));
         let metad = {
-            let mut d = unsafe { stream.alloc_zeros::<u8>(meta_h.len() * 8) }.unwrap();
+            let mut d = stream.alloc_zeros::<u8>(meta_h.len() * 8).unwrap();
             stream.memcpy_htod(bytemuck_meta(&meta_h), &mut d).unwrap();
             d
         };
@@ -380,7 +380,7 @@ let w = unsafe { stream.alloc_zeros::<u8>(t * NV * KD * 2) }.unwrap();
 
         // ── 逐阶段对拍 ──
         let dt = |s: &cudarc::driver::CudaSlice<u8>| -> Vec<f32> {
-            bf16_to_f32(&stream.memcpy_dtov(s).expect("dtoh"))
+            bf16_to_f32(&stream.clone_dtoh(s).expect("dtoh"))
         };
         // 容差分级:tight = fork 同源金标(理论逐位,留 JIT/AOT 变体余量);
         // 宽 = pip-fla f32 金标 × bf16 链(输入量化 × 64 步递推放大)
@@ -391,7 +391,7 @@ let w = unsafe { stream.alloc_zeros::<u8>(t * NV * KD * 2) }.unwrap();
         } else {
             case.g_cum.iter().map(|v| v / RCP_LN2).collect() // log2 → nats
         };
-        assert_close("g_cum(nats)", tag, &stream.memcpy_dtov(&gcum).unwrap(), &g_cum_want,
+        assert_close("g_cum(nats)", tag, &stream.clone_dtoh(&gcum).unwrap(), &g_cum_want,
             if *tight { 1e-3 } else { 2.5e-2 }, tol_r);
         assert_close("A(solve后)", tag, &dt(&ai), &case.a, tol_a, tol_r);
         assert_close("w", tag, &dt(&w), &case.w, tol_a, tol_r);
@@ -401,7 +401,7 @@ let w = unsafe { stream.alloc_zeros::<u8>(t * NV * KD * 2) }.unwrap();
         assert_close("h", tag, &h_cmp, &case.h, tol_a, tol_r);
         assert_close("v_new", tag, &dt(&v_new), &case.v_new, tol_a, tol_r);
         assert_close("o", tag, &dt(&o), &case.o, if *tight { 1e-4 } else { 5e-2 }, tol_r);
-        let ht_host = stream.memcpy_dtov(&state_out).unwrap();
+        let ht_host = stream.clone_dtoh(&state_out).unwrap();
         let ht_cmp = if needs_transpose(*tight) { transpose_kv(&ht_host, NV, VD, KD) } else { ht_host };
         assert_close("ht", tag, &ht_cmp, &case.ht, tol_a, tol_r);
             }

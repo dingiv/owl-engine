@@ -90,6 +90,7 @@ fn host_ref_knhd(q: &[u16], kc: &[u8], vc: &[u8], lens: &[usize]) -> Vec<f32> {
         for h in 0..H {
             let kvh = h / (H / HKV);
             let mut qk = vec![0f32; len];
+            #[allow(clippy::needless_range_loop)]
             for b in 0..len {
                 let (pb, bb) = (b / PAGE, b % PAGE);
                 let mut acc = 0f32;
@@ -103,6 +104,7 @@ fn host_ref_knhd(q: &[u16], kc: &[u8], vc: &[u8], lens: &[usize]) -> Vec<f32> {
             let l: f32 = qk.iter().map(|&x| (x - m).exp()).sum();
             for d in 0..HD {
                 let mut acc = 0f32;
+                #[allow(clippy::needless_range_loop)]
                 for b in 0..len {
                     let (pb, bb) = (b / PAGE, b % PAGE);
                     let vidx = pb * kbs + bb * (HKV * HD) + kvh * HD + d;
@@ -224,7 +226,7 @@ fn run_case_var(ctx: usize, check: bool, mask_all: bool, mask_var: u32) {
     // 块内 8 行的因果结构由 mask 位掩码表达,行 i 的可见上界 = seq_len-(S-1-i)。
     // 首版误传逐行 lens → 行 1..7 各少 1..7 个 key → 0.0146 假误差(掩码全开对照
     // 一开即塌到 3.1e-4,定谳 = 参数语义错,非精度)。
-    let seq_u32: Vec<u32> = if mask_all { vec![ctx as u32] } else { vec![ctx as u32] };
+    let seq_u32: Vec<u32> = vec![ctx as u32];
     let d_seq_u32 = {
         let mut d = unsafe { stream.alloc::<u32>(seq_u32.len()) }.unwrap();
         stream.memcpy_htod(&seq_u32, &mut d).unwrap();
@@ -237,7 +239,7 @@ fn run_case_var(ctx: usize, check: bool, mask_all: bool, mask_var: u32) {
         stream.memcpy_htod(&mask, &mut d).unwrap();
         d
     };
-    let sem_len = (HKV * 1).div_ceil(2) * 2 + 2 + HKV * 1 + 2; // round_up(nb_seq,2)+2+nb_seq+2
+    let sem_len = HKV.div_ceil(2) * 2 + 2 + HKV + 2; // round_up(nb_seq,2)+2+nb_seq+2
     let d_sem = {
         let mut d = unsafe { stream.alloc::<u32>(sem_len) }.unwrap();
         stream.memcpy_htod(&vec![0u32; sem_len], &mut d).unwrap();

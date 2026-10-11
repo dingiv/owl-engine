@@ -167,7 +167,7 @@ impl Linear {
                 .arg_usize(m)
                 .arg_usize(self.in_dim)
                 .arg_usize(n_pack)
-                .arg_usize(g as usize)
+                .arg_usize(g)
                 .with_shape(if bf16_act { Dtype::BF16 } else { Dtype::F16 }, vec![m, n_pack]);
             return narrow_strided(
                 &marlin,

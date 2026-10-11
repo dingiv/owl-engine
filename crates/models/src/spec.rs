@@ -19,6 +19,7 @@ pub const REC_PER_LAYER: usize = 8;
 /// - `gdns`:会话 GDN 状态块组叶子(restore 批量通道已回 state@F-1);
 /// - 返回 = 4 × n_gdn 个副作用根(conv ×3 + 递推;multi-root eval
 ///   消费,状态原地推进 → state@F+m)。
+#[allow(clippy::too_many_arguments)]
 pub fn fold_tree(
     model: &Model,
     rec: &[TensorOps],
@@ -54,7 +55,7 @@ pub fn fold_tree(
             &gdns[gi],
             slots,
             slot_host,
-            &cu,
+            cu,
             m1,
             scalar,
         ));

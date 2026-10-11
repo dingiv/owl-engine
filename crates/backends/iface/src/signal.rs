@@ -18,8 +18,8 @@ use std::sync::Arc;
 ///
 /// 与 owl-iface 的 `BufToken` 同构(iface 侧做类型别名);signal 层
 /// 不定义任何 CUDA 语义,只做身份的传递与登记。
-
-
+///
+///
 /// 依赖接收器:token 被当前作用域订阅时调用。
 pub type Sink = Arc<dyn Fn(Token) + Send + Sync>;
 

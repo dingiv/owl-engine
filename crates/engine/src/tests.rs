@@ -12,8 +12,8 @@
 //! S0 调度决策面。
 
 use crate::engine::{Engine, EngineConfig, EngineKnobs};
+#[cfg(test)] // 仅单元档的 decode 差分用例消费;e2e 档不编该函数
 use crate::exec::decode_delta;
-use crate::exec::spec_degrade_transition;
 use crate::running::RunningEngine;
 use crate::scheduler::{SchedulerOutput, StepAction};
 use crate::turn::TurnEvent;
@@ -196,8 +196,7 @@ pub async fn gpu_08b_fuse_text_parity() {
         // OWL_GDN_FUSE_DECODE 无读者(死旗标,显式依赖律改造中删除)——
         // 双臂现同态(fused on),保留参数占位与恒等断言
         let _ = fuse;
-        let mut knobs = EngineKnobs::default();
-        knobs.sampler_enabled = false; // greedy
+        let mut knobs = EngineKnobs { sampler_enabled: false, ..Default::default() }; // greedy
         knobs.env.gdn.fused_decode = true;
         let mut engine = Engine::new(EngineConfig {
             device_ordinal: ordinal,
@@ -249,7 +248,7 @@ pub async fn gpu_two_turns_lifecycle(shared: Option<&mut RunningEngine<owl_cuda:
 
     let t1 = running.submit("Hello, who are you?", 16).expect("t1");
     let t2 = running.submit("用一句话介绍长城。", 16).expect("t2");
-    let (mut ttft, mut t0) = (None, std::time::Instant::now());
+    let (mut ttft, t0) = (None, std::time::Instant::now());
     let mut done = Vec::new();
     loop {
         match running.pump().await.expect("pump") {
@@ -626,7 +625,7 @@ pub async fn gpu_awq27b_marlin_e2e(shared: Option<&mut RunningEngine<owl_cuda::G
         return;
     }
     let ordinal = gpu_ordinal().expect("OWL_TEST_DEVICE");
-    let t0 = std::time::Instant::now();
+    let _t0 = std::time::Instant::now();
     // 共享装载(§四.1);None = 单跑自带装载
     let mut own;
     let running: &mut RunningEngine<owl_cuda::GpuClient> = match shared {
@@ -801,8 +800,9 @@ pub async fn gpu_prefix_cache_hit(shared: Option<&mut RunningEngine<owl_cuda::Gp
     eprintln!("[test] A prompt = {n_a} tok / B prompt = {n_b} tok(前缀共享)");
 
     let t0 = std::time::Instant::now();
-    let (sid_a, ta1) = running.submit_session(Some(101), prompt_a.as_str(), 12).expect("A");
+    let (_sid_a, ta1) = running.submit_session(Some(101), prompt_a.as_str(), 12).expect("A");
     let mut a_prefill_chunks = 0usize;
+    #[allow(unused_assignments)]
     let (mut a_ttft, mut a_text) = (None, String::new());
     loop {
         match running.pump().await.expect("pump") {
@@ -1077,8 +1077,7 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
             ordinal: usize,
             dir: &std::path::Path,
         ) -> Vec<(String, Vec<u32>)> {
-            let mut knobs = EngineKnobs::default();
-            knobs.sampler_enabled = false; // greedy(恒等门口径)
+            let mut knobs = EngineKnobs { sampler_enabled: false, ..Default::default() }; // greedy(恒等门口径)
             // 显式池余量(缺省 = 2×max_seq = 8 页,spec 链一挤就"块池耗尽";
             // 2026-10-13 套件内实测:前置用例扰动即红、单跑绿。恒等门测的是
             // 文本等价,不是容量边界 —— 边界另有专测)
@@ -1167,8 +1166,7 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
 
         /// **装载一次**(带 MTP 草稿;2026-10-13 用户令:不再每轮重载)
         async fn boot_gate_engine(ordinal: usize, dir: &str) -> RunningEngine<owl_cuda::GpuClient> {
-            let mut knobs = EngineKnobs::default();
-            knobs.sampler_enabled = false;
+            let mut knobs = EngineKnobs { sampler_enabled: false, ..Default::default() };
             // 24G 贴顶三旋钮(单会话门不需要多格/多快照/前缀缓存)
             knobs.gdn_slots = 1;
             knobs.snap_max = 1;
@@ -1263,8 +1261,7 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
             ddir: &str,
             max_new: usize,
         ) -> RunningEngine<owl_cuda::GpuClient> {
-            let mut knobs = EngineKnobs::default();
-            knobs.sampler_enabled = false;
+            let mut knobs = EngineKnobs { sampler_enabled: false, ..Default::default() };
             knobs.gdn_slots = 1;
             knobs.snap_max = 1;
             knobs.prefix_cache = false;
@@ -1467,7 +1464,7 @@ async fn drive_turn<D: DeviceClient>(running: &mut RunningEngine<D>, id: u64) ->
 /// 消掉。旧 e2e 的 wall÷max_new 与 gate 生成段 wall÷实际tok 两把尺子
 /// 分别虚高/虚低(差分实测:4d21122 24.3ms vs HEAD 24.8ms = 无回退,
 /// 当年"45 tok/s"是朴素口径虚高)。门控 OWL_AWQ27B_DIR + OWL_TEST_DEVICE。
-
+///
 /// 泄漏案探针(2026-10-10 深夜;slot≥1 崩塌案首刀):
 /// GDN_SLOTS=2 下,turn(slot0) 前后对比 slot1 状态区指纹 ——
 /// slot1 变 = 跨 slot 写实锤;不变 = 病在 slot1 核索引/复用路径。
@@ -1478,8 +1475,7 @@ pub async fn gpu_gdn_slot_cross_probe() {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
     };
-    let mut knobs = EngineKnobs::default();
-    knobs.gdn_slots = 2;
+    let mut knobs = EngineKnobs { gdn_slots: 2, ..Default::default() };
     knobs.prefix_cache = false;
     let mut engine = Engine::new(EngineConfig {
         device_ordinal: ordinal,
@@ -1491,15 +1487,6 @@ pub async fn gpu_gdn_slot_cross_probe() {
     let dir = asset_dir();
     let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
     let mut running = engine.run(loaded).await.expect("装配");
-
-    fn fnv(b: &[u8]) -> u64 {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for &x in b {
-            h ^= x as u64;
-            h = h.wrapping_mul(0x100_0000_01b3);
-        }
-        h
-    }
 
     // ① boot 后初始态:双 slot 指纹 + slot1 非零字节数(alloc 应已清零)
     let s1_0 = running.pool.gdn_slot_fingerprint(running.session.face_mut(), 1).await.unwrap();
@@ -1537,8 +1524,7 @@ pub async fn gpu_decode_marginal_bench() {
     };
     // 口径与恒等门一致(greedy 单会话三旋钮,显式 knobs)
     async fn gen(ordinal: usize, dir: &str, max_new: usize) -> (f64, usize) {
-        let mut knobs = EngineKnobs::default();
-        knobs.sampler_enabled = false;
+        let mut knobs = EngineKnobs { sampler_enabled: false, ..Default::default() };
         knobs.gdn_slots = 1;
         knobs.snap_max = 1;
         knobs.prefix_cache = false;
@@ -1555,7 +1541,7 @@ pub async fn gpu_decode_marginal_bench() {
             .await
             .expect("装载");
         let mut running = engine.run(loaded).await.expect("装配");
-        let (sid, id) = running
+        let (_sid, id) = running
             .submit_session(Some(7), "用五十字介绍长城。", max_new)
             .expect("submit");
         let t0 = std::time::Instant::now();
@@ -1582,7 +1568,6 @@ pub async fn gpu_decode_marginal_bench() {
 #[test]
 fn spec_degrade_transition_branches() {
     use crate::exec::spec_degrade_transition;
-use crate::running::RunningEngine;
     // 成功轮:三账全复位(含降级态/退避)
     let (s, d, p) = spec_degrade_transition(3, true, 256, 2, 6, 64);
     assert_eq!((s, d, p), (0, false, 64));

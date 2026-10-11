@@ -188,6 +188,7 @@ impl std::error::Error for MetricsError {}
 #[derive(Default)]
 struct Inner {
     /// 未配对 start 栈:key = (tag, thread 序号) → (Instant, file, line) 栈
+    #[allow(clippy::type_complexity)] // 未配对 start 栈(key → 栈)
     open: HashMap<(String, u64), VecDeque<(Instant, &'static str, u32)>>,
     /// 已配对样本:key = tag(容量 cap 环形驱逐)
     samples: HashMap<String, VecDeque<Sample>>,
@@ -368,9 +369,9 @@ impl MetricsStore {
             })
             .collect();
         match filter.sort {
-            MetricsSort::TotalDesc => reports.sort_by(|a, b| b.total.cmp(&a.total)),
-            MetricsSort::CountDesc => reports.sort_by(|a, b| b.count.cmp(&a.count)),
-            MetricsSort::RecentDesc => reports.sort_by(|a, b| b.last_at.cmp(&a.last_at)),
+            MetricsSort::TotalDesc => reports.sort_by_key(|b| std::cmp::Reverse(b.total)),
+            MetricsSort::CountDesc => reports.sort_by_key(|b| std::cmp::Reverse(b.count)),
+            MetricsSort::RecentDesc => reports.sort_by_key(|b| std::cmp::Reverse(b.last_at)),
             MetricsSort::NameAsc => reports.sort_by(|a, b| a.tag.cmp(&b.tag)),
         }
         if let Some(l) = filter.limit {
@@ -385,7 +386,7 @@ impl MetricsStore {
         if let Some(dq) = inner.samples.get(tag) {
             let mut durs: Vec<Duration> = dq
                 .iter()
-                .filter(|s| filter.since.map_or(true, |t| s.at >= t))
+                .filter(|s| filter.since.is_none_or(|t| s.at >= t))
                 .map(|s| s.dur)
                 .collect();
             r.count = durs.len() as u64;
@@ -469,8 +470,8 @@ pub fn query_metrics(filter: &MetricsFilter) -> Vec<TagReport> {
         return reports;
     }
     eprintln!(
-        "[metrics] {:<32} {:>7} {:>11} {:>10} {:>10} {:>10} {:>10} {:>5} {:>6} {:>6}  {}",
-        "tag", "count", "total", "avg", "p50", "p99", "max", "open", "orph", "drop", "last@"
+        "[metrics] {:<32} {:>7} {:>11} {:>10} {:>10} {:>10} {:>10} {:>5} {:>6} {:>6}  last@",
+        "tag", "count", "total", "avg", "p50", "p99", "max", "open", "orph", "drop"
     );
     for r in &reports {
         let (f, l) = (r.last_file.rsplit('/').next().unwrap_or(r.last_file), r.last_line);

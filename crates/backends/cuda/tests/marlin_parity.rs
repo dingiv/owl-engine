@@ -52,6 +52,7 @@ fn host_dequant_gemm(a: &[f32], q: &[u8], s: &[f32], m: usize, n: usize, k: usiz
 }
 
 /// 外部核启动消息(槽序契约:owl_kernels::family::marlin::GEMM_W4A16_SLOTS)
+#[allow(clippy::too_many_arguments)]
 fn marlin_launch(
     a: &owl_cuda::Bytes,
     b: &owl_cuda::Bytes,
@@ -121,7 +122,7 @@ async fn run_case(
     assert_eq!(s_packed.len(), (k / g) * n);
 
     // 上卡(bf16 模式:A/C 走 BF16 位型;参考用同位型回读值)
-    let (act_name, a_ref) = if is_bf16 {
+    let (_act_name, a_ref) = if is_bf16 {
         (
             "marlin_gemm_w4a16_bf16",
             a.iter()
@@ -323,6 +324,7 @@ async fn marlin_shape_sweep() {
 
 /// host dequant 参考(AWQ 非对称):W = (q − zp_group) × scale。
 /// zp 源布局 = ct out 主序:zp_packed[t, c] 的 nibble i = 行 8t+i。
+#[allow(clippy::too_many_arguments)]
 fn host_dequant_gemm_awq(
     a: &[f32],
     q: &[u8],
@@ -353,6 +355,7 @@ fn host_dequant_gemm_awq(
 
 /// AWQ 外核启动消息(槽序契约:GEMM_W4A16_AWQ = scales 后插 zeros,
 /// 7 Block + 4 sz)
+#[allow(clippy::too_many_arguments)]
 fn marlin_awq_launch(
     a: &owl_cuda::Bytes,
     b: &owl_cuda::Bytes,
@@ -407,7 +410,7 @@ async fn run_awq_case_g(client: &mut GpuClient, m: usize, n: usize, k: usize, g:
             let t = cell / groups;
             let c = cell % groups;
             (0..8)
-                .map(|i| ((zp_u8[(t * 8 + i) * groups + c] as u32) << (4 * i)))
+                .map(|i| (zp_u8[(t * 8 + i) * groups + c] as u32) << (4 * i))
                 .fold(0u32, |acc, v| acc | v) as i32
         })
         .collect();

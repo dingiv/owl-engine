@@ -43,7 +43,7 @@ impl TestRes {
     fn alloc_id(&mut self, bytes: usize) -> (u64, CudaSlice<u8>) {
         let id = self.next_id;
         self.next_id += 1;
-        let d = unsafe { self.stream.alloc_zeros::<u8>(bytes) }.expect("alloc");
+        let d = self.stream.alloc_zeros::<u8>(bytes).expect("alloc");
         (id, d)
     }
 
@@ -58,6 +58,7 @@ impl TestRes {
         self.blocks.get(&id).expect("块在册")
     }
 
+    #[allow(dead_code)] // 对拍辅助面(当前 case 未用,保留供扩展)
     fn take_bytes_f32(&self, id: u64) -> Vec<f32> {
         let s = self.slice_of(id);
         let host = self.stream.clone_dtoh(s).expect("dtoh");
@@ -121,7 +122,7 @@ impl DeviceRes for TestRes {
             .find(|(_, s)| s.device_ptr(&self.stream).0 == dst)
             .map(|(id, _)| *id);
         if let Some(id) = target {
-            let mut view = self.blocks.get_mut(&id).expect("在册");
+            let view = self.blocks.get_mut(&id).expect("在册");
             self.stream.memcpy_htod(src, view).expect("htod");
             return Ok(());
         }
@@ -147,6 +148,7 @@ fn read_bin(dir: &str, name: &str) -> Vec<f32> {
         .collect()
 }
 
+#[allow(dead_code)] // 对拍辅助面(当前 case 未用,保留)
 fn f32_to_bf16(src: &[f32]) -> Vec<u8> {
     src.iter()
         .flat_map(|f| half::bf16::from_f32(*f).to_le_bytes())
@@ -160,6 +162,7 @@ fn f32_to_f16_bytes(src: &[f32]) -> Vec<u8> {
 }
 
 /// [HV, X, Y] → [HV, Y, X](金标代际布局换算)
+#[allow(dead_code)] // 对拍辅助面(当前 case 未用,保留)
 fn transpose_kv(src: &[f32], hv: usize, x: usize, y: usize) -> Vec<f32> {
     let mut out = vec![0f32; src.len()];
     for hi in 0..hv {
@@ -248,7 +251,7 @@ fn gdn_chunked_new_chain_matches_golden() {
         ("c5_t128_deep", 128, true),
     ];
 
-    let rcp_ln2 = 1.442_695_f32;
+    let rcp_ln2 = std::f32::consts::LOG2_E;
     for (tag, t, tight) in cases {
         let nt = t.div_ceil(64);
         let q = read_bin(dir, &format!("{tag}.q"));

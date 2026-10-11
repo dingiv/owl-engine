@@ -220,7 +220,7 @@ impl KernelSpec for GdnChunkedRuntime {
         // ── meta 表驻留((T,NT) 键;handler 同款布局 [cu|coff|idx])──
         let (cu_p, coff_p, idx_p) = {
             let key = (t, nt);
-            if !st.meta.contains_key(&key) {
+            if let std::collections::hash_map::Entry::Vacant(e) = st.meta.entry(key) {
                 let mut host: Vec<i64> = Vec::with_capacity(4 + nt * 2);
                 host.extend_from_slice(&[0i64, t as i64]);
                 host.extend_from_slice(&[0i64, nt as i64]);
@@ -229,7 +229,7 @@ impl KernelSpec for GdnChunkedRuntime {
                 let bytes: Vec<u8> =
                     host.iter().flat_map(|v| v.to_le_bytes()).collect();
                 res.upload(nb.ptr, &bytes)?;
-                st.meta.insert(key, nb);
+                e.insert(nb);
             }
             let base = st.meta.get(&key).unwrap().ptr;
             (base, base + 16, base + 32)

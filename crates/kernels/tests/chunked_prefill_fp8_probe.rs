@@ -107,6 +107,7 @@ fn host_attn_ref(q: &[u16], kcache: &[u8], vcache: &[u8], kv_fp8: bool, hd: usiz
     for t in 0..T {
         for h in 0..NUM_HEADS {
             let kvh = h / (NUM_HEADS / NUM_KV_HEADS);
+            #[allow(clippy::needless_range_loop)]
             for b in 0..=t {
                 let pb = b / PAGE;
                 let bb = b % PAGE;
@@ -123,6 +124,7 @@ fn host_attn_ref(q: &[u16], kcache: &[u8], vcache: &[u8], kv_fp8: bool, hd: usiz
             let l: f32 = qk[..=t].iter().map(|&x| (x - m).exp()).sum();
             for d in 0..hd {
                 let mut acc = 0f32;
+                #[allow(clippy::needless_range_loop)]
                 for b in 0..=t {
                     let pb = b / PAGE;
                     let bb = b % PAGE;

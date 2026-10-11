@@ -124,7 +124,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         );
         ctx.env = self.env;
         ctx.trace_gate = self.cfg.knobs.probes.trace_gate;
-        let vocab = self.model.vocab_size();
+        let _vocab = self.model.vocab_size();
         // E5-DF4 逐层 bisect(OWL_PF_BISECT;非 dflash 路径):单遍 multi
         // eval 产出 48 层 taps + fin —— **fin 块直接作为主路输出**(bisect
         // 前向有 GDN 状态副作用,双执行会双推进;单执行 + 逐层 checksum
@@ -137,7 +137,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 指定层五站 stage tap(OWL_PF_STAGES=层号;配合 BISECT 定位层内核)
         let pf_stage_layer: Option<usize> = self.cfg.knobs.pf_stages;
         let mut bisect_fin_block: Option<(TensorOps, owl_iface::contract::Bytes)> = None;
-        let mut bisect_fin_blk: Option<owl_iface::contract::Bytes> = None;
+        let mut _bisect_fin_blk: Option<owl_iface::contract::Bytes> = None;
         if pf_bisect {
             let gdn_leaves = self.pool.gdn_caches();
             if pf_state_check {
@@ -162,7 +162,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     }
                 }
             }
-            let ids_all: Vec<usize> = (0..self.model.layers.len()).collect();
+            let _ids_all: Vec<usize> = (0..self.model.layers.len()).collect();
             // GDN 层内打点(M4 gdn_tap 现成):每 GDN 层 8 件
             // (q/k/v raw + q_n/k_n/v_c/g/beta)→ 定位 qkv-proj/l2norm/conv/gating
             // GDN 层内 8 件打点(gdn_tap)已启用:层六站展开 + 8 件随层带出
@@ -233,7 +233,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
             eprintln!("[pf-bisect] chunk base={base} t={t} 层 checksum 已记");
         }
-        let face = self.session.face_mut();
+        let _face = self.session.face_mut();
         let vocab = self.model.vocab_size();
         if is_last {
             // E3:末行设备 argmax(4B 回读,免 [T,V] 大 dtoh)。
@@ -246,7 +246,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let (hidden_full, prefill_taps) = if pf_bisect {
                 // bisect fin 块直通(block-leaf 下游 eval 零操作)
                 let (decl, blk) = bisect_fin_block.take().expect("bisect fin");
-                bisect_fin_blk = Some(blk);
+                _bisect_fin_blk = Some(blk);
                 (decl, None)
             } else if self.dflash_tap_count > 0 {
                 let (h, tp) = self.model.tapped_hidden(&ids_t, &ctx, &[5, 19, 33, 47, 61]);
@@ -410,7 +410,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // DFlash2:同构 concat 单根(taps 随块回收前切片 encode)
             let (tree, prefill_taps) = if pf_bisect {
                 let (decl, blk) = bisect_fin_block.take().expect("bisect fin(非末)");
-                bisect_fin_blk = Some(blk);
+                _bisect_fin_blk = Some(blk);
                 (decl, None)
             } else if self.dflash_tap_count > 0 {
                 let (h, tp) = self.model.tapped_hidden(&ids_t, &ctx, &[5, 19, 33, 47, 61]);
@@ -445,7 +445,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 // hidden,taps 同块后随)—— dtoh 整父块契约必须等大读
                 // (曾用 t·hidden → 多 chunk DFlash2 首跑即炸;MTP 无 taps
                 // 时 n_tp=0 同式兼容)
-                let rows_b = if prefill_taps.is_some() { prefill_taps.as_ref().unwrap().0.len() + 1 } else { 1 } * t;
+                let rows_b = if let Some(tp) = &prefill_taps { tp.0.len() + 1 } else { 1 } * t;
                 let mut buf = vec![0u8; rows_b * d.hidden * esz];
                 face.dtoh(&b, &mut buf).await?;
                 if self.probes.prefill_cksum {
@@ -455,7 +455,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         .sum();
                     eprintln!("[cksum] chunk base={base} t={t} sum|x|={cks:.4}");
                 }
-                drop(face);
                 // prefill extend(E5-M5):行 0..T-1 的 mtp KV(行 T-1 配对需
                 // 下一 chunk 首 token,由其 extend 补)。DFlash2:草稿 KV
                 // 物化(整 chunk 全行 taps → encode)

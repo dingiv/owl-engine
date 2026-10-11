@@ -79,8 +79,8 @@ pub struct DeviceDesc {
 ///    通信缓冲计入各自卡的账本;
 /// 4. 账本外分配(包括集合通信库的内部缓冲)按
 ///    backends/README.md 准入铁律处理:**NCCL 因此除名**。
-
-/// 内存域状态机(与 graph 治理的 GraphPhase 同律;词汇权威在此)
+///
+///    内存域状态机(与 graph 治理的 GraphPhase 同律;词汇权威在此)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MemPhase {
     /// 无图存活:延迟释放在此窗口统一归还
@@ -217,8 +217,8 @@ pub trait Backend: Send + Sync + 'static {
 /// - 池块在非 Idle 相 drop → 延迟归还,禁止立即释放;
 /// - 捕获窗口内的生死由 P1-2 双路径钉住(birth-pin / park);
 /// - 实现是否真的安全由各自测试兜底(iface 层提供验收用例模板)。
-/// 后端不透明字节缓冲的 iface 视图(blanket impl,零 dyn 开销于热路径
-/// 之外的 P 阶段对象上)
+///   后端不透明字节缓冲的 iface 视图(blanket impl,零 dyn 开销于热路径
+///   之外的 P 阶段对象上)
 pub trait OpaqueDevBuf: DevBuf<u8> {
     /// 出生令牌(哨兵①:捕获期依赖记录的钥匙)
     fn token(&self) -> BufToken;

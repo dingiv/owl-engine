@@ -48,6 +48,8 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
 
     /// Qwen3.5-0.8B(维度/键约定/分词器事实全在 specs/qwen35.rs 声明;
     /// 未来 `load(dir)` 按 config.json 分发,挂账)
+    // A3 同步隔离:引擎单线程模型;Arc 仅作共享句柄,不跨线程发送。
+    #[allow(clippy::arc_with_non_send_sync)]
     pub async fn load_qwen35_0_8b(&mut self, dir: &Path) -> Result<LoadedModel> {
         let spec = qwen3_5_0_8b();
         let model = Arc::new(load_0_8b(dir, self.face).await?);
@@ -62,6 +64,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
 
     /// W4A16 装载(E3;llm-compressor 产物目录):装载期重排到 marlin
     /// 布局,q_proj 等全部达标 Linear 走 foreign GEMM(REQ-PRE-01)
+    #[allow(clippy::arc_with_non_send_sync)]
     pub async fn load_qwen35_0_8b_w4a16(
         &mut self,
         dir: &Path,
@@ -83,6 +86,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
     /// `head_plan`(C1,2026-10-11):untied lm_head 量化计划(唯一映射点
     /// owl_shared::config::HeadQuant → owl_models QuantPlan;量化方案
     /// = 配置枚举,loader 零硬编码)。
+    #[allow(clippy::arc_with_non_send_sync)]
     pub async fn load_qwen38_27b_awq(
         &mut self,
         dir: &Path,

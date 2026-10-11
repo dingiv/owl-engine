@@ -33,7 +33,7 @@ impl GpuClient {
     /// Future 的 resolve 时机由 server 决定(见模块注释的语义分级):
     /// - launch/alloc:issue 即 send → 立即 resolve(fire-and-forget)
     /// - htod/dtoh/sync:host 回调/栅栏后 send → pending 至 GPU 真完成
-    /// pending 期间 waker 挂起,不占执行线程。
+    ///   pending 期间 waker 挂起,不占执行线程。
     fn submit<T: Send + 'static>(
         &self,
         build: impl FnOnce(Ack<Result<T, ModelError>>) -> Command,

@@ -109,9 +109,9 @@ fn k0_fp8_write_readback() {
     stream.memset_zeros(&mut d_vc).unwrap();
     let mut d_slots = unsafe { stream.alloc::<f32>(slots.len()) }.unwrap();
     stream.memcpy_htod(&slots, &mut d_slots).unwrap();
-    let mut d_out = unsafe { stream.alloc::<u16>(1) }.unwrap();
+    let d_out = unsafe { stream.alloc::<u16>(1) }.unwrap();
 
-    let (ks, vs, hs, kst, vst) = (
+    let (ks, vs, hs, kst, _vst) = (
         (HKV * HD) as i32,
         (HKV * HD) as i32,
         HKV as i32,
@@ -147,6 +147,7 @@ fn k0_fp8_write_readback() {
     let mut vc = vec![0u8; kcache_len];
     stream.memcpy_dtoh(&d_vc, &mut vc).unwrap();
     let mut bad = 0;
+    #[allow(clippy::needless_range_loop)]
     for t in 0..3usize {
         // token3 = padding,跳写
         let slot = slots[t] as usize;

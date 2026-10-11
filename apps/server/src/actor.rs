@@ -53,7 +53,7 @@ pub enum SinkEvent {
 
 /// actor 主循环(独占线程内持 `&mut RunningEngine`;随 channel 关闭退出)
 pub async fn run_actor<D: DeviceClient>(
-    mut running: &mut RunningEngine<D>,
+    running: &mut RunningEngine<D>,
     mut rx: mpsc::Receiver<EngineReq>,
 ) {
     // turn_id → 事件回流(sink;Completed/Failed 后摘除)
@@ -61,10 +61,10 @@ pub async fn run_actor<D: DeviceClient>(
     loop {
         // ① 阻塞等首个请求(通道关 = 引擎退役)
         let Some(req) = rx.recv().await else { return };
-        accept(&mut running, &mut sinks, req).await;
+        accept(running, &mut sinks, req).await;
         // ② 排空积压(pump 前收完,保证收发不相交)
         while let Ok(req) = rx.try_recv() {
-            accept(&mut running, &mut sinks, req).await;
+            accept(running, &mut sinks, req).await;
         }
         // ③ 泵到排空,事件按 turn 路由
         loop {
@@ -132,7 +132,7 @@ async fn dispatch(
         TurnEvent::Idle => return,
     };
     if let Some(sink) = sinks.get(&tid) {
-        deliver(&sink, SinkEvent::Turn(ev)).await;
+        deliver(sink, SinkEvent::Turn(ev)).await;
     }
     if done {
         // 摘除即 drop(mpsc Sender 无显式 close;对端 recv 尽后自然断流)

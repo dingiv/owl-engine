@@ -325,7 +325,7 @@ async fn load_direct<D: DeviceClient, S: WeightSource + ?Sized>(
                 .map_err(|e| ModelError::Msg(format!("Weight '{}': {e}", w.key)))?;
         }
         off += len;
-        if off % (chunk_elems * 4) == 0 || off >= n {
+        if off.is_multiple_of(chunk_elems * 4) || off >= n {
             face.sync().await?;
         }
     }
@@ -344,7 +344,6 @@ async fn load_direct<D: DeviceClient, S: WeightSource + ?Sized>(
 /// (CPU 零重排)→ DMA 上卡 → registry 重排核就地生成 marlin 布局块
 /// → 原始块回收(Free 通道)。CPU 33s 重量排出热路径,重排在 GPU
 /// (显存带宽 ~900GB/s,哑 gather)。
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
     face: &mut D,
@@ -399,7 +398,7 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
             off += len;
             // upload_pinned 异步语义契约:计算读前必 sync(load_direct 同款
             // 纪律:每 4 块 + 尾;repack 核读 raw 前无栅栏 = 竞态读半截)
-            if off % (chunk_elems * 4) == 0 || off >= raw_elems {
+            if off.is_multiple_of(chunk_elems * 4) || off >= raw_elems {
                 face.sync().await?;
             }
         }

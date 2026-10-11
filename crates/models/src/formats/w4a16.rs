@@ -42,7 +42,7 @@ use std::sync::{Arc, Mutex};
 /// 维度族,m∈{1,32,4096})。判据回归 kernel/pack 真实约束:
 /// **n%256==0**(repack tile)且 **in%128==0**(g128 分组)。
 pub fn marlin_eligible(out_dim: usize, in_dim: usize) -> bool {
-    out_dim % 256 == 0 && in_dim % 128 == 0
+    out_dim.is_multiple_of(256) && in_dim.is_multiple_of(128)
 }
 
 /// 打包 n 档位(暗雷根治后 = **n 直通**):eligibility 已保证 n%256==0
@@ -50,7 +50,7 @@ pub fn marlin_eligible(out_dim: usize, in_dim: usize) -> bool {
 /// 已废(pad 实测仍挂;真凶 = use_fp32_reduce/c_tmp,见
 /// [`marlin_eligible`] 文档)。保留函数 = 语义锚点,防再引入 pad。
 pub fn marlin_n_pack(n: usize) -> usize {
-    debug_assert!(n % 256 == 0, "marlin pack 要求 n%256==0(得 {n})");
+    debug_assert!(n.is_multiple_of(256), "marlin pack 要求 n%256==0(得 {n})");
     n
 }
 
@@ -72,8 +72,10 @@ pub struct W4A16Source {
     maps: Vec<Mmap>,
     index: HashMap<String, RawEntry>,
     /// 懒物化字节缓存(键 → 字节;容量清空驱逐)
+    #[allow(clippy::type_complexity)] // 行块缓存(字节镜像 + 计数)
     cache: Mutex<(HashMap<String, Arc<[u8]>>, usize)>,
     /// gather 索引表(按 (k, n) 形状复用;除法分解只算一次)
+    #[allow(clippy::type_complexity)] // 索引缓存(键 → 列序)
     idx_cache: Mutex<HashMap<(usize, usize), Arc<Vec<u32>>>>,
     /// 构建串行锁(重排内部 rayon 已饱和全核;并发双构建纯浪费)
     build_lock: Mutex<()>,
@@ -204,11 +206,11 @@ impl W4A16Source {
 
     /// fc 列块物化(E5-DF3.5):fc.weight_packed [5120, 3200] I32 列子阵
     /// + fc.weight_scale [5120, 200] F16 列子阵 → (out=5120, k=5120) 走
-    /// 与 build_linear 同式的 marlin 重排(qweight U32 / scales F16)。
-    /// 列块恒 eligible(n=5120 % 256 == 0,k=5120 % 128 == 0)。
-    /// fc 列块**原始 ct packed** 字节(设备重排核的输入;不做 marlin 重排)
-    /// —— 与 [`Self::fc_block_bytes`] 的区别:后者返回的是**已重排的 marlin B**
-    /// (CPU 臂产物),喂给 GPU CtRepack 会二次重排 = 垃圾(2026-10-13 立案)。
+    ///   与 build_linear 同式的 marlin 重排(qweight U32 / scales F16)。
+    ///   列块恒 eligible(n=5120 % 256 == 0,k=5120 % 128 == 0)。
+    ///   fc 列块**原始 ct packed** 字节(设备重排核的输入;不做 marlin 重排)
+    ///   —— 与 [`Self::fc_block_bytes`] 的区别:后者返回的是**已重排的 marlin B**
+    ///   (CPU 臂产物),喂给 GPU CtRepack 会二次重排 = 垃圾(2026-10-13 立案)。
     fn fc_block_raw_bytes(&self, blk: usize) -> Option<Arc<[u8]>> {
         let vkey = format!("fc_block_{blk}_raw");
         {
@@ -492,8 +494,7 @@ impl WeightSource for W4A16Source {
             }
             return Some(v2_workspace_len(marlin_n_pack(out)));
         }
-        if key.ends_with(".marlin_ctmp") {
-            let base = &key[..key.len() - ".marlin_ctmp".len()];
+        if let Some(base) = key.strip_suffix(".marlin_ctmp") {
             let (out, k, _, _) = self.linear_dims(base)?;
             if !marlin_eligible(out, k) {
                 return None;
@@ -657,10 +658,9 @@ pub(crate) fn i32s_par(bytes: &[u8]) -> Vec<i32> {
 fn f16_bytes_to_bf16_bytes(bytes: &[u8]) -> Vec<u8> {
     bytes
         .chunks_exact(2)
-        .map(|c| {
+        .flat_map(|c| {
             half::bf16::from_f32(half::f16::from_le_bytes([c[0], c[1]]).to_f32()).to_le_bytes()
         })
-        .flatten()
         .collect::<Vec<u8>>()
 }
 

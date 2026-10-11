@@ -353,7 +353,7 @@ pub mod gdn {
                 DType::BF16 | DType::U32 => unimplemented!("GDN 族无 U32 变体"),
             },
             shape: Shape {
-                grid: (((vd + 63) / 64) as u32, (batch * nv) as u32, 1),
+                grid: (vd.div_ceil(64) as u32, (batch * nv) as u32, 1),
                 block: (64, 1, 1),
                 smem: ((2 * kd + 2) * 4) as u32,
             },
@@ -369,7 +369,7 @@ pub mod gdn {
             "owl_gdn_decode_step 仅有 f16 变体(dt={dt:?})"
         );
         assert_eq!(kd, vd, "decode_step 融合核要求 kd==vd(头方阵);得 {kd}/{vd}");
-        assert!(kd <= 128 && kd % 32 == 0, "decode_step 融合核要求 kd≤128 且 32 对齐,得 {kd}");
+        assert!(kd <= 128 && kd.is_multiple_of(32), "decode_step 融合核要求 kd≤128 且 32 对齐,得 {kd}");
         KernelPick {
             name: "owl_gdn_decode_step_f16",
             shape: Shape { grid: ((batch * nv) as u32, 1, 1), block: (kd as u32, 1, 1), smem: 0 },
@@ -385,7 +385,7 @@ pub mod gdn {
             "owl_gdn_decode_step_v2 仅有 f16 变体(dt={dt:?})"
         );
         assert_eq!(kd, vd, "decode_step v2 要求 kd==vd(头方阵);得 {kd}/{vd}");
-        assert!(kd <= 128 && kd % 32 == 0 && vd % 4 == 0, "decode_step v2 要求 kd≤128 32 对齐且 vd/4,得 {kd}/{vd}");
+        assert!(kd <= 128 && kd.is_multiple_of(32) && vd.is_multiple_of(4), "decode_step v2 要求 kd≤128 32 对齐且 vd/4,得 {kd}/{vd}");
         KernelPick {
             name: "owl_gdn_decode_step_v2_f16",
             shape: Shape { grid: ((batch * nv) as u32, 1, 1), block: (vd as u32, 1, 1), smem: 0 },
@@ -399,7 +399,7 @@ pub mod gdn {
         assert!(matches!(dt, DType::F16), "owl_gdn_conv_fwd 仅有 f16 变体(dt={dt:?})");
         KernelPick {
             name: "owl_gdn_conv_fwd_f16",
-            shape: Shape { grid: (1, ((d + 255) / 256) as u32, 1), block: (256, 1, 1), smem: 0 },
+            shape: Shape { grid: (1, d.div_ceil(256) as u32, 1), block: (256, 1, 1), smem: 0 },
         }
     }
 
@@ -414,7 +414,7 @@ pub mod gdn {
         KernelPick {
             name: "owl_gdn_recurrence_varlen_gqa_f16",
             shape: Shape {
-                grid: (((vd + 7) / 8) as u32, nv as u32, 1),
+                grid: (vd.div_ceil(8) as u32, nv as u32, 1),
                 block: (32, 8, 1),
                 smem: ((4 * kd + 4) * 4) as u32,
             },
@@ -527,7 +527,7 @@ pub mod ops {
         };
         let x_total: usize = shapes.first().map(|s| s.iter().product()).unwrap_or(0);
         let cols: usize = shapes.get(1).map(|s| s.iter().product()).unwrap_or(1);
-        let rows = if cols == 0 { 0 } else { x_total / cols };
+        let rows = x_total.checked_div(cols).unwrap_or(0);
         KernelPick {
             name,
             shape: Shape { grid: (rows as u32, 1, 1), block: (256, 1, 1), smem: 256 * 4 },
@@ -615,6 +615,7 @@ pub mod attn {
     }
 
     /// §三十一:伪序列变体(grid.y = seqs;decode = 1,verify = depth1)
+    #[allow(clippy::too_many_arguments)]
     pub fn paged_decode_v2_fp8_seq(
         env: &OpEnv,
         _dt: DType,
@@ -668,7 +669,7 @@ pub mod attn {
         KernelPick {
             name,
             shape: Shape {
-                grid: ((hq / hkv) as u32, hkv as u32, ((tokens + tokens_per_block - 1) / tokens_per_block) as u32),
+                grid: ((hq / hkv) as u32, hkv as u32, tokens.div_ceil(tokens_per_block) as u32),
                 block: (256, 1, 1),
                 smem: (64 + 2 * hd * env.page * 2) as u32,
             },
@@ -767,6 +768,7 @@ pub mod attn {
     }
 
     /// §三十一:伪序列变体(grid.y = seqs)
+    #[allow(clippy::too_many_arguments)]
     pub fn paged_decode_v2_seq(
         env: &OpEnv,
         dt: DType,
@@ -806,6 +808,7 @@ pub mod attn {
         paged_decode_v2_seq_knhd(env, dt, hd, hq, hkv, nb, nparts, 1)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn paged_decode_v2_seq_knhd(
         env: &OpEnv, dt: DType, hd: usize, hq: usize, _hkv: usize, _nb: usize,
         nparts: usize, seqs: usize,
@@ -836,6 +839,7 @@ pub mod attn {
         paged_decode_v2_fp8_seq_knhd(env, dt, hd, hq, hkv, nb, nparts, 1)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn paged_decode_v2_fp8_seq_knhd(
         env: &OpEnv, _dt: DType, hd: usize, hq: usize, _hkv: usize, _nb: usize,
         nparts: usize, seqs: usize,
@@ -905,7 +909,7 @@ pub mod attn {
         KernelPick {
             name,
             shape: Shape {
-                grid: ((hq / hkv) as u32, hkv as u32, ((tokens + 255) / 256) as u32),
+                grid: ((hq / hkv) as u32, hkv as u32, tokens.div_ceil(256) as u32),
                 block: (256, 1, 1),
                 smem: (64 + 2 * hd * env.page * 2) as u32,
             },
@@ -935,7 +939,7 @@ pub mod attn {
             256 => "owl_prefill_split_f16_hd256",
             other => panic!("prefill split 仅 hd256,得 {other}"),
         };
-        let qchunks = (tokens + 63) / 64;
+        let qchunks = tokens.div_ceil(64);
         KernelPick {
             name,
             shape: Shape {
@@ -973,7 +977,7 @@ pub mod attn {
             256 => "owl_prefill_split_f16_knhd_hd256",
             other => panic!("prefill split knhd 仅 hd256,得 {other}"),
         };
-        let qchunks = (tokens + 63) / 64;
+        let qchunks = tokens.div_ceil(64);
         KernelPick {
             name,
             shape: Shape {
@@ -993,7 +997,7 @@ pub mod attn {
             256 => "owl_prefill_split_fp8kv_knhd_hd256",
             other => panic!("prefill split fp8 knhd 仅 hd256,得 {other}"),
         };
-        let qchunks = (tokens + 63) / 64;
+        let qchunks = tokens.div_ceil(64);
         KernelPick {
             name,
             shape: Shape {
@@ -1011,7 +1015,7 @@ pub mod attn {
         KernelPick {
             name: "owl_prefill_split_reduce_f16_hd256",
             shape: Shape {
-                grid: ((((tokens * hq) + 255) / 256) as u32, 1, 1),
+                grid: ((tokens * hq).div_ceil(256) as u32, 1, 1),
                 block: (256, 1, 1),
                 smem: 0,
             },
@@ -1254,7 +1258,7 @@ pub mod mlp {
         KernelPick {
             name,
             shape: Shape {
-                grid: if matches!(dt, DType::F16) { ((((n + 1) / 2 + 255) / 256) as u32, 1, 1) } else { (((n + 255) / 256) as u32, 1, 1) },
+                grid: if matches!(dt, DType::F16) { (n.div_ceil(2).div_ceil(256) as u32, 1, 1) } else { (n.div_ceil(256) as u32, 1, 1) },
                 block: (256, 1, 1),
                 smem: 0,
             },
@@ -1429,7 +1433,7 @@ mod tests {
         );
         // smem 契约:上下文项 vs 地板(nb·page·4B vs 2·HD·4B)
         let p = attn::paged_decode_v1(&env32, DType::F16, 256, 24, 4, 2);
-        assert_eq!(p.shape.smem, (2 * 32 * 4).max((128 / 32 / 2) * 256 * 4));
+        assert_eq!(p.shape.smem, (128 / 32 / 2) * 256 * 4);
         assert_eq!(p.shape.grid, (24, 1, 1));
         assert_eq!(p.shape.block, (128, 1, 1));
     }

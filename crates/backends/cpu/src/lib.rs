@@ -14,7 +14,7 @@
 //!
 //! 模块地图:
 //! - [`value`]:f32 值块(CPU 后端的数据平面;host 真值)
-//! - [`ops`]:朴素算子实现(matmul/add/silu/rmsnorm;对拍锚的独立副本)
+//! - [`ops`][]:朴素算子实现(matmul/add/silu/rmsnorm;对拍锚的独立副本)
 //! - [`face`]:CpuFace(DeviceClient 实现;客户端直接持有的后端句柄)
 //!
 //! 纪律:本 crate 只依赖 owl-iface(契约),**不依赖任何前端 crate**

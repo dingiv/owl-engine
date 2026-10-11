@@ -11,7 +11,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         &mut self,
         token: u32,
         pos: usize,
-        kv_slots: [u32; 9],
+        _kv_slots: [u32; 9],
         gdn_slot: usize,
         grew: bool,
     ) -> Result<TurnEvent> {
@@ -25,7 +25,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let t0 = prof.then(std::time::Instant::now);
         let t_round = std::time::Instant::now();
         let mut t_snap = std::time::Duration::ZERO;
-        let mut t_verify = std::time::Duration::ZERO;
+        let t_verify;
         let mut t_rollback = std::time::Duration::ZERO;
         let mut t_propose = std::time::Duration::ZERO;
         let depth = self.spec_depth;
@@ -67,9 +67,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // + fold 记录)或 eager fallback(旧 verify_forward)。fold 记录
         // = 每层 8 件(conv 三 raw + 递推五件)。
         let block: Vec<u32> = std::iter::once(token).chain(drafts.iter().copied()).collect();
-        let (ids, hidden, records, hidden_owned) = if self.verify_graph.is_some() {
+        let (ids, hidden, records, hidden_owned) = if let Some(vg) = self.verify_graph.as_mut() {
             let ts = std::time::Instant::now();
-            let vg = self.verify_graph.as_mut().expect("verify_graph");
             let page = self.pool.page;
             let bt_chain = {
                 let s = self.sessions.get(sid).expect("账在");
@@ -79,7 +78,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let pos_f: Vec<f32> =
                 (pos..pos + block.len()).map(|p| p as f32).collect();
             if bt_chain.len() <= (pos + block.len() - 1) / page {
-                eprintln!("[spec-dbg] pos={pos} block={} bt_len={} page={page}", block.len(), bt_len = bt_chain.len());
+                eprintln!("[spec-dbg] pos={pos} block={} bt_len={bt_len} page={page}", block.len(), bt_len = bt_chain.len());
             }
             let slots_f: Vec<f32> = (pos..pos + block.len())
                 .map(|p| (bt_chain[p / page] * page as u32 + (p % page) as u32) as f32)
@@ -91,7 +90,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let bt8_f: Vec<f32> = (0..block.len())
                 .flat_map(|_| {
                     bt_chain.iter().map(|&b| b as f32)
-                        .chain(std::iter::repeat(0f32).take(nb_total - bt_chain.len()))
+                        .chain(std::iter::repeat_n(0f32, nb_total - bt_chain.len()))
                 })
                 .collect();
             // XQA 臂:semaphores 每轮清零(KV-split 归约计数;**同流序先于图回放**;
@@ -157,7 +156,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // B4 自适应降级态机(§6.24;DFlash2 专属 —— 同步机制走 dflash encode)
         // 2026-10-12 深夜重放 + 滚动 AL 窗口:连击 streak 会被"偶发 m=1"
         // 破解(随机域 AL≈1.1 时 9.3 t/s 案),窗口均值 < 盈亏线即降级
-        let mut degraded_now;
+        let degraded_now;
         if self.dflash_tap_count > 0 && self.probes.degrade_after > 0 {
             let (degrade_after, probe_every0) = (self.probes.degrade_after, self.probes.probe_every);
             let spec = self.tspec();

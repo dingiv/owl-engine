@@ -14,7 +14,7 @@ const NK: usize = 16;
 const NV: usize = 48;
 const KD: usize = 128;
 const VD: usize = 128;
-const SCALE: f32 = 0.08838834764831845; // 1/sqrt(128)
+const SCALE: f32 = 0.088_388_346; // 1/sqrt(128)
 
 /// 确定性伪随机 [0,1)
 fn lcg01(seq: u32, i: usize) -> f32 {
@@ -139,12 +139,12 @@ fn scalar_matches_varlen_big_t() {
         let to_f32 = |x: &[f16]| x.iter().map(|h| h.to_f32()).collect::<Vec<f32>>();
 
         // ── 臂 1:varlen(f16 in;state [1,NV,KD,VD] 零初态)──
-        let mut v_state = stream.alloc_zeros::<f32>(NV * KD * VD).unwrap();
-        let mut v_slots = stream.alloc_zeros::<f32>(1).unwrap(); // slot 0
+        let v_state = stream.alloc_zeros::<f32>(NV * KD * VD).unwrap();
+        let v_slots = stream.alloc_zeros::<f32>(1).unwrap(); // slot 0
         let cu_host = vec![0.0f32, t as f32];
         let mut v_cu = stream.alloc_zeros::<f32>(2).unwrap();
         stream.memcpy_htod(&cu_host, &mut v_cu).unwrap();
-        let mut v_out = unsafe { stream.alloc::<u16>(t * NV * VD) }.unwrap();
+        let v_out = unsafe { stream.alloc::<u16>(t * NV * VD) }.unwrap();
         {
             let sl_p = v_slots.device_ptr(&stream).0;
             let cu_p = v_cu.device_ptr(&stream).0;
@@ -153,7 +153,7 @@ fn scalar_matches_varlen_big_t() {
             let (batch_u, nv_u, nk_u, kd_u, vd_u) =
                 (1u64, NV as u64, NK as u64, KD as u64, VD as u64);
             let qs = SCALE; // q 缩放(varlen 乘在 q 上)
-            let grid = (((VD + 7) / 8) as u32, NV as u32, 1);
+            let grid = (VD.div_ceil(8) as u32, NV as u32, 1);
             let block = (32, 8, 1);
             let smem = ((4 * KD + 4) * 4) as u32;
             let mut b = stream.launch_builder(&f_var);
@@ -197,11 +197,11 @@ fn scalar_matches_varlen_big_t() {
         stream.memcpy_htod(&s_b, &mut d_sb).unwrap();
         let mut d_sg = stream.alloc_zeros::<f32>(s_g.len()).unwrap();
         stream.memcpy_htod(&s_g, &mut d_sg).unwrap();
-        let mut s_state = stream.alloc_zeros::<f32>(NV * KD * VD).unwrap();
+        let s_state = stream.alloc_zeros::<f32>(NV * KD * VD).unwrap();
         let seq_off = vec![0i32, t as i32];
         let mut d_soff = stream.alloc_zeros::<i32>(2).unwrap();
         stream.memcpy_htod(&seq_off, &mut d_soff).unwrap();
-        let mut s_out = stream.alloc_zeros::<f32>(t * NV * VD).unwrap();
+        let s_out = stream.alloc_zeros::<f32>(t * NV * VD).unwrap();
         {
             let sq_p = d_sq.device_ptr(&stream).0;
             let sk_p = d_sk.device_ptr(&stream).0;

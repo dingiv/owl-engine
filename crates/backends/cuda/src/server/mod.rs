@@ -26,16 +26,14 @@
 //! 原语带流 id —— 流内保序(依赖维),流间并发。
 
 use crate::ffi::{
-    launch_host_function, memcpy_dtoh_async, memcpy_htod_async, memset_d8_async, PushKernelArg,
+    launch_host_function, memcpy_dtoh_async, memcpy_htod_async, memset_d8_async,
     CudaContext, CudaSlice, CudaStream,
 };
 use std::sync::Arc;
-use cudarc::driver::DevicePtr;
 use crate::command::{Ack, Command};
 use crate::launch::issue_launch;
 use crate::state::{DeviceSelector, GpuCtx, KernelCache, Staging};
 use owl_iface::contract::{Arg, Bytes, LaunchMsg};
-use std::ffi::c_void;
 use crate::state::{STREAM_COMPUTE, STREAM_D2H, STREAM_H2D};
 use owl_iface::contract::ModelError;
 use std::sync::mpsc;
@@ -332,8 +330,8 @@ impl GpuServer {
                 &mut self.timings[last]
             };
             slot.1 += 1;
-            slot.2 += dt.as_nanos() as u128;
-            slot.3 = slot.3.max(dt.as_nanos() as u128);
+            slot.2 += dt.as_nanos();
+            slot.3 = slot.3.max(dt.as_nanos());
         }
     }
 
@@ -604,7 +602,7 @@ impl GpuServer {
                 _ => format!("gpu.{name}"),
             };
             let t0 = std::time::Instant::now();
-            let r = self.handle_launch_inner(msg, ack);
+            self.handle_launch_inner(msg, ack);
             if let Ok(stream) = self.ctx().stream(STREAM_COMPUTE) {
                 let _ = stream.synchronize(); // 归因同步(错误由 sticky 面另报)
             }
@@ -613,16 +611,16 @@ impl GpuServer {
                 s.timer_record_tag(&shape_tag, dt, file!(), 0);
                 s.timer_record_tag(&format!("gpu.{name}"), dt, file!(), 0);
             });
-            return r;
+            return ;
         }
         // 逐发射计时(OWL_LAUNCH_TIME=1;捕获期 warmup = 全模型 eager 一遍,
         // 一次跑完全谱;capture 回放期自动关闭 —— 回放是整图一发射)
         if self.probes.launch_time && !self.ctx().capture_stream() {
             let t = std::time::Instant::now();
             let name = msg.kernel.name.clone();
-            let r = self.handle_launch_inner(msg, ack);
+            self.handle_launch_inner(msg, ack);
             eprintln!("[launch-time] {:?} {}", t.elapsed(), name);
-            return r;
+            return ;
         }
         self.handle_launch_inner(msg, ack)
     }
@@ -859,7 +857,7 @@ impl owl_kernels::device::DeviceRes for GpuRes<'_> {
         // 由家族 grave 律保证不再分配 —— A1.7)。append-only 账本,物理
         // 释放 = server 销毁。
         let stream = self.stream()?;
-        let mut d = unsafe { stream.alloc_zeros::<u8>(bytes) }
+        let d = stream.alloc_zeros::<u8>(bytes)
             .map_err(|e| OpError::Launch { op: OP_RES.into(), stage: owl_kernels::contract::Stage::Load, detail: format!("scratch alloc: {e:?}") })?;
         use cudarc::driver::DevicePtr;
         let ptr = d.device_ptr(&stream).0;
@@ -904,7 +902,7 @@ impl owl_kernels::device::DeviceRes for GpuRes<'_> {
                 cudarc::driver::result::memcpy_htod_sync(dst, src)
             }
             .map_err(|e| OpError::Launch { op: OP_RES.into(), stage: owl_kernels::contract::Stage::Store, detail: format!("upload sync: {e:?}") })?;
-            let mut target = target; // 保留账本句柄(析构语义不变)
+            let _target = target; // 保留账本句柄(析构语义不变)
             Ok(())
         }
     }

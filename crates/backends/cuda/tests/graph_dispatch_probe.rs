@@ -6,10 +6,10 @@
 //! - distinct:K 个 distinct 内核轮转(模块/函数切换成本)
 //! - wide:12 参大签名(参数量成本)
 //! - big:大块(执行时间 > 派发:间隙是否被隐藏)
-//! 另测同链 eager(host 直发)对照。
+//!   另测同链 eager(host 直发)对照。
 
 use owl_cuda::{test_device_ordinal, DeviceClient as _, DeviceSelector, Dtype, GpuClient, GpuServer};
-use owl_iface::contract::{Arg, Bytes, KernelSource, LaunchMsg, Shape};
+use owl_iface::contract::{Arg, Bytes, KernelSource, LaunchMsg};
 use std::time::Instant;
 
 const ADD_CU: &str = r#"
@@ -20,22 +20,6 @@ extern "C" __global__ void probe_add_f32(
 }
 "#;
 
-fn add_msg(a: &Bytes, b: &Bytes, out: &Bytes, n: usize) -> LaunchMsg {
-    LaunchMsg {
-        kernel: KernelSource { name: "probe_add_f32".into(), source: ADD_CU.into() },
-        args: vec![
-            Arg::Block { id: a.id },
-            Arg::Block { id: b.id },
-            Arg::Block { id: out.id },
-            Arg::U64(n as u64),
-        ],
-        grid: (((n as u32) + 255) / 256, 1, 1),
-        block: (256, 1, 1),
-        shared_mem: 0,
-        out_elems: n,
-    }
-}
-
 fn add_msg_owned(a: &Bytes, b: &Bytes, out_id: u64, n: usize) -> LaunchMsg {
     LaunchMsg {
         kernel: KernelSource { name: "probe_add_f32".into(), source: ADD_CU.into() },
@@ -45,7 +29,7 @@ fn add_msg_owned(a: &Bytes, b: &Bytes, out_id: u64, n: usize) -> LaunchMsg {
             Arg::Block { id: out_id },
             Arg::U64(n as u64),
         ],
-        grid: (((n as u32) + 255) / 256, 1, 1),
+        grid: ((n as u32).div_ceil(256), 1, 1),
         block: (256, 1, 1),
         shared_mem: 0,
         out_elems: n,
@@ -138,7 +122,7 @@ async fn graph_dispatch_rate_probe() {
         })
         .collect();
     let elems = 256;
-    let a = alloc(&mut client, elems).await;
+    let _a = alloc(&mut client, elems).await;
     let b = alloc(&mut client, elems).await;
     let mut cur = alloc(&mut client, elems).await;
     client.graph_begin().await.expect("graph_begin");
@@ -153,7 +137,7 @@ async fn graph_dispatch_rate_probe() {
                 Arg::Block { id: nxt.id },
                 Arg::U64(elems as u64),
             ],
-            grid: (((elems as u32) + 255) / 256, 1, 1),
+            grid: ((elems as u32).div_ceil(256), 1, 1),
             block: (256, 1, 1),
             shared_mem: 0,
             out_elems: elems,

@@ -170,11 +170,11 @@ fn paged_decode_v2_knhd_parity() {
         stream.memcpy_htod(&block_tables, &mut d_bt).unwrap();
         let mut d_cl = unsafe { stream.alloc::<f32>(context_lens.len()) }.unwrap();
         stream.memcpy_htod(&context_lens, &mut d_cl).unwrap();
-        let mut d_es = unsafe { stream.alloc::<f32>(HQ * nparts) }.unwrap();
-        let mut d_ml = unsafe { stream.alloc::<f32>(HQ * nparts) }.unwrap();
+        let d_es = unsafe { stream.alloc::<f32>(HQ * nparts) }.unwrap();
+        let d_ml = unsafe { stream.alloc::<f32>(HQ * nparts) }.unwrap();
         let mut d_to = unsafe { stream.alloc::<u16>(tmp_elems) }.unwrap();
         stream.memset_zeros(&mut d_to).unwrap();
-        let mut d_alibi = unsafe { stream.alloc::<f32>(1) }.unwrap();
+        let d_alibi = unsafe { stream.alloc::<f32>(1) }.unwrap();
         let (qp, kcp2, vcp2, btp, clp, alp, esp, mlp, top) = (
             d_q.device_ptr(&stream).0,
             d_kc.device_ptr(&stream).0,
@@ -267,8 +267,8 @@ fn paged_decode_v2_knhd_parity() {
         }
     }
     let near = |a: &u16, b: &f32| (half::f16::from_bits(*a).to_f32() - *b).abs() < 5e-2;
-    let c_ok = out_c.iter().zip(host_ref.iter()).filter(|(a, b)| !near(*a, *b)).count();
-    let n_ok = out_n.iter().zip(host_ref.iter()).filter(|(a, b)| !near(*a, *b)).count();
+    let c_ok = out_c.iter().zip(host_ref.iter()).filter(|(a, b)| !near(a, b)).count();
+    let n_ok = out_n.iter().zip(host_ref.iter()).filter(|(a, b)| !near(a, b)).count();
     eprintln!("[ref] host 参考比对:classic 离谱 {c_ok}/{} knhd 离谱 {n_ok}(容差 5e-2)", out_c.len());
     eprintln!("[ref] host_ref[0..4] = {:?}", &host_ref[..4]);
 
@@ -336,11 +336,11 @@ fn paged_decode_v2_knhd_parity() {
         stream.memcpy_htod(&block_tables, &mut d_bt).unwrap();
         let mut d_cl = unsafe { stream.alloc::<f32>(context_lens.len()) }.unwrap();
         stream.memcpy_htod(&context_lens, &mut d_cl).unwrap();
-        let mut d_es = unsafe { stream.alloc::<f32>(HQ * nparts) }.unwrap();
-        let mut d_ml = unsafe { stream.alloc::<f32>(HQ * nparts) }.unwrap();
+        let d_es = unsafe { stream.alloc::<f32>(HQ * nparts) }.unwrap();
+        let d_ml = unsafe { stream.alloc::<f32>(HQ * nparts) }.unwrap();
         let mut d_to = unsafe { stream.alloc::<u16>(tmp_elems) }.unwrap();
         stream.memset_zeros(&mut d_to).unwrap();
-        let mut d_alibi = unsafe { stream.alloc::<f32>(1) }.unwrap();
+        let d_alibi = unsafe { stream.alloc::<f32>(1) }.unwrap();
         let (qp, kcp2, vcp2, btp, clp, alp, esp, mlp, top) = (
             d_q.device_ptr(&stream).0,
             d_kc.device_ptr(&stream).0,
@@ -451,10 +451,10 @@ fn prefill_split_knhd_parity() {
         stream.memcpy_htod(vcp, &mut d_vc).unwrap();
         let mut d_bt = unsafe { stream.alloc::<f32>(block_tables.len()) }.unwrap();
         stream.memcpy_htod(&block_tables, &mut d_bt).unwrap();
-        let mut d_so = unsafe { stream.alloc::<u16>(scr_out_elems) }.unwrap();
-        let mut d_ss = unsafe { stream.alloc::<f32>(scr_stat_elems) }.unwrap();
-        let mut d_alibi = unsafe { stream.alloc::<u16>(1) }.unwrap();
-        let mut d_dummy = unsafe { stream.alloc::<u16>(1) }.unwrap();
+        let d_so = unsafe { stream.alloc::<u16>(scr_out_elems) }.unwrap();
+        let d_ss = unsafe { stream.alloc::<f32>(scr_stat_elems) }.unwrap();
+        let d_alibi = unsafe { stream.alloc::<u16>(1) }.unwrap();
+        let d_dummy = unsafe { stream.alloc::<u16>(1) }.unwrap();
         let (qp, kcp2, vcp2, btp, sop, ssp, alp, dmp) = (
             d_q.device_ptr(&stream).0,
             d_kc.device_ptr(&stream).0,
@@ -488,7 +488,7 @@ fn prefill_split_knhd_parity() {
             .arg(&pg)
             .arg(&hqi)
             .arg(&dmp);
-        let qchunks = (t_tokens + 63) / 64;
+        let qchunks = t_tokens.div_ceil(64);
         unsafe {
             b.launch(LaunchConfig {
                 grid_dim: ((HQ / HKV) as u32, HKV as u32, (qchunks * nparts) as u32),
@@ -541,10 +541,10 @@ fn prefill_split_knhd_parity() {
         stream.memcpy_htod(vcp, &mut d_vc).unwrap();
         let mut d_bt = unsafe { stream.alloc::<f32>(block_tables.len()) }.unwrap();
         stream.memcpy_htod(&block_tables, &mut d_bt).unwrap();
-        let mut d_so = unsafe { stream.alloc::<u16>(scr_out_elems) }.unwrap();
-        let mut d_ss = unsafe { stream.alloc::<f32>(scr_stat_elems) }.unwrap();
-        let mut d_alibi = unsafe { stream.alloc::<u16>(1) }.unwrap();
-        let mut d_dummy = unsafe { stream.alloc::<u16>(1) }.unwrap();
+        let d_so = unsafe { stream.alloc::<u16>(scr_out_elems) }.unwrap();
+        let d_ss = unsafe { stream.alloc::<f32>(scr_stat_elems) }.unwrap();
+        let d_alibi = unsafe { stream.alloc::<u16>(1) }.unwrap();
+        let d_dummy = unsafe { stream.alloc::<u16>(1) }.unwrap();
         let (qp, kcp2, vcp2, btp, sop, ssp, alp, dmp) = (
             d_q.device_ptr(&stream).0,
             d_kc.device_ptr(&stream).0,
@@ -578,7 +578,7 @@ fn prefill_split_knhd_parity() {
             .arg(&pg)
             .arg(&hqi)
             .arg(&dmp);
-        let qchunks = (t_tokens + 63) / 64;
+        let qchunks = t_tokens.div_ceil(64);
         unsafe {
             b.launch(LaunchConfig {
                 grid_dim: ((HQ / HKV) as u32, HKV as u32, (qchunks * nparts) as u32),

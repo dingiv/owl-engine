@@ -11,7 +11,7 @@
 
 use crate::contract::{Bytes, Dtype, ModelError};
 use owl_iface::contract::Arg;
-use crate::ops::{Op, SemanticKernel};
+use crate::ops::Op;
 use crate::tensor::TensorOps;
 use std::future::Future;
 use std::pin::Pin;
@@ -115,6 +115,7 @@ where
 /// 透传臂 Reshape/SlotWrite 与父共享块 → 块归属按块计数,不按节点。
 /// scoped 结束时候选表 = 仍存活者(通常仅根外的零星),逐层收割后
 /// 图宽 = 峰值活跃集,chunk 可提至 ≥1024。)
+#[allow(clippy::type_complexity)] // 手写 boxed async fn 返回型
 pub fn eval_ops_scoped<'a, D>(
     t: &'a TensorOps,
     face: &'a mut D,
@@ -126,6 +127,7 @@ where
 }
 
 /// 带环境的 scoped 求值(EnvProvider;engine 供给)
+#[allow(clippy::type_complexity)] // 手写 boxed async fn 返回型
 pub fn eval_ops_scoped_env<'a, D>(
     t: &'a TensorOps,
     face: &'a mut D,
@@ -319,9 +321,9 @@ where
     Box::pin(_eval_node(t, ctx))
 }
 
-async fn _eval_node<'a, 'b, D>(
+async fn _eval_node<'a, D>(
     t: &'a TensorOps,
-    ctx: &'b mut EvalCtx<'a, D>,
+    ctx: &mut EvalCtx<'a, D>,
 ) -> Result<Bytes, ModelError>
 where
     D: crate::contract::DeviceClient,
@@ -477,6 +479,7 @@ where
             out
         }
         Op::SlotWrite => { ctx.track_alias(vals[0].id); vals[0].clone() }
+        #[allow(unreachable_patterns)] // 防御臂:Op 新增变体时给运行时错值而非静默
         other => return Err(ModelError::Msg(format!("eval 未覆盖: {other:?}"))),
     };
     ctx.memo.insert(t.id, out.clone());
@@ -595,6 +598,7 @@ mod liveness_tests {
 mod dtype_guard_tests {
     use super::*;
     use crate::contract::{DeviceClient, Dtype};
+    use crate::ops::SemanticKernel;
     use crate::tensor::TensorOps;
 
     /// CPU 面:f16 语义算子结构化报错(CPU 先不搞,裁决)——不许静默
