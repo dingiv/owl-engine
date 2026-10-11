@@ -81,20 +81,28 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let page = self.pool.page;
             let ctx_total = base + t;
             let nb = bt_chain.len();
+            // ⚠️ **块链可能长于「本 chunk 已覆盖页数」** —— 块表按**全 prompt**
+            // 预分配(scheduler::ensure_for_len),而本 chunk 只盖到 ctx_total。
+            // FI 三件套必须按**实际覆盖页数**截断:原式
+            // `ctx_total - nb*page + page` 在 nb 过大时下溢(debug panic)/
+            // 回绕成巨值(release → FI plan 拿着巨 last_len 越界读
+            // indices 数组外)。2026-10-13 由 gpu_longctx_fi_direct_gate
+            // 首跑暴露 —— 此前无任何测试启用 FI 面 + 多页 prefill。
+            let nb_used = ctx_total.div_ceil(page).min(nb).max(1);
             let k_fi_leaf = self.pool.kv_fi_leaves();
             let face = self.session.face_mut();
             let q_cu_b = owl_models::interpreters::eval_ops(
                 TensorOps::from_host(Dtype::U32, vec![2], &i32le(&[0, t as i32])).step(), face).await?;
             let idx_b = owl_models::interpreters::eval_ops(
-                TensorOps::from_host(Dtype::U32, vec![nb],
-                    &i32le(&bt_chain.iter().map(|&b| b as i32).collect::<Vec<_>>())).step(), face).await?;
+                TensorOps::from_host(Dtype::U32, vec![nb_used],
+                    &i32le(&bt_chain[..nb_used].iter().map(|&b| b as i32).collect::<Vec<_>>())).step(), face).await?;
             let ind_b = owl_models::interpreters::eval_ops(
-                TensorOps::from_host(Dtype::U32, vec![2], &i32le(&[0, nb as i32])).step(), face).await?;
+                TensorOps::from_host(Dtype::U32, vec![2], &i32le(&[0, nb_used as i32])).step(), face).await?;
             let ll_b = owl_models::interpreters::eval_ops(
                 TensorOps::from_host(Dtype::U32, vec![1],
-                    &i32le(&[(ctx_total - nb * page + page) as i32])).step(), face).await?;
+                    &i32le(&[(ctx_total - (nb_used - 1) * page) as i32])).step(), face).await?;
             let q_cu = TensorOps::of_block(q_cu_b.id, Dtype::U32, vec![2]);
-            let indices = TensorOps::of_block(idx_b.id, Dtype::U32, vec![nb]);
+            let indices = TensorOps::of_block(idx_b.id, Dtype::U32, vec![nb_used]);
             let indptr = TensorOps::of_block(ind_b.id, Dtype::U32, vec![2]);
             let last_len = TensorOps::of_block(ll_b.id, Dtype::U32, vec![1]);
             let (kcs, vcs): (Vec<TensorOps>, Vec<TensorOps>) =
@@ -300,7 +308,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     let face = self.session.face_mut();
                     let mut rbuf = vec![0u8; (n_tp + 1) * t * d_model * 2];
                     face.dtoh(&hfb, &mut rbuf).await?;
-                    owl_shared::file_loader::write("/tmp/owl_dflash_root.bin", &rbuf).ok();
+                    if let Err(e) = owl_shared::file_loader::write("/tmp/owl_dflash_root.bin", &rbuf) {
+                eprintln!("[dump] 落盘失败(诊断面不许静默): {e}");
+            }
                     eprintln!("[dflash-probe] concat 父块落盘 /tmp/owl_dflash_root.bin t={t}");
                 }
                 eprintln!("[dflash] prefill encode {t} rows @{} {:?}", base, ts.elapsed());

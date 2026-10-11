@@ -277,6 +277,9 @@ impl Attention {
     }
 
     /// v1 分页打分(K0 形态;alibi 槽 = K0 哑输出,树序依赖边)
+    // P6-B 将连同 v1 臂与 `vllm_paged_attention_v1_*` 四核一起删除:
+    // 现函数体首行即 panic(退役),后续实参自然未用 —— 显式 allow 免噪声
+    #[allow(unused_variables)]
     fn paged_decode_v1_k0(
         &self,
         q: &TensorOps,
@@ -297,10 +300,12 @@ impl Attention {
         // 生产由 engine 恒注入 `ctx.attn_v2`(engine.rs:452 / state.rs:301)
         // → 本臂不可达;本断言把「将来某路径忘注入 scratch」从**静默错值**
         // 改成**响错**(那天 §11.8 就是被这个静默炸给自己人埋了一轮)。
-        assert_eq!(
-            ctx.env.kv.layout,
-            crate::env::KvLayout::Classic,
-            "paged decode v1 臂无 kNHD 变体(仅 v2 有);kNHD 池必须在 \
+        // P6-A 后布局恒 kNHD(classic 已删),故本条 = **无条件响错**:
+        // 走到这里就是"某路径忘了 ctx.attn_v2"。保留了 §11.8 的教训
+        // (v1 臂无 kNHD 变体 → 静默读错元素);P6-B 会连同 v1 臂与
+        // `vllm_paged_attention_v1_*` 四核一起删除。
+        panic!(
+            "paged decode v1 臂已退役(无 kNHD 变体):kNHD 池必须在 \
              ctx.attn_v2 注入 AttnV2Scratch 走 v2 —— engine 生产路径恒注入"
         );
         let page = pol.page as i32;
@@ -1541,16 +1546,9 @@ mod f16_tests {
         // 2026-10-13 翻转:原硬编码 classic 寻址,而写核走 env 选择器
         // 已翻 kNHD → 探针自伤(A/B 两臂自洽但都偏离 G)。回读偏移必须
         // 与写核同源(env.kv.layout),否则本门测的是探针不是核。
-        let lay = crate::env::KvEnv::default().layout;
+        let _ = x;
         let vf = |pool: &[u8], t: usize, kh: usize, d: usize| -> f32 {
-            let e = match lay {
-                crate::env::KvLayout::Classic => {
-                    crate::env::KvLayout::classic_k_offset(t, kh, d, hkv, hd, page, x)
-                }
-                crate::env::KvLayout::Knhd => {
-                    crate::env::KvLayout::knhd_offset(t, kh, d, hkv, hd, page)
-                }
-            };
+            let e = crate::env::knhd_offset(t, kh, d, hkv, hd);
             let i = e * 2;
             half::f16::from_le_bytes([pool[i], pool[i + 1]]).to_f32()
         };
@@ -2138,211 +2136,10 @@ mod split_probe_tests {
     assert!(worst < 5e-2, "split attention 偏差 {worst}");
 }
 
-    // FlashInfer paged prefill 对拍(E1.5 硬门;真数据 + host 金标):
-    // 全 ctx 一次 K0-dual 灌池(classic + kHND 影子),q = 末 T token,
-    // FI causal chunked 语义 = q[i] attend [0, ctx_total-T+i]。
-    #[tokio::test]
-    async fn gpu_fi_prefill_probe() {
-        use crate::contract::DeviceClient as _;
-        if !crate::testkit::gpu_enabled() { return; }
-        // 引擎全参档(27B:24/4/256;chunk=page=32;双 chunk = 跨 chunk K0)
-        let fp8kv = owl_shared::env_reader::flag("FI_FP8");
-        let (hq, hkv, hd, page, x) = (24usize, 4usize, 256usize, 32usize, 8usize);
-        let nb = 2usize;
-        let ctx_total = nb * page;     // 64 = 两个 chunk
-        let t = 32usize;               // 末 32 token 为 q(chunk 2)
-        let ctx_base = ctx_total - t;
-        let mut gpu = crate::testkit::gpu_client().await;
-
-        // 输入(确定性伪随机;q 取末 t 行)
-        let qr: Vec<f32> = (0..t * hq * hd).map(|i| ((i * 7 % 23) as f32 - 11.0) * 0.13).collect();
-        let kr: Vec<f32> = (0..ctx_total * hkv * hd).map(|i| ((i * 11 % 19) as f32 - 9.0) * 0.17).collect();
-        let vr: Vec<f32> = (0..ctx_total * hkv * hd).map(|i| ((i * 13 % 17) as f32 - 8.0) * 0.19).collect();
-        let halfb = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect() };
-        let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
-        let i32b = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
-
-        let q = TensorOps::from_host(Dtype::F16, vec![t, hq * hd], &halfb(&qr));
-        let k_all = TensorOps::from_host(Dtype::F16, vec![ctx_total, hkv * hd], &halfb(&kr));
-        let v_all = TensorOps::from_host(Dtype::F16, vec![ctx_total, hkv * hd], &halfb(&vr));
-        let kc = crate::interpreters::eval_ops(
-            TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd / x, page, x]).step(), &mut gpu).await.unwrap();
-        let vc = crate::interpreters::eval_ops(
-            TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd, page]).step(), &mut gpu).await.unwrap();
-        let kc_t = TensorOps::of_block(kc.id, Dtype::F16, vec![nb, hkv, hd / x, page, x]);
-        let vc_t = TensorOps::of_block(vc.id, Dtype::F16, vec![nb, hkv, hd, page]);
-        let (kfi, vfi, kfi_t, vfi_t) = if fp8kv {
-            // e4m3 字节池(U32 承载:elems = bytes/4)
-            let n_u32 = nb * page * hkv * hd / 4;
-            let kf = crate::interpreters::eval_ops(
-                TensorOps::zeros(Dtype::U32, vec![n_u32]).step(), &mut gpu).await.unwrap();
-            let vf = crate::interpreters::eval_ops(
-                TensorOps::zeros(Dtype::U32, vec![n_u32]).step(), &mut gpu).await.unwrap();
-            (
-                kf.clone(),
-                vf.clone(),
-                TensorOps::of_block(kf.id, Dtype::U32, vec![n_u32]),
-                TensorOps::of_block(vf.id, Dtype::U32, vec![n_u32]),
-            )
-        } else {
-            let kf = crate::interpreters::eval_ops(
-                TensorOps::zeros(Dtype::F16, vec![nb, page, hkv, hd]).step(), &mut gpu).await.unwrap();
-            let vf = crate::interpreters::eval_ops(
-                TensorOps::zeros(Dtype::F16, vec![nb, page, hkv, hd]).step(), &mut gpu).await.unwrap();
-            (
-                kf.clone(),
-                vf.clone(),
-                TensorOps::of_block(kf.id, Dtype::F16, vec![nb, page, hkv, hd]),
-                TensorOps::of_block(vf.id, Dtype::F16, vec![nb, page, hkv, hd]),
-            )
-        };
-
-        // K0-dual:全 ctx 一次灌池(slots = 0..ctx_total;恒等页表)
-        let slots = TensorOps::from_host(Dtype::F32, vec![ctx_total], &f32b(&(0..ctx_total).map(|i| i as f32).collect::<Vec<_>>()));
-        let k0 = TensorOps::call(SemanticKernel::K0Dual).aux(&[ctx_total])
-            .arg(&k_all).arg(&v_all)
-            .arg(&kc_t).arg(&vc_t).arg(&kfi_t).arg(&vfi_t)
-            .arg(&slots)
-            .arg_i32((hkv * hd) as i32).arg_i32((hkv * hd) as i32)
-            .arg_i32(hkv as i32).arg_i32(hd as i32).arg_i32(page as i32).arg_i32(x as i32)
-            .with_shape(Dtype::F16, vec![1]);
-        let _ = crate::interpreters::eval_ops(k0.step(), &mut gpu).await.unwrap();
-        if !fp8kv {
-            // 影子池取证(观测窗内:k0 eval 后立即读;kNHD [nb, page, hkv, hd];
-            // K0-dual 写入与 FI 消费双把关;fp8 = e4m3 字节池,金标换算另案)
-            use crate::contract::DeviceClient as _;
-            let n1 = ctx_total * hkv * hd;
-            let mut kb = vec![0u8; n1 * 2];
-            gpu.dtoh(&kfi, &mut kb).await.expect("kfi dtoh");
-            let mut vb = vec![0u8; n1 * 2];
-            gpu.dtoh(&vfi, &mut vb).await.expect("vfi dtoh");
-            let hf = |b: &[u8], i: usize| half::f16::from_le_bytes([b[i * 2], b[i * 2 + 1]]).to_f32();
-            let mut wk = 0f32; let mut wv = 0f32; let mut nz_v = 0usize;
-            for tok in 0..ctx_total {
-                for hh in 0..hkv {
-                    for d in 0..hd {
-                        let off = tok * hkv * hd + hh * hd + d;
-                        wk = wk.max((hf(&kb, off) - kr[off]).abs());
-                        wv = wv.max((hf(&vb, off) - vr[off]).abs());
-                        if vb[off * 2..] != [0, 0] { nz_v += 1; }
-                    }
-                }
-            }
-            eprintln!("[fi-probe] 影子池对照:kfi worst {wk:.5} / vfi worst {wv:.5} / vfi 非零 {nz_v}/{}", n1);
-        }
-
-        // FI 表四件套(i32;预物化块 + of_block 引用,杀 from_host 时序变量)
-        let q_cu_b = crate::interpreters::eval_ops(
-            TensorOps::from_host(Dtype::U32, vec![2], &i32b(&[0, t as i32])).step(), &mut gpu).await.unwrap();
-        let idx_b = crate::interpreters::eval_ops(
-            TensorOps::from_host(Dtype::U32, vec![nb], &i32b(&(0..nb as i32).collect::<Vec<_>>())).step(), &mut gpu).await.unwrap();
-        let ind_b = crate::interpreters::eval_ops(
-            TensorOps::from_host(Dtype::U32, vec![2], &i32b(&[0, nb as i32])).step(), &mut gpu).await.unwrap();
-        let ll_b = crate::interpreters::eval_ops(
-            TensorOps::from_host(Dtype::U32, vec![1],
-                &i32b(&[(ctx_total - (ctx_total.div_ceil(page) - 1) * page) as i32])).step(), &mut gpu).await.unwrap();
-        let q_cu = TensorOps::of_block(q_cu_b.id, Dtype::U32, vec![2]);
-        let indices = TensorOps::of_block(idx_b.id, Dtype::U32, vec![nb]);
-        let indptr = TensorOps::of_block(ind_b.id, Dtype::U32, vec![2]);
-        let last_len = TensorOps::of_block(ll_b.id, Dtype::U32, vec![1]);
-
-        // FI 虚拟核(生产同款槽序;wr 依赖边 = 已完成的 k0)
-        let wr = TensorOps::call(if fp8kv { SemanticKernel::K0DualFp8kv } else { SemanticKernel::K0Dual })
-            .aux(&[ctx_total])
-            .arg(&k_all).arg(&v_all).arg(&kc_t).arg(&vc_t).arg(&kfi_t).arg(&vfi_t).arg(&slots)
-            .arg_i32((hkv * hd) as i32).arg_i32((hkv * hd) as i32)
-            .arg_i32(hkv as i32).arg_i32(hd as i32).arg_i32(page as i32).arg_i32(x as i32)
-            .with_shape(Dtype::F16, vec![1]);
-        let y = TensorOps::call(if fp8kv {
-            SemanticKernel::FiPrefillFp8kv
-        } else {
-            SemanticKernel::FiPrefill
-        })
-        .arg(&q).arg(&kfi_t).arg(&vfi_t)
-        .arg(&q_cu).arg(&indices).arg(&indptr).arg(&last_len)
-        .arg(&wr)
-        .arg_usize(t).arg_usize(ctx_total).arg_usize(t)
-        .arg_usize(hq).arg_usize(hkv).arg_usize(hd).arg_usize(page)
-        .arg_usize(fi_scale_bits(hd) as usize)
-        .with_shape(Dtype::F16, vec![t, hq * hd]);
-        let got = crate::testkit::harvest_f16(&mut gpu, &y).await;
-                gpu.close().await.expect("close");
-
-        // host 金标:q[i](绝对 ctx_base+i)attend kv[0..=ctx_base+i]
-        let hf = |b: &[u8], i: usize| half::f16::from_le_bytes([b[i * 2], b[i * 2 + 1]]).to_f32();
-        let kb = halfb(&kr); let vb = halfb(&vr); let qb = halfb(&qr);
-        let scale = 1.0 / (hd as f32).sqrt();
-        let mut worst = 0f32;
-        for tok in 0..t {
-            let abs = ctx_base + tok;
-            for h in 0..hq {
-                let kvh = h / (hq / hkv); // GQA:q 头 → kv 头
-                let mut m = f32::MIN; let mut scores = vec![0f32; abs + 1];
-                for kt in 0..=abs {
-                    let mut dot = 0f32;
-                    for d in 0..hd {
-                        dot += hf(&qb, (tok * hq + h) * hd + d)
-                            * hf(&kb, kt * hkv * hd + kvh * hd + d);
-                    }
-                    let s = dot * scale; scores[kt] = s; m = m.max(s);
-                }
-                let mut l = 0f32;
-                for kt in 0..=abs { scores[kt] = (scores[kt] - m).exp(); l += scores[kt]; }
-                for d in 0..hd {
-                    let mut acc = 0f32;
-                    for kt in 0..=abs { acc += scores[kt] * hf(&vb, kt * hkv * hd + kvh * hd + d); }
-                    let want = half::f16::from_f32(acc / l).to_f32();
-                    let got_v = got[(tok * hq + h) * hd + d];
-                    worst = worst.max((want - got_v).abs());
-                }
-            }
-        }
-        // 分 token/head 偏差分布(定位用)
-        let mut per_tok = vec![0f32; t];
-        for tok in 0..t {
-            let abs = ctx_base + tok;
-            for h in 0..hq {
-                let mut m = f32::MIN; let mut sc = vec![0f32; abs + 1];
-                for kt in 0..=abs {
-                    let mut dot = 0f32;
-                    for d in 0..hd { dot += hf(&qb, (tok*hq+h)*hd + d) * hf(&kb, kt*hd + d); }
-                    let sv = dot * scale; sc[kt] = sv; m = m.max(sv);
-                }
-                let mut l = 0f32;
-                for kt in 0..=abs { sc[kt] = (sc[kt] - m).exp(); l += sc[kt]; }
-                for d in 0..hd {
-                    let mut acc = 0f32;
-                    for kt in 0..=abs { acc += sc[kt] * hf(&vb, kt*hd + d); }
-                    let want = half::f16::from_f32(acc / l).to_f32();
-                    let got_v = got[(tok*hq+h)*hd + d];
-                    per_tok[tok] = per_tok[tok].max((want - got_v).abs());
-                }
-            }
-        }
-        let pairs: Vec<String> = (0..6).map(|d| {
-            let abs = ctx_base; let mut m = f32::MIN; let mut sc = vec![0f32; abs+1];
-            for kt in 0..=abs { let mut dot = 0f32; for dd in 0..hd { dot += hf(&qb, dd) * hf(&kb, kt*hd + dd); } let sv = dot*scale; sc[kt]=sv; m=m.max(sv); }
-            let mut l = 0f32; for kt in 0..=abs { sc[kt]=(sc[kt]-m).exp(); l+=sc[kt]; }
-            let mut acc = 0f32; for kt in 0..=abs { acc += sc[kt]*hf(&vb, kt*hd+d); }
-            format!("{}: got={:.5} want={:.5}", d, got[d], acc/l)
-        }).collect();
-        eprintln!("[fi-probe] t0h0[0..6] {:?}", pairs);
-        // 对照:got 的 t0 行是否更接近「无 scale」或「2× scale」?
-        for cand in [0.03125f32, 0.0625, 0.125] {
-            let mut w = 0f32;
-            for d in 0..hd {
-                let abs = ctx_base; let mut m = f32::MIN; let mut sc = vec![0f32; abs+1];
-                for kt in 0..=abs { let mut dot = 0f32; for dd in 0..hd { dot += hf(&qb, dd) * hf(&kb, kt*hd+dd); } let sv = dot*cand; sc[kt]=sv; m=m.max(sv); }
-                let mut l = 0f32; for kt in 0..=abs { sc[kt]=(sc[kt]-m).exp(); l+=sc[kt]; }
-                let mut acc = 0f32; for kt in 0..=abs { acc += sc[kt]*hf(&vb, kt*hd+d); }
-                w = w.max((got[d] - acc/l).abs());
-            }
-            eprintln!("[fi-probe] scale={cand} → t0 worst {w:.4}");
-        }
-        eprintln!("[fi-probe] worst |dev| = {worst:.4}");
-        let tol = if fp8kv { 9e-2 } else { 5e-2 }; // e4m3 KV 量化噪声(实测 ~0.05-0.08)
-        assert!(worst < tol, "FlashInfer prefill 偏差 {worst}(fp8kv={fp8kv})");
-        // 双断言:K0-dual 影子写入与 FI 消费各自把关(见影子池对照打印)
-    }
+    // (退役)`gpu_fi_prefill_probe` —— E1.5 期的 FI 隔离探针,建在
+    // **K0-dual(classic + 影子双写)** 之上;统一契约 P3 删影子池后该姿势已
+    // 不代表生产,且它是 K0-dual 核的唯一产品侧用户(P6-D 一并退役)。
+    // FI 正确性现由**端到端门**覆盖:`engine::tests::gpu_longctx_fi_direct_gate`
+    // (裸 LM + 补全式探针 + 同 dtype 只切读核 → 逐字一致)+ FI 清单门。
 
 }

@@ -16,7 +16,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let mut mtp_table = std::mem::take(&mut s.mtp_block_table);
             self.blocks_mtp.release_table(&mut mtp_table);
         }
-        self.sessions.close(session_id).ok();
+        // 关闭失败 = 块表/格归还失败:不许静默(律 #1)
+        if let Err(e) = self.sessions.close(session_id) {
+            eprintln!("[session] 临时会话 #{session_id} 关闭失败: {e}");
+        }
     }
     pub async fn abandon(&mut self, err: String) -> TurnEvent {
         let turn_id = self.active.as_ref().map(|a| a.id).unwrap_or(0);
@@ -29,7 +32,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         TurnEvent::Failed { turn: turn_id, err }
     }
 
-    pub(crate) async fn complete(&mut self) -> Result<TurnEvent> {
+    pub(crate) async fn complete(&mut self, reason: crate::turn::FinishReason) -> Result<TurnEvent> {
         let act = self.active.take().expect("active");
         // 取证(B6.3 后泄漏案):每 turn 设备余量打点(free 账由 cuda 侧 dtoh
         // 收割刷新;泄漏 = 线性下降)
@@ -51,6 +54,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             self.burn_ephemeral(act.session_id);
         }
         let text = self.tok.decode(&act.out);
-        Ok(TurnEvent::Completed { turn: act.id, text })
+        Ok(TurnEvent::Completed { turn: act.id, text, finish: reason })
     }
 }

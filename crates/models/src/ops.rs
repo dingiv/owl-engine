@@ -84,10 +84,6 @@ pub enum SemanticKernel {
     K0WriteFp8Bf16,
     K0WriteKnhd,
     K0WriteFp8Knhd,
-    /// K0 双写(classic + kNHD 影子;aux = [tokens])
-    K0Dual,
-    /// K0 双写 e4m3 影子
-    K0DualFp8kv,
     /// 分页 decode v1(aux = [hd, hq, hkv, nb])
     PagedDecode,
     /// v2 分页 decode 在线 softmax 主核(分块 PARTITION=512;aux =
@@ -200,8 +196,6 @@ impl SemanticKernel {
             SemanticKernel::K0WriteFp8Knhd => "attn.k0_write_fp8_knhd",
             SemanticKernel::K0WriteFp8 => "attn.k0_write_fp8",
             SemanticKernel::K0WriteFp8Bf16 => "attn.k0_write_fp8_bf16",
-            SemanticKernel::K0Dual => "attn.k0_dual",
-            SemanticKernel::K0DualFp8kv => "attn.k0_dual_fp8kv",
             SemanticKernel::PagedDecode => "attn.paged_decode",
             SemanticKernel::PagedDecodeV2 => "attn.paged_decode_v2",
             SemanticKernel::PagedDecodeV2Seq => "attn.paged_decode_v2_seq",

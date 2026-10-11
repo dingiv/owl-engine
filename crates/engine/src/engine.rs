@@ -271,7 +271,11 @@ impl<D: DeviceClient + 'static> Engine<D> {
             env.hw = owl_models::env::HwEnv::Cuda(oe.hw.arch);
         }
         env.quant = loaded.quant_plan;
+        // FI 面启用(量化恒 = 主池;影子池已删,本值只作"启用 + 池量化"携带)
+        // FI 面启用条件 = **能力条件**(f16 池 + paged 页表),不是开关:
+        // 2026-10-13 起配置面无 flashinfer 选项,FI 恒启用(env.attn.fi 仅门/诊断用)
         let fi_quant = if env.attn.fi
+            && env.kv.paged
             && loaded.spec.dtype == owl_models::tensor::Dtype::F16
         {
             Some(env.kv.quant)
@@ -362,7 +366,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
             seq_tokens: s,
             pool_tokens,
             kv: env.kv.quant,
-            fi: fi_quant,
+            fi_quant,
             draft_kv: if self.cfg.knobs.draft.kv_quant == owl_models::env::KvQuant::Fp8E4M3 {
                 owl_models::env::KvQuant::Fp8E4M3
             } else {
@@ -379,8 +383,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
         let pool = StatePool::alloc(&mut self.face, dims, &loaded.spec.layer_types, &plan).await?;
         if fi_quant.is_some() {
             eprintln!(
-                "[boot] FlashInfer prefill 面启用(影子池 ×{},quant={:?})",
-                pool.fi_face as usize,
+                "[boot] FlashInfer prefill 面启用(FI 直读主池 kNHD 单池;quant={:?})",
                 fi_quant.unwrap()
             );
         }
@@ -887,7 +890,12 @@ impl<D: DeviceClient + 'static> Engine<D> {
                 let dd = dims;
                 let key_dim = dims.nk * dims.hk;
                 let value_dim = dims.nv * dims.hv;
+                // 链步 decode 读核 scratch(seqs=1;与 draft.rs eager 路同源):
+                // kNHD 池落 v1 = 布局错位 → 草稿垃圾(2026-10-13 守卫捕获)
+                let attn_v2_pool = pool.attn_v2_scratch();
                 for m in 0..=spec_depth {
+                    // move 闭包逐个消耗 → 每轮取一份克隆
+                    let attn_v2_p = attn_v2_pool.clone();
                     let m1 = m + 1;
                     let model_p = Arc::clone(&loaded.model);
                     let mtp = std::sync::Arc::clone(mtp);
@@ -963,6 +971,8 @@ impl<D: DeviceClient + 'static> Engine<D> {
                                 &rp_p,
                                 vocab,
                                 env_p,
+                                // 图步链读核也走 v2(同 draft.rs:kNHD 池落 v1 = 错位)
+                                attn_v2_p.clone(),
                             );
                             sc.output("drafts", &droot)
                         },

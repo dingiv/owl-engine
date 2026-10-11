@@ -57,7 +57,7 @@ async fn main() {
                 use std::io::Write;
                 std::io::stdout().flush().ok();
             }
-            TurnEvent::Completed { turn, text } => {
+            TurnEvent::Completed { turn, text, .. } => {
                 println!("\n[gen] t{turn} 完成: {text}");
             }
             TurnEvent::Failed { turn, err } => {

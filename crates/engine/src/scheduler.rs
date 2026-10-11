@@ -164,12 +164,14 @@ impl<D: DeviceClient> RunningEngine<D> {
                 restore_key,
                 reset_gdn: cached_len == 0,
             });
+            let ignore_eos = turn.spec.ignore_eos;
             self.active = Some(crate::running::ActiveTurn {
                 id: turn.id,
                 session_id: turn.session_id,
                 ephemeral: turn.ephemeral,
                 prompt_ids: turn.prompt_ids,
                 max_new: turn.spec.max_new,
+                ignore_eos,
                 out: Vec::new(),
                 fed: cached_len,
                 decoded: String::new(),

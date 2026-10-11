@@ -8,6 +8,11 @@ fn main() {
         chat: ChatFormat {
             prefix: "<|im_start|>system\nReasoning effort is set to medium. Think through the task at a moderate depth: cover the key steps and verify the result, but keep the reasoning concise.<|im_end|>\n<|im_start|>user\n".into(),
             suffix: "<|im_end|>\n<|im_start|>assistant\n<think>\n".into(),
+            // 2026-10-13 补齐(多轮模板字段;取值同 specs/qwen35.rs 的规范档)
+            im_open: "<|im_start|>".into(),
+            im_close: "<|im_end|>\n".into(),
+            assistant_open: "<|im_start|>assistant\n".into(),
+            think_prefill: "<think>\n".into(),
         },
     };
     let tok = Tokenizer::from_spec(&dir, &spec).expect("tokenizer");

@@ -21,6 +21,20 @@ pub struct TurnSpec {
     pub prompt: String,
     /// 生成 token 上限(不含 prompt)
     pub max_new: usize,
+    /// OpenAI 兼容 `ignore_eos`:true = 忽略 EOS 强制跑满 `max_new`
+    /// (2026-10-13 落地)。**用途 = 测速口径**:decode 吞吐必须在不被
+    /// "模型想不想说话"干扰的足量生成上测(词汤 OOD 输入下模型常吐
+    /// 2 token 就 EOS → 旧口径读数是伪影,见坑册 §23/§24)
+    pub ignore_eos: bool,
+}
+
+/// turn 终了原因(OpenAI `finish_reason` 真源)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FinishReason {
+    /// 模型自吐 EOS(自然停)
+    Stop,
+    /// 触到 max_new 预算(含 ignore_eos 强制跑满)
+    Length,
 }
 
 /// 步级事件(pump 回吐;前端按此流式渲染)。**每 pump 必得一事件**
@@ -35,8 +49,8 @@ pub enum TurnEvent {
     /// 采样步产出一个 token(delta = 解码后文本增量;多字节字符跨
     /// token 由全量重解差分兜住)
     Token { turn: u64, delta: String },
-    /// turn 终了(eos 命中或预算尽;text = 生成全文,eos 不入文)
-    Completed { turn: u64, text: String },
+    /// turn 终了(text = 生成全文,eos 不入文;finish = 终了原因)
+    Completed { turn: u64, text: String, finish: FinishReason },
     /// turn 失败(槽/执行错误;槽已释放,队列继续)
     Failed { turn: u64, err: String },
 }

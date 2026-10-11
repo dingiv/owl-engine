@@ -48,7 +48,8 @@
 //! | sampling | temp / topk / topp / rep_penalty | 1.0 / 20 / 0.95 / 1.15 |
 //! | load | verify / debug_tap | flag / false |
 //! | dispatch | qkv_fuse / gdn_fused_decode / gdn_fused_decode_v2 | bool / 全真(**正语义**) |
-//! | dispatch | prefill_split / force_naive / flashinfer | flag / false |
+//! | dispatch | prefill_split / force_naive | flag / false |
+//! | dispatch | ~~flashinfer~~ | **已移除(2026-10-13):FI 恒启用,无开关** |
 //! | dispatch | gdn_chunked / gdn_scalar / kv_fp8 | flag / false |
 //! | dispatch | resolve_trace / host_argmax / ts_probe | flag / false |
 //! | probes | step_profile / gdn_dump / debug / prefill_cksum / fact_probe | flag / false |
@@ -226,7 +227,6 @@ pub struct DispatchCfg {
     pub prefill_split: bool,
     pub force_naive_prefill: bool,
     /// FlashInfer prefill 面
-    pub flashinfer: bool,
     pub gdn_chunked: bool,
     pub gdn_scalar: bool,
     /// GDN decode 融合 D1(缺省真)
@@ -385,7 +385,6 @@ impl Default for DispatchCfg {
             qkv_fuse: true,
             prefill_split: false,
             force_naive_prefill: false,
-            flashinfer: false,
             gdn_chunked: false,
             gdn_scalar: false,
             gdn_fused_decode: true,
@@ -465,13 +464,26 @@ kind = "awq27b"
 head_quant = "rtn-int4-g32"
 
 [runtime]
-max_seq = 2560
+# 2026-10-13 重定档(影子池时代旧值 = 2560/池 4352):单池 + FI 直读后
+# 内存不再是约束 —— 实测 vram 治理 `fixed_after=0.68G budget=4.66G
+# per_tok=53248B → 池上限 94024 tok`(fp8 目标池 32KB/tok + DFlash2
+# bf16 草稿池 20KB/tok)。故**池值现为产品选择而非内存必需**:
+# 取 16k ctx(相对旧档 6.4×),实测代价 ~2.5% prefill、~0.5% decode
+# (池/nparts 9472/19 → 16896/33 的 A/B)。
+max_seq = 16384
 
 [spec]
 depth = 7
 
+[server]
+# 单会话语义:GDN 格锁 1 → 并发闸门必须 ≤1(启动 fail-fast 校验
+# gdn_slots ≥ max_concurrency)。2026-10-13 实测:本档原**缺此项** →
+# `--flavor spec-dflash` 独立起不来(此前 e2e/bench 各自在配置文件里
+# 覆盖了 gdn_slots=8 才蒙混过去)。多会话档 = 这里改 8 + gdn_slots=8。
+max_concurrency = 1
+
 [pool]
-pool_tokens = 4352
+pool_tokens = 16896   # = ceil(16384/page)+slack(页 32;528 页;≈0.9G)
 vram_target = 0.99
 vram_reserve_mb = 512
 gdn_slots = 1
@@ -491,12 +503,11 @@ mode = "greedy"
 "#,
     ),
     (
-        // FlashInfer prefill + fp8 KV 池(E1.5/E2 面;f16+paged 才有意义,
-        // kind 锁 0.8b 基线 —— 27B FI 面挂账):prefill 1102@8192 实测档
+        // fp8 KV 池档(2026-10-13:FlashInfer **恒启用**,故本档只剩 fp8 KV
+        // 这一维;原"FI 开关 + 27B FI 面挂账"随开关移除一并作废)
         "fi-kv8",
         r#"
 [dispatch]
-flashinfer = true
 kv_fp8 = true
 "#,
     ),

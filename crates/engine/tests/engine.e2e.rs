@@ -125,6 +125,7 @@ async fn e2e_body() {
     run!(gpu_schedule_decision_surface); // max_seq=64/chunk=4(切块敏感)
     run!(gpu_gdn_slot_cross_probe);   // gdn_slots=2 + prefix_cache=false
     run!(gpu_08b_fuse_text_parity);   // greedy + fused_decode 臂
+    run!(gpu_longctx_fi_direct_gate); // fp8 池 × {FI 直读, 自研读核}(自装载两回)
 
     // ── 0.8B W4A16 装载臂(另一装载器) ──
     run!(gpu_w4a16_marlin_e2e);

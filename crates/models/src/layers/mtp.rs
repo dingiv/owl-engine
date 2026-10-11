@@ -117,6 +117,7 @@ impl MtpPredictor {
         pos_t: &[TensorOps],
         vocab: usize,
         env: crate::env::EnvProvider,
+        attn_v2: Option<crate::module::AttnV2Scratch>,
     ) -> TensorOps {
         assert_eq!(mtp_kvs.len(), k, "mtp 链缓冲数 = k");
         assert_eq!(pos_t.len(), k, "pos 表数 = k");
@@ -126,6 +127,13 @@ impl MtpPredictor {
         for i in 0..k {
             let mut ctx = ForwardCtx::decode(1, &pos_t[i], &mtp_kvs[i], rope);
             ctx.env = env;
+            // ⚠️ **链步 decode 读核必须跟 env 布局**(2026-10-13):草稿池
+            // 由 env 驱动的写核(fused_insert/k0_write 的 *_knhd 变体)写,
+            // 读侧若拿不到 v2 scratch 就会落到 **v1(classic 取址)**
+            // ↠ 与池布局错位 → 草稿全垃圾(规格兑现为零且静默,
+            // 27B MTP 恒等门以前只查最终文本故未暴露;
+            // 由 `attention.rs::paged_decode_v1_k0` 的布局守卫当场捕获)。
+            ctx.attn_v2 = attn_v2.clone();
             let emb = embed.embed(&tok, 1);
             let out = self.forward_step(&emb, &h, &ctx);
             let logits = embed.lm_head_matmul(&out);
@@ -163,6 +171,7 @@ impl MtpPredictor {
         rope: &Rope,
         vocab: usize,
         env: crate::env::EnvProvider,
+        attn_v2: Option<crate::module::AttnV2Scratch>,
     ) -> TensorOps {
         let m1 = tokens.shape[0];
         assert_eq!(hiddens.shape[0], m1, "extend 行数 = token 数");
@@ -185,6 +194,7 @@ impl MtpPredictor {
         for (pos_t, kv) in chain {
             let mut c = crate::module::ForwardCtx::decode(1, pos_t, kv, rope);
             c.env = env;
+            c.attn_v2 = attn_v2.clone(); // 链步读核同 propose(布局守卫点)
             let emb = embed.embed(&tok, 1);
             let out = self.forward_step(&emb, &h, &c);
             let lg = embed.lm_head_matmul(&out);
@@ -464,6 +474,7 @@ mod wiring_tests {
         let drafts = mtp.propose(
             &anchor_token, &anchor_hidden, 3, &embed, &rope, &kvs, &pos_t, vocab,
             crate::env::EnvProvider::default(),
+            None,
         );
         let got = harvest_drafts(&mut gpu, &drafts).await;
         assert_eq!(got.len(), 3, "草稿数");

@@ -41,10 +41,12 @@ pub fn kv_manifest_gate(
         "owl_naive_attn_nc_f16",                         // 草稿池 f16 NC(classic 岛,D5)
         "owl_naive_attn_nc_bf16",                        // 草稿池 bf16 NC(classic 岛,D5)
     ];
-    // 注(kv布局统一契约 2026-10-13 翻转):主池条目已从 classic 名换成
-    // kNHD 名(布局单源 = KvEnv.layout);影子双写核 `owl_reshape_and_cache_dual_*`
-    // 随影子池删除退出本清单(核本体待 P5/P6 清场)。草稿池按 D5 独立留 classic,
-    // 其写核(硬编码 K0Write)+ 读核(NaiveAttnNc)自成闭环不入 kNHD 列。
+    // 注(统一契约 P6-A/D,2026-10-13):主池 = **kNHD 单布局**(KvLayout 枚举
+    // 与 classic 偏移数学已删),故本清单只列 kNHD 名;影子双写核
+    // `owl_reshape_and_cache_dual_*` 与 K0-dual 语义**已整体退役**(核 + 登记
+    // 表 + driver 臂 + FI 隔离探针全删;FI 正确性改由 engine e2e
+    // `gpu_longctx_fi_direct_gate` 覆盖)。草稿池(P6-C 待翻)暂留 classic 岛,
+    // 其写核(硬编码 K0Write)+ 读核(NaiveAttnNc)自成闭环。
     let family: Vec<&str> = match quant {
         crate::env::KvQuant::Fp8E4M3 => fp8.to_vec(),
         crate::env::KvQuant::None => f16.to_vec(),

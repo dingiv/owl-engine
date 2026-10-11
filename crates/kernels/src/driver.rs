@@ -150,8 +150,6 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "attn.k0_write_knhd" => attn::k0_write_knhd(dt, ax(0)),
         "attn.k0_write_fp8_knhd" => attn::k0_write_fp8_knhd(ax(0)),
         "attn.k0_write_fp8_bf16" => attn::k0_write_fp8_bf16(ax(0)), // B6:bf16 入 → e4m3 池
-        "attn.k0_dual" => attn::k0_dual(ax(0)),
-        "attn.k0_dual_fp8kv" => attn::k0_dual_fp8kv(ax(0)),
         "attn.paged_decode" => attn::paged_decode_v1(req.env, dt, ax(0), ax(1), ax(2), ax(3)), // aux = [hd, hq, hkv, nb]
         "attn.paged_decode_v2" => {
             // aux = [hd, hq, hkv, nb, nparts];页配对律同 v1(谓词单源)
@@ -698,22 +696,6 @@ pub mod attn {
             other => panic!("chunked fp8 knhd 仅 hd∈{{128,256}},得 {other}"),
         };
         p
-    }
-
-    /// K0-dual(FlashInfer 配套;classic K/V + kNHD K/V 影子一次发射)
-    pub fn k0_dual(tokens: usize) -> KernelPick {
-        KernelPick {
-            name: "owl_reshape_and_cache_dual_f16",
-            shape: Shape { grid: (tokens as u32, 1, 1), block: (256, 1, 1), smem: 0 },
-        }
-    }
-
-    /// K0-dual fp8 KV(K/V 影子写 e4m3;classic f16 照写)
-    pub fn k0_dual_fp8kv(tokens: usize) -> KernelPick {
-        KernelPick {
-            name: "owl_reshape_and_cache_dual_f16_fp8kv",
-            shape: Shape { grid: (tokens as u32, 1, 1), block: (256, 1, 1), smem: 0 },
-        }
     }
 
     /// 页配对谓词(decode;声明期门控用 —— 执行期 resolve 同律 panic,

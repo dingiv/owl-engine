@@ -91,7 +91,8 @@ pub struct ForwardCtx<'a> {
     /// prefill:chunk 绝对起点(块首 token 的绝对 pos;split attention 的
     /// partition 网格声明需要 max_ctx = ctx_base + tokens;builder 缺省 0)
     pub ctx_base: usize,
-    /// FlashInfer prefill 面(None = 走旧分派;engine 按 env.attn.fi 注入)
+    /// FlashInfer prefill 面(**FI 恒启用**,engine 按池 dtype/paged 注入;
+    /// None = 该轮不走 FI(非 paged 池 / 非 f16 / 小 chunk < FI_MIN_TOKENS))
     pub fi: Option<FiPrefillCtx<'a>>,
     /// 本层注意力序号(layer_ctx 派生;fi 影子切片下标)
     pub fi_kvi: usize,

@@ -489,14 +489,23 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let mut evq = std::collections::VecDeque::new();
         for &t in &toks {
             let ev = self.sample_and_emit(t).await?;
-            let done = matches!(ev, TurnEvent::Completed { .. });
+            // 预算尽的末 token 走 Token + pending Completed(见 phases)——
+            // 故 active 已尽也算 done,余段作废
+            let done = matches!(ev, TurnEvent::Completed { .. }) || self.active.is_none();
             evq.push_back(ev);
             if done {
                 break; // eos/预算:余段作废
             }
         }
         mrec("spec.emit", ts.elapsed());
-        self.pending_events = evq;
+        // ⚠️ **不许覆盖**:预算尽时 `sample_and_emit` 已把终态 Completed 压入
+        // 本队列(它同时返回 Token),直接赋值 = 丢掉 Completed → actor 永不
+        // 派发终态 → handler 卡在 recv → 客户端一帧不收且不 EOF(2026-10-13
+        // 定谳:spec 档 + 跑满预算的请求挂死,**与流式无关**)。
+        // 序:本轮 Token… 之后接终态事件。
+        let mut merged = evq;
+        merged.append(&mut self.pending_events);
+        self.pending_events = merged;
         // E5-M5:spec 分相落账(/debug/metrics;与 spec_stats 同源双面)
         let t_all = t_round.elapsed();
         mrec("spec.round", t_all);

@@ -27,7 +27,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 草稿池寻址一律经 StatePool 权威(slot≥1 案配套;分派点零推槽)
         use crate::state::StatePool as SP;
         let slot_at = |p: usize| SP::draft_prefix_slot(p);
-        let _ = page;
         let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
         let tokens_f: Vec<f32> = (0..8)
             .map(|i| if i == 0 { bonus as f32 } else { owl_models::layers::dflash2::MASK_TOKEN_ID as f32 })
@@ -64,6 +63,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if prof {
             let t2 = std::time::Instant::now();
             pg.replay().await?;
+            // 失败已 `?` 上报;成功值此处不需要(仅为同步点)
             let _ = pg.read_output_f32("drafts").await?;
             eprintln!("[dflash-prof] pure_gpu={:?}", t2.elapsed());
         }
@@ -108,7 +108,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let s = self.sessions.get(act.session_id).expect("账在");
             (s.block_table.clone(), s.gdn_slot)
         };
-        let _ = bt_chain;
         let page = self.pool.page;
         let leaves = self.pool.dflash_kv_leaves().expect("dflash 池");
         let bt = self.pool.bt_leaf_flat();
@@ -150,7 +149,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let n: usize = memory.shape().iter().product();
             let mut buf = vec![0u8; n * 2];
             face.dtoh(&outs[0], &mut buf).await?;
-            owl_shared::file_loader::write("/tmp/owl_dflash_mem.bin", &buf).ok();
+            if let Err(e) = owl_shared::file_loader::write("/tmp/owl_dflash_mem.bin", &buf) {
+                eprintln!("[dump] 落盘失败(诊断面不许静默): {e}");
+            }
             eprintln!("[dflash-probe] memory 落盘 /tmp/owl_dflash_mem.bin t={t}");
         }
         Ok(())
@@ -250,7 +251,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 face.dtoh(&kb, &mut kbuf).await?;
             }
             if pos <= 18 {
-                owl_shared::file_loader::write("/tmp/owl_dflash_kpool.bin", &kbuf).ok();
+                if let Err(e) = owl_shared::file_loader::write("/tmp/owl_dflash_kpool.bin", &kbuf) {
+                eprintln!("[dump] 落盘失败(诊断面不许静默): {e}");
+            }
                 eprintln!("[dflash-probe] 草稿 K 池首块落盘 /tmp/owl_dflash_kpool.bin pos={pos}");
             }
             for r in 0..nrow {
@@ -292,21 +295,26 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 let n: usize = r.shape().iter().product();
                 let mut blk = vec![0u8; n * 2];
                 face.dtoh(&b, &mut blk).await?;
-                owl_shared::file_loader::write(format!("/tmp/owl_p{i}.bin"), &blk).ok();
+                if let Err(e) = owl_shared::file_loader::write(format!("/tmp/owl_p{i}.bin"), &blk) {
+                eprintln!("[dump] 落盘失败(诊断面不许静默): {e}");
+            }
             }
             let face = self.session.face_mut();
             let b = owl_models::interpreters::eval_ops(hidden.step(), face).await?;
             let n: usize = hidden.shape().iter().product();
             let mut hbuf = vec![0u8; n * 2];
             face.dtoh(&b, &mut hbuf).await?;
-            owl_shared::file_loader::write("/tmp/owl_dflash_hid.bin", &hbuf).ok();
+            if let Err(e) = owl_shared::file_loader::write("/tmp/owl_dflash_hid.bin", &hbuf) {
+                eprintln!("[dump] 落盘失败(诊断面不许静默): {e}");
+            }
             let mut m = Vec::new();
             m.extend_from_slice(&(pos as u32).to_le_bytes());
             m.extend_from_slice(&(anchor as u32).to_le_bytes());
-            owl_shared::file_loader::write("/tmp/owl_dflash_meta.bin", &m).ok();
+            if let Err(e) = owl_shared::file_loader::write("/tmp/owl_dflash_meta.bin", &m) {
+                eprintln!("[dump] 落盘失败(诊断面不许静默): {e}");
+            }
             eprintln!("[dflash-probe] {} probe roots + hidden 落盘(逐根独立 eval)pos={pos} anchor={anchor}", probe_roots.len());
         }
-        let _ = hidden;
         // 探针:logits 前 4 值 f16(NaN 定位;OWL_DFLASH_PROBE)
         let logits_probe = if self.probes.dflash_probe {
             Some(logits.clone())
@@ -394,7 +402,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
                 .collect::<Vec<_>>()
         };
-        let _ = b;
         if self.probes.dflash_probe {
             eprintln!("[dflash-probe] pos={pos} anchor={anchor} drafts={out:?}");
         }
@@ -432,7 +439,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         );
         // 编码槽表 = 线性逻辑位(pos..pos+rows;草稿池线性寻址,同 ②)
         let page = self.pool.page;
-        let _ = page;
         let leaves = self.pool.dflash_kv_leaves().expect("dflash 池");
         let bt = self.pool.bt_leaf_flat();
         let kvs: Vec<KvBuffers> = leaves
@@ -568,10 +574,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let env = self.env;
             let vocab = self.model.vocab_size();
             let rope = self.rope.clone();
+            // 链步 decode 读核跟池布局:kNH 池必须走 v2(否则落 v1 classic
+            // ↠ 布局错位、草稿全垃圾;2026-10-13 布局守卫捕获)
+            let attn_v2 = self.pool.attn_v2_scratch();
             match self.drafter.as_ref().expect("drafter") {
                 crate::running::Drafter::Mtp(mtp) => mtp.propose(
                     &anchor_t, &seed_view, depth, &self.model.embed, &rope, &kvs, &pos_ts,
-                    vocab, env,
+                    vocab, env, attn_v2,
                 ),
                 crate::running::Drafter::DFlash2(_) => unreachable!("DFlash2 不走 propose_first(seed 链)"),
             }
@@ -672,10 +681,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let env = self.env;
             let vocab = self.model.vocab_size();
             let rope = self.rope.clone();
+            let attn_v2 = self.pool.attn_v2_scratch(); // 同上:链步读核走 v2
             match self.drafter.as_ref().expect("drafter") {
                 crate::running::Drafter::Mtp(mtp) => mtp.propose_ext(
                     &tokens_t, &hiddens, &extend_pos, &extend_kv, &extend_slots, &extend_lens,
-                    &cu_t, &chain_refs, &self.model.embed, &rope, vocab, env,
+                    &cu_t, &chain_refs, &self.model.embed, &rope, vocab, env, attn_v2,
                 ),
                 crate::running::Drafter::DFlash2(_) => unreachable!("DFlash2 走 dflash_propose"),
             }
@@ -1008,6 +1018,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             (0..t).map(|r| owl_models::ops::argmax_f32idx(&logits, vocab, r * vocab)).collect();
         let refs: Vec<&TensorOps> = rows.iter().collect();
         let mut root = TensorOps::call(owl_models::ops::SemanticKernel::Concat);
+        // FIXME(2026-10-13,律 #1):`refs.get(i).unwrap_or(refs[0])` 在
+        // `t < 8` 时**静默用第 0 行补齐** —— 若属"固定 8 行图族"的按设计补齐,
+        // 应写成显式的 pad(并断言 t≥1);若属越界,静默回退会生成**错树**
+        // 且极难查。当前语义未定谳,故先挂牌不改行为(改动可能误伤 pad 路径)。
         for i in 0..8 {
             root = root.arg(refs.get(i).copied().unwrap_or(refs[0]));
         }

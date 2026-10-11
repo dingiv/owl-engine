@@ -24,8 +24,23 @@ pub enum EngineReq {
         session: Option<u64>,
         prompt: String,
         max_new: usize,
+        /// OpenAI 兼容扩展:忽略 EOS 跑满 max_new(测速口径)
+        ignore_eos: bool,
         sink: mpsc::Sender<SinkEvent>,
     },
+}
+
+/// 事件投递(律 #1:不许静默丢弃可失败返回值)。
+/// `send` 失败 = 请求方已断开 —— 属正常路径,但**首次**失败必须可见
+/// (每事件都打会刷屏,故用一次性旗标;非错误语义见下)。
+async fn deliver(sink: &mpsc::Sender<SinkEvent>, ev: SinkEvent) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if let Err(e) = sink.send(ev).await {
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            eprintln!("[actor] 事件投递失败(请求方已断开,后续同类不再重复打印): {e}");
+        }
+    }
 }
 
 /// actor → 请求方事件(首笔必为 Accepted/Rejected,其后 Turn 流)
@@ -67,11 +82,11 @@ pub async fn run_actor<D: DeviceClient>(
                     };
                     match sinks.remove(&failed_turn) {
                         Some(sink) => {
-                            let _ = sink.send(SinkEvent::Turn(failed)).await;
+                            deliver(&sink, SinkEvent::Turn(failed)).await;
                         }
                         None => {
                             for (_, sink) in sinks.drain() {
-                                let _ = sink.send(SinkEvent::Turn(failed.clone())).await;
+                                deliver(&sink, SinkEvent::Turn(failed.clone())).await;
                             }
                         }
                     }
@@ -88,18 +103,18 @@ async fn accept<D: DeviceClient>(
     sinks: &mut HashMap<u64, mpsc::Sender<SinkEvent>>,
     req: EngineReq,
 ) {
-    let EngineReq::Chat { session, prompt, max_new, sink } = req;
-    match running.submit_session(session, prompt, max_new) {
+    let EngineReq::Chat { session, prompt, max_new, ignore_eos, sink } = req;
+    match running.submit_session_ex(session, prompt, max_new, ignore_eos) {
         Ok((sid, tid)) => {
             // usage 真账:prompt token 数 = 队列/活跃 turn 的 prompt_ids
             // 长度(末块 prefill 不发 Prefill 事件,短 prompt 场景事件面
             // 拿不到 —— submit 后即刻取用,单源)
             let pt = running.turn_prompt_len(tid).unwrap_or(0);
             sinks.insert(tid, sink.clone());
-            let _ = sink.send(SinkEvent::Accepted { session: sid, turn: tid, prompt_tokens: pt }).await;
+            deliver(&sink, SinkEvent::Accepted { session: sid, turn: tid, prompt_tokens: pt }).await;
         }
         Err(e) => {
-            let _ = sink.send(SinkEvent::Rejected { err: e.to_string() }).await;
+            deliver(&sink, SinkEvent::Rejected { err: e.to_string() }).await;
         }
     }
 }
@@ -117,7 +132,7 @@ async fn dispatch(
         TurnEvent::Idle => return,
     };
     if let Some(sink) = sinks.get(&tid) {
-        let _ = sink.send(SinkEvent::Turn(ev)).await;
+        deliver(&sink, SinkEvent::Turn(ev)).await;
     }
     if done {
         // 摘除即 drop(mpsc Sender 无显式 close;对端 recv 尽后自然断流)

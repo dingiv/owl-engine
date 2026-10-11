@@ -76,18 +76,23 @@ fn lcg(n: usize, seed: u32) -> Vec<u16> {
 
 /// host 参考:每 seq 独立全局 softmax(attend [0, lens_s))。classic 布局。
 fn host_ref(q: &[u16], kc: &[u8], vc: &[u8], lens: &[usize]) -> Vec<f32> {
-    host_ref_impl(q, kc, vc, lens, true)
+    host_ref_impl(q, kc, vc, lens, true, false)
+}
+
+/// kNHD 变体(2026-10-13 补):页内 [page, hkv, hd] 连续
+fn host_ref_knhd(q: &[u16], kc: &[u8], vc: &[u8], lens: &[usize], kv_fp8: bool) -> Vec<f32> {
+    host_ref_impl(q, kc, vc, lens, kv_fp8, true)
 }
 
 fn host_ref_f16(q: &[u16], kc: &[u8], vc: &[u8], lens: &[usize]) -> Vec<f32> {
-    host_ref_impl(q, kc, vc, lens, false)
+    host_ref_impl(q, kc, vc, lens, false, false)
 }
 
-fn host_ref_impl(q: &[u16], kc: &[u8], vc: &[u8], lens: &[usize], kv_fp8: bool) -> Vec<f32> {
+fn host_ref_impl(q: &[u16], kc: &[u8], vc: &[u8], lens: &[usize], kv_fp8: bool, knhd: bool) -> Vec<f32> {
     let dec = |pool: &[u8], i: usize| if kv_fp8 { e4m3_decode(pool[i]) } else { f16_to_f32(pool[2*i] as u16 | ((pool[2*i+1] as u16) << 8)) };
     let mut out = vec![0f32; S * H * HD];
     let kbs = HKV * HD * PAGE;
-    let khs = HD * PAGE;
+    let khs = if knhd { HD } else { HD * PAGE };
     let scale = 1.0 / (HD as f32).sqrt();
     for s in 0..S {
         let len = lens[s];
@@ -99,7 +104,12 @@ fn host_ref_impl(q: &[u16], kc: &[u8], vc: &[u8], lens: &[usize], kv_fp8: bool) 
                 let bb = b % PAGE;
                 let mut acc = 0f32;
                 for d in 0..HD {
-                    let kidx = pb * kbs + kvh * khs + bb * X + (d / X) * (PAGE * X) + d % X;
+                    let kidx = if knhd {
+                        // kNHD:页内 [page, hkv, hd] 连续
+                        pb * kbs + bb * (HKV * HD) + kvh * HD + d
+                    } else {
+                        pb * kbs + kvh * khs + bb * X + (d / X) * (PAGE * X) + d % X
+                    };
                     acc += f16_to_f32(q[(s * H + h) * HD + d]) * dec(kc, kidx);
                 }
                 qk[b] = acc * scale;
@@ -111,7 +121,11 @@ fn host_ref_impl(q: &[u16], kc: &[u8], vc: &[u8], lens: &[usize], kv_fp8: bool) 
                 for b in 0..len {
                     let pb = b / PAGE;
                     let bb = b % PAGE;
-                    let vidx = pb * kbs + kvh * khs + d * PAGE + bb;
+                    let vidx = if knhd {
+                        pb * kbs + bb * (HKV * HD) + kvh * HD + d
+                    } else {
+                        pb * kbs + kvh * khs + d * PAGE + bb
+                    };
                     acc += (qk[b] - m).exp() * dec(vc, vidx);
                 }
                 out[(s * H + h) * HD + d] = acc / l;
@@ -121,13 +135,26 @@ fn host_ref_impl(q: &[u16], kc: &[u8], vc: &[u8], lens: &[usize], kv_fp8: bool) 
     out
 }
 
+/// 8 伪序列 × 多分区(真归并路径)对 host 真值门 —— **两布局都跑**。
+///
+/// 2026-10-13:① **转正**(原 `#[ignore]` 理由"reduce 段超门 0.18"已不复现:
+/// 实测 per-seq 误差 ~1.1e-4 ≪ 1e-2 门);② **补 kNHD 变体** —— 此前
+/// `kv_knhd_read_parity` 只测 `nparts=1`(归并退化为直拷),而生产长 ctx
+/// 每次 decode 都走 `nparts = ceil(pool/512)`(16k 池 = 33)+ verify 的
+/// seqs=8,故 **"kNHD × 归并" 此前无真值覆盖**(本文件此前只跑 classic 名)。
 #[test]
-#[ignore = "§三十二:8 伪序列 v2 reduce 段数值超门(0.18 均匀)定位中——主核已验干净(exp_sums 正确),reduce arg 序已修正仍超门;server 侧 2048+/20k 语义健康,仅短 ctx(2 partitions)半崩;勿删,定位后转正"]
 fn v2_paged_multiseq_matches_host() {
     if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
     }
+    for knhd in [false, true] {
+        eprintln!("[case] knhd={knhd}");
+        v2_multiseq_case(knhd);
+    }
+}
+
+fn v2_multiseq_case(knhd: bool) {
     let ctx = CudaContext::new(1).expect("ctx");
     ctx.bind_to_thread().expect("bind");
     let stream = ctx.default_stream();
@@ -195,12 +222,14 @@ fn v2_paged_multiseq_matches_host() {
 
     // ---- 主核:v2 fp8 hd256bs32;grid (H, S, NP) ----
     let f16_mode = std::env::var("V2_F16").is_ok();
-    let f = m.load_function(if f16_mode {
-        "vllm_paged_attention_v2_f16_hd256bs32"
-    } else {
-        "vllm_paged_attention_v2_fp8_hd256bs32"
-    })
-    .expect("load v2");
+    let f = m
+        .load_function(match (f16_mode, knhd) {
+            (false, false) => "vllm_paged_attention_v2_fp8_hd256bs32",
+            (false, true) => "vllm_paged_attention_v2_fp8_knhd_hd256bs32",
+            (true, false) => "vllm_paged_attention_v2_f16_hd256bs32",
+            (true, true) => "vllm_paged_attention_v2_f16_knhd_hd256bs32",
+        })
+        .expect("load v2");
     let (q_p, k_p, v_p, bt_p, ln_p, ab_p) = (
         d_q.device_ptr(&stream).0,
         d_k8.device_ptr(&stream).0,
@@ -216,6 +245,8 @@ fn v2_paged_multiseq_matches_host() {
         d_out.device_ptr(&stream).0,
     );
     let scale = 1f32 / (HD as f32).sqrt();
+    // head stride 实参(借出需具名绑定:classic = hd·page;kNHD = hd)
+    let kvhs_i: i32 = if knhd { HD as i32 } else { (HD * PAGE) as i32 };
     let mut b = stream.launch_builder(&f);
     // fp8 入口专有序(B6 移植改序;≠ f16 版!):q, k, v, bt, lens, alibi_f32*,
     //           exp_sums, max_logits, nkv, scale, max_nb, q_stride, kvbs, kvhs,
@@ -233,7 +264,8 @@ fn v2_paged_multiseq_matches_host() {
         .arg(&(NB as i32))
         .arg(&((H * HD) as i32))
         .arg(&((HKV * HD * PAGE) as i32))
-        .arg(&((HD * PAGE) as i32))
+        // head stride:classic = hd·page(x 交错);kNHD = hd(页内 [page,hkv,hd])
+        .arg(&kvhs_i)
         .arg(&1f32)
         .arg(&(-1i32))
         .arg(&0i32)
@@ -294,6 +326,8 @@ fn v2_paged_multiseq_matches_host() {
         let vb: Vec<u8> = v_f16.iter().flat_map(|h| h.to_le_bytes()).collect();
         // f16 模式:dec 走 f16 路径(kv_fp8=false)
         host_ref_f16(&q_f16, &kb, &vb, &lens)
+    } else if knhd {
+        host_ref_knhd(&q_f16, &k_fp8, &v_fp8, &lens, true)
     } else {
         host_ref(&q_f16, &k_fp8, &v_fp8, &lens)
     };
@@ -337,7 +371,10 @@ fn v2_paged_multiseq_matches_host() {
     println!("   zero_total={zero_total} by(s,h)={:?} (前 12)", zero_by_sh.iter().take(12).collect::<Vec<_>>());
     assert!(
         per_seq.iter().cloned().fold(0f32, f32::max) < 1e-2,
-        "v2 多伪序列对 host 参考超门(max {we:.6} @ s={ws})"
+        "v2 多伪序列对 host 参考超门(knhd={knhd}, max {we:.6} @ s={ws})"
     );
-    println!("v2 多伪序列探针 PASS(S={S} lens 递增 {CTX0}..{}):全 seq 贴 host 参考", lens[S - 1]);
+    println!(
+        "v2 多伪序列探针 PASS(knhd={knhd}, S={S}, nparts={NP}, lens 递增 {CTX0}..{}):全 seq 贴 host 参考",
+        lens[S - 1]
+    );
 }

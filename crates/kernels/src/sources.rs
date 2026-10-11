@@ -46,11 +46,9 @@ pub mod owl {
 pub mod attention {
     /// KV cache 散写(vLLM classic 布局;K1/K2 paged_attention 同款布局)
     pub const RESHAPE_AND_CACHE_F16: &str = include_str!("../cu/attention/reshape_and_cache.cu");
-    pub const RESHAPE_AND_CACHE_DUAL_F16: &str = include_str!("../cu/attention/reshape_and_cache_dual.cu");
     /// f16<->f32 设备 cast(GDN chunked 编排配套)
     pub const CAST: &str = include_str!("../cu/owl/cast.cu");
     /// fp8 KV 变体(nvrtc 独立核文件;FI adapter 本体含 flashinfer 头不可 nvrtc)
-    pub const RESHAPE_AND_CACHE_DUAL_F16_FP8KV: &str = include_str!("../cu/flashinfer/reshape_and_cache_dual_fp8kv.cu");
     /// B6.2:K0 批量写池 fp8 变体(f16 输入 → e4m3 池;主池 fp8 承载配套)
     pub const RESHAPE_AND_CACHE_FP8KV: &str = include_str!("../cu/attention/reshape_and_cache_fp8kv.cu");
     /// paged attention decode 家族(v1 / v2 分片 / v2 reduce;K1/K2)

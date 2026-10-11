@@ -89,8 +89,10 @@ pub(crate) struct PoolPlan {
     pub pool_tokens: usize,
     /// 主池 KV 量化
     pub kv: owl_models::env::KvQuant,
-    /// FlashInfer K/V 影子池量化(None = 无 FI 面)
-    pub fi: Option<owl_models::env::KvQuant>,
+    /// FI 直读面启用的池量化(None = 无 FI 面)。
+    /// **不是影子池量化** —— 影子池已随统一契约 P3 删除;本字段现在只表示
+    /// "FI prefill 面启用",量化恒等于主池 `kv`(名随实)
+    pub fi_quant: Option<owl_models::env::KvQuant>,
     /// 草稿池量化
     pub draft_kv: owl_models::env::KvQuant,
     /// 投机形态(快照/MTP 链/草稿池三件的唯一事实来源)
@@ -353,8 +355,13 @@ impl StatePool {
                 snaps.push(GdnSnapSlot { key: None, last_use: 0, bufs });
             }
         }
+        // 池 dtype 标签随实报(原硬写 "kv f16" 在 fp8 档说谎 —— 2026-10-13)
+        let kv_label = match plan.kv {
+            owl_models::env::KvQuant::Fp8E4M3 => "kv fp8 e4m3",
+            owl_models::env::KvQuant::None => "kv f16",
+        };
         eprintln!(
-            "[boot] 状态块分配 {:.2}s(kv f16 ×{} / gdn ×{},会话容量 {},池 {} 页 × {page} tok,页表 nb = {nb},dflash = {df})",
+            "[boot] 状态块分配 {:.2}s({kv_label} ×{} / gdn ×{},会话容量 {},池 {} 页 × {page} tok,页表 nb = {nb},dflash = {df})",
             t.elapsed().as_secs_f32(),
             kvs.len(),
             gdns.len(),
@@ -376,7 +383,7 @@ impl StatePool {
         } else {
             None
         };
-        Ok(StatePool { gdn_slots, dump_all, kvs, fi_face: plan.fi.is_some(), verify_attn_v2,
+        Ok(StatePool { gdn_slots, dump_all, kvs, fi_face: plan.fi_quant.is_some(), verify_attn_v2,
             kv_fp8, dflash_fp8, gdns, snaps, snap_tick: 0, bt, bt_mtp, spec_snap, mtp_kvs, dflash_kvs, attn_v2, page, nb, paged, x, dims })
     }
 

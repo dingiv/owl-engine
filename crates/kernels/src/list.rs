@@ -149,8 +149,6 @@ pub static REGISTRY: &[Entry] = &[
     // ---- attention port 家族(K0;vendor attention.rs rev c0f19f2,Apache-2.0;
     //      vLLM classic 布局,K1/K2 paged_attention 同款;适配认领见 .cu 头注)----
     Entry { name: "vllm_reshape_and_cache_f16", source: sources::attention::RESHAPE_AND_CACHE_F16, args: "T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_reshape_and_cache_dual_f16", source: sources::attention::RESHAPE_AND_CACHE_DUAL_F16, args: "T,T,T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_reshape_and_cache_dual_f16_fp8kv", source: sources::attention::RESHAPE_AND_CACHE_DUAL_F16_FP8KV, args: "T,T,T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     // B6.2:K0 批量写池 fp8 变体(f16 输入,e4m3 池;形状无关单核)
     Entry { name: "owl_reshape_and_cache_fp8kv", source: sources::attention::RESHAPE_AND_CACHE_FP8KV, args: "T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
     Entry { name: "owl_reshape_and_cache_fp8kv_bf16", source: sources::attention::RESHAPE_AND_CACHE_FP8KV, args: "T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::BF16 },

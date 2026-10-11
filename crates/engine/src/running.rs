@@ -44,6 +44,8 @@ pub(crate) struct ActiveTurn {
     pub(crate) ephemeral: bool,
     pub(crate) prompt_ids: Vec<u32>,
     pub(crate) max_new: usize,
+    /// 忽略 EOS 跑满预算(TurnSpec 透传;测速口径)
+    pub(crate) ignore_eos: bool,
     pub(crate) out: Vec<u32>,
     /// KV/prompt 推进指针(会话 turn 从 `cached_len` 起步 = 增量 prefill)
     pub(crate) fed: usize,
@@ -263,6 +265,18 @@ impl<D: DeviceClient> RunningEngine<D> {
         prompt: impl Into<String>,
         max_new: usize,
     ) -> Result<(u64, u64)> {
+        self.submit_session_ex(session, prompt, max_new, false)
+    }
+
+    /// 同 [`Self::submit_session`],多一个 `ignore_eos`(OpenAI 兼容扩展;
+    /// true = 忽略 EOS 跑满 `max_new` —— 测速口径用)
+    pub fn submit_session_ex(
+        &mut self,
+        session: impl Into<Option<u64>>,
+        prompt: impl Into<String>,
+        max_new: usize,
+        ignore_eos: bool,
+    ) -> Result<(u64, u64)> {
         let session = session.into();
         let prompt = prompt.into();
         let prompt_ids = {
@@ -280,6 +294,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             if std::env::var("OWL_PROMPT_DUMP").is_ok() {
                 let ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
+                    // 系统时钟回拨兜底 → 0(非失败路径;仅用于 dump 文件名)
                     .map(|d| d.as_millis())
                     .unwrap_or(0);
                 let path = format!("/tmp/owl-prompt-{ms}.txt");
@@ -299,6 +314,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         let cached_hit = session
             .and_then(|id| self.sessions.get(id).map(|s| (s.cached_len, s.guard(&prompt_ids))))
             .filter(|&(_, guard)| guard)
+            // 无会话 / 守卫未命中 → cached 0(语义默认,非失败)
             .map(|(cached, _)| cached)
             .unwrap_or(0);
         let need = prompt_ids.len().max(cached_hit) + max_new;
@@ -320,7 +336,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             id,
             session_id,
             ephemeral,
-            spec: TurnSpec { prompt, max_new },
+            spec: TurnSpec { prompt, max_new, ignore_eos },
             prompt_ids,
         });
         Ok((session_id, id))
@@ -346,7 +362,10 @@ impl<D: DeviceClient> RunningEngine<D> {
                         let mut mt = std::mem::take(&mut s.mtp_block_table);
                         self.blocks_mtp.release_table(&mut mt);
                     }
-                    self.sessions.close(victim).ok();
+                    // 会话关闭失败 = 块表归还/状态回收失败:不许静默(律 #1)
+                    if let Err(e) = self.sessions.close(victim) {
+                        eprintln!("[session] LRU 逐出 #{victim} 关闭失败: {e}");
+                    }
                     owl_shared::metrics::with_metrics_store(|m| {
                         m.counter_add("session.evict", 1, file!(), line!())
                     });
@@ -457,7 +476,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         let id = self.submit(prompt, max_new)?;
         loop {
             match self.pump().await? {
-                TurnEvent::Completed { turn, text } if turn == id => return Ok(text),
+                TurnEvent::Completed { turn, text, .. } if turn == id => return Ok(text),
                 TurnEvent::Idle => {
                     return Err(ModelError::Msg(format!("generate: turn {id} 队列丢失")))
                 }

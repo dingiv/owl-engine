@@ -37,6 +37,20 @@ pub struct ChatRequest {
     /// 扩展字段:会话键(服务端哈希为 u64 会话 id;见模块头)
     #[serde(default)]
     pub session: Option<String>,
+    /// 流式 usage 开关(OpenAI 约定 `stream_options.include_usage`)
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
+    /// OpenAI 兼容扩展(部分实现通用):忽略 EOS,强制生成满 `max_tokens`
+    /// —— **测速口径**(decode 吞吐要在足量生成上测,否则 OOD 输入下
+    /// 模型吐 2 token 就停,读数成伪影;2026-10-13)
+    #[serde(default)]
+    pub ignore_eos: bool,
+}
+
+#[derive(Deserialize)]
+pub struct StreamOptions {
+    #[serde(default)]
+    pub include_usage: bool,
 }
 
 #[derive(Deserialize)]
@@ -185,6 +199,7 @@ fn now() -> u64 {
 
 fn unix() -> std::time::Duration {
     std::time::SystemTime::now()
+        // 系统时钟回拨兜底 → 0(非失败路径;仅用于时间戳/ID)
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
 }
@@ -256,6 +271,7 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
         session: req.session.as_deref().map(session_id),
         prompt: render_prompt(&req.messages),
         max_new: req.max_tokens.unwrap_or(DEFAULT_MAX_NEW),
+        ignore_eos: req.ignore_eos,
         sink: sink_tx,
     };
     if tx.send(engine_req).await.is_err() {
@@ -293,21 +309,42 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
                         let first = chunk_json(
                             &id, model_name, json!({"role": "assistant", "content": ""}), None,
                         );
-                        http::sse_data(w, &serde_json::to_string(&first).unwrap_or_default()).await?;
+                        http::sse_data(w, &first.to_string()).await?;
                     }
                     let chunk = chunk_json(&id, model_name, json!({"content": delta}), None);
-                    http::sse_data(w, &serde_json::to_string(&chunk).unwrap_or_default()).await?;
+                    http::sse_data(w, &chunk.to_string()).await?;
                 }
             }
             // Prefill 进度帧(末笔 total = prompt token 数,入 usage)
             Some(SinkEvent::Turn(TurnEvent::Prefill { total, .. })) => {
                 usage.prompt = total;
             }
-            Some(SinkEvent::Turn(TurnEvent::Completed { text, .. })) => {
+            Some(SinkEvent::Turn(TurnEvent::Completed { text, finish, .. })) => {
+                let reason = match finish {
+                    owl_engine::turn::FinishReason::Stop => "stop",
+                    owl_engine::turn::FinishReason::Length => "length",
+                };
                 return match mode {
                     ReplyMode::Stream => {
-                        let chunk = chunk_json(&id, model_name, json!({}), Some("stop"));
-                        http::sse_data(w, &serde_json::to_string(&chunk).unwrap_or_default()).await?;
+                        let chunk = chunk_json(&id, model_name, json!({}), Some(reason));
+                        http::sse_data(w, &chunk.to_string()).await?;
+                        // OpenAI 约定:请求 include_usage 时,末帧(DONE 之前)
+                        // 发 choices=[] + usage 的真账帧(2026-10-13;此前
+                        // owl 流式不返 usage → 测速端只能本地估 token,违反
+                        // "token 计数必须用 usage" 的口径律)
+                        if req.stream_options.as_ref().is_some_and(|o| o.include_usage) {
+                            let u = chunk_json(
+                                &id, model_name, json!({}), None,
+                            );
+                            let mut u = u;
+                            u["choices"] = json!([]);
+                            u["usage"] = json!({
+                                "prompt_tokens": usage.prompt,
+                                "completion_tokens": usage.completion,
+                                "total_tokens": usage.prompt + usage.completion,
+                            });
+                            http::sse_data(w, &u.to_string()).await?;
+                        }
                         http::sse_data(w, "[DONE]").await?;
                         eprintln!("[chat] turn {:?} 完成:{}", turn.map(|(_, t)| t), preview(&text));
                         Ok(())
@@ -317,7 +354,7 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
                             w,
                             200,
                             &completion_json(
-                                &id, model_name, &text, "stop", usage.prompt, usage.completion,
+                                &id, model_name, &text, reason, usage.prompt, usage.completion,
                             ),
                         )
                         .await
@@ -328,12 +365,13 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
                 return match mode {
                     // SSE 中途错误:协议无标准错误帧,error json + DONE 收口
                     ReplyMode::Stream => {
-                        let _ = http::sse_data(
-                            w,
-                            &serde_json::to_string(&error_json(err)).unwrap_or_default(),
-                        )
-                        .await;
-                        let _ = http::sse_data(w, "[DONE]").await;
+                        // 客户端可能已断开(写失败属正常),但不许静默(律 #1)
+                        if let Err(e) = http::sse_data(w, &error_json(err).to_string()).await {
+                            eprintln!("[chat] 流式错误帧写失败(客户端可能已断开): {e}");
+                        }
+                        if let Err(e) = http::sse_data(w, "[DONE]").await {
+                            eprintln!("[chat] 流式收尾帧写失败(客户端可能已断开): {e}");
+                        }
                         Ok(())
                     }
                     ReplyMode::Aggregate => http::respond_json(w, 500, &error_json(err)).await,

@@ -261,7 +261,7 @@ pub async fn gpu_two_turns_lifecycle(shared: Option<&mut RunningEngine<owl_cuda:
                 ttft = Some(t0.elapsed());
                 eprintln!("[ttft] 首 Token(turn {turn}): {:?}", ttft.unwrap());
             }
-            TurnEvent::Completed { turn, text } => {
+            TurnEvent::Completed { turn, text, .. } => {
                 eprintln!("[ttft] turn {turn} 完成(累计 {:?})", t0.elapsed());
                 done.push((turn, text))
             }
@@ -416,7 +416,7 @@ pub async fn gpu_longctx_4k_prefix_qa(shared: Option<&mut RunningEngine<owl_cuda
             TurnEvent::Token { turn, .. } if turn == t1 && ttft.is_none() => {
                 ttft = Some(t0.elapsed());
             }
-            TurnEvent::Completed { turn, text } if turn == t1 => {
+            TurnEvent::Completed { turn, text, .. } if turn == t1 => {
                 text1 = text;
                 break;
             }
@@ -452,6 +452,113 @@ pub async fn gpu_longctx_4k_prefix_qa(shared: Option<&mut RunningEngine<owl_cuda
         eprintln!("[test] t{t2} 答: {text2}");
         assert!(!text2.trim().is_empty(), "t{t2} 产出非空");
         assert!(running.session_len(sid).unwrap_or(0) >= n_tok, "账本收口");
+    }
+}
+
+/// GPU 门控:FI 直读单池健康门(2026-10-13 立项;kV 统一契约 P5 收尾)。
+///
+/// 背景:统一契约把主池翻 kNHD、FI 从「影子池双写」改为「直读主池」;
+/// 为迎合它,写核/读核大范围改过。这条链**数值上**是否健康,此前没有
+/// 有效判据:HTTP + greedy 的「跳实现逐字节门」已实测作废(两个
+/// flash-attention 实现的 ulp 差被 greedy 放大成完全不同的文本;且
+/// 27B AWQ + 空 think 预填在长文上模型自身退化)—— 见坑册 §23。
+///
+/// 本门姿势(照 [`gpu_longctx_4k_prefix_qa`] 的教训):
+/// - **裸 LM**(不走 chat 模板)+ **补全式探针**(让模型续写暗号本体;
+///   问答式在裸 LM 上必退化成文本续写);
+/// - **同 dtype(fp8)同池几何**,只切读核(`attn.fi`)= FI 直读 vs 自研
+///   (chunked_opt / split)→ 输出**应逐字一致**,**与文本质量无关**:
+///   就算续写是垃圾,两臂的垃圾也必须一样 —— 这才是等价门;
+/// - 4k prompt ⇒ 百级 chunk(prefill_chunk=32),覆盖两臂各自的多 chunk 路径。
+///
+/// 断言:①两臂 prompt token 数一致 ②召回行为一致 ③**文本逐字一致**。
+pub async fn gpu_longctx_fi_direct_gate() {
+    let Some(ordinal) = gpu_ordinal() else {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    };
+    let seq: usize = owl_shared::env_reader::parse_or("OWL_E2E_SEQ", 4096);
+    const NEEDLE: &str = "蓝鲸二十一号";
+
+    /// 单臂:boot(池 dtype 与 `fi` 可切)→ 4k 前缀记忆 prompt → 补全式生成。
+    async fn arm(ordinal: usize, fi: bool, fp8: bool, seq: usize) -> (String, usize) {
+        let dir = asset_dir();
+        let mut knobs = EngineKnobs::default();
+        knobs.env.kv.quant = if fp8 {
+            owl_models::env::KvQuant::Fp8E4M3
+        } else {
+            owl_models::env::KvQuant::None
+        };
+        knobs.env.attn.fi = fi; // ← 唯一变量:读核(FI 直读 vs 自研 chunked/split)
+        let mut engine = Engine::new(EngineConfig {
+            device_ordinal: ordinal,
+            max_seq_tokens: seq,
+            prefill_chunk: 32,
+            knobs,
+        })
+        .expect("构造");
+        let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
+        let mut running = engine.run(loaded).await.expect("装配");
+
+        let marker = "本会话暗号:「蓝鲸二十一号」。\n\n";
+        let question = "\n\n清单结束。按约定,暗号重复一遍:暗号是「";
+        let filler = |i: usize| {
+            format!("第{i}条:观测点{i}记录到信号{i},强度{i}级,来源坐标({i},{i}),持续{i}天。\n")
+        };
+        let mut body = String::from(marker);
+        let mut i = 0usize;
+        loop {
+            let cand = format!("{body}{}", filler(i));
+            if running.tok.encode(&format!("{cand}{question}")).len() + 32 > seq {
+                break; // 留 32 token 生成余量
+            }
+            body = cand;
+            i += 1;
+        }
+        let prompt = format!("{body}{question}");
+        let n_tok = running.tok.encode(&prompt).len();
+        assert!(n_tok > seq * 4 / 5, "长文应填满窗口 ≥80%,得 {n_tok}/{seq}");
+        let t0 = std::time::Instant::now();
+        let (_, t) = running
+            .submit_session(Some(7), prompt.as_str(), 16)
+            .expect("submit 应在 4k 预算内");
+        let text = drive_turn(&mut running, t).await;
+        eprintln!(
+            "[fi-gate] fi={fi} fp8={fp8} prompt={n_tok} tok({i} 条) 生成 @ {:?}: {text:?}",
+            t0.elapsed()
+        );
+        // 实例收尾屏障(同 gpu_spec_identity_gate/恒等门 既有约定):
+        // 本门连开 4 个实例,不 barrier 则前一个的 CUDA ctx/显存尚未析构,
+        // 下一个实例的 VRAM 探测读到未释放的账 → 池被算小 → 后续用例
+        // “KV 块池耗尽”(§11.5 跨用例污染同族;2026-10-13 套件内实测复现)。
+        drop(running);
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        (text, n_tok)
+    }
+
+    // 两臂:fp8 生产档 × 读核(自研 / FI 直读)。同 dtype 内两臂必须
+    // **逐字一致**。f16 档由既有 `gpu_longctx_4k_prefix_qa`(默认 env 即
+    // f16 池)覆盖 —— 本门只补 fp8 这一档,少开两次装载(套件内池账
+    // 扰动与耗时都省;2026-10-13 四臂版曾把后置 spec 门的池挤小)。
+    let mut _cross = String::new();
+    for fp8 in [true] {
+        let (off, n_off) = arm(ordinal, false, fp8, seq).await;
+        let (on, n_on) = arm(ordinal, true, fp8, seq).await;
+        assert_eq!(n_off, n_on, "两臂 prompt token 数应一致(同构造)");
+        let (r_off, r_on) = (off.contains(NEEDLE), on.contains(NEEDLE));
+        eprintln!(
+            "[fi-gate] fp8={fp8} 召回 FI-off={r_off} / FI-on={r_on}; 逐字一致={}",
+            off == on
+        );
+        assert_eq!(
+            r_off, r_on,
+            "两臂召回行为应一致(fp8={fp8})\n  off={off:?}\n  on ={on:?}"
+        );
+        assert_eq!(
+            off, on,
+            "同 dtype 同池、只换读核 → 输出应逐字一致(不一致 = FI 直读或自研读核的实参/几何有问题;fp8={fp8})\n  off={off:?}\n  on ={on:?}"
+        );
+        _cross = off.clone();
     }
 }
 
@@ -704,7 +811,7 @@ pub async fn gpu_prefix_cache_hit(shared: Option<&mut RunningEngine<owl_cuda::Gp
             TurnEvent::Token { turn, .. } if turn == ta1 && a_ttft.is_none() => {
                 a_ttft = Some(t0.elapsed());
             }
-            TurnEvent::Completed { turn, text } if turn == ta1 => {
+            TurnEvent::Completed { turn, text, .. } if turn == ta1 => {
                 a_text = text;
                 break;
             }
@@ -727,7 +834,7 @@ pub async fn gpu_prefix_cache_hit(shared: Option<&mut RunningEngine<owl_cuda::Gp
             TurnEvent::Token { turn, .. } if turn == tb1 && b_ttft.is_none() => {
                 b_ttft = Some(t0b.elapsed());
             }
-            TurnEvent::Completed { turn, text } if turn == tb1 => {
+            TurnEvent::Completed { turn, text, .. } if turn == tb1 => {
                 eprintln!("[test] B 答: {text}");
                 break;
             }
@@ -836,7 +943,7 @@ pub async fn gpu_27b_chat_inference(shared: Option<&mut RunningEngine<owl_cuda::
                     }
                     n_tok += 1;
                 }
-                TurnEvent::Completed { turn, text: t } if turn == id => {
+                TurnEvent::Completed { turn, text: t, .. } if turn == id => {
                     text = t;
                     break;
                 }
@@ -942,7 +1049,7 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
             let id = running.submit(*q, 48).expect("submit");
             let text = loop {
                 match running.pump().await.expect("pump") {
-                    TurnEvent::Completed { turn, text } if turn == id => break text,
+                    TurnEvent::Completed { turn, text, .. } if turn == id => break text,
                     TurnEvent::Idle => panic!("队列丢失"),
                     _ => {}
                 }
@@ -972,6 +1079,10 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
         ) -> Vec<(String, Vec<u32>)> {
             let mut knobs = EngineKnobs::default();
             knobs.sampler_enabled = false; // greedy(恒等门口径)
+            // 显式池余量(缺省 = 2×max_seq = 8 页,spec 链一挤就"块池耗尽";
+            // 2026-10-13 套件内实测:前置用例扰动即红、单跑绿。恒等门测的是
+            // 文本等价,不是容量边界 —— 边界另有专测)
+            knobs.pool_tokens = Some(1024);
             if spec {
                 knobs.draft.depth = 3;
                 knobs.draft.dumb = true;
@@ -997,6 +1108,21 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
                     .map(|s| s.tokens.clone())
                     .unwrap_or_default();
                 out.push((text, toks));
+            }
+            // ★ 回归门(2026-10-13 定谳的挂死案):**跑满预算的 turn 必须
+            // 送达终态事件**。病史:spec 路径轮末 `pending_events = evq`
+            // 覆盖,把预算尽时 `sample_and_emit` 压入的 Completed 冲掉 →
+            // actor 永不派发终态 → HTTP 层卡在 recv(客户端一帧不收也不
+            // EOF)。此处 `ignore_eos=true` 强制跑满 8 tok → `drive_turn`
+            // 若等不到 Completed 会 panic("队列丢失")= 门红。
+            {
+                let (sid_ie, id_ie) = running
+                    .submit_session_ex(Some(900), "用一句话介绍长城。", 8, true)
+                    .expect("submit(ignore_eos)");
+                let text_ie = drive_turn(&mut running, id_ie).await;
+                let n = running.sessions.get(sid_ie).map(|s| s.tokens.len()).unwrap_or(0);
+                eprintln!("[spec-gate] 预算尽门(ignore_eos): {n} tok,文本 {text_ie:?}");
+                assert!(n >= 8, "预算尽 turn 应跑满 8 tok,得 {n}(终态事件是否送达见 panic 信息)");
             }
             let st = running.spec_stats;
             eprintln!(
@@ -1331,7 +1457,7 @@ async fn drive_turn<D: DeviceClient>(running: &mut RunningEngine<D>, id: u64) ->
             TurnEvent::Prefill { turn, fed, total } if turn == id => {
                 eprintln!("[ev] t{turn} prefill {fed}/{total}")
             }
-            TurnEvent::Completed { turn, text } if turn == id => break text,
+            TurnEvent::Completed { turn, text, .. } if turn == id => break text,
             TurnEvent::Failed { turn, err } => panic!("t{turn} 失败: {err}"),
             _ => {}
         }

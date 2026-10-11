@@ -111,9 +111,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             };
             // 诊断:KV 池回读(取证图内 K0 写是否落盘)—— 槽 2 = prompt
             // (eager prefill 写);槽 pos = 本步 K0(图内写)。
-            // 回读偏移走**布局单源**(env.kv.layout × 索引数学静态函数;
-            // 2026-10-13 翻转:原硬编码 classic `s*x` 只在 b=0 成立,
-            // 翻 kNHD 后指向错位 —— 诊断仪表不许说谎)。头 0 / 维 0..8。
+            // 回读偏移走**布局单源**(`env::knhd_offset`;P6-A 后单布局,
+            // 原 classic x 交错分支已删)。头 0 / 维 0..8。
             // B6.3:fp8 池字节域同序(1B/elem,e4m3);A/B 池对拍仪表
             // (f16 boot 半值 vs fp8 boot 字节,host RNE 桥对)
             if self.probes.debug && step < 16 {
@@ -125,18 +124,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 face.dtoh(&kv0.0, &mut whole).await?;
                 let (hkv, hd) = (self.pool.dims.hkv, self.pool.dims.hd);
                 let page = self.pool.page;
-                let layout = self.env.kv.layout;
-                let x = self.env.kv.x;
-                let k_off = |slot: usize, d: usize| -> usize {
-                    match layout {
-                        owl_models::env::KvLayout::Classic => {
-                            owl_models::env::KvLayout::classic_k_offset(slot, 0, d, hkv, hd, page, x)
-                        }
-                        owl_models::env::KvLayout::Knhd => {
-                            owl_models::env::KvLayout::knhd_offset(slot, 0, d, hkv, hd, page)
-                        }
-                    }
-                };
+                let k_off =
+                    |slot: usize, d: usize| -> usize { owl_models::env::knhd_offset(slot, 0, d, hkv, hd) };
                 let probe = |slot: usize| -> usize {
                     let base = k_off(slot, 0) * esz;
                     if fp8 {
@@ -332,8 +321,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 mfact(bs, "emit.eos", nt as u64);
             }
         }
-        if self.tok.is_eos(nt) {
-            return self.complete().await;
+        // ignore_eos(OpenAI 兼容;测速口径):EOS 只记账不终止
+        let ignore_eos = self.active.as_ref().map(|a| a.ignore_eos).unwrap_or(false);
+        if self.tok.is_eos(nt) && !ignore_eos {
+            return self.complete(crate::turn::FinishReason::Stop).await;
         }
         let (delta, budget_done) = {
             let act = self.active.as_mut().expect("active 已保证");
@@ -341,7 +332,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             (decode_delta(&self.tok, &act.out, &mut act.decoded), act.out.len() >= act.max_new)
         };
         if budget_done {
-            return self.complete().await;
+            // 末 token 也要作为 Token 事件发出 —— 否则 (a) usage.completion
+            // 少 1(服务端按 Token 事件计数),(b) 流式丢末段文本(2026-10-13
+            // 修:实测 max_tokens=64 时 usage 报 63)。事件序 = Token →
+            // Completed(pending 队列先出,见 running::pump)
+            let done_ev = self.complete(crate::turn::FinishReason::Length).await?;
+            self.pending_events.push_back(done_ev);
+            return Ok(TurnEvent::Token { turn: turn_id, delta });
         }
         Ok(TurnEvent::Token { turn: turn_id, delta })
     }
