@@ -8,7 +8,7 @@ use crate::device::ScratchBuf;
 
 use crate::family::gdn_scalar::cubin;
 use crate::client::gdn_scalar::{GdnScalarCall, GDN_SCALAR};
-use crate::registry::KernelSpec;
+use crate::registry::{FamilyGuard, KernelFamily};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -18,7 +18,6 @@ const CAST: &str = "owl_cast";
 
 #[derive(Default)]
 pub struct GdnScalarRuntime {
-    loaded: bool,
     k: Option<Arc<cudarc::driver::CudaFunction>>,
     cast_f32_f16: Option<Arc<cudarc::driver::CudaFunction>>,
     o_f32: Option<ScratchBuf>,
@@ -28,7 +27,7 @@ pub struct GdnScalarRuntime {
     t_cap: usize,
 }
 
-impl KernelSpec for GdnScalarRuntime {
+impl KernelFamily for GdnScalarRuntime {
     fn id(&self) -> OpId {
         OP
     }
@@ -37,22 +36,22 @@ impl KernelSpec for GdnScalarRuntime {
         crate::contract::Linkage::AotCubin
     }
 
-    fn validate(&self) -> Result<(), OpError> { Ok(()) }
-    fn init(&mut self, res: &mut dyn crate::device::DeviceRes, exec: &mut crate::device::Exec) -> Result<(), OpError> {
-        if self.loaded {
-            return Ok(());
-        }
-        self.k = Some(
-            exec.load_cubin(res, ASSET, cubin::CHUNK_SCALAR_F32, cubin::KERNEL_F32, OP)?,
-        );
-        self.cast_f32_f16 = Some(exec.load_nvrtc(
-            res, CAST,
-            crate::sources::attention::CAST,
-            "owl_cast_f32_f16", OP,
-        )?);
-        self.soff = Some(res.alloc(2 * 4, "gdn_scalar.soff")?);
-        self.loaded = true;
-        Ok(())
+    /// 构造函数:单核 cubin + cast nvrtc + soff 预钉
+    fn assemble(
+        res: &mut dyn crate::device::DeviceRes,
+        exec: &mut crate::device::Exec,
+    ) -> Result<Box<dyn KernelFamily>, OpError> {
+        let me = GdnScalarRuntime {
+            k: Some(exec.load_cubin(res, ASSET, cubin::CHUNK_SCALAR_F32, cubin::KERNEL_F32, OP)?),
+            cast_f32_f16: Some(exec.load_nvrtc(
+                res, CAST,
+                crate::sources::attention::CAST,
+                "owl_cast_f32_f16", OP,
+            )?),
+            soff: Some(res.alloc(2 * 4, "gdn_scalar.soff")?),
+            ..Default::default()
+        };
+        Ok(FamilyGuard::boxed(me))
     }
 
     fn run(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {

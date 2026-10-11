@@ -56,6 +56,12 @@ pub struct KvEnv {
     pub x: usize,
     /// paged(false = legacy 直排)
     pub paged: bool,
+    /// 注意力头维(**模型几何事实**;0 = 未知 ⇒ 拾取期几何门跳过该项)。
+    /// 由引擎 boot 从 `ModelDims` 合入 —— 池几何 [nb,page,hkv,hd] 的一半,
+    /// 也是算子 `ShapeFamily.head_dim` 声明的对账面。
+    pub head_dim: usize,
+    /// GQA 分组比 hq/hkv(0 = 未知/不适用)
+    pub grp: usize,
 }
 
 /// kV 池内元素偏移(kNHD 单布局,唯一真源):[nb, page, hkv, hd] 页内连续
@@ -79,6 +85,9 @@ impl KvEnv {
             page: 32,
             x: 8,
             paged: true,
+            // 模型几何:boot 由 ModelDims 合入(缺省 0 = 未知,门跳过)
+            head_dim: 0,
+            grp: 0,
         }
     }
 
@@ -298,6 +307,8 @@ impl EnvProvider {
             HwEnv::Cuda(arch) => Some(owl_kernels::driver::OpEnv {
                 hw: owl_kernels::driver::Hw { arch },
                 page: if self.kv.paged { self.kv.page } else { 0 },
+                head_dim: self.kv.head_dim,
+                grp: self.kv.grp,
             }),
         }
     }

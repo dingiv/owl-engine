@@ -12,10 +12,18 @@
 use crate::client::xqa::{parse_verify, DECODE_XQA, VERIFY_XQA};
 use crate::contract::{Bytes, LaunchMsg, OpError, OpId};
 use crate::family::xqa::{owl_xqa_launch, owl_xqa_launch_decode};
-use crate::registry::KernelSpec;
+use crate::registry::{FamilyGuard, KernelFamily};
 
 pub struct XqaRuntime;
 pub struct XqaDecodeRuntime;
+
+impl XqaRuntime {
+    /// 本族算子表(**引用 `ops::xqa` 的命名 static** —— 单一提升点)
+    const OPS: &'static [&'static crate::spec::KernelMeta] = &[&crate::ops::xqa::XQA_VERIFY];
+}
+impl XqaDecodeRuntime {
+    const OPS: &'static [&'static crate::spec::KernelMeta] = &[&crate::ops::xqa::XQA_DECODE];
+}
 
 /// 发射公共体(`decode=false` → verify 实例化,`true` → decode 实例化)。
 fn emit(
@@ -122,30 +130,25 @@ fn emit(
     Ok(Bytes { id: c.out.id, len: msg.out_elems })
 }
 
-impl KernelSpec for XqaRuntime {
+impl KernelFamily for XqaRuntime {
     fn id(&self) -> OpId {
         OpId(VERIFY_XQA)
     }
 
-    fn names(&self) -> Vec<&'static str> {
-        vec![VERIFY_XQA]
+    fn ops(&self) -> &'static [&'static crate::spec::KernelMeta] {
+        Self::OPS
     }
 
     fn linkage(&self) -> crate::contract::Linkage {
         crate::contract::Linkage::StaticLib
     }
 
-    fn validate(&self) -> Result<(), OpError> {
-        Ok(())
-    }
-
     /// 无装配(workspace 由调用方给 —— 层侧持有,图内安全责任在层侧)
-    fn init(
-        &mut self,
+    fn assemble(
         _res: &mut dyn crate::device::DeviceRes,
         _exec: &mut crate::device::Exec,
-    ) -> Result<(), OpError> {
-        Ok(())
+    ) -> Result<Box<dyn KernelFamily>, OpError> {
+        Ok(FamilyGuard::boxed(XqaRuntime))
     }
 
     fn run(
@@ -158,29 +161,24 @@ impl KernelSpec for XqaRuntime {
     }
 }
 
-impl KernelSpec for XqaDecodeRuntime {
+impl KernelFamily for XqaDecodeRuntime {
     fn id(&self) -> OpId {
         OpId(DECODE_XQA)
     }
 
-    fn names(&self) -> Vec<&'static str> {
-        vec![DECODE_XQA]
+    fn ops(&self) -> &'static [&'static crate::spec::KernelMeta] {
+        Self::OPS
     }
 
     fn linkage(&self) -> crate::contract::Linkage {
         crate::contract::Linkage::StaticLib
     }
 
-    fn validate(&self) -> Result<(), OpError> {
-        Ok(())
-    }
-
-    fn init(
-        &mut self,
+    fn assemble(
         _res: &mut dyn crate::device::DeviceRes,
         _exec: &mut crate::device::Exec,
-    ) -> Result<(), OpError> {
-        Ok(())
+    ) -> Result<Box<dyn KernelFamily>, OpError> {
+        Ok(FamilyGuard::boxed(XqaDecodeRuntime))
     }
 
     fn run(

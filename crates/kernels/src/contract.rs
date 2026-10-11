@@ -24,12 +24,15 @@
 // ============================================================================
 
 /// 数据类型
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Dtype {
     F32,
     BF16,
     F16,
     U32,
+    /// 字节承载(e4m3 KV 池 / 任意按字节寻址的池块;2026-10-13 P3 随
+    /// 算子准入的池访问声明引入 —— fp8 池参数此前只能靠注释说"1B/elem")
+    U8,
 }
 
 impl Dtype {
@@ -39,6 +42,7 @@ impl Dtype {
             Dtype::F32 => 4,
             Dtype::BF16 | Dtype::F16 => 2,
             Dtype::U32 => 4,
+            Dtype::U8 => 1,
         }
     }
 }
@@ -49,6 +53,51 @@ pub type Shape = Vec<usize>;
 /// 元素总数
 pub fn numel(shape: &[usize]) -> usize {
     shape.iter().product()
+}
+
+// ============================================================================
+// 长度律哨兵(§5.3 ExtentLaw 的 L3 面)
+// ============================================================================
+
+/// **全局硬律:numel > 0**。零长块/槽 = 上游形状 bug(锁页分配空指针 /
+/// 静默空写,如 `xqa_sem` 零长案、pool dtype 改造漏写者案)。
+///
+/// 构造期即结构化拒,错误带**槽名**(`slot`)+ **块 id**(定位一步到位):
+/// `contract <op>: <slot> 期望 numel ≥ 1 实得 块 id=N numel=0`。
+/// 对应 `graph_plan::fill_slots`(槽声明为 0 元素)与
+/// `state::Staging::alloc(n, label)` 同类守卫在 kernels 契约面的收口。
+pub fn require_numel(numel: usize, slot: &'static str, op: &str, id: u64) -> Result<(), OpError> {
+    if numel == 0 {
+        return Err(OpError::Contract {
+            op: op.to_string(),
+            field: slot,
+            expect: "numel ≥ 1(零长块/槽 = 上游形状 bug)".into(),
+            got: format!("块 id={id} numel=0"),
+        });
+    }
+    Ok(())
+}
+
+/// **形状互证:numel(shape) == len 且 numel > 0**(两律合一)。
+/// 有 shape 数组的解析点用(声明账长必须等于形状元素总数)。
+pub fn require_shape_len(
+    shape: &[usize],
+    len: usize,
+    slot: &'static str,
+    op: &str,
+    id: u64,
+) -> Result<(), OpError> {
+    let n = numel(shape);
+    require_numel(n, slot, op, id)?;
+    if n != len {
+        return Err(OpError::Contract {
+            op: op.to_string(),
+            field: slot,
+            expect: format!("numel(shape)={n}"),
+            got: format!("块 id={id} len={len}"),
+        });
+    }
+    Ok(())
 }
 
 /// 图身份证(server 签发;graph_end 成功后可 graph_launch 重放)
@@ -270,3 +319,33 @@ impl InvariantBox {
 // family face parse 三层承接;样例 NarrowStrided 与 SemanticKernel::Narrow
 // 重复,已删。E1-E15 台账的代码级防线 = KernelCall 时代遗产 + 现役
 // lower_kernel C2 对拍 + 家族 face 校验,不受影响。
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 零长块/槽 ⇒ 结构化 Contract 错(带槽名 + 块 id),不是 panic/静默。
+    #[test]
+    fn numel_guard_rejects_zero_with_name_and_id() {
+        let e = require_numel(0, "q", "demo_op", 42).unwrap_err();
+        match e {
+            OpError::Contract { field, ref got, .. } => {
+                assert_eq!(field, "q", "错误未带槽名");
+                assert!(got.contains("42"), "错误未带块 id: {got}");
+                assert!(got.contains("numel=0"), "错误未带 numel: {got}");
+            }
+            other => panic!("期望 Contract 错,实得 {other}"),
+        }
+        assert!(require_numel(6, "q", "demo_op", 1).is_ok(), "非零应放行");
+    }
+
+    /// 形状互证:numel(shape) == len 且 numel > 0(两律合一)。
+    #[test]
+    fn shape_len_guard_cross_checks() {
+        assert!(require_shape_len(&[2, 3], 6, "x", "demo_op", 1).is_ok());
+        let e = require_shape_len(&[2, 3], 5, "x", "demo_op", 9).unwrap_err();
+        assert!(format!("{e}").contains("numel(shape)=6"), "{e}");
+        let z = require_shape_len(&[0, 4], 0, "x", "demo_op", 9).unwrap_err();
+        assert!(format!("{z}").contains("numel=0"), "{z}");
+    }
+}

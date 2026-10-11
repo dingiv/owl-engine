@@ -88,6 +88,11 @@ pub struct OpEnv {
     /// KV 页大小(tokens/block;0 = 非 paged/legacy)。页配对律的 env 侧
     /// 单源 —— wrapper 变体选择在此吃页,调用点无页可错配
     pub page: usize,
+    /// 注意力头维(0 = 未知 ⇒ 几何门跳过该项)。模型级几何事实,
+    /// 由引擎 boot 从 `ModelDims` 合入(与 hw 同律:被动律)
+    pub head_dim: usize,
+    /// GQA 分组比 hq/hkv(0 = 未知/不适用)
+    pub grp: usize,
 }
 
 /// 一次拾取请求(解释器 → driver;全部只读引用,零 I/O)
@@ -125,7 +130,7 @@ pub fn resolve(req: OpReq) -> KernelPick {
             )
         })
     };
-    match req.op.0 {
+    let pick = match req.op.0 {
         "gdn.gating_g" => gdn::gating_g(dt),
         "gdn.l2norm" => gdn::l2norm(dt, ax(0)),
         "gdn.conv_upd" => gdn::conv_upd(dt),
@@ -267,16 +272,60 @@ pub fn resolve(req: OpReq) -> KernelPick {
         other => panic!(
             "driver::resolve(\"{other}\"): 未登记的语义算子命名空间 —— 动作词表住 models::ops::SemanticKernel(op_id 落本表),实现住本模块分派表(两侧须同票)"
         ),
+    };
+    // **几何门**(2026-10-13 P4;拾取即验):已建表算子的 `ShapeFamily`
+    // 声明必须接受当前模型几何。错配 = compose 期编程/配置错(与
+    // `aux 越界`/`无配对 wrapper` 同类)—— 在 boot warmup 阶段即暴露,
+    // 等价于拒启。未建表算子(仅引入)无声明 ⇒ 放行(白名单门管它)。
+    if let Some(m) = pick.meta() {
+        let q = crate::spec::ShapeQuery {
+            head_dim: req.env.head_dim,
+            page: req.env.page,
+            grp: req.env.grp,
+            tile: 0,
+        };
+        if let Err(why) = m.shape.accepts(&q) {
+            panic!(
+                "driver::resolve(\"{}\") -> {}: 几何不接受 —— {why}(算子 ShapeFamily 声明;模型几何 hd={} page={} grp={})",
+                req.op.0, m.entry, req.env.head_dim, req.env.page, req.env.grp
+            );
+        }
     }
+    pick
 }
 
 /// 一次拾取的产物:名字 + 发射配置(构造 [`Kernel`](crate::sources) 对应
 /// 的发射全部输入;grid 哨兵 (0,0,0) = 解释层按输出元素数自动 1D
 /// ceil/256,同登记表约)
+///
+/// # 准入声明(2026-10-13 P3)
+///
+/// **已建表算子经 [`KernelPick::of`] 拾取**:名字来自算子的 `ENTRY` 关联常量
+/// (driver 里不再出现该核名字面量),元数据经 [`KernelPick::meta`] 取到。
+/// 未建表算子继续用结构体字面量构造 —— 它们处在"仅引入"状态(`meta()` = None),
+/// P4 的生产白名单硬门保证它们进不了生产档。
+///
+/// 为什么不把 `meta` 做成字段:driver 里有 131 处 `KernelPick { .. }` 字面量,
+/// 加字段 = 131 处纯机械改写(设计稿 §十"更名/瘦身带来大面积 diff"的风险面)。
+/// 改成**按名查表**(`meta()`)后:生产臂用 `of::<T>()` 拿到类型耦合的名字,
+/// 未建表臂零改动,语义等价而 diff 最小。
 #[derive(Clone, Debug)]
 pub struct KernelPick {
     pub name: &'static str,
     pub shape: Shape,
+}
+
+impl KernelPick {
+    /// **按 `KernelSpec` 拾取**(生产臂用):名字 = 算子关联常量,
+    /// 元数据/槽序/检查函数随之而来(编译期耦合,名字不可能写错)。
+    pub const fn of<T: crate::spec::KernelSpec>(shape: Shape) -> Self {
+        Self { name: T::ENTRY, shape }
+    }
+
+    /// 本算子的准入声明(未建表 = `None`,即"仅引入")
+    pub fn meta(&self) -> Option<&'static crate::spec::KernelMeta> {
+        crate::ops::meta(self.name)
+    }
 }
 
 /// 哨兵 1D 发射形态(逐元素/批量核的公共形态)
@@ -1070,12 +1119,12 @@ pub mod attn {
 
     /// XQA verify 注意力(foreign 家族臂;host 函数发射,workspace 在 runtime)
     pub fn xqa_verify() -> KernelPick {
-        KernelPick { name: crate::contract::names::VERIFY_XQA, shape: FOREIGN }
+        KernelPick::of::<crate::ops::xqa::XqaVerify>(FOREIGN)
     }
 
     /// XQA 裸 decode 注意力(q=1;foreign 家族臂;第二份实例化 `M_TILESIZE=16`)
     pub fn xqa_decode() -> KernelPick {
-        KernelPick { name: crate::contract::names::DECODE_XQA, shape: FOREIGN }
+        KernelPick::of::<crate::ops::xqa::XqaDecode>(FOREIGN)
     }
 
     /// FlashInfer paged prefill(foreign 家族臂;plan 缓存 + run 在家族 runtime)
@@ -1163,14 +1212,11 @@ pub mod attn {
         hd: usize,
         _half: usize,
     ) -> KernelPick {
-        KernelPick {
-            name: "owl_qknorm_rope_kv_insert_f16_fp8kv_knhd",
-            shape: Shape {
-                grid: (tokens as u32, (hq + hkv) as u32, 1),
-                block: (hd as u32, 1, 1),
-                smem: (hd * 4) as u32,
-            },
-        }
+        KernelPick::of::<crate::ops::fused::QknormRopeKvInsertF16Fp8Knhd>(Shape {
+            grid: (tokens as u32, (hq + hkv) as u32, 1),
+            block: (hd as u32, 1, 1),
+            smem: (hd * 4) as u32,
+        })
     }
 
     /// B6.3:fp8 e4m3 主池变体(几何逐字同 f16;cache 形参 u8 寻址)
@@ -1204,10 +1250,11 @@ pub mod attn {
     }
 
     pub fn k0_write_fp8_knhd(tokens: usize) -> KernelPick {
-        KernelPick {
-            name: "owl_reshape_and_cache_fp8kv_knhd",
-            shape: Shape { grid: (tokens as u32, 1, 1), block: (256, 1, 1), smem: 0 },
-        }
+        KernelPick::of::<crate::ops::attn::K0WriteFp8Knhd>(Shape {
+            grid: (tokens as u32, 1, 1),
+            block: (256, 1, 1),
+            smem: 0,
+        })
     }
 
     /// paged prefill 的 Hw 占位(谓词用;env 之外不可得时)
@@ -1420,8 +1467,8 @@ mod tests {
     #[test]
     fn attn_paged_decode_pairing_and_smem() {
         use super::attn;
-        let env32 = OpEnv { hw: Hw { arch: crate::Arch::Sm86 }, page: 32 };
-        let env16 = OpEnv { hw: Hw { arch: crate::Arch::Sm86 }, page: 16 };
+        let env32 = OpEnv { hw: Hw { arch: crate::Arch::Sm86 }, page: 32, head_dim: 256, grp: 6 };
+        let env16 = OpEnv { hw: Hw { arch: crate::Arch::Sm86 }, page: 16, head_dim: 256, grp: 6 };
         // 页配对律:wrapper 随页(32→bs32/TG1,16→bs16/TG2)
         assert_eq!(
             attn::paged_decode_v1(&env32, DType::F16, 256, 24, 4, 2).name,
@@ -1446,7 +1493,7 @@ mod tests {
         assert!(!attn::paged_decode_ok(256, 8));
         assert!(attn::paged_prefill_ok(256, 32) && !attn::paged_prefill_ok(256, 16));
         assert!(!attn::paged_prefill_ok(64, 32));
-        let env = OpEnv { hw: Hw { arch: crate::Arch::Sm86 }, page: 32 };
+        let env = OpEnv { hw: Hw { arch: crate::Arch::Sm86 }, page: 32, head_dim: 256, grp: 6 };
         let p = attn::paged_prefill(&env, DType::F16, 256, 4, 24, 300);
         assert_eq!(p.name, "vllm_chunked_prefill_paged_attn_opt_f16_hd256");
         assert_eq!(p.shape.grid, (6, 4, 2)); // ceil(300/256)=2

@@ -247,6 +247,7 @@ pub async fn load_27b_dflash2_with<D: DeviceClient + 'static>(
                     * match e.dtype {
                         crate::contract::Dtype::F16 | crate::contract::Dtype::BF16 => 2,
                         crate::contract::Dtype::F32 | crate::contract::Dtype::U32 => 4,
+                        crate::contract::Dtype::U8 => 1,
                     };
                 let key = format!("{:?}/{:?}", e.dtype, e.layout);
                 let e2 = agg.entry(key).or_insert((0, 0));

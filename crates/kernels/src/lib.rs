@@ -15,6 +15,14 @@ pub mod contract;
 /// "登记表"才是它的本体,native/foreign 之别交给 driver/registry)
 pub mod list;
 
+/// 生产算子元数据表(P3;`impl KernelSpec` 声明,按域分模块)
+pub mod ops;
+
+/// 算子准入契约(单算子声明式元数据:参数表/形状族/池访问/数值律 +
+/// 编译期擦除 KernelMeta;2026-10-13 P3,**零 feature 门** —— models 经
+/// driver 的 KernelPick 消费同一份元数据,不需要 device 面)
+pub mod spec;
+
 /// 家族底座(资产/FFI/ABI:两平面共用的单源 —— cubins/OwlCublas/marlin
 /// FFI/flashinfer FFI;cublas/marlin/flashinfer 随各自 FFI feature 门)
 pub mod family;
@@ -23,8 +31,8 @@ pub mod family;
 /// 客户端平面(类型化 Call builder + 线格式单源;models 视角,
 /// 零 cudarc 依赖 —— 随 lib 全 feature 可用)
 pub mod client;
-/// 服务端平面(家族 runtime:registry::KernelSpec 实现;feature=device ——
-/// KernelSpec 签名引用 device::Exec)
+/// 服务端平面(家族 runtime:KernelFamily 实现;feature=device ——
+/// KernelFamily 签名引用 device::Exec)
 #[cfg(feature = "device")]
 pub mod server;
 
@@ -34,8 +42,8 @@ pub mod server;
 #[cfg(feature = "device")]
 pub mod device;
 
-/// 算子注册表(OpId 唯一住址 + KernelSpec 面 + OpRegistry;
-/// 同属服务端面 —— KernelSpec 签名引用 device::Exec,随 device 门)
+/// 算子注册表(OpId 唯一住址 + KernelFamily 面 + OpRegistry;
+/// 同属服务端面 —— KernelFamily 签名引用 device::Exec,随 device 门)
 #[cfg(feature = "device")]
 pub mod registry;
 

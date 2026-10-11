@@ -155,8 +155,10 @@ pub struct GdnScalarCallBuilder {
 
 impl GdnScalarCallBuilder {
     fn check(&self, b: &Bytes, want: usize, field: &'static str) -> Result<(), OpError> {
+        // 全局硬律 numel > 0(零长形状 ⇒ 结构化拒,带槽名 + 块 id)
+        crate::contract::require_numel(want, field, GDN_SCALAR, b.id)?;
         if b.len != 0 && b.len != want {
-            return Err(contract(field, &format!("{want} elems"), &b.len.to_string()));
+            return Err(contract(field, &format!("{want} elems"), &format!("块 id={} len={}", b.id, b.len)));
         }
         Ok(())
     }

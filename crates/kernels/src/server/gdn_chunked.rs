@@ -23,7 +23,7 @@ use crate::device::{DeviceRes, Exec, LaunchVal, ScratchBuf};
 use crate::family::gdn_chunked::cubins;
 use crate::family::gdn_chunked::cubins::launch as LC;
 use crate::client::gdn_chunked::{GdnChunkedCall, GDN_CHUNKED};
-use crate::registry::KernelSpec;
+use crate::registry::{FamilyGuard, KernelFamily};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -90,12 +90,21 @@ fn ensure_one(
 /// 家族 runtime(FamilyRuntime;注册于 backends::ops M4 切换面)
 #[derive(Default)]
 pub struct GdnChunkedRuntime {
-    loaded: bool,
     fns: HashMap<&'static str, Arc<CudaFunction>>,
     scratch: Scratch,
 }
 
-impl KernelSpec for GdnChunkedRuntime {
+impl GdnChunkedRuntime {
+    /// 本族算子表(单名已建表 ⇒ `names()` 由本表派生)
+    const OPS: &'static [&'static crate::spec::KernelMeta] =
+        &[&crate::ops::gdn_chunked::GDN_CHUNKED_FWD];
+}
+
+impl KernelFamily for GdnChunkedRuntime {
+    fn ops(&self) -> &'static [&'static crate::spec::KernelMeta] {
+        Self::OPS
+    }
+
     fn id(&self) -> OpId {
         OP
     }
@@ -104,12 +113,12 @@ impl KernelSpec for GdnChunkedRuntime {
         crate::contract::Linkage::AotCubin
     }
 
-    /// boot 装配:六 cubin(符号逐一校验 = P4 门)+ cast nvrtc + setattr
-    fn validate(&self) -> Result<(), OpError> { Ok(()) }
-    fn init(&mut self, res: &mut dyn crate::device::DeviceRes, exec: &mut crate::device::Exec) -> Result<(), OpError> {
-        if self.loaded {
-            return Ok(());
-        }
+    /// 构造函数:六 cubin(符号逐一校验 = 装配门)+ cast nvrtc + setattr
+    fn assemble(
+        res: &mut dyn crate::device::DeviceRes,
+        exec: &mut crate::device::Exec,
+    ) -> Result<Box<dyn KernelFamily>, OpError> {
+        let mut me = GdnChunkedRuntime::default();
         let table: &[(&'static str, &[u8], &'static str)] = &[
             ("cumsum", cubins::CUMSUM, "chunk_local_cumsum_scalar_kernel"),
             ("kkt", cubins::KKT, "chunk_scaled_dot_kkt_fwd_kernel"),
@@ -120,7 +129,7 @@ impl KernelSpec for GdnChunkedRuntime {
         ];
         for (name, bytes, symbol) in table {
             let f = exec.load_cubin(res, ASSET, bytes, symbol, OP)?;
-            self.fns.insert(name, f);
+            me.fns.insert(name, f);
         }
         for sym in [
             "owl_cast_f16_bf16",
@@ -131,17 +140,16 @@ impl KernelSpec for GdnChunkedRuntime {
         ] {
             let f = exec
                 .load_nvrtc(res, CAST, crate::sources::attention::CAST, sym, OP)?;
-            self.fns.insert(sym, f);
+            me.fns.insert(sym, f);
         }
         for (name, sz) in [
             ("wu", LC::WU_SHARED),
             ("h", LC::H_SHARED),
             ("o", LC::O_SHARED),
         ] {
-            Exec::set_shared_limit(self.fns.get(name).expect("刚装载"), sz)?;
+            Exec::set_shared_limit(me.fns.get(name).expect("刚装载"), sz)?;
         }
-        self.loaded = true;
-        Ok(())
+        Ok(FamilyGuard::boxed(me))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -159,7 +167,6 @@ impl KernelSpec for GdnChunkedRuntime {
         let Self {
             fns,
             scratch: st,
-            loaded: _,
         } = self;
         let f = |name: &str| -> Result<Arc<CudaFunction>, OpError> {
             fns.get(name).cloned().ok_or_else(|| OpError::Asset {

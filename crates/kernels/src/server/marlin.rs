@@ -3,9 +3,9 @@
 
 use crate::contract::{Bytes, LaunchMsg, OpError, OpId, Stage};
 
-use crate::client::marlin::{parse_gemm, GEMM_W4A16, GEMM_W4A16_AWQ, GEMM_W4A16_BF16};
+use crate::client::marlin::{parse_gemm, GEMM_W4A16, GEMM_W4A16_AWQ};
 use crate::family::marlin;
-use crate::registry::KernelSpec;
+use crate::registry::{FamilyGuard, KernelFamily};
 
 /// marlin 家族(f16/AWQ/bf16 三名;一个 runtime 实例按名分派。
 /// 名字 = client face re-export(contract::names 单源),零本地字面量
@@ -13,22 +13,34 @@ use crate::registry::KernelSpec;
 #[derive(Default)]
 pub struct MarlinRuntime;
 
-impl KernelSpec for MarlinRuntime {
+impl MarlinRuntime {
+    /// 本族算子表(marlin 三名**全建表** ⇒ `names()` 由本表派生,不再手列)
+    const OPS: &'static [&'static crate::spec::KernelMeta] = &[
+        &crate::ops::marlin::W4A16_F16,
+        &crate::ops::marlin::W4A16_AWQ,
+        &crate::ops::marlin::W4A16_BF16,
+    ];
+}
+
+impl KernelFamily for MarlinRuntime {
     fn id(&self) -> OpId {
         OpId(GEMM_W4A16)
     }
 
-    fn names(&self) -> Vec<&'static str> {
-        vec![GEMM_W4A16, GEMM_W4A16_AWQ, GEMM_W4A16_BF16]
+    fn ops(&self) -> &'static [&'static crate::spec::KernelMeta] {
+        Self::OPS
     }
 
     fn linkage(&self) -> crate::contract::Linkage {
         crate::contract::Linkage::StaticLib
     }
 
-    fn validate(&self) -> Result<(), OpError> { Ok(()) }
-    fn init(&mut self, _res: &mut dyn crate::device::DeviceRes, _exec: &mut crate::device::Exec) -> Result<(), OpError> {
-        Ok(()) // 纯 FFI 零句柄;链接期已解析
+    /// 构造函数:纯 FFI 零句柄;链接期已解析(装配门 = 无)
+    fn assemble(
+        _res: &mut dyn crate::device::DeviceRes,
+        _exec: &mut crate::device::Exec,
+    ) -> Result<Box<dyn KernelFamily>, OpError> {
+        Ok(FamilyGuard::boxed(MarlinRuntime))
     }
 
     fn run(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {

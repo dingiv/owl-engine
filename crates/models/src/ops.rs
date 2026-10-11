@@ -253,6 +253,13 @@ pub(crate) fn ddt(dt: crate::contract::Dtype) -> Result<owl_kernels::driver::DTy
         crate::contract::Dtype::BF16 => DType::BF16,
         crate::contract::Dtype::F32 => DType::F32,
         crate::contract::Dtype::U32 => DType::U32,
+        // U8 = 字节承载(e4m3 池等):不是激活域 dtype,进不了语义算子拾取
+        // (driver 的 DType 是"激活域"词表)。此路必须显式拒,不得静默降级。
+        crate::contract::Dtype::U8 => {
+            return Err(crate::contract::ModelError::Msg(
+                "ddt: U8 是字节承载(池块),不参与语义算子拾取".to_string(),
+            ))
+        }
     })
 }
 
@@ -488,16 +495,9 @@ pub fn lower_kernel(
     out: &Bytes,
     out_elems: usize,
 ) -> LaunchMsg {
-    // 槽序唯一权威:注册表签名优先,逃生舱 kernel 自带 sig
-    let sig: &str = match crate::kernel::lookup(kernel.name) {
-        Some(e) => e.args,
-        None if !kernel.sig.is_empty() => kernel.sig,
-        None => panic!(
-            "lower_kernel({}): 非注册 kernel 必须带 with_sig(槽序契约无权威即拒绝发射)",
-            kernel.name
-        ),
-    };
-    let toks: Vec<&str> = sig.split(',').collect();
+    // 槽序唯一权威(优先序:算子元数据 → 登记表 → 逃生舱签名;
+    // 2026-10-13 P3:已建表算子经 KernelSpec 的 PARAMS 派生,零第二份手抄)
+    let toks: Vec<&str> = kernel.slot_tokens();
     // 输出槽位:E3 起 sig 可含 "O"(输出块所在槽,marlin foreign 等
     // out 非末参的核);无 O = 末位 T(向后兼容)
     let out_pos = toks.iter().position(|t| *t == "O");
@@ -649,7 +649,7 @@ mod foreign_call_lock {
     use owl_kernels::driver::{OpEnv, OpReq};
 
     fn env() -> OpEnv {
-        OpEnv { hw: owl_kernels::driver::Hw { arch: owl_kernels::Arch::Sm86 }, page: 0 }
+        OpEnv { hw: owl_kernels::driver::Hw { arch: owl_kernels::Arch::Sm86 }, page: 0, head_dim: 0, grp: 0 }
     }
 
     /// 层声明形态(chunked;与 layers/gdn.rs 逐字同构)

@@ -46,6 +46,9 @@ pub enum ModelError {
     PoolExhausted { pool: String, needed: u64, available: u64 },
     /// 池块句柄死亡后被引用(令牌世代校验失败;哨兵①词汇)
     DeadBlock { id: u64 },
+    /// 跨账本解析:块 id 被拿到别家账本解析(pitfall §27 撞号案;
+    /// 把六步定位压成一行)
+    CrossLedger { id: u64, owner: u32, reader: u32 },
     /// 捕获事务违约(空窗/窗内非法操作/审计不一致)
     CaptureViolation { detail: String },
     /// server 不可达/已关闭
@@ -68,6 +71,9 @@ impl std::fmt::Display for ModelError {
                 write!(f, "PoolExhausted: {pool} 需 {needed}B 余 {available}B")
             }
             ModelError::DeadBlock { id } => write!(f, "DeadBlock: {id}"),
+            ModelError::CrossLedger { id, owner, reader } => {
+                write!(f, "跨账本块: 块 id={id} 属 ledger {owner},被 ledger {reader} 解析")
+            }
             ModelError::CaptureViolation { detail } => write!(f, "CaptureViolation: {detail}"),
             ModelError::ServerClosed => write!(f, "ServerClosed"),
             ModelError::Msg(m) => write!(f, "{m}"),

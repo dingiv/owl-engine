@@ -7,7 +7,7 @@
 use owl_kernels::server::cublas::CublasRuntime;
 use owl_kernels::contract::{Bytes, LaunchMsg, OpError};
 use owl_kernels::device::{DeviceRes, Exec, ScratchBuf};
-use owl_kernels::registry::KernelSpec;
+use owl_kernels::registry::KernelFamily;
 use std::collections::HashMap;
 use std::sync::Arc;
 use cudarc::driver::{CudaSlice, DevicePtr};
@@ -91,8 +91,7 @@ fn cublas_runtime_matches_host_matmul() {
     let dev: usize = std::env::var("OWL_TEST_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
     let mut res = TestRes::new(dev);
     let mut exec = Exec::new();
-    let mut rt = CublasRuntime::default();
-    rt.init(&mut res, &mut exec).expect("init");
+    let mut rt = <CublasRuntime as KernelFamily>::assemble(&mut res, &mut exec).expect("assemble");
 
     // C[2,3] = A[2,6] × W[3,6]^T(nt=true;owl Linear 形态)
     let (t, hidden, n_out) = (2usize, 6usize, 3usize);

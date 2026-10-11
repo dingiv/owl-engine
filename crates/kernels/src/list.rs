@@ -58,13 +58,17 @@ pub struct Kernel {
     pub source: &'static str,
     pub launch: LaunchShape,
     /// 逃生舱签名(非注册 kernel 必带;格式同 Entry.args,含末位输出 T)。
-    /// 注册 kernel 此字段留空 —— 槽序权威取注册表。
+    /// 注册 kernel 此字段留空 —— 槽序权威取注册表/算子元数据。
     pub sig: &'static str,
+    /// **算子准入声明**(2026-10-13 P3):已建表算子由
+    /// [`with_pick`](crate::list::with_pick) 从 `KernelPick` 带入;
+    /// 未建表(仅引入)与逃生舱核为 `None`。
+    pub meta: Option<&'static crate::spec::KernelMeta>,
 }
 
 impl Kernel {
     pub fn new(name: &'static str, source: &'static str) -> Self {
-        Self { name, source, launch: LaunchShape::default(), sig: "" }
+        Self { name, source, launch: LaunchShape::default(), sig: "", meta: None }
     }
 
     /// 显式发射配置(覆盖自动 1D)
@@ -77,6 +81,30 @@ impl Kernel {
     pub fn with_sig(mut self, sig: &'static str) -> Self {
         self.sig = sig;
         self
+    }
+
+    /// 挂算子准入声明(槽序/检查函数随之而来)
+    pub fn with_meta(mut self, meta: &'static crate::spec::KernelMeta) -> Self {
+        self.meta = Some(meta);
+        self
+    }
+
+    /// **槽序权威**(优先序):算子元数据 → 登记表 → 逃生舱签名。
+    /// 三条都是 `'static`,零分配;元数据在时它就是唯一真源。
+    pub fn slot_tokens(&self) -> Vec<&'static str> {
+        if let Some(m) = self.meta {
+            return m.slot_tokens();
+        }
+        let sig = match lookup(self.name) {
+            Some(e) => e.args,
+            None => self.sig,
+        };
+        assert!(
+            !sig.is_empty(),
+            "kernel::slot_tokens({}): 无元数据也无登记/逃生舱槽序 —— 拒发",
+            self.name
+        );
+        sig.split(',').collect()
     }
 }
 
@@ -398,9 +426,17 @@ pub fn kernel_with(name: &'static str, grid: (u32, u32, u32), block: (u32, u32, 
 
 /// 构造 Kernel 值(driver 拾取形态;**新调用点一律走此入口**,名字/参数
 /// 由 owl-kernels::driver 单源推导 —— 字符串核名与手抄 grid/block/smem
-/// 在 models 层属遗留,迁移完归零,grep 审计入验收)
+/// 在 models 层属遗留,迁移完归零,grep 审计入验收)。
+///
+/// **已建表算子**(`pick.meta()` 非空):名字/源码/槽序全部取算子自托管的
+/// 元数据(foreign 家族 `SOURCE` 为空 ⇒ 源码为空串,server 走家族 FFI);
+/// **未建表**(仅引入):回落登记表取源。
 pub fn with_pick(p: crate::driver::KernelPick) -> Kernel {
-    kernel_with(p.name, p.shape.grid, p.shape.block, p.shape.smem)
+    let launch = LaunchShape { grid: p.shape.grid, block: p.shape.block, shared_mem: p.shape.smem };
+    match p.meta() {
+        Some(m) => Kernel { name: m.entry, source: m.source, launch, sig: "", meta: Some(m) },
+        None => Kernel { name: p.name, source: source(p.name), launch, sig: "", meta: None },
+    }
 }
 
 /// 发射配置便捷(与 kernel_with 同参,LaunchShape 形态)
@@ -408,6 +444,100 @@ pub fn launch_shape(grid: (u32, u32, u32), block: (u32, u32, u32), shared_mem: u
     LaunchShape { grid, block, shared_mem }
 }
 
+
+// ============================================================================
+// §3 `.cu` 签名解析(机器互证;唯一解析器 —— 测试门与算子准入门共用,
+//    两道门不许各写一遍,否则会各说各话)
+// ============================================================================
+
+/// 解析 .cu 源里 `extern "C" __global__ void <name>(...)` 的形参序列,
+/// 映射为 Entry.args 同构字符串(无 regex,朴素扫描)。
+/// 形参序列 → Entry.args 词表字符串(T/sz/i32/f32;三种核形态共用)
+pub fn map_params(params: &str, name: &str, kind: &str) -> String {
+    params
+        .split(',')
+        .map(|p| {
+            let p = p
+                .replace("const ", "")
+                .replace("__restrict__ ", "")
+                .replace('\\', " ")
+                .trim()
+                .to_string();
+            if p.contains('*') {
+                "T".to_string()
+            } else if p.contains("size_t") || p.contains("unsigned long long") {
+                "sz".to_string()
+            } else if p.contains("float") {
+                "f32".to_string()
+            } else if p.contains("int") {
+                // 含 unsigned int:4 字节无符号 —— Arg 无此宽度,登记表禁止
+                assert!(!p.contains("unsigned"), "{name}: 禁止 unsigned int 形参(用 size_t;Arg::U64 8 字节对位)");
+                "i32".to_string()
+            } else {
+                panic!("{name}: 无法识别的{kind}形参 `{p}`(args 词表:T/sz/i32/f32)");
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// 从 `text[start..]` 截到首个 `)` 的形参串 → 词表
+pub fn params_at(text: &str, start: usize, name: &str, kind: &str) -> Option<String> {
+    let end = text[start..].find(')')? + start;
+    Some(map_params(&text[start..end], name, kind))
+}
+
+pub fn parse_cu_sig(source: &str, name: &str) -> Option<String> {
+    // 剥行注释(形参注记含逗号/括号,会干扰边界与切分)+ **折叠宏续行**
+    // (`\` + 换行 → 空格:宏体形参住在续行里,不折叠则形参串被反斜杠污染)
+    let clean: String = source
+        .lines()
+        .map(|l| l.split("//").next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace("\\\n", " ");
+    // 形态 1:宏展开核(F5 ops_pair):实例行 `OWL_<FAMILY>_KERNEL(<name>, <T>, PARAMS)`
+    // —— PARAMS 自带类型化形参,机器对账以实例为准(C2 不弱化)
+    for line in clean.lines() {
+        let t = line.trim();
+        if t.starts_with("OWL_") && t.contains("KERNEL(") {
+            if let Some(rest) = t.split_once('(').map(|x| x.1) {
+                let mut parts = rest.splitn(3, ',');
+                if parts.next().map(|x| x.trim()) == Some(name) {
+                    let params = parts
+                        .nth(1)
+                        .and_then(|p| p.trim().strip_prefix('('))
+                        .and_then(|p| p.strip_suffix(')'))
+                        .unwrap_or("");
+                    return Some(map_params(params, name, "宏"));
+                }
+            }
+        }
+    }
+    // 形态 2:单层宏实例化核(chunked KNHD 族:`CHUNKED_KNHD_ENTRY(<name>, <hd>, <kv_fp8>)`)
+    // — 实例行只带实参,形参住在 `#define <MACRO>(<首形参>, …)` 的定义体
+    //   `void <首形参>(…)` 里:按定义体取参,与字面核同口径(名字门不弱化)
+    for line in clean.lines() {
+        let t = line.trim();
+        let Some((mac, rest)) = t.split_once('(') else { continue };
+        if mac.is_empty() || !mac.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        if rest.split(',').next().map(str::trim) != Some(name) {
+            continue;
+        }
+        let def_anchor = format!("#define {mac}(");
+        let Some(d) = clean.find(&def_anchor) else { continue };
+        let formal = clean[d + def_anchor.len()..].split(',').next()?.trim().to_string();
+        let body_anchor = format!("void {formal}(");
+        let Some(s) = clean[d..].find(&body_anchor) else { continue };
+        return params_at(&clean[d..], s + body_anchor.len(), name, "宏");
+    }
+    // 形态 3:字面核 `extern "C" __global__ void <name>(…)`
+    let anchor = format!("__global__ void {name}(");
+    let start = clean.find(&anchor)? + anchor.len();
+    params_at(&clean, start, name, "")
+}
 
 #[cfg(test)]
 mod tests {
@@ -525,94 +655,6 @@ mod tests {
     // C2:登记 args ↔ .cu 实签名互证(u32/sz 错位、out 位置两雷的机器拦截)
     // ======================================================================
 
-    /// 解析 .cu 源里 `extern "C" __global__ void <name>(...)` 的形参序列,
-    /// 映射为 Entry.args 同构字符串(无 regex,朴素扫描)。
-    /// 形参序列 → Entry.args 词表字符串(T/sz/i32/f32;三种核形态共用)
-    fn map_params(params: &str, name: &str, kind: &str) -> String {
-        params
-            .split(',')
-            .map(|p| {
-                let p = p
-                    .replace("const ", "")
-                    .replace("__restrict__ ", "")
-                    .replace('\\', " ")
-                    .trim()
-                    .to_string();
-                if p.contains('*') {
-                    "T".to_string()
-                } else if p.contains("size_t") || p.contains("unsigned long long") {
-                    "sz".to_string()
-                } else if p.contains("float") {
-                    "f32".to_string()
-                } else if p.contains("int") {
-                    // 含 unsigned int:4 字节无符号 —— Arg 无此宽度,登记表禁止
-                    assert!(!p.contains("unsigned"), "{name}: 禁止 unsigned int 形参(用 size_t;Arg::U64 8 字节对位)");
-                    "i32".to_string()
-                } else {
-                    panic!("{name}: 无法识别的{kind}形参 `{p}`(args 词表:T/sz/i32/f32)");
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(",")
-    }
-
-    /// 从 `text[start..]` 截到首个 `)` 的形参串 → 词表
-    fn params_at(text: &str, start: usize, name: &str, kind: &str) -> Option<String> {
-        let end = text[start..].find(')')? + start;
-        Some(map_params(&text[start..end], name, kind))
-    }
-
-    fn parse_cu_sig(source: &str, name: &str) -> Option<String> {
-        // 剥行注释(形参注记含逗号/括号,会干扰边界与切分)+ **折叠宏续行**
-        // (`\` + 换行 → 空格:宏体形参住在续行里,不折叠则形参串被反斜杠污染)
-        let clean: String = source
-            .lines()
-            .map(|l| l.split("//").next().unwrap_or(""))
-            .collect::<Vec<_>>()
-            .join("\n")
-            .replace("\\\n", " ");
-        // 形态 1:宏展开核(F5 ops_pair):实例行 `OWL_<FAMILY>_KERNEL(<name>, <T>, PARAMS)`
-        // —— PARAMS 自带类型化形参,机器对账以实例为准(C2 不弱化)
-        for line in clean.lines() {
-            let t = line.trim();
-            if t.starts_with("OWL_") && t.contains("KERNEL(") {
-                if let Some(rest) = t.split_once('(').map(|x| x.1) {
-                    let mut parts = rest.splitn(3, ',');
-                    if parts.next().map(|x| x.trim()) == Some(name) {
-                        let params = parts
-                            .nth(1)
-                            .and_then(|p| p.trim().strip_prefix('('))
-                            .and_then(|p| p.strip_suffix(')'))
-                            .unwrap_or("");
-                        return Some(map_params(params, name, "宏"));
-                    }
-                }
-            }
-        }
-        // 形态 2:单层宏实例化核(chunked KNHD 族:`CHUNKED_KNHD_ENTRY(<name>, <hd>, <kv_fp8>)`)
-        // — 实例行只带实参,形参住在 `#define <MACRO>(<首形参>, …)` 的定义体
-        //   `void <首形参>(…)` 里:按定义体取参,与字面核同口径(名字门不弱化)
-        for line in clean.lines() {
-            let t = line.trim();
-            let Some((mac, rest)) = t.split_once('(') else { continue };
-            if mac.is_empty() || !mac.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                continue;
-            }
-            if rest.split(',').next().map(str::trim) != Some(name) {
-                continue;
-            }
-            let def_anchor = format!("#define {mac}(");
-            let Some(d) = clean.find(&def_anchor) else { continue };
-            let formal = clean[d + def_anchor.len()..].split(',').next()?.trim().to_string();
-            let body_anchor = format!("void {formal}(");
-            let Some(s) = clean[d..].find(&body_anchor) else { continue };
-            return params_at(&clean[d..], s + body_anchor.len(), name, "宏");
-        }
-        // 形态 3:字面核 `extern "C" __global__ void <name>(…)`
-        let anchor = format!("__global__ void {name}(");
-        let start = clean.find(&anchor)? + anchor.len();
-        params_at(&clean, start, name, "")
-    }
 
     #[test]
     fn registry_sig_matches_cu_signatures() {

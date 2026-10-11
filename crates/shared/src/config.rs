@@ -220,7 +220,7 @@ pub struct LoadCfg {
 
 /// 解释器分派面(models EnvProvider 组装源;**正语义** —— true = 开,
 /// env 面的 NO_FUSE 反开关是兼容遗留,不入 toml)
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DispatchCfg {
     /// W2 qkv 融合(缺省真;2026-10-04 k-probe 硬门定谳)
@@ -255,6 +255,16 @@ pub struct DispatchCfg {
     pub resolve_trace: bool,
     pub host_argmax: bool,
     pub ts_probe: bool,
+    /// **生产算子白名单**(设计 §八 P4「白名单硬门」;`None`/空 = 门关)。
+    ///
+    /// 非空 ⇒ 只允许这些算子发射:未列出的算子**发射即结构化拒**
+    /// (deny-by-default)。语义 = "本档位需要的算子集合" —— 生产档显式列全,
+    /// dev/诊断档留空(门关)。
+    ///
+    /// 为什么是硬门:未建表(仅引入)的算子不该在不知道它契约的情况下进生产;
+    /// 而"哪些算子在跑"此前**无人知道**(实测靠 `launch_time` 日志数)。
+    /// 装配期还会用本表跑**池写集穷举审计**(`ops::audit_active`)。
+    pub allowed_ops: Option<Vec<String>>,
 }
 
 /// 诊断探针族(全域布尔;boot 一次解析,热路径零 env)
@@ -401,6 +411,7 @@ impl Default for DispatchCfg {
             resolve_trace: false,
             host_argmax: false,
             ts_probe: false,
+            allowed_ops: None,
         }
     }
 }
@@ -448,6 +459,25 @@ prefix_cache = false
 
 [sampling]
 mode = "greedy"
+
+[dispatch]
+# 裸 27B 档白名单(实测 27 个;与 kernels `ops::PROD_AWQ27B_2026_10_13` 一致)
+allowed_ops = [
+        "cublas_gemm_f16", "flashinfer_prefill_paged_fp8kv",
+        "marlin_gemm_w4a16_awq", "owl_add_f16",
+        "owl_argmax_f32idx_f16", "owl_ct_repack_u32",
+        "owl_embed_f16", "owl_fused_add_rmsnorm_f16",
+        "owl_gdn_conv_fwd_f16", "owl_gdn_conv_upd_dual_f16",
+        "owl_gdn_decode_step_v2_f16", "owl_gdn_gating_g_f16",
+        "owl_gdn_l2norm_f16", "owl_gdn_norm_act_f16",
+        "owl_gdn_recurrence_varlen_gqa_f16", "owl_gemv_dual_f16",
+        "owl_narrow_strided_f16", "owl_norm_rope_f16",
+        "owl_qknorm_rope_kv_insert_f16_fp8kv_knhd", "owl_reshape_and_cache_fp8kv_knhd",
+        "owl_rmsnorm_f16", "owl_sigmoid_f16",
+        "owl_sigmoid_gate_mul_f16", "owl_silu_and_mul_f16",
+        "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256", "vllm_paged_attention_v2_fp8_knhd_hd256bs32",
+        "vllm_paged_attention_v2_reduce_f16_hd256",
+]
 "#,
     ),
     (
@@ -500,6 +530,34 @@ prefix_cache = false
 
 [dispatch]
 kv_fp8 = true
+# **生产算子白名单**(P4 硬门;清单 = 实测台账,与 kernels
+# `ops::PROD_SPEC_DFLASH_2026_10_13` 逐项一致 —— 由 apps/server 的门测试锁死)。
+# 非空 ⇒ 未列出的算子发射即结构化拒(deny-by-default);装配期还会用它跑
+# 池写集穷举审计(读必有人写 + 声明自洽 + 活跃写者不歧义)。
+allowed_ops = [
+        "cublas_gemm_bf16", "cublas_gemm_f16",
+        "flashinfer_prefill_paged_fp8kv", "gdn_chunked_delta_rule_fwd",
+        "marlin_gemm_w4a16_awq", "marlin_gemm_w4a16_bf16",
+        "owl_add_bf16", "owl_add_f16",
+        "owl_argmax_f32idx_f16", "owl_cast_bf16_f16",
+        "owl_cast_f16_bf16", "owl_concat_rows_f16",
+        "owl_concat_rows_f32", "owl_ct_repack_u32",
+        "owl_dflash_conv_bf16", "owl_dflash_select_bf16",
+        "owl_embed_f16", "owl_fused_add_rmsnorm_bf16",
+        "owl_fused_add_rmsnorm_f16", "owl_gdn_conv_fwd_f16",
+        "owl_gdn_conv_upd_dual_f16", "owl_gdn_decode_step_v2_f16",
+        "owl_gdn_gating_g_f16", "owl_gdn_l2norm_f16",
+        "owl_gdn_norm_act_f16", "owl_gdn_recurrence_varlen_gqa_f16",
+        "owl_gemv_dual_f16", "owl_naive_attn_nc_bf16_v2",
+        "owl_narrow_strided_f16", "owl_norm_rope_bf16",
+        "owl_norm_rope_f16", "owl_qknorm_rope_kv_insert_f16_fp8kv_knhd",
+        "owl_reshape_and_cache_fp8kv_knhd", "owl_rmsnorm_bf16",
+        "owl_rmsnorm_f16", "owl_sigmoid_f16",
+        "owl_sigmoid_gate_mul_f16", "owl_silu_and_mul_bf16",
+        "owl_silu_and_mul_f16", "owl_topk16_f16",
+        "owl_xqa_decode", "owl_xqa_verify",
+        "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256", "vllm_reshape_and_cache_bf16",
+]
 # XQA verify 臂(2026-10-13 D3 **转正**):恒等门 3/3 稳定绿(spec ≡ 无 spec
 # 逐 token;fp8 池 + 27B + DFlash2),verify 纯时 65.2→31.2ms、8192 spec
 # decode 27.7→47.0 t/s(+70%,且首次反超同池裸档 36.4)。形状不匹配时层侧

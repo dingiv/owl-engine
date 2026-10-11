@@ -6,7 +6,7 @@
 use crate::contract::{Bytes, LaunchMsg, OpError, OpId};
 
 use crate::client::cublas::{parse_gemm, GEMM_BF16, GEMM_F16};
-use crate::registry::KernelSpec;
+use crate::registry::{FamilyGuard, KernelFamily};
 use crate::family::cublas::OwlCublas;
 
 
@@ -15,25 +15,32 @@ pub struct CublasRuntime {
     blas: Option<OwlCublas>,
 }
 
+impl CublasRuntime {
+    /// 本族算子表(两名全建表 ⇒ `names()` 由本表派生)
+    const OPS: &'static [&'static crate::spec::KernelMeta] =
+        &[&crate::ops::cublas::GEMM_F16, &crate::ops::cublas::GEMM_BF16];
+}
 
-impl KernelSpec for CublasRuntime {
+
+impl KernelFamily for CublasRuntime {
     fn id(&self) -> OpId {
         OpId(GEMM_F16)
     }
 
-    fn names(&self) -> Vec<&'static str> {
-        vec![GEMM_F16, GEMM_BF16]
+    fn ops(&self) -> &'static [&'static crate::spec::KernelMeta] {
+        Self::OPS
     }
 
     fn linkage(&self) -> crate::contract::Linkage {
         crate::contract::Linkage::StaticLib
     }
 
-    fn validate(&self) -> Result<(), OpError> { Ok(()) }
-    fn init(&mut self, res: &mut dyn crate::device::DeviceRes, _exec: &mut crate::device::Exec) -> Result<(), OpError> {
-        if self.blas.is_some() {
-            return Ok(());
-        }
+    /// 构造函数:OwlCublas 句柄预钉(ensure_blas 律:构造期急切,
+    /// 捕获内首次初始化事故类结构性消灭)
+    fn assemble(
+        res: &mut dyn crate::device::DeviceRes,
+        _exec: &mut crate::device::Exec,
+    ) -> Result<Box<dyn KernelFamily>, OpError> {
         let stream = res.stream()?;
         let blas = OwlCublas::new(stream.clone())
             .map_err(|e| OpError::Asset { op: GEMM_F16.into(), detail: format!("cublas handle: {e}") })?;
@@ -45,8 +52,7 @@ impl KernelSpec for CublasRuntime {
         // 定谳为毒源则本注释升级为永久禁用依据。捕获期 gemv splitK 在
         // 悬置期间会走池分配(MEM_ALLOC/FREE 节点回归)—— 图捕获联调前
         // 必须先结本案。
-        self.blas = Some(blas);
-        Ok(())
+        Ok(FamilyGuard::boxed(CublasRuntime { blas: Some(blas) }))
     }
 
     fn run(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, _exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {

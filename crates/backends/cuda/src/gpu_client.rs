@@ -100,6 +100,10 @@ impl DeviceClient for GpuClient {
         Some(owl_kernels::driver::OpEnv {
             hw: owl_kernels::driver::Hw { arch: owl_kernels::Arch::Sm86 },
             page: 0, // 页项由解释器从页策略单源补齐(kv_paged_policy)
+            // 几何事实由引擎 boot 从 ModelDims 合入(EnvProvider::op_env);
+            // 后端自述面拿不到模型几何 ⇒ 0 = 未知(几何门跳过)
+            head_dim: 0,
+            grp: 0,
         })
     }
 

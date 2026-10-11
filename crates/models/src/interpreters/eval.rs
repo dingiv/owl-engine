@@ -65,6 +65,8 @@ pub(crate) fn decode_host(dtype: Dtype, buf: &[u8]) -> Vec<f32> {
             .chunks_exact(4)
             .map(|c| f32::from_bits(u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
             .collect(),
+        // U8(字节池):逐字节转 f32(观测面只用于统计量级;池内容不是激活)
+        Dtype::U8 => buf.iter().map(|b| *b as f32).collect(),
     }
 }
 
@@ -435,8 +437,13 @@ where
             let mut env = ctx.face.op_env().unwrap_or(owl_kernels::driver::OpEnv {
                 hw: owl_kernels::driver::Hw { arch: owl_kernels::Arch::Sm86 },
                 page: 0,
+                head_dim: 0,
+                grp: 0,
             });
             env.page = crate::module::kv_paged_policy(dtype).map(|p| p.page).unwrap_or(0);
+            // 几何事实自 env 单源补齐(与页同律:解释器 = env 注入点)
+            env.head_dim = ctx.env.kv.head_dim;
+            env.grp = ctx.env.kv.grp;
             let shapes: Vec<Vec<usize>> = t.parents.iter().map(|p| p.shape.clone()).collect();
             let scalars: Vec<i64> = t.args.iter().filter_map(|a| match a {
                 crate::ops::KernelArg::Bits(v) => Some(*v as i64),
@@ -455,12 +462,18 @@ where
                 eprintln!("[call] {:?} -> {} grid={:?} block={:?} smem={} n_elems={}",
                     op, pick.name, pick.shape.grid, pick.shape.block, pick.shape.smem, n_elems);
             }
-            // foreign 家族臂(2026-10-12 用户律:gdn 两臂入词表):名字不在
-            // native 登记表(无 .cu 源,server 按名分派家族 runtime);
-            // 槽序 sig = 家族线契约单源(owl_kernels::client face)
-            let kernel = match crate::ops::foreign_sig(pick.name) {
-                Some(sig) => crate::kernel::Kernel::new(pick.name, "").with_sig(sig),
-                None => crate::kernel::with_pick(pick),
+            // 统一构造(2026-10-13 P3 算子准入):
+            // ① 已建表算子(meta 在场)⇒ 名字/源码/槽序全取算子元数据,
+            //    foreign 家族臂的 SOURCE 为空 ⇒ server 走家族 FFI;
+            // ② 未建表 foreign 臂 ⇒ 家族线契约 sig(face 单源);
+            // ③ 未建表 native ⇒ 登记表(仅引入)
+            let kernel = if pick.meta().is_some() {
+                crate::kernel::with_pick(pick)
+            } else {
+                match crate::ops::foreign_sig(pick.name) {
+                    Some(sig) => crate::kernel::Kernel::new(pick.name, "").with_sig(sig),
+                    None => crate::kernel::with_pick(pick),
+                }
             };
             // 以下 = 统一发射面(登记表 dtype 守门 + alloc + lower + launch)
             if let Some(e) = crate::kernel::lookup(kernel.name) {

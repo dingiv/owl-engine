@@ -273,6 +273,10 @@ impl<D: DeviceClient + 'static> Engine<D> {
         if let Some(oe) = self.face.op_env() {
             env.hw = owl_models::env::HwEnv::Cuda(oe.hw.arch);
         }
+        // 模型几何事实合入(2026-10-13 P4:算子准入的几何门对账面)——
+        // 与 hw 同律:引擎 = 环境事实来源,算子层零探测
+        env.kv.head_dim = hd;
+        env.kv.grp = hq.checked_div(hkv).unwrap_or(0);
         env.quant = loaded.quant_plan;
         // FI 面启用(量化恒 = 主池;影子池已删,本值只作"启用 + 池量化"携带)
         // FI 面启用条件 = **能力条件**(f16 池 + paged 页表),不是开关:

@@ -218,6 +218,9 @@ pub struct GdnChunkedCallBuilder {
 
 impl GdnChunkedCallBuilder {
     fn check(&self, b: &Bytes, want_elems: usize, field: &'static str) -> Result<(), OpError> {
+        // 全局硬律 numel > 0:形状派生长度为零 ⇒ 构造期结构化拒
+        // (带槽名 + 块 id,§5.3 ExtentLaw 哨兵)
+        crate::contract::require_numel(want_elems, field, GDN_CHUNKED, b.id)?;
         // Bytes.len = f32 元素口径账长;f16 块账长 = 元素数(C1 同律)。
         // len=0 = 叶子占位(裸 id),放行(测试域/特殊流)。
         if b.len != 0 && b.len != want_elems {
@@ -225,7 +228,7 @@ impl GdnChunkedCallBuilder {
                 op: GDN_CHUNKED.to_string(),
                 field,
                 expect: format!("{want_elems} elems (t·dim)"),
-                got: b.len.to_string(),
+                got: format!("块 id={} len={}", b.id, b.len),
             });
         }
         Ok(())
@@ -403,5 +406,21 @@ mod tests {
             Err(e) => panic!("期望 q 长度 Contract 错,实得 {e}"),
             Ok(_) => panic!("期望 q 长度 Contract 错,实得 Ok"),
         }
+    }
+
+    /// 零长槽哨兵(§5.3 ExtentLaw):形状派生长度为零 ⇒ 构造期结构化拒,
+    /// 错误带槽名 + 块 id(不是 panic、不是静默)。
+    #[test]
+    fn builder_rejects_zero_len_shape() {
+        let s = GdnShape { t: 0, nv: 48, nk: 16, kd: 128 };
+        let r = GdnChunkedCall::builder(s).q(&dummy(7, 0));
+        let msg = match r {
+            Err(e) => format!("{e}"),
+            Ok(_) => panic!("期望 q 零长 Contract 错,实得 Ok"),
+        };
+        assert_eq!(
+            msg,
+            "contract gdn_chunked_delta_rule_fwd: q 期望 numel ≥ 1(零长块/槽 = 上游形状 bug) 实得 块 id=7 numel=0"
+        );
     }
 }

@@ -16,7 +16,7 @@ use owl_kernels::server::gdn_chunked::GdnChunkedRuntime;
 use owl_kernels::contract::{Bytes, LaunchMsg};
 use owl_kernels::device::{DeviceRes, Exec, ScratchBuf};
 use owl_kernels::client::gdn_chunked::GdnChunkedCall;
-use owl_kernels::registry::KernelSpec;
+use owl_kernels::registry::KernelFamily;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -241,7 +241,7 @@ fn gdn_chunked_new_chain_matches_golden() {
     let dev: usize = std::env::var("OWL_TEST_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
     let mut res = TestRes::new(dev);
     let mut exec = Exec::new();
-    let mut rt = GdnChunkedRuntime::default();
+    let mut rt = <GdnChunkedRuntime as KernelFamily>::assemble(&mut res, &mut exec).expect("runtime assemble");
 
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/gdn_fla/cases");
     // (tag, T, tight)
@@ -297,8 +297,7 @@ fn gdn_chunked_new_chain_matches_golden() {
             .build().unwrap();
         let msg: LaunchMsg = call.to_launch(out_b.clone());
 
-        // ── 新链执行(init + run;Result 全链)──
-        rt.init(&mut res, &mut exec).expect("runtime init");
+        // ── 新链执行(run;Result 全链)──
         rt.run(&msg, &mut res, &mut exec).expect("runtime run");
         res.stream.synchronize().expect("sync");
 

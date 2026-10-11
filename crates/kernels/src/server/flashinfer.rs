@@ -7,12 +7,12 @@
 use crate::contract::{Bytes, LaunchMsg, OpError, OpId};
 use crate::device::ScratchBuf;
 
-use crate::client::flashinfer::{parse_prefill, PREFILL_FI, PREFILL_FI_FP8KV};
+use crate::client::flashinfer::{parse_prefill, PREFILL_FI};
 use crate::family::flashinfer::{
     owl_fi_prefill_plan, owl_fi_prefill_run, owl_fi_prefill_run_fp8kv,
     FI_FLOAT_WS_BYTES, FI_HOST_STAGING_BYTES, FI_INT_WS_BYTES,
 };
-use crate::registry::KernelSpec;
+use crate::registry::{FamilyGuard, KernelFamily};
 
 #[derive(Clone, Copy, PartialEq)]
 struct PlanKey {
@@ -23,6 +23,12 @@ struct PlanKey {
     hkv: usize,
     hd: usize,
     page: usize,
+}
+
+impl FiRuntime {
+    /// 本族已建表算子(子集:只有 fp8 臂)
+    const OPS: &'static [&'static crate::spec::KernelMeta] =
+        &[&crate::ops::flashinfer::PREFILL_FI_FP8KV];
 }
 
 pub struct FiRuntime {
@@ -48,27 +54,34 @@ impl FiRuntime {
     // —— 2026-10-12 review I-10 案(旧 N_F16/N_FP8KV 已删)
 }
 
-impl KernelSpec for FiRuntime {
+impl KernelFamily for FiRuntime {
     fn id(&self) -> OpId {
         OpId(PREFILL_FI)
     }
 
-    fn names(&self) -> Vec<&'static str> {
-        vec![PREFILL_FI, PREFILL_FI_FP8KV]
+    /// 本族**已建表**算子(fp8 臂;f16 臂未建表 —— 它由族主名承担,
+    /// 见 `KernelFamily::names()` 的 id ∪ ops 律)
+    fn ops(&self) -> &'static [&'static crate::spec::KernelMeta] {
+        Self::OPS
     }
 
     fn linkage(&self) -> crate::contract::Linkage {
         crate::contract::Linkage::StaticLib
     }
 
-    fn validate(&self) -> Result<(), OpError> { Ok(()) }
-    fn init(&mut self, res: &mut dyn crate::device::DeviceRes, _exec: &mut crate::device::Exec) -> Result<(), OpError> {
-        if self.float_ws.is_some() {
-            return Ok(());
-        }
-        self.float_ws = Some(res.alloc(FI_FLOAT_WS_BYTES, "fi.float_ws")?);
-        self.int_ws = Some(res.alloc(FI_INT_WS_BYTES, "fi.int_ws")?);
-        Ok(())
+    /// 构造函数:workspace 预钉(float 64MB + int 32MB;构造期,
+    /// 捕获内首次初始化事故类结构性消灭)
+    fn assemble(
+        res: &mut dyn crate::device::DeviceRes,
+        _exec: &mut crate::device::Exec,
+    ) -> Result<Box<dyn KernelFamily>, OpError> {
+        let me = FiRuntime {
+            float_ws: Some(res.alloc(FI_FLOAT_WS_BYTES, "fi.float_ws")?),
+            int_ws: Some(res.alloc(FI_INT_WS_BYTES, "fi.int_ws")?),
+            host_staging: vec![0u8; FI_HOST_STAGING_BYTES],
+            plan: None,
+        };
+        Ok(FamilyGuard::boxed(me))
     }
 
     fn run(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, _exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {

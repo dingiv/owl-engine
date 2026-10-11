@@ -7,6 +7,7 @@ use crate::ffi::{device_get_count, free_host, malloc_host, CudaContext, CudaFunc
 use cudarc::nvrtc::safe::{compile_ptx_with_opts, CompileOptions};
 use owl_iface::contract::GraphId;
 use owl_iface::contract::ModelError;
+use owl_iface::contract::{numel, Shape};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -38,6 +39,9 @@ pub struct DiagOpts {
     /// nvrtc include 目录(None = 缺省 /usr/local/cuda/include;
     /// 入口自 CUDA_HOME/CUDA_PATH 解析)
     pub nvrtc_include: Option<std::path::PathBuf>,
+    /// **生产算子白名单**(dispatch.allowed_ops;None/空 = 门关)。
+    /// `Arc` = 与 server 主循环共享,逐发射判定零克隆。
+    pub allowed_ops: Option<std::sync::Arc<Vec<String>>>,
 }
 
 impl DiagOpts {
@@ -55,6 +59,12 @@ impl DiagOpts {
             graph_flags: c.graph_flags.to_bits(),
             capture_slab_mb: c.capture_slab_mb,
             nvrtc_include: c.nvrtc_include.clone(),
+            allowed_ops: cfg
+                .dispatch
+                .allowed_ops
+                .as_ref()
+                .filter(|v| !v.is_empty())
+                .map(|v| std::sync::Arc::new(v.clone())),
         }
     }
 }
@@ -110,6 +120,70 @@ pub(super) enum Block {
     Carved { slab: Arc<CudaSlice<u8>>, off: usize, n: usize },
 }
 
+/// 账本内块 id 位编码(裁决 2,2026-10-13):单 u64 高位 ledger、低 40 位
+/// 本账递增 local。线格式 `Bytes{id,len}` 不变 —— 只是 id 不再跨账本撞号
+/// (pitfall §27 根因)。报错可同时打印两段。
+const BLOCK_LEDGER_SHIFT: u32 = 40;
+const BLOCK_LOCAL_MASK: u64 = (1u64 << BLOCK_LEDGER_SHIFT) - 1;
+
+/// 打包块 id(分配点)。
+fn pack_block_id(ledger: u32, local: u64) -> u64 {
+    ((ledger as u64) << BLOCK_LEDGER_SHIFT) | (local & BLOCK_LOCAL_MASK)
+}
+
+/// 访问器:块 id → 所属账本(0 成本解码;诊断/断言用)。
+pub(super) fn ledger_of(id: u64) -> u32 {
+    (id >> BLOCK_LEDGER_SHIFT) as u32
+}
+
+/// 访问器:块 id → 账本内局部序号(测试/诊断)。
+#[cfg(test)]
+fn local_of(id: u64) -> u64 {
+    id & BLOCK_LOCAL_MASK
+}
+
+/// 解析点断言:块 id 必须属本账本(跨账本 = §27 撞号案;六步压成一行)。
+fn assert_ledger(id: u64, ledger: u32) -> Result<(), ModelError> {
+    let owner = ledger_of(id);
+    if owner != ledger {
+        return Err(ModelError::CrossLedger { id, owner, reader: ledger });
+    }
+    Ok(())
+}
+
+/// 块账条目:块本体 + 账长 + 账本身份 + 布局/类型(§6.2 VramBlock 最小面)。
+///
+/// `dtype`/`shape` 当前从字节口径填充 —— cuda 池账是字节级分配
+/// (`new_block` 只见 `slice.len()`),元素级 dtype/shape 待分配 API 携带
+/// 元数据后细化;本轮先落 `ledger` 身份字段(撞号门)。
+///
+/// `BlockDtype` 是**本账局部** dtype token(不动线格式 `Dtype`;字节口径
+/// 无元素宽语义,向共享 `Dtype` 加 U8 会连带 driver::DType / models 映射
+/// 全链改,超出 P1 最小面)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BlockDtype {
+    /// 字节口径(池块/元数据 blob)
+    Bytes,
+}
+
+impl BlockDtype {
+    fn size_bytes(self) -> usize {
+        match self {
+            BlockDtype::Bytes => 1,
+        }
+    }
+}
+
+pub(super) struct BlockEntry {
+    pub(super) block: Block,
+    /// 账长(字节口径;f16 基线)
+    pub(super) bytes: usize,
+    /// 分配它的账本(actor 序号;解析点断言 == 本账本)
+    pub(super) ledger: u32,
+    pub(super) dtype: BlockDtype,
+    pub(super) shape: Shape,
+}
+
 // ============================================================================
 // 设备上下文 + 流注册表
 // ============================================================================
@@ -126,9 +200,11 @@ pub(super) struct GpuCtx {
     /// 图注册表:id → 实例化图(重放用)
     graphs: HashMap<GraphId, GraphHolder>,
     next_graph: GraphId,
-    /// 块账房:id → (块, 元素数)
-    blocks: HashMap<u64, (Block, usize)>,
+    /// 块账房:id → 块条目(账长/账本身份/dtype/shape)
+    blocks: HashMap<u64, BlockEntry>,
     next_block: u64,
+    /// 本账本编号(= GpuServer actor 序号;块 id 高位编码此值)
+    ledger: u32,
     /// 动态 smem 每块上限(CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK
     /// _OPTIN;发射前硬顶守卫,超限结构化拒绝 —— 2026-09-27 v1 smem 事故)
     smem_optin: usize,
@@ -174,7 +250,7 @@ impl Drop for GraphHolder {
 }
 
 impl GpuCtx {
-    pub(super) fn new(selector: &DeviceSelector, diag: DiagOpts) -> Result<Self, String> {
+    pub(super) fn new(selector: &DeviceSelector, diag: DiagOpts, ledger: u32) -> Result<Self, String> {
         let ordinal = selector.resolve()?;
         let ctx = CudaContext::new(ordinal).map_err(|e| format!("{e:?}"))?;
         ctx.bind_to_thread().map_err(|e| format!("{e:?}"))?;
@@ -214,6 +290,7 @@ impl GpuCtx {
             next_graph: 1,
             blocks: HashMap::new(),
             next_block: 1,
+            ledger,
             smem_optin,
         })
     }
@@ -457,10 +534,20 @@ impl GpuCtx {
 
     /// 登记新块(图外:独立分配)
     pub(super) fn new_block(&mut self, slice: CudaSlice<u8>) -> u64 {
-        let n = slice.len();
-        let id = self.next_block;
+        let bytes = slice.len();
+        let local = self.next_block;
         self.next_block += 1;
-        self.blocks.insert(id, (Block::Owned(slice), n));
+        let id = pack_block_id(self.ledger, local);
+        self.blocks.insert(
+            id,
+            BlockEntry {
+                block: Block::Owned(slice),
+                bytes,
+                ledger: self.ledger,
+                dtype: BlockDtype::Bytes,
+                shape: vec![bytes],
+            },
+        );
         id
     }
 
@@ -484,11 +571,21 @@ impl GpuCtx {
                 "捕获 slab 耗尽:已用 {used} + 对齐后需 {n} > {slab_cap}(warmup 计量失准或 OWL_CAPTURE_SLAB_MB 固定档过小)"
             )));
         }
-        let id = self.next_block;
+        let local = self.next_block;
         self.next_block += 1;
+        let id = pack_block_id(self.ledger, local);
         let (off, slab) = (used, cap.slab.clone());
         cap.used = used + n;
-        self.blocks.insert(id, (Block::Carved { slab, off, n }, n));
+        self.blocks.insert(
+            id,
+            BlockEntry {
+                block: Block::Carved { slab, off, n },
+                bytes: n,
+                ledger: self.ledger,
+                dtype: BlockDtype::Bytes,
+                shape: vec![n],
+            },
+        );
         Ok(id)
     }
 
@@ -498,8 +595,14 @@ impl GpuCtx {
         id: u64,
         stream: &CudaStream,
     ) -> Result<(u64, usize), ModelError> {
+        assert_ledger(id, self.ledger)?;
         use crate::ffi::DevicePtr;
-        match &self.blocks.get(&id).ok_or(ModelError::DeadBlock { id })?.0 {
+        let e = self.blocks.get(&id).ok_or(ModelError::DeadBlock { id })?;
+        // 块账自洽(哨兵;cfg! 展开 ⇒ 两档都编译,零热路径语义)
+        debug_assert_eq!(e.ledger, self.ledger, "块条目账本与 id 账本不一致");
+        debug_assert_eq!(numel(&e.shape), e.bytes, "块 shape/账长不一致");
+        debug_assert!(e.dtype.size_bytes() >= 1, "块 dtype 非法");
+        match &e.block {
             Block::Owned(slice) => {
                 let (p, _) = slice.device_ptr(stream);
                 Ok((p, slice.len()))
@@ -519,9 +622,12 @@ impl GpuCtx {
         }
     }
 
-    /// 块元素数(账长校验用)
+    /// 块账长(字节口径;账长校验 + **准入哨兵**用 —— 哨兵侧
+    /// `Result → Option` 降级:探测不该炸,真解析的拒绝仍在
+    /// `block_ptr`/`assert_ledger`)
     pub(super) fn block_len(&self, id: u64) -> Result<usize, ModelError> {
-        Ok(self.blocks.get(&id).ok_or(ModelError::DeadBlock { id })?.1)
+        assert_ledger(id, self.ledger)?;
+        Ok(self.blocks.get(&id).ok_or(ModelError::DeadBlock { id })?.bytes)
     }
 
     /// 中间块回收(E2a):移除 Owned 块(CudaSlice drop → 流序
@@ -538,7 +644,7 @@ impl GpuCtx {
     pub(super) fn free_blocks(&mut self, ids: &[u64]) -> usize {
         let any_owned = ids
             .iter()
-            .any(|id| self.blocks.get(id).is_some_and(|(b, _)| matches!(b, Block::Owned(_))));
+            .any(|id| self.blocks.get(id).is_some_and(|e| matches!(e.block, Block::Owned(_))));
         // diag.free_legacy:旁路事件钉序(崩坏案 A/B 判别;性能画像用)
         if any_owned && self.capture.is_none() && !self.diag.free_legacy {
             if let (Ok(comp), Ok(h2d), Ok(d2h)) = (
@@ -558,13 +664,13 @@ impl GpuCtx {
             let owned = self
                 .blocks
                 .get(id)
-                .is_some_and(|(b, _)| matches!(b, Block::Owned(_)));
+                .is_some_and(|e| matches!(e.block, Block::Owned(_)));
             if owned {
-                if let Some((b, _)) = self.blocks.remove(id) {
-                    if let Block::Owned(slice) = &b {
+                if let Some(e) = self.blocks.remove(id) {
+                    if let Block::Owned(slice) = &e.block {
                         freed_bytes += slice.len() as i64; // B6.5 live 记账
                     }
-                    drop(b); // free_async(块自身流;已按上律钉序)
+                    drop(e); // free_async(块自身流;已按上律钉序)
                     n += 1;
                 }
             }
@@ -675,5 +781,34 @@ impl Drop for Staging {
     fn drop(&mut self) {
         // 收尾失败无路可报(Drop 语义);sticky 错误会在后续流操作上暴露
         let _ = unsafe { free_host(self.ptr as *mut _) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 跨账本 id 解析 ⇒ 结构化 CrossLedger 错(含 id + 两个 ledger 号)。
+    /// 纯解码/断言,不触 CUDA(可在无卡环境跑)。
+    #[test]
+    fn cross_ledger_id_is_rejected() {
+        let id = pack_block_id(2, 11);
+        assert_eq!(ledger_of(id), 2);
+        assert_eq!(local_of(id), 11);
+        let e = assert_ledger(id, 1).expect_err("跨账本必拒");
+        let msg = format!("{e}");
+        assert_eq!(
+            msg,
+            "跨账本块: 块 id=2199023255563 属 ledger 2,被 ledger 1 解析"
+        );
+        // 同账本放行
+        assert!(assert_ledger(id, 2).is_ok());
+    }
+
+    /// 位拼接跨账本注入性:同 local 不同 ledger ⇒ id 不同(§27 撞号门根因消除)。
+    #[test]
+    fn pack_is_injective_across_ledgers() {
+        assert_ne!(pack_block_id(1, 11), pack_block_id(2, 11));
+        assert_eq!(ledger_of(pack_block_id(3, 99)), 3);
     }
 }

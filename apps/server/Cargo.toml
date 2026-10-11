@@ -19,6 +19,8 @@ serde_json = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 
 [dev-dependencies]
+# 生产白名单门测试:核对 flavor 清单与 kernels 实测台账(2026-10-13 P4)
+owl-kernels = { path = "../../crates/kernels" }
 # e2e 骨架用 prctl(PR_SET_PDEATHSIG):父进程被 SIGKILL 时子 server 必须随之
 # 退出(否则孤儿残留占端口+显存 → 后续整轮假绿;libc 已在 lock 内,零新增)
 libc = "0.2"

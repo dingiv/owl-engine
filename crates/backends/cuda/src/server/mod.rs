@@ -125,6 +125,8 @@ pub struct GpuServer {
     kernels: KernelCache,
     /// 算子注册表(M4 cutover:foreign 分派唯一入口;boot 装配,P4 门)
     registry: Option<owl_kernels::registry::OpRegistry>,
+    /// 生产算子白名单(dispatch.allowed_ops;None/空 = 门关;2026-10-13 P4)
+    allowed_ops: Option<std::sync::Arc<Vec<String>>>,
     /// 执行引擎(kernels::device;LaunchVal 值表发射 + 装载缓存)
     exec: owl_kernels::device::Exec,
     /// scratch 物理账本(家族 runtime 的 alloc 落此;append-only,
@@ -174,6 +176,7 @@ impl GpuServer {
             kernels: KernelCache::new(diag.nvrtc_include.clone()),
 // (diag 自身随 Self 移动,克隆 include 后置)
             registry: None,
+            allowed_ops: diag.allowed_ops.clone(),
             exec: owl_kernels::device::Exec::new(),
             scratch_ledger: Vec::new(),
             dispatch: None,
@@ -186,7 +189,7 @@ impl GpuServer {
     /// 事件循环主入口(server 线程生命周期 = 循环生命周期)。
     /// 首行上线设备(本线程 bind_to_thread 一次到位)+ 起派发线程。
     pub fn run(mut self) -> Result<(), String> {
-        let ctx = GpuCtx::new(&self.selector, self.diag.clone());
+        let ctx = GpuCtx::new(&self.selector, self.diag.clone(), self.actor_tag as u32);
         match ctx {
             Ok(c) => {
                 if let Some(boot) = self.boot.take() {
@@ -205,7 +208,27 @@ impl GpuServer {
                     let r = owl_kernels::registry::OpRegistry::boot(&mut res, &mut exec);
                     self.exec = exec;
                     match r {
-                        Ok(reg) => self.registry = Some(reg),
+                        Ok(reg) => {
+                            // 白名单硬门(装配期两件事,失败 = 拒启):
+                            // ① 列出的算子必须都已建表(名字打错/未建表 = 配置错);
+                            // ② 用生效集合跑**池写集穷举审计**(读必有人写 + 声明自洽
+                            //    + 活跃写者不歧义)
+                            if let Some(list) = self.allowed_ops.clone() {
+                                for n in list.iter() {
+                                    if reg.meta(n).is_none() {
+                                        return Err(format!(
+                                            "白名单算子 `{n}` 未建表(dispatch.allowed_ops 有误或该算子尚无 KernelSpec 声明)"
+                                        ));
+                                    }
+                                }
+                                let names: Vec<&str> = list.iter().map(|s| s.as_str()).collect();
+                                if let Err(e) = owl_kernels::ops::audit_active(Some(&names)) {
+                                    return Err(format!("池写集审计失败(拒启): {e}"));
+                                }
+                                eprintln!("[kernels] 生产白名单:{} 项生效(池审计通过)", list.len());
+                            }
+                            self.registry = Some(reg)
+                        }
                         Err(e) => return Err(format!("算子注册表装配失败(拒启): {e}")),
                     }
                 }
@@ -286,7 +309,16 @@ impl GpuServer {
         // cublasDestroy 撞已拆上下文 → libcublasLt SIGSEGV;显式 take =
         // 句柄在活上下文内销毁,gdb bt 实证)。M4 后句柄住 registry
         // (cublas runtime 内),同律 = registry 整体先于 ctx 掉。
-        drop(self.registry.take());
+        //
+        // ⚠️ 收尾走**显式 `close()`**(析构唯一官方出口),不裸 drop:
+        // 裸 drop 会让 FamilyGuard 的"未经 close() 即 drop"兜底告警**在每次
+        // 正常退出时刷 N 条** ⇒ 告警疲劳,把真漏淹没(2026-10-13 复核实测)。
+        // 次序不变:仍在 ctx 拆掉之前。
+        if let Some(reg) = self.registry.take() {
+            if let Err(e) = reg.close() {
+                eprintln!("[kernels] registry 收尾失败(已尽力逐族 close): {e}");
+            }
+        }
         self.scratch_ledger.clear();
         if let Some(ctx) = &self.ctx {
             for sid in [STREAM_H2D, STREAM_COMPUTE, STREAM_D2H] {
@@ -625,7 +657,49 @@ impl GpuServer {
         self.handle_launch_inner(msg, ack)
     }
 
+    /// **算子准入 L3 哨兵**(唯一调用点;2026-10-13 P3)。
+    ///
+    /// 覆盖**两条发射路**:原生 NVRTC 与家族 FFI —— 它们在这里汇合,
+    /// 所以门放这里而不是 models(design §五「由上层统一调用」的落地,
+    /// 实测唯一能同时管住两路的位置)。
+    ///
+    /// 未建表算子(`meta() == None`,处于"仅引入"状态)= 放行但无门 ——
+    /// P4 的生产白名单硬门才会把"未建表进生产"变成拒启。
+    fn admission_check(&self, msg: &LaunchMsg) -> Result<(), owl_kernels::contract::OpError> {
+        use owl_kernels::spec::{CheckCtx, Geom};
+        // ① 白名单硬门(deny-by-default;门关时跳过)
+        if let Some(list) = &self.allowed_ops {
+            if !list.iter().any(|n| n == &msg.kernel.name) {
+                return Err(owl_kernels::contract::OpError::Contract {
+                    op: msg.kernel.name.clone(),
+                    field: "allowed_ops",
+                    expect: format!("∈ 本档白名单({} 项;dispatch.allowed_ops)", list.len()),
+                    got: "未列入 —— 该算子未获准入进本生产档".into(),
+                });
+            }
+        }
+        // ② 算子自身准入声明(L3 哨兵;未建表 = 无声明 ⇒ 无检查)
+        let Some(meta) = self.registry.as_ref().and_then(|r| r.meta(&msg.kernel.name)) else {
+            return Ok(());
+        };
+        let geom = Geom {
+            grid: msg.grid,
+            block: msg.block,
+            smem: msg.shared_mem,
+            out_elems: msg.out_elems,
+        };
+        let ctx_ref = self.ctx.as_ref();
+        // 账长探测:不在本账本/不在册 ⇒ None(哨兵跳过该槽)
+        let len = |id: u64| ctx_ref.and_then(|c| c.block_len(id).ok());
+        let ctx = CheckCtx { op: meta.entry, args: &msg.args, geom: &geom, len: &len };
+        meta.check(&ctx)
+    }
+
     fn handle_launch_inner(&mut self, msg: LaunchMsg, ack: Ack<Result<Bytes, ModelError>>) {
+        // 准入门(foreign/native 汇合点;失败 = 指名道姓的 Contract 错)
+        if let Err(e) = self.admission_check(&msg) {
+            return ack.send(Err(ModelError::Msg(format!("[算子准入] {e}"))));
+        }
         // foreign-kernel 通道(M4 cutover:算子注册表唯一入口 —— 名字分派
         // 在注册表内部,server 主循环零算子知识;旧 handle_foreign_launch
         // 已退役,见 ops/ 模块)。路由判定 = 注册表 knows(boot 表自洽,
