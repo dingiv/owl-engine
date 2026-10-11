@@ -31,11 +31,24 @@ pub(super) fn issue_launch(
     for a in &msg.args {
         match a {
             Arg::Block { id } => {
-                let (p, _len) = ctx.block_ptr(*id, stream)?;
+                let (p, _len) = ctx.block_ptr(*id, stream).map_err(|e| {
+                    // 原生 launch 实参解析失败 —— 带核名与槽序(DeadBlock 定位)
+                    ModelError::Msg(format!(
+                        "[launch-arg] kernel={} arg_idx={} id={id} :: {e}",
+                        msg.kernel.name,
+                        slots.len()
+                    ))
+                })?;
                 slots.push(Slot::Ptr(p));
             }
             Arg::BlockSlice { id, byte_offset, .. } => {
-                let (p, _len) = ctx.block_ptr(*id, stream)?;
+                let (p, _len) = ctx.block_ptr(*id, stream).map_err(|e| {
+                    ModelError::Msg(format!(
+                        "[launch-arg] kernel={} arg_idx={} id={id}(slice) :: {e}",
+                        msg.kernel.name,
+                        slots.len()
+                    ))
+                })?;
                 slots.push(Slot::Ptr(p + byte_offset));
             }
             Arg::U64(v) => slots.push(Slot::U(*v)),

@@ -11,6 +11,15 @@
 //  4) owl_naive_attn_nc_f16   非因果块 attention(propose 8 行双向;测试/
 //                             eager 回退臂;生产臂 = FI kNonCausal 变体)
 //
+// ⭐ 草稿自注意力滑窗(2026-10-13,D2 修正):检查点 config.json
+//   `sliding_window = 2048` + `use_sliding_window = true`(5 层全滑窗),
+//   参考研究原文:"the drafter reads 5 of the target's 64 layers through a
+//   **2 048-token sliding window** so its work grows roughly linearly"。
+//   → 非因果块注意力的**前缀**只取最近 2048 行(自块 8 行恒全可见)。
+//   修正前:前缀全扫(0..prefix_len)→ ①长 ctx 白烧 (prefix/2048)× 时间,
+//   ②attention 图案超出训练窗。仅当前缀 > 2048 时生效(短 ctx 逐位不变)。
+#define OWL_NC_SLIDING_WINDOW 2048
+
 // 数值律:输入 f16,累计 f32,输出随槽(契约 5:索引量 f32 过线;词表 id
 // < 2²⁴ 精确)。平局取最小索引(与 owl_argmax / torch.topksorted 语义一致,
 // host 对拍同律)。
@@ -373,7 +382,10 @@ extern "C" __global__ void owl_naive_attn_nc_f16(
     if (d == 0) { s_m = -3.0e38f; s_l = 0.0f; }
     __syncthreads();
 
-    for (int srow = 0; srow < kv_len; ++srow) {
+    // D2 滑窗:前缀只取最近 OWL_NC_SLIDING_WINDOW 行(自块恒全可见)
+    const int srow_begin =
+        (prefix_len > OWL_NC_SLIDING_WINDOW) ? (prefix_len - OWL_NC_SLIDING_WINDOW) : 0;
+    for (int srow = srow_begin; srow < kv_len; ++srow) {
         float kv;
         if (srow < prefix_len) {
             const int b = srow / page;
@@ -448,7 +460,10 @@ extern "C" __global__ void owl_naive_attn_nc_fp8kv_f16(
     if (d == 0) { s_m = -3.0e38f; s_l = 0.0f; }
     __syncthreads();
 
-    for (int srow = 0; srow < kv_len; ++srow) {
+    // D2 滑窗:前缀只取最近 OWL_NC_SLIDING_WINDOW 行(自块恒全可见)
+    const int srow_begin =
+        (prefix_len > OWL_NC_SLIDING_WINDOW) ? (prefix_len - OWL_NC_SLIDING_WINDOW) : 0;
+    for (int srow = srow_begin; srow < kv_len; ++srow) {
         float kv;
         if (srow < prefix_len) {
             const int b = srow / page;
@@ -526,7 +541,10 @@ extern "C" __global__ void owl_naive_attn_nc_bf16(
     if (d == 0) { s_m = -3.0e38f; s_l = 0.0f; }
     __syncthreads();
 
-    for (int srow = 0; srow < kv_len; ++srow) {
+    // D2 滑窗:前缀只取最近 OWL_NC_SLIDING_WINDOW 行(自块恒全可见)
+    const int srow_begin =
+        (prefix_len > OWL_NC_SLIDING_WINDOW) ? (prefix_len - OWL_NC_SLIDING_WINDOW) : 0;
+    for (int srow = srow_begin; srow < kv_len; ++srow) {
         float kv;
         if (srow < prefix_len) {
             const int b = srow / page;
@@ -601,7 +619,10 @@ extern "C" __global__ void owl_naive_attn_nc_fp8kv_bf16(
     if (d == 0) { s_m = -3.0e38f; s_l = 0.0f; }
     __syncthreads();
 
-    for (int srow = 0; srow < kv_len; ++srow) {
+    // D2 滑窗:前缀只取最近 OWL_NC_SLIDING_WINDOW 行(自块恒全可见)
+    const int srow_begin =
+        (prefix_len > OWL_NC_SLIDING_WINDOW) ? (prefix_len - OWL_NC_SLIDING_WINDOW) : 0;
+    for (int srow = srow_begin; srow < kv_len; ++srow) {
         float kv;
         if (srow < prefix_len) {
             const int b = srow / page;
@@ -680,7 +701,10 @@ extern "C" __global__ void owl_naive_attn_nc_f16_knhd(
     if (d == 0) { s_m = -3.0e38f; s_l = 0.0f; }
     __syncthreads();
 
-    for (int srow = 0; srow < kv_len; ++srow) {
+    // D2 滑窗:前缀只取最近 OWL_NC_SLIDING_WINDOW 行(自块恒全可见)
+    const int srow_begin =
+        (prefix_len > OWL_NC_SLIDING_WINDOW) ? (prefix_len - OWL_NC_SLIDING_WINDOW) : 0;
+    for (int srow = srow_begin; srow < kv_len; ++srow) {
         float kv;
         if (srow < prefix_len) {
             const int b = srow / page;
@@ -754,7 +778,10 @@ extern "C" __global__ void owl_naive_attn_nc_fp8kv_f16_knhd(
     if (d == 0) { s_m = -3.0e38f; s_l = 0.0f; }
     __syncthreads();
 
-    for (int srow = 0; srow < kv_len; ++srow) {
+    // D2 滑窗:前缀只取最近 OWL_NC_SLIDING_WINDOW 行(自块恒全可见)
+    const int srow_begin =
+        (prefix_len > OWL_NC_SLIDING_WINDOW) ? (prefix_len - OWL_NC_SLIDING_WINDOW) : 0;
+    for (int srow = srow_begin; srow < kv_len; ++srow) {
         float kv;
         if (srow < prefix_len) {
             const int b = srow / page;
@@ -831,7 +858,10 @@ extern "C" __global__ void owl_naive_attn_nc_bf16_knhd(
     if (d == 0) { s_m = -3.0e38f; s_l = 0.0f; }
     __syncthreads();
 
-    for (int srow = 0; srow < kv_len; ++srow) {
+    // D2 滑窗:前缀只取最近 OWL_NC_SLIDING_WINDOW 行(自块恒全可见)
+    const int srow_begin =
+        (prefix_len > OWL_NC_SLIDING_WINDOW) ? (prefix_len - OWL_NC_SLIDING_WINDOW) : 0;
+    for (int srow = srow_begin; srow < kv_len; ++srow) {
         float kv;
         if (srow < prefix_len) {
             const int b = srow / page;
@@ -905,7 +935,10 @@ extern "C" __global__ void owl_naive_attn_nc_fp8kv_bf16_knhd(
     if (d == 0) { s_m = -3.0e38f; s_l = 0.0f; }
     __syncthreads();
 
-    for (int srow = 0; srow < kv_len; ++srow) {
+    // D2 滑窗:前缀只取最近 OWL_NC_SLIDING_WINDOW 行(自块恒全可见)
+    const int srow_begin =
+        (prefix_len > OWL_NC_SLIDING_WINDOW) ? (prefix_len - OWL_NC_SLIDING_WINDOW) : 0;
+    for (int srow = srow_begin; srow < kv_len; ++srow) {
         float kv;
         if (srow < prefix_len) {
             const int b = srow / page;

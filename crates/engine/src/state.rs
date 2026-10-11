@@ -99,6 +99,8 @@ pub(crate) struct PoolPlan {
     pub spec_mode: crate::running::SpecMode,
     /// 投机深度(verify 块 = depth+1;verify v2 scratch 定形用;0 = off)
     pub spec_depth: usize,
+    /// verify 臂改走 XQA(feature `xqa`;knobs.env.attn.verify_xqa)
+    pub verify_xqa: bool,
     /// GDN 状态格容量
     pub gdn_slots: usize,
     /// spec 快照池深度
@@ -132,6 +134,9 @@ pub(crate) struct StatePool {
     pub(crate) attn_v2: Option<owl_models::module::AttnV2Scratch>,
     /// verify v2 scratch(seqs=depth1;§三十一)
     pub(crate) verify_attn_v2: Option<owl_models::module::AttnV2Scratch>,
+    /// XQA verify 面(2026-10-13 D3):常量页表/掩码 + semaphores + scratch
+    /// (seq_lens 逐轮变 → 由图输入槽供给,不在本结构)
+    pub(crate) xqa_verify: Option<owl_models::module::XqaVerifyCtx>,
     /// spec 快照(E5-M2:投机轮回滚缓冲;OWL_SPEC_DEPTH>0 时分配,
     /// 内容 = 轮首 GDN 态 state@B-1;restore 后仍有效,全接受后失效重拍)
     pub(crate) spec_snap: Option<GdnSnapSlot>,
@@ -333,6 +338,56 @@ impl StatePool {
         } else {
             None
         };
+        // XQA verify 面(2026-10-13 D3;kNHD fp8 池 + grp6 + hd256 + page32)
+        let xqa_verify = if paged
+            && plan.spec_depth > 0
+            && plan.verify_xqa
+            && matches!(plan.kv, owl_models::env::KvQuant::Fp8E4M3)
+            && dims.hd == 256
+            && page == 32
+            && dims.hq / dims.hkv == 6
+        {
+            let nb_i = nb;
+            // 常量页表:单会话恒等链(0..nb)以 **i32 位型走私**进 f32 账叶
+            let pt: Vec<f32> = (0..nb_i).map(|i| f32::from_bits(i as u32)).collect();
+            let ptb = face.alloc(Dtype::F32, nb_i).await?;
+            face.write_block_f32(&ptb, 0, &pt).await?;
+            // 常量掩码:行 i = 块内第 i 个 token,bit k = 允许看第 k 个 key,
+            // 因果 = (1<<(i+1))-1(含自身)
+            let seqs = plan.spec_depth + 1;
+            let mask: Vec<f32> = (0..seqs)
+                .map(|i| f32::from_bits(((1u32 << (i + 1)) - 1) as u32))
+                .collect();
+            let mkb = face.alloc(Dtype::F32, seqs).await?;
+            face.write_block_f32(&mkb, 0, &mask).await?;
+            // semaphores:u32[round_up(hkv·batch,2)+2+hkv·batch+2](batch=1);
+            // **每次发射前必须清零**(KV-split 归约计数)
+            let sem_n = dims.hkv.div_ceil(2) * 2 + 2 + dims.hkv + 2;
+            let sem = zero_block_dt(face, sem_n, Dtype::F32).await?;
+            // scratch:持久工作区(参考实现 256MiB)
+            // 工作区定档 **32MiB**(2026-10-13 定谳):本形状(batch=1、hkv=4、
+            // hd256、q=8、ctx≤16k)的 KV-split 归约 partial 只有 ~0.7MB,32MiB
+            // 有 40× 余量;参考实现给 256MiB 是因为它不知道形状。
+            // ⚠️ 挂账(未结):≥128MiB 时 **e2e 门那套引擎实例**会报
+            // `pump: DeadBlock`(server 路径 256MiB 正常)—— 疑与大额 alloc 撞
+            // 引擎的显存治理/捕获 slab(门设 capture_slab_mb=160)。32MiB 下
+            // 恒等门绿,故先按需定档;治理交互另案。
+            const XQA_SCRATCH_MB: usize = 32;
+            let scr_mb = XQA_SCRATCH_MB;
+            let scr = zero_block_dt(face, (scr_mb << 20) / 2, Dtype::F16).await?;
+            Some(owl_models::module::XqaVerifyCtx {
+                page_table: block_leaf(&ptb, vec![nb_i]),
+                seq_lens: block_leaf(&ptb, vec![1]), // 占位:图装配时换成输入槽
+                mask: block_leaf(&mkb, vec![seqs]),
+                semaphores: block_leaf(&sem.0, vec![sem_n]),
+                scratch: block_leaf_dt(&scr.0, vec![(scr_mb << 20) / 2], Dtype::F16),
+                q_seq_len: seqs,
+                max_seq_len: nb_i * page,
+                sm_count: XQA_SM_COUNT,
+            })
+        } else {
+            None
+        };
         let mut gdns: Vec<GdnBlocks> = Vec::new();
         for _ in 0..n_gdn {
             let conv_q = zero_block(face, gdn_slots * dims.nk * dims.hk * 3).await?;
@@ -383,7 +438,7 @@ impl StatePool {
         } else {
             None
         };
-        Ok(StatePool { gdn_slots, dump_all, kvs, fi_face: plan.fi_quant.is_some(), verify_attn_v2,
+        Ok(StatePool { gdn_slots, dump_all, kvs, fi_face: plan.fi_quant.is_some(), verify_attn_v2, xqa_verify,
             kv_fp8, dflash_fp8, gdns, snaps, snap_tick: 0, bt, bt_mtp, spec_snap, mtp_kvs, dflash_kvs, attn_v2, page, nb, paged, x, dims })
     }
 
@@ -503,6 +558,26 @@ impl StatePool {
     /// verify v2 scratch(seqs=depth1;§三十一)
     pub(crate) fn verify_attn_v2_scratch(&self) -> Option<owl_models::module::AttnV2Scratch> {
         self.verify_attn_v2.clone()
+    }
+
+    /// XQA verify 面(常量件;seq_lens 由图输入槽供给,调用方覆盖)
+    pub(crate) fn xqa_verify_ctx(&self) -> Option<owl_models::module::XqaVerifyCtx> {
+        self.xqa_verify.clone()
+    }
+
+    /// XQA semaphores 元素数(图输入槽写零用;0 = 本档无 XQA 面)
+    pub(crate) fn xqa_sem_n(&self) -> usize {
+        self.xqa_verify
+            .as_ref()
+            .map(|x| x.semaphores.shape().iter().product::<usize>())
+            .unwrap_or(0)
+    }
+
+    /// XQA semaphores 块 + 字节数(每轮发射前清零用)
+    pub(crate) fn xqa_sem_zero(&self) -> Option<(owl_iface::contract::Bytes, usize)> {
+        let x = self.xqa_verify.as_ref()?;
+        let n = x.semaphores.shape().iter().product::<usize>();
+        Some((owl_iface::contract::Bytes { id: x.semaphores.id(), len: n }, n * 4))
     }
 
     /// KV 池形状(模式相关;与层分派同源策略)
@@ -899,6 +974,11 @@ impl StatePool {
         face.write_block_f32(&self.bt, 0, &v).await
     }
 }
+
+/// XQA 的 `multiProcessorCount`(KV-split 启发式;**只影响切分粒度,不影响
+/// 正确性**)。⚠️ FIXME:硬编码 sm86 双卡(SM=84);3080 为 68 —— 挂账:后端
+/// 暴露 multi_processor_count 后改查询(DeviceClient 现无此面)。
+const XQA_SM_COUNT: usize = 84;
 
 /// 按 dtype 清零分配(KV/GDN 状态块)。**设备侧 alloc + memset**,不走
 /// host 零向量 —— 曾用 `vec![0f32; n]` + to_le_bytes 逐元素造 64MB(rec

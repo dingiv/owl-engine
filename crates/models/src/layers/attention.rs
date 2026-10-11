@@ -30,6 +30,12 @@ use crate::ops::SemanticKernel;
 fn fi_scale_bits(hd: usize) -> u64 {
     (1.0f32 / (hd as f32).sqrt()).to_bits() as u64
 }
+/// XQA 的 q_scale 位型(契约 = attn_scale·sqrt(hd);核内再除 sqrt(hd))。
+/// 本地化理由同 `fi_scale_bits`:默认档(未开 `xqa` feature)不得依赖
+/// kernels 侧被 cfg 门的 client 面。
+fn xqa_q_scale_bits(hd: usize) -> u64 {
+    ((1.0f32 / (hd as f32).sqrt()) * (hd as f32).sqrt()).to_bits() as u64
+}
 #[cfg(test)]
 use crate::kernel;
 
@@ -418,6 +424,81 @@ impl Attention {
     /// ([ctx+1 .. ctx+seqs]);scratch = ctx.attn_v2(seqs 倍)。语义 =
     /// 每 token attend [0, pos_t](前缀截断即 chunk 内 causal)。
     #[allow(clippy::too_many_arguments)]
+    /// XQA verify 臂(2026-10-13 D3 立案;kNHD fp8 池)。
+    ///
+    /// 与 `verify_v2_arm` **同语义**(T=depth+1 行因果块:行 i 看 [0, pos+i]),
+    /// 差别只在注意力核形态:伪序列臂 = 8 条序列各扫一遍全 ctx(元素数 ×8),
+    /// XQA = KV-split + warp-specialized + GQA 内共享 K/V 读(`SPEC_DEC` 模式
+    /// q=1+K 的 q 维扩展近乎免费)。单算子对拍(kernels crate):
+    /// ctx8192 0.495ms vs v2 2.673ms = 5.40×,max|XQA−host| 4.5e-4(v2 4.6e-4)。
+    ///
+    /// 前置(调用点已查):`ctx.xqa` 在场 + `q_seq_len == tokens` + kNHD fp8 池;
+    /// KV 已由上游 K0 写入(与其余 prefill 臂同序)。
+    #[allow(clippy::too_many_arguments)]
+    fn verify_xqa_arm(
+        &self,
+        q: &TensorOps,
+        k: &TensorOps,
+        v: &TensorOps,
+        gate: &TensorOps,
+        kv: &KvBuffers,
+        tokens: usize,
+        ctx: &ForwardCtx,
+        pol: &crate::module::KvPagedPolicy,
+        kv_slots: &TensorOps,
+        x: &crate::module::XqaVerifyCtx,
+    ) -> TensorOps {
+        let dt = q.dtype;
+        let hd = self.hd;
+        // ① K0 写本块 KV 到池(**XQA 从池读**,不像 naive NC 核读寄存器;
+        //    与 v2/其余 prefill 臂同序)+ 依赖边 wr(XQA 不解引用,仅保序)
+        let k0_op = ctx.env.kv.k0_write_op();
+        let wr = TensorOps::call(k0_op)
+            .aux(&[tokens])
+            .arg(k)
+            .arg(v)
+            .arg(&kv.k_cache)
+            .arg(&kv.v_cache)
+            .arg(kv_slots)
+            .arg_i32(self.hkv as i32 * hd as i32)
+            .arg_i32(self.hkv as i32 * hd as i32)
+            .arg_i32(self.hkv as i32)
+            .arg_i32(hd as i32)
+            .arg_i32(pol.page as i32)
+            .arg_i32(pol.x as i32)
+            .with_shape(dt, vec![1]);
+        // q_scale = attn_scale·sqrt(hd)(核内再除 sqrt(hd));位型过线
+        let q_scale_bits = xqa_q_scale_bits(hd);
+        let y = TensorOps::call(SemanticKernel::XqaVerify)
+            .arg(q)
+            .arg(&kv.k_cache)
+            .arg(&kv.v_cache)
+            .arg(&x.page_table)
+            .arg(&x.seq_lens)
+            .arg(&x.mask)
+            .arg(&x.semaphores)
+            .arg(&x.scratch)
+            .arg(&wr) // 依赖边(K0 先于读池)
+            .arg_usize(tokens)
+            .arg_usize(self.hkv)
+            .arg_usize(hd)
+            .arg_usize(pol.page)
+            .arg_usize(x.max_seq_len)
+            .arg_usize(q_scale_bits as usize)
+            .arg_usize(x.sm_count)
+            .arg_usize(pol.page * self.hkv * hd) // 元素序 strides
+            .arg_usize(self.hkv * hd)
+            .arg_usize(hd)
+            .with_shape(dt, vec![tokens, self.hq * hd]);
+        let n = tokens * self.hq * hd;
+        let y = TensorOps::call(SemanticKernel::GateMul)
+            .arg(gate)
+            .arg(&y)
+            .arg_usize(n)
+            .with_shape(dt, vec![tokens, self.hq * hd]);
+        self.o_proj.forward(&y, ctx)
+    }
+
     fn verify_v2_arm(
         &self,
         q: &TensorOps,
@@ -839,7 +920,19 @@ impl Attention {
                     // 观测实为 chunked 老路径的崩(86ms 延迟特征),v2 探针
                     // 已证 2-partition 形态数值正确(softcap=1.0 修正后
                     // PASS,误差 1e-4)。全 ctx 走 v2 臂。
-                    if tokens <= 16 {
+                    // XQA 臂(2026-10-13 D3):kNHD fp8 池 + spec-dec q=1+K 单遍。
+                    // 语义与 v2 伪序列臂等价(因果块 [anchor, d1..dk]),但 KV 只
+                    // 读一遍 + GQA 内共享读;单算子实测 ctx8192 5.40×。
+                    if tokens <= 16 && ctx.env.attn.verify_xqa {
+                        if let Some(x) = ctx.xqa.as_ref() {
+                            if x.q_seq_len == tokens {
+                                return self.verify_xqa_arm(
+                                    &q, &k, &v, &gate, kv, tokens, ctx, &pol, kv_slots, x,
+                                );
+                            }
+                        }
+                    }
+                    if tokens <= 16 && ctx.env.attn.verify_v2 {
                         if let (Some(s2), Some(bt8)) =
                             (ctx.attn_v2.as_ref(), ctx.v2_bt8.as_ref())
                         {
@@ -851,6 +944,8 @@ impl Attention {
                             }
                         }
                     }
+                    // verify_v2=false:本处落到 prefill 族(split / chunked_opt),
+                    // 即 qo_len=T 单遍形态(D3 立案 A/B 臂;见 config.rs 注释)
                     // 诊断二分开关保留(OWL_FORCE_NAIVE_PREFILL=1 走逐 token
                     // 对照;2026-10-01 撤销遗留的 if false 硬禁用 —— 它让
                     // 全部 prefill 注意力落 naive 逐 token 路径)
@@ -1825,6 +1920,283 @@ mod owl_port_tests {
     use crate::testkit::{gpu_client, gpu_enabled};
     use crate::tensor::Dtype;
 
+    /// **层内对照**:XQA verify 臂 vs v2 伪序列臂(2026-10-13 D3 立案)。
+    ///
+    /// 同一 Attention 层、同一输入、同一 **fp8 kNHD 池**,只切注意力核形态:
+    /// - 臂 A `verify_v2`  :8 条伪序列各扫一遍全 ctx(元素数 ×8)
+    /// - 臂 B `verify_xqa` :XQA spec-dec q=1+K 单遍(KV-split + GQA 共享读)
+    ///
+    /// 判据:输出 `max|A−B| < 1e-2`(两核各贴 host 已由 kernels crate 单算子
+    /// 对拍证明:4.6e-4 / 4.5e-4)。附两臂耗时(host 计时,含 harvest 同步)。
+    ///
+    /// ⚠️ **FIXME(2026-10-13,未结)**:本测试的**数据构造退化** —— 两臂输出
+    /// **逐位相同**且呈与注意力核无关的线性斜坡(前 8 = 0.274/0.689/1.105/…),
+    /// 即"注意力结果被淹没"⇒ 对照**零分辨率**(不能当 XQA 等价门用)。
+    /// 已排除:池数据合法性(换成合法 e4m3 后仍同)、池账叶形状、f16 溢出
+    /// (权重缩 1e-4 后 nan=0)。嫌疑:`xs`/o_proj 构造使 y 退化为常数向量。
+    /// 修法建议:抄 `v1_isolation_case_inner` 的 xs/权重构造(hidden=6/hq=2
+    /// 的小档先跑通再放大),或直接比对**注意力层输出**(绕过 o_proj)。
+    /// 真正的等价门在 kernels crate(`tests/xqa_verify_probe.rs`)已绿。
+    #[tokio::test]
+    async fn gpu_attn_verify_xqa_matches_v2() {
+        if !gpu_enabled() {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return;
+        }
+        // 小档:hq/hkv = 6/1 ⇒ grp=6 与 XQA 编译期 HEAD_GRP_SIZE 一致;
+        // hidden=6 让 o_proj 项数 = hq*hd = 1536(大档 6144 会把注意力差异
+        // 淹进线性斜坡 —— 首版 24/4/hidden8 的教训,见 FIXME)
+        let (hq, hkv, hd, hidden) = (6usize, 1usize, 256usize, 6usize);
+        let (page, t_len, pos0) = (32usize, 8usize, 2040usize); // 8 行块 @ ctx 2048
+        let ctx_total = pos0 + t_len;
+        let nb = ctx_total.div_ceil(page);
+        let pol = crate::module::kv_paged_policy(Dtype::F16).expect("paged policy");
+
+        let attn = Attention::new(hq, hkv, hd, hidden, 1e-6, QuantPlan::F16);
+        let mut gpu = gpu_client().await;
+        let lctx = crate::module::LoaderCtx {
+            dtype: Dtype::F16,
+            shard: 1,
+            device_repack: false,
+            verify: false,
+            debug_tap: false,
+        };
+        // 六槽源(本模块本地化;兄弟模块的同名 helper 私有)
+        let src = crate::testkit::Src::from([
+            ("q_proj".to_string(), (0..hq * hd * 2 * hidden).map(|i| ((i as f32 + 3.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>()),
+            ("k_proj".to_string(), (0..hkv * hd * hidden).map(|i| ((i as f32 + 4.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>()),
+            ("v_proj".to_string(), (0..hkv * hd * hidden).map(|i| ((i as f32 + 5.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>()),
+            ("o_proj".to_string(), (0..hidden * hq * hd).map(|i| ((i as f32 + 6.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>()),
+            ("q_norm".to_string(), (0..hd).map(|i| ((i as f32 + 7.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>()),
+            ("k_norm".to_string(), (0..hd).map(|i| ((i as f32 + 8.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>()),
+        ]);
+        crate::interpreters::eval_load(&attn, &mut gpu, &src, &lctx)
+            .await
+            .expect("attention f16 装载");
+        let rp = crate::layers::rope::Rope::new(ctx_total + 16, hd, 32, 10_000.0).expect("rope");
+        crate::interpreters::eval_load(&rp, &mut gpu, &rp.tables(), &lctx)
+            .await
+            .expect("rope 表");
+
+        // fp8 kNHD 池(扁平 u8;页内 [page, hkv, hd] 连续)+ 非零随机内容
+        // (全零池会让两臂都输出 0 → 判据零分辨率)
+        let pool_elems = nb * hkv * hd * page;
+        // 账叶 F16 承载 fp8 字节(2B/元素 → 过分配;核只吃裸指针 + stride)。
+        // 内容取确定伪随机半精度值,保证两臂都有非零前馈分辨率。
+        // ⚠️ 必须**合法 e4m3** 字节:首版用 f16 位型当字节 → 多为 NaN/非法码
+        // ⇒ 两臂输出全 NaN,`f32::max` 把 NaN 静默吃掉 → 假绿 0.000000。
+        let rnd: Vec<u8> = (0..pool_elems * 2)
+            .map(|i| {
+                let x = (i as u32).wrapping_mul(2654435761);
+                let f = ((x & 0xFFFF) as f32 / 65535.0 - 0.5) * 0.5;
+                let h = half::f16::from_f32(f).to_bits();
+                // f16 → e4m3 近似:sign | exp(截 4 位,禁全 1) | mantissa 高 3 位
+                let sign = ((h >> 15) & 1) as u8;
+                let exp = (((h >> 10) & 0x1F) as i32 - 15 + 7).clamp(0, 14) as u8;
+                let man = ((h >> 7) & 0x7) as u8;
+                (sign << 7) | (exp << 3) | man
+            })
+            .collect();
+        let kc = crate::interpreters::eval_ops(
+            TensorOps::from_host(Dtype::F16, vec![pool_elems], &rnd).step(),
+            &mut gpu,
+        )
+        .await
+        .expect("kc");
+        let vc = crate::interpreters::eval_ops(
+            TensorOps::from_host(Dtype::F16, vec![pool_elems], &rnd).step(),
+            &mut gpu,
+        )
+        .await
+        .expect("vc");
+
+        let xs = TensorOps::from_host(
+            Dtype::F16,
+            vec![t_len, hidden],
+            &(0..t_len * hidden)
+                .map(|i| {
+                    half::f16::from_f32(((i as f32) * 0.37 - 1.0).sin())
+                        .to_le_bytes()
+                })
+                .flatten()
+                .collect::<Vec<u8>>(),
+        );
+        let pos = TensorOps::from_host(
+            Dtype::F32,
+            vec![t_len],
+            &crate::testkit::f32b(&(0..t_len).map(|t| (pos0 + t) as f32).collect::<Vec<_>>()),
+        );
+        let slots = TensorOps::from_host(
+            Dtype::F32,
+            vec![t_len],
+            &crate::testkit::f32b(&(0..t_len).map(|t| (pos0 + t) as f32).collect::<Vec<_>>()),
+        );
+        let lens = TensorOps::from_host(
+            Dtype::F32,
+            vec![t_len],
+            &crate::testkit::f32b(&(0..t_len).map(|t| (pos0 + t + 1) as f32).collect::<Vec<_>>()),
+        );
+        // 池账叶按生产形状(classic 五维;engine k_shape 同式)—— 扁平叶
+        // 会让 K0 写按形状推的长度/几何算错(inf 行嫌疑)
+        let k_shape = vec![nb, hkv, hd / pol.x, page, pol.x];
+        let kv = KvBuffers {
+            k_cache: TensorOps::of_block(kc.id, Dtype::F16, k_shape.clone()),
+            v_cache: TensorOps::of_block(vc.id, Dtype::F16, k_shape),
+            slots: slots.clone(),
+            kv_lens: lens.clone(),
+            block_tables: TensorOps::from_host(
+                Dtype::F32,
+                vec![1, nb],
+                &crate::testkit::f32b(&(0..nb).map(|i| i as f32).collect::<Vec<_>>()),
+            ),
+        };
+        let bt8 = TensorOps::from_host(
+            Dtype::F32,
+            vec![t_len, nb],
+            &crate::testkit::f32b(&(0..t_len).flat_map(|_| (0..nb).map(|b| b as f32)).collect::<Vec<_>>()),
+        );
+
+        // 臂 A:v2 伪序列(scratch 三件套:nparts = ceil(nb·page/512))
+        let nparts = (nb * page).div_ceil(512);
+        let v2 = crate::module::AttnV2Scratch {
+            exp_sums: TensorOps::of_block(
+                crate::interpreters::eval_ops(
+                    TensorOps::zeros(Dtype::F32, vec![t_len * hq * nparts]).step(),
+                    &mut gpu,
+                )
+                .await
+                .expect("es")
+                .id,
+                Dtype::F32,
+                vec![t_len * hq * nparts],
+            ),
+            max_logits: TensorOps::of_block(
+                crate::interpreters::eval_ops(
+                    TensorOps::zeros(Dtype::F32, vec![t_len * hq * nparts]).step(),
+                    &mut gpu,
+                )
+                .await
+                .expect("ml")
+                .id,
+                Dtype::F32,
+                vec![t_len * hq * nparts],
+            ),
+            tmp_out: TensorOps::of_block(
+                crate::interpreters::eval_ops(
+                    TensorOps::zeros(Dtype::F16, vec![t_len * hq * nparts * hd]).step(),
+                    &mut gpu,
+                )
+                .await
+                .expect("tmp")
+                .id,
+                Dtype::F16,
+                vec![t_len * hq * nparts * hd],
+            ),
+            nparts,
+            seqs: t_len,
+        };
+
+        // 臂 B:XQA 面(i32 页表 / u32 总长 / 因果掩码 / 零 semaphore / scratch)
+        let xqa = crate::module::XqaVerifyCtx {
+            page_table: TensorOps::from_host(
+                Dtype::U32,
+                vec![1, nb],
+                &(0..nb).map(|i| i as u32).flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+            ),
+            seq_lens: TensorOps::from_host(
+                Dtype::U32,
+                vec![1],
+                &(ctx_total as u32).to_le_bytes().to_vec(),
+            ),
+            mask: TensorOps::from_host(
+                Dtype::U32,
+                vec![1, t_len],
+                &(0..t_len)
+                    .map(|i| ((1u32 << (i + 1)) - 1))
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<u8>>(),
+            ),
+            semaphores: TensorOps::of_block(
+                crate::interpreters::eval_ops(
+                    TensorOps::zeros(Dtype::U32, vec![16]).step(),
+                    &mut gpu,
+                )
+                .await
+                .expect("sem")
+                .id,
+                Dtype::U32,
+                vec![16],
+            ),
+            scratch: TensorOps::of_block(
+                crate::interpreters::eval_ops(
+                    TensorOps::zeros(Dtype::F16, vec![32 * 1024 * 1024]).step(),
+                    &mut gpu,
+                )
+                .await
+                .expect("scratch")
+                .id,
+                Dtype::F16,
+                vec![32 * 1024 * 1024],
+            ),
+            q_seq_len: t_len,
+            max_seq_len: nb * page,
+            sm_count: 84,
+        };
+
+        let fp8_env = || crate::env::EnvProvider {
+            kv: crate::env::KvEnv {
+                quant: crate::env::KvQuant::Fp8E4M3,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // 两臂 ctx 预构造(KvBuffers 非 Clone → 各自借用同一份池)
+        let mut ctx_v2 = ForwardCtx::attn_prefill(t_len, &pos, &kv, &rp, &slots, &lens);
+        let mut env_v2 = fp8_env();
+        env_v2.attn.verify_v2 = true;
+        env_v2.attn.verify_xqa = false;
+        ctx_v2.env = env_v2;
+        ctx_v2.attn_v2 = Some(v2);
+        ctx_v2.v2_bt8 = Some(&bt8);
+
+        let mut ctx_x = ForwardCtx::attn_prefill(t_len, &pos, &kv, &rp, &slots, &lens);
+        let mut env_x = fp8_env();
+        env_x.attn.verify_v2 = false;
+        env_x.attn.verify_xqa = true;
+        ctx_x.env = env_x;
+        ctx_x.xqa = Some(xqa);
+
+        // 预热(首跑含 NVRTC 编译/XQA 首发射;计时取第二轮)
+        let _ = crate::testkit::harvest_f16(&mut gpu, &attn.forward(&xs, &ctx_v2)).await;
+        let _ = crate::testkit::harvest_f16(&mut gpu, &attn.forward(&xs, &ctx_x)).await;
+        let t0 = std::time::Instant::now();
+        let a = crate::testkit::harvest_f16(&mut gpu, &attn.forward(&xs, &ctx_v2)).await;
+        let ms_v2 = t0.elapsed().as_secs_f64() * 1e3;
+        let t1 = std::time::Instant::now();
+        let b = crate::testkit::harvest_f16(&mut gpu, &attn.forward(&xs, &ctx_x)).await;
+        let ms_xqa = t1.elapsed().as_secs_f64() * 1e3;
+        // 假绿护栏:输出必须有限且非平凡(全 NaN/全零 = 判据无分辨率)
+        let nan_a = a.iter().filter(|v| !v.is_finite()).count();
+        let nan_b = b.iter().filter(|v| !v.is_finite()).count();
+        let _ = (nan_a, nan_b);
+        let finite = a.iter().chain(b.iter()).all(|v| v.is_finite());
+        let amp = a.iter().fold(0f32, |m, v| m.max(v.abs()));
+        assert!(finite, "输出含 NaN/Inf → 判据无效(池数据/核参数错)");
+        assert!(amp > 1e-6, "输出全零/近零(amp={amp:.6})→ 判据无分辨率");
+        let mut worst = 0f32;
+        for i in 0..a.len() {
+            worst = worst.max((a[i] - b[i]).abs());
+        }
+        assert!(worst.is_finite(), "差值含 NaN → 判据无效");
+        println!(
+            "层内对照(verify T={t_len} @ ctx {ctx_total},fp8 kNHD 池):\n  \
+             v2 臂 {ms_v2:.2}ms | XQA 臂 {ms_xqa:.2}ms | 比值 {:.2}\n  \
+             max|v2−XQA| = {worst:.6}(门 1e-2)",
+            ms_v2 / ms_xqa
+        );
+        assert!(worst < 1e-2, "层内 XQA vs v2 超门:{worst:.6}");
+    }
+
     /// GPU:owl_sigmoid_gate_mul_f16(NInfer 移植)vs host f32
     /// 验融合等价:silu 链上的 sigmoid+mul 双发射 → 单核(工单 N 收口锚)
     #[tokio::test]
@@ -1994,8 +2366,8 @@ mod split_probe_tests {
         TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd / x, page, x]).step(), &mut gpu).await.unwrap();
     let vc = crate::interpreters::eval_ops(
         TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd, page]).step(), &mut gpu).await.unwrap();
-    let bt = TensorOps::from_host(Dtype::F32, vec![1, nb], &f32b(&(0..nb).map(|i| i as f32).collect::<Vec<_>>()));
-    let slots = TensorOps::from_host(Dtype::F32, vec![t], &f32b(&(0..t).map(|i| i as f32).collect::<Vec<_>>()));
+    let bt = TensorOps::from_host(Dtype::F32, vec![1, nb], &crate::testkit::f32b(&(0..nb).map(|i| i as f32).collect::<Vec<_>>()));
+    let slots = TensorOps::from_host(Dtype::F32, vec![t], &crate::testkit::f32b(&(0..t).map(|i| i as f32).collect::<Vec<_>>()));
     let scr_out_b = crate::interpreters::eval_ops(
         TensorOps::zeros(Dtype::F16, vec![t * hq * nparts * hd]).step(), &mut gpu).await.unwrap();
     let scr_stat_b = crate::interpreters::eval_ops(

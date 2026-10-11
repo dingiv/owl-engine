@@ -374,6 +374,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
             },
             spec_mode,
             spec_depth,
+            verify_xqa: self.cfg.knobs.env.attn.verify_xqa,
             gdn_slots: self.cfg.knobs.gdn_slots,
             snap_max: self.cfg.knobs.snap_max,
             vram_target: self.cfg.knobs.vram_target,
@@ -466,7 +467,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
             };
             // E3 设备采样:token = argmax(logits)(f32 数值过线,契约 5)
             let tok = owl_models::ops::argmax_f32idx(&tree, vocab, 0);
-            sc.output("token", &tok);
+            sc.output("token", &tok)?;
             sc.output("logits", &tree)
         };
 
@@ -535,6 +536,17 @@ impl<D: DeviceClient + 'static> Engine<D> {
             let bt_leaf = pool.bt_leaf_flat();
             let bt_leaf_nb = *bt_leaf.shape().last().unwrap_or(&1);
             let verify_attn_v2 = pool.verify_attn_v2_scratch();
+            // XQA 面(2026-10-13 D3):池常量件 + 图槽 init(i32/u32 位型走私进
+            // f32 账叶 —— 与 sm_scale/fi_scale_bits 同款约定)
+            let xqa_pool_ctx = pool.xqa_verify_ctx();
+            let xqa_pt_nb = bt_leaf_nb;
+            let xqa_pt_init: Vec<f32> = (0..xqa_pt_nb)
+                .map(|i| f32::from_bits(i as u32))
+                .collect();
+            let xqa_sem_n = xqa_pool_ctx.as_ref().map(|x| x.semaphores.shape().iter().product::<usize>()).unwrap_or(0);
+            let xqa_mask_init: Vec<f32> = (0..depth1)
+                .map(|i| f32::from_bits(((1u32 << (i + 1)) - 1) as u32))
+                .collect();
             let env_v = env;
             let key_dim = dims.nk * dims.hk;
             let value_dim = dims.nv * dims.hv;
@@ -578,6 +590,15 @@ impl<D: DeviceClient + 'static> Engine<D> {
                         InputSlot::f32("gdn_slot", 1),
                         InputSlot::f32("gdn_cu", 2).init(vec![0.0, depth1 as f32]),
                         InputSlot::f32("bt8", depth1 * bt_leaf_nb),
+                        // XQA 面(2026-10-13 D3):seq_lens 逐轮变(u32 位型走私);
+                        // 页表/掩码是常量,在槽 init 里填一次(捕获前 Htod 合法)
+                        InputSlot::f32("xqa_seq", 1).init(vec![0.0]),
+                        InputSlot::f32("xqa_pt", xqa_pt_nb).init(xqa_pt_init.clone()),
+                        InputSlot::f32("xqa_mask", depth1).init(xqa_mask_init.clone()),
+                        // semaphores 走**图输入槽**(每轮 step 写零):
+                        // ⚠️ 曾用 `memset_zero` 命令 → 跨账本解析踩雷(见工单
+                        // §2.7 定谳);输入槽与 xqa_seq 同一条已验证通路
+                        InputSlot::f32("xqa_sem", xqa_sem_n).init(vec![0.0; xqa_sem_n]),
                     ],
                     outputs: vouts,
                     capture: !self.cfg.knobs.no_graph,
@@ -625,6 +646,23 @@ impl<D: DeviceClient + 'static> Engine<D> {
                     // = depth1 倍;bt8 = 8× 页链平铺,engine 每轮 host 写入)
                     ctx.attn_v2 = verify_attn_v2.clone();
                     ctx.v2_bt8 = Some(&bt8_in);
+                    // XQA verify 臂(2026-10-13 D3):面 = pool 常量件 + 图输入 seq
+                    if let Some(x) = xqa_pool_ctx.as_ref() {
+                        let seq_in = sc.input("xqa_seq")?;
+                        let pt_in = sc.input("xqa_pt")?;
+                        let mk_in = sc.input("xqa_mask")?;
+                        let sem_in = sc.input("xqa_sem")?;
+                        ctx.xqa = Some(owl_models::module::XqaVerifyCtx {
+                            page_table: pt_in,
+                            seq_lens: seq_in,
+                            mask: mk_in,
+                            semaphores: sem_in,
+                            scratch: x.scratch.clone(),
+                            q_seq_len: depth1,
+                            max_seq_len: x.max_seq_len,
+                            sm_count: x.sm_count,
+                        });
+                    }
                     let tap: std::rc::Rc<std::cell::RefCell<Vec<owl_models::tensor::TensorOps>>> =
                         std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
                     ctx.gdn_tap = Some(tap.clone());

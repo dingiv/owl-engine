@@ -182,6 +182,10 @@ pub struct AttnEnv {
     pub prefill_split: bool,
     /// 诊断二分:强制 naive 回退(paged 数值质量 A/B)
     pub force_naive_prefill: bool,
+    /// verify 臂选择(2026-10-13 D3):true = v2 伪序列臂;false = prefill 族
+    pub verify_v2: bool,
+    /// verify 臂改走 XQA(true 且 ctx.xqa 在场时优先于 verify_v2)
+    pub verify_xqa: bool,
     /// FlashInfer prefill 面 —— **生产恒真**(2026-10-13:配置面开关已移除,
     /// 没有不启用的情况)。本字段保留仅供**门/诊断**做读核 A/B
     /// (engine::tests::gpu_longctx_fi_direct_gate 用它切 FI/自研读核)
@@ -261,6 +265,8 @@ impl EnvProvider {
                 qkv_fuse: d.qkv_fuse,
                 prefill_split: d.prefill_split,
                 force_naive_prefill: d.force_naive_prefill,
+                verify_v2: d.verify_v2,
+                verify_xqa: d.verify_xqa,
                 // FI **恒启用**(2026-10-13 用户令:移除开关,没有不启用的情况;
                 // 原 dispatch.flashinfer 已删)
                 fi: true,

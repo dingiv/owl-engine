@@ -117,6 +117,8 @@ pub mod names {
     pub const GEMM_W4A16_BF16: &str = "marlin_gemm_w4a16_bf16";
     /// FlashInfer paged prefill(f16 KV)
     pub const PREFILL_FI: &str = "flashinfer_prefill_paged_f16";
+    /// XQA verify/decode 注意力(foreign;feature `xqa`)
+    pub const VERIFY_XQA: &str = "owl_xqa_verify";
     /// FlashInfer paged prefill(fp8 e4m3 KV)
     pub const PREFILL_FI_FP8KV: &str = "flashinfer_prefill_paged_fp8kv";
 }

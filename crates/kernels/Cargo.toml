@@ -14,6 +14,9 @@ description = "Operator dispatch + unified kernel home: .cu sources, nvrtc compi
 "marlin" = ["dep:rayon", "dep:half"]
 # FlashInfer prefill(预编 .a + foreign-kernel;E1.5 工作包)
 "flashinfer" = []
+# XQA(kNHD fp8 KV 的 decode/verify 注意力;移植自 vllm-ampere-optimized/flashampere;
+# 预编 .a + foreign-kernel;2026-10-13 长 ctx verify 立案)
+"xqa" = []
 # 服务端面执行原语(device.rs:DeviceRes + Exec;纯 cudarc driver/nvrtc,
 # 零 build.rs nvcc 面(旧 "cuda" feature 的 cuda_ops 预编链已退役删除,勿复活))
 "device" = ["dep:cudarc"]

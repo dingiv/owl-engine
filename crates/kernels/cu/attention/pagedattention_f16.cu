@@ -1120,14 +1120,34 @@ __device__ void paged_attention_kernel_f16(
                              + kv_head_idx * kv_head_stride
                              + (long long)physical_block_offset * (kv_block_stride / BLOCK_SIZE);
           if constexpr (KV_FP8) {
+            // ⭐ D3 提速(2026-10-13,长 ctx 衰减立案):1B 标量读 → 8B 向量读。
+            // 动机:同形 f16 核 0.93ms/次 vs fp8 核 4.63ms/次(5.0×,nsys 定谳);
+            // 根因 = 每元素一次 1B warp-load,32 lane 落在 32 个不同 32B sector
+            // (kNHD 页内 token 维 stride = hkv·hd)→ sector 放大 32×。
+            // 改 8B(uint2 宽)后每 lane 一次取满 8 个连续 dim,放大 → 4×。
+            // 对齐:vec_idx*VEC_SIZE 恒 8B 对齐(页内 [page,hkv,hd] 连续;
+            // kv_head_stride / 每 token stride 均 8 的倍数)→ 与
+            // THREAD_GROUP_SIZE 取值无关,无需额外守卫。
             const unsigned char* k_ptr8 =
                 reinterpret_cast<const unsigned char*>(k_cache) + kn + vec_idx * VEC_SIZE;
             __half kt[VEC_SIZE];
+            if constexpr (VEC_SIZE <= 8 && 8 % VEC_SIZE == 0) {
+              const unsigned long long raw =
+                  *reinterpret_cast<const unsigned long long*>(k_ptr8);
+              const unsigned char* rb = reinterpret_cast<const unsigned char*>(&raw);
 #pragma unroll
-            for (int t = 0; t < VEC_SIZE; t++) {
-              __nv_fp8_e4m3 e;
-              e.__x = k_ptr8[t];
-              kt[t] = __half(__nv_cvt_fp8_to_halfraw(e.__x, __NV_E4M3));
+              for (int t = 0; t < VEC_SIZE; t++) {
+                __nv_fp8_e4m3 e;
+                e.__x = rb[t];
+                kt[t] = __half(__nv_cvt_fp8_to_halfraw(e.__x, __NV_E4M3));
+              }
+            } else {
+#pragma unroll
+              for (int t = 0; t < VEC_SIZE; t++) {
+                __nv_fp8_e4m3 e;
+                e.__x = k_ptr8[t];
+                kt[t] = __half(__nv_cvt_fp8_to_halfraw(e.__x, __NV_E4M3));
+              }
             }
             k_vecs[j] = *reinterpret_cast<const K_vec*>(kt);
           } else {
@@ -1234,6 +1254,91 @@ __device__ void paged_attention_kernel_f16(
     *exp_sums_ptr = exp_sum;
   }
 
+  // ========================================================================
+  // ⭐ D3 合并读通道(kNHD + fp8 KV;2026-10-13 长 ctx 衰减立案)
+  //
+  // 旧路径:V 累加沿 **token 维** gather(stride = hkv·hd ≈ 1KB),fp8 下
+  // 每元素一次 1B warp-load → 32B/sector 只用到 1B(放大 32×),与 K 侧
+  // 同源(实测同形 f16 核 0.93ms/次 vs fp8 核 4.63ms/次,5.0×)。
+  //
+  // 本通道把映射换成 **lane→连续 dim**(每 lane 持 DPL = HEAD_SIZE/32 个
+  // 连续 dim):逐 token 读该 token 的连续 DPL 字节 —— 页内 [page,hkv,hd]
+  // 连续 ⇒ warp 内 lane 相邻 = 字节相邻 = **完全合曲**(1 次 8B 读覆盖
+  // 原先 8 次 1B 读),acc[dpl] += p * v[dpl]。
+  // 归约结构随之简化:lane 间 dim 互不相交 → 无 warp 内归约;仅需跨 warp
+  // 按页求和(与旧路径同构),再按维写 tmp_out。数值序不变(同一 softmax
+  // 归一化 logits × V 求和,只是求和次序由 (dim, token) 换成 (token, dim))
+  // —— 浮点结合律差异在 f32 累加下 < 1e-6(单元探针门 1e-2 有量级余量)。
+  // ========================================================================
+  if constexpr (KNHD && KV_FP8 && USE_PARTITIONING) {
+    constexpr int WARP = 32;
+    constexpr int DPL = HEAD_SIZE / WARP;
+    static_assert(HEAD_SIZE % WARP == 0, "lane→dim 通道要求 hd 整除 32");
+    const int dim0 = lane * DPL;
+    float acc[DPL];
+#pragma unroll
+    for (int j = 0; j < DPL; j++) {
+      acc[j] = 0.f;
+    }
+    const unsigned char* v_bytes = reinterpret_cast<const unsigned char*>(v_cache);
+    const long long tok_stride = kv_block_stride / BLOCK_SIZE;
+    for (int block_idx = start_block_idx + warp_idx; block_idx < end_block_idx;
+         block_idx += NUM_WARPS) {
+      const long long pbn = static_cast<long long>((int)block_table[block_idx]);
+      const long long v_row0 =
+          pbn * kv_block_stride + kv_head_idx * kv_head_stride + (long long)dim0;
+      const int tok_in_page = MIN(BLOCK_SIZE, seq_len - block_idx * BLOCK_SIZE);
+      for (int t = 0; t < tok_in_page; t++) {
+        // 归一化后 logits(分区内 softmax;越窗行 0 → 贡献 0,故跳过越界即可)
+        const float p = logits[block_idx * BLOCK_SIZE + t - start_token_idx];
+        const unsigned char* vp = v_bytes + v_row0 + (long long)t * tok_stride;
+#pragma unroll
+        for (int j = 0; j < DPL; j++) {
+          __nv_fp8_e4m3 e;
+          e.__x = vp[j];
+          acc[j] += p * __half2float(__half(__nv_cvt_fp8_to_halfraw(e.__x, __NV_E4M3)));
+        }
+      }
+    }
+    // 跨 warp 归并前须屏障(logits 与 out_smem 共用 shared_mem,与旧路径同规)
+    __syncthreads();
+    float* out_smem = reinterpret_cast<float*>(shared_mem);
+#pragma unroll
+    for (int i = NUM_WARPS; i > 1; i /= 2) {
+      int mid = i / 2;
+      if (warp_idx >= mid && warp_idx < i) {
+        float* dst = &out_smem[(warp_idx - mid) * HEAD_SIZE];
+#pragma unroll
+        for (int j = 0; j < DPL; j++) {
+          dst[dim0 + j] = acc[j];
+        }
+      }
+      __syncthreads();
+      if (warp_idx < mid) {
+        const float* src = &out_smem[warp_idx * HEAD_SIZE];
+#pragma unroll
+        for (int j = 0; j < DPL; j++) {
+          acc[j] += src[dim0 + j];
+        }
+      }
+      __syncthreads();
+    }
+    // 分区部分输出 tmp_out [seqs, hq, nparts, hd]
+    // ⚠️ 只有 **warp 0** 持全和(树归并把上 warp 折进下 warp;与旧路径
+    // 的 `if (warp_idx == 0)` 写回同规)。少了这个守卫 = 各 warp 用自身
+    // 部分和互相覆盖(首版实测:探针 max err 1.85 @ s=2)。
+    if (warp_idx == 0) {
+      uint16_t* o = out + seq_idx * num_heads * max_num_partitions * HEAD_SIZE
+                        + head_idx * max_num_partitions * HEAD_SIZE
+                        + partition_idx * HEAD_SIZE;
+#pragma unroll
+      for (int j = 0; j < DPL; j++) {
+        from_float(o[dim0 + j], acc[j]);
+      }
+    }
+    return; // 本核后续仅剩旧 V 通道,已在此完成
+  }
+
   // Each thread will fetch 16 bytes from the value cache at a time.
   constexpr int V_VEC_SIZE = MIN(16 / sizeof(uint16_t), BLOCK_SIZE);
   using V_vec = typename Vec<uint16_t, V_VEC_SIZE>::Type;
@@ -1283,6 +1388,12 @@ __device__ void paged_attention_kernel_f16(
         V_vec v_vec;
         if constexpr (KNHD) {
           // 统一契约 P2:token 维跨 hkv·hd 聚集(gather);值序不变 → 位等
+          // ⚠️ D3 未完项(2026-10-13 实测):本 gather 轴 = token 维,
+          // stride = hkv·hd(1024B),lane 间不可合并 → fp8 下仍是每元素
+          // 一次 1B 读(sector 放大 32×)。已定的修法 = 把 V 累加改成
+          // "lane 拥有连续 dpl 个 dim(@某一 token 的 dim 维连续 8B 读,
+          // warp 内 lane 相邻 = 字节相邻 = 合曲)",与 K 的 lane→token
+          // 映射互换;待改(见 roadmap.local/spec长ctx衰减 §P2)。
           __half vt[V_VEC_SIZE];
 #pragma unroll
           for (int j = 0; j < V_VEC_SIZE; j++) {

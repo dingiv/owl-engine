@@ -160,6 +160,8 @@ pub enum SemanticKernel {
     FiPrefill,
     /// FlashInfer paged prefill(e4m3 KV)
     FiPrefillFp8kv,
+    /// XQA verify/decode 注意力(kNHD fp8 池;foreign-kernel)
+    XqaVerify,
 }
 
 impl SemanticKernel {
@@ -237,6 +239,7 @@ impl SemanticKernel {
             SemanticKernel::MarlinW4A16 => "marlin.w4a16",
             SemanticKernel::FiPrefill => "attn.fi_prefill",
             SemanticKernel::FiPrefillFp8kv => "attn.fi_prefill_fp8kv",
+            SemanticKernel::XqaVerify => "attn.xqa_verify",
         })
     }
 }
@@ -610,6 +613,7 @@ pub(crate) fn foreign_sig(name: &str) -> Option<&'static str> {
         x if x == n::GEMM_W4A16_BF16 => Some(owl_kernels::client::marlin::SIG),
         x if x == n::PREFILL_FI => Some(owl_kernels::client::fi_sig::SIG),
         x if x == n::PREFILL_FI_FP8KV => Some(owl_kernels::client::fi_sig::SIG),
+        x if x == n::VERIFY_XQA => Some(owl_kernels::family::xqa::VERIFY_XQA_SIG),
         _ => None,
     }
 }

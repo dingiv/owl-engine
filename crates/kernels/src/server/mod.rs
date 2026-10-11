@@ -7,6 +7,8 @@
 /// cuBLAS GEMM runtime(feature=cublas,随底座)
 #[cfg(feature = "cublas")]
 pub mod cublas;
+#[cfg(feature = "xqa")]
+pub mod xqa;
 /// FlashInfer prefill runtime(feature=flashinfer,随底座)
 #[cfg(feature = "flashinfer")]
 pub mod flashinfer;
@@ -31,5 +33,7 @@ pub fn all_families() -> Vec<Box<dyn KernelSpec>> {
         Box::new(marlin::MarlinRuntime),
         #[cfg(feature = "flashinfer")]
         Box::new(flashinfer::FiRuntime::default()),
+        #[cfg(feature = "xqa")]
+        Box::new(xqa::XqaRuntime),
     ]
 }

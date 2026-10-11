@@ -112,6 +112,8 @@ pub struct ForwardCtx<'a> {
     pub seq_cu: Option<&'a TensorOps>,
     /// verify v2 伪序列页表([seqs×nb];§三十一 verify 臂;None = 非 verify 图)
     pub v2_bt8: Option<&'a TensorOps>,
+    /// XQA verify 面(2026-10-13 D3;None = 不走 XQA 臂)
+    pub xqa: Option<XqaVerifyCtx>,
     /// E5-M4 fold 记录面(verify 图专用):GDN 层把 fold 重放所需张量
     /// 依层序推入(每层 8:q/k/v raw → conv 重放;q_n/k_n/v_c/g/beta →
     /// 递推重放)。None = 零开销(生产 decode/prefill 不设)。
@@ -146,6 +148,7 @@ impl<'a> ForwardCtx<'a> {
             attn_v2: None,
             seq_cu: None,
             v2_bt8: None,
+            xqa: None,
             gdn_tap: None,
         }
     }
@@ -179,6 +182,7 @@ impl<'a> ForwardCtx<'a> {
             attn_v2: None,
             seq_cu: None,
             v2_bt8: None,
+            xqa: None,
             gdn_tap: None,
         }
     }
@@ -207,6 +211,7 @@ impl<'a> ForwardCtx<'a> {
             attn_v2: None,
             seq_cu: None,
             v2_bt8: None,
+            xqa: None,
             gdn_tap: None,
         }
     }
@@ -239,6 +244,7 @@ impl<'a> ForwardCtx<'a> {
             attn_v2: None,
             seq_cu: None,
             v2_bt8: None,
+            xqa: None,
             gdn_tap: None,
         }
     }
@@ -274,6 +280,7 @@ impl<'a> ForwardCtx<'a> {
             attn_v2: None,
             seq_cu: None,
             v2_bt8: None,
+            xqa: None,
             gdn_tap: None,
         }
     }
@@ -309,6 +316,7 @@ impl<'a> ForwardCtx<'a> {
             attn_v2: None,
             seq_cu: None,
             v2_bt8: None,
+            xqa: None,
             gdn_tap: None,
         }
     }
@@ -350,6 +358,7 @@ impl<'a> ForwardCtx<'a> {
             attn_v2: None,
             seq_cu: None,
             v2_bt8: None,
+            xqa: None,
             gdn_tap: None,
         }
     }
@@ -419,6 +428,26 @@ pub struct AttnV2Scratch {
     /// 伪序列数(§三十一:decode=1;verify=depth1,8 token 当 8 伪序列,
     /// grid.y 并行 + partition 维 = flash-decoding 形态;层臂按此防误配)
     pub seqs: usize,
+}
+
+/// XQA verify/decode 面(2026-10-13 D3 立案;kNHD fp8 池 + spec-dec q=1+K)。
+/// 张量全由 engine/测试注入(层内零自建 —— 捕获期禁 Htod 同 FI 先例):
+/// - `page_table` **i32** `[1, nb]`(owl 现有 bt 是 f32 → 需 i32 孪生)
+/// - `seq_lens` **u32** `[1]` = **整请求总 KV 长**(不是逐行前缀长)
+/// - `mask` **u32** `[1, q_seq_len, ceil(q/32)]`:行 i = 块内第 i 个 token,
+///   bit k = 允许看块内第 k 个 key,因果 = `(1<<(i+1))-1`
+/// - `semaphores` **u32**(KV-split 归约计数;**每次发射前必须为零**)
+/// - `scratch` 工作区(持久;参考实现 256MiB)
+#[derive(Clone)]
+pub struct XqaVerifyCtx {
+    pub page_table: TensorOps,
+    pub seq_lens: TensorOps,
+    pub mask: TensorOps,
+    pub semaphores: TensorOps,
+    pub scratch: TensorOps,
+    pub q_seq_len: usize,
+    pub max_seq_len: usize,
+    pub sm_count: usize,
 }
 
 /// KV 动态上下文:每步由 runner 构造。(注:decode 直排路径暂走

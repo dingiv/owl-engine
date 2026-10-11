@@ -107,7 +107,13 @@ impl ServerProbes {
 
 mod harvest;
 
+/// actor 编号(全局静态计数;DeadBlock 跨账本定谳用:每个 GpuServer = 一个
+/// 独立账本,id 从 1 各自计数)
+static ACTOR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub struct GpuServer {
+    /// 本 actor 的账本编号(打点/定谳用)
+    pub(crate) actor_tag: u64,
     rx: mpsc::Receiver<Command>,
     selector: DeviceSelector,
     /// 设备诊断/调优选项(入口显式传入;Default = 全关。显式依赖律:
@@ -161,6 +167,7 @@ impl GpuServer {
         debug: bool,
     ) -> Self {
         Self {
+            actor_tag: ACTOR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             rx,
             selector,
             pool: std::sync::Arc::new(PinnedPool::default()),
@@ -192,6 +199,7 @@ impl GpuServer {
                 // "捕获内首次初始化"事故类结构性消灭)。失败 = 拒启。
                 {
                     let mut res = GpuRes {
+                        actor_tag: self.actor_tag,
                         ctx: self.ctx.as_ref().expect("ctx 上线"),
                         scratch: &mut self.scratch_ledger,
                     };
@@ -551,7 +559,10 @@ impl GpuServer {
             eprintln!("[cap-prof] memset_zero {}B block{block}", len_bytes);
         }
         let result = (|| {
-            let (dptr, _) = self.ctx().block_ptr(block, &stream)?;
+            let (dptr, _) = self.ctx().block_ptr(block, &stream).map_err(|e| {
+                // 带上块 id(谁在 memset 一个不存在的块;DeadBlock 定位)
+                ModelError::Msg(format!("[memset-arg] id={block} len={len_bytes} :: {e}"))
+            })?;
             unsafe {
                 crate::ffi::memset_d8_async(dptr + offset_bytes as u64, 0, len_bytes, stream.cu_stream())
             }
@@ -624,7 +635,7 @@ impl GpuServer {
         if self.registry.as_ref().is_some_and(|r| r.knows(&msg.kernel.name)) {
             let out = (|| -> Result<Bytes, String> {
                 let ctx = self.ctx.as_ref().ok_or("server 未上线")?;
-                let mut res = GpuRes { ctx, scratch: &mut self.scratch_ledger };
+                let mut res = GpuRes { ctx, scratch: &mut self.scratch_ledger, actor_tag: self.actor_tag };
                 self.registry
                     .as_mut()
                     .expect("knows 已查非 None")
@@ -811,6 +822,8 @@ unsafe extern "C" fn trampoline(data: *mut std::ffi::c_void) {
 pub(crate) struct GpuRes<'a> {
     pub ctx: &'a crate::state::GpuCtx,
     pub scratch: &'a mut Vec<(u64, CudaSlice<u8>)>,
+    /// 本 actor 账本编号(DeadBlock 定谳:跨账本时能看出"问的是哪个账房")
+    pub actor_tag: u64,
 }
 
 const OP_RES: &str = "server.res";
@@ -833,7 +846,12 @@ impl owl_kernels::device::DeviceRes for GpuRes<'_> {
         let (p, _) = self
             .ctx
             .block_ptr(b.id, &stream)
-            .map_err(|e| OpError::Contract { op: OP_RES.into(), field: "resolve", expect: "块在册".into(), got: b.id.to_string() })?;
+            .map_err(|e| OpError::Contract {
+                op: OP_RES.into(),
+                field: "resolve",
+                expect: format!("块在册(actor_tag={} 账本)", self.actor_tag),
+                got: format!("id={} / {e}", b.id),
+            })?;
         Ok(p)
     }
     fn alloc(&mut self, bytes: usize, _tag: &'static str) -> Result<ScratchBuf, OpError> {
@@ -874,7 +892,10 @@ impl owl_kernels::device::DeviceRes for GpuRes<'_> {
             // 捕获窗:async 节点(回放重放 memcpy;不变盒语义由家族保证)
             // 捕获窗:async 节点(回放重放 memcpy;不变盒语义由家族保证)
             // SAFETY:dst ∈ scratch 账本(本 impl 分配并持有);src 不变盒
-            unsafe { crate::ffi::memcpy_htod_async(dst, src, stream.cu_stream()) };
+            // 2026-10-13(家规:可失败返回值不可丢弃):原 `;` 丢弃入队错误
+            // → 入队失败会静默变成"节点不存在"(回放时少一次 memcpy)。现上抛。
+            unsafe { crate::ffi::memcpy_htod_async(dst, src, stream.cu_stream()) }
+                .map_err(|e| OpError::Launch { op: OP_RES.into(), stage: owl_kernels::contract::Stage::Store, detail: format!("upload async: {e:?}") })?;
             Ok(())
         } else {
             // 2026-10-09 崩案修复试刀:async memcpy_htod 静默不写(meta 表读回全零)

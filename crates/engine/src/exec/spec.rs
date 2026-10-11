@@ -94,6 +94,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         .chain(std::iter::repeat(0f32).take(nb_total - bt_chain.len()))
                 })
                 .collect();
+            // XQA 臂:semaphores 每轮清零(KV-split 归约计数;**同流序先于图回放**;
+            // 参考实现 = torch sem.zero_();图内不做,故在轮侧发 memset)
+            // ⚠️ 必须用 **session face**(池块的账房;verify 图 face 是另一份
+            // 账本 → 传别家的块 id = 打到别的块上 → `pump: DeadBlock` 实测踩过)
+            // XQA seq_lens = **整请求总 KV 长**(含块内 depth+1 个位置;u32 位型走私)
+            let xqa_seq_v = [f32::from_bits((pos + block.len()) as u32)];
+            // semaphores 每轮写零(图输入槽;KV-split 归约计数)
+            let xqa_sem_v: Vec<f32> = vec![0.0; self.pool.xqa_sem_n()];
             let t_step_v = std::time::Instant::now();
             vg.step(&[
                 ("ids", ids_f.as_slice()),
@@ -102,6 +110,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 ("kv_lens", lens_f.as_slice()),
                 ("gdn_slot", &[gdn_slot as f32]),
                 ("bt8", bt8_f.as_slice()),
+                ("xqa_seq", xqa_seq_v.as_slice()),
+                ("xqa_sem", xqa_sem_v.as_slice()),
             ])
             .await?;
             let t_read_v = std::time::Instant::now();

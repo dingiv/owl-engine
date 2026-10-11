@@ -7,11 +7,14 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    // 仅 marlin feature 需要 nvcc(纯源码之家消费方零 nvcc 依赖)
-    if std::env::var_os("CARGO_FEATURE_MARLIN").is_none() {
-        return;
-    }
+    // ⚠️ 2026-10-13 修连坐:原 main() 在 `CARGO_FEATURE_MARLIN` 缺席时整段
+    // return —— 而 FI/XQA 两段(.a 复制 + rustc-link-lib 指令)当时都写在
+    // build_marlin() 体内 ⇒ **单独开 `--features flashinfer`(或 xqa)会静默
+    // 不链接**,症状 = 运行期 undefined symbol。现改为三 feature 各自成段、
+    // 各自门控(marlin 段本体原有自门控,原 early-return 是冗余且有害)。
     build_marlin();
+    build_xqa();
+    build_flashinfer();
 }
 
 fn build_marlin() {
@@ -115,6 +118,91 @@ fn build_marlin() {
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", cuda_lib.display());
     }
 
+}
+
+fn build_xqa() {
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+    // ------------------------------------------------------------------
+    // XQA(kNHD fp8 KV 的 decode/verify 注意力;2026-10-13 长 ctx verify 立案)
+    // 移植自 repos/vllm-ampere-optimized/flashampere/xqa/csrc(Ampere 闭包,16 文件,
+    // 无 cutlass / 无 FI 头依赖)→ 可用普通 nvcc 直编,只需 --expt-relaxed-constexpr。
+    // XQA_FORCE_BUILD=1 重编;否则用 prebuilt/libowl_xqa.a(入库,marlin/FI 先例)。
+    // ------------------------------------------------------------------
+    if std::env::var_os("CARGO_FEATURE_XQA").is_some() {
+        println!("cargo:rerun-if-changed=cu/xqa/prebuilt/libowl_xqa.a");
+        println!("cargo:rerun-if-changed=cu/xqa/owl_xqa_launch.cu");
+        println!("cargo:rerun-if-changed=cu/xqa/mha.cu");
+        println!("cargo:rerun-if-env-changed=XQA_FORCE_BUILD");
+        let xqa_dir = out_dir.join("xqa");
+        std::fs::create_dir_all(&xqa_dir).unwrap();
+        let prebuilt = PathBuf::from("cu/xqa/prebuilt/libowl_xqa.a");
+        let force = env::var("XQA_FORCE_BUILD").ok().as_deref() == Some("1");
+        if prebuilt.exists() && !force {
+            let dest = xqa_dir.join("libowl_xqa.a");
+            std::fs::copy(&prebuilt, &dest).expect("copy prebuilt libowl_xqa.a");
+            println!("cargo:warning=owl-kernels: using prebuilt {}", prebuilt.display());
+        } else {
+            // 实例化参数 = owl 生产形状(见 cu/xqa/README.md / owl_xqa_launch.cu 头注)
+            let defines = [
+                "-DNDEBUG=1",
+                "-DBEAM_WIDTH=1",
+                "-DUSE_INPUT_KV=0",
+                "-DUSE_CUSTOM_BARRIER=1",
+                "-DTOKENS_PER_PAGE=32",
+                "-DHEAD_ELEMS=256",
+                "-DHEAD_GRP_SIZE=6",
+                "-DINPUT_FP16=1",
+                "-DDTYPE=__half",
+                "-DCACHE_ELEM_ENUM=2",
+                "-DSLIDING_WINDOW=0",
+                "-DLOW_PREC_OUTPUT=0",
+                "-DSPEC_DEC=1",
+                "-DMLA_WRAPPER=0",
+                "-DUSE_SM90_MHA=0",
+            ];
+            let nvcc_x = env::var("XQA_NVCC").unwrap_or_else(|_| "nvcc".into());
+            let mut objs: Vec<PathBuf> = Vec::new();
+            for src in ["mha.cu", "owl_xqa_launch.cu"] {
+                let obj = xqa_dir.join(format!("{}.o", src.trim_end_matches(".cu")));
+                let mut cmd = std::process::Command::new(&nvcc_x);
+                cmd.args(["-O3", "-std=c++17", "-arch=sm_86", "--expt-relaxed-constexpr"])
+                    .args(defines)
+                    .arg("-c")
+                    .arg(PathBuf::from("cu/xqa").join(src))
+                    .arg("-o")
+                    .arg(&obj);
+                let status = cmd.status().expect("xqa: failed to spawn nvcc");
+                assert!(status.success(), "xqa: nvcc failed on {src}");
+                objs.push(obj);
+            }
+            // ⚠️ 必须先删旧归档:对象文件名若换过(如 xqa_launch.o → launch.o),
+            // `ar rcs` 是"按名替换"→ 旧成员**留在归档里且排在前**,链接器取第一个
+            // 定义 = 永远链到旧版(实测踩坑:改 launcher 后二进制行为不变、
+            // strings 查不到新串,排查半天的"幽灵")。
+            let lib = xqa_dir.join("libowl_xqa.a");
+            let _ = std::fs::remove_file(&lib);
+            let ar = env::var("AR").unwrap_or_else(|_| "ar".into());
+            let mut cmd = std::process::Command::new(ar);
+            cmd.args(["rcs"]).arg(&lib).args(&objs);
+            let status = cmd.status().expect("xqa: failed to spawn ar");
+            assert!(status.success(), "xqa: ar failed");
+            println!("cargo:warning=owl-kernels: built libowl_xqa.a from source");
+        }
+        let cuda_lib = env::var("CUDA_HOME")
+            .map(|h| PathBuf::from(h).join("lib64"))
+            .unwrap_or_else(|_| PathBuf::from("/usr/local/cuda/lib64"));
+        println!("cargo:rustc-link-search=native={}", xqa_dir.display());
+        println!("cargo:rustc-link-search=native={}", cuda_lib.display());
+        println!("cargo:rustc-link-lib=static=owl_xqa");
+        println!("cargo:rustc-link-lib=dylib=cudart");
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", cuda_lib.display());
+    }
+
+}
+
+fn build_flashinfer() {
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     // ------------------------------------------------------------------
     // FlashInfer prefill(预编 .a 入库;foreign-kernel 通道;E1.5 工作包)
     // FLASHINFER_FORCE_BUILD=1 重编:nvcc -arch=sm_86 -I<flashinfer>/include
@@ -154,13 +242,14 @@ fn build_marlin() {
             assert!(status.success(), "flashinfer: ar failed");
             println!("cargo:warning=owl-kernels: built libowl_flashinfer.a from source");
         }
-        println!("cargo:rustc-link-search=native={}", fi_dir.display());
-        println!("cargo:rustc-link-lib=static=owl_flashinfer");
-        println!("cargo:rustc-link-lib=dylib=cudart");
-        println!("cargo:rustc-link-lib=dylib=stdc++");
         let cuda_lib = env::var("CUDA_HOME")
             .map(|h| PathBuf::from(h).join("lib64"))
             .unwrap_or_else(|_| PathBuf::from("/usr/local/cuda/lib64"));
+        println!("cargo:rustc-link-search=native={}", fi_dir.display());
+        println!("cargo:rustc-link-search=native={}", cuda_lib.display());
+        println!("cargo:rustc-link-lib=static=owl_flashinfer");
+        println!("cargo:rustc-link-lib=dylib=cudart");
+        println!("cargo:rustc-link-lib=dylib=stdc++");
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", cuda_lib.display());
     }
 }

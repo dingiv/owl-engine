@@ -230,6 +230,7 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "marlin.w4a16" => marlin::w4a16(req.shapes, dt),
         "attn.fi_prefill" => attn::fi_prefill(false),
         "attn.fi_prefill_fp8kv" => attn::fi_prefill(true),
+        "attn.xqa_verify" => attn::xqa_verify(),
         "elems.cast_f16_f32" => elems::cast_f16_f32(dt),
         "ops.concat" => elems::concat(dt),
         "ops.rope" => elems::rope(dt, ax(0)),
@@ -1056,6 +1057,11 @@ pub mod attn {
             name,
             shape: Shape { grid: (t, hq, 1), block: (hd.max(1), 1, 1), smem: 0 },
         }
+    }
+
+    /// XQA verify/decode(foreign 家族臂;host 函数发射,workspace 在 runtime)
+    pub fn xqa_verify() -> KernelPick {
+        KernelPick { name: crate::contract::names::VERIFY_XQA, shape: FOREIGN }
     }
 
     /// FlashInfer paged prefill(foreign 家族臂;plan 缓存 + run 在家族 runtime)

@@ -6,6 +6,8 @@
 
 /// GDN chunked(face;零门)
 pub mod gdn_chunked;
+#[cfg(feature = "xqa")]
+pub mod xqa;
 /// GDN scalar(face;零门)
 pub mod gdn_scalar;
 /// cuBLAS GEMM face(feature=cublas,随底座)

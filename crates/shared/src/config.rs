@@ -226,6 +226,16 @@ pub struct DispatchCfg {
     pub qkv_fuse: bool,
     pub prefill_split: bool,
     pub force_naive_prefill: bool,
+    /// verify(T=depth+1)走的注意力臂:true = v2 伪序列臂(现状缺省);
+    /// false = 回落 prefill 族(--split / --chunked_opt)。
+    /// 2026-10-13 立(长 ctx 衰减 D3 立案):v2 伪序列臂在 ctx 8192 实测
+    /// 4.63ms/层(fp8),而 prefill 族是 qo_len=8 单遍形态 —— 本开关是
+    /// 两族 A/B 的唯一入口,定谳后固化其一,不留双路径。
+    pub verify_v2: bool,
+    /// verify 臂改走 **XQA**(kNHD fp8 池 + spec-dec q=1+K;feature `xqa`)。
+    /// 2026-10-13 D3:XQA 单算子实测 ctx8192 0.495ms vs v2 2.673ms(5.40×),
+    /// 数值 max|XQA−host| 4.5e-4(v2 4.6e-4)。缺省 false(定谳后再翻)。
+    pub verify_xqa: bool,
     /// FlashInfer prefill 面
     pub gdn_chunked: bool,
     pub gdn_scalar: bool,
@@ -385,6 +395,8 @@ impl Default for DispatchCfg {
             qkv_fuse: true,
             prefill_split: false,
             force_naive_prefill: false,
+            verify_v2: true,
+            verify_xqa: false,
             gdn_chunked: false,
             gdn_scalar: false,
             gdn_fused_decode: true,
@@ -492,6 +504,12 @@ prefix_cache = false
 
 [dispatch]
 kv_fp8 = true
+# XQA verify 臂(2026-10-13 D3 **转正**):恒等门 3/3 稳定绿(spec ≡ 无 spec
+# 逐 token;fp8 池 + 27B + DFlash2),verify 纯时 65.2→31.2ms、8192 spec
+# decode 27.7→47.0 t/s(+70%,且首次反超同池裸档 36.4)。形状不匹配时层侧
+# 自动回落 v2 臂(graceful)。根因与修法见工单 §2.7(semaphores 走图输入槽,
+# 不用跨账本的 memset 命令)。
+verify_xqa = true
 # GDN prefill 臂(2026-10-11 终版):fork-bf16 全家桶转正 —— g 语义律
 # 修复(kkt/h/o 必须吃 cumsum 而非 raw g;raw g 在深谷 -24 时
 # exp(±24)=e²⁴ 爆炸)。恒等门:四域 vs recurrence 逐位一致;std 矩阵

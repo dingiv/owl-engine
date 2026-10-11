@@ -4,12 +4,15 @@
 //! - [`cublas`]:OwlCublas 封装(handle/工作区/gemm)
 //! - [`marlin`]:FFI + repack(装载域 weight packing)
 //! - [`flashinfer`]:FFI + workspace 常量
+//! - [`xqa`]:XQA 契约 + FFI(Ampere spec-verify;2026-10-13)
 //!
 //! cublas/marlin/flashinfer 随各自 FFI feature 门;gdn 两家族零门。
 
 /// cuBLAS 封装(feature=cublas;cudarc cublas 绑定)
 #[cfg(feature = "cublas")]
 pub mod cublas;
+/// XQA 契约 + FFI(feature=xqa 时链接;契约面零门 —— 层侧 sig 查询要它)
+pub mod xqa;
 /// FlashInfer FFI + workspace 常量(feature=flashinfer)
 #[cfg(feature = "flashinfer")]
 pub mod flashinfer;

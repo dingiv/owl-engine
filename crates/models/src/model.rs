@@ -163,6 +163,7 @@ impl Model {
             ts_buf: ctx.ts_buf.clone(),
             attn_v2: ctx.attn_v2.clone(),
             v2_bt8: ctx.v2_bt8,
+            xqa: ctx.xqa.clone(),
         }
     }
 
