@@ -982,3 +982,245 @@ extern "C" __global__ void owl_naive_attn_nc_fp8kv_bf16_knhd(
     }
     out[((long long)t * q_heads + h) * d_dim + d] = __float2bfloat16_rn(acc / s_l);
 }
+
+// ============================================================================
+// NC 注意力 **v2 核**(2026-10-13 ③;只换并行结构,**语义与上面 `owl_naive_attn_nc_*`
+// 逐字同一套**:非因果自块 + 前缀滑窗 2048 + 经典池布局 + kv_len_p 设备读)。
+//
+// 为什么:旧核每 KV 行一次 128 宽 block 归约(7 步树 + 共 11 次 __syncthreads)。
+// 拆分实测(prefix 2048/窗口 2048,测试文件里的诊断核 diag_*):
+//   纯同步链+softmax = **1.295ms** / +K 读 0.48 / +V 读 0.36 / 合计 2.237ms
+//   ⇒ **同步链占 58%**,是唯一值得砍的大项(设计稿 D2 判断正确;V 的 sector
+//   放大只值 0.36ms —— L2 把它兜住了,原估的"16× 放大"不成立)。
+//
+// 结构(lane→连续 dim + warp butterfly + split-K + 收尾一次归并):
+//   ① 每 lane 持 DPL = d_dim/32 个**连续** dim(sr 与 q 同布局);
+//   ② 逐行:lane 内点积 → **warp butterfly(__shfl_xor_sync × 5)** ⇒ 每个 lane
+//      都拿到完整点积 ⇒ online softmax 的 m/l/resc 在 lane 间**逐位一致**
+//      (无需共享、无需同步);
+//   ③ 行的遍历区间按 warp 切成 split-K(floating 均分),各 warp 独立
+//      online softmax;
+//   ④ **每 block 只归并一次**(flash-decoding 式:smem 存各 warp 的 m/l/acc,
+//      1 次 __syncthreads,再按本 lane 的 dim 合并 + 归一)。
+//   ⇒ 内层循环零同步;全局同步从"每行 11 次"降到"每 block 1 次"。
+//
+// ⚠️ 数值序变化(点积改 butterfly、softmax 改 split-K 归并)⇒ 必须过
+//   `dflash2_nc_probe` 的 host 参考门(1e-2)与引擎恒等门/AL 红线。
+//
+// ⚠️ 约束:d_dim 必须 32 整除且 DPL ∈ {1..8};x 取 dtype 的向量宽(bf16/f16 → 8)。
+//   池 K 的 4/8 连续 dim 落在同一个 x 组内(对齐前提见工单 §P1)。
+// ============================================================================
+
+#define OWL_NC_DPL_MAX 8
+
+/// 4 个连续元素 → float[4](8B 合曲读;bf16 = 2×bfloat162 / f16 = 2×half2)
+template <typename T>
+struct NcVec4;
+template <>
+struct NcVec4<__nv_bfloat16> {
+    static __device__ __forceinline__ void load(const __nv_bfloat16* p, float* o) {
+        uint2 v = *reinterpret_cast<const uint2*>(p);
+        const __nv_bfloat162 a = *reinterpret_cast<const __nv_bfloat162*>(&v.x);
+        const __nv_bfloat162 b = *reinterpret_cast<const __nv_bfloat162*>(&v.y);
+        o[0] = __bfloat162float(a.x);
+        o[1] = __bfloat162float(a.y);
+        o[2] = __bfloat162float(b.x);
+        o[3] = __bfloat162float(b.y);
+    }
+};
+template <>
+struct NcVec4<__half> {
+    static __device__ __forceinline__ void load(const __half* p, float* o) {
+        uint2 v = *reinterpret_cast<const uint2*>(p);
+        const __half2 a = *reinterpret_cast<const __half2*>(&v.x);
+        const __half2 b = *reinterpret_cast<const __half2*>(&v.y);
+        o[0] = __low2float(a);
+        o[1] = __high2float(a);
+        o[2] = __low2float(b);
+        o[3] = __high2float(b);
+    }
+};
+
+template <typename T>
+struct NcConv;
+template <>
+struct NcConv<__nv_bfloat16> {
+    static __device__ __forceinline__ float tof(__nv_bfloat16 v) { return __bfloat162float(v); }
+    static __device__ __forceinline__ __nv_bfloat16 fromf(float v) { return __float2bfloat16(v); }
+};
+template <>
+struct NcConv<__half> {
+    static __device__ __forceinline__ float tof(__half v) { return __half2float(v); }
+    static __device__ __forceinline__ __half fromf(float v) { return __float2half(v); }
+};
+
+template <typename T, int DPL>
+__device__ __forceinline__ void nc_attn_loop(
+    const T* __restrict__ q,
+    const T* __restrict__ k_self,
+    const T* __restrict__ v_self,
+    const T* __restrict__ kc,
+    const T* __restrict__ vc,
+    const float* __restrict__ kv_len_p,
+    int q_heads, int kv_heads, int d_dim,
+    int page, int x,
+    T* __restrict__ out) {
+    const int t = blockIdx.x;
+    const int h = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int nwarp = blockDim.x >> 5;
+    // DPL>0 = 编译期定死(可矢量读);DPL==0 = 运行时 dpl(标量兜底)
+    const int dpl = (DPL > 0) ? DPL : (d_dim >> 5);
+    const int d0 = lane * dpl;
+    const int kvh = h / (q_heads / kv_heads);
+    const int hd_x = d_dim / x;
+    const int kv_len = (int)kv_len_p[0];
+    const int prefix_len = kv_len - gridDim.x;
+    const float scale = rsqrtf((float)d_dim);
+
+    const T* qs = q + ((long long)t * q_heads + h) * d_dim;
+    float qd[OWL_NC_DPL_MAX];
+#pragma unroll
+    for (int j = 0; j < OWL_NC_DPL_MAX; ++j) {
+        qd[j] = (j < dpl) ? NcConv<T>::tof(qs[d0 + j]) : 0.0f;
+    }
+
+    // D2 滑窗:前缀只取最近 OWL_NC_SLIDING_WINDOW 行(自块恒全可见)
+    const int srow_begin =
+        (prefix_len > OWL_NC_SLIDING_WINDOW) ? (prefix_len - OWL_NC_SLIDING_WINDOW) : 0;
+    // 本 warp 的行切片(连续均分;余数归前几片)
+    const int nrow = kv_len - srow_begin;
+    const int per = (nrow + nwarp - 1) / nwarp;
+    const int lo = srow_begin + warp * per;
+    const int hi = (lo + per < kv_len) ? (lo + per) : kv_len;
+
+    float m = -3.0e38f;
+    float l = 0.0f;
+    float acc[OWL_NC_DPL_MAX];
+#pragma unroll
+    for (int j = 0; j < OWL_NC_DPL_MAX; ++j) acc[j] = 0.0f;
+
+    for (int srow = lo; srow < hi; ++srow) {
+        const bool pre = (srow < prefix_len);
+        const int b = pre ? (srow / page) : 0;
+        const int off = pre ? (srow % page) : 0;
+        float dot = 0.0f;
+        if (DPL == 4 && (x % 4) == 0) {
+            // 合曲路径:4 个连续 dim 落在同一 x 组(池)/ 本身就连续(自块)
+            float kvf[4];
+            if (pre) {
+                const long long base = ((long long)b * kv_heads + kvh) * hd_x * page * x
+                                       + (long long)off * x
+                                       + (long long)(d0 / x) * page * x + (d0 % x);
+                NcVec4<T>::load(kc + base, kvf);
+            } else {
+                const int st = srow - prefix_len;
+                NcVec4<T>::load(k_self + ((long long)st * kv_heads + kvh) * d_dim + d0, kvf);
+            }
+#pragma unroll
+            for (int j = 0; j < 4; ++j) dot += qd[j] * kvf[j];
+        } else if (pre) {
+            const long long base = ((long long)b * kv_heads + kvh) * hd_x * page * x
+                                   + (long long)off * x;
+#pragma unroll
+            for (int j = 0; j < OWL_NC_DPL_MAX; ++j) {
+                if (j < dpl) {
+                    const int dim = d0 + j;
+                    dot += qd[j]
+                           * NcConv<T>::tof(kc[base + (long long)(dim / x) * page * x
+                                               + (dim % x)]);
+                }
+            }
+        } else {
+            const int st = srow - prefix_len;
+            const T* ks = k_self + ((long long)st * kv_heads + kvh) * d_dim;
+#pragma unroll
+            for (int j = 0; j < OWL_NC_DPL_MAX; ++j) {
+                if (j < dpl) dot += qd[j] * NcConv<T>::tof(ks[d0 + j]);
+            }
+        }
+        // warp butterfly:5 步后**每个 lane 都持完整点积**(故 softmax 态逐位一致)
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            dot += __shfl_xor_sync(0xffffffffu, dot, o);
+        }
+        const float dot_s = dot * scale;
+        const float m_new = fmaxf(m, dot_s);
+        const float resc = __expf(m - m_new);
+        const float p = __expf(dot_s - m_new);
+        l = l * resc + p;
+        m = m_new;
+        if (pre) {
+            const long long base = ((long long)b * kv_heads + kvh) * (long long)d_dim * page;
+#pragma unroll
+            for (int j = 0; j < OWL_NC_DPL_MAX; ++j) {
+                if (j < dpl) {
+                    acc[j] = acc[j] * resc
+                             + p * NcConv<T>::tof(vc[base + (long long)(d0 + j) * page + off]);
+                }
+            }
+        } else {
+            const int st = srow - prefix_len;
+            const T* vs = v_self + ((long long)st * kv_heads + kvh) * d_dim;
+#pragma unroll
+            for (int j = 0; j < OWL_NC_DPL_MAX; ++j) {
+                if (j < dpl) acc[j] = acc[j] * resc + p * NcConv<T>::tof(vs[d0 + j]);
+            }
+        }
+    }
+
+    // ---- 收尾:每 block 一次跨 warp 归并(flash-decoding 式;1 次 __syncthreads)----
+    __shared__ float s_acc[8][256];
+    __shared__ float s_m[8];
+    __shared__ float s_l[8];
+    if (lane == 0) {
+        s_m[warp] = m;
+        s_l[warp] = l;
+    }
+#pragma unroll
+    for (int j = 0; j < OWL_NC_DPL_MAX; ++j) {
+        if (j < dpl) s_acc[warp][d0 + j] = acc[j];
+    }
+    __syncthreads();
+    float mg = -3.0e38f;
+    for (int w = 0; w < nwarp; ++w) mg = fmaxf(mg, s_m[w]);
+    float lg = 0.0f;
+    float ag[OWL_NC_DPL_MAX];
+#pragma unroll
+    for (int j = 0; j < OWL_NC_DPL_MAX; ++j) ag[j] = 0.0f;
+    for (int w = 0; w < nwarp; ++w) {
+        const float e = __expf(s_m[w] - mg);
+        lg += s_l[w] * e;
+#pragma unroll
+        for (int j = 0; j < OWL_NC_DPL_MAX; ++j) {
+            if (j < dpl) ag[j] += s_acc[w][d0 + j] * e;
+        }
+    }
+    T* o = out + ((long long)t * q_heads + h) * d_dim;
+#pragma unroll
+    for (int j = 0; j < OWL_NC_DPL_MAX; ++j) {
+        if (j < dpl) o[d0 + j] = NcConv<T>::fromf(ag[j] / lg);
+    }
+}
+
+extern "C" __global__ void owl_naive_attn_nc_bf16_v2(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_self,
+    const __nv_bfloat16* __restrict__ v_self, const __nv_bfloat16* __restrict__ kc,
+    const __nv_bfloat16* __restrict__ vc, const float* __restrict__ kv_len_p,
+    int q_heads, int kv_heads, int d_dim, int page, int x,
+    __nv_bfloat16* __restrict__ out) {
+    const int dpl = d_dim >> 5;
+    if (dpl == 4) {
+        nc_attn_loop<__nv_bfloat16, 4>(q, k_self, v_self, kc, vc, kv_len_p, q_heads, kv_heads,
+                                       d_dim, page, x, out);
+    } else if (dpl == 8) {
+        nc_attn_loop<__nv_bfloat16, 8>(q, k_self, v_self, kc, vc, kv_len_p, q_heads, kv_heads,
+                                       d_dim, page, x, out);
+    } else {
+        nc_attn_loop<__nv_bfloat16, 0>(q, k_self, v_self, kc, vc, kv_len_p, q_heads, kv_heads,
+                                       d_dim, page, x, out);
+    }
+}
+

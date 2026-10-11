@@ -620,13 +620,19 @@ impl<D: DeviceClient + 'static> Engine<D> {
                         InputSlot::f32("bt8", depth1 * bt_leaf_nb),
                         // XQA 面(2026-10-13 D3):seq_lens 逐轮变(u32 位型走私);
                         // 页表/掩码是常量,在槽 init 里填一次(捕获前 Htod 合法)
+                        // ⚠️ **零长槽地雷**:`xqa_sem_n` 在"无 XQA 面"时为 0,
+                        // 无条件声明就是零长槽 ⇒ 每轮 step 写 0 字节 ⇒ 后端
+                        // `malloc_host(0)` 空指针崩(2026-10-13 挂账 #7 定谳:
+                        // 0.8B spec 档踩的就是它 —— 之前只跑 fp8 门所以未暴露)。
+                        // 取 `.max(1)`:拓扑恒常(不做条件声明),多写 4 字节无害。
                         InputSlot::f32("xqa_seq", 1).init(vec![0.0]),
                         InputSlot::f32("xqa_pt", xqa_pt_nb).init(xqa_pt_init.clone()),
                         InputSlot::f32("xqa_mask", depth1).init(xqa_mask_init.clone()),
                         // semaphores 走**图输入槽**(每轮 step 写零):
                         // ⚠️ 曾用 `memset_zero` 命令 → 跨账本解析踩雷(见工单
                         // §2.7 定谳);输入槽与 xqa_seq 同一条已验证通路
-                        InputSlot::f32("xqa_sem", xqa_sem_n).init(vec![0.0; xqa_sem_n]),
+                        InputSlot::f32("xqa_sem", xqa_sem_n.max(1))
+                            .init(vec![0.0; xqa_sem_n.max(1)]),
                     ],
                     outputs: vouts,
                     capture: !self.cfg.knobs.no_graph,

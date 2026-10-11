@@ -354,6 +354,13 @@ impl<D: DeviceClient> GraphPlan<D> {
                 .iter()
                 .find(|s| s.name == *name)
                 .ok_or_else(|| ModelError::Msg(format!("step: 未声明输入槽 {name}")))?;
+            // 0 长槽 = 上游形状 bug(声明期就应拦住);放行会在后端炸
+            // `malloc_host(0)` 空指针(2026-10-13 挂账 #7 的源头,守卫在这里)
+            if slot.len == 0 {
+                return Err(ModelError::Msg(format!(
+                    "step: 槽 {name} 声明为 0 元素(零长块写 ⇒ 后端锁页分配空指针;上游形状 bug)"
+                )));
+            }
             if data.len() != slot.len {
                 return Err(ModelError::Msg(format!(
                     "step: 槽 {name} 装填 {} 元素 ≠ 容量 {}",

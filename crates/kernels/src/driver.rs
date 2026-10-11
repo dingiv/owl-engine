@@ -1047,8 +1047,12 @@ pub mod attn {
         let t = shapes.first().and_then(|s| s.first().copied()).unwrap_or(1) as u32;
         let hq = scalars.first().copied().unwrap_or(1) as u32;
         let hd = scalars.get(2).copied().unwrap_or(128) as u32;
+        // v2 臂(2026-10-13 ③):dpl = hd/32 ∈ {4,8} 时走重写核(1.86×);其余旧核。
+        // fp8kv 面 v2 未做 ⇒ 一律旧核。
+        let v2 = !fp8kv && matches!(dt, DType::BF16) && matches!(hd, 128 | 256);
         let name = match (dt, fp8kv) {
             (DType::F16, false) => "owl_naive_attn_nc_f16",
+            (DType::BF16, false) if v2 => "owl_naive_attn_nc_bf16_v2",
             (DType::BF16, false) => "owl_naive_attn_nc_bf16",
             (DType::F16, true) => "owl_naive_attn_nc_fp8kv_f16",
             (DType::BF16, true) => "owl_naive_attn_nc_fp8kv_bf16",

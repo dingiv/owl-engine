@@ -100,8 +100,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // 账本 → 传别家的块 id = 打到别的块上 → `pump: DeadBlock` 实测踩过)
             // XQA seq_lens = **整请求总 KV 长**(含块内 depth+1 个位置;u32 位型走私)
             let xqa_seq_v = [f32::from_bits((pos + block.len()) as u32)];
-            // semaphores 每轮写零(图输入槽;KV-split 归约计数)
-            let xqa_sem_v: Vec<f32> = vec![0.0; self.pool.xqa_sem_n()];
+            // semaphores 每轮写零(图输入槽;KV-split 归约计数)。
+            // `.max(1)` 与声明端同式 —— "无 XQA 面"时槽仍存在(= 1 元素),
+            // 避免零长写(挂账 #7)。
+            let xqa_sem_v: Vec<f32> = vec![0.0; self.pool.xqa_sem_n().max(1)];
             let t_step_v = std::time::Instant::now();
             vg.step(&[
                 ("ids", ids_f.as_slice()),

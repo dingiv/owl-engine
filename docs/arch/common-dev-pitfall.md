@@ -453,3 +453,35 @@
   (`owl_shared::vram::FREE`,`cuMemGetInfo` 落账后覆盖),**不是实时查询** ——
   同一配置两次 boot 可差 17GB(实测 A=23.32G / B=5.56G 而真实分配逐位相同)。
   **别用这一行做 A/B 的内存差异判据**,要看 `live=`/`fixed_after=`/`per_tok=`。
+
+## 30. 测速工具:`usage` 拒用陷阱 —— 启发式估算**覆盖**了正确的真账(2026-10-13,② 验收)
+
+- **症状**:`llm_speedtest` 报 `out 1 / 8 / 110`(期望 256)+ `⚠token统计异常`,看着像
+  "引擎早停"。但那些行的**墙钟时间与正常行完全一样**(6247ms vs 6209ms),ITL 也是
+  正常量级(68.8ms)⇒ 生成显然跑满了。
+- **定谳**(`-v` 透传内核日志,同一次运行两行对照):
+  ```
+  行1(异常): API usage completion_tokens=256 ✅ / 工具累计内容=117 字符 / 本地估算=8  → 报 8
+  行2(正常): API usage completion_tokens=256 ✅ / 工具累计内容=942 字符 / 本地估算≈256 → 报 256
+  [TokenWarning] Decode API stats look abnormal; api=256, local=8, diff=3100.0%. Using local estimate.
+  ```
+  **服务端没错**(curl 原始 SSE:10/10 次 `completion_tokens == max_tokens`、
+  `finish_reason=length`、`ignore_eos` 生效)。错的是工具的 sanity 检查——
+  它拿一个**字符/词启发式估算器**去"校验"引擎的 usage,不一致时**用估算覆盖真账**,
+  与工作区自己的口径律(`token 计数必须用 usage.completion_tokens`)直接冲突。
+- **触发条件**:随机词池域让模型整段**退化成复读/空白** ⇒ 字符/token 骤降
+  (256 token 只产出 117 字符)⇒ 启发式(忽略空白、按字/词计数)严重低估 ⇒ 触发
+  偏差判据。**这不是引擎行为,是"域退化"在输出侧的表现**,此前只记录了域退化对 AL
+  的影响(§2.3/§B4),没记它对**输出文本**的影响。
+- **修**:`resolve_token_count_with_sanity_check` 增加 `hard_upper`(单响应物理上界
+  = 请求的 `max_tokens`),判据从"统计"改"结构":
+  - `api <= hard_upper` ⇒ **以 usage 为准**(不符只告警,不改值);
+  - `api > hard_upper` ⇒ 物理不可能(累计总量型服务端,llama.cpp 并发)⇒ 才回落本地估算。
+  另外把两处告警分开计数/显示(`token记账异常` vs `输出与估算不符(以usage为准)`),
+  并把 prompt/out 的"来源"标签改成**逐字段**(此前 decode 一告警,连 prompt 列也显示
+  "本地估算",误导判读)。
+- **律**:
+  1. **真账(服务端 usage)永远优先于本地启发式**;启发式只能在真账"结构性不可能"时兜底;
+  2. 看到 `out`/`decode 速度` 反常,先核**墙钟时间与 ITL**——时间正常 = 生成正常,
+     问题在记账,不在引擎;
+  3. 测速口径的三件套一起看:`usage` 真账 + 累计内容长度 + 墙钟时间,任一不符即先怀疑工具。
