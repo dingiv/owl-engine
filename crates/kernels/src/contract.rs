@@ -117,8 +117,12 @@ pub mod names {
     pub const GEMM_W4A16_BF16: &str = "marlin_gemm_w4a16_bf16";
     /// FlashInfer paged prefill(f16 KV)
     pub const PREFILL_FI: &str = "flashinfer_prefill_paged_f16";
-    /// XQA verify/decode 注意力(foreign;feature `xqa`)
+    /// XQA verify 注意力(foreign;feature `xqa`;SPEC_DEC=1 `M_TILESIZE=32`)
     pub const VERIFY_XQA: &str = "owl_xqa_verify";
+    /// XQA 裸 decode 注意力(foreign;feature `xqa`;SPEC_DEC=1 `M_TILESIZE=16` ——
+    /// q=1 只需 6 行 head-token,窄 tile 减半 MMA 浪费;见
+    /// roadmap.local/后续两刀-裸decode接XQA与草稿向量化-设计.md §D1)
+    pub const DECODE_XQA: &str = "owl_xqa_decode";
     /// FlashInfer paged prefill(fp8 e4m3 KV)
     pub const PREFILL_FI_FP8KV: &str = "flashinfer_prefill_paged_fp8kv";
 }

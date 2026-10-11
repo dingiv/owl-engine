@@ -231,6 +231,7 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "attn.fi_prefill" => attn::fi_prefill(false),
         "attn.fi_prefill_fp8kv" => attn::fi_prefill(true),
         "attn.xqa_verify" => attn::xqa_verify(),
+        "attn.xqa_decode" => attn::xqa_decode(),
         "elems.cast_f16_f32" => elems::cast_f16_f32(dt),
         "ops.concat" => elems::concat(dt),
         "ops.rope" => elems::rope(dt, ax(0)),
@@ -1059,9 +1060,14 @@ pub mod attn {
         }
     }
 
-    /// XQA verify/decode(foreign 家族臂;host 函数发射,workspace 在 runtime)
+    /// XQA verify 注意力(foreign 家族臂;host 函数发射,workspace 在 runtime)
     pub fn xqa_verify() -> KernelPick {
         KernelPick { name: crate::contract::names::VERIFY_XQA, shape: FOREIGN }
+    }
+
+    /// XQA 裸 decode 注意力(q=1;foreign 家族臂;第二份实例化 `M_TILESIZE=16`)
+    pub fn xqa_decode() -> KernelPick {
+        KernelPick { name: crate::contract::names::DECODE_XQA, shape: FOREIGN }
     }
 
     /// FlashInfer paged prefill(foreign 家族臂;plan 缓存 + run 在家族 runtime)

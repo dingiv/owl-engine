@@ -251,8 +251,7 @@ impl<D: DeviceClient> GraphPlan<D> {
 
     /// 每步执行:装填输入(write_block 原位)→ 回放或 eager 直发。
     /// 未提到的输入槽保持上步内容(典型:常量槽)。
-    pub async fn step(&mut self, inputs: &[(&str, &[f32])]) -> Result<()> {
-        self.fill_slots(inputs).await?;
+    pub async fn step(&mut self, inputs: &[(&str, &[f32])]) -> Result<()> {        self.fill_slots(inputs).await?;
         // 诊断:槽回读(desc.debug_probe;取证每步标量是否真落烘焙槽 ——
         // 复读病理立案的仪表盘)
         if self.debug_probe {
@@ -336,6 +335,16 @@ impl<D: DeviceClient> GraphPlan<D> {
     // ------------------------------------------------------------------
 
     /// 槽装填:write_block 原位(指针稳定 —— 回放根基)
+    /// 本图是否声明了某输入槽(可选槽的调用方决策面;缺失时 `step` 会报错)
+    pub fn has_input(&self, name: &str) -> bool {
+        self.inputs.iter().any(|s| s.name == name)
+    }
+
+    /// 某输入槽的元素数(None = 未声明)
+    pub fn input_len(&self, name: &str) -> Option<usize> {
+        self.inputs.iter().find(|s| s.name == name).map(|s| s.len)
+    }
+
     async fn fill_slots(&mut self, fills: &[(&str, &[f32])]) -> Result<()> {
         // S1:批量装填 —— 一次设备往返(校验全过才发;错误归因仍逐槽)
         let mut writes: Vec<(&Bytes, usize, &[f32])> = Vec::with_capacity(fills.len());

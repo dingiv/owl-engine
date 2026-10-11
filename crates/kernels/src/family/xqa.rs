@@ -31,6 +31,9 @@ use std::ffi::c_void;
 /// foreign-kernel 虚拟核名(server 分派臂;字面量住址 = contract::names)
 pub const VERIFY_XQA: &str = crate::contract::names::VERIFY_XQA;
 
+/// 第二份实例化的虚拟核名(裸 decode q=1;见 cu/xqa/README.md 双实例化节)
+pub const DECODE_XQA: &str = crate::contract::names::DECODE_XQA;
+
 /// 槽序契约(LaunchMsg.args;6 Block + 10 sz):
 /// `[T q, T k_cache, T v_cache, T page_table(i32), T seq_lens(u32),
 ///   T mask(u32), T semaphores(u32), T scratch, T wr, O out, sz q_seq_len, sz hkv,
@@ -49,6 +52,12 @@ pub const VERIFY_XQA_SLOTS: &str =
 pub const VERIFY_XQA_SIG: &str =
     "T,T,T,T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz,sz,sz,sz,sz";
 
+/// **decode 臂线槽序**:与 verify **逐字同型**(两份实例化签名一致,q=1 时
+/// mask 仍走 SPEC_DEC 掩码路径 —— 只需 bit0=1)。分列常量只为"臂/名成对律"
+/// 与将来若真分叉时留单点改口。
+pub const DECODE_XQA_SIG: &str =
+    "T,T,T,T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz,sz,sz,sz,sz";
+
 /// XQA 工作区(参考实现给 256MiB;持久复用)
 pub const XQA_SCRATCH_BYTES: usize = 256 * 1024 * 1024;
 
@@ -56,6 +65,33 @@ extern "C" {
     /// 发射(见 cu/xqa/owl_xqa_launch.cu 契约;返回 0 = 成功,非零 = 参数拒绝)
     #[allow(clippy::too_many_arguments)]
     pub fn owl_xqa_launch(
+        sm_count: u32,
+        nb_k_heads: u32,
+        sliding_win_size: u32,
+        q_scale: f32,
+        output: *mut c_void,
+        q: *const c_void,
+        k_cache: *mut c_void,
+        v_cache: *mut c_void,
+        page_table: *const i32,
+        max_seq_len: u32,
+        seq_lens: *const u32,
+        batch_size: u32,
+        kv_scale: f32,
+        q_seq_len: u32,
+        mask: *const u32,
+        semaphores: *mut u32,
+        scratch: *mut c_void,
+        kv_stride_page: u64,
+        kv_stride_token: u64,
+        kv_stride_head: u64,
+        stream: *mut c_void,
+    ) -> i32;
+
+    /// 第二份实例化(`-Dowl_xqa_launch=owl_xqa_launch_decode` 由 build.rs 改名;
+    /// 签名与 verify 逐字一致,差别只在编译期 `M_TILESIZE=16`)
+    #[allow(clippy::too_many_arguments)]
+    pub fn owl_xqa_launch_decode(
         sm_count: u32,
         nb_k_heads: u32,
         sliding_win_size: u32,

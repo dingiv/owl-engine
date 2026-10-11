@@ -374,7 +374,8 @@ impl<D: DeviceClient + 'static> Engine<D> {
             },
             spec_mode,
             spec_depth,
-            verify_xqa: self.cfg.knobs.env.attn.verify_xqa,
+            xqa_verify: self.cfg.knobs.env.attn.verify_xqa,
+            xqa_decode: self.cfg.knobs.env.attn.decode_xqa,
             gdn_slots: self.cfg.knobs.gdn_slots,
             snap_max: self.cfg.knobs.snap_max,
             vram_target: self.cfg.knobs.vram_target,
@@ -418,6 +419,13 @@ impl<D: DeviceClient + 'static> Engine<D> {
         let gdn_caches = pool.gdn_caches();
         let bt_leaf = pool.bt_leaf();
         let attn_v2 = pool.attn_v2_scratch();
+        // XQA 裸 decode 面(2026-10-13 ②):池常量件 + 两个图输入槽
+        // (`xqa_seq` = kv_len 的 **u32 位型** —— 核按 `const uint32_t*` 读,
+        //  直接写 f32 数值会拿到浮点位型;`xqa_sem` = 每轮写零)。
+        // 槽只在 `decode_xqa` 开时才加 ⇒ 关时图拓扑与历史一致(零影响)。
+        let xqa_decode_on = self.cfg.knobs.env.attn.decode_xqa;
+        let xqa_decode_ctx = if xqa_decode_on { pool.xqa_ctx() } else { None };
+        let xqa_dec_sem_n = if xqa_decode_on { pool.xqa_sem_n() } else { 0 };
         // B4:decode 图 taps(DFlash2 降级期逐 token 草稿同步的取数面;
         // OWL_DFLASH_NOTAPS 同款逃生开关)。tapped_hidden 零额外计算,
         // 仅多 5 个 [1,hidden] 输出槽写;非 dflash 走原 forward(拓扑不变)
@@ -454,6 +462,22 @@ impl<D: DeviceClient + 'static> Engine<D> {
             ctx.env = env; // 捕获期烘焙(图闭包 env 定格;回放沿用)
             ctx.ts_buf = ts_buf; // 刀D 时间戳探针(None = 关)
             ctx.attn_v2 = attn_v2.clone(); // v2 分页 decode scratch(None = v1)
+            // XQA 裸 decode 臂(2026-10-13 ②):面 = pool 常量件 + 图输入 seq/sem
+            // (sem 走输入槽的正解见工单 §2.7 —— 禁跨账本 memset 命令)
+            if let Some(x) = xqa_decode_ctx.as_ref() {
+                let seq_in = sc.input("xqa_seq")?;
+                let sem_in = sc.input("xqa_sem")?;
+                ctx.xqa = Some(owl_models::module::XqaVerifyCtx {
+                    page_table: x.page_table.clone(),
+                    seq_lens: seq_in,
+                    mask: x.mask.clone(),
+                    semaphores: sem_in,
+                    scratch: x.scratch.clone(),
+                    q_seq_len: 1,
+                    max_seq_len: x.max_seq_len,
+                    sm_count: x.sm_count,
+                });
+            }
             // B4:降级期取数面 —— tapped_hidden 拿末层 hidden + 5 层 taps
             // (零额外前向;l m_head 与 forward 同式)。非 dflash 原路(位等价)
             let tree = if decode_taps {
@@ -482,6 +506,10 @@ impl<D: DeviceClient + 'static> Engine<D> {
                         InputSlot::f32("kv_slot", 1),
                         InputSlot::f32("gdn_slot", 1).init(vec![0.0]),
                     ];
+                    if xqa_dec_sem_n > 0 {
+                        v.push(InputSlot::f32("xqa_seq", 1).init(vec![0.0]));
+                        v.push(InputSlot::f32("xqa_sem", xqa_dec_sem_n).init(vec![0.0; xqa_dec_sem_n]));
+                    }
                     if self.cfg.knobs.ts_probe {
                         v.push(InputSlot::f32("ts_buf", 4096));
                     }
@@ -538,7 +566,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
             let verify_attn_v2 = pool.verify_attn_v2_scratch();
             // XQA 面(2026-10-13 D3):池常量件 + 图槽 init(i32/u32 位型走私进
             // f32 账叶 —— 与 sm_scale/fi_scale_bits 同款约定)
-            let xqa_pool_ctx = pool.xqa_verify_ctx();
+            let xqa_pool_ctx = pool.xqa_ctx();
             let xqa_pt_nb = bt_leaf_nb;
             let xqa_pt_init: Vec<f32> = (0..xqa_pt_nb)
                 .map(|i| f32::from_bits(i as u32))

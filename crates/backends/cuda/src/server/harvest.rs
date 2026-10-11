@@ -48,7 +48,7 @@ impl GpuServer {
         let mut buf: Box<dyn owl_iface::contract::PinnedRegion + Send> =
             match self.pool.take(n) {
                 Some(b) => b,
-                None => Box::new(Staging::alloc(n)?),
+                None => Box::new(Staging::alloc(n, "try_htod")?),
             };
         buf.slice_bytes_mut()[..n].copy_from_slice(data);
         let (dptr, _) = self.ctx().block_ptr(id, stream)?;
@@ -83,7 +83,7 @@ impl GpuServer {
         // miss 才 cudaHostAlloc（页锁定；大块 ~300ms —— 装载期主要成本之一）
         owl_shared::counter_inc!("srv.pinned_miss");
         owl_shared::counter_add!("srv.pinned_miss_bytes", bytes as u64);
-        match owl_shared::timer_scope!("srv.pinned_alloc", Staging::alloc(bytes)) {
+        match owl_shared::timer_scope!("srv.pinned_alloc", Staging::alloc(bytes, "alloc_pinned")) {
             Ok(s) => ack.send(Ok(Box::new(s))),
             Err(e) => ack.send(Err(e)),
         }
@@ -175,7 +175,7 @@ impl GpuServer {
             let mut staging: Box<dyn owl_iface::contract::PinnedRegion + Send> =
                 match self.pool.take(data.len()) {
                     Some(b) => b,
-                    None => match Staging::alloc(data.len()) {
+                    None => match Staging::alloc(data.len(), "htod_chunks") {
                         Ok(s) => Box::new(s),
                         Err(e) => {
                             for b in pending {
@@ -240,7 +240,7 @@ impl GpuServer {
         let mut staging: Box<dyn owl_iface::contract::PinnedRegion + Send> =
             match self.pool.take(data.len()) {
                 Some(b) => b,
-                None => match Staging::alloc(data.len()) {
+                None => match Staging::alloc(data.len(), "htod_chunk") {
                     Ok(s) => Box::new(s),
                     Err(e) => return ack.take().unwrap().send(Err(e)),
                 },
@@ -350,7 +350,7 @@ impl GpuServer {
         let mut staging: Box<dyn owl_iface::contract::PinnedRegion + Send> =
             match self.pool.take(n) {
                 Some(b) => b,
-                None => Box::new(Staging::alloc(n)?),
+                None => Box::new(Staging::alloc(n, "dtoh")?),
             };
         // 拷贝长度钉死 n(池码头容量 ≥ n,整段拷会越读设备块)
         unsafe {

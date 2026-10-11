@@ -1279,28 +1279,15 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
             if owl_shared::env_reader::flag("OWL_GATE_FP8") {
                 knobs.env.kv.quant = owl_models::env::KvQuant::Fp8E4M3;
             }
-            // XQA verify 臂开关(2026-10-13 D3;恒等门用 —— spec ≡ 无 spec
-            // 是 XQA 进生产的唯一红线)
+            // XQA 臂开关(2026-10-13;恒等门用 —— spec ≡ 无 spec / 裸 decode
+            // 臂不破文本,是 XQA 进生产的唯一红线)
             if owl_shared::env_reader::flag("OWL_GATE_XQA") {
                 knobs.env.attn.verify_xqa = true;
             }
-            if let Some(p) = owl_shared::env_reader::parse::<usize>("OWL_GATE_POOL") {
-                knobs.pool_tokens = Some(p);
-            }
-            let head_plan = if owl_shared::env_reader::flag("OWL_GATE_INT4HEAD") {
-                owl_models::module::QuantPlan::W4A16Awq
-            } else {
-                owl_models::module::QuantPlan::F16
-            };
-            knobs.draft.dflash2_dir = Some(ddir.to_string());
-            // E19 定位开关(2026-10-13):knhd×fp8 池×int4 头×spec 语义回归复现(缺省关)
-            if owl_shared::env_reader::flag("OWL_GATE_FP8") {
-                knobs.env.kv.quant = owl_models::env::KvQuant::Fp8E4M3;
-            }
-            // XQA verify 臂开关(2026-10-13 D3;恒等门用 —— spec ≡ 无 spec
-            // 是 XQA 进生产的唯一红线)
-            if owl_shared::env_reader::flag("OWL_GATE_XQA") {
-                knobs.env.attn.verify_xqa = true;
+            // 裸 decode XQA 臂(2026-10-13 ②):baseline 轮(spec_depth=0)
+            // 就走它 ⇒ 本门同时是"decode 臂不破文本"的红线
+            if owl_shared::env_reader::flag("OWL_GATE_DECODE_XQA") {
+                knobs.env.attn.decode_xqa = true;
             }
             if let Some(p) = owl_shared::env_reader::parse::<usize>("OWL_GATE_POOL") {
                 knobs.pool_tokens = Some(p);

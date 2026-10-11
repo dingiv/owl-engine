@@ -162,6 +162,8 @@ pub enum SemanticKernel {
     FiPrefillFp8kv,
     /// XQA verify/decode 注意力(kNHD fp8 池;foreign-kernel)
     XqaVerify,
+    /// XQA 裸 decode 注意力(q=1;第二份实例化 `M_TILESIZE=16`;foreign-kernel)
+    XqaDecode,
 }
 
 impl SemanticKernel {
@@ -240,6 +242,7 @@ impl SemanticKernel {
             SemanticKernel::FiPrefill => "attn.fi_prefill",
             SemanticKernel::FiPrefillFp8kv => "attn.fi_prefill_fp8kv",
             SemanticKernel::XqaVerify => "attn.xqa_verify",
+            SemanticKernel::XqaDecode => "attn.xqa_decode",
         })
     }
 }
@@ -614,6 +617,7 @@ pub(crate) fn foreign_sig(name: &str) -> Option<&'static str> {
         x if x == n::PREFILL_FI => Some(owl_kernels::client::fi_sig::SIG),
         x if x == n::PREFILL_FI_FP8KV => Some(owl_kernels::client::fi_sig::SIG),
         x if x == n::VERIFY_XQA => Some(owl_kernels::family::xqa::VERIFY_XQA_SIG),
+        x if x == n::DECODE_XQA => Some(owl_kernels::family::xqa::DECODE_XQA_SIG),
         _ => None,
     }
 }

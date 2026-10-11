@@ -35,5 +35,7 @@ pub fn all_families() -> Vec<Box<dyn KernelSpec>> {
         Box::new(flashinfer::FiRuntime::default()),
         #[cfg(feature = "xqa")]
         Box::new(xqa::XqaRuntime),
+        #[cfg(feature = "xqa")]
+        Box::new(xqa::XqaDecodeRuntime),
     ]
 }

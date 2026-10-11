@@ -99,8 +99,10 @@ pub(crate) struct PoolPlan {
     pub spec_mode: crate::running::SpecMode,
     /// 投机深度(verify 块 = depth+1;verify v2 scratch 定形用;0 = off)
     pub spec_depth: usize,
-    /// verify 臂改走 XQA(feature `xqa`;knobs.env.attn.verify_xqa)
-    pub verify_xqa: bool,
+    /// XQA verify 臂(SPEC_DEC=1 `M_TILESIZE=32`)
+    pub xqa_verify: bool,
+    /// XQA 裸 decode 臂(SPEC_DEC=1 `M_TILESIZE=16`)
+    pub xqa_decode: bool,
     /// GDN 状态格容量
     pub gdn_slots: usize,
     /// spec 快照池深度
@@ -136,7 +138,9 @@ pub(crate) struct StatePool {
     pub(crate) verify_attn_v2: Option<owl_models::module::AttnV2Scratch>,
     /// XQA verify 面(2026-10-13 D3):常量页表/掩码 + semaphores + scratch
     /// (seq_lens 逐轮变 → 由图输入槽供给,不在本结构)
-    pub(crate) xqa_verify: Option<owl_models::module::XqaVerifyCtx>,
+    /// XQA 资源面(verify 与裸 decode **共用**;见 `plan.verify_xqa` /
+    /// `plan.decode_xqa` 门 —— 任一开就分配)
+    pub(crate) xqa: Option<owl_models::module::XqaVerifyCtx>,
     /// spec 快照(E5-M2:投机轮回滚缓冲;OWL_SPEC_DEPTH>0 时分配,
     /// 内容 = 轮首 GDN 态 state@B-1;restore 后仍有效,全接受后失效重拍)
     pub(crate) spec_snap: Option<GdnSnapSlot>,
@@ -338,10 +342,14 @@ impl StatePool {
         } else {
             None
         };
-        // XQA verify 面(2026-10-13 D3;kNHD fp8 池 + grp6 + hd256 + page32)
-        let xqa_verify = if paged
-            && plan.spec_depth > 0
-            && plan.verify_xqa
+        // XQA 资源面(2026-10-13 D3 + ②;kNHD fp8 池 + grp6 + hd256 + page32)
+        // **verify 与裸 decode 共用同一份**:恒定件(页表/掩码/semaphores/
+        // scratch)两图都能用,只有 `seq_lens`/`semaphores` 需按图各挂一个
+        // 输入槽(verify 图 vs decode 图各自的 `xqa_seq`/`xqa_sem`)。
+        // 掩码:q=1 时只读 index 0,而 index 0 = `(1<<1)-1 = 1` —— 恰好是
+        // decode 需要的"bit0 允许自身",**两形状共用同一张量**。
+        let xqa = if paged
+            && (plan.xqa_verify || plan.xqa_decode)
             && matches!(plan.kv, owl_models::env::KvQuant::Fp8E4M3)
             && dims.hd == 256
             && page == 32
@@ -353,8 +361,8 @@ impl StatePool {
             let ptb = face.alloc(Dtype::F32, nb_i).await?;
             face.write_block_f32(&ptb, 0, &pt).await?;
             // 常量掩码:行 i = 块内第 i 个 token,bit k = 允许看第 k 个 key,
-            // 因果 = (1<<(i+1))-1(含自身)
-            let seqs = plan.spec_depth + 1;
+            // 因果 = (1<<(i+1))-1(含自身);q=1 只读 index 0(= 1)
+            let seqs = (plan.spec_depth + 1).max(1);
             let mask: Vec<f32> = (0..seqs)
                 .map(|i| f32::from_bits(((1u32 << (i + 1)) - 1) as u32))
                 .collect();
@@ -438,7 +446,7 @@ impl StatePool {
         } else {
             None
         };
-        Ok(StatePool { gdn_slots, dump_all, kvs, fi_face: plan.fi_quant.is_some(), verify_attn_v2, xqa_verify,
+        Ok(StatePool { gdn_slots, dump_all, kvs, fi_face: plan.fi_quant.is_some(), verify_attn_v2, xqa,
             kv_fp8, dflash_fp8, gdns, snaps, snap_tick: 0, bt, bt_mtp, spec_snap, mtp_kvs, dflash_kvs, attn_v2, page, nb, paged, x, dims })
     }
 
@@ -560,14 +568,14 @@ impl StatePool {
         self.verify_attn_v2.clone()
     }
 
-    /// XQA verify 面(常量件;seq_lens 由图输入槽供给,调用方覆盖)
-    pub(crate) fn xqa_verify_ctx(&self) -> Option<owl_models::module::XqaVerifyCtx> {
-        self.xqa_verify.clone()
+    /// XQA 资源面(常量件;`seq_lens`/`semaphores` 由图输入槽供给,调用方覆盖)
+    pub(crate) fn xqa_ctx(&self) -> Option<owl_models::module::XqaVerifyCtx> {
+        self.xqa.clone()
     }
 
     /// XQA semaphores 元素数(图输入槽写零用;0 = 本档无 XQA 面)
     pub(crate) fn xqa_sem_n(&self) -> usize {
-        self.xqa_verify
+        self.xqa
             .as_ref()
             .map(|x| x.semaphores.shape().iter().product::<usize>())
             .unwrap_or(0)
@@ -575,7 +583,7 @@ impl StatePool {
 
     /// XQA semaphores 块 + 字节数(每轮发射前清零用)
     pub(crate) fn xqa_sem_zero(&self) -> Option<(owl_iface::contract::Bytes, usize)> {
-        let x = self.xqa_verify.as_ref()?;
+        let x = self.xqa.as_ref()?;
         let n = x.semaphores.shape().iter().product::<usize>();
         Some((owl_iface::contract::Bytes { id: x.semaphores.id(), len: n }, n * 4))
     }

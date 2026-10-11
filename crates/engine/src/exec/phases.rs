@@ -66,15 +66,25 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if grew {
             self.write_bt(sid).await?;
         }
-        self.session
-            .step(&[
-                ("frontier", &[token as f32]),
-                ("pos", &[pos as f32]),
-                ("kv_len", &[(pos + 1) as f32]),
-                ("kv_slot", &[kv_slot as f32]),
-                ("gdn_slot", &[gdn_slot as f32]),
-            ])
-            .await?;
+        // XQA 裸 decode 臂(2026-10-13 ②):`xqa_seq` = kv_len 的 **u32 位型**
+        // (核按 `const uint32_t*` 读;`(pos+1) as f32` 会拿到浮点位型);
+        // `xqa_sem` 每轮清零(KV-split 归约计数 —— 参考实现 `sem.zero_()`)。
+        // 两槽只在 `decode_xqa` 开时存在于图中(否则 `step` 会报未声明槽)。
+        let mut step_slots: Vec<(&str, Vec<f32>)> = vec![
+            ("frontier", vec![token as f32]),
+            ("pos", vec![pos as f32]),
+            ("kv_len", vec![(pos + 1) as f32]),
+            ("kv_slot", vec![kv_slot as f32]),
+            ("gdn_slot", vec![gdn_slot as f32]),
+        ];
+        if self.session.has_input("xqa_seq") {
+            step_slots.push(("xqa_seq", vec![f32::from_bits((pos + 1) as u32)]));
+            let n = self.session.input_len("xqa_sem").unwrap_or(0);
+            step_slots.push(("xqa_sem", vec![0.0; n]));
+        }
+        let step_refs: Vec<(&str, &[f32])> =
+            step_slots.iter().map(|(n, v)| (*n, v.as_slice())).collect();
+        self.session.step(&step_refs).await?;
         if prof {
             eprintln!("[step-prof] pos={pos} fill+launch={:?} wall={}", t0.unwrap().elapsed(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100000);
         }

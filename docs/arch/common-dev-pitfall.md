@@ -395,3 +395,61 @@
   3. 定位 `DeadBlock` 三步:探针看该 id 是否被 free → 三处解析点各带标记看**谁在解析**
      → 用 id 撞号(尺寸/内容对不上)判定跨账本;
   4. 报错信息里带 **actor 编号 + 核名 + 参序号**(本次已落,零热路径成本)。
+
+## 28. 同一份第三方核编两个实例化:符号要改名,但**别默认"改编译期旋钮"这条臂能用**(2026-10-13,XQA D1)
+
+- **症状 A(幽灵宏名)**:给第二份实例化传 `-Down_xqa_launch=owl_xqa_launch_decode`,
+  以为把 `owl_xqa_launch` 改名了 —— 实际 GCC 把 `-Down_xqa_launch` 解析成
+  `-D` + **`own_xqa_launch`**(宏名少了首字母 `l`)。两份归档于是**都导出
+  `owl_xqa_launch`**,链接器只取一个 ⇒ 第二份实例化悄悄跑到第一份的核上。
+  **律:改名前先 `nm -C --defined-only` 对账两份归档的 `T` 符号集合**;
+  正确写法 = `-Dowl_xqa_launch=owl_xqa_launch_decode`。
+- **症状 B(SPEC_DEC=0 实例化 SIGSEGV)**:上游/fork 的 JIT 对 q=1 走
+  `-DSPEC_DEC=0`,我们编出来同一份源码的该实例化在
+  `cuLaunchKernelEx` **内部 libcuda 段错误**(`owl_xqa_launch_decode →
+  launchMHAFlashInferDec → cudaLaunchKernelExC → cuLaunchKernelEx`)。
+  排查顺序(可复用):①gdb 拿栈 → 定位是"host 侧 libcuda 崩"而非核内错;
+  ②打印 launch 契约(`hostSmem/grid/cta/ctaTile/launchCfg.dynamicSmemBytes`)
+  → **全部正常**(`smem=67200 grid=(8,4,1) cta=(128,1,2) ctaTile=(256,16)`);
+  ③`compute-sanitizer --tool memcheck` → 0 error(说不上话);
+  ④摘掉另一份实例化单独跑 → **照样崩** ⇒ 排除双 fatbin 同进程干扰;
+  ⑤对账符号 → 无重名。
+  **结论:不是我们的用例错,是该配置在"我们的编译方式(单 `-arch=sm_86` /
+  普通 nvcc)"下落地产物不可用**;fork 用 multi-arch gencode + torch JIT,
+  可能压根没在这条路上跑过 sm86。
+- **正解(用它)**:保留已验证的 `SPEC_DEC=1` **掩码路径**,只把 tile 行数收窄
+  —— `-DM_TILESIZE=16`(`mha.cu:84` 在 SPEC_DEC 下 `nbValidRows = rowsPerBlock
+  = M_TILESIZE`;`mha.cu:2907` 有 `M_TILESIZE == 16` 的上游支持痕迹)。
+  q=1 只需 6 行 ⇒ `warpTile.y` 从 32 降到 16,MMA 浪费减半,
+  **掩码/参数语义与 verify 逐字同一套实现 ⇒ 零新风险面**。
+- **律**:
+  1. **双实例化优先"同一份已验证语义 + 收窄几何参数",而不是"切换另一条代码臂"**;
+     切换代码臂的验证成本高一个量级(本次就撞上不可用的臂)。
+  2. **两份实例化必须 `nm` 对账 `T` 符号**(改名前/后各一次),并**实测两份的
+     `hostSmem` 等编译期量确实不同**(证明没跨解析 —— 本次:83584 vs 67200 ✓)。
+  3. **"调编译期旋钮"这条路要先用最小独立测试证伪/证实**,不要直接接进引擎
+     (§26 同源:先 kernels crate 单算子,不拉上层)。
+- **另记(负结果,别重复试)**:XQA 的 `nbSubSeqPerSeq = min(SM/(batch·hkv), ·)`
+  给 1 CTA/SM;把 `sm_count` 放大 2/3/4×(= 2-4 CTA/SM)**反而更慢**
+  (`0.283 → 0.396 ms`,多 split 的归并+尾浪成本 > 占用率收益)。q=1 时 XQA
+  对 v2 只有 **1.46×**(对比 q=8 的 4.72×)—— 因为 v2 以 384 CTA 超高占用把延迟
+  藏住了,XQA 的"元素数 ÷6"优势被每 split 固定开销摊薄。
+
+## 29. 「按 exe 路径认进程」在重建后会静默失效(` (deleted)` 后缀)——A/B 被旧 server 污染(2026-10-13,② 验收)
+
+- **症状**:同一个 A/B 序列跑出互相矛盾的结论(某次 B 的读数与 A 完全一致),且
+  重跑结果漂移;事后 `pgrep` 才发现**上一轮的 server 一直活着占着 18G 显存**。
+- **根因**:清理脚本用 `readlink -f /proc/$pid/exe` 与目标二进制路径做**字符串相等**
+  比较 —— 只要该二进制在进程存活期间被 `cargo build` 覆盖过,`readlink` 就变成
+  `/path/server (deleted)`,比较**永远为假** ⇒ 循环静默跳过 ⇒ 旧 server 不死。
+  更毒的是:它不报错、不崩溃,只是让后续每个测量都跑在**被占用的卡**上
+  (起不来的会 OOM 报错,起得来的会给出貌似正常的读数)。
+- **律**:
+  1. 认进程时先剥后缀:`readlink -f /proc/$p/exe | sed 's/ (deleted)$//'` 再比较;
+  2. **每次起 server 前先核显存**(`nvidia-smi --query-gpu=index,memory.used`),
+     等到目标卡 <100MiB 才继续 —— 显存是唯一可信的"卡是否空"判据;
+  3. A/B 脚本必须**自证环境干净**(打印起跑时的显存),否则结论作废。
+- **附带**:`[boot] vram 治理: ... free=` 里的 `free` 是**设备线程缓存值**
+  (`owl_shared::vram::FREE`,`cuMemGetInfo` 落账后覆盖),**不是实时查询** ——
+  同一配置两次 boot 可差 17GB(实测 A=23.32G / B=5.56G 而真实分配逐位相同)。
+  **别用这一行做 A/B 的内存差异判据**,要看 `live=`/`fixed_after=`/`per_tok=`。

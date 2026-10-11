@@ -13,6 +13,8 @@
 use crate::contract::{Arg, Bytes, LaunchMsg, OpError};
 
 pub const VERIFY_XQA: &str = crate::family::xqa::VERIFY_XQA;
+/// 裸 decode 臂(同名解析口径 —— 槽序与 verify 同型,解析函数复用)
+pub const DECODE_XQA: &str = crate::family::xqa::DECODE_XQA;
 
 #[derive(Clone, Copy, Debug)]
 pub struct BlockRef {

@@ -652,11 +652,16 @@ impl owl_iface::contract::PinnedRegion for Staging {
 
 impl Staging {
     /// 分配 n 元素的 pinned 缓冲(未初始化)
-    pub(super) fn alloc(n: usize) -> Result<Self, ModelError> {
+    pub(super) fn alloc(n: usize, label: &'static str) -> Result<Self, ModelError> {
         // 字节口径(f16 基线,2026-09-26):n = 字节数,DMA 按 byte 计数
         let ptr = unsafe { malloc_host(n, 0) }
-            .map_err(|e| ModelError::Msg(format!("malloc_host: {e:?}")))? as *mut u8;
-        assert!(!ptr.is_null());
+            .map_err(|e| ModelError::Msg(format!("malloc_host(n={n}B): {e:?}")))? as *mut u8;
+        // FIXME(2026-10-13):cudarc 的 `malloc_host` 对失败/零尺寸可能回 Ok(null)
+        // ——这里是裸 assert,拿不到任何上下文。先带上尺寸与原因(下同)。
+        assert!(
+            ptr.is_null() == false,
+            "Staging::alloc[{label}]: malloc_host(n={n}B) 返回空指针(锁页内存耗尽?n=0 = 零长块写,上游形状错)"
+        );
         Ok(Self { ptr, len: n })
     }
 

@@ -17,8 +17,22 @@
 //
 // 实例化参数(编译期,由 build.rs 传):
 //   TOKENS_PER_PAGE=32 / HEAD_ELEMS=256 / HEAD_GRP_SIZE=6 / CACHE_ELEM_ENUM=2
-//   (fp8 e4m3 KV)/ INPUT_FP16=1 + DTYPE=__half / SPEC_DEC=1(verify)/
+//   (fp8 e4m3 KV)/ INPUT_FP16=1 + DTYPE=__half /
 //   SLIDING_WINDOW=0 / LOW_PREC_OUTPUT=0 / USE_SM90_MHA=0 / MLA_WRAPPER=0
+//
+// **两份实例化(2026-10-13 ② 立案)**:
+//   verify → `owl_xqa_launch`        (SPEC_DEC=1,M_TILESIZE=32:T=8 伪序列、48 行需 2 block)
+//   decode → `owl_xqa_launch_decode` (SPEC_DEC=1,**M_TILESIZE=16**:q=1 只需 6 行)
+// 为什么要两份:`rowsPerBlock = M_TILESIZE` 决定一个 CTA 覆盖多少 head-token 行,
+// 而 `warpTile.y = roundUp(nbValidRows, 16)` ⇒ q=1 用 32 行 tile 时只 6 行有效
+// (实测 ctx8192 仅 1.38×,vs q=8 的 4.73×)。收窄到 16 行后浪费减半。
+// ⚠️ 不用 `SPEC_DEC=0`:`mha.cu:84` 在该模式下 `nbValidRows = headGrpSize*beamWidth`,
+// 本 fork 编译出的实例化在 `cuLaunchKernelEx` 内 libcuda **SIGSEGV**(已实测,
+// 参数/尺寸/符号均正常)—— 掩码路径(SPEC_DEC=1)已验证可用,只收窄 tile 最稳。
+// 两份实例化用 `-D` 宏重命名内部全局符号(否则同进程两归档 `launchMHAFlashInfer`
+// 撞名,链接器只取一个)。
+//
+// 签名两份一致(q_seq_len/mask 恒在,两者都是 SPEC_DEC=1)。
 //
 // 布局契约(与 owl kNHD 主池逐字对齐;XQA 文档名 = NHD):
 //   KV = [num_pages, tokens_per_page, num_kv_heads, head_dim] —— owl 页内
@@ -66,6 +80,11 @@ extern "C" int owl_xqa_launch(
   // throw std::runtime_error)。**绝不能让它穿过 `extern "C"` 边界**:
   // 实测 = 调用方进程直接 abort(`Rust cannot catch foreign exceptions`),
   // 且异常文本丢失(难以定位)。此处就地捕获 → 打印原因 + 返回非零码。
+#if !SPEC_DEC
+  // 若将来真要用 SPEC_DEC=0:q 维/掩码两个入参只为统一签名而保留
+  (void)q_seq_len;
+  (void)mask;
+#endif
   try {
     launchMHAFlashInfer(sm_count, nb_k_heads, sliding_win_size, q_scale, /*qScalePtr=*/nullptr,
                       reinterpret_cast<OutputHead*>(output),
@@ -74,7 +93,9 @@ extern "C" int owl_xqa_launch(
                       reinterpret_cast<GMemCacheHead*>(v_cache),
                       page_table, max_seq_len, seq_lens, batch_size, kv_scale,
                       /*kvScalePtr=*/nullptr,
+#if SPEC_DEC
                       q_seq_len, /*qCuSeqLens=*/nullptr, mask,
+#endif
                       semaphores, scratch, /*enable_pdl=*/false,
                         kv_stride_page, kv_stride_token, kv_stride_head,
                         reinterpret_cast<cudaStream_t>(stream));

@@ -135,58 +135,84 @@ fn build_xqa() {
         println!("cargo:rerun-if-env-changed=XQA_FORCE_BUILD");
         let xqa_dir = out_dir.join("xqa");
         std::fs::create_dir_all(&xqa_dir).unwrap();
-        let prebuilt = PathBuf::from("cu/xqa/prebuilt/libowl_xqa.a");
+        println!("cargo:rerun-if-changed=cu/xqa/prebuilt/libowl_xqa_decode.a");
         let force = env::var("XQA_FORCE_BUILD").ok().as_deref() == Some("1");
-        if prebuilt.exists() && !force {
-            let dest = xqa_dir.join("libowl_xqa.a");
-            std::fs::copy(&prebuilt, &dest).expect("copy prebuilt libowl_xqa.a");
-            println!("cargo:warning=owl-kernels: using prebuilt {}", prebuilt.display());
-        } else {
-            // 实例化参数 = owl 生产形状(见 cu/xqa/README.md / owl_xqa_launch.cu 头注)
-            let defines = [
-                "-DNDEBUG=1",
-                "-DBEAM_WIDTH=1",
-                "-DUSE_INPUT_KV=0",
-                "-DUSE_CUSTOM_BARRIER=1",
-                "-DTOKENS_PER_PAGE=32",
-                "-DHEAD_ELEMS=256",
-                "-DHEAD_GRP_SIZE=6",
-                "-DINPUT_FP16=1",
-                "-DDTYPE=__half",
-                "-DCACHE_ELEM_ENUM=2",
-                "-DSLIDING_WINDOW=0",
-                "-DLOW_PREC_OUTPUT=0",
-                "-DSPEC_DEC=1",
-                "-DMLA_WRAPPER=0",
-                "-DUSE_SM90_MHA=0",
-            ];
-            let nvcc_x = env::var("XQA_NVCC").unwrap_or_else(|_| "nvcc".into());
+        let nvcc_x = env::var("XQA_NVCC").unwrap_or_else(|_| "nvcc".into());
+        let ar = env::var("AR").unwrap_or_else(|_| "ar".into());
+        // 通用实例化参数 = owl 生产形状(见 cu/xqa/README.md / owl_xqa_launch.cu 头注)
+        const COMMON: &[&str] = &[
+            "-DNDEBUG=1",
+            "-DBEAM_WIDTH=1",
+            "-DUSE_INPUT_KV=0",
+            "-DUSE_CUSTOM_BARRIER=1",
+            "-DTOKENS_PER_PAGE=32",
+            "-DHEAD_ELEMS=256",
+            "-DHEAD_GRP_SIZE=6",
+            "-DINPUT_FP16=1",
+            "-DDTYPE=__half",
+            "-DCACHE_ELEM_ENUM=2",
+            "-DSLIDING_WINDOW=0",
+            "-DLOW_PREC_OUTPUT=0",
+            "-DMLA_WRAPPER=0",
+            "-DUSE_SM90_MHA=0",
+        ];
+        // (预编名, 归档名, 专有 -D):
+        //   verify = SPEC_DEC=1(rowsPerBlock = M_TILESIZE = 32;q=8 → 48 行需 2 block)
+        //   decode = SPEC_DEC=1 + **M_TILESIZE=16**(q=1 只需 6 行 ⇒ warpTile.y=16,
+        //           半于 32 的 MMA 浪费)。掩码路径与 verify 同一套(已验证),
+        //           只动 tile 行数 —— 避开 SPEC_DEC=0 那条对本 fork 会 SIGSEGV 的臂。
+        // 两份实例化用 `-D` 宏重命名内部全局符号(否则同进程两归档
+        // `launchMHAFlashInfer` 撞名,链接器只取一个)。
+        let specs: [(&str, &str, &[&str]); 2] = [
+            ("libowl_xqa.a", "owl_xqa", &["-DSPEC_DEC=1"]),
+            (
+                "libowl_xqa_decode.a",
+                "owl_xqa_decode",
+                &[
+                    "-DSPEC_DEC=1",
+                    "-DM_TILESIZE=16",
+                    "-Dowl_xqa_launch=owl_xqa_launch_decode",
+                    "-DlaunchMHAFlashInfer=launchMHAFlashInferDec",
+                    "-DlaunchMHA=launchMHADec",
+                ],
+            ),
+        ];
+        for (prebuilt_name, lib_name, extra) in specs {
+            let prebuilt = PathBuf::from("cu/xqa/prebuilt").join(prebuilt_name);
+            let dest = xqa_dir.join(format!("lib{lib_name}.a"));
+            if prebuilt.exists() && !force {
+                std::fs::copy(&prebuilt, &dest).expect("copy prebuilt xqa lib");
+                println!(
+                    "cargo:warning=owl-kernels: {lib_name}: using prebuilt {}",
+                    prebuilt.display()
+                );
+                continue;
+            }
             let mut objs: Vec<PathBuf> = Vec::new();
             for src in ["mha.cu", "owl_xqa_launch.cu"] {
-                let obj = xqa_dir.join(format!("{}.o", src.trim_end_matches(".cu")));
+                let obj = xqa_dir.join(format!("{lib_name}__{}.o", src.trim_end_matches(".cu")));
                 let mut cmd = std::process::Command::new(&nvcc_x);
                 cmd.args(["-O3", "-std=c++17", "-arch=sm_86", "--expt-relaxed-constexpr"])
-                    .args(defines)
+                    .args(COMMON)
+                    .args(extra)
                     .arg("-c")
                     .arg(PathBuf::from("cu/xqa").join(src))
                     .arg("-o")
                     .arg(&obj);
                 let status = cmd.status().expect("xqa: failed to spawn nvcc");
-                assert!(status.success(), "xqa: nvcc failed on {src}");
+                assert!(status.success(), "xqa: nvcc failed on {src} ({lib_name})");
                 objs.push(obj);
             }
             // ⚠️ 必须先删旧归档:对象文件名若换过(如 xqa_launch.o → launch.o),
             // `ar rcs` 是"按名替换"→ 旧成员**留在归档里且排在前**,链接器取第一个
             // 定义 = 永远链到旧版(实测踩坑:改 launcher 后二进制行为不变、
             // strings 查不到新串,排查半天的"幽灵")。
-            let lib = xqa_dir.join("libowl_xqa.a");
-            let _ = std::fs::remove_file(&lib);
-            let ar = env::var("AR").unwrap_or_else(|_| "ar".into());
-            let mut cmd = std::process::Command::new(ar);
-            cmd.args(["rcs"]).arg(&lib).args(&objs);
+            let _ = std::fs::remove_file(&dest);
+            let mut cmd = std::process::Command::new(&ar);
+            cmd.args(["rcs"]).arg(&dest).args(&objs);
             let status = cmd.status().expect("xqa: failed to spawn ar");
-            assert!(status.success(), "xqa: ar failed");
-            println!("cargo:warning=owl-kernels: built libowl_xqa.a from source");
+            assert!(status.success(), "xqa: ar failed ({lib_name})");
+            println!("cargo:warning=owl-kernels: built lib{lib_name}.a from source");
         }
         let cuda_lib = env::var("CUDA_HOME")
             .map(|h| PathBuf::from(h).join("lib64"))
@@ -194,6 +220,7 @@ fn build_xqa() {
         println!("cargo:rustc-link-search=native={}", xqa_dir.display());
         println!("cargo:rustc-link-search=native={}", cuda_lib.display());
         println!("cargo:rustc-link-lib=static=owl_xqa");
+        println!("cargo:rustc-link-lib=static=owl_xqa_decode");
         println!("cargo:rustc-link-lib=dylib=cudart");
         println!("cargo:rustc-link-lib=dylib=stdc++");
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", cuda_lib.display());

@@ -366,6 +366,13 @@ impl Attention {
         ctx: &ForwardCtx,
         pol: &crate::module::KvPagedPolicy,
     ) -> TensorOps {
+        // XQA 臂优先(2026-10-13 ②;T=1 裸 decode)。池/形状不匹配 ⇒
+        // `ctx.xqa` 为 None ⇒ 自动回落 v2 主核(graceful,与 verify 臂同款纪律)。
+        if tokens == 1 && ctx.env.attn.decode_xqa {
+            if let Some(x) = ctx.xqa.as_ref() {
+                return self.decode_xqa_arm(q, gate, wr, kv, ctx, pol, x);
+            }
+        }
         let s2 = ctx.attn_v2.as_ref().expect(
             "paged v2: ctx.attn_v2 scratch 缺失(引擎应预分配注入;层分派已判 is_some)",
         );
@@ -435,6 +442,64 @@ impl Attention {
     /// 前置(调用点已查):`ctx.xqa` 在场 + `q_seq_len == tokens` + kNHD fp8 池;
     /// KV 已由上游 K0 写入(与其余 prefill 臂同序)。
     #[allow(clippy::too_many_arguments)]
+    /// XQA 裸 decode 臂(2026-10-13 ②;kNHD fp8 池 + `M_TILESIZE=16` 实例化)。
+    ///
+    /// 与 `paged_decode_v2_k0` **同语义**(单行 query 看 `[0, kv_lens)`),
+    /// 差别只在注意力核形态。单算子对拍(`crates/kernels/tests/xqa_decode_probe.rs`,
+    /// kNHD fp8 / q=1 / 3090 Ti):ctx 512/2048/8192 = 1.90× / 2.25× / **1.46×**
+    /// vs v2 主核+reduce。
+    ///
+    /// 与 verify 臂的三处差别:(1)`q_seq_len = 1`;(2)掩码只用 index 0
+    /// (= 1,即"bit0 允许自身"—— 恰好与 verify 掩码第 0 行同值,两形状共用
+    /// 同一张量);(3)池不写 —— KV 已由上游(K0 / 融合插池)写入,`wr` 仅保序。
+    ///
+    /// 前置(调用点已查):`ctx.xqa` 在场 + `tokens == 1` + kNHD fp8 池 +
+    /// hd256 + page32 + hq/hkv == 6(池门同源,见 `state.rs`)。
+    #[allow(clippy::too_many_arguments)]
+    fn decode_xqa_arm(
+        &self,
+        q: &TensorOps,
+        gate: &TensorOps,
+        wr: &TensorOps,
+        kv: &KvBuffers,
+        ctx: &ForwardCtx,
+        pol: &crate::module::KvPagedPolicy,
+        x: &crate::module::XqaVerifyCtx,
+    ) -> TensorOps {
+        let dt = q.dtype;
+        let hd = self.hd;
+        let tokens = 1usize;
+        let q_scale_bits = xqa_q_scale_bits(hd);
+        let y = TensorOps::call(SemanticKernel::XqaDecode)
+            .arg(q)
+            .arg(&kv.k_cache)
+            .arg(&kv.v_cache)
+            .arg(&x.page_table)
+            .arg(&x.seq_lens) // 图输入槽:每步 = kv_lens(u32 位型)
+            .arg(&x.mask) // 常量:index 0 = 1
+            .arg(&x.semaphores) // 图输入槽:每步写零
+            .arg(&x.scratch)
+            .arg(wr) // 依赖边(K0/融合插池先于读池)
+            .arg_usize(tokens)
+            .arg_usize(self.hkv)
+            .arg_usize(hd)
+            .arg_usize(pol.page)
+            .arg_usize(x.max_seq_len)
+            .arg_usize(q_scale_bits as usize)
+            .arg_usize(x.sm_count)
+            .arg_usize(pol.page * self.hkv * hd) // 元素序 strides
+            .arg_usize(self.hkv * hd)
+            .arg_usize(hd)
+            .with_shape(dt, vec![tokens, self.hq * hd]);
+        let n = tokens * self.hq * hd;
+        let y = TensorOps::call(SemanticKernel::GateMul)
+            .arg(gate)
+            .arg(&y)
+            .arg_usize(n)
+            .with_shape(dt, vec![tokens, self.hq * hd]);
+        self.o_proj.forward(&y, ctx)
+    }
+
     fn verify_xqa_arm(
         &self,
         q: &TensorOps,

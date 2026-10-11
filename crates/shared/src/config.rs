@@ -236,6 +236,12 @@ pub struct DispatchCfg {
     /// 2026-10-13 D3:XQA 单算子实测 ctx8192 0.495ms vs v2 2.673ms(5.40×),
     /// 数值 max|XQA−host| 4.5e-4(v2 4.6e-4)。缺省 false(定谳后再翻)。
     pub verify_xqa: bool,
+    /// 裸 decode(T=1)改走 **XQA**(第二份实例化 `M_TILESIZE=16`;feature `xqa`)。
+    /// 2026-10-13 ② 立案:kernels crate 单算子实测(kNHD fp8/q=1/3090 Ti)
+    /// ctx 512/2048/8192 = 1.90× / 2.25× / **1.46×** vs v2 主核+reduce
+    /// (`crates/kernels/tests/xqa_decode_probe.rs`)。
+    /// 与 `verify_xqa` **独立**(走不同图:decode 常驻捕获图 vs verify 桶形图)。
+    pub decode_xqa: bool,
     /// FlashInfer prefill 面
     pub gdn_chunked: bool,
     pub gdn_scalar: bool,
@@ -397,6 +403,7 @@ impl Default for DispatchCfg {
             force_naive_prefill: false,
             verify_v2: true,
             verify_xqa: false,
+            decode_xqa: false,
             gdn_chunked: false,
             gdn_scalar: false,
             gdn_fused_decode: true,
@@ -510,6 +517,10 @@ kv_fp8 = true
 # 自动回落 v2 臂(graceful)。根因与修法见工单 §2.7(semaphores 走图输入槽,
 # 不用跨账本的 memset 命令)。
 verify_xqa = true
+# 裸 decode 走 XQA(2026-10-13 ②):第二份实例化 `M_TILESIZE=16`。
+# 注:短 ctx 收益略低(512 档 1.90× vs 2048 档 2.25×),但**不缺省加 ctx
+# 阈值门** —— 最小值也在 1.4× 以上,且阈值本身是额外的一支分支/形状面。
+decode_xqa = true
 # GDN prefill 臂(2026-10-11 终版):fork-bf16 全家桶转正 —— g 语义律
 # 修复(kkt/h/o 必须吃 cumsum 而非 raw g;raw g 在深谷 -24 时
 # exp(±24)=e²⁴ 爆炸)。恒等门:四域 vs recurrence 逐位一致;std 矩阵
