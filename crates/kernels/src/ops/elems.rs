@@ -2,14 +2,13 @@
 
 use crate::contract::{Dtype, Law};
 use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param};
-use crate::sources;
 
 /// `owl_narrow_strided_f16` —— 窄切物化(逐 token 视图;`outer/src_dim/start/out_dim` 四标量)
 pub struct NarrowStridedF16;
 
 impl KernelSpec for NarrowStridedF16 {
     const ENTRY: &'static str = "owl_narrow_strided_f16";
-    const SOURCE: &'static str = sources::text::ATTENTION_F32;
+    const SOURCE: &'static str = include_str!("../../cu/owl/attention.cu");
     const PARAMS: &'static [Param] = &[
         Param::t_in("src", Dtype::F16, 2),
         Param::sz("outer"),
@@ -28,7 +27,7 @@ pub struct GemvDualF16;
 
 impl KernelSpec for GemvDualF16 {
     const ENTRY: &'static str = "owl_gemv_dual_f16";
-    const SOURCE: &'static str = sources::owl::GEMV_DUAL_F16;
+    const SOURCE: &'static str = include_str!("../../cu/owl/gemv_dual_f16.cu");
     const PARAMS: &'static [Param] = &[
         Param::t_in("wb", Dtype::F16, 2),
         Param::t_in("wa", Dtype::F16, 2),
@@ -48,7 +47,7 @@ pub struct AddF16;
 
 impl KernelSpec for AddF16 {
     const ENTRY: &'static str = "owl_add_f16";
-    const SOURCE: &'static str = sources::OPS_F16;
+    const SOURCE: &'static str = include_str!("../../cu/owl/ops_pair.cu");
     const PARAMS: &'static [Param] = &[
         Param::t_in("a", Dtype::F16, 1),
         Param::t_in("b", Dtype::F16, 1),
@@ -65,7 +64,7 @@ pub struct AddBf16;
 
 impl KernelSpec for AddBf16 {
     const ENTRY: &'static str = "owl_add_bf16";
-    const SOURCE: &'static str = sources::OPS_F16;
+    const SOURCE: &'static str = include_str!("../../cu/owl/ops_pair.cu");
     const PARAMS: &'static [Param] = &[
         Param::t_in("a", Dtype::BF16, 1),
         Param::t_in("b", Dtype::BF16, 1),
@@ -82,7 +81,7 @@ pub struct SigmoidF16;
 
 impl KernelSpec for SigmoidF16 {
     const ENTRY: &'static str = "owl_sigmoid_f16";
-    const SOURCE: &'static str = sources::OPS_F16;
+    const SOURCE: &'static str = include_str!("../../cu/owl/ops_pair.cu");
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::F16, 1),
         Param::t_out("out", Dtype::F16, 1),
@@ -98,7 +97,7 @@ pub struct SigmoidGateMulF16;
 
 impl KernelSpec for SigmoidGateMulF16 {
     const ENTRY: &'static str = "owl_sigmoid_gate_mul_f16";
-    const SOURCE: &'static str = sources::owl::SIGMOID_GATE_MUL_F16;
+    const SOURCE: &'static str = include_str!("../../cu/owl/sigmoid_gate_mul_f16.cu");
     const PARAMS: &'static [Param] = &[
         Param::t_in("gate", Dtype::F16, 1),
         Param::t_in("x", Dtype::F16, 1),
@@ -115,7 +114,7 @@ pub struct CastF16Bf16;
 
 impl KernelSpec for CastF16Bf16 {
     const ENTRY: &'static str = "owl_cast_f16_bf16";
-    const SOURCE: &'static str = sources::attention::CAST;
+    const SOURCE: &'static str = include_str!("../../cu/owl/cast.cu");
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::F16, 1),
         Param::i32("n"),
@@ -131,7 +130,7 @@ pub struct CastBf16F16;
 
 impl KernelSpec for CastBf16F16 {
     const ENTRY: &'static str = "owl_cast_bf16_f16";
-    const SOURCE: &'static str = sources::attention::CAST;
+    const SOURCE: &'static str = include_str!("../../cu/owl/cast.cu");
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::BF16, 1),
         Param::i32("n"),
@@ -147,7 +146,7 @@ pub struct ConcatRowsF16;
 
 impl KernelSpec for ConcatRowsF16 {
     const ENTRY: &'static str = "owl_concat_rows_f16";
-    const SOURCE: &'static str = sources::text::CONCAT_F32;
+    const SOURCE: &'static str = include_str!("../../cu/owl/concat.cu");
     const PARAMS: &'static [Param] = &[
         Param::t_in("i0", Dtype::F16, 2),
         Param::t_in("i1", Dtype::F16, 2),
@@ -172,7 +171,7 @@ pub struct ConcatRowsF32;
 
 impl KernelSpec for ConcatRowsF32 {
     const ENTRY: &'static str = "owl_concat_rows_f32";
-    const SOURCE: &'static str = sources::text::CONCAT_F32;
+    const SOURCE: &'static str = include_str!("../../cu/owl/concat.cu");
     const PARAMS: &'static [Param] = &[
         Param::t_in("i0", Dtype::F32, 2),
         Param::t_in("i1", Dtype::F32, 2),
@@ -197,7 +196,7 @@ pub struct EmbedF16;
 
 impl KernelSpec for EmbedF16 {
     const ENTRY: &'static str = "owl_embed_f16";
-    const SOURCE: &'static str = sources::text::EMBED_F32;
+    const SOURCE: &'static str = include_str!("../../cu/owl/embed_f32.cu");
     const PARAMS: &'static [Param] = &[
         Param::t_in("w", Dtype::F16, 2),
         Param::t_in("ids", Dtype::F32, 1),
@@ -214,7 +213,7 @@ pub struct ArgmaxF32IdxF16;
 
 impl KernelSpec for ArgmaxF32IdxF16 {
     const ENTRY: &'static str = "owl_argmax_f32idx_f16";
-    const SOURCE: &'static str = sources::owl::ARGMAX_F16;
+    const SOURCE: &'static str = include_str!("../../cu/owl/argmax_f16.cu");
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::F16, 1),
         Param::i32("n"),
@@ -231,7 +230,7 @@ pub struct Topk16F16;
 
 impl KernelSpec for Topk16F16 {
     const ENTRY: &'static str = "owl_topk16_f16";
-    const SOURCE: &'static str = sources::owl::DFLASH2_F16;
+    const SOURCE: &'static str = include_str!("../../cu/owl/dflash2.cu");
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::F16, 2),
         Param::i32("vocab"),

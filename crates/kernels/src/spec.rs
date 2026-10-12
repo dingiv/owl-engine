@@ -465,13 +465,14 @@ pub trait CheckRunner {
     /// 按块句柄回读(等价于 `resolve` + `download`)
     fn download_block(&mut self, b: &crate::contract::Bytes, dst: &mut [u8]) -> Result<(), OpError>;
     /// **经注册表发射**(与生产同一路径:`OpRegistry::execute`)—— foreign
-    /// 算子(FFI/家族 runtime)只能这样跑;native 用 [`launch_nvrtc`](Self::launch_nvrtc)。
+    /// 算子(FFI/家族 runtime)只能这样跑;native 用 [`launch_aot`](Self::launch_aot)。
     fn dispatch(&mut self, msg: crate::contract::LaunchMsg) -> Result<crate::contract::Bytes, OpError>;
     fn upload(&mut self, dst: CheckBuf, src: &[u8]) -> Result<(), OpError>;
     /// 设备 → host 回读(**独立参考比对的唯一入口**)
     fn download(&mut self, src: CheckBuf, dst: &mut [u8]) -> Result<(), OpError>;
-    /// NVRTC 源码发射(符号名 = `name`;值表见 [`crate::contract::LaunchVal`])
-    fn launch_nvrtc(
+    /// **构建期资产发射**(符号名 = `name`;源哈希查资产,零运行期编译)。
+    /// 值表见 [`crate::contract::LaunchVal`]。
+    fn launch_aot(
         &mut self,
         name: &'static str,
         source: &'static str,

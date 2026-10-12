@@ -61,7 +61,7 @@
 //! | cuda | d2h_prof / gpu_prof / free_legacy | flag / false |
 //! | cuda | graph_flags | { upload, device_launch } / 全 false |
 //! | cuda | capture_slab_mb | Option<usize> / None(hint 定量) |
-//! | cuda | nvrtc_include | Option<PathBuf>(toml 面直给;env CUDA_HOME 废) |
+//! | cuda | *(nvrtc_include/native_aot 2026-10-13 退役 —— NVRTC 已删)* | — |
 //! | graph | no_graph | flag / false |
 //!
 //! 账外键(不入公共面):测试私有旋钮(OWL_GATE_*/OWL_E2E_*/OWL_SWEEP_*/
@@ -303,8 +303,10 @@ pub struct CudaCfg {
     pub graph_flags: GraphInstantiateFlags,
     /// 捕获 slab 固定档 MiB(None = warmup 计量定量)
     pub capture_slab_mb: Option<usize>,
-    /// nvrtc include(None = 缺省 /usr/local/cuda/include)
-    pub nvrtc_include: Option<PathBuf>,
+    // nvrtc_include(2026-10-13 退役):NVRTC 编译路径已删 —— 设备码一律
+    // 构建期 cubin 资产(源哈希查表),include 路径是构建期 `nvcc` 的事。
+    // 键已从配置面移除(不许留死键,`deny_unknown_fields` 会让旧档拒启 →
+    // 显式暴露"该档还在用已退役旋钮")。
 }
 
 /// 图装配面(engine GraphPlanDesc)

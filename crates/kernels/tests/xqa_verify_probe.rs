@@ -117,32 +117,6 @@ fn host_ref_knhd(q: &[u16], kc: &[u8], vc: &[u8], lens: &[usize]) -> Vec<f32> {
     out
 }
 
-extern "C" {
-    #[allow(clippy::too_many_arguments)]
-    fn owl_xqa_launch(
-        sm_count: u32,
-        nb_k_heads: u32,
-        sliding_win_size: u32,
-        q_scale: f32,
-        output: *mut core::ffi::c_void,
-        q: *const core::ffi::c_void,
-        k_cache: *mut core::ffi::c_void,
-        v_cache: *mut core::ffi::c_void,
-        page_table: *const i32,
-        max_seq_len: u32,
-        seq_lens: *const u32,
-        batch_size: u32,
-        kv_scale: f32,
-        q_seq_len: u32,
-        mask: *const u32,
-        semaphores: *mut u32,
-        scratch: *mut core::ffi::c_void,
-        kv_stride_page: u64,
-        kv_stride_token: u64,
-        kv_stride_head: u64,
-        stream: *mut core::ffi::c_void,
-    ) -> i32;
-}
 
 /// 一次全量测量:XQA 单发 + v2(主核+reduce)两发,同 ctx、同池。
 fn run_case(ctx: usize, check: bool) { run_case_mm(ctx, check, false) }
@@ -285,34 +259,48 @@ fn run_case_var(ctx: usize, check: bool, mask_all: bool, mask_var: u32) {
         d_sem.device_ptr(&stream).0,
         d_scratch.device_ptr(&stream).0,
     );
-    let stream_raw = stream.cu_stream() as *mut core::ffi::c_void;
-    let xqa_call = |out: u64| unsafe {
-        owl_xqa_launch(
-            SM86_SM_COUNT,
-            HKV as u32,
-            0,
-            1.0, // q_scale = attn_scale(1/sqrt(256)) * sqrt(256) = 1.0
-            out as *mut core::ffi::c_void,
-            q_p as *const core::ffi::c_void,
-            k_p as *mut core::ffi::c_void,
-            v_p as *mut core::ffi::c_void,
-            bt_p as *const i32,
-            (nb * PAGE) as u32,
-            sq_p as *const u32,
-            1,
-            1.0,
-            S as u32,
-            mk_p as *const u32,
-            sem_p as *mut u32,
-            sc_p as *mut core::ffi::c_void,
-            (PAGE * HKV * HD) as u64,
-            (HKV * HD) as u64,
-            HD as u64,
-            stream_raw,
-        )
+    // ---- XQA 单发(2026-10-13 C3a:构建期资产 + Rust 发射器) ----
+    let (xqa_kernel, xqa_consts) =
+        owl_kernels::family::xqa::load_for_probe(&ctx_c, owl_kernels::family::xqa::ASSET_VERIFY)
+            .expect("载 xqa_verify 资产");
+    let mk_args = |out: u64| owl_kernels::family::xqa::XqaArgs {
+        q_seq_len: S as u32,
+        nb_k_heads: HKV as u32,
+        q_cu_seq_lens: 0,
+        q_scale: 1.0, // = attn_scale(1/sqrt(256)) * sqrt(256)
+        q_scale_ptr: 0,
+        output: out,
+        q: q_p,
+        mask: mk_p,
+        attention_sinks: 0,
+        cache: owl_kernels::family::xqa::KVCacheList {
+            k_cache: k_p,
+            v_cache: v_p,
+            page_list: bt_p,
+            seq_len_list: sq_p,
+            max_nb_pages_per_seq: xqa_consts.max_nb_pages_per_seq((nb * PAGE) as u32),
+            _pad: 0,
+        },
+        batch_size: 1,
+        kv_scale: 1.0,
+        kv_scale_ptr: 0,
+        stride_page: xqa_consts.stride_in_heads((PAGE * HKV * HD) as u64),
+        stride_token: xqa_consts.stride_in_heads((HKV * HD) as u64),
+        stride_head: xqa_consts.stride_in_heads(HD as u64),
+        semaphores: sem_p,
+        scratch: sc_p,
     };
-    let rc = xqa_call(o_p);
-    assert_eq!(rc, 0, "owl_xqa_launch 返回 {rc}");
+    let xqa_call = |out: u64| {
+        owl_kernels::family::xqa::launch_on_stream(
+            &stream,
+            &xqa_kernel,
+            &xqa_consts,
+            &mk_args(out),
+            SM86_SM_COUNT,
+        )
+        .expect("xqa launch");
+    };
+    xqa_call(o_p);
     stream.synchronize().expect("xqa sync");
 
     // ---- v2 基线(主核 + reduce;与生产同两发) ----

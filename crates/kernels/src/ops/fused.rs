@@ -5,7 +5,6 @@ use crate::spec::{
     meta_of, pools, CaptureEvidence, Determinism, KernelMeta, KernelSpec, LayoutTag, Param,
     PoolAccess,
 };
-use crate::sources;
 
 /// `owl_qknorm_rope_kv_insert_f16_fp8kv_knhd` —— qk-norm + rotate-half rope
 /// + KV 散写(主池 e4m3/kNHD)三发合一。
@@ -17,7 +16,7 @@ pub struct QknormRopeKvInsertF16Fp8Knhd;
 
 impl KernelSpec for QknormRopeKvInsertF16Fp8Knhd {
     const ENTRY: &'static str = "owl_qknorm_rope_kv_insert_f16_fp8kv_knhd";
-    const SOURCE: &'static str = sources::owl::QKNORM_ROPE_KV_INSERT_F16_FP8KV;
+    const SOURCE: &'static str = include_str!("../../cu/owl/fused.cu");
     const PARAMS: &'static [Param] = &[
         // q_raw 是 per-head [value|gate] 半段拼接(strided 读)
         Param::t_in("q_raw", Dtype::F16, 2),
@@ -60,7 +59,7 @@ pub struct QknormRopeKvInsertF16Fp8;
 
 impl KernelSpec for QknormRopeKvInsertF16Fp8 {
     const ENTRY: &'static str = "owl_qknorm_rope_kv_insert_f16_fp8kv";
-    const SOURCE: &'static str = sources::owl::QKNORM_ROPE_KV_INSERT_F16_FP8KV;
+    const SOURCE: &'static str = include_str!("../../cu/owl/fused.cu");
     const PARAMS: &'static [Param] = &[
         Param::t_in("q_raw", Dtype::F16, 2),
         Param::t_in("k", Dtype::F16, 3),

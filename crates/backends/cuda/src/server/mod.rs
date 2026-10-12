@@ -173,7 +173,7 @@ impl GpuServer {
             pool: std::sync::Arc::new(PinnedPool::default()),
             boot,
             ctx: None,
-            kernels: KernelCache::new(diag.nvrtc_include.clone()),
+            kernels: KernelCache::new(),
 // (diag 自身随 Self 移动,克隆 include 后置)
             registry: None,
             allowed_ops: diag.allowed_ops.clone(),

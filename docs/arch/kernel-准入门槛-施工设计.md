@@ -795,3 +795,475 @@ impl KernelPick {
 6. **新发现(非本专项)**:`apps/server/tests/e2e.rs` 的"算术 2+2"用例在**改动前
    的树上同样失败**(A/B 实证),返回的是**上一个 session 的答案**(Paris)——
    即 server 路径存在会话串扰类缺陷,已挂账(与算子准入无关)。
+
+
+---
+
+## 十五、资产形态与源码归属(2026-10-13 用户裁决 —— 两条硬规则)
+
+### 15.1 R4:资产只允许 `.a`;**`.cubin` 形态淘汰**
+
+| 允许 | 禁止 |
+|---|---|
+| `.a`(静态库)+ 一个 `extern "C"` **host 入口**(marlin/xqa/FI 先例:`rustc-link-lib=static`) | `.cubin` + `include_bytes!` + 自研 loader + `json` 元数据 + `manifest` 指纹 |
+| 系统库动态调用(cublas,唯一例外) | 运行期 NVRTC 之外的任何"自造加载机制" |
+
+⇒ **`Linkage::AotCubin` 变体退役**,`Linkage` 只剩 `StaticLib` / `Nvrtc` 两态。
+**机制数 6 → 3**:
+
+| 机制 | 定位 | 成员 |
+|---|---|---|
+| **M1 源码在树 + NVRTC 直发** | 无状态单核 | native 全部(110) |
+| **M2 源码在树 + build.rs 预编 `.a`** | 有状态/多核/需 host 入口 | marlin、xqa、flashinfer(头 vendor 后)、gdn_scalar、gdn_chunked(源 vendor 后) |
+| **M3 外部二进制库** | 无源可编 | cublas(系统 `.so`);gdn_chunked 若不 vendor 源也归此(入库 `.a`) |
+
+**R4 的前提与出口(2026-10-13 补注;必须与裁决同读)**:
+
+| 载体 | 跨 OS | 跨 CPU 架构 | 跨 GPU 架构 | 本项目 |
+|---|---|---|---|---|
+| 源码(`.cu`/Triton `.py`)→ 本机编译 | ✅ | ✅ | ✅ | **M1**(native 110) |
+| PTX(驱动 JIT) | ✅ | ✅ | ✅ | 未用(备选出口) |
+| `.cubin` | ✅ | ✅ | ❌(SASS 绑 sm) | **淘汰**(R4) |
+| `.fatbin`(多 `-gencode`) | ✅ | ✅ | ⚠️ 部分 | `.a` 内嵌形态 |
+| `.a` / `.so` | ❌ | ❌ | ❌ | **M2/M3** |
+
+- **前提**:本工作区锁 Linux + x86_64 + sm86(驱动 615/595 + P2P 补丁 + 全 Ampere),
+  因此"`.a` 不跨 OS/不跨 CPU 架构"**在本项目内不构成损失**;
+- **裁决理由 = 消除自造机制 + 形态统一**(`.cubin` 逼出自研 loader + 符号校验 +
+  `json` 元数据 + `manifest` 指纹 + Rust 侧编排;`.a` 只需 host 入口 + FFI);
+- **出口(将来跨平台/跨架构时)**:见 §15.1.1 —— **出口 = 源在树 + 能在目标平台重编**,
+  资产格式不是决定因素(`.a` 是**产物**:源在树就能在 Windows 上再产一份 `.lib`);
+- **两个隐性事实**:① `.a` 路线的设备码靠 **cudart** 注册(实测 `libmarlin.a` 引用
+  `__cudaRegisterFatBinary*`,故必须 `-lcudart`),而 `.cubin` 路线走 **driver API**
+  (`libcuda`);② gdn_chunked 转 `.a` 后**仍绑 sm86**(内嵌 fatbin),
+  换 40/50 系同样要重编/重采 —— 这个维度两条路都没解决,只有源码/PTX 解决。
+
+#### 15.1.1 跨平台出口(2026-10-13 追问 marlin/Windows 后补)
+
+**分层结论**:
+
+| 目标 | 需要什么 | 本仓库现状 |
+|---|---|---|
+| 跨 **OS / CPU 架构** | **能在目标平台重编源码** | marlin/xqa/FI/gdn_scalar 源在树 ⇒ ✅(build.rs 加 Windows 分支:`nvcc -c` + MSVC `lib.exe` → `.lib`);**gdn_chunked 源不在树 ⇒ ❌ 会卡** |
+| 跨 **GPU 架构** | **源码** 或 **PTX**(驱动 JIT) | 只有源码路线(M1 NVRTC 天然跨 sm);`.a`/`.cubin` 都绑 sm |
+| 资产格式(`.a` vs `.cubin`) | **不是**决定因素 | `.a` 是**产物**,不是源 |
+
+**三条 Windows 路线**(若将来真要):
+1. **A(推荐)**:build.rs 平台分支 + `lib.exe` 重编 `.lib` —— 源在树即可,工作量小;
+2. B:只复用设备码(`.nv_fatbin`/cubin 跨 OS)+ 主机侧走 driver API 自己编排 —— **与 R4 冲突**(正是要删的自造 loader/编排),不取;
+3. C(A 增强):设备码用 **PTX**(`-gencode …code=compute_86`)⇒ 设备码可 JIT 到未来架构;但 **PTX 不解决跨 OS**。
+
+**但 Windows 对 owl 整体不是"归档格式"问题**(第一道门槛在别处):
+- 引擎依赖**打过 PCIe P2P 补丁的 `open-gpu-kernel-modules`**(Linux 内核模块);
+  Windows 驱动闭源无法打补丁 ⇒ 双卡 P2P 无等价物;
+- **NCCL 官方只发 Linux** ⇒ 两引擎的 TP/通信路径需另找方案;
+- 其余:`/dev/shm` offload、`libnccl` 收编、进程组纪律、BMC/iKVM 运维面……
+⇒ **owl = "Linux + Ampere + 打过补丁的驱动"三位一体**;现实的跨平台场景是
+"**单个算子/组件搬到别的平台复用**",那种场景正解 = 路线 A。
+
+**因此"保住出口"三条(不猜将来,只保出口)**:
+1. **所有族的源必须在树**(⇒ gdn_chunked 必须解决 —— 这比 R4 的"形态统一"更硬);
+2. build.rs 重编路径**平台无关化**(`nvcc`/`ar` 探测可覆盖 + 平台分支 + `lib.exe`);
+3. 文档写明本律(本节)。
+
+**迁移动作**:
+- `gdn_scalar`:`build.sh` 的 `nvcc -cubin` → `nvcc -c` + `ar` → `libowl_gdn_scalar.a` + 一个 C host 入口包装 launch;build.rs 加 `rustc-link-lib`;删 `include_bytes!`/`load_cubin`/Rust 侧编排。
+- `gdn_chunked`:七核 cubin **作为数据内嵌进 `.a`**(`ld -r -b binary` 或 `xxd -i`),`.a` 导出 `owl_gdn_chunked_fwd(...)`(内部 `cuModuleLoadData` + 六核流水);删 `json`/`manifest`/自研 loader/Rust 侧编排。
+- 可选(另案):`GDN_FORCE_BUILD=1` 走 triton 重编(源从 `packages/vllm/vllm/third_party/flash_linear_attention` vendor 到 owl `cu/gdn/fla/`,采集脚本 `testdata/gdn_fla/harvest_fork.py` 一并搬)。
+
+### 15.2 R5:源码归**算子自托管**;`sources.rs` 集中表淘汰
+
+- **规则**:每个算子的 `SOURCE` **就地** `include_str!("../../cu/<域>/<file>.cu")` —— 与它的算子表同文件、同目录;
+- **理由**:`sources.rs` 是"名字 → 源"的第二张表(设计 §2.2 立意 = 元数据/源码物理上只有一个住址);实测 `cu/owl/fused.cu` 被 **5 个常量**指向 ⇒ 一文件多算子 + 集中表 = 又一次"两处对不上"的温床;
+- **进度(2026-10-13)**:`ops/` 下 **64 张表 + 3 个 oracle 已就地化**(`grep sources::` 在 `ops/` 内为空);
+- **剩余 17 个消费者**:`list.rs`(110 条 Entry,R1 建表完成后随 REGISTRY 一起退役)、`server/gdn_{chunked,scalar}.rs`(随 R4 一起改)、**13 个探针 + marlin_parity**(改为从 `ops::meta(name).source` 取源 —— 消灭第二份);
+- **待裁**:`fused.cu`/`ops_pair.cu`/`gdn.cu`/`dflash2.cu` 等**一文件多算子**是否拆成"一算子一 `.cu`"(贴设计 §2.1"算子与 .cu 对望"律;成本 = 拆文件 + 重编验证)。
+
+
+### 15.3 "JIT 红利"的实测审计(2026-10-13;用户裁决"不要运行期编译"后必读)
+
+用户裁决:**设备码一律 cubin(构建期产出) + 主机侧一律 Rust + 零运行期编译**。
+要问"丢了什么",先查**我们实际吃到哪几条**——实测结论:四条里只吃到 1.5 条。
+
+| 设计稿宣称的 JIT 红利 | 我们的**实际**用法(实测) | 改 cubin 后 |
+|---|---|---|
+| ① 同源多 dtype 免预编("dtype 参数化近乎免费") | **没吃**:变体在源码里用宏**逐个写出**(`ops_pair.cu` 11 处 `OWL_*_KERNEL(name, T, ...)` 实例)⇒ 一个文件编一次即含全部变体 | **零损失**(构建期同样"一文件一 cubin,含全部变体") |
+| ② 按当前设备编("换卡即跑") | **吃了**:server 路径 `CompileOptions{arch: None}` ⇒ nvrtc 出**通用 PTX** → **驱动载入时 JIT** 到实际设备(即"运行期编译"×2) | ❌ **真丢**:cubin 是 SASS,绑 sm;可用 fatbin 多目标**部分补**(sm86+sm89+sm120),**未来新架构补不了** |
+| ③ 源码即资产(免构建期 nvcc / 免二进制入库+指纹) | **吃了**:`.cu` 进 git 即全部,二进制是运行期产物 | ⚠️ 变"构建期产物":要么每次构建编(需 nvcc),要么入库 + 指纹(`*_FORCE_BUILD` 先例) |
+| ④ 开发期即时迭代(改一行 `.cu` 不用等构建) | 吃了(开发便利) | ⚠️ 变构建期几秒(只编改动文件;且一次出全文件所有核,比 NVRTC 逐核快) |
+
+**换来的收益(对称)**:
+- **启动快**:现在 boot 有一部分是 NVRTC 首用编译 + 驱动 JIT(~20 个 `.cu` 文件、110 个核);
+  改 cubin 后**运行期零编译**;
+- **零运行期编译风险**:编译错误从"运行期首次发射"提前到**构建期**(fail fast);
+- **跨 OS 更简单**(cubin 跨 OS;NVRTC 需要目标平台的 CUDA toolkit);
+- **形态统一**:1 种机制(cubin + Rust 编排)+ 1 例外(库调用)。
+
+**结论**:在本项目(**锁 Linux + x86_64 + sm86**)里,真丢的只有 ②"换卡即跑",
+而它**被"锁 sm86"这条前提屏蔽**;①③④ 是"成本从运行期搬到构建期"。
+⇒ 裁决的实际代价小,收益实在;**未来换架构的出口 = 源在树 ⇒ 重编**(R5 的硬价值)。
+
+> 勘误:`docs/arch/operator-matrix.md` 的"推论 2(JIT 红利)"把①说成"运行期按宏多编译",
+> 与实测不符(变体本就写死在源码里) —— 以本节为准。
+
+
+### 15.4 cubin 预编的形态与架构维度(2026-10-13 实测)
+
+**用户定调**:"编译的时候就要很明确地感知显卡架构;编译选项里肯定会有这种东西;
+针对不同的架构,编出来的东西不一样;**可以在编译时选择支持多少种架构**"。
+⇒ **架构 = 构建期一等输入**(不是运行期 JIT 决定)。
+
+| 事实(实测) | 结论 |
+|---|---|
+| `nvcc -cubin` **不允许**多 code instance:`Option '--cubin' is not allowed when compiling for multiple GPU code instances` | 多代际容器 = **`.fatbin`**(内含每代际一份 cubin;`cuModuleLoadData` 载入 API 完全相同,运行期由**驱动**挑最匹配) ⇒ 统一用 `-fatbin` |
+| `OWL_CUBIN_ARCHS=sm_86,sm_89,sm_120` → 一个 **185 KB** fatbin,`cuobjdump --list-elf` 显示内嵌 `ops_pair.{1,2,3}.sm_{86,89,120}.cubin` | "编译时选择支持多少种架构"**已落地**:一个资产含多代际 |
+| `ops_pair.cu` 里 f16/bf16/f32 变体是**源码里用宏逐个实例化**(11 处) | **build.rs 唯一需要参数化的维度 = arch**;dtype/量化变体随源码走(与 §15.3 审计一致) |
+
+**新增的门(待接)**:`装配期架构门` —— 设备 sm ∉ 资产 arch 集 ⇒ **拒启**,
+把 `no kernel image is available for execution on the device` 从**发射时**提前到**装配期**
+(资产 manifest 已记 `archs` 集,设备 sm 由 `cuDeviceGetAttribute(COMPUTE_CAPABILITY_*)` 查)。
+
+**构建期旋钮**:`OWL_CUBIN_ARCHS`(CSV,缺省 `sm_86`)/ `OWL_NVCC` / `OWL_CUBIN_ONLY`(排障)。
+
+---
+
+### 15.5 C2 施工实录(2026-10-13;**native 全量迁 cubin,运行期零编译**,已验收)
+
+用户裁决("零运行期编译,设备码一律 cubin")的落地。**终态 = 构建期 `nvcc -fatbin`
+产资产 + 运行期按源哈希查表 + NVRTC 仅作诊断出口**。
+
+#### 15.5.1 源清单 = `include_str!` 闭包(零第二份清单)
+
+`build.rs` 不另立"要编哪些 `.cu`"的清单 —— 它**扫描** `src/**/*.rs` 里所有
+`include_str!("…/*.cu")`,解析成真实路径去重。命中的正是
+
+- `KernelSpec::SOURCE`(R5 就地 `include_str!`,64 张表),以及
+- `list.rs::REGISTRY` 经 `sources.rs` 引的源。
+
+⇒ **新增算子 = 加表(自带 `include_str!`)⇒ 构建期自动纳入**。物理上不可能出现
+"加了表但忘了编"(E3/E15 类"两处对不上"在构建面也堵死)。实测闭包 = **19 个文件**:
+
+| 域 | 文件 |
+|---|---|
+| `cu/attention/` | `pagedattention_f16` / `prefill_paged_attn_f16` / `prefill_split_f16` / `reshape_and_cache` / `reshape_and_cache_fp8kv` |
+| `cu/owl/` | `argmax_f16` / `attention` / `cast` / `concat` / `dflash2` / `embed_f32` / `fused` / `gdn` / `gemv_dual_f16` / `ops_pair` / `rope_f32` / `sigmoid_gate_mul_f16` / `ts_probe` |
+| `cu/marlin/` | `marlin_repack_ct`(native 通道;**不是** `marlin_host`/`vllm_marlin/*` 那些 `.a` 设备码) |
+
+家族自管源(`cu/xqa/**`、`cu/flashinfer/**`、`cu/gdn/**`、`cu/marlin/vllm_marlin/**`)
+不在闭包内 ⇒ 天然排除,无需排除表。
+
+#### 15.5.2 新发现:`__CUDACC_RTC__` 方言 —— cubin 预编**不是**免费的
+
+19 个源里 **16 个 nvcc 直编即过**;3 个不行,暴露出 NVRTC 与 nvcc 的**语义差**:
+
+| 文件 | nvcc 报错 | 根因 | 修法(双载体可编) |
+|---|---|---|---|
+| `attention/pagedattention_f16.cu`、`attention/prefill_paged_attn_f16.cu` | `a __global__ function call must be configured`(11 / 9 处) | 文件按 NVRTC 习惯写:**`extern "C" __global__` 入口直接当函数调用内层 `__global__` 模板**(全文件零 `<<<>>>`)。NVRTC 无宿主编译 ⇒ 一切皆 device 语义,合法;nvcc 走真宿主/设备双通道 ⇒ 未配置的 `__global__` 调用是硬错 | 内层核限定符分臂:`__CUDACC_RTC__` → `__global__`(与旧文本逐字相同),否则 → `__device__`。**语义等价**:内层从不被 host 发射 |
+| 同上 + `owl/argmax_f16.cu` | `invalid redeclaration of type name "int64_t"` / `identifier "uint16_t" is undefined` | 文件自带 **mini-stdint `typedef`**(nvrtc 默认头集极简,`stdint.h` 不可开);nvcc 下真 `stdint.h` 已由 CUDA 头引入 ⇒ 撞重声明(或反向缺失) | `#ifdef __CUDACC_RTC__` 圈住 `typedef` 块;`#else` 加 `#include <stdint.h>` |
+
+**两条纪律(本次固化)**:
+
+1. **新建 `.cu` 必须双载体可编**(`nvcc -fatbin` 是构建期硬门之一);
+   NVRTC 方言(`__global__` 当函数调、mini-stdint 序言)一律进
+   `#ifdef __CUDACC_RTC__` 分臂 —— 否则该文件进不了资产表 = `native_aot=require` 下拒启。
+2. 三处改动在 `__CUDACC_RTC__` 分支下产生的**预处理文本与改动前逐字相同**
+   ⇒ NVRTC 路径行为零变化(A/B 已由 e2e 对照复核)。
+
+#### 15.5.3 资产登记表(生成的 Rust 文件,不手改)
+
+`build.rs` → `$OUT_DIR/cubin_assets.rs` → `kernels::family::cubins`(`include!` 进来):
+
+```text
+CUBIN_ARCHS : &[&str]                       // 构建期 OWL_CUBIN_ARCHS 解析结果
+CUBIN_ASSETS: &[CubinAsset { asset, src, src_hash, src_len, bytes }]
+```
+
+- **查表键 = 源文本哈希**(FNV-1a 64)+ **源长度**(双判据)⇒ 查的是**内容**不是名字,
+  与 `KernelSpec::SOURCE` 天然一一对应(不存在第二份名字→资产映射);
+- 每个资产另带 `src: include_str!(绝对路径)` —— 反查/自洽锁/诊断用;
+- **哈希算法两处一份**(build.rs 与 Rust 侧)**不自证**:由
+  `cubins::tests::generated_hashes_match_rust_hash_fn` 对全部资产回算锁死(漂移一处即红);
+- 该模块门 = `feature = "device"`(models 侧零成本);
+- `OWL_CUBIN_SKIP=1` ⇒ 写空表(纯 NVRTC 基线),同一文件形态免分支。
+
+#### 15.5.4 装载面:kernels 侧零改动,执行面一处收口
+
+| 层 | 变化 |
+|---|---|
+| `family/cubins.rs`(**新**) | 资产表 + `asset_of_source` / `has_aot` / `coverage()` + 3 个静态门测试 |
+| `owl-cuda::state::KernelCache` | `ensure_kernel(name, source)`:**先查资产**(命中 ⇒ 载 fatbin 模块 + `load_function`),未命中按载体档处理。附带收益:**模块按 `.cu` 共享**(旧路径是**每核一个模块**,逐核 nvrtc + 重复装载) |
+| `owl-cuda::state::GpuCtx::new` | **装配期架构门**(设备 sm ∉ `CUBIN_ARCHS` ⇒ 拒启)+ **AOT 覆盖率报告/硬门** |
+| `shared::config` | 新键 `cuda.native_aot` = `require`(**缺省**)/ `prefer` / `off` |
+
+**缺省 = `require`**(不是 `prefer`):"零运行期编译"是律不是优化;覆盖率已实测
+110/110 且有测试锁(`registry_coverage_is_total`),故缺省在门内。`prefer`/`off`
+是刻意留的诊断出口(A/B 对照)。
+
+#### 15.5.5 验收(全部实测)
+
+| 判据 | 结果 |
+|---|---|
+| 构建期编出资产 | **19 个 `.cu` → 19 个 fatbin**(sm_86) |
+| 登记表覆盖 | **110/110**(boot 报告 `[aot] … 登记表覆盖 110/110`) |
+| 已建表算子源全命中 | 64 张表全绿(`every_declared_op_source_has_asset`) |
+| 哈希自洽 | 19/19 逐资产回算一致(`generated_hashes_match_rust_hash_fn`) |
+| **零运行期编译** | 整轮 e2e 真机跑完 **`grep -c aot-miss` = 0** |
+| **数值等价**(逐位) | `cubin_launch_probe` 6/6 绿:smem 归约 `owl_rmsnorm_f16`(8192 元素 × 两 w_off 臂)/ 平局语义 `owl_argmax_f32idx_f16` / **分区注意力链** `v2_f16_hd256bs32 + reduce`(2048 元素)—— nvrtc vs fatbin **逐位一致** |
+| 回归 | kernels lib 58(全 feature)/ 55(device)/ 50(默认)· models 117 · engine 22 · shared 27 · op_tables 7 · oracles 8 · 白名单 2 —— 全绿;clippy 两档 0 警 |
+| 既有缺陷(与本役无关) | `apps/server` e2e 的「算术 2+2」用例仍返回上一 session 答案(**A/B 实证:`native_aot=off` 旧路径同样复现** ⇒ 非本役引入,挂账未修) |
+
+#### 15.5.6 收益(冷 `~/.nv/ComputeCache` 三次采样)
+
+| 载体档 | boot→health | 首次对话(首用核编译) | **到首答** |
+|---|---|---|---|
+| `off`(NVRTC + 驱动 JIT) | 32.2 / 33.4 / 34.4 s | 38.6 / 38.7 / 39.1 s | **≈ 71–74 s** |
+| `require`(构建期 cubin) | 27.2 / 28.1 / 28.4 s | **0.4 / 0.4 / 0.4 s** | **≈ 28 s** |
+
+⇒ **到首答省 ≈ 43 s(−60%)**;NVRTC 那 ~39 s 是"首用某核才编译"的尾巴
+(实测:同一进程第二次请求即 0.4 s,故它只在**每个新核首次发射**时付)。
+附带一条:该路径此前**依赖驱动 ComputeCache**(本机 `~/.nv/ComputeCache` 已 770 MB)
+才在重启后免于重付 —— cubin 路线**与该缓存彻底解耦**。
+
+#### 15.5.7 剩余(下一步)
+
+- **C3**:marlin/xqa/FI 三个 `.a` 家族 —— 设备码改 cubin、C host 编排搬 Rust(删 `.a`);
+- **C4**:gdn 两家 —— `cu/gdn/gdn_chunk_scalar.cu` 已可纳入同一闭包(替换
+  `assets/gdn_scalar/*.cubin`);gdn_chunked(Triton 采集)源 vendor 进树后同办;
+- **C5**:删 `Linkage` 三态 / `sources.rs` / `list::REGISTRY`(C2 后它们只剩兜底职责);
+- `R1` 余 55 条未建表入口 **不需要**单独安排:只要它的 `.cu` 在 `include_str!` 闭包内,
+  资产已自动就位(建表是**准入声明**问题,与编译载体解耦)。
+
+---
+
+### 15.6 C2e —— **NVRTC 退役**(2026-10-13 收官;零运行期编译从"策略"变"结构")
+
+§15.5 把**生产 native 路径**搬到了 cubin,但有**三条运行期编译调用点被绕过**
+(它们走 `kernels::device::Exec::load_nvrtc`,不经过 server 的 `KernelCache`,
+所以 `native_aot` 门管不到)。本节把它们一并收口,并把"零运行期编译"变成
+**结构性判据**而不是自觉。
+
+#### 15.6.1 三条漏网调用点
+
+| 调用点 | 用途 | 处置 |
+|---|---|---|
+| `server/gdn_scalar.rs::assemble` | `owl_cast_f32_f16`(源 `cu/owl/cast.cu`) | → `Exec::load_aot`(源哈希查资产) |
+| `server/gdn_chunked.rs::assemble` | `owl_cast_{f16_bf16,bf16_f16,f16_f32}` + `owl_state_{kv_to_vk,vk_to_kv}` | → `Exec::load_aot` |
+| `server/selfcheck.rs::Runner::launch_nvrtc` | 装配期 oracle 的 native 发射 | 改名 `launch_aot`,`CheckRunner` trait 同步改名(3 个 oracle 调用点) |
+
+#### 15.6.2 删掉的东西(不留双路径)
+
+| 删除 | 位置 |
+|---|---|
+| `Exec::load_nvrtc` + `nvrtc: HashMap<…CudaModule>` + `nvrtc_include` 字段 | `kernels/src/device.rs` |
+| `KernelCache::ensure_kernel_nvrtc` + `compile_ptx_with_opts/CompileOptions` 导入 | `owl-cuda/src/state.rs` |
+| `pub mod nvrtc { compile_ptx_with_opts, CompileOptions }` re-export | `owl-cuda/src/ffi.rs` |
+| 配置键 `cuda.nvrtc_include` / `cuda.native_aot`(+ `NativeAot` 枚举) | `shared/src/config.rs`、`assets/owl.example.toml` |
+
+**为什么连 `native_aot` 档一起删**:`Require/Prefer/Off` 三档的存在本身就是
+"还留着 NVRTC"的意思。裁定"零运行期编译"之后,留一个 `off` 档 = 留一条
+生产可走的旧路径(设计纪律:定谳后固化其一,不留双路径)。A/B 数据已录
+§15.5.6,历史可回查,路径不再留。
+
+> `cudarc` 的 `nvrtc` feature **保留**:它提供 `Ptx::from_binary`(纯数据
+> 类型,`load_module` 的入参);保留 ≠ 允许编译,由下节的门机器执行。
+
+#### 15.6.3 新结构性门:`tests/no_runtime_compile.rs`
+
+运行期断言只能证明"本轮没编译";证明不了"代码里没有编译入口"。本门扫描
+源码:
+
+- **范围** = `crates/**/src/**` + `apps/**/src/**`(跳过 `tests/`、`examples/`);
+- **禁词** = `compile_ptx*` / `nvrtcCompileProgram` / `CompileOptions` /
+  `nvrtcCreateProgram` / `nvrtcGetCUBIN` / `nvrtcGetPTX`;
+- **白名单** = 含 `Ptx::from_binary` 的行(纯数据包装);
+- **自证** = `banned_matcher_is_sensitive` 用正/负样例锁判据本身(防"扫描器坏了 ⇒ 永远绿")。
+
+门的**首次运行就抓到了 §15.6.2 表里最后两行**(`state.rs` 与 `ffi.rs`),说明它是活的。
+
+#### 15.6.4 顺带修掉的真实缺陷:同 tag 多 cubin 的模块撞车
+
+`Exec` 原按 `load_cubin(asset="gdn_chunked", bytes, symbol)` 的 **tag** 做模块缓存
+—— 而 `gdn_chunked` 一族**六个 Triton cubin 共用一个 tag** ⇒ 后五个 cubin 全拿到
+第一个的模块。实测症状(真机 boot):
+
+```text
+[kernels] ❌ 算子注册表装配失败(拒启): asset gdn_chunked_delta_rule_fwd:
+          符号 chunk_scaled_dot_kkt_fwd_kernel 不在 gdn_chunked
+          (DriverError(CUDA_ERROR_NOT_FOUND, "named symbol not found"))
+```
+
+修法:**块身份 = (tag, 字节首址, 长度)**(`BlobKey`)—— AOT 资产(`include_bytes!`)
+与自管 cubin(static 表项)各自唯一,同名不同块物理上不可能撞。函数缓存键
+一并改用 `(BlobKey, symbol)`(否则同名符号会静默取到别的块里的函数)。
+
+**这条缺陷的价值在"它被哪一层拦住"**:不是错数值,而是**装配期拒启 +
+指名道姓**(`Linkage::AotCubin` 的符号逐一校验门)。这正是 P4/P5 那套门要拦的
+东西 —— 本役新增的"模块共享"优化若要出错,也只会往这个方向出。
+
+#### 15.6.5 门的负例验证(真机)
+
+| 构造 | 期望 | 实测 |
+|---|---|---|
+| `OWL_CUBIN_SKIP=1` 构建(空资产表) | 拒启、报缺哪些 | ✅ `server_exit=1`,`零运行期编译硬门:110 个登记表核无构建期 cubin 资产 …前几个: ["owl_add_f32", …]` |
+| `OWL_CUBIN_ARCHS=sm_89` 构建,跑在 sm_86 卡 | 架构门拒启 | ✅ `装配期架构门:设备 sm_86(ordinal 1)不在构建期 cubin 代际集 ["sm_89"] 内 —— 重建时请加 OWL_CUBIN_ARCHS=...,sm_86` |
+| 顺带修:`OWL_CUBIN_SKIP` 的 `rerun-if-env-changed` 必须在**两条分支之外**发 | 改 env 必触发重跑 | ✅(踩坑记录:指令只在 build.rs 真跑过那次才被 cargo 记住) |
+
+#### 15.6.6 验收(全部实测)
+
+| 判据 | 结果 |
+|---|---|
+| 生产路径零编译调用 | `no_runtime_compile` 2/2 绿(含判据自证) |
+| 真机 boot + 首答 | `[aot] 覆盖 110/110`、`aot-miss` = **0**、boot 29–31 s、首答 0.4 s |
+| 装配期自检 | 5 个 oracle 全绿(走新 `launch_aot` 面):`1.953e-3` / `64000` / `3.065e-4` / `3.904e-3` / `7.507e-3` |
+| GDN 两家(改道后的 CAST + 六 cubin) | `gdn_scalar_golden` 1/1、`gdn_chunked_golden` 1/1 绿 |
+| 其余回归 | kernels lib 58/58 · op_tables 7 · oracles 8 · cublas 隔离 1 · cubin 探针 6 · models 117 · engine 22 · shared 27 · 白名单 2 —— 全绿 |
+| clippy | `--workspace --all-targets` 与全 feature 两档 **0 警** |
+
+#### 15.6.7 剩余(下一步)
+
+- **C3**:marlin / xqa / flashinfer 三个 `.a` 家族 —— 设备码改 cubin、C host 编排搬 Rust
+  (删 `prebuilt/*.a`)。**注意 FI 还带一个树外依赖**(`owl_fi_attention.cu` 头
+  vendor 自 `~/.cudaforge/git/checkouts/flashinfer-*`),不满足 §15.1.1 的
+  "源必须在树",要先 vendor 头;
+- **C4**:`cu/gdn/gdn_chunk_scalar.cu` 纳进同一 `include_str!` 闭包(替换
+  `assets/gdn_scalar/*.cubin` 与 `Linkage::AotCubin` 的最后残余);
+  gdn_chunked 的 Triton 源 vendor 进树后同办;
+- **C5**:删 `Linkage` 三态 / `sources.rs` / `list::REGISTRY`。
+
+---
+
+### 15.7 C4a —— `gdn_scalar` 归入统一资产面(2026-10-13;入库 cubin blob 清零)
+
+`gdn_scalar` 是 §15.1 R4 时代"**预编 cubin 入库 + `include_bytes!` + 自管清单**"
+的最后一个活样本(`assets/gdn_scalar/{chunk_scalar_f32.cubin, build.sh, manifest.toml}`)。
+它的源本来就在树(`cu/gdn/gdn_chunk_scalar.cu`),只是没被 `include_str!` 引用 ⇒
+不在 §15.5.1 的闭包内 ⇒ 也就没有构建期资产。
+
+| 动作 | 内容 |
+|---|---|
+| **源自托管** | `family/gdn_scalar.rs`:`cubin` 模块 → **`asset`** 模块,`SOURCE = include_str!("../../cu/gdn/gdn_chunk_scalar.cu")`(就地,§R5 律) |
+| **闭包自动纳入** | 源被 `include_str!` 引用 ⇒ `build.rs` 扫到 ⇒ 编 fatbin ⇒ 进资产登记表(资产数 **19 → 20**) |
+| **装载改道** | `server/gdn_scalar.rs`:`exec.load_cubin(…bytes…)` → `exec.load_aot(res, asset::SOURCE, asset::KERNEL_F32, OP)` |
+| **删资产** | `crates/kernels/assets/gdn_scalar/` 整目录删除(cubin blob + build.sh + manifest)—— 一处机制,不留自管资产 |
+| 测试面 | `gdn_scalar_golden` / `gdn_big_t_arms_parity` 改取 `asset::bytes()`(资产表反查,不再读 blob) |
+
+**验收**:`gdn_scalar_golden` 1/1 绿;真机把控制臂打开
+(`dispatch.gdn_scalar=true / gdn_chunked=false`)boot + 首答成功(aot 覆盖 110/110、
+资产 20、零 `aot-miss`)⇒ `assemble` 里 cast 与主核都走了资产表。
+
+> **顺带印证白名单硬门**:同一次尝试(未放开 `allowed_ops`)被拦在 boot:
+> `[算子准入] contract owl_cast_f16_f32: allowed_ops 期望 ∈ 本档白名单(44 项) 实得 未列入`。
+> 控制臂要用的算子在**生产白名单**里没有 ⇒ 拒启 —— 这正是 P4 那道门的设计意图
+> (生产档只允许它声明过的算子集)。
+
+> **顺带暴露的一条资产纪律问题**:`crates/kernels/assets/` 整个目录是
+> **gitignore**(`crates/kernels/.gitignore:1`)—— 也就是说旧的"cubin 入库"其实
+> **没进 git**:fresh clone 里这些二进制不存在,装载会在运行期失败,得有人记得手工
+> 跑一次 `build.sh`。新的方案把资产变成**构建产物**(源在树 ⇒ `cargo build` 即产),
+> clone 即可复现 —— 这比"跑得快"更要紧的一层:R4 时代的资产面**不可复现**。
+
+**剩余(C4b)**:`gdn_chunked` 的六个 Triton cubin(`assets/gdn_chunked*/`)仍走
+`load_cubin` 老路 —— 要归入统一面必须先把它**源 vendor 进树**(Triton `.py` +
+采集脚本,§15.1.1 律 1"所有族的源必须在树")并给出构建期编译路径(需 triton/torch
+开发期依赖)。另:`Linkage` 三态已确认**零消费者**(只有 `FamilyGuard` 直通),
+C5 可整块删。
+
+---
+
+### 15.8 C3a —— XQA:`.a` → 构建期 cubin + **Rust host 发射器**(2026-10-13)
+
+三个 `.a` 家族里最小的一支(host 发射器 ~40 行)。**1.5 MB 二进制 + 223 行 C 出局**,
+换成 2 个构建期 fatbin(551 KB / 518 KB)+ 一个 Rust 发射器。
+
+#### 15.8.1 上游自带的出口:`-DGENERATE_CUBIN`
+
+`mha.h` 里本来就有:
+```cpp
+#ifdef GENERATE_CUBIN
+#define CUBIN_EXPORT extern "C"      // 上游的"只出设备码"模式
+#else
+#define CUBIN_EXPORT static
+#endif
+```
+⇒ 用它编译,`kernel_mha` 落成 **STB_GLOBAL STO_ENTRY**(可直接 `cuModuleGetFunction`)。
+**不定义它则一切符号被内部化**(实测 `STB_LOCAL`),driver 按名取不到。
+
+**owl 本地 port 两处**(都写进 `mha.cu` 的 `#ifndef GENERATE_CUBIN` 注记):
+1. owl 加的 host 发射器段(`configureKernel` + `launchMHAFlashInfer`)原本**没**被
+   `GENERATE_CUBIN` 排除 ⇒ 该模式下 `utils.h` 的 `checkCuda` / `hostUtils.h` 的
+   `makeLaunchConfig` 已被条件排除 ⇒ 未定义标识符。**补上 `#ifndef GENERATE_CUBIN`**;
+2. 见 15.8.2。
+
+#### 15.8.2 关键设计:**资产自描述**(编译期常量不复制到 Rust)
+
+单 TU `-cubin` 会把**设备变量内部化**:实测 `smemSize`(以及 `__device__` /
+`__constant__` 全局,加 `__attribute__((visibility("default")))` 也一样)全部落
+`STB_LOCAL` ⇒ `cuModuleGetGlobal` 取不到。而 host 发射器需要这些**编译期常量**:
+dynamic smem 尺寸、`ctaTile`、`headGrpSize`、`rowsPerBlock`、`tokensPerPage`、
+`validElemsPerHead`、`allowMultiBlock`、cta 形状、`sizeof(KVCacheList<true>)`。
+
+⇒ 内核侧发一个 1 线程探针核 `owl_xqa_launch_consts(uint32_t* out)` 把常量写进缓冲;
+Rust 侧**装配期发一次 + 44 B D2H**(~50 µs,一次性)。
+
+**为什么值得**:替代方案是"Rust 复刻 C++ 的 constexpr 推导"—— 那正是本项目反复
+打击的"两处对不上"(改一处编译选项,Rust 常量静默失配 ⇒ 错几何 ⇒ 错值/越界)。
+自描述让**单一真源**留在 `mha.cu`,且带一道**布局硬门**:第 12 槽 =
+`sizeof(KVCacheList<true>)`,与 Rust 镜像 `size_of` 比对,不等即**装配期拒启**。
+
+#### 15.8.3 契约面新增:`LaunchVal::Blob`(by-value 结构体参数)
+
+`kernel_mha` 有一个 **40 字节 by-value 结构体**参数(`KVCacheList<true>`)。
+
+**踩坑(实测 `CUDA_ERROR_MISALIGNED_ADDRESS`)**:先按"CUDA 参数区紧密排布"把结构体
+拆成 **5 个 `U64` 槽** —— **错的**。`cuLaunchKernel` 的 `kernelParams` 是
+"**每参数一个指针**",驱动按内核元数据里的 `paramSize`(实测 `EIATTR_KPARAM_INFO`
+= ordinal 10 / offset 0x48 / size **0x28**)从该指针拷 40 字节 ⇒ 从第一个 u64 的地址
+拷 40 字节 = 读到邻居栈。
+
+**正解**:`LaunchVal::Blob { len, bytes: [u8; 64] }`(内联镜像,**值随 `LaunchVal`
+owned**,压槽时取地址天然安全,无悬垂),`launch_vals` 对结构体只压**一个指针**。
+镜像由调用方 `#[repr(C)]` + `const` size 断言保证,并可经 15.8.2 的自描述**机器锁死**。
+
+顺带:原 `Exec::launch` 的压槽循环提为 `device::launch_vals`(**唯一映射点**)——
+生产与探针共用,"测试绿 ⇒ 生产绿"。
+
+#### 15.8.4 另一条实测坑:探针槽数
+
+`CONSTS_SLOTS` 从 11 涨到 12 时,内核侧探针核**忘了同步** ⇒ 尾三槽读到全零
+(`tokens_per_page=0` ⇒ `maxNbPagesPerSeq` 爆表、`valid_elems_per_head=0` ⇒ stride
+不换算)⇒ 同样是 `MISALIGNED_ADDRESS`。**教训**:探针核与 host 的槽数是**一份契约的
+两半**,`XqaConsts::from_slots` 的长度门只拦"太短",拦不了"内核少写"(零值合法)。
+⇒ 缓解:数值探针(`xqa_verify/decode_probe`)是最终判据,而它确实抓到了。
+
+#### 15.8.5 构建期增量闸(顺手修的开发回路问题)
+
+`build.rs` 的 rerun 面含 `src/**/*.rs`(源清单 = `include_str!` 闭包)⇒ **改任何一个
+Rust 文件都会重跑 build.rs**。没有闸的话每次 Rust 编辑要把 20 个 `.cu` + `mha.cu`×2
+重编一遍。
+
+⇒ `compile_fatbin` 带**指纹增量闸**(源 mtime+长度 + 架构集 + 编译选项 → `.stamp`);
+指纹一致即跳过 nvcc。实测:**touch 一个 .rs 后整轮构建 0.5 s**(全增量命中,
+零 nvcc;日志显式打"(全增量命中,零 nvcc)");**改 `mha.cu` 后 = 19.6 s**
+(只重编两个 xqa fatbin,20 个 native 源仍增量命中)。
+
+#### 15.8.6 验收(全部实测)
+
+| 判据 | 结果 |
+|---|---|
+| `xqa_verify_probe`(数值 + 速度) | **PASS**:ctx8192 XQA **0.505 ms** vs v2 2.673 ms = **5.29×**;`max\|XQA−host\|` **4.51e-4**(历史 0.495ms / 5.40× / 4.5e-4 —— 一致) |
+| `xqa_decode_probe`(两实例化 A/B) | **PASS**:ctx8192 decode 实例化 **0.286 ms** vs v2 0.421 = **1.47×**(历史 1.46×) |
+| 资产自描述 | `verify: smem=83584 ctaTile=(256,32) rowsPerBlock=32` / `decode: smem=67200 ctaTile=(256,16) rowsPerBlock=16`;**`sizeof(KVCacheList)=40` = Rust 镜像** ✓ |
+| **真机生产档**(`spec-dflash`:`verify_xqa=true` + `decode_xqa=true`,白名单含两臂) | boot 30.4 s + 首答 **0.4 s** 成功;`[aot] 110/110`、`aot-miss`=**0** ⇒ XQA 两臂在**真实图里**走的就是新发射器 |
+| 回归 | kernels lib 58 · no_runtime_compile 2 · op_tables 7 · oracles 8 · cubin 探针 6 · models 117 · engine 22 · shared 27 · 白名单 2 —— 全绿;clippy `--workspace --all-targets` 与全 feature **0 警** |
+| 出局资产 | `prebuilt/libowl_xqa{,_decode}.a`(1.5 MB,git 内)+ `owl_xqa_launch.cu` + `xqa_wrapper.cu`(死文件:引用不存在的 `../tvm_ffi_utils.h`) |
+
+#### 15.8.7 剩余
+
+- **C3b marlin**(19 MB `.a`):4 个 sm80 设备码 → cubin;`marlin_host.cu`(514 行
+  exec-config/occupancy 启发式)搬 Rust —— 需 `cuOccupancyMaxActiveBlocksPerMultiprocessor`
+  等 driver 能力,**三者中最重**;
+- **C3c flashinfer**(8.2 MB `.a`):还差**树外头 vendor**(`owl_fi_attention.cu` 的头
+  来自 `~/.cudaforge/git/checkouts/flashinfer-*`,不满足 §15.1.1"源必须在树");
+- **C4b gdn_chunked**:13 个 Triton cubin(仍 `load_cubin` 老路)→ 需 vendor Triton
+  源 + 构建期 triton 编译路径;
+- **C5**:`Linkage` 三态(已确认零消费者)/ `sources.rs` / `list::REGISTRY`。

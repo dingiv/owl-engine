@@ -36,11 +36,26 @@
 #include <cuda_fp16.h>
 
 // ---- nvrtc 序言(mini-stdint + 常量 + 宏;与 pagedattention_f16.cu 同款)----
+// 双载体(2026-10-13 cubin 预编):仅 NVRTC 需自备 stdint;nvcc 下真
+// stdint.h 已由 CUDA 头引入,自备会撞重声明 ⇒ 分臂。
+#ifdef __CUDACC_RTC__
 typedef int int32_t;
 typedef unsigned int uint32_t;
 typedef unsigned short uint16_t;
 typedef long long int64_t;
 typedef unsigned long long uint64_t;
+#else
+#include <stdint.h>
+#endif
+
+// 内层核限定符:NVRTC 下 `__global__` 可直接当函数调;nvcc 下未配置的
+// `__global__` 调用是硬错 ⇒ 内层核(从不由 host 发射)取 `__device__`。
+// 同 pagedattention_f16.cu 头注。
+#ifdef __CUDACC_RTC__
+#define OWL_INNER_KERNEL __global__
+#else
+#define OWL_INNER_KERNEL __device__
+#endif
 #ifndef INFINITY
 #define INFINITY (__int_as_float(0x7f800000))
 #endif
@@ -896,7 +911,7 @@ inline __device__ float fast_tanh_opt(float x) {
 using namespace vllm;
 
 template<int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_CHUNK_SIZE, bool KV_FP8 = false, bool KNHD = false>
-__global__ void chunked_prefill_paged_attention_opt_f16(
+OWL_INNER_KERNEL void chunked_prefill_paged_attention_opt_f16(
     uint16_t* __restrict__ out,              
     const uint16_t* __restrict__ q,          
     const uint16_t* __restrict__ k_cache,     

@@ -19,13 +19,16 @@
 // ============================================================================
 #include <cuda_fp16.h>
 
-// nvrtc 极简头集需自备 typedef(同 prefill_split_f16.cu 契约)
+// nvrtc 极简头集需自备 typedef(同 prefill_split_f16.cu 契约;双载体
+// 2026-10-13:仅 NVRTC 自备 —— nvcc 下自备会撞重声明/头集差异)
 #ifdef __CUDACC_RTC__
 typedef int int32_t;
 typedef unsigned int uint32_t;
 typedef unsigned short uint16_t;
 typedef long long int64_t;
 typedef unsigned long long uint64_t;
+#else
+#include <stdint.h>
 #endif
 
 constexpr int ARGMAX_BLOCK = 256;

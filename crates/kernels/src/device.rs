@@ -4,13 +4,18 @@
 //! 切分判据(operator-contract 设计 v0.4 §4.4)= **状态 vs 机械**:
 //! - 状态留 server:块表/账本(A5.2)、捕获状态机与图治理(A1.6/A1.7)、
 //!   三流模型 —— DeviceRes 五方法即全部,server 侧再无执行代码;
-//! - 机械下沉 kernels:nvrtc 编译缓存、cubin 模块表、launch 组装、
+//! 机械下沉 kernels:资产(cubin)模块表、launch 组装、
 //!   捕获窗守卫与登记的机械部分、staging 不变盒、体检核发射。
+//!
+//! **零运行期编译**(2026-10-13 裁决,NVRTC 已退役):设备码一律构建期
+//! `build.rs` cubin 资产([`Exec::load_aot`] 是唯一装载入口);源不在
+//! `include_str!` 闭包内 = 装载即拒(旧 `load_nvrtc` 已删,勿复活)。
 //!
 //! P3 无例外:资源获取/状态读取/副作用一律 `Result`;裸返回仅限纯且全
 //! 函数。零 `()`、零 log-and-continue、零 ack 侧信道。
 //!
-//! feature = "device"(cudarc driver/nvrtc;独立于已退役的 cuda_ops 预编链)。
+//! feature = "device"(cudarc driver/nvrtc;独立于已退役的 cuda_ops 预编链;
+//! `nvrtc` feature 仅提供 `Ptx::from_binary` 数据类型包装,零编译)。
 
 use crate::contract::{FieldStats, InvariantBox, Law, OpError, OpId, Stage};
 /// 发射参数值(权威定义在 [`crate::contract`] —— 自检面(零 feature 门)也要用它)
@@ -129,24 +134,151 @@ pub enum FunctionKey {
     // 句柄/workspace 预钉 —— ensure_blas / marlin workspace / FI plan ws。
 }
 
+/// 设备码块身份(**缓存键的唯一真源**)。
+///
+/// 为什么不能只用"资产名":`gdn_chunked` 一族**六个 Triton cubin 共用一个
+/// tag**,按 tag 做模块缓存会让后五个 cubin 静默拿到第一个的模块
+/// (实测踩坑:装配期报 `named symbol not found`)。
+/// 键 = (tag, 字节块首址, 长度):AOT 资产(`include_bytes!` 静态)与自管
+/// cubin(`static` 表项)各自唯一 ⇒ 同名不同块物理上不可能撞。
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct BlobKey {
+    tag: &'static str,
+    ptr: usize,
+    len: usize,
+}
+
+impl BlobKey {
+    fn of(tag: &'static str, bytes: &[u8]) -> Self {
+        Self { tag, ptr: bytes.as_ptr() as usize, len: bytes.len() }
+    }
+}
+
+/// **值表发射(唯一映射点)**:`LaunchVal` 表 → cudarc 参数槽 → 发射。
+///
+/// 为什么提出来:`Exec::launch`(生产路径)与测试探针(直用 cudarc)必须
+/// **逐位同构**地压槽,否则"测试绿 ≠ 生产绿"。指针参数以 u64 位型直入 8 字节槽
+/// (与 handler `&u64` 同 ABI);`arg()` 不可败(参数空间按值拷贝),失败面收敛
+/// 在一处。生命周期一律取同一个 `'a`(`LaunchArgs` 对其类型参数**不变**,
+/// 拆两个生命周期无法统一 —— 首试教训)。
+///
+/// **by-value 结构体参数**走 [`LaunchVal::Blob`]:驱动按内核参数元数据里的
+/// `paramSize` 从**一个指针**拷字节 ⇒ 必须给完整镜像的地址(拆成多个槽是错的,
+/// 见 `LaunchVal::Blob` 注)。镜像布局由调用方 `#[repr(C)]` + size 断言保证,
+/// 并可经"资产自描述"回报的 `sizeof` 机器锁死(XQA `KVCacheList` 即此)。
+pub fn launch_vals<'a>(
+    stream: &'a Arc<CudaStream>,
+    f: &'a CudaFunction,
+    grid: (u32, u32, u32),
+    block: (u32, u32, u32),
+    shared_mem: u32,
+    vals: &'a [LaunchVal],
+) -> Result<(), cudarc::driver::DriverError> {
+    use cudarc::driver::PushKernelArg;
+    let mut b = stream.launch_builder(f);
+    for v in vals {
+        match v {
+            LaunchVal::Ptr(p) => {
+                b.arg(p);
+            }
+            LaunchVal::U64(x) => {
+                b.arg(x);
+            }
+            LaunchVal::U32(x) => {
+                b.arg(x);
+            }
+            LaunchVal::I32(x) => {
+                b.arg(x);
+            }
+            LaunchVal::F32(x) => {
+                b.arg(x);
+            }
+            // 结构体镜像:取内联数组首字节地址(驱动按 paramSize 拷 len 字节);
+            // 数组随 `vals` 切片存活 ⇒ 指针在 launch 期间有效
+            LaunchVal::Blob { len, bytes } => {
+                debug_assert!(*len as usize <= bytes.len());
+                b.arg(&bytes[0]);
+            }
+        }
+    }
+    // SAFETY: 槽序与宽度由调用方按算子契约给(表驱动;L3 哨兵已查)
+    unsafe {
+        b.launch(cudarc::driver::LaunchConfig {
+            grid_dim: grid,
+            block_dim: block,
+            shared_mem_bytes: shared_mem,
+        })
+    }
+    .map(|_| ())
+}
+
 /// 执行引擎:kernels 实现;全部机械,吃资源面干活。
-/// 私有态:nvrtc 编译缓存 / cubin 模块表 / staging 盒池(家族接入时填充)。
+/// 私有态:设备码块 → 模块表 / 函数缓存。
 #[derive(Default)]
 pub struct Exec {
-    /// 函数缓存:(来源标签, 符号名) → 函数(cubin 与 nvrtc 同表)
-    fns: HashMap<(&'static str, &'static str), Arc<CudaFunction>>,
-    /// nvrtc 编译缓存(源码标签 → PTX 模块;编译一次全符号共享)
-    nvrtc: HashMap<&'static str, Arc<cudarc::driver::CudaModule>>,
-    /// nvrtc include 路径(缺省 /usr/local/cuda/include)
-    nvrtc_include: Vec<String>,
+    /// 函数缓存:(块身份, 符号) → 函数
+    fns: HashMap<(BlobKey, &'static str), Arc<CudaFunction>>,
+    /// 模块表:块身份 → 已载模块(同一 `.cu`/同一 cubin 的多核共享)
+    modules: HashMap<BlobKey, Arc<cudarc::driver::CudaModule>>,
 }
 
 impl Exec {
     pub fn new() -> Self {
-        Self { nvrtc_include: vec!["/usr/local/cuda/include".to_string()], ..Default::default() }
+        Self::default()
     }
 
-    /// AOT cubin 装载(缓存键 = (资产标签, 符号);重复请求查表直回)
+    /// **构建期资产装载**(native 核唯一路径;源哈希查表 → fatbin → 符号)。
+    ///
+    /// 查表键 = **源文本**(不是名字):与 `KernelSpec::SOURCE` 一一对应,
+    /// 不存在第二份名字→资产映射(设计 §15.5.3)。模块按资产共享 —— 同一
+    /// `.cu` 的多个核只载一次。
+    ///
+    /// 未命中 = `OpError::Asset`(**不是**降级到运行期编译:自 2026-10-13
+    /// 裁决起 NVRTC 已退役,本函数是唯一的设备码装载入口)。
+    pub fn load_aot(
+        &mut self,
+        res: &mut dyn DeviceRes,
+        source: &str,
+        symbol: &'static str,
+        op: OpId,
+    ) -> Result<Arc<CudaFunction>, OpError> {
+        let asset = crate::family::cubins::asset_of_source(source).ok_or_else(|| OpError::Asset {
+            op: op.0.to_string(),
+            detail: format!(
+                "symbol {symbol}: 源({} B)无构建期 cubin 资产 —— 不在 build.rs 的 include_str! 闭包内\
+                 (零运行期编译硬门:NVRTC 已退役,见设计 §15.3/§15.5)",
+                source.len()
+            ),
+        })?;
+        let key = BlobKey::of(asset.asset, asset.bytes);
+        if let Some(f) = self.fns.get(&(key, symbol)) {
+            return Ok(f.clone());
+        }
+        let module = match self.modules.get(&key) {
+            Some(m) => m.clone(),
+            None => {
+                let ctx = res.context()?;
+                let m = ctx
+                    .load_module(cudarc::nvrtc::Ptx::from_binary(asset.bytes.to_vec()))
+                    .map_err(|e| OpError::Asset {
+                        op: op.0.to_string(),
+                        detail: format!("asset {}: {e:?}", asset.asset),
+                    })?;
+                self.modules.insert(key, m.clone());
+                m
+            }
+        };
+        let f = module.load_function(symbol).map_err(|e| OpError::Asset {
+            op: op.0.to_string(),
+            detail: format!("符号 {symbol} 不在资产 {}({e:?})——资产/代码代际失配", asset.asset),
+        })?;
+        let f = Arc::new(f);
+        self.fns.insert((key, symbol), f.clone());
+        Ok(f)
+    }
+
+    /// 裸 cubin 装载(旧族自管资产路径;`gdn_scalar` 先例)。
+    /// 新族一律走 [`load_aot`](Self::load_aot)(资产登记表统一面)。
     pub fn load_cubin(
         &mut self,
         res: &mut dyn DeviceRes,
@@ -155,55 +287,28 @@ impl Exec {
         symbol: &'static str,
         op: OpId,
     ) -> Result<Arc<CudaFunction>, OpError> {
-        if let Some(f) = self.fns.get(&(asset, symbol)) {
+        // ⚠️ 块身份含字节首址:同 tag 的多份 cubin(如 gdn_chunked 六核)必须
+        // 各自成模块,否则后续 cubin 的符号查不到(实测:装配期 named symbol not found)
+        let key = BlobKey::of(asset, bytes);
+        if let Some(f) = self.fns.get(&(key, symbol)) {
             return Ok(f.clone());
         }
-        let ctx = res.context()?;
-        let m = ctx
-            .load_module(cudarc::nvrtc::Ptx::from_binary(bytes.to_vec()))
-            .map_err(|e| OpError::Asset { op: op.0.to_string(), detail: format!("cubin {asset}: {e:?}") })?;
-        let f = m
+        let module = match self.modules.get(&key) {
+            Some(m) => m.clone(),
+            None => {
+                let ctx = res.context()?;
+                let m = ctx
+                    .load_module(cudarc::nvrtc::Ptx::from_binary(bytes.to_vec()))
+                    .map_err(|e| OpError::Asset { op: op.0.to_string(), detail: format!("cubin {asset}: {e:?}") })?;
+                self.modules.insert(key, m.clone());
+                m
+            }
+        };
+        let f = module
             .load_function(symbol)
             .map_err(|e| OpError::Asset { op: op.0.to_string(), detail: format!("符号 {symbol} 不在 {asset}({e:?})——资产/代码代际失配,manifest 门拦截") })?;
         let f = Arc::new(f);
-        self.fns.insert((asset, symbol), f.clone());
-        Ok(f)
-    }
-
-    /// NVRTC 源码装载(编译一次;符号查表直回)
-    pub fn load_nvrtc(
-        &mut self,
-        res: &mut dyn DeviceRes,
-        source_tag: &'static str,
-        source: &'static str,
-        symbol: &'static str,
-        op: OpId,
-    ) -> Result<Arc<CudaFunction>, OpError> {
-        if let Some(f) = self.fns.get(&(source_tag, symbol)) {
-            return Ok(f.clone());
-        }
-        if !self.nvrtc.contains_key(source_tag) {
-            use cudarc::nvrtc::CompileOptions;
-            let ptx = cudarc::nvrtc::compile_ptx_with_opts(
-                source,
-                CompileOptions {
-                    include_paths: self.nvrtc_include.clone(),
-                    ..Default::default()
-                },
-            )
-            .map_err(|e| OpError::Asset { op: op.0.to_string(), detail: format!("nvrtc {source_tag}: {e:?}") })?;
-            let ctx = res.context()?;
-            let m = ctx
-                .load_module(ptx)
-                .map_err(|e| OpError::Asset { op: op.0.to_string(), detail: format!("nvrtc module {source_tag}: {e:?}") })?;
-            self.nvrtc.insert(source_tag, m);
-        }
-        let m = self.nvrtc.get(source_tag).expect("刚插入").clone();
-        let f = m
-            .load_function(symbol)
-            .map_err(|e| OpError::Asset { op: op.0.to_string(), detail: format!("nvrtc 符号 {symbol}: {e:?}") })?;
-        let f = Arc::new(f);
-        self.fns.insert((source_tag, symbol), f.clone());
+        self.fns.insert((key, symbol), f.clone());
         Ok(f)
     }
 
@@ -237,33 +342,8 @@ impl Exec {
             res.record_capture(LaunchNote { op: op.0.to_string(), kernel, grid, block, shared_mem })?;
         }
         let stream = res.stream()?;
-        let mut b = stream.launch_builder(f);
-        use cudarc::driver::PushKernelArg;
-        for v in vals {
-            // 指针参数 = u64 位型直入 8 字节槽(与 handler &u64 同 ABI);
-            // arg() 不可败(参数空间按值拷贝),失败面收敛在 launch 一处
-            match v {
-                LaunchVal::Ptr(p) => {
-                    b.arg(p);
-                }
-                LaunchVal::U64(x) => {
-                    b.arg(x);
-                }
-                LaunchVal::I32(x) => {
-                    b.arg(x);
-                }
-                LaunchVal::F32(x) => {
-                    b.arg(x);
-                }
-            }
-        }
-        let cfg = cudarc::driver::LaunchConfig {
-            grid_dim: grid,
-            block_dim: block,
-            shared_mem_bytes: shared_mem,
-        };
-        unsafe { b.launch(cfg) }.map_err(|e| OpError::Launch { op: op.0.to_string(), stage: Stage::Compute, detail: format!("{kernel}: {e:?}") })?;
-        Ok(())
+        launch_vals(&stream, f, grid, block, shared_mem, vals)
+            .map_err(|e| OpError::Launch { op: op.0.to_string(), stage: Stage::Compute, detail: format!("{kernel}: {e:?}") })
     }
 
     /// htod(不变盒;staging 纪律:构造后不可变,捕获窗引用安全)。

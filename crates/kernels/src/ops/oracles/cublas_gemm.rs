@@ -2,7 +2,7 @@
 //!
 //! foreign 算子(marlin/xqa/FI/cublas)的参数是**账本块句柄**,发射走
 //! 家族 runtime —— 所以 oracle 用 [`CheckRunner::dispatch`](经注册表,与生产
-//! 同一路径),而不是 `launch_nvrtc`。本 oracle 同时是 P5c 运行面的**端到端
+//! 同一路径),而不是 `launch_aot`。本 oracle 同时是 P5c 运行面的**端到端
 //! 验证件**:`alloc_block` + `dispatch` + `download_block` 三件都走到。
 //!
 //! 语义(`client::cublas` 线格式 + `family::cublas::gemm_f16`,nt=true =

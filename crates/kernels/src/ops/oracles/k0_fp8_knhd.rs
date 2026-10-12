@@ -10,7 +10,7 @@
 
 use crate::contract::{LaunchVal, OpError};
 use crate::spec::{BootCheck, CheckBuf, CheckReport, CheckRunner};
-use crate::sources::attention::RESHAPE_AND_CACHE_FP8KV;
+const RESHAPE_AND_CACHE_FP8KV: &str = include_str!("../../../cu/attention/reshape_and_cache_fp8kv.cu");
 
 use super::{e4m3_encode, f16_to_f32, lcg_f16};
 
@@ -75,7 +75,7 @@ pub fn run_case(r: &mut dyn CheckRunner, c: &Case) -> Result<(Vec<u8>, Vec<u8>),
         LaunchVal::I32(8),
         LaunchVal::Ptr(d_out.ptr),
     ];
-    r.launch_nvrtc(
+    r.launch_aot(
         "owl_reshape_and_cache_fp8kv_knhd",
         RESHAPE_AND_CACHE_FP8KV,
         (T as u32, 1, 1),

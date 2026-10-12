@@ -29,7 +29,6 @@ use std::sync::Arc;
 
 const OP: OpId = OpId(GDN_CHUNKED);
 const ASSET: &str = "gdn_chunked";
-const CAST: &str = "owl_cast";
 // 家族几何(HV/KD/VD)随调用 shape 单源(GdnShape);server 零字面量
 // —— 旧 HV27/D128 常量声明后未用已删(2026-10-12 review G 案)
 
@@ -138,8 +137,8 @@ impl KernelFamily for GdnChunkedRuntime {
             "owl_state_kv_to_vk",
             "owl_state_vk_to_kv",
         ] {
-            let f = exec
-                .load_nvrtc(res, CAST, crate::sources::attention::CAST, sym, OP)?;
+            // 构建期资产(源哈希查表;`owl__cast` 已在 include_str! 闭包内)
+            let f = exec.load_aot(res, crate::sources::attention::CAST, sym, OP)?;
             me.fns.insert(sym, f);
         }
         for (name, sz) in [

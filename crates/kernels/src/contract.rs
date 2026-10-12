@@ -184,9 +184,46 @@ pub mod names {
 pub enum LaunchVal {
     /// 设备指针(块解析产物/scratch;8 字节指针槽)
     Ptr(u64),
+    /// 8 字节整数(`size_t`/`long long`)
     U64(u64),
+    /// **4 字节无符号**(`uint32_t`;vendor 核常用,如 XQA 的 `qSeqLen`/
+    /// `nbKHeads`/strides)。与 [`I32`](Self::I32) 同宽不同语义 —— 宽度必须
+    /// 显式,否则 8 字节槽会**错位吞掉**后续参数(实测教训类)。
+    U32(u32),
+    /// 4 字节有符号(`int`)
     I32(i32),
+    /// 4 字节浮点(`float`)
     F32(f32),
+    /// **by-value 结构体参数**(内联镜像 ≤ 64 字节)。
+    ///
+    /// 为什么需要它:`cuLaunchKernel` 的 `kernelParams` 是"**每参数一个指针**",
+    /// 驱动按**内核参数元数据里的 `paramSize`** 从该指针拷字节 —— 所以结构体参数
+    /// 必须给一个指向 **完整镜像** 的指针(把 40 字节结构体拆成 5 个 u64 槽是
+    /// **错的**:驱动会从第一个 u64 的地址拷 40 字节 = 读到邻居栈)。
+    /// 内联存储 ⇒ 值随 `LaunchVal` 一起 owned,压槽时取地址天然安全(无悬垂)。
+    /// 调用方保证 `#[repr(C)]` 镜像与内核形参**逐字节一致**(size 断言 + 资产
+    /// 自描述可双重锁死,见 `family::xqa`)。
+    Blob {
+        len: u32,
+        bytes: [u8; BLOB_MAX],
+    },
+}
+
+/// [`LaunchVal::Blob`] 内联容量(够 XQA `KVCacheList`=40B 等小结构体)
+pub const BLOB_MAX: usize = 64;
+
+impl LaunchVal {
+    /// 结构体镜像 → 参数槽(镜像 ≤ [`BLOB_MAX`];超长 = 调用方错误,截断前即断言)
+    pub fn blob(bytes: &[u8]) -> Self {
+        assert!(
+            bytes.len() <= BLOB_MAX,
+            "LaunchVal::blob: 镜像 {} B 超上限 {BLOB_MAX} B(扩容 BLOB_MAX 或改走指针)",
+            bytes.len()
+        );
+        let mut buf = [0u8; BLOB_MAX];
+        buf[..bytes.len()].copy_from_slice(bytes);
+        LaunchVal::Blob { len: bytes.len() as u32, bytes: buf }
+    }
 }
 
 /// 发射消息

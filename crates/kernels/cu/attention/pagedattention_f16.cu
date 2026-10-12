@@ -51,11 +51,30 @@
 // ============================================================================
 
 // ---- nvrtc 序言:mini-stdint + 数学常量 + 宏(stdint.h/float.h 不可开)----
+// 双载体(2026-10-13 cubin 预编):仅 **NVRTC** 需自备 stdint(nvrtc 默认头集
+// 极简,stdint.h 不可开);nvcc 下真 stdint.h 已由 CUDA 头引入,自备 typedef
+// 会撞 "invalid redeclaration of type name int64_t" ⇒ 分臂。
+#ifdef __CUDACC_RTC__
 typedef int int32_t;
 typedef unsigned int uint32_t;
 typedef unsigned short uint16_t;
 typedef long long int64_t;
 typedef unsigned long long uint64_t;
+#else
+#include <stdint.h>
+#endif
+
+// ---- 内层核限定符(双载体)----------------------------------------------------
+// NVRTC 无宿主编译 ⇒ 一切均是 device 语义,`__global__` 可直接当普通函数调用
+// (本文件全部 `__global__` 都只被其它 `__global__` 调用,无 `<<<>>>`);
+// 而 nvcc 的 `-cubin/-fatbin` 走真宿主/设备双通道,未配置的 `__global__` 调用
+// 是硬错("a __global__ function call must be configured")⇒ 内层核在 nvcc 下
+// 取 `__device__`。两载体语义等价:内层从不被 host 发射。
+#ifdef __CUDACC_RTC__
+#define OWL_INNER_KERNEL __global__
+#else
+#define OWL_INNER_KERNEL __device__
+#endif
 #ifndef FLT_MAX
 #define FLT_MAX 340282346638528859811704183484516925440.0f
 #endif
@@ -1509,7 +1528,7 @@ template<
   int HEAD_SIZE,
   int BLOCK_SIZE,
   int NUM_THREADS>
-__global__ void paged_attention_v1_kernel_f16(
+OWL_INNER_KERNEL void paged_attention_v1_kernel_f16(
   uint16_t* __restrict__ out,             // [num_seqs, num_heads, head_size]
   const uint16_t* __restrict__ q,         // [num_seqs, num_heads, head_size]
   const uint16_t* __restrict__ k_cache,   // [num_blocks, num_kv_heads, head_size/x, block_size, x]
@@ -1540,7 +1559,7 @@ template<
   int BLOCK_SIZE,
   int NUM_THREADS,
   int PARTITION_SIZE>
-__global__ void paged_attention_v2_kernel_f16(
+OWL_INNER_KERNEL void paged_attention_v2_kernel_f16(
   float* __restrict__ exp_sums,           // [num_seqs, num_heads, max_num_partitions]
   float* __restrict__ max_logits,         // [num_seqs, num_heads, max_num_partitions]
   uint16_t* __restrict__ tmp_out,         // [num_seqs, num_heads, max_num_partitions, head_size]
@@ -1570,7 +1589,7 @@ template<
   int HEAD_SIZE,
   int NUM_THREADS,
   int PARTITION_SIZE>
-__global__ void paged_attention_v2_reduce_kernel_f16(
+OWL_INNER_KERNEL void paged_attention_v2_reduce_kernel_f16(
   uint16_t* __restrict__ out,             // [num_seqs, num_heads, head_size]
   const float* __restrict__ exp_sums,     // [num_seqs, num_heads, max_num_partitions]
   const float* __restrict__ max_logits,   // [num_seqs, num_heads, max_num_partitions]

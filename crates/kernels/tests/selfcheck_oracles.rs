@@ -183,7 +183,7 @@ impl DeviceRes for TestRes {
 fn with_runner<R>(f: impl FnOnce(&mut dyn CheckRunner) -> R) -> Option<R> {
     let mut res = TestRes::new()?;
     let mut exec = Exec::new();
-    // 自检面(仅 native oracle:launch_nvrtc 路径;foreign 需 registry 注入)
+    // 自检面(仅 native oracle:launch_aot 路径;foreign 需 registry 注入)
     let mut r = Runner { res: &mut res, exec: &mut exec, registry: None };
     Some(f(&mut r))
 }

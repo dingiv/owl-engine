@@ -14,7 +14,7 @@
 
 use crate::contract::{LaunchVal, OpError};
 use crate::spec::{BootCheck, CheckBuf, CheckReport, CheckRunner};
-use crate::sources::owl::DFLASH2_F16;
+const DFLASH2_F16: &str = include_str!("../../../cu/owl/dflash2.cu");
 
 use super::{bf16_to_f32, lcg_bf16};
 
@@ -153,7 +153,7 @@ pub fn run_case(r: &mut dyn CheckRunner, c: &Case) -> Result<Vec<f32>, OpError> 
         LaunchVal::I32(X as i32),
         LaunchVal::Ptr(d_out.ptr),
     ];
-    r.launch_nvrtc(
+    r.launch_aot(
         "owl_naive_attn_nc_bf16_v2",
         DFLASH2_F16,
         (T as u32, HQ as u32, 1),

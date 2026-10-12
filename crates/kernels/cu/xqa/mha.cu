@@ -409,6 +409,38 @@ struct alignas(128) SharedMem {
 };
 
 CUBIN_EXPORT __device__ constexpr uint32_t smemSize = sizeof(SharedMem);
+// ⚠️ owl 本地 port 注记(2026-10-13 cubin 形态):**资产自描述**。
+//
+// 单 TU `-cubin` 下 nvcc 会把**一切设备变量内部化**(实测 `smemSize` 与
+// `__device__`/`__constant__` 全局都落成 STB_LOCAL,加
+// `__attribute__((visibility("default")))` 也一样)⇒ `cuModuleGetGlobal` 取不到,
+// 而 host 发射器(Rust)必须知道这些**编译期常量**:dynamic smem 尺寸、
+// `ctaTile`、`headGrpSize`、`rowsPerBlock`、cta 线程数……
+//
+// 解法:让 cubin **自己报**——一个 1 线程探针核把常量写进 host 缓冲
+// (装配期发射一次 + 4B×N D2H)。单一真源 = 本文件的 `sizeof`/`constexpr`,
+// **Rust 侧零常量复制**(复制常量 = "两处对不上"的经典温床)。
+// 只 `GENERATE_CUBIN` 时存在(host 构建路径不需要它)。
+CUBIN_EXPORT __global__ void owl_xqa_launch_consts(uint32_t* out) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    out[0] = static_cast<uint32_t>(sizeof(SharedMem));  // dynamic smem 字节数
+    out[1] = ctaTile.x;                                 // grid 推导(nbSubSeqPerSeq 上限)
+    out[2] = ctaTile.y;
+    out[3] = headGrpSize;
+    out[4] = warp_size * ctaShapeInWarps.x;             // cta 线程数
+    out[5] = ctaShapeInWarps.y;
+    out[6] = ctaShapeInWarps.z;
+#if SPEC_DEC
+    out[7] = rowsPerBlock;                              // = M_TILESIZE
+#else
+    out[7] = 0;
+#endif
+    out[8] = allowMultiBlockMode ? 1u : 0u;
+    out[9] = tokensPerPage;
+    out[10] = validElemsPerHead;
+    out[11] = static_cast<uint32_t>(sizeof(KVCacheList<true>));  // 布局自描述(host 侧镜像比对)
+  }
+}
 #ifdef __CUDA_ARCH__
 static_assert(smemSize < kMAX_SMEM_SIZE);
 #endif
@@ -3096,6 +3128,13 @@ void launchMHA(
 }
 #endif
 
+// ⚠️ owl 本地 port 注记(2026-10-13 cubin 形态):本段是 owl 加的 host 发射器
+// (`configureKernel` + `launchMHAFlashInfer`),上游无此段。它**必须**同
+// `launchMHA` 一样被 `GENERATE_CUBIN` 排除 —— 否则 `-DGENERATE_CUBIN` 下
+// `utils.h` 的 host 辅助(`checkCuda`)已被条件排除、`hostUtils.h` 更未引入,
+// 而本段仍要编译 ⇒ 未定义标识符。`GENERATE_CUBIN` 语义 = **只出设备码**;
+// host 侧发射器改由 Rust 承担(owl `server/xqa.rs`)。
+#ifndef GENERATE_CUBIN
 // ⚠️ owl 本地修复(2026-10-13;上游此处是 **文件作用域 static**,见 xqa/README.md):
 // 装载期(还没有 CUDA 上下文)就 `cudaMemcpyFromSymbol` → 失败后 `size` 是**未初始化
 // 栈垃圾**,又被当 dynamicSmemBytes 发射 ⇒ `cudaLaunchKernelEx` 抛
@@ -3185,4 +3224,5 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
                      scratch);
   checkCuda(cudaPeekAtLastError());
 }
-#endif
+#endif  // GENERATE_CUBIN(owl host 发射器段)
+#endif  // !(IS_MLA)

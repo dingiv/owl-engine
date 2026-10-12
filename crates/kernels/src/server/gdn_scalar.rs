@@ -6,15 +6,13 @@
 use crate::contract::{Bytes, InvariantBox, LaunchMsg, OpError, OpId};
 use crate::device::ScratchBuf;
 
-use crate::family::gdn_scalar::cubin;
+use crate::family::gdn_scalar::asset;
 use crate::client::gdn_scalar::{GdnScalarCall, GDN_SCALAR};
 use crate::registry::{FamilyGuard, KernelFamily};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 const OP: OpId = OpId(GDN_SCALAR);
-const ASSET: &str = "gdn_scalar";
-const CAST: &str = "owl_cast";
 
 #[derive(Default)]
 pub struct GdnScalarRuntime {
@@ -42,11 +40,12 @@ impl KernelFamily for GdnScalarRuntime {
         exec: &mut crate::device::Exec,
     ) -> Result<Box<dyn KernelFamily>, OpError> {
         let me = GdnScalarRuntime {
-            k: Some(exec.load_cubin(res, ASSET, cubin::CHUNK_SCALAR_F32, cubin::KERNEL_F32, OP)?),
-            cast_f32_f16: Some(exec.load_nvrtc(
-                res, CAST,
+            k: Some(exec.load_aot(res, asset::SOURCE, asset::KERNEL_F32, OP)?),
+            cast_f32_f16: Some(exec.load_aot(
+                res,
                 crate::sources::attention::CAST,
-                "owl_cast_f32_f16", OP,
+                "owl_cast_f32_f16",
+                OP,
             )?),
             soff: Some(res.alloc(2 * 4, "gdn_scalar.soff")?),
             ..Default::default()
@@ -111,8 +110,8 @@ impl KernelFamily for GdnScalarRuntime {
             crate::device::LaunchVal::F32(1.0 / (kd as f32).sqrt()),
         ];
         let grid = (shape.ns, hv as u32, 1);
-        let block = (cubin::BLOCK, 1, 1);
-        let smem = cubin::SMEM_D128;
+        let block = (asset::BLOCK, 1, 1);
+        let smem = asset::SMEM_D128;
         exec.launch(res, OP, k, "gdn_scalar", grid, block, smem, vals)?;
 
         // ── cast-out:o_f32 → out(f16)──

@@ -81,12 +81,12 @@ fn scalar_matches_varlen_big_t() {
     let stream = ctx.default_stream();
 
     // scalar 臂 cubin
-    let cubin = owl_kernels::family::gdn_scalar::cubin::CHUNK_SCALAR_F32;
+    let cubin = owl_kernels::family::gdn_scalar::asset::bytes();
     let m_scalar = ctx
         .load_module(cudarc::nvrtc::Ptx::from_binary(cubin.to_vec()))
         .expect("load scalar cubin");
     let f_scalar = m_scalar
-        .load_function(owl_kernels::family::gdn_scalar::cubin::KERNEL_F32)
+        .load_function(owl_kernels::family::gdn_scalar::asset::KERNEL_F32)
         .expect("fn scalar");
     // varlen 源(nvrtc)
     let ptx = cudarc::nvrtc::compile_ptx_with_opts(

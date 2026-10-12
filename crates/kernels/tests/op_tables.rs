@@ -66,9 +66,9 @@ fn r1_undeclared_inventory() {
     for n in &u {
         eprintln!("[R1]   {n}");
     }
-    // ⚠️ 上限 = 当前实测值(2026-10-13:69);建一批表就同步下调一批
+    // ⚠️ 上限 = 当前实测值(2026-10-13 B1 后:55);建一批表就同步下调一批
     assert!(
-        u.len() <= 69,
+        u.len() <= 55,
         "未声明算子增加到 {} 条 —— 新增核必须带 impl KernelSpec(R1)",
         u.len()
     );

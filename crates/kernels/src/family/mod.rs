@@ -23,3 +23,7 @@ pub mod gdn_scalar;
 /// Marlin FFI + repack(feature=marlin)
 #[cfg(feature = "marlin")]
 pub mod marlin;
+/// **构建期 cubin 资产登记表**(build.rs 生成;源文本哈希 → fatbin 字节)。
+/// 门 = `device` —— 只有执行面(backends/cuda)按源查资产;models 侧零成本。
+#[cfg(feature = "device")]
+pub mod cubins;

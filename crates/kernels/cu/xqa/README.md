@@ -10,11 +10,15 @@
 
 **本目录改动**(相对上游):
 - 删 `flashinfer_xqa_binding.cu` / `tvm_ffi_utils.h`(TVM FFI 运行时依赖,owl 不用);
-- 增 `owl_xqa_launch.cu` —— 裸指针 C ABI 薄 binding,直调 `launchMHAFlashInfer`
-  (等价上游 `xqa_wrapper.cu`,只是参数从 TensorView 换成裸指针);
-- 其余 `mha.cu` / 头文件**逐字未改**(冻结;升级 = 与上游 diff `mha.cu`)。
+- (2026-10-13 C3a 起)**不再有 C host 发射器**:host 侧搬 Rust
+  (`crates/kernels/src/{family,server}/xqa.rs`);本目录只留**设备码源**
+  (`mha.cu` + 头)。构建期用 `-DGENERATE_CUBIN`(上游自带的"只出设备码"模式)
+  编两个宏变体 fatbin(`xqa_verify` / `xqa_decode`)。
+- 已删:`owl_xqa_launch.cu`(裸指针 C ABI 薄 binding —— 职责搬 Rust)、
+  `xqa_wrapper.cu`(上游 TVM-FFI binding,owl 从未编译它,且引用不存在的
+  `../tvm_ffi_utils.h`)、`prebuilt/*.a`(预编二进制)。
 
-**实例化**(build.rs 传,见 `owl_xqa_launch.cu` 头注):TOKENS_PER_PAGE=32 /
+**实例化**(build.rs 传,见 `crates/kernels/build.rs::build_xqa_assets`):TOKENS_PER_PAGE=32 /
 HEAD_ELEMS=256 / HEAD_GRP_SIZE=6 / CACHE_ELEM_ENUM=2(fp8 e4m3)/ INPUT_FP16=1 /
 SPEC_DEC=1 / 其余 0。**编译只需补 `--expt-relaxed-constexpr`**(实测 12s 出 sm86 目标)。
 
@@ -24,14 +28,21 @@ SPEC_DEC=1 / 其余 0。**编译只需补 `--expt-relaxed-constexpr`**(实测 12
 
 ## owl 本地改动(相对上游 / flashampere)
 
-1. **删** `flashinfer_xqa_binding.cu` / `tvm_ffi_utils.h`(TVM FFI 依赖);**增**
-   `owl_xqa_launch.cu`(裸指针 C ABI,直调 `launchMHAFlashInfer`)。
+1. **删** `flashinfer_xqa_binding.cu` / `tvm_ffi_utils.h`(TVM FFI 依赖);
+   2026-10-13 起连 `owl_xqa_launch.cu` / `xqa_wrapper.cu` 一并删(host 侧搬 Rust)。
 2. **`mha.cu` 本地修复(上游 bug)**:`hostSmemSize` 原为**文件作用域 static**,在
    **库装载期**(还没有 CUDA 上下文)就 `cudaMemcpyFromSymbol` → 失败后 `size` 是
    **未初始化栈垃圾**,又被当 `dynamicSmemBytes` 发射 ⇒ `cudaLaunchKernelEx` 抛
    `cudaErrorInvalidValue`。现象极具迷惑性:**同一二进制 device 0 通过 / device 1 崩**
    (栈垃圾逐进程不同)。修法 = 改**首次发射时惰性求值 + `checkCuda` 逐步查错**。
-3. 其余文件逐字未改(升级 = 与上游 `mha.cu` diff)。
+   ⚠️ 2026-10-13 起该 host 段被 `#ifndef GENERATE_CUBIN` 圈住(cubin 形态只出
+   设备码;host 职责在 Rust)。
+3. **`mha.cu` 本地新增(2026-10-13 cubin 形态)**:`owl_xqa_launch_consts`
+   —— 1 线程探针核,把 host 需要的编译期常量(smem/ctaTile/headGrpSize/
+   rowsPerBlock/tokensPerPage/headElems/allowMultiBlock/cta 形状)写进缓冲。
+   **资产自描述**:单 TU cubin 会把设备变量内部化(STB_LOCAL,`cuModuleGetGlobal`
+   取不到),故改由核自己报 ⇒ Rust 侧零常量复制。
+4. 其余文件逐字未改(升级 = 与上游 `mha.cu` diff)。
 
 ## 调用契约(实测钉死,踩坑留档)
 

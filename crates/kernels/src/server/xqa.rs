@@ -1,21 +1,77 @@
-//! XQA verify / decode runtime(StaticLib 链路;host 函数发射)。
+//! XQA verify / decode runtime(2026-10-13 C3a:**构建期 cubin + Rust host 发射器**)。
+//!
+//! 形态:两个宏变体资产(`xqa_verify` / `xqa_decode`,build.rs `-DGENERATE_CUBIN`
+//! 编出)+ 本模块的 Rust 发射器(替换原 `cu/xqa/owl_xqa_launch.cu` 的 C 发射器)。
+//! 编译期常量(ctaTile / smem / rowsPerBlock / tokensPerPage / …)**由内核侧探针核
+//! 在装配期报回**(资产自描述,见 `family::xqa` 头注)⇒ Rust 侧零常量复制。
 //!
 //! 无内部状态:semaphores / scratch 由**调用方**给(层侧持有;图内安全
 //! 责任在层侧 —— semaphores 每次发射前必须为零)。本 runtime 只做
-//! 「解析 → 块指针解析 → `owl_xqa_launch*` → 回执 out」。
+//! 「解析 → 块指针解析 → 组装值表 → `Exec::launch` → 回执 out」。
 //!
-//! 两条臂共用同一套槽序/解析(`parse_verify`;两份实例化签名一致),
-//! 差别只在宿主发射函数:
-//! - `XqaRuntime`       → `owl_xqa_launch`        (SPEC_DEC=1 `M_TILESIZE=32`,verify)
-//! - `XqaDecodeRuntime` → `owl_xqa_launch_decode` (SPEC_DEC=1 `M_TILESIZE=16`,裸 decode q=1)
+//! 两条臂共用同一套槽序/解析(`parse_verify`;两份实例化签名一致),差别只在
+//! 装载的**资产变体**:
+//! - `XqaRuntime`       → `xqa_verify`(SPEC_DEC=1 `M_TILESIZE=32`)
+//! - `XqaDecodeRuntime` → `xqa_decode`(SPEC_DEC=1 `M_TILESIZE=16`,裸 decode q=1)
 
 use crate::client::xqa::{parse_verify, DECODE_XQA, VERIFY_XQA};
 use crate::contract::{Bytes, LaunchMsg, OpError, OpId};
-use crate::family::xqa::{owl_xqa_launch, owl_xqa_launch_decode};
+use crate::family::xqa::{
+    KVCacheList, XqaArgs, XqaConsts, ASSET_DECODE, ASSET_VERIFY, CONSTS_SLOTS, SYM_CONSTS, SYM_KERNEL,
+};
 use crate::registry::{FamilyGuard, KernelFamily};
+use std::sync::Arc;
 
-pub struct XqaRuntime;
-pub struct XqaDecodeRuntime;
+/// 臂状态:内核句柄 + 资产自描述常量(装配期一次定)
+pub struct XqaRuntime {
+    kernel: Arc<cudarc::driver::CudaFunction>,
+    consts: XqaConsts,
+}
+
+pub struct XqaDecodeRuntime {
+    kernel: Arc<cudarc::driver::CudaFunction>,
+    consts: XqaConsts,
+}
+
+/// 装配公共体:载资产 → 载内核与探针核 → **发一次探针核读常量** → 置 smem 上限。
+///
+/// 为什么探针核要真发一次:常量住内核侧的编译期表达式里(单 TU cubin 会把设备
+/// 变量内部化,`cuModuleGetGlobal` 取不到)。一次 1 线程发射 + 44B D2H = 装配期
+/// 一次性成本(~50µs),换 host 侧**零常量复制**。
+fn assemble_common(
+    res: &mut dyn crate::device::DeviceRes,
+    exec: &mut crate::device::Exec,
+    variant: &'static str,
+    op: OpId,
+) -> Result<(Arc<cudarc::driver::CudaFunction>, XqaConsts), OpError> {
+    let bytes = crate::family::cubins::xqa_asset(variant).ok_or_else(|| OpError::Asset {
+        op: op.0.to_string(),
+        detail: format!("XQA 资产 {variant} 不存在(feature `xqa` 未开?build.rs 未编?)"),
+    })?;
+    let kernel = exec.load_cubin(res, variant, bytes, SYM_KERNEL, op)?;
+    let probe = exec.load_cubin(res, variant, bytes, SYM_CONSTS, op)?;
+
+    // ---- 探针核:1 线程 + 44B 输出 ----
+    let out = res.alloc(CONSTS_SLOTS * 4, "xqa.consts")?;
+    let vals = [crate::contract::LaunchVal::Ptr(out.ptr)];
+    exec.launch(res, op, &probe, SYM_CONSTS, (1, 1, 1), (32, 1, 1), 0, &vals)?;
+    let mut buf = [0u8; CONSTS_SLOTS * 4];
+    res.download(out.ptr, &mut buf)?;
+    let slots: Vec<u32> = buf
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let consts = XqaConsts::from_slots(&slots)?;
+    // 动态 smem 上限(原 `configureKernel()` 的 cudaFuncSetAttribute)
+    crate::device::Exec::set_shared_limit(&kernel, consts.smem)?;
+    eprintln!(
+        "[xqa] 资产自描述 {variant}: smem={} ctaTile=({}, {}) headGrp={} cta=({},{},{}) rowsPerBlock={} multiBlock={} tokensPerPage={} headElems={}",
+        consts.smem, consts.cta_tile_x, consts.cta_tile_y, consts.head_grp,
+        consts.cta_x, consts.cta_y, consts.cta_z, consts.rows_per_block,
+        consts.allow_multi_block, consts.tokens_per_page, consts.valid_elems_per_head
+    );
+    Ok((kernel, consts))
+}
 
 impl XqaRuntime {
     /// 本族算子表(**引用 `ops::xqa` 的命名 static** —— 单一提升点)
@@ -25,12 +81,14 @@ impl XqaDecodeRuntime {
     const OPS: &'static [&'static crate::spec::KernelMeta] = &[&crate::ops::xqa::XQA_DECODE];
 }
 
-/// 发射公共体(`decode=false` → verify 实例化,`true` → decode 实例化)。
+/// 发射公共体(两条臂共用;差别只在装载的资产变体)
 fn emit(
     msg: &LaunchMsg,
     res: &mut dyn crate::device::DeviceRes,
+    exec: &mut crate::device::Exec,
     op: &'static str,
-    decode: bool,
+    kernel: &Arc<cudarc::driver::CudaFunction>,
+    consts: &XqaConsts,
 ) -> Result<Bytes, OpError> {
     let c = parse_verify(msg)?;
     // 逐参命名解析(失败即报"哪一个参 + 哪个块 id" —— DeadBlock 定谳用)
@@ -53,80 +111,43 @@ fn emit(
     let sem = r("semaphores", &c.semaphores)?;
     let scratch = r("scratch", &c.scratch)?;
     let out = r("out", &crate::client::xqa::BlockRef { id: c.out.id, byte_offset: 0 })?;
-    let stream = res.stream()?;
-    // 公共实参(两实例化签名逐字一致)
-    let args = (
+
+    // 图元(常量全部来自资产自描述;Rust 侧零复制)
+    let (grid, block, smem) = consts.launch_geometry(
         c.sm_count as u32,
+        /*batch=*/ 1,
         c.hkv as u32,
-        0u32, // sliding window 关(本实例化 SLIDING_WINDOW=0)
-        c.q_scale,
-        out,
-        q,
-        kc,
-        vc,
-        pt,
         c.max_seq_len as u32,
-        sl,
-        1u32,  // batch = 1(owl 单会话)
-        1.0f32, // kv_scale(fp8 KV 无 per-tensor scale)
         c.q_seq_len as u32,
-        mk,
-        sem,
-        scratch,
-        c.stride_page as u64,
-        c.stride_token as u64,
-        c.stride_head as u64,
     );
-    let rc = unsafe {
-        let st = stream.cu_stream() as *mut std::ffi::c_void;
-        let f: unsafe extern "C" fn(
-            u32, u32, u32, f32,
-            *mut std::ffi::c_void, *const std::ffi::c_void,
-            *mut std::ffi::c_void, *mut std::ffi::c_void,
-            *const i32, u32, *const u32, u32, f32, u32, *const u32,
-            *mut u32, *mut std::ffi::c_void,
-            u64, u64, u64, *mut std::ffi::c_void,
-        ) -> i32 =
-            if decode { owl_xqa_launch_decode } else { owl_xqa_launch };
-        f(
-            args.0,
-            args.1,
-            args.2,
-            args.3,
-            args.4 as *mut std::ffi::c_void,
-            args.5 as *const std::ffi::c_void,
-            args.6 as *mut std::ffi::c_void,
-            args.7 as *mut std::ffi::c_void,
-            args.8 as *const i32,
-            args.9,
-            args.10 as *const u32,
-            args.11,
-            args.12,
-            args.13,
-            args.14 as *const u32,
-            args.15 as *mut u32,
-            args.16 as *mut std::ffi::c_void,
-            args.17,
-            args.18,
-            args.19,
-            st,
-        )
+    let args = XqaArgs {
+        q_seq_len: c.q_seq_len as u32,
+        nb_k_heads: c.hkv as u32,
+        q_cu_seq_lens: 0,
+        q_scale: c.q_scale,
+        q_scale_ptr: 0,
+        output: out,
+        q,
+        mask: mk,
+        attention_sinks: 0,
+        cache: KVCacheList {
+            k_cache: kc,
+            v_cache: vc,
+            page_list: pt,
+            seq_len_list: sl,
+            max_nb_pages_per_seq: consts.max_nb_pages_per_seq(c.max_seq_len as u32),
+            _pad: 0,
+        },
+        batch_size: 1,
+        kv_scale: 1.0, // fp8 KV 无 per-tensor scale
+        kv_scale_ptr: 0,
+        stride_page: consts.stride_in_heads(c.stride_page as u64),
+        stride_token: consts.stride_in_heads(c.stride_token as u64),
+        stride_head: consts.stride_in_heads(c.stride_head as u64),
+        semaphores: sem,
+        scratch,
     };
-    if rc != 0 {
-        return Err(OpError::Launch {
-            op: op.into(),
-            stage: crate::contract::Stage::Compute,
-            detail: format!(
-                "{} 参数拒绝 rc={rc}(q_seq_len={} hd={} page={} max_seq={} sm={})",
-                if decode { "owl_xqa_launch_decode" } else { "owl_xqa_launch" },
-                c.q_seq_len,
-                c.hd,
-                c.page,
-                c.max_seq_len,
-                c.sm_count
-            ),
-        });
-    }
+    exec.launch(res, OpId(op), kernel, crate::family::xqa::SYM_KERNEL, grid, block, smem, &args.vals(consts.head_grp))?;
     Ok(Bytes { id: c.out.id, len: msg.out_elems })
 }
 
@@ -140,24 +161,25 @@ impl KernelFamily for XqaRuntime {
     }
 
     fn linkage(&self) -> crate::contract::Linkage {
-        crate::contract::Linkage::StaticLib
+        crate::contract::Linkage::AotCubin
     }
 
-    /// 无装配(workspace 由调用方给 —— 层侧持有,图内安全责任在层侧)
+    /// 装配:载 `xqa_verify` 资产 + 探针核读常量(workspace 仍由调用方给)
     fn assemble(
-        _res: &mut dyn crate::device::DeviceRes,
-        _exec: &mut crate::device::Exec,
+        res: &mut dyn crate::device::DeviceRes,
+        exec: &mut crate::device::Exec,
     ) -> Result<Box<dyn KernelFamily>, OpError> {
-        Ok(FamilyGuard::boxed(XqaRuntime))
+        let (kernel, consts) = assemble_common(res, exec, ASSET_VERIFY, OpId(VERIFY_XQA))?;
+        Ok(FamilyGuard::boxed(XqaRuntime { kernel, consts }))
     }
 
     fn run(
         &mut self,
         msg: &LaunchMsg,
         res: &mut dyn crate::device::DeviceRes,
-        _exec: &mut crate::device::Exec,
+        exec: &mut crate::device::Exec,
     ) -> Result<Bytes, OpError> {
-        emit(msg, res, VERIFY_XQA, false)
+        emit(msg, res, exec, VERIFY_XQA, &self.kernel, &self.consts)
     }
 }
 
@@ -171,22 +193,23 @@ impl KernelFamily for XqaDecodeRuntime {
     }
 
     fn linkage(&self) -> crate::contract::Linkage {
-        crate::contract::Linkage::StaticLib
+        crate::contract::Linkage::AotCubin
     }
 
     fn assemble(
-        _res: &mut dyn crate::device::DeviceRes,
-        _exec: &mut crate::device::Exec,
+        res: &mut dyn crate::device::DeviceRes,
+        exec: &mut crate::device::Exec,
     ) -> Result<Box<dyn KernelFamily>, OpError> {
-        Ok(FamilyGuard::boxed(XqaDecodeRuntime))
+        let (kernel, consts) = assemble_common(res, exec, ASSET_DECODE, OpId(DECODE_XQA))?;
+        Ok(FamilyGuard::boxed(XqaDecodeRuntime { kernel, consts }))
     }
 
     fn run(
         &mut self,
         msg: &LaunchMsg,
         res: &mut dyn crate::device::DeviceRes,
-        _exec: &mut crate::device::Exec,
+        exec: &mut crate::device::Exec,
     ) -> Result<Bytes, OpError> {
-        emit(msg, res, DECODE_XQA, true)
+        emit(msg, res, exec, DECODE_XQA, &self.kernel, &self.consts)
     }
 }

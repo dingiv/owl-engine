@@ -87,7 +87,7 @@ pub struct EngineKnobs {
     /// prefill 尾块校验(原 OWL_PF_FIN_CHECK)
     pub pf_fin_check: bool,
     /// 设备诊断/调优选项(srv_timing/cap_prof/launch_sync/free_legacy/
-    /// graph_flags/capture_slab_mb/nvrtc_include;原散点 OWL_* 直读 →
+    /// graph_flags/capture_slab_mb;原散点 OWL_* 直读 →
     /// owl_cuda::DiagOpts 一体携带,入口经 DiagOpts::from_env 填充)
     pub cuda: owl_cuda::DiagOpts,
     /// 解释器执行环境(硬件档/KV 策略/量化/分派旋钮;Default = 生产基线)

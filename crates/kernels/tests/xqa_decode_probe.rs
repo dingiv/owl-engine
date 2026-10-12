@@ -7,7 +7,8 @@
 //! GQA 24q/4kv,hd256,page 32,kNHD 布局 [page, token, hkv, hd] 的 **fp8 e4m3** 池。
 //! 与 `xqa_verify_probe.rs` 的区别:**q_seq_len=1、无因果块、掩码只有一个恒等的 bit0**。
 //!
-//! ⚠️ 本探针第一目的 = **D1 备选实测**:现有 prebuilt `libowl_xqa.a` 是
+//! ⚠️ 本探针第一目的 = **D1 备选实测**:原先的 prebuilt `libowl_xqa.a`(2026-10-13
+//! C3a 起改为构建期 fatbin 资产 + Rust 发射器,见 `family::xqa`)是
 //! `SPEC_DEC=1` 实例化(`mha.cu:84` 把 `nbValidRows` 钉死为 `rowsPerBlock=32`);
 //! 若 q=1 走它数值正确/速度可用,则裸 decode 不必再编第二份 `mha.cu`;
 //! 若慢(32 行里只有 6 行有效 → 5.3× MMA 浪费),则编 `SPEC_DEC=0`(rows=6)第二份。
@@ -118,59 +119,6 @@ fn host_ref_knhd(q: &[u16], kc: &[u8], vc: &[u8], len: usize) -> Vec<f32> {
     out
 }
 
-extern "C" {
-    #[allow(clippy::too_many_arguments)]
-    fn owl_xqa_launch(
-        sm_count: u32,
-        nb_k_heads: u32,
-        sliding_win_size: u32,
-        q_scale: f32,
-        output: *mut core::ffi::c_void,
-        q: *const core::ffi::c_void,
-        k_cache: *mut core::ffi::c_void,
-        v_cache: *mut core::ffi::c_void,
-        page_table: *const i32,
-        max_seq_len: u32,
-        seq_lens: *const u32,
-        batch_size: u32,
-        kv_scale: f32,
-        q_seq_len: u32,
-        mask: *const u32,
-        semaphores: *mut u32,
-        scratch: *mut core::ffi::c_void,
-        kv_stride_page: u64,
-        kv_stride_token: u64,
-        kv_stride_head: u64,
-        stream: *mut core::ffi::c_void,
-    ) -> i32;
-
-    /// 第二份实例化(`SPEC_DEC=1 + M_TILESIZE=16`,写给 q=1 的窄 tile):
-    /// 签名与 `owl_xqa_launch` 一致。
-    #[allow(clippy::too_many_arguments)]
-    fn owl_xqa_launch_decode(
-        sm_count: u32,
-        nb_k_heads: u32,
-        sliding_win_size: u32,
-        q_scale: f32,
-        output: *mut core::ffi::c_void,
-        q: *const core::ffi::c_void,
-        k_cache: *mut core::ffi::c_void,
-        v_cache: *mut core::ffi::c_void,
-        page_table: *const i32,
-        max_seq_len: u32,
-        seq_lens: *const u32,
-        batch_size: u32,
-        kv_scale: f32,
-        q_seq_len: u32,
-        mask: *const u32,
-        semaphores: *mut u32,
-        scratch: *mut core::ffi::c_void,
-        kv_stride_page: u64,
-        kv_stride_token: u64,
-        kv_stride_head: u64,
-        stream: *mut core::ffi::c_void,
-    ) -> i32;
-}
 
 /// q_seq_len(1 = decode 目标形状;>1 = 顺便交叉验证 spec-dec 形状仍可用)
 /// `decode_inst`:true → 走 `SPEC_DEC=0` 的第二份实例化(仅 q=1 有意义)
@@ -271,66 +219,70 @@ fn run_case(ctx: usize, q_seq_len: usize, decode_inst: bool, check: bool) {
         d_sem.device_ptr(&stream).0,
         d_scratch.device_ptr(&stream).0,
     );
-    let stream_raw = stream.cu_stream() as *mut core::ffi::c_void;
     // XQA_SM:覆盖 launcher 的 sm_count(只是用来算 nbSubSeqPerSeq 的 split 数——
     // 放大它 = 每 SM 多放 CTA = 提占用率;用来验证"是否为延迟墙")
     let sm_count: u32 = owl_shared::env_reader::str("XQA_SM")
         .and_then(|s| s.parse().ok())
         .unwrap_or(SM86_SM_COUNT);
-    let xqa_call = |out: u64| unsafe {
-        if decode_inst {
-            assert_eq!(q_seq_len, 1, "decode 实例化只支持 q=1");
-            owl_xqa_launch_decode(
-                sm_count,
-                HKV as u32,
-                0,
-                1.0,
-                out as *mut core::ffi::c_void,
-                q_p as *const core::ffi::c_void,
-                k_p as *mut core::ffi::c_void,
-                v_p as *mut core::ffi::c_void,
-                bt_p as *const i32,
-                (nb * PAGE) as u32,
-                sq_p as *const u32,
-                1,
-                1.0,
-                q_seq_len as u32,
-                mk_p as *const u32,
-                sem_p as *mut u32,
-                sc_p as *mut core::ffi::c_void,
-                (PAGE * HKV * HD) as u64,
-                (HKV * HD) as u64,
-                HD as u64,
-                stream_raw,
-            )
-        } else {
-            owl_xqa_launch(
-                sm_count,
-                HKV as u32,
-                0,
-                1.0, // q_scale = attn_scale(1/sqrt(256)) * sqrt(256) = 1.0
-                out as *mut core::ffi::c_void,
-                q_p as *const core::ffi::c_void,
-                k_p as *mut core::ffi::c_void,
-                v_p as *mut core::ffi::c_void,
-                bt_p as *const i32,
-                (nb * PAGE) as u32,
-                sq_p as *const u32,
-                1,
-                1.0,
-                q_seq_len as u32,
-                mk_p as *const u32,
-                sem_p as *mut u32,
-                sc_p as *mut core::ffi::c_void,
-                (PAGE * HKV * HD) as u64,
-                (HKV * HD) as u64,
-                HD as u64,
-                stream_raw,
-            )
+    // ---- XQA 单发(2026-10-13 C3a:构建期资产 + Rust 发射器) ----
+    // 两个变体各载一次(verify = M_TILESIZE 32 / decode = 16),A/B 同源同槽序
+    let (k_verify, c_verify) =
+        owl_kernels::family::xqa::load_for_probe(&ctx_c, owl_kernels::family::xqa::ASSET_VERIFY)
+            .expect("载 xqa_verify");
+    let (k_decode, c_decode) =
+        owl_kernels::family::xqa::load_for_probe(&ctx_c, owl_kernels::family::xqa::ASSET_DECODE)
+            .expect("载 xqa_decode");
+    let mk_args = |c: &owl_kernels::family::xqa::XqaConsts, out: u64| {
+        owl_kernels::family::xqa::XqaArgs {
+            q_seq_len: q_seq_len as u32,
+            nb_k_heads: HKV as u32,
+            q_cu_seq_lens: 0,
+            q_scale: 1.0, // = attn_scale(1/sqrt(256)) * sqrt(256)
+            q_scale_ptr: 0,
+            output: out,
+            q: q_p,
+            mask: mk_p,
+            attention_sinks: 0,
+            cache: owl_kernels::family::xqa::KVCacheList {
+                k_cache: k_p,
+                v_cache: v_p,
+                page_list: bt_p,
+                seq_len_list: sq_p,
+                max_nb_pages_per_seq: c.max_nb_pages_per_seq((nb * PAGE) as u32),
+                _pad: 0,
+            },
+            batch_size: 1,
+            kv_scale: 1.0,
+            kv_scale_ptr: 0,
+            stride_page: c.stride_in_heads((PAGE * HKV * HD) as u64),
+            stride_token: c.stride_in_heads((HKV * HD) as u64),
+            stride_head: c.stride_in_heads(HD as u64),
+            semaphores: sem_p,
+            scratch: sc_p,
         }
     };
-    let rc = xqa_call(o_p);
-    assert_eq!(rc, 0, "owl_xqa_launch 返回 {rc}");
+    let xqa_call = |out: u64| {
+        if decode_inst {
+            assert_eq!(q_seq_len, 1, "decode 实例化只支持 q=1");
+            owl_kernels::family::xqa::launch_on_stream(
+                &stream,
+                &k_decode,
+                &c_decode,
+                &mk_args(&c_decode, out),
+                sm_count,
+            )
+        } else {
+            owl_kernels::family::xqa::launch_on_stream(
+                &stream,
+                &k_verify,
+                &c_verify,
+                &mk_args(&c_verify, out),
+                sm_count,
+            )
+        }
+        .expect("xqa launch");
+    };
+    xqa_call(o_p);
     stream.synchronize().expect("xqa sync");
 
     // ---- v2 基线(主核 + reduce;与生产同两发) ----

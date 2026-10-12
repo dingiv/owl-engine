@@ -4,7 +4,6 @@
 //! 只被 actor 线程触碰(单线程所有权;零锁)。
 
 use crate::ffi::{device_get_count, free_host, malloc_host, CudaContext, CudaFunction, CudaSlice, CudaStream, CAPTURE_MODE_THREAD_LOCAL};
-use cudarc::nvrtc::safe::{compile_ptx_with_opts, CompileOptions};
 use owl_iface::contract::GraphId;
 use owl_iface::contract::ModelError;
 use owl_iface::contract::{numel, Shape};
@@ -36,9 +35,6 @@ pub struct DiagOpts {
     /// 捕获 slab 固定档 MiB(None = warmup 计量定量;原 OWL_CAPTURE_SLAB_MB
     /// —— 24G 贴顶的 27B + spec 双图场景,verify 图按需调小)
     pub capture_slab_mb: Option<usize>,
-    /// nvrtc include 目录(None = 缺省 /usr/local/cuda/include;
-    /// 入口自 CUDA_HOME/CUDA_PATH 解析)
-    pub nvrtc_include: Option<std::path::PathBuf>,
     /// **生产算子白名单**(dispatch.allowed_ops;None/空 = 门关)。
     /// `Arc` = 与 server 主循环共享,逐发射判定零克隆。
     pub allowed_ops: Option<std::sync::Arc<Vec<String>>>,
@@ -58,7 +54,6 @@ impl DiagOpts {
             gpu_prof: c.gpu_prof,
             graph_flags: c.graph_flags.to_bits(),
             capture_slab_mb: c.capture_slab_mb,
-            nvrtc_include: c.nvrtc_include.clone(),
             allowed_ops: cfg
                 .dispatch
                 .allowed_ops
@@ -273,6 +268,43 @@ impl GpuCtx {
             .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)
             .map_err(|e| format!("查 MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: {e:?}"))?
             as usize;
+        // ---- 装配期架构门(设计 §15.4)----
+        // 设备 sm ∉ 构造期编出的代际集 ⇒ **现在**拒启,而不是等到某次发射
+        // 报 "no kernel image is available for execution on the device"。
+        // 资产集为空(`OWL_CUBIN_SKIP` 构建)= 门关(仅用于门的负例验证)。
+        {
+            let archs = owl_kernels::family::cubins::CUBIN_ARCHS;
+            if !archs.is_empty() {
+                let major = ctx
+                    .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+                    .map_err(|e| format!("查 COMPUTE_CAPABILITY_MAJOR: {e:?}"))?;
+                let minor = ctx
+                    .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
+                    .map_err(|e| format!("查 COMPUTE_CAPABILITY_MINOR: {e:?}"))?;
+                let dev = format!("sm_{major}{minor}");
+                if !archs.contains(&dev.as_str()) {
+                    return Err(format!(
+                        "装配期架构门:设备 {dev}(ordinal {ordinal} )不在构建期 cubin 代际集 {archs:?} 内 ——\
+                         重建时请加 `OWL_CUBIN_ARCHS=...,{dev}`(设计 §15.4)"
+                    ));
+                }
+            }
+            // ---- 零运行期编译覆盖率(boot 报告 + require 硬门)----
+            let (covered, total, missing) = owl_kernels::family::cubins::coverage();
+            eprintln!(
+                "[aot] 构建期 cubin 代际 {archs:?} / 资产 {} 个 —— 登记表覆盖 {covered}/{total}",
+                owl_kernels::family::cubins::CUBIN_ASSETS.len()
+            );
+            if !missing.is_empty() {
+                let show: Vec<&str> = missing.iter().take(8).copied().collect();
+                let total_show = missing.len();
+                return Err(format!(
+                    "零运行期编译硬门:{total_show} 个登记表核无构建期 cubin 资产 —— \
+                     这些入口的 .cu 不在 build.rs 的 include_str! 闭包内(见 [aot] 行);\
+                     前几个: {show:?}"
+                ));
+            }
+        }
         let mut streams = HashMap::new();
         for (id, _role) in [(STREAM_H2D, "h2d"), (STREAM_COMPUTE, "compute"), (STREAM_D2H, "d2h")] {
             let s = ctx.new_stream().map_err(|e| format!("建流({_role}): {e:?}"))?;
@@ -681,21 +713,39 @@ impl GpuCtx {
 }
 
 // ============================================================================
-// kernel 编译缓存(懒编译;name+source → CudaFunction)
+// kernel 装载缓存(2026-10-13 载体切换:构建期 cubin 优先,零运行期编译)
 // ============================================================================
+//
+// 两个平面:
+// - **AOT 面**:`build.rs` 把每个 `.cu` 编成 fatbin(`$OUT_DIR/cubins/`),登记表
+//   以**源文本哈希**为键(`owl_kernels::family::cubins`)。同一文件的核共享一个
+//   模块(旧路径是**每核一个模块**,逐核 nvrtc + 重复装载)。
+// - **无 NVRTC 面**(2026-10-13 裁决:零运行期编译 ⇒ NVRTC 已退役):
+//   资产未命中 = **拒发**(不降级到运行期编译)。
+//
+// `aot_hits` / `misses` 是**机器判据面**:验收 = 整轮 e2e 日志 `aot-miss` 恒 0;
+// 结构性判据 = `crates/kernels/tests/no_runtime_compile.rs`(生产路径零编译调用)。
 
 pub(super) struct KernelCache {
     compiled: HashMap<String, CudaFunction>,
-    /// nvrtc include 目录(DiagOpts.nvrtc_include,boot 注入;显式依赖律)
-    nvrtc_include: Option<std::path::PathBuf>,
+    /// AOT 资产名 → 已载模块(同 `.cu` 的核共享一个模块)
+    modules: HashMap<&'static str, Arc<cudarc::driver::CudaModule>>,
+    /// 资产的核数(诊断/验收判据)
+    pub(super) aot_hits: usize,
+    /// 无资产的核名(每名一次;= 拒启清单/机器判据面)
+    pub(super) misses: Vec<String>,
 }
 
 impl KernelCache {
-    pub(super) fn new(nvrtc_include: Option<std::path::PathBuf>) -> Self {
-        Self { compiled: HashMap::new(), nvrtc_include }
+    pub(super) fn new() -> Self {
+        Self { compiled: HashMap::new(), modules: HashMap::new(), aot_hits: 0, misses: Vec::new() }
     }
 
-    /// 懒编译:CUDA C 源 → nvrtc → PTX → module → function(命中缓存直返)
+    /// 核取用:**构建期 cubin 资产唯一路径**(源哈希查表 → fatbin → 符号)。
+    ///
+    /// 未命中 = `Err`(拒发)。**没有 NVRTC 兜底**(2026-10-13 裁决:零运行期
+    /// 编译);源码不在 `include_str!` 闭包内 = 该入口没有构建期资产 =
+    /// 编程错误(要么漏建表,要么该入口已废弃应从发射链剔除)。
     pub(super) fn ensure_kernel(
         &mut self,
         ctx: &Arc<CudaContext>,
@@ -705,25 +755,42 @@ impl KernelCache {
         if let Some(f) = self.compiled.get(name) {
             return Ok(f.clone());
         }
-        // include 路径:cuda_fp16.h 等 CUDA 头(f16 基线 F2;nvrtc 默认
-        // 搜索表为空,需显式给 toolkit include 目录)
-        let cuda_include = self
-            .nvrtc_include
-            .clone()
-            .unwrap_or_else(|| std::path::PathBuf::from("/usr/local/cuda/include"));
-        let opts = CompileOptions {
-            arch: Some("compute_86"),
-            include_paths: vec![cuda_include.to_string_lossy().into_owned()],
-            ..Default::default()
+        let asset = owl_kernels::family::cubins::asset_of_source(source).ok_or_else(|| {
+            // 机器判据面:整轮 e2e 日志里 `grep -c aot-miss` 应恒 0
+            eprintln!("[aot-miss] {name} —— 无构建期 cubin 资产(源 {} B)", source.len());
+            if !self.misses.iter().any(|m| m == name) {
+                self.misses.push(name.to_string());
+            }
+            ModelError::Msg(format!(
+                "{name} 无构建期 cubin 资产(源 {} B)—— 零运行期编译硬门:该 .cu 不在 build.rs 的 \
+                 include_str! 闭包内(NVRTC 已退役,无兜底路径)",
+                source.len()
+            ))
+        })?;
+        let module = match self.modules.get(asset.asset) {
+            Some(m) => m.clone(),
+            None => {
+                // fatbin 载入:driver API 与纯 cubin 完全相同(多代际由驱动
+                // 按设备挑最匹配那份)
+                let m = ctx
+                    .load_module(cudarc::nvrtc::Ptx::from_binary(asset.bytes.to_vec()))
+                    .map_err(|e| {
+                        ModelError::Msg(format!(
+                            "aot load_module({} / {name}): {e:?} —— 资产载入失败(代际不匹配?驱动过旧?)",
+                            asset.asset
+                        ))
+                    })?;
+                self.modules.insert(asset.asset, m.clone());
+                m
+            }
         };
-        let ptx = compile_ptx_with_opts(source, opts)
-            .map_err(|e| ModelError::Msg(format!("nvrtc({name}): {e:?}")))?;
-        let module = ctx
-            .load_module(ptx)
-            .map_err(|e| ModelError::Msg(format!("load_module({name}): {e:?}")))?;
-        let func = module
-            .load_function(name)
-            .map_err(|e| ModelError::Msg(format!("load_function({name}): {e:?}")))?;
+        let func = module.load_function(name).map_err(|e| {
+            ModelError::Msg(format!(
+                "aot load_function({name}) in {}: {e:?} —— 符号不在资产里(源哈希命中但符号缺失 = 登记表/源失配)",
+                asset.asset
+            ))
+        })?;
+        self.aot_hits += 1;
         self.compiled.insert(name.to_string(), func.clone());
         Ok(func)
     }

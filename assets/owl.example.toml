@@ -100,7 +100,8 @@
 # gpu_prof = false              # 逐核归因(/debug/metrics 消费)
 # free_legacy = false           # 旁路事件钉序(崩坏案 A/B)
 # capture_slab_mb = 0           # 捕获 slab 固定档(缺省 = warmup 计量定量;spec verify 实需 ~160)
-# nvrtc_include = ""            # 缺省 /usr/local/cuda/include
+# (nvrtc_include / native_aot 键已于 2026-10-13 退役:NVRTC 编译路径删除,
+#  设备码一律构建期 cubin 资产 —— 见 docs/arch/kernel-准入门槛-施工设计.md §15.5)
 
 [cuda.graph_flags]
 # upload = false                # 实例化旗标 UPLOAD=0b10

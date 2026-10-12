@@ -8,7 +8,6 @@ use crate::contract::{Dtype, Law};
 use crate::spec::{
     meta_of, pools, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param, PoolAccess,
 };
-use crate::sources;
 
 // ============================================================================
 // 门控 / 归一(前置琐核)
@@ -19,7 +18,7 @@ pub struct GatingGF16;
 
 impl KernelSpec for GatingGF16 {
     const ENTRY: &'static str = "owl_gdn_gating_g_f16";
-    const SOURCE: &'static str = sources::text::GDN_F32;
+    const SOURCE: &'static str = include_str!("../../cu/owl/gdn.cu");
     const PARAMS: &'static [Param] = &[
         Param::t_in("a_log", Dtype::F16, 2),
         Param::t_in("a", Dtype::F16, 2),
@@ -38,7 +37,7 @@ pub struct L2NormF16;
 
 impl KernelSpec for L2NormF16 {
     const ENTRY: &'static str = "owl_gdn_l2norm_f16";
-    const SOURCE: &'static str = sources::text::GDN_F32;
+    const SOURCE: &'static str = include_str!("../../cu/owl/gdn.cu");
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::F16, 2),
         Param::sz("rows"),
@@ -56,7 +55,7 @@ pub struct NormActF16;
 
 impl KernelSpec for NormActF16 {
     const ENTRY: &'static str = "owl_gdn_norm_act_f16";
-    const SOURCE: &'static str = sources::text::GDN_F32;
+    const SOURCE: &'static str = include_str!("../../cu/owl/gdn.cu");
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::F16, 2),
         Param::t_in("z", Dtype::F16, 2),
@@ -82,7 +81,7 @@ pub struct ConvFwdF16;
 
 impl KernelSpec for ConvFwdF16 {
     const ENTRY: &'static str = "owl_gdn_conv_fwd_f16";
-    const SOURCE: &'static str = sources::text::GDN_F32;
+    const SOURCE: &'static str = include_str!("../../cu/owl/gdn.cu");
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::F16, 2),
         Param::t_in("w", Dtype::F16, 2),
@@ -106,7 +105,7 @@ pub struct ConvUpdDualF16;
 
 impl KernelSpec for ConvUpdDualF16 {
     const ENTRY: &'static str = "owl_gdn_conv_upd_dual_f16";
-    const SOURCE: &'static str = sources::text::GDN_F32;
+    const SOURCE: &'static str = include_str!("../../cu/owl/gdn.cu");
     const PARAMS: &'static [Param] = &[
         Param::t_in("x_q", Dtype::F16, 2),
         Param::t_in("x_k", Dtype::F16, 2),
@@ -136,7 +135,7 @@ pub struct RecurrenceVarlenGqaF16;
 
 impl KernelSpec for RecurrenceVarlenGqaF16 {
     const ENTRY: &'static str = "owl_gdn_recurrence_varlen_gqa_f16";
-    const SOURCE: &'static str = sources::text::GDN_F32;
+    const SOURCE: &'static str = include_str!("../../cu/owl/gdn.cu");
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 3),
         Param::t_in("k", Dtype::F16, 3),
@@ -167,7 +166,7 @@ pub struct DecodeStepV2F16;
 
 impl KernelSpec for DecodeStepV2F16 {
     const ENTRY: &'static str = "owl_gdn_decode_step_v2_f16";
-    const SOURCE: &'static str = sources::text::GDN_F32;
+    const SOURCE: &'static str = include_str!("../../cu/owl/gdn.cu");
     const PARAMS: &'static [Param] = &[
         Param::t_in("q_c", Dtype::F16, 2),
         Param::t_in("k_c", Dtype::F16, 2),

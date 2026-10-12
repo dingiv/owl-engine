@@ -46,7 +46,7 @@ impl CheckRunner for Runner<'_> {
                 op: msg.kernel.name.clone(),
                 field: "dispatch",
                 expect: "注册表在场(自检运行面在注册表建成之后注入)".into(),
-                got: "launch_nvrtc-only runner".into(),
+                got: "无注册表 runner(仅 launch_aot 路径)".into(),
             });
         };
         reg.execute(&msg, self.res, self.exec)
@@ -60,7 +60,7 @@ impl CheckRunner for Runner<'_> {
         self.res.download(src.ptr, dst)
     }
 
-    fn launch_nvrtc(
+    fn launch_aot(
         &mut self,
         name: &'static str,
         source: &'static str,
@@ -69,7 +69,7 @@ impl CheckRunner for Runner<'_> {
         shared_mem: u32,
         vals: &[LaunchVal],
     ) -> Result<(), OpError> {
-        let f = self.exec.load_nvrtc(self.res, source, source, name, OpId(name))?;
+        let f = self.exec.load_aot(self.res, source, name, OpId(name))?;
         self.exec.launch(self.res, OpId(name), &f, name, grid, block, shared_mem, vals)
     }
 

@@ -7,7 +7,6 @@ use crate::spec::{
     meta_of, pools, CaptureEvidence, Determinism, KernelMeta, KernelSpec, LayoutTag, Param,
     PoolAccess,
 };
-use crate::sources;
 
 // ============================================================================
 // 草稿非因果块注意力(DFlash2 propose 的 NC 核 v2;2026-10-13 ③ 转正)
@@ -21,7 +20,7 @@ pub struct NcAttnBf16V2;
 
 impl KernelSpec for NcAttnBf16V2 {
     const ENTRY: &'static str = "owl_naive_attn_nc_bf16_v2";
-    const SOURCE: &'static str = sources::owl::DFLASH2_F16;
+    const SOURCE: &'static str = include_str!("../../cu/owl/dflash2.cu");
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::BF16, 2),
         Param::t_in("k_self", Dtype::BF16, 3),
@@ -62,10 +61,8 @@ impl KernelSpec for NcAttnBf16V2 {
 /// (bs32 = block 32 行;kNHD 寻址;KV 池 e4m3 1B/elem)。
 pub struct PagedAttnV2Fp8KnhdHd256Bs32;
 
-impl KernelSpec for PagedAttnV2Fp8KnhdHd256Bs32 {
-    const ENTRY: &'static str = "vllm_paged_attention_v2_fp8_knhd_hd256bs32";
-    const SOURCE: &'static str = sources::attention::PAGED_ATTENTION_F16;
-    const PARAMS: &'static [Param] = &[
+/// paged v2 主核共享参数表(18 参;f16/fp8 × classic/kNHD 同 ABI)
+const PAGED_V2_FP8_KNHD_PARAMS: &[Param] = &[
         Param::t_in("q", Dtype::F16, 2),
         // fp8 e4m3 池(1B/elem;.cu 以 uint16_t* 声明仅为 2 字节装载)
         Param::t_in("k_cache", Dtype::U8, 4),
@@ -85,8 +82,12 @@ impl KernelSpec for PagedAttnV2Fp8KnhdHd256Bs32 {
         Param::i32("sliding_window"),
         Param::i32("use_alibi"),
         Param::t_out("tmp_out", Dtype::F16, 2),
-    ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::U8)];
+];
+
+impl KernelSpec for PagedAttnV2Fp8KnhdHd256Bs32 {
+    const ENTRY: &'static str = "vllm_paged_attention_v2_fp8_knhd_hd256bs32";
+    const SOURCE: &'static str = include_str!("../../cu/attention/pagedattention_f16.cu");
+    const PARAMS: &'static [Param] = PAGED_V2_FP8_KNHD_PARAMS;
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;
@@ -97,6 +98,7 @@ impl KernelSpec for PagedAttnV2Fp8KnhdHd256Bs32 {
         grp: None,
         tile: None,
     };
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::U8)];
 }
 
 /// `vllm_paged_attention_v2_reduce_f16_hd256` —— 分区 partial 归并
@@ -105,7 +107,7 @@ pub struct PagedAttnV2ReduceF16Hd256;
 
 impl KernelSpec for PagedAttnV2ReduceF16Hd256 {
     const ENTRY: &'static str = "vllm_paged_attention_v2_reduce_f16_hd256";
-    const SOURCE: &'static str = sources::attention::PAGED_ATTENTION_F16;
+    const SOURCE: &'static str = include_str!("../../cu/attention/pagedattention_f16.cu");
     const PARAMS: &'static [Param] = &[
         Param::t_in("exp_sums", Dtype::F32, 2),
         Param::t_in("max_logits", Dtype::F32, 2),
@@ -130,7 +132,7 @@ pub struct K0WriteFp8Knhd;
 
 impl KernelSpec for K0WriteFp8Knhd {
     const ENTRY: &'static str = "owl_reshape_and_cache_fp8kv_knhd";
-    const SOURCE: &'static str = sources::attention::RESHAPE_AND_CACHE_FP8KV;
+    const SOURCE: &'static str = include_str!("../../cu/attention/reshape_and_cache_fp8kv.cu");
     const PARAMS: &'static [Param] = &[
         Param::t_in("key", Dtype::F16, 3),
         Param::t_in("value", Dtype::F16, 3),
@@ -174,7 +176,7 @@ pub struct ChunkedPrefillFp8KnhdHd256;
 
 impl KernelSpec for ChunkedPrefillFp8KnhdHd256 {
     const ENTRY: &'static str = "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256";
-    const SOURCE: &'static str = sources::attention::PREFILL_PAGED_ATTN_F16;
+    const SOURCE: &'static str = include_str!("../../cu/attention/prefill_paged_attn_f16.cu");
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
         Param::t_in("k_cache", Dtype::U8, 4),
@@ -220,7 +222,7 @@ pub struct K0WriteFp8Classic;
 
 impl KernelSpec for K0WriteFp8Classic {
     const ENTRY: &'static str = "owl_reshape_and_cache_fp8kv";
-    const SOURCE: &'static str = sources::attention::RESHAPE_AND_CACHE_FP8KV;
+    const SOURCE: &'static str = include_str!("../../cu/attention/reshape_and_cache_fp8kv.cu");
     const PARAMS: &'static [Param] = K0_PARAMS;
     const POOL: &'static [PoolAccess] = &[
         PoolAccess::write(pools::KV_MAIN, LayoutTag::Classic, Dtype::U8),
@@ -260,7 +262,7 @@ pub struct K0WriteBf16;
 
 impl KernelSpec for K0WriteBf16 {
     const ENTRY: &'static str = "vllm_reshape_and_cache_bf16";
-    const SOURCE: &'static str = sources::attention::RESHAPE_AND_CACHE_F16;
+    const SOURCE: &'static str = include_str!("../../cu/attention/reshape_and_cache.cu");
     const PARAMS: &'static [Param] = &[
         Param::t_in("key", Dtype::BF16, 3),
         Param::t_in("value", Dtype::BF16, 3),
@@ -294,7 +296,7 @@ pub struct NcAttnFp8kvBf16;
 
 impl KernelSpec for NcAttnFp8kvBf16 {
     const ENTRY: &'static str = "owl_naive_attn_nc_fp8kv_bf16";
-    const SOURCE: &'static str = sources::owl::DFLASH2_F16;
+    const SOURCE: &'static str = include_str!("../../cu/owl/dflash2.cu");
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::BF16, 2),
         Param::t_in("k_self", Dtype::BF16, 3),
@@ -334,7 +336,7 @@ pub struct NormRopeF16;
 
 impl KernelSpec for NormRopeF16 {
     const ENTRY: &'static str = "owl_norm_rope_f16";
-    const SOURCE: &'static str = sources::owl::NORM_ROPE_F16;
+    const SOURCE: &'static str = include_str!("../../cu/owl/fused.cu");
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::F16, 2),
         Param::t_in("w", Dtype::F16, 1),
@@ -358,7 +360,7 @@ pub struct NormRopeBf16;
 
 impl KernelSpec for NormRopeBf16 {
     const ENTRY: &'static str = "owl_norm_rope_bf16";
-    const SOURCE: &'static str = sources::owl::NORM_ROPE_F16;
+    const SOURCE: &'static str = include_str!("../../cu/owl/fused.cu");
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::BF16, 2),
         Param::t_in("w", Dtype::BF16, 1),
@@ -392,6 +394,92 @@ pub static NC_ATTN_FP8KV_BF16: KernelMeta = meta_of::<NcAttnFp8kvBf16>();
 pub static NORM_ROPE_F16: KernelMeta = meta_of::<NormRopeF16>();
 pub static NORM_ROPE_BF16: KernelMeta = meta_of::<NormRopeBf16>();
 
+
+// ============================================================================
+// R1 批次 1:attention 池读写变体族(用户裁决 2026-10-13:凡是用到都必须有声明)
+// —— 共享参数表(同 ABI 只差 ENTRY/池 dtype/几何声明),逐表由 `.cu` 互证门对账
+// ============================================================================
+
+/// paged v2 主核参数表(f16/fp8 × classic/kNHD × hd128/256 同 ABI;18 参)
+const PAGED_V2_PARAMS: &[Param] = PAGED_V2_FP8_KNHD_PARAMS;
+/// reduce 参数表(6 参;hd128/hd256 同 ABI)
+const PAGED_V2_REDUCE_PARAMS: &[Param] = &[
+    Param::t_in("exp_sums", Dtype::F32, 2),
+    Param::t_in("max_logits", Dtype::F32, 2),
+    Param::t_in("tmp_out", Dtype::F16, 2),
+    Param::t_in("context_lens", Dtype::F32, 1),
+    Param::i32("max_num_partitions"),
+    Param::t_out("out", Dtype::F16, 2),
+];
+
+/// paged v2 变体描述符(表里只写差异项;ABI 由共享参数表承担)
+macro_rules! paged_v2_variant {
+    ($ty:ident, $entry:literal, $pool_dt:expr, $hd:expr, $page:expr, $dims:expr) => {
+        #[doc = concat!("`", $entry, "`(paged attention v2 变体;ABI = PAGED_V2_PARAMS)")]
+        pub struct $ty;
+
+        impl KernelSpec for $ty {
+            const ENTRY: &'static str = $entry;
+            const SOURCE: &'static str = include_str!("../../cu/attention/pagedattention_f16.cu");
+            const PARAMS: &'static [Param] = PAGED_V2_PARAMS;
+            const LAWS: &'static [Law] = &[Law::OutputFinite];
+            const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+            const DETERMINISM: Determinism = Determinism::Deterministic;
+            const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+                kv_dtype: Some($pool_dt),
+                head_dim: $dims,
+                page: $page,
+                grp: None,
+                tile: None,
+            };
+            const POOL: &'static [PoolAccess] =
+                &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, $pool_dt)];
+        }
+    };
+}
+
+paged_v2_variant!(PagedV2F16Hd128Bs32, "vllm_paged_attention_v2_f16_hd128bs32", Dtype::F16, 128, &[32], &[128]);
+paged_v2_variant!(PagedV2F16Hd256Bs32, "vllm_paged_attention_v2_f16_hd256bs32", Dtype::F16, 256, &[32], &[256]);
+paged_v2_variant!(PagedV2F16KnhdHd128Bs32, "vllm_paged_attention_v2_f16_knhd_hd128bs32", Dtype::F16, 128, &[32], &[128]);
+paged_v2_variant!(PagedV2F16KnhdHd256Bs32, "vllm_paged_attention_v2_f16_knhd_hd256bs32", Dtype::F16, 256, &[32], &[256]);
+paged_v2_variant!(PagedV2F16KnhdHd128, "vllm_paged_attention_v2_f16_knhd_hd128", Dtype::F16, 128, &[16], &[128]);
+paged_v2_variant!(PagedV2F16KnhdHd256, "vllm_paged_attention_v2_f16_knhd_hd256", Dtype::F16, 256, &[16], &[256]);
+paged_v2_variant!(PagedV2Fp8Hd128, "vllm_paged_attention_v2_fp8_hd128", Dtype::U8, 128, &[16], &[128]);
+paged_v2_variant!(PagedV2Fp8Hd256, "vllm_paged_attention_v2_fp8_hd256", Dtype::U8, 256, &[16], &[256]);
+paged_v2_variant!(PagedV2Fp8Hd128Bs32, "vllm_paged_attention_v2_fp8_hd128bs32", Dtype::U8, 128, &[32], &[128]);
+paged_v2_variant!(PagedV2Fp8Hd256Bs32, "vllm_paged_attention_v2_fp8_hd256bs32", Dtype::U8, 256, &[32], &[256]);
+paged_v2_variant!(PagedV2Fp8KnhdHd128Bs32, "vllm_paged_attention_v2_fp8_knhd_hd128bs32", Dtype::U8, 128, &[32], &[128]);
+paged_v2_variant!(PagedV2Fp8KnhdHd256, "vllm_paged_attention_v2_fp8_knhd_hd256", Dtype::U8, 256, &[16], &[256]);
+paged_v2_variant!(PagedV2Fp8KnhdHd128, "vllm_paged_attention_v2_fp8_knhd_hd128", Dtype::U8, 128, &[16], &[128]);
+
+/// `vllm_paged_attention_v2_reduce_f16_hd128` —— 分区归并(hd128 变体)
+pub struct PagedV2ReduceF16Hd128;
+
+impl KernelSpec for PagedV2ReduceF16Hd128 {
+    const ENTRY: &'static str = "vllm_paged_attention_v2_reduce_f16_hd128";
+    const SOURCE: &'static str = include_str!("../../cu/attention/pagedattention_f16.cu");
+    const PARAMS: &'static [Param] = PAGED_V2_REDUCE_PARAMS;
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+
+pub static PAGED_V2_F16_HD128BS32: KernelMeta = meta_of::<PagedV2F16Hd128Bs32>();
+pub static PAGED_V2_F16_HD256BS32: KernelMeta = meta_of::<PagedV2F16Hd256Bs32>();
+pub static PAGED_V2_F16_KNHD_HD128BS32: KernelMeta = meta_of::<PagedV2F16KnhdHd128Bs32>();
+pub static PAGED_V2_F16_KNHD_HD256BS32: KernelMeta = meta_of::<PagedV2F16KnhdHd256Bs32>();
+pub static PAGED_V2_F16_KNHD_HD128: KernelMeta = meta_of::<PagedV2F16KnhdHd128>();
+pub static PAGED_V2_F16_KNHD_HD256: KernelMeta = meta_of::<PagedV2F16KnhdHd256>();
+pub static PAGED_V2_FP8_HD128: KernelMeta = meta_of::<PagedV2Fp8Hd128>();
+pub static PAGED_V2_FP8_HD256: KernelMeta = meta_of::<PagedV2Fp8Hd256>();
+pub static PAGED_V2_FP8_HD128BS32: KernelMeta = meta_of::<PagedV2Fp8Hd128Bs32>();
+pub static PAGED_V2_FP8_HD256BS32: KernelMeta = meta_of::<PagedV2Fp8Hd256Bs32>();
+pub static PAGED_V2_FP8_KNHD_HD128BS32: KernelMeta = meta_of::<PagedV2Fp8KnhdHd128Bs32>();
+pub static PAGED_V2_FP8_KNHD_HD256: KernelMeta = meta_of::<PagedV2Fp8KnhdHd256>();
+pub static PAGED_V2_FP8_KNHD_HD128: KernelMeta = meta_of::<PagedV2Fp8KnhdHd128>();
+pub static PAGED_V2_REDUCE_F16_HD128: KernelMeta = meta_of::<PagedV2ReduceF16Hd128>();
+
 /// 本域全部已建表算子
 pub static METAS: &[&KernelMeta] = &[
     &NC_ATTN_BF16_V2,
@@ -404,6 +492,21 @@ pub static METAS: &[&KernelMeta] = &[
     &NC_ATTN_FP8KV_BF16,
     &NORM_ROPE_F16,
     &NORM_ROPE_BF16,
+    // ---- R1 批次 1:paged v2 变体族 ----
+    &PAGED_V2_F16_HD128BS32,
+    &PAGED_V2_F16_HD256BS32,
+    &PAGED_V2_F16_KNHD_HD128BS32,
+    &PAGED_V2_F16_KNHD_HD256BS32,
+    &PAGED_V2_F16_KNHD_HD128,
+    &PAGED_V2_F16_KNHD_HD256,
+    &PAGED_V2_FP8_HD128,
+    &PAGED_V2_FP8_HD256,
+    &PAGED_V2_FP8_HD128BS32,
+    &PAGED_V2_FP8_HD256BS32,
+    &PAGED_V2_FP8_KNHD_HD128BS32,
+    &PAGED_V2_FP8_KNHD_HD256,
+    &PAGED_V2_FP8_KNHD_HD128,
+    &PAGED_V2_REDUCE_F16_HD128,
 ];
 
 /// **谓词 ⇔ 声明一致性**(P4:收编 driver 谓词 —— 页配对律此前只住
