@@ -1,4 +1,4 @@
-//! Marlin W4A16 runtime(StaticLib 链路;纯 FFI 零句柄,stream/dev 注入)。
+//! Marlin W4A16 runtime(FFI 直调链路;纯 FFI 零句柄,stream/dev 注入)。
 //! 三名同构:f16 / AWQ / bf16(名路由 → gemm_v2_raw / gemm_v2_raw_bf16)。
 
 use crate::contract::{Bytes, LaunchMsg, OpError, OpId, Stage};
@@ -31,9 +31,6 @@ impl KernelFamily for MarlinRuntime {
         Self::OPS
     }
 
-    fn linkage(&self) -> crate::contract::Linkage {
-        crate::contract::Linkage::StaticLib
-    }
 
     /// 构造函数:纯 FFI 零句柄;链接期已解析(装配门 = 无)
     fn assemble(

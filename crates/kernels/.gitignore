@@ -1,1 +1,10 @@
+# (2026-10-13 起 `assets/` 已整体退役 —— gdn_chunked 六核改**构建期 AOT 自编**,
+#  见 fla/README.md 与 tools/gdn_aot_compile.py;此处保留忽略项以防将来有临时产物。)
 assets
+
+# Python 字节码(AOT 编译脚本跑过后会生成;不进版本)
+__pycache__/
+
+# uv 环境(AOT 构建用;`uv sync --project crates/kernels` 生成)
+.venv/
+uv.lock

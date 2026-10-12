@@ -97,7 +97,7 @@ pub trait DeviceRes {
     fn record_capture(&mut self, note: LaunchNote) -> Result<(), OpError>;
     /// host 字节上传到设备指针(meta 表/小常量;同步语义,回执即落地)
     fn upload(&mut self, dst: DevPtr, src: &[u8]) -> Result<(), OpError>;
-    /// 设备序号(FFI 面 dev 注入;marlin/cublas 等 StaticLib 家族用)
+    /// 设备序号(FFI 面 dev 注入;marlin/cublas 等直调家族用)
     fn device_ordinal(&self) -> Result<i32, OpError>;
     /// **账本块分配**(装配期自检专用;2026-10-13 P5c)。
     ///
@@ -122,17 +122,6 @@ pub trait DeviceRes {
     fn download(&mut self, src: DevPtr, dst: &mut [u8]) -> Result<(), OpError>;
 }
 
-
-/// 函数解析键(Linkage 三链路一个入口)
-#[derive(Debug, Clone)]
-pub enum FunctionKey {
-    /// AOT cubin 资产符号(boot 期已装载,此处查表)
-    Cubin { asset: &'static str, symbol: &'static str },
-    /// NVRTC 源码(首用编译,(source hash, name) 缓存)
-    Nvrtc { name: &'static str, source: &'static str },
-    // StaticLib 不走这里:FFI 直调(链接期已解析),init 期只做
-    // 句柄/workspace 预钉 —— ensure_blas / marlin workspace / FI plan ws。
-}
 
 /// 设备码块身份(**缓存键的唯一真源**)。
 ///

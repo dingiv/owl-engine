@@ -1,0 +1,67 @@
+# owl-kernels Triton AOT 构建环境(uv 项目;2026-10-13)
+#
+# 用途:`crates/kernels/triton/gdn_aot_compile.py` 把 gdn_chunked 六核从
+# **树内 vendor 的 FLA 源**(`triton/fla/`)AOT 编成 cubin —— build.rs 默认调它。
+#
+# 用法:
+#     uv sync --project crates/kernels        # → crates/kernels/.venv(装 deps + 本包 editable)
+#     cargo build                             # build.rs 自动用这个 venv
+#     # 也可直接跑(uv 会带上本环境):
+#     uv run --project crates/kernels triton/gdn_aot_compile.py --out /tmp/gdn
+#
+# 为什么钉死 triton==3.7.1:它是**编译器**,版本变了 SASS 就变 ⇒ 资产不再是
+# "逐字节可复现"。这一条不能松。
+# 为什么用 CPU 版 torch:FLA 的 wrapper 用 torch 做张量簿记(alloc/dtype/shape/
+# contiguous),AOT 只编译不发射 ⇒ **不需要 CUDA 版**(省 ~2.5 GB);配合脚本的
+# `--device none`(target 桩)⇒ **构建期零 GPU**。
+
+[project]
+name = "owl-kernels-triton-aot"
+version = "0.0.0"
+description = "owl kernels: gdn_chunked Triton AOT build environment"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # 编译器:钉死(= 产出既有资产的版本)
+    "triton==3.7.1",
+    # 张量簿记(wrapper 用);版本不参与 codegen ⇒ 由 uv.lock 钉
+    "torch",
+]
+
+# ---------------------------------------------------------------------------
+# 源目录声明(**根 = triton/**,顶层模块列在 module-name 里)
+#
+# `module-root = "triton"` ⇒ 打包器去 `crates/kernels/triton/` 下找源;
+# `module-name = ["fla"]`  ⇒ 顶层模块 = `triton/fla`(vendor 的 FLA 闭包)。
+# 装的是 **editable**(uv 缺省 dev 模式)⇒ venv 里的 `fla` 指回树内源码,
+# 不留第二份拷贝;脚本里 `import fla.ops` 直接可用,不必手插 sys.path。
+#
+# ★ **加下一个 Triton 算子族**(用户 2026-10-13 追问):uv_build 的 module-name
+#   **支持列表**(实测/官方文档:`module-name = ["foo", "bar"]`)。所以加族 =
+#     1) 把上游包 vendor 到 `triton/<name>/`(保持其内部相对 import 的包名);
+#     2) 往下面这个列表**加一个名字**(一行);
+#     3) 该族的 AOT 脚本 + 配置表放 `triton/<name>_aot.{py,json}`;
+#     4) build.rs 加一段(资产表 + 增量闸)+ family 侧 resolve。
+#   完整配方见 triton/README.md「加一个新的 Triton 算子族」一节。
+#   (不推荐 `namespace = true` 自动收:官方注明它会**关掉安全检查**。)
+#
+# ⚠️ 若哪天要改成"不装本包"(纯工具环境):去掉 [build-system] 与
+# [tool.uv.build-backend],加 `[tool.uv] package = false` —— 那样模块不被装,
+# 脚本会退回 `sys.path.insert(triton/)` 兜底(两条路都在脚本里)。
+# ---------------------------------------------------------------------------
+[build-system]
+requires = ["uv_build>=0.12,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = "triton"
+# 顶层模块列表:加新族就往这里加名字(uv_build 支持列表形式)
+module-name = ["fla"]
+
+# torch 走 CPU 轮子(构建期不需要 CUDA)
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }

@@ -162,7 +162,11 @@ fn compile_fatbin(
     true
 }
 
-fn build_native_cubins(out_dir: &std::path::Path, xqa_rows: &[(&'static str, PathBuf)]) {
+fn build_native_cubins(
+    out_dir: &std::path::Path,
+    xqa_rows: &[(&'static str, PathBuf)],
+    gdn_rows: &[(&'static str, PathBuf)],
+) {
     let manifest_path = out_dir.join("cubin_assets.rs");
     // ⚠️ 必须在**两条分支之外**发这条指令:指令只在 build.rs 真的跑过那次才被
     // cargo 记住 —— 上一轮没发,这一轮改 OWL_CUBIN_SKIP 就不会触发重跑
@@ -234,6 +238,26 @@ fn build_native_cubins(out_dir: &std::path::Path, xqa_rows: &[(&'static str, Pat
     }
     out.push_str("];\n\n");
     out.push_str(&xqa_table_src(xqa_rows));
+    out.push_str(&gdn_table_src(gdn_rows));
+    // ---- 资产指纹(见下方注释:这是**强制 crate 重编**的唯一可靠手段)----
+    let mut fp: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |bytes: &[u8]| {
+        for b in bytes.iter().step_by(7) {
+            fp ^= *b as u64;
+            fp = fp.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for (_, _, _, _, bin) in &rows {
+        if let Ok(b) = std::fs::read(bin) {
+            mix(&b);
+        }
+    }
+    for (_, bin) in xqa_rows.iter().chain(gdn_rows.iter()) {
+        if let Ok(b) = std::fs::read(bin) {
+            mix(&b);
+        }
+    }
+    println!("cargo:rustc-env=OWL_ASSET_FP={fp:016x}");
     std::fs::write(&manifest_path, out).expect("write cubin_assets.rs");
     println!(
         "cargo:warning=owl-kernels: 构建期 cubin {} 个源文件 ({}) —— {} 个源可零 NVRTC 发射{}",
@@ -316,8 +340,103 @@ fn build_xqa_assets(out_dir: &std::path::Path) -> Vec<(&'static str, PathBuf)> {
     rows
 }
 
+// ============================================================================
+// GDN chunked 资产(2026-10-13 C4b-β:**opt-in 构建期 AOT 自编**)
+//
+// 调 `triton/gdn_aot_compile.py`(需 Python+triton 环境),把六核从
+// **树内 vendor 的 FLA 源**(`triton/fla/`)+ **配置表**(`triton/gdn_chunked_aot.json`)
+// 编成 cubin;产物与入库采集件**逐字节一致**(实测,见设计 §15.11)。
+//
+// 缺省(不设该 env)= 用入库采集产物 ⇒ 默认构建**不需要** Python/triton。
+//
+// 旋钮:`GDN_TRITON_PY`(解释器;缺省探工作区 `vllm-test/.venv`)、
+//      `GDN_TRITON_DEVICE`(warmup 取 target 的设备,缺省 cuda:0)。
+// ============================================================================
+fn build_gdn_assets(out_dir: &std::path::Path) -> Vec<(&'static str, PathBuf)> {
+    const NAMES: &[&str] = &["cumsum", "kkt", "merge", "wu", "h", "o"];
+    // ⚠️ 三条 env 指令必须**无条件**发(cargo 只在 build.rs 真跑过那次才记住它):
+    // 写在 early-return 之后 = 缺省构建从不登记 ⇒ 之后设 env 不会触发重跑
+    // (实测踩过 OWL_CUBIN_SKIP 同款坑)
+    println!("cargo:rerun-if-env-changed=GDN_TRITON_BUILD");
+    println!("cargo:rerun-if-env-changed=GDN_TRITON_PY");
+    println!("cargo:rerun-if-env-changed=GDN_TRITON_DEVICE");
+    // **默认自编**(2026-10-13 用户裁决:既然构建期已引入 Python+triton,
+    // 就不留入库采集件)。`GDN_TRITON_BUILD=0` = 显式关(无 triton 环境仍能
+    // **编过**这个 crate;代价 = 该族的资产表为空 ⇒ 装配期拒启,见 family 侧)。
+    if env::var("GDN_TRITON_BUILD").ok().as_deref() == Some("0") {
+        println!("cargo:warning=owl-kernels: GDN_TRITON_BUILD=0 —— 跳过 gdn_chunked 六核自编(资产表为空,该族装配期拒启)");
+        return Vec::new();
+    }
+    let script = "triton/gdn_aot_compile.py";
+    println!("cargo:rerun-if-changed={script}");
+    let mut deps: Vec<String> = vec![script.to_string()];
+    deps.push("triton/gdn_chunked_aot.json".to_string());
+    all_files("triton", &mut deps);
+    deps.sort();
+
+    let dir = out_dir.join("gdn");
+    std::fs::create_dir_all(&dir).expect("mkdir gdn assets");
+    let flags = format!(
+        "gdn-aot py={:?} dev={:?}",
+        env::var("GDN_TRITON_PY").ok(),
+        env::var("GDN_TRITON_DEVICE").ok()
+    );
+    let probe = dir.join("cumsum.cubin");
+    if !stamp_hit(&probe, &deps, &flags) {
+        let py = env::var("GDN_TRITON_PY").unwrap_or_else(|_| {
+            // 本 crate 自己的 uv 环境(`uv sync --project crates/kernels`;声明见
+            // crates/kernels/pyproject.toml:triton==3.7.1 + CPU torch)
+            // → 退到工作区现成的 venv(vllm-test,见 cu/xqa/README 先例)
+            let cands = [".venv/bin/python", "../../../vllm-test/.venv/bin/python"];
+            match cands.iter().map(PathBuf::from).find(|p| p.exists()) {
+                Some(p) => p.to_string_lossy().into_owned(),
+                None => panic!(
+                    "gdn_chunked 六核 AOT 需要 Python+triton 环境:先 `uv sync --project crates/kernels` \
+                     生成 crates/kernels/.venv,或设 `GDN_TRITON_PY=<venv>/bin/python`;\
+                     也可 `GDN_TRITON_BUILD=0` 显式跳过(该族装配期拒启)"
+                ),
+            }
+        });
+        // 缺省 `none` = 零 GPU(target 桩);`GDN_TRITON_DEVICE=cuda:N` 切真实设备
+        let dev = env::var("GDN_TRITON_DEVICE").unwrap_or_else(|_| "none".into());
+        let status = Command::new(&py)
+            .arg(script)
+            .arg("--out")
+            .arg(&dir)
+            .arg("--device")
+            .arg(&dev)
+            .status()
+            .unwrap_or_else(|e| panic!("gdn-aot: failed to spawn {py}: {e}"));
+        assert!(status.success(), "gdn-aot: 自编失败({script})");
+        for n in NAMES {
+            let p = dir.join(format!("{n}.cubin"));
+            assert!(p.exists(), "gdn-aot: 自编未产出 {n}.cubin");
+        }
+        stamp_write(&probe, &deps, &flags);
+        println!(
+            "cargo:warning=owl-kernels: GDN chunked 六核 **AOT 自编**完成(树内 FLA 源 triton/fla/ + 配置表 triton/gdn_chunked_aot.json)"
+        );
+    } else {
+        println!("cargo:warning=owl-kernels: GDN chunked 六核 AOT 增量命中(零 triton)");
+    }
+    NAMES.iter().map(|n| (*n, dir.join(format!("{n}.cubin")))).collect()
+}
+
 /// `OWL_CUBIN_SKIP` 档的空登记表(纯 NVRTC 基线对照;同一文件形态免分支)
-const EMPTY_ASSETS_RS: &str = "// @generated (OWL_CUBIN_SKIP)\npub const CUBIN_ARCHS: &[&str] = &[];\n\npub struct CubinAsset {\n    pub asset: &'static str,\n    pub src: &'static str,\n    pub src_hash: u64,\n    pub src_len: usize,\n    pub bytes: &'static [u8],\n}\n\npub const CUBIN_ASSETS: &[CubinAsset] = &[];\n\npub const XQA_ASSETS: &[(&str, &[u8])] = &[];\n\npub fn xqa_asset(_name: &str) -> Option<&'static [u8]> {\n    None\n}\n";
+const EMPTY_ASSETS_RS: &str = "// @generated (OWL_CUBIN_SKIP)\npub const CUBIN_ARCHS: &[&str] = &[];\n\npub struct CubinAsset {\n    pub asset: &'static str,\n    pub src: &'static str,\n    pub src_hash: u64,\n    pub src_len: usize,\n    pub bytes: &'static [u8],\n}\n\npub const CUBIN_ASSETS: &[CubinAsset] = &[];\n\npub const XQA_ASSETS: &[(&str, &[u8])] = &[];\n\npub fn xqa_asset(_name: &str) -> Option<&'static [u8]> {\n    None\n}\n\npub const GDN_ASSETS: &[(&str, &[u8])] = &[];\n\npub fn gdn_asset(_name: &str) -> Option<&'static [u8]> {\n    None\n}\n";
+
+/// 生成 GDN chunked 资产表(opt-in 自编;空表 = 用入库采集件)
+fn gdn_table_src(rows: &[(&'static str, PathBuf)]) -> String {
+    let mut t = String::from(
+        "/// GDN chunked 六核(opt-in `GDN_TRITON_BUILD=1` 构建期 AOT 自编;空 = 用入库采集件)\n\
+         pub const GDN_ASSETS: &[(&str, &[u8])] = &[\n",
+    );
+    for (name, path) in rows {
+        t.push_str(&format!("    (\"{name}\", include_bytes!(\"{}\")),\n", path.display()));
+    }
+    t.push_str("];\n\n/// GDN 资产查表(核名 → cubin 字节;空表返回 None)\npub fn gdn_asset(name: &str) -> Option<&'static [u8]> {\n    GDN_ASSETS.iter().find(|(n, _)| *n == name).map(|(_, b)| *b)\n}\n");
+    t
+}
 
 /// 生成 XQA 资产表(宏变体:键 = 变体名;见 `build_xqa_assets` 头注)
 fn xqa_table_src(rows: &[(&'static str, PathBuf)]) -> String {
@@ -373,7 +492,8 @@ fn main() {
     // native cubin 构建期产出(终态 = 零运行期编译)
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let xqa_rows = build_xqa_assets(&out_dir);
-    build_native_cubins(&out_dir, &xqa_rows);
+    let gdn_rows = build_gdn_assets(&out_dir);
+    build_native_cubins(&out_dir, &xqa_rows, &gdn_rows);
     // ⚠️ 2026-10-13 修连坐:原 main() 在 `CARGO_FEATURE_MARLIN` 缺席时整段
     // return —— 而 FI/XQA 两段(.a 复制 + rustc-link-lib 指令)当时都写在
     // build_marlin() 体内 ⇒ **单独开 `--features flashinfer`(或 xqa)会静默

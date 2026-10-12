@@ -58,7 +58,6 @@ pub trait KernelFamily: Send {
         v
     }
 
-    fn linkage(&self) -> crate::contract::Linkage;
 
     /// **构造函数**(工厂语义)。带 `where Self: Sized` 保住 trait 的 dyn 兼容。
     fn assemble(
@@ -137,9 +136,6 @@ impl<F: KernelFamily + 'static> KernelFamily for FamilyGuard<F> {
     }
     fn names(&self) -> Vec<&'static str> {
         self.family().names()
-    }
-    fn linkage(&self) -> crate::contract::Linkage {
-        self.family().linkage()
     }
     /// 守卫由族工厂创建,不可作为工厂(类型错误拦在编译期之外)。
     fn assemble(
@@ -464,9 +460,6 @@ mod tests {
             }
             fn ops(&self) -> &'static [&'static crate::spec::KernelMeta] {
                 self.0
-            }
-            fn linkage(&self) -> crate::contract::Linkage {
-                crate::contract::Linkage::Nvrtc
             }
             fn assemble(
                 _res: &mut dyn crate::device::DeviceRes,

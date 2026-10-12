@@ -55,6 +55,16 @@ fn assemble_common(
     let out = res.alloc(CONSTS_SLOTS * 4, "xqa.consts")?;
     let vals = [crate::contract::LaunchVal::Ptr(out.ptr)];
     exec.launch(res, op, &probe, SYM_CONSTS, (1, 1, 1), (32, 1, 1), 0, &vals)?;
+    // ⚠️ **回读前必须同步**:`DeviceRes::download` 走 `cuMemcpyDtoH_v2`(阻塞在
+    // **NULL/legacy 默认流**上),与我们的 compute 流**不同流 ⇒ 不构成同步点**
+    // ⇒ 竞态读到全零(实测:同一份资产 verify 读到 40、decode 读到 0,间歇性;
+    // 装配期布局门当场拦下)。装配期路径非热路径,显式同步最省事。
+    // (对照:oracle 面一律 `r.sync()` 后再 `download` —— 同款纪律)
+    res.stream()?.synchronize().map_err(|e| OpError::Launch {
+        op: op.0.to_string(),
+        stage: crate::contract::Stage::Compute,
+        detail: format!("xqa consts sync: {e:?}"),
+    })?;
     let mut buf = [0u8; CONSTS_SLOTS * 4];
     res.download(out.ptr, &mut buf)?;
     let slots: Vec<u32> = buf
@@ -160,9 +170,6 @@ impl KernelFamily for XqaRuntime {
         Self::OPS
     }
 
-    fn linkage(&self) -> crate::contract::Linkage {
-        crate::contract::Linkage::AotCubin
-    }
 
     /// 装配:载 `xqa_verify` 资产 + 探针核读常量(workspace 仍由调用方给)
     fn assemble(
@@ -192,9 +199,6 @@ impl KernelFamily for XqaDecodeRuntime {
         Self::OPS
     }
 
-    fn linkage(&self) -> crate::contract::Linkage {
-        crate::contract::Linkage::AotCubin
-    }
 
     fn assemble(
         res: &mut dyn crate::device::DeviceRes,

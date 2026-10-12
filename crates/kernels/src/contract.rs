@@ -16,7 +16,7 @@
 //! DeviceClient —— 经 re-export 引用本模块,零破坏)。
 //!
 //! 新增词汇(operator-contract 施工设计 v0.4):[`OpError`](Result 全链的
-//! 错误模型)/[`FieldStats`]/[`Law`]/[`Stage`]/[`Linkage`]/[`OpId`]/
+//! 错误模型)/[`FieldStats`]/[`Law`]/[`Stage`]/[`OpId`]/
 //! [`InvariantBox`]。
 
 // ============================================================================
@@ -317,21 +317,8 @@ impl std::fmt::Display for OpId {
 }
 
 // ============================================================================
-// 链路形态 + 暂存盒(服务端面词汇;device.rs 消费)
+// 暂存盒(服务端面词汇;device.rs 消费)
 // ============================================================================
-
-/// 链路形态(§4.5;决定装载时机与校验门)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Linkage {
-    /// 构建期静态链接(.a / 系统库,extern "C"):链接期符号解析免费,
-    /// init 期只做句柄/workspace 预钉(ensure_blas 律)
-    StaticLib,
-    /// AOT cubin 资产(include_bytes!,gitignore + manifest):boot 期
-    /// load + 符号逐一校验 × manifest sha256 双门
-    AotCubin,
-    /// NVRTC 动态编译(源码在 git,首用编译 + (source hash, name) 缓存)
-    Nvrtc,
-}
 
 /// 不变盒:htod staging 的不变源(soff 案纪律)—— 捕获节点引用的
 /// host 缓冲必须与发射时序无关(每 T 一份永不互改);构造后不可变。

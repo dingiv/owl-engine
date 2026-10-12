@@ -108,9 +108,6 @@ impl KernelFamily for GdnChunkedRuntime {
         OP
     }
 
-    fn linkage(&self) -> crate::contract::Linkage {
-        crate::contract::Linkage::AotCubin
-    }
 
     /// 构造函数:六 cubin(符号逐一校验 = 装配门)+ cast nvrtc + setattr
     fn assemble(
@@ -118,15 +115,30 @@ impl KernelFamily for GdnChunkedRuntime {
         exec: &mut crate::device::Exec,
     ) -> Result<Box<dyn KernelFamily>, OpError> {
         let mut me = GdnChunkedRuntime::default();
-        let table: &[(&'static str, &[u8], &'static str)] = &[
-            ("cumsum", cubins::CUMSUM, "chunk_local_cumsum_scalar_kernel"),
-            ("kkt", cubins::KKT, "chunk_scaled_dot_kkt_fwd_kernel"),
-            ("merge", cubins::MERGE, "merge_16x16_to_64x64_inverse_kernel"),
-            ("wu", cubins::WU, "recompute_w_u_fwd_kernel"),
-            ("h", cubins::H, "chunk_gated_delta_rule_fwd_kernel_h_blockdim64"),
-            ("o", cubins::O, "chunk_fwd_kernel_o"),
+        // 资产取用:**构建期 AOT 自编**(缺 = 装配期拒启,见下)
+        let table: &[(&'static str, Option<&'static [u8]>, &'static str)] = &[
+            ("cumsum", cubins::cumsum(), "chunk_local_cumsum_scalar_kernel"),
+            ("kkt", cubins::kkt(), "chunk_scaled_dot_kkt_fwd_kernel"),
+            ("merge", cubins::merge(), "merge_16x16_to_64x64_inverse_kernel"),
+            ("wu", cubins::wu(), "recompute_w_u_fwd_kernel"),
+            ("h", cubins::h(), "chunk_gated_delta_rule_fwd_kernel_h_blockdim64"),
+            ("o", cubins::o(), "chunk_fwd_kernel_o"),
         ];
+        let missing: Vec<&str> =
+            table.iter().filter(|(_, b, _)| b.is_none()).map(|(n, _, _)| *n).collect();
+        if !missing.is_empty() {
+            return Err(OpError::Asset {
+                op: OP.0.to_string(),
+                detail: format!(
+                    "gdn_chunked 资产缺失 {missing:?}(六核 = {:?})—— 构建期 AOT 未跑?\
+                     缺省应自动自编(需 Python+triton,`GDN_TRITON_PY` 可指解释器);\
+                     `GDN_TRITON_BUILD=0` 会显式跳过 ⇒ 本族不可用。见 triton/README.md",
+                    cubins::NAMES
+                ),
+            });
+        }
         for (name, bytes, symbol) in table {
+            let bytes = bytes.expect("上方已查缺失");
             let f = exec.load_cubin(res, ASSET, bytes, symbol, OP)?;
             me.fns.insert(name, f);
         }

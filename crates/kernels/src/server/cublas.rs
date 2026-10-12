@@ -1,4 +1,4 @@
-//! cublas GEMM runtime(StaticLib 链路;FFI 直调,链接期符号已解析)。
+//! cublas GEMM runtime(FFI 直调链路,链接期符号已解析)。
 //!
 //! init:OwlCublas 句柄 + 私有工作区预钉(ensure_blas 律:构造期急切,
 //! 捕获内首次初始化事故类结构性消灭)。run:解析 → 三指针 → gemm。
@@ -31,9 +31,6 @@ impl KernelFamily for CublasRuntime {
         Self::OPS
     }
 
-    fn linkage(&self) -> crate::contract::Linkage {
-        crate::contract::Linkage::StaticLib
-    }
 
     /// 构造函数:OwlCublas 句柄预钉(ensure_blas 律:构造期急切,
     /// 捕获内首次初始化事故类结构性消灭)

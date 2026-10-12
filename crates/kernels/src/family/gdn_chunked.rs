@@ -61,24 +61,46 @@ pub fn is_foreign(name: &str) -> bool {
     name == GDN_CHUNKED_FWD
 }
 
-/// AOT 资产(cubin 内嵌;sm86 / triton 3.7.1 产出)
+/// 设备码资产(**构建期 AOT 自编**,2026-10-13 C4b-β)。
+///
+/// 源 = 树内 vendor 的 FLA(`triton/fla/`)+ 配置表 `triton/gdn_chunked_aot.json`;
+/// 编译 = `triton/gdn_aot_compile.py`(build.rs 默认跑,`GDN_TRITON_BUILD=0` 可关)。
+/// **不留入库采集件**:产物是构建产物,与 native cubin / marlin / FI 同形态。
+///
+/// 取用面返回 `Option`:缺 = 装配期**结构化拒启**(不 panic;见
+/// `server/gdn_chunked.rs::assemble`)。构建期缺失只可能来自
+/// `GDN_TRITON_BUILD=0`(显式关)或脚本失败。
 pub mod cubins {
-    pub const CUMSUM: &[u8] =
-        include_bytes!("../../assets/gdn_chunked/cumsum.cubin");
-    pub const KKT: &[u8] =
-        include_bytes!("../../assets/gdn_chunked/kkt.cubin");
-    pub const WU: &[u8] =
-        include_bytes!("../../assets/gdn_chunked/wu.cubin");
-    pub const H: &[u8] =
-        include_bytes!("../../assets/gdn_chunked/h.cubin");
-    /// 无初态变体(参数表无 h0;fresh 序列;shared 98564 / w4 / BV=64)
-    pub const H_NOH0: &[u8] =
-        include_bytes!("../../assets/gdn_chunked/h_noh0.cubin");
-    pub const O: &[u8] =
-        include_bytes!("../../assets/gdn_chunked/o.cubin");
+    #[cfg(feature = "device")]
+    fn asset(name: &'static str) -> Option<&'static [u8]> {
+        crate::family::cubins::gdn_asset(name)
+    }
+    #[cfg(not(feature = "device"))]
+    fn asset(_name: &'static str) -> Option<&'static [u8]> {
+        None
+    }
+
+    pub fn cumsum() -> Option<&'static [u8]> {
+        asset("cumsum")
+    }
+    pub fn kkt() -> Option<&'static [u8]> {
+        asset("kkt")
+    }
+    pub fn wu() -> Option<&'static [u8]> {
+        asset("wu")
+    }
+    pub fn h() -> Option<&'static [u8]> {
+        asset("h")
+    }
+    pub fn o() -> Option<&'static [u8]> {
+        asset("o")
+    }
     /// solve_tril(BT=64)单核形态:merge_16x16_to_64x64_inverse
-    pub const MERGE: &[u8] =
-        include_bytes!("../../assets/gdn_chunked/merge.cubin");
+    pub fn merge() -> Option<&'static [u8]> {
+        asset("merge")
+    }
+    /// 六核清单(装配期报告/缺件报错用)
+    pub const NAMES: &[&str] = &["cumsum", "kkt", "merge", "wu", "h", "o"];
 
     /// 发射常量(2026-10-11 fork-bf16 重采集:torch profiler 实测指纹,
     /// 采集于 T=1024/NK16/NV48/KD=VD=128/g-f32 配方;变体 = autotune 选中)
@@ -98,6 +120,6 @@ pub mod cubins {
         pub const O_BV: u32 = 64;
         pub const O_SHARED: u32 = 24576;
         pub const O_WARPS: u32 = 4;
-        // 旧 pip-fla f32 时代常量已随资产备份(assets/gdn_chunked_pipfla_f32)
+        // (pip-fla f32 时代的对照臂常量与资产已于 2026-10-13 退役删除)
     }
 }

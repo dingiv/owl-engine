@@ -1,4 +1,4 @@
-//! FlashInfer paged prefill runtime(StaticLib 链路;FFI plan/run 分离)。
+//! FlashInfer paged prefill runtime(FFI 直调链路;plan/run 分离)。
 //!
 //! init:workspace 预钉(float 64MB + int 32MB;构造期,捕获内首次初始化
 //! 事故类结构性消灭)。run:plan(每形状缓存,键 = 形状七元组)→ run
@@ -65,9 +65,6 @@ impl KernelFamily for FiRuntime {
         Self::OPS
     }
 
-    fn linkage(&self) -> crate::contract::Linkage {
-        crate::contract::Linkage::StaticLib
-    }
 
     /// 构造函数:workspace 预钉(float 64MB + int 32MB;构造期,
     /// 捕获内首次初始化事故类结构性消灭)

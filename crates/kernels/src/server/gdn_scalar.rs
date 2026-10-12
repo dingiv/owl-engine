@@ -30,9 +30,6 @@ impl KernelFamily for GdnScalarRuntime {
         OP
     }
 
-    fn linkage(&self) -> crate::contract::Linkage {
-        crate::contract::Linkage::AotCubin
-    }
 
     /// 构造函数:单核 cubin + cast nvrtc + soff 预钉
     fn assemble(

@@ -1346,3 +1346,214 @@ marlin selector ⊆ 实例化 ✓(258 变体引用 / 258 个已实例化)
 | flashinfer | 构建期 `.a`(设备码 + C host;头闭包在树) | **0** |
 | gdn_chunked(13 cubin) | `assets/`(**gitignore** —— 本就是运行期必需但未入库!) | 0(但**不可复现**,C4b 待办) |
 | cublas | 系统 `.so`(唯一例外) | 0 |
+
+---
+
+### 15.10 收尾(2026-10-13):死代码 + 资产入库 + 终态
+
+#### 15.10.1 `Linkage` / `FunctionKey` 删除(C5-α)
+
+`Linkage` 三态(`StaticLib`/`AotCubin`/`Nvrtc`)自 §15.5 起就只剩**声明**
+作用:全仓唯一引用是 `KernelFamily::linkage()` 的**直通**(`FamilyGuard` 转发),
+**零消费者**。装载形态现在由**实现事实**决定(资产表 / FFI 直调),声明式字段
+只会成为"声明与实现漂移"的温床 ⇒ **整块删除**(trait 方法 + 7 个族实现 +
+测试桩 + `contract.rs` 枚举)。同批删 `device::FunctionKey`(死枚举:三链路
+合一后无人构造)。
+
+#### 15.10.2 `assets/` 改回入库(C4b-α;clone 可编)
+
+**实测缺陷**:`crates/kernels/.gitignore` 忽略整个 `assets/`,而
+`family/gdn_chunked.rs` 用 `include_bytes!("../../assets/gdn_chunked/*.cubin")`
+⇒ **clean clone 根本编不过**(`include_bytes!` 找不到文件),生产档
+`gdn_chunked` prefill 臂也无从运行。这与 §15.7 发现 gdn_scalar blob 的问题
+**同类同因**("gitignore 掉了运行期必需的资产")。
+
+处置:**去掉 `.gitignore` 条目 + 资产入库**(13 cubin + provenance json +
+manifest,1.7 MB);新增 `assets/README.md` 记**来源/复现配方/根治工单**
+(源是 Triton `.py`,构建期编译需 triton+torch ≈1.8 GB 开发期依赖;
+源当前在 `packages/vllm` 检出里 = owl 树外,故先入库止血)。
+
+#### 15.10.3 终态:资产面一览
+
+| 家族 | 载体 | 源在树 | git 内二进制 | clone 可重建 |
+|---|---|---|---|---|
+| native 110 核 + gdn_scalar + xqa(2 变体) | 构建期 fatbin | ✅ | 0 | ✅ |
+| marlin | 构建期 `.a`(4 支设备码 + C host) | ✅ | 0 | ✅ |
+| flashinfer | 构建期 `.a`(设备码 + C host) | ✅(头闭包已 vendor) | 0 | ✅ |
+| gdn_chunked(13 cubin) | 采集产物入库 + 配方在树 | ⚠️(源在 vllm 检出) | 1.7 MB | ⚠️(需 triton;工单在案) |
+| cublas | 系统 `.so`(唯一例外) | — | 0 | ✅ |
+
+**四条律全部达成**:① 零运行期编译(结构性门 + `aot-miss`=0)
+② 源在树(唯一例外 = gdn_chunked 的 Triton 源,已立工单)
+③ 形态统一(一处机制:构建期资产;一处例外:系统库)
+④ 架构 = 构建期一等输入(`OWL_CUBIN_ARCHS` + 装配期架构门)。
+
+**终态判据**(真机):boot 26.6 s + 首答 0.5 s;`[aot] 110/110`、`aot-miss` = 0;
+marlin oracle `max|err| = 3.065e-4`(与预编件时代同值);xqa 5.29×(0.505 ms vs
+2.673 ms)/ decode 1.47×,与历史记录一致;回归全绿;clippy 0 警。
+
+> 过程留档(值得记的一条,含一次**误诊更正**):收尾时出现过
+> `[xqa] 布局失配:内核 0 B vs Rust 镜像 40 B`。当时先判"旧 OUT_DIR 陈旧 fatbin",
+> **错了** —— 真因是 **回读竞态**:`DeviceRes::download` 走 `cuMemcpyDtoH_v2`
+> (阻塞在 **NULL/legacy 默认流**),与 compute 流不同流 ⇒ 不构成同步点 ⇒ 间歇
+> 读到全零(同一份资产 verify 读到 40 / decode 读到 0)。修法 = 回读前显式
+> `res.stream()?.synchronize()`(oracle 面本来就有 `r.sync()` 同款纪律,见 §15.11.3)。
+> **两次都是布局硬门拦下的**(fail-closed 而非静默错值)—— 这正是 §15.8.2
+> "资产自描述"要买的东西。顺带修掉一条 cargo 跟踪隐患:资产经 `rustc-env`
+> 发**指纹**(`OWL_ASSET_FP`),指纹变 ⇒ 强制重编 crate(见 §15.11.3 末行)。
+
+---
+
+### 15.11 C4b-β —— gdn_chunked 六核**我们自编**(2026-10-13;opt-in,产物逐字节复现)
+
+用户追问:"这些预编译文件不能由我们自己来编吗?" ⇒ 能,而且**编出来与入库件
+逐字节相同**。
+
+#### 15.11.1 结论先给
+
+| 核 | AOT 自编 | 入库采集件 | 对比 |
+|---|---|---|---|
+| cumsum | 9952 B `c1c4285f76d5` | 9952 B `c1c4285f76d5` | **字节一致 ✓** |
+| kkt | 39264 B `c6c8b7e1b79e` | 39264 B `c6c8b7e1b79e` | **字节一致 ✓** |
+| merge | 134880 B `9ff7c2ab80b4` | 134880 B `9ff7c2ab80b4` | **字节一致 ✓** |
+| wu | 81120 B `0a16fe8bbf83` | 81120 B `0a16fe8bbf83` | **字节一致 ✓** |
+| h | 124000 B `e80afeef2002` | 124000 B `e80afeef2002` | **字节一致 ✓** |
+| o | 86624 B `f4803d0235b1` | 86624 B `f4803d0235b1` | **字节一致 ✓** |
+
+⇒ 采集件不再是"不可复现的外来 blob":**源在树 + 配置烘焙 ⇒ 可重建**。
+
+#### 15.11.2 三件事让它成为可能
+
+1. **源 vendor 进树**(§15.1.1 律 1):`triton/fla/` = 六核 import 闭包(9 文件,
+   236 KB)。原文件从 vllm 取 `triton_utils`/`platforms` ⇒ 加
+   `fla/triton_shim.py` 等价垫片 + 改 import(语义不变);
+   `ops/__init__.py` 清空(未 vendor 的模块会 ModuleNotFoundError)。
+2. **配置烘焙**:`assets/gdn_chunked/*.json` 记的是当年 autotune 选中值的
+   **结果**(`num_warps/num_stages/shared`),而源码 `@triton.autotune(configs=…)`
+   的 config 还带 constexpr kwargs(`BK`/`BV`)。kkt/h/o 的 `(w,s)` 各有
+   3/2/4 个候选 ⇒ **逐个候选编译、用编译产物回读的 `shared` 与记录值比对**,
+   唯一命中者即选中配置(全部不中 = 报错退出,不猜)。实测命中:
+   `kkt BK=64` / `h BV=64` / `o BK=32,BV=64`。
+3. **AOT 而非跑流水线**:内核对象被换成 `_WarmupProxy` —— wrapper 照常算
+   args/constexpr/grid,但 `kernel[grid](…)` 变成 `jit_fn.warmup(…)`
+   (**只编译不发射**)。⇒ 复用 wrapper 的**逐字配方**(零手抄 args),
+   不跑流水线、不重跑 autotune(后者会让产物**不确定**)。
+
+#### 15.11.3 踩坑留档(每一条都实测复现过)
+
+| 坑 | 症状 | 正解 |
+|---|---|---|
+| 换掉模块符号 | `dynamic_func() missing IS_VARLEN` | **必须保留外层 `Heuristics`**(它注入 IS_VARLEN),只顶替它内层的 autotuner/jit |
+| 候选轮询取"当前值" | `'_WarmupProxy' object has no attribute 'warmup'` | `Heuristics` 是**就地被改**的 ⇒ 每轮从**原始对象**重建,且提前 `_jit_of` 剥到底 |
+| grid 回调吃 meta | `KeyError: 'BV'` | `def grid(meta)` 要用**并入候选 kwargs 之后**的 meta 求值 |
+| dtype 配方 | `Both operands must be same dtype. Got fp16 and fp32`(o 核)/ `Expected fp32 but got fp16`(kkt) | 引擎先 `owl_cast_f16_bf16` 把输入转 **bf16** ⇒ 激活域 = bf16(`h_buf` 亦 bf16),`g/g_cum/A/state` = f32。**按资产 `origin`("bf16+g_f32")与引擎实参走**,别信 harvest 脚本里遗留的 `DT=f16`(那会让 cumsum 从 9952 变 10080) |
+| 默认 CUDA 设备 | autotuner bench 内 `Pointer argument cannot be accessed from Triton (cpu tensor?)` | `torch.cuda.set_device(dev)` 必须与张量设备一致(否则 bench 在设备 0 分配、张量在设备 1) |
+| build.rs env 指令位置 | 设 `GDN_TRITON_BUILD=1` 不触发重编 | `rerun-if-env-changed` 必须**无条件**发(同 §15.6.5 的 `OWL_CUBIN_SKIP` 坑) |
+| **装配期回读竞态**(§15.8 同款,误诊过一次) | `download` 读到全零(间歇) | `download` = `cuMemcpyDtoH_v2` 阻塞在 **NULL 流**,与 compute 流不同流 ⇒ **回读前显式 `stream().synchronize()`** |
+| `include_bytes!` 指向 `$OUT_DIR` 产物 | 资产已更新、rlib 仍嵌旧字节 | 资产经 `rustc-env` 发**指纹**(`OWL_ASSET_FP`,boot 报告可见)⇒ 指纹变即强制重编 crate |
+
+> 另:原 `testdata/gdn_fla/harvest_fork.py`(跑流水线的旧配方)**并非"跑不通"**,
+> 而是要求默认 CUDA 设备 = 张量设备(见上表);它的问题在别处 ——
+> autotune 现场选配置 ⇒ 产物不确定,且要 GPU 跑完整流水线。故自建走 AOT。
+
+#### 15.11.4 接线与验收
+
+| 层 | 变化 |
+|---|---|
+| `triton/fla/`(新) | FLA 六核闭包 vendor + `triton_shim.py` + README(来源/改动/升级法) |
+| `triton/gdn_aot_compile.py`(新) | AOT 编译脚本(配置自校验;`--out` / `--device`) |
+| `build.rs` | `GDN_TRITON_BUILD=1`(opt-in)⇒ 跑脚本 → `$OUT_DIR/gdn/*.cubin` → 生成 `GDN_ASSETS` 表;**增量闸** + 解释器探测(`GDN_TRITON_PY`,缺省探工作区 `vllm-test/.venv`)+ `GDN_TRITON_DEVICE` |
+| `family/gdn_chunked.rs` | `cubins::*` 由 `const` 改 **`fn` + `resolve()`**:自编资产优先,入库采集件兜底(`h_noh0` 明确标注"未注册,保留备用") |
+| `server/gdn_chunked.rs` / `tests/gdn_chunked_golden.rs` | 取资产处改调 `cubins::x()` |
+
+**验收**:① 自编 6 核与入库件**逐字节一致**(表见上);② `GDN_TRITON_BUILD=1`
+构建 + `gdn_chunked_golden` **绿**,且 **c5(同源同核紧容差)max|Δ| = 0.000e0**
+(g_cum/A/w/u/h/v_new/o/ht 全项);③ 缺省构建(不设 env)**不需要** Python/triton,
+走入库件,golden 同样绿。
+
+#### 15.11.5 翻默认 + `assets/` 整体退役(2026-10-13 用户裁决)
+
+用户追问两点,直接改变了设计:
+> "既然你都引入这个 triton 了……那为什么又要留着它呢?还有这个 `.json`,它到底是
+> 个什么东西?为什么源码里面还需要有一个 `.json`?每个 cubin 都必须要有吗?"
+
+**① 翻默认**:`GDN_TRITON_BUILD` 由 opt-in 改为**默认开** ⇒ **入库采集件整体删除**
+(`crates/kernels/assets/` 退役,~1.8 MB:6 生产 cubin + `h_noh0` + pipfla_f32
+退役备份 + manifest)。六核与 native cubin / marlin / flashinfer **同形态**:
+**资产 = 构建产物**。
+
+**② 每个 cubin 都要一份 json 吗?—— 不要**。区分两类:
+
+| 类 | 编译输入 | 需要配置表吗 |
+|---|---|---|
+| native(20 个 fatbin) | `.cu` 源 + 架构(`OWL_CUBIN_ARCHS`) | **不需要** —— 输入从源码唯一确定 |
+| Triton(gdn_chunked 六核) | 源 + **autotune 选中那组选项** | **需要** —— 选项空间是**搜出来的**,不从源码唯一导出 |
+
+⇒ 六份 per-kernel json **合并成一张表** `triton/gdn_chunked_aot.json`(角色写在文件名与
+`_note` 里:"本族 AOT 编译配置表";含 `num_warps`/`num_stages`/`kwargs(BK,BV)` +
+`shared` 期望值)。脚本**按表直接编译**(不再搜候选),并把产物回读的 `shared` 与
+表值比对 —— 不等即拒用(**源/配置漂移的机器判据**)。它更像 lockfile,不是
+per-binary 元数据。
+
+**③ 逃生舱**:`GDN_TRITON_BUILD=0` = 显式跳过自编 ⇒ 资产表为空 ⇒ 该族
+**装配期拒启**(实测:`asset gdn_chunked_delta_rule_fwd: gdn_chunked 资产缺失
+["cumsum","kkt","merge","wu","h","o"] … 缺省应自动自编(需 Python+triton)`),
+但 crate 本身**仍能编过** —— 给"没有 triton 的环境"留一条只编不跑的路。
+
+**④ 未注册资产一并删除**:`h_noh0`(无初态变体)与 `pipfla_f32`(退役变体备份)
+是设备码但**没有任何装载路径**;将来要用 = 配置表加一行 + `initial_state=None`
+重编即可(一行改动)。
+
+**验收**:缺省构建自动自编(日志 `GDN chunked 六核 **AOT 自编**完成`);
+`gdn_chunked_golden` 绿(c5 紧容差);真机 boot 33.6 s + 首答 0.5 s、`[aot] 110/110`、
+`aot-miss`=0;`GDN_TRITON_BUILD=0` 路径按设计拒启;全回归 + clippy 0 警。
+
+#### 15.11.6 构建环境:**uv 项目声明依赖 + 零 GPU**(2026-10-13 用户指令)
+
+用户指出:既然构建期要 Python,就该**用 uv 把依赖声明清楚**,而不是靠"工作区里
+恰好有个装了 triton 的 venv"。
+
+⇒ `crates/kernels/pyproject.toml`(uv 项目;**含源目录声明** ——
+`[tool.uv.build-backend] module-root = "triton"` / `module-name = "fla"`,即
+"源根 = `crates/kernels/triton/`,顶层模块 = vendor 的 `fla`";`uv sync` 把它
+**editable 装进 venv** ⇒ 脚本 `import fla.ops` 直接可用,不再手插 `sys.path`):
+
+| 依赖 | 理由 |
+|---|---|
+| `triton==3.7.1`(**钉死**) | 编译器版本变 ⇒ SASS 变 ⇒ 资产不再逐字节可复现 |
+| `torch`(**CPU 轮子**,`[tool.uv.sources]` 指 `download.pytorch.org/whl/cpu`) | FLA wrapper 的真张量簿记(`empty_like`/`len`/`.to`);AOT 不发射 ⇒ 不需要 CUDA 版(省 ~2.5 GB) |
+
+```bash
+uv sync --project crates/kernels      # → crates/kernels/.venv
+cargo build                           # build.rs 自动用该 venv
+```
+
+**零 GPU**(`--device none`,缺省):AOT 只编译不发射 ⇒ `CompiledKernel._init_handles()`
+(需 `driver.utils.load_binary` + 设备)**从不被调用**;`run()` 起手只要
+`get_current_device/get_current_stream`(缓存键)+ `get_current_target()` ⇒
+注入**桩驱动**给这三个,其余方法一被调用即报错(设备触达哨兵)。
+
+**实测**:`uv` 环境 + 零 GPU 的产物与"带 GPU 真实设备"产物**逐字节一致**
+(6/6,sha16 全同);`GDN_TRITON_DEVICE=cuda:N` 保留为排障/对照路径。
+
+**多族可扩**(用户追问"后面要加其他 Triton 算子怎么办"):`triton/` 是**多族共用
+的源根**,`module-name` 用**列表**形式(uv_build 支持 `["foo","bar"]`,官方文档在案)
+⇒ 加族 = ①vendor 到 `triton/<name>/`(保持上游包名)②`module-name` 加一个名字
+③该族 `triton/<name>_aot.{py,json}` ④`build.rs` 加一段(照 `build_gdn_assets`)
+⑤family 侧 `resolve()` + 数值判据。**实测**(dummy 族)建目录 + 加名 + `uv sync`
+⇒ 两个模块都 import 通、都指回树内(editable)。
+不用 `namespace = true`(官方注明**关掉安全检查**);也不把 `crates/kernels` 塞进
+`sys.path`(会遮蔽真正的 `triton` 包)。配方写进 `triton/README.md`。
+
+**顺带两处 vendor 补丁**(都写进 `triton/fla/ops/utils.py` 注记):
+① `import torch` 改可选(用到 torch 的三处:AOT 不需要 `get_all_max_shared_mem`;
+`is_intel_alchemist` 恒短路;`is_nvidia_hopper` 见②);
+② `is_nvidia_hopper` 原式 `torch.cuda.get_device_name(0)` +
+`get_device_capability()` 需 **torch + 真实 GPU** ⇒ 改为从**编译目标**
+(`GPUTarget.arch >= 90`)判 —— 语义等价(Ampere ⇒ False),且跟随 target 而非宿主 GPU。
+
+#### 15.11.7 剩余(未做)
+
+- marlin / flashinfer 的 **host 侧搬 Rust**(§15.9.6 成本账)仍为独立工单;
+- 构建期 Python+triton 是**硬依赖**(本机由工作区 `vllm-test/.venv` 提供;
+  `GDN_TRITON_PY` 可指向其它解释器)。

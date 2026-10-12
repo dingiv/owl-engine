@@ -196,12 +196,12 @@ fn gdn_chunked_golden_stage_by_stage() {
     use owl_kernels::family::gdn_chunked::cubins::launch as LC;
     // ⚠️ 符号名 = fork 六核(2026-10-11 资产换血后);pip-fla 旧名
     // (chunk_gated_delta_rule_fwd_kkt_solve_kernel)已随资产退役。
-    let f_cum = load_fn(cubins::CUMSUM, "chunk_local_cumsum_scalar_kernel");
-    let f_kkt = load_fn(cubins::KKT, "chunk_scaled_dot_kkt_fwd_kernel");
-    let f_merge = load_fn(cubins::MERGE, "merge_16x16_to_64x64_inverse_kernel");
-    let f_wu = load_fn(cubins::WU, "recompute_w_u_fwd_kernel");
-    let f_h = load_fn(cubins::H, "chunk_gated_delta_rule_fwd_kernel_h_blockdim64");
-    let f_o = load_fn(cubins::O, "chunk_fwd_kernel_o");
+    let f_cum = load_fn(cubins::cumsum().expect("构建期 AOT 资产缺失(GDN_TRITON_BUILD=0?)"), "chunk_local_cumsum_scalar_kernel");
+    let f_kkt = load_fn(cubins::kkt().expect("构建期 AOT 资产缺失(GDN_TRITON_BUILD=0?)"), "chunk_scaled_dot_kkt_fwd_kernel");
+    let f_merge = load_fn(cubins::merge().expect("构建期 AOT 资产缺失(GDN_TRITON_BUILD=0?)"), "merge_16x16_to_64x64_inverse_kernel");
+    let f_wu = load_fn(cubins::wu().expect("构建期 AOT 资产缺失(GDN_TRITON_BUILD=0?)"), "recompute_w_u_fwd_kernel");
+    let f_h = load_fn(cubins::h().expect("构建期 AOT 资产缺失(GDN_TRITON_BUILD=0?)"), "chunk_gated_delta_rule_fwd_kernel_h_blockdim64");
+    let f_o = load_fn(cubins::o().expect("构建期 AOT 资产缺失(GDN_TRITON_BUILD=0?)"), "chunk_fwd_kernel_o");
     // shared opt-in(与 handler 同名单:wu/h/o;fork 选中变体 h=49412 超 48K 顶)
     for (f, sz) in [
         (&f_wu, LC::WU_SHARED as i32),

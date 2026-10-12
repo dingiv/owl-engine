@@ -26,6 +26,15 @@
 
 include!(concat!(env!("OUT_DIR"), "/cubin_assets.rs"));
 
+/// **资产指纹**(构建期算出,见 `build.rs`;覆盖 cubin / xqa / gdn 全部资产)。
+///
+/// 为什么需要它:`include_bytes!` 指向 `$OUT_DIR` 的产物时,cargo **不保证**
+/// 产物一变就重编 crate(实测踩过:fatbin 已更新、rlib 仍嵌旧字节 ⇒ 装配期
+/// 布局门报"内核 0 B vs Rust 镜像 40 B")。把指纹经 `rustc-env` 发出 = 指纹变
+/// ⇒ **cargo 强制重编该 crate**(rustc-env 是 cargo 跟踪的构建脚本输出)。
+/// 它同时是 boot 报告的"资产代际"人眼锚点。
+pub const ASSET_FP: &str = env!("OWL_ASSET_FP");
+
 /// FNV-1a 64 —— **必须**与 `build.rs::hash_source` 逐位一致。
 ///
 /// 两处一份算法是"两处对不上"的经典温床,故不自证:由

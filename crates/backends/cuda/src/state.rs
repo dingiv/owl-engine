@@ -292,8 +292,9 @@ impl GpuCtx {
             // ---- 零运行期编译覆盖率(boot 报告 + require 硬门)----
             let (covered, total, missing) = owl_kernels::family::cubins::coverage();
             eprintln!(
-                "[aot] 构建期 cubin 代际 {archs:?} / 资产 {} 个 —— 登记表覆盖 {covered}/{total}",
-                owl_kernels::family::cubins::CUBIN_ASSETS.len()
+                "[aot] 构建期 cubin 代际 {archs:?} / 资产 {} 个(fp {}) —— 登记表覆盖 {covered}/{total}",
+                owl_kernels::family::cubins::CUBIN_ASSETS.len(),
+                owl_kernels::family::cubins::ASSET_FP
             );
             if !missing.is_empty() {
                 let show: Vec<&str> = missing.iter().take(8).copied().collect();
