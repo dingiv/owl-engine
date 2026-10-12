@@ -39,6 +39,8 @@ impl KernelSpec for NcAttnBf16V2 {
         Param::t_out("out", Dtype::BF16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Classic, Dtype::BF16)];
+    const SELFCHECK: Option<&'static dyn crate::spec::BootCheck> =
+        Some(&crate::ops::oracles::nc_bf16_v2::NcBf16V2Oracle);
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;
@@ -146,6 +148,8 @@ impl KernelSpec for K0WriteFp8Knhd {
         Param::t_out("out", Dtype::F16, 1),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Knhd, Dtype::U8)];
+    const SELFCHECK: Option<&'static dyn crate::spec::BootCheck> =
+        Some(&crate::ops::oracles::k0_fp8_knhd::K0Fp8KnhdOracle);
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;

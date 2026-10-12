@@ -20,6 +20,8 @@ pub mod gdn_scalar;
 #[cfg(feature = "marlin")]
 pub mod marlin;
 
+pub mod selfcheck;
+
 use crate::registry::{FamilyFactory, KernelFamily};
 
 /// 全家族装配表(名字→runtime 的唯一住址;M5 manifest 门挂各家族 assemble)。

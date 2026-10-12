@@ -13,6 +13,8 @@
 //! feature = "device"(cudarc driver/nvrtc;独立于已退役的 cuda_ops 预编链)。
 
 use crate::contract::{FieldStats, InvariantBox, Law, OpError, OpId, Stage};
+/// 发射参数值(权威定义在 [`crate::contract`] —— 自检面(零 feature 门)也要用它)
+pub use crate::contract::LaunchVal;
 use cudarc::driver::{CudaContext, CudaFunction, CudaStream};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,6 +47,15 @@ impl DeviceRes for &mut dyn DeviceRes {
     }
     fn device_ordinal(&self) -> Result<i32, OpError> {
         (**self).device_ordinal()
+    }
+    fn download(&mut self, src: DevPtr, dst: &mut [u8]) -> Result<(), OpError> {
+        (**self).download(src, dst)
+    }
+    fn alloc_block(&mut self, bytes: usize, tag: &'static str) -> Result<crate::contract::Bytes, OpError> {
+        (**self).alloc_block(bytes, tag)
+    }
+    fn upload_block(&mut self, b: &crate::contract::Bytes, src: &[u8]) -> Result<(), OpError> {
+        (**self).upload_block(b, src)
     }
 }
 
@@ -83,17 +94,29 @@ pub trait DeviceRes {
     fn upload(&mut self, dst: DevPtr, src: &[u8]) -> Result<(), OpError>;
     /// 设备序号(FFI 面 dev 注入;marlin/cublas 等 StaticLib 家族用)
     fn device_ordinal(&self) -> Result<i32, OpError>;
+    /// **账本块分配**(装配期自检专用;2026-10-13 P5c)。
+    ///
+    /// 与 [`alloc`](Self::alloc) 的区别:`alloc` 给的是**裸 scratch 指针**
+    /// (不进账房 ⇒ 不能被 `resolve` 解析);而 FFI/家族 runtime 的算子参数
+    /// 是**块句柄** ⇒ 自检要跑 foreign 算子(marvin/xqa/FI/cublas)就必须能
+    /// 拿到"真在册的块"。返回 [`Bytes`](crate::contract::Bytes) 句柄。
+    fn alloc_block(&mut self, bytes: usize, tag: &'static str) -> Result<crate::contract::Bytes, OpError>;
+
+    /// **按块句柄上传**(装配期自检专用;2026-10-13 P5c)。
+    ///
+    /// 为什么与 [`upload`](Self::upload) 分开:`upload` 的 dst 是**裸指针**且
+    /// 服务端只认"指针在 scratch 账本"(写者白名单);而自检要往**账本块**灌
+    /// 输入(块句柄 → `resolve` → 写)。两条语义不同,不合并。
+    fn upload_block(&mut self, b: &crate::contract::Bytes, src: &[u8]) -> Result<(), OpError>;
+
+    /// **设备 → host 字节回读**(装配期自检/诊断专用;2026-10-13 P5)。
+    ///
+    /// 为什么单列一个方法:自检(oracle)必须能把算子输出**读回 host 与独立
+    /// 参考逐字节比对** —— 这是"静默错值"类唯一能机器判定的手段。
+    /// 与 `upload` 对称:裸指针 + 字节口径,元素语义归调用方。
+    fn download(&mut self, src: DevPtr, dst: &mut [u8]) -> Result<(), OpError>;
 }
 
-/// 发射参数值(owned 值表元素;指针参数 = u64 位型直入指针槽)
-#[derive(Debug, Clone, Copy)]
-pub enum LaunchVal {
-    /// 设备指针(块解析产物/scratch;8 字节指针槽)
-    Ptr(u64),
-    U64(u64),
-    I32(i32),
-    F32(f32),
-}
 
 /// 函数解析键(Linkage 三链路一个入口)
 #[derive(Debug, Clone)]

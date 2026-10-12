@@ -36,8 +36,14 @@ impl KernelSpec for MarlinGemmW4a16Awq {
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;
+    // 装配期 oracle 住 `cfg(feature = "marlin")` 模块(要用自家 packer 造输入)
+    // —— 表(零门)与 oracle(门内)的接触点只有这一对互斥常量
+    #[cfg(feature = "marlin")]
+    const SELFCHECK: Option<&'static dyn crate::spec::BootCheck> =
+        Some(&crate::ops::oracles::marlin::MarlinAwqOracle);
+    #[cfg(not(feature = "marlin"))]
+    const SELFCHECK: Option<&'static dyn crate::spec::BootCheck> = None;
 }
-
 
 /// `marlin_gemm_w4a16_bf16` —— BF16 激活/输出臂(**无 zeros 槽**:6 块 + 4 sz)。
 /// DFlash2 草稿路径(权重原生 BF16)。

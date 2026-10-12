@@ -50,6 +50,30 @@ fn op_tables_match_cu_signatures() {
     eprintln!("[op-tables] {checked} 张表与 .cu 签名逐参一致 ✓(foreign 表另计)");
 }
 
+/// **R1 进度表**(用户裁决 2026-10-13:凡是用到都必须有 `impl KernelSpec`)。
+///
+/// 两件事:① 打印未声明清单(建表推进的工单);② **锁"不许新增"** —— 新增
+/// 核必须同时带声明,否则数字会涨,本门立刻红(上限随建表推进逐批下调)。
+#[test]
+fn r1_undeclared_inventory() {
+    let u = owl_kernels::ops::undeclared();
+    eprintln!(
+        "[R1] 未声明 {} / 登记 {} / 已建表 {}",
+        u.len(),
+        owl_kernels::ops::registered_count(),
+        owl_kernels::ops::built_count()
+    );
+    for n in &u {
+        eprintln!("[R1]   {n}");
+    }
+    // ⚠️ 上限 = 当前实测值(2026-10-13:69);建一批表就同步下调一批
+    assert!(
+        u.len() <= 69,
+        "未声明算子增加到 {} 条 —— 新增核必须带 impl KernelSpec(R1)",
+        u.len()
+    );
+}
+
 /// 名字全库唯一(表内重复 = 路由歧义)
 #[test]
 fn op_table_entries_are_unique() {

@@ -9,7 +9,7 @@ pub use cudarc::driver::{
 };
 
 /// result 同步原语(逐项;当前仅 D2H 回读)
-pub use cudarc::driver::result::memcpy_dtoh_sync;
+pub use cudarc::driver::result::{memcpy_dtoh_sync, memcpy_htod_sync};
 
 /// result 图原语(M1 图治理 + 哨兵③;只返回句柄,自身零分配——
 /// 准入铁律通过,证据:cudarc 0.19.9 result.rs:788/801/1494/1514/1522/1531)

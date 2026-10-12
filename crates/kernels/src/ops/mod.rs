@@ -44,6 +44,7 @@ pub mod gdn_chunked;
 pub mod ln;
 pub mod load;
 pub mod marlin;
+pub mod oracles;
 pub mod xqa;
 
 /// 域表清单(每项 = 一个域的全部已建表算子;顺序 = 阅读序,无功能含义)
@@ -76,6 +77,25 @@ pub fn meta(name: &str) -> Option<&'static KernelMeta> {
 /// 已建表算子数(P3 进度条;boot 报告与 `--print-op-table` 共用)
 pub fn built_count() -> usize {
     TABLES.iter().map(|t| t.len()).sum()
+}
+
+/// **未声明算子**(R1 进度表 / 未来执法面):登记表里有、但没有 `impl KernelSpec`
+/// 的 native 入口。
+///
+/// 为什么单列一个函数:**"引入 vs 启用"的硬界要可数**。R1 规则(用户裁决
+/// 2026-10-13)= 任何算子被发射前必须有声明 —— 本函数就是"还没达标"的清单,
+/// boot 报告它、测试锁它;等它归零,就把"无声明 ⇒ 拒发射"打开。
+pub fn undeclared() -> Vec<&'static str> {
+    crate::list::REGISTRY
+        .iter()
+        .filter(|e| meta(e.name).is_none())
+        .map(|e| e.name)
+        .collect()
+}
+
+/// 登记表条数(声明覆盖率的分母)
+pub fn registered_count() -> usize {
+    crate::list::REGISTRY.len()
 }
 
 // ============================================================================

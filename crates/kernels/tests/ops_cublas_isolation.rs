@@ -80,6 +80,56 @@ impl DeviceRes for TestRes {
     fn device_ordinal(&self) -> Result<i32, OpError> {
         Ok(0)
     }
+    fn upload_block(
+        &mut self,
+        b: &owl_kernels::contract::Bytes,
+        src: &[u8],
+    ) -> Result<(), owl_kernels::contract::OpError> {
+        // 测试面:按块 id 直查(账房即 self.blocks)
+        let stream = self.stream.clone();
+        let s = self.blocks.get_mut(&b.id).ok_or_else(|| {
+            owl_kernels::contract::OpError::Contract {
+                op: "test".into(),
+                field: "upload_block",
+                expect: "块在册".into(),
+                got: format!("id={}", b.id),
+            }
+        })?;
+        stream.memcpy_htod(src, s).map_err(|e| owl_kernels::contract::OpError::Contract {
+            op: "test".into(),
+            field: "upload_block",
+            expect: "htod".into(),
+            got: format!("{e:?}"),
+        })
+    }
+
+    fn alloc_block(
+        &mut self,
+        bytes: usize,
+        tag: &'static str,
+    ) -> Result<owl_kernels::contract::Bytes, OpError> {
+        // 测试面:走裸分配 + 在册登记(resolve 可解析)
+        let s = unsafe { self.stream.alloc::<u8>(bytes.max(1)) }
+            .map_err(|e| owl_kernels::contract::OpError::Contract {
+                op: "test".into(),
+                field: "alloc_block",
+                expect: "-".into(),
+                got: format!("{e:?}"),
+            })?;
+        let id = self.next_id;
+        self.next_id += 1;
+        self.blocks.insert(id, s);
+        let _ = tag;
+        Ok(owl_kernels::contract::Bytes::new(id, bytes))
+    }
+    fn download(&mut self, _src: u64, _dst: &mut [u8]) -> Result<(), OpError> {
+        Err(OpError::Contract {
+            op: "test".into(),
+            field: "download",
+            expect: "-".into(),
+            got: "-".into(),
+        })
+    }
 }
 
 #[test]

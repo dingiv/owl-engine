@@ -176,6 +176,19 @@ pub mod names {
     pub const PREFILL_FI_FP8KV: &str = "flashinfer_prefill_paged_fp8kv";
 }
 
+/// 发射参数值(owned 值表元素;指针参数 = u64 位型直入指针槽)。
+///
+/// 住 contract(而非 device)的原因:**自检面零 feature 门** —— 装配期 oracle
+/// 要构造值表,而 device 面是 `feature = "device"` 门控的。
+#[derive(Debug, Clone, Copy)]
+pub enum LaunchVal {
+    /// 设备指针(块解析产物/scratch;8 字节指针槽)
+    Ptr(u64),
+    U64(u64),
+    I32(i32),
+    F32(f32),
+}
+
 /// 发射消息
 pub struct LaunchMsg {
     pub kernel: KernelSource,

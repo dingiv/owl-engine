@@ -201,35 +201,29 @@ impl GpuServer {
                 {
                     let mut res = GpuRes {
                         actor_tag: self.actor_tag,
-                        ctx: self.ctx.as_ref().expect("ctx 上线"),
+                        ctx: self.ctx.as_mut().expect("ctx 上线"),
                         scratch: &mut self.scratch_ledger,
                     };
                     let mut exec = std::mem::take(&mut self.exec);
-                    let r = owl_kernels::registry::OpRegistry::boot(&mut res, &mut exec);
+                    // 白名单硬门 + 池写集审计 + 装配期自检全在注册表 boot 内
+                    // (设计 §八 P4/P5:装配门全链一个入口,失败 = 拒启)
+                    let allowed: Option<Vec<&str>> = self
+                        .allowed_ops
+                        .as_ref()
+                        .map(|v| v.iter().map(|s| s.as_str()).collect());
+                    let r = owl_kernels::registry::OpRegistry::boot_with(
+                        &mut res,
+                        &mut exec,
+                        allowed.as_deref(),
+                    );
                     self.exec = exec;
                     match r {
-                        Ok(reg) => {
-                            // 白名单硬门(装配期两件事,失败 = 拒启):
-                            // ① 列出的算子必须都已建表(名字打错/未建表 = 配置错);
-                            // ② 用生效集合跑**池写集穷举审计**(读必有人写 + 声明自洽
-                            //    + 活跃写者不歧义)
-                            if let Some(list) = self.allowed_ops.clone() {
-                                for n in list.iter() {
-                                    if reg.meta(n).is_none() {
-                                        return Err(format!(
-                                            "白名单算子 `{n}` 未建表(dispatch.allowed_ops 有误或该算子尚无 KernelSpec 声明)"
-                                        ));
-                                    }
-                                }
-                                let names: Vec<&str> = list.iter().map(|s| s.as_str()).collect();
-                                if let Err(e) = owl_kernels::ops::audit_active(Some(&names)) {
-                                    return Err(format!("池写集审计失败(拒启): {e}"));
-                                }
-                                eprintln!("[kernels] 生产白名单:{} 项生效(池审计通过)", list.len());
-                            }
-                            self.registry = Some(reg)
+                        Ok(reg) => self.registry = Some(reg),
+                        Err(e) => {
+                            // 拒启必须可见(否则只剩"族被 drop"的兜底告警,查不到原因)
+                            eprintln!("[kernels] ❌ 算子注册表装配失败(拒启): {e}");
+                            return Err(format!("算子注册表装配失败(拒启): {e}"));
                         }
-                        Err(e) => return Err(format!("算子注册表装配失败(拒启): {e}")),
                     }
                 }
             }
@@ -705,13 +699,15 @@ impl GpuServer {
         // 已退役,见 ops/ 模块)。路由判定 = 注册表 knows(boot 表自洽,
         // 零第二份清单;旧 is_foreign_name 硬编码枚举已删,2026-10-12 review D 案)
         if self.registry.as_ref().is_some_and(|r| r.knows(&msg.kernel.name)) {
+            // 字段级解构:ctx(&mut,alloc_block 需要)、registry、exec 三者借用不相交
+            let Self { ctx, registry, exec, scratch_ledger, actor_tag, .. } = self;
             let out = (|| -> Result<Bytes, String> {
-                let ctx = self.ctx.as_ref().ok_or("server 未上线")?;
-                let mut res = GpuRes { ctx, scratch: &mut self.scratch_ledger, actor_tag: self.actor_tag };
-                self.registry
+                let ctx = ctx.as_mut().ok_or("server 未上线")?;
+                let mut res = GpuRes { ctx, scratch: scratch_ledger, actor_tag: *actor_tag };
+                registry
                     .as_mut()
                     .expect("knows 已查非 None")
-                    .execute(&msg, &mut res, &mut self.exec)
+                    .execute(&msg, &mut res, exec)
                     .map_err(|e| e.to_string())
             })()
             .map_err(ModelError::Msg);
@@ -892,7 +888,8 @@ unsafe extern "C" fn trampoline(data: *mut std::ffi::c_void) {
 /// 家族 runtime 经 kernels::device::DeviceRes 使用;解析/分配/上传/
 /// 捕获查询全部对准 GpuCtx 既有机制(与旧 handler 同一机制,零新面)。
 pub(crate) struct GpuRes<'a> {
-    pub ctx: &'a crate::state::GpuCtx,
+    /// 可变:`alloc_block`(自检面真账本块分配)要往账房插条目(2026-10-13 P5c)
+    pub ctx: &'a mut crate::state::GpuCtx,
     pub scratch: &'a mut Vec<(u64, CudaSlice<u8>)>,
     /// 本 actor 账本编号(DeadBlock 定谳:跨账本时能看出"问的是哪个账房")
     pub actor_tag: u64,
@@ -980,6 +977,56 @@ impl owl_kernels::device::DeviceRes for GpuRes<'_> {
             Ok(())
         }
     }
+    fn alloc_block(
+        &mut self,
+        bytes: usize,
+        tag: &'static str,
+    ) -> Result<owl_kernels::contract::Bytes, OpError> {
+        // 装配期自检用:真账本块(可被 resolve)。**不计 slab/vram 音账** ——
+        // 自检块是装配期一次性小额,且池预算在自检之前已按固定面定尺;
+        // 计入 live 会让池预算随自检项数漂移(账目语义混乱 > 少记几十 KB)。
+        let stream = self.stream()?;
+        let slice = unsafe { stream.alloc::<u8>(bytes) }.map_err(|e| OpError::Launch {
+            op: "selfcheck".into(),
+            stage: owl_kernels::contract::Stage::Load,
+            detail: format!("alloc_block[{tag}]({bytes}B): {e:?}"),
+        })?;
+        let id = self.ctx.new_block(slice);
+        Ok(owl_kernels::contract::Bytes::new(id, bytes))
+    }
+
+    fn upload_block(
+        &mut self,
+        b: &owl_kernels::contract::Bytes,
+        src: &[u8],
+    ) -> Result<(), OpError> {
+        // 账本块上传(自检面):resolve 拿到块指针 → 同步 htod。
+        // 与 `upload`(scratch-only 白名单)分开:这里写的是**账房在册块**。
+        let p = self.resolve(b)?;
+        // (sync 变体不吃 stream —— 同步语义;回执即落地)
+        unsafe { crate::ffi::memcpy_htod_sync(p, src) }.map_err(|e| {
+            OpError::Launch {
+                op: OP_RES.into(),
+                stage: owl_kernels::contract::Stage::Store,
+                detail: format!("upload_block(id={}, {}B): {e:?}", b.id, src.len()),
+            }
+        })
+    }
+
+    fn download(&mut self, src: u64, dst: &mut [u8]) -> Result<(), OpError> {
+        // 装配期自检回读(同步语义:回执即落地;非热路径)
+        // SAFETY:dst 是 host 可写切片,src 是本账本块/scratch 的设备虚地址,
+        // 长度由 dst 决定(调用方负责 src 侧可读范围 ≥ dst.len();自检面
+        // 按自己的分配尺寸回读)。
+        unsafe { crate::ffi::memcpy_dtoh_sync(dst, src) }.map_err(|e| {
+            OpError::Launch {
+                op: OP_RES.into(),
+                stage: owl_kernels::contract::Stage::Load,
+                detail: format!("dtoh(ptr={src:#x}, {}B): {e:?}", dst.len()),
+            }
+        })
+    }
+
     fn device_ordinal(&self) -> Result<i32, OpError> {
         Ok(self.ctx.device_ordinal() as i32)
     }

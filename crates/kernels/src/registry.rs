@@ -207,10 +207,70 @@ impl OpRegistry {
         Self::init_all(crate::server::family_factories(), res, exec)
     }
 
+    /// **生产档 boot**(白名单在场):族装配 → 白名单校验 → 池写集审计 →
+    /// 装配期自检。任一失败 = Err ⇒ 引擎拒启(设计 §八 P4/P5 的装配门全链)。
+    pub fn boot_with(
+        res: &mut dyn crate::device::DeviceRes,
+        exec: &mut crate::device::Exec,
+        allowed: Option<&[&str]>,
+    ) -> Result<Self, OpError> {
+        // 装配(族构造即门 + 白名单 + 池审计)→ **然后**跑自检:
+        // foreign 算子的 oracle 要经注册表发射(dispatch),所以自检必须在
+        // 注册表建成之后(2026-10-13 P5c 的调用点搬迁)。
+        let mut reg = Self::init_all_with(crate::server::family_factories(), res, exec, allowed)?;
+        reg.run_selfchecks(res, exec, allowed)?;
+        Ok(reg)
+    }
+
+    /// **装配期自检**(设计 §5.5:独立 oracle,失败 = Err ⇒ 拒启)。
+    ///
+    /// **随白名单生效**:白名单在场 = 生产档 ⇒ 只对生效算子跑 oracle
+    /// (装配期成本按档位裁,"该跑谁"也是确定的);门关(dev/测试档)不跑 ——
+    /// 那类环境常无设备资源,自检由 GPU 测试面覆盖
+    /// (`tests/selfcheck_oracles.rs`:正例 + 判据敏感性负例)。
+    fn run_selfchecks(
+        &mut self,
+        res: &mut dyn crate::device::DeviceRes,
+        exec: &mut crate::device::Exec,
+        allowed: Option<&[&str]>,
+    ) -> Result<(), OpError> {
+        let Some(a) = allowed else { return Ok(()) };
+        let active: Vec<&'static crate::spec::KernelMeta> = self
+            .metas
+            .values()
+            .copied()
+            .filter(|m| a.contains(&m.entry))
+            .collect();
+        let n = crate::server::selfcheck::run_selfchecks(active.into_iter(), res, exec, self)?;
+        if n > 0 {
+            eprintln!("[kernels] 装配期自检:{n} 个算子通过(oracle 独立参考)");
+        }
+        Ok(())
+    }
+
+    /// 带白名单的装配(生产档入口:白名单同时喂给池审计与装配期自检)
+    pub fn init_all_with(
+        factories: Vec<FamilyFactory>,
+        res: &mut dyn crate::device::DeviceRes,
+        exec: &mut crate::device::Exec,
+        allowed: Option<&[&str]>,
+    ) -> Result<Self, OpError> {
+        Self::init_all_inner(factories, res, exec, allowed)
+    }
+
     pub fn init_all(
         factories: Vec<FamilyFactory>,
         res: &mut dyn crate::device::DeviceRes,
         exec: &mut crate::device::Exec,
+    ) -> Result<Self, OpError> {
+        Self::init_all_inner(factories, res, exec, None)
+    }
+
+    fn init_all_inner(
+        factories: Vec<FamilyFactory>,
+        res: &mut dyn crate::device::DeviceRes,
+        exec: &mut crate::device::Exec,
+        allowed: Option<&[&str]>,
     ) -> Result<Self, OpError> {
         let mut names = HashSet::new();
         let mut families: Vec<Box<dyn KernelFamily>> = Vec::with_capacity(factories.len());
@@ -272,13 +332,36 @@ impl OpRegistry {
             .count();
         let foreign_unbuilt = names.iter().filter(|n| !metas.contains_key(**n)).count();
         eprintln!(
-            "[kernels] 算子准入:已建表 {} / 原生登记 {}(未建表 {})/ 家族臂 {}(未建表 {})",
+            "[kernels] 算子准入:已建表 {} / 原生登记 {}(未声明 {})/ 家族臂 {}(未声明 {})",
             metas.len(),
             crate::list::REGISTRY.len(),
             native_unbuilt,
             names.len(),
             foreign_unbuilt
         );
+        if native_unbuilt > 0 {
+            // R1 进度(用户裁决:凡是用到都必须有声明):未声明清单要可数、可见
+            let und = crate::ops::undeclared();
+            eprintln!("[kernels] R1 未声明算子 {} 条:{}", und.len(), und.join(" "));
+        }
+        // 装配期自检(设计 §5.5:独立 oracle,失败 = 拒启)。
+        // 白名单在场 ⇒ 只跑生效算子(装配期成本按档位裁);否则跑全部已建表。
+        // ── 白名单硬门(装配期三件事)──────────────────────────────
+        if let Some(a) = allowed {
+            for n in a {
+                if !metas.contains_key(n) {
+                    return Err(OpError::Contract {
+                        op: (*n).to_string(),
+                        field: "allowed_ops",
+                        expect: "白名单算子必须已建表(有 KernelSpec 声明)".into(),
+                        got: "未建表(仅引入)—— 不许进生产档".into(),
+                    });
+                }
+            }
+            crate::ops::audit_active(Some(a))?;
+            eprintln!("[kernels] 生产白名单:{} 项生效(池写集审计通过)", a.len());
+        }
+
         Ok(Self { families, names, metas })
     }
 
@@ -445,6 +528,23 @@ mod tests {
         }
         fn device_ordinal(&self) -> Result<i32, OpError> {
             Ok(0)
+        }
+        fn upload_block(
+            &mut self,
+            _b: &crate::contract::Bytes,
+            _src: &[u8],
+        ) -> Result<(), OpError> {
+            Err(OpError::Contract { op: "nop".into(), field: "upload_block", expect: "-".into(), got: "-".into() })
+        }
+        fn alloc_block(
+            &mut self,
+            _bytes: usize,
+            _tag: &'static str,
+        ) -> Result<crate::contract::Bytes, OpError> {
+            Err(OpError::Contract { op: "nop".into(), field: "alloc_block", expect: "-".into(), got: "-".into() })
+        }
+        fn download(&mut self, _src: crate::device::DevPtr, _dst: &mut [u8]) -> Result<(), OpError> {
+            Err(OpError::Contract { op: "nop".into(), field: "download", expect: "-".into(), got: "-".into() })
         }
     }
 }

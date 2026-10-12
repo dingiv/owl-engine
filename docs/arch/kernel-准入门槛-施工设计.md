@@ -738,14 +738,59 @@ impl KernelPick {
 | 全量 e2e | ✅ | **17/17 场景 365.6s**,几何门零误伤(0.8B/27B × f16/fp8 × spec/裸 × 全池) |
 | clippy | ✅ | 0(默认 + 全 feature 两档) |
 
-**未完成(P5/P6)**:
-1. **毒值自检(NaN 哨兵)**:设计 §5.4 的"池灌 NaN → warmup → 断言出口无 NaN
-   + 实际改写字节集 == 声明写集" —— 需要引擎级 warmup 与逐字节比对管道,
-   本棒只落了**声明间互证**那一半(R1-R3);
-2. **`selfcheck` 独立 oracle**(P5):`SELFCHECK` 字段已立,尚无实现;
-3. **`ShapeRule.dims/rels`**:符号维与维间关系目前全部 `NONE` ——
-   真正的"形状族逐参约束"(如 `D == Hkv*HD`)未填;
-4. **数值指纹**(设计 §5.7):`assets/ops-fingerprint.toml` 未立;
+### 14.9 P5 第一棒(2026-10-13;独立 oracle + 毒值自检落地)
+
+| 项 | 状态 | 证据 |
+|---|---|---|
+| 自检运行时(ungated `CheckRunner` ↔ device 侧 `Runner` 适配) | ✅ | `spec::CheckRunner` / `server::selfcheck::Runner`;`LaunchVal` 下沉 contract(自检面零门) |
+| `DeviceRes::download`(设备→host 回读唯一出口) | ✅ | 装配期 oracle 的必备原语(与 `upload` 对称) |
+| **毒值自检** | ✅ | K0 fp8 池写:池灌 e4m3-NaN(`0x7F`)→ 发射 → **声明写集外字节仍为毒值**(实测未写 64000 字节)+ 越界写当场红 |
+| **独立 oracle**(K0 fp8 knHD) | ✅ | e4m3 RNE 参考**逐字节相等**(0 处不符);发现并修正参考侧 ±0.0 符号语义 |
+| **独立 oracle**(NC v2) | ✅ | host 全量 softmax 参考(滑窗+自块)`max|err|=3.904e-3 ≤ 2e-2` |
+| **独立 oracle**(融合插池 fp8 knHD) | ✅ | host norm+rope 参考 + e4m3 逐字节 + 毒值律:`max|err|=1.953e-3(相对 1e-2)`,未写字节 7936 —— **E10 案 ② + rope 配对案(2026-10-02)两处现场同时上锁** |
+| **判据敏感性证明**(负例 ×3) | ✅ | K0 换 classic 寻址 ⇒ **1512 处**不符;NC 关滑窗 ⇒ `1.119e-1` vs 噪声 `3.9e-3`(**28×**);融合插池参考换历史 **rope 配对错** ⇒ `4.478` vs 噪声 `1.95e-3`(**2300×**)+ classic 池寻址 ⇒ 248 处 |
+| boot 期执行 | ✅ | 生产 server 三行自检:融合插池 ✓(未写 7936)/ K0 fp8 ✓(未写 64000)/ NC v2 ✓ |
+| 门:自检随白名单生效 | ✅ | 白名单在场 ⇒ 只跑生效算子(dev/测试档不跑 —— 那类环境无设备资源) |
+| clippy / 回归 | ✅ | clippy 0;kernels 72(默认)/55(全 feature)、models 119、engine 22、shared 27、server 2;e2e 恒等门 `AL=1.17` 逐位一致 |
+
+### 14.10 P5c(2026-10-13;**foreign 自检运行面**完工)
+
+| 项 | 状态 | 证据 |
+|---|---|---|
+| `DeviceRes::alloc_block`(真账本块) | ✅ | `GpuRes` 的 `ctx` 改 `&mut`(foreign 发射路径字段级解构);自检块**不计** slab/vram 音账(否则池预算随自检项数漂移) |
+| `DeviceRes::upload_block` / `download` | ✅ | 块句柄读写一对;与 `upload`(scratch-only 白名单)并列 —— 语义不同不合并(坑册 §38) |
+| `CheckRunner::{alloc_block, upload_block, download_block, dispatch}` | ✅ | `dispatch` = **经注册表**(与生产同一路径 `OpRegistry::execute`) |
+| 自检调用点搬迁 | ✅ | `init_all` 内部 → `boot_with` 的**注册表建成之后**(foreign oracle 要 dispatch) |
+| **第一个 foreign oracle**(cublas GEMM) | ✅ | `alloc_block + dispatch + upload_block + download_block` 四件全走;`max\|err\|=7.507e-3`(相对 1e-2) |
+| 判据敏感性(负例 ×1) | ✅ | 参考按 `a·b`(布局错)⇒ `41.04` vs 噪声 `7.5e-3`(**5500×**) |
+| 拒启可见性 | ✅ | boot 失败加 `eprintln!` + 自检**先打名再跑**(实测:原先只剩"族被 drop"告警,查不到原因) |
+| 生产 boot | ✅ | 4 条自检全绿(融合插池/K0 fp8/NC v2/**cublas**),引擎照常就绪+捕获+服务 |
+| 回归 | ✅ | clippy 0;kernels 72/55、models 119、engine 22、shared 27、oracle 6/6;e2e `AL=1.17` 逐位一致 |
+
+### 14.11 P5d(2026-10-13;**marlin oracle** 落地 —— 生产发射量第一)
+
+| 项 | 状态 | 证据 |
+|---|---|---|
+| **marlin W4A16 AWQ oracle** | ✅ | 自家 packer 造输入(`pack_marlin_b/s/z`)+ 经注册表 dispatch + **独立 host 反量化参考** `(q−zp)·s`:`max\|err\|=3.065e-4`,噪声/信号 RMS `1.7e-4`(parity 门阈值 2e-2 的 **1/100**) |
+| oracle 与门的接触点 | ✅ | oracle 住 `#[cfg(feature="marlin")]`(要用 packer);`SELFCHECK` 用**一对互斥 cfg 常量**挂 —— 表零门、oracle 门内,接触面只有这一点 |
+| 判据敏感性(负例 ×1 双形态) | ✅ | 忽略零偏(zp≡8)⇒ RMS **22.79**(134000×);按 `[k,n]` 读权重 ⇒ **1.85**(11000×) |
+| 生产 boot | ✅ | **5 条自检全绿**:marlin AWQ / cublas / 融合插池 / K0 fp8 / NC v2 |
+| 实测约束 | ✅ | marlin 打包要求 `k%128==0 && n%256==0`(小形状被 packer 直接 assert)—— 自检几何取 m=4/n=256/k=128/g=32 |
+| 回归 | ✅ | clippy 0;kernels 72/55、models 119、engine 22、shared 27、oracle **8/8**;e2e `AL=1.17` 逐位一致 |
+
+**未完成(P5 剩余 / P6)**:
+1. **更多 oracle**:native 侧还差 `vllm_reshape_and_cache_bf16`(草稿池写者,逐位参考)
+   与 `owl_reshape_and_cache_fp8kv`(classic 池写者)—— K0 oracle 已是参数化结构,
+   加变体 = 加寻址/编码开关;
+   **foreign 侧**:运行面 + marlin oracle 已就绪(P5c/P5d);还差
+   gdn_chunked(金标参考)、xqa、FI 三家的 oracle;
+2. **毒值自检的"出口 NaN"半边**:本棒验的是"池被写过且写集穷举";"出口无 NaN"
+   需要引擎级 warmup 管道(设计与实现另案);
+3. **`ShapeRule.dims/rels`**:符号维与维间关系目前全部 `NONE` —— 需要服务端
+   账本携带**真实 shape**(现在 `BlockEntry.shape` 是占位 `vec![bytes]`),
+   即设计 §6.2 的 `VramBlock` 完整面;
+4. **数值指纹**(设计 §5.7):`assets/ops-fingerprint.toml` 未立(oracle 已覆盖
+   两个高危算子,指纹的边际价值在无参考测试的算子上);
 5. 顺带:`owl_gdn_decode_step_f16`(非 v2)与 `gdn_scalar` 臂仍未建表(不在生产集);
 6. **新发现(非本专项)**:`apps/server/tests/e2e.rs` 的"算术 2+2"用例在**改动前
    的树上同样失败**(A/B 实证),返回的是**上一个 session 的答案**(Paris)——

@@ -445,18 +445,71 @@ pub enum Determinism {
     Unassessed,
 }
 
-/// 装配期自检(独立 oracle;设计 §5.5)
-pub trait BootCheck: Send + Sync {
-    fn run(&self) -> Result<CheckReport, OpError>;
+/// 自检缓冲区(设备指针 + 字节数;自检面零 feature 门 ⇒ 不复用 `ScratchBuf`)
+#[derive(Debug, Clone, Copy)]
+pub struct CheckBuf {
+    pub ptr: u64,
+    pub bytes: usize,
 }
 
-/// 自检报告(逐元素误差 + 首个越界元素)
+/// **自检运行时**(ungated 抽象;device 门内的适配器把 `DeviceRes × Exec`
+/// 桥到本面 —— 这样 oracle 住零门模块,而 device 面照旧门控)。
+///
+/// 五个方法 = 装配期 oracle 的全部需求:分配 / 上传 / 回读 / 发射 / 同步。
+pub trait CheckRunner {
+    fn alloc(&mut self, bytes: usize, tag: &'static str) -> Result<CheckBuf, OpError>;
+    /// **账本块分配**(foreign 算子自检必需:它们的参数是块句柄,不是 scratch)
+    fn alloc_block(&mut self, bytes: usize, tag: &'static str) -> Result<crate::contract::Bytes, OpError>;
+    /// 按块句柄上传(等价于 `resolve` + `upload`)
+    fn upload_block(&mut self, b: &crate::contract::Bytes, src: &[u8]) -> Result<(), OpError>;
+    /// 按块句柄回读(等价于 `resolve` + `download`)
+    fn download_block(&mut self, b: &crate::contract::Bytes, dst: &mut [u8]) -> Result<(), OpError>;
+    /// **经注册表发射**(与生产同一路径:`OpRegistry::execute`)—— foreign
+    /// 算子(FFI/家族 runtime)只能这样跑;native 用 [`launch_nvrtc`](Self::launch_nvrtc)。
+    fn dispatch(&mut self, msg: crate::contract::LaunchMsg) -> Result<crate::contract::Bytes, OpError>;
+    fn upload(&mut self, dst: CheckBuf, src: &[u8]) -> Result<(), OpError>;
+    /// 设备 → host 回读(**独立参考比对的唯一入口**)
+    fn download(&mut self, src: CheckBuf, dst: &mut [u8]) -> Result<(), OpError>;
+    /// NVRTC 源码发射(符号名 = `name`;值表见 [`crate::contract::LaunchVal`])
+    fn launch_nvrtc(
+        &mut self,
+        name: &'static str,
+        source: &'static str,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        shared_mem: u32,
+        vals: &[crate::contract::LaunchVal],
+    ) -> Result<(), OpError>;
+    /// 流同步(回读前必须;自检是装配期一次性动作,不走热路径纪律)
+    fn sync(&mut self) -> Result<(), OpError>;
+}
+
+/// 装配期自检(**独立 oracle**;设计 §5.5)。
+///
+/// 三条纪律:① 参考必须是**独立实现**(同源副本对不出双错,E8);
+/// ② 装配期默认执行,失败 = **拒启**;③ 报告含逐元素 `max|err|` + 首个越界元素。
+pub trait BootCheck: Send + Sync {
+    /// 自检名(报告/boot 日志用)
+    fn name(&self) -> &'static str;
+    fn run(&self, r: &mut dyn CheckRunner) -> Result<CheckReport, OpError>;
+}
+
+/// 自检报告(逐元素误差 + 首个越界元素 + 毒值律结论)
 #[derive(Debug, Clone)]
 pub struct CheckReport {
     pub op: &'static str,
     pub worst_abs_err: f32,
     pub first_bad: Option<(usize, f32, f32)>,
     pub tolerance: f32,
+    /// 毒值自检结论(`Some(未写字节数)` = 声明写集之外的字节仍为毒值 ⇒ 写集穷举成立)
+    pub poison_untouched: Option<usize>,
+}
+
+impl CheckReport {
+    /// 纯数值型报告(无数值越界 = `first_bad: None`)
+    pub fn numeric(op: &'static str, worst_abs_err: f32, tolerance: f32) -> Self {
+        Self { op, worst_abs_err, first_bad: None, tolerance, poison_untouched: None }
+    }
 }
 
 // ============================================================================
