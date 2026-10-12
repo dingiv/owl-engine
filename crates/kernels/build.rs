@@ -332,6 +332,43 @@ fn xqa_table_src(rows: &[(&'static str, PathBuf)]) -> String {
     t
 }
 
+/// 多源/多头构建的**增量闸**(与 `compile_fatbin` 同款思路)。
+///
+/// 指纹 = 每个依赖(源 + 头)的 `len:mtime` + 编译旗子;存 `<dst>.stamp`。
+/// 为什么必须有:这些 `.a` 的冷编是分钟级(marlin 4 个模板重 TU ≈ 3.5 min、
+/// FI ≈ 1.5 min),而 build.rs 的 rerun 面很宽 —— 没有闸就没有可用的编辑回路。
+fn deps_fingerprint(deps: &[String], flags: &str) -> String {
+    let mut s = String::new();
+    for d in deps {
+        let (len, mtime) = match std::fs::metadata(d) {
+            Ok(m) => (
+                m.len(),
+                m.modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|x| x.as_nanos())
+                    .unwrap_or(0),
+            ),
+            Err(_) => (0, 0),
+        };
+        s.push_str(&format!("{d}:{len}:{mtime}\n"));
+    }
+    s.push_str("flags=");
+    s.push_str(flags);
+    s.push('\n');
+    s
+}
+
+fn stamp_hit(dst: &std::path::Path, deps: &[String], flags: &str) -> bool {
+    let stamp = dst.with_extension("stamp");
+    dst.exists()
+        && std::fs::read_to_string(&stamp).ok().as_deref() == Some(deps_fingerprint(deps, flags).as_str())
+}
+
+fn stamp_write(dst: &std::path::Path, deps: &[String], flags: &str) {
+    std::fs::write(dst.with_extension("stamp"), deps_fingerprint(deps, flags)).expect("write stamp");
+}
+
 fn main() {
     // native cubin 构建期产出(终态 = 零运行期编译)
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
@@ -346,41 +383,92 @@ fn main() {
     build_flashinfer();
 }
 
+/// marlin 编译期依赖的头(E5-DF3 同日十二:selector 改动不触发重编 →
+/// host `.o` 落后一代 → 新旧分支混链 undefined)
+const MARLIN_HEADERS: &[&str] = &[
+    "cu/marlin/vllm_marlin/kernel.h",
+    "cu/marlin/vllm_marlin/kernel_selector.h",
+    "cu/marlin/vllm_marlin/kernel_selector_full.upstream.h",
+    "cu/marlin/vllm_marlin/marlin_template.h",
+    "cu/marlin/vllm_marlin/marlin_dtypes.cuh",
+    "cu/marlin/vllm_marlin/marlin_mma.h",
+    "cu/marlin/vllm_marlin/dequant.h",
+];
+
+/// **selector ⊆ 实例化**门(2026-10-13)。
+///
+/// `marlin_host.cu` 的 `get_marlin_kernel` 靠 `#include "kernel_selector.h"`
+/// 选核,而该头是**生成的**(从实例化文件 1:1 生成)。一旦两者漂移,后果是
+/// **链接期** undefined hidden symbol(实测踩过;E5-DF3 同款"新旧分支混链")。
+/// 本门在**构建期**把两边的 `Marlin<...>` 变体集抽出来比对,selector 引用
+/// 而未实例化 ⇒ 直接拒构建(带首个缺失变体)。
+fn check_marlin_selector(sources: &[PathBuf]) {
+    fn variants(text: &str) -> std::collections::BTreeSet<String> {
+        let mut set = std::collections::BTreeSet::new();
+        let bytes = text.as_bytes();
+        let needle = b"Marlin<";
+        let mut i = 0usize;
+        while let Some(pos) = text[i..].find("Marlin<") {
+            let start = i + pos + needle.len();
+            if let Some(end) = text[start..].find('>') {
+                set.insert(text[start..start + end].split_whitespace().collect::<String>());
+                i = start + end;
+            } else {
+                break;
+            }
+            let _ = bytes;
+        }
+        set
+    }
+    let sel = std::fs::read_to_string("cu/marlin/vllm_marlin/kernel_selector.h").expect("selector");
+    let want = variants(&sel);
+    let mut have = std::collections::BTreeSet::new();
+    for src in sources {
+        if let Ok(t) = std::fs::read_to_string(src) {
+            have.extend(variants(&t));
+        }
+    }
+    let missing: Vec<&String> = want.difference(&have).collect();
+    assert!(
+        missing.is_empty(),
+        "marlin selector 引用了 {} 个**未实例化**的 Marlin<...> 变体(链接期 undefined hidden symbol 的根因);\
+         首个: {:?} —— 要么把对应 sm80_kernel_*.cu 纳入 sources,要么从 selector 删掉该分支(见 kernel_selector.h 头注)",
+        missing.len(),
+        missing.first()
+    );
+    println!(
+        "cargo:warning=owl-kernels: marlin selector ⊆ 实例化 ✓({} 变体引用 / {} 个已实例化)",
+        want.len(),
+        have.len()
+    );
+}
+
 fn build_marlin() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     // ------------------------------------------------------------------
     // marlin W4A16(f16 激活 × u4 权重 × f16 scales;foreign-kernel 通道)
-    // 预编 .a 入库,日常构建零 nvcc;FORCE_BUILD 时三源 nvcc(sm86)。
+    //
+    // **2026-10-13 C3-α**:由"预编 `.a` 入库(19 MB)"改为**构建期从源编**
+    // —— 源本就在树(`cu/marlin/*.cu` + `vllm_marlin/`),入库二进制只是
+    // "省一次 nvcc"的代价,却让 19 MB 二进制留在 git 且无法 review。
+    // 冷编 ≈ 3.5 min,由 [`stamp_hit`] 增量闸吸收(只在源/头变化时付)。
     // 旗子纪律(照 xinfer marlin-ffi 先例,禁 fast_math;vLLM≥12.8 的
     // -static-global-template-stub=false 必带,否则跨 TU 拒链)。
     // ------------------------------------------------------------------
     if std::env::var_os("CARGO_FEATURE_MARLIN").is_some() {
-        println!("cargo:rerun-if-changed=cu/marlin/prebuilt/libmarlin.a");
         // .h 追踪(E5-DF3 同日十二:selector 改动不触发重编 → host .o 落后
         // 一代 → 新旧分支混链 undefined)
-        for h in [
-            "cu/marlin/vllm_marlin/kernel.h",
-            "cu/marlin/vllm_marlin/kernel_selector.h",
-            "cu/marlin/vllm_marlin/kernel_selector_full.upstream.h",
-            "cu/marlin/vllm_marlin/marlin_template.h",
-            "cu/marlin/vllm_marlin/marlin_dtypes.cuh",
-            "cu/marlin/vllm_marlin/marlin_mma.h",
-            "cu/marlin/vllm_marlin/dequant.h",
-        ] {
+        for h in MARLIN_HEADERS {
             println!("cargo:rerun-if-changed={}", h);
         }
         println!("cargo:rerun-if-env-changed=MARLIN_FORCE_BUILD");
         println!("cargo:rerun-if-env-changed=MARLIN_CUDA_ARCH");
         println!("cargo:rerun-if-env-changed=MARLIN_NVCC");
-        let marlin_prebuilt = PathBuf::from("cu/marlin/prebuilt/libmarlin.a");
         let force = env::var("MARLIN_FORCE_BUILD").ok().as_deref() == Some("1");
         let obj_dir = out_dir.join("marlin");
         std::fs::create_dir_all(&obj_dir).unwrap();
-        if marlin_prebuilt.exists() && !force {
-            let dest = out_dir.join("libmarlin.a");
-            std::fs::copy(&marlin_prebuilt, &dest).expect("copy prebuilt libmarlin.a");
-            println!("cargo:warning=owl-kernels: using prebuilt {}", marlin_prebuilt.display());
-        } else {
+        let lib_out = out_dir.join("libmarlin.a");
+        {
             let arch = env::var("MARLIN_CUDA_ARCH").unwrap_or_else(|_| "86".into());
             let nvcc_m = env::var("MARLIN_NVCC").unwrap_or_else(|_| "nvcc".into());
             let base = PathBuf::from("cu/marlin");
@@ -389,8 +477,19 @@ fn build_marlin() {
                 base.join("vllm_marlin/sm80_kernel_float16_u4_float16.cu"),   // AWQ 非对称(kU4)
                 base.join("vllm_marlin/sm80_kernel_float16_u4b8_float16.cu"), // GPTQ 对称(kU4B8)
                 base.join("vllm_marlin/sm80_kernel_bfloat16_u4b8_bfloat16.cu"), // BF16 激活变体(E5-DF3 草稿 BF16 化)
+                base.join("vllm_marlin/sm80_kernel_s8_u4b8_float16.cu"),      // W4A8 s8→f16(S1;selector 引用之)
             ];
             let includes = [base.join("vllm_marlin"), base.join("vllm_marlin/shim")];
+            let ar = env::var("AR").unwrap_or_else(|_| "ar".into());
+            // ⚠️ `force` 不进指纹(一次性旁路,不是构建输入;进了会导致
+            // "用 FORCE_BUILD 跑过一次之后,普通构建反而重编")
+            check_marlin_selector(&sources);
+            let flags = format!("marlin arch=sm_{arch} nvcc={nvcc_m} ar={ar}");
+            let mut deps: Vec<String> = sources.iter().map(|p| p.display().to_string()).collect();
+            deps.extend(MARLIN_HEADERS.iter().map(|h| h.to_string()));
+            if !force && stamp_hit(&lib_out, &deps, &flags) {
+                println!("cargo:warning=owl-kernels: libmarlin.a 增量命中(零 nvcc)");
+            } else {
             let mut objs = Vec::new();
             for src in &sources {
                 println!("cargo:rerun-if-changed={}", src.display());
@@ -425,16 +524,17 @@ fn build_marlin() {
                 assert!(status.success(), "marlin: nvcc failed for {}", src.display());
                 objs.push(obj);
             }
-            let lib = out_dir.join("libmarlin.a");
-            let ar = env::var("AR").unwrap_or_else(|_| "ar".into());
-            let mut cmd = Command::new(&ar);
-            cmd.arg("rcs").arg(lib.to_str().unwrap());
-            for o in &objs {
-                cmd.arg(o.to_str().unwrap());
+                let _ = std::fs::remove_file(&lib_out); // ar rcs 是按名替换:旧成员会留存
+                let mut cmd = Command::new(&ar);
+                cmd.arg("rcs").arg(lib_out.to_str().unwrap());
+                for o in &objs {
+                    cmd.arg(o.to_str().unwrap());
+                }
+                let status = cmd.status().expect("marlin: failed to spawn ar");
+                assert!(status.success(), "marlin: ar failed");
+                stamp_write(&lib_out, &deps, &flags);
+                println!("cargo:warning=owl-kernels: built libmarlin.a (sm_{arch}) from source");
             }
-            let status = cmd.status().expect("marlin: failed to spawn ar");
-            assert!(status.success(), "marlin: ar failed");
-            println!("cargo:warning=owl-kernels: built libmarlin.a (sm_{arch}) from source");
         }
         let cuda_lib = env::var("CUDA_HOME")
             .map(|h| PathBuf::from(h).join("lib64"))
@@ -449,46 +549,72 @@ fn build_marlin() {
 
 }
 
+/// 递归列目录下所有文件(指纹/追踪用;零 walkdir 依赖)
+fn all_files(dir: &str, out: &mut Vec<String>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            all_files(&p.to_string_lossy(), out);
+        } else {
+            out.push(p.to_string_lossy().to_string());
+        }
+    }
+}
+
 fn build_flashinfer() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     // ------------------------------------------------------------------
-    // FlashInfer prefill(预编 .a 入库;foreign-kernel 通道;E1.5 工作包)
-    // FLASHINFER_FORCE_BUILD=1 重编:nvcc -arch=sm_86 -I<flashinfer>/include
-    // (fork 检出:~/.cudaforge/git/checkouts/flashinfer-0f06c2305a276bcb;
-    //  裁剪面见 cu/flashinfer/owl_fi_attention.cu 头注)
+    // FlashInfer prefill(foreign-kernel 通道;E1.5 工作包)
+    //
+    // **2026-10-13 C3-α**:由"预编 `.a` 入库(8.2 MB)"改为**构建期从源编**;
+    // 头闭包已 **vendor 进树**(`cu/flashinfer/include/`,22 文件 ~700 KB,
+    // 闭包复现法见其 README)—— 原先缺省读 `~/.cudaforge/...` 的**树外**检出,
+    // 违 §15.1.1 律 1"所有族的源必须在树"。冷编 ≈ 1.5 min,增量闸吸收。
     // ------------------------------------------------------------------
     if std::env::var_os("CARGO_FEATURE_FLASHINFER").is_some() {
-        println!("cargo:rerun-if-changed=cu/flashinfer/prebuilt/libowl_flashinfer.a");
+        let src = "cu/flashinfer/owl_fi_attention.cu";
+        let fi_include = env::var("FLASHINFER_INCLUDE")
+            .unwrap_or_else(|_| "cu/flashinfer/include".into());
+        println!("cargo:rerun-if-changed={src}");
+        println!("cargo:rerun-if-changed={fi_include}");
         println!("cargo:rerun-if-env-changed=FLASHINFER_FORCE_BUILD");
-        let fi_prebuilt = PathBuf::from("cu/flashinfer/prebuilt/libowl_flashinfer.a");
+        println!("cargo:rerun-if-env-changed=FLASHINFER_INCLUDE");
+        println!("cargo:rerun-if-env-changed=FLASHINFER_NVCC");
         let force = env::var("FLASHINFER_FORCE_BUILD").ok().as_deref() == Some("1");
+        let nvcc_m = env::var("FLASHINFER_NVCC").unwrap_or_else(|_| "nvcc".into());
+        let ar = env::var("AR").unwrap_or_else(|_| "ar".into());
         let fi_dir = out_dir.join("flashinfer");
-        std::fs::create_dir_all(&fi_dir).unwrap();
-        if fi_prebuilt.exists() && !force {
-            let dest = fi_dir.join("libowl_flashinfer.a");
-            std::fs::copy(&fi_prebuilt, &dest).expect("copy prebuilt libowl_flashinfer.a");
-            println!("cargo:warning=owl-kernels: using prebuilt {}", fi_prebuilt.display());
+        std::fs::create_dir_all(&fi_dir).expect("mkdir flashinfer out");
+        let lib = fi_dir.join("libowl_flashinfer.a");
+        let flags = format!("fi arch=sm_86 nvcc={nvcc_m} ar={ar} inc={fi_include} fp8=1");
+        let mut deps: Vec<String> = vec![src.to_string()];
+        all_files(&fi_include, &mut deps);
+        deps.sort();
+        if !force && stamp_hit(&lib, &deps, &flags) {
+            println!("cargo:warning=owl-kernels: libowl_flashinfer.a 增量命中(零 nvcc)");
         } else {
-            let fi_include = env::var("FLASHINFER_INCLUDE").unwrap_or_else(|_| {
-                "/home/div/.cudaforge/git/checkouts/flashinfer-0f06c2305a276bcb/include".into()
-            });
-            let nvcc_m = env::var("FLASHINFER_NVCC").unwrap_or_else(|_| "nvcc".into());
-            let src = PathBuf::from("cu/flashinfer/owl_fi_attention.cu");
             let obj = fi_dir.join("owl_fi_attention.o");
-            let status = std::process::Command::new(nvcc_m)
-                .args(["-O3", "-std=c++17", "-arch=sm_86"])
-                .arg(format!("-I{}", fi_include))
-                .arg("-c").arg(&src).arg("-o").arg(&obj)
+            // ⚠️ `-DFLASHINFER_ENABLE_FP8_E4M3` 是**必需**的:fp8 KV 入口
+            // `owl_fi_prefill_run_fp8kv` 被该宏圈住(源注释:"编译门"),而
+            // owl 生产档 quant=Fp8E4M3 + fi=true ⇒ 缺它 = 链接期 undefined
+            // symbol(实测:旧预编 `.a` 是带该宏编的,从源路径原先没带 ——
+            // 又一例"预编配方与树内配方不一致")
+            let status = std::process::Command::new(&nvcc_m)
+                .args(["-O3", "-std=c++17", "-arch=sm_86", "-DFLASHINFER_ENABLE_FP8_E4M3"])
+                .arg(format!("-I{fi_include}"))
+                .arg("-c").arg(src).arg("-o").arg(&obj)
                 .status()
                 .expect("flashinfer: failed to spawn nvcc");
             assert!(status.success(), "flashinfer: nvcc failed");
-            let ar = env::var("AR").unwrap_or_else(|_| "ar".into());
-            let status = std::process::Command::new(ar)
-                .args(["rcs"]).arg(fi_dir.join("libowl_flashinfer.a")).arg(&obj)
+            let _ = std::fs::remove_file(&lib);
+            let status = std::process::Command::new(&ar)
+                .args(["rcs"]).arg(&lib).arg(&obj)
                 .status()
                 .expect("flashinfer: failed to spawn ar");
             assert!(status.success(), "flashinfer: ar failed");
-            println!("cargo:warning=owl-kernels: built libowl_flashinfer.a from source");
+            stamp_write(&lib, &deps, &flags);
+            println!("cargo:warning=owl-kernels: built libowl_flashinfer.a from source (in-tree headers)");
         }
         let cuda_lib = env::var("CUDA_HOME")
             .map(|h| PathBuf::from(h).join("lib64"))

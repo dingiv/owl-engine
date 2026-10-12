@@ -1267,3 +1267,82 @@ Rust 文件都会重跑 build.rs**。没有闸的话每次 Rust 编辑要把 20 
 - **C4b gdn_chunked**:13 个 Triton cubin(仍 `load_cubin` 老路)→ 需 vendor Triton
   源 + 构建期 triton 编译路径;
 - **C5**:`Linkage` 三态(已确认零消费者)/ `sources.rs` / `list::REGISTRY`。
+
+---
+
+### 15.9 C3-α —— marlin / flashinfer:预编 `.a` → **构建期从源编**(2026-10-13)
+
+**27.2 MB 二进制出局**(marlin 19.1 MB + FI 8.2 MB,原先都在 git 里)。两支的
+**host 侧仍留在 C**(见 §15.9.5 的成本账),本节做的是"**资产面**"那一半:
+入库二进制 → 构建产物 + 源/头全在树 + 增量闸 + 两道新门。
+
+#### 15.9.1 三个实测发现(都指向同一句话:**预编件不是本仓产物**)
+
+| 发现 | 证据 | 后果 |
+|---|---|---|
+| **①`libmarlin.a` 是外来二进制** | 它的成员含 `marlin_quant.o` / `sampler_core.o` / `silu_int8_quant.o` / `bf16inst.o` / `sm80_kernel_s8_u4b8_bfloat16.o` —— **本仓没有这些源**(那些是 xinfer marlin-ffi 的对象) | "预编入库"实为**不可复现的外来 blob**;而且 `build.rs` 的 `FORCE_BUILD` 路径(3 源)**从未链接通过** |
+| **②selector 引用未实例化变体** | `kernel_selector.h` 引用 **306** 个 `Marlin<...>` 变体,树内 4 个 `sm80_kernel_*.cu` 只实例化 **258** ⇒ 缺 **48** 条 `kS8×kU4B8×kBFloat16`(其源文件 `sm80_kernel_s8_u4b8_bfloat16.cu` **不在树**) | 从源编 = **链接期 `undefined hidden symbol`**(实测)。修:源清单补上在树的第 4 支(`s8→f16`)+ 从 selector 删那 48 条 + **加构建期机器门**(见 15.9.3) |
+| **③FI 从源编缺编译门** | `owl_fi_prefill_run_fp8kv` 被 `#ifdef FLASHINFER_ENABLE_FP8_E4M3` 圈住,而 build.rs 的从源命令**没带该宏** ⇒ 符号缺失(实测链接失败);旧预编件带该宏 | 补 `-DFLASHINFER_ENABLE_FP8_E4M3`(owl 生产档 `quant=Fp8E4M3 + fi=true` **必需**) |
+
+#### 15.9.2 FI 头闭包 vendor 进树(§15.1.1 律 1)
+
+原缺省 `-I ~/.cudaforge/git/checkouts/flashinfer-0f06c2305a276bcb/include` ——
+**树外**检出 ⇒ clone 重建不出 `.a`。实测 `nvcc -M` 头闭包 = **22 文件 / 696 KB
+(不含 cutlass)** ⇒ 整体 vendor 到 `cu/flashinfer/include/`(保留相对布局;
+复现法写进其 README)。⇒ **两个 `.a` 现在都能从 clone 重建**。
+
+#### 15.9.3 新门:`check_marlin_selector`(selector ⊆ 实例化)
+
+`get_marlin_kernel` 靠生成的 `kernel_selector.h` 选核,该头与实例化文件一旦漂移,
+后果是**链接期**报错(实测踩过;E5-DF3 "新旧分支混链" 同款)。新门在 **build.rs**
+里把两边的 `Marlin<...>` 变体集抽出来比对,引用而未实例化 ⇒ **直接拒构建**
+(带首个缺失变体)。实测输出:
+
+```
+marlin selector ⊆ 实例化 ✓(258 变体引用 / 258 个已实例化)
+```
+
+#### 15.9.4 增量闸(两支共用)
+
+`stamp_hit` / `stamp_write`(源+头 `len:mtime` 指纹 + 编译旗子 → `<lib>.stamp`)。
+
+| 场景 | 实测 |
+|---|---|
+| touch 一个 `.rs`(build.rs 重跑) | **0.6 s**(native cubin 20 + marlin + FI **全增量命中,零 nvcc**) |
+| 改 `mha.cu` | 19.6 s(只重编 xqa 两个 fatbin) |
+| 冷编 marlin(4 支) | ≈ 3.5 min |
+| 冷编 FI | ≈ 1.5 min |
+
+> 旗子纪律:`FORCE_BUILD` **不进指纹**(一次性旁路,不是构建输入;进了会导致
+> "用 FORCE_BUILD 跑过一次之后,普通构建反而重编"—— 实测踩过)。
+
+#### 15.9.5 验收
+
+| 判据 | 结果 |
+|---|---|
+| **marlin 数值** | 装配期 oracle `marlin_gemm_w4a16_awq`: `max\|err\| = 3.065e-4` —— 与预编件时代**逐位同值**(§15.6.6 记录值) |
+| **FI 数值/通路** | 生产档 boot:`[boot] FlashInfer prefill 面启用(FI 直读主池 kNHD 单池;quant=Fp8E4M3)`;首答 0.5 s |
+| 链接 | `cargo build --workspace` 通过(此前从源路径**链接失败**) |
+| 真机 boot | 27.7 s + 首答 0.5 s;`[aot] 110/110`、`aot-miss` = **0** |
+| 回归 | kernels lib 58 · no_runtime_compile 2 · op_tables 7 · oracles 8 · cubin 探针 6 · models 117 · engine 22 · shared 27;clippy `--workspace --all-targets` **0 警** |
+| 出局 | `cu/marlin/prebuilt/libmarlin.a`(19.1 MB)+ `cu/flashinfer/prebuilt/libowl_flashinfer.a`(8.2 MB) |
+
+#### 15.9.6 剩余(C3-β:host 侧搬 Rust 的成本账)
+
+| 家族 | host 侧是什么 | 搬 Rust 的成本 |
+|---|---|---|
+| **marlin** | `marlin_host.cu` 514 行:exec-config/occupancy 启发式(`cudaOccupancyMaxActiveBlocksPerMultiprocessor`)+ `MARLIN_KERNEL_PARAMS` 20 参装配 + 从 mangled 符号选核 | 中(需 driver occupancy 绑定 + 符号名表;可由 build.rs 从 `cuobjdump -symbols` 抽 mangled 名生成) |
+| **flashinfer** | `owl_fi_attention.cu` 309 行,但 `plan` 面 = **flashinfer 自己的 `PrefillPlan` 调度器**(C++ 模板,数百行算法) | **高**(等于 fork 上游调度算法;Rust 侧现只消费不透明的 `plan15`) |
+
+⇒ 两者是"形态统一 + 跨 OS"的收益,**不**影响"零运行期编译 / clone 可重建 / 源在树"
+(这四条本节已全部达成)。建议按上表排序另立工单,不在本设计内顺手做。
+
+#### 15.9.7 全资产面现状(本役后)
+
+| 家族 | 载体 | git 内二进制 |
+|---|---|---|
+| native 110 核 + gdn_scalar + xqa(2 变体) | 构建期 fatbin(源哈希/变体名查表) | **0** |
+| marlin | 构建期 `.a`(4 支 sm80 设备码 + C host) | **0** |
+| flashinfer | 构建期 `.a`(设备码 + C host;头闭包在树) | **0** |
+| gdn_chunked(13 cubin) | `assets/`(**gitignore** —— 本就是运行期必需但未入库!) | 0(但**不可复现**,C4b 待办) |
+| cublas | 系统 `.so`(唯一例外) | 0 |

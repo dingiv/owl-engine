@@ -12,8 +12,11 @@
 //   池由 owl_reshape_and_cache_dual_f16(K0-dual)同发射写出。
 // 平面:plan(host,每 chunk 一次;server 侧 1 项缓存)+ run(每 attention
 //   层一次)。批 = 1(owl 单会话),qo_indptr = [0,T],kv_indptr = [0,ctx]。
-// 编译:nvcc -O3 -std=c++17 -arch=sm_86 -I<flashinfer>/include -c 本文件
-//   → libowl_flashinfer.a(prebuilt 入库,marlin .a 先例;零构建期依赖)。
+// 编译:nvcc -O3 -std=c++17 -arch=sm_86 -DFLASHINFER_ENABLE_FP8_E4M3
+//   -I cu/flashinfer/include -c 本文件 → libowl_flashinfer.a
+//   (2026-10-13 C3-α:改为**构建期从源编**;头闭包已 vendor 进树
+//    `cu/flashinfer/include/`,原 prebuilt `.a`(8.2 MB)已删。
+//    ⚠️ `-DFLASHINFER_ENABLE_FP8_E4M3` 必需 —— 见下方 fp8 段与 build.rs 注)。
 // ============================================================================
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
