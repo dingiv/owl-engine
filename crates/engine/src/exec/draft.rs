@@ -998,9 +998,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             None
         };
 
+        // P1′(2026-10-14):同 prefill_chunk —— cu_seqlens 每轮一次(替代
+        // 逐层 from_host 兜底;48 次 8B H2D × ~3.5ms 往返)
+        let seq_cu = TensorOps::from_host(Dtype::F32, vec![2], &f32b(&[0.0, t as f32]));
         let mut ctx = owl_models::module::ForwardCtx::model_prefill(
             t, &pos_t, &kvs_step, &self.rope, &gdns_step, &slots_t, &lens_t, &gdn_slot_t, base, fi,
         );
+        ctx.seq_cu = Some(&seq_cu);
         ctx.env = self.env;
         let face = self.session.face_mut();
         let vocab = self.model.vocab_size();

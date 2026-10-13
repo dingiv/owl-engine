@@ -269,6 +269,74 @@ impl GpuCtx {
         // G0 护栏:关 event-tracking(坑 A)。多流 + event tracking 会让
         // safe 层在块读写上插事件,污染图捕获(CAPTURE_ISOLATION/图内事件节点)
         unsafe { ctx.disable_event_tracking() };
+        // ── P1″(2026-10-14):**默认池属性调优**(NVIDIA CUDA Programming
+        //    Guide §4.3.4.2 / §4.3.4.4;cudarc 缺省 = 驱动缺省,对
+        //    "整块只跑不 sync" 的 eager 路径最不利):
+        //    ① `RELEASE_THRESHOLD` 缺省 0 ⇒ 每次 stream/event/device
+        //       synchronize 都把物理页还给 OS ⇒ 下一发 alloc 重新映射(昂贵 OS 调用);
+        //    ② `REUSE_ALLOW_OPPORTUNISTIC` 缺省 0 ⇒ free 掉的块**必须等 CPU
+        //       侧同步**才能复用 ⇒ 逐节点 alloc/free churn 只能不断长池子。
+        //    实测依据:512-tok prefill 375 ms 中设备核仅 8%;`OWL_NO_RECLAIM=1`
+        //    (干脆不 free)⇒ **77-117 ms(5×)**,但无界常驻 OOM ⇒ 要的是
+        //    "能复用"而不是"不释放"。
+        //    (池归属 = 设备默认池:server 用 `cuMemAllocAsync`,即默认池。
+        //     预算纪律不变:`vram_target` 侧仍可随时 `cuMemPoolTrimTo` 回收。)
+        // 裸 sys 层调用(cudarc `result::` 包装在 cuda-13020 档被 cfg 掉;
+        // 原始绑定不门控 —— 本项目已有 sys 直用先例,见下方 MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)
+        let pool_setup = || -> Result<(), String> {
+            use cudarc::driver::sys as cs;
+            let dev = cudarc::driver::result::device::get(ordinal as i32)
+                .map_err(|e| format!("device::get: {e:?}"))?;
+            let mut pool = std::mem::MaybeUninit::<cs::CUmemoryPool>::uninit();
+            let rc = unsafe { cs::cuDeviceGetDefaultMemPool(pool.as_mut_ptr(), dev) };
+            if rc != cs::CUresult::CUDA_SUCCESS {
+                return Err(format!("cuDeviceGetDefaultMemPool: {rc:?}"));
+            }
+            let pool = unsafe { pool.assume_init() };
+            let mut threshold: u64 = u64::MAX;
+            let mut opportunistic: i32 = 1;
+            let mut follow_events: i32 = 1;
+            for (attr, val, what) in [
+                (
+                    cs::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+                    &mut threshold as *mut u64 as *mut core::ffi::c_void,
+                    "RELEASE_THRESHOLD=UINT64_MAX",
+                ),
+                (
+                    cs::CUmemPool_attribute::CU_MEMPOOL_ATTR_REUSE_ALLOW_OPPORTUNISTIC,
+                    &mut opportunistic as *mut i32 as *mut core::ffi::c_void,
+                    "REUSE_ALLOW_OPPORTUNISTIC=1",
+                ),
+                (
+                    cs::CUmemPool_attribute::CU_MEMPOOL_ATTR_REUSE_FOLLOW_EVENT_DEPENDENCIES,
+                    &mut follow_events as *mut i32 as *mut core::ffi::c_void,
+                    "REUSE_FOLLOW_EVENT_DEPENDENCIES=1",
+                ),
+            ] {
+                let rc = unsafe { cs::cuMemPoolSetAttribute(pool, attr, val) };
+                // 家规:可失败调用不得吞掉 —— 池属性是性能面,失败 = 可见降级
+                if rc != cs::CUresult::CUDA_SUCCESS {
+                    sink.logf(
+                        owl_shared::log::LVL_WARN,
+                        "pool",
+                        format_args!("池属性 {what} 设置失败(性能面降级): {rc:?}"),
+                    );
+                }
+            }
+            Ok(())
+        };
+        match pool_setup() {
+            Ok(()) => sink.logf(
+                owl_shared::log::LVL_INFO,
+                "pool",
+                format_args!("默认池已调优:release=MAX / opportunistic=1 / follow_events=1"),
+            ),
+            Err(e) => sink.logf(
+                owl_shared::log::LVL_WARN,
+                "pool",
+                format_args!("默认池调优失败(驱动缺省行为): {e}"),
+            ),
+        }
         // 动态 smem 每块上限(boot 查一次缓存;发射前硬顶守卫用,
         // 不逐发射查 CUDA —— 热路径零额外调用)
         let smem_optin = ctx

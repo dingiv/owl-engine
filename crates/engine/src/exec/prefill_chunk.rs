@@ -119,9 +119,16 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         } else {
             None
         };
+        // P1′(2026-10-14):**cu_seqlens [0,T] 每 chunk 只上传一次**。
+        // 原先 attn/gdn 层各自 `from_host([2])` 兜底(16 attn + 32 gdn = **48 次
+        // 8 字节 H2D / chunk**)—— 每次 8B 上传的**往返延迟 ~3.5ms**(issue 侧仅
+        // 16µs)⇒ ~170ms/chunk 白烧。注入面本就存在(verify 图先例 E5-M4:
+        // `ctx.seq_cu`),eager prefill 只是没接。
+        let seq_cu = TensorOps::from_host(Dtype::F32, vec![2], &f32b(&[0.0, t as f32]));
         let mut ctx = ForwardCtx::model_prefill(
             t, &pos_t, &kvs_step, &self.rope, &gdns_step, &slots_t, &lens_t, &gdn_slot, base, fi,
         );
+        ctx.seq_cu = Some(&seq_cu);
         ctx.env = self.env;
         ctx.trace_gate = self.cfg.knobs.probes.trace_gate;
         let _vocab = self.model.vocab_size();
