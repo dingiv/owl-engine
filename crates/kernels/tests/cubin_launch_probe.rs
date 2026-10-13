@@ -26,7 +26,7 @@ use half::f16;
 fn add_asset() -> &'static owl_kernels::family::cubins::CubinAsset {
     let src = owl_kernels::spec::meta_of::<owl_kernels::ops::elems::AddF16>().src;
     owl_kernels::family::cubins::asset(src)
-        .expect("cu/owl/add.cu 应有构建期 fatbin 资产(build.rs 未编?)")
+        .expect("cu/elems/add.cu 应有构建期 fatbin 资产(build.rs 未编?)")
 }
 
 const N: usize = 1024;

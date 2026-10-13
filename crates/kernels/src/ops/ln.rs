@@ -8,7 +8,7 @@ pub struct RmsnormF16;
 
 impl KernelSpec for RmsnormF16 {
     const ENTRY: &'static str = "owl_rmsnorm_f16";
-    const SRC: &'static str = "cu/owl/rmsnorm.cu";
+    const SRC: &'static str = "cu/ln/rmsnorm.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::F16, 2),
         Param::t_in("alpha", Dtype::F16, 1),
@@ -27,7 +27,7 @@ pub struct RmsnormBf16;
 
 impl KernelSpec for RmsnormBf16 {
     const ENTRY: &'static str = "owl_rmsnorm_bf16";
-    const SRC: &'static str = "cu/owl/rmsnorm.cu";
+    const SRC: &'static str = "cu/ln/rmsnorm.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::BF16, 2),
         Param::t_in("alpha", Dtype::BF16, 1),
@@ -46,7 +46,7 @@ pub struct FusedAddRmsnormF16;
 
 impl KernelSpec for FusedAddRmsnormF16 {
     const ENTRY: &'static str = "owl_fused_add_rmsnorm_f16";
-    const SRC: &'static str = "cu/owl/fused_add_rmsnorm.cu";
+    const SRC: &'static str = "cu/ln/fused_add_rmsnorm.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("mixed", Dtype::F16, 2),
         Param::t_inout("residual", Dtype::F16, 2),
@@ -66,7 +66,7 @@ pub struct FusedAddRmsnormBf16;
 
 impl KernelSpec for FusedAddRmsnormBf16 {
     const ENTRY: &'static str = "owl_fused_add_rmsnorm_bf16";
-    const SRC: &'static str = "cu/owl/fused_add_rmsnorm.cu";
+    const SRC: &'static str = "cu/ln/fused_add_rmsnorm.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("mixed", Dtype::BF16, 2),
         Param::t_inout("residual", Dtype::BF16, 2),
@@ -86,7 +86,7 @@ pub struct SiluAndMulF16;
 
 impl KernelSpec for SiluAndMulF16 {
     const ENTRY: &'static str = "owl_silu_and_mul_f16";
-    const SRC: &'static str = "cu/owl/silu_and_mul.cu";
+    const SRC: &'static str = "cu/ln/silu_and_mul.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("g", Dtype::F16, 2),
         Param::t_in("u", Dtype::F16, 2),
@@ -103,7 +103,7 @@ pub struct SiluAndMulBf16;
 
 impl KernelSpec for SiluAndMulBf16 {
     const ENTRY: &'static str = "owl_silu_and_mul_bf16";
-    const SRC: &'static str = "cu/owl/silu_and_mul.cu";
+    const SRC: &'static str = "cu/ln/silu_and_mul.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("g", Dtype::BF16, 2),
         Param::t_in("u", Dtype::BF16, 2),
@@ -134,7 +134,7 @@ pub struct RmsnormF32;
 
 impl KernelSpec for RmsnormF32 {
     const ENTRY: &'static str = "owl_rmsnorm_f32";
-    const SRC: &'static str = "cu/owl/rmsnorm.cu";
+    const SRC: &'static str = "cu/ln/rmsnorm.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::F32, 2),
         Param::t_in("alpha", Dtype::F32, 2),

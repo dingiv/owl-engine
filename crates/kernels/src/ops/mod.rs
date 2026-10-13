@@ -41,6 +41,7 @@ pub mod flashinfer;
 pub mod fused;
 pub mod gdn;
 pub mod gdn_chunked;
+pub mod gdn_scalar;
 pub mod ln;
 pub mod load;
 pub mod marlin;
@@ -52,6 +53,7 @@ pub static TABLES: &[&[&KernelMeta]] = &[
     attn::METAS,
     gdn::METAS,
     gdn_chunked::METAS,
+    gdn_scalar::METAS,
     elems::METAS,
     fused::METAS,
     ln::METAS,

@@ -9,7 +9,7 @@ pub struct DflashConvBf16;
 
 impl KernelSpec for DflashConvBf16 {
     const ENTRY: &'static str = "owl_dflash_conv_bf16";
-    const SRC: &'static str = "cu/owl/dflash_conv.cu";
+    const SRC: &'static str = "cu/dflash/dflash_conv.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::BF16, 2),
         Param::t_in("delta", Dtype::BF16, 2),
@@ -32,7 +32,7 @@ pub struct DflashSelectBf16;
 
 impl KernelSpec for DflashSelectBf16 {
     const ENTRY: &'static str = "owl_dflash_select_bf16";
-    const SRC: &'static str = "cu/owl/dflash_select.cu";
+    const SRC: &'static str = "cu/dflash/dflash_select.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("cand", Dtype::F32, 2),
         Param::t_in("unary", Dtype::F32, 2),
@@ -65,7 +65,7 @@ pub struct DflashConvF16;
 
 impl KernelSpec for DflashConvF16 {
     const ENTRY: &'static str = "owl_dflash_conv_f16";
-    const SRC: &'static str = "cu/owl/dflash_conv.cu";
+    const SRC: &'static str = "cu/dflash/dflash_conv.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::F16, 2),
         Param::t_in("delta", Dtype::F16, 2),
@@ -88,7 +88,7 @@ pub struct DflashSelectF16;
 
 impl KernelSpec for DflashSelectF16 {
     const ENTRY: &'static str = "owl_dflash_select_f16";
-    const SRC: &'static str = "cu/owl/dflash_select.cu";
+    const SRC: &'static str = "cu/dflash/dflash_select.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("cand", Dtype::F32, 2),
         Param::t_in("unary", Dtype::F32, 2),

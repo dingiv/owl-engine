@@ -16,7 +16,7 @@ pub struct QknormRopeKvInsertF16Fp8Knhd;
 
 impl KernelSpec for QknormRopeKvInsertF16Fp8Knhd {
     const ENTRY: &'static str = "owl_qknorm_rope_kv_insert_f16_fp8kv_knhd";
-    const SRC: &'static str = "cu/owl/qknorm_insert.cu";
+    const SRC: &'static str = "cu/fused/qknorm_insert.cu";
     const PARAMS: &'static [Param] = &[
         // q_raw 是 per-head [value|gate] 半段拼接(strided 读)
         Param::t_in("q_raw", Dtype::F16, 2),
@@ -59,7 +59,7 @@ pub struct QknormRopeKvInsertF16Fp8;
 
 impl KernelSpec for QknormRopeKvInsertF16Fp8 {
     const ENTRY: &'static str = "owl_qknorm_rope_kv_insert_f16_fp8kv";
-    const SRC: &'static str = "cu/owl/qknorm_insert.cu";
+    const SRC: &'static str = "cu/fused/qknorm_insert.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q_raw", Dtype::F16, 2),
         Param::t_in("k", Dtype::F16, 3),
@@ -108,7 +108,7 @@ pub struct QknormRopeKvInsertF16;
 
 impl KernelSpec for QknormRopeKvInsertF16 {
     const ENTRY: &'static str = "owl_qknorm_rope_kv_insert_f16";
-    const SRC: &'static str = "cu/owl/qknorm_insert.cu";
+    const SRC: &'static str = "cu/fused/qknorm_insert.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
         Param::t_in("q_raw", Dtype::F16, 2),
@@ -149,7 +149,7 @@ pub struct QknormRopeKvInsertF16Knhd;
 
 impl KernelSpec for QknormRopeKvInsertF16Knhd {
     const ENTRY: &'static str = "owl_qknorm_rope_kv_insert_f16_knhd";
-    const SRC: &'static str = "cu/owl/qknorm_insert.cu";
+    const SRC: &'static str = "cu/fused/qknorm_insert.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
         Param::t_in("q_raw", Dtype::F16, 2),

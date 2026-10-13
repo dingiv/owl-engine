@@ -58,15 +58,74 @@ impl KernelSpec for FiPrefillFp8kv {
 }
 
 
+/// `flashinfer_prefill_paged_f16` —— paged prefill(**f16 主池**;fp8kv 孪生)。
+///
+/// 槽序与 fp8kv 版逐位同形(适配器同一 plan;只有池元素宽不同)——
+/// 两者共享 `client::fi_sig::SIG`,故本表 PARAMS 除池 dtype 外逐字一致。
+pub struct FiPrefillF16;
+
+impl KernelSpec for FiPrefillF16 {
+    const ENTRY: &'static str = "flashinfer_prefill_paged_f16";
+    /// foreign(预编 `.a`):无 `.cu` 源
+    const SRC: &'static str = "";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("q", Dtype::F16, 2),
+        // f16 主池(adapter 内部布局;2B/elem)
+        Param::t_in("k_cache", Dtype::F16, 4),
+        Param::t_in("v_cache", Dtype::F16, 4),
+        Param::t_in("q_cu", Dtype::U32, 1),
+        Param::t_in("indices", Dtype::U32, 1),
+        Param::t_in("indptr", Dtype::U32, 1),
+        Param::t_in("last_len", Dtype::U32, 1),
+        Param::t_in("wr", Dtype::U8, 1),
+        Param::t_out("out", Dtype::F16, 2),
+        Param::sz("total_rows"),
+        Param::sz("ctx_total"),
+        Param::sz("t"),
+        Param::sz("hq"),
+        Param::sz("hkv"),
+        Param::sz("hd"),
+        Param::sz("page"),
+        Param::s("sm_scale_bits", crate::spec::ScalarTy::F32Bits),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+    const POOL: &'static [crate::spec::PoolAccess] =
+        &[crate::spec::PoolAccess::read(
+            crate::spec::pools::KV_MAIN,
+            crate::spec::LayoutTag::Knhd,
+            Dtype::F16,
+        )];
+    const SHAPE: ShapeFamily = ShapeFamily {
+        kv_dtype: Some(Dtype::F16),
+        head_dim: &[128, 256],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
+    };
+}
+
+
+pub static PREFILL_FI_F16: KernelMeta = meta_of::<FiPrefillF16>();
+
 pub static PREFILL_FI_FP8KV: KernelMeta = meta_of::<FiPrefillFp8kv>();
 
 /// 本域全部已建表算子
-pub static METAS: &[&KernelMeta] = &[&PREFILL_FI_FP8KV];
+pub static METAS: &[&KernelMeta] = &[&PREFILL_FI_FP8KV, &PREFILL_FI_F16];
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::spec::meta_of;
+
+    /// f16 孪生与 fp8kv 版**逐位同形**(同一 plan,只差池元素宽)
+    #[test]
+    fn fi_f16_mirrors_fp8kv_slots() {
+        let a = meta_of::<FiPrefillFp8kv>();
+        let b = meta_of::<FiPrefillF16>();
+        assert_eq!(a.args_str(), b.args_str(), "FI f16 与 fp8kv 槽序必须同形");
+    }
 
     /// 与旧权威串(`client::fi_sig::SIG`)逐字一致
     #[test]

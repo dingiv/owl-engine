@@ -63,98 +63,98 @@ pub(crate) mod cu {
     /// owl 自研/移植位(工单 N;NInfer 等外部引擎核的 owl 契约改写)
     pub mod owl {
         /// 融合核族(2026-10-13 C 轮自 fused.cu 分出)
-        pub const NORM_ROPE: &str = "cu/owl/norm_rope.cu";
+        pub const NORM_ROPE: &str = "cu/attn/norm_rope.cu";
         /// 融合核族(2026-10-13 C 轮自 fused.cu 分出)
-        pub const SILU_AND_MUL: &str = "cu/owl/silu_and_mul.cu";
+        pub const SILU_AND_MUL: &str = "cu/ln/silu_and_mul.cu";
         /// 融合核族(2026-10-13 C 轮自 fused.cu 分出)
-        pub const FUSED_ADD_RMSNORM: &str = "cu/owl/fused_add_rmsnorm.cu";
+        pub const FUSED_ADD_RMSNORM: &str = "cu/ln/fused_add_rmsnorm.cu";
         /// 融合核族(2026-10-13 C 轮自 fused.cu 分出)
-        pub const QKNORM_INSERT: &str = "cu/owl/qknorm_insert.cu";
+        pub const QKNORM_INSERT: &str = "cu/fused/qknorm_insert.cu";
 
         /// GDN 核族(2026-10-13 C 轮自 gdn.cu 按**算子族**分出)
-        pub const GDN_CONV_UPD: &str = "cu/owl/gdn_conv_upd.cu";
+        pub const GDN_CONV_UPD: &str = "cu/gdn/gdn_conv_upd.cu";
         /// GDN 核族(2026-10-13 C 轮自 gdn.cu 按**算子族**分出)
-        pub const GDN_CONV_FWD: &str = "cu/owl/gdn_conv_fwd.cu";
+        pub const GDN_CONV_FWD: &str = "cu/gdn/gdn_conv_fwd.cu";
         /// GDN 核族(2026-10-13 C 轮自 gdn.cu 按**算子族**分出)
-        pub const GDN_GATING: &str = "cu/owl/gdn_gating.cu";
+        pub const GDN_GATING: &str = "cu/gdn/gdn_gating.cu";
         /// GDN 核族(2026-10-13 C 轮自 gdn.cu 按**算子族**分出)
-        pub const GDN_DELTA_DEC: &str = "cu/owl/gdn_delta_dec.cu";
+        pub const GDN_DELTA_DEC: &str = "cu/gdn/gdn_delta_dec.cu";
         /// GDN 核族(2026-10-13 C 轮自 gdn.cu 按**算子族**分出)
-        pub const GDN_NORM_ACT: &str = "cu/owl/gdn_norm_act.cu";
+        pub const GDN_NORM_ACT: &str = "cu/gdn/gdn_norm_act.cu";
         /// GDN 核族(2026-10-13 C 轮自 gdn.cu 按**算子族**分出)
-        pub const GDN_L2NORM: &str = "cu/owl/gdn_l2norm.cu";
+        pub const GDN_L2NORM: &str = "cu/gdn/gdn_l2norm.cu";
         /// GDN 核族(2026-10-13 C 轮自 gdn.cu 按**算子族**分出)
-        pub const GDN_RECURRENCE: &str = "cu/owl/gdn_recurrence.cu";
+        pub const GDN_RECURRENCE: &str = "cu/gdn/gdn_recurrence.cu";
         /// GDN 核族(2026-10-13 C 轮自 gdn.cu 按**算子族**分出)
-        pub const GDN_DECODE_STEP: &str = "cu/owl/gdn_decode_step.cu";
+        pub const GDN_DECODE_STEP: &str = "cu/gdn/gdn_decode_step.cu";
 
         /// 2026-10-13 C 轮自 dflash2.cu 按算子族分出
-        pub const NAIVE_ATTN_NC: &str = "cu/owl/naive_attn_nc.cu";
+        pub const NAIVE_ATTN_NC: &str = "cu/attn/naive_attn_nc.cu";
         /// 2026-10-13 C 轮自 dflash2.cu 按算子族分出
-        pub const DFLASH_CONV: &str = "cu/owl/dflash_conv.cu";
+        pub const DFLASH_CONV: &str = "cu/dflash/dflash_conv.cu";
         /// 2026-10-13 C 轮自 dflash2.cu 按算子族分出
-        pub const DFLASH_SELECT: &str = "cu/owl/dflash_select.cu";
+        pub const DFLASH_SELECT: &str = "cu/dflash/dflash_select.cu";
         /// 2026-10-13 C 轮自 dflash2.cu 按算子族分出
-        pub const DFLASH_TOPK: &str = "cu/owl/dflash_topk.cu";
+        pub const DFLASH_TOPK: &str = "cu/elems/dflash_topk.cu";
 
         /// 原子 cu/owl/attention.cu 的 NARROW_STRIDED(2026-10-13 C 轮分出)
-        pub const NARROW_STRIDED: &str = "cu/owl/narrow_strided.cu";
+        pub const NARROW_STRIDED: &str = "cu/elems/narrow_strided.cu";
         /// 原子 cu/owl/attention.cu 的 NAIVE_DECODE_ATTN(2026-10-13 C 轮分出)
-        pub const NAIVE_DECODE_ATTN: &str = "cu/owl/naive_decode_attn.cu";
+        pub const NAIVE_DECODE_ATTN: &str = "cu/attn/naive_decode_attn.cu";
 
         // ---- 语义算子族(2026-10-13 C 轮:一算子一 `.cu` —— 原 ops_pair.cu
         //      按**算子族**拆开,与 ops/elems.rs、ops/ln.rs 的声明对望)----
-        pub const ADD: &str = "cu/owl/add.cu";
-        pub const MUL: &str = "cu/owl/mul.cu";
-        pub const SILU: &str = "cu/owl/silu.cu";
-        pub const SIGMOID: &str = "cu/owl/sigmoid.cu";
-        pub const MATMUL: &str = "cu/owl/matmul.cu";
-        pub const RMSNORM: &str = "cu/owl/rmsnorm.cu";
+        pub const ADD: &str = "cu/elems/add.cu";
+        pub const MUL: &str = "cu/elems/mul.cu";
+        pub const SILU: &str = "cu/elems/silu.cu";
+        pub const SIGMOID: &str = "cu/elems/sigmoid.cu";
+        pub const MATMUL: &str = "cu/elems/matmul.cu";
+        pub const RMSNORM: &str = "cu/ln/rmsnorm.cu";
 
-        pub const SIGMOID_GATE_MUL_F16: &str = "cu/owl/sigmoid_gate_mul_f16.cu";
+        pub const SIGMOID_GATE_MUL_F16: &str = "cu/elems/sigmoid_gate_mul_f16.cu";
         /// f16/bf16 设备 cast 族(C 轮起独立成文件;原来合在 cast.cu 里)
-        pub const CAST: &str = "cu/owl/cast.cu";
+        pub const CAST: &str = "cu/elems/cast.cu";
         /// GDN 状态布局转置 [HV,K,V] ↔ [HV,V,K](C 轮自 cast.cu 分出)
-        pub const STATE_TRANSPOSE: &str = "cu/owl/state_transpose.cu";
+        pub const STATE_TRANSPOSE: &str = "cu/gdn/state_transpose.cu";
         /// 刀3a'(2026-10-04):双权 GEMV 单发(b/a 投影;杀 cublas gemvx+splitK)
-        pub const GEMV_DUAL_F16: &str = "cu/owl/gemv_dual_f16.cu";
+        pub const GEMV_DUAL_F16: &str = "cu/elems/gemv_dual_f16.cu";
         /// 设备侧贪心采样(E3;REQ-DEC-04)
-        pub const ARGMAX_F16: &str = "cu/owl/argmax_f16.cu";
+        pub const ARGMAX_F16: &str = "cu/elems/argmax_f16.cu";
         /// 刀D 层间时间戳探针(2026-10-12 自 models 逃生舱收编)
-        pub const TS_PROBE: &str = "cu/owl/ts_probe.cu";
+        pub const TS_PROBE: &str = "cu/probe/ts_probe.cu";
         // ---- 融合核族(C1;2026-10-01;Ampere-first 准则见 .cu 头注)----
         /// ct packed → marlin B 设备重排(2026-10-01 装载提速;主源 =
         /// attention.rs marlin_repack.cu gptq_repack_kernel,输入侧转置适配;
         /// 2026-10-12 归编 cu/marlin/ —— marlin 家族源码同目录)
-        pub const CT_REPACK_U32: &str = "cu/marlin/marlin_repack_ct.cu";
+        pub const CT_REPACK_U32: &str = "cu/load/marlin_repack_ct.cu";
     }
 
     /// attention port 家族(K0 起步;vendor attention.rs rev c0f19f2,Apache-2.0,
     /// 文件级复用 + f16 特化;出处与适配认领见各 .cu 头注)
     pub mod attention {
         /// KV cache 散写(vLLM classic 布局;K1/K2 paged_attention 同款布局)
-        pub const RESHAPE_AND_CACHE_F16: &str = "cu/attention/reshape_and_cache.cu";
+        pub const RESHAPE_AND_CACHE_F16: &str = "cu/attn/reshape_and_cache.cu";
         /// fp8 KV 变体(nvrtc 独立核文件;FI adapter 本体含 flashinfer 头不可 nvrtc)
         /// B6.2:K0 批量写池 fp8 变体(f16 输入 → e4m3 池;主池 fp8 承载配套)
-        pub const RESHAPE_AND_CACHE_FP8KV: &str = "cu/attention/reshape_and_cache_fp8kv.cu";
+        pub const RESHAPE_AND_CACHE_FP8KV: &str = "cu/attn/reshape_and_cache_fp8kv.cu";
         /// paged attention decode 家族(v1 / v2 分片 / v2 reduce;K1/K2)
-        pub const PAGED_ATTENTION_F16: &str = "cu/attention/pagedattention_f16.cu";
+        pub const PAGED_ATTENTION_F16: &str = "cu/attn/pagedattention_f16.cu";
         /// chunked prefill paged attention(在线 softmax + 滑窗;smem tile)
-        pub const PREFILL_PAGED_ATTN_F16: &str = "cu/attention/prefill_paged_attn_f16.cu";
+        pub const PREFILL_PAGED_ATTN_F16: &str = "cu/attn/prefill_paged_attn_f16.cu";
         /// prefill split attention(flash-decoding 式 context 分块 + reduce;
         /// 2026-10-02 C1 自研序,长 ctx prefill 主案)
-        pub const PREFILL_SPLIT_F16: &str = "cu/attention/prefill_split_f16.cu";
+        pub const PREFILL_SPLIT_F16: &str = "cu/attn/prefill_split_f16.cu";
     }
 
     /// 文本主干 kernel(2026-10-12 归编 cu/owl/ —— owl 自研/移植位,不再
     /// 单设 text 目录;mod 名保留 = 消费方零改动)
     pub mod text {
         /// embedding 查表
-        pub const EMBED_F32: &str = "cu/owl/embed_f32.cu";
+        pub const EMBED_F32: &str = "cu/elems/embed_f32.cu";
         /// rope(interleaved partial)
-        pub const ROPE_HALF_PARTIAL_F32: &str = "cu/owl/rope_f32.cu";
+        pub const ROPE_HALF_PARTIAL_F32: &str = "cu/elems/rope_f32.cu";
         /// PF1a 栈核(concat_rows;arity 8,展开路径测试锚专用)
-        pub const CONCAT_F32: &str = "cu/owl/concat.cu";
+        pub const CONCAT_F32: &str = "cu/elems/concat.cu";
     }
 }
 use self::cu::text;

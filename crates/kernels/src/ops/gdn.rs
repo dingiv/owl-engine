@@ -18,7 +18,7 @@ pub struct GatingGF16;
 
 impl KernelSpec for GatingGF16 {
     const ENTRY: &'static str = "owl_gdn_gating_g_f16";
-    const SRC: &'static str = "cu/owl/gdn_gating.cu";
+    const SRC: &'static str = "cu/gdn/gdn_gating.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("a_log", Dtype::F16, 2),
         Param::t_in("a", Dtype::F16, 2),
@@ -37,7 +37,7 @@ pub struct L2NormF16;
 
 impl KernelSpec for L2NormF16 {
     const ENTRY: &'static str = "owl_gdn_l2norm_f16";
-    const SRC: &'static str = "cu/owl/gdn_l2norm.cu";
+    const SRC: &'static str = "cu/gdn/gdn_l2norm.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::F16, 2),
         Param::sz("rows"),
@@ -55,7 +55,7 @@ pub struct NormActF16;
 
 impl KernelSpec for NormActF16 {
     const ENTRY: &'static str = "owl_gdn_norm_act_f16";
-    const SRC: &'static str = "cu/owl/gdn_norm_act.cu";
+    const SRC: &'static str = "cu/gdn/gdn_norm_act.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::F16, 2),
         Param::t_in("z", Dtype::F16, 2),
@@ -81,7 +81,7 @@ pub struct ConvFwdF16;
 
 impl KernelSpec for ConvFwdF16 {
     const ENTRY: &'static str = "owl_gdn_conv_fwd_f16";
-    const SRC: &'static str = "cu/owl/gdn_conv_fwd.cu";
+    const SRC: &'static str = "cu/gdn/gdn_conv_fwd.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::F16, 2),
         Param::t_in("w", Dtype::F16, 2),
@@ -105,7 +105,7 @@ pub struct ConvUpdDualF16;
 
 impl KernelSpec for ConvUpdDualF16 {
     const ENTRY: &'static str = "owl_gdn_conv_upd_dual_f16";
-    const SRC: &'static str = "cu/owl/gdn_conv_upd.cu";
+    const SRC: &'static str = "cu/gdn/gdn_conv_upd.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("x_q", Dtype::F16, 2),
         Param::t_in("x_k", Dtype::F16, 2),
@@ -135,7 +135,7 @@ pub struct RecurrenceVarlenGqaF16;
 
 impl KernelSpec for RecurrenceVarlenGqaF16 {
     const ENTRY: &'static str = "owl_gdn_recurrence_varlen_gqa_f16";
-    const SRC: &'static str = "cu/owl/gdn_recurrence.cu";
+    const SRC: &'static str = "cu/gdn/gdn_recurrence.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 3),
         Param::t_in("k", Dtype::F16, 3),
@@ -166,7 +166,7 @@ pub struct DecodeStepV2F16;
 
 impl KernelSpec for DecodeStepV2F16 {
     const ENTRY: &'static str = "owl_gdn_decode_step_v2_f16";
-    const SRC: &'static str = "cu/owl/gdn_decode_step.cu";
+    const SRC: &'static str = "cu/gdn/gdn_decode_step.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q_c", Dtype::F16, 2),
         Param::t_in("k_c", Dtype::F16, 2),
@@ -222,7 +222,7 @@ pub struct GdnConvUpdF16;
 
 impl KernelSpec for GdnConvUpdF16 {
     const ENTRY: &'static str = "owl_gdn_conv_upd_f16";
-    const SRC: &'static str = "cu/owl/gdn_conv_upd.cu";
+    const SRC: &'static str = "cu/gdn/gdn_conv_upd.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::F16, 2),
         Param::t_in("w", Dtype::F16, 2),
@@ -246,7 +246,7 @@ pub struct GdnConvUpdF32;
 
 impl KernelSpec for GdnConvUpdF32 {
     const ENTRY: &'static str = "owl_gdn_conv_upd_f32";
-    const SRC: &'static str = "cu/owl/gdn_conv_upd.cu";
+    const SRC: &'static str = "cu/gdn/gdn_conv_upd.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::F32, 2),
         Param::t_in("w", Dtype::F32, 2),
@@ -270,7 +270,7 @@ pub struct GdnDeltaDecF16;
 
 impl KernelSpec for GdnDeltaDecF16 {
     const ENTRY: &'static str = "owl_gdn_delta_dec_f16";
-    const SRC: &'static str = "cu/owl/gdn_delta_dec.cu";
+    const SRC: &'static str = "cu/gdn/gdn_delta_dec.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
         Param::t_in("k", Dtype::F16, 2),
@@ -299,7 +299,7 @@ pub struct GdnDeltaDecF32;
 
 impl KernelSpec for GdnDeltaDecF32 {
     const ENTRY: &'static str = "owl_gdn_delta_dec_f32";
-    const SRC: &'static str = "cu/owl/gdn_delta_dec.cu";
+    const SRC: &'static str = "cu/gdn/gdn_delta_dec.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F32, 2),
         Param::t_in("k", Dtype::F32, 2),
@@ -328,7 +328,7 @@ pub struct GdnDecodeStepF16;
 
 impl KernelSpec for GdnDecodeStepF16 {
     const ENTRY: &'static str = "owl_gdn_decode_step_f16";
-    const SRC: &'static str = "cu/owl/gdn_decode_step.cu";
+    const SRC: &'static str = "cu/gdn/gdn_decode_step.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q_c", Dtype::F16, 2),
         Param::t_in("k_c", Dtype::F16, 2),
@@ -365,7 +365,7 @@ pub struct GdnGatingGF32;
 
 impl KernelSpec for GdnGatingGF32 {
     const ENTRY: &'static str = "owl_gdn_gating_g_f32";
-    const SRC: &'static str = "cu/owl/gdn_gating.cu";
+    const SRC: &'static str = "cu/gdn/gdn_gating.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("a_log", Dtype::F32, 2),
         Param::t_in("a", Dtype::F32, 2),
@@ -385,7 +385,7 @@ pub struct GdnL2normF32;
 
 impl KernelSpec for GdnL2normF32 {
     const ENTRY: &'static str = "owl_gdn_l2norm_f32";
-    const SRC: &'static str = "cu/owl/gdn_l2norm.cu";
+    const SRC: &'static str = "cu/gdn/gdn_l2norm.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::F32, 2),
         Param::sz("rows"),
@@ -404,7 +404,7 @@ pub struct GdnNormActF32;
 
 impl KernelSpec for GdnNormActF32 {
     const ENTRY: &'static str = "owl_gdn_norm_act_f32";
-    const SRC: &'static str = "cu/owl/gdn_norm_act.cu";
+    const SRC: &'static str = "cu/gdn/gdn_norm_act.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::F32, 2),
         Param::t_in("z", Dtype::F32, 2),

@@ -10,7 +10,7 @@
 
 use crate::contract::{LaunchVal, OpError};
 use crate::spec::{BootCheck, CheckBuf, CheckReport, CheckRunner};
-const RESHAPE_AND_CACHE_FP8KV: &str = "cu/attention/reshape_and_cache_fp8kv.cu";
+const RESHAPE_AND_CACHE_FP8KV: &str = "cu/attn/reshape_and_cache_fp8kv.cu";
 
 use super::{e4m3_encode, f16_to_f32, lcg_f16};
 
