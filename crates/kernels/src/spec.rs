@@ -640,6 +640,19 @@ impl KernelMeta {
         self.params.iter().map(token_of).collect()
     }
 
+    /// **声明口径 dtype** = 输出槽的元素类型(F 轮:原登记表 `Entry.dtype`
+    /// 的唯一信息,现由声明面派生 —— 每张 native 表都有输出槽,由
+    /// `op_tables` 的「O 槽必须是指针位」门与 `list::tests` 的
+    /// `every_native_table_declares_out_dtype` 保证)。
+    ///
+    /// `None` = 无输出槽(部分 foreign 虚拟核)。调用方按需降级。
+    pub fn out_dtype(&self) -> Option<Dtype> {
+        self.params.iter().find(|p| p.role == ParamRole::Out).and_then(|p| match p.ty {
+            ParamType::Tensor { dtype, .. } => Some(dtype),
+            _ => None,
+        })
+    }
+
     /// 槽序串(`T,O,sz,...`;诊断/文档/`--print-op-table` 用)
     pub fn args_str(&self) -> String {
         self.slot_tokens().join(",")

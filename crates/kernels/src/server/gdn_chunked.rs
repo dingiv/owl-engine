@@ -152,8 +152,8 @@ impl KernelFamily for GdnChunkedRuntime {
             ),
             (
                 // 家族私有核:不走算子准入面(故没有 `ops::source` 出口),
-                // 常量就地取自登记表 §0
-                crate::list::cu::owl::STATE_TRANSPOSE,
+                // 常量就近住家族模块(crate::family::gdn_chunked::asset)
+                crate::family::gdn_chunked::asset::STATE_TRANSPOSE,
                 &["owl_state_kv_to_vk", "owl_state_vk_to_kv"][..],
             ),
         ] {

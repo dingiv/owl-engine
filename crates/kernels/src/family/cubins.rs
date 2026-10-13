@@ -72,14 +72,13 @@ pub fn has_aot(src_id: &str) -> bool {
 
 /// **AOT 覆盖率**(登记表全量):`(已覆盖, 总数, 缺陷名)`。
 ///
-/// 符号集取 [`crate::list::REGISTRY`] 而非 `ops::TABLES` —— 前者是**发射面**
-/// 的全集(含未建表的"仅引入"入口),后者只是已建表子集。报表要的是
-/// "还有哪个入口会走 NVRTC";空源(foreign 虚核)不计入。
+/// F 轮(2026-10-13)起符号集取 [`crate::ops::all`] —— 声明面已是**发射面
+/// 全集**(登记表退役,`未声明 = 0`);空源(foreign 虚核)不计入。
 pub fn coverage() -> (usize, usize, Vec<&'static str>) {
     let mut covered = 0usize;
     let mut total = 0usize;
     let mut missing: Vec<&'static str> = Vec::new();
-    for e in crate::list::REGISTRY {
+    for e in crate::ops::all() {
         if e.src.is_empty() {
             continue;
         }
@@ -87,7 +86,7 @@ pub fn coverage() -> (usize, usize, Vec<&'static str>) {
         if has_aot(e.src) {
             covered += 1;
         } else {
-            missing.push(e.name);
+            missing.push(e.entry);
         }
     }
     (covered, total, missing)

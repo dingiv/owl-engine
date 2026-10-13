@@ -53,33 +53,29 @@ fn op_tables_match_cu_signatures() {
     eprintln!("[op-tables] {checked} 张表与 .cu 签名逐参一致 ✓(foreign 表另计)");
 }
 
-/// **R1 进度表**(用户裁决 2026-10-13:凡是用到都必须有 `impl KernelSpec`)。
+/// **R1 判据(F 轮换源:构建期编出的符号 ⊆ 声明集)**。
 ///
-/// 两件事:① 打印未声明清单(建表推进的工单);② **锁"不许新增"** —— 新增
-/// 核必须同时带声明,否则数字会涨,本门立刻红(上限随建表推进逐批下调)。
+/// 旧判据 = "登记表差额"(110 − 已建表)。F 轮登记表退役后,唯一真源是声明面,
+/// 判据换成**符号集包含关系** —— 更贴 R1 本意:凡编出来的核都必须有
+/// `impl KernelSpec`;**新增 `.cu` 忘了建表**会被当场抓住(旧判据抓不到:
+/// 那条路要求人先去登记表登记一条,漏登记就漏检)。
 #[test]
-fn r1_undeclared_inventory() {
-    let u = owl_kernels::ops::undeclared();
-    eprintln!(
-        "[R1] 未声明 {} / 登记 {} / 已建表 {}",
-        u.len(),
-        owl_kernels::ops::registered_count(),
-        owl_kernels::ops::built_count()
-    );
-    for n in &u {
-        eprintln!("[R1]   {n}");
+fn every_compiled_symbol_is_declared() {
+    let u = owl_kernels::ops::undeclared_symbols();
+    for (id, sym) in &u {
+        eprintln!("[R1]   {id} :: {sym}");
     }
-    // ✅ **R1 结案(2026-10-13 D 轮)**:110/110 全部建表,阈值钉死为 0 ——
-    // 此后新增任何核都必须同时带 `impl KernelSpec`,否则本门立刻红。
     assert!(
         u.is_empty(),
-        "出现未声明算子 {} 条:{:?} —— 新增核必须带 impl KernelSpec(R1)",
-        u.len(),
-        u
+        "编出但未声明的核符号 {} 条 —— 新核必须带 impl KernelSpec(R1)",
+        u.len()
+    );
+    eprintln!(
+        "[R1] 编出符号集 ⊆ 声明集 ✓(声明表 {} 张)",
+        owl_kernels::ops::declared_count()
     );
 }
 
-/// 名字全库唯一(表内重复 = 路由歧义)
 #[test]
 fn op_table_entries_are_unique() {
     let mut seen = std::collections::HashSet::new();

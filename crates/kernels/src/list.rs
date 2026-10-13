@@ -36,133 +36,6 @@
 // `models::kernel::kv_manifest_gate` 在 boot 期要用)
 include!(concat!(env!("OUT_DIR"), "/cubin_symbols.rs"));
 
-// ============================================================================
-// §0 `.cu` 源常量(就地 `include_str!`;R5 —— 集中模块 `sources.rs` 已退役)
-// ============================================================================
-//
-// 与**算子自托管面**(`crate::ops` 的 `KernelSpec::SOURCE`)的分工:
-// - **已建表**算子 ⇒ 源只有一个住址 = 算子自己([`source`] 优先取它);
-// - **仅引入**(未建表)⇒ 源只有登记表这一个住址,**就地**住在本模块;
-// - 两处同时有 = 冗余(尚未消灭),由 `registry_source_agrees_with_op_meta`
-//   机器锁一致 —— 不许漂移;待 R1 建表补齐,本模块随 `REGISTRY` 整体退役。
-// - **家族私有核**(不走算子准入面、只在装配期按名装载的辅助核,如 GDN
-//   状态转置)也住这里 —— 它们是唯一一类没有“名字 → 源”公共出口的常量,
-//   故本模块对 crate 内可见。
-pub(crate) mod cu {
-    //! kernel 源码之家(纯 include_str;零依赖,零逻辑)。
-    //!
-    //! 纪律:**.cu 源码只允许住在本 crate**(`cu/` 目录)——models/layers、
-    //! TensorOps 组合面一律经 `owl_models::kernels` 注册表按名取用,禁止
-    //! 直接内嵌/直引源码(2026-09-25 用户裁决:kernel 源与业务层解耦,
-    //! 中间垫 = models::kernels 注册表)。
-    //!
-    //! 后端语义:cu/owl/ = owl 自研/移植位(文本主干/融合/dflash/时间戳等);
-    //! cu/gdn/ 等随各域立项迁入。launcher(cubin 预编/发射)在后端
-    //! (owl-cuda server),本模块只管**源文本的住址**。
-
-    /// owl 自研/移植位(工单 N;NInfer 等外部引擎核的 owl 契约改写)
-    pub mod owl {
-        /// 融合核族(2026-10-13 C 轮自 fused.cu 分出)
-        pub const NORM_ROPE: &str = "cu/attn/norm_rope.cu";
-        /// 融合核族(2026-10-13 C 轮自 fused.cu 分出)
-        pub const SILU_AND_MUL: &str = "cu/ln/silu_and_mul.cu";
-        /// 融合核族(2026-10-13 C 轮自 fused.cu 分出)
-        pub const FUSED_ADD_RMSNORM: &str = "cu/ln/fused_add_rmsnorm.cu";
-        /// 融合核族(2026-10-13 C 轮自 fused.cu 分出)
-        pub const QKNORM_INSERT: &str = "cu/fused/qknorm_insert.cu";
-
-        /// GDN 核族(2026-10-13 C 轮自 gdn.cu 按**算子族**分出)
-        pub const GDN_CONV_UPD: &str = "cu/gdn/gdn_conv_upd.cu";
-        /// GDN 核族(2026-10-13 C 轮自 gdn.cu 按**算子族**分出)
-        pub const GDN_CONV_FWD: &str = "cu/gdn/gdn_conv_fwd.cu";
-        /// GDN 核族(2026-10-13 C 轮自 gdn.cu 按**算子族**分出)
-        pub const GDN_GATING: &str = "cu/gdn/gdn_gating.cu";
-        /// GDN 核族(2026-10-13 C 轮自 gdn.cu 按**算子族**分出)
-        pub const GDN_DELTA_DEC: &str = "cu/gdn/gdn_delta_dec.cu";
-        /// GDN 核族(2026-10-13 C 轮自 gdn.cu 按**算子族**分出)
-        pub const GDN_NORM_ACT: &str = "cu/gdn/gdn_norm_act.cu";
-        /// GDN 核族(2026-10-13 C 轮自 gdn.cu 按**算子族**分出)
-        pub const GDN_L2NORM: &str = "cu/gdn/gdn_l2norm.cu";
-        /// GDN 核族(2026-10-13 C 轮自 gdn.cu 按**算子族**分出)
-        pub const GDN_RECURRENCE: &str = "cu/gdn/gdn_recurrence.cu";
-        /// GDN 核族(2026-10-13 C 轮自 gdn.cu 按**算子族**分出)
-        pub const GDN_DECODE_STEP: &str = "cu/gdn/gdn_decode_step.cu";
-
-        /// 2026-10-13 C 轮自 dflash2.cu 按算子族分出
-        pub const NAIVE_ATTN_NC: &str = "cu/attn/naive_attn_nc.cu";
-        /// 2026-10-13 C 轮自 dflash2.cu 按算子族分出
-        pub const DFLASH_CONV: &str = "cu/dflash/dflash_conv.cu";
-        /// 2026-10-13 C 轮自 dflash2.cu 按算子族分出
-        pub const DFLASH_SELECT: &str = "cu/dflash/dflash_select.cu";
-        /// 2026-10-13 C 轮自 dflash2.cu 按算子族分出
-        pub const DFLASH_TOPK: &str = "cu/elems/dflash_topk.cu";
-
-        /// 原子 cu/owl/attention.cu 的 NARROW_STRIDED(2026-10-13 C 轮分出)
-        pub const NARROW_STRIDED: &str = "cu/elems/narrow_strided.cu";
-        /// 原子 cu/owl/attention.cu 的 NAIVE_DECODE_ATTN(2026-10-13 C 轮分出)
-        pub const NAIVE_DECODE_ATTN: &str = "cu/attn/naive_decode_attn.cu";
-
-        // ---- 语义算子族(2026-10-13 C 轮:一算子一 `.cu` —— 原 ops_pair.cu
-        //      按**算子族**拆开,与 ops/elems.rs、ops/ln.rs 的声明对望)----
-        pub const ADD: &str = "cu/elems/add.cu";
-        pub const MUL: &str = "cu/elems/mul.cu";
-        pub const SILU: &str = "cu/elems/silu.cu";
-        pub const SIGMOID: &str = "cu/elems/sigmoid.cu";
-        pub const MATMUL: &str = "cu/elems/matmul.cu";
-        pub const RMSNORM: &str = "cu/ln/rmsnorm.cu";
-
-        pub const SIGMOID_GATE_MUL_F16: &str = "cu/elems/sigmoid_gate_mul_f16.cu";
-        /// f16/bf16 设备 cast 族(C 轮起独立成文件;原来合在 cast.cu 里)
-        pub const CAST: &str = "cu/elems/cast.cu";
-        /// GDN 状态布局转置 [HV,K,V] ↔ [HV,V,K](C 轮自 cast.cu 分出)
-        pub const STATE_TRANSPOSE: &str = "cu/gdn/state_transpose.cu";
-        /// 刀3a'(2026-10-04):双权 GEMV 单发(b/a 投影;杀 cublas gemvx+splitK)
-        pub const GEMV_DUAL_F16: &str = "cu/elems/gemv_dual_f16.cu";
-        /// 设备侧贪心采样(E3;REQ-DEC-04)
-        pub const ARGMAX_F16: &str = "cu/elems/argmax_f16.cu";
-        /// 刀D 层间时间戳探针(2026-10-12 自 models 逃生舱收编)
-        pub const TS_PROBE: &str = "cu/probe/ts_probe.cu";
-        // ---- 融合核族(C1;2026-10-01;Ampere-first 准则见 .cu 头注)----
-        /// ct packed → marlin B 设备重排(2026-10-01 装载提速;主源 =
-        /// attention.rs marlin_repack.cu gptq_repack_kernel,输入侧转置适配;
-        /// 2026-10-12 归编 cu/marlin/ —— marlin 家族源码同目录)
-        pub const CT_REPACK_U32: &str = "cu/load/marlin_repack_ct.cu";
-    }
-
-    /// attention port 家族(K0 起步;vendor attention.rs rev c0f19f2,Apache-2.0,
-    /// 文件级复用 + f16 特化;出处与适配认领见各 .cu 头注)
-    pub mod attention {
-        /// KV cache 散写(vLLM classic 布局;K1/K2 paged_attention 同款布局)
-        pub const RESHAPE_AND_CACHE_F16: &str = "cu/attn/reshape_and_cache.cu";
-        /// fp8 KV 变体(nvrtc 独立核文件;FI adapter 本体含 flashinfer 头不可 nvrtc)
-        /// B6.2:K0 批量写池 fp8 变体(f16 输入 → e4m3 池;主池 fp8 承载配套)
-        pub const RESHAPE_AND_CACHE_FP8KV: &str = "cu/attn/reshape_and_cache_fp8kv.cu";
-        /// paged attention decode 家族(v1 / v2 分片 / v2 reduce;K1/K2)
-        pub const PAGED_ATTENTION_F16: &str = "cu/attn/pagedattention_f16.cu";
-        /// chunked prefill paged attention(在线 softmax + 滑窗;smem tile)
-        pub const PREFILL_PAGED_ATTN_F16: &str = "cu/attn/prefill_paged_attn_f16.cu";
-        /// prefill split attention(flash-decoding 式 context 分块 + reduce;
-        /// 2026-10-02 C1 自研序,长 ctx prefill 主案)
-        pub const PREFILL_SPLIT_F16: &str = "cu/attn/prefill_split_f16.cu";
-    }
-
-    /// 文本主干 kernel(2026-10-12 归编 cu/owl/ —— owl 自研/移植位,不再
-    /// 单设 text 目录;mod 名保留 = 消费方零改动)
-    pub mod text {
-        /// embedding 查表
-        pub const EMBED_F32: &str = "cu/elems/embed_f32.cu";
-        /// rope(interleaved partial)
-        pub const ROPE_HALF_PARTIAL_F32: &str = "cu/elems/rope_f32.cu";
-        /// PF1a 栈核(concat_rows;arity 8,展开路径测试锚专用)
-        pub const CONCAT_F32: &str = "cu/elems/concat.cu";
-    }
-}
-use self::cu::text;
-
-// ============================================================================
-// §1 Kernel 值(核函数的身份证 + 源码 + 发射配置)
-// ============================================================================
-
 /// 发射配置(grid 哨兵 (0,0,0) = 自动 1D)
 #[derive(Clone, Debug)]
 pub struct LaunchShape {
@@ -193,7 +66,9 @@ pub struct Kernel {
 
 impl Kernel {
     pub fn new(name: &'static str, src: &'static str) -> Self {
-        Self { name, src, launch: LaunchShape::default(), sig: "", meta: None }
+        // F 轮:准入声明是槽序/几何的唯一真源 ⇒ 构造期**自动挂载**
+        // (名字已在声明面就带上;逃生舱核自然为 None,走 `sig`)。
+        Self { name, src, launch: LaunchShape::default(), sig: "", meta: crate::ops::meta(name) }
     }
 
     /// 显式发射配置(覆盖自动 1D)
@@ -214,274 +89,27 @@ impl Kernel {
         self
     }
 
-    /// **槽序权威**(优先序):算子元数据 → 登记表 → 逃生舱签名。
-    /// 三条都是 `'static`,零分配;元数据在时它就是唯一真源。
+    /// **槽序权威**(F 轮后优先序):算子元数据 → 逃生舱签名。
+    /// 两条都是 `'static`,零分配;有声明时它就是唯一真源
+    /// (登记表已退役 —— 槽序不再有第三条落点)。
     pub fn slot_tokens(&self) -> Vec<&'static str> {
         if let Some(m) = self.meta {
             return m.slot_tokens();
         }
-        let sig = match lookup(self.name) {
-            Some(e) => e.args,
-            None => self.sig,
-        };
+        // 逃生舱核(无声明,如测试/诊断核):槽序必须显式给签名
         assert!(
-            !sig.is_empty(),
-            "kernel::slot_tokens({}): 无元数据也无登记/逃生舱槽序 —— 拒发",
+            !self.sig.is_empty(),
+            "kernel::slot_tokens({}): 既无准入声明也无逃生舱槽序 —— 拒发",
             self.name
         );
-        sig.split(',').collect()
+        self.sig.split(',').collect()
     }
 }
 
-// ============================================================================
-// §2 注册表:名字 → 源(封闭常量)
-// ============================================================================
-
-/// 登记表条目:发射名 → 源码 + 形参签名(多名字可共源;名字 = server 编译
-/// 缓存键)。
-///
-/// `args` = 槽序契约的机器可读形(C2,2026-09-26):逗号分隔的形参类型序
-/// 列,`T`=块参 / `sz`=8 字节标量(Arg::U64 ↔ kernel `size_t`)/ `i32` /
-/// `f32`;**顺序即 LaunchMsg args 序**,对 Kernel 节点路径输出块固定末参。
-/// `lower_kernel` 对表校验声明槽序;下方测试解析 .cu 实签名互证 ——
-/// u32/sz 错位、输出不在末参两颗雷在这里机器拦截。
-///
-/// `dtype` = 块参 dtype 标注(f16 基线守门,2026-09-26):eval 发射前
-/// 对账声明 dtype,不符 = 结构化报错 —— 堵死「f32 核读 f16 字节 =
-/// 静默垃圾」路径。现状全族 F32;F2 起逐核加 f16 变体条目。
-/// dtype = **输出/声明口径**(守门对账节点声明);混合核(F4:conv_upd /
-/// delta_dec 激活 f16 + state f32)输入位宽由 .cu 源自证,守门不查入参。
-pub struct Entry {
-    pub name: &'static str,
-    pub src: &'static str,
-    pub args: &'static str,
-    pub dtype: crate::contract::Dtype,
-}
-
-/// 全量登记(封闭;按域分组)
-pub static REGISTRY: &[Entry] = &[
-    // ---- 语义算子动作表(ops.cu 母本;lower_* 一一对应;
-    //      此族经 lower_* 硬编码装配,out 位置随 .cu 签名)----
-    Entry { name: "owl_add_f32", src: cu::owl::ADD, args: "T,T,O,sz", dtype: crate::contract::Dtype::F32 },
-    Entry { name: "owl_mul_f32", src: cu::owl::MUL, args: "T,T,O,sz", dtype: crate::contract::Dtype::F32 },
-    Entry { name: "owl_sigmoid_f32", src: cu::owl::SIGMOID, args: "T,O,sz", dtype: crate::contract::Dtype::F32 },
-    Entry { name: "owl_silu_f32", src: cu::owl::SILU, args: "T,O,sz", dtype: crate::contract::Dtype::F32 },
-    Entry { name: "owl_matmul_f32", src: cu::owl::MATMUL, args: "T,T,T,i32,i32,i32", dtype: crate::contract::Dtype::F32 },
-    Entry { name: "owl_matmul_nt_f32", src: cu::owl::MATMUL, args: "T,T,T,i32,i32,i32", dtype: crate::contract::Dtype::F32 },
-    Entry { name: "owl_rmsnorm_f32", src: cu::owl::RMSNORM, args: "T,T,O,i32,f32,i32", dtype: crate::contract::Dtype::F32 },
-    // ---- f16 基线变体(F2;桥宏:读 half 算 float 写 half;matmul 无 f16 = cuBLAS)----
-    Entry { name: "owl_add_f16", src: cu::owl::ADD, args: "T,T,O,sz", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_mul_f16", src: cu::owl::MUL, args: "T,T,O,sz", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_sigmoid_f16", src: cu::owl::SIGMOID, args: "T,O,sz", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_silu_f16", src: cu::owl::SILU, args: "T,O,sz", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_rmsnorm_f16", src: cu::owl::RMSNORM, args: "T,T,O,i32,f32,i32", dtype: crate::contract::Dtype::F16 },
-    // bf16 语义算子(E5-DF3 同日十四;fc 部分和累加 add_bf16 + 各 norm rmsnorm_bf16)
-    Entry { name: "owl_add_bf16", src: cu::owl::ADD, args: "T,T,O,sz", dtype: crate::contract::Dtype::BF16 },
-    Entry { name: "owl_mul_bf16", src: cu::owl::MUL, args: "T,T,O,sz", dtype: crate::contract::Dtype::BF16 },
-    Entry { name: "owl_rmsnorm_bf16", src: cu::owl::RMSNORM, args: "T,T,O,i32,f32,i32", dtype: crate::contract::Dtype::BF16 },
-    // ---- 模型琐核 f16 变体(F3;embed/rope 同源文件追加,narrow 在 attention.cu)----
-    Entry { name: "owl_embed_f16", src: text::EMBED_F32, args: "T,T,sz,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_rope_half_partial_f16", src: text::ROPE_HALF_PARTIAL_F32, args: "T,T,T,T,sz,sz,sz,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_narrow_strided_f16", src: cu::owl::NARROW_STRIDED, args: "T,sz,sz,sz,sz,T", dtype: crate::contract::Dtype::F16 },
-    // ---- 采样(E3;设备 argmax,输出口径 F32 = 索引数值过线)----
-    Entry { name: "owl_argmax_f32idx_f16", src: cu::owl::ARGMAX_F16, args: "T,i32,i32,T", dtype: crate::contract::Dtype::F32 },
-    // ---- GDN + attention f16 变体(F4;state 恒 f32 混合核,输出口径 F16)----
-    Entry { name: "owl_gdn_gating_g_f16", src: cu::owl::GDN_GATING, args: "T,T,T,sz,sz,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_gdn_l2norm_f16", src: cu::owl::GDN_L2NORM, args: "T,sz,sz,f32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_gdn_conv_upd_f16", src: cu::owl::GDN_CONV_UPD, args: "T,T,T,T,sz,sz,sz,i32,T", dtype: crate::contract::Dtype::F16 },
-    // 刀3b(2026-10-04):q/k 双段 conv 单发(发射收敛;输出 [batch, dq+dk] 单块)
-    Entry { name: "owl_gdn_conv_upd_dual_f16", src: cu::owl::GDN_CONV_UPD, args: "T,T,T,T,T,T,T,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_gdn_delta_dec_f16", src: cu::owl::GDN_DELTA_DEC, args: "T,T,T,T,T,T,T,sz,sz,sz,sz,sz,f32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_gdn_norm_act_f16", src: cu::owl::GDN_NORM_ACT, args: "T,T,T,sz,sz,sz,f32,i32,T", dtype: crate::contract::Dtype::F16 },
-    // D1:decode 整链融合(v-conv + l2norm×2 + gating + sigmoid + delta + norm_act;
-    // 输出末参)
-    Entry { name: "owl_gdn_decode_step_f16", src: cu::owl::GDN_DECODE_STEP, args: "T,T,T,T,T,T,T,T,T,T,T,T,T,sz,sz,sz,sz,sz,f32,f32,f32,T", dtype: crate::contract::Dtype::F16 },
-    // D1-v2(2026-10-04 sglang 刺探):delta 相 float4 行组重写(同契约)
-    Entry { name: "owl_gdn_decode_step_v2_f16", src: cu::owl::GDN_DECODE_STEP, args: "T,T,T,T,T,T,T,T,T,T,T,T,T,sz,sz,sz,sz,sz,f32,f32,f32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_naive_decode_attn_f16", src: cu::owl::NAIVE_DECODE_ATTN, args: "T,T,T,T,T,T,T,sz,sz,sz,sz,T", dtype: crate::contract::Dtype::F16 },
-    // ---- attention port 家族(K0;vendor attention.rs rev c0f19f2,Apache-2.0;
-    //      vLLM classic 布局,K1/K2 paged_attention 同款;适配认领见 .cu 头注)----
-    Entry { name: "vllm_reshape_and_cache_f16", src: cu::attention::RESHAPE_AND_CACHE_F16, args: "T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    // B6.2:K0 批量写池 fp8 变体(f16 输入,e4m3 池;形状无关单核)
-    Entry { name: "owl_reshape_and_cache_fp8kv", src: cu::attention::RESHAPE_AND_CACHE_FP8KV, args: "T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_reshape_and_cache_fp8kv_bf16", src: cu::attention::RESHAPE_AND_CACHE_FP8KV, args: "T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::BF16 },
-    // ---- kNHD 变体(kv布局统一契约 P1;寻址见 cu 头注,x 形参占位)----
-    Entry { name: "vllm_reshape_and_cache_f16_knhd", src: cu::attention::RESHAPE_AND_CACHE_F16, args: "T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "vllm_reshape_and_cache_bf16_knhd", src: cu::attention::RESHAPE_AND_CACHE_F16, args: "T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::BF16 },
-    Entry { name: "owl_reshape_and_cache_fp8kv_knhd", src: cu::attention::RESHAPE_AND_CACHE_FP8KV, args: "T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_reshape_and_cache_fp8kv_bf16_knhd", src: cu::attention::RESHAPE_AND_CACHE_FP8KV, args: "T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::BF16 },
-    // K0 BF16(DFlash2 草稿池;同日十四)
-    Entry { name: "vllm_reshape_and_cache_bf16", src: cu::attention::RESHAPE_AND_CACHE_F16, args: "T,T,T,T,T,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::BF16 },
-    Entry { name: "owl_cast_f16_f32", src: cu::owl::CAST, args: "T,i32,T", dtype: crate::contract::Dtype::F32 },
-    Entry { name: "owl_cast_f32_f16", src: cu::owl::CAST, args: "T,i32,T", dtype: crate::contract::Dtype::F16 },
-    // f16 <-> bf16 铸边界(E5-DF3 同日十四;embed 后入草稿 / lm_head 前出草稿)
-    Entry { name: "owl_cast_f16_bf16", src: cu::owl::CAST, args: "T,i32,T", dtype: crate::contract::Dtype::BF16 },
-    Entry { name: "owl_cast_bf16_f16", src: cu::owl::CAST, args: "T,i32,T", dtype: crate::contract::Dtype::F16 },
-    // ---- paged attention decode(K1/K2;vendor pagedattention.cuh + v1/v2.cu;
-    //      grid 契约显式:v1 (H, seq, 1) / v2 (H, seq, ceil(max_ctx/512)) /
-    //      reduce (H, seq, 1);block (128,1,1);shared 契约见 .cu 头注)----
-    Entry { name: "vllm_paged_attention_v1_f16_hd128bs32", src: cu::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "vllm_paged_attention_v1_f16_hd128", src: cu::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "vllm_paged_attention_v1_f16_hd256", src: cu::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "vllm_paged_attention_v1_f16_hd256bs32", src: cu::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "vllm_paged_attention_v2_f16_hd128bs32", src: cu::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "vllm_paged_attention_v2_f16_hd256bs32", src: cu::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    // ---- B6:fp8 e4m3 KV 读变体(v2;签名同 f16,KV 存储侧 1B/elem)----
-    Entry { name: "vllm_paged_attention_v2_fp8_hd128", src: cu::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "vllm_paged_attention_v2_fp8_hd256", src: cu::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "vllm_paged_attention_v2_fp8_hd128bs32", src: cu::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "vllm_paged_attention_v2_fp8_hd256bs32", src: cu::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "vllm_paged_attention_v2_reduce_f16_hd128", src: cu::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "vllm_paged_attention_v2_reduce_f16_hd256", src: cu::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,i32,T", dtype: crate::contract::Dtype::F16 },
-    // ---- chunked prefill paged attention(在线 softmax + 滑窗;grid 契约:
-    //      (Hq/Hkv, Hkv, ceil(tokens/256));block (256,1,1) = TOKEN_CHUNK)----
-    Entry { name: "vllm_chunked_prefill_paged_attn_opt_f16_hd128", src: cu::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "vllm_chunked_prefill_paged_attn_opt_f16_knhd_hd256", src: cu::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256", src: cu::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "vllm_chunked_prefill_paged_attn_opt_f16_knhd_hd128", src: cu::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd128", src: cu::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "vllm_chunked_prefill_paged_attn_opt_f16_hd256", src: cu::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    // ---- B6.3:fp8 e4m3 KV 读变体(chunked prefill;签名同 f16)----
-    Entry { name: "vllm_chunked_prefill_paged_attn_opt_fp8_hd128", src: cu::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "vllm_chunked_prefill_paged_attn_opt_fp8_hd256", src: cu::attention::PREFILL_PAGED_ATTN_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    // TG=4 线程组分摊变体(2026-10-10 性能刀;grid.z = ceil(tokens/64))
-    // (tg4 变体条目 2026-10-13 删除:自研核已回滚,源码无同名核,登记表不留孤儿;
-    //  attention_tg4_probe.rs 仍挂 skip 门存案,WIP 重启时一并回归)
-    // ---- prefill split attention(flash-decoding;2026-10-02 长 ctx 主案)----
-    // K1 = context 分块在线 softmax(未归一化 partial + (m,l) 入 scratch);
-    // K2 = partition 归一化合并。smem 64KB(>48KB 走发射器 opt-in 通道)
-    Entry { name: "owl_prefill_split_f16_hd256", src: cu::attention::PREFILL_SPLIT_F16, args: "T,T,T,T,T,T,T,f32,i32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    // fp8 e4m3 KV 直读变体(2026-10-12;签名同 f16,K/V = 字节池):
-    // ① 修雷:fp8 池 + f16 核 = 字节错位(§二十八埋雷实录);② 读量减半
-    Entry { name: "owl_prefill_split_fp8kv_hd256", src: cu::attention::PREFILL_SPLIT_F16, args: "T,T,T,T,T,T,T,f32,i32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    // ---- kNHD 变体(kv布局统一契约 P2;签名与 classic 同)----
-    Entry { name: "vllm_paged_attention_v2_f16_knhd_hd256bs32", src: cu::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "vllm_paged_attention_v2_f16_knhd_hd256", src: cu::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "vllm_paged_attention_v2_f16_knhd_hd128bs32", src: cu::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "vllm_paged_attention_v2_f16_knhd_hd128", src: cu::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "vllm_paged_attention_v2_fp8_knhd_hd256bs32", src: cu::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "vllm_paged_attention_v2_fp8_knhd_hd256", src: cu::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "vllm_paged_attention_v2_fp8_knhd_hd128bs32", src: cu::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "vllm_paged_attention_v2_fp8_knhd_hd128", src: cu::attention::PAGED_ATTENTION_F16, args: "T,T,T,T,T,T,T,T,i32,f32,i32,i32,i32,i32,f32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_prefill_split_f16_knhd_hd256", src: cu::attention::PREFILL_SPLIT_F16, args: "T,T,T,T,T,T,T,f32,i32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_prefill_split_fp8kv_knhd_hd256", src: cu::attention::PREFILL_SPLIT_F16, args: "T,T,T,T,T,T,T,f32,i32,i32,i32,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_prefill_split_reduce_f16_hd256", src: cu::attention::PREFILL_SPLIT_F16, args: "T,T,T,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    // ---- PF1a 栈核(concat_rows;arity 8,展开路径测试锚专用)----
-    Entry { name: "owl_concat_rows_f16", src: text::CONCAT_F32, args: "T,T,T,T,T,T,T,T,sz,sz,sz,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_concat_rows_f32", src: text::CONCAT_F32, args: "T,T,T,T,T,T,T,T,sz,sz,sz,T", dtype: crate::contract::Dtype::F32 },
-    // ---- PF1b 批核(chunked prefill;T 循环核内,工单 G 换源)----
-    Entry { name: "owl_gdn_conv_fwd_f16", src: cu::owl::GDN_CONV_FWD, args: "T,T,T,T,T,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_gdn_recurrence_varlen_gqa_f16", src: cu::owl::GDN_RECURRENCE, args: "T,T,T,T,T,T,T,T,sz,sz,sz,sz,sz,f32,T", dtype: crate::contract::Dtype::F16 },
-    // ---- owl 移植位(工单 N;NInfer sigmoid_gate_mul,attention 门融合)----
-    Entry { name: "owl_sigmoid_gate_mul_f16", src: cu::owl::SIGMOID_GATE_MUL_F16, args: "T,T,sz,T", dtype: crate::contract::Dtype::F16 },
-    // 刀3a'(2026-10-04):双权 GEMV(b/a 投影单发;grid (ceil(rows/4), m))
-    Entry { name: "owl_gemv_dual_f16", src: cu::owl::GEMV_DUAL_F16, args: "T,T,T,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    // ---- DFlash2 草稿特有核族(E5-DF1;2026-10-07;语义锚 = sglang dflash.py)----
-    // 分组动态深度 2-tap 卷积(delta [T,2,2,G] side-major + base [2,2,H];
-    // 位置掩码 t%block;group=16 烘焙;propose T=8 定形,extend 不走本核)
-    Entry { name: "owl_dflash_conv_f16", src: cu::owl::DFLASH_CONV, args: "T,T,T,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    // BF16 变体(同日十四;草稿路径 BF16 化,权重原生 BF16)
-    Entry { name: "owl_dflash_conv_bf16", src: cu::owl::DFLASH_CONV, args: "T,T,T,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::BF16 },
-    // 逐行 top-16(单缓冲 [rows, 32]:值半区降序 + 索引半区,双 f32;
-    // 无 bf16 变体 —— lm_head 铸边界前 logits 恒 f16)
-    Entry { name: "owl_topk16_f16", src: cu::owl::DFLASH_TOPK, args: "T,i32,T", dtype: crate::contract::Dtype::F32 },
-    // selector 格打分 + 贪心 walk 融合(单缓冲 [S·(K·K+1)]:toks + scores)
-    Entry { name: "owl_dflash_select_f16", src: cu::owl::DFLASH_SELECT, args: "T,T,T,T,T,T,i32,i32,i32,T", dtype: crate::contract::Dtype::F32 },
-    // selector BF16 变体(proj/a_tab/b_tab bf16,码本原生 BF16;cand/unary/out f32)
-    Entry { name: "owl_dflash_select_bf16", src: cu::owl::DFLASH_SELECT, args: "T,T,T,T,T,T,i32,i32,i32,T", dtype: crate::contract::Dtype::F32 },
-    // 非因果块 attention(自块直读 + 前缀池;classic 寻址同 reshape_and_cache)
-    // v2 签名(E5-DF4):去 q_tokens(grid.y=T 承担);kv_len 张量读
-    Entry { name: "owl_naive_attn_nc_f16", src: cu::owl::NAIVE_ATTN_NC, args: "T,T,T,T,T,T,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_naive_attn_nc_bf16", src: cu::owl::NAIVE_ATTN_NC, args: "T,T,T,T,T,T,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::BF16 },
-    // v2(2026-10-13 ③):只换并行结构(lane→连续dim + warp butterfly + split-K),
-    // 语义/槽序与旧核逐字同一套 ⇒ args 串相同。单算子实测 prefix2048(窗口2048)
-    // 2.238 → 1.201ms(1.86×);数值 max|gpu−host| 0.0039 两核同档。
-    Entry { name: "owl_naive_attn_nc_bf16_v2", src: cu::owl::NAIVE_ATTN_NC, args: "T,T,T,T,T,T,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::BF16 },
-    // ---- B6 偷显存:fp8kv 变体(前缀池 e4m3;自块/出 = 原 dtype)----
-    Entry { name: "owl_naive_attn_nc_fp8kv_f16", src: cu::owl::NAIVE_ATTN_NC, args: "T,T,T,T,T,T,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_naive_attn_nc_fp8kv_bf16", src: cu::owl::NAIVE_ATTN_NC, args: "T,T,T,T,T,T,i32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::BF16 },
-    // ---- 融合核族(C1;2026-10-01;Ampere-first,单输出 SSA 契约友好)----
-    // norm_rope:qk-norm(×(1+w)^{w_off})+ rotate-half partial rope 三发合一
-    // (narrow+norm+rope;strided 读 q_raw 的 per-head [value|gate] 半段)
-    Entry { name: "owl_norm_rope_f16", src: cu::owl::NORM_ROPE, args: "T,T,T,T,T,f32,sz,sz,sz,i32,T", dtype: crate::contract::Dtype::F16 },
-    // norm_rope BF16(x/w/out bf16,cos/sin f16 共享表;同日十四)
-    Entry { name: "owl_norm_rope_bf16", src: cu::owl::NORM_ROPE, args: "T,T,T,T,T,f32,sz,sz,sz,i32,T", dtype: crate::contract::Dtype::BF16 },
-    // silu_and_mul:SwiGLU 门控 silu(g)⊙u 双输入单输出(vLLM 语义 port;
-    // 替 gate.silu().mul(up) 两发,float 中间,中间量化消除)
-    Entry { name: "owl_silu_and_mul_f16", src: cu::owl::SILU_AND_MUL, args: "T,T,sz,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_silu_and_mul_bf16", src: cu::owl::SILU_AND_MUL, args: "T,T,sz,T", dtype: crate::contract::Dtype::BF16 },
-    // fused_add_rmsnorm:residual 原地 += mixed(副作用律)+ rmsnorm·w 单输出
-    // (vLLM layernorm_kernels.cu fused_add_rms_norm port;decoder 双残差之一)
-    Entry { name: "owl_fused_add_rmsnorm_f16", src: cu::owl::FUSED_ADD_RMSNORM, args: "T,T,T,f32,sz,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_fused_add_rmsnorm_bf16", src: cu::owl::FUSED_ADD_RMSNORM, args: "T,T,T,f32,sz,i32,T", dtype: crate::contract::Dtype::BF16 },
-    // qknorm_rope_kv_insert:q norm+rope → q_out;k norm+rope → key_cache 散写;
-    // v → value_cache(minimax_m3 同款 (token,head-slot) 结构,三发合一)
-    Entry { name: "owl_qknorm_rope_kv_insert_f16", src: cu::owl::QKNORM_INSERT, args: "T,T,T,T,T,T,T,T,T,T,T,f32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    // B6.3:fp8 主池变体(签名逐字同 f16;cache 形参 u8 寻址 1B/elem)
-    Entry { name: "owl_qknorm_rope_kv_insert_f16_fp8kv", src: cu::owl::QKNORM_INSERT, args: "T,T,T,T,T,T,T,T,T,T,T,f32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_qknorm_rope_kv_insert_f16_knhd", src: cu::owl::QKNORM_INSERT, args: "T,T,T,T,T,T,T,T,T,T,T,f32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    Entry { name: "owl_qknorm_rope_kv_insert_f16_fp8kv_knhd", src: cu::owl::QKNORM_INSERT, args: "T,T,T,T,T,T,T,T,T,T,T,f32,i32,i32,i32,i32,T", dtype: crate::contract::Dtype::F16 },
-    // ---- 刀D 层间时间戳探针(2026-10-12 自 models 逃生舱收编;链式拷贝 + clock64)----
-    Entry { name: "probe_ts_f16", src: cu::owl::TS_PROBE, args: "T,T,sz,sz,T", dtype: crate::contract::Dtype::F16 },
-    // ---- ct packed → marlin B 设备重排(2026-10-01 装载提速;AWQ 装载线)----
-    Entry { name: "owl_ct_repack_u32", src: cu::owl::CT_REPACK_U32, args: "T,sz,sz,T", dtype: crate::contract::Dtype::U32 },
-    // ---- 文本主干(Qwen3.5 mini-demo;Kernel 节点路径,输出块末参)----
-    Entry { name: "owl_embed_f32", src: text::EMBED_F32, args: "T,T,sz,T", dtype: crate::contract::Dtype::F32 },
-    Entry {
-        name: "owl_rope_half_partial_f32",
-        src: text::ROPE_HALF_PARTIAL_F32,
-        args: "T,T,T,T,sz,sz,sz,T",
-        dtype: crate::contract::Dtype::F32,
-    },
-    Entry {
-        name: "owl_narrow_strided_f32",
-        src: cu::owl::NARROW_STRIDED,
-        args: "T,sz,sz,sz,sz,T",
-        dtype: crate::contract::Dtype::F32,
-    },
-    Entry {
-        name: "owl_naive_decode_attn_f32",
-        src: cu::owl::NAIVE_DECODE_ATTN,
-        args: "T,T,T,T,T,T,T,sz,sz,sz,sz,T",
-        dtype: crate::contract::Dtype::F32,
-    },
-    // ---- GDN 线性注意力(Qwen3.5 mini-demo;Kernel 节点路径,输出块末参)----
-    // (beta 臂 = sigmoid(b) 复用 owl_sigmoid_f32,不登记)
-    Entry {
-        name: "owl_gdn_gating_g_f32",
-        src: cu::owl::GDN_GATING,
-        args: "T,T,T,sz,sz,T",
-        dtype: crate::contract::Dtype::F32,
-    },
-    Entry {
-        name: "owl_gdn_l2norm_f32",
-        src: cu::owl::GDN_L2NORM,
-        args: "T,sz,sz,f32,T",
-        dtype: crate::contract::Dtype::F32,
-    },
-    Entry {
-        name: "owl_gdn_conv_upd_f32",
-        src: cu::owl::GDN_CONV_UPD,
-        args: "T,T,T,T,sz,sz,sz,i32,T",
-        dtype: crate::contract::Dtype::F32,
-    },
-    Entry {
-        name: "owl_gdn_delta_dec_f32",
-        src: cu::owl::GDN_DELTA_DEC,
-        args: "T,T,T,T,T,T,T,sz,sz,sz,sz,sz,f32,T",
-        dtype: crate::contract::Dtype::F32,
-    },
-    Entry {
-        name: "owl_gdn_norm_act_f32",
-        src: cu::owl::GDN_NORM_ACT,
-        args: "T,T,T,sz,sz,sz,f32,i32,T",
-        dtype: crate::contract::Dtype::F32,
-    },
-];
-
-/// 查登记(组合面一般用 [`source`]/[`kernel`];本函数供测试/文档)
-pub fn lookup(name: &str) -> Option<&'static Entry> {
-    REGISTRY.iter().find(|e| e.name == name)
+/// **算子准入查询**(原"登记表查名字"入口;F 轮 2026-10-13 起**唯一真源
+/// = 算子自托管声明**,登记表已退役)。
+pub fn lookup(name: &str) -> Option<&'static crate::spec::KernelMeta> {
+    crate::ops::meta(name)
 }
 
 /// 资产 id → `.cu` 源文本(**仅测试/工具面**;运行期已不再需要源文本 ——
@@ -491,13 +119,9 @@ pub fn cu_text(src_id: &str) -> String {
         .unwrap_or_else(|e| panic!("cu_text({src_id}): {e}"))
 }
 
-/// **资产符号清单查表**(E 轮 2026-10-13:源文本退役 ⇒ 判据从"正则扫文本"
-/// 升级为"构建期实际编出的符号清单")。
-///
-/// 清单由 `build.rs` 从 `.cu` 解析并随资产表生成(字面核 + 单层宏实例化两种
-/// 形态都收),见 `ASSET_SYMBOLS`。`models::kernel::kv_manifest_gate` 的池
-/// 写者/读者核对走的仍是本函数 —— 判据变强:不再是"文本里像不像",而是
-/// "编译期真的有没有这个符号"。
+/// **资产符号清单查表**(E 轮:源文本退役 ⇒ 判据从"正则扫文本"升级为
+/// "构建期实际编出的符号清单";符号由 `build.rs` 从 `.cu` 解析)。
+/// `models::kernel::kv_manifest_gate` 的池写者/读者核对走本函数。
 pub fn source_defines(src_id: &str, name: &str) -> bool {
     ASSET_SYMBOLS
         .iter()
@@ -505,20 +129,10 @@ pub fn source_defines(src_id: &str, name: &str) -> bool {
         .is_some_and(|(_, syms)| syms.contains(&name))
 }
 
+/// 算子名 → **资产 id**(`KernelSpec::SRC` 的唯一读取口;F 轮后不再有
+/// 登记表兜底 —— 未建表 = 未准入 = 编程错误)。
 pub fn source(name: &str) -> &'static str {
     crate::ops::source(name)
-}
-
-/// 登记表侧的原始取值(**只给 [`crate::ops::source`] 的兜底分支用**;
-/// 外部一律走 `source` —— 解析序不许有第二份实现)。
-pub(crate) fn registry_source(name: &str) -> &'static str {
-    match lookup(name) {
-        Some(e) => e.src,
-        None => panic!(
-            "kernel::source(\"{name}\"): 既未建表也未登记 —— 新 kernel 须先在 \
-             owl-kernels cu/ 加源,再在该算子声明(或 REGISTRY)登记一条"
-        ),
-    }
 }
 
 /// 构造 Kernel 值(默认发射配置:grid 哨兵 = 自动 1D ceil/256)
@@ -649,54 +263,43 @@ pub fn parse_cu_sig(src: &str, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ops;
     
 
-    /// **登记表 ⇔ 算子自托管面:同名源必须逐字节一致**(2026-10-13,B 轮)。
-    ///
-    /// 已建表算子的源本来只该有算子身上那一个住址;登记表为了未建表条目
-    /// 保留了一份就地 `include_str!`,于是“两处同时有”。本门把这两处**机器
-    /// 锁一致** —— 任一处改了而另一处没跟上,立刻红(不许漂移)。
-    /// 待 R1 建表补齐,R1 上限降到 0 时本表整体退役,本门自动失去对象。
+    /// **每张原生表的资产与符号清单在场**(原"登记表有源"门的等价升级)。
     #[test]
-    fn registry_source_agrees_with_op_meta() {
-        let mut redundant = 0usize;
-        for e in REGISTRY {
-            let Some(m) = crate::ops::meta(e.name) else { continue };
-            assert_eq!(
-                e.src, m.src,
-                "{}: 登记表与算子声明的 .cu 源不同(两处对不上)",
-                e.name
-            );
-            redundant += 1;
+    fn every_declared_op_has_asset_and_symbols() {
+        let mut n = 0;
+        for m in ops::all() {
+            if m.src.is_empty() { continue; }   // foreign(FFI):无 `.cu`
+            assert!(m.src.starts_with("cu/") && m.src.ends_with(".cu"),
+                    "{}: 资产 id 非法 {}", m.entry, m.src);
+            assert!(cu_text(m.src).contains("extern \"C\" __global__"),
+                    "{}: 资产 {} 不是核源码", m.entry, m.src);
+            assert!(source_defines(m.src, m.entry),
+                    "{}: 不在资产 {} 的构建期符号清单里", m.entry, m.src);
+            n += 1;
         }
-        eprintln!(
-            "[list] 登记表 {}/{} 条与算子声明源一致(余 {} 条 = 仅引入)✓",
-            redundant,
-            REGISTRY.len(),
-            REGISTRY.len() - redundant
-        );
+        eprintln!("[list] {n} 张原生表的资产 + 符号清单在场 ✓");
     }
 
-    /// **解析序锁**:`source()` 对已建表算子必须返回算子自托管的那一份;
-    /// 对仅引入算子回落到登记表。两条路都不许 panic。
+    /// **R1(F 轮换源):构建期编出的符号 ⊆ 声明集** —— 凡编出来的核都必须有
+    /// `impl KernelSpec`。比原"登记表差额"更贴 R1 本意:能抓"新加 `.cu` 但没
+    /// 建表"(登记表差额抓不到,因为那条路要人先去登记)。
     #[test]
-    fn source_resolves_every_registered_name() {
-        for e in REGISTRY {
-            let s = source(e.name);
-            assert_eq!(s, e.src, "{}: source() 未按登记表/算子面解析", e.name);
-        }
+    fn every_compiled_symbol_is_declared() {
+        let und = ops::undeclared_symbols();
+        assert!(und.is_empty(), "编出但未声明的核符号 {} 条:{und:?}", und.len());
+        eprintln!("[R1] 编出符号集 ⊆ 声明集 ✓(登记表已退役,判据换源)");
     }
 
+    /// **每张原生表都有输出槽** ⇒ 声明口径 dtype 可派生(F 轮删 `Entry.dtype`
+    /// 的依据;`op_tables` 的 O 指针门是它的机器面)。
     #[test]
-    fn registry_entries_have_sources() {
-        for e in REGISTRY {
-            // 资产 id 形如 `cu/**.cu`(E 轮:该字段已从"源文本"改为"资产身份")
-            assert!(e.src.starts_with("cu/") && e.src.ends_with(".cu"), "{} 资产 id 非法:{}", e.name, e.src);
-            assert!(cu_text(e.src).contains("extern \"C\" __global__"), "{} 资产源缺核", e.name);
-            assert!(
-                super::source_defines(e.src, e.name),
-                "{} 构建期符号清单里没有该核(名字与源不符)", e.name
-            );
+    fn every_native_table_declares_out_dtype() {
+        for m in ops::all() {
+            if m.src.is_empty() { continue; }
+            assert!(m.out_dtype().is_some(), "{}: 无输出槽 ⇒ 声明口径 dtype 不可派生", m.entry);
         }
     }
 
@@ -719,33 +322,34 @@ mod tests {
             ),
         ];
         let mut paired = 0usize;
-        for e in REGISTRY {
-            if !e.name.contains("_knhd") {
+        for e in ops::all() {
+            if !e.entry.contains("_knhd") {
                 continue;
             }
-            if KNHD_ONLY.iter().any(|(n, _)| *n == e.name) {
+            if KNHD_ONLY.iter().any(|(n, _)| *n == e.entry) {
                 continue;
             }
-            let classic = e.name.replace("_knhd", "");
-            let Some(c) = REGISTRY.iter().find(|x| x.name == classic.as_str()) else {
+            let classic = e.entry.replace("_knhd", "");
+            let Some(c) = ops::all().find(|x| x.entry == classic.as_str()) else {
                 panic!(
                     "{}: 无 classic 伙伴 `{classic}` —— 要么补对偶,要么登进 KNHD_ONLY 并写理由",
-                    e.name
+                    e.entry
                 );
             };
             assert_eq!(
-                c.args, e.args,
-                "{}: args 与 classic 伙伴不符 —— 翻转须只换名(实参表同一)",
-                e.name
+                c.args_str(), e.args_str(),
+                "{}: 槽序与 classic 伙伴不符 —— 翻转须只换名(实参表同一)",
+                e.entry
             );
-            assert_eq!(c.src, e.src, "{}: 与 classic 伙伴不同源", e.name);
+            assert_eq!(c.src, e.src, "{}: 与 classic 伙伴不同源", e.entry);
             paired += 1;
         }
-        // 覆盖锁:18 = 2026-10-13 实况对数(登记新增 kNHD 核时同步上调)
-        assert_eq!(paired, 18, "配对 kNHD 变体数异常(实 {paired})—— 漏登记或误删?");
+        // 覆盖锁:22 = 2026-10-13 F 轮实况对数(新增 kNHD 核时同步上调)
+        // (C 轮拆文件后 attn 域补入 4 个 knhd NC 变体:18 → 22)
+        assert_eq!(paired, 22, "配对 kNHD 变体数异常(实 {paired})—— 漏登记或误删?");
         for (n, why) in KNHD_ONLY {
             assert!(
-                REGISTRY.iter().any(|e| e.name == *n),
+                ops::all().any(|e| e.entry == *n),
                 "KNHD_ONLY 条目 `{n}` 已不在登记表({why}),请清理白名单"
             );
         }
@@ -763,8 +367,8 @@ mod tests {
     #[test]
     fn registry_names_are_unique() {
         let mut seen = std::collections::HashSet::new();
-        for e in REGISTRY {
-            assert!(seen.insert(e.name), "{} 重复登记", e.name);
+        for e in ops::all() {
+            assert!(seen.insert(e.entry), "{} 重复声明", e.entry);
         }
     }
 
@@ -795,48 +399,5 @@ mod tests {
     }
 
 
-    // ======================================================================
-    // C2:登记 args ↔ .cu 实签名互证(u32/sz 错位、out 位置两雷的机器拦截)
-    // ======================================================================
-
-
-    #[test]
-    fn registry_sig_matches_cu_signatures() {
-        for e in REGISTRY {
-            let actual = parse_cu_sig(&cu_text(e.src), e.name)
-                .unwrap_or_else(|| panic!("{}: .cu 源里找不到同名核", e.name));
-            // O 标记(2026-10-12 瘦身:纯算子族经 lower_kernel 装配,输出槽
-            // 显式化)—— 归一 T 后与 .cu 实签名对位;O 位必须是 .cu 指针槽
-            let o_count = e.args.matches("O").count();
-            assert!(o_count <= 1, "{}: O 标记至多一个", e.name);
-            let normalized = e.args.replace("O", "T");
-            assert_eq!(
-                normalized, actual,
-                "{}: 登记签名与 .cu 实签名不符(改签名须同步登记表)",
-                e.name
-            );
-            if o_count == 1 {
-                let pos = e.args.split(',').position(|t| t == "O").unwrap();
-                let cu_toks: Vec<&str> = actual.split(',').collect();
-                assert_eq!(
-                    cu_toks[pos], "T",
-                    "{}: O 槽必须是 .cu 指针位(输出块)",
-                    e.name
-                );
-            }
-            // Kernel 节点路径(text/ 域四核)输出块必须末参;语义算子族
-            // (lower_* 硬编码装配)out 位置随 .cu 签名,不受此限
-            if matches!(
-                e.name,
-                "owl_embed_f32" | "owl_embed_f16"
-                    | "owl_rope_half_partial_f32" | "owl_rope_half_partial_f16"
-                    | "owl_narrow_strided_f32" | "owl_narrow_strided_f16"
-                    | "owl_naive_decode_attn_f32" | "owl_naive_decode_attn_f16"
-                    | "owl_sigmoid_gate_mul_f16"
-            ) {
-                assert!(e.args.ends_with("T"), "{}: Kernel 节点路径输出块必须末参", e.name);
-            }
-        }
-    }
 
 }

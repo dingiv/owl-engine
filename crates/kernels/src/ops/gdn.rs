@@ -372,7 +372,7 @@ impl KernelSpec for GdnGatingGF32 {
         Param::t_in("dt_bias", Dtype::F32, 2),
         Param::sz("total"),
         Param::sz("heads"),
-        Param::t_in("g", Dtype::F32, 2),
+        Param::t_out("g", Dtype::F32, 2),
     ];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;

@@ -499,7 +499,7 @@ impl KernelSpec for NaiveDecodeAttnF16 {
         Param::sz("q_heads"),
         Param::sz("kv_heads"),
         Param::sz("d_dim"),
-        Param::t_in("out", Dtype::F16, 2),
+        Param::t_out("out", Dtype::F16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::F16)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -529,7 +529,7 @@ impl KernelSpec for NaiveDecodeAttnF32 {
         Param::sz("q_heads"),
         Param::sz("kv_heads"),
         Param::sz("d_dim"),
-        Param::t_in("out", Dtype::F32, 2),
+        Param::t_out("out", Dtype::F32, 2),
     ];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
         kv_dtype: Some(Dtype::F16), head_dim: &[128], page: &[16, 32, 64, 128], grp: None, tile: None,
@@ -558,7 +558,7 @@ impl KernelSpec for NaiveAttnNcF16 {
         Param::i32("d_dim"),
         Param::i32("page"),
         Param::i32("x"),
-        Param::t_in("out", Dtype::F16, 2),
+        Param::t_out("out", Dtype::F16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Classic, Dtype::F16)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -588,7 +588,7 @@ impl KernelSpec for NaiveAttnNcBf16 {
         Param::i32("d_dim"),
         Param::i32("page"),
         Param::i32("x"),
-        Param::t_in("out", Dtype::BF16, 2),
+        Param::t_out("out", Dtype::BF16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Classic, Dtype::BF16)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -618,7 +618,7 @@ impl KernelSpec for NaiveAttnNcFp8KvF16 {
         Param::i32("d_dim"),
         Param::i32("page"),
         Param::i32("x"),
-        Param::t_in("out", Dtype::F16, 2),
+        Param::t_out("out", Dtype::F16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Classic, Dtype::U8)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -648,7 +648,7 @@ impl KernelSpec for VllmReshapeAndCacheF16 {
         Param::i32("head_size"),
         Param::i32("block_size"),
         Param::i32("x"),
-        Param::t_in("out", Dtype::F16, 2),
+        Param::t_out("out", Dtype::F16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Classic, Dtype::F16)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -678,7 +678,7 @@ impl KernelSpec for VllmReshapeAndCacheF16Knhd {
         Param::i32("head_size"),
         Param::i32("block_size"),
         Param::i32("x"),
-        Param::t_in("out", Dtype::F16, 2),
+        Param::t_out("out", Dtype::F16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F16)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -708,7 +708,7 @@ impl KernelSpec for VllmReshapeAndCacheBf16Knhd {
         Param::i32("head_size"),
         Param::i32("block_size"),
         Param::i32("x"),
-        Param::t_in("out", Dtype::BF16, 2),
+        Param::t_out("out", Dtype::BF16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Knhd, Dtype::BF16)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -738,7 +738,7 @@ impl KernelSpec for ReshapeAndCacheFp8KvBf16 {
         Param::i32("head_size"),
         Param::i32("block_size"),
         Param::i32("x"),
-        Param::t_in("out", Dtype::BF16, 2),
+        Param::t_out("out", Dtype::BF16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Classic, Dtype::U8)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -768,7 +768,7 @@ impl KernelSpec for ReshapeAndCacheFp8KvBf16Knhd {
         Param::i32("head_size"),
         Param::i32("block_size"),
         Param::i32("x"),
-        Param::t_in("out", Dtype::BF16, 2),
+        Param::t_out("out", Dtype::BF16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Knhd, Dtype::U8)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -802,7 +802,7 @@ impl KernelSpec for VllmPagedAttentionV1F16Hd128 {
         Param::f32("softscapping"),
         Param::i32("sliding_window"),
         Param::i32("use_alibi"),
-        Param::t_in("out", Dtype::F16, 2),
+        Param::t_out("out", Dtype::F16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::F16)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -836,7 +836,7 @@ impl KernelSpec for VllmPagedAttentionV1F16Hd128bs32 {
         Param::f32("softscapping"),
         Param::i32("sliding_window"),
         Param::i32("use_alibi"),
-        Param::t_in("out", Dtype::F16, 2),
+        Param::t_out("out", Dtype::F16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::F16)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -870,7 +870,7 @@ impl KernelSpec for VllmPagedAttentionV1F16Hd256 {
         Param::f32("softscapping"),
         Param::i32("sliding_window"),
         Param::i32("use_alibi"),
-        Param::t_in("out", Dtype::F16, 2),
+        Param::t_out("out", Dtype::F16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::F16)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -904,7 +904,7 @@ impl KernelSpec for VllmPagedAttentionV1F16Hd256bs32 {
         Param::f32("softscapping"),
         Param::i32("sliding_window"),
         Param::i32("use_alibi"),
-        Param::t_in("out", Dtype::F16, 2),
+        Param::t_out("out", Dtype::F16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::F16)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -945,7 +945,7 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptF16Hd128 {
         Param::i32("kv_head_stride"),
         Param::i32("use_alibi_flag"),
         Param::i32("use_sinks_flag"),
-        Param::t_in("out", Dtype::F16, 2),
+        Param::t_out("out", Dtype::F16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::F16)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -986,7 +986,7 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptF16Hd256 {
         Param::i32("kv_head_stride"),
         Param::i32("use_alibi_flag"),
         Param::i32("use_sinks_flag"),
-        Param::t_in("out", Dtype::F16, 2),
+        Param::t_out("out", Dtype::F16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::F16)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -1027,7 +1027,7 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptF16KnhdHd128 {
         Param::i32("kv_head_stride"),
         Param::i32("use_alibi_flag"),
         Param::i32("use_sinks_flag"),
-        Param::t_in("out", Dtype::F16, 2),
+        Param::t_out("out", Dtype::F16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F16)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -1068,7 +1068,7 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptF16KnhdHd256 {
         Param::i32("kv_head_stride"),
         Param::i32("use_alibi_flag"),
         Param::i32("use_sinks_flag"),
-        Param::t_in("out", Dtype::F16, 2),
+        Param::t_out("out", Dtype::F16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F16)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -1109,7 +1109,7 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptFp8Hd128 {
         Param::i32("kv_head_stride"),
         Param::i32("use_alibi_flag"),
         Param::i32("use_sinks_flag"),
-        Param::t_in("out", Dtype::F16, 2),
+        Param::t_out("out", Dtype::F16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::U8)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -1150,7 +1150,7 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptFp8Hd256 {
         Param::i32("kv_head_stride"),
         Param::i32("use_alibi_flag"),
         Param::i32("use_sinks_flag"),
-        Param::t_in("out", Dtype::F16, 2),
+        Param::t_out("out", Dtype::F16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::U8)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -1191,7 +1191,7 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptFp8KnhdHd128 {
         Param::i32("kv_head_stride"),
         Param::i32("use_alibi_flag"),
         Param::i32("use_sinks_flag"),
-        Param::t_in("out", Dtype::F16, 2),
+        Param::t_out("out", Dtype::F16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::U8)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -1226,7 +1226,7 @@ impl KernelSpec for PrefillSplitF16Hd256 {
         Param::i32("kv_head_stride"),
         Param::i32("page"),
         Param::i32("hq"),
-        Param::t_in("dummy", Dtype::F16, 2),
+        Param::t_out("dummy", Dtype::F16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::F16)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -1261,7 +1261,7 @@ impl KernelSpec for PrefillSplitFp8KvHd256 {
         Param::i32("kv_head_stride"),
         Param::i32("page"),
         Param::i32("hq"),
-        Param::t_in("dummy", Dtype::F16, 2),
+        Param::t_out("dummy", Dtype::F16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::U8)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -1296,7 +1296,7 @@ impl KernelSpec for PrefillSplitF16KnhdHd256 {
         Param::i32("kv_head_stride"),
         Param::i32("page"),
         Param::i32("hq"),
-        Param::t_in("dummy", Dtype::F16, 2),
+        Param::t_out("dummy", Dtype::F16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F16)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -1331,7 +1331,7 @@ impl KernelSpec for PrefillSplitFp8KvKnhdHd256 {
         Param::i32("kv_head_stride"),
         Param::i32("page"),
         Param::i32("hq"),
-        Param::t_in("dummy", Dtype::F16, 2),
+        Param::t_out("dummy", Dtype::F16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::U8)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -1357,7 +1357,7 @@ impl KernelSpec for PrefillSplitReduceF16Hd256 {
         Param::i32("hq"),
         Param::i32("hd"),
         Param::i32("T"),
-        Param::t_in("out", Dtype::F16, 2),
+        Param::t_out("out", Dtype::F16, 2),
     ];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
         kv_dtype: Some(Dtype::F16), head_dim: &[256], page: &[16, 32, 64, 128], grp: None, tile: None,
@@ -1394,6 +1394,218 @@ pub static OWL_PREFILL_SPLIT_FP8KV_HD256: KernelMeta = meta_of::<PrefillSplitFp8
 pub static OWL_PREFILL_SPLIT_F16_KNHD_HD256: KernelMeta = meta_of::<PrefillSplitF16KnhdHd256>();
 pub static OWL_PREFILL_SPLIT_FP8KV_KNHD_HD256: KernelMeta = meta_of::<PrefillSplitFp8KvKnhdHd256>();
 pub static OWL_PREFILL_SPLIT_REDUCE_F16_HD256: KernelMeta = meta_of::<PrefillSplitReduceF16Hd256>();
+
+
+/// `vllm_paged_attention_v2_f16_hd128` —— pagedattention_f16.cu(F 轮符号门抓出)
+///
+/// page=16 档(packing 走此名;`driver.rs` 依 page 拾取)—— **原为未登记的活路径**,F 轮符号门抓出
+pub struct VllmPagedAttentionV2F16Hd128;
+
+impl KernelSpec for VllmPagedAttentionV2F16Hd128 {
+    const ENTRY: &'static str = "vllm_paged_attention_v2_f16_hd128";
+    const SRC: &'static str = "cu/attn/pagedattention_f16.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("q", Dtype::F16, 2),
+        Param::t_in("k_cache", Dtype::F16, 2),
+        Param::t_in("v_cache", Dtype::F16, 2),
+        Param::t_in("block_tables", Dtype::F32, 2),
+        Param::t_in("context_lens", Dtype::F32, 2),
+        Param::t_in("alibi_slopes", Dtype::F32, 2),
+        Param::t_in("exp_sums", Dtype::F32, 2),
+        Param::t_in("max_logits", Dtype::F32, 2),
+        Param::i32("num_kv_heads"),
+        Param::f32("scale"),
+        Param::i32("max_num_blocks_per_seq"),
+        Param::i32("q_stride"),
+        Param::i32("kv_block_stride"),
+        Param::i32("kv_head_stride"),
+        Param::f32("softscapping"),
+        Param::i32("sliding_window"),
+        Param::i32("use_alibi"),
+        Param::t_out("tmp_out", Dtype::F16, 2),
+    ];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::F16)];
+    const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+        kv_dtype: Some(Dtype::F16), head_dim: &[128], page: &[16], grp: None, tile: None,
+    };
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+
+/// `vllm_paged_attention_v2_f16_hd256` —— pagedattention_f16.cu(F 轮符号门抓出)
+///
+/// 同上
+pub struct VllmPagedAttentionV2F16Hd256;
+
+impl KernelSpec for VllmPagedAttentionV2F16Hd256 {
+    const ENTRY: &'static str = "vllm_paged_attention_v2_f16_hd256";
+    const SRC: &'static str = "cu/attn/pagedattention_f16.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("q", Dtype::F16, 2),
+        Param::t_in("k_cache", Dtype::F16, 2),
+        Param::t_in("v_cache", Dtype::F16, 2),
+        Param::t_in("block_tables", Dtype::F32, 2),
+        Param::t_in("context_lens", Dtype::F32, 2),
+        Param::t_in("alibi_slopes", Dtype::F32, 2),
+        Param::t_in("exp_sums", Dtype::F32, 2),
+        Param::t_in("max_logits", Dtype::F32, 2),
+        Param::i32("num_kv_heads"),
+        Param::f32("scale"),
+        Param::i32("max_num_blocks_per_seq"),
+        Param::i32("q_stride"),
+        Param::i32("kv_block_stride"),
+        Param::i32("kv_head_stride"),
+        Param::f32("softscapping"),
+        Param::i32("sliding_window"),
+        Param::i32("use_alibi"),
+        Param::t_out("tmp_out", Dtype::F16, 2),
+    ];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::F16)];
+    const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+        kv_dtype: Some(Dtype::F16), head_dim: &[256], page: &[16], grp: None, tile: None,
+    };
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+
+/// `owl_naive_attn_nc_f16_knhd` —— naive_attn_nc.cu(F 轮符号门抓出)
+///
+/// ⚠️ 当前 0 调用点(暂不可达;候选:从 .cu 删除变体 —— 先按 R1「编出即有裁决」建表)
+pub struct NaiveAttnNcF16Knhd;
+
+impl KernelSpec for NaiveAttnNcF16Knhd {
+    const ENTRY: &'static str = "owl_naive_attn_nc_f16_knhd";
+    const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("q", Dtype::F16, 2),
+        Param::t_in("k_self", Dtype::F16, 2),
+        Param::t_in("v_self", Dtype::F16, 2),
+        Param::t_in("kc", Dtype::F16, 2),
+        Param::t_in("vc", Dtype::F16, 2),
+        Param::t_in("kv_len_p", Dtype::F32, 2),
+        Param::i32("q_heads"),
+        Param::i32("kv_heads"),
+        Param::i32("d_dim"),
+        Param::i32("page"),
+        Param::i32("x"),
+        Param::t_out("out", Dtype::F16, 2),
+    ];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Knhd, Dtype::F16)];
+    const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+        kv_dtype: Some(Dtype::F16), head_dim: &[128], page: &[32], grp: None, tile: None,
+    };
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+
+/// `owl_naive_attn_nc_bf16_knhd` —— naive_attn_nc.cu(F 轮符号门抓出)
+///
+/// 同上
+pub struct NaiveAttnNcBf16Knhd;
+
+impl KernelSpec for NaiveAttnNcBf16Knhd {
+    const ENTRY: &'static str = "owl_naive_attn_nc_bf16_knhd";
+    const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("q", Dtype::BF16, 2),
+        Param::t_in("k_self", Dtype::BF16, 2),
+        Param::t_in("v_self", Dtype::BF16, 2),
+        Param::t_in("kc", Dtype::BF16, 2),
+        Param::t_in("vc", Dtype::BF16, 2),
+        Param::t_in("kv_len_p", Dtype::F32, 2),
+        Param::i32("q_heads"),
+        Param::i32("kv_heads"),
+        Param::i32("d_dim"),
+        Param::i32("page"),
+        Param::i32("x"),
+        Param::t_out("out", Dtype::BF16, 2),
+    ];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Knhd, Dtype::BF16)];
+    const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+        kv_dtype: Some(Dtype::BF16), head_dim: &[128], page: &[32], grp: None, tile: None,
+    };
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+
+/// `owl_naive_attn_nc_fp8kv_f16_knhd` —— naive_attn_nc.cu(F 轮符号门抓出)
+///
+/// 同上
+pub struct NaiveAttnNcFp8KvF16Knhd;
+
+impl KernelSpec for NaiveAttnNcFp8KvF16Knhd {
+    const ENTRY: &'static str = "owl_naive_attn_nc_fp8kv_f16_knhd";
+    const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("q", Dtype::F16, 2),
+        Param::t_in("k_self", Dtype::F16, 2),
+        Param::t_in("v_self", Dtype::F16, 2),
+        Param::t_in("kc", Dtype::U8, 2),
+        Param::t_in("vc", Dtype::U8, 2),
+        Param::t_in("kv_len_p", Dtype::F32, 2),
+        Param::i32("q_heads"),
+        Param::i32("kv_heads"),
+        Param::i32("d_dim"),
+        Param::i32("page"),
+        Param::i32("x"),
+        Param::t_out("out", Dtype::F16, 2),
+    ];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Knhd, Dtype::U8)];
+    const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+        kv_dtype: Some(Dtype::U8), head_dim: &[128], page: &[32], grp: None, tile: None,
+    };
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+
+/// `owl_naive_attn_nc_fp8kv_bf16_knhd` —— naive_attn_nc.cu(F 轮符号门抓出)
+///
+/// 同上
+pub struct NaiveAttnNcFp8KvBf16Knhd;
+
+impl KernelSpec for NaiveAttnNcFp8KvBf16Knhd {
+    const ENTRY: &'static str = "owl_naive_attn_nc_fp8kv_bf16_knhd";
+    const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("q", Dtype::BF16, 2),
+        Param::t_in("k_self", Dtype::BF16, 2),
+        Param::t_in("v_self", Dtype::BF16, 2),
+        Param::t_in("kc", Dtype::U8, 2),
+        Param::t_in("vc", Dtype::U8, 2),
+        Param::t_in("kv_len_p", Dtype::F32, 2),
+        Param::i32("q_heads"),
+        Param::i32("kv_heads"),
+        Param::i32("d_dim"),
+        Param::i32("page"),
+        Param::i32("x"),
+        Param::t_out("out", Dtype::BF16, 2),
+    ];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Knhd, Dtype::U8)];
+    const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+        kv_dtype: Some(Dtype::U8), head_dim: &[128], page: &[32], grp: None, tile: None,
+    };
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+
+pub static VLLM_PAGED_ATTENTION_V2_F16_HD128: KernelMeta = meta_of::<VllmPagedAttentionV2F16Hd128>();
+pub static VLLM_PAGED_ATTENTION_V2_F16_HD256: KernelMeta = meta_of::<VllmPagedAttentionV2F16Hd256>();
+pub static NAIVE_ATTN_NC_F16_KNHD: KernelMeta = meta_of::<NaiveAttnNcF16Knhd>();
+pub static NAIVE_ATTN_NC_BF16_KNHD: KernelMeta = meta_of::<NaiveAttnNcBf16Knhd>();
+pub static NAIVE_ATTN_NC_FP8_KV_F16_KNHD: KernelMeta = meta_of::<NaiveAttnNcFp8KvF16Knhd>();
+pub static NAIVE_ATTN_NC_FP8_KV_BF16_KNHD: KernelMeta = meta_of::<NaiveAttnNcFp8KvBf16Knhd>();
 
 /// 本域全部已建表算子
 pub static METAS: &[&KernelMeta] = &[
@@ -1448,6 +1660,12 @@ pub static METAS: &[&KernelMeta] = &[
     &OWL_PREFILL_SPLIT_F16_KNHD_HD256,
     &OWL_PREFILL_SPLIT_FP8KV_KNHD_HD256,
     &OWL_PREFILL_SPLIT_REDUCE_F16_HD256,
+    &VLLM_PAGED_ATTENTION_V2_F16_HD128,
+    &VLLM_PAGED_ATTENTION_V2_F16_HD256,
+    &NAIVE_ATTN_NC_F16_KNHD,
+    &NAIVE_ATTN_NC_BF16_KNHD,
+    &NAIVE_ATTN_NC_FP8_KV_F16_KNHD,
+    &NAIVE_ATTN_NC_FP8_KV_BF16_KNHD,
 ];
 
 /// **谓词 ⇔ 声明一致性**(P4:收编 driver 谓词 —— 页配对律此前只住

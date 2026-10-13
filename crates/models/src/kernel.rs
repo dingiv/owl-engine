@@ -5,8 +5,7 @@
 //! 是 models 词汇)。旧路径 `crate::kernel::*` 全量续用,调用点零改动。
 
 pub use owl_kernels::list::{
-    kernel, kernel_with, launch_shape, lookup, source, with_pick, Entry, Kernel, LaunchShape,
-    REGISTRY,
+    kernel, kernel_with, launch_shape, lookup, source, with_pick, Kernel, LaunchShape,
 };
 
 // ======================================================================
@@ -62,7 +61,7 @@ pub fn kv_manifest_gate(
     }
     let mut bad: Vec<&str> = Vec::new();
     for name in &family {
-        let Some(e) = REGISTRY.iter().find(|e| e.name == *name) else {
+        let Some(e) = owl_kernels::ops::meta(name) else {
             bad.push(name);
             continue;
         };

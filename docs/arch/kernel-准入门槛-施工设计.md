@@ -1831,3 +1831,89 @@ target/release/server (39M)
 - `KernelSource.source`(线格式字段)名字未改,语义已是 id;
 - 家族自管资产(marlin/xqa/flashinfer/gdn_chunked cubin 表)仍按**名字**查表(它们不经 build.rs 的 `.cu` 编译面),与本轮统一化是两条链,可另立项;
 - 目录对望已做(§15.13.5),但 `ops/attn.rs` 内 26 张表尚未宏收敛。
+
+---
+
+### 15.15 F 轮:`REGISTRY` 登记表退役(2026-10-13;算子元数据物理上只剩一个住址)
+
+用户追问:「`pub static REGISTRY: &[Entry]` 是否可以退役,或者改动了?」→ 先做**字段级可派生性审计**,再退。
+
+#### 15.15.1 审计:四字段全部可派生(数据)
+
+临时门跑 110 条,拿登记表逐字段对声明面:
+
+| 字段 | 结果 | 判定 |
+|---|---|---|
+| `name` | —— | `meta.entry` |
+| `src`(资产 id) | **0 不同** | 完全可派生 |
+| `dtype`(声明口径) | **0 不同** —— 恰等于**输出槽 dtype** | 可派生(修 27 条 O 标记后 110/110) |
+| `args`(槽序串) | 70 条字面不同,但**归一化(去 `O`)后 110/110 逐字一致** | **零信息量** ⇒ 字段可删 |
+
+`args` 的 70 条差异**方向是登记表更差**:它不标输出槽(`T,T,T,i32,i32,i32` vs 声明的 `T,T,O,i32,i32,i32`)。即当年那份手抄不但冗余,精度还低于声明面。
+
+**前置修正**:27 条声明无输出槽(`owl_naive_decode_attn_*` / `vllm_reshape_and_cache_*` / `vllm_paged_attention_v1_*` / `owl_prefill_split_*`(哑输出 `dummy`)/ `owl_gdn_gating_g_f32`(`g`))—— 病因同 D 轮的 17 处:**登记串没打 `O`**,生成器照抄成输入。全部改 `t_out` ⇒ `dtype` 可派生 + `O` 指针门覆盖面 **83 → 110**。
+
+#### 15.15.2 改动面
+
+| 面 | 之前 | 之后 |
+|---|---|---|
+| **源常量集中表** `list.rs §0 mod cu` | 40 个 `pub const`(C 轮 §15.12 留下的最后残余) | **整体删除**(声明面自带 `SRC` 字面量) |
+| `list::Entry` + `REGISTRY` | 结构体 + **110 行表体** | **删除**(字段全可派生) |
+| `lookup(name)` | `Option<&Entry>` | `Option<&KernelMeta>`(= `ops::meta`) |
+| `registry_source` | 兜底分支 | 删除(无兜底:未声明 = 未准入 = panic 点名) |
+| `Kernel::slot_tokens` | 元数据 → 登记表 → 逃生舱签名 | 元数据 → 逃生舱签名(两条 `'static`,零分配) |
+| `Kernel::new` | `meta: None` | **构造期自动挂声明**(名字已在声明面就带上;逃生舱核自然 None) |
+| `eval.rs` dtype 门 | `Entry.dtype` | `meta.out_dtype()`(新 helper;域缺失时降级不拦) |
+| `kv_manifest_gate` | `REGISTRY.iter().find` | `ops::meta(name)` + `list::source_defines(meta.src, name)` |
+| `cubins::coverage()` / boot 报告 | 遍历 `REGISTRY` | 遍历 `ops::all()`;报告改为 **「已声明 N 张 / 编出符号 M 条(未声明 k)」** |
+
+**`list.rs`:842 → 401 行**(−441),且模块职责收敛为「遗留 `Kernel` 值类型 + `.cu` 签名解析器 + 测试面读盘」。
+
+#### 15.15.3 新 R1 门抓到的**真漏**(旧判据不可能抓到)
+
+R1 判据换源为 **「构建期编出的符号集 ⊆ 声明集」** 后,当场抓出 6 条**编出来但从没登记过**的核:
+
+| 条目 | 性质 |
+|---|---|
+| `vllm_paged_attention_v2_f16_hd128` / `_hd256` | ⚠️ **活路径**:`driver.rs` 按 `page=16` 拾取这两个名字(源码里真的写着)—— 原为**未登记的活路径**,任何 page=16 档都会被准入白名单拒。**旧判据永远抓不到**:它比的是"登记表 − 已建表",而这两条连登记表都没进 |
+| `owl_naive_attn_nc_{f16,bf16,fp8kv_f16,fp8kv_bf16}_knhd` | 当前 **0 调用点**(死变体;候选从 `.cu` 删除 —— 先按「编出即有裁决」建表) |
+
+⇒ 两条活路径已补声明,**白名单在 page=16 档现在可用了**。
+
+#### 15.15.4 家族私有核:显式册 + 防呆
+
+3 条编出来但**不走准入面**的辅助核(家族 `assemble` 按名装载)进 `ops::FAMILY_PRIVATE`(每条写理由):
+
+```
+cu/gdn/gdn_chunk_scalar.cu :: owl_gdn_chunk_scalar_f32   (§15.7 gdn_scalar 家族单核)
+cu/gdn/state_transpose.cu  :: owl_state_kv_to_vk / owl_state_vk_to_kv  (gdn_chunked 状态转置)
+```
+门**豁免这三条**,同时**防呆**:册上每条必须真在符号清单里(改名/删核忘清册 = 红)。这与 `KNHD_ONLY` 的"登册 + 理由"是同一套设计。
+
+**顺带修的提取器 bug**:`symbols_of` 的字面核分支会把宏体里的形参 `NAME` 当成核名(`#define X(NAME,…) extern "C" __global__ void NAME(`)→ 补上"必须含小写"过滤(与宏实例化分支同律)。
+
+#### 15.15.5 门的变化:两空两强
+
+| 门 | 变化 |
+|---|---|
+| `registry_source_agrees_with_op_meta`(B 轮) | **变空** ⇒ 删 |
+| `registry_sig_matches_cu_signatures`(C2) | **变空**(槽序只剩一处真源)⇒ 删 |
+| `op_tables` 的「`O` 槽必须是指针位」 | **变强**:83 → **110** 条覆盖 |
+| R1 门 | **换源变强**:登记表差额 → **符号集 ⊆ 声明集**(能抓"新加 `.cu` 未建表") |
+
+#### 15.15.6 验收(全部实测)
+
+| 项 | 数字 |
+|---|---|
+| `list.rs` | 842 → **401 行**;代码面 `REGISTRY`/`Entry`/`registry_source` 引用 **0** |
+| boot 报告 | `算子准入:已声明 **127** 张(原生表 + 家族臂 11)/ 编出符号 **119** 条(未声明 **0**)` |
+| 门 | lib **61/61** · op_tables **7/7**(110 张表逐参互证)· oracles 8/8 · no_runtime_compile 2/2 |
+| models / shared | **117/117** · 27/27 |
+| clippy / workspace check | **0 警** / 0 错 |
+| **GPU** | cubin_launch + 8 套探针全绿(9 套 EXIT=0) |
+| **真机 boot** | `--flavor spec-dflash` → 白名单 **44 项**生效 → `Captured` → 一句话问候连贯 |
+
+#### 15.15.7 剩余(未做)
+
+- 4 条 `owl_naive_attn_nc_*_knhd` 死变体(0 调用点):候选**从 `.cu` 删除**(资产不养死码),需重编 + 数值回归;
+- `Kernel`/`LaunchShape` 值类型与 `kernel_with` 字符串路径仍是**遗留**(driver 拾取是正路,§P3 的迁移尾账),`sig` 逃生舱字段待逃生舱核清零后一并删。

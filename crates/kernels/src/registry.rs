@@ -322,23 +322,22 @@ impl OpRegistry {
         // 准入索引(纯元数据,与发射路由无关)
         let metas: std::collections::HashMap<_, _> =
             crate::ops::all().map(|m| (m.entry, m)).collect();
-        let native_unbuilt = crate::list::REGISTRY
-            .iter()
-            .filter(|e| !metas.contains_key(e.name))
-            .count();
-        let foreign_unbuilt = names.iter().filter(|n| !metas.contains_key(**n)).count();
+        // F 轮(2026-10-13):登记表退役 ⇒ 唯一真源 = 声明面。boot 报告改为
+        // 三件事:**声明表张数 / 家族臂数 / 编出但未声明的符号数**(后者是
+        // 新的 R1 判据:构建期符号集 ⊆ 声明集)。
+        let n_declared = crate::ops::declared_count();
+        let n_family = names.len();
+        let undeclared = crate::ops::undeclared_symbols();
         eprintln!(
-            "[kernels] 算子准入:已建表 {} / 原生登记 {}(未声明 {})/ 家族臂 {}(未声明 {})",
-            metas.len(),
-            crate::list::REGISTRY.len(),
-            native_unbuilt,
-            names.len(),
-            foreign_unbuilt
+            "[kernels] 算子准入:已声明 {} 张(原生表 + 家族臂 {})/ 编出符号 {} 条(未声明 {})",
+            n_declared,
+            n_family,
+            crate::list::ASSET_SYMBOLS.iter().map(|(_, s)| s.len()).sum::<usize>(),
+            undeclared.len()
         );
-        if native_unbuilt > 0 {
-            // R1 进度(用户裁决:凡是用到都必须有声明):未声明清单要可数、可见
-            let und = crate::ops::undeclared();
-            eprintln!("[kernels] R1 未声明算子 {} 条:{}", und.len(), und.join(" "));
+        if !undeclared.is_empty() {
+            // R1(F 轮换源:编出的符号 ⊆ 声明集)—— 未声明清单要可数、可见
+            eprintln!("[kernels] R1 编出但未声明的核符号 {} 条:{undeclared:?}", undeclared.len());
         }
         // 装配期自检(设计 §5.5:独立 oracle,失败 = 拒启)。
         // 白名单在场 ⇒ 只跑生效算子(装配期成本按档位裁);否则跑全部已建表。

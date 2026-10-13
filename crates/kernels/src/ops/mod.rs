@@ -81,14 +81,16 @@ pub fn meta(name: &str) -> Option<&'static KernelMeta> {
 /// 解析序(**单一实现**住本函数,`list::source` 只是兼容转发):
 /// 1. **已建表** ⇒ `KernelMeta::SOURCE`(就地 `include_str!`,R5 —— 算子
 ///    自托管面是它的唯一住址);
-/// 2. **仅引入**(未建表)⇒ 登记表 [`crate::list::REGISTRY`] —— 它只有那一个
-///    住址,故不是第二份抄写;待 R1 建表补齐,本分支随登记表一起退役。
 ///
-/// 名字查不到 = 编程错误(拼错名),panic 带登记提示。
+/// **F 轮(2026-10-13)后无兜底**:登记表已退役,声明面是唯一真源 ⇒
+/// 名字查不到 = 未准入 = 编程错误 —— 拼错名或漏建表,直接 panic 点名。
 pub fn source(name: &str) -> &'static str {
     match meta(name) {
         Some(m) => m.src,
-        None => crate::list::registry_source(name),
+        None => panic!(
+            "ops::source({name:?}): 无该算子的准入声明 —— 新核须先在 `cu/` 加源 \
+             并在 `ops/<域>.rs` 建表(登记表已退役,见设计 §15.15)"
+        ),
     }
 }
 
@@ -97,23 +99,49 @@ pub fn built_count() -> usize {
     TABLES.iter().map(|t| t.len()).sum()
 }
 
-/// **未声明算子**(R1 进度表 / 未来执法面):登记表里有、但没有 `impl KernelSpec`
-/// 的 native 入口。
+/// **编出来但没有声明的核符号**(R1 判据,F 轮换源)。
 ///
-/// 为什么单列一个函数:**"引入 vs 启用"的硬界要可数**。R1 规则(用户裁决
-/// 2026-10-13)= 任何算子被发射前必须有声明 —— 本函数就是"还没达标"的清单,
-/// boot 报告它、测试锁它;等它归零,就把"无声明 ⇒ 拒发射"打开。
-pub fn undeclared() -> Vec<&'static str> {
-    crate::list::REGISTRY
+/// 旧判据 = 登记表差额(110 − 已建表);F 轮登记表退役后换成
+/// **构建期实际编出的符号集 ⊆ 声明集** —— 更贴 R1 本意:凡编出来的核都必须
+/// 有 `impl KernelSpec`。**新增 `.cu` 而忘了建表**会被本函数当场抓住
+/// (旧判据抓不到:它要求人先去登记表登记一条)。
+/// **家族私有核**(编出来但**不走算子准入面**的辅助核:家族装配期按名装载,
+/// 不经 `KernelSpec` 的发射路由)。R1 符号门据此豁免 —— **每条必须写理由**,
+/// 且门会校验它确实在符号清单里(登错名 = 红)。
+///
+/// 与"算子"的界:算子有准入声明(参数表/池/律)且经 registry 路由;私有核
+/// 只是某个家族自己的编排零件,消费者是那个家族的 `assemble`。
+pub const FAMILY_PRIVATE: &[(&str, &str)] = &[
+    // §15.7:gdn_scalar 家族的单核(FLA chunk_scalar;exec.load_aot 按名装载)
+    ("cu/gdn/gdn_chunk_scalar.cu", "owl_gdn_chunk_scalar_f32"),
+    // gdn_chunked 装配期的状态布局转置 [HV,K,V] ↔ [HV,V,K]
+    ("cu/gdn/state_transpose.cu", "owl_state_kv_to_vk"),
+    ("cu/gdn/state_transpose.cu", "owl_state_vk_to_kv"),
+];
+
+pub fn undeclared_symbols() -> Vec<(&'static str, &'static str)> {
+    // 防呆:册上每条都必须在符号清单里(改名/删核后忘了清册 = 红)
+    for (id, sym) in FAMILY_PRIVATE {
+        assert!(
+            crate::list::ASSET_SYMBOLS.iter().any(|(i, s)| i == id && s.contains(sym)),
+            "FAMILY_PRIVATE 登记了不存在的符号:{id} :: {sym}(改名/删核后请同步清册)"
+        );
+    }
+    undeclared_symbols_raw()
+}
+
+fn undeclared_symbols_raw() -> Vec<(&'static str, &'static str)> {
+    crate::list::ASSET_SYMBOLS
         .iter()
-        .filter(|e| meta(e.name).is_none())
-        .map(|e| e.name)
+        .flat_map(|(id, syms)| syms.iter().map(move |s| (*id, *s)))
+        .filter(|(_, s)| meta(s).is_none())
+        .filter(|(id, s)| !FAMILY_PRIVATE.iter().any(|(i, x)| i == id && x == s))
         .collect()
 }
 
-/// 登记表条数(声明覆盖率的分母)
-pub fn registered_count() -> usize {
-    crate::list::REGISTRY.len()
+/// 声明表条数(唯一真源;旧"登记表条数"已退役)
+pub fn declared_count() -> usize {
+    TABLES.iter().map(|t| t.len()).sum()
 }
 
 // ============================================================================

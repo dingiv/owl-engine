@@ -70,6 +70,13 @@ pub fn is_foreign(name: &str) -> bool {
 /// 取用面返回 `Option`:缺 = 装配期**结构化拒启**(不 panic;见
 /// `server/gdn_chunked.rs::assemble`)。构建期缺失只可能来自
 /// `GDN_TRITON_BUILD=0`(显式关)或脚本失败。
+/// 家族**私有核**的源常量(不走算子准入面:装配期按名装载的辅助核)。
+/// F 轮后不再寄生在登记表 §0 —— 就近住在消费它的家族模块里。
+pub mod asset {
+    /// GDN 状态布局转置 `[HV,K,V] ↔ [HV,V,K]`(f32)
+    pub const STATE_TRANSPOSE: &str = "cu/gdn/state_transpose.cu";
+}
+
 pub mod cubins {
     #[cfg(feature = "device")]
     fn asset(name: &'static str) -> Option<&'static [u8]> {

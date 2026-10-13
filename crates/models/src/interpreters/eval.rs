@@ -476,11 +476,13 @@ where
                 }
             };
             // 以下 = 统一发射面(登记表 dtype 守门 + alloc + lower + launch)
-            if let Some(e) = crate::kernel::lookup(kernel.name) {
-                if e.dtype != dtype {
+            // dtype 守门(F 轮):口径 = **算子声明的输出槽 dtype**(原登记表
+            // `Entry.dtype` 的等价物,已从声明面派生)
+            if let Some(od) = crate::kernel::lookup(kernel.name).and_then(|m| m.out_dtype()) {
+                if od != dtype {
                     return Err(ModelError::Msg(format!(
-                        "[dtype 守门] kernel \"{}\" 登记为 {:?},声明为 {:?}\n{}",
-                        kernel.name, e.dtype, dtype,
+                        "[dtype 守门] kernel \"{}\" 声明输出为 {:?},实得 {:?}\n{}",
+                        kernel.name, od, dtype,
                         std::backtrace::Backtrace::force_capture()
                     )));
                 }

@@ -121,7 +121,11 @@ fn symbols_of(text: &str) -> Vec<String> {
     while let Some(p) = rest.find("__global__ void ") {
         rest = &rest[p + "__global__ void ".len()..];
         let name: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
-        if !name.is_empty() && rest[name.len()..].trim_start().starts_with('(') {
+        // 全大写 = 宏形参(宏体里 `void NAME(...)` 形态),不是核名 —— 真核名含小写
+        if !name.is_empty()
+            && rest[name.len()..].trim_start().starts_with('(')
+            && name.chars().any(|c| c.is_ascii_lowercase())
+        {
             out.push(name);
         }
     }
