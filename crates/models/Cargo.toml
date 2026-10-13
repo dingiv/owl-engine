@@ -29,6 +29,11 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 half = "2"
 tokio = { version = "1", features = ["rt"] }
 
+[features]
+# 性能/日志框架:release 也展开计时宏与日志宏(见 docs/arch/perf-framework.md)
+perf = ["owl-shared/perf"]
+log = ["owl-shared/log"]
+
 [dev-dependencies]
 # 样例的 async 运行时(CPU face 即测即用;GPU face 经 owl-cuda actor 消化阻塞)
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

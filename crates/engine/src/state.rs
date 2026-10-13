@@ -187,7 +187,7 @@ impl StatePool {
         let t = std::time::Instant::now();
         let n_full = layer_types.iter().filter(|&&f| f).count();
         let n_gdn = layer_types.len() - n_full;
-        eprintln!("[boot] StatePool::alloc 进入(n_full={n_full} kv_fp8={kv_fp8})");
+        owl_shared::log_info!("boot", "StatePool::alloc 进入(n_full={n_full} kv_fp8={kv_fp8})");
 
         // B6.5 显存硬预算治理(2026-10-10):池容量 =
         // min(手工上限, (target×total − live − reserve)/每 token 字节)。
@@ -211,8 +211,7 @@ impl StatePool {
                 - fixed_after as i64
                 - owl_shared::vram::live_bytes() as i64;
             let cap = (budget.max(0) as u64 / per_tok_bytes.max(1) as u64) as usize;
-            eprintln!(
-                "[boot] vram 治理:total={:.1}G free={:.2}G live={:.1}G target={:.0}% reserve={}MB fixed_after={:.2}G budget={:.2}G per_tok={}B → 池上限 {} tok(manual={})",
+            owl_shared::log_info!("boot", "vram 治理:total={:.1}G free={:.2}G live={:.1}G target={:.0}% reserve={}MB fixed_after={:.2}G budget={:.2}G per_tok={}B → 池上限 {} tok(manual={})",
                 vram_total as f64 / 1073741824.0,
                 owl_shared::vram::free_bytes() as f64 / 1073741824.0,
                 owl_shared::vram::live_bytes() as f64 / 1073741824.0,
@@ -424,8 +423,7 @@ impl StatePool {
             owl_models::env::KvQuant::Fp8E4M3 => "kv fp8 e4m3",
             owl_models::env::KvQuant::None => "kv f16",
         };
-        eprintln!(
-            "[boot] 状态块分配 {:.2}s({kv_label} ×{} / gdn ×{},会话容量 {},池 {nb} 页 × {page} tok,页表 nb = {nb},dflash = {df})",
+        owl_shared::log_info!("boot", "状态块分配 {:.2}s({kv_label} ×{} / gdn ×{},会话容量 {},池 {nb} 页 × {page} tok,页表 nb = {nb},dflash = {df})",
             t.elapsed().as_secs_f32(),
             kvs.len(),
             gdns.len(),
@@ -773,7 +771,7 @@ impl StatePool {
             face.dtoh(&g.rec.0, &mut buf).await?;
             let seg = &buf[gdn_slot * row_elems * 4..(gdn_slot + 1) * row_elems * 4];
             let nz = seg.iter().filter(|&&b| b != 0).count();
-            eprintln!("[gdn-dbg] reset_gdn slot={gdn_slot} rec非零字节={nz}/{}", seg.len());
+            owl_shared::log_debug!("gdn-dbg", "reset_gdn slot={gdn_slot} rec非零字节={nz}/{}", seg.len());
         }
         Ok(())
     }

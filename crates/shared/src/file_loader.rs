@@ -58,6 +58,16 @@ pub fn open(path: impl AsRef<Path>) -> Result<File> {
     File::open(path)
 }
 
+/// 追加模式开句柄(日志落盘;不存在则建)
+pub fn append(path: impl AsRef<Path>) -> Result<File> {
+    std::fs::OpenOptions::new().create(true).append(true).open(path)
+}
+
+/// 重命名(日志 rotation;跨设备会 Err,调用方处理)
+pub fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<()> {
+    std::fs::rename(from, to)
+}
+
 /// 路径拼接便利(调用点免 `PathBuf::from(x).join(y)` 样板)
 pub fn join(base: impl AsRef<Path>, rest: &str) -> PathBuf {
     base.as_ref().join(rest)

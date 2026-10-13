@@ -52,7 +52,8 @@
 //! | dispatch | ~~flashinfer~~ | **已移除(2026-10-13):FI 恒启用,无开关** |
 //! | dispatch | gdn_chunked / gdn_scalar / kv_fp8 | flag / false |
 //! | dispatch | resolve_trace / host_argmax / ts_probe | flag / false |
-//! | probes | step_profile / gdn_dump / debug / prefill_cksum / fact_probe | flag / false |
+//! | probes | step_profile / perf_level / gdn_dump / debug / prefill_cksum / fact_probe | flag / false |
+//! | log | level / tags_allow / tags_deny / file / max_mb / keep / timestamp | 见模块 |
 //! | probes | trace_gate / dflash_probe / propose_eager | flag / false |
 //! | probes | dflash_eager / dflash_noencode / dflash_dumb | flag / false |
 //! | probes | gdn_dump_all / pf_bisect / pf_fin_check / raw_completion | flag / false |
@@ -267,11 +268,82 @@ pub struct DispatchCfg {
     pub allowed_ops: Option<Vec<String>>,
 }
 
+/// 性能框架分级(映射到 `owl_shared::metrics::level`;见
+/// docs/arch/perf-framework.md §一)。`off` = 零成本基线对照臂。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PerfLevel {
+    Off,
+    Counters,
+    #[default]
+    Host,
+    Gpu,
+}
+
+impl PerfLevel {
+    pub fn to_u8(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::Counters => 1,
+            Self::Host => 2,
+            Self::Gpu => 3,
+        }
+    }
+}
+
+/// 日志级别(映射到 `owl_shared::log::Level`;`off` = 静音)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Off,
+    Error,
+    #[default]
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    pub fn to_u8(self) -> u8 {
+        match self {
+            Self::Off => crate::log::LVL_OFF,
+            Self::Error => crate::log::LVL_ERROR,
+            Self::Warn => crate::log::LVL_WARN,
+            Self::Info => crate::log::LVL_INFO,
+            Self::Debug => crate::log::LVL_DEBUG,
+            Self::Trace => crate::log::LVL_TRACE,
+        }
+    }
+}
+
+/// 日志面(logger 框架;模块头见 `crates/shared/src/log.rs`)
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LogCfg {
+    /// 级别阈值(off/error/warn/info/debug/trace;**缺省 warn**)
+    pub level: LogLevel,
+    /// tag 前缀白名单(空 = 全放行)
+    pub tags_allow: Vec<String>,
+    /// tag 前缀黑名单(优先于白名单)
+    pub tags_deny: Vec<String>,
+    /// tee 落盘路径(None = 仅 stderr)
+    pub file: Option<std::path::PathBuf>,
+    /// 单文件上限 MiB(0 = 不 rotation)
+    pub max_mb: u64,
+    /// rotation 保留份数
+    pub keep: usize,
+    /// 前置 `2026-10-14T00:12:33.123Z ` 时间戳
+    pub timestamp: bool,
+}
+
 /// 诊断探针族(全域布尔;boot 一次解析,热路径零 env)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProbesCfg {
     pub step_profile: bool,
+    /// 性能分级(off/counters/host/gpu;缺省 host = 历史行为)
+    pub perf_level: PerfLevel,
     pub gdn_dump: bool,
     pub debug: bool,
     pub prefill_cksum: bool,
@@ -352,6 +424,7 @@ pub struct OwlConfig {
     pub cuda: CudaCfg,
     pub graph: GraphCfg,
     pub server: ServerCfg,
+    pub log: LogCfg,
 }
 
 impl Default for RuntimeCfg {

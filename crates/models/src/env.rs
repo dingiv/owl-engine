@@ -238,6 +238,38 @@ pub struct GdnEnv {
     pub fused_decode_v2: bool,
 }
 
+/// 解释器求值阶段(性能面定相;docs/arch/perf-framework.md §四)。
+///
+/// 用途:性能钩子的 tag 前缀段 —— `interp.host.node.<phase>.<class>`。
+/// 定相不靠线程栈(span 跨 await 有错位风险),而由引擎逐相位赋值。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EvalPhase {
+    /// 未定相(eager 诊断、测试、装载面)
+    #[default]
+    Unk,
+    /// 预填充 chunk
+    Prefill,
+    /// 裸 decode 步
+    Decode,
+    /// 投机轮(verify + propose/encode)
+    Spec,
+    /// 装载域(权重转换/repack)
+    Load,
+}
+
+impl EvalPhase {
+    /// tag 前缀段(有界词表)
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Unk => "unk",
+            Self::Prefill => "prefill",
+            Self::Decode => "decode",
+            Self::Spec => "spec",
+            Self::Load => "load",
+        }
+    }
+}
+
 /// 解释器执行环境完备描述(默认 = 生产基线 + 无硬件环境)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EnvProvider {
@@ -248,6 +280,15 @@ pub struct EnvProvider {
     pub kv: KvEnv,
     pub attn: AttnEnv,
     pub diag: DiagEnv,
+    /// 求值阶段(性能面定相;不影响计算语义)
+    pub phase: EvalPhase,
+}
+
+impl EnvProvider {
+    /// 阶段切换(值语义;引擎逐相位赋值 —— 显式依赖律)
+    pub fn with_phase(self, p: EvalPhase) -> Self {
+        Self { phase: p, ..self }
+    }
 }
 
 

@@ -19,6 +19,96 @@ use std::pin::Pin;
 use super::observe::{BlockRef, BlockStats, NodeEvent, Tap, Want};
 
 // ============================================================================
+// §0 性能钩子(perf-framework.md §四)
+// ============================================================================
+//
+// 解释器是全部节点的唯一执行口 ⇒ 「每个算子的宿主耗时 + 调用树」一处声明、
+// 全图生效。钩子≈只读:不改变计算、不新增 launch/alloc。
+//
+// 两道门:①编译期(debug 或 feature `perf`;不带 = 空语句零成本)
+//         ②运行期 level(eval 入口读一次存入 [`PerfCtx`],热路径零全局查询)
+//
+// tag 律:`interp.host.<面>.<phase>.<class>`,class = 核名(登记表有界集)
+// 或内建类;phase 由 [`crate::env::EvalPhase`] 定相。
+
+/// 热路径性能面(值语义;入口一次性组装)
+#[derive(Clone, Copy)]
+struct PerfCtx {
+    /// 运行期分级(见 `metrics::level`)
+    level: u8,
+    /// 阶段 tag 段(`unk`/`prefill`/`decode`/`spec`/`load`)
+    phase: &'static str,
+}
+
+impl Default for PerfCtx {
+    fn default() -> Self {
+        Self { level: owl_shared::metrics::level::OFF, phase: "unk" }
+    }
+}
+
+impl PerfCtx {
+    fn of(env: &crate::env::EnvProvider) -> Self {
+        // 非 perf 构建:`PERF_BUILD = false` 常量折叠 → 本函数空转
+        if !owl_shared::metrics::PERF_BUILD {
+            return Self::default();
+        }
+        Self { level: owl_shared::metrics::level(), phase: env.phase.tag() }
+    }
+
+    /// HOST 级以上(计时准入;非 perf 构建 = 常量假)
+    #[inline]
+    fn host(self) -> bool {
+        owl_shared::metrics::PERF_BUILD && self.level >= owl_shared::metrics::level::HOST
+    }
+}
+
+/// 样本落账(直用 API:不经宏,故 release 亦有效)
+#[inline]
+fn perf_rec(tag: &str, dur: std::time::Duration) {
+    owl_shared::metrics::with_metrics_store(|s| s.timer_record_tag(tag, dur, file!(), line!()));
+}
+
+/// 计数落账
+#[inline]
+fn perf_cnt(tag: &str, n: u64) {
+    owl_shared::metrics::with_metrics_store(|s| s.counter_add(tag, n, file!(), line!()));
+}
+
+/// 分段秒表(`Call` 臂宿主链分段:resolve/build/alloc/lower/launch)
+struct LapTimer {
+    at: std::time::Instant,
+}
+
+impl LapTimer {
+    #[inline]
+    fn start() -> Self {
+        Self { at: std::time::Instant::now() }
+    }
+    /// 落上一段账并重置
+    #[inline]
+    fn lap(&mut self, tag: &str) {
+        let now = std::time::Instant::now();
+        perf_rec(tag, now.saturating_duration_since(self.at));
+        self.at = now;
+    }
+}
+
+/// 算子类名(有界词表;`Call` 臂在 resolve 后用核名覆写)
+fn builtin_class(op: &Op) -> &'static str {
+    match op {
+        Op::Htod { .. } => "htod",
+        Op::Zeros => "zeros",
+        Op::Block { .. } => "block",
+        Op::Reshape | Op::SliceView { .. } => "view",
+        Op::SlotWrite => "slot_write",
+        Op::Matmul | Op::MatmulNt => "gemm",
+        Op::Call { .. } => "call",
+        #[allow(unreachable_patterns)]
+        _ => "other",
+    }
+}
+
+// ============================================================================
 // §1 异步解释器:eval(层入口)/ eval_ops(树归约;引擎主路径)
 // ============================================================================
 
@@ -90,11 +180,12 @@ where
     D: crate::contract::DeviceClient + 'a,
 {
     Box::pin(async move {
+        let perf = PerfCtx::of(&env);
         let mut ctx =
             EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new(),
                 arena_set: std::collections::HashSet::new(),
                 block_users: std::collections::HashMap::new(),
-                pending: std::collections::HashMap::new(), reclaim: false, env };
+                pending: std::collections::HashMap::new(), reclaim: false, perf, env };
         let root = _eval_rec(t, &mut ctx).await?;
         // 非 scoped 口径:竞技场原样丢弃(块常驻,历史行为不变)
         Ok(root)
@@ -139,11 +230,12 @@ where
     D: crate::contract::DeviceClient + 'a,
 {
     Box::pin(async move {
+        let perf = PerfCtx::of(&env);
         let mut ctx =
             EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new(),
                 arena_set: std::collections::HashSet::new(),
                 block_users: std::collections::HashMap::new(),
-                pending: count_pending(t), reclaim: std::env::var("OWL_NO_RECLAIM").is_err(), env };
+                pending: count_pending(t), reclaim: std::env::var("OWL_NO_RECLAIM").is_err(), perf, env };
         let root = _eval_rec(t, &mut ctx).await?;
         let mut candidates = std::mem::take(&mut ctx.arena);
         candidates.retain(|id| *id != root.id && ctx.arena_set.contains(id));
@@ -176,11 +268,12 @@ where
     D: crate::contract::DeviceClient + 'a,
 {
     Box::pin(async move {
+        let perf = PerfCtx::of(&env);
         let mut ctx =
             EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new(),
                 arena_set: std::collections::HashSet::new(),
                 block_users: std::collections::HashMap::new(),
-                pending: std::collections::HashMap::new(), reclaim: false, env };
+                pending: std::collections::HashMap::new(), reclaim: false, perf, env };
         let mut out = Vec::with_capacity(roots.len());
         for r in roots {
             out.push(_eval_rec(r, &mut ctx).await?);
@@ -210,11 +303,12 @@ where
                 *pending.entry(id).or_insert(0) += c;
             }
         }
+        let perf = PerfCtx::of(&env);
         let mut ctx =
             EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new(),
                 arena_set: std::collections::HashSet::new(),
                 block_users: std::collections::HashMap::new(),
-                pending, reclaim: true, env };
+                pending, reclaim: true, perf, env };
         let mut out = Vec::with_capacity(roots.len());
         for r in roots {
             out.push(_eval_rec(r, &mut ctx).await?);
@@ -241,11 +335,13 @@ where
     D: crate::contract::DeviceClient + 'a,
 {
     Box::pin(async move {
+        let env = crate::env::EnvProvider::default();
+        let perf = PerfCtx::of(&env);
         let mut ctx =
-            EvalCtx { face, memo: std::collections::HashMap::new(), tap: Some(tap), arena: Vec::new(), env: crate::env::EnvProvider::default(),
+            EvalCtx { face, memo: std::collections::HashMap::new(), tap: Some(tap), arena: Vec::new(), env,
                 arena_set: std::collections::HashSet::new(),
                 block_users: std::collections::HashMap::new(),
-                pending: std::collections::HashMap::new(), reclaim: false };
+                pending: std::collections::HashMap::new(), reclaim: false, perf };
         _eval_rec(t, &mut ctx).await
     })
 }
@@ -268,6 +364,8 @@ struct EvalCtx<'a, D> {
     pending: std::collections::HashMap<u64, usize>,
     /// 活性中途回收开关(scoped = true;plain/tap 保历史语义)
     reclaim: bool,
+    /// 性能面(level 入口读一次;热路径零全局查询)
+    perf: PerfCtx,
     /// 解释器执行环境(EnvProvider;默认 = Cpu + 生产基线 —— Call 臂
     /// 对 Cpu 回退 face.op_env() 旧径,存量调用点零迁移)
     env: crate::env::EnvProvider,
@@ -335,6 +433,12 @@ where
     // kernel(conv/delta)执行两遍,第二遍读到滑过的状态 → 语义破坏。
     // memo 键 = 节点 id(全局自增,克隆保留 → 同节点 = 同值)。
     if let Some(b) = ctx.memo.get(&t.id) {
+        // 性能面:CSE 命中 = 白赚的节点(无计时样本 → counter 记)
+        if owl_shared::metrics::PERF_BUILD
+            && ctx.perf.level >= owl_shared::metrics::level::COUNTERS
+        {
+            perf_cnt("interp.count.cse_hit", 1);
+        }
         return Ok(b.clone());
     }
     if let Some(e) = &t.err {
@@ -386,6 +490,14 @@ where
     let n_elems: usize = shape.iter().product::<usize>();
     let n_bytes = n_elems * dtype.size_bytes();
 
+    // ── 性能面:本节点**排他**宿主计时 ─────────────────────────────
+    // 起表点在本行(父递归/ins 构造已完成)⇒ 样本 = 该节点自身的宿主成本;
+    // 包住子节点的账留给外层(调用树由报告按 tag 层次承担)。
+    let perf = ctx.perf;
+    let t_node = if perf.host() { Some(std::time::Instant::now()) } else { None };
+    // 类名先按内建词表;`Call` 臂 resolve 后用**核名**覆写(登记表有界集)
+    let mut class: &'static str = builtin_class(&t.op);
+
     let out: Bytes = match &t.op {
         Op::Htod { bytes } => {
             let b = ctx.face.htod(dtype, &shape, bytes).await?;
@@ -428,6 +540,8 @@ where
             out
         }
         Op::Call { op, aux } => {
+            // 性能面:宿主链分段(选核 / 构件 / 分配 / 线格式构造 / 发射)
+            let mut lap = if perf.host() { Some(LapTimer::start()) } else { None };
             // 硬件感知拾取(被动律):环境必传 —— hw 自 face(引擎感知),
             // page 自页策略单源;kernels/解释器零探测。CPU face 无环境 =
             // 结构化"需 GPU server"(与 Kernel 节点 CPU 口径同)。
@@ -458,6 +572,10 @@ where
                 aux,
                 scalars: &scalars,
             });
+            if let Some(l) = lap.as_mut() {
+                l.lap("interp.host.seg.resolve");
+            }
+            class = pick.name; // 类名 = 核名(报告里与图材料单同词表)
             if ctx.env.diag.resolve_trace {
                 eprintln!("[call] {:?} -> {} grid={:?} block={:?} smem={} n_elems={}",
                     op, pick.name, pick.shape.grid, pick.shape.block, pick.shape.smem, n_elems);
@@ -487,10 +605,22 @@ where
                     )));
                 }
             }
+            if let Some(l) = lap.as_mut() {
+                l.lap("interp.host.seg.build");
+            }
             let out = ctx.face.alloc_uninit(dtype, n_elems).await?;
+            if let Some(l) = lap.as_mut() {
+                l.lap("interp.host.seg.alloc");
+            }
             ctx.track_new(out.id);
             let msg = crate::ops::lower_kernel(&kernel, &t.args, &ins, &out, n_elems);
+            if let Some(l) = lap.as_mut() {
+                l.lap("interp.host.seg.lower");
+            }
             ctx.face.launch(msg).await?;
+            if let Some(l) = lap.as_mut() {
+                l.lap("interp.host.seg.launch");
+            }
             out
         }
         Op::SlotWrite => { ctx.track_alias(vals[0].id); vals[0].clone() }
@@ -498,6 +628,13 @@ where
         other => return Err(ModelError::Msg(format!("eval 未覆盖: {other:?}"))),
     };
     ctx.memo.insert(t.id, out.clone());
+    // ── 性能面:本节点账落地(排他宿主时;tag = interp.host.node.<phase>.<class>)──
+    if let Some(t0) = t_node {
+        perf_rec(
+            &format!("interp.host.node.{}.{}", perf.phase, class),
+            t0.elapsed(),
+        );
+    }
     // ── 活性中途回收(2026-10-02;scoped 独占;在 Tap 窗口后 —— 观测窗
     // 律要求父输入窗口内存活)── 逐父递减剩余消费者数;计零 = 节点死亡
     // → memo 摘除 + 块归属减一;归零且竞技场原生且非本节点输出(透传

@@ -13,3 +13,18 @@ owl-iface = { path = "../backends/iface" }
 # 纯 Rust 链 toml→toml_edit→winnow,零系统依赖)
 serde = { workspace = true }
 toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
+
+[features]
+# **默认开日志面**(2026-10-14 用户裁决):不开 feature 的 release 里
+# 五级日志宏全是空语句 —— 默认构建要带日志,故入 default。
+# 想要「编译期逐字节静默」的包:把依赖改成 default-features = false,
+# 或运行时 [log] level = "off"。
+default = ["log"]
+
+# 性能框架(docs/arch/perf-framework.md):计时宏在 **release** 也可展开。
+# 不带本 feature = 生产二进制逐字节零成本(宏仍只在 debug 展开);
+# `cargo build --release -p server --features perf` = 基准二进制。
+perf = []
+# logger 框架(docs/arch/log-framework.md / log.rs 模块头):五级日志宏的
+# 编译期门。**不开时五级全是空语句**(编译期剔除,零运行时)。
+log = []

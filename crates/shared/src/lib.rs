@@ -13,12 +13,16 @@
 //!   config loader 的底层;应用代码勿直用 —— 走 [`config`]);
 //! - [`file_loader`]:文件读写统一入口(std::fs 薄包装,未来统一
 //!   控制点留口;应用运行时文件 I/O 一律经此;build.rs 例外)。
+//! - [`log`]:**logger 框架**(2026-10-14;与 metrics 同风格、不同定位 ——
+//!   事件流 vs 数值账;宏风格 log_info!/… + feature `log` 编译期门 + 运行期
+//!   级别/tag 过滤 + tee 落盘与 rotation)。
 
 pub use owl_iface::signal;
 
 pub mod config;
 pub mod env_reader;
 pub mod file_loader;
+pub mod log;
 pub mod metrics;
 pub mod slab_hint;
 pub mod vram;

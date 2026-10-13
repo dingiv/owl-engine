@@ -283,7 +283,7 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
     let turn = match sink_rx.recv().await {
         Some(SinkEvent::Accepted { session, turn, prompt_tokens }) => {
             usage.prompt = prompt_tokens;
-            eprintln!("[chat] 受理 session {session:#x} turn {turn}(stream={})", mode == ReplyMode::Stream);
+            owl_shared::log_info!("chat", "受理 session {session:#x} turn {turn}(stream={})", mode == ReplyMode::Stream);
             Some((session, turn))
         }
         Some(SinkEvent::Rejected { err }) => {
@@ -346,7 +346,7 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
                             http::sse_data(w, &u.to_string()).await?;
                         }
                         http::sse_data(w, "[DONE]").await?;
-                        eprintln!("[chat] turn {:?} 完成:{}", turn.map(|(_, t)| t), preview(&text));
+                        owl_shared::log_info!("chat", "turn {:?} 完成:{}", turn.map(|(_, t)| t), preview(&text));
                         Ok(())
                     }
                     ReplyMode::Aggregate => {
@@ -367,10 +367,10 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
                     ReplyMode::Stream => {
                         // 客户端可能已断开(写失败属正常),但不许静默(律 #1)
                         if let Err(e) = http::sse_data(w, &error_json(err).to_string()).await {
-                            eprintln!("[chat] 流式错误帧写失败(客户端可能已断开): {e}");
+                            owl_shared::log_info!("chat", "流式错误帧写失败(客户端可能已断开): {e}");
                         }
                         if let Err(e) = http::sse_data(w, "[DONE]").await {
-                            eprintln!("[chat] 流式收尾帧写失败(客户端可能已断开): {e}");
+                            owl_shared::log_info!("chat", "流式收尾帧写失败(客户端可能已断开): {e}");
                         }
                         Ok(())
                     }

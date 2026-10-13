@@ -58,7 +58,7 @@ pub fn kv_manifest_gate(
             crate::env::KvQuant::Fp8E4M3 => "flashinfer_prefill_paged_fp8kv",
             _ => "flashinfer_prefill_paged_f16",
         };
-        eprintln!("[kv-manifest] FI prefill = {fi_name}(server plan 路径,适配器自校验)");
+        owl_shared::log_info!("kv-manifest", "FI prefill = {fi_name}(server plan 路径,适配器自校验)");
     }
     let mut bad: Vec<&str> = Vec::new();
     for name in &family {
@@ -77,8 +77,7 @@ pub fn kv_manifest_gate(
             "kv_manifest_gate(quant={quant:?}): 清单内核缺失或 .cu 源无定义: {bad:?} —— 池 dtype 改造漏网(pitfall §14 写者穷举律)"
         )));
     }
-    eprintln!(
-        "[kv-manifest] quant={quant:?} fi={fi_on}:{} 族内核全部在场 ✓",
+    owl_shared::log_info!("kv-manifest", "quant={quant:?} fi={fi_on}:{} 族内核全部在场 ✓",
         family.len()
     );
     Ok(())

@@ -127,7 +127,7 @@ pub(crate) fn open_raw_index(
     for p in paths {
         let t0 = std::time::Instant::now();
         let mmap = Mmap::open(&p)?;
-        eprintln!("[st] {p:?} mmap {}MB ({:.1?})", mmap.len() / 1_000_000, t0.elapsed());
+        owl_shared::log_info!("st", "{p:?} mmap {}MB ({:.1?})", mmap.len() / 1_000_000, t0.elapsed());
         let map_ix = maps.len();
         let base = mmap.as_ptr() as usize;
         let st = safetensors::SafeTensors::deserialize(&mmap)

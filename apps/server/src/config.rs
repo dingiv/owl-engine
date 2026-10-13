@@ -27,6 +27,15 @@ pub struct CliArgs {
     pub flavor: Option<String>,
     /// --list-flavors:列出可用预设后退出
     pub list_flavors: bool,
+    /// --perf-dump <PATH>:每 turn 终了覆写性能账(CSV + 同名 .json;
+    /// 见 docs/arch/perf-framework.md §三)
+    pub perf_dump: Option<PathBuf>,
+    /// --perf-level <off|counters|host|gpu>:覆盖 [probes] perf_level
+    pub perf_level: Option<String>,
+    /// --log-level <off|error|warn|info|debug|trace>:覆盖 [log] level
+    pub log_level: Option<String>,
+    /// --log-file <PATH>:覆盖 [log] file(tee 落盘)
+    pub log_file: Option<PathBuf>,
 }
 
 impl CliArgs {
@@ -45,8 +54,36 @@ impl CliArgs {
                     );
                 }
                 "--list-flavors" => out.list_flavors = true,
+                "--perf-dump" => {
+                    out.perf_dump = Some(PathBuf::from(
+                        it.next().ok_or("--perf-dump 需要路径(CSV 基名;同名 .json 一并写)")?,
+                    ));
+                }
+                "--perf-level" => {
+                    let v = it.next().ok_or("--perf-level 需要值(off|counters|host|gpu)")?;
+                    if owl_shared::metrics::level::parse(&v).is_none() {
+                        return Err(format!("--perf-level 非法值 {v:?}(off|counters|host|gpu)"));
+                    }
+                    out.perf_level = Some(v);
+                }
+                "--log-level" => {
+                    let v = it.next().ok_or("--log-level 需要值(off|error|warn|info|debug|trace)")?;
+                    if owl_shared::log::Level::parse_threshold(&v).is_none() {
+                        return Err(format!(
+                            "--log-level 非法值 {v:?}(off|error|warn|info|debug|trace)"
+                        ));
+                    }
+                    out.log_level = Some(v);
+                }
+                "--log-file" => {
+                    out.log_file = Some(PathBuf::from(
+                        it.next().ok_or("--log-file 需要路径(tee:stderr + 文件)")?,
+                    ));
+                }
                 _ if a.starts_with('-') => {
-                    return Err(format!("未知参数 {a:?}(支持:[CONFIG] --flavor <N> --list-flavors)"));
+                    return Err(format!(
+                        "未知参数 {a:?}(支持:[CONFIG] --flavor <N> --perf-dump <PATH> --perf-level <L> --log-level <L> --log-file <P> --list-flavors)"
+                    ));
                 }
                 _ => {
                     if out.config.is_some() {
@@ -83,13 +120,40 @@ pub struct ServerConfig {
     pub head_quant: owl_shared::config::HeadQuant,
     /// 最大并发请求(server.max_concurrency;默认 8;须 ≤ knobs.gdn_slots)
     pub max_concurrency: usize,
+    /// 性能账落盘基名(--perf-dump;None = 不落盘)
+    pub perf_dump: Option<PathBuf>,
+    /// 性能分级(probes.perf_level,可被 --perf-level 覆盖)
+    pub perf_level: u8,
+    /// 日志面([log] module;CLI 可覆盖 level/file)
+    pub log: owl_shared::config::LogCfg,
 }
 
 impl ServerConfig {
     /// boot 边界唯一入口:四层叠加加载 → app 面组装。
-    pub fn load(flavor: Option<&str>, file: Option<&Path>) -> Result<Self, String> {
+    /// `cli` 携带 --perf-dump / --perf-level 两个 app 面覆盖。
+    pub fn load(flavor: Option<&str>, file: Option<&Path>, cli: &CliArgs) -> Result<Self, String> {
         let cfg = OwlConfig::load(flavor, file)?;
-        Ok(Self::from_config(cfg))
+        let mut out = Self::from_config(cfg);
+        if let Some(l) = cli.perf_level.as_deref() {
+            out.perf_level =
+                owl_shared::metrics::level::parse(l).ok_or("perf-level 非法")?;
+        }
+        out.perf_dump = cli.perf_dump.clone();
+        if let Some(l) = cli.log_level.as_deref() {
+            out.log.level = match owl_shared::log::Level::parse_threshold(l) {
+                Some(v) if v == owl_shared::log::LVL_OFF => owl_shared::config::LogLevel::Off,
+                Some(v) if v == owl_shared::log::LVL_ERROR => owl_shared::config::LogLevel::Error,
+                Some(v) if v == owl_shared::log::LVL_WARN => owl_shared::config::LogLevel::Warn,
+                Some(v) if v == owl_shared::log::LVL_DEBUG => owl_shared::config::LogLevel::Debug,
+                Some(v) if v == owl_shared::log::LVL_TRACE => owl_shared::config::LogLevel::Trace,
+                Some(_) => owl_shared::config::LogLevel::Info,
+                None => return Err("--log-level 非法".into()),
+            };
+        }
+        if let Some(f) = cli.log_file.clone() {
+            out.log.file = Some(f);
+        }
+        Ok(out)
     }
 
     /// app 面组装(已加载配置 → server 形态;测试可直接喂 default/定制)
@@ -113,6 +177,9 @@ impl ServerConfig {
             prefill_chunk: cfg.runtime.prefill_chunk,
             head_quant: cfg.model.head_quant,
             max_concurrency: cfg.server.max_concurrency,
+            perf_dump: None,
+            perf_level: cfg.probes.perf_level.to_u8(),
+            log: cfg.log,
         }
     }
 }

@@ -90,8 +90,7 @@ impl AwqSource {
     pub fn open_dir(dir: &Path) -> Result<Self, ModelError> {
         let t0 = std::time::Instant::now();
         let (maps, index) = open_raw_index(dir)?;
-        eprintln!(
-            "[awq] mmap 索引 {} 项 @ {:?}(懒物化,无缓存)",
+        owl_shared::log_info!("awq", "mmap 索引 {} 项 @ {:?}(懒物化,无缓存)",
             index.len(),
             t0.elapsed()
         );
@@ -592,7 +591,7 @@ impl AwqSource {
         owl_shared::metrics::with_metrics_store(|s| {
             s.timer_record_tag(tag, t0.elapsed(), file!(), line!())
         });
-        eprintln!("[awq] 物化 {base} (out={out}, k={k}) @ {:?}", t0.elapsed());
+        owl_shared::log_info!("awq", "物化 {base} (out={out}, k={k}) @ {:?}", t0.elapsed());
         Ok(())
     }
 

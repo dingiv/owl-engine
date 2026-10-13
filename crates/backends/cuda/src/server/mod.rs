@@ -221,7 +221,7 @@ impl GpuServer {
                         Ok(reg) => self.registry = Some(reg),
                         Err(e) => {
                             // 拒启必须可见(否则只剩"族被 drop"的兜底告警,查不到原因)
-                            eprintln!("[kernels] ❌ 算子注册表装配失败(拒启): {e}");
+                            owl_shared::log_info!("kernels", "❌ 算子注册表装配失败(拒启): {e}");
                             return Err(format!("算子注册表装配失败(拒启): {e}"));
                         }
                     }
@@ -273,12 +273,11 @@ impl GpuServer {
         self.shutdown_fence();
         // server 侧逐命令分相汇总(OWL_SRV_TIMING;与 [load] 客户端探针互补)
         if self.probes.srv_timing && !self.timings.is_empty() {
-            eprintln!("[srv-timing] ===== handler 分相(count / total / max) =====");
+            owl_shared::log_debug!("srv-timing", "===== handler 分相(count / total / max) =====");
             let mut rows = self.timings.clone();
             rows.sort_by_key(|(_, _, total, _)| std::cmp::Reverse(*total));
             for (name, count, total, max) in rows {
-                eprintln!(
-                    "[srv-timing]   {:<14} x{:<5} total={:>8.1}ms max={:>8.1}ms",
+                owl_shared::log_debug!("srv-timing", "  {:<14} x{:<5} total={:>8.1}ms max={:>8.1}ms",
                     name,
                     count,
                     total as f64 / 1e6,
@@ -310,7 +309,7 @@ impl GpuServer {
         // 次序不变:仍在 ctx 拆掉之前。
         if let Some(reg) = self.registry.take() {
             if let Err(e) = reg.close() {
-                eprintln!("[kernels] registry 收尾失败(已尽力逐族 close): {e}");
+                owl_shared::log_info!("kernels", "registry 收尾失败(已尽力逐族 close): {e}");
             }
         }
         self.scratch_ledger.clear();
@@ -484,7 +483,7 @@ impl GpuServer {
             Command::Launch { .. } => "Launch",
             Command::Close { .. } => "Close",
         };
-        eprintln!("[owl-gpu] 捕获期拒绝: {} —— {why}", name(&cmd));
+        owl_shared::log_warn!("owl-gpu", "捕获期拒绝: {} —— {why}", name(&cmd));
         match cmd {
             Command::GraphBegin { ack } => reject!(ack),
             Command::GraphEnd { ack } => reject!(ack),
@@ -525,7 +524,7 @@ impl GpuServer {
                     let stream = self.ctx().stream(STREAM_COMPUTE)?.clone();
                     let (dptr, _) = self.ctx().block_ptr(id, &stream)?;
                     if self.probes.cap_prof {
-                        eprintln!("[cap-prof] carve-memset {}B", n_bytes);
+                        owl_shared::log_debug!("cap-prof", "carve-memset {}B", n_bytes);
                     }
                     unsafe { memset_d8_async(dptr, 0, n_bytes, stream.cu_stream()) }
                         .map_err(|e| ModelError::Msg(format!("carve memset: {e:?}")))?;
@@ -580,7 +579,7 @@ impl GpuServer {
             Err(e) => return ack.send(Err(e)),
         };
         if self.ctx().capture_stream() && self.probes.cap_prof {
-            eprintln!("[cap-prof] memset_zero {}B block{block}", len_bytes);
+            owl_shared::log_debug!("cap-prof", "memset_zero {}B block{block}", len_bytes);
         }
         let result = (|| {
             let (dptr, _) = self.ctx().block_ptr(block, &stream).map_err(|e| {
@@ -645,7 +644,7 @@ impl GpuServer {
             let t = std::time::Instant::now();
             let name = msg.kernel.name.clone();
             self.handle_launch_inner(msg, ack);
-            eprintln!("[launch-time] {:?} {}", t.elapsed(), name);
+            owl_shared::log_debug!("launch-time", "{:?} {}", t.elapsed(), name);
             return ;
         }
         self.handle_launch_inner(msg, ack)
@@ -734,7 +733,7 @@ impl GpuServer {
         // 零回调,流水线不被驱动唤醒打断,并为 CUDA Graph 捕获铺路。
         let capturing = ctx.capture_stream();
         if capturing && self.probes.cap_prof {
-            eprintln!("[cap-prof] native launch {} out={}", msg.kernel.name, msg.out_elems);
+            owl_shared::log_debug!("cap-prof", "native launch {} out={}", msg.kernel.name, msg.out_elems);
         }
         match issue_launch(ctx, &stream, kernels, &msg, self.probes.debug) {
             Ok(out_id) => {
@@ -764,7 +763,7 @@ impl GpuServer {
     fn handle_free(&mut self, ids: Vec<u64>, ack: Ack<Result<(), ModelError>>) {
         let freed = self.ctx_mut().free_blocks(&ids);
         if self.probes.debug {
-            eprintln!("[owl-gpu] free: {}/{} 块归池", freed, ids.len());
+            owl_shared::log_warn!("owl-gpu", "free: {}/{} 块归池", freed, ids.len());
         }
         ack.send(Ok(()));
     }

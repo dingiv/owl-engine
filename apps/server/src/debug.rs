@@ -7,7 +7,7 @@
 
 use serde_json::{json, Value};
 
-use owl_shared::metrics::{collect_metrics, MetricsFilter};
+use owl_shared::metrics::{collect_metrics, collect_since_epoch, level_name, MetricsFilter};
 
 /// 单次查询行数上限(防动态 tag 增殖拖爆应答)
 const ROWS_LIMIT: usize = 512;
@@ -38,4 +38,80 @@ pub fn metrics_json(prefix: &str) -> Value {
         .collect();
     rows.sort_by(|a, b| total_ms(b).partial_cmp(&total_ms(a)).unwrap_or(std::cmp::Ordering::Equal));
     json!({ "rows": rows })
+}
+
+// ============================================================================
+// 性能框架出口(/debug/perf;docs/arch/perf-framework.md §三)
+// ============================================================================
+
+/// 收集性能账(前缀过滤 + limit)。`epoch` = 只看最近一次 mark_epoch 之后
+/// (engine 每 turn 开头打标 ⇒ “本轮”视角)。
+fn perf_rows(prefix: &str, epoch: bool) -> Vec<owl_shared::metrics::TagReport> {
+    let mut f = MetricsFilter::new().limit(ROWS_LIMIT);
+    if !prefix.is_empty() {
+        f = f.tag_prefix(prefix);
+    }
+    if epoch {
+        collect_since_epoch(f)
+    } else {
+        collect_metrics(&f)
+    }
+}
+
+/// 参考总时:取最大 total(通常 = 阶段包络 span)。树报告的 % 相对它。
+fn ref_total(rows: &[owl_shared::metrics::TagReport]) -> std::time::Duration {
+    rows.iter()
+        .map(|r| r.total.max(r.self_total))
+        .max()
+        .unwrap_or(std::time::Duration::from_millis(1))
+}
+
+/// 树状纯文本报告(人读入口:curl /debug/perf)
+pub fn perf_text(prefix: &str, epoch: bool) -> String {
+    let rows = perf_rows(prefix, epoch);
+    let refd = ref_total(&rows);
+    let mut out = format!(
+        "# owl perf  level={}  prefix={:?}  epoch={}  rows={}  ref_total={:.3}ms\n",
+        level_name(),
+        prefix,
+        if epoch { "on" } else { "off" },
+        rows.len(),
+        refd.as_secs_f64() * 1e3,
+    );
+    out.push_str("# 列:n=样本数 self=排他耗时(不含子) % =相对 ref_total;子按 self 降序\n");
+    out.push_str(&owl_shared::metrics::render_tree(&rows, refd));
+    out
+}
+
+/// 机器可读投影(与 /debug/metrics 同形 + self/open/orphan/ooo)
+pub fn perf_json(prefix: &str, epoch: bool) -> Value {
+    let rows = perf_rows(prefix, epoch);
+    json!({
+        "level": level_name(),
+        "prefix": prefix,
+        "epoch": epoch,
+        "ref_total_ms": ref_total(&rows).as_secs_f64() * 1e3,
+        "rows": rows
+            .into_iter()
+            .map(|r| json!({
+                "tag": r.tag, "count": r.count, "counter": r.counter,
+                "total_ms": r.total.as_secs_f64() * 1e3,
+                "self_ms": r.self_total.as_secs_f64() * 1e3,
+                "avg_ms": r.avg.as_secs_f64() * 1e3,
+                "p50_ms": r.p50.as_secs_f64() * 1e3,
+                "p99_ms": r.p99.as_secs_f64() * 1e3,
+                "max_ms": r.max.as_secs_f64() * 1e3,
+                "open": r.open_spans, "orphan": r.orphan_ends,
+                "ooo": r.out_of_order, "drop": r.dropped,
+            }))
+            .collect::<Vec<Value>>(),
+    })
+}
+
+/// 分级在线切换(免重启 A/B:`off` = 零成本基线臂)
+pub fn perf_set_level(name: &str) -> Result<&'static str, String> {
+    let l = owl_shared::metrics::level::parse(name)
+        .ok_or_else(|| format!("未知 perf level {name:?}(off|counters|host|gpu)"))?;
+    owl_shared::metrics::set_level(l);
+    Ok(level_name())
 }

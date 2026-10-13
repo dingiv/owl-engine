@@ -38,7 +38,7 @@ async fn deliver(sink: &mpsc::Sender<SinkEvent>, ev: SinkEvent) {
     static WARNED: AtomicBool = AtomicBool::new(false);
     if let Err(e) = sink.send(ev).await {
         if !WARNED.swap(true, Ordering::Relaxed) {
-            eprintln!("[actor] 事件投递失败(请求方已断开,后续同类不再重复打印): {e}");
+            owl_shared::log_warn!("actor", "事件投递失败(请求方已断开,后续同类不再重复打印): {e}");
         }
     }
 }
@@ -55,6 +55,7 @@ pub enum SinkEvent {
 pub async fn run_actor<D: DeviceClient>(
     running: &mut RunningEngine<D>,
     mut rx: mpsc::Receiver<EngineReq>,
+    perf_dump: Option<std::path::PathBuf>,
 ) {
     // turn_id → 事件回流(sink;Completed/Failed 后摘除)
     let mut sinks: HashMap<u64, mpsc::Sender<SinkEvent>> = HashMap::new();
@@ -70,11 +71,26 @@ pub async fn run_actor<D: DeviceClient>(
         loop {
             match running.pump().await {
                 Ok(TurnEvent::Idle) => break,
-                Ok(ev) => dispatch(&mut sinks, ev).await,
+                Ok(ev) => {
+                    // turn 终了 = 性能账落盘点(每 turn 覆写,进程被 kill 也不丢)
+                    let terminal = matches!(
+                        ev,
+                        TurnEvent::Completed { .. } | TurnEvent::Failed { .. }
+                    );
+                    dispatch(&mut sinks, ev).await;
+                    if terminal {
+                        if let Some(p) = &perf_dump {
+                            let f = owl_shared::metrics::MetricsFilter::new();
+                            if let Err(e) = owl_shared::metrics::dump(&f, p) {
+                                owl_shared::log_warn!("perf", "dump 失败 {}: {e}", p.display());
+                            }
+                        }
+                    }
+                }
                 Err(e) => {
                     // 引擎错误(架子):烧毁 active turn(E5 性能会战:
                     // 弃置滞留 = GDN 格泄漏 → 2 格两轮耗尽)+ 广播
-                    eprintln!("[actor] pump 错误: {e}");
+                    owl_shared::log_warn!("actor", "pump 错误: {e}");
                     let failed = running.abandon(format!("engine: {e}")).await;
                     let failed_turn = match &failed {
                         TurnEvent::Failed { turn, .. } => *turn,

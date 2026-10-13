@@ -100,6 +100,22 @@ pub async fn respond_json<W: AsyncWriteExt + Unpin>(
 }
 
 /// SSE 响应头(close 定界;无 Content-Length —— HTTP/1.1 连接关闭即报文完)
+/// 纯文本应答(诊断面:/debug/perf 的树状报告 —— 人读优先,不过 JSON)
+pub async fn respond_text<W: AsyncWriteExt + Unpin>(
+    w: &mut W,
+    code: u16,
+    body: &str,
+) -> io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 {code} {}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        status_text(code),
+        body.len()
+    );
+    w.write_all(head.as_bytes()).await?;
+    w.write_all(body.as_bytes()).await?;
+    w.flush().await
+}
+
 pub async fn respond_sse_head<W: AsyncWriteExt + Unpin>(w: &mut W) -> io::Result<()> {
     let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
     w.write_all(head.as_bytes()).await?;

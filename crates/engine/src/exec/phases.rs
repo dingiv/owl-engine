@@ -5,6 +5,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// turn 启动执行(设备侧照办):GDN 格重置 / 边界快照恢复 + 持久
     /// 块表重写(write_bt;图烘焙 bt 指针,内容重写指针稳定图不重捕)
     pub(crate) async fn execute_begin(&mut self, b: BeginPlan) -> Result<()> {
+        // 性能面:本轮 epoch 起点(/debug/perf?epoch=1 = 只看本轮;不 reset,
+        // 历史样本仍可全量查询 —— perf-framework.md §三)
+        owl_shared::metrics::mark_epoch();
         if b.reset_gdn {
             let face = self.session.face_mut();
             self.pool.reset_gdn(face, b.gdn_slot).await?;

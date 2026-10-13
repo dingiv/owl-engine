@@ -251,14 +251,13 @@ impl WeightSource for SafeTensorsSource {
         let e = match self.index.lock().unwrap().get(key).cloned() {
             Some(e) => e,
             None => {
-                eprintln!("[st][DIAG] 索引未命中: {key}");
+                owl_shared::log_info!("st", "[DIAG] 索引未命中: {key}");
                 return None;
             }
         };
         let esz = e.esz();
         if (offset_elems + len) * esz > e.nbytes {
-            eprintln!(
-                "[st][DIAG] OOB: {key} off{offset_elems} len{len} esz{esz} nbytes{}",
+            owl_shared::log_info!("st", "[DIAG] OOB: {key} off{offset_elems} len{len} esz{esz} nbytes{}",
                 e.nbytes
             );
             return None;

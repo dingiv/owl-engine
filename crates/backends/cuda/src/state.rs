@@ -254,7 +254,7 @@ impl GpuCtx {
             .and_then(|dev| unsafe { cudarc::driver::result::device::total_mem(dev) })
         {
             Ok(bytes) => owl_shared::vram::total_set(bytes as u64),
-            Err(e) => eprintln!("[boot] vram total 查询失败(治理禁用): {e:?}"),
+            Err(e) => owl_shared::log_info!("boot", "vram total 查询失败(治理禁用): {e:?}"),
         }
         if let Ok((free, _)) = cudarc::driver::result::mem_get_info() {
             owl_shared::vram::free_set(free as u64);
@@ -291,8 +291,7 @@ impl GpuCtx {
             }
             // ---- 零运行期编译覆盖率(boot 报告 + require 硬门)----
             let (covered, total, missing) = owl_kernels::family::cubins::coverage();
-            eprintln!(
-                "[aot] 构建期 cubin 代际 {archs:?} / 资产 {} 个(fp {}) —— 登记表覆盖 {covered}/{total}",
+            owl_shared::log_info!("aot", "构建期 cubin 代际 {archs:?} / 资产 {} 个(fp {}) —— 登记表覆盖 {covered}/{total}",
                 owl_kernels::family::cubins::CUBIN_ASSETS.len(),
                 owl_kernels::family::cubins::ASSET_FP
             );
@@ -496,26 +495,26 @@ impl GpuCtx {
                     }
                 }
             }
-            eprintln!("[gl-prof] 图节点 = {got}(类型 {kinds:?};真枚举 0=EMPTY 1=KERNEL 2=MEMCPY 3=MEMSET 4=HOST 10=MEM_ALLOC 11=MEM_FREE)");
+            owl_shared::log_debug!("gl-prof", "图节点 = {got}(类型 {kinds:?};真枚举 0=EMPTY 1=KERNEL 2=MEMCPY 3=MEMSET 4=HOST 10=MEM_ALLOC 11=MEM_FREE)");
             if !alloc_sizes.is_empty() {
                 let mut rows: Vec<_> = alloc_sizes.into_iter().collect();
                 rows.sort_by_key(|b| std::cmp::Reverse(b.0));
                 for (sz, n) in rows.iter().take(12) {
-                    eprintln!("[gl-prof]   MEM_ALLOC {sz}B × {n}");
+                    owl_shared::log_debug!("gl-prof", "  MEM_ALLOC {sz}B × {n}");
                 }
             }
             if !kern_names.is_empty() {
                 let mut rows: Vec<_> = kern_names.into_iter().collect();
                 rows.sort_by_key(|b| std::cmp::Reverse(b.1));
                 for (name, n) in rows.iter().take(40) {
-                    eprintln!("[gl-prof]   K {name} × {n}");
+                    owl_shared::log_debug!("gl-prof", "  K {name} × {n}");
                 }
             }
             if !cpy_sizes.is_empty() {
                 let mut rows: Vec<_> = cpy_sizes.into_iter().collect();
                 rows.sort_by(|a, b| b.0.cmp(&a.0));
                 for (sz, n) in rows.iter().take(12) {
-                    eprintln!("[gl-prof]   MEMCPY {:?} × {n}", sz);
+                    owl_shared::log_debug!("gl-prof", "  MEMCPY {:?} × {n}", sz);
                 }
             }
         }
@@ -548,7 +547,7 @@ impl GpuCtx {
         unsafe { crate::ffi::graph_launch(exec, cu_stream) }
             .map_err(|e| ModelError::Msg(format!("graph_launch({gid}): {e:?}")))?;
         if prof {
-            eprintln!("[gl-prof] gid={gid} launch={:?}", t0.unwrap().elapsed());
+            owl_shared::log_debug!("gl-prof", "gid={gid} launch={:?}", t0.unwrap().elapsed());
         }
         // 诊断开关(diag.launch_sync):回放后同步归因(烘焙指针消费者)
         if self.diag.launch_sync {
@@ -556,7 +555,7 @@ impl GpuCtx {
             stream
                 .synchronize()
                 .map_err(|e| ModelError::Msg(format!("graph-sync({gid}): {e:?}")))?;
-            eprintln!("[gl-prof] gid={gid} gpu-sync={:?}", t1.elapsed());
+            owl_shared::log_debug!("gl-prof", "gid={gid} gpu-sync={:?}", t1.elapsed());
         }
         Ok(())
     }
@@ -595,7 +594,7 @@ impl GpuCtx {
         // 不会破坏后续块基底。
         const CARVE_ALIGN: usize = 256;
         if self.cap_prof {
-            eprintln!("[cap-prof] carve {}B", n);
+            owl_shared::log_debug!("cap-prof", "carve {}B", n);
         }
         let used = cap.used.div_ceil(CARVE_ALIGN) * CARVE_ALIGN;
         let slab_cap = cap.cap;
@@ -758,7 +757,7 @@ impl KernelCache {
         }
         let asset = owl_kernels::family::cubins::asset(source).ok_or_else(|| {
             // 机器判据面:整轮 e2e 日志里 `grep -c aot-miss` 应恒 0
-            eprintln!("[aot-miss] {name} —— 无构建期 cubin 资产(源 {} B)", source.len());
+            owl_shared::log_warn!("aot-miss", "{name} —— 无构建期 cubin 资产(源 {} B)", source.len());
             if !self.misses.iter().any(|m| m == name) {
                 self.misses.push(name.to_string());
             }

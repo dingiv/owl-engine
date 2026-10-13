@@ -141,7 +141,7 @@ impl GpuServer {
             // DMA 未发生 —— 块内容缺失由调用方末端 sync 后自查/重试兜底)
             if let Some(buf) = cell.lock().unwrap().take() {
                 pool_err.put(buf);
-                eprintln!("[srv] upload notify 失败: {e:?}");
+                owl_shared::log_debug!("srv", "upload notify 失败: {e:?}");
             }
         }
     }
@@ -299,7 +299,7 @@ impl GpuServer {
             owl_shared::vram::free_set(free as u64);
         }
         if let Some(t) = t_d2h {
-            eprintln!("[d2h-prof] sync={:?} n={want_bytes}", t.elapsed());
+            owl_shared::log_debug!("d2h-prof", "sync={:?} n={want_bytes}", t.elapsed());
         }
         let stream = match self.ctx().stream(STREAM_D2H) {
             Ok(s) => s.clone(),
@@ -310,7 +310,7 @@ impl GpuServer {
         match self.try_dtoh(&stream, id, want_bytes) {
             Ok(staging) => {
                 if let Some(t) = t_d2h2 {
-                    eprintln!("[d2h-prof] issue={:?}", t.elapsed());
+                    owl_shared::log_debug!("d2h-prof", "issue={:?}", t.elapsed());
                 }
                 // 完成 → 码头字节直出(传输面字节口径)→ 回执 → 码头归还池
                 let mut cb_ack = ack.take();

@@ -18,6 +18,13 @@ serde_json = { workspace = true }
 # 手写 HTTP/1.1 + SSE(架子零重依赖;axum/hyper 迁移挂账,见 http.rs 模块头)
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 
+[features]
+# 性能框架(docs/arch/perf-framework.md):带本 feature 的 release 构建里
+# 计时宏/钩子全速采集;不带 = 生产二进制零成本。
+#   用法: cargo build --release -p server --features perf
+perf = ["owl-shared/perf", "owl-engine/perf"]
+log = ["owl-shared/log", "owl-engine/log"]
+
 [dev-dependencies]
 # 生产白名单门测试:核对 flavor 清单与 kernels 实测台账(2026-10-13 P4)
 owl-kernels = { path = "../../crates/kernels" }

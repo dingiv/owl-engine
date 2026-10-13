@@ -304,7 +304,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
         } else if self.cfg.knobs.draft.dumb {
             crate::running::SpecMode::Dumb
         } else {
-            eprintln!("[boot] OWL_SPEC_DEPTH>0 但无草稿器(非 mtp/dflash2 检查点)→ C7 回落 DecodeBatch");
+            owl_shared::log_info!("boot", "OWL_SPEC_DEPTH>0 但无草稿器(非 mtp/dflash2 检查点)→ C7 回落 DecodeBatch");
             crate::running::SpecMode::Off
         };
         let spec_depth = if spec_mode == crate::running::SpecMode::Off {
@@ -316,8 +316,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
             spec_depth_raw.min(3)
         };
         if spec_mode != crate::running::SpecMode::Off {
-            eprintln!(
-                "[boot] spec 模式 = {:?} depth={spec_depth}(注:spec 轮恒 greedy,采样 parity 挂 D4 device accept)",
+            owl_shared::log_info!("boot", "spec 模式 = {:?} depth={spec_depth}(注:spec 轮恒 greedy,采样 parity 挂 D4 device accept)",
                 spec_mode
             );
         }
@@ -326,7 +325,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
             crate::running::SpecMode::Mtp => {
                 let dir = loaded.mtp_dir.as_ref().expect("mtp_dir");
                 let (mtp, _) = owl_models::specs::qwen35::load_27b_mtp(dir, &mut self.face).await?;
-                eprintln!("[boot] MTP 草稿头装载(spec depth={spec_depth})");
+                owl_shared::log_info!("boot", "MTP 草稿头装载(spec depth={spec_depth})");
                 Some(crate::running::Drafter::Mtp(std::sync::Arc::new(mtp)))
             }
             crate::running::SpecMode::DFlash2 => {
@@ -335,7 +334,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
                 let draft_kv_fp8 = self.cfg.knobs.draft.kv_quant == owl_models::env::KvQuant::Fp8E4M3;
                 let t_draft = std::time::Instant::now();
                 let (d2, _) = owl_models::specs::qwen35::load_27b_dflash2(std::path::Path::new(dir), &mut self.face, draft_kv_fp8).await?;
-                eprintln!("[boot] DFlash2 草稿装载(depth={spec_depth};1.92B BF16 激活,sglang 对齐) {:.2}s", t_draft.elapsed().as_secs_f32());
+                owl_shared::log_info!("boot", "DFlash2 草稿装载(depth={spec_depth};1.92B BF16 激活,sglang 对齐) {:.2}s", t_draft.elapsed().as_secs_f32());
                 Some(crate::running::Drafter::DFlash2(std::sync::Arc::new(d2)))
             }
             _ => None,
@@ -365,7 +364,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
         // 即启动即拦,不等 E2E 红灯)
         owl_models::kernel::kv_manifest_gate(env.kv.quant, env.attn.fi)?;
         if kv_fp8 {
-            eprintln!("[boot] KV 池 fp8 e4m3(容量减半/ctx 翻倍;读核 *_fp8 变体)");
+            owl_shared::log_info!("boot", "KV 池 fp8 e4m3(容量减半/ctx 翻倍;读核 *_fp8 变体)");
         }
         // B6 偷显存:草稿池 e4m3(与草稿装载同旗标)
         let _dflash_fp8 = self.cfg.knobs.draft.kv_quant == owl_models::env::KvQuant::Fp8E4M3;
@@ -391,8 +390,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
         };
         let pool = StatePool::alloc(&mut self.face, dims, &loaded.spec.layer_types, &plan).await?;
         if let Some(q) = fi_quant {
-            eprintln!(
-                "[boot] FlashInfer prefill 面启用(FI 直读主池 kNHD 单池;quant={:?})",
+            owl_shared::log_info!("boot", "FlashInfer prefill 面启用(FI 直读主池 kNHD 单池;quant={:?})",
                 q
             );
         }
@@ -549,9 +547,9 @@ impl<D: DeviceClient + 'static> Engine<D> {
         )
         .await?;
         if let crate::graph_plan::PlanOutcome::EagerFallback { reason } = &capture_outcome {
-            eprintln!("[engine] 捕获降级为 eager:{reason}");
+            owl_shared::log_warn!("engine", "捕获降级为 eager:{reason}");
         }
-        eprintln!("[boot] GraphPlan plan(warmup+捕获) {:.2}s", t_run.elapsed().as_secs_f32());
+        owl_shared::log_info!("boot", "GraphPlan plan(warmup+捕获) {:.2}s", t_run.elapsed().as_secs_f32());
 
         // E5-M4:verify 桶形图(T = depth+1 定形;spec 模式专用)—— 消
         // 投机轮的整模 eager 发射税(~830 发 × ~25µs)。FI 不入图(T=4
@@ -748,11 +746,11 @@ impl<D: DeviceClient + 'static> Engine<D> {
             .await?;
             match voutcome {
                 crate::graph_plan::PlanOutcome::Captured => {
-                    eprintln!("[boot] verify 桶形图捕获(T={depth1}) +{:.2}s", t_run.elapsed().as_secs_f32());
+                    owl_shared::log_info!("boot", "verify 桶形图捕获(T={depth1}) +{:.2}s", t_run.elapsed().as_secs_f32());
                     Some(vg)
                 }
                 other => {
-                    eprintln!("[boot] verify 图降级({other:?})→ eager verify+重放路");
+                    owl_shared::log_info!("boot", "verify 图降级({other:?})→ eager verify+重放路");
                     None
                 }
             }
@@ -794,7 +792,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
                     fouts.push(OutputSlot { name: format!("f{i}"), shape, dtype: Dtype::F16 });
                 }
                 let Some(fface) = extra_faces.pop() else {
-                    eprintln!("[boot] fold 图 face 耗尽 → eager fold");
+                    owl_shared::log_info!("boot", "fold 图 face 耗尽 → eager fold");
                     break;
                 };
                 let (fg, fout) = GraphPlan::plan(
@@ -847,10 +845,10 @@ impl<D: DeviceClient + 'static> Engine<D> {
                 .await?;
                 match fout {
                     crate::graph_plan::PlanOutcome::Captured => {
-                        eprintln!("[boot] fold 桶形图捕获(m={m}) +{:.2}s", t_run.elapsed().as_secs_f32());
+                        owl_shared::log_info!("boot", "fold 桶形图捕获(m={m}) +{:.2}s", t_run.elapsed().as_secs_f32());
                         fold_graphs.push(fg);
                     }
-                    other => eprintln!("[boot] fold 图降级(m={m},{other:?})→ eager fold"),
+                    other => owl_shared::log_info!("boot", "fold 图降级(m={m},{other:?})→ eager fold"),
                 }
             }
 
@@ -955,13 +953,13 @@ impl<D: DeviceClient + 'static> Engine<D> {
                         .await?;
                         match dout {
                             crate::graph_plan::PlanOutcome::Captured => {
-                                eprintln!("[boot] dflash propose 图捕获(encode+propose 单图,固定 8 行) +{:.2}s", t_run.elapsed().as_secs_f32());
+                                owl_shared::log_info!("boot", "dflash propose 图捕获(encode+propose 单图,固定 8 行) +{:.2}s", t_run.elapsed().as_secs_f32());
                                 dflash_graph = Some(dg);
                             }
-                            other => eprintln!("[boot] dflash propose 图降级({other:?})→ eager propose"),
+                            other => owl_shared::log_info!("boot", "dflash propose 图降级({other:?})→ eager propose"),
                         }
                     }
-                    None => eprintln!("[boot] dflash propose 图 face 耗尽 → eager propose"),
+                    None => owl_shared::log_info!("boot", "dflash propose 图 face 耗尽 → eager propose"),
                 }
             }
 
@@ -1062,10 +1060,10 @@ impl<D: DeviceClient + 'static> Engine<D> {
                     .await?;
                     match pout {
                         crate::graph_plan::PlanOutcome::Captured => {
-                            eprintln!("[boot] propose 桶形图捕获(m={m})");
+                            owl_shared::log_info!("boot", "propose 桶形图捕获(m={m})");
                             propose_graphs.push(pg);
                         }
-                        other => eprintln!("[boot] propose 图降级(m={m},{other:?})→ eager propose"),
+                        other => owl_shared::log_info!("boot", "propose 图降级(m={m},{other:?})→ eager propose"),
                     }
                 }
             }

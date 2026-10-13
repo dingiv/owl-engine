@@ -458,13 +458,35 @@ impl<D: DeviceClient> RunningEngine<D> {
                 }
                 match action {
                     StepAction::Prefill { chunk_ids, base, is_last } => {
-                        self.execute_prefill(chunk_ids, base, is_last).await
+                        // 性能面:相位定相 + 包络 span(perf-framework.md §四)。
+                        // 引擎 actor = current_thread 运行时 ⇒ 单线程栈配对安全;
+                        // 解释器节点钩子按 env.phase 打 tag,两者同源。
+                        let saved = self.env.phase;
+                        self.env.phase = owl_models::env::EvalPhase::Prefill;
+                        owl_shared::timer_start!("engine.phase.prefill");
+                        let r = self.execute_prefill(chunk_ids, base, is_last).await;
+                        owl_shared::timer_end!("engine.phase.prefill");
+                        self.env.phase = saved;
+                        r
                     }
                     StepAction::Decode { token, pos, kv_slot, gdn_slot, grew } => {
-                        self.execute_decode(token, pos, kv_slot, gdn_slot, grew).await
+                        let saved = self.env.phase;
+                        self.env.phase = owl_models::env::EvalPhase::Decode;
+                        owl_shared::timer_start!("engine.phase.decode");
+                        let r = self.execute_decode(token, pos, kv_slot, gdn_slot, grew).await;
+                        owl_shared::timer_end!("engine.phase.decode");
+                        self.env.phase = saved;
+                        r
                     }
                     StepAction::SpecRound { token, pos, kv_slots, gdn_slot, grew } => {
-                        self.execute_spec_round(token, pos, kv_slots, gdn_slot, grew).await
+                        let saved = self.env.phase;
+                        self.env.phase = owl_models::env::EvalPhase::Spec;
+                        owl_shared::timer_start!("engine.phase.spec");
+                        let r =
+                            self.execute_spec_round(token, pos, kv_slots, gdn_slot, grew).await;
+                        owl_shared::timer_end!("engine.phase.spec");
+                        self.env.phase = saved;
+                        r
                     }
                 }
             }
