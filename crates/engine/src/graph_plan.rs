@@ -32,7 +32,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use owl_iface::contract::{Bytes, DeviceClient, Dtype, GraphId, ModelError};
-use owl_models::interpreters::eval_ops_multi;
+use owl_models::interpreters::{eval_ops_multi, eval_ops_multi_scoped_env};
 use owl_models::ops::{Op, PlanNode};
 use owl_models::TensorOps;
 
@@ -167,6 +167,10 @@ enum Mode {
 
 pub struct GraphPlan<D: DeviceClient> {
     face: D,
+    /// 解释器执行环境(显式依赖律,引擎 boot 组装后下传)。
+    /// 用途:①eager 臂的 scoped 回收/env 定相(perf tag 不再落 `unk`)
+    /// ②层声明侧的分派旋钮(与 ForwardCtx.env 同源)
+    env: owl_models::env::EnvProvider,
     /// 槽回读诊断打印(desc.debug_probe;显式依赖律)
     debug_probe: bool,
     inputs: Vec<InSlotDev>,
@@ -183,6 +187,7 @@ impl<D: DeviceClient> GraphPlan<D> {
     /// 姿势 6 warmup 门禁(lite)/ 两道捕获预检 / EagerFallback。
     pub async fn plan(
         mut face: D,
+        env: owl_models::env::EnvProvider,
         desc: GraphPlanDesc,
         forward: impl Fn(&PlanCtx) -> Result<()> + 'static,
     ) -> Result<(Self, PlanOutcome)> {
@@ -197,6 +202,7 @@ impl<D: DeviceClient> GraphPlan<D> {
 
         let mut sess = Self {
             face,
+            env,
             debug_probe: desc.debug_probe,
             inputs: ins,
             out_specs: desc
@@ -231,7 +237,13 @@ impl<D: DeviceClient> GraphPlan<D> {
             let _ = owl_shared::slab_hint::meter_take();
             sess.eval_current().await?;
             sess.face.sync().await?;
+            // warmup 输出块归还(原 `clear()` 只丢句柄、块留池外 ⇒ 每次
+            // plan 一次性泄漏;此处显式 free)
+            let warm: Vec<u64> = sess.last.values().map(|o| o.block.id).collect();
             sess.last.clear();
+            if !warm.is_empty() {
+                sess.face.free(&warm).await?;
+            }
             let metered = owl_shared::slab_hint::meter_take() as usize;
             if !desc.slab_fixed {
                 owl_shared::slab_hint::set_hint(metered + metered / 8 + (1 << 20));
@@ -248,6 +260,13 @@ impl<D: DeviceClient> GraphPlan<D> {
             fallback("未请求捕获")
         };
         Ok((sess, outcome))
+    }
+
+    /// 相位定相(perf tag 维度;引擎逐相位调用)。
+    /// 构造期 env 是**快照**,相位是**逐相位状态** ⇒ 需显式同步
+    /// (引擎侧 `RunningEngine::set_phase` 同时更新自身 env 与各 plan)。
+    pub fn set_phase(&mut self, p: owl_models::env::EvalPhase) {
+        self.env.phase = p;
     }
 
     /// 每步执行:装填输入(write_block 原位)→ 回放或 eager 直发。
@@ -395,7 +414,23 @@ impl<D: DeviceClient> GraphPlan<D> {
     }
 
     /// eager 归约:全输出 eval 入 last(读序由 dtoh 读语义保证)
+    ///
+    /// **块生命周期(2026-10-14 修复)**:本函数是 eager 臂唯一入口,
+    /// 两处回收缺一不可 ——
+    /// 1. **上一轮声明输出**:本函数重写 `last`,旧块到此作废 →
+    ///    入口处显式 `free`。契约:`output_*` 句柄仅在**本次回放内**有效;
+    ///    跨回放使用 = 悬空 id → 服务端结构化 `DeadBlock`(**fail loud**,
+    ///    不会静默错值)。捕获臂不受影响(输出块在 slab 常驻)。
+    /// 2. **本轮中间块**:`eval_ops_multi_scoped_env`(per-node 活性回收 +
+    ///    末次 arena−roots 清扫)。原实现用 plain `eval_ops_multi`
+    ///    (块常驻)**每步泄漏全部中间块** ⇒ 实测 ~100 步
+    ///    `CUDA_ERROR_OUT_OF_MEMORY`,且失败后池不可恢复。
     async fn eval_current(&mut self) -> Result<()> {
+        if !self.last.is_empty() {
+            let old: Vec<u64> = self.last.values().map(|o| o.block.id).collect();
+            self.last.clear();
+            self.face.free(&old).await?;
+        }
         // E5-M4:**多根共享 memo 单次归约**(eval_ops_multi)—— 逐根
         // eval_ops 会把共享子树(整模前向)每根重执行一遍:verify 图
         // 389 根(384 记录 = 整模内部节点)实测 warmup 387 次整模前向
@@ -403,7 +438,7 @@ impl<D: DeviceClient> GraphPlan<D> {
         // 路径补修;捕获窗 eval_ops_multi 早已正确)
         let outs = self.declare_outputs()?;
         let trees: Vec<&TensorOps> = outs.iter().map(|(_, t)| t).collect();
-        let results = eval_ops_multi(&trees, &mut self.face).await?;
+        let results = eval_ops_multi_scoped_env(&trees, &mut self.face, self.env).await?;
         for ((name, _), block) in outs.iter().zip(results) {
             let want = self.out_specs[name];
             if block.len != 0 && block.len != want {
@@ -516,6 +551,7 @@ mod tests {
         };
         let (mut sess, outcome) = GraphPlan::plan(
             face,
+            owl_models::env::EnvProvider::default(),
             desc,
             move |sc: &PlanCtx| -> Result<()> {
                 let x = sc.input("x")?;
@@ -549,7 +585,7 @@ mod tests {
             slab_fixed: false,
             debug_probe: false,
         };
-        let r = GraphPlan::plan(face, desc, |sc: &PlanCtx| -> Result<()> {
+        let r = GraphPlan::plan(face, owl_models::env::EnvProvider::default(), desc, |sc: &PlanCtx| -> Result<()> {
             let a = sc.input("a")?;
             let b = sc.input("b")?;
             sc.output("s", &a.add(&b))?;
@@ -582,6 +618,7 @@ mod tests {
         };
         let (mut sess, outcome) = GraphPlan::plan(
             face,
+            owl_models::env::EnvProvider::default(),
             desc,
             move |sc: &PlanCtx| -> Result<()> {
                 let x = sc.input("x")?;
@@ -632,7 +669,7 @@ mod tests {
 
         // eager 锚
         let w1 = w_eager.clone();
-        let (mut s_eager, o_e) = GraphPlan::plan(f_eager, desc(false), move |sc: &PlanCtx| -> Result<()> {
+        let (mut s_eager, o_e) = GraphPlan::plan(f_eager, owl_models::env::EnvProvider::default(), desc(false), move |sc: &PlanCtx| -> Result<()> {
             let x = sc.input("x")?;
             let y = sc.input("y")?;
             sc.output("s", &x.add(&y).matmul(&w1))
@@ -642,7 +679,7 @@ mod tests {
         assert!(matches!(o_e, PlanOutcome::EagerFallback { .. }));
 
         // 捕获线
-        let (mut s_cap, o_c) = GraphPlan::plan(f_cap, desc(true), move |sc: &PlanCtx| -> Result<()> {
+        let (mut s_cap, o_c) = GraphPlan::plan(f_cap, owl_models::env::EnvProvider::default(), desc(true), move |sc: &PlanCtx| -> Result<()> {
             let x = sc.input("x")?;
             let y = sc.input("y")?;
             sc.output("s", &x.add(&y).matmul(&w_cap))

@@ -206,6 +206,8 @@ pub(super) struct GpuCtx {
     /// 刀1.6:探针开关(boot 解析;热路径零 env 查询)
     pub(super) srv_timing: bool,
     pub(super) cap_prof: bool,
+    /// 诊断下沉口(注入面):日志 + 分相计时都走它(cuda 不依赖日志 crate)
+    pub(super) sink: owl_shared::log::LogSink,
 }
 
 /// 捕获会话:目标流 + 切块 slab + 发射计数(空窗哨兵用)
@@ -245,7 +247,12 @@ impl Drop for GraphHolder {
 }
 
 impl GpuCtx {
-    pub(super) fn new(selector: &DeviceSelector, diag: DiagOpts, ledger: u32) -> Result<Self, String> {
+    pub(super) fn new(
+        selector: &DeviceSelector,
+        diag: DiagOpts,
+        ledger: u32,
+        sink: owl_shared::log::LogSink,
+    ) -> Result<Self, String> {
         let ordinal = selector.resolve()?;
         let ctx = CudaContext::new(ordinal).map_err(|e| format!("{e:?}"))?;
         ctx.bind_to_thread().map_err(|e| format!("{e:?}"))?;
@@ -254,7 +261,7 @@ impl GpuCtx {
             .and_then(|dev| unsafe { cudarc::driver::result::device::total_mem(dev) })
         {
             Ok(bytes) => owl_shared::vram::total_set(bytes as u64),
-            Err(e) => owl_shared::log_info!("boot", "vram total 查询失败(治理禁用): {e:?}"),
+            Err(e) => sink.logf(owl_shared::log::LVL_INFO, "boot", format_args!("vram total 查询失败(治理禁用): {e:?}")),
         }
         if let Ok((free, _)) = cudarc::driver::result::mem_get_info() {
             owl_shared::vram::free_set(free as u64);
@@ -291,10 +298,10 @@ impl GpuCtx {
             }
             // ---- 零运行期编译覆盖率(boot 报告 + require 硬门)----
             let (covered, total, missing) = owl_kernels::family::cubins::coverage();
-            owl_shared::log_info!("aot", "构建期 cubin 代际 {archs:?} / 资产 {} 个(fp {}) —— 登记表覆盖 {covered}/{total}",
+            sink.logf(owl_shared::log::LVL_INFO, "aot", format_args!("构建期 cubin 代际 {archs:?} / 资产 {} 个(fp {}) —— 登记表覆盖 {covered}/{total}",
                 owl_kernels::family::cubins::CUBIN_ASSETS.len(),
                 owl_kernels::family::cubins::ASSET_FP
-            );
+            ));
             if !missing.is_empty() {
                 let show: Vec<&str> = missing.iter().take(8).copied().collect();
                 let total_show = missing.len();
@@ -323,6 +330,7 @@ impl GpuCtx {
             blocks: HashMap::new(),
             next_block: 1,
             ledger,
+            sink,
             smem_optin,
         })
     }
@@ -495,26 +503,26 @@ impl GpuCtx {
                     }
                 }
             }
-            owl_shared::log_debug!("gl-prof", "图节点 = {got}(类型 {kinds:?};真枚举 0=EMPTY 1=KERNEL 2=MEMCPY 3=MEMSET 4=HOST 10=MEM_ALLOC 11=MEM_FREE)");
+            self.sink.logf(owl_shared::log::LVL_DEBUG, "gl-prof", format_args!("图节点 = {got}(类型 {kinds:?};真枚举 0=EMPTY 1=KERNEL 2=MEMCPY 3=MEMSET 4=HOST 10=MEM_ALLOC 11=MEM_FREE)"));
             if !alloc_sizes.is_empty() {
                 let mut rows: Vec<_> = alloc_sizes.into_iter().collect();
                 rows.sort_by_key(|b| std::cmp::Reverse(b.0));
                 for (sz, n) in rows.iter().take(12) {
-                    owl_shared::log_debug!("gl-prof", "  MEM_ALLOC {sz}B × {n}");
+                    self.sink.logf(owl_shared::log::LVL_DEBUG, "gl-prof", format_args!("  MEM_ALLOC {sz}B × {n}"));
                 }
             }
             if !kern_names.is_empty() {
                 let mut rows: Vec<_> = kern_names.into_iter().collect();
                 rows.sort_by_key(|b| std::cmp::Reverse(b.1));
                 for (name, n) in rows.iter().take(40) {
-                    owl_shared::log_debug!("gl-prof", "  K {name} × {n}");
+                    self.sink.logf(owl_shared::log::LVL_DEBUG, "gl-prof", format_args!("  K {name} × {n}"));
                 }
             }
             if !cpy_sizes.is_empty() {
                 let mut rows: Vec<_> = cpy_sizes.into_iter().collect();
                 rows.sort_by(|a, b| b.0.cmp(&a.0));
                 for (sz, n) in rows.iter().take(12) {
-                    owl_shared::log_debug!("gl-prof", "  MEMCPY {:?} × {n}", sz);
+                    self.sink.logf(owl_shared::log::LVL_DEBUG, "gl-prof", format_args!("  MEMCPY {:?} × {n}", sz));
                 }
             }
         }
@@ -547,7 +555,7 @@ impl GpuCtx {
         unsafe { crate::ffi::graph_launch(exec, cu_stream) }
             .map_err(|e| ModelError::Msg(format!("graph_launch({gid}): {e:?}")))?;
         if prof {
-            owl_shared::log_debug!("gl-prof", "gid={gid} launch={:?}", t0.unwrap().elapsed());
+            self.sink.logf(owl_shared::log::LVL_DEBUG, "gl-prof", format_args!("gid={gid} launch={:?}", t0.unwrap().elapsed()));
         }
         // 诊断开关(diag.launch_sync):回放后同步归因(烘焙指针消费者)
         if self.diag.launch_sync {
@@ -555,7 +563,7 @@ impl GpuCtx {
             stream
                 .synchronize()
                 .map_err(|e| ModelError::Msg(format!("graph-sync({gid}): {e:?}")))?;
-            owl_shared::log_debug!("gl-prof", "gid={gid} gpu-sync={:?}", t1.elapsed());
+            self.sink.logf(owl_shared::log::LVL_DEBUG, "gl-prof", format_args!("gid={gid} gpu-sync={:?}", t1.elapsed()));
         }
         Ok(())
     }
@@ -594,7 +602,7 @@ impl GpuCtx {
         // 不会破坏后续块基底。
         const CARVE_ALIGN: usize = 256;
         if self.cap_prof {
-            owl_shared::log_debug!("cap-prof", "carve {}B", n);
+            self.sink.logf(owl_shared::log::LVL_DEBUG, "cap-prof", format_args!("carve {}B", n));
         }
         let used = cap.used.div_ceil(CARVE_ALIGN) * CARVE_ALIGN;
         let slab_cap = cap.cap;
@@ -751,13 +759,14 @@ impl KernelCache {
         ctx: &Arc<CudaContext>,
         name: &str,
         source: &str,
+        sink: owl_shared::log::LogSink,
     ) -> Result<CudaFunction, ModelError> {
         if let Some(f) = self.compiled.get(name) {
             return Ok(f.clone());
         }
         let asset = owl_kernels::family::cubins::asset(source).ok_or_else(|| {
             // 机器判据面:整轮 e2e 日志里 `grep -c aot-miss` 应恒 0
-            owl_shared::log_warn!("aot-miss", "{name} —— 无构建期 cubin 资产(源 {} B)", source.len());
+            sink.logf(owl_shared::log::LVL_WARN, "aot-miss", format_args!("{name} —— 无构建期 cubin 资产(源 {} B)", source.len()));
             if !self.misses.iter().any(|m| m == name) {
                 self.misses.push(name.to_string());
             }

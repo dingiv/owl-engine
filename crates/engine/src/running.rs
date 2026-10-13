@@ -418,6 +418,27 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// **S0 调度/执行分离**:本函数 = 调度(纯主机侧决策,零设备 IO)
     /// + 执行(设备侧照办)—— 决策面可单测,执行器无决策权
     ///   (调度层铺开 §S0;对标 vLLM v1 schedule/execute 分离)。
+    ///
+    /// 相位定相:**引擎 env + 各 GraphPlan 的 env 快照**同步。
+    /// 相位是 perf tag 维度(`interp.host.node.<phase>.<核>`),GraphPlan
+    /// 构造期只拿到 env 快照 ⇒ 逐相位显式下发(perf-framework.md §十.3)。
+    pub(crate) fn set_phase(&mut self, p: owl_models::env::EvalPhase) {
+        self.env.phase = p;
+        self.session.set_phase(p);
+        if let Some(g) = self.verify_graph.as_mut() {
+            g.set_phase(p);
+        }
+        for g in self.fold_graphs.iter_mut() {
+            g.set_phase(p);
+        }
+        for g in self.propose_graphs.iter_mut() {
+            g.set_phase(p);
+        }
+        if let Some(g) = self.dflash_graph.as_mut() {
+            g.set_phase(p);
+        }
+    }
+
     pub async fn pump(&mut self) -> Result<TurnEvent> {
         // E5-M2:spec 轮多 token 事件队列优先排空(schedule 前 —— 事件序
         // 不可与下一轮调度交织)
@@ -462,30 +483,30 @@ impl<D: DeviceClient> RunningEngine<D> {
                         // 引擎 actor = current_thread 运行时 ⇒ 单线程栈配对安全;
                         // 解释器节点钩子按 env.phase 打 tag,两者同源。
                         let saved = self.env.phase;
-                        self.env.phase = owl_models::env::EvalPhase::Prefill;
+                        self.set_phase(owl_models::env::EvalPhase::Prefill);
                         owl_shared::timer_start!("engine.phase.prefill");
                         let r = self.execute_prefill(chunk_ids, base, is_last).await;
                         owl_shared::timer_end!("engine.phase.prefill");
-                        self.env.phase = saved;
+                        self.set_phase(saved);
                         r
                     }
                     StepAction::Decode { token, pos, kv_slot, gdn_slot, grew } => {
                         let saved = self.env.phase;
-                        self.env.phase = owl_models::env::EvalPhase::Decode;
+                        self.set_phase(owl_models::env::EvalPhase::Decode);
                         owl_shared::timer_start!("engine.phase.decode");
                         let r = self.execute_decode(token, pos, kv_slot, gdn_slot, grew).await;
                         owl_shared::timer_end!("engine.phase.decode");
-                        self.env.phase = saved;
+                        self.set_phase(saved);
                         r
                     }
                     StepAction::SpecRound { token, pos, kv_slots, gdn_slot, grew } => {
                         let saved = self.env.phase;
-                        self.env.phase = owl_models::env::EvalPhase::Spec;
+                        self.set_phase(owl_models::env::EvalPhase::Spec);
                         owl_shared::timer_start!("engine.phase.spec");
                         let r =
                             self.execute_spec_round(token, pos, kv_slots, gdn_slot, grew).await;
                         owl_shared::timer_end!("engine.phase.spec");
-                        self.env.phase = saved;
+                        self.set_phase(saved);
                         r
                     }
                 }

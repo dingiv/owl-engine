@@ -138,6 +138,9 @@ pub struct GpuServer {
     timings: Vec<(&'static str, u64, u128, u128)>,
     /// 探针开关(构造期解析;热路径零 env 查询)
     probes: ServerProbes,
+    /// 诊断下沉口(注入面;见 [`owl_shared::log::LogSink`]):server 用它
+    /// 打日志,并在**发射/回收**路径记逐算子耗时。
+    sink: owl_shared::log::LogSink,
 }
 
 impl GpuServer {
@@ -166,6 +169,20 @@ impl GpuServer {
         diag: crate::state::DiagOpts,
         debug: bool,
     ) -> Self {
+        Self::with_diag_sink(rx, selector, boot, diag, debug, owl_shared::log::LogSink::none())
+    }
+
+    /// 带**诊断下沉口**构造(注入面;GPU server 构造函数持 sink)。
+    /// 实现方一般是 `owl_shared::log::sink()`(日志 + metrics 双出口);
+    /// `LogSink::none()` = 全静默(测试/无宿主场景)。
+    pub fn with_diag_sink(
+        rx: mpsc::Receiver<Command>,
+        selector: DeviceSelector,
+        boot: Option<mpsc::Sender<Result<(), String>>>,
+        diag: crate::state::DiagOpts,
+        debug: bool,
+        sink: owl_shared::log::LogSink,
+    ) -> Self {
         Self {
             actor_tag: ACTOR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             rx,
@@ -183,13 +200,14 @@ impl GpuServer {
             timings: Vec::new(),
             probes: ServerProbes::from_parts(&diag, debug),
             diag,
+            sink,
         }
     }
 
     /// 事件循环主入口(server 线程生命周期 = 循环生命周期)。
     /// 首行上线设备(本线程 bind_to_thread 一次到位)+ 起派发线程。
     pub fn run(mut self) -> Result<(), String> {
-        let ctx = GpuCtx::new(&self.selector, self.diag.clone(), self.actor_tag as u32);
+        let ctx = GpuCtx::new(&self.selector, self.diag.clone(), self.actor_tag as u32, self.sink);
         match ctx {
             Ok(c) => {
                 if let Some(boot) = self.boot.take() {
@@ -221,7 +239,7 @@ impl GpuServer {
                         Ok(reg) => self.registry = Some(reg),
                         Err(e) => {
                             // 拒启必须可见(否则只剩"族被 drop"的兜底告警,查不到原因)
-                            owl_shared::log_info!("kernels", "❌ 算子注册表装配失败(拒启): {e}");
+                            self.sink.logf(owl_shared::log::LVL_INFO, "kernels", format_args!("❌ 算子注册表装配失败(拒启): {e}"));
                             return Err(format!("算子注册表装配失败(拒启): {e}"));
                         }
                     }
@@ -258,6 +276,13 @@ impl GpuServer {
                 Ok(c) => c,
                 Err(_) => break, // 全部客户端离场
             };
+            // ② 队列等待 = 客户端入队 → 本线程被唤醒出队(tag `srv.queue.<kind>`)
+            // 与 `srv.tx`/`srv.op`/`srv.wait` 三段拼出一次往返的完整分解。
+            if self.sink.timing() {
+                let kind = cmd.kind();
+                self.sink
+                    .timer(&format!("srv.queue.{kind}"), cmd.created_at().elapsed());
+            }
             match cmd {
                 Command::Close { ack } if !closing => {
                     ack.send(Ok(()));
@@ -273,16 +298,16 @@ impl GpuServer {
         self.shutdown_fence();
         // server 侧逐命令分相汇总(OWL_SRV_TIMING;与 [load] 客户端探针互补)
         if self.probes.srv_timing && !self.timings.is_empty() {
-            owl_shared::log_debug!("srv-timing", "===== handler 分相(count / total / max) =====");
+            self.sink.logf(owl_shared::log::LVL_DEBUG, "srv-timing", format_args!("===== handler 分相(count / total / max) ====="));
             let mut rows = self.timings.clone();
             rows.sort_by_key(|(_, _, total, _)| std::cmp::Reverse(*total));
             for (name, count, total, max) in rows {
-                owl_shared::log_debug!("srv-timing", "  {:<14} x{:<5} total={:>8.1}ms max={:>8.1}ms",
+                self.sink.logf(owl_shared::log::LVL_DEBUG, "srv-timing", format_args!("  {:<14} x{:<5} total={:>8.1}ms max={:>8.1}ms",
                     name,
                     count,
                     total as f64 / 1e6,
                     max as f64 / 1e6
-                );
+                ));
             }
         }
         Ok(())
@@ -309,7 +334,7 @@ impl GpuServer {
         // 次序不变:仍在 ctx 拆掉之前。
         if let Some(reg) = self.registry.take() {
             if let Err(e) = reg.close() {
-                owl_shared::log_info!("kernels", "registry 收尾失败(已尽力逐族 close): {e}");
+                self.sink.logf(owl_shared::log::LVL_INFO, "kernels", format_args!("registry 收尾失败(已尽力逐族 close): {e}"));
             }
         }
         self.scratch_ledger.clear();
@@ -395,7 +420,7 @@ impl GpuServer {
                 }
                 Command::GraphEnd { ack } => ack.send(self.ctx_mut().graph_end()),
                 Command::Close { ack } => ack.send(Ok(())), // 防御性幂等回执
-                other => Self::reject(other),
+                other => Self::reject(other, self.sink),
             };
         }
 
@@ -432,9 +457,9 @@ impl GpuServer {
     }
 
     /// 捕获期违规命令的结构化拒绝
-    fn reject(cmd: Command) {
+    fn reject(cmd: Command, sink: owl_shared::log::LogSink) {
         Self::reject_with(cmd, "图捕获进行中:该操作被拒 —— 捕获期仅允许 \
-             Launch/Alloc;同步/搬运/图操作会破坏图捕获".to_string());
+             Launch/Alloc;同步/搬运/图操作会破坏图捕获".to_string(), sink);
     }
 
     /// Closing 态拒绝:每条命令的 ack 都必须回 ServerClosed
@@ -462,7 +487,7 @@ impl GpuServer {
         }
     }
 
-    fn reject_with(cmd: Command, why: String) {
+    fn reject_with(cmd: Command, why: String, sink: owl_shared::log::LogSink) {
         macro_rules! reject { ($ack:expr) => { $ack.send(Err(ModelError::Msg(why.clone()))) } }
         let name = |c: &Command| match c {
             Command::GraphBegin { .. } => "GraphBegin",
@@ -483,7 +508,7 @@ impl GpuServer {
             Command::Launch { .. } => "Launch",
             Command::Close { .. } => "Close",
         };
-        owl_shared::log_warn!("owl-gpu", "捕获期拒绝: {} —— {why}", name(&cmd));
+        sink.logf(owl_shared::log::LVL_WARN, "owl-gpu", format_args!("捕获期拒绝: {} —— {why}", name(&cmd)));
         match cmd {
             Command::GraphBegin { ack } => reject!(ack),
             Command::GraphEnd { ack } => reject!(ack),
@@ -505,7 +530,20 @@ impl GpuServer {
         }
     }
 
+    /// alloc 段分相(与客户端 `interp.host.seg.alloc` 对账;差值 = 管道)
     fn handle_alloc(
+        &mut self,
+        n_bytes: usize,
+        elems: usize,
+        zero: bool,
+        ack: Ack<Result<Bytes, ModelError>>,
+    ) {
+        let t0 = std::time::Instant::now();
+        self.handle_alloc_inner(n_bytes, elems, zero, ack);
+        self.sink.timer("srv.seg.alloc", t0.elapsed());
+    }
+
+    fn handle_alloc_inner(
         &mut self,
         n_bytes: usize,
         elems: usize,
@@ -524,7 +562,7 @@ impl GpuServer {
                     let stream = self.ctx().stream(STREAM_COMPUTE)?.clone();
                     let (dptr, _) = self.ctx().block_ptr(id, &stream)?;
                     if self.probes.cap_prof {
-                        owl_shared::log_debug!("cap-prof", "carve-memset {}B", n_bytes);
+                        self.sink.logf(owl_shared::log::LVL_DEBUG, "cap-prof", format_args!("carve-memset {}B", n_bytes));
                     }
                     unsafe { memset_d8_async(dptr, 0, n_bytes, stream.cu_stream()) }
                         .map_err(|e| ModelError::Msg(format!("carve memset: {e:?}")))?;
@@ -579,7 +617,7 @@ impl GpuServer {
             Err(e) => return ack.send(Err(e)),
         };
         if self.ctx().capture_stream() && self.probes.cap_prof {
-            owl_shared::log_debug!("cap-prof", "memset_zero {}B block{block}", len_bytes);
+            self.sink.logf(owl_shared::log::LVL_DEBUG, "cap-prof", format_args!("memset_zero {}B block{block}", len_bytes));
         }
         let result = (|| {
             let (dptr, _) = self.ctx().block_ptr(block, &stream).map_err(|e| {
@@ -593,7 +631,19 @@ impl GpuServer {
         })();
         ack.send(result);
     }
+    /// 逐算子服务端总时(注入口:GPU server 构造函数注入的 sink)。
+    ///
+    /// 口径 = 命令进入 handler → 发射调用返回(含参数装配/取核/准入/发射);
+    /// 与客户端 `interp.host.seg.launch`(18µs 级)**对账** ⇒ 差值 = 管道
+    /// (actor 队列往返 + 回执),是「宿主链 93% 在 launch+alloc」的下一层分解。
     fn handle_launch(&mut self, msg: LaunchMsg, ack: Ack<Result<Bytes, ModelError>>) {
+        let t0 = std::time::Instant::now();
+        let name = msg.kernel.name.clone();
+        self.handle_launch_probed(msg, ack);
+        self.sink.timer(&format!("srv.op.{name}"), t0.elapsed());
+    }
+
+    fn handle_launch_probed(&mut self, msg: LaunchMsg, ack: Ack<Result<Bytes, ModelError>>) {
         // GPU 逐核归因探针(OWL_GPU_PROF=1;2026-10-01 50tok/s 分账立案):
         // 每发射后同步 COMPUTE 流 → 本核隔离运行,host 计时 ≈ 核 GPU 纯时
         // (含 ~10µs sync 往返底噪);动态 tag `gpu.{核名}` 入 owl-shared
@@ -644,7 +694,7 @@ impl GpuServer {
             let t = std::time::Instant::now();
             let name = msg.kernel.name.clone();
             self.handle_launch_inner(msg, ack);
-            owl_shared::log_debug!("launch-time", "{:?} {}", t.elapsed(), name);
+            self.sink.logf(owl_shared::log::LVL_DEBUG, "launch-time", format_args!("{:?} {}", t.elapsed(), name));
             return ;
         }
         self.handle_launch_inner(msg, ack)
@@ -698,6 +748,10 @@ impl GpuServer {
         // 已退役,见 ops/ 模块)。路由判定 = 注册表 knows(boot 表自洽,
         // 零第二份清单;旧 is_foreign_name 硬编码枚举已删,2026-10-12 review D 案)
         if self.registry.as_ref().is_some_and(|r| r.knows(&msg.kernel.name)) {
+            // 家族(foreign)路分相:与 native 路的 srv.seg.prep/issue 并列,
+            // 使 srv.op 的可分解性覆盖两路(P5 对账需要)
+            let t_fam = std::time::Instant::now();
+            let sink = self.sink;
             // 字段级解构:ctx(&mut,alloc_block 需要)、registry、exec 三者借用不相交
             let Self { ctx, registry, exec, scratch_ledger, actor_tag, .. } = self;
             let out = (|| -> Result<Bytes, String> {
@@ -710,9 +764,12 @@ impl GpuServer {
                     .map_err(|e| e.to_string())
             })()
             .map_err(ModelError::Msg);
+            sink.timer("srv.seg.fam", t_fam.elapsed());
             return ack.send(out);
         }
         let mut ack = Some(ack);
+        // 下沉口(值语义,先拷贝;下面字段级解构不再借 self)
+        let sink = self.sink;
         // 字段级解构:ctx(不可变)与 kernels(可变)借用不相交
         let Self { ctx, kernels, .. } = self;
         let ctx = match ctx.as_ref() {
@@ -733,9 +790,9 @@ impl GpuServer {
         // 零回调,流水线不被驱动唤醒打断,并为 CUDA Graph 捕获铺路。
         let capturing = ctx.capture_stream();
         if capturing && self.probes.cap_prof {
-            owl_shared::log_debug!("cap-prof", "native launch {} out={}", msg.kernel.name, msg.out_elems);
+            self.sink.logf(owl_shared::log::LVL_DEBUG, "cap-prof", format_args!("native launch {} out={}", msg.kernel.name, msg.out_elems));
         }
-        match issue_launch(ctx, &stream, kernels, &msg, self.probes.debug) {
+        match issue_launch(ctx, &stream, kernels, &msg, self.probes.debug, sink) {
             Ok(out_id) => {
                 self.ctx_mut().note_launch();
                 // 诊断开关(OWL_LAUNCH_SYNC=1):逐发射同步,sticky 错误
@@ -761,9 +818,12 @@ impl GpuServer {
     /// 中间块回收(E2a):账房移除 Owned 块归池。调用方契约 = 已收割
     /// 所需数据(dtoh 回执即 COMPUTE 排空);图捕获期由 G2 拒绝臂拦截。
     fn handle_free(&mut self, ids: Vec<u64>, ack: Ack<Result<(), ModelError>>) {
+        let t0 = std::time::Instant::now();
         let freed = self.ctx_mut().free_blocks(&ids);
+        self.sink.timer("srv.seg.free", t0.elapsed());
+        self.sink.count("srv.count.free_blocks", freed as u64);
         if self.probes.debug {
-            owl_shared::log_warn!("owl-gpu", "free: {}/{} 块归池", freed, ids.len());
+            self.sink.logf(owl_shared::log::LVL_WARN, "owl-gpu", format_args!("free: {}/{} 块归池", freed, ids.len()));
         }
         ack.send(Ok(()));
     }

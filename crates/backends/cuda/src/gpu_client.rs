@@ -19,13 +19,52 @@ use std::sync::mpsc;
 #[derive(Clone)]
 pub struct GpuClient {
     tx: mpsc::Sender<Command>,
+    /// 诊断下沉口(与 GPU server 同一只;`sink()` 组装时同传双方)
+    sink: owl_shared::log::LogSink,
+}
+
+/// 计时包封:记录 `submit → Ready` 的**等待**(分相 tag `srv.wait.<kind>`)。
+/// 与 `srv.tx.<kind>`(入队)、`srv.op.<kind>`(服务端处理)三段拼起来
+/// 就是客户端观测的那一段 —— 差值即唤醒延迟(见 perf-framework §十)。
+struct TimedWaiter<T> {
+    inner: Waiter<T>,
+    t0: Option<std::time::Instant>,
+    sink: owl_shared::log::LogSink,
+    kind: &'static str,
+}
+
+impl<T: Send + 'static> Future for TimedWaiter<T> {
+    type Output = T;
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<T> {
+        // SAFETY:inner 不被移动(结构体自持,pin 投影到字段)
+        let this = unsafe { self.get_unchecked_mut() };
+        let inner = unsafe { std::pin::Pin::new_unchecked(&mut this.inner) };
+        match inner.poll(cx) {
+            std::task::Poll::Ready(v) => {
+                if let Some(t0) = this.t0.take() {
+                    this.sink
+                        .timer(&format!("srv.wait.{}", this.kind), t0.elapsed());
+                }
+                std::task::Poll::Ready(v)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
 }
 
 impl GpuClient {
     /// client 构造函数:**纯句柄**(管道的 client 端;管道由外部组装者
     /// 创建后分别传入 server 与 client,双方都不自创管道)。
     pub fn new(tx: mpsc::Sender<Command>) -> Self {
-        Self { tx }
+        Self { tx, sink: owl_shared::log::LogSink::none() }
+    }
+
+    /// 带下沉口构造(组装糖/spawn_with 用;两侧同 sink)
+    pub fn with_sink(tx: mpsc::Sender<Command>, sink: owl_shared::log::LogSink) -> Self {
+        Self { tx, sink }
     }
 
     /// 投递信封,返回回执 Future(client 侧 `.await`)。
@@ -39,8 +78,22 @@ impl GpuClient {
         build: impl FnOnce(Ack<Result<T, ModelError>>) -> Command,
     ) -> Result<impl Future<Output = Result<T, ModelError>>, ModelError> {
         let (ack, waiter): (Ack<_>, Waiter<_>) = Ack::pair();
-        self.tx.send(build(ack)).map_err(|_| ModelError::ServerClosed)?;
-        Ok(waiter)
+        let cmd = build(ack);
+        let kind = cmd.kind();
+        // ① 入队(客户端侧):锁 mpsc + 唤醒服务端线程
+        let t_tx = if self.sink.timing() { Some(std::time::Instant::now()) } else { None };
+        self.tx.send(cmd).map_err(|_| ModelError::ServerClosed)?;
+        if let Some(t0) = t_tx {
+            self.sink.timer(&format!("srv.tx.{kind}"), t0.elapsed());
+        }
+        // ② 等回执(含服务端出队/处理/回执唤醒全程;`srv.wait − srv.op − srv.queue`
+        //    = 回执侧的唤醒延迟)
+        Ok(TimedWaiter {
+            inner: waiter,
+            t0: if self.sink.timing() { Some(std::time::Instant::now()) } else { None },
+            sink: self.sink,
+            kind,
+        })
     }
 }
 
@@ -62,7 +115,7 @@ impl GpuClient {
     /// thread::spawn(move || server.run());
     /// ```
     pub fn spawn(selector: DeviceSelector) -> Result<Self, String> {
-        Self::spawn_with(selector, crate::state::DiagOpts::default(), false)
+        Self::spawn_with(selector, crate::state::DiagOpts::default(), false, owl_shared::log::LogSink::none())
     }
 
     /// 带设备诊断选项组装(显式依赖律入口;engine 经 EngineKnobs 传入)
@@ -70,10 +123,11 @@ impl GpuClient {
         selector: DeviceSelector,
         diag: crate::state::DiagOpts,
         debug: bool,
+        sink: owl_shared::log::LogSink,
     ) -> Result<Self, String> {
         let (tx, rx) = mpsc::channel::<Command>();
         let (boot_tx, boot_rx) = mpsc::channel::<Result<(), String>>();
-        let server = GpuServer::with_diag(rx, selector, Some(boot_tx), diag, debug);
+        let server = GpuServer::with_diag_sink(rx, selector, Some(boot_tx), diag, debug, sink);
         std::thread::Builder::new()
             .spawn(move || {
                 // server 收摊 → 账房/图注册表随 ctx 析构,派发线程排空后退出
@@ -83,7 +137,7 @@ impl GpuClient {
         boot_rx
             .recv()
             .map_err(|e| format!("server boot 通道关闭: {e}"))??;
-        Ok(Self::new(tx))
+        Ok(Self::with_sink(tx, sink))
     }
 
     /// 优雅关机:server 进入 Closing —— 排空积压(结构化拒绝)+ 设备栅栏

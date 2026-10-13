@@ -24,7 +24,11 @@ pub(super) fn issue_launch(
     kernels: &mut KernelCache,
     msg: &LaunchMsg,
     debug: bool,
+    sink: owl_shared::log::LogSink,
 ) -> Result<u64, ModelError> {
+    // 分相秒表(注入口):prep = 装配 + 取核 + smem 守卫;issue = 发射调用。
+    // 与客户端 `interp.host.seg.launch` 对账 ⇒ 差值 = 管道(actor 队列往返)。
+    let t_prep = std::time::Instant::now();
     // 1. 参数槽装配:Block → 设备指针;BlockSlice → 块首 + 字节偏移;
     //    标量按类型入槽
     let mut slots: Vec<Slot> = Vec::with_capacity(msg.args.len());
@@ -64,9 +68,10 @@ pub(super) fn issue_launch(
             Slot::I(v) => format!("i32 {v}"),
             Slot::F(v) => format!("f32 {v}"),
         }).collect();
-        eprintln!("[dbg launch-ptr] {} = {addrs:?}", msg.kernel.name);
-        eprintln!(
-            "[dbg launch] {} slots = {:?}",
+        sink.logf(owl_shared::log::LVL_DEBUG, "dbg", format_args!("launch-ptr {} = {addrs:?}", msg.kernel.name));
+        sink.logf(
+            owl_shared::log::LVL_DEBUG, "dbg", format_args!(
+            "launch {} slots = {:?}",
             msg.kernel.name,
             msg.args
                 .iter()
@@ -80,11 +85,11 @@ pub(super) fn issue_launch(
                     Arg::F32(v) => format!("F32({v})"),
                 })
                 .collect::<Vec<_>>()
-        );
+        ));
     }
 
     // 2. 懒编译(缓存命中直返)
-    let func = kernels.ensure_kernel(&ctx.ctx, &msg.kernel.name, &msg.kernel.source)?;
+    let func = kernels.ensure_kernel(&ctx.ctx, &msg.kernel.name, &msg.kernel.source, sink)?;
 
     // 2.4 硬顶守卫:动态 smem 超设备 opt-in 上限 → 结构化拒绝(提前到
     // 发射前,而非驱动层泛化 INVALID_VALUE)。开销 = 一次字段比较
@@ -107,15 +112,18 @@ pub(super) fn issue_launch(
         use cudarc::driver::sys::CUfunction_attribute_enum as Attr;
         let r = func.set_attribute(Attr::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
             msg.shared_mem as i32);
-        eprintln!("[dbg optin] {} smem={} set_attr={r:?} max_dyn_attr={:?}",
+        sink.logf(owl_shared::log::LVL_DEBUG, "dbg", format_args!(
+            "optin {} smem={} set_attr={r:?} max_dyn_attr={:?}",
             msg.kernel.name, msg.shared_mem,
-            func.get_attribute(Attr::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES));
+            func.get_attribute(Attr::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES)));
         r.map_err(|e| ModelError::Msg(format!(
             "launch({}): cudaFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE, {}) 失败: {e:?}",
             msg.kernel.name, msg.shared_mem)))?;
     }
 
     // 3. 发射(非阻塞:提交进流即返回)
+    sink.timer("srv.seg.prep", t_prep.elapsed());
+    let t_issue = std::time::Instant::now();
     unsafe {
         let mut builder = stream.launch_builder(&func);
         for slot in &slots {
@@ -134,6 +142,7 @@ pub(super) fn issue_launch(
             })
             .map_err(|e| ModelError::Msg(format!("launch({}): {e}", msg.kernel.name)))?;
     }
+    sink.timer("srv.seg.issue", t_issue.elapsed());
 
     // 4. 输出块句柄(槽序契约:最后一个 Block;BlockSlice 仅入参不参与)
     let out_id = msg

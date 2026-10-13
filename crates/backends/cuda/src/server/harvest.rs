@@ -6,7 +6,14 @@ use super::*;
 
 impl GpuServer {
 
+    /// srv.seg.htod 分相(与客户端同名段对账;差值 = 管道/等待)
     pub(super) fn handle_htod(&mut self, data: Vec<u8>, ack: Ack<Result<Bytes, ModelError>>) {
+        let t0 = std::time::Instant::now();
+        self.handle_htod_inner(data, ack);
+        self.sink.timer("srv.seg.htod", t0.elapsed());
+    }
+
+    pub(super) fn handle_htod_inner(&mut self, data: Vec<u8>, ack: Ack<Result<Bytes, ModelError>>) {
         let mut ack = Some(ack);
         let n = data.len();
         let stream = match self.ctx().stream(STREAM_H2D) {
@@ -141,7 +148,7 @@ impl GpuServer {
             // DMA 未发生 —— 块内容缺失由调用方末端 sync 后自查/重试兜底)
             if let Some(buf) = cell.lock().unwrap().take() {
                 pool_err.put(buf);
-                owl_shared::log_debug!("srv", "upload notify 失败: {e:?}");
+                self.sink.logf(owl_shared::log::LVL_DEBUG, "srv", format_args!("upload notify 失败: {e:?}"));
             }
         }
     }
@@ -273,7 +280,19 @@ impl GpuServer {
         }
     }
 
+    /// srv.seg.dtoh 分相(与客户端同名段对账;差值 = 管道/等待)
     pub(super) fn handle_dtoh(
+        &mut self,
+        id: u64,
+        want_bytes: usize,
+        ack: Ack<Result<Vec<u8>, ModelError>>,
+    ) {
+        let t0 = std::time::Instant::now();
+        self.handle_dtoh_inner(id, want_bytes, ack);
+        self.sink.timer("srv.seg.dtoh", t0.elapsed());
+    }
+
+    pub(super) fn handle_dtoh_inner(
         &mut self,
         id: u64,
         want_bytes: usize,
@@ -299,7 +318,7 @@ impl GpuServer {
             owl_shared::vram::free_set(free as u64);
         }
         if let Some(t) = t_d2h {
-            owl_shared::log_debug!("d2h-prof", "sync={:?} n={want_bytes}", t.elapsed());
+            self.sink.logf(owl_shared::log::LVL_DEBUG, "d2h-prof", format_args!("sync={:?} n={want_bytes}", t.elapsed()));
         }
         let stream = match self.ctx().stream(STREAM_D2H) {
             Ok(s) => s.clone(),
@@ -310,7 +329,7 @@ impl GpuServer {
         match self.try_dtoh(&stream, id, want_bytes) {
             Ok(staging) => {
                 if let Some(t) = t_d2h2 {
-                    owl_shared::log_debug!("d2h-prof", "issue={:?}", t.elapsed());
+                    self.sink.logf(owl_shared::log::LVL_DEBUG, "d2h-prof", format_args!("issue={:?}", t.elapsed()));
                 }
                 // 完成 → 码头字节直出(传输面字节口径)→ 回执 → 码头归还池
                 let mut cb_ack = ack.take();

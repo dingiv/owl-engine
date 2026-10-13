@@ -225,10 +225,12 @@ static BOOT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 impl Engine<GpuClient> {
     /// 常规构造:按 cfg 绑定 GPU(ordinal)
     pub fn new(cfg: EngineConfig) -> Result<Self> {
+        // 诊断下沉口(boot 一次组装,显式下传):日志 + 发射/回收计时
         let face = GpuClient::spawn_with(
             DeviceSelector::Ordinal(cfg.device_ordinal),
             cfg.knobs.cuda.clone(),
             cfg.knobs.probes.debug,
+            owl_shared::log::sink(),
         )
             .map_err(|e| ModelError::Msg(format!("engine: gpu 绑定失败 {e:?}")))?;
         Self::on(cfg, face)
@@ -502,6 +504,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
 
         let (session, capture_outcome) = GraphPlan::plan(
             self.face,
+            env,
             GraphPlanDesc {
                 inputs: {
                     let mut v = vec![
@@ -617,6 +620,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
             }
             let (vg, voutcome) = GraphPlan::plan(
                 vface,
+                env,
                 GraphPlanDesc {
                     inputs: vec![
                         InputSlot::f32("ids", depth1),
@@ -797,6 +801,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
                 };
                 let (fg, fout) = GraphPlan::plan(
                     fface,
+                    env,
                     GraphPlanDesc {
                         inputs: vec![
                             InputSlot::f32("slots", 1).init(vec![0.0]),
@@ -872,6 +877,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
                     Some(gface) => {
                         let (dg, dout) = GraphPlan::plan(
                             gface,
+                            env,
                             GraphPlanDesc {
                                 inputs: vec![
                                     InputSlot::f32("tokens", 8),
@@ -996,6 +1002,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
                     let pface = extra_faces.pop().expect("extra face");
                     let (pg, pout) = GraphPlan::plan(
                         pface,
+                        env,
                         GraphPlanDesc {
                             inputs: pins,
                             outputs: vec![OutputSlot { name: "drafts".into(), shape: vec![spec_depth, 1], dtype: Dtype::F32 }],

@@ -45,7 +45,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ============================================================================
 // §1 级别
@@ -484,6 +484,122 @@ pub fn set_tags(allow: Vec<String>, deny: Vec<String>) -> bool {
         }
         None => false,
     }
+}
+
+// ============================================================================
+// §4b 下沉口(LogSink):**注入面**
+// ============================================================================
+//
+// 为什么需要:设备面(`crates/backends/cuda` 的 GPU server)与算子面
+// (`crates/kernels`,**lib 零依赖律** —— 不能依赖 owl-shared)都要能说话,
+// 但不能反过来依赖日志/指标 crate。正解 = **注入**:这类下层只持一个
+// **零状态可 Copy 的函数指针包**,由上层(GPU server 构造函数 / 引擎)
+// 显式传入。
+//
+// 一个对象管三件事(都是「把事实抽出去」,不是新概念):
+// - `log(level, tag, msg)` —— 事件流(本模块);
+// - `timer(tag, dur)` / `count(tag, n)` —— 数值账(`crate::metrics`)。
+//
+// 未注入(= [`LogSink::none`])时全部静默且**零分支以外的开销**。
+
+/// 日志 + 计时下沉口(值语义;fn 指针不可捕获 ⇒ 实现方只能走进程级单例)
+#[derive(Clone, Copy, Default)]
+pub struct LogSink {
+    log: Option<fn(u8, &str, &str)>,
+    enabled: Option<fn(u8, &str) -> bool>,
+    timer: Option<fn(&str, Duration)>,
+    count: Option<fn(&str, u64)>,
+}
+
+impl LogSink {
+    /// 空口(全部丢弃;测试/无宿主场景)
+    pub const fn none() -> Self {
+        Self { log: None, enabled: None, timer: None, count: None }
+    }
+
+    /// 显式组装(各面可单独给)
+    pub const fn new(
+        log: Option<fn(u8, &str, &str)>,
+        enabled: Option<fn(u8, &str) -> bool>,
+        timer: Option<fn(&str, Duration)>,
+        count: Option<fn(&str, u64)>,
+    ) -> Self {
+        Self { log, enabled, timer, count }
+    }
+
+    /// 是否未接线(免无谓 format)
+    #[inline]
+    pub fn is_none(&self) -> bool {
+        self.log.is_none() && self.timer.is_none() && self.count.is_none()
+    }
+
+    /// 级/tag 准入(未接 enabled = 一律不过 —— 「没接就不打」)
+    #[inline]
+    pub fn enabled(&self, level: u8, tag: &str) -> bool {
+        match self.enabled {
+            Some(f) => f(level, tag),
+            None => self.log.is_some(),
+        }
+    }
+
+    /// 记一行(先准入再 format —— 不过门时零分配)
+    #[inline]
+    pub fn logf(&self, level: u8, tag: &str, args: std::fmt::Arguments<'_>) {
+        if !self.enabled(level, tag) {
+            return;
+        }
+        if let Some(f) = self.log {
+            f(level, tag, &std::fmt::format(args));
+        }
+    }
+
+    /// 计时**是否值得起表**(接线存在 + metrics 已到 HOST 级)
+    /// —— `off` 档不该白付 `Instant::now()`
+    #[inline]
+    pub fn timing(&self) -> bool {
+        self.timer.is_some()
+            && crate::metrics::PERF_BUILD
+            && crate::metrics::level() >= crate::metrics::level::HOST
+    }
+
+    /// 记一段耗时(落 metrics;tag 律 `<plane>.<class>[.<detail>]`)
+    #[inline]
+    pub fn timer(&self, tag: &str, d: Duration) {
+        if let Some(f) = self.timer {
+            f(tag, d);
+        }
+    }
+
+    /// 计数
+    #[inline]
+    pub fn count(&self, tag: &str, n: u64) {
+        if let Some(f) = self.count {
+            f(tag, n);
+        }
+    }
+}
+
+fn sink_log(level: u8, tag: &str, msg: &str) {
+    if let Some(g) = LOGGER.get() {
+        g.emit(level, tag, msg);
+    }
+}
+
+fn sink_enabled(level: u8, tag: &str) -> bool {
+    LOGGER.get().is_some_and(|g| g.enabled(level, tag))
+}
+
+fn sink_timer(tag: &str, d: Duration) {
+    crate::metrics::with_metrics_store(|s| s.timer_record_tag(tag, d, file!(), line!()));
+}
+
+fn sink_count(tag: &str, n: u64) {
+    crate::metrics::with_metrics_store(|s| s.counter_add(tag, n, file!(), line!()));
+}
+
+/// 全局 logger + metrics 的现成接线(应用入口/引擎构造时取一次,显式下传)
+pub fn sink() -> LogSink {
+    LogSink::new(Some(sink_log), Some(sink_enabled), Some(sink_timer), Some(sink_count))
 }
 
 // ============================================================================

@@ -238,3 +238,167 @@ prompt 24 tok + 128 输出(ignore_eos)/ greedy-decode 档(sampling,非 spec)。
 - 但当前 24 tok chunk 下宿主只占 1.9% ⇒ **宿主不是本档瓶颈**;优先序仍应是
   设备侧面(GEMM/GDN/attention 的 GPU 时间分布),否则会在无意义的微观优化上花时间。
   ⇒ **先交 P5(GPU 面),再定刀**。
+
+---
+
+## 九、P5 第一步:注入式下沉口(LogSink)+ 服务端分相(2026-10-14 用户指令)
+
+### 9.1 为什么要"注入"而不是"依赖"
+
+设备面(`crates/backends/cuda`)与算子面(`crates/kernels`)**不能反过来依赖
+日志/指标 crate**:kernels 的 **lib 零依赖律**(owl-shared 只在它的
+dev-dependencies)是硬约束;cuda 虽有 owl-shared,但让下层自己去找全局
+单例也违背「显式依赖律」。
+
+⇒ 做法:**一个零状态可 Copy 的函数指针包**,由上层在**构造函数**注入:
+
+```rust
+// owl_shared::log::LogSink —— 一个对象管三件事
+log(level, tag, msg)   // 事件流(→ logger)
+timer(tag, dur)        // 数值账(→ metrics timer_record_tag)
+count(tag, n)          // 计数
+```
+
+- `GpuServer::with_diag_sink(rx, selector, boot, diag, debug, sink)`
+  —— **GPU server 构造函数持 sink**;`with_diag` 沿用旧签名(注入
+  `LogSink::none()` = 全静默);
+- 引擎 boot 处一次性组装:`GpuClient::spawn_with(…, owl_shared::log::sink())`
+  (`sink()` = 全局 logger + metrics 的现成接线);
+- cuda 内所有打印改走 `self.sink.logf(LEVEL, tag, format_args!(…))`
+  —— **先准入再 format**(不过门时零分配),`LogSink::none()` 时全静默;
+- 顺带解决 kernels 13 处挂账的**同型方案**(将来把 sink 经 `Exec`/registry
+  初始化面传进 kernels 即可,不动依赖图)。
+
+### 9.2 服务端分相(发射/回收路径)
+
+| tag | 位置 | 含义 |
+|---|---|---|
+| `srv.op.<核名>` | `handle_launch` 包络 | 逐算子服务端总时(两路都覆盖) |
+| `srv.seg.prep` | `issue_launch` 前段 | 参数槽装配 + 取核 + smem 守卫 + 准入 |
+| `srv.seg.issue` | `issue_launch` 后段 | 真正的 `cuLaunchKernel` 提交 |
+| `srv.seg.fam` | 家族(foreign)路 | registry.execute(FFI/marshal) |
+| `srv.seg.alloc` / `srv.seg.free` | `handle_alloc`/`handle_free` | 池块分配 / 回收 |
+| `srv.seg.htod` / `srv.seg.dtoh` | harvest | 搬运两向(`dtoh` 前等 COMPUTE 排空) |
+| `srv.count.free_blocks` | `handle_free` | 回收块数 |
+
+### 9.3 首次对账(同 epoch;27B/3090Ti/f16 池;2 请求 × 32 tok)
+
+| 段 | 客户端观测 | 服务端真活 | **管道/调度** |
+|---|---:|---:|---:|
+| 原生发射 | `interp.host.seg.launch` **22.4 µs** | prep 0.57 + issue 4.7 = **5.3 µs** | **17.1 µs(76%)** |
+| 分配 | `interp.host.seg.alloc` **16.1 µs** | `srv.seg.alloc` **4.5 µs** | **11.6 µs(72%)** |
+| 家族路发射 | (含在上面) | `srv.seg.fam` **13.4 µs** | ≈9 µs |
+| 回收 | — | `srv.seg.free` 4.2 µs | — |
+| H2D | `interp.host.node.*.htod` 60 µs | `srv.seg.htod` 15.3 µs | ≈45 µs |
+| 逐算子总 | `interp.host.node` 66.6 ms / 4799 节点 | `srv.op` 17.4 ms / 1429 发 | — |
+
+**结论(第一杠杆)**:解释器宿主链的**七成以上是「到 actor 的往返」**,
+服务端真干活只有 4-13 µs/命令。`resolve/lower/build` 合计 <3 µs
+(选核/构件/线格式**不是**问题)。
+
+**免费代理**:`srv.seg.dtoh` = **21.9 ms/步**(它必须等 COMPUTE 排空)
+⇒ 这是**图态 decode 的步 GPU 时代理**,不必等逐核 event 对就能看趋势
+(带宽地板 ≈13 ms/步 ⇒ 表面 1.7× 空间)。
+
+### 9.4 管道税拆解(第二轮探针:tx / queue / op / wait 四表)
+
+四只表:`srv.tx.<kind>`(客户端入队)、`srv.queue.<kind>`(入队→服务端出队,
+客户端在 `Ack` 上盖 `created` 时间戳、服务端出队时相减)、`srv.op.<核名>`
+(服务端处理全程)、`srv.wait.<kind>`(客户端等回执全程)。
+
+**一次 `launch` 命令的完整生命周期(1429 次,同 epoch,单位 µs/次)**
+
+| 段 | 每次 | 归属 |
+|---|---:|---|
+| `srv.tx.launch` | **1.84** | 客户端:锁 mpsc + 入队 + unpark |
+| `srv.queue.launch` | **6.67** | **入向唤醒延迟**(线程 park→run,跨核) |
+| `srv.op`(真活) | **10.86** | 服务端 |
+| ├ `srv.seg.prep` | 0.48 | 参数装配 + 取核 + smem 守卫 |
+| ├ `srv.seg.issue` | **4.05** | 真正的 `cuLaunchKernel` |
+| ├ `srv.seg.fam` | 11.52(449 发) | 家族路 FFI/marshal |
+| └ **余(准入+分派+回执记账)** | **≈6.3** | 白名单线性扫描等 |
+| 回执唤醒 + 客户端 poll | ≈1.44 | ack `waker.wake` → 引擎线程 |
+| **= `srv.wait.launch`** | **20.81** | 客户端看到的等回执全程 |
+| 客户端 `interp.host.seg.launch` | **23.19** | 再 +2.4 = boxed-future 链 poll 重入 |
+
+其余 kind(同 epoch):`alloc` tx 1.83 / queue 6.74 / seg 3.72 / wait 14.31;
+`free` tx 1.84 / queue 6.74 / seg 3.19 / **wait 16.09**(残余 4.3 = 分派 +
+回收记账,含每批 event 钉序);`dtoh` wait 22.14 ms vs seg 21.91 ms ⇒
+**税仅 ~7 µs,全是等排空**(GPU 边界)。
+
+**结论(推翻了上一轮的猜测)**:
+1. **免回执收益很小**(回执侧唤醒仅 ~1.4 µs + await 重入 2.4 µs);
+2. **最大单项 = 入向唤醒 6.67 µs/命令**(跨核 park→run);
+3. **服务端真活 10.86 µs 里,纯发射只有 4.5 µs,余 ≈6.3 µs 是准入/分派/记账**;
+4. 每 `Call` 节点两条命令(alloc+launch)⇒ 税 ≈ **25 µs/节点**,服务端真活
+   ≈22 µs/节点(其中"真的发起 GPU 动作"只有 ~9 µs)。
+
+---
+
+## 十、decode 测量(2026-10-14;含图态/eager A/B 与三条方法论修正)
+
+档:`testdata/server/decode-{graph,eager}-27b.toml`(同 prompt 410 tok、同 32 输出、
+`--ignore-eos`、bare f16 池、无 spec、单会话;3090 Ti)。
+
+### 10.1 基线(图态,256 tok 全程)
+
+| 量 | 值 |
+|---|---:|
+| 轮墙(含 TTFT) | 7.85 s |
+| `engine.phase.prefill` | 357.6 ms(410 tok ⇒ ~1150 t/s) |
+| `engine.phase.decode` | 6.470 s / 255 = **25.37 ms/步** |
+| `srv.seg.dtoh` | 23.34 ms/步(**等 COMPUTE 排空 + D2H** = 图态 GPU 时) |
+| `srv.wait.graph_launch` | 36.5 µs/步(整步一次提交:tx 2.8 + queue 15.7 + 回放) |
+| host 采样/决策 | 25.37 − 23.66 = **~1.7 ms/步(6.7%)** |
+| 解码图材料单 | **836 节点**(marlin 352 / farn 64 / rmsnorm 65 / silu 64 / add 64 / gdn×3 144 / attn 32 / 其余) |
+
+⇒ **decode 92% 是 GPU 边界,6.7% 是 host 采样链,0.2% 是提交税。**
+
+### 10.2 图态 vs eager(同 prompt / 同 32 tok / 同 ctx 区间,冷启动已排除)
+
+| | graph | eager |
+|---|---:|---:|
+| 步时 `decode.step` | **25.18 ms** | **47.61 ms** |
+| `srv.seg.dtoh`/步 | **22.91 ms** | **2.06 ms** |
+| 命令管线等待/步 | ~0.04 ms | **~27 ms**(616 launch×23.9µs + 616 alloc×20.4µs) |
+| 树声明(`declare_outputs`)+ 其余 | ~0(捕获一次) | **~17 ms** |
+| host 采样 | ~1.7 ms | ~1 ms |
+
+⇒ **图替我们省 22.4 ms/步(47%)**,省的是「每步重建 SSA 树 ~17ms + 命令管道 ~27ms」,
+代价是设备侧节点派发(已含在 22.9 ms 里)。
+
+### 10.3 三条方法论修正(入册)
+
+1. **`srv.seg.dtoh` 只在图态是「GPU 时」代理** —— 图态 22.91 ms/步
+   (整步一次性提交后等排空 = 真 GPU 时);eager 态只有 **2.06 ms/步**
+   (host 提交慢,GPU 早已空)⇒ **同一指标两态语义相反**,跨态不可比。
+2. **样本容量 4096/tag 的静默截断** —— 256 tok 档里 `marlin`/`block`/`view`/
+   `interp.host.seg.*` 全部 **count = 4096(顶到 cap)**,`dropped` 才看得出。
+   判读纪律:**看 `drop` 字段;per-sample 均值仍有效,总数与会话级计数无效**。
+3. **`unk` 相位 = GraphPlan 缺 env** —— eager 臂的节点全落
+   `interp.host.node.unk.*`,因为 `GraphPlan::replay → eval_current →
+   eval_ops_multi()` **不带 EnvProvider**(`EnvProvider::default().phase = Unk`)。
+   修法:把 env 穿进 GraphPlan(小改)。
+
+### 10.4 ✅ 已修:eager 臂 decode 每步泄漏 → ~100 步 OOM(真 bug)
+
+`GraphPlan::replay` 的 `Mode::Eager` 走 [`eval_current`](../crates/engine/src/graph_plan.rs)
+→ **`eval_ops_multi`(plain 口径:块常驻,无回收)** ⇒ 每步中间块全留存,
+实测 ~100 步后 `CUDA_ERROR_OUT_OF_MEMORY`,且**失败后池不可恢复**(后续请求立刻再 OOM)。
+生产走 Captured 所以从未暴露。
+
+**修复(2026-10-14,用户指令「先修 bug」)**:
+1. `eval_current` 改 **`eval_ops_multi_scoped_env`**(per-node 活性回收 +
+   末次 arena−roots 清扫)⇒ 中间块当轮即还;
+2. **上一轮声明输出显式回收**(入口处 `free`)—— 契约:`output_*` 句柄
+   仅在**本次回放内**有效,跨回放使用 = 悬空 id → 服务端结构化
+   `DeadBlock`(**fail loud**,不会静默错值);捕获臂不受影响(slab 常驻);
+3. `plan()` 的 warmup 收尾从 `last.clear()`(只丢句柄)改**显式 free**;
+4. **顺带修 `unk` 相位**(同一条链路):`EnvProvider` 贯入 `GraphPlan`,
+   并新增 `RunningEngine::set_phase`(引擎 env + 5 类 plan 的 env 快照同步)
+   ⇒ eager 臂节点从 `interp.host.node.unk.*` 正名为 `.decode.*`。
+
+**验收**:eager 臂 410 tok prompt + **256 tok × 2 次全通**,`[vram-trace]`
+两轮 `free=2869MiB` **零增长**;graph 臂回归 25.25 ms/步(改前 25.18,噪声内);
+engine lib **22/22**;engine e2e 全场景 **1 passed(255.5s,含 spec/DFlash2
+恒等门)**;clippy 0 警。

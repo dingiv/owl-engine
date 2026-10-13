@@ -132,6 +132,54 @@ pub enum Command {
     },
 }
 
+impl Command {
+    /// 命令类名(分相 tag 维度;**有界词表**,与各变体一一对应)
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::GraphBegin { .. } => "graph_begin",
+            Self::GraphEnd { .. } => "graph_end",
+            Self::GraphLaunch { .. } => "graph_launch",
+            Self::Alloc { .. } => "alloc",
+            Self::Htod { .. } => "htod",
+            Self::MemsetZero { .. } => "memset_zero",
+            Self::HtodChunk { .. } => "htod_chunk",
+            Self::HtodChunks { .. } => "htod_chunks",
+            Self::AllocPinned { .. } => "alloc_pinned",
+            Self::UploadPinned { .. } => "upload_pinned",
+            Self::Dtoh { .. } => "dtoh",
+            Self::Free { .. } => "free",
+            Self::CopyBlock { .. } => "copy_block",
+            Self::CopyBatch { .. } => "copy_batch",
+            Self::Launch { .. } => "launch",
+            Self::Sync { .. } => "sync",
+            Self::Close { .. } => "close",
+        }
+    }
+
+    /// 命令创建时刻(客户端 Ack::pair 盖;**分相探针**:server 出队读)
+    pub fn created_at(&self) -> std::time::Instant {
+        match self {
+            Self::GraphBegin { ack } => ack.created_at(),
+            Self::GraphEnd { ack } => ack.created_at(),
+            Self::GraphLaunch { ack, .. } => ack.created_at(),
+            Self::Alloc { ack, .. } => ack.created_at(),
+            Self::Htod { ack, .. } => ack.created_at(),
+            Self::MemsetZero { ack, .. } => ack.created_at(),
+            Self::HtodChunk { ack, .. } => ack.created_at(),
+            Self::HtodChunks { ack, .. } => ack.created_at(),
+            Self::AllocPinned { ack, .. } => ack.created_at(),
+            Self::UploadPinned { ack, .. } => ack.created_at(),
+            Self::Dtoh { ack, .. } => ack.created_at(),
+            Self::Free { ack, .. } => ack.created_at(),
+            Self::CopyBlock { ack, .. } => ack.created_at(),
+            Self::CopyBatch { ack, .. } => ack.created_at(),
+            Self::Launch { ack, .. } => ack.created_at(),
+            Self::Sync { ack, .. } => ack.created_at(),
+            Self::Close { ack, .. } => ack.created_at(),
+        }
+    }
+}
+
 // ============================================================================
 // 回执桥(waker oneshot;server 侧 send 唤醒,client 侧 Future 真异步 pending)
 // ============================================================================
@@ -142,14 +190,25 @@ pub enum Command {
 struct Once<T> {
     value: Mutex<Option<T>>,
     waker: Mutex<Option<Waker>>,
+    /// 命令创建时刻(客户端 [`Ack::pair`] 盖;server 出队读 ⇒ 队列等待可测)
+    created: std::time::Instant,
 }
 
 pub struct Ack<T>(Arc<Once<T>>);
 
 impl<T> Ack<T> {
     pub fn pair() -> (Self, Waiter<T>) {
-        let inner = Arc::new(Once { value: Mutex::new(None), waker: Mutex::new(None) });
+        let inner = Arc::new(Once {
+            value: Mutex::new(None),
+            waker: Mutex::new(None),
+            created: std::time::Instant::now(),
+        });
         (Self(inner.clone()), Waiter(inner))
+    }
+
+    /// 命令创建时刻(分相探针:server 出队时减它 = 入队→出队的唤醒延迟)
+    pub fn created_at(&self) -> std::time::Instant {
+        self.0.created
     }
 
     /// server 侧回执:落值 + 唤醒 client Future
