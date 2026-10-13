@@ -255,6 +255,50 @@ pub static EMBED_F16: KernelMeta = meta_of::<EmbedF16>();
 pub static ARGMAX_F32IDX_F16: KernelMeta = meta_of::<ArgmaxF32IdxF16>();
 pub static TOPK16_F16: KernelMeta = meta_of::<Topk16F16>();
 
+/// `owl_topk16_split_f16` —— split-K 段一(grid = rows×nparts):
+/// 每块扫 vocab/nparts,uint4 向量载入 + 寄存器全展开插入 + warp 锦标赛归并
+/// (2026-10-14 D2:旧单块核 grid=(rows,1,1) 只用 7/132 SM)
+pub struct Topk16SplitF16;
+
+impl KernelSpec for Topk16SplitF16 {
+    const ENTRY: &'static str = "owl_topk16_split_f16";
+    const SRC: &'static str = "cu/elems/dflash_topk.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("x", Dtype::F16, 2),
+        Param::i32("vocab"),
+        Param::i32("nparts"),
+        Param::i32("rows"),
+        // 单输出槽:值区 [rows*nparts*K] + 索引区(int32 位型)[rows*nparts*K]
+        Param::t_out("tmp", Dtype::F32, 1),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+pub static TOPK16_SPLIT_F16: KernelMeta = meta_of::<Topk16SplitF16>();
+
+/// `owl_topk16_merge_f16` —— split-K 段二(一行一 warp,零同步):
+/// nparts×16 候选 → top-16,输出布局与卷 `owl_topk16_f16` 逐位一致
+pub struct Topk16MergeF16;
+
+impl KernelSpec for Topk16MergeF16 {
+    const ENTRY: &'static str = "owl_topk16_merge_f16";
+    const SRC: &'static str = "cu/elems/dflash_topk.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("tmp", Dtype::F32, 1),
+        Param::i32("nparts"),
+        Param::i32("rows"),
+        Param::i32("vocab"),
+        Param::t_out("out", Dtype::F32, 1),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+pub static TOPK16_MERGE_F16: KernelMeta = meta_of::<Topk16MergeF16>();
+
 
 // ============================================================================
 // `elems.rs` 域 R1 补表
@@ -591,6 +635,8 @@ pub static METAS: &[&KernelMeta] = &[
     &EMBED_F16,
     &ARGMAX_F32IDX_F16,
     &TOPK16_F16,
+    &TOPK16_SPLIT_F16,
+    &TOPK16_MERGE_F16,
     &OWL_ADD_F32,
     &OWL_MUL_F32,
     &OWL_MUL_F16,

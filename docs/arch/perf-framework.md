@@ -464,3 +464,33 @@ CUPTI 驱动回调线程 ──shim(只 memcpy)──► 旁路缓冲 ──► 
 **draft 图(graph 29)**:`owl_naive_attn_nc_bf16_v2` **1127.8 µs/层调用** × 5 层
 + `owl_topk16_f16` **1067.9 µs/次** + `owl_dflash_conv_bf16` 442 µs ⇒ 这是
 propose 轮(~11 ms)的大头,与 `spec.propose` 分相自洽。
+
+### 11.6 交付纪律(2026-10-14 补录,D2 战中现场抓)
+
+**⚠️ 排空线程必须周期 flush**。CUPTI 的 activity 记录**不是**实时交付:它们先进
+CUPTI 内部缓冲,**只有内部缓冲满、或显式 `cuptiActivityFlushAll`** 才经
+`on_buffer_completed` 交给我们(我们自己申请的 2 MiB 缓冲只是"交付容器")。
+首版实现只在 `stop()` 时 flush ⇒ **低体量负载样本恒为 0**(实测:几十轮 decode
+≈ 几 MB,不满分片 ⇒ `/debug/perf/epoch/gpu` 一行没有,而"武装成功"日志照常打印
+—— 静默失效,最坏的一种)。修法 = 排空线程**每 50 ms 先 `owl_cupti_flush()` 再排空**
+(专用线程,与驱动线程回调解耦;nsys 同款姿势)。
+
+**开销口径(复测)**:同一负载 `--perf-level host` vs `gpu` 的 `spec.round` =
+42.4 vs 43.6 ms/轮 ⇒ **+3%**(旧口径的 +5.4% 是另一种负载形状;两者同量级)。
+即:**逐核账可信,但别拿 gpu 档的数当绝对性能**。
+
+**判读纪律补充**:`gpu.graph.<gid>.<核名>` 的 `n` 是**回放次数**,
+`self/n` = 单次核时(ngraphId 归属能力见 §11.1)。同一核可能同时出现在
+verify / draft / fold 三个图里 —— 看 `gid` 分辨,别看总数。
+
+### 11.7 feature 转发链(2026-10-14 实测坑)
+
+`perf` 是**逐 crate 的 feature**:`server --features perf` 只点亮 `server`/`engine`/
+`shared` 的宏,而**解释器钩子住在 `crates/models`** ⇒ 若 `owl-engine/perf` 不转发
+`owl-models/perf`,则 `interp.host.node.*` / `interp.host.seg.*` **一行都不会出现**
+(`/debug/perf/interp` 空),而 `engine.phase.*` / `srv.*` / `gpu.*` 照常有 —— 
+**半哑状态,无任何告警**。修法:`crates/engine/Cargo.toml`
+`perf = ["owl-shared/perf", "owl-models/perf"]`(log 同款)。
+
+**纪律**:凡新增跨 crate 的 feature 门,必须①补齐转发链 ②真机跑一次并确认
+目标 tag 前缀**非空**(空 = 静默失效,比报错更贵)。

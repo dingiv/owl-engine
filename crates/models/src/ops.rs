@@ -144,6 +144,12 @@ pub enum SemanticKernel {
     Argmax,
     /// 逐行 top-16(值半区 + 索引半区双 f32;aux = [rows])
     Topk16,
+    /// 逐行 top-16 split-K 段一(2026-10-14 D2;aux = [rows, nparts];
+    /// 输出单缓冲 [2·rows·nparts·K]:值区 f32 + 索引区 int32 位型)
+    Topk16Split,
+    /// 逐行 top-16 split-K 段二(一行一 warp;aux = [rows];
+    /// 输入 = 段一单缓冲,输出 = 与 Topk16 逐位同布局的 [2·rows·K])
+    Topk16Merge,
     /// DFlash2 格打分 + 贪心 walk 融合(单块;输出 [rows·(K·K+1)])
     DflashSelect,
     /// DFlash2 分组动态深度 2-tap 卷积
@@ -232,6 +238,8 @@ impl SemanticKernel {
             SemanticKernel::CastBf16F16 => "elems.cast_bf16_f16",
             SemanticKernel::Argmax => "ops.argmax",
             SemanticKernel::Topk16 => "ops.topk16",
+            SemanticKernel::Topk16Split => "ops.topk16_split",
+            SemanticKernel::Topk16Merge => "ops.topk16_merge",
             SemanticKernel::DflashSelect => "dflash.select",
             SemanticKernel::DflashConv => "dflash.conv",
             SemanticKernel::NaiveAttnNc => "attn.naive_nc",

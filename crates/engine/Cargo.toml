@@ -24,9 +24,9 @@ owl-cpu = { path = "../backends/cpu" }
 
 [features]
 # 性能框架:release 也展开计时宏(见 workpace docs/arch/perf-framework.md)
-perf = ["owl-shared/perf"]
+perf = ["owl-shared/perf", "owl-models/perf"]
 # logger 框架:不开时五级日志宏全是空语句(编译期剔除)
-log = ["owl-shared/log"]
+log = ["owl-shared/log", "owl-models/log"]
 
 # E2E 场景面(docs/arch/test-architecture.md §三):集成测试经
 # `--features e2e` 导入源文件里的场景函数;生产构建零改动(整块 cfg 剔除)。

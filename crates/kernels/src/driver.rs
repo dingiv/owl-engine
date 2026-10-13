@@ -225,6 +225,8 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "ops.ts_stamp" => ops::ts_stamp(),
         "ops.argmax" => ops::argmax(),
         "ops.topk16" => ops::topk16(ax(0)),
+        "ops.topk16_split" => ops::topk16_split(ax(0), ax(1)), // aux = [rows, nparts]
+        "ops.topk16_merge" => ops::topk16_merge(ax(0)),        // aux = [rows]
         "ops.sigmoid_gate_mul" => attn::gate_mul(dt),
         "elems.cast_f16_bf16" => elems::cast_dir(false),
         "elems.cast_bf16_f16" => elems::cast_dir(true),
@@ -553,6 +555,24 @@ pub mod ops {
     /// 逐行 top-16(单缓冲 [rows, 32]:值半区降序 + 索引半区;aux = [rows])
     pub fn topk16(rows: usize) -> KernelPick {
         KernelPick::of::<crate::ops::elems::Topk16F16>(Shape { grid: (rows as u32, 1, 1), block: (256, 1, 1), smem: 0 })
+    }
+
+    /// split-K 段一(2026-10-14 D2;grid = rows×nparts,dyn 0)
+    pub fn topk16_split(rows: usize, nparts: usize) -> KernelPick {
+        KernelPick::of::<crate::ops::elems::Topk16SplitF16>(Shape {
+            grid: ((rows * nparts) as u32, 1, 1),
+            block: (256, 1, 1),
+            smem: 0,
+        })
+    }
+
+    /// split-K 段二(一行一 warp;grid = rows,block = 32)
+    pub fn topk16_merge(rows: usize) -> KernelPick {
+        KernelPick::of::<crate::ops::elems::Topk16MergeF16>(Shape {
+            grid: (rows as u32, 1, 1),
+            block: (32, 1, 1),
+            smem: 0,
+        })
     }
 
     /// rmsnorm:一 block 一行(×(1+w) 同核,w_off 入参;rows 从形状推导:

@@ -629,7 +629,8 @@ allowed_ops = [
         "owl_reshape_and_cache_fp8kv_knhd", "owl_rmsnorm_bf16",
         "owl_rmsnorm_f16", "owl_sigmoid_f16",
         "owl_sigmoid_gate_mul_f16", "owl_silu_and_mul_bf16",
-        "owl_silu_and_mul_f16", "owl_topk16_f16",
+        "owl_silu_and_mul_f16", "owl_topk16_merge_f16",
+        "owl_topk16_split_f16",
         "owl_xqa_decode", "owl_xqa_verify",
         "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256", "vllm_reshape_and_cache_bf16",
 ]

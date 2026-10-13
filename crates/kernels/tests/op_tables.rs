@@ -227,6 +227,8 @@ fn production_picks_carry_admission_meta() {
         ("embed", driver::elems::embed(DType::F16, 8)),
         ("argmax", driver::ops::argmax()),
         ("topk16", driver::ops::topk16(8)),
+        ("topk16 split", driver::ops::topk16_split(8, 16)),
+        ("topk16 merge", driver::ops::topk16_merge(8)),
         ("rmsnorm", driver::ops::rmsnorm(DType::F16, &rms_shapes)),
         (
             "fused_add_rmsnorm",

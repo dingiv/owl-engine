@@ -259,7 +259,7 @@ pub fn audit_active(
 //   ② 池写集穷举审计的输入(`audit_active`);
 //   ③ P3 建表范围的依据(生产集 100% 建表 = 本表 ⊆ `all()`)。
 
-/// `--flavor spec-dflash` 实测发射集(44 个;27B AWQ + DFlash2 d7 + fp8 主池
+/// `--flavor spec-dflash` 实测发射集(45 个;27B AWQ + DFlash2 d7 + fp8 主池
 /// + gdn_chunked + XQA verify/decode + int4 头)
 pub const PROD_SPEC_DFLASH_2026_10_13: &[&str] = &[
     "cublas_gemm_bf16",
@@ -301,7 +301,8 @@ pub const PROD_SPEC_DFLASH_2026_10_13: &[&str] = &[
     "owl_sigmoid_gate_mul_f16",
     "owl_silu_and_mul_bf16",
     "owl_silu_and_mul_f16",
-    "owl_topk16_f16",
+    "owl_topk16_merge_f16",
+    "owl_topk16_split_f16",
     "owl_xqa_decode",
     "owl_xqa_verify",
     "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256",

@@ -150,8 +150,18 @@ pub fn start(sink: owl_shared::log::LogSink) -> Result<(), String> {
                 if st.stop.load(Ordering::Relaxed) {
                     break;
                 }
+                // **先 flush 再排空**:CUPTI 的 activity 记录只在内部缓冲满或
+                // `cuptiActivityFlushAll` 时才经 `on_buffer_completed` 交付。
+                // 早期 PoC 只在 stop 时 flush ⇒ 低体量负载(几十轮 decode ≈
+                // 几 MB,不满 2 MiB 分片)永远拿不到样本(实测 0 行)。
+                // flush 跑在专用线程,与驱动线程回调解耦(nsys 同款姿势)。
+                unsafe { owl_cupti_flush() };
                 drain_once(st);
                 std::thread::sleep(Duration::from_millis(DRAIN_MS));
+            }
+            // 收尾:再 flush 一次拿残留,然后排空
+            if STATE.get().is_some() {
+                unsafe { owl_cupti_flush() };
             }
             if let Some(st) = STATE.get() {
                 drain_once(st); // 收尾排空

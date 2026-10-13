@@ -40,6 +40,7 @@ use crate::module::{ForwardCtx, KvBuffers, Module, QuantPlan, Weight};
 use crate::ops::SemanticKernel;
 use crate::TensorOps;
 
+// FIXME: 将来要支持其他dflash模型怎么办?
 // ---- 检查点家族定形常量(dflash_config 实测;z-lab/Qwen3.8-27B-DFlash2)----
 /// conv taps(conv_kernel_size)
 pub const TAPS: usize = 2;
@@ -51,6 +52,10 @@ pub const BLOCK: usize = 8;
 pub const DEPTH: usize = BLOCK - 1;
 /// selector 每 slot 候选数(selector_top_k)
 pub const TOP_K: usize = 16;
+
+/// top-16 的 split-K 分段数(2026-10-14 D2;实测 np=16 邻域最优:
+/// grid=rows×16 ≈ 单波 132 SM;见 crates/kernels/tests/topk16_probe.rs)
+pub const TOPK_NPARTS: usize = 16;
 /// selector 码本秩(selector_rank)
 pub const RANK: usize = 256;
 /// 噪声块 MASK token id(mask_token_id)
@@ -542,11 +547,23 @@ impl CandidateSelector {
         let rows = h - 1; // DEPTH
         let dim = hidden.shape()[1];
         let pred = hidden.slice_view(dim, vec![rows, dim]); // 行 1..(连续视图)
-        let topk = TensorOps::call(SemanticKernel::Topk16)
-            .aux(&[rows])
+        // top-16 = **split-K 两段**(2026-10-14 D2):段一 grid=rows×NPARTS 分段扫
+        // (旧的 grid=rows 只用 7/132 SM,实测 1068 µs/轮;纯扫描地板仅 16 µs),
+        // 段二一行一 warp 归并。输出布局与旧单核逐位同律(平局取小索引)。
+        let part = TensorOps::call(SemanticKernel::Topk16Split)
+            .aux(&[rows, TOPK_NPARTS])
             .arg(logits)
-        .arg_i32(self.vocab as i32)
-        .with_shape(Dtype::F32, vec![2 * rows * TOP_K]); // 值区 + 索引区(两段连续)
+            .arg_i32(self.vocab as i32)
+            .arg_i32(TOPK_NPARTS as i32)
+            .arg_i32(rows as i32)
+            .with_shape(Dtype::F32, vec![2 * rows * TOPK_NPARTS * TOP_K]);
+        let topk = TensorOps::call(SemanticKernel::Topk16Merge)
+            .aux(&[rows])
+            .arg(&part)
+            .arg_i32(TOPK_NPARTS as i32)
+            .arg_i32(rows as i32)
+            .arg_i32(self.vocab as i32)
+            .with_shape(Dtype::F32, vec![2 * rows * TOP_K]); // 值区 + 索引区(两段连续)
         let cand = topk.slice_view(rows * TOP_K, vec![rows, TOP_K]); // 索引区
         let vals = topk.slice_view(0, vec![rows, TOP_K]); // 值区(unary)
         // ② proj = hidden_projection(pred)[rows, RANK](dtype 随 hidden)
