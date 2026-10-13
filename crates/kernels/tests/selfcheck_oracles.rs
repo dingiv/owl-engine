@@ -23,7 +23,7 @@ use owl_kernels::ops::oracles::{
 #[cfg(feature = "marlin")]
 use owl_kernels::ops::oracles::marlin as ml;
 use owl_kernels::server::selfcheck::Runner;
-use owl_kernels::spec::{BootCheck, CheckRunner};
+use owl_kernels::bootcheck::{BootCheck, CheckRunner};
 
 /// 测试用资源面(最小实现:分配/上传/回读 —— oracle 的全部需求)
 struct TestRes {

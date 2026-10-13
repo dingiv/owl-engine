@@ -13,7 +13,7 @@
 //! HQ/HKV 缩小到 4/1 让 host 参考成本落在几十毫秒级。
 
 use crate::contract::{LaunchVal, OpError};
-use crate::spec::{BootCheck, CheckBuf, CheckReport, CheckRunner};
+use crate::bootcheck::{BootCheck, CheckBuf, CheckReport, CheckRunner};
 const DFLASH2_F16: &str = "cu/attn/naive_attn_nc.cu";
 
 use super::{bf16_to_f32, lcg_bf16};

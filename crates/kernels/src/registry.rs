@@ -332,7 +332,7 @@ impl OpRegistry {
             "[kernels] 算子准入:已声明 {} 张(原生表 + 家族臂 {})/ 编出符号 {} 条(未声明 {})",
             n_declared,
             n_family,
-            crate::list::ASSET_SYMBOLS.iter().map(|(_, s)| s.len()).sum::<usize>(),
+            crate::cu_sig::ASSET_SYMBOLS.iter().map(|(_, s)| s.len()).sum::<usize>(),
             undeclared.len()
         );
         if !undeclared.is_empty() {

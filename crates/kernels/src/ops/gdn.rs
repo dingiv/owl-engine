@@ -5,9 +5,7 @@
 //! `LAWS` 声明是装配期不变量门的挂点(设计 §5.5)。
 
 use crate::contract::{Dtype, Law};
-use crate::spec::{
-    meta_of, pools, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param, PoolAccess,
-};
+use crate::spec::{meta_of, pools, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param, PoolAccess};
 
 // ============================================================================
 // 门控 / 归一(前置琐核)

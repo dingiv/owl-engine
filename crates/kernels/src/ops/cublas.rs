@@ -24,7 +24,7 @@ impl KernelSpec for CublasGemmF16 {
         // 转置标志(**不是变体选择**;cublas nt 形参)
         Param::sz("nt"),
     ];
-    const SELFCHECK: Option<&'static dyn crate::spec::BootCheck> =
+    const SELFCHECK: Option<&'static dyn crate::bootcheck::BootCheck> =
         Some(&crate::ops::oracles::cublas_gemm::CublasGemmOracle);
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;

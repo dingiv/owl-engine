@@ -4,9 +4,7 @@
 //! 共享 `GDN_STATE` 状态池(rw / f32)。槽序权威历史 = `client::gdn_scalar::SIG`。
 
 use crate::contract::{Dtype, Law};
-use crate::spec::{
-    meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param, ScalarTy,
-};
+use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param, ScalarTy};
 
 /// `gdn_scalar_delta_rule_fwd` —— GDN scalar 前向(单核 + cast 编排入口)
 pub struct GdnScalarDeltaRuleFwd;

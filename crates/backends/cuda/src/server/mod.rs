@@ -660,7 +660,7 @@ impl GpuServer {
     /// 未建表算子(`meta() == None`,处于"仅引入"状态)= 放行但无门 ——
     /// P4 的生产白名单硬门才会把"未建表进生产"变成拒启。
     fn admission_check(&self, msg: &LaunchMsg) -> Result<(), owl_kernels::contract::OpError> {
-        use owl_kernels::spec::{CheckCtx, Geom};
+        use owl_kernels::bootcheck::{CheckCtx, Geom};
         // ① 白名单硬门(deny-by-default;门关时跳过)
         if let Some(list) = &self.allowed_ops {
             if !list.iter().any(|n| n == &msg.kernel.name) {

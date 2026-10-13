@@ -9,7 +9,7 @@
 //! 2. 派生逻辑本身正确(若派生写错,这里也会红);
 //! 3. 输出槽 `O` 确实落在 `.cu` 的指针位上。
 //!
-//! 解析器 = [`owl_kernels::list::parse_cu_sig`](**唯一**解析器;登记表
+//! 解析器 = [`owl_kernels::cu_sig::parse_cu_sig`](**唯一**解析器;登记表
 //! 的 C2 门与本门共用它 —— 两道门各写一份解析 = 各说各话,见坑册)。
 
 use owl_kernels::ops;
@@ -25,13 +25,13 @@ fn op_tables_match_cu_signatures() {
         }
         // E 轮(2026-10-13):`SRC` 已从"源文本"改为**资产 id** —— 文本按需
         // 从磁盘取(仅测试面;运行期不再需要任何 `.cu` 文本)。
-        let text = owl_kernels::list::cu_text(m.src);
+        let text = owl_kernels::cu_sig::cu_text(m.src);
         assert!(
             text.contains("extern \"C\" __global__"),
             "{}: 资产 {} 不是核源码(拿错文件?)",
             m.entry, m.src
         );
-        let actual = owl_kernels::list::parse_cu_sig(&text, m.entry)
+        let actual = owl_kernels::cu_sig::parse_cu_sig(&text, m.entry)
             .unwrap_or_else(|| panic!("{}: 源码里找不到同名入口", m.entry));
         // 线槽序里 `O`(输出角色)在 `.cu` 里就是一个指针位 ⇒ 归一 T 后比对
         let normalized = m.args_str().replace('O', "T");

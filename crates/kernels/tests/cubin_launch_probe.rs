@@ -205,7 +205,7 @@ fn nvrtc_and_fatbin_agree_bitwise() {
     let ctx = CudaContext::new(ord).expect("context");
     // NVRTC 对照臂:源文本按资产 id 从磁盘取(仅测试面;生产路径零源文本)
     let src_id = owl_kernels::spec::meta_of::<owl_kernels::ops::elems::AddF16>().src;
-    let src = owl_kernels::list::cu_text(src_id);
+    let src = owl_kernels::cu_sig::cu_text(src_id);
     let ptx = cudarc::nvrtc::compile_ptx_with_opts(
         &src,
         cudarc::nvrtc::CompileOptions {
@@ -296,7 +296,7 @@ fn aot_equiv_rmsnorm_f16() {
     let ctx = CudaContext::new(ord).expect("ctx");
     let stream = ctx.default_stream();
     let src_id = owl_kernels::spec::meta_of::<owl_kernels::ops::ln::RmsnormF16>().src;
-    let src = owl_kernels::list::cu_text(src_id);
+    let src = owl_kernels::cu_sig::cu_text(src_id);
     let (mn, mf) = dual_modules(&ctx, src_id, &src);
 
     const ROWS: usize = 8;
@@ -349,7 +349,7 @@ fn aot_equiv_argmax_ties() {
     let ctx = CudaContext::new(ord).expect("ctx");
     let stream = ctx.default_stream();
     let src_id = owl_kernels::spec::meta_of::<owl_kernels::ops::elems::ArgmaxF32IdxF16>().src;
-    let src = owl_kernels::list::cu_text(src_id);
+    let src = owl_kernels::cu_sig::cu_text(src_id);
     let (mn, mf) = dual_modules(&ctx, src_id, &src);
 
     // 精心构造平局:多个相同最大值(取**最小索引**) + 全负 + 首位最大
@@ -395,7 +395,7 @@ fn aot_equiv_paged_attention_v2_chain() {
     let ctx = CudaContext::new(ord).expect("ctx");
     let stream = ctx.default_stream();
     let src_id = owl_kernels::spec::meta_of::<owl_kernels::ops::attn::PagedV2F16Hd256Bs32>().src;
-    let src = owl_kernels::list::cu_text(src_id);
+    let src = owl_kernels::cu_sig::cu_text(src_id);
     let (mn, mf) = dual_modules(&ctx, src_id, &src);
 
     const HD: usize = 256;

@@ -4,7 +4,8 @@
 //! 本文件只剩 re-export 与 boot 胶水(kv_manifest_gate:KvQuant/ModelError
 //! 是 models 词汇)。旧路径 `crate::kernel::*` 全量续用,调用点零改动。
 
-pub use owl_kernels::list::{
+pub use owl_kernels::cu_sig::{cu_text, parse_cu_sig, source_defines};
+pub use owl_kernels::kernel::{
     kernel, kernel_with, launch_shape, lookup, source, with_pick, Kernel, LaunchShape,
 };
 
@@ -66,8 +67,8 @@ pub fn kv_manifest_gate(
             continue;
         };
         // .cu 源里必须有该核定义(字面 or 单层宏实例化;判据单源 =
-        // owl_kernels::list::source_defines —— chunked kNHD 族走宏)
-        if !owl_kernels::list::source_defines(e.src, name) {
+        // owl_kernels::cu_sig::source_defines —— chunked kNHD 族走宏)
+        if !owl_kernels::cu_sig::source_defines(e.src, name) {
             bad.push(name);
         }
     }

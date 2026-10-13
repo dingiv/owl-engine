@@ -3,10 +3,7 @@
 //! 参数名/序/类型 = `.cu` 签名的逐字抄录(机器互证见 `tests/op_tables.rs`)。
 
 use crate::contract::{Dtype, Law};
-use crate::spec::{
-    meta_of, pools, CaptureEvidence, Determinism, KernelMeta, KernelSpec, LayoutTag, Param,
-    PoolAccess,
-};
+use crate::spec::{meta_of, pools, CaptureEvidence, Determinism, KernelMeta, KernelSpec, LayoutTag, Param, PoolAccess};
 
 // ============================================================================
 // 草稿非因果块注意力(DFlash2 propose 的 NC 核 v2;2026-10-13 ③ 转正)
@@ -38,7 +35,7 @@ impl KernelSpec for NcAttnBf16V2 {
         Param::t_out("out", Dtype::BF16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Classic, Dtype::BF16)];
-    const SELFCHECK: Option<&'static dyn crate::spec::BootCheck> =
+    const SELFCHECK: Option<&'static dyn crate::bootcheck::BootCheck> =
         Some(&crate::ops::oracles::nc_bf16_v2::NcBf16V2Oracle);
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -150,7 +147,7 @@ impl KernelSpec for K0WriteFp8Knhd {
         Param::t_out("out", Dtype::F16, 1),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Knhd, Dtype::U8)];
-    const SELFCHECK: Option<&'static dyn crate::spec::BootCheck> =
+    const SELFCHECK: Option<&'static dyn crate::bootcheck::BootCheck> =
         Some(&crate::ops::oracles::k0_fp8_knhd::K0Fp8KnhdOracle);
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;

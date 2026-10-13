@@ -423,7 +423,7 @@ fn split_fp8_matches_f16() {
     ctx.bind_to_thread().expect("bind");
     let stream = ctx.default_stream();
     let ptx = cudarc::nvrtc::compile_ptx_with_opts(
-        owl_kernels::list::cu_text(owl_kernels::ops::source("owl_prefill_split_reduce_f16_hd256")).as_str(),
+        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("owl_prefill_split_reduce_f16_hd256")).as_str(),
         cudarc::nvrtc::CompileOptions {
             arch: Some("compute_86"),
             include_paths: vec!["/usr/local/cuda/include".into()],

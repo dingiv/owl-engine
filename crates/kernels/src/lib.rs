@@ -16,7 +16,9 @@ pub mod contract;
 /// 登记表(list:native kernel 名字 → 源 + 槽序契约 + dtype 标注;
 /// 2026-10-12 自 models::kernel 迁入,同日由 native.rs 更名 list.rs ——
 /// "登记表"才是它的本体,native/foreign 之别交给 driver/registry)
-pub mod list;
+pub mod kernel;
+pub mod bootcheck;
+pub mod cu_sig;
 
 /// 生产算子元数据表(P3;`impl KernelSpec` 声明,按域分模块)
 pub mod ops;

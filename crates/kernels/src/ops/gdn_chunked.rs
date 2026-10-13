@@ -5,9 +5,7 @@
 //! 客户端不可达(类型面 `GateRaw` 堵死 raw/cumsum 混喂)。
 
 use crate::contract::{Dtype, Law};
-use crate::spec::{
-    meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param, ScalarTy,
-};
+use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param, ScalarTy};
 
 /// `gdn_chunked_delta_rule_fwd` —— GDN chunked 前向(六核编排入口)
 pub struct GdnChunkedDeltaRuleFwd;

@@ -104,7 +104,7 @@ mod tests {
     fn generated_hashes_match_rust_hash_fn() {
         assert!(!CUBIN_ASSETS.is_empty(), "资产表为空 —— build.rs 未产 cubin?");
         for a in CUBIN_ASSETS {
-            let text = crate::list::cu_text(a.id);
+            let text = crate::cu_sig::cu_text(a.id);
             assert_eq!(
                 hash_source(&text),
                 a.src_hash,

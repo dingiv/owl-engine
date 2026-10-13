@@ -6,7 +6,8 @@
 
 use crate::contract::{OpError, OpId, LaunchVal, Stage};
 use crate::device::{DeviceRes, Exec};
-use crate::spec::{CheckBuf, CheckRunner, CheckReport, KernelMeta};
+use crate::bootcheck::{CheckBuf, CheckRunner, CheckReport};
+use crate::spec::{KernelMeta};
 
 /// 自检运行时(设备侧实现)
 ///

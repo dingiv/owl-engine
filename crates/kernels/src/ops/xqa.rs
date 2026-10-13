@@ -8,10 +8,8 @@
 //! 覆盖 `q_seq_len`(SPEC_DEC 掩码按 `ceil(q/32)` 行组织)。
 
 use crate::contract::{Dtype, Law, OpError};
-use crate::spec::{
-    meta_of, CaptureEvidence, CheckCtx, Determinism, KernelMeta, KernelSpec, Param, RangeRule,
-    ShapeFamily,
-};
+use crate::bootcheck::{CheckCtx};
+use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param, RangeRule, ShapeFamily};
 use crate::family::xqa;
 
 /// 双臂共用的 20 槽参数表(两份实例化签名逐字同型,故共用一张表)。
@@ -148,7 +146,8 @@ pub static METAS: &[&KernelMeta] = &[&XQA_VERIFY, &XQA_DECODE];
 mod tests {
     use super::*;
     use crate::contract::Arg;
-    use crate::spec::{meta_of, Geom};
+    use crate::bootcheck::{Geom};
+use crate::spec::{meta_of};
 
     const GEOM: Geom = Geom { grid: (1, 1, 1), block: (128, 1, 1), smem: 0, out_elems: 256 };
 

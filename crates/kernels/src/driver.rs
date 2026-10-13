@@ -298,17 +298,25 @@ pub fn resolve(req: OpReq) -> KernelPick {
 /// 的发射全部输入;grid 哨兵 (0,0,0) = 解释层按输出元素数自动 1D
 /// ceil/256,同登记表约)
 ///
-/// # 准入声明(2026-10-13 P3)
+/// # 准入声明(2026-10-13 P3 立项;**F2 轮 2026-10-13 收口**)
 ///
-/// **已建表算子经 [`KernelPick::of`] 拾取**:名字来自算子的 `ENTRY` 关联常量
-/// (driver 里不再出现该核名字面量),元数据经 [`KernelPick::meta`] 取到。
-/// 未建表算子继续用结构体字面量构造 —— 它们处在"仅引入"状态(`meta()` = None),
-/// P4 的生产白名单硬门保证它们进不了生产档。
+/// **名字一律不手写**,两条来源:
+/// - native 核 ⇒ [`KernelPick::of::<T>()`]:名字来自算子的 `ENTRY` 关联常量;
+/// - foreign 家族臂 ⇒ 家族 face 常量(`family::*::…_FWD` / `client::*::SIG` 同源)。
 ///
-/// 为什么不把 `meta` 做成字段:driver 里有 131 处 `KernelPick { .. }` 字面量,
-/// 加字段 = 131 处纯机械改写(设计稿 §十"更名/瘦身带来大面积 diff"的风险面)。
-/// 改成**按名查表**(`meta()`)后:生产臂用 `of::<T>()` 拿到类型耦合的名字,
-/// 未建表臂零改动,语义等价而 diff 最小。
+/// **F2 轮前**还有 18 处 `KernelPick { name: "owl_…" }` 字面量(`probe_ts` /
+/// `argmax` / `topk16` / `cast` / `qknorm_insert` ×3 / `gemv_dual` /
+/// `ct_repack` / `decode_step{,_v2}` / `conv_{upd_dual,fwd}` / `recurrence` /
+/// `reshape_and_cache` ×2 / `prefill_split_reduce` / `sigmoid_gate_mul`),
+/// 依据是"未建表算子只能字面量构造"—— 而 F 轮把"未声明"清零后该前提消失,
+/// 已全部升格为 `of::<T>()` ⇒ **driver 里零核名字符串**。
+///
+/// 这不是省字:`of::<T>()` 让"名字在 picker、声明面却漏了"这类不一致
+/// **物理上写不出来**(F 轮抓到的 `vllm_paged_attention_v2_f16_hd128/hd256`
+/// 活路径正是该病)。
+///
+/// 为什么 `meta` 不做成字段:构造点上百处,加字段 = 大面积机械改写;
+/// 改成**按名查表**(`meta()`)后 `of::<T>()` 拿到类型耦合的名字,语义等价而 diff 最小。
 #[derive(Clone, Debug)]
 pub struct KernelPick {
     pub name: &'static str,
@@ -388,7 +396,7 @@ pub mod gdn {
     /// batch·(dq+dk);输出单块 [batch, dq+dk],消费侧列切 = 免费视图)
     pub fn conv_upd_dual(dt: DType) -> KernelPick {
         assert!(matches!(dt, DType::F16), "conv_upd_dual 仅有 f16 变体");
-        KernelPick { name: "owl_gdn_conv_upd_dual_f16", shape: SENTINEL_1D }
+        KernelPick::of::<crate::ops::gdn::ConvUpdDualF16>(SENTINEL_1D)
     }
 
     /// delta_dec:单步递推(批 4)。shared 契约 = `(2·kd + 2)·4B`(kd 项
@@ -419,10 +427,7 @@ pub mod gdn {
         );
         assert_eq!(kd, vd, "decode_step 融合核要求 kd==vd(头方阵);得 {kd}/{vd}");
         assert!(kd <= 128 && kd.is_multiple_of(32), "decode_step 融合核要求 kd≤128 且 32 对齐,得 {kd}");
-        KernelPick {
-            name: "owl_gdn_decode_step_f16",
-            shape: Shape { grid: ((batch * nv) as u32, 1, 1), block: (kd as u32, 1, 1), smem: 0 },
-        }
+        KernelPick::of::<crate::ops::gdn::GdnDecodeStepF16>(Shape { grid: ((batch * nv) as u32, 1, 1), block: (kd as u32, 1, 1), smem: 0 })
     }
 
     /// D1-v2(2026-10-04 sglang 刺探):delta 相 float4 行组重写(同契约;
@@ -435,10 +440,7 @@ pub mod gdn {
         );
         assert_eq!(kd, vd, "decode_step v2 要求 kd==vd(头方阵);得 {kd}/{vd}");
         assert!(kd <= 128 && kd.is_multiple_of(32) && vd.is_multiple_of(4), "decode_step v2 要求 kd≤128 32 对齐且 vd/4,得 {kd}/{vd}");
-        KernelPick {
-            name: "owl_gdn_decode_step_v2_f16",
-            shape: Shape { grid: ((batch * nv) as u32, 1, 1), block: (vd as u32, 1, 1), smem: 0 },
-        }
+        KernelPick::of::<crate::ops::gdn::DecodeStepV2F16>(Shape { grid: ((batch * nv) as u32, 1, 1), block: (vd as u32, 1, 1), smem: 0 })
     }
 
     /// conv_fwd:decode 卷前向(工单 G;**仅 f16 变体**,f32 请求 = 编程
@@ -446,10 +448,7 @@ pub mod gdn {
     /// grid = (1, ceil(d/256), 1)。
     pub fn conv_fwd(dt: DType, d: usize) -> KernelPick {
         assert!(matches!(dt, DType::F16), "owl_gdn_conv_fwd 仅有 f16 变体(dt={dt:?})");
-        KernelPick {
-            name: "owl_gdn_conv_fwd_f16",
-            shape: Shape { grid: (1, d.div_ceil(256) as u32, 1), block: (256, 1, 1), smem: 0 },
-        }
+        KernelPick::of::<crate::ops::gdn::ConvFwdF16>(Shape { grid: (1, d.div_ceil(256) as u32, 1), block: (256, 1, 1), smem: 0 })
     }
 
     /// recurrence_varlen_gqa:批前向递推(工单 G;**仅 f16 变体**)。
@@ -460,14 +459,11 @@ pub mod gdn {
             matches!(dt, DType::F16),
             "owl_gdn_recurrence_varlen_gqa 仅有 f16 变体(dt={dt:?})"
         );
-        KernelPick {
-            name: "owl_gdn_recurrence_varlen_gqa_f16",
-            shape: Shape {
-                grid: (vd.div_ceil(8) as u32, nv as u32, 1),
-                block: (32, 8, 1),
-                smem: ((4 * kd + 4) * 4) as u32,
-            },
-        }
+        KernelPick::of::<crate::ops::gdn::RecurrenceVarlenGqaF16>(Shape {
+            grid: (vd.div_ceil(8) as u32, nv as u32, 1),
+            block: (32, 8, 1),
+            smem: ((4 * kd + 4) * 4) as u32,
+        })
     }
 
     /// norm_act:×w(非零中心)+ silu(批 5;一 block 一 (row, group))。
@@ -546,23 +542,17 @@ pub mod ops {
 
     /// 刀D 层间时间戳探针(链式拷贝 + clock64;哨兵 1D)
     pub fn ts_stamp() -> KernelPick {
-        KernelPick { name: "probe_ts_f16", shape: SENTINEL_1D }
+        KernelPick::of::<crate::ops::elems::ProbeTsF16>(SENTINEL_1D)
     }
 
     /// 设备侧贪心 argmax(单块两段规约;fixed (1,1,1) × 256)
     pub fn argmax() -> KernelPick {
-        KernelPick {
-            name: "owl_argmax_f32idx_f16",
-            shape: Shape { grid: (1, 1, 1), block: (256, 1, 1), smem: 0 },
-        }
+        KernelPick::of::<crate::ops::elems::ArgmaxF32IdxF16>(Shape { grid: (1, 1, 1), block: (256, 1, 1), smem: 0 })
     }
 
     /// 逐行 top-16(单缓冲 [rows, 32]:值半区降序 + 索引半区;aux = [rows])
     pub fn topk16(rows: usize) -> KernelPick {
-        KernelPick {
-            name: "owl_topk16_f16",
-            shape: Shape { grid: (rows as u32, 1, 1), block: (256, 1, 1), smem: 0 },
-        }
+        KernelPick::of::<crate::ops::elems::Topk16F16>(Shape { grid: (rows as u32, 1, 1), block: (256, 1, 1), smem: 0 })
     }
 
     /// rmsnorm:一 block 一行(×(1+w) 同核,w_off 入参;rows 从形状推导:
@@ -636,18 +626,12 @@ pub mod attn {
 
     /// B6.2:K0 写池 fp8 变体(f16/bf16 输入 → e4m3 池;形状无关单核)
     pub fn k0_write_fp8(tokens: usize) -> KernelPick {
-        KernelPick {
-            name: "owl_reshape_and_cache_fp8kv",
-            shape: Shape { grid: (tokens as u32, 1, 1), block: (256, 1, 1), smem: 0 },
-        }
+        KernelPick::of::<crate::ops::attn::K0WriteFp8Classic>(Shape { grid: (tokens as u32, 1, 1), block: (256, 1, 1), smem: 0 })
     }
 
     /// B6:K0 写池 fp8 变体(bf16 输入;草稿侧)
     pub fn k0_write_fp8_bf16(tokens: usize) -> KernelPick {
-        KernelPick {
-            name: "owl_reshape_and_cache_fp8kv_bf16",
-            shape: Shape { grid: (tokens as u32, 1, 1), block: (256, 1, 1), smem: 0 },
-        }
+        KernelPick::of::<crate::ops::attn::ReshapeAndCacheFp8KvBf16>(Shape { grid: (tokens as u32, 1, 1), block: (256, 1, 1), smem: 0 })
     }
 
     /// B6.1:decode v2 fp8 e4m3 KV 读(形状契约同 f16;页配对律同源)
@@ -1061,14 +1045,11 @@ pub mod attn {
     /// hd 仅 hd256 核名 —— hd 校验由核名/登记表承担)
     pub fn prefill_split_reduce(dt: DType, tokens: usize, hq: usize) -> KernelPick {
         assert!(matches!(dt, DType::F16), "prefill split reduce 仅有 f16 变体");
-        KernelPick {
-            name: "owl_prefill_split_reduce_f16_hd256",
-            shape: Shape {
-                grid: ((tokens * hq).div_ceil(256) as u32, 1, 1),
-                block: (256, 1, 1),
-                smem: 0,
-            },
-        }
+        KernelPick::of::<crate::ops::attn::PrefillSplitReduceF16Hd256>(Shape {
+            grid: ((tokens * hq).div_ceil(256) as u32, 1, 1),
+            block: (256, 1, 1),
+            smem: 0,
+        })
     }
 
     /// naive 逐 token 解码(回退/对照臂;dt 双变体;哨兵 1D)
@@ -1086,7 +1067,7 @@ pub mod attn {
     /// 输出门融合(out × sigmoid(gate);**仅 f16**;哨兵 1D)
     pub fn gate_mul(dt: DType) -> KernelPick {
         assert!(matches!(dt, DType::F16), "owl_sigmoid_gate_mul 仅有 f16 变体");
-        KernelPick { name: "owl_sigmoid_gate_mul_f16", shape: SENTINEL_1D }
+        KernelPick::of::<crate::ops::elems::SigmoidGateMulF16>(SENTINEL_1D)
     }
 
     /// 非因果块 attention(DFlash2 草稿;自块直读 + 前缀池;v2 签名:
@@ -1175,14 +1156,11 @@ pub mod attn {
         _half: usize,
     ) -> KernelPick {
         assert!(matches!(dt, DType::F16), "owl_qknorm_rope_kv_insert 仅有 f16 变体");
-        KernelPick {
-            name: "owl_qknorm_rope_kv_insert_f16",
-            shape: Shape {
-                grid: (tokens as u32, (hq + hkv) as u32, 1),
-                block: (hd as u32, 1, 1),
-                smem: (hd * 4) as u32,
-            },
-        }
+        KernelPick::of::<crate::ops::fused::QknormRopeKvInsertF16>(Shape {
+            grid: (tokens as u32, (hq + hkv) as u32, 1),
+            block: (hd as u32, 1, 1),
+            smem: (hd * 4) as u32,
+        })
     }
 
     /// kNHD 变体(统一契约 P1):q 出/w 写面与 classic 版逐式一致
@@ -1195,14 +1173,11 @@ pub mod attn {
         _half: usize,
     ) -> KernelPick {
         assert!(matches!(dt, DType::F16), "owl_qknorm_rope_kv_insert_knhd 仅有 f16 变体");
-        KernelPick {
-            name: "owl_qknorm_rope_kv_insert_f16_knhd",
-            shape: Shape {
-                grid: (tokens as u32, (hq + hkv) as u32, 1),
-                block: (hd as u32, 1, 1),
-                smem: (hd * 4) as u32,
-            },
-        }
+        KernelPick::of::<crate::ops::fused::QknormRopeKvInsertF16Knhd>(Shape {
+            grid: (tokens as u32, (hq + hkv) as u32, 1),
+            block: (hd as u32, 1, 1),
+            smem: (hd * 4) as u32,
+        })
     }
 
     pub fn qkv_norm_rope_insert_fp8kv_knhd(
@@ -1227,14 +1202,11 @@ pub mod attn {
         hd: usize,
         _half: usize,
     ) -> KernelPick {
-        KernelPick {
-            name: "owl_qknorm_rope_kv_insert_f16_fp8kv",
-            shape: Shape {
-                grid: (tokens as u32, (hq + hkv) as u32, 1),
-                block: (hd as u32, 1, 1),
-                smem: (hd * 4) as u32,
-            },
-        }
+        KernelPick::of::<crate::ops::fused::QknormRopeKvInsertF16Fp8>(Shape {
+            grid: (tokens as u32, (hq + hkv) as u32, 1),
+            block: (hd as u32, 1, 1),
+            smem: (hd * 4) as u32,
+        })
     }
 
     /// kNHD 变体(kv布局统一契约 P1):K/V 同构 [nb,page,hkv,hd],x 形参占位不参与寻址
@@ -1329,7 +1301,7 @@ pub mod elems {
 
     pub fn cast_f16_f32(dt: DType) -> KernelPick {
         assert!(matches!(dt, DType::F32), "cast_f16_f32 出 f32,得 {dt:?}");
-        KernelPick { name: "owl_cast_f16_f32", shape: SENTINEL_1D }
+        KernelPick::of::<crate::ops::elems::CastF16F32>(SENTINEL_1D)
     }
 
     use super::{DType, KernelPick, Shape, SENTINEL_1D};
@@ -1365,14 +1337,11 @@ pub mod elems {
     pub fn gemv_dual(dt: DType, rows_b: usize, rows_a: usize, _cols: usize, tokens: usize) -> KernelPick {
         assert!(matches!(dt, DType::F16), "gemv_dual 仅有 f16 变体");
         let rows = (rows_b + rows_a) as u32;
-        KernelPick {
-            name: "owl_gemv_dual_f16",
-            shape: Shape {
-                grid: (rows.div_ceil(4), tokens as u32, 1),
-                block: (128, 1, 1),
-                smem: 0,
-            },
-        }
+        KernelPick::of::<crate::ops::elems::GemvDualF16>(Shape {
+            grid: (rows.div_ceil(4), tokens as u32, 1),
+            block: (128, 1, 1),
+            smem: 0,
+        })
     }
 
     /// 行栈 concat(arity ≤ 8;哨兵 1D)
@@ -1407,14 +1376,11 @@ pub mod load {
     /// ct packed → marlin B 重排(U32;**核签名形参即 rows/cols**,无 aux)。
     /// grid = (out/64, (k/8)/2),block 32(契约见 .cu 头注)。
     pub fn ct_repack(rows: usize, cols: usize) -> KernelPick {
-        KernelPick {
-            name: "owl_ct_repack_u32",
-            shape: Shape {
-                grid: ((rows / 64) as u32, (cols / 2) as u32, 1),
-                block: (32, 1, 1),
-                smem: 0,
-            },
-        }
+        KernelPick::of::<crate::ops::load::CtRepackU32>(Shape {
+            grid: ((rows / 64) as u32, (cols / 2) as u32, 1),
+            block: (32, 1, 1),
+            smem: 0,
+        })
     }
 
     pub const CT_REPACK: super::OpId = super::OpId("load.ct_repack"); // OpId 全路径引用,免 import

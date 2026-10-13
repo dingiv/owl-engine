@@ -143,7 +143,7 @@ fn run_case(prefix: usize, check: bool) {
 
     // ---- 编译 + 取核(OWL_NC_KERNEL 可切名做 A/B)----
     let ptx = cudarc::nvrtc::compile_ptx_with_opts(
-        owl_kernels::list::cu_text(owl_kernels::ops::source("owl_naive_attn_nc_bf16_v2")).as_str(),
+        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("owl_naive_attn_nc_bf16_v2")).as_str(),
         cudarc::nvrtc::CompileOptions {
             arch: Some("compute_86"),
             include_paths: vec!["/usr/local/cuda/include".into()],

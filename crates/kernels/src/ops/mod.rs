@@ -123,7 +123,7 @@ pub fn undeclared_symbols() -> Vec<(&'static str, &'static str)> {
     // 防呆:册上每条都必须在符号清单里(改名/删核后忘了清册 = 红)
     for (id, sym) in FAMILY_PRIVATE {
         assert!(
-            crate::list::ASSET_SYMBOLS.iter().any(|(i, s)| i == id && s.contains(sym)),
+            crate::cu_sig::ASSET_SYMBOLS.iter().any(|(i, s)| i == id && s.contains(sym)),
             "FAMILY_PRIVATE 登记了不存在的符号:{id} :: {sym}(改名/删核后请同步清册)"
         );
     }
@@ -131,7 +131,7 @@ pub fn undeclared_symbols() -> Vec<(&'static str, &'static str)> {
 }
 
 fn undeclared_symbols_raw() -> Vec<(&'static str, &'static str)> {
-    crate::list::ASSET_SYMBOLS
+    crate::cu_sig::ASSET_SYMBOLS
         .iter()
         .flat_map(|(id, syms)| syms.iter().map(move |s| (*id, *s)))
         .filter(|(_, s)| meta(s).is_none())

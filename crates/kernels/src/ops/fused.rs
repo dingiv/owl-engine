@@ -1,10 +1,7 @@
 //! 融合核域生产算子(norm/rope/池插三发合一)。
 
 use crate::contract::{Dtype, Law};
-use crate::spec::{
-    meta_of, pools, CaptureEvidence, Determinism, KernelMeta, KernelSpec, LayoutTag, Param,
-    PoolAccess,
-};
+use crate::spec::{meta_of, pools, CaptureEvidence, Determinism, KernelMeta, KernelSpec, LayoutTag, Param, PoolAccess};
 
 /// `owl_qknorm_rope_kv_insert_f16_fp8kv_knhd` —— qk-norm + rotate-half rope
 /// + KV 散写(主池 e4m3/kNHD)三发合一。
@@ -39,7 +36,7 @@ impl KernelSpec for QknormRopeKvInsertF16Fp8Knhd {
         Param::t_out("q_out", Dtype::F16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Knhd, Dtype::U8)];
-    const SELFCHECK: Option<&'static dyn crate::spec::BootCheck> =
+    const SELFCHECK: Option<&'static dyn crate::bootcheck::BootCheck> =
         Some(&crate::ops::oracles::qknorm_insert::QknormInsertOracle);
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;

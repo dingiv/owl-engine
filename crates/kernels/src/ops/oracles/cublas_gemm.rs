@@ -12,7 +12,7 @@
 //! 参考 = host f32 三重循环;判据 = **相对偏差**(f16 输出舍入 + 累加序)。
 
 use crate::contract::{Arg, KernelSource, LaunchMsg, OpError};
-use crate::spec::{BootCheck, CheckReport, CheckRunner};
+use crate::bootcheck::{BootCheck, CheckReport, CheckRunner};
 
 use super::{f16_bits, f16_to_f32, lcg_f16};
 

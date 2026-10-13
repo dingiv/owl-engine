@@ -287,7 +287,7 @@ fn run_case(ctx: usize, q_seq_len: usize, decode_inst: bool, check: bool) {
 
     // ---- v2 基线(主核 + reduce;与生产同两发) ----
     let ptx = cudarc::nvrtc::compile_ptx_with_opts(
-        owl_kernels::list::cu_text(owl_kernels::ops::source("vllm_paged_attention_v2_fp8_knhd_hd256bs32")).as_str(),
+        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("vllm_paged_attention_v2_fp8_knhd_hd256bs32")).as_str(),
         cudarc::nvrtc::CompileOptions {
             arch: Some("compute_86"),
             include_paths: vec!["/usr/local/cuda/include".into()],

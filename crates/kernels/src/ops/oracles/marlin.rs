@@ -13,7 +13,7 @@
 
 use crate::contract::{Arg, KernelSource, LaunchMsg, OpError};
 use crate::family::marlin::{c_tmp_float_len_v2, repack, v2_workspace_len};
-use crate::spec::{BootCheck, CheckReport, CheckRunner};
+use crate::bootcheck::{BootCheck, CheckReport, CheckRunner};
 
 use super::{f16_bits, f16_to_f32};
 

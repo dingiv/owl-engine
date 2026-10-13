@@ -14,7 +14,7 @@
 //! 配对错)、`layout_classic`(池布局错)。
 
 use crate::contract::{LaunchVal, OpError};
-use crate::spec::{BootCheck, CheckBuf, CheckReport, CheckRunner};
+use crate::bootcheck::{BootCheck, CheckBuf, CheckReport, CheckRunner};
 const QKNORM_ROPE_KV_INSERT_F16_FP8KV: &str = "cu/fused/qknorm_insert.cu";
 
 use super::{e4m3_encode, f16_bits, f16_to_f32, lcg_f16};

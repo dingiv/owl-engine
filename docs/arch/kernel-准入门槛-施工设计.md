@@ -1917,3 +1917,134 @@ cu/gdn/state_transpose.cu  :: owl_state_kv_to_vk / owl_state_vk_to_kv  (gdn_chun
 
 - 4 条 `owl_naive_attn_nc_*_knhd` 死变体(0 调用点):候选**从 `.cu` 删除**(资产不养死码),需重编 + 数值回归;
 - `Kernel`/`LaunchShape` 值类型与 `kernel_with` 字符串路径仍是**遗留**(driver 拾取是正路,§P3 的迁移尾账),`sig` 逃生舱字段待逃生舱核清零后一并删。
+
+---
+
+### 15.16 F2 轮:`driver` picker 去名字表(2026-10-13;名字一律来自声明面)
+
+用户追问:「`driver.rs` picker 逻辑还在用吗?需要优化吗?」→ 先查调用面,再动刀。
+
+#### 15.16.1 审计:在用,而且是**唯一发射分派口**
+
+| 面 | 事实 |
+|---|---|
+| `driver::resolve(OpReq)` | **73 条 match 臂**,内部**委托**给 18 个域 picker(`gdn::* / ops::* / attn::* / dflash::*` / …) |
+| 生产调用点 | `interpreters/eval.rs`(每次 Op 求值)· `formats/load.rs`(装载重排)· `specs/qwen35.rs` · `models/ops.rs` ×3 —— **6 处** |
+| 域 picker 生产面直调 | **无**(只经 `resolve` 进 —— 直接 grep `driver::<域>::` 会误判为死码) |
+| 谓词/常量出口 | `attn::paged_{decode,prefill}_ok`(models 当谓词用)· `load::CT_REPACK`(specs 当 op id) |
+| 已有机器面 | `resolve` 结尾 `m.shape.accepts(&q)` 几何核对(D 轮 page 猜窄就是被它拦的)+ `list::driver_picks_are_registered` + `ops/attn.rs` 谓词↔声明互证 |
+| 热路径 | ❌ **不是**:`resolve` 只跑在图**捕获期**(回放不走它)⇒ 本轮的收益全在**正确性/单一真源**,不在 tps |
+
+#### 15.16.2 病灶:`KernelPick` 注释里的那个前提**已经失效**
+
+`KernelPick` 原文档写着设计意图:
+
+> 已建表算子经 `KernelPick::of` 拾取:**名字来自算子的 `ENTRY` 关联常量(driver 里不再出现该核名字面量)**;未建表算子继续用结构体字面量 —— 它们处在"仅引入"状态(`meta()` = None),P4 的生产白名单硬门保证它们进不了生产档。
+
+**F 轮把"未声明"清零后,"未建表 ⇒ 只能字面量"这个前提消失了。** 实测剩 **18 处** `KernelPick { name: "owl_…" }`(而 `of::<T>()` 只有 4 处 —— P3 时改的那批):
+
+```
+probe_ts_f16 · owl_argmax_f32idx_f16 · owl_topk16_f16 · owl_cast_f16_f32
+owl_qknorm_rope_kv_insert_f16 / _knhd / _fp8kv · owl_gemv_dual_f16 · owl_ct_repack_u32
+owl_gdn_decode_step_f16 / _v2_f16 · owl_gdn_conv_upd_dual_f16 / conv_fwd_f16
+owl_gdn_recurrence_varlen_gqa_f16 · owl_reshape_and_cache_fp8kv / _bf16
+owl_prefill_split_reduce_f16_hd256 · owl_sigmoid_gate_mul_f16
+```
+**全部是 native 核、且全已建表** ⇒ 18 处全部升格 `KernelPick::of::<crate::ops::<域>::<Ty>>(shape)`(shape 原样搬)。
+
+#### 15.16.3 收益(这不是省字)
+
+- **driver 里零核名字符串**(实测 `name: "` 计数 = **0**;其余非 `of::<T>()` 的构造点用家族 **face 常量**引名,单源);
+- F 轮抓到的那个 bug 类**物理上写不出来**:`vllm_paged_attention_v2_f16_hd128/hd256` 正是"名字写在 picker、声明面却漏了"的症候 —— `of::<T>()` 强制名字必须来自 `ENTRY`;
+- `meta()` 从此**恒为 `Some`**(所有名字都来自声明面)⇒ 下一刀可退役**逃生舱**(`models::ops::foreign_sig` + `Kernel::sig`),见 §15.16.5。
+
+#### 15.16.4 验收(全部实测)
+
+| 项 | 数字 |
+|---|---|
+| `driver.rs` 名字字面量 | **18 → 0**;`of::<T>()` 4 → **22** |
+| 门 | lib **61/61** · op_tables **7/7**(110 张表逐参) |
+| models / shared | **117/117**(含 GPU 层测) · 27/27 |
+| clippy / workspace check | **0 警** / 0 错 |
+| **GPU** | **14 套探针全绿**(EXIT=0) |
+| **真机 boot** | `已声明 127 张 / 编出符号 119 条(未声明 0)` + 白名单 **44 项** → `Captured` → 回答连贯 |
+
+#### 15.16.5 下一刀(已定位,未做)
+
+1. **逃生舱退役**(F3):`pick.meta()` 恒 `Some` 后,`eval.rs` 的 `foreign_sig` 分支与 `models/ops.rs` 的 2 处 `.with_sig(...)` 成为死路 ⇒ `foreign_sig` + `Kernel::sig` + `kernel_with` 字符串路径可整体评估删除(与 §15.15.7 的尾账合并);
+2. **`ax(i)` 的 aux 位置约定**(54 处,顺序只写在注释里 `// aux = [batch, nv, kd, vd]`):传错 = **静默错值**(与 E7 raw-g 同类)。改法:`OpReq.aux: &[usize]` → 类型化 per-op 结构体/枚举 ⇒ 编译期消灭一整类 bug。**建议单独立项**(要动 op 词表构造点,比 ② 大)。
+
+---
+
+### 15.17 G 轮:模块名实对账(`list.rs` 拆解 + 自检面分家)(2026-10-13)
+
+用户追问:「`spec.rs` / `list.rs` / `registry.rs` 这三个文件是否需要整理,或者重命名?」→ 先做**名实对账**,再动手。
+
+#### 15.17.1 对账结论(一个必改、一个该拆、一个可留)
+
+| 文件 | 名字还准吗 | 实际内容 |
+|---|---|---|
+| `list.rs` (403) | ❌ **名字已无对应物** —— 原名"登记表(list)"在 **F 轮被删** | ①`LaunchShape`/`Kernel` 值 + 构造面 ②`.cu` 取证面 |
+| `spec.rs` (930) | ⚠️ 偏窄:它不只是 `KernelSpec` | §1-2 参数词汇/槽序派生 · §3 形状族/池/捕获 **+ 自检基建**(`CheckBuf`/`CheckRunner`/`BootCheck`/`CheckReport`)· §4 检查上下文 · §5 `KernelSpec`/`KernelMeta` |
+| `registry.rs` (542) | ✅ 贴 | `KernelFamily` trait + `FamilyGuard` + `OpRegistry` + 装配流程 |
+| (`contract.rs` 388) | ✅ 贴 | 线格式/错误/身份(**仅挂账**:`Law` 住 contract 而 `ShapeRule`/`RangeRule` 住 spec,律的落点两处) |
+
+引用成本(决定性价比):`list` **38 处** · `spec` 154 · `registry` 15。
+
+#### 15.17.2 `list.rs` → `kernel.rs` + `cu_sig.rs`(名字与内容都分开)
+
+| 新模块 | 行数 | 内容 |
+|---|---:|---|
+| `kernel.rs` | 233 | **算子值 + 构造面**:`LaunchShape` / `Kernel` / `lookup` / `source` / `kernel` / `kernel_with` / `with_pick` / `launch_shape` |
+| `cu_sig.rs` | 156 | **`.cu` 取证面**(纯测试/工具):`cu_text`(读盘) / `source_defines`(构建期符号清单) / `parse_cu_sig`+`map_params`+`params_at`(签名解析器) |
+
+判据:**构造面服务发射,取证面服务测试门与 boot 清单门** —— 生命周期与依赖面都不同。测试按归属分流(资产/符号门 → `cu_sig`;声明不变量与拾取门 → `kernel`)。
+
+#### 15.17.3 `spec.rs` 拆出 `bootcheck.rs`(名字保留)
+
+| 新模块 | 行数 | 内容 |
+|---|---:|---|
+| `bootcheck.rs` | 125 | `CheckBuf` / `CheckRunner` / `BootCheck` / `CheckReport` / `Geom` / `CheckCtx` |
+| `spec.rs` | 825 | 声明面(§1-2 参数词汇与槽序派生 · §3 形状族/池/捕获确定性 · §4 `KernelSpec`/`KernelMeta`) |
+
+界:**声明面 = 能进 `const` 上下文的词汇与派生;自检面 = 要跑设备的执行面**(`CheckRunner` 是 GPU 执行 trait)。依赖单向:`spec → bootcheck`(`KernelSpec::SELFCHECK: Option<&'static dyn BootCheck>`、`KernelMeta::check(&CheckCtx)`)。
+
+`spec` 这个名字**不改** —— "算子 spec 的词汇"就是它的内容。
+
+`registry.rs` **不动**(名字准;`assemble` 拆不拆是口味问题)。
+
+#### 15.17.4 落地形态
+
+```
+kernels/src/
+  contract.rs   线格式/错误/身份(不变)
+  spec.rs       算子声明词汇 + KernelSpec/KernelMeta(825,纯 const 面)
+  bootcheck.rs  装配期自检基建(125)
+  kernel.rs     算子值 + 构造面(233)
+  cu_sig.rs     .cu 签名解析 + 资产取证(156)
+  registry.rs   家族 trait + 注册表 + 装配(不变)
+  list.rs       ✗ 消失
+```
+外部影响:`models::kernel` 垫子 re-export 改两行;20 个文件引用迁移(按符号分流到 `kernel::` / `cu_sig::`,自检符号 61 处 → `bootcheck::`)。
+
+#### 15.17.5 踩坑留档(两条,都是**前缀遮蔽**同族)
+
+1. **`source` 先于 `source_defines` 替换** ⇒ `owl_kernels::list::source_defines` 被改写成 `kernel::source_defines`(把 `list::source` 当匹配目标)。**修法:按符号名长度降序替换**(与 §15.12.6 的 `cu/cu/` 同族错误 —— 批量替换必须**最长优先 + 断言命中**)。
+2. **测试块搬运脚本吃掉了 `#[test]`**:用 `#[test]\n(fn …)` 正则切块时属性在捕获组之外 ⇒ 全部测试变成"never used"。**修法:切块正则必须把属性一起捕获**,并在搬完后 `grep -c '#\[test\]'` 对账(与"数量核对是规则切换唯一保险"同律)。
+
+#### 15.17.6 验收(全部实测)
+
+| 项 | 数字 |
+|---|---|
+| 模块 | `list.rs` 消失;新增 `kernel.rs`(233)/ `cu_sig.rs`(156)/ `bootcheck.rs`(125);`spec.rs` 930 → **825** |
+| 残留引用 | `grep "list::"` = **0**(代码面) |
+| 门 | lib **61/61** · op_tables **7/7**(110 张表逐参)· oracles **8/8** · no_runtime_compile 2/2 · cubin_launch 6/6 |
+| models / shared | **117/117**(含 GPU 层测) · 27/27 |
+| clippy / workspace check | **0 警** / 0 错 |
+| **GPU** | **14 套探针全绿**(EXIT=0) |
+| **真机 boot** | `已声明 127 张 / 编出符号 119 条(未声明 0)` → 白名单 **44 项** → `Captured` |
+
+#### 15.17.7 剩余(未做)
+
+- **`Law` 的落点**(§15.15.7 尾账):`Law` 在 `contract.rs` 而 `ShapeRule`/`RangeRule` 在 `spec.rs` —— 让"算子律"单一落点也是合理选择,但 `Law` 引用面数百处,**收益不抵噪音**,记档不动。
+- `registry.rs` 的 `assemble` 是否拆 `assemble.rs`:口味问题,暂不动。
