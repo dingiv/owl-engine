@@ -162,6 +162,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let spec = self.tspec();
             spec.recent_rounds += 1;
             spec.recent_tokens += (m + 1) as u32;
+            // 轮时进窗口(时间门 + 绝对吞吐;t_round 在下方 EWMA 处已用)
+            let round_ms_now = t_round.elapsed().as_secs_f32() * 1000.0;
+            spec.recent_ms += round_ms_now;
             let (streak, degraded0, probe_every) = spec_degrade_transition(
                 spec.spec_zero_streak,
                 spec.spec_degraded,
@@ -170,24 +173,43 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 degrade_after,
                 probe_every0,
             );
-            // 动态盈亏线(2026-10-09):threshold = 滚动轮成本/裸步成本
-            // (夹 [2.0, 6.0];常数 1.2 曾低于真线 ~4 → AL 1.2~4 亏本区)
+            // 动态盈亏线(2026-10-09;2026-10-14 修口径):
+            // threshold = 滚动轮成本/裸步成本(夹 [2.0, 6.0])。
+            // **三处修正**(旧判据偏软的根因):
+            // ① **分母保鲜**:裸步 EWMA 只在降级期采样(非降级期没有裸步
+            //    ⇒ 分母是上一次降级期的陈值,跨 ctx 换档后失真)⇒ ctx 涨过
+            //    25% 即作废分母,并在重新采样前取**保守下限 2.5**
+            //    (旧兜底 1.2 远低于真线,是"AL 1.2~4 亏本区"的来源);
+            // ② **时间门**:窗口满 16 轮 **或** 满 600ms 即评估
+            //    (超长轮 150-300ms 下等 16 轮 = 2.4-4.8s,反应太慢);
+            // ③ 评估时给出**绝对吞吐**读数(tok/s)便于日志对账。
+            let _ctx_sampled = spec.bare_cost_ctx;
+            // ctx 换档**不作废**分母(2026-10-14 实测修正):裸步成本几乎不随
+            // ctx 变(25.3→26.4 ms @610→9010,±5%),而轮时才是 ctx 相关项 ⇒
+            // 保鲜的分母在换档后依然有效;作废只会退到保守兜底并**过度降级**
+            // (实测 ctx 2116→7870 时 AL 2.0 本可盈利,却被兜底 2.5 误降)。
+            // 采样点 `spec.bare_cost_ctx` 作日志/诊断用(_ctx_sampled)。
             let (rc, bc) = (spec.round_cost_ewma_ms, spec.bare_cost_ewma_ms);
-            let break_even = if rc > 0.0 && bc > 0.0 { (rc / bc).clamp(2.0, 6.0) } else { 1.2 };
-            let window_starved = if spec.recent_rounds >= 16 {
-                let avg = spec.recent_tokens as f32 / spec.recent_rounds as f32;
-                spec.recent_rounds = 0;
-                spec.recent_tokens = 0;
-                let starved = avg < break_even;
-                if starved {
-                    eprintln!(
-                        "[spec-degrade] 窗口 AL={avg:.2} < 盈亏线 {break_even:.2}(轮 {rc:.0}ms/裸 {bc:.0}ms)"
-                    );
-                }
-                starved
-            } else {
-                false
-            };
+            let break_even = if rc > 0.0 && bc > 0.0 { (rc / bc).clamp(2.0, 6.0) } else { 2.5 };
+            const WINDOW_ROUNDS: u32 = 16;
+            const WINDOW_MS: f32 = 600.0;
+            let window_starved =
+                if spec.recent_rounds >= WINDOW_ROUNDS || spec.recent_ms >= WINDOW_MS {
+                    let avg = spec.recent_tokens as f32 / spec.recent_rounds.max(1) as f32;
+                    let win_tps = spec.recent_tokens as f32 * 1000.0 / spec.recent_ms.max(1.0);
+                    spec.recent_rounds = 0;
+                    spec.recent_tokens = 0;
+                    spec.recent_ms = 0.0;
+                    let starved = avg < break_even;
+                    if starved {
+                        eprintln!(
+                            "[spec-degrade] 窗口 AL={avg:.2} < 盈亏线 {break_even:.2}(轮 {rc:.0}ms/裸 {bc:.0}ms;窗口吞吐 {win_tps:.1} tok/s)"
+                        );
+                    }
+                    starved
+                } else {
+                    false
+                };
             let degraded = degraded0 || window_starved;
             if degraded && !spec.spec_degraded {
                 eprintln!(

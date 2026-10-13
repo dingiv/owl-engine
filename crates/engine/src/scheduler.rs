@@ -175,7 +175,13 @@ impl<D: DeviceClient> RunningEngine<D> {
                 out: Vec::new(),
                 fed: cached_len,
                 decoded: String::new(),
-                spec: crate::running::TurnSpecState::default(),
+                spec: crate::running::TurnSpecState {
+                    // B4 分母**跨 turn 保鲜**(见 RunningEngine::bare_cost_carry_ms);
+                    // 其余 spec 态仍全零 = 生命周期收口纪律不动
+                    bare_cost_ewma_ms: self.bare_cost_carry_ms,
+                    bare_cost_ctx: self.bare_cost_carry_ctx,
+                    ..Default::default()
+                },
             });
         }
 

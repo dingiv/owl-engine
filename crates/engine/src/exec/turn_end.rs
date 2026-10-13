@@ -34,6 +34,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
 
     pub(crate) async fn complete(&mut self, reason: crate::turn::FinishReason) -> Result<TurnEvent> {
         let act = self.active.take().expect("active");
+        // B4 分母保鲜回写(下一 turn 种入;见 RunningEngine::bare_cost_carry_ms)
+        self.bare_cost_carry_ms = act.spec.bare_cost_ewma_ms;
+        self.bare_cost_carry_ctx = act.spec.bare_cost_ctx;
         // 取证(B6.3 后泄漏案):每 turn 设备余量打点(free 账由 cuda 侧 dtoh
         // 收割刷新;泄漏 = 线性下降)
         eprintln!("[vram-trace] turn end: free={:.0}MiB out={}",

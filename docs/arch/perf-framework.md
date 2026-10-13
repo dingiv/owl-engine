@@ -402,3 +402,65 @@ count(tag, n)          // 计数
 两轮 `free=2869MiB` **零增长**;graph 臂回归 25.25 ms/步(改前 25.18,噪声内);
 engine lib **22/22**;engine e2e 全场景 **1 passed(255.5s,含 spec/DFlash2
 恒等门)**;clippy 0 警。
+
+---
+
+## 十一、CUPTI 归因面 —— **引擎自己分析自己**(2026-10-14 PoC 落地)
+
+### 11.1 动机:图里发生了什么,两套仪器都看不见
+
+decode / verify 走**捕获图回放** ⇒ ①解释器钩子结构性为零(`interp.host.*` 0 节点)
+②`gpu_prof` 与图互斥(逐发射同步,只在 eager 有意义)③外部 nsys 能看,但
+**离开引擎**(不能进我们的账/报告/在线开关)。CUPTI(= nsys 的内核)是唯一
+能在**生产图态**拿逐核 GPU 时间、且零核改动的路。
+
+### 11.2 形态(注入式,与 sink 同源)
+
+```text
+CUPTI 驱动回调线程 ──shim(只 memcpy)──► 旁路缓冲 ──► 排空线程 ──► sink.timer
+                                                        gpu.kern.<核名>
+                                                        gpu.graph.<gid>.<核名>
+                                                        gpu.nodes.<gid>
+```
+
+| 件 | 落点 | 说明 |
+|---|---|---|
+| `native/cupti_shim.c` | `crates/backends/cuda/` | 吃真头文件,**C shim** 把 `CUpti_ActivityKernel11` 压成自包含 plain struct(核名内联 64B,无悬垂指针)⇒ Rust 侧零 ABI 猜测 |
+| `build.rs` | 同上 | **feature `cupti` 关 = 零动作**(不编 shim、不引 libcupti);开则 `cc`+`ar` 静态归档 + `-lcupti` + rpath |
+| `src/cupti.rs` | 同上 | 排空线程 + tag 构造;**回调只投递**(`try_lock` 拿不到即丢并计数) |
+| 武装点 | `GpuServer::run` | `if sink.gpu_armed()` ⇒ 才调 `owl_cupti_start`;`perf level = gpu` 是唯一开关(默认 `host` 不启动) |
+
+### 11.3 PoC 三条验收(全过)
+
+1. **图内逐核**:8k ctx 生产 spec 档两轮 → **45/45 行非零**,`graphId` 归属清晰
+   (5=verify / 29=draft / 8·11·14·17·23=fold 桶);
+2. **开销可测**:**+5.4%**(`level=host` 6.96s vs `level=gpu` 7.33s;同 prompt/同输出/3 轮中位);
+3. **零回归**:默认档 `gpu.*` 行数 = **0**(不调 `owl_cupti_start`);不开 feature 的
+   默认构建里 `cupti` 零命中(build.rs 早退)。
+
+### 11.4 ⚠️ CUPTI 语义坑(踩实,必记)
+
+**`CUPTI_ACTIVITY_KIND_KERNEL`(legacy kind 3)对图内节点只报名字、不报时间戳**
+(`start=end=0`,实测 11/49 非零);换 **`CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL`
+(kind 10,nsys 同款)** 后 **45/45 全非零**。⇒ 采集面一律用 kind 10。
+
+### 11.5 首战结论:verify 30 ms/轮的真身(重新定谳 item 1)
+
+**闭环校验**:图内逐核累加 = **30.3 ms/轮**,与我们自己的 `spec.verify.read`
+**31.1 ms** 吻合 ✓(两套仪器互证)。
+
+| verify 图内(8k ctx,归一到 16.2 轮) | ms/轮 | 占比 |
+|---|---:|---:|
+| **marlin GEMM** | **17.8** | **59%** |
+| **`kernel_mha`(XQA;469 µs/层 × 16 层)** | **7.5** | **25%** |
+| `owl_gdn_recurrence_varlen_gqa` | 2.0 | 7% |
+| farn/rmsnorm/conv/argmax/narrow/embed | ~2.5 | 8% |
+
+⇒ **"8 伪序列单遍化 / fp8 反量化"都不是主项**(XQA 只占 25%);verify 的成本
+≈ **一遍权重带宽(GEMM 59% 是常数项,T=8 与 T=1 同价)** + attention。
+**真正的 ctx 相关项只有 XQA**:512 档 ~4.4 ms → 8k 档 7.5 ms(+70%),
+**绝对头寸 = 3.1 ms/轮**(不是 31 ms)——长 ctx 若要动,动的是 XQA/fp8 读核。
+
+**draft 图(graph 29)**:`owl_naive_attn_nc_bf16_v2` **1127.8 µs/层调用** × 5 层
++ `owl_topk16_f16` **1067.9 µs/次** + `owl_dflash_conv_bf16` 442 µs ⇒ 这是
+propose 轮(~11 ms)的大头,与 `spec.propose` 分相自洽。

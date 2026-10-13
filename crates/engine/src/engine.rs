@@ -1079,12 +1079,36 @@ impl<D: DeviceClient + 'static> Engine<D> {
         // B4:探针 boot 解析一次(E3 纪律);探测周期初值传入态机字段
         let probes = self.cfg.knobs.probes;
         let dflash_notaps = self.cfg.knobs.draft.notaps;
+
+        // ── DFlash2 spec × 无 verify 图 = **boot 拒启**(2026-10-14 修)──
+        // DFlash2 的 verify 路径**硬依赖 verify 图**(taps 取自图的输出槽,
+        // 见 `exec/spec.rs`)。捕获失败 / `[graph] no_graph = true`(含
+        // eager 诊断档)下 `verify_graph = None` ⇒ 原行为是**首个 spec 轮
+        // panic**(`dflash 模式要求 verify 图(taps 输出)`)→ 引擎线程退役
+        // (实测:第二个请求收到「引擎退役」)。即"捕获失败 → eager 逃生"
+        // 这条路径对 DFlash2 既不可用、也**死得太晚**(跑到一半才炸)。
+        // ⇒ 收口为**装配期拒启**:要跑该档就显式 `[spec] depth = 0`
+        // 或 `[spec] notaps = true`(退 last_hidden,不需要图)。
+        if matches!(spec_mode, crate::running::SpecMode::DFlash2)
+            && !dflash_notaps
+            && verify_graph.is_none()
+        {
+            return Err(owl_iface::contract::ModelError::Msg(
+                "DFlash2 spec 需要 verify 图(taps 输出),但本档未建图\
+                 ([graph] no_graph = true 或捕获失败)。请二选一:去掉 no_graph,\
+                 或显式关闭该档([spec] depth = 0;或 [spec] notaps = true 退 last_hidden)"
+                    .to_string(),
+            ));
+        }
         Ok(RunningEngine {
             probes,
             session,
             tok: loaded.tokenizer,
             cfg: self.cfg,
             capture_outcome,
+            // B4 分母跨 turn 保鲜(初值 0 = 未采样,首窗口用保守兜底线)
+            bare_cost_carry_ms: 0.0,
+            bare_cost_carry_ctx: 0,
             pool,
             queue: std::collections::VecDeque::new(),
             active: None,

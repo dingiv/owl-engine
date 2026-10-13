@@ -509,12 +509,14 @@ pub struct LogSink {
     enabled: Option<fn(u8, &str) -> bool>,
     timer: Option<fn(&str, Duration)>,
     count: Option<fn(&str, u64)>,
+    /// 设备侧采集是否武装(`perf level = gpu`)—— 由下游(如 CUPTI)在构造期问一次
+    gpu: Option<fn() -> bool>,
 }
 
 impl LogSink {
     /// 空口(全部丢弃;测试/无宿主场景)
     pub const fn none() -> Self {
-        Self { log: None, enabled: None, timer: None, count: None }
+        Self { log: None, enabled: None, timer: None, count: None, gpu: None }
     }
 
     /// 显式组装(各面可单独给)
@@ -523,8 +525,9 @@ impl LogSink {
         enabled: Option<fn(u8, &str) -> bool>,
         timer: Option<fn(&str, Duration)>,
         count: Option<fn(&str, u64)>,
+        gpu: Option<fn() -> bool>,
     ) -> Self {
-        Self { log, enabled, timer, count }
+        Self { log, enabled, timer, count, gpu }
     }
 
     /// 是否未接线(免无谓 format)
@@ -560,6 +563,17 @@ impl LogSink {
         self.timer.is_some()
             && crate::metrics::PERF_BUILD
             && crate::metrics::level() >= crate::metrics::level::HOST
+    }
+
+    /// **设备侧采集是否武装**(`perf level = gpu`)。下游(如 CUPTI)在
+    /// 构造期问一次即决定是否装载采集器 —— 默认 `host` 档 ⇒ false ⇒
+    /// 采集器**根本不启动**(零开销)。
+    #[inline]
+    pub fn gpu_armed(&self) -> bool {
+        match self.gpu {
+            Some(f) => f(),
+            None => false,
+        }
     }
 
     /// 记一段耗时(落 metrics;tag 律 `<plane>.<class>[.<detail>]`)
@@ -599,7 +613,17 @@ fn sink_count(tag: &str, n: u64) {
 
 /// 全局 logger + metrics 的现成接线(应用入口/引擎构造时取一次,显式下传)
 pub fn sink() -> LogSink {
-    LogSink::new(Some(sink_log), Some(sink_enabled), Some(sink_timer), Some(sink_count))
+    LogSink::new(
+        Some(sink_log),
+        Some(sink_enabled),
+        Some(sink_timer),
+        Some(sink_count),
+        Some(sink_gpu_armed),
+    )
+}
+
+fn sink_gpu_armed() -> bool {
+    crate::metrics::PERF_BUILD && crate::metrics::level() >= crate::metrics::level::GPU
 }
 
 // ============================================================================

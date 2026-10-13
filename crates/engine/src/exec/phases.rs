@@ -281,6 +281,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 } else {
                     bc
                 };
+                // 采样时的 ctx(换档失效判据;见 SpecDegrade.bare_cost_ctx)
+                spec.bare_cost_ctx = pos;
             }
             mrec("decode.step.deg", t_step.elapsed());
         }

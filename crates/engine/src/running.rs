@@ -78,6 +78,12 @@ pub(crate) struct TurnSpecState {
     /// < 盈亏线(3.6 tok/轮)即降级,不看连击
     pub(crate) recent_rounds: u32,
     pub(crate) recent_tokens: u32,
+    /// B4 窗口内累计轮时(ms)—— ①**时间门**:超长轮下等满 16 轮太久
+    /// (44ms×16=0.7s、150ms×16=2.4s)②**绝对吞吐**读数(2026-10-14)
+    pub(crate) recent_ms: f32,
+    /// B4 分母(`bare_cost_ewma_ms`)采样时的 ctx(pos)—— ctx 涨过 25%
+    /// 即作废分母(换档后旧采样失真 = 判据偏软的主因,2026-10-14)
+    pub(crate) bare_cost_ctx: usize,
     /// B4 动态盈亏线(2026-10-09):滚动轮成本 / 裸步成本 ewma(ms)。
     /// 盈亏平衡 avg = round_cost/bare_cost(常数 1.2 曾远低于真线 ~4,
     /// AL 1.2~4 区间亏本跑 spec = 9.4 t/s 案)
@@ -163,6 +169,12 @@ pub struct RunningEngine<D: DeviceClient> {
     pub(crate) blocks_m: BlockManager,
     /// 解释器执行环境(EnvProvider;逐 chunk/step 注入 ctx)
     pub(crate) env: owl_models::env::EnvProvider,
+    /// B4 判据跨 turn 保鲜(2026-10-14):裸步成本 EWMA + 其采样 ctx。
+    /// **为什么必须跨 turn**:`TurnSpecState` 随 turn 销毁 ⇒ 每 turn 起步
+    /// 分母 = 0 ⇒ 首个窗口只能用保守兜底线(2.5),在"真线 1.4 而 AL≈2"
+    /// 的域会误降级并抖动。带 ctx 保鲜后,同档续聊直接沿用真线。
+    pub(crate) bare_cost_carry_ms: f32,
+    pub(crate) bare_cost_carry_ctx: usize,
     /// E5-M2:投机轮深(0 = 关;>0 = 每轮草稿数,调度发 SpecRound)
     pub(crate) spec_depth: usize,
     /// E5 性能:schedule 累计账(轮间 host 成本剖析)

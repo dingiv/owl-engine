@@ -253,6 +253,27 @@ impl GpuServer {
             }
         }
 
+        // ── CUPTI 进程内归因(feature `cupti` + `perf level = gpu`)──
+        // 只有显式武装时才装载采集器:默认 `host` 档 **根本不调**
+        // `owl_cupti_start`(零开销,二进制路径不变)。图内逐核归因的唯一
+        // 来源(见 perf-framework §十一;decode/verify 走图回放 ⇒ 解释器
+        // 钩子与 gpu_prof 都看不见里面)。
+        #[cfg(feature = "cupti")]
+        if self.sink.gpu_armed() {
+            match crate::cupti::start(self.sink) {
+                Ok(()) => self.sink.logf(
+                    owl_shared::log::LVL_INFO,
+                    "cupti",
+                    format_args!("CUPTI 归因已武装(逐核 GPU 时间 → gpu.kern.*/gpu.graph.*)"),
+                ),
+                Err(e) => self.sink.logf(
+                    owl_shared::log::LVL_WARN,
+                    "cupti",
+                    format_args!("CUPTI 武装失败(继续跑,无逐核账): {e}"),
+                ),
+            }
+        }
+
         // 派发线程:host 回调只投递,真正 finish(含 free_host 等 CUDA 操作)在这跑
         let (dtx, drx) = mpsc::channel::<Finish>();
         std::thread::Builder::new()
@@ -296,6 +317,19 @@ impl GpuServer {
             }
         }
         self.shutdown_fence();
+        // CUPTI 收尾(先 flush 再停;排空线程在 stop 内 join)
+        #[cfg(feature = "cupti")]
+        {
+            if crate::cupti::running() {
+                crate::cupti::stop();
+                let (tot, drop, batch, graph) = crate::cupti::stats();
+                self.sink.logf(
+                    owl_shared::log::LVL_INFO,
+                    "cupti",
+                    format_args!("CUPTI 收尾:记录 {tot}(图内 {graph})/丢 {drop}/排空批 {batch}"),
+                );
+            }
+        }
         // server 侧逐命令分相汇总(OWL_SRV_TIMING;与 [load] 客户端探针互补)
         if self.probes.srv_timing && !self.timings.is_empty() {
             self.sink.logf(owl_shared::log::LVL_DEBUG, "srv-timing", format_args!("===== handler 分相(count / total / max) ====="));

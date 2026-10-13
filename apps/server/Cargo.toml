@@ -23,6 +23,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 # 计时宏/钩子全速采集;不带 = 生产二进制零成本。
 #   用法: cargo build --release -p server --features perf
 perf = ["owl-shared/perf", "owl-engine/perf"]
+cupti = ["owl-cuda/cupti"]
 log = ["owl-shared/log", "owl-engine/log"]
 
 [dev-dependencies]

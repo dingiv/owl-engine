@@ -33,6 +33,10 @@ mod state;
 
 pub mod ffi;
 
+/// CUPTI 进程内归因(仅 feature `cupti`;见 perf-framework §十一)
+#[cfg(feature = "cupti")]
+pub mod cupti;
+
 pub use command::Command;
 pub use gpu_client::GpuClient;
 pub use state::DiagOpts;

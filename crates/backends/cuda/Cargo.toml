@@ -5,6 +5,14 @@ edition.workspace = true
 license.workspace = true
 description = "CUDA backend: cudarc wrapped with memory-safety governance (charter A1/A4)"
 
+[features]
+# CUPTI 进程内归因 shim(docs/arch/perf-framework.md §十一)。
+# **缺省关**:不开则 build.rs 零动作、不编 shim、不引 libcupti(生产二进制
+# 与之前逐字节等价);要"引擎自己分析自己"再加本 feature。
+#   用法: cargo build --release -p server --features perf,cupti
+#   运行时:/debug/perf/level/gpu 武装(level=gpu 才调 owl_cupti_start)
+cupti = []
+
 [dependencies]
 # 官方 crates.io 版(非 guoqingbao fork):图相关语义由本封装层自持,
 # 不依赖 fork 的 graph feature(A4:语义分歧不进第三方库)
