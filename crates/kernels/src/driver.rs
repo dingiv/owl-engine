@@ -294,7 +294,7 @@ pub fn resolve(req: OpReq) -> KernelPick {
     pick
 }
 
-/// 一次拾取的产物:名字 + 发射配置(构造 [`Kernel`](crate::sources) 对应
+/// 一次拾取的产物:名字 + 发射配置(构造 [`Kernel](crate::list) 对应
 /// 的发射全部输入;grid 哨兵 (0,0,0) = 解释层按输出元素数自动 1D
 /// ceil/256,同登记表约)
 ///

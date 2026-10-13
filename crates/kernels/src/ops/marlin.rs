@@ -17,7 +17,7 @@ pub struct MarlinGemmW4a16Awq;
 impl KernelSpec for MarlinGemmW4a16Awq {
     const ENTRY: &'static str = crate::contract::names::GEMM_W4A16_AWQ;
     /// foreign(静态链接):无 `.cu` 源
-    const SOURCE: &'static str = "";
+    const SRC: &'static str = "";
     const PARAMS: &'static [Param] = &[
         Param::t_in("a", Dtype::F16, 2),
         // 4bit 打包权重(32 位字承载)
@@ -51,7 +51,7 @@ pub struct MarlinGemmW4a16Bf16;
 
 impl KernelSpec for MarlinGemmW4a16Bf16 {
     const ENTRY: &'static str = crate::contract::names::GEMM_W4A16_BF16;
-    const SOURCE: &'static str = "";
+    const SRC: &'static str = "";
     const PARAMS: &'static [Param] = &[
         Param::t_in("a", Dtype::BF16, 2),
         Param::t_in("b", Dtype::U32, 2),
@@ -74,7 +74,7 @@ pub struct MarlinGemmW4a16F16;
 
 impl KernelSpec for MarlinGemmW4a16F16 {
     const ENTRY: &'static str = crate::contract::names::GEMM_W4A16;
-    const SOURCE: &'static str = "";
+    const SRC: &'static str = "";
     const PARAMS: &'static [Param] = &[
         Param::t_in("a", Dtype::F16, 2),
         Param::t_in("b", Dtype::U32, 2),

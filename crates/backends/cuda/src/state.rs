@@ -756,7 +756,7 @@ impl KernelCache {
         if let Some(f) = self.compiled.get(name) {
             return Ok(f.clone());
         }
-        let asset = owl_kernels::family::cubins::asset_of_source(source).ok_or_else(|| {
+        let asset = owl_kernels::family::cubins::asset(source).ok_or_else(|| {
             // 机器判据面:整轮 e2e 日志里 `grep -c aot-miss` 应恒 0
             eprintln!("[aot-miss] {name} —— 无构建期 cubin 资产(源 {} B)", source.len());
             if !self.misses.iter().any(|m| m == name) {
@@ -768,7 +768,7 @@ impl KernelCache {
                 source.len()
             ))
         })?;
-        let module = match self.modules.get(asset.asset) {
+        let module = match self.modules.get(asset.module) {
             Some(m) => m.clone(),
             None => {
                 // fatbin 载入:driver API 与纯 cubin 完全相同(多代际由驱动
@@ -778,17 +778,17 @@ impl KernelCache {
                     .map_err(|e| {
                         ModelError::Msg(format!(
                             "aot load_module({} / {name}): {e:?} —— 资产载入失败(代际不匹配?驱动过旧?)",
-                            asset.asset
+                            asset.module
                         ))
                     })?;
-                self.modules.insert(asset.asset, m.clone());
+                self.modules.insert(asset.module, m.clone());
                 m
             }
         };
         let func = module.load_function(name).map_err(|e| {
             ModelError::Msg(format!(
                 "aot load_function({name}) in {}: {e:?} —— 符号不在资产里(源哈希命中但符号缺失 = 登记表/源失配)",
-                asset.asset
+                asset.module
             ))
         })?;
         self.aot_hits += 1;

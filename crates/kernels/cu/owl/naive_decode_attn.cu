@@ -1,25 +1,13 @@
+// ============================================================================
+// owl naive decode attention(2026-10-13 C 轮自 cu/owl/attention.cu 按**算子族**
+// 拆出 —— 与 narrow_strided 分家,各自成文件)。
+//
+// 一线程一 (t, q_head)。写 cache(slot>=0)→ 对以 slot 结尾的连续 kv_len 行
+// 打分 softmax → 加权和出 out。索引/位置量按形态契约 5 走 f32 数值过线。
+// 语义与 f32 版逐式同源(窗 = [slot-kv_len+1, slot];scale = 1/sqrt(D))。
+// OWL_MAX_KV = 256(单步寄存器分数上限;扩容/分页归真分页 kernel 立项)。
+// ============================================================================
 #include <cuda_fp16.h>
-
-// attention kernels(Qwen3.5 full-attention 层;port 自旧世界 dry_kernels.cu
-// + 新世界契约改造)。约定:全 f32;decode(seq=1 per t)slot 直排 KV;
-// 索引/位置量按形态契约 5 走 f32 数值过线(核内 cast;pos 已有先例)。
-
-// 非连续窄切物化拷贝(dst[idx] = src[r * src_dim + start + d]):
-// attn_output_gate 的 per-head [value|gate] 切分用(两次发射,start=0 / head_dim,
-// outer = tokens*heads,src_dim = 2*head_dim);GDN conv 输出三段切分同款复用。
-// 标量形参 = size_t(与 Arg::U64/arg_usize 8 字节严格对位);
-// 输出块固定末参(槽序契约 4)。
-extern "C" __global__ void owl_narrow_strided_f32(
-    const float* src,
-    size_t outer, size_t src_dim, size_t start, size_t out_dim,
-    float* dst) {
-    unsigned long long idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned long long total = outer * out_dim;
-    if (idx >= total) return;
-    unsigned long long r = idx / out_dim;
-    unsigned long long d = idx % out_dim;
-    dst[idx] = src[r * src_dim + start + d];
-}
 
 // decode(seq=1 per t)naive attention:一线程一 (t, q_head)。
 // 写 cache(slot>=0)→ 对以 slot 结尾的连续 kv_len 行打分 softmax → 加权和出 out。
@@ -95,19 +83,6 @@ extern "C" __global__ void owl_naive_decode_attn_f32(
         const float* vc_row = vc + (unsigned long long)(base + s) * kv_heads * d_dim + (unsigned long long)kvh * d_dim;
         for (size_t d = 0; d < d_dim; ++d) od[d] += wgt * vc_row[d];
     }
-}
-
-// f16 基线变体(F3):纯 gather 拷贝,无数值转换(half 位型直搬)。
-extern "C" __global__ void owl_narrow_strided_f16(
-    const __half* src,
-    size_t outer, size_t src_dim, size_t start, size_t out_dim,
-    __half* dst) {
-    unsigned long long idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned long long total = outer * out_dim;
-    if (idx >= total) return;
-    unsigned long long r = idx / out_dim;
-    unsigned long long d = idx % out_dim;
-    dst[idx] = src[r * src_dim + start + d];
 }
 
 // f16 基线变体(F4):q/k/v half,KV cache half(先写后打分同款),

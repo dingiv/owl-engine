@@ -98,7 +98,7 @@ impl KernelSpec for XqaVerify {
     const ENTRY: &'static str = xqa::VERIFY_XQA;
     /// foreign(预编 `.a`):无 `.cu` 源 —— 源码/符号在 vendor 归档,
     /// 装配门由族的 manifest/sha256 面承担
-    const SOURCE: &'static str = "";
+    const SRC: &'static str = "";
     const PARAMS: &'static [Param] = XQA_PARAMS;
     const SHAPE: ShapeFamily = XQA_SHAPE;
     const POOL: &'static [crate::spec::PoolAccess] =
@@ -120,7 +120,7 @@ pub struct XqaDecode;
 
 impl KernelSpec for XqaDecode {
     const ENTRY: &'static str = xqa::DECODE_XQA;
-    const SOURCE: &'static str = "";
+    const SRC: &'static str = "";
     const PARAMS: &'static [Param] = XQA_PARAMS;
     const SHAPE: ShapeFamily = XQA_SHAPE;
     const POOL: &'static [crate::spec::PoolAccess] =

@@ -14,7 +14,7 @@
 
 use crate::contract::{LaunchVal, OpError};
 use crate::spec::{BootCheck, CheckBuf, CheckReport, CheckRunner};
-const DFLASH2_F16: &str = include_str!("../../../cu/owl/dflash2.cu");
+const DFLASH2_F16: &str = "cu/owl/naive_attn_nc.cu";
 
 use super::{bf16_to_f32, lcg_bf16};
 

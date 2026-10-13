@@ -40,7 +40,7 @@ impl KernelFamily for GdnScalarRuntime {
             k: Some(exec.load_aot(res, asset::SOURCE, asset::KERNEL_F32, OP)?),
             cast_f32_f16: Some(exec.load_aot(
                 res,
-                crate::sources::attention::CAST,
+                crate::ops::source("owl_cast_f32_f16"),
                 "owl_cast_f32_f16",
                 OP,
             )?),

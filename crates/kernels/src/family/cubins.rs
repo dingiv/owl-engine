@@ -56,25 +56,18 @@ pub const fn hash_source(s: &str) -> u64 {
 ///
 /// 双判据(哈希 + 长度):64 位哈希对 20 个资产本已足够,但装配错了核
 /// 是灾难级(错数值而非崩),故要求两个独立指纹同时命中。
-/// 空源(`foreign` 虚核的 `KernelSource.source`)直接不命中 —— 它们是
+/// 空源(`foreign` 虚核的 `KernelSource.src`)直接不命中 —— 它们是
 /// 家族 runtime 的路径,不走 native 编译面。
-pub fn asset_of_source(source: &str) -> Option<&'static CubinAsset> {
-    if source.is_empty() {
+pub fn asset(src_id: &str) -> Option<&'static CubinAsset> {
+    if src_id.is_empty() {
         return None;
     }
-    let h = hash_source(source);
-    let n = source.len();
-    CUBIN_ASSETS.iter().find(|a| a.src_hash == h && a.src_len == n)
-}
-
-/// 资产名 → 资产(诊断/报告面)
-pub fn asset(asset: &str) -> Option<&'static CubinAsset> {
-    CUBIN_ASSETS.iter().find(|a| a.asset == asset)
+    CUBIN_ASSETS.iter().find(|a| a.id == src_id)
 }
 
 /// 是否具备构建期资产(装配期门/覆盖率报告的谓词)
-pub fn has_aot(source: &str) -> bool {
-    asset_of_source(source).is_some()
+pub fn has_aot(src_id: &str) -> bool {
+    asset(src_id).is_some()
 }
 
 /// **AOT 覆盖率**(登记表全量):`(已覆盖, 总数, 缺陷名)`。
@@ -87,11 +80,11 @@ pub fn coverage() -> (usize, usize, Vec<&'static str>) {
     let mut total = 0usize;
     let mut missing: Vec<&'static str> = Vec::new();
     for e in crate::list::REGISTRY {
-        if e.source.is_empty() {
+        if e.src.is_empty() {
             continue;
         }
         total += 1;
-        if has_aot(e.source) {
+        if has_aot(e.src) {
             covered += 1;
         } else {
             missing.push(e.name);
@@ -104,29 +97,22 @@ pub fn coverage() -> (usize, usize, Vec<&'static str>) {
 mod tests {
     use super::*;
 
-    /// **自洽锁**:Rust 侧 `hash_source` 与 build.rs 侧逐位一致
-    /// (逐资产回算源哈希;算法漂移一处即红)
+    /// **自洽锁**:Rust 侧 `hash_source` 与 build.rs 侧逐位一致。
+    ///
+    /// E 轮后二进制不再内联 `.cu` ⇒ 回算样本从"内嵌文本"改为**磁盘上的源**
+    /// (测试面允许 IO)。判据不变:算法漂移一处即红。
     #[test]
     fn generated_hashes_match_rust_hash_fn() {
         assert!(!CUBIN_ASSETS.is_empty(), "资产表为空 —— build.rs 未产 cubin?");
         for a in CUBIN_ASSETS {
-            assert!(
-                !a.src.is_empty(),
-                "资产 {} 的源文本没内嵌(构建期 include_str 缺失)",
-                a.asset
-            );
+            let text = crate::list::cu_text(a.id);
             assert_eq!(
-                hash_source(a.src),
+                hash_source(&text),
                 a.src_hash,
                 "资产 {} 的源哈希与 build.rs 不一致(算法漂移)",
-                a.asset
+                a.id
             );
-            assert_eq!(a.src.len(), a.src_len, "资产 {} 源长度不一致", a.asset);
-            assert!(
-                asset_of_source(a.src).is_some_and(|x| x.asset == a.asset),
-                "资产 {} 反查失败(哈希 + 长度双判据应命中自身)",
-                a.asset
-            );
+            assert!(asset(a.id).is_some_and(|x| x.module == a.module), "资产 {} 反查失败", a.id);
         }
     }
 
@@ -140,11 +126,11 @@ mod tests {
         let mut missing: Vec<&str> = Vec::new();
         let mut native = 0usize;
         for m in crate::ops::all() {
-            if m.source.is_empty() {
+            if m.src.is_empty() {
                 continue;
             }
             native += 1;
-            if !has_aot(m.source) {
+            if !has_aot(m.src) {
                 missing.push(m.entry);
             }
         }

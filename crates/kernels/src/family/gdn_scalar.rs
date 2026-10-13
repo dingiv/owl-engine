@@ -37,16 +37,18 @@ pub const GDN_SCALAR_SLOTS: &str = "[T q, T k, T v, T g, T beta, T state, O out,
 
 /// 设备码资产(2026-10-13 C4:由"预编 cubin 入库"改为**源自托管 + 构建期资产**)
 ///
-/// **源在树**(`cu/gdn/gdn_chunk_scalar.cu`,就地 `include_str!`)⇒
-/// `build.rs` 的 `include_str!` 闭包自动纳入 ⇒ 编成 fatbin 进资产登记表
-/// (源哈希查表,与 native 核同一条链)。旧 `assets/gdn_scalar/*.cubin`
-/// (入库二进制 + build.sh + manifest)已删 —— 形态统一:一处机制,不留自管资产。
+/// **源在树**(`cu/gdn/gdn_chunk_scalar.cu`)⇒ `build.rs` 的**目录/字面量扫描**
+/// 自动纳入 ⇒ 编成 fatbin 进资产登记表(按资产 id 查表,与 native 核同一条链)。
+/// 旧 `assets/gdn_scalar/*.cubin`(入库二进制 + build.sh + manifest)已删 ——
+/// 形态统一:一处机制,不留自管资产。
+///
+/// E 轮(2026-10-13):`SOURCE` 从"源文本(`include_str!`)"改为**资产 id**;
 pub mod asset {
     /// 内核符号名(extern "C",名稳)
     pub const KERNEL_F32: &str = "owl_gdn_chunk_scalar_f32";
 
-    /// 源文本(就地 include_str;查表键 = 它的内容哈希)
-    pub const SOURCE: &str = include_str!("../../cu/gdn/gdn_chunk_scalar.cu");
+    /// **资产 id**(`cu/` 相对路径;= 登记表查表键,与 `KernelSpec::SRC` 同形)
+    pub const SOURCE: &str = "cu/gdn/gdn_chunk_scalar.cu";
 
     /// 发射常量(与 .cu 内 kBlockDim/kChunkSize/d=128 一致;单源律:改两处)
     pub const BLOCK: u32 = 256;
@@ -57,7 +59,7 @@ pub mod asset {
     /// 构建期资产字节(测试/诊断面 —— 生产走 `Exec::load_aot` 的符号查表)
     #[cfg(feature = "device")]
     pub fn bytes() -> &'static [u8] {
-        crate::family::cubins::asset_of_source(SOURCE)
+        crate::family::cubins::asset(SOURCE)
             .expect("gdn_chunk_scalar 应有构建期资产(build.rs 闭包漏了?)")
             .bytes
     }

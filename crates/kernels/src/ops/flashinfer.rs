@@ -15,7 +15,7 @@ pub struct FiPrefillFp8kv;
 impl KernelSpec for FiPrefillFp8kv {
     const ENTRY: &'static str = crate::contract::names::PREFILL_FI_FP8KV;
     /// foreign(预编 `.a`):无 `.cu` 源
-    const SOURCE: &'static str = "";
+    const SRC: &'static str = "";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
         // fp8 影子池(adapter 内部布局;1B/elem)

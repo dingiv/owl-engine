@@ -68,7 +68,7 @@ pub fn kv_manifest_gate(
         };
         // .cu 源里必须有该核定义(字面 or 单层宏实例化;判据单源 =
         // owl_kernels::list::source_defines —— chunked kNHD 族走宏)
-        if !owl_kernels::list::source_defines(e.source, name) {
+        if !owl_kernels::list::source_defines(e.src, name) {
             bad.push(name);
         }
     }

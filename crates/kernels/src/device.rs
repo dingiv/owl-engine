@@ -216,30 +216,30 @@ impl Exec {
         Self::default()
     }
 
-    /// **构建期资产装载**(native 核唯一路径;源哈希查表 → fatbin → 符号)。
+    /// **构建期资产装载**(native 核唯一路径;资产 id 查表 → fatbin → 符号)。
     ///
-    /// 查表键 = **源文本**(不是名字):与 `KernelSpec::SOURCE` 一一对应,
-    /// 不存在第二份名字→资产映射(设计 §15.5.3)。模块按资产共享 —— 同一
-    /// `.cu` 的多个核只载一次。
+    /// 查表键 = **资产 id**(`cu/` 相对路径),与 `KernelSpec::SRC` 一一对应。
+    /// E 轮(2026-10-13)起**不再携带源文本**:文本只在构建期参与编译,运行期
+    /// 只需要资产身份(设计 §15.5 的内容键立意改由「构建期目录扫描 + 符号
+    /// 清单」承担)。模块按资产共享 —— 同一 `.cu` 的多个核只载一次。
     ///
     /// 未命中 = `OpError::Asset`(**不是**降级到运行期编译:自 2026-10-13
     /// 裁决起 NVRTC 已退役,本函数是唯一的设备码装载入口)。
     pub fn load_aot(
         &mut self,
         res: &mut dyn DeviceRes,
-        source: &str,
+        src_id: &str,
         symbol: &'static str,
         op: OpId,
     ) -> Result<Arc<CudaFunction>, OpError> {
-        let asset = crate::family::cubins::asset_of_source(source).ok_or_else(|| OpError::Asset {
+        let asset = crate::family::cubins::asset(src_id).ok_or_else(|| OpError::Asset {
             op: op.0.to_string(),
             detail: format!(
-                "symbol {symbol}: 源({} B)无构建期 cubin 资产 —— 不在 build.rs 的 include_str! 闭包内\
-                 (零运行期编译硬门:NVRTC 已退役,见设计 §15.3/§15.5)",
-                source.len()
+                "symbol {symbol}: 资产 id {src_id:?} 无构建期 fatbin —— 该路径不在 build.rs 的 \
+                 目录扫描结果内(零运行期编译硬门:NVRTC 已退役,见设计 §15.3/§15.5)"
             ),
         })?;
-        let key = BlobKey::of(asset.asset, asset.bytes);
+        let key = BlobKey::of(asset.id, asset.bytes);
         if let Some(f) = self.fns.get(&(key, symbol)) {
             return Ok(f.clone());
         }
@@ -251,7 +251,7 @@ impl Exec {
                     .load_module(cudarc::nvrtc::Ptx::from_binary(asset.bytes.to_vec()))
                     .map_err(|e| OpError::Asset {
                         op: op.0.to_string(),
-                        detail: format!("asset {}: {e:?}", asset.asset),
+                        detail: format!("asset {}: {e:?}", asset.id),
                     })?;
                 self.modules.insert(key, m.clone());
                 m
@@ -259,7 +259,7 @@ impl Exec {
         };
         let f = module.load_function(symbol).map_err(|e| OpError::Asset {
             op: op.0.to_string(),
-            detail: format!("符号 {symbol} 不在资产 {}({e:?})——资产/代码代际失配", asset.asset),
+            detail: format!("符号 {symbol} 不在资产 {}({e:?})——资产/代码代际失配", asset.id),
         })?;
         let f = Arc::new(f);
         self.fns.insert((key, symbol), f.clone());

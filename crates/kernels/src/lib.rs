@@ -4,6 +4,9 @@
 //! 借力原则(REQ-DESIGN):GEMM = marlin-ffi(xinfer P1-P3 产物,活跃所有权)
 //! 直接接线;attention = attention-rs 快照;这里只定义**契约与分发表**,
 //! 不实现 kernel(REQ-DESIGN-03:自研是最后手段)。
+//!
+//! `.cu` 源常量的住址:已建表算子住 `ops/<域>.rs`(`KernelSpec::SOURCE`),
+//! 未建表「仅引入」算子住 `list.rs` §0 —— 集中模块 `sources.rs` 已退役。
 
 /// 契约面(类型权威:Dtype/线格式/Bytes/LaunchMsg/OpError/OpId;
 /// 2026-10-12 M2 自 owl-iface::contract 迁入 —— iface 依赖 kernels,
@@ -87,9 +90,5 @@ pub fn dispatch(arch: Arch) -> &'static str {
     }
 }
 
-pub mod sources;
-
-/// 硬件感知算子拾取(REQ-HW-01 落地;名字单源 + pick 产物 + 参数推导;
-/// 上层经具名函数描述「要什么」,本模块决定「用哪个、怎么发射」)
 pub mod driver;
 

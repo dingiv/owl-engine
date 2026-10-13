@@ -15,7 +15,7 @@ pub struct GdnChunkedDeltaRuleFwd;
 impl KernelSpec for GdnChunkedDeltaRuleFwd {
     const ENTRY: &'static str = crate::contract::names::GDN_CHUNKED;
     /// foreign(预编 cubin 编排):无单一 `.cu` 源
-    const SOURCE: &'static str = "";
+    const SRC: &'static str = "";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 3),
         Param::t_in("k", Dtype::F16, 3),

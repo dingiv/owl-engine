@@ -74,6 +74,22 @@ pub fn meta(name: &str) -> Option<&'static KernelMeta> {
     all().find(|m| m.entry == name)
 }
 
+/// **按入口名取 `.cu` 源码**(自托管的唯一读取口;探针 / 服务端装配面用)。
+///
+/// 解析序(**单一实现**住本函数,`list::source` 只是兼容转发):
+/// 1. **已建表** ⇒ `KernelMeta::SOURCE`(就地 `include_str!`,R5 —— 算子
+///    自托管面是它的唯一住址);
+/// 2. **仅引入**(未建表)⇒ 登记表 [`crate::list::REGISTRY`] —— 它只有那一个
+///    住址,故不是第二份抄写;待 R1 建表补齐,本分支随登记表一起退役。
+///
+/// 名字查不到 = 编程错误(拼错名),panic 带登记提示。
+pub fn source(name: &str) -> &'static str {
+    match meta(name) {
+        Some(m) => m.src,
+        None => crate::list::registry_source(name),
+    }
+}
+
 /// 已建表算子数(P3 进度条;boot 报告与 `--print-op-table` 共用)
 pub fn built_count() -> usize {
     TABLES.iter().map(|t| t.len()).sum()
@@ -418,7 +434,7 @@ mod tests {
     struct ReadOnly;
     impl KernelSpec for ReadOnly {
         const ENTRY: &'static str = "fake_reader";
-        const SOURCE: &'static str = "";
+        const SRC: &'static str = "";
         const PARAMS: &'static [Param] = &[];
         const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
             kv_dtype: Some(crate::contract::Dtype::U8),
@@ -436,7 +452,7 @@ mod tests {
     struct Mismatched;
     impl KernelSpec for Mismatched {
         const ENTRY: &'static str = "fake_mismatch";
-        const SOURCE: &'static str = "";
+        const SRC: &'static str = "";
         const PARAMS: &'static [Param] = &[];
         const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
             kv_dtype: Some(crate::contract::Dtype::U8),
@@ -455,7 +471,7 @@ mod tests {
     struct WriteKnhd;
     impl KernelSpec for WriteKnhd {
         const ENTRY: &'static str = "fake_writer_knhd";
-        const SOURCE: &'static str = "";
+        const SRC: &'static str = "";
         const PARAMS: &'static [Param] = &[];
         const POOL: &'static [PoolAccess] = &[PoolAccess::write(
             pools::KV_MAIN,
@@ -466,7 +482,7 @@ mod tests {
     struct WriteClassic;
     impl KernelSpec for WriteClassic {
         const ENTRY: &'static str = "fake_writer_classic";
-        const SOURCE: &'static str = "";
+        const SRC: &'static str = "";
         const PARAMS: &'static [Param] = &[];
         const POOL: &'static [PoolAccess] = &[PoolAccess::write(
             pools::KV_MAIN,

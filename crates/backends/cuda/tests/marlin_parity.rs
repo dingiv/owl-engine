@@ -501,7 +501,7 @@ async fn ct_repack_parity() {
         let msg = LaunchMsg {
             kernel: owl_cuda::KernelSource {
                 name: "owl_ct_repack_u32".into(),
-                source: owl_kernels::sources::owl::CT_REPACK_U32.into(),
+                source: owl_kernels::ops::source("owl_ct_repack_u32").into(),
             },
             args: vec![
                 Arg::Block { id: dp.id },

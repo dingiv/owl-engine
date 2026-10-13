@@ -20,7 +20,7 @@ pub struct NcAttnBf16V2;
 
 impl KernelSpec for NcAttnBf16V2 {
     const ENTRY: &'static str = "owl_naive_attn_nc_bf16_v2";
-    const SOURCE: &'static str = include_str!("../../cu/owl/dflash2.cu");
+    const SRC: &'static str = "cu/owl/naive_attn_nc.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::BF16, 2),
         Param::t_in("k_self", Dtype::BF16, 3),
@@ -86,7 +86,7 @@ const PAGED_V2_FP8_KNHD_PARAMS: &[Param] = &[
 
 impl KernelSpec for PagedAttnV2Fp8KnhdHd256Bs32 {
     const ENTRY: &'static str = "vllm_paged_attention_v2_fp8_knhd_hd256bs32";
-    const SOURCE: &'static str = include_str!("../../cu/attention/pagedattention_f16.cu");
+    const SRC: &'static str = "cu/attention/pagedattention_f16.cu";
     const PARAMS: &'static [Param] = PAGED_V2_FP8_KNHD_PARAMS;
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -107,7 +107,7 @@ pub struct PagedAttnV2ReduceF16Hd256;
 
 impl KernelSpec for PagedAttnV2ReduceF16Hd256 {
     const ENTRY: &'static str = "vllm_paged_attention_v2_reduce_f16_hd256";
-    const SOURCE: &'static str = include_str!("../../cu/attention/pagedattention_f16.cu");
+    const SRC: &'static str = "cu/attention/pagedattention_f16.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("exp_sums", Dtype::F32, 2),
         Param::t_in("max_logits", Dtype::F32, 2),
@@ -132,7 +132,7 @@ pub struct K0WriteFp8Knhd;
 
 impl KernelSpec for K0WriteFp8Knhd {
     const ENTRY: &'static str = "owl_reshape_and_cache_fp8kv_knhd";
-    const SOURCE: &'static str = include_str!("../../cu/attention/reshape_and_cache_fp8kv.cu");
+    const SRC: &'static str = "cu/attention/reshape_and_cache_fp8kv.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("key", Dtype::F16, 3),
         Param::t_in("value", Dtype::F16, 3),
@@ -176,7 +176,7 @@ pub struct ChunkedPrefillFp8KnhdHd256;
 
 impl KernelSpec for ChunkedPrefillFp8KnhdHd256 {
     const ENTRY: &'static str = "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256";
-    const SOURCE: &'static str = include_str!("../../cu/attention/prefill_paged_attn_f16.cu");
+    const SRC: &'static str = "cu/attention/prefill_paged_attn_f16.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
         Param::t_in("k_cache", Dtype::U8, 4),
@@ -222,7 +222,7 @@ pub struct K0WriteFp8Classic;
 
 impl KernelSpec for K0WriteFp8Classic {
     const ENTRY: &'static str = "owl_reshape_and_cache_fp8kv";
-    const SOURCE: &'static str = include_str!("../../cu/attention/reshape_and_cache_fp8kv.cu");
+    const SRC: &'static str = "cu/attention/reshape_and_cache_fp8kv.cu";
     const PARAMS: &'static [Param] = K0_PARAMS;
     const POOL: &'static [PoolAccess] = &[
         PoolAccess::write(pools::KV_MAIN, LayoutTag::Classic, Dtype::U8),
@@ -262,7 +262,7 @@ pub struct K0WriteBf16;
 
 impl KernelSpec for K0WriteBf16 {
     const ENTRY: &'static str = "vllm_reshape_and_cache_bf16";
-    const SOURCE: &'static str = include_str!("../../cu/attention/reshape_and_cache.cu");
+    const SRC: &'static str = "cu/attention/reshape_and_cache.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("key", Dtype::BF16, 3),
         Param::t_in("value", Dtype::BF16, 3),
@@ -296,7 +296,7 @@ pub struct NcAttnFp8kvBf16;
 
 impl KernelSpec for NcAttnFp8kvBf16 {
     const ENTRY: &'static str = "owl_naive_attn_nc_fp8kv_bf16";
-    const SOURCE: &'static str = include_str!("../../cu/owl/dflash2.cu");
+    const SRC: &'static str = "cu/owl/naive_attn_nc.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::BF16, 2),
         Param::t_in("k_self", Dtype::BF16, 3),
@@ -336,7 +336,7 @@ pub struct NormRopeF16;
 
 impl KernelSpec for NormRopeF16 {
     const ENTRY: &'static str = "owl_norm_rope_f16";
-    const SOURCE: &'static str = include_str!("../../cu/owl/fused.cu");
+    const SRC: &'static str = "cu/owl/norm_rope.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::F16, 2),
         Param::t_in("w", Dtype::F16, 1),
@@ -360,7 +360,7 @@ pub struct NormRopeBf16;
 
 impl KernelSpec for NormRopeBf16 {
     const ENTRY: &'static str = "owl_norm_rope_bf16";
-    const SOURCE: &'static str = include_str!("../../cu/owl/fused.cu");
+    const SRC: &'static str = "cu/owl/norm_rope.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::BF16, 2),
         Param::t_in("w", Dtype::BF16, 1),
@@ -420,7 +420,7 @@ macro_rules! paged_v2_variant {
 
         impl KernelSpec for $ty {
             const ENTRY: &'static str = $entry;
-            const SOURCE: &'static str = include_str!("../../cu/attention/pagedattention_f16.cu");
+            const SRC: &'static str = "cu/attention/pagedattention_f16.cu";
             const PARAMS: &'static [Param] = PAGED_V2_PARAMS;
             const LAWS: &'static [Law] = &[Law::OutputFinite];
             const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -457,7 +457,7 @@ pub struct PagedV2ReduceF16Hd128;
 
 impl KernelSpec for PagedV2ReduceF16Hd128 {
     const ENTRY: &'static str = "vllm_paged_attention_v2_reduce_f16_hd128";
-    const SOURCE: &'static str = include_str!("../../cu/attention/pagedattention_f16.cu");
+    const SRC: &'static str = "cu/attention/pagedattention_f16.cu";
     const PARAMS: &'static [Param] = PAGED_V2_REDUCE_PARAMS;
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;

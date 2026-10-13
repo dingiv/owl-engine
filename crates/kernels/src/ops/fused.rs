@@ -16,7 +16,7 @@ pub struct QknormRopeKvInsertF16Fp8Knhd;
 
 impl KernelSpec for QknormRopeKvInsertF16Fp8Knhd {
     const ENTRY: &'static str = "owl_qknorm_rope_kv_insert_f16_fp8kv_knhd";
-    const SOURCE: &'static str = include_str!("../../cu/owl/fused.cu");
+    const SRC: &'static str = "cu/owl/qknorm_insert.cu";
     const PARAMS: &'static [Param] = &[
         // q_raw 是 per-head [value|gate] 半段拼接(strided 读)
         Param::t_in("q_raw", Dtype::F16, 2),
@@ -59,7 +59,7 @@ pub struct QknormRopeKvInsertF16Fp8;
 
 impl KernelSpec for QknormRopeKvInsertF16Fp8 {
     const ENTRY: &'static str = "owl_qknorm_rope_kv_insert_f16_fp8kv";
-    const SOURCE: &'static str = include_str!("../../cu/owl/fused.cu");
+    const SRC: &'static str = "cu/owl/qknorm_insert.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q_raw", Dtype::F16, 2),
         Param::t_in("k", Dtype::F16, 3),
@@ -99,9 +99,100 @@ impl KernelSpec for QknormRopeKvInsertF16Fp8 {
 pub static QKNORM_ROPE_KV_INSERT_F16_FP8_KNHD: KernelMeta = meta_of::<QknormRopeKvInsertF16Fp8Knhd>();
 pub static QKNORM_ROPE_KV_INSERT_F16_FP8: KernelMeta = meta_of::<QknormRopeKvInsertF16Fp8>();
 
+// ----------------------------------------------------------------------------
+// R1 补表(2026-10-13):f16 主池两支 —— 声明从登记表派生,签名由 `op_tables` 门互证
+// ----------------------------------------------------------------------------
+
+/// `owl_qknorm_rope_kv_insert_f16` —— 经典池 f16 插池(classic 布局,主池+草稿池双写)
+pub struct QknormRopeKvInsertF16;
+
+impl KernelSpec for QknormRopeKvInsertF16 {
+    const ENTRY: &'static str = "owl_qknorm_rope_kv_insert_f16";
+    const SRC: &'static str = "cu/owl/qknorm_insert.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("q", Dtype::F16, 2),
+        Param::t_in("q_raw", Dtype::F16, 2),
+        Param::t_in("kw", Dtype::F16, 2),
+        Param::t_in("beta", Dtype::F16, 2),
+        Param::t_in("cos", Dtype::F16, 2),
+        Param::t_in("sin", Dtype::F16, 2),
+        Param::t_in("k", Dtype::F16, 2),
+        Param::t_in("v", Dtype::F16, 2),
+        Param::t_in("kc", Dtype::F16, 3),
+        Param::t_in("vc", Dtype::F16, 3),
+        Param::t_in("slots", Dtype::F32, 1),
+        Param::f32("eps"),
+        Param::i32("tokens"),
+        Param::i32("heads"),
+        Param::i32("head_dim"),
+        Param::i32("w_off"),
+        Param::t_out("out", Dtype::F16, 2),
+    ];
+    const POOL: &'static [PoolAccess] = &[
+        PoolAccess::write(pools::KV_MAIN, LayoutTag::Classic, Dtype::F16),
+        PoolAccess::write(pools::KV_DRAFT, LayoutTag::Classic, Dtype::F16),
+    ];
+    const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+        kv_dtype: Some(Dtype::F16),
+        head_dim: &[128],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
+    };
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+/// `owl_qknorm_rope_kv_insert_f16_knhd` —— kNHD 单布局 f16 插池(主池 f16)
+pub struct QknormRopeKvInsertF16Knhd;
+
+impl KernelSpec for QknormRopeKvInsertF16Knhd {
+    const ENTRY: &'static str = "owl_qknorm_rope_kv_insert_f16_knhd";
+    const SRC: &'static str = "cu/owl/qknorm_insert.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("q", Dtype::F16, 2),
+        Param::t_in("q_raw", Dtype::F16, 2),
+        Param::t_in("kw", Dtype::F16, 2),
+        Param::t_in("beta", Dtype::F16, 2),
+        Param::t_in("cos", Dtype::F16, 2),
+        Param::t_in("sin", Dtype::F16, 2),
+        Param::t_in("k", Dtype::F16, 2),
+        Param::t_in("v", Dtype::F16, 2),
+        Param::t_in("kc", Dtype::F16, 3),
+        Param::t_in("vc", Dtype::F16, 3),
+        Param::t_in("slots", Dtype::F32, 1),
+        Param::f32("eps"),
+        Param::i32("tokens"),
+        Param::i32("heads"),
+        Param::i32("head_dim"),
+        Param::i32("w_off"),
+        Param::t_out("out", Dtype::F16, 2),
+    ];
+    const POOL: &'static [PoolAccess] =
+        &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F16)];
+    const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+        kv_dtype: Some(Dtype::F16),
+        head_dim: &[256],
+        page: &[32],
+        grp: None,
+        tile: None,
+    };
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+pub static QKNORM_ROPE_KV_INSERT_F16: KernelMeta = meta_of::<QknormRopeKvInsertF16>();
+pub static QKNORM_ROPE_KV_INSERT_F16_KNHD: KernelMeta = meta_of::<QknormRopeKvInsertF16Knhd>();
+
 /// 本域全部已建表算子
-pub static METAS: &[&KernelMeta] =
-    &[&QKNORM_ROPE_KV_INSERT_F16_FP8_KNHD, &QKNORM_ROPE_KV_INSERT_F16_FP8];
+pub static METAS: &[&KernelMeta] = &[
+    &QKNORM_ROPE_KV_INSERT_F16_FP8_KNHD,
+    &QKNORM_ROPE_KV_INSERT_F16_FP8,
+    &QKNORM_ROPE_KV_INSERT_F16,
+    &QKNORM_ROPE_KV_INSERT_F16_KNHD,
+];
 
 #[cfg(test)]
 mod tests {

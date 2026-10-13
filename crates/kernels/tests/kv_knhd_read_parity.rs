@@ -159,7 +159,7 @@ fn paged_decode_v2_knhd_parity() {
     }
 
     let run = |name: &str, kcp: &[u16], vcp: &[u16], kstride: i32| -> Vec<u16> {
-        let f = compile(&ctx, owl_kernels::sources::attention::PAGED_ATTENTION_F16, name);
+        let f = compile(&ctx, &owl_kernels::list::cu_text(owl_kernels::ops::source("vllm_paged_attention_v2_fp8_knhd_hd256bs32")), name);
         let mut d_q = unsafe { stream.alloc::<u16>(q.len()) }.unwrap();
         stream.memcpy_htod(&q, &mut d_q).unwrap();
         let mut d_kc = unsafe { stream.alloc::<u16>(kcp.len()) }.unwrap();
@@ -325,7 +325,7 @@ fn paged_decode_v2_knhd_parity() {
     let (kc_c8, kc_n8) = fill_pools_u8(PoolKind::KClassic, |s, h, d| (((s * 29 + h * 13 + d) % 120) + 1) as u8);
     let (vc_c8, vc_n8) = fill_pools_u8(PoolKind::VClassic, |s, h, d| (((s * 31 + h * 17 + d) % 120) + 1) as u8);
     let run8 = |name: &str, kcp: &[u8], vcp: &[u8], kstride: i32| -> Vec<u16> {
-        let f = compile(&ctx, owl_kernels::sources::attention::PAGED_ATTENTION_F16, name);
+        let f = compile(&ctx, &owl_kernels::list::cu_text(owl_kernels::ops::source("vllm_paged_attention_v2_fp8_knhd_hd256bs32")), name);
         let mut d_q = unsafe { stream.alloc::<u16>(q.len()) }.unwrap();
         stream.memcpy_htod(&q, &mut d_q).unwrap();
         let mut d_kc = unsafe { stream.alloc::<u8>(kcp.len()) }.unwrap();
@@ -436,7 +436,7 @@ fn prefill_split_knhd_parity() {
     });
 
     let run = |name: &str, kcp: &[u16], vcp: &[u16], kstride: i32| -> (Vec<u16>, Vec<f32>) {
-        let f = compile(&ctx, owl_kernels::sources::attention::PREFILL_SPLIT_F16, name);
+        let f = compile(&ctx, &owl_kernels::list::cu_text(owl_kernels::ops::source("owl_prefill_split_reduce_f16_hd256")), name);
         // >48K smem opt-in(与 server 侧 launch.rs / 既有 split 探针同款)
         f.set_attribute(
             cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
@@ -526,7 +526,7 @@ fn prefill_split_knhd_parity() {
     let (kc_c8, kc_n8) = fill_pools_u8(PoolKind::KClassic, |s, h, d| (((s * 29 + h * 13 + d) % 120) + 1) as u8);
     let (vc_c8, vc_n8) = fill_pools_u8(PoolKind::VClassic, |s, h, d| (((s * 31 + h * 17 + d) % 120) + 1) as u8);
     let run8 = |name: &str, kcp: &[u8], vcp: &[u8], kstride: i32| -> (Vec<u16>, Vec<f32>) {
-        let f = compile(&ctx, owl_kernels::sources::attention::PREFILL_SPLIT_F16, name);
+        let f = compile(&ctx, &owl_kernels::list::cu_text(owl_kernels::ops::source("owl_prefill_split_reduce_f16_hd256")), name);
         // >48K smem opt-in(与 server 侧 launch.rs / 既有 split 探针同款)
         f.set_attribute(
             cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,

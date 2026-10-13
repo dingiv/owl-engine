@@ -563,7 +563,7 @@ pub trait KernelSpec: 'static {
     /// 线格式入口名(与某个 `.cu` 入口一对一)
     const ENTRY: &'static str;
     /// `.cu` 源码(`include_str!`;与算子同目录)
-    const SOURCE: &'static str;
+    const SRC: &'static str;
     /// 参数表(**槽序唯一真源**)
     const PARAMS: &'static [Param];
     /// 形状族(P4 填充;缺省 = 未建)
@@ -592,7 +592,7 @@ pub trait KernelSpec: 'static {
 pub const fn meta_of<T: KernelSpec>() -> KernelMeta {
     KernelMeta {
         entry: T::ENTRY,
-        source: T::SOURCE,
+        src: T::SRC,
         params: T::PARAMS,
         shape: T::SHAPE,
         pool: T::POOL,
@@ -607,7 +607,7 @@ pub const fn meta_of<T: KernelSpec>() -> KernelMeta {
 /// 擦除后的算子元数据(纯数据;可在 `static` 表里 const 构造)
 pub struct KernelMeta {
     pub entry: &'static str,
-    pub source: &'static str,
+    pub src: &'static str,
     pub params: &'static [Param],
     pub shape: ShapeFamily,
     pub pool: &'static [PoolAccess],
@@ -800,7 +800,7 @@ mod tests {
     struct Demo;
     impl KernelSpec for Demo {
         const ENTRY: &'static str = "demo_op";
-        const SOURCE: &'static str = "// demo";
+        const SRC: &'static str = "// demo";
         const PARAMS: &'static [Param] = &[
             Param::t_in("q", Dtype::F16, 2),
             Param::t_out("out", Dtype::F16, 2),

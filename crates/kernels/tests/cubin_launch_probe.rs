@@ -7,9 +7,9 @@
 //!
 //! 判据三条(任一失败即机制不成立):
 //! 1. **载入**:`cuModuleLoadData` 吃 fatbin(多代际容器,非纯 cubin)不报错;
-//! 2. **符号**:`owl_add_f16` / `owl_rmsnorm_bf16` 等**同文件内全部变体**
-//!    一次编译全部可见(§15.3 审计①:dtype 变体随源码走,build.rs 只需
-//!    参数化 **arch**);
+//! 2. **符号**:每个入口在**自己 `SOURCE`** 的资产里可见,且**边界独占**
+//!    (§15.3 审计①:dtype 变体随源码走,build.rs 只需参数化 **arch**;
+//!    C 轮拆分后本判据升级为“文件边界 = 算子族边界”);
 //! 3. **数值**:`owl_add_f16` 与 host 参考**逐元素逐位一致**(f16 加法在
 //!    两端都是 IEEE half 运算,无容差余地),且与 NVRTC 源码通道**逐位等价**
 //!    (迁移期"换载体不换数值"硬门)。
@@ -23,10 +23,10 @@ use cudarc::driver::{CudaContext, CudaFunction, DevicePtr, LaunchConfig, PushKer
 use half::f16;
 
 /// 构建期资产 —— 经**源哈希**查表(与生产路径同一入口,非测试专用通道)
-fn ops_pair_asset() -> &'static owl_kernels::family::cubins::CubinAsset {
-    let src = owl_kernels::spec::meta_of::<owl_kernels::ops::elems::AddF16>().source;
-    owl_kernels::family::cubins::asset_of_source(src)
-        .expect("ops_pair.cu 应有构建期 fatbin 资产(build.rs 未编?)")
+fn add_asset() -> &'static owl_kernels::family::cubins::CubinAsset {
+    let src = owl_kernels::spec::meta_of::<owl_kernels::ops::elems::AddF16>().src;
+    owl_kernels::family::cubins::asset(src)
+        .expect("cu/owl/add.cu 应有构建期 fatbin 资产(build.rs 未编?)")
 }
 
 const N: usize = 1024;
@@ -94,41 +94,69 @@ fn inputs() -> (Vec<f16>, Vec<f16>) {
     (a, b)
 }
 
-/// fatbin 载入 + 多 dtype 变体可见性(判据 1+2)
+/// fatbin 载入 + **文件边界 = 算子族边界**(判据 1+2;**C 轮改造**)
+///
+/// C 轮把 `ops_pair.cu` 按**算子族**拆开后,旧判据“一个文件里全变体一次全出”
+/// 反了过来:**每个文件只应装本族的入口**。本门因此改成两条 ——
+/// 1. 每个已建表入口,在它自己 `SOURCE` 的资产里**必须**可见;
+/// 2. 同一入口在**别的**资产的模块里**必须不可见**(边界证明:拆干净了 ——
+///    既没把邻族的核顺手带过去,也没出现“同一核两处各留一份”)。
+///
+/// 两组判据的清单由 [`owl_kernels::ops::all`] 按源分组**自动生成** ——
+/// 加表/加文件即自动纳入,零第二份清单。
 #[test]
 fn fatbin_loads_and_exposes_all_variants() {
     let Some(ord) = dev_ordinal() else {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
     };
+    use std::collections::BTreeMap;
     let ctx = CudaContext::new(ord).expect("context");
-    let asset = ops_pair_asset();
-    let module = ctx
-        .load_module(cudarc::nvrtc::Ptx::from_binary(asset.bytes.to_vec()))
-        .expect("fatbin 载入(判据 1:多代际 fatbin 应等同 cuModuleLoadData)");
-    // 判据 2:`ops_pair.cu` 一个文件里全部实例一次编译全出
-    for sym in [
-        "owl_add_f32",
-        "owl_add_f16",
-        "owl_add_bf16",
-        "owl_mul_f16",
-        "owl_silu_f16",
-        "owl_sigmoid_f32",
-        "owl_rmsnorm_f32",
-        "owl_rmsnorm_f16",
-        "owl_rmsnorm_bf16",
-        "owl_matmul_f32",
-        "owl_matmul_nt_f32",
-    ] {
-        module
-            .load_function(sym)
-            .unwrap_or_else(|e| panic!("变体 {sym} 不在 fatbin 里: {e:?}"));
+
+    // 源文本 → 该源的全部已建表入口(每源一个模块)
+    let mut by_src: BTreeMap<&'static str, Vec<&'static str>> = BTreeMap::new();
+    for m in owl_kernels::ops::all() {
+        if m.src.is_empty() {
+            continue; // foreign(FFI):无 .cu 源,另由 face 常量对拍
+        }
+        by_src.entry(m.src).or_default().push(m.entry);
+    }
+    let all_names: Vec<&'static str> = by_src.values().flatten().copied().collect();
+
+    let mut mods = Vec::new();
+    for (src, names) in &by_src {
+        let asset = owl_kernels::family::cubins::asset(src)
+            .unwrap_or_else(|| panic!("源无 AOT 资产(build.rs 未编?):首入口 {}", names[0]));
+        let module = ctx
+            .load_module(cudarc::nvrtc::Ptx::from_binary(asset.bytes.to_vec()))
+            .unwrap_or_else(|e| panic!("fatbin 载入失败({}):{e:?}", asset.module));
+        mods.push((asset.module, module, names));
+    }
+
+    // 判据 1:本族符号可见
+    for (asset, module, names) in &mods {
+        for n in names.iter() {
+            module
+                .load_function(n)
+                .unwrap_or_else(|e| panic!("{n} 不在自己的资产 {asset} 里: {e:?}"));
+        }
+    }
+    // 判据 2:跨文件边界 —— 邻族入口不可见
+    for (asset, module, names) in &mods {
+        for n in &all_names {
+            if names.contains(n) {
+                continue;
+            }
+            assert!(
+                module.load_function(n).is_err(),
+                "{asset} 里竟然有邻族入口 {n} —— 拆分没拆干净(同一核两处各留一份?)"
+            );
+        }
     }
     eprintln!(
-        "C1 判据 1+2 绿:资产 {} ({} B, archs {:?}) 载入成功,11 个变体符号全部可见",
-        asset.asset,
-        asset.bytes.len(),
-        owl_kernels::family::cubins::CUBIN_ARCHS
+        "C1 判据 1+2 绿:{} 个资产载入成功,{} 个入口各归其位(跨文件边界逐一无泄漏)",
+        mods.len(),
+        all_names.len()
     );
 }
 
@@ -140,7 +168,7 @@ fn fatbin_launch_matches_host_reference() {
         return;
     };
     let ctx = CudaContext::new(ord).expect("context");
-    let asset = ops_pair_asset();
+    let asset = add_asset();
     let module = ctx
         .load_module(cudarc::nvrtc::Ptx::from_binary(asset.bytes.to_vec()))
         .expect("fatbin 载入");
@@ -175,10 +203,11 @@ fn nvrtc_and_fatbin_agree_bitwise() {
         return;
     };
     let ctx = CudaContext::new(ord).expect("context");
-    // 源 = 算子自托管的那一份(R5:就地 include_str;经元数据取,不另开入口)
-    let src = owl_kernels::spec::meta_of::<owl_kernels::ops::elems::AddF16>().source;
+    // NVRTC 对照臂:源文本按资产 id 从磁盘取(仅测试面;生产路径零源文本)
+    let src_id = owl_kernels::spec::meta_of::<owl_kernels::ops::elems::AddF16>().src;
+    let src = owl_kernels::list::cu_text(src_id);
     let ptx = cudarc::nvrtc::compile_ptx_with_opts(
-        src,
+        &src,
         cudarc::nvrtc::CompileOptions {
             include_paths: vec!["/usr/local/cuda/include".into()],
             ..Default::default()
@@ -188,7 +217,7 @@ fn nvrtc_and_fatbin_agree_bitwise() {
     let m_nvrtc = ctx.load_module(ptx).expect("nvrtc module");
     let f_nvrtc = m_nvrtc.load_function("owl_add_f16").expect("nvrtc fn");
     let m_fat = ctx
-        .load_module(cudarc::nvrtc::Ptx::from_binary(ops_pair_asset().bytes.to_vec()))
+        .load_module(cudarc::nvrtc::Ptx::from_binary(add_asset().bytes.to_vec()))
         .expect("fatbin module");
     let f_fat = m_fat.load_function("owl_add_f16").expect("fatbin fn");
 
@@ -220,7 +249,7 @@ use cudarc::driver::CudaModule;
 use std::sync::Arc;
 
 /// 双载体模块:nvrtc(源)与 fatbin(资产)
-fn dual_modules(ctx: &Arc<CudaContext>, source: &str) -> (Arc<CudaModule>, Arc<CudaModule>) {
+fn dual_modules(ctx: &Arc<CudaContext>, src_id: &str, source: &str) -> (Arc<CudaModule>, Arc<CudaModule>) {
     let ptx = cudarc::nvrtc::compile_ptx_with_opts(
         source,
         cudarc::nvrtc::CompileOptions {
@@ -231,7 +260,7 @@ fn dual_modules(ctx: &Arc<CudaContext>, source: &str) -> (Arc<CudaModule>, Arc<C
     )
     .expect("nvrtc");
     let a = ctx.load_module(ptx).expect("nvrtc module");
-    let asset = owl_kernels::family::cubins::asset_of_source(source).expect("源应有 AOT 资产");
+    let asset = owl_kernels::family::cubins::asset(src_id).expect("源应有 AOT 资产");
     let b = ctx
         .load_module(cudarc::nvrtc::Ptx::from_binary(asset.bytes.to_vec()))
         .expect("fatbin module");
@@ -266,8 +295,9 @@ fn aot_equiv_rmsnorm_f16() {
     };
     let ctx = CudaContext::new(ord).expect("ctx");
     let stream = ctx.default_stream();
-    let src = owl_kernels::spec::meta_of::<owl_kernels::ops::ln::RmsnormF16>().source;
-    let (mn, mf) = dual_modules(&ctx, src);
+    let src_id = owl_kernels::spec::meta_of::<owl_kernels::ops::ln::RmsnormF16>().src;
+    let src = owl_kernels::list::cu_text(src_id);
+    let (mn, mf) = dual_modules(&ctx, src_id, &src);
 
     const ROWS: usize = 8;
     const N: usize = 1024;
@@ -318,8 +348,9 @@ fn aot_equiv_argmax_ties() {
     };
     let ctx = CudaContext::new(ord).expect("ctx");
     let stream = ctx.default_stream();
-    let src = owl_kernels::spec::meta_of::<owl_kernels::ops::elems::ArgmaxF32IdxF16>().source;
-    let (mn, mf) = dual_modules(&ctx, src);
+    let src_id = owl_kernels::spec::meta_of::<owl_kernels::ops::elems::ArgmaxF32IdxF16>().src;
+    let src = owl_kernels::list::cu_text(src_id);
+    let (mn, mf) = dual_modules(&ctx, src_id, &src);
 
     // 精心构造平局:多个相同最大值(取**最小索引**) + 全负 + 首位最大
     let mut x = lcg_f16(4096, 5);
@@ -363,8 +394,9 @@ fn aot_equiv_paged_attention_v2_chain() {
     };
     let ctx = CudaContext::new(ord).expect("ctx");
     let stream = ctx.default_stream();
-    let src = owl_kernels::spec::meta_of::<owl_kernels::ops::attn::PagedV2F16Hd256Bs32>().source;
-    let (mn, mf) = dual_modules(&ctx, src);
+    let src_id = owl_kernels::spec::meta_of::<owl_kernels::ops::attn::PagedV2F16Hd256Bs32>().src;
+    let src = owl_kernels::list::cu_text(src_id);
+    let (mn, mf) = dual_modules(&ctx, src_id, &src);
 
     const HD: usize = 256;
     const PAGE: usize = 32;

@@ -142,16 +142,25 @@ impl KernelFamily for GdnChunkedRuntime {
             let f = exec.load_cubin(res, ASSET, bytes, symbol, OP)?;
             me.fns.insert(name, f);
         }
-        for sym in [
-            "owl_cast_f16_bf16",
-            "owl_cast_bf16_f16",
-            "owl_cast_f16_f32",
-            "owl_state_kv_to_vk",
-            "owl_state_vk_to_kv",
+        // 构建期资产(源哈希查表;`cu/owl/cast.cu` + `cu/owl/state_transpose.cu`
+        // 都已在 include_str! 闭包内)。源按入口名取自算子自托管面(R5);
+        // C 轮拆分后 cast 与状态转置**各自成文件** ⇒ 两个源各装一撮符号。
+        for (src, syms) in [
+            (
+                crate::ops::source("owl_cast_f16_bf16"),
+                &["owl_cast_f16_bf16", "owl_cast_bf16_f16", "owl_cast_f16_f32"][..],
+            ),
+            (
+                // 家族私有核:不走算子准入面(故没有 `ops::source` 出口),
+                // 常量就地取自登记表 §0
+                crate::list::cu::owl::STATE_TRANSPOSE,
+                &["owl_state_kv_to_vk", "owl_state_vk_to_kv"][..],
+            ),
         ] {
-            // 构建期资产(源哈希查表;`owl__cast` 已在 include_str! 闭包内)
-            let f = exec.load_aot(res, crate::sources::attention::CAST, sym, OP)?;
-            me.fns.insert(sym, f);
+            for sym in syms {
+                let f = exec.load_aot(res, src, sym, OP)?;
+                me.fns.insert(sym, f);
+            }
         }
         for (name, sz) in [
             ("wu", LC::WU_SHARED),

@@ -71,13 +71,13 @@ fn gdn_decode_step_batch2_equals_serial() {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
     }
-    // nvrtc 懒编译(源 = sources.rs GDN_F32 同文件;自足,仅 <cuda_fp16.h>)
+    // nvrtc 懒编译(源 = cu/owl/gdn.cu;自足,仅 <cuda_fp16.h>)
     let ctx = CudaContext::new(1).expect("ctx");
     ctx.bind_to_thread().expect("bind");
     let stream = ctx.default_stream();
     // nvrtc 懒编译(源 = text/gdn.cu;自足,仅 <cuda_fp16.h> 系统头)
     let ptx = cudarc::nvrtc::compile_ptx_with_opts(
-        owl_kernels::sources::text::GDN_F32,
+        &owl_kernels::list::cu_text(owl_kernels::ops::source("owl_gdn_recurrence_varlen_gqa_f16")),
         cudarc::nvrtc::CompileOptions {
             arch: Some("compute_86"),
             include_paths: vec!["/usr/local/cuda/include".into()],

@@ -17,7 +17,7 @@ use std::process::Command;
 //
 // 编译哪些 `.cu` **不另立清单**:扫描 `src/**/*.rs` 里所有
 // `include_str!("…/*.cu")`,解析成真实路径去重 —— 命中的正是
-// `KernelSpec::SOURCE`(就地 include_str,R5)+ `sources.rs` 的那一份集合。
+// `KernelSpec::SOURCE`(就地 include_str,R5)+ `list.rs` §0(未建表“仅引入”算子)。
 // 新增算子 = 加表(自带 include_str)⇒ 构建期自动纳入,物理上不可能
 // "加了表但忘了编"("两处对不上"的 E3/E15 根因在构建面也堵死)。
 // 家族自管源(marlin 设备码 / xqa / flashinfer)不在此闭包内,天然排除。
@@ -74,40 +74,83 @@ fn rs_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
 fn scan_cu_sources(root: &std::path::Path) -> Vec<PathBuf> {
     let mut rs = Vec::new();
     rs_files(&root.join("src"), &mut rs);
-    // src/**/*.rs 任一改动都可能新增/删除 include_str ⇒ 构建期重扫
     println!("cargo:rerun-if-changed=src");
     for f in &rs {
         println!("cargo:rerun-if-changed={}", f.display());
     }
+    // E 轮(2026-10-13):源文本不再进二进制 ⇒ 发现规则从"扫 include_str! 闭包"
+    // 改成"扫**资产 id 字面量**"(`const SRC: &'static str = "cu/…/x.cu";`,
+    // `KernelSpec::SRC` 与 `list.rs` §0 常量两处同形)。规则仍是**零第二份清单**:
+    // 加表即自动纳入;路径不存在 = 构建期直接失败(fail-closed)。
     let mut found: Vec<PathBuf> = Vec::new();
+    let mut ids: Vec<(String, PathBuf)> = Vec::new();
     for f in &rs {
         let Ok(text) = std::fs::read_to_string(f) else { continue };
-        let base = f.parent().expect("parent");
-        let mut rest = text.as_str();
-        while let Some(pos) = rest.find("include_str!(") {
-            rest = &rest[pos + "include_str!(".len()..];
-            let trimmed = rest.trim_start();
-            if trimmed.starts_with('r') {
-                panic!("include_str! 用了原始字符串({}):旧解析器只认裸字面量,请改写或扩解析器", f.display());
-            }
-            let Some(hit) = trimmed.strip_prefix('"') else { continue };
-            let Some(end) = hit.find('"') else {
-                panic!("include_str! 字面量未闭合: {}", f.display());
-            };
-            let rel = &hit[..end];
-            if !rel.ends_with(".cu") {
-                continue;
-            }
-            let abs = base.join(rel);
-            let canon = std::fs::canonicalize(&abs)
-                .unwrap_or_else(|e| panic!("include_str!({rel}) 解析失败({}): {e}", f.display()));
-            if !found.contains(&canon) {
-                found.push(canon);
-            }
+        for line in text.lines() {
+            if !line.contains("const ") { continue; }
+            let Some(pos) = line.find("\"cu/") else { continue };
+            let Some(end) = line[pos + 1..].find('"') else { continue };
+            let id = &line[pos + 1..pos + 1 + end];
+            if !id.ends_with(".cu") { continue; }
+            let abs = root.join(id);
+            let canon = std::fs::canonicalize(&abs).unwrap_or_else(|e| {
+                panic!("资产 id {id:?}(来自 {})解析失败: {e} —— 路径写错或文件已挪", f.display())
+            });
+            if !found.contains(&canon) { found.push(canon.clone()); }
+            if !ids.iter().any(|(i, _)| i == id) { ids.push((id.to_string(), canon)); }
         }
     }
+    // .cu 自身也要进 rerun 集合(内容变了要重编)
+    for c in &found { println!("cargo:rerun-if-changed={}", c.display()); }
     found.sort();
     found
+}
+
+/// `.cu` 源里"有定义"的核符号集合(字面核 + 单层宏实例化;判据与运行期
+/// 旧 `source_defines` 同源,现改为**构建期一次算好写进清单**)。
+fn symbols_of(text: &str) -> Vec<String> {
+    let clean: String = text
+        .lines()
+        .map(|l| l.split("//").next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace("\\\n", " ");
+    let mut out: Vec<String> = Vec::new();
+    // 1) 字面核:`__global__ void NAME(`
+    let mut rest = clean.as_str();
+    while let Some(p) = rest.find("__global__ void ") {
+        rest = &rest[p + "__global__ void ".len()..];
+        let name: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+        if !name.is_empty() && rest[name.len()..].trim_start().starts_with('(') {
+            out.push(name);
+        }
+    }
+    // 2) 宏实例化:先找"体里有 void"的命名宏,再取其调用行的首参
+    let mut macros: Vec<String> = Vec::new();
+    for line in clean.lines() {
+        let t = line.trim_start();
+        let Some(body) = t.strip_prefix("#define ") else { continue };
+        let Some((mac, _)) = body.split_once('(') else { continue };
+        let mac = mac.trim();
+        if mac.is_empty() || !mac.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') { continue; }
+        if body.contains("void ") { macros.push(mac.to_string()); }
+    }
+    for line in clean.lines() {
+        let t = line.trim_start();
+        let Some((head, rest)) = t.split_once('(') else { continue };
+        if !macros.iter().any(|m| m == head) { continue; }
+        let first = rest.split(',').next().unwrap_or("").trim();
+        // 全大写 = 宏形参(NAME/PARAMS/…),不是核名 —— 真核名一律含小写
+        if !first.is_empty()
+            && first.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && first.chars().any(|c| c.is_ascii_lowercase())
+        {
+            out.push(first.to_string());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// **增量闸**:fatbin 与 `.stamp` 都在且指纹一致 ⇒ 跳过 nvcc。
@@ -191,9 +234,10 @@ fn build_native_cubins(
     let bin_dir = out_dir.join("cubins");
     std::fs::create_dir_all(&bin_dir).expect("mkdir cubins");
 
-    // (asset, 源哈希, 源长度, 源路径, fatbin 路径)
-    let mut rows: Vec<(String, u64, usize, PathBuf, PathBuf)> = Vec::new();
+    // (module 名, 源哈希, 源长度, 源路径, fatbin 路径, 符号清单)
+    let mut rows: Vec<(String, u64, usize, PathBuf, PathBuf, Vec<String>)> = Vec::new();
     let mut rebuilt = 0usize;
+    let mut src_ids: Vec<String> = Vec::new();
     for src in &sources {
         println!("cargo:rerun-if-changed={}", src.display());
         let rel = src.strip_prefix(&cu_root).unwrap_or(src);
@@ -212,7 +256,9 @@ fn build_native_cubins(
             rebuilt += 1;
         }
         let text = std::fs::read_to_string(src).expect("read .cu");
-        rows.push((asset, hash_source(&text), text.len(), src.clone(), dst));
+        rows.push((asset, hash_source(&text), text.len(), src.clone(), dst, symbols_of(&text)));
+        // 资产 id = cu/ 相对路径(与 KernelSpec::SRC 同形)
+        src_ids.push(format!("cu/{}", rel.to_string_lossy().replace('\\', "/")));
     }
 
     // ---- 生成资产登记表(源哈希 → 资产;运行期零路径知识)----
@@ -227,16 +273,26 @@ fn build_native_cubins(
     out.push_str("pub const CUBIN_ARCHS: &[&str] = &[");
     out.push_str(&archs.iter().map(|a| format!("\"{a}\"")).collect::<Vec<_>>().join(", "));
     out.push_str("];\n\n");
-    out.push_str("/// 一个 `.cu` 文件产出的 fatbin 资产\npub struct CubinAsset {\n    /// 资产名(`cu/` 相对路径,`/` → `__`;= 模块缓存键)\n    pub asset: &'static str,\n    /// 该资产的源文本(`include_str!` —— 反查/自洽锁/诊断用)\n    pub src: &'static str,\n    /// 源文本 FNV-1a 64(与 `hash_source` 一致;查表键)\n    pub src_hash: u64,\n    /// 源文本字节数(哈希碰撞时的第二道判据 —— 双标识才敢直接装配)\n    pub src_len: usize,\n    /// fatbin 字节(`include_bytes!`;多代际容器)\n    pub bytes: &'static [u8],\n}\n\n");
+    out.push_str("/// 一个 `.cu` 文件产出的 fatbin 资产(E 轮:不再携带源文本 —— 运行期只要身份 + 字节)\npub struct CubinAsset {\n    /// **资产 id** = `cu/` 相对路径(与 `KernelSpec::SRC` 同形;查表键)\n    pub id: &'static str,\n    /// 模块缓存键/诊断名(`cu/` 相对路径,`/` → `__`)\n    pub module: &'static str,\n    /// 源内容 FNV-1a 64(**构建期指纹**;自洽门回算比对用)\n    pub src_hash: u64,\n    /// fatbin 字节(`include_bytes!`;多代际容器)\n    pub bytes: &'static [u8],\n}\n\n");
     out.push_str("pub const CUBIN_ASSETS: &[CubinAsset] = &[\n");
-    for (asset, hash, len, src, bin) in &rows {
+    let mut syms = String::from("// @generated by crates/kernels/build.rs —— **勿手改**。\n//\n// 资产符号清单(构建期从 .cu 解析;非 device 门 —— boot 期池清单门要用)。\npub const ASSET_SYMBOLS: &[(&str, &[&str])] = &[\n");
+    for ((asset, hash, _len, _src, bin, _symbols), src_id) in rows.iter().zip(src_ids.iter()) {
         out.push_str(&format!(
-            "    CubinAsset {{ asset: \"{asset}\", src: include_str!(\"{src}\"), src_hash: 0x{hash:016x}, src_len: {len}, bytes: include_bytes!(\"{bin}\") }},\n",
-            src = src.display(),
+            "    CubinAsset {{ id: \"{id}\", module: \"{asset}\", src_hash: 0x{hash:016x}, bytes: include_bytes!(\"{bin}\") }},\n",
+            id = src_id,
             bin = bin.display()
         ));
     }
     out.push_str("];\n\n");
+    for (_, _, _, _, _, symbols) in &rows {
+        let list = symbols.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(", ");
+        syms.push_str(&format!("    (\"@@ID@@\", &[{list}]),\n"));
+    }
+    syms.push_str("];\n");
+    for ((_, _, _, _, _, _), id) in rows.iter().zip(src_ids.iter()) {
+        syms = syms.replacen("\"@@ID@@\"", &format!("\"{id}\""), 1);
+    }
+
     out.push_str(&xqa_table_src(xqa_rows));
     out.push_str(&gdn_table_src(gdn_rows));
     // ---- 资产指纹(见下方注释:这是**强制 crate 重编**的唯一可靠手段)----
@@ -247,7 +303,7 @@ fn build_native_cubins(
             fp = fp.wrapping_mul(0x0000_0100_0000_01b3);
         }
     };
-    for (_, _, _, _, bin) in &rows {
+    for (_, _, _, _, bin, _) in &rows {
         if let Ok(b) = std::fs::read(bin) {
             mix(&b);
         }
@@ -259,6 +315,7 @@ fn build_native_cubins(
     }
     println!("cargo:rustc-env=OWL_ASSET_FP={fp:016x}");
     std::fs::write(&manifest_path, out).expect("write cubin_assets.rs");
+    std::fs::write(out_dir.join("cubin_symbols.rs"), syms).expect("write cubin_symbols.rs");
     println!(
         "cargo:warning=owl-kernels: 构建期 cubin {} 个源文件 ({}) —— {} 个源可零 NVRTC 发射{}",
         rows.len(),
@@ -423,7 +480,7 @@ fn build_gdn_assets(out_dir: &std::path::Path) -> Vec<(&'static str, PathBuf)> {
 }
 
 /// `OWL_CUBIN_SKIP` 档的空登记表(纯 NVRTC 基线对照;同一文件形态免分支)
-const EMPTY_ASSETS_RS: &str = "// @generated (OWL_CUBIN_SKIP)\npub const CUBIN_ARCHS: &[&str] = &[];\n\npub struct CubinAsset {\n    pub asset: &'static str,\n    pub src: &'static str,\n    pub src_hash: u64,\n    pub src_len: usize,\n    pub bytes: &'static [u8],\n}\n\npub const CUBIN_ASSETS: &[CubinAsset] = &[];\n\npub const XQA_ASSETS: &[(&str, &[u8])] = &[];\n\npub fn xqa_asset(_name: &str) -> Option<&'static [u8]> {\n    None\n}\n\npub const GDN_ASSETS: &[(&str, &[u8])] = &[];\n\npub fn gdn_asset(_name: &str) -> Option<&'static [u8]> {\n    None\n}\n";
+const EMPTY_ASSETS_RS: &str = "// @generated (OWL_CUBIN_SKIP)\npub const CUBIN_ARCHS: &[&str] = &[];\n\npub struct CubinAsset {\n    pub id: &'static str,\n    pub module: &'static str,\n    pub src_hash: u64,\n    pub bytes: &'static [u8],\n}\n\npub const CUBIN_ASSETS: &[CubinAsset] = &[];\n\npub const XQA_ASSETS: &[(&str, &[u8])] = &[];\n\npub fn xqa_asset(_name: &str) -> Option<&'static [u8]> {\n    None\n}\n\npub const GDN_ASSETS: &[(&str, &[u8])] = &[];\n\npub fn gdn_asset(_name: &str) -> Option<&'static [u8]> {\n    None\n}\n";
 
 /// 生成 GDN chunked 资产表(opt-in 自编;空表 = 用入库采集件)
 fn gdn_table_src(rows: &[(&'static str, PathBuf)]) -> String {

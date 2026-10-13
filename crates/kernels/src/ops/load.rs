@@ -8,7 +8,7 @@ pub struct CtRepackU32;
 
 impl KernelSpec for CtRepackU32 {
     const ENTRY: &'static str = "owl_ct_repack_u32";
-    const SOURCE: &'static str = include_str!("../../cu/marlin/marlin_repack_ct.cu");
+    const SRC: &'static str = "cu/marlin/marlin_repack_ct.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("in", Dtype::U32, 2),
         Param::sz("rows"),

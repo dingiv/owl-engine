@@ -562,7 +562,7 @@ pub fn lower_kernel(
         (kernel.launch.grid, kernel.launch.block, kernel.launch.shared_mem)
     };
     LaunchMsg {
-        kernel: KernelSource { name: kernel.name.to_string(), source: kernel.source.to_string() },
+        kernel: KernelSource { name: kernel.name.to_string(), source: kernel.src.to_string() },
         args,
         grid,
         block,

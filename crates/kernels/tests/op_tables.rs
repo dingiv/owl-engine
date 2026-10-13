@@ -20,15 +20,18 @@ use owl_kernels::spec::{meta_of, KernelSpec};
 fn op_tables_match_cu_signatures() {
     let mut checked = 0usize;
     for m in ops::all() {
-        if m.source.is_empty() {
+        if m.src.is_empty() {
             continue; // foreign(FFI):无 .cu 源,另由 face 常量对拍(见单测)
         }
+        // E 轮(2026-10-13):`SRC` 已从"源文本"改为**资产 id** —— 文本按需
+        // 从磁盘取(仅测试面;运行期不再需要任何 `.cu` 文本)。
+        let text = owl_kernels::list::cu_text(m.src);
         assert!(
-            m.source.contains("extern \"C\" __global__"),
-            "{}: SOURCE 不是核源码(拿错文件?)",
-            m.entry
+            text.contains("extern \"C\" __global__"),
+            "{}: 资产 {} 不是核源码(拿错文件?)",
+            m.entry, m.src
         );
-        let actual = owl_kernels::list::parse_cu_sig(m.source, m.entry)
+        let actual = owl_kernels::list::parse_cu_sig(&text, m.entry)
             .unwrap_or_else(|| panic!("{}: 源码里找不到同名入口", m.entry));
         // 线槽序里 `O`(输出角色)在 `.cu` 里就是一个指针位 ⇒ 归一 T 后比对
         let normalized = m.args_str().replace('O', "T");
@@ -89,7 +92,7 @@ fn op_table_entries_are_unique() {
 fn foreign_tables_declare_slots_without_source() {
     let mut n = 0usize;
     for m in ops::all() {
-        if !m.source.is_empty() {
+        if !m.src.is_empty() {
             continue;
         }
         assert!(!m.params.is_empty(), "{}: foreign 表无参数声明", m.entry);
@@ -121,7 +124,7 @@ fn meta_of_matches_direct_trait_const() {
     struct Probe;
     impl KernelSpec for Probe {
         const ENTRY: &'static str = "probe_op";
-        const SOURCE: &'static str = "";
+        const SRC: &'static str = "";
         const PARAMS: &'static [owl_kernels::spec::Param] = &[
             owl_kernels::spec::Param::t_in("x", owl_kernels::contract::Dtype::F16, 1),
             owl_kernels::spec::Param::sz("n"),

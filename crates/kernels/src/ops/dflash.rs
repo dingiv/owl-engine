@@ -9,7 +9,7 @@ pub struct DflashConvBf16;
 
 impl KernelSpec for DflashConvBf16 {
     const ENTRY: &'static str = "owl_dflash_conv_bf16";
-    const SOURCE: &'static str = include_str!("../../cu/owl/dflash2.cu");
+    const SRC: &'static str = "cu/owl/dflash_conv.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::BF16, 2),
         Param::t_in("delta", Dtype::BF16, 2),
@@ -32,7 +32,7 @@ pub struct DflashSelectBf16;
 
 impl KernelSpec for DflashSelectBf16 {
     const ENTRY: &'static str = "owl_dflash_select_bf16";
-    const SOURCE: &'static str = include_str!("../../cu/owl/dflash2.cu");
+    const SRC: &'static str = "cu/owl/dflash_select.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("cand", Dtype::F32, 2),
         Param::t_in("unary", Dtype::F32, 2),
@@ -53,5 +53,65 @@ impl KernelSpec for DflashSelectBf16 {
 pub static DFLASH_CONV_BF16: KernelMeta = meta_of::<DflashConvBf16>();
 pub static DFLASH_SELECT_BF16: KernelMeta = meta_of::<DflashSelectBf16>();
 
+
+// ============================================================================
+// `dflash.rs` 域 R1 补表
+// (R1 补表 2026-10-13:声明从登记表派生,签名由 `op_tables` 门逐参互证)
+// ============================================================================
+
+
+/// `owl_dflash_conv_f16` —— dflash_conv.cu(R1 补表)
+pub struct DflashConvF16;
+
+impl KernelSpec for DflashConvF16 {
+    const ENTRY: &'static str = "owl_dflash_conv_f16";
+    const SRC: &'static str = "cu/owl/dflash_conv.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("x", Dtype::F16, 2),
+        Param::t_in("delta", Dtype::F16, 2),
+        Param::t_in("base", Dtype::F16, 2),
+        Param::i32("side"),
+        Param::i32("block_size"),
+        Param::i32("hidden"),
+        Param::i32("groups"),
+        Param::i32("rows"),
+        Param::t_out("out", Dtype::F16, 2),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+
+/// `owl_dflash_select_f16` —— dflash_select.cu(R1 补表)
+pub struct DflashSelectF16;
+
+impl KernelSpec for DflashSelectF16 {
+    const ENTRY: &'static str = "owl_dflash_select_f16";
+    const SRC: &'static str = "cu/owl/dflash_select.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("cand", Dtype::F32, 2),
+        Param::t_in("unary", Dtype::F32, 2),
+        Param::t_in("proj", Dtype::F16, 2),
+        Param::t_in("anchor", Dtype::F32, 2),
+        Param::t_in("a_tab", Dtype::F16, 2),
+        Param::t_in("b_tab", Dtype::F16, 2),
+        Param::i32("slots"),
+        Param::i32("k_top"),
+        Param::i32("rank"),
+        Param::t_out("out", Dtype::F32, 2),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
 /// 本域全部已建表算子
-pub static METAS: &[&KernelMeta] = &[&DFLASH_CONV_BF16, &DFLASH_SELECT_BF16];
+
+pub static OWL_DFLASH_CONV_F16: KernelMeta = meta_of::<DflashConvF16>();
+pub static OWL_DFLASH_SELECT_F16: KernelMeta = meta_of::<DflashSelectF16>();
+
+pub static METAS: &[&KernelMeta] = &[&DFLASH_CONV_BF16, &DFLASH_SELECT_BF16,
+    &OWL_DFLASH_CONV_F16,
+    &OWL_DFLASH_SELECT_F16,
+];

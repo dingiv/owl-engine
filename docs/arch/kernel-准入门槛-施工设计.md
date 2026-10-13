@@ -876,8 +876,11 @@ impl KernelPick {
 - **规则**:每个算子的 `SOURCE` **就地** `include_str!("../../cu/<域>/<file>.cu")` —— 与它的算子表同文件、同目录;
 - **理由**:`sources.rs` 是"名字 → 源"的第二张表(设计 §2.2 立意 = 元数据/源码物理上只有一个住址);实测 `cu/owl/fused.cu` 被 **5 个常量**指向 ⇒ 一文件多算子 + 集中表 = 又一次"两处对不上"的温床;
 - **进度(2026-10-13)**:`ops/` 下 **64 张表 + 3 个 oracle 已就地化**(`grep sources::` 在 `ops/` 内为空);
-- **剩余 17 个消费者**:`list.rs`(110 条 Entry,R1 建表完成后随 REGISTRY 一起退役)、`server/gdn_{chunked,scalar}.rs`(随 R4 一起改)、**13 个探针 + marlin_parity**(改为从 `ops::meta(name).source` 取源 —— 消灭第二份);
-- **待裁**:`fused.cu`/`ops_pair.cu`/`gdn.cu`/`dflash2.cu` 等**一文件多算子**是否拆成"一算子一 `.cu`"(贴设计 §2.1"算子与 .cu 对望"律;成本 = 拆文件 + 重编验证)。
+- **✅ 2026-10-13 C 轮结案**:见 §15.12 —— 17 个消费者已清零,**`sources.rs` 模块已删除**
+  (常量就地并入 `list.rs` §0),**`.cu` 已按「一算子族一文件」拆开**。
+- **✅ 待裁项已决**:“一文件多算子是否拆”→ **按「算子族」拆、helper 随族走、不抽公共头**
+  (用户裁决;C 轮执行,7 个多算子文件 → 30 个族文件,`pagedattention_f16.cu` 的 vllm
+  模板机体**不拆**——拆它等于抽公共头,正好被同一裁决排除)。
 
 
 ### 15.3 "JIT 红利"的实测审计(2026-10-13;用户裁决"不要运行期编译"后必读)
@@ -1557,3 +1560,106 @@ cargo build                           # build.rs 自动用该 venv
 - marlin / flashinfer 的 **host 侧搬 Rust**(§15.9.6 成本账)仍为独立工单;
 - 构建期 Python+triton 是**硬依赖**(本机由工作区 `vllm-test/.venv` 提供;
   `GDN_TRITON_PY` 可指向其它解释器)。
+
+---
+
+### 15.12 C 轮:算子目录重构 —— `sources.rs` 退役 + 一算子族一 `.cu`(2026-10-13)
+
+用户指令:「继续收尾算子目录重构」→ 依次完成 A → B → C。三棒一句话:**"名字 → 源"从两张表变一张,再让 .cu 文件与算子族对望。**
+
+#### 15.12.1 A:17 个消费者迁移到唯一取源口
+
+新增唯一读取口(解析序 = 算子自托管优先,登记表兜底):
+
+```rust
+// kernels/src/ops/mod.rs
+pub fn source(name: &str) -> &'static str {
+    match meta(name) { Some(m) => m.source, None => crate::list::registry_source(name) }
+}
+```
+
+| 消费者 | 处数 | 迁移 |
+|---|---|---|
+| `server/gdn_chunked.rs` | 1(5 符号) | `sources::attention::CAST` → `ops::source("owl_cast_f16_bf16")` |
+| `server/gdn_scalar.rs` | 1 | → `ops::source("owl_cast_f32_f16")` |
+| 13 个探针 + `backends/cuda/tests/marlin_parity.rs` | 22 | `sources::X` → `ops::source("<本探针实际编译的入口名>")` |
+
+**为什么用「入口名」而不是「文件常量名」**:探针编译的是具名入口,按名取源与它要做的事同构;
+且未建表入口走登记表兜底 —— 两条路返回**同一份文本**(已逐条核对 15 个映射的源文件一致)。
+
+#### 15.12.2 B:`sources.rs` 模块删除 + 两道新门
+
+- `sources.rs` 的 `include_str!` 常量**就地并入 `list.rs` §0**(`mod cu`,`pub(crate)` 可见 ——
+  家族私有核如 GDN 状态转置没有 `ops::source` 出口,需要它);
+- 解析序收口:`ops::source` 是**唯一实现**,`list::source` 退化为转发;登记表侧原名
+  `registry_source`(只给兜底分支用);
+- **新门 1** `registry_source_agrees_with_op_meta`:登记表与算子声明同名的源必须**逐字节一致**
+  (实测 55/110 一致,余 55 = 仅引入)—— 把"两处同时有"这份冗余**机器锁住**,不许漂移;
+- **新门 2** `source_resolves_every_registered_name`:110 条登记名逐个解析,必须等于登记表所记。
+
+**为什么保留一份冗余而不立刻消灭**:已建表算子的源已只有算子一个住址;登记表那份是
+**未建表条目的唯一住址**,两者字段暂时同形。待 R1 建表补齐(§15.13),`REGISTRY` 由
+`ops::all()` 派生 ⇒ 冗余与 `registry_source` 一起蒸发。
+
+#### 15.12.3 C:一算子族一 `.cu`(用户裁决:按族拆、helper 随族走、**不抽公共头**)
+
+**拆点定义**:一个 `.cu` 只装**一个算子族**的全部变体(dtype / 布局 / knhd / v1-v2 都算变体);
+族之间不共享任何宏或 helper(共享 = 同族)。拆出的文件与母文件**同目录**(目录级对望
+`cu/<域>/ ↔ ops/<域>.rs` 是纯 `git mv`,留作独立小步,不与本轮混)。
+
+| 母文件 | 行数/入口 | 拆成 | 械 |
+|---|---|---|---|
+| `cu/owl/ops_pair.cu` | 133 / 18 变体 | `add.cu` `mul.cu` `silu.cu` `sigmoid.cu` `matmul.cu` `rmsnorm.cu` | 6 |
+| `cu/owl/fused.cu` | 686 / 10 | `norm_rope.cu` `silu_and_mul.cu` `fused_add_rmsnorm.cu` `qknorm_insert.cu` | 4 |
+| `cu/owl/gdn.cu` | 1068 / 15 | `gdn_{conv_upd,gating,delta_dec,norm_act,l2norm,conv_fwd,recurrence,decode_step}.cu` | 8 |
+| `cu/owl/dflash2.cu` | 1226 / 15 | `dflash_conv.cu` `dflash_select.cu` `dflash_topk.cu` `naive_attn_nc.cu` | 4 |
+| `cu/owl/cast.cu` | 52 / 6 | `cast.cu` + `state_transpose.cu` | 2 |
+| `cu/owl/attention.cu` | 136 / 4 | `narrow_strided.cu` + `naive_decode_attn.cu` | 2 |
+| `cu/attention/pagedattention_f16.cu` | 2132 / 24 | **不拆**(v1/v2/reduce 同族;拆它 = 抽 1500 行 vllm 模板机) | 0 |
+
+**helper 随族走**:`gdn16_{to,from}_float` / `gdn16_warp_reduce_sum` 等在各 GDN 族文件里各一份;
+`OWL_GDN*_MAX_KD` / `WARP_PER_BLOCK` / `OWL_NC_DPL_MAX` / `DFLASH_TOPK_*` / `OWL_MAX_KV`
+等宏随使用它的族文件走。每文件**自足**(单 TU 编一个 fatbin,无跨文件符号解析问题)。
+
+**顺带清掉的两条历史包袱**:
+- `cu::attention::CAST` → 移入 `cu::owl::CAST`(owl 自研位,不是 attention port);
+- `cu::text::GDN_F32` / `ATTENTION_F32`(f16 臂寄居在 `text` 模块)—— 随拆分回到各自族常量。
+
+#### 15.12.4 机器门升级:**文件边界 = 算子族边界**
+
+`cubin_launch_probe` 的判据 2 原为「一个文件里全变体一次出」,拆开后**反过来**了,故升级:
+
+1. 每个已建表入口在**它自己 `SOURCE`** 的资产里**必须可见**;
+2. 同一入口在**别的**资产的模块里**必须不可见**(`load_function` 必须报 NOT_FOUND)
+   —— 这条同时证明"拆干净了"与"没有同一核两处各留一份"。
+
+清单由 `ops::all()` 按源分组**自动生成**(零第二份清单);加的族/文件自动纳入。
+
+#### 15.12.5 验收(全部实测)
+
+| 项 | 数字 |
+|---|---|
+| 构建期 cubin 源 | 20 → **40**(拆出 30 个族文件,删 7 个母文件 + `sources.rs`) |
+| `no_runtime_compile` | 2/2(零运行期编译仍是结构) |
+| `op_tables`(表 ⇔ `.cu` 签名逐参) | **7/7**(覆盖全部 55 张原生表 —— 拆分后签名零漂移) |
+| `selfcheck_oracles` / `cubin_launch_probe` | 8/8 · **6/6**(新边界门全绿) |
+| kernels lib / models / shared | 60/60 · 117/117 · 27/27 |
+| clippy / workspace check | **0 警** · 0 错 |
+| **GPU 验收套件**(3090 Ti,`OWL_TEST_DEVICE=1`)| **11 套件 / 18 用例全绿**:cubin_launch(6) dflash2_nc(2) k0_fp8(1) kv_knhd_read(2) kv_knhd_write(2) gdn_chunked_golden(1) gdn_scalar_golden(1) gdn_big_t_arms(1) attention_split(1) chunked_prefill_fp8(1) gdn_chunked_chain(1) |
+
+#### 15.12.6 踩坑留档(两条都实测复现过)
+
+1. **`CUDA_VISIBLE_DEVICES` 会改探针语义**:`dflash2_nc_probe` 硬编码
+   `CudaContext::new(1)`,而运行纪律是 **不设 CVD** 的原用法(`OWL_TEST_DEVICE=1`)。
+   我加的 `CUDA_VISIBLE_DEVICES=1,2` 一路上报 `CUDA_ERROR_OUT_OF_MEMORY`(在
+   `memcpy_htod` 的暂存面),换成原用法 **2/2 全绿** —— 假回归,别再踩。
+   (同款教训已有先例:CUDA FASTEST_FIRST 序 ≠ nvidia-smi 序。)
+2. **脚本化拆分必须校验路径拼接**:`ops/` 用 `../../cu/...`、`oracle` 用 `../../../cu/...`、
+   `list.rs` 用 `../cu/...` —— 一次性 sed 很容易拼出 `cu/cu/...`。本次踩了两次,
+   均被 `build.rs` 的 `include_str!` 解析门当场拦下(好门)。收尾统一
+   `grep -r "cu/cu/"` 复查。
+
+#### 15.12.7 剩余(未做)
+
+- 目录级对望(`cu/<域>/` ↔ `ops/<域>.rs`)的纯搬移 —— 与拆分解耦,可在 R1 后一次做;
+- `list.rs` / `REGISTRY` 整体退役 —— 依赖 R1(见 §15.13)。

@@ -13,7 +13,7 @@ pub struct CublasGemmF16;
 impl KernelSpec for CublasGemmF16 {
     const ENTRY: &'static str = crate::contract::names::GEMM_F16;
     /// foreign(FFI):无 `.cu` 源
-    const SOURCE: &'static str = "";
+    const SRC: &'static str = "";
     const PARAMS: &'static [Param] = &[
         Param::t_in("a", Dtype::F16, 2),
         Param::t_in("b", Dtype::F16, 2),
@@ -36,7 +36,7 @@ pub struct CublasGemmBf16;
 
 impl KernelSpec for CublasGemmBf16 {
     const ENTRY: &'static str = crate::contract::names::GEMM_BF16;
-    const SOURCE: &'static str = "";
+    const SRC: &'static str = "";
     const PARAMS: &'static [Param] = &[
         Param::t_in("a", Dtype::BF16, 2),
         Param::t_in("b", Dtype::BF16, 2),
