@@ -421,8 +421,6 @@ impl KernelSpec for GdnNormActF32 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-/// 本域全部已建表算子
-
 pub static OWL_GDN_CONV_UPD_F16: KernelMeta = meta_of::<GdnConvUpdF16>();
 pub static OWL_GDN_CONV_UPD_F32: KernelMeta = meta_of::<GdnConvUpdF32>();
 pub static OWL_GDN_DELTA_DEC_F16: KernelMeta = meta_of::<GdnDeltaDecF16>();
@@ -432,6 +430,7 @@ pub static OWL_GDN_GATING_G_F32: KernelMeta = meta_of::<GdnGatingGF32>();
 pub static OWL_GDN_L2NORM_F32: KernelMeta = meta_of::<GdnL2normF32>();
 pub static OWL_GDN_NORM_ACT_F32: KernelMeta = meta_of::<GdnNormActF32>();
 
+/// 本域全部已建表算子
 pub static METAS: &[&KernelMeta] = &[
     &GATING_G_F16,
     &L2NORM_F16,

@@ -937,6 +937,10 @@ impl KernelPick {
 
 #### 15.5.1 源清单 = `include_str!` 闭包(零第二份清单)
 
+> ⚠️ **已被 §15.14(E 轮)取代**:扫描目标从 `include_str!` 闭包改为
+> **资产 id 字面量**(`const SRC: &'static str = "cu/…/x.cu";`)+ 逐条
+> **路径存在性校验**;"零第二份清单"这一立意不变,本条按历史存档。
+
 `build.rs` 不另立"要编哪些 `.cu`"的清单 —— 它**扫描** `src/**/*.rs` 里所有
 `include_str!("…/*.cu")`,解析成真实路径去重。命中的正是
 
@@ -1663,3 +1667,167 @@ pub fn source(name: &str) -> &'static str {
 
 - 目录级对望(`cu/<域>/` ↔ `ops/<域>.rs`)的纯搬移 —— 与拆分解耦,可在 R1 后一次做;
 - `list.rs` / `REGISTRY` 整体退役 —— 依赖 R1(见 §15.13)。
+
+---
+
+### 15.13 D 轮:R1 归零 + 目录对望 + 配置漂移修复(2026-10-13)
+
+用户指令:「把用得到的放进来先实现就行」+「继续,都做」。
+
+#### 15.13.1 病灶回顾(R1 = 55 条"仅引入")
+
+| 后果 | 实测 |
+|---|---|
+| **白名单硬门放不进它们** | `--flavor awq27b testdata/server/bench-27b-std.toml` **整档起不来**:流式请求全被准入门拒,`out=0`、TTFT 假性 14ms(测速工具把空响应算成 39912 t/s 的伪影) |
+| **池写集穷举审计不覆盖** | E10(漏写者⇒槽区全零)/ E14(双寻址)两类"不崩但胡说"的 bug 无机器判据 |
+| **`REGISTRY` 退不了役** | 名字→源/槽序/dtype 的第二份手抄继续存在(§15.12.2 留的冗余) |
+
+#### 15.13.2 建表方法:**从登记表 + `.cu` 派生,不手抄**
+
+生成器两步(见 §15.13.6 的复现要点):
+1. 取登记表该条目的 `args` 串(它已被 `list::registry_sig_matches_cu_signatures` 门锁住 ⇒ 可信);
+2. 从目标 `.cu` 解析**参数名与 C 类型**(字面核 + 单层宏实例化两种形态),按 token 逐位映射成 `Param`:
+   `T→Param::t_in/t_out(名, dtype, 2)`、`sz→Param::sz`、`i32→Param::i32`、`f32→Param::f32`。
+
+⇒ 生成物**一次过 `op_tables` 门**(110 张表逐参互证),零人眼对账。
+
+#### 15.13.3 三批进度
+
+| 批 | 域 | 张数 |
+|---|---|---:|
+| 1 | `elems` 16 + `ln` 1 + `dflash` 2 | 19 |
+| 2 | `gdn` 8 + `fused` 2 | 10 |
+| 3 | `attn` 26(**KV 池重口径**) | 26 |
+| 3' | 家族臂 FFI 虚核:`flashinfer_prefill_paged_f16` + `gdn_scalar_delta_rule_fwd` | 2 |
+
+```
+起点 [R1] 未声明 55 / 登记 110 / 已建表 64
+终点 [R1] 未声明  0 / 登记 110 / 已建表 121(110 原生 + 11 家族臂)
+[op-tables] 110 张表与 .cu 签名逐参一致 ✓
+```
+**R1 门阈值 55 → 0**(`r1_undeclared_inventory`):此后新增任何核(含 FFI 家族臂)不带声明立刻红。
+
+#### 15.13.4 准入门自己抓到的两个真错(本轮的"门有用"实证)
+
+1. **输出槽角色错**:生成器忠实照抄登记表,而登记表对 GDN 族**没给输出槽打 `O`**(写的是 `T`)⇒ 17 处 `Param::t_in("out", …)`(角色=输入)。已全部改回 `t_out`,顺带**把门变强**:`op_tables` 现在会断言 `O` 槽在 `.cu` 里必须是**指针位**。
+2. **`ShapeFamily.page` 猜窄**:26 张 attn 表我按名字后缀(`bs32`→32,否则 16)推 `page`,而 cache 写核与片大小无关 —— `models::specs::qwen35::tests::gpu_real_weights_prefill` 当场红:
+   ```
+   driver::resolve("attn.k0_write_knhd") -> vllm_reshape_and_cache_f16_knhd:
+   几何不接受 —— page 要求 ∈ [16],实得 32
+   ```
+   修正律:**池几何 = 配置决定 ⇒ 声明"受支持集合"**(`page: &[16,32,64,128]`,head_dim 无后缀者放宽 `[128,256]`),细窄留给真正的特化核(`*_hd128`)。
+
+#### 15.13.5 目录级对望(用户裁决「都做」)
+
+规则:`cu/<域>/` ↔ `ops/<域>.rs`;私有/无声明归位见下。
+
+```
+cu/attn/   ← ops/attn.rs     (8)    cu/gdn/   ← ops/gdn.rs      (10, 含 family 私有 state_transpose)
+cu/elems/  ← ops/elems.rs    (14)   cu/load/  ← ops/load.rs     (1)
+cu/ln/     ← ops/ln.rs       (3)    cu/probe/ (ts_probe)
+cu/fused/  ← ops/fused.rs    (1)    cu/marlin/ cu/xqa/ cu/flashinfer/  (家族自管,不动)
+cu/dflash/ ← ops/dflash.rs   (2)
+```
+- **搬 39 个文件 + 改写 id 字面量**;`cu/owl/`、`cu/attention/` 两个"杂项目录"消失;
+- 安全性由 §15.14 引入的 **build.rs 路径存在性校验**兜住(搬完仍 40 源,只重编搬动那批);
+- 踩坑:首次脚本用仓库根相对路径(`cu/…`)跑,`git mv/mv` 双双失败 → 脚本第一项就 abort ⇒ **零文件被移动**(幸而如此);加 `crates/kernels/` 前缀后一次成功 —— 批量搬移**必须前置断言源文件存在**(与批量替换必须断言命中同理)。
+
+#### 15.13.6 in-tree 配置漂移定谳 + 修复
+
+`testdata/server/bench-27b-std.toml` 与 flavor 白名单**两面同时对不上**(该 config 早于 P4 白名单硬门):
+
+| 面 | config | `awq27b` flavor 台账 |
+|---|---|---|
+| 池 dtype | **f16**(`kv_fp8` 缺省 false) | **fp8**(`PROD_AWQ27B_2026_10_13`) |
+| GDN 臂 | `gdn_chunked = true` | 只有 gdn_scalar 臂 |
+
+修法:**不动 flavor 台账**(它是"实测发射集"声明,不许无凭据改),改为在该 config 的文件层给 `allowed_ops`(四层叠加里文件层 > flavor 层,config 头注已列明"第 4 处有意覆盖")。R1 归零后 f16 那一撮全有声明,清单才写得出来 —— **这正是 D 的可见收益**。
+
+**实测(修复后首次真跑)**:`引擎就绪(捕获态 Captured)` + `生产白名单:28 项生效(池写集审计通过)`,`std` 五点三轮 **15/15**:prefill avg **1309.60** · decode avg **39.24** · TTFT@512 385-392ms —— 对拍同 f16 池口径历史基线(1318.11 / 39.14)与 C 轮后复测(1319.10 / 39.05):**±0.7% 内**。
+
+#### 15.13.7 验收(全部实测)
+
+| 项 | 数字 |
+|---|---|
+| `[R1]` | 未声明 **0** / 登记 110 / 已建表 **121** |
+| `op_tables` | **110 张表**逐参互证 |
+| kernels lib / models / shared | 62/62(含新增家族臂孪生门) · 117/117 · 27/27 |
+| clippy / workspace check | **0 警** / 0 错 |
+| GPU 套件 | cubin_launch 6/6 + **13 套探针全绿** |
+| 真机 boot | fp8 档(spec-dflash)与 **f16 档(awq27b)** 双双 Captured;std 均 15/15 |
+
+#### 15.13.8 剩余(未做)
+
+- **`REGISTRY` 退役**:全部 121 项都有声明后,登记表可由 `ops::all()` 派生(含 `Entry.src` 那份冗余),`registry_src` 一并删除 —— 独立小步,判据 = `registry_source_agrees_with_op_meta` 门失去对象时。
+- `ops/attn.rs` 的 26 张新表可进一步用 `macro_rules!` 收敛(现为生成器一次写出的展开形态)。
+
+---
+
+### 15.14 E 轮:**运行期源文本退役**(2026-10-13)
+
+用户指令(指着 `const SOURCE: &'static str = include_str!("../../cu/owl/gdn_delta_dec.cu");`):
+> 「我们走的预编译了,不再使用内联 JIT」
+
+#### 15.14.1 病灶:同一份 `.cu` 文本在二进制里躺了两遍
+
+预编译后,源文本**只参与构建期**(决定编什么),运行期只需要**资产身份**。但当时:
+
+```
+KernelSpec::SOURCE = include_str!("…")              ← 第一份文本(躺在 kernels rlib)
+CubinAsset { asset, src: include_str!("…"),         ← 第二份文本(build.rs 生成进资产表)
+             src_hash, src_len, bytes }
+运行期真正用到:src_hash / src_len / bytes —— src 只给测试/诊断
+查表: asset_of_source(源文本) ⇒ 每次装载真算一遍 FNV-1a64
+```
+
+「内容当键」的自证性(设计 §15.5 的立意:名字是"第三份表")在**构建期**依然成立;运行期还随身带文本纯属历史包袱。
+
+#### 15.14.2 改动面
+
+| 面 | 之前 | 之后 |
+|---|---|---|
+| 声明 | `const SOURCE: &'static str = include_str!(…)` | `const SRC: &'static str = "cu/…/x.cu"`(**资产 id**;改名以免"一名两义") |
+| 资产表 | `{ asset, **src**, src_hash, **src_len**, bytes }` | `{ **id**, **module**, src_hash, bytes }` |
+| 查表 | `asset_of_source(文本)` | `asset(id)`(按键查;`has_aot(id)`) |
+| 发现规则(build.rs) | 扫 `include_str!` 闭包 | 扫 **`const … = "cu/…/x.cu"` 字面量** + **逐条存在性校验**(路径写错 = 构建期失败);仍零第二份清单,`rerun-if-changed` 覆盖 `.cu` 本体 |
+| "源里有没有这个核" | `source_defines(文本, 名)` 正则扫文本 | 构建期生成的 **`ASSET_SYMBOLS`**(每资产符号清单;字面核 + 宏实例化)→ 判据从"文本像不像"升级为"编译期真有没有" |
+| 测试/工具面取源 | 直接吃内嵌文本 | `list::cu_text(id)` **按需读盘**(`CARGO_MANIFEST_DIR`) |
+
+`ops::source(name)` 保留为**唯一读取口**(现在返回资产 id),`list::source` 转发;`KernelSource.source`(线格式字段)语义同为 id,名字未改(挂账)。
+
+#### 15.14.3 验证:二进制里真的没有源文本了
+
+```
+target/release/server (39M)
+--- 源文本特征串(应未命中)---
+  extern "C" __global__ void                    未命中 ✓
+  OWL_ADD_KERNEL / OWL_RMSNORM_KERNEL           未命中 ✓
+  __nv_fp8_e4m3(__half2float                    未命中 ✓
+  blockIdx.x * blockDim.x + threadIdx.x         未命中 ✓
+  DFLASH_TOPK_BLOCK / OWL_NC_SLIDING_WINDOW     未命中 ✓
+--- 只应有的资产 id 串 ---
+  cu/elems/add.cu / cu/attn/pagedattention_f16.cu / cu/gdn/gdn_chunk_scalar.cu   命中 ✓
+```
+
+#### 15.14.4 踩坑留档(四条,全部实测复现)
+
+1. **两个函数共用同一行代码**:`source_defines` 与 `parse_cu_sig` 都有 `let clean: String = source`,批量替换把**解析器**一起改坏 —— 靠编译错误定位。**替换前先 `grep` 数一遍目标行数**。
+2. **扫描规则切换会静默丢文件**:`include_str!` 闭包 → 字面量扫描后源数 **40 → 39**,漏的是 `family/gdn_scalar.rs` 里那份"就地 include_str"(既不在 `ops/` 也不在 `list.rs`)。补法:拿 `find cu/**/*.cu`(减家族自管目录)对账 —— **数量核对是这类规则切换的唯一保险**。
+3. **宏形参漏进符号清单**:宏定义体里的 `NAME` 被当成核名(如 `CHUNKED_KNHD_ENTRY` 族)。修法:核名一律含小写 ⇒ 只收"含小写字母"的标识符。另有一处 id 少了 `cu/` 前缀(符号与 id 错位),一并修。
+4. **补丁静默不命中**:我给的 oldText 写的是 `SRC` 而文件里还是 `SOURCE`,`str.replace` 无声无息 ⇒ `op_tables` 仍在拿 **id 当文本**比对(报"SOURCE 不是核源码")。**纪律**:所有批量替换必须 `assert` 命中(§15.12.6 已立过同款规矩,本轮再犯一次)。
+
+#### 15.14.5 验收(全部实测)
+
+| 项 | 结果 |
+|---|---|
+| 构建期 cubin | **40 源**(与重构前一致) |
+| `op_tables` | 110 张表逐参互证(文本从磁盘取) |
+| lib / oracles / no_runtime_compile | 62/62 · 8/8 · 2/2 |
+| **GPU** | cubin_launch 6/6(含 NVRTC↔fatbin **逐位等价**,NVRTC 对照臂源从磁盘取)+ 13 套探针全绿 |
+| **真机 boot** | spec-dflash / awq27b 双双 `Captured`,问答输出连贯 |
+
+#### 15.14.6 剩余(未做)
+
+- `KernelSource.source`(线格式字段)名字未改,语义已是 id;
+- 家族自管资产(marlin/xqa/flashinfer/gdn_chunked cubin 表)仍按**名字**查表(它们不经 build.rs 的 `.cu` 编译面),与本轮统一化是两条链,可另立项;
+- 目录对望已做(§15.13.5),但 `ops/attn.rs` 内 26 张表尚未宏收敛。

@@ -77,7 +77,7 @@ fn gdn_decode_step_batch2_equals_serial() {
     let stream = ctx.default_stream();
     // nvrtc 懒编译(源 = text/gdn.cu;自足,仅 <cuda_fp16.h> 系统头)
     let ptx = cudarc::nvrtc::compile_ptx_with_opts(
-        &owl_kernels::list::cu_text(owl_kernels::ops::source("owl_gdn_recurrence_varlen_gqa_f16")),
+        owl_kernels::list::cu_text(owl_kernels::ops::source("owl_gdn_recurrence_varlen_gqa_f16")).as_str(),
         cudarc::nvrtc::CompileOptions {
             arch: Some("compute_86"),
             include_paths: vec!["/usr/local/cuda/include".into()],

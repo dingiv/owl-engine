@@ -306,7 +306,7 @@ fn chunked_prefill_fp8_matches_f16() {
     ctx.bind_to_thread().expect("bind");
     let stream = ctx.default_stream();
     let ptx = cudarc::nvrtc::compile_ptx_with_opts(
-        &owl_kernels::list::cu_text(owl_kernels::ops::source("vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256")),
+        owl_kernels::list::cu_text(owl_kernels::ops::source("vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256")).as_str(),
         cudarc::nvrtc::CompileOptions {
             arch: Some("compute_86"),
             include_paths: vec!["/usr/local/cuda/include".into()],

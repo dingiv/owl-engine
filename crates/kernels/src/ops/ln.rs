@@ -148,10 +148,9 @@ impl KernelSpec for RmsnormF32 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-/// 本域全部已建表算子
-
 pub static OWL_RMSNORM_F32: KernelMeta = meta_of::<RmsnormF32>();
 
+/// 本域全部已建表算子
 pub static METAS: &[&KernelMeta] = &[
     &RMSNORM_F16,
     &RMSNORM_BF16,

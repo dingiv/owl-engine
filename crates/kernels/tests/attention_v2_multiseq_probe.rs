@@ -160,7 +160,7 @@ fn v2_multiseq_case(knhd: bool) {
     ctx.bind_to_thread().expect("bind");
     let stream = ctx.default_stream();
     let ptx = cudarc::nvrtc::compile_ptx_with_opts(
-        &owl_kernels::list::cu_text(owl_kernels::ops::source("vllm_paged_attention_v2_fp8_knhd_hd256bs32")),
+        owl_kernels::list::cu_text(owl_kernels::ops::source("vllm_paged_attention_v2_fp8_knhd_hd256bs32")).as_str(),
         cudarc::nvrtc::CompileOptions {
             arch: Some("compute_86"),
             include_paths: vec!["/usr/local/cuda/include".into()],

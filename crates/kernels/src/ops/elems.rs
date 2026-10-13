@@ -559,8 +559,6 @@ impl KernelSpec for ProbeTsF16 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-/// 本域全部已建表算子
-
 pub static OWL_ADD_F32: KernelMeta = meta_of::<AddF32>();
 pub static OWL_MUL_F32: KernelMeta = meta_of::<MulF32>();
 pub static OWL_MUL_F16: KernelMeta = meta_of::<MulF16>();
@@ -578,6 +576,7 @@ pub static OWL_ROPE_HALF_PARTIAL_F16: KernelMeta = meta_of::<RopeHalfPartialF16>
 pub static OWL_ROPE_HALF_PARTIAL_F32: KernelMeta = meta_of::<RopeHalfPartialF32>();
 pub static PROBE_TS_F16: KernelMeta = meta_of::<ProbeTsF16>();
 
+/// 本域全部已建表算子
 pub static METAS: &[&KernelMeta] = &[
     &NARROW_STRIDED_F16,
     &GEMV_DUAL_F16,

@@ -90,7 +90,7 @@ fn scalar_matches_varlen_big_t() {
         .expect("fn scalar");
     // varlen 源(nvrtc)
     let ptx = cudarc::nvrtc::compile_ptx_with_opts(
-        &owl_kernels::list::cu_text(owl_kernels::ops::source("owl_gdn_recurrence_varlen_gqa_f16")),
+        owl_kernels::list::cu_text(owl_kernels::ops::source("owl_gdn_recurrence_varlen_gqa_f16")).as_str(),
         cudarc::nvrtc::CompileOptions {
             arch: Some("compute_86"),
             include_paths: vec!["/usr/local/cuda/include".into()],

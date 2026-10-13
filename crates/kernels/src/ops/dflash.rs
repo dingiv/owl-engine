@@ -106,11 +106,10 @@ impl KernelSpec for DflashSelectF16 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-/// 本域全部已建表算子
-
 pub static OWL_DFLASH_CONV_F16: KernelMeta = meta_of::<DflashConvF16>();
 pub static OWL_DFLASH_SELECT_F16: KernelMeta = meta_of::<DflashSelectF16>();
 
+/// 本域全部已建表算子
 pub static METAS: &[&KernelMeta] = &[&DFLASH_CONV_BF16, &DFLASH_SELECT_BF16,
     &OWL_DFLASH_CONV_F16,
     &OWL_DFLASH_SELECT_F16,

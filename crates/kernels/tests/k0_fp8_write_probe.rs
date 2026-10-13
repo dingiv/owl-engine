@@ -77,7 +77,7 @@ fn k0_fp8_write_readback() {
     ctx.bind_to_thread().expect("bind");
     let stream = ctx.default_stream();
     let ptx = cudarc::nvrtc::compile_ptx_with_opts(
-        &owl_kernels::list::cu_text(owl_kernels::ops::source("owl_reshape_and_cache_fp8kv")),
+        owl_kernels::list::cu_text(owl_kernels::ops::source("owl_reshape_and_cache_fp8kv")).as_str(),
         cudarc::nvrtc::CompileOptions {
             arch: Some("compute_86"),
             include_paths: vec!["/usr/local/cuda/include".into()],

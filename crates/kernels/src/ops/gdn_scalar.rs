@@ -56,7 +56,7 @@ mod tests {
     fn scalar_slot_order_matches_legacy_sig() {
         assert_eq!(
             meta_of::<GdnScalarDeltaRuleFwd>().args_str(),
-            crate::client::gdn_scalar::SIG.replace('O', "O")
+            crate::client::gdn_scalar::SIG
         );
     }
 }
