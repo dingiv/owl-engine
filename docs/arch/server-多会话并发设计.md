@@ -108,4 +108,7 @@ gdn_slots = 8          # GDN 状态格(= 活跃会话上限;生产 flavor 锁 1 
   - *机制本体*:**已验**——`crates/engine/src/tests.rs::gpu_prefix_cache_hit`
     (300 tok 共享前缀跨会话:块链物理共享 + B 的 prefill chunk ≪ A)。
   - 诊断面:e2e 末尾已打 `[前缀复用] 全量 N / 增量 M`;服务端可开
+  - 🔗 后续:agent 服务面(pi 对接)专项把这笔账升格为需求 REQ-AGT-08/09,
+    并给出渲染对称律与隐式会话两条解法 —— 见 `agent-服务面-设计与施工.md`
+    §4.3/§4.4(2026-10-14 立项)。
     `[probes] debug = true`(`[dbg prefix] match = N blocks`)+ `OWL_PROMPT_DUMP=1`。
