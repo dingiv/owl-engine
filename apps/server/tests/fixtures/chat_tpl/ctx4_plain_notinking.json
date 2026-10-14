@@ -1,0 +1,17 @@
+{
+  "messages": [
+    {
+      "role": "system",
+      "content": "hi"
+    },
+    {
+      "role": "user",
+      "content": "1+1=?"
+    }
+  ],
+  "add_generation_prompt": true,
+  "chat_template_kwargs": {
+    "enable_thinking": false,
+    "preserve_thinking": true
+  }
+}

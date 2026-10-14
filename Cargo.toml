@@ -26,7 +26,19 @@ serde = { version = "1", features = ["derive"] }
 bytemuck = "1.24.0"
 llguidance = { version = "1.7", default-features = false, features = ["lark", "referencing", "jsonschema_validation"] }
 regex = "1.12.2"
-serde_json = "1.0.108"
+# `preserve_order` = `Map` 用 IndexMap 而非 BTreeMap(键序 = 插入序)。
+# **不是性能选项而是正确性选项**:提示词面要求与 HF/vLLM 的 Python dict 序
+# 逐字节一致(tools schema 的键序会进 prompt);默认 BTreeMap 在**解析时
+# 就把键排序** → G0 判据不可能通过(agent 服务面 §7.1)。
+serde_json = { version = "1.0.108", features = ["preserve_order"] }
+# chat template 渲染(agent 服务面 §3.2):Rust 版 Jinja2。**只加库,不引入
+# Python**(PyPI 同名包 minijinja-py 是 PyO3 绑定,明确不用)。
+# 默认 feature 已含 builtins(namespace())/macros/debug;
+# 额外:json(tojson 原料)/preserve_order(键序=插入序,HF tojson 语义)/loop_controls。
+minijinja = { version = "2.24", features = ["json", "preserve_order", "loop_controls"] }
+# Jinja2 模板调用 Python str 方法(.split/.startswith/…)的兼容回调
+# (实测模板用 5 个,pycompat 全覆盖;见 docs/arch/agent-服务面-设计与施工.md §7.1)
+minijinja-contrib = { version = "2.24", features = ["pycompat"] }
 interprocess = "2.4.4"
 tokenizers = { version = "0.21.2", features = ["http"] }
 rayon = "1.12.0"

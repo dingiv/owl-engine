@@ -1,0 +1,61 @@
+{
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are pi, a coding agent. Work in /home/div/proj."
+    },
+    {
+      "role": "user",
+      "content": "列出当前目录,然后创建 hello.txt"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "bash",
+        "description": "Run a shell command. Use <cmd> carefully & wisely.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string",
+              "description": "命令,支持中文"
+            },
+            "timeout": {
+              "type": "number",
+              "default": 30
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "read",
+        "description": "Read a file",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      }
+    }
+  ],
+  "add_generation_prompt": true,
+  "chat_template_kwargs": {
+    "enable_thinking": true,
+    "preserve_thinking": true
+  }
+}

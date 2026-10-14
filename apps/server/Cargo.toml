@@ -15,6 +15,9 @@ owl-iface = { path = "../../crates/backends/iface" }
 owl-shared = { path = "../../crates/shared" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# chat template 渲染(agent 服务面 §3.2/§7.1;HF transformers 语义兼容层)
+minijinja = { workspace = true }
+minijinja-contrib = { workspace = true }
 # 手写 HTTP/1.1 + SSE(架子零重依赖;axum/hyper 迁移挂账,见 http.rs 模块头)
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 

@@ -32,10 +32,14 @@
 //! 面、usage 模型侧真账(现 = 事件面计数)。
 
 mod actor;
+// chat template 渲染器(HF 语义;agent 服务面 §3.2/§7.1)
+mod chat_tpl;
 mod config;
 mod debug;
 mod http;
 mod openai;
+// 三通道流式解析器(增量文本 → 思考/正文/工具调用;agent 服务面 §4.5)
+mod toolcall;
 
 use std::time::Duration;
 
@@ -59,7 +63,9 @@ async fn main() {
     let args = match crate::config::CliArgs::parse(std::env::args().skip(1)) {
         Ok(a) => a,
         Err(e) => {
-            owl_shared::log_info!("boot", "{e}");
+            // **拒启必须可见**(A1):此刻 logger 尚未初始化,`log_info!` 会被丢弃
+            // ⇒ 早期失败一律裸 eprintln(与 `[boot] 引擎装配失败` 同款)
+            eprintln!("[boot] 参数非法: {e}");
             std::process::exit(1);
         }
     };
@@ -74,7 +80,8 @@ async fn main() {
     let config = match ServerConfig::load(args.flavor.as_deref(), args.config.as_deref(), &args) {
         Ok(c) => c,
         Err(e) => {
-            owl_shared::log_info!("boot", "配置非法: {e}");
+            // 拒启必须可见(A1):此刻 logger 尚未初始化,`log_info!` 会被丢弃
+            eprintln!("[boot] 配置非法: {e}");
             std::process::exit(1);
         }
     };
@@ -100,7 +107,8 @@ async fn main() {
                 owl_shared::log::level_name(),
                 owl_shared::log::LOG_BUILD,
             ),
-            Err(e) => owl_shared::log_info!("boot", "{e}"),
+            // logger 自身失败 ⇒ 只能用 stderr(A1)
+            Err(e) => eprintln!("[boot] logger 初始化失败: {e}"),
         }
     }
 
@@ -117,6 +125,20 @@ async fn main() {
         owl_shared::log_info!("boot", "perf dump → {}(每 turn 终了覆写 CSV + .json)", p.display());
     }
 
+    // ── chat 模板(agent 服务面 §3.2):**快照资产**,装配期编译一次 ──
+    // 渲染唯一权威 = 模型目录里的 chat_template.jinja(新建/重命名为内置模板
+    // 串会直接打碎前缀复用,见 §4.3 R2);装载失败 = 拒启(渲染不出来 = 服务无意义)
+    let tpl = match chat_tpl::ChatTpl::load(&config.model_dir) {
+        Ok(t) => {
+            owl_shared::log_info!("boot", "chat 模板已装载({})", t.source());
+            std::sync::Arc::new(t)
+        }
+        Err(e) => {
+            eprintln!("[boot] chat 模板装载失败: {e}");
+            std::process::exit(1);
+        }
+    };
+
     // ── engine actor:专属线程(构造+装载+泵全在内;RunningEngine 非 Send)──
     // HTTP 侧留 bind/model_name 副本(model_name 回退服务端缺省)
     // 并发上限守卫(§三十五 server 上层):GDN 状态格 = 每并发会话一格,
@@ -125,7 +147,9 @@ async fn main() {
     let gdn_slots = config.knobs.gdn_slots;
     let max_concurrency = config.max_concurrency;
     if gdn_slots < max_concurrency {
-        owl_shared::log_info!("boot", "❌ max_concurrency({max_concurrency}) > GDN 状态格数({gdn_slots})—— 每并发会话占一格,请调 knobs.gdn_slots ≥ max_concurrency 或降低并发"
+        // 拒启必须可见(A1):默认日志级别 warn 下 log_info 不出 ⇒ 裸 eprintln
+        eprintln!(
+            "[boot] ❌ max_concurrency({max_concurrency}) > GDN 状态格数({gdn_slots})—— 每并发会话占一格,请调 knobs.gdn_slots ≥ max_concurrency 或降低并发"
         );
         std::process::exit(1);
     }
@@ -174,12 +198,13 @@ async fn main() {
             Ok((stream, _peer)) => {
                 let tx = tx.clone();
                 let model_name = model_name.clone();
+                let tpl = tpl.clone();
                 let gate = concurrency_gate.clone();
                 tokio::spawn(async move {
                     // 并发闸门:permit 获取排队(超出 max_concurrency 等待);
                     // 获取后持有至该连接服务完毕(长连接 = 占一并发位)
                     let _permit = gate.acquire().await;
-                    if let Err(e) = serve(stream, tx, model_name).await {
+                    if let Err(e) = serve(stream, tx, model_name, tpl).await {
                         owl_shared::log_warn!("conn", "{e}");
                     }
                 });
@@ -243,6 +268,7 @@ async fn serve(
     mut stream: tokio::net::TcpStream,
     tx: mpsc::Sender<EngineReq>,
     model_name: String,
+    tpl: std::sync::Arc<chat_tpl::ChatTpl>,
 ) -> std::io::Result<()> {
     let Some(req) = http::read_request(&mut stream).await? else {
         return Ok(());
@@ -262,7 +288,7 @@ async fn serve(
             .await?;
         }
         ("POST", "/v1/chat/completions") => {
-            openai::chat(&mut stream, &req.body, tx, &model_name).await?;
+            openai::chat(&mut stream, &req.body, tx, &model_name, &tpl).await?;
         }
         // 日志面入口(/debug/log[/level/<name>])
         ("GET", p) if p == "/debug/log" || p.starts_with("/debug/log/") => {
