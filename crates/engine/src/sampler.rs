@@ -25,16 +25,20 @@ pub struct SamplerCfg {
     pub temp: f32,
     pub topk: usize,
     pub topp: f32,
-    /// 重复惩罚(llama.cpp 同语义:>1 压制已现 token;正 logit 除,
-    /// 负 logit 乘;1.0 = 关。默认 1.15 = 反循环服务档 ——
-    /// top-p 逃不出 P>0.95 的复读吸引子,2026-10-01 实测定谳)
+    /// 重复惩罚(llama.cpp 同语义:**每个不同 token 只施加一次**;正 logit 除,
+    /// 负 logit 乘;1.0 = 关)。
+    ///
+    /// ⚠️ 默认 **1.0(关)**(2026-10-14 由 1.15 改回):该旋钮是 owl 自加的
+    /// "反循环服务档",而 checkpoint `generation_config`、OpenAI 协议、
+    /// vLLM(pi 侧无 `samplingParams`)都不施加 ⇒ 属**对参考实现的单方偏离**。
+    /// 实测(pi 真机):1.15 之下长思考/长输出必崩(复读→词沙拉),1.0 恢复正常。
     pub rep_penalty: f32,
 }
 
 impl Default for SamplerCfg {
-    /// 缺省 = 反循环服务档(generation_config 同款)
+    /// 缺省 = generation_config 同款三维,**不做重复惩罚**(rep_penalty = 1.0)
     fn default() -> Self {
-        SamplerCfg { temp: 1.0, topk: 20, topp: 0.95, rep_penalty: 1.15 }
+        SamplerCfg { temp: 1.0, topk: 20, topp: 0.95, rep_penalty: 1.0 }
     }
 }
 
@@ -70,8 +74,19 @@ pub fn sample(logits: &mut [f32], cfg: &SamplerCfg, rng: &mut u64, history: &[u3
     let n = logits.len();
     debug_assert!(n > 0);
     // ── repetition penalty(在 temperature 之前;llama.cpp 同语义:正除负乘)──
+    //
+    // **去重律**:每个**不同** token 只施加一次。原实现按 `history` 逐元素施加
+    // ⇒ 同一 token 出现 k 次被罚 k 次 = `rep_penalty^k` **指数累积**(k=10 → ÷4,
+    // k=30 → ÷66,k=60 → 基本禁掉);短输出无感(常见词 ≤2 次),而长思考/长输出
+    // 里换行/标点/常用词重复几十次 ⇒ 分布塌成复读与词沙拉(2026-10-14 pi 真机
+    // 定谳,`rep_penalty=1.0` 即恢复)。llama.cpp 用 candidates 位集去重,
+    // 此处用「拷贝 + 排序去重」(history = 64 + 本 turn 已生成,量级 10³,
+    // 排序 ~50µs,远低于采样本体;若将来成瓶颈可换 epoch 戳表复用缓冲)。
     if cfg.rep_penalty > 1.0 && !history.is_empty() {
-        for &t in history {
+        let mut uniq: Vec<u32> = history.to_vec();
+        uniq.sort_unstable();
+        uniq.dedup();
+        for &t in &uniq {
             let t = t as usize;
             if t < n {
                 let v = logits[t];
@@ -231,6 +246,42 @@ mod tests {
     }
 
     #[test]
+    /// **去重律**:同一 token 出现 k 次只罚一次(回归门;原实现 = 1.15^k 累积)
+    #[test]
+    fn rep_penalty_once_per_distinct_token() {
+        let cfg = SamplerCfg { temp: 0.0, topk: 20, topp: 0.95, rep_penalty: 1.5 };
+        let base = || {
+            let mut v = vec![-3f32; 64];
+            v[5] = 8.0;
+            v[6] = 7.0;
+            v
+        };
+        let once = {
+            let mut l = base();
+            sample(&mut l, &cfg, &mut 7, &[5]);
+            l
+        };
+        let five = {
+            let mut l = base();
+            sample(&mut l, &cfg, &mut 7, &[5, 5, 5, 5, 5]);
+            l
+        };
+        assert_eq!(once[5], five[5], "重复出现不得叠加惩罚(1.5^k 雷已焊死)");
+        assert!(once[5] < base()[5], "至少罚一次");
+        // 两个不同 token 各罚一次:8/1.5=5.333 vs 7/1.5=4.667
+        let two = {
+            let mut l = base();
+            sample(&mut l, &cfg, &mut 7, &[5, 6]);
+            l
+        };
+        assert!((two[5] - 5.3333).abs() < 1e-3 && (two[6] - 4.6667).abs() < 1e-3, "{:?} {:?}", two[5], two[6]);
+        // 1.0 = 关
+        let off = SamplerCfg { rep_penalty: 1.0, ..cfg };
+        let mut l = base();
+        sample(&mut l, &off, &mut 7, &[5, 5, 5]);
+        assert_eq!(l[5], 8.0, "rep_penalty=1.0 不得改动 logits");
+    }
+
     fn topp_mass_concentrates_head() {
         // 尖峰分布 + 大词表:top-p 截断后采样几乎全落头部
         let mut logits = vec![-20f32; 10000];

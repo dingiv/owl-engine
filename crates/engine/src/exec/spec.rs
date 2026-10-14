@@ -67,6 +67,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // + fold 记录)或 eager fallback(旧 verify_forward)。fold 记录
         // = 每层 8 件(conv 三 raw + 递推五件)。
         let block: Vec<u32> = std::iter::once(token).chain(drafts.iter().copied()).collect();
+        // XQA 页表:在借 self.verify_graph 之前算好(自 sessions 取真块链)
+        let xqa_pt_v = self.xqa_pt_of(sid);
         let (ids, hidden, records, hidden_owned) = if let Some(vg) = self.verify_graph.as_mut() {
             let ts = std::time::Instant::now();
             let page = self.pool.page;
@@ -113,6 +115,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 ("bt8", bt8_f.as_slice()),
                 ("xqa_seq", xqa_seq_v.as_slice()),
                 ("xqa_sem", xqa_sem_v.as_slice()),
+                // XQA 页表:会话真链(槽在 verify 图无条件声明;
+                // 不写 = 留着恒等链 = 读到别家 KV —— §7.6)
+                ("xqa_pt", xqa_pt_v.as_slice()),
             ])
             .await?;
             let t_read_v = std::time::Instant::now();
@@ -580,6 +585,22 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
 
     /// 活跃会话块表 → 持久 bt 块(设备;StatePool::write_bt 落地,
     /// 本壳只解析会话块链)
+    /// XQA 页表实时值 = **会话真块链**(`f32::from_bits(block_id)`;
+    /// XQA 核按 `const uint32_t*` 读,与 state.rs 的 init 编码同源),
+    /// 尾部补零到池 nb(与 bt8 同律:kv_lens 限界不读)。
+    ///
+    /// 为什么必须有它:图里若只用常量恒等链,则**只有单会话独占池**才正确 ——
+    /// agent 面每请求新会话(pi 不发 session 键),块链从空闲链续,XQA 却仍读
+    /// 0..nb ⇒ 读到别家 KV(§7.6 定谳:多请求"答上一题")。
+    pub(crate) fn xqa_pt_of(&self, sid: u64) -> Vec<f32> {
+        let empty: &[u32] = &[];
+        let table = self.sessions.get(sid).map(|s| s.block_table.as_slice()).unwrap_or(empty);
+        let nb = self.pool.nb.max(table.len());
+        let mut v: Vec<f32> = table.iter().map(|&b| f32::from_bits(b)).collect();
+        v.resize(nb, 0.0);
+        v
+    }
+
     pub(crate) async fn write_bt(&mut self, sid: u64) -> Result<()> {
         let table = self.sessions.get(sid).expect("账在").block_table.clone();
         let face = self.session.face_mut();
@@ -592,6 +613,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// 一块的物理 id)—— 块表在 turn-open 预长满,表尾 ≠ 边界块。
     /// 槽位选择/LRU 覆盖写在 StatePool::capture_snap(state.rs)。
     pub(crate) async fn capture_gdn_snap(&mut self, sid: u64, fed: usize) -> Result<()> {
+        // snap_max = 0 ⇒ 快照面整体关闭:跳过(该档无语义需求;不得靠内部错误
+        // 兜底 —— 那是 panic 换 503,见 agent 专项 A2)
+        if self.pool.snap_capacity() == 0 {
+            return Ok(());
+        }
         let (gdn_slot, key) = {
             let s = self.sessions.get(sid).expect("账在");
             let bi = fed / self.pool.page - 1;

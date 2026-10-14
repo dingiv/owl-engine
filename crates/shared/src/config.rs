@@ -45,7 +45,7 @@
 //! | spec | notaps / tapdecl | flag / false(verify 图诊断) |
 //! | spec | degrade_after / probe_every | usize / 6、64 |
 //! | sampling | mode | SamplerMode 枚举("greedy"\\|"sampling")/ sampling |
-//! | sampling | temp / topk / topp / rep_penalty | 1.0 / 20 / 0.95 / 1.15 |
+//! | sampling | temp / topk / topp / rep_penalty | 1.0 / 20 / 0.95 / 1.0 |
 //! | load | verify / debug_tap | flag / false |
 //! | dispatch | qkv_fuse / gdn_fused_decode / gdn_fused_decode_v2 | bool / 全真(**正语义**) |
 //! | dispatch | prefill_split / force_naive | flag / false |
@@ -498,7 +498,7 @@ impl Default for SamplingCfg {
             temp: 1.0,
             topk: 20,
             topp: 0.95,
-            rep_penalty: 1.15,
+            rep_penalty: 1.0,
         }
     }
 }

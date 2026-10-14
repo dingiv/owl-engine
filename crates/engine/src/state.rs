@@ -736,6 +736,12 @@ impl StatePool {
 
     /// 快照存在性(调度面复用边界判定:无快照的边界不可复用,GDN 态
     /// 对不上)
+    /// 快照池容量(`snap_max`;0 = 快照面整体关闭 —— 调用方须跳过 capture,
+    /// 否则 `capture_snap` 会因池空而报错,见 agent 专项 A2)
+    pub(crate) fn snap_capacity(&self) -> usize {
+        self.snaps.len()
+    }
+
     pub(crate) fn has_snap(&self, key: u32) -> bool {
         self.snaps.iter().any(|s| s.key == Some(key))
     }
@@ -844,20 +850,31 @@ impl StatePool {
         gdn_slot: usize,
         key: u32,
     ) -> Result<()> {
+        // 池空(snap_max = 0)不再是 panic(原 `expect("池非空")` 会炸掉整个
+        // owl-engine 线程 → 客户端收 503):退化为**结构化错误** —— 调用方
+        // (`capture_gdn_snap`)已按 snap_capacity() 先行跳过,故此处只作兜底
+        // (agent 专项 A2,2026-10-14)。
         let idx = match self.snaps.iter().position(|s| s.key == Some(key)) {
             Some(i) => i,
-            None => self
-                .snaps
-                .iter()
-                .position(|s| s.key.is_none())
-                .unwrap_or_else(|| {
-                    self.snaps
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|(_, s)| s.last_use)
-                        .map(|(i, _)| i)
-                        .expect("池非空")
-                }),
+            None => {
+                let free = self.snaps.iter().position(|s| s.key.is_none());
+                let lru = self
+                    .snaps
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, s)| s.last_use)
+                    .map(|(i, _)| i);
+                match free.or(lru) {
+                    Some(i) => i,
+                    None => {
+                        return Err(ModelError::Msg(
+                            "GDN 快照池为空(snap_max = 0):调用方应跳过 capture \u{2014}\u{2014} \
+                             见 roadmap.local/agent-服务面-剩余工作项 A2"
+                                .into(),
+                        ))
+                    }
+                }
+            }
         };
         self.snap_tick += 1;
         for (li, g) in self.gdns.iter().enumerate() {

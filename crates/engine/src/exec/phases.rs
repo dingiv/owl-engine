@@ -84,6 +84,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             step_slots.push(("xqa_seq", vec![f32::from_bits((pos + 1) as u32)]));
             let n = self.session.input_len("xqa_sem").unwrap_or(0);
             step_slots.push(("xqa_sem", vec![0.0; n]));
+            // XQA 页表 = 本会话真页链(不喂 = 图里恒等链 = 读到别家 KV;§7.6)
+            if self.session.has_input("xqa_pt") {
+                step_slots.push(("xqa_pt", self.xqa_pt_of(sid)));
+            }
         }
         let step_refs: Vec<(&str, &[f32])> =
             step_slots.iter().map(|(n, v)| (*n, v.as_slice())).collect();

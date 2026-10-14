@@ -473,9 +473,11 @@ impl<D: DeviceClient + 'static> Engine<D> {
             // (sem 走输入槽的正解见工单 §2.7 —— 禁跨账本 memset 命令)
             if let Some(x) = xqa_decode_ctx.as_ref() {
                 let seq_in = sc.input("xqa_seq")?;
+                let pt_in = sc.input("xqa_pt")?;
                 let sem_in = sc.input("xqa_sem")?;
                 ctx.xqa = Some(owl_models::module::XqaVerifyCtx {
-                    page_table: x.page_table.clone(),
+                    // 页表 = 输入槽(由核侧每轮写会话真链);verify 图同款
+                    page_table: pt_in,
                     seq_lens: seq_in,
                     mask: x.mask.clone(),
                     semaphores: sem_in,
@@ -517,6 +519,15 @@ impl<D: DeviceClient + 'static> Engine<D> {
                     if xqa_dec_sem_n > 0 {
                         v.push(InputSlot::f32("xqa_seq", 1).init(vec![0.0]));
                         v.push(InputSlot::f32("xqa_sem", xqa_dec_sem_n).init(vec![0.0; xqa_dec_sem_n]));
+                        // XQA **页表必须走输入槽**(每轮写会话真页链):
+                        // 常量恒等链 0..nb 只在"单会话独占池(块从 0 起)"时成立;
+                        // 多会话(agent:每请求新会话,块链从空闲链续)会让 XQA
+                        // 整段读到**别家 KV** —— 实测"答上一题"(§7.6 定谳,
+                        // 2026-10-14)。init 保留恒等链(单会话行为不变);
+                        // 槽尺寸 = 池 nb(与会话链上界一致,尾部补零)
+                        v.push(InputSlot::f32("xqa_pt", pool.nb).init(
+                            (0..pool.nb).map(|i| f32::from_bits(i as u32)).collect(),
+                        ));
                     }
                     if self.cfg.knobs.ts_probe {
                         v.push(InputSlot::f32("ts_buf", 4096));
