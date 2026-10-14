@@ -150,6 +150,17 @@ pub trait DeviceRes {
     /// 2. `ptrs` = 设备地址(生命周期判据的钥匙),没有就给空切片;`name`
     ///    允许空串;**不得在其中做分配/同步/阻塞**。
     fn note_device(&mut self, _kind: &'static str, _name: &str, _bytes: usize, _ptrs: &[u64]) {}
+
+    /// **入账面是否武装**(2026-10-15 审查补)。
+    ///
+    /// 为什么需要它:`note_device` 缺省是空体,但**调用方要先把载荷建出来**
+    /// (`Exec::launch` 每次发射都 `Vec::with_capacity` 收集指针)⇒ 关账时那笔
+    /// 分配是白做的(热路径:prefill 实测 3376 次发射/轮)。本方法让调用方
+    /// **先问再建**:缺省 `false`(非 device 面/未武装),`GpuRes` 覆写为
+    /// "trace 环已开"。
+    fn note_enabled(&self) -> bool {
+        false
+    }
 }
 
 
@@ -360,12 +371,21 @@ impl Exec {
         if res.capturing()? {
             res.record_capture(LaunchNote { op: op.0.to_string(), kernel, grid, block, shared_mem })?;
         }
-        // **家族面入账**(2026-10-15 A13 补漏):本函数是 gdn_chunked /
-        // gdn_scalar / xqa / flashinfer 四族核发射的唯一出口 —— 在此一次性
-        // 覆盖全员(值表里的 Ptr 参数顺带落账 = 设备地址判据)。
-        // 关账时是一次空实现调用(零成本);直连 FFI 的族(marlin/cublas/FI run)
-        // 自行调 `res.note_device("fam_ffi_launch", ..)`。
-        {
+        let stream = res.stream()?;
+        launch_vals(&stream, f, grid, block, shared_mem, vals).map_err(|e| {
+            OpError::Launch {
+                op: op.0.to_string(),
+                stage: Stage::Compute,
+                detail: format!("{kernel}: {e:?}"),
+            }
+        })?;
+        // **家族面入账**(2026-10-15 A13 补漏;审查后修正两点):本函数是
+        // gdn_chunked / gdn_scalar / xqa / flashinfer 四族核发射的唯一出口 ——
+        // 在此一次性覆盖全员(值表里的 Ptr 参数顺带落账 = 设备地址判据)。
+        //   ① `note_enabled()` 守门 ⇒ 关账时**不建载荷**(零分配,不再白建 Vec);
+        //   ② 入账挪到**发射成功之后** ⇒ 账与事实一致(失败不留幽灵条目)。
+        // 直连 FFI 的族(marlin/cublas/FI run)自行调 `note_device("fam_ffi_launch", ..)`。
+        if res.note_enabled() {
             let mut ptrs: Vec<u64> = Vec::with_capacity(vals.len());
             for v in vals {
                 if let LaunchVal::Ptr(p) = v {
@@ -374,9 +394,7 @@ impl Exec {
             }
             res.note_device("fam_launch", kernel, 0, &ptrs);
         }
-        let stream = res.stream()?;
-        launch_vals(&stream, f, grid, block, shared_mem, vals)
-            .map_err(|e| OpError::Launch { op: op.0.to_string(), stage: Stage::Compute, detail: format!("{kernel}: {e:?}") })
+        Ok(())
     }
 
     /// htod(不变盒;staging 纪律:构造后不可变,捕获窗引用安全)。

@@ -1003,3 +1003,51 @@ compute-sanitizer 才排除。与其每次靠仪器挖,不如在唯一咽喉把�
 | 日期 | 版本 | 内容 |
 |---|---|---|
 | 2026-10-15 | v1.0 | 参数校验审计(Launch-only 三盲点)+ 六条命令边界校验补口(off-by-one 验活)+ 槽序回归锁(同类型对调验红)+ 族身份字面量住址重构(删两总表,字面量归各族,身份面零门化,名字门补 XQA) |
+
+---
+
+## 十八、双路独立审查整改(2026-10-15;fork 子代理 + 父会话复核)
+
+两路 **fork 子代理**(继承本轮全部调查史)分别审 `crates/kernels/**` 与 CUDA 后端
+`server/**`;报告存 `roadmap.local/26-10-15-审查-{kernels,server}.md`。
+**父会话逐条复核**后落地"简单项",复杂项留新会话(见 §18.4)。
+
+### 18.1 本轮落地(9 项)
+
+| # | 修什么 | 位置 | 判据/证据 |
+|---|---|---|---|
+| 1 | **notify 失败路径统一**(3 处 `ack.take().unwrap()` **必 panic** + 1 处 `let _ = e` 让调用方**永挂**):ack 住 `Arc<Mutex<Option<Ack>>>` cell(与闭包二选一原子成立)+ `notify_failed()` 留 counter/LVL_ERROR | `server/harvest.rs` 四处 | 编译 + 真机验收(`srv.notify_fail` 计数 0) |
+| 2 | **家族面写路径边界**:`upload` 命中 scratch 账本只证明"基址在册"⇒ 补 `range_fits(buf_len,0,src.len())`;`upload_block` 补 `check_range` | `server/mod.rs` | 与命令面六条同口径;零假阳 |
+| 3 | **`download` EagerOnly 守卫**(捕获窗内 `cudaStreamSynchronize` 非法)+ GDN diag 块 `!capturing` | `server/mod.rs`、`kernels/server/gdn_chunked.rs` | **独立双路径命中**:审查者静态指出 + 父会话做 prefill 图设计时独立推出 |
+| 4 | **`Arg::BlockSlice.byte_offset ≤ block_len`** 粗错门 | `server/launch.rs` | 越界访存落邻块(设备内无保护) |
+| 5 | **`note_device` 守门 + 入账挪到发射成功后**:`note_enabled()`(缺省 false,GpuRes 覆写)⇒ 关账不建载荷 | `kernels/device.rs`、`server/mod.rs` | 关账零分配;账与事实一致 |
+| 6 | **GDN 两族 `slot` 跨参校验**(host 标量乘进状态块指针,唯一未校验处):`check()` 覆写 + `checked_mul` + 账长比较 | `ops/gdn_{chunked,scalar}.rs` | **正例 2 + 负例 2** 单测(越界拒 / 未知块拒 / 边界格放行) |
+| 7 | **门补强三处**:① `no_runtime_compile` **删白名单短路**(一行同时含 `Ptx::from_binary` 与禁词即被豁免 = 一行级绕过)+ ROOTS 自检(顶层带 Cargo.toml 的目录必须在扫描面);② `slot_order_lock` **扩 dtype/rank 类型签名锁**;③ 名字门**补正例半边**(清单改从 `ops::all()` **派生**,不再手写) | 三处门 | 各门自测 + "混合行必报"反证 + 名字门 2/2 |
+| 8 | **清理**:`src/server.rs.bak`(2000 行死文件)→ `docs/archive/`;`cu_sig.rs` 误导 FIXME(删它会断掉表↔签名互证门);`crate::list` 死引 ×5;`cmd_name` 与 `Command::kind()` **合一**;`carve_block` 区间防溢出(`range_fits`);`gpu_client::htod` **dtype 交叉校验**(不再 `let _ = dtype`);注释漂移(捕获护栏清单/名字住址/gdn parse 边界);fmt nit | — | 编译 + 门 |
+| 9 | **删死字段** `DiagOpts::legacy_sync`(复核结论见 §18.2) | `state.rs`、`harvest.rs` | 编译 + 单测 |
+
+### 18.2 复核纠正的一条审查结论(不成立)
+
+审查者 P1「`sync_mask` 位耦合:单开 bit1(DTOH) 会连带把 free 栅栏切成旧语义 ⇒
+A13 分解表 `mask=2 → 198` 那格是两个变量」—— **实测不成立**:`fence_targets` 早已改成
+`sync_at(FENCE)`、dtoh 走 `sync_at(DTOH)`,`legacy_sync` **只剩派生式没有读者**
+(审查者读到的是 `state.rs:876` 的**注释**,不是代码)。
+⇒ **§十四 的分解表仍是单变量,A13 结论无需更正**;残留只是"死字段 + 两处过时注释",
+本轮已一并删净。
+
+### 18.3 验收
+
+| 判据 | 结果 |
+|---|---|
+| 单测/门 | owl-kernels **57/57**(+3 slot 门)· owl-cuda **6/6** · owl-shared **36/36** · `no_runtime_compile` **2/2** · `server_name_lint` **2/2** · `raw_sync_primitives_gate` **1/1** |
+| 真机(6 请求 × ptok 543…2453) | **6/6 `tool_calls`** + logits/TTFT **与整改前逐位相同** |
+| 新门零假阳 | 越界拒绝 **0**、`srv.notify_fail` **0**、boot 门全过(家族臂 11 / 自检 5) |
+
+### 18.4 留给新会话的复杂项(明确不做)
+
+| 项 | 为什么复杂 |
+|---|---|
+| **L3 补 dtype/rank/role 比对**(`check_from_params` 只比 token 类) | 改 L3 语义 ⇒ 所有已建表算子的发射都要回归;是"声明驱动"的最后一块 |
+| **`DeviceRes::resolve_len`**(家族无法自证入参尺寸:marlin `ws`/`c_tmp`、xqa `scratch` 256MiB) | 动 trait 实现面(2 个 impl)+ 三族调用点 |
+| **`parse` 与 builder 成对按名取址** | 6 族 + models 调用点;只改一侧会造**新的**不对称(双锁已就位兜底) |
+| `prefill` 上 CUDA Graph | 见 §17 之外的独立设计讨论(slab 预算 / M0 去 from_host 是前置) |

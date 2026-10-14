@@ -552,26 +552,11 @@ impl GpuServer {
         }
     }
 
+    /// 命令名(分相计时标签)。**单一真源 = `Command::kind()`**
+    /// (2026-10-15 审查补:旧实现本地 match 出一张同名表,与 `kind()` 构成
+    /// "命令名两处写"的漂移源 —— 与刚消灭的算子名两处写同构)。
     fn cmd_name(c: &Command) -> &'static str {
-        match c {
-            Command::GraphBegin { .. } => "GraphBegin",
-            Command::GraphEnd { .. } => "GraphEnd",
-            Command::GraphLaunch { .. } => "GraphLaunch",
-            Command::Alloc { .. } => "Alloc",
-            Command::MemsetZero { .. } => "MemsetZero",
-            Command::Htod { .. } => "Htod",
-            Command::HtodChunk { .. } => "HtodChunk",
-            Command::HtodChunks { .. } => "HtodChunks",
-            Command::AllocPinned { .. } => "AllocPinned",
-            Command::UploadPinned { .. } => "UploadPinned",
-            Command::Dtoh { .. } => "Dtoh",
-            Command::Free { .. } => "Free",
-            Command::CopyBlock { .. } => "CopyBlock",
-            Command::CopyBatch { .. } => "CopyBatch",
-            Command::Sync { .. } => "Sync",
-            Command::Launch { .. } => "Launch",
-            Command::Close { .. } => "Close",
-        }
+        c.kind()
     }
 
     fn dispatch_inner(&mut self, cmd: Command) {
@@ -580,9 +565,13 @@ impl GpuServer {
         if let Some(tr) = self.trace.as_ref() {
             let e = self.trace_entry_of(&cmd);
             tr.push(e);
-        }        // G2 护栏:捕获期间仅放行「Launch / Alloc(切 slab)」—— 二者由
-        // 路由策略天然落在捕获流(COMPUTE);其余(搬运/同步/图操作)一律
-        // 结构化拒绝 —— 它们或含非法捕获语义,或污染捕获拓扑。
+        }
+        // G2 护栏:捕获期间放行清单 = **Launch / Alloc(切 slab) / MemsetZero /
+        // GraphEnd / Close** —— Launch 与 Alloc 由路由策略天然落在捕获流
+        // (COMPUTE);**MemsetZero 有意放行**(它是合法图节点,GDN 逐 turn 状态
+        // 重置靠它);GraphEnd/Close 是收尾幂等口。其余(Htod/Dtoh/Sync/
+        // GraphLaunch)一律**结构化拒绝** —— 或含非法捕获语义,或污染捕获拓扑。
+        // (注释原写"仅 Launch/Alloc",与代码漂移;2026-10-15 审查补正)
         if self.ctx().capture_stream() {
             return match cmd {
                 Command::Launch { msg, ack } => self.handle_launch(msg, ack),
@@ -1190,6 +1179,11 @@ impl owl_kernels::device::DeviceRes for GpuRes<'_> {
     /// 且 `stream = "family"` 一眼可辨;地址一并落账(生命周期判据的钥匙)。
     ///
     /// 纪律:关账(容量 0)仅一次 `OnceLock` 判定;`ptrs` 为空时**不分配**内存。
+    /// 入账面武装判定(关账 ⇒ 调用方跳过建载荷;`Exec::launch` 每发射一次)
+    fn note_enabled(&self) -> bool {
+        crate::trace::get().is_some_and(|r| r.enabled())
+    }
+
     fn note_device(&mut self, kind: &'static str, name: &str, bytes: usize, ptrs: &[u64]) {
         let Some(tr) = crate::trace::get() else { return };
         if !tr.enabled() {
@@ -1219,17 +1213,27 @@ impl owl_kernels::device::DeviceRes for GpuRes<'_> {
             src.len(),
             &[dst],
         );
-        let target = self
+        let (target, cap) = self
             .scratch
             .iter()
             .find(|(p, _)| *p == dst)
-            .map(|(_, s)| s.clone())
+            .map(|(_, s)| (s.clone(), s.len()))
             .ok_or_else(|| OpError::Contract {
                 op: OP_RES.into(),
                 field: "upload",
                 expect: "指针在 scratch 账本".into(),
                 got: format!("{dst:#x}"),
             })?;
+        // **边界校验(2026-10-15 审查补)**:账本命中只证明"基址在册",不证明
+        // "写得下" —— 越界会静默落**邻块**(与命令面六条同族;设备内无保护)。
+        if !crate::state::range_fits(cap, 0, src.len()) {
+            return Err(OpError::Contract {
+                op: OP_RES.into(),
+                field: "upload",
+                expect: format!("src.len ≤ scratch 缓冲长度({cap}B)"),
+                got: format!("{}B @{dst:#x}", src.len()),
+            });
+        }
         if capturing {
             // 捕获窗:async 节点(回放重放 memcpy;不变盒语义由家族保证)
             // 捕获窗:async 节点(回放重放 memcpy;不变盒语义由家族保证)
@@ -1319,6 +1323,15 @@ impl owl_kernels::device::DeviceRes for GpuRes<'_> {
         // 调用方 `download` 已自带 COMPUTE 排空,回读序两侧都齐。
         let p = self.resolve(b)?;
         let stream = self.stream()?;
+        // **边界校验(2026-10-15 审查补)**:账本块上传同样要验"写得下"
+        self.ctx
+            .check_range(b.id, 0, src.len(), "upload-block")
+            .map_err(|e| OpError::Contract {
+                op: OP_RES.into(),
+                field: "upload_block",
+                expect: "src.len ≤ block_len(账本)".into(),
+                got: format!("{}B :: {e:?}", src.len()),
+            })?;
         self.note_device("fam_upload_block", "", src.len(), &[p]);
         if self.ctx.diag.sync_at(owl_shared::config::sync_bit::SCRATCH_UP_LEGACY) {
             unsafe { crate::ffi::memcpy_htod_sync(p, src) }.map_err(|e| OpError::Launch {
@@ -1338,6 +1351,18 @@ impl owl_kernels::device::DeviceRes for GpuRes<'_> {
     }
 
     fn download(&mut self, src: u64, dst: &mut [u8]) -> Result<(), OpError> {
+        // **EagerOnly 守卫(2026-10-15 审查补)**:捕获窗内 `cudaStreamSynchronize`
+        // **非法**(`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`)—— 本函数为回读补的
+        // "排空 COMPUTE"在捕获期会把图捕获打坏。与 `Exec::sample_stats` 的既有
+        // 守卫同款;捕获期可达的调用方(GDN diag 块)另加 `!capturing`。
+        if self.ctx.capture_stream() {
+            return Err(OpError::Contract {
+                op: OP_RES.into(),
+                field: "download",
+                expect: "EagerOnly(捕获窗内禁 sync/D2H)".into(),
+                got: "capturing=true".into(),
+            });
+        }
         // 装配期自检回读(同步语义:回执即落地;非热路径)
         //
         // ⚠️ **A13 同族(2026-10-15)**:`memcpy_dtoh_sync` 走 **NULL 流**,

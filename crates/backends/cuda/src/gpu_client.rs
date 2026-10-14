@@ -321,13 +321,26 @@ impl DeviceClient for GpuClient {
         shape: &Shape,
         src: &[u8],
     ) -> Result<Bytes, ModelError> {
-        // 字节直传(f16 基线);Bytes.len = 元素数,按 shape 回填
+        // 字节直传(字节口径);Bytes.len = 元素数,按 shape 回填。
+        //
+        // ⚠️ **dtype 不再静默忽略**(2026-10-15 审查补):旧实现 `let _ = dtype;`
+        // ⇒ 调用方传错 dtype(非 f16 基线,如 U32 打包权重)时 `Bytes.len`
+        // 语义错而**无声**。这里做**交叉校验**(不拒非 F16 —— U32 是合法用法):
+        // `src` 字节数必须 ≥ `elems × dtype 字节宽`(多给容许:池块可含尾料)。
         let elems: usize = shape.iter().product();
+        let want = elems
+            .checked_mul(dtype.size_bytes())
+            .ok_or_else(|| ModelError::Msg(format!("htod: elems({elems})×dtype({dtype:?}) 溢出")))?;
+        if src.len() < want {
+            return Err(ModelError::Msg(format!(
+                "htod: src {}B < elems({elems})×dtype({dtype:?})={want}B —— dtype/shape 与字节数不一致",
+                src.len()
+            )));
+        }
         let mut b = self
             .submit(move |ack| Command::Htod { data: src.to_vec(), ack })?
             .await?;
         b.len = elems;
-        let _ = dtype;
         Ok(b)
     }
 

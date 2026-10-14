@@ -5,6 +5,20 @@
 use super::*;
 
 impl GpuServer {
+    /// **notify 失败留痕**(2026-10-15 审查补):`launch_host_function` 失败 =
+    /// 回执断链 —— 旧实现三处 `ack.take().unwrap()` 必 panic(server 线程猝死
+    /// ⇒ 引擎死),一处 `let _ = e` 让客户端 future **永挂**。现在统一:失败
+    /// 回执走 `Arc<Mutex<Option<Ack>>>` cell(与闭包二选一原子成立),并在此
+    /// 留 counter + LVL_ERROR(不再静默)。
+    fn notify_failed(&self, what: &str, e: &ModelError) {
+        owl_shared::counter_inc!("srv.notify_fail");
+        self.sink.logf(
+            owl_shared::log::LVL_ERROR,
+            "srv",
+            format_args!("{what} notify 失败(回执断链): {e:?}"),
+        );
+    }
+
 
     /// srv.seg.htod 分相(与客户端同名段对账;差值 = 管道/等待)
     pub(super) fn handle_htod(&mut self, data: Vec<u8>, ack: Ack<Result<Bytes, ModelError>>) {
@@ -33,15 +47,24 @@ impl GpuServer {
                             .ptrs([ptr]),
                     );
                 }
-                // 码头随 finish 存活至搬运完成后归还池(派发线程执行)
-                let mut cb_ack = ack.take();
+                // 码头随 finish 存活至搬运完成后归还池(派发线程执行)。
+                // ack 住 cell:闭包投递与失败回执**二选一**原子成立
+                // (旧 `let mut cb_ack = ack.take()` + 错误分支 `ack.take().unwrap()`
+                //  = 必 panic;2026-10-15 审查定谳)
+                let ack_cell = std::sync::Arc::new(std::sync::Mutex::new(ack.take()));
                 let pool = self.pool.clone();
+                let cell = ack_cell.clone();
                 let finish: Finish = Box::new(move || {
                     pool.put(buf);
-                    cb_ack.take().unwrap().send(Ok(Bytes::new(id, n)));
+                    if let Some(a) = cell.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                        a.send(Ok(Bytes::new(id, n)));
+                    }
                 });
                 if let Err(e) = self.notify(&stream, finish) {
-                    ack.take().unwrap().send(Err(e));
+                    if let Some(a) = ack_cell.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                        a.send(Err(e.clone()));
+                    }
+                    self.notify_failed("htod", &e);
                 }
             }
             Err(e) => ack.take().unwrap().send(Err(e)),
@@ -239,18 +262,25 @@ impl GpuServer {
             }
             pending.push(staging);
         }
-        // 单 notify:全部写到位后一次性回执(保序 = H2D 流序)
-        let mut cb_ack = ack.take();
+        // 单 notify:全部写到位后一次性回执(保序 = H2D 流序)。
+        // ⚠️ 旧实现在此 **`let _ = e;`** —— ack 已随闭包移交 ⇒ 客户端 future
+        // **永远 pending**(无 panic、无日志)。现统一走 cell + 留痕。
+        let ack_cell = std::sync::Arc::new(std::sync::Mutex::new(ack.take()));
         let pool = self.pool.clone();
+        let cell = ack_cell.clone();
         let finish: Finish = Box::new(move || {
             for b in pending {
                 pool.put(b);
             }
-            cb_ack.take().unwrap().send(Ok(()));
+            if let Some(a) = cell.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                a.send(Ok(()));
+            }
         });
         if let Err(e) = self.notify(&stream, finish) {
-            // notify 失败 = 断链(ack 已随闭包移交;与 handle_htod_chunk 同语义)
-            let _ = e;
+            if let Some(a) = ack_cell.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                a.send(Err(e.clone()));
+            }
+            self.notify_failed("htod_chunks", &e);
         }
     }
 
@@ -305,15 +335,22 @@ impl GpuServer {
             }
         })
         .err();
-        // 码头随 finish 存活至搬运完成后归还池(派发线程执行)
-        let mut cb_ack = ack.take();
+        // 码头随 finish 存活至搬运完成后归还池(派发线程执行);ack 住 cell
+        // (同上:旧 `ack.take().unwrap()` 在 notify 失败路径必 panic)
+        let ack_cell = std::sync::Arc::new(std::sync::Mutex::new(ack.take()));
         let pool = self.pool.clone();
+        let cell = ack_cell.clone();
         let finish: Finish = Box::new(move || {
             pool.put(staging);
-            cb_ack.take().unwrap().send(Ok(()));
+            if let Some(a) = cell.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                a.send(Ok(()));
+            }
         });
         if let Err(e) = self.notify(&stream, finish) {
-            ack.take().unwrap().send(Err(e));
+            if let Some(a) = ack_cell.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                a.send(Err(e.clone()));
+            }
+            self.notify_failed("htod_chunk", &e);
         }
     }
 
@@ -345,7 +382,7 @@ impl GpuServer {
         // 一个事件,D2H 流 wait 它 ⇒ 拷贝必然排在“本 dtoh 之前已入队”的全部产出
         // 核之后 —— **保序强度与整流 sync 同源**(事件记在尾上 = 等它 = 等此前全部),
         // 但服务端不等,后续命令照跑。
-        // `diag.legacy_sync`(全同步归因档)= 退回整流 sync(A/B 与回退)。
+        // `sync_bit::DTOH`(全同步归因档的 dtoh 半边)= 退回整流 sync(A/B 与回退)。
         let compute = match self.ctx().stream(STREAM_COMPUTE) {
             Ok(s) => s.clone(),
             Err(e) => return ack.send(Err(e)),
@@ -386,17 +423,23 @@ impl GpuServer {
                 if let Some(t) = t_d2h2 {
                     self.sink.logf(owl_shared::log::LVL_DEBUG, "d2h-prof", format_args!("issue={:?}", t.elapsed()));
                 }
-                // 完成 → 码头字节直出(传输面字节口径)→ 回执 → 码头归还池
-                let mut cb_ack = ack.take();
+                // 完成 → 码头字节直出(传输面字节口径)→ 回执 → 码头归还池;ack 住 cell
+                let ack_cell = std::sync::Arc::new(std::sync::Mutex::new(ack.take()));
                 let pool = self.pool.clone();
+                let cell = ack_cell.clone();
                 // 字节口径 = want_bytes(池码头容量 ≥ n,直出整段会超发)
                 let finish: Finish = Box::new(move || {
                     let bytes = staging.as_bytes()[..want_bytes].to_vec();
                     pool.put(staging);
-                    cb_ack.take().unwrap().send(Ok(bytes));
+                    if let Some(a) = cell.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                        a.send(Ok(bytes));
+                    }
                 });
                 if let Err(e) = self.notify(&stream, finish) {
-                    ack.take().unwrap().send(Err(e));
+                    if let Some(a) = ack_cell.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                        a.send(Err(e.clone()));
+                    }
+                    self.notify_failed("dtoh", &e);
                 }
             }
             Err(e) => ack.take().unwrap().send(Err(e)),

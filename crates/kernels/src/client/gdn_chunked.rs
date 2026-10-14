@@ -120,8 +120,11 @@ impl GdnChunkedCall {
         ]
     }
 
-    /// 反序列化唯一点:server 面从此读(错位/错数 = 结构化 Err,
-    /// 不再按数量盲切)。out = 解释器追加的输出块(O 槽,第 7 块)。
+    /// 反序列化唯一点:server 面从此读。**现状诚实边界**(2026-10-15 审查补正):
+    /// 实现 = **按位置切片 + 个数断言**(`blocks.len() != 7` / `scalars.len() != 6`)
+    /// ⇒ **同型槽错位不报错**(第二份槽序语义的已知缺口;双锁见
+    /// `ops::tests::slot_order_lock_family_ops`,按名取址待办)。
+    /// out = 解释器追加的输出块(O 槽,第 7 块)。
     /// BlockSlice 仅认零偏移(eval slice_view(0,..) 合法产物;非零偏移
     /// 本面不适用 —— 与 gdn_scalar 面同一口径,2026-10-12 review I-6 统一)。
     pub fn parse(msg: &LaunchMsg) -> Result<(Self, Bytes), OpError> {

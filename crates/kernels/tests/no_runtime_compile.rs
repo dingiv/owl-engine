@@ -17,26 +17,33 @@
 
 use std::path::{Path, PathBuf};
 
-/// 生产源根(相对 workspace 根);按此顺序扫描
-const ROOTS: &[&str] = &["crates", "apps"];
+/// 生产源根(相对 workspace 根);按此顺序扫描。
+///
+/// ⚠️ **新增顶层代码根必须登记在此**(2026-10-15 审查补):旧实现只扫
+/// `crates`/`apps` ⇒ 新加的顶层 crate(如 `tools/`)自动落在门外面。
+/// 配套自检见 `production_paths_never_compile_cuda_at_runtime` 的 ROOTS 覆盖断言。
+const ROOTS: &[&str] = &["crates", "apps", "tools"];
 
 /// 禁词(生产路径出现即红)
+///
+/// ⚠️ **不再有"白名单短路"**(2026-10-15 审查定谳):旧实现先查白名单
+/// (`Ptx::from_binary` / `PtxKind`)再查禁词 ⇒ 一行**同时**含两者即被豁免
+/// (`let p = Ptx::from_binary(compile_ptx(..)?)` 这类组合),等于一行级绕过。
+/// 现在:禁词命中即报 —— 白名单本就多余(`Ptx::from_binary` 不含任何禁词),
+/// 它唯一的实际效果就是开这个口子。
 fn banned(line: &str) -> Option<&'static str> {
-    // 白名单:纯数据类型包装(不含编译语义)
-    if line.contains("Ptx::from_binary") || line.contains("PtxKind") {
-        return None;
-    }
-    [
-        "compile_ptx",
-        "nvrtcCompileProgram",
-        "CompileOptions",
-        "nvrtcCreateProgram",
-        "nvrtcGetCUBIN",
-        "nvrtcGetPTX",
-    ]
-    .into_iter()
-    .find(|pat| line.contains(pat))
+    BANNED.iter().copied().find(|pat| line.contains(pat))
 }
+
+/// 禁词表(生产路径出现即红)
+const BANNED: &[&str] = &[
+    "compile_ptx",
+    "nvrtcCompileProgram",
+    "CompileOptions",
+    "nvrtcCreateProgram",
+    "nvrtcGetCUBIN",
+    "nvrtcGetPTX",
+];
 
 /// 递归收集 `*.rs`(跳过 `tests/`、`examples/`、`benches/`、`target/`)
 fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -63,6 +70,18 @@ fn production_paths_never_compile_cuda_at_runtime() {
         .and_then(|p| p.parent())
         .expect("workspace 根")
         .to_path_buf();
+    // 自检:顶层任何带 Cargo.toml 的目录都必须在 ROOTS 里(否则门自动失明)
+    for e in std::fs::read_dir(&root).expect("读 workspace 根").flatten() {
+        let p = e.path();
+        if !p.is_dir() || !p.join("Cargo.toml").is_file() {
+            continue;
+        }
+        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        assert!(
+            ROOTS.contains(&name),
+            "顶层代码根 {name}/ 不在 ROOTS ⇒ 零运行期编译门对它失明(请登记)"
+        );
+    }
     let mut files = Vec::new();
     for r in ROOTS {
         collect(&root.join(r), &mut files);
@@ -102,4 +121,10 @@ fn banned_matcher_is_sensitive() {
     // 合法用法不得误伤
     assert_eq!(banned("ctx.load_module(Ptx::from_binary(bytes.to_vec()))"), None);
     assert_eq!(banned("// cubin 载入走 driver API,零编译"), None);
+    // **混合行必报**(旧白名单短路的绕过口;2026-10-15 审查定谳)
+    assert_eq!(
+        banned("let p = Ptx::from_binary(compile_ptx(src, opts)?);"),
+        Some("compile_ptx"),
+        "一行同时含白名单词与禁词时不得被豁免"
+    );
 }

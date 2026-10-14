@@ -393,7 +393,9 @@ impl KernelFamily for GdnChunkedRuntime {
         cast_exec(res, exec, &f16bf16, v_p, t * hv * vd, in_v)?;
         cast_exec(res, exec, &f16bf16, beta_p, t * hv, in_beta)?;
         cast_exec(res, exec, &f16f32, g_p, t * hv, in_g)?;
-        let diag = diag_on() && st.diag_calls < 48;
+        // 捕获期禁入(2026-10-15 审查补):diag 走 sync + download,
+        // 两者在 CUDA stream capture 窗内均非法(见 DeviceRes::download 守卫)
+        let diag = diag_on() && st.diag_calls < 48 && !res.capturing().unwrap_or(false);
         let diag_tag = if diag {
             st.diag_calls += 1;
             format!(

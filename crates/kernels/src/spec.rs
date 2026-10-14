@@ -22,7 +22,7 @@
 //!
 //! # 与既有资产的关系
 //!
-//! - 登记表([`crate::list`])对**已建表**的算子退化为"名字 → 源"的兜底,
+//! - **登记表已退役**(F 轮):声明面是唯一真源,未建表 = 仅引入(无准入声明),
 //!   槽序/源码改从本模块的元数据取(未建表的旧入口继续走登记表字符串);
 //! - [`crate::driver`] 的 `KernelPick` 携带 `&'static KernelMeta`(算子身份),
 //!   不再携带裸名字字符串。
@@ -522,7 +522,7 @@ pub const fn meta_of<T: KernelSpec>() -> KernelMeta {
 
 /// 擦除后的算子元数据(纯数据;可在 `static` 表里 const 构造)
 pub struct KernelMeta {
-    /// **执行家族**(`names::NATIVE` = 原生 AOT 直发;否则 = 族 id)
+    /// **执行家族**(`spec::NATIVE` = 原生 AOT 直发;否则 = 族 id)
     pub family: OpId,
     pub entry: &'static str,
     pub src: &'static str,
@@ -566,7 +566,7 @@ impl KernelMeta {
 
     /// **声明口径 dtype** = 输出槽的元素类型(F 轮:原登记表 `Entry.dtype`
     /// 的唯一信息,现由声明面派生 —— 每张 native 表都有输出槽,由
-    /// `op_tables` 的「O 槽必须是指针位」门与 `list::tests` 的
+    /// `op_tables` 的「O 槽必须是指针位」门与 `ops::tests` 的
     /// `every_native_table_declares_out_dtype` 保证)。
     ///
     /// `None` = 无输出槽(部分 foreign 虚拟核)。调用方按需降级。

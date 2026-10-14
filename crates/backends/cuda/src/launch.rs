@@ -53,6 +53,21 @@ pub(super) fn issue_launch(
                         slots.len()
                     ))
                 })?;
+                // **切片偏移越界门(2026-10-15 审查补)**:`p + byte_offset` 一旦超尾,
+                // 核内访存即落**邻块**(设备内无保护)。此处只抓粗错(对齐另需
+                // 声明面加 `Param.offset_align`)。
+                let blen = ctx.block_len(*id).map_err(|e| {
+                    ModelError::Msg(format!(
+                        "[launch-arg] kernel={} slice id={id} :: {e}",
+                        msg.kernel.name
+                    ))
+                })?;
+                if *byte_offset > blen as u64 {
+                    return Err(ModelError::Msg(format!(
+                        "[launch-arg] kernel={} slice id={id} 越界:byte_offset={} > block_len={blen}",
+                        msg.kernel.name, byte_offset
+                    )));
+                }
                 slots.push(Slot::Ptr(p + byte_offset));
             }
             Arg::U64(v) => slots.push(Slot::U(*v)),

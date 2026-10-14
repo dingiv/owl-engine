@@ -23,12 +23,10 @@ pub struct DiagOpts {
     pub launch_sync: bool,
     /// 旁路事件钉序(原 OWL_FREE_LEGACY;崩坏案 A/B 判别)
     pub free_legacy: bool,
-    /// **全同步归因档**(回退档, 2026-10-14 P1′-laneC):true = 块回收栅栏退回
-    /// 「任一 Owned 块即发栅栏 + 恒等 H2D/D2H」(旧语义),且 dtoh 退回整流
-    /// `STREAM_COMPUTE.synchronize()`。默认 false = 新语义(按块定向栅栏 /
-    /// dtoh 事件定向等待)。用作性能 A/B 与出事回退。
-    /// 由 `cuda.launch_sync` 携带(该档本就是“全同步归因”、性能杀手勿常开)。
-    pub legacy_sync: bool,
+    // (原 `legacy_sync` 字段已删,2026-10-15):它的两个消费者早已各自改成
+    // **按位判定** —— dtoh 走 `sync_at(DTOH)`(harvest.rs),回收栅栏走
+    // `sync_at(FENCE)`(fence_targets)⇒ 字段只剩派生式没有读者。留着会让
+    // 审查者以为 "单开 bit1 会连带改 fence 语义"(实测不成立),故删。
     /// **同步点分解掩码**(2026-10-15):6 处同步点逐位开关,见
     /// [`owl_shared::config::sync_bit`]。`launch_sync = true` ⇒ `ALL`。
     /// 归因用:先看哪一位单独就能把病臂治好,再谈修法(靶子 = +17%)。
@@ -71,7 +69,6 @@ impl DiagOpts {
             cap_prof: c.cap_prof,
             launch_sync: mask & (sync_bit::ALLOC | sync_bit::LAUNCH) != 0,
             free_legacy: c.free_legacy,
-            legacy_sync: mask & (sync_bit::DTOH | sync_bit::FENCE) != 0,
             sync_mask: mask,
             launch_time: c.launch_time,
             d2h_prof: c.d2h_prof,
@@ -699,7 +696,7 @@ impl GpuCtx {
         }
         let used = cap.used.div_ceil(CARVE_ALIGN) * CARVE_ALIGN;
         let slab_cap = cap.cap;
-        if used + n > slab_cap {
+        if !range_fits(slab_cap, used, n) {
             return Err(ModelError::Msg(format!(
                 "捕获 slab 耗尽:已用 {used} + 对齐后需 {n} > {slab_cap}(warmup 计量失准或 OWL_CAPTURE_SLAB_MB 固定档过小)"
             )));
@@ -873,7 +870,7 @@ impl GpuCtx {
 
     /// 回收栅栏的目标流(去重;2026-10-14 定向化):
     /// - 默认(新语义):只有**分配流 ≠ COMPUTE** 的 Owned 块需要钉序;
-    /// - `diag.legacy_sync`(全同步归因档):任一 Owned 块 ⇒ H2D + D2H 都等(旧行为)。
+    /// - `sync_bit::FENCE`(旧行为):任一 Owned 块 ⇒ H2D + D2H 都等。
     fn fence_targets(&self, ids: &[u64]) -> Vec<Arc<CudaStream>> {
         let mut out: Vec<Arc<CudaStream>> = Vec::new();
         let compute = self.streams.get(&STREAM_COMPUTE);

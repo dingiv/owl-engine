@@ -3,8 +3,8 @@
 //! 这里住的 = **单算子的声明式契约**(`impl KernelSpec`),按 driver 的域
 //! 分模块排布(`ops::attn` ↔ `driver::attn`,依此类推)。**只给生产在用的
 //! 算子建表**(审查依据见 `docs/arch/kernel-准入门槛-施工设计.md` §十四):
-//! 未建表的入口继续走 [`crate::list`] 登记表(名字 → 源 + 手写槽序串),
-//! 保持"仅引入"状态 —— 物理上仍可发射,但没有准入声明。
+//! **未建表的入口 = "仅引入"**(登记表 F 轮已退役):物理上仍可发射,但没有
+//! 准入声明 ⇒ 名字路由/白名单/池审计都看不到它(boot 报告会列"编出但未声明")。
 //!
 //! # 为什么这些声明**不在** `server/` 下(与设计稿 §2.1 的一处偏离)
 //!
@@ -86,7 +86,7 @@ pub fn meta(name: &str) -> Option<&'static KernelMeta> {
 
 /// **按入口名取 `.cu` 源码**(自托管的唯一读取口;探针 / 服务端装配面用)。
 ///
-/// 解析序(**单一实现**住本函数,`list::source` 只是兼容转发):
+/// 解析序(**单一实现**住本函数;旧 `list::source` 兼容面已随登记表退役):
 /// 1. **已建表** ⇒ `KernelMeta::SOURCE`(就地 `include_str!`,R5 —— 算子
 ///    自托管面是它的唯一住址);
 ///
@@ -586,20 +586,23 @@ mod tests {
     /// 覆盖率门:锁表必须恰好覆盖全部族算子(一个不漏、一个不多)。
     #[test]
     fn slot_order_lock_family_ops() {
-        const EXPECT: &[(&str, &[&str])] = &[
-            (crate::family::gdn_chunked::GDN_CHUNKED_FWD, &["q", "k", "v", "beta", "gate", "state", "out", "t", "slot", "nv", "nk", "kd", "scale_bits"]),
-            (crate::family::gdn_scalar::GDN_SCALAR_FWD, &["q", "k", "v", "beta", "gate", "state", "out", "t", "slot", "nv", "nk", "kd", "vd", "scale_bits"]),
-            (crate::family::marlin::GEMM_W4A16_AWQ, &["a", "b", "out", "scales", "zeros", "ws", "c_tmp", "m", "k", "n", "groupsize"]),
-            (crate::family::marlin::GEMM_W4A16_BF16, &["a", "b", "out", "scales", "ws", "c_tmp", "m", "k", "n", "groupsize"]),
-            (crate::family::marlin::GEMM_W4A16, &["a", "b", "out", "scales", "ws", "c_tmp", "m", "k", "n", "groupsize"]),
-            (crate::family::cublas::GEMM_F16, &["a", "b", "out", "m", "k", "n", "nt"]),
-            (crate::family::cublas::GEMM_BF16, &["a", "b", "out", "m", "k", "n", "nt"]),
-            (crate::family::flashinfer::PREFILL_FI_FP8KV, &["q", "k_cache", "v_cache", "q_cu", "indices", "indptr", "last_len", "wr", "out", "total_rows", "ctx_total", "t", "hq", "hkv", "hd", "page", "sm_scale_bits"]),
-            (crate::family::flashinfer::PREFILL_FI, &["q", "k_cache", "v_cache", "q_cu", "indices", "indptr", "last_len", "wr", "out", "total_rows", "ctx_total", "t", "hq", "hkv", "hd", "page", "sm_scale_bits"]),
-            (crate::family::xqa::VERIFY_XQA, &["q", "k_cache", "v_cache", "page_table", "seq_lens", "mask", "semaphores", "scratch", "wr", "out", "q_seq_len", "hkv", "hd", "page", "max_seq_len", "q_scale_bits", "sm_count", "stride_page", "stride_token", "stride_head"]),
-            (crate::family::xqa::DECODE_XQA, &["q", "k_cache", "v_cache", "page_table", "seq_lens", "mask", "semaphores", "scratch", "wr", "out", "q_seq_len", "hkv", "hd", "page", "max_seq_len", "q_scale_bits", "sm_count", "stride_page", "stride_token", "stride_head"]),
+        // (族身份常量, 槽名序列, 类型签名序列)。**两把锁一起**:名字序列防
+        // 同型槽对调,类型签名防 dtype/rank 漂移(F16→BF16 / rank3→rank4 ——
+        // 只锁名字时这两类变更**不触发任何门**;2026-10-15 审查定谳)。
+        const EXPECT: &[(&str, &[&str], &[&str])] = &[
+            (crate::family::gdn_chunked::GDN_CHUNKED_FWD, &["q", "k", "v", "beta", "gate", "state", "out", "t", "slot", "nv", "nk", "kd", "scale_bits"], &["F16x3", "F16x3", "F16x3", "F16x3", "F16x3", "F32x4", "F16x3", "U64", "U64", "U64", "U64", "U64", "F32Bits"]),
+            (crate::family::gdn_scalar::GDN_SCALAR_FWD, &["q", "k", "v", "beta", "gate", "state", "out", "t", "slot", "nv", "nk", "kd", "vd", "scale_bits"], &["F16x3", "F16x3", "F16x3", "F16x3", "F16x3", "F32x4", "F16x3", "U64", "U64", "U64", "U64", "U64", "U64", "F32Bits"]),
+            (crate::family::marlin::GEMM_W4A16_AWQ, &["a", "b", "out", "scales", "zeros", "ws", "c_tmp", "m", "k", "n", "groupsize"], &["F16x2", "U32x2", "F16x2", "F16x2", "U32x2", "U32x1", "U32x1", "U64", "U64", "U64", "U64"]),
+            (crate::family::marlin::GEMM_W4A16_BF16, &["a", "b", "out", "scales", "ws", "c_tmp", "m", "k", "n", "groupsize"], &["BF16x2", "U32x2", "BF16x2", "F16x2", "U32x1", "U32x1", "U64", "U64", "U64", "U64"]),
+            (crate::family::marlin::GEMM_W4A16, &["a", "b", "out", "scales", "ws", "c_tmp", "m", "k", "n", "groupsize"], &["F16x2", "U32x2", "F16x2", "F16x2", "U32x1", "U32x1", "U64", "U64", "U64", "U64"]),
+            (crate::family::cublas::GEMM_F16, &["a", "b", "out", "m", "k", "n", "nt"], &["F16x2", "F16x2", "F16x2", "U64", "U64", "U64", "U64"]),
+            (crate::family::cublas::GEMM_BF16, &["a", "b", "out", "m", "k", "n", "nt"], &["BF16x2", "BF16x2", "BF16x2", "U64", "U64", "U64", "U64"]),
+            (crate::family::flashinfer::PREFILL_FI_FP8KV, &["q", "k_cache", "v_cache", "q_cu", "indices", "indptr", "last_len", "wr", "out", "total_rows", "ctx_total", "t", "hq", "hkv", "hd", "page", "sm_scale_bits"], &["F16x2", "U8x4", "U8x4", "U32x1", "U32x1", "U32x1", "U32x1", "U8x1", "F16x2", "U64", "U64", "U64", "U64", "U64", "U64", "U64", "F32Bits"]),
+            (crate::family::flashinfer::PREFILL_FI, &["q", "k_cache", "v_cache", "q_cu", "indices", "indptr", "last_len", "wr", "out", "total_rows", "ctx_total", "t", "hq", "hkv", "hd", "page", "sm_scale_bits"], &["F16x2", "F16x4", "F16x4", "U32x1", "U32x1", "U32x1", "U32x1", "U8x1", "F16x2", "U64", "U64", "U64", "U64", "U64", "U64", "U64", "F32Bits"]),
+            (crate::family::xqa::VERIFY_XQA, &["q", "k_cache", "v_cache", "page_table", "seq_lens", "mask", "semaphores", "scratch", "wr", "out", "q_seq_len", "hkv", "hd", "page", "max_seq_len", "q_scale_bits", "sm_count", "stride_page", "stride_token", "stride_head"], &["F16x2", "U8x4", "U8x4", "U32x2", "U32x1", "U32x1", "U32x1", "U8x1", "U8x1", "F16x2", "U64", "U64", "U64", "U64", "U64", "F32Bits", "U64", "U64", "U64", "U64"]),
+            (crate::family::xqa::DECODE_XQA, &["q", "k_cache", "v_cache", "page_table", "seq_lens", "mask", "semaphores", "scratch", "wr", "out", "q_seq_len", "hkv", "hd", "page", "max_seq_len", "q_scale_bits", "sm_count", "stride_page", "stride_token", "stride_head"], &["F16x2", "U8x4", "U8x4", "U32x2", "U32x1", "U32x1", "U32x1", "U8x1", "U8x1", "F16x2", "U64", "U64", "U64", "U64", "U64", "F32Bits", "U64", "U64", "U64", "U64"]),
         ];
-        for (entry, want) in EXPECT {
+        for (entry, want, want_ty) in EXPECT {
             let m = meta(entry).unwrap_or_else(|| panic!("锁表项 {entry} 不在声明表里"));
             assert_eq!(
                 m.param_names(),
@@ -607,12 +610,26 @@ mod tests {
                 "{entry}: 槽序变了 —— 请同步审 client/<族> 的 parse 与 ins_args/scalar_args \
                  (同类型槽对调 = L3 放行 + 解析器静默错值)"
             );
+            let got_ty: Vec<String> = m
+                .params
+                .iter()
+                .map(|p| match p.ty {
+                    crate::spec::ParamType::Tensor { dtype, rank } => format!("{dtype:?}x{rank}"),
+                    crate::spec::ParamType::Scalar(s) => format!("{s:?}"),
+                })
+                .collect();
+            assert_eq!(
+                got_ty,
+                *want_ty,
+                "{entry}: 类型签名变了(dtype/rank)—— 名字锁拦不住这类漂移;\
+                 请同步审各族 handler 的 dtype 假设与 client face 的 builder"
+            );
         }
         // 覆盖率门:族算子一个不漏
         let fam: Vec<&str> = all().filter(|m| m.is_family()).map(|m| m.entry).collect();
         assert_eq!(fam.len(), EXPECT.len(), "族算子清单与锁表项数不一致:{fam:?}");
         for e in &fam {
-            assert!(EXPECT.iter().any(|(k, _)| k == e), "族算子 {e} 未进锁表");
+            assert!(EXPECT.iter().any(|(k, _, _)| k == e), "族算子 {e} 未进锁表");
         }
         // 前置件自检:**按名寻址**可用(未来 parse/builder 按名取槽的基础)
         let g = meta("gdn_chunked_delta_rule_fwd").expect("gdn chunked");

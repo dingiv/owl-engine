@@ -71,7 +71,9 @@ pub fn params_at(text: &str, start: usize, name: &str, kind: &str) -> Option<Str
     Some(map_params(&text[start..end], name, kind))
 }
 
-// FIXME: 移除一个无用的函数
+// ⚠️ **不是死代码,勿删**(2026-10-15 审查定谳):`parse_cu_sig` 是**唯一**的
+// `.cu` 形参解析器 —— `tests/op_tables.rs` 的"声明表 ⇔ 签名"互证门靠它,
+// `models::kernel` 也再导出它。删掉 = 互证门失明(原 FIXME 误导已撤)。
 pub fn parse_cu_sig(src: &str, name: &str) -> Option<String> {
     // 剥行注释(形参注记含逗号/括号,会干扰边界与切分)+ **折叠宏续行**
     // (`\` + 换行 → 空格:宏体形参住在续行里,不折叠则形参串被反斜杠污染)
