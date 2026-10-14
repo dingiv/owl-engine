@@ -137,7 +137,7 @@ impl KernelSpec for RmsnormF32 {
     const SRC: &'static str = "cu/ln/rmsnorm.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::F32, 2),
-        Param::t_in("alpha", Dtype::F32, 2),
+        Param::t_in("alpha", Dtype::F32, 1),
         Param::t_out("out", Dtype::F32, 2),
         Param::i32("n"),
         Param::f32("eps"),

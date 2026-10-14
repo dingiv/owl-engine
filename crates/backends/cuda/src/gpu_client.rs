@@ -188,12 +188,19 @@ impl DeviceClient for GpuClient {
 
     async fn alloc(&mut self, dtype: Dtype, elems: usize) -> Result<Bytes, ModelError> {
         let n_bytes = elems * dtype.size_bytes();
-        self.submit(move |ack| Command::Alloc { n_bytes, elems, zero: true, ack })?.await
+        // 事实面:句柄自带 dtype(阶数未定形 = 0,由调用点 `view` 或张量视图定)
+        let mut b = self.submit(move |ack| Command::Alloc { n_bytes, elems, zero: true, ack })?.await?;
+        b.dtype = dtype;
+        b.rank = 0;
+        Ok(b)
     }
 
     async fn alloc_uninit(&mut self, dtype: Dtype, elems: usize) -> Result<Bytes, ModelError> {
         let n_bytes = elems * dtype.size_bytes();
-        self.submit(move |ack| Command::Alloc { n_bytes, elems, zero: false, ack })?.await
+        let mut b = self.submit(move |ack| Command::Alloc { n_bytes, elems, zero: false, ack })?.await?;
+        b.dtype = dtype;
+        b.rank = 0;
+        Ok(b)
     }
 
     async fn alloc_pinned(
@@ -340,7 +347,10 @@ impl DeviceClient for GpuClient {
         let mut b = self
             .submit(move |ack| Command::Htod { data: src.to_vec(), ack })?
             .await?;
+        // 事实面定形:服务端只回句柄(U8/未定形),dtype + 阶数由本面按 (dtype, shape) 回填
         b.len = elems;
+        b.dtype = dtype;
+        b.rank = shape.len() as u8;
         Ok(b)
     }
 

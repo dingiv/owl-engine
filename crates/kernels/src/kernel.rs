@@ -81,6 +81,12 @@ impl Kernel {
         );
         self.sig.split(',').collect()
     }
+
+    /// 槽的事实来源(父张量 / 输出 / 标量)—— 与 `lower_kernel` 的装配序
+    /// **单源**(同一条 token 规则,声明面与逃生舱签名共用;2026-10-15)。
+    pub fn slot_sources(&self) -> Vec<crate::spec::SlotSrc> {
+        crate::spec::slot_sources_of_tokens(&self.slot_tokens())
+    }
 }
 
 /// **算子准入查询**(原"登记表查名字"入口;F 轮 2026-10-13 起**唯一真源

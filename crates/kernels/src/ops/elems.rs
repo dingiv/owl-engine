@@ -49,9 +49,9 @@ impl KernelSpec for AddF16 {
     const ENTRY: &'static str = "owl_add_f16";
     const SRC: &'static str = "cu/elems/add.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("a", Dtype::F16, 1),
-        Param::t_in("b", Dtype::F16, 1),
-        Param::t_out("out", Dtype::F16, 1),
+        Param::t_in("a", Dtype::F16, 0),
+        Param::t_in("b", Dtype::F16, 0),
+        Param::t_out("out", Dtype::F16, 0),
         Param::sz("n"),
     ];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
@@ -66,9 +66,9 @@ impl KernelSpec for AddBf16 {
     const ENTRY: &'static str = "owl_add_bf16";
     const SRC: &'static str = "cu/elems/add.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("a", Dtype::BF16, 1),
-        Param::t_in("b", Dtype::BF16, 1),
-        Param::t_out("out", Dtype::BF16, 1),
+        Param::t_in("a", Dtype::BF16, 0),
+        Param::t_in("b", Dtype::BF16, 0),
+        Param::t_out("out", Dtype::BF16, 0),
         Param::sz("n"),
     ];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
@@ -83,8 +83,8 @@ impl KernelSpec for SigmoidF16 {
     const ENTRY: &'static str = "owl_sigmoid_f16";
     const SRC: &'static str = "cu/elems/sigmoid.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("x", Dtype::F16, 1),
-        Param::t_out("out", Dtype::F16, 1),
+        Param::t_in("x", Dtype::F16, 0),
+        Param::t_out("out", Dtype::F16, 0),
         Param::sz("n"),
     ];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
@@ -99,10 +99,10 @@ impl KernelSpec for SigmoidGateMulF16 {
     const ENTRY: &'static str = "owl_sigmoid_gate_mul_f16";
     const SRC: &'static str = "cu/elems/sigmoid_gate_mul_f16.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("gate", Dtype::F16, 1),
-        Param::t_in("x", Dtype::F16, 1),
+        Param::t_in("gate", Dtype::F16, 0),
+        Param::t_in("x", Dtype::F16, 0),
         Param::sz("n"),
-        Param::t_out("out", Dtype::F16, 1),
+        Param::t_out("out", Dtype::F16, 0),
     ];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -116,9 +116,9 @@ impl KernelSpec for CastF16Bf16 {
     const ENTRY: &'static str = "owl_cast_f16_bf16";
     const SRC: &'static str = "cu/elems/cast.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("x", Dtype::F16, 1),
+        Param::t_in("x", Dtype::F16, 0),
         Param::i32("n"),
-        Param::t_out("out", Dtype::BF16, 1),
+        Param::t_out("out", Dtype::BF16, 0),
     ];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -132,9 +132,9 @@ impl KernelSpec for CastBf16F16 {
     const ENTRY: &'static str = "owl_cast_bf16_f16";
     const SRC: &'static str = "cu/elems/cast.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("x", Dtype::BF16, 1),
+        Param::t_in("x", Dtype::BF16, 0),
         Param::i32("n"),
-        Param::t_out("out", Dtype::F16, 1),
+        Param::t_out("out", Dtype::F16, 0),
     ];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -148,14 +148,14 @@ impl KernelSpec for ConcatRowsF16 {
     const ENTRY: &'static str = "owl_concat_rows_f16";
     const SRC: &'static str = "cu/elems/concat.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("i0", Dtype::F16, 2),
-        Param::t_in("i1", Dtype::F16, 2),
-        Param::t_in("i2", Dtype::F16, 2),
-        Param::t_in("i3", Dtype::F16, 2),
-        Param::t_in("i4", Dtype::F16, 2),
-        Param::t_in("i5", Dtype::F16, 2),
-        Param::t_in("i6", Dtype::F16, 2),
-        Param::t_in("i7", Dtype::F16, 2),
+        Param::t_in("i0", Dtype::F16, 0),
+        Param::t_in("i1", Dtype::F16, 0),
+        Param::t_in("i2", Dtype::F16, 0),
+        Param::t_in("i3", Dtype::F16, 0),
+        Param::t_in("i4", Dtype::F16, 0),
+        Param::t_in("i5", Dtype::F16, 0),
+        Param::t_in("i6", Dtype::F16, 0),
+        Param::t_in("i7", Dtype::F16, 0),
         Param::sz("n"),
         Param::sz("r"),
         Param::sz("d"),
@@ -173,14 +173,14 @@ impl KernelSpec for ConcatRowsF32 {
     const ENTRY: &'static str = "owl_concat_rows_f32";
     const SRC: &'static str = "cu/elems/concat.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("i0", Dtype::F32, 2),
-        Param::t_in("i1", Dtype::F32, 2),
-        Param::t_in("i2", Dtype::F32, 2),
-        Param::t_in("i3", Dtype::F32, 2),
-        Param::t_in("i4", Dtype::F32, 2),
-        Param::t_in("i5", Dtype::F32, 2),
-        Param::t_in("i6", Dtype::F32, 2),
-        Param::t_in("i7", Dtype::F32, 2),
+        Param::t_in("i0", Dtype::F32, 0),
+        Param::t_in("i1", Dtype::F32, 0),
+        Param::t_in("i2", Dtype::F32, 0),
+        Param::t_in("i3", Dtype::F32, 0),
+        Param::t_in("i4", Dtype::F32, 0),
+        Param::t_in("i5", Dtype::F32, 0),
+        Param::t_in("i6", Dtype::F32, 0),
+        Param::t_in("i7", Dtype::F32, 0),
         Param::sz("n"),
         Param::sz("r"),
         Param::sz("d"),
@@ -199,7 +199,7 @@ impl KernelSpec for EmbedF16 {
     const SRC: &'static str = "cu/elems/embed_f32.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("w", Dtype::F16, 2),
-        Param::t_in("ids", Dtype::F32, 1),
+        Param::t_in("ids", Dtype::F32, 0),
         Param::sz("d_dim"),
         Param::t_out("out", Dtype::F16, 2),
     ];
@@ -215,7 +215,7 @@ impl KernelSpec for ArgmaxF32IdxF16 {
     const ENTRY: &'static str = "owl_argmax_f32idx_f16";
     const SRC: &'static str = "cu/elems/argmax_f16.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("x", Dtype::F16, 1),
+        Param::t_in("x", Dtype::F16, 0),
         Param::i32("n"),
         Param::i32("offset"),
         Param::t_out("out", Dtype::F32, 1),
@@ -313,9 +313,9 @@ impl KernelSpec for AddF32 {
     const ENTRY: &'static str = "owl_add_f32";
     const SRC: &'static str = "cu/elems/add.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("a", Dtype::F32, 2),
-        Param::t_in("b", Dtype::F32, 2),
-        Param::t_out("out", Dtype::F32, 2),
+        Param::t_in("a", Dtype::F32, 0),
+        Param::t_in("b", Dtype::F32, 0),
+        Param::t_out("out", Dtype::F32, 0),
         Param::sz("n"),
     ];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
@@ -331,9 +331,9 @@ impl KernelSpec for MulF32 {
     const ENTRY: &'static str = "owl_mul_f32";
     const SRC: &'static str = "cu/elems/mul.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("a", Dtype::F32, 2),
-        Param::t_in("b", Dtype::F32, 2),
-        Param::t_out("out", Dtype::F32, 2),
+        Param::t_in("a", Dtype::F32, 0),
+        Param::t_in("b", Dtype::F32, 0),
+        Param::t_out("out", Dtype::F32, 0),
         Param::sz("n"),
     ];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
@@ -349,9 +349,9 @@ impl KernelSpec for MulF16 {
     const ENTRY: &'static str = "owl_mul_f16";
     const SRC: &'static str = "cu/elems/mul.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("a", Dtype::F16, 2),
-        Param::t_in("b", Dtype::F16, 2),
-        Param::t_out("out", Dtype::F16, 2),
+        Param::t_in("a", Dtype::F16, 0),
+        Param::t_in("b", Dtype::F16, 0),
+        Param::t_out("out", Dtype::F16, 0),
         Param::sz("n"),
     ];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
@@ -367,9 +367,9 @@ impl KernelSpec for MulBf16 {
     const ENTRY: &'static str = "owl_mul_bf16";
     const SRC: &'static str = "cu/elems/mul.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("a", Dtype::BF16, 2),
-        Param::t_in("b", Dtype::BF16, 2),
-        Param::t_out("out", Dtype::BF16, 2),
+        Param::t_in("a", Dtype::BF16, 0),
+        Param::t_in("b", Dtype::BF16, 0),
+        Param::t_out("out", Dtype::BF16, 0),
         Param::sz("n"),
     ];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
@@ -385,8 +385,8 @@ impl KernelSpec for SigmoidF32 {
     const ENTRY: &'static str = "owl_sigmoid_f32";
     const SRC: &'static str = "cu/elems/sigmoid.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("x", Dtype::F32, 2),
-        Param::t_out("out", Dtype::F32, 2),
+        Param::t_in("x", Dtype::F32, 0),
+        Param::t_out("out", Dtype::F32, 0),
         Param::sz("n"),
     ];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
@@ -402,8 +402,8 @@ impl KernelSpec for SiluF32 {
     const ENTRY: &'static str = "owl_silu_f32";
     const SRC: &'static str = "cu/elems/silu.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("x", Dtype::F32, 2),
-        Param::t_out("out", Dtype::F32, 2),
+        Param::t_in("x", Dtype::F32, 0),
+        Param::t_out("out", Dtype::F32, 0),
         Param::sz("n"),
     ];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
@@ -419,8 +419,8 @@ impl KernelSpec for SiluF16 {
     const ENTRY: &'static str = "owl_silu_f16";
     const SRC: &'static str = "cu/elems/silu.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("x", Dtype::F16, 2),
-        Param::t_out("out", Dtype::F16, 2),
+        Param::t_in("x", Dtype::F16, 0),
+        Param::t_out("out", Dtype::F16, 0),
         Param::sz("n"),
     ];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
@@ -476,9 +476,9 @@ impl KernelSpec for CastF16F32 {
     const ENTRY: &'static str = "owl_cast_f16_f32";
     const SRC: &'static str = "cu/elems/cast.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("x", Dtype::F16, 2),
+        Param::t_in("x", Dtype::F16, 0),
         Param::i32("n"),
-        Param::t_out("out", Dtype::F32, 2),
+        Param::t_out("out", Dtype::F32, 0),
     ];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -493,9 +493,9 @@ impl KernelSpec for CastF32F16 {
     const ENTRY: &'static str = "owl_cast_f32_f16";
     const SRC: &'static str = "cu/elems/cast.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("x", Dtype::F32, 2),
+        Param::t_in("x", Dtype::F32, 0),
         Param::i32("n"),
-        Param::t_out("out", Dtype::F16, 2),
+        Param::t_out("out", Dtype::F16, 0),
     ];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -511,7 +511,7 @@ impl KernelSpec for EmbedF32 {
     const SRC: &'static str = "cu/elems/embed_f32.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("w", Dtype::F32, 2),
-        Param::t_in("ids", Dtype::F32, 2),
+        Param::t_in("ids", Dtype::F32, 0),
         Param::sz("d_dim"),
         Param::t_out("out", Dtype::F32, 2),
     ];

@@ -33,7 +33,7 @@ pub fn parse_gemm(msg: &LaunchMsg) -> Result<GemmCall, OpError> {
     let mut scalars: Vec<u64> = Vec::new();
     for a in &msg.args {
         match a {
-            Arg::Block { id } => blocks.push(BlockRef { id: *id, byte_offset: 0 }),
+            Arg::Block { id, .. } => blocks.push(BlockRef { id: *id, byte_offset: 0 }),
             Arg::BlockSlice { id, byte_offset, .. } => {
                 blocks.push(BlockRef { id: *id, byte_offset: *byte_offset })
             }

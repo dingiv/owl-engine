@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
-use owl_kernels::contract::{Bytes, OpError};
+use owl_kernels::contract::{Bytes, Dtype, OpError};
 use owl_kernels::device::{DeviceRes, Exec, LaunchNote, ScratchBuf};
 use owl_kernels::ops::oracles::{
     cublas_gemm as cb, k0_fp8_knhd as k0, nc_bf16_v2 as nc, qknorm_insert as qk,
@@ -50,9 +50,9 @@ impl DeviceRes for TestRes {
     fn stream(&self) -> Result<Arc<CudaStream>, OpError> {
         Ok(self.stream.clone())
     }
-    fn resolve(&self, b: &Bytes) -> Result<u64, OpError> {
+    fn resolve(&self, id: u64) -> Result<u64, OpError> {
         self.blocks
-            .get(&b.id)
+            .get(&id)
             .map(|s| {
                 use cudarc::driver::DevicePtr;
                 s.device_ptr(&self.stream).0
@@ -61,7 +61,7 @@ impl DeviceRes for TestRes {
                 op: "test".into(),
                 field: "resolve",
                 expect: "块在册".into(),
-                got: format!("id={}", b.id),
+                got: format!("id={}", id),
             })
     }
     fn alloc(&mut self, bytes: usize, _tag: &'static str) -> Result<ScratchBuf, OpError> {
@@ -148,7 +148,7 @@ impl DeviceRes for TestRes {
         let id = self.next;
         self.next += 1;
         self.blocks.insert(id, s);
-        Ok(owl_kernels::contract::Bytes::new(id, bytes))
+        Ok(owl_kernels::contract::Bytes::new(id, bytes, Dtype::U8, 0))
     }
     fn download(&mut self, src: u64, dst: &mut [u8]) -> Result<(), OpError> {
         use cudarc::driver::DevicePtr;

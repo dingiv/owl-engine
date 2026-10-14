@@ -22,9 +22,9 @@ impl KernelSpec for GdnChunkedDeltaRuleFwd {
         Param::t_in("q", Dtype::F16, 3),
         Param::t_in("k", Dtype::F16, 3),
         Param::t_in("v", Dtype::F16, 3),
-        Param::t_in("beta", Dtype::F16, 3),
-        // raw gate(语义律:cumsum 由 handler 内部产生,不跨面)
-        Param::t_in("gate", Dtype::F16, 3),
+        Param::t_in("beta", Dtype::F16, 2),
+        // raw gate(语义律:cumsum 由 handler 内部产生,不跨面;[T, HV] 二继)
+        Param::t_in("gate", Dtype::F16, 2),
         // GDN 状态槽 [slots, HV, KD, VD](f32)
         Param::t_inout("state", Dtype::F32, 4),
         Param::t_out("out", Dtype::F16, 3),
@@ -143,8 +143,22 @@ mod tests {
     /// 状态块 id=6;`slots` 槽数;stride = nv*kd*kd*4 = 32*128*128*4 = 2MiB
     const STRIDE: usize = 32 * 128 * 128 * 4;
 
+    /// 测试参数:事实按 PARAMS 声明填(q/k/v F16x3,beta/gate F16x2,state F32x4,out F16x3)
     fn args_with_slot(slot: u64) -> Vec<Arg> {
-        let mut v: Vec<Arg> = (1..=7u64).map(|id| Arg::Block { id }).collect();
+        let facts = [
+            (Dtype::F16, 3),
+            (Dtype::F16, 3),
+            (Dtype::F16, 3),
+            (Dtype::F16, 2),
+            (Dtype::F16, 2),
+            (Dtype::F32, 4),
+            (Dtype::F16, 3),
+        ];
+        let mut v: Vec<Arg> = facts
+            .iter()
+            .enumerate()
+            .map(|(i, (d, r))| Arg::block(i as u64 + 1, *d, *r))
+            .collect();
         for s in [512u64, slot, 32, 16, 128, 0x3f00_0000] {
             v.push(Arg::U64(s));
         }

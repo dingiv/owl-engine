@@ -108,16 +108,33 @@ pub type GraphId = u64;
 // ============================================================================
 
 /// 池块句柄:server 签发的身份证(id → server 账房 → 显存)。
+///
+/// **自描述**(2026-10-15 用户裁决):句柄自带 `dtype` + `rank` —— 它们是
+/// 客户端(SSA 图)才有的标注,随线格式发到服务端后由 L3 权威校验
+/// (客户端不再自查)。`rank = 0` = **尚未定形**(`alloc` 只知元素数、不知形状;
+/// 定形时用 [`view`](Self::view) 或直接由张量视图给 `Arg`)。
 #[derive(Clone, Debug)]
 pub struct Bytes {
     pub id: u64,
-    /// 元素数(f32)
+    /// 元素数(元素口径;`len × dtype.size_bytes()` = 字节数)
     pub len: usize,
+    pub dtype: Dtype,
+    pub rank: u8,
 }
 
 impl Bytes {
-    pub fn new(id: u64, len: usize) -> Self {
-        Self { id, len }
+    pub const fn new(id: u64, len: usize, dtype: Dtype, rank: u8) -> Self {
+        Self { id, len, dtype, rank }
+    }
+
+    /// 视图重声明(只改标注,不动 id/len):`alloc` 后按形状定形、切片重解释用。
+    pub const fn view(self, dtype: Dtype, rank: u8) -> Self {
+        Self { dtype, rank, ..self }
+    }
+
+    /// 事实面(块句柄自带的 dtype + 阶数)
+    pub const fn facts(&self) -> (Dtype, u8) {
+        (self.dtype, self.rank)
     }
 }
 
@@ -131,16 +148,54 @@ pub struct KernelSource {
 /// 发射参数槽(有序;与 kernel 签名严格对位)
 /// 类型化:标量按 kernel 形参宽度入槽(CUDA 参数空间自然对齐,
 /// 8 字节槽顶 4 字节形参会错位读参 —— 坑 I)
+///
+/// **块参携带事实面**(`dtype` + `rank`;2026-10-15 用户裁决):
+/// dtype/rank 只存在于客户端(SSA 图的标注),服务端物理上看不见 ⇒
+/// **随线格式发过去**,由服务端 L3(`spec::check_from_params`)权威校验
+/// (客户端不再自查 —— 单一咽喉,覆盖所有发射路)。
+/// `rank` = 该张量的阶数(`shape.len()`);**必填**(无"未知"档 ——
+/// 不静默)。声明侧 `rank = 0` 才是"阶数无关"的显式标记。
 #[derive(Clone, Debug)]
 pub enum Arg {
-    Block { id: u64 },
+    Block { id: u64, dtype: Dtype, rank: u8 },
     /// 刀1:块内连续切片视图(发射 ptr = block_ptr(id) + byte_offset;
     /// elems = 元素数,供 CPU 面切片与校验;kernel ABI 不感知 —— 尺寸
     /// 标量已由槽序携带)。输出槽恒为全块 Block,BlockSlice 仅入参。
-    BlockSlice { id: u64, byte_offset: u64, elems: u64 },
+    /// `dtype`/`rank` = **切片视图**的事实(与全块可能不同)。
+    BlockSlice { id: u64, byte_offset: u64, elems: u64, dtype: Dtype, rank: u8 },
     U64(u64),
     I32(i32),
     F32(f32),
+}
+
+impl Arg {
+    /// 块参(事实随行)
+    pub const fn block(id: u64, dtype: Dtype, rank: u8) -> Self {
+        Arg::Block { id, dtype, rank }
+    }
+
+    /// 切片视图(事实随行)
+    pub const fn block_slice(id: u64, byte_offset: u64, elems: u64, dtype: Dtype, rank: u8) -> Self {
+        Arg::BlockSlice { id, byte_offset, elems, dtype, rank }
+    }
+
+    /// 块参的事实面(标量槽 = `None`)—— L3 事实面的**唯一读取口**
+    pub const fn facts(&self) -> Option<(Dtype, u8)> {
+        match self {
+            Arg::Block { dtype, rank, .. } | Arg::BlockSlice { dtype, rank, .. } => {
+                Some((*dtype, *rank))
+            }
+            _ => None,
+        }
+    }
+
+    /// 块 id(标量槽 = `None`)
+    pub const fn block_id(&self) -> Option<u64> {
+        match self {
+            Arg::Block { id, .. } | Arg::BlockSlice { id, .. } => Some(*id),
+            _ => None,
+        }
+    }
 }
 
 // **族名/算子名不再集中于此**(2026-10-15 用户裁决:字面量住各族自己的定义处)。

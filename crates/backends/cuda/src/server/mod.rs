@@ -33,7 +33,7 @@ use std::sync::Arc;
 use crate::command::{Ack, Command};
 use crate::launch::issue_launch;
 use crate::state::{DeviceSelector, GpuCtx, KernelCache, Staging};
-use owl_iface::contract::{Arg, Bytes, LaunchMsg};
+use owl_iface::contract::{Arg, Bytes, Dtype, LaunchMsg};
 use crate::state::{STREAM_COMPUTE, STREAM_D2H, STREAM_H2D};
 use owl_iface::contract::ModelError;
 use std::sync::mpsc;
@@ -249,7 +249,7 @@ impl GpuServer {
                     .args
                     .iter()
                     .filter_map(|a| match a {
-                        Arg::Block { id } => Some(*id),
+                        Arg::Block { id, .. } => Some(*id),
                         Arg::BlockSlice { id, .. } => Some(*id),
                         _ => None,
                     })
@@ -261,7 +261,7 @@ impl GpuServer {
                     .iter()
                     .rev()
                     .find_map(|a| match a {
-                        Arg::Block { id } => Some(*id),
+                        Arg::Block { id, .. } => Some(*id),
                         Arg::BlockSlice { id, .. } => Some(*id),
                         _ => None,
                     })
@@ -729,7 +729,8 @@ impl GpuServer {
                     unsafe { memset_d8_async(dptr, 0, n_bytes, stream.cu_stream()) }
                         .map_err(|e| ModelError::Msg(format!("carve memset: {e:?}")))?;
                 }
-                Ok(Bytes::new(id, elems))
+                // 句柄占位(事实面由客户端 `alloc(dtype, elems)` 侧定形)
+                Ok(Bytes::new(id, elems, Dtype::U8, 0))
             })();
             return ack.send(result);
         }
@@ -764,7 +765,8 @@ impl GpuServer {
                 // 发射账:**分配落定**记 id + 设备地址(trace 条目 alloc 本身
                 // 无 id —— 生命周期判据要它才能把地址钉到块上)
                 self.trace_alloc_done(id);
-                Ok(Bytes::new(id, elems))
+                // 句柄占位(事实面由客户端 `alloc(dtype, elems)` 侧定形)
+                Ok(Bytes::new(id, elems, Dtype::U8, 0))
             });
         ack.send(result);
     }
@@ -975,9 +977,11 @@ impl GpuServer {
                         ))));
                     }
                 }
+                // 出参句柄:事实面(声明 dtype/rank)由**线格式的 out 槽**承载,
+                // 客户端回执后按它定形;此处只给句柄(未定形占位)
                 ack.take()
                     .unwrap()
-                    .send(Ok(Bytes::new(out_id, msg.out_elems)))
+                    .send(Ok(Bytes::new(out_id, msg.out_elems, Dtype::U8, 0)))
             }
             Err(e) => ack.take().unwrap().send(Err(e)),
         }
@@ -1143,16 +1147,16 @@ impl owl_kernels::device::DeviceRes for GpuRes<'_> {
             .map_err(|e| OpError::Launch { op: OP_RES.into(), stage: owl_kernels::contract::Stage::Load, detail: format!("stream: {e:?}") })
             .cloned()
     }
-    fn resolve(&self, b: &Bytes) -> Result<u64, OpError> {
+    fn resolve(&self, id: u64) -> Result<u64, OpError> {
         let stream = self.stream()?;
         let (p, _) = self
             .ctx
-            .block_ptr(b.id, &stream)
+            .block_ptr(id, &stream)
             .map_err(|e| OpError::Contract {
                 op: OP_RES.into(),
                 field: "resolve",
                 expect: format!("块在册(actor_tag={} 账本)", self.actor_tag),
-                got: format!("id={} / {e}", b.id),
+                got: format!("id={id} / {e}"),
             })?;
         Ok(p)
     }
@@ -1305,7 +1309,7 @@ impl owl_kernels::device::DeviceRes for GpuRes<'_> {
             detail: format!("alloc_block[{tag}]({bytes}B): {e:?}"),
         })?;
         let id = self.ctx.new_block(slice);
-        Ok(owl_kernels::contract::Bytes::new(id, bytes))
+        Ok(owl_kernels::contract::Bytes::new(id, bytes, Dtype::U8, 0))
     }
 
     fn upload_block(
@@ -1321,7 +1325,7 @@ impl owl_kernels::device::DeviceRes for GpuRes<'_> {
         // compute-sanitizer 就在本函数上抓到 `Use-before-alloc`(写进尚未
         // 落定的内存 ⇒ 静默丢写)。改为**与分配同流的 async 拷贝**;
         // 调用方 `download` 已自带 COMPUTE 排空,回读序两侧都齐。
-        let p = self.resolve(b)?;
+        let p = self.resolve(b.id)?;
         let stream = self.stream()?;
         // **边界校验(2026-10-15 审查补)**:账本块上传同样要验"写得下"
         self.ctx

@@ -3,7 +3,7 @@
 //! init:OwlCublas 句柄 + 私有工作区预钉(ensure_blas 律:构造期急切,
 //! 捕获内首次初始化事故类结构性消灭)。run:解析 → 三指针 → gemm。
 
-use crate::contract::{Bytes, LaunchMsg, OpError, OpId};
+use crate::contract::{Bytes, Dtype, LaunchMsg, OpError, OpId};
 
 use crate::client::cublas::{parse_gemm, GEMM_BF16, GEMM_F16};
 use crate::registry::{FamilyGuard, KernelFamily};
@@ -54,9 +54,9 @@ impl KernelFamily for CublasRuntime {
         // 变体(f16/bf16)按【核名】路由;线内 nt sz = cublas 转置标志
         let bf16 = msg.kernel.name == GEMM_BF16;
         let call = parse_gemm(msg)?;
-        let a = res.resolve(&Bytes { id: call.a.id, len: 0 })? + call.a.byte_offset;
-        let b = res.resolve(&Bytes { id: call.b.id, len: 0 })? + call.b.byte_offset;
-        let out = res.resolve(&Bytes { id: call.out.id, len: 0 })? + call.out.byte_offset;
+        let a = res.resolve(call.a.id)? + call.a.byte_offset;
+        let b = res.resolve(call.b.id)? + call.b.byte_offset;
+        let out = res.resolve(call.out.id)? + call.out.byte_offset;
         let blas = self.blas.as_ref().ok_or_else(|| OpError::Asset {
             op: GEMM_F16.into(),
             detail: "cublas 句柄未装配".into(),
@@ -74,6 +74,6 @@ impl KernelFamily for CublasRuntime {
             stage: crate::contract::Stage::Compute,
             detail: format!("m={} k={} n={} nt={}: {e}", call.m, call.k, call.n, call.nt),
         })?;
-        Ok(Bytes { id: call.out.id, len: msg.out_elems })
+        Ok(Bytes::new(call.out.id, msg.out_elems, if bf16 { Dtype::BF16 } else { Dtype::F16 }, 2))
     }
 }

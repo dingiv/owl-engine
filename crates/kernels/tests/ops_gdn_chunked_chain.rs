@@ -13,7 +13,7 @@
 
 use cudarc::driver::{CudaContext, CudaSlice, DevicePtr, PushKernelArg};
 use owl_kernels::server::gdn_chunked::GdnChunkedRuntime;
-use owl_kernels::contract::{Bytes, LaunchMsg};
+use owl_kernels::contract::{Bytes, Dtype, LaunchMsg};
 use owl_kernels::device::{DeviceRes, Exec, ScratchBuf};
 use owl_kernels::client::gdn_chunked::GdnChunkedCall;
 use owl_kernels::registry::KernelFamily;
@@ -51,7 +51,7 @@ impl TestRes {
         let (id, mut d) = self.alloc_id(bytes.len());
         self.stream.memcpy_htod(bytes, &mut d).expect("htod");
         self.blocks.insert(id, d);
-        Bytes { id, len: 0 }
+        Bytes::new(id, 0, Dtype::U8, 0) // 测试替身:只按 id 解析
     }
 
     fn slice_of(&self, id: u64) -> &CudaSlice<u8> {
@@ -84,16 +84,16 @@ impl DeviceRes for TestRes {
     fn stream(&self) -> Result<Arc<cudarc::driver::CudaStream>, owl_kernels::contract::OpError> {
         Ok(self.stream.clone())
     }
-    fn resolve(&self, b: &Bytes) -> Result<u64, owl_kernels::contract::OpError> {
-        self.blocks.get(&b.id).map(|s| s.device_ptr(&self.stream).0).ok_or_else(|| {
+    fn resolve(&self, id: u64) -> Result<u64, owl_kernels::contract::OpError> {
+        self.blocks.get(&id).map(|s| s.device_ptr(&self.stream).0).ok_or_else(|| {
             let mut keys: Vec<u64> = self.blocks.keys().copied().collect();
             keys.sort();
-            eprintln!("[resolve miss] id={} 在册 keys={keys:?} len={}", b.id, b.len);
+            eprintln!("[resolve miss] id={id} 在册 keys={keys:?}");
             owl_kernels::contract::OpError::Contract {
                 op: "test".into(),
                 field: "resolve",
                 expect: "块在册".into(),
-                got: b.id.to_string(),
+                got: id.to_string(),
             }
         })
     }
@@ -170,7 +170,7 @@ impl DeviceRes for TestRes {
         self.next_id += 1;
         self.blocks.insert(id, s);
         let _ = tag;
-        Ok(owl_kernels::contract::Bytes::new(id, bytes))
+        Ok(owl_kernels::contract::Bytes::new(id, bytes, Dtype::U8, 0))
     }
     fn download(
         &mut self,
@@ -340,7 +340,7 @@ fn gdn_chunked_new_chain_matches_golden() {
         let state_b = res.upload_new(&s0_bytes);
         let (out_id, out_slice) = res.alloc_id(t * NV * VD * 2);
         res.blocks.insert(out_id, out_slice); // 直取路径必须自己落表(upload 路径内含)
-        let out_b = Bytes { id: out_id, len: t * NV * VD };
+        let out_b = Bytes::new(out_id, t * NV * VD, Dtype::F16, 3); // [t, NV, VD] f16
 
         let call = GdnChunkedCall::builder(shape)
             .q(&q_b).unwrap()
@@ -510,7 +510,7 @@ fn gdn_chunked_nt_decomposition_identity() {
         let state_b = res.upload_new(&vec![0u8; NV * KD * VD * 4]); // 每臂独立起点(零态)
         let (out_id, out_slice) = res.alloc_id(t * NV * VD * 2);
         res.blocks.insert(out_id, out_slice);
-        let out_b = Bytes { id: out_id, len: t * NV * VD };
+        let out_b = Bytes::new(out_id, t * NV * VD, Dtype::F16, 3); // [t, NV, VD] f16
         let shape = owl_kernels::client::gdn_chunked::GdnShape {
             t: t as u32, nv: NV as u32, nk: NK as u32, kd: KD as u32,
         };
@@ -551,7 +551,7 @@ fn gdn_chunked_nt_decomposition_identity() {
         for i in 0..NT {
             let (out_id, out_slice) = res.alloc_id(T_SM * NV * VD * 2);
             res.blocks.insert(out_id, out_slice);
-            let out_b = Bytes { id: out_id, len: T_SM * NV * VD };
+            let out_b = Bytes::new(out_id, T_SM * NV * VD, Dtype::F16, 3); // [T_SM, NV, VD] f16
             let call = GdnChunkedCall::builder(shape)
                 .q(&qs[i]).unwrap().k(&ks[i]).unwrap().v(&vs[i]).unwrap()
                 .beta(&bs[i]).unwrap().gate_raw(&gs[i]).unwrap()
@@ -672,7 +672,7 @@ fn gdn_chunked_matches_varlen_fn_level() {
         let state_b = res.upload_new(&st0_bytes);
         let (out_id, out_slice) = res.alloc_id(t * NV * VD * 2);
         res.blocks.insert(out_id, out_slice);
-        let out_b = Bytes { id: out_id, len: t * NV * VD };
+        let out_b = Bytes::new(out_id, t * NV * VD, Dtype::F16, 3); // [t, NV, VD] f16
         let shape = owl_kernels::client::gdn_chunked::GdnShape { t: t as u32, nv: NV as u32, nk: NK as u32, kd: KD as u32 };
         let call = GdnChunkedCall::builder(shape)
             .q(&q_b).unwrap().k(&k_b).unwrap().v(&v_b).unwrap()

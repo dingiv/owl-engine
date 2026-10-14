@@ -34,7 +34,7 @@ impl CheckRunner for Runner<'_> {
     }
 
     fn download_block(&mut self, b: &crate::contract::Bytes, dst: &mut [u8]) -> Result<(), OpError> {
-        let p = self.res.resolve(b)?;
+        let p = self.res.resolve(b.id)?;
         self.res.download(p, dst)
     }
 

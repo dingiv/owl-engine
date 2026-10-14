@@ -20,16 +20,17 @@ impl KernelSpec for FiPrefillFp8kv {
     const SRC: &'static str = "";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
-        // fp8 影子池(adapter 内部布局;1B/elem)
-        Param::t_in("k_cache", Dtype::U8, 4),
-        Param::t_in("v_cache", Dtype::U8, 4),
+        // fp8 主池句柄:引擎叶子口径 = U32 扁平字节账(与 XQA 同律;
+        // 池的 e4m3 字节语义由 `POOL` 的 `Dtype::U8` 承担)
+        Param::t_in("k_cache", Dtype::U32, 1),
+        Param::t_in("v_cache", Dtype::U32, 1),
         // FI plan 的 host 侧索引表(设备块承载;dtype 由 adapter 定义)
         Param::t_in("q_cu", Dtype::U32, 1),
         Param::t_in("indices", Dtype::U32, 1),
         Param::t_in("indptr", Dtype::U32, 1),
         Param::t_in("last_len", Dtype::U32, 1),
-        // 依赖边(K0 写池先于 FI 读池;FI 不解引用,仅保序)
-        Param::t_in("wr", Dtype::U8, 1),
+        // 依赖边(K0 写池先于 FI 读池;FI 不解引用,仅保序;假输出块 F16 [1])
+        Param::t_in("wr", Dtype::F16, 1),
         Param::t_out("out", Dtype::F16, 2),
         Param::sz("total_rows"),
         Param::sz("ctx_total"),
@@ -74,14 +75,14 @@ impl KernelSpec for FiPrefillF16 {
     const SRC: &'static str = "";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
-        // f16 主池(adapter 内部布局;2B/elem)
-        Param::t_in("k_cache", Dtype::F16, 4),
+        // f16 主池:kNHD 分页视图(引擎叶子 = [nb, hkv, hd/x, page, x] / v [nb,hkv,hd,page])
+        Param::t_in("k_cache", Dtype::F16, 5),
         Param::t_in("v_cache", Dtype::F16, 4),
         Param::t_in("q_cu", Dtype::U32, 1),
         Param::t_in("indices", Dtype::U32, 1),
         Param::t_in("indptr", Dtype::U32, 1),
         Param::t_in("last_len", Dtype::U32, 1),
-        Param::t_in("wr", Dtype::U8, 1),
+        Param::t_in("wr", Dtype::F16, 1),
         Param::t_out("out", Dtype::F16, 2),
         Param::sz("total_rows"),
         Param::sz("ctx_total"),

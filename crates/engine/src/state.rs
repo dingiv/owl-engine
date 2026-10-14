@@ -384,6 +384,9 @@ impl StatePool {
             let scr_mb = XQA_SCRATCH_MB;
             let scr = zero_block_dt(face, (scr_mb << 20) / 2, Dtype::F16).await?;
             Some(owl_models::module::XqaVerifyCtx {
+                // ⚠️ 四件套 = **图输入槽**(每步写 f32 数值;核按 u32 读同一
+                // 4 字节 = 位型走私)。故叶子注解与输入槽同 dtype = F32
+                // (2026-10-15 事实面审计:声明也必须写 F32,见 ops/xqa.rs 头注)
                 page_table: block_leaf(&ptb, vec![nb_i]),
                 seq_lens: block_leaf(&ptb, vec![1]), // 占位:图装配时换成输入槽
                 mask: block_leaf(&mkb, vec![seqs]),
@@ -534,15 +537,19 @@ impl StatePool {
             .iter()
             .map(|kb| {
                 (
+                    // 草稿池是 **BF16 分配**(见 StatePool::alloc 的 dflash_kvs 段:
+                    // "草稿路径 BF16 全程,独立于目标池 dims.dtype")⇒ 叶子注解也必须
+                    // 是 BF16。旧实现传 `self.dims.dtype`(目标池 F16)= 注解撒谎,
+                    // 被 L3 事实面当场抳住(2026-10-15)。
                     block_leaf_dt(
                         &kb.k_cache.0,
                         vec![self.nb, dkv, dhd / self.x, self.page, self.x],
-                        self.dims.dtype,
+                        Dtype::BF16,
                     ),
                     block_leaf_dt(
                         &kb.v_cache.0,
                         vec![self.nb, dkv, dhd, self.page],
-                        self.dims.dtype,
+                        Dtype::BF16,
                     ),
                 )
             })
@@ -586,7 +593,16 @@ impl StatePool {
     pub(crate) fn xqa_sem_zero(&self) -> Option<(owl_iface::contract::Bytes, usize)> {
         let x = self.xqa.as_ref()?;
         let n = x.semaphores.shape().iter().product::<usize>();
-        Some((owl_iface::contract::Bytes { id: x.semaphores.id(), len: n }, n * 4))
+        // 事实面随叶子(位型走私:写 f32 数值、核按 u32 读)
+        Some((
+            owl_iface::contract::Bytes::new(
+                x.semaphores.id(),
+                n,
+                x.semaphores.dtype(),
+                x.semaphores.shape().len() as u8,
+            ),
+            n * 4,
+        ))
     }
 
     /// KV 池形状(模式相关;与层分派同源策略)
@@ -1022,10 +1038,13 @@ async fn zero_block_dt<D: DeviceClient>(face: &mut D, n: usize, dt: Dtype) -> Re
 }
 
 fn block_leaf_dt(b: &Bytes, shape: Vec<usize>, dt: Dtype) -> TensorOps {
-    match dt {
-        Dtype::F16 | Dtype::BF16 => TensorOps::of_block(b.id, dt, shape),
-        _ => TensorOps::of_block(b.id, Dtype::F32, shape),
-    }
+    // 如实传递(2026-10-15 L3 事实面审计):原实现对非 2B 类型一律折叠成
+    // `Dtype::F32`(`_ => of_block(F32)`)—— legacy "f32 基线"残留。后果:
+    // fp8 KV 池块以 `Dtype::U32`(bytes/4 口径)分配,叶子却注解 F32,
+    // 声明面(XQA/FI 的 `k_cache: U8`)与实际喂的视图**三方各说各话**。
+    // 折叠去掉后叶子注解 = 分配口径;池的"e4m3 字节语义"由 `PoolAccess`
+    // 声明承担(见 ops/xqa.rs 的 `pools::KV_MAIN` 项)。
+    TensorOps::of_block(b.id, dt, shape)
 }
 
 async fn zero_block<D: DeviceClient>(face: &mut D, n: usize) -> Result<BlockN> {

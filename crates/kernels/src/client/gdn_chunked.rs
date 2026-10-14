@@ -17,7 +17,7 @@
 //! ⚠️ g 语义律:本面只产 **raw gate**;cumsum 产物是运行时私有态,
 //! 客户端不可达(类型面堵死 raw/cumsum 混喂)。
 
-use crate::contract::{Arg, Bytes, LaunchMsg, OpError, KernelSource};
+use crate::contract::{Arg, Bytes, Dtype, KernelSource, LaunchMsg, OpError};
 
 /// 家族名(字面量住址 = `family::gdn_chunked`;models 经本常量引用)
 pub const GDN_CHUNKED: &str = crate::family::gdn_chunked::GDN_CHUNKED_FWD;
@@ -85,12 +85,12 @@ impl GdnChunkedCall {
     /// 输入槽(6 Block;顺序即契约)
     pub fn ins_args(&self) -> [Arg; 6] {
         [
-            Arg::Block { id: self.q.id },
-            Arg::Block { id: self.k.id },
-            Arg::Block { id: self.v.id },
-            Arg::Block { id: self.beta.id },
-            Arg::Block { id: self.gate.0.id },
-            Arg::Block { id: self.state.pool.id },
+            Arg::block(self.q.id, self.q.dtype, self.q.rank),
+            Arg::block(self.k.id, self.k.dtype, self.k.rank),
+            Arg::block(self.v.id, self.v.dtype, self.v.rank),
+            Arg::block(self.beta.id, self.beta.dtype, self.beta.rank),
+            Arg::block(self.gate.0.id, self.gate.0.dtype, self.gate.0.rank),
+            Arg::block(self.state.pool.id, self.state.pool.dtype, self.state.pool.rank),
         ]
     }
 
@@ -132,12 +132,12 @@ impl GdnChunkedCall {
         let mut scalars: Vec<u64> = Vec::new();
         for a in &msg.args {
             match a {
-                Arg::Block { id } => blocks.push(Bytes { id: *id, len: 0 }),
-                Arg::BlockSlice { id, byte_offset, .. } => {
+                Arg::Block { id, dtype, rank } => blocks.push(Bytes::new(*id, 0, *dtype, *rank)),
+                Arg::BlockSlice { id, byte_offset, elems: _, dtype, rank } => {
                     if *byte_offset != 0 {
                         return Err(contract_err("args", "Block(零偏移)", "非零偏移 BlockSlice"));
                     }
-                    blocks.push(Bytes { id: *id, len: 0 });
+                    blocks.push(Bytes::new(*id, 0, *dtype, *rank));
                 }
                 Arg::U64(v) => scalars.push(*v),
                 Arg::I32(v) => scalars.push(*v as u64),
@@ -176,7 +176,7 @@ impl GdnChunkedCall {
     pub fn to_launch(&self, out: Bytes) -> LaunchMsg {
         let mut args: Vec<Arg> = Vec::with_capacity(13);
         args.extend(self.ins_args());
-        args.push(Arg::Block { id: out.id });
+        args.push(Arg::block(out.id, out.dtype, out.rank));
         args.extend(self.scalar_args());
         LaunchMsg {
             kernel: KernelSource { name: GDN_CHUNKED.to_string(), source: String::new() },
@@ -338,8 +338,14 @@ mod tests {
         GdnShape { t, nv: 48, nk: 16, kd: 128 }
     }
 
+    /// 测试块:事实按本面配方填(q/k/v/beta/gate = F16;state = F32 [slots,HV,KD,VD];out = F16 [t,nv,kd])
     fn dummy(id: u64, len: usize) -> Bytes {
-        Bytes { id, len }
+        Bytes::new(id, len, Dtype::F16, 3)
+    }
+
+    /// 指定事实的测试块(beta/gate = F16x2;state = F32x4)
+    fn dummy_f(id: u64, len: usize, dtype: Dtype, rank: u8) -> Bytes {
+        Bytes::new(id, len, dtype, rank)
     }
 
     fn sample(t: u32) -> GdnChunkedCall {
@@ -348,9 +354,9 @@ mod tests {
             .q(&dummy(1, (s.t as usize) * 16 * 128)).unwrap()
             .k(&dummy(2, (s.t as usize) * 16 * 128)).unwrap()
             .v(&dummy(3, (s.t as usize) * 48 * 128)).unwrap()
-            .beta(&dummy(4, (s.t as usize) * 48)).unwrap()
-            .gate_raw(&dummy(5, (s.t as usize) * 48)).unwrap()
-            .state(&dummy(6, 48 * 128 * 128), 0).unwrap()
+            .beta(&dummy_f(4, (s.t as usize) * 48, Dtype::F16, 2)).unwrap()
+            .gate_raw(&dummy_f(5, (s.t as usize) * 48, Dtype::F16, 2)).unwrap()
+            .state(&dummy_f(6, 48 * 128 * 128, Dtype::F32, 4), 0).unwrap()
             .build().unwrap()
     }
 

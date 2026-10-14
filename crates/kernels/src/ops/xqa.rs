@@ -19,16 +19,25 @@ use crate::family::xqa;
 ///   stride_page, stride_token, stride_head]`
 const XQA_PARAMS: &[Param] = &[
     Param::t_in("q", Dtype::F16, 2),
-    Param::t_in("k_cache", Dtype::U8, 4),
-    Param::t_in("v_cache", Dtype::U8, 4),
+    // fp8 主池句柄:引擎叶子口径 = U32 扁平字节账(`bytes/4` 字;2026-10-15
+    // L3 事实面对齐 —— 池的 e4m3 字节语义由 `POOL` 的 `Dtype::U8` 承担)。
+    // 旧声明 `U8 rank4` 描述的是核内 kNHD 字节视图,与喂进来的句柄不是同一层。
+    Param::t_in("k_cache", Dtype::U32, 1),
+    Param::t_in("v_cache", Dtype::U32, 1),
     // 页表/序列长/掩码/信号量/scratch 都是 u32/i32 承载块(位型见 .cu)
-    Param::t_in("page_table", Dtype::U32, 2),
-    Param::t_in("seq_lens", Dtype::U32, 1),
-    Param::t_in("mask", Dtype::U32, 1),
-    Param::t_in("semaphores", Dtype::U32, 1),
-    Param::t_in("scratch", Dtype::U8, 1),
+    // 页表/序列长/信号量/掩码 = **图输入槽**(每步由引擎写零/写值):
+    // 写入面是 F32(数值口径),核按 u32 读同一 4 字节 —— 位型走私,
+    // 与标量槽 `q_scale_bits` 同律(2026-10-15 事实面对齐:声明 = 喂进来的视图)
+    Param::t_in("page_table", Dtype::F32, 2),
+    Param::t_in("seq_lens", Dtype::F32, 2),
+    // mask / wr:两臂喂的阶数不同(decode rank1 / verify rank2;wr 是纯依赖边)
+    // ⇒ 显式 `0` = 阶数无关(两臂共用本表,不拆表)
+    Param::t_in("mask", Dtype::F32, 0),
+    Param::t_in("semaphores", Dtype::F32, 2),
+    // 工作区:引擎以 F16 口径分配/注解(`(scr_mb<<20)/2` 元素)
+    Param::t_in("scratch", Dtype::F16, 1),
     // 依赖边(K0 写池先于 XQA 读池;XQA 不解引用,仅保序)
-    Param::t_in("wr", Dtype::U8, 1),
+    Param::t_in("wr", Dtype::F16, 0),
     Param::t_out("out", Dtype::F16, 2),
     // ---- 10 个 sz 标量 ----
     Param::sz("q_seq_len").range(RangeRule { min: Some(1.0), max: None, set: None }),
@@ -164,9 +173,25 @@ use crate::spec::{meta_of};
         assert_eq!(meta_of::<XqaDecode>().args_str(), xqa::DECODE_XQA_SIG);
     }
 
+    /// 测试参数:事实按 XQA_PARAMS 声明填(事实面门现在会逐槽比对)
     fn xqa_args(q_seq_len: u64) -> Vec<Arg> {
-        let mut v: Vec<Arg> = (0..9).map(|i| Arg::Block { id: i + 1 }).collect();
-        v.push(Arg::Block { id: 100 }); // out
+        let facts = [
+            (Dtype::F16, 2), // q
+            (Dtype::U32, 1), // k_cache
+            (Dtype::U32, 1), // v_cache
+            (Dtype::F32, 2), // page_table
+            (Dtype::F32, 2), // seq_lens
+            (Dtype::F32, 1), // mask(声明 rank=0 阶数无关;发送方仍须给真实阶数 ≥1)
+            (Dtype::F32, 2), // semaphores
+            (Dtype::F16, 1), // scratch
+            (Dtype::F16, 1), // wr(依赖边)
+        ];
+        let mut v: Vec<Arg> = facts
+            .iter()
+            .enumerate()
+            .map(|(i, (d, r))| Arg::block(i as u64 + 1, *d, *r))
+            .collect();
+        v.push(Arg::block(100, Dtype::F16, 2)); // out
         for s in [q_seq_len, 1, 256, 32, 4096, 1, 84, 1, 1, 1] {
             v.push(Arg::U64(s));
         }

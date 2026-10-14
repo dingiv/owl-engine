@@ -13,7 +13,7 @@ impl KernelSpec for DflashConvBf16 {
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::BF16, 2),
         Param::t_in("delta", Dtype::BF16, 2),
-        Param::t_in("base", Dtype::BF16, 2),
+        Param::t_in("base", Dtype::BF16, 3),
         Param::i32("side"),
         Param::i32("block_size"),
         Param::i32("hidden"),
@@ -37,7 +37,7 @@ impl KernelSpec for DflashSelectBf16 {
         Param::t_in("cand", Dtype::F32, 2),
         Param::t_in("unary", Dtype::F32, 2),
         Param::t_in("proj", Dtype::BF16, 2),
-        Param::t_in("anchor", Dtype::F32, 2),
+        Param::t_in("anchor", Dtype::F32, 0),
         Param::t_in("a_tab", Dtype::BF16, 2),
         Param::t_in("b_tab", Dtype::BF16, 2),
         Param::i32("slots"),

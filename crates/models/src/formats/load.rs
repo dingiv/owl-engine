@@ -204,7 +204,12 @@ async fn load_group<D: DeviceClient, S: WeightSource + ?Sized>(
                 load_device_rearrange(face, w, src, n, op, rows, cols, tap, deferred, verify).await?
             }
         };
-        w.sink.deliver(crate::contract::Bytes::new(entry.block.id, n));
+        w.sink.deliver(crate::contract::Bytes::new(
+            entry.block.id,
+            n,
+            w.dtype,
+            w.shape.len() as u8,
+        ));
         manifest.push(entry);
     }
     Ok(manifest)
@@ -335,7 +340,7 @@ async fn load_direct<D: DeviceClient, S: WeightSource + ?Sized>(
         dtype: w.dtype,
         shape: w.shape.clone(),
         layout: Layout::Direct,
-        block: crate::contract::Bytes::new(b.id, n),
+        block: crate::contract::Bytes::new(b.id, n, w.dtype, w.shape.len() as u8),
         csum: if verify { csum } else { 0 },
     })
 }
@@ -424,24 +429,25 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
             aux: &[],
             scalars: &[],
         });
-        face.launch(crate::contract::LaunchMsg {
+        let msg = crate::contract::LaunchMsg {
             kernel: crate::contract::KernelSource {
                 name: pick.name.to_string(),
                 source: crate::kernel::source(pick.name).to_string(),
             },
             args: vec![
-                crate::contract::Arg::Block { id: raw.id },
+                crate::contract::Arg::block(raw.id, crate::contract::Dtype::U32, 2), // ct packed [rows, cols]
                 crate::contract::Arg::U64(rows as u64),
                 crate::contract::Arg::U64(cols as u64),
-                crate::contract::Arg::Block { id: out_block.id },
+                crate::contract::Arg::block(out_block.id, crate::contract::Dtype::U32, 2), // marlin B [k/16, rows*2]
             ],
             grid: pick.shape.grid,
             block: pick.shape.block,
             shared_mem: pick.shape.smem,
             out_elems: n,
-        })
-        .await
-        .map_err(|e| ModelError::Msg(format!("Weight '{}': repack launch {e}", w.key)))?;
+        };
+        face.launch(msg)
+            .await
+            .map_err(|e| ModelError::Msg(format!("Weight '{}': repack launch {e}", w.key)))?;
         // 端到端校验(OWL_LOAD_VERIFY;前 4 层):GPU 重排输出 vs CPU fused 逐位
         if let Some(ph) = &packed_host {
             static VERIFY_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -478,7 +484,7 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
         dtype: w.dtype,
         shape: w.shape.clone(),
         layout: Layout::DeviceRearrange { op, rows, cols },
-        block: crate::contract::Bytes::new(out_block.id, n),
+        block: crate::contract::Bytes::new(out_block.id, n, Dtype::U32, 2),
         csum: 0, // staged = raw 而块 = 重排后:回读不可比,深校验挂账
     })
 }
@@ -525,7 +531,7 @@ async fn load_transposed<D: DeviceClient, S: WeightSource + ?Sized>(
         dtype: w.dtype,
         shape: w.shape.clone(),
         layout: Layout::Transposed,
-        block: crate::contract::Bytes::new(b.id, n),
+        block: crate::contract::Bytes::new(b.id, n, w.dtype, w.shape.len() as u8),
         csum: if verify { fnv1a(&bytes, 0xcbf29ce484222325) } else { 0 },
     })
 }

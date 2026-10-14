@@ -90,7 +90,7 @@ pub fn kv_manifest_gate(
 mod tests {
     use super::*;
     
-    use owl_iface::contract::Arg;
+    use owl_iface::contract::{Arg, Dtype};
     use owl_kernels::contract::Bytes;
 
     #[test]
@@ -103,8 +103,8 @@ mod tests {
             crate::ops::KernelArg::Bits(4),
             crate::ops::KernelArg::Bits(5),
         ];
-        let ins = vec![Arg::Block { id: 1 }];
-        let out = Bytes::new(9, 0);
+        let ins = vec![Arg::block(1, Dtype::F16, 2)];
+        let out = Bytes::new(9, 0, Dtype::F16, 2);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = crate::ops::lower_kernel(&k, &scalars, &ins, &out, 0);
         }));
@@ -121,8 +121,8 @@ mod tests {
             crate::ops::KernelArg::Bits(3),
             crate::ops::KernelArg::Bits(4),
         ];
-        let ins = vec![Arg::Block { id: 1 }, Arg::Block { id: 2 }]; // 应为 1 个父
-        let out = Bytes::new(9, 0);
+        let ins = vec![Arg::block(1, Dtype::F16, 2), Arg::block(2, Dtype::F16, 2)]; // 应为 1 个父
+        let out = Bytes::new(9, 0, Dtype::F16, 2);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = crate::ops::lower_kernel(&k, &scalars, &ins, &out, 0);
         }));
@@ -139,13 +139,13 @@ mod tests {
             crate::ops::KernelArg::Bits(30),
             crate::ops::KernelArg::Bits(40),
         ];
-        let ins = vec![Arg::Block { id: 7 }];
-        let out = Bytes::new(9, 8);
+        let ins = vec![Arg::block(7, Dtype::F16, 2)];
+        let out = Bytes::new(9, 8, Dtype::F16, 2);
         let msg = crate::ops::lower_kernel(&k, &scalars, &ins, &out, 8);
         assert_eq!(msg.args.len(), 6); // T + sz×4 + out
-        assert!(matches!(&msg.args[0], owl_iface::contract::Arg::Block { id: 7 }));
+        assert!(matches!(&msg.args[0], Arg::Block { id: 7, .. }));
         assert!(matches!(&msg.args[1], owl_iface::contract::Arg::U64(10)));
-        assert!(matches!(&msg.args[5], owl_iface::contract::Arg::Block { id: 9 }));
+        assert!(matches!(&msg.args[5], Arg::Block { id: 9, .. }));
         assert_eq!(msg.out_elems, 8);
     }
 }

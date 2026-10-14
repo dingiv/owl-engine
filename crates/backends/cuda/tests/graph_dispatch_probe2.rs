@@ -60,12 +60,12 @@ async fn marlin_graph_dispatch_probe() {
     let msg = |a: &owl_cuda::Bytes| LaunchMsg {
         kernel: owl_cuda::KernelSource { name: "marlin_gemm_w4a16".into(), source: String::new() },
         args: vec![
-            Arg::Block { id: a.id },
-            Arg::Block { id: db.id },
-            Arg::Block { id: dc.id },
-            Arg::Block { id: ds.id },
-            Arg::Block { id: dws.id },
-            Arg::Block { id: dctmp.id },
+            Arg::block(a.id, a.dtype, a.rank),
+            Arg::block(db.id, db.dtype, db.rank),
+            Arg::block(dc.id, dc.dtype, dc.rank),
+            Arg::block(ds.id, ds.dtype, ds.rank),
+            Arg::block(dws.id, dws.dtype, dws.rank),
+            Arg::block(dctmp.id, dctmp.dtype, dctmp.rank),
             Arg::U64(m as u64),
             Arg::U64(k as u64),
             Arg::U64(n as u64),
@@ -109,9 +109,9 @@ extern "C" __global__ void probe_add_f32(
 }
 "#.into() },
         args: vec![
-            Arg::Block { id: sentinel_in.id },
-            Arg::Block { id: sentinel_in.id },
-            Arg::Block { id: sentinel_out.id },
+            Arg::block(sentinel_in.id, sentinel_in.dtype, sentinel_in.rank),
+            Arg::block(sentinel_in.id, sentinel_in.dtype, sentinel_in.rank),
+            Arg::block(sentinel_out.id, sentinel_out.dtype, sentinel_out.rank),
             Arg::U64(4),
         ],
         grid: (1, 1, 1),
@@ -152,9 +152,9 @@ async fn cublas_graph_dispatch_probe() {
     let msg = |_a: &owl_cuda::Bytes| LaunchMsg {
         kernel: owl_cuda::KernelSource { name: "cublas_gemm_f16".into(), source: String::new() },
         args: vec![
-            Arg::Block { id: x.id },
-            Arg::Block { id: w.id },
-            Arg::Block { id: dc.id },
+            Arg::block(x.id, x.dtype, x.rank),
+            Arg::block(w.id, w.dtype, w.rank),
+            Arg::block(dc.id, dc.dtype, dc.rank),
             Arg::U64(mm as u64),
             Arg::U64(kk as u64),
             Arg::U64(nn as u64),
@@ -190,10 +190,10 @@ extern "C" __global__ void probe_scale_f32(
     client.launch(LaunchMsg {
         kernel: owl_cuda::KernelSource { name: "probe_scale_f32".into(), source: SCALE_CU.into() },
         args: vec![
-            Arg::Block { id: x.id },
+            Arg::block(x.id, x.dtype, x.rank),
             Arg::F32(2.0),
             Arg::U64(4),
-            Arg::Block { id: sentinel_out.id },
+            Arg::block(sentinel_out.id, sentinel_out.dtype, sentinel_out.rank),
         ],
         grid: (1, 1, 1),
         block: (256, 1, 1),

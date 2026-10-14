@@ -18,12 +18,15 @@ impl KernelSpec for GdnScalarDeltaRuleFwd {
     /// foreign(AOT cubin + cast 编排):无单一 `.cu` 源
     const SRC: &'static str = "";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("q", Dtype::F16, 3),
-        Param::t_in("k", Dtype::F16, 3),
-        Param::t_in("v", Dtype::F16, 3),
-        Param::t_in("beta", Dtype::F16, 3),
+        // 层侧 CAST_F16_F32 预铸后直入(f32 指针;核 = `owl_gdn_chunk_scalar_f32`
+        // 的 `const float*` 形参 —— 2026-10-15 L3 事实面对齐:旧声明 F16 陈旧)
+        Param::t_in("q", Dtype::F32, 3),
+        Param::t_in("k", Dtype::F32, 3),
+        Param::t_in("v", Dtype::F32, 3),
+        // beta/gate = [T, HV] 二继(f32)
+        Param::t_in("beta", Dtype::F32, 2),
         // raw gate(语义律同 chunked:cumsum 是核内私有态,不跨面)
-        Param::t_in("gate", Dtype::F16, 3),
+        Param::t_in("gate", Dtype::F32, 2),
         // GDN 状态槽 [slots, HV, KD, VD](f32)
         Param::t_inout("state", Dtype::F32, 4),
         Param::t_out("out", Dtype::F16, 3),

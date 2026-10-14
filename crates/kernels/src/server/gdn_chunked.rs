@@ -371,15 +371,15 @@ impl KernelFamily for GdnChunkedRuntime {
         }
 
         // ── 输入解析(块句柄 → 设备指针)──
-        let q_p = res.resolve(call.q())?;
-        let k_p = res.resolve(call.k())?;
-        let v_p = res.resolve(call.v())?;
-        let beta_p = res.resolve(call.beta())?;
-        let g_p = res.resolve(&call.gate().0)?;
+        let q_p = res.resolve(call.q().id)?;
+        let k_p = res.resolve(call.k().id)?;
+        let v_p = res.resolve(call.v().id)?;
+        let beta_p = res.resolve(call.beta().id)?;
+        let g_p = res.resolve(call.gate().0.id)?;
         let state_slot_p = res
-            .resolve(&call.state().pool)?
+            .resolve(call.state().pool.id)?
             + (call.state().slot as u64) * (hv * kd * vd * 4) as u64;
-        let out_p = res.resolve(&out)?;
+        let out_p = res.resolve(out.id)?;
         let scale = shape.scale();
         let ti = t as i32;
         let scratch: u64 = 0; // triton 尾参(global/profile scratch)
@@ -601,7 +601,7 @@ impl KernelFamily for GdnChunkedRuntime {
                     .chunks_exact(2)
                     .map(|c| bf16_to_f32(c[0], c[1]))
                     .collect();
-                let (mn, mx, nz, _) = stat(&vs);
+                let (_mn, mx, nz, _) = stat(&vs);
                 hline.push(format!("#{i_t}:{mx:.2}/{nz}"));
             }
             eprintln!("[gdn-diag] {diag_tag} h_buf 逐 chunk(max|·|/非零数, blk={blk}B): {}", hline.join(" "));

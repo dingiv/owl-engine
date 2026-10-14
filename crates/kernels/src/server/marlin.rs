@@ -1,7 +1,7 @@
 //! Marlin W4A16 runtime(FFI 直调链路;纯 FFI 零句柄,stream/dev 注入)。
 //! 三名同构:f16 / AWQ / bf16(名路由 → gemm_v2_raw / gemm_v2_raw_bf16)。
 
-use crate::contract::{Bytes, LaunchMsg, OpError, OpId, Stage};
+use crate::contract::{Bytes, Dtype, LaunchMsg, OpError, OpId, Stage};
 
 use crate::client::marlin::{parse_gemm, GEMM_W4A16_AWQ};
 use crate::family::marlin;
@@ -36,7 +36,7 @@ impl KernelFamily for MarlinRuntime {
         }
         let call = parse_gemm(msg, msg.kernel.name == marlin::GEMM_W4A16_BF16)?;
         let r = |b: &crate::client::marlin::BlockRef| {
-            res.resolve(&Bytes { id: b.id, len: 0 }).map(|p| p + b.byte_offset)
+            res.resolve(b.id).map(|p| p + b.byte_offset)
         };
         let a = r(&call.a)?;
         let b = r(&call.b)?;
@@ -78,7 +78,7 @@ impl KernelFamily for MarlinRuntime {
             stage: Stage::Compute,
             detail,
         })?;
-        Ok(Bytes { id: call.out.id, len: msg.out_elems })
+        Ok(Bytes::new(call.out.id, msg.out_elems, if call.bf16 { Dtype::BF16 } else { Dtype::F16 }, 2))
     }
 }
 
@@ -90,7 +90,7 @@ impl MarlinRuntime {
     fn run_awq(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, _exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {
         let call = crate::client::marlin::parse_gemm_awq(msg)?;
         let r = |b: &crate::client::marlin::BlockRef| {
-            res.resolve(&Bytes { id: b.id, len: 0 }).map(|p| p + b.byte_offset)
+            res.resolve(b.id).map(|p| p + b.byte_offset)
         };
         let a = r(&call.a)?;
         let b = r(&call.b)?;
@@ -124,7 +124,7 @@ impl MarlinRuntime {
             stage: Stage::Compute,
             detail: format!("err {e}: {}", marlin::v2_err_str(e)),
         })?;
-        Ok(Bytes { id: call.out.id, len: msg.out_elems })
+        Ok(Bytes::new(call.out.id, msg.out_elems, if call.bf16 { Dtype::BF16 } else { Dtype::F16 }, 2))
     }
 }
 

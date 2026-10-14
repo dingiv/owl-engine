@@ -34,7 +34,7 @@ pub(super) fn issue_launch(
     let mut slots: Vec<Slot> = Vec::with_capacity(msg.args.len());
     for a in &msg.args {
         match a {
-            Arg::Block { id } => {
+            Arg::Block { id, .. } => {
                 let (p, _len) = ctx.block_ptr(*id, stream).map_err(|e| {
                     // 原生 launch 实参解析失败 —— 带核名与槽序(DeadBlock 定位)
                     ModelError::Msg(format!(
@@ -91,8 +91,8 @@ pub(super) fn issue_launch(
             msg.args
                 .iter()
                 .map(|a| match a {
-                    Arg::Block { id } => format!("Block({id})"),
-                    Arg::BlockSlice { id, byte_offset, elems } => {
+                    Arg::Block { id, .. } => format!("Block({id})"),
+                    Arg::BlockSlice { id, byte_offset, elems, .. } => {
                         format!("Slice({id}+{byte_offset}B,{elems}e)")
                     }
                     Arg::U64(v) => format!("U64({v})"),
@@ -165,7 +165,7 @@ pub(super) fn issue_launch(
         .iter()
         .rev()
         .find_map(|a| match a {
-            Arg::Block { id } => Some(*id),
+            Arg::Block { id, .. } => Some(*id),
             Arg::BlockSlice { .. } | Arg::U64(_) | Arg::I32(_) | Arg::F32(_) => None,
         })
         .ok_or_else(|| ModelError::Msg("launch: args 中无输出块".to_string()))?;

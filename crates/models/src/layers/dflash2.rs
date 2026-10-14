@@ -281,8 +281,8 @@ impl DfAttn {
         };
         TensorOps::call(k0_op)
             .aux(&[t])
-            .arg(&k)
-            .arg(&v)
+            .arg(&k.reshape(vec![t, self.hkv, self.hd]))
+            .arg(&v.reshape(vec![t, self.hkv, self.hd]))
             .arg(&kv.k_cache)
             .arg(&kv.v_cache)
             .arg(&kv.slots)
@@ -333,8 +333,8 @@ impl DfAttn {
             other => panic!("owl_naive_attn_nc 无 {other:?} 变体"),
         })
         .arg(&q)
-        .arg(&k)
-        .arg(&v)
+        .arg(&k.reshape(vec![t, self.hkv, self.hd]))
+        .arg(&v.reshape(vec![t, self.hkv, self.hd]))
         .arg(&kv.k_cache)
         .arg(&kv.v_cache)
         .arg(kv_len_t)
@@ -2011,7 +2011,7 @@ mod tests {
         // 手动复算 propose_attn 内部(拆黑盒;pre-o_proj 与 o_proj 双锚)
         let q_raw_self2 = attn.q_proj().forward(&self2, &ctx);
         let k_raw_self2 = attn.k_proj().forward(&self2, &ctx);
-        let v_self2 = attn.v_proj().forward(&self2, &ctx);
+        let v_self2 = attn.v_proj().forward(&self2, &ctx).reshape(vec![2, hkv, hd]);
         let q_self2 = {
             let (cos_d, sin_d) = rope.cos_sin_decl();
             TensorOps::call(crate::ops::SemanticKernel::NormRope)
@@ -2042,7 +2042,7 @@ mod tests {
                 .arg_usize(rope.rotary_half())
                 .arg_i32(attn.k_norm().w_off() as i32) // 同律
                 .aux(&[2, hkv, hd])
-                .with_shape(Dtype::F16, vec![2, hkv * hd])
+                .with_shape(Dtype::F16, vec![2, hkv, hd]) // [T, Hkv, D](核视图;K0/NC 两消费者同求 3D)
         };
         // v2 语义:写-后-打分 —— 自块 k/v 先 K0 写池 slots [3,4],
         // NC 全窗 [0..5) 纯池读(生产流同式:encode/propose 前置写槽)

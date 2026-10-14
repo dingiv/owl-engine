@@ -1051,3 +1051,96 @@ A13 分解表 `mask=2 → 198` 那格是两个变量」—— **实测不成立*
 | **`DeviceRes::resolve_len`**(家族无法自证入参尺寸:marlin `ws`/`c_tmp`、xqa `scratch` 256MiB) | 动 trait 实现面(2 个 impl)+ 三族调用点 |
 | **`parse` 与 builder 成对按名取址** | 6 族 + models 调用点;只改一侧会造**新的**不对称(双锁已就位兜底) |
 | `prefill` 上 CUDA Graph | 见 §17 之外的独立设计讨论(slab 预算 / M0 去 from_host 是前置) |
+
+## 十九、L3 事实面(dtype/rank/角色)+ 声明面审计(2026-10-15;台账 **A20**)
+
+§18.4 的第一项("声明驱动最后一块")当日落地。**用户裁决**:用 rank(不是 shape);
+**能有多严格就多严格,不搞静默丢弃**;不一致**逐条按性质分**(声明错改声明 / 调用点
+扇平改调用点 / 阶数无关写 0);fp8 池句柄的 dtype **修引擎折叠**而不是改声明。
+
+### 19.1 架构(用户裁决:**事实随线格式走,服务端唯一门**)
+
+初版把检查放在客户端(`models::ops::check_call_facts`,靠闭包探针读 SSA 图的事实)。
+**用户当场纠正**:客户端自查 = 运动员兼裁判,覆盖不到 oracle/测试/未来新路 ——
+"你客户端那些参数为什么不发过去呢?"。改后:
+
+| 面 | 变化 |
+|---|---|
+| **线格式** | `Arg::Block { id, **dtype, rank** }` / `Arg::BlockSlice { …, dtype, rank }`;`Bytes` 变**自描述**(`{ id, len, dtype, rank }`,`alloc` 后 rank 0 = 未定形,`view()` 定形) |
+| **服务端 L3** | 事实检查**并入 `check_from_params`**(与 token/账长/几何/角色同一函数)⇒ 唯一咽喉 `admission_check` 覆盖所有发射路 |
+| **客户端** | **不再自查**(删 `check_call_facts` 与 4 个调用点);只负责**如实填事实** |
+| 顺带 | `DeviceRes::resolve(&Bytes)` → **`resolve(id: u64)`**(原签名逼出满地 `Bytes{id,len:0}` 占位块) |
+
+语义(用户裁决:能多严就多严,不静默):
+- 张量槽 `facts()` 缺失 ⇒ 拒;`dtype` 精确相等;
+- `rank`:声明 `0` = **显式阶数无关**(核按计数扁平索引);发送方 `rank = 0`
+  (**未定形**)在张量槽 = **拒**(不许用"未定形"蒙混);
+- `Out` 槽必须是全块 `Block`。
+
+### 19.2 槽序单源
+
+`models::ops::lower_kernel` 的槽序规则(输出槽/父张量槽/标量槽)走
+`spec::slot_sources` ⇒ 装配序与检查序**单源**(原 `is_out` 闭包就地推导,必漂)。
+事实取自**父节点视图**(`p.dtype` / `p.shape.len()`),不是块句柄的标注 ——
+`Reshape`/`SliceView` 透传底块时句柄标注会滞后(实测踩到:delta_dec 收 rank2),
+故两臂同时按本节点视图 `view()` 重定形。
+
+### 19.3 服务端补强 4 条(同一张表)
+
+| # | 补什么 | 旧行为 |
+|---|---|---|
+| 1 | **未知块 ⇒ 拒**(`arg_len == None`) | 静默跳过零长/对齐检查 |
+| 2 | **几何通用律**:`out_elems ≥ 1`;`grid.x ≥ 1`(全零 `(0,0,0)` = 显式"runtime 自持"哨兵,家族路专用) | `ctx.geom` **从不被读** ⇒ 任意几何都过 |
+| 3 | `Out` 槽禁 `BlockSlice`(线格式完整性) | 无 |
+| 4 | 删 `t_out` 的**假 range**(张量槽 range 从不被求值) | 假声明 |
+
+### 19.4 审计方法(影子扫描;**已删**,不入库)
+
+真机跑不动全量算子,故先用**临时全槽扫描**(`OWL_L3_AUDIT=1`:逐槽登记不拒发,
+去重打印)跑真机取**全表**,逐条裁决后再转严格。**审计代码已删**(生产路径无影子档)。
+
+- 起点:**155 条**(fp8 档 27B,一次 boot + 一次请求);终局 **0 条**。
+- 迭代轮次:5 轮(每轮修完再跑);f16 档另跑 3 轮。
+
+### 19.5 审计发现(**两条是真 bug**)
+
+| 发现 | 性质 |
+|---|---|
+| `owl_qknorm_rope_kv_insert_f16{,_knhd}` 的声明表是**旧签名**(`q, q_raw, kw, beta, cos, sin, k, v, kc, vc, …`),`.cu` 早已是 `q_raw, k, v, key_cache, value_cache, slots, q_w, k_w, …` —— **token 串逐字相同**(11×T+f32+4×i32+T)⇒ 老门全绿,而**语义槽位全错位** | **f16-KV 档融合插池 = 读写全错**(静默);新增**名字级互证门**焊死这类 |
+| `vllm_paged_attention_v2_{f16,fp8}_knhd_*` **共用一张表**,而 fp8 池句柄是 U32 扁平字节账、f16 池句柄是 kNHD 分页视图 ⇒ 一表两用必错 | 拆两表(按 `$pool_dt` 选) |
+| `block_leaf_dt`(引擎叶子注解)把非 2B 类型**一律折叠成 F32**(legacy f32 基线残留)⇒ fp8 池块以 U32 分配却注解 F32,与声明(U8)、调用点三方各说各话 | 修引擎:**如实传递** |
+| `dflash_kv_leaves` 草稿池叶子注解用 `self.dims.dtype`(目标池 F16),而草稿池是 **BF16 分配** | 修引擎:BF16 |
+| XQA 四件套(page_table/seq_lens/mask/semaphores)= **图输入槽**(写 f32 数值、核按 u32 读 = 位型走私)⇒ 声明写 F32 + 注记 | 对齐 |
+| 24 条 rank:层侧顺手扇平(`key/k/q` = `[T, HK·HD]`)而核真按 3D 索引 ⇒ **改调用点 reshape**(零成本元数据) | 对齐 |
+| `beta/gate`(gdn 两臂)、`a_log/dt_bias`、`pos/ids/anchor/gamma/conv_state/slots/cu_seqlens` … 声明陈旧 ⇒ 改声明;逐元素核(add/mul/sigmoid/silu/cast/argmax/embed-ids/concat 行/rope pos)⇒ **显式 `rank = 0`** | 对齐 |
+| `owl-models` 测试目标**从未编译过**(`model_prefill` 少一参 + 测试里用 `?` 返回 `()`);修好后 123/123,并当场抓出**测试自身**的 dtype 错(`LoaderCtx::default()` = F32 的 rope 表喂进 `const __half* cos_t` 的融合插池核) | 顺手修(测试域) |
+
+### 19.6 新门
+
+| 门 | 判据 |
+|---|---|
+| `op_tables::op_tables_match_cu_param_names`(**新**) | 声明表形参**名** == `.cu` 形参名(逐位含序);121 张 native 表全绿。取证口与 token 级**同一实现**(`cu_sig::cu_params_of` 三形态:宏展开/单层宏实例化/字面核) |
+| `spec::tests` +7 | 事实面正例 / dtype 负例 / rank 负例 / **事实缺失必拒** / `rank=0` 通配 / Out 禁 BlockSlice / 未知块拒 / 几何律 / `slot_sources` 与 O 位一致 |
+| A17 锁表 | 11 个族算子的 (名序, 类型签名) 按新声明**重生成**(`gdn_chunked` beta/gate = F16x2;`gdn_scalar` = F32x3/F32x2;xqa/FI/cublas/marlin 池句柄口径) |
+
+### 19.7 验收
+
+| 判据 | 结果 |
+|---|---|
+| 单测/门 | kernels **63/63** · op_tables **8/8** · no_runtime_compile **2/2** · models **123/123**(目标首次可编译)· cuda **6/6 + 2/2 + 1/1**(`--lib`/门;`gpu_server` 集成测试见下)· shared **39/39** |
+| 真机 fp8 档(6 请求 × ptok 543…2453) | **6/6 `tool_calls`** + `[L3 事实面]` 拒绝 **0** |
+| 真机 **f16-KV 档**(同模型,`kv_fp8=false`) | boot/plan/请求全绿 + 拒绝 **0**(这条档就是上面那个静默 bug 的现场) |
+| 事实面口径 | **服务端** `check_from_params` 唯一门(客户端零自查);`Arg`/`Bytes` 携带 dtype/rank;`DeviceRes::resolve(id)` |
+| 存量失效(非本轮) | `backends/cuda/tests/gpu_server.rs::gpu_server_contract` 用**内联 `.cu` 源**跑 `owl_scale_f32` —— NVRTC 退役后的"零运行期编译"硬门当场拒(该测试自那次退役起就失效,与事实面无关);要复活需给它一个构建期资产 |
+| 数值指纹 | 同一探针点(t=31/379/405)gap = **4.57812 / 4.32812 / 4.56250** 与改动前**逐位相同** |
+
+### 19.8 诚实边界(未验路径)
+
+- 审计覆盖 = **该档跑到的路径**(fp8 档:XQA/FI/K0/fp8-pool/草稿 BF16;f16 档:FI f16/
+  paged v2 f16/fused insert f16/草稿 BF16)。**未跑到**的臂(naive decode、classic 池臂、
+  0.8B W4A16 档、holo/nex 档)只做了**静态对齐**(按池口径推断 + 名字级门 + `.cu` 视图),
+  未做真机验证 —— 谁开那些档,门会当场把不对齐的地方**指名报出来**(不会再静默)。
+- `rank = 0` 目前用在:逐元素核(计数扁平索引)、行栈/位型表/池句柄等**视图随臂变**的槽。
+  它是**显式**声明(不是漏写),但确实弱于具体阶数 ⇒ 复核时优先看这些槽。
+- `ShapeRule`(符号维)仍是**空机制**(121 张表 0 处填)⇒ shape 级检查(维度顺序/转置)
+  仍未落地;本轮把事实面接口开在 `TensorFacts` 上,将来加 shape 只需扩该结构 + 求值器。

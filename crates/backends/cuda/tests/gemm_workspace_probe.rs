@@ -9,9 +9,9 @@ fn gemm_launch(a: &owl_cuda::Bytes, w: &owl_cuda::Bytes, o: &owl_cuda::Bytes, to
     LaunchMsg {
         kernel: owl_cuda::KernelSource { name: "cublas_gemm_f16".into(), source: String::new() },
         args: vec![
-            Arg::Block { id: a.id },
-            Arg::Block { id: w.id },
-            Arg::Block { id: o.id },
+            Arg::block(a.id, a.dtype, a.rank),
+            Arg::block(w.id, w.dtype, w.rank),
+            Arg::block(o.id, o.dtype, o.rank),
             Arg::U64(tokens as u64),
             Arg::U64(k as u64),
             Arg::U64(feats as u64),

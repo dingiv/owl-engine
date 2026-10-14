@@ -13,6 +13,7 @@
 use crate::contract::{Arg, Bytes, KernelSource, LaunchMsg};
 
 use owl_kernels::driver::OpId;
+use owl_kernels::spec::SlotSrc;
 
 /// 语义算子动作词表(2026-10-12 用户律:层面向**抽象动作**,不面向实现
 /// —— 层只描述「对张量做什么」,硬件归解释器/驱动关注。枚举变体 = 层侧
@@ -423,7 +424,7 @@ pub fn lower_gemm(
         args: vec![
             ins[0].clone(),
             ins[1].clone(),
-            Arg::Block { id: out.id },
+            Arg::block(out.id, out.dtype, out.rank),
             Arg::U64(m as u64),
             Arg::U64(k as u64),
             Arg::U64(n as u64),
@@ -449,7 +450,7 @@ pub fn lower_matmul(ins: &[Arg], out: &Bytes, m: usize, k: usize, n: usize) -> L
         args: vec![
             ins[0].clone(),
             ins[1].clone(),
-            Arg::Block { id: out.id },
+            Arg::block(out.id, out.dtype, out.rank),
             Arg::I32(m as i32),
             Arg::I32(k as i32),
             Arg::I32(n as i32),
@@ -468,7 +469,7 @@ pub fn lower_matmul_nt(ins: &[Arg], out: &Bytes, m: usize, k: usize, n: usize) -
         args: vec![
             ins[0].clone(),
             ins[1].clone(),
-            Arg::Block { id: out.id },
+            Arg::block(out.id, out.dtype, out.rank),
             Arg::I32(m as i32),
             Arg::I32(k as i32),
             Arg::I32(n as i32),
@@ -506,62 +507,51 @@ pub fn lower_kernel(
     // 槽序唯一权威(优先序:算子元数据 → 登记表 → 逃生舱签名;
     // 2026-10-13 P3:已建表算子经 KernelSpec 的 PARAMS 派生,零第二份手抄)
     let toks: Vec<&str> = kernel.slot_tokens();
-    // 输出槽位:E3 起 sig 可含 "O"(输出块所在槽,marlin foreign 等
-    // out 非末参的核);无 O = 末位 T(向后兼容)
-    let out_pos = toks.iter().position(|t| *t == "O");
-    let is_out = |i: usize| match out_pos {
-        Some(p) => i == p,
-        None => i + 1 == toks.len(),
-    };
-    // 其余 T 槽数必须等于父依赖数
-    let t_in = toks
-        .iter()
-        .enumerate()
-        .filter(|(i, t)| **t == "T" && !is_out(*i))
-        .count();
+    // 槽的事实来源(父张量 / 输出 / 标量):**规则单源** =
+    // `owl_kernels::spec::slot_sources_of_tokens`(2026-10-15:原 `is_out`
+    // 闭包就地推导 —— 事实面检查要与装配序逐槽对齐,两处推导必漂)
+    let srcs: Vec<SlotSrc> = kernel.slot_sources();
+    // 父张量槽数必须等于父依赖数
+    let t_in = srcs.iter().filter(|s| matches!(s, SlotSrc::Parent(_))).count();
     assert!(
         t_in == ins.len(),
         "lower_kernel({}): 签名 T 槽 {t_in} != 父依赖 {}(检查 .arg 链)",
         kernel.name,
         ins.len()
     );
+    let n_scal = srcs.iter().filter(|s| matches!(s, SlotSrc::Scalar)).count();
     assert!(
-        toks.len() - t_in - 1 == scalars.len(), // -1 = 输出槽(末位 T 或 O)
-        "lower_kernel({}): 签名标量槽 {} != 标量参数 {}(sz/i32/f32 与 arg_usize/arg_i32/arg_f32 对位)",
+        n_scal == scalars.len(),
+        "lower_kernel({}): 签名标量槽 {n_scal} != 标量参数 {}(sz/i32/f32 与 arg_usize/arg_i32/arg_f32 对位)",
         kernel.name,
-        toks.len() - t_in - 1,
         scalars.len()
     );
 
-    // 按 sig 对位装配:T → 下一个父块(父输出类型 = 张量块,查父即得);
-    // sz/i32/f32 → 下一个标量;末位 T → 输出块
+    // 按槽源装配:Parent → 下一个父块;Out → 输出块;Scalar → 下一个标量
     let mut args: Vec<Arg> = Vec::with_capacity(toks.len());
-    let (mut pi, mut si) = (0usize, 0usize);
-    for (i, tok) in toks.iter().enumerate() {
-        let is_out = is_out(i);
-        match *tok {
-            "T" if is_out => args.push(Arg::Block { id: out.id }),
-            "O" => args.push(Arg::Block { id: out.id }),
-            "T" => {
-                args.push(ins[pi].clone());
-                pi += 1;
+    let mut si = 0usize;
+    for (i, (tok, src)) in toks.iter().zip(srcs.iter()).enumerate() {
+        match src {
+            SlotSrc::Out => args.push(Arg::block(out.id, out.dtype, out.rank)),
+            SlotSrc::Parent(pi) => args.push(ins[*pi].clone()),
+            SlotSrc::Scalar => {
+                match *tok {
+                    "sz" => match &scalars[si] {
+                        KernelArg::Bits(v) => args.push(Arg::U64(*v)),
+                        other => panic!("lower_kernel({}): 槽 {i} 期望 sz,实得 {other:?}", kernel.name),
+                    },
+                    "i32" => match &scalars[si] {
+                        KernelArg::I32(v) => args.push(Arg::I32(*v)),
+                        other => panic!("lower_kernel({}): 槽 {i} 期望 i32,实得 {other:?}", kernel.name),
+                    },
+                    "f32" => match &scalars[si] {
+                        KernelArg::F32(v) => args.push(Arg::F32(*v)),
+                        other => panic!("lower_kernel({}): 槽 {i} 期望 f32,实得 {other:?}", kernel.name),
+                    },
+                    other => panic!("lower_kernel({}): 非法签名 token `{other}`", kernel.name),
+                }
+                si += 1;
             }
-            "sz" => match &scalars[si] {
-                KernelArg::Bits(v) => args.push(Arg::U64(*v)),
-                other => panic!("lower_kernel({}): 槽 {i} 期望 sz,实得 {other:?}", kernel.name),
-            },
-            "i32" => match &scalars[si] {
-                KernelArg::I32(v) => args.push(Arg::I32(*v)),
-                other => panic!("lower_kernel({}): 槽 {i} 期望 i32,实得 {other:?}", kernel.name),
-            },
-            "f32" => match &scalars[si] {
-                KernelArg::F32(v) => args.push(Arg::F32(*v)),
-                other => panic!("lower_kernel({}): 槽 {i} 期望 f32,实得 {other:?}", kernel.name),
-            },
-            other => panic!("lower_kernel({}): 非法签名 token `{other}`", kernel.name),
-        }
-        if !is_out && *tok != "T" {
-            si += 1;
         }
     }
     let (grid, block, shared_mem) = if kernel.launch.grid == (0, 0, 0) {
@@ -584,6 +574,9 @@ pub fn auto_grid(out_elems: usize) -> (u32, u32, u32) {
     ceil_1d(out_elems)
 }
 
+
+
+
 // ============================================================================
 // 采样(E3;REQ-DEC-04 每步零大 D2H)
 // ============================================================================
@@ -601,7 +594,6 @@ pub fn argmax_f32idx(x: &crate::tensor::TensorOps, n: usize, offset: usize) -> c
     .arg_i32(offset as i32)
     .with_shape(Dtype::F32, vec![1])
 }
-
 
 // ============================================================================
 // §6 层↔kernels 隔离面(2026-10-12 用户律:**layers 禁触 owl_kernels**;
@@ -711,9 +703,9 @@ mod foreign_call_lock {
         });
         let kernel = crate::kernel::Kernel::new(pick.name, "")
             .with_sig(foreign_sig(pick.name).expect("foreign sig"));
-        let out = Bytes::new(99, 64 * 48 * 128);
+        let out = Bytes::new(99, 64 * 48 * 128, Dtype::F16, 3); // [t, nv, kd]
         let ins: Vec<Arg> = [&q, &k, &v, &beta, &gate, &state]
-            .iter().map(|t| Arg::Block { id: t.id }).collect();
+            .iter().map(|t| Arg::block(t.id, t.dtype, t.shape.len() as u8)).collect();
         let msg = lower_kernel(&kernel, &node.args, &ins, &out, 64 * 48 * 128);
 
         // server 面 parse 逐位对拍(线格式四点锁的最后一环)
@@ -758,9 +750,9 @@ mod foreign_call_lock {
         });
         let kernel = crate::kernel::Kernel::new(pick.name, "")
             .with_sig(foreign_sig(pick.name).expect("foreign sig"));
-        let out = Bytes::new(99, 32 * 8 * 64);
+        let out = Bytes::new(99, 32 * 8 * 64, Dtype::F16, 3);
         let ins: Vec<Arg> = [&q, &k, &v, &g, &beta, &state]
-            .iter().map(|t| Arg::Block { id: t.id }).collect();
+            .iter().map(|t| Arg::block(t.id, t.dtype, t.shape.len() as u8)).collect();
         let msg = lower_kernel(&kernel, &node.args, &ins, &out, 32 * 8 * 64);
 
         let (call, out2) = fc_scalar::GdnScalarCall::parse(&msg).expect("server parse");

@@ -6,7 +6,7 @@
 //! wr = 依赖边;sm_scale 以 f32 位型过线,server 面 from_bits 还原;
 //! nb 由页表推导,非线格式字段)。
 
-use crate::contract::{Arg, Bytes, LaunchMsg, OpError};
+use crate::contract::{Arg, Bytes, Dtype, LaunchMsg, OpError};
 
 pub const PREFILL_FI: &str = crate::family::flashinfer::PREFILL_FI;
 pub const PREFILL_FI_FP8KV: &str = crate::family::flashinfer::PREFILL_FI_FP8KV;
@@ -49,7 +49,7 @@ pub fn parse_prefill(msg: &LaunchMsg) -> Result<FiPrefillCall, OpError> {
     let mut scalars: Vec<u64> = Vec::new();
     for a in &msg.args {
         match a {
-            Arg::Block { id } => blocks.push(BlockRef { id: *id, byte_offset: 0 }),
+            Arg::Block { id, .. } => blocks.push(BlockRef { id: *id, byte_offset: 0 }),
             Arg::BlockSlice { id, byte_offset, .. } => {
                 blocks.push(BlockRef { id: *id, byte_offset: *byte_offset })
             }
@@ -89,7 +89,7 @@ pub fn parse_prefill(msg: &LaunchMsg) -> Result<FiPrefillCall, OpError> {
         indptr,
         last_len,
         wr,
-        out: Bytes { id: blocks[8].id, len: 0 },
+        out: Bytes::new(blocks[8].id, 0, Dtype::F16, 2),
         total_rows: scalars[0] as usize,
         ctx_total: scalars[1] as usize,
         t: scalars[2] as usize,

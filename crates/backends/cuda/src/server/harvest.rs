@@ -57,7 +57,9 @@ impl GpuServer {
                 let finish: Finish = Box::new(move || {
                     pool.put(buf);
                     if let Some(a) = cell.lock().unwrap_or_else(|p| p.into_inner()).take() {
-                        a.send(Ok(Bytes::new(id, n)));
+                        // 事实面由客户端按 (dtype, shape) 定形(`htod` 回执后 patch);
+                        // 服务端此处只给**句柄**(字节口径 U8 + rank 0 = 未定形)
+                        a.send(Ok(Bytes::new(id, n, Dtype::U8, 0)));
                     }
                 });
                 if let Err(e) = self.notify(&stream, finish) {

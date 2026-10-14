@@ -744,7 +744,10 @@ impl GatedDeltaNet {
             // 自研链 ~2100µs(5.5×)。大 T 限定(与 scalar 同纪律)。
             // 具名算子声明(2026-10-12 用户律二番):名字/发射配置归 driver
             chunked_delta(
-                &q_n, &k_n, &v_c, &beta, &g, &gdn.rec, slot_host,
+                &q_n.reshape(vec![tokens, self.nk, self.hk_dim]),
+                &k_n.reshape(vec![tokens, self.nk, self.hk_dim]),
+                &v_c.reshape(vec![tokens, self.nv, self.hv_dim]),
+                &beta, &g, &gdn.rec, slot_host,
                 tokens, self.nv, self.nk, self.hk_dim,
             )
         } else {

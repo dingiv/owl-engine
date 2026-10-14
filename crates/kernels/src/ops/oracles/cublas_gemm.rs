@@ -66,9 +66,9 @@ pub fn run_case(r: &mut dyn CheckRunner, c: &Case) -> Result<Vec<u16>, OpError> 
             source: String::new(),
         },
         args: vec![
-            Arg::Block { id: da.id },
-            Arg::Block { id: db.id },
-            Arg::Block { id: dout.id },
+            Arg::block(da.id, da.dtype, da.rank),
+            Arg::block(db.id, db.dtype, db.rank),
+            Arg::block(dout.id, dout.dtype, dout.rank),
             Arg::U64(N_OUT as u64),
             Arg::U64(K as u64),
             Arg::U64(TT as u64),

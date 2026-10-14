@@ -251,3 +251,34 @@ fn production_picks_carry_admission_meta() {
     eprintln!("[op-tables] {n} 个生产臂均携带准入声明 ✓");
 }
 
+/// **名字级互证**(2026-10-15):声明表形参名 == `.cu` 形参名(逐位、含序)。
+///
+/// 为什么 token 级不够:token 串只编码 T/sz/i32/f32 的**形状**,看不见
+/// "同形状、不同语义槽位"的漂移 —— 实测活体
+/// `owl_qknorm_rope_kv_insert_f16{,_knhd}`:声明是旧签名、`.cu` 是新签名,
+/// token 串逐字相同 ⇒ 旧门全绿,而调用点按新序喂 = 语义全错位。
+#[test]
+fn op_tables_match_cu_param_names() {
+    let mut checked = 0usize;
+    for m in ops::all() {
+        if m.src.is_empty() {
+            continue; // foreign(FFI):无 .cu 源(名字面由 face 常量/锁表承担)
+        }
+        let text = owl_kernels::cu_sig::cu_text(m.src);
+        let Some(cu) = owl_kernels::cu_sig::parse_cu_param_names(&text, m.entry) else {
+            panic!("{}: 源码里找不到同名入口", m.entry);
+        };
+        let mine = m.param_names();
+        assert_eq!(
+            mine,
+            cu.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            "{}: 声明表形参名与 .cu 不符(语义槽位错位)\n  表: {:?}\n  cu: {:?}",
+            m.entry,
+            mine,
+            cu
+        );
+        checked += 1;
+    }
+    assert!(checked >= 30, "建表数异常(仅 {checked} 条参与名字互证)");
+    eprintln!("[op-tables] {checked} 张表形参名与 .cu 逐位一致 ✓");
+}

@@ -79,10 +79,10 @@ fn scale_msg(x: &Bytes, out: &Bytes, k: f32, n: usize) -> LaunchMsg {
     LaunchMsg {
         kernel: KernelSource { name: "owl_scale_f32".into(), source: SCALE_CU.into() },
         args: vec![
-            Arg::Block { id: x.id },
+            Arg::block(x.id, x.dtype, x.rank),
             Arg::F32(k),
             Arg::U64(n as u64),
-            Arg::Block { id: out.id },
+            Arg::block(out.id, out.dtype, out.rank),
         ],
         grid: ((n as u32).div_ceil(256), 1, 1),
         block: (256, 1, 1),
@@ -97,7 +97,7 @@ fn scale_msg(x: &Bytes, out: &Bytes, k: f32, n: usize) -> LaunchMsg {
 
 /// 步骤 1:alloc 零化(N4 图外 memset 回归哨)
 async fn step_alloc_zeroed(client: &mut GpuClient) {
-    let out = client.alloc(Dtype::F32, 8).await.expect("alloc");
+    let out = client.alloc(Dtype::F32, 8).await.expect("alloc").view(Dtype::F32, 1);
     let got = harvest(client, &out, 8).await;
     assert!(
         got.iter().all(|&v| v == 0.0),
@@ -123,7 +123,7 @@ async fn step_launch_scale(client: &mut GpuClient) {
         .htod(Dtype::F32, &Shape::from(vec![4]), &le_f32(&xs))
         .await
         .expect("htod");
-    let out = client.alloc(Dtype::F32, 4).await.expect("alloc");
+    let out = client.alloc(Dtype::F32, 4).await.expect("alloc").view(Dtype::F32, 1);
     client
         .launch(scale_msg(&x, &out, 3.0, 4))
         .await
@@ -139,7 +139,7 @@ async fn step_sync_is_barrier(client: &mut GpuClient) {
         .htod(Dtype::F32, &Shape::from(vec![src.len()]), &le_f32(&src))
         .await
         .expect("htod");
-    let out = client.alloc(Dtype::F32, src.len()).await.expect("alloc");
+    let out = client.alloc(Dtype::F32, src.len()).await.expect("alloc").view(Dtype::F32, 1);
     client.launch(scale_msg(&x, &out, 1.0, src.len())).await.expect("launch");
     let got = harvest(client, &out, src.len()).await;
     for (i, (g, w)) in got.iter().zip(src.iter()).enumerate() {
@@ -153,8 +153,8 @@ async fn step_graph_capture_and_replay(client: &mut GpuClient, x: &Bytes) {
     client.graph_begin().await.expect("graph_begin");
 
     // 捕获期 Alloc(切片块 + memset 进图)+ scale 发射
-    let zeros = client.alloc(Dtype::F32, 4).await.expect("captured alloc");
-    let out = client.alloc(Dtype::F32, 4).await.expect("captured alloc");
+    let zeros = client.alloc(Dtype::F32, 4).await.expect("captured alloc").view(Dtype::F32, 1);
+    let out = client.alloc(Dtype::F32, 4).await.expect("captured alloc").view(Dtype::F32, 1);
     client.launch(scale_msg(x, &out, 3.0, 4)).await.expect("launch");
 
     let gid = client.graph_end().await.expect("graph_end");
@@ -265,7 +265,7 @@ async fn gpu_server_contract() {
 async fn step_graph_launch_probe(client: &mut GpuClient, x: &Bytes) {
     for (tag, launches) in [("小图", 1usize), ("大图", 500usize)] {
         client.graph_begin().await.expect("begin");
-        let out = client.alloc(Dtype::F32, 4).await.expect("alloc");
+        let out = client.alloc(Dtype::F32, 4).await.expect("alloc").view(Dtype::F32, 1);
         for _ in 0..launches {
             client.launch(scale_msg(x, &out, 1.0, 4)).await.expect("launch");
         }
@@ -324,13 +324,13 @@ async fn gpu_gemm_f16_matches_host() {
 
     let da = client.htod(Dtype::F16, &Shape::from(vec![t, k]), &le_f16(&a)).await.expect("htod a");
     let dw = client.htod(Dtype::F16, &Shape::from(vec![n, k]), &le_f16(&w)).await.expect("htod w");
-    let dout = client.alloc(Dtype::F16, t * n).await.expect("alloc out");
+    let dout = client.alloc(Dtype::F16, t * n).await.expect("alloc out").view(Dtype::F16, 2); // [m,n]
     let msg = LaunchMsg {
         kernel: KernelSource { name: "cublas_gemm_f16".into(), source: String::new() },
         args: vec![
-            Arg::Block { id: da.id },
-            Arg::Block { id: dw.id },
-            Arg::Block { id: dout.id },
+            Arg::block(da.id, da.dtype, da.rank),
+            Arg::block(dw.id, dw.dtype, dw.rank),
+            Arg::block(dout.id, dout.dtype, dout.rank),
             Arg::U64(n as u64),
             Arg::U64(k as u64),
             Arg::U64(t as u64),

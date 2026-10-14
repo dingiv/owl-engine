@@ -988,7 +988,7 @@ mod tests {
         let slots_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&(0..t_len).map(|t| t as f32).collect::<Vec<_>>()));
         let lens_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&(0..t_len).map(|t| t as f32 + 1.0).collect::<Vec<_>>()));
         let gdn_slot = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0]));
-        let ctx = ForwardCtx::model_prefill(t_len, &pos_all, &kvs_b, &rp, &gdns_b, &slots_all, &lens_all, &gdn_slot, 0, None);
+        let ctx = ForwardCtx::model_prefill(t_len, &pos_all, &kvs_b, &rp, &gdns_b, &slots_all, &lens_all, &gdn_slot, None, 0, None);
         let pre_hidden = crate::testkit::harvest(&mut gpu, &model.last_hidden(&ids_all, &ctx)).await;
         for t in 0..t_len {
             let d: f32 = pre_hidden[t * HIDDEN..(t + 1) * HIDDEN]
@@ -1001,7 +1001,7 @@ mod tests {
 
         // ── logits 根(缓冲套 C)+ host 锚 ──
         let (kvs_c, gdns_c) = model_bufs(&mut gpu, 1, 3).await;
-        let ctx_c = ForwardCtx::model_prefill(t_len, &pos_all, &kvs_c, &rp, &gdns_c, &slots_all, &lens_all, &gdn_slot, 0, None);
+        let ctx_c = ForwardCtx::model_prefill(t_len, &pos_all, &kvs_c, &rp, &gdns_c, &slots_all, &lens_all, &gdn_slot, None, 0, None);
         let got_all = crate::testkit::harvest(&mut gpu, &model.forward(&ids_all, &ctx_c)).await;
         let mut host2 = HostModel::new(checkpoint_src());
         for t in 0..t_len {

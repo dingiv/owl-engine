@@ -22,10 +22,10 @@ impl KernelSpec for NcAttnBf16V2 {
         Param::t_in("q", Dtype::BF16, 2),
         Param::t_in("k_self", Dtype::BF16, 3),
         Param::t_in("v_self", Dtype::BF16, 3),
-        Param::t_in("kc", Dtype::BF16, 3),
-        Param::t_in("vc", Dtype::BF16, 3),
+        Param::t_in("kc", Dtype::BF16, 5),
+        Param::t_in("vc", Dtype::BF16, 4),
         // 整请求 KV 长(设备侧标量,f32 张量;非 host 标量 —— 图内可读)
-        Param::t_in("kv_len_p", Dtype::F32, 1),
+        Param::t_in("kv_len_p", Dtype::F32, 0),
         Param::i32("q_heads"),
         Param::i32("kv_heads"),
         Param::i32("d_dim"),
@@ -58,15 +58,20 @@ impl KernelSpec for NcAttnBf16V2 {
 /// (bs32 = block 32 行;kNHD 寻址;KV 池 e4m3 1B/elem)。
 pub struct PagedAttnV2Fp8KnhdHd256Bs32;
 
-/// paged v2 主核共享参数表(18 参;f16/fp8 × classic/kNHD 同 ABI)
+/// paged v2 主核参数表 —— **fp8 池臂**(18 参;f16/fp8 × classic/kNHD 同 ABI,
+/// 池句柄视图不同 ⇒ 2026-10-15 拆两表)
 const PAGED_V2_FP8_KNHD_PARAMS: &[Param] = &[
         Param::t_in("q", Dtype::F16, 2),
-        // fp8 e4m3 池(1B/elem;.cu 以 uint16_t* 声明仅为 2 字节装载)
-        Param::t_in("k_cache", Dtype::U8, 4),
-        Param::t_in("v_cache", Dtype::U8, 4),
+        // fp8 主池句柄:引擎叶子 = U32 扁平字节账(`bytes/4` 字;池的 e4m3
+        // 字节语义由 `POOL` 的 `Dtype::U8` 承担)。旧声明 U8x4 描述的是核内
+        // kNHD 字节视图,与喂进来的句柄不是同一层(2026-10-15 事实面对齐)
+        Param::t_in("k_cache", Dtype::U32, 1),
+        Param::t_in("v_cache", Dtype::U32, 1),
         Param::t_in("block_tables", Dtype::F32, 2),
-        Param::t_in("context_lens", Dtype::F32, 1),
-        Param::t_in("alibi_slopes", Dtype::F32, 1),
+        // 每序列 KV 长:视图随臂变(计划输入槽 rank1 / 会话表 rank2)⇒ 显式阶数无关
+        Param::t_in("context_lens", Dtype::F32, 0),
+        // 哑槽(use_alibi=0 不解引用):喂 K0 哑输出 = 本族激活 dtype(f16)
+        Param::t_in("alibi_slopes", Dtype::F16, 0),
         Param::t_in("exp_sums", Dtype::F32, 2),
         Param::t_in("max_logits", Dtype::F32, 2),
         Param::i32("num_kv_heads"),
@@ -78,7 +83,8 @@ const PAGED_V2_FP8_KNHD_PARAMS: &[Param] = &[
         Param::f32("softscapping"),
         Param::i32("sliding_window"),
         Param::i32("use_alibi"),
-        Param::t_out("tmp_out", Dtype::F16, 2),
+        // 引擎 scratch 叶子 = 扁平 `[hq·nparts·hd]`(rank1)
+        Param::t_out("tmp_out", Dtype::F16, 1),
 ];
 
 impl KernelSpec for PagedAttnV2Fp8KnhdHd256Bs32 {
@@ -108,8 +114,10 @@ impl KernelSpec for PagedAttnV2ReduceF16Hd256 {
     const PARAMS: &'static [Param] = &[
         Param::t_in("exp_sums", Dtype::F32, 2),
         Param::t_in("max_logits", Dtype::F32, 2),
-        Param::t_in("tmp_out", Dtype::F16, 2),
-        Param::t_in("context_lens", Dtype::F32, 1),
+        // 引擎 scratch 叶子 = 扁平 `[hq·nparts·hd]`(rank1)
+        Param::t_in("tmp_out", Dtype::F16, 1),
+        // 每序列 KV 长:视图随臂变(计划输入槽 rank1 / 会话表 rank2)⇒ 显式阶数无关
+        Param::t_in("context_lens", Dtype::F32, 0),
         Param::i32("max_num_partitions"),
         Param::t_out("out", Dtype::F16, 2),
     ];
@@ -133,9 +141,9 @@ impl KernelSpec for K0WriteFp8Knhd {
     const PARAMS: &'static [Param] = &[
         Param::t_in("key", Dtype::F16, 3),
         Param::t_in("value", Dtype::F16, 3),
-        Param::t_in("key_cache", Dtype::U8, 4),
-        Param::t_in("value_cache", Dtype::U8, 4),
-        Param::t_in("slot_mapping", Dtype::F32, 1),
+        Param::t_in("key_cache", Dtype::U32, 1),
+        Param::t_in("value_cache", Dtype::U32, 1),
+        Param::t_in("slot_mapping", Dtype::F32, 0),
         Param::i32("key_stride"),
         Param::i32("value_stride"),
         Param::i32("num_heads"),
@@ -176,13 +184,13 @@ impl KernelSpec for ChunkedPrefillFp8KnhdHd256 {
     const SRC: &'static str = "cu/attn/prefill_paged_attn_f16.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
-        Param::t_in("k_cache", Dtype::U8, 4),
-        Param::t_in("v_cache", Dtype::U8, 4),
+        Param::t_in("k_cache", Dtype::U32, 1),
+        Param::t_in("v_cache", Dtype::U32, 1),
         Param::t_in("block_tables", Dtype::F32, 2),
-        Param::t_in("seq_lens", Dtype::F32, 1),
-        Param::t_in("query_start_len", Dtype::F32, 1),
-        Param::t_in("alibi_slopes", Dtype::F32, 1),
-        Param::t_in("sinks", Dtype::F32, 1),
+        Param::t_in("seq_lens", Dtype::F32, 0),
+        Param::t_in("query_start_len", Dtype::F32, 0),
+        Param::t_in("alibi_slopes", Dtype::F16, 0),
+        Param::t_in("sinks", Dtype::F32, 0),
         Param::i32("num_kv_heads"),
         Param::f32("sm_scale"),
         Param::i32("block_table_stride"),
@@ -243,7 +251,7 @@ const K0_PARAMS: &[Param] = &[
     Param::t_in("value", Dtype::F16, 3),
     Param::t_in("key_cache", Dtype::U8, 4),
     Param::t_in("value_cache", Dtype::U8, 4),
-    Param::t_in("slot_mapping", Dtype::F32, 1),
+    Param::t_in("slot_mapping", Dtype::F32, 2),
     Param::i32("key_stride"),
     Param::i32("value_stride"),
     Param::i32("num_heads"),
@@ -263,9 +271,9 @@ impl KernelSpec for K0WriteBf16 {
     const PARAMS: &'static [Param] = &[
         Param::t_in("key", Dtype::BF16, 3),
         Param::t_in("value", Dtype::BF16, 3),
-        Param::t_in("key_cache", Dtype::BF16, 4),
+        Param::t_in("key_cache", Dtype::BF16, 5),
         Param::t_in("value_cache", Dtype::BF16, 4),
-        Param::t_in("slot_mapping", Dtype::F32, 1),
+        Param::t_in("slot_mapping", Dtype::F32, 0),
         Param::i32("key_stride"),
         Param::i32("value_stride"),
         Param::i32("num_heads"),
@@ -298,9 +306,9 @@ impl KernelSpec for NcAttnFp8kvBf16 {
         Param::t_in("q", Dtype::BF16, 2),
         Param::t_in("k_self", Dtype::BF16, 3),
         Param::t_in("v_self", Dtype::BF16, 3),
-        Param::t_in("kc", Dtype::U8, 3),
-        Param::t_in("vc", Dtype::U8, 3),
-        Param::t_in("kv_len_p", Dtype::F32, 1),
+        Param::t_in("kc", Dtype::U32, 1),
+        Param::t_in("vc", Dtype::U32, 1),
+        Param::t_in("kv_len_p", Dtype::F32, 0),
         Param::i32("q_heads"),
         Param::i32("kv_heads"),
         Param::i32("d_dim"),
@@ -339,7 +347,7 @@ impl KernelSpec for NormRopeF16 {
         Param::t_in("w", Dtype::F16, 1),
         Param::t_in("cos_t", Dtype::F16, 2),
         Param::t_in("sin_t", Dtype::F16, 2),
-        Param::t_in("pos", Dtype::F32, 1),
+        Param::t_in("pos", Dtype::F32, 0),
         Param::f32("eps"),
         Param::sz("row_stride"),
         Param::sz("head_stride"),
@@ -363,7 +371,7 @@ impl KernelSpec for NormRopeBf16 {
         Param::t_in("w", Dtype::BF16, 1),
         Param::t_in("cos_t", Dtype::F16, 2),
         Param::t_in("sin_t", Dtype::F16, 2),
-        Param::t_in("pos", Dtype::F32, 1),
+        Param::t_in("pos", Dtype::F32, 0),
         Param::f32("eps"),
         Param::sz("row_stride"),
         Param::sz("head_stride"),
@@ -397,14 +405,36 @@ pub static NORM_ROPE_BF16: KernelMeta = meta_of::<NormRopeBf16>();
 // —— 共享参数表(同 ABI 只差 ENTRY/池 dtype/几何声明),逐表由 `.cu` 互证门对账
 // ============================================================================
 
-/// paged v2 主核参数表(f16/fp8 × classic/kNHD × hd128/256 同 ABI;18 参)
-const PAGED_V2_PARAMS: &[Param] = PAGED_V2_FP8_KNHD_PARAMS;
+/// paged v2 主核参数表 —— **f16 池臂**(池句柄 = kNHD 分页视图)
+const PAGED_V2_F16_KNHD_PARAMS: &[Param] = &[
+        Param::t_in("q", Dtype::F16, 2),
+        // f16 主池:引擎叶子 = [nb, hkv, hd/x, page, x](k)/[nb, hkv, hd, page](v)
+        Param::t_in("k_cache", Dtype::F16, 5),
+        Param::t_in("v_cache", Dtype::F16, 4),
+        Param::t_in("block_tables", Dtype::F32, 2),
+        // 每序列 KV 长:视图随臂变(计划输入槽 rank1 / 会话表 rank2)⇒ 显式阶数无关
+        Param::t_in("context_lens", Dtype::F32, 0),
+        Param::t_in("alibi_slopes", Dtype::F16, 0),
+        Param::t_in("exp_sums", Dtype::F32, 2),
+        Param::t_in("max_logits", Dtype::F32, 2),
+        Param::i32("num_kv_heads"),
+        Param::f32("scale"),
+        Param::i32("max_num_blocks_per_seq"),
+        Param::i32("q_stride"),
+        Param::i32("kv_block_stride"),
+        Param::i32("kv_head_stride"),
+        Param::f32("softscapping"),
+        Param::i32("sliding_window"),
+        Param::i32("use_alibi"),
+        Param::t_out("tmp_out", Dtype::F16, 1),
+];
 /// reduce 参数表(6 参;hd128/hd256 同 ABI)
 const PAGED_V2_REDUCE_PARAMS: &[Param] = &[
     Param::t_in("exp_sums", Dtype::F32, 2),
     Param::t_in("max_logits", Dtype::F32, 2),
-    Param::t_in("tmp_out", Dtype::F16, 2),
-    Param::t_in("context_lens", Dtype::F32, 1),
+    Param::t_in("tmp_out", Dtype::F16, 1),
+    // 每序列 KV 长:视图随臂变(计划输入槽 rank1 / 会话表 rank2)⇒ 显式阶数无关
+        Param::t_in("context_lens", Dtype::F32, 0),
     Param::i32("max_num_partitions"),
     Param::t_out("out", Dtype::F16, 2),
 ];
@@ -418,7 +448,11 @@ macro_rules! paged_v2_variant {
         impl KernelSpec for $ty {
             const ENTRY: &'static str = $entry;
             const SRC: &'static str = "cu/attn/pagedattention_f16.cu";
-            const PARAMS: &'static [Param] = PAGED_V2_PARAMS;
+            // 池句柄视图随池 dtype 分家(fp8 = U32 扁平字节账;f16 = kNHD 分页视图)
+            const PARAMS: &'static [Param] = match $pool_dt {
+                Dtype::U8 => PAGED_V2_FP8_KNHD_PARAMS,
+                _ => PAGED_V2_F16_KNHD_PARAMS,
+            };
             const LAWS: &'static [Law] = &[Law::OutputFinite];
             const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
             const DETERMINISM: Determinism = Determinism::Deterministic;
@@ -486,10 +520,10 @@ impl KernelSpec for NaiveDecodeAttnF16 {
     const SRC: &'static str = "cu/attn/naive_decode_attn.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
-        Param::t_in("k", Dtype::F16, 2),
-        Param::t_in("v", Dtype::F16, 2),
-        Param::t_in("kc", Dtype::F16, 2),
-        Param::t_in("vc", Dtype::F16, 2),
+        Param::t_in("k", Dtype::F16, 3),
+        Param::t_in("v", Dtype::F16, 3),
+        Param::t_in("kc", Dtype::F16, 5),
+        Param::t_in("vc", Dtype::F16, 4),
         Param::t_in("slots", Dtype::F32, 2),
         Param::t_in("kv_lens", Dtype::F32, 2),
         Param::sz("bs"),
@@ -545,11 +579,11 @@ impl KernelSpec for NaiveAttnNcF16 {
     const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
-        Param::t_in("k_self", Dtype::F16, 2),
-        Param::t_in("v_self", Dtype::F16, 2),
-        Param::t_in("kc", Dtype::F16, 2),
-        Param::t_in("vc", Dtype::F16, 2),
-        Param::t_in("kv_len_p", Dtype::F32, 2),
+        Param::t_in("k_self", Dtype::F16, 3),
+        Param::t_in("v_self", Dtype::F16, 3),
+        Param::t_in("kc", Dtype::F16, 5),
+        Param::t_in("vc", Dtype::F16, 4),
+        Param::t_in("kv_len_p", Dtype::F32, 0),
         Param::i32("q_heads"),
         Param::i32("kv_heads"),
         Param::i32("d_dim"),
@@ -575,11 +609,11 @@ impl KernelSpec for NaiveAttnNcBf16 {
     const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::BF16, 2),
-        Param::t_in("k_self", Dtype::BF16, 2),
-        Param::t_in("v_self", Dtype::BF16, 2),
-        Param::t_in("kc", Dtype::BF16, 2),
-        Param::t_in("vc", Dtype::BF16, 2),
-        Param::t_in("kv_len_p", Dtype::F32, 2),
+        Param::t_in("k_self", Dtype::BF16, 3),
+        Param::t_in("v_self", Dtype::BF16, 3),
+        Param::t_in("kc", Dtype::BF16, 5),
+        Param::t_in("vc", Dtype::BF16, 4),
+        Param::t_in("kv_len_p", Dtype::F32, 0),
         Param::i32("q_heads"),
         Param::i32("kv_heads"),
         Param::i32("d_dim"),
@@ -605,11 +639,11 @@ impl KernelSpec for NaiveAttnNcFp8KvF16 {
     const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
-        Param::t_in("k_self", Dtype::F16, 2),
-        Param::t_in("v_self", Dtype::F16, 2),
-        Param::t_in("kc", Dtype::U8, 2),
-        Param::t_in("vc", Dtype::U8, 2),
-        Param::t_in("kv_len_p", Dtype::F32, 2),
+        Param::t_in("k_self", Dtype::F16, 3),
+        Param::t_in("v_self", Dtype::F16, 3),
+        Param::t_in("kc", Dtype::U32, 1),
+        Param::t_in("vc", Dtype::U32, 1),
+        Param::t_in("kv_len_p", Dtype::F32, 0),
         Param::i32("q_heads"),
         Param::i32("kv_heads"),
         Param::i32("d_dim"),
@@ -634,18 +668,18 @@ impl KernelSpec for VllmReshapeAndCacheF16 {
     const ENTRY: &'static str = "vllm_reshape_and_cache_f16";
     const SRC: &'static str = "cu/attn/reshape_and_cache.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("key", Dtype::F16, 2),
-        Param::t_in("value", Dtype::F16, 2),
-        Param::t_in("key_cache", Dtype::F16, 2),
-        Param::t_in("value_cache", Dtype::F16, 2),
-        Param::t_in("slot_mapping", Dtype::F32, 2),
+        Param::t_in("key", Dtype::F16, 3),
+        Param::t_in("value", Dtype::F16, 3),
+        Param::t_in("key_cache", Dtype::F16, 5),
+        Param::t_in("value_cache", Dtype::F16, 4),
+        Param::t_in("slot_mapping", Dtype::F32, 0),
         Param::i32("key_stride"),
         Param::i32("value_stride"),
         Param::i32("num_heads"),
         Param::i32("head_size"),
         Param::i32("block_size"),
         Param::i32("x"),
-        Param::t_out("out", Dtype::F16, 2),
+        Param::t_out("out", Dtype::F16, 1),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Classic, Dtype::F16)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -664,18 +698,18 @@ impl KernelSpec for VllmReshapeAndCacheF16Knhd {
     const ENTRY: &'static str = "vllm_reshape_and_cache_f16_knhd";
     const SRC: &'static str = "cu/attn/reshape_and_cache.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("key", Dtype::F16, 2),
-        Param::t_in("value", Dtype::F16, 2),
-        Param::t_in("key_cache", Dtype::F16, 2),
-        Param::t_in("value_cache", Dtype::F16, 2),
-        Param::t_in("slot_mapping", Dtype::F32, 2),
+        Param::t_in("key", Dtype::F16, 3),
+        Param::t_in("value", Dtype::F16, 3),
+        Param::t_in("key_cache", Dtype::F16, 5),
+        Param::t_in("value_cache", Dtype::F16, 4),
+        Param::t_in("slot_mapping", Dtype::F32, 0),
         Param::i32("key_stride"),
         Param::i32("value_stride"),
         Param::i32("num_heads"),
         Param::i32("head_size"),
         Param::i32("block_size"),
         Param::i32("x"),
-        Param::t_out("out", Dtype::F16, 2),
+        Param::t_out("out", Dtype::F16, 1),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F16)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -694,18 +728,18 @@ impl KernelSpec for VllmReshapeAndCacheBf16Knhd {
     const ENTRY: &'static str = "vllm_reshape_and_cache_bf16_knhd";
     const SRC: &'static str = "cu/attn/reshape_and_cache.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("key", Dtype::BF16, 2),
-        Param::t_in("value", Dtype::BF16, 2),
-        Param::t_in("key_cache", Dtype::BF16, 2),
-        Param::t_in("value_cache", Dtype::BF16, 2),
-        Param::t_in("slot_mapping", Dtype::F32, 2),
+        Param::t_in("key", Dtype::BF16, 3),
+        Param::t_in("value", Dtype::BF16, 3),
+        Param::t_in("key_cache", Dtype::BF16, 5),
+        Param::t_in("value_cache", Dtype::BF16, 4),
+        Param::t_in("slot_mapping", Dtype::F32, 0),
         Param::i32("key_stride"),
         Param::i32("value_stride"),
         Param::i32("num_heads"),
         Param::i32("head_size"),
         Param::i32("block_size"),
         Param::i32("x"),
-        Param::t_out("out", Dtype::BF16, 2),
+        Param::t_out("out", Dtype::BF16, 1),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Knhd, Dtype::BF16)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -724,18 +758,18 @@ impl KernelSpec for ReshapeAndCacheFp8KvBf16 {
     const ENTRY: &'static str = "owl_reshape_and_cache_fp8kv_bf16";
     const SRC: &'static str = "cu/attn/reshape_and_cache_fp8kv.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("key", Dtype::BF16, 2),
-        Param::t_in("value", Dtype::BF16, 2),
-        Param::t_in("key_cache", Dtype::U8, 2),
-        Param::t_in("value_cache", Dtype::U8, 2),
-        Param::t_in("slot_mapping", Dtype::F32, 2),
+        Param::t_in("key", Dtype::BF16, 3),
+        Param::t_in("value", Dtype::BF16, 3),
+        Param::t_in("key_cache", Dtype::U32, 1),
+        Param::t_in("value_cache", Dtype::U32, 1),
+        Param::t_in("slot_mapping", Dtype::F32, 0),
         Param::i32("key_stride"),
         Param::i32("value_stride"),
         Param::i32("num_heads"),
         Param::i32("head_size"),
         Param::i32("block_size"),
         Param::i32("x"),
-        Param::t_out("out", Dtype::BF16, 2),
+        Param::t_out("out", Dtype::BF16, 1),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Classic, Dtype::U8)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -754,18 +788,18 @@ impl KernelSpec for ReshapeAndCacheFp8KvBf16Knhd {
     const ENTRY: &'static str = "owl_reshape_and_cache_fp8kv_bf16_knhd";
     const SRC: &'static str = "cu/attn/reshape_and_cache_fp8kv.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("key", Dtype::BF16, 2),
-        Param::t_in("value", Dtype::BF16, 2),
-        Param::t_in("key_cache", Dtype::U8, 2),
-        Param::t_in("value_cache", Dtype::U8, 2),
-        Param::t_in("slot_mapping", Dtype::F32, 2),
+        Param::t_in("key", Dtype::BF16, 3),
+        Param::t_in("value", Dtype::BF16, 3),
+        Param::t_in("key_cache", Dtype::U32, 1),
+        Param::t_in("value_cache", Dtype::U32, 1),
+        Param::t_in("slot_mapping", Dtype::F32, 0),
         Param::i32("key_stride"),
         Param::i32("value_stride"),
         Param::i32("num_heads"),
         Param::i32("head_size"),
         Param::i32("block_size"),
         Param::i32("x"),
-        Param::t_out("out", Dtype::BF16, 2),
+        Param::t_out("out", Dtype::BF16, 1),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Knhd, Dtype::U8)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -785,11 +819,11 @@ impl KernelSpec for VllmPagedAttentionV1F16Hd128 {
     const SRC: &'static str = "cu/attn/pagedattention_f16.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
-        Param::t_in("k_cache", Dtype::F16, 2),
-        Param::t_in("v_cache", Dtype::F16, 2),
+        Param::t_in("k_cache", Dtype::F16, 5),
+        Param::t_in("v_cache", Dtype::F16, 4),
         Param::t_in("block_tables", Dtype::F32, 2),
         Param::t_in("context_lens", Dtype::F32, 2),
-        Param::t_in("alibi_slopes", Dtype::F32, 2),
+        Param::t_in("alibi_slopes", Dtype::F16, 0),
         Param::i32("num_kv_heads"),
         Param::f32("scale"),
         Param::i32("max_num_blocks_per_seq"),
@@ -819,11 +853,11 @@ impl KernelSpec for VllmPagedAttentionV1F16Hd128bs32 {
     const SRC: &'static str = "cu/attn/pagedattention_f16.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
-        Param::t_in("k_cache", Dtype::F16, 2),
-        Param::t_in("v_cache", Dtype::F16, 2),
+        Param::t_in("k_cache", Dtype::F16, 5),
+        Param::t_in("v_cache", Dtype::F16, 4),
         Param::t_in("block_tables", Dtype::F32, 2),
         Param::t_in("context_lens", Dtype::F32, 2),
-        Param::t_in("alibi_slopes", Dtype::F32, 2),
+        Param::t_in("alibi_slopes", Dtype::F16, 0),
         Param::i32("num_kv_heads"),
         Param::f32("scale"),
         Param::i32("max_num_blocks_per_seq"),
@@ -853,11 +887,11 @@ impl KernelSpec for VllmPagedAttentionV1F16Hd256 {
     const SRC: &'static str = "cu/attn/pagedattention_f16.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
-        Param::t_in("k_cache", Dtype::F16, 2),
-        Param::t_in("v_cache", Dtype::F16, 2),
+        Param::t_in("k_cache", Dtype::F16, 5),
+        Param::t_in("v_cache", Dtype::F16, 4),
         Param::t_in("block_tables", Dtype::F32, 2),
         Param::t_in("context_lens", Dtype::F32, 2),
-        Param::t_in("alibi_slopes", Dtype::F32, 2),
+        Param::t_in("alibi_slopes", Dtype::F16, 0),
         Param::i32("num_kv_heads"),
         Param::f32("scale"),
         Param::i32("max_num_blocks_per_seq"),
@@ -887,11 +921,11 @@ impl KernelSpec for VllmPagedAttentionV1F16Hd256bs32 {
     const SRC: &'static str = "cu/attn/pagedattention_f16.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
-        Param::t_in("k_cache", Dtype::F16, 2),
-        Param::t_in("v_cache", Dtype::F16, 2),
+        Param::t_in("k_cache", Dtype::F16, 5),
+        Param::t_in("v_cache", Dtype::F16, 4),
         Param::t_in("block_tables", Dtype::F32, 2),
         Param::t_in("context_lens", Dtype::F32, 2),
-        Param::t_in("alibi_slopes", Dtype::F32, 2),
+        Param::t_in("alibi_slopes", Dtype::F16, 0),
         Param::i32("num_kv_heads"),
         Param::f32("scale"),
         Param::i32("max_num_blocks_per_seq"),
@@ -921,13 +955,13 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptF16Hd128 {
     const SRC: &'static str = "cu/attn/prefill_paged_attn_f16.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
-        Param::t_in("k_cache", Dtype::F16, 2),
-        Param::t_in("v_cache", Dtype::F16, 2),
+        Param::t_in("k_cache", Dtype::F16, 5),
+        Param::t_in("v_cache", Dtype::F16, 4),
         Param::t_in("block_tables", Dtype::F32, 2),
-        Param::t_in("seq_lens", Dtype::F32, 2),
-        Param::t_in("query_start_len", Dtype::F32, 2),
-        Param::t_in("alibi_slopes", Dtype::F32, 2),
-        Param::t_in("sinks", Dtype::F32, 2),
+        Param::t_in("seq_lens", Dtype::F32, 0),
+        Param::t_in("query_start_len", Dtype::F32, 0),
+        Param::t_in("alibi_slopes", Dtype::F16, 0),
+        Param::t_in("sinks", Dtype::F32, 0),
         Param::i32("num_kv_heads"),
         Param::f32("sm_scale"),
         Param::i32("block_table_stride"),
@@ -962,13 +996,13 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptF16Hd256 {
     const SRC: &'static str = "cu/attn/prefill_paged_attn_f16.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
-        Param::t_in("k_cache", Dtype::F16, 2),
-        Param::t_in("v_cache", Dtype::F16, 2),
+        Param::t_in("k_cache", Dtype::F16, 5),
+        Param::t_in("v_cache", Dtype::F16, 4),
         Param::t_in("block_tables", Dtype::F32, 2),
-        Param::t_in("seq_lens", Dtype::F32, 2),
-        Param::t_in("query_start_len", Dtype::F32, 2),
-        Param::t_in("alibi_slopes", Dtype::F32, 2),
-        Param::t_in("sinks", Dtype::F32, 2),
+        Param::t_in("seq_lens", Dtype::F32, 0),
+        Param::t_in("query_start_len", Dtype::F32, 0),
+        Param::t_in("alibi_slopes", Dtype::F16, 0),
+        Param::t_in("sinks", Dtype::F32, 0),
         Param::i32("num_kv_heads"),
         Param::f32("sm_scale"),
         Param::i32("block_table_stride"),
@@ -1003,13 +1037,13 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptF16KnhdHd128 {
     const SRC: &'static str = "cu/attn/prefill_paged_attn_f16.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
-        Param::t_in("k_cache", Dtype::F16, 2),
-        Param::t_in("v_cache", Dtype::F16, 2),
+        Param::t_in("k_cache", Dtype::F16, 5),
+        Param::t_in("v_cache", Dtype::F16, 4),
         Param::t_in("block_tables", Dtype::F32, 2),
-        Param::t_in("seq_lens", Dtype::F32, 2),
-        Param::t_in("query_start_len", Dtype::F32, 2),
-        Param::t_in("alibi_slopes", Dtype::F32, 2),
-        Param::t_in("sinks", Dtype::F32, 2),
+        Param::t_in("seq_lens", Dtype::F32, 0),
+        Param::t_in("query_start_len", Dtype::F32, 0),
+        Param::t_in("alibi_slopes", Dtype::F16, 0),
+        Param::t_in("sinks", Dtype::F32, 0),
         Param::i32("num_kv_heads"),
         Param::f32("sm_scale"),
         Param::i32("block_table_stride"),
@@ -1044,13 +1078,13 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptF16KnhdHd256 {
     const SRC: &'static str = "cu/attn/prefill_paged_attn_f16.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
-        Param::t_in("k_cache", Dtype::F16, 2),
-        Param::t_in("v_cache", Dtype::F16, 2),
+        Param::t_in("k_cache", Dtype::F16, 5),
+        Param::t_in("v_cache", Dtype::F16, 4),
         Param::t_in("block_tables", Dtype::F32, 2),
-        Param::t_in("seq_lens", Dtype::F32, 2),
-        Param::t_in("query_start_len", Dtype::F32, 2),
-        Param::t_in("alibi_slopes", Dtype::F32, 2),
-        Param::t_in("sinks", Dtype::F32, 2),
+        Param::t_in("seq_lens", Dtype::F32, 0),
+        Param::t_in("query_start_len", Dtype::F32, 0),
+        Param::t_in("alibi_slopes", Dtype::F16, 0),
+        Param::t_in("sinks", Dtype::F32, 0),
         Param::i32("num_kv_heads"),
         Param::f32("sm_scale"),
         Param::i32("block_table_stride"),
@@ -1085,13 +1119,13 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptFp8Hd128 {
     const SRC: &'static str = "cu/attn/prefill_paged_attn_f16.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
-        Param::t_in("k_cache", Dtype::F16, 2),
-        Param::t_in("v_cache", Dtype::F16, 2),
+        Param::t_in("k_cache", Dtype::U32, 1),
+        Param::t_in("v_cache", Dtype::U32, 1),
         Param::t_in("block_tables", Dtype::F32, 2),
-        Param::t_in("seq_lens", Dtype::F32, 2),
-        Param::t_in("query_start_len", Dtype::F32, 2),
-        Param::t_in("alibi_slopes", Dtype::F32, 2),
-        Param::t_in("sinks", Dtype::F32, 2),
+        Param::t_in("seq_lens", Dtype::F32, 0),
+        Param::t_in("query_start_len", Dtype::F32, 0),
+        Param::t_in("alibi_slopes", Dtype::F16, 0),
+        Param::t_in("sinks", Dtype::F32, 0),
         Param::i32("num_kv_heads"),
         Param::f32("sm_scale"),
         Param::i32("block_table_stride"),
@@ -1126,13 +1160,13 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptFp8Hd256 {
     const SRC: &'static str = "cu/attn/prefill_paged_attn_f16.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
-        Param::t_in("k_cache", Dtype::F16, 2),
-        Param::t_in("v_cache", Dtype::F16, 2),
+        Param::t_in("k_cache", Dtype::U32, 1),
+        Param::t_in("v_cache", Dtype::U32, 1),
         Param::t_in("block_tables", Dtype::F32, 2),
-        Param::t_in("seq_lens", Dtype::F32, 2),
-        Param::t_in("query_start_len", Dtype::F32, 2),
-        Param::t_in("alibi_slopes", Dtype::F32, 2),
-        Param::t_in("sinks", Dtype::F32, 2),
+        Param::t_in("seq_lens", Dtype::F32, 0),
+        Param::t_in("query_start_len", Dtype::F32, 0),
+        Param::t_in("alibi_slopes", Dtype::F16, 0),
+        Param::t_in("sinks", Dtype::F32, 0),
         Param::i32("num_kv_heads"),
         Param::f32("sm_scale"),
         Param::i32("block_table_stride"),
@@ -1167,13 +1201,13 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptFp8KnhdHd128 {
     const SRC: &'static str = "cu/attn/prefill_paged_attn_f16.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
-        Param::t_in("k_cache", Dtype::F16, 2),
-        Param::t_in("v_cache", Dtype::F16, 2),
+        Param::t_in("k_cache", Dtype::U32, 1),
+        Param::t_in("v_cache", Dtype::U32, 1),
         Param::t_in("block_tables", Dtype::F32, 2),
-        Param::t_in("seq_lens", Dtype::F32, 2),
-        Param::t_in("query_start_len", Dtype::F32, 2),
-        Param::t_in("alibi_slopes", Dtype::F32, 2),
-        Param::t_in("sinks", Dtype::F32, 2),
+        Param::t_in("seq_lens", Dtype::F32, 0),
+        Param::t_in("query_start_len", Dtype::F32, 0),
+        Param::t_in("alibi_slopes", Dtype::F16, 0),
+        Param::t_in("sinks", Dtype::F32, 0),
         Param::i32("num_kv_heads"),
         Param::f32("sm_scale"),
         Param::i32("block_table_stride"),
@@ -1208,8 +1242,8 @@ impl KernelSpec for PrefillSplitF16Hd256 {
     const SRC: &'static str = "cu/attn/prefill_split_f16.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
-        Param::t_in("k_cache", Dtype::F16, 2),
-        Param::t_in("v_cache", Dtype::F16, 2),
+        Param::t_in("k_cache", Dtype::F16, 5),
+        Param::t_in("v_cache", Dtype::F16, 4),
         Param::t_in("block_tables", Dtype::F32, 2),
         Param::t_in("scr_out", Dtype::F16, 2),
         Param::t_in("scr_stat", Dtype::F32, 2),
@@ -1243,8 +1277,8 @@ impl KernelSpec for PrefillSplitFp8KvHd256 {
     const SRC: &'static str = "cu/attn/prefill_split_f16.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
-        Param::t_in("k_cache", Dtype::F16, 2),
-        Param::t_in("v_cache", Dtype::F16, 2),
+        Param::t_in("k_cache", Dtype::U32, 1),
+        Param::t_in("v_cache", Dtype::U32, 1),
         Param::t_in("block_tables", Dtype::F32, 2),
         Param::t_in("scr_out", Dtype::F16, 2),
         Param::t_in("scr_stat", Dtype::F32, 2),
@@ -1278,8 +1312,8 @@ impl KernelSpec for PrefillSplitF16KnhdHd256 {
     const SRC: &'static str = "cu/attn/prefill_split_f16.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
-        Param::t_in("k_cache", Dtype::F16, 2),
-        Param::t_in("v_cache", Dtype::F16, 2),
+        Param::t_in("k_cache", Dtype::F16, 5),
+        Param::t_in("v_cache", Dtype::F16, 4),
         Param::t_in("block_tables", Dtype::F32, 2),
         Param::t_in("scr_out", Dtype::F16, 2),
         Param::t_in("scr_stat", Dtype::F32, 2),
@@ -1313,8 +1347,8 @@ impl KernelSpec for PrefillSplitFp8KvKnhdHd256 {
     const SRC: &'static str = "cu/attn/prefill_split_f16.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
-        Param::t_in("k_cache", Dtype::F16, 2),
-        Param::t_in("v_cache", Dtype::F16, 2),
+        Param::t_in("k_cache", Dtype::U32, 1),
+        Param::t_in("v_cache", Dtype::U32, 1),
         Param::t_in("block_tables", Dtype::F32, 2),
         Param::t_in("scr_out", Dtype::F16, 2),
         Param::t_in("scr_stat", Dtype::F32, 2),
@@ -1403,11 +1437,11 @@ impl KernelSpec for VllmPagedAttentionV2F16Hd128 {
     const SRC: &'static str = "cu/attn/pagedattention_f16.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
-        Param::t_in("k_cache", Dtype::F16, 2),
-        Param::t_in("v_cache", Dtype::F16, 2),
+        Param::t_in("k_cache", Dtype::F16, 5),
+        Param::t_in("v_cache", Dtype::F16, 4),
         Param::t_in("block_tables", Dtype::F32, 2),
         Param::t_in("context_lens", Dtype::F32, 2),
-        Param::t_in("alibi_slopes", Dtype::F32, 2),
+        Param::t_in("alibi_slopes", Dtype::F16, 0),
         Param::t_in("exp_sums", Dtype::F32, 2),
         Param::t_in("max_logits", Dtype::F32, 2),
         Param::i32("num_kv_heads"),
@@ -1441,11 +1475,11 @@ impl KernelSpec for VllmPagedAttentionV2F16Hd256 {
     const SRC: &'static str = "cu/attn/pagedattention_f16.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
-        Param::t_in("k_cache", Dtype::F16, 2),
-        Param::t_in("v_cache", Dtype::F16, 2),
+        Param::t_in("k_cache", Dtype::F16, 5),
+        Param::t_in("v_cache", Dtype::F16, 4),
         Param::t_in("block_tables", Dtype::F32, 2),
         Param::t_in("context_lens", Dtype::F32, 2),
-        Param::t_in("alibi_slopes", Dtype::F32, 2),
+        Param::t_in("alibi_slopes", Dtype::F16, 0),
         Param::t_in("exp_sums", Dtype::F32, 2),
         Param::t_in("max_logits", Dtype::F32, 2),
         Param::i32("num_kv_heads"),
@@ -1479,11 +1513,11 @@ impl KernelSpec for NaiveAttnNcF16Knhd {
     const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
-        Param::t_in("k_self", Dtype::F16, 2),
-        Param::t_in("v_self", Dtype::F16, 2),
-        Param::t_in("kc", Dtype::F16, 2),
-        Param::t_in("vc", Dtype::F16, 2),
-        Param::t_in("kv_len_p", Dtype::F32, 2),
+        Param::t_in("k_self", Dtype::F16, 3),
+        Param::t_in("v_self", Dtype::F16, 3),
+        Param::t_in("kc", Dtype::F16, 5),
+        Param::t_in("vc", Dtype::F16, 4),
+        Param::t_in("kv_len_p", Dtype::F32, 0),
         Param::i32("q_heads"),
         Param::i32("kv_heads"),
         Param::i32("d_dim"),
@@ -1511,11 +1545,11 @@ impl KernelSpec for NaiveAttnNcBf16Knhd {
     const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::BF16, 2),
-        Param::t_in("k_self", Dtype::BF16, 2),
-        Param::t_in("v_self", Dtype::BF16, 2),
-        Param::t_in("kc", Dtype::BF16, 2),
-        Param::t_in("vc", Dtype::BF16, 2),
-        Param::t_in("kv_len_p", Dtype::F32, 2),
+        Param::t_in("k_self", Dtype::BF16, 3),
+        Param::t_in("v_self", Dtype::BF16, 3),
+        Param::t_in("kc", Dtype::BF16, 5),
+        Param::t_in("vc", Dtype::BF16, 4),
+        Param::t_in("kv_len_p", Dtype::F32, 0),
         Param::i32("q_heads"),
         Param::i32("kv_heads"),
         Param::i32("d_dim"),
@@ -1543,11 +1577,11 @@ impl KernelSpec for NaiveAttnNcFp8KvF16Knhd {
     const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
-        Param::t_in("k_self", Dtype::F16, 2),
-        Param::t_in("v_self", Dtype::F16, 2),
-        Param::t_in("kc", Dtype::U8, 2),
-        Param::t_in("vc", Dtype::U8, 2),
-        Param::t_in("kv_len_p", Dtype::F32, 2),
+        Param::t_in("k_self", Dtype::F16, 3),
+        Param::t_in("v_self", Dtype::F16, 3),
+        Param::t_in("kc", Dtype::U32, 1),
+        Param::t_in("vc", Dtype::U32, 1),
+        Param::t_in("kv_len_p", Dtype::F32, 0),
         Param::i32("q_heads"),
         Param::i32("kv_heads"),
         Param::i32("d_dim"),
@@ -1575,11 +1609,11 @@ impl KernelSpec for NaiveAttnNcFp8KvBf16Knhd {
     const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::BF16, 2),
-        Param::t_in("k_self", Dtype::BF16, 2),
-        Param::t_in("v_self", Dtype::BF16, 2),
-        Param::t_in("kc", Dtype::U8, 2),
-        Param::t_in("vc", Dtype::U8, 2),
-        Param::t_in("kv_len_p", Dtype::F32, 2),
+        Param::t_in("k_self", Dtype::BF16, 3),
+        Param::t_in("v_self", Dtype::BF16, 3),
+        Param::t_in("kc", Dtype::U32, 1),
+        Param::t_in("vc", Dtype::U32, 1),
+        Param::t_in("kv_len_p", Dtype::F32, 0),
         Param::i32("q_heads"),
         Param::i32("kv_heads"),
         Param::i32("d_dim"),

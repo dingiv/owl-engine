@@ -18,9 +18,9 @@ impl KernelSpec for GatingGF16 {
     const ENTRY: &'static str = "owl_gdn_gating_g_f16";
     const SRC: &'static str = "cu/gdn/gdn_gating.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("a_log", Dtype::F16, 2),
+        Param::t_in("a_log", Dtype::F16, 1),
         Param::t_in("a", Dtype::F16, 2),
-        Param::t_in("dt_bias", Dtype::F16, 2),
+        Param::t_in("dt_bias", Dtype::F16, 1),
         Param::sz("total"),
         Param::sz("heads"),
         Param::t_out("g", Dtype::F16, 2),
@@ -84,9 +84,9 @@ impl KernelSpec for ConvFwdF16 {
         Param::t_in("x", Dtype::F16, 2),
         Param::t_in("w", Dtype::F16, 2),
         // conv_state 原地更新(副作用律;单流保序)
-        Param::t_inout("conv_state", Dtype::F32, 3),
-        Param::t_in("slots", Dtype::F32, 1),
-        Param::t_in("cu_seqlens", Dtype::F32, 1),
+        Param::t_inout("conv_state", Dtype::F32, 0),
+        Param::t_in("slots", Dtype::F32, 0),
+        Param::t_in("cu_seqlens", Dtype::F32, 0),
         Param::i32("batch"),
         Param::i32("d"),
         Param::i32("silu"),
@@ -111,7 +111,7 @@ impl KernelSpec for ConvUpdDualF16 {
         Param::t_in("w_k", Dtype::F16, 2),
         Param::t_inout("state_q", Dtype::F32, 3),
         Param::t_inout("state_k", Dtype::F32, 3),
-        Param::t_in("slots", Dtype::F32, 1),
+        Param::t_in("slots", Dtype::F32, 0),
         Param::i32("dq"),
         Param::i32("dk"),
         Param::i32("batch"),
@@ -139,11 +139,11 @@ impl KernelSpec for RecurrenceVarlenGqaF16 {
         Param::t_in("k", Dtype::F16, 3),
         Param::t_in("v", Dtype::F16, 3),
         // g 是 raw 门(语义律 E7:cumsum 是核内私有态,客户端不可达)
-        Param::t_in("g", Dtype::F16, 3),
-        Param::t_in("beta", Dtype::F16, 3),
-        Param::t_inout("state", Dtype::F32, 4),
-        Param::t_in("slots", Dtype::F32, 1),
-        Param::t_in("cu_seqlens", Dtype::F32, 1),
+        Param::t_in("g", Dtype::F16, 2),
+        Param::t_in("beta", Dtype::F16, 2),
+        Param::t_inout("state", Dtype::F32, 0),
+        Param::t_in("slots", Dtype::F32, 0),
+        Param::t_in("cu_seqlens", Dtype::F32, 0),
         Param::sz("batch"),
         Param::sz("nv"),
         Param::sz("nk"),
@@ -174,10 +174,10 @@ impl KernelSpec for DecodeStepV2F16 {
         Param::t_in("a_gate", Dtype::F16, 2),
         Param::t_in("w", Dtype::F16, 2),
         Param::t_inout("conv_v_state", Dtype::F32, 3),
-        Param::t_in("a_log", Dtype::F16, 2),
-        Param::t_in("dt_bias", Dtype::F16, 2),
+        Param::t_in("a_log", Dtype::F16, 1),
+        Param::t_in("dt_bias", Dtype::F16, 1),
         Param::t_inout("rec_state", Dtype::F32, 4),
-        Param::t_in("slots", Dtype::F32, 1),
+        Param::t_in("slots", Dtype::F32, 0),
         Param::t_in("norm_w", Dtype::F16, 1),
         Param::sz("batch"),
         Param::sz("nv"),
@@ -187,7 +187,7 @@ impl KernelSpec for DecodeStepV2F16 {
         Param::f32("eps_l2"),
         Param::f32("eps_norm"),
         Param::f32("q_scale"),
-        Param::t_out("out", Dtype::F16, 2),
+        Param::t_out("out", Dtype::F16, 3),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::rw(pools::GDN_STATE, Dtype::F32)];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
@@ -224,8 +224,8 @@ impl KernelSpec for GdnConvUpdF16 {
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::F16, 2),
         Param::t_in("w", Dtype::F16, 2),
-        Param::t_in("conv_state", Dtype::F32, 2),
-        Param::t_in("slots", Dtype::F32, 2),
+        Param::t_in("conv_state", Dtype::F32, 0),
+        Param::t_in("slots", Dtype::F32, 0),
         Param::sz("total"),
         Param::sz("d"),
         Param::sz("w_offset"),
@@ -248,8 +248,8 @@ impl KernelSpec for GdnConvUpdF32 {
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::F32, 2),
         Param::t_in("w", Dtype::F32, 2),
-        Param::t_in("conv_state", Dtype::F32, 2),
-        Param::t_in("slots", Dtype::F32, 2),
+        Param::t_in("conv_state", Dtype::F32, 0),
+        Param::t_in("slots", Dtype::F32, 0),
         Param::sz("total"),
         Param::sz("d"),
         Param::sz("w_offset"),
@@ -270,20 +270,20 @@ impl KernelSpec for GdnDeltaDecF16 {
     const ENTRY: &'static str = "owl_gdn_delta_dec_f16";
     const SRC: &'static str = "cu/gdn/gdn_delta_dec.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("q", Dtype::F16, 2),
-        Param::t_in("k", Dtype::F16, 2),
-        Param::t_in("v", Dtype::F16, 2),
+        Param::t_in("q", Dtype::F16, 3),
+        Param::t_in("k", Dtype::F16, 3),
+        Param::t_in("v", Dtype::F16, 3),
         Param::t_in("g", Dtype::F16, 2),
         Param::t_in("beta", Dtype::F16, 2),
-        Param::t_in("state", Dtype::F32, 2),
-        Param::t_in("slots", Dtype::F32, 2),
+        Param::t_in("state", Dtype::F32, 4),
+        Param::t_in("slots", Dtype::F32, 0),
         Param::sz("batch"),
         Param::sz("nv"),
         Param::sz("nk"),
         Param::sz("kd"),
         Param::sz("vd"),
         Param::f32("q_scale"),
-        Param::t_out("out", Dtype::F16, 2),
+        Param::t_out("out", Dtype::F16, 3),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::rw(pools::GDN_STATE, Dtype::F32)];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
@@ -299,20 +299,20 @@ impl KernelSpec for GdnDeltaDecF32 {
     const ENTRY: &'static str = "owl_gdn_delta_dec_f32";
     const SRC: &'static str = "cu/gdn/gdn_delta_dec.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("q", Dtype::F32, 2),
-        Param::t_in("k", Dtype::F32, 2),
-        Param::t_in("v", Dtype::F32, 2),
+        Param::t_in("q", Dtype::F32, 3),
+        Param::t_in("k", Dtype::F32, 3),
+        Param::t_in("v", Dtype::F32, 3),
         Param::t_in("g", Dtype::F32, 2),
         Param::t_in("beta", Dtype::F32, 2),
-        Param::t_in("state", Dtype::F32, 2),
-        Param::t_in("slots", Dtype::F32, 2),
+        Param::t_in("state", Dtype::F32, 4),
+        Param::t_in("slots", Dtype::F32, 0),
         Param::sz("batch"),
         Param::sz("nv"),
         Param::sz("nk"),
         Param::sz("kd"),
         Param::sz("vd"),
         Param::f32("q_scale"),
-        Param::t_out("out", Dtype::F32, 2),
+        Param::t_out("out", Dtype::F32, 3),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::rw(pools::GDN_STATE, Dtype::F32)];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
@@ -365,9 +365,9 @@ impl KernelSpec for GdnGatingGF32 {
     const ENTRY: &'static str = "owl_gdn_gating_g_f32";
     const SRC: &'static str = "cu/gdn/gdn_gating.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("a_log", Dtype::F32, 2),
+        Param::t_in("a_log", Dtype::F32, 1),
         Param::t_in("a", Dtype::F32, 2),
-        Param::t_in("dt_bias", Dtype::F32, 2),
+        Param::t_in("dt_bias", Dtype::F32, 1),
         Param::sz("total"),
         Param::sz("heads"),
         Param::t_out("g", Dtype::F32, 2),
@@ -406,7 +406,7 @@ impl KernelSpec for GdnNormActF32 {
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::F32, 2),
         Param::t_in("z", Dtype::F32, 2),
-        Param::t_in("gamma", Dtype::F32, 2),
+        Param::t_in("gamma", Dtype::F32, 1),
         Param::sz("rows"),
         Param::sz("value_dim"),
         Param::sz("group_size"),

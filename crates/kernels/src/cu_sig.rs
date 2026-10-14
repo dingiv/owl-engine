@@ -75,6 +75,20 @@ pub fn params_at(text: &str, start: usize, name: &str, kind: &str) -> Option<Str
 // `.cu` 形参解析器 —— `tests/op_tables.rs` 的"声明表 ⇔ 签名"互证门靠它,
 // `models::kernel` 也再导出它。删掉 = 互证门失明(原 FIXME 误导已撤)。
 pub fn parse_cu_sig(src: &str, name: &str) -> Option<String> {
+    let (params, kind) = cu_params_of(src, name)?;
+    Some(map_params(&params, name, kind))
+}
+
+/// **核形参串取证**(三形态统一;**唯一实现** —— token 级互证
+/// [`parse_cu_sig`] 与名字级互证 [`parse_cu_param_names`] 共用,
+/// 两道门不许各写一遍解析器)。
+///
+/// 返回 `(形参串, 形态标签)`。三形态:
+/// 1. 宏展开核实例行 `OWL_<FAMILY>_KERNEL(<name>, <T>, PARAMS)`;
+/// 2. 单层宏实例化核 `CHUNKED_KNHD_ENTRY(<name>, <hd>, <kv_fp8>)`
+///    (形参住 `#define` 定义体);
+/// 3. 字面核 `extern "C" __global__ void <name>(…)`。
+pub fn cu_params_of(src: &str, name: &str) -> Option<(String, &'static str)> {
     // 剥行注释(形参注记含逗号/括号,会干扰边界与切分)+ **折叠宏续行**
     // (`\` + 换行 → 空格:宏体形参住在续行里,不折叠则形参串被反斜杠污染)
     let clean: String = src
@@ -96,7 +110,7 @@ pub fn parse_cu_sig(src: &str, name: &str) -> Option<String> {
                         .and_then(|p| p.trim().strip_prefix('('))
                         .and_then(|p| p.strip_suffix(')'))
                         .unwrap_or("");
-                    return Some(map_params(params, name, "宏"));
+                    return Some((params.to_string(), "宏"));
                 }
             }
         }
@@ -118,12 +132,15 @@ pub fn parse_cu_sig(src: &str, name: &str) -> Option<String> {
         let formal = clean[d + def_anchor.len()..].split(',').next()?.trim().to_string();
         let body_anchor = format!("void {formal}(");
         let Some(s) = clean[d..].find(&body_anchor) else { continue };
-        return params_at(&clean[d..], s + body_anchor.len(), name, "宏");
+        let start = d + s + body_anchor.len();
+        let end = clean[start..].find(')')? + start;
+        return Some((clean[start..end].to_string(), "宏"));
     }
     // 形态 3:字面核 `extern "C" __global__ void <name>(…)`
     let anchor = format!("__global__ void {name}(");
     let start = clean.find(&anchor)? + anchor.len();
-    params_at(&clean, start, name, "")
+    let end = clean[start..].find(')')? + start;
+    Some((clean[start..end].to_string(), ""))
 }
 
 #[cfg(test)]
@@ -157,3 +174,41 @@ mod tests {
     }
 
 }
+
+// ============================================================================
+// §4 `.cu` 形参**名**解析(名字级互证;2026-10-15 L3 事实面补)
+// ============================================================================
+//
+// 为什么需要它:token 级互证(`parse_cu_sig`)只比 T/sz/i32/f32 的**形状**,
+// 看不见"同形状、不同语义槽位"的漂移 —— 2026-10-15 实测到活体:
+// `owl_qknorm_rope_kv_insert_f16{,_knhd}` 的声明表是**旧签名**
+// (`q, q_raw, kw, beta, cos, sin, k, v, kc, vc, slots, …`),
+// 而 .cu 早已是 `q_raw, k, v, key_cache, value_cache, slots, q_w, k_w, …`
+// —— 两者 token 串**逐字相同**(11×T + f32 + 4×i32 + T),门全绿,
+// 而语义槽位全错位(调用点按新序喂 ⇒ f16 档融合插池读写全错)。
+
+/// **核形参名序列**(名字级互证;与 token 级共用 [`cu_params_of`] 取证口)。
+///
+/// 为什么需要它:token 级只比 T/sz/i32/f32 的**形状**,看不见"同形状、不同
+/// 语义槽位"的漂移 —— 2026-10-15 实测活体 `owl_qknorm_rope_kv_insert_f16{,_knhd}`
+/// (声明旧签名 / .cu 新签名,token 串逐字相同)。
+pub fn parse_cu_param_names(src: &str, name: &str) -> Option<Vec<String>> {
+    let (params, _kind) = cu_params_of(src, name)?;
+    Some(
+        params
+            .split(',')
+            .filter_map(|p| {
+                let p = p
+                    .replace("const ", "")
+                    .replace("__restrict__ ", "")
+                    .replace('*', " ")
+                    .replace('&', " ");
+                let last = p.split_whitespace().last()?.trim_matches(|c: char| {
+                    matches!(c, ')' | '(' | ';' | '{' | '}' | ',')
+                }).to_string();
+                if last.is_empty() { None } else { Some(last) }
+            })
+            .collect(),
+    )
+}
+

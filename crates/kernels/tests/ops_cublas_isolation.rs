@@ -5,7 +5,7 @@
 //! 路径:CublasRuntime::run(TestRes) vs host 朴素 matmul。
 
 use owl_kernels::server::cublas::CublasRuntime;
-use owl_kernels::contract::{Bytes, LaunchMsg, OpError};
+use owl_kernels::contract::{Bytes, Dtype, LaunchMsg, OpError};
 use owl_kernels::device::{DeviceRes, Exec, ScratchBuf};
 use owl_kernels::registry::KernelFamily;
 use std::collections::HashMap;
@@ -32,7 +32,7 @@ impl TestRes {
         let mut d = self.stream.alloc_zeros::<u8>(bytes.len()).expect("alloc");
         self.stream.memcpy_htod(bytes, &mut d).expect("htod");
         self.blocks.insert(id, d);
-        Bytes { id, len: 0 }
+        Bytes::new(id, 0, Dtype::U8, 0) // 测试替身:只按 id 解析
     }
 }
 
@@ -43,11 +43,11 @@ impl DeviceRes for TestRes {
     fn stream(&self) -> Result<Arc<cudarc::driver::CudaStream>, OpError> {
         Ok(self.stream.clone())
     }
-    fn resolve(&self, b: &Bytes) -> Result<u64, OpError> {
+    fn resolve(&self, id: u64) -> Result<u64, OpError> {
         self.blocks
-            .get(&b.id)
+            .get(&id)
             .map(|s| s.device_ptr(&self.stream).0)
-            .ok_or_else(|| OpError::Contract { op: "t".into(), field: "resolve", expect: "在册".into(), got: b.id.to_string() })
+            .ok_or_else(|| OpError::Contract { op: "t".into(), field: "resolve", expect: "在册".into(), got: id.to_string() })
     }
     fn alloc(&mut self, bytes: usize, _tag: &'static str) -> Result<ScratchBuf, OpError> {
         let d = self.stream.alloc_zeros::<u8>(bytes).expect("alloc");
@@ -120,7 +120,7 @@ impl DeviceRes for TestRes {
         self.next_id += 1;
         self.blocks.insert(id, s);
         let _ = tag;
-        Ok(owl_kernels::contract::Bytes::new(id, bytes))
+        Ok(owl_kernels::contract::Bytes::new(id, bytes, Dtype::U8, 0))
     }
     fn download(&mut self, _src: u64, _dst: &mut [u8]) -> Result<(), OpError> {
         Err(OpError::Contract {
@@ -171,7 +171,7 @@ fn cublas_runtime_matches_host_matmul() {
         res.next_id += 1;
         (id, ptr)
     };
-    let out_b = Bytes { id: out_id, len: t * n_out };
+    let out_b = Bytes::new(out_id, t * n_out, Dtype::F16, 2); // cublas GEMM out = [m,n] f16
 
     let msg = LaunchMsg {
         kernel: owl_kernels::contract::KernelSource {
@@ -179,9 +179,9 @@ fn cublas_runtime_matches_host_matmul() {
             source: String::new(),
         },
         args: vec![
-            owl_kernels::contract::Arg::Block { id: a_b.id },
-            owl_kernels::contract::Arg::Block { id: w_b.id },
-            owl_kernels::contract::Arg::Block { id: out_b.id },
+            owl_kernels::contract::Arg::block(a_b.id, a_b.dtype, a_b.rank),
+            owl_kernels::contract::Arg::block(w_b.id, w_b.dtype, w_b.rank),
+            owl_kernels::contract::Arg::block(out_b.id, out_b.dtype, out_b.rank),
             owl_kernels::contract::Arg::U64(n_out as u64), // m = n_out(权重行)
             owl_kernels::contract::Arg::U64(hidden as u64), // k
             owl_kernels::contract::Arg::U64(t as u64), // n = tokens
@@ -209,9 +209,9 @@ fn cublas_runtime_matches_host_matmul() {
     {
         let stream = res.stream.clone();
         let blas = owl_kernels::family::cublas::OwlCublas::new(stream.clone()).expect("direct blas");
-        let a_p = res.resolve(&a_b).expect("a");
-        let b_p = res.resolve(&w_b).expect("b");
-        let o_p = res.resolve(&out_b).expect("o");
+        let a_p = res.resolve(a_b.id).expect("a");
+        let b_p = res.resolve(w_b.id).expect("b");
+        let o_p = res.resolve(out_b.id).expect("o");
         blas.gemm_f16(a_p, b_p, o_p, n_out, hidden, t, true).expect("direct gemm");
         stream.synchronize().expect("sync");
     }

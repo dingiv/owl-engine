@@ -33,7 +33,7 @@ pub trait Interpreter {
     /// MatmulNt:[m,k]×(B [n,k] 直读)→ [m,n]
     fn matmul_nt(&mut self, a: &Value, b: &Value, dtype: Dtype, shape: &Shape) -> Result<Value, ModelError>;
     /// Add(同形)
-    fn add(&mut self, a: &Value, b: &Value) -> Result<Value, ModelError>;
+    fn add(&mut self, a: &Value, b: &Value) -> Result<Value, ModelError>;  // FIXME: 这几个相加的、相乘的这个方法是不是过时了？不要再写了，可以移除掉这几个方法??
     /// Mul(同形逐元素乘;MLP 门控/输出门)
     fn mul(&mut self, a: &Value, b: &Value) -> Result<Value, ModelError>;
     /// Silu

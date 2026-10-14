@@ -456,7 +456,9 @@ where
             // 捕获当场炸「捕获 slab 耗尽」(2026-10-14 实测:27B spec-dflash 开池
             // 即 boot 失败,slab 7.69MB 差 81KB)。计量语义 = 闭包需求,与"是否复用"无关。
             owl_shared::slab_hint::meter_add(n_bytes as u64);
-            let b = Bytes::new(id, n_elems);
+            // 块尚未按形状定形:rank = 0(未定形;dtype 已知)——
+            // 视图事实由调用点(张量节点)在发射时给出
+            let b = Bytes::new(id, n_elems, dtype, 0);
             if zeroed {
                 self.face.memset_zero(&b, n_bytes).await?;
             }
@@ -577,12 +579,16 @@ where
         // 刀1:切片视图父 → Arg::BlockSlice(ptr = 块首 + offset·esz);
         // 其余 → Arg::Block。偏移在节点声明期已含父链合成。
         let a = match &p.op {
-            Op::SliceView { offset_elems } => Arg::BlockSlice {
-                id: b.id,
-                byte_offset: (offset_elems * p.dtype.size_bytes()) as u64,
-                elems: p.shape.iter().product::<usize>() as u64,
-            },
-            _ => Arg::Block { id: b.id },
+            Op::SliceView { offset_elems } => Arg::block_slice(
+                b.id,
+                (offset_elems * p.dtype.size_bytes()) as u64,
+                p.shape.iter().product::<usize>() as u64,
+                p.dtype,
+                p.shape.len() as u8,
+            ),
+            // 事实 = **本父节点的视图**(dtype + shape 阶数),不是块句柄的标注 ——
+            // 块句柄经 Reshape/SliceView 透传时会保留**底块**的标注(下面两臂已重定形)
+            _ => Arg::block(b.id, p.dtype, p.shape.len() as u8),
         };
         vals.push(b);
         ins.push(a);
@@ -626,21 +632,30 @@ where
             b
         }
         Op::Zeros => {
-            let b = ctx.alloc_out(dtype, n_elems, true).await?;
+            let b = ctx.alloc_out(dtype, n_elems, true).await?.view(dtype, shape.len() as u8);
             ctx.track_new(b.id);
             b
         }
-        Op::Block { id } => Bytes { id: *id, len: 0 },
-        Op::Reshape => { ctx.track_alias(vals[0].id); vals[0].clone() } // 纯元数据视图:透传父块(零拷贝)
+        // 裸块叶:事实取本节点声明(dtype + 阶数)
+        Op::Block { id } => Bytes::new(*id, 0, dtype, shape.len() as u8),
+        // 纯元数据视图:透传父块(零拷贝)—— 但**事实面按本节点视图重定形**
+        // (否则下游按父块标注发射 ⇒ rank/dtype 错,2026-10-15 事实面门实测)
+        Op::Reshape => {
+            ctx.track_alias(vals[0].id);
+            vals[0].clone().view(dtype, shape.len() as u8)
+        }
         // 刀1:连续切片视图(与 Reshape 同族透传;偏移在消费面由节点 op
         // 合成 Arg::BlockSlice,此处块句柄 = 父块全长 —— CSE/回收按块计)
-        Op::SliceView { .. } => { ctx.track_alias(vals[0].id); vals[0].clone() }
+        Op::SliceView { .. } => {
+            ctx.track_alias(vals[0].id);
+            vals[0].clone().view(dtype, shape.len() as u8)
+        }
         Op::Matmul | Op::MatmulNt => {
             let (m, n) = (shape[0], shape[1]);
             // k = 内维 = x 声明 shape 末维(C1:只读声明 shape;原取 ins[0].len
             // 在多行 [m,k] 时越界读 —— 此 bug 被"历届测试都单行"掩盖)
             let k = t.parents[0].shape.last().copied().unwrap_or(0);
-            let out = ctx.alloc_out(dtype, m * n, false).await?;
+            let out = ctx.alloc_out(dtype, m * n, false).await?.view(dtype, shape.len() as u8);
             ctx.track_new(out.id);
             if dtype == Dtype::F16 || dtype == Dtype::BF16 {
                 // f16/bf16:foreign-kernel 通道(cuBLAS;nt = owl Linear 惯例)。
@@ -729,7 +744,7 @@ where
             if let Some(l) = lap.as_mut() {
                 l.lap("interp.host.seg.build");
             }
-            let out = ctx.alloc_out(dtype, n_elems, false).await?;
+            let out = ctx.alloc_out(dtype, n_elems, false).await?.view(dtype, shape.len() as u8);
             if let Some(l) = lap.as_mut() {
                 l.lap("interp.host.seg.alloc");
             }

@@ -24,9 +24,9 @@ fn add_msg_owned(a: &Bytes, b: &Bytes, out_id: u64, n: usize) -> LaunchMsg {
     LaunchMsg {
         kernel: KernelSource { name: "probe_add_f32".into(), source: ADD_CU.into() },
         args: vec![
-            Arg::Block { id: a.id },
-            Arg::Block { id: b.id },
-            Arg::Block { id: out_id },
+            Arg::block(a.id, a.dtype, a.rank),
+            Arg::block(b.id, b.dtype, b.rank),
+            Arg::block(out_id, Dtype::F32, 2),
             Arg::U64(n as u64),
         ],
         grid: ((n as u32).div_ceil(256), 1, 1),
@@ -132,9 +132,9 @@ async fn graph_dispatch_rate_probe() {
         let msg = LaunchMsg {
             kernel: KernelSource { name: format!("probe_add_d{ki}"), source: sources[ki].clone() },
             args: vec![
-                Arg::Block { id: cur.id },
-                Arg::Block { id: b.id },
-                Arg::Block { id: nxt.id },
+                Arg::block(cur.id, cur.dtype, cur.rank),
+                Arg::block(b.id, b.dtype, b.rank),
+                Arg::block(nxt.id, nxt.dtype, nxt.rank),
                 Arg::U64(elems as u64),
             ],
             grid: ((elems as u32).div_ceil(256), 1, 1),

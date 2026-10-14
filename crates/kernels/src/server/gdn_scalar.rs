@@ -92,12 +92,12 @@ impl KernelFamily for GdnScalarRuntime {
 
         // ── 主核发射(内参序 = extern C 声明序;grid (ns, hv))──
         let state_p =
-            res.resolve(call.state())? + (call.slot() as u64) * (hv * kd * kd * 4) as u64;
-        let q_p = res.resolve(call.q())?;
-        let k_p = res.resolve(call.k())?;
-        let v_p = res.resolve(call.v())?;
-        let beta_p = res.resolve(call.beta())?;
-        let g_p = res.resolve(call.g())?;
+            res.resolve(call.state().id)? + (call.slot() as u64) * (hv * kd * kd * 4) as u64;
+        let q_p = res.resolve(call.q().id)?;
+        let k_p = res.resolve(call.k().id)?;
+        let v_p = res.resolve(call.v().id)?;
+        let beta_p = res.resolve(call.beta().id)?;
+        let g_p = res.resolve(call.g().id)?;
         let vals: &[crate::device::LaunchVal] = &[
             crate::device::LaunchVal::Ptr(o32),
             crate::device::LaunchVal::Ptr(q_p),
@@ -118,7 +118,7 @@ impl KernelFamily for GdnScalarRuntime {
         exec.launch(res, OP, k, "gdn_scalar", grid, block, smem, vals)?;
 
         // ── cast-out:o_f32 → out(f16)──
-        let out_p = res.resolve(&out)?;
+        let out_p = res.resolve(out.id)?;
         let n_out = t * hv * kd;
         exec.launch(
             res, OP, cast, "cast_out", (n_out.div_ceil(256) as u32, 1, 1), (256, 1, 1), 0,

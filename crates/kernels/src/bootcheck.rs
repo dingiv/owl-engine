@@ -117,7 +117,7 @@ impl CheckCtx<'_> {
     /// 信息时按 1B/elem 上报,零长律不受影响)
     pub fn arg_len(&self, i: usize) -> Option<usize> {
         match self.args.get(i)? {
-            Arg::Block { id } => (self.len)(*id),
+            Arg::Block { id, .. } => (self.len)(*id),
             Arg::BlockSlice { elems, .. } => Some(*elems as usize),
             _ => None,
         }

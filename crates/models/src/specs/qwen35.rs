@@ -652,22 +652,24 @@ mod tests {
                 aux: &[],
                 scalars: &[],
             });
-            gpu.launch(crate::contract::LaunchMsg {
+            let msg = crate::contract::LaunchMsg {
                 kernel: crate::contract::KernelSource {
                     name: pick.name.to_string(),
                     source: crate::kernel::source(pick.name).to_string(),
                 },
                 args: vec![
-                    crate::contract::Arg::Block { id: raw.id },
+                    crate::contract::Arg::block(raw.id, crate::contract::Dtype::U32, 2), // ct packed [rows, cols]
                     crate::contract::Arg::U64(rows as u64),
                     crate::contract::Arg::U64(cols as u64),
-                    crate::contract::Arg::Block { id: out_b.id },
+                    // ct_repack out = marlin B [k/16, rows*2] U32
+                    crate::contract::Arg::block(out_b.id, Dtype::U32, 2),
                 ],
                 grid: pick.shape.grid,
                 block: pick.shape.block,
                 shared_mem: pick.shape.smem,
                 out_elems: rows * k / 8,
-            })
+            };
+            gpu.launch(msg)
             .await
             .expect("CtRepack launch");
             gpu.sync().await.expect("sync");
@@ -970,7 +972,7 @@ mod tests {
                     let elems: usize = ev.shape.iter().product();
                     self.refs.push((
                         t.to_string(),
-                        crate::contract::Bytes { id: ev.out.block_id, len: elems },
+                        crate::contract::Bytes::new(ev.out.block_id, elems, ev.dtype, ev.shape.len() as u8),
                         elems,
                         ev.dtype,
                     ));
@@ -1352,7 +1354,7 @@ mod tests {
             &f32b(&(0..t_len).map(|t| t as f32 + 1.0).collect::<Vec<_>>()));
         let gdn_slot = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0]));
         let ctx = ForwardCtx::model_prefill(t_len, &pos_all, &kvs_pre, &rp, &gdns_pre,
-            &slots_all, &lens_all, &gdn_slot, 0, None);
+            &slots_all, &lens_all, &gdn_slot, None, 0, None);
         let all = crate::testkit::harvest_f16(&mut gpu, &model.forward(&ids_all, &ctx)).await;
 
         // 池字节对账存档(统一契约 P2 诊断):kvs 全 knhd 化后 K 池差异 =
@@ -1460,9 +1462,17 @@ mod tests {
         // rope 表(theta 1e7 / partial 64 / max_pos 262144)
         let rp = Rope::new(262_144, HD, 64, 10_000_000.0).expect("rope");
         eprintln!("[smoke] rope 表...");
-        crate::interpreters::eval_load(&rp, &mut gpu, &rp.tables(), &Default::default())
-            .await
-            .expect("rope 表");
+        // ⚠️ 表 dtype 必须随模型(F16):`LoaderCtx::default()` = F32 会让融合
+        // 插池核(`const __half* cos_t`)读到 f32 位型 = 静默错值 —— 2026-10-15
+        // L3 事实面门当场抓出(本测试此前从未编译过,故一直没暴露)
+        crate::interpreters::eval_load(
+            &rp,
+            &mut gpu,
+            &rp.tables(),
+            &crate::module::LoaderCtx { dtype: Dtype::F16, ..Default::default() },
+        )
+        .await
+        .expect("rope 表");
         eprintln!("[smoke] rope ok; 分配常驻缓冲...");
 
         // 常驻缓冲:6 full 层 KV + 18 gdn 层状态(真维度;全零起步)

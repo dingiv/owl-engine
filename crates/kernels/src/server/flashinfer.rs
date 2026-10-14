@@ -4,7 +4,7 @@
 //! 事故类结构性消灭)。run:plan(每形状缓存,键 = 形状七元组)→ run
 //! (f16/fp8kv 按名路由)。
 
-use crate::contract::{Bytes, LaunchMsg, OpError, OpId};
+use crate::contract::{Bytes, Dtype, LaunchMsg, OpError, OpId};
 use crate::device::ScratchBuf;
 
 use crate::client::flashinfer::{parse_prefill, PREFILL_FI};
@@ -78,7 +78,7 @@ impl KernelFamily for FiRuntime {
     fn run(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, _exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {
         let call = parse_prefill(msg)?;
         let r = |b: &crate::client::flashinfer::BlockRef| {
-            res.resolve(&Bytes { id: b.id, len: 0 }).map(|p| p + b.byte_offset)
+            res.resolve(b.id).map(|p| p + b.byte_offset)
         };
         let q = r(&call.q)?;
         let kc = r(&call.kc_fi)?;
@@ -190,6 +190,6 @@ impl KernelFamily for FiRuntime {
                 detail: format!("run err {rc}"),
             });
         }
-        Ok(Bytes { id: call.out.id, len: msg.out_elems })
+        Ok(Bytes::new(call.out.id, msg.out_elems, Dtype::F16, 2))
     }
 }

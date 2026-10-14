@@ -556,7 +556,7 @@ mod tests {
         fn stream(&self) -> Result<std::sync::Arc<cudarc::driver::CudaStream>, OpError> {
             Err(OpError::Contract { op: "nop".into(), field: "stream", expect: "-".into(), got: "-".into() })
         }
-        fn resolve(&self, _b: &Bytes) -> Result<u64, OpError> {
+        fn resolve(&self, _id: u64) -> Result<u64, OpError> {
             Err(OpError::Contract { op: "nop".into(), field: "resolve", expect: "-".into(), got: "-".into() })
         }
         fn alloc(&mut self, _bytes: usize, _tag: &'static str) -> Result<crate::device::ScratchBuf, OpError> {

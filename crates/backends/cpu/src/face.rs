@@ -62,7 +62,8 @@ impl DeviceClient for CpuFace {
         let id = self.next;
         self.next += 1;
         self.blocks.insert(id, v);
-        Ok(Bytes::new(id, elems))
+        // CPU 面值块恒 f32;阶数由客户端定形
+        Ok(Bytes::new(id, elems, Dtype::F32, 0))
     }
 
     /// 装载(host 字节 → f32 值块)
@@ -76,7 +77,7 @@ impl DeviceClient for CpuFace {
         let id = self.next;
         self.next += 1;
         self.blocks.insert(id, v);
-        Ok(Bytes::new(id, 0))
+        Ok(Bytes::new(id, 0, dtype, shape.len() as u8))
     }
 
     /// 收割(值 → LE 字节;长度须与块一致)
@@ -113,7 +114,7 @@ impl DeviceClient for CpuFace {
         let mut out_id: Option<u64> = None;
         for a in &msg.args {
             match a {
-                Arg::Block { id } => {
+                Arg::Block { id, .. } => {
                     out_id = Some(*id);
                     vals.push(
                         self.blocks
@@ -122,7 +123,7 @@ impl DeviceClient for CpuFace {
                             .ok_or(ModelError::DeadBlock { id: *id })?,
                     )
                 }
-                Arg::BlockSlice { id, byte_offset, elems } => {
+                Arg::BlockSlice { id, byte_offset, elems, .. } => {
                     // 刀1:连续切片视图 —— host 真值直接切片(CPU 面零指针;
                     // byte_offset 字节 ÷ 4 = f32 元素偏移,F32 单一执行面)
                     let full = self
@@ -174,7 +175,14 @@ impl DeviceClient for CpuFace {
         let id = out_id
             .ok_or_else(|| ModelError::Msg("launch: args 中无输出块".to_string()))?;
         self.blocks.insert(id, out);
-        Ok(Bytes::new(id, msg.out_elems))
+        // 出参句柄:事实面由线格式 out 槽承载(CPU 面同律)
+        let (dtype, rank) = msg
+            .args
+            .iter()
+            .rev()
+            .find_map(|a| a.facts())
+            .unwrap_or((Dtype::F32, 0));
+        Ok(Bytes::new(id, msg.out_elems, dtype, rank))
     }
 
     async fn upload_pinned(

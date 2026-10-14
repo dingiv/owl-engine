@@ -15,7 +15,7 @@
 //! - `XqaDecodeRuntime` → `xqa_decode`(SPEC_DEC=1 `M_TILESIZE=16`,裸 decode q=1)
 
 use crate::client::xqa::{parse_verify, DECODE_XQA, VERIFY_XQA};
-use crate::contract::{Bytes, LaunchMsg, OpError, OpId};
+use crate::contract::{Bytes, Dtype, LaunchMsg, OpError, OpId};
 use crate::family::xqa::{
     KVCacheList, XqaArgs, XqaConsts, ASSET_DECODE, ASSET_VERIFY, CONSTS_SLOTS, SYM_CONSTS, SYM_KERNEL,
 };
@@ -102,7 +102,7 @@ fn emit(
     let c = parse_verify(msg)?;
     // 逐参命名解析(失败即报"哪一个参 + 哪个块 id" —— DeadBlock 定谳用)
     let r = |name: &'static str, b: &crate::client::xqa::BlockRef| {
-        res.resolve(&Bytes { id: b.id, len: 0 }).map(|p| p + b.byte_offset).map_err(|e| {
+        res.resolve(b.id).map(|p| p + b.byte_offset).map_err(|e| {
             OpError::Contract {
                 op: op.into(),
                 field: name,
@@ -157,7 +157,7 @@ fn emit(
         scratch,
     };
     exec.launch(res, OpId(op), kernel, crate::family::xqa::SYM_KERNEL, grid, block, smem, &args.vals(consts.head_grp))?;
-    Ok(Bytes { id: c.out.id, len: msg.out_elems })
+    Ok(Bytes::new(c.out.id, msg.out_elems, Dtype::F16, 2))
 }
 
 impl KernelFamily for XqaRuntime {

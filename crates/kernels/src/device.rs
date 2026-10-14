@@ -35,8 +35,8 @@ impl DeviceRes for &mut dyn DeviceRes {
     fn stream(&self) -> Result<Arc<CudaStream>, OpError> {
         (**self).stream()
     }
-    fn resolve(&self, b: &crate::contract::Bytes) -> Result<DevPtr, OpError> {
-        (**self).resolve(b)
+    fn resolve(&self, id: u64) -> Result<DevPtr, OpError> {
+        (**self).resolve(id)
     }
     fn alloc(&mut self, bytes: usize, tag: &'static str) -> Result<ScratchBuf, OpError> {
         (**self).alloc(bytes, tag)
@@ -87,8 +87,10 @@ pub trait DeviceRes {
     fn context(&self) -> Result<Arc<CudaContext>, OpError>;
     /// 计算流(三流模型属 server;COMPUTE 流)
     fn stream(&self) -> Result<Arc<CudaStream>, OpError>;
-    /// 块句柄 → 设备指针(账房解析;Bytes 纯 ID 纪律的唯一出口)
-    fn resolve(&self, b: &crate::contract::Bytes) -> Result<DevPtr, OpError>;
+    /// **块 id → 设备指针**(账房解析;`Bytes` 纯 ID 纪律的唯一出口)。
+    /// 只要 id:句柄的其余字段(len/dtype/rank)是**事实面标注**,解析不看它们
+    /// (2026-10-15:原签名收 `&Bytes`,逼出满地 `Bytes { id, len: 0 }` 占位块)
+    fn resolve(&self, id: u64) -> Result<DevPtr, OpError>;
     /// scratch 分配:账本 + 捕获 slab 感知 + A1.7 强租约
     fn alloc(&mut self, bytes: usize, tag: &'static str) -> Result<ScratchBuf, OpError>;
     /// 捕获状态查询(当前是否处于图捕获窗)

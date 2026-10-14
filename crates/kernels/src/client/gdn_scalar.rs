@@ -45,12 +45,12 @@ impl GdnScalarCall {
     /// 输入槽(6 Block;q/k/v/g/beta/state;f32 直入)
     pub fn ins_args(&self) -> [Arg; 6] {
         [
-            Arg::Block { id: self.q.id },
-            Arg::Block { id: self.k.id },
-            Arg::Block { id: self.v.id },
-            Arg::Block { id: self.g.id },
-            Arg::Block { id: self.beta.id },
-            Arg::Block { id: self.state.id },
+            Arg::block(self.q.id, self.q.dtype, self.q.rank),
+            Arg::block(self.k.id, self.k.dtype, self.k.rank),
+            Arg::block(self.v.id, self.v.dtype, self.v.rank),
+            Arg::block(self.g.id, self.g.dtype, self.g.rank),
+            Arg::block(self.beta.id, self.beta.dtype, self.beta.rank),
+            Arg::block(self.state.id, self.state.dtype, self.state.rank),
         ]
     }
 
@@ -73,12 +73,12 @@ impl GdnScalarCall {
         let mut scalars: Vec<u64> = Vec::new();
         for a in &msg.args {
             match a {
-                Arg::Block { id } => blocks.push(Bytes { id: *id, len: 0 }),
-                Arg::BlockSlice { id, byte_offset, .. } => {
+                Arg::Block { id, dtype, rank } => blocks.push(Bytes::new(*id, 0, *dtype, *rank)),
+                Arg::BlockSlice { id, byte_offset, elems: _, dtype, rank } => {
                     if *byte_offset != 0 {
                         return Err(contract("args", "Block(零偏移)", "BlockSlice"));
                     }
-                    blocks.push(Bytes { id: *id, len: 0 });
+                    blocks.push(Bytes::new(*id, 0, *dtype, *rank));
                 }
                 Arg::U64(v) => scalars.push(*v),
                 _ => return Err(contract("args", "Block/U64", "其他")),
@@ -118,7 +118,7 @@ impl GdnScalarCall {
     pub fn to_launch(&self, out: Bytes) -> LaunchMsg {
         let mut args: Vec<Arg> = Vec::with_capacity(14);
         args.extend(self.ins_args());
-        args.push(Arg::Block { id: out.id });
+        args.push(Arg::block(out.id, out.dtype, out.rank));
         for v in self.scalar_u64s() {
             args.push(Arg::U64(v));
         }

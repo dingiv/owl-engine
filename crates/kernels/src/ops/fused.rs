@@ -20,14 +20,14 @@ impl KernelSpec for QknormRopeKvInsertF16Fp8Knhd {
         Param::t_in("k", Dtype::F16, 3),
         Param::t_in("v", Dtype::F16, 3),
         // 主池 fp8(e4m3,1B/elem)
-        Param::t_in("key_cache", Dtype::U8, 4),
-        Param::t_in("value_cache", Dtype::U8, 4),
-        Param::t_in("slots", Dtype::F32, 1),
+        Param::t_in("key_cache", Dtype::U32, 1),
+        Param::t_in("value_cache", Dtype::U32, 1),
+        Param::t_in("slots", Dtype::F32, 0),
         Param::t_in("q_w", Dtype::F16, 1),
         Param::t_in("k_w", Dtype::F16, 1),
         Param::t_in("cos_t", Dtype::F16, 2),
         Param::t_in("sin_t", Dtype::F16, 2),
-        Param::t_in("pos", Dtype::F32, 1),
+        Param::t_in("pos", Dtype::F32, 0),
         Param::f32("eps"),
         Param::i32("hkv"),
         Param::i32("half"),
@@ -61,14 +61,14 @@ impl KernelSpec for QknormRopeKvInsertF16Fp8 {
         Param::t_in("q_raw", Dtype::F16, 2),
         Param::t_in("k", Dtype::F16, 3),
         Param::t_in("v", Dtype::F16, 3),
-        Param::t_in("key_cache", Dtype::U8, 4),
-        Param::t_in("value_cache", Dtype::U8, 4),
-        Param::t_in("slots", Dtype::F32, 1),
+        Param::t_in("key_cache", Dtype::U32, 1),
+        Param::t_in("value_cache", Dtype::U32, 1),
+        Param::t_in("slots", Dtype::F32, 0),
         Param::t_in("q_w", Dtype::F16, 1),
         Param::t_in("k_w", Dtype::F16, 1),
         Param::t_in("cos_t", Dtype::F16, 2),
         Param::t_in("sin_t", Dtype::F16, 2),
-        Param::t_in("pos", Dtype::F32, 1),
+        Param::t_in("pos", Dtype::F32, 0),
         Param::f32("eps"),
         Param::i32("hkv"),
         Param::i32("half"),
@@ -107,23 +107,28 @@ impl KernelSpec for QknormRopeKvInsertF16 {
     const ENTRY: &'static str = "owl_qknorm_rope_kv_insert_f16";
     const SRC: &'static str = "cu/fused/qknorm_insert.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("q", Dtype::F16, 2),
+        // ⚠️ **2026-10-15 L3 事实面修正**:本表原为**旧签名**
+        // (`q, q_raw, kw, beta, cos, sin, k, v, kc, vc, slots, …`)——
+        // 与 `.cu` 的 token 串**逐字相同**(11×T+f32+4×i32+T),token 级互证门
+        // 全绿却语义槽位全错位(f16 档融合插池 = 读写全错)。现按 `.cu` 实名
+        // 逐参对齐(`op_tables` 新增**名字级**互证门焊死这一类)。
         Param::t_in("q_raw", Dtype::F16, 2),
-        Param::t_in("kw", Dtype::F16, 2),
-        Param::t_in("beta", Dtype::F16, 2),
-        Param::t_in("cos", Dtype::F16, 2),
-        Param::t_in("sin", Dtype::F16, 2),
-        Param::t_in("k", Dtype::F16, 2),
-        Param::t_in("v", Dtype::F16, 2),
-        Param::t_in("kc", Dtype::F16, 3),
-        Param::t_in("vc", Dtype::F16, 3),
-        Param::t_in("slots", Dtype::F32, 1),
+        Param::t_in("k", Dtype::F16, 3),
+        Param::t_in("v", Dtype::F16, 3),
+        Param::t_in("key_cache", Dtype::F16, 5),
+        Param::t_in("value_cache", Dtype::F16, 4),
+        Param::t_in("slots", Dtype::F32, 0),
+        Param::t_in("q_w", Dtype::F16, 1),
+        Param::t_in("k_w", Dtype::F16, 1),
+        Param::t_in("cos_t", Dtype::F16, 2),
+        Param::t_in("sin_t", Dtype::F16, 2),
+        Param::t_in("pos", Dtype::F32, 0),
         Param::f32("eps"),
-        Param::i32("tokens"),
-        Param::i32("heads"),
-        Param::i32("head_dim"),
+        Param::i32("hkv"),
+        Param::i32("half"),
+        Param::i32("page"),
         Param::i32("w_off"),
-        Param::t_out("out", Dtype::F16, 2),
+        Param::t_out("q_out", Dtype::F16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[
         PoolAccess::write(pools::KV_MAIN, LayoutTag::Classic, Dtype::F16),
@@ -148,23 +153,28 @@ impl KernelSpec for QknormRopeKvInsertF16Knhd {
     const ENTRY: &'static str = "owl_qknorm_rope_kv_insert_f16_knhd";
     const SRC: &'static str = "cu/fused/qknorm_insert.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("q", Dtype::F16, 2),
+        // ⚠️ **2026-10-15 L3 事实面修正**:本表原为**旧签名**
+        // (`q, q_raw, kw, beta, cos, sin, k, v, kc, vc, slots, …`)——
+        // 与 `.cu` 的 token 串**逐字相同**(11×T+f32+4×i32+T),token 级互证门
+        // 全绿却语义槽位全错位(f16 档融合插池 = 读写全错)。现按 `.cu` 实名
+        // 逐参对齐(`op_tables` 新增**名字级**互证门焊死这一类)。
         Param::t_in("q_raw", Dtype::F16, 2),
-        Param::t_in("kw", Dtype::F16, 2),
-        Param::t_in("beta", Dtype::F16, 2),
-        Param::t_in("cos", Dtype::F16, 2),
-        Param::t_in("sin", Dtype::F16, 2),
-        Param::t_in("k", Dtype::F16, 2),
-        Param::t_in("v", Dtype::F16, 2),
-        Param::t_in("kc", Dtype::F16, 3),
-        Param::t_in("vc", Dtype::F16, 3),
-        Param::t_in("slots", Dtype::F32, 1),
+        Param::t_in("k", Dtype::F16, 3),
+        Param::t_in("v", Dtype::F16, 3),
+        Param::t_in("key_cache", Dtype::F16, 5),
+        Param::t_in("value_cache", Dtype::F16, 4),
+        Param::t_in("slots", Dtype::F32, 0),
+        Param::t_in("q_w", Dtype::F16, 1),
+        Param::t_in("k_w", Dtype::F16, 1),
+        Param::t_in("cos_t", Dtype::F16, 2),
+        Param::t_in("sin_t", Dtype::F16, 2),
+        Param::t_in("pos", Dtype::F32, 0),
         Param::f32("eps"),
-        Param::i32("tokens"),
-        Param::i32("heads"),
-        Param::i32("head_dim"),
+        Param::i32("hkv"),
+        Param::i32("half"),
+        Param::i32("page"),
         Param::i32("w_off"),
-        Param::t_out("out", Dtype::F16, 2),
+        Param::t_out("q_out", Dtype::F16, 2),
     ];
     const POOL: &'static [PoolAccess] =
         &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F16)];

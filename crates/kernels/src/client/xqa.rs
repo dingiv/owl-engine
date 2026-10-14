@@ -10,7 +10,7 @@
 //! `sem.zero_()`)。图内路线 = 图里挂一个零写节点(引擎接线时落;本步
 //! 层测试由调用方直接给零张量)。
 
-use crate::contract::{Arg, Bytes, LaunchMsg, OpError};
+use crate::contract::{Arg, Bytes, Dtype, LaunchMsg, OpError};
 
 pub const VERIFY_XQA: &str = crate::family::xqa::VERIFY_XQA;
 /// 裸 decode 臂(同名解析口径 —— 槽序与 verify 同型,解析函数复用)
@@ -52,7 +52,7 @@ pub fn parse_verify(msg: &LaunchMsg) -> Result<XqaVerifyCall, OpError> {
     let mut scalars: Vec<u64> = Vec::new();
     for a in &msg.args {
         match a {
-            Arg::Block { id } => blocks.push(BlockRef { id: *id, byte_offset: 0 }),
+            Arg::Block { id, .. } => blocks.push(BlockRef { id: *id, byte_offset: 0 }),
             Arg::BlockSlice { id, byte_offset, .. } => {
                 blocks.push(BlockRef { id: *id, byte_offset: *byte_offset })
             }
@@ -80,7 +80,7 @@ pub fn parse_verify(msg: &LaunchMsg) -> Result<XqaVerifyCall, OpError> {
         q: blocks[0],
         // 槽序:[q, k, v, page_table, seq_lens, mask, semaphores, scratch, wr]
         //      + out(解释器追加)
-        out: Bytes { id: blocks[9].id, len: 0 },
+        out: Bytes::new(blocks[9].id, 0, Dtype::F16, 2),
         k_cache: blocks[1],
         v_cache: blocks[2],
         page_table: blocks[3],
