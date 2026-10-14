@@ -28,6 +28,41 @@ pub struct TurnSpec {
     pub ignore_eos: bool,
 }
 
+/// per-turn 采样**覆写**(部分字段;`None` 字段 = 继承引擎 `knobs.sampler`)。
+/// 为什么不直接传整块 `SamplerCfg`:请求只带 `temperature/top_p/top_k`,
+/// 而 `rep_penalty` 等档位旋钮住引擎侧 —— 整块传会**静默丢掉**后者。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TurnSampler {
+    /// OpenAI `temperature`;0 = 本 turn 贪心
+    pub temp: Option<f32>,
+    /// OpenAI `top_k`
+    pub topk: Option<usize>,
+    /// OpenAI `top_p`
+    pub topp: Option<f32>,
+}
+
+impl TurnSampler {
+    /// 三字段全缺 = 请求没表达采样意图 ⇒ 完全走引擎缺省
+    pub fn is_empty(&self) -> bool {
+        self.temp.is_none() && self.topk.is_none() && self.topp.is_none()
+    }
+}
+
+/// 提交面可选项(per-turn;AGT-06:**OpenAI 协议的采样意图逐请求生效**)。
+/// 历史教训:这些参数曾被服务面"收下 + 告警但未生效" —— 客户端发来的
+/// 采样意图被全局单源静默覆盖,是"模型看起来不听话"的头号制造机。
+#[derive(Clone, Debug, Default)]
+pub struct TurnOpts {
+    /// 忽略 EOS 跑满预算([`TurnSpec::ignore_eos`] 同义;测速口径)
+    pub ignore_eos: bool,
+    /// 采样覆写(见 [`TurnSampler`])
+    pub sampler: Option<TurnSampler>,
+    /// 停止串(命中即停,输出截断于该串之前;空 = 不启用)
+    pub stop: Vec<String>,
+    /// RNG 种子覆写(`None` = turn id 派生;同 turn 重放仍确定)
+    pub seed: Option<u64>,
+}
+
 /// turn 终了原因(OpenAI `finish_reason` 真源)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FinishReason {

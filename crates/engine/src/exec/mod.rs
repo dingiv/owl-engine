@@ -77,7 +77,7 @@ fn fnv_bytes(data: &[u8]) -> u64 {
 
 type Result<T> = std::result::Result<T, ModelError>;
 
-
+/// 增量解码(全量重解后取后缀差分;多字节字符跨 token 边界时以
 /// 全文重解兜底,流式末字符可能延后一笔)
 pub(crate) fn decode_delta(tok: &Tokenizer, out: &[u32], decoded: &mut String) -> String {
     const REPL: &str = "\u{FFFD}";
@@ -100,3 +100,83 @@ pub(crate) fn decode_delta(tok: &Tokenizer, out: &[u32], decoded: &mut String) -
     emit
 }
 
+/// 字节偏移向下取 char 边界(超界 = 全长;切 `&str` 前必须过一道)
+pub(crate) fn floor_boundary(s: &str, i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    let mut i = i;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// **stop 尾缓冲上界**:返回最大的 `end` 使 `s[..end]` 的尾部不包含任一停止串的
+/// **真前缀**(否则半截停止串会被当成正文流给客户端,命中时收不回来)。
+/// 空 `stops` = 全长(零开销)。
+pub(crate) fn safe_end(s: &str, stops: &[String]) -> usize {
+    let mut end = s.len();
+    for st in stops {
+        // 尾部 k 字节(1 ≤ k < |st|)若恰为 st 的前缀 ⇒ 回退到该起点
+        let maxk = (st.len() - 1).min(s.len());
+        for k in (1..=maxk).rev() {
+            let cut = s.len() - k;
+            if s.is_char_boundary(cut) && st.starts_with(&s[cut..]) && cut < end {
+                end = cut;
+                break;
+            }
+        }
+    }
+    end
+}
+
+
+#[cfg(test)]
+mod stop_tests {
+    use super::{floor_boundary, safe_end};
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// 空 stop 列表 = 零回吐(全长)
+    #[test]
+    fn no_stops_returns_full_len() {
+        assert_eq!(safe_end("abc", &[]), 3);
+    }
+
+    /// 尾部是停止串的**真前缀** ⇒ 回退(半截不许流给客户端)
+    #[test]
+    fn holdback_on_partial_prefix() {
+        let stops = s(&["</tool_call>"]);
+        assert_eq!(safe_end("abc</", &stops), 3, "`</` 是前缀 ⇒ 回吐");
+        assert_eq!(safe_end("abc</to", &stops), 3);
+        assert_eq!(safe_end("abc", &stops), 3, "无前缀 ⇒ 原样");
+        assert_eq!(safe_end("abc<x", &stops), 5, "`<x` 不是前缀 ⇒ 放行");
+        // 完整串不算"部分前缀":命中由调用方的 `find` 单独判定(本函数只
+        // 负责把**半截**留住)。故此处 = 全长
+        assert_eq!(safe_end("abc</tool_call>", &stops), 15);
+    }
+
+    /// 多串 / 长串前缀关系(短串是长串前缀时按最长回吐)
+    #[test]
+    fn holdback_multiple_stops() {
+        let stops = s(&["\n\n", "STOP", "<|im_end|>"]);
+        assert_eq!(safe_end("hi\n", &stops), 2);
+        assert_eq!(safe_end("hi<|im_e", &stops), 2);
+        assert_eq!(safe_end("hiSTO", &stops), 2);
+        assert_eq!(safe_end("hi XX", &stops), 5);
+    }
+
+    /// floor_boundary:绝不切进多字节字符中间(中文/emoji)
+    #[test]
+    fn boundary_is_char_safe() {
+        assert_eq!(floor_boundary("中文", 1), 0);
+        assert_eq!(floor_boundary("中文", 3), 3);
+        assert_eq!(floor_boundary("中文", 99), 6);
+        let e = "a😀b";
+        assert_eq!(floor_boundary(e, 2), 1, "emoji 中间回退到 1");
+        assert_eq!(floor_boundary(e, 5), 5);
+    }
+}

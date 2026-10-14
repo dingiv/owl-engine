@@ -56,7 +56,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // 终了即焚:块链归还账房 + 会话表移除(GDN 格随之释放)
             self.burn_ephemeral(act.session_id);
         }
-        let text = self.tok.decode(&act.out);
+        let mut text = self.tok.decode(&act.out);
+        // stop 串命中(AGT-06):终了文本较交付给客户端的输出多了一截停止串 ⇒
+        // 截回命中位置(char 边界安全,不命中则原样)
+        if let Some(n) = act.trim_text_to {
+            let n = crate::exec::floor_boundary(&text, n);
+            text.truncate(n);
+        }
         Ok(TurnEvent::Completed { turn: act.id, text, finish: reason })
     }
 }

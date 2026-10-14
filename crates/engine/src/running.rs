@@ -36,6 +36,9 @@ pub(crate) struct Turn {
     pub(crate) ephemeral: bool,
     pub(crate) spec: TurnSpec,
     pub(crate) prompt_ids: Vec<u32>,
+    /// per-turn 可选项(AGT-06)
+    pub(crate) opts: crate::turn::TurnOpts,    /// 提交时前缀命中量(usage `cached_tokens` 真源;AGT-12)
+    pub(crate) cached: usize,
 }
 
 pub(crate) struct ActiveTurn {
@@ -46,6 +49,22 @@ pub(crate) struct ActiveTurn {
     pub(crate) max_new: usize,
     /// 忽略 EOS 跑满预算(TurnSpec 透传;测速口径)
     pub(crate) ignore_eos: bool,
+    /// 本 turn 采样参数(AGT-06;**提交时已与 knobs 合并**,见 scheduler)
+    pub(crate) sampler: crate::sampler::SamplerCfg,
+    /// 本 turn 是否走采样路径(temp=0 或 flavor greedy 档 = 否)
+    pub(crate) sampler_on: bool,
+    /// 停止串(AGT-06;空 = 不启用)
+    pub(crate) stop: Vec<String>,
+    /// 已发射文本字节数(`decoded` 为全量;stop 回吐 holdback 用)
+    pub(crate) emitted: usize,
+    /// stop 命中位置(字节偏移;终了时据此截断 `Completed.text`)
+    pub(crate) trim_text_to: Option<usize>,
+    /// RNG 种子覆写(AGT-06 `seed`;None = turn id 派生)
+    pub(crate) seed: Option<u64>,
+    /// 本 turn **起始 fed**(= 真实前缀命中量:会话守卫命中或块级前缀
+    /// 缓存命中;AGT-12 `cached_tokens` 真源 —— 后者在 submit 时尚未
+    /// 决定,只有 begin 定相后才知)
+    pub(crate) cached_start: usize,
     pub(crate) out: Vec<u32>,
     /// KV/prompt 推进指针(会话 turn 从 `cached_len` 起步 = 增量 prefill)
     pub(crate) fed: usize,
@@ -290,6 +309,23 @@ impl<D: DeviceClient> RunningEngine<D> {
         max_new: usize,
         ignore_eos: bool,
     ) -> Result<(u64, u64)> {
+        self.submit_session_opts(
+            session,
+            prompt,
+            max_new,
+            crate::turn::TurnOpts { ignore_eos, ..Default::default() },
+        )
+    }
+
+    /// 同 [`Self::submit_session_ex`],但携带 per-turn 可选项(采样参数/停止串/种子;
+    /// AGT-06)。`ignore_eos` 在 `opts` 内。
+    pub fn submit_session_opts(
+        &mut self,
+        session: impl Into<Option<u64>>,
+        prompt: impl Into<String>,
+        max_new: usize,
+        opts: crate::turn::TurnOpts,
+    ) -> Result<(u64, u64)> {
         let session = session.into();
         let prompt = prompt.into();
         let prompt_ids = {
@@ -349,8 +385,10 @@ impl<D: DeviceClient> RunningEngine<D> {
             id,
             session_id,
             ephemeral,
-            spec: TurnSpec { prompt, max_new, ignore_eos },
+            spec: TurnSpec { prompt, max_new, ignore_eos: opts.ignore_eos },
             prompt_ids,
+            opts,
+            cached: cached_hit,
         });
         Ok((session_id, id))
     }
@@ -423,6 +461,29 @@ impl<D: DeviceClient> RunningEngine<D> {
                     .filter(|a| a.id == turn)
                     .map(|a| a.prompt_ids.len())
             })
+    }
+
+    /// 提交时**前缀命中量**(usage `cached_tokens` 真源;AGT-12):
+    /// 会话守卫命中 ⇒ = 会话已缓存 token 数;未命中/无会话 ⇒ 0。
+    /// **真值**:`prompt_tokens - cached_tokens` = 本 turn 实际 prefill 量。
+    pub fn turn_cached_len(&self, turn: u64) -> Option<usize> {
+        self.queue
+            .iter()
+            .find(|t| t.id == turn)
+            .map(|t| t.cached)
+    }
+
+    /// 活跃 turn 起始前缀命中量(AGT-12 真源;`turn` 不匹配 = None)
+    pub fn active_cached_len(&self, turn: u64) -> Option<usize> {
+        self.active
+            .as_ref()
+            .filter(|a| a.id == turn)
+            .map(|a| a.cached_start)
+    }
+
+    /// 当前活跃 turn id(actor 侧"该发缓存纠正帧了吗"判据)
+    pub fn active_turn_id(&self) -> Option<u64> {
+        self.active.as_ref().map(|a| a.id)
     }
 
     /// 推进到下一个事件点(每调用 = 活跃 turn 的一个采样步,或 turn 的

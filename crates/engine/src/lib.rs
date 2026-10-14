@@ -68,7 +68,7 @@ pub fn head_plan_of(hq: owl_shared::config::HeadQuant) -> owl_models::module::Qu
 pub use running::RunningEngine;
 pub use graph_plan::{GraphPlan, GraphPlanDesc, PlanOutcome};
 pub use session::{AgentSession, SessionTable};
-pub use turn::{TurnEvent, TurnSpec};
+pub use turn::{TurnEvent, TurnOpts, TurnSampler, TurnSpec};
 
 /// 本 crate 的结果别名:错误权威 = iface `ModelError`(线上一族,不另立)
 pub type Result<T> = std::result::Result<T, owl_iface::contract::ModelError>;

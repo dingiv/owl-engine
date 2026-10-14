@@ -128,7 +128,11 @@ async fn main() {
     // ── chat 模板(agent 服务面 §3.2):**快照资产**,装配期编译一次 ──
     // 渲染唯一权威 = 模型目录里的 chat_template.jinja(新建/重命名为内置模板
     // 串会直接打碎前缀复用,见 §4.3 R2);装载失败 = 拒启(渲染不出来 = 服务无意义)
-    let tpl = match chat_tpl::ChatTpl::load(&config.model_dir) {
+    let tpl = match chat_tpl::ChatTpl::load_with(
+        &config.model_dir,
+        config.agent.template_path.as_deref(),
+        config.agent_template_defaults(),
+    ) {
         Ok(t) => {
             owl_shared::log_info!("boot", "chat 模板已装载({})", t.source());
             std::sync::Arc::new(t)
@@ -157,6 +161,8 @@ async fn main() {
     );
 
     let (bind, model_name) = (config.bind.clone(), config.model_name.clone());
+    // agent 服务面旋钮(模板已装载用于 log;此处交协议面消费)
+    let agent = std::sync::Arc::new(config.agent.clone());
     let (tx, rx) = mpsc::channel::<EngineReq>(CHANNEL_CAPACITY);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<String, String>>();
     std::thread::Builder::new()
@@ -199,12 +205,13 @@ async fn main() {
                 let tx = tx.clone();
                 let model_name = model_name.clone();
                 let tpl = tpl.clone();
+                let agent = agent.clone();
                 let gate = concurrency_gate.clone();
                 tokio::spawn(async move {
                     // 并发闸门:permit 获取排队(超出 max_concurrency 等待);
                     // 获取后持有至该连接服务完毕(长连接 = 占一并发位)
                     let _permit = gate.acquire().await;
-                    if let Err(e) = serve(stream, tx, model_name, tpl).await {
+                    if let Err(e) = serve(stream, tx, model_name, tpl, agent).await {
                         owl_shared::log_warn!("conn", "{e}");
                     }
                 });
@@ -269,6 +276,7 @@ async fn serve(
     tx: mpsc::Sender<EngineReq>,
     model_name: String,
     tpl: std::sync::Arc<chat_tpl::ChatTpl>,
+    agent: std::sync::Arc<owl_shared::config::AgentCfg>,
 ) -> std::io::Result<()> {
     let Some(req) = http::read_request(&mut stream).await? else {
         return Ok(());
@@ -288,7 +296,7 @@ async fn serve(
             .await?;
         }
         ("POST", "/v1/chat/completions") => {
-            openai::chat(&mut stream, &req.body, tx, &model_name, &tpl).await?;
+            openai::chat(&mut stream, &req.body, tx, &model_name, &tpl, &agent).await?;
         }
         // 日志面入口(/debug/log[/level/<name>])
         ("GET", p) if p == "/debug/log" || p.starts_with("/debug/log/") => {

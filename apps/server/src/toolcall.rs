@@ -167,6 +167,9 @@ pub struct ChannelSplitter {
     buf: String,
     schemas: ToolSchemas,
     tool_index: usize,
+    /// 工具块解析开关(`[agent] parse_tool_calls`;关 = `<tool_call>` 原文
+    /// 进 `content` —— 诊断臂/兼容旧客户端)
+    tool_on: bool,
     /// 游标标记计数(如关思考时仍吐 `</thinking>`)—— 一律**吞掉**不泄漏
     /// 进通道,但计数交给上层记日志(不许静默)
     strays: usize,
@@ -181,8 +184,25 @@ impl ChannelSplitter {
             buf: String::new(),
             schemas,
             tool_index: 0,
+            tool_on: true,
             strays: 0,
         }
+    }
+
+    /// 关工具块解析(`[agent] parse_tool_calls = false`):工具标记不再进
+    /// 工具通道,而是**按普通文本放行**(诊断/回退臂)。思考通道不受影响。
+    pub fn with_tool_parsing(mut self, on: bool) -> Self {
+        self.tool_on = on;
+        self
+    }
+
+    /// 本 drain 生效的标记集(工具解析关时剔掉工具标记)
+    fn marks(&self) -> Vec<&'static str> {
+        MARKS
+            .iter()
+            .filter(|m| self.tool_on || (**m != MARK_TOOL_OPEN && **m != MARK_TOOL_CLOSE))
+            .copied()
+            .collect()
     }
 
     /// 本 turn 已解析出的工具调用数(协议层据此定 `finish_reason`)
@@ -269,8 +289,9 @@ impl ChannelSplitter {
                 }
                 State::Text | State::Think => {
                     // 找**最早**出现的标记(同位置取更长者,防前缀重叠)
+                    let marks = self.marks();
                     let mut hit: Option<(usize, &str)> = None;
-                    for m in MARKS.iter() {
+                    for m in marks.iter() {
                         if let Some(p) = self.buf.find(m) {
                             let better = match hit {
                                 Some((bp, bm)) => p < bp || (p == bp && m.len() > bm.len()),
@@ -295,7 +316,7 @@ impl ChannelSplitter {
                         }
                         None => {
                             // 尾巴可能是标记前缀(跨 chunk 切半)⇒ 挂起不发
-                            let hold = holdback_len(&self.buf, &MARKS);
+                            let hold = holdback_len(&self.buf, &marks);
                             let upto = self.buf.len() - hold;
                             if upto > 0 {
                                 out.push(Item::Delta {
@@ -624,5 +645,22 @@ mod tests {
         let mut s = ChannelSplitter::new(false, tools());
         let items = s.push("<thought>推理</thought>答案");
         assert_eq!(split(&items), "R:推理|T:答案|");
+    }
+
+    /// `[agent] parse_tool_calls = false`(诊断/回退臂):工具标记**按普通文本
+    /// 放行**,而思考通道不受影响
+    #[test]
+    fn tool_parsing_can_be_disabled() {
+        let mut s = ChannelSplitter::new(false, tools()).with_tool_parsing(false);
+        let items = s.push("<tool_call><function=bash>ls</function></tool_call>");
+        assert_eq!(s.tool_calls(), 0, "关解析 ⇒ 零工具调用");
+        assert_eq!(
+            split(&items),
+            "T:<tool_call><function=bash>ls</function></tool_call>|"
+        );
+        // 思考通道仍工作(两件事互不耦合)
+        let mut s = ChannelSplitter::new(false, tools()).with_tool_parsing(false);
+        let items = s.push("<think>思考</think>正文");
+        assert_eq!(split(&items), "R:思考|T:正文|");
     }
 }

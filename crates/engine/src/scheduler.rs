@@ -165,6 +165,26 @@ impl<D: DeviceClient> RunningEngine<D> {
                 reset_gdn: cached_len == 0,
             });
             let ignore_eos = turn.spec.ignore_eos;
+            let opts = turn.opts.clone();
+            // 采样面合并(AGT-06):请求覆写按字段并入引擎 knobs;
+            // 请求未表达采样意图 ⇒ 完全走 knobs(flavor 语义不变)
+            let (eff_sampler, sampler_on) = match opts.sampler {
+                Some(o) if !o.is_empty() => {
+                    let mut s = self.cfg.knobs.sampler;
+                    if let Some(t) = o.temp {
+                        s.temp = t;
+                    }
+                    if let Some(k) = o.topk {
+                        s.topk = k;
+                    }
+                    if let Some(p) = o.topp {
+                        s.topp = p;
+                    }
+                    let on = s.temp > 0.0;
+                    (s, on)
+                }
+                _ => (self.cfg.knobs.sampler, self.cfg.knobs.sampler_enabled),
+            };
             self.active = Some(crate::running::ActiveTurn {
                 id: turn.id,
                 session_id: turn.session_id,
@@ -172,8 +192,15 @@ impl<D: DeviceClient> RunningEngine<D> {
                 prompt_ids: turn.prompt_ids,
                 max_new: turn.spec.max_new,
                 ignore_eos,
+                sampler: eff_sampler,
+                sampler_on,
+                stop: opts.stop,
+                emitted: 0,
+                trim_text_to: None,
+                seed: opts.seed,
                 out: Vec::new(),
                 fed: cached_len,
+                cached_start: cached_len,
                 decoded: String::new(),
                 spec: crate::running::TurnSpecState {
                     // B4 分母**跨 turn 保鲜**(见 RunningEngine::bare_cost_carry_ms);

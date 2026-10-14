@@ -126,6 +126,8 @@ pub struct ServerConfig {
     pub perf_level: u8,
     /// 日志面([log] module;CLI 可覆盖 level/file)
     pub log: owl_shared::config::LogCfg,
+    /// agent 服务面([agent] module;模板覆盖/隐式会话/工具解析/档位)
+    pub agent: owl_shared::config::AgentCfg,
 }
 
 impl ServerConfig {
@@ -180,6 +182,24 @@ impl ServerConfig {
             perf_dump: None,
             perf_level: cfg.probes.perf_level.to_u8(),
             log: cfg.log,
+            agent: cfg.agent,
         }
+    }
+
+    /// agent 面缺省模板变量(`[agent]` → jinja 变量;请求 kwargs 覆盖之)。
+    /// **只装非缺省项** ⇒ 缺省档与 HF oracle(无 kwargs)逐字节同源。
+    pub fn agent_template_defaults(&self) -> serde_json::Map<String, serde_json::Value> {
+        use owl_shared::config::ToolCallFormat;
+        let mut m = serde_json::Map::new();
+        if self.agent.tool_call_format != ToolCallFormat::Xml {
+            m.insert("tool_call_format".into(), serde_json::json!("json"));
+        }
+        if self.agent.auto_disable_thinking_with_tools {
+            m.insert("auto_disable_thinking_with_tools".into(), serde_json::json!(true));
+        }
+        if let Some(e) = &self.agent.reasoning_effort {
+            m.insert("reasoning_effort".into(), serde_json::json!(e));
+        }
+        m
     }
 }

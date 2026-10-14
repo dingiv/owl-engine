@@ -174,7 +174,20 @@ def main() -> int:
         "stream": False,
     }
     st, raw = post(base, body, False)
-    check("temperature/top_p 收下不报错(M-B 接引擎)", st == 200, f"status={st} {raw[:160]}")
+    check("temperature/top_p 被接受且已生效(AGT-06:不再是『收下未接』)", st == 200, f"status={st} {raw[:160]}")
+    # stop 串(AGT-06;同请求带上):命中即截断,且 finish_reason 合法
+    stop_body = dict(body, stop=["巴黎"])
+    st, raw = post(base, stop_body, False)
+    check("stop 串被接受(AGT-06)", st == 200, f"status={st} {raw[:160]}")
+    if st == 200:
+        try:
+            v = json.loads(raw)
+            fr = v["choices"][0].get("finish_reason")
+            check("stop 请求 finish_reason 合法", fr in ("stop", "length", "tool_calls"), f"finish_reason={fr}")
+            c = v["choices"][0]["message"].get("content") or ""
+            check("stop 命中后输出不含停止串", "巴黎" not in c, f"content={c[:60]!r}")
+        except Exception as e:  # noqa: BLE001 - 解析失败即上报(不静默)
+            check("stop 响应可解析", False, f"{e}: {raw[:120]}")
 
     print()
     if FAILS:

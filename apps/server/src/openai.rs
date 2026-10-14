@@ -11,8 +11,8 @@
 //! [`ChatTpl`] 从模型快照 `chat_template.jinja` 渲染 —— 手写模板串
 //! = 前缀复用零命中的根因。
 //!
-//! 挂账(M-B):每请求采样参数接引擎(P1-2)、隐式默认会话(P1-9)、
-//! `prompt_tokens_details.cached_tokens`(P2-6)、取消/abort(P2-1)。
+//! 挂账(M-C):取消/abort 的上游用法(`EngineReq::Abort` 已就位,pi 侧
+//! 断流走路由 actor 自动弃置)。
 
 use std::sync::Arc;
 
@@ -20,7 +20,8 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
 
-use owl_engine::TurnEvent;
+use owl_engine::{TurnEvent, TurnOpts, TurnSampler};
+use owl_shared::config::AgentCfg;
 
 use crate::actor::{EngineReq, SinkEvent};
 use crate::chat_tpl::{ChatTpl, RenderArgs};
@@ -31,15 +32,12 @@ use crate::toolcall::{Chan, ChannelSplitter, Item, ToolSchemas};
 // §1 协议数据与校验
 // ============================================================================
 
-/// 默认生成步数(请求未带 `max_tokens` 时;pi 会给真值)
-const DEFAULT_MAX_NEW: usize = 4096;
-
-/// `max_tokens` 上限(M-A:夹紧而非拒绝 —— 池容量 16k 档,pi 默认要 32k;
-/// 精确夹紧到「池容量 − prompt」需引擎侧知情,归 M-B)
-const MAX_NEW_CAP: usize = 8192;
-
 /// 允许的 role(其余 = 400;不静默)
 const ROLES: [&str; 5] = ["system", "developer", "user", "assistant", "tool"];
+
+/// `stop` 串个数/长度上限(病态保护;超限 = 400 而非静默截断)
+const MAX_STOP_SEQS: usize = 8;
+const MAX_STOP_LEN: usize = 256;
 
 #[derive(Deserialize)]
 pub struct ChatRequest {
@@ -69,7 +67,7 @@ pub struct ChatRequest {
     pub chat_template_kwargs: Option<Map<String, Value>>,
     #[serde(default)]
     pub tool_choice: Option<Value>,
-    // ── 采样参数:M-A 收下 + 告警(M-B 接引擎);收到就说明白,不静默 ──
+    // ── 采样参数(AGT-06:逐请求生效,接引擎 per-turn 采样面)──
     #[serde(default)]
     pub temperature: Option<f64>,
     #[serde(default)]
@@ -78,6 +76,12 @@ pub struct ChatRequest {
     pub top_k: Option<u32>,
     #[serde(default)]
     pub stop: Option<Value>,
+    #[serde(default)]
+    pub seed: Option<i64>,
+    /// 思考档位(OpenAI 同名协议值;**直通模板** `reasoning_effort`,
+    /// 模板自持值域 none/low/medium/high/xhigh…;AGT-07)
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     /// 未识别字段(关键项拒启/次要项告警 —— 见 [`Self::validate`]/[`Self::warnings`])
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -167,22 +171,56 @@ impl ChatRequest {
         Ok(())
     }
 
-    /// 收下但暂未生效的参数 → 告警(不许静默;M-B 接引擎后删除对应项)
+    /// 收下但**仍未生效**的参数 → 告警(不许静默)。
+    /// AGT-06 后温度/停止串已真生效,此处只剩未知字段
     pub fn warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
-        if self.temperature.is_some() {
-            out.push(format!("temperature={:?}", self.temperature));
-        }
-        if self.top_p.is_some() || self.top_k.is_some() {
-            out.push(format!("top_p={:?} top_k={:?}", self.top_p, self.top_k));
-        }
-        if self.stop.is_some() {
-            out.push("stop".to_string());
-        }
         if !self.extra.is_empty() {
             out.push(format!("未知字段 {:?}", self.extra.keys().collect::<Vec<_>>()));
         }
         out
+    }
+
+    /// 采样覆写(AGT-06;`None`/空 = 请求未表达采样意图)
+    pub fn sampler_override(&self) -> Option<TurnSampler> {
+        let s = TurnSampler {
+            temp: self.temperature.map(|v| v as f32),
+            topk: self.top_k.map(|v| v as usize),
+            topp: self.top_p.map(|v| v as f32),
+        };
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }
+
+    /// 停止串归一(OpenAI 允许 string 或 string[];非法 = 结构化拒)
+    pub fn stop_strings(&self) -> Result<Vec<String>, String> {
+        let v = match &self.stop {
+            None | Some(Value::Null) => return Ok(Vec::new()),
+            Some(v) => v,
+        };
+        let list: Vec<String> = match v {
+            Value::String(s) => vec![s.clone()],
+            Value::Array(a) => a
+                .iter()
+                .map(|x| {
+                    x.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| "stop 数组元素必须是字符串".to_string())
+                })
+                .collect::<Result<_, _>>()?,
+            _ => return Err("stop 必须是字符串或字符串数组".into()),
+        };
+        let list: Vec<String> = list.into_iter().filter(|s| !s.is_empty()).collect();
+        if list.len() > MAX_STOP_SEQS {
+            return Err(format!("stop 串个数 {} 超过上限 {MAX_STOP_SEQS}", list.len()));
+        }
+        if let Some(over) = list.iter().find(|s| s.len() > MAX_STOP_LEN) {
+            return Err(format!("stop 串过长({}B > {MAX_STOP_LEN}B)", over.len()));
+        }
+        Ok(list)
     }
 
     /// **vLLM 同款归一**(`vllm/entrypoints/chat_utils.py::_postprocess_messages`):
@@ -241,10 +279,13 @@ impl ChatRequest {
         Ok(())
     }
 
-    /// 生成步数(夹紧到 [`MAX_NEW_CAP`];夹紧情况返回 true 供调用方告警)
-    pub fn max_new(&self) -> (usize, bool) {
-        let want = self.max_tokens.filter(|v| *v > 0).unwrap_or(DEFAULT_MAX_NEW);
-        (want.min(MAX_NEW_CAP), want > MAX_NEW_CAP)
+    /// 生成步数(夹紧到 `agent.max_new_cap`;夹紧情况返回 true 供调用方告警)
+    pub fn max_new(&self, agent: &AgentCfg) -> (usize, bool) {
+        let want = self
+            .max_tokens
+            .filter(|v| *v > 0)
+            .unwrap_or(agent.default_max_new);
+        (want.min(agent.max_new_cap), want > agent.max_new_cap)
     }
 
     /// 开启思考?(模板契约:未给 = 模板缺省 true)
@@ -256,6 +297,9 @@ impl ChatRequest {
             .unwrap_or(true)
     }
 }
+
+/// 隐式默认会话 id(AGT-09;`[agent] implicit_session` = true 时无 session 键的请求落此)
+pub const IMPLICIT_SESSION: u64 = 0;
 
 /// OpenAI 协议会话键 → 引擎 u64 会话 id(进程内哈希;同键同 id)
 pub fn session_id(key: &str) -> u64 {
@@ -276,6 +320,7 @@ pub fn completion_json(
     finish_reason: &str,
     prompt_tokens: usize,
     completion_tokens: usize,
+    cached_tokens: usize,
 ) -> Value {
     json!({
         "id": id,
@@ -291,6 +336,7 @@ pub fn completion_json(
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
+            "prompt_tokens_details": {"cached_tokens": cached_tokens},
         },
     })
 }
@@ -354,11 +400,13 @@ enum ReplyMode {
 }
 
 /// usage 账本(单源:prompt 初值 = Accepted 捎带,Prefill 末笔覆盖;
-/// completion = Token 事件计数,1 事件 = 1 采样步 = 1 token)
+/// completion = Token 事件计数,1 事件 = 1 采样步 = 1 token;
+/// cached = Accepted 捎带的**前缀命中量**,AGT-12)
 #[derive(Default)]
 struct Usage {
     prompt: usize,
     completion: usize,
+    cached: usize,
 }
 
 /// 非流式聚合器(三通道 → 单条 message)
@@ -384,6 +432,7 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
     tx: mpsc::Sender<EngineReq>,
     model_name: &str,
     tpl: &Arc<ChatTpl>,
+    agent: &AgentCfg,
 ) -> std::io::Result<()> {
     let mut req: ChatRequest = match serde_json::from_slice::<ChatRequest>(body) {
         Ok(r) => r,
@@ -391,38 +440,67 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
             return http::respond_json(w, 400, &error_json(format!("请求体非法: {e}"))).await
         }
     };
-    if let Err(e) = req.validate().and_then(|_| req.normalize_tool_calls()) {
+    if let Err(e) = req
+        .validate()
+        .and_then(|_| req.stop_strings().map(|_| ()))
+        .and_then(|_| req.normalize_tool_calls())
+    {
         return http::respond_json(w, 400, &error_json(e)).await;
     }
     for wmsg in req.warnings() {
-        owl_shared::log_warn!("chat", "收下但暂未生效(M-B 接引擎):{wmsg}");
+        owl_shared::log_warn!("chat", "收下但暂未生效(AGT-06 后仅余未知字段):{wmsg}");
     }
+    let stop = match req.stop_strings() {
+        Ok(s) => s,
+        Err(e) => return http::respond_json(w, 400, &error_json(e)).await,
+    };
     let mode = if req.stream { ReplyMode::Stream } else { ReplyMode::Aggregate };
     let model_name = req.model.as_deref().unwrap_or(model_name);
-    let (max_new, clamped) = req.max_new();
+    let (max_new, clamped) = req.max_new(agent);
     if clamped {
         owl_shared::log_warn!(
             "chat",
-            "max_tokens={:?} 超出本档上限 {MAX_NEW_CAP},已夹紧(M-B:随池定档放开)",
-            req.max_tokens
+            "max_tokens={:?} 超出本档上限 {},已夹紧(改 [agent] max_new_cap 随池定档放开)",
+            req.max_tokens,
+            agent.max_new_cap
         );
     }
+    // 思考档位(AGT-07):OpenAI `reasoning_effort` **直通模板变量**
+    // (模板自持值域: none|low|medium|high|xhigh|…)。请求 > 配置缺省
+    let mut kw = req.chat_template_kwargs.clone().unwrap_or_default();
+    if let Some(e) = &req.reasoning_effort {
+        kw.insert("reasoning_effort".into(), json!(e));
+    }
+    let kw_ref = if kw.is_empty() { None } else { Some(&kw) };
     // 渲染:唯一权威 = 快照模板(§4.3 R2);模板拒(如 system 含图像)= 400
     let prompt = match tpl.render(RenderArgs {
         messages: &req.messages,
         tools: req.tools.as_deref(),
         add_generation_prompt: true,
-        template_kwargs: req.chat_template_kwargs.as_ref(),
+        template_kwargs: kw_ref,
     }) {
         Ok(p) => p,
         Err(e) => return http::respond_json(w, 400, &error_json(e.to_string())).await,
     };
     let (sink_tx, mut sink_rx) = mpsc::channel::<SinkEvent>(SINK_CAPACITY);
+    // 会话身份:显式 `session` 键优先;缺省按 [agent] implicit_session 落到
+    // 隐式会话 0(AGT-09:pi 每轮全量重发历史 ⇒ 前缀增量命中;守卫失配
+    // 自回退全量重算,正确性不依赖客户端)
+    let session = match req.session.as_deref().map(session_id) {
+        Some(id) => Some(id),
+        None if agent.implicit_session => Some(IMPLICIT_SESSION),
+        None => None,
+    };
     let engine_req = EngineReq::Chat {
-        session: req.session.as_deref().map(session_id),
+        session,
         prompt,
         max_new,
-        ignore_eos: req.ignore_eos,
+        opts: TurnOpts {
+            ignore_eos: req.ignore_eos,
+            sampler: req.sampler_override(),
+            stop,
+            seed: req.seed.map(|s| s as u64),
+        },
         sink: sink_tx,
     };
     if tx.send(engine_req).await.is_err() {
@@ -432,11 +510,12 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
     // 首笔:受理确认 / 提交拒绝(预算越界等,submit 边界落地)
     let mut usage = Usage::default();
     let turn = match sink_rx.recv().await {
-        Some(SinkEvent::Accepted { session, turn, prompt_tokens }) => {
+        Some(SinkEvent::Accepted { session, turn, prompt_tokens, cached_tokens }) => {
             usage.prompt = prompt_tokens;
+            usage.cached = cached_tokens;
             owl_shared::log_info!(
                 "chat",
-                "受理 session {session:#x} turn {turn}(stream={};tools={};think={})",
+                "受理 session {session:#x} turn {turn}(stream={};tools={};think={};prompt={prompt_tokens};cached={cached_tokens})",
                 mode == ReplyMode::Stream,
                 req.tools.as_ref().map(|t| t.len()).unwrap_or(0),
                 req.enable_thinking(),
@@ -446,6 +525,16 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
         Some(SinkEvent::Rejected { err }) => {
             return http::respond_json(w, 400, &error_json(err)).await
         }
+        // 契约:首笔必为 Accepted/Rejected(actor 在 pump 前投递)⇒ 不会走到
+        // 这里(真走到 = 协议序错乱,不静默吞)
+        Some(SinkEvent::Session { .. }) => {
+            return http::respond_json(
+                w,
+                503,
+                &error_json("协议序错乱:缓存校正帧先于受理确认"),
+            )
+            .await
+        }
         _ => return http::respond_json(w, 503, &error_json("引擎退役")).await,
     };
 
@@ -453,7 +542,8 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
     let mut splitter = ChannelSplitter::new(
         req.enable_thinking(),
         ToolSchemas::from_tools(req.tools.as_deref().unwrap_or(&[])),
-    );
+    )
+    .with_tool_parsing(agent.parse_tool_calls);
     let mut acc = Agg {
         seed: unix().as_nanos() as u64,
         ..Default::default()
@@ -461,6 +551,20 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
     // role 首帧延到首个内容帧(2026-10-02:提前发会让测速端把 HTTP 往返
     // 当 TTFT,长 prompt 的 prefill 全被藏进首帧延迟)
     let mut role_sent = false;
+    // 写失败 ⇒ 显式弃置引擎 turn(AGT-10):actor 侧虽会在下次投递失败时
+    // 发现,但显式 abort 立刻停(长思考/长输出下差几十秒 GPU)。
+    // 注:宏必须在 `acc`/`role_sent` 作用域内定义 —— macro_rules 卫生:
+    // 宏体内标识符按**定义点**解析,定义在前就看不到(实测踩过)
+    macro_rules! emit {
+        ($items:expr) => {
+            if let Err(e) = emit_items(w, mode, &id, model_name, &mut acc, &mut role_sent, $items)
+                .await
+            {
+                abort_turn(&tx, turn.map(|(s, _)| s)).await;
+                return Err(e);
+            }
+        };
+    }
     if mode == ReplyMode::Stream {
         http::respond_sse_head(w).await?;
     }
@@ -469,15 +573,27 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
             Some(SinkEvent::Turn(TurnEvent::Token { delta, .. })) => {
                 usage.completion += 1;
                 let items = splitter.push(&delta);
-                emit_items(w, mode, &id, model_name, &mut acc, &mut role_sent, items).await?;
+                emit!(items);
             }
             // Prefill 进度帧(末笔 total = prompt token 数,入 usage)
             Some(SinkEvent::Turn(TurnEvent::Prefill { total, .. })) => {
                 usage.prompt = total;
             }
+            // 缓存校正帧(AGT-12):块级前缀缓存命中的真值(覆盖 submit 时估值)
+            Some(SinkEvent::Session { turn: t, cached_tokens }) => {
+                if turn.map(|(_, x)| x) == Some(t) && cached_tokens != usage.cached {
+                    owl_shared::log_info!(
+                        "chat",
+                        "turn {t} 前缀命中校正 {}(submit 时估值 {})",
+                        cached_tokens,
+                        usage.cached
+                    );
+                    usage.cached = cached_tokens;
+                }
+            }
             Some(SinkEvent::Turn(TurnEvent::Completed { text, finish, .. })) => {
                 let items = splitter.finish();
-                emit_items(w, mode, &id, model_name, &mut acc, &mut role_sent, items).await?;
+                emit!(items);
                 // 有工具调用 ⇒ finish_reason = tool_calls(pi 的 mapStopReason 只认
                 // stop/length/tool_calls 三者);strays 非零 = 值得一条日志
                 if splitter.strays() > 0 {
@@ -509,6 +625,7 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
                                 "prompt_tokens": usage.prompt,
                                 "completion_tokens": usage.completion,
                                 "total_tokens": usage.prompt + usage.completion,
+                                "prompt_tokens_details": {"cached_tokens": usage.cached},
                             });
                             http::sse_data(w, &u.to_string()).await?;
                         }
@@ -536,6 +653,7 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
                                 reason,
                                 usage.prompt,
                                 usage.completion,
+                                usage.cached,
                             ),
                         )
                         .await
@@ -575,6 +693,15 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
         }
     }
     Ok(())
+}
+
+/// 客户端写失败 ⇒ 请求引擎弃置该会话的活跃 turn(AGT-10)。
+/// 投递失败本身不可恢复(actor 已退役),但**不许静默**。
+async fn abort_turn(tx: &mpsc::Sender<EngineReq>, session: Option<u64>) {
+    let Some(session) = session else { return };
+    if tx.send(EngineReq::Abort { session }).await.is_err() {
+        owl_shared::log_warn!("chat", "abort 投递失败(actor 已退役,引擎随进程退出)");
+    }
 }
 
 /// 三通道产出 → SSE 帧(流式)或聚合器(非流式);role 首帧在此处懒发
@@ -711,26 +838,73 @@ mod tests {
         assert!(r.normalize_tool_calls().is_err(), "非 function 类型应被拒");
     }
 
-    /// 采样参数/未知字段 → 告警条目(不静默丢弃)
+    /// 采样参数/未知字段 → 告警条目(AGT-06 后温度/停止串已真生效;
+    /// 告警只余**未知字段**,不许静默丢弃)
     #[test]
-    fn warnings_surface_ignored_params() {
+    fn warnings_surface_only_unknown_fields() {
         let r: ChatRequest = serde_json::from_value(json!({
             "messages":[{"role":"user","content":"hi"}],
             "temperature": 0.7, "stop": ["x"], "seed": 1})).expect("parse");
         r.validate().unwrap();
-        let w = r.warnings();
-        assert_eq!(w.len(), 3, "{w:?}");
+        assert!(r.warnings().is_empty(), "已生效参数不该再告警:{:?}", r.warnings());
+        let r: ChatRequest = serde_json::from_value(json!({
+            "messages":[{"role":"user","content":"hi"}],
+            "presence_penalty": 0.5})).expect("parse");
+        assert_eq!(r.warnings().len(), 1, "未知字段必须可见");
     }
 
-    /// max_tokens 夹紧 + enable_thinking 取值
+    /// AGT-06:采样覆写只带请求出现的字段(未带 = 继承引擎档位)
+    #[test]
+    fn sampler_override_partial() {
+        let r: ChatRequest = serde_json::from_value(json!({
+            "messages":[{"role":"user","content":"hi"}]})).expect("parse");
+        assert!(r.sampler_override().is_none(), "未带采样参数 ⇒ 无覆写");
+        let r: ChatRequest = serde_json::from_value(json!({
+            "messages":[{"role":"user","content":"hi"}], "temperature": 0.0})).expect("parse");
+        let o = r.sampler_override().expect("有覆写");
+        assert_eq!(o.temp, Some(0.0));
+        assert_eq!(o.topk, None);
+        assert_eq!(o.topp, None);
+    }
+
+    /// AGT-06:stop 两形态(string / array)+ 非法形态结构化拒
+    #[test]
+    fn stop_strings_shapes() {
+        let r: ChatRequest = serde_json::from_value(json!({
+            "messages":[{"role":"user","content":"hi"}], "stop": "\n\n"})).expect("parse");
+        assert_eq!(r.stop_strings().unwrap(), vec!["\n\n".to_string()]);
+        let r: ChatRequest = serde_json::from_value(json!({
+            "messages":[{"role":"user","content":"hi"}], "stop": ["a", "b"]})).expect("parse");
+        assert_eq!(r.stop_strings().unwrap(), vec!["a".to_string(), "b".to_string()]);
+        let r: ChatRequest = serde_json::from_value(json!({
+            "messages":[{"role":"user","content":"hi"}], "stop": [1, 2]})).expect("parse");
+        assert!(r.stop_strings().is_err(), "非字符串元素应被拒");
+        let r: ChatRequest = serde_json::from_value(json!({
+            "messages":[{"role":"user","content":"hi"}], "stop": 7})).expect("parse");
+        assert!(r.stop_strings().is_err(), "非 string/array 应被拒");
+    }
+
+    /// max_tokens 夹紧(上限来自 [agent]) + enable_thinking 取值
     #[test]
     fn max_new_clamp_and_thinking_flag() {
+        let agent = AgentCfg::default();
         let r: ChatRequest = serde_json::from_value(json!({
             "messages":[{"role":"user","content":"x"}], "max_tokens": 32000})).expect("parse");
-        assert_eq!(r.max_new(), (MAX_NEW_CAP, true));
+        assert_eq!(r.max_new(&agent), (agent.max_new_cap, true));
+        let r: ChatRequest = serde_json::from_value(json!({
+            "messages":[{"role":"user","content":"x"}]})).expect("parse");
+        assert_eq!(r.max_new(&agent), (agent.default_max_new, false));
         let r: ChatRequest = serde_json::from_value(json!({
             "messages":[{"role":"user","content":"x"}],
             "chat_template_kwargs": {"enable_thinking": false}})).expect("parse");
         assert!(!r.enable_thinking());
+        // [agent] 定制上限生效(配置面唯一旋钮)
+        let agent = AgentCfg { max_new_cap: 32768, default_max_new: 2048, ..AgentCfg::default() };
+        let r: ChatRequest = serde_json::from_value(json!({
+            "messages":[{"role":"user","content":"x"}], "max_tokens": 40000})).expect("parse");
+        assert_eq!(r.max_new(&agent), (32768, true));
+        let r: ChatRequest = serde_json::from_value(json!({
+            "messages":[{"role":"user","content":"x"}]})).expect("parse");
+        assert_eq!(r.max_new(&agent), (2048, false));
     }
 }

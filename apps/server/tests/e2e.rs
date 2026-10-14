@@ -464,6 +464,280 @@ fn e2e_server_suite() {
     }
     println!("[并发] 8 线程并发独立 session 全 PASS(闸门/隔离回归)");
 
+    // ============ agent 服务面 L1(B3;2026-10-14)============
+    // 强判据优先逆:这里断的全是**协议不变式**(I1~I7),不依赖
+    // "模型肯不肯发工具调用" —— 后者是 A7 台账项(工具遵循度),
+    // 拿它做门 = 拿模型脾气做门(红绿不可复现)。
+    //
+    // ① 工具历史可渲染 + 往返 200(assistant.tool_calls 的 arguments 是
+    //    **JSON 字符串** + role:"tool" 结果回填)⇒ `normalize_tool_calls`
+    //    + 模板工具分支同时被验到
+    let tool_history = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "List the files in the current directory."},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "call_e2e_1", "type": "function",
+                 "function": {"name": "bash", "arguments": "{\"command\":\"ls -la\"}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_e2e_1", "name": "bash",
+             "content": "total 8\ndrwxr-xr-x 2 owl owl 4096 ."},
+            {"role": "user", "content": "How many entries does that listing show? Answer with just the number."}
+        ],
+        "tools": [{"type": "function", "function": {
+            "name": "bash", "description": "Run a bash command",
+            "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}
+        }}],
+        "max_tokens": 256,
+        "session": "e2e-agent-hist"
+    });
+    let (st, resp) = post("/v1/chat/completions", &tool_history.to_string());
+    let v: serde_json::Value = serde_json::from_str(&resp).expect("工具历史响应 JSON");
+    assert_eq!(st, 200, "工具历史可渲染且 200:{resp}");
+    // **强判据 = prompt_tokens A/B**(不依赖模型质量):带工具历史(含 tools 块
+    // + 两条 tool 轮)的 prompt 必然显著长于同题单轮 ⇒ 渲染丢工具轮 = 此处红
+    // (G2 负判据)。内容是否非空属模型/贪心档行为(e2e 档锁 greedy),
+    // 只打印不断言 —— 拿模型雿气做门 = 红绿不可复现。
+    let pt_tools = v["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
+    let bare = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "List the files in the current directory."},
+            {"role": "user", "content": "How many entries does that listing show? Answer with just the number."}
+        ],
+        "max_tokens": 64,
+        "session": "e2e-agent-bare"
+    });
+    let (_, resp_bare) = post("/v1/chat/completions", &bare.to_string());
+    let vb: serde_json::Value = serde_json::from_str(&resp_bare).expect("对照响应 JSON");
+    let pt_bare = vb["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
+    assert!(
+        pt_tools > pt_bare + 100,
+        "工具历史必须真进 prompt(pt_tools={pt_tools} vs 对照 pt_bare={pt_bare})—— 渲染丢工具轮 = 负判据"
+    );
+    println!(
+        "[agent] 工具历史渲染 PASS(prompt_tokens {pt_tools} vs 无工具对照 {pt_bare});本轮 content={:?}",
+        content_of(&v).chars().take(40).collect::<String>()
+    );
+
+    // ② thinking 回填对称(reasoning_content 入历史;§3.4/§4.3 R1)——
+    //    同强判据:回填段必须进 prompt(与不带 reasoning_content 的对照比)
+    let think_history = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "In one word, the color of grass?"},
+            {"role": "assistant", "reasoning_content": "The user asks a simple question. Grass is green. So the answer is green.",
+             "content": "Green"},
+            {"role": "user", "content": "Say READY."}
+        ],
+        "max_tokens": 64,
+        "session": "e2e-agent-think"
+    });
+    let (st, resp) = post("/v1/chat/completions", &think_history.to_string());
+    assert_eq!(st, 200, "reasoning_content 回填可渲染:{resp}");
+    let v: serde_json::Value = serde_json::from_str(&resp).expect("think 回填响应 JSON");
+    let pt_think = v["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
+    let no_think = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "In one word, the color of grass?"},
+            {"role": "assistant", "content": "Green"},
+            {"role": "user", "content": "Say READY."}
+        ],
+        "max_tokens": 64,
+        "session": "e2e-agent-nothink"
+    });
+    let (_, resp_nt) = post("/v1/chat/completions", &no_think.to_string());
+    let vn: serde_json::Value = serde_json::from_str(&resp_nt).expect("对照响应 JSON");
+    let pt_nothink = vn["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
+    assert!(
+        pt_think > pt_nothink,
+        "reasoning_content 必须真进 prompt(回填 {pt_think} vs 不回填 {pt_nothink})"
+    );
+    println!(
+        "[agent] reasoning_content 回填 PASS(prompt_tokens {pt_think} vs 不回填 {pt_nothink})"
+    );
+
+    // ③ SSE 不变式:finish_reason 恰好一次 / usage 帧 choices=[] 且在
+    //    [DONE] 之前 / cached_tokens 透出(AGT-12)
+    let sse_body = serde_json::json!({
+        "messages": [{"role": "user", "content": "Say READY."}],
+        "max_tokens": 32,
+        "session": "e2e-agent-sse",
+        "stream": true,
+        "stream_options": {"include_usage": true},
+        "chat_template_kwargs": {"enable_thinking": true, "preserve_thinking": true},
+    });
+    let (st, sse) = http_post_sse("/v1/chat/completions", &sse_body.to_string())
+        .expect("agent SSE 请求(挂死/读失败即在此报错)");
+    assert_eq!(st, 200, "agent SSE HTTP 200");
+    assert_eq!(
+        sse.matches("\"finish_reason\":\"").count(),
+        1,
+        "I1:finish_reason 必须恰好发一次(chunk 里的 null 不计)"
+    );
+    assert!(sse.contains("data: [DONE]"), "流式以 [DONE] 收尾");
+    let before_done = sse.split("data: [DONE]").next().unwrap_or("");
+    let last_frame = before_done
+        .rsplit("data: ")
+        .next()
+        .unwrap_or("");
+    let uv: serde_json::Value = serde_json::from_str(last_frame.trim())
+        .unwrap_or_else(|e| panic!("usage 帧非法 JSON({e}): {last_frame}"));
+    assert_eq!(
+        uv["choices"].as_array().map(|a| a.len()),
+        Some(0),
+        "I2:usage 帧 choices 必须为空数组:{uv}"
+    );
+    assert!(uv["usage"]["prompt_tokens_details"]["cached_tokens"].is_u64(),
+        "AGT-12:cached_tokens 必须透出:{uv}");
+    assert!(sse.contains("\"reasoning_content\"") || sse.contains("\"content\""),
+        "三通道至少一路有内容");
+    println!(
+        "[agent] SSE 不变式 PASS(finish_reason×1 / usage 帧 choices=[] / cached_tokens 透出){}",
+        if sse.contains("\"reasoning_content\"") { ";think 通道在" } else { ";本轮无 think 段(非判据)" }
+    );
+
+    // ④ stop 串真生效(AGT-06):受控 A/B —— 用**贪心必复读**的提示词
+    //    (greedy 的看家本领)先验"无 stop 时会吐出停止串",再验带 stop 被截断。
+    //    前提不成立(模型没按指令复读)= 打印 SKIP(不拿模型雿气当门);
+    //    engine 侧 holdback 另有单测。
+    // 判据用**单词** "BANANA"(不依赖复读的间隔形态 —— 实测 split/非 split 档
+    // 下间隔不同,用 "BANANA BANANA" 会让门变脆):控制臂必含它,stop 臂必无它。
+    let rep_prompt = "Print the word BANANA separated by spaces, over and over, forever. Do not stop.";
+    let (_, v0) = chatx("e2e-agent-nostop", rep_prompt, 64);
+    let c0 = content_of(&v0);
+    let with_stop = serde_json::json!({
+        "messages": [{"role": "user", "content": rep_prompt}],
+        "max_tokens": 64,
+        "temperature": 0.0,
+        "stop": ["BANANA"],
+        "chat_template_kwargs": {"enable_thinking": false},
+        "session": "e2e-agent-stop",
+    });
+    let (st, resp) = post("/v1/chat/completions", &with_stop.to_string());
+    let v1: serde_json::Value = serde_json::from_str(&resp).expect("stop 响应 JSON");
+    assert_eq!(st, 200, "stop 请求 HTTP 200");
+    let c1 = content_of(&v1);
+    if c0.contains("BANANA") {
+        assert!(!c1.contains("BANANA"), "stop 命中后输出不得含停止串:{c1:?}");
+        assert_eq!(
+            v1["choices"][0]["finish_reason"].as_str(),
+            Some("stop"),
+            "stop 命中 ⇒ finish_reason=stop(实得 {:?})",
+            v1["choices"][0]["finish_reason"]
+        );
+        assert!(c1.len() <= c0.len(), "截断后不得变长({} vs {})", c1.len(), c0.len());
+        println!("[agent] stop 串 PASS(对照 {:?} / 带 stop {:?})", c0, c1);
+    } else {
+        println!(
+            "[agent] stop 串 SKIP:对照未复读停止串(模型未按指令),无法判定;engine holdback 另有单测。对照={c0:?}"
+        );
+    }
+
+    // ⑤ 400 面(不静默):未支持关键字段 / 坏 arguments / 坏 stop / n>1
+    for (name, body) in [
+        ("n>1", serde_json::json!({"messages":[{"role":"user","content":"x"}],"n":4})),
+        ("坏 arguments", serde_json::json!({"messages":[
+            {"role":"user","content":"x"},
+            {"role":"assistant","content":"","tool_calls":[{"id":"c","type":"function",
+              "function":{"name":"bash","arguments":"{oops"}}]}],"max_tokens":8})),
+        ("坏 stop", serde_json::json!({"messages":[{"role":"user","content":"x"}],"stop":[17]})),
+        ("logprobs", serde_json::json!({"messages":[{"role":"user","content":"x"}],"logprobs":true})),
+        ("非 function 工具历史", serde_json::json!({"messages":[
+            {"role":"user","content":"x"},
+            {"role":"assistant","content":"","tool_calls":[{"id":"c","type":"custom",
+              "function":{"name":"bash","arguments":{}}}]}],"max_tokens":8})),
+    ] {
+        let (st, resp) = post("/v1/chat/completions", &body.to_string());
+        assert_eq!(st, 400, "{name} 应结构化拒(400),实得 {st}:{resp}");
+        let e: serde_json::Value = serde_json::from_str(&resp).expect("错误体 JSON");
+        assert!(
+            e["error"]["message"].as_str().is_some_and(|m| !m.is_empty()),
+            "{name}:错误消息非空:{e}"
+        );
+    }
+    println!("[agent] 400 面 PASS(n>1/坏 arguments/坏 stop/logprobs/非 function)");
+
+    // ⑥ `tools: []` 与 `strict` 容忍(pi 在"有工具历史但无新工具"时发明文)
+    let tolerated = serde_json::json!({
+        "messages": [{"role": "user", "content": "Say READY."}],
+        "tools": [],
+        "tool_choice": "auto",
+        "max_tokens": 16,
+        "session": "e2e-agent-empty"
+    });
+    let (st, _) = post("/v1/chat/completions", &tolerated.to_string());
+    assert_eq!(st, 200, "tools:[] 应被接受");
+    let strict = serde_json::json!({
+        "messages": [{"role": "user", "content": "Say READY."}],
+        "tools": [{"type": "function", "function": {"name": "bash", "strict": true,
+            "description": "d", "parameters": {"type": "object", "properties": {}}}}],
+        "max_tokens": 16,
+        "session": "e2e-agent-strict"
+    });
+    let (st, _) = post("/v1/chat/completions", &strict.to_string());
+    assert_eq!(st, 200, "function.strict 应被容忍");
+    println!("[agent] tools:[] / strict 容忍 PASS");
+
+    // ⑦ 工具闭环 —— **条件式**(模型肯发才续轮;A7 台账项,不做硬门):
+    //    若 turn1 真的出 tool_calls,则把结果回填续一轮并断协议正确性
+    let tool_req = serde_json::json!({
+        "messages": [{"role": "user", "content": "Use the bash tool to run: echo owl-agent"}],
+        "tools": [{"type": "function", "function": {"name": "bash", "description": "Run a bash command",
+            "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}}],
+        "tool_choice": "auto",
+        "max_tokens": 512,
+        "stream": true,
+        "stream_options": {"include_usage": true},
+        "session": "e2e-agent-loop"
+    });
+    let (st, sse) = http_post_sse("/v1/chat/completions", &tool_req.to_string())
+        .expect("工具闭环请求");
+    assert_eq!(st, 200, "工具闭环 turn1 HTTP 200");
+    if sse.contains("\"tool_calls\"") {
+        assert!(
+            sse.contains("\"finish_reason\":\"tool_calls\""),
+            "有工具调用 ⇒ finish_reason 必须是 tool_calls"
+        );
+        // 提取 arguments(pi 侧的终极判据:必须能解析成 JSON 对象)
+        let args = sse
+            .split("\"arguments\":\"")
+            .nth(1)
+            .and_then(|r| r.split('"').next())
+            .unwrap_or("")
+            .to_string();
+        let av: serde_json::Value = serde_json::from_str(&args)
+            .unwrap_or_else(|e| panic!("I4:arguments 必须是合法 JSON 串({e}):{args:?}"));
+        assert!(av.is_object(), "I4:arguments 应为对象:{av}");
+        // 轮 2:工具结果回填
+        let turn2 = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "Use the bash tool to run: echo owl-agent"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "call_e2e_loop", "type": "function",
+                     "function": {"name": "bash", "arguments": args}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_e2e_loop", "name": "bash",
+                 "content": "owl-agent"},
+                {"role": "user", "content": "What did the command print? Answer with just that word."}
+            ],
+            "max_tokens": 256,
+            "session": "e2e-agent-loop"
+        });
+        let (st, resp) = post("/v1/chat/completions", &turn2.to_string());
+        assert_eq!(st, 200, "工具闭环 turn2 HTTP 200:{resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("turn2 JSON");
+        assert!(
+            v["choices"][0]["finish_reason"].as_str().is_some_and(|f| ["stop", "length", "tool_calls"].contains(&f)),
+            "turn2 finish_reason 合法:{v}"
+        );
+        println!(
+            "[agent] 工具闭环 turn1→turn2 PASS(arguments 合法 JSON;turn2 content={:?})",
+            content_of(&v).chars().take(40).collect::<String>()
+        );
+    } else {
+        println!(
+            "[agent] 工具闭环:本轮模型未发 tool_calls(A7 工具遵循度台账项,非本门判据);\n        已验:请求接受 + 200 + finish_reason 合法"
+        );
+    }
+
     // ============ 诊断面(非判据):前缀复用命中统计 ============
     // 服务端 `[dflash] prefill encode N rows @M`:M>0 = 会话守卫命中 →
     // 增量 prefill(新 KV 架构的 block 复用 + 快照 + 跨轮 GDN 连续路径)。

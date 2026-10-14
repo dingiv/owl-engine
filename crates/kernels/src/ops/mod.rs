@@ -259,8 +259,14 @@ pub fn audit_active(
 //   ② 池写集穷举审计的输入(`audit_active`);
 //   ③ P3 建表范围的依据(生产集 100% 建表 = 本表 ⊆ `all()`)。
 
-/// `--flavor spec-dflash` 实测发射集(45 个;27B AWQ + DFlash2 d7 + fp8 主池
-/// + gdn_chunked + XQA verify/decode + int4 头)
+/// `--flavor spec-dflash` 实测发射集(**49 个**;27B AWQ + DFlash2 d7 + fp8 主池
+/// + gdn_chunked + XQA verify/decode + int4 头;A5 后含 f16 主池族 4 项)
+///
+/// **2026-10-14 A5 补丁**:追加 **f16 主池族**(4 个)。原先本集只锁 fp8 池
+/// (“XQA 前置 = fp8”),导致 `[dispatch] kv_fp8 = false` 的 f16 池档在
+/// 白名单硬门处撞结构化拒(§7.6 二分实验只能拿 `allowed_ops = []` 绕)。
+/// 现在两池族**共存于同一白名单**:`kv_fp8` 决定实际发射哪一族,
+/// 池写集审计按 (池名, dtype) 分组 ⇒ 两族各成闭环、互不歧义(R3)。
 pub const PROD_SPEC_DFLASH_2026_10_13: &[&str] = &[
     "cublas_gemm_bf16",
     "cublas_gemm_f16",
@@ -294,6 +300,8 @@ pub const PROD_SPEC_DFLASH_2026_10_13: &[&str] = &[
     "owl_norm_rope_bf16",
     "owl_norm_rope_f16",
     "owl_qknorm_rope_kv_insert_f16_fp8kv_knhd",
+    // ── f16 主池族(A5;`kv_fp8 = false` 时实际发射)──
+    "owl_qknorm_rope_kv_insert_f16_knhd",
     "owl_reshape_and_cache_fp8kv_knhd",
     "owl_rmsnorm_bf16",
     "owl_rmsnorm_f16",
@@ -305,8 +313,15 @@ pub const PROD_SPEC_DFLASH_2026_10_13: &[&str] = &[
     "owl_topk16_split_f16",
     "owl_xqa_decode",
     "owl_xqa_verify",
+    "vllm_chunked_prefill_paged_attn_opt_f16_knhd_hd256",
     "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256",
+    "vllm_paged_attention_v2_f16_knhd_hd256bs32",
+    // XQA 关臂(A9:decode_xqa/verify_xqa=false)所需的 v2-fp8 decode + reduce
+    // (与 awq27b 集同项;不列 = XQA 关档在白名单硬门处结构化拒,实测踩过)
+    "vllm_paged_attention_v2_fp8_knhd_hd256bs32",
+    "vllm_paged_attention_v2_reduce_f16_hd256",
     "vllm_reshape_and_cache_bf16",
+    "vllm_reshape_and_cache_f16_knhd",
 ];
 
 /// `--flavor awq27b` 实测发射集(27 个;裸 27B AWQ + fp8 主池,无草稿/XQA)

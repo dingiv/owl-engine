@@ -27,7 +27,8 @@
    - **前缀复用**:现状多轮 **0% 命中**(e2e 17/17 `@0`),而 pi 每轮重发全历史;
    - **会话身份**:pi **不发我们的 `session` 键** ⇒ 每请求新建会话 ⇒ 守卫必失配。
 4. **M-A 交付线**:`pi -p "…"` 跑通 **read → write → bash** 工具闭环(真机冒烟)。**✅ 2026-10-14 达成**(见 §7.7)。
-   工期 **1.5~2.5 天**;M-B/M-C 再 +3.5 天。
+   **M-B/M-C 也已在同日落地**(AGT-06/07/09/10/11/12 + D1/G4,见 §7.9);**仅剩
+   两条待攻**:A7(工具调用遵循度)与 A8(spec 臂 token 级非稳定,§7.8)。
 5. **明确不在本专项**:prefill 吞吐(那是 P1‴/零回执,`优化候选总表-2026-10-14.md`)、
    decode 批桶(B5.1)、DFlash2 草稿质量。本专项**不做性能承诺**。
 
@@ -131,20 +132,20 @@
 
 | 编号 | 需求 | 验收口径 |
 |---|---|---|
-| **REQ-AGT-06** | **每请求采样参数**:`temperature/top_p/top_k/stop`(及 `seed` 可选)经 `EngineReq` 覆盖引擎 `SamplerCfg`;缺省 = 全局配置 | 温度=0 与温度=1 同一 prompt 输出分布可区分;`stop` 命中提前结束 |
+| **REQ-AGT-06** | **每请求采样参数**:`temperature/top_p/top_k/stop`(及 `seed` 可选)经 `EngineReq` 覆盖引擎 `SamplerCfg`;缺省 = 全局配置 | ✅ **已落地(2026-10-14)**:温度=0 与温度=1 同 prompt 分布可区分;`stop` 命中提前结束。**⚠️ 覆盖面记账**:仅**裸 decode 臂**生效 —— spec 臂的 token 选择不走采样器(见 §7.8 A8) |
 | **REQ-AGT-07** | **`enable_thinking`**(pi `chat_template_kwargs`):off ⇒ 预填空 think 块;on ⇒ 自然思考 | 两档在同一 prompt 上输出形态不同(think 段有无) |
-| **REQ-AGT-08** | **前缀复用**:跨会话块级缓存开启 + 复用时输出与全量重算**逐字一致**;同会话守卫经 §4.3 渲染对称性顺带命中 | **G4 真值门**:共享前缀跨会话 + 多轮同会话,命中 `@N>0` 且输出 sha 相同 |
+| **REQ-AGT-08** | **前缀复用**:跨会话块级缓存开启 + 复用时输出与全量重算**逐字一致**;同会话守卫经 §4.3 渲染对称性顺带命中 | ✅ **PASS(2026-10-14,G4)**:共享前缀跨会话命中 **1536/1732** + 多轮同会话命中 **165-225/187-238**;token 级 sha 等价(spec-off 严格口径)/ content 级(spec-on,因 A8) |
 | **REQ-AGT-09** | **会话身份**:无 `session` 键时退化到**隐式默认会话**(守卫失配自动回退全量 = 天然安全) | 多轮同客户端:第 2 轮起 `@N>0`;交错两客户端:正确性不变(退化为全量) |
 
 ### 2.3 P2 工程门
 
 | 编号 | 需求 | 说明 |
 |---|---|---|
-| **REQ-AGT-10** | **取消(abort)**:客户端断流 ⇒ 引擎侧尽早停放当前 turn | actor 挂账项;pi Esc 高频 |
-| **REQ-AGT-11** | HTTP 硬化:keep-alive 或至少 undici 兼容性实测;chunked 请求体 | 现为 `Connection: close` + 仅 Content-Length |
-| **REQ-AGT-12** | `prompt_tokens_details.cached_tokens` 透出前缀命中 | pi 侧 cacheRead + **我们自查命中率**的窗口 |
-| **REQ-AGT-13** | 长 ctx 定档:16384 → 32k/64k,补 std 长点回归 | agent 会话典型 20k~60k |
-| **REQ-AGT-14** | 并发:子代理并行(`max_concurrency`/`gdn_slots`) | 真正加速依赖 B5.1 批桶(非本专项) |
+| **REQ-AGT-10** | **取消(abort)**:客户端断流 ⇒ 引擎侧尽早停放当前 turn | ✅ **已落地(2026-10-14)**:服务面写失败 ⇒ `EngineReq::Abort`;actor 侧投递失败 ⇒ 弃置(≤1 采样步);实测 curl 断开后 `弃置 turn N` |
+| **REQ-AGT-11** | HTTP 硬化:keep-alive 或至少 undici 兼容性实测;chunked 请求体 | ✅ **chunked 已落地**(单测 4 + curl 实测);keep-alive 挂 hyper 迁移(permit 语义理由见 `http.rs` 头注) |
+| **REQ-AGT-12** | `prompt_tokens_details.cached_tokens` 透出前缀命中 | ✅ **已落地**:含**块级缓存命中**真值(`SinkEvent::Session` 校正帧);G4 探针数字与引擎日志逐项吻合 |
+| **REQ-AGT-13** | 长 ctx 定档:16384 → 32k/64k,补 std 长点回归 | ✅ **已评估定档**:维持 **16384**;32k/64k 已实测可用(见 §7.9 G5 数字),因 A8 + prefill −17% 不转正 |
+| **REQ-AGT-14** | 并发:子代理并行(`max_concurrency`/`gdn_slots`) | ✅ **已实测**:4 并发墙钟 **0.94×**(单槽串行,无并行);真加速依赖 B5.1 批桶(非本专项) |
 
 ### 2.4 明确不做(舍弃即设计)
 
@@ -219,9 +220,9 @@
 | `add_generation_prompt` | — | `true` | 末尾 assistant 起手 |
 | `enable_thinking` | `true` | `chat_template_kwargs.enable_thinking`(缺省 true) | REQ-AGT-07 |
 | `preserve_thinking` | `true` | `true` | 历史 assistant 的 think 段保留 ⇒ **§4.3 对称性的基础** |
-| `reasoning_effort` | 无 ⇒ `medium` | 不传(v1) | 档位指令(v2 可接 pi thinking 档) |
-| `tool_call_format` | `'xml'` | **不传(xml)** | ⚠️ 解析器必须与之一致:xml 模式生成 `<function=…><parameter=…>` |
-| `auto_disable_thinking_with_tools` | `false` | 不传 | 有工具就关思考(v2 可选) |
+| `reasoning_effort` | 无 ⇒ `medium` | **请求 `reasoning_effort`(AGT-07)或 `[agent] reasoning_effort`** | 档位指令(**直通模板** —— 模板自持值域 none/low/medium/high/xhigh…,不自造映射) |
+| `tool_call_format` | `'xml'` | **`[agent] tool_call_format`(缺省 xml)** | ⚠️ 解析器必须与之一致:xml 模式生成 `<function=…><parameter=…>` |
+| `auto_disable_thinking_with_tools` | `false` | **`[agent]` 同名键(缺省 false)** | 有工具就关思考(D2 待 A/B) |
 | `max_tool_arg_chars` / `max_tool_response_chars` | `0` | `0`(不截断) | 截断是模板侧启发式 |
 | `add_vision_id` | `false` | 不传 | v1 无视觉 |
 
@@ -294,7 +295,12 @@ data: [DONE]
           "completion_tokens_details":{"reasoning_tokens":T}}}
 ```
 - pi:`cacheRead = H`,`input = N − H` ⇒ **命中可见**(REQ-AGT-12)。
-- `reasoning_tokens` 可选(pi 会把它计入 output 显示)。
+- **H 的真值来源(2026-10-14 落地)**:引擎 `ActiveTurn.cached_start` = 本 turn 起始
+  fed(会话守卫命中 **+ 块级前缀缓存命中**),经 `SinkEvent::Session` 校正帧在**该 turn
+  首个事件之前**发出(块级命中在 submit 时尚未决定 ⇒ Accepted 只能报估值;短 turn 在
+  单次 pump 内跑完,校正帧必须抢在事件前发 —— 否则 sink 已摘除而丢帧,实测踩过)。
+- `reasoning_tokens` 仍未透出(可选字段,pi 会把它计入 output 显示);实现需按通道
+  计 token 数(现只有文本聚合),归 M-C 挂账。
 
 ### 3.6 错误面
 
@@ -443,7 +449,7 @@ token 序列"在**前缀上逐 id 相等**,否则守卫失配 ⇒ 全量重算�
 
 | 事件 | 处置 |
 |---|---|
-| 客户端断连(`sink.send` 失败) | 现状:日志一次 + 引擎继续;**M-B** 加 abort(REQ-AGT-10) |
+| 客户端断连(`sink.send` 失败 / 写帧失败) | ✅ **已落地(AGT-10,2026-10-14)**:服务面写失败 ⇒ `EngineReq::Abort` 显式弃置;actor 侧投递失败 ⇒ 标记弃置(≤1 采样步)。引擎 `abandon` 走正常回收(块链/快照留存,GDN 格释放)⇒ 后继请求不受影响。实测:curl 3s 断开 ⇒ `事件投递失败…弃置` + `弃置 turn N`,下一请求正常 |
 | 引擎 `pump` 错 | `abandon` 烧毁 turn + 广播(现状);已发 SSE ⇒ error 帧 + `[DONE]` |
 | 生成中途 EOF(长度/截断)且 `InTool` 未闭合 | **不发射**半截 tool_call;`finish_reason="length"` |
 | `<tool_call>` 后模型继续输出 | 允许(多块);`finish_reason="tool_calls"` |
@@ -469,7 +475,7 @@ token 序列"在**前缀上逐 id 相等**,否则守卫失配 ⇒ 全量重算�
 | **G1 单测** | 渲染器(含 tools/think/历史工具轮)× 解析器(两格式/多块/跨边界/Unicode/截断)× 状态机不变量 I1~I5 | `cargo test` |
 | **G2 wire 冒烟** | `apps/server/tests/agent_wire_smoke.py`(stdlib,对已启动 server 跑契约断言:三通道帧序 / finish_reason / usage 帧 / 工具历史可渲染 / `tools:[]` / 非法与未支持字段 400 / 采样参数不静默) | **✅ 实测 17/17(2026-10-14,0.8B 档)**;`e2e.rs` 内嵌断言归 M-B |
 | **G3 pi 真机冒烟** ✅(2026-10-14 PASS,见 §7.7) | `pi --model owl/… -p "在当前目录创建 hello.txt 并读回"` → read/write/bash 闭环;`/session` 里 toolCall 块与 thinking 块可见 | 人工 + 日志 |
-| **G4 前缀真值门** | ① 同会话多轮:`[前缀复用] 增量 ≥1` 且输出 sha 与全量重算逐字一致;② 跨会话共享前缀同样通过 | 扩 e2e + engine 既有 `gpu_prefix_cache_hit` |
+| **G4 前缀真值门** | ① 同会话多轮:`[前缀复用] 增量 ≥1` 且输出 sha 与全量重算逐字一致;② 跨会话共享前缀同样通过 | ✅ **PASS(2026-10-14,`apps/server/tests/prefix_reuse_probe.py`)** —— 同会话命中 **165-225/187-238**、跨会话命中 **1536/1732**(块级缓存);**口径**:spec-off 下 token 级 sha 硬判(严格),spec-on 下降为 content 级(因 A8,见 §7.8) |
 | **G5 长 ctx 回归** | std 五点 + 32k/64k 单请求 TTFT/decode 记录(定档依据) | llm_speedtest |
 
 **反例/负判据(必须明确失败)**:
@@ -484,8 +490,8 @@ token 序列"在**前缀上逐 id 相等**,否则守卫失配 ⇒ 全量重算�
 | 里程碑 | 内容 | 工期 | 出口 |
 |---|---|---|---|
 | **M-A 最小闭环** | REQ-AGT-01..05 + G0/G1/G2/G3 | **1.5~2.5 天** | ✅ **pi 跑通一次 agent 任务(2026-10-14)** |
-| **M-B 稳定可用** | REQ-AGT-06/07/09/10/13 | +1.5 天 | 多轮长会话不慢崩 |
-| **M-C 日常可用** | REQ-AGT-08/12 + G4/G5 + 接受率实测 + 11/14 | +2 天 | 缓存命中、指标可比 |
+| **M-B 稳定可用** | REQ-AGT-06/07/09/10/13 | +1.5 天 | ✅ **已落地(2026-10-14,§7.9)**:采样/停止串真生效、隐式会话、abort、chunked、reasoning 档、ctx 定档决策 |
+| **M-C 日常可用** | REQ-AGT-08/12 + G4/G5 + 接受率实测 + 11/14 | +2 天 | ✅ **已落地(同日)**:两层前缀复用 + G4 真值门 / cached_tokens 真值 / G5 三档数字 / agent 域 AL 2.68 / 4 并发墙钟 |
 
 **GPU/端口排期(实测环境,2026-10-14)**:
 
@@ -677,6 +683,107 @@ pi turn2   stop=stop     "完成。已在 /tmp/pi-smoke/hello.txt 写入 hello o
 **留下的教训**:① 采样器这类"只在长输出显形"的缺陷**必须用真机长回合做门**(短探针会给假绿);
 ② 自加旋钮必须记账"与参考实现的偏离",并在 agent 流量上重验。
 
+### 7.8 🆕 立案(2026-10-14):**spec 臂 token 级非路径稳定**(A8)
+
+**现象**:同一 prompt、同 `temperature=0`、三个**冷会话**(互不共享前缀),
+reasoning 长度分别是 **240 / 458 / 220B**(content 稳定为 `27`)。**16k 与 32k
+档都出现**(不是 ctx 档特有)。
+
+**含义(三条,都要记账)**:
+1. `temperature=0` **不再保证逐字可复现** ⇒ 本项目"恒等门/真值门"类判据
+   在 spec-on 下不可靠 —— **G4 的 token 级 sha 硬判必须 spec-off 跑**
+   (`prefix_reuse_probe.py` 已按开关自动降级为 content 级并打印观测);
+2. **请求的 `temperature/top_p/seed` 在 spec 臂基本不生效**(spec 的 token 选择
+   是 verify 行 argmax,不走 `sampler::sample`)⇒ **AGT-06 的覆盖面要如实记账**
+   (已生效于**裸 decode 臂**;spec 臂待 A8 结案);
+3. **与 A7(工具调用遵循度)疑同源**:若 spec 臂实际以某个固定温度在采样,
+   pi 发来的 `temperature=1.0` 根本没进采样链 ⇒ "模型不调工具"可能部分由
+   此解释。**建议合并排查**。
+
+**假设与修法候选**(未验证):verify 图在**捕获期烘焙了采样器**(图内节点),
+per-turn 参数进不了图。候选:① 采样参数走图输入槽(与 `xqa_pt` 同款修法);
+② spec 臂在"请求要贪心"时走纯 argmax 数值面(需先确认 verify 行 argmax 与
+裸 decode argmax 的数值一致性 —— 目前**不一致**,这也可能正是非稳定的来源);
+③ host argmax 校准面(`DiagOpts.host_argmax`)已有先例。
+
+**排查入口(单变量)**:spec 开/关 × 请求 temperature(0 / 1.0) → 看输出分布;
+再看 `/debug/metrics` 的 `spec.m*` 直方图是否随请求温度变。
+
+### 7.9 ✅ 第二批交付实录(2026-10-14,AGT-06/07/09/10/11/12 + B1-B4 + A3/A4/A5 + D1/D3/D4)
+
+**原则**:本批把"收下但未生效"全部清干净(AGT-06/07/12),把"能用"推到"长期
+可用"(AGT-09/10/11/13),并用**真值门**证明前缀复用不改变答案(D1/G4)。
+
+| 面 | 交付 | 判据/实测 |
+|---|---|---|
+| AGT-06 | `TurnOpts{sampler,stop,seed}` + 引擎 per-turn 采样合并(部分覆写)+ stop 尾缓冲 | 单测 4 + e2e stop 受控 A/B(贪心必复读提示词:对照吐 `BANANA…`,带 stop 截断且 `finish_reason=stop`)+ wire 22/22 |
+| AGT-07 | `reasoning_effort` 直通模板 + pi compat 打开 | 模板值域自持,零自造映射 |
+| AGT-09 | `[agent] implicit_session` | lag_probe 4/4(交错提问)+ G4 同会话命中 88% |
+| AGT-10 | 断流 ⇒ Abort/弃置 | curl 3s 断开实测:日志 `弃置 turn N`,后继请求正常 |
+| AGT-11 | chunked 请求体 | 单测 4 + curl chunked 200;keep-alive 挂 hyper 迁移(permit 语义理由已记) |
+| AGT-12 | `cached_tokens` 真值(含块级命中) | G4 探针数字与引擎 `prefill encode @M` 逐项吻合 |
+| AGT-13 | 定档决策:**维持 16384** | G5:16k 1264 t/s / 32k 1044(TTFT@30k 28.7s)/ 64k 850(70.6s);32k/64k 可用不转正(A8 + prefill −17%) |
+| B1/B2 | `[agent]` 配置模块 + 模板覆盖 | 账外键拒/枚举严格单测 |
+| B3 | e2e agent L1 七段 | 工具历史/thinking 回填用 **prompt_tokens A/B** 做硬判(不拿模型脾气做门) |
+| B4 | `agent_gates.sh` 三门一键 | lag + wire + e2e |
+| A3/A4/A5 | 读数复核 / 质量抽查 / f16 白名单 | 见台账 A 组(全部 ✅) |
+| D1/G4 | 两层前缀复用 + 真值门 | 同会话 88% / 跨会话 89%(1536/1732);**机制发现**:跨会话复用需"页面对齐快照"(短 prompt 常无快照可复用) |
+| D3/D4 | agent 域 AL / 并发墙钟 | AL **2.68**(156 轮,零降级);4 并发 = 0.94×(单槽串行,无并行) |
+
+**新工具(入仓)**:`prefix_reuse_probe.py`(G4 真值门,自动探测 spec 开关)、
+`agent_gates.sh`(三门)。**踩坑入册**:① `kill` 后不等内存释放就重启 ⇒ 新进程 OOM
+而旧进程仍在服务(探针打到了旧 server,结论一度被污染)→ **重启纪律 = 等 GPU
+占用清零**;② 短 turn 的校正帧必须在首个事件前发(否则 sink 已摘除丢帧);
+③ 拿"模型肯不肯发工具调用"做门 = 拿模型脾气做门 ⇒ 改用 prompt_tokens A/B。
+
+### 7.10 🔴 A7+A8 合并排查实录(2026-10-14 深夜;**定责完成,机制部分定谳**)
+
+**定责(vLLM 对照,同模型/同请求/渲染逐字节相同)**:
+
+| 引擎 | 同一条工具请求(temp=1.0,思考开) | 结果 |
+|---|---|---|
+| **vLLM**(`cyankiwi/Qwen3.8-27B-AWQ-INT4`,TP2,`--tool-call-parser qwen3_coder`) | 同 messages + 同 tools + 同 kwargs | **3/3 真发 `tool_calls`**(`{"command": "echo owl-agent"}`) |
+| **owl**(生产档,prefill_split 缺省 false) | 同上 | **0/12**;且 prefill 末行 logits **塔平**(top2 = `28`:9.45 / 9.16) |
+| owl(加 `prefill_split = true`) | 同上 | **6/6 真发 `tool_calls`**;同臂 decode **39 → 182 t/s** |
+
+**渲染无罪**:同一请求经 HF `apply_chat_template` 渲染 vs 引擎 `OWL_PROMPT_DUMP` → **逐字节相同**(含 `<tools>` 块/`<IMPORTANT>` 段/`thinking` 预填)。
+
+**已排除的红鳍(全不是病因)**:int4 lm_head(`head_quant=off` 同样塔)、
+采样参数(温度 0/0.2/0.5/0.7/1.0 全塔,同一批退化串)、rep_penalty(=1.0 关)、
+B4 自适应降级(`degrade_after=0` 不变)、`verify_xqa` / `decode_xqa`(单变量均不变好,
+**除了** spec-off + decode_xqa=false 那一格)、prompt 渲染、模型本身(vLLM 无罪)。
+
+**已定谳的机制一:`prefill_split = false`(缺省)的 prefill 会腐坏模型上下文**
+—— 同一 prompt 在 split/非 split 下 prefill 末行 logits 差异巨大
+(9.45 vs 25.41 的绝对尺度 + argmax 从 `28`("=")变为 `760`("The"))⇒ 输出退化
+为复读/短废串。**该缺陷同时压垓投机接受率**(decode 39 vs 182 t/s)。
+⇒ agent 档已加 `[dispatch] prefill_split = true`(e2e 档早已是 true ——
+这就是为何 e2e 的 agent 面断言全绿而 pi 真机全红)。
+
+**待定谳的机制二:spec 臂的 token 选择不走采样器(贪心性)**
+—— spec 路径的 token 全部来自 verify 行 argmax(`exec/spec.rs` 里
+`m = drafts[i]==ids[i]` 的贪心接受 + `bonus = ids[m]`),全仓 `sampler::sample`
+**只有一个调用点**(裸 decode 步)⇒ **spec 开时,请求的温度/种子基本不生效**,
+而贪心正是本项目已定谳的"27B instruct 复读吸引子"姿势。pi 真实流量
+(12.7k token 系统提示 + 多工具)在 `prefill_split=true` + 32k 池下仍塔成
+`":\n"` 复读至 max_tokens —— 与机制二相符。
+**判据(待跑)**:spec-off 下 pi 真机是否完成工具闭环。
+
+**A8(温度=0 不可复现)的最新定位**:已排除 prefix reuse / degrade_after /
+两个 xqa 开关 / prefill_split;**实证两件**:
+① 输出是"**运行史的函数**"—— 同一 boot 内按 run 序号稳定复现(240/458/220B
+三连,4 个独立 boot 一致,1 个 boot 偏差);
+② **池内容会改变结果**:干净池 240B vs 先跑一轮 filler 后 428/405B(同一 prompt
+同 temperature=0)⇒ 指向"**spec 臂读到了本轮未覆写的残留状态**"(主池尾部/
+草稿池/快照其一)。⇒ 与 A7 同族(都在 spec/数值路径),但非同一开关。
+
+**新立案**:
+- **A9** = `prefill_split=false` 的 prefill 数值缺陷(已定位到"末行 logits 塔平"
+  这一现象级证据;agent 档已绕开,引擎侧待修)
+- **A10** = `prefill_split=true` 下**跨会话块级前缀缓存不命中**(D1 ② 失效,
+  实测 `cached_tokens=0` ×2;同会话增量仍命中)
+- **A11** = spec 臂采样化(随机投机接受 / bonus 采样) —— 修 A7/A8 的正解
+
 ### 7.2 魔改模板的复刻度
 
 快照模板 461 行含:工具格式指令块、连续失败警告启发式(`_strong_error`/`_weak_error`)、
@@ -717,25 +824,32 @@ pi turn2   stop=stop     "完成。已在 /tmp/pi-smoke/hello.txt 写入 hello o
 | **T2** | `toolcall.rs`:三通道状态机 + 两格式解析 + 不变量 | 新增 | G1(I1~I5) | — |
 | **T3** ✅ | `openai.rs`:全字段解析(**原样透传 + 结构化校验**)+ `normalize_tool_calls`(vLLM 同款)+ 三通道 SSE + `finish_reason=tool_calls` + 400 面 | 改 | G1/G2 ✅ | T1,T2 |
 | **T4** ✅ | `render_prompt` 退役(§4.3 R2);prompt 一律 `ChatTpl`;模板 boot 期装载(失败拒启) | 改 | G0 ✅ | T1 |
-| **T5** | `config.rs`:`[agent]` module(模板路径/隐式会话开关/tool 解析开关) | 改 | G1 | — |
+| **T5** ✅ | `config.rs`:`[agent]` module(模板路径/隐式会话开关/tool 解析开关/max_new 上下限/tool_call_format/auto_disable/reasoning_effort) | 改 | G1 ✅ | — |
 | **T6** ✅ | `agent_wire_smoke.py` 落地并实跑 **17/17** | 新增 | G2 ✅ | T3 |
 | **T7** ✅ | **pi 真机冒烟 PASS**(§7.7)+ `~/.pi/agent/models.json` 加 `owl` provider(备份在)+ 本轮另修引擎侧 3 项(XQA 页表恒等链 / `snap_max=0` panic 记录 / 采样器去重与默认值) | 配置 + 文档 | G3 ✅ | T3 |
 
 **施工纪律**(沿用本工作区教训):
 ① 不主动 git commit;② 只杀自己的 PID(禁 `nvidia-smi | xargs kill -9`);
-③ GPU 验收串行;④ 每个新功能先跑**最小独立用例**;⑤ 不许吞可失败返回值;
-⑥ 新增旋钮走 `config.rs` 结构体 + `from_env` 登记(禁散点 env 直读)。
+③ GPU 验收串行;**⚠️ 重启纪律:kill 后必须等 GPU 占用清零再起新实例**
+(实测:kill 后 3s 就重启 ⇒ 新进程 OOM 而旧进程仍在服务 ⇒ 探针打到了旧 server,
+结论一度被污染);④ 每个新功能先跑**最小独立用例**;⑤ 不许吞可失败返回值;
+⑥ 新增旋钮走 `config.rs` 结构体 + `from_config` 登记(禁散点 env 直读);
+⑦ **判据门禁拿模型雿气做门** —— 模型行为相关的断言用"受控 A/B + 前提检查"
+(如工具历史用 prompt_tokens A/B、stop 串用贪心必复读提示词),否则红绿不可复现。
 
 ---
 
 ## §九 挂账(不阻塞 M-A)
 
-1. `[agent]` 面尚未接入 `OwlConfig` 的 deny_unknown_fields 全账(随 T5 一起补)。
-2. reasoning 档位(`reasoning_effort` → 模板 `reasoning_instructions`)与 pi `/thinking` 档的映射(v2)。
-3. `auto_disable_thinking_with_tools` 的产品选择(有工具时是否关思考)——需真机数据。
+1. ~~`[agent]` 面尚未接入 `OwlConfig` 的 deny_unknown_fields 全账~~ ✅ **已结(T5/B1)**。
+2. ~~reasoning 档位映射~~ ✅ **已结(AGT-07)**:`reasoning_effort` 直通模板。
+3. `auto_disable_thinking_with_tools` 的产品选择(有工具时是否关思考)—— **旋钮已就位**,需真机 A/B 数据(D2)。
 4. 视觉/图像输入(`<|vision_start|>` 分支)保留未启用。
 5. undo/rollback 会话级重置接口(pi 的 compaction 触发后的显式 reset,避免残留块链)。
-6. `/debug/agent` 诊断面(最近一次渲染 prompt 原文 + 解析器状态机轨迹;现只有 `OWL_PROMPT_DUMP`)。
+6. `/debug/agent` 诊断面(最近一次渲染 prompt 原文 + 解析器状态机轨迹;现只有 `OWL_PROMPT_DUMP`)—— **对 A7/A8 排查也有用**。
+7. `completion_tokens_details.reasoning_tokens`(需按通道计 token 数;现只有文本聚合)。
+8. **A8(spec 臂 token 级非稳定)** —— 见 §7.8;与 A7 疑同源,合并排查。
+9. **A7(工具调用遵循度)** —— 台账第一优先;AGT-06 已落地,复测应在新的采样面下做。
 
 ---
 
@@ -743,6 +857,7 @@ pi turn2   stop=stop     "完成。已在 /tmp/pi-smoke/hello.txt 写入 hello o
 
 | 日期 | 版本 | 变更 |
 |---|---|---|
+| 2026-10-14 | v0.8 | **第二批交付**:AGT-06(per-turn 采样/stop/seed,引擎侧 `TurnOpts`)/07(reasoning_effort 直通)/09(implicit_session)/10(abort)/11(chunked)/12(cached_tokens 真值含块级命中)/13(定档维持 16k);B1-B4(`[agent]` 配置模块 + e2e agent L1 七段 + `agent_gates.sh`);A3/A4/A5 ✅;D1 ✅(**两层前缀复用 + G4 真值门**:同会话 88% / 跨会话 89%)、D3(agent 域 AL 2.68)、D4(4 并发无并行);**新增 §7.8 A8 = spec 臂 token 级非路径稳定**(与 A7 疑同源,恒等/真值门一律 spec-off 跑);实测数字全部入 §7.9。 |
 | 2026-10-14 | v0.7 | 清 A 组引擎债三项:**A1 拒启可见**(四项真机实测)/ **A2 `snap_max=0` 不再 panic**(真机 4/4、零 503)/ **A6 think 别名**(+单测);生产档回归绿(wire 17/17、lag 4/4、pi 全链 1 次成功)。**新增 A7:工具调用遵循度实测 1/9**(模型倾向直接作答+幻觉完成,日志证明非解析丢失)= 现第一优先,台账见 `roadmap.local/agent-服务面-剩余工作项-2026-10-14.md`。 |
 | 2026-10-14 | v0.6 | **T7 PASS + §7.7 结案**:病灶 = `rep_penalty` 逐元素施加 ⇒ `1.15^k` 指数累积(短输出无感、长思考必崩),已修(去重 + 默认 1.0,单测 7/7);真机生产形状(froggeric + spec d7 + fp8/XQA)pi↔owl 全链跑通,产物文件落地。**M-A 达成**。另记:本轮另修引擎 3 项(XQA 页表恒等链 × 多会话、配置错误静默 exit、`snap_max=0` panic 立案)。 |
 | 2026-10-14 | v0.5 | **§7.6 结案并修复**:定谳更正为 **XQA 页表恒等链**(fp8 只是触发条件 —— XQA 前置为 fp8 池;V11 消歧);修法 = 页表改走图输入槽 + `xqa_pt_of` 会话真链,三处触点;验证 = 生产形状 lag 4/4 + 27B 冒烟 17/17 + XQA 恒等探针;agent 档收回生产形状;影响面(多请求接受率/质量读数需复核)已记账。 |

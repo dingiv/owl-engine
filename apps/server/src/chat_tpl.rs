@@ -37,12 +37,6 @@ const TOKENIZER_CONFIG: &str = "tokenizer_config.json";
 #[derive(Debug)]
 pub struct TplError(String);
 
-impl TplError {
-    pub fn msg(&self) -> &str {
-        &self.0
-    }
-}
-
 impl std::fmt::Display for TplError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -68,17 +62,43 @@ pub struct ChatTpl {
     env: Environment<'static>,
     /// 模板来源(日志/诊断用)
     source: String,
+    /// agent 面缺省模板变量(`[agent]` 配置→jinja 变量;请求 kwargs 覆盖之)。
+    /// 只装**非缺省**项 ⇒ 与 HF oracle(无 kwargs)逐字节同源(G0 不变式)
+    defaults: Map<String, Json>,
 }
 
 impl ChatTpl {
-    /// 装载:读快照 `chat_template.jinja`(缺失回退 `tokenizer_config.json`
-    /// 内嵌 `chat_template` 字段,与 HF 解析顺序同源),编译一次。
+    /// 装载(**快照缺省面**;单测/工具便捷入口):读快照 `chat_template.jinja`
+    /// 或回退 `tokenizer_config.json.chat_template`,零 agent 缺省变量。
+    #[cfg(test)]
     pub fn load(model_dir: &Path) -> Result<Self, TplError> {
-        let (src, source) = read_template(model_dir)?;
+        Self::load_with(model_dir, None, Map::new())
+    }
+
+    /// 装载(B2 模板覆盖 + agent 缺省变量)。
+    /// `template_path`:`None` = 快照;相对路径 = 相对 `model_dir`。
+    pub fn load_with(
+        model_dir: &Path,
+        template_path: Option<&str>,
+        defaults: Map<String, Json>,
+    ) -> Result<Self, TplError> {
+        let (src, source) = match template_path {
+            None => read_template(model_dir)?,
+            Some(p) => {
+                let path = if Path::new(p).is_absolute() {
+                    std::path::PathBuf::from(p)
+                } else {
+                    model_dir.join(p)
+                };
+                let s = std::fs::read_to_string(&path)
+                    .map_err(|e| TplError(format!("读模板覆盖 {}: {e}", path.display())))?;
+                (s, format!("{} (agent.template_path)", path.display()))
+            }
+        };
         let mut env = build_env();
         env.add_template_owned(TPL_NAME.to_string(), src)
             .map_err(|e| TplError(format!("chat 模板编译失败({source}): {e}")))?;
-        Ok(Self { env, source })
+        Ok(Self { env, source, defaults })
     }
 
     /// 模板来源(装配日志)
@@ -96,6 +116,10 @@ impl ChatTpl {
         ctx.insert("add_generation_prompt".into(), Json::Bool(args.add_generation_prompt));
         // === 契约:chat_template_kwargs 展平到顶层 ===
         // (不展平 = enable_thinking=false 静默走默认 true;§3.2 注 / §7.1 坑 1)
+        // 序:agent 面缺省在前、请求 kwargs 在后(请求优先)
+        for (k, v) in &self.defaults {
+            ctx.insert(k.clone(), v.clone());
+        }
         if let Some(kw) = args.template_kwargs {
             for (k, v) in kw {
                 ctx.insert(k.clone(), v.clone());
@@ -317,7 +341,7 @@ mod tests {
     fn tpl(src: &str) -> ChatTpl {
         let mut env = build_env();
         env.add_template_owned(TPL_NAME.to_string(), src.to_string()).unwrap();
-        ChatTpl { env, source: "test".into() }
+        ChatTpl { env, source: "test".into(), defaults: Map::new() }
     }
 
     /// 渲染器必须可跨线程共享(HTTP 层多任务持有)
@@ -395,7 +419,7 @@ mod tests {
         let t = tpl("{% if true %}{{ raise_exception('boom') }}{% endif %}");
         let msgs: Vec<Json> = vec![];
         let e = t.render(args(&msgs, None, None)).unwrap_err();
-        assert!(e.msg().contains("boom"), "{e}");
+        assert!(e.to_string().contains("boom"), "{e}");
     }
 
     /// 契约:chat_template_kwargs 展平(不展平 = enable_thinking 静默失效)

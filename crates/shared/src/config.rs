@@ -64,6 +64,14 @@
 //! | cuda | capture_slab_mb | Option<usize> / None(hint 定量) |
 //! | cuda | *(nvrtc_include/native_aot 2026-10-13 退役 —— NVRTC 已删)* | — |
 //! | graph | no_graph | flag / false |
+//! | agent | template_path | Option<String> / None(相对路径 = 相对 model.dir) |
+//! | agent | implicit_session | flag / false(AGT-09:不带 session 键 ⇒ 会话 0) |
+//! | agent | default_max_new / max_new_cap | usize / 4096、8192 |
+//! | agent | parse_tool_calls | flag / true(工具三通道解析) |
+//! | agent | tool_call_format | ToolCallFormat 枚举("xml"\|"json")/ xml |
+//! | agent | auto_disable_thinking_with_tools | flag / false(有工具即关思考) |
+//! | agent | reasoning_effort | Option<String> / None(OpenAI 同名协议值,
+//! |   |   | 模板值域 none/low/medium/high…;None = 不传让模板取默认) |
 //!
 //! 账外键(不入公共面):测试私有旋钮(OWL_GATE_*/OWL_E2E_*/OWL_SWEEP_*/
 //! OWL_WS_MUL/SPLIT_*/MARLIN_*/FI_DEBUG/OWL_27B_STRICT/OWL_HF_PARITY ——
@@ -389,6 +397,63 @@ pub struct GraphCfg {
     pub no_graph: bool,
 }
 
+/// 工具调用输出格式(agent.tool_call_format;**jinja 模板同名变量**)。
+/// xml = `<function=…><parameter=…>` 块;json = `<tool_call>{"name":…}` 单行。
+/// 解析器两格式都认(`toolcall.rs`),**切换时必须与模板同批**。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolCallFormat {
+    /// 模板缺省(厂商推荐)
+    #[default]
+    Xml,
+    /// 单行 JSON(部分实现/工具链更易解析)
+    Json,
+}
+
+/// agent 服务面(2026-10-14 T5;agent-服务面-设计与施工.md §三/§九)。
+/// 这些旋钮此前散落为 `openai.rs` 硬编码常量与 adapter 侧约定 ——
+/// 迁入配置总账后由 `ServerConfig` 显式搬运,账外键拒启。
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentCfg {
+    /// 模板路径覆盖(B2):None = 模型快照 `<model.dir>/chat_template.jinja`;
+    /// 相对路径 = 相对 model.dir。**不动快照**换模板的运维抓手
+    /// (模板漂移调查 / 模板 A/B 的载体)
+    pub template_path: Option<String>,
+    /// 隐式默认会话(AGT-09):请求不带 `session` 键时落到会话 0。
+    /// pi 每轮全量重发历史 ⇒ 前缀增量命中;false = 每请求临时会话
+    /// (旧行为,每次全量重算 + GDN 格轮转)
+    pub implicit_session: bool,
+    /// 未带 `max_tokens` 时的生成步数
+    pub default_max_new: usize,
+    /// `max_tokens` 夹紧上限(须 ≤ 池容量 − prompt 量级;随池定档放开)
+    pub max_new_cap: usize,
+    /// 工具三通道解析(关 = 工具文本原样进 `content` —— 诊断臂)
+    pub parse_tool_calls: bool,
+    /// 工具格式(**必须与模板同值**:模板按它选分支,解析器按它选状态机)
+    pub tool_call_format: ToolCallFormat,
+    /// 有工具即关思考(模板同名变量;产品选择待真机 A/B)
+    pub auto_disable_thinking_with_tools: bool,
+    /// 思考档位缺省(OpenAI 同名协议值:模板值域 none/low/medium/high/xhigh…;
+    /// 请求带 `reasoning_effort` 时以请求为准)。None = 不传 ⇒ 模板取自己的缺省
+    pub reasoning_effort: Option<String>,
+}
+
+impl Default for AgentCfg {
+    fn default() -> Self {
+        Self {
+            template_path: None,
+            implicit_session: false,
+            default_max_new: 4096,
+            max_new_cap: 8192,
+            parse_tool_calls: true,
+            tool_call_format: ToolCallFormat::Xml,
+            auto_disable_thinking_with_tools: false,
+            reasoning_effort: None,
+        }
+    }
+}
+
 /// 本地服务面(并发/排队;owl 定位 = 本地单机,不做对外高并发)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -424,6 +489,7 @@ pub struct OwlConfig {
     pub cuda: CudaCfg,
     pub graph: GraphCfg,
     pub server: ServerCfg,
+    pub agent: AgentCfg,
     pub log: LogCfg,
 }
 
@@ -626,14 +692,23 @@ allowed_ops = [
         "owl_gemv_dual_f16", "owl_naive_attn_nc_bf16_v2",
         "owl_narrow_strided_f16", "owl_norm_rope_bf16",
         "owl_norm_rope_f16", "owl_qknorm_rope_kv_insert_f16_fp8kv_knhd",
+        "owl_qknorm_rope_kv_insert_f16_knhd",
         "owl_reshape_and_cache_fp8kv_knhd", "owl_rmsnorm_bf16",
         "owl_rmsnorm_f16", "owl_sigmoid_f16",
         "owl_sigmoid_gate_mul_f16", "owl_silu_and_mul_bf16",
         "owl_silu_and_mul_f16", "owl_topk16_merge_f16",
         "owl_topk16_split_f16",
         "owl_xqa_decode", "owl_xqa_verify",
-        "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256", "vllm_reshape_and_cache_bf16",
+        "vllm_chunked_prefill_paged_attn_opt_f16_knhd_hd256",
+        "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256",
+        "vllm_paged_attention_v2_f16_knhd_hd256bs32",
+        "vllm_paged_attention_v2_fp8_knhd_hd256bs32",
+        "vllm_paged_attention_v2_reduce_f16_hd256",
+        "vllm_reshape_and_cache_bf16", "vllm_reshape_and_cache_f16_knhd",
 ]
+# 白名单同时含 **fp8 与 f16 两主池族**(2026-10-14 A5 补):`kv_fp8` 决定
+# 实际发射哪一族 —— f16 档不用再拿 `allowed_ops = []` 绕硬门。两族在池
+# 写集审计里按 (池名, dtype) 分组,各自闭环(R3 不撞)。
 # XQA verify 臂(2026-10-13 D3 **转正**):恒等门 3/3 稳定绿(spec ≡ 无 spec
 # 逐 token;fp8 池 + 27B + DFlash2),verify 纯时 65.2→31.2ms、8192 spec
 # decode 27.7→47.0 t/s(+70%,且首次反超同池裸档 36.4)。形状不匹配时层侧
@@ -751,6 +826,30 @@ mod tests {
         assert!(c.dispatch.qkv_fuse && c.dispatch.gdn_fused_decode);
         assert!(!c.cuda.graph_flags.upload);
         assert!(!c.graph.no_graph);
+    }
+
+    #[test]
+    fn agent_面缺省与账外键() {
+        let c = OwlConfig::default();
+        assert!(c.agent.template_path.is_none());
+        assert!(!c.agent.implicit_session, "隐式会话默认关(旧行为不变)");
+        assert_eq!(c.agent.default_max_new, 4096);
+        assert_eq!(c.agent.max_new_cap, 8192);
+        assert!(c.agent.parse_tool_calls);
+        assert_eq!(c.agent.tool_call_format, ToolCallFormat::Xml);
+        assert!(!c.agent.auto_disable_thinking_with_tools);
+        assert!(c.agent.reasoning_effort.is_none());
+        // 账外键 / 非法枚举 = 拒启(deny_unknown_fields + 严格枚举)
+        assert!(OwlConfig::from_toml_str("[agent]\ntemplate_pathz = \"x\"").is_err());
+        assert!(OwlConfig::from_toml_str("[agent]\ntool_call_format = \"yaml\"").is_err());
+        let c = OwlConfig::from_toml_str(
+            "[agent]\nimplicit_session = true\ntool_call_format = \"json\"\nmax_new_cap = 32768\nreasoning_effort = \"high\"\n",
+        )
+        .expect("合法 agent 键应通过");
+        assert!(c.agent.implicit_session);
+        assert_eq!(c.agent.tool_call_format, ToolCallFormat::Json);
+        assert_eq!(c.agent.max_new_cap, 32768);
+        assert_eq!(c.agent.reasoning_effort.as_deref(), Some("high"));
     }
 
     #[test]

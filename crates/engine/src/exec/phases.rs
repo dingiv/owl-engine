@@ -118,7 +118,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // instruct 模型上嚌进复读吸引子(2026-10-01 27B 实测);cost =
         // 每步 logits dtoh(~1MB);device 采样核留 E4 靶面。
         let t_dtoh = prof.then(std::time::Instant::now);
-        let nt = if self.cfg.knobs.sampler_enabled {
+        // 采样开/关(AGT-06):**请求带采样参数则以请求为准**
+        // (`temperature=0` = 本 turn 贪心);未带 = 引擎 knobs(flavor 语义)。
+        // 旧行为不变(GDN 恒等门类测试不带请求参数)。
+        let eff_sampler = self.active.as_ref().expect("活跃").sampler;
+        let sampler_on = self.active.as_ref().expect("活跃").sampler_on;
+        let nt = if sampler_on {
             let mut logits = self.session.read_output_f32("logits").await?;
             // 诊断:分布形状(绝对尺度 / top1-top2 gap / 候选词面)——
             // 复读病理定位的仪表盘(OWL_DEBUG 门控,前 16 步)
@@ -196,9 +201,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     .collect();
                 eprintln!("[logits-dump] t{turn_id} s{step}: {}", pretty.join(" | "));
             }
-            // RNG seed = turn id ⊕ 步数(同 turn 重放确定性,跨 turn 独立)
-            let mut rng = turn_id.wrapping_mul(0x9E3779B97F4A7C15)
-                ^ step.wrapping_mul(0xBF58476D1CE4E5B9);
+            // RNG seed = turn id ⊕ 步数(同 turn 重放确定性,跨 turn 独立);
+            // 请求给了 `seed` ⇒ 以它为基(AGT-06)
+            let seed_base = self
+                .active
+                .as_ref()
+                .expect("活跃")
+                .seed
+                .unwrap_or_else(|| turn_id.wrapping_mul(0x9E3779B97F4A7C15));
+            let mut rng = seed_base ^ step.wrapping_mul(0xBF58476D1CE4E5B9);
             // 惩罚集 = prompt 尾(64)+ 已生成(反循环;llama.cpp 同语义)
             let history: Vec<u32> = {
                 let act = self.active.as_ref().expect("活跃");
@@ -210,12 +221,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     .collect()
             };
             let t_sample = prof.then(std::time::Instant::now);
-            let nt = crate::sampler::sample(&mut logits, &self.cfg.knobs.sampler, &mut rng, &history);
+            let nt = crate::sampler::sample(&mut logits, &eff_sampler, &mut rng, &history);
             if prof {
                 eprintln!("[step-prof] pos={pos} host-sample={:?} wall3={}", t_sample.unwrap().elapsed(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100000);
             }
             if self.probes.debug {
-                eprintln!("[sample-dump] t{turn_id} s{step}: sampled={nt} hist={} pen={}", history.len(), self.cfg.knobs.sampler.rep_penalty);
+                eprintln!("[sample-dump] t{turn_id} s{step}: sampled={nt} hist={} pen={}", history.len(), eff_sampler.rep_penalty);
             }
             nt
         } else if self.env.diag.host_argmax {
@@ -345,11 +356,53 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if self.tok.is_eos(nt) && !ignore_eos {
             return self.complete(crate::turn::FinishReason::Stop).await;
         }
-        let (delta, budget_done) = {
+        let budget_done = {
             let act = self.active.as_mut().expect("active 已保证");
             act.out.push(nt);
-            (decode_delta(&self.tok, &act.out, &mut act.decoded), act.out.len() >= act.max_new)
+            // `decoded` 由全量重解差分维护(delta 本步统一从 `emitted` 切片取,
+            // 以便 stop 尾缓冲能回吐);返回值丢弃是有意的
+            let _appended = decode_delta(&self.tok, &act.out, &mut act.decoded);
+            act.out.len() >= act.max_new
         };
+        // ── stop 串(AGT-06;OpenAI `stop`)──
+        // ① 命中:输出截断于停止串起点(prompt 里也不能多一个字节),
+        //    本 turn 以 `Stop` 终止;
+        // ② 未命中:**尾缓冲上界** —— 发出的文本不得含任一停止串的真前缀
+        //    (否则半截停止串已流给客户端,命中时收不回来)。
+        // 空 stop 列表 = 零额外开销(`safe_end` 直接返回全长)。
+        let (delta, stop_hit) = {
+            let act = self.active.as_mut().expect("active 已保证");
+            let hit = if act.stop.is_empty() {
+                None
+            } else {
+                act.stop
+                    .iter()
+                    .filter_map(|s| act.decoded.find(s.as_str()).map(|p| (p, s.clone())))
+                    .min_by_key(|(p, _)| *p)
+            };
+            let start = floor_boundary(&act.decoded, act.emitted);
+            let end = match &hit {
+                Some((p, _)) => floor_boundary(&act.decoded, *p).max(start),
+                None => safe_end(&act.decoded, &act.stop).max(start),
+            };
+            let out = act.decoded[start..end].to_string();
+            act.emitted = end;
+            if let Some((p, _)) = &hit {
+                // 终了文本也要截断(Completed.text 不含停止串)
+                act.trim_text_to = Some(*p);
+            }
+            (out, hit)
+        };
+        if let Some((_, s)) = stop_hit {
+            // 事件序 = Token(若有回吐) → Completed(Stop);与预算尽同构
+            owl_shared::log_debug!("engine", "turn {turn_id} 命中 stop 串 {:?},输出截断", s);
+            let done_ev = self.complete(crate::turn::FinishReason::Stop).await?;
+            if delta.is_empty() {
+                return Ok(done_ev);
+            }
+            self.pending_events.push_back(done_ev);
+            return Ok(TurnEvent::Token { turn: turn_id, delta });
+        }
         if budget_done {
             // 末 token 也要作为 Token 事件发出 —— 否则 (a) usage.completion
             // 少 1(服务端按 Token 事件计数),(b) 流式丢末段文本(2026-10-13
