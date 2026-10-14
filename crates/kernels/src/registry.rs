@@ -33,18 +33,19 @@ pub trait KernelFamily: Send {
 
     /// **本族算子**(注册语义;设计 §2.2):返回本族的准入声明表。
     ///
-    /// 缺省空表 = 本族尚无已建表算子(未建表的族继续用 `names()` 手列)。
-    /// 实现里一行 `Self::OPS`(常量表 = 域表的子集,**同一份 KernelMeta**)。
-    fn ops(&self) -> &'static [&'static crate::spec::KernelMeta] {
-        &[]
+    /// **派生**(2026-10-15 声明驱动):缺省 = `ops::of_family(self.id())` ——
+    /// 单一真源 = 每个算子的 [`KernelSpec::FAMILY`](crate::spec::KernelSpec::FAMILY);
+    /// 族侧**不再手写** `const OPS`(旧形态在 6 个族里各抄一份,与声明面
+    /// 可能漂移)。
+    fn ops(&self) -> Vec<&'static crate::spec::KernelMeta> {
+        crate::ops::of_family(self.id()).collect()
     }
 
     /// 本族声明的名字 = **族 id(主名)∪ 已建表算子名**。
     ///
     /// 这样每族都不必手列名字(消灭"名字两处写"这个漂移源):
-    /// - 全量建表的族(marlin/cublas/xqa)→ 全部由 `ops()` 派生;
-    /// - 部分建表的族(FI:fp8 已建、f16 未建)→ 主名(id)+ 已建表项;
-    /// - 尚未建表的族(gdn_scalar)→ 只剩主名。
+    /// - 全量建表的族(marlin/cublas/xqa/gdn_*)→ 全部由 `ops()` 派生;
+    /// - 部分建表的族(主名不是任何算子 ENTRY 的族)→ 主名(id)+ 已建表项。
     ///
     /// ⚠️ 不写成"`ops()` 非空则纯派生":那样**部分建表**的族会丢掉主名
     /// (2026-10-13 实测:FI 的 f16 臂主名 + gdn_scalar 会静默从路由表消失)。
@@ -131,7 +132,7 @@ impl<F: KernelFamily + 'static> KernelFamily for FamilyGuard<F> {
     fn id(&self) -> OpId {
         self.id
     }
-    fn ops(&self) -> &'static [&'static crate::spec::KernelMeta] {
+    fn ops(&self) -> Vec<&'static crate::spec::KernelMeta> {
         self.family().ops()
     }
     fn names(&self) -> Vec<&'static str> {
@@ -186,6 +187,9 @@ pub struct OpRegistry {
     families: Vec<Box<dyn KernelFamily>>,
     /// 名字速查(boot 期自 families 收口;knows()/execute 同源)
     names: HashSet<&'static str>,
+    /// **名字 → 族下标**(boot 期一次建;`execute` 从"线性扫族×名"变 O(1),
+    /// 2026-10-15 声明驱动路由)
+    route: std::collections::HashMap<&'static str, usize>,
     /// **名字 → 准入声明**(boot 期自 [`crate::ops::METAS`] 建一次;
     /// 发射期 check 走它 —— O(1),热路径零扫描)。
     ///
@@ -269,6 +273,7 @@ impl OpRegistry {
         allowed: Option<&[&str]>,
     ) -> Result<Self, OpError> {
         let mut names = HashSet::new();
+        let mut route: std::collections::HashMap<&'static str, usize> = std::collections::HashMap::new();
         let mut families: Vec<Box<dyn KernelFamily>> = Vec::with_capacity(factories.len());
         for factory in factories {
             // 装配失败路径也要收尾已建成的族(§4.4 同律:错误路径不留
@@ -305,6 +310,7 @@ impl OpRegistry {
                     return Err(e);
                 }
             }
+            let idx = families.len();
             for n in f.names() {
                 if !names.insert(n) {
                     let e = OpError::Contract {
@@ -316,12 +322,60 @@ impl OpRegistry {
                     close_all(families);
                     return Err(e);
                 }
+                // 名字 → 族下标(boot 一次;`execute` O(1);旧实现每次发射
+                // 线性扫 `families × names`)
+                route.insert(n, idx);
             }
             families.push(f);
         }
         // 准入索引(纯元数据,与发射路由无关)
         let metas: std::collections::HashMap<_, _> =
             crate::ops::all().map(|m| (m.entry, m)).collect();
+
+        // ── 声明驱动路由的自洽门(2026-10-15)───────────────────────────
+        // A) **声明的家族必须真实存在**:非 Native 的算子,其 `FAMILY` 必须在
+        //    已装配的族 id 里 —— 否则那份元数据永远发不出去(路由收不到它),
+        //    是纯粹的摆设。这是"声明驱动"的正面判据(旧设计靠 ops⊆names 事后校)。
+        let ids: HashSet<&'static str> = families.iter().map(|f| f.id().0).collect();
+        let orphan: Vec<&str> = crate::ops::all()
+            .filter(|m| m.is_family() && !ids.contains(m.family.0))
+            .map(|m| m.entry)
+            .collect();
+        if !orphan.is_empty() {
+            close_all(families);
+            return Err(OpError::Contract {
+                op: "registry".into(),
+                field: "KernelSpec::FAMILY",
+                expect: "非 Native 的算子,其家族必须已装配".into(),
+                got: format!("孤儿声明(家族不存在):{orphan:?}"),
+            });
+        }
+        // B) **路由表里的名字若已建表,其 FAMILY 必须指向本族**:反向判据
+        //    (拦住"名字挂在甲族、声明却写乙族"——那会让元数据与执行者分家)。
+        for f in families.iter() {
+            let id = f.id();
+            for n in f.names() {
+                if let Some(m) = metas.get(n) {
+                    if m.family != id {
+                        let e = OpError::Contract {
+                            op: n.to_string(),
+                            field: "KernelSpec::FAMILY",
+                            expect: format!("{} (本族 id)", id.0),
+                            got: format!("{}(声明与路由分家)", m.family.0),
+                        };
+                        close_all(families);
+                        return Err(e);
+                    }
+                }
+            }
+            // C) 空 ops() = 只能靠主名路由(未建表);不报错但必须可见
+            if f.ops().is_empty() {
+                eprintln!(
+                    "[kernels] 族 {} 无已建表算子(只能靠主名路由;声明面零约束)",
+                    id.0
+                );
+            }
+        }
         // F 轮(2026-10-13):登记表退役 ⇒ 唯一真源 = 声明面。boot 报告改为
         // 三件事:**声明表张数 / 家族臂数 / 编出但未声明的符号数**(后者是
         // 新的 R1 判据:构建期符号集 ⊆ 声明集)。
@@ -357,7 +411,7 @@ impl OpRegistry {
             eprintln!("[kernels] 生产白名单:{} 项生效(池写集审计通过)", a.len());
         }
 
-        Ok(Self { families, names, metas })
+        Ok(Self { families, names, route, metas })
     }
 
     /// **准入声明查询**(发射期 check 的唯一入口;未建表 = `None` = 仅引入)。
@@ -384,6 +438,7 @@ impl OpRegistry {
             }
         }
         self.names.clear();
+        self.route.clear();
         match first {
             Some(e) => Err(e),
             None => Ok(()),
@@ -391,9 +446,9 @@ impl OpRegistry {
     }
 
     /// 名字路由判定(foreign/native 双路唯一真源;boot 表自洽)。
-    /// 线格式名 ∈ 注册表 = foreign 家族臂,否则走 native nvrtc 路径。
+    /// 线格式名 ∈ 注册表 = foreign 家族臂,否则走 native 路径。
     pub fn knows(&self, name: &str) -> bool {
-        self.names.contains(name)
+        self.route.contains_key(name)
     }
 
     /// server 唯一算子入口:名字 → 家族 runtime 的分派在注册表内部。
@@ -403,17 +458,15 @@ impl OpRegistry {
         res: &mut dyn crate::device::DeviceRes,
         exec: &mut crate::device::Exec,
     ) -> Result<Bytes, OpError> {
-        let f = self
-            .families
-            .iter_mut()
-            .find(|f| f.names().iter().any(|n| *n == msg.kernel.name))
-            .ok_or_else(|| OpError::Contract {
+        let idx = *self.route.get(msg.kernel.name.as_str()).ok_or_else(|| {
+            OpError::Contract {
                 op: msg.kernel.name.clone(),
                 field: "name",
                 expect: "已注册家族".into(),
                 got: format!("{}(未注册)", msg.kernel.name),
-            })?;
-        f.run(msg, res, exec)
+            }
+        })?;
+        self.families[idx].run(msg, res, exec)
     }
 }
 
@@ -457,8 +510,8 @@ mod tests {
             fn id(&self) -> OpId {
                 OpId("fake_family")
             }
-            fn ops(&self) -> &'static [&'static crate::spec::KernelMeta] {
-                self.0
+            fn ops(&self) -> Vec<&'static crate::spec::KernelMeta> {
+                self.0.to_vec()
             }
             fn assemble(
                 _res: &mut dyn crate::device::DeviceRes,

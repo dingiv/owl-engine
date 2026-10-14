@@ -25,9 +25,15 @@ pub struct GdnScalarRuntime {
     t_cap: usize,
 }
 
+impl GdnScalarRuntime {
+    /// **本族身份**(族名 = 线契约名;字面量住 `family::gdn_scalar`,零门)
+    /// —— 声明面 `ops::gdn_scalar::*::FAMILY` 与本处引用**同一字面量**。
+    pub const ID: OpId = OpId(crate::family::gdn_scalar::GDN_SCALAR_FWD);
+}
+
 impl KernelFamily for GdnScalarRuntime {
     fn id(&self) -> OpId {
-        OP
+        Self::ID
     }
 
 

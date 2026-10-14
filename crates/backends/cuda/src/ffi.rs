@@ -8,8 +8,24 @@ pub use cudarc::driver::{
     PushKernelArg,
 };
 
-/// result 同步原语(逐项;当前仅 D2H 回读)
-pub use cudarc::driver::result::{memcpy_dtoh_sync, memcpy_htod_sync};
+/// **NULL 流同步原语**(raw driver `cuMemcpy*_v2` 语义:与任何非默认流**无序**)
+///
+/// ⚠️ **A13 定谳(2026-10-15)**:`result::memcpy_*_sync` 是 **NULL 流同步拷贝** ——
+/// 用它写一个由 `stream.alloc`(流序 `cudaMallocAsync`)刚给的地址,两者**零序**
+/// ⇒ 写会落进尚未落定的内存并被**静默丢弃**(compute-sanitizer 判据:
+/// `Use-before-alloc @ cuMemcpyHtoD ← cuMemAllocAsync`)。本仓**三次**踩中
+/// (2026-10-09 “meta 表读回全零”/ `xqa.rs` / `gdn_chunked.rs:453`),每次都靠
+/// 本地补 sync 绕过 —— 直到 A13 才追到写侧。
+///
+/// **纪律(只允许 `GpuRes` 用)**:
+///   ① 目标是流序分配/要参与后续核 ⇒ 改用同流 `memcpy_htod_async(..., COMPUTE)`
+///      (首选,零代价,分配→拷贝→核 同流严格有序);
+///   ② 回读/自检类同步 D2H ⇒ **拷贝前先排空目标流**(`GpuRes::download` 已内建)。
+///
+/// 故此处**降级 `pub(crate)`**:不对 crate 外开放这条 NULL 流后门;
+/// 外部要回读走 `DeviceRes::download`(自带排空),要上传走 `DeviceRes::upload`。
+/// 机器判据:`crates/backends/cuda/tests/raw_sync_primitives_gate.rs`。
+pub(crate) use cudarc::driver::result::{memcpy_dtoh_sync, memcpy_htod_sync};
 
 /// result 图原语(M1 图治理 + 哨兵③;只返回句柄,自身零分配——
 /// 准入铁律通过,证据:cudarc 0.19.9 result.rs:788/801/1494/1514/1522/1531)

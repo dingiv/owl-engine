@@ -11,7 +11,9 @@ use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec,
 pub struct CublasGemmF16;
 
 impl KernelSpec for CublasGemmF16 {
-    const ENTRY: &'static str = crate::contract::names::GEMM_F16;
+    /// 执行家族(声明驱动路由;见 `KernelSpec::FAMILY`)
+    const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::cublas::GEMM_F16);
+    const ENTRY: &'static str = crate::family::cublas::GEMM_F16;
     /// foreign(FFI):无 `.cu` 源
     const SRC: &'static str = "";
     const PARAMS: &'static [Param] = &[
@@ -35,7 +37,9 @@ impl KernelSpec for CublasGemmF16 {
 pub struct CublasGemmBf16;
 
 impl KernelSpec for CublasGemmBf16 {
-    const ENTRY: &'static str = crate::contract::names::GEMM_BF16;
+    /// 执行家族(声明驱动路由;见 `KernelSpec::FAMILY`)
+    const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::cublas::GEMM_F16);
+    const ENTRY: &'static str = crate::family::cublas::GEMM_BF16;
     const SRC: &'static str = "";
     const PARAMS: &'static [Param] = &[
         Param::t_in("a", Dtype::BF16, 2),

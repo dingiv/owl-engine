@@ -10,7 +10,9 @@ use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec,
 pub struct GdnScalarDeltaRuleFwd;
 
 impl KernelSpec for GdnScalarDeltaRuleFwd {
-    const ENTRY: &'static str = crate::client::gdn_scalar::GDN_SCALAR;
+    /// 执行家族(声明驱动路由;见 `KernelSpec::FAMILY`)
+    const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::gdn_scalar::GDN_SCALAR_FWD);
+    const ENTRY: &'static str = crate::family::gdn_scalar::GDN_SCALAR_FWD;
     /// foreign(AOT cubin + cast 编排):无单一 `.cu` 源
     const SRC: &'static str = "";
     const PARAMS: &'static [Param] = &[

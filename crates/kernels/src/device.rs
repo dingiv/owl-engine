@@ -95,7 +95,16 @@ pub trait DeviceRes {
     fn capturing(&self) -> Result<bool, OpError>;
     /// A1.6 登记钩子(捕获窗内的发射原材料;server 组装 CaptureRecord)
     fn record_capture(&mut self, note: LaunchNote) -> Result<(), OpError>;
-    /// host 字节上传到设备指针(meta 表/小常量;同步语义,回执即落地)
+    /// host 字节上传到设备指针(meta 表/小常量)。
+    ///
+    /// **序语义(2026-10-15 A13 更正)**:实现侧一律**与目标块所在流同序**
+    /// (分配 → 上传 → 后续核 在该流上严格有序);**回执 ≠ host 侧落地**。
+    /// 旧文档写「同步语义,回执即落地」—— 那句是错的,且**正是 A13 的病根**:
+    /// 实现曾用 NULL 流同步拷贝写一个由 `stream.alloc`(流序异步分配)刚给的
+    /// 地址,两者零序 ⇒ 写落进尚未落定的内存被**静默丢弃**
+    /// (compute-sanitizer 判据:`Use-before-alloc @ cuMemcpyHtoD ← cuMemAllocAsync`)。
+    /// 调用方不得依赖「upload 返回后 host 就能读到」;要读请走
+    /// [`download`](Self::download)(它自带回读前排空)。
     fn upload(&mut self, dst: DevPtr, src: &[u8]) -> Result<(), OpError>;
     /// 设备序号(FFI 面 dev 注入;marlin/cublas 等直调家族用)
     fn device_ordinal(&self) -> Result<i32, OpError>;
@@ -119,7 +128,28 @@ pub trait DeviceRes {
     /// 为什么单列一个方法:自检(oracle)必须能把算子输出**读回 host 与独立
     /// 参考逐字节比对** —— 这是"静默错值"类唯一能机器判定的手段。
     /// 与 `upload` 对称:裸指针 + 字节口径,元素语义归调用方。
+    ///
+    /// **序语义(2026-10-15 A13 更正)**:实现侧在回读前**排空生产流**,否则
+    /// NULL 流同步 D2H 与 COMPUTE 流无序 ⇒ 读到半写入/旧值/全零
+    /// (本仓 2026-10-09 / `xqa.rs` / `gdn_chunked.rs:453` 三次本地绕行的病根)。
     fn download(&mut self, src: DevPtr, dst: &mut [u8]) -> Result<(), OpError>;
+
+    /// **家族面设备动作入账钩子**(2026-10-15 A13 补漏)。
+    ///
+    /// 为什么需要它:家族 runtime 直连设备(scratch 分配 / 上传 / 回读 /
+    /// 核发射 / FFI 直发)**不产生 `Command`**,而发射账(perf-framework
+    /// §十三)只在命令派发处记一条 ⇒ **家族面在账上完全隐身** —— A13 就是
+    /// 这样藏了一整轮,最后靠 compute-sanitizer 才挖出来。
+    ///
+    /// 用法(有界词表):`fam_alloc` / `fam_upload` / `fam_upload_block` /
+    /// `fam_download` / `fam_launch` / `fam_ffi_launch`。
+    ///
+    /// **纪律**:
+    /// 1. 这是**通知**(best-effort),不是可失败操作 —— 记账失败绝不拖垮执行,
+    ///    故返回 `()` 且缺省空实现(关账时零成本);
+    /// 2. `ptrs` = 设备地址(生命周期判据的钥匙),没有就给空切片;`name`
+    ///    允许空串;**不得在其中做分配/同步/阻塞**。
+    fn note_device(&mut self, _kind: &'static str, _name: &str, _bytes: usize, _ptrs: &[u64]) {}
 }
 
 
@@ -329,6 +359,20 @@ impl Exec {
     ) -> Result<(), OpError> {
         if res.capturing()? {
             res.record_capture(LaunchNote { op: op.0.to_string(), kernel, grid, block, shared_mem })?;
+        }
+        // **家族面入账**(2026-10-15 A13 补漏):本函数是 gdn_chunked /
+        // gdn_scalar / xqa / flashinfer 四族核发射的唯一出口 —— 在此一次性
+        // 覆盖全员(值表里的 Ptr 参数顺带落账 = 设备地址判据)。
+        // 关账时是一次空实现调用(零成本);直连 FFI 的族(marlin/cublas/FI run)
+        // 自行调 `res.note_device("fam_ffi_launch", ..)`。
+        {
+            let mut ptrs: Vec<u64> = Vec::with_capacity(vals.len());
+            for v in vals {
+                if let LaunchVal::Ptr(p) = v {
+                    ptrs.push(*p);
+                }
+            }
+            res.note_device("fam_launch", kernel, 0, &ptrs);
         }
         let stream = res.stream()?;
         launch_vals(&stream, f, grid, block, shared_mem, vals)

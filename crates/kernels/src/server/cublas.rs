@@ -16,20 +16,18 @@ pub struct CublasRuntime {
 }
 
 impl CublasRuntime {
-    /// 本族算子表(两名全建表 ⇒ `names()` 由本表派生)
-    const OPS: &'static [&'static crate::spec::KernelMeta] =
-        &[&crate::ops::cublas::GEMM_F16, &crate::ops::cublas::GEMM_BF16];
+    /// **本族身份**(族名 = 线契约名;字面量住 `family::<族>`,零门)
+    /// —— 声明面 `ops/<域>::FAMILY` 与执行面 `id()` 引用**同一字面量**。
+    pub const ID: OpId = OpId(crate::family::cublas::GEMM_F16);
+    // 本族算子表:由 `KernelSpec::FAMILY` 派生(`KernelFamily::ops()` 缺省实现)
 }
 
 
 impl KernelFamily for CublasRuntime {
     fn id(&self) -> OpId {
-        OpId(GEMM_F16)
+        Self::ID
     }
 
-    fn ops(&self) -> &'static [&'static crate::spec::KernelMeta] {
-        Self::OPS
-    }
 
 
     /// 构造函数:OwlCublas 句柄预钉(ensure_blas 律:构造期急切,
@@ -63,6 +61,9 @@ impl KernelFamily for CublasRuntime {
             op: GEMM_F16.into(),
             detail: "cublas 句柄未装配".into(),
         })?;
+        // 家族面入账(A13 补漏):cuBLAS = **直连 FFI 发射**(不经 `Exec::launch`),
+        // 账上本无痕;ptrs = A/B/out 三块地址。
+        res.note_device("fam_ffi_launch", &msg.kernel.name, 0, &[a, b, out]);
         let gemm = if bf16 {
             blas.gemm_bf16(a, b, out, call.m, call.k, call.n, call.nt)
         } else {

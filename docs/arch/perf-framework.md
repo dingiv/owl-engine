@@ -592,3 +592,414 @@ waited_ms / credits / released / waiting`。
 | 日期 | 版本 | 内容 |
 |---|---|---|
 | 2026-10-14 | v1.0 | 立项当日落地:`owl_shared::stepgate`(宏 + feature 门 + 两模式 + tx/rx 唤醒)+ 三处检查点(interp.node / engine.prefill / engine.decode)+ 配置/CLI/HTTP 三面控制 + metrics 四键 + 6 单测(含"翻旧账"回归)+ 真机两档验收 |
+
+## 十三、GPU server 发射账(trace ring;2026-10-14 立项当日落地)
+
+### 13.1 定位
+
+前十二节里,CUPTI 答"**设备侧**时间花在哪",`[call]` 解释器账答"**解释器**发了什么";
+本节答第三问:**server 侧的事实发射序** —— 它是全部设备动作的唯一咽喉
+(`launch` / `htod` / `dtoh` / `alloc` / `memset` / `free` / `copy` / `graph`),
+而 `[call]` 账**看不到**搬运/回收/图。
+
+### 13.2 形态
+
+`crates/backends/cuda/src/trace.rs`:定容环形账(`VecDeque` + 单调 `seq`),
+在 `GpuServer::dispatch_inner` **派发之前**记一条;`htod` 额外在**落定**时补记一条
+`htod_landed`(带块 id + **设备地址** —— 地址复用是"跨流 UAF"类缺陷的唯一钥匙)。
+
+每条账目:`seq / host_ns / cmd / stream(compute|h2d|d2h) / name / grid / block /
+smem / bytes / ids / ptrs / out_id`(输出块 id —— 契约:最后一个 Block 实参 = 输出)。
+
+### 13.3 开关与查询
+
+```bash
+# 开关(配置面;0 = 关 = 逐命令零开销)
+[cuda]
+trace_ring = 65536        # 建议 4096~65536(27B 一次 prefill+decode ≈ 3.6 万条)
+
+# 查询(app 侧直读发布出来的账;不占 DeviceClient 契约)
+curl /debug/launches                      # 最近 200 条(缺省)
+curl /debug/launches/5000                 # 最近 5000 条(按发射序,旧→新)
+curl /debug/launches/50/htod_landed       # 只看上传落定(带地址)
+curl /debug/launches/50/h2d               # 按流过滤(compute|h2d|d2h)
+curl /debug/launches/50/marlin            # 按核名子串过滤
+```
+
+### 13.4 首战(27B/spec-dflash/一次请求,`trace_ring=65536`)
+
+* 一次请求 **36481 条**命令,涉及 **10977 个地址**;
+* **三流密交织**:decode 每步固定形状 = `htod_chunks(37624B) → graph_launch →
+  dtoh(32B) → htod_chunks(4B) → graph_launch → copy_batch(159MB) → htod_chunks(232B)
+  → graph_launch → dtoh(7196B)` —— 一屏就能看出"哪些动作之间没有序";
+* **地址复用密集**:同一地址在同一请求内落定最多 **15 次**;
+* **输入侧潜在冲突 276 起**(某核读 P 之后 `htod_landed` 覆写 P,中间**无 sync**);
+  落定尺寸高度集中:**272B ×215 / 32B ×49 / 4B ×12**;
+* **272B 那条是"每轮一次"**:间隔恒定 ≈270 条命令 / 4.6ms(一个 decode 轮),
+  上下文恒为 `… → htod(272B) → htod_landed → graph_launch → …`。
+
+⇒ **机制候选(待正面验证)**:spec 轮的**图输入槽**由 H2D 上传,紧随其后的
+`graph_launch` 在 COMPUTE 上读同一地址,**两条流之间没有栅栏** ⇒ 回放可能读到
+半写入槽。与仓内 2026-10-03 "FI 表渐进腐败案"(同型;那次靠"预物化"修了 FI 表,
+**图输入槽没修**)以及 `[cuda] launch_sync=true` 能治好 A13 病臂(恒等 H2D/D2H)
+的现象**一致**。验证路径:给该上传→回放之间加一道**定向事件栅栏**,看 A13 病臂是否
+在 `gdn_chunked` 开着的情况下转健康。
+
+### 13.5 纪律
+
+1. **账是"发射序",不是"执行序"**:同流内发射序 = 执行序(CUDA 保证),跨流之间
+   **无序** —— 账里两条相邻条目完全可能并发执行(这正是要看的东西);
+2. `host_ns` = host 单调时钟(相对建账),不是 GPU 时间;设备时间轴用 CUPTI(§十一);
+3. 记账不许拖垮执行:容量 0 直接返回,锁中毒就地恢复;
+4. `htod_chunks`(分块写入路径)目前只记**发射**,未记落定 —— 图输入槽走的正是它,
+   需要时补(见 §13.4 的候选机制)。
+
+### 13.6 变更记录
+
+| 日期 | 版本 | 内容 |
+|---|---|---|
+| 2026-10-14 | v1.0 | `cuda::trace` 环形账(命令级 + htod 落定)+ `[cuda] trace_ring` + `GET /debug/launches[/<n>[/<kind>]]` + 3 单测;首战产出"图输入槽无栅栏"机制候选(§13.4) |
+
+---
+
+## 十四、A13 结案:NULL 流同步拷贝 × 流序异步分配(2026-10-15)
+
+> **一句话**:`DeviceRes::upload`(家族 runtime scratch 上传)用 **NULL 流同步
+> `cuMemcpyHtoD`** 写一个由 **`stream.alloc`(流序 `cudaMallocAsync`)** 刚分配的
+> 地址 —— 两者之间**没有任何序**,写会落进**尚未落定**的内存并被静默丢弃。
+> chunked GDN 的 **meta 表(cu/coff/idx)** 走的正是这条路 ⇒ 分块索引/偏移读成
+> 上一次占用者的残值 ⇒ prefill 末行 hidden 被确定性算错 ⇒ pi 场景"不发工具"。
+
+### 14.1 病灶(compute-sanitizer 定谳)
+
+```
+========= Use-before-alloc on allocation of size 1,024 bytes at 0x31a6000600
+=========     Address 0x31a6000600 is potentially accessed before it is allocated
+=========   访问点: cuMemcpyHtoD_v2 → GpuRes as DeviceRes::upload_block → marlin oracle
+=========   分配点: cuMemAllocAsync → CudarcStream::alloc → GpuRes as DeviceRes::alloc_block
+```
+
+生产面(`crates/kernels/src/server/gdn_chunked.rs:422`):
+
+```rust
+let nb = res.alloc(host.len() * 8, "gdn.meta")?;   // 流序异步分配(COMPUTE)
+res.upload(nb.ptr, &bytes)?;                        // NULL 流同步拷贝 ⇒ 无序
+```
+
+### 14.2 定谳实验(同 boot / 同 prompt / 只切一位)
+
+新增 `[cuda] sync_mask`(同步点分解掩码,见 [`sync_bit`])后逐点 A/B
+(27B AWQ,chunked GDN 臂,ptok=1403,判据 = `[pf-probe]` 末行 logits):
+
+| mask | 同步点 | 末行 logits | 行为 |
+|---|---|---|---|
+| 0 | 无(旧缺省) | `28` / gap 0.914 | ❌ 塌陷 |
+| 1 | HTOD(H2D DMA 后 sync) | `28` / 0.914 | ❌ 逐位无变化 |
+| 4 | FENCE(回收栅栏旧语义) | `28` / 0.914 | ❌ 无变化 |
+| 16 | GRAPH(回放后 sync) | `28` / 0.914 | ❌ 无变化 |
+| 2 | DTOH(整流 `COMPUTE.sync`) | `198` / 0.453 | ⚠️ 第三种错值(半程定序) |
+| 8 | LAUNCH(逐发射 sync) | `760` / 2.5625 | ⚠️ argmax 对但残差 |
+| 32 | ALLOC(alloc 后 sync) | `760` / 2.5625 | ⚠️ 同上 |
+| 63 | 全部(`launch_sync`) | `760` / 2.5625 | ⚠️ 同上 |
+| **64** | **scratch 上传前排空 COMPUTE** | **`760` / 4.328** | ✅ 与 varlen 臂一致 |
+| 128 | 上传退回 NULL 流同步(复现位) | `28` / 0.914 | ❌ **A13 逐字节复现** |
+
+**读法**:① 拷贝流(HTOD/FENCE)与本病历**无关** ⇒ "跨流 UAF"假设彻底出局;
+② 位 8/32 这两个互不相干的点各自"治好",说明治愈机制是**把 host 摁住让异步
+分配落定**(同族位 2 只摁住 71 次 dtoh ⇒ 得到第三种错值,失败是分级的);
+③ 位 8/32/63 的 gap 2.5625 ≠ 真值 4.328 ⇒ **旧"解药" `launch_sync` 其实是
+治了一半**(argmax 碰对),单看 argmax 会把运气当因果。
+
+### 14.3 发射账侧证据(为什么先前抓不到)
+
+- 病灶路径**不是 `Command`**(家族 runtime 直连 `DeviceRes`),所以发射账/htod
+  栅栏全看不见它;只表现为"块 id 计数比命令数多 14"这类旁证;
+- 两份 trace(mask=0 vs 8)对拍:窗口内**命令序列逐项同构**(cmd/核名/几何/字节
+  全同),唯一差异是**设备地址**(窗口地址集合交集仅 508/4779)⇒ 当时的
+  "布局敏感"观感成立,但**不是布局在起作用,而是布局决定了那笔写落在
+  "已映射"还是"未落定"的内存上**;
+- 同一 mask 不同的两次 boot 布局也只 50% 重合而**值逐字节相同** ⇒ "布局是原因"
+  当场被证伪,才转向直接仪器(memcheck)。
+
+### 14.4 修法与代价
+
+`DeviceRes::upload` / `upload_block` 改为**与分配同流的 async 拷贝**
+(`memcpy_htod_async(…, COMPUTE)`:分配 → 拷贝 → 后续核 三者同流严格有序;
+捕获分支本来就是这么写的);`download`(NULL 流同步 D2H)补**回读前排空
+COMPUTE**(仓内 2026-10-09 / xqa.rs:69 / gdn_chunked.rs:453 **三次本地绕行**
+的病根即此)。`SCRATCH_UP_LEGACY`(bit 7)保留旧行为以便复现。
+
+| 口径 | 旧(病) | 新 |
+|---|---|---|
+| TTFT @ptok1403 | 1.18s | **1.19s**(零代价) |
+| 末行 logits | 28 / 0.914 | 760 / 4.328 |
+| finish / 工具 | `length`,无 tool_calls | **`tool_calls`,`{"command":"echo owl-agent"}`** |
+| 端点(varlen 参照) | 1.34s / 1.80s | 1.65s(chunked 提速仍在) |
+
+广泛验收:ptok 543/753/1403/1753/2453 各一次 + 1403 重复一次 = **6/6 全绿**,
+重复请求 gap 逐位相同(4.32812)⇒ 确定性恢复。
+
+### 14.5 门与探针(新增/沿用)
+
+| 门/探针 | 用途 |
+|---|---|
+| `[cuda] sync_mask` + `sync_bit::*` | 同步点**逐位**归因(`launch_sync` 是合称,不可再当单变量用) |
+| `sync_bit::SCRATCH_UP_LEGACY` | **A13 复现开关**(仪器验证/回归对照) |
+| `cuda.trace_ring` + `alloc_done`/`free` 地址 | 生命周期判据(本轮补上 alloc 落定 + memset/free 的地址) |
+| step gate(§十二)/ CUPTI(§十一) | host 领先深度与设备时间轴 |
+
+### 14.6 变更记录
+
+| 日期 | 版本 | 内容 |
+|---|---|---|
+| 2026-10-15 | v1.0 | A13 结案:根因 NULL 流同步拷贝 × 流序异步分配;修 upload/upload_block/download;新增 `sync_mask` 分解面与 `SCRATCH_UP_LEGACY` 复现位;发射账补 `alloc_done`/地址 |
+
+---
+
+## 十五、家族面收口(临时补救;2026-10-15,A13 暴露的结构性缺口)
+
+> A13 的病根能藏一整轮,根因不是"没人看",而是**家族面不在任何仪器的视场内**:
+> 家族 runtime 直连 `DeviceRes` 的设备动作**不产生 `Command`**,而发射账(§十三)
+> 只在命令派发处记一条。本轮把"再犯"与"看不见"两件事一起收掉(治理层欠账另记)。
+
+### 15.1 收口审计(改前)
+
+| # | 面 | 谁能到 | 经 `Command`? | 进发射账? | 定序纪律 | 捕获护栏 |
+|---|---|---|---|---|---|---|
+| 1 | 引擎→server | `GpuClient`(唯一客户端) | ✅ | ✅ | ✅ 三流路由 + dtoh 事件栅栏 | ✅ G2 结构拒绝 |
+| 2 | 家族核发射 | `Exec::launch` → `launch_vals` | ❌ | ❌ | ✅ 同 COMPUTE 流 | ⚠️ 查了 `capturing()` 但 `record_capture` 是**空实现** |
+| 3 | 家族直连 FFI | marlin host launcher / cublas / FI plan+run | ❌ | ❌ | ✅ 用 `res.stream()` 的 cu_stream | ❌ 连 `capturing()` 都不查 |
+| 4 | 家族 scratch | `GpuRes::alloc` → `alloc_zeros`(append-only) | ❌ | ❌ | ✅ 同流 | ❌ 靠"族 grave 律"人工约定 |
+| 5 | 家族上传/回读 | `GpuRes::{upload,upload_block,download}` | ❌ | ❌ | ✅ **§十四 刚补** | ❌ |
+
+### 15.2 临时补救三件套(已落)
+
+**① 可观测:`DeviceRes::note_device`**（`crates/kernels/src/device.rs`）
+
+```rust
+/// 家族面设备动作入账钩子 —— 通知(best-effort),缺省空实现(关账零成本)
+fn note_device(&mut self, _kind: &'static str, _name: &str, _bytes: usize, _ptrs: &[u64]) {}
+```
+- `GpuRes` 覆写 → 写进**同一个**发射环(`crate::trace`,§十三),`stream = "family"`;
+- 接线面:`Exec::launch`(覆盖 gdn_chunked / gdn_scalar / xqa / FI 的**全部核发射**,
+  值表里的 `Ptr` 参数顺带落账)+ `GpuRes::{alloc,upload,upload_block,download}`
+  + 三个 **FFI 直发族**各自自报一条(marlin 两臂 / cublas / FI run);
+- 词表(有界):`fam_alloc` / `fam_upload` / `fam_upload_block` / `fam_download` /
+  `fam_launch` / `fam_ffi_launch`。
+- ⚠️ `Exec` 在 `kernels` crate,不能依赖 `owl-cuda` 的 trace 模块 ⇒ 必须走
+  `DeviceRes` 注入面(不能直接调),这是本钩子存在的形式理由。
+
+**② 文档纠错**(孕育 A13 的错误前提)
+
+`DeviceRes::upload` 原文"同步语义,回执即落地"→ 改为"**同流有序;回执 ≠ host 侧落地**",
+并把 memcheck 判据(`Use-before-alloc @ cuMemcpyHtoD ← cuMemAllocAsync`)挂在注释上;
+`download` 补"实现侧在回读前排空生产流"的序语义。
+
+**③ 原语收口 + 机器判据门**
+
+- `crates/backends/cuda/src/ffi.rs`:`memcpy_htod_sync` / `memcpy_dtoh_sync`
+  (raw driver = **NULL 流**)**降级 `pub(crate)`** —— 不对 crate 外开这条后门;
+- 新门 `crates/backends/cuda/tests/raw_sync_primitives_gate.rs`:
+  ① 全仓 `crates/**/*.rs` 扫代码面,白名单外命中 = **红**(注释里提名字允许 —— A13 的病史注释不该被自己的门绊倒);
+  ② `ffi.rs` 的再导出必须 `pub(crate)`;
+  ③ 白名单项必须**真实命中**(防白名单自己腐坏)。
+
+### 15.3 验收
+
+| 判据 | 结果 |
+|---|---|
+| 家族面入账(一次 ptok=1403 请求,ring=65536) | `fam_launch` 1826 + `fam_ffi_launch` 2172(marlin AWQ 967 / BF16 705 / cublas f16 260 / bf16 196 / FI fp8 44)+ `fam_alloc`/`fam_upload` |
+| 收口门 | `raw_sync_primitives_gate` ✅(命中 5 处,全部白名单内) |
+| 单测 | owl-shared 36/36 · owl-cuda 5/5 · owl-kernels 53/53 |
+| 回归(6 请求 × ptok 543…2453) | 6/6 `finish=tool_calls` + 参数正确 + logits 逐位同修后值 |
+| **零代价** | TTFT 与补救前**逐位相同**(0.54/0.63/1.14/1.43/1.99s) |
+| 病态复现位 | `sync_mask=128` 仍逐字节复现(`28`/0.91406) |
+
+### 15.4 未收口(立项级,不是临时补救能覆盖的)
+
+1. **`GpuRes::record_capture` 是空实现**(自注"A1.6 数据结构化随 graph 治理层立项(挂账)")
+   ⇒ `Exec::launch` 捕获窗内**登记了但没地方落**;
+2. **两条族路在捕获窗不对称**:`Exec` 路"查 `capturing()` + 登记(空)",marlin/cublas/FI
+   **什么都不查**(进捕获窗全靠驱动原生 capture 兜);
+3. **G2 护栏只管命令面**(捕获期只放行 Launch/Alloc)—— 家族面没有对应护栏,
+   捕获窗内 `res.alloc`/`download` 这类非法动作只能靠"族 grave 律"人工约定拦住。
+
+### 15.5 变更记录
+
+| 日期 | 版本 | 内容 |
+|---|---|---|
+| 2026-10-15 | v1.0 | 家族面收口三件套:`DeviceRes::note_device`(家族面入账)+ 文档纠错 + NULL 流原语 `pub(crate)` 与机器判据门;审计表与治理层欠账入档 |
+
+---
+
+## 十六、声明驱动路由(2026-10-15):`KernelSpec::FAMILY` + 拒启路径修复
+
+> 起因:A13 让人看清**家族面不在任何仪器视场内**(§十五);进一步追问发现更基础的
+> 一层问题 —— **"某个算子归哪个族执行"这件事在算子侧不可见**,族成员关系只能
+> **反向**声明(`KernelFamily::ops()` 手写表),于是路由表、元数据表、族表三份
+> 靠 boot 事后校验勉强绑住。
+
+### 16.1 改前结构(三份表 + 事后校验)
+
+| 处 | 内容 | 被谁校验 |
+|---|---|---|
+| `ops/<域>.rs` `PARAMS` | 槽序/类型/律 | `check_from_params`(L3)+ 池写集审计 |
+| `KernelFamily::ops()` | **手写** `const OPS: &[...]`(6 族各抄一份) | boot:"ops ⊆ names"(事后) |
+| `OpRegistry::names` | 名字集合 → `knows()`/`execute()` **线性扫族×名** | boot:"家族名全库唯一" |
+
+代价:① 归属在声明处不可见;② `names() = 族主名 ∪ ops()` 的"部分建表"陷阱
+(2026-10-13 实测:FI f16 主名 + gdn_scalar 静默从路由表消失);③ 每次发射线性扫;
+④ 族 id 在 `server/<族>::id()` 与 `ops/<域>::FAMILY` **两处提及**,可各自改。
+
+### 16.2 改后:`FAMILY` 声明 + 派生 + 索引 + 硬门
+
+```rust
+// spec.rs —— 声明面新增一维
+pub trait KernelSpec: 'static {
+    /// 执行家族(NATIVE = 原生 AOT 直发)
+    const FAMILY: OpId = OpId(crate::contract::names::NATIVE);
+    ...
+}
+// ops/marlin.rs —— 声明即归属
+impl KernelSpec for MarlinGemmW4a16Awq { const FAMILY: OpId = family_id::MARLIN; ... }
+```
+
+**族身份为什么住 `contract::family_id`(零门总账)而不是族结构体**:族 id 要被
+**两侧**引用 —— 声明面 `ops/<域>.rs`(**零 feature 门**,models 以 `features=["marlin"]`
+依赖本 crate 就要拿元数据)与执行面 `server/<族>.rs`(`device` 门)。**零门面引用有门面
+= 编译断**(同一约束见 `ops/mod.rs` 头注);而 `client/{cublas,marlin,xqa,flashinfer}.rs`
+与 `family/{cublas,marlin,flashinfer}.rs` 也带 feature 门 ⇒ 本节是唯一对六个族都合法
+的零门位置。**终局**:各族 face 零门化后,本节整体下移到 `client/<族>.rs`(那才是
+`client/mod.rs` 说的"face = 名字常量")。
+
+配套三件事:
+1. `KernelFamily::ops()` **降级为派生**:缺省 = `ops::of_family(self.id())` —— 6 族的
+   手写 `const OPS` 全删,单一真源 = `KernelSpec::FAMILY`;
+2. `OpRegistry` 建 **name → 族下标** 索引(boot 一次)⇒ `execute`/`knows` 从
+   "线性扫族×名"变 O(1);
+3. 两条**声明驱动硬门**(取代事后校验)+ 一条可见性告警:
+   - **A 孤儿声明**:非 Native 的算子,其 `FAMILY` 必须真实存在(否则元数据发不出去);
+   - **B 声明与路由分家**:路由表里的名字若已建表,其 `FAMILY` 必须指向本族;
+   - **C 空 ops()**:告警(只能靠主名路由)。
+
+### 16.3 验收
+
+| 判据 | 结果 |
+|---|---|
+| 路由面零漂移 | `已声明 129 张(原生表 + 家族臂 **11**)` —— 与改前逐字同 |
+| 单测 | owl-kernels 53/53 · owl-cuda 5/5 · owl-shared 36/36 · NULL 流门 1/1 |
+| 真机(6 请求 × ptok 543…2453) | 6/6 `tool_calls` + logits/TTFT **与改前逐位相同** |
+| **门会红(负例)** | `ops/gdn_scalar.rs` 的 `FAMILY` 改成不存在的族 ⇒ 拒启,错误**指名道姓**:`孤儿声明(家族不存在):["gdn_scalar_delta_rule_fwd"]` |
+
+### 16.4 顺手挖出并修掉:拒启路径三缺陷(运维级)
+
+负例验收时暴露 —— 拒启触发后**进程永挂、无监听、`warn` 档下零输出**:
+
+| # | 缺陷 | 位置 | 后果 |
+|---|---|---|---|
+| 1 | **boot 握手过早**:`boot.send(Ok(()))` 放在"设备 ctx 上线"处,而注册表 P4 门在**其后** | `server/mod.rs::run` | 拒启被"已 Ok 过"掩盖 ⇒ `spawn_with` 返回成功 ⇒ 引擎继续启动 ⇒ 向已退出的 server 发命令 ⇒ 引擎线程卡住 ⇒ `ready` 永不发 ⇒ **main 永挂** |
+| 2 | **可失败返回值被丢弃**:`let _ = server.run();` | `gpu_client.rs::spawn_with` | 真 Err 静默(AGENTS 纪律点名:"不允许丢弃一个可失败的函数的返回值") |
+| 3 | 拒启消息 `LVL_INFO` | `server/mod.rs` | 生产 `warn` 档**看不见**(而同文件注释写着"拒启必须可见") |
+
+修法:① 握手移到 **boot 全链成功之后**,失败路径**显式上握手送真 Err**;② 改
+`if let Err(e) = server.run() { eprintln!("[gpu-client] server 线程退出(Err): {e}") }`
+(裸 eprintln,不经级别门);③ 消息升 **`LVL_ERROR`**。
+
+**负例验收(warn 档)**:`exit=1`(不再挂)且三处错误全链可见:
+```
+[ERROR] [kernels] ❌ 算子注册表装配失败(拒启): ... 孤儿声明(家族不存在):["gdn_scalar_delta_rule_fwd"]
+[boot] 引擎装配失败: engine: gpu 绑定失败 "算子注册表装配失败(拒启): ..."
+[gpu-client] server 线程退出(Err): 算子注册表装配失败(拒启): ...
+```
+> 这类"活着但没引擎"的假进程,正是本会话里反复把人误导成"卡死/OOM"的现象源。
+
+### 16.5 未做(下一轮)
+
+`Call`/`parse` **仍是第二份槽序语义**:`client/<族>::parse` 手写下标,只断言
+**个数**(`blocks.len() != 7`)不断言序与类型 —— `PARAMS` 里两个同类型槽对调,
+`check_from_params` 照放行、`parse` 却会把 state 当 gate 读(静默错值)。
+修法 = `parse` 由 `PARAMS` **按名取槽**(`const fn slot_index(name)` + `slots.block("q")?`),
+代价 ≈ 6 族改写;兜底低成本版 = boot 期对每个已建表算子**干跑 parse** 并断言与
+`PARAMS` 派生序列一致。
+
+### 16.6 变更记录
+
+| 日期 | 版本 | 内容 |
+|---|---|---|
+| 2026-10-15 | v1.0 | `KernelSpec::FAMILY` + `contract::family_id` 族身份总账 + `ops()` 派生 + name→族 O(1) 索引 + 三条声明驱动门;修拒启路径三缺陷(握手点/错误丢弃/级别),负例验收 |
+
+---
+
+## 十七、server 参数校验审计与补口 + 族身份字面量住址重构(2026-10-15)
+
+### 17.1 审计:校验只在 `Launch` 一路,六条命令裸奔
+
+| 命令 | 校验 | 缺口 |
+|---|---|---|
+| `Launch` | ✅ L3 全量:槽数对位 / 槽类型对位 / 张量非零长+对齐 / 标量 set·min·max;**白名单逐发射强制** | ① `registry.meta(name)==None` ⇒ **直接 `Ok(())` 跳过**(未建表算子零校验;白名单在场时被白名单挡住,dev 档无);② 块不在账本 ⇒ `arg_len=None` ⇒ 零长/对齐**静默跳过**(非法块仍会在 resolve 期报错,只是晚一步);③ **几何(grid/block/smem/out_elems)默认不校验**(`Geom` 只给自定义 check 用) |
+| `Dtoh` | ✅ `want_bytes > n` 拒(前缀读有意放行) | — |
+| `GraphLaunch` | ✅ 图存在性 | — |
+| `Alloc` / `Htod` | 无 | 无上限/预算校验(引擎侧负责) |
+| **`HtodChunk(s)` / `UploadPinned` / `MemsetZero` / `CopyBlock` / `CopyBatch`** | **无** | **`offset + len ≤ block_len` 全无校验** ⇒ 越界写直接落**邻块** |
+
+**为什么要紧**:设备内**无越界保护**,`ptr + offset` 超尾就写邻块;而池复用使邻块身份随布局变
+⇒ 表现成"布局敏感的确定性错值" —— **A13 期间"邻块 clobber"正是头号嫌疑**,最后靠
+compute-sanitizer 才排除。与其每次靠仪器挖,不如在唯一咽喉把它变成结构化拒绝。
+
+### 17.2 补口(六条命令)+ 验活
+
+- `GpuCtx::check_range(id, off, len, what)`(块在册 + `range_fits`)+ 纯函数
+  `range_fits(n, off, len)`(溢出按越界;`off+len == n` 合法)+ 单测 8 例边界;
+- 接线:`HtodChunk` / `HtodChunks`(逐写)/ `UploadPinned` / `MemsetZero` /
+  `CopyBlock`(源+目标)/ `CopyBatch`(逐 copy 源+目标)。
+- **零假阳**:6 请求 × ptok 543…2453 全绿,logits/TTFT 逐位同,越界拒绝计数 **0**;
+- **门会红(off-by-one 注入)**:`n-1` 注入后第一个权重上传即爆出可执行错误 ——
+  ```
+  [boot] 引擎装配失败: Weight 'model.language_model.embed_tokens.weight':
+    [upload-pinned-arg] id=1099511627787 越界:offset=2415919104 + len=126877696 > block_len=2542796799
+  ```
+  且 `2415919104+126877696 = 2542796800`(真实块长)⇒ **合法路径正好写满**,
+  `≤` 语义与边界同时被证明。
+
+### 17.3 槽序回归锁(为"parse 仍是第二份语义"补的机器判据)
+
+族侧 `client/<族>::parse` 与 `ins_args`/`scalar_args` 都**手写下标**,`PARAMS` 是另一份;
+同类型槽对调时 L3 只看类型 ⇒ 放行,而解析器把 `state` 当 `gate` 读 = 静默错值。
+新增 `ops::tests::slot_order_lock_family_ops`:把 **11 个族算子**的 `PARAMS` 名序列钉死
+(键引族身份常量),并带**覆盖率门**(族算子一个不漏)。**同类型对调验红**:
+注入 `q↔v` 对调(同类型同 rank ⇒ L3 放行)⇒ 锁立刻红,消息指名"请同步审 parse 与 builder"。
+配套 `KernelMeta::{param_names, slot_index}`(按名寻址 = 未来 parse/builder 按名取槽的前置件)。
+
+> **未做(下一轮)**:只改 `parse` 会造成**新的不对称**(builder 仍手写序)⇒ 正解是
+> **builder + parse 成对按名取址**(6 族 + models 调用点,≈半天);现在先有锁兜着。
+
+### 17.4 族身份字面量住址重构(用户裁决:字面量住各族自己)
+
+**删掉两个总表**:`contract::names`(12 条字面量)与 `contract::family_id`(7 条族身份)。
+**新住址**:
+
+| 面 | 住址 |
+|---|---|
+| 族名/算子名字面量 | **各族自己的 `family/<族>.rs`**(身份面**零门**) |
+| 族身份 `OpId` | **族 runtime 结构体上**:`server/<族>::ID`(`id()` 返回 `Self::ID`) |
+| 声明面 | `ops/<域>::ENTRY` 与 `::FAMILY` 都引用**族字面量** |
+| "无族"标记 | `spec::NATIVE`(它不是族字面量,是"无族"哨兵) |
+
+**门控处理**(零门面引用有门面 = 编译断):三个带 feature 门的族文件把**身份面零门化** ——
+`family/cublas.rs`(cudarc 项 `#[cfg(feature="cublas")]`)、`family/marlin/mod.rs`
+(`repack` 随 `feature="marlin"`)、`family/flashinfer.rs`(本就零依赖);
+`family/mod.rs` 三个模块声明去门。**`cargo check -p owl-kernels`(零 feature)通过** = 零门律保住。
+
+**名字门补齐**:`crates/backends/cuda/tests/server_name_lint.rs`(server 子树禁裸字面量)
+此前**漏了 XQA 两名**(覆盖缺口),已补;文档改成新住址纪律(清单 = 住址表两侧互证)。
+另:`ops::tests::slot_order_lock` 的键改引族常量(ops 面不再躺族名字面量);
+`models/{ops,env,kernel}.rs`、`kernels/driver.rs`、`ops/oracles/*` 全部改引族常量。
+
+**验收**:owl-kernels 54/54 · owl-cuda 6/6 + 名字门 ✅ + NULL 流门 ✅ · owl-shared 36/36 ·
+零门编译 ✅ · 真机 6/6 `tool_calls` + logits/TTFT **逐位同改前**。
+
+### 17.5 变更记录
+
+| 日期 | 版本 | 内容 |
+|---|---|---|
+| 2026-10-15 | v1.0 | 参数校验审计(Launch-only 三盲点)+ 六条命令边界校验补口(off-by-one 验活)+ 槽序回归锁(同类型对调验红)+ 族身份字面量住址重构(删两总表,字面量归各族,身份面零门化,名字门补 XQA) |

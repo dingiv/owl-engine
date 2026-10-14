@@ -19,8 +19,8 @@
 
 use crate::contract::{Arg, Bytes, LaunchMsg, OpError, KernelSource};
 
-/// 家族名(全库唯一字面量住址 = contract::names;models 经本常量引用)
-pub const GDN_CHUNKED: &str = crate::contract::names::GDN_CHUNKED;
+/// 家族名(字面量住址 = `family::gdn_chunked`;models 经本常量引用)
+pub const GDN_CHUNKED: &str = crate::family::gdn_chunked::GDN_CHUNKED_FWD;
 /// 槽序签名(lower_kernel 对位;O = 输出槽)
 pub const SIG: &str = "T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz";
 

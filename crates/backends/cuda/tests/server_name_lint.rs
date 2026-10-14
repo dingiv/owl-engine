@@ -1,9 +1,13 @@
 //! server 侧名字面量门(P0 收官;operator-contract 设计 §4.1)。
 //!
 //! **server 主循环零算子知识**:`server/` 子树不得含任何算子名字字面量
-//! —— 名字分派在 kernels::registry(knows/execute),家族名经各 face
-//! 常量引用。违例 = 本测试红。
-//! (backends/cuda::ops 的 runtime 面经 face 常量引名,亦零字面量。)
+//! —— 名字分派在 kernels::registry(knows/execute),家族名经**族身份常量**
+//! 引用。违例 = 本测试红。
+//!
+//! **住址纪律(2026-10-15)**:族名/算子名的**唯一定义处 = 各族自己的
+//! `kernels::family/<族>.rs`**(身份面零门,声明面 `ops/` 与 models 可引用);
+//! 本清单 = 该住址表的**两侧互证**(清单里的名字必须在代码里以字面量存在于
+//! 那个文件,而 server 子树里一个都不许出现)。
 
 use std::path::Path;
 
@@ -17,6 +21,9 @@ const OP_NAME_LITERALS: &[&str] = &[
     "marlin_gemm_w4a16_bf16",
     "flashinfer_prefill_paged_f16",
     "flashinfer_prefill_paged_fp8kv",
+    // 2026-10-15 补:此前漏了 XQA 两名(门有覆盖缺口 ⇒ 清单不完整)
+    "owl_xqa_verify",
+    "owl_xqa_decode",
 ];
 
 fn walk_rs(dir: &Path, hits: &mut Vec<String>) {

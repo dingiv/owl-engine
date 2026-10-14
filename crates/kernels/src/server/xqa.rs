@@ -84,11 +84,10 @@ fn assemble_common(
 }
 
 impl XqaRuntime {
-    /// 本族算子表(**引用 `ops::xqa` 的命名 static** —— 单一提升点)
-    const OPS: &'static [&'static crate::spec::KernelMeta] = &[&crate::ops::xqa::XQA_VERIFY];
-}
-impl XqaDecodeRuntime {
-    const OPS: &'static [&'static crate::spec::KernelMeta] = &[&crate::ops::xqa::XQA_DECODE];
+    /// **本族身份**(族名 = 线契约名;字面量住 `family::<族>`,零门)
+    /// —— 声明面 `ops/<域>::FAMILY` 与执行面 `id()` 引用**同一字面量**。
+    pub const ID: OpId = OpId(crate::family::xqa::VERIFY_XQA);
+    // 本族算子表:由 `KernelSpec::FAMILY` 派生(单一提升点 = ops::xqa 的 static)
 }
 
 /// 发射公共体(两条臂共用;差别只在装载的资产变体)
@@ -163,12 +162,9 @@ fn emit(
 
 impl KernelFamily for XqaRuntime {
     fn id(&self) -> OpId {
-        OpId(VERIFY_XQA)
+        Self::ID
     }
 
-    fn ops(&self) -> &'static [&'static crate::spec::KernelMeta] {
-        Self::OPS
-    }
 
 
     /// 装配:载 `xqa_verify` 资产 + 探针核读常量(workspace 仍由调用方给)
@@ -190,14 +186,17 @@ impl KernelFamily for XqaRuntime {
     }
 }
 
+impl XqaDecodeRuntime {
+    /// **本族身份**(族名 = 线契约名;字面量住 `family::xqa`,零门)
+    /// —— 声明面 `ops::xqa::XqaDecode::FAMILY` 与本处引用**同一字面量**。
+    pub const ID: OpId = OpId(crate::family::xqa::DECODE_XQA);
+}
+
 impl KernelFamily for XqaDecodeRuntime {
     fn id(&self) -> OpId {
-        OpId(DECODE_XQA)
+        Self::ID
     }
 
-    fn ops(&self) -> &'static [&'static crate::spec::KernelMeta] {
-        Self::OPS
-    }
 
 
     fn assemble(

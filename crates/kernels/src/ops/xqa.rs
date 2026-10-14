@@ -93,6 +93,8 @@ fn check_xqa(ctx: &CheckCtx<'_>) -> Result<(), OpError> {
 pub struct XqaVerify;
 
 impl KernelSpec for XqaVerify {
+    /// 执行家族(声明驱动路由;见 `KernelSpec::FAMILY`)
+    const FAMILY: crate::contract::OpId = crate::contract::OpId(xqa::VERIFY_XQA);
     const ENTRY: &'static str = xqa::VERIFY_XQA;
     /// foreign(预编 `.a`):无 `.cu` 源 —— 源码/符号在 vendor 归档,
     /// 装配门由族的 manifest/sha256 面承担
@@ -117,6 +119,8 @@ impl KernelSpec for XqaVerify {
 pub struct XqaDecode;
 
 impl KernelSpec for XqaDecode {
+    /// 执行家族(声明驱动路由;见 `KernelSpec::FAMILY`)
+    const FAMILY: crate::contract::OpId = crate::contract::OpId(xqa::DECODE_XQA);
     const ENTRY: &'static str = xqa::DECODE_XQA;
     const SRC: &'static str = "";
     const PARAMS: &'static [Param] = XQA_PARAMS;

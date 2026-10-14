@@ -170,18 +170,15 @@ pub struct GdnChunkedRuntime {
 }
 
 impl GdnChunkedRuntime {
-    /// 本族算子表(单名已建表 ⇒ `names()` 由本表派生)
-    const OPS: &'static [&'static crate::spec::KernelMeta] =
-        &[&crate::ops::gdn_chunked::GDN_CHUNKED_FWD];
+    /// **本族身份**(族名 = 线契约名;字面量住 `family::gdn_chunked`,零门)
+    /// —— 声明面 `ops::gdn_chunked::*::FAMILY` 与本处引用**同一字面量**。
+    pub const ID: OpId = OpId(crate::family::gdn_chunked::GDN_CHUNKED_FWD);
 }
 
-impl KernelFamily for GdnChunkedRuntime {
-    fn ops(&self) -> &'static [&'static crate::spec::KernelMeta] {
-        Self::OPS
-    }
 
+impl KernelFamily for GdnChunkedRuntime {
     fn id(&self) -> OpId {
-        OP
+        Self::ID
     }
 
 

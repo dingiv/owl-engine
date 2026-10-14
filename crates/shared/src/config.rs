@@ -60,6 +60,7 @@
 //! | probes | gdn_dump_all / pf_bisect / pf_fin_check / raw_completion | flag / false |
 //! | probes | pf_stages | Option<usize> / None |
 //! | cuda | srv_timing / cap_prof / launch_sync / launch_time | flag / false |
+//! | cuda | trace_ring | usize / 0(关;>0 = 发射账容量) |
 //! | cuda | d2h_prof / gpu_prof / free_legacy | flag / false |
 //! | cuda | graph_flags | { upload, device_launch } / 全 false |
 //! | cuda | capture_slab_mb | Option<usize> / None(hint 定量) |
@@ -398,6 +399,11 @@ pub struct CudaCfg {
     pub srv_timing: bool,
     pub cap_prof: bool,
     pub launch_sync: bool,
+    /// **同步点分解掩码**(诊断 A/B,2026-10-15):`launch_sync` 是「全部同步点」
+    /// 的合称,不是单一变量 —— 要做归因必须逐点开关。位定义见 [`sync_bit`];
+    /// 0(缺省)= 生产语义。`launch_sync = true` 时本字段被覆盖为 [`sync_bit::ALL`]。
+    #[serde(default)]
+    pub sync_mask: u32,
     pub launch_time: bool,
     pub d2h_prof: bool,
     pub gpu_prof: bool,
@@ -405,10 +411,45 @@ pub struct CudaCfg {
     pub graph_flags: GraphInstantiateFlags,
     /// 捕获 slab 固定档 MiB(None = warmup 计量定量)
     pub capture_slab_mb: Option<usize>,
+    /// **发射账容量**(0 = 关;>0 ⇒ server 记最近 N 条命令,含流/核名/块地址)。
+    /// 查询:`GET /debug/launches[/<n>[/<kind>]]`;见 cuda::trace 模块头。
+    #[serde(default)]
+    pub trace_ring: usize,
     // nvrtc_include(2026-10-13 退役):NVRTC 编译路径已删 —— 设备码一律
     // 构建期 cubin 资产(源哈希查表),include 路径是构建期 `nvcc` 的事。
     // 键已从配置面移除(不许留死键,`deny_unknown_fields` 会让旧档拒启 →
     // 显式暴露"该档还在用已退役旋钮")。
+}
+
+/// 同步点分解掩码的位定义(`cuda.sync_mask`;诊断 A/B 用)。
+///
+/// 6 处同步点分两类:**跨流 IO 序**(HTOD/DTOH/FENCE —— 拷贝流与 COMPUTE 之间的
+/// 内存可见性)与 **host 领先**(LAUNCH/GRAPH/ALLOC —— host 是否等设备追上)。
+/// `launch_sync = true` 曾把两类一起钉死 ⇒ "能治好" 但归因不明;分开才能指认
+/// 是哪一对跨流/哪一处领先在竞速。
+pub mod sync_bit {
+    /// `try_htod`:H2D DMA 后 `sync` H2D 流(host 等上传真落定)
+    pub const HTOD: u32 = 1 << 0;
+    /// `dtoh`:退回整流 `COMPUTE.synchronize()`(旧语义;否则 = 事件定向等待)
+    pub const DTOH: u32 = 1 << 1;
+    /// 块回收栅栏:任一 Owned 块 ⇒ H2D + D2H 都等(旧语义;否则 = 按块定向)
+    pub const FENCE: u32 = 1 << 2;
+    /// 逐 eager launch 后 `COMPUTE.synchronize()`
+    pub const LAUNCH: u32 = 1 << 3;
+    /// 图回放后 `COMPUTE.synchronize()`
+    pub const GRAPH: u32 = 1 << 4;
+    /// alloc/memset 后 `COMPUTE.synchronize()`
+    pub const ALLOC: u32 = 1 << 5;
+    /// **家族 runtime scratch 上传·实验位**(A13,2026-10-15):拷贝前先排空
+    /// COMPUTE(让流序分配落定)。定谳时用过;现生产缺省已修为同流 async。
+    pub const SCRATCH_SYNC_UP: u32 = 1 << 6;
+    /// **家族 runtime scratch 上传·回退位**:**复现 A13** —— `DeviceRes::upload`
+    /// 非捕获分支退回 "NULL 流同步拷贝"(2026-10-09 试刀行为)。
+    /// ⚠️ 置位 = 故意把写序抹掉(写进尚未落定的异步分配 ⇒ 静默丢写),
+    /// 仅供 A/B 与仪器验证;生产不得置位。
+    pub const SCRATCH_UP_LEGACY: u32 = 1 << 7;
+    /// `launch_sync` 的全部六点(仍不含 scratch 上传位 —— 它们在语义上不是"多一道同步")
+    pub const ALL: u32 = HTOD | DTOH | FENCE | LAUNCH | GRAPH | ALLOC;
 }
 
 /// 图装配面(engine GraphPlanDesc)

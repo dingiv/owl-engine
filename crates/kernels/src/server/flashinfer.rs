@@ -26,9 +26,10 @@ struct PlanKey {
 }
 
 impl FiRuntime {
-    /// 本族已建表算子(子集:只有 fp8 臂)
-    const OPS: &'static [&'static crate::spec::KernelMeta] =
-        &[&crate::ops::flashinfer::PREFILL_FI_FP8KV];
+    /// **本族身份**(族名 = 线契约名;字面量住 `family::flashinfer`,零门)
+    pub const ID: OpId = OpId(crate::family::flashinfer::PREFILL_FI);
+
+    // 本族算子表:由 `KernelSpec::FAMILY` 派生(f16 + fp8 两臂)
 }
 
 pub struct FiRuntime {
@@ -49,21 +50,14 @@ impl Default for FiRuntime {
     }
 }
 
-impl FiRuntime {
-    // 名字 = client face re-export(contract::names 单源),零本地字面量
-    // —— 2026-10-12 review I-10 案(旧 N_F16/N_FP8KV 已删)
-}
 
 impl KernelFamily for FiRuntime {
     fn id(&self) -> OpId {
-        OpId(PREFILL_FI)
+        Self::ID
     }
 
     /// 本族**已建表**算子(fp8 臂;f16 臂未建表 —— 它由族主名承担,
     /// 见 `KernelFamily::names()` 的 id ∪ ops 律)
-    fn ops(&self) -> &'static [&'static crate::spec::KernelMeta] {
-        Self::OPS
-    }
 
 
     /// 构造函数:workspace 预钉(float 64MB + int 32MB;构造期,
@@ -161,6 +155,9 @@ impl KernelFamily for FiRuntime {
         } else {
             owl_fi_prefill_run
         };
+        // 家族面入账(A13 补漏):FlashInfer = **直连 FFI 发射**(plan/run 均不经
+        // `Exec::launch`),账上本无痕;ptrs = q/kc/vc/out 四块地址。
+        res.note_device("fam_ffi_launch", &msg.kernel.name, 0, &[q, kc, vc, out_ptr]);
         let rc = unsafe {
             run(
                 q as *const std::ffi::c_void,

@@ -130,8 +130,16 @@ impl GpuClient {
         let server = GpuServer::with_diag_sink(rx, selector, Some(boot_tx), diag, debug, sink);
         std::thread::Builder::new()
             .spawn(move || {
-                // server 收摊 → 账房/图注册表随 ctx 析构,派发线程排空后退出
-                let _ = server.run();
+                // server 收摊 → 账房/图注册表随 ctx 析构,派发线程排空后退出。
+                //
+                // ⚠️ **不许丢弃 Err**(2026-10-15;AGENTS 纪律:可失败返回值不可丢弃):
+                // 原为 `let _ = server.run();` —— 拒启/致命错误在此静默,叠加当时
+                // "握手过早"缺陷后表现为"进程活着、无监听、日志无声"(A13 负例门
+                // 实测:54 线程存活 / health 无响应)。现裸 eprintln(不经级别门,
+                // 拒启是运维必须看见的事件)。
+                if let Err(e) = server.run() {
+                    eprintln!("[gpu-client] server 线程退出(Err): {e}");
+                }
             })
             .map_err(|e| format!("server 线程启动失败: {e}"))?;
         boot_rx

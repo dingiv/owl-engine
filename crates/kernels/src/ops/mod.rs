@@ -70,6 +70,14 @@ pub fn all() -> impl Iterator<Item = &'static KernelMeta> {
     TABLES.iter().flat_map(|t| t.iter().copied())
 }
 
+/// **按家族过滤已建表算子**(族 `ops()` 的派生源 —— 声明驱动路由,2026-10-15)。
+///
+/// 族侧不再手写 `const OPS: &[...]`:`KernelFamily::ops()` 的缺省实现就是
+/// `of_family(self.id())` —— 单一真源 = 每个算子的 `KernelSpec::FAMILY`。
+pub fn of_family(id: crate::contract::OpId) -> impl Iterator<Item = &'static KernelMeta> {
+    all().filter(move |m| m.family == id)
+}
+
 /// 按名查元数据(线性扫描;测试/工具面用 —— 热路径走 `OpRegistry` 的
 /// boot 期索引,别在这条路上做逐发射查找)
 pub fn meta(name: &str) -> Option<&'static KernelMeta> {
@@ -560,6 +568,59 @@ mod tests {
         let m = [&meta_of::<WriteKnhd>(), &meta_of::<WriteClassic>()];
         let e = audit_pools(&m).unwrap_err();
         assert!(e.to_string().contains("布局唯一"), "{e}");
+    }
+
+    /// **槽序回归锁(族算子;2026-10-15)**
+    ///
+    /// # 为什么需要
+    ///
+    /// 族侧 `client/<族>::parse` 与 `ins_args`/`scalar_args` 都**手写下标**
+    /// (`blocks[0]`/`scalars[1]`),隐含一份槽序假设;`PARAMS` 是另一份。
+    /// 改 `PARAMS` 里两个**同类型**槽时,L3(`check_from_params`)只看类型 ⇒
+    /// 照放行,而解析器会把 `state` 当 `gate` 读 = **静默错值**。
+    /// 本锁把两侧钉死:**改序 ⇒ 本测试红 ⇒ 作者必须同时审 parse 与 builder**。
+    ///
+    /// 与既有 `scalar_slot_order_matches_legacy_sig`(逐族、比旧 SIG 串)互补:
+    /// 那些锁的是"与历史签名一致",本锁的是"**全部族算子一个不漏** + 名序列"。
+    ///
+    /// 覆盖率门:锁表必须恰好覆盖全部族算子(一个不漏、一个不多)。
+    #[test]
+    fn slot_order_lock_family_ops() {
+        const EXPECT: &[(&str, &[&str])] = &[
+            (crate::family::gdn_chunked::GDN_CHUNKED_FWD, &["q", "k", "v", "beta", "gate", "state", "out", "t", "slot", "nv", "nk", "kd", "scale_bits"]),
+            (crate::family::gdn_scalar::GDN_SCALAR_FWD, &["q", "k", "v", "beta", "gate", "state", "out", "t", "slot", "nv", "nk", "kd", "vd", "scale_bits"]),
+            (crate::family::marlin::GEMM_W4A16_AWQ, &["a", "b", "out", "scales", "zeros", "ws", "c_tmp", "m", "k", "n", "groupsize"]),
+            (crate::family::marlin::GEMM_W4A16_BF16, &["a", "b", "out", "scales", "ws", "c_tmp", "m", "k", "n", "groupsize"]),
+            (crate::family::marlin::GEMM_W4A16, &["a", "b", "out", "scales", "ws", "c_tmp", "m", "k", "n", "groupsize"]),
+            (crate::family::cublas::GEMM_F16, &["a", "b", "out", "m", "k", "n", "nt"]),
+            (crate::family::cublas::GEMM_BF16, &["a", "b", "out", "m", "k", "n", "nt"]),
+            (crate::family::flashinfer::PREFILL_FI_FP8KV, &["q", "k_cache", "v_cache", "q_cu", "indices", "indptr", "last_len", "wr", "out", "total_rows", "ctx_total", "t", "hq", "hkv", "hd", "page", "sm_scale_bits"]),
+            (crate::family::flashinfer::PREFILL_FI, &["q", "k_cache", "v_cache", "q_cu", "indices", "indptr", "last_len", "wr", "out", "total_rows", "ctx_total", "t", "hq", "hkv", "hd", "page", "sm_scale_bits"]),
+            (crate::family::xqa::VERIFY_XQA, &["q", "k_cache", "v_cache", "page_table", "seq_lens", "mask", "semaphores", "scratch", "wr", "out", "q_seq_len", "hkv", "hd", "page", "max_seq_len", "q_scale_bits", "sm_count", "stride_page", "stride_token", "stride_head"]),
+            (crate::family::xqa::DECODE_XQA, &["q", "k_cache", "v_cache", "page_table", "seq_lens", "mask", "semaphores", "scratch", "wr", "out", "q_seq_len", "hkv", "hd", "page", "max_seq_len", "q_scale_bits", "sm_count", "stride_page", "stride_token", "stride_head"]),
+        ];
+        for (entry, want) in EXPECT {
+            let m = meta(entry).unwrap_or_else(|| panic!("锁表项 {entry} 不在声明表里"));
+            assert_eq!(
+                m.param_names(),
+                *want,
+                "{entry}: 槽序变了 —— 请同步审 client/<族> 的 parse 与 ins_args/scalar_args \
+                 (同类型槽对调 = L3 放行 + 解析器静默错值)"
+            );
+        }
+        // 覆盖率门:族算子一个不漏
+        let fam: Vec<&str> = all().filter(|m| m.is_family()).map(|m| m.entry).collect();
+        assert_eq!(fam.len(), EXPECT.len(), "族算子清单与锁表项数不一致:{fam:?}");
+        for e in &fam {
+            assert!(EXPECT.iter().any(|(k, _)| k == e), "族算子 {e} 未进锁表");
+        }
+        // 前置件自检:**按名寻址**可用(未来 parse/builder 按名取槽的基础)
+        let g = meta("gdn_chunked_delta_rule_fwd").expect("gdn chunked");
+        assert_eq!(g.slot_index("gate"), Some(4));
+        assert_eq!(g.slot_index("state"), Some(5));
+        assert_eq!(g.slot_index("out"), Some(6));
+        assert_eq!(g.slot_index("slot"), Some(8), "标量槽同表寻址");
+        assert_eq!(g.slot_index("不存在"), None);
     }
 
     /// 命名 static 是**单一提升点**:域表里的每一项都必须指向 `all()` 里

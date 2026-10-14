@@ -410,13 +410,13 @@ pub fn lower_gemm(
     bf16: bool,
 ) -> LaunchMsg {
     LaunchMsg {
-        // 核名 = 线契约常量(唯一字面量住址 owl_kernels::contract::names;
+        // 核名 = 族身份常量(字面量住址 owl_kernels::family::cublas;
         // models 零 cublas feature 也经此引用 —— 字面量全库只写一次)
         kernel: KernelSource {
             name: if bf16 {
-                owl_kernels::contract::names::GEMM_BF16.to_string()
+                owl_kernels::family::cublas::GEMM_BF16.to_string()
             } else {
-                owl_kernels::contract::names::GEMM_F16.to_string()
+                owl_kernels::family::cublas::GEMM_F16.to_string()
             },
             source: String::new(),
         },
@@ -613,17 +613,16 @@ pub fn argmax_f32idx(x: &crate::tensor::TensorOps, n: usize, offset: usize) -> c
 /// 登记表无 foreign 条目,sig 住 client face 单源。gdn 两臂 Call 通道的
 /// 桥:driver 拾取名 → 本表 → lower_kernel 对位装配)
 pub(crate) fn foreign_sig(name: &str) -> Option<&'static str> {
-    use owl_kernels::contract::names as n;
     match name {
         x if x == owl_kernels::family::gdn_chunked::GDN_CHUNKED_FWD => Some(owl_kernels::client::gdn_chunked::SIG),
         x if x == owl_kernels::family::gdn_scalar::GDN_SCALAR_FWD => Some(owl_kernels::client::gdn_scalar::SIG),
-        x if x == n::GEMM_W4A16 => Some(owl_kernels::client::marlin::SIG),
-        x if x == n::GEMM_W4A16_AWQ => Some(owl_kernels::client::marlin::SIG_AWQ),
-        x if x == n::GEMM_W4A16_BF16 => Some(owl_kernels::client::marlin::SIG),
-        x if x == n::PREFILL_FI => Some(owl_kernels::client::fi_sig::SIG),
-        x if x == n::PREFILL_FI_FP8KV => Some(owl_kernels::client::fi_sig::SIG),
-        x if x == n::VERIFY_XQA => Some(owl_kernels::family::xqa::VERIFY_XQA_SIG),
-        x if x == n::DECODE_XQA => Some(owl_kernels::family::xqa::DECODE_XQA_SIG),
+        x if x == owl_kernels::family::marlin::GEMM_W4A16 => Some(owl_kernels::client::marlin::SIG),
+        x if x == owl_kernels::family::marlin::GEMM_W4A16_AWQ => Some(owl_kernels::client::marlin::SIG_AWQ),
+        x if x == owl_kernels::family::marlin::GEMM_W4A16_BF16 => Some(owl_kernels::client::marlin::SIG),
+        x if x == owl_kernels::family::flashinfer::PREFILL_FI => Some(owl_kernels::client::fi_sig::SIG),
+        x if x == owl_kernels::family::flashinfer::PREFILL_FI_FP8KV => Some(owl_kernels::client::fi_sig::SIG),
+        x if x == owl_kernels::family::xqa::VERIFY_XQA => Some(owl_kernels::family::xqa::VERIFY_XQA_SIG),
+        x if x == owl_kernels::family::xqa::DECODE_XQA => Some(owl_kernels::family::xqa::DECODE_XQA_SIG),
         _ => None,
     }
 }

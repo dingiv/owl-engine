@@ -17,7 +17,9 @@
 //! 层级纪律:本模块不依赖 owl-iface(错误 = String,server 侧映射
 //! ModelError);裸指针入参(u64 设备地址),零 cudarc driver 泛型面。
 
+#[cfg(feature = "cublas")]
 use cudarc::cublas::{result as cb, sys, CudaBlas};
+#[cfg(feature = "cublas")]
 use std::sync::Arc;
 
 /// 外部算子名(foreign-kernel 通道):Launch 的核名以此标识外部库执行,
@@ -26,21 +28,23 @@ use std::sync::Arc;
 /// **槽序契约**(LaunchMsg.args,与 .cu 核同构 —— 输出块固定末参前的
 /// Block 序 + 类型化标量):
 /// `[T a, T b, T out, sz m, sz k, sz n, sz nt]`(nt: 1 = owl Linear nt 形)。
-pub const GEMM_F16: &str = crate::contract::names::GEMM_F16;
+pub const GEMM_F16: &str = "cublas_gemm_f16";
 
 /// BF16 GEMM 外来核名(E5-DF3 同日十四;DFlash2 草稿非量化投影
 /// kernel_projection/hidden_projection 消费;槽序契约同 GEMM_F16)
-pub const GEMM_BF16: &str = crate::contract::names::GEMM_BF16;
+pub const GEMM_BF16: &str = "cublas_gemm_bf16";
 
 /// foreign 分派谓词(server handle_launch 前置检查)
 pub fn is_foreign(name: &str) -> bool {
     name == GEMM_F16 || name == GEMM_BF16
 }
 
+#[cfg(feature = "cublas")]
 pub struct OwlCublas {
     blas: CudaBlas,
 }
 
+#[cfg(feature = "cublas")]
 impl OwlCublas {
     /// 私有工作区预绑(C1 刀1.5 律:捕获期 gemv splitK 不走池分配,
     /// 免 MEM_ALLOC/FREE 节点;调用方保证 ws 生命周期 ≥ 句柄)

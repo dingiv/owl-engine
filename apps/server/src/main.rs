@@ -496,6 +496,20 @@ async fn serve(
             v["action"] = json!(msg);
             http::respond_json(&mut stream, 200, &v).await?;
         }
+        // **发射账查询面**(cuda::trace;`[cuda] trace_ring = <N>` 开启):
+        //   GET /debug/launches[/<n>[/<kind>]]  —— 最近 n 条(缺省 200)按发射序;
+        //   kind = 命令类(launch/htod/dtoh/free…)/流名(compute/h2d/d2h)/核名子串
+        ("GET", p) if p == "/debug/launches" || p.starts_with("/debug/launches/") => {
+            let rest = p.strip_prefix("/debug/launches").unwrap_or("").trim_start_matches('/');
+            let (ns, kind) = rest.split_once('/').unwrap_or((rest, ""));
+            let n = if ns.is_empty() {
+                200
+            } else {
+                ns.parse::<usize>().unwrap_or(200).min(100_000)
+            };
+            let kind = (!kind.is_empty()).then_some(kind);
+            http::respond_json(&mut stream, 200, &debug::launches_json(n, kind)).await?;
+        }
         // 诊断分账出口(投影在 debug 模块;路由只转发)
         ("GET", p) if p == "/debug/metrics" || p.starts_with("/debug/metrics/") => {
             let prefix = p.strip_prefix("/debug/metrics/").unwrap_or("");

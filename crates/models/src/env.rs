@@ -153,11 +153,11 @@ impl KvEnv {
     }
 
     /// FI paged prefill 虚核名(Kernel::new 直名族;字面量住址 =
-    /// owl_kernels::contract::names,零本地字面量 —— 2026-10-12 review D 案)
+    /// `owl_kernels::family::flashinfer`,零本地字面量)
     pub fn fi_prefill_name(&self) -> &'static str {
         match self.quant {
-            KvQuant::Fp8E4M3 => owl_kernels::contract::names::PREFILL_FI_FP8KV,
-            KvQuant::None => owl_kernels::contract::names::PREFILL_FI,
+            KvQuant::Fp8E4M3 => owl_kernels::family::flashinfer::PREFILL_FI_FP8KV,
+            KvQuant::None => owl_kernels::family::flashinfer::PREFILL_FI,
         }
     }
 

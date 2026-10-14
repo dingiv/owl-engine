@@ -129,6 +129,8 @@ pub struct GpuServer {
     allowed_ops: Option<std::sync::Arc<Vec<String>>>,
     /// 执行引擎(kernels::device;LaunchVal 值表发射 + 装载缓存)
     exec: owl_kernels::device::Exec,
+    /// **发射账**(cuda.trace_ring > 0 时建;见 crate::trace 模块头)
+    trace: Option<std::sync::Arc<crate::trace::TraceRing>>,
     /// scratch 物理账本(家族 runtime 的 alloc 落此;append-only,
     /// 释放 = server 销毁 —— 家族 grave 是逻辑侧,这里是物理侧)
     scratch_ledger: Vec<(u64, CudaSlice<u8>)>,
@@ -199,8 +201,122 @@ impl GpuServer {
             dispatch: None,
             timings: Vec::new(),
             probes: ServerProbes::from_parts(&diag, debug),
+            trace: {
+                // 发射账:容量 > 0 才建;建好即**发布**给 app 侧查询面
+                let r = crate::trace::TraceRing::new(diag.trace_ring);
+                if r.enabled() {
+                    crate::trace::publish(r.clone());
+                    Some(r)
+                } else {
+                    None
+                }
+            },
             diag,
             sink,
+        }
+    }
+
+    /// 分配落定入账(id + 设备地址;地址 = 生命周期判据的钥匙)
+    fn trace_alloc_done(&self, id: u64) {
+        let Some(tr) = self.trace.as_ref() else { return };
+        let Ok(st) = self.ctx().stream(crate::state::STREAM_COMPUTE) else {
+            return;
+        };
+        let ptr = self.ctx().block_ptr(id, st).map(|(p, _)| p).unwrap_or(0);
+        let len = self.ctx().block_len(id).unwrap_or(0);
+        tr.push(
+            crate::trace::TraceEntry::new("alloc_done", "compute")
+                .id(id)
+                .ptrs([ptr])
+                .bytes(len),
+        );
+    }
+
+    /// 命令 → 发射账目(派发前调用;块 id 顺带解析成设备地址 —— 地址复用判据)
+    fn trace_entry_of(&self, cmd: &Command) -> crate::trace::TraceEntry {
+        use crate::trace::TraceEntry as E;
+        let resolve = |ids: &[u64]| -> Vec<u64> {
+            let Ok(st) = self.ctx().stream(crate::state::STREAM_COMPUTE) else {
+                return Vec::new();
+            };
+            ids.iter()
+                .map(|id| self.ctx().block_ptr(*id, st).map(|(p, _)| p).unwrap_or(0))
+                .collect()
+        };
+        match cmd {
+            Command::Launch { msg, .. } => {
+                let ids: Vec<u64> = msg
+                    .args
+                    .iter()
+                    .filter_map(|a| match a {
+                        Arg::Block { id } => Some(*id),
+                        Arg::BlockSlice { id, .. } => Some(*id),
+                        _ => None,
+                    })
+                    .collect();
+                let ptrs = resolve(&ids);
+                // 契约:最后一个 Block/BlockSlice = 输出(launch.rs 回传口径)
+                let out_id = msg
+                    .args
+                    .iter()
+                    .rev()
+                    .find_map(|a| match a {
+                        Arg::Block { id } => Some(*id),
+                        Arg::BlockSlice { id, .. } => Some(*id),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                let mut e = E::new("launch", "compute")
+                    .name(msg.kernel.name.clone())
+                    .grid(msg.grid, msg.block, msg.shared_mem)
+                    .bytes(msg.out_elems)
+                    .ids(ids)
+                    .ptrs(ptrs);
+                e.out_id = out_id;
+                e
+            }
+            Command::Htod { data, .. } => E::new("htod", "h2d").bytes(data.len()),
+            Command::HtodChunk { block, data, .. } => {
+                E::new("htod_chunk", "h2d").bytes(data.len()).id(*block)
+            }
+            Command::HtodChunks { writes, .. } => E::new("htod_chunks", "h2d")
+                .bytes(writes.iter().map(|w| w.2.len()).sum())
+                .ids(writes.iter().map(|w| w.0)),
+            Command::UploadPinned { dst, len_bytes, .. } => {
+                E::new("upload_pinned", "h2d").bytes(*len_bytes).id(dst.id)
+            }
+            Command::Dtoh { id, want_bytes, .. } => {
+                E::new("dtoh", "d2h").bytes(*want_bytes).id(*id)
+            }
+            Command::Alloc { n_bytes, zero, .. } => E::new("alloc", "compute")
+                .bytes(*n_bytes)
+                .name(if *zero { "zero" } else { "uninit" }),
+            Command::MemsetZero { block, len_bytes, .. } => {
+                let ptrs = resolve(&[*block]);
+                E::new("memset_zero", "compute").bytes(*len_bytes).id(*block).ptrs(ptrs)
+            }
+            Command::Free { ids, .. } => {
+                // 回收前解析(此后账房已移除)⇒ free 条目自带地址
+                let ptrs = resolve(ids);
+                E::new("free", "").ids(ids.clone()).ptrs(ptrs)
+            }
+            Command::CopyBlock { src, dst, len_bytes, .. } => {
+                E::new("copy_block", "compute").bytes(*len_bytes).ids([*src, *dst])
+            }
+            Command::CopyBatch { copies, .. } => {
+                let ids: Vec<u64> = copies.iter().flat_map(|c| [c.0, c.2]).collect();
+                let ptrs = resolve(&ids);
+                E::new("copy_batch", "compute")
+                    .bytes(copies.iter().map(|c| c.4).sum())
+                    .ids(ids)
+                    .ptrs(ptrs)
+            }
+            Command::Sync { .. } => E::new("sync", ""),
+            Command::GraphBegin { .. } => E::new("graph_begin", ""),
+            Command::GraphEnd { .. } => E::new("graph_end", ""),
+            Command::GraphLaunch { .. } => E::new("graph_launch", "compute"),
+            Command::AllocPinned { bytes, .. } => E::new("alloc_pinned", "").bytes(*bytes),
+            Command::Close { .. } => E::new("close", ""),
         }
     }
 
@@ -210,12 +326,16 @@ impl GpuServer {
         let ctx = GpuCtx::new(&self.selector, self.diag.clone(), self.actor_tag as u32, self.sink);
         match ctx {
             Ok(c) => {
-                if let Some(boot) = self.boot.take() {
-                    let _ = boot.send(Ok(()));
-                }
                 self.ctx = Some(c);
                 // M4 cutover:算子注册表 boot 装配(P4 装配门;捕获窗前 ——
                 // "捕获内首次初始化"事故类结构性消灭)。失败 = 拒启。
+                //
+                // ⚠️ **boot 握手点(2026-10-15 修正)**:原实现把 `boot.send(Ok)`
+                // 放在"设备 ctx 上线"处 —— 而注册表装配(P4 门)**在它之后** ⇒
+                // 门拒启时握手已 Ok,拒启被掩盖:`spawn_with` 返回成功、引擎继续
+                // 启动、向已退出的 server 发命令 → 引擎线程卡住 → `ready` 永不发
+                // → **主进程永挂且无监听**(实测:门触发时 54 线程存活 / health 无响应 /
+                // warn 档下零输出)。现握手移到**boot 全链成功之后**。
                 {
                     let mut res = GpuRes {
                         actor_tag: self.actor_tag,
@@ -238,11 +358,24 @@ impl GpuServer {
                     match r {
                         Ok(reg) => self.registry = Some(reg),
                         Err(e) => {
-                            // 拒启必须可见(否则只剩"族被 drop"的兜底告警,查不到原因)
-                            self.sink.logf(owl_shared::log::LVL_INFO, "kernels", format_args!("❌ 算子注册表装配失败(拒启): {e}"));
-                            return Err(format!("算子注册表装配失败(拒启): {e}"));
+                            // 拒启必须可见:LVL_ERROR(任何档位都在门内)+ **上握手**
+                            // (否则 spawn_with 拿不到失败原因,只剩"通道关闭")
+                            let msg = format!("算子注册表装配失败(拒启): {e}");
+                            self.sink.logf(
+                                owl_shared::log::LVL_ERROR,
+                                "kernels",
+                                format_args!("❌ {msg}"),
+                            );
+                            if let Some(boot) = self.boot.take() {
+                                let _ = boot.send(Err(msg.clone()));
+                            }
+                            return Err(msg);
                         }
                     }
+                }
+                // ★ boot 全链成功 ⇒ 才发"就绪"(引擎侧此刻才可安全发命令)
+                if let Some(boot) = self.boot.take() {
+                    let _ = boot.send(Ok(()));
                 }
             }
             Err(e) => {
@@ -442,7 +575,12 @@ impl GpuServer {
     }
 
     fn dispatch_inner(&mut self, cmd: Command) {
-        // G2 护栏:捕获期间仅放行「Launch / Alloc(切 slab)」—— 二者由
+        // **发射账**(2026-10-14):派发前记一条 —— 得到"host 视角的事实发射序
+        // + 流归属 + 块地址"。关账(容量 0)= 此处一个 None 判定,零开销。
+        if let Some(tr) = self.trace.as_ref() {
+            let e = self.trace_entry_of(&cmd);
+            tr.push(e);
+        }        // G2 护栏:捕获期间仅放行「Launch / Alloc(切 slab)」—— 二者由
         // 路由策略天然落在捕获流(COMPUTE);其余(搬运/同步/图操作)一律
         // 结构化拒绝 —— 它们或含非法捕获语义,或污染捕获拓扑。
         if self.ctx().capture_stream() {
@@ -592,6 +730,7 @@ impl GpuServer {
         if self.ctx().capture_stream() {
             let result = (|| {
                 let id = self.ctx_mut().carve_block(n_bytes)?;
+                self.trace_alloc_done(id);
                 if zero {
                     let stream = self.ctx().stream(STREAM_COMPUTE)?.clone();
                     let (dptr, _) = self.ctx().block_ptr(id, &stream)?;
@@ -624,15 +763,19 @@ impl GpuServer {
                         .memset_zeros(&mut slice)
                         .map_err(|e| ModelError::Msg(format!("alloc memset: {e:?}")))?;
                 }
-                // 诊断开关(OWL_LAUNCH_SYNC=1):alloc/memset 后同步归因
-                if self.probes.launch_sync {
+                // 诊断开关(sync_bit::ALLOC):alloc/memset 后同步归因
+                if self.diag.sync_at(owl_shared::config::sync_bit::ALLOC) {
                     if let Err(e) = stream.synchronize() {
                         return Err(ModelError::Msg(format!(
                             "alloc-sync(n={n_bytes}): {e:?}"
                         )));
                     }
                 }
-                Ok(Bytes::new(self.ctx_mut().new_block(slice), elems))
+                let id = self.ctx_mut().new_block(slice);
+                // 发射账:**分配落定**记 id + 设备地址(trace 条目 alloc 本身
+                // 无 id —— 生命周期判据要它才能把地址钉到块上)
+                self.trace_alloc_done(id);
+                Ok(Bytes::new(id, elems))
             });
         ack.send(result);
     }
@@ -654,6 +797,8 @@ impl GpuServer {
             self.sink.logf(owl_shared::log::LVL_DEBUG, "cap-prof", format_args!("memset_zero {}B block{block}", len_bytes));
         }
         let result = (|| {
+            // 边界校验(2026-10-15 补口):越界写会落到邻块 —— 设备内无保护
+            self.ctx().check_range(block, offset_bytes, len_bytes, "memset")?;
             let (dptr, _) = self.ctx().block_ptr(block, &stream).map_err(|e| {
                 // 带上块 id(谁在 memset 一个不存在的块;DeadBlock 定位)
                 ModelError::Msg(format!("[memset-arg] id={block} len={len_bytes} :: {e}"))
@@ -711,11 +856,11 @@ impl GpuServer {
                 _ => format!("gpu.{name}"),
             };
             let t0 = std::time::Instant::now();
-            self.handle_launch_inner(msg, ack);
+            self.handle_launch_inner(msg, ack);           // FIXME: 计时器使用宏, 改成运行时0开销的形式
             if let Ok(stream) = self.ctx().stream(STREAM_COMPUTE) {
                 let _ = stream.synchronize(); // 归因同步(错误由 sticky 面另报)
             }
-            let dt = t0.elapsed();
+            let dt: std::time::Duration = t0.elapsed();
             owl_shared::metrics::with_metrics_store(|s| {
                 s.timer_record_tag(&shape_tag, dt, file!(), 0);
                 s.timer_record_tag(&format!("gpu.{name}"), dt, file!(), 0);
@@ -832,7 +977,7 @@ impl GpuServer {
                 // 诊断开关(OWL_LAUNCH_SYNC=1):逐发射同步,sticky 错误
                 // 归属到具体核(2026-09-27 长 ctx ILLEGAL_ADDRESS 排查;
                 // 捕获期禁 sync —— 跳过,捕获正确性由哨兵③/④另保)
-                if self.probes.launch_sync && !capturing {
+                if self.diag.sync_at(owl_shared::config::sync_bit::LAUNCH) && !capturing {
 
                     if let Err(e) = stream.synchronize() {
                         return ack.take().unwrap().send(Err(ModelError::Msg(format!(
@@ -878,6 +1023,9 @@ impl GpuServer {
             Err(e) => return ack.send(Err(e)),
         };
         let result = (|| {
+            // 边界校验(2026-10-15 补口):设备内 dtod 无保护,源/目标两端各查
+            self.ctx().check_range(src, src_off_bytes, len_bytes, "copy-src")?;
+            self.ctx().check_range(dst, dst_off_bytes, len_bytes, "copy-dst")?;
             let (sptr, _) = self.ctx().block_ptr(src, &stream)?;
             let (dptr, _) = self.ctx().block_ptr(dst, &stream)?;
             unsafe {
@@ -906,6 +1054,9 @@ impl GpuServer {
         };
         let result = (|| {
             for (src, src_off, dst, dst_off, len) in &copies {
+                // 边界校验(2026-10-15 补口;spec 快照 capture/restore 走本路)
+                self.ctx().check_range(*src, *src_off, *len, "copyb-src")?;
+                self.ctx().check_range(*dst, *dst_off, *len, "copyb-dst")?;
                 let (sptr, _) = self.ctx().block_ptr(*src, &stream)?;
                 let (dptr, _) = self.ctx().block_ptr(*dst, &stream)?;
                 unsafe {
@@ -1016,7 +1167,7 @@ impl owl_kernels::device::DeviceRes for GpuRes<'_> {
             })?;
         Ok(p)
     }
-    fn alloc(&mut self, bytes: usize, _tag: &'static str) -> Result<ScratchBuf, OpError> {
+    fn alloc(&mut self, bytes: usize, tag: &'static str) -> Result<ScratchBuf, OpError> {
         // 与旧 handler 同机制:stream.alloc_zeros(cudarc 直分配;捕获窗内
         // 由家族 grave 律保证不再分配 —— A1.7)。append-only 账本,物理
         // 释放 = server 销毁。
@@ -1025,11 +1176,33 @@ impl owl_kernels::device::DeviceRes for GpuRes<'_> {
             .map_err(|e| OpError::Launch { op: OP_RES.into(), stage: owl_kernels::contract::Stage::Load, detail: format!("scratch alloc: {e:?}") })?;
         use cudarc::driver::DevicePtr;
         let ptr = d.device_ptr(&stream).0;
+        // 入账:scratch 不在块账房(裸指针,不可 resolve)⇒ 账上只有这一条线索
+        self.note_device("fam_alloc", tag, bytes, &[ptr]);
         self.scratch.push((ptr, d));
         Ok(ScratchBuf { ptr, bytes })
     }
     fn capturing(&self) -> Result<bool, OpError> {
         Ok(self.ctx.capture_stream())
+    }
+    /// **家族面设备动作入账**(2026-10-15 A13 补漏):家族 runtime 的设备动作
+    /// 不产生 `Command` ⇒ 发射账(§十三)看不见它们 —— A13 藏一整轮的直接原因。
+    /// 本覆写把家族面写进**同一个环**(命令面 `cmd` 与家族面 `kind` 并列可读),
+    /// 且 `stream = "family"` 一眼可辨;地址一并落账(生命周期判据的钥匙)。
+    ///
+    /// 纪律:关账(容量 0)仅一次 `OnceLock` 判定;`ptrs` 为空时**不分配**内存。
+    fn note_device(&mut self, kind: &'static str, name: &str, bytes: usize, ptrs: &[u64]) {
+        let Some(tr) = crate::trace::get() else { return };
+        if !tr.enabled() {
+            return;
+        }
+        let mut e = crate::trace::TraceEntry::new(kind, "family").bytes(bytes);
+        if !name.is_empty() {
+            e = e.name(name);
+        }
+        if !ptrs.is_empty() {
+            e = e.ptrs(ptrs.iter().copied());
+        }
+        tr.push(e);
     }
     fn record_capture(&mut self, _note: owl_kernels::device::LaunchNote) -> Result<(), OpError> {
         // 捕获登记 = CUDA stream capture 原生节点(旧 handler 同款零显式
@@ -1039,6 +1212,13 @@ impl owl_kernels::device::DeviceRes for GpuRes<'_> {
     fn upload(&mut self, dst: u64, src: &[u8]) -> Result<(), OpError> {
         let stream = self.stream()?;
         let capturing = self.ctx.capture_stream();
+        // 入账(家族面唯一账线索;A13 藏一轮的直接原因)
+        self.note_device(
+            "fam_upload",
+            if capturing { "capture" } else { "eager" },
+            src.len(),
+            &[dst],
+        );
         let target = self
             .scratch
             .iter()
@@ -1062,10 +1242,46 @@ impl owl_kernels::device::DeviceRes for GpuRes<'_> {
         } else {
             // 2026-10-09 崩案修复试刀:async memcpy_htod 静默不写(meta 表读回全零)
             // → 改同步 result API 直写
-            unsafe {
-                cudarc::driver::result::memcpy_htod_sync(dst, src)
+            //
+            // ⚠️ **A13(2026-10-15,compute-sanitizer 定谳)**:上述诊断是
+            // **回读侧** NULL 流无序的假象(`download` = `memcpy_dtoh_sync`,
+            // 与 compute 流无跨流序 ⇒ 读回全零;与 gdn_chunked.rs 453 行记载
+            // 同病史);改上传为同步反而**把写侧的序彻底抹掉** —— 目标地址
+            // 来自 `stream.alloc`(流序异步分配),NULL 流同步拷贝与它无任何
+            // 序,会写进**尚未落定**的内存(memcheck 判据:`Use-before-alloc`,
+            // 命中点即本函数与 `upload_block`)。
+            // 定谳实验(同 boot、同 prompt、只切一位):mask=0 → 末行 logits
+            // `28`/gap 0.91 + 不发工具;mask=64(拷贝前排空)→ `760`/gap 4.33
+            // + 真发 tool_calls;两者逐字节差 = 一位之差。
+            if self.ctx.diag.sync_at(owl_shared::config::sync_bit::SCRATCH_SYNC_UP) {
+                stream.synchronize().map_err(|e| OpError::Launch {
+                    op: OP_RES.into(),
+                    stage: owl_kernels::contract::Stage::Store,
+                    detail: format!("upload pre-sync: {e:?}"),
+                })?;
             }
-            .map_err(|e| OpError::Launch { op: OP_RES.into(), stage: owl_kernels::contract::Stage::Store, detail: format!("upload sync: {e:?}") })?;
+            // 生产语义(本分支):**与分配同流的 async 拷贝** —— 分配 → 拷贝 →
+            // 后续核 在 COMPUTE 流上严格有序(与捕获分支同一 API;原实现的
+            // 不对称仅此而已)。代价 = 0(实测 TTFT 不变)。
+            // `SCRATCH_UP_LEGACY` = 退回旧 NULL 流同步拷贝(**专门复现 A13**);
+            // `SCRATCH_SYNC_UP` = 保留的归因位(拷贝前排空 COMPUTE)。
+            if self.ctx.diag.sync_at(owl_shared::config::sync_bit::SCRATCH_UP_LEGACY) {
+                unsafe { cudarc::driver::result::memcpy_htod_sync(dst, src) }.map_err(|e| {
+                    OpError::Launch {
+                        op: OP_RES.into(),
+                        stage: owl_kernels::contract::Stage::Store,
+                        detail: format!("upload sync(legacy NULL 流): {e:?}"),
+                    }
+                })?;
+            } else {
+                unsafe { crate::ffi::memcpy_htod_async(dst, src, stream.cu_stream()) }.map_err(
+                    |e| OpError::Launch {
+                        op: OP_RES.into(),
+                        stage: owl_kernels::contract::Stage::Store,
+                        detail: format!("upload async(same-stream): {e:?}"),
+                    },
+                )?;
+            }
             let _target = target; // 保留账本句柄(析构语义不变)
             Ok(())
         }
@@ -1093,21 +1309,48 @@ impl owl_kernels::device::DeviceRes for GpuRes<'_> {
         b: &owl_kernels::contract::Bytes,
         src: &[u8],
     ) -> Result<(), OpError> {
-        // 账本块上传(自检面):resolve 拿到块指针 → 同步 htod。
+        // 账本块上传(自检面):resolve 拿到块指针 → htod。
         // 与 `upload`(scratch-only 白名单)分开:这里写的是**账房在册块**。
+        //
+        // ⚠️ **A13 同族(2026-10-15)**:原为 `memcpy_htod_sync`(NULL 流),
+        // 而目标块来自 `alloc_block` 的 `stream.alloc`(流序异步分配)——
+        // compute-sanitizer 就在本函数上抓到 `Use-before-alloc`(写进尚未
+        // 落定的内存 ⇒ 静默丢写)。改为**与分配同流的 async 拷贝**;
+        // 调用方 `download` 已自带 COMPUTE 排空,回读序两侧都齐。
         let p = self.resolve(b)?;
-        // (sync 变体不吃 stream —— 同步语义;回执即落地)
-        unsafe { crate::ffi::memcpy_htod_sync(p, src) }.map_err(|e| {
-            OpError::Launch {
+        let stream = self.stream()?;
+        self.note_device("fam_upload_block", "", src.len(), &[p]);
+        if self.ctx.diag.sync_at(owl_shared::config::sync_bit::SCRATCH_UP_LEGACY) {
+            unsafe { crate::ffi::memcpy_htod_sync(p, src) }.map_err(|e| OpError::Launch {
                 op: OP_RES.into(),
                 stage: owl_kernels::contract::Stage::Store,
-                detail: format!("upload_block(id={}, {}B): {e:?}", b.id, src.len()),
-            }
-        })
+                detail: format!("upload_block(id={}, {}B, legacy sync): {e:?}", b.id, src.len()),
+            })
+        } else {
+            unsafe { crate::ffi::memcpy_htod_async(p, src, stream.cu_stream()) }.map_err(|e| {
+                OpError::Launch {
+                    op: OP_RES.into(),
+                    stage: owl_kernels::contract::Stage::Store,
+                    detail: format!("upload_block(id={}, {}B, async): {e:?}", b.id, src.len()),
+                }
+            })
+        }
     }
 
     fn download(&mut self, src: u64, dst: &mut [u8]) -> Result<(), OpError> {
         // 装配期自检回读(同步语义:回执即落地;非热路径)
+        //
+        // ⚠️ **A13 同族(2026-10-15)**:`memcpy_dtoh_sync` 走 **NULL 流**,
+        // 与 COMPUTE 流无序 ⇒ 直接回读会拿到半写入/旧值/全零(本仓
+        // 2026-10-09 “meta 表读回全零”与 2026-10-13 同病史两次踩中,
+        // `gdn_chunked.rs` 453 行曾就地补 sync 绕过)。此处补齐序:**先排空
+        // COMPUTE**(生产方全在该流上),再做同步回读。
+        self.stream()?.synchronize().map_err(|e| OpError::Launch {
+            op: OP_RES.into(),
+            stage: owl_kernels::contract::Stage::Load,
+            detail: format!("download pre-sync: {e:?}"),
+        })?;
+        self.note_device("fam_download", "", dst.len(), &[src]);
         // SAFETY:dst 是 host 可写切片,src 是本账本块/scratch 的设备虚地址,
         // 长度由 dst 决定(调用方负责 src 侧可读范围 ≥ dst.len();自检面
         // 按自己的分配尺寸回读)。

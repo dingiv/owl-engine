@@ -22,6 +22,17 @@ impl GpuServer {
         };
         match self.try_htod(&stream, &data) {
             Ok((id, buf)) => {
+                // 发射账:上传**落定**记 id + 设备地址(A13 类"跨流 UAF"的钥匙:
+                // 该地址的 COMPUTE 读者是否在本次落定**之前**就已发射)
+                if let Some(tr) = self.trace.as_ref() {
+                    let ptr = self.ctx().block_ptr(id, &stream).map(|(p, _)| p).unwrap_or(0);
+                    tr.push(
+                        crate::trace::TraceEntry::new("htod_landed", "h2d")
+                            .bytes(n)
+                            .id(id)
+                            .ptrs([ptr]),
+                    );
+                }
                 // 码头随 finish 存活至搬运完成后归还池(派发线程执行)
                 let mut cb_ack = ack.take();
                 let pool = self.pool.clone();
@@ -64,7 +75,7 @@ impl GpuServer {
             .map_err(|e| ModelError::Msg(format!("htod async: {e:?}")))?;
         // 诊断开关(OWL_LAUNCH_SYNC=1):DMA 后同步归因(H2D 错误平时
         // 无条件 Ok 回执,sticky 晚冒 —— 2026-09-27 排查补)
-        if self.probes.launch_sync {
+        if self.diag.sync_at(owl_shared::config::sync_bit::HTOD) {
             stream
                 .synchronize()
                 .map_err(|e| ModelError::Msg(format!("htod-sync(n={n}): {e:?}")))?;
@@ -114,6 +125,14 @@ impl GpuServer {
             Ok((p, _)) => p,
             Err(e) => return ack.take().unwrap().send(Err(e)),
         };
+        // 边界校验(2026-10-15 补口;装载期流式写权重走本路)
+        if let Err(e) = self
+            .ctx()
+            .check_range(dst.id, offset_bytes, len_bytes, "upload-pinned")
+        {
+            self.pool.put(buf);
+            return ack.take().unwrap().send(Err(e));
+        }
         let t_dma = std::time::Instant::now();
         let dma = unsafe {
             memcpy_htod_async(
@@ -170,6 +189,16 @@ impl GpuServer {
         let mut pending: Vec<Box<dyn owl_iface::contract::PinnedRegion + Send>> =
             Vec::with_capacity(writes.len());
         for (block, offset_bytes, data) in &writes {
+            // 边界校验(2026-10-15 补口;S1 批量分块写:decode 每步装填)
+            if let Err(e) = self
+                .ctx()
+                .check_range(*block, *offset_bytes, data.len(), "htod-chunks")
+            {
+                for b in pending {
+                    self.pool.put(b);
+                }
+                return ack.take().unwrap().send(Err(e));
+            }
             let dptr_base = match self.ctx().block_ptr(*block, &stream) {
                 Ok((p, _)) => p,
                 Err(e) => {
@@ -237,6 +266,14 @@ impl GpuServer {
             Err(e) => return ack.send(Err(e)),
         };
         let mut ack = Some(ack);
+        // 边界校验(2026-10-15 补口):write_block 是 decode 每步高频小写路径,
+        // 越界会静默落邻块(设备内无保护)
+        if let Err(e) = self
+            .ctx()
+            .check_range(block, offset_bytes, data.len(), "htod-chunk")
+        {
+            return ack.take().unwrap().send(Err(e));
+        }
         let dptr_base = match self.ctx().block_ptr(block, &stream) {
             Ok((p, _)) => p,
             Err(e) => return ack.take().unwrap().send(Err(e)),
@@ -318,7 +355,7 @@ impl GpuServer {
             Err(e) => return ack.send(Err(e)),
         };
         let t_d2h = (want_bytes <= 64 && self.probes.d2h_prof).then(std::time::Instant::now);
-        if self.diag.legacy_sync {
+        if self.diag.sync_at(owl_shared::config::sync_bit::DTOH) {
             if let Err(e) = compute.synchronize().map_err(|e| ModelError::Msg(format!("sync: {e:?}"))) {
                 return ack.send(Err(e));
             }

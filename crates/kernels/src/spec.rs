@@ -27,7 +27,7 @@
 //! - [`crate::driver`] 的 `KernelPick` 携带 `&'static KernelMeta`(算子身份),
 //!   不再携带裸名字字符串。
 
-use crate::contract::{Arg, Dtype, Law, OpError};
+use crate::contract::{Arg, Dtype, Law, OpError, OpId};
 use crate::bootcheck::{BootCheck, CheckCtx};
 
 // ============================================================================
@@ -450,10 +450,31 @@ pub enum Determinism {
 // §4 算子契约 trait(关联常量;编译期擦除)
 // ============================================================================
 
+/// **原生哨兵**(非族):`KernelSpec::FAMILY` 的缺省值 —— AOT cubin 直发。
+///
+/// 与任何族 id 都不相等;boot 期用它判"这个算子归谁执行"。它不是族字面量,
+/// 而是"**无族**"标记,故住 spec 面(族名字面量住各族 `family/<族>.rs`)。
+pub const NATIVE: &str = "native";
+
 /// 单算子契约。**只有关联常量 + 一个可默认的静态方法**(无 `&self`):
 /// 带关联常量的 trait 不能做 trait 对象(rustc E0038 实证),这不是代价 ——
 /// 它把算子侧彻底静态化,元数据在编译期擦成 [`KernelMeta`] 纯数据表。
 pub trait KernelSpec: 'static {
+    /// **执行家族**(2026-10-15;声明驱动路由)。
+    ///
+    /// 缺省 = [`NATIVE`](crate::spec::NATIVE)(原生 AOT 直发);
+    /// 家族算子填**族 id**(= `KernelFamily::id()` 的 `OpId`)。
+    ///
+    /// 为什么必须有这一维(旧设计只有反向的 `KernelFamily::ops()`):
+    /// 1. **归属在声明处可见** —— 读 `ops/marlin.rs` 就能看出它归 `MarlinRuntime`,
+    ///    不必翻到族侧;
+    /// 2. 族 `ops()` 可以**派生**(`ops::of_family(id)`)而不是手写一张表 ⇒
+    ///    消灭 `names() = 族主名 ∪ ops()` 那个"部分建表"陷阱
+    ///    (2026-10-13 实测事故:FI f16 主名 + gdn_scalar 静默从路由表消失);
+    /// 3. boot 期建 **名字 → 族** 索引 ⇒ `execute` 从"线性扫族×名"变 O(1);
+    /// 4. 新增一条**声明驱动**的硬门:非 Native 的算子,其家族必须真实存在
+    ///    (否则那份元数据永远发不出去 —— 纯粹的摆设)。
+    const FAMILY: OpId = OpId(crate::spec::NATIVE);
     /// 线格式入口名(与某个 `.cu` 入口一对一)
     const ENTRY: &'static str;
     /// `.cu` 源码(`include_str!`;与算子同目录)
@@ -485,6 +506,7 @@ pub trait KernelSpec: 'static {
 /// 实测可行:`const fn` + 关联常量 + trait 方法取 `fn` 指针,全在 const 上下文内。
 pub const fn meta_of<T: KernelSpec>() -> KernelMeta {
     KernelMeta {
+        family: T::FAMILY,
         entry: T::ENTRY,
         src: T::SRC,
         params: T::PARAMS,
@@ -500,6 +522,8 @@ pub const fn meta_of<T: KernelSpec>() -> KernelMeta {
 
 /// 擦除后的算子元数据(纯数据;可在 `static` 表里 const 构造)
 pub struct KernelMeta {
+    /// **执行家族**(`names::NATIVE` = 原生 AOT 直发;否则 = 族 id)
+    pub family: OpId,
     pub entry: &'static str,
     pub src: &'static str,
     pub params: &'static [Param],
@@ -518,6 +542,7 @@ impl std::fmt::Debug for KernelMeta {
     /// 诊断关心的是名字/槽序/律
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KernelMeta")
+            .field("family", &self.family.0)
             .field("entry", &self.entry)
             .field("slots", &self.args_str())
             .field("laws", &self.laws)
@@ -529,6 +554,11 @@ impl std::fmt::Debug for KernelMeta {
 }
 
 impl KernelMeta {
+    /// 是否家族算子(非原生)
+    pub fn is_family(&self) -> bool {
+        self.family.0 != crate::spec::NATIVE
+    }
+
     /// 槽序 token 序列(由 [`PARAMS`](Self::params) 派生 —— 零第二份手抄)
     pub fn slot_tokens(&self) -> Vec<&'static str> {
         self.params.iter().map(token_of).collect()
@@ -560,6 +590,24 @@ impl KernelMeta {
     /// 参数名(槽位诊断用;越界给 `?`)
     pub fn param_name(&self, i: usize) -> &'static str {
         self.params.get(i).map(|p| p.name).unwrap_or("?")
+    }
+
+    /// **槽序名序列**(唯一可读视图;回归锁/工具/文档面用)。
+    ///
+    /// 与 [`args_str`](Self::args_str)(token 串)互补:token 串看类型,名序列看语义。
+    pub fn param_names(&self) -> Vec<&'static str> {
+        self.params.iter().map(|p| p.name).collect()
+    }
+
+    /// **按名查槽下标**(声明面寻址)。
+    ///
+    /// 这是"`parse`/builder 按名取槽"(待办)的前置件 —— 现有手写解析器用
+    /// 字面下标(`blocks[0]`/`scalars[1]`),本方法让它们可改成
+    /// `slots.block("gate")?`,从而与 `PARAMS` 同源。
+    /// 当前用途:`ops::tests::slot_order_lock` 把**解析器/装配器隐含的序**
+    /// 与 `PARAMS` 钉死 —— 改 `PARAMS` 而不同步两侧 = 测试立刻红。
+    pub fn slot_index(&self, name: &str) -> Option<usize> {
+        self.params.iter().position(|p| p.name == name)
     }
 
     /// 发射期检查(统一入口;**server 唯一调用点**)

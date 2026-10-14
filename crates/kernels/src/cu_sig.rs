@@ -71,6 +71,7 @@ pub fn params_at(text: &str, start: usize, name: &str, kind: &str) -> Option<Str
     Some(map_params(&text[start..end], name, kind))
 }
 
+// FIXME: 移除一个无用的函数
 pub fn parse_cu_sig(src: &str, name: &str) -> Option<String> {
     // 剥行注释(形参注记含逗号/括号,会干扰边界与切分)+ **折叠宏续行**
     // (`\` + 换行 → 空格:宏体形参住在续行里,不折叠则形参串被反斜杠污染)

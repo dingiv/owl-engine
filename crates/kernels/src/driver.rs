@@ -1132,9 +1132,9 @@ pub mod attn {
     pub fn fi_prefill(fp8kv: bool) -> KernelPick {
         KernelPick {
             name: if fp8kv {
-                crate::contract::names::PREFILL_FI_FP8KV
+                crate::family::flashinfer::PREFILL_FI_FP8KV
             } else {
-                crate::contract::names::PREFILL_FI
+                crate::family::flashinfer::PREFILL_FI
             },
             shape: FOREIGN,
         }
@@ -1529,11 +1529,11 @@ pub mod marlin {
     /// AWQ 6 父(xs,qw,sc,zs,ws,c_tmp)/ f16·bf16 5 父;bf16 由 dt 路由)
     pub fn w4a16(shapes: &[Vec<usize>], dt: DType) -> KernelPick {
         let name = if shapes.len() == 6 {
-            crate::contract::names::GEMM_W4A16_AWQ
+            crate::family::marlin::GEMM_W4A16_AWQ
         } else if dt == DType::BF16 {
-            crate::contract::names::GEMM_W4A16_BF16
+            crate::family::marlin::GEMM_W4A16_BF16
         } else {
-            crate::contract::names::GEMM_W4A16
+            crate::family::marlin::GEMM_W4A16
         };
         KernelPick { name, shape: FOREIGN }
     }

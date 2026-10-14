@@ -12,6 +12,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+
+    // FIXME: 这个是做什么的? 不允许依赖环境变量 CARGO_FEATURE_CUPTI
     println!("cargo:rerun-if-changed=native/cupti_shim.c");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
 

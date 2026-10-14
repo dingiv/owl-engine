@@ -15,7 +15,9 @@ use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec,
 pub struct MarlinGemmW4a16Awq;
 
 impl KernelSpec for MarlinGemmW4a16Awq {
-    const ENTRY: &'static str = crate::contract::names::GEMM_W4A16_AWQ;
+    /// 执行家族(声明驱动路由;见 `KernelSpec::FAMILY`)
+    const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::marlin::GEMM_W4A16);
+    const ENTRY: &'static str = crate::family::marlin::GEMM_W4A16_AWQ;
     /// foreign(静态链接):无 `.cu` 源
     const SRC: &'static str = "";
     const PARAMS: &'static [Param] = &[
@@ -50,7 +52,9 @@ impl KernelSpec for MarlinGemmW4a16Awq {
 pub struct MarlinGemmW4a16Bf16;
 
 impl KernelSpec for MarlinGemmW4a16Bf16 {
-    const ENTRY: &'static str = crate::contract::names::GEMM_W4A16_BF16;
+    /// 执行家族(声明驱动路由;见 `KernelSpec::FAMILY`)
+    const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::marlin::GEMM_W4A16);
+    const ENTRY: &'static str = crate::family::marlin::GEMM_W4A16_BF16;
     const SRC: &'static str = "";
     const PARAMS: &'static [Param] = &[
         Param::t_in("a", Dtype::BF16, 2),
@@ -73,7 +77,9 @@ impl KernelSpec for MarlinGemmW4a16Bf16 {
 pub struct MarlinGemmW4a16F16;
 
 impl KernelSpec for MarlinGemmW4a16F16 {
-    const ENTRY: &'static str = crate::contract::names::GEMM_W4A16;
+    /// 执行家族(声明驱动路由;见 `KernelSpec::FAMILY`)
+    const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::marlin::GEMM_W4A16);
+    const ENTRY: &'static str = crate::family::marlin::GEMM_W4A16;
     const SRC: &'static str = "";
     const PARAMS: &'static [Param] = &[
         Param::t_in("a", Dtype::F16, 2),

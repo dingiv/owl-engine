@@ -21,6 +21,8 @@ pub fn kv_manifest_gate(
     quant: crate::env::KvQuant,
     fi_on: bool,
 ) -> Result<(), crate::contract::ModelError> {
+
+    // FIXME: 非常不优雅的实现, 需要处理, 字面量在后续的维护处理中，非常的麻烦
     let fp8: &[&str] = &[
         "owl_reshape_and_cache_fp8kv_knhd",              // K0 写(kNHD 单池)
         "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd128", // chunked 读 hd128
@@ -55,8 +57,8 @@ pub fn kv_manifest_gate(
     // 自校验 is_fi),不在 models 登记表(零 kernels 依赖律)。仅信息行。
     if fi_on {
         let fi_name = match quant {
-            crate::env::KvQuant::Fp8E4M3 => "flashinfer_prefill_paged_fp8kv",
-            _ => "flashinfer_prefill_paged_f16",
+            crate::env::KvQuant::Fp8E4M3 => owl_kernels::family::flashinfer::PREFILL_FI_FP8KV,
+            _ => owl_kernels::family::flashinfer::PREFILL_FI,
         };
         owl_shared::log_info!("kv-manifest", "FI prefill = {fi_name}(server plan 路径,适配器自校验)");
     }

@@ -135,3 +135,38 @@ pub fn step_json() -> Value {
         "waiting": s.waiting,
     })
 }
+
+/// **发射账投影**(`GET /debug/launches[/<n>[/<kind>]]`;见 `owl_cuda::trace` 模块头)。
+/// `kind` 可匹配命令类(`launch`/`htod`/`dtoh`/`free`…)、流名(`compute`/`h2d`/`d2h`)
+/// 或核名子串。`ptrs` 以十六进制给出 —— 地址复用是跨流 UAF 类缺陷的唯一钥匙。
+pub fn launches_json(n: usize, kind: Option<&str>) -> Value {
+    let (in_ring, total, cap) = owl_cuda::trace::stats();
+    let rows: Vec<Value> = owl_cuda::trace::recent(n, kind)
+        .into_iter()
+        .map(|e| {
+            json!({
+                "seq": e.seq,
+                "t_us": e.host_ns / 1000,
+                "cmd": e.cmd,
+                "stream": e.stream,
+                "name": e.name,
+                "grid": [e.grid.0, e.grid.1, e.grid.2],
+                "block": [e.block.0, e.block.1, e.block.2],
+                "smem": e.smem,
+                "bytes": e.bytes,
+                "ids": e.ids,
+                "out_id": e.out_id,
+                "ptrs": e.ptrs.iter().map(|p| format!("{p:#x}")).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    json!({
+        "enabled": cap > 0,
+        "capacity": cap,
+        "in_ring": in_ring,
+        "total": total,
+        "n": n,
+        "kind": kind,
+        "rows": rows,
+    })
+}

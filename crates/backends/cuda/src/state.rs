@@ -29,6 +29,10 @@ pub struct DiagOpts {
     /// dtoh 事件定向等待)。用作性能 A/B 与出事回退。
     /// 由 `cuda.launch_sync` 携带(该档本就是“全同步归因”、性能杀手勿常开)。
     pub legacy_sync: bool,
+    /// **同步点分解掩码**(2026-10-15):6 处同步点逐位开关,见
+    /// [`owl_shared::config::sync_bit`]。`launch_sync = true` ⇒ `ALL`。
+    /// 归因用:先看哪一位单独就能把病臂治好,再谈修法(靶子 = +17%)。
+    pub sync_mask: u32,
     /// server 提交计时(server probes 面;DiagOpts 一体携带免双参)
     pub launch_time: bool,
     /// dtoh 分相(server probes 面)
@@ -41,26 +45,40 @@ pub struct DiagOpts {
     /// 捕获 slab 固定档 MiB(None = warmup 计量定量;原 OWL_CAPTURE_SLAB_MB
     /// —— 24G 贴顶的 27B + spec 双图场景,verify 图按需调小)
     pub capture_slab_mb: Option<usize>,
+    /// **发射账容量**(cuda.trace_ring;0 = 关)。>0 ⇒ server 记最近 N 条
+    /// 命令(launch/htod/dtoh/alloc/free/memset/copy;见 `crate::trace`)。
+    pub trace_ring: usize,
     /// **生产算子白名单**(dispatch.allowed_ops;None/空 = 门关)。
     /// `Arc` = 与 server 主循环共享,逐发射判定零克隆。
     pub allowed_ops: Option<std::sync::Arc<Vec<String>>>,
 }
 
 impl DiagOpts {
+    /// 同步点查询(归因面):该位是否武装。热路径只是一次位与。
+    pub fn sync_at(&self, bit: u32) -> bool {
+        self.sync_mask & bit != 0
+    }
+
     /// **入口侧组装器**:自全量配置对象显式组装(设备路径零 env 读取)
     pub fn from_config(cfg: &owl_shared::config::OwlConfig) -> Self {
+        use owl_shared::config::sync_bit;
         let c = &cfg.cuda;
+        // 同步点分解:launch_sync 仍是「全同步」的合称(向后兼容/回退),
+        // sync_mask 逐点归因(生产缺省 0 = 全关)。
+        let mask = if c.launch_sync { sync_bit::ALL } else { c.sync_mask };
         Self {
             srv_timing: c.srv_timing,
             cap_prof: c.cap_prof,
-            launch_sync: c.launch_sync,
+            launch_sync: mask & (sync_bit::ALLOC | sync_bit::LAUNCH) != 0,
             free_legacy: c.free_legacy,
-            legacy_sync: c.launch_sync,
+            legacy_sync: mask & (sync_bit::DTOH | sync_bit::FENCE) != 0,
+            sync_mask: mask,
             launch_time: c.launch_time,
             d2h_prof: c.d2h_prof,
             gpu_prof: c.gpu_prof,
             graph_flags: c.graph_flags.to_bits(),
             capture_slab_mb: c.capture_slab_mb,
+            trace_ring: c.trace_ring,
             allowed_ops: cfg
                 .dispatch
                 .allowed_ops
@@ -632,8 +650,8 @@ impl GpuCtx {
         if prof {
             self.sink.logf(owl_shared::log::LVL_DEBUG, "gl-prof", format_args!("gid={gid} launch={:?}", t0.unwrap().elapsed()));
         }
-        // 诊断开关(diag.launch_sync):回放后同步归因(烘焙指针消费者)
-        if self.diag.launch_sync {
+        // 诊断开关(diag.sync_at(G RAPH)):回放后同步归因(烘焙指针消费者)
+        if self.diag.sync_at(owl_shared::config::sync_bit::GRAPH) {
             let t1 = std::time::Instant::now();
             stream
                 .synchronize()
@@ -745,6 +763,36 @@ impl GpuCtx {
         Ok(self.blocks.get(&id).ok_or(ModelError::DeadBlock { id })?.bytes)
     }
 
+    /// **搬运/清零/拷贝类命令的统一边界校验**(2026-10-15;A13 审计补口)。
+    ///
+    /// 判据:`offset + len ≤ block_len`(块账本 = 字节口径)。
+    ///
+    /// # 为什么必须在这一层收
+    ///
+    /// 设备内**无越界保护**:`ptr + offset` 一旦超尾,写就落到**邻块**——
+    /// 而池复用使邻块身份随布局变 ⇒ 表现为"布局敏感的确定性错值"
+    /// (A13 期间"邻块 clobber"曾是头号嫌疑,最后靠 compute-sanitizer 才排除)。
+    /// 与其每次靠仪器挖,不如在**唯一咽喉**(server 命令面)把它变成结构化拒绝。
+    /// 补口前实测:`Launch` 有 L3 全量校验,而 `HtodChunk(s)/UploadPinned/
+    /// MemsetZero/CopyBlock/CopyBatch` **六条一律无边界校验**。
+    pub(super) fn check_range(
+        &self,
+        id: u64,
+        off: usize,
+        len: usize,
+        what: &str,
+    ) -> Result<(), ModelError> {
+        let n = self
+            .block_len(id)
+            .map_err(|e| ModelError::Msg(format!("[{what}-arg] id={id} :: {e}")))?;
+        if !range_fits(n, off, len) {
+            return Err(ModelError::Msg(format!(
+                "[{what}-arg] id={id} 越界:offset={off} + len={len} > block_len={n}"
+            )));
+        }
+        Ok(())
+    }
+
     /// 中间块回收(E2a):移除 Owned 块(CudaSlice drop → 流序
     /// free_async 归还设备池);Carved 块(slab 切片)跳过不删;
     /// 未知 id 容错跳过(幂等)。返回实际回收数。
@@ -832,7 +880,7 @@ impl GpuCtx {
         for id in ids {
             let Some(e) = self.blocks.get(id) else { continue };
             let Block::Owned(slice) = &e.block else { continue };
-            if self.diag.legacy_sync {
+            if self.diag.sync_at(owl_shared::config::sync_bit::FENCE) {
                 for sid in [STREAM_H2D, STREAM_D2H] {
                     if let Some(s) = self.streams.get(&sid) {
                         if !out.iter().any(|p| Arc::ptr_eq(p, s)) {
@@ -1018,5 +1066,31 @@ mod tests {
     fn pack_is_injective_across_ledgers() {
         assert_ne!(pack_block_id(1, 11), pack_block_id(2, 11));
         assert_eq!(ledger_of(pack_block_id(3, 99)), 3);
+    }
+}
+
+/// **区间是否落在块内**(纯函数;`check_range` 的算术核 —— 可单测)。
+///
+/// 边界语义:`off + len == n` 合法(写满);`off + len > n` 越界;
+/// 溢出(`usize` 相加回绕)按越界处理(不可信输入不许回绕成小值)。
+pub(super) fn range_fits(n: usize, off: usize, len: usize) -> bool {
+    off.checked_add(len).map(|end| end <= n).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::range_fits;
+
+    /// 边界:恰好写满合法 / 超 1 字节越界 / 零长在尾合法 / 起点即越界 / 溢出拒绝
+    #[test]
+    fn range_fits_boundaries() {
+        assert!(range_fits(100, 0, 100), "恰好写满");
+        assert!(range_fits(100, 50, 50), "尾部对齐");
+        assert!(range_fits(100, 100, 0), "零长在尾(合法:不写)");
+        assert!(!range_fits(100, 0, 101), "超 1 字节");
+        assert!(!range_fits(100, 100, 1), "起点即越界");
+        assert!(!range_fits(100, 101, 0), "起点越界(零长也不放)");
+        assert!(!range_fits(usize::MAX, 1, usize::MAX), "相加溢出按越界");
+        assert!(!range_fits(0, 0, 1), "空块写入");
     }
 }

@@ -13,7 +13,9 @@ use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec,
 pub struct FiPrefillFp8kv;
 
 impl KernelSpec for FiPrefillFp8kv {
-    const ENTRY: &'static str = crate::contract::names::PREFILL_FI_FP8KV;
+    /// 执行家族(声明驱动路由;见 `KernelSpec::FAMILY`)
+    const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::flashinfer::PREFILL_FI);
+    const ENTRY: &'static str = crate::family::flashinfer::PREFILL_FI_FP8KV;
     /// foreign(预编 `.a`):无 `.cu` 源
     const SRC: &'static str = "";
     const PARAMS: &'static [Param] = &[
@@ -65,7 +67,9 @@ impl KernelSpec for FiPrefillFp8kv {
 pub struct FiPrefillF16;
 
 impl KernelSpec for FiPrefillF16 {
-    const ENTRY: &'static str = "flashinfer_prefill_paged_f16";
+    /// 执行家族(声明驱动路由;见 `KernelSpec::FAMILY`)
+    const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::flashinfer::PREFILL_FI);
+    const ENTRY: &'static str = crate::family::flashinfer::PREFILL_FI;
     /// foreign(预编 `.a`):无 `.cu` 源
     const SRC: &'static str = "";
     const PARAMS: &'static [Param] = &[

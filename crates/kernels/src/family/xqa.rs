@@ -26,10 +26,10 @@
 //!
 //! **workspace**:semaphores 与 scratch 由 runtime 持久持有(图内安全:
 //! 热路径零分配;参考实现 scratch 给 256MiB)。
-/// foreign-kernel 虚拟核名(server 分派臂;字面量住址 = contract::names)
-pub const VERIFY_XQA: &str = crate::contract::names::VERIFY_XQA;
+/// foreign-kernel 虚拟核名(server 分派臂;**字面量住址 = 本模块**)
+pub const VERIFY_XQA: &str = "owl_xqa_verify";
 /// 第二份实例化的虚拟核名(裸 decode q=1;见 cu/xqa/README.md 双实例化节)
-pub const DECODE_XQA: &str = crate::contract::names::DECODE_XQA;
+pub const DECODE_XQA: &str = "owl_xqa_decode";
 /// 槽序契约(LaunchMsg.args;6 Block + 10 sz):
 /// `[T q, T k_cache, T v_cache, T page_table(i32), T seq_lens(u32),
 ///   T mask(u32), T semaphores(u32), T scratch, T wr, O out, sz q_seq_len, sz hkv,

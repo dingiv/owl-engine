@@ -6,22 +6,21 @@
 //! - [`flashinfer`]:FFI + workspace 常量
 //! - [`xqa`]:XQA 契约 + FFI(Ampere spec-verify;2026-10-13)
 //!
-//! cublas/marlin/flashinfer 随各自 FFI feature 门;gdn 两家族零门。
+//! **门控(2026-10-15 起)**:各族的**身份字面量/契约面零门**(声明面
+//! `ops/<域>.rs` 与 models 要引用族名);**FFI/封装面随各自 feature 门**
+//! (`#[cfg]` 落在文件内的门控项上)。
 
-/// cuBLAS 封装(feature=cublas;cudarc cublas 绑定)
-#[cfg(feature = "cublas")]
+/// cuBLAS:族身份零门;**OwlCublas 封装**随 feature=cublas(cudarc 绑定)
 pub mod cublas;
 /// XQA 契约 + FFI(feature=xqa 时链接;契约面零门 —— 层侧 sig 查询要它)
 pub mod xqa;
-/// FlashInfer FFI + workspace 常量(feature=flashinfer)
-#[cfg(feature = "flashinfer")]
+/// FlashInfer:族身份 + workspace 常量 + FFI 声明(零依赖,零门)
 pub mod flashinfer;
 /// GDN chunked AOT cubin + 发射常量(零门)
 pub mod gdn_chunked;
 /// GDN scalar AOT cubin(零门)
 pub mod gdn_scalar;
-/// Marlin FFI + repack(feature=marlin)
-#[cfg(feature = "marlin")]
+/// Marlin:族身份 + FFI 声明(零门);**repack** 随 feature=marlin(half/rayon)
 pub mod marlin;
 /// **构建期 cubin 资产登记表**(build.rs 生成;源文本哈希 → fatbin 字节)。
 /// 门 = `device` —— 只有执行面(backends/cuda)按源查资产;models 侧零成本。

@@ -62,7 +62,7 @@ pub fn run_case(r: &mut dyn CheckRunner, c: &Case) -> Result<Vec<u16>, OpError> 
     // [a, b, out(O), m, k, n, nt];nt=true ⇒ m = n_out、n = T(owl Linear 惯例)
     let msg = LaunchMsg {
         kernel: KernelSource {
-            name: crate::contract::names::GEMM_F16.to_string(),
+            name: crate::family::cublas::GEMM_F16.to_string(),
             source: String::new(),
         },
         args: vec![
@@ -118,13 +118,13 @@ impl BootCheck for CublasGemmOracle {
         let (worst, first_bad) = rel_worst(&got, &want);
         if let Some((i, g, w)) = first_bad {
             return Err(OpError::Contract {
-                op: crate::contract::names::GEMM_F16.into(),
+                op: crate::family::cublas::GEMM_F16.into(),
                 field: "out",
                 expect: format!("相对偏差 ≤ {TOL:.1e}(host f32 参考 a·bᵀ)"),
                 got: format!("首越界 idx={i} gpu={g} host={w}(max|err|={worst:.3e})"),
             });
         }
-        let mut rep = CheckReport::numeric(crate::contract::names::GEMM_F16, worst, TOL);
+        let mut rep = CheckReport::numeric(crate::family::cublas::GEMM_F16, worst, TOL);
         rep.first_bad = first_bad;
         let _ = f16_bits(0.0);
         Ok(rep)

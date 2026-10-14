@@ -143,38 +143,18 @@ pub enum Arg {
     F32(f32),
 }
 
-// ============================================================================
-// foreign 虚拟核名(线契约身份;全库唯一字面量住址,2026-10-12 review
-// D/I-10 案收口)—— family(FFI 面)/client(face)/server(runtime)/
-// models(零 feature 消费方)一律经此引用,禁止再写裸字面量。
-// server_name_lint 的清单 = 本表(两侧互证)。
-// ============================================================================
-pub mod names {
-    /// cuBLAS f16 GEMM(f16 基线 F1)
-    pub const GEMM_F16: &str = "cublas_gemm_f16";
-    /// cuBLAS BF16 GEMM(E5-DF3;DFlash2 草稿投影)
-    pub const GEMM_BF16: &str = "cublas_gemm_bf16";
-    /// GDN chunked 六核编排(FLA fork-bf16)
-    pub const GDN_CHUNKED: &str = "gdn_chunked_delta_rule_fwd";
-    /// GDN scalar 单核臂(lmdeploy pre_sm90 port)
-    pub const GDN_SCALAR: &str = "gdn_scalar_delta_rule_fwd";
-    /// Marlin W4A16 f16 臂
-    pub const GEMM_W4A16: &str = "marlin_gemm_w4a16";
-    /// Marlin AWQ(kU4 非对称)臂
-    pub const GEMM_W4A16_AWQ: &str = "marlin_gemm_w4a16_awq";
-    /// Marlin BF16 激活/输出臂
-    pub const GEMM_W4A16_BF16: &str = "marlin_gemm_w4a16_bf16";
-    /// FlashInfer paged prefill(f16 KV)
-    pub const PREFILL_FI: &str = "flashinfer_prefill_paged_f16";
-    /// XQA verify 注意力(foreign;feature `xqa`;SPEC_DEC=1 `M_TILESIZE=32`)
-    pub const VERIFY_XQA: &str = "owl_xqa_verify";
-    /// XQA 裸 decode 注意力(foreign;feature `xqa`;SPEC_DEC=1 `M_TILESIZE=16` ——
-    /// q=1 只需 6 行 head-token,窄 tile 减半 MMA 浪费;见
-    /// roadmap.local/后续两刀-裸decode接XQA与草稿向量化-设计.md §D1)
-    pub const DECODE_XQA: &str = "owl_xqa_decode";
-    /// FlashInfer paged prefill(fp8 e4m3 KV)
-    pub const PREFILL_FI_FP8KV: &str = "flashinfer_prefill_paged_fp8kv";
-}
+// **族名/算子名不再集中于此**(2026-10-15 用户裁决:字面量住各族自己的定义处)。
+//
+// 住址表(每族的 `family/<族>.rs`,身份面零门 ⇒ 声明面 `ops/` 与 models 可引用):
+//   cuBLAS      → `family::cublas::{GEMM_F16, GEMM_BF16}`
+//   Marlin      → `family::marlin::{GEMM_W4A16, GEMM_W4A16_AWQ, GEMM_W4A16_BF16}`
+//   GDN chunked → `family::gdn_chunked::GDN_CHUNKED_FWD`
+//   GDN scalar  → `family::gdn_scalar::GDN_SCALAR_FWD`
+//   FlashInfer  → `family::flashinfer::{PREFILL_FI, PREFILL_FI_FP8KV}`
+//   XQA         → `family::xqa::{VERIFY_XQA, DECODE_XQA}`
+// 族身份(`OpId`)挂在**族 runtime 结构体**上(`server/<族>::ID`);声明面
+// `KernelSpec::FAMILY` 与执行面 `id()` 引用**同一字面量**。
+// "原生哨兵" = `crate::spec::NATIVE`(它不是族,是"无族"标记)。
 
 /// 发射参数值(owned 值表元素;指针参数 = u64 位型直入指针槽)。
 ///

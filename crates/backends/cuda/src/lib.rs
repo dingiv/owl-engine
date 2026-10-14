@@ -32,6 +32,7 @@ mod server;
 mod state;
 
 pub mod ffi;
+pub mod trace;
 
 /// CUPTI 进程内归因(仅 feature `cupti`;见 perf-framework §十一)
 #[cfg(feature = "cupti")]

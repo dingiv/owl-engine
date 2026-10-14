@@ -104,7 +104,7 @@ pub fn run_case(r: &mut dyn CheckRunner, c: &Case) -> Result<Vec<u16>, OpError> 
     // [a, b, out(O), scales, zeros, ws, c_tmp, m, k, n, groupsize]
     let msg = LaunchMsg {
         kernel: KernelSource {
-            name: crate::contract::names::GEMM_W4A16_AWQ.to_string(),
+            name: crate::family::marlin::GEMM_W4A16_AWQ.to_string(),
             source: String::new(),
         },
         args: vec![
@@ -164,7 +164,7 @@ impl BootCheck for MarlinAwqOracle {
         let (noise, max_abs, first_bad) = noise_metrics(&got, &want);
         if let Some((i, g, w)) = first_bad {
             return Err(OpError::Contract {
-                op: crate::contract::names::GEMM_W4A16_AWQ.into(),
+                op: crate::family::marlin::GEMM_W4A16_AWQ.into(),
                 field: "out",
                 expect: format!("逐元素相对偏差 ≤ {TOL:.1e}(host 显式反量化参考)"),
                 got: format!(
@@ -174,12 +174,12 @@ impl BootCheck for MarlinAwqOracle {
         }
         if noise > TOL as f64 {
             return Err(OpError::Contract {
-                op: crate::contract::names::GEMM_W4A16_AWQ.into(),
+                op: crate::family::marlin::GEMM_W4A16_AWQ.into(),
                 field: "out",
                 expect: format!("噪声/信号 RMS ≤ {TOL:.1e}"),
                 got: format!("{noise:.4}(max|err|={max_abs:.4})"),
             });
         }
-        Ok(CheckReport::numeric(crate::contract::names::GEMM_W4A16_AWQ, max_abs, TOL))
+        Ok(CheckReport::numeric(crate::family::marlin::GEMM_W4A16_AWQ, max_abs, TOL))
     }
 }
