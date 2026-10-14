@@ -115,3 +115,23 @@ pub fn perf_set_level(name: &str) -> Result<&'static str, String> {
     owl_shared::metrics::set_level(l);
     Ok(level_name())
 }
+
+/// 单步/粘滞调试门状态投影(`GET /debug/step`;见 docs/arch/perf-framework.md §五)
+pub fn step_json() -> Value {
+    let s = owl_shared::stepgate::state();
+    json!({
+        "mode": s.mode,
+        "compiled": s.compiled,
+        "armed": s.armed,
+        "every": s.every,
+        "interval_ms": s.interval_ms,
+        "interval_us": s.interval_us,
+        "hits": s.hits,
+        "advanced": s.advanced,
+        "waits": s.waits,
+        "waited_ms": s.waited_ms,
+        "credits": s.credits,
+        "released": s.released,
+        "waiting": s.waiting,
+    })
+}

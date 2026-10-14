@@ -31,6 +31,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let act = self.active.as_ref().expect("活跃");
             (act.id, act.session_id)
         };
+        // 调试门:prefill 块粒度(见 owl_shared::stepgate;`--step-gate` 控制)
+        owl_shared::step_gate!("engine.prefill").await;
         let last_row = self.prefill_chunk(&chunk_ids, base, is_last).await?;
         // E2c:块边界跨越 → GDN 快照拍摄(可复用身份 = 链尾块)
         let new_fed = base + chunk_ids.len();
@@ -62,6 +64,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         grew: bool,
     ) -> Result<TurnEvent> {
         let sid = self.active.as_ref().expect("活跃").session_id;
+        // 调试门:decode 步粒度
+        owl_shared::step_gate!("engine.decode").await;
         let prof = self.probes.step_profile;
         let t0 = prof.then(std::time::Instant::now);
         let t_step = std::time::Instant::now();

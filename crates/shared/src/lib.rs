@@ -16,6 +16,10 @@
 //! - [`log`]:**logger 框架**(2026-10-14;与 metrics 同风格、不同定位 ——
 //!   事件流 vs 数值账;宏风格 log_info!/… + feature `log` 编译期门 + 运行期
 //!   级别/tag 过滤 + tee 落盘与 rotation)。
+//! - [`stepgate`]:**单步/粘滞调试门**(2026-10-14;与 metrics/log 同纪律、
+//!   不同用途 —— 干预而非观察):`step_gate!("tag").await` 检查点宏 +
+//!   feature `stepgate` 编译期门(不带 = 空展开零开销)+ 运行期档位
+//!   off/sticky/single + tx/rx 外部 step 信号(HTTP `/debug/step*`)。
 
 pub use owl_iface::signal;
 
@@ -24,6 +28,7 @@ pub mod env_reader;
 pub mod file_loader;
 pub mod log;
 pub mod metrics;
+pub mod stepgate;
 pub mod slab_hint;
 pub mod vram;
 pub mod testkit;

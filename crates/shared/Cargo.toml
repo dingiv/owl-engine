@@ -13,6 +13,10 @@ owl-iface = { path = "../backends/iface" }
 # 纯 Rust 链 toml→toml_edit→winnow,零系统依赖)
 serde = { workspace = true }
 toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
+# 单步/粘滞调试门(stepgate feature):等待必须是 async(不许阻塞运行时线程,
+# 否则 HTTP 控制面回不了 step 信号 = 自锁)—— 见 src/stepgate.rs 模块头纪律 3。
+# 不带 stepgate feature 时本依赖不编译(optional)。
+tokio = { version = "1", optional = true, features = ["sync", "time"] }
 
 [features]
 # **默认开日志面**(2026-10-14 用户裁决):不开 feature 的 release 里
@@ -28,3 +32,13 @@ perf = []
 # logger 框架(docs/arch/log-framework.md / log.rs 模块头):五级日志宏的
 # 编译期门。**不开时五级全是空语句**(编译期剔除,零运行时)。
 log = []
+
+# **单步/粘滞调试门**(docs/arch/perf-framework.md §五 / stepgate.rs 模块头):
+# 解释器检查点的编译期门。不带 = `step_gate!` 空展开(参数不求值、零开销);
+# 带 = 可运行期切 off/sticky/single + tx/rx 外部 step 信号。
+# 构建调试二进制:`cargo build --release -p server --features stepgate`
+stepgate = ["dep:tokio"]
+
+[dev-dependencies]
+# stepgate 单测要 #[tokio::test](runtime + macros);不进生产依赖面
+tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }

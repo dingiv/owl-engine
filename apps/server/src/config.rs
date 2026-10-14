@@ -36,6 +36,15 @@ pub struct CliArgs {
     pub log_level: Option<String>,
     /// --log-file <PATH>:覆盖 [log] file(tee 落盘)
     pub log_file: Option<PathBuf>,
+    /// --step-gate <off|sticky|single>:单步/粘滞调试门档位(需 `--features
+    /// stepgate` 构建;见 docs/arch/perf-framework.md §五)
+    pub step_gate: Option<String>,
+    /// --step-gate-ms <N>:粘滞档每检查点睡眠毫秒
+    pub step_gate_ms: Option<u64>,
+    /// --step-gate-us <N>:粘滞间隔(µs;覆盖 --step-gate-ms)
+    pub step_gate_us: Option<u64>,
+    /// --step-gate-every <N>:每 N 个检查点停一次
+    pub step_gate_every: Option<u64>,
 }
 
 impl CliArgs {
@@ -79,6 +88,31 @@ impl CliArgs {
                     out.log_file = Some(PathBuf::from(
                         it.next().ok_or("--log-file 需要路径(tee:stderr + 文件)")?,
                     ));
+                }
+                "--step-gate" => {
+                    let v = it.next().ok_or("--step-gate 需要值(off|sticky|single)")?;
+                    if owl_shared::stepgate::StepMode::parse(&v).is_none() {
+                        return Err(format!("--step-gate 非法值 {v:?}(off|sticky|single)"));
+                    }
+                    out.step_gate = Some(v);
+                }
+                "--step-gate-ms" => {
+                    let v = it.next().ok_or("--step-gate-ms 需要毫秒数")?;
+                    out.step_gate_ms = Some(
+                        v.parse().map_err(|_| format!("--step-gate-ms 非法值 {v:?}"))?,
+                    );
+                }
+                "--step-gate-us" => {
+                    let v = it.next().ok_or("--step-gate-us 需要微秒数")?;
+                    out.step_gate_us = Some(
+                        v.parse().map_err(|_| format!("--step-gate-us 非法值 {v:?}"))?,
+                    );
+                }
+                "--step-gate-every" => {
+                    let v = it.next().ok_or("--step-gate-every 需要正整数")?;
+                    out.step_gate_every = Some(
+                        v.parse().map_err(|_| format!("--step-gate-every 非法值 {v:?}"))?,
+                    );
                 }
                 _ if a.starts_with('-') => {
                     return Err(format!(
@@ -128,6 +162,12 @@ pub struct ServerConfig {
     pub log: owl_shared::config::LogCfg,
     /// agent 服务面([agent] module;模板覆盖/隐式会话/工具解析/档位)
     pub agent: owl_shared::config::AgentCfg,
+    /// 单步/粘滞调试门(probes.step_gate*;CLI 可覆盖;见 perf-framework.md §五)
+    pub step_gate: owl_shared::stepgate::StepMode,
+    pub step_gate_ms: u64,
+    /// 亚毫秒档(µs;>0 覆盖 ms)
+    pub step_gate_us: u64,
+    pub step_gate_every: u64,
 }
 
 impl ServerConfig {
@@ -154,6 +194,20 @@ impl ServerConfig {
         }
         if let Some(f) = cli.log_file.clone() {
             out.log.file = Some(f);
+        }
+        // 调试门:CLI 覆盖配置面(档位/间隔/步长;非法档位在 CLI 解析期已拒)
+        if let Some(m) = cli.step_gate.as_deref() {
+            out.step_gate = owl_shared::stepgate::StepMode::parse(m)
+                .ok_or_else(|| format!("--step-gate 非法值 {m:?}"))?;
+        }
+        if let Some(v) = cli.step_gate_ms {
+            out.step_gate_ms = v;
+        }
+        if let Some(v) = cli.step_gate_us {
+            out.step_gate_us = v;
+        }
+        if let Some(v) = cli.step_gate_every {
+            out.step_gate_every = v;
         }
         Ok(out)
     }
@@ -183,6 +237,10 @@ impl ServerConfig {
             perf_level: cfg.probes.perf_level.to_u8(),
             log: cfg.log,
             agent: cfg.agent,
+            step_gate: cfg.probes.step_gate,
+            step_gate_ms: cfg.probes.step_gate_ms,
+            step_gate_us: cfg.probes.step_gate_us,
+            step_gate_every: cfg.probes.step_gate_every,
         }
     }
 

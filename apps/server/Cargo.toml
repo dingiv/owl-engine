@@ -22,6 +22,8 @@ minijinja-contrib = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 
 [features]
+stepgate = ["owl-shared/stepgate"]
+
 # 性能框架(docs/arch/perf-framework.md):带本 feature 的 release 构建里
 # 计时宏/钩子全速采集;不带 = 生产二进制零成本。
 #   用法: cargo build --release -p server --features perf

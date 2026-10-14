@@ -494,3 +494,101 @@ verify / draft / fold 三个图里 —— 看 `gid` 分辨,别看总数。
 
 **纪律**:凡新增跨 crate 的 feature 门,必须①补齐转发链 ②真机跑一次并确认
 目标 tag 前缀**非空**(空 = 静默失效,比报错更贵)。
+
+## 十二、单步 / 粘滞调试门(step gate;2026-10-14 立项当日落地)
+
+### 12.1 定位
+
+前三节是**观察**(metrics 数值账 / log 事件流 / CUPTI 设备归因);本节是**干预**:
+让解释器在检查点**停下来**,把"看不清楚的执行序"变成"可以一步步走出来的执行序"。
+与另两者共用同一套纪律:**宏 + 编译期 feature 门 + 运行期档位 + 全局单例(在线可切)**。
+
+### 12.2 两种模式
+
+| 模式 | 唤醒条件 | 用途 |
+|---|---|---|
+| `Sticky`(**粘滞**) | **定时器**:每个检查点睡 `step_gate_ms` | 整体放慢,便于盯日志/指标/显存;**不改执行序** |
+| `Single`(**单步**) | **外部显式 step 信号**(tx/rx 通道) | 逐检查点手动推进:发一步走一步 |
+| `Off` | — | 零干预(缺省) |
+
+### 12.3 检查点(三个粒度)
+
+| 站点 | 位置 | 粒度 |
+|---|---|---|
+| `interp.node` | `crates/models/src/interpreters/eval.rs::_eval_node` 顶部(CSE 判定**之前**) | **最细**:一步 = 一次节点访问 |
+| `engine.prefill` | `crates/engine/src/exec/phases.rs::execute_prefill` | 每 prefill 块 |
+| `engine.decode` | 同上 `execute_decode` | 每 decode 步 |
+
+`step_gate_every = N` 把最细那档**粗化**(每 N 个检查点才停一次)⇒ 层粒度/块粒度都能凑出来
+(27B 实测:一个短 prompt 的 prefill+32 decode ≈ **6441 个检查点** ⇒ `every=200` ⇒ 32 次等待)。
+
+### 12.4 零开销律(宏)
+
+```rust
+owl_shared::step_gate!("interp.node").await;
+```
+
+* **不带 `stepgate` feature 的构建**:宏展开为 `core::future::ready(())`
+  —— **参数不求值、无分支、无全局查询**(与 `perf`/`log` 的"生产零成本"同款);
+* 带 feature:一次检查点(档位判定 + 命中计数 + 可选等待);
+* 调试二进制:`cargo build --release -p server --features stepgate`
+  (server 的 feature 转发到 `owl-shared/stepgate`;见 §11.7 feature 转发链)。
+
+### 12.5 控制面
+
+```bash
+# 启动参数(或配置 [probes] step_gate*)
+server --flavor spec-dflash owl.toml --step-gate sticky --step-gate-ms 20 --step-gate-every 200
+
+# 在线(HTTP;与 /debug/perf/level、/debug/log/level 同风格)
+curl /debug/step                          # 状态快照
+curl /debug/step/mode/single              # 切档(立即生效)
+curl /debug/step/release/1                # **发一步**(n=0 或 inf = 不限步)
+curl /debug/step/ms/20                    # 粘滞间隔
+curl /debug/step/every/200                # 粗化步长
+```
+
+状态面字段:`mode / compiled / armed / every / interval_ms / hits / advanced / waits /
+waited_ms / credits / released / waiting`。
+`compiled=false` = 本二进制未编入 feature(此时配非 off 档会在 boot 时**可见告警**,不静默失效)。
+
+### 12.6 指标面(接 metrics 框架)
+
+| 键 | 语义 |
+|---|---|
+| `stepgate.hits` | 进入检查点次数(counter) |
+| `stepgate.advanced` | **真正通过**门的检查点数(等待结束/吃信用/被 every 过滤都算) |
+| `stepgate.waits` | 真等了几次 |
+| `stepgate.wait` | 每次等待时延(timer;按 `file!/line!` 分站点) |
+
+查询:`GET /debug/metrics/stepgate`。
+
+### 12.7 纪律(实测踩中,写进契约)
+
+1. **boot 完成后才武装**:boot 期的 warmup/图捕获也跑解释器,而那时 HTTP 面还没起来
+   ⇒ 一开始就 Single 会**自锁**(实测:main 卡在 `ready_rx.recv()`,端口不监听,
+   GPU 显存已占 ⇒ 表现为"起来了但连不上")。故 `configure` 只在就绪横幅**之前一行**调用,
+   状态面用 `armed` 标明;
+2. **通道只做唤醒,不携带状态**:载荷式消息会在通道里**排队**,后来的检查点可能吃到
+   **早先的**旧档位 ⇒ "翻旧账"(实测:切回 single 后请求跑到第 3 个检查点被更早的
+   `Mode(off)` 放跑整轮)。⇒ **状态唯一住址 = 原子量**,被叫醒者一律重读;
+3. **通道关闭 = 放行**:宁可少等一步,也不把引擎焊死;
+4. **等待必须 async**(`tokio::sync::Mutex` + `mpsc`):阻塞运行时线程会让 HTTP 面
+   回不了 step 信号 = 死锁;
+5. `release(n)`:**本检查点吃 1 步**,余下 n−1 入信用池;`release(0)` = 不限步
+   (⚠️ 不能写 `release(n-1)`:n=1 时 `0` 会被当成"不限步"⇒ 整轮跑飞,实测踩中)。
+
+### 12.8 首测数据(27B/3090Ti/spec-dflash;短 prompt;`every=200`)
+
+| 档 | TTFT | 说明 |
+|---|---|---|
+| `off` | **0.40s** | 基线(`hits=0`,门连计数都不走) |
+| `sticky` 20ms | **0.76s** | host 累计睡 674ms,**墙钟只 +0.36s** ⇒ 等待与 GPU 计算重叠(顺带量出 host 领先量) |
+| `single` | 31.4s | 由外部按 3 次 `release/1` + 一次 `release/0` 驱动;`release/1` ⇒ 恰好前进 1 个检查点(200 节点) |
+| 切回 `off` | 0.42s | 在线切档立即生效,下一请求零等待 |
+
+### 12.9 变更记录
+
+| 日期 | 版本 | 内容 |
+|---|---|---|
+| 2026-10-14 | v1.0 | 立项当日落地:`owl_shared::stepgate`(宏 + feature 门 + 两模式 + tx/rx 唤醒)+ 三处检查点(interp.node / engine.prefill / engine.decode)+ 配置/CLI/HTTP 三面控制 + metrics 四键 + 6 单测(含"翻旧账"回归)+ 真机两档验收 |

@@ -86,6 +86,10 @@
 # dflash_noencode = false
 # dflash_dumb = false
 # gdn_dump_all = false
+# ── 单步/粘滞调试门(perf-framework.md §十二;需 `--features stepgate` 构建)──
+# step_gate = "off"             # off | sticky(定时器) | single(等外部 step 信号)
+# step_gate_ms = 50             # sticky 档每检查点睡眠毫秒
+# step_gate_every = 1           # 每 N 个检查点停一次(粗化步长)
 # pf_bisect = false             # prefill 逐层 checksum 二分
 # pf_stages = 0                 # 指定层五站 stage tap(层号)
 # pf_fin_check = false

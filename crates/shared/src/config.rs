@@ -53,6 +53,7 @@
 //! | dispatch | gdn_chunked / gdn_scalar / kv_fp8 | flag / false |
 //! | dispatch | resolve_trace / host_argmax / ts_probe | flag / false |
 //! | probes | step_profile / perf_level / gdn_dump / debug / prefill_cksum / fact_probe | flag / false |
+//! | probes | step_gate / step_gate_ms / step_gate_us / step_gate_every | StepMode("off"\|"sticky"\|"single") / 50 / 0(覆盖 ms) / 1 |
 //! | log | level / tags_allow / tags_deny / file / max_mb / keep / timestamp | 见模块 |
 //! | probes | trace_gate / dflash_probe / propose_eager | flag / false |
 //! | probes | dflash_eager / dflash_noencode / dflash_dumb | flag / false |
@@ -367,6 +368,27 @@ pub struct ProbesCfg {
     pub pf_stages: Option<usize>,
     pub pf_fin_check: bool,
     pub raw_completion: bool,
+    /// **单步/粘滞调试门**(2026-10-14;见 `crate::stepgate` 模块头):
+    /// 解释器检查点的运行期档位。⚠️ 需以 `--features stepgate` 构建才生效;
+    /// 未编入时入口会**可见地告警**(不静默失效)。
+    pub step_gate: crate::stepgate::StepMode,
+    /// 粘滞档每检查点睡眠毫秒(缺省 50)
+    #[serde(default = "default_step_gate_ms")]
+    pub step_gate_ms: u64,
+    /// **亚毫秒档**(µs;>0 时覆盖 `step_gate_ms`,粘滞等待走自旋)
+    #[serde(default)]
+    pub step_gate_us: u64,
+    /// 每 N 个检查点停一次(缺省 1 = 每点都停)
+    #[serde(default = "default_step_gate_every")]
+    pub step_gate_every: u64,
+}
+
+fn default_step_gate_ms() -> u64 {
+    50
+}
+
+fn default_step_gate_every() -> u64 {
+    1
 }
 
 /// CUDA 设备面(诊断旗标 + 图实例化位面 + slab 定档 + nvrtc 工具链)

@@ -86,6 +86,15 @@ async fn main() {
         }
     };
 
+    // 调试门三件套先取局部:下面 `config` 会被 move 进 actor 线程,
+    // 而武装点必须在 boot 完成之后(见下方注释)
+    let (sg_mode, sg_ms, sg_us, sg_every) = (
+        config.step_gate,
+        config.step_gate_ms,
+        config.step_gate_us,
+        config.step_gate_every,
+    );
+
     // logger 全局仓(框架;五级宏的编译期门 = feature `log` ——
     // 不开时宏全是空语句,本 init 仍无害且让直接 API 可用)
     {
@@ -184,6 +193,22 @@ async fn main() {
             eprintln!("[boot] 引擎装配失败: {e}");
             std::process::exit(1);
         }
+    }
+
+    // **单步/粘滞调试门武装**(2026-10-14):**必须放在 boot 完成之后** ——
+    // boot 期的 warmup/图捕获也会跑解释器,而此刻 HTTP 面还没起来;若一开始
+    // 就 Single 会自锁(见 stepgate.rs 模块头纪律 1)。非 off 档在未编入
+    // `stepgate` feature 的二进制里会**可见告警**(不静默失效)。
+    owl_shared::stepgate::configure_ex(sg_mode, sg_ms, sg_us, sg_every);
+    if sg_mode != owl_shared::stepgate::StepMode::Off {
+        eprintln!(
+            "[boot] 调试门已武装:mode={} interval={}(ms={} us={}) every={}(状态面 GET /debug/step;发步 POST /debug/step/release/<n>)",
+            sg_mode.name(),
+            if sg_us > 0 { format!("{}us", sg_us) } else { format!("{}ms", sg_ms) },
+            sg_ms,
+            sg_us,
+            sg_every
+        );
     }
 
     // 并发上限守卫(§三十五 server 上层):GDN 状态格 = 每并发会话一格,
@@ -352,6 +377,124 @@ async fn serve(
                 )
                 .await?;
             }
+        }
+        // **单步/粘滞调试门**(docs/arch/perf-framework.md §五;投影在
+        // `owl_shared::stepgate`,路由只转发):
+        //   GET  /debug/step                     状态快照
+        //   *    /debug/step/mode/<off|sticky|single>   切档
+        //   *    /debug/step/release/<n>         发 step 信号(n=1 走一步;
+        //                                        n=0 或 inf = 不限步)
+        //   *    /debug/step/ms/<n>             粘滞间隔
+        //   *    /debug/step/every/<n>          每 N 点停一次
+        //   POST /debug/step                     便捷:放行 1 步
+        ("GET", p) if p == "/debug/step" => {
+            http::respond_json(&mut stream, 200, &debug::step_json()).await?;
+        }
+        (m, p) if p == "/debug/step" || p.starts_with("/debug/step/") => {
+            let rest = p.strip_prefix("/debug/step").unwrap_or("").trim_start_matches('/');
+            let (what, arg) = rest.split_once('/').unwrap_or((rest, ""));
+            let arg = arg.trim();
+            let (ok, msg) = match what {
+                "" => {
+                    if m == "POST" {
+                        (owl_shared::stepgate::release(1), "release 1".to_string())
+                    } else {
+                        (true, "GET /debug/step = 状态;POST = 放行 1 步".to_string())
+                    }
+                }
+                "mode" => match owl_shared::stepgate::StepMode::parse(arg) {
+                    Some(mm) => (
+                        owl_shared::stepgate::set_mode(mm),
+                        format!("mode={}", mm.name()),
+                    ),
+                    None => {
+                        http::respond_json(
+                            &mut stream,
+                            400,
+                            &openai::error_json(format!(
+                                "未知调试门档位 {arg:?}(off|sticky|single)"
+                            )),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                },
+                "release" => {
+                    let n = match arg {
+                        "inf" | "all" | "continue" | "0" => 0u64,
+                        s => match s.parse::<u64>() {
+                            Ok(v) => v,
+                            Err(_) => {
+                                http::respond_json(
+                                    &mut stream,
+                                    400,
+                                    &openai::error_json(format!(
+                                        "release 需要整数或 inf,得 {s:?}"
+                                    )),
+                                )
+                                .await?;
+                                return Ok(());
+                            }
+                        },
+                    };
+                    (
+                        owl_shared::stepgate::release(n),
+                        format!("release {n}{}", if n == 0 { "(不限步)" } else { "" }),
+                    )
+                }
+                "us" => match arg.parse::<u64>() {
+                    Ok(v) => (owl_shared::stepgate::set_interval_us(v), format!("us={v}")),
+                    Err(_) => {
+                        http::respond_json(
+                            &mut stream,
+                            400,
+                            &openai::error_json(format!("us 需要整数,得 {arg:?}")),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                },
+                "ms" => match arg.parse::<u64>() {
+                    Ok(v) => (owl_shared::stepgate::set_interval_ms(v), format!("ms={v}")),
+                    Err(_) => {
+                        http::respond_json(
+                            &mut stream,
+                            400,
+                            &openai::error_json(format!("ms 需要整数,得 {arg:?}")),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                },
+                "every" => match arg.parse::<u64>() {
+                    Ok(v) => (owl_shared::stepgate::set_every(v), format!("every={v}")),
+                    Err(_) => {
+                        http::respond_json(
+                            &mut stream,
+                            400,
+                            &openai::error_json(format!("every 需要整数,得 {arg:?}")),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                },
+                other => {
+                    http::respond_json(
+                        &mut stream,
+                        400,
+                        &openai::error_json(format!(
+                            "未知调试门路径 {other:?}(mode/release/ms/every)"
+                        )),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            // 控制通道没消费者(引擎侧未编入 feature / 已退出)= 如实报,不谎报 ok
+            let mut v = debug::step_json();
+            v["applied"] = json!(ok);
+            v["action"] = json!(msg);
+            http::respond_json(&mut stream, 200, &v).await?;
         }
         // 诊断分账出口(投影在 debug 模块;路由只转发)
         ("GET", p) if p == "/debug/metrics" || p.starts_with("/debug/metrics/") => {

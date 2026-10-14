@@ -545,6 +545,10 @@ async fn _eval_node<'a, D>(
 where
     D: crate::contract::DeviceClient,
 {
+    // **单步/粘滞调试门**(2026-10-14;`step_gate!` 不带 feature 时为空展开):
+    // 放在 CSE 判定**之前** ⇒ "一步 = 一次节点访问"(含命中),行为可预测。
+    // 见 owl_shared::stepgate 模块头(off/sticky/single + tx/rx 外部 step 信号)。
+    owl_shared::step_gate!("interp.node").await;
     // CSE / DAG 求值(2026-09-26 定案):共享子树(如 DecoderLayer 的残差
     // h:既喃 ln2 又喃残差加)只求值一次 —— 无 CSE 则 mixer 的状态副作用
     // kernel(conv/delta)执行两遍,第二遍读到滑过的状态 → 语义破坏。
