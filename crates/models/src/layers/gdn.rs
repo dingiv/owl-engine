@@ -650,7 +650,14 @@ impl GatedDeltaNet {
         // - scalar:lmdeploy pre_sm90 port 单核(cast ×5 → 单 Call;对照臂)
         // - recurrence:现役 varlen 递推批核(基线/小 T)
         if ctx.trace_gate {
-            eprintln!("[gdn-gate] scalar={} chunked={} T={}", ctx.env.gdn.scalar, ctx.env.gdn.chunked, tokens);
+            eprintln!(
+                "[gdn-gate] scalar={} chunked={} T={} slot_host={:?} dev_slot_present={}",
+                ctx.env.gdn.scalar,
+                ctx.env.gdn.chunked,
+                tokens,
+                ctx.gdn_slot_host,
+                ctx.gdn_slot.is_some(),
+            );
         }
         // E5-M4 fold 记录(verify 图 tap;生产路径 None 零开销):每层 8 件
         // 依序推入 —— conv 重放三 raw(q/k/v)+ 递推重放五件(post-conv/
@@ -671,6 +678,25 @@ impl GatedDeltaNet {
         // 的档位(0.8B NV=16)强制回落 varlen,防核静默写飞
         let chunked_shape_ok = self.nv == 48 && self.nk == 16 && self.hk_dim == 128 && self.hv_dim == 128;
         let scalar_shape_ok = self.hk_dim == 128 && self.hv_dim == 128;
+        // 槽号真值(A13 定谳,2026-10-14):chunked/scalar 两臂的状态寻址
+        // 吃 **host 标量** —— 它必须由调用方注入;缺了就是「把本会话的
+        // rec 态读写到槽 0」的静默错值,故一律拒发(不陟回 varlen:
+        // 两臂态约定不同,静默换臂 = 错值变种,本项目旧病史同族)
+        let need_slot_host = (ctx.env.gdn.scalar && !ctx.env.gdn.chunked && tokens >= 64 && scalar_shape_ok)
+            || (ctx.env.gdn.chunked && tokens >= 64 && chunked_shape_ok);
+        let slot_host = match ctx.gdn_slot_host {
+            Some(s) => s,
+            None if need_slot_host => {
+                return TensorOps::poisoned(
+                    Dtype::F16,
+                    vec![tokens, value_dim],
+                    "gdn prefill: 本臂(chunked/scalar,状态槽寻址)需 host 槽号真值,\n\
+                     但 ForwardCtx::gdn_slot_host = None(调用方未注入) —— 拒发:\n\
+                     静默取 0 会把本会话 rec 态写到别人格(A13)",
+                );
+            }
+            None => 0, // varlen 臂不用(状态走设备槽张量)
+        };
         let y = if ctx.env.gdn.scalar && !ctx.env.gdn.chunked && tokens >= 64 && scalar_shape_ok {
             // scalar 臂(lmdeploy 单核;T 分臂:仅大 T —— 小 T(verify/
             // propose=8/decode=1)回 recurrence,每层 5 cast 核在小 T 纯开销)
@@ -701,7 +727,7 @@ impl GatedDeltaNet {
                 &g_f,
                 &beta_f,
                 &gdn.rec,
-                ctx.gdn_slot_host,
+                slot_host,
                 tokens,
                 self.nv,
                 self.nk,
@@ -718,7 +744,7 @@ impl GatedDeltaNet {
             // 自研链 ~2100µs(5.5×)。大 T 限定(与 scalar 同纪律)。
             // 具名算子声明(2026-10-12 用户律二番):名字/发射配置归 driver
             chunked_delta(
-                &q_n, &k_n, &v_c, &beta, &g, &gdn.rec, ctx.gdn_slot_host,
+                &q_n, &k_n, &v_c, &beta, &g, &gdn.rec, slot_host,
                 tokens, self.nv, self.nk, self.hk_dim,
             )
         } else {

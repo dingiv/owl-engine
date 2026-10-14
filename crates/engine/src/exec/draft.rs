@@ -880,7 +880,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         block: &[u32],
         base: usize,
         gdn_slot: usize,
-    ) -> Result<(Vec<u32>, owl_iface::contract::Bytes)> {
+        want_logits: bool,
+    ) -> Result<(Vec<u32>, owl_iface::contract::Bytes, Option<Vec<f32>>)> {
         let t = block.len();
         let (bt_chain, _) = {
             let act = self.active.as_ref().expect("active 已保证");
@@ -1002,7 +1003,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 逐层 from_host 兜底;48 次 8B H2D × ~3.5ms 往返)
         let seq_cu = TensorOps::from_host(Dtype::F32, vec![2], &f32b(&[0.0, t as f32]));
         let mut ctx = owl_models::module::ForwardCtx::model_prefill(
-            t, &pos_t, &kvs_step, &self.rope, &gdns_step, &slots_t, &lens_t, &gdn_slot_t, base, fi,
+            t, &pos_t, &kvs_step, &self.rope, &gdns_step, &slots_t, &lens_t, &gdn_slot_t,
+            Some(gdn_slot), // A13:host 槽真值(verify T≤16 不走 chunked 臂;注入即真值)
+            base, fi,
         );
         ctx.seq_cu = Some(&seq_cu);
         ctx.env = self.env;
@@ -1034,6 +1037,23 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             owl_models::interpreters::eval_ops_scoped_env(root.step(), face, self.env).await?;
         let mut buf = vec![0u8; 4 * t];
         face.dtoh(&b, &mut buf).await?;
+        // A11:采样接受需要各行**目标分布**(不只 argmax)⇒ 按需物化
+        // [t, vocab] 行 logits(f16 → host f32;仅采样档付这份 D2H)
+        let row_logits: Option<Vec<f32>> = if want_logits {
+            let (lb, arena3) =
+                owl_models::interpreters::eval_ops_scoped_env(logits.step(), face, self.env).await?;
+            let mut lbuf = vec![0u8; 2 * t * vocab];
+            face.dtoh(&lb, &mut lbuf).await?;
+            face.free(&[lb.id]).await?;
+            face.free(&arena3).await?;
+            Some(
+                lbuf.chunks_exact(2)
+                    .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                    .collect(),
+            )
+        } else {
+            None
+        };
         // 显式归还:argmax 根 + 两树中间块(hidden 根 hb 存活,随返回值)
         face.free(&[b.id]).await?;
         face.free(&arena2).await?;
@@ -1042,7 +1062,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
             .collect();
-        Ok((ids, hb))
+        Ok((ids, hb, row_logits))
     }
 
     // ====================================================================

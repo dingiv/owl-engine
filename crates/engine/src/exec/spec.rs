@@ -67,9 +67,26 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // + fold 记录)或 eager fallback(旧 verify_forward)。fold 记录
         // = 每层 8 件(conv 三 raw + 递推五件)。
         let block: Vec<u32> = std::iter::once(token).chain(drafts.iter().copied()).collect();
+        // verify 行数 = anchor + 草稿(depth+1;与图的 depth1 桶同宽)
+        let rows_n = block.len();
+        // A11:采样接受开关 + 采样参数 + 惩罚历史(必须在借 verify_graph 前取好)
+        let (sampler_on, sampler_cfg) = {
+            let act = self.active.as_ref().expect("活跃");
+            (act.sampler_on, act.sampler)
+        };
+        let mut hist: Vec<u32> = {
+            let act = self.active.as_ref().expect("活跃");
+            let tail = act.prompt_ids.len().saturating_sub(64);
+            act.prompt_ids[tail..].iter().chain(act.out.iter()).copied().collect()
+        };
+        let seed_base = {
+            let act = self.active.as_ref().expect("活跃");
+            act.seed.unwrap_or_else(|| act.id.wrapping_mul(0x9E3779B97F4A7C15))
+        };
         // XQA 页表:在借 self.verify_graph 之前算好(自 sessions 取真块链)
         let xqa_pt_v = self.xqa_pt_of(sid);
-        let (ids, hidden, records, hidden_owned) = if let Some(vg) = self.verify_graph.as_mut() {
+        let (ids, hidden, records, hidden_owned, row_logits) =
+            if let Some(vg) = self.verify_graph.as_mut() {
             let ts = std::time::Instant::now();
             let page = self.pool.page;
             let bt_chain = {
@@ -122,6 +139,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             .await?;
             let t_read_v = std::time::Instant::now();
             let tok_f = vg.read_output_f32("tok").await?;
+            // A11:采样档额外回读 per-row logits([depth1, vocab];仅采样档付)
+            let row_logits = if sampler_on {
+                Some(vg.read_output_f32("logits").await?)
+            } else {
+                None
+            };
             // E5 性能:verify 分相(step=上传+launch;read=同步+回读;
             // pure=同步后裸 replay+read = 图独占 GPU 时间)
             if self.probes.step_profile {
@@ -144,20 +167,57 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .map(|i| vg.output_block(&format!("r{i}")).expect("fold 记录槽"))
                 .collect();
             t_verify = ts.elapsed();
-            (ids, hidden, records, false) // 图输出槽:持久,不 free
+            (ids, hidden, records, false, row_logits) // 图输出槽:持久,不 free
         } else {
             let ts = std::time::Instant::now();
-            let (ids, hidden) = self.verify_forward(&block, pos, gdn_slot).await?;
+            let (ids, hidden, row_logits) =
+                self.verify_forward(&block, pos, gdn_slot, sampler_on).await?;
             t_verify = ts.elapsed();
-            (ids, hidden, Vec::new(), true)
+            (ids, hidden, Vec::new(), true, row_logits)
         };
         if prof {
             eprintln!("[spec-prof] pos={pos} verify={:?}", t0.unwrap().elapsed());
         }
 
-        // ④ greedy 接受:行 i argmax vs draft i;i < depth
-        let m = (0..depth).take_while(|&i| drafts[i] == ids[i]).count();
-        let bonus = ids[m];
+        // ④ 接受(A11):采样档 = **抽-比式**;贪心档 = 原式(argmax 比对)
+        // 原实现只有贪心接受 ⇒ spec 臂完全不采样 ⇒ 请求温度/top_p/seed
+        // 在 spec 开时失效 = 事实贪心(27B instruct 复读吸引子;A7/A8 根因)。
+        let (m, emitted, bonus) = if sampler_on {
+            let Some(lg) = row_logits.as_ref() else {
+                return Err(ModelError::Msg(
+                    "spec 采样接受需要 per-row logits(verify 路未出 logits 槽)".into(),
+                ));
+            };
+            let vocab = self.model.vocab_size();
+            if lg.len() < rows_n * vocab {
+                return Err(ModelError::Msg(format!(
+                    "spec logits 槽尺寸不符:得 {} < {}×{}",
+                    lg.len(),
+                    rows_n,
+                    vocab
+                )));
+            }
+            let mut s: Vec<u32> = Vec::with_capacity(rows_n);
+            let mut scratch: Vec<f32> = Vec::with_capacity(vocab);
+            for i in 0..rows_n {
+                scratch.clear();
+                scratch.extend_from_slice(&lg[i * vocab..(i + 1) * vocab]);
+                // RNG:与裸 decode 同构(位置定序 ⇒ 可复现;不用轮内计数,
+                // 免得降级态换路后抽点错位)
+                let mut rng =
+                    seed_base ^ ((pos + i) as u64).wrapping_mul(0xBF58476D1CE4E5B9);
+                let tok = crate::sampler::sample(&mut scratch, &sampler_cfg, &mut rng, &hist);
+                s.push(tok);
+                hist.push(tok); // 已发出的 token 进惩罚集(与逐 token 解码同语义)
+            }
+            let m = spec_sampled_accept_prefix(&drafts, &s[..depth]);
+            mcnt("spec.sample.rounds", 1);
+            mcnt("spec.sample.accepted", m as u64);
+            (m, s[..=m].to_vec(), s[m])
+        } else {
+            let m = (0..depth).take_while(|&i| drafts[i] == ids[i]).count();
+            (m, ids[..=m].to_vec(), ids[m])
+        };
         // B4 自适应降级态机(§6.24;DFlash2 专属 —— 同步机制走 dflash encode)
         // 2026-10-12 深夜重放 + 滚动 AL 窗口:连击 streak 会被"偶发 m=1"
         // 破解(随机域 AL≈1.1 时 9.3 t/s 案),窗口均值 < 盈亏线即降级
@@ -408,7 +468,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 let replay: Vec<u32> = std::iter::once(token)
                     .chain(drafts[..m].iter().copied())
                     .collect();
-                let (_, replay_hidden) = self.verify_forward(&replay, pos, gdn_slot).await?;
+                let (_, replay_hidden, _) =
+                    self.verify_forward(&replay, pos, gdn_slot, false).await?;
                 let face = self.session.face_mut();
                 face.free(&[replay_hidden.id]).await?;
                 t_rollback = ts.elapsed();
@@ -418,9 +479,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         self.tspec().spec_snap_valid = false;
 
         // ⑥ 提交:fed = bonus 位(F');发射 = 接受 drafts + bonus(m+1)
-        let toks: Vec<u32> = drafts[..m].to_vec();
-        let mut toks = toks;
-        toks.push(bonus);
+        // (A11:采样档 emitted = 采样表前 m+1 位;贪心档 = ids[..=m])
+        let mut toks: Vec<u32> = emitted;
         {
             let act = self.active.as_mut().expect("活跃");
             act.fed = pos + m + 1;

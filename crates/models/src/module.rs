@@ -98,8 +98,13 @@ pub struct ForwardCtx<'a> {
     pub fi_kvi: usize,
     /// 解释器执行环境(EnvProvider;engine/测试构造定制,构造器取默认)
     pub env: crate::env::EnvProvider,
-    /// GDN 状态槽号(host 侧真值;chunked 臂发射标量用)
-    pub gdn_slot_host: usize,
+    /// GDN 状态槽号(host 侧真值;chunked/scalar 臂发射标量用)。
+    /// **必须由调用方注入**(`model_prefill` 参数)。2026-10-14 定谳(A13):
+    /// 本字段曾硬编码 0 且全仓无赋值 ⇒ `gdn_slots > 1` 时 chunked/scalar
+    /// 臂把每会话的 rec 态读写到**槽 0**(别人的态),而 varlen 臂走设备槽
+    /// 张量(正确)⇒ 长 prompt 误态塌陷。`None` = 调用方未提供,此时
+    /// **需要它的臂一律 poisoned 拒发**(不许静默取 0)。
+    pub gdn_slot_host: Option<usize>,
     /// 刀D 取证:时间戳探针缓冲块(OWL_TS_PROBE;None = 关。U32 [4096]
     /// 输入槽,ts 内核逐层 clock64 原地写,回放后 dtoh 读原生时间线)
     pub ts_buf: Option<TensorOps>,
@@ -142,7 +147,7 @@ impl<'a> ForwardCtx<'a> {
             fi: None,
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
-            gdn_slot_host: 0,
+            gdn_slot_host: None,
             ts_buf: None,
             trace_gate: false,
             attn_v2: None,
@@ -176,7 +181,7 @@ impl<'a> ForwardCtx<'a> {
             fi: None,
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
-            gdn_slot_host: 0,
+            gdn_slot_host: None,
             ts_buf: None,
             trace_gate: false,
             attn_v2: None,
@@ -205,7 +210,7 @@ impl<'a> ForwardCtx<'a> {
             fi: None,
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
-            gdn_slot_host: 0,
+            gdn_slot_host: None,
             ts_buf: None,
             trace_gate: false,
             attn_v2: None,
@@ -238,7 +243,7 @@ impl<'a> ForwardCtx<'a> {
             fi: None,
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
-            gdn_slot_host: 0,
+            gdn_slot_host: None,
             ts_buf: None,
             trace_gate: false,
             attn_v2: None,
@@ -274,7 +279,7 @@ impl<'a> ForwardCtx<'a> {
             fi: None,
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
-            gdn_slot_host: 0,
+            gdn_slot_host: None,
             ts_buf: None,
             trace_gate: false,
             attn_v2: None,
@@ -310,7 +315,7 @@ impl<'a> ForwardCtx<'a> {
             fi: None,
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
-            gdn_slot_host: 0,
+            gdn_slot_host: None,
             ts_buf: None,
             trace_gate: false,
             attn_v2: None,
@@ -334,6 +339,7 @@ impl<'a> ForwardCtx<'a> {
         kv_slots: &'a TensorOps,
         kv_lens: &'a TensorOps,
         gdn_slot: &'a TensorOps,
+        gdn_slot_host: Option<usize>,
         ctx_base: usize,
         fi: Option<FiPrefillCtx<'a>>,
     ) -> Self {
@@ -353,7 +359,7 @@ impl<'a> ForwardCtx<'a> {
             fi,
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
-            gdn_slot_host: 0,
+            gdn_slot_host,
             ts_buf: None,
             trace_gate: false,
             attn_v2: None,

@@ -465,6 +465,23 @@ async fn run_awq_case_g(client: &mut GpuClient, m: usize, n: usize, k: usize, g:
 #[tokio::test]
 async fn marlin_w4a16_awq_parity() {
     let mut client = assemble();
+    // 2026-10-14 A13:m 维**生产档**补位 —— 原列表只有 m=1/32,而 27B prefill
+    // 的 AWQ(kU4/g=32/zp)实际跑 m=分块长(512/443/256…)。本组先做 m 扫描
+    // (小 n/k 保证 host 参考秒级),末尾带一档生产形状。
+    let mut cases: Vec<(usize, usize, usize)> =
+        [64usize, 128, 192, 256, 320, 384, 448, 512]
+            .into_iter()
+            .map(|m| (m, 1024usize, 512usize))
+            .collect();
+    cases.push((512, 5120, 5120)); // 生产:qkvz/o-proj 同维族(m=chunk)
+    for (m, n, k) in cases {
+        let (noise_ratio, max_abs) = run_awq_case(&mut client, m, n, k).await;
+        eprintln!("[awq] m={m} n={n} k={k} g=32 → 噪声/信号RMS={noise_ratio:.6} max_abs={max_abs:.5}");
+        assert!(
+            noise_ratio < 2e-2 && noise_ratio.is_finite(),
+            "awq m={m} 噪声比 {noise_ratio}"
+        );
+    }
     for (m, n, k) in [(1usize, 1024usize, 5120usize), (32usize, 5120usize, 5120usize)] {
         let (noise_ratio, max_abs) = run_awq_case(&mut client, m, n, k).await;
         eprintln!("[awq] m={m} n={n} k={k} g=32 → 噪声/信号RMS={noise_ratio:.6} max_abs={max_abs:.5}");

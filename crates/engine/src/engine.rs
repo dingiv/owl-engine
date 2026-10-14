@@ -603,6 +603,11 @@ impl<D: DeviceClient + 'static> Engine<D> {
             let mut vouts = vec![
                 OutputSlot { name: "tok".into(), shape: vec![depth1, 1], dtype: Dtype::F32 },
                 OutputSlot { name: "hid".into(), shape: vec![depth1, dims.hidden], dtype: dims.dtype },
+                // A11(2026-10-14):per-row logits 出槽 —— 投机轮的**采样接受**
+                // 需要各行目标分布(原先只有 argmax ⇒ spec 臂不采样 =
+                // 请求温度失效;A7/A8 根因,见 agent 专项 §7.11)。
+                // 贪心档不回读(零额外 D2H);仅采样档付 ~2.4MB/轮。
+                OutputSlot { name: "logits".into(), shape: vec![depth1, model_v.vocab_size()], dtype: Dtype::F16 },
             ];
             // DFlash2 target taps(E5-DF2;层输出残差流,sglang capture 同语义)
             // OWL_DFLASH_NOTAPS=1 → 退回 last_hidden(排查开关:隔离 taps 图)
@@ -695,7 +700,13 @@ impl<D: DeviceClient + 'static> Engine<D> {
                         .collect();
                     let mut ctx = ForwardCtx::model_prefill(
                         depth1, &pos, &kvs_step, &rp_v, &gdns_step, &slots_in, &lens_in,
-                        &gdn_slot, 0, None,
+                        &gdn_slot,
+                        // 捕获图:槽号是回放期输入(捕获期无真值)—— T=depth1
+                        // ≤ 16 < 64,chunked/scalar 臂结构上不可能启用,故
+                        // None 安全;若将来在此捕 ≥64 图,层侧会拒发(poisoned)
+                        // 而不是静默写槽 0(显式依赖律)
+                        None,
+                        0, None,
                     );
                     ctx.seq_cu = Some(&gdn_cu);
                     ctx.env = env_v;
@@ -738,6 +749,13 @@ impl<D: DeviceClient + 'static> Engine<D> {
                     };
                     let _ = &taps;
                     let logits = model_v.embed.lm_head_matmul(&hidden);
+                    // A11(2026-10-14):per-row logits 出槽 —— 投机轮的
+                    // **采样接受**需要各行目标分布(原先只出 argmax ⇒ spec 臂
+                    // 完全不采样,请求温度/top_p/seed 失效 = 事实贪心;
+                    // A7 工具遵循度塌陷 + A8 不可复现的根因,见
+                    // docs/arch/agent-服务面-设计与施工.md §7.11)。
+                    // 仅采样档回读(贪心档零额外 D2H)。
+                    sc.output("logits", &logits)?;
                     let rows: Vec<owl_models::tensor::TensorOps> = (0..depth1)
                         .map(|r| owl_models::ops::argmax_f32idx(&logits, vocab, r * vocab))
                         .collect();

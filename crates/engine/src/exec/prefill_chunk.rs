@@ -125,8 +125,18 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 16µs)⇒ ~170ms/chunk 白烧。注入面本就存在(verify 图先例 E5-M4:
         // `ctx.seq_cu`),eager prefill 只是没接。
         let seq_cu = TensorOps::from_host(Dtype::F32, vec![2], &f32b(&[0.0, t as f32]));
+        // 诊断(2026-10-14 A13):`OWL_PF_FENCE=1` ⇒ from_host 叶子(pos/slots/
+        // lens/id/gdn_slot)建完后插一道流栅栏 —— 判「H2D 叶子与 COMPUTE 核
+        // 无跨流序」竞态(仓内 2026-10-03 FI 表同病史:预物化修法)
+        if std::env::var_os("OWL_PF_FENCE").is_some_and(|v| v != "0") {
+            self.session.face_mut().sync().await?;
+        }
         let mut ctx = ForwardCtx::model_prefill(
-            t, &pos_t, &kvs_step, &self.rope, &gdns_step, &slots_t, &lens_t, &gdn_slot, base, fi,
+            t, &pos_t, &kvs_step, &self.rope, &gdns_step, &slots_t, &lens_t, &gdn_slot,
+            // A13(2026-10-14):chunked/scalar 臂的 rec 态寻址吃这个 host 标量
+            // —— 必须喂本会话真槽(曾恒 0 = 读写别人格 → 长 prompt 塌陷)
+            Some(gdn_slot_v),
+            base, fi,
         );
         ctx.seq_cu = Some(&seq_cu);
         ctx.env = self.env;

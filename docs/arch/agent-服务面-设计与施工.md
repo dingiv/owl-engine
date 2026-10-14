@@ -784,6 +784,60 @@ B4 自适应降级(`degrade_after=0` 不变)、`verify_xqa` / `decode_xqa`(单�
   实测 `cached_tokens=0` ×2;同会话增量仍命中)
 - **A11** = spec 臂采样化(随机投机接受 / bonus 采样) —— 修 A7/A8 的正解
 
+### 7.11 🔴 A7/A8 深挖(2026-10-14 深夜):**prefill 末行 logits 的布局相关错读**(未根治)
+
+**定谳到部件(证据链)**:工具 prompt 的**首 token 错** → 全篇复读/幻觉完成:
+
+| 观测 | 值 |
+|---|---|
+| 健康臂(prefill 末行 logits top2) | `760`("The") / 24.2-27.4,**gap 4-7** |
+| 病臂 | `28`("=") / 9.453 或 `50303` / 9.320 —— **塌平**、错 argmax |
+| argmax 核 vs host top1 | **恒一致**(28==28、760==760)⇒ 内核无罪,是 **logits 本身错** |
+| hidden `hb` | 请求内 hash **稳定**(未被覆写) |
+| int4 头 vs f16 头 | **都翻**(不是头) |
+| spec / 采样 / B4 降级 | 关掉仍翻(不是 spec;A11 已另修采样) |
+
+**关键判据 = "布局运气律"**:下列**每一个**变量都曾让结果翻转,而它们**都不是因**——
+加只读诊断(`dflash_probe` / 一次 `dtoh` / 一次 plain eval)、换 `head_quant`、换
+`launch_sync` / `free_legacy`、换 `prefill_split`、甚至**只是重启**(实测 6/6、5/6、
+0/6、0/6、5/6 跨 boot)。其中 `prefill_split` 已由**核发射账**证伪(两次 boot 的
+`srv.op.*` prefill 核逐项相同 ⇒ 该 flag 对本 prompt 是空操作)。
+
+**⚠️ 跨流 UAF 假设已证伪(2026-10-14 深夜,同一轮深挖)**:① `STREAM_H2D` 在
+`server/mod.rs` 里**从未用于任何上传**(只在流初始化出现两次)⇒ 上传/核/alloc/memset
+**全在 COMPUTE 一条流**;② 设备地址复用实测**高频**(400 行窗口 152 次)但**全部是
+COMPUTE→COMPUTE**(驱动对同流复用有流序保证)。⇒ 病灶不在 server 的流序/栅栏,
+而在 **host 跑在 GPU 前面所暴露的"发射顺序/依赖"** —— 任何 host 扰动(加打印、
+一次 dtoh、多一次 plain eval、换 boot)都会让症状翻转,正是"窗口被 host 节流关掉"
+的特征;FFI 家族(marlin/cublas)的发射已确认是 server 线程内 inline(非异步),
+故嫌疑面收窄到**命令序与求值序的一致性**。
+
+**下一个仪器(必做,1-2d)**:server 发射面加**单调序号账** —— 每条
+launch/upload/memset 打 `seq + 核名 + 块 id`;对一次工具 prompt 的 prefill 末行
+DAG(lm_head gemm → argmax)核对**命令序是否与求值序一致**(gemm 的发射是否可能
+排在 argmax 之后)。
+
+**已落缓解(未根治)**:prefill 末行两处 eval(`Narrow` 末行 + `argmax`)改走
+**plain(不回收)** —— 方向正确但实测仍随 boot 翻(布局运气)。**立案 A13**
+(引擎/backend lane):在 `resolve()`/allocator 侧打**设备地址**账,查
+「free 后地址被复用而读者在途」的窗口。
+
+**A11 同时落地(spec 臂采样化)**:verify 图新增 `logits` 出槽 + 投机轮改
+**抽-比式采样接受**(`exec/mod.rs::spec_sampled_accept_prefix`:逐行从目标分布
+抽 token 与草稿比对,首个不等处改发重抽 —— 分布精确,不依赖草稿分布)+ per-turn
+采样参数/RNG/惩罚历史接入。意义:**请求的 `temperature/top_p/seed` 在 spec 开时
+真正生效**(原为 verify 行 argmax = 事实贪心)。单测 3 + 真机 `spec.sample.rounds`>0。
+
+**pi 真机的进步与残余**:从"完全不发工具调用"→ 日志出现
+`工具块畸形(tool_call_unclosed;0B)已丢弃`(模型**发出了 `<tool_call>` 但未闭合,
+思考跑满 8192 token)⇒ 引擎侧已正确,**残余 = 长 prompt 下思考不收敛/格式不闭合**
+(模型侧,归 D2 的档位/模板 A/B)。
+
+**方法教训(本轮两次自纠)**:① `prefill_split` 与 `head_quant` 都曾是**空操作或
+布局运气**被误当因果 —— 单变量实验必须同时看**核发射账**与**设备地址账**;
+② 观测者效应(加打印即变好)本身就是最强的线索:它指向"布局/地址相关",而不是
+"语义错"。
+
 ### 7.2 魔改模板的复刻度
 
 快照模板 461 行含:工具格式指令块、连续失败警告启发式(`_strong_error`/`_weak_error`)、
@@ -857,7 +911,7 @@ B4 自适应降级(`degrade_after=0` 不变)、`verify_xqa` / `decode_xqa`(单�
 
 | 日期 | 版本 | 变更 |
 |---|---|---|
-| 2026-10-14 | v0.8 | **第二批交付**:AGT-06(per-turn 采样/stop/seed,引擎侧 `TurnOpts`)/07(reasoning_effort 直通)/09(implicit_session)/10(abort)/11(chunked)/12(cached_tokens 真值含块级命中)/13(定档维持 16k);B1-B4(`[agent]` 配置模块 + e2e agent L1 七段 + `agent_gates.sh`);A3/A4/A5 ✅;D1 ✅(**两层前缀复用 + G4 真值门**:同会话 88% / 跨会话 89%)、D3(agent 域 AL 2.68)、D4(4 并发无并行);**新增 §7.8 A8 = spec 臂 token 级非路径稳定**(与 A7 疑同源,恒等/真值门一律 spec-off 跑);实测数字全部入 §7.9。 |
+| 2026-10-14 | v0.9 | **§7.11:A7/A8 深挖** —— 定谳到 **prefill 末行 logits 的布局相关错读**(布局运气律:所有变量都是扰动而非因;`prefill_split` 由核发射账证伪)⇒ 真凶 = 释放块**设备地址复用**(UAF 类),**未根治**,已落 plain-eval 缓解 + 立案 A13;**A11 spec 臂采样化落地**(verify 出 logits 槽 + 抽-比式接受,分布精确,单测+真机);G4 口径定谳(token 级只在 spec-off);pi 真机进步到"发 `<tool_call>` 未闭合"(残余归 D2) |\n| 2026-10-14 | v0.8 | **第二批交付**:AGT-06(per-turn 采样/stop/seed,引擎侧 `TurnOpts`)/07(reasoning_effort 直通)/09(implicit_session)/10(abort)/11(chunked)/12(cached_tokens 真值含块级命中)/13(定档维持 16k);B1-B4(`[agent]` 配置模块 + e2e agent L1 七段 + `agent_gates.sh`);A3/A4/A5 ✅;D1 ✅(**两层前缀复用 + G4 真值门**:同会话 88% / 跨会话 89%)、D3(agent 域 AL 2.68)、D4(4 并发无并行);**新增 §7.8 A8 = spec 臂 token 级非路径稳定**(与 A7 疑同源,恒等/真值门一律 spec-off 跑);实测数字全部入 §7.9。 |
 | 2026-10-14 | v0.7 | 清 A 组引擎债三项:**A1 拒启可见**(四项真机实测)/ **A2 `snap_max=0` 不再 panic**(真机 4/4、零 503)/ **A6 think 别名**(+单测);生产档回归绿(wire 17/17、lag 4/4、pi 全链 1 次成功)。**新增 A7:工具调用遵循度实测 1/9**(模型倾向直接作答+幻觉完成,日志证明非解析丢失)= 现第一优先,台账见 `roadmap.local/agent-服务面-剩余工作项-2026-10-14.md`。 |
 | 2026-10-14 | v0.6 | **T7 PASS + §7.7 结案**:病灶 = `rep_penalty` 逐元素施加 ⇒ `1.15^k` 指数累积(短输出无感、长思考必崩),已修(去重 + 默认 1.0,单测 7/7);真机生产形状(froggeric + spec d7 + fp8/XQA)pi↔owl 全链跑通,产物文件落地。**M-A 达成**。另记:本轮另修引擎 3 项(XQA 页表恒等链 × 多会话、配置错误静默 exit、`snap_max=0` panic 立案)。 |
 | 2026-10-14 | v0.5 | **§7.6 结案并修复**:定谳更正为 **XQA 页表恒等链**(fp8 只是触发条件 —— XQA 前置为 fp8 池;V11 消歧);修法 = 页表改走图输入槽 + `xqa_pt_of` 会话真链,三处触点;验证 = 生产形状 lag 4/4 + 27B 冒烟 17/17 + XQA 恒等探针;agent 档收回生产形状;影响面(多请求接受率/质量读数需复核)已记账。 |

@@ -100,6 +100,22 @@ pub(crate) fn decode_delta(tok: &Tokenizer, out: &[u32], decoded: &mut String) -
     emit
 }
 
+/// **采样接受的前缀长度**(A11,2026-10-14):首个 `drafts[i] != sampled[i]`
+/// 的 `i`。语义 = 发射 `sampled[0..=m]`(前 m 个恰等于 drafts,末位是
+/// 在拒绝点的重抽)。
+///
+/// 分布正确性(逐位归纳):发 x 的概率 =
+///   P(s=draft)·1[x=draft] + P(s≠draft)·P(s=x | s≠draft) = p_target(x)
+/// —— 即"抽-比"式投机采样,**不依赖草稿分布**(DFlash2 选择器只有 lattice
+/// 码本、无全词表分布 ⇒ 无法用 p/q 比值式)。
+pub(crate) fn spec_sampled_accept_prefix(drafts: &[u32], sampled: &[u32]) -> usize {
+    drafts
+        .iter()
+        .zip(sampled.iter())
+        .take_while(|(d, s)| d == s)
+        .count()
+}
+
 /// 字节偏移向下取 char 边界(超界 = 全长;切 `&str` 前必须过一道)
 pub(crate) fn floor_boundary(s: &str, i: usize) -> usize {
     if i >= s.len() {
@@ -131,6 +147,31 @@ pub(crate) fn safe_end(s: &str, stops: &[String]) -> usize {
     end
 }
 
+
+#[cfg(test)]
+mod spec_accept_tests {
+    use super::spec_sampled_accept_prefix;
+
+    /// 全同 ⇒ 全接受(深度 = drafts 长度)
+    #[test]
+    fn all_match_accepts_everything() {
+        assert_eq!(spec_sampled_accept_prefix(&[1, 2, 3], &[1, 2, 3, 9]), 3);
+    }
+
+    /// 首个不等处停(末位是重抽,不参与接受)
+    #[test]
+    fn first_mismatch_stops() {
+        assert_eq!(spec_sampled_accept_prefix(&[1, 2, 3], &[1, 7, 3, 4]), 1);
+        assert_eq!(spec_sampled_accept_prefix(&[1, 2, 3], &[9, 2, 3, 4]), 0);
+    }
+
+    /// 边界:空草稿 / 采样表短于草稿(取较短者,不越界)
+    #[test]
+    fn bounds_are_safe() {
+        assert_eq!(spec_sampled_accept_prefix(&[], &[1]), 0);
+        assert_eq!(spec_sampled_accept_prefix(&[1, 2], &[1]), 1);
+    }
+}
 
 #[cfg(test)]
 mod stop_tests {

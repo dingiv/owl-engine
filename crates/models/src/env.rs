@@ -318,8 +318,11 @@ impl EnvProvider {
                 verify_xqa: d.verify_xqa,
                 decode_xqa: d.decode_xqa,
                 // FI **恒启用**(2026-10-13 用户令:移除开关,没有不启用的情况;
-                // 原 dispatch.flashinfer 已删)
-                fi: true,
+                // 原 dispatch.flashinfer 已删)。
+                // ⚠️ 诊断 A/B(2026-10-14 A13 立案):`OWL_DIAG_NO_FI=1` 只服务
+                // 「FI 读核 vs 自研读核」同 boot 同分块的单变量对照(缺省 = 恒启用,
+                // 生产语义零变化;确认病灶后可撤)
+                fi: !owl_shared::env_reader::flag("OWL_DIAG_NO_FI"),
             },
             gdn: GdnEnv {
                 chunked: d.gdn_chunked,
