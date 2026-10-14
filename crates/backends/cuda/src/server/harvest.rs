@@ -298,19 +298,41 @@ impl GpuServer {
         want_bytes: usize,
         ack: Ack<Result<Vec<u8>, ModelError>>,
     ) {
-        // 路由:D2H 流(结果收割维)。先排空 COMPUTE:kernel 在 COMPUTE 流,
-        // 本 memcpy 在 D2H 流 —— 跨流无保序,不排空则读块与产出 kernel 竞速
-        // (实测:真模型单步中途 dtoh 读到全零块;sync 后重读同块数据完好
-
-        // —— 2026-09-26 塔零案定谳,interpreter-tap.md)。收割路径本就阻塞
-        // 等回调,排空无额外代价;htod 侧 async+sync 已内建,无对称问题。
+        // 路由:D2H 流(结果收割维)。
+        //
+        // **跨流保序(2026-09-26 塔零案 / 2026-10-14 P1′-laneC 定向化)**:kernel
+        // 在 COMPUTE 流, 本 memcpy 在 D2H 流 —— 跨流无保序,不排空则读块与产出
+        // kernel 竞速(实测:真模型单步中途 dtoh 读到全零块)。
+        // 旧修法 = `STREAM_COMPUTE.synchronize()`(整流排空,阻塞**服务端线程**
+        // ⇒ 整条命令管道被钉死)。新修法 = **事件定向等待**:在 COMPUTE 当前尾记
+        // 一个事件,D2H 流 wait 它 ⇒ 拷贝必然排在“本 dtoh 之前已入队”的全部产出
+        // 核之后 —— **保序强度与整流 sync 同源**(事件记在尾上 = 等它 = 等此前全部),
+        // 但服务端不等,后续命令照跑。
+        // `diag.legacy_sync`(全同步归因档)= 退回整流 sync(A/B 与回退)。
+        let compute = match self.ctx().stream(STREAM_COMPUTE) {
+            Ok(s) => s.clone(),
+            Err(e) => return ack.send(Err(e)),
+        };
+        let stream = match self.ctx().stream(STREAM_D2H) {
+            Ok(s) => s.clone(),
+            Err(e) => return ack.send(Err(e)),
+        };
         let t_d2h = (want_bytes <= 64 && self.probes.d2h_prof).then(std::time::Instant::now);
-        if let Err(e) = self
-            .ctx()
-            .stream(STREAM_COMPUTE)
-            .and_then(|s| s.synchronize().map_err(|e| ModelError::Msg(format!("sync: {e:?}"))))
-        {
-            return ack.send(Err(e));
+        if self.diag.legacy_sync {
+            if let Err(e) = compute.synchronize().map_err(|e| ModelError::Msg(format!("sync: {e:?}"))) {
+                return ack.send(Err(e));
+            }
+        } else {
+            match compute.record_event(None) {
+                Ok(ev) => {
+                    if let Err(e) = stream.wait(&ev) {
+                        return ack.send(Err(ModelError::Msg(format!("dtoh 跨流事件等待: {e:?}"))));
+                    }
+                }
+                Err(e) => {
+                    return ack.send(Err(ModelError::Msg(format!("dtoh 跨流事件记入: {e:?}"))));
+                }
+            }
         }
         // 取证(B6.3 后泄漏案):每次收割刷新设备余量账(engine 侧逐 turn 打印;
         // cuMemGetInfo µs 级,收割频度下零税)
@@ -318,12 +340,8 @@ impl GpuServer {
             owl_shared::vram::free_set(free as u64);
         }
         if let Some(t) = t_d2h {
-            self.sink.logf(owl_shared::log::LVL_DEBUG, "d2h-prof", format_args!("sync={:?} n={want_bytes}", t.elapsed()));
+            self.sink.logf(owl_shared::log::LVL_DEBUG, "d2h-prof", format_args!("序={:?} n={want_bytes}", t.elapsed()));
         }
-        let stream = match self.ctx().stream(STREAM_D2H) {
-            Ok(s) => s.clone(),
-            Err(e) => return ack.send(Err(e)),
-        };
         let t_d2h2 = t_d2h;
         let mut ack = Some(ack);
         match self.try_dtoh(&stream, id, want_bytes) {

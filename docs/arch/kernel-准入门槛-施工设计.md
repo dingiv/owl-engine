@@ -1678,7 +1678,7 @@ pub fn source(name: &str) -> &'static str {
 
 | 后果 | 实测 |
 |---|---|
-| **白名单硬门放不进它们** | `--flavor awq27b testdata/server/bench-27b-std.toml` **整档起不来**:流式请求全被准入门拒,`out=0`、TTFT 假性 14ms(测速工具把空响应算成 39912 t/s 的伪影) |
+| **白名单硬门放不进它们** | `--flavor awq27b testdata/args/bench-27b-std.toml` **整档起不来**:流式请求全被准入门拒,`out=0`、TTFT 假性 14ms(测速工具把空响应算成 39912 t/s 的伪影) |
 | **池写集穷举审计不覆盖** | E10(漏写者⇒槽区全零)/ E14(双寻址)两类"不崩但胡说"的 bug 无机器判据 |
 | **`REGISTRY` 退不了役** | 名字→源/槽序/dtype 的第二份手抄继续存在(§15.12.2 留的冗余) |
 
@@ -1734,7 +1734,7 @@ cu/dflash/ ← ops/dflash.rs   (2)
 
 #### 15.13.6 in-tree 配置漂移定谳 + 修复
 
-`testdata/server/bench-27b-std.toml` 与 flavor 白名单**两面同时对不上**(该 config 早于 P4 白名单硬门):
+`testdata/args/bench-27b-std.toml` 与 flavor 白名单**两面同时对不上**(该 config 早于 P4 白名单硬门):
 
 | 面 | config | `awq27b` flavor 台账 |
 |---|---|---|

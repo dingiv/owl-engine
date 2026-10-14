@@ -17,6 +17,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use super::observe::{BlockRef, BlockStats, NodeEvent, Tap, Want};
+use super::planner::BlockPool;
 
 // ============================================================================
 // §0 性能钩子(perf-framework.md §四)
@@ -72,6 +73,16 @@ fn perf_rec(tag: &str, dur: std::time::Duration) {
 #[inline]
 fn perf_cnt(tag: &str, n: u64) {
     owl_shared::metrics::with_metrics_store(|s| s.counter_add(tag, n, file!(), line!()));
+}
+
+/// 块池预算(字节;**0 / 缺省 = 关**)。P1″ 2026-10-14。
+///
+/// 门 = env `OWL_BLOCK_POOL`(与本文件的 `OWL_NO_RECLAIM` 同一「诊断/调优门」
+/// 先例),**`OnceLock` 缓存一次** ⇒ 热路径零 env 查询。
+/// 引擎侧后续应升格为 `OwlConfig` 键(本 lane 文件面不含 engine/,见报告)。
+fn block_pool_budget() -> usize {
+    static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| owl_shared::env_reader::parse::<usize>("OWL_BLOCK_POOL").unwrap_or(0))
 }
 
 /// 分段秒表(`Call` 臂宿主链分段:resolve/build/alloc/lower/launch)
@@ -185,7 +196,7 @@ where
             EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new(),
                 arena_set: std::collections::HashSet::new(),
                 block_users: std::collections::HashMap::new(),
-                pending: std::collections::HashMap::new(), reclaim: false, perf, env };
+                pending: std::collections::HashMap::new(), reclaim: false, perf, env, pool: None };
         let root = _eval_rec(t, &mut ctx).await?;
         // 非 scoped 口径:竞技场原样丢弃(块常驻,历史行为不变)
         Ok(root)
@@ -229,14 +240,38 @@ pub fn eval_ops_scoped_env<'a, D>(
 where
     D: crate::contract::DeviceClient + 'a,
 {
+    eval_ops_scoped_env_pool(t, face, env, block_pool_budget())
+}
+
+/// scoped 求值 + **显式块池预算**(0 = 关;P1″)。
+/// 测试面直传预算 ⇒ 不依赖进程级 env;生产入口走 [`block_pool_budget`]。
+#[allow(clippy::type_complexity)] // 手写 boxed async fn 返回型
+pub(crate) fn eval_ops_scoped_env_pool<'a, D>(
+    t: &'a TensorOps,
+    face: &'a mut D,
+    env: crate::env::EnvProvider,
+    pool_budget: usize,
+) -> Pin<Box<dyn Future<Output = Result<(Bytes, Vec<u64>), ModelError>> + Send + 'a>>
+where
+    D: crate::contract::DeviceClient + 'a,
+{
     Box::pin(async move {
         let perf = PerfCtx::of(&env);
         let mut ctx =
             EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new(),
                 arena_set: std::collections::HashSet::new(),
                 block_users: std::collections::HashMap::new(),
-                pending: count_pending(t), reclaim: std::env::var("OWL_NO_RECLAIM").is_err(), perf, env };
-        let root = _eval_rec(t, &mut ctx).await?;
+                pending: count_pending(t), reclaim: std::env::var("OWL_NO_RECLAIM").is_err(), perf, env,
+                pool: (pool_budget > 0).then(|| BlockPool::new(pool_budget)) };
+        let r = _eval_rec(t, &mut ctx).await;
+        // 池**无论成败都要抽干**:错误路径不抽 = 缓存块被遗弃而 server 仍认
+        // 它们 owned(真漏显存)。主路错优先(池错只降级不掩盖)。
+        let flushed = ctx.flush_pool().await;
+        let root = match (r, flushed) {
+            (Ok(root), Ok(())) => root,
+            (Ok(_), Err(e)) => return Err(e),
+            (Err(e), _) => return Err(e),
+        };
         let mut candidates = std::mem::take(&mut ctx.arena);
         candidates.retain(|id| *id != root.id && ctx.arena_set.contains(id));
         Ok((root, candidates))
@@ -273,7 +308,7 @@ where
             EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new(),
                 arena_set: std::collections::HashSet::new(),
                 block_users: std::collections::HashMap::new(),
-                pending: std::collections::HashMap::new(), reclaim: false, perf, env };
+                pending: std::collections::HashMap::new(), reclaim: false, perf, env, pool: None };
         let mut out = Vec::with_capacity(roots.len());
         for r in roots {
             out.push(_eval_rec(r, &mut ctx).await?);
@@ -304,15 +339,18 @@ where
             }
         }
         let perf = PerfCtx::of(&env);
+        let pool_budget = block_pool_budget();
         let mut ctx =
             EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new(),
                 arena_set: std::collections::HashSet::new(),
                 block_users: std::collections::HashMap::new(),
-                pending, reclaim: true, perf, env };
+                pending, reclaim: true, perf, env,
+                pool: (pool_budget > 0).then(|| BlockPool::new(pool_budget)) };
         let mut out = Vec::with_capacity(roots.len());
         for r in roots {
             out.push(_eval_rec(r, &mut ctx).await?);
         }
+        ctx.flush_pool().await?;
         let root_ids: std::collections::HashSet<u64> = out.iter().map(|b| b.id).collect();
         let mut candidates: Vec<u64> = std::mem::take(&mut ctx.arena);
         candidates.retain(|id| !root_ids.contains(id) && ctx.arena_set.contains(id));
@@ -341,7 +379,7 @@ where
             EvalCtx { face, memo: std::collections::HashMap::new(), tap: Some(tap), arena: Vec::new(), env,
                 arena_set: std::collections::HashSet::new(),
                 block_users: std::collections::HashMap::new(),
-                pending: std::collections::HashMap::new(), reclaim: false, perf };
+                pending: std::collections::HashMap::new(), reclaim: false, perf, pool: None };
         _eval_rec(t, &mut ctx).await
     })
 }
@@ -369,13 +407,24 @@ struct EvalCtx<'a, D> {
     /// 解释器执行环境(EnvProvider;默认 = Cpu + 生产基线 —— Call 臂
     /// 对 Cpu 回退 face.op_env() 旧径,存量调用点零迁移)
     env: crate::env::EnvProvider,
+    /// **块池**(P1″;`None` = 存量逐节点 alloc/free 路径不变)
+    /// 只在 scoped(reclaim=true)入口装载 —— plain/multi/tap 口径
+    /// (图捕获面)零改动:捕获窗分配会烙进图,不能改分配模式。
+    pool: Option<BlockPool>,
 }
 
-impl<'a, D> EvalCtx<'a, D> {
-    /// 新块登记:竞技场 + 成员速查 + 块归属 = 1
+impl<'a, D> EvalCtx<'a, D>
+where
+    D: crate::contract::DeviceClient,
+{
+    /// 新块登记:竞技场 + 成员速查 + 块归属 = 1。
+    /// 池命中会复用**已登记**的 id(它本就在 arena 里)⇒ 只在首次见到该 id
+    /// 时推 arena,避免候选表出现重复项(重复项不会错值,但会令
+    /// `srv.count.free_blocks` / 候选表口径失真)。
     fn track_new(&mut self, id: u64) {
-        self.arena.push(id);
-        self.arena_set.insert(id);
+        if self.arena_set.insert(id) {
+            self.arena.push(id);
+        }
         *self.block_users.entry(id).or_insert(0) += 1;
     }
 
@@ -384,6 +433,74 @@ impl<'a, D> EvalCtx<'a, D> {
         if self.arena_set.contains(&id) {
             *self.block_users.entry(id).or_insert(0) += 1;
         }
+    }
+
+    /// 输出块获取(**块池面**;P1″):命中池 = **零命令**复用死块;
+    /// 未命中 = 落 server 真分配并登记容量。
+    /// `zeroed`(`Op::Zeros` 语义)在命中时必须补一次设备侧 memset ——
+    /// 池块内容 = 上一位使用者的旧值(契约:Zeros 即零化)。
+    /// **不在此登记竞技场**:`track_new` 由调用方统一调用(单一拼写;
+    /// 命中/未命中在调用方眼里都是「一个新输出块」)。
+    async fn alloc_out(
+        &mut self,
+        dtype: Dtype,
+        n_elems: usize,
+        zeroed: bool,
+    ) -> Result<Bytes, ModelError> {
+        let n_bytes = n_elems * dtype.size_bytes();
+        let hit = self.pool.as_mut().and_then(|p| p.take(n_bytes));
+        if let Some(id) = hit {
+            // 池命中**必须照样计入 slab_hint 计量**(与 server 真分配侧同口径):
+            // 捕获 slab 的定量靠 GraphPlan warmup dry-run 计量闭包需求,而捕获窗
+            // 走 plain 入口(pool=None)⇒ 若命中不计,量得的 slab 会**偏小**,
+            // 捕获当场炸「捕获 slab 耗尽」(2026-10-14 实测:27B spec-dflash 开池
+            // 即 boot 失败,slab 7.69MB 差 81KB)。计量语义 = 闭包需求,与"是否复用"无关。
+            owl_shared::slab_hint::meter_add(n_bytes as u64);
+            let b = Bytes::new(id, n_elems);
+            if zeroed {
+                self.face.memset_zero(&b, n_bytes).await?;
+            }
+            return Ok(b);
+        }
+        let b = if zeroed {
+            self.face.alloc(dtype, n_elems).await?
+        } else {
+            self.face.alloc_uninit(dtype, n_elems).await?
+        };
+        if let Some(p) = self.pool.as_mut() {
+            p.register(b.id, n_bytes);
+        }
+        Ok(b)
+    }
+
+    /// 归还一个已死块(DAG 上再无消费者):入池 = **零命令**;否则真 free。
+    async fn release_block(&mut self, id: u64) -> Result<(), ModelError> {
+        if self.pool.as_mut().is_some_and(|p| p.give_back(id)) {
+            return Ok(());
+        }
+        self.face.free(&[id]).await
+    }
+
+    /// 收尾:抽干池,**一条批量 free**(替代 N 条逐块 free)。
+    async fn flush_pool(&mut self) -> Result<(), ModelError> {
+        let Some(mut p) = self.pool.take() else {
+            return Ok(());
+        };
+        let ids = p.drain();
+        let st = p.stats();
+        if st.hit + st.miss > 0 {
+            // 池账落 metrics(counters 级;`/debug/metrics/interp.pool.`)
+            perf_cnt("interp.pool.hit", st.hit);
+            perf_cnt("interp.pool.miss", st.miss);
+            perf_cnt("interp.pool.in_pool", st.in_pool);
+            perf_cnt("interp.pool.spilled", st.spilled);
+            perf_cnt("interp.pool.flush_blocks", st.flush_blocks);
+            perf_cnt("interp.pool.peak_cached_bytes", st.peak_cached_bytes as u64);
+        }
+        if !ids.is_empty() {
+            self.face.free(&ids).await?;
+        }
+        Ok(())
     }
 }
 
@@ -505,7 +622,7 @@ where
             b
         }
         Op::Zeros => {
-            let b = ctx.face.alloc(dtype, n_elems).await?;
+            let b = ctx.alloc_out(dtype, n_elems, true).await?;
             ctx.track_new(b.id);
             b
         }
@@ -519,7 +636,7 @@ where
             // k = 内维 = x 声明 shape 末维(C1:只读声明 shape;原取 ins[0].len
             // 在多行 [m,k] 时越界读 —— 此 bug 被"历届测试都单行"掩盖)
             let k = t.parents[0].shape.last().copied().unwrap_or(0);
-            let out = ctx.face.alloc_uninit(dtype, m * n).await?;
+            let out = ctx.alloc_out(dtype, m * n, false).await?;
             ctx.track_new(out.id);
             if dtype == Dtype::F16 || dtype == Dtype::BF16 {
                 // f16/bf16:foreign-kernel 通道(cuBLAS;nt = owl Linear 惯例)。
@@ -608,7 +725,7 @@ where
             if let Some(l) = lap.as_mut() {
                 l.lap("interp.host.seg.build");
             }
-            let out = ctx.face.alloc_uninit(dtype, n_elems).await?;
+            let out = ctx.alloc_out(dtype, n_elems, false).await?;
             if let Some(l) = lap.as_mut() {
                 l.lap("interp.host.seg.alloc");
             }
@@ -655,7 +772,7 @@ where
                     }
                     if *u == 0 && bid != out.id && ctx.arena_set.contains(&bid) {
                         ctx.arena_set.remove(&bid);
-                        ctx.face.free(&[bid]).await?;
+                        ctx.release_block(bid).await?;
                     }
                 }
             }
@@ -743,6 +860,76 @@ mod liveness_tests {
         face.dtoh(&root, &mut buf).await.expect("根 dtoh");
         let v = f32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         assert!((v - 27.0).abs() < 1e-5, "应 27.0,得 {v}");
+    }
+
+    /// **块池命中 + `Zeros` 补零的确定性见证**(P1″)。
+    ///
+    /// 构造一个确定性求值序:先释放一个**非零**块,紧接着一个 `Zeros`
+    /// 节点取块 ——
+    ///   `a = (x·c) + one` ⇒ `x·c` 的输出块在 a 节点结束处被释放(16B,非零);
+    ///   `v = a + zeros(4)` ⇒ zeros 节点在 a **之后**求值,best-fit/LIFO 恰好
+    ///   取到那个非零块。
+    /// 若命中后漏掉 `memset_zero`,zeros 块会带着 18.0 的真值 ⇒ v = 37 而非 19。
+    /// (CpuFace 的 `alloc` 恒零化,故「池关」口径 = 金标;两口径逐位对比。)
+    #[tokio::test]
+    async fn pool_hit_zeroed_node_is_really_zeroed() {
+        for budget in [0usize, 1 << 20] {
+            let mut face = owl_cpu::CpuFace::new();
+            let c = TensorOps::from_host(Dtype::F32, vec![4], &f32b(&[2.0; 4]));
+            let one = TensorOps::from_host(Dtype::F32, vec![4], &f32b(&[1.0; 4]));
+            let x = TensorOps::from_host(Dtype::F32, vec![4], &f32b(&[9.0; 4]));
+            let a = x.mul(&c).add(&one);
+            let v = a.add(&TensorOps::zeros(Dtype::F32, vec![4]));
+            let (root, cands) = eval_ops_scoped_env_pool(
+                &v, &mut face, crate::env::EnvProvider::default(), budget,
+            )
+            .await
+            .expect("scoped eval");
+            let mut buf = vec![0u8; 16];
+            face.dtoh(&root, &mut buf).await.expect("根 dtoh");
+            let got = decode_host(Dtype::F32, &buf);
+            for g in &got {
+                assert!(
+                    (g - 19.0).abs() < 1e-5,
+                    "budget={budget}: 期望 19(=9×2+1),得 {got:?}(38 则 = 漏了命中后的 memset)"
+                );
+            }
+            // 池收尾已抽干 ⇒ 候选表不应包含池内块(两口径都不重复交还)
+            assert!(cands.is_empty(), "budget={budget}: 候选表应空,得 {}", cands.len());
+        }
+    }
+
+    /// **逐层同形循环:池开 / 池关两口径逐位一致**(复用不得改值)。
+    /// 形状 = prefill 的真实分配形状(每层同形 → 池跨层命中)。
+    #[tokio::test]
+    async fn pool_reuse_matches_pool_off_bit_exact() {
+        let build = || {
+            let c = TensorOps::from_host(Dtype::F32, vec![8], &f32b(&(0..8).map(|i| i as f32 * 0.5).collect::<Vec<f32>>()));
+            let b = TensorOps::from_host(Dtype::F32, vec![8], &f32b(&(0..8).map(|i| 1.0 + i as f32).collect::<Vec<f32>>()));
+            let mut x = TensorOps::from_host(Dtype::F32, vec![8], &f32b(&[1.5; 8]));
+            for _ in 0..6 {
+                x = x.mul(&c).add(&b);
+            }
+            x
+        };
+        let mut f_off = owl_cpu::CpuFace::new();
+        let (r_off, _) = eval_ops_scoped_env_pool(
+            &build(), &mut f_off, crate::env::EnvProvider::default(), 0,
+        )
+        .await
+        .expect("池关");
+        let mut off = vec![0u8; 32];
+        f_off.dtoh(&r_off, &mut off).await.expect("dtoh off");
+        let mut f_on = owl_cpu::CpuFace::new();
+        let (r_on, cands_on) = eval_ops_scoped_env_pool(
+            &build(), &mut f_on, crate::env::EnvProvider::default(), 1 << 20,
+        )
+        .await
+        .expect("池开");
+        let mut on = vec![0u8; 32];
+        f_on.dtoh(&r_on, &mut on).await.expect("dtoh on");
+        assert_eq!(on, off, "池开/池关两口径必须逐位一致");
+        assert!(cands_on.is_empty(), "候选表应空(池块已入池、不减 arena)");
     }
 }
 

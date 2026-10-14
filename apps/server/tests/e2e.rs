@@ -19,8 +19,8 @@ const PORT: u16 = 8135;
 const HEALTH_TIMEOUT_SECS: u64 = 180;
 const REQ_TIMEOUT_SECS: u64 = 300;
 
-/// server 配置(testdata/server/e2e-27b.toml;口径来由见该文件头注)
-const CONFIG: &str = include_str!("../../../testdata/server/e2e-27b.toml");
+/// server 配置(testdata/args/e2e-27b.toml;口径来由见该文件头注)
+const CONFIG: &str = include_str!("../../../testdata/args/e2e-27b.toml");
 
 // ── 测试骨架(2026-10-13 按两条律重写)───────────────────────────────
 // 律 #1:可失败函数的返回值**不许丢弃**;律 #2:可失败逻辑**不许**写成

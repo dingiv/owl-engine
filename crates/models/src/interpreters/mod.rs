@@ -11,6 +11,7 @@
 //! | 装载 | [`crate::formats::load`] | Loadable::layout → 取数/变换/物化(流式分块 + 并发流水) | [`eval_load`] |
 //! | 观测面(tap) | [`observe`] | 节点级单步调试的事件词汇与协议(挂在 eval 归约点) | [`observe::Tap`] / [`observe::StatsTap`] |
 //! | 生成 | [`generate`] | 步循环域:GenSpec 声明 + 逐 step 驱动整模单树(采样/停机) | [`eval_generate`] |
+//! | 内存规划 | [`planner`] | 块池:块粒度 slab 复用(best-fit + liveness 驱动;社区 port 自 llama.cpp ggml_gallocr) | [`planner::BlockPool`] |
 //!
 //! 新变体(图捕获回放、量化装载、其他平台)按域另起文件,公共词汇
 //! 上提至本文件 —— 勿在变体间互相依赖。
@@ -25,6 +26,7 @@
 pub mod eval;
 pub mod generate;
 pub mod observe;
+pub mod planner;
 
 pub use eval::{eval, eval_ops, eval_ops_multi, eval_ops_multi_env, eval_ops_multi_scoped_env, eval_ops_env, eval_ops_scoped, eval_ops_scoped_env, eval_ops_tap};
 pub use generate::{eval_generate, GenSpec, Sampling};

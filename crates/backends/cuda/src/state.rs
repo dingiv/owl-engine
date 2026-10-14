@@ -23,6 +23,12 @@ pub struct DiagOpts {
     pub launch_sync: bool,
     /// 旁路事件钉序(原 OWL_FREE_LEGACY;崩坏案 A/B 判别)
     pub free_legacy: bool,
+    /// **全同步归因档**(回退档, 2026-10-14 P1′-laneC):true = 块回收栅栏退回
+    /// 「任一 Owned 块即发栅栏 + 恒等 H2D/D2H」(旧语义),且 dtoh 退回整流
+    /// `STREAM_COMPUTE.synchronize()`。默认 false = 新语义(按块定向栅栏 /
+    /// dtoh 事件定向等待)。用作性能 A/B 与出事回退。
+    /// 由 `cuda.launch_sync` 携带(该档本就是“全同步归因”、性能杀手勿常开)。
+    pub legacy_sync: bool,
     /// server 提交计时(server probes 面;DiagOpts 一体携带免双参)
     pub launch_time: bool,
     /// dtoh 分相(server probes 面)
@@ -49,6 +55,7 @@ impl DiagOpts {
             cap_prof: c.cap_prof,
             launch_sync: c.launch_sync,
             free_legacy: c.free_legacy,
+            legacy_sync: c.launch_sync,
             launch_time: c.launch_time,
             d2h_prof: c.d2h_prof,
             gpu_prof: c.gpu_prof,
@@ -741,29 +748,58 @@ impl GpuCtx {
     /// 中间块回收(E2a):移除 Owned 块(CudaSlice drop → 流序
     /// free_async 归还设备池);Carved 块(slab 切片)跳过不删;
     /// 未知 id 容错跳过(幂等)。返回实际回收数。
-    /// **E5 跨流回收律(2026-10-08 崩坏案修正)**:free_async 落在块自身
-    /// 分配流(htod 块 = H2D,队列浅,free 立即归池),而 COMPUTE 可能
-    /// 还压着该块的在途读者(65 层深队列)——设备池把同址发给下一个
-    /// alloc 即成跨流 UAF。旧注“流序安全”仅对同流复用成立。修法:drop
-    /// 前 COMPUTE 记事件,H2D/D2H wait 之 —— free 被钉在读者排空后,任意
-    /// 流复用皆安全;COMPUTE 同流复用本就保序不受影响。指纹全吻合:
-    /// dtoh 排空掩蔽 / bisect 0/10 / GDN 臂无关 / 冷 boot 首选(与塔零
-    /// 案同病,当时只修了 dtoh 侧)。捕获期跳过(事件会被烤进图)。
+    ///
+    /// **E5 跨流回收律(2026-10-08 崩坏案修正)+ 定向化(2026-10-14 P1′-laneC)**:
+    /// free_async 落在**块自身分配流**。危险集合 = **分配流 ≠ COMPUTE 的块** ——
+    /// 实测只有 htod dst(分配在 H2D、队列浅 ⇒ free 立即归池),而 COMPUTE 可能
+    /// 还压着该块的在途读者(65 层深队列)⇒ 设备池把同址发给下一个 alloc 即成
+    /// 跨流 UAF。旧注“流序安全”仅对同流复用成立。修法:drop 前 COMPUTE 记事件,
+    /// **需要钉序的那些流** wait 之 —— free 被钉在读者排空后,任意流复用皆安全。
+    /// COMPUTE 分配的块 free 落在 COMPUTE 自身(深队列),流序天然保序
+    /// ⇒ **无需栅栏**(实测这类占 ~98%)。
+    ///
+    /// ⚠️ 旧实现按「任一 Owned 块」发栅栏 ⇒ 每 chunk ~2900 道栅栏,把 H2D 流
+    /// 钉在 COMPUTE 尾上(nsys:H2D 5863 次等待 = 808.9 ms)⇒ 下一发 htod 卡住
+    /// ⇒ 等回执的客户端卡住 ⇒ **管道永远跑不到前面**(设备 idle 85%)。
+    /// 捕获期跳过(事件会被烤进图)。
     pub(super) fn free_blocks(&mut self, ids: &[u64]) -> usize {
-        let any_owned = ids
-            .iter()
-            .any(|id| self.blocks.get(id).is_some_and(|e| matches!(e.block, Block::Owned(_))));
-        // diag.free_legacy:旁路事件钉序(崩坏案 A/B 判别;性能画像用)
-        if any_owned && self.capture.is_none() && !self.diag.free_legacy {
-            if let (Ok(comp), Ok(h2d), Ok(d2h)) = (
-                self.stream(STREAM_COMPUTE),
-                self.stream(STREAM_H2D),
-                self.stream(STREAM_D2H),
-            ) {
-                if let Ok(ev) = comp.record_event(None) {
-                    let _ = h2d.wait(&ev);
-                    let _ = d2h.wait(&ev);
-                } // 事件失败回旧语义(不让回收路径崩)
+        if self.capture.is_none() && !self.diag.free_legacy {
+            let fence = self.fence_targets(ids);
+            if !fence.is_empty() {
+                // 可观测面(父会话收口验收用):实发栅栏数 / 等待流数 / 被定向化省掉数
+                self.sink.count("srv.count.free_fence", 1);
+                self.sink.count("srv.count.free_fence_streams", fence.len() as u64);
+                let sink = self.sink;
+                if let Ok(comp) = self.stream(STREAM_COMPUTE) {
+                    if let Ok(ev) = comp.record_event(None) {
+                        for s in &fence {
+                            // 家规:可失败返回值不吞 —— 栅栏失败降级为**可见**事件
+                            // (块回收照跑;后续复用由设备池的保守分配兜底)
+                            if let Err(e) = s.wait(&ev) {
+                                sink.logf(
+                                    owl_shared::log::LVL_WARN,
+                                    "free-fence",
+                                    format_args!("跳流栅栏 wait 失败(已降级;若见跨流脏读请查此): {e:?}"),
+                                );
+                            }
+                        }
+                    } // 事件创建失败 = 回旧语义(不让回收路径崩),但记一笔
+                    else {
+                        sink.logf(
+                            owl_shared::log::LVL_WARN,
+                            "free-fence",
+                            format_args!("跳流栅栏 event 创建失败(本次回收无钉序)"),
+                        );
+                    }
+                }
+            } else if ids
+                .iter()
+                .any(|id| self.blocks.get(id).is_some_and(|e| matches!(e.block, Block::Owned(_))))
+            {
+                // 旧实现(“任一 Owned 块 ⇒ 恒等 H2D+D2H 都等”)会在此发一道栅栏
+                // —— 本计数 = 被定向化省掉的栅栏数(谓词与旧实现逐字同为 Owned;
+                // 每 chunk 千级;应远大于上面)
+                self.sink.count("srv.count.free_fence_skip", 1);
             }
         }
         let mut n = 0;
@@ -785,6 +821,34 @@ impl GpuCtx {
         }
         owl_shared::vram::live_add(-freed_bytes);
         n
+    }
+
+    /// 回收栅栏的目标流(去重;2026-10-14 定向化):
+    /// - 默认(新语义):只有**分配流 ≠ COMPUTE** 的 Owned 块需要钉序;
+    /// - `diag.legacy_sync`(全同步归因档):任一 Owned 块 ⇒ H2D + D2H 都等(旧行为)。
+    fn fence_targets(&self, ids: &[u64]) -> Vec<Arc<CudaStream>> {
+        let mut out: Vec<Arc<CudaStream>> = Vec::new();
+        let compute = self.streams.get(&STREAM_COMPUTE);
+        for id in ids {
+            let Some(e) = self.blocks.get(id) else { continue };
+            let Block::Owned(slice) = &e.block else { continue };
+            if self.diag.legacy_sync {
+                for sid in [STREAM_H2D, STREAM_D2H] {
+                    if let Some(s) = self.streams.get(&sid) {
+                        if !out.iter().any(|p| Arc::ptr_eq(p, s)) {
+                            out.push(s.clone());
+                        }
+                    }
+                }
+                continue;
+            }
+            let st = slice.stream();
+            let is_compute = compute.is_some_and(|c| Arc::ptr_eq(c, st));
+            if !is_compute && !out.iter().any(|p| Arc::ptr_eq(p, st)) {
+                out.push(st.clone());
+            }
+        }
+        out
     }
 }
 

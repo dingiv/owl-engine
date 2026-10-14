@@ -337,7 +337,7 @@ count(tag, n)          // 计数
 
 ## 十、decode 测量(2026-10-14;含图态/eager A/B 与三条方法论修正)
 
-档:`testdata/server/decode-{graph,eager}-27b.toml`(同 prompt 410 tok、同 32 输出、
+档:`testdata/args/decode-{graph,eager}-27b.toml`(同 prompt 410 tok、同 32 输出、
 `--ignore-eos`、bare f16 池、无 spec、单会话;3090 Ti)。
 
 ### 10.1 基线(图态,256 tok 全程)
