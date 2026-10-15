@@ -19,6 +19,11 @@ use std::collections::HashMap;
 pub struct CpuFace {
     blocks: HashMap<u64, Value>,
     next: u64,
+    /// **归还记账面**(2026-10-15 段求值 P0):`free` 的 id 顺序入账。
+    /// 语义:CPU 面**不真焚数据**(存量用例依赖"free 后仍可读"),但把"谁被归还"
+    /// 记下来 —— 段间存活(piecewise 的 keep 不变量)、活性回收覆盖面这些
+    /// **记账类判据**必须能观测,否则测不出来。
+    freed: Vec<u64>,
 }
 
 impl Default for CpuFace {
@@ -29,7 +34,12 @@ impl Default for CpuFace {
 
 impl CpuFace {
     pub fn new() -> Self {
-        Self { blocks: HashMap::new(), next: 1 }
+        Self { blocks: HashMap::new(), next: 1, freed: Vec::new() }
+    }
+
+    /// 已归还块 id(记账面;见字段注释)
+    pub fn freed_ids(&self) -> &[u64] {
+        &self.freed
     }
 }
 
@@ -78,6 +88,13 @@ impl DeviceClient for CpuFace {
         self.next += 1;
         self.blocks.insert(id, v);
         Ok(Bytes::new(id, 0, dtype, shape.len() as u8))
+    }
+
+    /// 归还(记账面覆写;见 [`CpuFace::freed_ids`])—— **不焚数据**:
+    /// CPU 面是"记账真值",存量用例在 free 后仍读块属有意行为。
+    async fn free(&mut self, ids: &[u64]) -> Result<(), ModelError> {
+        self.freed.extend_from_slice(ids);
+        Ok(())
     }
 
     /// 收割(值 → LE 字节;长度须与块一致)

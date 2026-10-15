@@ -21,6 +21,78 @@ use crate::turn::TurnEvent;
 use owl_cpu::CpuFace; // dev-dep:仅 cfg(test) 单元档可用
 use owl_iface::contract::DeviceClient;
 
+/// **piecewise 段驱动件门**(2026-10-15;A4)—— **不装模型**,纯 `GraphPlan` 面。
+///
+/// 判据(与设计 `docs/piecewise-断点图-设计与实现.md` §7 P2 同源):
+/// ① 捕获成功且**段/断点数与声明一致**;
+/// ② **回放两次值一致**(跨段地址接力 + 可重复);
+/// ③ 断点的钉块由驱动件按声明形状分配 ⇒ 两期同址(值由断点算子写入)。
+///
+/// 树:`y = x + c`(段0)→ `brk = y + y`(**断点**;窗外)→ `out = brk + c`(尾段)。
+pub async fn gpu_piecewise_segments() {
+    let Some(ordinal) = gpu_ordinal() else {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    };
+    // 最小 GpuClient 装配(与 owl-cuda 的 gpu_server 测试同款:server 专职线程 + 管道)
+    let (tx, rx) = std::sync::mpsc::channel::<owl_cuda::Command>();
+    let server = owl_cuda::GpuServer::new(
+        rx,
+        owl_cuda::DeviceSelector::Ordinal(ordinal),
+        None,
+    );
+    let face = owl_cuda::GpuClient::new(tx);
+    std::thread::Builder::new()
+        .name("owl-pw-test".into())
+        .spawn(move || server.run().expect("server run 异常退出"))
+        .expect("起 server 线程失败");
+
+    let desc = crate::graph_plan::GraphPlanDesc {
+        inputs: vec![
+            crate::graph_plan::InputSlot::f32("x", 4).init(vec![1.0; 4]),
+            crate::graph_plan::InputSlot::f32("c", 4).init(vec![1.0; 4]),
+        ],
+        outputs: vec![crate::graph_plan::OutputSlot::f32("out", &[4])],
+        capture: true,
+        slab_fixed: false,
+        debug_probe: false,
+    };
+    let forward = |sc: &crate::graph_plan::PlanCtx| -> Result<(), owl_iface::contract::ModelError> {
+        let x = sc.input("x")?;
+        let c = sc.input("c")?;
+        let y = x.add(&c); // 段0
+        let brk = y.add(&y); // 断点(窗外重放)
+        sc.break_node(&brk)?;
+        let out = brk.add(&c); // 尾段
+        sc.output("out", &out)
+    };
+    let (mut plan, outcome) = crate::graph_plan::GraphPlan::plan_piecewise(
+        face,
+        owl_models::env::EnvProvider::default(),
+        desc,
+        true,
+        forward,
+    )
+    .await
+    .expect("plan_piecewise");
+    assert!(
+        matches!(outcome, crate::graph_plan::PlanOutcome::Captured),
+        "应捕获,得 {outcome:?}"
+    );
+    assert_eq!(plan.piecewise_shape(), (2, 1), "应两段一断点");
+    // 回放 ×2:x=1,c=1 ⇒ y=2 ⇒ brk=4 ⇒ out=5
+    for i in 0..2 {
+        let xs = [1.0f32; 4];
+        plan.step(&[("x", &xs)]).await.expect("step");
+        let v = plan.read_output_f32("out").await.expect("read out");
+        assert!(
+            v.iter().all(|x| (x - 5.0).abs() < 1e-4),
+            "回放 #{i} 值应 5.0,得 {v:?}"
+        );
+    }
+    eprintln!("[piecewise] 两段一断点捕获 + 双回放 值一致 ✓");
+}
+
 fn asset_dir() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../models/assets/Qwen3.5-0.8B")

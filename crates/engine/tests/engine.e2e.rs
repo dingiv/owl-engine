@@ -121,6 +121,9 @@ async fn e2e_body() {
         eprintln!("[e2e] 0.8B 默认档 skip(被 OWL_E2E_ONLY 排除)");
     }
 
+    // ── piecewise 段驱动件(不装模型;纯 GraphPlan 面) ──
+    run!(gpu_piecewise_segments);
+
     // ── 0.8B 其余档:boot 期配置各不相同,各自装载 ──
     run!(gpu_schedule_decision_surface); // max_seq=64/chunk=4(切块敏感)
     run!(gpu_gdn_slot_cross_probe);   // gdn_slots=2 + prefix_cache=false

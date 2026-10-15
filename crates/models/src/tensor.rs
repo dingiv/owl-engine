@@ -163,6 +163,15 @@ impl TensorOps {
         self.id
     }
 
+    /// **操作数只读视图**(归约所需的全部输入;叶子为空)。
+    ///
+    /// 为什么要有:分段/重排计划器需要"这个节点的输入是什么"来**推导段根**
+    /// (`piecewise` 的每段根 = 下一个断点的操作数)—— 那是计划面的事,
+    /// 不该让计划器去摸内部字段。克隆是浅的(Arc 共享父节点)。
+    pub fn operands(&self) -> Vec<TensorOps> {
+        self.parents.iter().map(|p| (**p).clone()).collect()
+    }
+
     /// 语义坐标(观测面;None = 未打标)
     pub fn label(&self) -> Option<&str> {
         self.label.as_deref()
