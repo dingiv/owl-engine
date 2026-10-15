@@ -17,6 +17,7 @@
 //! 经 interpreters 模块 shim 转发(历史调用面不动)。
 
 pub mod awq;
+pub mod kind;
 pub mod load;
 pub mod mmap;
 pub mod safetensors;
@@ -32,6 +33,7 @@ pub(crate) fn split_qkvz(base: &str) -> Option<(String, String)> {
 }
 
 pub use awq::AwqSource;
+pub use kind::{detect, CheckpointKind, Detection};
 pub use load::eval_load;
 pub use safetensors::SafeTensorsSource;
 pub use w4a16::{marlin_eligible, marlin_n_pack, W4A16Source};
