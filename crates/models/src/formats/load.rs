@@ -49,19 +49,12 @@ where
 {
     let want = layer.layout(ctx); // 声明:层产出需求清单(ctx 引用透传)
     let tap = if ctx.debug_tap { Some(std::sync::Mutex::new(Box::new(StderrTap) as Box<dyn LoadTap>)) } else { None }; // 观测:ctx.debug_tap 门控,缺省零开销
-    // 设备重排的原始块延迟回收清单(E2a 契约:回收前数据须已收割 ——
-    // repack 核异步读 raw,火后即 free 会踩;栅栏后统一回收)
-    let deferred: std::sync::Arc<Mutex<Vec<u64>>> = std::sync::Arc::default();
-    let manifest = eval_want(&want, face, src, tap.as_ref(), &deferred, ctx.verify).await?;
+    let manifest = eval_want(&want, face, src, tap.as_ref(), ctx.verify).await?;
     // 上载栅栏:全部 DMA 落定后方可进入计算域(upload_pinned 入队即回执,
     // 完成语义由本栅栏一次总代价兜底)
     face.sync().await?;
     // 装载校验(OWL_LOAD_VERIFY 门控):整块回读 vs staged 校验和
     verify_loaded(&manifest, face, ctx.verify).await?;
-    let ids = std::mem::take(&mut *deferred.lock().unwrap());
-    if !ids.is_empty() {
-        face.free(&ids).await?;
-    }
     Ok(manifest)
 }
 
@@ -70,22 +63,164 @@ where
 // ============================================================================
 
 /// 需求清单求值:face 具备并发句柄且 Want 多于一条 → 分桶流水;否则顺序。
-type Deferred = std::sync::Arc<Mutex<Vec<u64>>>;
+///
+/// **装载批**(2026-10-16 装载提速):设备端转换臂(原始字节上卡 → cast 核)
+/// 把"逐键 sync"降成"批末 sync" —— 未冲的 cast 挂在批里,DMA 不逐键排空;
+/// 同时收容待回收原始块(DeviceRearrange / 设备转换的 raw;launch 异步读,
+/// 必须在栅栏后才能 free)。**每桶/每路独占一个**(跨账本禁混:块 id 只在本
+/// face 的账本里可解析)。
+#[derive(Default)]
+pub(crate) struct LoadBatch {
+    /// 待发 cast(顶序 = 上传顺序;flush 时一次性 launch)
+    casts: Vec<PendingCast>,
+    /// 上一轮 cast 的 raw(本轮 flush 的栅栏后方可回收 —— 两相回收:
+    /// **本批 cast 的 raw 必须等下一轮栅栏**,否则 free 出的地址被复用
+    /// 而 cast 还在读 = UAF)
+    stale_ids: Vec<u64>,
+    /// 待发批占用的原始字节(raw;定批阈值用)
+    raw_bytes: usize,
+}
+
+/// 一件待发设备 cast(bf16 raw → f16 目标)
+struct PendingCast {
+    raw: u64,
+    out: crate::contract::Bytes,
+    elems: usize,
+    key: String,
+}
+
+/// 批阈值:同时约束"滞留原始字节"(显存)与"件数"(sync 次数)
+// ⚠️ **批 >1 未定谳**(2026-10-16 实测:batch 8/512MB ⇒ 概率性错值
+// ——首图 argmax 79 vs 280、top-10 全不交,重跑又全绿;batch 32/512MB
+// 确定复现;batch 4/256MB 单次通过;batch 1 = 逐键 sync 稳定全绿且
+// **墙时同档(1.8s)** ⇒ 收益为零、风险确凿 ⇒ 默认批 1。
+// 待专项排查:批内多键 raw 与 cast 的生命周期/池复用面(见设计文档 §14 挂账)。
+const CAST_BATCH_BYTES: usize = 1;
+const CAST_BATCH_KEYS: usize = 1;
+const FREE_BATCH_IDS: usize = 16;
+
+impl LoadBatch {
+    /// 入批(超阈即冲)
+    async fn push_cast<D: DeviceClient>(
+        &mut self,
+        face: &mut D,
+        c: PendingCast,
+  ) -> Result<(), ModelError> {
+        self.raw_bytes += c.elems * 2;
+        self.casts.push(c);
+        if self.raw_bytes >= CAST_BATCH_BYTES || self.casts.len() >= CAST_BATCH_KEYS {
+            self.flush(face).await?;
+        }
+        Ok(())
+    }
+
+    /// 原始块入**待回收**(调用方保证:该块的所有读者 kernel 已入队;
+    /// 回收推迟到下一轮 flush 的栅栏之后)
+    fn push_free(&mut self, id: u64) {
+        self.stale_ids.push(id);
+    }
+
+    /// 冲批:一次栅栏(H2D 落定)→ 逐件 launch cast → 回收原始块。
+    /// 顺序不可换:cast 读 raw 必须在 DMA 之后;free 必须在 cast 之后。
+    async fn flush<D: DeviceClient>(&mut self, face: &mut D) -> Result<(), ModelError> {
+        if self.casts.is_empty() {
+            return Ok(());
+        }
+        // 栅栏:H2D 全部落定(cast 读 raw 的前提)
+        face.sync().await?;
+        // 回收**上一轮** raw(被本轮栅栏覆盖:它们的读者已跑完)
+        self.reclaim(face).await?;
+        // 本轮 cast 的 raw 记入下一轮(两相回收)
+        for c in self.casts.drain(..) {
+            launch_bf16_to_f16(face, c.raw, &c.out, c.elems, &c.key).await?;
+            self.stale_ids.push(c.raw);
+        }
+        self.raw_bytes = 0;
+        Ok(())
+    }
+
+    /// 收尾:最后一批 raw 也要回收(调用前须已有栅栏覆盖其读者)
+    async fn finish<D: DeviceClient>(&mut self, face: &mut D) -> Result<(), ModelError> {
+        self.flush(face).await?;
+        face.sync().await?;
+        self.reclaim(face).await?;
+        Ok(())
+    }
+
+    async fn reclaim<D: DeviceClient>(&mut self, face: &mut D) -> Result<(), ModelError> {
+        let ids = std::mem::take(&mut self.stale_ids);
+        if !ids.is_empty() {
+            face.free(&ids).await?;
+        }
+        Ok(())
+    }
+}
+
+/// 设备端 bf16→f16 cast(语义拾取:driver::resolve;被动律同 DeviceRearrange)
+async fn launch_bf16_to_f16<D: DeviceClient>(
+    face: &mut D,
+    raw: u64,
+    out: &crate::contract::Bytes,
+    elems: usize,
+    key: &str,
+) -> Result<(), ModelError> {
+    use crate::contract::{Arg, Dtype, KernelSource, LaunchMsg};
+    let env = face
+        .op_env()
+        .ok_or_else(|| ModelError::Msg(format!("Weight '{key}': 设备 cast 需 GPU 环境")))?;
+    let op = crate::ops::SemanticKernel::CastBf16F16;
+    let pick = owl_kernels::driver::resolve(owl_kernels::driver::OpReq {
+        op: op.op_id(),
+        env: &env,
+        dt: owl_kernels::driver::DType::F16,
+        shapes: &[],
+        aux: &[],
+        scalars: &[],
+    });
+    let msg = LaunchMsg {
+        kernel: KernelSource {
+            name: pick.name.to_string(),
+            source: crate::kernel::source(pick.name).to_string(),
+        },
+        // 参数序 = elems.cast_bf16_f16 线契约:(x: BF16, n: i32, out: F16)
+        args: vec![
+            Arg::block(raw, Dtype::BF16, 1),
+            Arg::I32(
+                i32::try_from(elems)
+                    .map_err(|_| ModelError::Msg(format!("Weight '{key}': 元素数 {elems} 超 i32")))?,
+            ),
+            Arg::block(out.id, Dtype::F16, 1),
+        ],
+        // 哨兵展开(全零 grid = runtime 自持;native 路展开规则 =
+        // `models::ops::auto_grid` —— 手发 LaunchMsg 必须自己展开)
+        grid: if pick.shape.grid == (0, 0, 0) {
+            crate::ops::auto_grid(elems)
+        } else {
+            pick.shape.grid
+        },
+        block: pick.shape.block,
+        shared_mem: pick.shape.smem,
+        out_elems: elems,
+    };
+    face.launch(msg)
+        .await
+        .map_err(|e| ModelError::Msg(format!("Weight '{key}': cast launch {e}")))?;
+    Ok(())
+}
 
 async fn eval_want<D: DeviceClient, S: WeightSource + ?Sized>(
     want: &LoaderOps,
     face: &mut D,
     src: &S,
     tap: Option<&Mutex<Box<dyn LoadTap>>>,
-    deferred: &Deferred,
     verify: bool,
 ) -> Result<LoadManifest, ModelError> {
     let handles = face.loader_faces(LOAD_WORKERS);
     let manifest = match handles {
         Some(handles) if handles.len() > 1 && want.wants().len() > 1 => {
-            eval_want_parallel(want, handles, src, tap, deferred, verify).await?
+            eval_want_parallel(want, handles, src, tap, verify).await?
         }
-        _ => eval_want_sequential(want, face, src, tap, deferred, verify).await?,
+        _ => eval_want_sequential(want, face, src, tap, verify).await?,
     };
     Ok(manifest)
 }
@@ -107,28 +242,19 @@ fn key_groups<'a>(wants: &'a [crate::module::Want]) -> Vec<Vec<&'a crate::module
 }
 
 /// 顺序路径(CpuFace / 单 Want / 无并发能力)
-const DEFERRED_FREE_COUNT: usize = 16; // raw 滞留 16 块批量回收一次(~1-2GB)
-
 async fn eval_want_sequential<D: DeviceClient, S: WeightSource + ?Sized>(
     want: &LoaderOps,
     face: &mut D,
     src: &S,
     tap: Option<&Mutex<Box<dyn LoadTap>>>,
-    deferred: &Deferred,
     verify: bool,
 ) -> Result<LoadManifest, ModelError> {
     let mut manifest = LoadManifest::default();
+    let mut batch = LoadBatch::default();
     for group in key_groups(want.wants()) {
-        manifest.0.extend(load_group(face, &group, src, tap, deferred, verify).await?);
-        // 批量回收:滞留 raw 超阈值 → sync(COMPUTE 排空,E2a 契约)+ free
-        if deferred.lock().unwrap().len() >= DEFERRED_FREE_COUNT {
-            face.sync().await?;
-            let ids = std::mem::take(&mut *deferred.lock().unwrap());
-            if !ids.is_empty() {
-                face.free(&ids).await?;
-            }
-        }
+        manifest.0.extend(load_group(face, &group, src, tap, &mut batch, verify).await?);
     }
+    batch.finish(face).await?;
     Ok(manifest)
 }
 
@@ -141,7 +267,6 @@ async fn eval_want_parallel<D: DeviceClient, S: WeightSource + ?Sized>(
     handles: Vec<D>,
     src: &S,
     tap: Option<&Mutex<Box<dyn LoadTap>>>,
-    deferred: &Deferred,
     verify: bool,
 ) -> Result<LoadManifest, ModelError> {
     let mut groups = key_groups(want.wants());
@@ -160,17 +285,12 @@ async fn eval_want_parallel<D: DeviceClient, S: WeightSource + ?Sized>(
     }
     let futs = buckets.into_iter().map(|(mut face, bundles, _)| async move {
         let mut entries = Vec::new();
+        // 批**每桶独占**(跨账本禁混:块 id 只在本 face 账本可解析)
+        let mut batch = LoadBatch::default();
         for bundle in &bundles {
-            entries.extend(load_group(&mut face, bundle, src, tap, deferred, verify).await?);
-            // 批量回收(并行桶;sync 任一句柄 = 全设备排空)
-            if deferred.lock().unwrap().len() >= DEFERRED_FREE_COUNT {
-                face.sync().await?;
-                let ids = std::mem::take(&mut *deferred.lock().unwrap());
-                if !ids.is_empty() {
-                    face.free(&ids).await?;
-                }
-            }
+            entries.extend(load_group(&mut face, bundle, src, tap, &mut batch, verify).await?);
         }
+        batch.finish(&mut face).await?;
         Ok::<_, ModelError>(entries)
     });
     let results = join_all(futs).await;
@@ -191,7 +311,7 @@ async fn load_group<D: DeviceClient, S: WeightSource + ?Sized>(
     group: &[&crate::module::Want],
     src: &S,
     tap: Option<&Mutex<Box<dyn LoadTap>>>,
-    deferred: &Deferred,
+    batch: &mut LoadBatch,
     verify: bool,
 ) -> Result<Vec<LoadEntry>, ModelError> {
     let mut manifest = Vec::new();
@@ -199,9 +319,9 @@ async fn load_group<D: DeviceClient, S: WeightSource + ?Sized>(
         let n: usize = w.shape.iter().product();
         let entry = match w.layout {
             Layout::Transposed => load_transposed(face, w, src, n, tap, verify).await?,
-            Layout::Direct => load_direct(face, w, src, n, tap, verify).await?,
+            Layout::Direct => load_direct(face, w, src, n, tap, batch, verify).await?,
             Layout::DeviceRearrange { op, rows, cols } => {
-                load_device_rearrange(face, w, src, n, op, rows, cols, tap, deferred, verify).await?
+                load_device_rearrange(face, w, src, n, op, rows, cols, tap, batch, verify).await?
             }
         };
         w.sink.deliver(crate::contract::Bytes::new(
@@ -295,8 +415,17 @@ async fn load_direct<D: DeviceClient, S: WeightSource + ?Sized>(
     src: &S,
     n: usize,
     tap: Option<&Mutex<Box<dyn LoadTap>>>,
+    batch: &mut LoadBatch,
     verify: bool,
 ) -> Result<LoadEntry, ModelError> {
+    // **原始字节 + 设备端转换臂**(2026-10-16 装载提速):源天然 bf16、
+    // 目标 f16 ⇒ CPU 只做 memcpy(零元素转换),转换由设备 cast 核完成
+    // —— 实测 CPU 转换 bf16→f16 仅 ~2.2GB/s(debug),是全载最大单相。
+    if w.dtype == crate::contract::Dtype::F16
+        && src.native_dtype(&w.key) == Some(crate::contract::Dtype::BF16)
+    {
+        return load_direct_device_cast(face, w, src, n, tap, batch, verify).await;
+    }
     let esz = w.dtype.size_bytes();
     let mut probe = KeyProbe::start(tap, &w.key, n * esz);
     let b = face
@@ -345,6 +474,101 @@ async fn load_direct<D: DeviceClient, S: WeightSource + ?Sized>(
     })
 }
 
+/// **原始字节 + 设备 cast 臂**(2026-10-16):CPU 只 memcpy,转换在 GPU。
+///
+/// 为什么:`load_direct` 的元素转换(mmap → F16C → pinned)在整载里是最大
+/// 单相(bf16→f16 实测 ~2.2GB/s debug;9G 权重 ⇒ 数秒),而 DMA 可达
+/// 5-9GB/s。本臂把元素转换换成"原始字节 memcpy + 设备 cast 核"(显存带宽
+/// 量级),CPU 侧只余一次 memcpy ⇒ CPU 与 DMA 都在 GB/s 级且可流水重叠。
+///
+/// 三件:
+/// 1. 原始块上卡(`Dtype::BF16`,元素数 = n ⇒ 字节数与 f16 目标等量);
+/// 2. 设备 cast 核(`SemanticKernel::CastBf16F16`)→ 目标 f16 块;
+/// 3. 原始块**延迟回收**(与 DeviceRearrange 同纪律:launch 异步读 raw,
+///    火后即 free 会踩 ⇒ 入装载批,批末栅栏后统一回收)。
+///
+/// `verify` 校验和按**原始字节**计(raw 即数据真身;目标块 = 变换后,
+/// 与 staged 不可比 —— 与 DeviceRearrange 同款挂账)。
+async fn load_direct_device_cast<D: DeviceClient, S: WeightSource + ?Sized>(
+    face: &mut D,
+    w: &crate::module::Want,
+    src: &S,
+    n: usize,
+    tap: Option<&Mutex<Box<dyn LoadTap>>>,
+    batch: &mut LoadBatch,
+    verify: bool,
+) -> Result<LoadEntry, ModelError> {
+    let esz = Dtype::BF16.size_bytes();
+    let mut probe = KeyProbe::start(tap, &w.key, n * esz);
+    // 1) 原始块上卡(memcpy 直写 pinned → DMA;≥64MB 自动分块)
+    let raw = face
+        .alloc_uninit(Dtype::BF16, n)
+        .await
+        .map_err(|e| ModelError::Msg(format!("Weight '{}': raw alloc {e}", w.key)))?;
+    let chunk_elems = (CHUNK_BYTES / esz).max(1);
+    let mut csum = 0xcbf29ce484222325u64;
+    let mut off = 0usize;
+    while off < n {
+        let len = chunk_elems.min(n - off);
+        let mut lease = {
+            let _s = probe.span("pinned_alloc");
+            face.alloc_pinned(len * esz)
+                .await
+                .map_err(|e| ModelError::Msg(format!("Weight '{}': {e}", w.key)))?
+        };
+        {
+            let _s = probe.span("raw_copy");
+            src.copy_native_into(&w.key, off, len, lease.slice_bytes_mut())
+                .ok_or_else(|| attribution(src, &w.key, n))?;
+        }
+        if verify {
+            csum = fnv1a(&lease.slice_bytes_mut()[..len * esz], csum);
+        }
+        {
+            let _s = probe.span("htod");
+            face.upload_pinned(lease, &raw, off * esz, len * esz)
+                .await
+                .map_err(|e| ModelError::Msg(format!("Weight '{}': {e}", w.key)))?;
+        }
+        off += len;
+        // upload_pinned 异步语义契约:核读前必须 sync(与 load_direct 同款)
+        if off.is_multiple_of(chunk_elems * 4) || off >= n {
+            face.sync().await?;
+        }
+    }
+    // 2) 目标块 + cast **入批**(批末一次 sync 后统一 launch —— 逐键 sync
+    //    会打断 DMA 流水:699 键 ≈ 699 次全流排空)
+    let b = face
+        .alloc(w.dtype, n)
+        .await
+        .map_err(|e| ModelError::Msg(format!("Weight '{}': {e}", w.key)))?;
+    {
+        let _s = probe.span("cast_enqueue");
+        batch
+            .push_cast(
+                face,
+                PendingCast {
+                    raw: raw.id,
+                    out: crate::contract::Bytes::new(b.id, n, w.dtype, w.shape.len() as u8),
+                    elems: n,
+                    key: w.key.clone(),
+                },
+            )
+            .await?;
+    }
+    probe.done();
+    Ok(LoadEntry {
+        key: w.key.clone(),
+        dtype: w.dtype,
+        shape: w.shape.clone(),
+        layout: Layout::Direct,
+        block: crate::contract::Bytes::new(b.id, n, w.dtype, w.shape.len() as u8),
+        // 目标块 = 设备变换产物,与 staged(raw)不可比 ⇒ csum 挂 0
+        // (同 DeviceRearrange;深校验留专用通道)
+        csum: 0,
+    })
+}
+
 /// 设备重排臂(2026-10-01 AWQ 装载提速):源供**原始 packed** 字节
 /// (CPU 零重排)→ DMA 上卡 → registry 重排核就地生成 marlin 布局块
 /// → 原始块回收(Free 通道)。CPU 33s 重量排出热路径,重排在 GPU
@@ -359,7 +583,7 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
     rows: usize,
     cols: usize,
     tap: Option<&Mutex<Box<dyn LoadTap>>>,
-    _deferred: &Deferred,
+    batch: &mut LoadBatch,
     verify: bool,
 ) -> Result<LoadEntry, ModelError> {
     let raw_elems = rows * cols;
@@ -474,10 +698,9 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
             }
         }
     }
-    // 3) 原始块回收(E2a Free 通道;数据已进重排输出块)。尽力而为:
-    // 回收失败不阻断装载(后续 alloc 压力会暴露),显式丢弃 —— Result 全链
-    // 纪律下的明示弃置(2026-10-12 review I-7 案)
-    let _ = face.free(&[raw.id]).await;
+    // 3) 原始块回收(E2a Free 通道;**入批**统一回收 —— 阈值到达即冲批,
+    //    批冲含一次全流栅栏 ⇒ repack 核读毕后方可 free。)
+    batch.push_free(raw.id);
     probe.done();
     Ok(LoadEntry {
         key: w.key.clone(),

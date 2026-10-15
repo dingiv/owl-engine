@@ -576,3 +576,49 @@ prefill + 生产 decode 面(v2 scratch + qkv 融合插池)。
 - 遗留(M5 服务面):图像预处理进 owl(`Qwen2VLImageProcessorFast` 对拍,现走
   Python 金标)+ OpenAI 兼容 `image_url` + chat 注入文本按 `chat_template.jinja`
   校订(见 `VlmCfg::from_json` 里的 FIXME)。
+
+---
+
+## 14. 装载提速:bf16→f16 转换挪到 GPU(2026-10-16)
+
+**口径**:4B VLM 整装(文本 + 塔,检查点 9.3GB bf16 → 设备 9.08GB f16)。
+**结果:3.1~3.6s → 1.8~1.9s(≈1.7×)**,正确性不变(真图四图 e2e 答案/top-1/
+top-10 与提速前逐项一致;0.8B 真权重 prefill 回归绿)。
+
+### 14.1 改了什么(用户裁决:数据放 GPU 上转换,别用 CPU vec)
+
+| # | 改动 | 效果 |
+|---|---|---|
+| 1 | **设备端转换臂**(`load_direct_device_cast`):源天然 bf16 + 目标 f16 ⇒ CPU 只 memcpy(mmap→pinned),DMA(raw bf16)上卡,再由 `elems.cast_bf16_f16` 核转成 f16 | 干掉最大单相:CPU 逐元素 F16C 转换实测 **2.2GB/s**(debug/opt-level3 皆然)⇒ 9GB 权重 ≈ 4s 的墙,现为 0 |
+| 2 | `WeightSource::{native_dtype, copy_native_into}`(默认 None/None,旧源零影响) | 原始字节通道的显式能力口 |
+| 3 | mmap→pinned **四线程拷贝**(≥8MB;与既有 `convert_range` 同款并行阈) | 单线程 7.4GB/s → ~4× |
+| 4 | 原始块**两相回收**(本批 cast 的 raw 等下一轮栅栏后才 free) | 无泄漏、无 UAF(曾漏 free) |
+| 5 | 探针:`LoaderCtx.debug_tap` 逐键分相 + `OWL_VLM_BENCH=1` 微基准(convert / pinned 往返 / DMA 单发与并发)+ metrics 分相表 | 瓶颈可复测 |
+
+### 14.2 提速后的分相账(metrics;四桶并发,墙 2.2s)
+
+| 相 | 合计 | 说明 |
+|---|---|---|
+| `pinned_alloc` | 2.09s | 池命中为主;`srv.pinned_alloc` = **5 次 miss × 64ms**(`cudaHostAlloc` 页锁) |
+| `htod` | 1.20s | 上传命令往返(异步语义) |
+| `cast_enqueue` | 1.17s | **批 1 = 逐键栅栏**(≈1.9ms/键)+ launch |
+| `raw_copy` | 0.76s | 四线程 memcpy(9.08GB ⇒ 12GB/s 等效) |
+| `convert` | 0.44s | 72 个 **f32 源键**(A_log/dt_bias 等)仍走 CPU 单线程 F16C |
+
+### 14.3 三件实测天花板(微基准,写死)
+
+1. CPU bf16→f16(F16C 手工核)**≈2.2GB/s** ⇒ 元素转换天然是墙(故挪 GPU);
+2. pinned→device DMA(热池、64MB 块、单面)**≈9~11GB/s**;
+3. **4 面并发 DMA ≈1.2GB/s** —— 并行桶对 DMA *有害*(全设备 `sync` 互踩),
+   装载的并行收益只在 CPU 段;单面深流水才是 DMA 的正解(架构挂账)。
+
+### 14.4 挂账(未定谳,勿盲动)
+
+1. **cast 批 >1 概率性错值**(batch 8/512MB:首图 argmax 79 vs 280、top-10 全不交,
+   重跑又全绿;batch 32/512MB 确定复现;batch 4/256MB 单次通过;batch 1 稳定全绿)。
+   墙时批 1 与批 4 **同档(1.8s)** ⇒ 收益为零、风险确凿 ⇒ 默认批 1。
+   待查:批内多键 raw/cast 生命周期与池复用面。
+2. pinned miss 5 × 64ms ≈ 0.32s:池预热/尺寸分类可削(需先量命中率曲线);
+3. 逐键栅栏 ≈1.9ms(批 1 的固有代价):正解 = H2D→COMPUTE 事件序
+   (server 已有 `notify`/record_event 底座),非批处理;
+4. f32 源键 0.44s:同一转换口可并行化(σ 小,收益 0.1s 级)。

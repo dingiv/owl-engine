@@ -232,13 +232,21 @@ impl Vlm {
         face: &mut D,
         dtype: Dtype,
     ) -> Result<Vlm, ModelError> {
+        Self::load_ctx(dir, face, LoaderCtx { dtype, shard: 1, device_repack: false, verify: false, debug_tap: false }).await
+    }
+
+    /// 同上,装载 ctx 外给(分相探针 / 校验 / 分片调试面)
+    pub async fn load_ctx<D: crate::contract::DeviceClient + 'static>(
+        dir: &std::path::Path,
+        face: &mut D,
+        ctx: LoaderCtx,
+    ) -> Result<Vlm, ModelError> {
         let raw = owl_shared::file_loader::read(&dir.join("config.json")).map_err(|e| {
             ModelError::Msg(format!("Vlm::load: config.json 读入 {}: {e}", dir.display()))
         })?;
         let cfg = VlmCfg::from_json(&raw)?;
         let vlm = Vlm::new(cfg, QuantPlan::F16, QuantPlan::F16)?;
         let src = crate::formats::safetensors::SafeTensorsSource::open_dir(dir)?;
-        let ctx = LoaderCtx { dtype, shard: 1, device_repack: false, verify: false, debug_tap: false };
         crate::interpreters::eval_load(&vlm, face, &src, &ctx).await?;
         Ok(vlm)
     }
@@ -614,8 +622,23 @@ mod tests {
         let dir = ckpt_dir();
         let t0 = std::time::Instant::now();
         let mut gpu = crate::testkit::gpu_client().await;
-        let vlm = Vlm::load(&dir, &mut gpu, Dtype::F16).await.expect("Vlm::load(4B)");
+        let dbg = std::env::var("OWL_VLM_LOAD_DEBUG").ok().as_deref() == Some("1");
+        if dbg {
+            // 分相账本需要 store 上线(测试进程默认未装)
+            let _ = owl_shared::metrics::init_metrics(owl_shared::metrics::MetricsStore::new());
+        }
+        let vlm = Vlm::load_ctx(&dir, &mut gpu, crate::module::LoaderCtx {
+            dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: dbg,
+        }).await.expect("Vlm::load(4B)");
         eprintln!("[vlm] 4B 整装 {:.1}s", t0.elapsed().as_secs_f64());
+        if dbg {
+            let reps = owl_shared::metrics::collect_metrics(
+                &owl_shared::metrics::MetricsFilter::new().limit(4096),
+            );
+            for r in reps.iter().filter(|r| r.tag.starts_with("srv.") || r.tag.starts_with("load.") || r.tag.starts_with("loadv.")) {
+                eprintln!("[metrics] {:<28} n={:<8} total={:?}", r.tag, r.count, r.total);
+            }
+        }
 
         let c = vlm.cfg();
         let (hq, _hkv, hd) = c.text_spec.full_heads;
@@ -838,6 +861,131 @@ mod tests {
             );
             assert_eq!(gen, want_ids, "[{tag}] owl 贪心序列必须与 HF 相同");
         }
+        gpu.close().await.expect("关机");
+    }
+
+    /// **装载分相微基准**(定位瓶颈用;门控 `OWL_VLM_BENCH=1` + `OWL_TEST_DEVICE`)。
+    ///
+    /// 量三段各自的上限:① bf16→f16 CPU 转换(F16C)② mmap→host memcpy
+    /// ③ pinned→device DMA(异步上传 + 尾 sync)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bench_load_phases() {
+        use crate::contract::DeviceClient as _;
+        use crate::formats::safetensors::SafeTensorsSource;
+        use crate::module::WeightSource;
+        if std::env::var("OWL_VLM_BENCH").ok().as_deref() != Some("1") {
+            eprintln!("skip: OWL_VLM_BENCH=1 未开");
+            return;
+        }
+        if !crate::testkit::gpu_enabled() {
+            crate::testkit::skip_note();
+            return;
+        }
+        let dir = ckpt_dir();
+        let mut gpu = crate::testkit::gpu_client().await;
+        let src = SafeTensorsSource::open_dir(&dir).expect("源");
+        // 样本 = 四个大键(≈ 0.4GB;真权重面)
+        let keys = [
+            "model.language_model.layers.0.mlp.down_proj.weight",
+            "model.language_model.layers.0.mlp.gate_proj.weight",
+            "model.language_model.layers.0.linear_attn.in_proj_qkvz.weight",
+            "model.visual.blocks.0.mlp.linear_fc1.weight",
+        ];
+        let n0 = src.elem_len(keys[0]).expect("键");
+        let tot_elems: usize = keys.iter().map(|k| src.elem_len(k).unwrap_or(0)).sum();
+        let gb = tot_elems as f64 * 2.0 / 1e9;
+        eprintln!("[bench] 样本 {gb:.3}GB(四键)");
+
+        // ① CPU 转换 bf16→f16(单键 ×3 轮)
+        for k in keys {
+            let n = src.elem_len(k).expect("键");
+            let mut buf = vec![0u8; n * 2];
+            let reps = 3;
+            let t0 = std::time::Instant::now();
+            for _ in 0..reps {
+                src.convert_chunk_into_bytes(k, 0, n, &mut buf, Dtype::F16).expect("convert");
+            }
+            let dt = t0.elapsed().as_secs_f64();
+            eprintln!("[bench] ① convert {n:>9} elem: {:.2} GB/s", n as f64 * 2.0 * reps as f64 / 1e9 / dt);
+        }
+
+        // ② host 读(mmap 在页缓存 → Vec):raw 路径的拷贝下限
+        let mut raw_gb = 0f64;
+        let mut raw_s = 0f64;
+        for k in keys {
+            let n = src.elem_len(k).expect("键");
+            let t0 = std::time::Instant::now();
+            let v = src.take_range(k, 0, n).expect("取数"); // 含转换;只作"有数据"对照
+            std::hint::black_box(&v);
+            raw_gb += n as f64 * 2.0 / 1e9;
+            raw_s += t0.elapsed().as_secs_f64();
+        }
+        eprintln!("[bench] ② take_range(含转换)F32 面: {:.2} GB/s", raw_gb / raw_s);
+
+        // ②' pinned 租约往返(热池):alloc + drop ×200 —— 摘掉 DMA 看纯命令延迟
+        {
+            let mut leases = Vec::new();
+            for _ in 0..4 {
+                leases.push(gpu.alloc_pinned(64 << 20).await.expect("warm"));
+            }
+            drop(leases); // 先放 4 个回池(池命中路径)
+            let t0 = std::time::Instant::now();
+            for _ in 0..200 {
+                let l = gpu.alloc_pinned(64 << 20).await.expect("pinned");
+                drop(l);
+            }
+            let dt = t0.elapsed().as_secs_f64();
+            eprintln!("[bench] ②' alloc_pinned 往返(64MB,热池 ×200): {:.3} ms/次", dt * 1e3 / 200.0);
+        }
+
+        // ③ pinned → device DMA:单发大块(1GB)与多路并发(4 面)
+        let n_big = 512usize << 20; // 1GB f16 = 512Mi 元素
+        let mut big = vec![0u8; n_big * 2];
+        for (i, c) in big.chunks_exact_mut(4096).enumerate() {
+            c.fill((i & 0xff) as u8);
+        }
+        let blk = gpu.alloc(Dtype::F16, n_big).await.expect("1GB 设备块");
+        // 单发 1GB(分块 128MB)+ 尾 sync
+        for reps in [1usize, 3] {
+            let t0 = std::time::Instant::now();
+            for _ in 0..reps {
+                let mut off = 0usize;
+                while off < n_big {
+                    let len = (64usize << 20).min(n_big - off);
+                    let mut lease = gpu.alloc_pinned(len * 2).await.expect("pinned");
+                    lease.slice_bytes_mut()[..len * 2].copy_from_slice(&big[off * 2..(off + len) * 2]);
+                    gpu.upload_pinned(lease, &blk, off * 2, len * 2).await.expect("upload");
+                    off += len;
+                }
+                gpu.sync().await.expect("sync");
+            }
+            let dt = t0.elapsed().as_secs_f64();
+            eprintln!("[bench] ③ DMA 1GB/64MB 块 ×{reps}: {:.2} GB/s({dt:.2}s)", 1.0 * reps as f64 / dt);
+        }
+        // 4 面并发(装载工件同款:每面各自 256MB)
+        let faces: Vec<_> = gpu.loader_faces(4).expect("并发面");
+        let per = 128usize << 20; // 每面 256MB f16 = 128Mi 元素
+        let t0 = std::time::Instant::now();
+        let mut futs = Vec::new();
+        for (fi, mut f) in faces.into_iter().enumerate() {
+            let blk = f.alloc(Dtype::F16, per).await.expect("分块");
+            let src = big[..per * 2].to_vec();
+            futs.push(async move {
+                let mut off = 0usize;
+                while off < per {
+                    let len = (16usize << 20).min(per - off);
+                    let mut lease = f.alloc_pinned(len * 2).await.expect("pinned");
+                    lease.slice_bytes_mut()[..len * 2].copy_from_slice(&src[off * 2..(off + len) * 2]);
+                    f.upload_pinned(lease, &blk, off * 2, len * 2).await.expect("upload");
+                    off += len;
+                }
+                f.sync().await.expect("sync");
+                let _ = fi;
+            });
+        }
+        futures_util::future::join_all(futs).await;
+        let dt = t0.elapsed().as_secs_f64();
+        eprintln!("[bench] ③ DMA 4 面并发(每面 256MB,16MB 块): {:.2} GB/s({dt:.2}s)", 0.25 * 4.0 / dt);
         gpu.close().await.expect("关机");
     }
 }

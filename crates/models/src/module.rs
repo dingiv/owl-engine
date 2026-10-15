@@ -554,6 +554,26 @@ pub trait WeightSource {
         None
     }
 
+    /// **源天然元素 dtype**(原始字节通道可用时;None = 无原始通道 ⇒
+    /// 走元素转换路径)。供"原始字节上卡 + 设备端转换"臂判定
+    /// (2026-10-16 装载提速:CPU 只 memcpy,转换挪到 GPU)。
+    fn native_dtype(&self, _key: &str) -> Option<Dtype> {
+        None
+    }
+
+    /// 原始字节区间直拷(零元素转换;`dst.len() ≥ len × 天然宽度`)。
+    /// 上卡后由设备 cast 核完成 dtype 转换 —— 本口只保证"字节原样"。
+    /// 默认 None = 不支持(调用方回退到 [`Self::convert_chunk_into_bytes`])。
+    fn copy_native_into(
+        &self,
+        _key: &str,
+        _offset_elems: usize,
+        _len: usize,
+        _dst: &mut [u8],
+    ) -> Option<()> {
+        None
+    }
+
     /// 分块转换**直写**目标缓冲(2026-09-26 二拷贝预算:转换这 1 次
     /// 直达 pinned 租约,不再有中间 Vec;流式源覆写为 mmap 直解码)。
     /// f16 基线尾批:字节口径 + dtype 参数化 —— F32 写 f32 LE、F16 写
