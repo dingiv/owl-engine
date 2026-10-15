@@ -116,8 +116,46 @@ pub static PREFILL_FI_F16: KernelMeta = meta_of::<FiPrefillF16>();
 
 pub static PREFILL_FI_FP8KV: KernelMeta = meta_of::<FiPrefillFp8kv>();
 
+
+// ============================================================================
+// 视觉塔注意力:ragged **非因果** prefill(2026-10-15)
+//   —— 复用 vendored FlashInfer FA2 家族核(`MaskMode::kNone`);
+//      槽位与 native `vis::AttnFullF16` **逐字同构**(driver 按 dtype/图数选臂)。
+// ============================================================================
+
+/// `flashinfer_attn_ragged_f16` —— 非因果 varlen 自注意力(单图;dense K/V;hd ∈ {64})
+pub struct FiAttnRaggedF16;
+
+impl KernelSpec for FiAttnRaggedF16 {
+    /// 家族 id = **FI 族**(= `FiRuntime::ID`,其值就是 paged f16 的入口名 ——
+    /// 族 id 与"首个入口名"同源的既定语汇,勿把它当算子名读)
+    const FAMILY: crate::contract::OpId =
+        crate::contract::OpId(crate::family::flashinfer::PREFILL_FI);
+    const ENTRY: &'static str = crate::family::flashinfer::ATTN_RAGGED_F16;
+    /// foreign(预编 `.a` + 适配器胶水):无 `.cu` 资产
+    const SRC: &'static str = "";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("q", Dtype::F16, 3),
+        Param::t_in("k", Dtype::F16, 3),
+        Param::t_in("v", Dtype::F16, 3),
+        Param::t_in("cu_seqlens", Dtype::F32, 1),
+        Param::t_out("out", Dtype::F16, 3),
+        Param::sz("rows"),
+        Param::sz("heads"),
+        Param::sz("head_dim"),
+        Param::i32("n_seq"),
+        Param::f32("scale"),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+pub static FI_ATTN_RAGGED_F16: KernelMeta = meta_of::<FiAttnRaggedF16>();
+
 /// 本域全部已建表算子
-pub static METAS: &[&KernelMeta] = &[&PREFILL_FI_FP8KV, &PREFILL_FI_F16];
+pub static METAS: &[&KernelMeta] =
+    &[&PREFILL_FI_FP8KV, &PREFILL_FI_F16, &FI_ATTN_RAGGED_F16];
 
 #[cfg(test)]
 mod tests {

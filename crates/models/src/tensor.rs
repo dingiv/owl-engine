@@ -470,6 +470,155 @@ impl TensorOps {
         )
     }
 
+    /// LayerNorm(affine;**视觉塔专用**):y = (x−mean)·rsqrt(var+eps)·w + b。
+    /// 父序 = x [rows,n] / weight [n] / bias [n](与 PARAMS 同序);
+    /// 标量槽序 = n(i32) / eps(f32)。
+    /// 形状律:n 由 weight 定,x 行数 = total/n(任意前导维折叠),bias 同宽。
+    pub fn layernorm(&self, weight: &TensorOps, bias: &TensorOps, eps: f32) -> TensorOps {
+        let n: usize = weight.shape.iter().product();
+        if let Some(e) = self.shape_rule(weight, "layernorm", |a, b| {
+            let cols: usize = b.iter().product();
+            let total: usize = a.iter().product();
+            cols > 0 && total.is_multiple_of(cols)
+        }) {
+            return self.poisoned_local(e);
+        }
+        let bn: usize = bias.shape.iter().product();
+        if bn != n {
+            return self.poisoned_local(LazyError {
+                at_depth: self.depth + 1,
+                detail: format!("layernorm: bias 宽 {bn} ≠ weight 宽 {n}"),
+            });
+        }
+        let meta = (self.dtype, self.shape.clone());
+        self.join(
+            Op::Call { op: SemanticKernel::Layernorm, aux: vec![] },
+            Some(weight),
+            meta,
+            vec![KernelArg::I32(n as i32), KernelArg::F32(eps)],
+        )
+        .arg(bias)
+    }
+
+    /// GELU(tanh 近似;视觉塔 MLP)。逐元素一元;标量槽 = n(sz)。
+    pub fn gelu_tanh(&self) -> TensorOps {
+        let n: usize = self.shape.iter().product();
+        let meta = (self.dtype, self.shape.clone());
+        self.join(
+            Op::Call { op: SemanticKernel::GeluTanh, aux: vec![] },
+            None,
+            meta,
+            vec![KernelArg::Bits(n as u64)],
+        )
+    }
+
+    /// GELU(精确 erf;视觉塔 merger)。与 [`Self::gelu_tanh`] **不可互替**。
+    pub fn gelu_erf(&self) -> TensorOps {
+        let n: usize = self.shape.iter().product();
+        let meta = (self.dtype, self.shape.clone());
+        self.join(
+            Op::Call { op: SemanticKernel::GeluErf, aux: vec![] },
+            None,
+            meta,
+            vec![KernelArg::Bits(n as u64)],
+        )
+    }
+
+    /// 行广播加:x [rows, cols] + bias [cols](视觉塔每条 Linear 的 bias)。
+    /// 形状律:bias 宽 = x 末维,且 x 行数 = total/cols。标量槽 = cols(sz)。
+    pub fn bias_add(&self, bias: &TensorOps) -> TensorOps {
+        let cols: usize = bias.shape.iter().product();
+        if let Some(e) = self.shape_rule(bias, "bias_add", |a, b| {
+            let bc: usize = b.iter().product();
+            a.last().copied().unwrap_or(0) == bc && bc > 0
+        }) {
+            return self.poisoned_local(e);
+        }
+        let meta = (self.dtype, self.shape.clone());
+        self.join(
+            Op::Call { op: SemanticKernel::BiasAdd, aux: vec![] },
+            Some(bias),
+            meta,
+            vec![KernelArg::Bits(cols as u64)],
+        )
+    }
+
+    /// 位置嵌入 4-tap 重采样(self = table [n_pos, dim];idx/wts [n, n_taps] 恒 f32)。
+    /// 形状律:idx 与 wts 同形;idx 末维 = taps;table 末维 = dim。
+    /// 标量槽 = n_taps(sz), dim(sz);父序 = table / idx / wts。
+    pub fn pos_embed_bilinear(&self, idx: &TensorOps, wts: &TensorOps) -> TensorOps {
+        if idx.shape != wts.shape {
+            return self.poisoned_local(LazyError {
+                at_depth: self.depth + 1,
+                detail: format!("pos_embed: idx 形状 {:?} ≠ wts 形状 {:?}", idx.shape, wts.shape),
+            });
+        }
+        let dim = self.shape.last().copied().unwrap_or(0);
+        let taps = idx.shape.last().copied().unwrap_or(0);
+        if dim == 0 || taps == 0 {
+            return self.poisoned_local(LazyError {
+                at_depth: self.depth + 1,
+                detail: format!("pos_embed: dim/taps 为 0(table {dim}, idx {taps})"),
+            });
+        }
+        let rows: usize = idx.shape.first().copied().unwrap_or(0);
+        let meta = (self.dtype, vec![rows, dim]);
+        self.join(
+            Op::Call { op: SemanticKernel::PosEmbedBilinear, aux: vec![] },
+            Some(idx),
+            meta,
+            vec![KernelArg::Bits(taps as u64), KernelArg::Bits(dim as u64)],
+        )
+        .arg(wts)
+    }
+
+    /// 非因果 varlen 全注意力(self = q [rows, heads, dim];k/v 同 hkv 头;cu f32 段界)。
+    /// 形状律:q/k/v 末维一致、头数一致(k 与 v 同形);cu 长度 = n_seq+1。
+    /// 标量槽 = rows(sz), heads(sz), head_dim(sz), n_seq(i32), scale(f32)。
+    pub fn attn_full(
+        &self,
+        k: &TensorOps,
+        v: &TensorOps,
+        cu: &TensorOps,
+        n_seq: usize,
+        scale: f32,
+    ) -> TensorOps {
+        let q = self.shape.clone();
+        if q.len() != 3 || k.shape.len() != 3 || v.shape != k.shape {
+            return self.poisoned_local(LazyError {
+                at_depth: self.depth + 1,
+                detail: format!("attn_full: q {:?} / k {:?} / v {:?} 形状不符(需 3 维且 k==v)", q, k.shape, v.shape),
+            });
+        }
+        if q[1] != k.shape[1] || q[2] != k.shape[2] {
+            return self.poisoned_local(LazyError {
+                at_depth: self.depth + 1,
+                detail: format!("attn_full: q 头数/维度 {:?} ≠ k {:?}(本核无 GQA)", q, k.shape),
+            });
+        }
+        if cu.shape.iter().product::<usize>() != n_seq + 1 {
+            return self.poisoned_local(LazyError {
+                at_depth: self.depth + 1,
+                detail: format!("attn_full: cu_seqlens 长 {:?} ≠ n_seq+1 = {}", cu.shape, n_seq + 1),
+            });
+        }
+        let meta = (self.dtype, q.clone());
+        self.join(
+            Op::Call { op: SemanticKernel::AttnFull, aux: vec![] },
+            Some(k),
+            meta,
+            vec![
+                KernelArg::Bits(q[0] as u64),
+                KernelArg::Bits(q[1] as u64),
+                KernelArg::Bits(q[2] as u64),
+                KernelArg::I32(n_seq as i32),
+                KernelArg::F32(scale),
+            ],
+        )
+        .arg(v)
+        .arg(cu)
+    }
+
     // ======================================================================
     // 参数槽(Kernel 节点;按序入包)
     // ======================================================================

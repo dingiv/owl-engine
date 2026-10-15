@@ -140,6 +140,25 @@ impl<'a> NamedSlots<'a> {
             other => Err(self.mismatch(name, "U64(sz 槽)", other)),
         }
     }
+
+    /// f32 标量槽(`Param::f32` 直传槽 —— 如 `vis.attn_full` 的 scale;
+    /// 与 `F32Bits` 位型走私不同:这条是**真 float 槽**,线格式 = `Arg::F32`)
+    pub fn f32(&self, name: &str) -> Result<f32, OpError> {
+        let a = &self.args[self.at(name)?];
+        match a {
+            Arg::F32(v) => Ok(*v),
+            other => Err(self.mismatch(name, "F32(f32 槽)", other)),
+        }
+    }
+
+    /// i32 标量槽(`Param::i32` 直传槽 —— 如 `vis.attn_full` 的 n_seq)
+    pub fn i32(&self, name: &str) -> Result<i32, OpError> {
+        let a = &self.args[self.at(name)?];
+        match a {
+            Arg::I32(v) => Ok(*v),
+            other => Err(self.mismatch(name, "I32(i32 槽)", other)),
+        }
+    }
 }
 
 /// GDN chunked(face;零门)

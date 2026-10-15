@@ -71,3 +71,45 @@ pub fn parse_prefill(msg: &LaunchMsg) -> Result<FiPrefillCall, OpError> {
         sm_scale: f32::from_bits(s.u64("sm_scale_bits")? as u32),        fp8kv: msg.kernel.name == PREFILL_FI_FP8KV,
     })
 }
+
+// ============================================================================
+// 视觉塔注意力(ragged 非因果;2026-10-15)—— **与 native `vis.attn_full` 同槽位**
+// ============================================================================
+
+pub const ATTN_RAGGED_F16: &str = crate::family::flashinfer::ATTN_RAGGED_F16;
+
+/// 取用槽名(声明序;`vis::AttnFull` 的 PARAMS 同名同序 ⇒ F3 成对律可查)
+pub const ATTN_RAGGED_SLOTS: &[&str] =
+    &["q", "k", "v", "cu_seqlens", "out", "rows", "heads", "head_dim", "n_seq", "scale"];
+
+#[derive(Clone, Debug)]
+pub struct FiAttnRaggedCall {
+    pub q: BlockRef,
+    pub k: BlockRef,
+    pub v: BlockRef,
+    pub cu: BlockRef,
+    pub out: Bytes,
+    pub rows: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    pub n_seq: usize,
+    pub scale: f32,
+}
+
+/// 解析(4 Block + 5 标量;**按名取址**)
+pub fn parse_attn_ragged(msg: &LaunchMsg) -> Result<FiAttnRaggedCall, OpError> {
+    let s = crate::client::NamedSlots::new(msg)?;
+    Ok(FiAttnRaggedCall {
+        q: s.block("q")?,
+        k: s.block("k")?,
+        v: s.block("v")?,
+        cu: s.block("cu_seqlens")?,
+        out: s.out_block("out", 0)?,
+        rows: s.u64("rows")? as usize,
+        heads: s.u64("heads")? as usize,
+        head_dim: s.u64("head_dim")? as usize,
+        n_seq: s.i32("n_seq")? as usize,  // i32 槽(与 native `vis.attn_full` 同声明)
+        scale: s.f32("scale")?,
+    })
+}
+

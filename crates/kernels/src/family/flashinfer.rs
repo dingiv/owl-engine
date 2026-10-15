@@ -36,6 +36,12 @@ pub const PREFILL_FI: &str = "flashinfer_prefill_paged_f16";
 /// fp8 KV 变体(e4m3 KV + half Q/Out;槽序同 PREFILL_FI)
 pub const PREFILL_FI_FP8KV: &str = "flashinfer_prefill_paged_fp8kv";
 
+/// **视觉塔注意力**(2026-10-15):ragged(**非分页**)非因果 prefill。
+/// 复用同一份 vendored FlashInfer FA2 家族核(`BatchPrefillWithRaggedKVCacheDispatched`
+/// + `MaskMode::kNone`),与 vLLM 的 ViT 走同路算法;胶水住
+/// `cu/flashinfer/owl_fi_attn_ragged.cu`。**单图契约**(n_seq == 1;多图由 driver 分流到 native 臂)。
+pub const ATTN_RAGGED_F16: &str = "flashinfer_attn_ragged_f16";
+
 /// 槽序契约(LaunchMsg.args):
 /// `[T q, T k_fi, T v_fi, T q_cu_seqlens, T indices, T indptr, T last_len,
 ///   T wr(树序依赖边,K0-dual 先于读池;FI 不解引用),
@@ -57,7 +63,7 @@ pub const FI_HOST_STAGING_BYTES: usize = 32 * 1024 * 1024;
 
 /// foreign 分派谓词(server handle_launch 前置检查)
 pub fn is_foreign(name: &str) -> bool {
-    name == PREFILL_FI || name == PREFILL_FI_FP8KV
+    name == PREFILL_FI || name == PREFILL_FI_FP8KV || name == ATTN_RAGGED_F16
 }
 
 extern "C" {
@@ -119,4 +125,41 @@ extern "C" {
         sm_scale: f32,
         stream: *mut c_void,
     ) -> i32;
+    /// 视觉塔 ragged plan(host;每形状一次)
+    pub fn owl_fi_attn_ragged_plan(
+        float_ws: *mut std::ffi::c_void,
+        float_ws_size: usize,
+        int_ws: *mut std::ffi::c_void,
+        int_ws_size: usize,
+        page_locked: *mut std::ffi::c_void,
+        page_locked_size: usize,
+        out_plan15: *mut i64,
+        out_cta_tile_q: *mut i32,
+        out_cu_dev: *mut i32,
+        rows: i32,
+        num_heads: i32,
+        head_dim: i32,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
+
+    /// 视觉塔 ragged run(f16;非因果;单图)
+    pub fn owl_fi_attn_ragged_run_f16(
+        q: *const std::ffi::c_void,
+        k: *const std::ffi::c_void,
+        v: *const std::ffi::c_void,
+        cu: *const std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        plan15: *const i64,
+        int_ws: *mut std::ffi::c_void,
+        int_ws_size: usize,
+        float_ws: *mut std::ffi::c_void,
+        float_ws_size: usize,
+        rows: i32,
+        num_heads: i32,
+        head_dim: i32,
+        n_seq: i32,
+        scale: f32,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
+
 }

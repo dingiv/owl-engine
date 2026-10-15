@@ -165,6 +165,47 @@ impl DeviceClient for CpuFace {
                 // 标量与 lower_rmsnorm 对位:cols(I32)/eps(F32)/w_off(I32)
                 ops::rmsnorm(&vals[0], &vals[1], i32s[0] as usize, f32s[0], i32s[1] != 0)?
             }
+            "owl_layernorm_f32" => {
+                // 标量与 ops/vis.rs 声明对位:n(I32)/eps(F32);父 = x/weight/bias
+                ops::layernorm(&vals[0], &vals[1], &vals[2], i32s[0] as usize, f32s[0])?
+            }
+            "owl_rope_half_partial_f32" => ops::rope_half_partial(
+                &vals[0],
+                &vals[1],
+                &vals[2],
+                &vals[3],
+                u64s[0] as usize,
+                u64s[1] as usize,
+                u64s[2] as usize,
+            )?,
+            "owl_narrow_strided_f32" => ops::narrow_strided(
+                &vals[0],
+                u64s[0] as usize,
+                u64s[1] as usize,
+                u64s[2] as usize,
+                u64s[3] as usize,
+            )?,
+            "owl_gelu_tanh_f32" => ops::gelu_tanh(&vals[0])?,
+            "owl_gelu_erf_f32" => ops::gelu_erf(&vals[0])?,
+            "owl_bias_add_f32" => ops::bias_add(&vals[0], &vals[1], u64s[0] as usize)?,
+            "owl_pos_embed_bilinear_f32" => ops::pos_embed_bilinear(
+                &vals[0],
+                &vals[1],
+                &vals[2],
+                u64s[0] as usize,
+                u64s[1] as usize,
+            )?,
+            "owl_vis_attn_full_f32" => ops::attn_full(
+                &vals[0],
+                &vals[1],
+                &vals[2],
+                &vals[3],
+                u64s[0] as usize,
+                u64s[1] as usize,
+                u64s[2] as usize,
+                i32s[0] as usize,
+                f32s[0],
+            )?,
             other => {
                 return Err(ModelError::Msg(format!(
                     "CpuFace::launch: 未注册的动作 {other}"

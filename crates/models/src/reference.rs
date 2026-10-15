@@ -52,6 +52,65 @@ pub trait Interpreter {
         eps: f32,
         w_off: bool,
     ) -> Result<Value, ModelError>;
+    /// Layernorm(affine;视觉塔):parents = [x, weight, bias];two-pass mean/var
+    fn layernorm(
+        &mut self,
+        x: &Value,
+        weight: &Value,
+        bias: &Value,
+        n: usize,
+        eps: f32,
+    ) -> Result<Value, ModelError>;
+    /// GELU(tanh 近似;视觉塔 MLP)
+    fn gelu_tanh(&mut self, x: &Value) -> Result<Value, ModelError>;
+    /// GELU(精确 erf;视觉塔 merger)
+    fn gelu_erf(&mut self, x: &Value) -> Result<Value, ModelError>;
+    /// 行广播加(x [rows,cols] + bias [cols])
+    fn bias_add(&mut self, x: &Value, bias: &Value, cols: usize) -> Result<Value, ModelError>;
+    /// 位置嵌入 4-tap 重采样(table / idx / wts)
+    fn pos_embed_bilinear(
+        &mut self,
+        table: &Value,
+        idx: &Value,
+        wts: &Value,
+        n_taps: usize,
+        dim: usize,
+    ) -> Result<Value, ModelError>;
+    /// 非因果 varlen 全注意力(q/k/v/cu;无 GQA)
+    #[allow(clippy::too_many_arguments)]
+    fn attn_full(
+        &mut self,
+        q: &Value,
+        k: &Value,
+        v: &Value,
+        cu: &Value,
+        rows: usize,
+        heads: usize,
+        head_dim: usize,
+        n_seq: usize,
+        scale: f32,
+    ) -> Result<Value, ModelError>;
+    /// Rope(rotate-half 表驱动;pos 选表行,前 2·half 维旋转)
+    #[allow(clippy::too_many_arguments)]
+    fn rope_half_partial(
+        &mut self,
+        x: &Value,
+        cos_t: &Value,
+        sin_t: &Value,
+        pos: &Value,
+        heads: usize,
+        head_dim: usize,
+        half: usize,
+    ) -> Result<Value, ModelError>;
+    /// 非连续窄切物化
+    fn narrow_strided(
+        &mut self,
+        src: &Value,
+        outer: usize,
+        src_dim: usize,
+        start: usize,
+        out_dim: usize,
+    ) -> Result<Value, ModelError>;
     /// SlotWrite:KV 写槽(副作用;返回透传值)
     fn slot_write(&mut self, v: &Value) -> Result<Value, ModelError> {
         Ok(v.clone()) // CPU 参考实现:无状态,透传
@@ -171,6 +230,75 @@ fn reduce_rec(
                 other => panic!("rmsnorm 标量槽 2 期望 i32 w_off,实得 {other:?}"),
             };
             itp.rmsnorm(&ins[0], &ins[1], eps, w_off)
+        }
+        Op::Call { op: SemanticKernel::Layernorm, .. } => {
+            // 标量槽序 = vis.layernorm 线契约:n(i32) / eps(f32)
+            let n = match t.args.first() {
+                Some(KernelArg::I32(v)) => *v as usize,
+                other => panic!("layernorm 标量槽 0 期望 i32 n,实得 {other:?}"),
+            };
+            let eps = match t.args.get(1) {
+                Some(KernelArg::F32(v)) => *v,
+                other => panic!("layernorm 标量槽 1 期望 f32 eps,实得 {other:?}"),
+            };
+            itp.layernorm(&ins[0], &ins[1], &ins[2], n, eps)
+        }
+        Op::Call { op: SemanticKernel::Rope, .. } => {
+            // 标量槽序 = ops.rope 线契约:heads(sz)/head_dim(sz)/half(sz)
+            let sz = |i: usize, what: &str| match t.args.get(i) {
+                Some(KernelArg::Bits(v)) => *v as usize,
+                other => panic!("rope 标量槽 {i}({what})期望 sz,实得 {other:?}"),
+            };
+            itp.rope_half_partial(&ins[0], &ins[1], &ins[2], &ins[3], sz(0, "heads"), sz(1, "head_dim"), sz(2, "half"))
+        }
+        Op::Call { op: SemanticKernel::Narrow, .. } => {
+            // 标量槽序 = ops.narrow 线契约:outer/src_dim/start/out_dim(sz)
+            let sz = |i: usize, what: &str| match t.args.get(i) {
+                Some(KernelArg::Bits(v)) => *v as usize,
+                other => panic!("narrow 标量槽 {i}({what})期望 sz,实得 {other:?}"),
+            };
+            itp.narrow_strided(&ins[0], sz(0, "outer"), sz(1, "src_dim"), sz(2, "start"), sz(3, "out_dim"))
+        }
+        Op::Call { op: SemanticKernel::GeluTanh, .. } => itp.gelu_tanh(&ins[0]),
+        Op::Call { op: SemanticKernel::GeluErf, .. } => itp.gelu_erf(&ins[0]),
+        Op::Call { op: SemanticKernel::BiasAdd, .. } => {
+            // 标量槽序 = vis.bias_add 线契约:cols(sz)
+            let cols = match t.args.first() {
+                Some(KernelArg::Bits(v)) => *v as usize,
+                other => panic!("bias_add 标量槽 0 期望 sz cols,实得 {other:?}"),
+            };
+            itp.bias_add(&ins[0], &ins[1], cols)
+        }
+        Op::Call { op: SemanticKernel::PosEmbedBilinear, .. } => {
+            // 标量槽序 = vis.pos_embed 线契约:n_taps(sz) / dim(sz)
+            let n_taps = match t.args.first() {
+                Some(KernelArg::Bits(v)) => *v as usize,
+                other => panic!("pos_embed 标量槽 0 期望 sz n_taps,实得 {other:?}"),
+            };
+            let dim = match t.args.get(1) {
+                Some(KernelArg::Bits(v)) => *v as usize,
+                other => panic!("pos_embed 标量槽 1 期望 sz dim,实得 {other:?}"),
+            };
+            itp.pos_embed_bilinear(&ins[0], &ins[1], &ins[2], n_taps, dim)
+        }
+        Op::Call { op: SemanticKernel::AttnFull, .. } => {
+            // 标量槽序 = vis.attn_full 线契约:rows/heads/head_dim(sz) / n_seq(i32) / scale(f32)
+            let sz = |i: usize, what: &str| match t.args.get(i) {
+                Some(KernelArg::Bits(v)) => *v as usize,
+                other => panic!("attn_full 标量槽 {i}({what})期望 sz,实得 {other:?}"),
+            };
+            let n_seq = match t.args.get(3) {
+                Some(KernelArg::I32(v)) => *v as usize,
+                other => panic!("attn_full 标量槽 3 期望 i32 n_seq,实得 {other:?}"),
+            };
+            let scale = match t.args.get(4) {
+                Some(KernelArg::F32(v)) => *v,
+                other => panic!("attn_full 标量槽 4 期望 f32 scale,实得 {other:?}"),
+            };
+            itp.attn_full(
+                &ins[0], &ins[1], &ins[2], &ins[3],
+                sz(0, "rows"), sz(1, "heads"), sz(2, "head_dim"), n_seq, scale,
+            )
         }
         // 其余动作(gdn/attn/ln/mlp/dflash/marlin/fi…)= GPU/引擎路径;
         // CPU 参考面结构化拒绝,绝不静默
@@ -350,5 +478,250 @@ impl Interpreter for CpuInterpreter {
             }
         }
         Ok(Value { f32: out, shape: x.shape.clone() })
+    }
+
+    /// Layernorm(affine;two-pass mean/var —— 与 torch.nn.LayerNorm 同序;
+    /// 与 `owl-cpu` / CUDA 实现**互为独立副本**,禁止互引)
+    fn layernorm(
+        &mut self,
+        x: &Value,
+        weight: &Value,
+        bias: &Value,
+        n: usize,
+        eps: f32,
+    ) -> Result<Value, ModelError> {
+        let n = n.max(1);
+        if weight.f32.len() < n || bias.f32.len() < n {
+            return Err(ModelError::Msg(format!(
+                "layernorm: weight/bias 短于行宽 {n}(得 {}/{})",
+                weight.f32.len(),
+                bias.f32.len()
+            )));
+        }
+        let rows = x.f32.len() / n;
+        let mut out = vec![0.0f32; rows * n];
+        for r in 0..rows {
+            let xs = &x.f32[r * n..(r + 1) * n];
+            let mean = xs.iter().sum::<f32>() / n as f32;
+            let var = xs.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n as f32;
+            let inv = 1.0 / (var + eps).sqrt();
+            for c in 0..n {
+                out[r * n + c] = (xs[c] - mean) * inv * weight.f32[c] + bias.f32[c];
+            }
+        }
+        Ok(Value { f32: out, shape: x.shape.clone() })
+    }
+
+    fn rope_half_partial(
+        &mut self,
+        x: &Value,
+        cos_t: &Value,
+        sin_t: &Value,
+        pos: &Value,
+        heads: usize,
+        head_dim: usize,
+        half: usize,
+    ) -> Result<Value, ModelError> {
+        let row_len = heads * head_dim;
+        if row_len == 0 || x.f32.len() % row_len != 0 {
+            return Err(ModelError::Msg(format!(
+                "rope: x 长 {} 不是 heads·head_dim = {row_len} 的整数倍",
+                x.f32.len()
+            )));
+        }
+        let rows = x.f32.len() / row_len;
+        let table_rows = cos_t.f32.len() / half.max(1);
+        let mut out = x.f32.clone();
+        for t in 0..rows {
+            let p = pos.f32[t] as usize;
+            if p >= table_rows {
+                return Err(ModelError::Msg(format!(
+                    "rope: pos[{t}] = {p} 越出表行数 {table_rows}"
+                )));
+            }
+            for h in 0..heads {
+                let base = t * row_len + h * head_dim;
+                for i in 0..half {
+                    let a = x.f32[base + i];
+                    let b = x.f32[base + i + half];
+                    let (c, s) = (cos_t.f32[p * half + i], sin_t.f32[p * half + i]);
+                    out[base + i] = a.mul_add(c, -(b * s));
+                    out[base + i + half] = b.mul_add(c, a * s);
+                }
+            }
+        }
+        Ok(Value { f32: out, shape: x.shape.clone() })
+    }
+
+    fn narrow_strided(
+        &mut self,
+        src: &Value,
+        outer: usize,
+        src_dim: usize,
+        start: usize,
+        out_dim: usize,
+    ) -> Result<Value, ModelError> {
+        if (outer.saturating_sub(1)) * src_dim + start + out_dim > src.f32.len() {
+            return Err(ModelError::Msg(format!(
+                "narrow_strided: 读越界(outer {outer} src_dim {src_dim} start {start} out_dim {out_dim})"
+            )));
+        }
+        let mut out = Vec::with_capacity(outer * out_dim);
+        for r in 0..outer {
+            let s = r * src_dim + start;
+            out.extend_from_slice(&src.f32[s..s + out_dim]);
+        }
+        Ok(Value { f32: out, shape: vec![outer, out_dim] })
+    }
+
+    fn gelu_tanh(&mut self, x: &Value) -> Result<Value, ModelError> {
+        // 0.5x(1+tanh(√(2/π)(x+0.044715x³)));与 owl-cpu 互为独立副本
+        let c = (2.0f64 / std::f64::consts::PI).sqrt();
+        let vals: Vec<f32> = x
+            .f32
+            .iter()
+            .map(|v| {
+                let vf = *v as f64;
+                (0.5 * vf * (1.0 + (c * (vf + 0.044715 * vf * vf * vf)).tanh())) as f32
+            })
+            .collect();
+        Ok(Value { f32: vals, shape: x.shape.clone() })
+    }
+
+    fn gelu_erf(&mut self, x: &Value) -> Result<Value, ModelError> {
+        // 0.5x(1+erf(x/√2));erf 走 f64 级数(|x|>4 饱和 —— 误差 < 1.5e-8)
+        fn erf_series(x: f64) -> f64 {
+            if x.abs() > 4.0 {
+                return x.signum();
+            }
+            let mut t = x;
+            let mut acc = x;
+            for n in 1..=200u32 {
+                t *= -x * x / f64::from(n);
+                let term = t / f64::from(2 * n + 1);
+                acc += term;
+                if term.abs() < 1e-18 {
+                    break;
+                }
+            }
+            2.0 / std::f64::consts::PI.sqrt() * acc
+        }
+        let vals: Vec<f32> = x
+            .f32
+            .iter()
+            .map(|v| {
+                let vf = *v as f64;
+                (0.5 * vf * (1.0 + erf_series(vf / std::f64::consts::SQRT_2))) as f32
+            })
+            .collect();
+        Ok(Value { f32: vals, shape: x.shape.clone() })
+    }
+
+    fn bias_add(&mut self, x: &Value, bias: &Value, cols: usize) -> Result<Value, ModelError> {
+        let cols = cols.max(1);
+        if bias.f32.len() < cols {
+            return Err(ModelError::Msg(format!(
+                "bias_add: bias 长 {} < cols {cols}",
+                bias.f32.len()
+            )));
+        }
+        let rows = x.f32.len() / cols;
+        let mut out = x.f32.clone();
+        for r in 0..rows {
+            for c in 0..cols {
+                out[r * cols + c] += bias.f32[c];
+            }
+        }
+        Ok(Value { f32: out, shape: x.shape.clone() })
+    }
+
+    fn pos_embed_bilinear(
+        &mut self,
+        table: &Value,
+        idx: &Value,
+        wts: &Value,
+        n_taps: usize,
+        dim: usize,
+    ) -> Result<Value, ModelError> {
+        let (n_taps, dim) = (n_taps.max(1), dim.max(1));
+        let rows = idx.f32.len() / n_taps;
+        let n_pos = table.f32.len() / dim;
+        let mut out = vec![0.0f32; rows * dim];
+        for r in 0..rows {
+            let mut acc = vec![0.0f32; dim];
+            for k in 0..n_taps {
+                let row = idx.f32[r * n_taps + k] as usize;
+                if row >= n_pos {
+                    return Err(ModelError::Msg(format!(
+                        "pos_embed: idx[{r},{k}] = {row} 越出表行数 {n_pos}"
+                    )));
+                }
+                let w = wts.f32[r * n_taps + k];
+                let src = &table.f32[row * dim..(row + 1) * dim];
+                for (d, s) in src.iter().enumerate() {
+                    acc[d] += w * s;
+                }
+            }
+            out[r * dim..(r + 1) * dim].copy_from_slice(&acc);
+        }
+        Ok(Value { f32: out, shape: vec![rows, dim] })
+    }
+
+    fn attn_full(
+        &mut self,
+        q: &Value,
+        k: &Value,
+        v: &Value,
+        cu: &Value,
+        rows: usize,
+        heads: usize,
+        head_dim: usize,
+        n_seq: usize,
+        scale: f32,
+    ) -> Result<Value, ModelError> {
+        // 两趟 softmax(先 max 后加权和);与 CUDA 的在线 softmax 数学同值
+        let mut out = vec![0.0f32; rows * heads * head_dim];
+        let elem = |b: &Value, row: usize, head: usize, d: usize| b.f32[(row * heads + head) * head_dim + d];
+        for row in 0..rows {
+            let mut span = (0usize, 0usize);
+            for s in 0..n_seq {
+                let a = cu.f32[s] as usize;
+                let b = cu.f32[s + 1] as usize;
+                if a <= row && row < b {
+                    span = (a, b);
+                    break;
+                }
+            }
+            let (start, end) = span;
+            if start >= end {
+                continue;
+            }
+            for head in 0..heads {
+                let mut m = f32::NEG_INFINITY;
+                let mut scores = vec![0.0f32; end - start];
+                for (i, t) in (start..end).enumerate() {
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot = elem(q, row, head, d).mul_add(elem(k, t, head, d), dot);
+                    }
+                    scores[i] = dot * scale;
+                    m = m.max(scores[i]);
+                }
+                let mut l = 0.0f32;
+                let mut acc = vec![0.0f32; head_dim];
+                for (i, t) in (start..end).enumerate() {
+                    let e = (scores[i] - m).exp();
+                    l += e;
+                    for d in 0..head_dim {
+                        acc[d] = elem(v, t, head, d).mul_add(e, acc[d]);
+                    }
+                }
+                let inv = if l > 0.0 { 1.0 / l } else { 0.0 };
+                for d in 0..head_dim {
+                    out[(row * heads + head) * head_dim + d] = acc[d] * inv;
+                }
+            }
+        }
+        Ok(Value { f32: out, shape: vec![rows, heads, head_dim] })
     }
 }

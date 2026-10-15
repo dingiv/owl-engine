@@ -10,9 +10,12 @@ requires-python = ">=3.12"
 dependencies = [
     # torch 钉 CPU 轮(对拍在 CPU 跑;索引见 [tool.uv.sources])
     "torch>=2.9",
+    # 图像预处理(vision harness:processor 的 fast 臂需要)
+    "torchvision>=0.20",
     "transformers>=4.57",
     "safetensors>=0.6",
     "numpy>=2.0",
+    "pillow>=12.3.0",
 ]
 
 # 脚本项目(非 python 包):只要依赖同步,不构建安装
@@ -21,6 +24,7 @@ package = false
 
 [tool.uv.sources]
 torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
