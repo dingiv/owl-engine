@@ -1,5 +1,27 @@
 # Piecewise(可断)捕获图 —— 设计与实现方案(2026-10-15;perf 会话立项)
 
+## §0 现状与用法(先读这一页;实录从 §1 起)
+
+| 项 | 值 |
+|---|---|
+| **状态** | ✅ **已转正**(2026-10-16):prefill / verify / decode **三条路全部 FI+split** |
+| **开关**(flavor `spec-dflash`,已置位) | `verify_piecewise = true`、`verify_fi = true`、`verify_xqa = false`、`verify_v2 = false`、`decode_fi = true`、`decode_xqa = false`(外加既有 `kv_fp8 = true`) |
+| **回退** | 把 `verify_piecewise/verify_fi/decode_fi` 关掉 ⇒ 回 XQA/v2(**不改代码**);⚠️ **args 档覆盖 flavor**(深合并),`testdata/args/spec-27b-prod.toml` 等本地档必须同步改,否则静默跑回旧臂 |
+| **拓扑** | 27B:verify = 17 段/16 断点(T=8);session = 17 段/16 断点(T=1 每步) |
+| **收益**(27B+fp8,greedy) | verify 32k 轮时 69.3 → **48.4ms(−30%)**;decode 裸步 32k 47.8 → **29.0ms(−39%)**;两路**对 ctx 平坦**;文本与旧臂**逐位一致**;prefill ±0.3% |
+| **代价/未决** | 17+17 条 slab(显存 ≈ 图数 × 单图 slab)⇒ 20G 卡生产档 OOM,段合并待 S1.5;生产档带 spec 的请求级验证、长 ctx 文本 A/B、soak 未做 |
+| **不变量** | **I-1..I-6**(§5)+ **I-7 段边界值必须 keep**、**I-8 捕获窗内零回收**、**I-9 空段/空尾不建图**、**I-10 断点采集面与 plan 的断点表同源**(§11.3) |
+| **机制一句话** | 树被**断点**(核节点)切成段,各段单独捕获;断点由驱动件在**段间窗外 eager 重放**并写进**钉块**(plan 持有、两期同址);核里"每轮变的宿主标量"走**宿主标量槽**(`BreakDecl::host_scalar`,下标 = kernel 契约槽序),每轮变的设备值走**图输入槽** |
+| **取证仪器**(env diag,§11.4/§11.12) | **boot 期 `现役臂: prefill=… \| verify=… \| decode=… \| spec=… \| kv_fp8=…` 一行**(臂身份自证);`session/verify 分段捕获(段=N 断点=M)`;`OWL_PW_SELFCHECK`(回放≡eager,NaN 记 ∞);`OWL_PW_BREAKS=k`;`OWL_PW_PIN_ZERO` + `[pw-pin-now]`;`OWL_KV_DUMP` + `tools/kv_footprint.py`;`[fi-plan]`(OWL_FI_DEBUG);`tools/pw-ab-greedy.sh`、`tools/pw-probe.sh` |
+| **门** | engine lib 33/33、models lib 129/129、`gpu_piecewise_segments`;`OWL_GATE_PIECEWISE=1` ⇒ 27B 恒等门整臂(断点臂不破文本红线) |
+
+**三条最贵的教训**(全文最有复用价值的部分):
+1. **追"连贯但错"的输出,先证"这条路径到底有没有跑"** —— 段/断点计数、plan 计数、
+   KV 字节足迹,三个几行的仪器各排掉一个方向(核错/布局错/表错);本次真因是
+   `plan_session` **少交断点采集面** ⇒ FI 核被烘进图 + plan 用占位 `ctx_total=1` 烘死。
+2. **"看起来像 A 臂"的数字可能是 B 臂**(档被拼坏,把 v2 当 FI 报过一栏)⇒ 报数前先验臂身份。
+3. **对 NaN 全盲的门等于没有门**(首版 `max|Δ|>1e-3` 把"两臂都 NaN"读成"一致")。
+
 > **触发**:V1 核级验证已达标(FI+split 在 verify 形状 0.249 ms/发 vs XQA 1.541),
 > 但**换不进引擎** —— 现役 verify/decode 是**捕获图**,而 FI 的 plan 在 split 档**依赖 ctx**
 > (chunk 数 / `o_indptr` / `merge_indptr` / `padded_batch`),一张图只对一个 ctx 有效。
@@ -627,3 +649,36 @@ decode_fi=true`(⚠️ args 覆盖 flavor,两处都要改;同一坑第二次踩)
 plan 计数、字节差分),再怀疑数值 —— 本轮三个仪器(分段计数/plan 打印/KV 足迹)各只花几行,
 却一次排掉"核错/布局错/表错"三个方向;**而"看起来像 A 臂"的数字可能是 B 臂**(档被我拼坏过一次,
 把 v2 当成了 FI)⇒ 报数前先验"臂真的在跑"。
+
+### 11.14 转正落码后的验证状态(2026-10-16 收尾)
+
+- **落码**:flavor `spec-dflash`(`verify_xqa/v2=false`,`verify_piecewise/fi=true`,`decode_xqa=false`,
+  `decode_fi=true`)+ 生产 args 档同步(**args 覆盖 flavor,两处都要改** —— 本轮踩了三次:两次
+  `verify_*`、一次 `decode_*`;凡"改 flavor 就生效"的直觉都是错的)。
+- **已验证**:生产几何下 boot 成功,且**两条 plan 都是分段态**:
+  `session 分段捕获(段=17 断点=16)` + `verify 分段捕获(T=8;段=17 断点=16)` ✓;
+  裸 decode 臂文本 ≡ v2/XQA 逐位、timing −16%/−39%(§11.13,同 flavor 同池)。
+- ⚠️ **未验证**:生产档**跑一个带 spec 的请求**(`prod-fi-check.toml`)在 20G 的 3080 上
+  **OOM**(`alloc 1.7MiB` 失败)——不是接线问题:两条 piecewise plan 各 17 段 ⇒ 17+17 条
+  slab(每段按自己的 dry 计量开)+ fold/propose 图族,总占用在 20G 卡上贴顶。
+  ⇒ 待 3090 Ti 空出(GPU1/2 现被主会话两实例占用,不动)时补一次请求级验证;
+  并记一笔**优化项**:段 slab 合并("一条 slab N 段",设计 §10.2 的 A3 完整版)由主会话
+  S1.5 arena 落地后启用 ⇒ 显存占用可回到单图量级。
+
+### 11.15 ✅ A 组验证收官(2026-10-16;**24G 卡到位后全部跑完**)
+
+| 项 | 结果 |
+|---|---|
+| **A① 生产档请求级(带 spec,depth=7,fp8,24G 3090 Ti)** | ✅ boot 两条 plan 分段态;**greedy 请求文本与基线逐字一致**;轮时 **16.3ms/轮**(短 ctx) |
+| **A② 长 ctx decode 文本级 A/B** | ✅ 参考臂 `decode=XQA` vs 实验臂 `decode=FI断点(17/16)`,**prompt=9298 tok(291 页)× 32 tok 逐字一致** |
+| **A③ soak(生产档,sampling)** | ✅ 225 tok / 4.77s、**16.0ms/轮**、AL≈4.2、**零 error/panic/Xid 迹象** |
+| **A④ 门** | ✅ engine lib 33/33、models lib 129/129、`gpu_piecewise_segments` 真机绿 |
+| ⚠️ 仍未做 | 27B 恒等门整臂(`OWL_GATE_PIECEWISE=1`)因**既有 MTP 路径红**(`draft.rs:852` index OOB,**piecewise 关亦复现**)而红 ⇒ 实际红线仍用 `tools/pw-ab-greedy.sh`(已两次证明:1 条/16 条断点 + 长 ctx) |
+
+**⚠️ 本轮又踩一次"args 覆盖 flavor",但这次是反过来**:**没写的键继承 flavor** ⇒ 我写
+`decode_xqa = true` 想造 XQA 参考臂,却漏了 `decode_fi = false` ⇒ 参考臂实际跑 FI(A② 第一轮
+"一致"是假绿灯)。**是 boot 期那行『现役臂』把它当场抓出来的**(仪器一上线就还本)⇒ 参考臂一律
+**显式写全六键**(`decode_fi=false` 之类)。
+
+**A 组结论**:V1 三段换装(来源核/收益/正确性)**全部自证完毕**;生产档在 24G 卡上可跑、文本正确、
+轮时正确、无 Xid。剩下只有 C 组债务(段 slab 合并等 S1.5、pin 守卫、diag 登记)与 D 组通报。

@@ -132,6 +132,39 @@ impl<D: DeviceClient> GraphFleet<D> {
         } else {
             (Vec::new(), None, Vec::new())
         };
+        // **现役臂自证**(2026-10-16;教训:臂身份必须能查 —— 本轮曾把 v2 当 FI 报过一栏)。
+        // 三条路(prefill/verify/decode)各自的实际臂 + 分段计数 + spec 深度 + 池 dtype。
+        {
+            let arm = |pw: (usize, usize), xqa: bool, v2: bool, fi: bool| -> String {
+                if pw.1 > 0 {
+                    format!("FI断点({}段/{}断点)", pw.0, pw.1)
+                } else if fi {
+                    "FI(单图)".to_string()
+                } else if xqa {
+                    "XQA".to_string()
+                } else if v2 {
+                    "v2".to_string()
+                } else {
+                    "prefill族".to_string()
+                }
+            };
+            let (vs, vb) = verify.as_ref().map(|g| g.piecewise_shape()).unwrap_or((0, 0));
+            let (ss, sb) = session.piecewise_shape();
+            owl_shared::log_info!(
+                "boot",
+                "现役臂: prefill={} | verify={} | decode={} | spec=depth{} | kv_fp8={}",
+                if boot.knobs.env.attn.fi { "FI" } else { "自研读核" },
+                arm(
+                    (vs, vb),
+                    boot.knobs.env.attn.verify_xqa,
+                    boot.knobs.env.attn.verify_v2,
+                    boot.knobs.env.attn.verify_fi
+                ),
+                arm((ss, sb), boot.knobs.env.attn.decode_xqa, false, boot.knobs.env.attn.decode_fi),
+                boot.spec.depth,
+                boot.pool.kv_fp8,
+            );
+        }
         Ok(Self {
             session,
             capture_outcome,
