@@ -164,6 +164,7 @@ impl Model {
             attn_v2: ctx.attn_v2.clone(),
             v2_bt8: ctx.v2_bt8,
             xqa: ctx.xqa.clone(),
+            attn_break: ctx.attn_break.clone(),
         }
     }
 

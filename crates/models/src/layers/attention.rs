@@ -59,6 +59,19 @@ pub struct Attention {
     hidden: usize,
 }
 
+/// 注意力**核节点**登记(piecewise 断点采集面;`ctx.attn_break` = None 时
+/// 一次 `is_some()` 判、零开销)。
+///
+/// 语义:核 = 唯一"每轮按 ctx 重算 plan"的节点(FI 的 split 档 plan 依赖
+/// ctx)⇒ piecewise 把它移出捕获图、在段间 eager 重放(设计见
+/// `docs/piecewise-断点图-设计与实现.md`)。只推**核节点**(不含 GateMul/
+/// o_proj):前段落地的 q/K0 与后段消费的 softmax 输出各自在图内。
+fn note_attn_kernel(ctx: &ForwardCtx, y: &TensorOps) {
+    if let Some(sink) = ctx.attn_break.as_ref() {
+        sink.borrow_mut().push(crate::interpreters::BreakDecl::node(y.clone()));
+    }
+}
+
 impl Attention {
     /// 准备容器(0.8B:hq=8, hkv=2, hd=256 → q_proj out 4096 / kv out 512;
     /// `plan` = 量化计划构造期注入,尺寸门控在 Linear 内定形)
@@ -427,7 +440,7 @@ impl Attention {
         self.o_proj.forward(&y, ctx)
     }
 
-    /// verify v2 臂(§三十一):8 伪序列单次 v2 发射 + reduce。
+/// verify v2 臂(§三十一):8 伪序列单次 v2 发射 + reduce。
     /// bt8 = [seqs×nb] 页链平铺(engine 每轮写入);kv_lens = 图输入递增表
     /// ([ctx+1 .. ctx+seqs]);scratch = ctx.attn_v2(seqs 倍)。语义 =
     /// 每 token attend [0, pos_t](前缀截断即 chunk 内 causal)。
@@ -495,6 +508,7 @@ impl Attention {
             .arg_usize(self.hkv * hd)
             .arg_usize(hd)
             .with_shape(dt, vec![tokens, self.hq * hd]);
+        note_attn_kernel(ctx, &y);
         let n = tokens * self.hq * hd;
         let y = TensorOps::call(SemanticKernel::GateMul)
             .arg(gate)
@@ -561,6 +575,7 @@ impl Attention {
             .arg_usize(self.hkv * hd)
             .arg_usize(hd)
             .with_shape(dt, vec![tokens, self.hq * hd]);
+        note_attn_kernel(ctx, &y);
         let n = tokens * self.hq * hd;
         let y = TensorOps::call(SemanticKernel::GateMul)
             .arg(gate)
@@ -895,6 +910,7 @@ impl Attention {
         .arg_usize(pol.page)
         .arg_usize(fi_scale_bits(self.hd) as usize)
         .with_shape(dt, vec![tokens, self.hq * self.hd]);
+        note_attn_kernel(ctx, &y);
         // ③ 输出门(f16 融合单发)+ 出投影(与旧路径同)
         let n = tokens * self.hq * self.hd;
         let y = TensorOps::call(SemanticKernel::GateMul)

@@ -387,6 +387,42 @@ where
 //   S-2 `keep` 命中的值在后续段里**地址不变**(块被保护,永不归还/入池);
 //   S-3 调用方自行保证被断开的节点是**幂等**的(段求值面不管这个)。
 
+/// **断点登记**(模型层产出 ⇒ 驱动件消费;见 `docs/piecewise-断点图-设计与实现.md`)。
+///
+/// 与"段/断点/钉块"三概念对齐:节点 = 被移出图的那次求值;
+/// `host_scalar` = **宿主标量槽**——节点里"每轮会变的宿主标量"的显式通路。
+///
+/// 为什么需要:核的标量参数在**建树期烘死**,而有些标量是 plan/调度的输入
+/// (典型:FI 的 `ctx_total` —— plan key 含它,而它每轮随 ctx 增长)。
+/// 捕获图里烘死它 ⇒ 一张图只对一个 ctx 有效;piecewise 把核移出图后,
+/// 仍必须把**本轮**的值补进那个槽,否则窗外求值拿到的还是 capture 期的值。
+///
+/// 通路形状:`(标量槽下标, 每轮值)` —— 下标 = **kernel 契约里的 sz 槽序**
+/// (权威 = `KernelSpec::PARAMS`),不是魔法数;值由调用方(引擎)每轮写。
+/// 设备侧的量(页表/indptr/…)仍走图输入槽,两类输入边界清晰。
+pub struct BreakDecl {
+    /// 断点节点(= 移出图的求值;操作数全是稳定块叶或上段产出)
+    pub node: TensorOps,
+    /// 宿主标量槽:`arg_idx` 越界在 plan 期结构化拒捕(不静默用旧值)
+    pub host_scalar: Option<(usize, std::sync::Arc<std::sync::atomic::AtomicUsize>)>,
+}
+
+impl BreakDecl {
+    /// 静态断点(无宿主标量):核里没有每轮变的标量
+    pub fn node(node: TensorOps) -> Self {
+        Self { node, host_scalar: None }
+    }
+
+    /// 带宿主标量槽的断点(核含每轮变的宿主标量;见类型注)
+    pub fn with_host_scalar(
+        node: TensorOps,
+        arg_idx: usize,
+        cell: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        Self { node, host_scalar: Some((arg_idx, cell)) }
+    }
+}
+
 /// 段求值接力棒(**段间最小状态**;与图/捕获/算子种类无关)。
 #[derive(Default, Clone, Debug)]
 pub struct EvalCarry {
@@ -419,13 +455,27 @@ impl EvalCarry {
     }
 }
 
+/// **段求值口径**(与调用点所处的窗口绑定;**选错即硬错或泄漏**):
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SegMode {
+    /// **捕获窗内**(`graph_begin..graph_end` 之间):块所有权归 slab —— 禁一切
+    /// 回收(捕获期 free 被服务端白名单拒:实测 "图捕获进行中:该操作被拒";
+    /// 且 Carved 块本就不可还)。口径 = 单图 path 的 `eval_ops_multi`
+    /// (那个入口从不复用/不回收)。
+    Capturing,
+    /// **窗外**(干跑计量 / 断点求值 / 诊断):per-node 活性回收 + 段末候选清扫。
+    Eager,
+}
+
 /// **段求值**(piecewise 求值面原语,见本段头注):
 /// 在 `carry` 接力下求值 `roots` 的可达子图,返回各根的块句柄。
+/// `mode` = 本段求值所处的窗口([`SegMode`];捕获窗内零回收)。
 pub fn eval_segment<'a, D>(
     roots: &'a [&'a TensorOps],
     face: &'a mut D,
     env: crate::env::EnvProvider,
     carry: &'a mut EvalCarry,
+    mode: SegMode,
 ) -> Pin<Box<dyn Future<Output = Result<Vec<Bytes>, ModelError>> + Send + 'a>>
 where
     D: crate::contract::DeviceClient + 'a,
@@ -438,7 +488,9 @@ where
             }
         }
         let perf = PerfCtx::of(&env);
-        let pool_budget = block_pool_budget();
+        // 捕获口径:零池、零回收(与 `eval_ops_multi` 同律 —— 窗内一切分配进 slab)
+        let capt = mode == SegMode::Capturing;
+        let pool_budget = if capt { 0 } else { block_pool_budget() };
         let mut ctx = EvalCtx {
             face,
             memo: std::mem::take(&mut carry.memo),
@@ -447,7 +499,7 @@ where
             arena_set: std::collections::HashSet::new(),
             block_users: std::collections::HashMap::new(),
             pending,
-            reclaim: true,
+            reclaim: !capt,
             perf,
             env,
             pool: (pool_budget > 0).then(|| BlockPool::new(pool_budget)),
@@ -460,13 +512,15 @@ where
             out.push(_eval_rec(r, &mut ctx).await?);
         }
         ctx.flush_pool().await?;
-        let root_ids: std::collections::HashSet<u64> = out.iter().map(|b| b.id).collect();
-        let mut candidates: Vec<u64> = std::mem::take(&mut ctx.arena);
-        candidates.retain(|id| {
-            !root_ids.contains(id) && ctx.arena_set.contains(id) && !ctx.is_kept(*id)
-        });
-        if !candidates.is_empty() {
-            ctx.face.free(&candidates).await?;
+        if !capt {
+            let root_ids: std::collections::HashSet<u64> = out.iter().map(|b| b.id).collect();
+            let mut candidates: Vec<u64> = std::mem::take(&mut ctx.arena);
+            candidates.retain(|id| {
+                !root_ids.contains(id) && ctx.arena_set.contains(id) && !ctx.is_kept(*id)
+            });
+            if !candidates.is_empty() {
+                ctx.face.free(&candidates).await?;
+            }
         }
         // 段末接力:**只**把 keep 命中的值留给下一段(其余块已回收/归还)
         ctx.memo.retain(|node_id, _| carry.keep.contains(node_id));
@@ -1061,7 +1115,7 @@ mod liveness_tests {
 
         let mut carry = EvalCarry::default();
         carry.keep.insert(a.id);
-        let seg0 = eval_segment(&[&a], &mut face, Default::default(), &mut carry)
+        let seg0 = eval_segment(&[&a], &mut face, Default::default(), &mut carry, SegMode::Eager)
             .await
             .expect("seg0");
         assert_eq!(seg0.len(), 1);
@@ -1078,7 +1132,7 @@ mod liveness_tests {
         carry.resolve(brk.id, brk_block.clone());
         assert!(carry.keep.contains(&brk.id), "resolve 必须同时登记 keep");
 
-        let seg1 = eval_segment(&[&r], &mut face, Default::default(), &mut carry)
+        let seg1 = eval_segment(&[&r], &mut face, Default::default(), &mut carry, SegMode::Eager)
             .await
             .expect("seg1");
         let rv = read_f32(&mut face, &seg1[0]).await;
@@ -1109,7 +1163,7 @@ mod liveness_tests {
         let mut carry = EvalCarry::default();
         carry.override_out(n.id, pin.clone());
 
-        let outs = eval_segment(&[&n], &mut face, Default::default(), &mut carry)
+        let outs = eval_segment(&[&n], &mut face, Default::default(), &mut carry, SegMode::Eager)
             .await
             .expect("eval");
         assert_eq!(outs[0].id, pin.id, "覆盖点必须写进给定块(而不是新分配)");
@@ -1132,7 +1186,7 @@ mod liveness_tests {
         let bad = face.alloc(Dtype::F32, 1).await.expect("错尺寸钉块").view(Dtype::F32, 1);
         let mut carry = EvalCarry::default();
         carry.override_out(n.id, bad);
-        let r = eval_segment(&[&n], &mut face, Default::default(), &mut carry).await;
+        let r = eval_segment(&[&n], &mut face, Default::default(), &mut carry, SegMode::Eager).await;
         let e = r.err().expect("尺寸不符必须拒").to_string();
         assert!(e.contains("输出覆盖尺寸不符"), "拒语应指向覆盖尺寸,得 {e}");
     }
@@ -1151,7 +1205,7 @@ mod liveness_tests {
 
         let mut carry = EvalCarry::default();
         carry.keep.insert(kept.id);
-        let s0 = eval_segment(&[&root], &mut face, Default::default(), &mut carry)
+        let s0 = eval_segment(&[&root], &mut face, Default::default(), &mut carry, SegMode::Eager)
             .await
             .expect("seg0");
         let root_bid = s0[0].id;
@@ -1169,7 +1223,7 @@ mod liveness_tests {
             "阳性对照失败:本段一个死块都没归还 ⇒ 回收没跑(判据空转)"
         );
         // 再请求 kept = 命中 memo 的同块(零重算)
-        let s1 = eval_segment(&[&kept], &mut face, Default::default(), &mut carry)
+        let s1 = eval_segment(&[&kept], &mut face, Default::default(), &mut carry, SegMode::Eager)
             .await
             .expect("seg1");
         assert_eq!(s1[0].id, kept_bid, "keep 节点应命中 memo 返回同块");
@@ -1185,11 +1239,11 @@ mod liveness_tests {
         let x = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[7.0]));
         let n = x.add(&one);
         let mut carry = EvalCarry::default(); // 不登记 keep
-        let s0 = eval_segment(&[&n], &mut face, Default::default(), &mut carry)
+        let s0 = eval_segment(&[&n], &mut face, Default::default(), &mut carry, SegMode::Eager)
             .await
             .expect("seg0");
         assert!(carry.memo.is_empty(), "未 keep 的值不该出现在接力棒里");
-        let s1 = eval_segment(&[&n], &mut face, Default::default(), &mut carry)
+        let s1 = eval_segment(&[&n], &mut face, Default::default(), &mut carry, SegMode::Eager)
             .await
             .expect("seg1");
         assert_ne!(s0[0].id, s1[0].id, "未 keep ⇒ 应重算出新块");

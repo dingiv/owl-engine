@@ -126,6 +126,13 @@ pub struct ForwardCtx<'a> {
     /// GDN 分派门控打印(EngineKnobs.probes.trace_gate 注入;显式依赖律,
     /// 原 OWL_TRACE_GATE 层内直读 —— 热路径零 env)
     pub trace_gate: bool,
+    /// **注意力核断点采集面**(piecewise 捕获图;形态同 `gdn_tap` ——
+    /// 层把**核节点**推进来,不是引擎去认识算子):注意力层在 FI/XQA 那个
+    /// `Call` 节点建好后推入。核 = 唯一「每轮按 ctx 重算 plan」的节点,故
+    /// piecewise 把它移出捕获图、在段间 eager 重放(设计见
+    /// `docs/piecewise-断点图-设计与实现.md`)。None = 非 piecewise
+    /// (一次 `is_some()` 判,热路径零开销)。
+    pub attn_break: Option<std::rc::Rc<std::cell::RefCell<Vec<crate::interpreters::BreakDecl>>>>,
 }
 
 impl<'a> ForwardCtx<'a> {
@@ -155,6 +162,7 @@ impl<'a> ForwardCtx<'a> {
             v2_bt8: None,
             xqa: None,
             gdn_tap: None,
+            attn_break: None,
         }
     }
 
@@ -189,6 +197,7 @@ impl<'a> ForwardCtx<'a> {
             v2_bt8: None,
             xqa: None,
             gdn_tap: None,
+            attn_break: None,
         }
     }
 
@@ -218,6 +227,7 @@ impl<'a> ForwardCtx<'a> {
             v2_bt8: None,
             xqa: None,
             gdn_tap: None,
+            attn_break: None,
         }
     }
 
@@ -251,6 +261,7 @@ impl<'a> ForwardCtx<'a> {
             v2_bt8: None,
             xqa: None,
             gdn_tap: None,
+            attn_break: None,
         }
     }
 
@@ -287,6 +298,7 @@ impl<'a> ForwardCtx<'a> {
             v2_bt8: None,
             xqa: None,
             gdn_tap: None,
+            attn_break: None,
         }
     }
 
@@ -323,6 +335,7 @@ impl<'a> ForwardCtx<'a> {
             v2_bt8: None,
             xqa: None,
             gdn_tap: None,
+            attn_break: None,
         }
     }
 
@@ -367,6 +380,7 @@ impl<'a> ForwardCtx<'a> {
             v2_bt8: None,
             xqa: None,
             gdn_tap: None,
+            attn_break: None,
         }
     }
 }

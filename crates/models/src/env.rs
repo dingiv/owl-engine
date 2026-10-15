@@ -197,6 +197,9 @@ pub struct AttnEnv {
     pub verify_v2: bool,
     /// verify 臂改走 XQA(true 且 ctx.xqa 在场时优先于 verify_v2)
     pub verify_xqa: bool,
+    /// **verify 图改段驱动件**(piecewise;注意力核 = 断点,在段间 eager 重放
+    /// ⇒ 核可以走"每轮按 ctx 重算 plan"的臂,如 FI split)。零断点 = 退化单图
+    pub verify_piecewise: bool,
     /// 裸 decode 走 XQA(第二份实例化 `M_TILESIZE=16`;shape/feature 不匹配自动回落 v2)
     pub decode_xqa: bool,
     /// FI 接管的 T 下限(`dispatch.fi_min_tokens`;t ≥ 此值走 FI 主臂)
@@ -321,6 +324,7 @@ impl EnvProvider {
                 force_naive_prefill: d.force_naive_prefill,
                 verify_v2: d.verify_v2,
                 verify_xqa: d.verify_xqa,
+                verify_piecewise: d.verify_piecewise,
                 decode_xqa: d.decode_xqa,
                 fi_min_tokens: d.fi_min_tokens,
                 xqa_prefill: d.xqa_prefill,

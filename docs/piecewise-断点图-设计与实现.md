@@ -273,3 +273,85 @@ N 段就是 N 倍显存。⇒ 每段捕获**前**先做一次**逐段干跑**(�
   `y=x+c`(段0)→ `brk=y+y`(**断点,窗外**)→ `out=brk+c`(尾段),
   **真机绿**:捕获 `(段,断点)=(2,1)`、回放 ×2 值恒为 5.0 ✓
   (该场景**不装模型** —— 纯 GraphPlan 面,秒级,与 CUDA 面步骤 5b 一起钉住机制)。
+
+---
+
+## 11. 施工记录:P2 接线 + **真机追凶实录**(2026-10-16 凌晨)
+
+### 11.1 已落(全部在 perf worktree;`dispatch.verify_piecewise` **缺省关** = 生产零变化)
+
+| 件 | 落点 | 说明 |
+|---|---|---|
+| 断点采集面 `break_sink()` | `engine/src/graph_plan.rs` | `PlanCtx.breaks` 改 `Rc<RefCell<…>>`;模型层 push = 本 plan 登记断点(**单一拼写点**)。⚠️ 踩坑:自建一张表 ⇒ 驱动件永远看到 0 断点(实测"piecewise 无断点"降级)|
+| `ForwardCtx.attn_break` | `models/src/module.rs`(+`model.rs::layer_ctx`) | 形态同 `gdn_tap`;7 个构造器全 None(零开销) |
+| 层侧登记 | `models/src/layers/attention.rs::note_attn_kernel` | 三处:**XQA verify/decode/FI** 的**核节点**(不含 GateMul/o_proj) |
+| `plan_verify` 接线 | `engine/src/graph_fleet.rs` | 开关开 ⇒ `plan_piecewise`(零断点 = **退化单图**,与 `plan` 同形 ⇒ 不静默降级为 eager);开关关 ⇒ 单图原路 |
+| **段边界 keep** | `graph_plan.rs` | 见 11.3(不变量 I-7) |
+| `SegMode::{Capturing,Eager}` | `models/src/interpreters/eval.rs` | 捕获窗内**禁一切回收**(捕获期 free 被服务端白名单拒:实测"图捕获进行中:该操作被拒");口径 = 单图 path 的 `eval_ops_multi`。dry 计量仍走 Eager(回收 + 段末清扫,不泄漏) |
+| 空段/空尾守卫 | `graph_plan.rs` | 根全在 memo ⇒ 不建图(空捕获窗是硬错);`segs: Vec<Option<GraphId>>` + `tail: Option<GraphId>` |
+| **图内一致门**(diag) | `graph_plan.rs`(`OWL_PW_SELFCHECK=1`) | 回放一次 vs eager 整树,逐输出比 max\|Δ\|;**NaN 记 ∞** |
+| 断点二分(⚙) | `graph_plan.rs`(`OWL_PW_BREAKS=k`) | 只保留前 k 个断点(其余退化为普通节点)⇒ 可对"第几个断点开始错"二分 |
+| 取证面(⚙) | `engine/src/exec/spec.rs`(`OWL_PW_DUMP_TOK=1`) | verify `tok[8]`/`hid` 画像/钉块画像/断点操作数画像 |
+
+**两条门**:CPU(`cargo test -p owl-engine --lib` 33/33、`cargo test -p owl-models --lib` 128/128)+ GPU
+(`gpu_piecewise_segments` 真机绿:捕获 (段,断点)=(2,1)、双回放值恒 5.0)。**⚠️ 测试要在空闲卡上跑**
+(GPU2 上有实例时该场景挂起;GPU0/3 空闲即秒过)。
+
+### 11.2 🔴 **真机 verify 断裂**(未解;P3 的前置)
+
+**症状**:27B + fp8 池 + XQA + `degrade_after=0`(关自适应降级)+ greedy + 哑草稿:
+- `k=0`(退化单图,piecewise path、零断点)⇒ **文本与基线逐字一致 ✓**(⇒ 段捕获/harvest/fold/propose 全链无问题)
+- `k=1`(只第一个注意力核做断点)⇒ **文本 "用户!!!!…"**(首轮即崩)
+- 取证(`OWL_PW_DUMP_TOK`,pos=53):
+  - `tok = [-1,-1,…]`(argmax 内核的"无最大值"哨兵 `bi=-1` ⇒ **logits 全非数**)
+  - `hid`:40960 元素 **nan=40960**(全非数)
+  - **`pw-pin`:钉块 49152 元素 **nan=49152** ⇒ **断点(急切 XQA)自身产出全非数**
+  - **`pw-op`(断点操作数)全部有限**:`q`(F16, max=1.02e1)✓ / 池(U32 fp8 字节)✓ / 页表/seq_lens/mask(位型)✓ /
+    semaphores=0 ✓ / scratch(F16 16M, 66048 个 NaN —— 池内常驻 scratch,旧内容)✓ / `wr`(1 元素)=0 ✓
+
+⇒ **定位:eager(图外)XQA 发射产出 NaN,而它的输入全有限;同一个核在图内跑是对的。**
+差异只剩:①发射路径(捕获 vs 直接)、②`scratch`(常驻池块)里的陈旧 NaN 内容、③图形语义。
+**已排除**:跨流无序(两路都在 `STREAM_COMPUTE`)、`set_shared_limit`(assemble 期已设)、
+几何/常量(同一 `consts`,同网格/块/smem)、K0 依赖边(同流序)、页表/槽(逐轮写 ✓)、
+断点机制本身(`k=0` 绿 + 段边界 keep 已修)。
+
+**⇒ 下一刀(按性价比)**:
+1. **断点改挂注意力输出**(`GateMul`+`o_proj` 之后,纯 GEMM 节点)⇒ 二分"eager XQA 发射"vs"分裂机制";
+   若这一步绿 ⇒ 收敛到 XQA 发射面(与机制无关)。
+2. **scratch 归因**:在同一 boot 里把 `scratch` 清零后重放一次(或在 `plan_piecewise` 捕获前 `memset_zero` scratch)
+   ⇒ 判"陈旧 NaN 被核读取"。
+3. **`XqaGeom` 对照**:同形状下 eager 走 `Single`(KV-split 关)vs `Capped` ⇒ 判"split 归约(scratch + semaphores)
+   在**非图**发射下的语义"(图内 = 一次流内串行;图外 = 单发,理论同序,但归约缓冲/计数器协议需实证)。
+4. 与探针交叉:同一 boot 内用 `family::xqa::launch_on_stream` 直发一次(探针路)对拍 ——
+   探针路已知绿(`xqa_decode_probe`/`xqa_prefill_probe`),两者只差 `Exec::launch` 的封装与参数来源。
+
+**⚠️ 教训(方法论)**:`OWL_PW_SELFCHECK` 首版用 `max|Δ| > 1e-3` 判差 —— **NaN 全盲**
+(`NaN > 1e-3 = false`)⇒ 曾把"两臂都全 NaN"读成"一致(仅 16 输出差)"。已修(NaN 记 ∞);
+修后同一条件报 **383/392 输出差** ✓ 与 `tok=-1` 自洽。
+
+### 11.3 不变量补条(施工中新增,缺一条就是静默错值)
+
+| # | 不变量 | 为什么 | 守门 |
+|---|---|---|---|
+| **I-7** | **段边界值必须 `keep`**:凡"本段算、后续段还要用"的节点(静态判:`A_i ∩ {last_need > i}`)一律跨段存活 | 段末 memo 只留 keep ⇒ 未 keep 的值在**后段会被重算**。纯算子重算只是白烧;但**带副作用的节点**(池写 `wr` / GDN conv·rec 递推)**重算 = 双写** ⇒ 状态被推进两遍(实测 `r*` fold 记录首偏) | `plan_piecewise` 的段边界分析(零算子知识)+ `OWL_PW_SELFCHECK` |
+| **I-8** | **捕获窗内零回收** | 捕获期 `free` 被服务端白名单结构化拒(实测);且 Carved 块本就不可还 | `SegMode::Capturing`(禁池、禁回收、免段末清扫) |
+| **I-9** | 空段/空尾**不建图** | `graph_end` 对空捕获窗硬错(哨兵③) | `segs: Vec<Option<GraphId>>` / `tail: Option<GraphId>` |
+| **I-10** | 断点采集面必须与 `PlanCtx` 的断点表**同一张**(`break_sink()`) | 自建表 ⇒ 驱动件永远看到 0 断点(静默降级) | 单一拼写点(`sc.break_sink()`);`piecewise 无断点` 分支已删(零断点 = 退化单图) |
+
+### 11.4 复现(repro;本地档在 `testdata/`,`gitignore` 内)
+
+```bash
+# 档:perf-ab-base.toml / perf-ab-pw.toml(greedy + dumb 哑草稿 + degrade_after=0;
+#     后者比前者只多 [dispatch] verify_piecewise = true)
+# ① 文本 A/B(判"verify 行 0 是否是真模型下一 token")
+PW_ENV="OWL_PW_BREAKS=1" bash tools/pw-ab-greedy.sh testdata/args/perf-ab-pw.toml /tmp/pw.log /tmp/pw.json
+#   k=0 ⇒ 与 base 逐字同;k=1 ⇒ "用户!!!!…"
+# ② 取证(钉块/操作数/tok/hid 画像)
+PW_ENV="OWL_PW_BREAKS=1 OWL_PW_DUMP_TOK=1" bash tools/pw-ab-greedy.sh ...
+#   grep -E "pw-tok|pw-hid|pw-pin|pw-op" /tmp/pw.log
+# ③ 图内一致门(必须 NaN 记 ∞;boot 期就能红)
+PW_ENV="OWL_PW_BREAKS=1 OWL_PW_SELFCHECK=1" bash tools/pw-ab-greedy.sh ...
+# ④ 恒等门(0.8B/27B;注意这两条门在本 worktree 有**既有环境性失败**:
+#    submit 期就报 "prompt+生成 超预算",与本改动无关 ⇒ 用 ①②③)
+OWL_GATE_PIECEWISE=1 OWL_GATE_XQA=1 OWL_E2E_ONLY=dflash2_identity cargo test ...
+```

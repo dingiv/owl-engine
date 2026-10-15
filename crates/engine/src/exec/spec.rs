@@ -139,6 +139,44 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             .await?;
             let t_read_v = std::time::Instant::now();
             let tok_f = vg.read_output_f32("tok").await?;
+            // 诊断(perf 会话排查用;`OWL_PW_DUMP_TOK=1`):verify 行 0..7 的
+            // 候选 token —— piecewise 断裂时最直接的判据(常量/零 = 读未写值)
+            if owl_shared::env_reader::flag("OWL_PW_DUMP_TOK") {
+                eprintln!("[pw-tok] pos={pos} tok={:?}", tok_f);
+                let h = vg.read_output_f32("hid").await?;
+                let (mut nan, mut mx, mut sum) = (0usize, 0f32, 0f64);
+                for v in h.iter() {
+                    if v.is_nan() {
+                        nan += 1;
+                    }
+                    mx = mx.max(v.abs());
+                    sum += *v as f64;
+                }
+                eprintln!(
+                    "[pw-hid] pos={pos} n={} nan={nan} absmax={mx:.3e} mean={:.3e} first4={:?}",
+                    h.len(),
+                    sum / h.len().max(1) as f64,
+                    &h[..4.min(h.len())]
+                );
+                let ops = vg.pw_break_operand_stats(0).await?;
+                eprintln!(
+                    "[pw-op] pos={pos} :: {}",
+                    ops.iter()
+                        .map(|(i, n, dt, nan, mx)| format!("#{i}[{dt:?}] n={n} nan={nan} max={mx:.2e}"))
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                );
+                let pins = vg.pw_pin_stats().await?;
+                eprintln!(
+                    "[pw-pin] pos={pos} n={} :: {}",
+                    pins.len(),
+                    pins.iter()
+                        .take(4)
+                        .map(|(n, nan, mx)| format!("{n}元素/nan={nan}/max={mx:.2e}"))
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                );
+            }
             let t_tok = std::time::Instant::now();
             // A11:采样档额外回读 per-row logits([depth1, vocab];仅采样档付)
             let row_logits = if sampler_on {

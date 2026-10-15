@@ -1158,6 +1158,10 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
                 knobs.draft.depth = 3;
                 knobs.draft.dumb = true;
             }
+            // piecewise A/B 臂(2026-10-15 perf 会话;恒等门用)
+            if owl_shared::env_reader::flag("OWL_GATE_PIECEWISE") {
+                knobs.env.attn.verify_piecewise = true;
+            }
             let mut engine = Engine::new(EngineConfig {
                 device_ordinal: ordinal,
                 max_seq_tokens: 128,
@@ -1245,6 +1249,10 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
             // 草稿档一律按投机配置 boot;baseline 轮靠运行时 spec_depth=0 回落
             knobs.draft.depth = 3;
             knobs.cuda.capture_slab_mb = Some(160);
+            // piecewise A/B 臂(2026-10-15 perf 会话;恒等门用)
+            if owl_shared::env_reader::flag("OWL_GATE_PIECEWISE") {
+                knobs.env.attn.verify_piecewise = true;
+            }
             let mut engine = Engine::new(EngineConfig {
                 device_ordinal: ordinal,
                 max_seq_tokens: 256,

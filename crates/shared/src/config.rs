@@ -246,6 +246,12 @@ pub struct DispatchCfg {
     /// 4.63ms/层(fp8),而 prefill 族是 qo_len=8 单遍形态 —— 本开关是
     /// 两族 A/B 的唯一入口,定谳后固化其一,不留双路径。
     pub verify_v2: bool,
+    /// **verify 段驱动件**(piecewise):把 verify 图的**注意力核**登记为断点,
+    /// 整图改分段捕获回放(注意力在段间 eager 重放,其余仍在图内)。
+    /// 2026-10-15 立项(V1b):FI 的 split 档 plan 依赖 ctx ⇒ 单图只对一个
+    /// ctx 有效;段驱动件让 plan 每轮在窗外重算。零断点时退化为单图
+    /// (与 `plan` 同形),开关开而臂未登记核时**不**降级为逐步 eager。
+    pub verify_piecewise: bool,
     /// verify 臂改走 **XQA**(kNHD fp8 池 + spec-dec q=1+K;feature `xqa`)。
     /// 2026-10-13 D3:XQA 单算子实测 ctx8192 0.495ms vs v2 2.673ms(5.40×),
     /// 数值 max|XQA−host| 4.5e-4(v2 4.6e-4)。缺省 false(定谳后再翻)。
@@ -634,6 +640,9 @@ impl Default for DispatchCfg {
             force_naive_prefill: false,
             verify_v2: true,
             verify_xqa: false,
+            // piecewise 段驱动件:**缺省关**(2026-10-15 立项;A/B 先证机制
+            // 零回归,定谱后再翻默认 —— 同 verify_xqa 的翻法)
+            verify_piecewise: false,
             decode_xqa: false,
             xqa_prefill: false,
             fi_min_tokens: 1,

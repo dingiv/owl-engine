@@ -163,6 +163,11 @@ impl TensorOps {
         self.id
     }
 
+    /// **标量槽数**(宿主标量槽下标校验用;槽序权威 = `KernelSpec::PARAMS`)
+    pub fn n_scalar_args(&self) -> usize {
+        self.args.len()
+    }
+
     /// **操作数只读视图**(归约所需的全部输入;叶子为空)。
     ///
     /// 为什么要有:分段/重排计划器需要"这个节点的输入是什么"来**推导段根**
@@ -515,6 +520,24 @@ impl TensorOps {
         out
     }
 
+    /// **标量槽改写**(拷贝语义:同父/同 op/同形状,**新 id**)。
+    ///
+    /// 用途(piecewise 宿主标量槽;见 `docs/piecewise-断点图-设计与实现.md`):
+    /// 断点核里那些"每轮会变的宿主标量"(FI 的 `ctx_total` = plan key)
+    /// 不能在捕获期烘死 ⇒ 回放期由驱动件按**契约下标**把本轮值补进来,
+    /// 再送出窗外求值。id 换新 = memo/覆盖按新节点记账,旧条目不参与。
+    ///
+    /// `idx` 越界 = 上游违约(调用点先校验):返回 `None`,不静默自吞。
+    pub fn with_arg_bits(self, idx: usize, bits: u64) -> Option<TensorOps> {
+        if idx >= self.args.len() {
+            return None;
+        }
+        let mut out = self;
+        out.args[idx] = KernelArg::Bits(bits);
+        out.id = next_id();
+        Some(out)
+    }
+
     pub fn arg_bool(self, v: bool) -> TensorOps {
         self.arg_bits(v as u64)
     }
@@ -661,6 +684,35 @@ mod tests {
             let want = 1.0 / (1.0 + (-v).exp());
             assert!((g - want).abs() < 1e-6, "{g} vs {want}");
         }
+    }
+
+    /// 宿主标量槽的载体:`with_arg_bits` = 拷贝 + 换一个标量槽 + **新 id**
+    /// (piecewise 回放期每轮补值;旧 id 由调用方摘账)
+    #[test]
+    fn with_arg_bits_patches_one_slot_and_refreshes_id() {
+        let x = TensorOps::zeros(Dtype::F32, vec![2]);
+        let n = TensorOps::call(crate::ops::SemanticKernel::Concat)
+            .arg(&x)
+            .arg_usize(7)
+            .arg_usize(9)
+            .with_shape(Dtype::F32, vec![2]);
+        let old_id = n.id();
+        assert_eq!(n.n_scalar_args(), 2);
+
+        let p = n.clone().with_arg_bits(1, 42).expect("槽 1 存在");
+        assert_ne!(p.id(), old_id, "补丁 = 新节点 id(memo/覆盖按新节点记账)");
+        assert_eq!(p.n_scalar_args(), 2);
+        assert_eq!(p.shape(), n.shape());
+        // 除被补的那一槽,节点其余部分逐位沿用(操作数 id / 形状 / 槽数)
+        assert_eq!(
+            p.operands().iter().map(|o| o.id()).collect::<Vec<_>>(),
+            n.operands().iter().map(|o| o.id()).collect::<Vec<_>>(),
+            "补丁只动标量槽:操作数(依赖边)逐位沿用"
+        );
+
+        // 越界 = 上游违约:结构化 None(调用点 plan 期拒捕),不静默自吞
+        assert!(n.clone().with_arg_bits(2, 1).is_none());
+        assert!(x.clone().with_arg_bits(0, 1).is_none(), "叶子无标量槽");
     }
 
     #[test]

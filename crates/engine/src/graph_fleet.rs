@@ -318,6 +318,11 @@ impl<D: DeviceClient> GraphFleet<D> {
             .collect();
         let key_dim = dims.nk * dims.hk;
         let value_dim = dims.nv * dims.hv;
+        // piecewise(可断捕获图;2026-10-15 perf 会话立项):verify 图要把
+        // **注意力核**移出捕获图(核的 plan 在 split 档依赖 ctx ⇒ 单图只对
+        // 一个 ctx 有效)。开关 = `dispatch.verify_piecewise`;设计见
+        // `docs/piecewise-断点图-设计与实现.md`。
+        let pw_on = knobs.env.attn.verify_piecewise;
         let mut vouts = vec![
             OutputSlot { name: "tok".into(), shape: vec![depth1, 1], dtype: Dtype::F32 },
             OutputSlot { name: "hid".into(), shape: vec![depth1, dims.hidden], dtype: dims.dtype },
@@ -350,10 +355,7 @@ impl<D: DeviceClient> GraphFleet<D> {
             };
             vouts.push(OutputSlot { name: format!("r{i}") , shape, dtype: dims.dtype });
         }
-        let (vg, voutcome) = GraphPlan::plan(
-            vface,
-            env,
-            GraphPlanDesc {
+        let desc = GraphPlanDesc {
                 inputs: vec![
                     InputSlot::f32("ids", depth1),
                     InputSlot::f32("pos", depth1),
@@ -382,8 +384,9 @@ impl<D: DeviceClient> GraphFleet<D> {
                 capture: !knobs.no_graph,
                 slab_fixed: knobs.cuda.capture_slab_mb.is_some(),
                 debug_probe: knobs.probes.debug,
-            },
-            move |sc: &PlanCtx| -> Result<()> {
+        };
+        let break_of_this_plan = pw_on;
+        let forward = move |sc: &PlanCtx| -> Result<()> {
                 let ids = sc.input("ids")?;
                 let pos = sc.input("pos")?;
                 let slots_in = sc.input("kv_slots")?;
@@ -424,6 +427,13 @@ impl<D: DeviceClient> GraphFleet<D> {
                     None,
                     0, None,
                 );
+                // **断点采集面递进模型**:注意力臂在建树深处才看得见核节点,
+                // 此处把采集 handle 交给 ctx。handle 必须 = `PlanCtx` 的那张表
+                // (`sc.break_sink()`;单一拼写点) —— 自建一张表 = 模型 push 到
+                // 别家表上,驱动件永远看到 0 断点(实测踩过)。
+                if pw_on {
+                    ctx.attn_break = Some(sc.break_sink());
+                }
                 ctx.seq_cu = Some(&gdn_cu);
                 ctx.env = env;
                 // §三十一:verify v2 臂(8 伪序列 partition 并行;scratch
@@ -490,9 +500,27 @@ impl<D: DeviceClient> GraphFleet<D> {
                     sc.output(format!("r{i}"), t)?;
                 }
                 Ok(())
-            },
-        )
-        .await?;
+        };
+        // 两档:开关开 ⇒ 段驱动件(零断点 = **退化单图**,与 `plan` 同形;故
+        // "臂未登记核"不会静默降级为逐步 eager)；开关关 ⇒ 单图原路。
+        let (vg, voutcome) = if break_of_this_plan {
+            let (vg, vo) = GraphPlan::plan_piecewise(vface, env, desc, true, forward).await?;
+            let (nseg, nbrk) = vg.piecewise_shape();
+            match &vo {
+                PlanOutcome::Captured => owl_shared::log_info!(
+                    "boot",
+                    "verify 分段捕获(T={depth1};段={nseg} 断点={nbrk}) +{:.2}s",
+                    t0.elapsed().as_secs_f32()
+                ),
+                other => owl_shared::log_info!(
+                    "boot",
+                    "verify 分段捕获降级({other:?})→ eager verify+重放路"
+                ),
+            }
+            (vg, vo)
+        } else {
+            GraphPlan::plan(vface, env, desc, forward).await?
+        };
         match voutcome {
             PlanOutcome::Captured => {
                 owl_shared::log_info!("boot", "verify 桶形图捕获(T={depth1}) +{:.2}s", t0.elapsed().as_secs_f32());
