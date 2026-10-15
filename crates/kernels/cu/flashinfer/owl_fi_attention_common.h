@@ -44,10 +44,33 @@ constexpr MaskMode OWL_MASK_MODE = MaskMode::kCausal;
 // ---------------------------------------------------------------------------
 // 探针旋钮(旧 fork 版同名保留)
 // ---------------------------------------------------------------------------
-/// split-kv 开关(缺省关 ⇒ 口径与历史一致;上游 plan 会再按 SM 数自行决定)
+/// split-kv 开关(**缺省开**;`FI_SPLIT_KV=0` 关回历史口径)。
+///
+/// ⚠️ 2026-10-15 V1 定谳前的状态:本开关**形同虚设** —— 开与不开都错的,
+/// 因为三处前提缺了/错了(全部实测,见 `crates/kernels/tests/fi_prefill_probe.rs`
+/// 的 verify/decode 形状档):
+///   ① plan 的 `kv_indptr` 我们传的是 **token 级**,而 plan 这套数组整体系
+///      **page 级**(`kv_len_arr` → `num_chunks_kv` → 二分搜索的
+///      `min_kv_chunk_size = 128/page`)⇒ split 档 plan 算 34 chunk、
+///      核按 2912 token/chunk 算 2 ⇒ partial 行缩放与 `merge_indptr` 打架
+///      ⇒ 除第 0 行全零(T=8/ctx3072:零值 43008/49152)。
+///      分水岭 = `server/flashinfer.rs` 传页级 kv_indptr。
+///   ② 尾部 CTA 掩码没接(plan 只在 split 档生成 `block_valid_mask`)。
+///   ③ `partition_kv` 由 dispatcher 按 `tmp_v` 是否为空自行覆盖(我们那行
+///      硬编码 `false` 其实被覆盖了,不影响;留着与 plan 同值更自明)。
+/// 修好后实测(3090 Ti,fi_prefill_probe,host oracle 门 1e-2,全档 ≤5e-4):
+///   | 形状 | 本开关=1 | =0 | XQA 同形状 |
+///   |---|---|---|---|
+///   | T=1/ctx=3072 | 0.030 ms | 0.126 | — |
+///   | T=8/ctx=32768 | **0.249** | 3.604 | 1.541 |
+///   | T=1/ctx=32768 | **0.118** | 1.264 | 0.910 |
+///   | T=512/ctx=16384 | 5.393 | 5.394 | —(大 T 本就并行) |
+/// ⇒ 小 T 形状收益 6–14×,大 T 中性;生产"尾块"面(T 很小、ctx 很长)是
+/// 直接的净赚,**故缺省转正**。
 static bool owl_fi_split_kv_enabled() {
   const char* e = getenv("FI_SPLIT_KV");
-  return e != nullptr && e[0] != '\0' && e[0] != '0';
+  if (e != nullptr && e[0] != '\0' && e[0] == '0') return false;
+  return true;
 }
 /// KV 元素字节数(1 = e4m3 主池【生产】;2 = f16 池)。只喂 plan 的选瓦启发式。
 static uint32_t owl_fi_kv_bytes() {
@@ -156,9 +179,26 @@ static int owl_fi_run_impl(
   params.max_total_num_rows = (uint32_t)plan_info.total_num_rows;
   params.total_num_rows = nullptr;  // 非 cuda-graph 档
   params.padded_batch_size = (uint32_t)plan_info.padded_batch_size;
-  params.partition_kv = false;  // 与上游参考实现同款(plan 已把 split 编进调度表)
+  // ⚠️ **partition_kv 必须 = plan 的 split_kv**(2026-10-15 V1 定谳):
+  // 上游 `include/` 从不设本字段(调用方责任),而核内三处都拿它分叉:
+  //   max_chunk_size / chunk_start / chunk_end(是否按 kv_tile_idx 切 KV)
+  //   与 `o_ptr_base`(partial 写 tmp_v 还是写 o)。
+  // 本行曾是 `false` 硬编码 + "plan 已把 split 编进调度表" 的注释 —— **错的**:
+  // 调度表只决定"发射多少个 kv_tile 项",核要不要真分块由本字段定。
+  // 实测(FI_SPLIT_KV=1 探针):T=8/ctx=3072 数值 max|FI−host| = 1.39(门 1e-2)
+  // ⇒ split 路**从未真正可用**;改回 = plan 值后转绿(见探针复跑)。
+  params.partition_kv = plan_info.split_kv;
   if (plan_info.split_kv) {
     params.merge_indptr = GetPtrFromBaseOffset<OwlId>(int_ws, plan_info.merge_indptr_offset);
+    // ⚠️ **尾部 CTA 掩码必须接上**(2026-10-15 V1 定谳,与 partition_kv 同一批):
+    // split 档 `padded_batch_size = max(2·SM/hkv, new_batch_size)` 会**大于**真实
+    // 工作项数 ⇒ 尾部 CTA 会读 `page_locked` 里的**陈旧** request/qo_tile/kv_tile
+    // ⇒ 算出垃圾 partial 并被 merge 累加(实测 T=8/ctx=3072 max|FI−host| = 1.39)。
+    // 上游只在 split 档分配这张表(`scheduler.cuh` 内 `block_valid_mask_offset` +
+    // `mask[i] = i < new_batch_size`),核侧守卫 `if (block_valid_mask && !mask[bx]) return;`
+    // 一直都在 —— 缺的只是**把指针传进去**。非 split 档该区不存在 ⇒ 保持 nullptr。
+    params.block_valid_mask =
+        GetPtrFromBaseOffset<bool>(int_ws, plan_info.block_valid_mask_offset);
   }
 
   OwlOut* tmp_v = nullptr;

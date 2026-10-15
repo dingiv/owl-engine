@@ -230,3 +230,60 @@ llm_speedtest 的 t/s 是 AL 的函数,而 AL 随 prompt 域/温度/随机性漂
 ⇒ **优化优先级不变,但含义更清楚**:派发税(~11 µs/节点)与递推核的节点数是
 **每 token 都要付**的钱 —— spec 只是把它摊薄了;**裸 decode 路径的 820 节点图
 每 token 付 ~9 ms**,这也解释了"27B INT4 单卡只有 40 t/s"(权重带宽地板 ≈15 ms/token)。
+
+---
+
+# 四、V1 落地:FI 的 split-KV 修通(2026-10-15 晚;用户批准执行 V1)
+
+**目标**:把 verify/decode 的注意力从 XQA(2.09 TFLOPS)换成 FI(prefill 核,split-KV)。
+**结论**:**核级已全绿且大赢**,但**进图**还差一步(见 §4.4)。
+
+## 4.1 三个根因(全是"从没真正跑过"型)
+
+| # | 根因 | 证据 | 修法 |
+|---|---|---|---|
+| ① | **plan 的 `kv_indptr` 要 page 级**,我们一直传 token 级 | split 档 plan 算 `num_chunks_kv = ceil_div(kv_len_tokens, chunk_pages)` = 34,核按设备里的 `chunk×page = 2912 token` 算 `ceil_div(kv_len, chunk)` = 2 ⇒ partial 行的 `o_stride_n` 缩放与 `merge_indptr` 口径打架 ⇒ **除第 0 行全零**(T=8/ctx3072:零值 43008/49152) | `server/flashinfer.rs`:`kv_indptr = [0, ceil(ctx/page)]`。split 关时该数组不参与决策 ⇒ 这个单位错一直隐身 |
+| ② | **尾部 CTA 掩码没接** | plan 只在 split 档生成 `block_valid_mask`(`i < new_batch_size`);`padded_batch = max(2·SM/hkv, tiles)` 会大于真工作项数 ⇒ 尾部 CTA 读陈旧调度表 | 适配器把该区指针接进 `params.block_valid_mask`(核侧守卫本来就在) |
+| ③ | `partition_kv` 那行硬编码 `false` | 实际由 dispatcher 按 `tmp_v` 是否为空**自行覆盖** ⇒ 不影响行为;留着与 plan 同值只为自明 | 改成 `= plan_info.split_kv` |
+
+**上游 main 同款**:①以外的两处是上游形态;① 是**唯一真凶**,且上游 plan/核的口径差只有在 `page_size > 1` 且 split 开时才暴露。
+
+## 4.2 核级实测(3090 Ti;host oracle 门 1e-2;**全档 ≤5.5e-4,零坏行**)
+
+| 形状 | FI+split | FI 无 split | XQA(现役) | vs XQA |
+|---|---:|---:|---:|---:|
+| T=1/ctx=3072 | **0.030 ms** | 0.126 | — | — |
+| T=8/ctx=3072 | **0.046** | 0.342 | 0.196 | 4.3× |
+| T=8/ctx=8192 | **0.078** | 0.906 | 0.530 | 6.8× |
+| **T=8/ctx=32768** | **0.249** | 3.604 | **1.541** | **6.2×** |
+| T=16/32/ctx=32768 | 0.460 / 0.686 | 3.604(三者同值 ⇒ 纯延迟) | — | — |
+| **T=1/ctx=32768**(decode) | **0.118** | 1.264 | **0.910** | **7.7×** |
+| T=2 / T=4 / ctx=32768 | 0.119 / 0.246 | 1.260 / 3.607 | — | — |
+| T=512/ctx=16384(生产 prefill) | 5.393 | 5.394 | — | 中性(大 T 本就并行) |
+
+⇒ 判据「≤0.3 ms/发」**达标**(0.249);小 T 收益 6–14×,大 T 中性。
+
+## 4.3 已落地的收益(生产现状 = `fi_min_tokens=1`)
+
+- **尾块面**:长 prompt 的**小尾块**(T 很小、ctx 很长)以前走 FI 无 split = 3.6 ms/层 × 16 = **~57 ms/请求**;现在 ~4 ms ⇒ **单请求省 ~53 ms**。
+- **缺省转正**:`FI_SPLIT_KV` 缺省改为 **开**(`=0` 关回历史)。
+- **引擎回归**(spec-dflash,ctx 阶梯,split 开):prefill **1347.9 / 1294.6 / 1141.9 t/s**
+  (对照 split 前 1349.4 / 1299.5 / 1141.0)⇒ **±0.4% 内无回归** ✓;
+  decode 逐点差异全部落在 AL 抖动内(§12 口径)。
+
+## 4.4 ⚠️ 还没拿到的:把 verify/decode 的注意力换成 FI(需进图/换臂)
+
+- **verify(每轮 16 层)**:现役 XQA 24.66 ms/轮 → FI+split 折算 **≈4.0 ms/轮**(0.249×16)
+  ⇒ 轮时 70 → **~49 ms** ⇒ **decode +42%**。
+- **裸 decode(每步 16 层)**:XQA 14.52 ms/步 → **≈1.9 ms/步** ⇒ 步时 37.6 → 25 ms ⇒ **+50%**。
+- **卡点**:verify/decode 都是**捕获图**(XQA 的几何与 ctx 无关 ⇒ 一张图吃所有 ctx);
+  而 **FI 的 plan 在 split 档依赖 ctx**(`num_chunks_kv`、`o_indptr`/`merge_indptr`、`padded_batch`)
+  ⇒ **一张图只对一个 ctx 有效**。两条出路:
+  1. **piecewise(推荐)**:把注意力移出图,成为图段之间的 **eager 断点**(每层一次 FI 调用 +
+     一次 `graph_launch`);FI 的 plan 缓存按 `(T, ctx)` 自动命中(每轮 1 次 plan,~0.1 ms,
+     换回 20 ms)。⇒ 正是 `docs/arch/prefill-graph-设计与实现.md` 的 **M2c 断点原语**复用。
+  2. **按 ctx 桶预捕 verify 图**(每桶一张):图数 × 桶数,boot 时间与显存都涨;
+     且桶内 kv_len 仍会漂 ⇒ 要核侧把"行 stride"改成传入常量(**改上游核**,不推荐)。
+- **对 prefill-graph 设计的连带影响(必须回写主会话的设计)**:M2b「整段单图」的 P-1
+  「plan 与 ctx 无关」**只在 split 关时成立**(F-5 的前提就是 `disable_split_kv=true`);
+  split 开 ⇒ plan 变 ctx 依赖 ⇒ 那条设计必须显式标注该前提。

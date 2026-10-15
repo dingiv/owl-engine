@@ -137,7 +137,16 @@ impl KernelFamily for FiRuntime {
                 });
             }
             let qo_indptr = [0i32, call.t as i32];
-            let kv_indptr = [0i32, call.ctx_total as i32];
+            // ⚠️ **kv_indptr 是 page 级**(2026-10-15 V1 定谳)—— plan 这套数组
+            // (`kv_len_arr` → `effective_kv_len_arr` → `num_chunks_kv` → 二分搜索的
+            // `min_kv_chunk_size = 128/page`)整体按 **页** 计量;而核侧的
+            // `paged_kv.indptr` 也是页级 ⇒ 两侧同尺。此前传 token 级([0, ctx_total])
+            // ⇒ split 档 plan 算出 34 chunk、核按 2912 token/chunk 算 2 ⇒ partial
+            // 行的 `o_stride_n` 缩放与 `merge_indptr` 口径打架 ⇒ 除第 0 行全零
+            // (实测 T=8/ctx=3072:零值 43008/49152)。split 关时该数组不参与任何
+            // 决策(plan 与 ctx 无关),所以这个单位错一直隐身。
+            let nb_pages = call.ctx_total.div_ceil(call.page.max(1)) as i32;
+            let kv_indptr = [0i32, nb_pages];
             let (mut plan15, mut cta_tile_q, mut split_kv) = ([0i64; 15], 0i32, 0i32);
             let rc = unsafe {
                 owl_fi_prefill_plan(
