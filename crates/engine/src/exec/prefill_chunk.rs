@@ -18,8 +18,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let t = ids.len();
         // E2b:活跃会话块链 + GDN 格(逻辑位 → 物理槽由块表换算)
         let (bt_chain, gdn_slot_v) = {
-            let act = self.active.as_ref().expect("active 已保证");
-            let s = self.sessions.get(act.session_id).expect("账在");
+            let act = self.turns.active.as_ref().expect("active 已保证");
+            let s = self.bank.sessions.get(act.session_id).expect("账在");
             (s.block_table.clone(), s.gdn_slot)
         };
         let f32seq = |start: usize, n: usize| -> Vec<u8> {
@@ -90,7 +90,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // 首跑暴露 —— 此前无任何测试启用 FI 面 + 多页 prefill。
             let nb_used = ctx_total.div_ceil(page).min(nb).max(1);
             let k_fi_leaf = self.pool.kv_fi_leaves();
-            let face = self.session.face_mut();
+            let face = self.graphs.session.face_mut();
             let q_cu_b = owl_models::interpreters::eval_ops(
                 TensorOps::from_host(Dtype::U32, vec![2], &i32le(&[0, t as i32])).step(), face).await?;
             let idx_b = owl_models::interpreters::eval_ops(
@@ -129,7 +129,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // lens/id/gdn_slot)建完后插一道流栅栏 —— 判「H2D 叶子与 COMPUTE 核
         // 无跨流序」竞态(仓内 2026-10-03 FI 表同病史:预物化修法)
         if std::env::var_os("OWL_PF_FENCE").is_some_and(|v| v != "0") {
-            self.session.face_mut().sync().await?;
+            self.graphs.session.face_mut().sync().await?;
         }
         let mut ctx = ForwardCtx::model_prefill(
             t, &pos_t, &kvs_step, &self.rope, &gdns_step, &slots_t, &lens_t, &gdn_slot,
@@ -147,7 +147,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 前向有 GDN 状态副作用,双执行会双推进;单执行 + 逐层 checksum
         // → metrics `pf.c{base}.l{i}`,双 boot/双跑 diff = 首个发散层)。
         // fin block-leaf 下游 eval = 零操作透传。
-        let pf_bisect = self.cfg.knobs.pf_bisect && self.dflash_tap_count == 0;
+        let pf_bisect = self.cfg.knobs.pf_bisect && self.spec.dflash_tap_count == 0;
         // GDN 状态 checksum(pre/post;崩坏排查:状态脏 = reset 病,状态净
         // 而输出异 = 核病)。rec [slots,nv,kd,vd] f32 全量 dtoh ≈ 3.1MB/层。
         let pf_state_check = pf_bisect;
@@ -167,7 +167,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     ] {
                         let mut sb = vec![0u8; nb * 4];
                         {
-                            let face = self.session.face_mut();
+                            let face = self.graphs.session.face_mut();
                             let blk = owl_models::interpreters::eval_ops(buf.step(), face).await?;
                             face.dtoh(&blk, &mut sb).await?;
                         }
@@ -199,14 +199,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             names.push("fin".into());
             let refs: Vec<&TensorOps> = roots.iter().collect();
             let outs = {
-                let face = self.session.face_mut();
+                let face = self.graphs.session.face_mut();
                 owl_models::interpreters::eval_ops_multi_env(&refs, face, self.env).await?
             };
             for (i, r) in roots.iter().enumerate() {
                 let n: usize = r.shape().iter().product();
                 let mut b = vec![0u8; n * 2];
                 {
-                    let face = self.session.face_mut();
+                    let face = self.graphs.session.face_mut();
                     let res = face.dtoh(&outs[i], &mut b).await;
                     if let Err(e) = res {
                         eprintln!("[pf-bisect] dtoh 失败 i={i} name={} shape={:?} blk_bytes={} err={e}", names[i], r.shape(), b.len());
@@ -236,7 +236,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     ] {
                         let mut sb = vec![0u8; nb * 4];
                         {
-                            let face = self.session.face_mut();
+                            let face = self.graphs.session.face_mut();
                             let blk = owl_models::interpreters::eval_ops(buf.step(), face).await?;
                             face.dtoh(&blk, &mut sb).await?;
                         }
@@ -250,7 +250,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
             eprintln!("[pf-bisect] chunk base={base} t={t} 层 checksum 已记");
         }
-        let _face = self.session.face_mut();
+        let _face = self.graphs.session.face_mut();
         let vocab = self.model.vocab_size();
         if is_last {
             // E3:末行设备 argmax(4B 回读,免 [T,V] 大 dtoh)。
@@ -265,7 +265,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 let (decl, blk) = bisect_fin_block.take().expect("bisect fin");
                 _bisect_fin_blk = Some(blk);
                 (decl, None)
-            } else if self.dflash_tap_count > 0 {
+            } else if self.spec.dflash_tap_count > 0 {
                 let (h, tp) = self.model.tapped_hidden(&ids_t, &ctx, &[5, 19, 33, 47, 61]);
                 let mut c = TensorOps::call(owl_models::ops::SemanticKernel::Concat).arg(&h);
                 for t in &tp {
@@ -289,7 +289,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             };
             let d_model = hidden_full.shape()[1];
             let (hfb, arena1) = {
-                let face = self.session.face_mut();
+                let face = self.graphs.session.face_mut();
                 eval_ops_scoped_env(hidden_full.step(), face, self.env).await?
             };
             // E5 崩坏排查·轻探针(OWL_PF_FIN_CHECK;bisect 900 dtoh 强掩蔽
@@ -299,7 +299,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 let n_fin = t * d_model;
                 let mut fb = vec![0u8; n_fin * 2];
                 {
-                    let face = self.session.face_mut();
+                    let face = self.graphs.session.face_mut();
                     face.dtoh(&hfb, &mut fb).await?;
                 }
                 mfact(
@@ -320,9 +320,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     .collect();
                 self.prefill_dflash_encode(&tap_views, base).await?;
                 // 探针:concat 父块整块落盘(python 对拍 taps;真块 dtoh)
-                if self.probes.dflash_probe && !self.dflash_mem_dumped2 {
-                    self.dflash_mem_dumped2 = true;
-                    let face = self.session.face_mut();
+                if self.probes.dflash_probe && !self.spec.mem_dumped2 {
+                    self.spec.mem_dumped2 = true;
+                    let face = self.graphs.session.face_mut();
                     let mut rbuf = vec![0u8; (n_tp + 1) * t * d_model * 2];
                     face.dtoh(&hfb, &mut rbuf).await?;
                     if let Err(e) = owl_shared::file_loader::write("/tmp/owl_dflash_root.bin", &rbuf) {
@@ -343,12 +343,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .arg_usize(d_model)
                 .with_shape(d.dtype, vec![1, d_model]);
             let (hb, arena2) = {
-                let face = self.session.face_mut();
+                let face = self.graphs.session.face_mut();
                 eval_ops_scoped_env(last.step(), face, self.env).await?
             };
             let hb_view = TensorOps::of_block(hb.id, d.dtype, vec![1, d_model]);
             let (b, arena3) = {
-                let face = self.session.face_mut();
+                let face = self.graphs.session.face_mut();
                 let logits = self.model.embed.lm_head_matmul(&hb_view);
                 // 崩坏排查:末行 logits top-2(id+值)——近局翻转判别
                 if self.probes.dflash_probe {
@@ -389,7 +389,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 let tok = owl_models::ops::argmax_f32idx(&logits, vocab, 0);
                 eval_ops_scoped_env(tok.step(), face, self.env).await?
             };
-            if self.drafter.is_some() && t > 1 {
+            if self.spec.drafter.is_some() && t > 1 {
                 // prefill extend(E5-M5):本 chunk 行 0..T-1 的 mtp KV
                 // (行 T-1 的配对需下一 chunk 首 token,由其 extend 补;
                 // 末位 P-1 由首轮 propose_first 的 extend 行补)
@@ -398,13 +398,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let buf: [u8; 4];
             let mut seed_keep: Option<owl_iface::contract::Bytes> = None;
             {
-                let face = self.session.face_mut();
+                let face = self.graphs.session.face_mut();
                 let mut buf_t = [0u8; 4];
                 face.dtoh(&b, &mut buf_t).await?;
                 face.free(&[b.id]).await?;
                 face.free(&arena3).await?;
                 face.free(&arena2).await?;
-                if self.drafter.is_some() {
+                if self.spec.drafter.is_some() {
                     seed_keep = Some(hb);
                 } else {
                     face.free(&[hb.id]).await?;
@@ -429,7 +429,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 let (decl, blk) = bisect_fin_block.take().expect("bisect fin(非末)");
                 _bisect_fin_blk = Some(blk);
                 (decl, None)
-            } else if self.dflash_tap_count > 0 {
+            } else if self.spec.dflash_tap_count > 0 {
                 let (h, tp) = self.model.tapped_hidden(&ids_t, &ctx, &[5, 19, 33, 47, 61]);
                 let mut c = TensorOps::call(owl_models::ops::SemanticKernel::Concat).arg(&h);
                 for tt in &tp {
@@ -452,11 +452,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 (self.model.last_hidden(&ids_t, &ctx), None)
             };
             let (b, arena) = {
-                let face = self.session.face_mut();
+                let face = self.graphs.session.face_mut();
                 eval_ops_scoped_env(tree.step(), face, self.env).await?
             };
             {
-                let face = self.session.face_mut();
+                let face = self.graphs.session.face_mut();
                 let esz = if d.dtype == Dtype::F16 { 2 } else { 4 };
                 // DFlash2:b = concat 根 [n_tp·t + t, hidden](行 0 块 =
                 // hidden,taps 同块后随)—— dtoh 整父块契约必须等大读
@@ -484,12 +484,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         })
                         .collect();
                     self.prefill_dflash_encode(&tap_views, base).await?;
-                } else if self.drafter.is_some() && t > 1 {
+                } else if self.spec.drafter.is_some() && t > 1 {
                     let ts = std::time::Instant::now();
                     self.prefill_extend(&b, t - 1, ids, base).await?;
                     t_ext += ts.elapsed();
                 }
-                let face = self.session.face_mut();
+                let face = self.graphs.session.face_mut();
                 face.free(&[b.id]).await?;
                 face.free(&arena).await?; // E2a:中间块归池(每 chunk 零净增)
             }

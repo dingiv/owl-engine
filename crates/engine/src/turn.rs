@@ -15,6 +15,12 @@
 //! pump 按事件点推进);真并发(多 turn 共 batch)随 M2 continuous
 //! batching 换入 —— 词汇与 API 形状不变,只换引擎内部。
 
+use std::collections::VecDeque;
+
+use owl_iface::contract::Bytes;
+
+use crate::sampler::SamplerCfg;
+
 /// 提交面:一个用户请求(前端一个 turn)
 #[derive(Clone, Debug)]
 pub struct TurnSpec {
@@ -88,4 +94,150 @@ pub enum TurnEvent {
     Completed { turn: u64, text: String, finish: FinishReason },
     /// turn 失败(槽/执行错误;槽已释放,队列继续)
     Failed { turn: u64, err: String },
+}
+
+// ===========================================================================
+// turn 运行账(2026-10-14 拆分自 running.rs:RunningEngine 万能结构体
+// 按状态域拆解 —— 本节收编**排队/活跃/ id 发号/多 token 事件队列**)
+// ===========================================================================
+
+/// 队列中待跑的 turn(提交面快照)
+pub(crate) struct Turn {
+    pub(crate) id: u64,
+    /// 归属会话(已解析 id;None 提交在 submit 时已建临时账)
+    pub(crate) session_id: u64,
+    /// 临时会话(终了即焚;行为同 M0.5 每 turn 全量重算)
+    pub(crate) ephemeral: bool,
+    pub(crate) spec: TurnSpec,
+    pub(crate) prompt_ids: Vec<u32>,
+    /// per-turn 可选项(AGT-06)
+    pub(crate) opts: TurnOpts,
+    /// 提交时前缀命中量(usage `cached_tokens` 真源;AGT-12)
+    pub(crate) cached: usize,
+}
+
+/// 活跃 turn(占用执行位的完整运行态)
+pub(crate) struct ActiveTurn {
+    pub(crate) id: u64,
+    pub(crate) session_id: u64,
+    pub(crate) ephemeral: bool,
+    pub(crate) prompt_ids: Vec<u32>,
+    pub(crate) max_new: usize,
+    /// 忽略 EOS 跑满预算(TurnSpec 透传;测速口径)
+    pub(crate) ignore_eos: bool,
+    /// 本 turn 采样参数(AGT-06;**提交时已与 knobs 合并**,见 scheduler)
+    pub(crate) sampler: SamplerCfg,
+    /// 本 turn 是否走采样路径(temp=0 或 flavor greedy 档 = 否)
+    pub(crate) sampler_on: bool,
+    /// 停止串(AGT-06;空 = 不启用)
+    pub(crate) stop: Vec<String>,
+    /// 已发射文本字节数(`decoded` 为全量;stop 回吐 holdback 用)
+    pub(crate) emitted: usize,
+    /// stop 命中位置(字节偏移;终了时据此截断 `Completed.text`)
+    pub(crate) trim_text_to: Option<usize>,
+    /// RNG 种子覆写(AGT-06 `seed`;None = turn id 派生)
+    pub(crate) seed: Option<u64>,
+    /// 本 turn **起始 fed**(= 真实前缀命中量:会话守卫命中或块级前缀
+    /// 缓存命中;AGT-12 `cached_tokens` 真源 —— 后者在 submit 时尚未
+    /// 决定,只有 begin 定相后才知)
+    pub(crate) cached_start: usize,
+    pub(crate) out: Vec<u32>,
+    /// KV/prompt 推进指针(会话 turn 从 `cached_len` 起步 = 增量 prefill)
+    pub(crate) fed: usize,
+    pub(crate) decoded: String,
+    /// spec 轮机器状态(**turn 生命周期**:随 ActiveTurn 创建、随 turn
+    /// 终了销毁)。历史教训:这七件曾寄存引擎级,跨 turn 残留 ——
+    /// spec_snap_valid 残留 true = 新 turn 用上 turn 快照折叠(GDN 污染,
+    /// AL 2.97→0.49);B4 降级三态残留 = 下 turn 带病起步。生命周期卡对
+    /// 后此类跨 turn 污染结构性消失(2026-10-10)。
+    pub(crate) spec: TurnSpecState,
+}
+
+/// turn 域 spec 状态(生命周期 = ActiveTurn;见上)
+#[derive(Default)]
+pub(crate) struct TurnSpecState {
+    /// spec 快照有效性(轮首拍;fold 后失效重拍;全接受轮保持)
+    pub(crate) spec_snap_valid: bool,
+    /// 已 propose 草稿(host 账;轮末产出轮首消费)
+    pub(crate) spec_drafts_host: Option<Vec<u32>>,
+    /// B4:m=0 连击计数(成功轮归零)
+    pub(crate) spec_zero_streak: usize,
+    /// B4:降级态(true = 调度发裸 Decode;草稿池逐 token 同步)
+    pub(crate) spec_degraded: bool,
+    /// B4:降级以来 decode 步数(探测周期判定)
+    pub(crate) spec_steps_degraded: usize,
+    /// B4:当前探测周期(失败 ×2 退避,上限 512)
+    pub(crate) spec_probe_every: usize,
+    /// B4 滚动 AL 窗口(2026-10-12):轮数 / 产出 token 数 —— 连击 streak
+    /// 会被"偶发 m=1"破解(随机域 AL≈1.1 时 9.3 t/s 案),窗口均值
+    /// < 盈亏线(3.6 tok/轮)即降级,不看连击
+    pub(crate) recent_rounds: u32,
+    pub(crate) recent_tokens: u32,
+    /// B4 窗口内累计轮时(ms)—— ①**时间门**:超长轮下等满 16 轮太久
+    /// (44ms×16=0.7s、150ms×16=2.4s)②**绝对吞吐**读数(2026-10-14)
+    pub(crate) recent_ms: f32,
+    /// B4 分母(`bare_cost_ewma_ms`)采样时的 ctx(pos)—— ctx 涨过 25%
+    /// 即作废分母(换档后旧采样失真 = 判据偏软的主因,2026-10-14)
+    pub(crate) bare_cost_ctx: usize,
+    /// B4 动态盈亏线(2026-10-09):滚动轮成本 / 裸步成本 ewma(ms)。
+    /// 盈亏平衡 avg = round_cost/bare_cost(常数 1.2 曾远低于真线 ~4,
+    /// AL 1.2~4 区间亏本跑 spec = 9.4 t/s 案)
+    pub(crate) round_cost_ewma_ms: f32,
+    pub(crate) bare_cost_ewma_ms: f32,
+    /// prefill 末行 hidden(首轮 propose 的 anchor_hidden;消费后置 None)
+    pub(crate) spec_seed_hidden: Option<Bytes>,
+}
+
+/// turn 运行账(组合叶;RunningEngine 持有)。字段 pub(crate) 供
+/// scheduler/exec 直读,turn 生命周期方法收拢在此。
+pub(crate) struct TurnLedger {
+    /// 待跑队列(pump 逐个取首)
+    pub(crate) queue: VecDeque<Turn>,
+    /// 活跃 turn(M0.5 单槽:None = 空位)
+    pub(crate) active: Option<ActiveTurn>,
+    /// turn id 发号器(进程内单调)
+    pub(crate) next_id: u64,
+    /// 多 token 轮的事件队列(pump 逐个出;SpecRound 一轮 m+1 token)
+    pub(crate) pending_events: VecDeque<TurnEvent>,
+}
+
+impl TurnLedger {
+    pub(crate) fn new() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            active: None,
+            next_id: 1,
+            pending_events: VecDeque::new(),
+        }
+    }
+
+    /// 号 +1
+    pub(crate) fn alloc_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    /// 活跃 turn 域 spec 状态(无活跃 = 调用序错误,响亮 panic)
+    pub(crate) fn tspec(&mut self) -> &mut TurnSpecState {
+        &mut self
+            .active
+            .as_mut()
+            .expect("turn 域 spec 状态:无活跃 turn")
+            .spec
+    }
+
+    pub(crate) fn tspec_ref(&self) -> &TurnSpecState {
+        &self.active.as_ref().expect("turn 域 spec 状态:无活跃 turn").spec
+    }
+
+    /// 排队中的 turn(按 id;usage 真账取用面)
+    pub(crate) fn queued(&self, turn: u64) -> Option<&Turn> {
+        self.queue.iter().find(|t| t.id == turn)
+    }
+
+    /// 活跃 turn(按 id 过滤)
+    pub(crate) fn active_of(&self, turn: u64) -> Option<&ActiveTurn> {
+        self.active.as_ref().filter(|a| a.id == turn)
+    }
 }

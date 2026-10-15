@@ -15,10 +15,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let fp = pos + m + 1;
         let _page = self.pool.page;
         {
-            let act = self.active.as_ref().expect("active 已保证");
-            let s = self.sessions.get_mut(act.session_id).expect("账在");
+            let act = self.turns.active.as_ref().expect("active 已保证");
+            let s = self.bank.sessions.get_mut(act.session_id).expect("账在");
             let before = s.block_table.len();
-            self.blocks_m.ensure_for_len(&mut s.block_table, fp + 8)?;
+            self.bank.blocks_m.ensure_for_len(&mut s.block_table, fp + 8)?;
             if s.block_table.len() != before {
                 let sid = act.session_id;
                 self.write_bt(sid).await?;
@@ -41,7 +41,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let prop_kv_lens: Vec<f32> = (0..8).map(|i| (fp + 1 + i) as f32).collect();
         let kv_len = vec![(fp + 8) as f32];
         let anchor = vec![bonus as f32];
-        let pg = self.dflash_graph.as_mut().expect("dflash_graph");
+        let pg = self.graphs.dflash.as_mut().expect("dflash_graph");
         let prof = self.probes.step_profile;
         let t0 = prof.then(std::time::Instant::now);
         pg.step(&[
@@ -89,11 +89,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         tap_views: &[TensorOps],
         base: usize,
     ) -> Result<()> {
-        let d2 = match self.drafter.as_ref() {
-            Some(crate::running::Drafter::DFlash2(d)) => std::sync::Arc::clone(d),
+        let d2 = match self.spec.drafter.as_ref() {
+            Some(crate::spec_runtime::Drafter::DFlash2(d)) => std::sync::Arc::clone(d),
             _ => unreachable!("prefill_dflash_encode 非 dflash 模式"),
         };
-        let rope = self.draft_rope.as_ref().expect("draft rope").clone();
+        let rope = self.spec.draft_rope.as_ref().expect("draft rope").clone();
         let t = tap_views[0].shape()[0];
         let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
         let pos_t = TensorOps::from_host(
@@ -104,8 +104,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 草稿池线性逻辑寻址(slot = 逻辑位;NC 前缀读 [0, prefix) 直排;
         // bt 物理槽仅首 session 重合 —— slot≥1 案修,2026-10-10)
         let (_bt_chain, _) = {
-            let act = self.active.as_ref().expect("active 已保证");
-            let s = self.sessions.get(act.session_id).expect("账在");
+            let act = self.turns.active.as_ref().expect("active 已保证");
+            let s = self.bank.sessions.get(act.session_id).expect("账在");
             (s.block_table.clone(), s.gdn_slot)
         };
         let _page = self.pool.page;
@@ -135,15 +135,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let memory = d2.project_memory(tap_views, &ctx);
         let roots = d2.encode_kv(&memory, &pos_t, &kvs, &rope, &ctx);
         {
-            let face = self.session.face_mut();
+            let face = self.graphs.session.face_mut();
             let refs: Vec<&TensorOps> = roots.iter().collect();
             owl_models::interpreters::eval_ops_multi_scoped_env(&refs, face, self.env).await?;
         }
         // 探针:首回合 memory 落盘(python 重算 fc 对拍;真块 dtoh 合法。
         // taps 由调用方从 concat 父块整块落盘 —— 切片视图 dtoh 整父块契约)
-        if self.probes.dflash_probe && !self.dflash_mem_dumped {
-            self.dflash_mem_dumped = true;
-            let face = self.session.face_mut();
+        if self.probes.dflash_probe && !self.spec.mem_dumped {
+            self.spec.mem_dumped = true;
+            let face = self.graphs.session.face_mut();
             let refs: Vec<&TensorOps> = std::iter::once(&memory).collect();
             let outs = owl_models::interpreters::eval_ops_multi(&refs, face).await?;
             let n: usize = memory.shape().iter().product();
@@ -162,11 +162,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// 草稿 KV 窗口 [0, pos+8)(前缀 pos 行已物化 + 自块 8 行直读)。
     /// 返回 (草稿 host 表, 观测面块)。首轮(pos = fed)与轮末同式。
     pub(crate) async fn dflash_propose(&mut self, anchor: u32, pos: usize) -> Result<Vec<u32>> {
-        let d2 = match self.drafter.as_ref() {
-            Some(crate::running::Drafter::DFlash2(d)) => std::sync::Arc::clone(d),
+        let d2 = match self.spec.drafter.as_ref() {
+            Some(crate::spec_runtime::Drafter::DFlash2(d)) => std::sync::Arc::clone(d),
             _ => unreachable!("dflash_propose 非 dflash 模式"),
         };
-        let rope = self.draft_rope.as_ref().expect("draft rope").clone();
+        let rope = self.spec.draft_rope.as_ref().expect("draft rope").clone();
         let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
         // 噪声块 token/位置表(8 行定形)
         let mut toks = vec![anchor as f32];
@@ -185,8 +185,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let leaves = self.pool.dflash_kv_leaves().expect("dflash 池");
         let bt = self.pool.bt_leaf_flat();
         let (_bt_chain, _) = {
-            let act = self.active.as_ref().expect("active 已保证");
-            let s = self.sessions.get(act.session_id).expect("账在");
+            let act = self.turns.active.as_ref().expect("active 已保证");
+            let s = self.bank.sessions.get(act.session_id).expect("账在");
             (s.block_table.clone(), s.gdn_slot)
         };
         let page = self.pool.page;
@@ -196,18 +196,18 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 伴设备侧重写,否则 scheduler 下轮 grew=false 跳过 write_bt,
         // 烘焙块表停代(gate9 文本分歧 / gate10 空轮两案真凶)
         {
-            let act = self.active.as_ref().expect("active 已保证");
-            let s = self.sessions.get_mut(act.session_id).expect("账在");
+            let act = self.turns.active.as_ref().expect("active 已保证");
+            let s = self.bank.sessions.get_mut(act.session_id).expect("账在");
             let before = s.block_table.len();
-            self.blocks_m.ensure_for_len(&mut s.block_table, pos + 8)?;
+            self.bank.blocks_m.ensure_for_len(&mut s.block_table, pos + 8)?;
             if s.block_table.len() != before {
                 let sid = act.session_id;
                 self.write_bt(sid).await?;
             }
         }
         let (bt_chain, _) = {
-            let act = self.active.as_ref().expect("active 已保证");
-            let s = self.sessions.get(act.session_id).expect("账在");
+            let act = self.turns.active.as_ref().expect("active 已保证");
+            let s = self.bank.sessions.get(act.session_id).expect("账在");
             (s.block_table.clone(), s.gdn_slot)
         };
         if self.probes.dflash_probe {
@@ -242,12 +242,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let row_elems = 8 * 128;
             let kslice = k0.slice_view(0, vec![nrow * row_elems]);
             let kb = {
-                let face = self.session.face_mut();
+                let face = self.graphs.session.face_mut();
                 owl_models::interpreters::eval_ops(kslice.step(), face).await?
             };
             let mut kbuf = vec![0u8; 786432]; // 整池块(dtoh 强等;12页×8×128×32×2B)
             {
-                let face = self.session.face_mut();
+                let face = self.graphs.session.face_mut();
                 face.dtoh(&kb, &mut kbuf).await?;
             }
             if pos <= 18 {
@@ -287,10 +287,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 探针:首个 propose 的 hidden + 全部探针根落盘(python 逐阶段对拍;
         // **逐根独立 eval** —— multi 后段会把早根块回收复用,dtoh 读到陈旧
         // 块(root0 曾读出 1e6 级垃圾假象);单链重执行确定性,值可信)
-        if self.probes.dflash_probe && !self.dflash_hid_dumped {
-            self.dflash_hid_dumped = true;
+        if self.probes.dflash_probe && !self.spec.hid_dumped {
+            self.spec.hid_dumped = true;
             for (i, r) in probe_roots.iter().enumerate() {
-                let face = self.session.face_mut();
+                let face = self.graphs.session.face_mut();
                 let b = owl_models::interpreters::eval_ops(r.step(), face).await?;
                 let n: usize = r.shape().iter().product();
                 let mut blk = vec![0u8; n * 2];
@@ -299,7 +299,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 eprintln!("[dump] 落盘失败(诊断面不许静默): {e}");
             }
             }
-            let face = self.session.face_mut();
+            let face = self.graphs.session.face_mut();
             let b = owl_models::interpreters::eval_ops(hidden.step(), face).await?;
             let n: usize = hidden.shape().iter().product();
             let mut hbuf = vec![0u8; n * 2];
@@ -322,7 +322,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             None
         };
         let (b, arena) = {
-            let face = self.session.face_mut();
+            let face = self.graphs.session.face_mut();
             owl_models::interpreters::eval_ops_scoped_env(drafts.step(), face, self.env).await?
         };
         if let Some(lp) = logits_probe {
@@ -332,14 +332,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             roots.push(lp);
             let refs: Vec<&TensorOps> = roots.iter().collect();
             let outs = {
-                let face = self.session.face_mut();
+                let face = self.graphs.session.face_mut();
                 owl_models::interpreters::eval_ops_multi_env(&refs, face, self.env).await?
             };
             for (i, pr) in probe_roots.iter().enumerate() {
                 let n: usize = pr.shape().iter().product();
                 let mut pbuf = vec![0u8; n * 2];
                 {
-                    let face = self.session.face_mut();
+                    let face = self.graphs.session.face_mut();
                     face.dtoh(&outs[i], &mut pbuf).await?;
                 }
                 // 探针根 dtype 随草稿(bf16 后同 2B,解析面分派)
@@ -365,7 +365,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let lb = outs.last().expect("logits root");
             let mut lbuf = vec![0u8; 7 * 248320 * 2];
             {
-                let face = self.session.face_mut();
+                let face = self.graphs.session.face_mut();
                 face.dtoh(lb, &mut lbuf).await?;
             }
             let lvals: Vec<f32> = lbuf[..16]
@@ -391,7 +391,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
         }
         let out = {
-            let face = self.session.face_mut();
+            let face = self.graphs.session.face_mut();
             // drafts 根 = select 单缓冲的 SliceView —— dtoh 回读整父块
             // [S·(K·K+1) f32],取前 S 个(dflash2.rs select 同坑,测试侧同修)
             let mut buf = vec![0u8; 7196];
@@ -425,7 +425,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 行数钉 8(verify 块全行;taps 块仅 8 行,m=7 时 m+2=9 越界读 ——
         // 多编行下轮被自块写/重编覆盖,幂等安全;E5-DF4 与图路径同式)
         let rows = (m + 2).min(8);
-        let rope = self.draft_rope.as_ref().expect("draft rope").clone();
+        let rope = self.spec.draft_rope.as_ref().expect("draft rope").clone();
         let dtype = self.pool.dims.dtype;
         let views: Vec<TensorOps> = taps
             .iter()
@@ -469,12 +469,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let probe = self.probes.dflash_probe;
         if probe {
             let b1 = {
-                let face = self.session.face_mut();
+                let face = self.graphs.session.face_mut();
                 owl_models::interpreters::eval_ops(memory.step(), face).await?
             };
             {
                 let mut vb = vec![0u8; rows * 5120 * 2];
-                let face = self.session.face_mut();
+                let face = self.graphs.session.face_mut();
                 face.dtoh(&b1, &mut vb).await?;
                 let mx = vb[..5120 * 2]
                     .chunks_exact(2)
@@ -488,12 +488,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
             let refs1 = vec![&memory];
             let o1 = {
-                let face = self.session.face_mut();
+                let face = self.graphs.session.face_mut();
                 owl_models::interpreters::eval_ops_multi(&refs1, face).await?
             };
             {
                 let mut vb = vec![0u8; rows * 5120 * 2];
-                let face = self.session.face_mut();
+                let face = self.graphs.session.face_mut();
                 face.dtoh(&o1[0], &mut vb).await?;
                 let mx = vb[..5120 * 2]
                     .chunks_exact(2)
@@ -508,7 +508,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         let roots = d2.encode_kv(&memory, &pos_t, &kvs, &rope, &ctx);
         {
-            let face = self.session.face_mut();
+            let face = self.graphs.session.face_mut();
             let refs: Vec<&TensorOps> = roots.iter().collect();
             owl_models::interpreters::eval_ops_multi_scoped_env(&refs, face, self.env).await?;
         }
@@ -517,7 +517,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let kn: usize = k0.shape().iter().product();
             let mut kb = vec![0u8; kn * 2];
             {
-                let face = self.session.face_mut();
+                let face = self.graphs.session.face_mut();
                 let b = owl_models::interpreters::eval_ops(k0.step(), face).await?;
                 face.dtoh(&b, &mut kb).await?;
             }
@@ -535,7 +535,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// 位置 pos-1 = M1 propose 本尊;seed hidden = prefill 末块 harvest。
     /// 产出 k 草稿块持久(spec_drafts)。
     pub(crate) async fn propose_first(&mut self, anchor: u32, pos: usize) -> Result<()> {
-        let depth = self.spec_depth;
+        let depth = self.spec.depth;
         let seed = self
             .tspec()
             .spec_seed_hidden
@@ -577,20 +577,20 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // 链步 decode 读核跟池布局:kNH 池必须走 v2(否则落 v1 classic
             // ↠ 布局错位、草稿全垃圾;2026-10-13 布局守卫捕获)
             let attn_v2 = self.pool.attn_v2_scratch();
-            match self.drafter.as_ref().expect("drafter") {
-                crate::running::Drafter::Mtp(mtp) => mtp.propose(
+            match self.spec.drafter.as_ref().expect("drafter") {
+                crate::spec_runtime::Drafter::Mtp(mtp) => mtp.propose(
                     &anchor_t, &seed_view, depth, &self.model.embed, &rope, &kvs, &pos_ts,
                     vocab, env, attn_v2,
                 ),
-                crate::running::Drafter::DFlash2(_) => unreachable!("DFlash2 不走 propose_first(seed 链)"),
+                crate::spec_runtime::Drafter::DFlash2(_) => unreachable!("DFlash2 不走 propose_first(seed 链)"),
             }
         };
         let (b, arena) = {
-            let face = self.session.face_mut();
+            let face = self.graphs.session.face_mut();
             owl_models::interpreters::eval_ops_scoped_env(drafts.step(), face, self.env).await?
         };
         {
-            let face = self.session.face_mut();
+            let face = self.graphs.session.face_mut();
             face.free(&arena).await?;
             face.free(&[seed.id]).await?; // seed 块已消费,归还
             let mut buf = vec![0u8; 4 * depth];
@@ -616,7 +616,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         toks: &[u32],
         pos: usize,
     ) -> Result<owl_iface::contract::Bytes> {
-        let depth = self.spec_depth;
+        let depth = self.spec.depth;
         // mtp 链表覆盖:extend F..F+m + 链 F'..F'+depth-2(F' = F+m+1)
         let fp = pos + m + 1;
         // 链步最远位 = fp+depth-2 → 链表需覆盖 token 数 fp+depth-1
@@ -682,23 +682,23 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let vocab = self.model.vocab_size();
             let rope = self.rope.clone();
             let attn_v2 = self.pool.attn_v2_scratch(); // 同上:链步读核走 v2
-            match self.drafter.as_ref().expect("drafter") {
-                crate::running::Drafter::Mtp(mtp) => mtp.propose_ext(
+            match self.spec.drafter.as_ref().expect("drafter") {
+                crate::spec_runtime::Drafter::Mtp(mtp) => mtp.propose_ext(
                     &tokens_t, &hiddens, &extend_pos, &extend_kv, &extend_slots, &extend_lens,
                     &cu_t, &chain_refs, &self.model.embed, &rope, vocab, env, attn_v2,
                 ),
-                crate::running::Drafter::DFlash2(_) => unreachable!("DFlash2 走 dflash_propose"),
+                crate::spec_runtime::Drafter::DFlash2(_) => unreachable!("DFlash2 走 dflash_propose"),
             }
         };
         mrec("spec.propose.build", ts_build.elapsed());
         let ts_eval = std::time::Instant::now();
         let (b, arena) = {
-            let face = self.session.face_mut();
+            let face = self.graphs.session.face_mut();
             owl_models::interpreters::eval_ops_scoped_env(drafts.step(), face, self.env).await?
         };
         mrec("spec.propose.eval", ts_eval.elapsed());
         {
-            let face = self.session.face_mut();
+            let face = self.graphs.session.face_mut();
             face.free(&arena).await?;
         }
         Ok(b)
@@ -719,15 +719,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let t_all = std::time::Instant::now();
         // DFlash2 早退(无链式 extend;草稿 KV 走 prefill_dflash_encode)
         // —— 门必须先于 blocks_mtp 预留(mtp 账房非 mtp 模式 = 0 块)
-        if !matches!(self.drafter.as_ref(), Some(crate::running::Drafter::Mtp(_))) {
+        if !matches!(self.spec.drafter.as_ref(), Some(crate::spec_runtime::Drafter::Mtp(_))) {
             return Ok(());
         }
         let d = self.pool.dims;
         let page = self.pool.page;
         let bt = {
-            let sid = self.active.as_ref().expect("active 已保证").session_id;
-            let s = self.sessions.get_mut(sid).expect("账在");
-            self.blocks_mtp.ensure_for_len(&mut s.mtp_block_table, base + t_rows)?;
+            let sid = self.turns.active.as_ref().expect("active 已保证").session_id;
+            let s = self.bank.sessions.get_mut(sid).expect("账在");
+            self.bank.blocks_mtp.ensure_for_len(&mut s.mtp_block_table, base + t_rows)?;
             s.mtp_block_table.clone()
         };
         let (kc, vc) = self.pool.mtp_kv_leaf().expect("mtp 池");
@@ -776,8 +776,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         };
         mrec("spec.extend.pre", t_all.elapsed());
         let ts_eval = std::time::Instant::now();
-        let mtp = match self.drafter.as_ref() {
-            Some(crate::running::Drafter::Mtp(m)) => m,
+        let mtp = match self.spec.drafter.as_ref() {
+            Some(crate::spec_runtime::Drafter::Mtp(m)) => m,
             _ => return Ok(()), // DFlash2 无链式 extend(草稿 KV 走 dflash_encode)
         };
         let root = mtp.extend_block(
@@ -785,13 +785,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             &self.model.embed, &self.rope, self.env,
         );
         let (_b, arena) = {
-            let face = self.session.face_mut();
+            let face = self.graphs.session.face_mut();
             owl_models::interpreters::eval_ops_scoped_env(root.step(), face, self.env).await?
         };
         mrec("spec.extend.eval", ts_eval.elapsed());
         mrec("spec.extend", t_all.elapsed());
         {
-            let face = self.session.face_mut();
+            let face = self.graphs.session.face_mut();
             face.free(&arena).await?;
         }
         Ok(())
@@ -806,17 +806,17 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         toks: &[u32],
         pos: usize,
     ) -> Result<Vec<u32>> {
-        let depth = self.spec_depth;
+        let depth = self.spec.depth;
         let page = self.pool.page;
         let bt = {
-            let sid = self.active.as_ref().expect("active 已保证").session_id;
-            let s = self.sessions.get_mut(sid).expect("账在");
-            self.blocks_mtp.ensure_for_len(&mut s.mtp_block_table, pos + m + depth)?;
+            let sid = self.turns.active.as_ref().expect("active 已保证").session_id;
+            let s = self.bank.sessions.get_mut(sid).expect("账在");
+            self.bank.blocks_mtp.ensure_for_len(&mut s.mtp_block_table, pos + m + depth)?;
             s.mtp_block_table.clone()
         };
         {
             let ts_w = std::time::Instant::now();
-            let face = self.session.face_mut();
+            let face = self.graphs.session.face_mut();
             self.pool.write_bt_mtp(face, &bt).await?;
             mrec("spec.propose.btwt", ts_w.elapsed());
         }
@@ -849,7 +849,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             ins.push((names[j * 3 + 1].as_str(), b.as_slice()));
             ins.push((names[j * 3 + 2].as_str(), c.as_slice()));
         }
-        let pg = &mut self.propose_graphs[m];
+        let pg = &mut self.graphs.propose[m];
         let t1 = std::time::Instant::now();
         pg.step(&ins).await?;
         let t_step = t1.elapsed();
@@ -863,9 +863,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// mtp 链表 ensure(E5-M2b;propose eager 路径用 from_host 表,非持久
     /// bt 块 —— 图不烘焙 mtp 链)。返回 host 块链副本。
     pub(crate) fn mtp_chain_bt(&mut self, cover: usize) -> Result<Vec<u32>> {
-        let sid = self.active.as_ref().expect("active 已保证").session_id;
-        let s = self.sessions.get_mut(sid).expect("账在");
-        self.blocks_mtp.ensure_for_len(&mut s.mtp_block_table, cover)?;
+        let sid = self.turns.active.as_ref().expect("active 已保证").session_id;
+        let s = self.bank.sessions.get_mut(sid).expect("账在");
+        self.bank.blocks_mtp.ensure_for_len(&mut s.mtp_block_table, cover)?;
         Ok(s.mtp_block_table.clone())
     }
 
@@ -884,8 +884,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     ) -> Result<(Vec<u32>, owl_iface::contract::Bytes, Option<Vec<f32>>)> {
         let t = block.len();
         let (bt_chain, _) = {
-            let act = self.active.as_ref().expect("active 已保证");
-            let s = self.sessions.get(act.session_id).expect("账在");
+            let act = self.turns.active.as_ref().expect("active 已保证");
+            let s = self.bank.sessions.get(act.session_id).expect("账在");
             (s.block_table.clone(), s.gdn_slot)
         };
         let kv_caches = self.pool.kv_caches();
@@ -965,7 +965,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let ctx_total = base + t;
             let nb = bt_chain.len();
             let k_fi_leaf = self.pool.kv_fi_leaves();
-            let face = self.session.face_mut();
+            let face = self.graphs.session.face_mut();
             let q_cu_b = owl_models::interpreters::eval_ops(
                 TensorOps::from_host(Dtype::U32, vec![2], &i32le(&[0, t as i32])).step(), face)
                 .await?;
@@ -1009,7 +1009,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         );
         ctx.seq_cu = Some(&seq_cu);
         ctx.env = self.env;
-        let face = self.session.face_mut();
+        let face = self.graphs.session.face_mut();
         let vocab = self.model.vocab_size();
         // 树一:hidden 根([t, hidden];E5-M2b:extend 同迭代消费 → 根块
         // 存活返回,中间块即焚)。原单树版的 argmax 根与 _arena 均 drop 未

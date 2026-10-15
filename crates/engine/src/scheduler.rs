@@ -79,15 +79,14 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 只动账(队列/会话账/块账房/活跃 turn),**零 await**。
     pub(crate) fn schedule(&mut self) -> Result<SchedulerOutput> {
         let mut begin = None;
-        if self.active.is_none() {
-            let Some(turn) = self.queue.pop_front() else {
+        if self.turns.active.is_none() {
+            let Some(turn) = self.turns.queue.pop_front() else {
                 return Ok(SchedulerOutput::Idle);
             };
             // E2c 复用形态:GuardHit(同会话,块链/格态原样)/
             // PrefixHit(跨会话,块链复用 + 快照恢复)/ Fresh(全量)
             let (cached_len, gdn_slot, restore_key) = {
-                let s = self
-                    .sessions
+                let s = self.bank.sessions
                     .get_mut(turn.session_id)
                     .expect("submit 已建会话账");
                 // ⚠️ 新会话(空账)guard 恒真 —— cached_len == 0 必须落到
@@ -103,8 +102,8 @@ impl<D: DeviceClient> RunningEngine<D> {
                     (s.cached_len, s.gdn_slot, None)
                 } else if self.pool.paged {
                     // 前缀缓存匹配(先匹配后释放旧链;内容寻址 = 跨会话)
-                    let (mut m, chain) = self.blocks_m.match_prefix(&turn.prompt_ids);
-                    if self.blocks_m.debug {
+                    let (mut m, chain) = self.bank.blocks_m.match_prefix(&turn.prompt_ids);
+                    if self.bank.blocks_m.debug {
                         eprintln!("[dbg prefix] match = {m} blocks / chain = {chain:?}");
                     }
                     if m > 0 && m * self.pool.page == turn.prompt_ids.len() {
@@ -119,44 +118,43 @@ impl<D: DeviceClient> RunningEngine<D> {
                     }
                     if m > 0 {
                         for &b in &chain[..m] {
-                            self.blocks_m.incref(b);
+                            self.bank.blocks_m.incref(b);
                         }
                         let mut old = std::mem::take(&mut s.block_table);
-                        self.blocks_m.release_table(&mut old);
+                        self.bank.blocks_m.release_table(&mut old);
                         s.block_table = chain[..m].to_vec();
                         // MTP 链同步重置(E5-M2b):保留前缀的 mtp 条目虽
                         // 语义可复用(同 token 同 hidden 确定性),但 M2b
                         // 无 prefill extend,重建面 = 0 起步(草稿质量降,
                         // 恒等不受影响 —— 草稿只影响速度)
                         let mut mold = std::mem::take(&mut s.mtp_block_table);
-                        self.blocks_mtp.release_table(&mut mold);
+                        self.bank.blocks_mtp.release_table(&mut mold);
                         s.reset();
                         s.cached_len = m * self.pool.page;
                         (m * self.pool.page, s.gdn_slot, Some(chain[m - 1]))
                     } else {
                         let mut table = std::mem::take(&mut s.block_table);
-                        self.blocks_m.release_table(&mut table);
+                        self.bank.blocks_m.release_table(&mut table);
                         let mut mold = std::mem::take(&mut s.mtp_block_table);
-                        self.blocks_mtp.release_table(&mut mold);
+                        self.bank.blocks_mtp.release_table(&mut mold);
                         s.reset();
                         (0, s.gdn_slot, None)
                     }
                 } else {
                     let mut table = std::mem::take(&mut s.block_table);
-                    self.blocks_m.release_table(&mut table);
+                    self.bank.blocks_m.release_table(&mut table);
                     let mut mold = std::mem::take(&mut s.mtp_block_table);
-                    self.blocks_mtp.release_table(&mut mold);
+                    self.bank.blocks_mtp.release_table(&mut mold);
                     s.reset();
                     (0, s.gdn_slot, None)
                 }
             };
             // E2b:块表确保覆盖 prompt(增量 turn 块链已存,只长新增段)
             {
-                let s = self
-                    .sessions
+                let s = self.bank.sessions
                     .get_mut(turn.session_id)
                     .expect("submit 已建会话账");
-                self.blocks_m.ensure_for_len(&mut s.block_table, turn.prompt_ids.len())?;
+                self.bank.blocks_m.ensure_for_len(&mut s.block_table, turn.prompt_ids.len())?;
             }
             begin = Some(BeginPlan {
                 session_id: turn.session_id,
@@ -185,7 +183,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 }
                 _ => (self.cfg.knobs.sampler, self.cfg.knobs.sampler_enabled),
             };
-            self.active = Some(crate::running::ActiveTurn {
+            self.turns.active = Some(crate::turn::ActiveTurn {
                 id: turn.id,
                 session_id: turn.session_id,
                 ephemeral: turn.ephemeral,
@@ -202,18 +200,18 @@ impl<D: DeviceClient> RunningEngine<D> {
                 fed: cached_len,
                 cached_start: cached_len,
                 decoded: String::new(),
-                spec: crate::running::TurnSpecState {
+                spec: crate::turn::TurnSpecState {
                     // B4 分母**跨 turn 保鲜**(见 RunningEngine::bare_cost_carry_ms);
                     // 其余 spec 态仍全零 = 生命周期收口纪律不动
-                    bare_cost_ewma_ms: self.bare_cost_carry_ms,
-                    bare_cost_ctx: self.bare_cost_carry_ctx,
+                    bare_cost_ewma_ms: self.spec.carry_ms,
+                    bare_cost_ctx: self.spec.carry_ctx,
                     ..Default::default()
                 },
             });
         }
 
         // 相位决策:prompt 相位(块式 prefill;W1/PF1)优先
-        let act = self.active.as_ref().expect("begin 或已有活跃");
+        let act = self.turns.active.as_ref().expect("begin 或已有活跃");
         if act.fed < act.prompt_ids.len() {
             let base = act.fed;
             let remaining = act.prompt_ids.len() - base;
@@ -230,30 +228,30 @@ impl<D: DeviceClient> RunningEngine<D> {
 
         // 生成相位:decode 单步 / 投机轮(host 派生量备齐 —— 物理槽/跨页增长)
         let (sid, token, pos) = {
-            let act = self.active.as_ref().expect("活跃");
+            let act = self.turns.active.as_ref().expect("活跃");
             (act.session_id, *act.out.last().expect("生成中"), act.fed)
         };
         // B4 自适应降级(§6.24):降级态发裸 Decode(草稿池逐 token 同步);
         // 每 probe_every 步发一轮真 SpecRound 探测(m≥1 → 解除降级,
         // 见 execute_spec_round 尾态机)。非降级 = 原调度,零变化。
         // B4 三态在 ActiveTurn.spec(turn 生命周期;2026-10-10 收口)
-        let spec = if self.spec_depth == 0 {
+        let spec = if self.spec.depth == 0 {
             0
-        } else if !self.active.as_ref().expect("活跃").spec.spec_degraded {
-            self.spec_depth
-        } else if self.active.as_ref().expect("活跃").spec.spec_steps_degraded
-            >= self.active.as_ref().expect("活跃").spec.spec_probe_every
+        } else if !self.turns.active.as_ref().expect("活跃").spec.spec_degraded {
+            self.spec.depth
+        } else if self.turns.active.as_ref().expect("活跃").spec.spec_steps_degraded
+            >= self.turns.active.as_ref().expect("活跃").spec.spec_probe_every
         {
-            self.active.as_mut().expect("活跃").spec.spec_steps_degraded = 0;
-            self.spec_depth
+            self.turns.active.as_mut().expect("活跃").spec.spec_steps_degraded = 0;
+            self.spec.depth
         } else {
             0
         };
         let (kv_slot, kv_slots, gdn_slot, grew) = {
-            let s = self.sessions.get_mut(sid).expect("账在");
+            let s = self.bank.sessions.get_mut(sid).expect("账在");
             let need = if spec > 0 { pos + spec + 1 } else { pos + 1 };
             let before = s.block_table.len();
-            self.blocks_m.ensure_for_len(&mut s.block_table, need)?;
+            self.bank.blocks_m.ensure_for_len(&mut s.block_table, need)?;
             let grew = s.block_table.len() != before;
             let page = self.pool.page;
             let slot_at = |p: usize| {

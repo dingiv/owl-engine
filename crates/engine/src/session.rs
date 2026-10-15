@@ -29,6 +29,7 @@
 //! 模板渲染不稳定)**回退全量重算**(正确性优先,缓存命中其次);
 //! 真前缀匹配/radix 树随 M2 continuous batching 立项。
 
+use crate::blocks::BlockManager;
 use crate::Result;
 
 /// 客户端会话账(引擎侧感知面;KV cache 连续性的记账形态)
@@ -195,6 +196,98 @@ impl SessionTable {
             .remove(&id)
             .map(|_| ())
             .ok_or_else(|| owl_iface::contract::ModelError::Msg(format!("session {id} 不存在")))
+    }
+}
+
+// ===========================================================================
+// SessionBank(2026-10-14 拆分自 running.rs:RunningEngine 万能结构体
+// 按状态域拆解 —— 本节收编**会话账 + 双块账房**及其复合操作)
+// ===========================================================================
+
+/// 会话 + 块账房(组合叶;RunningEngine 持有)。会话账与两套物理块链
+/// (target 链 / MTP 草稿链)的变更永远两者同屋 —— 逐出/关闭/重置
+/// 都是"账 + 链"复合操作,拆散在两处曾是泄漏温床。
+pub(crate) struct SessionBank {
+    /// 会话账(GDN 格分配/LRU 逐出/前缀守卫)
+    pub sessions: SessionTable,
+    /// target 链块账房(E2b;块链按会话分派,池内 ref 计数)
+    pub blocks_m: BlockManager,
+    /// MTP 链页账房(E5-M2b;独立页池,无前缀缓存)
+    pub blocks_mtp: BlockManager,
+}
+
+impl SessionBank {
+    /// E5:取或建 + 格耗尽 LRU 逐出重试(提交与泵不相交,无活跃 turn,
+    /// 全部存活会话皆可逐;块链归账房,格随 close 回收)。键控与
+    /// ephemeral 两臂共用 —— ephemeral 流量为主的服务面,老键控会话
+    /// 必须让位(2026-10-10 sweep 实录:8 个键控会话存活时全部
+    /// ephemeral 请求 400)
+    pub(crate) fn get_or_create_evicting(
+        &mut self,
+        id: Option<u64>,
+        gdn_slots: usize,
+    ) -> Result<u64> {
+        match self.sessions.get_or_create(id, gdn_slots) {
+            Ok(x) => Ok(x.0),
+            Err(e) if format!("{e}").contains("GDN 状态格耗尽") => {
+                let mut last = e;
+                loop {
+                    let Some(victim) = self.sessions.lru_victim() else {
+                        return Err(last);
+                    };
+                    self.release_session_chains(victim);
+                    // 会话关闭失败 = 块表归还/状态回收失败:不许静默(律 #1)
+                    if let Err(e) = self.sessions.close(victim) {
+                        eprintln!("[session] LRU 逐出 #{victim} 关闭失败: {e}");
+                    }
+                    owl_shared::metrics::with_metrics_store(|m| {
+                        m.counter_add("session.evict", 1, file!(), line!())
+                    });
+                    eprintln!("[session] LRU 逐出 #{victim}(GDN 格回收)→ 重试");
+                    match self.sessions.get_or_create(id, gdn_slots) {
+                        Ok(x) => return Ok(x.0),
+                        Err(e2) if format!("{e2}").contains("GDN 状态格耗尽") => {
+                            last = e2;
+                        }
+                        Err(e2) => return Err(e2),
+                    }
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// 显式关会话(客户端声明不再续;账本清票,target 链归还账房)
+    ///
+    /// FIXME(拆分时发现的链归还不对称,行为零变化纪律下保持原样):
+    /// 本路径只归还 target 链,**不归还 MTP 链** —— 与 evict/burn(双链
+    /// 同还)不对称,mtp 模式下显式 close 会漏 MTP 页。待立案修。
+    pub(crate) fn close(&mut self, id: u64) -> Result<()> {
+        if let Some(s) = self.sessions.get_mut(id) {
+            let mut table = std::mem::take(&mut s.block_table);
+            self.blocks_m.release_table(&mut table);
+        }
+        self.sessions.close(id)
+    }
+
+    /// 临时会话烧毁(complete/abandon 共用;块链归账房 + 表移除释放格,
+    /// 双链同还)。关闭失败不许静默(律 #1)。
+    pub(crate) fn burn(&mut self, session_id: u64) {
+        self.release_session_chains(session_id);
+        if let Err(e) = self.sessions.close(session_id) {
+            eprintln!("[session] 临时会话 #{session_id} 关闭失败: {e}");
+        }
+    }
+
+    /// 单会话双链归还(target 链 + MTP 链;逐出/关闭/烧毁共用的
+    /// 复合操作 —— 链归还必须与账本操作同屋,防单边清理)
+    fn release_session_chains(&mut self, id: u64) {
+        if let Some(s) = self.sessions.get_mut(id) {
+            let mut table = std::mem::take(&mut s.block_table);
+            self.blocks_m.release_table(&mut table);
+            let mut mtp_table = std::mem::take(&mut s.mtp_block_table);
+            self.blocks_mtp.release_table(&mut mtp_table);
+        }
     }
 }
 

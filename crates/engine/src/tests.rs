@@ -107,7 +107,7 @@ pub async fn gpu_schedule_decision_surface() {
                 }
                 _ => panic!("期望 Prefill"),
             }
-            eng.active.as_ref().unwrap().prompt_ids.len()
+            eng.turns.active.as_ref().unwrap().prompt_ids.len()
         }
         _ => panic!("期望 Step"),
     };
@@ -124,7 +124,7 @@ pub async fn gpu_schedule_decision_surface() {
 
     // 模拟执行器推进至 prompt 末 + 产出首 token → decode 派生量备齐
     {
-        let act = eng.active.as_mut().unwrap();
+        let act = eng.turns.active.as_mut().unwrap();
         act.fed = act.prompt_ids.len();
         act.out.push(7);
     }
@@ -140,7 +140,7 @@ pub async fn gpu_schedule_decision_surface() {
                     // 物理槽 = 块表[pos/page]×page + pos%page(页 16 后
                     // 17 token 提示词跨入块 1,恒 b0 假设已不成立)
                     let expect_slot =
-                        eng.sessions.get(sid).unwrap().block_table[n / page] as usize * page
+                        eng.bank.sessions.get(sid).unwrap().block_table[n / page] as usize * page
                             + n % page;
                     assert_eq!(kv_slot as usize, expect_slot, "物理槽 = 块链换算");
                     assert_eq!(gdn_slot, 0, "首会话格 0");
@@ -155,8 +155,8 @@ pub async fn gpu_schedule_decision_surface() {
     // GuardHit:账本截短两 token(模拟客户端续发同前缀 prompt),
     // 同会话续发 → 增量起步 + 不重置 GDN
     {
-        let act = eng.active.take().unwrap();
-        let s = eng.sessions.get_mut(act.session_id).unwrap();
+        let act = eng.turns.active.take().unwrap();
+        let s = eng.bank.sessions.get_mut(act.session_id).unwrap();
         s.commit_turn(&act.prompt_ids, &[]);
         s.cached_len -= 2;
     }
@@ -241,9 +241,9 @@ pub async fn gpu_two_turns_lifecycle(shared: Option<&mut RunningEngine<owl_cuda:
         }
     };
     assert!(
-        matches!(running.capture_outcome, crate::graph_plan::PlanOutcome::Captured),
+        matches!(running.capture_outcome(), crate::graph_plan::PlanOutcome::Captured),
         "真模型捕获应成功(回放态),得 {:?}",
-        running.capture_outcome
+        running.capture_outcome()
     );
 
     let t1 = running.submit("Hello, who are you?", 16).expect("t1");
@@ -595,9 +595,9 @@ pub async fn gpu_w4a16_marlin_e2e() {
         .expect("W4A16 装载");
     let mut running = engine.run(loaded).await.expect("装配");
     assert!(
-        matches!(running.capture_outcome, crate::graph_plan::PlanOutcome::Captured),
+        matches!(running.capture_outcome(), crate::graph_plan::PlanOutcome::Captured),
         "W4A16 decode 图应捕获成功(回放态),得 {:?}",
-        running.capture_outcome
+        running.capture_outcome()
     );
     let t0 = std::time::Instant::now();
     let t1 = running
@@ -649,9 +649,9 @@ pub async fn gpu_awq27b_marlin_e2e(shared: Option<&mut RunningEngine<owl_cuda::G
     };
     assert!(
         owl_shared::env_reader::flag("OWL_NO_GRAPH")
-            || matches!(running.capture_outcome, crate::graph_plan::PlanOutcome::Captured),
+            || matches!(running.capture_outcome(), crate::graph_plan::PlanOutcome::Captured),
         "27B decode 图应捕获成功,得 {:?}",
-        running.capture_outcome
+        running.capture_outcome()
     );
     let t1 = running
         .submit("用一句话介绍长城。", 16)
@@ -664,7 +664,7 @@ pub async fn gpu_awq27b_marlin_e2e(shared: Option<&mut RunningEngine<owl_cuda::G
     );
     // 刀D 取证:层间原生时间线(OWL_TS_PROBE;clock64 @~1.98GHz)
     if owl_shared::env_reader::flag("OWL_TS_PROBE") {
-        let raw = match running.session.read_input_slot_bytes("ts_buf").await {
+        let raw = match running.graphs.session.read_input_slot_bytes("ts_buf").await {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("[ts] 读回失败 {e}");
@@ -722,7 +722,7 @@ pub async fn gpu_multi_session_isolation(shared: Option<&mut RunningEngine<owl_c
     let ta1_text = drive_turn(&mut *running, ta1).await;
     eprintln!("[test] A1: {ta1_text}");
     assert!(!ta1_text.trim().is_empty());
-    let a_table_1 = running.sessions.get(101).expect("A 账在").block_table.clone();
+    let a_table_1 = running.bank.sessions.get(101).expect("A 账在").block_table.clone();
     let a_len_1 = running.session_len(101).expect("A 账在");
     assert!(!a_table_1.is_empty(), "A 块链非空");
 
@@ -734,11 +734,11 @@ pub async fn gpu_multi_session_isolation(shared: Option<&mut RunningEngine<owl_c
     assert!(!tb1_text.trim().is_empty());
 
     // 隔离断言 ①:B 的 turn 后,A 的块链/账本逐字节不变
-    let a_table_2 = running.sessions.get(101).expect("A 账在").block_table.clone();
+    let a_table_2 = running.bank.sessions.get(101).expect("A 账在").block_table.clone();
     assert_eq!(a_table_1, a_table_2, "B 的 turn 不得扰动 A 块链");
     assert_eq!(running.session_len(101), Some(a_len_1), "B 的 turn 不得扰动 A 账本");
     // 隔离断言 ②:物理块零共享(无前缀缓存 = 全新分配)
-    let b_table = running.sessions.get(202).expect("B 账在").block_table.clone();
+    let b_table = running.bank.sessions.get(202).expect("B 账在").block_table.clone();
     assert!(b_table.iter().all(|b| !a_table_2.contains(b)), "A/B 物理块互异");
     eprintln!("[test] 块链 A = {a_table_2:?} / B = {b_table:?}");
 
@@ -849,8 +849,8 @@ pub async fn gpu_prefix_cache_hit(shared: Option<&mut RunningEngine<owl_cuda::Gp
     );
 
     // 机械断言:chunk 数骤降 + 块链物理共享 + 账本各自收口
-    let a_chain = running.sessions.get(101).expect("A").block_table.clone();
-    let b_chain = running.sessions.get(202).expect("B").block_table.clone();
+    let a_chain = running.bank.sessions.get(101).expect("A").block_table.clone();
+    let b_chain = running.bank.sessions.get(202).expect("B").block_table.clone();
     assert!(
         b_prefill_chunks * 4 <= a_prefill_chunks.max(1),
         "B prefill chunk 数应 ≪ A:{b_prefill_chunks} vs {a_prefill_chunks}"
@@ -994,9 +994,9 @@ pub async fn boot_08b(max_seq: usize) -> RunningEngine<owl_cuda::GpuClient> {
     let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
     let running = engine.run(loaded).await.expect("装配");
     assert!(
-        matches!(running.capture_outcome, crate::graph_plan::PlanOutcome::Captured),
+        matches!(running.capture_outcome(), crate::graph_plan::PlanOutcome::Captured),
         "0.8B 装载应捕获成功(回放态),得 {:?}",
-        running.capture_outcome
+        running.capture_outcome()
     );
     eprintln!("[e2e] 0.8B 默认档装载完成 {:?}(max_seq={max_seq})", t0.elapsed());
     running
@@ -1025,9 +1025,9 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
         .expect("27B AWQ 装载");
     let running = engine.run(loaded).await.expect("装配");
     assert!(
-        matches!(running.capture_outcome, crate::graph_plan::PlanOutcome::Captured),
+        matches!(running.capture_outcome(), crate::graph_plan::PlanOutcome::Captured),
         "27B 装载应捕获成功(回放态),得 {:?}",
-        running.capture_outcome
+        running.capture_outcome()
     );
     eprintln!("[e2e] 27B 默认档装载完成 {:?}", t0.elapsed());
     running
@@ -1101,8 +1101,7 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
                     .submit_session(Some(100 + i as u64), *p, 48)
                     .expect("submit");
                 let text = drive_turn(&mut running, id).await;
-                let toks = running
-                    .sessions
+                let toks = running.bank.sessions
                     .get(sid)
                     .map(|s| s.tokens.clone())
                     .unwrap_or_default();
@@ -1119,11 +1118,11 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
                     .submit_session_ex(Some(900), "用一句话介绍长城。", 8, true)
                     .expect("submit(ignore_eos)");
                 let text_ie = drive_turn(&mut running, id_ie).await;
-                let n = running.sessions.get(sid_ie).map(|s| s.tokens.len()).unwrap_or(0);
+                let n = running.bank.sessions.get(sid_ie).map(|s| s.tokens.len()).unwrap_or(0);
                 eprintln!("[spec-gate] 预算尽门(ignore_eos): {n} tok,文本 {text_ie:?}");
                 assert!(n >= 8, "预算尽 turn 应跑满 8 tok,得 {n}(终态事件是否送达见 panic 信息)");
             }
-            let st = running.spec_stats;
+            let st = running.spec.stats;
             eprintln!(
                 "[spec-gate] stats: rounds={} sum_m={} full={} partial={} zero={}",
                 st.rounds, st.sum_m, st.full, st.partial, st.zero
@@ -1196,15 +1195,14 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
             prompt: &str,
             tag: &str,
         ) -> (String, Vec<u32>) {
-            running.spec_depth = spec_depth;
+            running.spec.depth = spec_depth;
             let (sid, id) = running.submit_session(Some(7), prompt, 40).expect("submit");
             let text = drive_turn(running, id).await;
-            let toks = running
-                .sessions
+            let toks = running.bank.sessions
                 .get(sid)
                 .map(|s| s.tokens.clone())
                 .unwrap_or_default();
-            let st = running.spec_stats;
+            let st = running.spec.stats;
             eprintln!(
                 "[spec-gate-27b] {tag} spec_depth={spec_depth} stats: rounds={} sum_m={} full={} partial={} zero={}",
                 st.rounds, st.sum_m, st.full, st.partial, st.zero
@@ -1311,9 +1309,9 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
                 .expect("装载");
             let running = engine.run(loaded).await.expect("装配");
             assert!(
-                matches!(running.capture_outcome, crate::graph_plan::PlanOutcome::Captured),
+                matches!(running.capture_outcome(), crate::graph_plan::PlanOutcome::Captured),
                 "带草稿装载应捕获成功,得 {:?}",
-                running.capture_outcome
+                running.capture_outcome()
             );
             running
         }
@@ -1328,18 +1326,17 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
             tag: &str,
         ) -> (String, Vec<u32>) {
             let prompt_len = prompt.chars().count(); // 近似(测试口径)
-            running.spec_depth = spec_depth;
+            running.spec.depth = spec_depth;
             let (sid, id) = running.submit_session(Some(7), prompt, max_new).expect("submit");
             let tg = std::time::Instant::now();
             let text = drive_turn(running, id).await;
             let t_gen = tg.elapsed();
-            let toks = running
-                .sessions
+            let toks = running.bank.sessions
                 .get(sid)
                 .map(|s| s.tokens.clone())
                 .unwrap_or_default();
             let gen_n = toks.len().saturating_sub(prompt_len);
-            let st = running.spec_stats;
+            let st = running.spec.stats;
             let al = if st.rounds > 0 { st.sum_m as f64 / st.rounds as f64 } else { 0.0 };
             eprintln!(
                 "[dflash-gate] 生成段: {} tok / {t_gen:.1?} = {:.1} tok/s({tag})",
@@ -1489,8 +1486,8 @@ pub async fn gpu_gdn_slot_cross_probe() {
     let mut running = engine.run(loaded).await.expect("装配");
 
     // ① boot 后初始态:双 slot 指纹 + slot1 非零字节数(alloc 应已清零)
-    let s1_0 = running.pool.gdn_slot_fingerprint(running.session.face_mut(), 1).await.unwrap();
-    let nz0 = running.pool.gdn_slot_zero_check(running.session.face_mut(), 1).await.unwrap();
+    let s1_0 = running.pool.gdn_slot_fingerprint(running.graphs.session.face_mut(), 1).await.unwrap();
+    let nz0 = running.pool.gdn_slot_zero_check(running.graphs.session.face_mut(), 1).await.unwrap();
     eprintln!("[slot-probe] boot 后 slot1 非零字节 = {nz0}(期望 0 = alloc 清零生效)");
 
     // ② turn(slot0,新 session)
@@ -1501,9 +1498,9 @@ pub async fn gpu_gdn_slot_cross_probe() {
     let _ = sid;
 
     // ③ turn 后双 slot 指纹
-    let s1_1 = running.pool.gdn_slot_fingerprint(running.session.face_mut(), 1).await.unwrap();
-    let s0_1 = running.pool.gdn_slot_fingerprint(running.session.face_mut(), 0).await.unwrap();
-    let s1_nz = running.pool.gdn_slot_zero_check(running.session.face_mut(), 1).await.unwrap();
+    let s1_1 = running.pool.gdn_slot_fingerprint(running.graphs.session.face_mut(), 1).await.unwrap();
+    let s0_1 = running.pool.gdn_slot_fingerprint(running.graphs.session.face_mut(), 0).await.unwrap();
+    let s1_nz = running.pool.gdn_slot_zero_check(running.graphs.session.face_mut(), 1).await.unwrap();
     eprintln!("[slot-probe] turn 后 slot1 非零字节 = {s1_nz}(>0 = turn(slot0) 跨写了 slot1)");
     let same1 = s1_0 == s1_1;
     eprintln!("[slot-probe] slot1 指纹 turn 前后相同 = {same1}(false = 跨 slot 写实锤)");
@@ -1547,7 +1544,7 @@ pub async fn gpu_decode_marginal_bench() {
         let t0 = std::time::Instant::now();
         let _text = drive_turn(&mut running, id).await;
         let wall = t0.elapsed().as_secs_f64();
-        let n = running.sessions.get(7).map(|v| v.tokens.len()).unwrap_or(0);
+        let n = running.bank.sessions.get(7).map(|v| v.tokens.len()).unwrap_or(0);
         drop(running);
         std::thread::sleep(std::time::Duration::from_secs(3));
         (wall, n)
