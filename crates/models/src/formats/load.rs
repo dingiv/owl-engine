@@ -18,12 +18,95 @@
 
 use crate::contract::{Dtype, DeviceClient, ModelError};
 use crate::module::{Layout, LoadEntry, LoadManifest, LoaderOps, WeightSource};
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 // ============================================================================
 // §1 入口:eval_load(声明 → 求值 → 上载栅栏)
 // ============================================================================
+
+/// **装载旋钮**(与模型无关;解释器化设计 §3 — 调用点不再拼 LoaderCtx)
+#[derive(Debug, Clone, Copy)]
+pub struct LoadOpts {
+    /// 目标 dtype(计算档事实;`None` = 由调用方/spec 决定,必给)
+    pub dtype: crate::contract::Dtype,
+    /// 设备重排(量化族;**已裁决结果**;`None` = 能力自述裁决)
+    pub device_repack: Option<bool>,
+    /// 装载校验(整块回读对账)
+    pub verify: bool,
+    /// 逐键分相探针(stderr)
+    pub debug_tap: bool,
+}
+
+impl LoadOpts {
+    /// 常规档:能力自述裁决 repack(生产入口调用点用它,别手拼 LoaderCtx)
+    pub fn new<D: DeviceClient>(face: &D, dtype: crate::contract::Dtype) -> Self {
+        Self {
+            dtype,
+            device_repack: Some(
+                crate::module::RepackPath::resolve(None, face.device_kernels()).is_device(),
+            ),
+            verify: false,
+            debug_tap: false,
+        }
+    }
+
+    /// 装载 ctx(旋钮 → LoaderCtx;唯一产地)
+    pub fn ctx(&self) -> crate::module::LoaderCtx {
+        crate::module::LoaderCtx {
+            dtype: self.dtype,
+            shard: 1,
+            device_repack: self.device_repack.unwrap_or(false),
+            verify: self.verify,
+            debug_tap: self.debug_tap,
+        }
+    }
+}
+
+/// **通用装载入口**(解释器化 L2 第一段):`Loadable::layout` 声明 × 起点源
+/// ⇒ 物化。真正的"起点侧"通用化(按 [`CheckpointKind`] 自动开源)见
+/// [`load_from_dir`];本函数是纯加法(旧具名函数仍走 `eval_load`)。
+pub async fn load_component<T, D, S>(
+    face: &mut D,
+    comp: &T,
+    src: &S,
+    opts: LoadOpts,
+) -> Result<crate::module::LoadManifest, ModelError>
+where
+    T: crate::module::Loadable,
+    D: DeviceClient,
+    S: WeightSource + ?Sized,
+{
+    eval_load(comp, face, src, &opts.ctx()).await
+}
+
+/// **起点开箱**:目录 → (探测格式, 源) —— 起点轴收口(设计 §2.2)。
+///
+/// v1 覆盖裸 safetensors 族;量化族(`PackQuantized`/`AwqGemm`)的**源选择**
+/// 需再读 `quantization_config`(awq vs compressed-tensors),留 L2 第二段
+/// —— 此处**响亮拒**,不许静默挑源。
+pub async fn load_from_dir<T, D>(
+    dir: &Path,
+    face: &mut D,
+    comp: &T,
+    opts: LoadOpts,
+) -> Result<crate::module::LoadManifest, ModelError>
+where
+    T: crate::module::Loadable,
+    D: DeviceClient,
+{
+    let det = crate::formats::kind::detect(dir)?;
+    match det.kind {
+        crate::formats::kind::CheckpointKind::SafeTensors => {
+            let src = crate::formats::safetensors::SafeTensorsSource::open_dir(dir)?;
+            load_component(face, comp, &src, opts).await
+        }
+        other => Err(ModelError::Msg(format!(
+            "load_from_dir: 起点格式 {other:?} 的源选择未接(L2 第二段;暂用既有具名装载函数)"
+        ))),
+    }
+}
 
 /// 装载执行(层级入口):驱动层的 `Loadable::layout` 需求并物化。
 /// 解释器自己调用层钩子并为它传递 LoaderCtx —— 使用者只给层与源。
@@ -373,7 +456,10 @@ async fn load_direct<D: DeviceClient, S: WeightSource + ?Sized>(
     // **原始字节 + 设备端转换臂**(2026-10-16 装载提速):源天然 bf16、
     // 目标 f16 ⇒ CPU 只做 memcpy(零元素转换),转换由设备 cast 核完成
     // —— 实测 CPU 转换 bf16→f16 仅 ~2.2GB/s(debug),是全载最大单相。
-    if w.dtype == crate::contract::Dtype::F16
+    // ⚠️ 设备转换臂是 **GPU-only**(要 BF16 设备块 + cast 核)⇒ 必须看面能力;
+    // CpuFace 的 alloc 只认 F32/F16(2026-10-16 由 L2 等价门当场抓出)
+    if face.device_kernels()
+        && w.dtype == crate::contract::Dtype::F16
         && src.native_dtype(&w.key) == Some(crate::contract::Dtype::BF16)
     {
         return load_direct_device_cast(face, w, src, n, tap, batch, verify).await;
@@ -892,4 +978,61 @@ fn attribution<S: WeightSource + ?Sized>(src: &S, key: &str, n: usize) -> ModelE
 /// Want 的目标字节量(元素数 × dtype 宽;LPT 分桶权重)
 fn want_bytes(w: &crate::module::Want) -> usize {
     w.shape.iter().product::<usize>() * w.dtype.size_bytes()
+}
+
+#[cfg(test)]
+mod generic_entry_tests {
+    use super::*;
+    use crate::specs::qwen35::{qwen3_5_0_8b, Qwen35Convention};
+
+    /// **L2 等价门**:通用入口(`load_from_dir` + `LoadOpts`)与旧具名装载路
+    /// (`load_0_8b` 同体的 eval_load)产出**同一份清单**(键/dtype/形状逐条相等)。
+    /// CPU face 即可(与 `cpu_real_weights_load` 同档),无需 GPU 门。
+    #[tokio::test]
+    async fn generic_entry_equals_named_loader() {
+        let dir = crate::testkit::manifest_dir().join("assets/Qwen3.5-0.8B");
+        if !dir.is_dir() {
+            eprintln!("skip: {} 不在(模型库软链)", dir.display());
+            return;
+        }
+        let spec = qwen3_5_0_8b();
+        let mk = || {
+            crate::model::Model::new(
+                &spec,
+                Qwen35Convention::new("model.language_model"),
+                crate::module::QuantPlan::F16,
+                crate::module::QuantPlan::F16,
+            )
+        };
+        let mut face = owl_cpu::CpuFace::new();
+        let opts = LoadOpts {
+            dtype: spec.dtype,
+            device_repack: Some(false),
+            verify: false,
+            debug_tap: false,
+        };
+
+        // 旧路(与 load_0_8b 同体,只为取清单)
+        let src = crate::formats::safetensors::SafeTensorsSource::open_dir(&dir).expect("源开箱");
+        let old = eval_load(&mk(), &mut face, &src, &opts.ctx()).await.expect("eval_load");
+
+        // 新路(起点探测 + 通用入口)
+        let new = load_from_dir(&dir, &mut face, &mk(), opts)
+            .await
+            .expect("load_from_dir");
+
+        let norm = |m: &LoadManifest| {
+            let mut v: Vec<(String, String, Vec<usize>)> = m
+                .entries()
+                .iter()
+                .map(|e| (e.key.clone(), format!("{:?}", e.dtype), e.shape.clone()))
+                .collect();
+            v.sort();
+            v
+        };
+        let (a, b) = (norm(&old), norm(&new));
+        assert_eq!(a.len(), b.len(), "清单条目数");
+        assert_eq!(a, b, "键/dtype/形状逐条相等");
+        eprintln!("[L2] 通用入口 ≡ 具名装载:{} 条逐项相等 ✓", a.len());
+    }
 }
