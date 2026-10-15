@@ -132,7 +132,7 @@ impl GpuServer {
         }
     }
 
-    /// 上传租约:buf 所有权移入,DMA 到 dst+offset;完成回调把 buf 归还池
+    /// 上传租约(命令壳):`enqueue_upload_pinned` + 回执
     pub(super) fn handle_upload_pinned(
         &mut self,
         buf: Box<dyn owl_iface::contract::PinnedRegion + Send>,
@@ -141,14 +141,25 @@ impl GpuServer {
         len_bytes: usize,
         ack: Ack<Result<(), ModelError>>,
     ) {
+        ack.send(self.enqueue_upload_pinned(buf, dst, offset_bytes, len_bytes));
+    }
+
+    /// **上传核心**(只入队 DMA + 登记租约归还;不 ack)—— 复合命令
+    /// `UploadAndLaunch` 与命令壳共用(mutual: 单机制,无第二套上传路径)
+    pub(super) fn enqueue_upload_pinned(
+        &mut self,
+        buf: Box<dyn owl_iface::contract::PinnedRegion + Send>,
+        dst: Bytes,
+        offset_bytes: usize,
+        len_bytes: usize,
+    ) -> Result<(), ModelError> {
         let stream = match self.ctx().stream(STREAM_H2D) {
             Ok(s) => s.clone(),
-            Err(e) => return ack.send(Err(e)),
+            Err(e) => return Err(e),
         };
-        let mut ack = Some(ack);
         let dptr_base = match self.ctx().block_ptr(dst.id, &stream) {
             Ok((p, _)) => p,
-            Err(e) => return ack.take().unwrap().send(Err(e)),
+            Err(e) => return Err(e),
         };
         // 边界校验(2026-10-15 补口;装载期流式写权重走本路)
         if let Err(e) = self
@@ -156,7 +167,7 @@ impl GpuServer {
             .check_range(dst.id, offset_bytes, len_bytes, "upload-pinned")
         {
             self.pool.put(buf);
-            return ack.take().unwrap().send(Err(e));
+            return Err(e);
         }
         let t_dma = std::time::Instant::now();
         let dma = unsafe {
@@ -169,11 +180,10 @@ impl GpuServer {
         owl_shared::timer_record!("srv.dma_enqueue", t_dma.elapsed());
         owl_shared::counter_add!("srv.dma_bytes", len_bytes as u64);
         if let Err(e) = dma {
-            // 建场失败:未入队任何 DMA,finish 不得投递 —— 租约回池 + 回执错误
+            // 建场失败:未入队任何 DMA,finish 不得投递 —— 租约回池 + 返回错误
             let e = ModelError::Msg(format!("upload_pinned async: {e:?}"));
             self.pool.put(buf);
-            ack.take().unwrap().send(Err(e));
-            return;
+            return Err(e);
         }
         // 异步语义(F5 尾批,用户裁决):入队即回执 —— DMA 完成由调用方
         // 的显式 sync 栅栏兜底;finish 只归还租约入池(页锁定代价不再
@@ -186,7 +196,6 @@ impl GpuServer {
             let buf = cell2.lock().unwrap().take().unwrap();
             pool.put(buf);
         });
-        ack.take().unwrap().send(Ok(())); // 入队即回执(非阻塞)
         if let Err(e) = self.notify(&stream, finish) {
             // notify 失败:finish 未投递,租约回收入池(ack 已回,
             // DMA 未发生 —— 块内容缺失由调用方末端 sync 后自查/重试兜底)
@@ -195,6 +204,7 @@ impl GpuServer {
                 self.sink.logf(owl_shared::log::LVL_DEBUG, "srv", format_args!("upload notify 失败: {e:?}"));
             }
         }
+        Ok(()) // 入队即返回(DMA 完成由调用方栅栏/事件序兜底)
     }
 
     /// 分块写入已 alloc 的块(流式装载):pinned 码头 + memcpyAsync

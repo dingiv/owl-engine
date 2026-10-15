@@ -688,6 +688,33 @@ impl GpuCtx {
         Ok(())
     }
 
+    /// **跨流等待**(E2b 起用;E3 的序消费口):把 `stream` 排到 `dep` 的
+    /// **当前尾事件**之后 —— 设备端排队、**零 host 阻塞**(实测提交 p50 180ns,
+    /// 对比 host 全排空 1.9ms/键)。
+    ///
+    /// - **捕获期禁止**(`cuStreamWaitEvent` 不可捕获)⇒ 防御性拒(正常路径由
+    ///   server 白名单先拦,此处是第二道);
+    /// - `dep` 尚无完成点 ⇒ 响亮拒(不静默跳过 —— 跳过就等于丢序)。
+    pub(super) fn wait_stream_on_tail(&self, stream: StreamId, dep: StreamId) -> Result<(), ModelError> {
+        if self.capture_stream() {
+            return Err(ModelError::Msg(
+                "跨流等待不可捕获:捕获期禁止 wait_stream_on_tail".into(),
+            ));
+        }
+        let ev = self.tail_event.get(&dep).copied().ok_or_else(|| {
+            ModelError::Msg(format!("wait_stream_on_tail: dep 流 {dep} 尚无尾事件(先 record_tail)"))
+        })?;
+        let st = self.stream(stream)?;
+        unsafe {
+            crate::ffi::stream_wait_event(
+                st.cu_stream(),
+                ev.0,
+                crate::ffi::sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
+            )
+        }
+        .map_err(|e| ModelError::Msg(format!("wait_stream_on_tail({stream}←{dep}): {e:?}")))
+    }
+
     /// 该流的尾事件(仅 server 内部消费;`None` = 该流尚无已记账的完成点)
     #[allow(dead_code)] // E2 的依赖判序消费口(本刀只记账)
     pub(super) fn tail_event(&self, sid: StreamId) -> Option<TailEvent> {

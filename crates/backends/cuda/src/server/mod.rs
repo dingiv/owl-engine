@@ -34,7 +34,7 @@ use crate::command::{Ack, Command};
 use crate::launch::issue_launch;
 use crate::state::{DeviceSelector, GpuCtx, KernelCache, Staging};
 use owl_iface::contract::{Arg, Bytes, Dtype, LaunchMsg};
-use crate::state::{StreamId, STREAM_COMPUTE, STREAM_D2H, STREAM_H2D};
+use crate::state::{STREAM_COMPUTE, STREAM_D2H, STREAM_H2D};
 use owl_iface::contract::ModelError;
 use std::sync::mpsc;
 
@@ -642,14 +642,6 @@ impl GpuServer {
         if self.ctx().capture_stream() {
             return match cmd {
                 Command::Launch { msg, ack } => self.handle_launch(msg, ack),
-            // E2a:线格式/校验/负门在位,**接线 = E2b**(完成回调链 → 设备端
-            // 事件序;两侧底噪已量 p50 170~740ns / 180ns)。半成品响亮拒。
-            Command::UploadAndLaunch { ack, .. } => ack.send(Err(ModelError::Msg(
-                "UploadAndLaunch: E2a 未接线(线格式/校验/负门已在位;接线 = E2b)".into(),
-            ))),
-            Command::LaunchAndHarvest { ack, .. } => ack.send(Err(ModelError::Msg(
-                "LaunchAndHarvest: E2a 未接线(线格式/校验/负门已在位;接线 = E2b)".into(),
-            ))),
                 Command::Alloc { n_bytes, elems, zero, ack } => self.handle_alloc(n_bytes, elems, zero, ack),
                 Command::MemsetZero { block, offset_bytes, len_bytes, ack } => {
                     self.handle_memset_zero(block, offset_bytes, len_bytes, ack)
@@ -691,14 +683,13 @@ impl GpuServer {
             }
             Command::CopyBatch { copies, ack } => self.handle_copy_batch(copies, ack),
             Command::Launch { msg, ack } => self.handle_launch(msg, ack),
-            // E2a:线格式/校验/负门在位,**接线 = E2b**(完成回调链 → 设备端
-            // 事件序;两侧底噪已量 p50 170~740ns / 180ns)。半成品响亮拒。
-            Command::UploadAndLaunch { ack, .. } => ack.send(Err(ModelError::Msg(
-                "UploadAndLaunch: E2a 未接线(线格式/校验/负门已在位;接线 = E2b)".into(),
-            ))),
-            Command::LaunchAndHarvest { ack, .. } => ack.send(Err(ModelError::Msg(
-                "LaunchAndHarvest: E2a 未接线(线格式/校验/负门已在位;接线 = E2b)".into(),
-            ))),
+            // **E2b 接线**:复合 = 设备端事件序(record_tail + waitEvent),零 host 阻塞
+            Command::UploadAndLaunch { buf, dst, offset_bytes, len_bytes, msg, ack } => {
+                self.handle_upload_and_launch(buf, dst, offset_bytes, len_bytes, msg, ack)
+            }
+            Command::LaunchAndHarvest { msg, id, want_bytes, ack } => {
+                self.handle_launch_and_harvest(msg, id, want_bytes, ack)
+            }
             Command::Sync { ack } => self.handle_sync(ack),
             Command::GraphBegin { ack } => ack.send(self.ctx_mut().graph_begin()),
             Command::GraphEnd { ack } => ack.send(self.ctx_mut().graph_end()),
@@ -1038,10 +1029,17 @@ impl GpuServer {
         meta.check(&ctx)
     }
 
+    /// 发射命令壳:`enqueue_launch` + 回执
     fn handle_launch_inner(&mut self, msg: LaunchMsg, ack: Ack<Result<Bytes, ModelError>>) {
+        ack.send(self.enqueue_launch(msg));
+    }
+
+    /// **发射核心**(只入队、不 ack)—— 命令壳与 E2b 复合命令共用
+    /// (单机制:不留第二套发射路径)
+    fn enqueue_launch(&mut self, msg: LaunchMsg) -> Result<Bytes, ModelError> {
         // 准入门(foreign/native 汇合点;失败 = 指名道姓的 Contract 错)
         if let Err(e) = self.admission_check(&msg) {
-            return ack.send(Err(ModelError::Msg(format!("[算子准入] {e}"))));
+            return Err(ModelError::Msg(format!("[算子准入] {e}")));
         }
         // foreign-kernel 通道(M4 cutover:算子注册表唯一入口 —— 名字分派
         // 在注册表内部,server 主循环零算子知识;旧 handle_foreign_launch
@@ -1065,24 +1063,19 @@ impl GpuServer {
             })()
             .map_err(ModelError::Msg);
             sink.timer("srv.seg.fam", t_fam.elapsed());
-            return ack.send(out);
+            return out;
         }
-        let mut ack = Some(ack);
         // 下沉口(值语义,先拷贝;下面字段级解构不再借 self)
         let sink = self.sink;
         // 字段级解构:ctx(不可变)与 kernels(可变)借用不相交
         let Self { ctx, kernels, .. } = self;
         let ctx = match ctx.as_ref() {
             Some(c) => c,
-            None => {
-                return ack.take().unwrap().send(Err(ModelError::Msg(
-                    "server 未上线".to_string(),
-                )))
-            }
+            None => return Err(ModelError::Msg("server 未上线".to_string())),
         };
         let stream = match ctx.stream(STREAM_COMPUTE) {
             Ok(s) => s.clone(),
-            Err(e) => return ack.take().unwrap().send(Err(e)),
+            Err(e) => return Err(e),
         };
         // 火后不理:提交成功即回执(输出块句柄 issue 期已确定)。
         // 数据正确性由同流硬件保序保证;GPU 侧错误 sticky 延迟暴露
@@ -1101,20 +1094,79 @@ impl GpuServer {
                 if self.diag.sync_at(owl_shared::config::sync_bit::LAUNCH) && !capturing {
 
                     if let Err(e) = stream.synchronize() {
-                        return ack.take().unwrap().send(Err(ModelError::Msg(format!(
+                        return Err(ModelError::Msg(format!(
                             "launch-sync({}): {e:?}",
                             msg.kernel.name
-                        ))));
+                        )));
                     }
                 }
                 // 出参句柄:事实面(声明 dtype/rank)由**线格式的 out 槽**承载,
                 // 客户端回执后按它定形;此处只给句柄(未定形占位)
-                ack.take()
-                    .unwrap()
-                    .send(Ok(Bytes::new(out_id, msg.out_elems, Dtype::U8, 0)))
+                Ok(Bytes::new(out_id, msg.out_elems, Dtype::U8, 0))
             }
-            Err(e) => ack.take().unwrap().send(Err(e)),
+            Err(e) => Err(e),
         }
+    }
+
+    /// **E2b 复合:上传并计算** —— 一次 pinned 搬运 + 一次发射,**设备端序**:
+    /// `enqueue(H2D) → record_tail(H2D) → COMPUTE waitEvent → enqueue(COMPUTE)`。
+    /// 客户端口不出现流/事件/槽;零 host 阻塞(实测 record 170~740ns / wait 180ns)。
+    fn handle_upload_and_launch(
+        &mut self,
+        buf: Box<dyn owl_iface::contract::PinnedRegion + Send>,
+        dst: Bytes,
+        offset_bytes: usize,
+        len_bytes: usize,
+        msg: LaunchMsg,
+        ack: Ack<Result<Bytes, ModelError>>,
+    ) {
+        let out = (|| -> Result<Bytes, ModelError> {
+            self.enqueue_upload_pinned(buf, dst, offset_bytes, len_bytes)?;
+            self.ctx_mut().record_tail(STREAM_H2D)?;
+            self.ctx_mut()
+                .wait_stream_on_tail(STREAM_COMPUTE, STREAM_H2D)?;
+            self.enqueue_launch(msg)
+        })();
+        ack.send(out);
+    }
+
+    /// **E2b 复合:计算并回读** —— 一次发射 + 一次回读;**设备端序**:
+    /// `enqueue(COMPUTE) → record_tail(COMPUTE) → D2H waitEvent → Dtoh`。
+    /// **闭集校验**:`id` 必须 = 本 launch 的输出块(槽序末位 Block);不符响亮拒。
+    /// 回读的异步回执**直接复用外层 ack**(不引入 host 排空)。
+    fn handle_launch_and_harvest(
+        &mut self,
+        msg: LaunchMsg,
+        id: u64,
+        want_bytes: usize,
+        ack: Ack<Result<Vec<u8>, ModelError>>,
+    ) {
+        // 槽序末位 Block = 输出块(与 launch.rs 的回传口径一致)
+        let out_block = msg.args.iter().rev().find_map(|a| match a {
+            Arg::Block { id, .. } => Some(*id),
+            _ => None,
+        });
+        match out_block {
+            Some(o) if o == id => {}
+            other => {
+                return ack.send(Err(ModelError::Msg(format!(
+                    "LaunchAndHarvest: harvest id {id} ≠ 本 launch 输出块 {other:?}(闭集校验)"
+                ))))
+            }
+        }
+        if let Err(e) = self.enqueue_launch(msg) {
+            return ack.send(Err(e));
+        }
+        if let Err(e) = self.ctx_mut().record_tail(STREAM_COMPUTE) {
+            return ack.send(Err(e));
+        }
+        if let Err(e) = self
+            .ctx_mut()
+            .wait_stream_on_tail(STREAM_D2H, STREAM_COMPUTE)
+        {
+            return ack.send(Err(e));
+        }
+        self.handle_dtoh(id, want_bytes, ack);
     }
 
     /// 中间块回收(E2a):账房移除 Owned 块归池。调用方契约 = 已收割
