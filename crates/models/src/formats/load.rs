@@ -414,13 +414,16 @@ impl LoadStaging {
 }
 
 /// 设备端 bf16→f16 cast(语义拾取:driver::resolve;被动律同 DeviceRearrange)
-async fn launch_bf16_to_f16<D: DeviceClient>(
-    face: &mut D,
+/// 设备 cast 的 **LaunchMsg**(不发射):参数序 = `elems.cast_bf16_f16` 线契约
+/// `(x: BF16, n: i32, out: F16)`。E3 起由复合口 `upload_and_launch` 一次带走
+/// (搬运 + 发射之间的序 = 设备端事件)。
+fn cast_msg<D: DeviceClient>(
+    face: &D,
     raw: u64,
     out: &crate::contract::Bytes,
     elems: usize,
     key: &str,
-) -> Result<(), ModelError> {
+) -> Result<crate::contract::LaunchMsg, ModelError> {
     use crate::contract::{Arg, Dtype, KernelSource, LaunchMsg};
     let env = face
         .op_env()
@@ -459,10 +462,7 @@ async fn launch_bf16_to_f16<D: DeviceClient>(
         shared_mem: pick.shape.smem,
         out_elems: elems,
     };
-    face.launch(msg)
-        .await
-        .map_err(|e| ModelError::Msg(format!("Weight '{key}': cast launch {e}")))?;
-    Ok(())
+    Ok(msg)
 }
 
 async fn eval_want<D: DeviceClient, S: WeightSource + ?Sized>(
@@ -728,12 +728,18 @@ async fn load_direct_device_cast<D: DeviceClient, S: WeightSource + ?Sized>(
     match staging.acquire(face, StageArm::CastBf16In, n).await? {
         // ① 整键入槽(常见路:键 ≤ 槽)
         Some(slot) => {
-            upload_native_range(face, src, &w.key, 0, n, slot.id, &mut probe, verify, &mut csum).await?;
-            // 栅栏:H2D 落定 = cast 读槽的前提(DMA 与 COMPUTE 异流,禁想当然)
-            face.sync().await?;
+            let chunks =
+                fill_native_chunks(face, src, &w.key, 0, n, &mut probe, verify, &mut csum).await?;
+            let in_bytes = crate::contract::Bytes::new(slot.id, n, Dtype::BF16, 1);
+            let msg = cast_msg(face, slot.id, &out_bytes, n, &w.key)?;
             {
                 let _s = probe.span("cast_enqueue");
-                launch_bf16_to_f16(face, slot.id, &out_bytes, n, &w.key).await?;
+                // **E3 复合口**:搬运 + 发射一次走 —— 两段之间的序 = 设备端事件
+                // (H2D 尾事件 → COMPUTE waitEvent),**零 host 排空**
+                // (原 `face.sync()` 全排空 ≈1.9ms/键)
+                face.upload_and_launch(&in_bytes, chunks, msg)
+                    .await
+                    .map_err(|e| ModelError::Msg(format!("Weight '{}': 复合上传 + 发射 {e}", w.key)))?;
             }
         }
         // ② **超槽键流式**:段 ≤ 槽;输入切片 → 段输出槽 → D2D 贴回目标块中段
@@ -758,21 +764,27 @@ async fn load_direct_device_cast<D: DeviceClient, S: WeightSource + ?Sized>(
             let mut off = 0usize;
             while off < n {
                 let seg = seg_cap.min(n - off);
-                upload_native_range(face, src, &w.key, off, seg, in_slot.id, &mut probe, verify, &mut csum).await?;
-                face.sync().await?; // H2D 落定(cast 读槽)
+                let chunks =
+                    fill_native_chunks(face, src, &w.key, off, seg, &mut probe, verify, &mut csum)
+                        .await?;
                 let seg_out = crate::contract::Bytes::new(seg_slot.id, seg, w.dtype, 1);
-                launch_bf16_to_f16(face, in_slot.id, &seg_out, seg, &w.key).await?;
-                face.sync().await?; // cast 读毕(段输出槽 / 下一段要复写输入槽)
+                let in_bytes = crate::contract::Bytes::new(in_slot.id, seg, Dtype::BF16, 1);
+                let msg = cast_msg(face, in_slot.id, &seg_out, seg, &w.key)?;
+                // 复合:段搬运 + cast 一次走(设备端序);贴回在 COMPUTE 同流,
+                // 与 cast 天然有序;下一段/下一键的输入槽复写由复合口的
+                // **写等读前置等待**(H2D ← COMPUTE 尾)罩住 —— 全程零 host 排空
+                face.upload_and_launch(&in_bytes, chunks, msg)
+                    .await
+                    .map_err(|e| ModelError::Msg(format!("Weight '{}': 段复合 {e}", w.key)))?;
                 face.copy_block_at(&seg_out, 0, &out_bytes, off * w.dtype.size_bytes(), seg * w.dtype.size_bytes())
                     .await
                     .map_err(|e| ModelError::Msg(format!("Weight '{}': 段贴回 {e}", w.key)))?;
-                face.sync().await?; // 贴回读毕(段输出槽下一段复写)
                 off += seg;
             }
         }
     }
-    // 消费者读毕 ⇒ 槽可复用(下一键会再走 acquire 轮转)
-    face.sync().await?;
+    // 槽复用的"消费者读毕"交给了下一键复合口的写等读前置等待;
+    // 装载末 `eval_load` 的上载栅栏负责"全部落定"(host 化读取/校验前)
     probe.done();
     Ok(LoadEntry {
         key: w.key.clone(),
@@ -790,20 +802,22 @@ async fn load_direct_device_cast<D: DeviceClient, S: WeightSource + ?Sized>(
 /// 首元素;≥64MB 自动分块 + 每 4 块/尾一次栅栏 —— cast 臂与重排臂共用的
 /// 上传口(槽是固定块,故目标偏移恒 0;流式的段偏移在源侧)。
 #[allow(clippy::too_many_arguments)]
-async fn upload_native_range<D: DeviceClient, S: WeightSource + ?Sized>(
+/// 原始 bf16 字节分块**填充** pinned 租约(不上传 —— 块表交给复合口一次带走)。
+/// 源元素区间 `[src_off, src_off+len_total)`;每块 = `CHUNK_BYTES` 粒。
+#[allow(clippy::too_many_arguments)]
+async fn fill_native_chunks<D: DeviceClient, S: WeightSource + ?Sized>(
     face: &mut D,
     src: &S,
     key: &str,
     src_off: usize,
     len_total: usize,
-    dst: u64,
     probe: &mut KeyProbe<'_>,
     verify: bool,
     csum: &mut u64,
-) -> Result<(), ModelError> {
+) -> Result<Vec<crate::contract::UpChunk>, ModelError> {
     let esz = Dtype::BF16.size_bytes();
-    let dst_bytes = crate::contract::Bytes::new(dst, len_total, Dtype::BF16, 1);
     let chunk_elems = (CHUNK_BYTES / esz).max(1);
+    let mut chunks = Vec::new();
     let mut off = 0usize;
     while off < len_total {
         let len = chunk_elems.min(len_total - off);
@@ -821,18 +835,59 @@ async fn upload_native_range<D: DeviceClient, S: WeightSource + ?Sized>(
         if verify {
             *csum = fnv1a(&lease.slice_bytes_mut()[..len * esz], *csum);
         }
-        {
-            let _s = probe.span("htod");
-            face.upload_pinned(lease, &dst_bytes, off * esz, len * esz)
-                .await
-                .map_err(|e| ModelError::Msg(format!("Weight '{key}': {e}")))?;
-        }
+        chunks.push(crate::contract::UpChunk {
+            offset_bytes: off * esz,
+            len_bytes: len * esz,
+            lease,
+        });
         off += len;
-        if off.is_multiple_of(chunk_elems * 4) || off >= len_total {
-            face.sync().await?;
-        }
     }
-    Ok(())
+    Ok(chunks)
+}
+
+/// 源 packed 字节分块**填充** pinned 租约(重排臂专用:源是 U32 packed;
+/// `packed_host` = OWL_LOAD_VERIFY 的 host 副本,顺路拷走)。
+async fn fill_packed_chunks<D: DeviceClient, S: WeightSource + ?Sized>(
+    face: &mut D,
+    src: &S,
+    key: &str,
+    raw_elems: usize,
+    probe: &mut KeyProbe<'_>,
+    packed_host: &mut Option<Vec<u8>>,
+) -> Result<Vec<crate::contract::UpChunk>, ModelError> {
+    let chunk_elems = (CHUNK_BYTES / 4).max(1);
+    let mut chunks = Vec::new();
+    let mut off = 0usize;
+    while off < raw_elems {
+        let len = chunk_elems.min(raw_elems - off);
+        let mut lease = {
+            let _s = probe.span("pinned_alloc");
+            face.alloc_pinned(len * 4)
+                .await
+                .map_err(|e| ModelError::Msg(format!("Weight '{key}': {e}")))?
+        };
+        {
+            let _s = probe.span("convert");
+            src.convert_chunk_into_bytes(
+                key,
+                off,
+                len,
+                lease.slice_bytes_mut(),
+                crate::contract::Dtype::U32,
+            )
+            .ok_or_else(|| attribution(src, key, raw_elems))?;
+        }
+        if let Some(ph) = packed_host.as_mut() {
+            ph[off * 4..(off + len) * 4].copy_from_slice(&lease.slice_bytes_mut()[..len * 4]);
+        }
+        chunks.push(crate::contract::UpChunk {
+            offset_bytes: off * 4,
+            len_bytes: len * 4,
+            lease,
+        });
+        off += len;
+    }
+    Ok(chunks)
 }
 
 /// 设备重排臂(2026-10-01 AWQ 装载提速):源供**原始 packed** 字节
@@ -874,39 +929,8 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
             ))
         })?;
     let raw = crate::contract::Bytes::new(raw_slot.id, raw_elems, crate::contract::Dtype::U32, 2);
-    {
-        let chunk_elems = (CHUNK_BYTES / 4).max(1);
-        let mut off = 0usize;
-        while off < raw_elems {
-            let len = chunk_elems.min(raw_elems - off);
-            let mut lease = {
-                let _s = probe.span("pinned_alloc");
-                face.alloc_pinned(len * 4)
-                    .await
-                    .map_err(|e| ModelError::Msg(format!("Weight '{}': {e}", w.key)))?
-            };
-            {
-                let _s = probe.span("convert");
-                src.convert_chunk_into_bytes(w.key.as_str(), off, len, lease.slice_bytes_mut(), crate::contract::Dtype::U32)
-                    .ok_or_else(|| attribution(src, &w.key, raw_elems))?;
-            }
-            if let Some(ph) = &mut packed_host {
-                ph[off * 4..(off + len) * 4].copy_from_slice(&lease.slice_bytes_mut()[..len * 4]);
-            }
-            {
-                let _s = probe.span("htod");
-                face.upload_pinned(lease, &raw, off * 4, len * 4)
-                    .await
-                    .map_err(|e| ModelError::Msg(format!("Weight '{}': {e}", w.key)))?;
-            }
-            off += len;
-            // upload_pinned 异步语义契约:计算读前必 sync(load_direct 同款
-            // 纪律:每 4 块 + 尾;repack 核读 raw 前无栅栏 = 竞态读半截)
-            if off.is_multiple_of(chunk_elems * 4) || off >= raw_elems {
-                face.sync().await?;
-            }
-        }
-    }
+    // 源 packed 分块填租约(不上传;序交给复合口 —— E3 起不再逐键 host 排空)
+    let chunks = fill_packed_chunks(face, src, &w.key, raw_elems, &mut probe, &mut packed_host).await?;
     // 2) 重排核(语义拾取:driver::resolve(OpEnv 必传,被动律);
     //    grid/block 契约公式住 driver(load::ct_repack))
     let out_block = face
@@ -944,9 +968,10 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
             shared_mem: pick.shape.smem,
             out_elems: n,
         };
-        face.launch(msg)
+        // **E3 复合口**:搬运 + 重排一次走(写等读 + 读等写都是设备端事件)
+        face.upload_and_launch(&raw, chunks, msg)
             .await
-            .map_err(|e| ModelError::Msg(format!("Weight '{}': repack launch {e}", w.key)))?;
+            .map_err(|e| ModelError::Msg(format!("Weight '{}': 复合重排 {e}", w.key)))?;
         // 端到端校验(OWL_LOAD_VERIFY;前 4 层):GPU 重排输出 vs CPU fused 逐位
         if let Some(ph) = &packed_host {
             static VERIFY_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -973,8 +998,8 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
             }
         }
     }
-    // 3) 收位:一次栅栏(重排核读毕 ⇒ 槽可复用;目标块就绪)
-    face.sync().await?;
+    // 3) 收位:槽复用交给下一键复合口的写等读前置等待;全部落定由装载末
+    //    上载栅栏负责(host 读取/校验/交付前)
     probe.done();
     Ok(LoadEntry {
         key: w.key.clone(),
