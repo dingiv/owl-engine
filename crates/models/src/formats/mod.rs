@@ -34,7 +34,7 @@ pub(crate) fn split_qkvz(base: &str) -> Option<(String, String)> {
 }
 
 pub use awq::AwqSource;
-pub use kind::{detect, CheckpointKind, Detection};
+pub use kind::{detect, CheckpointKind, Detection, QuantScheme};
 pub use load::eval_load;
 pub use safetensors::SafeTensorsSource;
 pub use w4a16::{marlin_eligible, marlin_n_pack, W4A16Source};

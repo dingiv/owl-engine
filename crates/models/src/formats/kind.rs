@@ -33,6 +33,14 @@ pub enum CheckpointKind {
     AwqGemm,
 }
 
+/// 量化**方案**词表(config 实测分族;`quant_method` 不足以分族 —— 两者同为
+/// compressed-tensors,见 `load::quant_family`)
+pub type QuantScheme = &'static str;
+/// g32 + 非对称(+zp;cyankiwi AWQ-INT4 实测 group_size=32/symmetric=false/zp int8)
+pub const QUANT_G32_ASYM: QuantScheme = "g32-asym";
+/// g128 + 对称(llm-compressor W4A16 产物)
+pub const QUANT_G128_SYM: QuantScheme = "g128-sym";
+
 /// 探测结论(事实面:命中哪族 + 条目规模 + 原生 dtype 分布)
 #[derive(Debug, Clone)]
 pub struct Detection {

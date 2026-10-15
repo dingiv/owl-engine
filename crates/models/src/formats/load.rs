@@ -67,25 +67,60 @@ impl LoadOpts {
 /// **通用装载入口**(解释器化 L2 第一段):`Loadable::layout` 声明 × 起点源
 /// ⇒ 物化。真正的"起点侧"通用化(按 [`CheckpointKind`] 自动开源)见
 /// [`load_from_dir`];本函数是纯加法(旧具名函数仍走 `eval_load`)。
-pub async fn load_component<T, D, S>(
+pub async fn load_component<T, D>(
     face: &mut D,
     comp: &T,
-    src: &S,
+    src: &dyn WeightSource,
     opts: LoadOpts,
 ) -> Result<crate::module::LoadManifest, ModelError>
 where
     T: crate::module::Loadable,
     D: DeviceClient,
-    S: WeightSource + ?Sized,
 {
+    // `&dyn WeightSource`(trait 全程对象安全)⇒ 起点族可在同一条通用路上换源
     eval_load(comp, face, src, &opts.ctx()).await
+}
+
+/// 量化**方案**判据:`config.json:quantization_config.config_groups.group_0.weights`
+/// 的 `(group_size, symmetric)` —— **不是 `quant_method`**(实测:cyankiwi
+/// AWQ-INT4 与 llm-compressor W4A16 产物**同为** `compressed-tensors`,
+/// 分族靠方案:g32-asym+zp ⇒ awq.rs;g128-sym ⇒ w4a16.rs)。
+///
+/// 纯读零猜测;未接方案**响亮拒**(带着实测到的 group_size/symmetric)。
+fn quant_family(dir: &Path) -> Result<crate::formats::kind::QuantScheme, ModelError> {
+    use crate::formats::kind::{QuantScheme, QUANT_G32_ASYM, QUANT_G128_SYM};
+    let raw = owl_shared::file_loader::read(&dir.join("config.json"))
+        .map_err(|e| ModelError::Msg(format!("load_from_dir: 读 config.json: {e}")))?;
+    let v: serde_json::Value = serde_json::from_slice(&raw)
+        .map_err(|e| ModelError::Msg(format!("load_from_dir: config.json 解析: {e}")))?;
+    let w = v
+        .get("quantization_config")
+        .and_then(|q| q.get("config_groups"))
+        .and_then(|g| g.get("group_0"))
+        .and_then(|g| g.get("weights"))
+        .ok_or_else(|| {
+            ModelError::Msg(
+                "load_from_dir: 量化检查点缺 config_groups.group_0.weights(不许猜方案)".into(),
+            )
+        })?;
+    let group_size = w.get("group_size").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+    let symmetric = w.get("symmetric").and_then(|x| x.as_bool()).unwrap_or(false);
+    match (group_size, symmetric) {
+        (32, false) => Ok(QUANT_G32_ASYM),
+        (128, true) => Ok(QUANT_G128_SYM),
+        other => Err(ModelError::Msg(format!(
+            "load_from_dir: 量化方案 (group_size={}, symmetric={}) 未接源族(响亮拒)",
+            other.0, other.1
+        ))),
+    }
 }
 
 /// **起点开箱**:目录 → (探测格式, 源) —— 起点轴收口(设计 §2.2)。
 ///
-/// v1 覆盖裸 safetensors 族;量化族(`PackQuantized`/`AwqGemm`)的**源选择**
-/// 需再读 `quantization_config`(awq vs compressed-tensors),留 L2 第二段
-/// —— 此处**响亮拒**,不许静默挑源。
+/// 三族全接:
+/// - `SafeTensors` → [`SafeTensorsSource`];
+/// - `PackQuantized` / `AwqGemm` → 按 `quant_method` 选族
+///   (`compressed-tensors` → [`W4A16Source`];`awq` → [`AwqSource`];其余响亮拒)。
 pub async fn load_from_dir<T, D>(
     dir: &Path,
     face: &mut D,
@@ -96,15 +131,28 @@ where
     T: crate::module::Loadable,
     D: DeviceClient,
 {
+    use crate::formats::kind::CheckpointKind;
     let det = crate::formats::kind::detect(dir)?;
     match det.kind {
-        crate::formats::kind::CheckpointKind::SafeTensors => {
+        CheckpointKind::SafeTensors => {
             let src = crate::formats::safetensors::SafeTensorsSource::open_dir(dir)?;
             load_component(face, comp, &src, opts).await
         }
-        other => Err(ModelError::Msg(format!(
-            "load_from_dir: 起点格式 {other:?} 的源选择未接(L2 第二段;暂用既有具名装载函数)"
-        ))),
+        CheckpointKind::PackQuantized | CheckpointKind::AwqGemm => {
+            match quant_family(dir)? {
+                crate::formats::kind::QUANT_G32_ASYM => {
+                    let src = crate::formats::awq::AwqSource::open_dir(dir)?;
+                    load_component(face, comp, &src, opts).await
+                }
+                crate::formats::kind::QUANT_G128_SYM => {
+                    let src = crate::formats::w4a16::W4A16Source::open_dir(dir)?;
+                    load_component(face, comp, &src, opts).await
+                }
+                other => Err(ModelError::Msg(format!(
+                    "load_from_dir: 量化方案 {other} 未接源族(响亮拒,不许猜)"
+                ))),
+            }
+        }
     }
 }
 
@@ -1034,5 +1082,62 @@ mod generic_entry_tests {
         assert_eq!(a.len(), b.len(), "清单条目数");
         assert_eq!(a, b, "键/dtype/形状逐条相等");
         eprintln!("[L2] 通用入口 ≡ 具名装载:{} 条逐项相等 ✓", a.len());
+    }
+
+    /// **量化族通用入口**:27B AWQ 经 `load_from_dir` 与 `AwqSource` 直开同清单
+    /// (门控真检查点存在;CPU face 不开设备重排 ⇒ `device_repack = Some(false)`)
+    #[tokio::test]
+    async fn generic_entry_covers_quantized_family() {
+        let dir = std::path::PathBuf::from(
+            std::env::var("OWL_CKPT_27B_AWQ")
+                .unwrap_or_else(|_| "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4".into()),
+        );
+        if !dir.is_dir() {
+            eprintln!("skip: 27B AWQ 检查点不在");
+            return;
+        }
+        // AWQ 源产 U32 marlin 块 ⇒ **必须 GPU face**(CpuFace 只认 F32/F16);
+        // 且 27B AWQ 整装 ≈10G+ ⇒ 需 ≥24G 卡(20G 实测 layer40 OOM)。
+        // 独立门 `OWL_L2_AWQ=1`(本机跑法:`OWL_L2_AWQ=1 OWL_TEST_DEVICE=<3090>`)。
+        if std::env::var("OWL_L2_AWQ").ok().as_deref() != Some("1") {
+            eprintln!("skip: OWL_L2_AWQ=1 未开(27B AWQ 整装需 ≥24G 卡)");
+            return;
+        }
+        if !crate::testkit::gpu_enabled() {
+            crate::testkit::skip_note();
+            return;
+        }
+        let spec = crate::specs::qwen35::qwen3_8_27b();
+        let mk = || {
+            crate::model::Model::new(
+                &spec,
+                Qwen35Convention::new("model.language_model"),
+                crate::module::QuantPlan::W4A16,
+                crate::module::QuantPlan::F16,
+            )
+        };
+        let mut face = crate::testkit::gpu_client().await;
+        let opts = LoadOpts {
+            dtype: crate::contract::Dtype::F16,
+            device_repack: Some(true), // 生产档(设备 marlin 重排)
+            verify: false,
+            debug_tap: false,
+        };
+        let src = crate::formats::awq::AwqSource::open_dir(&dir).expect("awq 源");
+        let old = eval_load(&mk(), &mut face, &src, &opts.ctx()).await.expect("eval_load(awq)");
+        let new = load_from_dir(&dir, &mut face, &mk(), opts).await.expect("load_from_dir(awq)");
+        let norm = |m: &LoadManifest| {
+            let mut v: Vec<(String, String, Vec<usize>)> = m
+                .entries()
+                .iter()
+                .map(|e| (e.key.clone(), format!("{:?}", e.dtype), e.shape.clone()))
+                .collect();
+            v.sort();
+            v
+        };
+        let (a, b) = (norm(&old), norm(&new));
+        assert_eq!(a.len(), b.len(), "量化族清单条目数");
+        assert_eq!(a, b, "量化族键/dtype/形状逐条相等");
+        eprintln!("[L2] 量化族通用入口 ≡ AwqSource 直开:{} 条逐项相等 ✓", a.len());
     }
 }
