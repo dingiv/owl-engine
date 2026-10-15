@@ -190,14 +190,26 @@ pub(crate) fn causal_mask_words(t: usize) -> Vec<u32> {
     v
 }
 
-/// **B2:桶 padding 比护栏**(2026-10-15 实测定档)
+/// **B2:桶 padding 比护栏**(B3 实测定档 2026-10-16;设计 §4.7g)
 ///
-/// 目测地:`pad_rows = t_pad − t_real` 就是 GEMM 白算的行数(≈0.78ms/行 @27B),
-/// 而图省下的是"固定段"(host 命令税 + 首调税,本 build 实测 ≈20–30ms)。
-/// 实测交叉点:pad 29 行仍净赢(−9.4ms)、pad 42 行净输(+5.4ms)、pad 64 行净输(+34ms)
-/// ⇒ 阈值取**一个最小桶宽**(32 行,27B ≈25ms 白算 ≈ 固定节余)。
-/// 作用:①`t512` 单桶档不再自伤(33-token chunk 不进 512 桶)②命中率/白算可预算。
-pub(crate) const BUCKET_PAD_MAX_ROWS: usize = 32;
+/// 判据面:图路每 chunk 省下的是**固定节余 H**(短 ctx 三臂实测 ≈2.3–4.8ms),
+/// 而白算成本 = `pad_rows × s`,斜率 s 随 ctx 增长(t128 桶 **0.28**ms/行 /
+/// t256 **0.67** / t512 **0.57**;由 eager 臂同桶内长度差直接量得)
+/// ⇒ 每桶盈亏平衡 ≈ H/s ⇒ **{t32:16, t64:16, t128:12, t256:4, t512:4}**。
+///
+/// 旧值(= 单档 32 行)按"固定段 20–30ms + 0.78ms/行"估,已被 B3 推翻:
+/// **pad=32 实测净输 +12.9…+15.0ms**(224→t256 / 480→t512)、pad=29 ≈ 0。
+/// 长提示 chunk 恒 pad=0 ⇒ 收紧不影响 std 五点收益(实测 +1.2…+2.9%)。
+/// 作用:①`t512` 单桶档不再自伤 ②命中率/白算可预算;t32/t64 桶(无直接实测)
+/// 取 16 行(行成本更低,盈亏平衡上移)。
+pub(crate) const fn bucket_pad_max_rows(t_pad: usize) -> usize {
+    match t_pad {
+        32 | 64 => 16,
+        128 => 12,
+        256 | 512 => 4,
+        _ => 4,
+    }
+}
 
 /// 让位/护栏的**一次 warn** 闸(响亮告知,不静默;每类一条)
 static BUCKET_BYPASS_WARNED: std::sync::atomic::AtomicBool =
@@ -252,17 +264,17 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
             return Ok(None);
         }
-        // ── **B2 padding 护栏**(2026-10-15 实测定档;见 [`BUCKET_PAD_MAX_ROWS`])──
+        // ── **B2 padding 护栏**(B3 实测定档;见 [`bucket_pad_max_rows`])──
         let pad_rows = t_pad.saturating_sub(t);
-        if pad_rows > BUCKET_PAD_MAX_ROWS {
+        let pad_max = bucket_pad_max_rows(t_pad);
+        if pad_rows > pad_max {
             mcnt("prefill.bucket.bypass.pad", 1);
             mcnt("prefill.bucket.pad_rows_skipped", pad_rows as u64);
             if !BUCKET_PAD_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 owl_shared::log_warn!(
                     "prefill-graph",
-                    "桶 padding 超比跳过(t_pad={t_pad} t_real={t} pad={pad_rows} 行 > {});\
-                     该 chunk 走 eager(白算 > 固定节余)",
-                    BUCKET_PAD_MAX_ROWS
+                    "桶 padding 超比跳过(t_pad={t_pad} t_real={t} pad={pad_rows} 行 > {pad_max});\
+                     该 chunk 走 eager(白算 > 固定节余)"
                 );
             }
             return Ok(None);
