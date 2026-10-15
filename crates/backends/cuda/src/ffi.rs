@@ -37,26 +37,11 @@ pub use cudarc::driver::result::stream::{
     end_capture as stream_end_capture, is_capturing as stream_is_capturing,
 };
 
-/// **事件原语**(E1 三流事件序:`docs/arch/三流事件序-设计与迁移.md`)。
-///
-/// 准入铁律:只取句柄(零分配、零 host 阻塞),证据:cudarc 0.19.9
-/// result.rs:1224(create)/1238(record)/1288(synchronize)/1302(destroy)。
-/// `create` 是 safe 函数(需线程已 bind 当前上下文 —— 只允许 `GpuCtx::new`
-/// 在 server 线程调用);其余为 unsafe raw 调用。
-/// 纪律:事件**只住 server 线程**(A3 同步隔离),客户端永不可见。
-pub use cudarc::driver::result::event::{
-    create as event_create, destroy as event_destroy, record as event_record,
-    synchronize as event_synchronize,
-};
-
 /// 裸 FFI(唯一低层出口;逐项白名单)
 pub mod sys {
     // driver 侧:指针类型 + 显式拷贝(tensor 装载/回读)
     pub use cudarc::driver::sys::{
         CUdeviceptr, cuMemcpyDtoH_v2, cuMemcpyHtoD_v2, cuMemcpyDtoDAsync_v2, cuMemsetD8Async, cuMemsetD16Async, cuMemsetD32Async,
-        // E1 事件序:句柄类型 + 创建标志(证据:cudarc 0.19.9 sys/mod.rs:423 CUevent /
-        // :43 CUevent_flags(别名) / :3058 CUevent_flags_enum)
-        CUevent, CUevent_flags,
         // graph 捕获(M1 归入 graph 治理层)
         CUgraphInstantiate_flags, CUstreamCaptureMode,
         // 图实例化零旗标入口(S1;见上方 graph 定谳注释)

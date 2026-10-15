@@ -34,7 +34,7 @@ use crate::command::{Ack, Command};
 use crate::launch::issue_launch;
 use crate::state::{DeviceSelector, GpuCtx, KernelCache, Staging};
 use owl_iface::contract::{Arg, Bytes, Dtype, LaunchMsg};
-use crate::state::{StreamId, STREAM_COMPUTE, STREAM_D2H, STREAM_H2D};
+use crate::state::{STREAM_COMPUTE, STREAM_D2H, STREAM_H2D};
 use owl_iface::contract::ModelError;
 use std::sync::mpsc;
 
@@ -513,8 +513,6 @@ impl GpuServer {
                     let _ = s.synchronize();
                 }
             }
-            // E1:事件句柄在流栅栏之后销毁(收摊唯一出口)
-            ctx.destroy_events();
         }
         drop(self.dispatch.take());
     }
@@ -531,32 +529,6 @@ impl GpuServer {
     // dispatch:issue 相(全非阻塞;GPU API 提交进流即返回)
     // ======================================================================
 
-    /// 命令的**目标流**(E1 记账表:哪些命令在 GPU 上落活、落在哪条流)。
-    ///
-    /// 与 `trace_entry_of` 的流标签同表(那里是给 trace 看的字符串;本表是
-    /// 给事件记账看的 StreamId)。**扩充命令面时必须同步**(E2 复合命令按
-    /// 自身语义定流)。
-    fn cmd_stream(c: &Command) -> Option<StreamId> {
-        match c {
-            // H2D 流:一切 host→device 搬运
-            Command::Htod { .. }
-            | Command::HtodChunk { .. }
-            | Command::HtodChunks { .. }
-            | Command::UploadPinned { .. } => Some(STREAM_H2D),
-            // COMPUTE 流:发射 / 清零分配 / 设备内拷贝 / 图回放
-            Command::Launch { .. }
-            | Command::Alloc { .. }
-            | Command::MemsetZero { .. }
-            | Command::CopyBlock { .. }
-            | Command::CopyBatch { .. }
-            | Command::GraphLaunch { .. } => Some(STREAM_COMPUTE),
-            // D2H 流:一切 device→host 回读
-            Command::Dtoh { .. } => Some(STREAM_D2H),
-            // 无 GPU 活/图控制/同步/宿主面:不记账
-            _ => None,
-        }
-    }
-
     fn dispatch(&mut self, cmd: Command) {
         // 逐命令计时(OWL_SRV_TIMING 门控;卸载时汇总 —— server 侧分相,
         // 与客户端 [load] 探针互补:handler 真实执行时间,含阻塞段)
@@ -566,43 +538,20 @@ impl GpuServer {
         } else {
             (None, None)
         };
-        // E1:本命令的落流(记账用;必须在 dispatch_inner 吞掉 cmd 之前取)
-        let sid = Self::cmd_stream(&cmd);
         self.dispatch_inner(cmd);
-        // **E1 纯记账**:把本命令的完成点记到该流尾事件(不等待任何东西;
-        // 序消费在 E2/E3)。捕获期自动跳过(见 `record_tail`)。
-        if let Some(sid) = sid {
-            let t_ev = if timing { Some(std::time::Instant::now()) } else { None };
-            if let Err(e) = self.ctx_mut().record_tail(sid) {
-                // 记账面失败不改命令语义:响亮但不改回执
-                self.sink.logf(
-                    owl_shared::log::LVL_WARN,
-                    "ev",
-                    format_args!("尾事件记账失败(stream {sid})—— 不影响本命令: {e}"),
-                );
-            }
-            if let Some(t1) = t_ev {
-                self.timing_acc("srv.ev_record", t1.elapsed());
-            }
-        }
         if let (Some(t0), Some(name)) = (t0, name) {
             let dt = t0.elapsed();
-            self.timing_acc(name, dt);
+            let slot = if let Some(pos) = self.timings.iter().position(|(n, ..)| *n == name) {
+                &mut self.timings[pos]
+            } else {
+                self.timings.push((name, 0u64, 0u128, 0u128));
+                let last = self.timings.len() - 1;
+                &mut self.timings[last]
+            };
+            slot.1 += 1;
+            slot.2 += dt.as_nanos();
+            slot.3 = slot.3.max(dt.as_nanos());
         }
-    }
-
-    /// 分相累加(count / total / max;OWL_SRV_TIMING 汇总表的唯一累加口)
-    fn timing_acc(&mut self, name: &'static str, dt: std::time::Duration) {
-        let slot = if let Some(pos) = self.timings.iter().position(|(n, ..)| *n == name) {
-            &mut self.timings[pos]
-        } else {
-            self.timings.push((name, 0u64, 0u128, 0u128));
-            let last = self.timings.len() - 1;
-            &mut self.timings[last]
-        };
-        slot.1 += 1;
-        slot.2 += dt.as_nanos();
-        slot.3 = slot.3.max(dt.as_nanos());
     }
 
     /// 命令名(分相计时标签)。**单一真源 = `Command::kind()`**
