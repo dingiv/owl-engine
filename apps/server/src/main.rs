@@ -71,7 +71,7 @@ async fn main() {
     };
     if args.list_flavors {
         eprintln!("可用 flavor:");
-        for n in owl_shared::config::flavor_names() {
+        for n in owl_shared::assets::preset_names() {
             eprintln!("  {n}");
         }
         return;
@@ -124,6 +124,58 @@ async fn main() {
     // metrics 全局仓(E5-M5 spec 分相探针消费面;/debug/metrics 查询;
     // 重复 init = AlreadyInit 保首个,loader 侧 init 幂等兼容)
     let _ = owl_shared::metrics::init_metrics(owl_shared::metrics::MetricsStore::new());
+
+    // ── 礼仪启动 + 优雅关停(2026-10-16)────────────────────────────────
+    // 一卡一锁(文件名 = 卡 UUID):被占 ⇒ 立即响亮拒绝(不抢占、不 OOM);
+    // 退出路径双保险:① 正常返回 ⇒ LockGuard::Drop ② 信号 ⇒ release(见下)。
+    let _gpu_lock = {
+        let port = config
+            .bind
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(0);
+        let info = owl_shared::gpu_lock::LockInfo::new(&config.device_uuid, port, None);
+        match owl_shared::gpu_lock::LockGuard::acquire(&info) {
+            Ok(g) => g,
+            Err(e) => {
+                owl_shared::log_error!("boot", "卡锁失败(拒绝启动): {e}");
+                eprintln!("[boot] 卡锁失败(拒绝启动): {e}");
+                std::process::exit(2);
+            }
+        }
+    };
+    owl_shared::log_info!(
+        "boot",
+        "已锁卡 {} (pid {};停服 = kill -TERM <pid>,自动清锁)",
+        config.device_uuid,
+        std::process::id()
+    );
+    // 信号:SIGTERM/SIGINT ⇒ 清锁 + 有序退出(`process::exit` 不跑 Drop ⇒ 显式 release)
+    {
+        let lock_path = _gpu_lock.path().to_path_buf();
+        let uuid = config.device_uuid.clone();
+        tokio::spawn(async move {
+            let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    owl_shared::log_warn!("boot", "SIGTERM 监听失败(优雅关停降级): {e}");
+                    return;
+                }
+            };
+            let mut sigint = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+                Ok(s) => s,
+                Err(e) => {
+                    owl_shared::log_warn!("boot", "SIGINT 监听失败(优雅关停降级): {e}");
+                    return;
+                }
+            };
+            tokio::select! { _ = sigterm.recv() => {}, _ = sigint.recv() => {} }
+            owl_shared::log_info!("boot", "收到停止信号 ⇒ 优雅关停(释放卡锁 {uuid} + 显存)");
+            owl_shared::gpu_lock::release(&lock_path);
+            std::process::exit(0);
+        });
+    }
     // 性能框架分级(docs/arch/perf-framework.md §一;off = 零成本基线臂)
     owl_shared::metrics::set_level(config.perf_level);
     owl_shared::log_info!("boot", "perf level = {}(perf_build={};无该 feature 的 release 里钩子空展开)",

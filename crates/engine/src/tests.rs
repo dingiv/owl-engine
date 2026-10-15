@@ -44,7 +44,7 @@ fn gpu_ordinal() -> Option<usize> {
 async fn cpu_construct_and_load(cfg: &OwlConfig) {
     let mut engine = Engine::on(
         EngineConfig {
-            device_ordinal: cfg.runtime.device,
+            device_ordinal: cfg.runtime.test_device.or(cfg.runtime.device_ordinal).unwrap_or(0),
             max_seq_tokens: cfg.runtime.max_seq,
             prefill_chunk: cfg.runtime.prefill_chunk,
             knobs: EngineKnobs::from_config(cfg),
@@ -64,7 +64,7 @@ async fn cpu_construct_and_load(cfg: &OwlConfig) {
 async fn cpu_incremental_decode_multibyte(cfg: &OwlConfig) {
     let mut engine = Engine::on(
         EngineConfig {
-            device_ordinal: cfg.runtime.device,
+            device_ordinal: cfg.runtime.test_device.or(cfg.runtime.device_ordinal).unwrap_or(0),
             max_seq_tokens: cfg.runtime.max_seq,
             prefill_chunk: cfg.runtime.prefill_chunk,
             knobs: EngineKnobs::from_config(cfg),
