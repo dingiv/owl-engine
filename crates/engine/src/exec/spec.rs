@@ -85,6 +85,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         };
         // XQA 页表:在借 self.graphs.verify 之前算好(自 sessions 取真块链)
         let xqa_pt_v = self.xqa_pt_of(sid);
+        // FI 断点臂的宿主标量槽(self.graphs 的可变借用前取好,同 xqa_pt_v 纪律)
+        let fi_ctx_cell = self.graphs.verify_fi_ctx();
         let (ids, hidden, records, hidden_owned, row_logits) =
             if let Some(vg) = self.graphs.verify.as_mut() {
             let ts = std::time::Instant::now();
@@ -122,21 +124,53 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // `.max(1)` 与声明端同式 —— "无 XQA 面"时槽仍存在(= 1 元素),
             // 避免零长写(挂账 #7)。
             let xqa_sem_v: Vec<f32> = vec![0.0; self.pool.xqa_sem_n().max(1)];
-            let t_step_v = std::time::Instant::now();
-            vg.step(&[
+            // **FI 断点臂**的逐轮值(该臂未开 ⇒ 空,不写槽):
+            // ① 宿主标量槽 `ctx_total`(= 本轮 kv 总长;plan 的 key)
+            // ② 表四件套(q_cu/indices/indptr/last_len;u32 位型过线)
+            let page_fi = self.pool.page;
+            let ctx_total_fi = pos + block.len();
+            let (fi_q_cu_v, fi_idx_v, fi_indptr_v, fi_ll_v): (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) =
+                if let Some(cell) = fi_ctx_cell.as_ref() {
+                    cell.store(ctx_total_fi, std::sync::atomic::Ordering::Relaxed);
+                    let nb_used = ctx_total_fi
+                        .div_ceil(page_fi)
+                        .min(bt_chain.len())
+                        .max(1);
+                    let mut idx = vec![0f32; self.pool.nb];
+                    for (i, b) in bt_chain.iter().take(nb_used).enumerate() {
+                        idx[i] = f32::from_bits(*b);
+                    }
+                    (
+                        vec![0.0, f32::from_bits(block.len() as u32)],
+                        idx,
+                        vec![0.0, f32::from_bits(nb_used as u32)],
+                        vec![f32::from_bits((ctx_total_fi - (nb_used - 1) * page_fi) as u32)],
+                    )
+                } else {
+                    (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                };
+            let gdn_slot_v1 = [gdn_slot as f32];
+            let mut ins: Vec<(&str, &[f32])> = vec![
                 ("ids", ids_f.as_slice()),
                 ("pos", pos_f.as_slice()),
                 ("kv_slots", slots_f.as_slice()),
                 ("kv_lens", lens_f.as_slice()),
-                ("gdn_slot", &[gdn_slot as f32]),
+                ("gdn_slot", gdn_slot_v1.as_slice()),
                 ("bt8", bt8_f.as_slice()),
                 ("xqa_seq", xqa_seq_v.as_slice()),
                 ("xqa_sem", xqa_sem_v.as_slice()),
                 // XQA 页表:会话真链(槽在 verify 图无条件声明;
                 // 不写 = 留着恒等链 = 读到别家 KV —— §7.6)
                 ("xqa_pt", xqa_pt_v.as_slice()),
-            ])
-            .await?;
+            ];
+            if !fi_q_cu_v.is_empty() {
+                ins.push(("fi_q_cu", fi_q_cu_v.as_slice()));
+                ins.push(("fi_indices", fi_idx_v.as_slice()));
+                ins.push(("fi_indptr", fi_indptr_v.as_slice()));
+                ins.push(("fi_last_len", fi_ll_v.as_slice()));
+            }
+            let t_step_v = std::time::Instant::now();
+            vg.step(&ins).await?;
             let t_read_v = std::time::Instant::now();
             let tok_f = vg.read_output_f32("tok").await?;
             // 诊断(perf 会话排查用;`OWL_PW_DUMP_TOK=1`):verify 行 0..7 的

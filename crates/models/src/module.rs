@@ -57,6 +57,18 @@ pub struct FiPrefillCtx<'a> {
     pub last_len: &'a TensorOps,
 }
 
+/// **FI 断点面**(piecewise verify;`ctx.attn_fi` 在场 = 本树要把 FI 核移出图)。
+///
+/// 格子 = **宿主标量槽**:FI 的 plan key 含 `ctx_total`(每轮随 ctx 长),
+/// 烘死在节点里就只对一个 ctx 有效 ⇒ 引擎逐轮写这个 atomic,
+/// 驱动件在**回放期**把它补进核的契约槽(见 `interpreters::BreakDecl`)。
+/// 零设备流量、零 D2H。
+#[derive(Clone)]
+pub struct AttnFiBreak {
+    /// 每轮 `ctx_total`(= 本轮 kv 总长);引擎在 step 前写
+    pub ctx_total: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
 pub struct ForwardCtx<'a> {
     /// 本步 token 数(decode = 1;prefill = 块长)
     pub tokens: usize,
@@ -133,6 +145,8 @@ pub struct ForwardCtx<'a> {
     /// `docs/piecewise-断点图-设计与实现.md`)。None = 非 piecewise
     /// (一次 `is_some()` 判,热路径零开销)。
     pub attn_break: Option<std::rc::Rc<std::cell::RefCell<Vec<crate::interpreters::BreakDecl>>>>,
+    /// **FI 断点面**(piecewise verify;None = 本树不换 FI 臂)
+    pub attn_fi: Option<AttnFiBreak>,
 }
 
 impl<'a> ForwardCtx<'a> {
@@ -163,6 +177,7 @@ impl<'a> ForwardCtx<'a> {
             xqa: None,
             gdn_tap: None,
             attn_break: None,
+            attn_fi: None,
         }
     }
 
@@ -198,6 +213,7 @@ impl<'a> ForwardCtx<'a> {
             xqa: None,
             gdn_tap: None,
             attn_break: None,
+            attn_fi: None,
         }
     }
 
@@ -228,6 +244,7 @@ impl<'a> ForwardCtx<'a> {
             xqa: None,
             gdn_tap: None,
             attn_break: None,
+            attn_fi: None,
         }
     }
 
@@ -262,6 +279,7 @@ impl<'a> ForwardCtx<'a> {
             xqa: None,
             gdn_tap: None,
             attn_break: None,
+            attn_fi: None,
         }
     }
 
@@ -299,6 +317,7 @@ impl<'a> ForwardCtx<'a> {
             xqa: None,
             gdn_tap: None,
             attn_break: None,
+            attn_fi: None,
         }
     }
 
@@ -336,6 +355,7 @@ impl<'a> ForwardCtx<'a> {
             xqa: None,
             gdn_tap: None,
             attn_break: None,
+            attn_fi: None,
         }
     }
 
@@ -381,6 +401,7 @@ impl<'a> ForwardCtx<'a> {
             xqa: None,
             gdn_tap: None,
             attn_break: None,
+            attn_fi: None,
         }
     }
 }

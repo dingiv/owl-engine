@@ -397,3 +397,57 @@ OWL_GATE_PIECEWISE=1 OWL_GATE_XQA=1 OWL_E2E_ONLY=dflash2_identity cargo test ...
 - **自检门要能看 NaN**(首版 `max|Δ|>1e-3` 对 NaN 全盲),且**在会改状态的模型上**
   它会把"重跑漂移"混进差异(GDN conv/rec 原地递推:两臂各跑一遍 ⇒ 状态推进两遍 ⇒ tap 必偏)
   ⇒ 它是**分诊器**不是等价门;等价门要用 ③/④ 那种"单变量、单轮、逐位"的口径。
+
+### 11.6 ✅ **P3 换装 FI 断点臂**(2026-10-16 凌晨;V1b 达成)
+
+三件(全部落在 perf worktree;开关 `dispatch.verify_fi` + `verify_piecewise`,**缺省关**):
+1. **FI 四件套走图输入槽**(`fi_q_cu/fi_indices/fi_indptr/fi_last_len`;init 与占位 ctx_total
+   = depth1 自洽,nb_pages=ceil(T/page)=1)+ 槽→**U32 视图**(算子准入按声明 dtype 校验输入,
+   糊 f32 叶会被拒:实测"q_cu 期望 U32 实得 F32");
+2. **层侧 FI 断点登记**:`fi_core_node()` 抽成单一拼写点(prefill 主臂与断点共用),
+   `paged_prefill_fi_output` 里按 **宿主标量槽** 登记(`FI_CTX_TOTAL_ARG = 1`,契约槽序 =
+   `client::flashinfer::PARSE_SLOTS`)。⚠️ 必须**只有**这一条登记:同时留旧的静态登记
+   ⇒ 33 段/32 断点(每个核跑两遍;实测 32k 轮时 97ms ↔ 16 断点 48ms);
+3. **引擎逐轮写值**(`exec/spec.rs`):`cell.store(pos + rows)` + 四件套(页链/indptr/last_len
+   全部 u32 位型过线);`GraphFleet::verify_fi_ctx()` 是唯一取用处(与 `xqa_pt_v` 同纪律:
+   在 `self.graphs` 可变借用前取好)。
+
+**真机判据**(27B + fp8 + greedy/dumb;`perf-ctxladder-27b{-fi}.toml`;同一 prompt/同一二进制):
+
+| ctx | 臂 | **轮时 ms/轮** | verify read | prefill t/s |
+|---:|---|---:|---:|---:|
+| 8192 | base(XQA 图内) | 52.81 | 36.70 | 1300.9 |
+| 8192 | **FI 断点** | **48.64 (−7.9%)** | **22.38** | 1304.7 |
+| 32768 | base | 69.27 | 53.12 | 1142.0 |
+| 32768 | **FI 断点** | **48.41 (−30.1%)** | **21.65** | 1145.0 |
+
+⇒ ① **设计文档 §6 的终局判据(32k 轮时 ≤52ms,换臂后 ≤50)达标**(48.4);
+② **轮时对 ctx 变平**(8k 48.6 / 32k 48.4)—— 长 ctx 衰减的根因(verify 图里的 ctx 依赖 XQA)消失;
+③ prefill 不动(±0.3%);④ 功能与基线逐位一致(tok/hid/文本)。
+
+**转正待办(需用户拍板)**:`spec-dflash` 档加 `verify_piecewise = true` + `verify_fi = true`
+(+ `verify_xqa/v2` 关)即进生产;decode(T=1)仍是 XQA(V1c 可同法换,断点在 session 图)。
+
+### 11.7 转正(2026-10-16):生产档换装 FI 断点臂 + 红线门接线
+
+**① 生产档**
+- `spec-dflash` flavor(`shared/config.rs`,**committed**):`verify_xqa = false`、
+  `verify_v2 = false`、`verify_piecewise = true`、`verify_fi = true`(注释里写了换代理由与换代数据);
+  `decode_xqa` 保持 true —— **decode(T=1)仍是 XQA**(V1c 可同法换:session 图 + 断点挂 XQA 核)。
+- ⚠️ **args 档会覆盖 flavor**:`testdata/args/spec-27b-prod.toml` 自己也带
+  `[dispatch] verify_xqa = true`(深度合并 ⇒ 只覆盖列出的键)⇒ 必须**同时**把 args 档那几行改掉,
+  否则 flavor 的换代被 args 覆盖回 XQA(实测第一轮就踩到:日志/文本看不出,要看轮时签名)。
+- 生产档实测(flavor+args 双改,8192):**轮时 52.8 → 46.7ms(−11.5%)、verify read 36.7 → 20.6ms**、
+  prefill 1305(不动)、decode 71.1 t/s。(生产几何 max_seq=16384 ⇒ 32k 点测不了;
+  32k 的 −30% 见 §11.6 的长几何档。)
+
+**② 红线门(接线完成,当前因 MTP 路径的环境性问题为红)**
+- `gpu_spec_identity_gate_27b` 的 `OWL_GATE_PIECEWISE=1` 现在**整臂**打开
+  (piecewise + verify_fi + verify_xqa/v2 关)⇒ 这条门 = "断点臂不破文本"红线
+  (baseline `spec_depth=0` vs spec 的贪心 token 流逐位比)。
+- 该门在本 worktree 有两处**既有**环境性红,已修一处:`_MIN_GEN_TOKENS = 1024`
+  要求 `max_seq − prompt ≥ 1024`(门用 256 ⇒ 恒拒发"超预算")⇒ 抬到 2048 后 baseline 轮通过;
+  另一处在 **MTP propose 路径**(`exec/draft.rs:852` panic,spec 轮),与断点臂无关
+  (piecewise 关闭时同样复现)⇒ **在这条 MTP 路径修好前,实际红线用**
+  `tools/pw-ab-greedy.sh` + `testdata/args/perf-ab-fi.toml`(greedy + 哑草稿,文本逐字对比,
+  实测 k=16 与 base 全等)。

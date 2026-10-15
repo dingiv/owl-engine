@@ -1159,8 +1159,14 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
                 knobs.draft.dumb = true;
             }
             // piecewise A/B 臂(2026-10-15 perf 会话;恒等门用)
+            // **piecewise + FI 断点臂**(2026-10-16 转正门:"断点臂不破文本"红线)——
+            // spec(断点臂)与 baseline(spec_depth=0)贪心 token 流必须逐位一致:
+            // 覆盖"FI 四件套走输入槽 + ctx_total 宿主标量槽 + 段间 eager 重放"全链
             if owl_shared::env_reader::flag("OWL_GATE_PIECEWISE") {
                 knobs.env.attn.verify_piecewise = true;
+                knobs.env.attn.verify_fi = true;
+                knobs.env.attn.verify_xqa = false;
+                knobs.env.attn.verify_v2 = false;
             }
             let mut engine = Engine::new(EngineConfig {
                 device_ordinal: ordinal,
@@ -1250,12 +1256,20 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
             knobs.draft.depth = 3;
             knobs.cuda.capture_slab_mb = Some(160);
             // piecewise A/B 臂(2026-10-15 perf 会话;恒等门用)
+            // **piecewise + FI 断点臂**(2026-10-16 转正门:"断点臂不破文本"红线)——
+            // spec(断点臂)与 baseline(spec_depth=0)贪心 token 流必须逐位一致:
+            // 覆盖"FI 四件套走输入槽 + ctx_total 宿主标量槽 + 段间 eager 重放"全链
             if owl_shared::env_reader::flag("OWL_GATE_PIECEWISE") {
                 knobs.env.attn.verify_piecewise = true;
+                knobs.env.attn.verify_fi = true;
+                knobs.env.attn.verify_xqa = false;
+                knobs.env.attn.verify_v2 = false;
             }
             let mut engine = Engine::new(EngineConfig {
                 device_ordinal: ordinal,
-                max_seq_tokens: 256,
+                // `_MIN_GEN_TOKENS = 1024` ⇒ room = max_seq − prompt 必须 ≥ 1024
+                // (老门 256 恒拒发 = 环境性红;2026-10-16 抬到 2048 —— 恒等门不比容量)
+                max_seq_tokens: 2048,
                 prefill_chunk: 64,
                 knobs,
             })
