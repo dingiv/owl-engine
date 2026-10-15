@@ -49,6 +49,8 @@ pub(crate) struct GraphFleet<D: DeviceClient> {
     pub dflash: Option<GraphPlan<D>>,
     /// **FI 断点臂的宿主标量槽**(verify 图 `ctx_total`;None = 该臂未开)
     pub verify_fi_ctx: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    /// **FI 断点臂的宿主标量槽**(session 图 / T=1 decode;None = 该臂未开)
+    pub decode_fi_ctx: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl<D: DeviceClient> GraphFleet<D> {
@@ -108,8 +110,8 @@ impl<D: DeviceClient> GraphFleet<D> {
         boot: FleetBoot<'_>,
         t0: T,
     ) -> Result<Self> {
-        // ① 主会话图
-        let (session, capture_outcome) = Self::plan_session(face, &boot, t0).await?;
+        // ① 主会话图(V1c:decode_fi 开 ⇒ 同图走 piecewise,断点挂 decode 核)
+        let (session, capture_outcome, decode_fi_ctx) = Self::plan_session(face, &boot, t0).await?;
         // ② verify 桶形图(spec 模式且主图捕获成功才有意义)
         let (verify, fi_ctx) = if boot.spec.depth > 0
             && vface.is_some()
@@ -130,7 +132,16 @@ impl<D: DeviceClient> GraphFleet<D> {
         } else {
             (Vec::new(), None, Vec::new())
         };
-        Ok(Self { session, capture_outcome, verify, fold, propose, dflash, verify_fi_ctx: fi_ctx })
+        Ok(Self {
+            session,
+            capture_outcome,
+            verify,
+            fold,
+            propose,
+            dflash,
+            verify_fi_ctx: fi_ctx,
+            decode_fi_ctx,
+        })
     }
 
     /// FI 断点臂的宿主标量槽(引擎逐轮写 `ctx_total`;None = 该臂未开)
@@ -138,12 +149,25 @@ impl<D: DeviceClient> GraphFleet<D> {
         self.verify_fi_ctx.clone()
     }
 
+    /// FI 断点臂(session/T=1)的宿主标量槽(引擎每步写 `ctx_total`)
+    pub(crate) fn decode_fi_ctx(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicUsize>> {
+        self.decode_fi_ctx.clone()
+    }
+
     /// ① 主会话图(槽 → 整模单树;状态句柄捕获,模型 Arc 共享)。
     /// 捕获期禁 Htod:常量标量走持久槽;KV/GDN 双槽分立 ——
     /// KV 槽 = 本 token 自己的格子(窗 = [slot-kv_len+1, slot],随步进;
     /// 2026-09-26 窗口语义探针定谳:slots 恒 0 读块外垃圾行);
     /// GDN 槽 = 序列状态格,turn 内恒 0(递推状态按序列累积)。
-    async fn plan_session(face: D, boot: &FleetBoot<'_>, t0: T) -> Result<(GraphPlan<D>, PlanOutcome)> {
+    async fn plan_session(
+        face: D,
+        boot: &FleetBoot<'_>,
+        t0: T,
+    ) -> Result<(
+        GraphPlan<D>,
+        PlanOutcome,
+        Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    )> {
         let env = boot.env;
         let pool = boot.pool;
         let dims = boot.dims;
@@ -166,7 +190,19 @@ impl<D: DeviceClient> GraphFleet<D> {
         // notaps 同款逃生开关)。tapped_hidden 零额外计算,
         // 仅多 5 个 [1,hidden] 输出槽写;非 dflash 走原 forward(拓扑不变)
         let decode_taps = boot.spec.dflash_tap_count > 0;
+        // V1c:decode_fi 开 ⇒ 本图走段驱动件(断点在 decode 核)
+        let dfi_cell: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>> = knobs
+            .env
+            .attn
+            .decode_fi
+            .then(|| std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)));
+        let fi_cell_c = dfi_cell.clone(); // Option:关时 None(闭包按它分流)
+        let fi_kcv: (Vec<TensorOps>, Vec<TensorOps>) = kv_caches.iter().cloned().unzip();
+        let fi_nb = pool.nb;
+        let dfi_on = knobs.env.attn.decode_fi; // 闭包 'static:先取值(同 xqa_decode_on 纪律)
         let forward = move |sc: &PlanCtx| -> Result<()> {
+            // FI 面持有处(活得比 ctx 长:FiPrefillCtx 借它们)
+            let fi_tensors: (TensorOps, TensorOps, TensorOps, TensorOps);
             let ids = sc.input("frontier")?;
             let pos = sc.input("pos")?;
             let kv_len = sc.input("kv_len")?;
@@ -215,6 +251,34 @@ impl<D: DeviceClient> GraphFleet<D> {
                     sm_count: x.sm_count,
                 });
             }
+            // FI 断点臂(session/T=1):表四件套槽 → U32 视图 + FiPrefillCtx +
+            // 宿主标量槽(ctx_total 每步由引擎写)
+            if let (true, Some(cell)) = (dfi_on, fi_cell_c.as_ref()) {
+                let blk_id = |t: &TensorOps| -> Result<u64> {
+                    match t.op() {
+                        owl_models::ops::Op::Block { id } => Ok(*id),
+                        _ => Err(owl_iface::contract::ModelError::Msg(
+                            "FI 表槽非块叶(内部契约违例)".into(),
+                        )),
+                    }
+                };
+                let (q_cu_t, idx_t, ind_t, ll_t) = (
+                    TensorOps::of_block(blk_id(&sc.input("fi_q_cu")?)?, Dtype::U32, vec![2]),
+                    TensorOps::of_block(blk_id(&sc.input("fi_indices")?)?, Dtype::U32, vec![fi_nb]),
+                    TensorOps::of_block(blk_id(&sc.input("fi_indptr")?)?, Dtype::U32, vec![2]),
+                    TensorOps::of_block(blk_id(&sc.input("fi_last_len")?)?, Dtype::U32, vec![1]),
+                );
+                fi_tensors = (q_cu_t, idx_t, ind_t, ll_t);
+                ctx.fi = Some(FiPrefillCtx {
+                    kcs: &fi_kcv.0,
+                    vcs: &fi_kcv.1,
+                    q_cu: &fi_tensors.0,
+                    indices: &fi_tensors.1,
+                    indptr: &fi_tensors.2,
+                    last_len: &fi_tensors.3,
+                });
+                ctx.attn_fi = Some(owl_models::module::AttnFiBreak { ctx_total: cell.clone() });
+            }
             // B4:降级期取数面 —— tapped_hidden 拿末层 hidden + 5 层 taps
             // (零额外前向;l m_head 与 forward 同式)。非 dflash 原路(位等价)
             let tree = if decode_taps {
@@ -232,10 +296,7 @@ impl<D: DeviceClient> GraphFleet<D> {
             sc.output("logits", &tree)
         };
 
-        let (session, capture_outcome) = GraphPlan::plan(
-            face,
-            env,
-            GraphPlanDesc {
+        let desc = GraphPlanDesc {
                 inputs: {
                     let mut v = vec![
                         InputSlot::f32("frontier", 1),
@@ -259,6 +320,15 @@ impl<D: DeviceClient> GraphFleet<D> {
                     }
                     if knobs.ts_probe {
                         v.push(InputSlot::f32("ts_buf", 4096));
+                    }
+                    // FI 断点臂(session/T=1;`decode_fi`):表四件套(位型过线,
+                    // u32 → f32)。init 与占位 ctx_total(=1 行)自洽:nb_pages=1
+                    if knobs.env.attn.decode_fi {
+                        v.push(InputSlot::f32("fi_q_cu", 2).init(vec![0.0, f32::from_bits(1)]));
+                        v.push(InputSlot::f32("fi_indices", pool.nb)
+                            .init((0..pool.nb).map(|i| f32::from_bits(i as u32)).collect()));
+                        v.push(InputSlot::f32("fi_indptr", 2).init(vec![0.0, f32::from_bits(1)]));
+                        v.push(InputSlot::f32("fi_last_len", 1).init(vec![f32::from_bits(1)]));
                     }
                     v
                 },
@@ -284,15 +354,18 @@ impl<D: DeviceClient> GraphFleet<D> {
                 capture: !knobs.no_graph,
                 slab_fixed: knobs.cuda.capture_slab_mb.is_some(),
                 debug_probe: knobs.probes.debug,
-            },
-            forward,
-        )
-        .await?;
+        };
+        // V1c:decode_fi 开 ⇒ 段驱动件(断点在 decode 核 ⇒ FI plan 每步重算)
+        let (session, capture_outcome) = if dfi_cell.is_some() {
+            GraphPlan::plan_piecewise(face, env, desc, true, forward).await?
+        } else {
+            GraphPlan::plan(face, env, desc, forward).await?
+        };
         if let PlanOutcome::EagerFallback { reason } = &capture_outcome {
             owl_shared::log_warn!("engine", "捕获降级为 eager:{reason}");
         }
         owl_shared::log_info!("boot", "GraphPlan plan(warmup+捕获) {:.2}s", t0.elapsed().as_secs_f32());
-        Ok((session, capture_outcome))
+        Ok((session, capture_outcome, dfi_cell))
     }
 
     /// ② verify 桶形图(E5-M4;T = depth+1 定形;spec 模式专用)—— 消

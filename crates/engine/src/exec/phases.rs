@@ -1,5 +1,6 @@
 //! 调度三相位执行(begin/prefill/decode)+ 采样收口 + GDN 画像
 use super::*;
+use owl_models::ops::PlanNode; // ⚙ diag:池叶 → 块 id(写者足迹取证)
 
 impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// turn 启动执行(设备侧照办):GDN 格重置 / 边界快照恢复 + 持久
@@ -93,9 +94,44 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 step_slots.push(("xqa_pt", self.xqa_pt_of(sid)));
             }
         }
+        // **FI 断点臂(V1c;T=1)**:宿主标量槽 ctx_total + 表四件套(位型过线)。
+        // 判据 = 槽在场(与 xqa_seq 同款纪律:`decode_fi` 关时图里没有这些槽)
+        if self.graphs.session.has_input("fi_q_cu") {
+            if let Some(cell) = self.graphs.decode_fi_ctx() {
+                let ctx_total = pos + 1;
+                cell.store(ctx_total, std::sync::atomic::Ordering::Relaxed);
+                let page = self.pool.page;
+                let bt_chain = {
+                    let s = self.bank.sessions.get(sid).expect("账在");
+                    s.block_table.clone()
+                };
+                let nb_used = ctx_total.div_ceil(page).min(bt_chain.len()).max(1);
+                let mut idx = vec![0f32; self.pool.nb];
+                for (i, b) in bt_chain.iter().take(nb_used).enumerate() {
+                    idx[i] = f32::from_bits(*b);
+                }
+                step_slots.push(("fi_q_cu", vec![0.0, f32::from_bits(1)]));
+                step_slots.push(("fi_indices", idx));
+                step_slots.push(("fi_indptr", vec![0.0, f32::from_bits(nb_used as u32)]));
+                step_slots.push((
+                    "fi_last_len",
+                    vec![f32::from_bits((ctx_total - (nb_used - 1) * page) as u32)],
+                ));
+            }
+        }
         let step_refs: Vec<(&str, &[f32])> =
             step_slots.iter().map(|(n, v)| (*n, v.as_slice())).collect();
+        // ⚙ KV 页字节差分(OWL_KV_DUMP=<pos>,一次):写前/写后各 d2h 一页 ⇒
+        // **写者的足迹**直接给出块内元素序(页面连续 vs 8B 小块 strided),
+        // 不需要任何参考值(见 docs §11.11「写者 A/B」)。
+        let kv_dump_at = owl_shared::env_reader::parse::<usize>("OWL_KV_DUMP");
+        if kv_dump_at == Some(pos) {
+            self.dump_kv_page(sid, kv_slot, "before").await?;
+        }
         self.graphs.session.step(&step_refs).await?;
+        if kv_dump_at == Some(pos) {
+            self.dump_kv_page(sid, kv_slot, "after").await?;
+        }
         if prof {
             eprintln!("[step-prof] pos={pos} fill+launch={:?} wall={}", t0.unwrap().elapsed(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100000);
         }
@@ -417,5 +453,64 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         Ok(TurnEvent::Token { turn: turn_id, delta })
     }
 
+
+
+    /// ⚙ diag:把"当前槽所在页"的 KV 字节 d2h 落盘(层 0 的 k 池;写者足迹取证)。
+    /// 落 `/tmp/kv-{tag}.bin` + `/tmp/kv-meta.txt`(blk/off/hkv/hd/page/字节数)。
+    async fn dump_kv_page(&mut self, sid: u64, kv_slot: u32, tag: &str) -> Result<()> {
+        let d = &self.pool.dims;
+        let page = self.pool.page;
+        let (hkv, hd) = (d.hkv, d.hd);
+        // fp8 池 = 1B/元素(扁平 u8 账);f16 池 = 2B ✓
+        let esize = if self.pool.kv_fp8 { 1 } else { d.dtype.size_bytes() };
+        let row_bytes = hkv * hd * esize;
+        let blk = {
+            let s = self.bank.sessions.get(sid).expect("账在");
+            let p = (kv_slot as usize) / page;
+            s.block_table.get(p).copied().unwrap_or(0)
+        };
+        let pool_leaf = self.pool.kv_caches()[0].0.clone();
+        let pool_id = match pool_leaf.op() {
+            owl_models::ops::Op::Block { id } => *id,
+            _ => return Ok(()),
+        };
+        let n = row_bytes * page;
+        let face = self.graphs.session.face_mut();
+        let scratch = face.alloc(owl_iface::contract::Dtype::U32, n / 4).await?;
+        let src = owl_iface::contract::Bytes::new(
+            pool_id,
+            n / 4,
+            owl_iface::contract::Dtype::U32,
+            0,
+        );
+        face.copy_block_at(
+            &src,
+            blk as usize * n,
+            &scratch,
+            0,
+            n,
+        )
+        .await?;
+        let mut buf = vec![0u8; n];
+        face.dtoh(&scratch, &mut buf).await?;
+        let _ = face.free(&[scratch.id]).await;
+        std::fs::write(format!("/tmp/kv-{tag}.bin"), &buf)
+            .map_err(|e| owl_iface::contract::ModelError::Msg(format!("kv dump 落盘: {e}")))?;
+        let meta = format!(
+            "tag={tag} slot={kv_slot} blk={blk} off={} hkv={hkv} hd={hd} page={page} row_bytes={row_bytes} page_bytes={n}\n",
+            kv_slot as usize % page
+        );
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/kv-meta.txt")
+                .map_err(|e| owl_iface::contract::ModelError::Msg(format!("kv meta: {e}")))?;
+            f.write_all(meta.as_bytes())
+                .map_err(|e| owl_iface::contract::ModelError::Msg(format!("kv meta 写: {e}")))?;
+        }
+        Ok(())
+    }
 
 }

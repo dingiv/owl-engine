@@ -256,6 +256,8 @@ pub struct DispatchCfg {
     pub break_at_out: bool,
     /// **verify 走 FI 断点臂**(V1b;需 `verify_piecewise`)——FI+split 换掉 XQA
     pub verify_fi: bool,
+    /// **decode(T=1)走 FI 断点臂**(V1c;session 常驻图改分段,断点挂 decode 核)
+    pub decode_fi: bool,
     /// verify 臂改走 **XQA**(kNHD fp8 池 + spec-dec q=1+K;feature `xqa`)。
     /// 2026-10-13 D3:XQA 单算子实测 ctx8192 0.495ms vs v2 2.673ms(5.40×),
     /// 数值 max|XQA−host| 4.5e-4(v2 4.6e-4)。缺省 false(定谳后再翻)。
@@ -649,6 +651,7 @@ impl Default for DispatchCfg {
             verify_piecewise: false,
             break_at_out: false,
             verify_fi: false,
+            decode_fi: false,
             decode_xqa: false,
             xqa_prefill: false,
             fi_min_tokens: 1,

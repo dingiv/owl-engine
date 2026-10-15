@@ -435,6 +435,49 @@ impl Attention {
         ctx: &ForwardCtx,
         pol: &crate::module::KvPagedPolicy,
     ) -> TensorOps {
+        // **FI 断点臂**(V1c;T=1 裸 decode):核移出 session 捕获图 ⇒ split 档 plan
+        // 每步按当前 ctx 重算(`ctx_total` 走宿主标量槽,四件套走图输入槽)。
+        // 与 verify 臂同构(见 `paged_prefill_fi_output`);`ctx.attn_fi` 在场 = 本树换臂。
+        if tokens == 1 && ctx.env.kv.is_fp8() {
+            if let (Some(ab), Some(fi)) = (ctx.attn_fi.as_ref(), ctx.fi.as_ref()) {
+                let y = fi_core_node(
+                    FiCoreGeom {
+                        tokens,
+                        hq: self.hq,
+                        hkv: self.hkv,
+                        hd: self.hd,
+                        page: pol.page,
+                        fp8: true,
+                    },
+                    q.dtype,
+                    q,
+                    &fi.kcs[ctx.fi_kvi],
+                    &fi.vcs[ctx.fi_kvi],
+                    fi.q_cu,
+                    fi.indices,
+                    fi.indptr,
+                    fi.last_len,
+                    // 依赖边(K0 先于读池;FI 不解引用)。decode 路的 wr 是
+                    // 2 维哑输出,FI 声明 rank=1 ⇒ 取 1 元素视图(零拷贝)
+                    &narrow_strided(wr, 1, 1, 0, 1, vec![1]),
+                    tokens, // 占位:回放期由宿主标量槽补本轮值
+                );
+                if let Some(sink) = ctx.attn_break.as_ref() {
+                    sink.borrow_mut().push(crate::interpreters::BreakDecl::with_host_scalar(
+                        y.clone(),
+                        FI_CTX_TOTAL_ARG,
+                        ab.ctx_total.clone(),
+                    ));
+                }
+                let n = tokens * self.hq * self.hd;
+                let yg = TensorOps::call(SemanticKernel::GateMul)
+                    .arg(gate)
+                    .arg(&y)
+                    .arg_usize(n)
+                    .with_shape(q.dtype, vec![tokens, self.hq * self.hd]);
+                return self.o_proj.forward(&yg, ctx);
+            }
+        }
         // XQA 臂优先(2026-10-13 ②;T=1 裸 decode)。池/形状不匹配 ⇒
         // `ctx.xqa` 为 None ⇒ 自动回落 v2 主核(graceful,与 verify 臂同款纪律)。
         if tokens == 1 && ctx.env.attn.decode_xqa {

@@ -12,7 +12,7 @@ for p in $(ss -ltnp 2>/dev/null | awk '/127\.0\.0\.1:8138/{print $NF}' | grep -o
 done
 sleep 4
 
-CUDA_VISIBLE_DEVICES=GPU-89dffb90-d810-7ce7-f649-60d781508f21 \
+CUDA_VISIBLE_DEVICES=${CVD:-GPU-89dffb90-d810-7ce7-f649-60d781508f21} \
   env ${PW_ENV:-OWL_PW_NOP=1} nohup ./target/release/server --flavor spec-dflash "$ARGS" --log-level info >"$LOG" 2>&1 &
 SPID=$!
 

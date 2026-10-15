@@ -451,3 +451,150 @@ OWL_GATE_PIECEWISE=1 OWL_GATE_XQA=1 OWL_E2E_ONLY=dflash2_identity cargo test ...
   (piecewise 关闭时同样复现)⇒ **在这条 MTP 路径修好前,实际红线用**
   `tools/pw-ab-greedy.sh` + `testdata/args/perf-ab-fi.toml`(greedy + 哑草稿,文本逐字对比,
   实测 k=16 与 base 全等)。
+
+### 11.8 ⚠️ V1c(decode T=1 换 FI)接线完成,**数值不一致 ⇒ 未转正**(2026-10-16)
+
+**落的件**(开关 `dispatch.decode_fi`,**缺省关**):
+- 模型:decode 分派新增 FI 断点分支(`paged_decode_v2_k0` 的 XQA 检查之前),
+  与 verify 臂同构(宿主标量槽 + `fi_core_node`);⚠️ decode 路的 `wr` 是 **2 维**哑输出,
+  FI 声明 rank=1 ⇒ 必须取 `narrow_strided(wr,1,1,0,1,[1])` 一元素视图(准入会拒:
+  "wr 期望 rank = 1 实得 2")。
+- 引擎:`plan_session` 在 `decode_fi` 开时走 `plan_piecewise`(session 常驻图 → 段驱动件);
+  四件套槽(`fi_q_cu/fi_indices/fi_indptr/fi_last_len`,位型过线)+ `decode_fi_ctx()`
+  宿主标量槽;`exec/phases.rs` 每步写 `ctx_total = pos+1` 与四件套(判据 = 槽在场,
+  与 `xqa_seq` 同款纪律)。踩坑:`expect("cell 必存在")` 会在关闭态 panic(已改为 Option 分流)。
+
+**为什么未转正**(硬判据):
+- 裸 decode 专档(`depth=0` + greedy,同一 prompt):XQA 臂 vs FI 臂 **文本不一致**——
+  两者都连贯(base "…介绍。让我来数一下。…" vs FI "…我用中文回答,因为…"),
+  且**从第一个 decode 步就分叉**(前缀 "用户要求" 相同 = prefill 产物相同)
+  ⇒ 不是 NaN/崩坏,而是 **FI 读到的 KV/几何与 XQA 不等价**。
+- ⇒ **按"先证不回归"纪律停手**:decode 臂是纯聊天的主路径,数值不一致 = 不可发布;生产档
+  保持 `decode_xqa = true`(V1b 的 verify 换代不受影响)。
+
+**下一步嫌疑表(按可能性)**:
+1. **最新一行的 fp8 写者不同**:decode 的当前行由**融合插池** `qknorm_rope_kv_insert_f16_fp8kv_knhd`
+   写,而 FI 的同形状核级门(`fi_prefill_probe` 的 T=1 档)与 verify 臂验证时,池里的行都是
+   **K0 家族**写的 ⇒ 先查"同一行的两类写者是否逐字节同布局"(fp8 packing/`x` 向量宽/scale 约定);
+2. **解码步的页链/`last_len`**:跨页时 `nb_used/last_len` 的口径(现按 `ceil((pos+1)/page)` 推);
+3. **`q`/scale 口径**:`fi_scale_bits` vs `xqa_q_scale_bits`(verify 形状已互等,但 decode 的
+   `sm_scale` 走的是另一条实例化,需逐位对拍);
+4. **最快的判据**:同 boot 内对同一 (q, 池, 表) 跑 XQA-decode 与 FI-decode 两个节点,
+   d2h 比 max|Δ|(把"臂"从"文本"里剥出来;`pw-pin` 那套仪器可直接复用)。
+
+### 11.9 🔎 V1c 病灶二分:**0.8B(f16)两臂逐字一致 ⇒ 病灶在 fp8 专用段**(2026-10-16)
+
+**为什么要换小模型**:0.8B 是 **f16 池**、且 XQA 不可用(hq/hkv≠6)⇒ 参考臂天然是 **v2 decode**,
+正好把"fp8 行写者/读法"这一大类嫌疑**裁掉一层**;且 boot ~10s(27B 是 ~90s)⇒ 追凶迭代快一个量级。
+落点:`testdata/args/dec08-{base,fi}.toml`(kind="0.8b", `dir=models/Qwen/Qwen3.5-0.8B`,
+greedy, `depth=0`,`max_seq=2048`(⚠️ `_MIN_GEN_TOKENS=1024` ⇒ max_seq 太小会恒拒发),
+`pool_tokens=4096`);run:`FLAVOR=awq27b CVD=<空闲 3080 uuid> bash tools/pw-ab-greedy.sh …`
+(harness 的 flavor/CVD 已参数化;⚠️ GPU1/2 是主会话实例,别动,用 GPU0/3 的 3080)。
+
+**结果**:
+```
+0.8B 参考臂(v2): 长城是古代中国防御工事，历经千年风雨，见证历史沧桑。
+0.8B FI 臂     : 长城是古代中国防御工事，历经千年风雨，见证历史沧桑。   ⇒ 逐字一致 ✓
+```
+⇒ **piecewise(session 图)+ FI 四件套槽 + `ctx_total` 宿主标量槽 + 段间 eager 重放 全链正确**;
+27B 的不一致只能出在**fp8 专用段**:
+
+**下一步判据(最锋利的一刀)**:27B + fp8 下把参考臂换成 **v2 decode**(`decode_xqa = false`,
+不进 XQA 臂)⇒
+- 若 **FI ≡ v2**(27B)→ 病灶在 **XQA 与 FI 对同一 fp8 行的读法差异**
+  (嫌疑:融合插池 `qknorm_rope_kv_insert_f16_fp8kv_knhd` 写的行 vs K0 家族写的行,
+  在 FI 的 fp8 读侧假设不同 —— `x` 向量宽/scale/packing);
+- 若 **FI ≢ v2** → 病灶在 FI 的 fp8 读核本身在 **decode 形状(T=1)** 下的前提
+  (核级门只覆盖过 T=1 的 **f16/探针表**,fp8×T=1 的核级对拍要做一档)。
+
+### 11.10 🔎 V1c 定谳刀:27B+fp8 **FI ≢ v2(同池同写者)** ⇒ 病灶在 FI 自己的 fp8 读法(2026-10-16)
+
+**实验**(`testdata/args/dec27-{base,fi}.toml`:27B + fp8 + `depth=0` + **`decode_xqa=false`** ⇒
+参考臂 = **v2 decode**,两臂同池同"融合插池"写者;greedy;3080 上跑):
+
+| 臂 | 文本 |
+|---|---|
+| v2(参考) | "用户要求用五十字介绍长城。我需要写一段恰好50个中文字符的介绍。让我来数一下。…" |
+| FI       | "用户要求我用中文回答,因为用户用中文提问了。但等等,…" |
+
+⇒ **FI ≢ v2** 而 **v2 ≡ XQA**(v2 这条文本与先前 XQA 臂逐字同)⇒ 病灶**不是**"XQA 与插池写者的约定差异",
+而是 **FI 自己对 fp8 池的读法/前提**。
+
+**三条事实的交集把范围夹到"fp8 × T=1"**:
+| 场景 | 池/形状 | 结果 |
+|---|---|---|
+| verify(T=8)FI vs XQA | **fp8** × T=8 | ≡ ✓(§11.6) |
+| 0.8B 裸 decode FI vs v2 | **f16** × T=1 | ≡ ✓(§11.9,harness 跑) |
+| 27B 裸 decode FI vs v2 | **fp8** × T=1 | **≢ ✗**(本表) |
+⇒ 唯一的未覆盖组合 = **fp8 × T=1**。而 V1 的核级探针 **只覆盖 fp8**(f16 臂未验)且 T=1 档是探针**自建的表** ⇒
+嫌疑落在"**引擎为 decode 步造的四件套口径**"与"探针那套"之间的差异(多页/末页 `last_len`/`q_cu`/`indptr`),
+或 FI 的 fp8 读核在 **T=1 多页**下的前提。
+
+**下一刀(核级,不碰引擎,最快)**:把 `crates/kernels/tests/fi_prefill_probe.rs` 补一档
+**"引擎形状的 T=1 多页 fp8"**(fp8 池、kv_len > page、末页半满、`q_cu=[0,1]`/`indptr=[0,nb_used]`/
+`last_len=kv_len-(nb_used-1)·page`),对 host oracle 判 —— 若探针绿 ⇒ 病灶在引擎表(逐字段对拍引擎写法);
+若探针红 ⇒ 核在 fp8×T=1 多页下的前提有洞(核侧修)。
+
+⚠️ 方法论留档:本轮后段两次"临时 curl + 短/长 prompt 对照"的结果**不可信**——不同模型/不同 prompt
+返回了**逐字相同**的文本(客户端/排队伪影),故**未采信**、也未据此改动结论。追凶只认:①harness 的两臂同 prompt 对照
+②核级 host oracle。后者(探针)是唯一能把"引擎表"与"核读法"干净分开的面。
+
+### 11.11 🔎 探针判"核无罪" + 两个 fp8 写者的块内元素序对不上(2026-10-16)
+
+**① 探针补"末页半满"档 → 全绿**(新增用例已入 `crates/kernels/tests/fi_prefill_probe.rs`):
+```
+(1,53) 2页 last_len=21   max|FI−host| 2.46e-4   零值 0/6144
+(1,3073) 97页 last_len=1 4.41e-4   0/6144
+(1,3080) 97页 last_len=8 5.20e-4   0/6144
+(1,1057) 34页 last_len=1 5.23e-4   0/6144
+(8,3080) verify+半满     5.32e-4   0/49152
+```
+⇒ **核在"fp8 × T=1 × 多页 + 末页半满"下是对的**(此前后所有 host 校验档的 ctx 都是 PAGE 整数倍
+⇒ 半满从没测过)。⇒ 病灶在**引擎侧**(表/写者),不在核。
+
+**② 读两个 fp8 写者的写址算式(块内元素序)**:
+| 写者 | 算式(块内) | 元素序 |
+|---|---|---|
+| `owl_reshape_and_cache_fp8kv`(**无后缀**) | `head*(hd/x)*page*x + xidx*page*x + off*x + xoff` | **x-packed / page-minor**:`[blk][hkv][hd/x][page][x]` |
+| `owl_reshape_and_cache_fp8kv_**knhd**` | `off*hkv*hd + head*hd + d` | **page-major**:`[blk][page][hkv][hd]` |
+| `owl_qknorm_rope_kv_insert_f16_fp8kv_**knhd**` | `((blk*hkv+kh)*(hd/8)+d/8)*page*8 + off*8 + d%8` | **x-packed(与无后缀同式,x=8)** |
+而 `EnvProvider::k0_write_op()` 对 fp8 返回 **`K0WriteFp8Knhd`**(= page-major 那个)⇒
+**prefill/verify 的行 = page-major,decode 的当前行 = x-packed** ⇒ 若两者真不同序,则
+FI 读 decode 行错(本次症状 ✓:FI 只与 K0 写的行对过账,verify 臂全 K0 ✓ 0.8B f16 又是同一族 ✓)。
+
+⚠️ **但我不能就此定谳**:若两者真不同序,则 decode 臂(XQA/v2)读 *prefill* 写的 prompt 行也该错
+(实测它们对 ⇒ 说明要么两者同序,要么读侧另有分派)⇒ **必须做字节级 A/B 才能定案**。
+
+**③ 下一刀(唯一能干净定案的)**:核级 **写者 A/B** —— 同一行 k/v 分别过
+`K0WriteFp8Knhd` 与 `owl_qknorm_rope_kv_insert_f16_fp8kv_knhd`,d2h 比**同一 slot 的字节**:
+- 字节同 ⇒ 布局一致,病灶回到"引擎为 decode 造的**表/值**"(逐字段对拍 `phases.rs` 的写法:
+  `indices` 只写前 `nb_used` 项、其余补 0;`indptr=[0,nb_used]`;`last_len=ctx−(nb_used−1)·page`;
+  `q_cu=[0,1]`;`ctx_total=pos+1` —— 与探针表逐字段比);
+- 字节不同 ⇒ **同池两套序**(潜在老账):FI 必须按"它读的那一族"的序取,或统一写者;
+  判据 = "FI 读 insert 写的行 vs 读 K0 写的行"两侧对 host oracle。
+
+### 11.12 ✅ 真机字节差分定案:两个 fp8 写者**同序(page-major)**——"写者不一致"出局(2026-10-16)
+
+**仪器**(用户点醒的做法:**不看日志看设备字节**,且不需要参考值):
+`OWL_KV_DUMP=<decode_pos>` ⇒ 在 `exec/phases.rs` 的 decode 步**写前/写后各 d2h 一页**
+(`copy_block_at` 抠出该页 → `dtoh` → `/tmp/kv-{before,after}.bin` + `kv-meta.txt`);
+分析器 `tools/kv_footprint.py`:**差分足迹**即结构性事实 ——
+- page-major ⇒ 该行 `hkv·hd` 字节是**一整段连续**(页内 `off·hkv·hd` 起);
+- x-packed  ⇒ 是 128 个 **8B 块 strided 256B**。
+
+**实测(27B + fp8,slot=54 ⇒ blk=1/off=22)**:
+```
+改动字节 1024(=hkv·hd)  改动区间 [22528,23551] = 22*1024 一整段
+假设 A(page-major) 命中;假设 B(x-packed) 覆盖 0.03 ⇒ 不符
+```
+⇒ **decode 的写者(融合插池)= page-major,与 `K0WriteFp8Knhd` 同序**;FI 的 `QKVLayout::kNHD`
+正是 page-major ⇒ **读法与池的写法一致** ⇒ §11.11 的"两套序"**出局**(当时从公式推的"无后缀=x-packed"
+是误读:调用方按**打包单位**传 `num_heads/head_size`,公式实际坍缩成 page-major)。
+
+**于是 V1c 剩下的差异面收窄为**(核 ✓、池写 ✓、表与 verify 同式 ✓ 都已排):
+1. **`q` 操作数的形态**:decode 路的 `q` 来自 `qknorm_rope_kv_insert` 家族(该家族与 XQA 的 fp8
+   q_scale 配套),而 FI 的 `Param::t_in("q", F16, 2)` 期望 f16 规整 `[T, hq·hd]`
+   —— 需核对该 op 在 **fp8 池**下返回的 q 是否仍为 f16/该形状(准入只校 dtype/rank,不校"语义");
+2. **`ctx_total` 宿主槽与 plan 的时序**:plan 每步 miss ⇒ 重算 + H2D(在窗外 ✓),需证实
+   "回放期真正读到的是本轮值"(仪器:`OWL_FI_DEBUG=1` 打印 plan 的 split/num_chunks,逐步对照);
+3. **`gate`/`wr` 依赖边**在 FI 节点里的槽序是否与 decode 路一致(两路 arm 的实参顺序不同)。

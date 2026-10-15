@@ -206,6 +206,9 @@ pub struct AttnEnv {
     /// **verify 走 FI 断点臂**(V1b):FI 核移出图 ⇒ split 档 plan 每轮按本轮 ctx
     /// 重算(四件套走输入槽;`ctx_total` 走宿主标量槽)
     pub verify_fi: bool,
+    /// **decode(T=1)走 FI 断点臂**(V1c):session 常驻图改分段捕获,
+    /// 断点挂 decode 核(四件套走输入槽 + `ctx_total` 宿主标量槽)
+    pub decode_fi: bool,
     /// 裸 decode 走 XQA(第二份实例化 `M_TILESIZE=16`;shape/feature 不匹配自动回落 v2)
     pub decode_xqa: bool,
     /// FI 接管的 T 下限(`dispatch.fi_min_tokens`;t ≥ 此值走 FI 主臂)
@@ -333,6 +336,7 @@ impl EnvProvider {
                 verify_piecewise: d.verify_piecewise,
                 break_at_out: d.break_at_out,
                 verify_fi: d.verify_fi,
+                decode_fi: d.decode_fi,
                 decode_xqa: d.decode_xqa,
                 fi_min_tokens: d.fi_min_tokens,
                 xqa_prefill: d.xqa_prefill,
