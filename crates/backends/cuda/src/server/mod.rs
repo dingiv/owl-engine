@@ -807,6 +807,20 @@ impl GpuServer {
     /// 与客户端 `interp.host.seg.launch`(18µs 级)**对账** ⇒ 差值 = 管道
     /// (actor 队列往返 + 回执),是「宿主链 93% 在 launch+alloc」的下一层分解。
     fn handle_launch(&mut self, msg: LaunchMsg, ack: Ack<Result<Bytes, ModelError>>) {
+        // **计时器关账 = 零开销**(2026-10-15;原 FIXME 落地):
+        // 与 `srv.tx`(gpu_client)/`srv.queue`(本文件派发循环)同款谓词
+        // `LogSink::timing()` = timer 面在场 ∧ `PERF_BUILD` ∧ level≥HOST ——
+        // 先问再建,未武装就不做 `Instant::now` / `kernel.name.clone()` /
+        // `format!`(本热路径的全部常驻税)。
+        //
+        // 语义对齐:`PERF_BUILD = debug_assertions ∨ feature=perf` ⇒
+        // 非 perf 的 release 里 `srv.op.*` 与其余 SRV 段一致地关账
+        // (要逐发射分解就 `--features perf`;原实现只漏了这一段 —— 三段
+        // 里只有它无门,是 `srv.op 10.86%` 数字在非 perf 档下也吃 CPU 的原因)。
+        // 不缓存到构造期:`/debug/perf/level` 可运行期升降。
+        if !self.sink.timing() {
+            return self.handle_launch_probed(msg, ack);
+        }
         let t0 = std::time::Instant::now();
         let name = msg.kernel.name.clone();
         self.handle_launch_probed(msg, ack);
@@ -847,7 +861,11 @@ impl GpuServer {
                 _ => format!("gpu.{name}"),
             };
             let t0 = std::time::Instant::now();
-            self.handle_launch_inner(msg, ack);           // FIXME: 计时器使用宏, 改成运行时0开销的形式
+            // 关账语义:本臂由 `gpu_prof` 布尔门控(未开 = 零动作;不需要宏
+            // —— 装配期/入口期的 `handle_launch` 计时器已按
+            // `LogSink::timing()` 先问再建,见其注)。开启档**本就要**逐核
+            // `stream.synchronize()`(归因定义如此),那笔 ≫ 计时器本身。
+            self.handle_launch_inner(msg, ack);
             if let Ok(stream) = self.ctx().stream(STREAM_COMPUTE) {
                 let _ = stream.synchronize(); // 归因同步(错误由 sticky 面另报)
             }
@@ -1137,6 +1155,20 @@ const OP_RES: &str = "server.res";
 use owl_kernels::contract::OpError;
 use owl_kernels::device::ScratchBuf;
 
+impl GpuRes<'_> {
+    /// 块 id → (设备指针, 账长字节)。`resolve`/`resolve_len` **共用**它:
+    /// 两个出口走同一条解析路径,错措辞只有一份(F2 尺寸自证的前提)。
+    fn resolve_span(&self, id: u64) -> Result<(u64, usize), OpError> {
+        let stream = <Self as owl_kernels::device::DeviceRes>::stream(self)?;
+        self.ctx.block_ptr(id, &stream).map_err(|e| OpError::Contract {
+            op: OP_RES.into(),
+            field: "resolve",
+            expect: format!("块在册(actor_tag={} 账本)", self.actor_tag),
+            got: format!("id={id} / {e}"),
+        })
+    }
+}
+
 impl owl_kernels::device::DeviceRes for GpuRes<'_> {
     fn context(&self) -> Result<Arc<CudaContext>, OpError> {
         Ok(self.ctx.ctx.clone())
@@ -1148,17 +1180,10 @@ impl owl_kernels::device::DeviceRes for GpuRes<'_> {
             .cloned()
     }
     fn resolve(&self, id: u64) -> Result<u64, OpError> {
-        let stream = self.stream()?;
-        let (p, _) = self
-            .ctx
-            .block_ptr(id, &stream)
-            .map_err(|e| OpError::Contract {
-                op: OP_RES.into(),
-                field: "resolve",
-                expect: format!("块在册(actor_tag={} 账本)", self.actor_tag),
-                got: format!("id={id} / {e}"),
-            })?;
-        Ok(p)
+        Ok(self.resolve_span(id)?.0)
+    }
+    fn resolve_len(&self, id: u64) -> Result<usize, OpError> {
+        Ok(self.resolve_span(id)?.1)
     }
     fn alloc(&mut self, bytes: usize, tag: &'static str) -> Result<ScratchBuf, OpError> {
         // 与旧 handler 同机制:stream.alloc_zeros(cudarc 直分配;捕获窗内

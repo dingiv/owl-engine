@@ -157,6 +157,7 @@ async fn main() {
     // 并发上限守卫(§三十五 server 上层):GDN 状态格 = 每并发会话一格,
     // max_concurrency 超格数 = 第 N+1 会话状态格耗尽(LRU 逐出活跃会话)
     // → 跨会话状态污染。不足即拒启(账外组合不静默)。
+    // FIXME: ??? 你server层的东西，你来感知引擎内部的逻辑???
     let gdn_slots = config.knobs.gdn_slots;
     let max_concurrency = config.max_concurrency;
     if gdn_slots < max_concurrency {

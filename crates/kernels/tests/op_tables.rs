@@ -282,3 +282,72 @@ fn op_tables_match_cu_param_names() {
     assert!(checked >= 30, "建表数异常(仅 {checked} 条参与名字互证)");
     eprintln!("[op-tables] {checked} 张表形参名与 .cu 逐位一致 ✓");
 }
+
+/// **非族算子:`out_pos()` 必须 = 最后一个张量槽**(现役回传 ABI;F1a)。
+///
+/// 判据来源:`server/launch.rs` 的回传口径 —— "**最后一个 Block/BlockSlice = 输出**"
+/// (`issue_launch` 按此回传句柄,发射账 `out_id` 同口径)。家族算子**豁免**:
+/// 它们 out 可非末位(marlin AWQ 的 out 在槽 2),其 runtime 按 `parse` 的**名**
+/// 取 out,不依赖"末位"约定。
+#[test]
+fn non_family_out_slot_is_last_tensor() {
+    for m in ops::all() {
+        if m.is_family() {
+            continue;
+        }
+        let pos = m.out_pos().unwrap_or_else(|| panic!("{}: 非族算子无 Out 槽", m.entry));
+        let last = m
+            .params
+            .iter()
+            .rposition(|p| p.kind() == owl_kernels::spec::ParamKind::Tensor)
+            .unwrap_or_else(|| panic!("{}: 无张量槽", m.entry));
+        assert_eq!(
+            pos, last,
+            "{}: out_pos={} 但最后一个张量槽={} —— 回传句柄按\"末位 Block\"取,声明必须末位",
+            m.entry, pos, last
+        );
+    }
+}
+
+/// **池写集 ↔ 槽角色互证**(F1b;审查"声明自洽"缺门)。
+///
+/// 两条律(可机器判定,且不误伤激活域):
+/// 1. 声明 `write`/`rw` 池 ⇒ **必须有承载写入的槽**(`InOut` 或 `Out`);
+/// 2. 声明 `rw` 池 ⇒ **必须有 `InOut` 槽**(原地读写语义)。
+///
+/// **反向不查**:`InOut` 槽**不要求**池声明 —— 激活域的原地槽合法
+/// (`fused_add_rmsnorm` 的 `residual`、gdn 的 conv 态),它们不是"池"。
+#[test]
+fn pool_writers_have_a_carrying_slot() {
+    use owl_kernels::spec::{AccessMode, ParamRole};
+    for m in ops::all() {
+        let mut has_inout = false;
+        let mut has_out = false;
+        for p in m.params {
+            match p.role {
+                ParamRole::InOut => has_inout = true,
+                ParamRole::Out => has_out = true,
+                // 其余角色(Scratch/Const 等)不承载池写
+                _ => {}
+            }
+        }
+        for pa in m.pool {
+            match pa.mode {
+                AccessMode::Write => assert!(
+                    has_inout || has_out,
+                    "{}: 声明写池 {} 但无 InOut/Out 槽承载(写入落点不可见)",
+                    m.entry,
+                    pa.pool
+                ),
+                AccessMode::ReadWrite => assert!(
+                    has_inout,
+                    "{}: 声明读写池 {} 但无 InOut 槽(原地语义缺槽)",
+                    m.entry,
+                    pa.pool
+                ),
+                AccessMode::Read => {}
+            }
+        }
+    }
+}
+

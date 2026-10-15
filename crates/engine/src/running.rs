@@ -266,9 +266,35 @@ pub(crate) struct SpecStats {
     pub zero: usize,
 }
 
+/// **生成预算的最小保留量**(tok):剩余额度低于它 = 真溢出(连一个像样的
+/// 工具调用/短答都放不下)⇒ 拒绝,让客户端压缩上下文。
+///
+/// 取 1024:pi 的工具调用单轮实测 200-500 tok(含 reasoning 可到 1k+),1k 是
+/// "还能干活"的下限;低于它就算跑起来也是半截输出。
+pub const _MIN_GEN_TOKENS: usize = 1024;
+
+/// **预算收缩**(纯函数;2026-10-15):`base + max_new ≤ max_seq` 是 KV 槽位
+/// 硬约束,但**不因此拒绝** —— 先按剩余额度收缩生成长度。
+///
+/// 返回 `Ok(实际可用 max_new)`(≤ 请求值)/ `Err((base, max_new))`(放不下):
+/// `room = max_seq − base`;`room < _MIN_GEN_TOKENS` ⇒ Err,否则
+/// `min(max_new, room)`。
+pub fn budget_clamp(
+    base: usize,
+    max_new: usize,
+    max_seq: usize,
+) -> std::result::Result<usize, (usize, usize)> {
+    let room = max_seq.saturating_sub(base);
+    if room < _MIN_GEN_TOKENS {
+        return Err((base, max_new));
+    }
+    Ok(max_new.min(room))
+}
+
 impl<D: DeviceClient> RunningEngine<D> {
     /// 提交 turn(临时会话:每 turn 独立,终了即焚;行为同 M0.5)。
-    /// 预算越界 fail-fast:prompt + 生成 ≤ max_seq_tokens(= KV 槽位)。
+    /// 预算:prompt + 生成 ≤ max_seq_tokens(= KV 槽位);超出先收缩生成
+    /// (见 [`budget_clamp`]),只剩 < 1k 才拒。
     /// turn 域 spec 状态(turn 生命周期;仅活跃 turn 可触 —— 轮执行期
     /// active 恒在;turn 外触碰 = 调用序错误)
     pub(crate) fn tspec(&mut self) -> &mut TurnSpecState {
@@ -366,15 +392,39 @@ impl<D: DeviceClient> RunningEngine<D> {
             // 无会话 / 守卫未命中 → cached 0(语义默认,非失败)
             .map(|(cached, _)| cached)
             .unwrap_or(0);
-        let need = prompt_ids.len().max(cached_hit) + max_new;
-        if need > self.cfg.max_seq_tokens {
-            return Err(ModelError::Msg(format!(
-                "submit: prompt {} + 生成 {} 超预算 {}",
-                prompt_ids.len(),
-                max_new,
-                self.cfg.max_seq_tokens
-            )));
-        }
+        // 预算(会话感知):base = max(prompt, cached,命中增量段时前缀仍占槽)
+        // 不足 ⇒ **先收缩生成长度**(不是直接拒):agent 客户端(pi)每轮重发
+        // 系统提示 + 工具 schema + 历史,工作区 `AGENTS.md`+skills 一注入
+        // prompt 就 26k+,而它按 `models.json.maxTokens` 要 8192 ⇒ 旧行为
+        // 直接 400(实测:工作区里一句"1+1=?"都发不出去)。收缩后仍能跑,
+        // `finish_reason=length` 由客户端自行续写/压缩。
+        let base = prompt_ids.len().max(cached_hit);
+        let max_new = match budget_clamp(base, max_new, self.cfg.max_seq_tokens) {
+            Ok(m) => {
+                if m != max_new {
+                    owl_shared::log_warn!(
+                        "chat",
+                        "预算收缩: prompt {} + 生成 {} > max_seq {} ⇒ 生成长度收缩到 {} tokens",
+                        prompt_ids.len(),
+                        max_new,
+                        self.cfg.max_seq_tokens,
+                        m
+                    );
+                }
+                m
+            }
+            Err(_) => {
+                // 连 [_MIN_GEN_TOKENS] 都放不下 ⇒ 真溢出:客户端该压缩上下文。
+                // 报文保留"超预算"字样(server 面据此归一化为 context-overflow
+                // 语义,客户端才会自动 compact;见 apps/server/src/openai.rs)
+                return Err(ModelError::Msg(format!(
+                    "submit: prompt {} + 生成 {} 超预算 {}",
+                    prompt_ids.len(),
+                    max_new,
+                    self.cfg.max_seq_tokens
+                )));
+            }
+        };
         let (session_id, ephemeral) = match session {
             Some(id) => (self.get_or_create_evicting(Some(id))?, false),
             None => (self.get_or_create_evicting(None)?, true),
@@ -600,5 +650,30 @@ impl<D: DeviceClient> RunningEngine<D> {
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    //! 预算收缩单测(纯;工作区 pi 场景的实际数字)
+    use super::{budget_clamp, _MIN_GEN_TOKENS};
+
+    #[test]
+    fn clamps_instead_of_rejecting() {
+        // 工作区实测:prompt 26446 + 请求 8192 ⇒ 32768 装不下 → 收缩到 6322
+        assert_eq!(budget_clamp(26446, 8192, 32768), Ok(32768 - 26446));
+        // 装得下 ⇒ 原样(不动客户端请求)
+        assert_eq!(budget_clamp(12723, 8192, 32768), Ok(8192));
+        // 边界:刚好 = max_seq ⇒ 可用 0 …… 但 0 < 下限 ⇒ 拒
+        assert_eq!(budget_clamp(32768, 8192, 32768), Err((32768, 8192)));
+        // 剩余恰好 = 下限 ⇒ 放行(边界语义:≥ 下限即可)
+        assert_eq!(budget_clamp(32768 - _MIN_GEN_TOKENS, 8192, 32768), Ok(_MIN_GEN_TOKENS));
+        // 剩余 = 下限 − 1 ⇒ 拒(真溢出,客户端该压缩)
+        assert_eq!(
+            budget_clamp(32768 - _MIN_GEN_TOKENS + 1, 8192, 32768),
+            Err((32768 - _MIN_GEN_TOKENS + 1, 8192))
+        );
+        // base 已 ≥ max_seq(saturating)⇒ 拒,不 panic
+        assert!(budget_clamp(99999, 8192, 32768).is_err());
     }
 }

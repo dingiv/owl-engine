@@ -336,9 +336,21 @@ impl OpRegistry {
         // A) **声明的家族必须真实存在**:非 Native 的算子,其 `FAMILY` 必须在
         //    已装配的族 id 里 —— 否则那份元数据永远发不出去(路由收不到它),
         //    是纯粹的摆设。这是"声明驱动"的正面判据(旧设计靠 ops⊆names 事后校)。
+        //
+        //    **射程 = 激活集**(2026-10-15 用户裁决):`allowed = Some(白名单)`
+        //    时只审白名单里的声明 —— 生产 boot 用 flavor 白名单,语义 = "**会被
+        //    发射的**声明必须有族";白名单外的声明本就不参与路由。`allowed = None`
+        //    (= 全量激活,测试/工具面)保持原严格度。
+        //    副作用(正收益):空激活集 ⇒ 零孤儿 ⇒ **裸注册表可构造**,
+        //    `knows/execute 同源` 这类不依赖真家族的纪律可测(旧行为下空表必撞
+        //    本门 ⇒ 该测试自 A16 起挂红)。
         let ids: HashSet<&'static str> = families.iter().map(|f| f.id().0).collect();
         let orphan: Vec<&str> = crate::ops::all()
             .filter(|m| m.is_family() && !ids.contains(m.family.0))
+            .filter(|m| match allowed {
+                Some(a) => a.contains(&m.entry),
+                None => true,
+            })
             .map(|m| m.entry)
             .collect();
         if !orphan.is_empty() {
@@ -346,7 +358,7 @@ impl OpRegistry {
             return Err(OpError::Contract {
                 op: "registry".into(),
                 field: "KernelSpec::FAMILY",
-                expect: "非 Native 的算子,其家族必须已装配".into(),
+                expect: "激活集里的非 Native 算子,其家族必须已装配(白名单外不审)".into(),
                 got: format!("孤儿声明(家族不存在):{orphan:?}"),
             });
         }
@@ -477,12 +489,22 @@ mod tests {
     /// knows() = execute() 同源(knows 为真 → execute 找得到家族;
     /// knows 为假 → execute 结构化拒)。家族表零实例化即可判定的前提
     /// 是两处同表 —— 本测试锁死这条纪律。
+    ///
+    /// **为何走白名单构造**(2026-10-15)：A16 的声明驱动门(A)要求"激活集里的
+    /// 非 Native 声明必须有族" —— 空工厂表 + 全量激活 = 11 条孤儿 ⇒ 直接拒
+    /// (本测试自 A16 起挂红)。用**空激活集** `Some(&[])` ⇒ 零激活声明 ⇒
+    /// 裸注册表可构造，纪律照测。
     #[test]
     fn knows_and_execute_share_the_table() {
-        // 零 DeviceRes 环境无法 boot 真家族(assemble 需 GPU);
-        // 这里用空工厂表验证空集行为 + 名字集构造逻辑。
-        let mut reg =
-            OpRegistry::init_all(vec![], &mut NopRes, &mut crate::device::Exec::new()).expect("空表");
+        // 零 DeviceRes 环境无法 boot 真家族(assemble 需 GPU);这里用空工厂表
+        // + 空激活集验证空集行为 + 名字集构造逻辑。
+        let mut reg = OpRegistry::init_all_with(
+            vec![],
+            &mut NopRes,
+            &mut crate::device::Exec::new(),
+            Some(&[]),
+        )
+        .expect("空激活集");
         assert!(!reg.knows("anything"));
         let msg = LaunchMsg {
             kernel: crate::contract::KernelSource { name: "anything".into(), source: String::new() },
@@ -558,6 +580,9 @@ mod tests {
         }
         fn resolve(&self, _id: u64) -> Result<u64, OpError> {
             Err(OpError::Contract { op: "nop".into(), field: "resolve", expect: "-".into(), got: "-".into() })
+        }
+        fn resolve_len(&self, _id: u64) -> Result<usize, OpError> {
+            Err(OpError::Contract { op: "nop".into(), field: "resolve_len", expect: "-".into(), got: "-".into() })
         }
         fn alloc(&mut self, _bytes: usize, _tag: &'static str) -> Result<crate::device::ScratchBuf, OpError> {
             Err(OpError::Contract { op: "nop".into(), field: "alloc", expect: "-".into(), got: "-".into() })

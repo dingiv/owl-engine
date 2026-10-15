@@ -23,13 +23,11 @@ use owl_cuda::{
     GpuServer, KernelSource, LaunchMsg, ModelError, Shape,
 };
 
-const SCALE_CU: &str = r#"
-extern "C" __global__ void owl_scale_f32(
-    const float* x, float k, const size_t n, float* out) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < (int)n) { out[i] = x[i] * k; }
-}
-"#;
+// ⚠️ 本套件原用**内联 `.cu` 源**(`owl_scale_f32`)—— NVRTC 退役后"零运行期编译"
+// 硬门当场拒(自那次退役起本测试就失效)。2026-10-15 改为**真资产核**
+// `owl_add_f32`(声明面已建表 + 构建期 cubin 在场):契约面覆盖不变,
+// 且顺带把 L3 事实面(dtype/rank)一起过门。
+const ADD_KERNEL: &str = "owl_add_f32";
 
 // ============================================================================
 // 组装与断言辅助(纯 owl_cuda 面)
@@ -75,14 +73,16 @@ fn assert_all_close(got: &[f32], want: f32, ctx: &str) {
 }
 
 /// 手工装配 scale 发射(槽序契约:标量按声明序,输出块固定最后)
-fn scale_msg(x: &Bytes, out: &Bytes, k: f32, n: usize) -> LaunchMsg {
+/// `owl_add_f32`(a+b→out)发射消息(真资产核;声明槽序 = [a,b,out,n])
+fn add_msg(a: &Bytes, b: &Bytes, out: &Bytes, n: usize) -> LaunchMsg {
     LaunchMsg {
-        kernel: KernelSource { name: "owl_scale_f32".into(), source: SCALE_CU.into() },
+        // native 资产核:source 字段 = **资产 id**(server 按 (资产, 名) 查构建期 cubin)
+        kernel: KernelSource { name: ADD_KERNEL.into(), source: owl_kernels::ops::source(ADD_KERNEL).to_string() },
         args: vec![
-            Arg::block(x.id, x.dtype, x.rank),
-            Arg::F32(k),
-            Arg::U64(n as u64),
+            Arg::block(a.id, a.dtype, a.rank),
+            Arg::block(b.id, b.dtype, b.rank),
             Arg::block(out.id, out.dtype, out.rank),
+            Arg::U64(n as u64),
         ],
         grid: ((n as u32).div_ceil(256), 1, 1),
         block: (256, 1, 1),
@@ -124,12 +124,14 @@ async fn step_launch_scale(client: &mut GpuClient) {
         .await
         .expect("htod");
     let out = client.alloc(Dtype::F32, 4).await.expect("alloc").view(Dtype::F32, 1);
-    client
-        .launch(scale_msg(&x, &out, 3.0, 4))
+    let ys = [4.0f32; 4];
+    let y = client
+        .htod(Dtype::F32, &Shape::from(vec![4]), &le_f32(&ys))
         .await
-        .expect("launch");
+        .expect("htod y");
+    client.launch(add_msg(&x, &y, &out, 4)).await.expect("launch");
     let got = harvest(client, &out, 4).await;
-    assert_all_close(&got, 6.0, "scale 槽序");
+    assert_all_close(&got, 6.0, "add 槽序(2+4)");
 }
 
 /// 步骤 4:launch 后 sync 栅栏收割(大数组)
@@ -140,7 +142,12 @@ async fn step_sync_is_barrier(client: &mut GpuClient) {
         .await
         .expect("htod");
     let out = client.alloc(Dtype::F32, src.len()).await.expect("alloc").view(Dtype::F32, 1);
-    client.launch(scale_msg(&x, &out, 1.0, src.len())).await.expect("launch");
+    let zeros = vec![0.0f32; src.len()];
+    let y = client
+        .htod(Dtype::F32, &Shape::from(vec![src.len()]), &le_f32(&zeros))
+        .await
+        .expect("htod y");
+    client.launch(add_msg(&x, &y, &out, src.len())).await.expect("launch");
     let got = harvest(client, &out, src.len()).await;
     for (i, (g, w)) in got.iter().zip(src.iter()).enumerate() {
         assert_eq!(g, w, "sync 栅栏后 [{i}] = {g}, 期望 {w}");
@@ -150,16 +157,22 @@ async fn step_sync_is_barrier(client: &mut GpuClient) {
 /// 步骤 5:图捕获/重放
 /// 捕获期 Alloc = carve + 图内 memset 节点(重放重清零);scale 保发射数 > 0
 async fn step_graph_capture_and_replay(client: &mut GpuClient, x: &Bytes) {
+    // 捕获窗只放行 Launch/Alloc/MemsetZero/GraphEnd/Close ⇒ 输入须在 begin 之前上卡
+    let ones = [1.0f32; 4];
+    let y = client
+        .htod(Dtype::F32, &Shape::from(vec![4]), &le_f32(&ones))
+        .await
+        .expect("htod y");
     client.graph_begin().await.expect("graph_begin");
 
     // 捕获期 Alloc(切片块 + memset 进图)+ scale 发射
     let zeros = client.alloc(Dtype::F32, 4).await.expect("captured alloc").view(Dtype::F32, 1);
     let out = client.alloc(Dtype::F32, 4).await.expect("captured alloc").view(Dtype::F32, 1);
-    client.launch(scale_msg(x, &out, 3.0, 4)).await.expect("launch");
+    client.launch(add_msg(x, &y, &out, 4)).await.expect("launch");
 
     let gid = client.graph_end().await.expect("graph_end");
 
-    // 重放 ×2:memset 节点应重清零 zeros 块;scale 输出落同一批块
+    // 重放 ×2:memset 节点应重清零 zeros 块;add 输出落同一批块
     for i in 0..2 {
         client.graph_launch(gid).await.expect("graph_launch");
         let got_zeros = harvest(client, &zeros, 4).await;
@@ -168,7 +181,8 @@ async fn step_graph_capture_and_replay(client: &mut GpuClient, x: &Bytes) {
             "图内 memset 重放应清零,实得 {got_zeros:?}"
         );
         let got = harvest(client, &out, 4).await;
-        assert_all_close(&got, 3.0, &format!("replay #{i}"));
+        // x=[1.0;4] + y=[1.0;4] = 2.0(旧内联 scale 核口径是 x*3=3.0)
+        assert_all_close(&got, 2.0, &format!("replay #{i}"));
     }
 }
 
@@ -263,11 +277,16 @@ async fn gpu_server_contract() {
 /// S1 探针:小图(3 节点)与大图(~500 节点)各连发 100 次,分相计时。
 /// 判决:小图也 ms 级 = 系统性(驱动/环境);大图独有 = 节点规模税。
 async fn step_graph_launch_probe(client: &mut GpuClient, x: &Bytes) {
+    let zeros = [0.0f32; 4];
+    let y = client
+        .htod(Dtype::F32, &Shape::from(vec![4]), &le_f32(&zeros))
+        .await
+        .expect("htod y");
     for (tag, launches) in [("小图", 1usize), ("大图", 500usize)] {
         client.graph_begin().await.expect("begin");
         let out = client.alloc(Dtype::F32, 4).await.expect("alloc").view(Dtype::F32, 1);
         for _ in 0..launches {
-            client.launch(scale_msg(x, &out, 1.0, 4)).await.expect("launch");
+            client.launch(add_msg(x, &y, &out, 4)).await.expect("launch");
         }
         let gid = client.graph_end().await.expect("end");
         // 预热 1 次(首启分配路径)

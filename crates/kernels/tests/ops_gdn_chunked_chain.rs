@@ -108,6 +108,16 @@ impl DeviceRes for TestRes {
     fn capturing(&self) -> Result<bool, owl_kernels::contract::OpError> {
         Ok(false)
     }
+    fn resolve_len(&self, id: u64) -> Result<usize, owl_kernels::contract::OpError> {
+        self.blocks.get(&id).map(|s| s.len()).ok_or_else(|| {
+            owl_kernels::contract::OpError::Contract {
+                op: "test".into(),
+                field: "resolve_len",
+                expect: "块在册".into(),
+                got: id.to_string(),
+            }
+        })
+    }
     fn record_capture(&mut self, note: owl_kernels::device::LaunchNote) -> Result<(), owl_kernels::contract::OpError> {
         self.notes.borrow_mut().push(format!("{}/{}", note.op, note.kernel));
         Ok(())

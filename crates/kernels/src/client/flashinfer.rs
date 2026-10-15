@@ -6,18 +6,21 @@
 //! wr = 依赖边;sm_scale 以 f32 位型过线,server 面 from_bits 还原;
 //! nb 由页表推导,非线格式字段)。
 
-use crate::contract::{Arg, Bytes, Dtype, LaunchMsg, OpError};
+use crate::contract::{Bytes, LaunchMsg, OpError};
+
+pub use super::BlockRef;
 
 pub const PREFILL_FI: &str = crate::family::flashinfer::PREFILL_FI;
 pub const PREFILL_FI_FP8KV: &str = crate::family::flashinfer::PREFILL_FI_FP8KV;
 
 pub use super::fi_sig::{scale_bits, SIG};
 
-#[derive(Clone, Copy, Debug)]
-pub struct BlockRef {
-    pub id: u64,
-    pub byte_offset: u64,
-}
+/// `parse_prefill` 取用的槽名(声明序;两臂同名 —— F3 成对律,
+/// `client::tests::parse_slots_are_exactly_declared` 逐字锁死)。
+pub const PARSE_SLOTS: &[&str] = &[
+    "q", "k_cache", "v_cache", "q_cu", "indices", "indptr", "last_len", "wr", "out",
+    "total_rows", "ctx_total", "t", "hq", "hkv", "hd", "page", "sm_scale_bits",
+];
 
 #[derive(Clone, Debug)]
 pub struct FiPrefillCall {
@@ -43,61 +46,28 @@ pub struct FiPrefillCall {
     pub fp8kv: bool,
 }
 
-/// 解析(9 Block + 8 sz)
+/// 解析(9 Block + 8 sz)。**按名取址**(F3):槽名/槽序取自声明表
+/// (`ops::flashinfer` 两臂各自的 PARAMS —— 同型槽 `indices`↔`indptr`、
+/// `kc_fi`↔`vc` 对调 ⇒ 结构化拒而非静默错值)。
 pub fn parse_prefill(msg: &LaunchMsg) -> Result<FiPrefillCall, OpError> {
-    let mut blocks: Vec<BlockRef> = Vec::new();
-    let mut scalars: Vec<u64> = Vec::new();
-    for a in &msg.args {
-        match a {
-            Arg::Block { id, .. } => blocks.push(BlockRef { id: *id, byte_offset: 0 }),
-            Arg::BlockSlice { id, byte_offset, .. } => {
-                blocks.push(BlockRef { id: *id, byte_offset: *byte_offset })
-            }
-            Arg::U64(v) => scalars.push(*v),
-            _ => {
-                return Err(OpError::Contract {
-                    op: msg.kernel.name.clone(),
-                    field: "args",
-                    expect: "Block/BlockSlice/U64".into(),
-                    got: "其他".into(),
-                })
-            }
-        }
-    }
-    if blocks.len() != 9 || scalars.len() != 8 {
-        return Err(OpError::Contract {
-            op: msg.kernel.name.clone(),
-            field: "槽序",
-            expect: "9 Block + 8 sz".into(),
-            got: format!("{}B/{}S", blocks.len(), scalars.len()),
-        });
-    }
-    let q = blocks[0];
-    let kc_fi = blocks[1];
-    let vc = blocks[2];
-    let q_cu = blocks[3];
-    let indices = blocks[4];
-    let indptr = blocks[5];
-    let last_len = blocks[6];
-    let wr = blocks[7];
+    let s = crate::client::NamedSlots::new(msg)?;
     Ok(FiPrefillCall {
-        q,
-        kc_fi,
-        vc,
-        q_cu,
-        indices,
-        indptr,
-        last_len,
-        wr,
-        out: Bytes::new(blocks[8].id, 0, Dtype::F16, 2),
-        total_rows: scalars[0] as usize,
-        ctx_total: scalars[1] as usize,
-        t: scalars[2] as usize,
-        hq: scalars[3] as usize,
-        hkv: scalars[4] as usize,
-        hd: scalars[5] as usize,
-        page: scalars[6] as usize,
-        sm_scale: f32::from_bits(scalars[7] as u32),
-        fp8kv: msg.kernel.name == PREFILL_FI_FP8KV,
+        q: s.block("q")?,
+        kc_fi: s.block("k_cache")?,
+        vc: s.block("v_cache")?,
+        q_cu: s.block("q_cu")?,
+        indices: s.block("indices")?,
+        indptr: s.block("indptr")?,
+        last_len: s.block("last_len")?,
+        wr: s.block("wr")?,
+        out: s.out_block("out", 0)?,
+        total_rows: s.u64("total_rows")? as usize,
+        ctx_total: s.u64("ctx_total")? as usize,
+        t: s.u64("t")? as usize,
+        hq: s.u64("hq")? as usize,
+        hkv: s.u64("hkv")? as usize,
+        hd: s.u64("hd")? as usize,
+        page: s.u64("page")? as usize,
+        sm_scale: f32::from_bits(s.u64("sm_scale_bits")? as u32),        fp8kv: msg.kernel.name == PREFILL_FI_FP8KV,
     })
 }

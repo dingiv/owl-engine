@@ -64,6 +64,14 @@ impl DeviceRes for TestRes {
                 got: format!("id={}", id),
             })
     }
+    fn resolve_len(&self, id: u64) -> Result<usize, OpError> {
+        self.blocks.get(&id).map(|s| s.len()).ok_or_else(|| OpError::Contract {
+            op: "test".into(),
+            field: "resolve_len",
+            expect: "块在册".into(),
+            got: format!("id={}", id),
+        })
+    }
     fn alloc(&mut self, bytes: usize, _tag: &'static str) -> Result<ScratchBuf, OpError> {
         let s = unsafe { self.stream.alloc::<u8>(bytes.max(1)) }.map_err(|e| OpError::Contract {
             op: "test".into(),

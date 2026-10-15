@@ -38,6 +38,9 @@ impl DeviceRes for &mut dyn DeviceRes {
     fn resolve(&self, id: u64) -> Result<DevPtr, OpError> {
         (**self).resolve(id)
     }
+    fn resolve_len(&self, id: u64) -> Result<usize, OpError> {
+        (**self).resolve_len(id)
+    }
     fn alloc(&mut self, bytes: usize, tag: &'static str) -> Result<ScratchBuf, OpError> {
         (**self).alloc(bytes, tag)
     }
@@ -91,6 +94,16 @@ pub trait DeviceRes {
     /// 只要 id:句柄的其余字段(len/dtype/rank)是**事实面标注**,解析不看它们
     /// (2026-10-15:原签名收 `&Bytes`,逼出满地 `Bytes { id, len: 0 }` 占位块)
     fn resolve(&self, id: u64) -> Result<DevPtr, OpError>;
+    /// **块账长(字节)**—— 家族 runtime 在 FFI 直发**前**自证入参尺寸
+    /// (F2:marlin `ws` / xqa `scratch`)。
+    ///
+    /// 为什么必需:FFI/内核越界**不会当场报错**,而是写进邻块(A13 期间
+    /// "邻块 clobber"正是头号嫌疑)⇒ 少分配必须在这里**结构化拒**,而不是
+    /// 等内核踩出去。
+    ///
+    /// 与 [`resolve`](Self::resolve) 走**同一条解析路径**(同措辞的错,只是
+    /// 多回传账长);块不在本账本 ⇒ 拒。
+    fn resolve_len(&self, id: u64) -> Result<usize, OpError>;
     /// scratch 分配:账本 + 捕获 slab 感知 + A1.7 强租约
     fn alloc(&mut self, bytes: usize, tag: &'static str) -> Result<ScratchBuf, OpError>;
     /// 捕获状态查询(当前是否处于图捕获窗)

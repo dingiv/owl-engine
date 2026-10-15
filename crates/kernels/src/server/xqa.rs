@@ -120,6 +120,18 @@ fn emit(
     let sem = r("semaphores", &c.semaphores)?;
     let scratch = r("scratch", &c.scratch)?;
     let out = r("out", &crate::client::xqa::BlockRef { id: c.out.id, byte_offset: 0 })?;
+    // F2 入参尺寸自证:scratch 是内核的**持久工作区**(KV-split partial +
+    // 行归约),少分配 ⇒ 越界写邻块。精确需求随 geometry 变且住内核
+    // `MemSegmenter`(host 推 = 复制内核常量)⇒ 只守下限,公式/拒语住
+    // `family::xqa`。
+    let have_scr =
+        res.resolve_len(c.scratch.id)?.saturating_sub(c.scratch.byte_offset as usize);
+    crate::family::xqa::scratch_size_check(have_scr).map_err(|detail| OpError::Contract {
+        op: op.to_string(),
+        field: "scratch",
+        expect: format!("块账长 ≥ {} B(下限)", crate::family::xqa::XQA_SCRATCH_FLOOR_BYTES),
+        got: detail,
+    })?;
 
     // 图元(常量全部来自资产自描述;Rust 侧零复制)
     let (grid, block, smem) = consts.launch_geometry(

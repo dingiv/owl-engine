@@ -67,6 +67,47 @@ pub fn c_tmp_float_len_v2(m: usize, sms: usize) -> usize {
     sms * m_block * 256
 }
 
+// ============================================================================
+// F2 入参尺寸自证(家族面自证,不靠 FFI 越界才现形)
+// ============================================================================
+
+/// workspace **字节**下限(= `v2_workspace_len(n)` 个 i32)。
+///
+/// 门与内核同一公式(公式住本模块 = 唯一真源;server 侧不复制算式)。
+pub fn v2_workspace_bytes(n: usize) -> usize {
+    v2_workspace_len(n) * 4
+}
+
+/// c_tmp 槽位**字节**下限。
+///
+/// 固化路径 `use_fp32_reduce=false` **不触碰** c_tmp,而精确公式
+/// [`c_tmp_float_len_v2`] 依赖运行时 m/sms(装载期不可知,故生产块只有
+/// 1 个 word)⇒ 这里只守「槽位有实体」(≥ 1 word),防零容量块/空 alias;
+/// 将来真启用 fp32-reduce 时,本函数与装载侧一起升到精确公式。
+pub const C_TMP_MIN_BYTES: usize = 4;
+
+/// F2 判决(纯):workspace 尺寸(`have` = 块账长)。
+pub fn ws_size_check(n: usize, have: usize) -> Result<(), String> {
+    let need = v2_workspace_bytes(n);
+    if have < need {
+        return Err(format!(
+            "ws 块账长 {have} B < 需要 {need} B(v2_workspace_len({n})={} 个 i32)",
+            v2_workspace_len(n)
+        ));
+    }
+    Ok(())
+}
+
+/// F2 判决(纯):c_tmp 尺寸(`have` = 块账长;下限语义见 [`C_TMP_MIN_BYTES`])。
+pub fn c_tmp_size_check(have: usize) -> Result<(), String> {
+    if have < C_TMP_MIN_BYTES {
+        return Err(format!(
+            "c_tmp 块账长 {have} B < {C_TMP_MIN_BYTES} B(槽位须有实体;固化路径不触碰但不可为零容量)"
+        ));
+    }
+    Ok(())
+}
+
 pub fn v2_err_str(err: i32) -> &'static str {
     match err {
         V2_ERR_NO_CONFIG => "no kernel config for this shape/dtype",
@@ -259,3 +300,31 @@ pub unsafe fn gemm_v2_awq_raw(
 
 #[cfg(feature = "marlin")]
 pub mod repack;
+
+#[cfg(test)]
+mod size_checks {
+    //! F2 尺寸判决单测(纯;门/公式同源 —— 公式住本模块,server 侧不复制算式)
+    use super::*;
+
+    /// 够长放行 / 短一截拒(1040 的 workspace 实为 1040*4 B;少 1 B 即红)
+    #[test]
+    fn ws_need_is_the_kernel_formula() {
+        let n = 4096usize;
+        assert_eq!(v2_workspace_len(n), (n / 64) * 128);
+        let need = v2_workspace_bytes(n);
+        assert_eq!(need, v2_workspace_len(n) * 4);
+        assert!(ws_size_check(n, need).is_ok());
+        let e = ws_size_check(n, need - 1).unwrap_err();
+        assert!(e.contains("ws 块账长"), "拒语须指名槽位与两边尺寸: {e}");
+        assert!(ws_size_check(n, 0).is_err(), "零容量块应拒");
+    }
+
+    /// c_tmp 下限 = 1 word(生产块恰为 1 个 U32)
+    #[test]
+    fn c_tmp_floor_is_one_word() {
+        assert_eq!(C_TMP_MIN_BYTES, 4);
+        assert!(c_tmp_size_check(C_TMP_MIN_BYTES).is_ok());
+        let e = c_tmp_size_check(0).unwrap_err();
+        assert!(e.contains("c_tmp 块账长"), "拒语须指名槽位: {e}");
+    }
+}

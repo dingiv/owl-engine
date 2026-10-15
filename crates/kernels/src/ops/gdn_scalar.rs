@@ -32,10 +32,16 @@ impl KernelSpec for GdnScalarDeltaRuleFwd {
         Param::t_out("out", Dtype::F16, 3),
         Param::sz("t"),
         Param::sz("slot"),
+        // ⚠️ 语义序(2026-10-15 F3 定谳):线上第 3..6 个标量是
+        // **ns/hv(=v 头数)/nk/kd**,不是旧表写的 nv/nk/kd/vd —— 旧表把
+        // 四个槽整体错位一格(名字与值不对应),导致本文件 `check` 的
+        // `slot × hv·kd·kd·4` 边界校验算成了 `slot × ns·nk·nk·4`
+        // (**过宽**,真的越界不报)。层侧(`layers/gdn.rs::scalar_delta`)
+        // 发的是 `ns=1, nv, nk, kd` —— 与修正后的名字逐位对齐。
+        Param::sz("ns"),
         Param::sz("nv"),
         Param::sz("nk"),
         Param::sz("kd"),
-        Param::sz("vd"),
         // kd^-0.5 位型走私(显式 token)
         Param::s("scale_bits", ScalarTy::F32Bits),
     ];
@@ -83,14 +89,14 @@ impl KernelSpec for GdnScalarDeltaRuleFwd {
             expect: "状态块在账本(可查账长)".into(),
             got: "未知块/不在账本".into(),
         })?;
-        let (nv, kd) = (sz("nv")?, sz("kd")?);
-        let stride = nv
+        let (hv, kd) = (sz("nv")?, sz("kd")?);
+        let stride = hv
             .checked_mul(kd)
             .and_then(|x| x.checked_mul(kd))
             .and_then(|x| x.checked_mul(4))
             .ok_or_else(|| OpError::Contract {
                 op: Self::ENTRY.into(),
-                field: "nv*kd*kd*4",
+                field: "hv*kd*kd*4",
                 expect: "不溢出".into(),
                 got: "checked_mul 溢出".into(),
             })?;

@@ -696,13 +696,24 @@ fn e2e_server_suite() {
             sse.contains("\"finish_reason\":\"tool_calls\""),
             "有工具调用 ⇒ finish_reason 必须是 tool_calls"
         );
-        // 提取 arguments(pi 侧的终极判据:必须能解析成 JSON 对象)
-        let args = sse
-            .split("\"arguments\":\"")
-            .nth(1)
-            .and_then(|r| r.split('"').next())
-            .unwrap_or("")
-            .to_string();
+        // 提取 arguments(pi 侧的终极判据:必须能解析成 JSON 对象)。
+        // ⚠️ **必须按 SSE JSON 解析后拼接 delta** —— 不能用 `split('"')`:
+        // SSE 帧里 arguments 是**字符串字段**,其内层引号被转义(`{\"command\":…}`),
+        // 朴素截断会在第一个 `\"` 处断成 `{\`(2026-10-15 实测:该断言自诞生起
+        // 只在"模型没发工具"时被跳过,一旦真发就假红 —— 测试自身缺陷,非引擎问题)。
+        let mut args = String::new();
+        for line in sse.lines() {
+            let Some(payload) = line.strip_prefix("data: ") else { continue };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else { continue };
+            for d in v["choices"].as_array().into_iter().flatten() {
+                for tc in d["delta"]["tool_calls"].as_array().into_iter().flatten() {
+                    if let Some(a) = tc["function"]["arguments"].as_str() {
+                        args.push_str(a);
+                    }
+                }
+            }
+        }
+        assert!(!args.is_empty(), "I4:有 tool_calls 却没拿到 arguments delta");
         let av: serde_json::Value = serde_json::from_str(&args)
             .unwrap_or_else(|e| panic!("I4:arguments 必须是合法 JSON 串({e}):{args:?}"));
         assert!(av.is_object(), "I4:arguments 应为对象:{av}");

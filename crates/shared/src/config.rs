@@ -740,7 +740,7 @@ kv_fp8 = true
 # 池写集穷举审计(读必有人写 + 声明自洽 + 活跃写者不歧义)。
 allowed_ops = [
         "cublas_gemm_bf16", "cublas_gemm_f16",
-        "flashinfer_prefill_paged_fp8kv", "gdn_chunked_delta_rule_fwd",
+        "flashinfer_prefill_paged_f16", "flashinfer_prefill_paged_fp8kv", "gdn_chunked_delta_rule_fwd",
         "marlin_gemm_w4a16_awq", "marlin_gemm_w4a16_bf16",
         "owl_add_bf16", "owl_add_f16",
         "owl_argmax_f32idx_f16", "owl_cast_bf16_f16",

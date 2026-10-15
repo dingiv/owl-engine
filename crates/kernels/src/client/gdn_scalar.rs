@@ -10,6 +10,14 @@ use crate::family::gdn_scalar::GDN_SCALAR_FWD;
 pub const GDN_SCALAR: &str = GDN_SCALAR_FWD;
 pub const SIG: &str = "T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz,sz";
 
+/// `parse` 取用的槽名(声明序;⚠️ 线上第 3..6 个标量的真语义是
+/// **ns/hv/nk/kd** —— 2026-10-15 F3 修正,旧表曾错标为 nv/nk/kd/vd) ——
+/// F3 成对律,`client::tests::parse_slots_are_exactly_declared` 逐字锁死。
+pub const PARSE_SLOTS: &[&str] = &[
+    "q", "k", "v", "beta", "gate", "state", "out", "t", "slot", "ns", "nv", "nk", "kd",
+    "scale_bits",
+];
+
 #[derive(Clone, Copy, Debug)]
 pub struct GdnScalarShape {
     pub t: u32,
@@ -67,48 +75,32 @@ impl GdnScalarCall {
         ]
     }
 
-    /// 反序列化唯一点(7 Block + 7 sz;ns=1 单序列门)
+    /// 反序列化唯一点(7 Block + 7 sz;ns=1 单序列门)。**按名取址**(F3):
+    /// 槽名/槽序全取自声明表(`ops::gdn_scalar`)—— 顺带定谳一处**声明标错**
+    /// (旧表把 ns/hv/nk/kd 写成 nv/nk/kd/vd ⇒ `check` 的 slot 越界校验用的是
+    /// 错维:stride 算成了 ns*nk*nk*4;2026-10-15 随 F3 一并修正)。
     pub fn parse(msg: &LaunchMsg) -> Result<(Self, Bytes), OpError> {
-        let mut blocks: Vec<Bytes> = Vec::new();
-        let mut scalars: Vec<u64> = Vec::new();
-        for a in &msg.args {
-            match a {
-                Arg::Block { id, dtype, rank } => blocks.push(Bytes::new(*id, 0, *dtype, *rank)),
-                Arg::BlockSlice { id, byte_offset, elems: _, dtype, rank } => {
-                    if *byte_offset != 0 {
-                        return Err(contract("args", "Block(零偏移)", "BlockSlice"));
-                    }
-                    blocks.push(Bytes::new(*id, 0, *dtype, *rank));
-                }
-                Arg::U64(v) => scalars.push(*v),
-                _ => return Err(contract("args", "Block/U64", "其他")),
-            }
+        let s = crate::client::NamedSlots::new(msg)?;
+        let ns = s.u64("ns")?;
+        if ns != 1 {
+            return Err(contract("ns", "1(单序列)", &ns.to_string()));
         }
-        if blocks.len() != 7 {
-            return Err(contract("blocks", "7", &blocks.len().to_string()));
-        }
-        if scalars.len() != 7 {
-            return Err(contract("scalars", "7", &scalars.len().to_string()));
-        }
-        if scalars[2] != 1 {
-            return Err(contract("ns", "1(单序列)", &scalars[2].to_string()));
-        }
-        let out = blocks[6].clone();
+        let out = s.out_block("out", msg.out_elems)?;
         Ok((
             Self {
-                q: blocks[0].clone(),
-                k: blocks[1].clone(),
-                v: blocks[2].clone(),
-                g: blocks[3].clone(),
-                beta: blocks[4].clone(),
-                state: blocks[5].clone(),
-                slot: scalars[1] as u32,
+                q: s.flat_block("q")?,
+                k: s.flat_block("k")?,
+                v: s.flat_block("v")?,
+                g: s.flat_block("gate")?,
+                beta: s.flat_block("beta")?,
+                state: s.flat_block("state")?,
+                slot: s.u64("slot")? as u32,
                 shape: GdnScalarShape {
-                    t: scalars[0] as u32,
-                    ns: scalars[2] as u32,
-                    nv: scalars[3] as u32,
-                    nk: scalars[4] as u32,
-                    kd: scalars[5] as u32,
+                    t: s.u64("t")? as u32,
+                    ns: ns as u32,
+                    nv: s.u64("nv")? as u32,
+                    nk: s.u64("nk")? as u32,
+                    kd: s.u64("kd")? as u32,
                 },
             },
             out,

@@ -278,7 +278,7 @@ pub fn audit_active(
 pub const PROD_SPEC_DFLASH_2026_10_13: &[&str] = &[
     "cublas_gemm_bf16",
     "cublas_gemm_f16",
-    "flashinfer_prefill_paged_fp8kv",
+    "flashinfer_prefill_paged_f16", "flashinfer_prefill_paged_fp8kv",
     "gdn_chunked_delta_rule_fwd",
     "marlin_gemm_w4a16_awq",
     "marlin_gemm_w4a16_bf16",
@@ -367,7 +367,7 @@ pub const PROD_AWQ27B_2026_10_13: &[&str] = &[
 pub const PRODUCTION_UNION_2026_10_13: &[&str] = &[
     "cublas_gemm_bf16",
     "cublas_gemm_f16",
-    "flashinfer_prefill_paged_fp8kv",
+    "flashinfer_prefill_paged_f16", "flashinfer_prefill_paged_fp8kv",
     "gdn_chunked_delta_rule_fwd",
     "marlin_gemm_w4a16_awq",
     "marlin_gemm_w4a16_bf16",
@@ -591,7 +591,7 @@ mod tests {
         // 只锁名字时这两类变更**不触发任何门**;2026-10-15 审查定谳)。
         const EXPECT: &[(&str, &[&str], &[&str])] = &[
             (crate::family::gdn_chunked::GDN_CHUNKED_FWD, &["q", "k", "v", "beta", "gate", "state", "out", "t", "slot", "nv", "nk", "kd", "scale_bits"], &["F16x3", "F16x3", "F16x3", "F16x2", "F16x2", "F32x4", "F16x3", "U64", "U64", "U64", "U64", "U64", "F32Bits"]),
-            (crate::family::gdn_scalar::GDN_SCALAR_FWD, &["q", "k", "v", "beta", "gate", "state", "out", "t", "slot", "nv", "nk", "kd", "vd", "scale_bits"], &["F32x3", "F32x3", "F32x3", "F32x2", "F32x2", "F32x4", "F16x3", "U64", "U64", "U64", "U64", "U64", "U64", "F32Bits"]),
+            (crate::family::gdn_scalar::GDN_SCALAR_FWD, &["q", "k", "v", "beta", "gate", "state", "out", "t", "slot", "ns", "nv", "nk", "kd", "scale_bits"], &["F32x3", "F32x3", "F32x3", "F32x2", "F32x2", "F32x4", "F16x3", "U64", "U64", "U64", "U64", "U64", "U64", "F32Bits"]),
             (crate::family::marlin::GEMM_W4A16_AWQ, &["a", "b", "out", "scales", "zeros", "ws", "c_tmp", "m", "k", "n", "groupsize"], &["F16x2", "U32x2", "F16x2", "F16x2", "U32x2", "U32x1", "U32x1", "U64", "U64", "U64", "U64"]),
             (crate::family::marlin::GEMM_W4A16_BF16, &["a", "b", "out", "scales", "ws", "c_tmp", "m", "k", "n", "groupsize"], &["BF16x2", "U32x2", "BF16x2", "F16x2", "U32x1", "U32x1", "U64", "U64", "U64", "U64"]),
             (crate::family::marlin::GEMM_W4A16, &["a", "b", "out", "scales", "ws", "c_tmp", "m", "k", "n", "groupsize"], &["F16x2", "U32x2", "F16x2", "F16x2", "U32x1", "U32x1", "U64", "U64", "U64", "U64"]),

@@ -17,12 +17,17 @@
 //! ⚠️ g 语义律:本面只产 **raw gate**;cumsum 产物是运行时私有态,
 //! 客户端不可达(类型面堵死 raw/cumsum 混喂)。
 
-use crate::contract::{Arg, Bytes, Dtype, KernelSource, LaunchMsg, OpError};
+use crate::contract::{Arg, Bytes, KernelSource, LaunchMsg, OpError};
 
 /// 家族名(字面量住址 = `family::gdn_chunked`;models 经本常量引用)
 pub const GDN_CHUNKED: &str = crate::family::gdn_chunked::GDN_CHUNKED_FWD;
 /// 槽序签名(lower_kernel 对位;O = 输出槽)
 pub const SIG: &str = "T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz";
+
+/// `parse` 取用的槽名(声明序) —— F3 成对律;
+/// `client::tests::parse_slots_are_exactly_declared` 逐字锁死。
+pub const PARSE_SLOTS: &[&str] =
+    &["q", "k", "v", "beta", "gate", "state", "out", "t", "slot", "nv", "nk", "kd", "scale_bits"];
 
 /// raw 门控(f16;层侧 g 原块)—— 客户端面唯一产出的 g 形态
 #[derive(Clone, Debug)]
@@ -120,52 +125,29 @@ impl GdnChunkedCall {
         ]
     }
 
-    /// 反序列化唯一点:server 面从此读。**现状诚实边界**(2026-10-15 审查补正):
-    /// 实现 = **按位置切片 + 个数断言**(`blocks.len() != 7` / `scalars.len() != 6`)
-    /// ⇒ **同型槽错位不报错**(第二份槽序语义的已知缺口;双锁见
-    /// `ops::tests::slot_order_lock_family_ops`,按名取址待办)。
-    /// out = 解释器追加的输出块(O 槽,第 7 块)。
-    /// BlockSlice 仅认零偏移(eval slice_view(0,..) 合法产物;非零偏移
-    /// 本面不适用 —— 与 gdn_scalar 面同一口径,2026-10-12 review I-6 统一)。
+    /// 反序列化唯一点:server 面从此读。**按名取址**(F3,2026-10-15):
+    /// 槽名/槽序全取自声明表(`ops::gdn_chunked`),同型槽对调或名字漂移
+    /// ⇒ **结构化拒**,不再有第二份槽序语义(旧“位置切片 + 个数断言”
+    /// 的缺口已堵)。
+    /// out = 解释器追加的输出块(O 槽)。BlockSlice 仅认零偏移
+    /// (eval slice_view(0,..) 合法产物;非零偏移本面不适用 —— 与
+    /// gdn_scalar 面同一口径,2026-10-12 review I-6 统一)。
     pub fn parse(msg: &LaunchMsg) -> Result<(Self, Bytes), OpError> {
-        let mut blocks: Vec<Bytes> = Vec::new();
-        let mut scalars: Vec<u64> = Vec::new();
-        for a in &msg.args {
-            match a {
-                Arg::Block { id, dtype, rank } => blocks.push(Bytes::new(*id, 0, *dtype, *rank)),
-                Arg::BlockSlice { id, byte_offset, elems: _, dtype, rank } => {
-                    if *byte_offset != 0 {
-                        return Err(contract_err("args", "Block(零偏移)", "非零偏移 BlockSlice"));
-                    }
-                    blocks.push(Bytes::new(*id, 0, *dtype, *rank));
-                }
-                Arg::U64(v) => scalars.push(*v),
-                Arg::I32(v) => scalars.push(*v as u64),
-                Arg::F32(_) => {
-                    return Err(contract_err("args", "sz", "F32 标量(本面标量全 sz/U64)"));
-                }
-            }
-        }
-        if blocks.len() != 7 {
-            return Err(contract_err("blocks", "7", &blocks.len().to_string()));
-        }
-        if scalars.len() != 6 {
-            return Err(contract_err("scalars", "6", &scalars.len().to_string()));
-        }
+        let s = crate::client::NamedSlots::new(msg)?;
         let shape = GdnShape {
-            t: scalars[0] as u32,
-            nv: scalars[2] as u32,
-            nk: scalars[3] as u32,
-            kd: scalars[4] as u32,
+            t: s.u64("t")? as u32,
+            nv: s.u64("nv")? as u32,
+            nk: s.u64("nk")? as u32,
+            kd: s.u64("kd")? as u32,
         };
-        let out = blocks[6].clone();
+        let out = s.out_block("out", msg.out_elems)?;
         let call = Self {
-            q: blocks[0].clone(),
-            k: blocks[1].clone(),
-            v: blocks[2].clone(),
-            beta: blocks[3].clone(),
-            gate: GateRaw(blocks[4].clone()),
-            state: StateSlot { pool: blocks[5].clone(), slot: scalars[1] as u32 },
+            q: s.flat_block("q")?,
+            k: s.flat_block("k")?,
+            v: s.flat_block("v")?,
+            beta: s.flat_block("beta")?,
+            gate: GateRaw(s.flat_block("gate")?),
+            state: StateSlot { pool: s.flat_block("state")?, slot: s.u64("slot")? as u32 },
             shape,
         };
         Ok((call, out))
@@ -197,15 +179,6 @@ impl GdnChunkedCall {
     pub fn gate(&self) -> &GateRaw { &self.gate }
     pub fn state(&self) -> &StateSlot { &self.state }
     pub fn shape(&self) -> GdnShape { self.shape }
-}
-
-fn contract_err(field: &'static str, expect: &str, got: &str) -> OpError {
-    OpError::Contract {
-        op: GDN_CHUNKED.to_string(),
-        field,
-        expect: expect.to_string(),
-        got: got.to_string(),
-    }
 }
 
 /// builder(字段名即契约;类型不对编译不过,长度不对构造期结构化报错)
@@ -333,6 +306,7 @@ impl GdnChunkedCallBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contract::Dtype;
 
     fn shape(t: u32) -> GdnShape {
         GdnShape { t, nv: 48, nk: 16, kd: 128 }

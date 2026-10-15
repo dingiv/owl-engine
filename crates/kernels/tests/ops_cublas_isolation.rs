@@ -49,6 +49,12 @@ impl DeviceRes for TestRes {
             .map(|s| s.device_ptr(&self.stream).0)
             .ok_or_else(|| OpError::Contract { op: "t".into(), field: "resolve", expect: "在册".into(), got: id.to_string() })
     }
+    fn resolve_len(&self, id: u64) -> Result<usize, OpError> {
+        self.blocks
+            .get(&id)
+            .map(|s| s.len())
+            .ok_or_else(|| OpError::Contract { op: "t".into(), field: "resolve_len", expect: "在册".into(), got: id.to_string() })
+    }
     fn alloc(&mut self, bytes: usize, _tag: &'static str) -> Result<ScratchBuf, OpError> {
         let d = self.stream.alloc_zeros::<u8>(bytes).expect("alloc");
         let ptr = d.device_ptr(&self.stream).0;

@@ -32,9 +32,13 @@ pub trait Interpreter {
     fn matmul(&mut self, a: &Value, b: &Value, dtype: Dtype, shape: &Shape) -> Result<Value, ModelError>;
     /// MatmulNt:[m,k]×(B [n,k] 直读)→ [m,n]
     fn matmul_nt(&mut self, a: &Value, b: &Value, dtype: Dtype, shape: &Shape) -> Result<Value, ModelError>;
-    /// Add(同形)
-    fn add(&mut self, a: &Value, b: &Value) -> Result<Value, ModelError>;  // FIXME: 这几个相加的、相乘的这个方法是不是过时了？不要再写了，可以移除掉这几个方法??
-    /// Mul(同形逐元素乘;MLP 门控/输出门)
+    /// Add(同形)—— **不是过时方法**(2026-10-15 复核):`reduce` 的
+    /// `Op::Call { SemanticKernel::Add }` 臂就派发到这里,而层侧
+    /// (decoder 残差 / dflash2 累加 / mtp)真发 Add/Mul 语义算子 ⇒
+    /// `CpuInterpreter` 作为**对拍锚**(与 `owl-cpu` / `owl-cuda` 互为独立副本)
+    /// 必须实现它们;删掉 = 参考面留白洞(图里有 Add 时对拍直接失明)。
+    fn add(&mut self, a: &Value, b: &Value) -> Result<Value, ModelError>;
+    /// Mul(同形逐元素乘;MLP 门控/输出门)—— 同 `add`,勿删(`Op::Call{Mul}` 臂派发于此)
     fn mul(&mut self, a: &Value, b: &Value) -> Result<Value, ModelError>;
     /// Silu
     fn silu(&mut self, x: &Value) -> Result<Value, ModelError>;

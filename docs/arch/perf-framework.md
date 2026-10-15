@@ -1121,17 +1121,19 @@ A13 分解表 `mask=2 → 198` 那格是两个变量」—— **实测不成立*
 |---|---|
 | `op_tables::op_tables_match_cu_param_names`(**新**) | 声明表形参**名** == `.cu` 形参名(逐位含序);121 张 native 表全绿。取证口与 token 级**同一实现**(`cu_sig::cu_params_of` 三形态:宏展开/单层宏实例化/字面核) |
 | `spec::tests` +7 | 事实面正例 / dtype 负例 / rank 负例 / **事实缺失必拒** / `rank=0` 通配 / Out 禁 BlockSlice / 未知块拒 / 几何律 / `slot_sources` 与 O 位一致 |
+| **`op_tables::non_family_out_slot_is_last_tensor`(新)** | 非族算子 `out_pos()` 必须 = **最后一个张量槽**(现役回传 ABI:"末位 Block = 输出";家族豁免 —— marlin AWQ 的 out 在槽 2,其 runtime 按名取 out)。**负例验红**(把 concat 的 out 移到首位 ⇒ 点名报错) |
+| **`op_tables::pool_writers_have_a_carrying_slot`(新)** | ① 声明 `write`/`rw` 池 ⇒ 必有 `InOut`/`Out` 槽承载写入 ② `rw` 池 ⇒ 必有 `InOut` 槽(反向不查:激活域原地槽合法)。落地时**修 6 处角色不如实**(gdn `conv_upd`/`delta_dec`/`decode_step`:声明 `rw(GDN_STATE)` 却写 `In`) |
 | A17 锁表 | 11 个族算子的 (名序, 类型签名) 按新声明**重生成**(`gdn_chunked` beta/gate = F16x2;`gdn_scalar` = F32x3/F32x2;xqa/FI/cublas/marlin 池句柄口径) |
 
 ### 19.7 验收
 
 | 判据 | 结果 |
 |---|---|
-| 单测/门 | kernels **63/63** · op_tables **8/8** · no_runtime_compile **2/2** · models **123/123**(目标首次可编译)· cuda **6/6 + 2/2 + 1/1**(`--lib`/门;`gpu_server` 集成测试见下)· shared **39/39** |
+| 单测/门 | kernels **63/63** · **op_tables 10/10**(+`out_pos` 门 +池写集↔角色门)· no_runtime_compile **2/2** · models **123/123**(目标首次可编译)· cuda **6/6 + 2/2 + 1/1** · shared **39/39** · server **33/33 + 2/2 + 1/1** |
 | 真机 fp8 档(6 请求 × ptok 543…2453) | **6/6 `tool_calls`** + `[L3 事实面]` 拒绝 **0** |
 | 真机 **f16-KV 档**(同模型,`kv_fp8=false`) | boot/plan/请求全绿 + 拒绝 **0**(这条档就是上面那个静默 bug 的现场) |
 | 事实面口径 | **服务端** `check_from_params` 唯一门(客户端零自查);`Arg`/`Bytes` 携带 dtype/rank;`DeviceRes::resolve(id)` |
-| 存量失效(非本轮) | `backends/cuda/tests/gpu_server.rs::gpu_server_contract` 用**内联 `.cu` 源**跑 `owl_scale_f32` —— NVRTC 退役后的"零运行期编译"硬门当场拒(该测试自那次退役起就失效,与事实面无关);要复活需给它一个构建期资产 |
+| 存量失效 → **已修** | `cuda/tests/gpu_server.rs` 的内联 `owl_scale_f32` → **真资产核 `owl_add_f32`**(`KernelSource.source` 须给资产 id)⇒ 契约套件 **2/2 复活**(自 NVRTC 退役以来首次可跑);`apps/server/tests/e2e.rs` 的 **I4 假红**同批修(SSE `arguments` 转义截断 ⇒ 改按 SSE-JSON 解析拼 delta)⇒ e2e 转绿 |
 | 数值指纹 | 同一探针点(t=31/379/405)gap = **4.57812 / 4.32812 / 4.56250** 与改动前**逐位相同** |
 
 ### 19.8 诚实边界(未验路径)
@@ -1144,3 +1146,120 @@ A13 分解表 `mask=2 → 198` 那格是两个变量」—— **实测不成立*
   它是**显式**声明(不是漏写),但确实弱于具体阶数 ⇒ 复核时优先看这些槽。
 - `ShapeRule`(符号维)仍是**空机制**(121 张表 0 处填)⇒ shape 级检查(维度顺序/转置)
   仍未落地;本轮把事实面接口开在 `TensorFacts` 上,将来加 shape 只需扩该结构 + 求值器。
+
+## 二十、声明面收尾:尺寸自证 + 按名取址 + rank=0 复核(2026-10-15;台账 §F F2/F3/F5c)
+
+§18.4 遗留三项里的前两项当日落地(第三项 = prefill 上 CUDA Graph,另账)。
+
+### 20.1 F2:家族面**入参尺寸自证**(`DeviceRes::resolve_len`)
+
+**问题**:家族 runtime 直连 FFI/launch(不经 `Command`),入参**尺寸**只在注释、
+装载器、公式三处各自记账 —— 少分配时 FFI/内核**不会当场报错**,而是越界写邻块
+(A13 期间"邻块 clobber"正是头号嫌疑)。
+
+**落地**:
+
+| 面 | 变化 |
+|---|---|
+| `DeviceRes` | 新方法 `resolve_len(id) -> usize`(**必实现**,不给缺省:每个资源面自己声明"账长怎么来的");与 `resolve` 走**同一条解析路径**(`GpuRes::resolve_span`,错措辞只有一份) |
+| 实现面 | `GpuRes` 覆写(账房 `block_ptr` 的物理长度)+ `&mut dyn DeviceRes` 转发 + **4 处测试替身**(registry `NopRes` / gdn chain / cublas isolation / oracles) |
+| marlin | `ws` 严格比公式(`v2_workspace_len(n) × 4 B`)——公式与拒语原文住 `family::marlin`(server 只做 `String → OpError` 映射,**不复制算式**);`c_tmp` 守**非空下限 1 word**(固化路径 `use_fp32_reduce=false` 不触碰,精确公式依赖运行时 m/sms ⇒ 只守"槽位有实体,不可零容量/空 alias") |
+| xqa | `scratch` 守**下限** `XQA_SCRATCH_FLOOR_BYTES = 1 MiB`;精确需求随 geometry 变且住内核 `MemSegmenter`,host 侧重推 = **复制内核常量** ⇒ 违本仓"零常量复制"律 ⇒ 只守量级(抓 1 word/4 KiB 类错,不抓 1.5× 少分配;生产定档 32 MiB、测试 64 MiB 远在其上) |
+| 边界语义 | `BlockSlice` 兼容:可用字节 = **账长 − 块内偏移**;不足 ⇒ `OpError::Contract`(field 指名槽位,`expect` 给需求字节,`got` 给实得字节) |
+
+**验收**:纯函数单测 3(够长放行 / 短一截拒 / 零容量拒;含"拒语须指名槽位")+
+**接线负例 1**(`server/marlin.rs::f2_gate`:账长替身 + AWQ 消息 ⇒ 门在 FFI 前拒,
+`field="ws"`/`"c_tmp"`;够长时放行到替身的 `stream()` 上,证明拦它的不是门)+
+真机 `selfcheck_oracles` **8/8**(marlin oracle 走的就是公式尺寸 ⇒ 无假阳)。
+
+### 20.2 F3:`parse` 与 builder **成对按名取址**
+
+**问题**:6 个 client parse 全是**位置切片**(`blocks[0]`/`scalars[0]`) + 个数断言
+⇒ "槽序"知识在**声明表 `PARAMS`** 与 parse 各存一份;同型槽对调时 L3 放行而
+解析器**静默错值**(gdn 两族的注释里就写着这条已知缺口)。
+
+**落地**:
+
+| 面 | 变化 |
+|---|---|
+| `client::NamedSlots`(新) | 线格式的**按名视图**:`new(msg)` 要求算子**已建表**(未建表 = 结构化拒,不回落位置切片)→ `block(name)` / `flat_block(name)`(零偏移口径,gdn 面)/ `out_block(name, elems)`(dtype/rank 取**声明**侧)/ `u64(name)`(sz 与 F32Bits 走私槽) |
+| `client::BlockRef` | **唯一住址**(原 cublas/flashinfer/marlin/xqa 四份同构副本删除,各族 `pub use` 保持旧路径) |
+| 6 个 parse | cublas / marlin(两臂)/ flashinfer / xqa / gdn_chunked / gdn_scalar 全部改按名取址 |
+| **`PARSE_SLOTS` 锁**(新,`client::tests::parse_slots_are_exactly_declared`) | 每个 parse 的槽名表与声明表**集合逐字相等** ⇒ 改名/插槽/漏跟 = **测试期红**(不等到运行时)。**另一半锁** = `ops::tests::slot_order_lock_family_ops` 的名字**序列** ⇒ **同型槽对调**由它拦。两把锁缺一不可:集合挡"漏跟",序列挡"对调" |
+
+**判据边界(诚实)**:线格式不带槽名 ⇒ **手搓消息**(测试/oracle/探针)若把同型槽
+摆错位,按名取址读到的仍是"声明意义上的那个槽";这类由 L3 的**槽类型对位**+
+各族对拍门兜。真正的收益是:**解析器不再持有第二份槽序**(改声明必须连带改的具体
+位置只剩 `PARSE_SLOTS` 一处,而它被机器锁着)。
+
+**顺手抓到真 bug**:**`gdn_scalar` 的声明把线上第 3..6 个标量整体错标一格**
+(线上真语义 `ns, nv, nk, kd`,旧表写 `nv, nk, kd, vd`)⇒ 该文件 `check` 里
+`slot` 越界校验的 stride 算成了 `ns·nk·nk·4`(**过宽**,真越界不报;正品是
+`hv·kd·kd·4`)。修正 = 声明改名 + `check` 变量名 + A17 锁表项随改。
+
+### 20.3 F5c:`rank = 0` 复核(真机 rank 表;工具入库)
+
+A20 把逐元素核/多臂共用槽显式标成 `rank=0`(阶数无关)——弱于具体阶数。要判
+"能不能收紧"不能靠读调用点猜,故:
+
+- **工具**:`OWL_L3_AUDIT=1`(在 `check_from_params` 事实面里,只对声明 `rank=0`
+  的槽生效;**OnceLock 门 ⇒ 关账 = 一次原子读**,去重键 = (op, 槽名, rank) ⇒
+  每个三元组只打一行)。工具**入库**(F5a 未验档的验证同样用它)。
+- **数据**(真机 27B,每档 boot + 3 个请求 90/950/2000 词):
+
+| 档 | 三元组数 | 备注 |
+|---|---:|---|
+| `ls-off`(fp8 KV + XQA + chunked) | 70 | 含 `vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256` 四件套 = rank1 |
+| `ls-f16`(f16 KV + FI/`paged v2`) | 70 | 同一槽可能两档都见;差异 = 池族专属算子(`_f16_knhd` / `_fp8kv_knhd`) |
+
+- **结论(逐类)**:
+  1. **同一 (op, 槽) 出现多个 rank ⇒ 必须维持 0**。实测多例:
+     `owl_norm_rope_*/pos`(1,2)、`owl_embed_f16::ids`(1,2)、
+     `owl_concat_rows_*::i0..i7`(1,2)、`owl_reshape_and_cache_*::slot_mapping`(1,2)、
+     `owl_dflash_select_bf16::anchor`(1,2)、`gdn_conv_fwd::cu_seqlens/slots`(1,2)、
+     `gdn_conv_fwd::conv_state`(1,2,3)、`gdn_recurrence_varlen_gqa::state`(1,4)、
+     `vllm_paged_attention_v2_f16_knhd_hd256bs32::alibi_slopes`(1,2)、
+     `xqa::{mask, wr}`(1,2,**表内已注记**表两臂共用)。
+  2. **占位/旗标槽 ⇒ 诚实维持 0**:`...::sinks`(层侧传 `kv.slots` 占位、
+     `use_sinks` 关)、`alibi_slopes`(多数臂传常量块)——它们**语义上无阶数**。
+  3. **单档单 rank 的候选(auto-tighten)不采**:该 op 是**全仓共用**的
+     (逐元素/铸核:add/sigmoid/cast/argmax/…),其他 flavor(0.8B/nex/holo/未验臂)
+     可能喂别的阶数 ⇒ 现在收紧 = 拿 F5a 未验路径去撞门。**收紧的前置** =
+     逐档跑 `OWL_L3_AUDIT=1` 拿到跨档一致的单 rank 表(工具已就位)。
+
+### 20.4 验收(同配置 A/B,**逐位**)
+
+| 判据 | 结果 |
+|---|---|
+| 单测/门 | kernels `--lib` **68/68**(默认 feature;+F2/F3 新增 6)· `--lib --features device,cublas,marlin,flashinfer,xqa` **76/77** —— 唯一红 = `registry::tests::knows_and_execute_share_the_table`(**A16 起就红**:空工厂表必撞 A16 孤儿声明门;非本轮引入,见 §F F8)· op_tables **10/10** · no_runtime_compile 2/2 · models `--lib` **123/123** · cuda **2/2**(gpu_server)+ 1/1 + 2/2 · shared 39/39 · server `ops_whitelist` 2/2 |
+| 真机(GPU 0,selfcheck) | `selfcheck_oracles` **8/8**(marlin oracle = F2 门的正例路径) |
+| 真机 27B **fp8/chunked 档**(6 请求,ptok 543…2453) | **6/6 `tool_calls`** + 探针 `gap = 4.57812 / 4.25000 / 4.32812 / 4.67188 / 4.56250 / 4.32812` —— 与 A20 基线**逐位相同** ⇒ F2/F3 **零代价、零漂移** |
+| 真机 27B **scalar 档**(`gdn_chunked=false`;F3 改名命中面) | boot + **3/3 `tool_calls`**(`gap ≈ 4.48 / 4.27 / 4.47`,与 chunked 档同健康区) |
+
+### 20.5 追加(同日,F6 批量 + F8)
+
+| # | 项 | 结论 |
+|---|---|---|
+| F6a | 生产档 `gdn_chunked` 回落**已撤**(用户裁决) | `testdata/server/agent-27b.toml` → `[dispatch] gdn_chunked = true`(A13 回落注释改写为撤回依据)。撤后真机(8137,chunked + prefix_cache):boot 绿 + **3/3 `tool_calls`**,TTFT 0.83/1.05/1.51s(scalar 臂对照 1.01/1.62/2.60s)⇒ 恢复 FLA 六核 prefill(~2100µs → ~383µs / 层 chunk) |
+| F6b | `reference.rs` 的 `add`/`mul` FIXME | **不是过时方法**:`reduce` 的 `Op::Call{SemanticKernel::Add/Mul}` 臂就派发到它们,层侧(decoder 残差/dflash2 累加/mtp)真发 Add/Mul ⇒ `CpuInterpreter` 作为对拍锚(与 `owl-cpu`/`owl-cuda` 互为独立副本)必须实现。FIXME → 判据注记 |
+| F6c | `cuda/build.rs` 的 `CARGO_FEATURE_CUPTI` | 改 `cfg!(feature = "cupti")`(cargo 把本包 feature 作为 `--cfg` 交给 build script;`CARGO_FEATURE_*` 是实现细节、且会被外部环境继承污染)。实测:开 feature 真编 shim、关 feature 零动作 |
+| F6d | 热路径计时器 | `handle_launch` 原**无条件** `Instant::now` + `kernel.name.clone()` + `format!`(而 `srv.tx`/`srv.queue` 两段早已由 `sink.timing()` 门控 ⇒ `srv.op` 是唯一漏网)⇒ **先问 `sink.timing()` 再建载荷**;gpu_prof 臂的注释同处改注(该臂由 bool 门控,且开启档本就要逐核 `synchronize()`)。真机 A/B:探针 gap 仍**逐位相同** |
+| F8 | `registry::tests::knows_and_execute_share_the_table`(A16 起在 device-feature lib 跑下必红) | 孤儿门(A16)**射程改为激活集**:`allowed = Some(白名单)` 时只审白名单内声明(语义 = "会被发射的声明必须有族"),`None` 保持全量严格。空激活集 ⇒ 零孤儿 ⇒ 裸注册表可构造,该测试复活。**kernels lib 带全 feature 77/77 全绿** |
+
+### 20.6 agent 服务面复验(A10 结案 + pi 真机端到端;2026-10-15)
+
+**A10(跨会话块级前缀缓存 \"失效\")定谳 = 档口径,不是引擎**:首轮复测所用的两档
+(`split-on/off.toml`,以及 `ls-off/ls-f16.toml` —— 都是 `ls-off` 副本)全部
+`prefix_cache = false` ⇒ 跨会话块级缓存**根本没开**,T5 `cached_tokens=0` 是应然。
+生产档(`agent-27b.toml`,`prefix_cache = true`)同探针:`T2 同会话 217/239`、
+**`T5 跨会话 1536/1732 = 88.7%`**、content sha 等价 ⇒ **G4 全绿**;
+`gdn_chunked = true/false` 两臂都命中(与 prefill 臂无关)。
+残留**设计限制**(D1 已记,非 bug):快照只在分块 prefill 末位 32 对齐处拍照 ⇒
+短 prompt 常无快照可复用(≥2 分块的长 prompt 稳定命中)。
+
+**真机 pi → owl 端到端**(判据 = M-A 的\"工具闭环\"):
+`pi --provider owl --model qwen3.8-27b -p \"用 bash 写 owl_probe.txt,再用 read 读回\"`
+⇒ 3 轮、12 tools、**模型真发 tool calls**(bash 建文件 + read 回读)、文件落地内容
+`owl-agent-ok`、末答正确;服务端侧:末轮 prompt **12950 / cached 12931**(增量只 19 行
+⇒ §4.3 对称律的会话增量复用生效),零 abort 零 error(唯一 WARN = pi 多发的
+`store` 字段,收下未生效)。

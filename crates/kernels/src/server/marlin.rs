@@ -44,6 +44,7 @@ impl KernelFamily for MarlinRuntime {
         let scales = r(&call.scales)?;
         let ws = r(&call.ws)?;
         let c_tmp = r(&call.c_tmp)?;
+        check_pack_sizes(&msg.kernel.name, &call, res)?;
         let dev = res.device_ordinal()?;
         let stream = res.stream()?;
         res.note_device("fam_ffi_launch", &msg.kernel.name, 0, &[a, b, out]);
@@ -104,6 +105,7 @@ impl MarlinRuntime {
         })?)?;
         let ws = r(&call.ws)?;
         let c_tmp = r(&call.c_tmp)?;
+        check_pack_sizes(&msg.kernel.name, &call, res)?;
         let dev = res.device_ordinal()?;
         let stream = res.stream()?;
         // 家族面入账(A13 补漏):**直连 FFI 发射**不计 `Command` ⇒ 账上本无痕。
@@ -128,3 +130,146 @@ impl MarlinRuntime {
     }
 }
 
+/// **F2 入参尺寸自证**(两臂共用):FFI 越界**不会当场报错**而是写进邻块
+/// (A13 期间 `邻块 clobber` 正是头号嫌疑)⇒ 在直发**前**拿块账长比公式。
+/// 公式与拒语原文均住 `family::marlin`(单源;此处只做 `String → OpError` 映射)。
+fn check_pack_sizes(
+    op: &str,
+    call: &crate::client::marlin::MarlinCall,
+    res: &dyn crate::device::DeviceRes,
+) -> Result<(), OpError> {
+    // BlockSlice 兼容:可用字节 = 账长 − 块内偏移
+    let have_ws = res.resolve_len(call.ws.id)?.saturating_sub(call.ws.byte_offset as usize);
+    marlin::ws_size_check(call.n, have_ws).map_err(|detail| OpError::Contract {
+        op: op.to_string(),
+        field: "ws",
+        expect: format!("块账长 ≥ {} B", marlin::v2_workspace_bytes(call.n)),
+        got: detail,
+    })?;
+    let have_ct = res.resolve_len(call.c_tmp.id)?.saturating_sub(call.c_tmp.byte_offset as usize);
+    marlin::c_tmp_size_check(have_ct).map_err(|detail| OpError::Contract {
+        op: op.to_string(),
+        field: "c_tmp",
+        expect: format!("块账长 ≥ {} B", marlin::C_TMP_MIN_BYTES),
+        got: detail,
+    })?;
+    Ok(())
+}
+
+
+#[cfg(all(test, feature = "device"))]
+mod f2_gate {
+    //! F2 门**接线**证明(负例;零 GPU):ws/c_tmp 块短一截 ⇒ `run` 在
+    //! 「解析后、FFI 发射前」结构化拒(field 指名槽位),而不是让 FFI 越界写
+    //! 邻块。正例(够长放行)在 `family::marlin::size_checks`(纯函数)。
+    use super::*;
+    use crate::contract::{Arg, Dtype, KernelSource};
+    use crate::device::ScratchBuf;
+    use crate::registry::KernelFamily;
+
+    /// 账长替身:只回答 `resolve_len`(本测试的判决输入);其余面一律 Err ——
+    /// 走到了就是接线错了(这些面本应在门之后才被调用)。
+    struct FixedRes {
+        ws_len: usize,
+        c_tmp_len: usize,
+    }
+    impl crate::device::DeviceRes for FixedRes {
+        fn context(&self) -> Result<std::sync::Arc<cudarc::driver::CudaContext>, OpError> {
+            Err(unexpected("context"))
+        }
+        fn stream(&self) -> Result<std::sync::Arc<cudarc::driver::CudaStream>, OpError> {
+            Err(unexpected("stream"))
+        }
+        fn resolve(&self, _id: u64) -> Result<u64, OpError> {
+            Ok(0x1000) // 占位指针:门只看账长,不看地址
+        }
+        fn resolve_len(&self, id: u64) -> Result<usize, OpError> {
+            Ok(match id {
+                6 => self.ws_len,
+                7 => self.c_tmp_len,
+                _ => 1 << 20,
+            })
+        }
+        fn alloc(&mut self, _b: usize, _t: &'static str) -> Result<ScratchBuf, OpError> {
+            Err(unexpected("alloc"))
+        }
+        fn capturing(&self) -> Result<bool, OpError> {
+            Err(unexpected("capturing"))
+        }
+        fn record_capture(&mut self, _n: crate::device::LaunchNote) -> Result<(), OpError> {
+            Err(unexpected("record_capture"))
+        }
+        fn upload(&mut self, _d: u64, _s: &[u8]) -> Result<(), OpError> {
+            Err(unexpected("upload"))
+        }
+        fn device_ordinal(&self) -> Result<i32, OpError> {
+            Err(unexpected("device_ordinal"))
+        }
+        fn upload_block(&mut self, _b: &crate::contract::Bytes, _s: &[u8]) -> Result<(), OpError> {
+            Err(unexpected("upload_block"))
+        }
+        fn alloc_block(&mut self, _b: usize, _t: &'static str) -> Result<crate::contract::Bytes, OpError> {
+            Err(unexpected("alloc_block"))
+        }
+        fn download(&mut self, _s: u64, _d: &mut [u8]) -> Result<(), OpError> {
+            Err(unexpected("download"))
+        }
+    }
+    fn unexpected(what: &str) -> OpError {
+        OpError::Contract {
+            op: "f2.gate".into(),
+            field: "unexpected",
+            expect: format!("门应在 FFI 前拦下,不该走到 {what}()"),
+            got: "走到了".into(),
+        }
+    }
+
+    /// AWQ 臂 7 块 + 4 sz(n=2560 ⇒ ws 需求 = 2560/64*128*4 = 20480 B)
+    fn awq_msg() -> crate::contract::LaunchMsg {
+        let blk = |id: u64| Arg::block(id, Dtype::F16, 2);
+        crate::contract::LaunchMsg {
+            kernel: KernelSource { name: crate::family::marlin::GEMM_W4A16_AWQ.into(), source: String::new() },
+            args: vec![
+                blk(1), blk(2), blk(3), blk(4), blk(5), blk(6), blk(7),
+                Arg::U64(64), Arg::U64(2560), Arg::U64(2560), Arg::U64(32),
+            ],
+            grid: (0, 0, 0),
+            block: (0, 0, 0),
+            shared_mem: 0,
+            out_elems: 64 * 2560,
+        }
+    }
+
+    #[test]
+    fn short_ws_is_rejected_before_ffi() {
+        let need = marlin::v2_workspace_bytes(2560);
+        // 够长 ⇒ 门放行(随后撞在替身的 stream() 上 —— 证明拦它的不是门)
+        let mut ok = FixedRes { ws_len: need, c_tmp_len: 4 };
+        let mut rt = MarlinRuntime;
+        let e = rt
+            .run(&awq_msg(), &mut ok, &mut crate::device::Exec::new())
+            .expect_err("替身无 GPU 面,门后必拒");
+        assert!(matches!(&e, OpError::Contract { field: "unexpected", .. }), "门不该拦够长的 ws: {e}");
+
+        // 短 1 B ⇒ 门在 FFI 前拒,且指名槽位与两边尺寸
+        let mut short = FixedRes { ws_len: need - 1, c_tmp_len: 4 };
+        let e = rt
+            .run(&awq_msg(), &mut short, &mut crate::device::Exec::new())
+            .expect_err("ws 短一截必拒");
+        match &e {
+            OpError::Contract { field, expect, got, .. } => {
+                assert_eq!(*field, "ws");
+                assert!(expect.contains(&need.to_string()), "expect 须带需求字节: {expect}");
+                assert!(got.contains("ws 块账长"), "got 须保留 family 拒语: {got}");
+            }
+            other => panic!("期望结构化 Contract,得 {other:?}"),
+        }
+
+        // c_tmp 零容量 ⇒ 同样在 FFI 前拒(公式语义在 family 单源)
+        let mut no_ct = FixedRes { ws_len: need, c_tmp_len: 0 };
+        let e = rt
+            .run(&awq_msg(), &mut no_ct, &mut crate::device::Exec::new())
+            .expect_err("c_tmp 零容量必拒");
+        assert!(matches!(&e, OpError::Contract { field: "c_tmp", .. }), "{e}");
+    }
+}

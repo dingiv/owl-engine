@@ -360,6 +360,40 @@ pub fn error_json(msg: impl Into<String>) -> Value {
     json!({"error": {"message": msg.into(), "type": "invalid_request_error"}})
 }
 
+/// **契约溢出类**拒绝的规范短语(pi 的 `OVERFLOW_PATTERNS` 原文之一)。
+///
+/// 用途:引擎的预算越界拒绝(`submit: prompt N + 生成 M 超预算 K`)是**中文裸
+/// 报文**——pi 的 `isContextOverflow()` **只看报文文本**与它的
+/// `OVERFLOW_PATTERNS` 做正则匹配(bundle 实测:`prompt (is )?too long` /
+/// `prompt exceeds max length` / `/request_too_large/` /
+/// `input is too long for requested model` / `exceeds the context window` /
+/// `exceeds … maximum context length…`);不在词表里 ⇒ pi 当**普通 400**
+/// 原样展示,**不触发自动 compaction** —— 这正是《设计》§3.6
+/// 「上下文超限须归一化为 context_length_exceeded 语义」的挂账项。
+///
+/// 修法:越界拒绝一律在 message 尾追加本短语 + `code` 字段;两轮重试
+/// (pi 压缩后重发)即自愈。
+const OVERFLOW_PHRASE: &str = "prompt exceeds max length";
+
+/// 引擎"预算越界"的稳定标记(中文诊断是引擎的既有输出)
+fn is_budget_reject(err: &str) -> bool {
+    err.contains("超预算")
+}
+
+/// 拒绝面 → wire 归一化(唯一实现;两处拒绝出口共用)
+pub fn error_json_for_reject(err: String) -> Value {
+    if is_budget_reject(&err) {
+        return json!({"error": {
+            "message": format!(
+                "{err}({OVERFLOW_PHRASE}: prompt + max_tokens > max_seq;请缩短上下文/压缩历史后重试)"
+            ),
+            "type": "invalid_request_error",
+            "code": "context_length_exceeded",
+        }});
+    }
+    error_json(err)
+}
+
 fn now() -> u64 {
     unix().as_secs()
 }
@@ -523,7 +557,9 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
             Some((session, turn))
         }
         Some(SinkEvent::Rejected { err }) => {
-            return http::respond_json(w, 400, &error_json(err)).await
+            // 预算越界 ⇒ 归一化为 pi 能认的 context-overflow 报文
+            // (否则 pi 不自动 compact;见 `error_json_for_reject` 注)
+            return http::respond_json(w, 400, &error_json_for_reject(err)).await
         }
         // 契约:首笔必为 Accepted/Rejected(actor 在 pump 前投递)⇒ 不会走到
         // 这里(真走到 = 协议序错乱,不静默吞)
@@ -906,5 +942,40 @@ mod tests {
         let r: ChatRequest = serde_json::from_value(json!({
             "messages":[{"role":"user","content":"x"}]})).expect("parse");
         assert_eq!(r.max_new(&agent), (2048, false));
+    }
+
+    /// **上下文溢出归一化**(wire 契约;设计 §3.6 挂账项)。
+    ///
+    /// pi 的 `isContextOverflow()` **只看报文文本**与它的 `OVERFLOW_PATTERNS`
+    /// 做正则匹配(两轮门 `explicitOverflow`/`assistantUsageMatchesProjection`
+    /// 都只要报文命中)⇒ 引擎的中文"超预算"必须带上词表里的规范短语,否则
+    /// pi 把它当**普通 400** 原样展示、**不触发自动 compaction**。
+    /// 词表 = pi-ai bundle 实测(2026-10-15;改短语就同步改这里 + 复核 bundle)。
+    #[test]
+    fn budget_reject_is_normalized_for_pi_compaction() {
+        const PI_OVERFLOW_PATTERNS: &[&str] = &[
+            "prompt (is )?too long",
+            "prompt exceeds max length",
+            "request_too_large",
+            "input is too long for requested model",
+            "exceeds the context window",
+            "exceeds .* maximum context length",
+        ];
+        // ① 短语必须**逐字**在词表里
+        assert!(
+            PI_OVERFLOW_PATTERNS.contains(&OVERFLOW_PHRASE),
+            "OVERFLOW_PHRASE {OVERFLOW_PHRASE:?} 不在 pi 词表里"
+        );
+        // ② 引擎原诊断保留 + code 落位(绝不静默改写)
+        let raw = "submit: prompt 27584 + 生成 8192 超预算 32768";
+        let body = error_json_for_reject(raw.to_string());
+        let msg = body["error"]["message"].as_str().expect("message");
+        assert!(msg.starts_with(raw), "原诊断须保留: {msg}");
+        assert!(msg.contains(OVERFLOW_PHRASE), "{msg}");
+        assert_eq!(body["error"]["code"], "context_length_exceeded");
+        // ③ 非预算拒绝不动(无 code、报文原样)
+        let plain = error_json_for_reject("messages 为空".into());
+        assert!(plain["error"].get("code").is_none());
+        assert_eq!(plain["error"]["message"], "messages 为空");
     }
 }

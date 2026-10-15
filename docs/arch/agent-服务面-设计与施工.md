@@ -307,11 +307,18 @@ data: [DONE]
 | 场景 | 响应 |
 |---|---|
 | 请求体非法/缺 messages/未支持字段 | `400` + `{"error":{"message":…,"type":"invalid_request_error"}}`(生命周期正确,pi 会用于 compaction/重试判断) |
-| 上下文超限(超 `max_seq`) | **须归一化为 `context_length_exceeded` 语义**(pi 据此触发 compaction) |
+| 上下文超限(超 `max_seq`) | ✅ **已落地(2026-10-15)**，两段：① **预算收缩**(`engine::running::budget_clamp`):`prompt + max_tokens > max_seq` 时**不直接拒**，先把生成长度收缩到剩余额度(下限 1024 tok)，`finish_reason=length` 由客户端自行续写/压缩；② **真溢出**(连 1024 都放不下) ⇒ `400` + 报文带上 pi 词表的规范短语 `prompt exceeds max length` + `code="context_length_exceeded"`(`openai::error_json_for_reject`；引擎原中文诊断**逐字保留**) ⇒ pi 的 `isContextOverflow()` 认出并走 compaction/上下文修复。词表来源 = pi-ai bundle `OVERFLOW_PATTERNS`(实测 2026-10-15)，锁在 `server` 单测 `budget_reject_is_normalized_for_pi_compaction` |
 | 引擎未就绪/断流 | `503`(现状) |
 | 生成中错误(已开始 SSE) | `error` 帧 + `[DONE]`(现状 `TurnEvent::Failed` 分支) |
 
 > 注意 pi 会识别**上下文溢出**类错误并自动 compact+retry;**不要把限流/瞬时错误伪装成溢出**。
+>
+> **为什么必须两段都要(2026-10-15 实测)**:pi 每轮**重发全量上下文**(系统提示 + 工具
+> schema + 历史);在工作区根(`/home/div/Documents/codes`，`AGENTS.md` 28 KB)它单次
+> 系统提示就 ≈ **26.4k tok**(pi 自己的对话窗口只够装 24.6k —— 因为 `models.json.maxTokens
+> = 8192` 把 32k 预算吃掉四分之一)。只做归一化 ⇒ 系统提示本身超的部分压不下去，pi
+> 会反复 compaction 仍发不出去;只做收缩 ⇒ 真溢出时无报错信息可识别。故两段共存:
+> **能跑就先跑(收缩)，真跑不动才报(归一化)**。
 
 ### 3.7 pi 侧目标配置(`~/.pi/agent/models.json`)
 

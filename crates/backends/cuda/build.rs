@@ -12,13 +12,16 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-
-    // FIXME: 这个是做什么的? 不允许依赖环境变量 CARGO_FEATURE_CUPTI
     println!("cargo:rerun-if-changed=native/cupti_shim.c");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
 
-    // feature 关(缺省)= 零动作:不进链接面
-    if std::env::var("CARGO_FEATURE_CUPTI").is_err() {
+    // feature 关(缺省)= 零动作:不编 shim、不进链接面。
+    //
+    // 判据用编译期 `cfg!`(cargo 把本包的 feature 作为 `--cfg feature=".."`
+    // 传给 build script)**不**读 `CARGO_FEATURE_*` 环境变量 ——
+    // 后者是 cargo 的实现细节(未写进 build script 契约),且会被外部环境
+    // 污染/继承(在本仓踩过“环境变量泄漏 ⇒ 构建面静默变样”类问题)。
+    if !cfg!(feature = "cupti") {
         return;
     }
 

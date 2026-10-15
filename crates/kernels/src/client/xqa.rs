@@ -10,17 +10,21 @@
 //! `sem.zero_()`)。图内路线 = 图里挂一个零写节点(引擎接线时落;本步
 //! 层测试由调用方直接给零张量)。
 
-use crate::contract::{Arg, Bytes, Dtype, LaunchMsg, OpError};
+use crate::contract::{Bytes, LaunchMsg, OpError};
 
 pub const VERIFY_XQA: &str = crate::family::xqa::VERIFY_XQA;
 /// 裸 decode 臂(同名解析口径 —— 槽序与 verify 同型,解析函数复用)
 pub const DECODE_XQA: &str = crate::family::xqa::DECODE_XQA;
 
-#[derive(Clone, Copy, Debug)]
-pub struct BlockRef {
-    pub id: u64,
-    pub byte_offset: u64,
-}
+pub use super::BlockRef;
+
+/// `parse_verify` 取用的槽名(声明序;两臂共用一张表 —— F3 成对律,
+/// `client::tests::parse_slots_are_exactly_declared` 逐字锁死)。
+pub const PARSE_SLOTS: &[&str] = &[
+    "q", "k_cache", "v_cache", "page_table", "seq_lens", "mask", "semaphores", "scratch",
+    "wr", "out", "q_seq_len", "hkv", "hd", "page", "max_seq_len", "q_scale_bits", "sm_count",
+    "stride_page", "stride_token", "stride_head",
+];
 
 #[derive(Clone, Debug)]
 pub struct XqaVerifyCall {
@@ -47,58 +51,33 @@ pub struct XqaVerifyCall {
     pub stride_head: usize,
 }
 
+/// 解析(9 Block + 10 sz;两臂同型)。**按名取址**(F3):槽名/槽序取自
+/// 声明表(`ops::xqa` 双臂共一张表);槽位漂移/名字打错 ⇒ 结构化拒。
 pub fn parse_verify(msg: &LaunchMsg) -> Result<XqaVerifyCall, OpError> {
-    let mut blocks: Vec<BlockRef> = Vec::new();
-    let mut scalars: Vec<u64> = Vec::new();
-    for a in &msg.args {
-        match a {
-            Arg::Block { id, .. } => blocks.push(BlockRef { id: *id, byte_offset: 0 }),
-            Arg::BlockSlice { id, byte_offset, .. } => {
-                blocks.push(BlockRef { id: *id, byte_offset: *byte_offset })
-            }
-            Arg::U64(v) => scalars.push(*v),
-            _ => {
-                return Err(OpError::Contract {
-                    op: msg.kernel.name.clone(),
-                    field: "args",
-                    expect: "Block/BlockSlice/U64(9 Block + 10 sz)".into(),
-                    got: format!("{a:?}"),
-                })
-            }
-        }
-    }
-    let need = (10, 10);
-    if blocks.len() != need.0 || scalars.len() != need.1 {
-        return Err(OpError::Contract {
-            op: msg.kernel.name.clone(),
-            field: "argc",
-            expect: format!("{} Block + {} sz", need.0, need.1),
-            got: format!("{} Block + {} sz", blocks.len(), scalars.len()),
-        });
-    }
+    let s = crate::client::NamedSlots::new(msg)?;
     Ok(XqaVerifyCall {
-        q: blocks[0],
-        // 槽序:[q, k, v, page_table, seq_lens, mask, semaphores, scratch, wr]
-        //      + out(解释器追加)
-        out: Bytes::new(blocks[9].id, 0, Dtype::F16, 2),
-        k_cache: blocks[1],
-        v_cache: blocks[2],
-        page_table: blocks[3],
-        seq_lens: blocks[4],
-        mask: blocks[5],
-        semaphores: blocks[6],
-        scratch: blocks[7],
-        wr: blocks[8],
-        q_seq_len: scalars[0] as usize,
-        hkv: scalars[1] as usize,
-        hd: scalars[2] as usize,
-        page: scalars[3] as usize,
-        max_seq_len: scalars[4] as usize,
-        q_scale: f32::from_bits(scalars[5] as u32),
-        sm_count: scalars[6] as usize,
-        stride_page: scalars[7] as usize,
-        stride_token: scalars[8] as usize,
-        stride_head: scalars[9] as usize,
+        q: s.block("q")?,
+        // 槽序:[q, k_cache, v_cache, page_table, seq_lens, mask, semaphores,
+        //       scratch, wr] + out(解释器追加)
+        out: s.out_block("out", 0)?,
+        k_cache: s.block("k_cache")?,
+        v_cache: s.block("v_cache")?,
+        page_table: s.block("page_table")?,
+        seq_lens: s.block("seq_lens")?,
+        mask: s.block("mask")?,
+        semaphores: s.block("semaphores")?,
+        scratch: s.block("scratch")?,
+        wr: s.block("wr")?,
+        q_seq_len: s.u64("q_seq_len")? as usize,
+        hkv: s.u64("hkv")? as usize,
+        hd: s.u64("hd")? as usize,
+        page: s.u64("page")? as usize,
+        max_seq_len: s.u64("max_seq_len")? as usize,
+        q_scale: f32::from_bits(s.u64("q_scale_bits")? as u32),
+        sm_count: s.u64("sm_count")? as usize,
+        stride_page: s.u64("stride_page")? as usize,
+        stride_token: s.u64("stride_token")? as usize,
+        stride_head: s.u64("stride_head")? as usize,
     })
 }
 

@@ -871,6 +871,14 @@ fn check_tensor_facts(op: &str, p: &Param, i: usize, a: &Arg) -> Result<(), OpEr
         });
     }
     // 声明 rank = 0 ⇒ 显式阶数无关(核按计数扁平索引)
+    if want_rank == 0 {
+        // [临时审计 F5c] 声明 0 的槽,记录**实际喂进来的 rank** ——
+        // 用途:找出哪些 "阶数无关" 其实在全部生产臂上都是固定阶数(可收紧)。
+        // 去重键 = (op, 槽名, rank);`OWL_L3_AUDIT=1` 才开(零成本关账)。
+        if *L3_AUDIT_ON.get_or_init(|| std::env::var_os("OWL_L3_AUDIT").is_some()) {
+            l3_audit_note(op, p.name, got_rank);
+        }
+    }
     if want_rank != 0 && got_rank != want_rank {
         return Err(OpError::Contract {
             op: op.to_string(),
@@ -882,8 +890,31 @@ fn check_tensor_facts(op: &str, p: &Param, i: usize, a: &Arg) -> Result<(), OpEr
     Ok(())
 }
 
-fn type_name(p: &Param) -> &'static str {
-    match p.ty {
+// ── [审计工具] 声明 rank=0 的槽实际喂进的阶数(F5c 立项面;`OWL_L3_AUDIT=1` 开)──
+//
+// 用途:rank=0 = 阶数无关(弱声明)。要判定某个槽**能不能收紧**,不能靠读
+// 调用点猜 —— 跑一遂生产档(发几个请求)拿"实际阶数表",再逐槽判:
+//   ① 同一 (op, 槽)出现 **多个不同 rank** ⇒ 必须维持 0(多臂共用/占位);
+//   ② 只出现一个 rank 且跨档一致 ⇒ **候选收紧**(收紧前先确认其他 flavor
+//      不走同一张表,否则 F5a 未验路径会当场被门拦);
+//   ③ 槽本身是**占位/旗标**(如 `sinks` 槽恒不解引用)⇒ 诚实维持 0 。
+// 关账成本 = 一次原子读(OnceLock)。
+static L3_AUDIT_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static L3_AUDIT_SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<(String, &'static str, u8)>>> =
+    std::sync::OnceLock::new();
+
+fn l3_audit_note(op: &str, slot: &'static str, rank: u8) {
+    let seen = L3_AUDIT_SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
+    let fresh = match seen.lock() {
+        Ok(mut s) => s.insert((op.to_string(), slot, rank)),
+        Err(_) => false,
+    };
+    if fresh {
+        eprintln!("[l3-audit] 声明0 实际{rank} {op}::{slot}");
+    }
+}
+
+fn type_name(p: &Param) -> &'static str {    match p.ty {
         ParamType::Tensor { dtype, rank } => match (dtype, rank) {
             (Dtype::F32, _) => "tensor f32",
             (Dtype::F16, _) => "tensor f16",

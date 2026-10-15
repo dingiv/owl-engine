@@ -53,6 +53,41 @@ pub const DECODE_XQA_SIG: &str =
     "T,T,T,T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz,sz,sz,sz,sz";
 /// XQA 工作区(参考实现给 256MiB;持久复用)
 pub const XQA_SCRATCH_BYTES: usize = 256 * 1024 * 1024;
+
+/// **scratch 尺寸下限**(F2 自证门;不是精确需求)。
+///
+/// 精确需求随 geometry(nbSubSeq/nbVChunks)变,且**住内核
+/// `MemSegmenter`**;host 侧重推 = 复制内核常量 ⇒ 违本仓 `零常量复制` 律。
+/// 故只守量级下限:实测本仓生产形状(batch=1/hkv=4/hd256/ctx≤16k)的
+/// KV-split partial ≈0.7MB,生产定档 **32MiB**(`engine/state.rs`),
+/// 测试 64MiB —— 下限取 1MiB(≈实测需求 1.4×):抓 `量级错`(如 1 word /
+/// 4KiB 块),不抓 1.5× 少分配。
+pub const XQA_SCRATCH_FLOOR_BYTES: usize = 1024 * 1024;
+
+/// F2 判决(纯):scratch 尺寸(`have` = 块账长;下限语义见上)。
+pub fn scratch_size_check(have: usize) -> Result<(), String> {
+    if have < XQA_SCRATCH_FLOOR_BYTES {
+        return Err(format!(
+            "scratch 块账长 {have} B < 下限 {XQA_SCRATCH_FLOOR_BYTES} B(参考实现 {XQA_SCRATCH_BYTES} B;本仓生产定档 32MiB)"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 够长放行 / 短一截拒(负例只差 1 字节 ⇒ 边界语义证明)
+    #[test]
+    fn scratch_floor_is_a_floor() {
+        assert!(scratch_size_check(XQA_SCRATCH_FLOOR_BYTES).is_ok());
+        assert!(scratch_size_check(32 << 20).is_ok(), "生产定档 32MiB 应放行");
+        let e = scratch_size_check(XQA_SCRATCH_FLOOR_BYTES - 1).unwrap_err();
+        assert!(e.contains("scratch 块账长"), "拒语须指名槽位与账长: {e}");
+        assert!(scratch_size_check(4).is_err(), "零容量/1 word 块应拒");
+    }
+}
 // ============================================================================
 // 资产与发射面(2026-10-13 C3a:`.a` → 构建期 fatbin + **Rust host 发射器**)
 // ============================================================================

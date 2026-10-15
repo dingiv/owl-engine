@@ -4,17 +4,20 @@
 //! 线格式:`[T a, T b, T out, sz m, sz k, sz n, sz nt]`(3 Block + 4 sz;
 //! a/b/out 允许 BlockSlice —— linear 行切片直喂)。nt 非零 = bf16 三参。
 
-use crate::contract::{Arg, LaunchMsg, OpError};
+use crate::contract::{LaunchMsg, OpError};
 
-/// 块引用(id + 字节偏移;BlockSlice 兼容)
-#[derive(Clone, Copy, Debug)]
-pub struct BlockRef {
-    pub id: u64,
-    pub byte_offset: u64,
-}
+pub use super::BlockRef;
 
 pub const GEMM_F16: &str = crate::family::cublas::GEMM_F16;
 pub const GEMM_BF16: &str = crate::family::cublas::GEMM_BF16;
+
+/// `parse_gemm` 取用的槽名(声明序)。
+///
+/// **这是与声明表的接口面**(F3 成对律):改名/插槽必须本表与
+/// `ops::cublas::PARAMS` 一起改;`client::tests::parse_slots_are_exactly_declared`
+/// 按集合逐字锁死(少一个/多一个都红)。同型槽**对调**由
+/// `ops::tests::slot_order_lock_family_ops` 的名字序列锁拦(集合相等拦不住)。
+pub const PARSE_SLOTS: &[&str] = &["a", "b", "out", "m", "k", "n", "nt"];
 #[derive(Clone, Copy, Debug)]
 pub struct GemmCall {
     pub a: BlockRef,
@@ -27,43 +30,19 @@ pub struct GemmCall {
     pub nt: bool,
 }
 
-/// 解析(3 Block + 4 sz;F16/BF16 两名同构)
+/// 解析(3 Block + 4 sz;F16/BF16 两名同构)。
+///
+/// **按名取址**(F3):槽名/槽序全取自声明表 `ops::cublas`(此处只写名字),
+/// 名字打错或槽移走 ⇒ 结构化拒(不再静默错位)。
 pub fn parse_gemm(msg: &LaunchMsg) -> Result<GemmCall, OpError> {
-    let mut blocks: Vec<BlockRef> = Vec::new();
-    let mut scalars: Vec<u64> = Vec::new();
-    for a in &msg.args {
-        match a {
-            Arg::Block { id, .. } => blocks.push(BlockRef { id: *id, byte_offset: 0 }),
-            Arg::BlockSlice { id, byte_offset, .. } => {
-                blocks.push(BlockRef { id: *id, byte_offset: *byte_offset })
-            }
-            Arg::U64(v) => scalars.push(*v),
-            _ => {
-                return Err(OpError::Contract {
-                    op: msg.kernel.name.clone(),
-                    field: "args",
-                    expect: "Block/BlockSlice/U64".into(),
-                    got: "其他".into(),
-                })
-            }
-        }
-    }
-    if blocks.len() != 3 || scalars.len() != 4 {
-        return Err(OpError::Contract {
-            op: msg.kernel.name.clone(),
-            field: "槽序",
-            expect: "3 Block + 4 sz".into(),
-            got: format!("{}B/{}S", blocks.len(), scalars.len()),
-        });
-    }
-    let [a, b, out] = [blocks[0], blocks[1], blocks[2]];
+    let s = crate::client::NamedSlots::new(msg)?;
     Ok(GemmCall {
-        a,
-        b,
-        out,
-        m: scalars[0] as usize,
-        k: scalars[1] as usize,
-        n: scalars[2] as usize,
-        nt: scalars[3] != 0,
+        a: s.block("a")?,
+        b: s.block("b")?,
+        out: s.block("out")?,
+        m: s.u64("m")? as usize,
+        k: s.u64("k")? as usize,
+        n: s.u64("n")? as usize,
+        nt: s.u64("nt")? != 0,
     })
 }
