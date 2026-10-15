@@ -57,6 +57,22 @@ pub struct FiPrefillCtx<'a> {
     pub last_len: &'a TensorOps,
 }
 
+/// VLM 图像 token 注入面(塔输出 + 行号表;`ctx` 显式依赖词表)
+#[derive(Clone, Copy)]
+pub struct ImageInject<'a> {
+    /// 塔输出 merged [N, D](D = 文本 hidden)
+    pub merged: &'a TensorOps,
+    /// 逐 token 行号 [L] f32:≥ 0 = 取 merged 行;负 = 文本位保留 embed
+    pub idx: &'a TensorOps,
+}
+
+/// VLM m-RoPE 表注入面([L, half] 行表;pos 通道须为行号 = arange(L))
+#[derive(Clone, Copy)]
+pub struct RopeTables<'a> {
+    pub cos: &'a TensorOps,
+    pub sin: &'a TensorOps,
+}
+
 pub struct ForwardCtx<'a> {
     /// 本步 token 数(decode = 1;prefill = 块长)
     pub tokens: usize,
@@ -123,6 +139,13 @@ pub struct ForwardCtx<'a> {
     /// 依层序推入(每层 8:q/k/v raw → conv 重放;q_n/k_n/v_c/g/beta →
     /// 递推重放)。None = 零开销(生产 decode/prefill 不设)。
     pub gdn_tap: Option<std::rc::Rc<std::cell::RefCell<Vec<TensorOps>>>>,
+    /// VLM 图像 token 注入面(prefill 单块整发;`None` = 纯文本路径零开销)。
+    /// 与 `ts_buf`/`seq_cu` 同款"动态依赖经 ctx 显式传入"律 —— 塔输出
+    /// [N, D] 与行号表 [L](负 = 文本位保留 embed)由调用方给足。
+    pub vlm_image: Option<ImageInject<'a>>,
+    /// VLM m-RoPE 表注入面(prefill;`None` = 用 rope 层的静态 1D 表)。
+    /// 多模态序列表 = [L, half](host 由 `layers::mrope` 算好上传)。
+    pub vlm_rope: Option<RopeTables<'a>>,
     /// GDN 分派门控打印(EngineKnobs.probes.trace_gate 注入;显式依赖律,
     /// 原 OWL_TRACE_GATE 层内直读 —— 热路径零 env)
     pub trace_gate: bool,
@@ -155,6 +178,8 @@ impl<'a> ForwardCtx<'a> {
             v2_bt8: None,
             xqa: None,
             gdn_tap: None,
+            vlm_image: None,
+            vlm_rope: None,
         }
     }
 
@@ -189,6 +214,8 @@ impl<'a> ForwardCtx<'a> {
             v2_bt8: None,
             xqa: None,
             gdn_tap: None,
+            vlm_image: None,
+            vlm_rope: None,
         }
     }
 
@@ -218,6 +245,8 @@ impl<'a> ForwardCtx<'a> {
             v2_bt8: None,
             xqa: None,
             gdn_tap: None,
+            vlm_image: None,
+            vlm_rope: None,
         }
     }
 
@@ -251,6 +280,8 @@ impl<'a> ForwardCtx<'a> {
             v2_bt8: None,
             xqa: None,
             gdn_tap: None,
+            vlm_image: None,
+            vlm_rope: None,
         }
     }
 
@@ -287,6 +318,8 @@ impl<'a> ForwardCtx<'a> {
             v2_bt8: None,
             xqa: None,
             gdn_tap: None,
+            vlm_image: None,
+            vlm_rope: None,
         }
     }
 
@@ -323,6 +356,8 @@ impl<'a> ForwardCtx<'a> {
             v2_bt8: None,
             xqa: None,
             gdn_tap: None,
+            vlm_image: None,
+            vlm_rope: None,
         }
     }
 
@@ -367,7 +402,29 @@ impl<'a> ForwardCtx<'a> {
             v2_bt8: None,
             xqa: None,
             gdn_tap: None,
+            vlm_image: None,
+            vlm_rope: None,
         }
+    }
+
+    /// 位置通道接管(VLM 行号表:pos[t] = t,真位置住 m-RoPE 表)
+    pub fn with_pos(mut self, pos: &'a TensorOps) -> Self {
+        self.pos = Some(pos);
+        self
+    }
+
+    /// VLM 注入面(prefill):图像 token 携带塔输出 merged + 行号表;本
+    /// 构建器只改自身字段,不做 I/O(自肃)。0.8B/纯文本路径不调 ⇒ 零开销。
+    pub fn with_vlm_image(mut self, merged: &'a TensorOps, idx: &'a TensorOps) -> Self {
+        self.vlm_image = Some(ImageInject { merged, idx });
+        self
+    }
+
+    /// VLM 注入面(prefill):m-RoPE 行表取代 rope 层静态 1D 表
+    /// (纯文本序列下两者逐元素同 ⇒ 退化零回归)
+    pub fn with_vlm_rope(mut self, cos: &'a TensorOps, sin: &'a TensorOps) -> Self {
+        self.vlm_rope = Some(RopeTables { cos, sin });
+        self
     }
 }
 

@@ -543,6 +543,43 @@ impl TensorOps {
         )
     }
 
+    /// VLM 图像 token 注入(self = h [L, D];`merged` = 塔输出 [N, D];`idx` [L] f32)。
+    ///
+    /// `idx[t] ≥ 0` ⇒ 取 `merged[idx[t]]`;`idx[t] < 0` ⇒ 保留 `h[t]`
+    /// (文本 token)。**响亮拒绝**:末维不齐 / 行号非有限或越出 N。
+    /// 标量槽 = dim(sz);父序 = h / merged / idx(**构造序** —— idx 在末位,与
+    /// `vis.pos_embed` 的 table/idx/wts 同款“索引量殿后”惯例)。
+    pub fn image_scatter(&self, merged: &TensorOps, idx: &TensorOps) -> TensorOps {
+        let dim = self.shape.last().copied().unwrap_or(0);
+        if dim == 0 || self.shape.len() != 2 || merged.shape.len() != 2 {
+            return self.poisoned_local(LazyError {
+                at_depth: self.depth + 1,
+                detail: format!("image_scatter: h {:?} / merged {:?} 需为 2 维且末维非零", self.shape, merged.shape),
+            });
+        }
+        if merged.shape[1] != dim {
+            return self.poisoned_local(LazyError {
+                at_depth: self.depth + 1,
+                detail: format!("image_scatter: merged 宽 {:?} ≠ h 宽 {dim}", merged.shape),
+            });
+        }
+        let rows: usize = self.shape.first().copied().unwrap_or(0);
+        if idx.shape.iter().product::<usize>() != rows {
+            return self.poisoned_local(LazyError {
+                at_depth: self.depth + 1,
+                detail: format!("image_scatter: idx 长 {:?} ≠ h 行数 {rows}", idx.shape),
+            });
+        }
+        let meta = (self.dtype, self.shape.clone());
+        self.join(
+            Op::Call { op: SemanticKernel::ImageScatter, aux: vec![] },
+            Some(merged),
+            meta,
+            vec![KernelArg::Bits(dim as u64)],
+        )
+        .arg(idx)
+    }
+
     /// 位置嵌入 4-tap 重采样(self = table [n_pos, dim];idx/wts [n, n_taps] 恒 f32)。
     /// 形状律:idx 与 wts 同形;idx 末维 = taps;table 末维 = dim。
     /// 标量槽 = n_taps(sz), dim(sz);父序 = table / idx / wts。

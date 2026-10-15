@@ -59,6 +59,7 @@ pub mod reference;
 pub mod specs;
 pub mod tensor;
 pub mod tokenizer;
+pub mod vlm;
 
 // ============================================================================
 // 公共门面(权威出口;推荐上层从这里取)

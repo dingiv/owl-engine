@@ -195,6 +195,9 @@ impl DeviceClient for CpuFace {
                 u64s[0] as usize,
                 u64s[1] as usize,
             )?,
+            "owl_image_scatter_f32" => {
+                ops::image_scatter(&vals[0], &vals[1], &vals[2], u64s[0] as usize)?
+            }
             "owl_vis_attn_full_f32" => ops::attn_full(
                 &vals[0],
                 &vals[1],

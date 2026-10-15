@@ -117,7 +117,7 @@ impl Attention {
             dt_raw == Dtype::F16 && !force_naive && ctx.env.attn.qkv_fuse && page_ok;
         if use_fused_insert {
             let page = pol.as_ref().unwrap().page;
-            let (cos_d, sin_d) = rope.cos_sin_decl();
+            let (cos_d, sin_d) = rope.cos_sin_of(ctx);
             let gate = narrow_strided(&q_raw, tokens * self.hq, self.hd * 2, self.hd, self.hd,
                 vec![tokens, self.hq * self.hd]);
             // B6.3:fp8 主池 → 融合插池核 e4m3 变体(env.kv.quant 单源;
@@ -152,7 +152,7 @@ impl Attention {
         let (q, gate, k) = if dt_raw == Dtype::F16 {
             // 融合:qk-norm(×(1+w))+ rotate-half partial rope 单发;
             // strided 读 q_raw(stride = q_raw 行长,head 步 = 2HD)
-            let (cos_d, sin_d) = rope.cos_sin_decl();
+            let (cos_d, sin_d) = rope.cos_sin_of(ctx);
             let gate = narrow_strided(&q_raw, tokens * self.hq, self.hd * 2, self.hd, self.hd,
                 vec![tokens, self.hq * self.hd]);
             let q = TensorOps::call(SemanticKernel::NormRope)
@@ -935,7 +935,7 @@ impl Attention {
         // C1 融合:同 decode 臂(norm_rope strided 直取 value 半段)
         let dt_raw = q_raw.dtype;
         let (q, gate, k) = if dt_raw == Dtype::F16 {
-            let (cos_d, sin_d) = rope.cos_sin_decl();
+            let (cos_d, sin_d) = rope.cos_sin_of(ctx);
             let gate = narrow_strided(&q_raw, tokens * self.hq, self.hd * 2, self.hd, self.hd,
                 vec![tokens, row_q]);
             let q = TensorOps::call(SemanticKernel::NormRope)

@@ -76,6 +76,14 @@ pub trait Interpreter {
         n_taps: usize,
         dim: usize,
     ) -> Result<Value, ModelError>;
+    /// VLM 图像 token 注入:h [L,D] 按 idx(≥0 行号 / <0 保留)换成 merged 行
+    fn image_scatter(
+        &mut self,
+        h: &Value,
+        merged: &Value,
+        idx: &Value,
+        dim: usize,
+    ) -> Result<Value, ModelError>;
     /// 非因果 varlen 全注意力(q/k/v/cu;无 GQA)
     #[allow(clippy::too_many_arguments)]
     fn attn_full(
@@ -280,6 +288,14 @@ fn reduce_rec(
                 other => panic!("pos_embed 标量槽 1 期望 sz dim,实得 {other:?}"),
             };
             itp.pos_embed_bilinear(&ins[0], &ins[1], &ins[2], n_taps, dim)
+        }
+        Op::Call { op: SemanticKernel::ImageScatter, .. } => {
+            // 标量槽序 = vis.image_scatter 线契约:dim(sz)
+            let dim = match t.args.first() {
+                Some(KernelArg::Bits(v)) => *v as usize,
+                other => panic!("image_scatter 标量槽 0 期望 sz dim,实得 {other:?}"),
+            };
+            itp.image_scatter(&ins[0], &ins[1], &ins[2], dim)
         }
         Op::Call { op: SemanticKernel::AttnFull, .. } => {
             // 标量槽序 = vis.attn_full 线契约:rows/heads/head_dim(sz) / n_seq(i32) / scale(f32)
@@ -663,6 +679,46 @@ impl Interpreter for CpuInterpreter {
                 }
             }
             out[r * dim..(r + 1) * dim].copy_from_slice(&acc);
+        }
+        Ok(Value { f32: out, shape: vec![rows, dim] })
+    }
+
+    /// 图像 token 注入(独立副本;与 owl-cpu / CUDA 互为对照,禁止互引):
+    /// 逐行判定,行号来自 f32 索引量,越界响亮拒。
+    fn image_scatter(
+        &mut self,
+        h: &Value,
+        merged: &Value,
+        idx: &Value,
+        dim: usize,
+    ) -> Result<Value, ModelError> {
+        let dim = dim.max(1);
+        let rows = h.f32.len().checked_div(dim).filter(|r| *r * dim == h.f32.len()).ok_or_else(|| {
+            ModelError::Msg(format!("image_scatter: h 长 {} 不是 dim {dim} 的整数倍", h.f32.len()))
+        })?;
+        let n_merged = merged.f32.len() / dim;
+        let mut out = Vec::with_capacity(h.f32.len());
+        for r in 0..rows {
+            let pick = idx.f32.get(r).copied().ok_or_else(|| {
+                ModelError::Msg(format!("image_scatter: idx 缺第 {r} 行(长 {})", idx.f32.len()))
+            })?;
+            // 负 = 文本位保留 embed;非负 = 取塔输出行(越界响亮拒)
+            let (src, base) = if pick < 0.0 {
+                (&h.f32, r * dim)
+            } else {
+                let row = pick as usize;
+                if row >= n_merged {
+                    return Err(ModelError::Msg(format!(
+                        "image_scatter: idx[{r}] = {pick} 越出 merged 行数 {n_merged}"
+                    )));
+                }
+                (&merged.f32, row * dim)
+            };
+            out.extend_from_slice(src.get(base..base + dim).ok_or_else(|| {
+                ModelError::Msg(format!(
+                    "image_scatter: 第 {r} 行源区间 [{base}, {base} + {dim}) 越界"
+                ))
+            })?);
         }
         Ok(Value { f32: out, shape: vec![rows, dim] })
     }

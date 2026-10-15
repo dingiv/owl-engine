@@ -33,6 +33,7 @@ pub mod gdn;
 pub mod layernorm;
 pub mod linear;
 pub mod mlp;
+pub mod mrope;
 pub mod mtp;
 pub mod rmsnorm;
 pub mod rope;

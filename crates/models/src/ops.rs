@@ -149,6 +149,9 @@ pub enum SemanticKernel {
     /// 父 = q / k / v / cu_seqlens(f32 段界);
     /// 标量槽 = rows(sz), heads(sz), head_dim(sz), n_seq(i32), scale(f32)
     AttnFull,
+    /// VLM 图像 token 注入:out[t] = idx[t] ≥ 0 ? merged[idx[t]] : h[t](文本侧接线)
+    /// 父 = h [L,D] / merged [N,D] / idx [L](f32;负 = 保留 h);标量槽 = dim(sz)
+    ImageScatter,
     /// SwiGLU 门控 silu(g)⊙u(aux = [n])
     SiluAndMul,
     /// ct packed → marlin B 设备重排(U32;核签名形参即 rows/cols)
@@ -259,6 +262,7 @@ impl SemanticKernel {
             SemanticKernel::BiasAdd => "vis.bias_add",
             SemanticKernel::PosEmbedBilinear => "vis.pos_embed",
             SemanticKernel::AttnFull => "vis.attn_full",
+            SemanticKernel::ImageScatter => "vis.image_scatter",
             SemanticKernel::SiluAndMul => "mlp.silu_and_mul",
             SemanticKernel::CtRepack => "load.ct_repack",
             SemanticKernel::TsStamp => "ops.ts_stamp",

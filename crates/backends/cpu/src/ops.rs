@@ -270,6 +270,48 @@ pub(crate) fn bias_add(x: &Value, bias: &Value, cols: usize) -> Result<Value, Mo
     Ok(Value { f32: out, shape: x.shape.clone() })
 }
 
+/// VLM 图像 token 注入:out[t] = idx[t] ≥ 0 ? merged[idx[t]] : h[t]
+/// (idx 为 f32 行号;负值 = 文本位保留 h)
+pub(crate) fn image_scatter(
+    h: &Value,
+    merged: &Value,
+    idx: &Value,
+    dim: usize,
+) -> Result<Value, ModelError> {
+    let dim = dim.max(1);
+    if h.f32.len() % dim != 0 || merged.f32.len() % dim != 0 {
+        return Err(ModelError::Msg(format!(
+            "owl_image_scatter: h 长 {} / merged 长 {} 不是 dim {dim} 的整数倍",
+            h.f32.len(),
+            merged.f32.len()
+        )));
+    }
+    let rows = h.f32.len() / dim;
+    let n_merged = merged.f32.len() / dim;
+    if idx.f32.len() != rows {
+        return Err(ModelError::Msg(format!(
+            "owl_image_scatter: idx 长 {} ≠ h 行数 {rows}",
+            idx.f32.len()
+        )));
+    }
+    let mut out = vec![0.0f32; rows * dim];
+    for r in 0..rows {
+        let v = idx.f32[r];
+        if v < 0.0 {
+            out[r * dim..(r + 1) * dim].copy_from_slice(&h.f32[r * dim..(r + 1) * dim]);
+            continue;
+        }
+        let src = v as usize;
+        if !v.is_finite() || src >= n_merged {
+            return Err(ModelError::Msg(format!(
+                "owl_image_scatter: idx[{r}] = {v} 越出 merged 行数 {n_merged}"
+            )));
+        }
+        out[r * dim..(r + 1) * dim].copy_from_slice(&merged.f32[src * dim..(src + 1) * dim]);
+    }
+    Ok(Value { f32: out, shape: h.shape.clone() })
+}
+
 /// 位置嵌入 4-tap 重采样:out[n,d] = Σ_k wts[n,k]·table[idx[n,k],d]
 pub(crate) fn pos_embed_bilinear(
     table: &Value,

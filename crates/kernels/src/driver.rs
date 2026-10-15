@@ -174,10 +174,14 @@ pub fn resolve(req: OpReq) -> KernelPick {
             req.shapes.get(1).map(|s| s.first().copied().unwrap_or(0)).unwrap_or(0),
         ),
         // q 的 shapes[0] = [rows, heads, head_dim];标量槽 = [rows, heads, head_dim, n_seq]
-        //
         // **两臂分流(2026-10-15 用户裁决:别自写算子)**:f16 + 单图 ⇒ 走
         // vendored FlashInfer 的 ragged 非因果 prefill(FA2 家族,vLLM ViT 同路算法);
         // 其余(f32 锚/多图)⇒ native 臂。
+        // 行数取 h 的 shapes[0] = [L, D](VLM 注入)
+        "vis.image_scatter" => vis::image_scatter(
+            dt,
+            req.shapes.first().map(|s| s.first().copied().unwrap_or(0)).unwrap_or(0),
+        ),
         "vis.attn_full" => {
             let q = req.shapes.first().cloned().unwrap_or_default();
             let n_seq = req.scalars.get(3).copied().unwrap_or(1);
@@ -1427,6 +1431,20 @@ pub mod vis {
             DType::F32 => "owl_pos_embed_bilinear_f32",
             DType::F16 => "owl_pos_embed_bilinear_f16",
             other => panic!("owl_pos_embed_bilinear 无 {other:?} 变体(F32/F16 两臂)"),
+        };
+        KernelPick {
+            name,
+            shape: Shape { grid: (rows as u32, 1, 1), block: (256, 1, 1), smem: 0 },
+        }
+    }
+
+    /// `image_scatter`:VLM 图像 token 注入(out[t] = idx[t] ≥ 0 ? merged[idx[t]] : h[t])。
+    /// grid (rows,1,1);block 256(rows 取 **h** 的行数)。
+    pub fn image_scatter(dt: DType, rows: usize) -> KernelPick {
+        let name = match dt {
+            DType::F32 => "owl_image_scatter_f32",
+            DType::F16 => "owl_image_scatter_f16",
+            other => panic!("owl_image_scatter 无 {other:?} 变体(F32/F16 两臂)"),
         };
         KernelPick {
             name,
