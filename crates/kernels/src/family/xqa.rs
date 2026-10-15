@@ -117,6 +117,22 @@ mod tests {
 pub const ASSET_VERIFY: &str = "verify";
 /// 裸 decode 臂变体(`M_TILESIZE=16`;见 cu/xqa/README.md 双实例化节)
 pub const ASSET_DECODE: &str = "decode";
+
+/// **verify 臂的 KV-split 封顶**(2026-10-15 perf 会话;唯一真源 = 本常量)。
+///
+/// 为什么封顶:verify 形状(q=8 行)在长 ctx 下是**延迟绑死**的
+/// (`crates/kernels/tests/xqa_geom_probe.rs`,3090 Ti,`M_TILESIZE=32`):
+///
+/// | ctx | nsub=1 | 4 | **8** | 16 | 20(旧自动) | 40 |
+/// |---|---:|---:|---:|---:|---:|---:|
+/// | 32768 ms/发 | 9.97 | 2.55 | **2.16** | 2.21 | 2.46 | 2.30 |
+/// | 8192 ms/发  | 2.54 | 0.71 | **0.53** | 0.61 | 0.74 | 0.91 |
+///
+/// ⇒ ① KV-split **必须有**(nsub=1 慢 4.6×);② 但它**不是越多越好**
+/// (归约成本反超收益)⇒ 自动档 `sm/(batch·hkv) = 84/4 = 21` **偏大**,
+/// 8 是本机最优点。缺省仍是自动档(不改变历史行为),verify 臂显式传本值。
+pub const VERIFY_SPLIT_CAP: u32 = 8;
+
 /// 内核符号名(两个变体同名 —— 分属两个模块,不冲突)
 pub const SYM_KERNEL: &str = "kernel_mha";
 /// 资产自描述探针核符号名
@@ -192,6 +208,27 @@ impl XqaConsts {
         })
     }
     /// grid / block / dynamic smem(`mha.cu:launchMHAFlashInfer` 逐式同构)
+    /// 自动几何 + **split 度上限**(`nsub_cap = u32::MAX` = 历史行为)。
+    pub fn launch_geometry_capped(
+        &self,
+        sm_count: u32,
+        batch: u32,
+        nb_k_heads: u32,
+        max_seq_len: u32,
+        q_seq_len: u32,
+        nsub_cap: u32,
+    ) -> ((u32, u32, u32), (u32, u32, u32), u32) {
+        let div_up = |a: u32, b: u32| a.div_ceil(b.max(1));
+        let _ = div_up;
+        let nb_sub_seq = if self.allow_multi_block == 0 {
+            1
+        } else {
+            let by_sm = (sm_count / (batch.max(1) * nb_k_heads.max(1))).max(1);
+            by_sm.min(div_up(max_seq_len, self.cta_tile_x)).min(nsub_cap.max(1))
+        };
+        self.geometry(nb_sub_seq, nb_k_heads, q_seq_len)
+    }
+
     pub fn launch_geometry(
         &self,
         sm_count: u32,
@@ -209,7 +246,8 @@ impl XqaConsts {
         };
         self.geometry(nb_sub_seq, nb_k_heads, q_seq_len)
     }
-    /// **单块几何**(KV-split 关;prefill 臂契约;自 `feat/prefill-graph` 合入)。
+
+/// **单块几何**(KV-split 关;prefill 臂契约;自 `feat/prefill-graph` 合入)。
     ///
     /// 为什么 prefill 不要 KV-split:prefill 的 `grid.y` =
     /// `nbKHeads · ceil(q·headGrp / rowsPerBlock)` 已经把 SM 喂饱
@@ -229,6 +267,16 @@ impl XqaConsts {
     ) -> ((u32, u32, u32), (u32, u32, u32), u32) {
         self.geometry(1, nb_k_heads, q_seq_len)
     }
+    /// 几何公共体(**公开**包装:`launch_on_stream_subseq` 用;字段语义见私有体)
+    pub fn geometry_pub(
+        &self,
+        nb_sub_seq: u32,
+        nb_k_heads: u32,
+        q_seq_len: u32,
+    ) -> ((u32, u32, u32), (u32, u32, u32), u32) {
+        self.geometry(nb_sub_seq, nb_k_heads, q_seq_len)
+    }
+
     /// 几何公共体(sub_seq 由调用方钉;两条入口只差这一个形参)
     fn geometry(
         &self,
@@ -395,6 +443,30 @@ pub fn launch_on_stream(
         args.cache.max_nb_pages_per_seq * consts.tokens_per_page,
         args.q_seq_len,
     );
+    crate::device::launch_vals(stream, kernel, grid, block, smem, &args.vals(consts.head_grp)).map_err(|e| {
+        crate::contract::OpError::Launch {
+            op: "xqa".into(),
+            stage: crate::contract::Stage::Compute,
+            detail: format!("{e:?}"),
+        }
+    })
+}
+
+/// **显式 KV-split 度**发射(探针/调参面;`nb_sub_seq = 1` ≡ 单块几何)。
+///
+/// 为什么要这个口:`launch_geometry` 把 split 度绑在 `sm_count/(batch·hkv)` 上,
+/// 探针想扫"并行度"这一维只能靠伪造 sm_count —— 那条路会把**上限**也一起改
+/// (`min(by_sm, ceil(max_seq/ctaTile))`),两变量纠缠 ⇒ 结论不可归因。
+/// 本口把这一维**单独**拿出来(调用方自担语义:serve 面仍走 `launch_geometry`)。
+#[cfg(feature = "device")]
+pub fn launch_on_stream_subseq(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    kernel: &cudarc::driver::CudaFunction,
+    consts: &XqaConsts,
+    args: &XqaArgs,
+    nb_sub_seq: u32,
+) -> Result<(), crate::contract::OpError> {
+    let (grid, block, smem) = consts.geometry_pub(nb_sub_seq, args.nb_k_heads, args.q_seq_len);
     crate::device::launch_vals(stream, kernel, grid, block, smem, &args.vals(consts.head_grp)).map_err(|e| {
         crate::contract::OpError::Launch {
             op: "xqa".into(),

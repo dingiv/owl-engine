@@ -378,6 +378,10 @@ fn build_xqa_assets(out_dir: &std::path::Path) -> Vec<(&'static str, PathBuf)> {
         "-DUSE_SM90_MHA=0",
         "-DGENERATE_CUBIN",
     ];
+    // ⚠️ M_TILESIZE=64 一档**不可行**(2026-10-15 实测):内核 `mha.cu:85`
+    //    `static_assert(nbValidRows <= 32u)` ⇒ verify 的 48 打包单元
+    //    (q=8 × headGrp 6)**结构上**必须分 2 个 token block ⇒ 同 kv head 的
+    //    KV 被读两遍是内核设计约束,不是几何选择。
     let specs: [(&'static str, &[&str]); 2] = [
         ("verify", &["-DSPEC_DEC=1"]),
         ("decode", &["-DSPEC_DEC=1", "-DM_TILESIZE=16"]),

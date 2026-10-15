@@ -139,12 +139,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             .await?;
             let t_read_v = std::time::Instant::now();
             let tok_f = vg.read_output_f32("tok").await?;
+            let t_tok = std::time::Instant::now();
             // A11:采样档额外回读 per-row logits([depth1, vocab];仅采样档付)
             let row_logits = if sampler_on {
                 Some(vg.read_output_f32("logits").await?)
             } else {
                 None
             };
+            let t_lg = std::time::Instant::now();
             // E5 性能:verify 分相(step=上传+launch;read=同步+回读;
             // pure=同步后裸 replay+read = 图独占 GPU 时间)
             if self.probes.step_profile {
@@ -159,6 +161,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 );
             }
             mrec("spec.verify.step", t_read_v - t_step_v);
+            // 2026-10-15:把 `verify.read` 拆开 —— 首轮归因发现它比「设备时间 + 采样」
+            // 多出 ~19 ms/轮(且与采样档无关:greedy A/B 只差 0.75 ms),必须定位。
+            mrec("spec.verify.tokread", t_tok.elapsed());
+            mrec("spec.verify.lgread", t_lg.elapsed());
             mrec("spec.verify.read", t_read_v.elapsed());
             let ids: Vec<u32> = tok_f.iter().map(|&v| v as u32).collect();
             let hidden = vg.output_block("hid").expect("hid 输出槽");

@@ -90,9 +90,20 @@ impl XqaRuntime {
     // 本族算子表:由 `KernelSpec::FAMILY` 派生(单一提升点 = ops::xqa 的 static)
 }
 
-/// 发射公共体(两条臂共用;差别只在装载的资产变体)
-/// 发射公共体(几何可变面单列:`single_block` = KV-split 关 = prefill 臂契约;
-/// 见 [`crate::family::xqa::XqaConsts::launch_geometry_single_block`])
+/// 发射几何档(显式枚举 —— 布尔盲性:三档各自是一个**契约**,不是开关)
+#[derive(Clone, Copy)]
+enum XqaGeom {
+    /// 自动(历史行为):`nb_sub_seq = min(sm/(batch·hkv), ceil(max_seq/ctaTile))`
+    Auto,
+    /// 自动 + **split 度上限**(verify 臂;上限值住
+    /// [`crate::family::xqa::VERIFY_SPLIT_CAP`],那里有几何扫描表)
+    Capped(u32),
+    /// 单块(KV-split 关;prefill 臂契约;见
+    /// [`crate::family::xqa::XqaConsts::launch_geometry_single_block`])
+    Single,
+}
+
+/// 发射公共体(三条臂共用;差别只在装载的资产变体与几何档)
 fn emit_geom(
     msg: &LaunchMsg,
     res: &mut dyn crate::device::DeviceRes,
@@ -100,7 +111,7 @@ fn emit_geom(
     op: &'static str,
     kernel: &Arc<cudarc::driver::CudaFunction>,
     consts: &XqaConsts,
-    single_block: bool,
+    geom: XqaGeom,
 ) -> Result<Bytes, OpError> {
     let c = parse_verify(msg)?;
     // 逐参命名解析(失败即报"哪一个参 + 哪个块 id" —— DeadBlock 定谳用)
@@ -137,16 +148,23 @@ fn emit_geom(
     })?;
 
     // 图元(常量全部来自资产自描述;Rust 侧零复制)
-    let (grid, block, smem) = if single_block {
-        consts.launch_geometry_single_block(c.hkv as u32, c.q_seq_len as u32)
-    } else {
-        consts.launch_geometry(
+    let (grid, block, smem) = match geom {
+        XqaGeom::Single => consts.launch_geometry_single_block(c.hkv as u32, c.q_seq_len as u32),
+        XqaGeom::Auto => consts.launch_geometry(
             c.sm_count as u32,
             /*batch=*/ 1,
             c.hkv as u32,
             c.max_seq_len as u32,
             c.q_seq_len as u32,
-        )
+        ),
+        XqaGeom::Capped(cap) => consts.launch_geometry_capped(
+            c.sm_count as u32,
+            /*batch=*/ 1,
+            c.hkv as u32,
+            c.max_seq_len as u32,
+            c.q_seq_len as u32,
+            cap,
+        ),
     };
     let args = XqaArgs {
         q_seq_len: c.q_seq_len as u32,
@@ -201,7 +219,15 @@ impl KernelFamily for XqaRuntime {
         res: &mut dyn crate::device::DeviceRes,
         exec: &mut crate::device::Exec,
     ) -> Result<Bytes, OpError> {
-        emit_geom(msg, res, exec, VERIFY_XQA, &self.kernel, &self.consts, false)
+        emit_geom(
+            msg,
+            res,
+            exec,
+            VERIFY_XQA,
+            &self.kernel,
+            &self.consts,
+            XqaGeom::Capped(crate::family::xqa::VERIFY_SPLIT_CAP),
+        )
     }
 }
 
@@ -243,7 +269,7 @@ impl KernelFamily for XqaPrefillRuntime {
         res: &mut dyn crate::device::DeviceRes,
         exec: &mut crate::device::Exec,
     ) -> Result<Bytes, OpError> {
-        emit_geom(msg, res, exec, PREFILL_XQA, &self.kernel, &self.consts, true)
+        emit_geom(msg, res, exec, PREFILL_XQA, &self.kernel, &self.consts, XqaGeom::Single)
     }
 }
 
@@ -274,6 +300,6 @@ impl KernelFamily for XqaDecodeRuntime {
         res: &mut dyn crate::device::DeviceRes,
         exec: &mut crate::device::Exec,
     ) -> Result<Bytes, OpError> {
-        emit_geom(msg, res, exec, DECODE_XQA, &self.kernel, &self.consts, false)
+        emit_geom(msg, res, exec, DECODE_XQA, &self.kernel, &self.consts, XqaGeom::Auto)
     }
 }
