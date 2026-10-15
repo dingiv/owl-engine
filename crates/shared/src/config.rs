@@ -252,6 +252,8 @@ pub struct DispatchCfg {
     /// ctx 有效;段驱动件让 plan 每轮在窗外重算。零断点时退化为单图
     /// (与 `plan` 同形),开关开而臂未登记核时**不**降级为逐步 eager。
     pub verify_piecewise: bool,
+    /// ⚙ 诊断:断点挂"注意力输出"而非核节点(见 AttnEnv::break_at_out)
+    pub break_at_out: bool,
     /// verify 臂改走 **XQA**(kNHD fp8 池 + spec-dec q=1+K;feature `xqa`)。
     /// 2026-10-13 D3:XQA 单算子实测 ctx8192 0.495ms vs v2 2.673ms(5.40×),
     /// 数值 max|XQA−host| 4.5e-4(v2 4.6e-4)。缺省 false(定谳后再翻)。
@@ -643,6 +645,7 @@ impl Default for DispatchCfg {
             // piecewise 段驱动件:**缺省关**(2026-10-15 立项;A/B 先证机制
             // 零回归,定谱后再翻默认 —— 同 verify_xqa 的翻法)
             verify_piecewise: false,
+            break_at_out: false,
             decode_xqa: false,
             xqa_prefill: false,
             fi_min_tokens: 1,

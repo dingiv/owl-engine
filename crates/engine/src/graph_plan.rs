@@ -755,36 +755,56 @@ impl<D: DeviceClient> GraphPlan<D> {
         let Some(pw) = self.pw.as_ref() else {
             return Err(ModelError::Msg("piecewise 回放:无段表(未捕获?)".into()));
         };
-        let n = pw.segs.len();
+        // 段/断点的 owned 快照(pw 的不可变借用不跨 self.face 的可变调用)
+        let segs: Vec<Option<GraphId>> = pw.segs.clone();
+        let tail = pw.tail;
+        let plan: Vec<(TensorOps, Bytes, Option<(usize, std::sync::Arc<std::sync::atomic::AtomicUsize>)>)> =
+            pw.breaks
+                .iter()
+                .map(|b| (b.node.clone(), b.out.clone(), b.host_scalar.clone()))
+                .collect();
+        // ⚙ 哨兵(OWL_PW_PIN_ZERO=1):回放**前**把钉块清零 ⇒ 回放后仍是零 =
+        // "断点的写没落"(发射没到/写偏);非零 = 落了(值另判)
+        if owl_shared::env_reader::flag("OWL_PW_PIN_ZERO") {
+            for (_, out, _) in plan.iter() {
+                let nbytes = out.len * out.dtype.size_bytes();
+                let blk = Bytes::new(out.id, out.len, out.dtype, 0);
+                self.face.memset_zero(&blk, nbytes).await?;
+            }
+        }
+        let n = plan.len();
         for i in 0..n {
-            let seg = pw.segs[i];
-            let brk = &pw.breaks[i];
-            let out = brk.out.clone();
-            // **宿主标量槽补丁**(本轮值):节点其余部分逐位不变,id 换新 ⇒
+            let (base, out, host) = &plan[i];
+            // **宿主标量槽补丁**(本轮值):节点其余逐位不变,id 换新 ⇒
             // 覆盖/memo 按新节点记账(旧条目摘掉,免逐轮涨)
-            let node = match &brk.host_scalar {
+            let node = match host {
                 Some((idx, cell)) => {
                     let v = cell.load(std::sync::atomic::Ordering::Relaxed) as u64;
-                    let fresh = brk.node.clone().with_arg_bits(*idx, v).ok_or_else(|| {
+                    let fresh = base.clone().with_arg_bits(*idx, v).ok_or_else(|| {
                         ModelError::Msg(format!("piecewise 回放:宿主标量槽 {idx} 越界(plan 期应已拒)"))
                     })?;
-                    let old = brk.node.id();
+                    let old = base.id();
                     if let Some(c) = self.pw_carry.as_mut() {
                         c.memo.remove(&old);
                         c.overrides.remove(&old);
                     }
                     fresh
                 }
-                None => brk.node.clone(),
+                None => base.clone(),
             };
-            if let Some(g) = seg {
+            if let Some(g) = segs[i] {
                 self.face.graph_launch(g).await?;
             }
             let carry = self
                 .pw_carry
                 .as_mut()
                 .ok_or_else(|| ModelError::Msg("piecewise 回放:无接力棒".into()))?;
-            carry.override_out(node.id(), out);
+            // ⚠️ **断点必须每轮真跑**:capture 期求值已把 `节点 id → 钉块`
+            // 写进 memo,回放期 `eval_segment` 一见命中就短路 **不发射**
+            // (实测:钉块回放前后逐位相同 = 断点成静态数据,陈旧值一路喂给尾段)。
+            // 摘掉该条 ⇒ 强制重算(钉块由 override 写)。
+            carry.memo.remove(&node.id());
+            carry.override_out(node.id(), out.clone());
             let _ = owl_models::interpreters::eval_segment(
                 &[&node],
                 &mut self.face,
@@ -793,8 +813,20 @@ impl<D: DeviceClient> GraphPlan<D> {
                 SegMode::Eager,
             )
             .await?;
+            // ⚙ 断点求值后立即读钉块(判 eager 的写落没落)
+            if owl_shared::env_reader::flag("OWL_PW_PIN_ZERO") {
+                let ov = OutVal { block: out.clone(), len: out.len, dtype: out.dtype };
+                let vals = self.read_vals(&ov).await?;
+                let nan = vals.iter().filter(|v| v.is_nan()).count();
+                let mx = vals.iter().fold(0f32, |a, v| a.max(v.abs()));
+                owl_shared::log_info!(
+                    "piecewise",
+                    "[pw-pin-now] 断点#{i} 求值后: n={} nan={nan} absmax={mx:.3e}",
+                    out.len
+                );
+            }
         }
-        if let Some(g) = self.pw.as_ref().and_then(|p| p.tail) {
+        if let Some(g) = tail {
             self.face.graph_launch(g).await?;
         }
         Ok(())

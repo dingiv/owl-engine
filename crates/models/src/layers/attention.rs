@@ -515,7 +515,11 @@ impl Attention {
             .arg(&y)
             .arg_usize(n)
             .with_shape(dt, vec![tokens, self.hq * hd]);
-        self.o_proj.forward(&y, ctx)
+        let out = self.o_proj.forward(&y, ctx);
+        if ctx.env.attn.break_at_out {
+            note_attn_kernel(ctx, &out);
+        }
+        out
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -582,7 +586,11 @@ impl Attention {
             .arg(&y)
             .arg_usize(n)
             .with_shape(dt, vec![tokens, self.hq * hd]);
-        self.o_proj.forward(&y, ctx)
+        let out = self.o_proj.forward(&y, ctx);
+        if ctx.env.attn.break_at_out {
+            note_attn_kernel(ctx, &out);
+        }
+        out
     }
 
     #[allow(clippy::too_many_arguments)]

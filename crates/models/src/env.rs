@@ -200,6 +200,9 @@ pub struct AttnEnv {
     /// **verify 图改段驱动件**(piecewise;注意力核 = 断点,在段间 eager 重放
     /// ⇒ 核可以走"每轮按 ctx 重算 plan"的臂,如 FI split)。零断点 = 退化单图
     pub verify_piecewise: bool,
+    /// ⚙ 诊断:**断点改挂"注意力输出"**(o_proj 之后的纯 GEMM 节点)而非核节点
+    /// ⇒ 二分"窗外发射面有病"还是"XQA 核在窗外有病"(piecewise 追凶用)
+    pub break_at_out: bool,
     /// 裸 decode 走 XQA(第二份实例化 `M_TILESIZE=16`;shape/feature 不匹配自动回落 v2)
     pub decode_xqa: bool,
     /// FI 接管的 T 下限(`dispatch.fi_min_tokens`;t ≥ 此值走 FI 主臂)
@@ -325,6 +328,7 @@ impl EnvProvider {
                 verify_v2: d.verify_v2,
                 verify_xqa: d.verify_xqa,
                 verify_piecewise: d.verify_piecewise,
+                break_at_out: d.break_at_out,
                 decode_xqa: d.decode_xqa,
                 fi_min_tokens: d.fi_min_tokens,
                 xqa_prefill: d.xqa_prefill,
