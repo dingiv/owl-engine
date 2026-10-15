@@ -23,7 +23,7 @@ use owl_cpu::CpuFace; // dev-dep:仅 cfg(test) 单元档可用
 #[cfg(test)]
 use owl_shared::config::OwlConfig;
 #[cfg(test)]
-use owl_test_macros::owl_test;
+use owl_macros::owl_test;
 use owl_iface::contract::DeviceClient;
 
 fn asset_dir() -> std::path::PathBuf {
@@ -39,7 +39,7 @@ fn gpu_ordinal() -> Option<usize> {
 /// EngineConfig 全件从**用例配置**注入(隐藏 env `OWL_TEST_CONFIG_CPU_CONSTRUCT_AND_LOAD`
 /// → 引擎同款 toml;缺省 = `OwlConfig::default()`)。本用例只到 loader ——
 /// 三件均不参与断言,注入不改测试行为;换档 = 换 toml 不改代码(S3 收编示范)。
-#[cfg(test)] // dev-dep(owl-test-macros)门控:单元档专用
+#[cfg(test)] // dev-dep(owl-macros)门控:单元档专用
 #[owl_test]
 async fn cpu_construct_and_load(cfg: &OwlConfig) {
     let mut engine = Engine::on(
@@ -58,7 +58,8 @@ async fn cpu_construct_and_load(cfg: &OwlConfig) {
 }
 
 /// CPU:增量解码多字节字符跨 token(🌟 4 字节;逐 token 喂入,
-/// 差分不得 panic 且终态与前缀累计一致)。EngineConfig 同样走用例配置注入。#[cfg(test)] // dev-dep(owl-test-macros)门控:单元档专用
+/// 差分不得 panic 且终态与前缀累计一致)。EngineConfig 同样走用例配置注入。
+#[cfg(test)] // dev-dep(owl-macros)门控:单元档专用
 #[owl_test]
 async fn cpu_incremental_decode_multibyte(cfg: &OwlConfig) {
     let mut engine = Engine::on(

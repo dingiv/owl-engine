@@ -1,5 +1,5 @@
 [package]
-name = "owl-test-macros"
+name = "owl-macros"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

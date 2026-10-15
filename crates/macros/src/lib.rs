@@ -1,6 +1,10 @@
 //! `#[owl_test]` —— 用例参数化测试属性过程宏(设计:
 //! `docs/arch/owl-test-macro.md`)。
 //!
+//! **本 crate = 工作区过程宏统一收容地**(2026-10-15 用户裁定:包名
+//! `owl-macros`,目录 `crates/macros` —— 后续新宏一律进这里,不再
+//! 一宏一 crate)。当前唯一导出 = `#[owl_test]`。
+//!
 //! **纯样板搬运,零逻辑**:配置解析/门控逻辑全在
 //! `owl_shared::testkit::case_config`;本 crate 只做签名校验 + 展开。
 //!

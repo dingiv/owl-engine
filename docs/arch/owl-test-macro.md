@@ -27,7 +27,7 @@
 ### 2.1 形态
 
 ```rust
-use owl_test_macros::owl_test;   // 过程宏 crate(仅导宏)
+use owl_macros::owl_test;   // 过程宏 crate `owl-macros`(仅导宏;后续新宏统一进此)
 use owl_shared::config::OwlConfig;
 
 /// 无门控用例:配置变量由宏注入
@@ -91,7 +91,7 @@ fn 名() {
 
 | 层 | 职责 |
 |---|---|
-| `crates/test-macros`(新,proc-macro only) | 签名校验 + 展开;**零逻辑**(逻辑在 helper,宏只搬运) |
+| `crates/macros`(新,proc-macro only) | 签名校验 + 展开;**零逻辑**(逻辑在 helper,宏只搬运) |
 | `owl_shared::testkit::case_config(name)` | 读隐藏 env → 唯一 loader 解析 → 返回 `OwlConfig`;GPU 门控读 `test_device` 回填 |
 | 消费测试 | 写 `#[owl_test]` + 带参签名;tokio dev-dep |
 
@@ -110,7 +110,7 @@ fn 名() {
 
 ## 四、验收
 
-1. `cargo test -p owl-test-macros -p owl-shared -p owl-engine --lib` 全绿;
+1. `cargo test -p owl-macros -p owl-shared -p owl-engine --lib` 全绿;
 2. **参数化实证**:设置 `OWL_TEST_CONFIG_<DEMO>` 指向一个改了
    `runtime.max_seq` 的 TOML,断言测试收到该值(env 清除则收 default —— 双臂
    单测,用 `EnvGuard` 防踩踏);
@@ -120,7 +120,7 @@ fn 名() {
 
 ## 五、施工记录(2026-10-15 同日完工)
 
-- **新 crate `crates/test-macros`**(proc-macro only,workspace 成员,
+- **新 crate `crates/macros`**(proc-macro only,workspace 成员,
   syn2+quote):`#[owl_test]` / `#[owl_test(gpu)]`;校验清单(响亮拒绝)
   = 非 async / 泛型 / 参数 >1 / 参数非 `&OwlConfig` / gpu 非 unit 返回,
   各自带修法提示。

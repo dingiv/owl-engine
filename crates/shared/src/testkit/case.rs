@@ -1,4 +1,4 @@
-//! `#[owl_test]` 用例配置注入(过程宏 `owl-test-macros` 的运行期伴生)。
+//! `#[owl_test]` 用例配置注入(过程宏 `owl-macros` 的运行期伴生)。
 //!
 //! **隐藏环境变量**(设计:`docs/arch/owl-test-macro.md` §2.2):每用例
 //! 一个键 `OWL_TEST_CONFIG_<用例函数名大写>` = 该用例专属配置文件路径

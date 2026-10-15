@@ -529,7 +529,7 @@ mod tests {
     use owl_cpu::CpuFace;
     use owl_models::interpreters::eval_ops;
     use owl_shared::config::OwlConfig;
-    use owl_test_macros::owl_test;
+    use owl_macros::owl_test;
 
     fn ones_w() -> TensorOps {
         let bytes: Vec<u8> = [1.0f32; 16].iter().flat_map(|f| f.to_le_bytes()).collect();

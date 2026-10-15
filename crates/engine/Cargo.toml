@@ -21,7 +21,7 @@ half = "2"
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 owl-cpu = { path = "../backends/cpu" }
-owl-test-macros = { path = "../test-macros" }
+owl-macros = { path = "../macros" }
 
 [features]
 # 性能框架:release 也展开计时宏(见 workpace docs/arch/perf-framework.md)
