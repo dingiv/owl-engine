@@ -129,6 +129,27 @@ pub enum Command {
         copies: Vec<(u64, usize, u64, usize, usize)>,
         ack: Ack<Result<(), ModelError>>,
     },
+    /// **UploadAndLaunch**(E2 复合;闭集 1:1,设计 §3.2):一次 pinned 搬运
+    /// + 一次发射。**客户端不出现流/事件/槽** —— 序由 server 内部保证
+    /// (E2a:线格式/校验/负门;**E2b 接线** = 完成回调链 → 设备端事件序)。
+    /// 失败带**结构化阶段**(transfer / launch)。
+    UploadAndLaunch {
+        buf: Box<dyn owl_iface::contract::PinnedRegion + Send>,
+        dst: Bytes,
+        offset_bytes: usize,
+        len_bytes: usize,
+        msg: LaunchMsg,
+        ack: Ack<Result<Bytes, ModelError>>,
+    },
+    /// **LaunchAndHarvest**(E2 复合;闭集 1:1):一次发射 + 一次回读。
+    /// 校验:`id` 必须是本 launch 的**输出块**(槽序末位 Block);
+    /// 契约:harvest 走 D2H 流异步,**禁退化成隐式全排空**。
+    LaunchAndHarvest {
+        msg: LaunchMsg,
+        id: u64,
+        want_bytes: usize,
+        ack: Ack<Result<Vec<u8>, ModelError>>,
+    },
     /// kernel 发射(非阻塞;fire-and-forget)
     Launch {
         msg: LaunchMsg,
@@ -157,6 +178,8 @@ impl Command {
             Self::Alloc { .. } => "alloc",
             Self::Htod { .. } => "htod",
             Self::MemsetZero { .. } => "memset_zero",
+            Self::UploadAndLaunch { .. } => "upload_and_launch",
+            Self::LaunchAndHarvest { .. } => "launch_and_harvest",
             Self::HtodChunk { .. } => "htod_chunk",
             Self::HtodChunks { .. } => "htod_chunks",
             Self::AllocPinned { .. } => "alloc_pinned",
@@ -181,6 +204,8 @@ impl Command {
             Self::GraphDestroy { ack, .. } => ack.created_at(),
             Self::Alloc { ack, .. } => ack.created_at(),
             Self::Htod { ack, .. } => ack.created_at(),
+            Self::UploadAndLaunch { ack, .. } => ack.created_at(),
+            Self::LaunchAndHarvest { ack, .. } => ack.created_at(),
             Self::MemsetZero { ack, .. } => ack.created_at(),
             Self::HtodChunk { ack, .. } => ack.created_at(),
             Self::HtodChunks { ack, .. } => ack.created_at(),

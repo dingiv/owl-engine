@@ -387,3 +387,38 @@ impl DeviceClient for GpuClient {
         self.submit(move |ack| Command::Free { ids, ack })?.await
     }
 }
+
+/// **E2 复合面(固有口)**;trait 加宽(= 让泛型调用点可用)与 server 侧
+/// 接线(完成回调链 → 设备端事件序)同属 E2b。
+impl GpuClient {
+    // ==================================================================
+    // E2 复合面(闭集 1:1;设计 docs/arch/三流事件序-设计与迁移.md §3.2)
+    // ==================================================================
+
+    /// **上传并计算**:一次 pinned 搬运 + 一次发射,序由 server 内部保证。
+    /// (E2a:线格式/校验/负门在位;接线 = E2b —— 目前 server 侧响亮拒。)
+    pub async fn upload_and_launch(
+        &mut self,
+        buf: Box<dyn owl_iface::contract::PinnedRegion + Send>,
+        dst: &Bytes,
+        offset_bytes: usize,
+        len_bytes: usize,
+        msg: LaunchMsg,
+    ) -> Result<Bytes, ModelError> {
+        let dst = dst.clone();
+        self.submit(move |ack| Command::UploadAndLaunch { buf, dst, offset_bytes, len_bytes, msg, ack })?
+            .await
+    }
+
+    /// **计算并回读**:一次发射 + 一次回读(`id` 必须是本 launch 的输出块;
+    /// 该校验在 server 侧 = E2b)。
+    pub async fn launch_and_harvest(
+        &mut self,
+        msg: LaunchMsg,
+        id: u64,
+        want_bytes: usize,
+    ) -> Result<Vec<u8>, ModelError> {
+        self.submit(move |ack| Command::LaunchAndHarvest { msg, id, want_bytes, ack })?
+            .await
+    }
+}

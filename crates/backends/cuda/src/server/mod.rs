@@ -244,6 +244,12 @@ impl GpuServer {
                 .collect()
         };
         match cmd {
+            Command::UploadAndLaunch { dst, len_bytes, .. } => {
+                E::new("upload_and_launch", "h2d").bytes(*len_bytes).id(dst.id)
+            }
+            Command::LaunchAndHarvest { id, want_bytes, .. } => {
+                E::new("launch_and_harvest", "d2h").bytes(*want_bytes).id(*id)
+            }
             Command::Launch { msg, .. } => {
                 let ids: Vec<u64> = msg
                     .args
@@ -536,24 +542,27 @@ impl GpuServer {
     /// 与 `trace_entry_of` 的流标签同表(那里是给 trace 看的字符串;本表是
     /// 给事件记账看的 StreamId)。**扩充命令面时必须同步**(E2 复合命令按
     /// 自身语义定流)。
-    fn cmd_stream(c: &Command) -> Option<StreamId> {
+    fn cmd_stream(c: &Command) -> u8 {
         match c {
             // H2D 流:一切 host→device 搬运
             Command::Htod { .. }
             | Command::HtodChunk { .. }
             | Command::HtodChunks { .. }
-            | Command::UploadPinned { .. } => Some(STREAM_H2D),
+            | Command::UploadPinned { .. } => 1u8 << STREAM_H2D,
             // COMPUTE 流:发射 / 清零分配 / 设备内拷贝 / 图回放
             Command::Launch { .. }
             | Command::Alloc { .. }
             | Command::MemsetZero { .. }
             | Command::CopyBlock { .. }
             | Command::CopyBatch { .. }
-            | Command::GraphLaunch { .. } => Some(STREAM_COMPUTE),
+            | Command::GraphLaunch { .. } => 1u8 << STREAM_COMPUTE,
             // D2H 流:一切 device→host 回读
-            Command::Dtoh { .. } => Some(STREAM_D2H),
+            Command::Dtoh { .. } => 1u8 << STREAM_D2H,
+            // 复合:两条腿各触一条流(E2 位图的第一个用例)
+            Command::UploadAndLaunch { .. } => (1u8 << STREAM_H2D) | (1u8 << STREAM_COMPUTE),
+            Command::LaunchAndHarvest { .. } => (1u8 << STREAM_COMPUTE) | (1u8 << STREAM_D2H),
             // 无 GPU 活/图控制/同步/宿主面:不记账
-            _ => None,
+            _ => 0,
         }
     }
 
@@ -567,19 +576,24 @@ impl GpuServer {
             (None, None)
         };
         // E1:本命令的落流(记账用;必须在 dispatch_inner 吞掉 cmd 之前取)
-        let sid = Self::cmd_stream(&cmd);
+        let sbits = Self::cmd_stream(&cmd);
         self.dispatch_inner(cmd);
         // **E1 纯记账**:把本命令的完成点记到该流尾事件(不等待任何东西;
         // 序消费在 E2/E3)。捕获期自动跳过(见 `record_tail`)。
-        if let Some(sid) = sid {
+        if sbits != 0 {
             let t_ev = if timing { Some(std::time::Instant::now()) } else { None };
-            if let Err(e) = self.ctx_mut().record_tail(sid) {
+            for sid in [STREAM_H2D, STREAM_COMPUTE, STREAM_D2H] {
+                if sbits & (1u8 << sid) == 0 {
+                    continue;
+                }
+                if let Err(e) = self.ctx_mut().record_tail(sid) {
                 // 记账面失败不改命令语义:响亮但不改回执
                 self.sink.logf(
                     owl_shared::log::LVL_WARN,
                     "ev",
                     format_args!("尾事件记账失败(stream {sid})—— 不影响本命令: {e}"),
                 );
+                }
             }
             if let Some(t1) = t_ev {
                 self.timing_acc("srv.ev_record", t1.elapsed());
@@ -628,6 +642,14 @@ impl GpuServer {
         if self.ctx().capture_stream() {
             return match cmd {
                 Command::Launch { msg, ack } => self.handle_launch(msg, ack),
+            // E2a:线格式/校验/负门在位,**接线 = E2b**(完成回调链 → 设备端
+            // 事件序;两侧底噪已量 p50 170~740ns / 180ns)。半成品响亮拒。
+            Command::UploadAndLaunch { ack, .. } => ack.send(Err(ModelError::Msg(
+                "UploadAndLaunch: E2a 未接线(线格式/校验/负门已在位;接线 = E2b)".into(),
+            ))),
+            Command::LaunchAndHarvest { ack, .. } => ack.send(Err(ModelError::Msg(
+                "LaunchAndHarvest: E2a 未接线(线格式/校验/负门已在位;接线 = E2b)".into(),
+            ))),
                 Command::Alloc { n_bytes, elems, zero, ack } => self.handle_alloc(n_bytes, elems, zero, ack),
                 Command::MemsetZero { block, offset_bytes, len_bytes, ack } => {
                     self.handle_memset_zero(block, offset_bytes, len_bytes, ack)
@@ -669,6 +691,14 @@ impl GpuServer {
             }
             Command::CopyBatch { copies, ack } => self.handle_copy_batch(copies, ack),
             Command::Launch { msg, ack } => self.handle_launch(msg, ack),
+            // E2a:线格式/校验/负门在位,**接线 = E2b**(完成回调链 → 设备端
+            // 事件序;两侧底噪已量 p50 170~740ns / 180ns)。半成品响亮拒。
+            Command::UploadAndLaunch { ack, .. } => ack.send(Err(ModelError::Msg(
+                "UploadAndLaunch: E2a 未接线(线格式/校验/负门已在位;接线 = E2b)".into(),
+            ))),
+            Command::LaunchAndHarvest { ack, .. } => ack.send(Err(ModelError::Msg(
+                "LaunchAndHarvest: E2a 未接线(线格式/校验/负门已在位;接线 = E2b)".into(),
+            ))),
             Command::Sync { ack } => self.handle_sync(ack),
             Command::GraphBegin { ack } => ack.send(self.ctx_mut().graph_begin()),
             Command::GraphEnd { ack } => ack.send(self.ctx_mut().graph_end()),
@@ -701,6 +731,8 @@ impl GpuServer {
             Command::HtodChunks { ack, .. } => closed!(ack),
             Command::AllocPinned { ack, .. } => closed!(ack),
             Command::UploadPinned { ack, .. } => closed!(ack),
+            Command::UploadAndLaunch { ack, .. } => closed!(ack),
+            Command::LaunchAndHarvest { ack, .. } => closed!(ack),
             Command::Dtoh { ack, .. } => closed!(ack),
             Command::Free { ack, .. } => closed!(ack),
             Command::CopyBlock { ack, .. } => closed!(ack),
@@ -718,6 +750,9 @@ impl GpuServer {
     fn reject_with(cmd: Command, why: String, sink: owl_shared::log::LogSink) {
         macro_rules! reject { ($ack:expr) => { $ack.send(Err(ModelError::Msg(why.clone()))) } }
         let name = |c: &Command| match c {
+            // E2 复合(分相计时标签;与 Command::kind() 同名单一真源)
+            Command::UploadAndLaunch { .. } => "upload_and_launch",
+            Command::LaunchAndHarvest { .. } => "launch_and_harvest",
             Command::GraphBegin { .. } => "GraphBegin",
             Command::GraphEnd { .. } => "GraphEnd",
             Command::GraphLaunch { .. } => "GraphLaunch",
@@ -752,6 +787,9 @@ impl GpuServer {
             Command::HtodChunks { ack, .. } => reject!(ack),
             Command::AllocPinned { ack, .. } => reject!(ack),
             Command::UploadPinned { ack, .. } => reject!(ack),
+            // **E2 负门**:复合命令内含搬运/回读(不可捕获)⇒ 捕获期结构化拒
+            Command::UploadAndLaunch { ack, .. } => reject!(ack),
+            Command::LaunchAndHarvest { ack, .. } => reject!(ack),
             Command::Dtoh { ack, .. } => reject!(ack),
             Command::Sync { ack, .. } => reject!(ack),
             Command::Free { ack, .. } => reject!(ack),
