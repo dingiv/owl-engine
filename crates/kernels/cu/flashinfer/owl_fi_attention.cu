@@ -48,6 +48,12 @@ extern "C" int owl_fi_prefill_plan(
     int64_t* out_plan15,
     int32_t* out_cta_tile_q,
     int32_t* out_split_kv,
+    // **plan 表写入 int_ws 的字节数**(= page_locked 缓冲里有效前缀长度)。
+    // 供 Rust 侧做"不变盒快照":多 plan 共存时,int_ws 是唯一共享区 ⇒
+    // 图回放前必须能自携本 plan 的表(见 server/flashinfer.rs 的 PlanEntry)。
+    // 与 PrefillPlanImpl<true> 内的 cudaMemcpyAsync 尺寸同源(两条路径
+    // 的 int_allocator 分配序相同 ⇒ need_int == num_allocated_bytes)。
+    size_t* out_int_bytes,
     const int32_t* qo_indptr_h,      // [B+1] host 端数组(plan 在 host 读)
     const int32_t* kv_indptr_h,      // [B+1] host(token 级)
     int32_t total_num_rows,
@@ -104,6 +110,7 @@ extern "C" int owl_fi_prefill_plan(
     for (int i = 0; i < 15; ++i) out_plan15[i] = v[i];
     *out_cta_tile_q = (int32_t)plan_info.cta_tile_q;
     *out_split_kv = plan_info.split_kv ? 1 : 0;
+    if (out_int_bytes) *out_int_bytes = need_int;
     return 0;
   } catch (const std::exception& e) {
     fprintf(stderr, "[owl-fi][plan] %s\n", e.what());

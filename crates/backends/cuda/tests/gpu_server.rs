@@ -365,6 +365,15 @@ async fn step_family_window_guard(client: &mut GpuClient) {
     let gate = client.htod(Dtype::F16, &Shape::from(vec![8, 1]), &le_f16(&[-0.01; 8])).await.expect("htod gate");
     let state = client.alloc(Dtype::F32, 128 * 128).await.expect("alloc state").view(Dtype::F32, 4);
     let out = client.alloc(Dtype::F16, elems_qkv).await.expect("alloc out").view(Dtype::F16, 3);
+    // P-6b:序列表(cu|coff|idx)现造一块(本测只关心窗内 alloc/upload 守卫,
+    // 表内容按 t=8 ⇒ nt=1;表在**窗外**造 —— 表本身归引擎写,不归 runtime)
+    let nt = 8usize.div_ceil(owl_kernels::family::gdn_chunked::BT).max(1);
+    let tbl_bytes = owl_kernels::family::gdn_chunked::table_host_bytes(8, nt);
+    let tables = client
+        .htod(Dtype::U8, &Shape::from(vec![tbl_bytes.len()]), &tbl_bytes)
+        .await
+        .expect("htod tables")
+        .view(Dtype::U32, 1);
 
     let call = GdnChunkedCall::builder(shape)
         .q(&q).expect("q 契约")
@@ -373,6 +382,7 @@ async fn step_family_window_guard(client: &mut GpuClient) {
         .beta(&beta).expect("beta 契约")
         .gate_raw(&gate).expect("gate 契约")
         .state(&state, 0).expect("state 契约")
+        .tables(&tables, nt).expect("tables 契约")
         .build().expect("家族调用装配");
     let msg = call.to_launch(out.clone());
 
@@ -389,7 +399,9 @@ async fn step_family_window_guard(client: &mut GpuClient) {
         let call2 = GdnChunkedCall::builder(shape)
             .q(&q).expect("q2").k(&k).expect("k2").v(&v).expect("v2")
             .beta(&beta).expect("beta2").gate_raw(&gate).expect("gate2")
-            .state(&state, 0).expect("state2").build().expect("build2");
+            .state(&state, 0).expect("state2")
+            .tables(&tables, nt).expect("tables2")
+            .build().expect("build2");
         client.launch(call2.to_launch(out.clone())).await.expect("窗外家族调用应照常");
     } else {
         r.expect("观察档:窗内家族调用放行(只记账,行为不变)");

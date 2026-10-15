@@ -157,6 +157,13 @@ impl Fi {
     }
 
     fn msg(&self, ctx: usize) -> LaunchMsg {
+        self.msg_geom(self.rows, self.rows, ctx)
+    }
+
+    /// 几何可变的消息构造(`total_rows`/`T` 进 plan 键 ⇒ 换它们 = 换 plan;
+    /// 块尺寸仍按本 fixture 的 `rows` —— 探针④只需要"另一条 plan 被算出来
+    /// 并推荐 int_ws",不需要那个形状本身几何自洽)。
+    fn msg_geom(&self, total_rows: usize, t: usize, ctx: usize) -> LaunchMsg {
         LaunchMsg {
             kernel: KernelSource { name: FI_OP.to_string(), source: String::new() },
             args: vec![
@@ -169,9 +176,9 @@ impl Fi {
                 Arg::Block { id: self.ll.id, dtype: Dtype::U32, rank: 1 },
                 Arg::Block { id: self.wr.id, dtype: Dtype::F16, rank: 1 },
                 Arg::Block { id: self.out.id, dtype: Dtype::F16, rank: 1 },
-                Arg::U64(self.rows as u64), // total_rows
-                Arg::U64(ctx as u64),       // ctx_total
-                Arg::U64(self.rows as u64), // T
+                Arg::U64(total_rows as u64), // total_rows
+                Arg::U64(ctx as u64),        // ctx_total
+                Arg::U64(t as u64),          // T
                 Arg::U64(H as u64),
                 Arg::U64(HKV as u64),
                 Arg::U64(HD as u64),
@@ -181,7 +188,7 @@ impl Fi {
             grid: (0, 0, 0),
             block: (0, 0, 0),
             shared_mem: 0,
-            out_elems: self.rows * H * HD,
+            out_elems: t * H * HD,
         }
     }
 
@@ -190,6 +197,13 @@ impl Fi {
     fn exec(&mut self, ctx: usize) {
         let msg = self.msg(ctx);
         self.reg.execute(&msg, &mut self.res, &mut self.exec).expect("FI run");
+    }
+
+    /// 发一条**别的几何**的消息(同 registry ⇒ 同 FiRuntime/int_ws;
+    /// 探针④用它把 int_ws 刷成另一条 plan)
+    fn exec_geom(&mut self, total_rows: usize, t: usize, ctx: usize) {
+        let msg = self.msg_geom(total_rows, t, ctx);
+        self.reg.execute(&msg, &mut self.res, &mut self.exec).expect("FI run(几何变体)");
     }
 
     /// 窗外:eager 参考 / 捕获后的收割
@@ -332,6 +346,61 @@ fn fi_graph_replay_m2a() {
         assert!(d_mask < 1e-6, "③a 掩码回放应≡eager:{d_mask:.3e}");
         assert!(d_nomask < 1e-6, "③b 尾部 CTA 写坏了真行(F-8 被否证):{d_nomask:.3e}");
         assert!(unmasked_ms >= 0.0 && masked_ms >= 0.0, "③c 计时口径自检(地板口径,见头注)");
+    }
+
+    // ── ④ int_ws 自携(多 plan 共存;M2b 2026-10-15)─────────────────────
+    //
+    // 病:int_ws 是**唯一共享区**(每次 `owl_fi_prefill_plan` 都把调度表
+    // memcpy 进同一个 int_ws),而图里烘的是 `int_ws + offset` 指针 ⇒ "最后
+    // 一个 plan"决定所有图读到什么(多桶/草稿面共存皆可踩)。
+    // 判据:A 捕获后,用**别的形状**把 int_ws 刷掉,再回放 A ⇒ 仍 ≡ A 的
+    // eager 基线(即 A 的图自携了 A 的 plan)。
+    // 取证档:`OWL_FI_NO_PLAN_RESTORE=1` 下本判据**必须红**(机制承重证据)。
+    {
+        let t = 128usize;
+        let mut f = Fi::new(dev, t, 128, t * H * HD * 2, 731);
+        f.tables(128);
+        f.run(128); // 预热:plan A 入条目表
+        f.res.capture_flag = true; // 窗内:激活 upload 会被烘进图(= 自携)
+        RawGraph::begin(&f.res.ctx, &f.res.stream).expect("begin");
+        f.exec(128);
+        let g = RawGraph::end(&f.res.ctx, &f.res.stream).expect("end");
+        f.res.capture_flag = false;
+        g.launch(&f.res.ctx, &f.res.stream).expect("launch base");
+        f.res.stream.synchronize().expect("sync");
+        let base = f.read(t);
+        // **结构判据**(权威):int_ws 内容 —— 回放后必须被刷回 A 的 plan 快照。
+        // 为什么不用"输出相等"当唯一判据:本档(split 关 + batch=1)的 plan 数组
+        // 内容是**形状无关**的(request_indices 全 0、qo_tile_indices 恒等),
+        // 输出在中毒时也可能碰巧相等 —— 那正是"靠陈旧表项恰好无害"的静默依赖
+        // (设计 §3.2 明列不做)。直接读 int_ws 才能把机制证成承重件。
+        let int_ws = f
+            .res
+            .block_id_of_len(32 * 1024 * 1024)
+            .expect("int_ws(32MiB)在册");
+        let before = f.res.take_bytes(int_ws);
+
+        // 另一形状(**同 registry** ⇒ 同 int_ws):64 行几何 ⇒ 新 plan ⇒ 冲 int_ws
+        // (选与 A **同 padded** 的形状:计划数组的"值"会变(o_indptr/kv_chunk_size),
+        //  但**不会**出现越界/重排索引 ⇒ 取证档红的时候也不会跑成病理慢速)
+        f.exec_geom(64, 64, 64);
+        f.res.stream.synchronize().expect("sync B");
+        let after_b = f.res.take_bytes(int_ws);
+        let first_diff = (0..2048).find(|&i| after_b[i] != before[i]);
+        let b_differs = first_diff.is_some();
+
+        g.launch(&f.res.ctx, &f.res.stream).expect("launch after switch");
+        f.res.stream.synchronize().expect("sync");
+        let after = f.read(t);
+        let restored = f.res.take_bytes(int_ws);
+        let ws_restored = restored[..2048] == before[..2048];
+        let d = maxdiff(&base, &after);
+        println!(
+            "[④] 多 plan 共存:B 调用后 int_ws 变了={b_differs}(首个差异字节 {first_diff:?}) | 回放 A 后 int_ws 复位={ws_restored} | 输出 |Δ| = {d:.3e}(取证档 OWL_FI_NO_PLAN_RESTORE=1 应红)"
+        );
+        assert!(b_differs, "④ 前提不成立:B 的 plan 没写进 int_ws(本实验是空转)");
+        assert!(ws_restored, "④ int_ws 自携失败(回放读到了别的 plan 的调度表)");
+        assert!(d < 1e-6, "④ 回放输出被别的 plan 影响:{d:.3e}");
     }
 
     println!("=== M2a 全绿:整段单图(§4.1 的 F-5/F-6/F-8)三条假设实测成立 ===");

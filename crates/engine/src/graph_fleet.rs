@@ -46,6 +46,9 @@ pub(crate) struct GraphFleet<D: DeviceClient> {
     /// DFlash2 propose 单图(E5-DF4;encode 全 8 行 + 噪声块 + selector,
     /// 固定几何;None = eager 回退)
     pub dflash: Option<GraphPlan<D>>,
+    /// **prefill 桶族(M2b)**:一桶一张整段单图(含 KV 写 + FI 注意力);
+    /// 空 = 档位 off / 未建(该档全走 eager 原路)
+    pub prefill: crate::prefill_plan::PrefillBuckets<D>,
 }
 
 impl<D: DeviceClient> GraphFleet<D> {
@@ -54,6 +57,7 @@ impl<D: DeviceClient> GraphFleet<D> {
     /// perf-framework.md §十.3)。
     pub(crate) fn set_phase(&mut self, p: owl_models::env::EvalPhase) {
         self.session.set_phase(p);
+        self.prefill.set_phase(p);
         if let Some(g) = self.verify.as_mut() {
             g.set_phase(p);
         }
@@ -105,7 +109,9 @@ impl<D: DeviceClient> GraphFleet<D> {
         boot: FleetBoot<'_>,
         t0: T,
     ) -> Result<Self> {
-        // ① 主会话图
+        // ① 主会话图(先留一个句柄给 ④ 的 prefill 桶族 —— 桶族在最后建,
+        // 那时 `face`/`vface` 都已被消费)
+        let pface_src = face.face_clone();
         let (session, capture_outcome) = Self::plan_session(face, &boot, t0).await?;
         // ② verify 桶形图(spec 模式且主图捕获成功才有意义)
         let verify = if boot.spec.depth > 0
@@ -126,7 +132,62 @@ impl<D: DeviceClient> GraphFleet<D> {
         } else {
             (Vec::new(), None, Vec::new())
         };
-        Ok(Self { session, capture_outcome, verify, fold, propose, dflash })
+        // ④ **prefill 桶族(M2b)**:最后建 —— 自己的槽面/自己的输出块,
+        // 与前面几族无共享羁绊;必须在家族 scratch 只增不减的律下**降序**捕
+        // (桶内部自己排;见 `prefill_plan` 模块头注硬纪律 #2)。
+        let prefill = if boot.knobs.prefill_bucket == owl_shared::config::PrefillBucket::Off {
+            crate::prefill_plan::PrefillBuckets::empty()
+        } else if boot.knobs.no_graph {
+            owl_shared::log_warn!(
+                "prefill-graph",
+                "[graph] no_graph = true ⇒ prefill 桶不建(桶属图族;要诊断桶请去掉该总闸)"
+            );
+            crate::prefill_plan::PrefillBuckets::empty()
+        } else if boot.knobs.env.attn.xqa_prefill {
+            // XQA prefill 臂在场 ⇒ 不建桶:桶图的槽面是 FI 四件套,XQA 要的是
+            // 页链/整请求长/位掩码三件 ⇒ 图内走 FI、eager 走 XQA(图 ≢ eager)。
+            // 响亮告知(不是静默降级)。
+            owl_shared::log_warn!(
+                "prefill-graph",
+                "dispatch.xqa_prefill 在场 ⇒ prefill 桶不建(桶图槽面 = FI 四件套;回 eager 原路)"
+            );
+            crate::prefill_plan::PrefillBuckets::empty()
+        } else if boot.pool.fi_face {
+            match pface_src {
+                None => {
+                    owl_shared::log_warn!(
+                        "prefill-graph",
+                        "face_clone 不可用 ⇒ prefill 桶不建(回 eager 原路)"
+                    );
+                    crate::prefill_plan::PrefillBuckets::empty()
+                }
+                Some(pf) => {
+                    let boot_pg = crate::prefill_plan::BucketBoot {
+                        env: boot.env,
+                        model: Arc::clone(&boot.model),
+                        rope: boot.rope.clone(),
+                        pool: boot.pool,
+                        dims: boot.dims,
+                        taps: boot.spec.dflash_tap_count,
+                        ladder: crate::prefill_plan::ladder(boot.knobs.prefill_bucket),
+                    };
+                    let buckets = crate::prefill_plan::PrefillBuckets::capture(&pf, &boot_pg).await;
+                    owl_shared::log_info!(
+                        "prefill-graph",
+                        "桶族摘要:t_pad 命中阶梯 = {}",
+                        buckets.summary()
+                    );
+                    buckets
+                }
+            }
+        } else {
+            owl_shared::log_warn!(
+                "prefill-graph",
+                "非 FI 档(pool.fi_face = false)⇒ prefill 桶不建(回 eager 原路)"
+            );
+            crate::prefill_plan::PrefillBuckets::empty()
+        };
+        Ok(Self { session, capture_outcome, verify, fold, propose, dflash, prefill })
     }
 
     /// ① 主会话图(槽 → 整模单树;状态句柄捕获,模型 Arc 共享)。
@@ -276,7 +337,10 @@ impl<D: DeviceClient> GraphFleet<D> {
                 slab_fixed: knobs.cuda.capture_slab_mb.is_some(),
                 debug_probe: knobs.probes.debug,
                 // 本族不加锚定回收(plain 口径:窗内块常驻 —— 历史行为零变化)
-                reclaim_capture: false,
+                // 锚定活性回收(2026-10-15 归因之修②;理由同族桶形图):
+                // plain = 分配总和(主会话 13.6MiB / 该图实测总量级更高)⇒
+                // 开 scoped,容量降到峰值活跃集;恒等门同族。
+                reclaim_capture: true,
                 warmup: true,
             },
             forward,
@@ -386,7 +450,10 @@ impl<D: DeviceClient> GraphFleet<D> {
                 slab_fixed: knobs.cuda.capture_slab_mb.is_some(),
                 debug_probe: knobs.probes.debug,
                 // 本族不加锚定回收(plain 口径:窗内块常驻 —— 历史行为零变化)
-                reclaim_capture: false,
+                // 锚定活性回收(2026-10-15 归因之修②;理由同族桶形图):
+                // plain = 分配总和(主会话 13.6MiB / 该图实测总量级更高)⇒
+                // 开 scoped,容量降到峰值活跃集;恒等门同族。
+                reclaim_capture: true,
                 warmup: true,
             },
             move |sc: &PlanCtx| -> Result<()> {
@@ -567,7 +634,11 @@ impl<D: DeviceClient> GraphFleet<D> {
                     slab_fixed: knobs.cuda.capture_slab_mb.is_some(),
                     debug_probe: knobs.probes.debug,
                     // 本族不加锚定回收(plain 口径:窗内块常驻 —— 历史行为零变化)
-                    reclaim_capture: false,
+                    // 锚定活性回收(2026-10-15 归因之修②):本族 plain 口径是**分配总和**
+                    // (verify 图实测 133MiB 而真活跃 ~19MB)⇒ 开 scoped 归约,
+                    // slab 容量 = 峰值活跃集。机制门 = graph_plan::gpu_capture_reclaim_matches_eager
+                    // + 族恒等门(fold/propose/verify 各有对拍)。
+                    reclaim_capture: true,
                     warmup: true,
                 },
                 move |sc: &PlanCtx| -> Result<()> {
@@ -674,7 +745,10 @@ impl<D: DeviceClient> GraphFleet<D> {
                 slab_fixed: knobs.cuda.capture_slab_mb.is_some(),
                 debug_probe: knobs.probes.debug,
                 // 本族不加锚定回收(plain 口径:窗内块常驻 —— 历史行为零变化)
-                reclaim_capture: false,
+                // 锚定活性回收(2026-10-15 归因之修②;理由同族桶形图):
+                // plain = 分配总和(主会话 13.6MiB / 该图实测总量级更高)⇒
+                // 开 scoped,容量降到峰值活跃集;恒等门同族。
+                reclaim_capture: true,
                 warmup: true,
             },
             move |sc: &PlanCtx| -> Result<()> {
@@ -800,7 +874,11 @@ impl<D: DeviceClient> GraphFleet<D> {
                     slab_fixed: knobs.cuda.capture_slab_mb.is_some(),
                     debug_probe: knobs.probes.debug,
                     // 本族不加锚定回收(plain 口径:窗内块常驻 —— 历史行为零变化)
-                    reclaim_capture: false,
+                    // 锚定活性回收(2026-10-15 归因之修②):本族 plain 口径是**分配总和**
+                    // (verify 图实测 133MiB 而真活跃 ~19MB)⇒ 开 scoped 归约,
+                    // slab 容量 = 峰值活跃集。机制门 = graph_plan::gpu_capture_reclaim_matches_eager
+                    // + 族恒等门(fold/propose/verify 各有对拍)。
+                    reclaim_capture: true,
                     warmup: true,
                 },
                 move |sc: &PlanCtx| -> Result<()> {

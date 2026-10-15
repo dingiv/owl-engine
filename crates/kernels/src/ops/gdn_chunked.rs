@@ -27,6 +27,8 @@ impl KernelSpec for GdnChunkedDeltaRuleFwd {
         Param::t_in("gate", Dtype::F16, 2),
         // GDN 状态槽 [slots, HV, KD, VD](f32)
         Param::t_inout("state", Dtype::F32, 4),
+        // 序列表(P-6b):cu|coff|idx 三件同块(字节口径 U32x1,同 marlin ws 记法)
+        Param::t_in("tables", Dtype::U32, 1),
         Param::t_out("out", Dtype::F16, 3),
         Param::sz("t"),
         Param::sz("slot"),
@@ -35,6 +37,8 @@ impl KernelSpec for GdnChunkedDeltaRuleFwd {
         Param::sz("kd"),
         // kd^-0.5 位型走私(显式 token)
         Param::s("scale_bits", ScalarTy::F32Bits),
+        // 块数 nt = ceil(t_real / BT)(P-6b;网格与 scratch 定尺都吃它)
+        Param::sz("nt"),
     ];
     const POOL: &'static [crate::spec::PoolAccess] =
         &[crate::spec::PoolAccess::rw(crate::spec::pools::GDN_STATE, Dtype::F32)];
@@ -124,12 +128,13 @@ mod tests {
     use super::*;
     use crate::spec::meta_of;
 
-    /// 与旧权威串(`client::gdn_chunked::SIG`)逐字一致
+    /// 与权威串(`client::gdn_chunked::SIG`)逐字一致 —— **P-6b 后 +1 表块(T)
+    /// +1 标量(nt)**:声明序 = q,k,v,beta,gate,state,tables | out | t,slot,nv,nk,kd,scale_bits,nt
     #[test]
     fn chunked_slot_order_matches_legacy_sig() {
         assert_eq!(
             meta_of::<GdnChunkedDeltaRuleFwd>().args_str(),
-            "T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz"
+            "T,T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz,sz"
         );
     }
 
@@ -143,7 +148,8 @@ mod tests {
     /// 状态块 id=6;`slots` 槽数;stride = nv*kd*kd*4 = 32*128*128*4 = 2MiB
     const STRIDE: usize = 32 * 128 * 128 * 4;
 
-    /// 测试参数:事实按 PARAMS 声明填(q/k/v F16x3,beta/gate F16x2,state F32x4,out F16x3)
+    /// 测试参数:事实按 PARAMS 声明填(q/k/v F16x3,beta/gate F16x2,state F32x4,
+    /// **tables U32x1**,out F16x3);块 id 1..8(state 恒 id=6 —— slot 门按它查账长)
     fn args_with_slot(slot: u64) -> Vec<Arg> {
         let facts = [
             (Dtype::F16, 3),
@@ -152,6 +158,7 @@ mod tests {
             (Dtype::F16, 2),
             (Dtype::F16, 2),
             (Dtype::F32, 4),
+            (Dtype::U32, 1),
             (Dtype::F16, 3),
         ];
         let mut v: Vec<Arg> = facts
@@ -159,7 +166,8 @@ mod tests {
             .enumerate()
             .map(|(i, (d, r))| Arg::block(i as u64 + 1, *d, *r))
             .collect();
-        for s in [512u64, slot, 32, 16, 128, 0x3f00_0000] {
+        // 标量:t, slot, nv, nk, kd, scale_bits, nt
+        for s in [512u64, slot, 32, 16, 128, 0x3f00_0000, 8] {
             v.push(Arg::U64(s));
         }
         v

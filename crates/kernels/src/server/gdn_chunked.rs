@@ -17,7 +17,7 @@
 //! Rust 视角 f32 仅为字节池标注(新链 ScratchBuf 无 dtype 假装)。
 
 use cudarc::driver::CudaFunction;
-use crate::contract::{Bytes, InvariantBox, LaunchMsg, OpError, OpId};
+use crate::contract::{Bytes, LaunchMsg, OpError, OpId};
 use crate::device::{DeviceRes, Exec, LaunchVal, ScratchBuf};
 
 use crate::family::gdn_chunked::cubins;
@@ -50,14 +50,8 @@ struct Scratch {
     in_beta: Option<ScratchBuf>,     // t*hv bf16
     in_g: Option<ScratchBuf>,        // t*hv f32
     o_b16: Option<ScratchBuf>,       // t*hv*vd bf16
-    meta: HashMap<(usize, usize), ScratchBuf>, // (T,NT) 键 i64 表驻留
-    /// **meta 表的冻结源盒**(P-6a,2026-10-15;设计 §4.3e):
-    /// 表内容 = `[0,t, 0,nt, (0,i)…]`,**纯函数于 (t,nt)** ⇒ 按同键冻一份
-    /// `InvariantBox`。修的是哪条旧路:原实现每次新键都 `upload(&栈上 Vec)`
-    /// —— 若这次物化发生在**捕获窗内**,那份 H2D 会被烙成图节点,回放期
-    /// **重读那个已释放的 host 地址** ⇒ 静默错值(与 FI plan 的内嵌 H2D 同族;
-    /// 现在源的生命周期 ≥ 运行时,窗内也不再危险)。
-    meta_boxes: HashMap<(usize, usize), InvariantBox>,
+    // 序列表(cu|coff|idx)**不再驻留 runtime**:改由引擎按 t_real 写入持久槽
+    // (P-6b,2026-10-15;见 run 内"序列表"段)。
     grave: Vec<ScratchBuf>,          // A1.7 坟场
     /// 诊断仪(OWL_GDN_DIAG):**逐 call 打印**前 N 次(跨臂对齐比较用;
     /// 按形状去重会看不到同臂逐 chunk 的演化)
@@ -261,7 +255,7 @@ impl KernelFamily for GdnChunkedRuntime {
         let nk = shape.nk as usize;
         let kd = shape.kd as usize;
         let vd = kd; // GDN:KD == VD(27B = 128)
-        let nt = t.div_ceil(64);
+        // nt 由调用方给(P-6b;见下方序列表段)
 
         // 拆借:res / exec / self 字段三方独立可变借
         let Self {
@@ -274,6 +268,37 @@ impl KernelFamily for GdnChunkedRuntime {
                 detail: format!("符号 {name} 未装载"),
             })
         };
+
+        // ── 序列表:cu | coff | idx(**调用入参**,P-6b 2026-10-15)──
+        //
+        // 旧实现把三张表按 `(t, nt)` 键缓存在 runtime 内部(host 生成 + 上传),
+        // 后果:桶 padding 下 `t = t_pad` ⇒ 假行被当成序列的一部分走完 ⇒
+        // **递推终态落在假行末尾且被假行污染**(探针 `gdn_bucket_pad_probe`
+        // 实测:真行输出 Δ=0、终态 Δ=3.6e-2)。
+        //
+        // 现在:FLA 语义的三张表改由**引擎按 t_real 写**进持久槽,作为调用入参
+        // 传入(与 FLA 上游 `cu_seqlens`/`chunk_indices` 入参一致);runtime 只切
+        // 三个视图 —— 内容与生命周期都不归它管 ⇒ ①假行**不在序列里**(cu 决定
+        // 一切,核结构上不碰)②图可烘(地址恒定)③少一条窗内 alloc 路径。
+        //
+        // 布局权威 = `family::gdn_chunked::{CU_OFF, COFF_OFF, IDX_OFF, table_bytes}`
+        // (引擎与本处同读一份常量);`nt` 也由调用方给(t_real 才能算出真块数)。
+        let tables = call.tables();
+        let nt = tables.nt;
+        let have_tbl = res.resolve_len(tables.tables.id)?;
+        let need_tbl = crate::family::gdn_chunked::table_bytes(nt);
+        if nt == 0 || have_tbl < need_tbl {
+            return Err(OpError::Contract {
+                op: OP.0.to_string(),
+                field: "tables",
+                expect: format!("≥ {need_tbl} B(nt={nt})且 nt ≥ 1"),
+                got: format!("块 id={} 可得 {have_tbl} B / nt={nt}", tables.tables.id),
+            });
+        }
+        let tbase = res.resolve(tables.tables.id)?; // Bytes 零偏移纪律(BlockSlice 才带 offset)
+        let cu_p = tbase + crate::family::gdn_chunked::CU_OFF as u64;
+        let coff_p = tbase + crate::family::gdn_chunked::COFF_OFF as u64;
+        let idx_p = tbase + crate::family::gdn_chunked::IDX_OFF as u64;
 
         // ── scratch 容量(扩容 = 坟场;几何 = 生产 realloc 同款)──
         let g_cum = ensure_one(&mut st.g_cum, &mut st.grave, res, t * hv * 4, "gdn.g_cum")?;
@@ -414,27 +439,6 @@ impl KernelFamily for GdnChunkedRuntime {
             String::new()
         };
 
-        // ── meta 表驻留((T,NT) 键;handler 同款布局 [cu|coff|idx])──
-        let (cu_p, coff_p, idx_p) = {
-            let key = (t, nt);
-            if let std::collections::hash_map::Entry::Vacant(e) = st.meta.entry(key) {
-                let mut host: Vec<i64> = Vec::with_capacity(4 + nt * 2);
-                host.extend_from_slice(&[0i64, t as i64]);
-                host.extend_from_slice(&[0i64, nt as i64]);
-                host.extend((0..nt).flat_map(|i| [0i64, i as i64]));
-                let nb = res.alloc(host.len() * 8, "gdn.meta")?;
-                let bytes: Vec<u8> =
-                    host.iter().flat_map(|v| v.to_le_bytes()).collect();
-                // **冻结盒 + 不变盒上传**(P-6a):源与运行时同寿 ⇒ 即便这次
-                // 物化落在捕获窗内,回放重放 memcpy 时读到的仍是这份不变盒
-                let box_ = InvariantBox::freeze(bytes);
-                res.upload_invariant(nb.ptr, &box_)?;
-                st.meta_boxes.insert(key, box_);
-                e.insert(nb);
-            }
-            let base = st.meta.get(&key).unwrap().ptr;
-            (base, base + 16, base + 32)
-        };
 
         // ── 状态转置入:池 [HV,K,V] → fork [V,K](handler 同款)──
         let kv_vk = f("owl_state_kv_to_vk")?;

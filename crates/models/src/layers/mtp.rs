@@ -457,7 +457,7 @@ mod wiring_tests {
         let mtp_kv = |slot: f32, len: f32| KvBuffers {
             k_cache: TensorOps::of_block(kc_b.id, Dtype::F16, vec![nb, hkv, hd / x, page, x]),
             v_cache: TensorOps::of_block(vc_b.id, Dtype::F16, vec![nb, hkv, hd, page]),
-            slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot])),
+            slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[slot])),  // 契约 r2
             kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[len])),
             block_tables: bt.clone(),
         };

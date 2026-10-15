@@ -633,6 +633,7 @@ where
         }
         Op::Zeros => {
             let b = ctx.alloc_out(dtype, n_elems, true).await?.view(dtype, shape.len() as u8);
+            owl_shared::slab_hint::probe_name(b.id, class);
             ctx.track_new(b.id);
             b
         }
@@ -656,6 +657,7 @@ where
             // 在多行 [m,k] 时越界读 —— 此 bug 被"历届测试都单行"掩盖)
             let k = t.parents[0].shape.last().copied().unwrap_or(0);
             let out = ctx.alloc_out(dtype, m * n, false).await?.view(dtype, shape.len() as u8);
+            owl_shared::slab_hint::probe_name(out.id, class);
             ctx.track_new(out.id);
             if dtype == Dtype::F16 || dtype == Dtype::BF16 {
                 // f16/bf16:foreign-kernel 通道(cuBLAS;nt = owl Linear 惯例)。
@@ -745,6 +747,8 @@ where
                 l.lap("interp.host.seg.build");
             }
             let out = ctx.alloc_out(dtype, n_elems, false).await?.view(dtype, shape.len() as u8);
+            // 峰值归因:本输出块挂上核名(`class` 已在上面 resolve 处覆写为核名)
+            owl_shared::slab_hint::probe_name(out.id, class);
             if let Some(l) = lap.as_mut() {
                 l.lap("interp.host.seg.alloc");
             }
@@ -1017,8 +1021,9 @@ mod dtype_guard_tests {
         let dx_b = gpu.htod(Dtype::F16, &shape, &xb).await.expect("htod x");
         let dy_b = gpu.htod(Dtype::F16, &shape, &yv.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()).await.expect("htod y");
         let da_b = gpu.htod(Dtype::F16, &shape, &alpha.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()).await.expect("htod alpha");
-        let dx = TensorOps::of_block(dx_b.id, Dtype::F16, vec![n]);
-        let dy = TensorOps::of_block(dy_b.id, Dtype::F16, vec![n]);
+        // 契约:rmsnorm x/out 皆 r2(行视图)
+        let dx = TensorOps::of_block(dx_b.id, Dtype::F16, vec![1, n]);
+        let dy = TensorOps::of_block(dy_b.id, Dtype::F16, vec![1, n]);
         let da = TensorOps::of_block(da_b.id, Dtype::F16, vec![n]);
 
         // y = silu(x + y) * sigmoid(x);z = rmsnorm(y ×w_off, alpha)

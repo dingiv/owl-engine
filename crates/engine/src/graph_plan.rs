@@ -49,13 +49,46 @@ pub struct InputSlot {
     pub name: String,
     /// 容量(元素;M0.5 步数据须等长,档位 narrow 视图随 batching 引入)
     pub len: usize,
-    /// 初始数据(warmup dry 执行用;缺省全零)
+    /// 声明的 dtype(缺省 F32;FI 表件槽 = U32 位型)
+    pub dtype: Dtype,
+    /// 声明的形状(缺省 `[1, len]` = 历史面;prefill 桶槽面用 [`Self::rank1`])
+    pub shape: Vec<usize>,
+    /// 初始数据(warmup dry 执行用;缺省全零。**U32 槽按位型承载** ——
+    /// 调用方写 `f32::from_bits(真 u32)` 即可)
     pub init: Vec<f32>,
 }
 
 impl InputSlot {
     pub fn f32(name: impl Into<String>, len: usize) -> Self {
-        Self { name: name.into(), len, init: Vec::new() }
+        Self {
+            name: name.into(),
+            len,
+            dtype: Dtype::F32,
+            shape: vec![1, len],
+            init: Vec::new(),
+        }
+    }
+
+    /// **rank-1 声明**(形状 = `[len]`)。prefill 桶槽面必须用它:闭包里的
+    /// 张量要与 eager 路**同形**(eager 的 `from_host(F32, vec![t], …)` 是
+    /// rank-1;算子准入表按 rank 对位)。
+    #[must_use]
+    pub fn rank1(mut self) -> Self {
+        self.shape = vec![self.len];
+        self
+    }
+
+    /// **U32 位型槽**(FI 的 `q_cu`/`indices`/`indptr`/`last_len` 四件;
+    /// 声明 dtype 进准入表 —— 历史 F32 声明会被 FI 的线格式门当场拒:
+    /// "q_cu 期望 dtype = U32 实得 F32")
+    pub fn u32(name: impl Into<String>, len: usize) -> Self {
+        Self {
+            name: name.into(),
+            len,
+            dtype: Dtype::U32,
+            shape: vec![len],
+            init: Vec::new(),
+        }
     }
 
     pub fn init(mut self, v: Vec<f32>) -> Self {
@@ -181,6 +214,9 @@ impl PlanCtx {
 struct InSlotDev {
     name: String,
     len: usize,
+    /// 声明形状/dtype(闭包与写入侧各自用;见 [`InputSlot`])
+    shape: Vec<usize>,
+    dtype: Dtype,
     block: Bytes,
 }
 
@@ -229,8 +265,20 @@ impl<D: DeviceClient> GraphPlan<D> {
         for i in desc.inputs {
             let mut init = i.init;
             init.resize(i.len, 0.0);
-            let block = face.htod(Dtype::F32, &vec![i.len], &f32b(&init)).await?;
-            ins.push(InSlotDev { name: i.name, len: i.len, block });
+            // U32 位型槽:init 值按 `f32::to_bits` 语义承载(F32 槽同字节)
+            let bytes: Vec<u8> = if i.dtype == Dtype::U32 {
+                init.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect()
+            } else {
+                f32b(&init)
+            };
+            let block = face.htod(i.dtype, &i.shape, &bytes).await?;
+            ins.push(InSlotDev {
+                name: i.name,
+                len: i.len,
+                shape: i.shape,
+                dtype: i.dtype,
+                block,
+            });
         }
 
         let mut sess = Self {
@@ -284,6 +332,12 @@ impl<D: DeviceClient> GraphPlan<D> {
             let warm_res = sess.eval_current().await;
             // 探针必须收(即使 warmup 失败),否则 PROBE_ON 残留污染下一图
             let peak = owl_shared::slab_hint::probe_end();
+            // 峰值归因(2026-10-15;用户令"先归因"):峰值时刻的构成 + 每名字分配总量
+            // —— 回答"193MiB 里谁占大头"(是搬算子还是减死重量,靠它定)
+            let attr = owl_shared::slab_hint::take_probe_report();
+            if !attr.is_empty() {
+                owl_shared::log_info!("graph-plan", "slab 峰值归因:{attr}");
+            }
             warm_res?;
             sess.face.sync().await?;
             // warmup 输出块归还(原 `clear()` 只丢句柄、块留池外 ⇒ 每次
@@ -468,7 +522,7 @@ impl<D: DeviceClient> GraphPlan<D> {
         for s in &self.inputs {
             inputs.insert(
                 s.name.clone(),
-                TensorOps::of_block(s.block.id, Dtype::F32, vec![1, s.len]),
+                TensorOps::of_block(s.block.id, s.dtype, s.shape.clone()),
             );
         }
         let ctx = PlanCtx { inputs, outputs: RefCell::new(Vec::new()) };

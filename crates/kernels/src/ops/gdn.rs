@@ -173,7 +173,7 @@ impl KernelSpec for DecodeStepV2F16 {
         Param::t_in("b_gate", Dtype::F16, 2),
         Param::t_in("a_gate", Dtype::F16, 2),
         Param::t_in("w", Dtype::F16, 2),
-        Param::t_inout("conv_v_state", Dtype::F32, 3),
+        Param::t_inout("conv_v_state", Dtype::F32, 3),  // 生产叶 [slots, dim, 3] = r3
         Param::t_in("a_log", Dtype::F16, 1),
         Param::t_in("dt_bias", Dtype::F16, 1),
         Param::t_inout("rec_state", Dtype::F32, 4),
@@ -335,12 +335,12 @@ impl KernelSpec for GdnDecodeStepF16 {
         Param::t_in("b_gate", Dtype::F16, 2),
         Param::t_in("a_gate", Dtype::F16, 2),
         Param::t_in("w", Dtype::F16, 2),
-        Param::t_inout("conv_v_state", Dtype::F32, 2),
-        Param::t_in("a_log", Dtype::F16, 2),
-        Param::t_in("dt_bias", Dtype::F16, 2),
-        Param::t_inout("rec_state", Dtype::F32, 2),
-        Param::t_in("slots", Dtype::F32, 2),
-        Param::t_in("norm_w", Dtype::F16, 2),
+        Param::t_inout("conv_v_state", Dtype::F32, 3),  // 生产叶 [slots, dim, 3] = r3
+        Param::t_in("a_log", Dtype::F16, 1),      // 权重叶 r1(与 v2/生产对齐)
+        Param::t_in("dt_bias", Dtype::F16, 1),     // 同上
+        Param::t_inout("rec_state", Dtype::F32, 4), // [slots, nv, hk, hv]
+        Param::t_in("slots", Dtype::F32, 0),        // 槽叶/输入槽两种口径 ⇒ 不约束
+        Param::t_in("norm_w", Dtype::F16, 1),
         Param::sz("batch"),
         Param::sz("nv"),
         Param::sz("nk"),
@@ -349,7 +349,7 @@ impl KernelSpec for GdnDecodeStepF16 {
         Param::f32("eps_l2"),
         Param::f32("eps_norm"),
         Param::f32("q_scale"),
-        Param::t_out("out", Dtype::F16, 2),
+        Param::t_out("out", Dtype::F16, 3),  // 层侧声明 [batch, nv, vd]
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::rw(pools::GDN_STATE, Dtype::F32)];
     const LAWS: &'static [Law] = &[Law::OutputFinite];

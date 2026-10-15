@@ -657,15 +657,19 @@ mod foreign_call_lock {
 
     /// 层声明形态(chunked;与 layers/gdn.rs 逐字同构)
     #[allow(clippy::too_many_arguments)]
+    /// GDN chunked 声明(P-6b:槽面 + `tables`(cu|coff|idx)与 `nt` 入参;
+    /// 顺序与 `layers::gdn::chunked_delta` 逐字同源 —— 线格式单源)
+    #[allow(clippy::too_many_arguments)]
     fn declare_chunked(
         q: &TensorOps, k: &TensorOps, v: &TensorOps, beta: &TensorOps,
-        gate: &TensorOps, state: &TensorOps, slot: usize,
+        gate: &TensorOps, state: &TensorOps, tables: &TensorOps, nt: usize, slot: usize,
         t: usize, nv: usize, nk: usize, kd: usize,
     ) -> TensorOps {
         TensorOps::call(SemanticKernel::GdnChunkedDelta)
-            .arg(q).arg(k).arg(v).arg(beta).arg(gate).arg(state)
+            .arg(q).arg(k).arg(v).arg(beta).arg(gate).arg(state).arg(tables)
             .arg_usize(t).arg_usize(slot).arg_usize(nv).arg_usize(nk).arg_usize(kd)
             .arg_bits((1.0f32 / (kd as f32).sqrt()).to_bits() as u64)
+            .arg_usize(nt)
             .with_shape(Dtype::F16, vec![t, nv, kd])
     }
 
@@ -698,7 +702,11 @@ mod foreign_call_lock {
         let beta = TensorOps::of_block(4, Dtype::F16, vec![64, 48]);
         let gate = TensorOps::of_block(5, Dtype::F16, vec![64, 48]);
         let state = TensorOps::of_block(6, Dtype::F32, vec![8, 48, 128, 128]);
-        let node = declare_chunked(&q, &k, &v, &beta, &gate, &state, 3, 64, 48, 16, 128);
+        // 序列表槽(cu|coff|idx;P-6b)= U32 位型 [IDX_OFF/4 + 4·nt] 词
+        let nt = 1usize;
+        let tbl_words = (owl_kernels::family::gdn_chunked::IDX_OFF / 4) + 4 * nt;
+        let tables = TensorOps::of_block(7, Dtype::U32, vec![tbl_words]);
+        let node = declare_chunked(&q, &k, &v, &beta, &gate, &state, &tables, nt, 3, 64, 48, 16, 128);
 
         // 解释器 Call 臂同款:pick → foreign sig kernel → lower_kernel
         let pick = owl_kernels::driver::resolve(OpReq {
@@ -708,7 +716,7 @@ mod foreign_call_lock {
         let kernel = crate::kernel::Kernel::new(pick.name, "")
             .with_sig(foreign_sig(pick.name).expect("foreign sig"));
         let out = Bytes::new(99, 64 * 48 * 128, Dtype::F16, 3); // [t, nv, kd]
-        let ins: Vec<Arg> = [&q, &k, &v, &beta, &gate, &state]
+        let ins: Vec<Arg> = [&q, &k, &v, &beta, &gate, &state, &tables]
             .iter().map(|t| Arg::block(t.id, t.dtype, t.shape.len() as u8)).collect();
         let msg = lower_kernel(&kernel, &node.args, &ins, &out, 64 * 48 * 128);
 
@@ -723,14 +731,16 @@ mod foreign_call_lock {
         assert_eq!(call.gate().0.id, gate.id);
         assert_eq!(call.state().pool.id, state.id);
         assert_eq!(call.state().slot, 3);
+        assert_eq!(call.tables().tables.id, tables.id);
+        assert_eq!(call.tables().nt, nt);
         assert_eq!(call.shape().t, 64);
         assert_eq!(call.shape().nv, 48);
         assert_eq!(call.shape().nk, 16);
         assert_eq!(call.shape().kd, 128);
-        // 槽序数:7 Block + 6 sz(lower_kernel 对位 sig 全额)
+        // 槽序数:8 Block(含 tables)+ 7 sz(lower_kernel 对位 sig 全额)
         let blocks = msg.args.iter().filter(|a| matches!(a, Arg::Block { .. })).count();
-        assert_eq!(blocks, 7);
-        assert_eq!(msg.args.len(), 13);
+        assert_eq!(blocks, 8);
+        assert_eq!(msg.args.len(), 15);
     }
 
     #[test]

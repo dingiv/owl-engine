@@ -1244,7 +1244,7 @@ mod tests {
         .arg_usize(src_dim)
         .arg_usize(start)
         .arg_usize(out_dim)
-        .with_shape(Dtype::F32, vec![outer * out_dim]);
+        .with_shape(Dtype::F32, vec![outer, out_dim]);  // 契约 dst r2
         let got = harvest(&mut gpu, &decl).await;
         gpu.close().await.expect("server 关机");
 
@@ -1295,16 +1295,17 @@ mod tests {
         let probe = |slot: f32, kv_len: f32| {
             let s = slot as usize;
             let (ck, cv) = cur(s);
-            let kc = TensorOps::from_host(Dtype::F32, vec![4, 1, 2], &f32b(&k_cache));
-            let vc = TensorOps::from_host(Dtype::F32, vec![4, 1, 2], &f32b(&v_cache));
+            // f32 臂契约:kc/vc r2
+            let kc = TensorOps::from_host(Dtype::F32, vec![4, 2], &f32b(&k_cache));
+            let vc = TensorOps::from_host(Dtype::F32, vec![4, 2], &f32b(&v_cache));
             TensorOps::call(SemanticKernel::NaiveDecode)
-            .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1, 2], &f32b(&q)))
-            .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1, 2], &f32b(&ck)))
-            .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1, 2], &f32b(&cv)))
+            .arg(&TensorOps::from_host(Dtype::F32, vec![1, 2], &f32b(&q)))   // 契约 q/k/v r2(f32 臂)
+            .arg(&TensorOps::from_host(Dtype::F32, vec![1, 2], &f32b(&ck)))
+            .arg(&TensorOps::from_host(Dtype::F32, vec![1, 2], &f32b(&cv)))
             .arg(&kc)
             .arg(&vc)
-            .arg(&TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot])))
-            .arg(&TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[kv_len])))
+            .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[slot])))   // 契约 slots/kv_lens r2
+            .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[kv_len])))
             .arg_usize(1)
             .arg_usize(1)
             .arg_usize(1)
@@ -1364,7 +1365,7 @@ mod f16_tests {
         .arg_usize(src_dim)
         .arg_usize(start)
         .arg_usize(out_dim)
-        .with_shape(Dtype::F16, vec![outer * out_dim]);
+        .with_shape(Dtype::F16, vec![outer, out_dim]);  // 契约 dst r2
         let out = crate::interpreters::eval_ops(decl.step(), &mut gpu).await.expect("eval");
         let mut buf = vec![0u8; outer * out_dim * 2];
         gpu.dtoh(&out, &mut buf).await.expect("dtoh");
@@ -1465,7 +1466,7 @@ mod f16_tests {
 
         // 参考臂:一次 prefill 块(paged;slots [0..T] / lens [1..T])
         let xs_all = TensorOps::from_host(Dtype::F16, vec![t_len, hidden], &halfb(&xs_f32));
-        let pos_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&(0..t_len).map(|t| t as f32).collect::<Vec<_>>()));
+        let pos_all = TensorOps::from_host(Dtype::F32, vec![1, t_len], &f32b(&(0..t_len).map(|t| t as f32).collect::<Vec<_>>()));
         let slots_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&(0..t_len).map(|t| t as f32).collect::<Vec<_>>()));
         let lens_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&(0..t_len).map(|t| t as f32 + 1.0).collect::<Vec<_>>()));
         // ⚠️ 参考臂 KvBuffers 的 slots/kv_lens 传 [T] 全量表(与 ctx 表
@@ -1510,7 +1511,7 @@ mod f16_tests {
         };
         for t in 0..t_len {
             let x_t = TensorOps::from_host(Dtype::F16, vec![1, hidden], &halfb(&xs_f32[t * hidden..(t + 1) * hidden]));
-            let pos_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32]));
+            let pos_t = TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[t as f32]));
             let kv_t = paged_kv(vec![t as f32], vec![t as f32 + 1.0]);
             let mut ctx = ForwardCtx::decode(1, &pos_t, &kv_t, &rp);
             ctx.attn_v2 = v2_scratch.clone();
@@ -1812,7 +1813,7 @@ mod f16_tests {
             let x_t = TensorOps::from_host(Dtype::F16, vec![1, hidden],
                 &xs_bytes[t * hidden * 2..(t + 1) * hidden * 2]);
             let pv = if pos_zero { 0.0f32 } else { t as f32 };
-            let pos_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[pv]));
+            let pos_t = TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[pv]));
             let kv = KvBuffers {
                 k_cache: TensorOps::of_block(kc.id, Dtype::F16, kc_shape.to_vec()),
                 v_cache: TensorOps::of_block(vc.id, Dtype::F16,
@@ -1878,10 +1879,11 @@ mod f16_tests {
             TensorOps::zeros(Dtype::F16, vec![8, hkv, hd]).step(), &mut gpu)
             .await.expect("vc");
         let kv_zero = |slots: Vec<f32>, lens: Vec<f32>| KvBuffers {
-            k_cache: TensorOps::of_block(kc_b.id, Dtype::F16, vec![8, hkv, hd]),
-            v_cache: TensorOps::of_block(vc_b.id, Dtype::F16, vec![8, hkv, hd]),
-            slots: TensorOps::from_host(Dtype::F32, vec![slots.len()], &f32b(&slots)),
-            kv_lens: TensorOps::from_host(Dtype::F32, vec![lens.len()], &f32b(&lens)),
+            // 契约:kc r5 / vc r4(paged,page=1,x=8);slots/kv_lens r2
+            k_cache: TensorOps::of_block(kc_b.id, Dtype::F16, vec![8, hkv, hd / 8, 1, 8]),
+            v_cache: TensorOps::of_block(vc_b.id, Dtype::F16, vec![8, hkv, hd, 1]),
+            slots: TensorOps::from_host(Dtype::F32, vec![1, slots.len()], &f32b(&slots)),
+            kv_lens: TensorOps::from_host(Dtype::F32, vec![1, lens.len()], &f32b(&lens)),
             block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
         };
 
@@ -1895,7 +1897,7 @@ mod f16_tests {
         let mut ref_outs = Vec::new();
         for t in 0..t_len {
             let x_t = TensorOps::from_host(Dtype::F16, vec![1, hidden], &halfb(&xs_f32[t * hidden..(t + 1) * hidden]));
-            let pos_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32]));
+            let pos_t = TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[t as f32]));
             let kv_t = kv_zero(vec![t as f32], vec![t as f32 + 1.0]);
             let decl = attn.forward(&x_t, &ForwardCtx::decode(1, &pos_t, &kv_t, &rp));
             ref_outs.push(crate::testkit::harvest_f16(&mut gpu, &decl).await);
@@ -1903,7 +1905,7 @@ mod f16_tests {
 
         // 被测:一次 prefill 块(slots/kv_lens/pos [T] 表)
         let xs_all = TensorOps::from_host(Dtype::F16, vec![t_len, hidden], &halfb(&xs_f32));
-        let pos_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&pos_f32));
+        let pos_all = TensorOps::from_host(Dtype::F32, vec![1, t_len], &f32b(&pos_f32));
         let slots_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&(0..t_len).map(|t| t as f32).collect::<Vec<_>>()));
         let lens_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&(0..t_len).map(|t| t as f32 + 1.0).collect::<Vec<_>>()));
         let kv_p = kv_zero(vec![0.0], vec![1.0]); // 表形式,单引 slots 不被读
@@ -1976,10 +1978,11 @@ mod f16_tests {
             TensorOps::zeros(Dtype::F32, vec![8, hkv, hd]).step(), &mut gpu)
             .await.expect("vc");
         let kv_zero = |slots: Vec<f32>, lens: Vec<f32>| KvBuffers {
-            k_cache: TensorOps::of_block(kc_b.id, Dtype::F32, vec![8, hkv, hd]),
-            v_cache: TensorOps::of_block(vc_b.id, Dtype::F32, vec![8, hkv, hd]),
-            slots: TensorOps::from_host(Dtype::F32, vec![slots.len()], &f32b(&slots)),
-            kv_lens: TensorOps::from_host(Dtype::F32, vec![lens.len()], &f32b(&lens)),
+            // 契约(f32 臂):kc/vc r2;slots/kv_lens r2
+            k_cache: TensorOps::of_block(kc_b.id, Dtype::F32, vec![8, hkv * hd]),
+            v_cache: TensorOps::of_block(vc_b.id, Dtype::F32, vec![8, hkv * hd]),
+            slots: TensorOps::from_host(Dtype::F32, vec![1, slots.len()], &f32b(&slots)),
+            kv_lens: TensorOps::from_host(Dtype::F32, vec![1, lens.len()], &f32b(&lens)),
             block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
         };
 
@@ -1990,14 +1993,14 @@ mod f16_tests {
         let mut ref_outs = Vec::new();
         for t in 0..t_len {
             let x_t = TensorOps::from_host(Dtype::F32, vec![1, hidden], &f32b(&xs_f32[t * hidden..(t + 1) * hidden]));
-            let pos_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32]));
+            let pos_t = TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[t as f32]));
             let kv_t = kv_zero(vec![t as f32], vec![t as f32 + 1.0]);
             let decl = attn.forward(&x_t, &ForwardCtx::decode(1, &pos_t, &kv_t, &rp));
             ref_outs.push(crate::testkit::harvest(&mut gpu, &decl).await);
         }
 
         let xs_all = TensorOps::from_host(Dtype::F32, vec![t_len, hidden], &f32b(&xs_f32));
-        let pos_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&(0..t_len).map(|t| t as f32).collect::<Vec<_>>()));
+        let pos_all = TensorOps::from_host(Dtype::F32, vec![1, t_len], &f32b(&(0..t_len).map(|t| t as f32).collect::<Vec<_>>()));
         let slots_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&(0..t_len).map(|t| t as f32).collect::<Vec<_>>()));
         let lens_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&(0..t_len).map(|t| t as f32 + 1.0).collect::<Vec<_>>()));
         let kv_p = kv_zero(vec![0.0], vec![1.0]);
@@ -2104,13 +2107,13 @@ mod owl_port_tests {
             })
             .collect();
         let kc = crate::interpreters::eval_ops(
-            TensorOps::from_host(Dtype::F16, vec![pool_elems], &rnd).step(),
+            TensorOps::from_host(Dtype::U32, vec![pool_elems / 2], &rnd).step(),  // U32 记账元素 = 字节/4
             &mut gpu,
         )
         .await
         .expect("kc");
         let vc = crate::interpreters::eval_ops(
-            TensorOps::from_host(Dtype::F16, vec![pool_elems], &rnd).step(),
+            TensorOps::from_host(Dtype::U32, vec![pool_elems / 2], &rnd).step(),  // U32 记账元素 = 字节/4
             &mut gpu,
         )
         .await
@@ -2143,10 +2146,13 @@ mod owl_port_tests {
         );
         // 池账叶按生产形状(classic 五维;engine k_shape 同式)—— 扁平叶
         // 会让 K0 写按形状推的长度/几何算错(inf 行嫌疑)
-        let k_shape = vec![nb, hkv, hd / pol.x, page, pol.x];
+        // **fp8 池的账叶口径 = U32 扁平**(与生产 `StatePool::kv_caches` 的
+        // kv_fp8 分支同式:元素 = 字节/4;契约 `owl_reshape_and_cache_fp8kv_knhd`
+        // 的 key/value_cache 就是 U32 rank-1)。原 F16 五维声明是 f16 时代遗留。
+        let k_shape = vec![pool_elems / 2];
         let kv = KvBuffers {
-            k_cache: TensorOps::of_block(kc.id, Dtype::F16, k_shape.clone()),
-            v_cache: TensorOps::of_block(vc.id, Dtype::F16, k_shape),
+            k_cache: TensorOps::of_block(kc.id, Dtype::U32, k_shape.clone()),
+            v_cache: TensorOps::of_block(vc.id, Dtype::U32, k_shape),
             slots: slots.clone(),
             kv_lens: lens.clone(),
             block_tables: TensorOps::from_host(
@@ -2173,7 +2179,7 @@ mod owl_port_tests {
                 .expect("es")
                 .id,
                 Dtype::F32,
-                vec![t_len * hq * nparts],
+                vec![t_len, hq * nparts],
             ),
             max_logits: TensorOps::of_block(
                 crate::interpreters::eval_ops(
@@ -2184,7 +2190,7 @@ mod owl_port_tests {
                 .expect("ml")
                 .id,
                 Dtype::F32,
-                vec![t_len * hq * nparts],
+                vec![t_len, hq * nparts],
             ),
             tmp_out: TensorOps::of_block(
                 crate::interpreters::eval_ops(
@@ -2201,20 +2207,21 @@ mod owl_port_tests {
             seqs: t_len,
         };
 
-        // 臂 B:XQA 面(i32 页表 / u32 总长 / 因果掩码 / 零 semaphore / scratch)
+        // 臂 B:XQA 面(页表/总长/掩码都按**契约 F32 槽位**承载 u32 位型 ——
+        // 与生产 `xqa_pt`/`xqa_seq`(GraphPlan InputSlot::f32)同口径;核读 u32)
         let xqa = crate::module::XqaVerifyCtx {
             page_table: TensorOps::from_host(
-                Dtype::U32,
+                Dtype::F32,
                 vec![1, nb],
                 &(0..nb).map(|i| i as u32).flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
             ),
             seq_lens: TensorOps::from_host(
-                Dtype::U32,
-                vec![1],
+                Dtype::F32,
+                vec![1, 1],  // 契约 r2(生产 xqa_seq 槽 = [1, len])
                 (ctx_total as u32).to_le_bytes().as_ref(),
             ),
             mask: TensorOps::from_host(
-                Dtype::U32,
+                Dtype::F32,
                 vec![1, t_len],
                 &(0..t_len)
                     .map(|i| (1u32 << (i + 1)) - 1)
@@ -2223,14 +2230,14 @@ mod owl_port_tests {
             ),
             semaphores: TensorOps::of_block(
                 crate::interpreters::eval_ops(
-                    TensorOps::zeros(Dtype::U32, vec![16]).step(),
+                    TensorOps::zeros(Dtype::F32, vec![16]).step(),
                     &mut gpu,
                 )
                 .await
                 .expect("sem")
                 .id,
-                Dtype::U32,
-                vec![16],
+                Dtype::F32,  // 契约/生产同式(零块 F32 承载)
+                vec![1, 16],  // 契约 r2(池叶/图槽都是 [1, n])
             ),
             scratch: TensorOps::of_block(
                 crate::interpreters::eval_ops(
@@ -2384,16 +2391,17 @@ mod naive_attn_f16_tests {
             let dk = gpu.htod(Dtype::F16, &sh(vec![1, hkv, hd]), &hb(kt)).await.unwrap();
             let dv = gpu.htod(Dtype::F16, &sh(vec![1, hkv, hd]), &hb(vt)).await.unwrap();
             let (q_t, k_t, v_t) = (
-                TensorOps::of_block(dq.id, Dtype::F16, vec![1, hq, hd]),
+                TensorOps::of_block(dq.id, Dtype::F16, vec![1, hq * hd]),  // 契约 q r2
                 TensorOps::of_block(dk.id, Dtype::F16, vec![1, hkv, hd]),
                 TensorOps::of_block(dv.id, Dtype::F16, vec![1, hkv, hd]),
             );
-            let kc_d = TensorOps::of_block(kc.id, Dtype::F16, vec![slots_n, hkv, hd]);
-            let vc_d = TensorOps::of_block(vc.id, Dtype::F16, vec![slots_n, hkv, hd]);
+            // 契约:kc r5(paged [nb,hkv,hd/x,page,x];此处 page=1,x=8)/ vc r4
+            let kc_d = TensorOps::of_block(kc.id, Dtype::F16, vec![slots_n, hkv, hd / 8, 1, 8]);
+            let vc_d = TensorOps::of_block(vc.id, Dtype::F16, vec![slots_n, hkv, hd, 1]);
             let decl = TensorOps::call(SemanticKernel::NaiveDecode)
             .arg(&q_t).arg(&k_t).arg(&v_t).arg(&kc_d).arg(&vc_d)
-            .arg(&TensorOps::from_host(Dtype::F32, vec![1], sl.to_le_bytes().as_ref()))
-            .arg(&TensorOps::from_host(Dtype::F32, vec![1], kl.to_le_bytes().as_ref()))
+            .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1], sl.to_le_bytes().as_ref()))  // 契约 r2(位型承载)
+            .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1], kl.to_le_bytes().as_ref()))
             .arg_usize(1).arg_usize(hq).arg_usize(hkv).arg_usize(hd)
             .with_shape(Dtype::F16, vec![1, hq * hd]);
             let o = crate::interpreters::eval_ops(decl.step(), &mut gpu).await.unwrap();
@@ -2464,8 +2472,8 @@ mod split_probe_tests {
     let _f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
 
     let q = TensorOps::from_host(Dtype::F16, vec![t, hq * hd], &halfb(&qr));
-    let k = TensorOps::from_host(Dtype::F16, vec![t, hkv * hd], &halfb(&kr));
-    let v = TensorOps::from_host(Dtype::F16, vec![t, hkv * hd], &halfb(&vr));
+    let k = TensorOps::from_host(Dtype::F16, vec![t, hkv, hd], &halfb(&kr));  // 契约 key r3
+    let v = TensorOps::from_host(Dtype::F16, vec![t, hkv, hd], &halfb(&vr));  // 契约 value r3
     let kc = crate::interpreters::eval_ops(
         TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd / x, page, x]).step(), &mut gpu).await.unwrap();
     let vc = crate::interpreters::eval_ops(
@@ -2476,8 +2484,9 @@ mod split_probe_tests {
         TensorOps::zeros(Dtype::F16, vec![t * hq * nparts * hd]).step(), &mut gpu).await.unwrap();
     let scr_stat_b = crate::interpreters::eval_ops(
         TensorOps::zeros(Dtype::F32, vec![t * hq * nparts * 2]).step(), &mut gpu).await.unwrap();
-    let scr_out = TensorOps::of_block(scr_out_b.id, Dtype::F16, vec![t * hq * nparts * hd]);
-    let scr_stat = TensorOps::of_block(scr_stat_b.id, Dtype::F32, vec![t * hq * nparts * 2]);
+    // 契约:scr_out/scr_stat 皆 r2
+    let scr_out = TensorOps::of_block(scr_out_b.id, Dtype::F16, vec![t * hq * nparts, hd]);
+    let scr_stat = TensorOps::of_block(scr_stat_b.id, Dtype::F32, vec![t * hq * nparts, 2]);
 
     // K0 写池
     let wr = TensorOps::call(SemanticKernel::K0Write).aux(&[t])

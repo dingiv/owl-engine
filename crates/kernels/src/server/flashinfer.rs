@@ -4,7 +4,9 @@
 //! 事故类结构性消灭)。run:plan(每形状缓存,键 = 形状七元组)→ run
 //! (f16/fp8kv 按名路由)。
 
-use crate::contract::{Bytes, Dtype, LaunchMsg, OpError, OpId};
+use std::collections::HashMap;
+
+use crate::contract::{Bytes, Dtype, InvariantBox, LaunchMsg, OpError, OpId};
 use crate::device::ScratchBuf;
 
 use crate::client::flashinfer::{parse_prefill, PREFILL_FI};
@@ -14,7 +16,7 @@ use crate::family::flashinfer::{
 };
 use crate::registry::{FamilyGuard, KernelFamily};
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct PlanKey {
     total_rows: usize,
     /// **split 关时恒 0**(归一化):源码级 F-5 —— split 关时 plan 的数组
@@ -74,6 +76,16 @@ fn plan_key(
     }
 }
 
+/// **取证档**(探针④红绿对照):`OWL_FI_NO_PLAN_RESTORE=1` ⇒ 关掉 int_ws
+/// 自携(plan 切换后不重刷)⇒ 多 plan 共存时应出现"回放读到别人的调度表"。
+/// 生产不得设此档(它存在的唯一目的是让探针能把机制证成承重件)。
+fn no_plan_restore() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var_os("OWL_FI_NO_PLAN_RESTORE").is_some_and(|v| !v.is_empty() && v != "0")
+    })
+}
+
 /// 诊断打印开关(与 C++ `owl_fi_debug` 同源:env `FI_DEBUG`)
 fn fi_debug() -> bool {
     std::env::var_os("FI_DEBUG").is_some_and(|v| !v.is_empty() && v != "0")
@@ -86,15 +98,121 @@ impl FiRuntime {
     // 本族算子表:由 `KernelSpec::FAMILY` 派生(f16 + fp8 两臂)
 }
 
+/// plan 条目(M2b,2026-10-15):一个 `PlanKey` 一份。
+///
+/// **为什么从"单条缓存"升级成"条目表"**:多桶(prefill 图族)共存时,int_ws
+/// 是**唯一共享区** —— 每次 `owl_fi_prefill_plan` 都会把调度表 memcpy 进同一个
+/// int_ws,而图里烘的是 `int_ws + offset` 指针 ⇒ "最后一个 plan"决定所有图读到
+/// 什么。条目表配 `staged` 不变盒后,**图自携 plan**:回放前先把 int_ws 刷回本
+/// plan 的表(窗内那次刷 = 图里一个 memcpy 节点;见 [`FiRuntime::activate`])。
+struct PlanEntry {
+    plan15: [i64; 15],
+    /// **不变盒:plan 表快照**(共享 staging 有效前缀的冻结拷贝)。
+    /// 为什么不能直接用共享 `host_staging`:plan 的 H2D 源是**同一个可变缓冲**
+    /// (换形状即重写)⇒ 窗内烘该 memcpy 的回放期会读到"最后一次 plan"的内容
+    /// (错调度表;设计 §4.6 那条雷的同一族)。盒 = 构造即冻结、生命周期 ≥ 图。
+    staged: InvariantBox,
+    /// 尾部 CTA 掩码块(P-5)+ 内容 `i < tiles`。为什么与 plan 同车:掩码是
+    /// `tiles/padded` 的函数;共用一条缓冲会被换形调用改写 ⇒ 回放旧图掩码失配
+    /// ⇒ **真行漏算**(静默错值)。
+    mask: ScratchBuf,
+    /// 真 tile 数(诊断/日志)
+    tiles: usize,
+    /// 入表序号(容量治理用;见 [`FiRuntime::evict_stale`])
+    born: u64,
+    /// **图归属**(该 plan 在捕获窗内被烘进图 ⇒ 掩码块/表快照被图引用 ⇒
+    /// 永不可驱逐;见 [`FiRuntime::activate`])
+    graph_owned: bool,
+}
+
 pub struct FiRuntime {
     float_ws: Option<ScratchBuf>,
     int_ws: Option<ScratchBuf>,
+    /// plan **共享** staging(plan 内部用;只是计量/复制的中转 —— 不要指望它
+    /// 的内容在半途稳定,快照见 [`PlanEntry::staged`])
     host_staging: Vec<u8>,
-    /// plan 缓存(**单条**)+ 它的**尾部 CTA 掩码**(P-5)。为什么 mask 必须
-    /// 与 plan 同车:MASK 内容 = `i < tiles`,而 `tiles/padded` 都是 plan 的
-    /// 函数;若共用一个 mask 缓冲,一次换形的 eager 调用会把上一条 plan 的
-    /// 掩码改写 ⇒ **回放旧图时掩码失配 ⇒ 真行漏算**(静默错值)。
-    plan: Option<(PlanKey, [i64; 15], ScratchBuf, usize /* tiles */)>,
+    /// plan 条目表(key = 形状七元组 + 两开关位;桶数量级)
+    plans: HashMap<PlanKey, PlanEntry>,
+    /// **int_ws 当前内容**对应的 key(None = 未知/已失效)
+    active: Option<PlanKey>,
+    /// 捕获窗上升沿检测(见 `activate` 的调用点注释)
+    last_capturing: bool,
+    /// 入表序号发生器(容量治理)
+    stamp: u64,
+}
+
+/// plan 条目表容量软上限(超过就驱逐**非图归属**的最旧条目)
+const PLAN_ENTRIES_SOFT_MAX: usize = 32;
+/// 驱逐后水位(避免每次插入都驱逐)
+const PLAN_ENTRIES_KEEP: usize = 16;
+
+impl FiRuntime {
+    /// plan 条目表**容量治理**:eager 路的 chunk 长逐值不同 ⇒ 键会缓慢堆积
+    /// (每键 = plan15 + 表快照(~KB 主机)+ 掩码块(~百字节设备))。超过软上限
+    /// 就驱逐**非图归属**的最旧条目(图引用的掩码/快照**永不动** —— 这是
+    /// [`PlanEntry::graph_owned`] 的全部意义;驱逐错一个 = 回放读到已释放块)。
+    fn evict_stale(&mut self) {
+        if self.plans.len() <= PLAN_ENTRIES_SOFT_MAX {
+            return;
+        }
+        let mut victims: Vec<(u64, PlanKey)> = self
+            .plans
+            .iter()
+            .filter(|(k, e)| !e.graph_owned && Some(**k) != self.active)
+            .map(|(k, e)| (e.born, *k))
+            .collect();
+        victims.sort_unstable_by_key(|(born, _)| *born);
+        let drop_n = self.plans.len().saturating_sub(PLAN_ENTRIES_KEEP);
+        for (_, k) in victims.into_iter().take(drop_n) {
+            self.plans.remove(&k);
+        }
+    }
+
+    /// 把 int_ws 刷成 `key` 的 plan 表(必要时)。
+    ///
+    /// 窗内调用 = 图里多一个 memcpy 节点 ⇒ **图自携 plan**(多桶/外部 plan
+    /// 切换都不再能静默换掉它读的表);窗外调用 = 立即生效(便宜的一次 H2D)。
+    fn activate(
+        &mut self,
+        key: PlanKey,
+        res: &mut dyn crate::device::DeviceRes,
+    ) -> Result<(), OpError> {
+        // 取证档(探针④红绿对照;生产不得设):关掉自携 ⇒ 应退回"读到别人的
+        // 调度表"。
+        if no_plan_restore() {
+            self.active = Some(key);
+            return Ok(());
+        }
+        if self.active == Some(key) {
+            return Ok(());
+        }
+        let int_ws = self.int_ws.as_ref().ok_or_else(|| OpError::Asset {
+            op: PREFILL_FI.into(),
+            detail: "workspace 未装配".into(),
+        })?;
+        let capturing = res.capturing().unwrap_or(false);
+        let entry = self.plans.get_mut(&key).ok_or_else(|| OpError::Contract {
+            op: PREFILL_FI.into(),
+            field: "plan",
+            expect: "激活的 plan 必在条目表".into(),
+            got: format!("{key:?}"),
+        })?;
+        if capturing {
+            entry.graph_owned = true;
+        }
+        res.upload_invariant(int_ws.ptr, &entry.staged)?;
+        self.active = Some(key);
+        if fi_debug() {
+            eprintln!(
+                "[owl-fi][plan] int_ws 激活(t={} padded={} tiles={} cap={})",
+                key.t,
+                entry.plan15[0].max(0),
+                entry.tiles,
+                res.capturing().unwrap_or(false),
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Default for FiRuntime {
@@ -103,7 +221,10 @@ impl Default for FiRuntime {
             float_ws: None,
             int_ws: None,
             host_staging: vec![0u8; FI_HOST_STAGING_BYTES],
-            plan: None,
+            plans: HashMap::new(),
+            active: None,
+            last_capturing: false,
+            stamp: 0,
         }
     }
 }
@@ -128,7 +249,10 @@ impl KernelFamily for FiRuntime {
             float_ws: Some(res.alloc(FI_FLOAT_WS_BYTES, "fi.float_ws")?),
             int_ws: Some(res.alloc(FI_INT_WS_BYTES, "fi.int_ws")?),
             host_staging: vec![0u8; FI_HOST_STAGING_BYTES],
-            plan: None,
+            plans: HashMap::new(),
+            active: None,
+            last_capturing: false,
+            stamp: 0,
         };
         Ok(FamilyGuard::boxed(me))
     }
@@ -148,14 +272,22 @@ impl KernelFamily for FiRuntime {
         let out_ref = crate::client::flashinfer::BlockRef { id: call.out.id, byte_offset: 0 };
         let out_ptr = r(&out_ref)?;
         // 就地解包( locals 贯穿 plan/run;None = init 未跑,Asset 拒)
-        let float_ws = self.float_ws.as_ref().ok_or_else(|| OpError::Asset {
-            op: PREFILL_FI.into(),
-            detail: "workspace 未装配".into(),
-        })?;
-        let int_ws = self.int_ws.as_ref().ok_or_else(|| OpError::Asset {
-            op: PREFILL_FI.into(),
-            detail: "workspace 未装配".into(),
-        })?;
+        // 注:只取 (ptr, bytes) 两个标量 —— 后面要 `self.activate(&mut self)`,
+        // 持 `&self.float_ws` 的引会与它撞借用。
+        let (float_ws_ptr, float_ws_bytes) = {
+            let w = self.float_ws.as_ref().ok_or_else(|| OpError::Asset {
+                op: PREFILL_FI.into(),
+                detail: "workspace 未装配".into(),
+            })?;
+            (w.ptr, w.bytes)
+        };
+        let (int_ws_ptr, int_ws_bytes) = {
+            let w = self.int_ws.as_ref().ok_or_else(|| OpError::Asset {
+                op: PREFILL_FI.into(),
+                detail: "workspace 未装配".into(),
+            })?;
+            (w.ptr, w.bytes)
+        };
         let stream = res.stream()?;
 
         // plan(host,每形状一次;键 = 形状七元组)
@@ -187,7 +319,7 @@ impl KernelFamily for FiRuntime {
         // 捕获期若 plan 未命中,**结构化拒**(→ 上层 `Ok(None)` → eager 原路),
         // 不静默、不把错节点烘进图。
         // (更强做法:每形状一份独立 staging 缓冲 ⇒ 节点源恒定;待有需求再上。)
-        if self.plan.as_ref().map(|(k, ..)| *k != key).unwrap_or(true) {
+        if !self.plans.contains_key(&key) {
             if res.capturing().unwrap_or(false) {
                 return Err(OpError::Launch {
                     op: msg.kernel.name.clone(),
@@ -199,17 +331,19 @@ impl KernelFamily for FiRuntime {
             let qo_indptr = [0i32, call.t as i32];
             let kv_indptr = [0i32, call.ctx_total as i32];
             let (mut plan15, mut cta_tile_q, mut split_kv) = ([0i64; 15], 0i32, 0i32);
+            let mut int_bytes: usize = 0;
             let rc = unsafe {
                 owl_fi_prefill_plan(
-                    float_ws.ptr as *mut std::ffi::c_void,
-                    float_ws.bytes,
-                    int_ws.ptr as *mut std::ffi::c_void,
-                    int_ws.bytes,
+                    float_ws_ptr as *mut std::ffi::c_void,
+                    float_ws_bytes,
+                    int_ws_ptr as *mut std::ffi::c_void,
+                    int_ws_bytes,
                     self.host_staging.as_mut_ptr() as *mut std::ffi::c_void,
                     self.host_staging.len(),
                     plan15.as_mut_ptr(),
                     &mut cta_tile_q,
                     &mut split_kv,
+                    &mut int_bytes,
                     qo_indptr.as_ptr(),
                     kv_indptr.as_ptr(),
                     call.total_rows as i32,
@@ -269,11 +403,44 @@ impl KernelFamily for FiRuntime {
                     padded - tiles
                 );
             }
-            self.plan = Some((key, plan15, mask, tiles));
+            // 不变盒快照(plan 表有效前缀;源 = 共享 staging —— 只在此刻拷一次,
+            // 此后 int_ws 的每次重刷都从盒子来,见 activate)
+            if int_bytes == 0 || int_bytes > self.host_staging.len() {
+                return Err(OpError::Contract {
+                    op: PREFILL_FI.into(),
+                    field: "int_bytes",
+                    expect: format!("1..={}(plan 表有效长度)", self.host_staging.len()),
+                    got: format!("{int_bytes}"),
+                });
+            }
+            let staged = InvariantBox::freeze(self.host_staging[..int_bytes].to_vec());
+            let born = self.stamp;
+            self.stamp += 1;
+            self.plans.insert(key, PlanEntry { plan15, staged, mask, tiles, born, graph_owned: false });
+            // C++ plan 自己已把表写进 int_ws ⇒ 内容认知同步(activate 不重刷)
+            self.active = Some(key);
+            self.evict_stale();
         }
+        // ── int_ws 激活(多 plan 共存;M2b 2026-10-15)──
+        //
+        // 窗内那次激活 = 图里一个 memcpy 节点 ⇒**图自携 plan**(多桶共存/
+        // 外部换形都不再能把图读的表换掉)。窗上升沿必须强制重激活:上一次
+        // 窗内烘过之后,int_ws 可能已被窗外调用刷成别的 plan,而**本窗的首个
+        // FI 调用**是唯一能再把它写进图的位置(窗内后续调用会命中 active).
+        let capturing = res.capturing().unwrap_or(false);
+        if capturing && !self.last_capturing {
+            self.active = None;
+        }
+        self.last_capturing = capturing;
+        self.activate(key, res)?;
         let (plan15, mask_ptr) = {
-            let (_, p, m, _) = self.plan.as_ref().expect("plan 缓存");
-            (*p, m.ptr)
+            let e = self.plans.get(&key).ok_or_else(|| OpError::Contract {
+                op: PREFILL_FI.into(),
+                field: "plan",
+                expect: "条目刚插入/命中".into(),
+                got: format!("{key:?}"),
+            })?;
+            (e.plan15, e.mask.ptr)
         };
 
         let run = if call.fp8kv {
@@ -295,10 +462,10 @@ impl KernelFamily for FiRuntime {
                 indptr as *mut i32,
                 last_len as *mut i32,
                 plan15.as_ptr(),
-                int_ws.ptr as *mut std::ffi::c_void,
-                int_ws.bytes,
-                float_ws.ptr as *mut std::ffi::c_void,
-                float_ws.bytes,
+                int_ws_ptr as *mut std::ffi::c_void,
+                int_ws_bytes,
+                float_ws_ptr as *mut std::ffi::c_void,
+                float_ws_bytes,
                 1, // batch
                 call.hq as i32,
                 call.hkv as i32,

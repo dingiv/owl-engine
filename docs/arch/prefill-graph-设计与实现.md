@@ -167,7 +167,7 @@
 |---|---|---|
 | **P-1** | ✅ **已落(2026-10-15)** —— `plan_key()` 纯函数:split 关时 `ctx_total` **归一化为 0**(F-5:那三条 ctx 链只在 split 分支被消费)⇒ 一个桶一份 plan 跨 ctx 复用;`split`/`graph` 两个开关位显式入键(切档不得复用错 plan);单测 `ctx_enters_key_only_when_split_on`。原设计文本: | 现状:plan 键含 `ctx_total`(`PlanKey{…, ctx_total, …}`)⇒ 每 chunk 重算,且捕获窗内必然 miss(→ 硬门拒捕)。改:split 关时**键去掉 ctx_total**(§4.1c F-5 已证其不影响结果,但**split 开时必须留着** ⇒ 键加 `split_on`);`total_rows`(=t_pad)仍在键;图档统一 `enable_cuda_graph=true` |
 | P-2 | **plan 的 workspace 块地址恒定** | 现状:`int_ws`/`float_ws`/`page_locked` 是 `FiRuntime` 装配期持久 scratch ✓ **已满足** |
-| **P-3** | ✅ **已落(2026-10-15)** —— `StatePool.fi_tables`(boot 一次分配 `q_cu/indices/indptr/last_len` 四块,容量 = 池页数)+ 每 chunk `write_blocks_f32` **原位写**(单条批量 `HtodChunks` 命令;回执 = 设备侧搬运完成 ⇒ 回执即落地,无跨流竞态);旧实现每 chunk **4 次 `eval_ops(from_host)` 往返同步** ⇒ 现少 3 次往返,且地址恒定(图可直接烘)。原设计文本: | 现状:每 call 由 `eval_ops` **新建块** ⇒ 地址每次变 ⇒ 图读不到新值。改:桶级固定块(容量 = 池页上限)+ `write_block` 原位写。**二轮收敛到三件**:`indices`/`indptr`/`last_len`;`q_cu` 走 **`[0, t_pad]` 常量**(槽 init 一次,捕获烘死,不必每 chunk 写) |
+| **P-3** | ✅ **已落(2026-10-15)** —— `StatePool.fi_tables`(boot 一次分配 `q_cu/indices/indptr/last_len` 四块,容量 = 池页数)+ 每 chunk `write_blocks_f32` **原位写**(单条批量 `HtodChunks` 命令;回执 = 设备侧搬运完成 ⇒ 回执即落地,无跨流竞态);旧实现每 chunk **4 次 `eval_ops(from_host)` 往返同步** ⇒ 现少 3 次往返,且地址恒定(图可直接烘)。原设计文本: | 现状:每 call 由 `eval_ops` **新建块** ⇒ 地址每次变 ⇒ 图读不到新值。改:桶级固定块(容量 = 池页上限)+ `write_block` 原位写。~~二轮收敛到三件:`q_cu` 走 `[0, t_pad]` 常量(槽 init 一次,捕获烘死,不必每 chunk 写)~~ ← **三轮更正(M2b 实测)**:`q_cu` 也**必须每 chunk 写**(写「真」`[0, t_real]`)—— 核的 `qo_len` 从**设备** `q_indptr` 读(`BatchPrefillPagedParams::get_qo_len`),因果窗口 = `kv_len(设备) − qo_len(设备) + row`;桶几何下 `t_pad` 只该进**形状**(与 plan tiles),真语义全由设备表定 ⇒ `qo_len`/`kv_len` 必须**同口径**,否则窗口错位 `t_pad − t_real`(静默错值) |
 | P-5 | **尾部 CTA 必须显式 mask**(二轮新发现) | 现状:`params.block_valid_mask = nullptr`,而**上游只在 `split_kv` 档分配该区**(§4.1c F-7)⇒ `padded_batch_size > 真 tile 数` 时尾部 CTA 读 staging 残留(**静默**,F-6/F-8)。改:适配器在 `int_ws` **自建 mask 区** + plan 后按 `i < tiles_plan` 填;**行 padding 下该 mask 是静态的**(桶级常量,零回放开销) |
 | ~~P-4~~ | ~~`total_num_rows` 走设备指针(真行数)~~ | **二轮删除**:该字段只在 split-kv 合并核(`VariableLengthMergeStates` / `VariableLengthAttentionSum`)被读(F-9),生产档 `disable_split_kv = true` ⇒ 结构上不读。**将来若开 split 再补**(一个 1×u32 输入槽)** |
 
@@ -232,8 +232,9 @@
 
 **推论 A:padding 是主路(不是可选)**
 
-- 桶几何下 FI 行数取 **`[0, t_pad]` 常量**(`q_cu` 槽 init 一次);真长度只进 `indices`/`indptr`/`last_len`(设备,回放期读)
-  ⇒ ① mask 静态(P-5 **零回放开销**)② `q_cu` 槽不必每 chunk 写 ③ 代价 = 假行白算。
+- 桶几何下 FI **张量**行数 = `t_pad`(布局),但**语义表全真**:`q_cu`(`qo_len`)、`indices`/`indptr`/`last_len`(`kv_len`)
+  都按 `t_real` 每 chunk 写进**持久设备槽**(M2b 实测;见 P-3 的三轮更正)
+  ⇒ ① mask 静态(P-5 **零回放开销**)② 因果窗口与 eager **逐字同式**(`kv_len − qo_len + row`)③ 代价 = 假行白算。
 - 假行的因果掩码**天然封死**:核内 `kv_len` 来自 `indptr`(真 ctx)、写位由 `qo_upper_bound = min(qo_len, …)` 封顶
   ⇒ 假行"看得到真 KV、写不到真行",只白算,**不向真行泄 NaN/Inf**(每行 softmax 独立)。
 - 白算的**绝对量**在噪声里:FI 只占 chunk 的 0.1–0.5% 量级(16 层 × ~0.1 ms @t=512/ctx=512);
@@ -374,6 +375,16 @@ arena"。**输入/输出槽不参与归还**;`Carved` 的捕获后 free 仍是 n
 
 ### 4.3e **家族面捕获入境纪律**(2026-10-15,M2b 的第二道硬门)
 
+> **2026-10-15 补:P-6b 已落地**(worktree `feat/prefill-graph-v2`)—— `gdn_chunked`
+> 的三张 FLA 表(cu/coff/idx)从 runtime 私有缓存改为**调用入参 + 引擎持久槽**,
+> 与 FLA 上游 API(`cu_seqlens`/`chunk_indices` 入参)一致。判据:
+> **红门探针** `crates/kernels/tests/gdn_bucket_pad_probe.rs`(桶 128 行装 64 真行、
+> 假行填有限垃圾)—— 修前**终态 Δ=3.578e-2**(真行输出 Δ=0)、修后**两者都是 0.000e0**。
+> 实现要点:①表布局常量单源 `family::gdn_chunked::{CU_OFF, COFF_OFF, IDX_OFF, BT,
+> table_bytes, table_host_bytes}`(`BT` 由单测与 AOT 配置表锁死)②引擎 `StatePool::gdn_tables`
+> 每 chunk 写(`nt = ceil(t_real/BT)`)③`ForwardCtx::gdn_tables` 注入,缺了**拒发**
+> (与 `gdn_slot_host` 同纪律)④声明面 +1 块 +1 标量,锁表/F3/家族测试同步。
+
 **为什么单列**:G2 捕获窗白名单只管 client 来的 `Command`(Htod/Dtoh/Sync 拒),
 而家族 `run()` 在同一 actor 线程里**直接调 `DeviceRes`** ⇒ **白名单对它无效**。
 旧口径是"家族 grave 律"(代码原话:"捕获窗内由家族 grave 律保证不再分配")= **靠自律**。
@@ -414,8 +425,9 @@ splitK 在捕获流上内部 `malloc` ⇒ 图里烙下 **192 对 `MEM_ALLOC/MEM_
 
 | 子件 | 状态 |
 |---|---|
-| **P-6a** `gdn_chunked` 的 meta 表 H2D **源**改冻结盒 | ✅ **已落**:`meta_boxes: HashMap<(t,nt), InvariantBox>` + `res.upload_invariant` ⇒ 表源与运行时同寿,**即便这次物化落在捕获窗内,回放重读的也是同一份盒**(原来读的是已释放的栈上 `Vec` ⇒ 静默错值) |
-| **P-6b** `gdn_chunked` 的 meta 槽与两族 cu **语义**槽化 | ⬜ 未落:①键首次命中时的 `res.alloc` 仍在窗内可能(现由 `fam_alloc_in_window` 观测 + `OWL_CAP_STRICT` 拒);②**cu = `[0,t_pad]` 烘死 ⇒ 假行推进递推态**(律①)—— 根治要扩 call 面(cu/coff/idx 进参)或让引擎灌设备槽,与 M2b 的桶几何一起做 |
+| **P-6a** `gdn_chunked` 的 meta 表 H2D **源**改冻结盒 | ✅ 已落(被 P-6b 取代 —— 表已不在 runtime 内,冻结盒随 meta 缓存一并删除) |
+| **P-6b** `gdn_chunked` 三张 FLA 表(cu/coff/idx)**槽化 + 进 call 面** | ✅ **已落(2026-10-15,worktree `feat/prefill-graph-v2`)**:表由**引擎按 `t_real`** 写持久槽(`StatePool::gdn_tables`,每 chunk `write_block_f32` 原位写),runtime 只切视图读;**假行不在序列里**(律①成立)、图可烘(地址恒定)、runtime 少一条窗内 alloc 路径。声明面 +1 块(`tables` U32x1)+1 标量(`nt`);A17 锁表/F3 覆盖门/家族测试同步。红门探针 `gdn_bucket_pad_probe`:终态 Δ 3.578e-2 → **0.000e0** |
+| **P-6b-②** `gdn_scalar` 的 `soff`(= `[0,T]` 冻结盒)**同族问题** | ⬜ 未落(同一配方:表进 call 面 / 引擎槽)。该臂是 `gdn_chunked=false` 的回落档与 `nv≠48` 形状,生产 27B 走 chunked ⇒ 优先级后置 |
 
 原设计文本(节选):
 
@@ -509,6 +521,213 @@ prefill **有状态副作用**(KV 池写 + GDN 递推)⇒ `GraphPlan::plan(captu
 |---|---|
 | **双执行**(`EagerFallback` 态 `step()` 再跑 eager) | `captured` 门守死:非 `Captured` 态 `step()` 返回 `Ok(None)`;外层 eager 路**不再**跑(调用点按返回值分支,单一路径执行)。分支 S1 实测已踩过这一条(GDN 态双推进) |
 | **FI plan 进图** | 已在 `server/flashinfer.rs` 立硬门(捕获窗内 plan 未命中 ⇒ 结构化拒 ⇒ 该桶放弃捕获)。**M2b 下 FI 的核在图内、但 plan 必须在窗外** ⇒ 该硬门就是 M2b 的安全带(配合 P-1 的桶级 plan + 键去 ctx) |
+| **int_ws 串台**(多键共存新雷;§4.7a) | **plan 自携**:每键一份不变盒快照 + 回放前 `upload_invariant` 刷 int_ws(窗内那次烘进图)⇒ 图不依赖"最后一个 plan"。取证档 `OWL_FI_NO_PLAN_RESTORE=1` 反证机制承重 |
+
+---
+
+## 4.7 **M2b 落地记(2026-10-15;施工实录与新增前置件)**
+
+### 4.7a 新增硬前置件:**FI plan 自携**(多桶共存的地基)
+
+**病**(落地时才发现,设计稿没写):`int_ws` 是 FI 家族**唯一共享区** —— 每次
+`owl_fi_prefill_plan` 都把调度表 `cudaMemcpyAsync` 进同一个 int_ws,而图里烘的是
+`int_ws + offset` 指针 ⇒ **"最后一个算过的 plan"决定所有图读到什么**。多桶(geobuckets)
+在 boot 逐个捕获,每个桶捕获前都要自己的 plan 在 int_ws 里;运行期 eager 换形
+(尾块长度不同 = 新键)、草稿面(Draft Encode 也走 FI prefill 家族)都会再刷一次。
+
+**修**(`crates/kernels/src/server/flashinfer.rs`):
+
+| 面 | 内容 |
+|---|---|
+| 条目表 | `plans: HashMap<PlanKey, PlanEntry{plan15, staged: InvariantBox, mask, tiles, born, graph_owned}>`;单条缓存退役 |
+| 快照 | plan 调用的 H2D 源是**共享可变** staging(换形即重写)⇒ 窗外把**有效前缀**(`need_int` 字节)考进不变盒。`need_int` 由 C++ wrapper 新增出参 `out_int_bytes` 给出(= `PrefillPlanImpl<true>` 里那次 memcpy 的尺寸,同源) |
+| 激活 | `active: Option<PlanKey>`;`active != key` ⇒ `res.upload_invariant(int_ws, &staged)`。**窗内那次 = 图里一个 memcpy 节点** ⇒ **图自携 plan**(回放先把表刷回自己的) |
+| 窗上升沿 | `capturing() && !last_capturing` ⇒ `active = None`(强制本窗首个 FI 调用重激活)—— 否则 warmup 之后 active 已等于本键,捕获期就不会烘那个节点 |
+| 纪律 | plan **未命中且在窗内**仍结构化拒(C++ plan 自身那个 H2D 的源是共享 staging,烘了必错);`graph_owned` 标记挡住驱逐(图引用掩码/快照) |
+
+**证据**(`fi_graph_replay_probe` ④;红绿两档):
+
+```text
+绿(机制开):B 形状把 int_ws 刷掉(首个差异字节 436)⇒ 回放 A 后 int_ws **复位=true**;输出 |Δ| = 0.000e0
+红(OWL_FI_NO_PLAN_RESTORE=1):同一实验 ⇒ int_ws **复位=false**(断言当场红)⇒ 机制是承重件
+```
+
+> 诚实注记:本档(split 关 + batch=1)下 plan 数组的**内容**几乎形状无关
+> (`request_indices` 恒 0、`qo_tile_indices` 恒等),所以"中毒"时输出**可能**恰好相等
+> —— 那正是设计 §3.2 明列不做的"靠陈旧表项恰好无害"。结构判据(直接读 int_ws)
+> 才是权威;内容巧合不能当不变量。
+
+### 4.7b 桶几何下的**设备表口径**(P-3 三轮更正 + GDN P-6b 收口)
+
+| 面 | 口径 |
+|---|---|
+| 张量形状 | 布局 `t_pad`(embed/GEMM/KV 写/FI q 行数都按布局) |
+| FI `q_cu`/`indices`/`indptr`/`last_len` | **每 chunk 写真值**(`qo_len`/`kv_len` 设备同口径 ⇒ 因果窗口 = eager 逐字同式) |
+| FI mask | 桶级静态(P-5;内容 `i < tiles_plan`) |
+| `seq_cu` | `[0, t_real]`(律①:varlen 核按它划行区间) |
+| GDN 序列表 | `cu=[0,t_real]` + **布局块数** `nt_layout=ceil(t_pad/BT)`(coff/idx 铺满布局)—— 图内 `nt` 是标量,必须烘死;尾部越界 chunk 的 CTA **读写都被 T 夹回**(探针 `gdn_bucket_pad_probe::gdn_bucket_pad_graph_posture_nt_layout_is_inert` 实测:真行输出/终态逐位 Δ=0) |
+| 假行 KV 槽 | dump 页(`StatePool.nb_kv = nb + 1`;不在页链 ⇒ 注意力结构上读不到;律②) |
+| 出图尾 | 末行窄切 + lm_head + argmax **图外**(律③;偏移是烘不得的 host 标量) |
+
+### 4.7c 落地件清单
+
+| 面 | 文件 |
+|---|---|
+| 桶族/捕获/回放 | `crates/engine/src/prefill_plan.rs`(ladder/pick_bucket/`gdn_host_slot_arm` 纯函数 + `BucketGraph`/`PrefillBuckets`) |
+| 分派与出图尾 | `crates/engine/src/exec/prefill_chunk.rs`(`bucket_prefill_chunk` + `bucket_tail`;未命中/不可用 ⇒ eager 原路) |
+| 桶表构造 | `ChunkTables::build_bucket`(真行真值 + 假行 dump;`fi_tables()` 三件套单源) |
+| 槽面 | `GraphPlan` 的 `InputSlot` 增 `dtype`/`shape`(`rank1()`/`u32()` 构造;FI 表件槽 = U32 位型) |
+| 池 | `PoolPlan.prefill_dump_page` + `StatePool.{nb_kv,dump_page,dump_slot_base,k_shape_kv}` |
+| 装配 | `GraphFleet::assemble` ④ 段(降序捕获;off/no_graph/xqa_prefill/非 FI 四道响亮降级门)+ `Engine::on` 撤回"配了没实现就拒" |
+| 开关 | `[graph] prefill_bucket = off|t512|geobuckets`(off = 今天行为) |
+
+### 4.7f **收尾小改:B1 诊断让位 / B2 padding 护栏 / B4 命中率统计**(2026-10-15 深夜)
+
+| # | 内容 | 判据/实测 |
+|---|---|---|
+| **B1** | **诊断档让位**:`pf_bisect` / `pf_stages` / `dflash_probe` 在场 ⇒ 桶**全部让位 eager** + 一次 warn(此前桶命中会**静默绕过**这些诊断——它们的实现只在 eager 路) | 优先级"诊断 > 图";不静默 |
+| **B2** | **padding 护栏**:`pad_rows = t_pad − t_real > 32` ⇒ 该 chunk 走 eager。阈值来自实测:pad **29 行仍净赢 −9.4ms**、pad **42 行净输 +5.4ms**、pad **64 行净输 +34ms**(@27B,0.78ms/行;图的固定节余 ≈20–30ms)⇒ 取"一个最小桶宽" | **实测复验**(86/192 两点,同卡同时段):86: 110.4→**99.9/102.6ms**(回到基线甚至更优);192: 201.4→**161.6/161.8ms**(−40ms,白算被拨回)。其余点不变 |
+| **B4** | **命中率/白算统计**(`/debug/metrics`):`prefill.bucket.hit[.t<t_pad>]` / `.bypass.pad` / `.pad_rows[_skipped]` / `prefill.eager.{chunks,tokens}` | 实测逐项对上:t128×6 / t256×2 / t512×3 / pad 跳过 4(跳过 212 行 = 42×2+64×2)/ eager 556 tok = (86+192)×2 |
+| **B7** | 观测面对齐:桶路与 eager 末块都记 `prefill.chunk`(此前桶路只有 `prefill.graph` = 发射成本、eager 末块缺行) | 图表按 chunk 数口径不再丢行 |
+
+⇒ `t512` 单桶档的自伤(小 chunk 进 512 桶 = 15× GEMM)被 B2 结构性封死;
+
+### 4.7e **显存归因 + slab arena 修复**(2026-10-15 深夜;用户令"先归因"→"开始")
+
+**工具**(入树,常驻诊断):影子探针加**双口径**(容量峰值 = bump 高水位 / 活跃峰值 =
+同时在用字节)与**按名字汇总**;求值器三个分配臂回填核名(`probe_name`);每张图
+boot 打一行 `slab 峰值归因:…`(两个探针单测,带串行锁防全局态互噬)。
+
+**归因结论(27B 生产档,t512 桶)**:
+
+| 量 | 修前 | 说明 |
+|---|---:|---|
+| 容量定尺 | **193 MiB** | bump 高水位 |
+| 真·同时活跃 | **81 MiB** | `marlin_w4a16 34MB`(=MLP gate/up 输出)+ `add 30MB` + `silu_and_mul 17MB` |
+| 空洞 | **112 MiB(58%)** | 大/小块交替的分配序列把 bump 顶高,碎片洞填不回大请求 |
+| 分配总量 | 8.1 GB | marlin 46% / silu_and_mul 13% / narrow 10% / gdn_conv_fwd 6% |
+
+⇒ **第一杠杆是分配器,不是搬算子(piecewise)**。
+
+**修法①**:`SlabArena` 从"尺寸类 best-fit + 从不合并 + 从不退顶"改为
+**空闲块偏移有序表(BTreeMap)+ 相邻合并(coalescing)+ 贴顶回收(trim_top)**
+⇒ 层间同形状序列(64 层 × 同批张量)复用同一段地址。
+
+**修法②**:decode/verify/fold/propose 四族 `reclaim_capture: false → true`
+(捕获归约口径与探针口径对齐;此前 warmup 用 scoped 而捕获用 plain —— 口径不一致
+只是靠"这些图峰值 == 总和"侥幸不炸)。
+
+**实测(同配置 boot;每桶都 Captured)**:
+
+| 桶 | 修前容量 | 修后容量 | 修后活跃 | 修后空洞 |
+|---|---:|---:|---:|---:|
+| t512 | 193 MiB | **91 MiB** | 81 MiB | 10 MiB(11%) |
+| t256 | 96 | **45** | 40.5 | 5.0 |
+| t128 | 48 | **22** | 20.2 | 2.5 |
+| t64 | 24 | **11** | 10.1 | 1.2 |
+| t32 | 12 | **5** | 5.1 | 0.6 |
+| **Σ** | **373** | **174 MiB**(定尺 ≈200) | — | — |
+
+功能/性能零回归:烟测 128→110ms / 512→386ms、prefill 1334 t/s(与修前逐点同);
+spec 档回答连贯 ⇒ verify/fold/propose 三族 scoped 捕获健康。单测 8/8、engine lib 37/37。
+
+**图显存总账**:640 MiB → **364 MiB**(−276 MiB ≈ 5.4k token 的 fp8 KV)。
+⚠️ verify 图的 133 MiB **不降** —— 它的 384 个逐层记录都是**已登记输出**,
+活跃集 == 总量(要降得改"少登记输出",另案)。
+
+**下一步候选**(按归因排序):③ 输出面瘦身(taps 仅 spec-on 产:活跃 81→~50MB)
+④ 元素级 in-place(add/silu/cast/rmsnorm)⑤ S-2 弹性常驻。
+
+### 4.7d 验收现状(①—⑥ 对表)
+
+| # | 判据 | 现状 |
+|---|---|---|
+| ① | 图内一致门(逐位) | ✅ 原子层:`fi_graph_replay_probe`(M2a ①②③;抽屉件换 ctx/假行 NaN/尾掩码全逐位) |
+| ② | 跨档门(贪心逐 token) | ✅ 引擎级:`gpu_prefill_bucket_matches_eager`(0.8B;geobuckets 全捕获,桶真回放(t128×1 + t64×1),输出与 eager **逐字相同**) |
+| ③ | 回放命令数 ≤ 60/chunk | ✅ 结构上 = 1 条 `graph_launch` + 3 条批量写(槽 / FI 表 / GDN 表)+ 出图尾(设计预算 ~13);真机发射成本 `prefill.graph` = **0.201ms avg / 0.17 p50 / 1.16 p99**(281 chunk) |
+| ④ | `t=512` 墙时不劣化 ±1% | ✅ **已量(§4.7g)**:TTFT −4.1…−203.3ms(−1.1…−3.2%)、prefill **+1.2…+2.9%**、per-chunk p50 −10.6ms ⇒ 不劣化成立且**净正** |
+| ⑤ | 桶不命中 ⇒ eager | ✅(`pick_bucket` 向上取整 + `usable`(未捕获/槽不匹配)双守门;单一路径执行;B2 护栏再叠一层) |
+| ⑥ | `t ≤ 128` 墙时 −60…−100 ms | ⬜→**作废(§4.7g 重定档)**:实测 pad=0 点 −2.3…−4.8ms、pad=29 ≈0、**pad=32 反输 +12.9…+15.0ms**;新线 = pad ≤ 8 走图时 TTFT 中位 ≥ −2ms |
+| — | 回归 | ✅ engine 36/36(CPU);kernels 侧 M2a/图姿态/探针全绿;0.8B e2e 共享组 4/5 通过(第 5 个 `gpu_longctx_4k_prefix_qa` 是**基线既有红**:prompt 4057 + 生成 16 超预算 4096,stash 到基线复现同样失败) |
+
+> ⬜ 两项是**性能验收**,需要真机墙时口径(设计 §1.2 的固定段)与 27B 档;
+> **2026-10-16 凌晨已补量(见 §4.7g)** —— 六项全绿,其中 ⑥ 原线作废、重定为 pad 分档线。
+
+### 4.7g **B3 墙时验收:三臂实测**(2026-10-16 凌晨;空闲 3090 Ti = CUDA ordinal 1;spec-dflash 生产档)
+
+**三臂**(同配置 = `testdata/server/agent-27b.toml` 派生:device=1 / bind 8140;同卡同时段;
+每臂同序列 = 桶扫 9 点 ×3 轮 + std×2 + 小桶×2):
+
+| 臂 | 二进制 | `prefill_bucket` |
+|---|---|---|
+| **A** | 主树 HEAD `60515fd` **现场重编**(`/tmp/b3/owl-server-A`,md5 `dde9cafa`) | 无(prefill 图不存在) |
+| **Boff** | worktree 二进制(含 M2b 代码;B6 版 `/tmp/owl-server-m2b-b6`) | `off`(漂移对照) |
+| **Bgeo** | 同一二进制 | `geobuckets` |
+
+⚠️ **口径修正(重要)**:上一轮 A/B 的“基线” = 归档 `/tmp/owl-server-baseline`(10-15 **08:43** 构建,早于当晚 20:04 的 refactor 合并),且 A 臂 = 当时**正在服务 pi 自身推理流量**的生产进程 ⇒ 旧结论 `+4.5…+9.6%` 混入了 build 漂移与自身流量。本轮 A 臂 = 主树 HEAD 独立进程,Boff 臂 兼作漂移对照(实测漂移很小:短点 +1.3ms、@8192 −36.8ms)。
+
+**表 1:std 五点三轮(TTFT ms / prefill t·s⁻¹;std1+std2 六点中位)**
+
+| 长度 | A TTFT | Boff | Bgeo | Δ(Boff→Bgeo) | A prefill | Boff | Bgeo | Δ(Boff→Bgeo) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 512 | 370.6 | 370.6 | 366.5 | −4.1ms(−1.1%) | 1389 | 1388 | 1404 | **+1.2%** |
+| 1024 | 748.2 | 746.4 | 729.8 | −18.4(−2.5%) | 1372 | 1376 | 1407 | **+2.3%** |
+| 2048 | 1523.9 | 1513.3 | 1478.1 | −45.8(−3.0%) | 1346 | 1355 | 1387 | **+2.4%** |
+| 4096 | 3093.1 | 3074.0 | 2989.2 | −103.9(−3.4%) | 1325 | 1333 | 1371 | **+2.9%** |
+| 8192 | 6335.8 | 6299.0 | 6132.6 | **−203.3**(−3.2%) | 1293 | 1301 | 1336 | **+2.7%** |
+
+**表 2:小 chunk(单 chunk 提示;三臂 TTFT 中位;桶/垫按**实到** token 算)**
+
+| 请求 | 实到 | 桶(垫行) | 路径 | A | Boff | Bgeo | Δ(Boff→Bgeo) |
+|---|---:|---|---|---:|---:|---:|---:|
+| 32 | 86 | t128(42) | eager(B2 让位) | 99.1 | 101.7 | 100.6 | −1.0 |
+| 64/96 | 99 | t128(29) | 图 | 104.3–104.5 | 103.8–104.3 | 102.6–104.1 | −0.2…−1.2 |
+| 128 | 128 | t128(0) | 图 | 109.9 | 112.5 | 107.7 | **−4.8** |
+| 160 | 160 | t256(96) | eager | 137.4 | 139.8 | 141.1 | +1.2 |
+| 192 | 192 | t256(64) | eager | 153.7 | 154.9 | 156.5 | +1.5 |
+| 224 | 224 | t256(32) | 图 | 181.2 | 182.4 | 195.3 | **+12.9** |
+| 256 | 256 | t256(0) | 图 | 196.6 | 198.0 | 195.5 | −2.5 |
+| 480 | 480 | t512(32) | 图 | 351.8 | 351.6 | 366.6 | **+15.0** |
+| 512 | 512 | t512(0) | 图 | 369.3 | 369.9 | 367.6 | −2.3 |
+
+**表 3:服务端 chunk 墙时(同二进制、同序列 **281 chunk** 累计对拍 —— 口径同,唯一干净的对拍面)**
+
+| 量 | Boff | Bgeo | Δ |
+|---|---:|---:|---:|
+| 全臂均值(281 chunk) | 313.6ms | 306.2ms | **−7.4ms(−2.4%)** |
+| 全臂 p50 | 370.5 | 359.9 | **−10.6ms** |
+| std1 / std2 相位均值(长 chunk 为主) | 320.8 / 327.5 | 311.9 / 319.5 | −8.9 / −8.0 |
+| `prefill.graph`(图发射:槽写 + graph_launch) | — | 0.201ms avg(0.17 p50 / 1.16 p99) | 达标(预算 ≤60 命令/chunk) |
+| 桶命中 | — | **260/281 = 92.5%**(std 相内 100%) | t512×211 / t128×24 / t64×13 / t256×12 |
+| `bypass.pad` / `eager.tokens` | — | 21 chunk / 2982 tok(均来自刻意坏垫点) | pad 行:垫 975 / 跳过 1242 |
+
+**结论与新接受线(设计 §3.1 目标表按实测重定)**
+
+| # | 设计线 | 实测 | **新线** |
+|---|---|---|---|
+| ④ | t=512 不劣化 ±1% | TTFT −1.1…−3.2%;prefill **+1.2…+2.9%**;per-chunk p50 −10.6ms | **及格 = 不劣化;达标 = prefill ≥ +1% 且 TTFT@8192 ≤ −100ms;冲刺 = prefill ≥ +3% 或 TTFT@8192 ≤ −200ms** ⇒ 本轮**达标**(@8192 逼近冲刺) |
+| ⑥ | t ≤ 128 墙时 −60…−100ms | pad=0 点 −2.3…−4.8ms;pad=29 ≈ 0;**pad=32 反输 +12.9…+15.0ms** | **原线作废**(它基于旧 build 的 ~110ms 固定段);新线 = **pad ≤ 8 走图时「TTFT 中位 ≥ −2ms 且不劣化」** |
+
+**B2 阈值定谳(应下调)**:图的每 chunk 固定节余 H ≈ 2.3–4.8ms(短 ctx),白算成本 = pad × s,
+s ≈ **0.28ms/行**(t128)/ **0.67**(t256)/ **0.57**(t512)(由 eager 臂同桶内长度差直接量得)⇒
+盈亏平衡 pad ≈ **4…17 行**,现行 32 行**太大**(pad 32 必输)。建议
+`BUCKET_PAD_MAX_ROWS: 32 → 8`(或按桶 {t128:12, t256:4, t512:4});H 随 ctx 增长(长提示 t512 chunk −8…−9ms),
+但长提示 chunk 恒 pad=0 ⇒ **收紧护栏不影响 std 收益**。
+
+**异常与风险(未结,另案)**
+
+1. **A 臂(主树 HEAD 新编二进制)在 small2 相位中途静默死亡**(03:05:24;日志末行 `[sched] n=4624`,
+   无 panic、无 OOM 记录、显存立即释放);同序列 Boff/Bgeo 两臂全绿。⇒ 主树 HEAD 有一次**未解释崩溃**,
+   已挂账;**当前生产 8137 仍跑旧二进制**(见 2)。
+2. 本轮进行中发现**生产进程(旧二进制)已静默死亡**(无日志尾),已用原二进制原样重启;
+   ⚠️ 即**生产当前 ≠ 主树 HEAD**,推动合并/转正时需一并处理。
+3. 噪声界:同臂 std1→std2 的 TTFT 差在 A/Bgeo 达 +2.3…+44.5ms(@8192,疑似热漂移),Boff 平坦(+1.2ms)
+   ⇒ 表 1 取六点中位,结论按 **Boff↔Bgeo 同二进制对拍**读。
+4. 启动显存:本卡 boot 瞬时峰值 ~23.7G/24.5G(稳态 21.9G = 与生产档同);Bgeo 终态 free 1602MB vs
+   Boff 1231MB(桶常驻 ≈ +370MB)⇒ 换 ctx 容量时需计此账(§4.7e 后 Σ174MiB + arena 余量)。
+
+> **产物**:`/tmp/b3/`(三臂 × 13 相位 × json/csv/服务端 metrics 快照 + 启动峰值采样 + 日志)。
+> 复现命令 = `bash /tmp/b3/run_arm.sh <tag> <bin> <cfg> sweep` + `python3 /tmp/b3/analyze.py`。
 
 ---
 
@@ -519,13 +738,31 @@ prefill **有状态副作用**(KV 池写 + GDN 递推)⇒ `GraphPlan::plan(captu
 | **M0** | **命令税对照实验(先量后建)**:实现"命令批/零回执"(P1‴ 的一条子集:同一条 `Command` 携带 N 条 launch,或 free/alloc 合批)并量 `t ≤ 128` 与 `t = 512` 两档 | 若 `t ≤ 128` 已拿到 ≥60% 的固定段收益 ⇒ **图不必做**;否则进 M1 | 2-3d |
 | **M1** | ✅ **已落(2026-10-15)** —— slab 峰值定量 + 捕获窗放行 Free + abort/destroy/close 三把生命周期原语 + `warmup:false`/`slab_fixed` 组合。详情与验证矩阵见 **§4.3d** | 单桶捕获不再受"分配总和 9362 MiB"限制(峰值口径);窗内 Free/复用/abort/destroy 全部有真机门 | ✅ 完成 |
 | **M2a** | ✅ **已做(2026-10-15)** —— P-5 掩码落地 + 三实验对拍(表件换 ctx / 假行 NaN / 尾掩码),全绿见 **§4.3f**;顺带钉死三条姿态坑(默认流/event-tracking/窗内 sync) | 三条假设 **F-5(plan 与 ctx 无关)/F-8(尾 CTA 不写坏真行)/律①(假行不污染)** 全部实测成立 | ✅ 完成 |
-| **M2b** | **整段单图**(首选):P-1 ✅ / P-2 ✅ / P-3 ✅ / P-5 ✅;**只剩 P-6b(GDN 两族 cu 语义槽化,§4.3e)**;单桶(t=512,含注意力)整 chunk 图 | ① **图内一致门**逐位 ② **跨档门**贪心逐 token 一致 ③ 回放期命令数 ≤ 60/chunk(设计预算 ~13)④ `t=512` 墙时**不劣化**(设备绑死,允许 ±1%)⑤ 桶不命中 ⇒ eager | 3-4d |
+| **M2b** | ✅ **已落(2026-10-15)** —— 整段单图 + **桶族**(M2b 与 M3 的桶几何一次做完:`t_pad` 向上取整、dump 页、布局/语义 t 分离、末行出图)。前置件 P-1/P-2/P-3(三轮更正)/P-5/P-6b 全落,**新增硬前置件 = FI plan 自携**(§4.7a,多桶共存的地基);落地件清单 §4.7c | ① 图内逐位 ✅(M2a + 探针)② 跨档贪心逐 token ✅(`gpu_prefill_bucket_matches_eager`,0.8B 逐字相同)③ 命令数 ✅(发射 0.201ms/chunk)④/⑥ **已量并重定档**(§4.7g:④ 达标、⑥ 原线作废)⑤ 桶不命中 ⇒ eager ✅ | ✅ 完成(B3 墙时表见 §4.7g;待用户裁决:护栏 32→8) |
 | **M2c** | **后备:断点原语**(§4.1b;M-A)+ `eval_ops_into` + 段列表回放 | 同 M2b(但 FI 留在图外) | 4-6d |
-| **M3** | **padding 桶族** {32,64,128,256,512} + 布局/语义 t 分离 + dump 页 + 末行出图 | ① 每桶恒等门 ② 调度器 chunk 长命中率统计(目标 ≥95%)③ **`t ≤ 128` 墙时 −60…−100 ms** ④ 长 chunk 持平 | 4-6d |
+| **M3** | ✅ **桶族已并入 M2b**(2026-10-15):ladder {32,64,128,256,512} + dump 页 + 布局/语义 t 分离 + 末行出图 + `prefill_bucket` 三档开关;**B3 墙时表已量(§4.7g,2026-10-16)**:std prefill +1.2…+2.9% / TTFT −203ms@8192,桶命中 92.5%(std 相 100%) | ① 每桶恒等门:桶内逐位由 M2a 覆盖;每桶「图≡eager」由引擎门覆盖(本机 0.8B 五桶)② 命中率 ✅(生产档 281 chunk 实测)③ ④ 墙时 ✅(重定档) | ✅ 完成(剩:护栏 32→8 的裁决与落地) |
 | **M4** | 收尾:PDL(`enable_pdl`)、**草稿面桶**(encode/extend;DFlash2)、XQA 尾块桶(小于 `fi_min_tokens` 的桶)、FI 槽容量/多会话面(multi-session batch>1 时 `q_cu` 不能再常量) | ① 恒等门 ② 首调税 = 0(§1.1 的 20.9 ms 空转)③ 缺省档仍关/按 flavor 开 | 3-5d |
 
-**回滚**:每阶段一个 knob(`graph.prefill_bucket = off|t512|geobuckets`);任何阶段失败 =
-回到上一档,无新语义残留。
+**回滚开关(✅ 配置面已落,2026-10-15;worktree `feat/prefill-graph-v2`)**
+
+```toml
+[graph]
+no_graph = false            # 总闸:一刀切关掉**全部**图捕获(decode/verify/fold/propose + prefill)
+prefill_bucket = "off"      # prefill **专属**档位(缺省 off = 今天行为)
+                            #   off        : 不建 prefill 图
+                            #   t512       : 只建 512 桶(最小面:显存最小、命中面 = 满块)
+                            #   geobuckets : 全桶族 {32,64,128,256,512}(尾块也吃图;显存 ≈ 374 MiB)
+```
+
+- **为什么分层而不是 bool**:回滚要能**逐级降**(`geobuckets → t512 → off`),不必在"全开/全关"之间跳;
+- **与总闸的关系**:`no_graph = true` 优先级最高(连 prefill 图也不建);两者独立,可只关 prefill 而不动现役 decode 族;
+- **配了就得生效(装配期护栏)**:`prefill_bucket ≠ off` 而实现尚未落地时,`Engine::on` **boot 最前**结构化拒启
+  (拒语点名档位 + "施工中" + 可行动指引)—— 静默忽略配置是本仓明令禁止的隐瞒行为;M2b 落地时把该护栏
+  换成真接线,**配置面零改动**(判据:单测 `prefill_bucket_non_off_is_rejected`);
+- **运行时熔断(叠加在档位之上,M2b 落地时实现)**:某桶捕获失败 / 回放数值门不过 ⇒ **该桶永久降级 eager**
+  (warn 一次、不重试),其余桶不受影响 —— 即"部分回滚"的动力学版本;
+- **可观测**:boot 日志逐桶打建图结果;`CaptureNodes`(2026-10-15,A1.6 落地)在图捕获时记录
+  "发射 N 发 / 内核 K 种 / 钉住哪些块",`graph_destroy` 时打印 ⇒ 运维一眼看到"哪张图在跑、烘了什么"。
 
 ---
 

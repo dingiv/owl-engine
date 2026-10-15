@@ -69,6 +69,8 @@ extern "C" {
         out_plan15: *mut i64,
         out_cta_tile_q: *mut i32,
         out_split_kv: *mut i32,
+        // plan 表写入 int_ws 的有效字节数(不变盒快照尺寸;C++ 侧 = need_int)
+        out_int_bytes: *mut usize,
         qo_indptr_h: *const i32,
         kv_indptr_h: *const i32,
         total_num_rows: i32,

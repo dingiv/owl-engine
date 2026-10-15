@@ -256,13 +256,13 @@ async fn gpu_prefill_paged_attn_f16_hd256_impl(t_ctx: usize) {
     let qb = |v: &[f32]| v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>();
 
     let decl = TensorOps::call(SemanticKernel::PagedPrefill).aux(&[hd, hkv, hq, t_ctx])
-    .arg(&TensorOps::from_host(Dtype::F16, vec![t_ctx, hq, hd], &qb(&q)))
+    .arg(&TensorOps::from_host(Dtype::F16, vec![t_ctx, hq * hd], &qb(&q)))
     .arg(&TensorOps::of_block(kc_b.id, Dtype::F16, vec![nb, hkv, hd / 8, p, 8]))
     .arg(&TensorOps::of_block(vc_b.id, Dtype::F16, vec![nb, hkv, hd, p]))
     .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0])))
     .arg(&TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t_ctx as f32])))
     .arg(&TensorOps::from_host(Dtype::F32, vec![2], &f32b(&[0.0, t_ctx as f32])))
-    .arg(&TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])))
+    .arg(&TensorOps::from_host(Dtype::F16, vec![1], &[0.0f32].iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>()))  // alibi 哑块(契约 F16)
     .arg(&TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])))
     .arg_i32(hkv as i32)
     .arg_f32(scale)
@@ -278,7 +278,7 @@ async fn gpu_prefill_paged_attn_f16_hd256_impl(t_ctx: usize) {
     .arg_i32(hd as i32 * p as i32)
     .arg_i32(0)
     .arg_i32(0)
-    .with_shape(Dtype::F16, vec![t_ctx, hq, hd]);
+    .with_shape(Dtype::F16, vec![t_ctx, hq * hd]);
     let got = crate::testkit::harvest_f16(&mut gpu, &decl).await;
 
     for (t, h) in (0..t_ctx).flat_map(|t| (0..hq).map(move |h| (t, h))) {
@@ -338,13 +338,13 @@ async fn gpu_paged_attention_v1_f16_smoke() {
     let _shared = (t_ctx.div_ceil(p) * p * 4).max((4 / 2) * hd * 4) as u32; // NUM_WARPS=4
 
     let decl = TensorOps::call(SemanticKernel::PagedDecode).aux(&[hd, hq, hkv, nb])
-        .arg(&TensorOps::from_host(Dtype::F16, vec![1, hq, hd],
+        .arg(&TensorOps::from_host(Dtype::F16, vec![1, hq * hd],
             &q.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>()))
         .arg(&TensorOps::of_block(kc_b.id, Dtype::F16, vec![nb, hkv, hd / 8, p, 8]))
         .arg(&TensorOps::of_block(vc_b.id, Dtype::F16, vec![nb, hkv, hd, p]))
         .arg(&TensorOps::from_host(Dtype::F32, vec![1, 2], &f32b(&tables)))
-        .arg(&TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t_ctx as f32])))
-        .arg(&TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0]))) // alibi 哑块(旗标 0 不解引用)
+        .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[t_ctx as f32])))
+        .arg(&TensorOps::from_host(Dtype::F16, vec![1], &[0.0f32].iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>())) // alibi 哑块(旗标 0 不解引用)
         .arg_i32(hkv as i32)
         .arg_f32(scale)
         .arg_i32(nb as i32)
@@ -354,7 +354,7 @@ async fn gpu_paged_attention_v1_f16_smoke() {
         .arg_f32(1.0)                                 // softscapping 直通
         .arg_i32(-1)                                  // sliding_window 关
         .arg_i32(0)                                   // use_alibi 关
-        .with_shape(Dtype::F16, vec![1, hq, hd]);     // 末位 T = 新分配输出
+        .with_shape(Dtype::F16, vec![1, hq * hd]);     // 末位 T = 新分配输出
 
     // nvrtc 懒编译在此行发生:编译失败 = 整个扁平化路线回炉
     let got = crate::testkit::harvest_f16(&mut gpu, &decl).await;
@@ -391,12 +391,12 @@ async fn gpu_paged_attention_v1_f16_hd256_smoke() {
     let qb = |v: &[f32]| v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>();
 
     let decl = TensorOps::call(SemanticKernel::PagedDecode).aux(&[hd, hq, hkv, nb])
-    .arg(&TensorOps::from_host(Dtype::F16, vec![1, hq, hd], &qb(&q)))
+    .arg(&TensorOps::from_host(Dtype::F16, vec![1, hq * hd], &qb(&q)))
     .arg(&TensorOps::of_block(kc_b.id, Dtype::F16, vec![nb, hkv, hd / 8, p, 8]))
     .arg(&TensorOps::of_block(vc_b.id, Dtype::F16, vec![nb, hkv, hd, p]))
     .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0])))
-    .arg(&TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t_ctx as f32])))
-    .arg(&TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])))
+    .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[t_ctx as f32])))
+    .arg(&TensorOps::from_host(Dtype::F16, vec![1], &[0.0f32].iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>()))  // alibi 哑块(契约 F16)
     .arg_i32(hkv as i32)
     .arg_f32(scale)
     .arg_i32(nb as i32)
@@ -406,7 +406,7 @@ async fn gpu_paged_attention_v1_f16_hd256_smoke() {
     .arg_f32(1.0)
     .arg_i32(-1)
     .arg_i32(0)
-    .with_shape(Dtype::F16, vec![1, hq, hd]);
+    .with_shape(Dtype::F16, vec![1, hq * hd]);
     let got = crate::testkit::harvest_f16(&mut gpu, &decl).await;
 
     let mut ref_out = Vec::new();
@@ -466,14 +466,14 @@ async fn gpu_paged_attention_v2_reduce_f16_smoke() {
     let ml_b = crate::interpreters::eval_ops(
         TensorOps::zeros(Dtype::F32, vec![1, hq, 1]).step(), &mut gpu).await.expect("ml");
     let v2 = TensorOps::call(SemanticKernel::PagedDecodeV2).aux(&[hd, hq, hkv, nb, 1])
-        .arg(&TensorOps::from_host(Dtype::F16, vec![1, hq, hd], &qb(&q)))
+        .arg(&TensorOps::from_host(Dtype::F16, vec![1, hq * hd], &qb(&q)))
         .arg(&TensorOps::of_block(kc_b.id, Dtype::F16, vec![nb, hkv, hd / 8, p, 8]))
         .arg(&TensorOps::of_block(vc_b.id, Dtype::F16, vec![nb, hkv, hd, p]))
         .arg(&TensorOps::from_host(Dtype::F32, vec![1, 2], &f32b(&tables)))
-        .arg(&TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t_ctx as f32])))
-        .arg(&TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])))
-        .arg(&TensorOps::of_block(es_b.id, Dtype::F32, vec![1, hq, 1]))
-        .arg(&TensorOps::of_block(ml_b.id, Dtype::F32, vec![1, hq, 1]))
+        .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[t_ctx as f32])))
+        .arg(&TensorOps::from_host(Dtype::F16, vec![1], &[0.0f32].iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>()))  // alibi 哑块(契约 F16)
+        .arg(&TensorOps::of_block(es_b.id, Dtype::F32, vec![1, hq]))
+        .arg(&TensorOps::of_block(ml_b.id, Dtype::F32, vec![1, hq]))
         .arg_i32(hkv as i32)
         .arg_f32(scale)
         .arg_i32(nb as i32)
@@ -483,17 +483,17 @@ async fn gpu_paged_attention_v2_reduce_f16_smoke() {
         .arg_f32(1.0)
         .arg_i32(-1)
         .arg_i32(0)
-        .with_shape(Dtype::F16, vec![1, hq, hd]);
+        .with_shape(Dtype::F16, vec![1 * hq * hd]);  // bs32 变体契约:tmp_out r1
     let tmp = crate::interpreters::eval_ops(v2.step(), &mut gpu).await.expect("v2 eval");
 
     // reduce:分片归约 → 终出(aux = [hd, hq, nparts, seqs];E16 seqs 入参)
     let rd = TensorOps::call(SemanticKernel::PagedV2Reduce).aux(&[hd, hq, 1, 1])
-        .arg(&TensorOps::of_block(es_b.id, Dtype::F32, vec![1, hq, 1]))
-        .arg(&TensorOps::of_block(ml_b.id, Dtype::F32, vec![1, hq, 1]))
-        .arg(&TensorOps::of_block(tmp.id, Dtype::F16, vec![1, hq, hd]))
+        .arg(&TensorOps::of_block(es_b.id, Dtype::F32, vec![1, hq]))
+        .arg(&TensorOps::of_block(ml_b.id, Dtype::F32, vec![1, hq]))
+        .arg(&TensorOps::of_block(tmp.id, Dtype::F16, vec![1 * hq * hd]))
         .arg(&TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t_ctx as f32])))
         .arg_i32(1) // max_num_partitions
-        .with_shape(Dtype::F16, vec![1, hq, hd]);
+        .with_shape(Dtype::F16, vec![1, hq * hd]);
     let got = crate::testkit::harvest_f16(&mut gpu, &rd).await;
 
     let mut ref_out = Vec::new();
@@ -532,13 +532,13 @@ async fn gpu_prefill_paged_attn_f16_smoke() {
     let qb = |v: &[f32]| v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>();
 
     let decl = TensorOps::call(SemanticKernel::PagedPrefill).aux(&[hd, hkv, hq, t_ctx])
-    .arg(&TensorOps::from_host(Dtype::F16, vec![t_ctx, hq, hd], &qb(&q)))
+    .arg(&TensorOps::from_host(Dtype::F16, vec![t_ctx, hq * hd], &qb(&q)))
     .arg(&TensorOps::of_block(kc_b.id, Dtype::F16, vec![nb, hkv, hd / 8, p, 8]))
     .arg(&TensorOps::of_block(vc_b.id, Dtype::F16, vec![nb, hkv, hd, p]))
     .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0]))) // 恒等块表
     .arg(&TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t_ctx as f32])))
     .arg(&TensorOps::from_host(Dtype::F32, vec![2], &f32b(&[0.0, t_ctx as f32]))) // query_start_len
-    .arg(&TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0]))) // alibi 哑
+    .arg(&TensorOps::from_host(Dtype::F16, vec![1], &[0.0f32].iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>())) // alibi 哑
     .arg(&TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0]))) // sinks 哑
     .arg_i32(hkv as i32)
     .arg_f32(scale)
@@ -554,7 +554,7 @@ async fn gpu_prefill_paged_attn_f16_smoke() {
     .arg_i32(hd as i32 * p as i32) // kv_head_stride
     .arg_i32(0)                    // use_alibi
     .arg_i32(0)                    // use_sinks
-    .with_shape(Dtype::F16, vec![t_ctx, hq, hd]);
+    .with_shape(Dtype::F16, vec![t_ctx, hq * hd]);
     let got = crate::testkit::harvest_f16(&mut gpu, &decl).await;
 
     // host 参照:逐 token 因果(token t 看 [0,t])

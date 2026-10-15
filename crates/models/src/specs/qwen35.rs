@@ -922,7 +922,21 @@ mod tests {
         let model = load_0_8b(&dir, &mut gpu).await?;
         eprintln!("[diag] loaded");
         let rp = Rope::new(262_144, 256, 64, 10_000_000.0)?;
-        crate::interpreters::eval_load(&rp, &mut gpu, &rp.tables(), &Default::default()).await?;
+        // ⚠️ 表 dtype 必须与生产同档(F16):`owl_qknorm_rope_kv_insert_f16_*`
+        // 契约声明 cos_t/sin_t = F16(旧 `Default::default()` = F32 ⇒ 准入门拒)
+        crate::interpreters::eval_load(
+            &rp,
+            &mut gpu,
+            &rp.tables(),
+            &crate::module::LoaderCtx {
+                dtype: Dtype::F16,
+                shard: 1,
+                device_repack: false,
+                verify: false,
+                debug_tap: false,
+            },
+        )
+        .await?;
 
         let (kvs_n, gdns_n) = (6usize, 18usize);
         let mut mk_kvs = Vec::new();

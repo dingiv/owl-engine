@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cudarc::driver::{CudaContext, CudaSlice, DevicePtr};
+use cudarc::driver::{CudaContext, CudaSlice, DevicePtr, DevicePtrMut};
 use owl_kernels::contract::{Bytes, Dtype, OpError};
 use owl_kernels::device::{DeviceRes, LaunchNote, ScratchBuf};
 
@@ -24,8 +24,13 @@ pub struct TestRes {
     dev_ordinal: i32,
     pub ctx: Arc<CudaContext>,
     pub stream: Arc<cudarc::driver::CudaStream>,
-    blocks: HashMap<u64, CudaSlice<u8>>,
+    pub blocks: HashMap<u64, CudaSlice<u8>>,
     next_id: u64,
+    /// 捕获窗句柄(P-6b/plan 自携探针用):置 true 即让家族以为自己在窗内
+    /// —— production 后端由 `CaptureState` 置位,探针无捕获台账,手工当开关。
+    /// 窗内路径的合法性(不许 sync/不许同步 H2D)由 [`TestRes::upload_invariant`]
+    /// 的 async 实现对称保障。
+    pub capture_flag: bool,
 }
 
 impl TestRes {
@@ -43,7 +48,7 @@ impl TestRes {
         // 生产侧把这条记为"坑 A",这里照抄 —— 探针必须与生产同姿态。
         unsafe { ctx.disable_event_tracking() };
         let stream = ctx.new_stream().expect("new_stream");
-        Self { dev_ordinal: dev as i32, ctx, stream, blocks: HashMap::new(), next_id: 1 }
+        Self { dev_ordinal: dev as i32, ctx, stream, blocks: HashMap::new(), next_id: 1, capture_flag: false }
     }
     pub fn upload(&mut self, bytes: &[u8]) -> Bytes {
         let id = self.next_id;
@@ -60,10 +65,29 @@ impl TestRes {
         self.blocks.insert(id, d);
         Bytes::new(id, bytes, Dtype::F16, 2)
     }
+    /// 按 f32 读回一个块(状态/表件;测试面)
+    pub fn take_f32(&self, id: u64) -> Vec<f32> {
+        let s = self.blocks.get(&id).expect("块在册");
+        let host = self.stream.clone_dtoh(s).expect("dtoh");
+        host.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    }
+
     pub fn take_u16(&self, id: u64) -> Vec<u16> {
         let s = self.blocks.get(&id).expect("块在册");
         let host = self.stream.clone_dtoh(s).expect("dtoh");
         host.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
+    }
+
+    /// 整块回读(u8;plan/workspace 取证面 —— 按尺寸找块见 `block_id_of_len`)
+    pub fn take_bytes(&self, id: u64) -> Vec<u8> {
+        let s = self.blocks.get(&id).expect("块在册");
+        self.stream.clone_dtoh(s).expect("dtoh")
+    }
+
+    /// 按**块字节数**找一个块 id(探针取证:FiRuntime 的 int_ws = 32MiB、
+    /// float_ws = 64MiB,尺寸在测试面唯一可辨)
+    pub fn block_id_of_len(&self, bytes: usize) -> Option<u64> {
+        self.blocks.iter().find(|(_, s)| s.len() == bytes).map(|(id, _)| *id)
     }
 }
 
@@ -119,7 +143,46 @@ impl DeviceRes for TestRes {
         })
     }
     fn capturing(&self) -> Result<bool, OpError> {
-        Ok(false)
+        Ok(self.capture_flag)
+    }
+    /// 不变盒上传:**async**(捕获窗内也能跑;production 同形)。
+    /// 同步 `memcpy_htod` 在窗内会直接 invalidate 捕获(M2a 姿态坑 #2 同族)。
+    fn upload_invariant(
+        &mut self,
+        dst: u64,
+        src: &owl_kernels::contract::InvariantBox,
+    ) -> Result<(), OpError> {
+        let target = self
+            .blocks
+            .iter()
+            .find(|(_, s)| s.device_ptr(&self.stream).0 == dst)
+            .map(|(id, _)| *id);
+        match target {
+            Some(id) => {
+                let v = self.blocks.get_mut(&id).expect("在册");
+                let (ptr, _g) = v.device_ptr_mut(&self.stream);
+                unsafe {
+                    cudarc::driver::result::memcpy_htod_async(
+                        ptr,
+                        src.as_bytes(),
+                        self.stream.cu_stream(),
+                    )
+                    .map_err(|e| OpError::Contract {
+                        op: "fi-probe".into(),
+                        field: "upload_invariant",
+                        expect: "async htod".into(),
+                        got: format!("{e:?}"),
+                    })?;
+                }
+                Ok(())
+            }
+            None => Err(OpError::Contract {
+                op: "fi-probe".into(),
+                field: "upload_invariant",
+                expect: "指针在册".into(),
+                got: format!("{dst:#x}"),
+            }),
+        }
     }
     fn record_capture(&mut self, _note: LaunchNote) -> Result<(), OpError> {
         Ok(())

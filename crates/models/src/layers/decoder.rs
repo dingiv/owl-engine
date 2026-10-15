@@ -382,7 +382,7 @@ mod tests {
             kv_lens: TensorOps::from_host(Dtype::F32, vec![tokens], &crate::testkit::f32b(&[1.0])),
             block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
         };
-        let pos = TensorOps::from_host(Dtype::F32, vec![tokens], &crate::testkit::f32b(&pos_v));
+        let pos = TensorOps::from_host(Dtype::F32, vec![1, tokens], &crate::testkit::f32b(&pos_v));  // 契约 pos r2
         let xs_t = TensorOps::from_host(Dtype::F32, vec![tokens, hidden], &crate::testkit::f32b(&xs));
         let ctx = ForwardCtx::decode(tokens, &pos, &kv, &rp);
         let decl = layer.forward(&xs_t, &ctx);

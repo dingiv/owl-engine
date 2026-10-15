@@ -55,8 +55,10 @@ pub struct EngineKnobs {
     pub draft: DraftCfg,
     /// 前缀缓存(缺省开;原 OWL_PREFIX_CACHE≠"0")
     pub prefix_cache: bool,
-    /// eager 直发,跳过图捕获(原 OWL_NO_GRAPH)
+    /// eager 直发,跳过图捕获(原 OWL_NO_GRAPH;**总闸**)
     pub no_graph: bool,
+    /// **prefill 图档位**(P1;`[graph] prefill_bucket`;缺省 `off` = 今天行为)
+    pub prefill_bucket: owl_shared::config::PrefillBucket,
     /// TS 探针槽(原 OWL_TS_PROBE)
     pub ts_probe: bool,
     /// GDN 槽数覆写(缺省 8;原 OWL_GDN_SLOTS)
@@ -97,6 +99,7 @@ impl Default for EngineKnobs {
             draft: DraftCfg::default(),
             prefix_cache: true,
             no_graph: false,
+            prefill_bucket: owl_shared::config::PrefillBucket::Off,
             ts_probe: false,
             gdn_slots: 8,
             snap_max: 4,
@@ -138,6 +141,7 @@ impl EngineKnobs {
             },
             prefix_cache: cfg.pool.prefix_cache,
             no_graph: cfg.graph.no_graph,
+            prefill_bucket: cfg.graph.prefill_bucket,
             ts_probe: cfg.dispatch.ts_probe,
             gdn_slots: cfg.pool.gdn_slots,
             snap_max: cfg.pool.snap_max,
@@ -228,6 +232,9 @@ impl Engine<GpuClient> {
 impl<D: DeviceClient + 'static> Engine<D> {
     /// 注入 face(CPU 测试/自定义后端;唯一构造机制,new 是其 GPU 特化)
     pub fn on(cfg: EngineConfig, face: D) -> Result<Self> {
+        // 注:`[graph] prefill_bucket` 的**真接线在 [`Self::run`]**(桶捕获需要
+        // 模型与状态池;静止点律 ⇒ 只在 boot 做)。此处不再拒启(2026-10-15
+        // M2b 落地;此前的"配了没实现就拒"临时门已被真接线取代)。
         Ok(Self { face, cfg })
     }
 
@@ -323,6 +330,9 @@ impl<D: DeviceClient + 'static> Engine<D> {
             vram_target: self.cfg.knobs.vram_target,
             vram_reserve_mb: self.cfg.knobs.vram_reserve_mb,
             dump_all: self.cfg.knobs.gdn_dump_all,
+            // prefill 桶 padding 的 dump 页(M2b):档位非 off 才多分配那 1 页
+            prefill_dump_page: self.cfg.knobs.prefill_bucket
+                != owl_shared::config::PrefillBucket::Off,
         };
         let pool = StatePool::alloc(&mut self.face, dims, &loaded.spec.layer_types, &plan).await?;
         if let Some(q) = fi_quant {

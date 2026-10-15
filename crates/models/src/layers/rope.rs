@@ -276,17 +276,17 @@ mod f16_tests {
         let dx = gpu.htod(Dtype::F16, &sh(vec![tokens, heads, hd]), &x.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()).await.expect("x");
         let dc = gpu.htod(Dtype::F16, &sh(vec![max_pos, half]), &cos.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()).await.expect("cos");
         let ds = gpu.htod(Dtype::F16, &sh(vec![max_pos, half]), &sin.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()).await.expect("sin");
-        let dp = gpu.htod(Dtype::F32, &sh(vec![tokens]), &crate::testkit::f32b(&pos)).await.expect("pos");
+        let dp = gpu.htod(Dtype::F32, &sh(vec![1, tokens]), &crate::testkit::f32b(&pos)).await.expect("pos");
         let (x_d, c_d, s_d, p_d) = (
-            TensorOps::of_block(dx.id, Dtype::F16, vec![tokens, heads, hd]),
+            TensorOps::of_block(dx.id, Dtype::F16, vec![tokens, heads * hd]),  // 契约 x r2(行视图)
             TensorOps::of_block(dc.id, Dtype::F16, vec![max_pos, half]),
             TensorOps::of_block(ds.id, Dtype::F16, vec![max_pos, half]),
-            TensorOps::of_block(dp.id, Dtype::F32, vec![tokens]),
+            TensorOps::of_block(dp.id, Dtype::F32, vec![1, tokens]),  // 契约 pos r2(生产槽 [1,T])
         );
         let decl = TensorOps::call(SemanticKernel::Rope).aux(&[tokens])
         .arg(&x_d).arg(&c_d).arg(&s_d).arg(&p_d)
         .arg_usize(heads).arg_usize(hd).arg_usize(half)
-        .with_shape(Dtype::F16, vec![tokens, heads, hd]);
+        .with_shape(Dtype::F16, vec![tokens, heads * hd]);  // 契约 out r2
         let out = crate::interpreters::eval_ops(decl.step(), &mut gpu).await.expect("eval");
         let mut buf = vec![0u8; tokens * heads * hd * 2];
         gpu.dtoh(&out, &mut buf).await.expect("dtoh");

@@ -641,7 +641,7 @@ mod tests {
         // 同型槽对调,类型签名防 dtype/rank 漂移(F16→BF16 / rank3→rank4 ——
         // 只锁名字时这两类变更**不触发任何门**;2026-10-15 审查定谳)。
         const EXPECT: &[(&str, &[&str], &[&str])] = &[
-            (crate::family::gdn_chunked::GDN_CHUNKED_FWD, &["q", "k", "v", "beta", "gate", "state", "out", "t", "slot", "nv", "nk", "kd", "scale_bits"], &["F16x3", "F16x3", "F16x3", "F16x2", "F16x2", "F32x4", "F16x3", "U64", "U64", "U64", "U64", "U64", "F32Bits"]),
+            (crate::family::gdn_chunked::GDN_CHUNKED_FWD, &["q", "k", "v", "beta", "gate", "state", "tables", "out", "t", "slot", "nv", "nk", "kd", "scale_bits", "nt"], &["F16x3", "F16x3", "F16x3", "F16x2", "F16x2", "F32x4", "U32x1", "F16x3", "U64", "U64", "U64", "U64", "U64", "F32Bits", "U64"]),
             (crate::family::gdn_scalar::GDN_SCALAR_FWD, &["q", "k", "v", "beta", "gate", "state", "out", "t", "slot", "ns", "nv", "nk", "kd", "scale_bits"], &["F32x3", "F32x3", "F32x3", "F32x2", "F32x2", "F32x4", "F16x3", "U64", "U64", "U64", "U64", "U64", "U64", "F32Bits"]),
             (crate::family::marlin::GEMM_W4A16_AWQ, &["a", "b", "out", "scales", "zeros", "ws", "c_tmp", "m", "k", "n", "groupsize"], &["F16x2", "U32x2", "F16x2", "F16x2", "U32x2", "U32x1", "U32x1", "U64", "U64", "U64", "U64"]),
             (crate::family::marlin::GEMM_W4A16_BF16, &["a", "b", "out", "scales", "ws", "c_tmp", "m", "k", "n", "groupsize"], &["BF16x2", "U32x2", "BF16x2", "F16x2", "U32x1", "U32x1", "U64", "U64", "U64", "U64"]),
@@ -689,8 +689,9 @@ mod tests {
         let g = meta("gdn_chunked_delta_rule_fwd").expect("gdn chunked");
         assert_eq!(g.slot_index("gate"), Some(4));
         assert_eq!(g.slot_index("state"), Some(5));
-        assert_eq!(g.slot_index("out"), Some(6));
-        assert_eq!(g.slot_index("slot"), Some(8), "标量槽同表寻址");
+        assert_eq!(g.slot_index("tables"), Some(6), "P-6b 序列表槽");
+        assert_eq!(g.slot_index("out"), Some(7));
+        assert_eq!(g.slot_index("slot"), Some(9), "标量槽同表寻址");
         assert_eq!(g.slot_index("不存在"), None);
     }
 
