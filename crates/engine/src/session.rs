@@ -217,6 +217,31 @@ pub(crate) struct SessionBank {
 }
 
 impl SessionBank {
+    /// boot 构造(target 链账房 + MTP 链账房;几何随池)。前缀缓存
+    /// 只挂 target 链(容量 = 池半);MTP 链无前缀缓存,非 mtp 模式
+    /// 0 块 —— 误用 = 结构化报错(池耗尽语义)。
+    pub(crate) fn new(
+        pool_nb: usize,
+        pool_page: usize,
+        paged: bool,
+        mtp: bool,
+        prefix_cache: bool,
+        debug: bool,
+    ) -> Self {
+        let mut blocks_m = BlockManager::new(pool_nb, pool_page);
+        blocks_m.debug = debug;
+        if paged && prefix_cache {
+            blocks_m.enable_prefix_cache((pool_nb / 2).max(1));
+        }
+        let mut blocks_mtp = BlockManager::new(if mtp { pool_nb } else { 0 }, pool_page);
+        blocks_mtp.debug = debug;
+        Self {
+            sessions: SessionTable::new(),
+            blocks_m,
+            blocks_mtp,
+        }
+    }
+
     /// E5:取或建 + 格耗尽 LRU 逐出重试(提交与泵不相交,无活跃 turn,
     /// 全部存活会话皆可逐;块链归账房,格随 close 回收)。键控与
     /// ephemeral 两臂共用 —— ephemeral 流量为主的服务面,老键控会话

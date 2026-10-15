@@ -9,7 +9,10 @@
 
 use std::sync::Arc;
 
+use owl_iface::contract::DeviceClient;
 use owl_models::layers::rope::Rope;
+
+use crate::Result;
 
 /// E5-M2b:spec 模式三态(C7 回退挂钩)。裁决在 boot:
 /// depth>0 且检查点有 mtp.* → Mtp;dumb 诊断位 → Dumb(哑草稿 =
@@ -69,4 +72,119 @@ pub(crate) struct SpecRuntime {
     pub carry_ms: f32,
     /// B4 保鲜 ctx(pos;涨过 25% 即作废,换档后旧采样失真)
     pub carry_ctx: usize,
+}
+
+// ===========================================================================
+// spec 域装载(2026-10-15 拆分自 engine.rs run():模式裁决 + 草稿器
+// 装载 + 草稿 rope —— 引擎级 spec 事实的一次性收拢)
+// ===========================================================================
+
+/// spec 装载输入(boot 旋钮 + 检查点事实的显式快照;
+/// 引擎内部零隐式依赖 —— 全部经此传入)
+pub(crate) struct SpecBootInput<'a> {
+    /// 投机深度原始值(0 = 关)
+    pub(crate) depth_raw: usize,
+    /// DFlash2 草稿检查点目录(None = 无该族草稿器)
+    pub(crate) dflash2_dir: Option<&'a str>,
+    /// MTP 草稿检查点目录(检查点自带 mtp.* 时 Some)
+    pub(crate) mtp_dir: Option<&'a std::path::Path>,
+    /// 哑草稿诊断位(无真草稿器时的 Dumb 档)
+    pub(crate) dumb: bool,
+    /// 草稿池 e4m3(B6 偷显存;AL 有损需 A/B)
+    pub(crate) draft_kv_fp8: bool,
+    /// DFlash2 taps 退回 last_hidden(排查开关)
+    pub(crate) notaps: bool,
+}
+
+/// **E5-M2b/C7:spec 模式三态裁决** + 草稿器装载(草稿 embed/lm_head
+/// 均共享 target 不持有)+ DFlash2 草稿 rope(θ 1e7,rotary 全维 128;
+/// z-lab 检查点家族)。
+///
+/// 裁决律:depth>0 且 dflash2_dir → DFlash2;depth>0 且检查点有 mtp.*
+/// → Mtp;dumb 诊断位 → Dumb;否则 Off(spec_depth 归零,调度回落
+/// DecodeBatch —— 无草稿器不白发 verify 税)。深度上限:DFlash2 = 7
+/// (block_size 8 = 1 锚 + 7 草稿,检查点家族定形)/ 其余 = 3
+/// (kv_slots [u32;4] 契约)。
+pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
+    face: &mut D,
+    inp: SpecBootInput<'_>,
+) -> Result<SpecRuntime> {
+    let mode = if inp.depth_raw == 0 {
+        SpecMode::Off
+    } else if inp.dflash2_dir.is_some() {
+        SpecMode::DFlash2
+    } else if inp.mtp_dir.is_some() {
+        SpecMode::Mtp
+    } else if inp.dumb {
+        SpecMode::Dumb
+    } else {
+        owl_shared::log_info!("boot", "OWL_SPEC_DEPTH>0 但无草稿器(非 mtp/dflash2 检查点)→ C7 回落 DecodeBatch");
+        SpecMode::Off
+    };
+    let depth = if mode == SpecMode::Off {
+        0
+    } else if mode == SpecMode::DFlash2 {
+        inp.depth_raw.min(7)
+    } else {
+        inp.depth_raw.min(3)
+    };
+    if mode != SpecMode::Off {
+        owl_shared::log_info!("boot", "spec 模式 = {:?} depth={depth}(注:spec 轮恒 greedy,采样 parity 挂 D4 device accept)",
+            mode
+        );
+    }
+    // 草稿器装载(C7;embed/lm_head 均共享 target)
+    let drafter = match mode {
+        SpecMode::Mtp => {
+            let dir = inp.mtp_dir.expect("Mtp 模式必有 mtp_dir(上游模式裁决已守)");
+            let (mtp, _) = owl_models::specs::qwen35::load_27b_mtp(dir, face).await?;
+            owl_shared::log_info!("boot", "MTP 草稿头装载(spec depth={depth})");
+            Some(Drafter::Mtp(Arc::new(mtp)))
+        }
+        SpecMode::DFlash2 => {
+            let dir = inp.dflash2_dir.expect("DFlash2 模式必有 dflash2_dir(上游模式裁决已守)");
+            let t_draft = std::time::Instant::now();
+            let (d2, _) = owl_models::specs::qwen35::load_27b_dflash2(
+                std::path::Path::new(dir),
+                face,
+                inp.draft_kv_fp8,
+            )
+            .await?;
+            owl_shared::log_info!("boot", "DFlash2 草稿装载(depth={depth};1.92B BF16 激活,sglang 对齐) {:.2}s", t_draft.elapsed().as_secs_f32());
+            Some(Drafter::DFlash2(Arc::new(d2)))
+        }
+        _ => None,
+    };
+    // DFlash2 草稿 rope(θ 1e7;z-lab 检查点家族)
+    let draft_rope = match &drafter {
+        Some(Drafter::DFlash2(_)) => {
+            let dr = Rope::new(262_144, 128, 128, 1.0e7)?;
+            let ctx = owl_models::module::LoaderCtx {
+                dtype: owl_models::contract::Dtype::F16,
+                shard: 1,
+                device_repack: false,
+                verify: false,
+                debug_tap: false,
+            };
+            owl_models::interpreters::eval_load(&dr, face, &dr.tables(), &ctx).await?;
+            Some(Arc::new(dr))
+        }
+        _ => None,
+    };
+    // DFlash2 target taps 数(dflash 模式 = 5 层;notaps 退 last_hidden = 0)
+    let dflash_tap_count = if mode == SpecMode::DFlash2 && !inp.notaps { 5 } else { 0 };
+    Ok(SpecRuntime {
+        depth,
+        mode,
+        drafter,
+        draft_rope,
+        dflash_tap_count,
+        stats: SpecStats::default(),
+        mem_dumped: false,
+        mem_dumped2: false,
+        hid_dumped: false,
+        // B4 分母跨 turn 保鲜(初值 0 = 未采样,首窗口用保守兜底线)
+        carry_ms: 0.0,
+        carry_ctx: 0,
+    })
 }
