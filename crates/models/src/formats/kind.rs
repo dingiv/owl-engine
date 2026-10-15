@@ -1,0 +1,188 @@
+//! **起点格式探测**(`CheckpointKind`):从目录读出"这是什么检查点"。
+//!
+//! 装载器"解释器化"的**起点轴**(设计见
+//! `docs/arch/装载器-解释器化-设计与迁移.md` §2.2/§2.3):终点格式由模型文件
+//! 的 `Loadable::layout` 声明,起点格式由本模块**探测**得出 —— 装载动作
+//! 由 (起点原生 dtype/键面 × 目标 Want) 决定,**不由函数名决定**。
+//!
+//! 规矩:
+//! - **纯索引嗅探,零数据拷贝**(mmap 索引;`mmap::open_raw_index` 全 dtype 可读);
+//! - **命中即定,歧义/零命中 = 响亮拒**(禁静默猜格式);
+//! - 规则只认"键面 + 原生 dtype"两类事实,不认目录名/文件名。
+//!
+//! 三族签名(2026-10-16 本机检查点实测,facts 写死):
+//!
+//! | 族 | 判据 | 实测样本 |
+//! |---|---|---|
+//! | [`CheckpointKind::SafeTensors`] | 无量化后缀;全条目 dtype ∈ {F32, BF16, F16} | 0.8B 488 张(BF16+F32)· 4B-VL 738 张 · DFlash2 草稿 81 张(BF16) |
+//! | [`CheckpointKind::PackQuantized`] | `.weight_packed` ∧ `.weight_scale` 在场 | cyankiwi 27B AWQ-INT4 2396 张(399×3 后缀 + I64/I32/BF16) |
+//! | [`CheckpointKind::AwqGemm`] | `.qweight` ∧ `.scales` 在场(经典 AWQ 命名) | 仓内 `formats/awq.rs` 兼容族(本机暂无样本,规则留位) |
+
+use crate::contract::ModelError;
+use std::path::{Path, PathBuf};
+
+/// 起点格式族(装载器解释器化的"格式词表";新增格式 = 加一臂 + 嗅探规则)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointKind {
+    /// 裸 safetensors(F32/BF16/F16;f16 基线直转源)
+    SafeTensors,
+    /// compressed-tensors **pack-quantized**(`.weight_packed/.weight_scale/.weight_shape`;
+    /// W4A16/AWQ g32-asym 同族,按原点选源:w4a16.rs / awq.rs)
+    PackQuantized,
+    /// 经典 AWQ GEMM 命名(`.qweight/.scales/.zeros[/.g_idx]`)
+    AwqGemm,
+}
+
+/// 量化**方案**词表(config 实测分族;`quant_method` 不足以分族 —— 两者同为
+/// compressed-tensors,见 `load::quant_family`)
+pub type QuantScheme = &'static str;
+/// g32 + 非对称(+zp;cyankiwi AWQ-INT4 实测 group_size=32/symmetric=false/zp int8)
+pub const QUANT_G32_ASYM: QuantScheme = "g32-asym";
+/// g128 + 对称(llm-compressor W4A16 产物)
+pub const QUANT_G128_SYM: QuantScheme = "g128-sym";
+
+/// 探测结论(事实面:命中哪族 + 条目规模 + 原生 dtype 分布)
+#[derive(Debug, Clone)]
+pub struct Detection {
+    pub kind: CheckpointKind,
+    /// 参与索引的分片文件(`*.safetensors`,排序)
+    pub files: Vec<PathBuf>,
+    /// 条目数
+    pub entries: usize,
+    /// 原生 dtype 分布(物化标签 + 计数;`u32` = safetensors dtype)
+    pub dtypes: Vec<(String, usize)>,
+}
+
+impl Detection {
+    /// 原生 dtype 是否单一(装载决策常问;多 dtype = 逐条判定)
+    pub fn single_dtype(&self) -> Option<&str> {
+        match self.dtypes.as_slice() {
+            [(d, _)] => Some(d),
+            _ => None,
+        }
+    }
+}
+
+/// 探测目录的起点格式(唯一入口;`checkpoint` 无条件实现族)。
+pub fn detect(dir: &Path) -> Result<Detection, ModelError> {
+    // 文件清单(与 open_raw_index 同口径:字典序;分片键天然互斥)
+    let mut files: Vec<PathBuf> = owl_shared::file_loader::read_dir(dir)
+        .map_err(|e| ModelError::Msg(format!("detect: 读目录 {dir:?}: {e}")))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+        .collect();
+    files.sort();
+    let (_, raw) = crate::formats::mmap::open_raw_index(dir)?;
+    let entries = raw.len();
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for e in raw.values() {
+        let d = format!("{:?}", e.dtype);
+        match counts.iter_mut().find(|(k, _)| *k == d) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((d, 1)),
+        }
+    }
+    counts.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let has = |suffix: &str| raw.keys().any(|k| k.ends_with(suffix));
+    let (pack, awq) = (has(".weight_packed"), has(".qweight"));
+    // 伴随后缀必须成对在场(只有半套 = 结构残缺,响亮拒)
+    if pack != has(".weight_scale") {
+        return Err(ModelError::Msg(
+            "detect: pack-quantized 签名残缺(.weight_packed/.weight_scale 必须成对)".into(),
+        ));
+    }
+    if awq != has(".scales") {
+        return Err(ModelError::Msg(
+            "detect: AWQ 签名残缺(.qweight/.scales 必须成对)".into(),
+        ));
+    }
+    let kind = match (pack, awq) {
+        (true, true) => {
+            return Err(ModelError::Msg(
+                "detect: 量化签名歧义(pack-quantized 与 AWQ 命名同时在场;不许猜)".into(),
+            ))
+        }
+        (true, false) => CheckpointKind::PackQuantized,
+        (false, true) => CheckpointKind::AwqGemm,
+        (false, false) => {
+            // 裸源:条目 dtype 必须全在 f16 基线白名单内(量化族的 I32/I64 会在此露出原形)
+            let bad: Vec<&String> = raw
+                .iter()
+                .filter(|(_, e)| {
+                    !matches!(
+                        e.dtype,
+                        safetensors::Dtype::F32 | safetensors::Dtype::BF16 | safetensors::Dtype::F16
+                    )
+                })
+                .map(|(k, _)| k)
+                .collect();
+            if let Some(first) = bad.first() {
+                return Err(ModelError::Msg(format!(
+                    "detect: 无量化后缀但条目 dtype 非 f32/bf16/f16(首例 {first})—— 起点格式未覆盖"
+                )));
+            }
+            CheckpointKind::SafeTensors
+        }
+    };
+    Ok(Detection { kind, files, entries, dtypes: counts })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dir(env: &str, default: &str) -> Option<PathBuf> {
+        let p = PathBuf::from(std::env::var(env).unwrap_or_else(|_| default.to_string()));
+        p.is_dir().then_some(p)
+    }
+
+    /// 裸 safetensors 族(0.8B / 4B-VL / DFlash2 草稿三档实测)
+    #[test]
+    fn detects_safetensors_family() {
+        for (env, default, entries) in [
+            ("OWL_CKPT_0_8B", "/home/div/Documents/codes/models/Qwen/Qwen3.5-0.8B", 488),
+            ("OWL_CKPT_4B_VL", "/home/div/Documents/codes/models/Qwen/Qwen3.5-4B", 738),
+            (
+                "OWL_CKPT_DFLASH2",
+                "/home/div/Documents/codes/models/z-lab/Qwen3.8-27B-DFlash2",
+                81,
+            ),
+        ] {
+            let Some(d) = dir(env, default) else {
+                eprintln!("skip: {default} 不在({env} 可指路)");
+                continue;
+            };
+            let det = detect(&d).expect("detect");
+            assert_eq!(det.kind, CheckpointKind::SafeTensors, "{}", d.display());
+            assert_eq!(det.entries, entries, "{} 条目数", d.display());
+            assert!(!det.files.is_empty());
+        }
+    }
+
+    /// pack-quantized 族(cyankiwi 27B AWQ-INT4:399×3 量化后缀 + I32/I64/BF16 混存)
+    #[test]
+    fn detects_pack_quantized_family() {
+        let Some(d) = dir(
+            "OWL_CKPT_27B_AWQ",
+            "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4",
+        ) else {
+            eprintln!("skip: 27B AWQ 检查点不在");
+            return;
+        };
+        let det = detect(&d).expect("detect");
+        assert_eq!(det.kind, CheckpointKind::PackQuantized);
+        assert_eq!(det.entries, 2396);
+        assert!(det.single_dtype().is_none(), "混存 dtype(实测 I32/I64/BF16)");
+    }
+
+    /// 响亮拒:空目录 / 不存在的路径
+    #[test]
+    fn rejects_empty_dir() {
+        let tmp = std::env::temp_dir().join("owl_kind_empty_probe");
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        assert!(detect(&tmp).is_err(), "空目录必须响亮拒");
+        assert!(detect(&tmp.join("nope")).is_err());
+    }
+}

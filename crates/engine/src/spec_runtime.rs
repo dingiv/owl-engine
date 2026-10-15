@@ -137,19 +137,33 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
     let drafter = match mode {
         SpecMode::Mtp => {
             let dir = inp.mtp_dir.expect("Mtp 模式必有 mtp_dir(上游模式裁决已守)");
-            let (mtp, _) = owl_models::specs::qwen35::load_27b_mtp(dir, face).await?;
+            // 声明构造走起点事实(同一份 27B 检查点的 spec;报告已由主模型装载
+            // 路径上屏,此处不重报);装载走通用入口
+            let (spec, _rep) = owl_models::model::ModelSpec::from_ckpt(
+                std::path::Path::new(dir),
+                owl_models::formats::spec::SpecSource::family(
+                    &owl_models::formats::qwen35::qwen3_8_27b(),
+                ),
+            )?;
+            let mtp = owl_models::layers::mtp::MtpPredictor::from_spec(&spec);
+            let opts = owl_models::formats::load::LoadOpts::new(face, owl_models::contract::Dtype::F16);
+            owl_models::formats::load::load_from_dir(std::path::Path::new(dir), face, &mtp, opts).await?;
             owl_shared::log_info!("boot", "MTP 草稿头装载(spec depth={depth})");
             Some(Drafter::Mtp(Arc::new(mtp)))
         }
         SpecMode::DFlash2 => {
             let dir = inp.dflash2_dir.expect("DFlash2 模式必有 dflash2_dir(上游模式裁决已守)");
             let t_draft = std::time::Instant::now();
-            let (d2, _) = owl_models::specs::qwen35::load_27b_dflash2(
+            // 声明:草稿检查点自己的 config(组件档)+ 起点格式探测 → fc 臂;
+            // 装载走通用入口(BF16 全程;设备重排 = 能力自述裁决)
+            let d2 = owl_models::formats::qwen35::dflash2_draft(
                 std::path::Path::new(dir),
-                face,
                 inp.draft_kv_fp8,
-            )
-            .await?;
+            )?;
+            let opts = owl_models::formats::load::LoadOpts::new(face, owl_models::contract::Dtype::BF16);
+            let draft_manifest =
+                owl_models::formats::load::load_from_dir(std::path::Path::new(dir), face, &d2, opts).await?;
+            owl_models::formats::load::manifest_mem_ledger(&draft_manifest, "draft-mem");
             owl_shared::log_info!("boot", "DFlash2 草稿装载(depth={depth};1.92B BF16 激活,sglang 对齐) {:.2}s", t_draft.elapsed().as_secs_f32());
             Some(Drafter::DFlash2(Arc::new(d2)))
         }

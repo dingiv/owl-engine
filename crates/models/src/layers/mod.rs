@@ -20,21 +20,24 @@
 //! - [`decoder`]:M-d 批(DecoderLayer Full/Gdn 枚举 + 双残差)
 //!
 //! 主干(批 8)在 [`crate::model`](共有机制);Qwen3.5 预设在
-//! [`crate::specs::qwen35`]。
+//! [`crate::formats::qwen35`]。
 //!
 //! 未搬(试水通过后逐个立项,勿一把梭):
-//! vision ViT、MTP、chunked prefill、量化。
+//! vision ViT(进行中:`feat/vision-tower`;已落 [`layernorm`] 第一件)、MTP、chunked prefill、量化。
 
 pub mod attention;
 pub mod dflash2;
 pub mod decoder;
 pub mod embedding;
 pub mod gdn;
+pub mod layernorm;
 pub mod linear;
 pub mod mlp;
+pub mod mrope;
 pub mod mtp;
 pub mod rmsnorm;
 pub mod rope;
+pub mod vision;
 
 // ============================================================================
 // 层间共享 Kernel 帮手(声明构造;零状态)

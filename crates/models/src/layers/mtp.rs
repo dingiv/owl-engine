@@ -55,6 +55,19 @@ impl MtpPredictor {
         }
     }
 
+    /// **声明构造**(起点侧事实 → 声明):维度全从主模型 spec 取 ——
+    /// MTP 头与目标模型同维(hidden/inter/FA 头/eps),无自持常量。
+    pub fn from_spec(spec: &crate::model::ModelSpec) -> Self {
+        Self::new(
+            spec.hidden,
+            spec.inter,
+            spec.full_heads.0,
+            spec.full_heads.1,
+            spec.full_heads.2,
+            spec.eps,
+        )
+    }
+
     pub fn hidden(&self) -> usize {
         self.hidden
     }
@@ -323,7 +336,15 @@ mod tests {
 
         // ── device:装载 + fc_path ──
         let mut gpu = gpu_client().await;
-        let (mtp, manifest) = crate::specs::qwen35::load_27b_mtp(dir, &mut gpu)
+        // 声明构造走起点事实(同目录 27B spec);装载走通用入口
+        let (spec, _rep) = crate::model::ModelSpec::from_ckpt(
+            dir,
+            crate::formats::spec::SpecSource::family(&crate::formats::qwen35::qwen3_8_27b()),
+        )
+        .expect("27B spec(起点)");
+        let mtp = crate::layers::mtp::MtpPredictor::from_spec(&spec);
+        let opts = crate::formats::load::LoadOpts::new(&gpu, Dtype::F16);
+        let manifest = crate::formats::load::load_from_dir(dir, &mut gpu, &mtp, opts)
             .await
             .expect("MTP 头装载");
         assert_eq!(mtp.hidden(), hidden);

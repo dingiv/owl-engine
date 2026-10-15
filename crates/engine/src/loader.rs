@@ -14,9 +14,9 @@ use std::sync::Arc;
 use owl_iface::contract::{DeviceClient, ModelError};
 use owl_models::layers::rope::Rope;
 use owl_models::model::ModelSpec;
-use owl_models::specs::{
-    load_0_8b, load_0_8b_w4a16, load_27b_awq, load_tokenizer, qwen3_5_0_8b, qwen3_8_27b,
-};
+use owl_models::formats::load::{load_from_dir, LoadOpts};
+use owl_models::formats::spec::{SpecReport, SpecSource};
+use owl_models::formats::{load_tokenizer, qwen3_5_0_8b, qwen3_8_27b, Qwen35Convention};
 use owl_models::tokenizer::Tokenizer;
 use owl_models::model::Model;
 
@@ -46,13 +46,21 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         ModelLoader { face }
     }
 
-    /// Qwen3.5-0.8B(维度/键约定/分词器事实全在 specs/qwen35.rs 声明;
-    /// 未来 `load(dir)` 按 config.json 分发,挂账)
+    /// Qwen3.5-0.8B(维度/键基座从**检查点**读:config.json 优先 + 形状
+    /// 兜底;族预设只供 tokenizer 声明;装载走通用入口)
     // A3 同步隔离:引擎单线程模型;Arc 仅作共享句柄,不跨线程发送。
     #[allow(clippy::arc_with_non_send_sync)]
     pub async fn load_qwen35_0_8b(&mut self, dir: &Path) -> Result<LoadedModel> {
-        let spec = qwen3_5_0_8b();
-        let model = Arc::new(load_0_8b(dir, self.face).await?);
+        let (spec, rep) = ModelSpec::from_ckpt(dir, SpecSource::family(&qwen3_5_0_8b()))?;
+        log_spec_report("0.8B", &rep);
+        let model = Model::new(
+            &spec,
+            Qwen35Convention::new(convention_base(&rep)),
+            owl_models::module::QuantPlan::F16,
+            owl_models::module::QuantPlan::F16,
+        );
+        load_from_dir(dir, self.face, &model, LoadOpts::plain(spec.dtype)).await?;
+        let model = Arc::new(model);
         let tokenizer = load_tokenizer(dir, &spec.tokenizer)?;
         let rope = Rope::new(262_144, 256, 64, 10_000_000.0)?;
         let quant_plan = owl_models::module::QuantPlan::F16;
@@ -70,8 +78,17 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         dir: &Path,
         tokenizer_dir: &Path,
     ) -> Result<LoadedModel> {
-        let spec = qwen3_5_0_8b();
-        let model = Arc::new(load_0_8b_w4a16(dir, self.face).await?);
+        let (spec, rep) = ModelSpec::from_ckpt(dir, SpecSource::family(&qwen3_5_0_8b()))?;
+        log_spec_report("0.8B-W4A16", &rep);
+        let model = Model::new(
+            &spec,
+            Qwen35Convention::new(convention_base(&rep)),
+            owl_models::module::QuantPlan::W4A16,
+            owl_models::module::QuantPlan::F16,
+        );
+        // 设备重排 = 关(与历史一致:0.8B 走 CPU 两步重排,量小不值 GPU 往返)
+        load_from_dir(dir, self.face, &model, LoadOpts::plain(spec.dtype)).await?;
+        let model = Arc::new(model);
         let tokenizer = load_tokenizer(tokenizer_dir, &spec.tokenizer)?;
         let rope = Rope::new(262_144, 256, 64, 10_000_000.0)?;
         let quant_plan = owl_models::module::QuantPlan::W4A16;
@@ -93,13 +110,23 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         tokenizer_dir: &Path,
         head_plan: owl_models::module::QuantPlan,
     ) -> Result<LoadedModel> {
-        let spec = qwen3_8_27b();
         // metrics 装载分相(直用 API 恒开;装载一次性路径,release 有数据)
         let _ = owl_shared::metrics::init_metrics(owl_shared::metrics::MetricsStore::new());
         owl_shared::metrics::with_metrics_store(|s| {
             s.timer_begin("load.27b.total", file!(), line!());
         });
-        let model = Arc::new(load_27b_awq(dir, self.face, head_plan).await?);
+        let (spec, rep) = ModelSpec::from_ckpt(dir, SpecSource::family(&qwen3_8_27b()))?;
+        log_spec_report("27B-AWQ", &rep);
+        let model = Model::new(
+            &spec,
+            Qwen35Convention::new(convention_base(&rep)),
+            owl_models::module::QuantPlan::W4A16Awq,
+            head_plan,
+        );
+        // 旋钮:设备重排 = 能力自述裁决(RepackPath::resolve 唯一收口)
+        let opts = LoadOpts::new(self.face, spec.dtype);
+        load_from_dir(dir, self.face, &model, opts).await?;
+        let model = Arc::new(model);
         let tokenizer = load_tokenizer(tokenizer_dir, &spec.tokenizer)?;
         let rope = Rope::new(262_144, 256, 64, 10_000_000.0)?;
         let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1, device_repack: false, verify: false, debug_tap: false };
@@ -120,5 +147,25 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
             mtp_dir: Some(dir.to_path_buf()),
         })
 
+    }
+}
+
+/// 键基座 → 键约定基座(`keys_base` 是**字符串前缀**(带尾点),约定无尾点;
+/// 组件档空基座 = 原生命名直映,与 `Qwen35Convention::new("")` 同义)。
+fn convention_base(rep: &SpecReport) -> &str {
+    rep.keys_base.trim_end_matches('.')
+}
+
+/// 起点读取账(响亮:键基座 + config↔形状 失配逐条上屏;
+/// 静默采形状违背“不静默”律)
+fn log_spec_report(tag: &str, rep: &SpecReport) {
+    owl_shared::log_info!(
+        "boot",
+        "[spec] {tag}: keys_base={:?} 失配 {} 条",
+        rep.keys_base,
+        rep.mismatches.len()
+    );
+    for m in &rep.mismatches {
+        owl_shared::log_info!("boot", "[spec] {tag} · {m}");
     }
 }

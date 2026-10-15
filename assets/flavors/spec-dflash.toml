@@ -1,16 +1,4 @@
-# owl 引擎预设档 `spec-dflash`(2026-10-16 从 crates/shared/src/config.rs 下沉)
-# 原文注释:// 27B + DFlash2 真草稿生产档(2026-10-10 实测配方;24G 单卡贴顶):
-# decode 34.56@512(对照 perf-roadmap 首测 fp8 主池+d7 = 35.16,同口径
-# 吻合)、Captured 零降级、装配 16.6s。
-# 锁"必须成套":
-# - d7 + fp8 主池(perf-roadmap 首测口径);
-# - slots=1(单会话门;slots=8 的 GDN 格 = fixed_after 1.7G,
-# budget 直接负 → 池 0 → OOM,实测立案);
-# - capture_slab 用 hint 定量(**勿设固定档**:160MB × ~10 图族
-# = 1.6G,贴顶必死,实测立案);
-# - vram_target 0.99 + 钉池 4352(治理只做护栏,池由显式钉值定)。
-# 需配套:model.dir + model.dflash2_dir(检查点目录);
-# 建议 model.name 显式给(缺省应答名是 0.8b 的,health 会误导)。
+# owl 预设档 `spec-dflash`(2026-10-16 合并 main FALVORS 表;内容以 main 为准)
 [model]
 kind = "awq27b"
 # C1(2026-10-11):lm_head int4 装载期现场 RTN(marlin kU4);质量门
@@ -84,16 +72,30 @@ allowed_ops = [
 # 白名单同时含 **fp8 与 f16 两主池族**(2026-10-14 A5 补):`kv_fp8` 决定
 # 实际发射哪一族 —— f16 档不用再拿 `allowed_ops = []` 绕硬门。两族在池
 # 写集审计里按 (池名, dtype) 分组,各自闭环(R3 不撞)。
-# XQA verify 臂(2026-10-13 D3 **转正**):恒等门 3/3 稳定绿(spec ≡ 无 spec
-# 逐 token;fp8 池 + 27B + DFlash2),verify 纯时 65.2→31.2ms、8192 spec
-# decode 27.7→47.0 t/s(+70%,且首次反超同池裸档 36.4)。形状不匹配时层侧
-# 自动回落 v2 臂(graceful)。根因与修法见工单 §2.7(semaphores 走图输入槽,
-# 不用跨账本的 memset 命令)。
-verify_xqa = true
+# ── verify 注意力臂(2026-10-16 **换代**:FI+split 断点臂转正)──
+#
+# 旧:XQA verify 臂(2026-10-13 D3 转正;恒等门 3/3 绿)。它的问题在长 ctx:
+# ctx 依赖的 KV-split 全在核内,verify 图墙时随 ctx 线性涨(32k 轮时 69.3ms)。
+# 新:FI+split(核级实测 verify 形状 ≤0.3ms/发 vs XQA 1.54)但 FI 的 plan 依赖
+# ctx ⇒ 必须把核移出捕获图 ⇒ **piecewise(段+断点)** 承载:
+#   verify_piecewise = 段驱动件;verify_fi = 断点走 FI 核(四件套走输入槽,
+#   ctx_total 走宿主标量槽 —— 见 docs/piecewise-断点图-设计与实现.md §11.6)
+# 真机:32k 轮时 69.3 → **48.4ms(−30%)**,轮时对 ctx **变平**(8k 48.6/32k 48.4),
+# 文本/tok/hid 与基线逐位一致;prefill 不动。
+# ⚠️ decode(T=1)已于同日(V1c)同法换装:见下方 decode_xqa/decode_fi 段。
+verify_xqa = false
+verify_v2 = false
+verify_piecewise = true
+verify_fi = true
 # 裸 decode 走 XQA(2026-10-13 ②):第二份实例化 `M_TILESIZE=16`。
 # 注:短 ctx 收益略低(512 档 1.90× vs 2048 档 2.25×),但**不缺省加 ctx
 # 阈值门** —— 最小值也在 1.4× 以上,且阈值本身是额外的一支分支/形状面。
-decode_xqa = true
+decode_xqa = false
+# decode 走 **FI 断点**(V1c;session 常驻图改分段,断点挂 decode 核):
+# 裸 decode 阶梯 8192/32768 = 33.1/47.8 → **27.8/29.0 ms/tok(-16%/-39%,对 ctx 平坦)**,
+# 文本与 v2/XQA 逐位一致。⚠️ 曾踩:plan_session 少交断点采集面 ⇒ FI 核被烘进图 + plan 用
+# 占位 ctx_total=1 ⇒ 文本连贯但错(见状 §11.13)。
+decode_fi = true
 # GDN prefill 臂(2026-10-11 终版):fork-bf16 全家桶转正 —— g 语义律
 # 修复(kkt/h/o 必须吃 cumsum 而非 raw g;raw g 在深谷 -24 时
 # exp(±24)=e²⁴ 爆炸)。恒等门:四域 vs recurrence 逐位一致;std 矩阵

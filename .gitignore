@@ -24,3 +24,5 @@ crates/kernels/cu/flashinfer/*.o
 /*.toml
 
 docs/archive
+# perf 会话产物(2026-10-15):原始账太大、且是本地运行快照,不入库
+perf-runs/

@@ -46,6 +46,7 @@ pub mod ln;
 pub mod load;
 pub mod marlin;
 pub mod oracles;
+pub mod vis;
 pub mod xqa;
 
 /// 域表清单(每项 = 一个域的全部已建表算子;顺序 = 阅读序,无功能含义)
@@ -63,6 +64,7 @@ pub static TABLES: &[&[&KernelMeta]] = &[
     cublas::METAS,
     flashinfer::METAS,
     xqa::METAS,
+    vis::METAS,
 ];
 
 /// 全部已建表算子(迭代序 = [`TABLES`] 序)
@@ -650,6 +652,9 @@ mod tests {
             (crate::family::cublas::GEMM_BF16, &["a", "b", "out", "m", "k", "n", "nt"], &["BF16x2", "BF16x2", "BF16x2", "U64", "U64", "U64", "U64"]),
             (crate::family::flashinfer::PREFILL_FI_FP8KV, &["q", "k_cache", "v_cache", "q_cu", "indices", "indptr", "last_len", "wr", "out", "total_rows", "ctx_total", "t", "hq", "hkv", "hd", "page", "sm_scale_bits"], &["F16x2", "U32x1", "U32x1", "U32x1", "U32x1", "U32x1", "U32x1", "F16x1", "F16x2", "U64", "U64", "U64", "U64", "U64", "U64", "U64", "F32Bits"]),
             (crate::family::flashinfer::PREFILL_FI, &["q", "k_cache", "v_cache", "q_cu", "indices", "indptr", "last_len", "wr", "out", "total_rows", "ctx_total", "t", "hq", "hkv", "hd", "page", "sm_scale_bits"], &["F16x2", "F16x5", "F16x4", "U32x1", "U32x1", "U32x1", "U32x1", "F16x1", "F16x2", "U64", "U64", "U64", "U64", "U64", "U64", "U64", "F32Bits"]),
+            // 视觉塔注意力(ragged 非因果;2026-10-15):槽位与 native
+            // `vis::AttnFullF16` **逐字同构**(driver 按 dtype/图数在两臂间分流)
+            (crate::family::flashinfer::ATTN_RAGGED_F16, &["q", "k", "v", "cu_seqlens", "out", "rows", "heads", "head_dim", "n_seq", "scale"], &["F16x3", "F16x3", "F16x3", "F32x1", "F16x3", "U64", "U64", "U64", "I32", "F32"]),
             (crate::family::xqa::VERIFY_XQA, &["q", "k_cache", "v_cache", "page_table", "seq_lens", "mask", "semaphores", "scratch", "wr", "out", "q_seq_len", "hkv", "hd", "page", "max_seq_len", "q_scale_bits", "sm_count", "stride_page", "stride_token", "stride_head"], &["F16x2", "U32x1", "U32x1", "F32x2", "F32x2", "F32x0", "F32x2", "F16x1", "F16x0", "F16x2", "U64", "U64", "U64", "U64", "U64", "F32Bits", "U64", "U64", "U64", "U64"]),
             (crate::family::xqa::DECODE_XQA, &["q", "k_cache", "v_cache", "page_table", "seq_lens", "mask", "semaphores", "scratch", "wr", "out", "q_seq_len", "hkv", "hd", "page", "max_seq_len", "q_scale_bits", "sm_count", "stride_page", "stride_token", "stride_head"], &["F16x2", "U32x1", "U32x1", "F32x2", "F32x2", "F32x0", "F32x2", "F16x1", "F16x0", "F16x2", "U64", "U64", "U64", "U64", "U64", "F32Bits", "U64", "U64", "U64", "U64"]),
             // prefill 臂:与 verify/decode **同一张 PARAMS 表**(同资产同槽序;

@@ -378,6 +378,10 @@ fn build_xqa_assets(out_dir: &std::path::Path) -> Vec<(&'static str, PathBuf)> {
         "-DUSE_SM90_MHA=0",
         "-DGENERATE_CUBIN",
     ];
+    // ⚠️ M_TILESIZE=64 一档**不可行**(2026-10-15 实测):内核 `mha.cu:85`
+    //    `static_assert(nbValidRows <= 32u)` ⇒ verify 的 48 打包单元
+    //    (q=8 × headGrp 6)**结构上**必须分 2 个 token block ⇒ 同 kv head 的
+    //    KV 被读两遍是内核设计约束,不是几何选择。
     let specs: [(&'static str, &[&str]); 2] = [
         ("verify", &["-DSPEC_DEC=1"]),
         ("decode", &["-DSPEC_DEC=1", "-DM_TILESIZE=16"]),
@@ -760,10 +764,13 @@ fn build_flashinfer() {
         // **ABI 零改动**。
         let src_f16 = "cu/flashinfer/owl_fi_attention.cu";
         let src_fp8 = "cu/flashinfer/owl_fi_attention_fp8.cu";
+        // 视觉塔注意力(2026-10-15):**同仓 FlashInfer ragged 非因果臂**
+        // (复用 vendored FA2 家族核,零自研核;见该 .cu 头注)
+        let src_ragged = "cu/flashinfer/owl_fi_attn_ragged.cu";
         let src_hdr = "cu/flashinfer/owl_fi_attention_common.h";
         let fi_include = env::var("FLASHINFER_INCLUDE")
             .unwrap_or_else(|_| "cu/flashinfer/include".into());
-        for f in [src_f16, src_fp8, src_hdr] {
+        for f in [src_f16, src_fp8, src_ragged, src_hdr] {
             println!("cargo:rerun-if-changed={f}");
         }
         println!("cargo:rerun-if-changed={fi_include}");
@@ -779,8 +786,12 @@ fn build_flashinfer() {
         let flags = format!(
             "fi arch=sm_86 nvcc={nvcc_m} ar={ar} inc={fi_include} src=upstream-0.6.18 split=2tu"
         );
-        let mut deps: Vec<String> =
-            vec![src_f16.to_string(), src_fp8.to_string(), src_hdr.to_string()];
+        let mut deps: Vec<String> = vec![
+            src_f16.to_string(),
+            src_fp8.to_string(),
+            src_ragged.to_string(),
+            src_hdr.to_string(),
+        ];
         all_files(&fi_include, &mut deps);
         deps.sort();
         if !force && stamp_hit(&lib, &deps, &flags) {
@@ -792,7 +803,7 @@ fn build_flashinfer() {
             // (历史坑留档:旧预编 `.a` 带该宏、从源路径起初没带 ⇒ 链接期
             //  undefined symbol;换源后这类"配方不一致"面自然消失)
             let mut objs: Vec<PathBuf> = Vec::new();
-            for src in [src_f16, src_fp8] {
+            for src in [src_f16, src_fp8, src_ragged] {
                 let obj = fi_dir.join(format!(
                     "{}.o",
                     PathBuf::from(src).file_stem().unwrap().to_string_lossy()
@@ -816,7 +827,7 @@ fn build_flashinfer() {
             assert!(status.success(), "flashinfer: ar failed");
             stamp_write(&lib, &deps, &flags);
             println!(
-                "cargo:warning=owl-kernels: built libowl_flashinfer.a from source (in-tree headers, 2 TU)"
+                "cargo:warning=owl-kernels: built libowl_flashinfer.a from source (in-tree headers, 3 TU)"
             );
         }
         let cuda_lib = env::var("CUDA_HOME")

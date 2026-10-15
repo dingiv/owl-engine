@@ -157,6 +157,42 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "ops.mul" => ops::mul(dt),
         "ops.silu" => ops::silu(dt),
         "ops.rmsnorm" => ops::rmsnorm(dt, req.shapes),
+        // 视觉塔族(2026-10-15;网格 = 一行一块 ⇒ 需要 x 的行数)
+        "vis.layernorm" => vis::layernorm(
+            dt,
+            req.shapes.first().map(|s| s.first().copied().unwrap_or(0)).unwrap_or(0),
+        ),
+        "vis.gelu_tanh" => vis::gelu(dt, true),
+        "vis.gelu_erf" => vis::gelu(dt, false),
+        "vis.bias_add" => vis::bias_add(
+            dt,
+            req.shapes.first().map(|s| s.first().copied().unwrap_or(0)).unwrap_or(0),
+        ),
+        // 行数取 **idx 张量**(父序 = table, idx, wts)的 shapes[1][0]
+        "vis.pos_embed" => vis::pos_embed(
+            dt,
+            req.shapes.get(1).map(|s| s.first().copied().unwrap_or(0)).unwrap_or(0),
+        ),
+        // q 的 shapes[0] = [rows, heads, head_dim];标量槽 = [rows, heads, head_dim, n_seq]
+        // **两臂分流(2026-10-15 用户裁决:别自写算子)**:f16 + 单图 ⇒ 走
+        // vendored FlashInfer 的 ragged 非因果 prefill(FA2 家族,vLLM ViT 同路算法);
+        // 其余(f32 锚/多图)⇒ native 臂。
+        // 行数取 h 的 shapes[0] = [L, D](VLM 注入)
+        "vis.image_scatter" => vis::image_scatter(
+            dt,
+            req.shapes.first().map(|s| s.first().copied().unwrap_or(0)).unwrap_or(0),
+        ),
+        "vis.attn_full" => {
+            let q = req.shapes.first().cloned().unwrap_or_default();
+            let n_seq = req.scalars.get(3).copied().unwrap_or(1);
+            vis::attn_full(
+                dt,
+                q.first().copied().unwrap_or(0),
+                q.get(1).copied().unwrap_or(0),
+                q.get(2).copied().unwrap_or(0),
+                n_seq,
+            )
+        }
         "attn.k0_write" => attn::k0_write(dt, ax(0)),
         "attn.k0_write_fp8" => attn::k0_write_fp8(ax(0)), // B6.2:f16 入 → e4m3 池(ax=tokens)
         "attn.k0_write_knhd" => attn::k0_write_knhd(dt, ax(0)),
@@ -1332,6 +1368,121 @@ pub mod mlp {
                 block: (256, 1, 1),
                 smem: 0,
             },
+        }
+    }
+}
+
+// ============================================================================
+// §4.6 视觉塔族(Qwen3.5-VL ViT;2026-10-15 vision-tower 立项)
+// ============================================================================
+
+pub mod vis {
+    use super::{DType, KernelPick, Shape, SENTINEL_1D};
+
+    /// `layernorm`:x [rows, n] / weight [n] / bias [n] → out [rows, n]。
+    /// grid (rows,1,1);block 256;smem 256·4B(行内**两趟**归约:mean → var;
+    /// 与 torch.nn.LayerNorm 同序,不做 E[x²]−mean²)。
+    /// 标量槽序 = n(i32) / eps(f32)。
+    /// 设计:docs/arch/vision-tower-设计与CPU对拍.md §1.2 #5。
+    pub fn layernorm(dt: DType, rows: usize) -> KernelPick {
+        let name = match dt {
+            DType::F32 => "owl_layernorm_f32",
+            DType::F16 => "owl_layernorm_f16",
+            DType::BF16 => "owl_layernorm_bf16",
+            other => panic!("owl_layernorm 无 {other:?} 变体"),
+        };
+        KernelPick {
+            name,
+            shape: Shape { grid: (rows as u32, 1, 1), block: (256, 1, 1), smem: (256 * 4) as u32 },
+        }
+    }
+
+    /// `gelu`:逐元素一元(tanh 近似 / 精确 erf 两变体;哨兵 1D)
+    pub fn gelu(dt: DType, tanh: bool) -> KernelPick {
+        let name = match (tanh, dt) {
+            (true, DType::F32) => "owl_gelu_tanh_f32",
+            (true, DType::F16) => "owl_gelu_tanh_f16",
+            (true, DType::BF16) => "owl_gelu_tanh_bf16",
+            (false, DType::F32) => "owl_gelu_erf_f32",
+            (false, DType::F16) => "owl_gelu_erf_f16",
+            (false, DType::BF16) => "owl_gelu_erf_bf16",
+            (_, other) => panic!("owl_gelu 无 {other:?} 变体"),
+        };
+        KernelPick { name, shape: SENTINEL_1D }
+    }
+
+    /// `bias_add`:x [rows, cols] + bias [cols]。grid (rows,1,1);block 256。
+    pub fn bias_add(dt: DType, rows: usize) -> KernelPick {
+        let name = match dt {
+            DType::F32 => "owl_bias_add_f32",
+            DType::F16 => "owl_bias_add_f16",
+            DType::BF16 => "owl_bias_add_bf16",
+            other => panic!("owl_bias_add 无 {other:?} 变体"),
+        };
+        KernelPick {
+            name,
+            shape: Shape { grid: (rows as u32, 1, 1), block: (256, 1, 1), smem: 0 },
+        }
+    }
+
+    /// `pos_embed`:4-tap 重采样 [n, dim]。grid (n,1,1);block 256。
+    pub fn pos_embed(dt: DType, rows: usize) -> KernelPick {
+        let name = match dt {
+            DType::F32 => "owl_pos_embed_bilinear_f32",
+            DType::F16 => "owl_pos_embed_bilinear_f16",
+            other => panic!("owl_pos_embed_bilinear 无 {other:?} 变体(F32/F16 两臂)"),
+        };
+        KernelPick {
+            name,
+            shape: Shape { grid: (rows as u32, 1, 1), block: (256, 1, 1), smem: 0 },
+        }
+    }
+
+    /// `image_scatter`:VLM 图像 token 注入(out[t] = idx[t] ≥ 0 ? merged[idx[t]] : h[t])。
+    /// grid (rows,1,1);block 256(rows 取 **h** 的行数)。
+    pub fn image_scatter(dt: DType, rows: usize) -> KernelPick {
+        let name = match dt {
+            DType::F32 => "owl_image_scatter_f32",
+            DType::F16 => "owl_image_scatter_f16",
+            other => panic!("owl_image_scatter 无 {other:?} 变体(F32/F16 两臂)"),
+        };
+        KernelPick {
+            name,
+            shape: Shape { grid: (rows as u32, 1, 1), block: (256, 1, 1), smem: 0 },
+        }
+    }
+
+    /// `attn_full`:非因果 varlen(视觉塔)。
+    ///
+    /// **两臂(按 dtype + 图数分流;见 `resolve` 的 `vis.attn_full` 臂)**:
+    /// - f16 + 单图 ⇒ **FlashInfer ragged 非因果 prefill**(foreign 家族臂;
+    ///   grid/smem 由家族 runtime 自算 ⇒ `FOREIGN` 哨兵);
+    /// - 其余 ⇒ native(一 block 8 行 × 一头,块内共享 smem K/V tile;
+    ///   grid = (ceil(rows/8), heads),smem = 2·TILE(64)·head_dim·sizeof(T))。
+    pub fn attn_full(dt: DType, rows: usize, heads: usize, head_dim: usize, n_seq: i64) -> KernelPick {
+        // FI ragged 适配器只实例化 hd=64 ⇒ 条件里必须带上(否则静默按 64 维算)
+        if dt == DType::F16 && n_seq == 1 && head_dim == 64 {
+            return KernelPick {
+                name: crate::family::flashinfer::ATTN_RAGGED_F16,
+                shape: super::FOREIGN,
+            };
+        }
+        let elem = match dt {
+            DType::F32 => 4usize,
+            DType::F16 => 2usize,
+            other => panic!("owl_vis_attn_full 无 {other:?} 变体(F32/F16 两臂)"),
+        };
+        let name = match dt {
+            DType::F32 => "owl_vis_attn_full_f32",
+            DType::F16 => "owl_vis_attn_full_f16",
+            other => unreachable!("上面已拒"),
+        };
+        const TILE: usize = 64;
+        let smem = (2 * TILE * head_dim.max(1) * elem) as u32;
+        let row_blocks = rows.div_ceil(8).max(1) as u32;
+        KernelPick {
+            name,
+            shape: Shape { grid: (row_blocks, heads.max(1) as u32, 1), block: (256, 1, 1), smem },
         }
     }
 }

@@ -9,7 +9,7 @@
 //! - 本文件只住**共有机制**(主干结构/单树求值/序列 ctx 派生/C10
 //!   分组件装载/fixture 测试),零模型特定参数;
 //! - **模型特有**住 `specs/<model>.rs`(维度预设/层型表约定/检查点
-//!   特例,纯参数事实零机制)—— 现存 [`crate::specs::qwen35`];
+//!   特例,纯参数事实零机制)—— 现存 [`crate::formats::qwen35`];
 //! - 新模型 = 新 spec 文件;mixer 词汇超出 Full|Gdn(MoE/MLA/…)时
 //!   另立 DecoderLayer 扩展口(需求基线:arch 分发表不写死),不动主干。
 //!
@@ -131,6 +131,16 @@ impl Model {
         self.vocab
     }
 
+    /// VLM 图像 token 注入(embed 之后 / 层循环之前 —— 与 HF
+    /// `masked_scatter` 同位)。`ctx.vlm_image = None` ⇒ 原地返回
+    /// (零节点零开销;纯文本路径不受影响)。
+    fn vlm_inject(&self, xs: TensorOps, ctx: &ForwardCtx) -> TensorOps {
+        match ctx.vlm_image {
+            Some(inj) => xs.image_scatter(inj.merged, inj.idx).tag("vlm_image"),
+            None => xs,
+        }
+    }
+
 
     /// per-layer 子 ctx(整模 ctx → 单层 ctx;kvs/gdns 按混型游标取,
     /// Attention/Gdn 层读单引用零感知)
@@ -165,6 +175,10 @@ impl Model {
             attn_v2: ctx.attn_v2.clone(),
             v2_bt8: ctx.v2_bt8,
             xqa: ctx.xqa.clone(),
+            vlm_image: ctx.vlm_image,
+            vlm_rope: ctx.vlm_rope,
+            attn_break: ctx.attn_break.clone(),
+            attn_fi: ctx.attn_fi.clone(),
         }
     }
 
@@ -181,6 +195,7 @@ impl Model {
     ) -> (TensorOps, Vec<(String, TensorOps)>) {
         let mut nodes: Vec<(String, TensorOps)> = Vec::new();
         let mut xs = self.embed.forward(ids, ctx).tag("embed");
+        xs = self.vlm_inject(xs, ctx);
         nodes.push(("embed".into(), xs.clone()));
         let (mut kvi, mut gi) = (0usize, 0usize);
         for (li, layer) in self.layers.iter().enumerate() {
@@ -221,6 +236,7 @@ impl Model {
         // 的声明者;tag 是纯标注(同 id 不变,CSE memo 不受影响),是观测
         // 面 tap 曲线/golden 指纹的定位键。
         let mut xs = self.embed.forward(ids, ctx).tag("embed");
+        xs = self.vlm_inject(xs, ctx);
         // 刀D 取证:层间 clock64 时间戳(OWL_TS_PROBE;embed 后/每层后/
         // final_norm 后各一拍,回放后 dtoh ts_buf 读原生层间时间线)
         let ts = ctx.ts_buf.clone().filter(|_| ctx.env.diag.ts_probe);
@@ -264,6 +280,7 @@ impl Model {
     ) -> (TensorOps, Vec<TensorOps>) {
         let mut taps: Vec<Option<TensorOps>> = vec![None; tap_ids.len()];
         let mut xs = self.embed.forward(ids, ctx).tag("embed");
+        xs = self.vlm_inject(xs, ctx);
         let (mut kvi, mut gi) = (0usize, 0usize);
         for (li, layer) in self.layers.iter().enumerate() {
             let sub = self.layer_ctx(ctx, kvi, gi);
@@ -1017,4 +1034,5 @@ mod tests {
         }
         gpu.close().await.expect("关机");
     }
+
 }

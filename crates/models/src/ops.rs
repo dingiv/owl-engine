@@ -131,6 +131,27 @@ pub enum SemanticKernel {
     // ---- ln./mlp./load.* ----
     /// fused_add_rmsnorm:residual 原地 += mixed + rmsnorm·w(aux = [rows, n])
     FusedAddRmsnorm,
+    /// LayerNorm(affine;视觉塔专用):mean/var 两趟 + weight/bias。
+    /// 父 = x [rows,n] / weight [n] / bias [n];标量槽 = n(i32), eps(f32)
+    Layernorm,
+    /// GELU(tanh 近似;视觉塔 MLP)。标量槽 = n(sz)
+    GeluTanh,
+    /// GELU(精确 erf;**视觉塔 merger 专用**;与 tanh 版不可互替)
+    GeluErf,
+    /// 行广播加(x [rows,cols] + bias [cols];视觉塔每条 Linear 的 bias)
+    /// 标量槽 = cols(sz)
+    BiasAdd,
+    /// 位置嵌入 4-tap 重采样(out[n,d] = Σ_k wts[n,k]·table[idx[n,k],d];
+    /// 视觉塔 48² 网格 → 图网格)。父 = table / idx(f32 索引) / wts;
+    /// 标量槽 = n_taps(sz), dim(sz)
+    PosEmbedBilinear,
+    /// 非因果 varlen 全注意力(逐图;无 GQA;视觉塔 hd=72)。
+    /// 父 = q / k / v / cu_seqlens(f32 段界);
+    /// 标量槽 = rows(sz), heads(sz), head_dim(sz), n_seq(i32), scale(f32)
+    AttnFull,
+    /// VLM 图像 token 注入:out[t] = idx[t] ≥ 0 ? merged[idx[t]] : h[t](文本侧接线)
+    /// 父 = h [L,D] / merged [N,D] / idx [L](f32;负 = 保留 h);标量槽 = dim(sz)
+    ImageScatter,
     /// SwiGLU 门控 silu(g)⊙u(aux = [n])
     SiluAndMul,
     /// ct packed → marlin B 设备重排(U32;核签名形参即 rows/cols)
@@ -235,6 +256,13 @@ impl SemanticKernel {
             SemanticKernel::QkvNormRopeInsertKnhd => "attn.qkv_norm_rope_insert_knhd",
             SemanticKernel::QkvNormRopeInsertFp8kvKnhd => "attn.qkv_norm_rope_insert_fp8kv_knhd",
             SemanticKernel::FusedAddRmsnorm => "ln.fused_add_rmsnorm",
+            SemanticKernel::Layernorm => "vis.layernorm",
+            SemanticKernel::GeluTanh => "vis.gelu_tanh",
+            SemanticKernel::GeluErf => "vis.gelu_erf",
+            SemanticKernel::BiasAdd => "vis.bias_add",
+            SemanticKernel::PosEmbedBilinear => "vis.pos_embed",
+            SemanticKernel::AttnFull => "vis.attn_full",
+            SemanticKernel::ImageScatter => "vis.image_scatter",
             SemanticKernel::SiluAndMul => "mlp.silu_and_mul",
             SemanticKernel::CtRepack => "load.ct_repack",
             SemanticKernel::TsStamp => "ops.ts_stamp",

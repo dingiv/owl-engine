@@ -3,7 +3,7 @@
 //! **拆分律适用(§四 23)**:本模块只含**全模型共用机制**——编解码、
 //! eos 判定、chat 包装的执行形态;**家族特有事实**(eos 特殊 token 名、
 //! chat 格式串)由各 specs/<family>.rs 以参数注入(见
-//! `specs::qwen35::load_tokenizer`)。tokenizer.json 本身是每份模型快照
+//! `formats::qwen35::load_tokenizer`)。tokenizer.json 本身是每份模型快照
 //! 自带资产,与权重同目录加载。
 //!
 //! 挂账:serving 层读快照内 chat_template.jinja + minijinja 渲染,才是

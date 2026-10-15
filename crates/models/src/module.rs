@@ -72,6 +72,34 @@ pub struct FiPrefillCtx<'a> {
     pub last_len: &'a TensorOps,
 }
 
+/// VLM 图像 token 注入面(塔输出 + 行号表;`ctx` 显式依赖词表)
+#[derive(Clone, Copy)]
+pub struct ImageInject<'a> {
+    /// 塔输出 merged [N, D](D = 文本 hidden)
+    pub merged: &'a TensorOps,
+    /// 逐 token 行号 [L] f32:≥ 0 = 取 merged 行;负 = 文本位保留 embed
+    pub idx: &'a TensorOps,
+}
+
+/// VLM m-RoPE 表注入面([L, half] 行表;pos 通道须为行号 = arange(L))
+#[derive(Clone, Copy)]
+pub struct RopeTables<'a> {
+    pub cos: &'a TensorOps,
+    pub sin: &'a TensorOps,
+}
+
+/// **FI 断点面**(piecewise verify;`ctx.attn_fi` 在场 = 本树要把 FI 核移出图)。
+///
+/// 格子 = **宿主标量槽**:FI 的 plan key 含 `ctx_total`(每轮随 ctx 长),
+/// 烘死在节点里就只对一个 ctx 有效 ⇒ 引擎逐轮写这个 atomic,
+/// 驱动件在**回放期**把它补进核的契约槽(见 `interpreters::BreakDecl`)。
+/// 零设备流量、零 D2H。
+#[derive(Clone)]
+pub struct AttnFiBreak {
+    /// 每轮 `ctx_total`(= 本轮 kv 总长);引擎在 step 前写
+    pub ctx_total: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
 pub struct ForwardCtx<'a> {
     /// 本步 token 数(decode = 1;prefill = 块长)
     pub tokens: usize,
@@ -140,9 +168,25 @@ pub struct ForwardCtx<'a> {
     /// 依层序推入(每层 8:q/k/v raw → conv 重放;q_n/k_n/v_c/g/beta →
     /// 递推重放)。None = 零开销(生产 decode/prefill 不设)。
     pub gdn_tap: Option<std::rc::Rc<std::cell::RefCell<Vec<TensorOps>>>>,
+    /// VLM 图像 token 注入面(prefill 单块整发;`None` = 纯文本路径零开销)。
+    /// 与 `ts_buf`/`seq_cu` 同款"动态依赖经 ctx 显式传入"律 —— 塔输出
+    /// [N, D] 与行号表 [L](负 = 文本位保留 embed)由调用方给足。
+    pub vlm_image: Option<ImageInject<'a>>,
+    /// VLM m-RoPE 表注入面(prefill;`None` = 用 rope 层的静态 1D 表)。
+    /// 多模态序列表 = [L, half](host 由 `layers::mrope` 算好上传)。
+    pub vlm_rope: Option<RopeTables<'a>>,
     /// GDN 分派门控打印(EngineKnobs.probes.trace_gate 注入;显式依赖律,
     /// 原 OWL_TRACE_GATE 层内直读 —— 热路径零 env)
     pub trace_gate: bool,
+    /// **注意力核断点采集面**(piecewise 捕获图;形态同 `gdn_tap` ——
+    /// 层把**核节点**推进来,不是引擎去认识算子):注意力层在 FI/XQA 那个
+    /// `Call` 节点建好后推入。核 = 唯一「每轮按 ctx 重算 plan」的节点,故
+    /// piecewise 把它移出捕获图、在段间 eager 重放(设计见
+    /// `docs/piecewise-断点图-设计与实现.md`)。None = 非 piecewise
+    /// (一次 `is_some()` 判,热路径零开销)。
+    pub attn_break: Option<std::rc::Rc<std::cell::RefCell<Vec<crate::interpreters::BreakDecl>>>>,
+    /// **FI 断点面**(piecewise verify;None = 本树不换 FI 臂)
+    pub attn_fi: Option<AttnFiBreak>,
 }
 
 impl<'a> ForwardCtx<'a> {
@@ -173,6 +217,10 @@ impl<'a> ForwardCtx<'a> {
             v2_bt8: None,
             xqa: None,
             gdn_tap: None,
+            vlm_image: None,
+            vlm_rope: None,
+            attn_break: None,
+            attn_fi: None,
         }
     }
 
@@ -208,6 +256,10 @@ impl<'a> ForwardCtx<'a> {
             v2_bt8: None,
             xqa: None,
             gdn_tap: None,
+            vlm_image: None,
+            vlm_rope: None,
+            attn_break: None,
+            attn_fi: None,
         }
     }
 
@@ -238,6 +290,10 @@ impl<'a> ForwardCtx<'a> {
             v2_bt8: None,
             xqa: None,
             gdn_tap: None,
+            vlm_image: None,
+            vlm_rope: None,
+            attn_break: None,
+            attn_fi: None,
         }
     }
 
@@ -272,6 +328,10 @@ impl<'a> ForwardCtx<'a> {
             v2_bt8: None,
             xqa: None,
             gdn_tap: None,
+            vlm_image: None,
+            vlm_rope: None,
+            attn_break: None,
+            attn_fi: None,
         }
     }
 
@@ -309,6 +369,10 @@ impl<'a> ForwardCtx<'a> {
             v2_bt8: None,
             xqa: None,
             gdn_tap: None,
+            vlm_image: None,
+            vlm_rope: None,
+            attn_break: None,
+            attn_fi: None,
         }
     }
 
@@ -346,6 +410,10 @@ impl<'a> ForwardCtx<'a> {
             v2_bt8: None,
             xqa: None,
             gdn_tap: None,
+            vlm_image: None,
+            vlm_rope: None,
+            attn_break: None,
+            attn_fi: None,
         }
     }
 
@@ -391,7 +459,31 @@ impl<'a> ForwardCtx<'a> {
             v2_bt8: None,
             xqa: None,
             gdn_tap: None,
+            vlm_image: None,
+            vlm_rope: None,
+            attn_break: None,
+            attn_fi: None,
         }
+    }
+
+    /// 位置通道接管(VLM 行号表:pos[t] = t,真位置住 m-RoPE 表)
+    pub fn with_pos(mut self, pos: &'a TensorOps) -> Self {
+        self.pos = Some(pos);
+        self
+    }
+
+    /// VLM 注入面(prefill):图像 token 携带塔输出 merged + 行号表;本
+    /// 构建器只改自身字段,不做 I/O(自肃)。0.8B/纯文本路径不调 ⇒ 零开销。
+    pub fn with_vlm_image(mut self, merged: &'a TensorOps, idx: &'a TensorOps) -> Self {
+        self.vlm_image = Some(ImageInject { merged, idx });
+        self
+    }
+
+    /// VLM 注入面(prefill):m-RoPE 行表取代 rope 层静态 1D 表
+    /// (纯文本序列下两者逐元素同 ⇒ 退化零回归)
+    pub fn with_vlm_rope(mut self, cos: &'a TensorOps, sin: &'a TensorOps) -> Self {
+        self.vlm_rope = Some(RopeTables { cos, sin });
+        self
     }
 }
 
@@ -518,6 +610,26 @@ pub trait WeightSource {
 
     /// 键的元素数(错误归因用:缺键 vs 长度不符;默认 None = 未知)
     fn elem_len(&self, _key: &str) -> Option<usize> {
+        None
+    }
+
+    /// **源天然元素 dtype**(原始字节通道可用时;None = 无原始通道 ⇒
+    /// 走元素转换路径)。供"原始字节上卡 + 设备端转换"臂判定
+    /// (2026-10-16 装载提速:CPU 只 memcpy,转换挪到 GPU)。
+    fn native_dtype(&self, _key: &str) -> Option<Dtype> {
+        None
+    }
+
+    /// 原始字节区间直拷(零元素转换;`dst.len() ≥ len × 天然宽度`)。
+    /// 上卡后由设备 cast 核完成 dtype 转换 —— 本口只保证"字节原样"。
+    /// 默认 None = 不支持(调用方回退到 [`Self::convert_chunk_into_bytes`])。
+    fn copy_native_into(
+        &self,
+        _key: &str,
+        _offset_elems: usize,
+        _len: usize,
+        _dst: &mut [u8],
+    ) -> Option<()> {
         None
     }
 

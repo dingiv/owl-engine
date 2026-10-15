@@ -174,6 +174,59 @@ impl SafeTensorsSource {
 }
 
 impl WeightSource for SafeTensorsSource {
+    /// 天然 dtype(F32/BF16;合并虚拟键 = None —— 原始通道不做行拼接)
+    fn native_dtype(&self, key: &str) -> Option<crate::contract::Dtype> {
+        if self.merged_parts(key).is_some() {
+            return None;
+        }
+        let e = self.index.lock().unwrap().get(key).cloned()?;
+        match e.dtype {
+            safetensors::Dtype::F32 => Some(crate::contract::Dtype::F32),
+            safetensors::Dtype::BF16 => Some(crate::contract::Dtype::BF16),
+            _ => None,
+        }
+    }
+
+    /// 原始字节直拷(mmap → dst;**纯 memcpy,零元素转换**)。
+    /// 消费完 `madvise(DONTNEED)` 归还映射页(与 convert_range 同律)。
+    fn copy_native_into(
+        &self,
+        key: &str,
+        offset_elems: usize,
+        len: usize,
+        dst: &mut [u8],
+    ) -> Option<()> {
+        if self.merged_parts(key).is_some() {
+            return None;
+        }
+        let e = self.index.lock().unwrap().get(key).cloned()?;
+        let esz = e.esz();
+        let want = len * esz;
+        if (offset_elems + len) * esz > e.nbytes || dst.len() < want {
+            return None;
+        }
+        let s = e.start + offset_elems * esz;
+        let src = &self.maps[e.map_ix][s..s + want];
+        // **大块分线程 memcpy**(2026-10-16 装载提速:与 convert_range 同款
+        // 并行阈)—— 单线程 memcpy ~7GB/s = 9GB 权重 1.2s,四线程 ≈ 0.3s,
+        // 让 CPU 侧不再当墙(DMA 才是应然瓶颈)。
+        const PAR_THRESHOLD: usize = 8 << 20;
+        if want >= PAR_THRESHOLD {
+            let chunk = want.div_ceil(4);
+            let dst_slices: Vec<&mut [u8]> = dst[..want].chunks_mut(chunk).collect();
+            let src_slices: Vec<&[u8]> = src.chunks(chunk).collect();
+            std::thread::scope(|scope| {
+                for (d, s) in dst_slices.into_iter().zip(src_slices) {
+                    scope.spawn(move || d.copy_from_slice(s));
+                }
+            });
+        } else {
+            dst[..want].copy_from_slice(src);
+        }
+        self.maps[e.map_ix].dontneed(s, want);
+        Some(())
+    }
+
     fn elem_len(&self, key: &str) -> Option<usize> {
         if let Some((_, n1, _, n2)) = self.merged_parts(key) {
             return Some(n1 + n2);

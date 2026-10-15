@@ -9,6 +9,11 @@
 //! - **观测**:[`LoadTap`](装载域 Tap 律:只观测,零执行权 —— 键边界回调,
 //!   结构上不可能改变装载;OWL_LOAD_DEBUG 挂 StderrTap,见 §5)。
 //!
+//! **装载期暂存预算**(2026-10-16 收尾):一切设备暂存走 [`LoadStaging`]
+//! (声明驱动的固定 2 槽环,`OWL_LOAD_STAGING_MB` 上限,超槽键按段流式)
+//! —— 装载前一行账、装载后零驻留;禁逐键 alloc/free(27B AWQ 曾因此攒
+//! 下 12.15GB raw,把单卡 24G 撑爆在 layer48)。
+//!
 //! 数据单副本流动律:take_range / convert_chunk_into_bytes 查到才实体化,
 //! pinned 租约 move 进消息,DMA 直读,用毕即弃(主机驻留 = 在途份)。
 //!
@@ -18,7 +23,7 @@
 
 use crate::contract::{Dtype, DeviceClient, ModelError};
 use crate::module::{Layout, LoadEntry, LoadManifest, LoaderOps, WeightSource};
-use futures_util::future::join_all;
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -26,9 +31,147 @@ use std::time::{Duration, Instant};
 // §1 入口:eval_load(声明 → 求值 → 上载栅栏)
 // ============================================================================
 
-/// 装载并发度(桶数;每桶一束键组。GpuClient 的 faces = 同管道句柄克隆,
-/// server 单线程自然串行 —— 并发面只用于客户端转换/DMA 流水重叠)。
-const LOAD_WORKERS: usize = 4;
+/// **装载旋钮**(与模型无关;解释器化设计 §3 — 调用点不再拼 LoaderCtx)
+#[derive(Debug, Clone, Copy)]
+pub struct LoadOpts {
+    /// 目标 dtype(计算档事实;`None` = 由调用方/spec 决定,必给)
+    pub dtype: crate::contract::Dtype,
+    /// 设备重排(量化族;**已裁决结果**;`None` = 能力自述裁决)
+    pub device_repack: Option<bool>,
+    /// 装载校验(整块回读对账)
+    pub verify: bool,
+    /// 逐键分相探针(stderr)
+    pub debug_tap: bool,
+}
+
+impl LoadOpts {
+    /// 常规档:能力自述裁决 repack(生产入口调用点用它,别手拼 LoaderCtx)
+    pub fn new<D: DeviceClient>(face: &D, dtype: crate::contract::Dtype) -> Self {
+        Self {
+            dtype,
+            device_repack: Some(
+                crate::module::RepackPath::resolve(None, face.device_kernels()).is_device(),
+            ),
+            verify: false,
+            debug_tap: false,
+        }
+    }
+
+    /// 非量化/固定档(无设备重排 + 零探针):裸 safetensors f16 直拷、
+    /// W4A16-CPU 重排等"不需要能力裁决"的装载点。
+    pub fn plain(dtype: crate::contract::Dtype) -> Self {
+        Self { dtype, device_repack: Some(false), verify: false, debug_tap: false }
+    }
+
+    /// 装载 ctx(旋钮 → LoaderCtx;唯一产地)
+    pub fn ctx(&self) -> crate::module::LoaderCtx {
+        crate::module::LoaderCtx {
+            dtype: self.dtype,
+            shard: 1,
+            device_repack: self.device_repack.unwrap_or(false),
+            verify: self.verify,
+            debug_tap: self.debug_tap,
+        }
+    }
+}
+
+/// **通用装载入口**(解释器化 L2 第一段):`Loadable::layout` 声明 × 起点源
+/// ⇒ 物化。真正的"起点侧"通用化(按 [`CheckpointKind`] 自动开源)见
+/// [`load_from_dir`];本函数是纯加法(旧具名函数仍走 `eval_load`)。
+pub async fn load_component<T, D>(
+    face: &mut D,
+    comp: &T,
+    src: &dyn WeightSource,
+    opts: LoadOpts,
+) -> Result<crate::module::LoadManifest, ModelError>
+where
+    T: crate::module::Loadable,
+    D: DeviceClient,
+{
+    // `&dyn WeightSource`(trait 全程对象安全)⇒ 起点族可在同一条通用路上换源
+    eval_load(comp, face, src, &opts.ctx()).await
+}
+
+/// 量化**方案**判据:`config.json:quantization_config.config_groups.group_0.weights`
+/// 的 `(group_size, symmetric)` —— **不是 `quant_method`**(实测:cyankiwi
+/// AWQ-INT4 与 llm-compressor W4A16 产物**同为** `compressed-tensors`,
+/// 分族靠方案:g32-asym+zp ⇒ awq.rs;g128-sym ⇒ w4a16.rs)。
+///
+/// 纯读零猜测;未接方案**响亮拒**(带着实测到的 group_size/symmetric)。
+fn quant_family(dir: &Path) -> Result<crate::formats::kind::QuantScheme, ModelError> {
+    use crate::formats::kind::{QUANT_G32_ASYM, QUANT_G128_SYM};
+    let raw = owl_shared::file_loader::read(&dir.join("config.json"))
+        .map_err(|e| ModelError::Msg(format!("load_from_dir: 读 config.json: {e}")))?;
+    let v: serde_json::Value = serde_json::from_slice(&raw)
+        .map_err(|e| ModelError::Msg(format!("load_from_dir: config.json 解析: {e}")))?;
+    let w = v
+        .get("quantization_config")
+        .and_then(|q| q.get("config_groups"))
+        .and_then(|g| g.get("group_0"))
+        .and_then(|g| g.get("weights"))
+        .ok_or_else(|| {
+            ModelError::Msg(
+                "load_from_dir: 量化检查点缺 config_groups.group_0.weights(不许猜方案)".into(),
+            )
+        })?;
+    let group_size = w.get("group_size").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+    let symmetric = w.get("symmetric").and_then(|x| x.as_bool()).unwrap_or(false);
+    let num_bits = w.get("num_bits").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+    // 三轴同判:**位数也必须在位**(W8/FP8 家族与 W4 同 g128-sym ⇒ 只盯
+    // group_size/symmetric 会把 8bit 当 4bit 解,静默错值)
+    match (num_bits, group_size, symmetric) {
+        (4, 32, false) => Ok(QUANT_G32_ASYM),
+        (4, 128, true) => Ok(QUANT_G128_SYM),
+        _ => Err(ModelError::Msg(format!(
+            "load_from_dir: 量化方案 (num_bits={num_bits}, group_size={group_size}, symmetric={symmetric}) 未接源族(响亮拒)"
+        ))),
+    }
+}
+
+/// **起点开箱**:目录 → (探测格式, 源) —— 起点轴收口(设计 §2.2)。
+///
+/// 三族全接:
+/// - `SafeTensors` → [`SafeTensorsSource`];
+/// - `PackQuantized` / `AwqGemm` → 按 `quant_method` 选族
+///   (`compressed-tensors` → [`W4A16Source`];`awq` → [`AwqSource`];其余响亮拒)。
+pub async fn load_from_dir<T, D>(
+    dir: &Path,
+    face: &mut D,
+    comp: &T,
+    opts: LoadOpts,
+) -> Result<crate::module::LoadManifest, ModelError>
+where
+    T: crate::module::Loadable,
+    D: DeviceClient,
+{
+    use crate::formats::kind::CheckpointKind;
+    let det = crate::formats::kind::detect(dir)?;
+    match det.kind {
+        CheckpointKind::SafeTensors => {
+            let src = crate::formats::safetensors::SafeTensorsSource::open_dir(dir)?;
+            load_component(face, comp, &src, opts).await
+        }
+        CheckpointKind::PackQuantized | CheckpointKind::AwqGemm => {
+            match quant_family(dir)? {
+                crate::formats::kind::QUANT_G32_ASYM => {
+                    let src = crate::formats::awq::AwqSource::open_dir(dir)?;
+                    // 源侧重排模式注入(起点开箱的一环:量化大键的 marlin B
+                    // 由 CPU 还是 GPU repack 产出;**须在首键物化前**)
+                    src.set_device_repack(opts.device_repack.unwrap_or(false));
+                    load_component(face, comp, &src, opts).await
+                }
+                crate::formats::kind::QUANT_G128_SYM => {
+                    let src = crate::formats::w4a16::W4A16Source::open_dir(dir)?;
+                    src.set_device_repack(opts.device_repack.unwrap_or(false));
+                    load_component(face, comp, &src, opts).await
+                }
+                other => Err(ModelError::Msg(format!(
+                    "load_from_dir: 量化方案 {other} 未接源族(响亮拒,不许猜)"
+                ))),
+            }
+        }
+    }
+}
 
 /// 装载执行(层级入口):驱动层的 `Loadable::layout` 需求并物化。
 /// 解释器自己调用层钩子并为它传递 LoaderCtx —— 使用者只给层与源。
@@ -49,19 +192,12 @@ where
 {
     let want = layer.layout(ctx); // 声明:层产出需求清单(ctx 引用透传)
     let tap = if ctx.debug_tap { Some(std::sync::Mutex::new(Box::new(StderrTap) as Box<dyn LoadTap>)) } else { None }; // 观测:ctx.debug_tap 门控,缺省零开销
-    // 设备重排的原始块延迟回收清单(E2a 契约:回收前数据须已收割 ——
-    // repack 核异步读 raw,火后即 free 会踩;栅栏后统一回收)
-    let deferred: std::sync::Arc<Mutex<Vec<u64>>> = std::sync::Arc::default();
-    let manifest = eval_want(&want, face, src, tap.as_ref(), &deferred, ctx.verify).await?;
+    let manifest = eval_want(&want, face, src, tap.as_ref(), ctx.verify).await?;
     // 上载栅栏:全部 DMA 落定后方可进入计算域(upload_pinned 入队即回执,
     // 完成语义由本栅栏一次总代价兜底)
     face.sync().await?;
     // 装载校验(OWL_LOAD_VERIFY 门控):整块回读 vs staged 校验和
     verify_loaded(&manifest, face, ctx.verify).await?;
-    let ids = std::mem::take(&mut *deferred.lock().unwrap());
-    if !ids.is_empty() {
-        face.free(&ids).await?;
-    }
     Ok(manifest)
 }
 
@@ -69,25 +205,278 @@ where
 // §2 调度:键分组 + LPT 分桶 + 顺序/并发两路径
 // ============================================================================
 
-/// 需求清单求值:face 具备并发句柄且 Want 多于一条 → 分桶流水;否则顺序。
-type Deferred = std::sync::Arc<Mutex<Vec<u64>>>;
+// ============================================================================
+// §2 调度 + 装载暂存区(固定槽环;2026-10-16 收尾)
+// ============================================================================
+
+/// 暂存臂(槽的 dtype 与尺寸律;每臂一环形,按声明惰性开)
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) enum StageArm {
+    /// 设备 cast 臂的**输入**槽:原始 bf16 字节(2B/元素)
+    CastBf16In,
+    /// 设备 cast 臂的**分段输出**槽(超槽键流式用;F16)
+    CastF16Seg,
+    /// 设备重排臂的输入槽:源 packed u32(4B/元素)
+    RepackU32In,
+}
+
+impl StageArm {
+    fn dtype(self) -> Dtype {
+        match self {
+            StageArm::CastBf16In => Dtype::BF16,
+            StageArm::CastF16Seg => Dtype::F16,
+            StageArm::RepackU32In => Dtype::U32,
+        }
+    }
+    fn tag(self) -> &'static str {
+        match self {
+            StageArm::CastBf16In => "cast.bf16.in",
+            StageArm::CastF16Seg => "cast.f16.seg",
+            StageArm::RepackU32In => "repack.u32.in",
+        }
+    }
+}
+
+/// **装载暂存区**(装载期唯一设备暂存来源;固定预算)。
+///
+/// 病根(2026-10-16 收尾立案,实测账):原实现逐键 `alloc_uninit` + "两相
+/// 回收",而回收口只在 `LoadBatch::flush`(有待发 cast 时)与装载收尾 ——
+/// **纯量化检查点一条 cast 都没有** ⇒ 399 个 raw 块(27B AWQ = **12.15GB**)
+/// 全攒到装载结束 ⇒ 24G 单卡在 layer48 崩(报错那一下 40MB 只是最后一根
+/// 稻草)。改为:
+/// - **声明驱动尺寸**:装载开始扫一遍 `LoaderOps`,按臂算出"本档最大暂存键"
+///   ⇒ 槽 = `min(声明峰值, 上限)`(上限 = `OWL_LOAD_STAGING_MB`,0 = 不设)
+///   ⇒ 装载期暂存预算 = `2 × Σ槽`,**装载前可打印、可断言**(A5.1 静态证明);
+/// - **固定 2 槽环**:逐键借还,不再 alloc/free ⇒ churn 归零、峰值恒定;
+/// - **槽复用时序**:每键 `H2D(槽) → 栅栏 → launch(读槽)`;两次借同一槽之间
+///   必有上一键的栅栏(它已覆盖"消费者读毕")⇒ 无需额外栅栏(见 `acquire`
+///   注释),这是把原"两相回收"的正确性论证原样搬过来;
+/// - **超槽键流式**:单键 > 槽 ⇒ 按段搬(输入切片 + 小整块输出 + D2D 贴回),
+///   槽不随键长大(见 `load_direct_device_cast` 分段路)。
+pub(crate) struct LoadStaging {
+    rings: std::collections::BTreeMap<StageArm, SlotRing>,
+}
+
+struct SlotRing {
+    /// 槽规(plan 期定:min(声明峰值, 上限);0 = 本档不需要该臂)
+    slot_elems: usize,
+    /// 环实体(首借时开:2 块)
+    slots: Vec<Slot>,
+    next: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Slot {
+    id: u64,
+    elems: usize,
+}
+
+/// 计划账(一行上屏:声明峰值 → 槽规 = 装载期暂存预算的静态证明)
+pub(crate) struct StagingPlan {
+    per_arm: Vec<(StageArm, usize, usize)>,
+    cap_bytes: usize,
+}
+
+impl LoadStaging {
+    /// **声明扫描 → 槽规**(纯数据,零设备分配)
+    fn plan<S: WeightSource + ?Sized>(want: &LoaderOps, src: &S, cap_bytes: usize) -> (Self, StagingPlan) {
+        use std::collections::BTreeMap;
+        let mut peak: BTreeMap<StageArm, usize> = BTreeMap::new();
+        for w in want.wants() {
+            let n: usize = w.shape.iter().product();
+            let arm = match w.layout {
+                // 设备重排臂:源 packed 整键上卡(rows × cols u32)
+                Layout::DeviceRearrange { rows, cols, .. } => Some((StageArm::RepackU32In, rows * cols)),
+                // 设备 cast 臂:want F16 而源天然 BF16 ⇒ 原始字节上卡落槽
+                Layout::Direct if w.dtype == Dtype::F16 && src.native_dtype(&w.key) == Some(Dtype::BF16) => {
+                    Some((StageArm::CastBf16In, n))
+                }
+                _ => None,
+            };
+            if let Some((a, elems)) = arm {
+                let e = peak.entry(a).or_insert(0);
+                *e = (*e).max(elems);
+            }
+        }
+        // 分段输出槽与输入同元素数(超槽键流式用)
+        if let Some(e) = peak.get(&StageArm::CastBf16In).copied() {
+            peak.insert(StageArm::CastF16Seg, e);
+        }
+        let mut rings = BTreeMap::new();
+        let mut per_arm = Vec::new();
+        for (arm, declared) in &peak {
+            let cap_elems = if cap_bytes == 0 {
+                *declared
+            } else {
+                (cap_bytes / arm.dtype().size_bytes()).max(1)
+            };
+            let slot_elems = (*declared).min(cap_elems).max(1);
+            per_arm.push((*arm, *declared, slot_elems));
+            rings.insert(*arm, SlotRing { slot_elems, slots: Vec::new(), next: 0 });
+        }
+        let _ = cap_bytes;
+        (Self { rings }, StagingPlan { per_arm, cap_bytes })
+    }
+
+    /// 一行上屏(声明峰值 → 槽规;装载期暂存预算 = 2 × Σ槽)
+    fn log_plan(plan: &StagingPlan) {
+        let mut total = 0usize;
+        let mut rows = Vec::new();
+        for (arm, declared, slot) in &plan.per_arm {
+            let b = arm.dtype().size_bytes();
+            total += 2 * slot * b;
+            rows.push(format!(
+                "{}: 声明峰值 {:.1}MB → 槽 {:.1}MB ×2",
+                arm.tag(),
+                (*declared * b) as f64 / 1e6,
+                (*slot * b) as f64 / 1e6
+            ));
+        }
+        eprintln!(
+            "[load] 暂存区(固定预算):{};合计 {:.1}MB(上限 {})",
+            if rows.is_empty() { "(本档无暂存臂)".to_string() } else { rows.join(" | ") },
+            total as f64 / 1e6,
+            if plan.cap_bytes == 0 { "无(取声明峰值)".to_string() } else { format!("{}MB", plan.cap_bytes >> 20) }
+        );
+    }
+
+    /// 上限旋钮(唯一 env 读取点:**缺省 128MB** = 单键超此就流式;0 = 不设上限)
+    /// 缺省值的理由:128MB 是 CHUNK_BYTES(上传分块口径),槽=块 ⇒ 整键单发
+    /// 时不会多切一刀;而绝大多数键(27B AWQ 最大 44.6MB)都在槽内 ⇒ 常规路
+    /// 零额外栅栏,只有 embed/lm_head 这类巨键(0.5~2GB)走分段。
+    fn cap_from_env() -> usize {
+        owl_shared::env_reader::parse_or("OWL_LOAD_STAGING_MB", 128usize).max(1) << 20
+    }
+
+    /// 借槽(固定环轮转;首借开环 = 2 块 × 槽规)。
+    ///
+    /// **复用正确性**:每键的 `H2D(槽) → 栅栏 → launch(读槽)` 中那道栅栏
+    /// 是全流屏障 ⇒ 它同时覆盖"上一轮读本槽的消费者已读毕";由 2 槽轮转
+    /// 保证两次借同一槽之间至少隔了另一键的那道栅栏。返回 `None` = 本键
+    /// 超槽(调用方走流式;**禁静默截断**)。
+    async fn acquire<D: DeviceClient>(
+        &mut self,
+        face: &mut D,
+        arm: StageArm,
+        need: usize,
+    ) -> Result<Option<Slot>, ModelError> {
+        let Some(ring) = self.rings.get_mut(&arm) else {
+            return Ok(None);
+        };
+        if ring.slots.is_empty() {
+            for _ in 0..2 {
+                let id = face
+                    .alloc_uninit(arm.dtype(), ring.slot_elems)
+                    .await
+                    .map_err(|e| ModelError::Msg(format!("暂存区 {}: alloc {e}", arm.tag())))?
+                    .id;
+                ring.slots.push(Slot { id, elems: ring.slot_elems });
+            }
+        }
+        let slot = ring.slots[ring.next % ring.slots.len()];
+        ring.next = ring.next.wrapping_add(1);
+        if need > slot.elems {
+            return Ok(None);
+        }
+        Ok(Some(slot))
+    }
+
+    /// 本臂槽规(0 = 本档不需要该臂)
+    fn slot_elems(&self, arm: StageArm) -> usize {
+        self.rings.get(&arm).map(|r| r.slot_elems).unwrap_or(0)
+    }
+
+    /// **收尾:槽全数归还**(暂存只在装载期 —— 装载后零驻留;
+    /// 2026-10-16 实测教训:槽不还 = 常驻 2×Σ槽,4B e2e 第四图被挤 OOM)
+    async fn finish<D: DeviceClient>(&mut self, face: &mut D) -> Result<(), ModelError> {
+        face.sync().await?;
+        let ids: Vec<u64> = self
+            .rings
+            .values_mut()
+            .flat_map(|r| r.slots.drain(..).map(|s| s.id))
+            .collect();
+        if !ids.is_empty() {
+            face.free(&ids).await?;
+        }
+        Ok(())
+    }
+
+    /// 超槽文案(响亮:带臂/需求/槽规/旋钮)
+    fn over_cap_msg(arm: StageArm, need: usize, slot: usize) -> String {
+        let b = arm.dtype().size_bytes();
+        format!(
+            "暂存区 {}: 本键 {:.1}MB > 槽 {:.1}MB(固定预算;OWL_LOAD_STAGING_MB 可调;本臂流式未开)",
+            arm.tag(),
+            (need * b) as f64 / 1e6,
+            (slot * b) as f64 / 1e6
+        )
+    }
+}
+
+/// 设备端 bf16→f16 cast(语义拾取:driver::resolve;被动律同 DeviceRearrange)
+async fn launch_bf16_to_f16<D: DeviceClient>(
+    face: &mut D,
+    raw: u64,
+    out: &crate::contract::Bytes,
+    elems: usize,
+    key: &str,
+) -> Result<(), ModelError> {
+    use crate::contract::{Arg, Dtype, KernelSource, LaunchMsg};
+    let env = face
+        .op_env()
+        .ok_or_else(|| ModelError::Msg(format!("Weight '{key}': 设备 cast 需 GPU 环境")))?;
+    let op = crate::ops::SemanticKernel::CastBf16F16;
+    let pick = owl_kernels::driver::resolve(owl_kernels::driver::OpReq {
+        op: op.op_id(),
+        env: &env,
+        dt: owl_kernels::driver::DType::F16,
+        shapes: &[],
+        aux: &[],
+        scalars: &[],
+    });
+    let msg = LaunchMsg {
+        kernel: KernelSource {
+            name: pick.name.to_string(),
+            source: crate::kernel::source(pick.name).to_string(),
+        },
+        // 参数序 = elems.cast_bf16_f16 线契约:(x: BF16, n: i32, out: F16)
+        args: vec![
+            Arg::block(raw, Dtype::BF16, 1),
+            Arg::I32(
+                i32::try_from(elems)
+                    .map_err(|_| ModelError::Msg(format!("Weight '{key}': 元素数 {elems} 超 i32")))?,
+            ),
+            Arg::block(out.id, Dtype::F16, 1),
+        ],
+        // 哨兵展开(全零 grid = runtime 自持;native 路展开规则 =
+        // `models::ops::auto_grid` —— 手发 LaunchMsg 必须自己展开)
+        grid: if pick.shape.grid == (0, 0, 0) {
+            crate::ops::auto_grid(elems)
+        } else {
+            pick.shape.grid
+        },
+        block: pick.shape.block,
+        shared_mem: pick.shape.smem,
+        out_elems: elems,
+    };
+    face.launch(msg)
+        .await
+        .map_err(|e| ModelError::Msg(format!("Weight '{key}': cast launch {e}")))?;
+    Ok(())
+}
 
 async fn eval_want<D: DeviceClient, S: WeightSource + ?Sized>(
     want: &LoaderOps,
     face: &mut D,
     src: &S,
     tap: Option<&Mutex<Box<dyn LoadTap>>>,
-    deferred: &Deferred,
     verify: bool,
 ) -> Result<LoadManifest, ModelError> {
-    let handles = face.loader_faces(LOAD_WORKERS);
-    let manifest = match handles {
-        Some(handles) if handles.len() > 1 && want.wants().len() > 1 => {
-            eval_want_parallel(want, handles, src, tap, deferred, verify).await?
-        }
-        _ => eval_want_sequential(want, face, src, tap, deferred, verify).await?,
-    };
-    Ok(manifest)
+    // 单路径(2026-10-16 用户裁决:别用并行 DMA;实测并行桶 ≈1.2GB/s 反劣)
+    // 暂存区 = 声明驱动(装载前一行账;固定预算,2026-10-16 收尾)
+    let (mut staging, plan) = LoadStaging::plan(want, src, LoadStaging::cap_from_env());
+    LoadStaging::log_plan(&plan);
+    eval_want_sequential(want, face, src, tap, verify, &mut staging).await
 }
 
 /// 键分组:同键多 Want(tied 双槽 = w 直读 + w_t 转置读)原子成组,
@@ -107,75 +496,20 @@ fn key_groups<'a>(wants: &'a [crate::module::Want]) -> Vec<Vec<&'a crate::module
 }
 
 /// 顺序路径(CpuFace / 单 Want / 无并发能力)
-const DEFERRED_FREE_COUNT: usize = 16; // raw 滞留 16 块批量回收一次(~1-2GB)
-
 async fn eval_want_sequential<D: DeviceClient, S: WeightSource + ?Sized>(
     want: &LoaderOps,
     face: &mut D,
     src: &S,
     tap: Option<&Mutex<Box<dyn LoadTap>>>,
-    deferred: &Deferred,
     verify: bool,
+    staging: &mut LoadStaging,
 ) -> Result<LoadManifest, ModelError> {
     let mut manifest = LoadManifest::default();
     for group in key_groups(want.wants()) {
-        manifest.0.extend(load_group(face, &group, src, tap, deferred, verify).await?);
-        // 批量回收:滞留 raw 超阈值 → sync(COMPUTE 排空,E2a 契约)+ free
-        if deferred.lock().unwrap().len() >= DEFERRED_FREE_COUNT {
-            face.sync().await?;
-            let ids = std::mem::take(&mut *deferred.lock().unwrap());
-            if !ids.is_empty() {
-                face.free(&ids).await?;
-            }
-        }
+        manifest.0.extend(load_group(face, &group, src, tap, staging, verify).await?);
     }
+    staging.finish(face).await?; // 收尾栅栏 + 槽归还(装载后零驻留)
     Ok(manifest)
-}
-
-/// 并发流水(键组按字节 LPT 装给最轻桶;join_all 协作驱动):
-/// 桶 await DMA 期间,其他桶的取数/转换在同一线程推进 —— F5-4 定谳
-/// 转换已非墙,协作交错即可吃满 DMA,无需 OS 线程。
-/// 交付序无关(Want 各带各的 sink;分配无跨 Want 定序)。
-async fn eval_want_parallel<D: DeviceClient, S: WeightSource + ?Sized>(
-    want: &LoaderOps,
-    handles: Vec<D>,
-    src: &S,
-    tap: Option<&Mutex<Box<dyn LoadTap>>>,
-    deferred: &Deferred,
-    verify: bool,
-) -> Result<LoadManifest, ModelError> {
-    let mut groups = key_groups(want.wants());
-    groups.sort_by_key(|g| std::cmp::Reverse(g.iter().map(|w| want_bytes(w)).sum::<usize>()));
-    let k = handles.len().min(groups.len()).max(1);
-    let mut buckets: Vec<(D, Vec<Vec<&crate::module::Want>>, usize)> = handles
-        .into_iter()
-        .take(k)
-        .map(|f| (f, Vec::new(), 0usize))
-        .collect();
-    for g in groups {
-        let bytes: usize = g.iter().map(|w| want_bytes(w)).sum();
-        let b = buckets.iter_mut().min_by_key(|(_, _, total)| *total).unwrap();
-        b.1.push(g);
-        b.2 += bytes;
-    }
-    let futs = buckets.into_iter().map(|(mut face, bundles, _)| async move {
-        let mut entries = Vec::new();
-        for bundle in &bundles {
-            entries.extend(load_group(&mut face, bundle, src, tap, deferred, verify).await?);
-            // 批量回收(并行桶;sync 任一句柄 = 全设备排空)
-            if deferred.lock().unwrap().len() >= DEFERRED_FREE_COUNT {
-                face.sync().await?;
-                let ids = std::mem::take(&mut *deferred.lock().unwrap());
-                if !ids.is_empty() {
-                    face.free(&ids).await?;
-                }
-            }
-        }
-        Ok::<_, ModelError>(entries)
-    });
-    let results = join_all(futs).await;
-    let all = results.into_iter().collect::<Result<Vec<_>, _>>()?;
-    Ok(all.into_iter().flatten().collect())
 }
 
 // ============================================================================
@@ -191,7 +525,7 @@ async fn load_group<D: DeviceClient, S: WeightSource + ?Sized>(
     group: &[&crate::module::Want],
     src: &S,
     tap: Option<&Mutex<Box<dyn LoadTap>>>,
-    deferred: &Deferred,
+    staging: &mut LoadStaging,
     verify: bool,
 ) -> Result<Vec<LoadEntry>, ModelError> {
     let mut manifest = Vec::new();
@@ -199,9 +533,9 @@ async fn load_group<D: DeviceClient, S: WeightSource + ?Sized>(
         let n: usize = w.shape.iter().product();
         let entry = match w.layout {
             Layout::Transposed => load_transposed(face, w, src, n, tap, verify).await?,
-            Layout::Direct => load_direct(face, w, src, n, tap, verify).await?,
+            Layout::Direct => load_direct(face, w, src, n, tap, staging, verify).await?,
             Layout::DeviceRearrange { op, rows, cols } => {
-                load_device_rearrange(face, w, src, n, op, rows, cols, tap, deferred, verify).await?
+                load_device_rearrange(face, w, src, n, op, rows, cols, tap, staging, verify).await?
             }
         };
         w.sink.deliver(crate::contract::Bytes::new(
@@ -295,8 +629,20 @@ async fn load_direct<D: DeviceClient, S: WeightSource + ?Sized>(
     src: &S,
     n: usize,
     tap: Option<&Mutex<Box<dyn LoadTap>>>,
+    staging: &mut LoadStaging,
     verify: bool,
 ) -> Result<LoadEntry, ModelError> {
+    // **原始字节 + 设备端转换臂**(2026-10-16 装载提速):源天然 bf16、
+    // 目标 f16 ⇒ CPU 只做 memcpy(零元素转换),转换由设备 cast 核完成
+    // —— 实测 CPU 转换 bf16→f16 仅 ~2.2GB/s(debug),是全载最大单相。
+    // ⚠️ 设备转换臂是 **GPU-only**(要 BF16 设备块 + cast 核)⇒ 必须看面能力;
+    // CpuFace 的 alloc 只认 F32/F16(2026-10-16 由 L2 等价门当场抓出)
+    if face.device_kernels()
+        && w.dtype == crate::contract::Dtype::F16
+        && src.native_dtype(&w.key) == Some(crate::contract::Dtype::BF16)
+    {
+        return load_direct_device_cast(face, w, src, n, tap, staging, verify).await;
+    }
     let esz = w.dtype.size_bytes();
     let mut probe = KeyProbe::start(tap, &w.key, n * esz);
     let b = face
@@ -345,6 +691,150 @@ async fn load_direct<D: DeviceClient, S: WeightSource + ?Sized>(
     })
 }
 
+/// **原始字节 + 设备 cast 臂**(2026-10-16):CPU 只 memcpy,转换在 GPU。
+///
+/// 为什么:`load_direct` 的元素转换(mmap → F16C → pinned)在整载里是最大
+/// 单相(bf16→f16 实测 ~2.2GB/s debug;9G 权重 ⇒ 数秒),而 DMA 可达
+/// 5-9GB/s。本臂把元素转换换成"原始字节 memcpy + 设备 cast 核"(显存带宽
+/// 量级),CPU 侧只余一次 memcpy ⇒ CPU 与 DMA 都在 GB/s 级且可流水重叠。
+///
+/// 三件:
+/// 1. 原始块上卡(`Dtype::BF16`,元素数 = n ⇒ 字节数与 f16 目标等量);
+/// 2. 设备 cast 核(`SemanticKernel::CastBf16F16`)→ 目标 f16 块;
+/// 3. 原始块**延迟回收**(与 DeviceRearrange 同纪律:launch 异步读 raw,
+///    火后即 free 会踩 ⇒ 交**固定暂存区**(槽逐键借还,栅栏后复写)。
+///
+/// `verify` 校验和按**原始字节**计(raw 即数据真身;目标块 = 变换后,
+/// 与 staged 不可比 —— 与 DeviceRearrange 同款挂账)。
+async fn load_direct_device_cast<D: DeviceClient, S: WeightSource + ?Sized>(
+    face: &mut D,
+    w: &crate::module::Want,
+    src: &S,
+    n: usize,
+    tap: Option<&Mutex<Box<dyn LoadTap>>>,
+    staging: &mut LoadStaging,
+    verify: bool,
+) -> Result<LoadEntry, ModelError> {
+    let esz = Dtype::BF16.size_bytes();
+    let mut probe = KeyProbe::start(tap, &w.key, n * esz);
+    let mut csum = 0xcbf29ce484222325u64;
+    // 目标块(永久产物)
+    let b = face
+        .alloc(w.dtype, n)
+        .await
+        .map_err(|e| ModelError::Msg(format!("Weight '{}': {e}", w.key)))?;
+    let out_bytes = crate::contract::Bytes::new(b.id, n, w.dtype, w.shape.len() as u8);
+
+    match staging.acquire(face, StageArm::CastBf16In, n).await? {
+        // ① 整键入槽(常见路:键 ≤ 槽)
+        Some(slot) => {
+            upload_native_range(face, src, &w.key, 0, n, slot.id, &mut probe, verify, &mut csum).await?;
+            // 栅栏:H2D 落定 = cast 读槽的前提(DMA 与 COMPUTE 异流,禁想当然)
+            face.sync().await?;
+            {
+                let _s = probe.span("cast_enqueue");
+                launch_bf16_to_f16(face, slot.id, &out_bytes, n, &w.key).await?;
+            }
+        }
+        // ② **超槽键流式**:段 ≤ 槽;输入切片 → 段输出槽 → D2D 贴回目标块中段
+        //    (输出槽只接受整块 ⇒ 走"小整块 + copy_block_at"两跳,不碰内核契约)
+        None => {
+            let seg_cap = staging.slot_elems(StageArm::CastBf16In);
+            let in_slot = staging
+                .acquire(face, StageArm::CastBf16In, seg_cap)
+                .await?
+                .ok_or_else(|| ModelError::Msg(LoadStaging::over_cap_msg(StageArm::CastBf16In, seg_cap, staging.slot_elems(StageArm::CastBf16In))))?;
+            let seg_slot = staging
+                .acquire(face, StageArm::CastF16Seg, seg_cap)
+                .await?
+                .ok_or_else(|| ModelError::Msg(LoadStaging::over_cap_msg(StageArm::CastF16Seg, seg_cap, staging.slot_elems(StageArm::CastF16Seg))))?;
+            eprintln!(
+                "[load] 超槽键流式:{} {:.1}MB > 槽 {:.1}MB ⇒ {} 段",
+                w.key,
+                (n * esz) as f64 / 1e6,
+                (seg_cap * esz) as f64 / 1e6,
+                n.div_ceil(seg_cap)
+            );
+            let mut off = 0usize;
+            while off < n {
+                let seg = seg_cap.min(n - off);
+                upload_native_range(face, src, &w.key, off, seg, in_slot.id, &mut probe, verify, &mut csum).await?;
+                face.sync().await?; // H2D 落定(cast 读槽)
+                let seg_out = crate::contract::Bytes::new(seg_slot.id, seg, w.dtype, 1);
+                launch_bf16_to_f16(face, in_slot.id, &seg_out, seg, &w.key).await?;
+                face.sync().await?; // cast 读毕(段输出槽 / 下一段要复写输入槽)
+                face.copy_block_at(&seg_out, 0, &out_bytes, off * w.dtype.size_bytes(), seg * w.dtype.size_bytes())
+                    .await
+                    .map_err(|e| ModelError::Msg(format!("Weight '{}': 段贴回 {e}", w.key)))?;
+                face.sync().await?; // 贴回读毕(段输出槽下一段复写)
+                off += seg;
+            }
+        }
+    }
+    // 消费者读毕 ⇒ 槽可复用(下一键会再走 acquire 轮转)
+    face.sync().await?;
+    probe.done();
+    Ok(LoadEntry {
+        key: w.key.clone(),
+        dtype: w.dtype,
+        shape: w.shape.clone(),
+        layout: Layout::Direct,
+        block: out_bytes,
+        // 目标块 = 设备变换产物,与 staged(raw)不可比 ⇒ csum 挂 0
+        // (同 DeviceRearrange;深校验留专用通道)
+        csum: 0,
+    })
+}
+
+/// 原始字节分块上卡(源元素区间 `[src_off, src_off+len)` → 目标块**槽内**
+/// 首元素;≥64MB 自动分块 + 每 4 块/尾一次栅栏 —— cast 臂与重排臂共用的
+/// 上传口(槽是固定块,故目标偏移恒 0;流式的段偏移在源侧)。
+#[allow(clippy::too_many_arguments)]
+async fn upload_native_range<D: DeviceClient, S: WeightSource + ?Sized>(
+    face: &mut D,
+    src: &S,
+    key: &str,
+    src_off: usize,
+    len_total: usize,
+    dst: u64,
+    probe: &mut KeyProbe<'_>,
+    verify: bool,
+    csum: &mut u64,
+) -> Result<(), ModelError> {
+    let esz = Dtype::BF16.size_bytes();
+    let dst_bytes = crate::contract::Bytes::new(dst, len_total, Dtype::BF16, 1);
+    let chunk_elems = (CHUNK_BYTES / esz).max(1);
+    let mut off = 0usize;
+    while off < len_total {
+        let len = chunk_elems.min(len_total - off);
+        let mut lease = {
+            let _s = probe.span("pinned_alloc");
+            face.alloc_pinned(len * esz)
+                .await
+                .map_err(|e| ModelError::Msg(format!("Weight '{key}': {e}")))?
+        };
+        {
+            let _s = probe.span("raw_copy");
+            src.copy_native_into(key, src_off + off, len, lease.slice_bytes_mut())
+                .ok_or_else(|| attribution(src, key, src_off + len_total))?;
+        }
+        if verify {
+            *csum = fnv1a(&lease.slice_bytes_mut()[..len * esz], *csum);
+        }
+        {
+            let _s = probe.span("htod");
+            face.upload_pinned(lease, &dst_bytes, off * esz, len * esz)
+                .await
+                .map_err(|e| ModelError::Msg(format!("Weight '{key}': {e}")))?;
+        }
+        off += len;
+        if off.is_multiple_of(chunk_elems * 4) || off >= len_total {
+            face.sync().await?;
+        }
+    }
+    Ok(())
+}
+
 /// 设备重排臂(2026-10-01 AWQ 装载提速):源供**原始 packed** 字节
 /// (CPU 零重排)→ DMA 上卡 → registry 重排核就地生成 marlin 布局块
 /// → 原始块回收(Free 通道)。CPU 33s 重量排出热路径,重排在 GPU
@@ -359,7 +849,7 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
     rows: usize,
     cols: usize,
     tap: Option<&Mutex<Box<dyn LoadTap>>>,
-    _deferred: &Deferred,
+    staging: &mut LoadStaging,
     verify: bool,
 ) -> Result<LoadEntry, ModelError> {
     let raw_elems = rows * cols;
@@ -370,11 +860,20 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
         None
     };
 
-    // 1) 原始块上卡(经 pinned;raw > 128MB 自动分块循环)
-    let raw = face
-        .alloc_uninit(crate::contract::Dtype::U32, raw_elems)
-        .await
-        .map_err(|e| ModelError::Msg(format!("Weight '{}': raw alloc {e}", w.key)))?;
+    // 1) 原始块 = **固定槽**(借还;不再逐键 alloc/free —— 2026-10-16 收尾:
+    //    原实现把 raw 交给两相回收,而纯量化档一次 flush 都不发生 ⇒
+    //    27B AWQ 的 12.15GB raw 全攒到装载结束 = 单卡 24G OOM 根因)
+    let raw_slot = staging
+        .acquire(face, StageArm::RepackU32In, raw_elems)
+        .await?
+        .ok_or_else(|| {
+            ModelError::Msg(LoadStaging::over_cap_msg(
+                StageArm::RepackU32In,
+                raw_elems,
+                staging.slot_elems(StageArm::RepackU32In),
+            ))
+        })?;
+    let raw = crate::contract::Bytes::new(raw_slot.id, raw_elems, crate::contract::Dtype::U32, 2);
     {
         let chunk_elems = (CHUNK_BYTES / 4).max(1);
         let mut off = 0usize;
@@ -474,10 +973,8 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
             }
         }
     }
-    // 3) 原始块回收(E2a Free 通道;数据已进重排输出块)。尽力而为:
-    // 回收失败不阻断装载(后续 alloc 压力会暴露),显式丢弃 —— Result 全链
-    // 纪律下的明示弃置(2026-10-12 review I-7 案)
-    let _ = face.free(&[raw.id]).await;
+    // 3) 收位:一次栅栏(重排核读毕 ⇒ 槽可复用;目标块就绪)
+    face.sync().await?;
     probe.done();
     Ok(LoadEntry {
         key: w.key.clone(),
@@ -705,6 +1202,27 @@ impl Drop for SpanGuard<'_, '_> {
 // §6 杂项:归因 / 字节量
 // ============================================================================
 
+/// 装载分类账(dtype×layout 聚合:件数 + 字节)—— 组件档启动诊断用。
+/// 通用工具(零模型知识):草稿头/塔/头部的装载账都走它,免得各写一份。
+pub fn manifest_mem_ledger(manifest: &crate::module::LoadManifest, tag: &str) {
+    let mut agg: std::collections::BTreeMap<String, (u64, u64)> = Default::default();
+    for e in manifest.entries() {
+        let bytes: u64 = e.shape.iter().map(|&d| d as u64).product::<u64>()
+            * match e.dtype {
+                Dtype::F16 | Dtype::BF16 => 2,
+                Dtype::F32 | Dtype::U32 => 4,
+                Dtype::U8 => 1,
+            };
+        let key = format!("{:?}/{:?}", e.dtype, e.layout);
+        let e2 = agg.entry(key).or_insert((0, 0));
+        e2.0 += 1;
+        e2.1 += bytes;
+    }
+    for (k, (n, b)) in agg {
+        eprintln!("[{tag}] {k}: {n} 项 {b} ({:.2} GB)", b as f64 / 1e9);
+    }
+}
+
 /// 装载取数失败归因:键不在 = 缺键;在但长度不符 = 元素数错误
 fn attribution<S: WeightSource + ?Sized>(src: &S, key: &str, n: usize) -> ModelError {
     match src.elem_len(key) {
@@ -715,7 +1233,192 @@ fn attribution<S: WeightSource + ?Sized>(src: &S, key: &str, n: usize) -> ModelE
     }
 }
 
-/// Want 的目标字节量(元素数 × dtype 宽;LPT 分桶权重)
-fn want_bytes(w: &crate::module::Want) -> usize {
-    w.shape.iter().product::<usize>() * w.dtype.size_bytes()
+#[cfg(test)]
+mod generic_entry_tests {
+    use super::*;
+    use crate::formats::qwen35::{qwen3_5_0_8b, Qwen35Convention};
+
+    /// **起点开箱不改清单门**(L2 等价门;**L4 后对照臂 = 手拼 eval_load**,
+    /// 旧具名装载函数已删):`load_from_dir`(起点探测 + 开源 + 求值)与
+    /// "同一声明直接 `eval_load`"产出**同一份清单**(键/dtype/形状逐条相等)。
+    /// CPU face 即可(与 `cpu_real_weights_load` 同档),无需 GPU 门。
+    #[tokio::test]
+    async fn generic_entry_open_preserves_manifest() {
+        let dir = crate::testkit::manifest_dir().join("assets/Qwen3.5-0.8B");
+        if !dir.is_dir() {
+            eprintln!("skip: {} 不在(模型库软链)", dir.display());
+            return;
+        }
+        let spec = qwen3_5_0_8b();
+        let mk = || {
+            crate::model::Model::new(
+                &spec,
+                Qwen35Convention::new("model.language_model"),
+                crate::module::QuantPlan::F16,
+                crate::module::QuantPlan::F16,
+            )
+        };
+        let mut face = owl_cpu::CpuFace::new();
+        let opts = LoadOpts {
+            dtype: spec.dtype,
+            device_repack: Some(false),
+            verify: false,
+            debug_tap: false,
+        };
+
+        // 对照臂:同一声明 + 同一源,直接 eval_load(不经起点探测/开箱)
+        let src = crate::formats::safetensors::SafeTensorsSource::open_dir(&dir).expect("源开箱");
+        let old = eval_load(&mk(), &mut face, &src, &opts.ctx()).await.expect("eval_load");
+
+        // 新路(起点探测 + 通用入口)
+        let new = load_from_dir(&dir, &mut face, &mk(), opts)
+            .await
+            .expect("load_from_dir");
+
+        let norm = |m: &LoadManifest| {
+            let mut v: Vec<(String, String, Vec<usize>)> = m
+                .entries()
+                .iter()
+                .map(|e| (e.key.clone(), format!("{:?}", e.dtype), e.shape.clone()))
+                .collect();
+            v.sort();
+            v
+        };
+        let (a, b) = (norm(&old), norm(&new));
+        assert_eq!(a.len(), b.len(), "清单条目数");
+        assert_eq!(a, b, "键/dtype/形状逐条相等");
+        eprintln!("[L2] 通用入口 ≡ 具名装载:{} 条逐项相等 ✓", a.len());
+    }
+
+    /// **新模型零代码门**(解释器化设计 §6 = 立案判据):model 库里**代码从未
+    /// 见过**的档(Qwen3.5-9B:32 层 3:1 hybrid / hidden 4096)—— 不改一行
+    /// .rs:起点探测([`detect`](crate::formats::kind::detect))→ 维度事实
+    /// (`from_ckpt`)→ 通用入口(`load_from_dir`)全链数据驱动。
+    ///
+    /// 默认只跑起点侧(探测 + spec,秒级);`OWL_NEW_CKPT_LOAD=1` 追加
+    /// **CPU face 整装**(9B f16 ≈18GB host —— GPU 门不参与:换 GPU 验装
+    /// 是另一个门的事)。
+    #[tokio::test]
+    async fn unseen_size_loads_without_code() {
+        let dir = std::path::PathBuf::from(
+            std::env::var("OWL_NEW_CKPT")
+                .unwrap_or_else(|_| "/home/div/Documents/codes/models/Qwen/Qwen3.5-9B".into()),
+        );
+        if !dir.is_dir() {
+            eprintln!("skip: 新档检查点不在({};OWL_NEW_CKPT 可指路)", dir.display());
+            return;
+        }
+        // ① 起点探测(纯索引嗅探)
+        let det = crate::formats::kind::detect(&dir).expect("detect(新档)");
+        // ② 维度事实(族预设只供 tokenizer/dtype 两项非维度事实)
+        let preset = qwen3_5_0_8b();
+        let (spec, rep) = crate::model::ModelSpec::from_ckpt(
+            &dir,
+            crate::formats::spec::SpecSource::family(&preset),
+        )
+        .expect("from_ckpt(新档)");
+        eprintln!(
+            "[new-ckpt] kind={:?} keys_base={:?} hidden={} inter={} layers={} full={:?} gdn={:?} vocab={} tied={} 失配={:?}",
+            det.kind,
+            rep.keys_base,
+            spec.hidden,
+            spec.inter,
+            spec.layer_types.len(),
+            spec.full_heads,
+            spec.gdn_heads,
+            spec.vocab,
+            spec.tied,
+            rep.mismatches
+        );
+        assert_eq!(det.kind, crate::formats::kind::CheckpointKind::SafeTensors);
+        assert!(
+            !rep.keys_base.is_empty() && rep.keys_base.ends_with('.'),
+            "键基座应由索引实测定位"
+        );
+        assert!(rep.mismatches.is_empty(), "config↔形状应一致: {:?}", rep.mismatches);
+        assert!(spec.layer_types.len() >= 8, "层数应成规模");
+        for (i, full) in spec.layer_types.iter().enumerate() {
+            assert_eq!(*full, i % 4 == 3, "层 {i} 层型不符 3:1 周期");
+        }
+        assert_eq!(spec.full_heads.0 * spec.full_heads.2 % spec.hidden, 0, "FA 头维守恒");
+        if std::env::var("OWL_NEW_CKPT_LOAD").ok().as_deref() != Some("1") {
+            eprintln!("[new-ckpt] 起点侧全绿(整装门 OWL_NEW_CKPT_LOAD=1 开启)");
+            return;
+        }
+        // ③ 通用入口整装(CPU face;9B f16 ≈18GB host)
+        let model = crate::model::Model::new(
+            &spec,
+            Qwen35Convention::new(rep.keys_base.trim_end_matches('.')),
+            crate::module::QuantPlan::F16,
+            crate::module::QuantPlan::F16,
+        );
+        let mut face = owl_cpu::CpuFace::new();
+        let t0 = std::time::Instant::now();
+        let manifest = load_from_dir(&dir, &mut face, &model, LoadOpts::plain(spec.dtype))
+            .await
+            .expect("整装(新档)");
+        eprintln!(
+            "[new-ckpt] 整装 {} 项 @ {:?}",
+            manifest.entries().len(),
+            t0.elapsed()
+        );
+        assert!(manifest.entries().len() > 300, "清单条目数应成规模");
+    }
+
+    /// **量化族通用入口**:27B AWQ 经 `load_from_dir` 与 `AwqSource` 直开同清单
+    /// (门控真检查点存在;CPU face 不开设备重排 ⇒ `device_repack = Some(false)`)
+    #[tokio::test]
+    async fn generic_entry_covers_quantized_family() {
+        let dir = std::path::PathBuf::from(
+            std::env::var("OWL_CKPT_27B_AWQ")
+                .unwrap_or_else(|_| "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4".into()),
+        );
+        if !dir.is_dir() {
+            eprintln!("skip: 27B AWQ 检查点不在");
+            return;
+        }
+        // AWQ 源产 U32 marlin 块 ⇒ **必须 GPU face**(CpuFace 只认 F32/F16);
+        // 且 27B AWQ 整装 ≈10G+ ⇒ 需 ≥24G 卡(20G 实测 layer40 OOM)。
+        // 独立门 `OWL_L2_AWQ=1`(本机跑法:`OWL_L2_AWQ=1 OWL_TEST_DEVICE=<3090>`)。
+        if std::env::var("OWL_L2_AWQ").ok().as_deref() != Some("1") {
+            eprintln!("skip: OWL_L2_AWQ=1 未开(27B AWQ 整装需 ≥24G 卡)");
+            return;
+        }
+        if !crate::testkit::gpu_enabled() {
+            crate::testkit::skip_note();
+            return;
+        }
+        let spec = crate::formats::qwen35::qwen3_8_27b();
+        let mk = || {
+            crate::model::Model::new(
+                &spec,
+                Qwen35Convention::new("model.language_model"),
+                crate::module::QuantPlan::W4A16,
+                crate::module::QuantPlan::F16,
+            )
+        };
+        let mut face = crate::testkit::gpu_client().await;
+        let opts = LoadOpts {
+            dtype: crate::contract::Dtype::F16,
+            device_repack: Some(true), // 生产档(设备 marlin 重排)
+            verify: false,
+            debug_tap: false,
+        };
+        let src = crate::formats::awq::AwqSource::open_dir(&dir).expect("awq 源");
+        let old = eval_load(&mk(), &mut face, &src, &opts.ctx()).await.expect("eval_load(awq)");
+        let new = load_from_dir(&dir, &mut face, &mk(), opts).await.expect("load_from_dir(awq)");
+        let norm = |m: &LoadManifest| {
+            let mut v: Vec<(String, String, Vec<usize>)> = m
+                .entries()
+                .iter()
+                .map(|e| (e.key.clone(), format!("{:?}", e.dtype), e.shape.clone()))
+                .collect();
+            v.sort();
+            v
+        };
+        let (a, b) = (norm(&old), norm(&new));
+        assert_eq!(a.len(), b.len(), "量化族清单条目数");
+        assert_eq!(a, b, "量化族键/dtype/形状逐条相等");
+        eprintln!("[L2] 量化族通用入口 ≡ AwqSource 直开:{} 条逐项相等 ✓", a.len());
+    }
 }

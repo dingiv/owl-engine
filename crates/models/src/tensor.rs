@@ -163,6 +163,20 @@ impl TensorOps {
         self.id
     }
 
+    /// **标量槽数**(宿主标量槽下标校验用;槽序权威 = `KernelSpec::PARAMS`)
+    pub fn n_scalar_args(&self) -> usize {
+        self.args.len()
+    }
+
+    /// **操作数只读视图**(归约所需的全部输入;叶子为空)。
+    ///
+    /// 为什么要有:分段/重排计划器需要"这个节点的输入是什么"来**推导段根**
+    /// (`piecewise` 的每段根 = 下一个断点的操作数)—— 那是计划面的事,
+    /// 不该让计划器去摸内部字段。克隆是浅的(Arc 共享父节点)。
+    pub fn operands(&self) -> Vec<TensorOps> {
+        self.parents.iter().map(|p| (**p).clone()).collect()
+    }
+
     /// 语义坐标(观测面;None = 未打标)
     pub fn label(&self) -> Option<&str> {
         self.label.as_deref()
@@ -470,6 +484,192 @@ impl TensorOps {
         )
     }
 
+    /// LayerNorm(affine;**视觉塔专用**):y = (x−mean)·rsqrt(var+eps)·w + b。
+    /// 父序 = x [rows,n] / weight [n] / bias [n](与 PARAMS 同序);
+    /// 标量槽序 = n(i32) / eps(f32)。
+    /// 形状律:n 由 weight 定,x 行数 = total/n(任意前导维折叠),bias 同宽。
+    pub fn layernorm(&self, weight: &TensorOps, bias: &TensorOps, eps: f32) -> TensorOps {
+        let n: usize = weight.shape.iter().product();
+        if let Some(e) = self.shape_rule(weight, "layernorm", |a, b| {
+            let cols: usize = b.iter().product();
+            let total: usize = a.iter().product();
+            cols > 0 && total.is_multiple_of(cols)
+        }) {
+            return self.poisoned_local(e);
+        }
+        let bn: usize = bias.shape.iter().product();
+        if bn != n {
+            return self.poisoned_local(LazyError {
+                at_depth: self.depth + 1,
+                detail: format!("layernorm: bias 宽 {bn} ≠ weight 宽 {n}"),
+            });
+        }
+        let meta = (self.dtype, self.shape.clone());
+        self.join(
+            Op::Call { op: SemanticKernel::Layernorm, aux: vec![] },
+            Some(weight),
+            meta,
+            vec![KernelArg::I32(n as i32), KernelArg::F32(eps)],
+        )
+        .arg(bias)
+    }
+
+    /// GELU(tanh 近似;视觉塔 MLP)。逐元素一元;标量槽 = n(sz)。
+    pub fn gelu_tanh(&self) -> TensorOps {
+        let n: usize = self.shape.iter().product();
+        let meta = (self.dtype, self.shape.clone());
+        self.join(
+            Op::Call { op: SemanticKernel::GeluTanh, aux: vec![] },
+            None,
+            meta,
+            vec![KernelArg::Bits(n as u64)],
+        )
+    }
+
+    /// GELU(精确 erf;视觉塔 merger)。与 [`Self::gelu_tanh`] **不可互替**。
+    pub fn gelu_erf(&self) -> TensorOps {
+        let n: usize = self.shape.iter().product();
+        let meta = (self.dtype, self.shape.clone());
+        self.join(
+            Op::Call { op: SemanticKernel::GeluErf, aux: vec![] },
+            None,
+            meta,
+            vec![KernelArg::Bits(n as u64)],
+        )
+    }
+
+    /// 行广播加:x [rows, cols] + bias [cols](视觉塔每条 Linear 的 bias)。
+    /// 形状律:bias 宽 = x 末维,且 x 行数 = total/cols。标量槽 = cols(sz)。
+    pub fn bias_add(&self, bias: &TensorOps) -> TensorOps {
+        let cols: usize = bias.shape.iter().product();
+        if let Some(e) = self.shape_rule(bias, "bias_add", |a, b| {
+            let bc: usize = b.iter().product();
+            a.last().copied().unwrap_or(0) == bc && bc > 0
+        }) {
+            return self.poisoned_local(e);
+        }
+        let meta = (self.dtype, self.shape.clone());
+        self.join(
+            Op::Call { op: SemanticKernel::BiasAdd, aux: vec![] },
+            Some(bias),
+            meta,
+            vec![KernelArg::Bits(cols as u64)],
+        )
+    }
+
+    /// VLM 图像 token 注入(self = h [L, D];`merged` = 塔输出 [N, D];`idx` [L] f32)。
+    ///
+    /// `idx[t] ≥ 0` ⇒ 取 `merged[idx[t]]`;`idx[t] < 0` ⇒ 保留 `h[t]`
+    /// (文本 token)。**响亮拒绝**:末维不齐 / 行号非有限或越出 N。
+    /// 标量槽 = dim(sz);父序 = h / merged / idx(**构造序** —— idx 在末位,与
+    /// `vis.pos_embed` 的 table/idx/wts 同款“索引量殿后”惯例)。
+    pub fn image_scatter(&self, merged: &TensorOps, idx: &TensorOps) -> TensorOps {
+        let dim = self.shape.last().copied().unwrap_or(0);
+        if dim == 0 || self.shape.len() != 2 || merged.shape.len() != 2 {
+            return self.poisoned_local(LazyError {
+                at_depth: self.depth + 1,
+                detail: format!("image_scatter: h {:?} / merged {:?} 需为 2 维且末维非零", self.shape, merged.shape),
+            });
+        }
+        if merged.shape[1] != dim {
+            return self.poisoned_local(LazyError {
+                at_depth: self.depth + 1,
+                detail: format!("image_scatter: merged 宽 {:?} ≠ h 宽 {dim}", merged.shape),
+            });
+        }
+        let rows: usize = self.shape.first().copied().unwrap_or(0);
+        if idx.shape.iter().product::<usize>() != rows {
+            return self.poisoned_local(LazyError {
+                at_depth: self.depth + 1,
+                detail: format!("image_scatter: idx 长 {:?} ≠ h 行数 {rows}", idx.shape),
+            });
+        }
+        let meta = (self.dtype, self.shape.clone());
+        self.join(
+            Op::Call { op: SemanticKernel::ImageScatter, aux: vec![] },
+            Some(merged),
+            meta,
+            vec![KernelArg::Bits(dim as u64)],
+        )
+        .arg(idx)
+    }
+
+    /// 位置嵌入 4-tap 重采样(self = table [n_pos, dim];idx/wts [n, n_taps] 恒 f32)。
+    /// 形状律:idx 与 wts 同形;idx 末维 = taps;table 末维 = dim。
+    /// 标量槽 = n_taps(sz), dim(sz);父序 = table / idx / wts。
+    pub fn pos_embed_bilinear(&self, idx: &TensorOps, wts: &TensorOps) -> TensorOps {
+        if idx.shape != wts.shape {
+            return self.poisoned_local(LazyError {
+                at_depth: self.depth + 1,
+                detail: format!("pos_embed: idx 形状 {:?} ≠ wts 形状 {:?}", idx.shape, wts.shape),
+            });
+        }
+        let dim = self.shape.last().copied().unwrap_or(0);
+        let taps = idx.shape.last().copied().unwrap_or(0);
+        if dim == 0 || taps == 0 {
+            return self.poisoned_local(LazyError {
+                at_depth: self.depth + 1,
+                detail: format!("pos_embed: dim/taps 为 0(table {dim}, idx {taps})"),
+            });
+        }
+        let rows: usize = idx.shape.first().copied().unwrap_or(0);
+        let meta = (self.dtype, vec![rows, dim]);
+        self.join(
+            Op::Call { op: SemanticKernel::PosEmbedBilinear, aux: vec![] },
+            Some(idx),
+            meta,
+            vec![KernelArg::Bits(taps as u64), KernelArg::Bits(dim as u64)],
+        )
+        .arg(wts)
+    }
+
+    /// 非因果 varlen 全注意力(self = q [rows, heads, dim];k/v 同 hkv 头;cu f32 段界)。
+    /// 形状律:q/k/v 末维一致、头数一致(k 与 v 同形);cu 长度 = n_seq+1。
+    /// 标量槽 = rows(sz), heads(sz), head_dim(sz), n_seq(i32), scale(f32)。
+    pub fn attn_full(
+        &self,
+        k: &TensorOps,
+        v: &TensorOps,
+        cu: &TensorOps,
+        n_seq: usize,
+        scale: f32,
+    ) -> TensorOps {
+        let q = self.shape.clone();
+        if q.len() != 3 || k.shape.len() != 3 || v.shape != k.shape {
+            return self.poisoned_local(LazyError {
+                at_depth: self.depth + 1,
+                detail: format!("attn_full: q {:?} / k {:?} / v {:?} 形状不符(需 3 维且 k==v)", q, k.shape, v.shape),
+            });
+        }
+        if q[1] != k.shape[1] || q[2] != k.shape[2] {
+            return self.poisoned_local(LazyError {
+                at_depth: self.depth + 1,
+                detail: format!("attn_full: q 头数/维度 {:?} ≠ k {:?}(本核无 GQA)", q, k.shape),
+            });
+        }
+        if cu.shape.iter().product::<usize>() != n_seq + 1 {
+            return self.poisoned_local(LazyError {
+                at_depth: self.depth + 1,
+                detail: format!("attn_full: cu_seqlens 长 {:?} ≠ n_seq+1 = {}", cu.shape, n_seq + 1),
+            });
+        }
+        let meta = (self.dtype, q.clone());
+        self.join(
+            Op::Call { op: SemanticKernel::AttnFull, aux: vec![] },
+            Some(k),
+            meta,
+            vec![
+                KernelArg::Bits(q[0] as u64),
+                KernelArg::Bits(q[1] as u64),
+                KernelArg::Bits(q[2] as u64),
+                KernelArg::I32(n_seq as i32),
+                KernelArg::F32(scale),
+            ],
+        )
+        .arg(v)
+        .arg(cu)
+    }
+
     // ======================================================================
     // 参数槽(Kernel 节点;按序入包)
     // ======================================================================
@@ -504,6 +704,24 @@ impl TensorOps {
         let mut out = self;
         out.args.push(KernelArg::I32(v));
         out
+    }
+
+    /// **标量槽改写**(拷贝语义:同父/同 op/同形状,**新 id**)。
+    ///
+    /// 用途(piecewise 宿主标量槽;见 `docs/piecewise-断点图-设计与实现.md`):
+    /// 断点核里那些"每轮会变的宿主标量"(FI 的 `ctx_total` = plan key)
+    /// 不能在捕获期烘死 ⇒ 回放期由驱动件按**契约下标**把本轮值补进来,
+    /// 再送出窗外求值。id 换新 = memo/覆盖按新节点记账,旧条目不参与。
+    ///
+    /// `idx` 越界 = 上游违约(调用点先校验):返回 `None`,不静默自吞。
+    pub fn with_arg_bits(self, idx: usize, bits: u64) -> Option<TensorOps> {
+        if idx >= self.args.len() {
+            return None;
+        }
+        let mut out = self;
+        out.args[idx] = KernelArg::Bits(bits);
+        out.id = next_id();
+        Some(out)
     }
 
     pub fn arg_bool(self, v: bool) -> TensorOps {
@@ -652,6 +870,35 @@ mod tests {
             let want = 1.0 / (1.0 + (-v).exp());
             assert!((g - want).abs() < 1e-6, "{g} vs {want}");
         }
+    }
+
+    /// 宿主标量槽的载体:`with_arg_bits` = 拷贝 + 换一个标量槽 + **新 id**
+    /// (piecewise 回放期每轮补值;旧 id 由调用方摘账)
+    #[test]
+    fn with_arg_bits_patches_one_slot_and_refreshes_id() {
+        let x = TensorOps::zeros(Dtype::F32, vec![2]);
+        let n = TensorOps::call(crate::ops::SemanticKernel::Concat)
+            .arg(&x)
+            .arg_usize(7)
+            .arg_usize(9)
+            .with_shape(Dtype::F32, vec![2]);
+        let old_id = n.id();
+        assert_eq!(n.n_scalar_args(), 2);
+
+        let p = n.clone().with_arg_bits(1, 42).expect("槽 1 存在");
+        assert_ne!(p.id(), old_id, "补丁 = 新节点 id(memo/覆盖按新节点记账)");
+        assert_eq!(p.n_scalar_args(), 2);
+        assert_eq!(p.shape(), n.shape());
+        // 除被补的那一槽,节点其余部分逐位沿用(操作数 id / 形状 / 槽数)
+        assert_eq!(
+            p.operands().iter().map(|o| o.id()).collect::<Vec<_>>(),
+            n.operands().iter().map(|o| o.id()).collect::<Vec<_>>(),
+            "补丁只动标量槽:操作数(依赖边)逐位沿用"
+        );
+
+        // 越界 = 上游违约:结构化 None(调用点 plan 期拒捕),不静默自吞
+        assert!(n.clone().with_arg_bits(2, 1).is_none());
+        assert!(x.clone().with_arg_bits(0, 1).is_none(), "叶子无标量槽");
     }
 
     #[test]

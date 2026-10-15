@@ -85,6 +85,18 @@ impl Rope {
         (self.cos.decl(), self.sin.decl())
     }
 
+    /// 表源(注意力接线唯一入口):**ctx 注入优先**(VLM m-RoPE 行表),
+    /// 否则用层内静态 1D 表([max_pos, half],pos 选行)。
+    ///
+    /// 纯文本序列下两者逐元素同(见 `layers::mrope` 的 `text_only_table_
+    /// equals_1d_rope`)⇒ 注入不改文本语义;注入表的行号契约 = pos[t] = t。
+    pub(crate) fn cos_sin_of(&self, ctx: &crate::module::ForwardCtx<'_>) -> (TensorOps, TensorOps) {
+        match ctx.vlm_rope {
+            Some(t) => (t.cos.clone(), t.sin.clone()),
+            None => self.cos_sin_decl(),
+        }
+    }
+
     /// rotary half(= rotary_dim / 2;配对 (i, i+half))
     pub(crate) fn rotary_half(&self) -> usize {
         self.rotary_dim / 2

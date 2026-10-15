@@ -139,7 +139,19 @@ pub struct FiRuntime {
     last_capturing: bool,
     /// 入表序号发生器(容量治理)
     stamp: u64,
+    /// 视觉塔 ragged 臂的 plan 缓存(2026-10-15;键 = (rows, heads, head_dim))
+    plan_ragged: Option<(RaggedKey, [i64; 15])>,
+    /// 视觉塔 ragged 的**规范 int32 段界**([0, rows];plan 期写一次,回放期只读)
+    ragged_cu: Option<ScratchBuf>,
 }
+/// 视觉塔 ragged plan 键(单图契约 ⇒ 三件即可)
+#[derive(Clone, Copy, PartialEq)]
+struct RaggedKey {
+    rows: usize,
+    heads: usize,
+    head_dim: usize,
+}
+
 
 /// plan 条目表容量软上限(超过就驱逐**非图归属**的最旧条目)
 const PLAN_ENTRIES_SOFT_MAX: usize = 32;
@@ -212,8 +224,7 @@ impl FiRuntime {
             );
         }
         Ok(())
-    }
-}
+    }}
 
 impl Default for FiRuntime {
     fn default() -> Self {
@@ -224,7 +235,8 @@ impl Default for FiRuntime {
             plans: HashMap::new(),
             active: None,
             last_capturing: false,
-            stamp: 0,
+            stamp: 0,plan_ragged: None,
+            ragged_cu: None,
         }
     }
 }
@@ -252,12 +264,17 @@ impl KernelFamily for FiRuntime {
             plans: HashMap::new(),
             active: None,
             last_capturing: false,
-            stamp: 0,
+            stamp: 0,plan_ragged: None,
+            ragged_cu: Some(res.alloc(64, "fi.ragged_cu")?),
         };
         Ok(FamilyGuard::boxed(me))
     }
 
     fn run(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, _exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {
+        // 视觉塔注意力(ragged 非因果;2026-10-15)—— 独立契约,先分流
+        if msg.kernel.name == crate::family::flashinfer::ATTN_RAGGED_F16 {
+            return self.run_attn_ragged(msg, res);
+        }
         let call = parse_prefill(msg)?;
         let r = |b: &crate::client::flashinfer::BlockRef| {
             res.resolve(b.id).map(|p| p + b.byte_offset)
@@ -329,7 +346,24 @@ impl KernelFamily for FiRuntime {
                 });
             }
             let qo_indptr = [0i32, call.t as i32];
-            let kv_indptr = [0i32, call.ctx_total as i32];
+            // ⚠️ **kv_indptr 是 page 级**(2026-10-15 V1 定谳)—— plan 这套数组
+            // (`kv_len_arr` → `effective_kv_len_arr` → `num_chunks_kv` → 二分搜索的
+            // `min_kv_chunk_size = 128/page`)整体按 **页** 计量;而核侧的
+            // `paged_kv.indptr` 也是页级 ⇒ 两侧同尺。此前传 token 级([0, ctx_total])
+            // ⇒ split 档 plan 算出 34 chunk、核按 2912 token/chunk 算 2 ⇒ partial
+            // 行的 `o_stride_n` 缩放与 `merge_indptr` 口径打架 ⇒ 除第 0 行全零
+            // (实测 T=8/ctx=3072:零值 43008/49152)。split 关时该数组不参与任何
+            // 决策(plan 与 ctx 无关),所以这个单位错一直隐身。
+            let nb_pages = call.ctx_total.div_ceil(call.page.max(1)) as i32;
+            // ⚙ 诊断(OWL_FI_DEBUG=1):plan 重算时的**本轮** ctx_total(宿主标量槽
+            // 是否真按步送到 —— piecewise 断点面取证;缺省零输出)
+            if std::env::var_os("OWL_FI_DEBUG").is_some_and(|v| v != "0") {
+                eprintln!(
+                    "[fi-plan] ctx_total={} nb_pages={nb_pages} T={} page={}",
+                    call.ctx_total, call.total_rows, call.page
+                );
+            }
+            let kv_indptr = [0i32, nb_pages];
             let (mut plan15, mut cta_tile_q, mut split_kv) = ([0i64; 15], 0i32, 0i32);
             let mut int_bytes: usize = 0;
             let rc = unsafe {
@@ -488,6 +522,127 @@ impl KernelFamily for FiRuntime {
     }
 }
 
+// ============================================================================
+// 视觉塔注意力:ragged **非因果** prefill(FlashInfer FA2 家族;2026-10-15)
+// ============================================================================
+
+impl FiRuntime {
+    /// 一次调用 = 一层注意力(q/k/v [rows, heads, head_dim] f16 连续)。
+    /// plan 每形状一次(窗口外;捕获期命中 ⇒ 与 paged 臂同律),**单图契约**。
+    fn run_attn_ragged(
+        &mut self,
+        msg: &LaunchMsg,
+        res: &mut dyn crate::device::DeviceRes,
+    ) -> Result<Bytes, OpError> {
+        let call = crate::client::flashinfer::parse_attn_ragged(msg)?;
+        let r = |b: &crate::client::flashinfer::BlockRef| {
+            res.resolve(b.id).map(|p| p + b.byte_offset)
+        };
+        let q = r(&call.q)?;
+        let k = r(&call.k)?;
+        let v = r(&call.v)?;
+        let _ = r(&call.cu)?; // 保留解析/账面对位(FI 臂用 plan 期写的规范 int32 段界)
+        let out = r(&crate::client::flashinfer::BlockRef { id: call.out.id, byte_offset: 0 })?;
+        let float_ws = self.float_ws.as_ref().ok_or_else(|| OpError::Asset {
+            op: crate::family::flashinfer::ATTN_RAGGED_F16.into(),
+            detail: "workspace 未装配".into(),
+        })?;
+        let int_ws = self.int_ws.as_ref().ok_or_else(|| OpError::Asset {
+            op: crate::family::flashinfer::ATTN_RAGGED_F16.into(),
+            detail: "workspace 未装配".into(),
+        })?;
+        let stream = res.stream()?;
+        if call.n_seq != 1 {
+            return Err(OpError::Contract {
+                op: crate::family::flashinfer::ATTN_RAGGED_F16.into(),
+                field: "n_seq",
+                expect: "1(单图契约;多图走 native vis.attn_full 臂)".into(),
+                got: format!("{}", call.n_seq),
+            });
+        }
+        let key = RaggedKey { rows: call.rows, heads: call.heads, head_dim: call.head_dim };
+        let cu_dev_ptr = self
+            .ragged_cu
+            .as_ref()
+            .ok_or_else(|| OpError::Asset {
+                op: crate::family::flashinfer::ATTN_RAGGED_F16.into(),
+                detail: "ragged cu scratch 未装配".into(),
+            })?
+            .ptr as *const std::ffi::c_void;
+        // 与 paged 臂同律:**plan 必须在捕获窗外算**(内含 H2D)
+        if self.plan_ragged.as_ref().map(|(k, _)| *k != key).unwrap_or(true) {
+            if res.capturing().unwrap_or(false) {
+                return Err(OpError::Launch {
+                    op: msg.kernel.name.clone(),
+                    stage: crate::contract::Stage::Load,
+                    detail: "FI ragged plan 未缓存而处于捕获窗(plan 内含 H2D)⇒ 拒捕回 eager"
+                        .to_string(),
+                });
+            }
+            let (mut plan15, mut cta_tile_q) = ([0i64; 15], 0i32);
+            let cu_dev = self.ragged_cu.as_ref().ok_or_else(|| OpError::Asset {
+                op: crate::family::flashinfer::ATTN_RAGGED_F16.into(),
+                detail: "ragged cu scratch 未装配".into(),
+            })?;
+            let rc = unsafe {
+                crate::family::flashinfer::owl_fi_attn_ragged_plan(
+                    float_ws.ptr as *mut std::ffi::c_void,
+                    float_ws.bytes,
+                    int_ws.ptr as *mut std::ffi::c_void,
+                    int_ws.bytes,
+                    self.host_staging.as_mut_ptr() as *mut std::ffi::c_void,
+                    self.host_staging.len(),
+                    plan15.as_mut_ptr(),
+                    &mut cta_tile_q,
+                    cu_dev.ptr as *mut i32,
+                    call.rows as i32,
+                    call.heads as i32,
+                    call.head_dim as i32,
+                    stream.cu_stream() as *mut std::ffi::c_void,
+                )
+            };
+            if rc != 0 {
+                return Err(OpError::Launch {
+                    op: msg.kernel.name.clone(),
+                    stage: crate::contract::Stage::Load,
+                    detail: format!("ragged plan err {rc}(rows={} heads={} hd={})", call.rows, call.heads, call.head_dim),
+                });
+            }
+            self.plan_ragged = Some((key, plan15));
+        }
+        let plan15 = self.plan_ragged.as_ref().map(|(_, p)| *p).expect("plan 缓存");
+        res.note_device("fam_ffi_launch", &msg.kernel.name, 0, &[q, k, v, out]);
+        let rc = unsafe {
+            crate::family::flashinfer::owl_fi_attn_ragged_run_f16(
+                q as *const std::ffi::c_void,
+                k as *const std::ffi::c_void,
+                v as *const std::ffi::c_void,
+                cu_dev_ptr,
+                out as *mut std::ffi::c_void,
+                plan15.as_ptr(),
+                int_ws.ptr as *mut std::ffi::c_void,
+                int_ws.bytes,
+                float_ws.ptr as *mut std::ffi::c_void,
+                float_ws.bytes,
+                call.rows as i32,
+                call.heads as i32,
+                call.head_dim as i32,
+                call.n_seq as i32,
+                call.scale,
+                stream.cu_stream() as *mut std::ffi::c_void,
+            )
+        };
+        if rc != 0 {
+            return Err(OpError::Launch {
+                op: msg.kernel.name.clone(),
+                stage: crate::contract::Stage::Compute,
+                detail: format!("ragged run err {rc}"),
+            });
+        }
+        Ok(call.out)
+    }
+}
+
 #[cfg(test)]
 mod plan_key_tests {
     use super::plan_key;
@@ -516,6 +671,5 @@ mod plan_key_tests {
             plan_key(512, 0, 512, 24, 4, 256, 32, true, false),
             plan_key(512, 0, 512, 24, 4, 256, 64, true, false),
             "page 必须分键"
-        );
-    }
+        );    }
 }

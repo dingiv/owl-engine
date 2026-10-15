@@ -59,6 +59,74 @@ pub struct Attention {
     hidden: usize,
 }
 
+/// 注意力**核节点**登记(piecewise 断点采集面;`ctx.attn_break` = None 时
+/// 一次 `is_some()` 判、零开销)。
+///
+/// 语义:核 = 唯一"每轮按 ctx 重算 plan"的节点(FI 的 split 档 plan 依赖
+/// ctx)⇒ piecewise 把它移出捕获图、在段间 eager 重放(设计见
+/// `docs/piecewise-断点图-设计与实现.md`)。只推**核节点**(不含 GateMul/
+/// o_proj):前段落地的 q/K0 与后段消费的 softmax 输出各自在图内。
+fn note_attn_kernel(ctx: &ForwardCtx, y: &TensorOps) {
+    if let Some(sink) = ctx.attn_break.as_ref() {
+        sink.borrow_mut().push(crate::interpreters::BreakDecl::node(y.clone()));
+    }
+}
+
+/// **FI 核节点几何**(工厂入参;与 prefill 主臂逐字同源)
+pub(crate) struct FiCoreGeom {
+    pub tokens: usize,
+    pub hq: usize,
+    pub hkv: usize,
+    pub hd: usize,
+    pub page: usize,
+    pub fp8: bool,
+}
+
+/// `ctx_total` 在 FI 核标量槽里的**契约下标**(槽序权威 =
+/// `client::flashinfer::PARSE_SLOTS`:total_rows, **ctx_total**, t, hq, hkv, hd, page, sm_scale_bits)
+/// —— piecewise 断点的宿主标量槽就补这一槽。
+pub(crate) const FI_CTX_TOTAL_ARG: usize = 1;
+
+/// **FI 核节点**(单一拼写点:prefill 主臂与 piecewise 断点共用;
+/// 只出"核"本身,输出门/出投影在外)。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fi_core_node(
+    g: FiCoreGeom,
+    dt: Dtype,
+    q: &TensorOps,
+    kcs: &TensorOps,
+    vcs: &TensorOps,
+    q_cu: &TensorOps,
+    indices: &TensorOps,
+    indptr: &TensorOps,
+    last_len: &TensorOps,
+    wr: &TensorOps,
+    ctx_total: usize,
+) -> TensorOps {
+    TensorOps::call(if g.fp8 {
+        SemanticKernel::FiPrefillFp8kv
+    } else {
+        SemanticKernel::FiPrefill
+    })
+    .arg(q)
+    .arg(kcs)
+    .arg(vcs)
+    .arg(q_cu)
+    .arg(indices)
+    .arg(indptr)
+    .arg(last_len)
+    .arg(wr)
+    .arg_usize(g.tokens) // total_rows
+    .arg_usize(ctx_total) // ← 宿主标量槽(每轮变;s. FI_CTX_TOTAL_ARG)
+    .arg_usize(g.tokens) // T
+    .arg_usize(g.hq)
+    .arg_usize(g.hkv)
+    .arg_usize(g.hd)
+    .arg_usize(g.page)
+    .arg_usize(fi_scale_bits(g.hd) as usize)
+    .with_shape(dt, vec![g.tokens, g.hq * g.hd])
+}
+
 impl Attention {
     /// 准备容器(0.8B:hq=8, hkv=2, hd=256 → q_proj out 4096 / kv out 512;
     /// `plan` = 量化计划构造期注入,尺寸门控在 Linear 内定形)
@@ -117,7 +185,7 @@ impl Attention {
             dt_raw == Dtype::F16 && !force_naive && ctx.env.attn.qkv_fuse && page_ok;
         if use_fused_insert {
             let page = pol.as_ref().unwrap().page;
-            let (cos_d, sin_d) = rope.cos_sin_decl();
+            let (cos_d, sin_d) = rope.cos_sin_of(ctx);
             let gate = narrow_strided(&q_raw, tokens * self.hq, self.hd * 2, self.hd, self.hd,
                 vec![tokens, self.hq * self.hd]);
             // B6.3:fp8 主池 → 融合插池核 e4m3 变体(env.kv.quant 单源;
@@ -152,7 +220,7 @@ impl Attention {
         let (q, gate, k) = if dt_raw == Dtype::F16 {
             // 融合:qk-norm(×(1+w))+ rotate-half partial rope 单发;
             // strided 读 q_raw(stride = q_raw 行长,head 步 = 2HD)
-            let (cos_d, sin_d) = rope.cos_sin_decl();
+            let (cos_d, sin_d) = rope.cos_sin_of(ctx);
             let gate = narrow_strided(&q_raw, tokens * self.hq, self.hd * 2, self.hd, self.hd,
                 vec![tokens, self.hq * self.hd]);
             let q = TensorOps::call(SemanticKernel::NormRope)
@@ -367,6 +435,49 @@ impl Attention {
         ctx: &ForwardCtx,
         pol: &crate::module::KvPagedPolicy,
     ) -> TensorOps {
+        // **FI 断点臂**(V1c;T=1 裸 decode):核移出 session 捕获图 ⇒ split 档 plan
+        // 每步按当前 ctx 重算(`ctx_total` 走宿主标量槽,四件套走图输入槽)。
+        // 与 verify 臂同构(见 `paged_prefill_fi_output`);`ctx.attn_fi` 在场 = 本树换臂。
+        if tokens == 1 && ctx.env.kv.is_fp8() {
+            if let (Some(ab), Some(fi)) = (ctx.attn_fi.as_ref(), ctx.fi.as_ref()) {
+                let y = fi_core_node(
+                    FiCoreGeom {
+                        tokens,
+                        hq: self.hq,
+                        hkv: self.hkv,
+                        hd: self.hd,
+                        page: pol.page,
+                        fp8: true,
+                    },
+                    q.dtype,
+                    q,
+                    &fi.kcs[ctx.fi_kvi],
+                    &fi.vcs[ctx.fi_kvi],
+                    fi.q_cu,
+                    fi.indices,
+                    fi.indptr,
+                    fi.last_len,
+                    // 依赖边(K0 先于读池;FI 不解引用)。decode 路的 wr 是
+                    // 2 维哑输出,FI 声明 rank=1 ⇒ 取 1 元素视图(零拷贝)
+                    &narrow_strided(wr, 1, 1, 0, 1, vec![1]),
+                    tokens, // 占位:回放期由宿主标量槽补本轮值
+                );
+                if let Some(sink) = ctx.attn_break.as_ref() {
+                    sink.borrow_mut().push(crate::interpreters::BreakDecl::with_host_scalar(
+                        y.clone(),
+                        FI_CTX_TOTAL_ARG,
+                        ab.ctx_total.clone(),
+                    ));
+                }
+                let n = tokens * self.hq * self.hd;
+                let yg = TensorOps::call(SemanticKernel::GateMul)
+                    .arg(gate)
+                    .arg(&y)
+                    .arg_usize(n)
+                    .with_shape(q.dtype, vec![tokens, self.hq * self.hd]);
+                return self.o_proj.forward(&yg, ctx);
+            }
+        }
         // XQA 臂优先(2026-10-13 ②;T=1 裸 decode)。池/形状不匹配 ⇒
         // `ctx.xqa` 为 None ⇒ 自动回落 v2 主核(graceful,与 verify 臂同款纪律)。
         if tokens == 1 && ctx.env.attn.decode_xqa {
@@ -427,7 +538,7 @@ impl Attention {
         self.o_proj.forward(&y, ctx)
     }
 
-    /// verify v2 臂(§三十一):8 伪序列单次 v2 发射 + reduce。
+/// verify v2 臂(§三十一):8 伪序列单次 v2 发射 + reduce。
     /// bt8 = [seqs×nb] 页链平铺(engine 每轮写入);kv_lens = 图输入递增表
     /// ([ctx+1 .. ctx+seqs]);scratch = ctx.attn_v2(seqs 倍)。语义 =
     /// 每 token attend [0, pos_t](前缀截断即 chunk 内 causal)。
@@ -495,13 +606,18 @@ impl Attention {
             .arg_usize(self.hkv * hd)
             .arg_usize(hd)
             .with_shape(dt, vec![tokens, self.hq * hd]);
+        note_attn_kernel(ctx, &y);
         let n = tokens * self.hq * hd;
         let y = TensorOps::call(SemanticKernel::GateMul)
             .arg(gate)
             .arg(&y)
             .arg_usize(n)
             .with_shape(dt, vec![tokens, self.hq * hd]);
-        self.o_proj.forward(&y, ctx)
+        let out = self.o_proj.forward(&y, ctx);
+        if ctx.env.attn.break_at_out {
+            note_attn_kernel(ctx, &out);
+        }
+        out
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -561,13 +677,18 @@ impl Attention {
             .arg_usize(self.hkv * hd)
             .arg_usize(hd)
             .with_shape(dt, vec![tokens, self.hq * hd]);
+        note_attn_kernel(ctx, &y);
         let n = tokens * self.hq * hd;
         let y = TensorOps::call(SemanticKernel::GateMul)
             .arg(gate)
             .arg(&y)
             .arg_usize(n)
             .with_shape(dt, vec![tokens, self.hq * hd]);
-        self.o_proj.forward(&y, ctx)
+        let out = self.o_proj.forward(&y, ctx);
+        if ctx.env.attn.break_at_out {
+            note_attn_kernel(ctx, &out);
+        }
+        out
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -873,28 +994,38 @@ impl Attention {
         // 2026-10-12 三形态归一 Call —— fp8kv = KV 策略选变体,名字/网格归
         // driver,槽序 sig 归家族线契约)
         let ctx_total = ctx.ctx_base + tokens;
-        let y = TensorOps::call(if ctx.env.kv.is_fp8() {
-            SemanticKernel::FiPrefillFp8kv
-        } else {
-            SemanticKernel::FiPrefill
-        })
-        .arg(q)
-        .arg(&fi.kcs[ctx.fi_kvi])
-        .arg(&fi.vcs[ctx.fi_kvi])
-        .arg(fi.q_cu)
-        .arg(fi.indices)
-        .arg(fi.indptr)
-        .arg(fi.last_len)
-        .arg(&wr) // 树序依赖边(K0 先于分块读池;FI 不解引用)
-        .arg_usize(tokens)          // total_rows(本 chunk q 行)
-        .arg_usize(ctx_total)       // kv_indptr host 端点
-        .arg_usize(tokens)          // T
-        .arg_usize(self.hq)
-        .arg_usize(self.hkv)
-        .arg_usize(self.hd)
-        .arg_usize(pol.page)
-        .arg_usize(fi_scale_bits(self.hd) as usize)
-        .with_shape(dt, vec![tokens, self.hq * self.hd]);
+        let y = fi_core_node(
+            FiCoreGeom {
+                tokens,
+                hq: self.hq,
+                hkv: self.hkv,
+                hd: self.hd,
+                page: pol.page,
+                fp8: ctx.env.kv.is_fp8(),
+            },
+            dt,
+            q,
+            &fi.kcs[ctx.fi_kvi],
+            &fi.vcs[ctx.fi_kvi],
+            fi.q_cu,
+            fi.indices,
+            fi.indptr,
+            fi.last_len,
+            &wr, // 树序依赖边(K0 先于分块读池;FI 不解引用)
+            ctx_total,
+        );
+        // **piecewise 断点登记**(verify 图;`ctx.attn_fi` 在场 = 本树换 FI 臂):
+        // 核移出图,`ctx_total` 走宿主标量槽 ⇒ plan 每轮按本轮 ctx 重算。
+        // 登记的就是下面喂给 GateMul 的**同一个节点**(捕获期 memo 指向钉块)。
+        if let (Some(sink), Some(ab)) = (ctx.attn_break.as_ref(), ctx.attn_fi.as_ref()) {
+            sink.borrow_mut().push(crate::interpreters::BreakDecl::with_host_scalar(
+                y.clone(),
+                FI_CTX_TOTAL_ARG,
+                ab.ctx_total.clone(),
+            ));
+        }
+        // ⚠️ FI 臂**不做**静态登记(上面已按宿主标量槽登记):FI 的 plan 依赖
+        // ctx_total,静态断点会把每轮变的量烘死;双登记 = 33 段/32 断点(踩过)。
         // ③ 输出门(f16 融合单发)+ 出投影(与旧路径同)
         let n = tokens * self.hq * self.hd;
         let y = TensorOps::call(SemanticKernel::GateMul)
@@ -935,7 +1066,7 @@ impl Attention {
         // C1 融合:同 decode 臂(norm_rope strided 直取 value 半段)
         let dt_raw = q_raw.dtype;
         let (q, gate, k) = if dt_raw == Dtype::F16 {
-            let (cos_d, sin_d) = rope.cos_sin_decl();
+            let (cos_d, sin_d) = rope.cos_sin_of(ctx);
             let gate = narrow_strided(&q_raw, tokens * self.hq, self.hd * 2, self.hd, self.hd,
                 vec![tokens, row_q]);
             let q = TensorOps::call(SemanticKernel::NormRope)
