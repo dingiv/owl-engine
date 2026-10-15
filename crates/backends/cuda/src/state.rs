@@ -88,6 +88,18 @@ impl DiagOpts {
 
 // 流身份证(server 内部路由键;客户端不可见 —— 三固定流是 server 策略)
 pub(super) type StreamId = u64;
+/// **尾事件句柄的线程域包装**(与 [`GraphHolder`] 同律:句柄只在 server
+/// 线程解引用/销毁 —— 该线程独占上下文;raw `CUevent` 非 Send 只是指针事实,
+/// cudarc 自身对 `CudaStream` 亦 `unsafe impl Send/Sync`)
+#[derive(Clone, Copy)]
+pub(super) struct TailEvent(crate::ffi::sys::CUevent);
+
+unsafe impl Send for TailEvent {}
+unsafe impl Sync for TailEvent {}
+
+/// E1 事件池容量(轮转;E2 起 = 在飞等待上界的记账口)
+const EVENT_POOL_N: usize = 8;
+
 pub(super) const STREAM_H2D: StreamId = 0;
 pub(super) const STREAM_COMPUTE: StreamId = 1;
 pub(super) const STREAM_D2H: StreamId = 2;
@@ -359,6 +371,13 @@ pub(super) struct GpuCtx {
     pub(super) diag: DiagOpts,
     /// 流注册表:三固定流(H2D/COMPUTE/D2H;客户端不可自创)
     streams: HashMap<StreamId, Arc<CudaStream>>,
+    /// **三流尾事件**(E1:纯记账 —— 每命令末尾 record 一次,**不等待**;
+    /// 序消费在 E2/E3。设计:`docs/arch/三流事件序-设计与迁移.md`)
+    tail_event: HashMap<StreamId, TailEvent>,
+    /// 事件池(round-robin):"重录挂在等待中的事件"是 CUDA UB(不报错)
+    /// ⇒ 池化是唯一正确的复用方式;容量 = 在飞等待上界(E2 起记账)
+    event_pool: Vec<TailEvent>,
+    ev_next: usize,
     /// 图捕获状态机(见 graph_begin/end 的护栏注释)
     ordinal: usize,
     capture: Option<CaptureState>,
@@ -610,10 +629,21 @@ impl GpuCtx {
             let s = ctx.new_stream().map_err(|e| format!("建流({_role}): {e:?}"))?;
             streams.insert(id, s);
         }
+        // E1:三流事件池(**CU_EVENT_DISABLE_TIMING** —— 计时的 event 会拖慢
+        // 且扰动时序;要计时另开探针)
+        let mut event_pool = Vec::with_capacity(EVENT_POOL_N);
+        for i in 0..EVENT_POOL_N {
+            let ev = crate::ffi::event_create(crate::ffi::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING)
+                .map_err(|e| format!("建事件({i}): {e:?}"))?;
+            event_pool.push(TailEvent(ev));
+        }
         Ok(Self {
             ctx,
             diag: diag.clone(),
             streams,
+            tail_event: HashMap::new(),
+            event_pool,
+            ev_next: 0,
             ordinal,
             srv_timing: diag.srv_timing,
             cap_prof: diag.cap_prof,
@@ -635,6 +665,44 @@ impl GpuCtx {
     }
 
     /// 流反查(id → 流)
+    /// **E1:把"本命令的完成点"记到该流的尾事件**(纯记账;不等待任何东西)。
+    ///
+    /// - **捕获期跳过**:图内 event 节点会污染捕获拓扑(cuda-pitfalls §26
+    ///   "event-tracking 启动即关"同律),且捕获不执行 ⇒ 尾事件语义不受影响;
+    /// - 失败不破坏命令语义(记账面),由调用方响亮记日志;
+    /// - 事件取池轮转:因为"某事件被 A 流等待、同时 B 流重录它"= **未定义行为**
+    ///   (不是报错),池化是唯一正确复用方式。
+    pub(super) fn record_tail(&mut self, sid: StreamId) -> Result<(), ModelError> {
+        if self.capture_stream() {
+            return Ok(());
+        }
+        if self.event_pool.is_empty() {
+            return Err(ModelError::Msg("事件池未装配".into()));
+        }
+        let ev = self.event_pool[self.ev_next % self.event_pool.len()];
+        self.ev_next = self.ev_next.wrapping_add(1);
+        let stream = self.stream(sid)?.clone();
+        unsafe { crate::ffi::event_record(ev.0, stream.cu_stream()) }
+            .map_err(|e| ModelError::Msg(format!("record_tail(stream {sid}): {e:?}")))?;
+        self.tail_event.insert(sid, ev);
+        Ok(())
+    }
+
+    /// 该流的尾事件(仅 server 内部消费;`None` = 该流尚无已记账的完成点)
+    #[allow(dead_code)] // E2 的依赖判序消费口(本刀只记账)
+    pub(super) fn tail_event(&self, sid: StreamId) -> Option<TailEvent> {
+        self.tail_event.get(&sid).copied()
+    }
+
+    /// 收摊:销毁事件池与尾事件句柄(在流栅栏之后调;进程生命周期末点)
+    pub(super) fn destroy_events(&self) {
+        for ev in self.event_pool.iter().copied() {
+            unsafe {
+                let _ = crate::ffi::event_destroy(ev.0);
+            }
+        }
+    }
+
     pub(super) fn stream(&self, id: StreamId) -> Result<&Arc<CudaStream>, ModelError> {
         self.streams
             .get(&id)

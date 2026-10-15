@@ -177,6 +177,8 @@ impl Model {
             xqa: ctx.xqa.clone(),
             vlm_image: ctx.vlm_image,
             vlm_rope: ctx.vlm_rope,
+            attn_break: ctx.attn_break.clone(),
+            attn_fi: ctx.attn_fi.clone(),
         }
     }
 

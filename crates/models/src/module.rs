@@ -88,6 +88,18 @@ pub struct RopeTables<'a> {
     pub sin: &'a TensorOps,
 }
 
+/// **FI 断点面**(piecewise verify;`ctx.attn_fi` 在场 = 本树要把 FI 核移出图)。
+///
+/// 格子 = **宿主标量槽**:FI 的 plan key 含 `ctx_total`(每轮随 ctx 长),
+/// 烘死在节点里就只对一个 ctx 有效 ⇒ 引擎逐轮写这个 atomic,
+/// 驱动件在**回放期**把它补进核的契约槽(见 `interpreters::BreakDecl`)。
+/// 零设备流量、零 D2H。
+#[derive(Clone)]
+pub struct AttnFiBreak {
+    /// 每轮 `ctx_total`(= 本轮 kv 总长);引擎在 step 前写
+    pub ctx_total: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
 pub struct ForwardCtx<'a> {
     /// 本步 token 数(decode = 1;prefill = 块长)
     pub tokens: usize,
@@ -166,6 +178,15 @@ pub struct ForwardCtx<'a> {
     /// GDN 分派门控打印(EngineKnobs.probes.trace_gate 注入;显式依赖律,
     /// 原 OWL_TRACE_GATE 层内直读 —— 热路径零 env)
     pub trace_gate: bool,
+    /// **注意力核断点采集面**(piecewise 捕获图;形态同 `gdn_tap` ——
+    /// 层把**核节点**推进来,不是引擎去认识算子):注意力层在 FI/XQA 那个
+    /// `Call` 节点建好后推入。核 = 唯一「每轮按 ctx 重算 plan」的节点,故
+    /// piecewise 把它移出捕获图、在段间 eager 重放(设计见
+    /// `docs/piecewise-断点图-设计与实现.md`)。None = 非 piecewise
+    /// (一次 `is_some()` 判,热路径零开销)。
+    pub attn_break: Option<std::rc::Rc<std::cell::RefCell<Vec<crate::interpreters::BreakDecl>>>>,
+    /// **FI 断点面**(piecewise verify;None = 本树不换 FI 臂)
+    pub attn_fi: Option<AttnFiBreak>,
 }
 
 impl<'a> ForwardCtx<'a> {
@@ -198,6 +219,8 @@ impl<'a> ForwardCtx<'a> {
             gdn_tap: None,
             vlm_image: None,
             vlm_rope: None,
+            attn_break: None,
+            attn_fi: None,
         }
     }
 
@@ -235,6 +258,8 @@ impl<'a> ForwardCtx<'a> {
             gdn_tap: None,
             vlm_image: None,
             vlm_rope: None,
+            attn_break: None,
+            attn_fi: None,
         }
     }
 
@@ -267,6 +292,8 @@ impl<'a> ForwardCtx<'a> {
             gdn_tap: None,
             vlm_image: None,
             vlm_rope: None,
+            attn_break: None,
+            attn_fi: None,
         }
     }
 
@@ -303,6 +330,8 @@ impl<'a> ForwardCtx<'a> {
             gdn_tap: None,
             vlm_image: None,
             vlm_rope: None,
+            attn_break: None,
+            attn_fi: None,
         }
     }
 
@@ -342,6 +371,8 @@ impl<'a> ForwardCtx<'a> {
             gdn_tap: None,
             vlm_image: None,
             vlm_rope: None,
+            attn_break: None,
+            attn_fi: None,
         }
     }
 
@@ -381,6 +412,8 @@ impl<'a> ForwardCtx<'a> {
             gdn_tap: None,
             vlm_image: None,
             vlm_rope: None,
+            attn_break: None,
+            attn_fi: None,
         }
     }
 
@@ -428,6 +461,8 @@ impl<'a> ForwardCtx<'a> {
             gdn_tap: None,
             vlm_image: None,
             vlm_rope: None,
+            attn_break: None,
+            attn_fi: None,
         }
     }
 

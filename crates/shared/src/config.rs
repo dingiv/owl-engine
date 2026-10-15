@@ -249,6 +249,18 @@ pub struct DispatchCfg {
     /// 4.63ms/层(fp8),而 prefill 族是 qo_len=8 单遍形态 —— 本开关是
     /// 两族 A/B 的唯一入口,定谳后固化其一,不留双路径。
     pub verify_v2: bool,
+    /// **verify 段驱动件**(piecewise):把 verify 图的**注意力核**登记为断点,
+    /// 整图改分段捕获回放(注意力在段间 eager 重放,其余仍在图内)。
+    /// 2026-10-15 立项(V1b):FI 的 split 档 plan 依赖 ctx ⇒ 单图只对一个
+    /// ctx 有效;段驱动件让 plan 每轮在窗外重算。零断点时退化为单图
+    /// (与 `plan` 同形),开关开而臂未登记核时**不**降级为逐步 eager。
+    pub verify_piecewise: bool,
+    /// ⚙ 诊断:断点挂"注意力输出"而非核节点(见 AttnEnv::break_at_out)
+    pub break_at_out: bool,
+    /// **verify 走 FI 断点臂**(V1b;需 `verify_piecewise`)——FI+split 换掉 XQA
+    pub verify_fi: bool,
+    /// **decode(T=1)走 FI 断点臂**(V1c;session 常驻图改分段,断点挂 decode 核)
+    pub decode_fi: bool,
     /// verify 臂改走 **XQA**(kNHD fp8 池 + spec-dec q=1+K;feature `xqa`)。
     /// 2026-10-13 D3:XQA 单算子实测 ctx8192 0.495ms vs v2 2.673ms(5.40×),
     /// 数值 max|XQA−host| 4.5e-4(v2 4.6e-4)。缺省 false(定谳后再翻)。
@@ -673,6 +685,12 @@ impl Default for DispatchCfg {
             force_naive_prefill: false,
             verify_v2: true,
             verify_xqa: false,
+            // piecewise 段驱动件:**缺省关**(2026-10-15 立项;A/B 先证机制
+            // 零回归,定谱后再翻默认 —— 同 verify_xqa 的翻法)
+            verify_piecewise: false,
+            break_at_out: false,
+            verify_fi: false,
+            decode_fi: false,
             decode_xqa: false,
             xqa_prefill: false,
             fi_min_tokens: 1,
@@ -841,16 +859,30 @@ allowed_ops = [
 # 白名单同时含 **fp8 与 f16 两主池族**(2026-10-14 A5 补):`kv_fp8` 决定
 # 实际发射哪一族 —— f16 档不用再拿 `allowed_ops = []` 绕硬门。两族在池
 # 写集审计里按 (池名, dtype) 分组,各自闭环(R3 不撞)。
-# XQA verify 臂(2026-10-13 D3 **转正**):恒等门 3/3 稳定绿(spec ≡ 无 spec
-# 逐 token;fp8 池 + 27B + DFlash2),verify 纯时 65.2→31.2ms、8192 spec
-# decode 27.7→47.0 t/s(+70%,且首次反超同池裸档 36.4)。形状不匹配时层侧
-# 自动回落 v2 臂(graceful)。根因与修法见工单 §2.7(semaphores 走图输入槽,
-# 不用跨账本的 memset 命令)。
-verify_xqa = true
+# ── verify 注意力臂(2026-10-16 **换代**:FI+split 断点臂转正)──
+#
+# 旧:XQA verify 臂(2026-10-13 D3 转正;恒等门 3/3 绿)。它的问题在长 ctx:
+# ctx 依赖的 KV-split 全在核内,verify 图墙时随 ctx 线性涨(32k 轮时 69.3ms)。
+# 新:FI+split(核级实测 verify 形状 ≤0.3ms/发 vs XQA 1.54)但 FI 的 plan 依赖
+# ctx ⇒ 必须把核移出捕获图 ⇒ **piecewise(段+断点)** 承载:
+#   verify_piecewise = 段驱动件;verify_fi = 断点走 FI 核(四件套走输入槽,
+#   ctx_total 走宿主标量槽 —— 见 docs/piecewise-断点图-设计与实现.md §11.6)
+# 真机:32k 轮时 69.3 → **48.4ms(−30%)**,轮时对 ctx **变平**(8k 48.6/32k 48.4),
+# 文本/tok/hid 与基线逐位一致;prefill 不动。
+# ⚠️ decode(T=1)已于同日(V1c)同法换装:见下方 decode_xqa/decode_fi 段。
+verify_xqa = false
+verify_v2 = false
+verify_piecewise = true
+verify_fi = true
 # 裸 decode 走 XQA(2026-10-13 ②):第二份实例化 `M_TILESIZE=16`。
 # 注:短 ctx 收益略低(512 档 1.90× vs 2048 档 2.25×),但**不缺省加 ctx
 # 阈值门** —— 最小值也在 1.4× 以上,且阈值本身是额外的一支分支/形状面。
-decode_xqa = true
+decode_xqa = false
+# decode 走 **FI 断点**(V1c;session 常驻图改分段,断点挂 decode 核):
+# 裸 decode 阶梯 8192/32768 = 33.1/47.8 → **27.8/29.0 ms/tok(-16%/-39%,对 ctx 平坦)**,
+# 文本与 v2/XQA 逐位一致。⚠️ 曾踩:plan_session 少交断点采集面 ⇒ FI 核被烘进图 + plan 用
+# 占位 ctx_total=1 ⇒ 文本连贯但错(见状 §11.13)。
+decode_fi = true
 # GDN prefill 臂(2026-10-11 终版):fork-bf16 全家桶转正 —— g 语义律
 # 修复(kkt/h/o 必须吃 cumsum 而非 raw g;raw g 在深谷 -24 时
 # exp(±24)=e²⁴ 爆炸)。恒等门:四域 vs recurrence 逐位一致;std 矩阵

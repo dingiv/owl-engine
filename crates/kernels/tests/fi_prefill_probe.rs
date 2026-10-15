@@ -336,9 +336,31 @@ fn run_case(t: usize, ctx: usize, host_check: bool, iters: usize) {
             "\n  max|FI−host| = {d:.6}   超门行数 = {bad_rows}/{t}   零值 = {nz}/{}",
             fx.len()
         );
-        assert!(d < 1e-2, "FI vs host 超门:{d:.6}(FI_SPLIT_KV={:?})", std::env::var("FI_SPLIT_KV"));
+        // 先打印再断言(2026-10-15:split 排查要看到"哪一行/哪一头错")
+        println!("{line}");
+        if d >= 1e-2 {
+            for s in 0..t.min(8) {
+                let rd = fx[s * H * HD..(s + 1) * H * HD]
+                    .iter()
+                    .zip(&host[s * H * HD..(s + 1) * H * HD])
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                let per_head: Vec<String> = (0..H.min(6))
+                    .map(|h| {
+                        let a = &fx[s * H * HD + h * HD..s * H * HD + (h + 1) * HD];
+                        let b = &host[s * H * HD + h * HD..s * H * HD + (h + 1) * HD];
+                        let m = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+                        format!("{m:.4}")
+                    })
+                    .collect();
+                println!("    row {s}: max|Δ|={rd:.6}  per-head(前6)={per_head:?}");
+            }
+            panic!("FI vs host 超门:{d:.6}(FI_SPLIT_KV={:?})", std::env::var("FI_SPLIT_KV"));
+        }
     }
-    println!("{line}");
+    if !host_check {
+        println!("{line}");
+    }
 }
 
 #[test]
@@ -361,6 +383,16 @@ fn fi_prefill_speed_and_parity() {
         // 在引擎里实测 6.7 ms/层(T=54, ctx 3126),而 XQA 只要 0.91 ms/层。
         (1, 3072, true, 50),
         (8, 3072, true, 50),
+        // ── **末页半满**(2026-10-16 V1c 立案)──
+        // 上面几档 ctx 都是 PAGE 的整数倍 ⇒ `last_len == PAGE`(整页)⇒
+        // "末页半满"从未进过 host 校验档。而引擎的每一步 decode(T=1)都是
+        // **末页半满**,且 27B+fp8 下 FI ≢ v2(0.8B f16 单页 ≡ ⇒ 唯一未覆盖
+        // 组合 = fp8 × T=1 × 多页/半满)⇒ 本组是那一格的核级判据。
+        (1, 53, true, 50),   // 2 页,last_len=21(引擎首步形状)
+        (1, 3073, true, 50), // 97 页,last_len=1(极端半满)
+        (1, 3080, true, 50), // 97 页,last_len=8
+        (8, 3080, true, 50), // verify 形状 + 半满(T=8 也判一处)
+        (1, 1057, true, 50), // 34 页,last_len=1
         (54, 3072, true, 50),
         (128, 3072, true, 50),
         // ── 大 T(生产主路径)──
@@ -370,6 +402,19 @@ fn fi_prefill_speed_and_parity() {
         (512, 4096, false, 20),
         (512, 8192, false, 20),
         (512, 16384, false, 10),
+        // ── **verify 形状**(2026-10-15 V1 立案:T=block 扩散草稿的 1 锚+K 行)──
+        // 目标:把 XQA SPEC_DEC 在该形状的 1.54 ms/发(ctx32k)打下来。
+        // 判据(探针面):≤0.3 ms/发;数值在短 ctx 档由 host oracle 背(见上方
+        // (1,3072)/(8,3072) 两例,`FI_SPLIT_KV=1` 复跑即验 split 归约)。
+        // decode 形状(q=1):现役 XQA spec-dec 在 ctx32k 是 0.91 ms/发(CUPTI 逐核)
+        (1, 8192, false, 30),
+        (1, 32768, false, 10),
+        (2, 32768, false, 10),
+        (4, 32768, false, 10),
+        (8, 8192, false, 30),
+        (8, 32768, false, 10),
+        (16, 32768, false, 10),
+        (32, 32768, false, 10),
     ];
     for &(t, ctx, hc, it) in cases {
         if !only.is_empty() && only != ctx.to_string() {
