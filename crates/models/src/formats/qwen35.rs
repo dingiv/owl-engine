@@ -1456,7 +1456,12 @@ mod tests {
 
         // 键集断言:BF16 = 81 键;W4A16 = 量化三槽 × 41 线性 + passthrough
         let keys: Vec<String> = manifest.entries().iter().map(|e| e.key.clone()).collect();
-        let is_q = keys.iter().any(|k| k.ends_with(".qweight"));
+        // 量化判据须认**两臂键名**:CPU 重排臂 = `.qweight`,设备重排臂 =
+        // `.packed_raw`(2026-10-16 收尾:原判据只认 `.qweight` ⇒ 设备臂
+        // 被误判成 BF16 族,撞 81 键断言 = 假红;两臂同门)
+        let is_q = keys
+            .iter()
+            .any(|k| k.ends_with(".qweight") || k.ends_with(".packed_raw"));
         if is_q {
             assert!(
                 keys.len() > 120 && keys.len() < 260,
@@ -1468,7 +1473,6 @@ mod tests {
         }
         if is_q {
             for expect in [
-                "fc_0.qweight",
                 "fc_4.scales",
                 "hidden_norm.weight",
                 "norm.weight",
@@ -1476,11 +1480,18 @@ mod tests {
                 "candidate_selector.predecessor_codebook",
                 "candidate_selector.successor_codebook",
                 "layers.0.attention_conv.base_kernel",
-                "layers.0.self_attn.q_proj.qweight",
-                "layers.4.mlp.down_proj.qweight",
                 "layers.4.self_attn.k_norm.weight",
             ] {
                 assert!(keys.iter().any(|k| k == expect), "缺键 {expect}");
+            }
+            // 量化线性主键:两臂命名二选一(CPU `.qweight` / 设备 `.packed_raw`)
+            for base in ["fc_0", "layers.0.self_attn.q_proj", "layers.4.mlp.down_proj"] {
+                let cpu = format!("{base}.qweight");
+                let dev = format!("{base}.packed_raw");
+                assert!(
+                    keys.iter().any(|k| k == &cpu || k == &dev),
+                    "缺键 {cpu} / {dev}"
+                );
             }
         } else {
             for expect in [
