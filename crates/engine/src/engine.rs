@@ -323,6 +323,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
             vram_target: self.cfg.knobs.vram_target,
             vram_reserve_mb: self.cfg.knobs.vram_reserve_mb,
             dump_all: self.cfg.knobs.gdn_dump_all,
+            gdn_dbg: self.cfg.knobs.probes.gdn_dbg,
         };
         let pool = StatePool::alloc(&mut self.face, dims, &loaded.spec.layer_types, &plan).await?;
         if let Some(q) = fi_quant {

@@ -115,6 +115,8 @@ pub(crate) struct PoolPlan {
     pub vram_reserve_mb: u64,
     /// GDN 画像 dump 全槽
     pub dump_all: bool,
+    /// reset_gdn 后 GDN rec 格画像(诊断面;原 OWL_GDN_DBG)
+    pub gdn_dbg: bool,
 }
 
 pub(crate) struct StatePool {
@@ -123,6 +125,8 @@ pub(crate) struct StatePool {
     /// GDN 画像 dump 全槽(knobs.gdn_dump_all)
     #[allow(dead_code)] // 诊断面字段(写入后当前无读者)
     pub(crate) dump_all: bool,
+    /// reset_gdn 后 rec 格画像([probes] gdn_dbg;诊断面)
+    pub(crate) gdn_dbg: bool,
     pub(crate) kvs: Vec<KvBlocks>,
     /// FI 直读旗标(统一契约 P3:影子池删除,FI 直读主池 kNHD 叶子)
     pub(crate) fi_face: bool,
@@ -209,6 +213,7 @@ impl StatePool {
         let gdn_slots = plan.gdn_slots;
         let snap_max = plan.snap_max;
         let dump_all = plan.dump_all;
+        let gdn_dbg = plan.gdn_dbg;
         let t = std::time::Instant::now();
         let n_full = layer_types.iter().filter(|&&f| f).count();
         let n_gdn = layer_types.len() - n_full;
@@ -486,7 +491,7 @@ impl StatePool {
         } else {
             None
         };
-        Ok(StatePool { gdn_slots, dump_all, kvs, fi_face, fi_tables, verify_attn_v2, xqa,
+        Ok(StatePool { gdn_slots, dump_all, gdn_dbg, kvs, fi_face, fi_tables, verify_attn_v2, xqa,
             kv_fp8, dflash_fp8, gdns, snaps, snap_tick: 0, bt, bt_mtp, spec_snap, mtp_kvs, dflash_kvs, attn_v2, page, nb, paged, x, dims })
     }
 
@@ -828,8 +833,8 @@ impl StatePool {
             }
         }
         face.sync().await?;
-        // 临时诊断(§三十二 会话污染定位;OWL_GDN_DBG=1 启用,收口后删)
-        if std::env::var("OWL_GDN_DBG").is_ok() {
+        // 临时诊断(§三十二 会话污染定位;[probes] gdn_dbg 启用,收口后删)
+        if self.gdn_dbg {
             let g = &self.gdns[0];
             let row_elems = g.rec.1 / self.gdn_slots;
             let mut buf = vec![0u8; g.rec.1 * 4];

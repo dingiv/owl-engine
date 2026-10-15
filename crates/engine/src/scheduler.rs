@@ -104,7 +104,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                     // 前缀缓存匹配(先匹配后释放旧链;内容寻址 = 跨会话)
                     let (mut m, chain) = self.bank.blocks_m.match_prefix(&turn.prompt_ids);
                     if self.bank.blocks_m.debug {
-                        eprintln!("[dbg prefix] match = {m} blocks / chain = {chain:?}");
+                        owl_shared::log_debug!("dbg prefix", "match = {m} blocks / chain = {chain:?}");
                     }
                     if m > 0 && m * self.pool.page == turn.prompt_ids.len() {
                         m -= 1; // 完全对齐保留末块重算(非空 prefill;xinfer 同语义)
