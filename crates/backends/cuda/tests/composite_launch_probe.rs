@@ -200,3 +200,55 @@ async fn composites_are_rejected_during_capture() {
     }
     c.sync().await.expect("sync");
 }
+
+/// **块账本不变量门**(长期价值):活块 id 唯一 + 地址区间不相交。
+///
+/// 为什么值得长期守:这两件事是"跨流 UAF / 写丢失"类缺陷的**唯一钥匙**
+/// (仓内 2026-10-08 E5 跨流回收律、2026-10-03 FI 表渐进腐败案都栽在这里);
+/// `/debug/blocks` 与同名的 HTTP 口(`GET /debug/blocks`)共用同一份判决。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn block_ledger_is_clean() {
+    if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    }
+    let mut c = assemble();
+    let n = 4096usize;
+    // 造一批块(不同尺寸 ⇒ 尽量压到不同尺寸类/复用面)
+    let a = c
+        .htod(Dtype::F32, &Shape::from(vec![n]), &le_f32(&vec![1.0f32; n]))
+        .await
+        .expect("htod");
+    let b = c.alloc(Dtype::F32, n).await.expect("alloc").view(Dtype::F32, 1);
+    let big = c
+        .alloc(Dtype::F32, n * 64)
+        .await
+        .expect("alloc big")
+        .view(Dtype::F32, 1);
+    let _ = (a.id, b.id, big.id);
+
+    let rows = c.block_ledger_dump().await.expect("block_ledger_dump");
+    assert!(!rows.is_empty(), "账本不应为空");
+    let mut ids: Vec<u64> = rows.iter().map(|r| r.id).collect();
+    ids.sort_unstable();
+    let dups: Vec<u64> = ids.windows(2).filter(|w| w[0] == w[1]).map(|w| w[0]).collect();
+    assert!(dups.is_empty(), "同 id 两条目(账本被顶掉/复用): {dups:?}");
+
+    let mut by_addr: Vec<(u64, usize, u64)> =
+        rows.iter().map(|r| (r.addr, r.bytes, r.id)).collect();
+    by_addr.sort_by_key(|t| t.0);
+    for w in by_addr.windows(2) {
+        let (a0, an, aid) = w[0];
+        let (b0, _, bid) = w[1];
+        assert!(
+            a0 + an as u64 <= b0,
+            "活块区间相交: id {aid} [{a0:#x}+{an:#x}) 与 id {bid} [{b0:#x})"
+        );
+    }
+    eprintln!(
+        "[ledger] {} 活块 / {} 字节;id 唯一 ✓ 区间不相交 ✓",
+        rows.len(),
+        rows.iter().map(|r| r.bytes).sum::<usize>()
+    );
+    c.sync().await.expect("sync");
+}

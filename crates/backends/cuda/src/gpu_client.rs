@@ -377,6 +377,13 @@ impl DeviceClient for GpuClient {
         self.submit(move |ack| Command::Launch { msg, ack })?.await
     }
 
+    /// **块账本投影**(调试面;默认 trait 口"不支持" ⇒ 这里给 GPU 实现)
+    async fn block_ledger_dump(
+        &mut self,
+    ) -> Result<Vec<owl_iface::contract::BlockLedgerRow>, ModelError> {
+        self.submit(move |ack| Command::BlockLedgerDump { ack })?.await
+    }
+
     async fn sync(&mut self) -> Result<(), ModelError> {
         self.submit(move |ack| Command::Sync { ack })?.await
     }

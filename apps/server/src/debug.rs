@@ -170,3 +170,47 @@ pub fn launches_json(n: usize, kind: Option<&str>) -> Value {
         "rows": rows,
     })
 }
+
+/// **块账本投影**(`GET /debug/blocks`)。
+///
+/// 与发射账(`/debug/launches`)互补:那张账是"每次命令的块 id + 地址",
+/// 本投影是**当前账本的权威快照**。两份内联不变量直接给出判决:
+/// - `dup_ids`:同一 id 出现两次(账本条目被顶掉/复用)⇒ 写读可能落在不同物理块;
+/// - `overlaps`:两个**活块**的地址区间相交 ⇒ 池把重叠区间发给了两个块。
+/// (仓内 2026-10-08 E5 跨流回收律 / 2026-10-03 FI 表渐进腐败案都栽在这两件事上。)
+pub fn blocks_json(rows: &[owl_cuda::BlockLedgerRow]) -> Value {
+    let mut by_addr: Vec<&owl_cuda::BlockLedgerRow> = rows.iter().collect();
+    by_addr.sort_by_key(|r| r.addr);
+    let mut overlaps: Vec<Value> = Vec::new();
+    for w in by_addr.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if a.addr + a.bytes as u64 > b.addr {
+            overlaps.push(json!({
+                "a": {"id": a.id, "addr": format!("{:#x}", a.addr), "bytes": a.bytes},
+                "b": {"id": b.id, "addr": format!("{:#x}", b.addr), "bytes": b.bytes},
+            }));
+        }
+    }
+    let mut ids: Vec<u64> = rows.iter().map(|r| r.id).collect();
+    ids.sort_unstable();
+    let dup_ids: Vec<u64> = ids.windows(2).filter(|w| w[0] == w[1]).map(|w| w[0]).collect();
+    let blocks: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "bytes": r.bytes,
+                "addr": format!("{:#x}", r.addr),
+                "ledger": r.ledger,
+            })
+        })
+        .collect();
+    json!({
+        "count": rows.len(),
+        "total_bytes": rows.iter().map(|r| r.bytes).sum::<usize>(),
+        "dup_ids": dup_ids,
+        "overlaps": overlaps,
+        "clean": dup_ids.is_empty() && overlaps.is_empty(),
+        "blocks": blocks,
+    })
+}

@@ -94,6 +94,9 @@ impl GpuServer {
                 None => Box::new(Staging::alloc(n, "try_htod")?),
             };
         buf.slice_bytes_mut()[..n].copy_from_slice(data);
+        // **清零序**(2026-10-16):H2D 写入设备块前,先等该块的 `alloc{zero}` memset
+        // 落地 —— 两流无序时晚到的 memset 会抹掉刚落地的搬运(实测 A_log 32B)。
+        self.ctx_mut().wait_zeroing(id, STREAM_H2D)?;
         let (dptr, _) = self.ctx().block_ptr(id, stream)?;
         // 池块容量 ≥ 请求:DMA 长度必须截到 n(越界写设备块 = INVALID_VALUE)
         unsafe { memcpy_htod_async(dptr, &buf.as_bytes()[..n], stream.cu_stream()) }
@@ -170,6 +173,8 @@ impl GpuServer {
             Ok(s) => s.clone(),
             Err(e) => return Err(e),
         };
+        // **清零序**(同 try_htod 注):目标块可能是 alloc{zero} 刚给的
+        self.ctx_mut().wait_zeroing(dst.id, stream_id)?;
         let dptr_base = match self.ctx().block_ptr(dst.id, &stream) {
             Ok((p, _)) => p,
             Err(e) => return Err(e),
@@ -242,6 +247,13 @@ impl GpuServer {
                 .ctx()
                 .check_range(*block, *offset_bytes, data.len(), "htod-chunks")
             {
+                for b in pending {
+                    self.pool.put(b);
+                }
+                return ack.take().unwrap().send(Err(e));
+            }
+            // **清零序**(2026-10-16):见 try_htod 注(H2D 写前等该块 memset)
+            if let Err(e) = self.ctx_mut().wait_zeroing(*block, STREAM_H2D) {
                 for b in pending {
                     self.pool.put(b);
                 }
@@ -327,6 +339,10 @@ impl GpuServer {
             .ctx()
             .check_range(block, offset_bytes, data.len(), "htod-chunk")
         {
+            return ack.take().unwrap().send(Err(e));
+        }
+        // **清零序**(2026-10-16):见 try_htod 注(H2D 写前等该块 memset)
+        if let Err(e) = self.ctx_mut().wait_zeroing(block, STREAM_H2D) {
             return ack.take().unwrap().send(Err(e));
         }
         let dptr_base = match self.ctx().block_ptr(block, &stream) {

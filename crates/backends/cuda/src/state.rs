@@ -374,6 +374,12 @@ pub(super) struct GpuCtx {
     /// **三流尾事件**(E1:纯记账 —— 每命令末尾 record 一次,**不等待**;
     /// 序消费在 E2/E3。设计:`docs/arch/三流事件序-设计与迁移.md`)
     tail_event: HashMap<StreamId, TailEvent>,
+    /// **每块"清零完成"事件**(2026-10-16 定谳的填坑):`alloc{zero:true}` 的
+    /// `memset_zeros` 是 **COMPUTE 流上的设备侧异步写**,而 host→device 搬运在
+    /// **H2D 流** ⇒ 跨流无序,**晚到的 memset 会把刚落地的搬运抹成 0**
+    /// (实测:A_log 32B 写完即读回 = 0)。本账在 memset 后记一个事件,
+    /// 搬运该块时等它一次;块回收时清账。
+    zero_ev: HashMap<u64, TailEvent>,
     /// 事件池(round-robin):"重录挂在等待中的事件"是 CUDA UB(不报错)
     /// ⇒ 池化是唯一正确的复用方式;容量 = 在飞等待上界(E2 起记账)
     event_pool: Vec<TailEvent>,
@@ -644,6 +650,7 @@ impl GpuCtx {
             tail_event: HashMap::new(),
             event_pool,
             ev_next: 0,
+            zero_ev: HashMap::new(),
             ordinal,
             srv_timing: diag.srv_timing,
             cap_prof: diag.cap_prof,
@@ -695,6 +702,75 @@ impl GpuCtx {
     /// - **捕获期禁止**(`cuStreamWaitEvent` 不可捕获)⇒ 防御性拒(正常路径由
     ///   server 白名单先拦,此处是第二道);
     /// - `dep` 尚无完成点 ⇒ 响亮拒(不静默跳过 —— 跳过就等于丢序)。
+    /// **块账本快照**(调试面;`GET /debug/blocks`):迭代活块并解析设备地址。
+    /// 捕获期禁调(解析会登记图引用租约 —— 那是执行语义,不是观测语义)。
+    pub(super) fn block_ledger(&self) -> Result<Vec<owl_iface::contract::BlockLedgerRow>, ModelError> {
+        if self.capture_stream() {
+            return Err(ModelError::Msg(
+                "block_ledger: 捕获期禁止(解析会登记图引用)".into(),
+            ));
+        }
+        let stream = self.stream(STREAM_COMPUTE)?.clone();
+        let mut rows = Vec::with_capacity(self.blocks.len());
+        for (&id, e) in self.blocks.iter() {
+            // 单块解析失败 ⇒ 响亮拒(调试面禁静默跳过:少一行就少一个证据)
+            let (addr, bytes) = self.block_ptr(id, &stream)?;
+            rows.push(owl_iface::contract::BlockLedgerRow {
+                id,
+                bytes,
+                addr,
+                ledger: e.ledger,
+            });
+        }
+        rows.sort_by_key(|r| r.id);
+        Ok(rows)
+    }
+
+    /// **登记"本块已清零"事件**(在 `alloc{zero:true}` 的 memset 之后由 server 调)
+    pub(super) fn note_zeroing(&mut self, id: u64, stream: StreamId) -> Result<(), ModelError> {
+        let st = self.stream(stream)?.clone();
+        let ev = unsafe {
+            crate::ffi::event_create(crate::ffi::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING)
+        }
+        .map_err(|e| ModelError::Msg(format!("note_zeroing({id}): 建事件 {e:?}")))?;
+        unsafe { crate::ffi::event_record(ev, st.cu_stream()) }
+            .map_err(|e| ModelError::Msg(format!("note_zeroing({id}): 记入 {e:?}")))?;
+        if let Some(old) = self.zero_ev.insert(id, TailEvent(ev)) {
+            unsafe { let _ = crate::ffi::event_destroy(old.0); }
+        }
+        Ok(())
+    }
+
+    /// **等待该块的清零落地**(写入该块的搬运前必调;无账 = 无需等待)。
+    /// 语义 = "别让本块的 memset 晚到把搬运抹了";等完即清账(一次足矣)——
+    /// 等待是**设备端**的(零 host 阻塞),事件在入队等待后即可销毁
+    /// (cudarc 同款纪律:等待捕获的是调用当刻的事件状态)。
+    pub(super) fn wait_zeroing(&mut self, id: u64, dst_stream: StreamId) -> Result<(), ModelError> {
+        let Some(ev) = self.zero_ev.remove(&id) else {
+            return Ok(());
+        };
+        let st = self.stream(dst_stream)?;
+        let r = unsafe {
+            crate::ffi::stream_wait_event(
+                st.cu_stream(),
+                ev.0,
+                crate::ffi::sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
+            )
+        }
+        .map_err(|e| ModelError::Msg(format!("wait_zeroing({id}): {e:?}")));
+        unsafe { let _ = crate::ffi::event_destroy(ev.0); }
+        r
+    }
+
+    /// 块回收时清清零账(防 id 复用后误等陈旧事件)
+    pub(super) fn clear_zeroing(&mut self, ids: &[u64]) {
+        for id in ids {
+            if let Some(ev) = self.zero_ev.remove(id) {
+                unsafe { let _ = crate::ffi::event_destroy(ev.0); }
+            }
+        }
+    }
+
     pub(super) fn wait_stream_on_tail(&self, stream: StreamId, dep: StreamId) -> Result<(), ModelError> {
         if self.capture_stream() {
             return Err(ModelError::Msg(

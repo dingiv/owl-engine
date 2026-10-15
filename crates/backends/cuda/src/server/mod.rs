@@ -244,6 +244,7 @@ impl GpuServer {
                 .collect()
         };
         match cmd {
+            Command::BlockLedgerDump { .. } => E::new("block_ledger_dump", ""),
             Command::UploadAndLaunch { dst, chunks, .. } => {
                 let n: usize = chunks.iter().map(|c| c.len_bytes).sum();
                 E::new("upload_and_launch", "h2d").bytes(n).id(dst.id)
@@ -562,7 +563,7 @@ impl GpuServer {
             // 复合:两条腿各触一条流(E2 位图的第一个用例)
             Command::UploadAndLaunch { .. } => (1u8 << STREAM_H2D) | (1u8 << STREAM_COMPUTE),
             Command::LaunchAndHarvest { .. } => (1u8 << STREAM_COMPUTE) | (1u8 << STREAM_D2H),
-            // 无 GPU 活/图控制/同步/宿主面:不记账
+            // 无 GPU 活/图控制/同步/宿主面:不记账(调试投影亦不触流)
             _ => 0,
         }
     }
@@ -685,6 +686,9 @@ impl GpuServer {
             Command::CopyBatch { copies, ack } => self.handle_copy_batch(copies, ack),
             Command::Launch { msg, ack } => self.handle_launch(msg, ack),
             // **E2b 接线**:复合 = 设备端事件序(record_tail + waitEvent),零 host 阻塞
+            Command::BlockLedgerDump { ack } => {
+                ack.send(self.ctx().block_ledger())
+            }
             Command::UploadAndLaunch { dst, chunks, msg, ack } => {
                 self.handle_upload_and_launch(dst, chunks, msg, ack)
             }
@@ -723,6 +727,7 @@ impl GpuServer {
             Command::HtodChunks { ack, .. } => closed!(ack),
             Command::AllocPinned { ack, .. } => closed!(ack),
             Command::UploadPinned { ack, .. } => closed!(ack),
+            Command::BlockLedgerDump { ack } => closed!(ack),
             Command::UploadAndLaunch { ack, .. } => closed!(ack),
             Command::LaunchAndHarvest { ack, .. } => closed!(ack),
             Command::Dtoh { ack, .. } => closed!(ack),
@@ -743,6 +748,7 @@ impl GpuServer {
         macro_rules! reject { ($ack:expr) => { $ack.send(Err(ModelError::Msg(why.clone()))) } }
         let name = |c: &Command| match c {
             // E2 复合(分相计时标签;与 Command::kind() 同名单一真源)
+            Command::BlockLedgerDump { .. } => "block_ledger_dump",
             Command::UploadAndLaunch { .. } => "upload_and_launch",
             Command::LaunchAndHarvest { .. } => "launch_and_harvest",
             Command::GraphBegin { .. } => "GraphBegin",
@@ -780,6 +786,7 @@ impl GpuServer {
             Command::AllocPinned { ack, .. } => reject!(ack),
             Command::UploadPinned { ack, .. } => reject!(ack),
             // **E2 负门**:复合命令内含搬运/回读(不可捕获)⇒ 捕获期结构化拒
+            Command::BlockLedgerDump { ack } => reject!(ack),
             Command::UploadAndLaunch { ack, .. } => reject!(ack),
             Command::LaunchAndHarvest { ack, .. } => reject!(ack),
             Command::Dtoh { ack, .. } => reject!(ack),
@@ -863,6 +870,13 @@ impl GpuServer {
                     }
                 }
                 let id = self.ctx_mut().new_block(slice);
+                if zero {
+                    // **填坑(2026-10-16)**:memset 是 COMPUTE 上的设备侧异步写,
+                    // 而 host→device 搬运在 H2D 流 —— 跨流无序,晚到的 memset 会把
+                    // 刚落地的搬运抹成 0(实测 A_log 32B 写完即读回 = 0)。
+                    // 记一个事件,让写本块的搬运等它一次(`GpuCtx::wait_zeroing`)。
+                    self.ctx_mut().note_zeroing(id, STREAM_COMPUTE)?;
+                }
                 // 发射账:**分配落定**记 id + 设备地址(trace 条目 alloc 本身
                 // 无 id —— 生命周期判据要它才能把地址钉到块上)
                 self.trace_alloc_done(id);

@@ -57,6 +57,11 @@ const CHANNEL_CAPACITY: usize = 64;
 /// accept 失败退避(防 fd 耗尽等错误风暴下忙旋)
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
+/// **诊断投影面共享单元**(`/debug/blocks` 的 GPU 命令出口)。
+/// 显式依赖律:不做全局变量 —— `main` 建、actor 装、HTTP 读,全走参数。
+type DbgFace =
+    std::sync::Arc<std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<owl_cuda::GpuClient>>>>;
+
 #[tokio::main]
 async fn main() {
     // CLI:唯一参数面(配置文件路径 + flavor;手写解析,未知参数拒启)
@@ -173,6 +178,9 @@ async fn main() {
     let (bind, model_name) = (config.bind.clone(), config.model_name.clone());
     // agent 服务面旋钮(模板已装载用于 log;此处交协议面消费)
     let agent = std::sync::Arc::new(config.agent.clone());
+    // **诊断投影面共享单元**(见 `DbgFace` 注):actor 装、HTTP 读
+    let dbg_face: DbgFace = std::sync::Arc::new(std::sync::OnceLock::new());
+    let dbg_face_actor = dbg_face.clone();
     let (tx, rx) = mpsc::channel::<EngineReq>(CHANNEL_CAPACITY);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<String, String>>();
     std::thread::Builder::new()
@@ -182,7 +190,7 @@ async fn main() {
                 .enable_all()
                 .build()
                 .expect("actor runtime");
-            rt.block_on(actor_main(config, rx, &ready_tx));
+            rt.block_on(actor_main(config, rx, &ready_tx, dbg_face_actor));
         })
         .expect("actor 线程");
 
@@ -229,6 +237,7 @@ async fn main() {
         match listener.accept().await {
             Ok((stream, _peer)) => {
                 let tx = tx.clone();
+                let dbg_face = dbg_face.clone();
                 let model_name = model_name.clone();
                 let tpl = tpl.clone();
                 let agent = agent.clone();
@@ -237,7 +246,7 @@ async fn main() {
                     // 并发闸门:permit 获取排队(超出 max_concurrency 等待);
                     // 获取后持有至该连接服务完毕(长连接 = 占一并发位)
                     let _permit = gate.acquire().await;
-                    if let Err(e) = serve(stream, tx, model_name, tpl, agent).await {
+                    if let Err(e) = serve(stream, tx, model_name, tpl, agent, dbg_face.get().cloned()).await {
                         owl_shared::log_warn!("conn", "{e}");
                     }
                 });
@@ -256,6 +265,7 @@ async fn actor_main(
     config: ServerConfig,
     rx: mpsc::Receiver<EngineReq>,
     ready: &std::sync::mpsc::Sender<Result<String, String>>,
+    dbg_face: DbgFace,
 ) {
     let built: owl_engine::Result<_> = async {
         let t0 = std::time::Instant::now();
@@ -293,6 +303,13 @@ async fn actor_main(
             return;
         }
     };
+    // **调试投影面出口**(`GET /debug/blocks`):引擎就绪后把 face 句柄克隆
+    // 放进共享单元(HTTP 侧只读到同一个 actor 的另一个发送端;不阻塞引擎)。
+    if let Some(c) = running.face_clone() {
+        let _ = dbg_face.set(std::sync::Arc::new(tokio::sync::Mutex::new(c)));
+    } else {
+        owl_shared::log_info!("boot", "face 克隆不可用 ⇒ /debug/blocks 回 503(该后端不支持)");
+    }
     actor::run_actor(&mut running, rx, config.perf_dump.clone()).await;
 }
 
@@ -303,6 +320,9 @@ async fn serve(
     model_name: String,
     tpl: std::sync::Arc<chat_tpl::ChatTpl>,
     agent: std::sync::Arc<owl_shared::config::AgentCfg>,
+    // 诊断投影用的 face 句柄(`GET /debug/blocks`):engine 侧 `face_clone()`
+    // 得到的同 actor 发送端;None = 该后端不支持克隆(端点回 503)
+    dbg_face: Option<std::sync::Arc<tokio::sync::Mutex<owl_cuda::GpuClient>>>,
 ) -> std::io::Result<()> {
     let Some(req) = http::read_request(&mut stream).await? else {
         return Ok(());
@@ -496,6 +516,34 @@ async fn serve(
             v["applied"] = json!(ok);
             v["action"] = json!(msg);
             http::respond_json(&mut stream, 200, &v).await?;
+        }
+        // **块账本投影**(判"同 id 两地址 / 两活块区间相交";与发射账互补:
+        // 那张账 = 每次命令的块 id+地址,本投影 = 当前账本的权威快照)
+        ("GET", "/debug/blocks") => {
+            use owl_cuda::DeviceClient as _;
+            match dbg_face.as_ref() {
+                Some(f) => match f.lock().await.block_ledger_dump().await {
+                    Ok(rows) => {
+                        http::respond_json(&mut stream, 200, &debug::blocks_json(&rows)).await?
+                    }
+                    Err(e) => {
+                        http::respond_json(
+                            &mut stream,
+                            500,
+                            &json!({"ok": false, "error": e.to_string()}),
+                        )
+                        .await?
+                    }
+                },
+                None => {
+                    http::respond_json(
+                        &mut stream,
+                        503,
+                        &json!({"ok": false, "error": "face 克隆不可用(此后端不支持)"}),
+                    )
+                    .await?
+                }
+            }
         }
         // **发射账查询面**(cuda::trace;`[cuda] trace_ring = <N>` 开启):
         //   GET /debug/launches[/<n>[/<kind>]]  —— 最近 n 条(缺省 200)按发射序;

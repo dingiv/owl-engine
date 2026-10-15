@@ -129,6 +129,11 @@ pub enum Command {
         copies: Vec<(u64, usize, u64, usize, usize)>,
         ack: Ack<Result<(), ModelError>>,
     },
+    /// **块账本投影**(调试面;`GET /debug/blocks`):全活块 (id, 字节, dtype, 地址, 账本)
+    /// —— 判「同 id 两地址」与「两活块区间相交」的唯一权威快照。
+    BlockLedgerDump {
+        ack: Ack<Result<Vec<owl_iface::contract::BlockLedgerRow>, ModelError>>,
+    },
     /// **UploadAndLaunch**(E2 复合;闭集 1:1,设计 §3.2):一次 pinned 搬运
     /// + 一次发射。**客户端不出现流/事件/槽** —— 序由 server 内部保证
     /// (E2a:线格式/校验/负门;**E2b 接线** = 完成回调链 → 设备端事件序)。
@@ -177,6 +182,7 @@ impl Command {
             Self::Alloc { .. } => "alloc",
             Self::Htod { .. } => "htod",
             Self::MemsetZero { .. } => "memset_zero",
+            Self::BlockLedgerDump { .. } => "block_ledger_dump",
             Self::UploadAndLaunch { .. } => "upload_and_launch",
             Self::LaunchAndHarvest { .. } => "launch_and_harvest",
             Self::HtodChunk { .. } => "htod_chunk",
@@ -203,6 +209,7 @@ impl Command {
             Self::GraphDestroy { ack, .. } => ack.created_at(),
             Self::Alloc { ack, .. } => ack.created_at(),
             Self::Htod { ack, .. } => ack.created_at(),
+            Self::BlockLedgerDump { ack } => ack.created_at(),
             Self::UploadAndLaunch { ack, .. } => ack.created_at(),
             Self::LaunchAndHarvest { ack, .. } => ack.created_at(),
             Self::MemsetZero { ack, .. } => ack.created_at(),

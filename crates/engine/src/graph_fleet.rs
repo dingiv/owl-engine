@@ -195,6 +195,12 @@ impl<D: DeviceClient> GraphFleet<D> {
     /// KV 槽 = 本 token 自己的格子(窗 = [slot-kv_len+1, slot],随步进;
     /// 2026-09-26 窗口语义探针定谳:slots 恒 0 读块外垃圾行);
     /// GDN 槽 = 序列状态格,turn 内恒 0(递推状态按序列累积)。
+    /// **face 句柄克隆**(诊断/投影面出口:`GET /debug/blocks` 的 GPU 命令通道;
+    /// 取主会话图的 face —— 克隆 = 同一个 actor 的另一个发送端)
+    pub fn face_clone(&self) -> Option<D> {
+        self.session.face_clone()
+    }
+
     async fn plan_session(face: D, boot: &FleetBoot<'_>, t0: T) -> Result<(GraphPlan<D>, PlanOutcome)> {
         let env = boot.env;
         let pool = boot.pool;

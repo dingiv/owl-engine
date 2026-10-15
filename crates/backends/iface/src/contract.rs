@@ -141,6 +141,24 @@ impl PinnedRegion for HeapRegion {
 /// - `htod` / `dtoh`:Ok = GPU 真完成(pinned 码头生命周期/数据收割
 ///   要求真实完成点;完成通知走 host 回调 cuLaunchHostFunc)
 /// - `sync`:栅栏,三条流此前全部工作落定(全设备语义屏障)
+/// **块账本一行**(调试投影;`GET /debug/blocks`)。
+///
+/// 为什么需要它:地址复用/区间重叠是"跨流 UAF"与"写丢失"类缺陷的**唯一钥匙**
+/// (仓内 2026-10-08 E5 跨流回收律 / 2026-10-03 FI 表渐进腐败案都栽在这里)。
+/// 发射账(`owl_cuda::trace`)给的是"每次命令的块 id + 地址";本投影给的是
+/// **当前账本的权威快照**(id → 地址区间/字节/dtype)⇒ 可直接判
+/// 「同 id 两地址」与「两活块区间相交」。
+#[derive(Debug, Clone)]
+pub struct BlockLedgerRow {
+    pub id: u64,
+    /// 账长(字节口径;块账本形态为字节,故不带 dtype)
+    pub bytes: usize,
+    /// 设备地址(解析当刻)
+    pub addr: u64,
+    /// 所属账本(actor 序号)
+    pub ledger: u32,
+}
+
 /// **复合命令 `UploadAndLaunch` 的一块搬运**(字节口径;租约所有权随命令
 /// 移入,server 在 DMA 完成后归还 pinned 池)。
 /// 定为契约面类型:既是线格式,也是 [`DeviceClient`] 复合口的参数。
@@ -363,6 +381,11 @@ pub trait DeviceClient: Send {
         _want_bytes: usize,
     ) -> impl Future<Output = Result<Vec<u8>, ModelError>> + Send {
         async { Err(ModelError::Msg("launch_and_harvest: 此后端未实现".into())) }
+    }
+
+    /// **块账本投影**(调试面;默认不支持):全活块 (id, 字节, dtype, 地址, 账本)。
+    fn block_ledger_dump(&mut self) -> impl Future<Output = Result<Vec<BlockLedgerRow>, ModelError>> + Send {
+        async { Err(ModelError::Msg("block_ledger_dump: 此后端未实现".into())) }
     }
 
     /// 设备内块→块拷贝(E2c:GDN 快照拍摄/恢复 —— 会话格 ↔ 快照缓冲

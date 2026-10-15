@@ -252,6 +252,11 @@ pub struct GraphPlan<D: DeviceClient> {
 }
 
 impl<D: DeviceClient> GraphPlan<D> {
+    /// **face 句柄克隆**(诊断投影出口;偶极:server 是 actor,克隆发送端即可)
+    pub(crate) fn face_clone(&self) -> Option<D> {
+        self.face.face_clone()
+    }
+
     /// 声明 + warmup + (可选)捕获。流程纪律全部在此闭合:
     /// 姿势 6 warmup 门禁(lite)/ 两道捕获预检 / EagerFallback。
     pub async fn plan(

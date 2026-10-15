@@ -166,6 +166,11 @@ pub fn budget_clamp(
 
 impl<D: DeviceClient> RunningEngine<D> {
     /// 捕获三态结果(Captured = 回放态;EagerFallback = 同闭包直发)
+    /// **face 句柄克隆**(HTTP 调试投影面出口;见 `apps/server` 的 `/debug/blocks`)
+    pub fn face_clone(&self) -> Option<D> {
+        self.graphs.face_clone()
+    }
+
     pub fn capture_outcome(&self) -> &crate::graph_plan::PlanOutcome {
         &self.graphs.capture_outcome
     }

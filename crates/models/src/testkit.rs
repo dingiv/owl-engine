@@ -154,9 +154,20 @@ pub fn gpu_enabled() -> bool {
 
 /// GPU face(owl-cuda actor;门控已过才调用)
 pub async fn gpu_client() -> owl_cuda::GpuClient {
-    owl_cuda::GpuClient::spawn(owl_cuda::DeviceSelector::Ordinal(
-        owl_cuda::test_device_ordinal(),
-    ))
+    // 发射账(`cuda.trace_ring`)在设备路径上**无 env 读取**(显式依赖律)⇒ 测试侧
+    // 读一次 env 显式传入:`OWL_TRACE_RING=<N>` 开(进程内全局环,测试可直接
+    // 用 `owl_cuda::trace::recent(...)` 读回 —— 含块 id 与设备地址)。
+    let trace_ring = owl_shared::env_reader::parse_or("OWL_TRACE_RING", 0usize);
+    let diag = owl_cuda::DiagOpts {
+        trace_ring,
+        ..Default::default()
+    };
+    owl_cuda::GpuClient::spawn_with(
+        owl_cuda::DeviceSelector::Ordinal(owl_cuda::test_device_ordinal()),
+        diag,
+        false,
+        owl_shared::log::LogSink::none(),
+    )
     .expect("gpu server boot(OWL_TEST_DEVICE 指向空闲卡)")
 }
 
