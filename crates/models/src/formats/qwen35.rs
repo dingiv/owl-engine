@@ -11,15 +11,17 @@
 //! 未来新档(4B/…)加构造函数;新模型(qwen3 dense 等)另起
 //! `specs/<model>.rs`,勿混居。
 //!
-//! **M-e 装载面**:Qwen35Convention(键名约定)+ [`load_0_8b`] 快照
-//! 目录装载入口 —— 模型特有胶水(子前缀/裸键/基座)全部封在本文件,
-//! 通用层(model.rs/module.rs/loader.rs)零 Qwen3.5 知识。
+//! **起点侧事实**(L4 后):Qwen35Convention(键名约定)+ 族预设
+//! ([`qwen3_5_0_8b`] / [`qwen3_8_27b`]:维度 + tokenizer 声明)+ 检查点特例
+//! ([`dflash2_draft`] 声明 + 两个 `Loadable` 键映射)——
+//! **零装载机制**:装载一律走 [`load_from_dir`](crate::formats::load::load_from_dir)
+//! 通用入口;通用层(model.rs/module.rs/formats/load.rs)零 Qwen3.5 知识。
 
 //! 检查点实测(488 张量):BF16 为主 + `A_log`/`dt_bias` 两个 F32 裸键;
 //! conv1d 为 3D `[6144,1,4]`(扁平直读)。visual/mtp 153 键不在最小路径。
 
 use crate::contract::{DeviceClient, ModelError};
-use crate::formats::safetensors::SafeTensorsSource;
+use crate::formats::load::LoadOpts;
 use crate::model::{Model, ModelSpec};
 use crate::module::{KeyConvention, Loadable, LoaderCtx, LoaderOps};
 use std::path::Path;
@@ -89,201 +91,6 @@ impl KeyConvention for Qwen35Convention {
         let tail = qsuffix.unwrap_or_else(|| suffix.to_string());
         format!("{}.layers.{i}.{}{local}{tail}", self.base, sub)
     }
-}
-
-// ============================================================================
-// 装载入口(M-e)
-// ============================================================================
-
-/// 装载 Qwen3.5-0.8B(快照目录:`config.json` + `*.safetensors`)。
-/// 目录内全部 safetensors 合并取源(BF16 → f32,visual/mtp 键无害
-/// 常驻源内,只有主干键会被查到);装载走整模 Loadable 单清单。
-/// 装载 Qwen3.5-0.8B(快照目录:`config.json` + `*.safetensors`)。
-/// 目录内全部 safetensors 合并取源(BF16 → f32,visual/mtp 键无害
-/// 常驻源内,只有主干键会被查到);装载走整模 Loadable 单清单。
-pub async fn load_0_8b<D: DeviceClient + 'static>(
-    dir: &Path,
-    face: &mut D,
-) -> Result<Model, ModelError> {
-    let model = Model::new(
-        &qwen3_5_0_8b(),
-        Qwen35Convention::new("model.language_model"),
-        crate::module::QuantPlan::F16,
-        crate::module::QuantPlan::F16,
-    );
-    let src = SafeTensorsSource::open_dir(dir)?;
-    // F16 直转装载(F5;权重 bf16 检查点 → f16 字节,不再 f32 设备中转)
-    let ctx = crate::module::LoaderCtx { dtype: qwen3_5_0_8b().dtype, shard: 1, device_repack: false, verify: false, debug_tap: false };
-    crate::interpreters::eval_load(&model, face, &src, &ctx).await?;
-    Ok(model)
-}
-
-/// 装载 Qwen3.5-0.8B **W4A16**(E3;llm-compressor 产物目录,
-/// compressed-tensors pack-quantized)—— 装载期重排到 marlin 布局
-/// (w4a16.rs 源;小线性自动反量化 f16)。
-pub async fn load_0_8b_w4a16<D: DeviceClient + 'static>(
-    dir: &Path,
-    face: &mut D,
-) -> Result<Model, ModelError> {
-    let spec = qwen3_5_0_8b();
-    // 量化计划构造期注入(禁 enable_* 可变后置):W4A16 臂在此定形,
-    // 尺寸门控(marlin_eligible)在 Linear 构造期完成,小线性自动落 f16。
-    let model = Model::new(
-        &spec,
-        Qwen35Convention::new("model.language_model"),
-        crate::module::QuantPlan::W4A16,
-        crate::module::QuantPlan::F16,
-    );
-    let src = crate::formats::w4a16::W4A16Source::open_dir(dir)?;
-    let ctx = crate::module::LoaderCtx { dtype: crate::contract::Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false };
-    crate::interpreters::eval_load(&model, face, &src, &ctx).await?;
-    Ok(model)
-}
-
-/// 装载 **Qwen3.8-27B AWQ-INT4**(2026-10-01;cyankiwi 检查点,
-/// compressed-tensors pack-quantized **g32-asym + zp**)—— 装载源
-/// formats/awq.rs:eligible 线性走 marlin kU4(has_zp)内核
-/// (GEMM_W4A16_AWQ),非门控线性/checkpoint ignore 项反量化或直读 f16。
-///
-/// 维度事实以**检查点实测**为准(config 的 24 头与张量形状不符):
-/// - full attention:q 48 头 ×256(q_proj [12288, 5120])/ kv 4 头 ×256
-///   (k/v_proj [1024, 5120]);
-/// - GDN:qk 16 头 ×128(in_proj_qkv [10240, 5120] = 2048+2048+6144)/
-///   v 48 头 ×128(in_proj_z [6144, 5120]);
-/// - 64 层 3:1 hybrid(layers i%4==3 为 full);vocab 248320 不 tied。
-///   MTP 头装载(E5-M0;cyankiwi 检查点自带 15 个 mtp.* 键全 BF16 ——
-///   结构 = vLLM Qwen3NextMultiTokenPredictor 同构,见 layers/mtp.rs)。
-///   返回 (组件, 装载清单);键集断言(15 键)由测试做。
-pub async fn load_27b_mtp<D: DeviceClient + 'static>(
-    dir: &Path,
-    face: &mut D,
-) -> Result<(crate::layers::mtp::MtpPredictor, crate::module::LoadManifest), ModelError> {
-    let s = qwen3_8_27b();
-    let mtp = crate::layers::mtp::MtpPredictor::new(
-        s.hidden,
-        s.inter,
-        s.full_heads.0,
-        s.full_heads.1,
-        s.full_heads.2,
-        s.eps,
-    );
-    let src = crate::formats::awq::AwqSource::open_dir(dir)?;
-    let device_repack =
-        crate::module::RepackPath::resolve(None, face.device_kernels()).is_device();
-    let ctx = crate::module::LoaderCtx {
-        dtype: crate::contract::Dtype::F16,
-        shard: 1,
-        device_repack,
-        verify: false,
-        debug_tap: false,
-    };
-    let manifest = crate::interpreters::eval_load(&mtp, face, &src, &ctx).await?;
-    Ok((mtp, manifest))
-}
-
-/// 装载 **Qwen3.8-27B DFlash2 草稿**(2026-10-07;E5-DF1,
-/// z-lab/Qwen3.8-27B-DFlash2,BF16 81 张量 1.92B —— 结构见
-/// layers/dflash2.rs 头注;键约定 = 检查点原生命名直映)。
-/// 全 F16 直转装载(BF16 源 → f16;fc 走 Transposed 臂,装载期 host
-/// 转置 —— W^T 行连续 = 列块,消费面逐 tap slice_view;设备重排优化挂账)。
-pub async fn load_27b_dflash2<D: DeviceClient + 'static>(
-    dir: &Path,
-    face: &mut D,
-    kv_fp8: bool,
-) -> Result<(crate::layers::dflash2::DFlash2Draft, crate::module::LoadManifest), ModelError> {
-    load_27b_dflash2_with(dir, face, kv_fp8, None).await
-}
-
-/// repack 路径可显式覆写(A/B 与单测用;None = 能力自述裁决)。
-/// 生产入口 [`load_27b_dflash2`] 走 None,行为与历史一致。
-pub async fn load_27b_dflash2_with<D: DeviceClient + 'static>(
-    dir: &Path,
-    face: &mut D,
-    kv_fp8: bool,
-    device_repack: Option<bool>,
-) -> Result<(crate::layers::dflash2::DFlash2Draft, crate::module::LoadManifest), ModelError> {
-    // 源族自动探测(fc.weight_scale 在 = compressed-tensors W4A16 g128;
-    // 缺 = BF16 原生)。W4A16 = 1.28GB(BF16 3.85GB)—— 24G 恒等门前置。
-    // 裸索引探测(SafeTensorsSource::open_dir 的 F32/BF16 校验会拒收
-    // W4A16 文件的 I32/F16 条目;open_raw_index 无过滤零拷贝)
-    let (_, raw) = crate::formats::mmap::open_raw_index(dir)?;
-    let is_q = raw.contains_key("fc.weight_packed");
-    drop(raw);
-    let ctx = crate::module::LoaderCtx {
-        // BF16(E5-DF3 同日十四;sglang 对齐):草稿路径 BF16 全程 ——
-        // 检查点 passthrough 权重(norms/conv 投影/codebooks)原生 BF16
-        // 直载零转换;marlin scales 钉 F16(dtype_override);激活/池全 bf16
-        dtype: crate::contract::Dtype::BF16,
-        shard: 1,
-        // 设备重排裁决(唯一产地 = RepackPath::resolve;2026-10-13 DFlash2
-        // 草稿提速):草稿原写死 false → CPU 两步 unpack+gather 66 张量
-        // ≈24.6s;改走 GPU repack(owl_ct_repack_u32,与 AWQ 同核同 B 布局)。
-        device_repack: crate::module::RepackPath::resolve(device_repack, face.device_kernels()).is_device(),
-        verify: false,
-        debug_tap: false,
-    };
-    if is_q {
-        let draft = crate::layers::dflash2::DFlash2Draft::new_with_plan_dt(
-            5120,
-            17408,
-            32,
-            8,
-            128,
-            5,
-            1e-6,
-            248320,
-            crate::module::QuantPlan::W4A16,
-            crate::contract::Dtype::BF16,
-        kv_fp8,
-        );
-        let src = crate::formats::w4a16::W4A16Source::open_dir(dir)?;
-        src.set_device_repack(ctx.device_repack);
-        let manifest = crate::interpreters::eval_load(&draft, face, &src, &ctx).await?;
-        // E5 内存账:草稿装载分类账(按 dtype×layout 聚合元素数与字节)
-        {
-            let mut agg: std::collections::BTreeMap<String, (u64, u64)> = Default::default();
-            for e in manifest.entries() {
-                let bytes: u64 = e.shape.iter().map(|&d| d as u64).product::<u64>()
-                    * match e.dtype {
-                        crate::contract::Dtype::F16 | crate::contract::Dtype::BF16 => 2,
-                        crate::contract::Dtype::F32 | crate::contract::Dtype::U32 => 4,
-                        crate::contract::Dtype::U8 => 1,
-                    };
-                let key = format!("{:?}/{:?}", e.dtype, e.layout);
-                let e2 = agg.entry(key).or_insert((0, 0));
-                e2.0 += 1;
-                e2.1 += bytes;
-            }
-            for (k, (n, b)) in agg {
-                eprintln!("[draft-mem] {k}: {n} 项 {b} ({:.2} GB)", b as f64 / 1e9);
-            }
-        }
-        return Ok((draft, manifest));
-    }
-    // ⚠️ BF16 原生家族(z-lab)分支警示(2026-10-10 立案):本分支草稿
-    // 在 27B+draft 服务形态实测全拒(AL=1.000 恒 m0,三域/双 dtype 主池
-    // 同象)→ spec 退化为裸 decode−税(数学域 36 vs W4A16 家族 157 t/s)。
-    // 生产一律用 W4A16(syvai);本分支死活另案(golden 参考/对照臂用途)。
-    eprintln!(
-        "[boot] ⚠️ DFlash2 草稿 = BF16 原生家族:实测草稿全拒(AL=1.0),\n         生产请用 W4A16 家族(syvai/...-DFlash2-W4A16);分支死活另案"
-    );
-    let draft = crate::layers::dflash2::DFlash2Draft::new_with_plan_dt(
-        5120,
-        17408,
-        32,
-        8,
-        128,
-        5,
-        1e-6,
-        248320,
-        crate::module::QuantPlan::F16,
-        crate::contract::Dtype::BF16,
-        kv_fp8,
-    );
-    eprintln!("[boot] dflash draft-pool kv_fp8 = {kv_fp8}");
-    let src = SafeTensorsSource::open_dir(dir)?;
-    let manifest = crate::interpreters::eval_load(&draft, face, &src, &ctx).await?;
-    Ok((draft, manifest))
 }
 
 /// fc 形态标记(Loadable 分派用;借用拆分)
@@ -417,37 +224,57 @@ impl Loadable for crate::layers::mtp::MtpPredictor {
     }
 }
 
-pub async fn load_27b_awq<D: DeviceClient + 'static>(
+/// **DFlash2 草稿声明**(起点 → 声明;**不装载**):
+/// - 维度事实 = 草稿检查点自己的 `config.json`(组件档:无 `embed_tokens`
+///   ⇒ 空基座,`ModelSpec::from_ckpt`);无自持常量;
+/// - fc 臂 = 起点格式探测([`CheckpointKind`](crate::formats::kind::CheckpointKind):
+///   `PackQuantized`/`AwqGemm` ⇒ W4A16 臂;`SafeTensors` ⇒ host 转置臂)
+///   —— 与装载器同一探测口(不由函数名决定);
+/// - dtype = BF16 全程(E5-DF3 同日十四;sglang 对齐):检查点 passthrough
+///   权重(norms/conv 投影/codebooks)原生 BF16 直载零转换;marlin scales
+///   钉 F16(dtype_override);激活/池全 bf16。
+///
+/// 装载交给调用方走通用入口
+/// [`load_from_dir`](crate::formats::load::load_from_dir)(起点开源 + 求值)。
+pub fn dflash2_draft(
     dir: &Path,
-    face: &mut D,
-    head_plan: crate::module::QuantPlan,
-) -> Result<Model, ModelError> {
-    let model = Model::new(
-        &qwen3_8_27b(),
-        Qwen35Convention::new("model.language_model"),
-        crate::module::QuantPlan::W4A16Awq,
-        // C1 lm_head 头部量化计划(2026-10-11):量化方案由配置枚举映射
-        // (HeadQuant → QuantPlan,engine loader 唯一点);W4A16Awq 下
-        // bf16 裸 lm_head 由装载源 F16 兕底臂现场 RTN int4(g32 sym,
-        // zp≡8;marlin kU4 通路)—— 零拼装,检查点不动。质量门:竖式/
-        // gate greedy A/B 已过。
-        head_plan,
-    );
-    let src = crate::formats::awq::AwqSource::open_dir(dir)?;
-    // repack 路径裁决(唯一收口:module::RepackPath::resolve ——
-    // 默认 GPU;host face 能力否决自动回退;OWL_LOAD_CPU_REPACK env 强制)
-    let device_repack =
-        crate::module::RepackPath::resolve(None, face.device_kernels()).is_device();
-    src.set_device_repack(device_repack);
-    let ctx = crate::module::LoaderCtx {
-        dtype: crate::contract::Dtype::F16,
-        shard: 1,
-        device_repack,
-        verify: false,
-        debug_tap: false,
+    kv_fp8: bool,
+) -> Result<crate::layers::dflash2::DFlash2Draft, ModelError> {
+    use crate::formats::kind::CheckpointKind;
+    let (spec, rep) = ModelSpec::from_ckpt(
+        dir,
+        crate::formats::spec::SpecSource::family(&qwen3_8_27b()),
+    )?;
+    if !rep.mismatches.is_empty() {
+        eprintln!(
+            "[dflash2] 草稿 spec 失配 {} 条: {:?}",
+            rep.mismatches.len(),
+            rep.mismatches
+        );
+    }
+    let kind = crate::formats::kind::detect(dir)?.kind;
+    let is_q = matches!(kind, CheckpointKind::PackQuantized | CheckpointKind::AwqGemm);
+    if !is_q {
+        // ⚠️ BF16 原生家族(z-lab)分支警示(2026-10-10 立案):本分支草稿
+        // 在 27B+draft 服务形态实测全拒(AL=1.000 恒 m0,三域/双 dtype 主池
+        // 同象)→ spec 退化为裸 decode−税(数学域 36 vs W4A16 家族 157 t/s)。
+        // 生产一律用 W4A16(syvai);本分支死活另案(golden 参考/对照臂用途)。
+        eprintln!(
+            "[boot] ⚠️ DFlash2 草稿 = BF16 原生家族:实测草稿全拒(AL=1.0),\n         生产请用 W4A16 家族(syvai/...-DFlash2-W4A16);分支死活另案"
+        );
+        eprintln!("[boot] dflash draft-pool kv_fp8 = {kv_fp8}");
+    }
+    let plan = if is_q {
+        crate::module::QuantPlan::W4A16
+    } else {
+        crate::module::QuantPlan::F16
     };
-    crate::interpreters::eval_load(&model, face, &src, &ctx).await?;
-    Ok(model)
+    Ok(crate::layers::dflash2::DFlash2Draft::from_spec(
+        &spec,
+        plan,
+        crate::contract::Dtype::BF16,
+        kv_fp8,
+    ))
 }
 
 /// Qwen3.5 tokenizer 装配:机制在 tokenizer.rs,事实在 spec 声明
@@ -543,7 +370,46 @@ mod tests {
     use crate::module::{ForwardCtx, Module};
     use crate::tensor::Dtype;
     use std::collections::HashMap;
+    use crate::formats::load::{load_from_dir, manifest_mem_ledger, LoadOpts};
     use crate::testkit::{f32b, manifest_dir};
+
+    /// 0.8B 整装(测试路;与 engine/loader.rs 同构:声明 → 通用入口)
+    async fn load_0_8b<D: crate::contract::DeviceClient>(
+        dir: &Path,
+        face: &mut D,
+    ) -> Result<Model, ModelError> {
+        let spec = qwen3_5_0_8b();
+        let model = Model::new(
+            &spec,
+            Qwen35Convention::new("model.language_model"),
+            crate::module::QuantPlan::F16,
+            crate::module::QuantPlan::F16,
+        );
+        load_from_dir(dir, face, &model, LoadOpts::plain(spec.dtype)).await?;
+        Ok(model)
+    }
+
+    /// DFlash2 草稿整装(测试路;device_repack 可覆写 = A/B 门)
+    async fn load_dflash2_draft<D: crate::contract::DeviceClient>(
+        dir: &Path,
+        face: &mut D,
+        kv_fp8: bool,
+        device_repack: Option<bool>,
+    ) -> Result<(crate::layers::dflash2::DFlash2Draft, crate::module::LoadManifest), ModelError> {
+        let draft = dflash2_draft(dir, kv_fp8)?;
+        let opts = LoadOpts {
+            dtype: Dtype::BF16,
+            device_repack: Some(
+                crate::module::RepackPath::resolve(device_repack, face.device_kernels())
+                    .is_device(),
+            ),
+            verify: false,
+            debug_tap: false,
+        };
+        let manifest = load_from_dir(dir, face, &draft, opts).await?;
+        manifest_mem_ledger(&manifest, "draft-mem");
+        Ok((draft, manifest))
+    }
 
     #[test]
     fn hybrid_3to1_matches_config() {
@@ -580,7 +446,7 @@ mod tests {
         // ① 生产姿势装载(设备重排臂)计时
         let t0 = std::time::Instant::now();
         let (draft_dev, manifest) =
-            load_27b_dflash2_with(std::path::Path::new(&dir), &mut gpu, false, Some(true))
+            load_dflash2_draft(std::path::Path::new(&dir), &mut gpu, false, Some(true))
                 .await
                 .expect("草稿装载(设备重排)");
         eprintln!(
@@ -715,7 +581,7 @@ mod tests {
         }
         let t_cpu = std::time::Instant::now();
         let (draft_cpu, _m2) =
-            load_27b_dflash2_with(std::path::Path::new(&dir), &mut gpu, false, Some(false))
+            load_dflash2_draft(std::path::Path::new(&dir), &mut gpu, false, Some(false))
                 .await
                 .expect("草稿装载(CPU 臂)");
         eprintln!("[draft-bench] CPU 臂装载(对照) {:?}", t_cpu.elapsed());
@@ -1099,7 +965,7 @@ mod tests {
             crate::module::QuantPlan::F16,
         );
         let manifest = {
-            let src = SafeTensorsSource::open_dir(&dir)?;
+            let src = crate::formats::safetensors::SafeTensorsSource::open_dir(&dir)?;
             let ctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false };
             crate::interpreters::eval_load(&model, &mut gpu, &src, &ctx).await?
         };
@@ -1254,6 +1120,12 @@ mod tests {
         use crate::layers::gdn::GdnBuffers;
         use crate::layers::rope::Rope;
         use crate::module::KvBuffers;
+        // 门控补齐(2026-10-16 收尾):本测原无门 ⇒ 全量跑默认占 0 号卡
+        // (本机 0 号常驻其他引擎 ⇒ OOM 假红);与邻居测同纪律。
+        if !crate::testkit::gpu_enabled() {
+            crate::testkit::skip_note();
+            return;
+        }
         let dir = manifest_dir().join("assets/Qwen3.5-0.8B");
         let t_len = 2usize; // 两 token 判别
         let slots_n = 8usize;
@@ -1431,10 +1303,11 @@ mod tests {
         use crate::layers::gdn::GdnBuffers;
         use crate::layers::rope::Rope;
         use crate::module::KvBuffers;
-        // if !crate::testkit::gpu_enabled() {
-        //     crate::testkit::skip_note();
-        //     return;
-        // }
+        // 门控恢复(2026-10-16 收尾):原注释掉 ⇒ 全量跑恒占 0 号卡
+        if !crate::testkit::gpu_enabled() {
+            crate::testkit::skip_note();
+            return;
+        }
         let dir = manifest_dir().join("assets/Qwen3.5-0.8B");
         eprintln!("[smoke] boot server...");
         let mut gpu = crate::testkit::gpu_client().await;
@@ -1575,7 +1448,7 @@ mod tests {
         };
         let dir = std::path::Path::new(&dir);
         let mut gpu = crate::testkit::gpu_client().await;
-        let (draft, manifest) = load_27b_dflash2(dir, &mut gpu, false)
+        let (draft, manifest) = load_dflash2_draft(dir, &mut gpu, false, None)
             .await
             .expect("DFlash2 装载");
         assert_eq!(draft.hidden(), 5120);

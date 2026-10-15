@@ -29,7 +29,7 @@ use crate::layers::mrope::{split_video_frames, token_types, MropeCfg};
 use crate::layers::vision::{GridThw, VisionCfg, VisionInputs, VisionTables, VisionTower};
 use crate::model::{Model, ModelSpec};
 use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, QuantPlan};
-use crate::specs::qwen35::Qwen35Convention;
+use crate::formats::qwen35::Qwen35Convention;
 use crate::TensorOps;
 
 /// VLM 超参(`config.json` 单源;文本 + 塔 + 占位 token 三族)
@@ -116,7 +116,7 @@ impl VlmCfg {
                     .map(|x| x.as_str() == Some("full_attention"))
                     .collect::<Vec<bool>>()
             })
-            .unwrap_or_else(|| crate::specs::qwen35::hybrid_3to1(g("num_hidden_layers").unwrap_or(0)));
+            .unwrap_or_else(|| crate::formats::qwen35::hybrid_3to1(g("num_hidden_layers").unwrap_or(0)));
         // eos 字面量:Qwen3.5 家族共享(vocab 248320;`<|im_end|>` = 248044)
         let eos: Vec<&'static str> = if text.get("eos_token_id").is_some() {
             vec!["<|im_end|>"]
@@ -246,8 +246,15 @@ impl Vlm {
         })?;
         let cfg = VlmCfg::from_json(&raw)?;
         let vlm = Vlm::new(cfg, QuantPlan::F16, QuantPlan::F16)?;
-        let src = crate::formats::safetensors::SafeTensorsSource::open_dir(dir)?;
-        crate::interpreters::eval_load(&vlm, face, &src, &ctx).await?;
+        // 装载走通用入口(起点探测 → 开源 → 求值);ctx → LoadOpts 单一映射
+        // (`shard` 是 TP 预留词,单卡恒 1,不进旋钮面)
+        let opts = crate::formats::load::LoadOpts {
+            dtype: ctx.dtype,
+            device_repack: Some(ctx.device_repack),
+            verify: ctx.verify,
+            debug_tap: ctx.debug_tap,
+        };
+        crate::formats::load::load_from_dir(dir, face, &vlm, opts).await?;
         Ok(vlm)
     }
 
@@ -752,7 +759,7 @@ mod tests {
         )
         .await
         .expect("rope 表(f16)");
-        let tok = crate::specs::qwen35::load_tokenizer(&dir, &c.text_spec.tokenizer).expect("tokenizer");
+        let tok = crate::formats::qwen35::load_tokenizer(&dir, &c.text_spec.tokenizer).expect("tokenizer");
 
         let json = std::fs::read_to_string(golden.with_extension("json")).expect("金标 sidecar json");
         let meta: serde_json::Value = serde_json::from_str(&json).expect("sidecar 解析");

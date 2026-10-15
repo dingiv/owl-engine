@@ -23,10 +23,20 @@ pub struct SpecSource<'a> {
     pub tokenizer: &'a TokenizerSpec,
 }
 
+impl<'a> SpecSource<'a> {
+    /// 组件档/族事实:dtype + tokenizer 声明取自模型族预设
+    /// (维度事实仍从检查点读 —— 预设只供"非维度"两项)。
+    pub fn family(preset: &'a ModelSpec) -> Self {
+        Self { dtype: preset.dtype, tokenizer: &preset.tokenizer }
+    }
+}
+
 /// 读取账(键基座 + config↔形状 失配清单;空 = 完全一致)
 #[derive(Debug, Default, Clone)]
 pub struct SpecReport {
-    /// 实测键基座(`model.language_model` / `model` / …;含尾点)
+    /// 实测键基座(`model.language_model` / `model` / …;含尾点)。
+    /// **空串 = 组件档**(草稿头/塔:检查点无 `embed_tokens` ⇒ 键为原生
+    /// 命名直映,基座为空),此时维度事实全部来自 config.json。
     pub keys_base: String,
     /// 失配条目(`字段: config=X 形状=Y(采形状)`)
     pub mismatches: Vec<String>,
@@ -47,10 +57,12 @@ impl ModelSpec {
         let idx: HashMap<String, crate::formats::mmap::RawEntry> = raw;
 
         // ---- 键基座:哪个前缀命中 embed_tokens(实测,禁写死)----
+        // 组件档(草稿头/塔)本无 embed_tokens ⇒ 空基座(原生命名直映);
+        // 维度事实退化为纯 config.json(缺项则由 pick 响亮拒)。
         let base = idx
             .keys()
             .find_map(|k| k.strip_suffix("embed_tokens.weight").map(|b| b.to_string()))
-            .ok_or_else(|| ModelError::Msg("from_ckpt: 索引里找不到 *.embed_tokens.weight(键基座无据)".into()))?;
+            .unwrap_or_default();
         let mut rep = SpecReport { keys_base: base.clone(), mismatches: Vec::new() };
 
         // ---- 形状探针(指数级:`.weight` 直取;量化族 `.weight_packed` 配 `.weight_shape`)----
@@ -134,43 +146,51 @@ impl ModelSpec {
             None => g("num_attention_heads").ok_or_else(|| ModelError::Msg("from_ckpt: num_attention_heads 无据".into()))?,
         };
         // GDN 头:config 给头数+头维;索引只查**乘积**是否一致
-        // (头维是 GDN 自己的 hk_dim,与 FA 的 hd 无关 —— 别拿 hd 去除)
-        let nk = g("linear_num_key_heads")
-            .ok_or_else(|| ModelError::Msg("from_ckpt: linear_num_key_heads 无据".into()))?;
-        let nv = g("linear_num_value_heads")
-            .ok_or_else(|| ModelError::Msg("from_ckpt: linear_num_value_heads 无据".into()))?;
-        let mut gdn_pair = |field: &str, cfg_dim: Option<usize>, prod: Option<usize>, heads: usize| -> Result<usize, ModelError> {
-            let cfg_dim = cfg_dim.ok_or_else(|| ModelError::Msg(format!("from_ckpt: {field} 无据")))?;
-            let Some(p) = prod else { return Ok(cfg_dim) };
-            if p == heads * cfg_dim {
-                return Ok(cfg_dim);
-            }
-            rep.mismatches.push(format!(
-                "{field}: config={cfg_dim}(×{heads}={}) 形状总宽={p}(采形状)",
-                heads * cfg_dim
-            ));
-            if p % heads == 0 {
-                Ok(p / heads)
-            } else {
-                rep.mismatches.push(format!("{field}: 形状总宽 {p} 不被头数 {heads} 整除(采 config)"));
-                Ok(cfg_dim)
-            }
+        // (头维是 GDN 自己的 hk_dim,与 FA 的 hd 无关 —— 别拿 hd 去除)。
+        // 纯 full-attention 档(草稿头/塔)无 GDN 层 ⇒ 四元组归零
+        // (零不参与任何形状律;有 GDN 层而 config 缺项则响亮拒)。
+        let has_gdn = layer_types.iter().any(|&full| !full);
+        let (nk, hk_dim, nv, hv_dim) = if !has_gdn {
+            (0, 0, 0, 0)
+        } else {
+            let nk = g("linear_num_key_heads")
+                .ok_or_else(|| ModelError::Msg("from_ckpt: linear_num_key_heads 无据".into()))?;
+            let nv = g("linear_num_value_heads")
+                .ok_or_else(|| ModelError::Msg("from_ckpt: linear_num_value_heads 无据".into()))?;
+            let mut gdn_pair = |field: &str, cfg_dim: Option<usize>, prod: Option<usize>, heads: usize| -> Result<usize, ModelError> {
+                let cfg_dim = cfg_dim.ok_or_else(|| ModelError::Msg(format!("from_ckpt: {field} 无据")))?;
+                let Some(p) = prod else { return Ok(cfg_dim) };
+                if p == heads * cfg_dim {
+                    return Ok(cfg_dim);
+                }
+                rep.mismatches.push(format!(
+                    "{field}: config={cfg_dim}(×{heads}={}) 形状总宽={p}(采形状)",
+                    heads * cfg_dim
+                ));
+                if p % heads == 0 {
+                    Ok(p / heads)
+                } else {
+                    rep.mismatches.push(format!("{field}: 形状总宽 {p} 不被头数 {heads} 整除(采 config)"));
+                    Ok(cfg_dim)
+                }
+            };
+            // in_proj_qkv 行数 = 2·nk·hk_dim + nv·hv_dim(**三段融合:q|k|v**);
+            // in_proj_z 行数 = nv·hv_dim(门)。故 v 段先定,再拿余量核 qk 段。
+            let hv_dim = gdn_pair(
+                "linear_value_head_dim",
+                g("linear_value_head_dim"),
+                first_layer("linear_attn.in_proj_z.weight").map(|s| s[0]),
+                nv,
+            )?;
+            let hk_dim = gdn_pair(
+                "linear_key_head_dim",
+                g("linear_key_head_dim"),
+                first_layer("linear_attn.in_proj_qkv.weight")
+                    .map(|s| s[0].saturating_sub(nv * hv_dim) / 2),
+                nk,
+            )?;
+            (nk, hk_dim, nv, hv_dim)
         };
-        // in_proj_qkv 行数 = 2·nk·hk_dim + nv·hv_dim(**三段融合:q|k|v**);
-        // in_proj_z 行数 = nv·hv_dim(门)。故 v 段先定,再拿余量核 qk 段。
-        let hv_dim = gdn_pair(
-            "linear_value_head_dim",
-            g("linear_value_head_dim"),
-            first_layer("linear_attn.in_proj_z.weight").map(|s| s[0]),
-            nv,
-        )?;
-        let hk_dim = gdn_pair(
-            "linear_key_head_dim",
-            g("linear_key_head_dim"),
-            first_layer("linear_attn.in_proj_qkv.weight")
-                .map(|s| s[0].saturating_sub(nv * hv_dim) / 2),
-            nk,
-        )?;
         // tied:config 为准;索引见 lm_head 而 config 说 tied ⇒ 记账(config 胜,
         // 与装载面同律:tied 复 embed 表,lm_head 键不装载)
         let tied = v
@@ -227,13 +247,13 @@ mod tests {
             (
                 "OWL_CKPT_0_8B",
                 "/home/div/Documents/codes/models/Qwen/Qwen3.5-0.8B",
-                crate::specs::qwen35::qwen3_5_0_8b as fn() -> ModelSpec,
+                crate::formats::qwen35::qwen3_5_0_8b as fn() -> ModelSpec,
                 "0.8B",
             ),
             (
                 "OWL_CKPT_27B_AWQ",
                 "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4",
-                crate::specs::qwen35::qwen3_8_27b as fn() -> ModelSpec,
+                crate::formats::qwen35::qwen3_8_27b as fn() -> ModelSpec,
                 "27B-AWQ",
             ),
         ] {
@@ -249,6 +269,44 @@ mod tests {
                 eprintln!("[{tag}]   · {m}");
             }
             assert_same(&got, &want, tag);
+        }
+    }
+
+    /// **组件档**(DFlash2 草稿:无 `embed_tokens` ⇒ 空基座 + 维度全走
+    /// config.json)—— 对拍旧手写常量(两种起点族同判据)。
+    #[test]
+    fn reads_component_draft_spec() {
+        for (env, default, tag) in [
+            (
+                "OWL_DFLASH2_DIR",
+                "/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16",
+                "W4A16",
+            ),
+            (
+                "OWL_DFLASH2_BF16_DIR",
+                "/home/div/Documents/codes/models/z-lab/Qwen3.8-27B-DFlash2",
+                "BF16",
+            ),
+        ] {
+            let Some(d) = dir(env, default) else {
+                eprintln!("skip: [{tag}] 草稿检查点不在({env} 可指路)");
+                continue;
+            };
+            let preset = crate::formats::qwen35::qwen3_8_27b();
+            let (spec, rep) = ModelSpec::from_ckpt(&d, SpecSource::family(&preset))
+                .unwrap_or_else(|e| panic!("[{tag}] from_ckpt: {e}"));
+            eprintln!(
+                "[{tag}] draft keys_base={:?};失配 {} 条 {:?}",
+                rep.keys_base,
+                rep.mismatches.len(),
+                rep.mismatches
+            );
+            assert_eq!(rep.keys_base, "", "[{tag}] 组件档 = 空基座(原生命名直映)");
+            assert_eq!((spec.hidden, spec.inter, spec.vocab), (5120, 17408, 248320), "[{tag}] 主维");
+            assert_eq!(spec.full_heads, (32, 8, 128), "[{tag}] FA 头");
+            assert_eq!(spec.layer_types.len(), 5, "[{tag}] 草稿层数");
+            assert!((spec.eps - 1e-6).abs() < 1e-9, "[{tag}] eps");
+            assert_eq!(spec.gdn_heads, (0, 0, 0, 0), "[{tag}] 无 GDN 层");
         }
     }
 

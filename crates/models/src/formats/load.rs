@@ -52,6 +52,12 @@ impl LoadOpts {
         }
     }
 
+    /// 非量化/固定档(无设备重排 + 零探针):裸 safetensors f16 直拷、
+    /// W4A16-CPU 重排等"不需要能力裁决"的装载点。
+    pub fn plain(dtype: crate::contract::Dtype) -> Self {
+        Self { dtype, device_repack: Some(false), verify: false, debug_tap: false }
+    }
+
     /// 装载 ctx(旋钮 → LoaderCtx;唯一产地)
     pub fn ctx(&self) -> crate::module::LoaderCtx {
         crate::module::LoaderCtx {
@@ -88,7 +94,7 @@ where
 ///
 /// 纯读零猜测;未接方案**响亮拒**(带着实测到的 group_size/symmetric)。
 fn quant_family(dir: &Path) -> Result<crate::formats::kind::QuantScheme, ModelError> {
-    use crate::formats::kind::{QuantScheme, QUANT_G32_ASYM, QUANT_G128_SYM};
+    use crate::formats::kind::{QUANT_G32_ASYM, QUANT_G128_SYM};
     let raw = owl_shared::file_loader::read(&dir.join("config.json"))
         .map_err(|e| ModelError::Msg(format!("load_from_dir: 读 config.json: {e}")))?;
     let v: serde_json::Value = serde_json::from_slice(&raw)
@@ -105,12 +111,14 @@ fn quant_family(dir: &Path) -> Result<crate::formats::kind::QuantScheme, ModelEr
         })?;
     let group_size = w.get("group_size").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
     let symmetric = w.get("symmetric").and_then(|x| x.as_bool()).unwrap_or(false);
-    match (group_size, symmetric) {
-        (32, false) => Ok(QUANT_G32_ASYM),
-        (128, true) => Ok(QUANT_G128_SYM),
-        other => Err(ModelError::Msg(format!(
-            "load_from_dir: 量化方案 (group_size={}, symmetric={}) 未接源族(响亮拒)",
-            other.0, other.1
+    let num_bits = w.get("num_bits").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+    // 三轴同判:**位数也必须在位**(W8/FP8 家族与 W4 同 g128-sym ⇒ 只盯
+    // group_size/symmetric 会把 8bit 当 4bit 解,静默错值)
+    match (num_bits, group_size, symmetric) {
+        (4, 32, false) => Ok(QUANT_G32_ASYM),
+        (4, 128, true) => Ok(QUANT_G128_SYM),
+        _ => Err(ModelError::Msg(format!(
+            "load_from_dir: 量化方案 (num_bits={num_bits}, group_size={group_size}, symmetric={symmetric}) 未接源族(响亮拒)"
         ))),
     }
 }
@@ -142,10 +150,14 @@ where
             match quant_family(dir)? {
                 crate::formats::kind::QUANT_G32_ASYM => {
                     let src = crate::formats::awq::AwqSource::open_dir(dir)?;
+                    // 源侧重排模式注入(起点开箱的一环:量化大键的 marlin B
+                    // 由 CPU 还是 GPU repack 产出;**须在首键物化前**)
+                    src.set_device_repack(opts.device_repack.unwrap_or(false));
                     load_component(face, comp, &src, opts).await
                 }
                 crate::formats::kind::QUANT_G128_SYM => {
                     let src = crate::formats::w4a16::W4A16Source::open_dir(dir)?;
+                    src.set_device_repack(opts.device_repack.unwrap_or(false));
                     load_component(face, comp, &src, opts).await
                 }
                 other => Err(ModelError::Msg(format!(
@@ -223,7 +235,6 @@ struct PendingCast {
 // 待专项排查:批内多键 raw 与 cast 的生命周期/池复用面(见设计文档 §14 挂账)。
 const CAST_BATCH_BYTES: usize = 1;
 const CAST_BATCH_KEYS: usize = 1;
-const FREE_BATCH_IDS: usize = 16;
 
 impl LoadBatch {
     /// 入批(超阈即冲)
@@ -1013,6 +1024,27 @@ impl Drop for SpanGuard<'_, '_> {
 // §6 杂项:归因 / 字节量
 // ============================================================================
 
+/// 装载分类账(dtype×layout 聚合:件数 + 字节)—— 组件档启动诊断用。
+/// 通用工具(零模型知识):草稿头/塔/头部的装载账都走它,免得各写一份。
+pub fn manifest_mem_ledger(manifest: &crate::module::LoadManifest, tag: &str) {
+    let mut agg: std::collections::BTreeMap<String, (u64, u64)> = Default::default();
+    for e in manifest.entries() {
+        let bytes: u64 = e.shape.iter().map(|&d| d as u64).product::<u64>()
+            * match e.dtype {
+                Dtype::F16 | Dtype::BF16 => 2,
+                Dtype::F32 | Dtype::U32 => 4,
+                Dtype::U8 => 1,
+            };
+        let key = format!("{:?}/{:?}", e.dtype, e.layout);
+        let e2 = agg.entry(key).or_insert((0, 0));
+        e2.0 += 1;
+        e2.1 += bytes;
+    }
+    for (k, (n, b)) in agg {
+        eprintln!("[{tag}] {k}: {n} 项 {b} ({:.2} GB)", b as f64 / 1e9);
+    }
+}
+
 /// 装载取数失败归因:键不在 = 缺键;在但长度不符 = 元素数错误
 fn attribution<S: WeightSource + ?Sized>(src: &S, key: &str, n: usize) -> ModelError {
     match src.elem_len(key) {
@@ -1023,21 +1055,17 @@ fn attribution<S: WeightSource + ?Sized>(src: &S, key: &str, n: usize) -> ModelE
     }
 }
 
-/// Want 的目标字节量(元素数 × dtype 宽;LPT 分桶权重)
-fn want_bytes(w: &crate::module::Want) -> usize {
-    w.shape.iter().product::<usize>() * w.dtype.size_bytes()
-}
-
 #[cfg(test)]
 mod generic_entry_tests {
     use super::*;
-    use crate::specs::qwen35::{qwen3_5_0_8b, Qwen35Convention};
+    use crate::formats::qwen35::{qwen3_5_0_8b, Qwen35Convention};
 
-    /// **L2 等价门**:通用入口(`load_from_dir` + `LoadOpts`)与旧具名装载路
-    /// (`load_0_8b` 同体的 eval_load)产出**同一份清单**(键/dtype/形状逐条相等)。
+    /// **起点开箱不改清单门**(L2 等价门;**L4 后对照臂 = 手拼 eval_load**,
+    /// 旧具名装载函数已删):`load_from_dir`(起点探测 + 开源 + 求值)与
+    /// "同一声明直接 `eval_load`"产出**同一份清单**(键/dtype/形状逐条相等)。
     /// CPU face 即可(与 `cpu_real_weights_load` 同档),无需 GPU 门。
     #[tokio::test]
-    async fn generic_entry_equals_named_loader() {
+    async fn generic_entry_open_preserves_manifest() {
         let dir = crate::testkit::manifest_dir().join("assets/Qwen3.5-0.8B");
         if !dir.is_dir() {
             eprintln!("skip: {} 不在(模型库软链)", dir.display());
@@ -1060,7 +1088,7 @@ mod generic_entry_tests {
             debug_tap: false,
         };
 
-        // 旧路(与 load_0_8b 同体,只为取清单)
+        // 对照臂:同一声明 + 同一源,直接 eval_load(不经起点探测/开箱)
         let src = crate::formats::safetensors::SafeTensorsSource::open_dir(&dir).expect("源开箱");
         let old = eval_load(&mk(), &mut face, &src, &opts.ctx()).await.expect("eval_load");
 
@@ -1082,6 +1110,81 @@ mod generic_entry_tests {
         assert_eq!(a.len(), b.len(), "清单条目数");
         assert_eq!(a, b, "键/dtype/形状逐条相等");
         eprintln!("[L2] 通用入口 ≡ 具名装载:{} 条逐项相等 ✓", a.len());
+    }
+
+    /// **新模型零代码门**(解释器化设计 §6 = 立案判据):model 库里**代码从未
+    /// 见过**的档(Qwen3.5-9B:32 层 3:1 hybrid / hidden 4096)—— 不改一行
+    /// .rs:起点探测([`detect`](crate::formats::kind::detect))→ 维度事实
+    /// (`from_ckpt`)→ 通用入口(`load_from_dir`)全链数据驱动。
+    ///
+    /// 默认只跑起点侧(探测 + spec,秒级);`OWL_NEW_CKPT_LOAD=1` 追加
+    /// **CPU face 整装**(9B f16 ≈18GB host —— GPU 门不参与:换 GPU 验装
+    /// 是另一个门的事)。
+    #[tokio::test]
+    async fn unseen_size_loads_without_code() {
+        let dir = std::path::PathBuf::from(
+            std::env::var("OWL_NEW_CKPT")
+                .unwrap_or_else(|_| "/home/div/Documents/codes/models/Qwen/Qwen3.5-9B".into()),
+        );
+        if !dir.is_dir() {
+            eprintln!("skip: 新档检查点不在({};OWL_NEW_CKPT 可指路)", dir.display());
+            return;
+        }
+        // ① 起点探测(纯索引嗅探)
+        let det = crate::formats::kind::detect(&dir).expect("detect(新档)");
+        // ② 维度事实(族预设只供 tokenizer/dtype 两项非维度事实)
+        let preset = qwen3_5_0_8b();
+        let (spec, rep) = crate::model::ModelSpec::from_ckpt(
+            &dir,
+            crate::formats::spec::SpecSource::family(&preset),
+        )
+        .expect("from_ckpt(新档)");
+        eprintln!(
+            "[new-ckpt] kind={:?} keys_base={:?} hidden={} inter={} layers={} full={:?} gdn={:?} vocab={} tied={} 失配={:?}",
+            det.kind,
+            rep.keys_base,
+            spec.hidden,
+            spec.inter,
+            spec.layer_types.len(),
+            spec.full_heads,
+            spec.gdn_heads,
+            spec.vocab,
+            spec.tied,
+            rep.mismatches
+        );
+        assert_eq!(det.kind, crate::formats::kind::CheckpointKind::SafeTensors);
+        assert!(
+            !rep.keys_base.is_empty() && rep.keys_base.ends_with('.'),
+            "键基座应由索引实测定位"
+        );
+        assert!(rep.mismatches.is_empty(), "config↔形状应一致: {:?}", rep.mismatches);
+        assert!(spec.layer_types.len() >= 8, "层数应成规模");
+        for (i, full) in spec.layer_types.iter().enumerate() {
+            assert_eq!(*full, i % 4 == 3, "层 {i} 层型不符 3:1 周期");
+        }
+        assert_eq!(spec.full_heads.0 * spec.full_heads.2 % spec.hidden, 0, "FA 头维守恒");
+        if std::env::var("OWL_NEW_CKPT_LOAD").ok().as_deref() != Some("1") {
+            eprintln!("[new-ckpt] 起点侧全绿(整装门 OWL_NEW_CKPT_LOAD=1 开启)");
+            return;
+        }
+        // ③ 通用入口整装(CPU face;9B f16 ≈18GB host)
+        let model = crate::model::Model::new(
+            &spec,
+            Qwen35Convention::new(rep.keys_base.trim_end_matches('.')),
+            crate::module::QuantPlan::F16,
+            crate::module::QuantPlan::F16,
+        );
+        let mut face = owl_cpu::CpuFace::new();
+        let t0 = std::time::Instant::now();
+        let manifest = load_from_dir(&dir, &mut face, &model, LoadOpts::plain(spec.dtype))
+            .await
+            .expect("整装(新档)");
+        eprintln!(
+            "[new-ckpt] 整装 {} 项 @ {:?}",
+            manifest.entries().len(),
+            t0.elapsed()
+        );
+        assert!(manifest.entries().len() > 300, "清单条目数应成规模");
     }
 
     /// **量化族通用入口**:27B AWQ 经 `load_from_dir` 与 `AwqSource` 直开同清单
@@ -1107,7 +1210,7 @@ mod generic_entry_tests {
             crate::testkit::skip_note();
             return;
         }
-        let spec = crate::specs::qwen35::qwen3_8_27b();
+        let spec = crate::formats::qwen35::qwen3_8_27b();
         let mk = || {
             crate::model::Model::new(
                 &spec,

@@ -56,7 +56,6 @@ pub mod module;
 pub mod ops;
 pub mod spec;
 pub mod reference;
-pub mod specs;
 pub mod tensor;
 pub mod tokenizer;
 pub mod vlm;

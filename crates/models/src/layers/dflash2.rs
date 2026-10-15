@@ -678,6 +678,25 @@ impl DFlash2Draft {
         Self::new_with_plan_dt(hidden, inter, hq, hkv, hd, n_layers, eps, vocab, plan, Dtype::F16, kv_fp8)
     }
 
+    /// **声明构造**(起点侧事实 → 声明):维度全从草稿检查点的 spec 取
+    /// (config.json:hidden/inter/FA 头/层数/eps/vocab);fc 臂由量化计划定。
+    /// 无自持常量 ⇒ 换 DFlash2 家族(W4A16/BF16/W8…)不动代码。
+    pub fn from_spec(spec: &crate::model::ModelSpec, plan: QuantPlan, dt: Dtype, kv_fp8: bool) -> Self {
+        Self::new_with_plan_dt(
+            spec.hidden,
+            spec.inter,
+            spec.full_heads.0,
+            spec.full_heads.1,
+            spec.full_heads.2,
+            spec.layer_types.len(),
+            spec.eps,
+            spec.vocab,
+            plan,
+            dt,
+            kv_fp8,
+        )
+    }
+
     /// 全参数构造(dt 显式;生产 = BF16,sglang 对齐,E5-DF3 同日十四:
     /// 草稿路径 BF16 全程 —— 权重原生 BF16 直载,激活 f16 溢出免疫;
     /// 池叶子由引擎侧同 dtype 分配)
@@ -1236,14 +1255,14 @@ mod tests {
         impl Loadable for FcOnly<'_> {
             fn layout(&self, _ctx: &LoaderCtx) -> crate::module::LoaderOps {
                 let fc = match self.0.fc_shape() {
-                    crate::specs::qwen35::FcShape::Q => {
+                    crate::formats::qwen35::FcShape::Q => {
                         let mut o = self.0.fc_q()[0].layout(_ctx);
                         for l in &self.0.fc_q()[1..] {
                             o = o.chain(l.layout(_ctx));
                         }
                         o
                     }
-                    crate::specs::qwen35::FcShape::F16T => self.0.fc_t().layout(_ctx),
+                    crate::formats::qwen35::FcShape::F16T => self.0.fc_t().layout(_ctx),
                 };
                 fc.chain(self.0.hidden_norm().layout(_ctx))
             }
