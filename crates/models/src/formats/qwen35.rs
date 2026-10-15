@@ -20,9 +20,8 @@
 //! 检查点实测(488 张量):BF16 为主 + `A_log`/`dt_bias` 两个 F32 裸键;
 //! conv1d 为 3D `[6144,1,4]`(扁平直读)。visual/mtp 153 键不在最小路径。
 
-use crate::contract::{DeviceClient, ModelError};
-use crate::formats::load::LoadOpts;
-use crate::model::{Model, ModelSpec};
+use crate::contract::ModelError;
+use crate::model::ModelSpec;
 use crate::module::{KeyConvention, Loadable, LoaderCtx, LoaderOps};
 use std::path::Path;
 
@@ -370,7 +369,9 @@ mod tests {
     use crate::module::{ForwardCtx, Module};
     use crate::tensor::Dtype;
     use std::collections::HashMap;
+    use crate::contract::{DeviceClient, ModelError};
     use crate::formats::load::{load_from_dir, manifest_mem_ledger, LoadOpts};
+    use crate::model::Model;
     use crate::testkit::{f32b, manifest_dir};
 
     /// 0.8B 整装(测试路;与 engine/loader.rs 同构:声明 → 通用入口)
