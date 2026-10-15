@@ -291,10 +291,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         } else {
             None
         };
-        // 诊断(2026-10-14 A13):`OWL_PF_FENCE=1` ⇒ from_host 叶子(pos/slots/
+        // 诊断(2026-10-14 A13):`[probes] pf_fence = true` ⇒ from_host 叶子(pos/slots/
         // lens/id/gdn_slot)建完后插一道流栅栏 —— 判「H2D 叶子与 COMPUTE 核
         // 无跨流序」竞态(仓内 2026-10-03 FI 表同病史:预物化修法)
-        if std::env::var_os("OWL_PF_FENCE").is_some_and(|v| v != "0") {
+        if self.probes.pf_fence {
             self.graphs.session.face_mut().sync().await?;
         }
         let mut ctx = ForwardCtx::model_prefill(
@@ -376,7 +376,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     let face = self.graphs.session.face_mut();
                     let res = face.dtoh(&outs[i], &mut b).await;
                     if let Err(e) = res {
-                        eprintln!("[pf-bisect] dtoh 失败 i={i} name={} shape={:?} blk_bytes={} err={e}", names[i], r.shape(), b.len());
+                        owl_shared::log_debug!("pf-bisect", "dtoh 失败 i={i} name={} shape={:?} blk_bytes={} err={e}", names[i], r.shape(), b.len());
                         return Err(e);
                     }
                 }
@@ -415,7 +415,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     }
                 }
             }
-            eprintln!("[pf-bisect] chunk base={base} t={t} 层 checksum 已记");
+            owl_shared::log_debug!("pf-bisect", "chunk base={base} t={t} 层 checksum 已记");
         }
         let _face = self.graphs.session.face_mut();
         let vocab = self.model.vocab_size();
@@ -493,11 +493,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     let mut rbuf = vec![0u8; (n_tp + 1) * t * d_model * 2];
                     face.dtoh(&hfb, &mut rbuf).await?;
                     if let Err(e) = owl_shared::file_loader::write("/tmp/owl_dflash_root.bin", &rbuf) {
-                eprintln!("[dump] 落盘失败(诊断面不许静默): {e}");
+                owl_shared::log_error!("dump", "落盘失败(诊断面不许静默): {e}");
             }
-                    eprintln!("[dflash-probe] concat 父块落盘 /tmp/owl_dflash_root.bin t={t}");
+                    owl_shared::log_debug!("dflash-probe", "concat 父块落盘 /tmp/owl_dflash_root.bin t={t}");
                 }
-                eprintln!("[dflash] prefill encode {t} rows @{} {:?}", base, ts.elapsed());
+                owl_shared::log_debug!("dflash", "prefill encode {t} rows @{} {:?}", base, ts.elapsed());
             }
             let hview = TensorOps::of_block(hfb.id, d.dtype, vec![t, d_model]);
             // 末行窄切 **物化**(OPS_NARROW):SliceView 作根透传父块丢偏移
@@ -527,7 +527,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     let mut lbuf2 = vec![0u8; vocab * 2];
                     face.dtoh(&lb2, &mut lbuf2).await?;
                     let same_inproc = lbuf == lbuf2;
-                    eprintln!("[pf-probe] boot{bs_seq} 同boot两次lm_head一致={same_inproc}");
+                    owl_shared::log_debug!("pf-probe", "boot{bs_seq} 同boot两次lm_head一致={same_inproc}");
                     let mut top: Vec<(f32, u32)> = lbuf
                         .chunks_exact(2)
                         .enumerate()
@@ -545,8 +545,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                             line!(),
                         );
                     });
-                    eprintln!(
-                        "[pf-probe] boot{} argmax(top2)={} gap={:.5} top=({} {:.4}) ({:.4})",
+                    owl_shared::log_debug!("pf-probe", "boot{} argmax(top2)={} gap={:.5} top=({} {:.4}) ({:.4})",
                         bs_seq,
                         top[0].1,
                         top[0].0 - top[1].0,
@@ -637,7 +636,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     let cks: f32 = buf.chunks_exact(2)
                         .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32().abs())
                         .sum();
-                    eprintln!("[cksum] chunk base={base} t={t} sum|x|={cks:.4}");
+                    owl_shared::log_debug!("cksum", "chunk base={base} t={t} sum|x|={cks:.4}");
                 }
                 // prefill extend(E5-M5):行 0..T-1 的 mtp KV(行 T-1 配对需
                 // 下一 chunk 首 token,由其 extend 补)。DFlash2:草稿 KV

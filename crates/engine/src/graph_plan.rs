@@ -281,7 +281,7 @@ impl<D: DeviceClient> GraphPlan<D> {
                     self.face.dtoh(&slot.block, &mut buf).await?;
                     let back: Vec<f32> =
                         buf.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
-                    eprintln!("[slot-dump] {name} = {back:?}");
+                    owl_shared::log_debug!("slot-dump", "{name} = {back:?}");
                 }
             }
         }

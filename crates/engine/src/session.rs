@@ -263,12 +263,12 @@ impl SessionBank {
                     self.release_session_chains(victim);
                     // 会话关闭失败 = 块表归还/状态回收失败:不许静默(律 #1)
                     if let Err(e) = self.sessions.close(victim) {
-                        eprintln!("[session] LRU 逐出 #{victim} 关闭失败: {e}");
+                        owl_shared::log_warn!("session", "LRU 逐出 #{victim} 关闭失败: {e}");
                     }
                     owl_shared::metrics::with_metrics_store(|m| {
                         m.counter_add("session.evict", 1, file!(), line!())
                     });
-                    eprintln!("[session] LRU 逐出 #{victim}(GDN 格回收)→ 重试");
+                    owl_shared::log_warn!("session", "LRU 逐出 #{victim}(GDN 格回收)→ 重试");
                     match self.sessions.get_or_create(id, gdn_slots) {
                         Ok(x) => return Ok(x.0),
                         Err(e2) if format!("{e2}").contains("GDN 状态格耗尽") => {
@@ -282,16 +282,11 @@ impl SessionBank {
         }
     }
 
-    /// 显式关会话(客户端声明不再续;账本清票,target 链归还账房)
-    ///
-    /// FIXME(拆分时发现的链归还不对称,行为零变化纪律下保持原样):
-    /// 本路径只归还 target 链,**不归还 MTP 链** —— 与 evict/burn(双链
-    /// 同还)不对称,mtp 模式下显式 close 会漏 MTP 页。待立案修。
+    /// 显式关会话(客户端声明不再续;账本清票,双链归还账房 ——
+    /// 与 evict/burn 三路径同构;2026-10-15 结案拆分时挂的 FIXME:
+    /// 原只还 target 链漏 MTP 页,mtp 模式下显式 close = 页池泄漏)。
     pub(crate) fn close(&mut self, id: u64) -> Result<()> {
-        if let Some(s) = self.sessions.get_mut(id) {
-            let mut table = std::mem::take(&mut s.block_table);
-            self.blocks_m.release_table(&mut table);
-        }
+        self.release_session_chains(id);
         self.sessions.close(id)
     }
 
@@ -300,7 +295,7 @@ impl SessionBank {
     pub(crate) fn burn(&mut self, session_id: u64) {
         self.release_session_chains(session_id);
         if let Err(e) = self.sessions.close(session_id) {
-            eprintln!("[session] 临时会话 #{session_id} 关闭失败: {e}");
+            owl_shared::log_warn!("session", "临时会话 #{session_id} 关闭失败: {e}");
         }
     }
 
@@ -406,5 +401,41 @@ mod tests {
         let v = st.lru_victim().expect("有候选");
         st.close(v).expect("close");
         st.get_or_create(Some(999), 4).expect("逐出后可建");
+    }
+}
+
+#[cfg(test)]
+mod bank_tests {
+    use super::*;
+
+    /// T4 结案门(2026-10-15):显式 close 必须双链同还 —— MTP 链曾漏还
+    /// (与 evict/burn 不对称,mtp 模式下显式关会话 = 页池泄漏)。
+    #[test]
+    fn close_releases_both_chains() {
+        let mut bank = SessionBank::new(64, 8, true, true, false, false);
+        let mtp_before = bank.blocks_mtp.free_blocks();
+        let tgt_before = bank.blocks_m.free_blocks();
+
+        let (id, s) = bank.sessions.get_or_create(Some(7), 4).expect("建会话");
+        assert_eq!(id, 7);
+        // target 链 2 块(24 tok / 块 8)+ MTP 链 1 块(9 tok)
+        bank.blocks_m.ensure_for_len(&mut s.block_table, 24).expect("target 块");
+        bank.blocks_mtp.ensure_for_len(&mut s.mtp_block_table, 9).expect("mtp 块");
+        assert!(bank.blocks_mtp.free_blocks() < mtp_before, "mtp 已占用");
+
+        bank.close(id).expect("close");
+        assert_eq!(bank.blocks_mtp.free_blocks(), mtp_before, "MTP 链必须归还");
+        assert_eq!(bank.blocks_m.free_blocks(), tgt_before, "target 链归还");
+        assert!(bank.sessions.get(id).is_none(), "账本移除");
+    }
+
+    /// 无 mtp 模式回归:0 块页池,release 空表 = no-op,close 正常。
+    #[test]
+    fn close_without_mtp_is_noop_on_empty_chain() {
+        let mut bank = SessionBank::new(32, 8, true, false, true, false);
+        let (id, s) = bank.sessions.get_or_create(Some(1), 4).expect("建会话");
+        bank.blocks_m.ensure_for_len(&mut s.block_table, 8).expect("target 块");
+        bank.close(id).expect("close");
+        assert!(bank.sessions.get(id).is_none());
     }
 }

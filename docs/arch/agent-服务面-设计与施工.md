@@ -907,7 +907,7 @@ DAG(lm_head gemm → argmax)核对**命令序是否与求值序一致**(gemm 的
 3. `auto_disable_thinking_with_tools` 的产品选择(有工具时是否关思考)—— **旋钮已就位**,需真机 A/B 数据(D2)。
 4. 视觉/图像输入(`<|vision_start|>` 分支)保留未启用。
 5. undo/rollback 会话级重置接口(pi 的 compaction 触发后的显式 reset,避免残留块链)。
-6. `/debug/agent` 诊断面(最近一次渲染 prompt 原文 + 解析器状态机轨迹;现只有 `OWL_PROMPT_DUMP`)—— **对 A7/A8 排查也有用**。
+6. `/debug/agent` 诊断面(最近一次渲染 prompt 原文 + 解析器状态机轨迹;现只有 prompt 落盘(`[probes] prompt_dump`,原 OWL_PROMPT_DUMP))—— **对 A7/A8 排查也有用**。
 7. `completion_tokens_details.reasoning_tokens`(需按通道计 token 数;现只有文本聚合)。
 8. **A8(spec 臂 token 级非稳定)** —— 见 §7.8;与 A7 疑同源,合并排查。
 9. **A7(工具调用遵循度)** —— 台账第一优先;AGT-06 已落地,复测应在新的采样面下做。
