@@ -38,6 +38,21 @@ pub enum StepKind {
 /// runner 每步构造,层只透传不自取(async-runtime §4.3 grab-bag);
 /// 无动态依赖的层(mlp/rmsnorm/…)忽略字段。借用结构,无 Default ——
 /// 测试用 [`ForwardCtx::minimal`]。
+/// GDN 序列表槽(P-6b,2026-10-15):`cu|coff|idx` 三件同块(布局见
+/// `owl_kernels::family::gdn_chunked::{CU_OFF, COFF_OFF, IDX_OFF}`)+ 块数。
+///
+/// **为什么必须由引擎给**:这三张表决定 chunked 六核的**行区间与递推落点** ——
+/// runtime 内部按 `t` 生成时,桶 padding 会把假行算进序列(终态被污染;
+/// 探针 `gdn_bucket_pad_probe` 实测 Δ=3.6e-2 → 0)。引擎知道**真长度**
+/// (`t_real`),而且表存在**持久槽**里 ⇒ 图(M2b)可直接烘、回放期换内容。
+#[derive(Clone, Copy)]
+pub struct GdnTableSlot<'a> {
+    /// 表块(cu|coff|idx;`t_real` 口径)
+    pub table: &'a TensorOps,
+    /// `nt = ceil(t_real / BT)`
+    pub nt: usize,
+}
+
 /// FlashInfer prefill 面(OWL_FLASHINFER=1;engine 每 chunk 构造):
 /// K 影子池(kHND)+ 表四件套(i32 设备;契约见 owl_kernels::family::flashinfer)。
 #[derive(Clone, Copy)]
@@ -121,6 +136,8 @@ pub struct ForwardCtx<'a> {
     /// 张量(正确)⇒ 长 prompt 误态塌陷。`None` = 调用方未提供,此时
     /// **需要它的臂一律 poisoned 拒发**(不许静默取 0)。
     pub gdn_slot_host: Option<usize>,
+    /// GDN 序列表槽(P-6b;chunked/scalar 递推臂用;None = 未注入 ⇒ 该臂拒发)
+    pub gdn_tables: Option<GdnTableSlot<'a>>,
     /// 刀D 取证:时间戳探针缓冲块(OWL_TS_PROBE;None = 关。U32 [4096]
     /// 输入槽,ts 内核逐层 clock64 原地写,回放后 dtoh 读原生时间线)
     pub ts_buf: Option<TensorOps>,
@@ -171,6 +188,7 @@ impl<'a> ForwardCtx<'a> {
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
             gdn_slot_host: None,
+            gdn_tables: None,
             ts_buf: None,
             trace_gate: false,
             attn_v2: None,
@@ -207,6 +225,7 @@ impl<'a> ForwardCtx<'a> {
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
             gdn_slot_host: None,
+            gdn_tables: None,
             ts_buf: None,
             trace_gate: false,
             attn_v2: None,
@@ -238,6 +257,7 @@ impl<'a> ForwardCtx<'a> {
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
             gdn_slot_host: None,
+            gdn_tables: None,
             ts_buf: None,
             trace_gate: false,
             attn_v2: None,
@@ -273,6 +293,7 @@ impl<'a> ForwardCtx<'a> {
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
             gdn_slot_host: None,
+            gdn_tables: None,
             ts_buf: None,
             trace_gate: false,
             attn_v2: None,
@@ -311,6 +332,7 @@ impl<'a> ForwardCtx<'a> {
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
             gdn_slot_host: None,
+            gdn_tables: None,
             ts_buf: None,
             trace_gate: false,
             attn_v2: None,
@@ -349,6 +371,7 @@ impl<'a> ForwardCtx<'a> {
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
             gdn_slot_host: None,
+            gdn_tables: None,
             ts_buf: None,
             trace_gate: false,
             attn_v2: None,
@@ -395,6 +418,7 @@ impl<'a> ForwardCtx<'a> {
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
             gdn_slot_host,
+            gdn_tables: None,
             ts_buf: None,
             trace_gate: false,
             attn_v2: None,

@@ -57,7 +57,7 @@
 //! | log | level / tags_allow / tags_deny / file / max_mb / keep / timestamp | 见模块 |
 //! | probes | trace_gate / dflash_probe / propose_eager | flag / false |
 //! | probes | dflash_eager / dflash_noencode / dflash_dumb | flag / false |
-//! | probes | gdn_dump_all / pf_bisect / pf_fin_check / raw_completion | flag / false |
+//! | probes | gdn_dump_all / pf_bisect / pf_fin_check / raw_completion / prompt_dump / gdn_dbg / pf_fence | flag / false |
 //! | probes | pf_stages | Option<usize> / None |
 //! | cuda | srv_timing / cap_prof / launch_sync / launch_time | flag / false |
 //! | cuda | trace_ring | usize / 0(关;>0 = 发射账容量) |
@@ -67,7 +67,9 @@
 //! | cuda | *(nvrtc_include/native_aot 2026-10-13 退役 —— NVRTC 已删)* | — |
 //! | dispatch | fi_min_tokens | usize / 1(FI 接管的 T 下限;128 = 复现旧行为) |
 //! | dispatch | xqa_prefill | flag / false(prefill 尾块走 XQA;主路径禁止开) |
-//! | graph | no_graph | flag / false |
+//! | graph | no_graph | flag / false(总闸:eager 直发,跳过**全部**图捕获) |
+//! | graph | prefill_bucket | off\|t512\|geobuckets / **off**(prefill 图**独立**
+//! |   |   | 开关:off = 今天行为;t512 = 只建 512 桶;geobuckets = 全桶族) |
 //! | agent | template_path | Option<String> / None(相对路径 = 相对 model.dir) |
 //! | agent | implicit_session | flag / false(AGT-09:不带 session 键 ⇒ 会话 0) |
 //! | agent | default_max_new / max_new_cap | usize / 4096、8192 |
@@ -80,7 +82,8 @@
 //! 账外键(不入公共面):测试私有旋钮(OWL_GATE_*/OWL_E2E_*/OWL_SWEEP_*/
 //! OWL_WS_MUL/SPLIT_*/MARLIN_*/FI_DEBUG/OWL_27B_STRICT/OWL_HF_PARITY ——
 //! 测试用例自由直读)、构建期键(build.rs 例外)、OWL_CONFIG(loader 路径
-//! 兜底,server 入口读)。
+//! 兜底,server 入口读)、OWL_TEST_CONFIG_*(`#[owl_test]` 每用例配置文件
+//! 路径,见 testkit::case 与 docs/arch/owl-test-macro.md)。
 
 use std::path::{Path, PathBuf};
 
@@ -397,6 +400,18 @@ pub struct ProbesCfg {
     pub pf_stages: Option<usize>,
     pub pf_fin_check: bool,
     pub raw_completion: bool,
+    /// 渲染后 prompt 落盘(/tmp/owl-prompt-*.txt;诊断面 —— 原
+    /// OWL_PROMPT_DUMP env,2026-10-15 随 env 退出配置链收编)
+    #[serde(default)]
+    pub prompt_dump: bool,
+    /// reset_gdn 后 GDN rec 格画像(§三十二 会话污染定位诊断面;
+    /// 原 OWL_GDN_DBG)
+    #[serde(default)]
+    pub gdn_dbg: bool,
+    /// prefill H2D 叶子后插流栅栏(A13 竞态排障;
+    /// 原 OWL_PF_FENCE)
+    #[serde(default)]
+    pub pf_fence: bool,
     /// **单步/粘滞调试门**(2026-10-14;见 `crate::stepgate` 模块头):
     /// 解释器检查点的运行期档位。⚠️ 需以 `--features stepgate` 构建才生效;
     /// 未编入时入口会**可见地告警**(不静默失效)。
@@ -484,8 +499,32 @@ pub mod sync_bit {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GraphCfg {
-    /// eager 直发,跳过图捕获
+    /// eager 直发,跳过图捕获(**总闸**:连 decode/verify/fold/propose 族一起关)
     pub no_graph: bool,
+    /// **prefill 图的独立档位**(P1;2026-10-15 立 —— 与总闸分离,可单关
+    /// prefill 而不动现役 decode 图族)。
+    ///
+    /// 分层而非 bool 的理由:回滚时要能**逐级降**,不必在"全开/全关"之间跳
+    /// - `off`(缺省):完全不建 prefill 图 = 今天行为,零影响;
+    /// - `t512`:只建 512 桶(最小面:显存最小、命中面 = 满块);
+    /// - `geobuckets`:全桶族 {32,64,128,256,512}(尾块也吃图,显存 ≈ 374 MiB)。
+    ///
+    /// 运行时另有**熔断**:某桶捕获失败/回放出错 ⇒ 该桶永久降级 eager
+    /// (只 warn 一次,不重试),与静态档位叠加。
+    pub prefill_bucket: PrefillBucket,
+}
+
+/// prefill 图档(见 [`GraphCfg::prefill_bucket`];serde 小写:off/t512/geobuckets)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrefillBucket {
+    /// 不建 prefill 图(= 今天行为)
+    #[default]
+    Off,
+    /// 只建 t=512 桶(最小面)
+    T512,
+    /// 全桶族 {32,64,128,256,512}
+    Geobuckets,
 }
 
 /// 工具调用输出格式(agent.tool_call_format;**jinja 模板同名变量**)。
@@ -1000,5 +1039,27 @@ mod tests {
 
         assert!(OwlConfig::load(Some("nope"), None).is_err(), "未知 flavor 拒");
         assert!(OwlConfig::load(None, Some(Path::new("/nonexistent/owl.toml"))).is_err());
+    }
+}
+
+#[cfg(test)]
+mod prefill_bucket_tests {
+    use super::*;
+
+    /// 三档字面量 + 缺省 off + 非法值**结构化拒**(deny_unknown_fields 同族纪律:
+    /// 配置面不许有"写了但没人认"的值)
+    #[test]
+    fn prefill_bucket_parses_three_levels() {
+        let get = |toml: &str| -> PrefillBucket {
+            toml::from_str::<GraphCfg>(toml).expect("解析").prefill_bucket
+        };
+        assert_eq!(get(""), PrefillBucket::Off, "缺省 = off(= 今天行为)");
+        assert_eq!(get("prefill_bucket = \"off\""), PrefillBucket::Off);
+        assert_eq!(get("prefill_bucket = \"t512\""), PrefillBucket::T512);
+        assert_eq!(get("prefill_bucket = \"geobuckets\""), PrefillBucket::Geobuckets);
+        assert!(
+            toml::from_str::<GraphCfg>("prefill_bucket = \"t1024\"").is_err(),
+            "非法档位必须拒(不许静默落 off)"
+        );
     }
 }

@@ -29,7 +29,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         self.spec.carry_ctx = act.spec.bare_cost_ctx;
         // 取证(B6.3 后泄漏案):每 turn 设备余量打点(free 账由 cuda 侧 dtoh
         // 收割刷新;泄漏 = 线性下降)
-        eprintln!("[vram-trace] turn end: free={:.0}MiB out={}",
+        owl_shared::log_debug!("vram-trace", "turn end: free={:.0}MiB out={}",
                   owl_shared::vram::free_bytes() as f64 / 1024.0 / 1024.0, act.out.len());
         // spec 轮机器状态随 act(TurnSpecState)销毁 —— 跨 turn 残留
         // 结构性消失(2026-10-10 生命周期收口;原手动 spec_drafts_host 清)

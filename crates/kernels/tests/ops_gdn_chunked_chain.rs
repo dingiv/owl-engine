@@ -204,6 +204,18 @@ const NV: usize = 48;
 const KD: usize = 128;
 const VD: usize = 128;
 
+
+/// P-6b:序列表(cu|coff|idx)现造一块(内容按 t_real = 调用 shape 的 t;测试面)
+fn make_tables(res: &mut TestRes, t: usize) -> (Bytes, usize) {
+    let nt = t.div_ceil(owl_kernels::family::gdn_chunked::BT).max(1);
+    let bytes = owl_kernels::family::gdn_chunked::table_host_bytes(t, nt);
+    let mut b = res.upload_new(&bytes);
+    b.len = 0; // 叶子占位(家族侧硬律:len=0 = 裸 id)
+    b.dtype = owl_kernels::contract::Dtype::U32;
+    b.rank = 1;
+    (b, nt)
+}
+
 fn read_bin(dir: &str, name: &str) -> Vec<f32> {
     let p = format!("{dir}/{name}.bin");
     let bytes = std::fs::read(&p).unwrap_or_else(|e| panic!("{p}: {e}"));
@@ -352,6 +364,7 @@ fn gdn_chunked_new_chain_matches_golden() {
         res.blocks.insert(out_id, out_slice); // 直取路径必须自己落表(upload 路径内含)
         let out_b = Bytes::new(out_id, t * NV * VD, Dtype::F16, 3); // [t, NV, VD] f16
 
+        let (tbl_b, tbl_nt) = make_tables(&mut res, *t);
         let call = GdnChunkedCall::builder(shape)
             .q(&q_b).unwrap()
             .k(&k_b).unwrap()
@@ -359,6 +372,8 @@ fn gdn_chunked_new_chain_matches_golden() {
             .beta(&beta_b).unwrap()
             .gate_raw(&g_b).unwrap()
             .state(&state_b, 0).unwrap()
+            .tables(&tbl_b, tbl_nt)
+            .unwrap()
             .build().unwrap();
         let msg: LaunchMsg = call.to_launch(out_b.clone());
 
@@ -524,10 +539,13 @@ fn gdn_chunked_nt_decomposition_identity() {
         let shape = owl_kernels::client::gdn_chunked::GdnShape {
             t: t as u32, nv: NV as u32, nk: NK as u32, kd: KD as u32,
         };
+        let (tbl_b, tbl_nt) = make_tables(res, t);
         let call = GdnChunkedCall::builder(shape)
             .q(&q_b).unwrap().k(&k_b).unwrap().v(&v_b).unwrap()
             .beta(&beta_b).unwrap().gate_raw(&g_b).unwrap()
             .state(&state_b, 0).unwrap()
+            .tables(&tbl_b, tbl_nt)
+            .unwrap()
             .build().unwrap();
         let msg: LaunchMsg = call.to_launch(out_b.clone());
         rt.run(&msg, res, exec).expect("runtime run");
@@ -562,10 +580,12 @@ fn gdn_chunked_nt_decomposition_identity() {
             let (out_id, out_slice) = res.alloc_id(T_SM * NV * VD * 2);
             res.blocks.insert(out_id, out_slice);
             let out_b = Bytes::new(out_id, T_SM * NV * VD, Dtype::F16, 3); // [T_SM, NV, VD] f16
+            let (tbl_b, tbl_nt) = make_tables(&mut res, T_SM);
             let call = GdnChunkedCall::builder(shape)
                 .q(&qs[i]).unwrap().k(&ks[i]).unwrap().v(&vs[i]).unwrap()
                 .beta(&bs[i]).unwrap().gate_raw(&gs[i]).unwrap()
                 .state(&state_b, 0).unwrap()
+                .tables(&tbl_b, tbl_nt).unwrap()
                 .build().unwrap();
             let msg: LaunchMsg = call.to_launch(out_b.clone());
             rt.run(&msg, &mut res, &mut exec).expect("runtime run");
@@ -684,10 +704,13 @@ fn gdn_chunked_matches_varlen_fn_level() {
         res.blocks.insert(out_id, out_slice);
         let out_b = Bytes::new(out_id, t * NV * VD, Dtype::F16, 3); // [t, NV, VD] f16
         let shape = owl_kernels::client::gdn_chunked::GdnShape { t: t as u32, nv: NV as u32, nk: NK as u32, kd: KD as u32 };
+        let (tbl_b, tbl_nt) = make_tables(&mut res, t);
         let call = GdnChunkedCall::builder(shape)
             .q(&q_b).unwrap().k(&k_b).unwrap().v(&v_b).unwrap()
             .beta(&beta_b).unwrap().gate_raw(&g_b).unwrap()
             .state(&state_b, 0).unwrap()
+            .tables(&tbl_b, tbl_nt)
+            .unwrap()
             .build().unwrap();
         let msg: LaunchMsg = call.to_launch(out_b.clone());
         rt.run(&msg, &mut res, &mut exec).expect("chain run");

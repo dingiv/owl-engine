@@ -315,6 +315,8 @@ impl GpuServer {
             Command::GraphBegin { .. } => E::new("graph_begin", ""),
             Command::GraphEnd { .. } => E::new("graph_end", ""),
             Command::GraphLaunch { .. } => E::new("graph_launch", "compute"),
+            Command::GraphAbort { .. } => E::new("graph_abort", ""),
+            Command::GraphDestroy { .. } => E::new("graph_destroy", ""),
             Command::AllocPinned { bytes, .. } => E::new("alloc_pinned", "").bytes(*bytes),
             Command::Close { .. } => E::new("close", ""),
         }
@@ -580,6 +582,16 @@ impl GpuServer {
                     self.handle_memset_zero(block, offset_bytes, len_bytes, ack)
                 }
                 Command::GraphEnd { ack } => ack.send(self.ctx_mut().graph_end()),
+                // 窗内出错/空窗的收尾手段 ⇒ 捕获期必须允许(否则只能等
+                // 窗自然结束,slab 留尸)
+                Command::GraphAbort { ack } => ack.send(self.ctx_mut().graph_abort()),
+                // **M1:捕获窗内放行 Free** —— 锚定活性回收(reclaim_capture)
+                // 的必要条件。窗内 `free_blocks` 三条路**零 CUDA 调用**:
+                // ①跨流事件栅栏本就在 `capture.is_none()` 守卫下跳过;
+                // ②Carved 块 → slab 内 arena 归还(纯 host 簿记);
+                // ③Owned 块 → **防御性不释放**(见 free_blocks 内守卫;窗内
+                //    不该出现 Owned 死块,释放会烙 MEM_FREE 节点)
+                Command::Free { ids, ack } => self.handle_free(ids, ack),
                 Command::Close { ack } => ack.send(Ok(())), // 防御性幂等回执
                 other => Self::reject(other, self.sink),
             };
@@ -609,6 +621,8 @@ impl GpuServer {
             Command::Sync { ack } => self.handle_sync(ack),
             Command::GraphBegin { ack } => ack.send(self.ctx_mut().graph_begin()),
             Command::GraphEnd { ack } => ack.send(self.ctx_mut().graph_end()),
+            Command::GraphAbort { ack } => ack.send(self.ctx_mut().graph_abort()),
+            Command::GraphDestroy { graph, ack } => ack.send(self.ctx_mut().graph_destroy(graph)),
             Command::GraphLaunch { graph, ack } => {
                 ack.send(self.ctx_mut().graph_launch(graph))
             }
@@ -645,6 +659,8 @@ impl GpuServer {
             Command::GraphBegin { ack, .. } => closed!(ack),
             Command::GraphEnd { ack, .. } => closed!(ack),
             Command::GraphLaunch { ack, .. } => closed!(ack),
+            Command::GraphAbort { ack, .. } => closed!(ack),
+            Command::GraphDestroy { ack, .. } => closed!(ack),
         }
     }
 
@@ -654,6 +670,8 @@ impl GpuServer {
             Command::GraphBegin { .. } => "GraphBegin",
             Command::GraphEnd { .. } => "GraphEnd",
             Command::GraphLaunch { .. } => "GraphLaunch",
+            Command::GraphAbort { .. } => "GraphAbort",
+            Command::GraphDestroy { .. } => "GraphDestroy",
             Command::Alloc { .. } => "Alloc",
             Command::MemsetZero { .. } => "MemsetZero",
             Command::Htod { .. } => "Htod",
@@ -674,6 +692,8 @@ impl GpuServer {
             Command::GraphBegin { ack } => reject!(ack),
             Command::GraphEnd { ack } => reject!(ack),
             Command::GraphLaunch { ack, .. } => reject!(ack),
+            Command::GraphAbort { ack, .. } => reject!(ack),
+            Command::GraphDestroy { ack, .. } => reject!(ack),
             Command::Alloc { ack, .. } => reject!(ack),
             Command::MemsetZero { ack, .. } => reject!(ack),
             Command::Htod { ack, .. } => reject!(ack),
@@ -765,6 +785,9 @@ impl GpuServer {
                 // 发射账:**分配落定**记 id + 设备地址(trace 条目 alloc 本身
                 // 无 id —— 生命周期判据要它才能把地址钉到块上)
                 self.trace_alloc_done(id);
+                // M1:warmup 影子 arena 登记(探针关 = 零开销;峰值口径的
+                // 来源 —— `probe_free` 在 free_blocks 里配对)
+                owl_shared::slab_hint::probe_alloc(id, n_bytes);
                 // 句柄占位(事实面由客户端 `alloc(dtype, elems)` 侧定形)
                 Ok(Bytes::new(id, elems, Dtype::U8, 0))
             });
@@ -982,7 +1005,7 @@ impl GpuServer {
         }
         match issue_launch(ctx, &stream, kernels, &msg, self.probes.debug, sink) {
             Ok(out_id) => {
-                self.ctx_mut().note_launch();
+                self.ctx_mut().note_launch(&msg.kernel.name);
                 // 诊断开关(OWL_LAUNCH_SYNC=1):逐发射同步,sticky 错误
                 // 归属到具体核(2026-09-27 长 ctx ILLEGAL_ADDRESS 排查;
                 // 捕获期禁 sync —— 跳过,捕获正确性由哨兵③/④另保)
@@ -1167,76 +1190,39 @@ impl GpuRes<'_> {
             got: format!("id={id} / {e}"),
         })
     }
-}
 
-impl owl_kernels::device::DeviceRes for GpuRes<'_> {
-    fn context(&self) -> Result<Arc<CudaContext>, OpError> {
-        Ok(self.ctx.ctx.clone())
-    }
-    fn stream(&self) -> Result<Arc<CudaStream>, OpError> {
-        self.ctx
-            .stream(crate::state::STREAM_COMPUTE)
-            .map_err(|e| OpError::Launch { op: OP_RES.into(), stage: owl_kernels::contract::Stage::Load, detail: format!("stream: {e:?}") })
-            .cloned()
-    }
-    fn resolve(&self, id: u64) -> Result<u64, OpError> {
-        Ok(self.resolve_span(id)?.0)
-    }
-    fn resolve_len(&self, id: u64) -> Result<usize, OpError> {
-        Ok(self.resolve_span(id)?.1)
-    }
-    fn alloc(&mut self, bytes: usize, tag: &'static str) -> Result<ScratchBuf, OpError> {
-        // 与旧 handler 同机制:stream.alloc_zeros(cudarc 直分配;捕获窗内
-        // 由家族 grave 律保证不再分配 —— A1.7)。append-only 账本,物理
-        // 释放 = server 销毁。
-        let stream = self.stream()?;
-        let d = stream.alloc_zeros::<u8>(bytes)
-            .map_err(|e| OpError::Launch { op: OP_RES.into(), stage: owl_kernels::contract::Stage::Load, detail: format!("scratch alloc: {e:?}") })?;
-        use cudarc::driver::DevicePtr;
-        let ptr = d.device_ptr(&stream).0;
-        // 入账:scratch 不在块账房(裸指针,不可 resolve)⇒ 账上只有这一条线索
-        self.note_device("fam_alloc", tag, bytes, &[ptr]);
-        self.scratch.push((ptr, d));
-        Ok(ScratchBuf { ptr, bytes })
-    }
-    fn capturing(&self) -> Result<bool, OpError> {
-        Ok(self.ctx.capture_stream())
-    }
-    /// **家族面设备动作入账**(2026-10-15 A13 补漏):家族 runtime 的设备动作
-    /// 不产生 `Command` ⇒ 发射账(§十三)看不见它们 —— A13 藏一整轮的直接原因。
-    /// 本覆写把家族面写进**同一个环**(命令面 `cmd` 与家族面 `kind` 并列可读),
-    /// 且 `stream = "family"` 一眼可辨;地址一并落账(生命周期判据的钥匙)。
-    ///
-    /// 纪律:关账(容量 0)仅一次 `OnceLock` 判定;`ptrs` 为空时**不分配**内存。
-    /// 入账面武装判定(关账 ⇒ 调用方跳过建载荷;`Exec::launch` 每发射一次)
-    fn note_enabled(&self) -> bool {
-        crate::trace::get().is_some_and(|r| r.enabled())
-    }
-
-    fn note_device(&mut self, kind: &'static str, name: &str, bytes: usize, ptrs: &[u64]) {
-        let Some(tr) = crate::trace::get() else { return };
-        if !tr.enabled() {
-            return;
-        }
-        let mut e = crate::trace::TraceEntry::new(kind, "family").bytes(bytes);
-        if !name.is_empty() {
-            e = e.name(name);
-        }
-        if !ptrs.is_empty() {
-            e = e.ptrs(ptrs.iter().copied());
-        }
-        tr.push(e);
-    }
-    fn record_capture(&mut self, _note: owl_kernels::device::LaunchNote) -> Result<(), OpError> {
-        // 捕获登记 = CUDA stream capture 原生节点(旧 handler 同款零显式
-        // 登记);A1.6 数据结构化随 graph 治理层立项(挂账)
-        Ok(())
-    }
-    fn upload(&mut self, dst: u64, src: &[u8]) -> Result<(), OpError> {
-        let stream = self.stream()?;
+    /// 上传公共体(`upload` / `upload_invariant` 共用;`invariant` 只影响
+    /// 捕获窗入境判定,不影响拷贝语义)
+    fn upload_impl(&mut self, dst: u64, src: &[u8], invariant: bool) -> Result<(), OpError> {
+        // 固有方法 ⇒ trait 方法须显式限定(resolve_span 同款先例)
+        let stream = <Self as owl_kernels::device::DeviceRes>::stream(self)?;
         let capturing = self.ctx.capture_stream();
+        // **捕获窗入境守卫**(§4.3e):裸切片窗内上传 = 源可能生命周期 < 图
+        // (栈上/可变缓冲)⇒ 回放读到已释放内存(静默错值)。不变盒恒放行。
+        if capturing && !invariant {
+            self.ctx.sink.count("srv.count.fam_upload_in_window", 1);
+            match crate::state::fam_window_verdict(
+                crate::state::FamAct::Upload { invariant: false },
+                crate::state::cap_strict(),
+            ) {
+                Ok(()) => self.ctx.sink.logf(
+                    owl_shared::log::LVL_WARN,
+                    "fam-upload-in-window",
+                    format_args!("捕获窗内裸切片 H2D({}B @{dst:#x})—— 源必须生命周期 ≥ 图(不变盒),否则回放静默错值", src.len()),
+                ),
+                Err(detail) => {
+                    return Err(OpError::Contract {
+                        op: OP_RES.into(),
+                        field: "upload",
+                        expect: "捕获窗内上传须走 upload_invariant(InvariantBox)".into(),
+                        got: detail,
+                    })
+                }
+            }
+        }
         // 入账(家族面唯一账线索;A13 藏一轮的直接原因)
-        self.note_device(
+        <Self as owl_kernels::device::DeviceRes>::note_device(
+            self,
             "fam_upload",
             if capturing { "capture" } else { "eager" },
             src.len(),
@@ -1318,6 +1304,113 @@ impl owl_kernels::device::DeviceRes for GpuRes<'_> {
             let _target = target; // 保留账本句柄(析构语义不变)
             Ok(())
         }
+    }
+}
+
+
+impl owl_kernels::device::DeviceRes for GpuRes<'_> {
+    fn context(&self) -> Result<Arc<CudaContext>, OpError> {
+        Ok(self.ctx.ctx.clone())
+    }
+    fn stream(&self) -> Result<Arc<CudaStream>, OpError> {
+        self.ctx
+            .stream(crate::state::STREAM_COMPUTE)
+            .map_err(|e| OpError::Launch { op: OP_RES.into(), stage: owl_kernels::contract::Stage::Load, detail: format!("stream: {e:?}") })
+            .cloned()
+    }
+    fn resolve(&self, id: u64) -> Result<u64, OpError> {
+        Ok(self.resolve_span(id)?.0)
+    }
+    fn resolve_len(&self, id: u64) -> Result<usize, OpError> {
+        Ok(self.resolve_span(id)?.1)
+    }
+    fn alloc(&mut self, bytes: usize, tag: &'static str) -> Result<ScratchBuf, OpError> {
+        // 与旧 handler 同机制:stream.alloc_zeros(cudarc 直分配)。append-only
+        // 账本,物理释放 = server 销毁。
+        //
+        // ⚠️ **捕获窗入境守卫(2026-10-15;设计 §4.3e)**:旧口径是"捕获窗内由
+        // 家族 grave 律保证不再分配"(纯自律)。实测定谳(cuBLAS splitK 案)表明
+        // 窗内 `cudaMallocAsync` **会被捕获**成 MEM_ALLOC/MEM_FREE 节点(回放期
+        // 重分配 + 派发税),且 scratch 是裸指针 ⇒ **完全在 slab/账房之外**
+        // (M1 峰值定尺看不见)。观察档计数 + 告警;`OWL_CAP_STRICT=1` 结构化拒。
+        if self.ctx.capture_stream() {
+            self.ctx.sink.count("srv.count.fam_alloc_in_window", 1);
+            match crate::state::fam_window_verdict(
+                crate::state::FamAct::ScratchAlloc,
+                crate::state::cap_strict(),
+            ) {
+                Ok(()) => self.ctx.sink.logf(
+                    owl_shared::log::LVL_WARN,
+                    "fam-alloc-in-window",
+                    format_args!("家族 scratch 分配发生在捕获窗(tag={tag}, {bytes}B)—— 会被烙成 MEM_ALLOC 节点且不进 slab/账房"),
+                ),
+                Err(detail) => {
+                    return Err(OpError::Contract {
+                        op: OP_RES.into(),
+                        field: "alloc",
+                        expect: "捕获窗内不得现建 scratch(装配期分配 / 不变盒 / 引擎真块三选一)".into(),
+                        got: format!("{detail}(tag={tag}, {bytes}B)"),
+                    })
+                }
+            }
+        }
+        let stream = self.stream()?;
+        let d = stream.alloc_zeros::<u8>(bytes)
+            .map_err(|e| OpError::Launch { op: OP_RES.into(), stage: owl_kernels::contract::Stage::Load, detail: format!("scratch alloc: {e:?}") })?;
+        use cudarc::driver::DevicePtr;
+        let ptr = d.device_ptr(&stream).0;
+        // 入账:scratch 不在块账房(裸指针,不可 resolve)⇒ 账上只有这一条线索
+        self.note_device("fam_alloc", tag, bytes, &[ptr]);
+        self.scratch.push((ptr, d));
+        Ok(ScratchBuf { ptr, bytes })
+    }
+    fn capturing(&self) -> Result<bool, OpError> {
+        Ok(self.ctx.capture_stream())
+    }
+    /// **家族面设备动作入账**(2026-10-15 A13 补漏):家族 runtime 的设备动作
+    /// 不产生 `Command` ⇒ 发射账(§十三)看不见它们 —— A13 藏一整轮的直接原因。
+    /// 本覆写把家族面写进**同一个环**(命令面 `cmd` 与家族面 `kind` 并列可读),
+    /// 且 `stream = "family"` 一眼可辨;地址一并落账(生命周期判据的钥匙)。
+    ///
+    /// 纪律:关账(容量 0)仅一次 `OnceLock` 判定;`ptrs` 为空时**不分配**内存。
+    /// 入账面武装判定(关账 ⇒ 调用方跳过建载荷;`Exec::launch` 每发射一次)
+    fn note_enabled(&self) -> bool {
+        crate::trace::get().is_some_and(|r| r.enabled())
+    }
+
+    fn note_device(&mut self, kind: &'static str, name: &str, bytes: usize, ptrs: &[u64]) {
+        let Some(tr) = crate::trace::get() else { return };
+        if !tr.enabled() {
+            return;
+        }
+        let mut e = crate::trace::TraceEntry::new(kind, "family").bytes(bytes);
+        if !name.is_empty() {
+            e = e.name(name);
+        }
+        if !ptrs.is_empty() {
+            e = e.ptrs(ptrs.iter().copied());
+        }
+        tr.push(e);
+    }
+    fn record_capture(&mut self, note: owl_kernels::device::LaunchNote) -> Result<(), OpError> {
+        // **A1.6 落地(2026-10-15)**:家族/外来核不发 `Command` ⇒ G2 白名单
+        // 与原生发射计数都看不见它们。这里把每次家族发射喂给窗内登记表
+        // (① 空窗哨兵不再误判"纯家族窗为空" ② "图里烘了什么"首次有账;
+        // 见 state.rs `CaptureNodes`)。窗口外调用 = 无动作。
+        if self.ctx.capture_stream() {
+            self.ctx.note_launch(note.kernel);
+        }
+        Ok(())
+    }
+    fn upload(&mut self, dst: u64, src: &[u8]) -> Result<(), OpError> {
+        self.upload_impl(dst, src, false)
+    }
+    fn upload_invariant(
+        &mut self,
+        dst: u64,
+        src: &owl_kernels::contract::InvariantBox,
+    ) -> Result<(), OpError> {
+        self.upload_impl(dst, src.as_bytes(), true)
     }
     fn alloc_block(
         &mut self,

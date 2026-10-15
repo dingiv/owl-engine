@@ -57,6 +57,12 @@ pub struct StepProbes {
     pub dflash_eager: bool,
     pub dflash_noencode: bool,
     pub dflash_dumb: bool,
+    /// 渲染后 prompt 落盘诊断(原 OWL_PROMPT_DUMP;2026-10-15 收编)
+    pub prompt_dump: bool,
+    /// reset_gdn 后 GDN rec 格画像(原 OWL_GDN_DBG;§三十二)
+    pub gdn_dbg: bool,
+    /// prefill H2D 叶子后流栅栏(A13 竞态排障;原 OWL_PF_FENCE)
+    pub pf_fence: bool,
 }
 
 impl StepProbes {
@@ -77,6 +83,9 @@ impl StepProbes {
             dflash_eager: p.dflash_eager,
             dflash_noencode: p.dflash_noencode,
             dflash_dumb: p.dflash_dumb,
+            prompt_dump: p.prompt_dump,
+            gdn_dbg: p.gdn_dbg,
+            pf_fence: p.pf_fence,
         }
     }
 }
@@ -129,22 +138,30 @@ pub struct RunningEngine<D: DeviceClient> {
 /// "还能干活"的下限;低于它就算跑起来也是半截输出。
 pub const _MIN_GEN_TOKENS: usize = 1024;
 
-/// **预算收缩**(纯函数;2026-10-15):`base + max_new ≤ max_seq` 是 KV 槽位
-/// 硬约束,但**不因此拒绝** —— 先按剩余额度收缩生成长度。
+/// **预算收缩**(纯函数;2026-10-15;同日修复回归:下限检查误杀小预算档):
+/// `base + max_new ≤ max_seq` 是 KV 槽位硬约束,但**不因此拒绝** ——
+/// 先按剩余额度收缩生成长度。
 ///
-/// 返回 `Ok(实际可用 max_new)`(≤ 请求值)/ `Err((base, max_new))`(放不下):
-/// `room = max_seq − base`;`room < _MIN_GEN_TOKENS` ⇒ Err,否则
-/// `min(max_new, room)`。
+/// 语义两段(顺序有义,勿倒):
+/// ① **请求本来就装得下 ⇒ 原样放行**(下限 `_MIN_GEN_TOKENS` 只约束
+///    "需要收缩"的场景;曾无条件先查下限 ⇒ max_seq < 1024 的档位
+///    任何 submit 必拒 —— 全部 spec e2e 小预算门被误杀的根因);
+/// ② 装不下 ⇒ 收缩:`room = max_seq − base`;`room < _MIN_GEN_TOKENS`
+///    ⇒ `Err((base, max_new))`(真溢出,客户端压缩上下文),否则
+///    `Ok(room)`(此时 room < max_new,即收缩后额度)。
 pub fn budget_clamp(
     base: usize,
     max_new: usize,
     max_seq: usize,
 ) -> std::result::Result<usize, (usize, usize)> {
+    if base.saturating_add(max_new) <= max_seq {
+        return Ok(max_new);
+    }
     let room = max_seq.saturating_sub(base);
     if room < _MIN_GEN_TOKENS {
         return Err((base, max_new));
     }
-    Ok(max_new.min(room))
+    Ok(room)
 }
 
 impl<D: DeviceClient> RunningEngine<D> {
@@ -221,9 +238,9 @@ impl<D: DeviceClient> RunningEngine<D> {
             } else {
                 self.tok.chat_wrap(&prompt)
             };
-            // 诊断:最终 prompt 落盘(OWL_PROMPT_DUMP=1;§三十六 多轮"无记忆"
+            // 诊断:最终 prompt 落盘([probes] prompt_dump;§三十六 多轮"无记忆"
             // 幻觉定位面 —— dump 渲染+wrap 后送模型的完整 prompt 字节)
-            if std::env::var("OWL_PROMPT_DUMP").is_ok() {
+            if self.probes.prompt_dump {
                 let ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     // 系统时钟回拨兜底 → 0(非失败路径;仅用于 dump 文件名)
@@ -231,8 +248,8 @@ impl<D: DeviceClient> RunningEngine<D> {
                     .unwrap_or(0);
                 let path = format!("/tmp/owl-prompt-{ms}.txt");
                 match std::fs::write(&path, &wrapped) {
-                    Ok(_) => eprintln!("[prompt-dump] {path} ({}B)", wrapped.len()),
-                    Err(e) => eprintln!("[prompt-dump] 落盘失败 {e}"),
+                    Ok(_) => owl_shared::log_debug!("prompt-dump", "{path} ({}B)", wrapped.len()),
+                    Err(e) => owl_shared::log_debug!("prompt-dump", "落盘失败 {e}"),
                 }
             }
             self.tok.encode(&wrapped)
@@ -368,8 +385,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             self.sched_acc_ns += d.as_nanos() as u64;
             self.sched_cnt += 1;
             if self.sched_cnt.is_multiple_of(16) {
-                eprintln!(
-                    "[sched] n={} avg={:.2}ms last={:.2}ms",
+                owl_shared::log_info!("sched", "n={} avg={:.2}ms last={:.2}ms",
                     self.sched_cnt,
                     self.sched_acc_ns as f64 / self.sched_cnt as f64 / 1e6,
                     d.as_secs_f64() * 1e3
@@ -462,5 +478,13 @@ mod budget_tests {
         );
         // base 已 ≥ max_seq(saturating)⇒ 拒,不 panic
         assert!(budget_clamp(99999, 8192, 32768).is_err());
+        // 回归门(2026-10-15):**装得下 ⇒ 原样放行**,下限不倒查 ——
+        // 小预算档(max_seq < 1024)曾被无条件下限检查误杀,全部
+        // spec e2e 门(spec_identity_gate 128 / awq27b 1024 / …)假红
+        assert_eq!(budget_clamp(18, 48, 128), Ok(48));
+        assert_eq!(budget_clamp(52, 16, 1024), Ok(16));
+        assert_eq!(budget_clamp(0, 48, 64), Ok(48));
+        // 装不下且 room < 下限 ⇒ 仍拒(round4 真溢出语义不变)
+        assert_eq!(budget_clamp(18, 4096, 128), Err((18, 4096)));
     }
 }

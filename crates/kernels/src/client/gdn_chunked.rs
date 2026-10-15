@@ -22,12 +22,14 @@ use crate::contract::{Arg, Bytes, KernelSource, LaunchMsg, OpError};
 /// 家族名(字面量住址 = `family::gdn_chunked`;models 经本常量引用)
 pub const GDN_CHUNKED: &str = crate::family::gdn_chunked::GDN_CHUNKED_FWD;
 /// 槽序签名(lower_kernel 对位;O = 输出槽)
-pub const SIG: &str = "T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz";
+pub const SIG: &str = "T,T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz,sz";
 
 /// `parse` 取用的槽名(声明序) —— F3 成对律;
 /// `client::tests::parse_slots_are_exactly_declared` 逐字锁死。
-pub const PARSE_SLOTS: &[&str] =
-    &["q", "k", "v", "beta", "gate", "state", "out", "t", "slot", "nv", "nk", "kd", "scale_bits"];
+pub const PARSE_SLOTS: &[&str] = &[
+    "q", "k", "v", "beta", "gate", "state", "tables", "out", "t", "slot", "nv", "nk", "kd",
+    "scale_bits", "nt",
+];
 
 /// raw 门控(f16;层侧 g 原块)—— 客户端面唯一产出的 g 形态
 #[derive(Clone, Debug)]
@@ -62,6 +64,15 @@ impl GdnShape {
     }
 }
 
+/// 序列表块句柄 + 块数(P-6b;引擎按 `t_real` 写,FLA 语义见
+/// `family::gdn_chunked::{CU_OFF, COFF_OFF, IDX_OFF}`)
+#[derive(Clone, Debug)]
+pub struct TablesSlot {
+    pub tables: Bytes,
+    /// `nt = ceil(t_real / BT)`
+    pub nt: usize,
+}
+
 /// 类型化调用(字段私有;builder 装配,parse 重建)
 #[derive(Clone, Debug)]
 pub struct GdnChunkedCall {
@@ -71,6 +82,8 @@ pub struct GdnChunkedCall {
     beta: Bytes,
     gate: GateRaw,
     state: StateSlot,
+    /// 序列表(cu|coff|idx;P-6b —— 引擎写,核读)
+    tables: TablesSlot,
     shape: GdnShape,
 }
 
@@ -84,11 +97,12 @@ impl GdnChunkedCall {
             beta: None,
             gate: None,
             state: None,
+            tables: None,
         }
     }
 
-    /// 输入槽(6 Block;顺序即契约)
-    pub fn ins_args(&self) -> [Arg; 6] {
+    /// 输入槽(7 Block;顺序即契约 —— `tables` 是 P-6b 新增的序列表)
+    pub fn ins_args(&self) -> [Arg; 7] {
         [
             Arg::block(self.q.id, self.q.dtype, self.q.rank),
             Arg::block(self.k.id, self.k.dtype, self.k.rank),
@@ -96,11 +110,12 @@ impl GdnChunkedCall {
             Arg::block(self.beta.id, self.beta.dtype, self.beta.rank),
             Arg::block(self.gate.0.id, self.gate.0.dtype, self.gate.0.rank),
             Arg::block(self.state.pool.id, self.state.pool.dtype, self.state.pool.rank),
+            Arg::block(self.tables.tables.id, self.tables.tables.dtype, self.tables.tables.rank),
         ]
     }
 
     /// 标量值(models 侧 TensorOps::arg_usize 胶水用;序/编码单源)
-    pub fn scalar_u64s(&self) -> [u64; 6] {
+    pub fn scalar_u64s(&self) -> [u64; 7] {
         let s = self.shape;
         [
             s.t as u64,
@@ -109,11 +124,12 @@ impl GdnChunkedCall {
             s.nk as u64,
             s.kd as u64,
             s.scale_bits(),
+            self.tables.nt as u64,
         ]
     }
 
-    /// 标量槽(6 sz;编码单源:scale = f32 位型入 U64)
-    pub fn scalar_args(&self) -> [Arg; 6] {
+    /// 标量槽(7 sz;编码单源:scale = f32 位型入 U64)
+    pub fn scalar_args(&self) -> [Arg; 7] {
         let s = self.shape;
         [
             Arg::U64(s.t as u64),
@@ -122,6 +138,7 @@ impl GdnChunkedCall {
             Arg::U64(s.nk as u64),
             Arg::U64(s.kd as u64),
             Arg::U64(s.scale_bits()),
+            Arg::U64(self.tables.nt as u64),
         ]
     }
 
@@ -148,6 +165,7 @@ impl GdnChunkedCall {
             beta: s.flat_block("beta")?,
             gate: GateRaw(s.flat_block("gate")?),
             state: StateSlot { pool: s.flat_block("state")?, slot: s.u64("slot")? as u32 },
+            tables: TablesSlot { tables: s.flat_block("tables")?, nt: s.u64("nt")? as usize },
             shape,
         };
         Ok((call, out))
@@ -156,7 +174,7 @@ impl GdnChunkedCall {
     /// 完整发射消息(旁路直发形态;解释器路径用 ins_args/scalar_args)。
     /// out 由调用方传入(直发面无解释器代分配)。
     pub fn to_launch(&self, out: Bytes) -> LaunchMsg {
-        let mut args: Vec<Arg> = Vec::with_capacity(13);
+        let mut args: Vec<Arg> = Vec::with_capacity(14);
         args.extend(self.ins_args());
         args.push(Arg::block(out.id, out.dtype, out.rank));
         args.extend(self.scalar_args());
@@ -179,6 +197,7 @@ impl GdnChunkedCall {
     pub fn gate(&self) -> &GateRaw { &self.gate }
     pub fn state(&self) -> &StateSlot { &self.state }
     pub fn shape(&self) -> GdnShape { self.shape }
+    pub fn tables(&self) -> &TablesSlot { &self.tables }
 }
 
 /// builder(字段名即契约;类型不对编译不过,长度不对构造期结构化报错)
@@ -190,6 +209,7 @@ pub struct GdnChunkedCallBuilder {
     beta: Option<Bytes>,
     gate: Option<GateRaw>,
     state: Option<StateSlot>,
+    tables: Option<TablesSlot>,
 }
 
 impl GdnChunkedCallBuilder {
@@ -269,6 +289,23 @@ impl GdnChunkedCallBuilder {
         Ok(self)
     }
 
+    /// **序列表**入面(P-6b):`nt = ceil(t_real / BT)`;块长按
+    /// `family::gdn_chunked::table_bytes(nt)` 起算(容差:块可以更大,
+    /// 引擎按 `nt_cap` 定容 ⇒ 只校验"装得下")
+    pub fn tables(mut self, b: &Bytes, nt: usize) -> Result<Self, OpError> {
+        let need = crate::family::gdn_chunked::table_bytes(nt);
+        if b.len != 0 && b.len < need {
+            return Err(OpError::Contract {
+                op: GDN_CHUNKED.to_string(),
+                field: "tables",
+                expect: format!("≥ {need} B (nt={nt};cu|coff|idx 布局)"),
+                got: format!("块 id={} len={}", b.id, b.len),
+            });
+        }
+        self.tables = Some(TablesSlot { tables: b.clone(), nt });
+        Ok(self)
+    }
+
     pub fn build(self) -> Result<GdnChunkedCall, OpError> {
         let missing = [
             ("q", self.q.is_none()),
@@ -277,6 +314,7 @@ impl GdnChunkedCallBuilder {
             ("beta", self.beta.is_none()),
             ("gate", self.gate.is_none()),
             ("state", self.state.is_none()),
+            ("tables", self.tables.is_none()),
         ]
         .into_iter()
         .filter(|(_, miss)| *miss)
@@ -298,6 +336,7 @@ impl GdnChunkedCallBuilder {
             beta: self.beta.unwrap(),
             gate: self.gate.unwrap(),
             state: self.state.unwrap(),
+            tables: self.tables.unwrap(),
             shape: self.shape,
         })
     }
@@ -324,6 +363,8 @@ mod tests {
 
     fn sample(t: u32) -> GdnChunkedCall {
         let s = shape(t);
+        // 序列表(P-6b):nt 由真长度推(与生产同式),块长按 table_bytes(nt)
+        let nt = (t as usize).div_ceil(crate::family::gdn_chunked::BT).max(1);
         GdnChunkedCall::builder(s)
             .q(&dummy(1, (s.t as usize) * 16 * 128)).unwrap()
             .k(&dummy(2, (s.t as usize) * 16 * 128)).unwrap()
@@ -331,6 +372,8 @@ mod tests {
             .beta(&dummy_f(4, (s.t as usize) * 48, Dtype::F16, 2)).unwrap()
             .gate_raw(&dummy_f(5, (s.t as usize) * 48, Dtype::F16, 2)).unwrap()
             .state(&dummy_f(6, 48 * 128 * 128, Dtype::F32, 4), 0).unwrap()
+            .tables(&dummy_f(7, crate::family::gdn_chunked::table_bytes(nt), Dtype::U32, 1), nt)
+            .unwrap()
             .build().unwrap()
     }
 
@@ -348,6 +391,8 @@ mod tests {
         assert_eq!(back.gate().0.id, call.gate().0.id);
         assert_eq!(back.state().pool.id, call.state().pool.id);
         assert_eq!(back.state().slot, call.state().slot);
+        assert_eq!(back.tables().tables.id, call.tables().tables.id);
+        assert_eq!(back.tables().nt, call.tables().nt);
         assert_eq!(back.shape().t, call.shape().t);
         assert_eq!(back.shape().scale_bits(), call.shape().scale_bits());
         assert_eq!(out2.id, out.id);
@@ -360,7 +405,7 @@ mod tests {
         let call = sample(64);
         let msg = call.to_launch(dummy(99, 64 * 48 * 128));
         assert_eq!(msg.kernel.name, GDN_CHUNKED);
-        // 7 块(q/k/v/beta/gate/state/out)+ 6 标量
+        // 8 块(q/k/v/beta/gate/state/**tables**/out)+ 7 标量(P-6b)
         let mut blocks = 0;
         let mut scalars: Vec<u64> = Vec::new();
         for a in &msg.args {
@@ -370,11 +415,11 @@ mod tests {
                 other => panic!("线格式外元素: {other:?}"),
             }
         }
-        assert_eq!(blocks, 7);
+        assert_eq!(blocks, 8);
         assert_eq!(
             scalars,
-            vec![64, 0, 48, 16, 128, shape(64).scale_bits()],
-            "标量序/位型漂移 = 旧链不识别"
+            vec![64, 0, 48, 16, 128, shape(64).scale_bits(), 1],
+            "标量序/位型漂移(末位 = nt;t=64 ⇒ nt=1)"
         );
     }
 

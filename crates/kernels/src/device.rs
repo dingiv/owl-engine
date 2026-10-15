@@ -53,6 +53,13 @@ impl DeviceRes for &mut dyn DeviceRes {
     fn upload(&mut self, dst: DevPtr, src: &[u8]) -> Result<(), OpError> {
         (**self).upload(dst, src)
     }
+    fn upload_invariant(
+        &mut self,
+        dst: DevPtr,
+        src: &crate::contract::InvariantBox,
+    ) -> Result<(), OpError> {
+        (**self).upload_invariant(dst, src)
+    }
     fn device_ordinal(&self) -> Result<i32, OpError> {
         (**self).device_ordinal()
     }
@@ -121,6 +128,23 @@ pub trait DeviceRes {
     /// 调用方不得依赖「upload 返回后 host 就能读到」;要读请走
     /// [`download`](Self::download)(它自带回读前排空)。
     fn upload(&mut self, dst: DevPtr, src: &[u8]) -> Result<(), OpError>;
+    /// **不变盒上传**(捕获窗的合规范式;见设计 §4.3e)。
+    ///
+    /// 为什么单列:`upload` 的源是**裸切片**,捕获窗内会被烙成 `memcpyAsync`
+    /// 节点 —— 回放期**重新读那个 host 地址**。源若是 run() 内现建的栈上/可变
+    /// 缓冲(典型:`gdn_chunked` 的 meta 表),回放读到的就是**已释放或已改写**
+    /// 的内存 ⇒ 静默错值(与 FI plan 内嵌 H2D 同族)。
+    ///
+    /// 本方法声明"源是 [`InvariantBox`](crate::contract::InvariantBox):
+    /// 构造即冻结、生命周期 ≥ 图" ⇒ 捕获窗内合规、零告警。
+    /// 缺省实现转发 [`upload`](Self::upload)(非捕获后端无需区分)。
+    fn upload_invariant(
+        &mut self,
+        dst: DevPtr,
+        src: &crate::contract::InvariantBox,
+    ) -> Result<(), OpError> {
+        self.upload(dst, src.as_bytes())
+    }
     /// 设备序号(FFI 面 dev 注入;marlin/cublas 等直调家族用)
     fn device_ordinal(&self) -> Result<i32, OpError>;
     /// **账本块分配**(装配期自检专用;2026-10-13 P5c)。

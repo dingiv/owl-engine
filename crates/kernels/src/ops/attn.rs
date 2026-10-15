@@ -520,10 +520,20 @@ impl KernelSpec for NaiveDecodeAttnF16 {
     const SRC: &'static str = "cu/attn/naive_decode_attn.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
+        // **契约(2026-10-16 B6 收敛):k/v r3 = [tokens, hkv, hd]。
+        // 两条活路已统一到同一口径:层 decode 路 `reshape([tokens,hkv,hd])`;
+        // prefill token-loop 路的窄视图也改成 `[1,hkv,hd]`(纯元数据;核按
+        // 显式标量寻址,不吃 rank)。
         Param::t_in("k", Dtype::F16, 3),
         Param::t_in("v", Dtype::F16, 3),
-        Param::t_in("kc", Dtype::F16, 5),
-        Param::t_in("vc", Dtype::F16, 4),
+        // kc/vc = **池叶**:形状随池表示而变(legacy r3 `[nb,hkv,hd]` / paged K r5
+        // / paged V r4 —— 页=1 时内存等价),且核按显式标量寻址。
+        // 契约单源 = 引擎 `StatePool::{k_shape,v_shape}`(池侧声明见 POOL),
+        // 故本二槽不约束 rank(r0)—— 不是"两套口径",是"表示相关槽"。
+        Param::t_in("kc", Dtype::F16, 0),
+        Param::t_in("vc", Dtype::F16, 0),
+        // 契约:slots/kv_lens r2([1, n] —— 池叶与狭窄视图同秩;2026-10-16 B6 收敛,
+        // 秩以**实测线格式事实**定:5 处活调用点均为 r2)
         Param::t_in("slots", Dtype::F32, 2),
         Param::t_in("kv_lens", Dtype::F32, 2),
         Param::sz("bs"),
@@ -550,10 +560,14 @@ impl KernelSpec for NaiveDecodeAttnF32 {
     const SRC: &'static str = "cu/attn/naive_decode_attn.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F32, 2),
-        Param::t_in("k", Dtype::F32, 2),
-        Param::t_in("v", Dtype::F32, 2),
-        Param::t_in("kc", Dtype::F32, 2),
-        Param::t_in("vc", Dtype::F32, 2),
+        // 契约:k/v r3 = [tokens, hkv, hd](与 f16 臂同式;2026-10-16 B6 收敛,
+        // 两条活路已统一 —— 旧声明 r2 与真调用不符)
+        Param::t_in("k", Dtype::F32, 3),
+        Param::t_in("v", Dtype::F32, 3),
+        // kc/vc = 池叶(表示相关槽;契约单源同 f16 臂,见上)
+        Param::t_in("kc", Dtype::F32, 0),
+        Param::t_in("vc", Dtype::F32, 0),
+        // 契约:slots/kv_lens r2([1, n];与 f16 臂同式)
         Param::t_in("slots", Dtype::F32, 2),
         Param::t_in("kv_lens", Dtype::F32, 2),
         Param::sz("bs"),
@@ -1247,7 +1261,7 @@ impl KernelSpec for PrefillSplitF16Hd256 {
         Param::t_in("block_tables", Dtype::F32, 2),
         Param::t_in("scr_out", Dtype::F16, 2),
         Param::t_in("scr_stat", Dtype::F32, 2),
-        Param::t_in("k0_alibi", Dtype::F16, 2),
+        Param::t_in("k0_alibi", Dtype::F16, 0),  // 调用方传 K0 写输出(out r1)⇒ 不约束 rank(2026-10-15 B6)
         Param::f32("scale"),
         Param::i32("hkv"),
         Param::i32("T"),
@@ -1257,7 +1271,7 @@ impl KernelSpec for PrefillSplitF16Hd256 {
         Param::i32("kv_head_stride"),
         Param::i32("page"),
         Param::i32("hq"),
-        Param::t_out("dummy", Dtype::F16, 2),
+        Param::t_out("dummy", Dtype::F16, 0),  // 哨兵槽:调用方传 K0 写输出(r1)⇒ 不约束(2026-10-15 B6)
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::F16)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -1282,7 +1296,7 @@ impl KernelSpec for PrefillSplitFp8KvHd256 {
         Param::t_in("block_tables", Dtype::F32, 2),
         Param::t_in("scr_out", Dtype::F16, 2),
         Param::t_in("scr_stat", Dtype::F32, 2),
-        Param::t_in("k0_alibi", Dtype::F16, 2),
+        Param::t_in("k0_alibi", Dtype::F16, 0),  // 调用方传 K0 写输出(out r1)⇒ 不约束 rank(2026-10-15 B6)
         Param::f32("scale"),
         Param::i32("hkv"),
         Param::i32("T"),
@@ -1292,7 +1306,7 @@ impl KernelSpec for PrefillSplitFp8KvHd256 {
         Param::i32("kv_head_stride"),
         Param::i32("page"),
         Param::i32("hq"),
-        Param::t_out("dummy", Dtype::F16, 2),
+        Param::t_out("dummy", Dtype::F16, 0),  // 哨兵槽:调用方传 K0 写输出(r1)⇒ 不约束(2026-10-15 B6)
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::U8)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -1317,7 +1331,7 @@ impl KernelSpec for PrefillSplitF16KnhdHd256 {
         Param::t_in("block_tables", Dtype::F32, 2),
         Param::t_in("scr_out", Dtype::F16, 2),
         Param::t_in("scr_stat", Dtype::F32, 2),
-        Param::t_in("k0_alibi", Dtype::F16, 2),
+        Param::t_in("k0_alibi", Dtype::F16, 0),  // 调用方传 K0 写输出(out r1)⇒ 不约束 rank(2026-10-15 B6)
         Param::f32("scale"),
         Param::i32("hkv"),
         Param::i32("T"),
@@ -1327,7 +1341,7 @@ impl KernelSpec for PrefillSplitF16KnhdHd256 {
         Param::i32("kv_head_stride"),
         Param::i32("page"),
         Param::i32("hq"),
-        Param::t_out("dummy", Dtype::F16, 2),
+        Param::t_out("dummy", Dtype::F16, 0),  // 哨兵槽:调用方传 K0 写输出(r1)⇒ 不约束(2026-10-15 B6)
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F16)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -1352,7 +1366,7 @@ impl KernelSpec for PrefillSplitFp8KvKnhdHd256 {
         Param::t_in("block_tables", Dtype::F32, 2),
         Param::t_in("scr_out", Dtype::F16, 2),
         Param::t_in("scr_stat", Dtype::F32, 2),
-        Param::t_in("k0_alibi", Dtype::F16, 2),
+        Param::t_in("k0_alibi", Dtype::F16, 0),  // 调用方传 K0 写输出(out r1)⇒ 不约束 rank(2026-10-15 B6)
         Param::f32("scale"),
         Param::i32("hkv"),
         Param::i32("T"),
@@ -1362,7 +1376,7 @@ impl KernelSpec for PrefillSplitFp8KvKnhdHd256 {
         Param::i32("kv_head_stride"),
         Param::i32("page"),
         Param::i32("hq"),
-        Param::t_out("dummy", Dtype::F16, 2),
+        Param::t_out("dummy", Dtype::F16, 0),  // 哨兵槽:调用方传 K0 写输出(r1)⇒ 不约束(2026-10-15 B6)
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::U8)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
@@ -1381,7 +1395,7 @@ impl KernelSpec for PrefillSplitReduceF16Hd256 {
     const ENTRY: &'static str = "owl_prefill_split_reduce_f16_hd256";
     const SRC: &'static str = "cu/attn/prefill_split_f16.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("split_alibi", Dtype::F16, 2),
+        Param::t_in("split_alibi", Dtype::F16, 0),  // 哨兵槽(=K0 写输出 r1)⇒ 不约束(2026-10-15 B6)
         Param::t_in("scr_out", Dtype::F16, 2),
         Param::t_in("scr_stat", Dtype::F32, 2),
         Param::i32("nparts"),

@@ -69,7 +69,9 @@ impl KernelSpec for DflashConvF16 {
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::F16, 2),
         Param::t_in("delta", Dtype::F16, 2),
-        Param::t_in("base", Dtype::F16, 2),
+        // base = 核表 `base_kernel [2(side), TAPS, hidden]`(装载器同形)⇒ r3;
+        // 旧声明 r2 与真算子/bf16 臂都不符(2026-10-15 B6 用例暴露)
+        Param::t_in("base", Dtype::F16, 3),
         Param::i32("side"),
         Param::i32("block_size"),
         Param::i32("hidden"),
@@ -93,13 +95,13 @@ impl KernelSpec for DflashSelectF16 {
         Param::t_in("cand", Dtype::F32, 2),
         Param::t_in("unary", Dtype::F32, 2),
         Param::t_in("proj", Dtype::F16, 2),
-        Param::t_in("anchor", Dtype::F32, 2),
+        Param::t_in("anchor", Dtype::F32, 0),  // 调用方传 [1] 标量;r2 旧声明与真调用不符(2026-10-15 B6)
         Param::t_in("a_tab", Dtype::F16, 2),
         Param::t_in("b_tab", Dtype::F16, 2),
         Param::i32("slots"),
         Param::i32("k_top"),
         Param::i32("rank"),
-        Param::t_out("out", Dtype::F32, 2),
+        Param::t_out("out", Dtype::F32, 1),  // 生产/测试皆单缓冲 [2·rows·K] 扁平(r1)
     ];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;

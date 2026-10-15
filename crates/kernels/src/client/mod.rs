@@ -322,16 +322,18 @@ mod tests {
     fn named_slots_fail_loud() {
         let name = crate::family::gdn_chunked::GDN_CHUNKED_FWD;
         let blk = |id: u64| Arg::block(id, crate::contract::Dtype::F16, 3);
+        // P-6b:7 块(q,k,v,beta,gate,state,tables)+ 7 标量(t,slot,nv,nk,kd,scale_bits,nt)
         let good: Vec<Arg> = vec![
-            blk(1), blk(2), blk(3), blk(4), blk(5), blk(6), blk(7),
+            blk(1), blk(2), blk(3), blk(4), blk(5), blk(6), blk(7), blk(8),
             Arg::U64(1), Arg::U64(0), Arg::U64(1), Arg::U64(1), Arg::U64(128), Arg::U64(0),
+            Arg::U64(1),
         ];
 
         // ① 未建表算子 ⇒ 拒(不回落位置切片)
         let e = NamedSlots::new(&launch("不存在的核", good.clone())).err().expect("未建表必拒");
         assert!(matches!(&e, OpError::Contract { field: "kernel.name", .. }), "{e}");
 
-        // ② 槽数不符 ⇒ 拒(声明 13 槽)
+        // ② 槽数不符 ⇒ 拒(声明 15 槽)
         let e = NamedSlots::new(&launch(name, good[..12].to_vec())).err().expect("槽数不符必拒");
         assert!(matches!(&e, OpError::Contract { field: "argc", .. }), "{e}");
 
@@ -355,7 +357,7 @@ mod tests {
 
         // ⑤ Out 槽禁 BlockSlice(L3 同律;回执句柄必须整块)
         let mut sliced = good.clone();
-        sliced[6] = Arg::BlockSlice {
+        sliced[7] = Arg::BlockSlice {
             id: 7,
             byte_offset: 0,
             elems: 8,

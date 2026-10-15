@@ -19,6 +19,11 @@ use crate::scheduler::{SchedulerOutput, StepAction};
 use crate::turn::TurnEvent;
 #[cfg(test)]
 use owl_cpu::CpuFace; // dev-dep:仅 cfg(test) 单元档可用
+// dev-dep 门控(与 tokio 同款模式):cfg(test) 先求值 ⇒ e2e 档不触宏名
+#[cfg(test)]
+use owl_shared::config::OwlConfig;
+#[cfg(test)]
+use owl_macros::owl_test;
 use owl_iface::contract::DeviceClient;
 
 fn asset_dir() -> std::path::PathBuf {
@@ -31,11 +36,19 @@ fn gpu_ordinal() -> Option<usize> {
 }
 
 /// CPU:构造(零执行)+ ModelLoader 装载门禁(权重/tokenizer 解析)
-#[cfg(test)] // dev-dep(tokio)门控:单元档专用
-#[tokio::test]
-async fn cpu_construct_and_load() {
+/// EngineConfig 全件从**用例配置**注入(隐藏 env `OWL_TEST_CONFIG_CPU_CONSTRUCT_AND_LOAD`
+/// → 引擎同款 toml;缺省 = `OwlConfig::default()`)。本用例只到 loader ——
+/// 三件均不参与断言,注入不改测试行为;换档 = 换 toml 不改代码(S3 收编示范)。
+#[cfg(test)] // dev-dep(owl-macros)门控:单元档专用
+#[owl_test]
+async fn cpu_construct_and_load(cfg: &OwlConfig) {
     let mut engine = Engine::on(
-        EngineConfig { device_ordinal: 0, max_seq_tokens: 64, prefill_chunk: 16, knobs: EngineKnobs::default() },
+        EngineConfig {
+            device_ordinal: cfg.runtime.device,
+            max_seq_tokens: cfg.runtime.max_seq,
+            prefill_chunk: cfg.runtime.prefill_chunk,
+            knobs: EngineKnobs::from_config(cfg),
+        },
         CpuFace::new(),
     )
     .expect("engine 构造");
@@ -45,12 +58,17 @@ async fn cpu_construct_and_load() {
 }
 
 /// CPU:增量解码多字节字符跨 token(🌟 4 字节;逐 token 喂入,
-/// 差分不得 panic 且终态与前缀累计一致)
-#[cfg(test)] // dev-dep(tokio)门控:单元档专用
-#[tokio::test]
-async fn cpu_incremental_decode_multibyte() {
+/// 差分不得 panic 且终态与前缀累计一致)。EngineConfig 同样走用例配置注入。
+#[cfg(test)] // dev-dep(owl-macros)门控:单元档专用
+#[owl_test]
+async fn cpu_incremental_decode_multibyte(cfg: &OwlConfig) {
     let mut engine = Engine::on(
-        EngineConfig { device_ordinal: 0, max_seq_tokens: 64, prefill_chunk: 16, knobs: EngineKnobs::default() },
+        EngineConfig {
+            device_ordinal: cfg.runtime.device,
+            max_seq_tokens: cfg.runtime.max_seq,
+            prefill_chunk: cfg.runtime.prefill_chunk,
+            knobs: EngineKnobs::from_config(cfg),
+        },
         CpuFace::new(),
     )
     .expect("engine 构造");
@@ -67,6 +85,23 @@ async fn cpu_incremental_decode_multibyte() {
         "累计差分应是终文前缀:acc={acc:?} final={final_text:?}"
     );
     assert!(final_text.contains('🌟'), "终文应含拆跨字符");
+}
+
+/// **参数化端到端实证**(owl-test-macro.md §四验收 2):wrapper 注入的
+/// `cfg` 必须与「独立按同键 loader 复算」逐字段一致 —— env 未设臂
+/// (default)与文件臂(设 `OWL_TEST_CONFIG_CASE_CONFIG_INJECTION=<toml>`)
+/// 用同一条断言。零装载零 GPU(单元档)。
+#[cfg(test)]
+#[owl_test]
+async fn case_config_injection(cfg: &OwlConfig) {
+    let key = "OWL_TEST_CONFIG_CASE_CONFIG_INJECTION";
+    let mut expect = match owl_shared::env_reader::str(key) {
+        Some(path) => OwlConfig::load(None, Some(std::path::Path::new(&path)))
+            .unwrap_or_else(|e| panic!("独立复算失败({path}): {e}")),
+        None => OwlConfig::default(),
+    };
+    expect.runtime.test_device = owl_shared::env_reader::parse("OWL_TEST_DEVICE");
+    assert_eq!(cfg, &expect, "宏注入配置必须与唯一 loader 独立复算逐字段同");
 }
 
 /// S0 调度决策面单测(GPU 门控 boot,但**调度步零设备执行**):
@@ -1583,4 +1618,150 @@ fn spec_degrade_transition_branches() {
     // threshold=0 = 禁用(永不入降级)
     let (s, d, p) = spec_degrade_transition(9, false, 64, 0, 0, 64);
     assert_eq!((s, d, p), (10, false, 64));
+}
+
+/// **`[graph] prefill_bucket` 档位面**(2026-10-15;M2b 落地后重写)。
+///
+/// 初版是"非 off ⇒ 装配期拒启"(实现未落时的防静默门)。M2b 把真接线放进
+/// `Engine::run`(桶捕获需要模型 + 状态池;静止点律 ⇒ 只在 boot),`Engine::on`
+/// 回到纯构造 ⇒ 三档均放行;无桶可用时走 eager 原路(且有 **warn 证据面**,
+/// 不是静默降级 —— 真机档见 `graph_fleet::assemble` 的 ④ 段)。
+#[cfg(test)]
+#[tokio::test]
+async fn prefill_bucket_levels_boot() {
+    use owl_shared::config::PrefillBucket;
+    let mk = |b: PrefillBucket| EngineConfig {
+        device_ordinal: 0,
+        max_seq_tokens: 64,
+        prefill_chunk: 16,
+        knobs: EngineKnobs { prefill_bucket: b, ..EngineKnobs::default() },
+    };
+    for b in [PrefillBucket::Off, PrefillBucket::T512, PrefillBucket::Geobuckets] {
+        assert!(Engine::on(mk(b), CpuFace::new()).is_ok(), "{b:?} 应可构造(真接线在 run)");
+    }
+}
+
+/// **桶闸道纯函数**(M2b):阶梯/向上取整/GDN host 槽臂判定(零设备)。
+#[cfg(test)]
+#[test]
+fn prefill_bucket_pick_and_ladder() {
+    use crate::prefill_plan::{gdn_host_slot_arm, ladder, pick_bucket};
+    use owl_shared::config::PrefillBucket;
+    // 阶梯:off 空;t512 单桶;geobuckets 五点
+    assert!(ladder(PrefillBucket::Off).is_empty());
+    assert_eq!(ladder(PrefillBucket::T512), &[512]);
+    assert_eq!(ladder(PrefillBucket::Geobuckets), &[32, 64, 128, 256, 512]);
+    // 向上取整(不向下):512 档下 t=1..=512 全命中 512;t>512 不命中
+    for t in [1usize, 33, 128, 511, 512] {
+        assert_eq!(pick_bucket(ladder(PrefillBucket::T512), t), Some(512));
+    }
+    assert_eq!(pick_bucket(ladder(PrefillBucket::T512), 513), None);
+    // geobuckets:边界贴着阶梯走
+    let l = ladder(PrefillBucket::Geobuckets);
+    for (t, want) in [(1usize, 32usize), (32, 32), (33, 64), (65, 128), (257, 512), (512, 512)] {
+        assert_eq!(pick_bucket(l, t), Some(want), "t={t}");
+    }
+    assert_eq!(pick_bucket(l, 900), None);
+    // GDN host 槽臂:27B 几何 + chunked ⇒ t≥64 才吃 host 槽(小 T 走 varlen)
+    let mut env = owl_models::env::EnvProvider::default();
+    let dims = crate::state::ModelDims {
+        hq: 24, hkv: 4, hd: 256, nk: 16, hk: 128, nv: 48, hv: 128, hidden: 2048,
+        dtype: owl_iface::contract::Dtype::F16,
+    };
+    env.gdn.chunked = true;
+    assert!(!gdn_host_slot_arm(&env, &dims, 32), "小桶走 varlen(设备槽)⇒ 不吃 host 槽");
+    assert!(gdn_host_slot_arm(&env, &dims, 64));
+    assert!(gdn_host_slot_arm(&env, &dims, 512));
+    // 非 chunked(0.8B 夹具几何)⇒ 恒 varlen ⇒ 不吃 host 槽
+    env.gdn.chunked = false;
+    assert!(!gdn_host_slot_arm(&env, &dims, 512));
+}
+
+// ===========================================================================
+// M2b:prefill 桶图(设计 §4–§6;GPU 门控)
+// ===========================================================================
+
+/// **桶图 ≡ eager(贪心逐 token)+ 桶确实被用上**(0.8B)。
+///
+/// 两引擎**同配置**,唯一差别 = `prefill_bucket`;同提示词贪心生成 ⇒ 输出文本
+/// 必须逐字相同。为什么是 token 级而非 hidden 级:跨桶时 FI 的 tile 数/tiling
+/// 随 t 变(设计 §4.1c"数值口径分两层")—— token 级 = 软门;桶内逐位门由
+/// `fi_graph_replay_probe`(M2a)与 kernels 侧门承担;GDN 假行面由
+/// `gdn_bucket_pad_probe` 承担。
+///
+/// 提示词长度故意跨两个桶(128 → 64):既验"向上取整命中",也验"多桶共存时
+/// int_ws 的 plan 自携"(见 `server/flashinfer.rs::PlanEntry`)。
+#[cfg(test)]
+#[tokio::test]
+async fn gpu_prefill_bucket_matches_eager() {
+    use owl_shared::config::PrefillBucket;
+    let Some(ordinal) = gpu_ordinal() else {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    };
+    let dir = asset_dir();
+    // 日志面接上(桶捕获的 warn/info 是 boot 证据面;测试里默认无 sink)
+    let _ = owl_shared::log::init_logger(owl_shared::log::LogConfig {
+        level: owl_shared::log::LVL_INFO,
+        ..Default::default()
+    });
+    // 贪心(关采样器)⇒ 两条路必须逐字同轨
+    async fn boot_bucket(
+        dir: &std::path::Path,
+        ordinal: usize,
+        b: PrefillBucket,
+    ) -> RunningEngine<owl_cuda::GpuClient> {
+        // `EnvProvider::default()` 是 attest=false(诊断 A/B 保留位);生产走
+        // `from_config` ⇒ `from_dispatch` 恒真(2026-10-13 用户令)⇒ 本测显式打开。
+        let env = owl_models::env::EnvProvider { attn: owl_models::env::AttnEnv { fi: true, ..Default::default() }, ..Default::default() };
+        let mut engine = Engine::new(EngineConfig {
+            device_ordinal: ordinal,
+            max_seq_tokens: 2048,
+            // 512:t_pad=512 桶(设计 M2b 的原目标形态 —— 长 chunk 也进图;
+            // 提示词 ~600 tok ⇒ chunk 512 + 尾块 88 ⇒ 同时命中大桶与中桶)
+            prefill_chunk: 512,
+            knobs: EngineKnobs {
+                prefill_bucket: b,
+                sampler_enabled: false,
+                env,
+                ..EngineKnobs::default()
+            },
+        })
+        .expect("构造");
+        let loaded = engine.loader().load_qwen35_0_8b(dir).await.expect("装载");
+        engine.run(loaded).await.expect("装配")
+    }
+    let prompt = "长城是中国古代的军事防御工程,用来抵御北方游牧民族的侵袭。".repeat(40);
+    async fn gen(running: &mut RunningEngine<owl_cuda::GpuClient>, prompt: &str, n: usize) -> String {
+        let id = running.submit(prompt.to_string(), n).expect("submit");
+        loop {
+            match running.pump().await.expect("pump") {
+                TurnEvent::Completed { turn, text, .. } if turn == id => return text,
+                TurnEvent::Failed { turn, err } => panic!("turn {turn} 失败: {err}"),
+                TurnEvent::Idle => panic!("队列丢失"),
+                _ => {}
+            }
+        }
+    }
+    // ① 桶档
+    let mut g = boot_bucket(&dir, ordinal, PrefillBucket::Geobuckets).await;
+    let buckets = g.graphs.prefill.captured_t_pads();
+    eprintln!("[m2b] 桶捕获:{:?}(summary = {})", buckets, g.graphs.prefill.summary());
+    assert!(
+        buckets.len() >= 3,
+        "geobuckets 至少应捕获小桶若干(实测 {buckets:?});捕获失败看 warn 证据面"
+    );
+    let out_graph = gen(&mut g, &prompt, 24).await;
+    let counts = g.graphs.prefill.replay_counts();
+    eprintln!("[m2b] 桶回放次数:{counts:?}");
+    // **证据面**:图路确实被走了(批 180 tok / chunk 128 ⇒ 命中 t128 + t64)
+    let used: Vec<usize> = counts.iter().filter(|(_, n)| *n > 0).map(|(t, _)| *t).collect();
+    assert!(!used.is_empty(), "桶一个都没回放 ⇒ 图路没生效(本测在测 eager vs eager)");
+    assert!(used.contains(&512), "本 prompt(chunk=512)应命中 t512 桶,实测 {used:?}");
+    // ② eager 档(同模型同配置,只关桶)
+    let mut e = boot_bucket(&dir, ordinal, PrefillBucket::Off).await;
+    let out_eager = gen(&mut e, &prompt, 24).await;
+    eprintln!("[m2b] 桶档 {out_graph:?}\n[m2b] eager {out_eager:?}");
+    assert!(!out_graph.trim().is_empty(), "桶档空回答");
+    assert_eq!(out_graph, out_eager, "桶图与 eager 的贪心输出必须逐字相同(M2b 跨档门)");
 }

@@ -47,6 +47,40 @@
 /// foreign-kernel 虚拟核名(server 分派臂;**字面量住址 = 本模块**)
 pub const GDN_CHUNKED_FWD: &str = "gdn_chunked_delta_rule_fwd";
 
+/// **FLA 序列表在表块内的字节布局**(P-6b;2026-10-15)。
+///
+/// 为什么把布局放这里:三张表(FLA 的 `cu_seqlens` / `chunk_offsets` /
+/// `chunk_indices`)在**引擎**(写)与 **runtime**(读)两侧都要按同一偏移切,
+/// 而表内容本身是本块的 8 字节 i64 数组:
+/// ```text
+///   [0]        cu              2×i64 = [0, t_real]          (序列边界)
+///   [16]       chunk_offsets   2×i64 = [0, nt]              (chunk_delta_h 的 h 缓冲偏移)
+///   [32]       chunk_indices   2×nt×i64 = (0, i) i<nt       (seq_id, chunk_id_in_seq)
+/// ```
+/// 语义权威 = `crates/kernels/triton/fla/ops/index.py::prepare_chunk_indices/
+/// chunk_offsets`(FLA 上游)。
+pub const CU_OFF: usize = 0;
+pub const COFF_OFF: usize = 16;
+pub const IDX_OFF: usize = 32;
+
+/// **FLA 块大小**(triton 配置 `shape.BT`;与 `triton/gdn_chunked_aot.json` 同源,
+/// 由本文件单测 `bt_matches_aot_config` 机器锁死)。`nt = ceil(t/BT)`。
+pub const BT: usize = 64;
+
+/// 表块字节数(给定块数上限)
+pub const fn table_bytes(nt_cap: usize) -> usize {
+    IDX_OFF + 16 * nt_cap
+}
+
+/// 按 `(t_real, nt)` 铸造表内容(引擎侧唯一构造点;runtime 侧零生成)
+pub fn table_host_bytes(t_real: usize, nt: usize) -> Vec<u8> {
+    let mut host: Vec<i64> = Vec::with_capacity(4 + nt * 2);
+    host.extend_from_slice(&[0, t_real as i64]);
+    host.extend_from_slice(&[0, nt as i64]);
+    host.extend((0..nt).flat_map(|i| [0i64, i as i64]));
+    host.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
 /// 槽序契约(LaunchMsg.args):
 /// `[T q, T k, T v, T g, T beta, T state(in/out f32 槽块), O out, T o_f32(scratch 出),
 ///   sz T, sz slot, sz hv, sz nk, sz kd, sz scale_bits, sz nt]`
@@ -128,5 +162,34 @@ pub mod cubins {
         pub const O_SHARED: u32 = 24576;
         pub const O_WARPS: u32 = 4;
         // (pip-fla f32 时代的对照臂常量与资产已于 2026-10-13 退役删除)
+    }
+}
+
+#[cfg(test)]
+mod table_layout_tests {
+    /// **BT 单源锁**:Rust 常量必须等于 AOT 配置表的 `shape.BT`
+    /// (编译产物按那张表选的瓦;漂了就是"表块数与核不一致"的静默错值)
+    #[test]
+    fn bt_matches_aot_config() {
+        const CFG: &str = include_str!("../../triton/gdn_chunked_aot.json");
+        let want = format!("\"BT\": {}", super::BT);
+        assert!(CFG.contains(&want), "AOT 配置里找不到 {want}(BT 漂移?)");
+    }
+
+    /// 表布局自洽:cu/coff/idx 的偏移与内容长度严格对应
+    #[test]
+    fn table_bytes_layout() {
+        let nt = 3usize;
+        let b = super::table_host_bytes(192, nt);
+        assert_eq!(b.len(), super::table_bytes(nt));
+        let i64_at = |off: usize, k: usize| -> i64 {
+            let s = off + k * 8;
+            i64::from_le_bytes(b[s..s + 8].try_into().unwrap())
+        };
+        assert_eq!((i64_at(super::CU_OFF, 0), i64_at(super::CU_OFF, 1)), (0, 192));
+        assert_eq!((i64_at(super::COFF_OFF, 0), i64_at(super::COFF_OFF, 1)), (0, 3));
+        for i in 0..nt {
+            assert_eq!((i64_at(super::IDX_OFF, 2 * i), i64_at(super::IDX_OFF, 2 * i + 1)), (0, i as i64));
+        }
     }
 }

@@ -77,24 +77,7 @@ impl ChunkTables {
         } else {
             seq(base, t)
         };
-        let fi = fi_face.then(|| {
-            let ctx_total = base + t;
-            let nb = bt_chain.len();
-            // ⚠️ **块链可能长于「本 chunk 已覆盖页数」** —— 块表按**全 prompt**
-            // 预分配(scheduler::ensure_for_len),而本 chunk 只盖到 ctx_total。
-            // 三件套必须按**实际覆盖页数**截断:原式 `ctx_total - nb*page + page`
-            // 在 nb 过大时下溢(debug panic)/回绕成巨值(release → FI plan 拿着
-            // 巨 last_len 越界读 indices 数组外)。2026-10-13 由
-            // gpu_longctx_fi_direct_gate 首跑暴露。
-            let nb_used = ctx_total.div_ceil(page).min(nb).max(1);
-            FiTables {
-                q_cu: vec![0, t as u32],
-                indices: bt_chain[..nb_used].to_vec(),
-                indptr: vec![0, nb_used as u32],
-                last_len: vec![(ctx_total - (nb_used - 1) * page) as u32],
-                nb_used,
-            }
-        });
+        let fi = fi_face.then(|| fi_tables(base, t, bt_chain, page));
         Self {
             ids: ids.iter().map(|v| *v as f32).collect(),
             pos: seq(base, t),
@@ -109,6 +92,79 @@ impl ChunkTables {
                 mask: causal_mask_words(t),
             }),
         }
+    }
+
+    /// **桶布局表(M2b)**:槽面按布局 `t_pad` 行铸,但**语义全真** —— 真行真值,
+    /// 假行落 **dump 页**(不在会话页链 ⇒ 注意力结构上读不到),其余表件
+    /// (`seq_cu`/FI 四件/GDN 三表)一律真口径。
+    ///
+    /// 设计 §4.2 三律的落地点:
+    /// - 律① 假行不得推进状态 ← `seq_cu = [0, t_real]`(varlen 核按它划行区间)
+    ///   + GDN 序列表按 `t_real` 铸(表内容见 `exec` 的 `gdn_table_host_bytes` 调用)
+    /// - 律② 假行的池写必须无害 ← `slots[≥t_real] = dump 页槽`
+    /// - 律③ 采样读真行 ← 出图尾按 `t_real` 窄切(不住本函数)
+    ///
+    /// `dump_slot_base` = dump 页首槽(`StatePool::dump_slot_base`);
+    /// 假行在页内循环落槽 —— 同址并发写本就不是读集(内容永不被读),
+    /// 但仍摊开以降低写冲突概率。
+    pub(crate) fn build_bucket(
+        ids: &[u32],
+        base: usize,
+        t_real: usize,
+        t_pad: usize,
+        page: usize,
+        bt_chain: &[u32],
+        gdn_slot_v: usize,
+        fi_face: bool,
+        dump_slot_base: usize,
+    ) -> Self {
+        debug_assert!(t_real >= 1 && t_real <= t_pad, "桶几何非法:{t_real}/{t_pad}");
+        let mut out = Self {
+            ids: vec![0.0; t_pad],
+            pos: (0..t_pad).map(|i| (base + i) as f32).collect(),
+            slots: vec![0.0; t_pad],
+            lens: vec![0.0; t_pad],
+            gdn_slot: gdn_slot_v as f32,
+            seq_cu: vec![0.0, t_real as f32],
+            fi: fi_face.then(|| fi_tables(base, t_real, bt_chain, page)),
+            xqa: None,
+        };
+        for i in 0..t_pad {
+            if i < t_real {
+                out.ids[i] = ids[i] as f32;
+                let pos = base + i;
+                out.slots[i] =
+                    (bt_chain[pos / page] * page as u32 + (pos % page) as u32) as f32;
+                out.lens[i] = (base + i + 1) as f32;
+            } else {
+                // 假行:id 取 0(嵌入有限)、槽落 dump 页、kv_len 取本 chunk 末真长
+                out.slots[i] = (dump_slot_base + (i - t_real) % page) as f32;
+                out.lens[i] = (base + t_real) as f32;
+            }
+        }
+        out
+    }
+}
+
+/// FlashInfer 表四件套(`nb_used` 按本 chunk **实际覆盖页数**截断;
+/// 桶布局下传 `t = t_real` —— 设备表读的 `qo_len` 必须与 `kv_len` 同口径,
+/// 否则因果窗口错位 `t_pad - t_real`(见设计 §4.1c 推论 A 的落地注记)。
+fn fi_tables(base: usize, t: usize, bt_chain: &[u32], page: usize) -> FiTables {
+    let ctx_total = base + t;
+    let nb = bt_chain.len();
+    // ⚠️ **块链可能长于「本 chunk 已覆盖页数」** —— 块表按**全 prompt**
+    // 预分配(scheduler::ensure_for_len),而本 chunk 只盖到 ctx_total。
+    // 三件套必须按**实际覆盖页数**截断:原式 `ctx_total - nb*page + page`
+    // 在 nb 过大时下溢(debug panic)/回绕成巨值(release → FI plan 拿着
+    // 巨 last_len 越界读 indices 数组外)。2026-10-13 由
+    // gpu_longctx_fi_direct_gate 首跑暴露。
+    let nb_used = ctx_total.div_ceil(page).min(nb).max(1);
+    FiTables {
+        q_cu: vec![0, t as u32],
+        indices: bt_chain[..nb_used].to_vec(),
+        indptr: vec![0, nb_used as u32],
+        last_len: vec![(ctx_total - (nb_used - 1) * page) as u32],
+        nb_used,
     }
 }
 
@@ -134,7 +190,275 @@ pub(crate) fn causal_mask_words(t: usize) -> Vec<u32> {
     v
 }
 
+/// **B2:桶 padding 比护栏**(B3 实测定档 2026-10-16;设计 §4.7g)
+///
+/// 判据面:图路每 chunk 省下的是**固定节余 H**(短 ctx 三臂实测 ≈2.3–4.8ms),
+/// 而白算成本 = `pad_rows × s`,斜率 s 随 ctx 增长(t128 桶 **0.28**ms/行 /
+/// t256 **0.67** / t512 **0.57**;由 eager 臂同桶内长度差直接量得)
+/// ⇒ 每桶盈亏平衡 ≈ H/s ⇒ **{t32:16, t64:16, t128:12, t256:4, t512:4}**。
+///
+/// 旧值(= 单档 32 行)按"固定段 20–30ms + 0.78ms/行"估,已被 B3 推翻:
+/// **pad=32 实测净输 +12.9…+15.0ms**(224→t256 / 480→t512)、pad=29 ≈ 0。
+/// 长提示 chunk 恒 pad=0 ⇒ 收紧不影响 std 五点收益(实测 +1.2…+2.9%)。
+/// 作用:①`t512` 单桶档不再自伤 ②命中率/白算可预算;t32/t64 桶(无直接实测)
+/// 取 16 行(行成本更低,盈亏平衡上移)。
+pub(crate) const fn bucket_pad_max_rows(t_pad: usize) -> usize {
+    match t_pad {
+        32 | 64 => 16,
+        128 => 12,
+        256 | 512 => 4,
+        _ => 4,
+    }
+}
+
+/// 让位/护栏的**一次 warn** 闸(响亮告知,不静默;每类一条)
+static BUCKET_BYPASS_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static BUCKET_PAD_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 impl<D: DeviceClient> crate::running::RunningEngine<D> {
+    // ========================================================================
+    // prefill 桶图路(M2b;设计 §4–§6)
+    // ========================================================================
+
+    /// **桶图命中 ⇒ 全走图路;否则返回 None(调用方走 eager 原路)。**
+    ///
+    /// 返回 `Some(nt)` = 末块 token;`Some(None)` = 中间块;`None` = 未命中。
+    ///
+    /// 三律的落地点都在 [`ChunkTables::build_bucket`] 与 `bucket_tail`:
+    /// ①假行不进序列(seq_cu/GDN 表真口径)②假行池写落 dump 页 ③采样读真行(出图尾)。
+    /// **单一路径执行**:桶命中就不跑 eager(否则 GDN/KV 双推进 —— §4.6)。
+    async fn bucket_prefill_chunk(
+        &mut self,
+        ids: &[u32],
+        base: usize,
+        is_last: bool,
+        bt_chain: &[u32],
+        gdn_slot_v: usize,
+    ) -> Result<Option<Option<u32>>> {
+        let t_all = std::time::Instant::now();
+        let t = ids.len();
+        if !self.pool.paged || self.graphs.prefill.is_empty() {
+            return Ok(None);
+        }
+        // 命中判定(向上取整;槽不匹配/未捕获都在 `usable` 里结构化拒)
+        let Some(bg) = self.graphs.prefill.get_mut(t, gdn_slot_v) else {
+            return Ok(None);
+        };
+        let t_pad = bg.t_pad;
+        // ── **B1 诊断档让位**(2026-10-15)──
+        // bisect / stage-tap / dflash 探针的实现只存在于 eager 路 ⇒ 桶命中会
+        // **静默绕过**它们(旧行为)。优先级:诊断 > 图;响亮告知一次。
+        if self.cfg.knobs.pf_bisect
+            || self.cfg.knobs.pf_stages.is_some()
+            || self.probes.dflash_probe
+        {
+            mcnt("prefill.bucket.bypass.diag", 1);
+            if !BUCKET_BYPASS_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                owl_shared::log_warn!(
+                    "prefill-graph",
+                    "诊断档在场(pf_bisect / pf_stages / dflash_probe)⇒ prefill 桶**全部让位 eager**\
+                     (图形诊断口径只在 eager 路;要图就关诊断)"
+                );
+            }
+            return Ok(None);
+        }
+        // ── **B2 padding 护栏**(B3 实测定档;见 [`bucket_pad_max_rows`])──
+        let pad_rows = t_pad.saturating_sub(t);
+        let pad_max = bucket_pad_max_rows(t_pad);
+        if pad_rows > pad_max {
+            mcnt("prefill.bucket.bypass.pad", 1);
+            mcnt("prefill.bucket.pad_rows_skipped", pad_rows as u64);
+            if !BUCKET_PAD_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                owl_shared::log_warn!(
+                    "prefill-graph",
+                    "桶 padding 超比跳过(t_pad={t_pad} t_real={t} pad={pad_rows} 行 > {pad_max});\
+                     该 chunk 走 eager(白算 > 固定节余)"
+                );
+            }
+            return Ok(None);
+        }
+        // 命中计数(B4:命中率/桶分布/白算行数,给 flavor 定档用)
+        mcnt(&format!("prefill.bucket.hit.t{t_pad}"), 1);
+        mcnt("prefill.bucket.hit", 1);
+        mcnt("prefill.bucket.pad_rows", pad_rows as u64);
+        // dump 页(律②):档位开启时池多分配 1 页;缺了 = 配置错(响亮拒,
+        // 不静默用错的槽点)
+        let Some(dump_slot) = self.pool.dump_slot_base() else {
+            return Err(owl_iface::contract::ModelError::Msg(format!(
+                "prefill 桶 t_pad={t_pad} 可用但池无 dump 页(档位/池几何不一致)"
+            )));
+        };
+        // 桶布局表(真行真值 + 假行 dump)
+        let tb = ChunkTables::build_bucket(
+            ids,
+            base,
+            t,
+            t_pad,
+            self.pool.page,
+            bt_chain,
+            gdn_slot_v,
+            self.pool.fi_face,
+            dump_slot,
+        );
+        // 注:FI 四件在**图路**走输入槽(`BucketGraph::replay` 里按布局长度装填)
+        // —— 池里那套持久块(`StatePool.fi_tables`)是 **eager 路**的表,这里不写
+        // (写了也没人读:图烘的是槽指针)。GDN 序列表不同:图烘的就是池块,
+        // 下方必须写。
+        // ── GDN 序列表写持久槽(**布局 nt = ceil(t_pad/BT)、cu = t_real**)──
+        // 图内 `nt` 是烘死的标量(布局口径);三张表的**内容**由本写定死:
+        // cu=[0,t_real] ⇒ 行区间/递推落点都在真行上(§4.3e P-6b;假行不进序列)。
+        if let Some(gt) = self.pool.gdn_table_blocks() {
+            let nt = t_pad.div_ceil(owl_models::kernel::GDN_BT).max(1);
+            if nt > gt.nt_cap {
+                return Err(owl_iface::contract::ModelError::Msg(format!(
+                    "GDN 序列表超槽容量:nt={nt} > nt_cap={}",
+                    gt.nt_cap
+                )));
+            }
+            let bytes = owl_models::kernel::gdn_table_host_bytes(t, nt);
+            let f32bits: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().expect("4 字节")))
+                .collect();
+            let face = self.graphs.session.face_mut();
+            face.write_block_f32(&gt.table, 0, &f32bits).await?;
+        }
+        // ── 回放(1 条 graph_launch)──
+        // B7:桶路也记 `prefill.chunk`(总时,host 口径;与 eager 同 tag ⇒
+        // 运维/仪表盘不丢行);`prefill.graph` 另记"回放发射"那一段。
+        let t_gr = std::time::Instant::now();
+        let (root, taps) = {
+            let Some(out) = bg.replay(&tb, t).await? else {
+                return Ok(None); // 未捕获(竞态:在判定与回放之间被降级)
+            };
+            (out.root, out.taps)
+        };
+        // `prefill.graph` = 槽写 + `graph_launch` 的**发射**成本(异步 ⇒ 天然小)
+        mrec("prefill.graph", t_gr.elapsed());
+        let nt = self.bucket_tail(&root, &taps, t, ids, base, is_last).await?;
+        mrec("prefill.chunk", t_all.elapsed());
+        Ok(Some(nt))
+    }
+
+    /// 桶图路的**出图尾**(律③:图内只出全行 hidden/taps;末行窄切 + lm_head
+    /// + argmax 一律图外 eager —— 偏移 `(t_real-1)·dd` 是烘不得的 host 标量)。
+    ///
+    /// 与 eager 尾逐字同构(同一个 `narrow` → `lm_head` → `argmax` 链、同一套
+    /// `prefill_dflash_encode`/`prefill_extend`/seed 保留纪律;块生命周期不同:
+    /// 图输出块归 `GraphPlan`,本函数**不 free 它**,只 free 自己创建的暂态块)。
+    #[allow(clippy::too_many_arguments)]
+    async fn bucket_tail(
+        &mut self,
+        root: &Bytes,
+        taps: &[TensorOps],
+        t: usize,
+        ids: &[u32],
+        base: usize,
+        is_last: bool,
+    ) -> Result<Option<u32>> {
+        let d = self.pool.dims;
+        let d_model = d.hidden;
+        let hidden = TensorOps::of_block(root.id, d.dtype, vec![t, d_model]);
+        let hidden = &hidden;
+        if !is_last {
+            // 中间块:taps 编码 / mtp extend(免 lm_head [T,V] 计算与大 dtoh)
+            if !taps.is_empty() {
+                let ts = std::time::Instant::now();
+                self.prefill_dflash_encode(taps, base).await?;
+                eprintln!("[dflash] prefill encode {t} rows @{} {:?}", base, ts.elapsed());
+            } else if self.spec.drafter.is_some() && t > 1 {
+                self.prefill_extend(root, t - 1, ids, base).await?;
+            }
+            if self.probes.prefill_cksum {
+                self.pf_cksum(root, base, t, d.hidden).await?;
+            }
+            return Ok(None);
+        }
+        // 末块
+        if self.cfg.knobs.pf_fin_check {
+            self.pf_fin_check(root, t, d_model).await?;
+        }
+        if !taps.is_empty() {
+            let ts = std::time::Instant::now();
+            self.prefill_dflash_encode(taps, base).await?;
+            eprintln!("[dflash] prefill encode {t} rows @{} {:?}", base, ts.elapsed());
+        }
+        // 末行窄切(**物化**:SliceView 作根丢偏移,根必须真块)
+        let last = TensorOps::call(owl_models::ops::SemanticKernel::Narrow)
+            .arg(hidden)
+            .arg_usize(1)
+            .arg_usize(d_model)
+            .arg_usize((t - 1) * d_model)
+            .arg_usize(d_model)
+            .with_shape(d.dtype, vec![1, d_model]);
+        let (hb, arena2) = {
+            let face = self.graphs.session.face_mut();
+            eval_ops_scoped_env(last.step(), face, self.env).await?
+        };
+        let hb_view = TensorOps::of_block(hb.id, d.dtype, vec![1, d_model]);
+        let vocab = self.model.vocab_size();
+        let (b, arena3) = {
+            let face = self.graphs.session.face_mut();
+            let logits = self.model.embed.lm_head_matmul(&hb_view);
+            let tok = owl_models::ops::argmax_f32idx(&logits, vocab, 0);
+            eval_ops_scoped_env(tok.step(), face, self.env).await?
+        };
+        if self.spec.drafter.is_some() && t > 1 {
+            self.prefill_extend(root, t - 1, ids, base).await?;
+        }
+        let mut buf_t = [0u8; 4];
+        let mut seed_keep: Option<Bytes> = None;
+        {
+            let face = self.graphs.session.face_mut();
+            face.dtoh(&b, &mut buf_t).await?;
+            face.free(&[b.id]).await?;
+            face.free(&arena3).await?;
+            face.free(&arena2).await?;
+            if self.spec.drafter.is_some() {
+                seed_keep = Some(hb);
+            } else {
+                face.free(&[hb.id]).await?;
+            }
+        }
+        if let Some(hb) = seed_keep {
+            self.tspec().spec_seed_hidden = Some(hb);
+        }
+        let nt = f32::from_le_bytes(buf_t) as u32;
+        mfact(self.boot_seq, "pf.last", nt as u64);
+        mfact(self.boot_seq, "pf.eos", self.tok.is_eos(nt) as u64);
+        Ok(Some(nt))
+    }
+
+    /// fin 校验(dtoh 一块 hidden 打点):`pf_fin_check` 走 FNV 指纹(mfact),
+    /// `prefill_cksum` 走 |x| 之和(两档历史打点各自保留 —— 字段语义不同,
+    /// 不能合并成一套)
+    async fn pf_fin_check(&mut self, root: &Bytes, t: usize, dd: usize) -> Result<()> {
+        let mut buf = vec![0u8; t * dd * 2];
+        {
+            let face = self.graphs.session.face_mut();
+            face.dtoh(root, &mut buf).await?;
+        }
+        mfact(self.boot_seq, "pf.fin", fnv_bytes(&buf) & 0x7fff_ffff_ffff_ffff);
+        Ok(())
+    }
+
+    /// `prefill_cksum` 档的 |x| 之和(诊断)
+    async fn pf_cksum(&mut self, root: &Bytes, base: usize, t: usize, dd: usize) -> Result<()> {
+        let mut buf = vec![0u8; t * dd * 2];
+        {
+            let face = self.graphs.session.face_mut();
+            face.dtoh(root, &mut buf).await?;
+        }
+        let cks: f32 = buf
+            .chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32().abs())
+            .sum();
+        eprintln!("[cksum] chunk base={base} t={t} sum|x|={cks:.4}");
+        Ok(())
+    }
+
     /// 块式 prefill(W1;批P5 契约):ids [T] 从 KV 行 base 起步,
     /// 单序列语义(gdn_slot 恒 0;KV 行随 token 走)。末块走 logits 根
     /// 返回末行;中间块走 last_hidden 根(免 lm_head [T,V] 计算与大
@@ -155,6 +479,20 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let s = self.bank.sessions.get(act.session_id).expect("账在");
             (s.block_table.clone(), s.gdn_slot)
         };
+        // ── prefill 桶图命中(M2b;设计 §4–§6)──
+        // 命中 ⇒ 槽写(真行真值 + 假行 dump 页)+ 1 条 graph_launch + 出图尾;
+        // 未命中/不可用 ⇒ 下方 eager 原路(**单一路径执行**,绝不双推进 —— §4.6)。
+        if !self.graphs.prefill.is_empty() {
+            match self.bucket_prefill_chunk(ids, base, is_last, &bt_chain, gdn_slot_v).await? {
+                Some(nt) => return Ok(nt),
+                None => {
+                    // B4:桶在场但本 chunk 走 eager(未命中/让位/护栏)⇒ eager 计数
+                    // (与 `prefill.bucket.hit*` 相除 = 命中率;tokens 求和 = 平均块长)
+                    mcnt("prefill.eager.chunks", 1);
+                    mcnt("prefill.eager.tokens", t as u64);
+                }
+            }
+        }
         // ── host 侧输入表**唯一取值点**(见 [`ChunkTables`])──
         let tb = ChunkTables::build(
             ids,
@@ -204,19 +542,39 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let fi_tensors;
         let fi = if let Some(ft) = tb.fi.as_ref() {
             let k_fi_leaf = self.pool.kv_fi_leaves();
+            // P-3(2026-10-15):表件写**持久槽**(地址恒定 ⇒ 图可直接烘;
+            // 旧实现每 chunk 4 次 `eval_ops(from_host)` = 4 次往返同步)。
+            // 写经 `write_blocks_f32` = 单条批量 HtodChunks 命令,回执 =
+            // 设备侧搬运完成的 host callback ⇒ **回执即落地**(无跨流竞态:
+            // 旧注释里"预物化"要的就是这个序;批量只是把 4 次压成 1 次)。
+            let fb = self
+                .pool
+                .fi_table_blocks()
+                .expect("FI 槽未分配(pool.fi_face 档恒有)")
+                .clone();
+            assert!(
+                ft.nb_used <= fb.nb_cap,
+                "FI 页链超槽容量:nb_used={} > nb_cap={}",
+                ft.nb_used,
+                fb.nb_cap
+            );
+            let bits = |v: &[u32]| -> Vec<f32> { v.iter().map(|x| f32::from_bits(*x)).collect() };
+            let w_q_cu = bits(&ft.q_cu);
+            let w_idx = bits(&ft.indices);
+            let w_ind = bits(&ft.indptr);
+            let w_ll = bits(&ft.last_len);
             let face = self.graphs.session.face_mut();
-            let q_cu_b = owl_models::interpreters::eval_ops(
-                TensorOps::from_host(Dtype::U32, vec![2], &u32le(&ft.q_cu)).step(), face).await?;
-            let idx_b = owl_models::interpreters::eval_ops(
-                TensorOps::from_host(Dtype::U32, vec![ft.nb_used], &u32le(&ft.indices)).step(), face).await?;
-            let ind_b = owl_models::interpreters::eval_ops(
-                TensorOps::from_host(Dtype::U32, vec![2], &u32le(&ft.indptr)).step(), face).await?;
-            let ll_b = owl_models::interpreters::eval_ops(
-                TensorOps::from_host(Dtype::U32, vec![1], &u32le(&ft.last_len)).step(), face).await?;
-            let q_cu = TensorOps::of_block(q_cu_b.id, Dtype::U32, vec![2]);
-            let indices = TensorOps::of_block(idx_b.id, Dtype::U32, vec![ft.nb_used]);
-            let indptr = TensorOps::of_block(ind_b.id, Dtype::U32, vec![2]);
-            let last_len = TensorOps::of_block(ll_b.id, Dtype::U32, vec![1]);
+            face.write_blocks_f32(&[
+                (&fb.q_cu, 0, w_q_cu.as_slice()),
+                (&fb.indices, 0, w_idx.as_slice()),
+                (&fb.indptr, 0, w_ind.as_slice()),
+                (&fb.last_len, 0, w_ll.as_slice()),
+            ])
+            .await?;
+            let q_cu = TensorOps::of_block(fb.q_cu.id, Dtype::U32, vec![2]);
+            let indices = TensorOps::of_block(fb.indices.id, Dtype::U32, vec![ft.nb_used]);
+            let indptr = TensorOps::of_block(fb.indptr.id, Dtype::U32, vec![2]);
+            let last_len = TensorOps::of_block(fb.last_len.id, Dtype::U32, vec![1]);
             let (kcs, vcs): (Vec<TensorOps>, Vec<TensorOps>) =
                 k_fi_leaf.iter().map(|(k, v)| (k.clone(), v.clone())).unzip();
             fi_tensors = (kcs, vcs, q_cu, indices, indptr, last_len);
@@ -291,10 +649,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         } else {
             None
         };
-        // 诊断(2026-10-14 A13):`OWL_PF_FENCE=1` ⇒ from_host 叶子(pos/slots/
+        // 诊断(2026-10-14 A13):`[probes] pf_fence = true` ⇒ from_host 叶子(pos/slots/
         // lens/id/gdn_slot)建完后插一道流栅栏 —— 判「H2D 叶子与 COMPUTE 核
         // 无跨流序」竞态(仓内 2026-10-03 FI 表同病史:预物化修法)
-        if std::env::var_os("OWL_PF_FENCE").is_some_and(|v| v != "0") {
+        if self.probes.pf_fence {
             self.graphs.session.face_mut().sync().await?;
         }
         let mut ctx = ForwardCtx::model_prefill(
@@ -305,6 +663,39 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             base, fi,
         );
         ctx.seq_cu = Some(&seq_cu);
+        // ── GDN 序列表(cu|coff|idx;P-6b 2026-10-15)──
+        //
+        // 三张 FLA 表按**本 chunk 真行数 t** 铸,写进持久槽(地址恒定 ⇒ 图可烘);
+        // `t_layout`(桶几何下的 t_pad)只进张量形状 —— 核的行区间与递推落点全
+        // 由这三张表定 ⇒ 假行**不在序列里**。旧路:runtime 内部按 `t` 生成 ⇒
+        // padding 假行推进递推态(探针 `gdn_bucket_pad_probe`:终态 Δ=3.6e-2)。
+        let gdn_nt = t.div_ceil(owl_models::kernel::GDN_BT).max(1);
+        let gdn_tbl_leaf;
+        let gdn_tables = match self.pool.gdn_table_blocks() {
+            Some(gt) => {
+                if gdn_nt > gt.nt_cap {
+                    return Err(owl_iface::contract::ModelError::Msg(format!(
+                        "GDN 序列表超槽容量:nt={gdn_nt} > nt_cap={}(seq_tokens/chunk 配置不一致)",
+                        gt.nt_cap
+                    )));
+                }
+                let bytes = owl_models::kernel::gdn_table_host_bytes(t, gdn_nt);
+                let f32bits: Vec<f32> = bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes(c.try_into().expect("4 字节")))
+                    .collect();
+                let face = self.graphs.session.face_mut();
+                face.write_block_f32(&gt.table, 0, &f32bits).await?;
+                gdn_tbl_leaf = TensorOps::of_block(
+                    gt.table.id,
+                    Dtype::U32,
+                    vec![owl_models::kernel::gdn_table_bytes(gdn_nt) / 4],
+                );
+                Some(owl_models::module::GdnTableSlot { table: &gdn_tbl_leaf, nt: gdn_nt })
+            }
+            None => None,
+        };
+        ctx.gdn_tables = gdn_tables;
         ctx.xqa = xqa_pf;
         ctx.env = self.env;
         ctx.trace_gate = self.cfg.knobs.probes.trace_gate;
@@ -376,7 +767,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     let face = self.graphs.session.face_mut();
                     let res = face.dtoh(&outs[i], &mut b).await;
                     if let Err(e) = res {
-                        eprintln!("[pf-bisect] dtoh 失败 i={i} name={} shape={:?} blk_bytes={} err={e}", names[i], r.shape(), b.len());
+                        owl_shared::log_debug!("pf-bisect", "dtoh 失败 i={i} name={} shape={:?} blk_bytes={} err={e}", names[i], r.shape(), b.len());
                         return Err(e);
                     }
                 }
@@ -415,7 +806,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     }
                 }
             }
-            eprintln!("[pf-bisect] chunk base={base} t={t} 层 checksum 已记");
+            owl_shared::log_debug!("pf-bisect", "chunk base={base} t={t} 层 checksum 已记");
         }
         let _face = self.graphs.session.face_mut();
         let vocab = self.model.vocab_size();
@@ -493,11 +884,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     let mut rbuf = vec![0u8; (n_tp + 1) * t * d_model * 2];
                     face.dtoh(&hfb, &mut rbuf).await?;
                     if let Err(e) = owl_shared::file_loader::write("/tmp/owl_dflash_root.bin", &rbuf) {
-                eprintln!("[dump] 落盘失败(诊断面不许静默): {e}");
+                owl_shared::log_error!("dump", "落盘失败(诊断面不许静默): {e}");
             }
-                    eprintln!("[dflash-probe] concat 父块落盘 /tmp/owl_dflash_root.bin t={t}");
+                    owl_shared::log_debug!("dflash-probe", "concat 父块落盘 /tmp/owl_dflash_root.bin t={t}");
                 }
-                eprintln!("[dflash] prefill encode {t} rows @{} {:?}", base, ts.elapsed());
+                owl_shared::log_debug!("dflash", "prefill encode {t} rows @{} {:?}", base, ts.elapsed());
             }
             let hview = TensorOps::of_block(hfb.id, d.dtype, vec![t, d_model]);
             // 末行窄切 **物化**(OPS_NARROW):SliceView 作根透传父块丢偏移
@@ -527,7 +918,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     let mut lbuf2 = vec![0u8; vocab * 2];
                     face.dtoh(&lb2, &mut lbuf2).await?;
                     let same_inproc = lbuf == lbuf2;
-                    eprintln!("[pf-probe] boot{bs_seq} 同boot两次lm_head一致={same_inproc}");
+                    owl_shared::log_debug!("pf-probe", "boot{bs_seq} 同boot两次lm_head一致={same_inproc}");
                     let mut top: Vec<(f32, u32)> = lbuf
                         .chunks_exact(2)
                         .enumerate()
@@ -545,8 +936,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                             line!(),
                         );
                     });
-                    eprintln!(
-                        "[pf-probe] boot{} argmax(top2)={} gap={:.5} top=({} {:.4}) ({:.4})",
+                    owl_shared::log_debug!("pf-probe", "boot{} argmax(top2)={} gap={:.5} top=({} {:.4}) ({:.4})",
                         bs_seq,
                         top[0].1,
                         top[0].0 - top[1].0,
@@ -588,6 +978,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let bs = self.boot_seq;
             mfact(bs, "pf.last", nt as u64);
             mfact(bs, "pf.eos", self.tok.is_eos(nt) as u64);
+            // B7(2026-10-15):末块也记 `prefill.chunk`(中间块/桶路都有;此处缺行
+            // 会让图表按"chunk 数"口径对不上)
+            mrec("prefill.chunk", t_chunk.elapsed());
             Ok(Some(nt))
         } else {
             // 中间块:last_hidden 根(状态推进完整;lm_head 免算)。
@@ -637,7 +1030,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     let cks: f32 = buf.chunks_exact(2)
                         .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32().abs())
                         .sum();
-                    eprintln!("[cksum] chunk base={base} t={t} sum|x|={cks:.4}");
+                    owl_shared::log_debug!("cksum", "chunk base={base} t={t} sum|x|={cks:.4}");
                 }
                 // prefill extend(E5-M5):行 0..T-1 的 mtp KV(行 T-1 配对需
                 // 下一 chunk 首 token,由其 extend 补)。DFlash2:草稿 KV

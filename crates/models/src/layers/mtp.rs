@@ -478,8 +478,8 @@ mod wiring_tests {
         let mtp_kv = |slot: f32, len: f32| KvBuffers {
             k_cache: TensorOps::of_block(kc_b.id, Dtype::F16, vec![nb, hkv, hd / x, page, x]),
             v_cache: TensorOps::of_block(vc_b.id, Dtype::F16, vec![nb, hkv, hd, page]),
-            slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot])),
-            kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[len])),
+            slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[slot])),  // 契约 r2
+            kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[len])),  // 契约 slots/kv_lens r2(B6 收敛)
             block_tables: bt.clone(),
         };
         let kvs: Vec<KvBuffers> = (0..3).map(|i| mtp_kv(i as f32, (i + 1) as f32)).collect();

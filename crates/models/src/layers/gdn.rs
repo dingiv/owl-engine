@@ -51,6 +51,9 @@ pub(crate) fn chunked_delta(
     beta: &TensorOps,
     gate: &TensorOps,
     state: &TensorOps,
+    // 序列表(cu|coff|idx;P-6b —— **引擎按 t_real 写**的持久槽)+ 块数 nt
+    tables: &TensorOps,
+    nt: usize,
     slot: usize,
     tokens: usize,
     nv: usize,
@@ -64,12 +67,14 @@ pub(crate) fn chunked_delta(
         .arg(beta)
         .arg(gate)
         .arg(state)
+        .arg(tables)
         .arg_usize(tokens)
         .arg_usize(slot)
         .arg_usize(nv)
         .arg_usize(nk)
         .arg_usize(kd)
         .arg_bits(scale_bits(kd))
+        .arg_usize(nt)
         .with_shape(Dtype::F16, vec![tokens, nv, kd])
 }
 
@@ -734,6 +739,15 @@ impl GatedDeltaNet {
                 self.hk_dim,
             )
         } else if ctx.env.gdn.chunked && tokens >= 64 && chunked_shape_ok {
+            // 序列表真值(A13 同纪律:缺了不静默取默认 —— 该表决定**行区间与
+            // 递推落点**,猜一个 = 递推态污染/错值;owner 是调度侧 t_real)
+            let Some(tbl) = ctx.gdn_tables else {
+                return TensorOps::poisoned(
+                    Dtype::F16,
+                    vec![tokens, value_dim],
+                    "gdn prefill(chunked 臂):需序列表槽(cu|coff|idx,按 t_real),\n                     但 ForwardCtx::gdn_tables = None —— 拒发(静默按布局 t 生成会把\n                     假行算进序列 ⇒ 递推态污染,见 gdn_bucket_pad_probe)",
+                );
+            };
             // FLA chunked 六核(2026-10-11 fork-bf16 全家桶;优先级置顶):
             // vLLM third_party fork 同源 cubin。**dtype 统一律(同日Ⅵ)**:
             // bf16/f32 配方全关在 handler 肚内 —— 层侧纯 f16 进出
@@ -747,7 +761,7 @@ impl GatedDeltaNet {
                 &q_n.reshape(vec![tokens, self.nk, self.hk_dim]),
                 &k_n.reshape(vec![tokens, self.nk, self.hk_dim]),
                 &v_c.reshape(vec![tokens, self.nv, self.hv_dim]),
-                &beta, &g, &gdn.rec, slot_host,
+                &beta, &g, &gdn.rec, tbl.table, tbl.nt, slot_host,
                 tokens, self.nv, self.nk, self.hk_dim,
             )
         } else {
@@ -2490,11 +2504,11 @@ mod f16_tests {
         let dd = gpu.htod(Dtype::F16, &sh(vec![heads]), &hbytes(&dt)).await.unwrap();
         let (l, a_, d_) = (
             TensorOps::of_block(dl.id, Dtype::F16, vec![heads]),
-            TensorOps::of_block(da.id, Dtype::F16, vec![total]),
+            TensorOps::of_block(da.id, Dtype::F16, vec![total / heads, heads]),  // 契约 a r2([行, 头])
             TensorOps::of_block(dd.id, Dtype::F16, vec![heads]),
         );
         let decl = TensorOps::call(SemanticKernel::GdnGatingG).arg(&l).arg(&a_).arg(&d_).arg_usize(total).arg_usize(heads)
-        .with_shape(Dtype::F16, vec![total]);
+        .with_shape(Dtype::F16, vec![total / heads, heads]);  // 契约 g r2
         let out = crate::interpreters::eval_ops(decl.step(), &mut gpu).await.unwrap();
         let mut buf = vec![0u8; total * 2];
         gpu.dtoh(&out, &mut buf).await.unwrap();

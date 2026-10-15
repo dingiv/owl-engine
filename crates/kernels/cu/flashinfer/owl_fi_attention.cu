@@ -48,6 +48,12 @@ extern "C" int owl_fi_prefill_plan(
     int64_t* out_plan15,
     int32_t* out_cta_tile_q,
     int32_t* out_split_kv,
+    // **plan 表写入 int_ws 的字节数**(= page_locked 缓冲里有效前缀长度)。
+    // 供 Rust 侧做"不变盒快照":多 plan 共存时,int_ws 是唯一共享区 ⇒
+    // 图回放前必须能自携本 plan 的表(见 server/flashinfer.rs 的 PlanEntry)。
+    // 与 PrefillPlanImpl<true> 内的 cudaMemcpyAsync 尺寸同源(两条路径
+    // 的 int_allocator 分配序相同 ⇒ need_int == num_allocated_bytes)。
+    size_t* out_int_bytes,
     const int32_t* qo_indptr_h,      // [B+1] host 端数组(plan 在 host 读)
     const int32_t* kv_indptr_h,      // [B+1] host(token 级)
     int32_t total_num_rows,
@@ -66,7 +72,7 @@ extern "C" int owl_fi_prefill_plan(
     cudaError_t werr = PrefillPlanWorkspaceSize<OwlId>(
         need_float, need_int, qo_h, kv_h, (uint32_t)total_num_rows, (uint32_t)batch_size,
         (uint32_t)num_qo_heads, (uint32_t)num_kv_heads, (uint32_t)head_dim, (uint32_t)head_dim,
-        (uint32_t)page_size, /*enable_cuda_graph=*/false, /*sizeof_dtype_o=*/sizeof(half),
+        (uint32_t)page_size, /*enable_cuda_graph=*/owl_fi_cuda_graph(), /*sizeof_dtype_o=*/sizeof(half),
         /*window_left=*/-1, /*fixed_split_size=*/0, disable_split_kv, /*num_colocated_ctas=*/0,
         /*uniform_q_len=*/(int64_t)0, stream, kv_bytes);
     if (werr != cudaSuccess) return (int)werr;
@@ -85,7 +91,7 @@ extern "C" int owl_fi_prefill_plan(
         float_ws, float_ws_size, int_ws, page_locked, int_ws_size, plan_info, qo_h, kv_h,
         (uint32_t)total_num_rows, (uint32_t)batch_size, (uint32_t)num_qo_heads,
         (uint32_t)num_kv_heads, (uint32_t)head_dim, (uint32_t)head_dim, (uint32_t)page_size,
-        /*enable_cuda_graph=*/false, /*sizeof_dtype_o=*/sizeof(half),
+        /*enable_cuda_graph=*/owl_fi_cuda_graph(), /*sizeof_dtype_o=*/sizeof(half),
         /*window_left=*/-1,
         /*fixed_split_size=*/0,
         /*disable_split_kv=*/disable_split_kv,
@@ -104,6 +110,7 @@ extern "C" int owl_fi_prefill_plan(
     for (int i = 0; i < 15; ++i) out_plan15[i] = v[i];
     *out_cta_tile_q = (int32_t)plan_info.cta_tile_q;
     *out_split_kv = plan_info.split_kv ? 1 : 0;
+    if (out_int_bytes) *out_int_bytes = need_int;
     return 0;
   } catch (const std::exception& e) {
     fprintf(stderr, "[owl-fi][plan] %s\n", e.what());
@@ -120,12 +127,12 @@ extern "C" int owl_fi_prefill_run(
     const int64_t* plan15, void* int_ws, size_t int_ws_size, void* float_ws,
     size_t float_ws_size, int32_t batch_size, int32_t num_qo_heads, int32_t num_kv_heads,
     int32_t head_dim, int32_t page_size, int32_t total_num_rows, float sm_scale,
-    cudaStream_t stream) {
+    const void* block_valid_mask, cudaStream_t stream) {
   try {
     return owl_fi_run_impl<half>(q_ptr, k_data, v_data, out_ptr, q_cu_seqlens, indices, indptr,
                                  last_len, plan15, int_ws, int_ws_size, float_ws, float_ws_size,
                                  batch_size, num_qo_heads, num_kv_heads, head_dim, page_size,
-                                 total_num_rows, sm_scale, stream, "run");
+                                 total_num_rows, sm_scale, block_valid_mask, stream, "run");
   } catch (const std::exception& e) {
     fprintf(stderr, "[owl-fi][run] %s\n", e.what());
     return -102;

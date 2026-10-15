@@ -170,6 +170,7 @@ impl Model {
             env: ctx.env,
             trace_gate: ctx.trace_gate,
             gdn_slot_host: ctx.gdn_slot_host,
+            gdn_tables: ctx.gdn_tables,
             ts_buf: ctx.ts_buf.clone(),
             attn_v2: ctx.attn_v2.clone(),
             v2_bt8: ctx.v2_bt8,
@@ -514,13 +515,13 @@ mod tests {
 
         // 声明良构:logits [1, vocab] 无毒(CPU face 不执行 Kernel,只验声明)
         let ids = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[3.0]));
-        let pos = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0]));
+        let pos = TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0]));  // 契约 pos r2
         let kvs: Vec<KvBuffers> = (0..1)
             .map(|_| KvBuffers {
                 k_cache: TensorOps::zeros(Dtype::F32, vec![KV_ROWS, HKV, HD]),
                 v_cache: TensorOps::zeros(Dtype::F32, vec![KV_ROWS, HKV, HD]),
-                slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
-                kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0])),
+                slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0])),  // 契约 slots/kv_lens r2(B6 收敛)
+                kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[1.0])),  // 契约 slots/kv_lens r2(B6 收敛)
                 block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
             })
             .collect();
@@ -844,8 +845,8 @@ mod tests {
                 v.push(KvBuffers {
                     k_cache: zero_block(&mut gpu, kv_zero.len(), vec![KV_ROWS, HKV, HD]).await,
                     v_cache: zero_block(&mut gpu, kv_zero.len(), vec![KV_ROWS, HKV, HD]).await,
-                    slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
-                    kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0])),
+                    slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0])),  // 契约 slots/kv_lens r2(B6 收敛)
+                    kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[1.0])),  // 契约 slots/kv_lens r2(B6 收敛)
                     block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
                 });
             }
@@ -874,15 +875,15 @@ mod tests {
         let steps: [(f32, f32, f32, f32); 2] = [(5.0, 0.0, 0.0, 1.0), (9.0, 1.0, 1.0, 2.0)];
         for (si, &(id, pos, slot, kv_len)) in steps.iter().enumerate() {
             let ids = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[id]));
-            let pos_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[pos]));
+            let pos_t = TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[pos]));  // 契约 pos r2
             // 每步重写动态标量块(slots/kv_lens 由 runner 步间改写 —— C7)
             let kvs_step: Vec<KvBuffers> = kvs
                 .iter()
                 .map(|kv| KvBuffers {
                     k_cache: kv.k_cache.clone(),
                     v_cache: kv.v_cache.clone(),
-                    slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot])),
-                    kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[kv_len])),
+                    slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[slot])),  // 契约 slots/kv_lens r2(B6 收敛)
+                    kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[kv_len])),  // 契约 slots/kv_lens r2(B6 收敛)
                     block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
                 })
                 .collect();
@@ -913,8 +914,8 @@ mod tests {
             kvs.push(KvBuffers {
                 k_cache: zero_block(gpu, kv_zero.len(), vec![KV_ROWS, HKV, HD]).await,
                 v_cache: zero_block(gpu, kv_zero.len(), vec![KV_ROWS, HKV, HD]).await,
-                slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
-                kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0])),
+                slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0])),  // 契约 slots/kv_lens r2(B6 收敛)
+                kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[1.0])),  // 契约 slots/kv_lens r2(B6 收敛)
                 block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
             });
         }
@@ -961,7 +962,7 @@ mod tests {
             .expect("rope 表");
 
         let ids: [f32; 4] = [5.0, 9.0, 3.0, 7.0];
-        let pos_of = |t: usize| TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32]));
+        let pos_of = |t: usize| TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[t as f32]));  // 契约 pos r2
 
         // ── 参考:T 次 decode 步,单根 = last_hidden(缓冲套 A)──
         let (kvs_a, gdns_a) = model_bufs(&mut gpu, 1, 3).await;
@@ -975,8 +976,8 @@ mod tests {
                 .map(|kv| KvBuffers {
                     k_cache: kv.k_cache.clone(),
                     v_cache: kv.v_cache.clone(),
-                    slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32])),
-                    kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32 + 1.0])),
+                    slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[t as f32])),  // 契约 slots/kv_lens r2(B6 收敛)
+                    kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[t as f32 + 1.0])),  // 契约 slots/kv_lens r2(B6 收敛)
                     block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
                 })
                 .collect();
@@ -999,7 +1000,7 @@ mod tests {
         // ── 被测:一次 prefill 块(缓冲套 B;单根 = last_hidden)──
         let (kvs_b, gdns_b) = model_bufs(&mut gpu, 1, 3).await;
         let ids_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&ids));
-        let pos_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&(0..t_len).map(|t| t as f32).collect::<Vec<_>>()));
+        let pos_all = TensorOps::from_host(Dtype::F32, vec![1, t_len], &f32b(&(0..t_len).map(|t| t as f32).collect::<Vec<_>>()));
         let slots_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&(0..t_len).map(|t| t as f32).collect::<Vec<_>>()));
         let lens_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&(0..t_len).map(|t| t as f32 + 1.0).collect::<Vec<_>>()));
         let gdn_slot = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0]));

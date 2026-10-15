@@ -239,7 +239,7 @@ mod tests {
             conv_k: TensorOps::zeros(Dtype::F32, vec![4, 8, 3]),
             conv_v: TensorOps::zeros(Dtype::F32, vec![4, 8, 3]),
             rec: TensorOps::zeros(Dtype::F32, vec![4, 2, 4, 4]),
-            slots: TensorOps::from_host(Dtype::F32, vec![tokens], &crate::testkit::f32b(&[0.0, 2.0])),
+            slots: TensorOps::from_host(Dtype::F32, vec![1, tokens], &crate::testkit::f32b(&[0.0, 2.0])),  // 契约 slots/kv_lens r2(B6 收敛)
         };
         let xs6 = TensorOps::from_host(Dtype::F32, vec![tokens, 6], &crate::testkit::f32b(&vec![0.4; tokens * 6]));
         let out = gdn.forward(&xs6, &ForwardCtx::gdn_decode(tokens, &gdn_buf));
@@ -378,11 +378,11 @@ mod tests {
         let kv = KvBuffers {
             k_cache: kc,
             v_cache: vc,
-            slots: TensorOps::from_host(Dtype::F32, vec![tokens], &crate::testkit::f32b(&[0.0])),
-            kv_lens: TensorOps::from_host(Dtype::F32, vec![tokens], &crate::testkit::f32b(&[1.0])),
+            slots: TensorOps::from_host(Dtype::F32, vec![1, tokens], &crate::testkit::f32b(&[0.0])),  // 契约 slots/kv_lens r2(B6 收敛)
+            kv_lens: TensorOps::from_host(Dtype::F32, vec![1, tokens], &crate::testkit::f32b(&[1.0])),  // 契约 slots/kv_lens r2(B6 收敛)
             block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
         };
-        let pos = TensorOps::from_host(Dtype::F32, vec![tokens], &crate::testkit::f32b(&pos_v));
+        let pos = TensorOps::from_host(Dtype::F32, vec![1, tokens], &crate::testkit::f32b(&pos_v));  // 契约 pos r2
         let xs_t = TensorOps::from_host(Dtype::F32, vec![tokens, hidden], &crate::testkit::f32b(&xs));
         let ctx = ForwardCtx::decode(tokens, &pos, &kv, &rp);
         let decl = layer.forward(&xs_t, &ctx);
@@ -517,7 +517,7 @@ mod tests {
                 conv_k: zero_block(&mut gpu, 4 * key_dim * 3, vec![4, key_dim, 3]).await.1,
                 conv_v: zero_block(&mut gpu, 4 * value_dim * 3, vec![4, value_dim, 3]).await.1,
                 rec: zero_block(&mut gpu, 4 * nv * hk_dim * hv_dim, vec![4, nv, hk_dim, hv_dim]).await.1,
-                slots: TensorOps::from_host(Dtype::F32, vec![tokens], &crate::testkit::f32b(&slots_v)),
+                slots: TensorOps::from_host(Dtype::F32, vec![1, tokens], &crate::testkit::f32b(&slots_v)),  // 契约 slots/kv_lens r2(B6 收敛)
             };
             let (m, hd, n2d, md, fd) = layer.forward_stages(&xs_t, &ForwardCtx::gdn_decode(tokens, &buf));
             // 每轮只 harvest 目标段:本段 eval = 该轮第一次 = 唯一干净态
@@ -615,7 +615,7 @@ mod tests {
                 conv_k: ck_t,
                 conv_v: cv_t,
                 rec: rc_t,
-                slots: TensorOps::from_host(Dtype::F32, vec![tokens], &crate::testkit::f32b(&slots_v)),
+                slots: TensorOps::from_host(Dtype::F32, vec![1, tokens], &crate::testkit::f32b(&slots_v)),  // 契约 slots/kv_lens r2(B6 收敛)
             };
             let (_, _, _, _, f1) = layer.forward_stages(&xs_t, &ForwardCtx::gdn_decode(tokens, &buf5));
             let g1 = crate::testkit::harvest(&mut gpu, &f1).await;

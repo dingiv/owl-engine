@@ -1154,7 +1154,7 @@ mod tests {
             .aux(&[rows])
             .arg(&logits_t)
         .arg_i32(vocab as i32)
-        .with_shape(Dtype::F32, vec![rows, 2 * TOP_K]);
+        .with_shape(Dtype::F32, vec![rows * 2 * TOP_K]);  // 契约 out r1(单缓冲 [rows,2K] 扁平)
         let topk_full = harvest(&mut gpu, &topk).await; // slice dtoh = 整父块,host 切分
         // 布局两段连续:值区 [rows*K) + 索引区 [rows*K, 2*rows*K)
         let got_vals = topk_full[..rows * TOP_K].to_vec();
@@ -2061,8 +2061,10 @@ mod tests {
                 .arg_usize(rope.rotary_half())
                 .arg_i32(attn.k_norm().w_off() as i32) // 同律
                 .aux(&[2, hkv, hd])
-                .with_shape(Dtype::F16, vec![2, hkv, hd]) // [T, Hkv, D](核视图;K0/NC 两消费者同求 3D)
+                .with_shape(Dtype::F16, vec![2, hkv * hd]) // 契约 out r2(行视图)
         };
+        // K0/NC 两消费者要 3D 核视图 ⇒ 在契约 r2 的 norm_rope 输出上挂零开销 reshape
+        let k_self2 = k_self2.reshape(vec![2, hkv, hd]);
         // v2 语义:写-后-打分 —— 自块 k/v 先 K0 写池 slots [3,4],
         // NC 全窗 [0..5) 纯池读(生产流同式:encode/propose 前置写槽)
         let k0_write = TensorOps::call(crate::ops::SemanticKernel::K0Write)

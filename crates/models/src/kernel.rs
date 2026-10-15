@@ -4,6 +4,14 @@
 //! 本文件只剩 re-export 与 boot 胶水(kv_manifest_gate:KvQuant/ModelError
 //! 是 models 词汇)。旧路径 `crate::kernel::*` 全量续用,调用点零改动。
 
+/// **GDN 序列表单源出口**(P-6b;2026-10-16 B6 收敛:原挂 `layers::gdn`
+/// —— 层文件直引 kernels 违反 facedir_lint,故搬到本垫子)。
+/// 单源在 `owl_kernels::family::gdn_chunked`(那里与 triton AOT 配置表锁死);
+/// engine/models 经这里取,免得出现第二份布局常量。
+pub use owl_kernels::family::gdn_chunked::{
+    table_bytes as gdn_table_bytes, table_host_bytes as gdn_table_host_bytes, BT as GDN_BT,
+};
+
 pub use owl_kernels::cu_sig::{cu_text, parse_cu_sig, source_defines};
 pub use owl_kernels::kernel::{
     kernel, kernel_with, launch_shape, lookup, source, with_pick, Kernel, LaunchShape,

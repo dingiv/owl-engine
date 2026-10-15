@@ -115,6 +115,12 @@ pub(crate) struct PoolPlan {
     pub vram_reserve_mb: u64,
     /// GDN 画像 dump 全槽
     pub dump_all: bool,
+    /// **prefill 桶 padding 的 KV dump 页**(M2b,2026-10-15;设计 §4.2 律②)。
+    /// true ⇒ 主 KV 池多分配 **1 页**作"假行落的点"(不在管理面块表里 ⇒
+    /// 注意力结构上读不到);false ⇒ 池几何与历史逐字不变。
+    pub prefill_dump_page: bool,
+    /// reset_gdn 后 GDN rec 格画像(诊断面;原 OWL_GDN_DBG)
+    pub gdn_dbg: bool,
 }
 
 pub(crate) struct StatePool {
@@ -123,6 +129,8 @@ pub(crate) struct StatePool {
     /// GDN 画像 dump 全槽(knobs.gdn_dump_all)
     #[allow(dead_code)] // 诊断面字段(写入后当前无读者)
     pub(crate) dump_all: bool,
+    /// reset_gdn 后 rec 格画像([probes] gdn_dbg;诊断面)
+    pub(crate) gdn_dbg: bool,
     pub(crate) kvs: Vec<KvBlocks>,
     /// FI 直读旗标(统一契约 P3:影子池删除,FI 直读主池 kNHD 叶子)
     pub(crate) fi_face: bool,
@@ -153,13 +161,63 @@ pub(crate) struct StatePool {
     pub(crate) dflash_kvs: Option<Vec<KvBlocks>>,
     /// MTP 链持久块表槽(E5-M5 propose 图烘焙;[1, nb] f32,每轮重写)
     pub(crate) bt_mtp: Option<Bytes>,
+    /// **GDN 序列表持久槽**(P-6b,2026-10-15;设计 §4.3e):`gdn_chunked` 六核的
+    /// 三张 FLA 表(`cu_seqlens|chunk_offsets|chunk_indices`)按**本 chunk 真行数**
+    /// 每 chunk 原位写;runtime 只读。
+    ///
+    /// 为什么必须持久且必须由引擎写:①核的行区间与**递推落点**全由这三张表定
+    /// —— 表按布局 t 生成会把 padding 假行算进序列(递推态污染,探针
+    /// `gdn_bucket_pad_probe` 实测终态 Δ=3.6e-2 → 0)②图(M2b)烘的是**指针**
+    /// ⇒ 地址必须恒定。None = 本档无 GDN 层。
+    pub(crate) gdn_tables: Option<GdnTableBlocks>,
+    /// **FlashInfer 表件持久槽**(P-3,2026-10-15;设计 §4.1c P-3):
+    /// `q_cu/indices/indptr/last_len` 四件在 boot 一次分配、每 chunk **原位写**
+    /// (`write_blocks_f32`,单次批量命令 + 回执即落地)。
+    /// 为什么必须持久:①图(M2b)会把它们的**指针**烘进图 ⇒ 地址必须恒定;
+    /// ②eager 路旧实现每 chunk `eval_ops(from_host)` × 4 = **4 次往返同步**,
+    /// 现 1 次批量写 ⇒ 少 3 次往返。None = 非 FI 档(`pool.fi_face = false`)。
+    pub(crate) fi_tables: Option<FiTableBlocks>,
     /// paged 池几何(页;legacy 模式 page = 容量,nb = 1)
     pub(crate) page: usize,
+    /// **管理面**页数(BlockManager/会话块表/FI 页链槽只认这些)
     pub(crate) nb: usize,
+    /// **物理**页数(含 padding dump 页;= `nb + dump`)
+    pub(crate) nb_kv: usize,
+    /// padding dump 页索引(假行 KV 槽落点;None = 本档无桶)
+    ///
+    /// 为什么假行不能落在真页:
+    /// 假行的 `slot` 若指向后面 chunk 还没写的真页 → ①KV 被脏值占位
+    /// (下个 chunk 真写会覆盖,但本层注意力若先读到就是错值)②末块尾部的位置
+    /// 可能在**块链之外**(越界槽号)。dump 页两种都堵死:恒不在链里,也恒可写。
+    pub(crate) dump_page: Option<usize>,
     pub(crate) paged: bool,
     x: usize,
     /// 池几何输入(spec 提取;prefill 叶子构造/执行器 dtype 分支用)
     pub(crate) dims: ModelDims,
+}
+
+/// GDN 序列表持久槽(P-6b;见 [`StatePool::gdn_tables`])
+pub(crate) struct GdnTableBlocks {
+    /// `cu|coff|idx` 三件同块(布局 = `owl_models::layers::gdn::gdn_table_*`,单源在 kernels::family)
+    pub table: Bytes,
+    /// 块数上限(`seq_tokens.div_ceil(BT)`;超界即结构性拒)
+    pub nt_cap: usize,
+}
+
+/// FlashInfer 表件持久槽(P-3;见 [`StatePool::fi_tables`])。
+/// `Clone` = 4 个块句柄的复制(零拷贝;调用方拿去持有时用)
+#[derive(Clone)]
+pub(crate) struct FiTableBlocks {
+    /// `[0, T]`(u32 位型,f32 账)
+    pub q_cu: Bytes,
+    /// 本会话页链(容量 = 池页数;每 chunk 写前 `nb_used` 项)
+    pub indices: Bytes,
+    /// `[0, nb_used]`
+    pub indptr: Bytes,
+    /// 末页有效 token 数
+    pub last_len: Bytes,
+    /// 容量(池页数,越界即结构性拒 —— 写前由调用方比对)
+    pub nb_cap: usize,
 }
 
 impl StatePool {
@@ -186,6 +244,7 @@ impl StatePool {
         let gdn_slots = plan.gdn_slots;
         let snap_max = plan.snap_max;
         let dump_all = plan.dump_all;
+        let gdn_dbg = plan.gdn_dbg;
         let t = std::time::Instant::now();
         let n_full = layer_types.iter().filter(|&&f| f).count();
         let n_gdn = layer_types.len() - n_full;
@@ -241,20 +300,24 @@ impl StatePool {
         };
         // E2b 块池容量:pool_tokens 向上取整到页;不低于单会话容量
         let nb = if paged { pool_tokens.div_ceil(page) } else { nb }.max(nb);
+        // prefill 桶 padding dump 页(M2b;设计 §4.2 律②):物理多 1 页,
+        // **管理面 nb 不变**(BlockManager/块表/页链槽容量都不受影响)。
+        let dump_page = plan.prefill_dump_page.then_some(nb);
+        let nb_kv = nb + dump_page.map(|_| 1).unwrap_or(0);
 
         let mut kvs: Vec<KvBlocks> = Vec::new();
         for _ in 0..n_full {
             // B6.2:fp8 池 = U32 字节承载 1B/elem(元素数不变,块大小减半);
             // 读核 *_fp8 变体读入即转 half,写核 K0 转换写
             let (k_elems, k_dt) = if kv_fp8 {
-                (nb * dims.hkv * dims.hd * page / 4, Dtype::U32)
+                (nb_kv * dims.hkv * dims.hd * page / 4, Dtype::U32)
             } else {
-                (nb * dims.hkv * dims.hd * page, dims.dtype)
+                (nb_kv * dims.hkv * dims.hd * page, dims.dtype)
             };
             let (v_elems, v_dt) = if kv_fp8 {
-                (nb * dims.hkv * dims.hd * page / 4, Dtype::U32)
+                (nb_kv * dims.hkv * dims.hd * page / 4, Dtype::U32)
             } else {
-                (nb * dims.hkv * dims.hd * page, dims.dtype)
+                (nb_kv * dims.hkv * dims.hd * page, dims.dtype)
             };
             let k_cache = zero_block_dt(face, k_elems, k_dt).await?;
             let v_cache = zero_block_dt(face, v_elems, v_dt).await?;
@@ -301,6 +364,27 @@ impl StatePool {
             eval_ops(TensorOps::zeros(Dtype::F32, vec![1, nb]).step(), face).await?
         } else {
             eval_ops(TensorOps::zeros(Dtype::F32, vec![1]).step(), face).await?
+        };
+        // GDN 序列表持久槽(P-6b):有 GDN 层就建(尺寸 ~KB 级)
+        let gdn_tables = if n_gdn > 0 {
+            let nt_cap = seq_tokens.div_ceil(owl_models::kernel::GDN_BT).max(1);
+            let bytes = owl_models::kernel::gdn_table_bytes(nt_cap);
+            Some(GdnTableBlocks { table: face.alloc(Dtype::F32, bytes.div_ceil(4)).await?, nt_cap })
+        } else {
+            None
+        };
+        // FI 表件持久槽(P-3):与 bt 同族(paged + FI 档一次分配,内容每 chunk 重写)
+        let fi_face = plan.fi_quant.is_some();
+        let fi_tables = if paged && fi_face {
+            Some(FiTableBlocks {
+                q_cu: face.alloc(Dtype::F32, 2).await?,
+                indices: face.alloc(Dtype::F32, nb).await?,
+                indptr: face.alloc(Dtype::F32, 2).await?,
+                last_len: face.alloc(Dtype::F32, 1).await?,
+                nb_cap: nb,
+            })
+        } else {
+            None
         };
         // MTP 链持久块表槽(E5-M5;propose 图烘焙;mtp 模式)
         let bt_mtp = if mtp && paged {
@@ -392,7 +476,10 @@ impl StatePool {
                 page_table: block_leaf(&ptb, vec![nb_i]),
                 seq_lens: block_leaf(&ptb, vec![1]), // 占位:图装配时换成输入槽
                 mask: block_leaf(&mkb, vec![seqs]),
-                semaphores: block_leaf(&sem.0, vec![sem_n]),
+                // 契约 `XQA_PARAMS` 的 semaphores 是 **r2**(与图路输入槽
+                // `xqa_sem` = InputSlot::f32 → [1, n] 同口径);此处旧声明 r1 是
+                // 遗留 —— eager 路会因此被准入门拒(2026-10-15 B6 用例暴露)。
+                semaphores: block_leaf(&sem.0, vec![1, sem_n]),
                 scratch: block_leaf_dt(&scr.0, vec![(scr_mb << 20) / 2], Dtype::F16),
                 q_seq_len: seqs,
                 max_seq_len: nb_i * page,
@@ -450,8 +537,8 @@ impl StatePool {
         } else {
             None
         };
-        Ok(StatePool { gdn_slots, dump_all, kvs, fi_face: plan.fi_quant.is_some(), verify_attn_v2, xqa,
-            kv_fp8, dflash_fp8, gdns, snaps, snap_tick: 0, bt, bt_mtp, spec_snap, mtp_kvs, dflash_kvs, attn_v2, page, nb, paged, x, dims })
+        Ok(StatePool { gdn_slots, dump_all, gdn_dbg, kvs, fi_face, fi_tables, gdn_tables, verify_attn_v2, xqa,
+            kv_fp8, dflash_fp8, gdns, snaps, snap_tick: 0, bt, bt_mtp, spec_snap, mtp_kvs, dflash_kvs, attn_v2, page, nb, nb_kv, dump_page, paged, x, dims })
     }
 
     /// MTP 链块表叶子(propose 图烘焙;None = 未启用)
@@ -625,13 +712,39 @@ impl StatePool {
         }
     }
 
+    /// 主 KV 池 K 叶子形状。**含 padding dump 页**(块尺寸 = 形状元素数;
+    /// 盘外页只作 bucket padding 假行的槽落点,永不进页链 ⇒ 绝不被读)。
+    /// ⚠️ MTP/草稿池用 [`StatePool::k_shape`](本函数不含 dump 页:那两个池单独分配,没多页)。
+    pub(crate) fn k_shape_kv(&self) -> Vec<usize> {
+        let d = &self.dims;
+        if self.paged {
+            vec![self.nb_kv, d.hkv, d.hd / self.x, self.page, self.x]
+        } else {
+            vec![self.nb_kv, d.hkv, d.hd]
+        }
+    }
+
+    pub(crate) fn v_shape_kv(&self) -> Vec<usize> {
+        let d = &self.dims;
+        if self.paged {
+            vec![self.nb_kv, d.hkv, d.hd, self.page]
+        } else {
+            vec![self.nb_kv, d.hkv, d.hd]
+        }
+    }
+
+    /// padding dump 页的 KV 平面槽基址(槽号 = 页号 × page;None = 无桶档)
+    pub(crate) fn dump_slot_base(&self) -> Option<usize> {
+        self.dump_page.map(|p| p * self.page)
+    }
+
     /// 逐层 KV cache 叶子句柄((k, v);slots/kv_lens/block_tables 由
     /// 调用方按步注入 —— 图闭包注输入槽,prefill 注 from_host 标量行)
     pub(crate) fn kv_caches(&self) -> Vec<(TensorOps, TensorOps)> {
         // B6.2:fp8 池 = U32 扁平字节账叶(指针面;读核按元素序自寻址,
         // FI 影子池 fp8 档同款)
         if self.kv_fp8 {
-            let shape = vec![self.nb * self.dims.hkv * self.dims.hd * self.page / 4];
+            let shape = vec![self.nb_kv * self.dims.hkv * self.dims.hd * self.page / 4];
             return self
                 .kvs
                 .iter()
@@ -643,8 +756,8 @@ impl StatePool {
                 })
                 .collect();
         }
-        let k_shape = self.k_shape();
-        let v_shape = self.v_shape();
+        let k_shape = self.k_shape_kv();
+        let v_shape = self.v_shape_kv();
         self.kvs
             .iter()
             .map(|b| {
@@ -654,6 +767,16 @@ impl StatePool {
                 )
             })
             .collect()
+    }
+
+    /// GDN 序列表持久槽(P-6b;None = 无 GDN 层)
+    pub(crate) fn gdn_table_blocks(&self) -> Option<&GdnTableBlocks> {
+        self.gdn_tables.as_ref()
+    }
+
+    /// FI 表件持久槽(P-3;None = 非 FI 档)
+    pub(crate) fn fi_table_blocks(&self) -> Option<&FiTableBlocks> {
+        self.fi_tables.as_ref()
     }
 
     /// FlashInfer K/V 叶子(统一契约 P3:影子池删除,直读主池 kNHD;
@@ -787,8 +910,8 @@ impl StatePool {
             }
         }
         face.sync().await?;
-        // 临时诊断(§三十二 会话污染定位;OWL_GDN_DBG=1 启用,收口后删)
-        if std::env::var("OWL_GDN_DBG").is_ok() {
+        // 临时诊断(§三十二 会话污染定位;[probes] gdn_dbg 启用,收口后删)
+        if self.gdn_dbg {
             let g = &self.gdns[0];
             let row_elems = g.rec.1 / self.gdn_slots;
             let mut buf = vec![0u8; g.rec.1 * 4];
