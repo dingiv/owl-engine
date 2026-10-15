@@ -204,19 +204,39 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let fi_tensors;
         let fi = if let Some(ft) = tb.fi.as_ref() {
             let k_fi_leaf = self.pool.kv_fi_leaves();
+            // P-3(2026-10-15):表件写**持久槽**(地址恒定 ⇒ 图可直接烘;
+            // 旧实现每 chunk 4 次 `eval_ops(from_host)` = 4 次往返同步)。
+            // 写经 `write_blocks_f32` = 单条批量 HtodChunks 命令,回执 =
+            // 设备侧搬运完成的 host callback ⇒ **回执即落地**(无跨流竞态:
+            // 旧注释里"预物化"要的就是这个序;批量只是把 4 次压成 1 次)。
+            let fb = self
+                .pool
+                .fi_table_blocks()
+                .expect("FI 槽未分配(pool.fi_face 档恒有)")
+                .clone();
+            assert!(
+                ft.nb_used <= fb.nb_cap,
+                "FI 页链超槽容量:nb_used={} > nb_cap={}",
+                ft.nb_used,
+                fb.nb_cap
+            );
+            let bits = |v: &[u32]| -> Vec<f32> { v.iter().map(|x| f32::from_bits(*x)).collect() };
+            let w_q_cu = bits(&ft.q_cu);
+            let w_idx = bits(&ft.indices);
+            let w_ind = bits(&ft.indptr);
+            let w_ll = bits(&ft.last_len);
             let face = self.graphs.session.face_mut();
-            let q_cu_b = owl_models::interpreters::eval_ops(
-                TensorOps::from_host(Dtype::U32, vec![2], &u32le(&ft.q_cu)).step(), face).await?;
-            let idx_b = owl_models::interpreters::eval_ops(
-                TensorOps::from_host(Dtype::U32, vec![ft.nb_used], &u32le(&ft.indices)).step(), face).await?;
-            let ind_b = owl_models::interpreters::eval_ops(
-                TensorOps::from_host(Dtype::U32, vec![2], &u32le(&ft.indptr)).step(), face).await?;
-            let ll_b = owl_models::interpreters::eval_ops(
-                TensorOps::from_host(Dtype::U32, vec![1], &u32le(&ft.last_len)).step(), face).await?;
-            let q_cu = TensorOps::of_block(q_cu_b.id, Dtype::U32, vec![2]);
-            let indices = TensorOps::of_block(idx_b.id, Dtype::U32, vec![ft.nb_used]);
-            let indptr = TensorOps::of_block(ind_b.id, Dtype::U32, vec![2]);
-            let last_len = TensorOps::of_block(ll_b.id, Dtype::U32, vec![1]);
+            face.write_blocks_f32(&[
+                (&fb.q_cu, 0, w_q_cu.as_slice()),
+                (&fb.indices, 0, w_idx.as_slice()),
+                (&fb.indptr, 0, w_ind.as_slice()),
+                (&fb.last_len, 0, w_ll.as_slice()),
+            ])
+            .await?;
+            let q_cu = TensorOps::of_block(fb.q_cu.id, Dtype::U32, vec![2]);
+            let indices = TensorOps::of_block(fb.indices.id, Dtype::U32, vec![ft.nb_used]);
+            let indptr = TensorOps::of_block(fb.indptr.id, Dtype::U32, vec![2]);
+            let last_len = TensorOps::of_block(fb.last_len.id, Dtype::U32, vec![1]);
             let (kcs, vcs): (Vec<TensorOps>, Vec<TensorOps>) =
                 k_fi_leaf.iter().map(|(k, v)| (k.clone(), v.clone())).unzip();
             fi_tensors = (kcs, vcs, q_cu, indices, indptr, last_len);

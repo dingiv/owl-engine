@@ -96,6 +96,9 @@ extern "C" {
         head_dim: i32, page_size: i32,
         total_num_rows: i32,
         sm_scale: f32,
+        // 尾部 CTA 掩码(P-5;null = 不用掩码)。内容 `i < tiles` 由 Rust 侧
+        // 按 plan15 算好、**窗外**上传一次(桶级静态;见 server/flashinfer.rs)
+        block_valid_mask: *const c_void,
         stream: *mut c_void,
     ) -> i32;
 
@@ -117,6 +120,9 @@ extern "C" {
         head_dim: i32, page_size: i32,
         total_num_rows: i32,
         sm_scale: f32,
+        // 尾部 CTA 掩码(P-5;null = 不用掩码)。内容 `i < tiles` 由 Rust 侧
+        // 按 plan15 算好、**窗外**上传一次(桶级静态;见 server/flashinfer.rs)
+        block_valid_mask: *const c_void,
         stream: *mut c_void,
     ) -> i32;
 }

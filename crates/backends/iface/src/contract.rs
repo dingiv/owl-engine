@@ -171,6 +171,25 @@ pub trait DeviceClient: Send {
         &mut self,
         graph: GraphId,
     ) -> impl Future<Output = Result<(), ModelError>> + Send;
+    /// **捕获窗作废**(窗内出错/空窗的收尾):退出捕获态 + 销毁半成品图 +
+    /// **窗内自产块整批作废**(slab 随之释放)。
+    ///
+    /// 为什么必须有:`GraphPlan` 的捕获窗一旦出错(声明违约/launch 失败/
+    /// slab 耗尽),窗内已切出的块就处于"无图可回放但已在账房"的孤儿态 ⇒
+    /// 不做 abort 则**整条 slab 钉到进程结束**(最坏 GB 级,见设计 §4.3c)。
+    /// 缺省实现 = 结构化拒(无捕获能力的 face 永不进入此路径)。
+    fn graph_abort(&mut self) -> impl Future<Output = Result<(), ModelError>> + Send {
+        async { Err(ModelError::Msg("graph_abort: 该 face 无图捕获能力".into())) }
+    }
+    /// **销毁已登记图**(单图退休:LRU 驱逐 / plan `close()` 的底层)。
+    /// 语义 = 排空回放 → 解除本图块租约 → 本图 slab 块移出账房。
+    /// 缺省实现 = 幂等空操作(无图后端语义上"无可销毁")。
+    fn graph_destroy(
+        &mut self,
+        _graph: GraphId,
+    ) -> impl Future<Output = Result<(), ModelError>> + Send {
+        async { Ok(()) }
+    }
     /// 清零分配:块登记 + COMPUTE 流序 memset 入队(异步;捕获期 slab
     /// 切块同款清零,Op::Zeros 语义的设备侧保证)。f16 基线(2026-09-26):
     /// dtype + elems 双参,字节宽由客户端按 size_bytes 换算 —— 传输面

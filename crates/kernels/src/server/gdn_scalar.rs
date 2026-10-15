@@ -88,7 +88,9 @@ impl KernelFamily for GdnScalarRuntime {
             .or_insert_with(|| {
                 InvariantBox::freeze([0i32, t as i32].iter().flat_map(|v| v.to_le_bytes()).collect())
             });
-        res.upload(soff, box_.as_bytes())?;
+        // 不变盒 API(非裸切片):捕获窗内合规 —— 回放重放 memcpy 时源恒为
+        // 这份冻结盒,与发射时序无关(设计 §4.3e 三条正路之②)
+        res.upload_invariant(soff, box_)?;
 
         // ── 主核发射(内参序 = extern C 声明序;grid (ns, hv))──
         let state_p =

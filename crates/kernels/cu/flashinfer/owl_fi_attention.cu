@@ -66,7 +66,7 @@ extern "C" int owl_fi_prefill_plan(
     cudaError_t werr = PrefillPlanWorkspaceSize<OwlId>(
         need_float, need_int, qo_h, kv_h, (uint32_t)total_num_rows, (uint32_t)batch_size,
         (uint32_t)num_qo_heads, (uint32_t)num_kv_heads, (uint32_t)head_dim, (uint32_t)head_dim,
-        (uint32_t)page_size, /*enable_cuda_graph=*/false, /*sizeof_dtype_o=*/sizeof(half),
+        (uint32_t)page_size, /*enable_cuda_graph=*/owl_fi_cuda_graph(), /*sizeof_dtype_o=*/sizeof(half),
         /*window_left=*/-1, /*fixed_split_size=*/0, disable_split_kv, /*num_colocated_ctas=*/0,
         /*uniform_q_len=*/(int64_t)0, stream, kv_bytes);
     if (werr != cudaSuccess) return (int)werr;
@@ -85,7 +85,7 @@ extern "C" int owl_fi_prefill_plan(
         float_ws, float_ws_size, int_ws, page_locked, int_ws_size, plan_info, qo_h, kv_h,
         (uint32_t)total_num_rows, (uint32_t)batch_size, (uint32_t)num_qo_heads,
         (uint32_t)num_kv_heads, (uint32_t)head_dim, (uint32_t)head_dim, (uint32_t)page_size,
-        /*enable_cuda_graph=*/false, /*sizeof_dtype_o=*/sizeof(half),
+        /*enable_cuda_graph=*/owl_fi_cuda_graph(), /*sizeof_dtype_o=*/sizeof(half),
         /*window_left=*/-1,
         /*fixed_split_size=*/0,
         /*disable_split_kv=*/disable_split_kv,
@@ -120,12 +120,12 @@ extern "C" int owl_fi_prefill_run(
     const int64_t* plan15, void* int_ws, size_t int_ws_size, void* float_ws,
     size_t float_ws_size, int32_t batch_size, int32_t num_qo_heads, int32_t num_kv_heads,
     int32_t head_dim, int32_t page_size, int32_t total_num_rows, float sm_scale,
-    cudaStream_t stream) {
+    const void* block_valid_mask, cudaStream_t stream) {
   try {
     return owl_fi_run_impl<half>(q_ptr, k_data, v_data, out_ptr, q_cu_seqlens, indices, indptr,
                                  last_len, plan15, int_ws, int_ws_size, float_ws, float_ws_size,
                                  batch_size, num_qo_heads, num_kv_heads, head_dim, page_size,
-                                 total_num_rows, sm_scale, stream, "run");
+                                 total_num_rows, sm_scale, block_valid_mask, stream, "run");
   } catch (const std::exception& e) {
     fprintf(stderr, "[owl-fi][run] %s\n", e.what());
     return -102;

@@ -17,7 +17,7 @@
 //! Rust 视角 f32 仅为字节池标注(新链 ScratchBuf 无 dtype 假装)。
 
 use cudarc::driver::CudaFunction;
-use crate::contract::{Bytes, LaunchMsg, OpError, OpId};
+use crate::contract::{Bytes, InvariantBox, LaunchMsg, OpError, OpId};
 use crate::device::{DeviceRes, Exec, LaunchVal, ScratchBuf};
 
 use crate::family::gdn_chunked::cubins;
@@ -51,6 +51,13 @@ struct Scratch {
     in_g: Option<ScratchBuf>,        // t*hv f32
     o_b16: Option<ScratchBuf>,       // t*hv*vd bf16
     meta: HashMap<(usize, usize), ScratchBuf>, // (T,NT) 键 i64 表驻留
+    /// **meta 表的冻结源盒**(P-6a,2026-10-15;设计 §4.3e):
+    /// 表内容 = `[0,t, 0,nt, (0,i)…]`,**纯函数于 (t,nt)** ⇒ 按同键冻一份
+    /// `InvariantBox`。修的是哪条旧路:原实现每次新键都 `upload(&栈上 Vec)`
+    /// —— 若这次物化发生在**捕获窗内**,那份 H2D 会被烙成图节点,回放期
+    /// **重读那个已释放的 host 地址** ⇒ 静默错值(与 FI plan 的内嵌 H2D 同族;
+    /// 现在源的生命周期 ≥ 运行时,窗内也不再危险)。
+    meta_boxes: HashMap<(usize, usize), InvariantBox>,
     grave: Vec<ScratchBuf>,          // A1.7 坟场
     /// 诊断仪(OWL_GDN_DIAG):**逐 call 打印**前 N 次(跨臂对齐比较用;
     /// 按形状去重会看不到同臂逐 chunk 的演化)
@@ -418,7 +425,11 @@ impl KernelFamily for GdnChunkedRuntime {
                 let nb = res.alloc(host.len() * 8, "gdn.meta")?;
                 let bytes: Vec<u8> =
                     host.iter().flat_map(|v| v.to_le_bytes()).collect();
-                res.upload(nb.ptr, &bytes)?;
+                // **冻结盒 + 不变盒上传**(P-6a):源与运行时同寿 ⇒ 即便这次
+                // 物化落在捕获窗内,回放重放 memcpy 时读到的仍是这份不变盒
+                let box_ = InvariantBox::freeze(bytes);
+                res.upload_invariant(nb.ptr, &box_)?;
+                st.meta_boxes.insert(key, box_);
                 e.insert(nb);
             }
             let base = st.meta.get(&key).unwrap().ptr;

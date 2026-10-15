@@ -30,162 +30,13 @@
 //!       -- --test-threads=1 --nocapture`;debug 下只用 `*_PF_ONLY=<ctx>` 跳 host 检查。
 #![cfg(feature = "device")]
 
-use std::collections::HashMap;
-use std::sync::Arc;
+mod fi_support;
+use fi_support::{f16_to_f32, TestRes, H, HD, HKV, PAGE};
+
 use std::time::Instant;
 
-use cudarc::driver::{CudaContext, CudaSlice, DevicePtr};
-use owl_kernels::contract::{Arg, Bytes, Dtype, KernelSource, LaunchMsg, OpError};
-use owl_kernels::device::{DeviceRes, Exec, LaunchNote, ScratchBuf};
-
-const PAGE: usize = 32;
-const HKV: usize = 4;
-const H: usize = 24;
-const HD: usize = 256;
-
-// ============================================================================
-// 测试资源面(与 ops_gdn_chunked_chain 同构的最小 DeviceRes)
-// ============================================================================
-struct TestRes {
-    dev_ordinal: i32,
-    ctx: Arc<CudaContext>,
-    stream: Arc<cudarc::driver::CudaStream>,
-    blocks: HashMap<u64, CudaSlice<u8>>,
-    next_id: u64,
-}
-
-impl TestRes {
-    fn new(dev: usize) -> Self {
-        let ctx = CudaContext::new(dev).expect("ctx");
-        ctx.bind_to_thread().expect("bind");
-        let stream = ctx.default_stream();
-        Self { dev_ordinal: dev as i32, ctx, stream, blocks: HashMap::new(), next_id: 1 }
-    }
-    fn upload(&mut self, bytes: &[u8]) -> Bytes {
-        let id = self.next_id;
-        self.next_id += 1;
-        let mut d = unsafe { self.stream.alloc::<u8>(bytes.len().max(1)) }.expect("alloc");
-        self.stream.memcpy_htod(bytes, &mut d).expect("htod");
-        self.blocks.insert(id, d);
-        Bytes::new(id, bytes.len(), Dtype::F16, 2)
-    }
-    fn zeros(&mut self, bytes: usize) -> Bytes {
-        let id = self.next_id;
-        self.next_id += 1;
-        let d = self.stream.alloc_zeros::<u8>(bytes.max(1)).expect("alloc0");
-        self.blocks.insert(id, d);
-        Bytes::new(id, bytes, Dtype::F16, 2)
-    }
-    fn take_u16(&self, id: u64) -> Vec<u16> {
-        let s = self.blocks.get(&id).expect("块在册");
-        let host = self.stream.clone_dtoh(s).expect("dtoh");
-        host.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
-    }
-}
-
-impl DeviceRes for TestRes {
-    fn context(&self) -> Result<Arc<CudaContext>, OpError> {
-        Ok(self.ctx.clone())
-    }
-    fn stream(&self) -> Result<Arc<cudarc::driver::CudaStream>, OpError> {
-        Ok(self.stream.clone())
-    }
-    fn resolve(&self, id: u64) -> Result<u64, OpError> {
-        self.blocks
-            .get(&id)
-            .map(|s| s.device_ptr(&self.stream).0)
-            .ok_or_else(|| OpError::Contract {
-                op: "fi-probe".into(),
-                field: "resolve",
-                expect: "块在册".into(),
-                got: id.to_string(),
-            })
-    }
-    fn resolve_len(&self, id: u64) -> Result<usize, OpError> {
-        self.blocks.get(&id).map(|s| s.len()).ok_or_else(|| OpError::Contract {
-            op: "fi-probe".into(),
-            field: "resolve_len",
-            expect: "块在册".into(),
-            got: id.to_string(),
-        })
-    }
-    fn alloc(&mut self, bytes: usize, _tag: &'static str) -> Result<ScratchBuf, OpError> {
-        let d = self.stream.alloc_zeros::<u8>(bytes.max(1)).expect("alloc");
-        let ptr = d.device_ptr(&self.stream).0;
-        self.blocks.insert(self.next_id, d);
-        self.next_id += 1;
-        Ok(ScratchBuf { ptr, bytes })
-    }
-    fn alloc_block(&mut self, bytes: usize, _tag: &'static str) -> Result<Bytes, OpError> {
-        Ok(self.zeros(bytes))
-    }
-    fn upload_block(&mut self, b: &Bytes, src: &[u8]) -> Result<(), OpError> {
-        let stream = self.stream.clone();
-        let s = self.blocks.get_mut(&b.id).ok_or_else(|| OpError::Contract {
-            op: "fi-probe".into(),
-            field: "upload_block",
-            expect: "块在册".into(),
-            got: format!("id={}", b.id),
-        })?;
-        stream.memcpy_htod(src, s).map_err(|e| OpError::Contract {
-            op: "fi-probe".into(),
-            field: "upload_block",
-            expect: "htod".into(),
-            got: format!("{e:?}"),
-        })
-    }
-    fn capturing(&self) -> Result<bool, OpError> {
-        Ok(false)
-    }
-    fn record_capture(&mut self, _note: LaunchNote) -> Result<(), OpError> {
-        Ok(())
-    }
-    fn device_ordinal(&self) -> Result<i32, OpError> {
-        Ok(self.dev_ordinal)
-    }
-    fn upload(&mut self, dst: u64, src: &[u8]) -> Result<(), OpError> {
-        let target = self
-            .blocks
-            .iter()
-            .find(|(_, s)| s.device_ptr(&self.stream).0 == dst)
-            .map(|(id, _)| *id);
-        match target {
-            Some(id) => {
-                let v = self.blocks.get_mut(&id).expect("在册");
-                self.stream.memcpy_htod(src, v).expect("htod");
-                Ok(())
-            }
-            None => Err(OpError::Contract {
-                op: "fi-probe".into(),
-                field: "upload",
-                expect: "指针在册".into(),
-                got: format!("{dst:#x}"),
-            }),
-        }
-    }
-    fn download(&mut self, src: u64, dst: &mut [u8]) -> Result<(), OpError> {
-        let target = self
-            .blocks
-            .iter()
-            .find(|(_, s)| s.device_ptr(&self.stream).0 == src)
-            .map(|(id, _)| *id);
-        match target {
-            Some(id) => {
-                let v = self.blocks.get(&id).expect("在册");
-                let host = self.stream.clone_dtoh(v).expect("dtoh");
-                let n = dst.len().min(host.len());
-                dst[..n].copy_from_slice(&host[..n]);
-                Ok(())
-            }
-            None => Err(OpError::Contract {
-                op: "fi-probe".into(),
-                field: "download",
-                expect: "指针在册".into(),
-                got: format!("{src:#x}"),
-            }),
-        }
-    }
-}
+use owl_kernels::contract::{Arg, Dtype, KernelSource, LaunchMsg};
+use owl_kernels::device::Exec;
 
 // ============================================================================
 // host 参考 + 数据生成(与 xqa_prefill_probe 同一把尺子:逐字同序)
@@ -326,9 +177,6 @@ fn lcg_f16(n: usize, seed: u32) -> Vec<u16> {
             half::f16::from_f32(((x & 0xFFFF) as f32 / 65535.0 - 0.5) * 4.0).to_bits()
         })
         .collect()
-}
-fn f16_to_f32(b: u16) -> f32 {
-    half::f16::from_bits(b).to_f32()
 }
 
 /// host 参考:kNHD + fp8 池,chunked prefill 行 i 看 `[0, ctx−T+i]`(闭区间)。

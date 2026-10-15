@@ -132,9 +132,11 @@ impl DeviceSelector {
 /// 块的两种形态:
 /// - Owned:图外独立分配(cudaMallocAsync)
 /// - Carved:捕获期从 capture slab 切出的切片(零分配;slab 随块保活)
+///   `cap_n` = 该块**可用容量**(对齐后;S1.5 回收凭它 —— `bytes` 是账长,
+///   两者可不同:切 1000B 得 cap_n=1024B)
 pub(super) enum Block {
     Owned(CudaSlice<u8>),
-    Carved { slab: Arc<CudaSlice<u8>>, off: usize, n: usize },
+    Carved { slab: Arc<CudaSlice<u8>>, off: usize, n: usize, cap_n: usize },
 }
 
 /// 账本内块 id 位编码(裁决 2,2026-10-13):单 u64 高位 ledger、低 40 位
@@ -205,6 +207,152 @@ pub(super) struct BlockEntry {
 // 设备上下文 + 流注册表
 // ============================================================================
 
+// ============================================================================
+// 家族面捕获入境纪律(2026-10-15;设计 §4.3e)
+// ============================================================================
+//
+// **为什么需要**:G2 捕获窗白名单只管 client 来的 `Command`(Htod/Dtoh/Sync 拒),
+// 而家族 `run()` 在同一 actor 线程里**直接调 `DeviceRes`** ⇒ 白名单对它无效。
+// 旧口径是"家族 grave 律"(代码注释原话:"捕获窗内由家族 grave 律保证不再分配"),
+// 即**靠自律**。实测定谳(2026-10-03 深夜,`代差分析与演进路线.md:222`):
+// cuBLAS gemv splitK 在捕获流上内部 `malloc` ⇒ 图里烙下 **192 对
+// MEM_ALLOC/MEM_FREE(3088B)** 节点(回放期重分配 + 派发税),修法是
+// `cublasSetWorkspace` **预绑进程级驻留工作区** —— 即"三条正路"之第一条。
+//
+// **三条正路**(窗内材料的合法来源):
+//   ① **装配期分配**(FI 的 int/float ws、XQA consts、cublas 工作区);
+//   ② **不变盒**(`InvariantBox`:构造即冻结、生命周期 ≥ 图 —— gdn_scalar 的
+//      soff,"捕获窗 async 节点,回放恒读盒");
+//   ③ **引擎真块**(走 `Command::Alloc` ⇒ 捕获期落 slab、进账房 —— marlin ws /
+//      XQA scratch/semaphores)。
+//
+// 本判定的射程 = 窗内**走第四条路**的动作(现建 scratch / 裸切片 H2D):
+// 观察档(**缺省**)**放行 + 计数 + 告警**(零行为变化,先取证);
+// `OWL_CAP_STRICT=1` 升为**结构化拒**(M2b 捕获桶前必须开的硬门)。
+
+/// 家族面在捕获窗内的动作类别
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FamAct {
+    /// scratch 分配(`DeviceRes::alloc`):窗内 `cudaMallocAsync` 可被捕获
+    /// ⇒ 烙 MEM_ALLOC/MEM_FREE 节点 + **完全在 slab/账房之外**
+    ScratchAlloc,
+    /// H2D 上传(`DeviceRes::upload`):`invariant` = 源是不变盒(合规范式)
+    Upload { invariant: bool },
+}
+
+/// 严格档开关(进程级一次读取;诊断旋钮 —— 与 `OWL_GDN_FRESH_SCRATCH` 同族)
+pub(super) fn cap_strict() -> bool {
+    static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *STRICT.get_or_init(|| {
+        owl_shared::env_reader::parse_or::<u8>("OWL_CAP_STRICT", 0) != 0
+    })
+}
+
+/// 入境判定(**纯函数**,零 CUDA ⇒ 可单测):
+/// - 不变盒上传 ⇒ 恒放行(捕获窗的合规范式);
+/// - 走第四条路的动作 ⇒ `strict` 拒 / 观察档放行(调用方负责 count + WARN)。
+pub(super) fn fam_window_verdict(act: FamAct, strict: bool) -> Result<(), String> {
+    let what = match act {
+        FamAct::Upload { invariant: true } => return Ok(()),
+        FamAct::ScratchAlloc => "家族 scratch 分配(alloc)",
+        FamAct::Upload { invariant: false } => "家族裸切片 H2D 上传(upload)",
+    };
+    let why = "捕获窗内的家族面分配/上传会**被烙进图**:分配 ⇒ MEM_ALLOC/MEM_FREE \
+               节点 + 不进 slab/账房;上传 ⇒ 源必须生命周期 ≥ 图(不变盒),否则回放 \
+               读到已释放/已改写的 host 内存(静默错值)。三条正路 = 装配期分配 / \
+               不变盒 / 引擎真块(设计 §4.3e)";
+    if strict {
+        Err(format!("{what}:{why}"))
+    } else {
+        Ok(())
+    }
+}
+
+// ============================================================================
+// 图引用租约(2026-10-15;把"指针稳定契约"从约定升级成机制)
+// ============================================================================
+
+/// **图引用租约** —— 把"被图烘过的块不得回收"变成可判定的簿记。
+///
+/// # 它挡的是哪一类错
+///
+/// 图里烘的是**裸设备指针**;而被捕进图的块有两类:
+/// - `Carved`(捕获窗内 Alloc ⇒ slab 切片):`free_blocks` 一律 no-op ⇒ 天然安全;
+/// - `Owned`(池件 = 权重/KV/GDN 态/bt 表;以及 `GraphPlan` 的输入槽):
+///   **可被 free**。一旦某处把它 free 掉,设备池会把同址发给下一个 alloc
+///   ⇒ 图变成"指向别人内存的陈旧指针"—— 表现是**静默错值**(不崩、不报错),
+///   正是本仓最贵的病型。
+///
+/// # 怎么挡
+///
+/// 捕获窗内每一次指针解析(`block_ptr`)都是"这个块会被烘进图"的证据 ⇒
+/// 记进窗口集;`graph_end` 收窗时登记进租约集(**只增不减** —— 当前没有
+/// 单图销毁通道,图活到上下文结束,见 `GpuCtx.graphs`)。`free_blocks` 对命中者
+/// **拒收 + 记账 + 告警**(响亮,但不致命:这一块本来就"还未到可回收时点")。
+///
+/// **没有它也能"靠约定活着"**(现役池件 boot 固定、输入槽无人 free)——
+/// 但那正是 M1(SlabArena 复用)与 S-2(单图销毁)一动就会破的墙。先把它
+/// 变成机制,后面两刀才有依据。
+#[derive(Default, Debug)]
+pub(super) struct GraphRefs {
+    /// 捕获窗内解析过的**可回收类**块 id(窗口内累积;begin 时清)
+    win: std::collections::HashSet<u64>,
+    /// id → **引用它的存活图数**(计数而非集合:单图销毁后须能正确解钉)
+    pinned: std::collections::HashMap<u64, u32>,
+}
+
+impl GraphRefs {
+    /// 开新窗(清窗口集;**不动既有租约** —— 已登记的图还活着)
+    pub(super) fn begin_window(&mut self) {
+        self.win.clear();
+    }
+
+    /// 窗内指针解析登记(幂等;**只登记 `Owned` 类**,理由见 `block_ptr`)
+    pub(super) fn record(&mut self, id: u64) {
+        self.win.insert(id);
+    }
+
+    /// 收窗 → 入租约;返回本图引用集(`GraphHolder.refs`)
+    pub(super) fn adopt(&mut self) -> Vec<u64> {
+        let v: Vec<u64> = self.win.drain().collect();
+        for id in &v {
+            *self.pinned.entry(*id).or_insert(0) += 1;
+        }
+        v
+    }
+
+    /// 单图销毁:递减引用计数(归零则解钉)。返回解钉块数(诊断)
+    pub(super) fn forget(&mut self, refs: &[u64]) -> usize {
+        let mut unpinned = 0;
+        for id in refs {
+            match self.pinned.get_mut(id) {
+                Some(c) if *c > 1 => *c -= 1,
+                Some(_) => {
+                    self.pinned.remove(id);
+                    unpinned += 1;
+                }
+                None => {}
+            }
+        }
+        unpinned
+    }
+
+    /// 该块是否被存活图引用(`free_blocks` 拒收判据)
+    pub(super) fn is_pinned(&self, id: u64) -> bool {
+        self.pinned.contains_key(&id)
+    }
+
+    #[cfg(test)]
+    fn pinned_len(&self) -> usize {
+        self.pinned.len()
+    }
+
+    #[cfg(test)]
+    fn window_len(&self) -> usize {
+        self.win.len()
+    }
+}
+
 pub(super) struct GpuCtx {
     pub ctx: Arc<CudaContext>,
     /// 诊断/调优选项(入口显式传入;显式依赖律)
@@ -214,6 +362,10 @@ pub(super) struct GpuCtx {
     /// 图捕获状态机(见 graph_begin/end 的护栏注释)
     ordinal: usize,
     capture: Option<CaptureState>,
+    /// 图引用租约(捕获窗引用集 + 存活图并集;见 [`GraphRefs`])。`RefCell`
+    /// 是因为 `block_ptr` 是 `&self`(launch 解析面共用);actor 单线程持有
+    /// ⇒ 无跨线程竞争
+    graph_refs: std::cell::RefCell<GraphRefs>,
     /// 图注册表:id → 实例化图(重放用)
     graphs: HashMap<GraphId, GraphHolder>,
     next_graph: GraphId,
@@ -232,12 +384,55 @@ pub(super) struct GpuCtx {
     pub(super) sink: owl_shared::log::LogSink,
 }
 
+/// **捕获窗内发射材料的登记表**(2026-10-15;A1.6 的落地,materials 账)。
+///
+/// 为什么需要:
+/// ① **空窗哨兵漏判** —— 家族/外来核走 `Exec::launch`(不产生 `Command`),
+///    原哨兵只数原生 `Command::Launch` ⇒ **纯家族发射的窗会被误判为空**
+///    (2026-10-03 `graph_dispatch_probe2` 踩过:外来核探针须补一发原生哨兵);
+/// ② **"图里烘了什么"无账** —— `GraphPlan` 的槽/输出是账内的,而家族窗内
+///    自产的 scratch/meta 是账外的(设计 §4.3e)⇒ 这张表是唯一线索。
+///
+/// 只按**内核名**聚合(不存每个节点):窗内可有数千发,原样存会在 host 侧
+/// 白白几百 KB;而"哪些核在图里"正是治理面要的信息。
+#[derive(Default, Debug, Clone)]
+pub(super) struct CaptureNodes {
+    /// 发射总数(原生 + 家族;= 原 `launches` 哨兵值)
+    pub total: usize,
+    /// 内核名 → 次数(键 = `String`:原生路径给的是 `LaunchMsg.kernel.name`,
+    /// 家族路径给 `&'static str`;窗口内一次性分摊,不值得为省几个 String 分叉)
+    by_kernel: std::collections::HashMap<String, usize>,
+}
+
+impl CaptureNodes {
+    pub(super) fn add(&mut self, kernel: &str) {
+        self.total += 1;
+        *self.by_kernel.entry(kernel.to_string()).or_insert(0) += 1;
+    }
+
+    /// Top-N 摘要(次数降序,同数按名序;日志/诊断用)
+    pub(super) fn top(&self, n: usize) -> Vec<(String, usize)> {
+        let mut v: Vec<(String, usize)> = self.by_kernel.iter().map(|(k, c)| (k.clone(), *c)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        v.truncate(n);
+        v
+    }
+
+    pub(super) fn distinct(&self) -> usize {
+        self.by_kernel.len()
+    }
+}
+
 /// 捕获会话:目标流 + 切块 slab + 发射计数(空窗哨兵用)
 struct CaptureState {
     stream: Arc<CudaStream>,
     slab: Arc<CudaSlice<u8>>,
-    used: usize,
-    launches: usize,
+    /// slab 内分配器(bump + 尺寸类回收;S1.5 ⇒ 容量 = 峰值活跃集而非总和)
+    arena: owl_shared::slab_hint::SlabArena,
+    /// **本窗自产块表**(abort 时整批作废的依据;graph_end 时交给 GraphHolder)
+    carved: Vec<u64>,
+    /// **本窗发射材料登记表**(原生 + 家族;空窗哨兵 + 治理账)
+    nodes: CaptureNodes,
     /// 本图实际 slab 容量(warmup 计量定量或 env 固定档;carve 校验
     /// 与 graph_begin 分配必须同口 —— 旧实现 carve 校验读 env,与
     /// hint 定量的 slab 脱口,2026-10-10)
@@ -256,6 +451,14 @@ struct GraphHolder {
     /// cudarc CudaGraph 同等资源语义)
     cu_graph: crate::ffi::sys::CUgraph,
     stream: std::sync::Arc<cudarc::driver::CudaStream>,
+    /// **本图烘入指针的 `Owned` 块集**(租约;见 [`GraphRefs`])
+    refs: Vec<u64>,
+    /// **本图专属的 slab 块集**(捕获窗自产;`graph_destroy` 时整批移出
+    /// 账房 ⇒ 最后一个引用走掉即物理释放)
+    carved: Vec<u64>,
+    /// **本图烘入的发射材料登记**(A1.6 落地;见 [`CaptureNodes`])——
+    /// `graph_destroy` 的日志与将来的显存归因都读它
+    nodes: CaptureNodes,
 }
 unsafe impl Send for GraphHolder {}
 
@@ -415,6 +618,7 @@ impl GpuCtx {
             srv_timing: diag.srv_timing,
             cap_prof: diag.cap_prof,
             capture: None,
+            graph_refs: Default::default(),
             graphs: HashMap::new(),
             next_graph: 1,
             blocks: HashMap::new(),
@@ -459,6 +663,9 @@ impl GpuCtx {
                 "graph_begin: 已有捕获进行中(不可嵌套/并发;先 graph_end)".to_string(),
             ));
         }
+        // 引用租约:开新窗(嵌套已在上面拒掉 ⇒ 这里清的是"上一张图已收窗"
+        // 之后的窗口集;既有租约不动)
+        self.graph_refs.get_mut().begin_window();
         let stream = self.stream(STREAM_COMPUTE)?.clone();
         // 捕获前必须排空该流(在飞任务会污染捕获窗)
         stream
@@ -479,7 +686,14 @@ impl GpuCtx {
         stream
             .begin_capture(CAPTURE_MODE_THREAD_LOCAL)
             .map_err(|e| ModelError::Msg(format!("graph_begin: {e:?}")))?;
-        self.capture = Some(CaptureState { stream, slab, used: 0, launches: 0, cap: slab_cap });
+        self.capture = Some(CaptureState {
+            stream,
+            slab,
+            arena: owl_shared::slab_hint::SlabArena::default(),
+            carved: Vec::new(),
+            nodes: CaptureNodes::default(),
+            cap: slab_cap,
+        });
         Ok(())
     }
 
@@ -489,13 +703,25 @@ impl GpuCtx {
             .capture
             .take()
             .ok_or_else(|| ModelError::Msg("graph_end: 当前没有进行中的捕获".to_string()))?;
-        // 哨兵③:空捕获窗(begin_capture 后一次发射都没有)
-        if cap.launches == 0 {
+        let mut cap = cap;
+        // 哨兵③:空捕获窗(begin_capture 后一次发射都没有;原生与家族同计)
+        if cap.nodes.total == 0 {
             // 仍须 end_capture 退出捕获态;空图被驱动以 NULL 返回
             let g = unsafe { crate::ffi::stream_end_capture(cap.stream.cu_stream()) }
                 .map_err(|e| ModelError::Msg(format!("graph_end: {e:?}")))?;
             if !g.is_null() {
                 let _ = unsafe { crate::ffi::graph_destroy(g) };
+            }
+            // 窗内自产块**整批作废**(不登记图 ⇒ 永不会被回放;移出账房
+            // ⇒ slab 最后一个引用走掉即释放)。旧实现留尸 = 整条 slab 钉到
+            // 进程结束(空窗虽罕见,但同一路径的"窗内出错"很常见)。
+            let orphan = self.release_window_blocks(&cap);
+            if orphan > 0 {
+                self.sink.logf(
+                    owl_shared::log::LVL_WARN,
+                    "graph-abort",
+                    format_args!("空捕获窗作废:回收 {orphan} 块 slab 引用(slab 随最后一个引用释放)"),
+                );
             }
             return Err(ModelError::Msg(
                 "graph_end: 空捕获窗(发射数 = 0;先在捕获期发射 ≥ 1 个 kernel)".to_string(),
@@ -618,11 +844,108 @@ impl GpuCtx {
         }
         let id = self.next_graph;
         self.next_graph += 1;
+        // **收窗 → 入租约**(§图引用租约):本窗内解析过的 `Owned` 块从此被
+        // `free_blocks` 拒收 —— 图里的裸指针就此获得"活着"的保证。
+        let refs = self.graph_refs.get_mut().adopt();
+        self.sink.logf(
+            owl_shared::log::LVL_DEBUG,
+            "graph-refs",
+            format_args!(
+                "图 {id}:发射 {} 发 / 内核 {} 种 / `Owned` 引用 {} 块 / slab 自产 {} 块(已入租约)— top {:?}",
+                cap.nodes.total,
+                cap.nodes.distinct(),
+                refs.len(),
+                cap.carved.len(),
+                cap.nodes.top(5)
+            ),
+        );
         self.graphs.insert(
             id,
-            GraphHolder { exec, cu_graph, stream: cap.stream.clone() },
+            GraphHolder {
+                exec,
+                cu_graph,
+                stream: cap.stream.clone(),
+                refs,
+                carved: std::mem::take(&mut cap.carved),
+                nodes: cap.nodes.clone(),
+            },
         );
         Ok(id)
+    }
+
+    /// **捕获窗作废**(abort;窗内出错/空窗的收尾)。
+    ///
+    /// 语义 = "这一窗从未存在":退出捕获态 + 销毁半成品图 + **窗内自产块
+    /// 整批移出账房**(⇒ slab 物理释放)。不做它的话,失败捕获会把**整条 slab**
+    /// (最坏 GB 级)永久钉在账房里到进程结束(旧实现的挂账 "graph abort")。
+    pub(super) fn graph_abort(&mut self) -> Result<(), ModelError> {
+        let cap = self
+            .capture
+            .take()
+            .ok_or_else(|| ModelError::Msg("graph_abort: 当前没有进行中的捕获".to_string()))?;
+        let g = unsafe { crate::ffi::stream_end_capture(cap.stream.cu_stream()) }
+            .map_err(|e| ModelError::Msg(format!("graph_abort: {e:?}")))?;
+        if !g.is_null() {
+            let _ = unsafe { crate::ffi::graph_destroy(g) };
+        }
+        let orphan = self.release_window_blocks(&cap);
+        // 窗集不入租约(这些块已消失;留着只会污染下一窗的 adopt)
+        self.graph_refs.get_mut().begin_window();
+        self.sink.logf(
+            owl_shared::log::LVL_WARN,
+            "graph-abort",
+            format_args!("捕获窗已作废:销毁半成品图 + 回收 {orphan} 块 slab 引用"),
+        );
+        Ok(())
+    }
+
+    /// 把某捕获窗的自产块移出账房(⇒ slab 的 `Arc` 计数下降;归零即释放)。
+    /// 返回回收块数。abort/空窗/单图销毁三处共用。
+    #[must_use]
+    fn release_window_blocks(&mut self, cap: &CaptureState) -> usize {
+        let mut n = 0;
+        for id in &cap.carved {
+            if self.blocks.remove(id).is_some() {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// **销毁已登记图**(单图退休;LRU 驱逐 / plan `close()` 的底层)。
+    ///
+    /// 三件事:①排队序(先排空 COMPUTE —— `cuGraphExecDestroy` 在有在飞
+    /// launch 时未定义,且块释放须与回放排空同序)②解除本图租约(计数递减,
+    /// 归零即解钉 ⇒ 客户端随后可 free 输入槽)③本图 slab 块整批移出账房。
+    pub(super) fn graph_destroy(&mut self, gid: GraphId) -> Result<(), ModelError> {
+        if self.capture.is_some() {
+            return Err(ModelError::Msg(
+                "graph_destroy: 捕获进行中不可销毁图(先 graph_end/graph_abort)".to_string(),
+            ));
+        }
+        let Some(g) = self.graphs.remove(&gid) else {
+            return Err(ModelError::Msg(format!("graph_destroy: 未知图 {gid}")));
+        };
+        self.stream(STREAM_COMPUTE)?
+            .synchronize()
+            .map_err(|e| ModelError::Msg(format!("graph_destroy: 预排空失败 {e:?}")))?;
+        let unpinned = self.graph_refs.get_mut().forget(&g.refs);
+        let mut released = 0;
+        for id in &g.carved {
+            if self.blocks.remove(id).is_some() {
+                released += 1;
+            }
+        }
+        let (n_launch, n_kind) = (g.nodes.total, g.nodes.distinct());
+        drop(g); // GraphHolder::drop ⇒ exec + cu_graph 双销毁
+        self.sink.logf(
+            owl_shared::log::LVL_INFO,
+            "graph-destroy",
+            format_args!(
+                "图 {gid} 已销毁:解钉 {unpinned} 块 `Owned` + 回收 {released} 块 slab 引用(原发射 {n_launch} 发 / 内核 {n_kind} 种)"
+            ),
+        );
+        Ok(())
     }
 
     /// 图重放(捕获期间拒绝;流序异步提交;路由 COMPUTE 流)
@@ -681,35 +1004,38 @@ impl GpuCtx {
         id
     }
 
-    /// 捕获期切块(零 cudaMalloc;slab 线性碰撞分配)
+    /// 捕获期切块(零 cudaMalloc;**slab 内 arena**:bump + 尺寸类回收,
+    /// 对齐 256B)。
+    ///
+    /// S1.5(2026-10-15,M1):原为**纯 bump**(无回收)⇒ 容量下限 = 分配总和
+    /// (27B/512-tok chunk 实测 9362 MiB ⇒ OOM,prefill 图根本捕不上)。现回收表
+    /// 复用已死块空间 ⇒ 容量 = **峰值活跃集**。
+    ///
+    /// ⚠️ 对齐前提同旧:向量化核(uint4/float4 16B 访存、cublas、FlashInfer)
+    /// 要求基底对齐;旧核全标量未暴露此缺陷(2026-09-27 v1 paged 核
+    /// MISALIGNED_ADDRESS 定谳)。
     pub(super) fn carve_block(&mut self, n: usize) -> Result<u64, ModelError> {
         let cap = self.capture.as_mut().ok_or_else(|| {
             ModelError::Msg("carve_block: 仅限捕获期(内部护栏违例)".to_string())
         })?;
-        // 256B 对齐切块:向量化核(uint4/float4 16B 访存、cublas、后续
-        // FlashInfer)要求基底对齐;旧核全标量未暴露此缺陷(2026-09-27
-        // v1 paged 核 MISALIGNED_ADDRESS 定谳)。无对齐需求的 2B 哑块也
-        // 不会破坏后续块基底。
-        const CARVE_ALIGN: usize = 256;
         if self.cap_prof {
             self.sink.logf(owl_shared::log::LVL_DEBUG, "cap-prof", format_args!("carve {}B", n));
         }
-        let used = cap.used.div_ceil(CARVE_ALIGN) * CARVE_ALIGN;
-        let slab_cap = cap.cap;
-        if !range_fits(slab_cap, used, n) {
-            return Err(ModelError::Msg(format!(
-                "捕获 slab 耗尽:已用 {used} + 对齐后需 {n} > {slab_cap}(warmup 计量失准或 OWL_CAPTURE_SLAB_MB 固定档过小)"
-            )));
-        }
+        let cap_total = cap.cap;
+        let (off, cap_n) = cap.arena.carve(n, cap_total).ok_or_else(|| {
+            ModelError::Msg(format!(
+                "捕获 slab 耗尽:需 {n}B(峰值 {cap_total} 已满)—— 探针定尺失准或 OWL_CAPTURE_SLAB_MB 固定档过小"
+            ))
+        })?;
         let local = self.next_block;
         self.next_block += 1;
         let id = pack_block_id(self.ledger, local);
-        let (off, slab) = (used, cap.slab.clone());
-        cap.used = used + n;
+        let slab = cap.slab.clone();
+        cap.carved.push(id);
         self.blocks.insert(
             id,
             BlockEntry {
-                block: Block::Carved { slab, off, n },
+                block: Block::Carved { slab, off, n, cap_n },
                 bytes: n,
                 ledger: self.ledger,
                 dtype: BlockDtype::Bytes,
@@ -728,6 +1054,15 @@ impl GpuCtx {
         assert_ledger(id, self.ledger)?;
         use crate::ffi::DevicePtr;
         let e = self.blocks.get(&id).ok_or(ModelError::DeadBlock { id })?;
+        // 图引用租约登记:捕获窗内的每次解析 = "这个块会被烘进图"
+        // (死块在上面已拒 ⇒ 不记野 id)。窗外的解析与图无关,零开销。
+        //
+        // ⚠️ **只登记 `Owned`**:`Carved` 的安全由**类型**保证(捕获后 free
+        // 一律 no-op;窗内 free = 回 arena 复用 —— 正是 M1 峰值口径的来源,
+        // 不能被租约拦下)。租约要补的恰是 `Owned`(池件/输入槽)那一半。
+        if self.capture.is_some() && matches!(e.block, Block::Owned(_)) {
+            self.graph_refs.borrow_mut().record(id);
+        }
         // 块账自洽(哨兵;cfg! 展开 ⇒ 两档都编译,零热路径语义)
         debug_assert_eq!(e.ledger, self.ledger, "块条目账本与 id 账本不一致");
         debug_assert_eq!(numel(&e.shape), e.bytes, "块 shape/账长不一致");
@@ -737,7 +1072,7 @@ impl GpuCtx {
                 let (p, _) = slice.device_ptr(stream);
                 Ok((p, slice.len()))
             }
-            Block::Carved { slab, off, n } => {
+            Block::Carved { slab, off, n, .. } => {
                 let view = slab.slice(*off..*off + *n);
                 let (p, _) = view.device_ptr(stream);
                 Ok((p, *n))
@@ -745,10 +1080,13 @@ impl GpuCtx {
         }
     }
 
-    /// 捕获期发射计数(哨兵③:graph_end 空窗校验;Launch 恒在 COMPUTE = 捕获流)
-    pub(super) fn note_launch(&mut self) {
+    /// 捕获期发射计数 + 登记(哨兵③:graph_end 空窗校验;Launch 恒在 COMPUTE
+    /// = 捕获流)。原生路径(`Command::Launch`)与家族路径(`record_capture`)
+    /// **共用**这一个入口 —— 家族发射同样算"窗内有发射"(原实现只数原生,
+    /// 会把纯家族窗误判为空窗,见 [`CaptureNodes`])。
+    pub(super) fn note_launch(&mut self, kernel: &str) {
         if let Some(cap) = &mut self.capture {
-            cap.launches += 1;
+            cap.nodes.add(kernel);
         }
     }
 
@@ -808,6 +1146,41 @@ impl GpuCtx {
     /// ⇒ 等回执的客户端卡住 ⇒ **管道永远跑不到前面**(设备 idle 85%)。
     /// 捕获期跳过(事件会被烤进图)。
     pub(super) fn free_blocks(&mut self, ids: &[u64]) -> usize {
+        // **图引用租约:拒收被图引用过的块**(见 [`GraphRefs`])。
+        //
+        // 为什么必须在咽喉处收:图烘的是裸指针 —— 被 free 的 `Owned` 块
+        // (池件/输入槽)会被设备池**原址重发**给下一个 alloc ⇒ 图变"陈旧
+        // 指针"(静默错值,不崩)。`Carved` 由下面的类型判据天然免疫,这里
+        // 补的正是另一半。行为 = **响亮拒收但不致命**:记账 + 告警,块留在
+        // 账房与 slab 里 ⇒ 没有 UAF/别名窗口。
+        // 快路径:无命中(稳态)零分配。
+        let rest_storage: Vec<u64>;
+        let ids: &[u64] = if ids.iter().any(|id| self.graph_refs.borrow().is_pinned(*id)) {
+            let (pinned, rest): (Vec<u64>, Vec<u64>) = ids
+                .iter()
+                .partition(|id| self.graph_refs.borrow().is_pinned(**id));
+            self.sink.count("srv.count.free_pinned_reject", pinned.len() as u64);
+            // 告警带"是哪张图钉的"(refs 字段的实际用途:诊断可行动)
+            let holder: Vec<GraphId> = self
+                .graphs
+                .iter()
+                .filter(|(_, g)| g.refs.iter().any(|r| pinned.contains(r)))
+                .map(|(gid, _)| *gid)
+                .collect();
+            self.sink.logf(
+                owl_shared::log::LVL_WARN,
+                "free-pinned",
+                format_args!(
+                    "{} 块被图引用租约拒收(首个 id={};持有图 {holder:?};图烘入该地址 ⇒ free 会让设备池原址重发)",
+                    pinned.len(),
+                    pinned[0]
+                ),
+            );
+            rest_storage = rest;
+            &rest_storage
+        } else {
+            ids
+        };
         if self.capture.is_none() && !self.diag.free_legacy {
             let fence = self.fence_targets(ids);
             if !fence.is_empty() {
@@ -850,17 +1223,48 @@ impl GpuCtx {
         let mut n = 0;
         let mut freed_bytes: i64 = 0;
         for id in ids {
-            let owned = self
-                .blocks
-                .get(id)
-                .is_some_and(|e| matches!(e.block, Block::Owned(_)));
-            if owned {
-                if let Some(e) = self.blocks.remove(id) {
-                    if let Block::Owned(slice) = &e.block {
-                        freed_bytes += slice.len() as i64; // B6.5 live 记账
+            // M1:warmup 影子 arena 归位(探针关 = 无动作)
+            owl_shared::slab_hint::probe_free(*id);
+            let Some((kind, off, cap_n)) = self.blocks.get(id).map(|e| match &e.block {
+                Block::Owned(_) => (0u8, 0usize, 0usize),
+                Block::Carved { off, cap_n, .. } => (1u8, *off, *cap_n),
+            }) else {
+                continue;
+            };
+            match kind {
+                // ── Owned:图外块 → 真释放(块自身流;已按上律钉序)──
+                0 => {
+                    // 捕获窗内 Owned 死块**不释放**:`free_async` 可被捕获 ⇒
+                    // 会烙 MEM_FREE 节点 + 地址漂移;而窗内分配一律 carve ⇒
+                    // 窗内的 Owned 块必是**输入/池件**(它们的地址已/将被烘
+                    // 入图)—— 防御性跳过(租约的窗内盲区就在此封口)。
+                    if self.capture.is_some() {
+                        self.sink.count("srv.count.free_owned_in_window", 1);
+                        continue;
                     }
-                    drop(e); // free_async(块自身流;已按上律钉序)
-                    n += 1;
+                    if let Some(e) = self.blocks.remove(id) {
+                        if let Block::Owned(slice) = &e.block {
+                            freed_bytes += slice.len() as i64; // B6.5 live 记账
+                        }
+                        drop(e);
+                        n += 1;
+                    }
+                }
+                // ── Carved 且**捕获窗内**:回 slab 内回收表(纯 host 簿记 ⇒
+                //    捕获安全)。安全依据:scoped 归约只归还**不可达**中间块,
+                //    而捕获按求值序记录 ⇒ 复用点在所有消费者之后(设计 §4.3)。
+                1 if self.capture.is_some() => {
+                    self.blocks.remove(id);
+                    if let Some(cap) = self.capture.as_mut() {
+                        cap.arena.release(off, cap_n);
+                        n += 1;
+                    }
+                }
+                // ── Carved 且**捕获后**:地址已烘进图 ⇒ **保持 no-op**
+                //    (不可再发放,否则图内已烘焙地址被无关张量覆盖 ——
+                //    施工文档 §5.2)。真要回收只能走 `graph_destroy`(整图退休)。
+                _ => {
+                    self.sink.count("srv.count.free_carved_noop", 1);
                 }
             }
         }
@@ -1063,6 +1467,87 @@ mod tests {
     fn pack_is_injective_across_ledgers() {
         assert_ne!(pack_block_id(1, 11), pack_block_id(2, 11));
         assert_eq!(ledger_of(pack_block_id(3, 99)), 3);
+    }
+
+    /// 图引用租约(纯簿记,零 CUDA):窗内解析**不入租约**,收窗才入;
+    /// 开新窗不清旧租约(老图还活着);重解析幂等;单图销毁按计数解钉。
+    #[test]
+    fn graph_refs_window_scope_and_pin() {
+        let mut r = GraphRefs::default();
+        // 窗内解析:只记窗口集,不入租约(图还没成)⇒ 此刻 free 应放行
+        r.begin_window();
+        r.record(7);
+        r.record(9);
+        assert_eq!(r.window_len(), 2);
+        assert!(!r.is_pinned(7), "收窗前不得入租约(否则捕获失败的块会被永久钉住)");
+        assert_eq!(r.pinned_len(), 0);
+        // 收窗:本图引用集 = 2 块,入租约
+        let refs = r.adopt();
+        assert_eq!(refs.len(), 2);
+        assert!(r.is_pinned(7) && r.is_pinned(9));
+        assert_eq!(r.window_len(), 0, "收窗须清窗口集");
+        // 开第二张图:旧租约不动,新窗独立
+        r.begin_window();
+        assert!(r.is_pinned(7), "老图还活着 ⇒ 租约不得随新窗清空");
+        assert_eq!(r.window_len(), 0);
+        // 同一块被第二张图再引用:计数 +1(并集不重复)
+        r.record(7);
+        r.record(11);
+        let refs2 = r.adopt();
+        assert_eq!(refs2.len(), 2);
+        assert_eq!(r.pinned_len(), 3, "并集:7/9/11");
+        // 销毁图 1:9 解钉;7 仍被图 2 引用(计数减到 1)⇒ 不得放行
+        let unpinned = r.forget(&refs);
+        assert_eq!(unpinned, 1, "只 9 归零");
+        assert!(!r.is_pinned(9));
+        assert!(r.is_pinned(7), "多图共享块:一张图销毁不得解钉");
+        // 销毁图 2:7/11 解钉;9 再 forget 幂等(不得 panic)
+        assert_eq!(r.forget(&refs2), 2);
+        assert_eq!(r.forget(&refs2), 0, "重复解钉幂等");
+        assert!(!r.is_pinned(7) && !r.is_pinned(11));
+        assert_eq!(r.pinned_len(), 0);
+        // 未解析过的块照常放行(自由块不得被误钉)
+        assert!(!r.is_pinned(13));
+    }
+
+    /// 捕获窗发射登记表:总数/聚合/Top-N 序稳定(镜像测试用)。
+    #[test]
+    fn capture_nodes_histogram_and_top() {
+        let mut n = CaptureNodes::default();
+        assert_eq!(n.total, 0);
+        n.add("owl_marlin_gemm_f16_u4b8");
+        n.add("owl_marlin_gemm_f16_u4b8");
+        n.add("owl_gdn_chunked_delta_rule_fwd");
+        n.add("owl_flashinfer_prefill_paged_fp8kv");
+        n.add("owl_gdn_chunked_delta_rule_fwd");
+        assert_eq!(n.total, 5);
+        assert_eq!(n.distinct(), 3);
+        let top = n.top(2);
+        assert_eq!(
+            top,
+            vec![
+                ("owl_gdn_chunked_delta_rule_fwd".to_string(), 2),
+                ("owl_marlin_gemm_f16_u4b8".to_string(), 2)
+            ],
+            "同数按名序(A13 同款确定性)"
+        );
+        assert_eq!(n.top(9).len(), 3, "N 超表长只回表内");
+    }
+
+    /// 家族面捕获入境判定:不变盒恒放行;走第四条路的动作观察档放行、严格档拒。
+    #[test]
+    fn fam_window_verdict_matrix() {
+        // 不变盒(gdn_scalar 的 soff 范式)= 捕获窗合规
+        assert!(fam_window_verdict(FamAct::Upload { invariant: true }, false).is_ok());
+        assert!(fam_window_verdict(FamAct::Upload { invariant: true }, true).is_ok());
+        // 观察档(缺省):放行(零行为变化)
+        assert!(fam_window_verdict(FamAct::ScratchAlloc, false).is_ok());
+        assert!(fam_window_verdict(FamAct::Upload { invariant: false }, false).is_ok());
+        // 严格档:结构化拒,且拒语必须点出病因(免得后人以为只是"不支持")
+        let e = fam_window_verdict(FamAct::ScratchAlloc, true).expect_err("严格档须拒");
+        assert!(e.contains("alloc") && e.contains("MEM_ALLOC"), "拒语应可行动:{e}");
+        let e = fam_window_verdict(FamAct::Upload { invariant: false }, true).expect_err("严格档须拒");
+        assert!(e.contains("upload") && e.contains("不变盒"), "拒语应可行动:{e}");
     }
 }
 

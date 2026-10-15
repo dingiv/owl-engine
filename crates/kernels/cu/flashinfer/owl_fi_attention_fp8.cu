@@ -21,13 +21,13 @@ extern "C" int owl_fi_prefill_run_fp8kv(
     const int64_t* plan15, void* int_ws, size_t int_ws_size, void* float_ws,
     size_t float_ws_size, int32_t batch_size, int32_t num_qo_heads, int32_t num_kv_heads,
     int32_t head_dim, int32_t page_size, int32_t total_num_rows, float sm_scale,
-    cudaStream_t stream) {
+    const void* block_valid_mask, cudaStream_t stream) {
   try {
     return owl_fi_run_impl<__nv_fp8_e4m3>(q_ptr, k_data, v_data, out_ptr, q_cu_seqlens, indices,
                                           indptr, last_len, plan15, int_ws, int_ws_size, float_ws,
                                           float_ws_size, batch_size, num_qo_heads, num_kv_heads,
-                                          head_dim, page_size, total_num_rows, sm_scale, stream,
-                                          "run_fp8kv");
+                                          head_dim, page_size, total_num_rows, sm_scale,
+                                          block_valid_mask, stream, "run_fp8kv");
   } catch (const std::exception& e) {
     fprintf(stderr, "[owl-fi][run_fp8kv] %s\n", e.what());
     return -103;

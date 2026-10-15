@@ -14,8 +14,43 @@ use crate::family::flashinfer::{
 };
 use crate::registry::{FamilyGuard, KernelFamily};
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 struct PlanKey {
+    total_rows: usize,
+    /// **split 关时恒 0**(归一化):源码级 F-5 —— split 关时 plan 的数组
+    /// 只由 qo 长度定,ctx 三条链(`kv_len_arr`/`effective_kv_len_arr`/
+    /// `kv_chunk_size`)只在 split 分支被消费 ⇒ 键去 ctx 后,**一个桶一份 plan
+    /// 跨 ctx 复用**(M2b 的 P-1)。split 开时必须留着(那时 ctx 真参与)。
+    ctx_total: usize,
+    /// **图档 plan**(`FI_CUDA_GRAPH`;见 common.h `owl_fi_cuda_graph`)
+    /// —— 数组与 `padded_batch_size` 都与 eager 档不同,必须分键,否则
+    /// 一次 eager 调用会把图档 plan 挤掉(mask 内容随之失配)
+    graph: bool,
+    /// split-kv 开关(`FI_SPLIT_KV`;与 C++ `owl_fi_split_kv_enabled` 同源)——
+    /// 决定 ctx 是否进键(见上),必须显式入键,否则切档后复用错 plan
+    split: bool,
+    t: usize,
+    hq: usize,
+    hkv: usize,
+    hd: usize,
+    page: usize,
+}
+
+/// 图档 plan 开关(与 C++ `owl_fi_cuda_graph` 同源:env `FI_CUDA_GRAPH`)。
+/// plan 期读一次(非热路径);两处必须一致,否则 PlanKey 与真数组错档。
+fn fi_cuda_graph() -> bool {
+    std::env::var_os("FI_CUDA_GRAPH").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// split-kv 开关(与 C++ `owl_fi_split_kv_enabled` 同源:env `FI_SPLIT_KV`)
+fn fi_split_kv() -> bool {
+    std::env::var_os("FI_SPLIT_KV").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// **plan 键归一化(纯函数;可单测)**:split 关 ⇒ 抹掉 `ctx_total`
+/// (源码级 F-5:那三条 ctx 链只在 split 分支被消费)⇒ 一个桶一份 plan 跨 ctx
+/// 复用(M2b 的 P-1);split 开 ⇒ ctx 真参与定瓦,必须进键。
+fn plan_key(
     total_rows: usize,
     ctx_total: usize,
     t: usize,
@@ -23,6 +58,25 @@ struct PlanKey {
     hkv: usize,
     hd: usize,
     page: usize,
+    graph: bool,
+    split: bool,
+) -> PlanKey {
+    PlanKey {
+        total_rows,
+        ctx_total: if split { ctx_total } else { 0 },
+        t,
+        hq,
+        hkv,
+        hd,
+        page,
+        graph,
+        split,
+    }
+}
+
+/// 诊断打印开关(与 C++ `owl_fi_debug` 同源:env `FI_DEBUG`)
+fn fi_debug() -> bool {
+    std::env::var_os("FI_DEBUG").is_some_and(|v| !v.is_empty() && v != "0")
 }
 
 impl FiRuntime {
@@ -36,7 +90,11 @@ pub struct FiRuntime {
     float_ws: Option<ScratchBuf>,
     int_ws: Option<ScratchBuf>,
     host_staging: Vec<u8>,
-    plan: Option<(PlanKey, [i64; 15])>,
+    /// plan 缓存(**单条**)+ 它的**尾部 CTA 掩码**(P-5)。为什么 mask 必须
+    /// 与 plan 同车:MASK 内容 = `i < tiles`,而 `tiles/padded` 都是 plan 的
+    /// 函数;若共用一个 mask 缓冲,一次换形的 eager 调用会把上一条 plan 的
+    /// 掩码改写 ⇒ **回放旧图时掩码失配 ⇒ 真行漏算**(静默错值)。
+    plan: Option<(PlanKey, [i64; 15], ScratchBuf, usize /* tiles */)>,
 }
 
 impl Default for FiRuntime {
@@ -101,15 +159,17 @@ impl KernelFamily for FiRuntime {
         let stream = res.stream()?;
 
         // plan(host,每形状一次;键 = 形状七元组)
-        let key = PlanKey {
-            total_rows: call.total_rows,
-            ctx_total: call.ctx_total,
-            t: call.t,
-            hq: call.hq,
-            hkv: call.hkv,
-            hd: call.hd,
-            page: call.page,
-        };
+        let key = plan_key(
+            call.total_rows,
+            call.ctx_total,
+            call.t,
+            call.hq,
+            call.hkv,
+            call.hd,
+            call.page,
+            fi_cuda_graph(),
+            fi_split_kv(),
+        );
         // ⚠️ **plan 必须在捕获窗之外算**(2026-10-14 实测 + 结构性守卫;自
         // `feat/prefill-graph` 合入)。
         //
@@ -127,7 +187,7 @@ impl KernelFamily for FiRuntime {
         // 捕获期若 plan 未命中,**结构化拒**(→ 上层 `Ok(None)` → eager 原路),
         // 不静默、不把错节点烘进图。
         // (更强做法:每形状一份独立 staging 缓冲 ⇒ 节点源恒定;待有需求再上。)
-        if self.plan.as_ref().map(|(k, _)| *k != key).unwrap_or(true) {
+        if self.plan.as_ref().map(|(k, ..)| *k != key).unwrap_or(true) {
             if res.capturing().unwrap_or(false) {
                 return Err(OpError::Launch {
                     op: msg.kernel.name.clone(),
@@ -171,9 +231,50 @@ impl KernelFamily for FiRuntime {
                     ),
                 });
             }
-            self.plan = Some((key, plan15));
+            // ── **P-5:尾部 CTA 掩码**(2026-10-15;设计 §4.1c F-6/F-7/F-8)
+            //
+            // 图档 plan 的 `padded_batch_size = max(2·SM/hkv, tiles)` ⇒ 尾部
+            // CTA 数可以远超真 tile 数(t_pad=128/3090:41 vs 12)。不掩码时
+            // 它们读 plan 表的**残留表项**(行为取决于上一次 plan 写了什么 =
+            // 静默);掩码后核侧 `if (!mask[bx]) return;` 立即退。
+            //
+            // 内容 `i < tiles` 由**本侧**算(唯一事实源 = plan15):
+            //   tiles = ceil_div(packed_qo_len, cta_tile_q),packed = t·gqa
+            // (`batch=1`;多请求时须逐请求求和 —— 本仓 FI 调用恒 batch=1,
+            //  非 1 在此结构化拒,不给"算错了但看着对"的余地)
+            let gqa = call.hq / call.hkv.max(1);
+            let (padded, cta_tile_q) = (plan15[0].max(0) as usize, plan15[3].max(0) as usize);
+            if gqa == 0 || cta_tile_q == 0 {
+                return Err(OpError::Contract {
+                    op: PREFILL_FI.into(),
+                    field: "plan15",
+                    expect: "cta_tile_q > 0 且 gqa ≥ 1".into(),
+                    got: format!("gqa={gqa} cta_tile_q={cta_tile_q}"),
+                });
+            }
+            let tiles = (call.total_rows * gqa).div_ceil(cta_tile_q).max(1);
+            let mask = res.alloc(padded.max(1), "fi.mask")?;
+            let mut m = vec![0u8; padded.max(1)];
+            for (i, v) in m.iter_mut().enumerate() {
+                *v = u8::from(i < tiles);
+            }
+            res.upload(mask.ptr, &m)?;
+            if padded > tiles && fi_debug() {
+                eprintln!(
+                    "[owl-fi][mask] 图档 plan:T={} ctx={} padded={} tiles={} ⇒ 掩 {} 个尾部 CTA",
+                    call.t,
+                    call.ctx_total,
+                    padded,
+                    tiles,
+                    padded - tiles
+                );
+            }
+            self.plan = Some((key, plan15, mask, tiles));
         }
-        let plan15 = self.plan.as_ref().map(|(_, p)| *p).expect("plan 缓存");
+        let (plan15, mask_ptr) = {
+            let (_, p, m, _) = self.plan.as_ref().expect("plan 缓存");
+            (*p, m.ptr)
+        };
 
         let run = if call.fp8kv {
             owl_fi_prefill_run_fp8kv
@@ -205,6 +306,7 @@ impl KernelFamily for FiRuntime {
                 call.page as i32,
                 call.total_rows as i32,
                 call.sm_scale,
+                mask_ptr as *const std::ffi::c_void,
                 stream.cu_stream() as *mut std::ffi::c_void,
             )
         };
@@ -216,5 +318,37 @@ impl KernelFamily for FiRuntime {
             });
         }
         Ok(Bytes::new(call.out.id, msg.out_elems, Dtype::F16, 2))
+    }
+}
+
+#[cfg(test)]
+mod plan_key_tests {
+    use super::plan_key;
+
+    /// **P-1 判据**:split 关 ⇒ ctx 不进键(换 ctx 复用同一份 plan);
+    /// split 开 ⇒ ctx 进键(不得跨 ctx 复用)。图档位单列(数组/padded 都不同)。
+    #[test]
+    fn ctx_enters_key_only_when_split_on() {
+        let k = |rows: usize, ctx: usize, graph: bool, split: bool| {
+            plan_key(rows, ctx, rows, 24, 4, 256, 32, graph, split)
+        };
+        let a = k(512, 512, true, false);
+        let b = k(512, 2048, true, false);
+        assert_eq!(a, b, "split 关:ctx 必须被归一化掉(F-5)");
+        assert_eq!(a.ctx_total, 0);
+
+        let c = k(512, 512, true, true);
+        let d = k(512, 2048, true, true);
+        assert_ne!(c, d, "split 开:ctx 必须分键");
+
+        // 图档位:同形状不同档 ⇒ 不同键(数组与 padded_batch_size 都不同)
+        assert_ne!(k(512, 0, false, false), k(512, 0, true, false));
+        // 形状位:行数/页 仍分键
+        assert_ne!(k(512, 0, true, false), k(511, 0, true, false));
+        assert_ne!(
+            plan_key(512, 0, 512, 24, 4, 256, 32, true, false),
+            plan_key(512, 0, 512, 24, 4, 256, 64, true, false),
+            "page 必须分键"
+        );
     }
 }

@@ -186,6 +186,14 @@ impl DeviceClient for GpuClient {
         self.submit(move |ack| Command::GraphLaunch { graph, ack })?.await
     }
 
+    async fn graph_abort(&mut self) -> Result<(), ModelError> {
+        self.submit(move |ack| Command::GraphAbort { ack })?.await
+    }
+
+    async fn graph_destroy(&mut self, graph: GraphId) -> Result<(), ModelError> {
+        self.submit(move |ack| Command::GraphDestroy { graph, ack })?.await
+    }
+
     async fn alloc(&mut self, dtype: Dtype, elems: usize) -> Result<Bytes, ModelError> {
         let n_bytes = elems * dtype.size_bytes();
         // 事实面:句柄自带 dtype(阶数未定形 = 0,由调用点 `view` 或张量视图定)

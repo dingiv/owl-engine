@@ -33,6 +33,19 @@ pub enum Command {
         graph: GraphId,
         ack: Ack<Result<(), ModelError>>,
     },
+    /// **捕获窗作废**(窗内出错/空窗的收尾;捕获期间**允许** —— 它就是窗内
+    /// 收尾手段)。语义 = "这一窗从未存在":退出捕获态 + 销毁半成品图 +
+    /// **窗内自产块整批移出账房**(⇒ slab 释放)。不做它则失败捕获会把整条
+    /// slab 钉到进程结束(state.rs `graph_abort`)
+    GraphAbort {
+        ack: Ack<Result<(), ModelError>>,
+    },
+    /// **销毁已登记图**(单图退休:LRU 驱逐 / plan `close()` 底层)。三件事:
+    /// 排空回放 → 解除本图块租约(归零即解钉)→ 本图 slab 块整批移出账房
+    GraphDestroy {
+        graph: GraphId,
+        ack: Ack<Result<(), ModelError>>,
+    },
     /// 清零分配(设备侧 memset,流序非阻塞;捕获期自动切 slab)。
     /// n_bytes = 清零/切块字节数;elems = Bytes 账长(元素口径,f16 ≠ bytes/4)
     /// zero = false 时免 memset(S1:scratch 输出 kernel 全量覆写;
@@ -139,6 +152,8 @@ impl Command {
             Self::GraphBegin { .. } => "graph_begin",
             Self::GraphEnd { .. } => "graph_end",
             Self::GraphLaunch { .. } => "graph_launch",
+            Self::GraphAbort { .. } => "graph_abort",
+            Self::GraphDestroy { .. } => "graph_destroy",
             Self::Alloc { .. } => "alloc",
             Self::Htod { .. } => "htod",
             Self::MemsetZero { .. } => "memset_zero",
@@ -162,6 +177,8 @@ impl Command {
             Self::GraphBegin { ack } => ack.created_at(),
             Self::GraphEnd { ack } => ack.created_at(),
             Self::GraphLaunch { ack, .. } => ack.created_at(),
+            Self::GraphAbort { ack } => ack.created_at(),
+            Self::GraphDestroy { ack, .. } => ack.created_at(),
             Self::Alloc { ack, .. } => ack.created_at(),
             Self::Htod { ack, .. } => ack.created_at(),
             Self::MemsetZero { ack, .. } => ack.created_at(),

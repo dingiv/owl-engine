@@ -275,6 +275,9 @@ impl<D: DeviceClient> GraphFleet<D> {
                 capture: !knobs.no_graph,
                 slab_fixed: knobs.cuda.capture_slab_mb.is_some(),
                 debug_probe: knobs.probes.debug,
+                // 本族不加锚定回收(plain 口径:窗内块常驻 —— 历史行为零变化)
+                reclaim_capture: false,
+                warmup: true,
             },
             forward,
         )
@@ -382,6 +385,9 @@ impl<D: DeviceClient> GraphFleet<D> {
                 capture: !knobs.no_graph,
                 slab_fixed: knobs.cuda.capture_slab_mb.is_some(),
                 debug_probe: knobs.probes.debug,
+                // 本族不加锚定回收(plain 口径:窗内块常驻 —— 历史行为零变化)
+                reclaim_capture: false,
+                warmup: true,
             },
             move |sc: &PlanCtx| -> Result<()> {
                 let ids = sc.input("ids")?;
@@ -560,6 +566,9 @@ impl<D: DeviceClient> GraphFleet<D> {
                     capture: !knobs.no_graph,
                     slab_fixed: knobs.cuda.capture_slab_mb.is_some(),
                     debug_probe: knobs.probes.debug,
+                    // 本族不加锚定回收(plain 口径:窗内块常驻 —— 历史行为零变化)
+                    reclaim_capture: false,
+                    warmup: true,
                 },
                 move |sc: &PlanCtx| -> Result<()> {
                     let slots = sc.input("slots")?;
@@ -664,6 +673,9 @@ impl<D: DeviceClient> GraphFleet<D> {
                 capture: !knobs.no_graph,
                 slab_fixed: knobs.cuda.capture_slab_mb.is_some(),
                 debug_probe: knobs.probes.debug,
+                // 本族不加锚定回收(plain 口径:窗内块常驻 —— 历史行为零变化)
+                reclaim_capture: false,
+                warmup: true,
             },
             move |sc: &PlanCtx| -> Result<()> {
                 let taps: Vec<TensorOps> = tap_blks
@@ -787,6 +799,9 @@ impl<D: DeviceClient> GraphFleet<D> {
                     capture: !knobs.no_graph,
                     slab_fixed: knobs.cuda.capture_slab_mb.is_some(),
                     debug_probe: knobs.probes.debug,
+                    // 本族不加锚定回收(plain 口径:窗内块常驻 —— 历史行为零变化)
+                    reclaim_capture: false,
+                    warmup: true,
                 },
                 move |sc: &PlanCtx| -> Result<()> {
                     // PlanCtx 输入声明形 [1, len] → flatten(行主前缀)

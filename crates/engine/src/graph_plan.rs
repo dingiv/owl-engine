@@ -86,7 +86,6 @@ impl OutputSlot {
 }
 
 /// 会话描述
-#[derive(Default)]
 pub struct GraphPlanDesc {
     pub inputs: Vec<InputSlot>,
     pub outputs: Vec<OutputSlot>,
@@ -97,6 +96,38 @@ pub struct GraphPlanDesc {
     pub slab_fixed: bool,
     /// 槽回读诊断打印(knobs.probes.debug;显式依赖律,原 OWL_DEBUG)
     pub debug_probe: bool,
+    /// **捕获窗锚定活性回收**(M1;缺省 false = 历史 plain 口径)。
+    /// true ⇒ 捕获窗内死块即时 free ⇒ slab 容量从"分配总和"降到"峰值活跃集"
+    /// (27B/512-tok chunk 实测:总和 9362 MiB ⇒ OOM;峰值 193 MiB ⇒ Captured)。
+    /// 安全依据见 `crates/backends/cuda/src/state.rs::GraphRefs` + `free_blocks`:
+    /// scoped 归约只归还**不可达**中间块,而捕获按求值序记录 ⇒ 复用点在所有
+    /// 消费者之后。prefill 图族开;decode/verify 族保持 false(它们的总和本来
+    /// 就只有几百 MB,改动 = 行为改动,不在本刀范围)。
+    pub reclaim_capture: bool,
+    /// **跳过 warmup 预跑**(缺省 true = 历史姿势 6 lite)。
+    ///
+    /// false 的语义:`plan()` 不再 eager 跑一遍闭包 ⇒ ①**不计量** ⇒ 必须
+    /// 配合固定 slab 档(`slab_fixed`,否则结构化拒)②**不产生状态副作用**
+    /// ⇒ 捕获可脱离"静止点律"(惰性按需捕获 / LRU 驱逐的前置件)。
+    /// 代价:声明树门禁不再于捕获前预检(窗口内才暴露 ⇒ 触发 abort 收窗)。
+    pub warmup: bool,
+}
+
+impl Default for GraphPlanDesc {
+    /// **手写 Default**(不用 derive):`warmup` 的"安全缺省值"是 **true**
+    /// —— `bool::default()` 会给出 false,而 false 要求 `slab_fixed`,是
+    /// 个只有在 `..Default::default()` 简写里才会踩的坑。
+    fn default() -> Self {
+        Self {
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            capture: false,
+            slab_fixed: false,
+            debug_probe: false,
+            reclaim_capture: false,
+            warmup: true,
+        }
+    }
 }
 
 /// plan 结果(A1.4:预检失败 = EagerFallback,同闭包直发)
@@ -173,6 +204,8 @@ pub struct GraphPlan<D: DeviceClient> {
     env: owl_models::env::EnvProvider,
     /// 槽回读诊断打印(desc.debug_probe;显式依赖律)
     debug_probe: bool,
+    /// 捕获窗锚定活性回收(M1;见 `GraphPlanDesc` 同名字段)
+    reclaim_capture: bool,
     inputs: Vec<InSlotDev>,
     out_specs: HashMap<String, usize>, // name → 元素数
     out_dt: HashMap<String, Dtype>,    // name → 收割 dtype(F5 logits f16)
@@ -204,6 +237,7 @@ impl<D: DeviceClient> GraphPlan<D> {
             face,
             env,
             debug_probe: desc.debug_probe,
+            reclaim_capture: desc.reclaim_capture,
             inputs: ins,
             out_specs: desc
                 .outputs
@@ -233,9 +267,24 @@ impl<D: DeviceClient> GraphPlan<D> {
         // slab 定量(E8→A1,2026-10-10):warmup 前弃旧账,后取闭包真
         // 分配字节 → hint = ×1.15 + 1MiB。env 显式设 OWL_CAPTURE_SLAB_MB
         // 时固定档优先(state 侧裁决),此处不置 hint 兼容旧档位。
-        if desc.capture {
+        if desc.capture && !desc.warmup && !desc.slab_fixed {
+            // 无 warmup ⇒ 无计量 ⇒ 必须给固定档;否则捕获窗内在 OOM 边缘
+            // 试探(窗已脏,只能 abort)。结构性拒,不给"猜一个 64MiB"的兜底。
+            return Err(ModelError::Msg(
+                "GraphPlanDesc{warmup:false} 必须同时 slab_fixed(capture_slab_mb 固定档);\
+                 否则捕获窗容量无来源"
+                    .to_string(),
+            ));
+        }
+        if desc.capture && desc.warmup {
             let _ = owl_shared::slab_hint::meter_take();
-            sess.eval_current().await?;
+            // M1:影子 arena 探针(warmup 与捕获窗是同一份 DAG/同一批形状,
+            // 且都走 scoped 归约 ⇒ 影子高水位 = 捕获真需要的容量)
+            owl_shared::slab_hint::probe_on(true);
+            let warm_res = sess.eval_current().await;
+            // 探针必须收(即使 warmup 失败),否则 PROBE_ON 残留污染下一图
+            let peak = owl_shared::slab_hint::probe_end();
+            warm_res?;
             sess.face.sync().await?;
             // warmup 输出块归还(原 `clear()` 只丢句柄、块留池外 ⇒ 每次
             // plan 一次性泄漏;此处显式 free)
@@ -246,7 +295,18 @@ impl<D: DeviceClient> GraphPlan<D> {
             }
             let metered = owl_shared::slab_hint::meter_take() as usize;
             if !desc.slab_fixed {
-                owl_shared::slab_hint::set_hint(metered + metered / 8 + (1 << 20));
+                // **口径必须与捕获模式一致**(M1 实测教训):锚定回收 ⇒ 需求 =
+                // 峰值活跃集(影子高水位);plain(历史口径)⇒ 窗内块常驻 ⇒
+                // 需求 = 分配总和。混用会把族定小 ⇒ 捕获中途耗尽当场炸。
+                let base = if desc.reclaim_capture { peak } else { metered }.max(4 << 20);
+                owl_shared::slab_hint::set_hint(base + base / 8 + (1 << 20));
+                owl_shared::log_info!(
+                    "graph-plan",
+                    "slab 定尺({}):峰值 {}MiB / 总和 {}MiB",
+                    if desc.reclaim_capture { "锚回收·峰值" } else { "plain·总和" },
+                    peak >> 20,
+                    metered >> 20
+                );
             }
         }
 
@@ -255,7 +315,16 @@ impl<D: DeviceClient> GraphPlan<D> {
             let r = sess.try_capture().await;
             // 收尾:graph_begin 已消费 hint;失败路径防陈旧 hint 污染下一图
             owl_shared::slab_hint::clear_hint();
-            r?
+            match r {
+                Ok(o) => o,
+                Err(e) => {
+                    // **失败不留尸**(2026-10-15):窗内已切出的块若无人认领,
+                    // 会把整条 slab 钉到进程结束(最坏 GB 级)。收窗 + 槽归还;
+                    // 两者失败都**不覆盖**原错(记可见警告,原错优先上抛)。
+                    sess.abandon().await;
+                    return Err(e);
+                }
+            }
         } else {
             fallback("未请求捕获")
         };
@@ -476,7 +545,14 @@ impl<D: DeviceClient> GraphPlan<D> {
         let trees: Vec<&TensorOps> = outs.iter().map(|(_, t)| t).collect();
         let mut win_err: Option<ModelError> = None;
         let mut blocks: Vec<(String, Bytes, usize, Dtype)> = Vec::new();
-        match eval_ops_multi(&trees, &mut self.face).await {
+        // M1:锚定回收族走 scoped 归约(窗内死块即时 free ⇒ 回 slab arena
+        // 复用 ⇒ 容量 = 峰值活跃集)。plain 族保持历史口径(窗内块常驻)。
+        let eval_res = if self.reclaim_capture {
+            eval_ops_multi_scoped_env(&trees, &mut self.face, self.env).await
+        } else {
+            eval_ops_multi(&trees, &mut self.face).await
+        };
+        match eval_res {
             Ok(results) => {
                 for ((name, _), b) in outs.iter().zip(results) {
                     let want = self.out_specs[name];
@@ -505,9 +581,61 @@ impl<D: DeviceClient> GraphPlan<D> {
                     .collect();
                 Ok(PlanOutcome::Captured)
             }
-            (Some(e), _) => Err(e), // 窗已脏:不可静默降级(挂账:graph abort)
-            (None, Err(e)) => Err(ModelError::Msg(format!("capture: graph_end 失败 {e}"))),
+            // 窗已脏:不可静默降级 ⇒ **abort 收窗**(销毁半成品图 + 窗内自产块
+            // 整批作废 ⇒ slab 释放),然后把原错上抛。abort 自身失败不覆盖原错
+            // (记可见警告);night 若 `graph_end` 已把窗收掉,abort 会结构化拒
+            // ⇒ 同样只记警告。
+            (Some(e), _) => {
+                self.abort_window().await;
+                Err(e)
+            }
+            (None, Err(e)) => {
+                self.abort_window().await;
+                Err(ModelError::Msg(format!("capture: graph_end 失败 {e}")))
+            }
         }
+    }
+
+    /// 捕获窗作废(abort)+ 说明性日志。**幂等**:若窗已被 `graph_end` 收掉,
+    /// face 会结构化拒 ⇒ 这里只记可见警告,不掩盖既有错。
+    async fn abort_window(&mut self) {
+        if let Err(e) = self.face.graph_abort().await {
+            owl_shared::log_warn!("graph-plan", "捕获窗作废失败(窗可能已收;slab 或留尸): {e}");
+        }
+    }
+
+    /// **失败路径清理**(`plan()` 捕获失败时调用):作废窗 + 归还输入槽。
+    ///
+    /// 输入槽是 `plan()` 期 `htod` 的 `Owned` 块,由图引用租约保护;捕获失败
+    /// ⇒ 没有图 ⇒ 租约未生效(`adopt` 未跑)⇒ 可安全归还,否则每次失败捕获都
+    /// 漏一批槽到进程结束。
+    async fn abandon(&mut self) {
+        self.abort_window().await;
+        let ids: Vec<u64> = self.inputs.iter().map(|s| s.block.id).collect();
+        if !ids.is_empty() {
+            if let Err(e) = self.face.free(&ids).await {
+                owl_shared::log_warn!("graph-plan", "失败路径归还输入槽失败(泄漏到进程结束): {e}");
+            }
+        }
+        self.inputs.clear();
+        self.last.clear();
+    }
+
+    /// **单图退休**(LRU 驱逐 / plan 生命期收尾的底层):销毁图 + 归还输入槽
+    /// + 丢弃输出句柄。次序**不可颠倒**(图先、槽后):图在时槽被租约钉住,
+    /// 先 free 只会被 `free_blocks` 响亮拒收。
+    pub async fn close(&mut self) -> Result<()> {
+        if let Mode::Captured { graph } = self.mode {
+            self.face.graph_destroy(graph).await?;
+            self.mode = Mode::Eager;
+        }
+        let ids: Vec<u64> = self.inputs.iter().map(|s| s.block.id).collect();
+        self.inputs.clear();
+        self.last.clear();
+        if !ids.is_empty() {
+            self.face.free(&ids).await?;
+        }
+        Ok(())
     }
 }
 
@@ -548,6 +676,9 @@ mod tests {
             capture: false,
             slab_fixed: false,
             debug_probe: false,
+            // 本族不加锚定回收(plain 口径:窗内块常驻 —— 历史行为零变化)
+            reclaim_capture: false,
+            warmup: true,
         };
         let (mut sess, outcome) = GraphPlan::plan(
             face,
@@ -574,6 +705,63 @@ mod tests {
         assert_eq!(s, vec![4.0; 4]);
     }
 
+    /// `warmup:false` 必须配固定 slab 档(否则容量无来源)⇒ **结构化拒**,
+    /// 不给"猜一个 64MiB"的兜底(踩了会在捕获窗 OOM,窗脏只能 abort)。
+    #[tokio::test]
+    async fn warmup_false_without_fixed_slab_is_rejected() {
+        let face = CpuFace::new();
+        let desc = GraphPlanDesc {
+            inputs: vec![InputSlot::f32("x", 4)],
+            outputs: vec![OutputSlot::f32("s", &[1, 4])],
+            capture: true,
+            warmup: false,
+            ..Default::default()
+        };
+        let r = GraphPlan::plan(face, owl_models::env::EnvProvider::default(), desc, |sc: &PlanCtx| {
+            let x = sc.input("x")?;
+            sc.output("s", &x)
+        })
+        .await;
+        let e = match r {
+            Err(e) => e,
+            Ok(_) => panic!("warmup:false + slab_fixed:false 必须拒"),
+        };
+        assert!(
+            format!("{e}").contains("warmup:false"),
+            "拒语应指明病因,实得 {e}"
+        );
+    }
+
+    /// `close()`(单图退休原语):eager 档 = 归还输入槽 + 幂等(第二次无槽可还
+    /// 仍是 Ok)。捕获档的图销毁面由 cuda 侧 `gpu_server` 步 11 覆盖。
+    #[tokio::test]
+    async fn close_is_idempotent_and_frees_slots() {
+        let w = ones_w();
+        let face = CpuFace::new();
+        let desc = GraphPlanDesc {
+            inputs: vec![InputSlot::f32("x", 4), InputSlot::f32("y", 4)],
+            outputs: vec![OutputSlot::f32("s", &[1, 4])],
+            capture: false,
+            ..Default::default()
+        };
+        let (mut sess, outcome) = GraphPlan::plan(
+            face,
+            owl_models::env::EnvProvider::default(),
+            desc,
+            move |sc: &PlanCtx| -> Result<()> {
+                let x = sc.input("x")?;
+                let y = sc.input("y")?;
+                sc.output("s", &x.add(&y).matmul(&w))?;
+                Ok(())
+            },
+        )
+        .await
+        .expect("plan");
+        assert!(matches!(outcome, PlanOutcome::EagerFallback { .. }));
+        sess.close().await.expect("close 应成功");
+        sess.close().await.expect("重复 close 幂等");
+    }
+
     #[tokio::test]
     async fn warmup_catches_declaration_poison() {
         // 闭包带形状违约([4] + [3] → 毒):plan 边界暴露,不污染业务步
@@ -584,6 +772,9 @@ mod tests {
             capture: true,
             slab_fixed: false,
             debug_probe: false,
+            // 本族不加锚定回收(plain 口径:窗内块常驻 —— 历史行为零变化)
+            reclaim_capture: false,
+            warmup: true,
         };
         let r = GraphPlan::plan(face, owl_models::env::EnvProvider::default(), desc, |sc: &PlanCtx| -> Result<()> {
             let a = sc.input("a")?;
@@ -615,6 +806,9 @@ mod tests {
             capture: true,
             slab_fixed: false,
             debug_probe: false,
+            // 本族不加锚定回收(plain 口径:窗内块常驻 —— 历史行为零变化)
+            reclaim_capture: false,
+            warmup: true,
         };
         let (mut sess, outcome) = GraphPlan::plan(
             face,
@@ -665,6 +859,9 @@ mod tests {
             capture,
             slab_fixed: false,
             debug_probe: false,
+            // 本族不加锚定回收(plain 口径:窗内块常驻 —— 历史行为零变化)
+            reclaim_capture: false,
+            warmup: true,
         };
 
         // eager 锚
@@ -703,6 +900,88 @@ mod tests {
             assert_eq!(a.len(), b.len());
             for (i, (u, v)) in a.iter().zip(&b).enumerate() {
                 assert!((u - v).abs() < 1e-5, "step{step}[{i}]: eager {u} vs 回放 {v}");
+            }
+        }
+    }
+
+    /// **M1 真机门**:`reclaim_capture = true`(窗内 scoped 回收 + slab arena
+    /// 复用 + 影子探针定尺)下,捕获/回放仍逐位等于 eager。
+    ///
+    /// 为什么必须单独测:reclaim 改的是**捕获窗内的块回收** —— 若活性判据错
+    /// (把还被图节点引用的块归还并复用),回放会读到被别人覆盖的内存 ⇒
+    /// **静默错值**。本测就是这个雷的守门(与 gpu_capture_matches_eager 同形,
+    /// 只差 `reclaim_capture` 一位)。
+    #[tokio::test]
+    async fn gpu_capture_reclaim_matches_eager() {
+        let Some(ordinal) = owl_shared::env_reader::parse::<usize>("OWL_TEST_DEVICE") else {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return;
+        };
+        let f_eager = owl_cuda::GpuClient::spawn(owl_cuda::DeviceSelector::Ordinal(ordinal))
+            .expect("gpu boot(eager 锚)");
+        let mut f_cap = owl_cuda::GpuClient::spawn(owl_cuda::DeviceSelector::Ordinal(ordinal))
+            .expect("gpu boot(捕获线)");
+
+        let w_bytes: Vec<u8> = (0..16)
+            .flat_map(|i| ((i % 5) as f32 - 2.0).to_le_bytes())
+            .collect();
+        let w_b = eval_ops(TensorOps::from_host(Dtype::F32, vec![4, 4], &w_bytes).step(), &mut f_cap)
+            .await
+            .expect("W 块化");
+        let w_cap = TensorOps::of_block(w_b.id, Dtype::F32, vec![4, 4]);
+        let w_eager = TensorOps::from_host(Dtype::F32, vec![4, 4], &w_bytes);
+
+        let desc = |capture: bool| GraphPlanDesc {
+            inputs: vec![InputSlot::f32("x", 4), InputSlot::f32("y", 4)],
+            outputs: vec![OutputSlot::f32("s", &[1, 4])],
+            capture,
+            slab_fixed: false,
+            debug_probe: false,
+            reclaim_capture: true, // ← 唯一差别
+            warmup: true,
+        };
+
+        let w1 = w_eager.clone();
+        let (mut s_eager, _) = GraphPlan::plan(
+            f_eager,
+            owl_models::env::EnvProvider::default(),
+            desc(false),
+            move |sc: &PlanCtx| -> Result<()> {
+                let x = sc.input("x")?;
+                let y = sc.input("y")?;
+                sc.output("s", &x.add(&y).matmul(&w1))
+            },
+        )
+        .await
+        .expect("eager plan");
+
+        let (mut s_cap, o_c) = GraphPlan::plan(
+            f_cap,
+            owl_models::env::EnvProvider::default(),
+            desc(true),
+            move |sc: &PlanCtx| -> Result<()> {
+                let x = sc.input("x")?;
+                let y = sc.input("y")?;
+                sc.output("s", &x.add(&y).matmul(&w_cap))
+            },
+        )
+        .await
+        .expect("capture plan");
+        assert!(matches!(o_c, PlanOutcome::Captured), "锚回收档捕获应成功,得 {o_c:?}");
+
+        for (step, (x, y)) in [
+            (&[1.0f32, 2.0, 3.0, 4.0], &[0.5f32, -1.0, 2.0, 0.25]),
+            (&[-2.0f32, 0.0, 7.0, 1.5], &[1.0f32; 4]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            s_eager.step(&[("x", x), ("y", y)]).await.expect("eager step");
+            s_cap.step(&[("x", x), ("y", y)]).await.expect("cap step");
+            let a = s_eager.read_output_f32("s").await.expect("read eager");
+            let b = s_cap.read_output_f32("s").await.expect("read cap");
+            for (i, (u, v)) in a.iter().zip(&b).enumerate() {
+                assert!((u - v).abs() < 1e-5, "reclaim step{step}[{i}]: eager {u} vs 回放 {v}");
             }
         }
     }

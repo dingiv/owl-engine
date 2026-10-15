@@ -55,6 +55,18 @@ static uint32_t owl_fi_kv_bytes() {
   if (e != nullptr && e[0] == '2') return 2;
   return 1;
 }
+/// **图档 plan**(P-5 前置;env `FI_CUDA_GRAPH`)。开启后 plan 按"图模式"定瓦:
+/// `cta_tile_q` 取最坏情形、`padded_batch_size = max(2·SM/hkv, tiles)` ⇒
+/// **尾部 CTA 恒存在**(小桶时远多于真 tile)⇒ 必须配 mask(见 `block_valid_mask`)。
+static bool owl_fi_cuda_graph() {
+  const char* e = getenv("FI_CUDA_GRAPH");
+  return e != nullptr && e[0] != '\0' && e[0] != '0';
+}
+/// mask 开关(诊断/取证;`FI_NO_MASK=1` 关掉 mask —— 用来量"白跑的尾部 CTA")
+static bool owl_fi_no_mask() {
+  const char* e = getenv("FI_NO_MASK");
+  return e != nullptr && e[0] != '\0' && e[0] != '0';
+}
 static bool owl_fi_debug() {
   const char* e = getenv("FI_DEBUG");
   return e != nullptr && e[0] != '\0' && e[0] != '0';
@@ -108,7 +120,7 @@ static int owl_fi_run_impl(
     const int64_t* plan15, void* int_ws, size_t int_ws_size, void* float_ws,
     size_t float_ws_size, int32_t batch_size, int32_t num_qo_heads, int32_t num_kv_heads,
     int32_t head_dim, int32_t page_size, int32_t total_num_rows, float sm_scale,
-    cudaStream_t stream, const char* tag) {
+    const void* block_valid_mask, cudaStream_t stream, const char* tag) {
   using ParamsType = BatchPrefillPagedParams<OwlQ, DTypeKV, OwlOut, OwlId>;
 
   // plan blob(15×int64;字段序 = PrefillPlanInfo,两端同源)
@@ -152,7 +164,13 @@ static int owl_fi_run_impl(
   params.kv_chunk_size_ptr =
       GetPtrFromBaseOffset<OwlId>(int_ws, plan_info.kv_chunk_size_ptr_offset);
   params.merge_indptr = nullptr;
-  params.block_valid_mask = nullptr;
+  // **P-5:尾部 CTA 掩码**(2026-10-15)。图档 plan 的 `padded_batch_size` 可为
+  // `max(2·SM/hkv, tiles)` ⇒ 尾部 CTA 远超真 tile 数;不掩码时它们读 plan 表
+  // 的**残留表项**(行为取决于上一次 plan 写了什么 —— 静默,不是不变量)。
+  // 掩码内容(`i < tiles`)由 Rust 侧按 plan15 算好并在**窗外**上传一次
+  // (桶级静态;`q_cu=[0,t_pad]` 常量 ⇒ mask 不随 chunk 变)。
+  // `FI_NO_MASK=1` = 取证档(量白跑成本;真行仍不应被写坏 —— 见探针)。
+  params.block_valid_mask = owl_fi_no_mask() ? nullptr : (bool*)block_valid_mask;
   params.max_total_num_rows = (uint32_t)plan_info.total_num_rows;
   params.total_num_rows = nullptr;  // 非 cuda-graph 档
   params.padded_batch_size = (uint32_t)plan_info.padded_batch_size;
@@ -170,10 +188,12 @@ static int owl_fi_run_impl(
 
   if (owl_fi_debug()) {
     fprintf(stderr,
-            "[owl-fi][%s] hd=%d page=%d T=%d hq=%d hkv=%d split=%d cta=%lld padded=%lld\n", tag,
-            head_dim, page_size, total_num_rows, num_qo_heads, num_kv_heads,
+            "[owl-fi][%s] hd=%d page=%d T=%d hq=%d hkv=%d split=%d cta=%lld padded=%lld "
+            "mask=%s graph=%d\n",
+            tag, head_dim, page_size, total_num_rows, num_qo_heads, num_kv_heads,
             (int)plan_info.split_kv, (long long)plan_info.cta_tile_q,
-            (long long)plan_info.padded_batch_size);
+            (long long)plan_info.padded_batch_size,
+            params.block_valid_mask ? "on" : "off", (int)owl_fi_cuda_graph());
   }
   return (int)owl_fi_dispatch(params, tmp_v, tmp_s, (uint32_t)plan_info.cta_tile_q, head_dim,
                               /*same_kv_strides=*/true, stream);

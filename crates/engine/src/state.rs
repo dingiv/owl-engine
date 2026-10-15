@@ -153,6 +153,13 @@ pub(crate) struct StatePool {
     pub(crate) dflash_kvs: Option<Vec<KvBlocks>>,
     /// MTP 链持久块表槽(E5-M5 propose 图烘焙;[1, nb] f32,每轮重写)
     pub(crate) bt_mtp: Option<Bytes>,
+    /// **FlashInfer 表件持久槽**(P-3,2026-10-15;设计 §4.1c P-3):
+    /// `q_cu/indices/indptr/last_len` 四件在 boot 一次分配、每 chunk **原位写**
+    /// (`write_blocks_f32`,单次批量命令 + 回执即落地)。
+    /// 为什么必须持久:①图(M2b)会把它们的**指针**烘进图 ⇒ 地址必须恒定;
+    /// ②eager 路旧实现每 chunk `eval_ops(from_host)` × 4 = **4 次往返同步**,
+    /// 现 1 次批量写 ⇒ 少 3 次往返。None = 非 FI 档(`pool.fi_face = false`)。
+    pub(crate) fi_tables: Option<FiTableBlocks>,
     /// paged 池几何(页;legacy 模式 page = 容量,nb = 1)
     pub(crate) page: usize,
     pub(crate) nb: usize,
@@ -160,6 +167,22 @@ pub(crate) struct StatePool {
     x: usize,
     /// 池几何输入(spec 提取;prefill 叶子构造/执行器 dtype 分支用)
     pub(crate) dims: ModelDims,
+}
+
+/// FlashInfer 表件持久槽(P-3;见 [`StatePool::fi_tables`])。
+/// `Clone` = 4 个块句柄的复制(零拷贝;调用方拿去持有时用)
+#[derive(Clone)]
+pub(crate) struct FiTableBlocks {
+    /// `[0, T]`(u32 位型,f32 账)
+    pub q_cu: Bytes,
+    /// 本会话页链(容量 = 池页数;每 chunk 写前 `nb_used` 项)
+    pub indices: Bytes,
+    /// `[0, nb_used]`
+    pub indptr: Bytes,
+    /// 末页有效 token 数
+    pub last_len: Bytes,
+    /// 容量(池页数,越界即结构性拒 —— 写前由调用方比对)
+    pub nb_cap: usize,
 }
 
 impl StatePool {
@@ -301,6 +324,19 @@ impl StatePool {
             eval_ops(TensorOps::zeros(Dtype::F32, vec![1, nb]).step(), face).await?
         } else {
             eval_ops(TensorOps::zeros(Dtype::F32, vec![1]).step(), face).await?
+        };
+        // FI 表件持久槽(P-3):与 bt 同族(paged + FI 档一次分配,内容每 chunk 重写)
+        let fi_face = plan.fi_quant.is_some();
+        let fi_tables = if paged && fi_face {
+            Some(FiTableBlocks {
+                q_cu: face.alloc(Dtype::F32, 2).await?,
+                indices: face.alloc(Dtype::F32, nb).await?,
+                indptr: face.alloc(Dtype::F32, 2).await?,
+                last_len: face.alloc(Dtype::F32, 1).await?,
+                nb_cap: nb,
+            })
+        } else {
+            None
         };
         // MTP 链持久块表槽(E5-M5;propose 图烘焙;mtp 模式)
         let bt_mtp = if mtp && paged {
@@ -450,7 +486,7 @@ impl StatePool {
         } else {
             None
         };
-        Ok(StatePool { gdn_slots, dump_all, kvs, fi_face: plan.fi_quant.is_some(), verify_attn_v2, xqa,
+        Ok(StatePool { gdn_slots, dump_all, kvs, fi_face, fi_tables, verify_attn_v2, xqa,
             kv_fp8, dflash_fp8, gdns, snaps, snap_tick: 0, bt, bt_mtp, spec_snap, mtp_kvs, dflash_kvs, attn_v2, page, nb, paged, x, dims })
     }
 
@@ -654,6 +690,11 @@ impl StatePool {
                 )
             })
             .collect()
+    }
+
+    /// FI 表件持久槽(P-3;None = 非 FI 档)
+    pub(crate) fn fi_table_blocks(&self) -> Option<&FiTableBlocks> {
+        self.fi_tables.as_ref()
     }
 
     /// FlashInfer K/V 叶子(统一契约 P3:影子池删除,直读主池 kNHD;
