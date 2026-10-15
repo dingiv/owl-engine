@@ -96,7 +96,7 @@ pub(crate) struct PoolPlan {
     /// 草稿池量化
     pub draft_kv: owl_models::env::KvQuant,
     /// 投机形态(快照/MTP 链/草稿池三件的唯一事实来源)
-    pub spec_mode: crate::running::SpecMode,
+    pub spec_mode: crate::spec_runtime::SpecMode,
     /// 投机深度(verify 块 = depth+1;verify v2 scratch 定形用;0 = off)
     pub spec_depth: usize,
     /// XQA verify 臂(SPEC_DEC=1 `M_TILESIZE=32`)
@@ -178,9 +178,9 @@ impl StatePool {
         // 调用点自洽)
         let kv_fp8 = plan.kv == owl_models::env::KvQuant::Fp8E4M3;
         let dflash_fp8 = plan.draft_kv == owl_models::env::KvQuant::Fp8E4M3;
-        let spec = plan.spec_mode != crate::running::SpecMode::Off;
-        let mtp = plan.spec_mode == crate::running::SpecMode::Mtp;
-        let dflash = plan.spec_mode == crate::running::SpecMode::DFlash2;
+        let spec = plan.spec_mode != crate::spec_runtime::SpecMode::Off;
+        let mtp = plan.spec_mode == crate::spec_runtime::SpecMode::Mtp;
+        let dflash = plan.spec_mode == crate::spec_runtime::SpecMode::DFlash2;
         let gdn_slots = plan.gdn_slots;
         let snap_max = plan.snap_max;
         let dump_all = plan.dump_all;

@@ -9,11 +9,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 历史样本仍可全量查询 —— perf-framework.md §三)
         owl_shared::metrics::mark_epoch();
         if b.reset_gdn {
-            let face = self.session.face_mut();
+            let face = self.graphs.session.face_mut();
             self.pool.reset_gdn(face, b.gdn_slot).await?;
         } else if let Some(key) = b.restore_key {
             // 前缀命中:恢复边界快照到会话格(免重灌;GDN 态对齐)
-            let face = self.session.face_mut();
+            let face = self.graphs.session.face_mut();
             self.pool.restore_snap(face, b.gdn_slot, key).await?;
         }
         self.write_bt(b.session_id).await
@@ -28,7 +28,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         is_last: bool,
     ) -> Result<TurnEvent> {
         let (turn_id, sid) = {
-            let act = self.active.as_ref().expect("活跃");
+            let act = self.turns.active.as_ref().expect("活跃");
             (act.id, act.session_id)
         };
         // 调试门:prefill 块粒度(见 owl_shared::stepgate;`--step-gate` 控制)
@@ -39,10 +39,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if self.pool.paged && new_fed.is_multiple_of(self.pool.page) {
             self.capture_gdn_snap(sid, new_fed).await?;
         }
-        self.active.as_mut().expect("活跃").fed += chunk_ids.len();
+        self.turns.active.as_mut().expect("活跃").fed += chunk_ids.len();
         if !is_last {
             // 块落定,无文本产出 —— 不谎报 Idle
-            let act = self.active.as_ref().expect("活跃");
+            let act = self.turns.active.as_ref().expect("活跃");
             return Ok(TurnEvent::Prefill {
                 turn: turn_id,
                 fed: act.fed,
@@ -63,7 +63,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         gdn_slot: usize,
         grew: bool,
     ) -> Result<TurnEvent> {
-        let sid = self.active.as_ref().expect("活跃").session_id;
+        let sid = self.turns.active.as_ref().expect("活跃").session_id;
         // 调试门:decode 步粒度
         owl_shared::step_gate!("engine.decode").await;
         let prof = self.probes.step_profile;
@@ -84,18 +84,18 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             ("kv_slot", vec![kv_slot as f32]),
             ("gdn_slot", vec![gdn_slot as f32]),
         ];
-        if self.session.has_input("xqa_seq") {
+        if self.graphs.session.has_input("xqa_seq") {
             step_slots.push(("xqa_seq", vec![f32::from_bits((pos + 1) as u32)]));
-            let n = self.session.input_len("xqa_sem").unwrap_or(0);
+            let n = self.graphs.session.input_len("xqa_sem").unwrap_or(0);
             step_slots.push(("xqa_sem", vec![0.0; n]));
             // XQA 页表 = 本会话真页链(不喂 = 图里恒等链 = 读到别家 KV;§7.6)
-            if self.session.has_input("xqa_pt") {
+            if self.graphs.session.has_input("xqa_pt") {
                 step_slots.push(("xqa_pt", self.xqa_pt_of(sid)));
             }
         }
         let step_refs: Vec<(&str, &[f32])> =
             step_slots.iter().map(|(n, v)| (*n, v.as_slice())).collect();
-        self.session.step(&step_refs).await?;
+        self.graphs.session.step(&step_refs).await?;
         if prof {
             eprintln!("[step-prof] pos={pos} fill+launch={:?} wall={}", t0.unwrap().elapsed(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100000);
         }
@@ -103,17 +103,17 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let total = t0.unwrap().elapsed();
             eprintln!("[step-prof] pos={pos} step-total={total:?} wall2={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100000);
         }
-        self.active.as_mut().expect("活跃").fed += 1;
+        self.turns.active.as_mut().expect("活跃").fed += 1;
         // E2c:decode 跨页边界 → 快照拍摄(同流保序,先拍再采样)
         {
-            let act = self.active.as_ref().expect("活跃");
+            let act = self.turns.active.as_ref().expect("活跃");
             if self.pool.paged && act.fed.is_multiple_of(self.pool.page) {
                 self.capture_gdn_snap(act.session_id, act.fed).await?;
             }
         }
         // D1 取证:GDN 状态格画像(OWL_GDN_DUMP;前 6 步,首末层 conv_v/rec)
         if self.probes.gdn_dump {
-            let step = self.active.as_ref().expect("活跃").out.len() as u64;
+            let step = self.turns.active.as_ref().expect("活跃").out.len() as u64;
             self.probe_gdn_dump(gdn_slot, step).await?;
         }
         // E3 设备采样:4B token 回读(旧 = 600KB logits dtoh + host argmax)。
@@ -125,14 +125,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 采样开/关(AGT-06):**请求带采样参数则以请求为准**
         // (`temperature=0` = 本 turn 贪心);未带 = 引擎 knobs(flavor 语义)。
         // 旧行为不变(GDN 恒等门类测试不带请求参数)。
-        let eff_sampler = self.active.as_ref().expect("活跃").sampler;
-        let sampler_on = self.active.as_ref().expect("活跃").sampler_on;
+        let eff_sampler = self.turns.active.as_ref().expect("活跃").sampler;
+        let sampler_on = self.turns.active.as_ref().expect("活跃").sampler_on;
         let nt = if sampler_on {
-            let mut logits = self.session.read_output_f32("logits").await?;
+            let mut logits = self.graphs.session.read_output_f32("logits").await?;
             // 诊断:分布形状(绝对尺度 / top1-top2 gap / 候选词面)——
             // 复读病理定位的仪表盘(OWL_DEBUG 门控,前 16 步)
             let (turn_id, step) = {
-                let act = self.active.as_ref().expect("活跃");
+                let act = self.turns.active.as_ref().expect("活跃");
                 (act.id, act.out.len() as u64)
             };
             // 诊断:KV 池回读(取证图内 K0 写是否落盘)—— 槽 2 = prompt
@@ -146,7 +146,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 let esz = if fp8 { 1usize } else { 2usize };
                 let kv0 = &self.pool.kvs[0].k_cache;
                 let mut whole = vec![0u8; kv0.1 * esz];
-                let face = self.session.face_mut();
+                let face = self.graphs.session.face_mut();
                 face.dtoh(&kv0.0, &mut whole).await?;
                 let (hkv, hd) = (self.pool.dims.hkv, self.pool.dims.hd);
                 let _page = self.pool.page;
@@ -207,8 +207,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
             // RNG seed = turn id ⊕ 步数(同 turn 重放确定性,跨 turn 独立);
             // 请求给了 `seed` ⇒ 以它为基(AGT-06)
-            let seed_base = self
-                .active
+            let seed_base = self.turns.active
                 .as_ref()
                 .expect("活跃")
                 .seed
@@ -216,7 +215,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let mut rng = seed_base ^ step.wrapping_mul(0xBF58476D1CE4E5B9);
             // 惩罚集 = prompt 尾(64)+ 已生成(反循环;llama.cpp 同语义)
             let history: Vec<u32> = {
-                let act = self.active.as_ref().expect("活跃");
+                let act = self.turns.active.as_ref().expect("活跃");
                 let tail = act.prompt_ids.len().saturating_sub(64);
                 act.prompt_ids[tail..]
                     .iter()
@@ -234,7 +233,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
             nt
         } else if self.env.diag.host_argmax {
-            let logits = self.session.read_output_f32("logits").await?;
+            let logits = self.graphs.session.read_output_f32("logits").await?;
             logits.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |a, (i, &v)| {
                 if v > a.1 { (i, v) } else { a }
             })
@@ -244,11 +243,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // 采样分支同格式 —— 基线/融合 A/B 对比用)
             if self.probes.debug {
                 let (turn_id, step) = {
-                    let act = self.active.as_ref().expect("活跃");
+                    let act = self.turns.active.as_ref().expect("活跃");
                     (act.id, act.out.len() as u64)
                 };
                 if step < 16 {
-                    let logits = self.session.read_output_f32("logits").await?;
+                    let logits = self.graphs.session.read_output_f32("logits").await?;
                     let mut top: Vec<(f32, u32)> = logits
                         .iter()
                         .enumerate()
@@ -267,7 +266,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     eprintln!("[logits-dump] t{turn_id} s{step}: {}", pretty.join(" | "));
                 }
             }
-            let tok_f = self.session.read_output_f32("token").await?;
+            let tok_f = self.graphs.session.read_output_f32("token").await?;
             tok_f[0] as u32
         };
         if prof {
@@ -276,17 +275,17 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         mrec("decode.step", t_step.elapsed());
         // B4 降级期草稿同步(§6.24 方案 A):decode 图 taps → 1 行 encode。
         // 毒化带 ≤8 token 即被覆写,探测重入零损;成本 ≈ 0.5ms/tok(2%)
-        if self.tspec_ref().spec_degraded && self.dflash_tap_count > 0 {
+        if self.tspec_ref().spec_degraded && self.spec.dflash_tap_count > 0 {
             // 降级步分相(2026-10-12 探针完善):sync encode 单独计时 ——
             // 9.3 t/s 案的 80ms/步嫌疑犯,一屏定谳
             let t_syn = std::time::Instant::now();
             let dtype = self.pool.dims.dtype;
             let hidden = self.pool.dims.hidden;
-            let taps: Vec<TensorOps> = (0..self.dflash_tap_count)
-                .filter_map(|i| self.session.output_block(&format!("tap{i}")))
+            let taps: Vec<TensorOps> = (0..self.spec.dflash_tap_count)
+                .filter_map(|i| self.graphs.session.output_block(&format!("tap{i}")))
                 .map(|b| TensorOps::of_block(b.id, dtype, vec![1, hidden]))
                 .collect();
-            if taps.len() == self.dflash_tap_count {
+            if taps.len() == self.spec.dflash_tap_count {
                 self.prefill_dflash_encode(&taps, pos).await?;
             }
             mrec("decode.sync", t_syn.elapsed());
@@ -326,7 +325,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             return Ok(());
         }
         let lines = {
-            let face = self.session.face_mut();
+            let face = self.graphs.session.face_mut();
             self.pool.gdn_slot_profile(face, gdn_slot, step, self.cfg.knobs.gdn_dump_all).await?
         };
         for l in lines {
@@ -339,12 +338,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// 采样 + 事件产出(Greedy;E3 设备 argmax,token id 直入)。
     /// eos 命中或预算尽 → Completed;否则 Token(delta = 解码文本增量)。
     pub(crate) async fn sample_and_emit(&mut self, nt: u32) -> Result<TurnEvent> {
-        let turn_id = self.active.as_ref().expect("active 已保证").id;
+        let turn_id = self.turns.active.as_ref().expect("active 已保证").id;
         {
             // 崩坏排查打点:首 token / EOS 事实(decode 与 spec 两路汇合)
             let bs = self.boot_seq;
-            let first = self
-                .active
+            let first = self.turns.active
                 .as_ref()
                 .map(|a| a.out.is_empty())
                 .unwrap_or(false);
@@ -356,12 +354,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
         }
         // ignore_eos(OpenAI 兼容;测速口径):EOS 只记账不终止
-        let ignore_eos = self.active.as_ref().map(|a| a.ignore_eos).unwrap_or(false);
+        let ignore_eos = self.turns.active.as_ref().map(|a| a.ignore_eos).unwrap_or(false);
         if self.tok.is_eos(nt) && !ignore_eos {
             return self.complete(crate::turn::FinishReason::Stop).await;
         }
         let budget_done = {
-            let act = self.active.as_mut().expect("active 已保证");
+            let act = self.turns.active.as_mut().expect("active 已保证");
             act.out.push(nt);
             // `decoded` 由全量重解差分维护(delta 本步统一从 `emitted` 切片取,
             // 以便 stop 尾缓冲能回吐);返回值丢弃是有意的
@@ -375,7 +373,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         //    (否则半截停止串已流给客户端,命中时收不回来)。
         // 空 stop 列表 = 零额外开销(`safe_end` 直接返回全长)。
         let (delta, stop_hit) = {
-            let act = self.active.as_mut().expect("active 已保证");
+            let act = self.turns.active.as_mut().expect("active 已保证");
             let hit = if act.stop.is_empty() {
                 None
             } else {
@@ -404,7 +402,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             if delta.is_empty() {
                 return Ok(done_ev);
             }
-            self.pending_events.push_back(done_ev);
+            self.turns.pending_events.push_back(done_ev);
             return Ok(TurnEvent::Token { turn: turn_id, delta });
         }
         if budget_done {
@@ -413,7 +411,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // 修:实测 max_tokens=64 时 usage 报 63)。事件序 = Token →
             // Completed(pending 队列先出,见 running::pump)
             let done_ev = self.complete(crate::turn::FinishReason::Length).await?;
-            self.pending_events.push_back(done_ev);
+            self.turns.pending_events.push_back(done_ev);
             return Ok(TurnEvent::Token { turn: turn_id, delta });
         }
         Ok(TurnEvent::Token { turn: turn_id, delta })

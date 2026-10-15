@@ -285,7 +285,7 @@ async fn actor_main(
     .await;
     let mut running = match built {
         Ok(r) => {
-            let _ = ready.send(Ok(format!("{:?}", r.capture_outcome)));
+            let _ = ready.send(Ok(format!("{:?}", r.capture_outcome())));
             r
         }
         Err(e) => {

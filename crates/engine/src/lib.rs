@@ -41,10 +41,12 @@ pub mod turn;
 // LoadedModel, ModelLoader, RunningEngine})
 pub(crate) mod engine;
 pub(crate) mod exec;
+pub(crate) mod graph_fleet;
 pub(crate) mod loader;
 pub(crate) mod running;
 pub(crate) mod sampler;
 pub(crate) mod scheduler;
+pub(crate) mod spec_runtime;
 pub(crate) mod state;
 // 测试分层(test-architecture.md):单元测试走 cfg(test);
 // e2e 场景面(源文件里的 pub async fn,无 #[test])走 feature `e2e`,

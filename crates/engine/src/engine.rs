@@ -298,52 +298,52 @@ impl<D: DeviceClient + 'static> Engine<D> {
         let spec_depth_raw = self.cfg.knobs.draft.depth;
         let dflash2_dir = self.cfg.knobs.draft.dflash2_dir.clone();
         let spec_mode = if spec_depth_raw == 0 {
-            crate::running::SpecMode::Off
+            crate::spec_runtime::SpecMode::Off
         } else if dflash2_dir.is_some() {
-            crate::running::SpecMode::DFlash2
+            crate::spec_runtime::SpecMode::DFlash2
         } else if loaded.mtp_dir.is_some() {
-            crate::running::SpecMode::Mtp
+            crate::spec_runtime::SpecMode::Mtp
         } else if self.cfg.knobs.draft.dumb {
-            crate::running::SpecMode::Dumb
+            crate::spec_runtime::SpecMode::Dumb
         } else {
             owl_shared::log_info!("boot", "OWL_SPEC_DEPTH>0 但无草稿器(非 mtp/dflash2 检查点)→ C7 回落 DecodeBatch");
-            crate::running::SpecMode::Off
+            crate::spec_runtime::SpecMode::Off
         };
-        let spec_depth = if spec_mode == crate::running::SpecMode::Off {
+        let spec_depth = if spec_mode == crate::spec_runtime::SpecMode::Off {
             0
-        } else if spec_mode == crate::running::SpecMode::DFlash2 {
+        } else if spec_mode == crate::spec_runtime::SpecMode::DFlash2 {
             // DFlash2:block_size 8 = 1 锚 + 7 草稿(检查点家族定形)
             spec_depth_raw.min(7)
         } else {
             spec_depth_raw.min(3)
         };
-        if spec_mode != crate::running::SpecMode::Off {
+        if spec_mode != crate::spec_runtime::SpecMode::Off {
             owl_shared::log_info!("boot", "spec 模式 = {:?} depth={spec_depth}(注:spec 轮恒 greedy,采样 parity 挂 D4 device accept)",
                 spec_mode
             );
         }
         // 草稿器装载(C7;embed/lm_head 均共享 target)
         let drafter = match spec_mode {
-            crate::running::SpecMode::Mtp => {
+            crate::spec_runtime::SpecMode::Mtp => {
                 let dir = loaded.mtp_dir.as_ref().expect("mtp_dir");
                 let (mtp, _) = owl_models::specs::qwen35::load_27b_mtp(dir, &mut self.face).await?;
                 owl_shared::log_info!("boot", "MTP 草稿头装载(spec depth={spec_depth})");
-                Some(crate::running::Drafter::Mtp(std::sync::Arc::new(mtp)))
+                Some(crate::spec_runtime::Drafter::Mtp(std::sync::Arc::new(mtp)))
             }
-            crate::running::SpecMode::DFlash2 => {
+            crate::spec_runtime::SpecMode::DFlash2 => {
                 let dir = dflash2_dir.as_ref().expect("dflash2_dir");
                 // B6 偷显存:草稿池 e4m3(可配;默认关 —— AL 有损需 A/B)
                 let draft_kv_fp8 = self.cfg.knobs.draft.kv_quant == owl_models::env::KvQuant::Fp8E4M3;
                 let t_draft = std::time::Instant::now();
                 let (d2, _) = owl_models::specs::qwen35::load_27b_dflash2(std::path::Path::new(dir), &mut self.face, draft_kv_fp8).await?;
                 owl_shared::log_info!("boot", "DFlash2 草稿装载(depth={spec_depth};1.92B BF16 激活,sglang 对齐) {:.2}s", t_draft.elapsed().as_secs_f32());
-                Some(crate::running::Drafter::DFlash2(std::sync::Arc::new(d2)))
+                Some(crate::spec_runtime::Drafter::DFlash2(std::sync::Arc::new(d2)))
             }
             _ => None,
         };
         // DFlash2 草稿 rope(θ 1e7,rotary 全维 128;z-lab 检查点家族)
         let draft_rope = match &drafter {
-            Some(crate::running::Drafter::DFlash2(_)) => {
+            Some(crate::spec_runtime::Drafter::DFlash2(_)) => {
                 let dr = owl_models::layers::rope::Rope::new(262_144, 128, 128, 1.0e7)?;
                 {
                     let ctx = owl_models::module::LoaderCtx {
@@ -406,7 +406,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
         // MTP 链页账房(E5-M2b):独立页池同几何;无前缀缓存。
         // 非 mtp 模式 0 块 —— 误用 = 结构化报错(池耗尽语义)。
         let mut blocks_mtp = BlockManager::new(
-            if spec_mode == crate::running::SpecMode::Mtp { pool.nb } else { 0 },
+            if spec_mode == crate::spec_runtime::SpecMode::Mtp { pool.nb } else { 0 },
             pool.page,
         );
         blocks_mtp.debug = self.cfg.knobs.probes.debug;
@@ -436,7 +436,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
         // B4:decode 图 taps(DFlash2 降级期逐 token 草稿同步的取数面;
         // OWL_DFLASH_NOTAPS 同款逃生开关)。tapped_hidden 零额外计算,
         // 仅多 5 个 [1,hidden] 输出槽写;非 dflash 走原 forward(拓扑不变)
-        let decode_taps = matches!(spec_mode, crate::running::SpecMode::DFlash2)
+        let decode_taps = matches!(spec_mode, crate::spec_runtime::SpecMode::DFlash2)
             && !self.cfg.knobs.draft.notaps;
         let forward = move |sc: &PlanCtx| -> Result<()> {
             let ids = sc.input("frontier")?;
@@ -611,12 +611,12 @@ impl<D: DeviceClient + 'static> Engine<D> {
             ];
             // DFlash2 target taps(E5-DF2;层输出残差流,sglang capture 同语义)
             // OWL_DFLASH_NOTAPS=1 → 退回 last_hidden(排查开关:隔离 taps 图)
-            let dflash_taps = matches!(spec_mode, crate::running::SpecMode::DFlash2)
+            let dflash_taps = matches!(spec_mode, crate::spec_runtime::SpecMode::DFlash2)
                 && !self.cfg.knobs.draft.notaps;
             // TAPDECL:声明期 tapped(收集)但不挂输出槽 —— 二分「tap 节点
             // 本身」vs「输出槽机制」(2026-10-07 恒等门排查)
             let dflash_tap_decl = dflash_taps
-                || (matches!(spec_mode, crate::running::SpecMode::DFlash2)
+                || (matches!(spec_mode, crate::spec_runtime::SpecMode::DFlash2)
                     && self.cfg.knobs.draft.tapdecl);
             if dflash_taps {
                 for i in 0..5 {
@@ -891,7 +891,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
             // 输入槽 = tokens/anchor/enc_pos/enc_slots/prop_pos/prop_slots/
             // kv_len;烘焙叶 = verify taps 槽 + 草稿池叶。prefix_len 曾为
             // 宿主烘焙标量,已改核内读 kv_len 张量(契约 5)。
-            if let Some(crate::running::Drafter::DFlash2(d2)) = drafter.as_ref() {
+            if let Some(crate::spec_runtime::Drafter::DFlash2(d2)) = drafter.as_ref() {
                 let tap_blks: Vec<owl_iface::contract::Bytes> = (0..5)
                     .map(|i| vg.output_block(&format!("tap{i}")).expect("tap 输出槽"))
                     .collect();
@@ -1001,7 +1001,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
             // E5-M5:propose 桶形图族(index = m ∈ 0..=depth —— 全接受
             // m=depth 也要出下轮草稿;extend m+1 行 + k-1 链步;
             // hidden = verify hid 槽前缀视图;lm_head/链全部入图)。
-            if let Some(crate::running::Drafter::Mtp(mtp)) = drafter.as_ref() {
+            if let Some(crate::spec_runtime::Drafter::Mtp(mtp)) = drafter.as_ref() {
                 let dd = dims;
                 let _key_dim = dims.nk * dims.hk;
                 let _value_dim = dims.nv * dims.hv;
@@ -1118,7 +1118,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
         // 这条路径对 DFlash2 既不可用、也**死得太晚**(跑到一半才炸)。
         // ⇒ 收口为**装配期拒启**:要跑该档就显式 `[spec] depth = 0`
         // 或 `[spec] notaps = true`(退 last_hidden,不需要图)。
-        if matches!(spec_mode, crate::running::SpecMode::DFlash2)
+        if matches!(spec_mode, crate::spec_runtime::SpecMode::DFlash2)
             && !dflash_notaps
             && verify_graph.is_none()
         {
@@ -1131,46 +1131,49 @@ impl<D: DeviceClient + 'static> Engine<D> {
         }
         Ok(RunningEngine {
             probes,
-            session,
             tok: loaded.tokenizer,
             cfg: self.cfg,
-            capture_outcome,
-            // B4 分母跨 turn 保鲜(初值 0 = 未采样,首窗口用保守兜底线)
-            bare_cost_carry_ms: 0.0,
-            bare_cost_carry_ctx: 0,
             pool,
-            queue: std::collections::VecDeque::new(),
-            active: None,
-            next_id: 1,
-            sessions: SessionTable::new(),
             model: loaded.model,
             rope: loaded.rope,
-            blocks_m,
             env,
-            spec_depth,
             sched_acc_ns: 0,
             sched_cnt: 0,
-            spec_mode,
-            drafter,
-            blocks_mtp,
-            verify_graph,
-            fold_graphs,
-            propose_graphs,
-            dflash_graph,
-            draft_rope,
-            dflash_tap_count: if matches!(spec_mode, crate::running::SpecMode::DFlash2)
-                && !dflash_notaps
-            {
-                5
-            } else {
-                0
-            },
-            dflash_mem_dumped: false,
-            dflash_mem_dumped2: false,
-            dflash_hid_dumped: false,
             boot_seq: BOOT_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1,
-            spec_stats: crate::running::SpecStats::default(),
-            pending_events: std::collections::VecDeque::new(),
+            turns: crate::turn::TurnLedger::new(),
+            bank: crate::session::SessionBank {
+                sessions: SessionTable::new(),
+                blocks_m,
+                blocks_mtp,
+            },
+            graphs: crate::graph_fleet::GraphFleet {
+                session,
+                capture_outcome,
+                verify: verify_graph,
+                fold: fold_graphs,
+                propose: propose_graphs,
+                dflash: dflash_graph,
+            },
+            spec: crate::spec_runtime::SpecRuntime {
+                depth: spec_depth,
+                mode: spec_mode,
+                drafter,
+                draft_rope,
+                dflash_tap_count: if matches!(spec_mode, crate::spec_runtime::SpecMode::DFlash2)
+                    && !dflash_notaps
+                {
+                    5
+                } else {
+                    0
+                },
+                stats: crate::spec_runtime::SpecStats::default(),
+                mem_dumped: false,
+                mem_dumped2: false,
+                hid_dumped: false,
+                // B4 分母跨 turn 保鲜(初值 0 = 未采样,首窗口用保守兜底线)
+                carry_ms: 0.0,
+                carry_ctx: 0,
+            },
         })
     }
 }

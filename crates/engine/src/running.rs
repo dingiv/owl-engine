@@ -10,7 +10,6 @@
 //! KV 由「kv_len 窗口 + 先写后打分」语义天然隔离);真并发随调度层铺开
 //! S3 拼批换入,submit/pump 形状不变。
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 use owl_iface::contract::{DeviceClient, ModelError};
@@ -18,99 +17,15 @@ use owl_models::layers::rope::Rope;
 use owl_models::model::Model;
 use owl_models::tokenizer::Tokenizer;
 
-use crate::blocks::BlockManager;
 use crate::engine::EngineConfig;
-use crate::graph_plan::GraphPlan;
+use crate::graph_fleet::GraphFleet;
 use crate::scheduler::{SchedulerOutput, StepAction};
-use crate::session::SessionTable;
+use crate::session::SessionBank;
+use crate::spec_runtime::SpecRuntime;
 use crate::state::StatePool;
-use crate::turn::{TurnEvent, TurnSpec};
+use crate::turn::{Turn, TurnEvent, TurnLedger, TurnSpec, TurnSpecState};
 
 type Result<T> = std::result::Result<T, ModelError>;
-
-pub(crate) struct Turn {
-    pub(crate) id: u64,
-    /// 归属会话(已解析 id;None 提交在 submit 时已建临时账)
-    pub(crate) session_id: u64,
-    /// 临时会话(终了即焚;行为同 M0.5 每 turn 全量重算)
-    pub(crate) ephemeral: bool,
-    pub(crate) spec: TurnSpec,
-    pub(crate) prompt_ids: Vec<u32>,
-    /// per-turn 可选项(AGT-06)
-    pub(crate) opts: crate::turn::TurnOpts,    /// 提交时前缀命中量(usage `cached_tokens` 真源;AGT-12)
-    pub(crate) cached: usize,
-}
-
-pub(crate) struct ActiveTurn {
-    pub(crate) id: u64,
-    pub(crate) session_id: u64,
-    pub(crate) ephemeral: bool,
-    pub(crate) prompt_ids: Vec<u32>,
-    pub(crate) max_new: usize,
-    /// 忽略 EOS 跑满预算(TurnSpec 透传;测速口径)
-    pub(crate) ignore_eos: bool,
-    /// 本 turn 采样参数(AGT-06;**提交时已与 knobs 合并**,见 scheduler)
-    pub(crate) sampler: crate::sampler::SamplerCfg,
-    /// 本 turn 是否走采样路径(temp=0 或 flavor greedy 档 = 否)
-    pub(crate) sampler_on: bool,
-    /// 停止串(AGT-06;空 = 不启用)
-    pub(crate) stop: Vec<String>,
-    /// 已发射文本字节数(`decoded` 为全量;stop 回吐 holdback 用)
-    pub(crate) emitted: usize,
-    /// stop 命中位置(字节偏移;终了时据此截断 `Completed.text`)
-    pub(crate) trim_text_to: Option<usize>,
-    /// RNG 种子覆写(AGT-06 `seed`;None = turn id 派生)
-    pub(crate) seed: Option<u64>,
-    /// 本 turn **起始 fed**(= 真实前缀命中量:会话守卫命中或块级前缀
-    /// 缓存命中;AGT-12 `cached_tokens` 真源 —— 后者在 submit 时尚未
-    /// 决定,只有 begin 定相后才知)
-    pub(crate) cached_start: usize,
-    pub(crate) out: Vec<u32>,
-    /// KV/prompt 推进指针(会话 turn 从 `cached_len` 起步 = 增量 prefill)
-    pub(crate) fed: usize,
-    pub(crate) decoded: String,
-    /// spec 轮机器状态(**turn 生命周期**:随 ActiveTurn 创建、随 turn
-    /// 终了销毁)。历史教训:这七件曾寄存引擎级,跨 turn 残留 ——
-    /// spec_snap_valid 残留 true = 新 turn 用上 turn 快照折叠(GDN 污染,
-    /// AL 2.97→0.49);B4 降级三态残留 = 下 turn 带病起步。生命周期卡对
-    /// 后此类跨 turn 污染结构性消失(2026-10-10)。
-    pub(crate) spec: TurnSpecState,
-}
-
-/// turn 域 spec 状态(生命周期 = ActiveTurn;见上)
-#[derive(Default)]
-pub(crate) struct TurnSpecState {
-    /// spec 快照有效性(轮首拍;fold 后失效重拍;全接受轮保持)
-    pub(crate) spec_snap_valid: bool,
-    /// 已 propose 草稿(host 账;轮末产出轮首消费)
-    pub(crate) spec_drafts_host: Option<Vec<u32>>,
-    /// B4:m=0 连击计数(成功轮归零)
-    pub(crate) spec_zero_streak: usize,
-    /// B4:降级态(true = 调度发裸 Decode;草稿池逐 token 同步)
-    pub(crate) spec_degraded: bool,
-    /// B4:降级以来 decode 步数(探测周期判定)
-    pub(crate) spec_steps_degraded: usize,
-    /// B4:当前探测周期(失败 ×2 退避,上限 512)
-    pub(crate) spec_probe_every: usize,
-    /// B4 滚动 AL 窗口(2026-10-12):轮数 / 产出 token 数 —— 连击 streak
-    /// 会被"偶发 m=1"破解(随机域 AL≈1.1 时 9.3 t/s 案),窗口均值
-    /// < 盈亏线(3.6 tok/轮)即降级,不看连击
-    pub(crate) recent_rounds: u32,
-    pub(crate) recent_tokens: u32,
-    /// B4 窗口内累计轮时(ms)—— ①**时间门**:超长轮下等满 16 轮太久
-    /// (44ms×16=0.7s、150ms×16=2.4s)②**绝对吞吐**读数(2026-10-14)
-    pub(crate) recent_ms: f32,
-    /// B4 分母(`bare_cost_ewma_ms`)采样时的 ctx(pos)—— ctx 涨过 25%
-    /// 即作废分母(换档后旧采样失真 = 判据偏软的主因,2026-10-14)
-    pub(crate) bare_cost_ctx: usize,
-    /// B4 动态盈亏线(2026-10-09):滚动轮成本 / 裸步成本 ewma(ms)。
-    /// 盈亏平衡 avg = round_cost/bare_cost(常数 1.2 曾远低于真线 ~4,
-    /// AL 1.2~4 区间亏本跑 spec = 9.4 t/s 案)
-    pub(crate) round_cost_ewma_ms: f32,
-    pub(crate) bare_cost_ewma_ms: f32,
-    /// prefill 末行 hidden(首轮 propose 的 anchor_hidden;消费后置 None)
-    pub(crate) spec_seed_hidden: Option<owl_iface::contract::Bytes>,
-}
 
 /// 步级探针开关(诊断面;结构纯数据,Default = 全关)。
 /// **入口侧构造器** = [`StepProbes::from_env`](server config/测试用例
@@ -166,104 +81,45 @@ impl StepProbes {
     }
 }
 
+/// 执行态引擎(请求入口)。
+///
+/// # 结构(2026-10-14 拆分:35 字段万能袋 → 状态域组合)
+///
+/// 按状态域拆四户入组合,本体只留**跨域核心资产**(设备面/配置/
+/// 模型/池/环境/探针):
+/// - [`crate::turn::TurnLedger`]:排队/活跃/id 发号/事件队列
+/// - [`crate::session::SessionBank`]:会话账 + 双块账房(target/MTP)
+/// - [`crate::graph_fleet::GraphFleet`]:主会话图 + spec 三族图阵
+/// - [`crate::spec_runtime::SpecRuntime`]:spec 模式/草稿器/统计/B4 保鲜
+///
+/// 生命周期分层:turn 域状态住 ActiveTurn(随 turn 生死);引擎级
+/// spec 状态住 SpecRuntime(跨 turn)—— 两层不混居(2026-10-10
+/// 生命周期收口教训)。
 pub struct RunningEngine<D: DeviceClient> {
     /// 步级探针(boot 解析;不可变)
     pub(crate) probes: StepProbes,
-    pub(crate) session: GraphPlan<D>,
-    pub(crate) tok: Tokenizer,
     pub(crate) cfg: EngineConfig,
-    /// 捕获三态结果(Captured = 回放态;EagerFallback = 同闭包直发)
-    pub capture_outcome: crate::graph_plan::PlanOutcome,
+    pub(crate) tok: Tokenizer,
     /// 设备状态块池(KV paged 池/GDN 格/快照池/持久块表;state.rs)
     pub(crate) pool: StatePool,
-    pub(crate) queue: VecDeque<Turn>,
-    pub(crate) active: Option<ActiveTurn>,
-    pub(crate) next_id: u64,
-    /// 会话账(S0):同会话跨 turn 复用 KV/GDN,增量 prefill
-    pub(crate) sessions: SessionTable,
     /// prefill 块式喂入(W1)的模型面:树根构造
     pub(crate) model: Arc<Model>,
     pub(crate) rope: Rope,
-    /// KV 物理块账房(E2b;块链按会话分派,池内 ref 计数)
-    pub(crate) blocks_m: BlockManager,
     /// 解释器执行环境(EnvProvider;逐 chunk/step 注入 ctx)
     pub(crate) env: owl_models::env::EnvProvider,
-    /// B4 判据跨 turn 保鲜(2026-10-14):裸步成本 EWMA + 其采样 ctx。
-    /// **为什么必须跨 turn**:`TurnSpecState` 随 turn 销毁 ⇒ 每 turn 起步
-    /// 分母 = 0 ⇒ 首个窗口只能用保守兜底线(2.5),在"真线 1.4 而 AL≈2"
-    /// 的域会误降级并抖动。带 ctx 保鲜后,同档续聊直接沿用真线。
-    pub(crate) bare_cost_carry_ms: f32,
-    pub(crate) bare_cost_carry_ctx: usize,
-    /// E5-M2:投机轮深(0 = 关;>0 = 每轮草稿数,调度发 SpecRound)
-    pub(crate) spec_depth: usize,
+    /// boot 序号(metrics 打点命名空间;进程内自增,b1/b2…)
+    pub(crate) boot_seq: u64,
     /// E5 性能:schedule 累计账(轮间 host 成本剖析)
     pub(crate) sched_acc_ns: u64,
     pub(crate) sched_cnt: usize,
-    /// E5-M2b:spec 模式三态(Mtp = 真草稿头;Dumb = 哑草稿诊断;
-    /// Off = 回落 DecodeBatch —— spec_depth 恒 0)
-    #[allow(dead_code)] // 诊断面字段(写入后当前无读者)
-    pub(crate) spec_mode: SpecMode,
-    /// MTP 草稿头(mtp 模式;embed/lm_head 共享 target 不持有;Arc =
-    /// propose 图闭包共享)
-    pub(crate) drafter: Option<Drafter>,
-    /// MTP 链页账房(E5-M2b;独立页池,无前缀缓存)
-    pub(crate) blocks_mtp: BlockManager,
-    /// verify 桶形图(E5-M4;T = depth+1 定形,输出 tok/hid + fold 记录;
-    /// None = eager fallback 走旧 verify+重放路)
-    pub(crate) verify_graph: Option<GraphPlan<D>>,
-    /// fold 桶形图族(E5-M5;index = m,状态 = spec 快照 buf 就地,
-    /// slot 恒 0;重放后 restore 回写会话格)
-    pub(crate) fold_graphs: Vec<GraphPlan<D>>,
-    /// propose 桶形图族(E5-M5;index = m,extend m+1 行 + k-1 链步,
-    /// 输出 drafts;首轮 propose_first 保持 eager)
-    pub(crate) propose_graphs: Vec<GraphPlan<D>>,
-    /// DFlash2 propose 单图(E5-DF4;encode 全 8 行 + 噪声块 + selector,
-    /// 固定几何;None = eager 回退)
-    pub(crate) dflash_graph: Option<GraphPlan<D>>,
-    /// DFlash2 草稿 rope(θ 1e7;dfflash 模式 Some)
-    pub(crate) draft_rope: Option<std::sync::Arc<owl_models::layers::rope::Rope>>,
-    /// DFlash2 target taps 数(dflash 模式 = 5;其余 0)
-    pub(crate) dflash_tap_count: usize,
-    /// taps/memory 探针落盘一次性门(OWL_DFLASH_PROBE;AL=0 排查)
-    pub(crate) dflash_mem_dumped: bool,
-    /// concat 父块落盘一次性门(同上)
-    pub(crate) dflash_mem_dumped2: bool,
-    /// propose hidden 落盘一次性门(同上)
-    pub(crate) dflash_hid_dumped: bool,
-    /// boot 序号(metrics 打点命名空间;进程内自增,b1/b2…)
-    pub(crate) boot_seq: u64,
-    /// spec 接受账(M2b 恒等门覆盖断言:三路 m 分布 + 账目闭合)
-    pub(crate) spec_stats: SpecStats,
-    /// 多 token 轮的事件队列(pump 逐个出;SpecRound 一轮 m+1 token)
-    pub(crate) pending_events: std::collections::VecDeque<TurnEvent>,
-}
-
-/// E5-M2b:spec 模式三态(C7 回退挂钩)。裁决在 boot:
-/// depth>0 且检查点有 mtp.* → Mtp;OWL_SPEC_DUMB=1 → Dumb(诊断面,
-/// 哑草稿 = anchor 重复);否则 Off(无草稿器不白发 verify 税)。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum SpecMode {
-    Off,
-    Dumb,
-    Mtp,
-    /// DFlash2 码本选择器草稿(E5-DF;OWL_DFLASH2_DIR)
-    DFlash2,
-}
-
-/// 草稿器枚举(E5-DF;MTP 链式 / DFlash2 噪声块式双族)
-pub(crate) enum Drafter {
-    Mtp(std::sync::Arc<owl_models::layers::mtp::MtpPredictor>),
-    DFlash2(std::sync::Arc<owl_models::layers::dflash2::DFlash2Draft>),
-}
-
-/// spec 接受账(轮级;恒等门/接受率观测面)
-#[derive(Default, Debug, Clone, Copy)]
-pub(crate) struct SpecStats {
-    pub rounds: usize,
-    pub sum_m: usize,
-    pub full: usize,
-    pub partial: usize,
-    pub zero: usize,
+    /// turn 运行账(turn.rs)
+    pub(crate) turns: TurnLedger,
+    /// 会话 + 块账房(session.rs)
+    pub(crate) bank: SessionBank,
+    /// 图族(graph_fleet.rs:主会话图 + verify/fold/propose/dflash)
+    pub(crate) graphs: GraphFleet<D>,
+    /// 引擎级 spec 运行态(spec_runtime.rs;turn 域七件套住 ActiveTurn)
+    pub(crate) spec: SpecRuntime,
 }
 
 /// **生成预算的最小保留量**(tok):剩余额度低于它 = 真溢出(连一个像样的
@@ -292,20 +148,21 @@ pub fn budget_clamp(
 }
 
 impl<D: DeviceClient> RunningEngine<D> {
+    /// 捕获三态结果(Captured = 回放态;EagerFallback = 同闭包直发)
+    pub fn capture_outcome(&self) -> &crate::graph_plan::PlanOutcome {
+        &self.graphs.capture_outcome
+    }
+
     /// 提交 turn(临时会话:每 turn 独立,终了即焚;行为同 M0.5)。
     /// 预算:prompt + 生成 ≤ max_seq_tokens(= KV 槽位);超出先收缩生成
     /// (见 [`budget_clamp`]),只剩 < 1k 才拒。
     /// turn 域 spec 状态(turn 生命周期;仅活跃 turn 可触 —— 轮执行期
     /// active 恒在;turn 外触碰 = 调用序错误)
     pub(crate) fn tspec(&mut self) -> &mut TurnSpecState {
-        &mut self
-            .active
-            .as_mut()
-            .expect("turn 域 spec 状态:无活跃 turn")
-            .spec
+        self.turns.tspec()
     }
     pub(crate) fn tspec_ref(&self) -> &TurnSpecState {
-        &self.active.as_ref().expect("turn 域 spec 状态:无活跃 turn").spec
+        self.turns.tspec_ref()
     }
 
     pub fn submit(&mut self, prompt: impl Into<String>, max_new: usize) -> Result<u64> {
@@ -387,7 +244,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         // (增量段写 `[cached, prompt)` 行,生成续写其后;失配回退全量时
         // prompt 为准,同一上界)
         let cached_hit = session
-            .and_then(|id| self.sessions.get(id).map(|s| (s.cached_len, s.guard(&prompt_ids))))
+            .and_then(|id| self.bank.sessions.get(id).map(|s| (s.cached_len, s.guard(&prompt_ids))))
             .filter(|&(_, guard)| guard)
             // 无会话 / 守卫未命中 → cached 0(语义默认,非失败)
             .map(|(cached, _)| cached)
@@ -426,12 +283,11 @@ impl<D: DeviceClient> RunningEngine<D> {
             }
         };
         let (session_id, ephemeral) = match session {
-            Some(id) => (self.get_or_create_evicting(Some(id))?, false),
-            None => (self.get_or_create_evicting(None)?, true),
+            Some(id) => (self.bank.get_or_create_evicting(Some(id), self.cfg.knobs.gdn_slots)?, false),
+            None => (self.bank.get_or_create_evicting(None, self.cfg.knobs.gdn_slots)?, true),
         };
-        let id = self.next_id;
-        self.next_id += 1;
-        self.queue.push_back(Turn {
+        let id = self.turns.alloc_id();
+        self.turns.queue.push_back(Turn {
             id,
             session_id,
             ephemeral,
@@ -443,97 +299,40 @@ impl<D: DeviceClient> RunningEngine<D> {
         Ok((session_id, id))
     }
 
-    /// E5:取或建 + 格耗尽 LRU 逐出重试(提交与泵不相交,无活跃 turn,
-    /// 全部存活会话皆可逐;块链归账房,格随 close 回收)。键控与
-    /// ephemeral 两臂共用 —— ephemeral 流量为主的服务面,老键控会话
-    /// 必须让位(2026-10-10 sweep 实录:8 个键控会话存活时全部
-    /// ephemeral 请求 400)
-    fn get_or_create_evicting(&mut self, id: Option<u64>) -> Result<u64> {
-        match self.sessions.get_or_create(id, self.cfg.knobs.gdn_slots) {
-            Ok(x) => Ok(x.0),
-            Err(e) if format!("{e}").contains("GDN 状态格耗尽") => {
-                let mut last = e;
-                loop {
-                    let Some(victim) = self.sessions.lru_victim() else {
-                        return Err(last);
-                    };
-                    if let Some(s) = self.sessions.get_mut(victim) {
-                        let mut t = std::mem::take(&mut s.block_table);
-                        self.blocks_m.release_table(&mut t);
-                        let mut mt = std::mem::take(&mut s.mtp_block_table);
-                        self.blocks_mtp.release_table(&mut mt);
-                    }
-                    // 会话关闭失败 = 块表归还/状态回收失败:不许静默(律 #1)
-                    if let Err(e) = self.sessions.close(victim) {
-                        eprintln!("[session] LRU 逐出 #{victim} 关闭失败: {e}");
-                    }
-                    owl_shared::metrics::with_metrics_store(|m| {
-                        m.counter_add("session.evict", 1, file!(), line!())
-                    });
-                    eprintln!("[session] LRU 逐出 #{victim}(GDN 格回收)→ 重试");
-                    match self.sessions.get_or_create(id, self.cfg.knobs.gdn_slots) {
-                        Ok(x) => return Ok(x.0),
-                        Err(e2) if format!("{e2}").contains("GDN 状态格耗尽") => {
-                            last = e2;
-                        }
-                        Err(e2) => return Err(e2),
-                    }
-                }
-            }
-            Err(e) => Err(e),
-        }
-    }
-
     /// 显式关会话(客户端声明不再续;账本清票,块链归还账房)
     pub fn close_session(&mut self, id: u64) -> Result<()> {
-        if let Some(s) = self.sessions.get_mut(id) {
-            let mut table = std::mem::take(&mut s.block_table);
-            self.blocks_m.release_table(&mut table);
-        }
-        self.sessions.close(id)
+        self.bank.close(id)
     }
 
     /// 会话账观测(已入 KV 的 token 数;None = 会话不存在)
     pub fn session_len(&self, id: u64) -> Option<usize> {
-        self.sessions.get(id).map(|s| s.cached_len)
+        self.bank.sessions.get(id).map(|s| s.cached_len)
     }
 
     /// 提交后的 prompt token 数(turn 尚在队列/活跃期内有效;usage 真账
     /// 单源 —— 服务层在 submit 后即刻取用,终了后 turn 已焚,返回 None)
     pub fn turn_prompt_len(&self, turn: u64) -> Option<usize> {
-        self.queue
-            .iter()
-            .find(|t| t.id == turn)
+        self.turns
+            .queued(turn)
             .map(|t| t.prompt_ids.len())
-            .or_else(|| {
-                self.active
-                    .as_ref()
-                    .filter(|a| a.id == turn)
-                    .map(|a| a.prompt_ids.len())
-            })
+            .or_else(|| self.turns.active_of(turn).map(|a| a.prompt_ids.len()))
     }
 
     /// 提交时**前缀命中量**(usage `cached_tokens` 真源;AGT-12):
     /// 会话守卫命中 ⇒ = 会话已缓存 token 数;未命中/无会话 ⇒ 0。
     /// **真值**:`prompt_tokens - cached_tokens` = 本 turn 实际 prefill 量。
     pub fn turn_cached_len(&self, turn: u64) -> Option<usize> {
-        self.queue
-            .iter()
-            .find(|t| t.id == turn)
-            .map(|t| t.cached)
+        self.turns.queued(turn).map(|t| t.cached)
     }
 
     /// 活跃 turn 起始前缀命中量(AGT-12 真源;`turn` 不匹配 = None)
     pub fn active_cached_len(&self, turn: u64) -> Option<usize> {
-        self.active
-            .as_ref()
-            .filter(|a| a.id == turn)
-            .map(|a| a.cached_start)
+        self.turns.active_of(turn).map(|a| a.cached_start)
     }
 
     /// 当前活跃 turn id(actor 侧"该发缓存纠正帧了吗"判据)
     pub fn active_turn_id(&self) -> Option<u64> {
-        self.active.as_ref().map(|a| a.id)
+        self.turns.active.as_ref().map(|a| a.id)
     }
 
     /// 推进到下一个事件点(每调用 = 活跃 turn 的一个采样步,或 turn 的
@@ -547,25 +346,13 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 构造期只拿到 env 快照 ⇒ 逐相位显式下发(perf-framework.md §十.3)。
     pub(crate) fn set_phase(&mut self, p: owl_models::env::EvalPhase) {
         self.env.phase = p;
-        self.session.set_phase(p);
-        if let Some(g) = self.verify_graph.as_mut() {
-            g.set_phase(p);
-        }
-        for g in self.fold_graphs.iter_mut() {
-            g.set_phase(p);
-        }
-        for g in self.propose_graphs.iter_mut() {
-            g.set_phase(p);
-        }
-        if let Some(g) = self.dflash_graph.as_mut() {
-            g.set_phase(p);
-        }
+        self.graphs.set_phase(p);
     }
 
     pub async fn pump(&mut self) -> Result<TurnEvent> {
         // E5-M2:spec 轮多 token 事件队列优先排空(schedule 前 —— 事件序
         // 不可与下一轮调度交织)
-        if let Some(ev) = self.pending_events.pop_front() {
+        if let Some(ev) = self.turns.pending_events.pop_front() {
             return Ok(ev);
         }
         let prof = self.cfg.knobs.probes.step_profile;

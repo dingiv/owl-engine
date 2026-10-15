@@ -234,13 +234,60 @@ mod tests {
             (crate::family::xqa::DECODE_XQA, crate::client::xqa::PARSE_SLOTS),
         ]);
 
-        for (entry, want) in cases {
+        for (entry, want) in cases.iter() {
             let m = crate::ops::meta(entry).unwrap_or_else(|| panic!("{entry} 未建表"));
             assert_eq!(
                 m.param_names(),
                 *want,
                 "{entry}: parse 取用槽名与声明表不一致 —— 改名/插槽必须**成对改**\
                  (只改一边 = 运行时才炸;只改声明 = 同型槽静默错位)"
+            );
+        }
+
+        // **覆盖率门**:每个"有 client parse 面"的族算子都必须显式进 case 列表
+        // —— 新增族算子(如 prefill-graph 分支的 `owl_xqa_prefill`)会让本门红,
+        // 逼"parse 与声明成对改"落到位(否则新算子静默不受按名取址锁保护)。
+        //
+        // 面清单按 **feature** 列(族 shim 随 feature 门控):四个 shim feature
+        // **全开**时,本清单必须与 `ops::all()` 的族算子集合**逐字相等**
+        // ⇒ "新增族算子忘了进锁"在标准门跑法(全 feature)下必红。
+        let mut want: Vec<&str> = vec![
+            crate::family::gdn_chunked::GDN_CHUNKED_FWD,
+            crate::family::gdn_scalar::GDN_SCALAR_FWD,
+        ];
+        #[cfg(feature = "cublas")]
+        want.extend([crate::family::cublas::GEMM_F16, crate::family::cublas::GEMM_BF16]);
+        #[cfg(feature = "marlin")]
+        want.extend([
+            crate::family::marlin::GEMM_W4A16,
+            crate::family::marlin::GEMM_W4A16_BF16,
+            crate::family::marlin::GEMM_W4A16_AWQ,
+        ]);
+        #[cfg(feature = "flashinfer")]
+        want.extend([
+            crate::family::flashinfer::PREFILL_FI,
+            crate::family::flashinfer::PREFILL_FI_FP8KV,
+        ]);
+        #[cfg(feature = "xqa")]
+        want.extend([crate::family::xqa::VERIFY_XQA, crate::family::xqa::DECODE_XQA]);
+        let listed: std::collections::BTreeSet<&str> = cases.iter().map(|(n, _)| *n).collect();
+        let want_set: std::collections::BTreeSet<&str> = want.iter().copied().collect();
+        assert_eq!(
+            listed, want_set,
+            "parse 槽名锁的 case 列表与【有 parse 面的族算子】清单不一致\
+             (新增族算子必须在此显式声明它用哪张槽名表 —— 与 ops 的 A17 锁同律)"
+        );
+        #[cfg(all(feature = "cublas", feature = "marlin", feature = "flashinfer", feature = "xqa"))]
+        {
+            // 全 feature(= 标准门跑法)⇒ 面清单必须覆盖**所有**族算子
+            let fam: std::collections::BTreeSet<&str> = crate::ops::all()
+                .filter(|m| m.is_family())
+                .map(|m| m.entry)
+                .collect();
+            let missing: Vec<&&str> = fam.difference(&want_set).collect();
+            assert!(
+                missing.is_empty(),
+                "族算子没有 client parse 面/未进锁:{missing:?}"
             );
         }
     }

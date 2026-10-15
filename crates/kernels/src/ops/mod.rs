@@ -397,6 +397,17 @@ pub const PRODUCTION_UNION_2026_10_13: &[&str] = &[
     "owl_norm_rope_bf16",
     "owl_norm_rope_f16",
     "owl_qknorm_rope_kv_insert_f16_fp8kv_knhd",
+    // ── f16 主池族(A5/F5d;`kv_fp8 = false` 时实际发射)——
+    // 2026-10-15:并集曾漏这 6 项(且多一个无主的 `owl_topk16_f16`)
+    // ⇒ 新增机器门 `production_union_equals_flavor_union`:并集与
+    // 两档清单的**集合相等**从此是红线(手抄清单不再靠注释自律)
+    "owl_qknorm_rope_kv_insert_f16_knhd",
+    "owl_topk16_merge_f16",
+    "owl_topk16_split_f16",
+    "vllm_chunked_prefill_paged_attn_opt_f16_knhd_hd256",
+    "vllm_paged_attention_v2_f16_knhd_hd256bs32",
+    "vllm_reshape_and_cache_f16_knhd",
+
     "owl_reshape_and_cache_fp8kv_knhd",
     "owl_rmsnorm_bf16",
     "owl_rmsnorm_f16",
@@ -404,7 +415,6 @@ pub const PRODUCTION_UNION_2026_10_13: &[&str] = &[
     "owl_sigmoid_gate_mul_f16",
     "owl_silu_and_mul_bf16",
     "owl_silu_and_mul_f16",
-    "owl_topk16_f16",
     "owl_xqa_decode",
     "owl_xqa_verify",
     "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256",
@@ -442,6 +452,41 @@ mod tests {
             PRODUCTION_UNION_2026_10_13.len(),
             built_count()
         );
+    }
+
+    /// **并集 = 两档清单的集合并**(机器门;2026-10-15 立)。
+    ///
+    /// 为什么:三张表(spec-dflash / awq27b / union)都是**手抄清单**,
+    /// "union = sp ∪ awq" 此前只是注释里的一句话 ⇒ 实测已漂移:
+    /// ① A5/F5d 给 spec-dflash 补的 f16 主池族 6 项并集没跟;
+    /// ② 并集里还留着无主的 `owl_topk16_f16`(两档白名单都没有 ⇒
+    ///    生产不会发射它)。
+    /// 纪律 = **集合相等**(双向包含);顺序/分组不判。
+    /// (反例:某分支把并集里的 `owl_naive_attn_nc_bf16_v2` 换成了未接线的
+    ///  `v3` —— 本门会当场红,而当时它绿着。)
+    #[test]
+    fn production_union_equals_flavor_union() {
+        use std::collections::BTreeSet;
+        let set = |l: &[&'static str]| -> BTreeSet<&'static str> { l.iter().copied().collect() };
+        let sp = set(PROD_SPEC_DFLASH_2026_10_13);
+        let aw = set(PROD_AWQ27B_2026_10_13);
+        let un = set(PRODUCTION_UNION_2026_10_13);
+        let want: BTreeSet<&str> = sp.union(&aw).copied().collect();
+        let missing: Vec<&&str> = want.difference(&un).collect();
+        let extra: Vec<&&str> = un.difference(&want).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "并集 != 两档并(spec-dflash ∪ awq27b):\n  并集缺:{missing:?}\n  并集多:{extra:?}"
+        );
+        // 两档清单自身无重复(手抄清单的常见笔误)
+        for (name, l) in [
+            ("spec-dflash", PROD_SPEC_DFLASH_2026_10_13),
+            ("awq27b", PROD_AWQ27B_2026_10_13),
+            ("union", PRODUCTION_UNION_2026_10_13),
+        ] {
+            let s = set(l);
+            assert_eq!(s.len(), l.len(), "{name} 清单有重复项");
+        }
     }
 
     /// **生产集审计必须全绿**(§14.2 实测清单:spec-dflash 44 + awq27b 27 的并集)
