@@ -111,4 +111,4 @@ gdn_slots = 8          # GDN 状态格(= 活跃会话上限;生产 flavor 锁 1 
   - 🔗 后续:agent 服务面(pi 对接)专项把这笔账升格为需求 REQ-AGT-08/09,
     并给出渲染对称律与隐式会话两条解法 —— 见 `agent-服务面-设计与施工.md`
     §4.3/§4.4(2026-10-14 立项)。
-    `[probes] debug = true`(`[dbg prefix] match = N blocks`)+ `OWL_PROMPT_DUMP=1`。
+    `[probes] debug = true`(`[dbg prefix] match = N blocks`)+ `[probes] prompt_dump = true`(原 OWL_PROMPT_DUMP,2026-10-15 收编)。

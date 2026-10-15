@@ -97,11 +97,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             step_slots.iter().map(|(n, v)| (*n, v.as_slice())).collect();
         self.graphs.session.step(&step_refs).await?;
         if prof {
-            eprintln!("[step-prof] pos={pos} fill+launch={:?} wall={}", t0.unwrap().elapsed(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100000);
+            owl_shared::log_info!("step-prof", "pos={pos} fill+launch={:?} wall={}", t0.unwrap().elapsed(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100000);
         }
         if prof {
             let total = t0.unwrap().elapsed();
-            eprintln!("[step-prof] pos={pos} step-total={total:?} wall2={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100000);
+            owl_shared::log_info!("step-prof", "pos={pos} step-total={total:?} wall2={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100000);
         }
         self.turns.active.as_mut().expect("活跃").fed += 1;
         // E2c:decode 跨页边界 → 快照拍摄(同流保序,先拍再采样)
@@ -164,8 +164,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     }
                 };
                 let pos_now = pos;
-                eprintln!(
-                    "[kv-dump] fp8={fp8} pos={pos_now} 槽2非零={}/8 槽{pos_now}非零={}/8 槽{}非零={}/8",
+                owl_shared::log_debug!(
+                    "kv-dump", "fp8={fp8} pos={pos_now} 槽2非零={}/8 槽{pos_now}非零={}/8 槽{}非零={}/8",
                     probe(2),
                     probe(pos_now),
                     pos_now.saturating_sub(1),
@@ -178,13 +178,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         .iter()
                         .map(|b| format!("{b:02x}"))
                         .collect();
-                    eprintln!("[kv-hex] fp8 槽{pos_now} k[0..8] = {hex}");
+                    owl_shared::log_debug!("kv-hex", "fp8 槽{pos_now} k[0..8] = {hex}");
                 } else {
                     let hex: String = whole[base_now..base_now + 16]
                         .iter()
                         .map(|b| format!("{b:02x}"))
                         .collect();
-                    eprintln!("[kv-hex] 槽{pos_now} k[0..8] = {hex}");
+                    owl_shared::log_debug!("kv-hex", "槽{pos_now} k[0..8] = {hex}");
                 }
             }
             if self.probes.debug && step < 16 {
@@ -203,7 +203,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         format!("{:.2}:'{}'", v, self.tok.decode(&[*i]).replace('\n', "\\n"))
                     })
                     .collect();
-                eprintln!("[logits-dump] t{turn_id} s{step}: {}", pretty.join(" | "));
+                owl_shared::log_debug!("logits-dump", "t{turn_id} s{step}: {}", pretty.join(" | "));
             }
             // RNG seed = turn id ⊕ 步数(同 turn 重放确定性,跨 turn 独立);
             // 请求给了 `seed` ⇒ 以它为基(AGT-06)
@@ -226,10 +226,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let t_sample = prof.then(std::time::Instant::now);
             let nt = crate::sampler::sample(&mut logits, &eff_sampler, &mut rng, &history);
             if prof {
-                eprintln!("[step-prof] pos={pos} host-sample={:?} wall3={}", t_sample.unwrap().elapsed(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100000);
+                owl_shared::log_info!("step-prof", "pos={pos} host-sample={:?} wall3={}", t_sample.unwrap().elapsed(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100000);
             }
             if self.probes.debug {
-                eprintln!("[sample-dump] t{turn_id} s{step}: sampled={nt} hist={} pen={}", history.len(), eff_sampler.rep_penalty);
+                owl_shared::log_debug!("sample-dump", "t{turn_id} s{step}: sampled={nt} hist={} pen={}", history.len(), eff_sampler.rep_penalty);
             }
             nt
         } else if self.env.diag.host_argmax {
@@ -263,14 +263,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                             format!("{:.2}:'{}'", v, self.tok.decode(&[*i]).replace('\n', "\\n"))
                         })
                         .collect();
-                    eprintln!("[logits-dump] t{turn_id} s{step}: {}", pretty.join(" | "));
+                    owl_shared::log_debug!("logits-dump", "t{turn_id} s{step}: {}", pretty.join(" | "));
                 }
             }
             let tok_f = self.graphs.session.read_output_f32("token").await?;
             tok_f[0] as u32
         };
         if prof {
-            eprintln!("[step-prof] pos={pos} token-dtoh={:?}", t_dtoh.unwrap().elapsed());
+            owl_shared::log_info!("step-prof", "pos={pos} token-dtoh={:?}", t_dtoh.unwrap().elapsed());
         }
         mrec("decode.step", t_step.elapsed());
         // B4 降级期草稿同步(§6.24 方案 A):decode 图 taps → 1 行 encode。
@@ -329,7 +329,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             self.pool.gdn_slot_profile(face, gdn_slot, step, self.cfg.knobs.gdn_dump_all).await?
         };
         for l in lines {
-            eprintln!("{l}");
+            // GDN 画像行(probes.gdn_dump 门内;行体自含格式,只挂 tag)
+            owl_shared::log_debug!("gdn-dump", "{l}");
         }
         Ok(())
     }

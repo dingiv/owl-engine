@@ -97,7 +97,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let pos_f: Vec<f32> =
                 (pos..pos + block.len()).map(|p| p as f32).collect();
             if bt_chain.len() <= (pos + block.len() - 1) / page {
-                eprintln!("[spec-dbg] pos={pos} block={} bt_len={bt_len} page={page}", block.len(), bt_len = bt_chain.len());
+                owl_shared::log_debug!("spec-dbg", "pos={pos} block={} bt_len={bt_len} page={page}", block.len(), bt_len = bt_chain.len());
             }
             let slots_f: Vec<f32> = (pos..pos + block.len())
                 .map(|p| (bt_chain[p / page] * page as u32 + (p % page) as u32) as f32)
@@ -151,8 +151,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 let t_v1 = std::time::Instant::now();
                 vg.replay().await?;
                 let _ = vg.read_output_f32("tok").await?;
-                eprintln!(
-                    "[verify-prof] step={:?} read={:?} pure={:?}",
+                owl_shared::log_info!("verify-prof", "step={:?} read={:?} pure={:?}",
                     t_read_v - t_step_v,
                     t_v1 - t_read_v,
                     t_v1.elapsed()
@@ -176,7 +175,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             (ids, hidden, Vec::new(), true, row_logits)
         };
         if prof {
-            eprintln!("[spec-prof] pos={pos} verify={:?}", t0.unwrap().elapsed());
+            owl_shared::log_info!("spec-prof", "pos={pos} verify={:?}", t0.unwrap().elapsed());
         }
 
         // ④ 接受(A11):采样档 = **抽-比式**;贪心档 = 原式(argmax 比对)
@@ -267,8 +266,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     spec.recent_ms = 0.0;
                     let starved = avg < break_even;
                     if starved {
-                        eprintln!(
-                            "[spec-degrade] 窗口 AL={avg:.2} < 盈亏线 {break_even:.2}(轮 {rc:.0}ms/裸 {bc:.0}ms;窗口吞吐 {win_tps:.1} tok/s)"
+                        owl_shared::log_warn!("spec-degrade", "窗口 AL={avg:.2} < 盈亏线 {break_even:.2}(轮 {rc:.0}ms/裸 {bc:.0}ms;窗口吞吐 {win_tps:.1} tok/s)"
                         );
                     }
                     starved
@@ -277,13 +275,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 };
             let degraded = degraded0 || window_starved;
             if degraded && !spec.spec_degraded {
-                eprintln!(
-                    "[spec-degrade] m=0×{streak} win_starved={window_starved} 盈亏线={break_even:.2} → 降级裸 decode(probe 每 {probe_every} tok)"
+                owl_shared::log_warn!("spec-degrade", "m=0×{streak} win_starved={window_starved} 盈亏线={break_even:.2} → 降级裸 decode(probe 每 {probe_every} tok)"
                 );
                 mcnt("spec.degrade", 1);
                 spec.spec_drafts_host = None;
             } else if !degraded && spec.spec_degraded {
-                eprintln!("[spec-degrade] 探测命中 m={m} → 恢复 spec");
+                owl_shared::log_warn!("spec-degrade", "探测命中 m={m} → 恢复 spec");
                 mcnt("spec.undegrad", 1);
             }
             spec.spec_zero_streak = streak;
@@ -325,7 +322,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     format!("d{}={}{}", i, drafts[i], near)
                 })
                 .collect();
-            eprintln!("[dflash-probe] pos={pos} ids={:?} {}", &ids[..depth.min(ids.len())], hits.join(" "));
+            owl_shared::log_debug!("dflash-probe", "pos={pos} ids={:?} {}", &ids[..depth.min(ids.len())], hits.join(" "));
         }
 
         // ⑤ 部分接受 → GDN 回滚 + 已接受前缀重放(v1 窗口重处理,施工
@@ -520,7 +517,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let d = self.dflash_propose(bonus, fp).await?;
             if self.probes.dflash_probe && self.spec.stats.rounds < 3 {
                 let toks_txt = self.tok.decode(&d);
-                eprintln!("[dflash-probe] pos={fp} bonus={bonus} drafts={d:?} txt={toks_txt:?}");
+                owl_shared::log_debug!("dflash-probe", "pos={fp} bonus={bonus} drafts={d:?} txt={toks_txt:?}");
             }
             t_propose += ts.elapsed();
             self.tspec().spec_drafts_host = Some(d);
@@ -633,8 +630,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             mrec("spec.round.spec", t_all);
         }
         if prof {
-            eprintln!(
-                "[spec-prof] pos={pos} total={t_all:?} verify={t_verify:?} rollback={t_rollback:?} propose={t_propose:?} snap={t_snap:?} m={m} deg={degraded_now}"
+            owl_shared::log_info!("spec-prof", "pos={pos} total={t_all:?} verify={t_verify:?} rollback={t_rollback:?} propose={t_propose:?} snap={t_snap:?} m={m} deg={degraded_now}"
             );
         }
         self.turns.pending_events

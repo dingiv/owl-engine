@@ -113,7 +113,7 @@ curl "127.0.0.1:8136/debug/log/tags/boot,gl-prof/-" # allow=boot,gl-prof;deny �
 |---|---|---|---|
 | ① | `apps/server/src/**` + engine boot/装配(`engine.rs`/`state.rs`/`blocks.rs`) | **45** | ✅ 2026-10-14 |
 | ①′ | **开机噪音面**:models(`formats/*`/`kernel.rs`)+ cuda(`state.rs`/`server/mod.rs`/`harvest.rs`/`launch.rs`)+ `shared/metrics.rs` | **50** | ✅ 2026-10-14 |
-| ② | engine 剩余(探针/分账/`[sched]`/`[*-prof]`/`[*-probe]`) | ≈75 | 待办 |
+| ② | engine 剩余(探针/分账/`[sched]`/`[*-prof]`/`[*-probe]`) | 58 | ✅ 2026-10-15 |
 | ③ | models 层内探针(`layers/**` 的 `[gdn-*]`/`[enc-forensic]`/`[m-sweep]`) | ≈90 | 待办 |
 | ⚠️ | **`crates/kernels`(13 处)**:kernels 的 **lib 零依赖律**禁止依赖 `owl-shared` | 13 | **挂账**:需 `LogSink` **注入**设计(fn 指针经 Exec/registry 初始化面显式传入,不破依赖图) |
 | — | `crates/*/tests` + `examples` | 184 | **不动**(测试输出本就该直出) |

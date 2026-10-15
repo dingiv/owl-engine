@@ -94,8 +94,7 @@ impl BlockManager {
         let blocks: Vec<usize> = table[..full].iter().map(|&b| b as usize).collect();
         let PrefixCacheUpdate { inserted, evicted } = cache.insert_prefix(tokens, &blocks);
         if self.debug {
-            eprintln!(
-                "[dbg prefix] cache_seq: full={} inserted={} evicted={} 表块={}",
+            owl_shared::log_debug!("dbg prefix", "cache_seq: full={} inserted={} evicted={} 表块={}",
                 full,
                 inserted.len(),
                 evicted.len(),

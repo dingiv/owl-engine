@@ -333,6 +333,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
             // prefill 桶 padding 的 dump 页(M2b):档位非 off 才多分配那 1 页
             prefill_dump_page: self.cfg.knobs.prefill_bucket
                 != owl_shared::config::PrefillBucket::Off,
+            gdn_dbg: self.cfg.knobs.probes.gdn_dbg,
         };
         let pool = StatePool::alloc(&mut self.face, dims, &loaded.spec.layer_types, &plan).await?;
         if let Some(q) = fi_quant {

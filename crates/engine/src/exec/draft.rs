@@ -65,14 +65,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             pg.replay().await?;
             // 失败已 `?` 上报;成功值此处不需要(仅为同步点)
             let _ = pg.read_output_f32("drafts").await?;
-            eprintln!("[dflash-prof] pure_gpu={:?}", t2.elapsed());
+            owl_shared::log_info!("dflash-prof", "pure_gpu={:?}", t2.elapsed());
         }
         if let (Some(a), Some(b)) = (t0, t1) {
             // E2 语义勘误(原 fill/launch/read 误导):total = 轮内全程;
             // step = 装填+发射段;read_extra = 首读段(含队列排水);
             // pure_gpu(上行)= 同步后裸 replay = 图独占 GPU 时间
-            eprintln!(
-                "[dflash-prof] total={:?} step={:?} read_extra={:?}",
+            owl_shared::log_info!("dflash-prof", "total={:?} step={:?} read_extra={:?}",
                 a.elapsed(),
                 b - a,
                 b.elapsed()
@@ -150,9 +149,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let mut buf = vec![0u8; n * 2];
             face.dtoh(&outs[0], &mut buf).await?;
             if let Err(e) = owl_shared::file_loader::write("/tmp/owl_dflash_mem.bin", &buf) {
-                eprintln!("[dump] 落盘失败(诊断面不许静默): {e}");
+                owl_shared::log_error!("dump", "落盘失败(诊断面不许静默): {e}");
             }
-            eprintln!("[dflash-probe] memory 落盘 /tmp/owl_dflash_mem.bin t={t}");
+            owl_shared::log_debug!("dflash-probe", "memory 落盘 /tmp/owl_dflash_mem.bin t={t}");
         }
         Ok(())
     }
@@ -211,7 +210,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             (s.block_table.clone(), s.gdn_slot)
         };
         if self.probes.dflash_probe {
-            eprintln!("[dflash-probe] propose pos={pos} bt_len={} page={page}", bt_chain.len());
+            owl_shared::log_debug!("dflash-probe", "propose pos={pos} bt_len={} page={page}", bt_chain.len());
         }
         // 噪声块自槽(经寻址权威;线性逻辑位)
         let self_slots: Vec<f32> = (0..8usize)
@@ -252,9 +251,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
             if pos <= 18 {
                 if let Err(e) = owl_shared::file_loader::write("/tmp/owl_dflash_kpool.bin", &kbuf) {
-                eprintln!("[dump] 落盘失败(诊断面不许静默): {e}");
+                owl_shared::log_error!("dump", "落盘失败(诊断面不许静默): {e}");
             }
-                eprintln!("[dflash-probe] 草稿 K 池首块落盘 /tmp/owl_dflash_kpool.bin pos={pos}");
+                owl_shared::log_debug!("dflash-probe", "草稿 K 池首块落盘 /tmp/owl_dflash_kpool.bin pos={pos}");
             }
             for r in 0..nrow {
                 let s: f32 = kbuf[r * row_elems * 2..(r + 1) * row_elems * 2]
@@ -266,7 +265,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     })
                     .sum();
                 if r < 3 || s.is_nan() {
-                    eprintln!("[dflash-probe] draftK row{r} |x|前64和 = {s}");
+                    owl_shared::log_debug!("dflash-probe", "draftK row{r} |x|前64和 = {s}");
                 }
             }
         }
@@ -296,7 +295,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 let mut blk = vec![0u8; n * 2];
                 face.dtoh(&b, &mut blk).await?;
                 if let Err(e) = owl_shared::file_loader::write(format!("/tmp/owl_p{i}.bin"), &blk) {
-                eprintln!("[dump] 落盘失败(诊断面不许静默): {e}");
+                owl_shared::log_error!("dump", "落盘失败(诊断面不许静默): {e}");
             }
             }
             let face = self.graphs.session.face_mut();
@@ -305,15 +304,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let mut hbuf = vec![0u8; n * 2];
             face.dtoh(&b, &mut hbuf).await?;
             if let Err(e) = owl_shared::file_loader::write("/tmp/owl_dflash_hid.bin", &hbuf) {
-                eprintln!("[dump] 落盘失败(诊断面不许静默): {e}");
+                owl_shared::log_error!("dump", "落盘失败(诊断面不许静默): {e}");
             }
             let mut m = Vec::new();
             m.extend_from_slice(&(pos as u32).to_le_bytes());
             m.extend_from_slice(&anchor.to_le_bytes());
             if let Err(e) = owl_shared::file_loader::write("/tmp/owl_dflash_meta.bin", &m) {
-                eprintln!("[dump] 落盘失败(诊断面不许静默): {e}");
+                owl_shared::log_error!("dump", "落盘失败(诊断面不许静默): {e}");
             }
-            eprintln!("[dflash-probe] {} probe roots + hidden 落盘(逐根独立 eval)pos={pos} anchor={anchor}", probe_roots.len());
+            owl_shared::log_debug!("dflash-probe", "{} probe roots + hidden 落盘(逐根独立 eval)pos={pos} anchor={anchor}", probe_roots.len());
         }
         // 探针:logits 前 4 值 f16(NaN 定位;OWL_DFLASH_PROBE)
         let logits_probe = if self.probes.dflash_probe {
@@ -360,7 +359,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     .chunks_exact(2)
                     .map(|c| parse2([c[0], c[1]]))
                     .collect();
-                eprintln!("[dflash-probe] root{i} ({}) |x|前512和 = {s} head={head:?}", pr.shape().iter().map(|v| v.to_string()).collect::<Vec<_>>().join("x"));
+                owl_shared::log_debug!("dflash-probe", "root{i} ({}) |x|前512和 = {s} head={head:?}", pr.shape().iter().map(|v| v.to_string()).collect::<Vec<_>>().join("x"));
             }
             let lb = outs.last().expect("logits root");
             let mut lbuf = vec![0u8; 7 * 248320 * 2];
@@ -372,7 +371,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .chunks_exact(2)
                 .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
                 .collect();
-            eprintln!("[dflash-probe] logits[0..4]={lvals:?}");
+            owl_shared::log_debug!("dflash-probe", "logits[0..4]={lvals:?}");
             // 槽 0 候选 vs 发出草稿(选择器诊断:topk 面若合理而 toks 离谱
             // = 码本项支配 walk;topk 已离谱 = hidden 坏)
             {
@@ -387,7 +386,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 top.select_nth_unstable_by(7, |a, b| b.0.partial_cmp(&a.0).unwrap());
                 top.truncate(8);
                 top.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-                eprintln!("[dflash-probe] slot0 lm_head top8 = {:?}", top);
+                owl_shared::log_debug!("dflash-probe", "slot0 lm_head top8 = {:?}", top);
             }
         }
         let out = {
@@ -403,7 +402,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .collect::<Vec<_>>()
         };
         if self.probes.dflash_probe {
-            eprintln!("[dflash-probe] pos={pos} anchor={anchor} drafts={out:?}");
+            owl_shared::log_debug!("dflash-probe", "pos={pos} anchor={anchor} drafts={out:?}");
         }
         Ok(out)
     }
@@ -484,7 +483,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     .chunks_exact(2)
                     .filter(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32() != 0.0)
                     .count();
-                eprintln!("[enc-bisect] ①eval_ops(memory) 独立: 行0 非零={nz}/5120 |max|={mx:.4}");
+                owl_shared::log_debug!("enc-bisect", "①eval_ops(memory) 独立: 行0 非零={nz}/5120 |max|={mx:.4}");
             }
             let refs1 = vec![&memory];
             let o1 = {
@@ -503,7 +502,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     .chunks_exact(2)
                     .filter(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32() != 0.0)
                     .count();
-                eprintln!("[enc-bisect] ②multi 根=[memory]: 行0 非零={nz}/5120 |max|={mx:.4}");
+                owl_shared::log_debug!("enc-bisect", "②multi 根=[memory]: 行0 非零={nz}/5120 |max|={mx:.4}");
             }
         }
         let roots = d2.encode_kv(&memory, &pos_t, &kvs, &rope, &ctx);
@@ -525,7 +524,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .chunks_exact(2)
                 .filter(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32() != 0.0)
                 .count();
-            eprintln!("[enc-bisect] ③encode 后 K 池非零={nz}/{}", kn);
+            owl_shared::log_debug!("enc-bisect", "③encode 后 K 池非零={nz}/{}", kn);
         }
         Ok(())
     }

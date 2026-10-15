@@ -57,7 +57,7 @@
 //! | log | level / tags_allow / tags_deny / file / max_mb / keep / timestamp | 见模块 |
 //! | probes | trace_gate / dflash_probe / propose_eager | flag / false |
 //! | probes | dflash_eager / dflash_noencode / dflash_dumb | flag / false |
-//! | probes | gdn_dump_all / pf_bisect / pf_fin_check / raw_completion | flag / false |
+//! | probes | gdn_dump_all / pf_bisect / pf_fin_check / raw_completion / prompt_dump / gdn_dbg / pf_fence | flag / false |
 //! | probes | pf_stages | Option<usize> / None |
 //! | cuda | srv_timing / cap_prof / launch_sync / launch_time | flag / false |
 //! | cuda | trace_ring | usize / 0(关;>0 = 发射账容量) |
@@ -82,7 +82,8 @@
 //! 账外键(不入公共面):测试私有旋钮(OWL_GATE_*/OWL_E2E_*/OWL_SWEEP_*/
 //! OWL_WS_MUL/SPLIT_*/MARLIN_*/FI_DEBUG/OWL_27B_STRICT/OWL_HF_PARITY ——
 //! 测试用例自由直读)、构建期键(build.rs 例外)、OWL_CONFIG(loader 路径
-//! 兜底,server 入口读)。
+//! 兜底,server 入口读)、OWL_TEST_CONFIG_*(`#[owl_test]` 每用例配置文件
+//! 路径,见 testkit::case 与 docs/arch/owl-test-macro.md)。
 
 use std::path::{Path, PathBuf};
 
@@ -399,6 +400,18 @@ pub struct ProbesCfg {
     pub pf_stages: Option<usize>,
     pub pf_fin_check: bool,
     pub raw_completion: bool,
+    /// 渲染后 prompt 落盘(/tmp/owl-prompt-*.txt;诊断面 —— 原
+    /// OWL_PROMPT_DUMP env,2026-10-15 随 env 退出配置链收编)
+    #[serde(default)]
+    pub prompt_dump: bool,
+    /// reset_gdn 后 GDN rec 格画像(§三十二 会话污染定位诊断面;
+    /// 原 OWL_GDN_DBG)
+    #[serde(default)]
+    pub gdn_dbg: bool,
+    /// prefill H2D 叶子后插流栅栏(A13 竞态排障;
+    /// 原 OWL_PF_FENCE)
+    #[serde(default)]
+    pub pf_fence: bool,
     /// **单步/粘滞调试门**(2026-10-14;见 `crate::stepgate` 模块头):
     /// 解释器检查点的运行期档位。⚠️ 需以 `--features stepgate` 构建才生效;
     /// 未编入时入口会**可见地告警**(不静默失效)。
