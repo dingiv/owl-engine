@@ -2,6 +2,7 @@
 members = [
     "crates/graph",
     "crates/comm",
+    "crates/test-macros",
     "crates/kernels",
     "crates/backends/cuda",
     "crates/backends/cpu",

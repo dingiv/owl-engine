@@ -80,7 +80,8 @@
 //! 账外键(不入公共面):测试私有旋钮(OWL_GATE_*/OWL_E2E_*/OWL_SWEEP_*/
 //! OWL_WS_MUL/SPLIT_*/MARLIN_*/FI_DEBUG/OWL_27B_STRICT/OWL_HF_PARITY ——
 //! 测试用例自由直读)、构建期键(build.rs 例外)、OWL_CONFIG(loader 路径
-//! 兜底,server 入口读)。
+//! 兜底,server 入口读)、OWL_TEST_CONFIG_*(`#[owl_test]` 每用例配置文件
+//! 路径,见 testkit::case 与 docs/arch/owl-test-macro.md)。
 
 use std::path::{Path, PathBuf};
 

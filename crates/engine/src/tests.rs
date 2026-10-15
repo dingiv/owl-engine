@@ -19,6 +19,11 @@ use crate::scheduler::{SchedulerOutput, StepAction};
 use crate::turn::TurnEvent;
 #[cfg(test)]
 use owl_cpu::CpuFace; // dev-dep:仅 cfg(test) 单元档可用
+// dev-dep 门控(与 tokio 同款模式):cfg(test) 先求值 ⇒ e2e 档不触宏名
+#[cfg(test)]
+use owl_shared::config::OwlConfig;
+#[cfg(test)]
+use owl_test_macros::owl_test;
 use owl_iface::contract::DeviceClient;
 
 fn asset_dir() -> std::path::PathBuf {
@@ -31,11 +36,19 @@ fn gpu_ordinal() -> Option<usize> {
 }
 
 /// CPU:构造(零执行)+ ModelLoader 装载门禁(权重/tokenizer 解析)
-#[cfg(test)] // dev-dep(tokio)门控:单元档专用
-#[tokio::test]
-async fn cpu_construct_and_load() {
+/// EngineConfig 全件从**用例配置**注入(隐藏 env `OWL_TEST_CONFIG_CPU_CONSTRUCT_AND_LOAD`
+/// → 引擎同款 toml;缺省 = `OwlConfig::default()`)。本用例只到 loader ——
+/// 三件均不参与断言,注入不改测试行为;换档 = 换 toml 不改代码(S3 收编示范)。
+#[cfg(test)] // dev-dep(owl-test-macros)门控:单元档专用
+#[owl_test]
+async fn cpu_construct_and_load(cfg: &OwlConfig) {
     let mut engine = Engine::on(
-        EngineConfig { device_ordinal: 0, max_seq_tokens: 64, prefill_chunk: 16, knobs: EngineKnobs::default() },
+        EngineConfig {
+            device_ordinal: cfg.runtime.device,
+            max_seq_tokens: cfg.runtime.max_seq,
+            prefill_chunk: cfg.runtime.prefill_chunk,
+            knobs: EngineKnobs::from_config(cfg),
+        },
         CpuFace::new(),
     )
     .expect("engine 构造");
@@ -45,12 +58,16 @@ async fn cpu_construct_and_load() {
 }
 
 /// CPU:增量解码多字节字符跨 token(🌟 4 字节;逐 token 喂入,
-/// 差分不得 panic 且终态与前缀累计一致)
-#[cfg(test)] // dev-dep(tokio)门控:单元档专用
-#[tokio::test]
-async fn cpu_incremental_decode_multibyte() {
+/// 差分不得 panic 且终态与前缀累计一致)。EngineConfig 同样走用例配置注入。#[cfg(test)] // dev-dep(owl-test-macros)门控:单元档专用
+#[owl_test]
+async fn cpu_incremental_decode_multibyte(cfg: &OwlConfig) {
     let mut engine = Engine::on(
-        EngineConfig { device_ordinal: 0, max_seq_tokens: 64, prefill_chunk: 16, knobs: EngineKnobs::default() },
+        EngineConfig {
+            device_ordinal: cfg.runtime.device,
+            max_seq_tokens: cfg.runtime.max_seq,
+            prefill_chunk: cfg.runtime.prefill_chunk,
+            knobs: EngineKnobs::from_config(cfg),
+        },
         CpuFace::new(),
     )
     .expect("engine 构造");
@@ -67,6 +84,23 @@ async fn cpu_incremental_decode_multibyte() {
         "累计差分应是终文前缀:acc={acc:?} final={final_text:?}"
     );
     assert!(final_text.contains('🌟'), "终文应含拆跨字符");
+}
+
+/// **参数化端到端实证**(owl-test-macro.md §四验收 2):wrapper 注入的
+/// `cfg` 必须与「独立按同键 loader 复算」逐字段一致 —— env 未设臂
+/// (default)与文件臂(设 `OWL_TEST_CONFIG_CASE_CONFIG_INJECTION=<toml>`)
+/// 用同一条断言。零装载零 GPU(单元档)。
+#[cfg(test)]
+#[owl_test]
+async fn case_config_injection(cfg: &OwlConfig) {
+    let key = "OWL_TEST_CONFIG_CASE_CONFIG_INJECTION";
+    let mut expect = match owl_shared::env_reader::str(key) {
+        Some(path) => OwlConfig::load(None, Some(std::path::Path::new(&path)))
+            .unwrap_or_else(|e| panic!("独立复算失败({path}): {e}")),
+        None => OwlConfig::default(),
+    };
+    expect.runtime.test_device = owl_shared::env_reader::parse("OWL_TEST_DEVICE");
+    assert_eq!(cfg, &expect, "宏注入配置必须与唯一 loader 独立复算逐字段同");
 }
 
 /// S0 调度决策面单测(GPU 门控 boot,但**调度步零设备执行**):
