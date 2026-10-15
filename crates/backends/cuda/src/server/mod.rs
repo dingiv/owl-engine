@@ -244,8 +244,9 @@ impl GpuServer {
                 .collect()
         };
         match cmd {
-            Command::UploadAndLaunch { dst, len_bytes, .. } => {
-                E::new("upload_and_launch", "h2d").bytes(*len_bytes).id(dst.id)
+            Command::UploadAndLaunch { dst, chunks, .. } => {
+                let n: usize = chunks.iter().map(|c| c.len_bytes).sum();
+                E::new("upload_and_launch", "h2d").bytes(n).id(dst.id)
             }
             Command::LaunchAndHarvest { id, want_bytes, .. } => {
                 E::new("launch_and_harvest", "d2h").bytes(*want_bytes).id(*id)
@@ -684,8 +685,8 @@ impl GpuServer {
             Command::CopyBatch { copies, ack } => self.handle_copy_batch(copies, ack),
             Command::Launch { msg, ack } => self.handle_launch(msg, ack),
             // **E2b 接线**:复合 = 设备端事件序(record_tail + waitEvent),零 host 阻塞
-            Command::UploadAndLaunch { buf, dst, offset_bytes, len_bytes, msg, ack } => {
-                self.handle_upload_and_launch(buf, dst, offset_bytes, len_bytes, msg, ack)
+            Command::UploadAndLaunch { dst, chunks, msg, ack } => {
+                self.handle_upload_and_launch(dst, chunks, msg, ack)
             }
             Command::LaunchAndHarvest { msg, id, want_bytes, ack } => {
                 self.handle_launch_and_harvest(msg, id, want_bytes, ack)
@@ -1113,18 +1114,29 @@ impl GpuServer {
     /// 客户端口不出现流/事件/槽;零 host 阻塞(实测 record 170~740ns / wait 180ns)。
     fn handle_upload_and_launch(
         &mut self,
-        buf: Box<dyn owl_iface::contract::PinnedRegion + Send>,
         dst: Bytes,
-        offset_bytes: usize,
-        len_bytes: usize,
+        chunks: Vec<owl_iface::contract::UpChunk>,
         msg: LaunchMsg,
         ack: Ack<Result<Bytes, ModelError>>,
     ) {
         let out = (|| -> Result<Bytes, ModelError> {
-            self.enqueue_upload_pinned(buf, dst, offset_bytes, len_bytes)?;
-            self.ctx_mut().record_tail(STREAM_H2D)?;
-            self.ctx_mut()
-                .wait_stream_on_tail(STREAM_COMPUTE, STREAM_H2D)?;
+            // **同流策略**(2026-10-16 定调,设计 §3.2「序由 server 内部保证」):
+            // 搬运就放在**消费它的 COMPUTE 流**上 ⇒ 「写完才算」由**单流硬件
+            // 保序**给出,**零事件、零栅栏、零跨流假设**;同时也天然解决"槽复用
+            // 的写等读"(前一轮核与本次搬运同流)。
+            // 代价 = 该键的 DMA 与计算不重叠 —— 但装载本就是"搬一块算一块"的
+            // 逐键串行形状,host 侧仍可提前备好下一键的租约。
+            // (跨流事件序留给需要**真并行**的场合:`LaunchAndHarvest` 的 D2H
+            //  回读走的就是既有 dtoh 事件等待路。)
+            for c in chunks {
+                self.enqueue_upload_pinned_on(
+                    STREAM_COMPUTE,
+                    c.lease,
+                    dst.clone(),
+                    c.offset_bytes,
+                    c.len_bytes,
+                )?;
+            }
             self.enqueue_launch(msg)
         })();
         ack.send(out);

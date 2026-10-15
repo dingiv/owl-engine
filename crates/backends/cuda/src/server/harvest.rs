@@ -153,7 +153,20 @@ impl GpuServer {
         offset_bytes: usize,
         len_bytes: usize,
     ) -> Result<(), ModelError> {
-        let stream = match self.ctx().stream(STREAM_H2D) {
+        self.enqueue_upload_pinned_on(STREAM_H2D, buf, dst, offset_bytes, len_bytes)
+    }
+
+    /// 同上,但**指定流**(复合命令 `UploadAndLaunch` 用:把搬运放在**消费它的
+    /// 那条流**上 ⇒ 单流硬件保序,零事件零栅栏 —— 见 server 侧复合处理体)
+    pub(super) fn enqueue_upload_pinned_on(
+        &mut self,
+        stream_id: crate::state::StreamId,
+        buf: Box<dyn owl_iface::contract::PinnedRegion + Send>,
+        dst: Bytes,
+        offset_bytes: usize,
+        len_bytes: usize,
+    ) -> Result<(), ModelError> {
+        let stream = match self.ctx().stream(stream_id) {
             Ok(s) => s.clone(),
             Err(e) => return Err(e),
         };

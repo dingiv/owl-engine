@@ -134,10 +134,9 @@ pub enum Command {
     /// (E2a:线格式/校验/负门;**E2b 接线** = 完成回调链 → 设备端事件序)。
     /// 失败带**结构化阶段**(transfer / launch)。
     UploadAndLaunch {
-        buf: Box<dyn owl_iface::contract::PinnedRegion + Send>,
         dst: Bytes,
-        offset_bytes: usize,
-        len_bytes: usize,
+        /// 分块搬运(装载按 CHUNK 切;序罩住**全部**块 —— 见 server 侧前置等待)
+        chunks: Vec<owl_iface::contract::UpChunk>,
         msg: LaunchMsg,
         ack: Ack<Result<Bytes, ModelError>>,
     },

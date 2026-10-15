@@ -13,6 +13,4 @@
 //! (2026-09-26 文件重组:吸收原 client.rs / types.rs(重复物)/
 //! shape.rs / error.rs 的 re-export 部分,四个碎壳合一。)
 
-pub use owl_iface::contract::{
-    Arg, Bytes, DeviceClient, Dtype, GraphId, KernelSource, LaunchMsg, ModelError, Shape, numel,
-};
+pub use owl_iface::contract::{Arg, Bytes, DeviceClient, Dtype, GraphId, KernelSource, LaunchMsg, ModelError, Shape, UpChunk, numel};

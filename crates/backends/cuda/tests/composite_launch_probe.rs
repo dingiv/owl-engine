@@ -88,7 +88,11 @@ async fn composites_hold_stream_order_and_closed_set_validation() {
     let bb = le_f32(&bv);
     lease.slice_bytes_mut()[..bb.len()].copy_from_slice(&bb);
     let out_b = c
-        .upload_and_launch(lease, &b, 0, n * 4, add_msg(&a, &b, &out1, n))
+        .upload_and_launch(
+            &b,
+            vec![owl_cuda::UpChunk { offset_bytes: 0, len_bytes: n * 4, lease }],
+            add_msg(&a, &b, &out1, n),
+        )
         .await
         .expect("upload_and_launch");
     assert_eq!(out_b.id, out1.id, "复合 #1 回传的应是本 launch 输出块");
@@ -172,7 +176,11 @@ async fn composites_are_rejected_during_capture() {
     c.graph_begin().await.expect("捕获开始");
     // 捕获期发复合 #1(内含 H2D)⇒ 必须被白名单拒
     let e1 = c
-        .upload_and_launch(lease, &b, 0, n * 4, add_msg(&a, &b, &out, n))
+        .upload_and_launch(
+            &b,
+            vec![owl_cuda::UpChunk { offset_bytes: 0, len_bytes: n * 4, lease }],
+            add_msg(&a, &b, &out, n),
+        )
         .await
         .expect_err("捕获期 UploadAndLaunch 应拒");
     // 捕获期发复合 #2(内含 Dtoh)⇒ 同样拒

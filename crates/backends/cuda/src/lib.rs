@@ -48,7 +48,7 @@ pub use state::DeviceSelector;
 // 2026-09-25 解除 owl-cuda → owl-models 反向依赖,客户只依赖 owl-cuda
 // 即可组装命令,不必直连任何前端 crate)
 pub use owl_iface::contract::{
-    Arg, Bytes, DeviceClient, GraphId, KernelSource, LaunchMsg, ModelError,
+    Arg, Bytes, DeviceClient, GraphId, KernelSource, LaunchMsg, ModelError, UpChunk,
 };
 pub use owl_iface::contract::{Dtype, Shape};
 

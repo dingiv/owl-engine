@@ -141,6 +141,15 @@ impl PinnedRegion for HeapRegion {
 /// - `htod` / `dtoh`:Ok = GPU 真完成(pinned 码头生命周期/数据收割
 ///   要求真实完成点;完成通知走 host 回调 cuLaunchHostFunc)
 /// - `sync`:栅栏,三条流此前全部工作落定(全设备语义屏障)
+/// **复合命令 `UploadAndLaunch` 的一块搬运**(字节口径;租约所有权随命令
+/// 移入,server 在 DMA 完成后归还 pinned 池)。
+/// 定为契约面类型:既是线格式,也是 [`DeviceClient`] 复合口的参数。
+pub struct UpChunk {
+    pub offset_bytes: usize,
+    pub len_bytes: usize,
+    pub lease: Box<dyn PinnedRegion + Send>,
+}
+
 pub trait DeviceClient: Send {
     /// 执行环境提供(硬件感知;None = 无 GPU 环境,语义调用结构化拒绝)。
     /// 感知发生在引擎/boot 侧(实现者可缓存);kernels/解释器零探测
@@ -329,6 +338,31 @@ pub trait DeviceClient: Send {
         _len_bytes: usize,
     ) -> impl Future<Output = Result<(), ModelError>> + Send {
         async { Err(ModelError::Msg("memset_zero: 此后端未实现".into())) }
+    }
+
+    /// **复合口(E3):上传并计算** —— 一次(可分块)搬运 + 一次发射,两者之间的
+    /// 序由实现方保证(**设备端事件序**,零 host 阻塞)。需要跨流序的调用点
+    /// 只用本口,不自己拼"上传 + 栅栏 + 发射"。
+    ///
+    /// 默认不支持(只有能跨流定序的 face 实现;天然同步的后端无需它)。
+    fn upload_and_launch(
+        &mut self,
+        _dst: &Bytes,
+        _chunks: Vec<UpChunk>,
+        _msg: LaunchMsg,
+    ) -> impl Future<Output = Result<Bytes, ModelError>> + Send {
+        async { Err(ModelError::Msg("upload_and_launch: 此后端未实现".into())) }
+    }
+
+    /// **复合口(E3):计算并回读** —— 一次发射 + 一次回读;序同样由实现方保证
+    /// (发射 → 等该流落定 → 回读),**禁退化成 host 全排空**。默认不支持。
+    fn launch_and_harvest(
+        &mut self,
+        _msg: LaunchMsg,
+        _id: u64,
+        _want_bytes: usize,
+    ) -> impl Future<Output = Result<Vec<u8>, ModelError>> + Send {
+        async { Err(ModelError::Msg("launch_and_harvest: 此后端未实现".into())) }
     }
 
     /// 设备内块→块拷贝(E2c:GDN 快照拍摄/恢复 —— 会话格 ↔ 快照缓冲

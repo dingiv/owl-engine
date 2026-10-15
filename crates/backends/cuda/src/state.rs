@@ -701,18 +701,23 @@ impl GpuCtx {
                 "跨流等待不可捕获:捕获期禁止 wait_stream_on_tail".into(),
             ));
         }
-        let ev = self.tail_event.get(&dep).copied().ok_or_else(|| {
-            ModelError::Msg(format!("wait_stream_on_tail: dep 流 {dep} 尚无尾事件(先 record_tail)"))
+        // **按需新事件,不池化**(与 `server/harvest.rs::handle_dtoh_inner` 的
+        // 「塔零案」修法**同机制**):`record_event(None)` 每次新建 + `wait(&ev)`
+        // 设备端等待。
+        //
+        // ⚠️ **池化复用是错的**(2026-10-16 实测定谳):CUDA 语义里"事件被某流
+        // 等待、同时被重录"= **UB(不报错)** —— 池轮转 8 事件下 4B VLM 四图
+        // **确定性错值**(bird top-1 47 vs 280)。故本口一律新建;
+        // state 里那套 `tail_event/event_pool` 降为**纯记账**(只录不等人,
+        // 不参与任何定序)。
+        let dep_stream = self.stream(dep)?;
+        let ev = dep_stream.record_event(None).map_err(|e| {
+            ModelError::Msg(format!("wait_stream_on_tail({stream}←{dep}): 记入 {e:?}"))
         })?;
         let st = self.stream(stream)?;
-        unsafe {
-            crate::ffi::stream_wait_event(
-                st.cu_stream(),
-                ev.0,
-                crate::ffi::sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
-            )
-        }
-        .map_err(|e| ModelError::Msg(format!("wait_stream_on_tail({stream}←{dep}): {e:?}")))
+        st.wait(&ev).map_err(|e| {
+            ModelError::Msg(format!("wait_stream_on_tail({stream}←{dep}): 等待 {e:?}"))
+        })
     }
 
     /// 该流的尾事件(仅 server 内部消费;`None` = 该流尚无已记账的完成点)
