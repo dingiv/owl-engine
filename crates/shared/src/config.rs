@@ -830,7 +830,7 @@ allowed_ops = [
 #   ctx_total 走宿主标量槽 —— 见 docs/piecewise-断点图-设计与实现.md §11.6)
 # 真机:32k 轮时 69.3 → **48.4ms(−30%)**,轮时对 ctx **变平**(8k 48.6/32k 48.4),
 # 文本/tok/hid 与基线逐位一致;prefill 不动。
-# ⚠️ decode(T=1)仍走 XQA(见下方 decode_xqa;V1c 可同法换)。
+# ⚠️ decode(T=1)已于同日(V1c)同法换装:见下方 decode_xqa/decode_fi 段。
 verify_xqa = false
 verify_v2 = false
 verify_piecewise = true
@@ -838,7 +838,12 @@ verify_fi = true
 # 裸 decode 走 XQA(2026-10-13 ②):第二份实例化 `M_TILESIZE=16`。
 # 注:短 ctx 收益略低(512 档 1.90× vs 2048 档 2.25×),但**不缺省加 ctx
 # 阈值门** —— 最小值也在 1.4× 以上,且阈值本身是额外的一支分支/形状面。
-decode_xqa = true
+decode_xqa = false
+# decode 走 **FI 断点**(V1c;session 常驻图改分段,断点挂 decode 核):
+# 裸 decode 阶梯 8192/32768 = 33.1/47.8 → **27.8/29.0 ms/tok(-16%/-39%,对 ctx 平坦)**,
+# 文本与 v2/XQA 逐位一致。⚠️ 曾踩:plan_session 少交断点采集面 ⇒ FI 核被烘进图 + plan 用
+# 占位 ctx_total=1 ⇒ 文本连贯但错(见状 §11.13)。
+decode_fi = true
 # GDN prefill 臂(2026-10-11 终版):fork-bf16 全家桶转正 —— g 语义律
 # 修复(kkt/h/o 必须吃 cumsum 而非 raw g;raw g 在深谷 -24 时
 # exp(±24)=e²⁴ 爆炸)。恒等门:四域 vs recurrence 逐位一致;std 矩阵

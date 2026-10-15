@@ -598,3 +598,32 @@ FI 读 decode 行错(本次症状 ✓:FI 只与 K0 写的行对过账,verify 臂
 2. **`ctx_total` 宿主槽与 plan 的时序**:plan 每步 miss ⇒ 重算 + H2D(在窗外 ✓),需证实
    "回放期真正读到的是本轮值"(仪器:`OWL_FI_DEBUG=1` 打印 plan 的 split/num_chunks,逐步对照);
 3. **`gate`/`wr` 依赖边**在 FI 节点里的槽序是否与 decode 路一致(两路 arm 的实参顺序不同)。
+
+### 11.13 ✅ V1c 结案(2026-10-16):真因 = session 图**没交断点采集面**(一行),FI 核被烘进图用占位 plan
+
+**取证**(两件仪器:FI plan 的 ctx_total 打印 + session 分段日志):
+```
+session 分段捕获(段=1 断点=0)         ← decode_fi 开着却是 0 断点
+[fi-plan] ctx_total=1 nb_pages=1 T=1   ← 占位值(建树期的 ctx_total=tokens=1)
+[fi-plan] ctx_total=53 nb_pages=2 T=53 ← 全程只有 prefill 的两次
+```
+⇒ 模型侧 FI 分支照常返回 FI 节点,但 `ctx.attn_break` 为 None ⇒ **登记被跳过** ⇒ 核留在
+session 图里,plan 用**占位 ctx_total=1** 烘死 ⇒ 每步拿"ctx=1"的调度表读 53+ 的池
+⇒ 输出连贯但错(先前"FI ≢ v2"的症状全由此解释,**不是**核/布局/表的问题)。
+
+**修复**:`plan_session` 闭包里与 `plan_verify` 同律 `ctx.attn_break = Some(sc.break_sink())`
+⇒ `session 分段捕获(段=17 断点=16)`,FI 臂文本 ≡ v2/XQA **逐字一致**。
+
+**收益(裸 decode 阶梯,27B+fp8,greedy)**:
+| ctx | XQA(生产) | **FI 断点** | FI+桶 2048 |
+|---:|---:|---:|---:|
+| 8192 | 33.13 ms/tok | **27.83** | 28.37 |
+| 32768 | 47.78 ms/tok | **29.00(−39%)** | 29.66 |
+⇒ 对 ctx **平坦**(27.8/29.0),fi-plan 每步重算(609 次/两点)其实便宜 ⇒ **分桶无益**(+1%),
+不做桶(设计上少一层)。**转正**:flavor `spec-dflash` + 生产 args 档 `decode_xqa=false /
+decode_fi=true`(⚠️ args 覆盖 flavor,两处都要改;同一坑第二次踩)。
+
+**方法论**(本轮的账):追踪"连贯但错"的输出时,**先证"这条路径到底有没有跑"**(段/断点计数、
+plan 计数、字节差分),再怀疑数值 —— 本轮三个仪器(分段计数/plan 打印/KV 足迹)各只花几行,
+却一次排掉"核错/布局错/表错"三个方向;**而"看起来像 A 臂"的数字可能是 B 臂**(档被我拼坏过一次,
+把 v2 当成了 FI)⇒ 报数前先验"臂真的在跑"。

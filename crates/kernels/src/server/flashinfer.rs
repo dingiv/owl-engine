@@ -146,6 +146,14 @@ impl KernelFamily for FiRuntime {
             // (实测 T=8/ctx=3072:零值 43008/49152)。split 关时该数组不参与任何
             // 决策(plan 与 ctx 无关),所以这个单位错一直隐身。
             let nb_pages = call.ctx_total.div_ceil(call.page.max(1)) as i32;
+            // ⚙ 诊断(OWL_FI_DEBUG=1):plan 重算时的**本轮** ctx_total(宿主标量槽
+            // 是否真按步送到 —— piecewise 断点面取证;缺省零输出)
+            if std::env::var_os("OWL_FI_DEBUG").is_some_and(|v| v != "0") {
+                eprintln!(
+                    "[fi-plan] ctx_total={} nb_pages={nb_pages} T={} page={}",
+                    call.ctx_total, call.total_rows, call.page
+                );
+            }
             let kv_indptr = [0i32, nb_pages];
             let (mut plan15, mut cta_tile_q, mut split_kv) = ([0i64; 15], 0i32, 0i32);
             let rc = unsafe {

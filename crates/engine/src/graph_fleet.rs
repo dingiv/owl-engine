@@ -253,6 +253,13 @@ impl<D: DeviceClient> GraphFleet<D> {
             }
             // FI 断点臂(session/T=1):表四件套槽 → U32 视图 + FiPrefillCtx +
             // 宿主标量槽(ctx_total 每步由引擎写)
+            // ⚠️ **断点采集面**必须交给模型(与 plan_verify 同律):不交 ⇒
+            // 模型只能"把 FI 核照原样吐回树里" ⇒ 核被烘进图 + plan 用占位
+            // ctx_total 烘死 ⇒ 每步拿 ctx=1 的调度表读 53+ 的池(实测踩过:
+            // "段=1 断点=0" + fi-plan 只有 prefill 两次 + 文本连贯但错)。
+            if dfi_on {
+                ctx.attn_break = Some(sc.break_sink());
+            }
             if let (true, Some(cell)) = (dfi_on, fi_cell_c.as_ref()) {
                 let blk_id = |t: &TensorOps| -> Result<u64> {
                     match t.op() {
@@ -357,7 +364,10 @@ impl<D: DeviceClient> GraphFleet<D> {
         };
         // V1c:decode_fi 开 ⇒ 段驱动件(断点在 decode 核 ⇒ FI plan 每步重算)
         let (session, capture_outcome) = if dfi_cell.is_some() {
-            GraphPlan::plan_piecewise(face, env, desc, true, forward).await?
+            let (g, o) = GraphPlan::plan_piecewise(face, env, desc, true, forward).await?;
+            let (ns, nb) = g.piecewise_shape();
+            owl_shared::log_info!("boot", "session 分段捕获(段={ns} 断点={nb}) +{:.2}s", t0.elapsed().as_secs_f32());
+            (g, o)
         } else {
             GraphPlan::plan(face, env, desc, forward).await?
         };

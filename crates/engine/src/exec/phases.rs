@@ -99,7 +99,16 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if self.graphs.session.has_input("fi_q_cu") {
             if let Some(cell) = self.graphs.decode_fi_ctx() {
                 let ctx_total = pos + 1;
-                cell.store(ctx_total, std::sync::atomic::Ordering::Relaxed);
+                // ⚙ diag(`OWL_FI_BUCKET=<n>`):把**宿主标量槽**按桶上取整 ⇒ plan
+                // 只在跨桶时重算(表仍按真值写 ⇒ 每行 KV 上界由设备表定)。
+                // 判据:文本仍 ≡ 参考臂(plan 过供给只是多些被掩的 CTA)。
+                let bucket = owl_shared::env_reader::parse::<usize>("OWL_FI_BUCKET").unwrap_or(0);
+                let plan_ctx = if bucket > 0 {
+                    ctx_total.div_ceil(bucket) * bucket
+                } else {
+                    ctx_total
+                };
+                cell.store(plan_ctx, std::sync::atomic::Ordering::Relaxed);
                 let page = self.pool.page;
                 let bt_chain = {
                     let s = self.bank.sessions.get(sid).expect("账在");
