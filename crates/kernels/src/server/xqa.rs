@@ -14,7 +14,7 @@
 //! - `XqaRuntime`       → `xqa_verify`(SPEC_DEC=1 `M_TILESIZE=32`)
 //! - `XqaDecodeRuntime` → `xqa_decode`(SPEC_DEC=1 `M_TILESIZE=16`,裸 decode q=1)
 
-use crate::client::xqa::{parse_verify, DECODE_XQA, VERIFY_XQA};
+use crate::client::xqa::{parse_verify, DECODE_XQA, PREFILL_XQA, VERIFY_XQA};
 use crate::contract::{Bytes, Dtype, LaunchMsg, OpError, OpId};
 use crate::family::xqa::{
     KVCacheList, XqaArgs, XqaConsts, ASSET_DECODE, ASSET_VERIFY, CONSTS_SLOTS, SYM_CONSTS, SYM_KERNEL,
@@ -91,13 +91,16 @@ impl XqaRuntime {
 }
 
 /// 发射公共体(两条臂共用;差别只在装载的资产变体)
-fn emit(
+/// 发射公共体(几何可变面单列:`single_block` = KV-split 关 = prefill 臂契约;
+/// 见 [`crate::family::xqa::XqaConsts::launch_geometry_single_block`])
+fn emit_geom(
     msg: &LaunchMsg,
     res: &mut dyn crate::device::DeviceRes,
     exec: &mut crate::device::Exec,
     op: &'static str,
     kernel: &Arc<cudarc::driver::CudaFunction>,
     consts: &XqaConsts,
+    single_block: bool,
 ) -> Result<Bytes, OpError> {
     let c = parse_verify(msg)?;
     // 逐参命名解析(失败即报"哪一个参 + 哪个块 id" —— DeadBlock 定谳用)
@@ -134,13 +137,17 @@ fn emit(
     })?;
 
     // 图元(常量全部来自资产自描述;Rust 侧零复制)
-    let (grid, block, smem) = consts.launch_geometry(
-        c.sm_count as u32,
-        /*batch=*/ 1,
-        c.hkv as u32,
-        c.max_seq_len as u32,
-        c.q_seq_len as u32,
-    );
+    let (grid, block, smem) = if single_block {
+        consts.launch_geometry_single_block(c.hkv as u32, c.q_seq_len as u32)
+    } else {
+        consts.launch_geometry(
+            c.sm_count as u32,
+            /*batch=*/ 1,
+            c.hkv as u32,
+            c.max_seq_len as u32,
+            c.q_seq_len as u32,
+        )
+    };
     let args = XqaArgs {
         q_seq_len: c.q_seq_len as u32,
         nb_k_heads: c.hkv as u32,
@@ -194,7 +201,49 @@ impl KernelFamily for XqaRuntime {
         res: &mut dyn crate::device::DeviceRes,
         exec: &mut crate::device::Exec,
     ) -> Result<Bytes, OpError> {
-        emit(msg, res, exec, VERIFY_XQA, &self.kernel, &self.consts)
+        emit_geom(msg, res, exec, VERIFY_XQA, &self.kernel, &self.consts, false)
+    }
+}
+
+/// **prefill(chunked q=T)臂 runtime**(自 `feat/prefill-graph` 合入,2026-10-15)。
+///
+/// 与 [`XqaRuntime`] **同一份资产/同一槽序**(`M_TILESIZE=32` 的 SPEC_DEC 单遍核
+/// 在 q=T 时就是 chunked prefill 的因果块),唯一分叉 = **几何强制单块**
+/// (`nbSubSeq = 1`):`grid.y = hkv·ceil(q·headGrp/rowsPerBlock)` 已把 SM 喂饱
+/// (q=512 ⇒ 384 CTAs),实测再开 KV-split 时间一字不变 ⇒ 本臂结构上**不需要**
+/// scratch/semaphores(`isMultiBlock` 恒假;顺带绕开 semaphores 尺寸雷,见
+/// `cu/xqa/README.md`)。该不变量**只住这里**(调用方拿不到第二处决定权)。
+pub struct XqaPrefillRuntime {
+    kernel: Arc<cudarc::driver::CudaFunction>,
+    consts: XqaConsts,
+}
+
+impl XqaPrefillRuntime {
+    /// **本族身份**(族名 = 线契约名;字面量住 `family::xqa`,零门)
+    pub const ID: OpId = OpId(crate::family::xqa::PREFILL_XQA);
+}
+
+impl KernelFamily for XqaPrefillRuntime {
+    fn id(&self) -> OpId {
+        Self::ID
+    }
+
+    /// 装配:载 **verify 资产**(同一份实例化)
+    fn assemble(
+        res: &mut dyn crate::device::DeviceRes,
+        exec: &mut crate::device::Exec,
+    ) -> Result<Box<dyn KernelFamily>, OpError> {
+        let (kernel, consts) = assemble_common(res, exec, ASSET_VERIFY, OpId(PREFILL_XQA))?;
+        Ok(FamilyGuard::boxed(XqaPrefillRuntime { kernel, consts }))
+    }
+
+    fn run(
+        &mut self,
+        msg: &LaunchMsg,
+        res: &mut dyn crate::device::DeviceRes,
+        exec: &mut crate::device::Exec,
+    ) -> Result<Bytes, OpError> {
+        emit_geom(msg, res, exec, PREFILL_XQA, &self.kernel, &self.consts, true)
     }
 }
 
@@ -225,6 +274,6 @@ impl KernelFamily for XqaDecodeRuntime {
         res: &mut dyn crate::device::DeviceRes,
         exec: &mut crate::device::Exec,
     ) -> Result<Bytes, OpError> {
-        emit(msg, res, exec, DECODE_XQA, &self.kernel, &self.consts)
+        emit_geom(msg, res, exec, DECODE_XQA, &self.kernel, &self.consts, false)
     }
 }

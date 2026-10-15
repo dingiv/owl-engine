@@ -152,8 +152,51 @@ impl KernelSpec for XqaDecode {
 pub static XQA_VERIFY: KernelMeta = meta_of::<XqaVerify>();
 pub static XQA_DECODE: KernelMeta = meta_of::<XqaDecode>();
 
+/// `owl_xqa_prefill` —— **chunked prefill** 注意力(q=T 行因果块)。
+///
+/// 与 [`XqaVerify`] **同资产同槽序**(同一份 `M_TILESIZE=32` 实例化;
+/// SPEC_DEC 单遍核在 q=T 时就是 chunked prefill 的因果块:行 i 看
+/// `[0, ctx_base+i]`,掩码 `mask[i] = (1<<(i+1))-1` 逐字同式)。
+/// 分开建表的两个理由:① 审计面能分辨臂(白名单/日志/性能相位);
+/// ② **几何契约不同** —— 本臂强制单块(`launch_geometry_single_block`),
+/// 该不变量住 server emit 一处(见 `server::xqa::XqaPrefillRuntime`)。
+///
+/// ⚠️ 生产主路径**不用它**(CUPTI 同请求 A/B:XQA 258.5ms vs FI 63.0ms = 慢 4.1×;
+/// XQA 是 decode 形状核);它只接 **FI 的缺口**(`t < fi_min_tokens` 尾块 /
+/// `ctx.fi` 缺席),那里 9.4× 于回落核。`dispatch.xqa_prefill` 缺省 false。
+pub struct XqaPrefill;
+
+impl KernelSpec for XqaPrefill {
+    /// 执行家族(声明驱动路由;**声明面与执行面同一字面量** —— A18 律)
+    const FAMILY: crate::contract::OpId = crate::contract::OpId(xqa::PREFILL_XQA);
+    const ENTRY: &'static str = xqa::PREFILL_XQA;
+    const SRC: &'static str = "";
+    const PARAMS: &'static [Param] = XQA_PARAMS;
+    const SHAPE: ShapeFamily = ShapeFamily {
+        kv_dtype: Some(Dtype::U8),
+        head_dim: &[256],
+        page: &[16, 32, 64, 128],
+        grp: Some(6),
+        tile: None,
+    };
+    const POOL: &'static [crate::spec::PoolAccess] =
+        &[crate::spec::PoolAccess::read(
+            crate::spec::pools::KV_MAIN,
+            crate::spec::LayoutTag::Knhd,
+            Dtype::U8,
+        )];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+    fn check(ctx: &CheckCtx<'_>) -> Result<(), OpError> {
+        check_xqa(ctx)
+    }
+}
+
+pub static XQA_PREFILL: KernelMeta = meta_of::<XqaPrefill>();
+
 /// 本域全部已建表算子
-pub static METAS: &[&KernelMeta] = &[&XQA_VERIFY, &XQA_DECODE];
+pub static METAS: &[&KernelMeta] = &[&XQA_VERIFY, &XQA_DECODE, &XQA_PREFILL];
 
 #[cfg(test)]
 mod tests {
@@ -171,6 +214,9 @@ use crate::spec::{meta_of};
         let m = meta_of::<XqaVerify>();
         assert_eq!(m.args_str(), xqa::VERIFY_XQA_SIG);
         assert_eq!(meta_of::<XqaDecode>().args_str(), xqa::DECODE_XQA_SIG);
+        // prefill 臂:同一张槽序表(逐字同型)⇒ 三臂互证
+        assert_eq!(meta_of::<XqaPrefill>().args_str(), xqa::PREFILL_XQA_SIG);
+        assert_eq!(meta_of::<XqaPrefill>().args_str(), m.args_str());
     }
 
     /// 测试参数:事实按 XQA_PARAMS 声明填(事实面门现在会逐槽比对)

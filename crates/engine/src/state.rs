@@ -103,6 +103,8 @@ pub(crate) struct PoolPlan {
     pub xqa_verify: bool,
     /// XQA 裸 decode 臂(SPEC_DEC=1 `M_TILESIZE=16`)
     pub xqa_decode: bool,
+    /// **XQA prefill 臂**(chunked q=T;同一份 `M_TILESIZE=32` 实例化)
+    pub xqa_prefill: bool,
     /// GDN 状态格容量
     pub gdn_slots: usize,
     /// spec 快照池深度
@@ -349,7 +351,7 @@ impl StatePool {
         // 掩码:q=1 时只读 index 0,而 index 0 = `(1<<1)-1 = 1` —— 恰好是
         // decode 需要的"bit0 允许自身",**两形状共用同一张量**。
         let xqa = if paged
-            && (plan.xqa_verify || plan.xqa_decode)
+            && (plan.xqa_verify || plan.xqa_decode || plan.xqa_prefill)
             && matches!(plan.kv, owl_models::env::KvQuant::Fp8E4M3)
             && dims.hd == 256
             && page == 32

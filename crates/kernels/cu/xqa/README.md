@@ -70,3 +70,36 @@ SPEC_DEC=1 / 其余 0。**编译只需补 `--expt-relaxed-constexpr`**(实测 12
 
 ⇒ 按 16 个全注意力层/轮折算:verify 注意力 **42.8ms → 7.9ms(−34.9ms/轮)**。
 数值与现役 v2 臂同级(4.5e-4 vs 4.6e-4),门 1e-2 有 22× 余量。
+
+## prefill 形状(q=T 大块)—— ⚠️ **别用**(2026-10-14 实测否决)
+
+`SPEC_DEC` 的 q 维"近乎免费"是 **小 q 专属**(q=1..8)。q=T 时它是**输家**:
+
+| 同请求 A/B(3038 tok / 6 chunk,CUPTI 逐核) | XQA `kernel_mha` | FlashInfer `BatchPrefill` |
+|---|---:|---:|
+| prefill 注意力总时 | **258.5 ms** | **63.0 ms(快 4.1×)** |
+| 每 chunk(16 层) | 43.0 ms | 10.5 ms |
+
+根因:张量核利用率 —— XQA@q=512 ≈ **9 TFLOPS**,FI(FA2 q 分块)40+ TFLOPS。
+单算子对拍里 XQA 2–3× 于 `vllm_chunked_prefill_paged_opt_fp8_knhd_hd256` 是真的,
+但那个核**只在 FI 缺席时**(`t < 128` 尾块 / `ctx.fi=None`)才上阵 ⇒ 拿它当
+"生产基线"做选型会把结论方向搞反(**§14.1 教训**)。
+XQA prefill 因此只作 **FI 缺口交接臂**(`dispatch.xqa_prefill`,缺省关;
+t<128 处 9.4× 于回落核),命令与全部证据见
+`docs/arch/prefill-graph-施工.md` **§14**。
+
+### ⚠️ KV-split 的 semaphores 数组必须按 `gridDim.y × batch` 分配
+
+`mha.cu:2829`:`atom.inc [semaphores[nbIndepHeadTokens·idxReq + blockIdx.y]]`,
+而 `nbIndepHeadTokens = gridDim.y`。SPEC_DEC 下
+`gridDim.y = nbKHeads·ceil(q·headGrp / rowsPerBlock)`:
+
+| 臂 | q | gridDim.y | 需要槽数 | 参考实现旧式(hkv+2+hkv+2=12) |
+|---|---:|---:|---:|---|
+| decode | 1 | 4 | 4 | 侥幸够 |
+| verify | 8 | 8 | 8 | 侥幸够 |
+| **prefill** | 512 | **384** | **384** | ❌ **越界 372 槽**(实测现象:1/3 输出全零) |
+
+⇒ 按 `grid.y + slack` 分配;引擎侧靠 `launch_geometry_single_block`(KV-split 关)
+让该数组结构上永不解引用(开 split 时间**一字不变**:ctx512 0.882 vs 0.886 ms,
+ctx16384 21.244 vs 21.564 ms)。

@@ -749,15 +749,23 @@ fn build_flashinfer() {
     // FlashInfer prefill(foreign-kernel 通道;E1.5 工作包)
     //
     // **2026-10-13 C3-α**:由"预编 `.a` 入库(8.2 MB)"改为**构建期从源编**;
-    // 头闭包已 **vendor 进树**(`cu/flashinfer/include/`,22 文件 ~700 KB,
-    // 闭包复现法见其 README)—— 原先缺省读 `~/.cudaforge/...` 的**树外**检出,
+    // 头闭包已 **vendor 进树**(`cu/flashinfer/include/`,**上游 0.6.18 闭包**
+    // 22 文件 ~700 KB;闭包复现法见其 README)—— 原先缺省读 `~/.cudaforge/...` 的**树外**检出,
     // 违 §15.1.1 律 1"所有族的源必须在树"。冷编 ≈ 1.5 min,增量闸吸收。
     // ------------------------------------------------------------------
     if std::env::var_os("CARGO_FEATURE_FLASHINFER").is_some() {
-        let src = "cu/flashinfer/owl_fi_attention.cu";
+        // 2026-10-15 **拆 TU**:上游 0.6.18 单 TU 里 f16+fp8 双实例化 FA2 模板
+        // ⇒ ptxas 病态卡住。按 KV dtype 臂拆:plan+f16 住主文件,fp8 臂单列
+        // (共享模板头 `owl_fi_attention_common.h`);两个 .o 归同一个 `.a`,
+        // **ABI 零改动**。
+        let src_f16 = "cu/flashinfer/owl_fi_attention.cu";
+        let src_fp8 = "cu/flashinfer/owl_fi_attention_fp8.cu";
+        let src_hdr = "cu/flashinfer/owl_fi_attention_common.h";
         let fi_include = env::var("FLASHINFER_INCLUDE")
             .unwrap_or_else(|_| "cu/flashinfer/include".into());
-        println!("cargo:rerun-if-changed={src}");
+        for f in [src_f16, src_fp8, src_hdr] {
+            println!("cargo:rerun-if-changed={f}");
+        }
         println!("cargo:rerun-if-changed={fi_include}");
         println!("cargo:rerun-if-env-changed=FLASHINFER_FORCE_BUILD");
         println!("cargo:rerun-if-env-changed=FLASHINFER_INCLUDE");
@@ -768,34 +776,48 @@ fn build_flashinfer() {
         let fi_dir = out_dir.join("flashinfer");
         std::fs::create_dir_all(&fi_dir).expect("mkdir flashinfer out");
         let lib = fi_dir.join("libowl_flashinfer.a");
-        let flags = format!("fi arch=sm_86 nvcc={nvcc_m} ar={ar} inc={fi_include} fp8=1");
-        let mut deps: Vec<String> = vec![src.to_string()];
+        let flags = format!(
+            "fi arch=sm_86 nvcc={nvcc_m} ar={ar} inc={fi_include} src=upstream-0.6.18 split=2tu"
+        );
+        let mut deps: Vec<String> =
+            vec![src_f16.to_string(), src_fp8.to_string(), src_hdr.to_string()];
         all_files(&fi_include, &mut deps);
         deps.sort();
         if !force && stamp_hit(&lib, &deps, &flags) {
             println!("cargo:warning=owl-kernels: libowl_flashinfer.a 增量命中(零 nvcc)");
         } else {
-            let obj = fi_dir.join("owl_fi_attention.o");
-            // ⚠️ `-DFLASHINFER_ENABLE_FP8_E4M3` 是**必需**的:fp8 KV 入口
-            // `owl_fi_prefill_run_fp8kv` 被该宏圈住(源注释:"编译门"),而
-            // owl 生产档 quant=Fp8E4M3 + fi=true ⇒ 缺它 = 链接期 undefined
-            // symbol(实测:旧预编 `.a` 是带该宏编的,从源路径原先没带 ——
-            // 又一例"预编配方与树内配方不一致")
-            let status = std::process::Command::new(&nvcc_m)
-                .args(["-O3", "-std=c++17", "-arch=sm_86", "-DFLASHINFER_ENABLE_FP8_E4M3"])
-                .arg(format!("-I{fi_include}"))
-                .arg("-c").arg(src).arg("-o").arg(&obj)
-                .status()
-                .expect("flashinfer: failed to spawn nvcc");
-            assert!(status.success(), "flashinfer: nvcc failed");
+            // 2026-10-14 换源(上游 0.6.18):`-DFLASHINFER_ENABLE_FP8_E4M3`
+            // **已不需要** —— 旧 guoqingbao fork 用该宏圈住 fp8 入口,上游核内
+            // 自带 fp8 反量化(`fast_dequant_f8f16x4`)。
+            // (历史坑留档:旧预编 `.a` 带该宏、从源路径起初没带 ⇒ 链接期
+            //  undefined symbol;换源后这类"配方不一致"面自然消失)
+            let mut objs: Vec<PathBuf> = Vec::new();
+            for src in [src_f16, src_fp8] {
+                let obj = fi_dir.join(format!(
+                    "{}.o",
+                    PathBuf::from(src).file_stem().unwrap().to_string_lossy()
+                ));
+                let status = std::process::Command::new(&nvcc_m)
+                    .args(["-O3", "-std=c++17", "-arch=sm_86"])
+                    .arg(format!("-I{fi_include}"))
+                    .arg("-c").arg(src).arg("-o").arg(&obj)
+                    .status()
+                    .expect("flashinfer: failed to spawn nvcc");
+                assert!(status.success(), "flashinfer: nvcc failed on {src}");
+                objs.push(obj);
+            }
             let _ = std::fs::remove_file(&lib);
-            let status = std::process::Command::new(&ar)
-                .args(["rcs"]).arg(&lib).arg(&obj)
-                .status()
-                .expect("flashinfer: failed to spawn ar");
+            let mut ar_cmd = std::process::Command::new(&ar);
+            ar_cmd.args(["rcs"]).arg(&lib);
+            for o in &objs {
+                ar_cmd.arg(o);
+            }
+            let status = ar_cmd.status().expect("flashinfer: failed to spawn ar");
             assert!(status.success(), "flashinfer: ar failed");
             stamp_write(&lib, &deps, &flags);
-            println!("cargo:warning=owl-kernels: built libowl_flashinfer.a from source (in-tree headers)");
+            println!(
+                "cargo:warning=owl-kernels: built libowl_flashinfer.a from source (in-tree headers, 2 TU)"
+            );
         }
         let cuda_lib = env::var("CUDA_HOME")
             .map(|h| PathBuf::from(h).join("lib64"))

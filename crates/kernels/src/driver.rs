@@ -138,7 +138,14 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "gdn.delta_dec" => gdn::delta_dec(dt, ax(3), ax(0), ax(1), ax(2)), // aux = [batch, nv, kd, vd]
         "gdn.decode_step" => gdn::decode_step(dt, ax(0), ax(1), ax(2), ax(3)), // aux = [batch, nv, kd, vd]
         "gdn.decode_step_v2" => gdn::decode_step_v2(dt, ax(0), ax(1), ax(2), ax(3)),
-        "gdn.conv_fwd" => gdn::conv_fwd(dt, ax(0)),
+        "gdn.conv_fwd" => gdn::conv_fwd(
+            dt,
+            ax(0),
+            // N1(2026-10-14):t 维并行 ⇒ picker 需要 tokens(x 实到行数 = shapes[0][0])
+            // 与 batch(标量槽 0);旧版只吃 d ⇒ 核内对 t 顺序扫描、批 1 时仅 8/8/24 CTA。
+            req.shapes.first().map(|s| s.first().copied().unwrap_or(0)).unwrap_or(0),
+            req.scalars.first().map(|b| (*b).max(0) as usize).unwrap_or(1),
+        ),
         "gdn.recurrence_varlen_gqa" => gdn::recurrence_varlen_gqa(dt, ax(2), ax(0), ax(1)), // aux = [nv, kd, vd]
         "gdn.norm_act" => gdn::norm_act(dt, ax(0), ax(1), ax(2)), // aux = [rows, value_dim, group_size]
         // foreign 家族臂(2026-10-12 用户律:gdn 两臂入词表,与 native 同一
@@ -239,6 +246,7 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "attn.fi_prefill_fp8kv" => attn::fi_prefill(true),
         "attn.xqa_verify" => attn::xqa_verify(),
         "attn.xqa_decode" => attn::xqa_decode(),
+        "attn.xqa_prefill" => attn::xqa_prefill(),
         "elems.cast_f16_f32" => elems::cast_f16_f32(dt),
         "ops.concat" => elems::concat(dt),
         "ops.rope" => elems::rope(dt, ax(0)),
@@ -445,12 +453,31 @@ pub mod gdn {
         KernelPick::of::<crate::ops::gdn::DecodeStepV2F16>(Shape { grid: ((batch * nv) as u32, 1, 1), block: (vd as u32, 1, 1), smem: 0 })
     }
 
-    /// conv_fwd:decode 卷前向(工单 G;**仅 f16 变体**,f32 请求 = 编程
-    /// 错误,decl 构造期 panic —— 与登记表 `source()` 同纪律)。
-    /// grid = (1, ceil(d/256), 1)。
-    pub fn conv_fwd(dt: DType, d: usize) -> KernelPick {
+    /// conv_fwd:**prefill 卷前向**(工单 G;**仅 f16 变体**,f32 请求 =
+    /// 编程错误,decl 构造期 panic —— 与登记表 `source()` 同纪律)。
+    ///
+    /// **发射几何(N1,2026-10-14;自 feat/prefill-graph 合入)**:
+    /// `grid = (ceil(d/256), tiles, batch)`,`tiles = ceil(tokens / TILE_ROWS)`。
+    /// 旧版是 `(1, ceil(d/256), 1)` + 核内对 t **顺序扫描** ⇒ 批 1 时 q/k/v 各只
+    /// 8/8/24 个 CTA,延迟绑死(122-170 µs/发;nsys 定谳 = prefill 的 4.6%);
+    /// 新核把 t 维切块并行 ⇒ 实测 **17.5 → 2.0 ms/chunk(−88.6%)**,
+    /// prefill 相位 **−3.6~3.8%**(两把尺子互证,见
+    /// `docs/arch/prefill-graph-施工.md` §13.3)。
+    ///
+    /// `tokens` 取自 `shapes[0][0]`(x 的实到行数);`batch` 取自标量槽 0
+    /// (生产 prefill 恒 1;多层折叠路同)。**TILE_ROWS 只是网格提示** ——
+    /// 核内自算 `ts = ceil(len/gridDim.y)`,picker 与核零常量耦合。
+    /// **前置律**:`TILE_ROWS >= 3`(保证 tiles>1 ⇒ ts>=3 ⇒ 只有 tile 0 碰 state);
+    /// 取 32。
+    pub fn conv_fwd(dt: DType, d: usize, tokens: usize, batch: usize) -> KernelPick {
         assert!(matches!(dt, DType::F16), "owl_gdn_conv_fwd 仅有 f16 变体(dt={dt:?})");
-        KernelPick::of::<crate::ops::gdn::ConvFwdF16>(Shape { grid: (1, d.div_ceil(256) as u32, 1), block: (256, 1, 1), smem: 0 })
+        const TILE_ROWS: usize = 32;
+        let tiles = tokens.div_ceil(TILE_ROWS).max(1);
+        KernelPick::of::<crate::ops::gdn::ConvFwdF16>(Shape {
+            grid: (d.div_ceil(256) as u32, tiles as u32, batch.max(1) as u32),
+            block: (256, 1, 1),
+            smem: 0,
+        })
     }
 
     /// recurrence_varlen_gqa:批前向递推(工单 G;**仅 f16 变体**)。
@@ -1127,6 +1154,10 @@ pub mod attn {
     pub fn xqa_decode() -> KernelPick {
         KernelPick::of::<crate::ops::xqa::XqaDecode>(FOREIGN)
     }
+    /// XQA prefill 臂(与 verify 同资产;几何 = 单块,住 server emit)
+    pub fn xqa_prefill() -> KernelPick {
+        KernelPick::of::<crate::ops::xqa::XqaPrefill>(FOREIGN)
+    }
 
     /// FlashInfer paged prefill(foreign 家族臂;plan 缓存 + run 在家族 runtime)
     pub fn fi_prefill(fp8kv: bool) -> KernelPick {
@@ -1439,7 +1470,13 @@ mod tests {
         assert_eq!(gdn::l2norm(DType::F32, 7).name, "owl_gdn_l2norm_f32");
         assert_eq!(gdn::l2norm(DType::F32, 7).shape.grid, (7, 1, 1));
         assert_eq!(gdn::norm_act(DType::F16, 4, 2048, 128).shape.grid, (64, 1, 1));
-        assert_eq!(gdn::conv_fwd(DType::F16, 6144).shape.grid, (1, 24, 1));
+        // N1(2026-10-14):grid = (ceil(d/256), tiles=ceil(tokens/32), batch);
+        // tiles 只由 tokens 决定 ⇒ 几何自证(含 0/32/33 边界与 batch 维)
+        assert_eq!(gdn::conv_fwd(DType::F16, 6144, 0, 1).shape.grid, (24, 1, 1));
+        assert_eq!(gdn::conv_fwd(DType::F16, 6144, 32, 1).shape.grid, (24, 1, 1));
+        assert_eq!(gdn::conv_fwd(DType::F16, 6144, 33, 1).shape.grid, (24, 2, 1));
+        assert_eq!(gdn::conv_fwd(DType::F16, 2048, 461, 1).shape.grid, (8, 15, 1));
+        assert_eq!(gdn::conv_fwd(DType::F16, 6144, 461, 3).shape.grid, (24, 15, 3));
         assert_eq!(ops::sigmoid(DType::F16).name, "owl_sigmoid_f16");
         assert_eq!(ops::sigmoid(DType::F32).name, "owl_sigmoid_f32");
     }
@@ -1447,7 +1484,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "仅有 f16 变体")]
     fn f16_only_kernels_reject_f32() {
-        let _ = gdn::conv_fwd(DType::F32, 6144);
+        let _ = gdn::conv_fwd(DType::F32, 6144, 128, 1);
     }
 
     #[test]

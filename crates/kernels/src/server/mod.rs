@@ -40,5 +40,7 @@ pub fn family_factories() -> Vec<FamilyFactory> {
         xqa::XqaRuntime::assemble,
         #[cfg(feature = "xqa")]
         xqa::XqaDecodeRuntime::assemble,
+        #[cfg(feature = "xqa")]
+        xqa::XqaPrefillRuntime::assemble,
     ]
 }

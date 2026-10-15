@@ -169,6 +169,9 @@ pub enum SemanticKernel {
     XqaVerify,
     /// XQA 裸 decode 注意力(q=1;第二份实例化 `M_TILESIZE=16`;foreign-kernel)
     XqaDecode,
+    /// XQA prefill 注意力(chunked q=T;与 verify 同资产/同槽序,
+    /// host 几何强制单块 —— 见 `kernels::server::xqa::XqaPrefillRuntime`)
+    XqaPrefill,
 }
 
 impl SemanticKernel {
@@ -250,6 +253,7 @@ impl SemanticKernel {
             SemanticKernel::FiPrefillFp8kv => "attn.fi_prefill_fp8kv",
             SemanticKernel::XqaVerify => "attn.xqa_verify",
             SemanticKernel::XqaDecode => "attn.xqa_decode",
+            SemanticKernel::XqaPrefill => "attn.xqa_prefill",
         })
     }
 }

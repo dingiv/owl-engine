@@ -432,7 +432,10 @@ impl Attention {
     /// ([ctx+1 .. ctx+seqs]);scratch = ctx.attn_v2(seqs 倍)。语义 =
     /// 每 token attend [0, pos_t](前缀截断即 chunk 内 causal)。
     #[allow(clippy::too_many_arguments)]
-    /// XQA verify 臂(2026-10-13 D3 立案;kNHD fp8 池)。
+    /// XQA **spec-dec 单遍臂**(2026-10-13 D3 立案;kNHD fp8 池)——
+    /// 两个形状共用**同一份 `M_TILESIZE=32` 实例化与同一槽序**,按 `k_op`
+    /// 分名(`XqaVerify` = T=depth+1 行因果块;`XqaPrefill` = chunked q=T
+    /// 行因果块,行 i 看 `[0, ctx_base+i]`,掩码逐字同式)。
     ///
     /// 与 `verify_v2_arm` **同语义**(T=depth+1 行因果块:行 i 看 [0, pos+i]),
     /// 差别只在注意力核形态:伪序列臂 = 8 条序列各扫一遍全 ctx(元素数 ×8),
@@ -502,8 +505,9 @@ impl Attention {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn verify_xqa_arm(
+    fn xqa_specdec_arm(
         &self,
+        k_op: SemanticKernel,
         q: &TensorOps,
         k: &TensorOps,
         v: &TensorOps,
@@ -536,7 +540,7 @@ impl Attention {
             .with_shape(dt, vec![1]);
         // q_scale = attn_scale·sqrt(hd)(核内再除 sqrt(hd));位型过线
         let q_scale_bits = xqa_q_scale_bits(hd);
-        let y = TensorOps::call(SemanticKernel::XqaVerify)
+        let y = TensorOps::call(k_op)
             .arg(q)
             .arg(&kv.k_cache)
             .arg(&kv.v_cache)
@@ -996,7 +1000,8 @@ impl Attention {
                     if tokens <= 16 && ctx.env.attn.verify_xqa {
                         if let Some(x) = ctx.xqa.as_ref() {
                             if x.q_seq_len == tokens {
-                                return self.verify_xqa_arm(
+                                return self.xqa_specdec_arm(
+                                    SemanticKernel::XqaVerify,
                                     &q, &k, &v, &gate, kv, tokens, ctx, &pol, kv_slots, x,
                                 );
                             }
@@ -1027,12 +1032,43 @@ impl Attention {
                         // 18→36ms/tok;split 同形状平坦 ~14-17)—— 大 chunk
                         // 走 FI 吃 tensor-core 收益(prefill −25%),小 T 回落
                         // chunked_opt(读 classic 主池,零影子依赖)。
-                        const FI_MIN_TOKENS: usize = 128;
+                        // 门槛 = `dispatch.fi_min_tokens`(缺省 1;2026-10-14
+                        // 单测 `fi_prefill_probe` 显示可降到 1 —— FI 在 T=54/ctx3072
+                        // 是 0.437 ms/层,而 t<128 回落核同形状 6.7 ms/层;
+                        // 历史硬编码 128 的依据被该单测推翻 ⇒ 收成配置旋钮)
+                        let fi_min_tokens = ctx.env.attn.fi_min_tokens;
                         if let Some(fi) = &ctx.fi {
-                            if tokens >= FI_MIN_TOKENS {
+                            if tokens >= fi_min_tokens {
                                 return self.paged_prefill_fi_output(
                                     &q, &k, &v, &gate, kv, tokens, ctx, &pol, kv_slots, fi,
                                 );
+                            }
+                        }
+                        // XQA prefill 臂(**只接 FI 不覆盖的尾块**;自
+                        // `feat/prefill-graph` 合入,2026-10-15)。
+                        //
+                        // ⚠️ **位置就是判据**:本臂不许放在 FI 之前 —— CUPTI
+                        // 逐核实测(3038 tok / 6 chunk,同请求 A/B):XQA
+                        // `kernel_mha` **258.5ms** vs FI `BatchPrefill`
+                        // **63.0ms = 慢 4.1×**(每 chunk 43.0 vs 10.5ms)。
+                        // XQA 是 **decode 形状**的核(SPEC_DEC 的 q 维近乎免费
+                        // = 小 q 专属),q=T 时只有 ~9 TFLOPS(FI 40+);单算子
+                        // 探针里它 2–3× 于 `chunked knhd` 是真的 —— 但那个核
+                        // **只在 FI 缺席时**上阵,拿它当基线做选型方向就反了。
+                        //
+                        // 所以本臂的价值面 = **FI 的缺口**(t < fi_min_tokens
+                        // 尾块,或 `ctx.fi` 缺席;现役回落 `chunked knhd` 只有
+                        // 24 CTA):探针同形状对拍(T=128)XQA 0.355 vs chunked
+                        // 1.381ms = **3.9×**(`crates/kernels/tests/xqa_prefill_probe.rs`)。
+                        // 表件缺位(非 fp8 池/页≠32/特征关)⇒ 原路回落。
+                        if ctx.env.attn.xqa_prefill {
+                            if let Some(x) = ctx.xqa.as_ref() {
+                                if x.q_seq_len == tokens {
+                                    return self.xqa_specdec_arm(
+                                        SemanticKernel::XqaPrefill,
+                                        &q, &k, &v, &gate, kv, tokens, ctx, &pol, kv_slots, x,
+                                    );
+                                }
                             }
                         }
                         // 长 ctx split(flash-decoding;2026-10-02):nparts ≥ 4

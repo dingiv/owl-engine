@@ -232,6 +232,8 @@ mod tests {
         cases.extend([
             (crate::family::xqa::VERIFY_XQA, crate::client::xqa::PARSE_SLOTS),
             (crate::family::xqa::DECODE_XQA, crate::client::xqa::PARSE_SLOTS),
+            // prefill 臂复用同一张槽序表 ⇒ 同一份 PARSE_SLOTS(覆盖门会强制列出)
+            (crate::family::xqa::PREFILL_XQA, crate::client::xqa::PARSE_SLOTS),
         ]);
 
         for (entry, want) in cases.iter() {
@@ -269,7 +271,11 @@ mod tests {
             crate::family::flashinfer::PREFILL_FI_FP8KV,
         ]);
         #[cfg(feature = "xqa")]
-        want.extend([crate::family::xqa::VERIFY_XQA, crate::family::xqa::DECODE_XQA]);
+        want.extend([
+            crate::family::xqa::VERIFY_XQA,
+            crate::family::xqa::DECODE_XQA,
+            crate::family::xqa::PREFILL_XQA,
+        ]);
         let listed: std::collections::BTreeSet<&str> = cases.iter().map(|(n, _)| *n).collect();
         let want_set: std::collections::BTreeSet<&str> = want.iter().copied().collect();
         assert_eq!(

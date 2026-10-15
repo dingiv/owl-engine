@@ -30,6 +30,12 @@
 pub const VERIFY_XQA: &str = "owl_xqa_verify";
 /// 第二份实例化的虚拟核名(裸 decode q=1;见 cu/xqa/README.md 双实例化节)
 pub const DECODE_XQA: &str = "owl_xqa_decode";
+/// prefill(chunked q=T)虚拟核名 —— **同一份 `M_TILESIZE=32` 实例化**,
+/// 差别只在 host 侧几何(本臂强制单块 ⇒ KV-split 关)。
+/// 自 `feat/prefill-graph` 合入(2026-10-15);它只作 **FI 缺口交接臂**
+/// (`t < fi_min_tokens` 尾块 / `ctx.fi` 缺席),CUPTI 实测主路径换它净亏 4.1×
+/// ⇒ `dispatch.xqa_prefill` 缺省 **false**。
+pub const PREFILL_XQA: &str = "owl_xqa_prefill";
 /// 槽序契约(LaunchMsg.args;6 Block + 10 sz):
 /// `[T q, T k_cache, T v_cache, T page_table(i32), T seq_lens(u32),
 ///   T mask(u32), T semaphores(u32), T scratch, T wr, O out, sz q_seq_len, sz hkv,
@@ -50,6 +56,10 @@ pub const VERIFY_XQA_SIG: &str =
 /// mask 仍走 SPEC_DEC 掩码路径 —— 只需 bit0=1)。分列常量只为"臂/名成对律"
 /// 与将来若真分叉时留单点改口。
 pub const DECODE_XQA_SIG: &str =
+    "T,T,T,T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz,sz,sz,sz,sz";
+/// **prefill 臂线槽序**:与 verify/decode **逐字同型**(第三份"臂"共用同一份
+/// 实例化与资产 —— 差别只在 host 侧几何(prefill 强制单块)与表件来源)。
+pub const PREFILL_XQA_SIG: &str =
     "T,T,T,T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz,sz,sz,sz,sz";
 /// XQA 工作区(参考实现给 256MiB;持久复用)
 pub const XQA_SCRATCH_BYTES: usize = 256 * 1024 * 1024;
@@ -197,10 +207,41 @@ impl XqaConsts {
             let by_sm = (sm_count / (batch.max(1) * nb_k_heads.max(1))).max(1);
             by_sm.min(div_up(max_seq_len, self.cta_tile_x))
         };
-        let nb_token_blocks = div_up(q_seq_len * self.head_grp, self.rows_per_block);
-        let grid = (nb_sub_seq, nb_k_heads * nb_token_blocks, batch);
+        self.geometry(nb_sub_seq, nb_k_heads, q_seq_len)
+    }
+    /// **单块几何**(KV-split 关;prefill 臂契约;自 `feat/prefill-graph` 合入)。
+    ///
+    /// 为什么 prefill 不要 KV-split:prefill 的 `grid.y` =
+    /// `nbKHeads · ceil(q·headGrp / rowsPerBlock)` 已经把 SM 喂饱
+    /// (t=512 ⇒ 384 CTAs),`grid.x` 再加分割**实测时间一字不变**
+    /// (2026-10-14 探针 `XQA_PF_NOSPLIT`:ctx512 0.882 vs 0.886 ms;
+    /// ctx16384 21.244 vs 21.564 ms)⇒ 白拿 multi-block 归约的全部代价:
+    /// scratch(16k ctx = 129MB)+ semaphores。
+    ///
+    /// ⚠️ **semaphores 尺寸雷**(同批挖出,见 `cu/xqa/README.md`):
+    /// `mha.cu` 按 `semaphores[gridDim.y·idxReq + blockIdx.y]` 索引,
+    /// SPEC_DEC 下 prefill 需要 `grid.y = 384` 槽,而引擎现分配 12 槽
+    /// ⇒ 开 split 会越界写。本入口把 `grid.x` 钉成 1 ⇒ 该数组**结构上不解引用**。
+    pub fn launch_geometry_single_block(
+        &self,
+        nb_k_heads: u32,
+        q_seq_len: u32,
+    ) -> ((u32, u32, u32), (u32, u32, u32), u32) {
+        self.geometry(1, nb_k_heads, q_seq_len)
+    }
+    /// 几何公共体(sub_seq 由调用方钉;两条入口只差这一个形参)
+    fn geometry(
+        &self,
+        nb_sub_seq: u32,
+        nb_k_heads: u32,
+        q_seq_len: u32,
+    ) -> ((u32, u32, u32), (u32, u32, u32), u32) {
+        let nb_token_blocks = q_seq_len
+            .max(1)
+            .saturating_mul(self.head_grp.max(1))
+            .div_ceil(self.rows_per_block.max(1));
         let block = (self.cta_x, self.cta_y, self.cta_z);
-        (grid, block, self.smem)
+        ((nb_sub_seq, nb_k_heads * nb_token_blocks, 1), block, self.smem)
     }
     /// `maxNbPagesPerSeq = maxSeqLen / tokensPerPage`(exactDiv)
     pub fn max_nb_pages_per_seq(&self, max_seq_len: u32) -> u32 {

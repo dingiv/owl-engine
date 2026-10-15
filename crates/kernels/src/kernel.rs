@@ -224,7 +224,7 @@ mod tests {
             driver::gdn::conv_upd(DType::F32).name,
             driver::gdn::delta_dec(DType::F16, 128, 1, 16, 128).name,
             driver::gdn::delta_dec(DType::F32, 128, 1, 16, 128).name,
-            driver::gdn::conv_fwd(DType::F16, 6144).name,
+            driver::gdn::conv_fwd(DType::F16, 6144, 512, 1).name,
             driver::gdn::recurrence_varlen_gqa(DType::F16, 128, 16, 128).name,
             driver::gdn::norm_act(DType::F16, 1, 2048, 128).name,
             driver::gdn::norm_act(DType::F32, 1, 2048, 128).name,

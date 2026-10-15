@@ -320,6 +320,11 @@ pub const PROD_SPEC_DFLASH_2026_10_13: &[&str] = &[
     "owl_topk16_merge_f16",
     "owl_topk16_split_f16",
     "owl_xqa_decode",
+    // ⚠️ 在白名单但**档位缺省不启用**(`dispatch.xqa_prefill=false`):
+    // CUPTI 同形状 A/B = XQA 258.5ms vs FI 63.0ms(**慢 4.1×**,主路径禁用);
+    // 它只接 FI 不覆盖的 t<128 尾块(那里 3.9× 于 chunked knhd 回落核)。
+    // 留白名单 = 复验只改一行 config。
+    "owl_xqa_prefill",
     "owl_xqa_verify",
     "vllm_chunked_prefill_paged_attn_opt_f16_knhd_hd256",
     "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256",
@@ -416,6 +421,7 @@ pub const PRODUCTION_UNION_2026_10_13: &[&str] = &[
     "owl_silu_and_mul_bf16",
     "owl_silu_and_mul_f16",
     "owl_xqa_decode",
+    "owl_xqa_prefill",
     "owl_xqa_verify",
     "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256",
     "vllm_paged_attention_v2_fp8_knhd_hd256bs32",
@@ -646,6 +652,9 @@ mod tests {
             (crate::family::flashinfer::PREFILL_FI, &["q", "k_cache", "v_cache", "q_cu", "indices", "indptr", "last_len", "wr", "out", "total_rows", "ctx_total", "t", "hq", "hkv", "hd", "page", "sm_scale_bits"], &["F16x2", "F16x5", "F16x4", "U32x1", "U32x1", "U32x1", "U32x1", "F16x1", "F16x2", "U64", "U64", "U64", "U64", "U64", "U64", "U64", "F32Bits"]),
             (crate::family::xqa::VERIFY_XQA, &["q", "k_cache", "v_cache", "page_table", "seq_lens", "mask", "semaphores", "scratch", "wr", "out", "q_seq_len", "hkv", "hd", "page", "max_seq_len", "q_scale_bits", "sm_count", "stride_page", "stride_token", "stride_head"], &["F16x2", "U32x1", "U32x1", "F32x2", "F32x2", "F32x0", "F32x2", "F16x1", "F16x0", "F16x2", "U64", "U64", "U64", "U64", "U64", "F32Bits", "U64", "U64", "U64", "U64"]),
             (crate::family::xqa::DECODE_XQA, &["q", "k_cache", "v_cache", "page_table", "seq_lens", "mask", "semaphores", "scratch", "wr", "out", "q_seq_len", "hkv", "hd", "page", "max_seq_len", "q_scale_bits", "sm_count", "stride_page", "stride_token", "stride_head"], &["F16x2", "U32x1", "U32x1", "F32x2", "F32x2", "F32x0", "F32x2", "F16x1", "F16x0", "F16x2", "U64", "U64", "U64", "U64", "U64", "F32Bits", "U64", "U64", "U64", "U64"]),
+            // prefill 臂:与 verify/decode **同一张 PARAMS 表**(同资产同槽序;
+            // 差别只在 host 侧几何 ⇒ 不在这张表的表达面内)
+            (crate::family::xqa::PREFILL_XQA, &["q", "k_cache", "v_cache", "page_table", "seq_lens", "mask", "semaphores", "scratch", "wr", "out", "q_seq_len", "hkv", "hd", "page", "max_seq_len", "q_scale_bits", "sm_count", "stride_page", "stride_token", "stride_head"], &["F16x2", "U32x1", "U32x1", "F32x2", "F32x2", "F32x0", "F32x2", "F16x1", "F16x0", "F16x2", "U64", "U64", "U64", "U64", "U64", "F32Bits", "U64", "U64", "U64", "U64"]),
         ];
         for (entry, want, want_ty) in EXPECT {
             let m = meta(entry).unwrap_or_else(|| panic!("锁表项 {entry} 不在声明表里"));

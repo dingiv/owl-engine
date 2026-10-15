@@ -65,6 +65,8 @@
 //! | cuda | graph_flags | { upload, device_launch } / 全 false |
 //! | cuda | capture_slab_mb | Option<usize> / None(hint 定量) |
 //! | cuda | *(nvrtc_include/native_aot 2026-10-13 退役 —— NVRTC 已删)* | — |
+//! | dispatch | fi_min_tokens | usize / 1(FI 接管的 T 下限;128 = 复现旧行为) |
+//! | dispatch | xqa_prefill | flag / false(prefill 尾块走 XQA;主路径禁止开) |
 //! | graph | no_graph | flag / false |
 //! | agent | template_path | Option<String> / None(相对路径 = 相对 model.dir) |
 //! | agent | implicit_session | flag / false(AGT-09:不带 session 键 ⇒ 会话 0) |
@@ -254,6 +256,32 @@ pub struct DispatchCfg {
     /// (`crates/kernels/tests/xqa_decode_probe.rs`)。
     /// 与 `verify_xqa` **独立**(走不同图:decode 常驻捕获图 vs verify 桶形图)。
     pub decode_xqa: bool,
+    /// prefill(chunked q=T)注意力改走 **XQA**(与 verify **同一份
+    /// `M_TILESIZE=32` 实例化**;feature `xqa`;自 `feat/prefill-graph` 合入)。
+    ///
+    /// ⚠️ **只作 FI 缺口交接臂,不许放到 FI 之前**(CUPTI 逐核同请求 A/B:
+    /// XQA `kernel_mha` 258.5ms vs FI `BatchPrefill` 63.0ms = **慢 4.1×**;
+    /// XQA 是 decode 形状核,q=512 只有 ~9 TFLOPS)。价值面 = `t < fi_min_tokens`
+    /// 的尾块(现役回落核 24 CTA)⇒ 探针 T=128 同形状 **3.9×**
+    /// (`crates/kernels/tests/xqa_prefill_probe.rs`),长 prompt 净省 ~75ms
+    /// (期望值 ≈ 0.25×75ms)。缺省 **false** = 生产零行为变化。
+    pub xqa_prefill: bool,
+    /// **FI 接管的 T 下限**(行)。**缺省 1 = FI 通吃**(2026-10-14 定谳,自
+    /// `feat/prefill-graph` 合入)。
+    ///
+    /// 历史缺省 128(2026-10-12 立),依据是"FI 对小 qo 低效(18→36ms/tok)"。
+    /// ⚠️ 2026-10-14 单测推翻该依据(`crates/kernels/tests/fi_prefill_probe.rs`,
+    /// 生产核的第一个单测):FI 在 T=1/8/54/128 × ctx=3072 实测
+    /// **0.287/0.435/0.437/0.438 ms/层**(数值 max|FI−host| 3.2e-4,超门行数 0),
+    /// 而旧门槛以下的回落核(`chunked knhd`,24 CTA 低并行)同形状 **6.7 ms/层**
+    /// (in-engine CUPTI)⇒ **FI 快 15×**,且差距随 ctx 线性放大(T=128:ctx512
+    /// 1.38 → ctx8192 20.05 ms/层)。
+    ///
+    /// 引擎 A/B(3 轮交替 boot,中位,同 prompt 只差本键;尾块 47/36 行):
+    /// **−73.8ms @3.1k ctx(−3.0%)· −272.2ms @8.2k ctx(−4.1%)**;
+    /// 短 prompt(58 tok)与满 chunk(567 tok)各 −2.8/−1.9ms(无回归)。
+    /// 本键留作诊断旋钮(128 = 复现旧行为)。
+    pub fi_min_tokens: usize,
     /// FlashInfer prefill 面
     pub gdn_chunked: bool,
     pub gdn_scalar: bool,
@@ -607,6 +635,8 @@ impl Default for DispatchCfg {
             verify_v2: true,
             verify_xqa: false,
             decode_xqa: false,
+            xqa_prefill: false,
+            fi_min_tokens: 1,
             gdn_chunked: false,
             gdn_scalar: false,
             gdn_fused_decode: true,
@@ -761,7 +791,7 @@ allowed_ops = [
         "owl_sigmoid_gate_mul_f16", "owl_silu_and_mul_bf16",
         "owl_silu_and_mul_f16", "owl_topk16_merge_f16",
         "owl_topk16_split_f16",
-        "owl_xqa_decode", "owl_xqa_verify",
+        "owl_xqa_decode", "owl_xqa_prefill", "owl_xqa_verify",
         "vllm_chunked_prefill_paged_attn_opt_f16_knhd_hd256",
         "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256",
         "vllm_paged_attention_v2_f16_knhd_hd256bs32",

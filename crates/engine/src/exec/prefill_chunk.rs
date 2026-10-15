@@ -1,6 +1,139 @@
 //! 块式 prefill(树根装配与执行;taps/encode/BISECT 取证)
 use super::*;
 
+// ============================================================================
+// chunk host 侧输入表(自 `feat/prefill-graph` 择取,2026-10-15;**不含图路**)
+// ============================================================================
+//
+// 为什么收成结构:这些表的取值逻辑原先散在本文件里(FI 四件套 / slots / lens /
+// ids / pos / seq_cu / gdn_slot),而 XQA prefill 臂需要**同一批值**(页链/整请求
+// 长/位掩码)⇒ 抽成唯一取值点(纯计算:零 await/零设备/零副作用)。
+// 顺带收敛:eager 的 slots/lens/gdn_slot 由**逐层各一份**收成**共享一份**
+// (值逐字节相同 ⇒ 零行为变化,纯命令数下降)。
+//
+// ⚠️ 上游的图路(prefill-graph S0/S1)未取;本结构只服务 eager 路 + XQA 表件。
+pub(crate) struct ChunkTables {
+    pub ids: Vec<f32>,
+    pub pos: Vec<f32>,
+    /// KV 槽(物理页槽;legacy = 恒等直排)
+    pub slots: Vec<f32>,
+    pub lens: Vec<f32>,
+    pub gdn_slot: f32,
+    /// `[0, t]`(attn/gdn 的 cu_seqlens)
+    pub seq_cu: Vec<f32>,
+    pub fi: Option<FiTables>,
+    /// XQA prefill 表件(`dispatch.xqa_prefill` 开才有;见 [`XqaTables`])
+    pub xqa: Option<XqaTables>,
+}
+
+/// FlashInfer 表四件套(U32 位型;`nb_used` = 本 chunk 实际覆盖页数)
+pub(crate) struct FiTables {
+    pub q_cu: Vec<u32>,
+    pub indices: Vec<u32>,
+    pub indptr: Vec<u32>,
+    pub last_len: Vec<u32>,
+    pub nb_used: usize,
+}
+
+/// XQA prefill 表件(U32 位型;`q_seq_len` 由调用方按本 chunk 真行数传)
+///
+/// - `page_table` = 本会话**物理页链**(= FI 的 `indices` 同值 —— 两者是
+///   "页链"的两种编码;kNHD 池下同一份);
+/// - `seq_len` = 整请求 KV 长(`ctx_total`)—— XQA 的 `seqLens` 语义就是它,
+///   块内因果**只由 mask 表达**(见 `cu/xqa/README.md` 调用契约);
+/// - `mask` = spec-dec 位掩码 `[t, ceil(t/32)]` u32,行 i 的 bit 0..i 置 1。
+///   行跨 `ceil(t/32)` ⇒ 表件随行数定制,`qSeqLen` 槽就传本 chunk 真行数
+///   (尾块不越写)。
+pub(crate) struct XqaTables {
+    pub page_table: Vec<u32>,
+    pub seq_len: u32,
+    pub mask: Vec<u32>,
+}
+
+impl ChunkTables {
+    /// 纯计算:无 await、无设备、无副作用
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build(
+        ids: &[u32],
+        base: usize,
+        t: usize,
+        paged: bool,
+        page: usize,
+        bt_chain: &[u32],
+        gdn_slot_v: usize,
+        fi_face: bool,
+        xqa_face: bool,
+    ) -> Self {
+        let seq = |start: usize, n: usize| -> Vec<f32> {
+            (0..n).map(|i| (start + i) as f32).collect()
+        };
+        let slots = if paged {
+            (base..base + t)
+                .map(|pos| {
+                    let b = bt_chain[pos / page];
+                    (b * page as u32 + (pos % page) as u32) as f32
+                })
+                .collect()
+        } else {
+            seq(base, t)
+        };
+        let fi = fi_face.then(|| {
+            let ctx_total = base + t;
+            let nb = bt_chain.len();
+            // ⚠️ **块链可能长于「本 chunk 已覆盖页数」** —— 块表按**全 prompt**
+            // 预分配(scheduler::ensure_for_len),而本 chunk 只盖到 ctx_total。
+            // 三件套必须按**实际覆盖页数**截断:原式 `ctx_total - nb*page + page`
+            // 在 nb 过大时下溢(debug panic)/回绕成巨值(release → FI plan 拿着
+            // 巨 last_len 越界读 indices 数组外)。2026-10-13 由
+            // gpu_longctx_fi_direct_gate 首跑暴露。
+            let nb_used = ctx_total.div_ceil(page).min(nb).max(1);
+            FiTables {
+                q_cu: vec![0, t as u32],
+                indices: bt_chain[..nb_used].to_vec(),
+                indptr: vec![0, nb_used as u32],
+                last_len: vec![(ctx_total - (nb_used - 1) * page) as u32],
+                nb_used,
+            }
+        });
+        Self {
+            ids: ids.iter().map(|v| *v as f32).collect(),
+            pos: seq(base, t),
+            slots,
+            lens: seq(base + 1, t),
+            gdn_slot: gdn_slot_v as f32,
+            seq_cu: vec![0.0, t as f32],
+            fi,
+            xqa: xqa_face.then(|| XqaTables {
+                page_table: bt_chain.to_vec(),
+                seq_len: (base + t) as u32,
+                mask: causal_mask_words(t),
+            }),
+        }
+    }
+}
+
+/// XQA SPEC_DEC 因果位掩码:`[t, ceil(t/32)]` u32,行 i 的 bit 0..i 置 1。
+/// 语义定谳与多方佐证见 `crates/kernels/cu/xqa/README.md`(掩码位序/极性/
+/// 行序三组 A/B:唯"行 i 看块内 0..i、含自身"贴 host)。
+pub(crate) fn causal_mask_words(t: usize) -> Vec<u32> {
+    let wpr = t.div_ceil(32);
+    let mut v = vec![0u32; t * wpr];
+    for i in 0..t {
+        for w in 0..wpr {
+            let lo = w * 32;
+            let hi = (i + 1).min(lo + 32);
+            v[i * wpr + w] = if hi <= lo {
+                0
+            } else if hi - lo == 32 {
+                u32::MAX
+            } else {
+                (1u32 << (hi - lo)) - 1
+            };
+        }
+    }
+    v
+}
+
 impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// 块式 prefill(W1;批P5 契约):ids [T] 从 KV 行 base 起步,
     /// 单序列语义(gdn_slot 恒 0;KV 行随 token 走)。末块走 logits 根
@@ -22,19 +155,29 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let s = self.bank.sessions.get(act.session_id).expect("账在");
             (s.block_table.clone(), s.gdn_slot)
         };
-        let f32seq = |start: usize, n: usize| -> Vec<u8> {
-            (0..n)
-                .flat_map(|i| ((start + i) as f32).to_le_bytes())
-                .collect()
-        };
+        // ── host 侧输入表**唯一取值点**(见 [`ChunkTables`])──
+        let tb = ChunkTables::build(
+            ids,
+            base,
+            t,
+            self.pool.paged,
+            self.pool.page,
+            &bt_chain,
+            gdn_slot_v,
+            self.pool.fi_face,
+            self.env.attn.xqa_prefill,
+        );
+        let slots_leaf = TensorOps::from_host(Dtype::F32, vec![t], &f32b(&tb.slots));
+        let lens_leaf = TensorOps::from_host(Dtype::F32, vec![t], &f32b(&tb.lens));
+        let gdn_slot_leaf = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[tb.gdn_slot]));
         let kv_caches = self.pool.kv_caches();
         let kvs_step: Vec<KvBuffers> = kv_caches
             .iter()
             .map(|(k, v)| KvBuffers {
                 k_cache: k.clone(),
                 v_cache: v.clone(),
-                slots: TensorOps::from_host(Dtype::F32, vec![t], &f32seq(base, t)),
-                kv_lens: TensorOps::from_host(Dtype::F32, vec![t], &f32seq(base + 1, t)),
+                slots: slots_leaf.clone(),
+                kv_lens: lens_leaf.clone(),
                 block_tables: self.pool.bt_leaf_flat(),
             })
             .collect();
@@ -46,63 +189,32 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 conv_k: g.conv_k.clone(),
                 conv_v: g.conv_v.clone(),
                 rec: g.rec.clone(),
-                slots: TensorOps::from_host(Dtype::F32, vec![1], &f32seq(0, 1)),
+                slots: gdn_slot_leaf.clone(),
             })
             .collect();
-        let ids_t = TensorOps::from_host(
-            Dtype::F32,
-            vec![t],
-            &ids.iter().flat_map(|v| (*v as f32).to_le_bytes()).collect::<Vec<u8>>(),
-        );
-        let pos_t = TensorOps::from_host(Dtype::F32, vec![t], &f32seq(base, t));
-        // E2b:slots = 物理槽(块链换算);legacy 恒等直排不变
-        let slots_t = if self.pool.paged {
-            let page = self.pool.page;
-            let phys: Vec<f32> = (base..base + t)
-                .map(|pos| {
-                    let b = bt_chain[pos / page];
-                    (b * page as u32 + (pos % page) as u32) as f32
-                })
-                .collect();
-            TensorOps::from_host(Dtype::F32, vec![t], &f32b(&phys))
-        } else {
-            TensorOps::from_host(Dtype::F32, vec![t], &f32seq(base, t))
-        };
-        let lens_t = TensorOps::from_host(Dtype::F32, vec![t], &f32seq(base + 1, t));
-        let gdn_slot = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[gdn_slot_v as f32]));
+        let ids_t = TensorOps::from_host(Dtype::F32, vec![t], &f32b(&tb.ids));
+        let pos_t = TensorOps::from_host(Dtype::F32, vec![t], &f32b(&tb.pos));
+        let gdn_slot = gdn_slot_leaf.clone();
         // FlashInfer 表四件套(i32 设备;OWL_FLASHINFER=1 时非空,E1.5):
         // q_cu=[0,T] / indices=块链 / indptr=[0,nb] / last_len=末页有效数。
         // ⚠️ 预物化(eval 往返同步)而非 from_host 叶子:Htod 在 H2D 流、
         // FI 核在 COMPUTE 流,无跨流序 —— 异步竞态会让 FI 偶发读到半写入
         // 表(渐进腐败案,2026-10-03;09-28 upload_pinned 同病史)。
-        let i32le = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let u32le = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
         let fi_tensors;
-        let fi = if self.pool.fi_face {
-            let page = self.pool.page;
-            let ctx_total = base + t;
-            let nb = bt_chain.len();
-            // ⚠️ **块链可能长于「本 chunk 已覆盖页数」** —— 块表按**全 prompt**
-            // 预分配(scheduler::ensure_for_len),而本 chunk 只盖到 ctx_total。
-            // FI 三件套必须按**实际覆盖页数**截断:原式
-            // `ctx_total - nb*page + page` 在 nb 过大时下溢(debug panic)/
-            // 回绕成巨值(release → FI plan 拿着巨 last_len 越界读
-            // indices 数组外)。2026-10-13 由 gpu_longctx_fi_direct_gate
-            // 首跑暴露 —— 此前无任何测试启用 FI 面 + 多页 prefill。
-            let nb_used = ctx_total.div_ceil(page).min(nb).max(1);
+        let fi = if let Some(ft) = tb.fi.as_ref() {
             let k_fi_leaf = self.pool.kv_fi_leaves();
             let face = self.graphs.session.face_mut();
             let q_cu_b = owl_models::interpreters::eval_ops(
-                TensorOps::from_host(Dtype::U32, vec![2], &i32le(&[0, t as i32])).step(), face).await?;
+                TensorOps::from_host(Dtype::U32, vec![2], &u32le(&ft.q_cu)).step(), face).await?;
             let idx_b = owl_models::interpreters::eval_ops(
-                TensorOps::from_host(Dtype::U32, vec![nb_used],
-                    &i32le(&bt_chain[..nb_used].iter().map(|&b| b as i32).collect::<Vec<_>>())).step(), face).await?;
+                TensorOps::from_host(Dtype::U32, vec![ft.nb_used], &u32le(&ft.indices)).step(), face).await?;
             let ind_b = owl_models::interpreters::eval_ops(
-                TensorOps::from_host(Dtype::U32, vec![2], &i32le(&[0, nb_used as i32])).step(), face).await?;
+                TensorOps::from_host(Dtype::U32, vec![2], &u32le(&ft.indptr)).step(), face).await?;
             let ll_b = owl_models::interpreters::eval_ops(
-                TensorOps::from_host(Dtype::U32, vec![1],
-                    &i32le(&[(ctx_total - (nb_used - 1) * page) as i32])).step(), face).await?;
+                TensorOps::from_host(Dtype::U32, vec![1], &u32le(&ft.last_len)).step(), face).await?;
             let q_cu = TensorOps::of_block(q_cu_b.id, Dtype::U32, vec![2]);
-            let indices = TensorOps::of_block(idx_b.id, Dtype::U32, vec![nb_used]);
+            let indices = TensorOps::of_block(idx_b.id, Dtype::U32, vec![ft.nb_used]);
             let indptr = TensorOps::of_block(ind_b.id, Dtype::U32, vec![2]);
             let last_len = TensorOps::of_block(ll_b.id, Dtype::U32, vec![1]);
             let (kcs, vcs): (Vec<TensorOps>, Vec<TensorOps>) =
@@ -124,7 +236,61 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 8 字节 H2D / chunk**)—— 每次 8B 上传的**往返延迟 ~3.5ms**(issue 侧仅
         // 16µs)⇒ ~170ms/chunk 白烧。注入面本就存在(verify 图先例 E5-M4:
         // `ctx.seq_cu`),eager prefill 只是没接。
-        let seq_cu = TensorOps::from_host(Dtype::F32, vec![2], &f32b(&[0.0, t as f32]));
+        let seq_cu = TensorOps::from_host(Dtype::F32, vec![2], &f32b(&tb.seq_cu));
+        // ── XQA prefill 表件(`dispatch.xqa_prefill`;缺省关)──
+        // 三张 U32 位型表(页链/整请求长/因果位掩码)与 FI 四件套同路:
+        // **预物化**(eval_ops 往返同步)而非 from_host 叶子 —— Htod 在 H2D
+        // 流、核在 COMPUTE 流,无跨流序 ⇒ 异步竞态会让核偶发读到半写入表
+        // (2026-10-03 渐进腐败案同病史,见上方 FI 表注)。
+        // semaphores/scratch 两件取池里的真块:单块几何(`XqaPrefillRuntime`
+        // 强制 `nbSubSeq=1`)下核**结构上不解引用**它们,传真块只为"不隐瞒"。
+        let xqa_tensors;
+        let xqa_pf = if self.env.attn.xqa_prefill {
+            match (self.pool.xqa_ctx(), tb.xqa.as_ref()) {
+                (Some(px), Some(xt)) => {
+                    let face = self.graphs.session.face_mut();
+                    let pt_b = owl_models::interpreters::eval_ops(
+                        TensorOps::from_host(
+                            Dtype::U32,
+                            vec![xt.page_table.len()],
+                            &u32le(&xt.page_table),
+                        )
+                        .step(),
+                        face,
+                    )
+                    .await?;
+                    let sl_b = owl_models::interpreters::eval_ops(
+                        TensorOps::from_host(Dtype::U32, vec![1], &u32le(&[xt.seq_len])).step(),
+                        face,
+                    )
+                    .await?;
+                    let mk_b = owl_models::interpreters::eval_ops(
+                        TensorOps::from_host(Dtype::U32, vec![xt.mask.len()], &u32le(&xt.mask))
+                            .step(),
+                        face,
+                    )
+                    .await?;
+                    xqa_tensors = (
+                        TensorOps::of_block(pt_b.id, Dtype::U32, vec![xt.page_table.len()]),
+                        TensorOps::of_block(sl_b.id, Dtype::U32, vec![1]),
+                        TensorOps::of_block(mk_b.id, Dtype::U32, vec![xt.mask.len()]),
+                    );
+                    Some(owl_models::module::XqaVerifyCtx {
+                        page_table: xqa_tensors.0.clone(),
+                        seq_lens: xqa_tensors.1.clone(),
+                        mask: xqa_tensors.2.clone(),
+                        semaphores: px.semaphores.clone(),
+                        scratch: px.scratch.clone(),
+                        q_seq_len: t,
+                        max_seq_len: px.max_seq_len,
+                        sm_count: px.sm_count,
+                    })
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         // 诊断(2026-10-14 A13):`OWL_PF_FENCE=1` ⇒ from_host 叶子(pos/slots/
         // lens/id/gdn_slot)建完后插一道流栅栏 —— 判「H2D 叶子与 COMPUTE 核
         // 无跨流序」竞态(仓内 2026-10-03 FI 表同病史:预物化修法)
@@ -132,13 +298,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             self.graphs.session.face_mut().sync().await?;
         }
         let mut ctx = ForwardCtx::model_prefill(
-            t, &pos_t, &kvs_step, &self.rope, &gdns_step, &slots_t, &lens_t, &gdn_slot,
+            t, &pos_t, &kvs_step, &self.rope, &gdns_step, &slots_leaf, &lens_leaf, &gdn_slot,
             // A13(2026-10-14):chunked/scalar 臂的 rec 态寻址吃这个 host 标量
             // —— 必须喂本会话真槽(曾恒 0 = 读写别人格 → 长 prompt 塌陷)
             Some(gdn_slot_v),
             base, fi,
         );
         ctx.seq_cu = Some(&seq_cu);
+        ctx.xqa = xqa_pf;
         ctx.env = self.env;
         ctx.trace_gate = self.cfg.knobs.probes.trace_gate;
         let _vocab = self.model.vocab_size();

@@ -110,7 +110,32 @@ impl KernelFamily for FiRuntime {
             hd: call.hd,
             page: call.page,
         };
+        // ⚠️ **plan 必须在捕获窗之外算**(2026-10-14 实测 + 结构性守卫;自
+        // `feat/prefill-graph` 合入)。
+        //
+        // 事实(本机实测,`cudaStreamCaptureModeGlobal`,sm_86):
+        // `cudaMemcpyAsync` 的 **H2D/D2H × pinned/pageable 四组合全部可被捕获**
+        // (各成 1 个 memcpy 节点,回放 3 次值正确);不可捕获的只有**同步**
+        // `cudaMemcpy` 与 `cudaMalloc/Free`。⇒ plan 内部的
+        // `cudaMemcpyAsync(int_ws ← page_locked staging)` **会被烘进图**,而
+        // `host_staging` 是**可变**缓冲(换形状会重写)—— 一旦 plan 在窗内算,
+        // 图里就留下"从可变 host 缓冲拷贝"的节点,回放期取**当时**的内容
+        // ⇒ 错调度表/越界,且**不报错**。
+        //
+        // 现状为何没炸:图捕获前有一次 warmup eager(`GraphPlan::plan`),plan 已
+        // 缓存 ⇒ 捕获期不重算。但那是"时序恰好",不是不变量 —— 故此处立硬门:
+        // 捕获期若 plan 未命中,**结构化拒**(→ 上层 `Ok(None)` → eager 原路),
+        // 不静默、不把错节点烘进图。
+        // (更强做法:每形状一份独立 staging 缓冲 ⇒ 节点源恒定;待有需求再上。)
         if self.plan.as_ref().map(|(k, _)| *k != key).unwrap_or(true) {
+            if res.capturing().unwrap_or(false) {
+                return Err(OpError::Launch {
+                    op: msg.kernel.name.clone(),
+                    stage: crate::contract::Stage::Load,
+                    detail: "FI plan 未缓存而处于捕获窗:plan 内含 H2D(可被捕获),\
+                             必须在窗口外算 —— 拒捕回 eager".to_string(),
+                });
+            }
             let qo_indptr = [0i32, call.t as i32];
             let kv_indptr = [0i32, call.ctx_total as i32];
             let (mut plan15, mut cta_tile_q, mut split_kv) = ([0i64; 15], 0i32, 0i32);

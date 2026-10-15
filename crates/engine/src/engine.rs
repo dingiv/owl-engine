@@ -384,6 +384,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
             spec_depth,
             xqa_verify: self.cfg.knobs.env.attn.verify_xqa,
             xqa_decode: self.cfg.knobs.env.attn.decode_xqa,
+            xqa_prefill: self.cfg.knobs.env.attn.xqa_prefill,
             gdn_slots: self.cfg.knobs.gdn_slots,
             snap_max: self.cfg.knobs.snap_max,
             vram_target: self.cfg.knobs.vram_target,

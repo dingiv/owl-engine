@@ -197,7 +197,8 @@ fn production_picks_carry_admission_meta() {
         ("gdn gating_g", driver::gdn::gating_g(DType::F16)),
         ("gdn l2norm", driver::gdn::l2norm(DType::F16, 8)),
         ("gdn norm_act", driver::gdn::norm_act(DType::F16, 8, 128, 128)),
-        ("gdn conv_fwd", driver::gdn::conv_fwd(DType::F16, 6144)),
+        // N1(2026-10-14):t 维并行 ⇒ 形状取 tokens/batch(此处取生产 chunk 形)
+        ("gdn conv_fwd", driver::gdn::conv_fwd(DType::F16, 6144, 512, 1)),
         (
             "gdn conv_upd_dual",
             driver::gdn::conv_upd_dual(DType::F16),

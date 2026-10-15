@@ -15,6 +15,9 @@ use crate::contract::{Bytes, LaunchMsg, OpError};
 pub const VERIFY_XQA: &str = crate::family::xqa::VERIFY_XQA;
 /// 裸 decode 臂(同名解析口径 —— 槽序与 verify 同型,解析函数复用)
 pub const DECODE_XQA: &str = crate::family::xqa::DECODE_XQA;
+/// prefill 臂(chunked q=T;同一份 `M_TILESIZE=32` 实例化与同一槽序,
+/// 差别只在 host 侧几何 —— 见 `server::xqa::XqaPrefillRuntime`)
+pub const PREFILL_XQA: &str = crate::family::xqa::PREFILL_XQA;
 
 pub use super::BlockRef;
 
