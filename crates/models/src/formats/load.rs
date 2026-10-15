@@ -18,17 +18,12 @@
 
 use crate::contract::{Dtype, DeviceClient, ModelError};
 use crate::module::{Layout, LoadEntry, LoadManifest, LoaderOps, WeightSource};
-use futures_util::future::join_all;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 // ============================================================================
 // §1 入口:eval_load(声明 → 求值 → 上载栅栏)
 // ============================================================================
-
-/// 装载并发度(桶数;每桶一束键组。GpuClient 的 faces = 同管道句柄克隆,
-/// server 单线程自然串行 —— 并发面只用于客户端转换/DMA 流水重叠)。
-const LOAD_WORKERS: usize = 4;
 
 /// 装载执行(层级入口):驱动层的 `Loadable::layout` 需求并物化。
 /// 解释器自己调用层钩子并为它传递 LoaderCtx —— 使用者只给层与源。
@@ -126,9 +121,12 @@ impl LoadBatch {
         if self.casts.is_empty() {
             return Ok(());
         }
-        // 栅栏:H2D 全部落定(cast 读 raw 的前提)
+        // 栅栏:H2D 落定(cast 读 raw 的前提)。
+        // ⚠️ 2026-10-16 试验记录:把 DMA 换到 COMPUTE 流("同流免栅栏")
+        // 在**去掉本栅栏**时**确定性错值**(四图 top-1 全错、top-10 不交),
+        // 带栅栏则全绿 ⇒ "同流即序"的朴素推理不成立(根因未定,
+        // 记设计文档 §14 挂账);故栅栏保留 = 正确性优先。
         face.sync().await?;
-        // 回收**上一轮** raw(被本轮栅栏覆盖:它们的读者已跑完)
         self.reclaim(face).await?;
         // 本轮 cast 的 raw 记入下一轮(两相回收)
         for c in self.casts.drain(..) {
@@ -215,14 +213,8 @@ async fn eval_want<D: DeviceClient, S: WeightSource + ?Sized>(
     tap: Option<&Mutex<Box<dyn LoadTap>>>,
     verify: bool,
 ) -> Result<LoadManifest, ModelError> {
-    let handles = face.loader_faces(LOAD_WORKERS);
-    let manifest = match handles {
-        Some(handles) if handles.len() > 1 && want.wants().len() > 1 => {
-            eval_want_parallel(want, handles, src, tap, verify).await?
-        }
-        _ => eval_want_sequential(want, face, src, tap, verify).await?,
-    };
-    Ok(manifest)
+    // 单路径(2026-10-16 用户裁决:别用并行 DMA;实测并行桶 ≈1.2GB/s 反劣)
+    eval_want_sequential(want, face, src, tap, verify).await
 }
 
 /// 键分组:同键多 Want(tied 双槽 = w 直读 + w_t 转置读)原子成组,
@@ -256,46 +248,6 @@ async fn eval_want_sequential<D: DeviceClient, S: WeightSource + ?Sized>(
     }
     batch.finish(face).await?;
     Ok(manifest)
-}
-
-/// 并发流水(键组按字节 LPT 装给最轻桶;join_all 协作驱动):
-/// 桶 await DMA 期间,其他桶的取数/转换在同一线程推进 —— F5-4 定谳
-/// 转换已非墙,协作交错即可吃满 DMA,无需 OS 线程。
-/// 交付序无关(Want 各带各的 sink;分配无跨 Want 定序)。
-async fn eval_want_parallel<D: DeviceClient, S: WeightSource + ?Sized>(
-    want: &LoaderOps,
-    handles: Vec<D>,
-    src: &S,
-    tap: Option<&Mutex<Box<dyn LoadTap>>>,
-    verify: bool,
-) -> Result<LoadManifest, ModelError> {
-    let mut groups = key_groups(want.wants());
-    groups.sort_by_key(|g| std::cmp::Reverse(g.iter().map(|w| want_bytes(w)).sum::<usize>()));
-    let k = handles.len().min(groups.len()).max(1);
-    let mut buckets: Vec<(D, Vec<Vec<&crate::module::Want>>, usize)> = handles
-        .into_iter()
-        .take(k)
-        .map(|f| (f, Vec::new(), 0usize))
-        .collect();
-    for g in groups {
-        let bytes: usize = g.iter().map(|w| want_bytes(w)).sum();
-        let b = buckets.iter_mut().min_by_key(|(_, _, total)| *total).unwrap();
-        b.1.push(g);
-        b.2 += bytes;
-    }
-    let futs = buckets.into_iter().map(|(mut face, bundles, _)| async move {
-        let mut entries = Vec::new();
-        // 批**每桶独占**(跨账本禁混:块 id 只在本 face 账本可解析)
-        let mut batch = LoadBatch::default();
-        for bundle in &bundles {
-            entries.extend(load_group(&mut face, bundle, src, tap, &mut batch, verify).await?);
-        }
-        batch.finish(&mut face).await?;
-        Ok::<_, ModelError>(entries)
-    });
-    let results = join_all(futs).await;
-    let all = results.into_iter().collect::<Result<Vec<_>, _>>()?;
-    Ok(all.into_iter().flatten().collect())
 }
 
 // ============================================================================
@@ -531,7 +483,6 @@ async fn load_direct_device_cast<D: DeviceClient, S: WeightSource + ?Sized>(
                 .map_err(|e| ModelError::Msg(format!("Weight '{}': {e}", w.key)))?;
         }
         off += len;
-        // upload_pinned 异步语义契约:核读前必须 sync(与 load_direct 同款)
         if off.is_multiple_of(chunk_elems * 4) || off >= n {
             face.sync().await?;
         }
