@@ -58,3 +58,47 @@ fn event_record_is_sub_10us() {
         "cuEventRecord p50 = {p50}ns ≥ 10µs —— E2 必须改批量记账(E1 判据见设计文档 §5)"
     );
 }
+
+/// **跨流等待的提交开销**(E2 判据):A 流录事件 → B 流 `waitEvent` N 次。
+/// 这是 E3 要用来替换「host 全排空(≈1.9ms/键)」的那一刀的代价上界;
+/// 判据同前:**个位数 µs**(若超标,E3 的收益就要重算)。
+#[test]
+fn stream_wait_event_is_sub_10us() {
+    if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    }
+    let ctx = ffi::CudaContext::new(test_device_ordinal()).expect("开设备");
+    ctx.bind_to_thread().expect("bind");
+    let a = ctx.new_stream().expect("流 A(H2D 角色)");
+    let b = ctx.new_stream().expect("流 B(COMPUTE 角色)");
+    let mut pool = Vec::new();
+    for _ in 0..8 {
+        pool.push(
+            ffi::event_create(ffi::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING).expect("建事件"),
+        );
+    }
+    let mut samples = Vec::with_capacity(2000);
+    for i in 0..2000usize {
+        let ev = pool[i % pool.len()];
+        unsafe { ffi::event_record(ev, a.cu_stream()) }.expect("record(A)");
+        let t0 = std::time::Instant::now();
+        unsafe { ffi::stream_wait_event(b.cu_stream(), ev, ffi::sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT) }
+            .expect("wait(B)");
+        samples.push(t0.elapsed().as_nanos() as u64);
+    }
+    let _ = b.synchronize();
+    let _ = a.synchronize();
+    for ev in pool {
+        unsafe { let _ = ffi::event_destroy(ev); }
+    }
+    samples.sort_unstable();
+    let p50 = samples[samples.len() / 2];
+    let p99 = samples[(samples.len() * 99) / 100];
+    let mean = samples.iter().sum::<u64>() / samples.len() as u64;
+    eprintln!("[ev-cost] cuStreamWaitEvent 提交: p50={p50}ns p99={p99}ns mean={mean}ns(A 录→B 等, 池 8)");
+    assert!(
+        p50 < 10_000,
+        "cuStreamWaitEvent p50 = {p50}ns ≥ 10µs —— E3 的收益须重算(设计 §5)"
+    );
+}

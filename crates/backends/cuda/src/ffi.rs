@@ -49,6 +49,11 @@ pub use cudarc::driver::result::event::{
     synchronize as event_synchronize,
 };
 
+/// **跨流等待**(E2/E3 的序消费口):B 流等到 A 流的事件后才继续 —— 零 host
+/// 往返(对比:host 全排空 ≈1.9ms/键)。证据:cudarc 0.19.9 result.rs:749
+/// `stream::wait_event`(unsafe:流/事件须未释放)。
+pub use cudarc::driver::result::stream::wait_event as stream_wait_event;
+
 /// 裸 FFI(唯一低层出口;逐项白名单)
 pub mod sys {
     // driver 侧:指针类型 + 显式拷贝(tensor 装载/回读)
@@ -56,7 +61,7 @@ pub mod sys {
         CUdeviceptr, cuMemcpyDtoH_v2, cuMemcpyHtoD_v2, cuMemcpyDtoDAsync_v2, cuMemsetD8Async, cuMemsetD16Async, cuMemsetD32Async,
         // E1 事件序:句柄类型 + 创建标志(证据:cudarc 0.19.9 sys/mod.rs:423 CUevent /
         // :43 CUevent_flags(别名) / :3058 CUevent_flags_enum)
-        CUevent, CUevent_flags,
+        CUevent, CUevent_flags, CUevent_wait_flags,
         // graph 捕获(M1 归入 graph 治理层)
         CUgraphInstantiate_flags, CUstreamCaptureMode,
         // 图实例化零旗标入口(S1;见上方 graph 定谳注释)
