@@ -21,6 +21,7 @@ pub mod kind;
 pub mod load;
 pub mod mmap;
 pub mod safetensors;
+pub mod spec;
 pub mod w4a16;
 
 /// 刀2 虚拟合并键:{base}in_proj_qkvz = row-stack({base}in_proj_qkv,
