@@ -42,13 +42,6 @@ fn scale_bits(kd: usize) -> u64 {
     (1.0f32 / (kd as f32).sqrt()).to_bits() as u64
 }
 
-/// **FLA 序列表的单源出口**(P-6b)。单源在 `owl_kernels::family::gdn_chunked`
-/// (那里与 triton AOT 配置表锁死);engine/models 经这里取,免得
-/// (a) 引擎为了几个常量去依赖 kernels crate,(b) 出现第二份布局常量。
-pub use owl_kernels::family::gdn_chunked::{
-    table_bytes as gdn_table_bytes, table_host_bytes as gdn_table_host_bytes, BT as GDN_BT,
-};
-
 /// chunked 臂声明(语义算子 gdn.chunked_delta;六核 FLA,slot 寻址状态池)
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn chunked_delta(

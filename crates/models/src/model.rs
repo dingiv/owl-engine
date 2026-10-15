@@ -505,8 +505,8 @@ mod tests {
             .map(|_| KvBuffers {
                 k_cache: TensorOps::zeros(Dtype::F32, vec![KV_ROWS, HKV, HD]),
                 v_cache: TensorOps::zeros(Dtype::F32, vec![KV_ROWS, HKV, HD]),
-                slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
-                kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0])),
+                slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0])),  // 契约 slots/kv_lens r2(B6 收敛)
+                kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[1.0])),  // 契约 slots/kv_lens r2(B6 收敛)
                 block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
             })
             .collect();
@@ -830,8 +830,8 @@ mod tests {
                 v.push(KvBuffers {
                     k_cache: zero_block(&mut gpu, kv_zero.len(), vec![KV_ROWS, HKV, HD]).await,
                     v_cache: zero_block(&mut gpu, kv_zero.len(), vec![KV_ROWS, HKV, HD]).await,
-                    slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
-                    kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0])),
+                    slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0])),  // 契约 slots/kv_lens r2(B6 收敛)
+                    kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[1.0])),  // 契约 slots/kv_lens r2(B6 收敛)
                     block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
                 });
             }
@@ -867,8 +867,8 @@ mod tests {
                 .map(|kv| KvBuffers {
                     k_cache: kv.k_cache.clone(),
                     v_cache: kv.v_cache.clone(),
-                    slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot])),
-                    kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[kv_len])),
+                    slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[slot])),  // 契约 slots/kv_lens r2(B6 收敛)
+                    kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[kv_len])),  // 契约 slots/kv_lens r2(B6 收敛)
                     block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
                 })
                 .collect();
@@ -899,8 +899,8 @@ mod tests {
             kvs.push(KvBuffers {
                 k_cache: zero_block(gpu, kv_zero.len(), vec![KV_ROWS, HKV, HD]).await,
                 v_cache: zero_block(gpu, kv_zero.len(), vec![KV_ROWS, HKV, HD]).await,
-                slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
-                kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0])),
+                slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0])),  // 契约 slots/kv_lens r2(B6 收敛)
+                kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[1.0])),  // 契约 slots/kv_lens r2(B6 收敛)
                 block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
             });
         }
@@ -961,8 +961,8 @@ mod tests {
                 .map(|kv| KvBuffers {
                     k_cache: kv.k_cache.clone(),
                     v_cache: kv.v_cache.clone(),
-                    slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32])),
-                    kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32 + 1.0])),
+                    slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[t as f32])),  // 契约 slots/kv_lens r2(B6 收敛)
+                    kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[t as f32 + 1.0])),  // 契约 slots/kv_lens r2(B6 收敛)
                     block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
                 })
                 .collect();

@@ -392,7 +392,7 @@ impl<D: DeviceClient> PrefillBuckets<D> {
         let bt = pool.bt_leaf_flat();
         // GDN 序列表:**布局口径 = ceil(t_pad/BT)**(图内 `nt` 是标量,烘死;
         // 表内容由引擎按 t_real 写 —— cu 决定行区间与递推落点,§4.3e P-6b)
-        let gdn_nt = t_pad.div_ceil(owl_models::layers::gdn::GDN_BT).max(1);
+        let gdn_nt = t_pad.div_ceil(owl_models::kernel::GDN_BT).max(1);
         let gdn_table = match pool.gdn_table_blocks() {
             Some(gt) => {
                 if gdn_nt > gt.nt_cap {
@@ -404,7 +404,7 @@ impl<D: DeviceClient> PrefillBuckets<D> {
                 Some(TensorOps::of_block(
                     gt.table.id,
                     Dtype::U32,
-                    vec![owl_models::layers::gdn::gdn_table_bytes(gdn_nt) / 4],
+                    vec![owl_models::kernel::gdn_table_bytes(gdn_nt) / 4],
                 ))
             }
             None => None,

@@ -310,14 +310,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 图内 `nt` 是烘死的标量(布局口径);三张表的**内容**由本写定死:
         // cu=[0,t_real] ⇒ 行区间/递推落点都在真行上(§4.3e P-6b;假行不进序列)。
         if let Some(gt) = self.pool.gdn_table_blocks() {
-            let nt = t_pad.div_ceil(owl_models::layers::gdn::GDN_BT).max(1);
+            let nt = t_pad.div_ceil(owl_models::kernel::GDN_BT).max(1);
             if nt > gt.nt_cap {
                 return Err(owl_iface::contract::ModelError::Msg(format!(
                     "GDN 序列表超槽容量:nt={nt} > nt_cap={}",
                     gt.nt_cap
                 )));
             }
-            let bytes = owl_models::layers::gdn::gdn_table_host_bytes(t, nt);
+            let bytes = owl_models::kernel::gdn_table_host_bytes(t, nt);
             let f32bits: Vec<f32> = bytes
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes(c.try_into().expect("4 字节")))
@@ -669,7 +669,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // `t_layout`(桶几何下的 t_pad)只进张量形状 —— 核的行区间与递推落点全
         // 由这三张表定 ⇒ 假行**不在序列里**。旧路:runtime 内部按 `t` 生成 ⇒
         // padding 假行推进递推态(探针 `gdn_bucket_pad_probe`:终态 Δ=3.6e-2)。
-        let gdn_nt = t.div_ceil(owl_models::layers::gdn::GDN_BT).max(1);
+        let gdn_nt = t.div_ceil(owl_models::kernel::GDN_BT).max(1);
         let gdn_tbl_leaf;
         let gdn_tables = match self.pool.gdn_table_blocks() {
             Some(gt) => {
@@ -679,7 +679,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         gt.nt_cap
                     )));
                 }
-                let bytes = owl_models::layers::gdn::gdn_table_host_bytes(t, gdn_nt);
+                let bytes = owl_models::kernel::gdn_table_host_bytes(t, gdn_nt);
                 let f32bits: Vec<f32> = bytes
                     .chunks_exact(4)
                     .map(|c| f32::from_le_bytes(c.try_into().expect("4 字节")))
@@ -689,7 +689,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 gdn_tbl_leaf = TensorOps::of_block(
                     gt.table.id,
                     Dtype::U32,
-                    vec![owl_models::layers::gdn::gdn_table_bytes(gdn_nt) / 4],
+                    vec![owl_models::kernel::gdn_table_bytes(gdn_nt) / 4],
                 );
                 Some(owl_models::module::GdnTableSlot { table: &gdn_tbl_leaf, nt: gdn_nt })
             }

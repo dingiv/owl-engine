@@ -1091,13 +1091,18 @@ impl Attention {
         }
 
         // 逐 token 段:naive_attn 单发(bs=1;槽/kv_len 取表行 t 窄视图)
+        // ⚠️ 契约秩收敛(2026-10-16 B6):k/v 一律查 r3 `[1,hkv,hd]`(与 decode
+        // 路 `reshape([tokens,hkv,hd])` 同口径,声明面已收紧为 r3);核按显式
+        // 标量寻址 ⇒ 纯元数据,零行为变化。
         let mut ys: Vec<TensorOps> = Vec::with_capacity(tokens);
         for t in 0..tokens {
             let q_t = narrow_strided(&q, 1, row_q, t * row_q, row_q, vec![1, row_q]);
-            let k_t = narrow_strided(&k, 1, row_kv, t * row_kv, row_kv, vec![1, row_kv]);
-            let v_t = narrow_strided(&v, 1, row_kv, t * row_kv, row_kv, vec![1, row_kv]);
-            let slot_t = narrow_strided(kv_slots, 1, 1, t, 1, vec![1]);
-            let len_t = narrow_strided(kv_lens, 1, 1, t, 1, vec![1]);
+            let k_t = narrow_strided(&k, 1, row_kv, t * row_kv, row_kv, vec![1, self.hkv, self.hd]);
+            let v_t = narrow_strided(&v, 1, row_kv, t * row_kv, row_kv, vec![1, self.hkv, self.hd]);
+            // ⚠️ 契约秩收敛(2026-10-16 B6):slots/kv_lens 一律 r2
+            // `[1,1]`(与池叶/声明面同秩);核按标量寻址 ⇒ 纯元数据。
+            let slot_t = narrow_strided(kv_slots, 1, 1, t, 1, vec![1, 1]);
+            let len_t = narrow_strided(kv_lens, 1, 1, t, 1, vec![1, 1]);
             let y_t = TensorOps::call(SemanticKernel::NaiveDecode) // 哨兵;核内 bs 上界 guard
             .arg(&q_t)
             .arg(&k_t)
@@ -1295,13 +1300,13 @@ mod tests {
         let probe = |slot: f32, kv_len: f32| {
             let s = slot as usize;
             let (ck, cv) = cur(s);
-            // f32 臂契约:kc/vc r2
+            // 契约:k/v r3 `[1,hkv,hd]`(f32 臂与层路同口径)、q r2;kc/vc 表示相关(不约束)
             let kc = TensorOps::from_host(Dtype::F32, vec![4, 2], &f32b(&k_cache));
             let vc = TensorOps::from_host(Dtype::F32, vec![4, 2], &f32b(&v_cache));
             TensorOps::call(SemanticKernel::NaiveDecode)
-            .arg(&TensorOps::from_host(Dtype::F32, vec![1, 2], &f32b(&q)))   // 契约 q/k/v r2(f32 臂)
-            .arg(&TensorOps::from_host(Dtype::F32, vec![1, 2], &f32b(&ck)))
-            .arg(&TensorOps::from_host(Dtype::F32, vec![1, 2], &f32b(&cv)))
+            .arg(&TensorOps::from_host(Dtype::F32, vec![1, 2], &f32b(&q)))   // 契约 q r2
+            .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1, 2], &f32b(&ck)))  // 契约 k r3
+            .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1, 2], &f32b(&cv)))  // 契约 v r3
             .arg(&kc)
             .arg(&vc)
             .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[slot])))   // 契约 slots/kv_lens r2
@@ -1818,8 +1823,8 @@ mod f16_tests {
                 k_cache: TensorOps::of_block(kc.id, Dtype::F16, kc_shape.to_vec()),
                 v_cache: TensorOps::of_block(vc.id, Dtype::F16,
                     vec![kc_shape[0], hkv, hd, page]),
-                slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32])),
-                kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32 + 1.0])),
+                slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[t as f32])),  // 契约 slots/kv_lens r2(B6 收敛)
+                kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[t as f32 + 1.0])),  // 契约 slots/kv_lens r2(B6 收敛)
                 block_tables: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0])),
             };
             let mut ctx = ForwardCtx::decode(1, &pos_t, &kv, rp);

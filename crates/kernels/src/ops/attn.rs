@@ -520,18 +520,22 @@ impl KernelSpec for NaiveDecodeAttnF16 {
     const SRC: &'static str = "cu/attn/naive_decode_attn.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
-        // FIXME(接口不唯一,2026-10-15 B6 暴露):本槽在**调用点存在两套口径** ——
-        // 层 `attention.rs` 的 decode 路 `reshape([tokens,hkv,hd])`(r3)与
-        // prefill token-loop 路直传(r2);池叶又随分页/legacy 为 r5/r3。
-        // 核按显式标量寻址,不吃声明 rank ⇒ 暂声明 r0(不约束),
-        // 待调用点收敛为一套口径后收紧(另案)。
-        Param::t_in("k", Dtype::F16, 0),
-        Param::t_in("v", Dtype::F16, 0),
+        // **契约(2026-10-16 B6 收敛):k/v r3 = [tokens, hkv, hd]。
+        // 两条活路已统一到同一口径:层 decode 路 `reshape([tokens,hkv,hd])`;
+        // prefill token-loop 路的窄视图也改成 `[1,hkv,hd]`(纯元数据;核按
+        // 显式标量寻址,不吃 rank)。
+        Param::t_in("k", Dtype::F16, 3),
+        Param::t_in("v", Dtype::F16, 3),
+        // kc/vc = **池叶**:形状随池表示而变(legacy r3 `[nb,hkv,hd]` / paged K r5
+        // / paged V r4 —— 页=1 时内存等价),且核按显式标量寻址。
+        // 契约单源 = 引擎 `StatePool::{k_shape,v_shape}`(池侧声明见 POOL),
+        // 故本二槽不约束 rank(r0)—— 不是"两套口径",是"表示相关槽"。
         Param::t_in("kc", Dtype::F16, 0),
         Param::t_in("vc", Dtype::F16, 0),
-        // 同上:slots/kv_lens 在调用点存在 r1(叶/标量)与 r2(图输入槽)两套口径 ⇒ 不约束
-        Param::t_in("slots", Dtype::F32, 0),
-        Param::t_in("kv_lens", Dtype::F32, 0),
+        // 契约:slots/kv_lens r2([1, n] —— 池叶与狭窄视图同秩;2026-10-16 B6 收敛,
+        // 秩以**实测线格式事实**定:5 处活调用点均为 r2)
+        Param::t_in("slots", Dtype::F32, 2),
+        Param::t_in("kv_lens", Dtype::F32, 2),
         Param::sz("bs"),
         Param::sz("q_heads"),
         Param::sz("kv_heads"),
@@ -556,19 +560,16 @@ impl KernelSpec for NaiveDecodeAttnF32 {
     const SRC: &'static str = "cu/attn/naive_decode_attn.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F32, 2),
-        // k/v = 层侧 `reshape([tokens, hkv, hd])`(与 f16 臂同式;旧声明 r2 与真调用不符)
-        // FIXME(接口不唯一,2026-10-15 B6 暴露):本槽在**调用点存在两套口径** ——
-        // 层 `attention.rs` 的 decode 路 `reshape([tokens,hkv,hd])`(r3)与
-        // prefill token-loop 路直传(r2);池叶又随分页/legacy 为 r5/r3。
-        // 核按显式标量寻址,不吃声明 rank ⇒ 暂声明 r0(不约束),
-        // 待调用点收敛为一套口径后收紧(另案)。
-        Param::t_in("k", Dtype::F32, 0),
-        Param::t_in("v", Dtype::F32, 0),
+        // 契约:k/v r3 = [tokens, hkv, hd](与 f16 臂同式;2026-10-16 B6 收敛,
+        // 两条活路已统一 —— 旧声明 r2 与真调用不符)
+        Param::t_in("k", Dtype::F32, 3),
+        Param::t_in("v", Dtype::F32, 3),
+        // kc/vc = 池叶(表示相关槽;契约单源同 f16 臂,见上)
         Param::t_in("kc", Dtype::F32, 0),
         Param::t_in("vc", Dtype::F32, 0),
-        // 同上:slots/kv_lens 在调用点存在 r1(叶/标量)与 r2(图输入槽)两套口径 ⇒ 不约束
-        Param::t_in("slots", Dtype::F32, 0),
-        Param::t_in("kv_lens", Dtype::F32, 0),
+        // 契约:slots/kv_lens r2([1, n];与 f16 臂同式)
+        Param::t_in("slots", Dtype::F32, 2),
+        Param::t_in("kv_lens", Dtype::F32, 2),
         Param::sz("bs"),
         Param::sz("q_heads"),
         Param::sz("kv_heads"),

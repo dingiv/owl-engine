@@ -367,8 +367,8 @@ impl StatePool {
         };
         // GDN 序列表持久槽(P-6b):有 GDN 层就建(尺寸 ~KB 级)
         let gdn_tables = if n_gdn > 0 {
-            let nt_cap = seq_tokens.div_ceil(owl_models::layers::gdn::GDN_BT).max(1);
-            let bytes = owl_models::layers::gdn::gdn_table_bytes(nt_cap);
+            let nt_cap = seq_tokens.div_ceil(owl_models::kernel::GDN_BT).max(1);
+            let bytes = owl_models::kernel::gdn_table_bytes(nt_cap);
             Some(GdnTableBlocks { table: face.alloc(Dtype::F32, bytes.div_ceil(4)).await?, nt_cap })
         } else {
             None
