@@ -57,6 +57,19 @@ pub enum ModelError {
     Msg(String),
 }
 
+impl ModelError {
+    /// **不可恢复?**(2026-10-16) —— 与"单个请求失败"分开:
+    ///
+    /// - `PoolExhausted`:池/显存**硬预算拒绝**或真耗尽 ⇒ 继续跑只会连环失败;
+    /// - `ServerClosed`:设备 server 已关闭 ⇒ 引擎已无设备面。
+    ///
+    /// 服务面据此走**优雅关停**(释放卡锁 + 有序退出),而不是把错误塞回单个 turn。
+    /// 其余变体(形状/键缺失/形状不符/兜底)`= 可归因到具体请求/装载,不致命。
+    pub fn is_fatal(&self) -> bool {
+        matches!(self, ModelError::PoolExhausted { .. } | ModelError::ServerClosed)
+    }
+}
+
 impl std::fmt::Display for ModelError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -168,6 +181,69 @@ pub struct UpChunk {
     pub lease: Box<dyn PinnedRegion + Send>,
 }
 
+// ============================================================================
+// 状态存储的交换面(设计卷 §15;iface 声明 / store 实现 / server 使用)
+// ============================================================================
+
+/// 连接器侧的一块存储槽(store 分配号;server 只按号读写)。
+///
+/// **层级知识留在 store**:RAM / 磁盘 / NVMe-oF 的差别不外泄给 server ——
+/// server 是唯一持裸指针的一层(裁决⑫),只负责"把字节从这里搬到那里",
+/// "那里是什么"由 [`Connector`] 决定。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ConnSlot(pub u64);
+
+/// 交换方向。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwapDir {
+    /// 设备 → 连接器(换出/下沉)。
+    Out,
+    /// 连接器 → 设备(换回/回灌)。
+    In,
+}
+
+/// **交换的一片**。
+///
+/// 一个逻辑块 = 每层片段各一片(0.8B 12 片 / 27B 32 片):设备上块是**分层**
+/// 存储的,一层一片;而连接器侧一个逻辑块占**一个槽**(连续 `slot_bytes`),
+/// 故两侧偏移各说各话(`dev_off` vs `conn_off`)。
+#[derive(Clone, Copy, Debug)]
+pub struct SwapPiece {
+    /// 设备块句柄 id(server 解析地址;沿用 `dtoh_at` 的"只取 id"口径)。
+    pub block: u64,
+    /// 设备块内字节偏移(= 槽 × 每页字节)。
+    pub dev_off: usize,
+    /// 连接器槽内字节偏移(该层片段在逻辑块内的起点)。
+    pub conn_off: usize,
+    /// 字节长度(= 该层每页字节)。
+    pub len: usize,
+    /// 本片所属逻辑块的连接器槽。
+    pub slot: ConnSlot,
+}
+
+/// **交换的"另一端"**(RAM / 磁盘 / …)—— 实现者是 store,使用者是 server。
+///
+/// 契约:
+/// - `put`/`get` 只谈**槽号 + 槽内偏移 + 字节**,不得假设设备侧布局;
+/// - 错误**响亮**(不许静默丢片:片错了 = 该逻辑块内容错,必须上抛让
+///   调用方回滚账);
+/// - 实现必须 `Send`(随命令在命令线程与本层之间转移,单主零锁)。
+pub trait Connector: Send + 'static {
+    /// 写入一片(server 已从设备侧拷出 `bytes`;out 语义 = 落定)。
+    fn put(&mut self, slot: ConnSlot, off: usize, bytes: &[u8]) -> Result<(), ModelError>;
+    /// 读出一片(server 随后上传到设备)。
+    fn get(&self, slot: ConnSlot, off: usize, out: &mut [u8]) -> Result<(), ModelError>;
+    /// 层名(诊断/报告面:`ram` / `disk` / …)。
+    fn tier_name(&self) -> &'static str;
+    /// **解箱取回**(单主语义的回收口):命令回执把 connector 原箱奉还,
+    /// 调用方据此 `downcast` 回自己的具体类型(每块只是移动一个 `Vec`,零拷贝)。
+    ///
+    /// 实现侧写一行 `fn unbox(self: Box<Self>) -> Box<dyn Any + Send> { self }`
+    /// (不能给默认实现:trait object 上 `Self` 无尺寸,默认体的 coercion 编不过;
+    /// 具体实现里 `Self: Sized` 恒成立)。
+    fn unbox(self: Box<Self>) -> Box<dyn std::any::Any + Send>;
+}
+
 pub trait DeviceClient: Send {
     /// 执行环境提供(硬件感知;None = 无 GPU 环境,语义调用结构化拒绝)。
     /// 感知发生在引擎/boot 侧(实现者可缓存);kernels/解释器零探测
@@ -256,6 +332,123 @@ pub trait DeviceClient: Send {
     /// 数据的显式栅栏(计时/步边界/捕获前净空)
     fn dtoh(&mut self, b: &Bytes, out: &mut [u8])
         -> impl Future<Output = Result<(), ModelError>> + Send;
+    /// **带偏移的设备→主机读**(状态存储的搬出面,2026-10-16):
+    /// `dtoh` 只能读块前缀,而"逻辑块 = 层缓冲内的一个页"必须按**槽偏移**读
+    /// (`off_bytes = slot × 每页字节`)⇒ 补这条。语义与 [`DeviceClient::dtoh`]
+    /// 同(读语义:回执时 out = 块在全部先前已回执命令之后的那一段)。
+    ///
+    /// 默认 = **响亮"未实现"**(后端逐个补齐;CPU 面已给实现供 store 单测)。
+    /// 批面(`DtohBatch`,一次命令搬一个块的全部层片段)是它的下一步 —— 见
+    /// `docs/arch/store-状态存储-设计与迁移.md` §10.3 推论 B。
+    fn dtoh_at(
+        &mut self,
+        _b: &Bytes,
+        _off_bytes: usize,
+        _out: &mut [u8],
+    ) -> impl Future<Output = Result<(), ModelError>> + Send {
+        async { Err(ModelError::Msg("dtoh_at: 此后端未实现".into())) }
+    }
+    /// **批量分块读**(状态存储"整块搬出",2026-10-16):一次命令搬 N 段
+    /// (`(块, 偏移字节, 长度字节)`),回执 = 各段按**入参顺序**拼接的字节。
+    ///
+    /// 为什么必须批:一个逻辑块 = 层数 × 2 个片段(0.8B 12 段 / 27B 32 段),
+    /// 不批则每次搬出 12/32 次 actor 往返,收益被往返吃光(设计卷 §10.3 推论 B)。
+    /// 默认实现 = 逐段 [`DeviceClient::dtoh_at`] 拼接(语义等价;GPU 面覆写为
+    /// 单命令 `DtohBatch`)。
+    fn dtoh_batch(
+        &mut self,
+        pieces: &[(&Bytes, usize, usize)],
+    ) -> impl Future<Output = Result<Vec<u8>, ModelError>> + Send
+    where
+        Self: Sized,
+    {
+        #[allow(clippy::unnecessary_to_owned)]
+        let owned: Vec<(Bytes, usize, usize)> =
+            pieces.iter().map(|(b, o, l)| ((*b).clone(), *o, *l)).collect();
+        async move {
+            let mut out = Vec::new();
+            for (b, off, len) in &owned {
+                let at = out.len();
+                out.resize(at + *len, 0);
+                self.dtoh_at(b, *off, &mut out[at..]).await?;
+            }
+            Ok(out)
+        }
+    }
+
+    /// **批量分块写**(host → device,带偏移;状态存储"整块搬回")。
+    /// 默认 = 逐段 pinned 租约上传(语义等价;GPU 面覆写为单命令 `HtodChunks`)。
+    fn htod_batch(
+        &mut self,
+        writes: &[(&Bytes, usize, &[u8])],
+    ) -> impl Future<Output = Result<(), ModelError>> + Send
+    where
+        Self: Sized,
+    {
+        #[allow(clippy::unnecessary_to_owned)]
+        let owned: Vec<(Bytes, usize, Vec<u8>)> = writes
+            .iter()
+            .map(|(b, off, data)| ((*b).clone(), *off, data.to_vec()))
+            .collect();
+        async move {
+            for (b, off, data) in &owned {
+                let mut lease = self.alloc_pinned(data.len()).await?;
+                lease.slice_bytes_mut()[..data.len()].copy_from_slice(data);
+                self.upload_pinned(lease, b, *off, data.len()).await?;
+            }
+            Ok(())
+        }
+    }
+
+    /// **swap = 一条原子命令**(设计卷 §15;2026-10-16):N 片一次提交、一次 ack。
+    ///
+    /// 语义:
+    /// - **一次 ack = 全部片段完成**(同流保序)⇒ store 侧"落账"只需一次 await;
+    /// - `conn` 随命令**进出**(移入、回执时原箱奉还)⇒ 单主、零锁;
+    /// - 中途失败 = **整条失败**(不得留半态;调用方负责回滚账 / 响亮上抛);
+    /// - 捕获窗内 = 结构化拒(时序归 engine,§10.3)。
+    ///
+    /// 层级无关:RAM 与 disk 只差 [`Connector`] 实现,server 侧代码零分支。
+    /// 默认实现 = 逐片 `dtoh_at` / `alloc_pinned + upload_pinned` 循环
+    /// (**语义等价**,任何 face 都能跑);GPU 面覆写为单命令 `Swap`。
+    ///
+    /// 回执奉还的 connector 用 [`Connector::unbox`] 取回具体类型。
+    fn swap(
+        &mut self,
+        dir: SwapDir,
+        pieces: &[SwapPiece],
+        conn: Box<dyn Connector + Send>,
+    ) -> impl Future<Output = Result<Box<dyn Connector + Send>, ModelError>> + Send
+    where
+        Self: Sized,
+    {
+        let owned: Vec<SwapPiece> = pieces.to_vec();
+        async move {
+            let mut conn = conn;
+            // 句柄只取 id(与 `dtoh_at` 同口径 —— 字节级搬运不参与 dtype 校验)
+            let handle = |p: &SwapPiece| Bytes::new(p.block, 0, Dtype::U8, 0);
+            match dir {
+                SwapDir::Out => {
+                    for p in &owned {
+                        let mut buf = vec![0u8; p.len];
+                        self.dtoh_at(&handle(p), p.dev_off, &mut buf).await?;
+                        conn.put(p.slot, p.conn_off, &buf)?;
+                    }
+                }
+                SwapDir::In => {
+                    for p in &owned {
+                        let mut buf = vec![0u8; p.len];
+                        conn.get(p.slot, p.conn_off, &mut buf)?;
+                        let mut lease = self.alloc_pinned(p.len).await?;
+                        lease.slice_bytes_mut()[..p.len].copy_from_slice(&buf);
+                        self.upload_pinned(lease, &handle(p), p.dev_off, p.len).await?;
+                    }
+                }
+            }
+            Ok(conn)
+        }
+    }
+
     /// 算子发射(COMPUTE 流,火后不理):Ok = 提交成功;同流保序,
     /// 与数据搬运的跨流先后靠回执时序/sync 建立(顺序语义,见 trait 级文档)
     fn launch(&mut self, msg: LaunchMsg)
