@@ -26,12 +26,13 @@
 //! zeros/ws)+ ctmp;Qwen35Convention 认 `.zeros` 后缀。
 
 use crate::contract::{Dtype, ModelError};
-use crate::formats::mmap::{open_raw_index, Mmap, RawEntry};
+use crate::formats::mmap::{copy_par, open_raw_index, Mmap, RawEntry};
 use crate::formats::split_qkvz;
 use crate::formats::w4a16::{bf16_par, i32s_le_bytes, i32s_par, u16s_le_bytes};
 use crate::module::WeightSource;
 use owl_kernels::family::marlin::repack::{
-    marlin_fused_indices, pack_marlin_b_fused, pack_marlin_b_gather_into, pack_marlin_s,
+    marlin_fused_indices, marlin_scales_index, pack_marlin_b_fused, pack_marlin_b_gather_into,
+    pack_marlin_s_idx,
     pack_marlin_z, unpack_zp_ct,
 };
 use owl_kernels::family::marlin::v2_workspace_len;
@@ -56,12 +57,28 @@ enum QuantForm<'a> {
     F16 { we: &'a RawEntry },
 }
 
+/// 索引表种类(形状索引缓存键的第三轴;原 `bool` 只容 gather/fused 两态)
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum IdxKind {
+    /// `marlin_gather_indices`(F16 兜底臂的 nibble gather)
+    Gather,
+    /// `marlin_fused_indices`(Ct 臂的 packed_word<<3|nib 融合表)
+    Fused,
+    /// `marlin_scales_index`(scales 转置+perm 的源下标表)
+    Scales,
+}
+
 /// 键字节解析结果(懒物化后的一致字节 + 登记 dtype)
 enum Resolved {
     /// 零填充直写(ws/ctmp;不占存储)
     Zeroed,
     /// mmap 视图直转/直拷(passthrough;f16 基线同款)
     View(RawEntry),
+    /// **多段逻辑拼接视图**(合并虚拟键:in_proj_qkvz.packed_raw = 两子基
+    /// `weight_packed` 按序拼接)。零中间缓冲:消费侧按 dst 偏移**直写**
+    /// (2026-10-16 装载提速定谳:原实现每键新建 41.9MB Vec + 二次拷贝,
+    /// anon 首触 + 拷贝共 ≈75ms/键 × 48 键 = 3.9s,纯税)
+    Merged(Vec<RawEntry>),
     /// 已物化字节(qweight U32 / scales F16 / zeros U32 / 反量化 weight F16)
     Bytes(Arc<[u8]>, Dtype),
 }
@@ -74,7 +91,7 @@ pub struct AwqSource {
     cache: Mutex<(HashMap<String, Arc<[u8]>>, usize)>,
     /// gather/fused 索引表(按 (k, out, fused?) 形状复用;除法分解只算一次)
     #[allow(clippy::type_complexity)] // 索引缓存(键 → 列序)
-    idx_cache: Mutex<HashMap<(usize, usize, bool), Arc<Vec<u32>>>>,
+    idx_cache: Mutex<HashMap<(usize, usize, IdxKind), Arc<Vec<u32>>>>,
     /// 构建分片锁(16 片按 base hash;同 base 互斥、异 base 并行 ——
     /// 全局单锁时 build 串行链 ≈ 装载墙钟主导,分片后 4 桶并发 build
     /// 与 DMA 流水重叠)
@@ -213,10 +230,8 @@ impl AwqSource {
                     self.index.get(&format!("{b1}.weight_packed")),
                     self.index.get(&format!("{b2}.weight_packed")),
                 ) {
-                    let mut buf = Vec::with_capacity(e1.nbytes + e2.nbytes);
-                    buf.extend_from_slice(&self.maps[e1.map_ix][e1.start..e1.start + e1.nbytes]);
-                    buf.extend_from_slice(&self.maps[e2.map_ix][e2.start..e2.start + e2.nbytes]);
-                    return Some(Resolved::Bytes(buf.into(), Dtype::U32));
+                    // 零中间缓冲:两子基视图按序交给消费侧直写
+                    return Some(Resolved::Merged(vec![e1.clone(), e2.clone()]));
                 }
             }
             if let Some(pe) = self.index.get(&format!("{base}.weight_packed")) {
@@ -238,7 +253,65 @@ impl AwqSource {
         None
     }
 
-    /// 量化线性物化(键首触才建;qweight/scales/zeros/weight 四键共享
+    /// scales 源索引表(按 (k, out) 形状缓存;见 [`Self::pack_scales`])
+    fn scales_index(&self, out: usize, k: usize) -> Arc<Vec<u32>> {
+        self.idx_cache
+            .lock()
+            .unwrap()
+            .entry((k, out, IdxKind::Scales))
+            .or_insert_with(|| Arc::new(marlin_scales_index(out, k / 32)))
+            .clone()
+    }
+
+    /// marlin scales 打包(装载热路径):源索引表按 (k, out) 形状缓存 ⇒ 每元素
+    /// 零整数除法。
+    ///
+    /// 2026-10-16 提速定谳:原 `pack_marlin_s` 每元素现算两次运行时除法
+    /// (`/ out` `/ % out`,out 非二次幂)⇒ 0.74GB/s(2.78M 元素 7.5ms/键,
+    /// 整载 352 键 ≈2.6s)。整载共 6 种形状,表一次、热路径纯 gather。
+    fn pack_scales(&self, scales_f32: &[f32], out: usize, k: usize) -> Vec<u16> {
+        let groups = k / 32;
+        pack_marlin_s_idx(scales_f32, out, groups, &self.scales_index(out, k))
+    }
+
+    /// **bf16 源 → marlin scales 字节**(单遍融合;装载热路径)。
+    ///
+    /// 原链 = `bf16_par`(源→f32,11MB)+ `pack_marlin_s`(f32→u16,5.6MB)
+    /// + `u16s_le_bytes`(u16→字节,5.6MB):三分配两拷贝,每键 ≈22MB
+    /// 新堆页。2026-10-16 release 定谳:`.scales` 352 键 **3.42s** 是全载
+    /// 最大单项,而三件纯算力只占 ≈3ms/键 —— 余量全在分配/缺页。
+    /// 本函数 = 索引表 gather + bf16→f16 + LE 直写 dst,**一分配一路过**,
+    /// 且逐位与原链等价(bf16→f32 为零舍入展宽,余下同一 `f16::from_f32`)。
+    ///
+    /// `parts` = 源 bf16 分段:1 段 = 常规 Ct 键;2 段 = 合并虚拟键左右半
+    /// (拼接语义等同于原 `scales_f32` 的 concat)。
+    fn pack_scales_bytes(&self, parts: &[&[u8]], out: usize, k: usize) -> Vec<u8> {
+        let groups = k / 32;
+        let mut dst = vec![0u8; out * groups * 2];
+        pack_scales_bf16_into(parts, out, groups, &self.scales_index(out, k), &mut dst);
+        dst
+    }
+
+    /// 派生/虚拟键(不指向单一 mmap 条目)名判定 —— [`Self::resolve`]
+    /// 专项分支表的**谓词镜像**(单一事实源:`resolve` 里的分支与本节
+    /// 同名列表;两处同改)。
+    ///
+    /// 用途:[`WeightSource::native_dtype`] 的廉价筛查(声扫热路,禁物化)。
+    /// 反面(不是派生键)也可能解析成 `Bytes`(如 `x.weight` 只有
+    /// `weight_packed` 的 F16 兜底层)—— 那由 `index.get(key)` 缺失逼住。
+    fn is_derived_key(&self, key: &str) -> bool {
+        key.ends_with(".marlin_ws")
+            || key.ends_with(".marlin_ctmp")
+            || key.ends_with(".qweight")
+            || key.ends_with(".scales")
+            || key.ends_with(".zeros")
+            || key.ends_with(".packed_raw")
+            || key == "mtp.fc_e.weight"
+            || key == "mtp.fc_h.weight"
+    }
+
+
+/// 量化线性物化(键首触才建;qweight/scales/zeros/weight 四键共享
     /// 一次构建)。双检缓存 + build_lock 串行(w4a16 同款)。
     fn linear_bytes_for(&self, base: &str, key: &str) -> Option<Arc<[u8]>> {
         // 刀2 虚拟合并:in_proj_qkvz = row-stack(in_proj_qkv, in_proj_z)。
@@ -274,20 +347,22 @@ impl AwqSource {
             let k = k1;
             let groups = k / 32;
             // 源域行堆叠:scales/zp 展开 concat([out, groups] 行主序)
+            // **scales 不拼中转**:两段 bf16 视图 + 形状索引表单遍融合直出字节
             let sb1 = &self.maps[se1.map_ix][se1.start..se1.start + se1.nbytes];
             let sb2 = &self.maps[se2.map_ix][se2.start..se2.start + se2.nbytes];
-            let mut scales_f32 = bf16_par(sb1);
-            scales_f32.extend(bf16_par(sb2));
             let zb1 = &self.maps[ze1.map_ix][ze1.start..ze1.start + ze1.nbytes];
             let zb2 = &self.maps[ze2.map_ix][ze2.start..ze2.start + ze2.nbytes];
             let mut zp_u8 = unpack_zp_ct(&i32s_par(zb1), n1, groups);
             zp_u8.extend(unpack_zp_ct(&i32s_par(zb2), n2, groups));
-            self.maps[se1.map_ix].dontneed(se1.start, se1.nbytes);
-            self.maps[se2.map_ix].dontneed(se2.start, se2.nbytes);
             self.maps[ze1.map_ix].dontneed(ze1.start, ze1.nbytes);
             self.maps[ze2.map_ix].dontneed(ze2.start, ze2.nbytes);
             let bytes: Vec<u8> = match suffix {
-                ".scales" => u16s_le_bytes(&pack_marlin_s(&scales_f32, out, groups)),
+                ".scales" => {
+                    let b = self.pack_scales_bytes(&[sb1, sb2], out, k);
+                    self.maps[se1.map_ix].dontneed(se1.start, se1.nbytes);
+                    self.maps[se2.map_ix].dontneed(se2.start, se2.nbytes);
+                    b
+                }
                 ".zeros" => i32s_le_bytes(&pack_marlin_z(&zp_u8, out, groups)),
                 ".qweight" | ".packed_raw" => {
                     // packed 源域 [n, k/8] i32 行主序,flat concat 合法
@@ -310,7 +385,7 @@ impl AwqSource {
                             .idx_cache
                             .lock()
                             .unwrap()
-                            .entry((k, out, true))
+                            .entry((k, out, IdxKind::Fused))
                             .or_insert_with(|| Arc::new(marlin_fused_indices(k, out)))
                             .clone();
                         let mut b_buf: Vec<i32> = Vec::new();
@@ -369,27 +444,23 @@ impl AwqSource {
             // ---- 轻路径(device):CPU 仅产 scales/zeros;qweight 的
             //      marlin B 由 GPU repack 产出(load.rs 设备重排臂),
             //      packed 原样 DMA —— CPU 44MB×3 的重排/拷贝全消 ----
-            let s_pack: Vec<u16>;
+            let s_bytes: Vec<u8>;
             let z_buf: Vec<i32>;
             match form {
                 QuantForm::Ct { se, ze, .. } => {
                     form_ct = true;
                     // 设备臂分相(2026-10-12 装载提速):原只有 load.mat.ct
                     // 总账(198ms/层)—— 拆到五段,定谳真凶住哪段。
-                    let scales_f32 = owl_shared::timer_scope!("load.zp.sread", {
-                        let b = &self.maps[se.map_ix][se.start..se.start + se.nbytes];
-                        bf16_par(b)
-                    });
                     let zp_i32 = owl_shared::timer_scope!("load.zp.zread", {
                         let b = &self.maps[ze.map_ix][ze.start..ze.start + ze.nbytes];
                         i32s_par(b)
                     });
+                    s_bytes = owl_shared::timer_scope!("load.zp.spack", {
+                        let se_v = &self.maps[se.map_ix][se.start..se.start + se.nbytes];
+                        self.pack_scales_bytes(&[se_v], out, k)
+                    });
                     self.maps[se.map_ix].dontneed(se.start, se.nbytes);
                     self.maps[ze.map_ix].dontneed(ze.start, ze.nbytes);
-                    s_pack = owl_shared::timer_scope!(
-                        "load.zp.spack",
-                        pack_marlin_s(&scales_f32, out, groups)
-                    );
                     let zp_u8 = owl_shared::timer_scope!(
                         "load.zp.unpack",
                         unpack_zp_ct(&zp_i32, out, groups)
@@ -415,7 +486,7 @@ impl AwqSource {
                     };
                     self.maps[we.map_ix].dontneed(we.start, we.nbytes);
                     let scales_f32 = rtn_g32_sym_scales(&w_f32, out, k);
-                    s_pack = pack_marlin_s(&scales_f32, out, groups);
+                    s_bytes = u16s_le_bytes(&self.pack_scales(&scales_f32, out, k));
                     z_buf = pack_marlin_z(&vec![8u8; out * groups], out, groups);
                     // packed_raw_ct(设备重排核的输入):RTN nibbles → ct i32
                     let qb = rtn_g32_sym_packed(&w_f32, out, k);
@@ -430,11 +501,8 @@ impl AwqSource {
                     ));
                 }
             }
-            inserts.push((
-                format!("{base}.scales"),
-                Arc::from(u16s_le_bytes(&s_pack).into_boxed_slice()),
-                s_pack.len() * 2,
-            ));
+            let s_len = s_bytes.len();
+            inserts.push((format!("{base}.scales"), Arc::from(s_bytes.into_boxed_slice()), s_len));
             inserts.push((
                 format!("{base}.zeros"),
                 Arc::from(i32s_le_bytes(&z_buf).into_boxed_slice()),
@@ -443,7 +511,7 @@ impl AwqSource {
         } else if crate::formats::w4a16::marlin_eligible(out, k) {
             // ---- 全路径(Host 臂;裁决唯一产地 = module::RepackPath::resolve)----
             // B 打包与 U4B8 同套(q 原值,无 −8;dequant 在 kU4 内核内做)
-            let s_pack: Vec<u16>;
+            let s_bytes: Vec<u8>;
             let z_buf: Vec<i32>;
             // B 打包双路径:Ct = fused(packed 直提 nibble,消 89MB 中转);
             // F16 兜底 = unpacked u8 → 旧 gather(元素索引域,与 fused 分缓存)
@@ -455,7 +523,6 @@ impl AwqSource {
                     let packed_bytes = &self.maps[pe.map_ix][pe.start..pe.start + pe.nbytes];
                     packed = i32s_par(packed_bytes);
                     let scale_bytes = &self.maps[se.map_ix][se.start..se.start + se.nbytes];
-                    let scales_f32 = bf16_par(scale_bytes);
                     let zp_bytes = &self.maps[ze.map_ix][ze.start..ze.start + ze.nbytes];
                     let zp_i32 = i32s_par(zp_bytes);
                     // 源页消费完毕即还(DONTNEED)
@@ -463,7 +530,7 @@ impl AwqSource {
                     self.maps[se.map_ix].dontneed(se.start, se.nbytes);
                     self.maps[ze.map_ix].dontneed(ze.start, ze.nbytes);
                     let t_step = std::time::Instant::now();
-                    s_pack = pack_marlin_s(&scales_f32, out, groups);
+                    s_bytes = self.pack_scales_bytes(&[scale_bytes], out, k);
                     let zp_u8 = unpack_zp_ct(&zp_i32, out, groups);
                     z_buf = pack_marlin_z(&zp_u8, out, groups);
                     owl_shared::metrics::with_metrics_store(|s| {
@@ -488,7 +555,7 @@ impl AwqSource {
                     };
                     self.maps[we.map_ix].dontneed(we.start, we.nbytes);
                     let scales_f32 = rtn_g32_sym_scales(&w_f32, out, k);
-                    s_pack = pack_marlin_s(&scales_f32, out, groups);
+                    s_bytes = u16s_le_bytes(&self.pack_scales(&scales_f32, out, k));
                     z_buf = pack_marlin_z(&vec![8u8; out * groups], out, groups);
                     packed = Vec::new();
                     let qb = rtn_g32_sym_packed(&w_f32, out, k);
@@ -515,7 +582,7 @@ impl AwqSource {
                     .idx_cache
                     .lock()
                     .unwrap()
-                    .entry((k, out, true))
+                    .entry((k, out, IdxKind::Fused))
                     .or_insert_with(|| Arc::new(marlin_fused_indices(k, out)))
                     .clone();
                 pack_marlin_b_fused(&packed, &idx, words, &mut b_buf);
@@ -524,7 +591,7 @@ impl AwqSource {
                     .idx_cache
                     .lock()
                     .unwrap()
-                    .entry((k, out, false))
+                    .entry((k, out, IdxKind::Gather))
                     .or_insert_with(|| {
                         Arc::new(owl_kernels::family::marlin::repack::marlin_gather_indices(k, out))
                     })
@@ -540,11 +607,8 @@ impl AwqSource {
                 Arc::from(i32s_le_bytes(&b_buf).into_boxed_slice()),
                 b_buf.len() * 4,
             ));
-            inserts.push((
-                format!("{base}.scales"),
-                Arc::from(u16s_le_bytes(&s_pack).into_boxed_slice()),
-                s_pack.len() * 2,
-            ));
+            let s_len = s_bytes.len();
+            inserts.push((format!("{base}.scales"), Arc::from(s_bytes.into_boxed_slice()), s_len));
             inserts.push((
                 format!("{base}.zeros"),
                 Arc::from(i32s_le_bytes(&z_buf).into_boxed_slice()),
@@ -613,6 +677,15 @@ impl AwqSource {
                 }
                 (KeyData::Owned(out), Dtype::F16)
             }
+            Resolved::Merged(parts) => {
+                // 合并虚拟键(tied 双槽/元素域取数用):按序展开各段字节
+                // (U32 位型 —— 与 `Bytes` 同一取数语义;不走装载热路径)
+                let mut out = Vec::with_capacity(parts.iter().map(|p| p.nbytes).sum());
+                for p in &parts {
+                    out.extend_from_slice(&self.maps[p.map_ix][p.start..p.start + p.nbytes]);
+                }
+                (KeyData::Owned(out), Dtype::U32)
+            }
             Resolved::Bytes(b, dt) => (KeyData::Shared(b), dt),
         })
     }
@@ -636,6 +709,56 @@ impl WeightSource for AwqSource {
     fn take(&self, key: &str) -> Option<Vec<f32>> {
         let n = self.elem_len(key)?;
         self.take_range(key, 0, n)
+    }
+
+    /// 天然 dtype(passthrough 原生键的原始字节通道;量化为 I32/派生键无原始浮点字节)
+    /// —— 供 "原始字节上卡 + 设备端 cast" 臂判定(2026-10-16 装载提速定谳:
+    /// 27B AWQ 的 embed/lm_head(BF16 2.54GB ×2)因本口缺位而走 CPU F16C
+    /// ~1.5~3.3GB/s,占整载 ≈2.65s)。
+    ///
+    /// **必须廉价**(装载暂存区声扫会对全部 Want 逐个问一次)且与
+    /// [`Self::copy_native_into`] 同源判定(`Some` ⟹ 字节直拷必成)。
+    /// 故走 `Resolved::View` 的**等价谓词**(查索引 + 排派生键名),
+    /// **绝不调 `resolve`**:后者对派生键会当场物化整键(qweight/scales/…,
+    /// 27B 档 ≈14GB 主机内存)—— 2026-10-16 实测教训:声扫里调 resolve
+    /// = 整载多花 3.5s(键循环 2.82s 被拉到 6.31s),且把懒物化提前成
+    /// 全量物化。
+    fn native_dtype(&self, key: &str) -> Option<Dtype> {
+        if self.is_derived_key(key) {
+            return None;
+        }
+        let e = self.index.get(key)?;
+        match e.dtype {
+            safetensors::Dtype::F32 => Some(Dtype::F32),
+            safetensors::Dtype::BF16 => Some(Dtype::BF16),
+            safetensors::Dtype::F16 => Some(Dtype::F16),
+            _ => None,
+        }
+    }
+
+    /// 原始字节区间直拷(mmap → dst;**纯 memcpy,零元素转换**)。
+    ///
+    /// 只服务"原生视图"键(`resolve` = `View`):派生键(qweight/scales/zeros/
+    /// fc 半拆)与合并虚拟键回退元素转换路(响亮 None —— 调用方自会回退)。
+    fn copy_native_into(
+        &self,
+        key: &str,
+        offset_elems: usize,
+        len: usize,
+        dst: &mut [u8],
+    ) -> Option<()> {
+        let Resolved::View(e) = self.resolve(key)? else {
+            return None;
+        };
+        let esz = e.esz();
+        let s = e.start.checked_add(offset_elems.checked_mul(esz)?)?;
+        let want = len.checked_mul(esz)?;
+        if s.checked_add(want)? > e.start + e.nbytes || dst.len() < want {
+            return None;
+        }
+        copy_par(&self.maps[e.map_ix][s..s + want], dst);
+        self.maps[e.map_ix].dontneed(s, want);
+        Some(())
     }
 
     fn elem_len(&self, key: &str) -> Option<usize> {
@@ -747,7 +870,7 @@ impl WeightSource for AwqSource {
                 // 设备重排原始键:I32 packed → U32 want(4B 同宽原样直拷)
                 if e.dtype == safetensors::Dtype::I32 && dtype == Dtype::U32 {
                     let s = e.start + offset_elems * 4;
-                    dst[..need].copy_from_slice(&self.maps[e.map_ix][s..s + need]);
+                    copy_par(&self.maps[e.map_ix][s..s + need], dst);
                     self.maps[e.map_ix].dontneed(s, need);
                     return Some(());
                 }
@@ -762,7 +885,7 @@ impl WeightSource for AwqSource {
                 let s = e.start + offset_elems * src_esz;
                 let win = &self.maps[e.map_ix][s..s + len * src_esz];
                 match e.dtype {
-                    safetensors::Dtype::F16 => dst[..need].copy_from_slice(win),
+                    safetensors::Dtype::F16 => copy_par(win, dst),
                     safetensors::Dtype::BF16 => {
                         crate::f16c::bf16_bytes_to_f16_bytes(win, &mut dst[..need])
                     }
@@ -779,16 +902,96 @@ impl WeightSource for AwqSource {
                 self.maps[e.map_ix].dontneed(s, len * src_esz);
                 Some(())
             }
+            // 合并虚拟键(两子基按序拼接):按 dst 偏移**直写**,零中间缓冲;
+            // 支持任意 [offset_elems, offset_elems+len) 区间跨段(与大键分块同律)
+            Resolved::Merged(parts) => {
+                if dtype != Dtype::U32 {
+                    return None;
+                }
+                let s = offset_elems.checked_mul(4)?;
+                let e = s.checked_add(need)?;
+                let mut pos = 0usize; // 逻辑拼接内的游标
+                let mut w = 0usize; // dst 写入位
+                for p in &parts {
+                    let p_end = pos.checked_add(p.nbytes)?;
+                    if p_end <= s {
+                        pos = p_end;
+                        continue;
+                    }
+                    if pos >= e {
+                        break;
+                    }
+                    let from = s.saturating_sub(pos);
+                    let to = (e - pos).min(p.nbytes);
+                    let len_p = to - from;
+                    let src = &self.maps[p.map_ix][p.start + from..p.start + to];
+                    copy_par(src, &mut dst[w..w + len_p]);
+                    self.maps[p.map_ix].dontneed(p.start + from, len_p);
+                    w += len_p;
+                    pos = p_end;
+                }
+                if w != need {
+                    return None;
+                }
+                Some(())
+            }
             Resolved::Bytes(b, reg) => {
                 if reg != dtype {
                     return None;
                 }
                 let s = offset_elems * esz;
-                dst[..need].copy_from_slice(b.get(s..s + need)?);
+                copy_par(b.get(s..s + need)?, dst);
                 Some(())
             }
         }
     }
+}
+
+    /// **bf16 源 → marlin scales 字节**(单遍融合;装载热路径的内部器)。
+///
+/// `parts` = 源 bf16 分段(1 或 2 段;2 段 = 合并虚拟键左右半,按序拼接);
+/// `idx` = [`marlin_scales_index`] 源下标表;逐位等价原链
+/// `bf16_par → pack_marlin_s → u16s_le_bytes`。
+pub(crate) fn pack_scales_bf16_into(
+    parts: &[&[u8]],
+    out: usize,
+    groups: usize,
+    idx: &[u32],
+    dst: &mut [u8],
+) {
+    use rayon::prelude::*;
+    let n = out * groups;
+    assert_eq!(idx.len(), n, "scales 索引表长度 = (groups,out) 展平");
+    assert!(dst.len() >= n * 2, "scales 目标字节不足");
+    // 段数只容 1/2(多于两段 = 亮声拒;合并虚拟键只有左右半)
+    let (a, b, cut) = match parts {
+        [] => panic!("scales 源分段为空"),
+        [a] => (*a, *a, usize::MAX),
+        [a, b] => (*a, *b, a.len() / 2),
+        _ => panic!("scales 源分段 > 2:{} 段未支持", parts.len()),
+    };
+    // 源覆盖度校验(响亮:索引表指到段外 = 编程错,不得静默读错字节)
+    let esrc = a.len() / 2 + if parts.len() == 2 { b.len() / 2 } else { 0 };
+    assert!(
+        a.len() % 2 == 0 && (parts.len() != 2 || b.len() % 2 == 0),
+        "scales 源字节量必须偶数"
+    );
+    assert!(esrc >= n, "scales 源元素数 {esrc} < 目标 {n}");
+    // 分块并行(块 = 2Ki 输出元素;块内串行递推,免逐元素派发税)
+    const BLK: usize = 1 << 11;
+    dst[..n * 2]
+        .par_chunks_mut(BLK * 2)
+        .enumerate()
+        .for_each(|(t, dchunk)| {
+            let base = t * BLK;
+            for (k, d2) in dchunk.chunks_exact_mut(2).enumerate() {
+                let g = idx[base + k] as usize;
+                let (src, o) = if g < cut { (a, g) } else { (b, g - cut) };
+                let bits = u16::from_le_bytes([src[o * 2], src[o * 2 + 1]]);
+                let f = f32::from_bits((bits as u32) << 16);
+                d2.copy_from_slice(&half::f16::from_f32(f).to_le_bytes());
+            }
+        });
 }
 
 /// RTN g32-sym 现场量化(q packed U4B8 语义):q = clamp(round(w/s), −8, 7)+8,
@@ -896,6 +1099,21 @@ mod tests {
         out: usize,
         k: usize,
     ) {
+        write_ct_named(dir, "model.safetensors", base, packed, scales_bf16, zp, out, k);
+    }
+
+    /// 同上但可指定文件名(多子基检查点:合并虚拟键的对拍需要两个文件共存)
+    #[allow(clippy::too_many_arguments)]
+    fn write_ct_named(
+        dir: &Path,
+        file_name: &str,
+        base: &str,
+        packed: &[i32],
+        scales_bf16: &[u8],
+        zp: &[i32],
+        out: usize,
+        k: usize,
+    ) {
         owl_shared::file_loader::create_dir_all(dir).expect("mkdir");
         let mut header = String::from("{");
         let mut blobs: Vec<Vec<u8>> = Vec::new();
@@ -927,7 +1145,142 @@ mod tests {
         for b in blobs {
             file.extend_from_slice(&b);
         }
-        owl_shared::file_loader::write(dir.join("model.safetensors"), file).expect("写 ct 检查点");
+        owl_shared::file_loader::write(dir.join(file_name), file).expect("写 ct 检查点");
+    }
+
+    /// **合并虚拟键直写对拍**(2026-10-16 装载提速):
+    /// `in_proj_qkvz.packed_raw`(两子基 `weight_packed` 按序拼接)的
+    /// **零中间缓冲直写**必须 ≡ 参考实现"先拼接全量再按区间切片",
+    /// 且覆盖:整键/头部/跨段边界/尾部/乱序窗口 + 越界响亮拒。
+    #[test]
+    fn merged_packed_raw_direct_write_parity() {
+        let (out1, out2, k) = (256usize, 128usize, 256usize);
+        let dir = tmp_path("awq_merged_raw");
+        let n1 = out1 * (k / 8);
+        let n2 = out2 * (k / 8);
+        let p1: Vec<i32> = (0..n1).map(|i| (i as i32).wrapping_mul(0x0BB6_7AE1) ^ 0x5a5a).collect();
+        let p2: Vec<i32> = (0..n2).map(|i| (i as i32).wrapping_mul(0x9E37_79B1_u32 as i32)).collect();
+        let mk_scales = |n: usize| f32_to_bf16_bytes(&vec![0.25f32; n]);
+        let mk_zp = |n: usize| vec![0i32; n];
+        write_ct_named(
+            &dir,
+            "a.safetensors",
+            "l.in_proj_qkv",
+            &p1,
+            &mk_scales(out1 * (k / 32)),
+            &mk_zp((out1 / 8) * (k / 32)),
+            out1,
+            k,
+        );
+        write_ct_named(
+            &dir,
+            "b.safetensors",
+            "l.in_proj_z",
+            &p2,
+            &mk_scales(out2 * (k / 32)),
+            &mk_zp((out2 / 8) * (k / 32)),
+            out2,
+            k,
+        );
+        let src = AwqSource::open_dir(&dir).expect("open");
+        let key = "l.in_proj_qkvz.packed_raw";
+        assert!(
+            matches!(src.resolve(key), Some(Resolved::Merged(_))),
+            "合并键应解析为 Merged 视图"
+        );
+        let mut want: Vec<u8> = Vec::with_capacity((n1 + n2) * 4);
+        want.extend(p1.iter().flat_map(|v| v.to_le_bytes()));
+        want.extend(p2.iter().flat_map(|v| v.to_le_bytes()));
+        let n = n1 + n2;
+        let windows = [
+            (0usize, n),
+            (0, 1),
+            (0, 7),
+            (n1 - 3, 9),
+            (n1, n2),
+            (n1 - 64, 128),
+            (n - 5, 5),
+            (12, 1000),
+            (77, 4096),
+            (n / 2, n - n / 2),
+        ];
+        for (off, len) in windows {
+            let mut got = vec![0u8; len * 4];
+            assert!(
+                src.convert_chunk_into_bytes(key, off, len, &mut got, Dtype::U32).is_some(),
+                "窗口 [{off},{}) 应可直写",
+                off + len
+            );
+            assert_eq!(
+                got,
+                want[off * 4..(off + len) * 4],
+                "窗口 [{off},{}) 字节不一致",
+                off + len
+            );
+        }
+        // 越界/宽度不符 = 响亮 None(禁静默截断)
+        let mut small = vec![0u8; 4];
+        assert!(src.convert_chunk_into_bytes(key, n - 1, 2, &mut small, Dtype::U32).is_none());
+        assert!(src.convert_chunk_into_bytes(key, 0, n, &mut small, Dtype::U32).is_none());
+        assert!(src.convert_chunk_into_bytes(key, 0, 1, &mut small, Dtype::F16).is_none());
+    }
+
+    /// **scales 单遍融合**逐位对拍:融合直出字节 ≡ 原链
+    /// (`bf16_par` → `pack_marlin_s` → `u16s_le_bytes`),单段与两段都验。
+    #[test]
+    fn scales_fused_bytes_parity() {
+        use owl_kernels::family::marlin::repack::{marlin_scales_index, pack_marlin_s};
+        let (out, k) = (256usize, 256usize);
+        let groups = k / 32;
+        let dir = tmp_path("awq_scales_fused");
+        let scales: Vec<f32> = (0..out * groups).map(|i| 0.013 + (i % 521) as f32 * 2e-4).collect();
+        let sb = f32_to_bf16_bytes(&scales);
+        write_ct_dir(&dir, "l", &vec![0i32; out * (k / 8)], &sb, &vec![0i32; (out / 8) * groups], out, k);
+        let src = AwqSource::open_dir(&dir).expect("open");
+        let view = &src.maps[src.index["l.weight_scale"].map_ix]
+            [src.index["l.weight_scale"].start..src.index["l.weight_scale"].start + src.index["l.weight_scale"].nbytes];
+        // 单段
+        let idx = marlin_scales_index(out, groups);
+        let want = u16s_le_bytes(&pack_marlin_s(&bf16_par(view), out, groups));
+        let got = src.pack_scales_bytes(&[view], out, k);
+        assert_eq!(got, want, "单段融合逐位");
+        assert_eq!(idx.len(), out * groups);
+        // 两段(合并虚拟键语义:右半拼在左半之后)
+        let (o1, o2) = (out / 2, out - out / 2);
+        let (v1, v2) = (view, view);
+        let merged = src.pack_scales_bytes(&[v1, v2], out, k);
+        let mut f32_merged = bf16_par(v1);
+        f32_merged.extend(bf16_par(v2));
+        let want2 = u16s_le_bytes(&pack_marlin_s(&f32_merged[..out * groups], out, groups));
+        assert_eq!(merged, want2, "两段融合逐位");
+        let _ = (o1, o2);
+    }
+
+    /// `pack_marlin_s` 索引表化**逐位对拍**(冻结参考实现 = 原现算表式)
+    #[test]
+    fn marlin_scales_index_pack_parity() {
+        use owl_kernels::family::marlin::repack::{marlin_scale_perm, pack_marlin_s};
+        fn pack_marlin_s_ref(scales: &[f32], out: usize, groups: usize) -> Vec<u16> {
+            let sp = marlin_scale_perm();
+            let mut packed = vec![0u16; groups * out];
+            for gi in 0..groups {
+                for o in 0..out {
+                    let idx = gi * out + o;
+                    let src_idx = (idx / 64) * 64 + sp[idx % 64];
+                    let (sg, so) = (src_idx / out, src_idx % out);
+                    packed[idx] = half::f16::from_f32(scales[so * groups + sg]).to_bits();
+                }
+            }
+            packed
+        }
+        for (out, groups) in [(64usize, 2usize), (128, 4), (256, 1), (5120, 544)] {
+            let n = out * groups;
+            let scales: Vec<f32> = (0..n).map(|i| ((i * 2654435761) % 65536) as f32 / 8192.0).collect();
+            let idx = marlin_scales_index(out, groups);
+            let got = pack_marlin_s_idx(&scales, out, groups, &idx);
+            assert_eq!(got, pack_marlin_s_ref(&scales, out, groups), "(out={out}, groups={groups}) 逐位");
+            assert_eq!(pack_marlin_s(&scales, out, groups), got, "壳函数与索引路一致");
+        }
     }
 
     fn f32_to_bf16_bytes(v: &[f32]) -> Vec<u8> {
@@ -1001,5 +1354,196 @@ mod tests {
         let whole = src.take("l.scales").expect("take scales");
         let half1 = src.take_range("l.scales", 0, whole.len() / 2).expect("r1");
         assert_eq!(&whole[..half1.len()], &half1[..], "分块 = 整取前缀");
+    }
+
+    /// 本进程累计磁盘读字节(`/proc/self/io`)—— 区分"页缓存命中"与"真磁盘读"
+    fn io_read_bytes() -> u64 {
+        std::fs::read_to_string("/proc/self/io")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find_map(|l| l.strip_prefix("read_bytes: ").and_then(|v| v.trim().parse().ok()))
+            })
+            .unwrap_or(0)
+    }
+
+    /// N 线程分块拷贝(与 `safetensors::copy_native_into` 同款)
+    fn par_copy(src: &[u8], dst: &mut [u8], threads: usize) {
+        if threads <= 1 {
+            dst.copy_from_slice(src);
+            return;
+        }
+        let chunk = src.len().div_ceil(threads);
+        let ds: Vec<&mut [u8]> = dst.chunks_mut(chunk).collect();
+        let ss: Vec<&[u8]> = src.chunks(chunk).collect();
+        std::thread::scope(|sc| {
+            for (d, s) in ds.into_iter().zip(ss) {
+                sc.spawn(move || d.copy_from_slice(s));
+            }
+        });
+    }
+
+    /// 一段计账(逐次打印 + 磁盘读增量)
+    fn bench_seg(tag: &str, bytes: usize, reps: usize, mut f: impl FnMut(usize)) {
+        let r0 = io_read_bytes();
+        let mut times = Vec::new();
+        for i in 0..reps {
+            let t = std::time::Instant::now();
+            f(i);
+            times.push(t.elapsed().as_secs_f64());
+        }
+        let dr = io_read_bytes().saturating_sub(r0);
+        let all: Vec<String> = times
+            .iter()
+            .map(|d| format!("{:>7.1}ms/{:>5.2}GB/s", d * 1e3, bytes as f64 / 1e9 / d))
+            .collect();
+        eprintln!(
+            "[iobench] {tag:<32} {} 磁盘读 {:+.0}MB",
+            all.join("  "),
+            dr as f64 / 1e6
+        );
+    }
+
+    /// **scales 构建链微基准**(门控 `OWL_AWQ_IOBENCH=1`):旧链
+    /// (`bf16_par` → `pack_marlin_s` → `u16s_le_bytes`)vs 新单遍融合
+    /// (`pack_scales_bytes`)—— 装载提速的回归哨(2026-10-16:21ms/键 → 8ms/键)。
+    #[test]
+    fn bench_scales_chain() {
+        if !owl_shared::env_reader::flag("OWL_AWQ_IOBENCH") {
+            eprintln!("skip: OWL_AWQ_IOBENCH 未开");
+            return;
+        }
+        use owl_kernels::family::marlin::repack::pack_marlin_s;
+        // 27B mlp 档尺度:out=5120, k=17408 ⇒ groups=544, scales=2.78M 元素
+        let (out, k) = (5120usize, 17408usize);
+        let groups = k / 32;
+        let n = out * groups;
+        let scales_f32: Vec<f32> = (0..n).map(|i| 0.01 + (i % 977) as f32 * 1e-5).collect();
+        let src_bf16 = f32_to_bf16_bytes(&scales_f32);
+        eprintln!("[iobench] scales 链(27B mlp 档):out={out} groups={groups} 元素={n}");
+        bench_seg("旧链 bf16_par+spack+bytes", n * 2, 3, |_| {
+            std::hint::black_box(u16s_le_bytes(&pack_marlin_s(&bf16_par(&src_bf16), out, groups)));
+        });
+        let idx = marlin_scales_index(out, groups);
+        let mut dst = vec![0u8; n * 2];
+        bench_seg("索引表 gather(u16)", n * 2, 3, |_| {
+            std::hint::black_box(pack_marlin_s_idx(&scales_f32, out, groups, &idx));
+        });
+        bench_seg("单遍融合直出字节", n * 2, 3, |_| {
+            pack_scales_bf16_into(&[&src_bf16], out, groups, &idx, &mut dst);
+        });
+    }
+
+    /// **装载 I/O 通路微基准**(瓶颈定位用;门控 `OWL_AWQ_IOBENCH=1`)。
+    ///
+    /// 逐键量:① `resolve()` 单独(合并虚拟键的构建成本)② 现行
+    /// `convert_chunk_into_bytes`(resolve + 拷贝 + DONTNEED)③ 裸拷 mmap 视图
+    /// (1T/4T —— 内存带宽上限)④ 合并键的两子基直拷(理想实现)。
+    /// dst 先预热(隔离目标页缺页);每段带 `/proc/self/io` 磁盘读增量。
+    #[test]
+    fn bench_raw_copy_paths() {
+        if !owl_shared::env_reader::flag("OWL_AWQ_IOBENCH") {
+            eprintln!("skip: OWL_AWQ_IOBENCH 未开");
+            return;
+        }
+        let dir = std::path::PathBuf::from(owl_shared::env_reader::str("OWL_CKPT_27B_AWQ").unwrap_or_else(|| {
+            "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4".into()
+        }));
+        let src = AwqSource::open_dir(&dir).expect("源");
+        let want = owl_shared::env_reader::str("OWL_AWQ_IOBENCH_KEYS").unwrap_or_else(|| {
+            "model.language_model.layers.0.linear_attn.in_proj_qkvz.packed_raw,model.language_model.layers.0.mlp.down_proj.packed_raw,model.language_model.embed_tokens.weight".into()
+        });
+        for key in want.split(',').map(str::trim).filter(|k| !k.is_empty()) {
+            let first = src.resolve(key);
+            let nbytes = match &first {
+                Some(Resolved::View(e)) => e.nbytes,
+                Some(Resolved::Bytes(b, _)) => b.len(),
+                other => {
+                    eprintln!("[iobench] 跳过 {key}(臂 {} 不适用)", matches!(other, None));
+                    continue;
+                }
+            };
+            let dtype = if key.ends_with(".packed_raw") { Dtype::U32 } else { Dtype::F16 };
+            let elems = nbytes / dtype.size_bytes();
+            let arm = match src.resolve(key) {
+                Some(Resolved::View(e)) => format!("View({:?},{}MB)", e.dtype, e.nbytes / 1_000_000),
+                Some(Resolved::Bytes(b, d)) => format!("Bytes({d:?},{:.1}MB)", b.len() as f64 / 1e6),
+                Some(Resolved::Merged(ps)) => format!(
+                    "Merged({} 段,{:.1}MB)",
+                    ps.len(),
+                    ps.iter().map(|p| p.nbytes).sum::<usize>() as f64 / 1e6
+                ),
+                Some(Resolved::Zeroed) => "Zeroed".to_string(),
+                None => "None".to_string(),
+            };
+            eprintln!("[iobench] 键 {key}");
+            eprintln!("[iobench]   臂={arm} 字节={:.1}MB", nbytes as f64 / 1e6);
+            let mut dst = vec![0u8; nbytes];
+            dst.fill(0x5a); // dst 预热(不把目标缺页算进拷贝)
+            // ① resolve 单独(合并虚拟键 = 每次调用重建整个缓冲)
+            bench_seg("① resolve() 单独", nbytes, 3, |_| {
+                std::hint::black_box(src.resolve(key));
+            });
+            // ② 现行 API(装载域唯一入口)
+            bench_seg("② convert_chunk_into_bytes", nbytes, 3, |_| {
+                src.convert_chunk_into_bytes(key, 0, elems, &mut dst, dtype).expect("convert");
+            });
+            // ③ 裸拷:mmap 视图(仅 View 臂可比)
+            if let Some(Resolved::View(e)) = src.resolve(key) {
+                let r0 = io_read_bytes();
+                {
+                    let view = &src.maps[e.map_ix][e.start..e.start + e.nbytes];
+                    bench_seg("③ 裸拷 mmap 视图 1T", nbytes, 3, |_| dst.copy_from_slice(view));
+                    bench_seg("③' 裸拷 mmap 视图 4T", nbytes, 3, |_| par_copy(view, &mut dst, 4));
+                }
+                let _ = io_read_bytes().saturating_sub(r0);
+            }
+            // ④ 合并虚拟键的两子基直拷(理想:零中间缓冲)
+            if let Some(base) = key.strip_suffix(".packed_raw") {
+                if let Some((b1, b2)) = crate::formats::split_qkvz(base) {
+                    let (e1, e2) = (
+                        src.index.get(&format!("{b1}.weight_packed")).cloned(),
+                        src.index.get(&format!("{b2}.weight_packed")).cloned(),
+                    );
+                    if let (Some(e1), Some(e2)) = (e1, e2) {
+                        bench_seg("④ 两子基直拷 1T(理想)", nbytes, 3, |_| {
+                            let (a, b) = dst.split_at_mut(e1.nbytes);
+                            a.copy_from_slice(&src.maps[e1.map_ix][e1.start..e1.start + e1.nbytes]);
+                            b.copy_from_slice(&src.maps[e2.map_ix][e2.start..e2.start + e2.nbytes]);
+                        });
+                        bench_seg("④' 两子基直拷 4T(理想)", nbytes, 3, |_| {
+                            let (a, b) = dst.split_at_mut(e1.nbytes);
+                            par_copy(&src.maps[e1.map_ix][e1.start..e1.start + e1.nbytes], a, 4);
+                            par_copy(&src.maps[e2.map_ix][e2.start..e2.start + e2.nbytes], b, 4);
+                        });
+                        // ⑤ 中间缓冲成本:每轮新建 Vec + 两拷贝 + drop
+                        bench_seg("⑤ 中间 Vec 建+拷+drop", nbytes, 3, |_| {
+                            let mut buf = Vec::with_capacity(nbytes);
+                            buf.extend_from_slice(
+                                &src.maps[e1.map_ix][e1.start..e1.start + e1.nbytes],
+                            );
+                            buf.extend_from_slice(
+                                &src.maps[e2.map_ix][e2.start..e2.start + e2.nbytes],
+                            );
+                            dst.copy_from_slice(&buf);
+                            std::hint::black_box(buf.len());
+                        });
+                        // ⑤' 同链但缓冲复用(只省 alloc/首触)
+                        let mut keep = Vec::with_capacity(nbytes);
+                        bench_seg("⑤' 中间 Vec 复用", nbytes, 3, |_| {
+                            keep.clear();
+                            keep.extend_from_slice(
+                                &src.maps[e1.map_ix][e1.start..e1.start + e1.nbytes],
+                            );
+                            keep.extend_from_slice(
+                                &src.maps[e2.map_ix][e2.start..e2.start + e2.nbytes],
+                            );
+                            dst.copy_from_slice(&keep);
+                            std::hint::black_box(keep.len());
+                        });
+                    }
+                }
+            }
+        }
     }
 }
