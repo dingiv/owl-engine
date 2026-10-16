@@ -222,31 +222,54 @@ pub fn pack_marlin_b_a8(q: &[u8], k: usize, n: usize) -> Vec<i32> {
     b
 }
 
-/// scales(f32 行主序 out×groups)→ marlin s((groups, n) fp16 位型,n = out)。
-/// port upstream Layer.pack 的 s 段(flatten → (-1,64)[:, scale_perm] → 还原)。
-pub fn pack_marlin_s(scales: &[f32], out: usize, groups: usize) -> Vec<u16> {
+/// scales 源索引表((groups,out) 展平下标 → 源 `scales` flat 下标)。
+///
+/// 2026-10-16 装载提速定谳:原 `pack_marlin_s` 每个元素做**两次运行时整数
+/// 除法**(`src_idx / out` 与 `% out`,out 非二次幂)⇒ 实测 0.74GB/s
+/// (2.78M 元素 7.5ms/键 × 352 键 = 2.6s)。分解与形状 (out,groups) 无关,
+/// 每形状一次即可(装载域按形状缓存;整载只 6 种形状)。
+pub fn marlin_scales_index(out: usize, groups: usize) -> Vec<u32> {
     use rayon::prelude::*;
-    assert_eq!(scales.len(), out * groups);
     let sp = marlin_scale_perm();
     assert_eq!(sp.len(), 64);
-
-    // 转置 + 64-chunk perm + f16 打包单遍融合(rayon 按 out 行并行;
-    // 原三步串行在 27B gate/up(9.5M 元素)上 ~33ms/层,融合后 ~8ms)
-    let mut packed: Vec<u16> = vec![0u16; groups * out];
-    packed
-        .par_chunks_mut(out)
+    assert!(groups * out > 0, "scales 形状非空");
+    let mut idx = vec![0u32; groups * out];
+    idx.par_chunks_mut(out)
         .enumerate()
-        .for_each(|(gi, dst_row)| {
-            for (o, cell) in dst_row.iter_mut().enumerate() {
-                // 目标 flat 下标 gi*out+o;64-chunk perm:chunk = idx/64,槽 = idx%64
-                let idx = gi * out + o;
-                let src_idx = (idx / 64) * 64 + sp[idx % 64];
-                // src_idx = src_group*out + src_o(转置回查)
+        .for_each(|(gi, row)| {
+            for (o, cell) in row.iter_mut().enumerate() {
+                let i = gi * out + o;
+                let src_idx = (i / 64) * 64 + sp[i % 64];
                 let (sg, so) = (src_idx / out, src_idx % out);
-                *cell = f16::from_f32(scales[so * groups + sg]).to_bits();
+                *cell = (so * groups + sg) as u32;
             }
         });
+    idx
+}
+
+/// 纯 gather 打包(与 [`pack_marlin_s`] 逐位一致 —— 后者即本函数 + 现算表)。
+pub fn pack_marlin_s_idx(scales: &[f32], out: usize, groups: usize, idx: &[u32]) -> Vec<u16> {
+    use rayon::prelude::*;
+    assert_eq!(scales.len(), out * groups);
+    assert_eq!(idx.len(), out * groups, "索引表长度 = (groups,out) 展平");
+    let mut packed: Vec<u16> = vec![0u16; out * groups];
     packed
+        .par_iter_mut()
+        .zip(idx.par_iter())
+        .for_each(|(cell, &i)| {
+            *cell = f16::from_f32(scales[i as usize]).to_bits();
+        });
+    packed
+}
+
+/// scales(f32 行主序 out×groups)→ marlin s((groups, n) fp16 位型,n = out)。
+/// port upstream Layer.pack 的 s 段(flatten → (-1,64)[:, scale_perm] → 还原)。
+///
+/// 无缓存调用点(测试/单次)走此壳;**装载热路径**用 [`marlin_scales_index`]
+/// + [`pack_marlin_s_idx`](索引表按形状缓存,消每元素两次除法)。
+pub fn pack_marlin_s(scales: &[f32], out: usize, groups: usize) -> Vec<u16> {
+    let idx = marlin_scales_index(out, groups);
+    pack_marlin_s_idx(scales, out, groups, &idx)
 }
 
 /// scales(f32 行主序 out×groups)→ marlin s((groups, n) f32,未转 fp16)。
