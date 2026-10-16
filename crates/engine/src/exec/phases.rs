@@ -22,11 +22,28 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if !b.pending_loads.is_empty() {
             let leg = &mut self.bank.leg_target;
             let face = self.graphs.session.face_mut();
-            // **一条命令搬 N 块**(§15 批面):逐块 = 每块一次 actor 往返 + 一次回执,
-            // 回灌收益会被往返吃光(store 卷 §16.5 第 1 条挂账)。
+            // §21:搬运由 engine 编排(取计划 → face.swap → 回执 → 记账);
+            // **一条命令搬 N 块**(逐块 = 每块一次往返,回灌收益被吃光)。
             let chains: Vec<owl_store::ChainHash> =
                 b.pending_loads.iter().map(|(_, c)| *c).collect();
-            let slots = owl_store::onload_blocks(leg, face, &chains).await?;
+            let (cs, new_slots, pieces, table) = {
+                let p = owl_store::plan_onload(leg, &chains)?;
+                (p.chains, p.slots, p.pieces, p.table)
+            };
+            let conn = match face
+                .swap(owl_iface::contract::SwapDir::In, &pieces, Box::new(table))
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    owl_store::abort_onload(leg, &cs, &new_slots);
+                    return Err(owl_iface::contract::ModelError::Msg(format!(
+                        "回灌 swap 失败(engine 编排):{e}"
+                    )));
+                }
+            };
+            let table = owl_store::reclaim_slot_table(conn)?;
+            let slots = owl_store::commit_onload(leg, &cs, &new_slots, table)?;
             let s = self.bank.sessions.get_mut(b.session_id).ok_or_else(|| {
                 owl_iface::contract::ModelError::Msg(format!("回灌:会话 {} 不在账", b.session_id))
             })?;

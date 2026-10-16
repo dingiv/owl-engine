@@ -787,8 +787,8 @@ pub struct BlockState { pub refs: u32, pub fp: u64, pub carrier: Carrier, pub la
 
 | 层 | 角色 | 判据 |
 |---|---|---|
-| **engine** | **决策 + 调用** | 何时换(段边界/压力时刻)、哪条链、**保护面**;绝不参与"怎么搬" |
-| **store** | **实现** | 换什么、搬到哪层、账怎么迁、宿主缓冲怎么管、策略怎么出序 |
+| **engine** | **决策 + 调用 + 编排** | 何时换(段边界/压力时刻)、哪条链、**保护面**;**搬运的编排**(取计划 → `face.swap` → 回执 → 记账)—— engine 是**唯一发起 I/O** 的一层 |
+| **store** | **实现(纯 host;§21)** | 换什么、搬到哪层、账怎么迁、宿主缓冲怎么管、策略怎么出序 —— 出**计划**与**记账**,**不碰 face** |
 | **server** | **执行** | 地址计算、DMA/流序、**一次 ack** |
 
 ### 10.3 两条硬推论
@@ -1097,14 +1097,15 @@ server 报:块账房 used/reserved(/debug/blocks)+ 池高水
 /// 相一:**判**(纯 host、零 I/O、可单测) —— 在 schedule 的决策面调用
 pub fn plan(leg/rel, need: Need, protect: &Protected) -> Verdict;   // "谁走、谁进、还是拒"
 
-/// 相二:**搬**(段边界、async、显式收 face) —— 在 exec 的段边界调用
-pub fn apply(leg/rel, face, &Verdict) -> Result<Applied>;           // 执行搬运并回账
+/// 相二:**搬**(段边界、async) —— **由 engine 编排**(§21):
+///   store(纯 host):plan_offload/plan_onload(算片 + 借台)· commit_*(回账)· abort_*(回滚)
+///   engine:         取计划 → `face.swap(dir, &pieces, conn)` → reclaim → commit
 ```
 
 - **判**可以在任意时刻(包括图捕获窗内)调用 —— 它只动账(§13.2 的六件);
 - **搬**只在段边界:piecewise 接缝 / pump 间隙 / prefill 分块之间(律③);
-- 两相之间**状态可变**(判完到搬完之间可能有别的 turn 动账)⇒ `apply` 必须**重验**
-  (引用变了就跳过该条:`Busy` = 跳过,不是错误)。
+- 两相之间**状态可变**(判完到搬完之间可能有别的 turn 动账)⇒ **取计划时必须重验**
+  (`plan_*` 的 `Busy` = 跳过该条,不是错误 —— 见 §21)。
 
 ### 14.2 决策单(Verdict)
 
@@ -1143,7 +1144,8 @@ pub struct Verdict {
 ### 14.5 落地清单(第一刀)
 
 1. `store` 出 `plan(need, protect) -> Verdict`(**纯判定**,覆盖 §12.3 次序:下沉 → 驱逐 → 拒)
-   与 `apply(face, &Verdict)`(**段边界搬运**,`Busy` 跳过);
+   与 `plan_offload/plan_onload + commit_*/abort_*`(**纯 host** 的搬运计划与记账);
+   `apply` 的**编排在 engine**(§21);
 2. engine 侧把现有触发点**改经钩子**(H1/H2 现在各有一处"临时法":`pool_housekeeping(nb/8)` 与
    `ensure_for_len` 的同步驱逐)⇒ 全部走 `plan`/`apply`;
 3. 打点:每个钩子的 `need / out.len() / in_.len() / deny / 实际搬了多少`(metrics);
@@ -1685,3 +1687,44 @@ engine lib 套件  65s → 4.59s   (含两处 CPU 装载)
 - 装载 65s → **3.83s**:staging 池化 + `#[inline(never)]` 别名修 + 数组切分(§18.4.4 + 坑册 §50)
 - 需求驱动保洁(§17)/ 回灌批次化(§17.7)/ 链级卸载律(§16.2)
 - CPU mock 档四件(§18)/ store 无卡端到端演示(§19)
+
+
+---
+
+## 21. 裁决:store **不做 I/O**(plan/commit/abort),搬运由 engine 编排 · 2026-10-17
+
+> 收敛 §10.2 与 §14.1 的表述张力:§10.2 写"engine = 决策 + 调用 · store = 实现 · server = 执行",
+> 而 §14.1 的伪代码把 `apply(face, …)` 放在了 store。**本裁决以前者为准** ——
+> **store 是纯逻辑状态机,连 `face` 都不认**。
+
+```rust
+// ── store(纯 host;零 I/O 依赖)────────────────────────────
+pub fn plan(leg, need, protect) -> Verdict;                        // 判:谁走谁进/拒
+pub fn plan_offload(leg, tail) -> StoreResult<OutPlan>;            // 算片 + 借宿主台(整条链)
+pub fn plan_onload(leg, chains) -> StoreResult<InPlan>;            // 取内容 + 分配槽 + 组片
+pub fn commit_offload(leg, &blocks, table) -> StoreResult<usize>;  // 记账(落宿主 + 摘绑定)
+pub fn commit_onload(leg, &chains, &slots, table) -> StoreResult<Vec<u32>>;
+pub fn abort_offload(leg, &blocks);  pub fn abort_onload(leg, &chains, &slots);   // 回滚
+pub fn reclaim_slot_table(conn) -> StoreResult<SlotTable>;         // 回执取台(原箱奉还)
+
+// ── engine(编排;唯一发起 I/O 的一层)─────────────────────
+let (blocks, pieces, table) = { let p = plan_offload(leg, tail)?; (p.blocks, p.pieces, p.table) };
+let conn = face.swap(SwapDir::Out, &pieces, Box::new(table)).await?;   // ← engine 发起
+let table = reclaim_slot_table(conn)?;
+commit_offload(leg, &blocks, table)?;
+```
+
+**为什么**:
+- store 因此可**当纯状态机穷举测试**(无 face / 无异步 / 无设备面);`plan_*` 任意时刻可调(含捕获窗内);
+- 搬运编排的形态(顺序、并发、多块在飞、盘层 I/O 线程)归 engine —— 那正是它"决策 + 调用"的职责;
+- 代价:重验/回滚/计数的**判定**仍在 store(`plan_*` 的 `Busy`),但**执行序**在 engine。
+
+**失败语义(HARD)**:搬运失败 ⇒ `abort_*` —— **内容已随命令消失 ⇒ 条目一并删**(不留假账);
+槽台随失败的 connector 一起释放。
+
+**落点**:`engine::running::apply_verdict`(决策单逐条)· `engine::exec::phases::execute_begin`(段边界回灌);
+样板 = `crates/store/tests/store_e2e.rs` 的 `engine_offload` / `engine_onload`
+(store 侧测试也有一份同构替身,只为在无 engine 下测搬运闭环)。
+
+**门(全绿)**:store **61 + 2**(单测 + 无卡 e2e)· engine lib 36 · `cpu_mock_smoke` 3 ·
+GPU 演示台(换出 12 块 / 3 命令 · 回灌 2 块 / 1 命令 · 兜底驱逐 0)。

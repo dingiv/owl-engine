@@ -1,10 +1,12 @@
-//! **store 无卡端到端演示(§19)**:需求驱动下沉 → 链级整条搬 → 命中批量回灌 →
+//! **store 无卡端到端演示(§19/§21)**:需求驱动下沉 → 链级整条搬 → 命中批量回灌 →
 //! 内容逐字节恒等 —— 全部用 **store 自己的公开 API** 驱动 + `CpuFace` 做真搬运,
 //! **不依赖 engine / GPU**(秒级,可进默认套件)。
 //!
-//! 为什么单独有它:engine 侧的 `OWL_OFFLOAD_PROBE` 需要真模型前向(无卡档受
-//! 执行域 dtype 约束,见设计卷 §18.5.1);而 store 的**账与搬运**闭环不需要
-//! 模型 —— 这里把同一套三门口用 store API 复刻,作为 store 自己的回归锚。
+//! **编排归属(§21 裁决)**:store **不做 I/O**(连 `face` 都不认)—— 它只出
+//! **计划**(`plan_offload`/`plan_onload`:算片 + 借宿主台)与**记账**
+//! (`commit_*` / `abort_*`)。搬运由 **engine 编排**:取计划 → `face.swap` → 回执 → 记账。
+//! 本文件里的 `engine_offload`/`engine_onload` 就是那段编排的**样板**(生产里在
+//! `engine::running::apply_verdict` / `exec::phases::execute_begin`)。
 //!
 //! 场景(冷热交替;与 engine 演示台同构):
 //! ```text
@@ -15,15 +17,65 @@
 //! ```
 
 use owl_cpu::CpuFace;
-use owl_iface::contract::{DeviceClient, Dtype, HeapRegion, PinnedRegion};
+use owl_iface::contract::{DeviceClient, Dtype, HeapRegion, PinnedRegion, SwapDir};
 use owl_store::{
-    apply, offload_chain, onload_blocks, plan, BlockClass, BlockLeg, LegConfig, Need, NeedWhy,
-    PieceSpec, PoolLayout,
+    commit_offload, commit_onload, plan, plan_offload, plan_onload, reclaim_slot_table, BlockClass,
+    BlockLeg, ChainHash, LegConfig, Need, NeedWhy, PieceSpec, PoolLayout, Sink, StoreResult,
 };
 
 const PIECE_ELEMS: usize = 64;
 const PIECE_BYTES: usize = PIECE_ELEMS * 4;
 const PAGE_TOKENS: usize = 32;
+
+// ───────────────────────── engine 式编排(样板)─────────────────────────
+//
+// 生产位置:`engine::running::apply_verdict`(决策单逐条执行)与
+// `engine::exec::phases::execute_begin`(段边界回灌)。三者形态必须一致:
+// **取计划 → face.swap → 回执取台 → commit**;失败走 abort(条目删,不留假账)。
+
+/// 换出**整条链**(一条 swap 搬 N 块)。
+async fn engine_offload(
+    leg: &mut BlockLeg,
+    face: &mut CpuFace,
+    tail: ChainHash,
+) -> StoreResult<usize> {
+    let (blocks, pieces, table) = {
+        let p = plan_offload(leg, tail)?; // 纯 host(算片 + 借台);Busy = 零副作用
+        (p.blocks, p.pieces, p.table)
+    };
+    let conn = match face.swap(SwapDir::Out, &pieces, Box::new(table)).await {
+        Ok(c) => c,
+        Err(e) => {
+            owl_store::abort_offload(leg, &blocks); // 内容已丢 ⇒ 条目一并删
+            return Err(owl_store::StoreError::Invariant(format!("swap(Out) 失败:{e}")));
+        }
+    };
+    let table = reclaim_slot_table(conn)?;
+    commit_offload(leg, &blocks, table)
+}
+
+/// 回灌**一批块**(一条 swap 搬 N 块)。
+async fn engine_onload(
+    leg: &mut BlockLeg,
+    face: &mut CpuFace,
+    chains: &[ChainHash],
+) -> StoreResult<Vec<u32>> {
+    let (cs, slots, pieces, table) = {
+        let p = plan_onload(leg, chains)?; // 纯 host(取内容 + 分配槽 + 组片)
+        (p.chains, p.slots, p.pieces, p.table)
+    };
+    let conn = match face.swap(SwapDir::In, &pieces, Box::new(table)).await {
+        Ok(c) => c,
+        Err(e) => {
+            owl_store::abort_onload(leg, &cs, &slots); // 槽归还 + 条目删
+            return Err(owl_store::StoreError::Invariant(format!("swap(In) 失败:{e}")));
+        }
+    };
+    let table = reclaim_slot_table(conn)?;
+    commit_onload(leg, &cs, &slots, table)
+}
+
+// ───────────────────────── 夹具 ─────────────────────────
 
 /// 两片段(= 两层 k/v)× `slots` 槽的设备池。
 async fn pieces(face: &mut CpuFace, slots: usize) -> Vec<PieceSpec> {
@@ -62,16 +114,14 @@ async fn read_slot(face: &mut CpuFace, ps: &[PieceSpec], slot: u32) -> Vec<u8> {
     let mut out = Vec::new();
     for p in ps {
         let mut d = vec![0u8; p.stride_bytes];
-        face.dtoh_at(&p.buf, slot as usize * p.stride_bytes, &mut d)
-            .await
-            .expect("读槽");
+        face.dtoh_at(&p.buf, slot as usize * p.stride_bytes, &mut d).await.expect("读槽");
         out.extend_from_slice(&d);
     }
     out
 }
 
 /// 建一条链(整块登记)→ 归还会话引用(缓存独占 ⇒ 可下沉)。
-async fn build_chain(leg: &mut BlockLeg, tokens: &[u32]) -> Vec<owl_store::ChainHash> {
+async fn build_chain(leg: &mut BlockLeg, tokens: &[u32]) -> Vec<ChainHash> {
     let mut table = Vec::new();
     leg.ensure_for_len(&mut table, tokens.len()).expect("块表");
     leg.register_chain(tokens, &table).expect("登记");
@@ -111,8 +161,15 @@ async fn offload_and_batch_reload_without_gpu() {
     let need = Need { slots: 2, why: NeedWhy::Admit };
     let verdict = plan(&l, need, &[]);
     assert!(!verdict.out.is_empty(), "池满 + 新需求 ⇒ 必须出单(下沉/驱逐)");
-    let applied = apply(&mut l, &mut face, &verdict).await.expect("执行决策单");
-    assert!(applied.offloaded > 0, "需求驱动下沉:应真搬(而非驱逐):{applied:?}");
+    // engine 式执行:逐条取计划 → swap → 记账
+    let mut offloaded = 0usize;
+    for item in &verdict.out {
+        match item.sink {
+            Sink::Host => offloaded += engine_offload(&mut l, &mut face, item.chain).await.expect("换出"),
+            Sink::Drop => l.drop_cached(item.chain).expect("驱逐"),
+        }
+    }
+    assert!(offloaded > 0, "需求驱动下沉:应真搬(而非驱逐)");
     let rep = l.report();
     assert!(rep.ops.offloads > 0 && rep.ops.offload_batches > 0, "换出门①:{:?}", rep.ops);
     assert!(rep.host_bytes > 0, "宿主层应有驻留");
@@ -123,7 +180,7 @@ async fn offload_and_batch_reload_without_gpu() {
     let pending = hit.pending_host();
     assert!(!pending.is_empty(), "A 已被整条沉到宿主 ⇒ 命中面应有待回灌块(A 的链头段也在)");
     assert!(!hit.all_resident(), "整条链沉 ⇒ 命中面不全驻留");
-    let slots = onload_blocks(&mut l, &mut face, &pending).await.expect("批量回灌");
+    let slots = engine_onload(&mut l, &mut face, &pending).await.expect("批量回灌");
     assert_eq!(slots.len(), pending.len(), "同序返回槽");
     let rep2 = l.report();
     assert_eq!(rep2.ops.onloads as usize, pending.len(), "回灌计数 = 块数");
@@ -137,8 +194,8 @@ async fn offload_and_batch_reload_without_gpu() {
     }
 }
 
-/// **链级整条搬**(§14.6):一次 `offload_chain` 把链从尾到头搬完 —— 链头段必须
-/// 也在宿主(否则命中面从链头就是设备格,回灌永不触发)。
+/// **链级整条搬**(§14.6):一次换出把链从尾到头搬完 —— 链头段必须也在宿主
+/// (否则命中面从链头就是设备格,回灌永不触发)。
 #[tokio::test]
 async fn chain_offload_moves_head_to_tail_and_batch_reloads() {
     let mut face = CpuFace::new();
@@ -157,14 +214,15 @@ async fn chain_offload_moves_head_to_tail_and_batch_reloads() {
     assert_eq!((cands[0].tail, cands[0].head), (tail, head));
     assert_eq!(cands[0].dev_blocks, 3);
 
-    assert_eq!(offload_chain(&mut l, &mut face, tail).await.expect("整条沉"), 3);
+    assert_eq!(engine_offload(&mut l, &mut face, tail).await.expect("整条沉"), 3);
     for (i, h) in chain.iter().enumerate() {
         assert_eq!(l.carrier_of(*h).expect("在账"), owl_store::Carrier::Host, "第 {i} 块应在宿主");
     }
     let hit = l.match_prefix(&tokens).expect("宿主格仍命中");
     assert_eq!(hit.pending_host().len(), 3, "三段全待回灌(链头段在内)");
-    let n = onload_blocks(&mut l, &mut face, &hit.pending_host()).await.expect("批量回灌");
+    let n = engine_onload(&mut l, &mut face, &hit.pending_host()).await.expect("批量回灌");
     assert_eq!(n.len(), 3);
+
     let rep = l.report();
     assert_eq!(rep.host_blocks, 0, "回灌后宿主副本应清空");
     assert_eq!(rep.cached_blocks, 3, "链仍在账");

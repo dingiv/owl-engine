@@ -55,10 +55,11 @@ pub use budget::{check_admission, Admission, AdmissionVerdict, BudgetInputs, Tur
 pub use id::{ChainHash, PrefixId, SnapKey, TOKENS_PER_BLOCK};
 pub use kv::{hash_block, tail_hash, CacheUpdate, ChainCursor, KvStats, KvStore, MatchedBlock, PrefixMatch};
 pub use leg::{
-    offload_block, offload_chain, onload_block, onload_blocks, BlockClass, BlockLeg, Carrier,
-    ChainCand, ChainHit, LegConfig, LegOps, LegStats, PieceSpec, PoolLayout,
+    abort_offload, abort_onload, commit_offload, commit_onload, plan_offload, plan_onload,
+    reclaim_slot_table, BlockClass, BlockLeg, Carrier, ChainCand, ChainHit, InPlan, LegConfig,
+    LegOps, LegStats, OutPlan, PieceSpec, PoolLayout,
 };
-pub use hooks::{apply, plan, Applied, EvictOut, Need, NeedWhy, Sink, Verdict};
+pub use hooks::{plan, Applied, EvictOut, Need, NeedWhy, Sink, Verdict};
 pub use policy::{AdmissionPolicy, EvictCandidate, EvictPolicy, Leg, LruPolicy, QueuePolicy};
 pub use rel::{EvictItem, EvictPlan, KvConfig, Protected, RecallHit, RecallMode, Rel, StoreReport};
 pub use state::StateStore;

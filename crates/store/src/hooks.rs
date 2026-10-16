@@ -11,9 +11,7 @@
 //!
 //! 两相之间状态可变 ⇒ `apply` **重验**:引用变了(`Busy`)只**跳过该条**,不是错误。
 
-use owl_iface::contract::DeviceClient;
 
-use crate::error::{StoreError, StoreResult};
 use crate::id::ChainHash;
 use crate::leg::BlockLeg;
 
@@ -155,41 +153,3 @@ pub fn plan(leg: &BlockLeg, need: Need, protect: &[ChainHash]) -> Verdict {
     v
 }
 
-/// **相二:搬**(段边界;显式收 face)。**实现全在 store,执行在 server。**
-///
-/// 语义:`Busy`(引用 > 1 = 活跃面)⇒ **跳过该条并计数**;其余错误**上抛**(不静默);
-/// `in_` 的条目做回灌(返回的新槽由调用方写回块表 —— H4 的形态)。
-pub async fn apply<D: DeviceClient>(
-    leg: &mut BlockLeg,
-    face: &mut D,
-    v: &Verdict,
-) -> StoreResult<Applied> {
-    let mut a = Applied::default();
-    for item in &v.out {
-        match item.sink {
-            // §14.6 链级:整条搬(尾 → 头);`Busy` = 整条跳过(零副作用:
-            // `offload_chain` 先整条校验再动手)
-            Sink::Host if item.span > 1 => match crate::leg::offload_chain(leg, face, item.chain).await {
-                Ok(n) => a.offloaded += n,
-                Err(StoreError::Busy(_)) => a.skipped_busy += 1,
-                Err(e) => return Err(e),
-            },
-            Sink::Host => match crate::leg::offload_block(leg, face, item.chain).await {
-                Ok(()) => a.offloaded += 1,
-                Err(StoreError::Busy(_)) => a.skipped_busy += 1,
-                Err(e) => return Err(e),
-            },
-            Sink::Drop => match leg.drop_cached(item.chain) {
-                Ok(()) => a.dropped += 1,
-                Err(StoreError::Busy(_)) => a.skipped_busy += 1,
-                Err(e) => return Err(e),
-            },
-        }
-    }
-    for chain in &v.in_ {
-        // 回灌:调用方(engine)拿新槽写回块表 —— 这里只保证内容回到设备
-        let _slot = crate::leg::onload_block(leg, face, *chain).await?;
-        a.onloaded += 1;
-    }
-    Ok(a)
-}

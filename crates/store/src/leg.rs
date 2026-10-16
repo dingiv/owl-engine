@@ -27,7 +27,7 @@
 //! - 片段读走 [`moves::download_span`](=`dtoh_at`;CUDA 面待补,见设计卷 §10.5)。
 //!   批面(`DtohBatch`/`HtodBatch`)是下一步;它**不改本文件的 API**(实现换成批命令即可)。
 
-use owl_iface::contract::{Bytes, ConnSlot, Connector, DeviceClient, SwapDir, SwapPiece};
+use owl_iface::contract::{Bytes, ConnSlot, Connector, SwapPiece};
 
 use crate::error::{StoreError, StoreResult};
 use crate::host::{HostBlock, HostTier, SlotTable};
@@ -503,86 +503,163 @@ impl ChainHit {
 
 // ───────────────────────────── 数据面(自由函数) ─────────────────────────────
 
-/// **换出**:一块 → 宿主层(engine 在**段边界**调用)。
-///
-/// 顺序(失败不留半态):借槽台 → **一条 swap 命令**(设备 → 连接器;
-/// 每层片段一片,一次 ack)→ 落账 → **摘绑定 + 还槽**(引用必须为 1;
-/// 活跃面 = 响亮拒)。
-/// 宿主层关闭(`host_bytes = 0`)= 借台就响亮拒(默认档不换出)。
-pub async fn offload_block<D: DeviceClient>(
-    leg: &mut BlockLeg,
-    face: &mut D,
-    chain: ChainHash,
-) -> StoreResult<()> {
-    let slot = leg.kv.ensure_offloadable(chain)?; // 前置:存在 + 设备绑定 + 引用 = 1
-    let n = offload_planes(leg, face, &[(chain, slot)]).await?;
-    debug_assert_eq!(n, 1);
-    Ok(())
+// ─────────────────── 搬运计划 / 记账(纯 host;§21 裁决)───────────────────
+//
+// **store 不做 I/O**(连 `face` 都不认):它只出**计划**(算片 + 借宿主台)与**记账**
+// (落账 / 摘绑定 / 回滚)。搬运由 **engine 编排**:取计划 → `face.swap` → 回执 → 记账。
+// 形态律:
+// - `plan_*` 纯 host(任意时刻可调,只动账与内存;组片走注册的布局);
+// - `commit_*` 纯 host(搬运成功后回账);
+// - `abort_*` 纯 host(搬运失败后回滚 —— **内容已随命令消失 ⇒ 条目一并删**,不留假账)。
+
+/// **换出计划**(纯 host;不碰 face)。
+pub struct OutPlan {
+    /// 逐块(身份, 原设备槽) —— 记账与回滚用。
+    pub blocks: Vec<(ChainHash, u32)>,
+    /// 设备 → 连接器的片(每块 × 每层片段)。
+    pub pieces: Vec<SwapPiece>,
+    /// 宿主侧槽台(engine 原箱交给 `face.swap`,回执后交还 [`commit_offload`])。
+    pub table: SlotTable,
 }
 
-/// **换出整条链**(§14.6 链级卸载律;engine 在**段边界**调用)。
-///
-/// 次序:**整条一起搬**(不许停在半截 —— 半截链对复用无贡献);
-/// 已在宿主的块**幂等跳过**(同链/他链已搬走它);一条 swap 命令搬完
-/// (N 块 × 每层片段)。
-///
-/// 先整条校验(`chain_down_span`)再动手:任一设备块仍被会话持(活跃面)⇒
-/// **响亮拒 `Busy`,零副作用**(调用方据此跳过整条)。
-///
-/// 返回实际搬走的块数。
-pub async fn offload_chain<D: DeviceClient>(
-    leg: &mut BlockLeg,
-    face: &mut D,
-    tail: ChainHash,
-) -> StoreResult<usize> {
-    // 整条可搬才动手(引用面在 `chain_down_span` 里逐块查)
+/// **回灌计划**(纯 host):宿主内容取出 + 设备槽分配 + 组片。
+pub struct InPlan {
+    /// 待回灌的块身份(与 `slots` 同序)。
+    pub chains: Vec<ChainHash>,
+    /// 新分配的设备槽(同序)。
+    pub slots: Vec<u32>,
+    /// 连接器 → 设备的片。
+    pub pieces: Vec<SwapPiece>,
+    /// 宿主侧槽台(engine 交给 `face.swap(In, …)`)。
+    pub table: SlotTable,
+}
+
+/// 回执取回槽台(单主语义:命令把 connector 原箱奉还;类型不符 = 响亮拒)。
+pub fn reclaim_slot_table(conn: Box<dyn Connector + Send>) -> StoreResult<SlotTable> {
+    conn.unbox().downcast::<SlotTable>().map(|b| *b).map_err(|_| {
+        StoreError::Invariant("swap 回执的连接器不是 SlotTable(实现面自洽性违约)".into())
+    })
+}
+
+/// **换出计划**:整条链(§14.6 粒度律)—— 先整条校验(`chain_down_span`)再算片;
+/// 已在宿主的块**幂等跳过**(同链/他链已搬走它)。
+/// 活跃面(设备块引用 > 1)或无可搬块 ⇒ `Busy`(**零副作用**,调用方跳过该条)。
+pub fn plan_offload(leg: &mut BlockLeg, tail: ChainHash) -> StoreResult<OutPlan> {
+    leg.pieces()?; // 未注册布局 = 先拒
     leg.kv.chain_down_span(tail).ok_or_else(|| {
         StoreError::Busy(format!(
             "链 {tail:?} 不可整条下沉(链尾不在账 / 有设备块引用 > 1 / 全链已在宿主)"
         ))
     })?;
-    let chain = leg.kv.chain_of(tail); // 逻辑序(根 → 尾)
-    // 只搬**设备块**(已在宿主的幂等跳过)
-    let mut planes: Vec<(ChainHash, u32)> = Vec::new();
+    let chain = leg.kv.chain_of(tail);
+    let mut blocks: Vec<(ChainHash, u32)> = Vec::new();
     for b in &chain {
         if b.slot.is_some() {
-            planes.push((b.chain, leg.kv.bound_slot(b.chain)?));
+            blocks.push((b.chain, leg.kv.bound_slot(b.chain)?));
         }
     }
-    if planes.is_empty() {
-        return Ok(0);
+    if blocks.is_empty() {
+        return Err(StoreError::Busy(format!("链 {tail:?} 没有可搬的设备块")));
     }
-    offload_planes(leg, face, &planes).await
+    let bufs = leg.host.lend_slots(blocks.len())?; // 预算在借台处查(超界零副作用)
+    let pieces = out_pieces(leg, &blocks)?;
+    Ok(OutPlan { blocks, pieces, table: SlotTable::new(bufs) })
 }
 
-/// **批量换出的执行面**(§15:`swap` 一条命令搬 `planes.len()` 块 × 每层片段)。
-///
-/// 调用方须已做完**整单校验**(引用面);本函数只管搬与落账:
-/// 借台 → 组片 → 一条命令 → 拆台落账 → 逐块摘绑定还槽 → 计数。
-async fn offload_planes<D: DeviceClient>(
+/// **换出记账**(搬运成功后调用;纯 host):内容装回宿主层 + 摘绑定还槽 + 计数。
+pub fn commit_offload(
     leg: &mut BlockLeg,
-    face: &mut D,
-    planes: &[(ChainHash, u32)],
+    blocks: &[(ChainHash, u32)],
+    table: SlotTable,
 ) -> StoreResult<usize> {
-    let bufs = leg.host.lend_slots(planes.len())?; // 预算在借台处查(超界零副作用)
-    let pieces = out_pieces(leg, planes)?;
-    let conn = face
-        .swap(SwapDir::Out, &pieces, Box::new(SlotTable::new(bufs)))
-        .await
-        .map_err(|e| StoreError::Invariant(format!("换出 swap 失败({} 块):{e}", planes.len())))?;
-    let table = reclaim_slot_table(conn)?;
-    // 落账:内容装回宿主层
+    let n = blocks.len();
     let items: Vec<(ChainHash, HostBlock)> =
-        planes.iter().map(|(c, _)| *c).zip(table.into_slots()).collect();
+        blocks.iter().map(|(c, _)| *c).zip(table.into_slots()).collect();
     leg.host.land(items)?;
-    // 摘绑定 + 还槽(缓存那份引用随绑定一起还)
-    for (chain, _) in planes {
-        leg.kv.unbind(*chain)?;
+    for (chain, _) in blocks {
+        leg.kv.unbind(*chain)?; // 摘绑定 + 还槽(缓存那份引用随绑定一起还)
     }
-    leg.ops.offloads += planes.len() as u64;
-    leg.ops.offload_bytes += (planes.len() * leg.slot_bytes()) as u64;
+    leg.ops.offloads += n as u64;
+    leg.ops.offload_bytes += (n * leg.slot_bytes()) as u64;
     leg.ops.offload_batches += 1;
-    Ok(planes.len())
+    Ok(n)
+}
+
+/// **换出回滚**(搬运失败后调用;纯 host):内容已随命令消失 ⇒ **条目一并删**
+/// (留着 `slot = None` 的条目就是假账,下次回灌必 `Unknown`)。
+/// 槽台随失败的 connector 一起消失(内存释放),不在此回收。
+pub fn abort_offload(leg: &mut BlockLeg, blocks: &[(ChainHash, u32)]) {
+    for (chain, _) in blocks {
+        let _ = leg.kv.drop_entry(*chain);
+    }
+}
+
+/// **回灌计划**(纯 host):逐块取宿主内容 → 分配槽 → 组片。
+/// 任一环节失败即回滚已做的部分(内容放回 / 槽归还),不留半态。
+pub fn plan_onload(leg: &mut BlockLeg, chains: &[ChainHash]) -> StoreResult<InPlan> {
+    if chains.is_empty() {
+        return Ok(InPlan {
+            chains: Vec::new(),
+            slots: Vec::new(),
+            pieces: Vec::new(),
+            table: SlotTable::new(Vec::new()),
+        });
+    }
+    leg.pieces()?; // 未注册布局 = 先拒(别先动宿主)
+    let mut bufs: Vec<HostBlock> = Vec::with_capacity(chains.len());
+    for c in chains {
+        match leg.host.take(*c) {
+            Ok(b) => bufs.push(b),
+            Err(e) => {
+                leg.host.recycle_many(bufs);
+                return Err(e);
+            }
+        }
+    }
+    let mut slots: Vec<u32> = Vec::with_capacity(chains.len());
+    for _ in chains {
+        match leg.kv.alloc_slot() {
+            Ok(s) => slots.push(s),
+            Err(e) => {
+                for s in &slots {
+                    let _ = leg.kv.decref(*s);
+                }
+                leg.host.recycle_many(bufs);
+                return Err(e);
+            }
+        }
+    }
+    let planes: Vec<(ChainHash, u32)> = chains.iter().copied().zip(slots.iter().copied()).collect();
+    let pieces = in_pieces(leg, &planes, 0)?;
+    Ok(InPlan { chains: chains.to_vec(), slots, pieces, table: SlotTable::new(bufs) })
+}
+
+/// **回灌记账**(搬运成功后调用;纯 host):缓冲回池 + 绑定回设备(引用 +1)+ 计数。
+/// 返回与入参**同序**的槽(调用方写回块表)。
+pub fn commit_onload(
+    leg: &mut BlockLeg,
+    chains: &[ChainHash],
+    slots: &[u32],
+    table: SlotTable,
+) -> StoreResult<Vec<u32>> {
+    leg.host.recycle_many(table.into_slots());
+    for (chain, slot) in chains.iter().zip(slots) {
+        leg.kv.rebind(*chain, *slot)?;
+    }
+    leg.ops.onloads += chains.len() as u64;
+    leg.ops.onload_bytes += (chains.len() * leg.slot_bytes()) as u64;
+    leg.ops.onload_batches += 1;
+    Ok(slots.to_vec())
+}
+
+/// **回灌回滚**(搬运失败后调用;纯 host):槽归还 + 条目删(内容已丢)。
+pub fn abort_onload(leg: &mut BlockLeg, chains: &[ChainHash], slots: &[u32]) {
+    for s in slots {
+        let _ = leg.kv.decref(*s);
+    }
+    for c in chains {
+        let _ = leg.kv.drop_entry(*c);
+    }
 }
 
 /// 组换出片:每块 × 每层片段一片
@@ -604,104 +681,6 @@ fn out_pieces(leg: &BlockLeg, planes: &[(ChainHash, u32)]) -> StoreResult<Vec<Sw
         }
     }
     Ok(out)
-}
-
-/// 回执取回槽台(单主语义:命令把 connector 原箱奉还,
-/// 这里按具体类型拆箱 —— 类型不符 = 响亮拒,不静默)。
-fn reclaim_slot_table(conn: Box<dyn Connector + Send>) -> StoreResult<SlotTable> {
-    conn.unbox()
-        .downcast::<SlotTable>()
-        .map(|b| *b)
-        .map_err(|_| {
-            StoreError::Invariant("swap 回执的连接器不是 SlotTable(实现面自洽性违约)".into())
-        })
-}
-
-/// **换回**:宿主层 → 设备(engine 在段边界调用);返回新绑定的槽(填进块表)。
-///
-/// 单块 = N=1 的糖(与 [`onload_blocks`] **同一条路径** —— 律 13:单件不是第二套实现)。
-pub async fn onload_block<D: DeviceClient>(
-    leg: &mut BlockLeg,
-    face: &mut D,
-    chain: ChainHash,
-) -> StoreResult<u32> {
-    let mut slots = onload_blocks(leg, face, &[chain]).await?;
-    Ok(slots.pop().expect("N=1 ⇒ 恰一个槽"))
-}
-
-/// **批量换回**(§15 批面;engine 段边界**一次命令搬 N 块**)。
-///
-/// 一条 `swap(In)` 搬 N 块 × 每层片段,返回与入参**同序**的新槽。
-/// 为什么必须批:命中 N 块 = N 次 actor 往返 + N 次回执,不批则回灌收益被往返吃光。
-///
-/// 失败**不留半态**(命令是原子的:全成或全败):
-/// ①已取的宿主内容与新建的槽全部回滚;②**条目一并删除** —— 内容已随命令消失,
-/// 留着 `slot = None` 的条目就是假账(下次回灌必 `Unknown`)。
-pub async fn onload_blocks<D: DeviceClient>(
-    leg: &mut BlockLeg,
-    face: &mut D,
-    chains: &[ChainHash],
-) -> StoreResult<Vec<u32>> {
-    if chains.is_empty() {
-        return Ok(Vec::new());
-    }
-    leg.pieces()?; // 未注册布局 = 先拒(别先动宿主)
-    // ① 取内容(逐块移出;任一失败即回滚已取的)
-    let mut bufs: Vec<HostBlock> = Vec::with_capacity(chains.len());
-    for c in chains {
-        match leg.host.take(*c) {
-            Ok(b) => bufs.push(b),
-            Err(e) => {
-                leg.host.recycle_many(bufs);
-                return Err(e);
-            }
-        }
-    }
-    // ② 分配槽(任一失败即回滚:槽归还 + 内容放回)
-    let mut slots: Vec<u32> = Vec::with_capacity(chains.len());
-    for _ in chains {
-        match leg.kv.alloc_slot() {
-            Ok(s) => slots.push(s),
-            Err(e) => {
-                for s in &slots {
-                    let _ = leg.kv.decref(*s);
-                }
-                leg.host.recycle_many(bufs);
-                return Err(e);
-            }
-        }
-    }
-    let planes: Vec<(ChainHash, u32)> =
-        chains.iter().copied().zip(slots.iter().copied()).collect();
-    let pieces = in_pieces(leg, &planes, 0)?;
-    let r = async {
-        let conn = face
-            .swap(SwapDir::In, &pieces, Box::new(SlotTable::new(bufs)))
-            .await
-            .map_err(|e| {
-                StoreError::Invariant(format!("回灌 swap 失败({} 块):{e}", chains.len()))
-            })?;
-        let table = reclaim_slot_table(conn)?;
-        leg.host.recycle_many(table.into_slots());
-        for (chain, slot) in &planes {
-            leg.kv.rebind(*chain, *slot)?; // 缓存绑定一份(引用 +1 ⇒ 会话 + 缓存)
-        }
-        Ok(())
-    }
-    .await;
-    if let Err(e) = r {
-        for s in &slots {
-            let _ = leg.kv.decref(*s); // 槽归还(引用 1 → 0)
-        }
-        for c in chains {
-            let _ = leg.kv.drop_entry(*c); // 内容真丢 ⇒ 条目一起删(不留假账)
-        }
-        return Err(e);
-    }
-    leg.ops.onloads += chains.len() as u64;
-    leg.ops.onload_bytes += (chains.len() * leg.slot_bytes()) as u64;
-    leg.ops.onload_batches += 1;
-    Ok(slots)
 }
 
 /// 组换入片(与 [`out_pieces`] 对称;`base_slot` = 台面槽位起点)。
@@ -734,6 +713,37 @@ mod tests {
     use crate::id::TOKENS_PER_BLOCK;
     use owl_cpu::CpuFace;
     use owl_iface::contract::Dtype;
+    use owl_iface::contract::{DeviceClient, SwapDir};
+
+    /// **测试侧编排**(模拟 engine):取计划 → `face.swap` → 回执 → 记账。
+    /// 生产里这段编排在 engine(§21);store 侧只出计划与记账 —— 这里替身是为了
+    /// 让 store 的搬运闭环仍能在**无 engine** 下测到端到端。
+    async fn do_offload(leg: &mut BlockLeg, face: &mut CpuFace, tail: ChainHash) -> StoreResult<usize> {
+        let (blocks, pieces, table) = {
+            let p = plan_offload(leg, tail)?;
+            (p.blocks, p.pieces, p.table)
+        };
+        let conn = face
+            .swap(SwapDir::Out, &pieces, Box::new(table))
+            .await
+            .map_err(|e| StoreError::Invariant(format!("测试编排 swap(Out) 失败:{e}")))?;
+        let table = reclaim_slot_table(conn)?;
+        commit_offload(leg, &blocks, table)
+    }
+
+    /// 同上:回灌一条命令。
+    async fn do_onload(leg: &mut BlockLeg, face: &mut CpuFace, chains: &[ChainHash]) -> StoreResult<Vec<u32>> {
+        let (cs, slots, pieces, table) = {
+            let p = plan_onload(leg, chains)?;
+            (p.chains, p.slots, p.pieces, p.table)
+        };
+        let conn = face
+            .swap(SwapDir::In, &pieces, Box::new(table))
+            .await
+            .map_err(|e| StoreError::Invariant(format!("测试编排 swap(In) 失败:{e}")))?;
+        let table = reclaim_slot_table(conn)?;
+        commit_onload(leg, &cs, &slots, table)
+    }
 
     const PIECE_ELEMS: usize = 32; // 128B/片段
     const PAGE_BYTES: usize = PIECE_ELEMS * 4;
@@ -837,20 +847,23 @@ mod tests {
         seed_slot(&mut face, &pieces, tail_slot, 0x40).await;
         let before = read_slot(&mut face, &pieces, tail_slot).await;
         let free_before = l.report().slots_free;
-        offload_block(&mut l, &mut face, tail).await.expect("换出");
+        do_offload(&mut l, &mut face, tail).await.expect("换出");
         let rep = l.report();
-        assert_eq!(real(rep.host_bytes), PAGE_BYTES * 2, "宿主应持一个逻辑块");
-        assert_eq!(rep.slots_free, free_before + 1, "摘绑定 ⇒ 槽回池");
+        // 新 API 是**链级**下沉(§14.6):tail 一站 ⇒ 整条链(2 块 = 4 片段)全部进宿主。
+        assert_eq!(real(rep.host_bytes), PAGE_BYTES * 4, "宿主应持整条链(2 块)");
+        assert_eq!(rep.slots_free, free_before + 2, "摘绑定 ⇒ 两槽回池");
         assert_eq!(l.carrier_of(tail).expect("在账"), Carrier::Host, "载体 = 宿主");
         // S3-3b:宿主格命中**不再整条拒** —— 命中面逐块给出载体,engine 段边界回灌
         let h2 = l.match_prefix(&tokens).expect("宿主格也可命中");
         assert_eq!(h2.matched_blocks, 2, "内容仍在(只是载体在宿主)");
         assert_eq!(h2.slots[1], None, "尾块在宿主层");
         assert!(!h2.all_resident(), "整条未全驻留");
-        assert_eq!(h2.pending_host(), vec![tail], "待回灌 = 尾块身份");
+        assert_eq!(h2.pending_host(), vec![hit.hashes[0], tail], "整条链待回灌(链头段在内)");
 
-        // 换回:新槽(旧槽已回池),内容逐字节复原
-        let slot2 = onload_block(&mut l, &mut face, tail).await.expect("换回");
+        // 换回:整条链回到设备(host 只留 0)
+        let back = do_onload(&mut l, &mut face, &h2.pending_host()).await.expect("换回");
+        assert_eq!(back.len(), 2, "整条回灌");
+        let slot2 = back[1];
         assert_eq!(l.carrier_of(tail).expect("在账"), Carrier::Device(slot2));
         assert_eq!(real(l.report().host_bytes), 0, "宿主缓冲已回收");
         let after = read_slot(&mut face, &pieces, slot2).await;
@@ -881,7 +894,7 @@ mod tests {
         closed.register_chain(&tokens, &table).expect("登记");
         let tail = closed.match_prefix(&tokens).expect("命中").hashes[0];
         closed.release_table(&mut table).expect("归还");
-        let err = offload_block(&mut closed, &mut face, tail).await.expect_err("关层必拒");
+        let err = do_offload(&mut closed, &mut face, tail).await.expect_err("关层必拒");
         assert!(matches!(err, StoreError::Exhausted(_)), "得 {err:?}");
 
         // ② 会话仍持引用 ⇒ 活跃面不可下沉
@@ -892,7 +905,7 @@ mod tests {
         l.ensure_for_len(&mut t2, 32).expect("块表");
         l.register_chain(&tokens, &t2).expect("登记");
         let c2 = l.match_prefix(&tokens).expect("命中").hashes[0];
-        let err = offload_block(&mut l, &mut face, c2).await.expect_err("活跃面必拒");
+        let err = do_offload(&mut l, &mut face, c2).await.expect_err("活跃面必拒");
         assert!(matches!(err, StoreError::Busy(_)), "活跃面拒 = Busy(调用方据此跳过候选),得 {err:?}");
     }
 
@@ -932,7 +945,7 @@ mod tests {
         assert_eq!((cands[0].dev_blocks, cands[0].blocks), (3, 3));
 
         // 整条搬:链头段也必须到宿主(§14.6 律 1:半截链 = 碎片)
-        let moved = offload_chain(&mut l, &mut face, tail).await.expect("整条下沉");
+        let moved = do_offload(&mut l, &mut face, tail).await.expect("整条下沉");
         assert_eq!(moved, 3);
         for (i, h) in hit.hashes.iter().enumerate() {
             assert_eq!(l.carrier_of(*h).expect("在账"), Carrier::Host, "第 {i} 块应在宿主");
@@ -946,12 +959,12 @@ mod tests {
         assert!(!h2.all_resident());
 
         // 整条再搬一次:幂等(全在宿主 ⇒ 无槽可腾 ⇒ 响亮拒,零副作用)
-        let err = offload_chain(&mut l, &mut face, tail).await.expect_err("空票必拒");
+        let err = do_offload(&mut l, &mut face, tail).await.expect_err("空票必拒");
         assert!(matches!(err, StoreError::Busy(_)), "得 {err:?}");
 
         // 回灌:逐字节复原(逻辑序)
         for (i, h) in h2.hashes.iter().enumerate() {
-            let slot = onload_block(&mut l, &mut face, *h).await.expect("回灌");
+            let slot = do_onload(&mut l, &mut face, &[*h]).await.expect("回灌")[0];
             assert_eq!(read_slot(&mut face, &pieces, slot).await, before[i], "块 {i} 逐字节一致");
         }
         assert_eq!(l.report().host_blocks, 0, "宿主副本已全部移出");
@@ -984,12 +997,12 @@ mod tests {
             before.push(read_slot(&mut face, &pieces, slot).await);
         }
         let tail = *hashes.last().expect("尾块");
-        assert_eq!(offload_chain(&mut l, &mut face, tail).await.expect("整条沉"), 2);
+        assert_eq!(do_offload(&mut l, &mut face, tail).await.expect("整条沉"), 2);
         let ops0 = l.report().ops;
         assert_eq!((ops0.offload_batches, ops0.offloads), (1, 2), "换出:1 命令 2 块");
 
         // 批量回灌:**一条命令**
-        let slots = onload_blocks(&mut l, &mut face, &hashes).await.expect("批量回灌");
+        let slots = do_onload(&mut l, &mut face, &hashes).await.expect("批量回灌");
         assert_eq!(slots.len(), 2, "同序返回两个槽");
         let ops1 = l.report().ops;
         assert_eq!((ops1.onload_batches, ops1.onloads), (1, 2), "回灌:1 命令 2 块");
@@ -998,7 +1011,7 @@ mod tests {
         }
         assert_eq!(l.report().host_blocks, 0, "宿主副本已全部取出");
         // 空表 = 空结果(不触命令、不报错 —— 调用方的"无待回灌"路径)
-        assert!(onload_blocks(&mut l, &mut face, &[]).await.expect("空表").is_empty());
+        assert!(do_onload(&mut l, &mut face, &[]).await.expect("空表").is_empty());
     }
 
     /// 活跃面(会话持有整条链)⇒ 链级候选不出票、整条搬**零副作用**拒。
@@ -1015,7 +1028,7 @@ mod tests {
         let tail = l.match_prefix(&tokens).expect("命中").hashes[1];
         // 会话仍持引用
         assert!(l.chain_offload_candidates(&[], 4).is_empty(), "活跃面不得出票");
-        let err = offload_chain(&mut l, &mut face, tail).await.expect_err("活跃面必拒");
+        let err = do_offload(&mut l, &mut face, tail).await.expect_err("活跃面必拒");
         assert!(matches!(err, StoreError::Busy(_)), "得 {err:?}");
         assert_eq!(l.report().host_blocks, 0, "拒 = 零副作用(不许搬半截)");
         assert_eq!(l.report().ops.offloads, 0);

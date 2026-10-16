@@ -430,6 +430,87 @@ impl<D: DeviceClient> RunningEngine<D> {
         Ok(owl_store::Need { slots: 0, why: NeedWhy::Idle })
     }
 
+
+
+
+    /// **决策单执行**(§21 裁决:**搬运由 engine 编排**;store 只出计划与记账)。
+    ///
+    /// 逐条:取计划(纯 host)→ **engine 自己发 `face.swap`** → 回执取台 → 记账。
+    /// - `Busy`(判与搬之间状态变了)= **跳过该条**(不是错误);
+    /// - 搬运失败 ⇒ `abort_*`(内容已随命令消失 ⇒ 条目删,不留假账)后上抛;
+    /// - `Drop` 是纯 host(store 直接删条目),无需 face。
+    async fn apply_verdict(
+        &mut self,
+        verdict: &owl_store::Verdict,
+    ) -> Result<owl_store::Applied> {
+        use owl_store::Sink;
+        let mut a = owl_store::Applied::default();
+        // ① 换出/驱逐
+        for item in &verdict.out {
+            match item.sink {
+                Sink::Host => {
+                    let (blocks, pieces, table) = {
+                        match owl_store::plan_offload(&mut self.bank.leg_target, item.chain) {
+                            Ok(p) => (p.blocks, p.pieces, p.table),
+                            Err(owl_store::StoreError::Busy(_)) => {
+                                a.skipped_busy += 1;
+                                continue;
+                            }
+                            Err(e) => return Err(e.into()),
+                        }
+                    };
+                    let face = self.graphs.session.face_mut();
+                    let conn = match face
+                        .swap(owl_iface::contract::SwapDir::Out, &pieces, Box::new(table))
+                        .await
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            owl_store::abort_offload(&mut self.bank.leg_target, &blocks);
+                            return Err(owl_iface::contract::ModelError::Msg(format!(
+                                "换出 swap 失败(engine 编排):{e}"
+                            )));
+                        }
+                    };
+                    let table = owl_store::reclaim_slot_table(conn)?;
+                    a.offloaded +=
+                        owl_store::commit_offload(&mut self.bank.leg_target, &blocks, table)?;
+                }
+                Sink::Drop => match self.bank.leg_target.drop_cached(item.chain) {
+                    Ok(()) => a.dropped += 1,
+                    Err(owl_store::StoreError::Busy(_)) => a.skipped_busy += 1,
+                    Err(e) => return Err(e.into()),
+                },
+            }
+        }
+        // ② 回灌(Verdict.in_:逐条一条命令;H4 的批量形态在 execute_begin)
+        for chain in &verdict.in_ {
+            let (cs, slots, pieces, table) = {
+                match owl_store::plan_onload(&mut self.bank.leg_target, std::slice::from_ref(chain)) {
+                    Ok(p) => (p.chains, p.slots, p.pieces, p.table),
+                    Err(e) => return Err(e.into()),
+                }
+            };
+            let face = self.graphs.session.face_mut();
+            let conn = match face
+                .swap(owl_iface::contract::SwapDir::In, &pieces, Box::new(table))
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    owl_store::abort_onload(&mut self.bank.leg_target, &cs, &slots);
+                    return Err(owl_iface::contract::ModelError::Msg(format!(
+                        "回灌 swap 失败(engine 编排):{e}"
+                    )));
+                }
+            };
+            let table = owl_store::reclaim_slot_table(conn)?;
+            let _ = owl_store::commit_onload(&mut self.bank.leg_target, &cs, &slots, table)?;
+            a.onloaded += 1;
+        }
+        Ok(a)
+    }
+
     /// **池压力保洁**(§14 钩子 H1/H2;段边界调用)—— store 的插入语义:
     /// "给你一个需求,谁该离开、谁该进来?" 本函数只负责**问**与**搬**,
     /// 判定内容全在 store(`owl_store::plan` / `apply`)。
@@ -464,8 +545,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             // 凑不够 = 真容量不足预警:照搬能搬的(下沉不丢内容),响亮留痕
             owl_shared::log_warn!("store", "钩子:需求凑不够(真容量不足预警):{why}");
         }
-        let face = self.graphs.session.face_mut();
-        let applied = owl_store::apply(&mut self.bank.leg_target, face, &verdict).await?;
+        let applied = self.apply_verdict(&verdict).await?;
         owl_shared::log_debug!(
             "store",
             "钩子({:?}) 判 out={n_out} in={n_in} ⇒ 搬:下沉 {} 驱逐 {} 回灌 {} 跳过活跃 {}",
