@@ -1023,13 +1023,23 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let rows: Vec<TensorOps> =
             (0..t).map(|r| owl_models::ops::argmax_f32idx(&logits, vocab, r * vocab)).collect();
         let refs: Vec<&TensorOps> = rows.iter().collect();
+        // **固定槽树**(arity = `CONCAT_ROWS_SLOTS`,声明面事实):核按末位
+        // `n = t` **只读前 t 槽** ⇒ `t < 8` 的槽是**有意 pad**(槽位形状不随 t
+        // 变 ⇒ 图族一次捕获覆盖所有 t,不必每 t 重捕)。
+        // 2026-10-16 定谳(原 FIXME「pad 还是越界未定谳」):pad **是**设计;
+        // 越界(t > 槽数)则声明面根本装不下 ⇒ 装配期已按 depth 拒(见
+        // `Engine::run` 的定形门),此处再守一道(运行期 t 不只有 depth 一个来源)。
+        if t == 0 || t > owl_models::kernel::CONCAT_ROWS_SLOTS {
+            return Err(ModelError::Msg(format!(
+                "verify 行数 t={t} 超出首轮拼接槽数 {}([spec] depth ≤ {});树不会静默截断",
+                owl_models::kernel::CONCAT_ROWS_SLOTS,
+                owl_models::kernel::CONCAT_ROWS_SLOTS - 1
+            )));
+        }
         let mut root = TensorOps::call(owl_models::ops::SemanticKernel::Concat);
-        // FIXME(2026-10-13,律 #1):`refs.get(i).unwrap_or(refs[0])` 在
-        // `t < 8` 时**静默用第 0 行补齐** —— 若属"固定 8 行图族"的按设计补齐,
-        // 应写成显式的 pad(并断言 t≥1);若属越界,静默回退会生成**错树**
-        // 且极难查。当前语义未定谳,故先挂牌不改行为(改动可能误伤 pad 路径)。
-        for i in 0..8 {
-            root = root.arg(refs.get(i).copied().unwrap_or(refs[0]));
+        for i in 0..owl_models::kernel::CONCAT_ROWS_SLOTS {
+            // i < t:真行;i ≥ t:pad(核只读前 t 槽,值无意义 —— 取第 0 行即可)
+            root = root.arg(if i < t { refs[i] } else { refs[0] });
         }
         let root = root.arg_usize(t).arg_usize(1).arg_usize(1).with_shape(Dtype::F32, vec![t, 1]);
         let (b, arena2) =
