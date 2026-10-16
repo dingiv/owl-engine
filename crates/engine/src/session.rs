@@ -29,7 +29,8 @@
 //! 模板渲染不稳定)**回退全量重算**(正确性优先,缓存命中其次);
 //! 真前缀匹配/radix 树随 M2 continuous batching 立项。
 
-use crate::blocks::BlockManager;
+use owl_store::{BlockClass, BlockLeg, ChainCursor, LegConfig, PoolLayout};
+
 use crate::Result;
 
 /// 客户端会话账(引擎侧感知面;KV cache 连续性的记账形态)
@@ -56,6 +57,11 @@ pub struct AgentSession {
     pub gdn_slot: usize,
     /// E5:LRU 触达时间(SessionTable.tick;越小越老,逐出候选)
     pub last_use: u64,
+    /// **链哈希游标**(快照键真源):已哈希整块数 + 链尾内容身份。
+    /// 懒惰推进(只喂新增整块)⇒ 全 turn O(n);键必须是**内容身份**
+    /// (物理块号会被回收复用 —— `owl_store::ChainCursor` 头注)。
+    /// 生命周期跟随链:前缀失配 `reset()` 归零;前缀命中由调度层 `seed()`。
+    pub(crate) chain: ChainCursor,
 }
 
 impl AgentSession {
@@ -70,6 +76,7 @@ impl AgentSession {
             mtp_block_table: Vec::new(),
             gdn_slot,
             last_use: 0,
+            chain: ChainCursor::new(),
         }
     }
 
@@ -81,10 +88,12 @@ impl AgentSession {
     }
 
     /// 账本重置(前缀失配回退):清账 + 清块表(块归还由引擎调账房,
-    /// 本函数只负责账面 —— 引擎在 reset 路径调 `release_table`)
+    /// 本函数只负责账面 —— 引擎在 reset 路径调 `release_table`)。
+    /// 链哈希游标一并归零(新链从零起 —— 身份跟着链走)。
     pub fn reset(&mut self) {
         self.cached_len = 0;
         self.tokens.clear();
+        self.chain.reset();
     }
 
     /// 会话 KV 预算校验:全量 prompt + 本 turn 生成长度 ≤ 槽区容量
@@ -204,16 +213,41 @@ impl SessionTable {
 // 按状态域拆解 —— 本节收编**会话账 + 双块账房**及其复合操作)
 // ===========================================================================
 
+/// 块腿几何(boot 一次;S3-3 后 engine 只认 `BlockLeg`,`KvStore` 收成 store 内部件)。
+pub(crate) struct BankPlan {
+    /// 池块容量(**管理面**页数)
+    pub nb: usize,
+    /// 单块 token 数(页)
+    pub page: usize,
+    /// target 池每页字节(`StatePool::block_bytes()`)
+    pub block_bytes: usize,
+    /// MTP 池每页字节(`StatePool::mtp_block_bytes()`;未开 = 0)
+    pub mtp_block_bytes: usize,
+    /// paged 池(legacy 无块表)
+    pub paged: bool,
+    /// MTP 草稿链页池启用
+    pub mtp: bool,
+    /// 前缀缓存开关(容量 = 池半)
+    pub prefix_cache: bool,
+    /// target 腿宿主层预算(字节;0 = 关层,REQ C4 默认关)
+    pub host_bytes: usize,
+}
+
 /// 会话 + 块账房(组合叶;RunningEngine 持有)。会话账与两套物理块链
 /// (target 链 / MTP 草稿链)的变更永远两者同屋 —— 逐出/关闭/重置
 /// 都是"账 + 链"复合操作,拆散在两处曾是泄漏温床。
+///
+/// **S3-2(2026-10-16)**:两本账(物理块引用账 + 前缀内容树)已自 engine
+/// 迁入 `owl-store`(`KvStore` = 槽池 + 内容身份前缀树),engine 只留
+/// 会话块表(`Vec<u32>`)与设备叶子 —— 裁决①的落点。设备叶子(池缓冲)
+/// 仍归 `StatePool`;store 只发槽号与身份。
 pub(crate) struct SessionBank {
     /// 会话账(GDN 格分配/LRU 逐出/前缀守卫)
     pub sessions: SessionTable,
-    /// target 链块账房(E2b;块链按会话分派,池内 ref 计数)
-    pub blocks_m: BlockManager,
-    /// MTP 链页账房(E5-M2b;独立页池,无前缀缓存)
-    pub blocks_mtp: BlockManager,
+    /// target 链块腿(前缀缓存挂这里;宿主面 = `plan.host_bytes`)
+    pub leg_target: BlockLeg,
+    /// MTP 链块腿(独立页池,无前缀缓存;宿主面恒关 —— 裁决④推后)
+    pub leg_mtp: BlockLeg,
 }
 
 impl SessionBank {
@@ -221,26 +255,53 @@ impl SessionBank {
     /// 只挂 target 链(容量 = 池半);MTP 链无前缀缓存,非 mtp 模式
     /// 0 块 —— 误用 = 结构化报错(池耗尽语义)。
     pub(crate) fn new(
-        pool_nb: usize,
-        pool_page: usize,
-        paged: bool,
-        mtp: bool,
-        prefix_cache: bool,
-        debug: bool,
-    ) -> Self {
-        let mut blocks_m = BlockManager::new(pool_nb, pool_page);
-        blocks_m.debug = debug;
-        if paged && prefix_cache {
-            blocks_m.enable_prefix_cache((pool_nb / 2).max(1));
+        plan: BankPlan,
+        target_layout: PoolLayout,
+        mtp_layout: Option<PoolLayout>,
+    ) -> Result<Self> {
+        // **缓存容量 = 设备槽 + 宿主槽**(S3-3b 定案):前缀索引**跨三层** ——
+        // 卸载到宿主的块仍占一个条目名额,若容量只按设备池算(旧:`nb/2`),
+        // 卸载后的条目会被容量驱逐立刻淘汰 ⇒ 宿主层攒不住东西(实测:换出 2 块
+        // 后条目即被逐,回灌永远不触发)。宿主面关闭时 = 旧行为。
+        let host_slots = if plan.host_bytes > 0 && plan.block_bytes > 0 {
+            plan.host_bytes / plan.block_bytes
+        } else {
+            0
+        };
+        // 宿主面关闭(host_slots = 0)= **旧行为逐字不变**(nb/2);开宿主面才扩容
+        let cache_cap = if plan.paged && plan.prefix_cache {
+            (plan.nb / 2 + host_slots).max(1)
+        } else {
+            0
+        };
+        let mut leg_target = BlockLeg::open(LegConfig {
+            slots: plan.nb,
+            block_tokens: plan.page,
+            block_bytes: plan.block_bytes,
+            cache_cap,
+            host_bytes: plan.host_bytes,
+            class: BlockClass::KvPage,
+            label: "target",
+        })?;
+        leg_target.attach_pool(target_layout)?;
+        let mut leg_mtp = BlockLeg::open(LegConfig {
+            slots: if plan.mtp { plan.nb } else { 0 },
+            block_tokens: plan.page,
+            block_bytes: if plan.mtp { plan.mtp_block_bytes } else { 1 },
+            cache_cap: 0,
+            host_bytes: 0,
+            class: BlockClass::KvPage,
+            label: "mtp",
+        })?;
+        if let Some(l) = mtp_layout {
+            leg_mtp.attach_pool(l)?;
         }
-        let mut blocks_mtp = BlockManager::new(if mtp { pool_nb } else { 0 }, pool_page);
-        blocks_mtp.debug = debug;
-        Self {
-            sessions: SessionTable::new(),
-            blocks_m,
-            blocks_mtp,
-        }
+        Ok(Self { sessions: SessionTable::new(), leg_target, leg_mtp })
     }
+
+    // （块腿的复合口做成**自由函数**:借用只落在 `&mut KvStore` 那一个字段上
+    //   —— 调用点多处仍持 `&mut AgentSession`(会话表另行借出),方法口会整借
+    //   bank 而冲突;自由函数与"字段不相交"的借用形状对齐。）
 
     /// E5:取或建 + 格耗尽 LRU 逐出重试(提交与泵不相交,无活跃 turn,
     /// 全部存活会话皆可逐;块链归账房,格随 close 回收)。键控与
@@ -260,7 +321,9 @@ impl SessionBank {
                     let Some(victim) = self.sessions.lru_victim() else {
                         return Err(last);
                     };
-                    self.release_session_chains(victim);
+                    if let Err(e) = self.release_session_chains(victim) {
+                        owl_shared::log_warn!("session", "LRU 逐出 #{victim} 链归还失败: {e}");
+                    }
                     // 会话关闭失败 = 块表归还/状态回收失败:不许静默(律 #1)
                     if let Err(e) = self.sessions.close(victim) {
                         owl_shared::log_warn!("session", "LRU 逐出 #{victim} 关闭失败: {e}");
@@ -286,28 +349,35 @@ impl SessionBank {
     /// 与 evict/burn 三路径同构;2026-10-15 结案拆分时挂的 FIXME:
     /// 原只还 target 链漏 MTP 页,mtp 模式下显式 close = 页池泄漏)。
     pub(crate) fn close(&mut self, id: u64) -> Result<()> {
-        self.release_session_chains(id);
+        self.release_session_chains(id)?;
         self.sessions.close(id)
     }
 
     /// 临时会话烧毁(complete/abandon 共用;块链归账房 + 表移除释放格,
     /// 双链同还)。关闭失败不许静默(律 #1)。
     pub(crate) fn burn(&mut self, session_id: u64) {
-        self.release_session_chains(session_id);
+        if let Err(e) = self.release_session_chains(session_id) {
+            owl_shared::log_warn!("session", "临时会话 #{session_id} 链归还失败: {e}");
+        }
         if let Err(e) = self.sessions.close(session_id) {
             owl_shared::log_warn!("session", "临时会话 #{session_id} 关闭失败: {e}");
         }
     }
 
     /// 单会话双链归还(target 链 + MTP 链;逐出/关闭/烧毁共用的
-    /// 复合操作 —— 链归还必须与账本操作同屋,防单边清理)
-    fn release_session_chains(&mut self, id: u64) {
+    /// 复合操作 —— 链归还必须与账本操作同屋,防单边清理)。
+    /// 归还失败(槽引用账不平)**不许静默**:记 warn 再抛(律 #1)。
+    fn release_session_chains(&mut self, id: u64) -> Result<()> {
+        // 先摘表(借用随块结束),再归还 —— 归还口是 self 的方法(账房自肃)
+        let mut table = Vec::new();
+        let mut mtp_table = Vec::new();
         if let Some(s) = self.sessions.get_mut(id) {
-            let mut table = std::mem::take(&mut s.block_table);
-            self.blocks_m.release_table(&mut table);
-            let mut mtp_table = std::mem::take(&mut s.mtp_block_table);
-            self.blocks_mtp.release_table(&mut mtp_table);
+            table = std::mem::take(&mut s.block_table);
+            mtp_table = std::mem::take(&mut s.mtp_block_table);
         }
+        self.leg_target.release_table(&mut table)?;
+        self.leg_mtp.release_table(&mut mtp_table)?;
+        Ok(())
     }
 }
 
@@ -410,31 +480,65 @@ mod bank_tests {
 
     /// T4 结案门(2026-10-15):显式 close 必须双链同还 —— MTP 链曾漏还
     /// (与 evict/burn 不对称,mtp 模式下显式关会话 = 页池泄漏)。
+    fn plan(nb: usize, page: usize, mtp: bool, prefix_cache: bool) -> BankPlan {
+        BankPlan {
+            nb,
+            page,
+            block_bytes: 1 << 20,
+            mtp_block_bytes: 1 << 20,
+            paged: true,
+            mtp,
+            prefix_cache,
+            host_bytes: 0,
+        }
+    }
+
+    /// 测试用装配:布局 = 单片段(只跑账,不跑搬运)
+    fn bank_of(p: BankPlan) -> SessionBank {
+        let target = PoolLayout {
+            class: BlockClass::KvPage,
+            epoch: 0,
+            pieces: vec![owl_store::PieceSpec {
+                buf: owl_iface::contract::Bytes::new(0, 1, owl_iface::contract::Dtype::F32, 1),
+                stride_bytes: p.block_bytes,
+            }],
+        };
+        let mtp = p.mtp.then(|| PoolLayout {
+            class: BlockClass::KvPage,
+            epoch: 0,
+            pieces: vec![owl_store::PieceSpec {
+                buf: owl_iface::contract::Bytes::new(0, 1, owl_iface::contract::Dtype::F32, 1),
+                stride_bytes: p.mtp_block_bytes,
+            }],
+        });
+        SessionBank::new(p, target, mtp).expect("装配块腿")
+    }
+
     #[test]
     fn close_releases_both_chains() {
-        let mut bank = SessionBank::new(64, 8, true, true, false, false);
-        let mtp_before = bank.blocks_mtp.free_blocks();
-        let tgt_before = bank.blocks_m.free_blocks();
+        let mut bank = bank_of(plan(64, 8, true, false));
+        let mtp_before = bank.leg_mtp.report().slots_free;
+        let tgt_before = bank.leg_target.report().slots_free;
 
         let (id, s) = bank.sessions.get_or_create(Some(7), 4).expect("建会话");
         assert_eq!(id, 7);
         // target 链 2 块(24 tok / 块 8)+ MTP 链 1 块(9 tok)
-        bank.blocks_m.ensure_for_len(&mut s.block_table, 24).expect("target 块");
-        bank.blocks_mtp.ensure_for_len(&mut s.mtp_block_table, 9).expect("mtp 块");
-        assert!(bank.blocks_mtp.free_blocks() < mtp_before, "mtp 已占用");
+        bank.leg_target.ensure_for_len(&mut s.block_table, 24).expect("target 块");
+        bank.leg_mtp.ensure_for_len(&mut s.mtp_block_table, 9).expect("mtp 块");
+        assert!(bank.leg_mtp.report().slots_free < mtp_before, "mtp 已占用");
 
         bank.close(id).expect("close");
-        assert_eq!(bank.blocks_mtp.free_blocks(), mtp_before, "MTP 链必须归还");
-        assert_eq!(bank.blocks_m.free_blocks(), tgt_before, "target 链归还");
+        assert_eq!(bank.leg_mtp.report().slots_free, mtp_before, "MTP 链必须归还");
+        assert_eq!(bank.leg_target.report().slots_free, tgt_before, "target 链归还");
         assert!(bank.sessions.get(id).is_none(), "账本移除");
     }
 
     /// 无 mtp 模式回归:0 块页池,release 空表 = no-op,close 正常。
     #[test]
     fn close_without_mtp_is_noop_on_empty_chain() {
-        let mut bank = SessionBank::new(32, 8, true, false, true, false);
+        let mut bank = bank_of(plan(32, 8, false, true));
         let (id, s) = bank.sessions.get_or_create(Some(1), 4).expect("建会话");
-        bank.blocks_m.ensure_for_len(&mut s.block_table, 8).expect("target 块");
+        bank.leg_target.ensure_for_len(&mut s.block_table, 8).expect("target 块");
         bank.close(id).expect("close");
         assert!(bank.sessions.get(id).is_none());
     }

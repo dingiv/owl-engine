@@ -371,6 +371,119 @@ impl<D: DeviceClient> RunningEngine<D> {
         self.graphs.set_phase(p);
     }
 
+    /// **本步的设备槽需求**(§12.4 需求驱动保洁的**真源**)。
+    ///
+    /// 口径 = 与 `schedule()` 里 `ensure_for_len` 的 target **同一份算式**
+    /// (块长走 [`crate::scheduler::RunningEngine::prefill_step_chunk`] 单源):
+    /// - 队列里有待准入 turn ⇒ 目标 = 该 prompt 全长(准入那一刻就要覆盖);
+    /// - 活跃 turn 在 prefill ⇒ 目标 = `fed + chunk`;
+    /// - 活跃 turn 在 decode ⇒ 目标 = `pos + spec 深度上界 + 1`
+    ///   (**上界是安全方向**:多算只是多腾几个槽(内容不丢),
+    ///   少算才会退回 `ensure_for_len` 的同步驱逐 —— 那正是要消灭的);
+    /// - 无活跃且队列空 ⇒ **零需求**(§12.4:不用固定水位预搬;
+    ///   预搬是显式策略,留给将来 预热/B 轴)。
+    ///
+    /// 返回的是"**还要长多少槽**"(已扣当前表长),不是总量。
+    ///
+    /// 准入分支要查一次命中面(纯 host、与 `schedule` 同一条匹配路):
+    /// Δ_j = `ceil(N_j/page) − 设备已驻留的命中块数`(§12.1)—— **host 命中的
+    /// 块不算省槽**(回灌时照样占槽,少算就是回灌 Exhausted)。
+    fn step_need(&mut self) -> Result<owl_store::Need> {
+        use owl_store::NeedWhy;
+        let page = self.pool.page.max(1);
+        let slots_for = |tokens: usize| tokens.div_ceil(page);
+        // ① 待准入(队列 front):准入即要覆盖整个 prompt
+        if let Some(t) = self.turns.queue.front() {
+            let (sid, plen) = (t.session_id, t.prompt_ids.len());
+            let dev = {
+                let hit = self.bank.leg_target.match_prefix(&t.prompt_ids)?;
+                Self::reuse_face(&self.pool, &hit, plen, page).1
+            };
+            let have = self.bank.sessions.get(sid).map(|s| s.block_table.len()).unwrap_or(0);
+            return Ok(owl_store::Need {
+                slots: slots_for(plen).saturating_sub(dev).saturating_sub(have),
+                why: NeedWhy::Admit,
+            });
+        }
+        // ② 活跃 turn:prefill 用单源块长;decode 用 spec 深度上界
+        if let Some(act) = self.turns.active.as_ref() {
+            let target = match Self::prefill_step_chunk(
+                act.fed,
+                act.prompt_ids.len(),
+                self.cfg.prefill_chunk,
+            ) {
+                Some(chunk) => act.fed + chunk,
+                None => act.fed + self.spec.depth + 1, // 生成相位(act.fed = pos)
+            };
+            let have = self
+                .bank
+                .sessions
+                .get(act.session_id)
+                .map(|s| s.block_table.len())
+                .unwrap_or(0);
+            return Ok(owl_store::Need {
+                slots: slots_for(target).saturating_sub(have),
+                why: NeedWhy::Grow,
+            });
+        }
+        // ③ 空转:零需求(不预搬)
+        Ok(owl_store::Need { slots: 0, why: NeedWhy::Idle })
+    }
+
+    /// **池压力保洁**(§14 钩子 H1/H2;段边界调用)—— store 的插入语义:
+    /// "给你一个需求,谁该离开、谁该进来?" 本函数只负责**问**与**搬**,
+    /// 判定内容全在 store(`owl_store::plan` / `apply`)。
+    ///
+    /// §12.4 口径:**需求驱动** —— `need` 由 [`Self::step_need`] 与 `schedule()`
+    /// 的同一份算式给出;空转(零需求)不搬。`need.slots == 0` = 直接返回
+    /// (老路径零变化:宿主面关闭时同样直接返回)。
+    /// 判定单里的 `deny` = **"即使搬空也不够"的真容量不足预警** ⇒ 响亮 WARN,
+    /// 但 `out` 里能搬的照搬(下沉不丢内容);真拒绝由 `ensure_for_len` 兜底。
+    async fn pool_housekeeping(&mut self, need: owl_store::Need) -> Result<()> {
+        if !self.bank.leg_target.host_enabled() || need.slots == 0 {
+            return Ok(());
+        }
+        let verdict = owl_store::plan(&self.bank.leg_target, need, &[]);
+        if owl_shared::env_reader::flag("OWL_STORE_HOOK_DEBUG") {
+            eprintln!(
+                "[hook] {:?} need={} free={}/{} 判 out={} in={} deny={:?}",
+                need.why,
+                need.slots,
+                self.bank.leg_target.slots_free(),
+                self.bank.leg_target.slots_total(),
+                verdict.out.len(),
+                verdict.in_.len(),
+                verdict.deny
+            );
+        }
+        if verdict.is_noop() {
+            return Ok(());
+        }
+        let (n_out, n_in) = (verdict.out.len(), verdict.in_.len());
+        if let Some(why) = &verdict.deny {
+            // 凑不够 = 真容量不足预警:照搬能搬的(下沉不丢内容),响亮留痕
+            owl_shared::log_warn!("store", "钩子:需求凑不够(真容量不足预警):{why}");
+        }
+        let face = self.graphs.session.face_mut();
+        let applied = owl_store::apply(&mut self.bank.leg_target, face, &verdict).await?;
+        owl_shared::log_debug!(
+            "store",
+            "钩子({:?}) 判 out={n_out} in={n_in} ⇒ 搬:下沉 {} 驱逐 {} 回灌 {} 跳过活跃 {}",
+            need.why,
+            applied.offloaded,
+            applied.dropped,
+            applied.onloaded,
+            applied.skipped_busy
+        );
+        owl_shared::metrics::with_metrics_store(|m| {
+            m.counter_add("store.hook.out", applied.offloaded as u64, file!(), line!());
+            m.counter_add("store.hook.drop", applied.dropped as u64, file!(), line!());
+            m.counter_add("store.hook.in", applied.onloaded as u64, file!(), line!());
+            m.counter_add("store.hook.busy", applied.skipped_busy as u64, file!(), line!());
+        });
+        Ok(())
+    }
+
     pub async fn pump(&mut self) -> Result<TurnEvent> {
         // E5-M2:spec 轮多 token 事件队列优先排空(schedule 前 —— 事件序
         // 不可与下一轮调度交织)
@@ -382,6 +495,15 @@ impl<D: DeviceClient> RunningEngine<D> {
         // owl_shared 全局 store(debug 展开/release 零开销);prof 时查询
         // 打印。其余 STEP_PROFILE 打点保留原样(gl-prof/srv-timing 工具链
         // 依赖其输出格式,逐点收编挂账)。
+        // **§14 钩子(段边界)**:需求驱动保洁(§12.4)—— 给 store 一个**真需求**
+        // (本步要长的槽数,与 `schedule` 同一份算式),它答"谁走谁进"。
+        //  · 有活跃/待准入 ⇒ H1(H1 准入)/ H2(增长),need = 真 delta;
+        //  · 空转 ⇒ **零需求,不搬**(§12.4 废弃了"总槽/2"这类固定水位:
+        //    预搬是显式策略,不是默认行为)。
+        // 保洁**先于** `schedule` 里的 `ensure_for_len` ⇒ 正常路径下同步驱逐恒为空
+        // (报告面 `ops.ensure_evicted` 可查)。
+        let need = self.step_need()?;
+        self.pool_housekeeping(need).await?;
         owl_shared::timer_start!("engine.pump.schedule");
         let t_sched = (prof || true).then(std::time::Instant::now);
         let out = self.schedule()?;

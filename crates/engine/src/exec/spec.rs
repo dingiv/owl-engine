@@ -743,8 +743,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
 
 
     /// GDN 快照拍摄(E2c;块边界跨越时调用):会话格状态 → 槽位缓冲。
-    /// key = **边界覆盖块**(block_table[fed/page - 1],即快照边界最后
-    /// 一块的物理 id)—— 块表在 turn-open 预长满,表尾 ≠ 边界块。
+    ///
+    /// **key = 边界块的内容身份**(逐块父链哈希;`owl_store::ChainCursor`)
+    /// —— **不是**物理块号:物理块号是会被回收复用的槽号(`decref` 归零 →
+    /// 自由队列 → 下次分配即拿回),拿它当键 ⇒ 槽复用后 `has_snap(旧槽号)`
+    /// 命中**别人的状态** = 静默错值(定谳见 store 设计卷 §9.1)。
+    /// 边界 token 段来源 = 本 turn 的完整 token 链(`prompt_ids ++ out`;
+    /// prefill 期落在 prompt 内,decode 期跨到生成段)—— `fed` 单调不减。
     /// 槽位选择/LRU 覆盖写在 StatePool::capture_snap(state.rs)。
     pub(crate) async fn capture_gdn_snap(&mut self, sid: u64, fed: usize) -> Result<()> {
         // snap_max = 0 ⇒ 快照面整体关闭:跳过(该档无语义需求;不得靠内部错误
@@ -752,19 +757,59 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if self.pool.snap_capacity() == 0 {
             return Ok(());
         }
+        let page = self.pool.page;
+        let full_blocks = fed / page;
+        if page == 0 || full_blocks == 0 {
+            return Ok(()); // 边界 0 = 无已完整块,无状态可拍
+        }
+        // 1) 纯读游标位置(借用即散)
+        let start = self.bank.sessions.get(sid).map(|s| s.chain.blocks()).unwrap_or(0);
+        if start >= full_blocks {
+            return Ok(()); // 幂等:同一 fed 不重复拍(状态由同一 token 链唯一确定)
+        }
+        // 2) 取新增整块的 token 段(活跃 turn 的链面)
+        let seg = self.tokens_upto(start * page, full_blocks * page)?;
+        // 3) 推进身份链(段长不符 = 结构性拒,不静默)
         let (gdn_slot, key) = {
-            let s = self.bank.sessions.get(sid).expect("账在");
-            let bi = fed / self.pool.page - 1;
-            (
-                s.gdn_slot,
-                *s.block_table
-                    .get(bi)
-                    .ok_or_else(|| ModelError::Msg("空块链不可拍快照".into()))?,
-            )
+            let s = self
+                .bank
+                .sessions
+                .get_mut(sid)
+                .ok_or_else(|| ModelError::Msg(format!("会话 {sid} 不在账")))?;
+            let tail = s.chain.advance(page, &seg, full_blocks).ok_or_else(|| {
+                ModelError::Msg(format!(
+                    "链哈希游标推进失败:sid={sid} fed={fed} start={start} 新增 {} 块",
+                    full_blocks.saturating_sub(start)
+                ))
+            })?;
+            (s.gdn_slot, owl_store::SnapKey::at_boundary(tail))
         };
         let face = self.graphs.session.face_mut();
         self.pool.capture_snap(face, gdn_slot, key).await
     }
 
-
+    /// 取本 turn 已喂入 KV 的 token 段 `[lo, hi)`(= `prompt_ids ++ out`)。
+    /// 越过已喂面 = **结构性拒**(快照边界不得越过 KV 真实内容 —— 静默截断
+    /// 会让快照身份与实际内容脱节)。
+    fn tokens_upto(&self, lo: usize, hi: usize) -> Result<Vec<u32>> {
+        let act = self.turns.active.as_ref().ok_or_else(|| {
+            ModelError::Msg("无活跃 turn:快照边界必须落在本 turn 的 token 链上".into())
+        })?;
+        let plen = act.prompt_ids.len();
+        let mut seg = Vec::with_capacity(hi.saturating_sub(lo));
+        for i in lo..hi {
+            if i < plen {
+                seg.push(act.prompt_ids[i]);
+            } else {
+                let j = i - plen;
+                seg.push(*act.out.get(j).ok_or_else(|| {
+                    ModelError::Msg(format!(
+                        "快照边界越界:token {i} 未喂(plen={plen} out={})",
+                        act.out.len()
+                    ))
+                })?);
+            }
+        }
+        Ok(seg)
+    }
 }

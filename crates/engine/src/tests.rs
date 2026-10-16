@@ -287,6 +287,407 @@ pub async fn gpu_schedule_decision_surface() {
     }
 }
 
+/// **S3-3b 实证(0.8B + 小池 + 宿主面)**:**需求驱动保洁**(§12.4)下的
+/// 下沉 → 命中回灌。
+///
+/// 场景(**冷热交替**,真需求驱动;不再靠空转水位制造下沉):
+/// ```text
+/// 轮 1/2  热链 A、B(各 3 块)⇒ 占 6/8 槽,free = 2
+/// 轮 3    长 prompt(8 块)⇒ need = 8 − 2 = 6 ⇒ 保洁**整条**沉 A+B(内容留在宿主)
+/// 轮 4    重发 A 的 prompt ⇒ 命中面落在宿主 ⇒ 段边界回灌 2 块(+ 冷转热需腾位)
+/// ```
+/// 跑:`OWL_OFFLOAD_PROBE=1 OWL_E2E_ONLY=offload_probe cargo test -p owl-engine \
+///      --features e2e --test engine_e2e -- --test-threads=1 --nocapture`
+pub async fn gpu_08b_offload_probe() {
+    if !owl_shared::env_reader::flag("OWL_OFFLOAD_PROBE") {
+        eprintln!("skip: OWL_OFFLOAD_PROBE 未设(S3-3b 实证按需开)");
+        return;
+    }
+    let Some(ordinal) = gpu_ordinal() else {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    };
+    let dir = asset_dir();
+    let mut engine = Engine::new(offload_probe_config(ordinal)).expect("构造");
+    let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
+    let mut running = engine.run(loaded).await.expect("装配");
+    offload_probe_scenario(&mut running).await;
+}
+
+/// **CPU mock 档(§18)**:同一套三门口跑在 `CpuFace` 上 —— **无卡**验证
+/// store 的换出/回灌/需求驱动保洁。账与搬运真,数值空转(`null_kernels`;
+/// 输出是垃圾但**确定性** ⇒ 门③恒等仍可判)。
+///
+/// 跑:`OWL_CPU_MOCK=1 OWL_OFFLOAD_PROBE=1 cargo test -p owl-engine \
+///      --features e2e --test engine_e2e -- --test-threads=1 --nocapture`
+/// (0.8B 在 CPU 上装载 ~65s —— 按需开,不进默认套件。)
+pub async fn cpu_mock_offload_probe() {
+    if !owl_shared::env_reader::flag("OWL_CPU_MOCK") || !owl_shared::env_reader::flag("OWL_OFFLOAD_PROBE") {
+        eprintln!("skip: OWL_CPU_MOCK / OWL_OFFLOAD_PROBE 未设(CPU mock 档按需开)");
+        return;
+    }
+    let face = owl_cpu::CpuFace::mock(owl_cpu::MockLimits {
+        null_kernels: true,
+        graph_capture: true,
+        ..Default::default()
+    });
+    let mut engine = Engine::on(offload_probe_config(0), face).expect("构造(CPU mock)");
+    let loaded = engine.loader().load_qwen35_0_8b(&asset_dir()).await.expect("装载");
+    let mut running = engine.run(loaded).await.expect("装配");
+    offload_probe_scenario(&mut running).await;
+}
+
+/// 演示台旋钮(两档共用 —— 池/宿主/快照几何与 face 无关)。
+fn offload_probe_config(ordinal: usize) -> EngineConfig {
+    let mut knobs = EngineKnobs { sampler_enabled: false, ..Default::default() };
+    knobs.pool_tokens = Some(256); // 单会话容量下限 = 256/32 = 8 页 ⇒ nb = **8 槽**
+    knobs.host_cache_mb = 8; // 宿主面开(8MiB ⇒ 可容 ~21 块)
+    knobs.snap_max = 16; // 快照别被 LRU 冲掉(前缀复用要求边界快照在场)
+    EngineConfig {
+        device_ordinal: ordinal,
+        max_seq_tokens: 256, // 8 页(池下限 = 单会话容量;要造压力就得同时压它)
+        prefill_chunk: 32,
+        knobs,
+    }
+}
+
+/// **store 演示台场景体(face 无关)** —— GPU 真卡档与 CPU mock 档**共用同一份
+/// 断言**(三门口 + 兜底驱逐 + 批面):§18 的 mock 价值就在"同一门"上。
+async fn offload_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>) {
+    // prompt 先算好(借用 `running.tok` 只在这里一次;下面要 &mut *running)
+    let mk = |i: usize, target: usize| -> String {
+        let mut body = String::new();
+        let mut k = 0usize;
+        while body.chars().count() < target {
+            body.push_str(&format!("第{i}则条目{k}:信号强度{k}级。"));
+            k += 1;
+        }
+        body
+    };
+    let hot: Vec<String> = (0..2).map(|i| mk(i, 88)).collect(); // 各 ~89 tok ⇒ 3 块
+    let long = mk(9, 240); // ~240 tok ⇒ 8 块(**需求**:8 − free 2 = 6 槽)
+
+    // 跑 ephemeral turn(终了焚链 ⇒ 缓存独占 ⇒ 可下沉)
+    // 门③基线:**冷启动**(轮 1)= 无缓存路径的生成全文
+    let mut cold_text: Option<String> = None;
+    for (i, p) in hot.iter().enumerate() {
+        let text = probe_run_turn(&mut *running, p).await;
+        if i == 0 {
+            cold_text = Some(text);
+        }
+    }
+
+    // **轮 3:需求驱动下沉** —— 长 prompt 准入即要 8 槽,free 只 2 ⇒
+    // 保洁按链把 A+B(各 3 块)整条沉到宿主(内容不丢,不是被同步驱逐掉)
+    let _ = probe_run_turn(&mut *running, &long).await;
+
+    let rep = running.bank.leg_target.report();
+    eprintln!(
+        "[s3-3b] 轮 3 后:自由槽 {}/{} · 缓存 {} 块 · 宿主 {} 块 / {:.2}MiB · 换出 {} 次 {}KiB(drop {} / 兜底驱逐 {})",
+        rep.slots_free,
+        rep.slots_total,
+        rep.cached_blocks,
+        rep.host_blocks,
+        rep.host_bytes as f64 / 1048576.0,
+        rep.ops.offloads,
+        rep.ops.offload_bytes >> 10,
+        rep.ops.ensure_evicted,
+        "—"
+    );
+    assert!(rep.ops.offloads > 0, "门①:需求驱动保洁应真下沉(宿主面已开)");
+    assert!(rep.host_bytes > 0, "门①:宿主层应真有驻留");
+    assert_eq!(rep.ops.ensure_evicted, 0, "需求驱动到位 ⇒ `ensure_for_len` 同步驱逐应为 0");
+
+    // 诊断:命中面到底长什么样(scheduler 看到的同一面)。
+    // ⚠️ 口径必须与 submit 一致:`submit_session` 内部先 `chat_wrap` 再 encode
+    // (裸 `encode(prompt)` = 少了模板前缀 ⇒ 哈希链从第 0 块就不同,匹配恒 0;
+    // 本诊断此前正是踩了这个假现场,见设计卷 §16)。
+    {
+        let mut diag = |tag: &str, p: &str| {
+            let wrapped = running.tok.chat_wrap(p);
+            let ids = running.tok.encode(&wrapped);
+            let hit = running.bank.leg_target.match_prefix(&ids).expect("match");
+            let rows: Vec<String> = hit
+                .hashes
+                .iter()
+                .zip(&hit.slots)
+                .enumerate()
+                .map(|(i, (h, s))| {
+                    format!(
+                        "{i}:{}|snap={}",
+                        if s.is_some() { "dev" } else { "host" },
+                        if running.pool.has_snap(owl_store::SnapKey::at_boundary(*h)) {
+                            "Y"
+                        } else {
+                            "N"
+                        }
+                    )
+                })
+                .collect();
+            eprintln!(
+                "[s3-3b] 诊断 {tag}:tokens={} matched={} pending={} · {}",
+                ids.len(),
+                hit.matched_blocks,
+                hit.pending_host().len(),
+                rows.join(" ")
+            );
+        };
+        diag("链A(轮 1/4 的 prompt)", &hot[0]);
+        diag("链B", &hot[1]);
+        eprintln!(
+            "[s3-3b] 诊断 快照池:cap={} used={}",
+            running.pool.snap_capacity(),
+            running.pool.snap_used()
+        );
+    }
+
+    // **轮 4:冷转热** —— 重发第 1 轮 prompt ⇒ 命中面落在宿主 ⇒ 段边界回灌
+    let text = probe_run_turn(&mut *running, &hot[0]).await;
+    eprintln!("[s3-3b] 命中轮回吐:{text:?}");
+    // **门③**:命中路径(宿主格→段边界回灌)与**冷启动**必须逐字节恒等
+    let cold = cold_text.as_deref().expect("轮 1 冷启动基线在场");
+    assert_eq!(text, cold, "门③:命中路径输出必须与冷启动逐字节一致");
+
+    let rep2 = running.bank.leg_target.report();
+    eprintln!(
+        "[s3-3b] 轮 4 后:宿主 {} 块 / {:.2}MiB · 换出 {} 块/{} 命令 · 回灌 {} 块/{} 命令 · 兜底驱逐 {}",
+        rep2.host_blocks,
+        rep2.host_bytes as f64 / 1048576.0,
+        rep2.ops.offloads,
+        rep2.ops.offload_batches,
+        rep2.ops.onloads,
+        rep2.ops.onload_batches,
+        rep2.ops.ensure_evicted
+    );
+    assert!(rep2.ops.onloads > 0, "门②:命中应触发段边界回灌(onload)");
+    assert!(rep2.ops.onloads >= 2, "命中面有两块在宿主 ⇒ 回灌至少 2 块");
+    assert_eq!(
+        rep2.ops.onload_batches, 1,
+        "§15 批面:多块回灌必须**一条命令**(逐块 = 每块一次往返)"
+    );
+    assert_eq!(rep2.ops.ensure_evicted, 0, "全程不得依赖 `ensure_for_len` 的同步驱逐");
+    // 轮 4 的换出 = **为回灌腾位**(冷链让路)⇒ 宿主净增减不作文判据;
+    // 真正要看的:回灌发生了、且没有同步驱逐(上两条)。
+}
+
+/// 跑一个 ephemeral turn 到完成(探针共用;返回生成全文)。
+async fn probe_run_turn<D: DeviceClient>(running: &mut RunningEngine<D>, prompt: &str) -> String {
+    let (_, tid) = running.submit_session(None, prompt, 8).expect("submit");
+    let mut n = 0usize;
+    loop {
+        match running.pump().await.expect("pump") {
+            TurnEvent::Idle => panic!("turn {tid} 队列丢失"),
+            TurnEvent::Completed { turn, text, .. } if turn == tid => return text,
+            TurnEvent::Failed { turn, err } => panic!("t{turn} 失败: {err}"),
+            _ => {
+                n += 1;
+                assert!(n < 8192, "事件不收敛");
+            }
+        }
+    }
+}
+
+/// **S0 预算实测(0.8B 档)** —— 固定面分解表:**每一项都是实测数字**
+/// (A5.1:没有数字的项禁止进预算式),产出可直接喂 `owl_store::Rel::open`
+/// 的 `BudgetInputs`(S3-3 host 卸载接线的前置)。
+///
+/// 跑法(钉卡示例;默认**不开** —— 需显式置 `OWL_BUDGET_PROBE=1`):
+/// ```bash
+/// CUDA_VISIBLE_DEVICES=GPU-<3080> OWL_TEST_DEVICE=0 OWL_BUDGET_PROBE=1 \
+///   cargo test -p owl-engine --features e2e --test engine_e2e -- --test-threads=1 --nocapture
+/// ```
+/// 口径(全部来自真分配账,禁止按公式估):
+/// - `weights` = live(装载后) − live(Engine::new 后);
+/// - 固定面 = live(run 后) − live(装载后),再按**池几何**拆出 KV 池 / GDN 格 /
+///   快照池 / 草稿池;余项 = **运行底价**(图 slab + 激活 + CUDA ctx + 表件);
+/// - turn 期 live 峰值由 200µs 采样线程给(瞬态面)。
+pub async fn gpu_08b_budget_probe() {
+    if !owl_shared::env_reader::flag("OWL_BUDGET_PROBE") {
+        eprintln!("skip: OWL_BUDGET_PROBE 未设(预算实测按需开)");
+        return;
+    }
+    let Some(ordinal) = gpu_ordinal() else {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    };
+    let dir = asset_dir();
+    let mb = |b: u64| b as f64 / 1048576.0;
+    let snapshot = |tag: &str| {
+        eprintln!(
+            "[budget] {tag:<22} total={:>9.1}MiB free={:>9.1}MiB live={:>9.1}MiB",
+            mb(owl_shared::vram::total_bytes()),
+            mb(owl_shared::vram::free_bytes()),
+            mb(owl_shared::vram::live_bytes()),
+        );
+    };
+
+    let mut engine = Engine::new(EngineConfig {
+        device_ordinal: ordinal,
+        max_seq_tokens: 4096,
+        prefill_chunk: 32,
+        knobs: EngineKnobs::default(),
+    })
+    .expect("构造");
+    let live_open = owl_shared::vram::live_bytes();
+    // **v_card 口径(设计卷 §2.2)**:开卡后 `cuMemGetInfo` 的 free(不是标称容量)
+    // —— CUDA ctx(~250MiB,不入 live 账)已在 free 里被扣掉,故它不进底价。
+    let v_card = owl_shared::vram::free_bytes();
+    snapshot("①Engine::new");
+
+    let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
+    let live_loaded = owl_shared::vram::live_bytes();
+    snapshot("②装载后");
+
+    let mut running = engine.run(loaded).await.expect("装配");
+    let live_run = owl_shared::vram::live_bytes();
+    snapshot("③run 后");
+
+    // 池几何先**拷出来**(下面要 &mut running 跑 turn;借用不重叠)
+    let (nb, nb_kv, page, n_full, n_gdn, kv_fp8, gdn_slots, snap_slots, paged) = {
+        let pool = &running.pool;
+        (
+            pool.nb,
+            pool.nb_kv,
+            pool.page,
+            pool.kvs.len(),
+            pool.gdn_count(),
+            pool.kv_fp8,
+            pool.gdn_slots,
+            pool.snap_capacity(),
+            pool.paged,
+        )
+    };
+    let (block_bytes, gdn_row_bytes) = {
+        let pool = &running.pool;
+        (pool.block_bytes(), pool.gdn_row_bytes())
+    };
+    let kv_pool = (nb_kv * block_bytes) as u64;
+    let gdn_pool = (gdn_slots * gdn_row_bytes) as u64;
+    let (snap_pool, draft_pool) = {
+        let pool = &running.pool;
+        (pool.snapshot_pool_bytes() as u64, pool.draft_pool_bytes() as u64)
+    };
+    let kv_per_tok = (block_bytes / page.max(1)).max(1);
+    let weights = live_loaded.saturating_sub(live_open);
+    let runtime_floor = live_run
+        .saturating_sub(live_loaded)
+        .saturating_sub(kv_pool + gdn_pool + snap_pool + draft_pool);
+
+    eprintln!(
+        "[budget] 池几何 nb={} nb_kv={} page={} n_full={} n_gdn={} kv_fp8={} gdn_slots={} snap_slots={} paged={}",
+        nb, nb_kv, page, n_full, n_gdn, kv_fp8, gdn_slots, snap_slots, paged
+    );
+    eprintln!(
+        "[budget] 导出 kv_bytes_per_token={kv_per_tok}B({}KiB) gdn_row={:.2}MiB gdn_pool={:.2}MiB snap_pool={:.2}MiB draft_pool={:.2}MiB",
+        kv_per_tok >> 10,
+        mb(gdn_row_bytes as u64),
+        mb(gdn_pool),
+        mb(snap_pool as u64),
+        mb(draft_pool as u64)
+    );
+    eprintln!(
+        "[budget] 固定面分解(实测):权重 {:.1}MiB + KV池 {:.1}MiB + GDN格 {:.1}MiB + 快照池 {:.1}MiB + 草稿池 {:.1}MiB + **运行底价(余项)** {:.1}MiB",
+        mb(weights),
+        mb(kv_pool),
+        mb(gdn_pool),
+        mb(snap_pool),
+        mb(draft_pool),
+        mb(runtime_floor)
+    );
+
+    // turn 期 live 峰值(瞬态面;200µs 采样线程)
+    let peak = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sampler = {
+        let (p, s) = (peak.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !s.load(std::sync::atomic::Ordering::Relaxed) {
+                p.fetch_max(owl_shared::vram::live_bytes(), std::sync::atomic::Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+        })
+    };
+    let (sid, tid) = running
+        .submit_session(Some(9001), "用五十字介绍长城。", 16)
+        .expect("submit");
+    let mut fed = 0usize;
+    loop {
+        match running.pump().await.expect("pump") {
+            TurnEvent::Idle => panic!("turn {tid} 队列丢失"),
+            TurnEvent::Prefill { turn, .. } if turn == tid => fed += 1,
+            TurnEvent::Completed { turn, .. } if turn == tid => break,
+            TurnEvent::Failed { turn, err } => panic!("t{turn} 失败: {err}"),
+            _ => {}
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    sampler.join().expect("采样线程");
+    snapshot("④首 turn 后");
+    eprintln!(
+        "[budget] turn 期 live 峰值={:.1}MiB(prefill chunk {} 次,16 tok 生成)",
+        mb(peak.load(std::sync::atomic::Ordering::Relaxed)),
+        fed
+    );
+    let _ = sid;
+
+    let n_star = |turns: u64| {
+        let fixed = weights
+            .saturating_add(runtime_floor)
+            .saturating_add(gdn_pool.saturating_mul(turns))
+            .saturating_add(draft_pool);
+        v_card.saturating_sub(fixed) / (kv_per_tok as u64)
+    };
+    eprintln!(
+        "[budget] **BudgetInputs 建议(0.8B/3080 档)**:v_card_bytes={v_card}(开卡 free;total={}) weights_bytes={weights} \
+runtime_floor_bytes={runtime_floor} draft_pool_bytes={draft_pool} gdn_row_bytes={} kv_bytes_per_token={kv_per_tok} host_bytes=0 disk_bytes=0",
+        owl_shared::vram::total_bytes(),
+        gdn_row_bytes
+    );
+    eprintln!(
+        "[budget] 容量换算:V_avail(1 turn)={}MiB ⇒ N*≈{} tok;V_avail(2 turn)={}MiB ⇒ N*≈{} tok",
+        mb(v_card.saturating_sub(weights.saturating_add(runtime_floor).saturating_add(gdn_pool).saturating_add(draft_pool))),
+        n_star(1),
+        mb(v_card.saturating_sub(weights.saturating_add(runtime_floor).saturating_add(gdn_pool * 2).saturating_add(draft_pool))),
+        n_star(2)
+    );
+
+    // ── **显存硬预算实证**(2026-10-16):小预算 ⇒ server 侧**主动拒发** ──
+    // 判据(cuda::state::vram_budget_guard):驱动账 free−reserve / live 账上限;
+    // 拒发 = 结构化 `PoolExhausted`(+ is_fatal ⇒ 服务面优雅关停)。
+    // 目的:证明"引擎装配遇到超预算"是**干净的结构化失败**,不是 CUDA 抛错。
+    {
+        let mut knobs = EngineKnobs::default();
+        knobs.cuda.vram_budget_mb = Some(64); // 64MiB:装不下池(96MiB KV + 154MiB GDN)
+        let mut e2 = Engine::new(EngineConfig {
+            device_ordinal: ordinal,
+            max_seq_tokens: 4096,
+            prefill_chunk: 32,
+            knobs,
+        })
+        .expect("构造");
+        // 拒发可落在**装载**(权重 htod)或**装配**(池 alloc)任一 —— 两处同一条闸
+        let refused = match e2.loader().load_qwen35_0_8b(&dir).await {
+            Err(e) => e,
+            Ok(loaded2) => match e2.run(loaded2).await {
+                Ok(_) => panic!("64MiB 预算下装配不该成功(硬预算未生效?)"),
+                Err(e) => e,
+            },
+        };
+        eprintln!(
+            "[budget] 硬预算拒发实证:{refused}(is_fatal={})",
+            refused.is_fatal()
+        );
+        assert!(
+            matches!(refused, owl_iface::contract::ModelError::PoolExhausted { .. }),
+            "期望结构化 PoolExhausted,得 {refused:?}"
+        );
+        assert!(
+            refused.is_fatal(),
+            "拒发必须保住致命类别(否则服务面不会走优雅关停;装载层不得把它包成 Msg)"
+        );
+    }
+}
+
 /// GPU 门控:双 turn 生命周期 —— submit 入队 / pump 事件流 / per-turn
 /// GDN 重置(第二个 turn 在脏状态后仍须产出连贯文本)。
 /// D1 冒烟:0.8B greedy 双配置(融合 vs 旧链)各产出非空连贯文本。

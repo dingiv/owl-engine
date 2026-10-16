@@ -18,7 +18,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let act = self.turns.active.as_ref().expect("active 已保证");
             let s = self.bank.sessions.get_mut(act.session_id).expect("账在");
             let before = s.block_table.len();
-            self.bank.blocks_m.ensure_for_len(&mut s.block_table, fp + 8)?;
+            self.bank.leg_target.ensure_for_len(&mut s.block_table, fp + 8)?;
             if s.block_table.len() != before {
                 let sid = act.session_id;
                 self.write_bt(sid).await?;
@@ -198,7 +198,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let act = self.turns.active.as_ref().expect("active 已保证");
             let s = self.bank.sessions.get_mut(act.session_id).expect("账在");
             let before = s.block_table.len();
-            self.bank.blocks_m.ensure_for_len(&mut s.block_table, pos + 8)?;
+            self.bank.leg_target.ensure_for_len(&mut s.block_table, pos + 8)?;
             if s.block_table.len() != before {
                 let sid = act.session_id;
                 self.write_bt(sid).await?;
@@ -726,7 +726,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let bt = {
             let sid = self.turns.active.as_ref().expect("active 已保证").session_id;
             let s = self.bank.sessions.get_mut(sid).expect("账在");
-            self.bank.blocks_mtp.ensure_for_len(&mut s.mtp_block_table, base + t_rows)?;
+            self.bank.leg_mtp.ensure_for_len(&mut s.mtp_block_table, base + t_rows)?;
             s.mtp_block_table.clone()
         };
         let (kc, vc) = self.pool.mtp_kv_leaf().expect("mtp 池");
@@ -810,7 +810,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let bt = {
             let sid = self.turns.active.as_ref().expect("active 已保证").session_id;
             let s = self.bank.sessions.get_mut(sid).expect("账在");
-            self.bank.blocks_mtp.ensure_for_len(&mut s.mtp_block_table, pos + m + depth)?;
+            self.bank.leg_mtp.ensure_for_len(&mut s.mtp_block_table, pos + m + depth)?;
             s.mtp_block_table.clone()
         };
         {
@@ -864,7 +864,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     pub(crate) fn mtp_chain_bt(&mut self, cover: usize) -> Result<Vec<u32>> {
         let sid = self.turns.active.as_ref().expect("active 已保证").session_id;
         let s = self.bank.sessions.get_mut(sid).expect("账在");
-        self.bank.blocks_mtp.ensure_for_len(&mut s.mtp_block_table, cover)?;
+        self.bank.leg_mtp.ensure_for_len(&mut s.mtp_block_table, cover)?;
         Ok(s.mtp_block_table.clone())
     }
 

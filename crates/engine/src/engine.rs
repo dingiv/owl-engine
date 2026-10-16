@@ -55,6 +55,9 @@ pub struct EngineKnobs {
     pub draft: DraftCfg,
     /// 前缀缓存(缺省开;原 OWL_PREFIX_CACHE≠"0")
     pub prefix_cache: bool,
+    /// **宿主层预算 MiB**(状态存储三层的中层;缺省 **0 = 关层**,REQ C4)。
+    /// 环境变量 `OWL_HOST_CACHE_MB`;S3-3b(回灌)接线前开了也没用
+    pub host_cache_mb: usize,
     /// eager 直发,跳过图捕获(原 OWL_NO_GRAPH;**总闸**)
     pub no_graph: bool,
     /// **prefill 图档位**(P1;`[graph] prefill_bucket`;缺省 `off` = 今天行为)
@@ -98,6 +101,7 @@ impl Default for EngineKnobs {
             pool_tokens: None,
             draft: DraftCfg::default(),
             prefix_cache: true,
+            host_cache_mb: 0,
             no_graph: false,
             prefill_bucket: owl_shared::config::PrefillBucket::Off,
             ts_probe: false,
@@ -140,6 +144,9 @@ impl EngineKnobs {
                 tapdecl: cfg.spec.tapdecl,
             },
             prefix_cache: cfg.pool.prefix_cache,
+            // 宿主层预算(S3-3):环境的 opt-in 旋钮(不进 OwlConfig —— 未接线前
+            // 开它只会让命中/驱逐响亮拒;接线后按档进 config 再谈)
+            host_cache_mb: owl_shared::env_reader::parse("OWL_HOST_CACHE_MB").unwrap_or(0),
             no_graph: cfg.graph.no_graph,
             prefill_bucket: cfg.graph.prefill_bucket,
             ts_probe: cfg.dispatch.ts_probe,
@@ -253,9 +260,15 @@ impl<D: DeviceClient + 'static> Engine<D> {
         let s = self.cfg.max_seq_tokens;
         let (hq, hkv, hd) = loaded.spec.full_heads;
         let (nk, hk, nv, hv) = loaded.spec.gdn_heads;
+        // ⚠️ **已知缺口(§18.5 挂账①)**:CPU/mock 档若要跑引擎真前向,
+        // `dtype` 不能简单归一为 F32 —— `kv_paged_policy(dtype)` 与
+        // attn v2 scratch 注入都以**模型 dtype** 为前提(F32 ⇒ 无分页策略
+        // ⇒ 走 legacy v1 臂 ⇒ attention.rs 的退役 panic)。所需修法:
+        // 让分页策略/scratch 与执行域 dtype 解耦(单独一刀),不在 mock 刀里扫。
         let dims = ModelDims {
             hq, hkv, hd, nk, hk, nv, hv,
-            hidden: loaded.spec.hidden, dtype: loaded.spec.dtype,
+            hidden: loaded.spec.hidden,
+            dtype: loaded.spec.dtype,
         };
 
         // 解释器执行环境(EnvProvider;E1.5 抽象):旋钮携带(入口经
@@ -345,13 +358,21 @@ impl<D: DeviceClient + 'static> Engine<D> {
         // 会话账 + 双块账房(E2b/E2c;session.rs:target 链前缀缓存挂载 +
         // MTP 链独立页池 —— 复合构造一次落位)
         let bank = crate::session::SessionBank::new(
-            pool.nb,
-            pool.page,
-            pool.paged,
-            spec.mode == SpecMode::Mtp,
-            self.cfg.knobs.prefix_cache,
-            self.cfg.knobs.probes.debug,
-        );
+            crate::session::BankPlan {
+                nb: pool.nb,
+                page: pool.page,
+                block_bytes: pool.block_bytes(),
+                mtp_block_bytes: pool.mtp_block_bytes(),
+                paged: pool.paged,
+                mtp: spec.mode == SpecMode::Mtp,
+                prefix_cache: self.cfg.knobs.prefix_cache,
+                // 宿主层预算(REQ C4:默认关;0 = 关层)—— 开它之前先做 S3-3b(回灌),
+                // 否则命中/驱逐遇宿主格会响亮拒(设计卷 §10.4 律⑤)
+                host_bytes: self.cfg.knobs.host_cache_mb << 20,
+            },
+            pool.pool_layout(0),
+            pool.mtp_pool_layout(0),
+        )?;
 
         // 图族总装配(graph_fleet.rs:① 主会话图(warmup+捕获)→
         // ② verify 桶形图 → ③ fold/DFlash2/MTP 族;face 句柄派生

@@ -37,9 +37,19 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 跨 turn 连续。临时会话终了即焚(表不随 turn 数无界增长)
         if let Some(s) = self.bank.sessions.get_mut(act.session_id) {
             s.commit_turn(&act.prompt_ids, &act.out);
-            // E2c:块链登记前缀缓存(缓存持引用;会话释放后块仍驻留)
+            // E2c:块链登记前缀缓存(缓存持引用;会话释放后块仍驻留)。
+            // S3-2:登记走 store 的块腿(引用配对在腿内自洽)
             if self.pool.paged {
-                self.bank.blocks_m.cache_seq(&s.tokens, &s.block_table);
+                let up = self.bank.leg_target.register_chain(&s.tokens, &s.block_table)?;
+                if self.cfg.knobs.probes.debug {
+                    owl_shared::log_debug!(
+                        "dbg prefix",
+                        "register_chain: 块表={} 新入={} 逐出={}",
+                        s.block_table.len(),
+                        up.inserted.len(),
+                        up.evicted.len()
+                    );
+                }
             }
         }
         if act.ephemeral {
