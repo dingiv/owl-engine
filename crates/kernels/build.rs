@@ -663,6 +663,8 @@ fn build_marlin() {
                 base.join("vllm_marlin/sm80_kernel_float16_u4b8_float16.cu"), // GPTQ 对称(kU4B8)
                 base.join("vllm_marlin/sm80_kernel_bfloat16_u4b8_bfloat16.cu"), // BF16 激活变体(E5-DF3 草稿 BF16 化)
                 base.join("vllm_marlin/sm80_kernel_s8_u4b8_float16.cu"),      // W4A8 s8→f16(S1;selector 引用之)
+                base.join("vllm_marlin/sm80_kernel_s8_u4_float16.cu"),        // W4A8 s8→f16 × AWQ 非对称(kU4;生产 27B 走这条)
+                base.join("vllm_marlin/sm80_kernel_s8_u4_bfloat16.cu"),       // W4A8 s8→bf16 × kU4(BF16 激活档)
             ];
             let includes = [base.join("vllm_marlin"), base.join("vllm_marlin/shim")];
             let ar = env::var("AR").unwrap_or_else(|_| "ar".into());
