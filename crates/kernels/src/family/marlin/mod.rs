@@ -328,3 +328,52 @@ mod size_checks {
         assert!(e.contains("c_tmp 块账长"), "拒语须指名槽位: {e}");
     }
 }
+
+// ============================================================================
+// 后端能力面(W4A8 线,2026-10-16;C④-1)
+// ============================================================================
+
+/// **marlin 后端**(`QuantGemm` 契约的首个实现体)。
+///
+/// 能力真值 = 架构真值:int8 张量核(IMMA `mma.s8s8s32`)自 **sm80** 起可用 ⇒
+/// 本仓 [`crate::Arch`] 现有两档(Sm86/Sm89)对 W4A16 / W4A8 / MoE-WNA16 全支持。
+/// ⚠️ 三处 `match` **故意不写通配臂**:未来新增 `Arch` 变体(尤其 < sm80)时,
+/// 编译器会在**这里**逼着作者明确表态,而不是静默继承旧答案(信条:响亮拒绝)。
+pub struct MarlinBackend;
+
+impl crate::QuantGemm for MarlinBackend {
+    fn w4a16(&self, arch: crate::Arch) -> bool {
+        match arch {
+            crate::Arch::Sm86 | crate::Arch::Sm89 => true,
+        }
+    }
+    /// W4A8 = int8 激活 × int4 权重(需 int8 张量核,sm80+)
+    fn w4a8(&self, arch: crate::Arch) -> bool {
+        match arch {
+            crate::Arch::Sm86 | crate::Arch::Sm89 => true,
+        }
+    }
+    fn moe_wna16(&self, arch: crate::Arch) -> bool {
+        match arch {
+            crate::Arch::Sm86 | crate::Arch::Sm89 => true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+    use crate::{Arch, QuantGemm};
+
+    /// 能力真值门:两档架构全支持;`dispatch` 指向 marlin 后端
+    #[test]
+    fn marlin_backend_capabilities() {
+        let b = MarlinBackend;
+        for a in [Arch::Sm86, Arch::Sm89] {
+            assert!(b.w4a16(a), "w4a16 {a:?}");
+            assert!(b.w4a8(a), "w4a8 {a:?}(int8 IMMA 需 sm80+)");
+            assert!(b.moe_wna16(a), "moe_wna16 {a:?}");
+        }
+        assert!(crate::dispatch(Arch::Sm86).contains("marlin"), "dispatch 指向 marlin 后端");
+    }
+}
