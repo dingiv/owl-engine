@@ -36,6 +36,7 @@
 //! | model | awq27b_dir | Option<String> / None(27B AWQ 检查点门控) |
 //! | model | dflash2_dir | Option<String>(⚠️ W4A16 量化家族 syvai 系;
 //! |   |   | BF16 源(z-lab)喂引擎 = 草稿全噪声 AL=0,装载期嗅探拒启) |
+//! | model | w4a8 | bool / false(S2;W4A8 档位 —— 权重 a8 布局 + int8 激活) |
 //! | model | head_quant | HeadQuant 枚举("off"\|"rtn-int4-g32")/ off(C1;|
 //! |   |   | 竖式/gate 质量门后转正) |
 //! | pool | pool_tokens | Option<usize> / None(=2×单会话) |
@@ -196,6 +197,11 @@ pub struct ModelCfg {
     /// C1(2026-10-11):untied lm_head 头部量化方案(枚举严格;映射点
     /// 在 engine loader:HeadQuant → QuantPlan)。质量门台账见枚举值注。
     pub head_quant: HeadQuant,
+    /// **W4A8 档位**(S2;2026-10-17;默认 off = 今天行为):开 = 权重 a8 布局
+    /// 三件套 + 激活 per-token int8 + kS8×kU4 GEMM(int8 张量核;prefill 2.29×,
+    /// decode 不变)。**只作用于主干层** —— lm_head / 草稿 / mtp 各自独立
+    /// plan(选层排除在本仓是结构性的,不需要名字正则)。
+    pub w4a8: bool,
 }
 
 /// 池几何与显存预算(engine StatePool)

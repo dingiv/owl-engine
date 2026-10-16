@@ -974,6 +974,14 @@ pub enum QuantPlan {
     /// 2026-10-01 cyankiwi/Qwen3.8-27B-AWQ-INT4 装载线):GEMM 走
     /// kU4(has_zp)内核,B 打包与 U4B8 同套,zp 单独烘焙 marlin 布局
     W4A16Awq,
+    /// **W4A8 × AWQ**(S2;2026-10-17):权重=**a8 布局**三件套
+    /// (`qweight_a8`/`scales_a8`[int16 位型]/`zeros_a8`)+ 全局因子
+    /// (`a8_factor` f32[1]);激活走 `quant_int8_row`(per-token int8)+
+    /// `marlin_gemm_w4a8_awq`(kS8×kU4,int8 张量核 ⇒ prefill 2.29×)。
+    ///
+    /// 与 `W4A16Awq` 的差别**全在布局与激活面**:权重同源、模型同构 ⇒
+    /// 换 plan 即 A/B(端口/配置不动)。
+    W4A8Awq,
 }
 
 /// 装载语境(layout 钩子的 ctx;按值传递,Copy)

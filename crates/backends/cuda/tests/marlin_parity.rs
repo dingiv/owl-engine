@@ -494,6 +494,81 @@ async fn marlin_w4a16_awq_parity() {
 }
 
 // ============================================================================
+// ct packed → marlin B **a8** 设备重排对拍(2026-10-17;S2 补)
+// ============================================================================
+
+/// GPU `owl_ct_repack_a8_u32` 输出 vs CPU `pack_marlin_b_a8` **逐 u32 一致**。
+///
+/// 为什么必须逐位:两个重排核的**输入契约与输出字数完全相同**(都是 ct packed
+/// 进、`k·n/8` u32 出)—— 唯一差别是 tile 几何与 nibble 排布 ⇒ 拿错核**不会
+/// 报错**,只会让 marlin 读到错列(设计卷 §14.3 判别探针实测:a8 布局喂 a16
+/// 表错列、反之亦然)。故本门是这条线的**换核保险**。
+#[tokio::test]
+async fn ct_repack_a8_parity() {
+    let mut client = assemble();
+    // 覆盖 grid 两维(rows/32 × cols/4)+ 非方形 + 生产形状族
+    for (out_dim, k) in [
+        (64usize, 128usize),
+        (256usize, 512usize),
+        (1024usize, 5120usize),
+        (5120usize, 5120usize),
+        (17408usize, 5120usize),
+    ] {
+        let rows = out_dim;
+        let cols = k / 8;
+        let packed: Vec<i32> = (0..rows * cols)
+            .map(|i| (i as i32).wrapping_mul(0x9E37_79B1_u32 as i32) ^ 0x1234_5678)
+            .collect();
+        // CPU 参照 = 真源 pack_marlin_b_a8(unpack_nibbles 后打包)
+        let q = owl_kernels::family::marlin::repack::unpack_nibbles(&packed, out_dim, k);
+        let b_ref = owl_kernels::family::marlin::repack::pack_marlin_b_a8(&q, k, out_dim);
+        assert_eq!(b_ref.len(), k * out_dim / 8, "a8 B 字数 = k·n/8");
+
+        let dp = owl_iface::htod!(client, Dtype::U32, &Shape::from(vec![rows, cols]), &le_i32(&packed)).await.expect("htod packed");
+        let dout = owl_iface::alloc!(client, Dtype::U32, b_ref.len()).await.expect("alloc out");
+        let msg = LaunchMsg {
+            kernel: owl_cuda::KernelSource {
+                name: "owl_ct_repack_a8_u32".into(),
+                source: owl_kernels::ops::source("owl_ct_repack_a8_u32").into(),
+            },
+            args: vec![
+                Arg::block(dp.id, dp.dtype, 2),
+                Arg::U64(rows as u64),
+                Arg::U64(cols as u64),
+                Arg::block(dout.id, dout.dtype, 2),
+            ],
+            // grid = (out/32, (k/8)/4);block 128(契约见 .cu 头注)
+            grid: ((rows / 32) as u32, (cols / 4) as u32, 1),
+            block: (128, 1, 1),
+            shared_mem: 0,
+            out_elems: b_ref.len(),
+        };
+        client.launch(msg).await.expect("a8 repack launch");
+        let mut buf = vec![0u8; b_ref.len() * 4];
+        client.dtoh(&dout, &mut buf).await.expect("dtoh");
+        client.sync().await.expect("sync");
+
+        let mut bad = 0usize;
+        let mut first = None;
+        for (i, w) in buf.chunks_exact(4).enumerate() {
+            let got = i32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+            if got != b_ref[i] {
+                bad += 1;
+                if first.is_none() {
+                    first = Some((i, got, b_ref[i]));
+                }
+            }
+        }
+        eprintln!(
+            "[repack-a8] out={out_dim} k={k}: 坏字 {}/{}",
+            bad,
+            b_ref.len()
+        );
+        assert_eq!(bad, 0, "GPU a8 repack 必须 vs CPU pack_marlin_b_a8 逐位一致;首错 {first:?}");
+    }
+}
+
+// ============================================================================
 // ct packed → marlin B 设备重排对拍(2026-10-01 GPU repack 装载线)
 // ============================================================================
 
@@ -513,7 +588,9 @@ async fn ct_repack_parity() {
         assert_eq!(b_ref.len(), (k / 16) * (rows * 2));
 
         // GPU
-        let dp = owl_iface::htod!(client, Dtype::U32, &Shape::from(vec![packed.len()]), &le_i32(&packed)).await.expect("htod packed");
+        // ⚠️ 块事实按**真形状**标注(rank2):L3 事实门按声明表核 dtype/rank,
+        // 标成 rank1 会被准入拒(2026-10-17 实测:本测试自 L3 门落地后一直是红的)
+        let dp = owl_iface::htod!(client, Dtype::U32, &Shape::from(vec![rows, cols]), &le_i32(&packed)).await.expect("htod packed");
         let dout = owl_iface::alloc!(client, Dtype::U32, b_ref.len()).await.expect("alloc out");
         let msg = LaunchMsg {
             kernel: owl_cuda::KernelSource {
@@ -521,10 +598,10 @@ async fn ct_repack_parity() {
                 source: owl_kernels::ops::source("owl_ct_repack_u32").into(),
             },
             args: vec![
-                Arg::block(dp.id, dp.dtype, dp.rank),
+                Arg::block(dp.id, dp.dtype, 2),
                 Arg::U64(rows as u64),
                 Arg::U64(cols as u64),
-                Arg::block(dout.id, dout.dtype, dout.rank),
+                Arg::block(dout.id, dout.dtype, 2),
             ],
             // grid = (out/64, (k/8)/2);block 32(契约见 .cu 头注)
             grid: ((rows / 64) as u32, (cols / 2) as u32, 1),

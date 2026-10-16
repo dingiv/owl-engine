@@ -162,6 +162,8 @@ pub enum SemanticKernel {
     SiluAndMul,
     /// ct packed → marlin B 设备重排(U32;核签名形参即 rows/cols)
     CtRepack,
+    /// W4A8 的 B 重排(S2):同输入契约、同输出字数,tile 几何不同
+    CtRepackA8,
     /// 刀D 层间时间戳探针(链式拷贝 + clock64;标量槽 = idx/n)
     TsStamp,
     /// f16 → bf16 铸边界(草稿装载)
@@ -276,6 +278,7 @@ impl SemanticKernel {
             SemanticKernel::ImageScatter => "vis.image_scatter",
             SemanticKernel::SiluAndMul => "mlp.silu_and_mul",
             SemanticKernel::CtRepack => "load.ct_repack",
+            SemanticKernel::CtRepackA8 => "load.ct_repack_a8",
             SemanticKernel::TsStamp => "ops.ts_stamp",
             SemanticKernel::CastF16Bf16 => "elems.cast_f16_bf16",
             SemanticKernel::CastBf16F16 => "elems.cast_bf16_f16",

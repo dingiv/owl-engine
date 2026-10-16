@@ -103,12 +103,17 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
     /// `head_plan`(C1,2026-10-11):untied lm_head 量化计划(唯一映射点
     /// owl_shared::config::HeadQuant → owl_models QuantPlan;量化方案
     /// = 配置枚举,loader 零硬编码)。
+    ///
+    /// `w4a8`(S2,2026-10-17):**主干**量化档 —— false = W4A16Awq(今天行为),
+    /// true = W4A8Awq(a8 布局 + 激活 int8 + int8 张量核)。显式参数而非
+    /// env:量化方案改语义(不是诊断旋钮),且入口(server boot)从配置读。
     #[allow(clippy::arc_with_non_send_sync)]
     pub async fn load_qwen38_27b_awq(
         &mut self,
         dir: &Path,
         tokenizer_dir: &Path,
         head_plan: owl_models::module::QuantPlan,
+        w4a8: bool,
     ) -> Result<LoadedModel> {
         // metrics 装载分相(直用 API 恒开;装载一次性路径,release 有数据)
         let _ = owl_shared::metrics::init_metrics(owl_shared::metrics::MetricsStore::new());
@@ -117,10 +122,19 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         });
         let (spec, rep) = ModelSpec::from_ckpt(dir, SpecSource::family(&qwen3_8_27b()))?;
         log_spec_report("27B-AWQ", &rep);
+        let quant_plan = if w4a8 {
+            owl_shared::log_info!(
+                "boot",
+                "W4A8 档位开:权重 a8 布局 + 激活 per-token int8 + kS8×kU4 GEMM"
+            );
+            owl_models::module::QuantPlan::W4A8Awq
+        } else {
+            owl_models::module::QuantPlan::W4A16Awq
+        };
         let model = Model::new(
             &spec,
             Qwen35Convention::new(convention_base(&rep)),
-            owl_models::module::QuantPlan::W4A16Awq,
+            quant_plan,
             head_plan,
         );
         // 旋钮:设备重排 = 能力自述裁决(RepackPath::resolve 唯一收口)
@@ -135,7 +149,6 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let rope = Rope::new(262_144, 256, 64, 10_000_000.0)?;
         let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1, device_repack: false, verify: false, debug_tap: false };
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
-        let quant_plan = owl_models::module::QuantPlan::W4A16Awq;
         owl_shared::metrics::with_metrics_store(|s| {
             let _ = s.timer_end("load.27b.total", file!(), line!());
         });

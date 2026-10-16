@@ -327,6 +327,12 @@ pub fn resolve(req: OpReq) -> KernelPick {
             let cols = req.shapes.first().map(|s| s.get(1).copied().unwrap_or(0)).unwrap_or(0);
             load::ct_repack(rows, cols)
         }
+        // W4A8 的 B 重排(S2 补):同输入/同输出字数,只换 tile 几何与块形
+        "load.ct_repack_a8" => {
+            let rows = req.shapes.first().map(|s| s[0]).unwrap_or(0);
+            let cols = req.shapes.first().map(|s| s.get(1).copied().unwrap_or(0)).unwrap_or(0);
+            load::ct_repack_a8(rows, cols)
+        }
         other => panic!(
             "driver::resolve(\"{other}\"): 未登记的语义算子命名空间 —— 动作词表住 models::ops::SemanticKernel(op_id 落本表),实现住本模块分派表(两侧须同票)"
         ),
@@ -1615,7 +1621,17 @@ pub mod load {
         })
     }
 
+    /// W4A8 的 B 重排(**同输入契约、同输出字数**,tile 几何不同)
+    pub fn ct_repack_a8(rows: usize, cols: usize) -> KernelPick {
+        KernelPick::of::<crate::ops::load::CtRepackA8U32>(Shape {
+            grid: ((rows / 32) as u32, (cols / 4) as u32, 1),
+            block: (128, 1, 1),
+            smem: 0,
+        })
+    }
+
     pub const CT_REPACK: super::OpId = super::OpId("load.ct_repack"); // OpId 全路径引用,免 import
+    pub const CT_REPACK_A8: super::OpId = super::OpId("load.ct_repack_a8");
 }
 
 // ============================================================================
