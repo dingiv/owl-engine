@@ -3,12 +3,15 @@
 //! ```text
 //! V_avail(卡)   = V_card − 权重 − 运行底价 − Σ_active GDN 行 − 草稿池
 //! N*(dense 上限) = V_avail / k                      ← 容量线①
-//! 准入(turn_i) ⇔ Σ_active floor_j + floor_i + 缓存驻留 + 弹性余量 + 运行底价 ≤ V_card
+//! 准入面(face)  = kv_face_bytes > 0 ? 池 : V_avail  ← 固定池档 / 动态池档(§23.2)
+//! 准入(turn_i) ⇔ Σ_active floor_j + floor_i + 缓存驻留 + 弹性余量 ≤ face
 //!                ∧ #active_turn + 1 ≤ max_active_turns
 //! ```
 //!
 //! **A5.1 律**:`BudgetInputs` 的每一项都必须来自实测;缺项(0)在 `decompose` 里
 //! 只允许"确实为 0 的项"(草稿池关/host 关),权重与运行底价为 0 = 分解失败。
+//! **例外 = 固定池档**(`kv_face_bytes > 0`):准入判据走池墙,卡级三项可以不实测
+//! (记 0,报告面由 [`VramBudget::card_measured`] 标出"未实测";绝不静默)。
 
 use crate::error::{StoreError, StoreResult};
 use crate::tier::TierBudget;
@@ -32,6 +35,12 @@ pub struct BudgetInputs {
     pub host_bytes: usize,
     /// 磁盘层上限(0 = 关层)。
     pub disk_bytes: usize,
+    /// **预分配的设备 KV 面**(池字节;设计卷 §23.2)。
+    ///
+    /// `> 0` = **固定池档**:设备 KV 在 boot 预分配完,准入按池墙判(§2.3 的
+    /// `Σ N_j·k + N_i·k + 缓存 ≤ pool·k`);`0` = **动态池档**:按卡级余量
+    /// `V_avail` 判(§2.4 式,池随请求增长)。
+    pub kv_face_bytes: usize,
 }
 
 /// per-turn 预算诉求 = **KVMem 式损失的耐受度**(设计卷 §2.4)。
@@ -64,6 +73,8 @@ pub struct VramBudget {
     inputs: BudgetInputs,
     /// 本档允许的活跃 turn 上限(boot 旋钮;硬天花板)。
     max_active_turns: usize,
+    /// 卡级三项是否实测(`v_card`/权重/底价)。固定池档允许缺项 —— 报告面必须能看见。
+    card_measured: bool,
 }
 
 impl VramBudget {
@@ -72,17 +83,21 @@ impl VramBudget {
     /// 失败条件(A5.1 响亮拒):权重或运行底价为 0(说明没有实测数字)、
     /// `max_active_turns == 0`、或按上限满编的活跃 turn 行都放不下。
     pub fn decompose(inputs: BudgetInputs, max_active_turns: usize) -> StoreResult<Self> {
-        if inputs.weights_bytes == 0 {
-            return Err(StoreError::Budget("权重字节为 0(缺实测数字,禁进预算式)".into()));
-        }
-        if inputs.runtime_floor_bytes == 0 {
-            return Err(StoreError::Budget("运行底价为 0(缺实测数字,禁进预算式)".into()));
-        }
         if inputs.kv_bytes_per_token == 0 {
             return Err(StoreError::Budget("每 token KV 字节为 0".into()));
         }
         if max_active_turns == 0 {
             return Err(StoreError::Budget("max_active_turns = 0(没有任何 turn 能跑)".into()));
+        }
+        // 固定池档(池已预分配)⇒ 准入判据不看卡级三项 ⇒ 允许未实测(记 0 + 标记);
+        // 动态池档 ⇒ 卡级三项是判据本身,缺项 = 分解失败(A5.1)。
+        let fixed_pool = inputs.kv_face_bytes > 0;
+        let card_measured = inputs.weights_bytes > 0 && inputs.runtime_floor_bytes > 0;
+        if !card_measured && !fixed_pool {
+            let miss = if inputs.weights_bytes == 0 { "权重字节" } else { "运行底价" };
+            return Err(StoreError::Budget(format!(
+                "{miss}为 0(缺实测数字,禁进预算式;动态池档无池面兜底)"
+            )));
         }
         let rows = inputs
             .gdn_row_bytes
@@ -94,7 +109,7 @@ impl VramBudget {
             .and_then(|v| v.checked_add(rows))
             .and_then(|v| v.checked_add(inputs.draft_pool_bytes))
             .ok_or_else(|| StoreError::Budget("固定面预算溢出".into()))?;
-        if fixed >= inputs.v_card_bytes {
+        if card_measured && fixed >= inputs.v_card_bytes {
             return Err(StoreError::Budget(format!(
                 "固定面 {fixed} ≥ 卡可用 {}:装不下权重+底价+{}×{}MB 行+草稿",
                 inputs.v_card_bytes,
@@ -102,7 +117,22 @@ impl VramBudget {
                 inputs.gdn_row_bytes / (1 << 20)
             )));
         }
-        Ok(Self { inputs, max_active_turns })
+        Ok(Self { inputs, max_active_turns, card_measured })
+    }
+
+    /// 卡级三项(`v_card`/权重/底价)是否实测。固定池档允许缺项 —— 缺了不是
+    /// "没这回事",而是**这个档的准入不依赖它**;报告面与日志必须区分。
+    pub fn card_measured(&self) -> bool {
+        self.card_measured
+    }
+
+    /// **准入判据面**(唯一产地;设计卷 §23.2):固定池档 = 预分配池;动态池档 = 卡级余量。
+    pub fn face_bytes(&self) -> usize {
+        if self.inputs.kv_face_bytes > 0 {
+            self.inputs.kv_face_bytes
+        } else {
+            self.v_avail_bytes()
+        }
     }
 
     /// 当前档位下,满编活跃 turn 时留给 KV 的字节(= 容量线①的分子)。
@@ -137,11 +167,24 @@ impl VramBudget {
 }
 
 /// 活跃 turn 的在飞占用(准入面的状态;方法自肃,只改自身)。
+///
+/// 四个面(§23.2 拆分规则):
+/// ```text
+/// reserved     = Σ_active turn 的实占地板(不可动;G2b 保留额)
+/// session_held = idle 会话还持着的 KV 历史(不可动;目标模型 §2.3 里它应可动)
+/// cache        = 纯缓存面(可动/可驱逐/可下沉)
+/// elastic      = 地板之上的灵活面(可动;B 轴预留)
+/// ⇒ committed = reserved + session_held + cache
+/// ⇒ evictable = cache + elastic
+/// ```
+/// 固定池档下引擎同步后 `committed = 池实占`(**精确**,不双算)。
 #[derive(Debug, Default)]
 pub struct Admission {
     active: std::collections::BTreeMap<u64, ActiveTurn>,
     /// 缓存面驻留(可驱逐)。
     cache_bytes: usize,
+    /// 非 turn 归属的**不可动面**(idle 会话持着的历史;引擎段边界同步)。
+    session_held_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -184,9 +227,31 @@ impl Admission {
         Ok(())
     }
 
+    /// **保留额更新**(活跃 turn 的设备实占;设计卷 §23.2):turn 增长过程中
+    /// 由引擎在段边界同步(与 `set_elastic` 同形 —— 登记一次、更新多次)。
+    ///
+    /// 为什么不用 `admit` 重登记:重登记会丢掉 `elastic`(两个字段各有语义,
+    /// 更新旧一个不许顺手清另一个)。
+    pub fn set_floor(&mut self, turn: u64, bytes: usize) -> StoreResult<()> {
+        let t = self
+            .active
+            .get_mut(&turn)
+            .ok_or_else(|| StoreError::Unknown(format!("turn {turn}")))?;
+        t.floor_bytes = bytes;
+        Ok(())
+    }
+
     /// 缓存面驻留登记(入账/出账由调用方配对)。
     pub fn set_cache_bytes(&mut self, bytes: usize) {
         self.cache_bytes = bytes;
+    }
+
+    /// **非 turn 归属的不可动面**(例:idle 会话还持着的 KV 历史)。
+    ///
+    /// 它必须单独占一格:算进 `cache` ⇒ 准入会先把话说满(`EvictThen`)
+    /// 而搬家时 `Busy`;算进 `reserved` ⇒ 保留额报告失真(G2b)。
+    pub fn set_session_held(&mut self, bytes: usize) {
+        self.session_held_bytes = bytes;
     }
 
     /// 活跃 turn 数。
@@ -207,6 +272,11 @@ impl Admission {
     /// 缓存面(可驱逐)。
     pub fn cache_bytes(&self) -> usize {
         self.cache_bytes
+    }
+
+    /// 非 turn 归属的不可动面(idle 会话持着的历史)。
+    pub fn session_held_bytes(&self) -> usize {
+        self.session_held_bytes
     }
 }
 
@@ -261,10 +331,14 @@ pub fn check_admission(
     }
     let floor_bytes = floor.floor_bytes(ctx_tokens, inp.kv_bytes_per_token);
     let ctx_bytes = ctx_tokens.saturating_mul(inp.kv_bytes_per_token);
-    // 已用 = 保留面 + 弹性面 + 缓存面;固定面(权重/底价/行/草稿)已从 V_avail 扣掉
-    let committed = admission.reserved_bytes() + admission.elastic_bytes() + admission.cache_bytes();
-    let v_avail = budget.v_avail_bytes();
-    if committed.saturating_add(floor_bytes) <= v_avail {
+    // 已用 = 保留面 + 会话持有面 + 弹性面 + 缓存面;固定面(权重/底价/行/草稿)已从 V_avail 扣掉
+    let committed = admission.reserved_bytes()
+        + admission.session_held_bytes()
+        + admission.elastic_bytes()
+        + admission.cache_bytes();
+    // 判据面 = 固定池档的池墙 / 动态池档的卡级余量(§23.2,一产地)
+    let face = budget.face_bytes();
+    if committed.saturating_add(floor_bytes) <= face {
         // 地板放得下;Strict 还需全量
         if floor.is_strict() && ctx_bytes > floor_bytes {
             return AdmissionVerdict::Reject {
@@ -275,7 +349,7 @@ pub fn check_admission(
         }
         return AdmissionVerdict::Admit { floor_bytes };
     }
-    let short = (committed + floor_bytes).saturating_sub(v_avail);
+    let short = (committed + floor_bytes).saturating_sub(face);
     if evictable_bytes >= short {
         return AdmissionVerdict::EvictThen { floor_bytes, need_bytes: short };
     }
@@ -293,7 +367,7 @@ pub fn check_admission(
         verdict_for_full(on_full, reason)
     } else {
         // 有耐受:把地板压到"能给的量",并把差额推给三层(下限 = 0)
-        let grantable = v_avail.saturating_sub(committed);
+        let grantable = face.saturating_sub(committed);
         if grantable == 0 {
             return verdict_for_full(on_full, reason);
         }
@@ -326,8 +400,26 @@ mod tests {
             kv_bytes_per_token: 32 * 1024,
             host_bytes: 16 << 30,
             disk_bytes: 0,
+            kv_face_bytes: 0,
         };
         VramBudget::decompose(inp, max_turns).expect("分解")
+    }
+
+    /// **固定池档**:池已预分配 ⇒ 准入按池墙判;卡级三项未实测也允许装配
+    /// (但报告面必须能看见 —— `card_measured() == false`)。
+    fn pool_budget(max_turns: usize, face: usize) -> VramBudget {
+        let inp = BudgetInputs {
+            v_card_bytes: 0,
+            weights_bytes: 0,
+            runtime_floor_bytes: 0,
+            draft_pool_bytes: 0,
+            gdn_row_bytes: 1,
+            kv_bytes_per_token: 32 * 1024,
+            host_bytes: 0,
+            disk_bytes: 0,
+            kv_face_bytes: face,
+        };
+        VramBudget::decompose(inp, max_turns).expect("固定池档装配")
     }
 
     #[test]
@@ -341,8 +433,62 @@ mod tests {
             kv_bytes_per_token: 1,
             host_bytes: 0,
             disk_bytes: 0,
+            kv_face_bytes: 0, // 也没有池面兑底 ⇒ 必须拒
         };
         assert!(matches!(VramBudget::decompose(inp, 1), Err(StoreError::Budget(_))));
+    }
+
+    #[test]
+    fn fixed_pool_absorbs_unmeasured_card_but_says_so() {
+        let b = pool_budget(1, 1 << 20);
+        assert!(!b.card_measured(), "未实测必须可查（不许静默）");
+        assert_eq!(b.face_bytes(), 1 << 20, "判据面 = 池");
+        assert_eq!(b.v_avail_bytes(), 0, "卡级余量确实为 0（没实测）");
+    }
+
+    #[test]
+    fn pool_face_is_the_admission_wall() {
+        let b = pool_budget(2, 4 << 20); // 池 4MiB；k=32KiB ⇒ 128 tok 容量
+        let a = Admission::new();
+        // 128 tok × 32KiB = 4MiB ⇒ 刚好装下
+        assert!(matches!(
+            check_admission(&b, &a, TurnFloor::Strict, 128, 0, QueuePolicy::Reject),
+            AdmissionVerdict::Admit { .. }
+        ));
+        // 129 tok ⇒ 超池 ⇒ 响亮拒（卡级 v_avail=0 时不误报 Admit）
+        match check_admission(&b, &a, TurnFloor::Strict, 129, 0, QueuePolicy::Reject) {
+            AdmissionVerdict::Reject { reason } => assert!(reason.contains("Strict"), "{reason}"),
+            other => panic!("应拒，得 {other:?}"),
+        }
+        // 可动面够 ⇒ 先腾后进
+        let mut a2 = Admission::new();
+        a2.set_cache_bytes(4 << 20); // 池满（全在缓存面）
+        let v = check_admission(&b, &a2, TurnFloor::Strict, 128, 4 << 20, QueuePolicy::Reject);
+        match v {
+            AdmissionVerdict::EvictThen { need_bytes, .. } => assert_eq!(need_bytes, 4 << 20),
+            other => panic!("应先腾后进，得 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn committed_is_exactly_pool_occupancy() {
+        // §23.2 拆分规则:reserved(活跃实占) + cache(其余池实占) = 池实占
+        let b = pool_budget(2, 8 << 20);
+        let mut a = Admission::new();
+        a.admit(1, 0, 0).expect("登记");
+        a.set_floor(1, 2 << 20).expect("实占更新");
+        a.set_cache_bytes(3 << 20);
+        assert_eq!(a.reserved_bytes(), 2 << 20);
+        assert_eq!(a.cache_bytes(), 3 << 20);
+        // 池 8MiB，已 commit 5MiB ⇒ 再要 3MiB 刚好；要 3MiB+1 就超
+        assert!(matches!(
+            check_admission(&b, &a, TurnFloor::Strict, 96, 0, QueuePolicy::Reject),
+            AdmissionVerdict::Admit { .. }
+        ));
+        assert!(matches!(
+            check_admission(&b, &a, TurnFloor::Strict, 97, 0, QueuePolicy::Reject),
+            AdmissionVerdict::Reject { .. }
+        ));
     }
 
     #[test]

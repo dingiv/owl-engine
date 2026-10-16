@@ -155,6 +155,10 @@ pub struct LegStats {
     pub class: BlockClass,
     /// 布局代数(`None` = 未注册)。
     pub epoch: Option<u64>,
+    /// 单块设备字节(对账口:字节 = 块数 × 本值)。
+    pub block_bytes: usize,
+    /// 单块 token 数(页)。
+    pub block_tokens: usize,
     /// 槽总容量。
     pub slots_total: usize,
     /// 自由槽。
@@ -163,8 +167,12 @@ pub struct LegStats {
     pub cached_blocks: usize,
     /// host 承载条目数。
     pub host_blocks: usize,
-    /// 设备侧缓存字节。
+    /// 设备侧缓存字节(树绑定条目面)。
     pub gpu_bytes: usize,
+    /// **池实占字节**(槽账真源:已用槽 × 块字节)。
+    pub occupied_bytes: usize,
+    /// **可直接搬动的设备面字节**(引用 = 1;§23.2 准入可动面真源)。
+    pub movable_bytes: usize,
     /// 宿主侧驻留字节。
     pub host_bytes: usize,
     /// 宿主层预算(0 = 关层)。
@@ -309,6 +317,56 @@ impl BlockLeg {
         self.host.budget_bytes()
     }
 
+    /// 宿主层**空转缓冲**字节(真实 RAM;报告必须算上 —— 已 acquire 未 put 的池租约)。
+    pub fn host_free_bytes(&self) -> usize {
+        self.host.free_bytes()
+    }
+
+    /// 前缀缓存探针计数(命中/未命中入账;命中面查询后调用)。
+    pub fn note_probe(&mut self, hit: bool) {
+        self.kv.note_probe(hit);
+    }
+
+    /// 一条链的块数(诊断/报告;不在账 = 0)。
+    pub fn chain_len(&self, chain: ChainHash) -> usize {
+        self.kv.chain_len(chain)
+    }
+
+    /// 整块前缀的内容身份(身份原语的腿面出口;engine 播种链游标 / 测试)。
+    pub fn tail_hash(&self, tokens: &[u32], full_blocks: usize) -> Option<ChainHash> {
+        self.kv.tail_hash(tokens, full_blocks)
+    }
+
+    /// 块账统计(内容身份树 + 槽池面;门面报告用 —— 单一真源)。
+    pub fn kv_stats(&self) -> crate::kv::KvStats {
+        self.kv.stats()
+    }
+
+    /// **可直接搬动的设备面字节**(S3b §23.2):设备绑定且**引用数 = 1** 的块
+    /// (纯缓存面;被任何会话链/活跃 turn 持着的块不算)。
+    ///
+    /// 为什么是真源而不是"池实占 − 活跃实占":
+    /// - 活跃面与 idle 会话**都拿会话引用** ⇒ 字节相减会把 idle 会话持着的
+    ///   历史算成可动,而 `chain_down_span`/`ensure_offloadable` 会 Busy
+    ///   ⇒ 准入就会先把话说满(`EvictThen`)再搬不动(退回 `Exhausted`)。
+    /// - 这里把"能不能搬"的真判据(引用数)直接当账——两个数不再两套口径。
+    ///
+    /// 注:idle 会话持着的历史在本实现里也算"不可动"(目标模型 §2.3 里它
+    /// 应该可动 —— 那条律等"会话引用 ≠ 活跃引用"拆分刀)。
+    pub fn movable_bytes(&self) -> usize {
+        self.kv.movable_bytes()
+    }
+
+    /// **池实占字节**(槽账真源:已用槽 × 块字节;S3b §23.2)。
+    ///
+    /// 为什么不看 [`Self::kv_stats`] 的 `gpu_bytes`:那是**树里绑定条目**的面 ——
+    /// 尾部不满一块的前缀(`tokens.len()/page` 截断)不进树,但槽已经占了;
+    /// 准入按"绑定面"算就会**少算实占**(实测:8 会话占满 8 槽,绑定面只 6 块)。
+    pub fn occupied_bytes(&self) -> usize {
+        let used = self.kv.slots_total().saturating_sub(self.kv.slots_free());
+        used * self.kv.block_bytes()
+    }
+
     /// 链名(诊断/拒发文案)。
     pub fn label(&self) -> &'static str {
         self.label
@@ -448,11 +506,15 @@ impl BlockLeg {
         LegStats {
             class: self.class,
             epoch: self.layout_epoch(),
+            block_bytes: self.kv.block_bytes(),
+            block_tokens: self.kv.block_tokens(),
             slots_total: kv.slots_total,
             slots_free: kv.slots_free,
             cached_blocks: kv.cached_blocks,
             host_blocks: kv.host_blocks,
             gpu_bytes: kv.gpu_bytes,
+            occupied_bytes: self.occupied_bytes(),
+            movable_bytes: self.movable_bytes(),
             host_bytes: self.host.used_bytes(),
             host_budget_bytes: self.host.budget_bytes(),
             ops: self.ops,

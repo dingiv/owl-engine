@@ -1660,9 +1660,11 @@ engine lib 套件  65s → 4.59s   (含两处 CPU 装载)
 
 ### A. store 刀内(设计/实现)
 
-1. ★ **`Rel` 收编去重**:`rel.rs` 仍持一份与 `BlockLeg` 重复的 offload/host 面(§11.4 挂账③);
-   两条腿齐备后收编(前置 = S2/S2b 状态腿)。
-2. **P1**:E2c 快照 capture/restore 迁 `copy_batch`(72/192 次 await → 1;**纯收益**)。
+1. ~~★ **`Rel` 收编去重**:`rel.rs` 仍持一份与 `BlockLeg` 重复的 offload/host 面(§11.4 挂账③)~~
+   ✅ **已结(S3b,§24.1)**:`Rel` 只持 `leg`/`state`/`ledger`/预算/准入账;重复面删除。
+   **本刀同刀完成 §6 刀序第 4 项(S3b:per-turn 地板 + `AdmissionPolicy` 落地)** —— 见 §23/§24。
+2. ~~★ **P1**:E2c 快照 capture/restore 迁 `copy_batch`(72/192 次 await → 1)~~
+   ✅ **已结(§27)**:capture/restore 各一条 `copy_batch`(与 `capture_spec_snap` 同构)。
 3. H2 的"按需下沉"退化路径(无整条可沉时按叶)**打点未区分**(现在只记总量)。
 4. `upload_pinned` 的 F16 LUT:定谳后 LUT 与位运算**都已优化** ⇒ LUT 的净收益待重测;
    若持平可删(简化)。
@@ -1670,8 +1672,14 @@ engine lib 套件  65s → 4.59s   (含两处 CPU 装载)
 
 ### B. 状态腿(S2/S2b)
 
-6. **S2**:GDN 状态腿三层化(快照可下沉)+ `Rel::Exact` 全链。
-7. **S2b**:GDN 行 = 活跃 turn 借还 + `max_active_turns` 正名。
+6. ~~**S2**:GDN 状态腿三层化(快照可下沉)+ `Rel::Exact` 全链~~
+   ✅ **已结(S2,§25/§26)**:快照池矩阵化 + `StateStore` 为账 + 状态腿搬运口 +
+   `reuse_face` 查 store 层账 + 段边界回灌;**同刀完成引用语义拆分**(§24.5② 收口:
+   idle 会话不持设备表 ⇒ `session_held = 0`、`reserved` = 真·在飞工作集)。
+7. ~~★ **S2b**:GDN 行 = 活跃 turn 借还 + `max_active_turns` 正名~~
+   ✅ **已结(§28)**:行随 turn 借还(`StateStore::borrow_row/return_row`),
+   会话不再绑行、不再有"格耗尽/LRU 逐出会话";旋钮正名 `max_active_turns`
+   (`OWL_MAX_ACTIVE_TURNS`;旧名 `OWL_GDN_SLOTS` 兼容)。
 8. 草稿腿(MTP/draft)的 `ensure_for_len(… + 8)` 固定余量**未纳入需求算式**(§17.9)。
 9. 空转预搬(TTFT 优化)若要做 ⇒ 作为**显式策略**立项(**禁回常数水位**,§12.4/§17)。
 
@@ -1681,12 +1689,27 @@ engine lib 套件  65s → 4.59s   (含两处 CPU 装载)
 11. B 轴(KVMem 窗口压缩)落地后 `D_active` 变小 ⇒ 需求算式要跟着改(§17.9)。
 12. engine"CPU 执行档"(真前向无卡跑):三缺口清单见 §18.5.1;裁决**不追**(§18.5.2);
     store 所需的无卡验证已由 §19 覆盖。
+13. **对账口进服务面**(§13.4 落地②):store 账 × server 账 × 固定面表的对账打印 ——
+    `store_report()`/`leg_stats()` 已公开(S3b),但还没接 `/debug` 与告警面。
+14. ~~**`Rel` 门面全链**:engine 分两处查、门面没人用~~
+    ✅ **已结(§27)**:两处调用点都走 `Rel::match_prefix → (ChainHit, RecallHit)`;
+    `reuse_face` 用 `RecallHit.snap_tier` 做**尾边界在场**的快路(`RecallMode::Exact`
+    在调度面的落点);逐边界回查仍走 store 的账(同源,不是旁路)。
+15. **状态腿驱逐序接策略对象**:目前"最冷设备槽"= 槽级 LRU(`snap_last_use`);
+    store 的 `EvictPolicy` 只服务 KV 腿(§26.5③)。
+16. **快照密度/按需补拍**(§26.5②):`prefill_chunk > page` 时中途边界无快照 ⇒
+    复用粒度被 chunk 卡住;要更细就得"按需补拍"(27B 一条 ≈ 162MB ⇒ 需显式策略)。
+17. **状态腿盘层**(§26.5④):`Carrier::Disk` 位已留;宿主分片满了仍是丢(S6 内)。
+18. **准入面的收尾**(§24.5①④):`Queue` 无定时器(重判时机 = 下一次事件)**仍挂**;
+    ~~`OWL_ADMIT_ON_FULL` 坏值 = panic~~ ✅ 已结(§27:坏值 = 响亮拒 + exit(2))。
 
 ### D. 已结(留档以免重开)
 
 - 装载 65s → **3.83s**:staging 池化 + `#[inline(never)]` 别名修 + 数组切分(§18.4.4 + 坑册 §50)
 - 需求驱动保洁(§17)/ 回灌批次化(§17.7)/ 链级卸载律(§16.2)
 - CPU mock 档四件(§18)/ store 无卡端到端演示(§19)
+- **S3b:`Rel` 接线 + 准入预算**(§23/§24):收编去重 + 固定池档池墙 + H1 判决
+  (Admit/EvictThen/Queue/Reject)+ 四面对账;门 = 无卡准入门 3 + GPU 三门口 + 0.8B 全场景
 
 
 ---
@@ -1780,3 +1803,418 @@ GPU 演示台(换出 12 块 / 3 命令 · 回灌 2 块 / 1 命令 · 兜底驱�
 22GB)占用 ⇒ **误杀**(2026-10-17,已报)。
 **纪律**:杀进程只用 **PID 文件**或精确校验 `cmdline`;**禁止**按进程名 `-x` 匹配杀
 (除 AGENTS 的"pkill -f 匹配自身"之外,新增同类:进程名撞车)。
+
+---
+
+## 23. S3b:`Rel` 接线 + 准入预算(收编去重 × 固定池档的池墙)· 2026-10-17
+
+> **本刀 = §20★A1(`Rel` 收编去重)+ §6 刀序第 4 项(per-turn `dense_floor` 接 `TurnOpts` +
+> `AdmissionPolicy` 落地)** —— 两件事共用同一条接缝(`Rel` 门面),并刀做,一次把
+> §13.5 的施工绑定兑现:**建账 → 判据 → 判决 → 执行** 全链在场。
+>
+> 落定后 engine **经 `Rel` 走**(不再直用 `BlockLeg`),H1 准入从"占槽后 `Exhausted`"
+> 变成"**判在前**":够就进、不够先腾、腾不够就拒/排队(带数字)。
+
+### 23.1 收编形态(store 侧;§11.4 挂账③ 的兑现)
+
+```rust
+pub struct Rel {
+    pub leg: BlockLeg,       // KV 腿:账 + 宿主物理 + 搬运口(唯一状态持有者)
+    pub state: StateStore,   // GDN 腿(账;搬运待 S2)
+    pub ledger: TierLedger,  // 语义账(状态腿 / 保留面 / 弹性面;KV 块面从腿报出,不重复记)
+    pub policy: AdmissionPolicy,
+    pub admission: Admission,
+    budget: VramBudget,
+    evict: Box<dyn EvictPolicy>,
+}
+```
+
+| 改动 | 内容 | 理由 |
+|---|---|---|
+| **删重复状态** | `Rel::{kv, host}` 两个字段消失(腿已持同样的两件) | 两本账同源才可能对不上;§13.4 的对账口要求单一真源 |
+| **删重复实现** | `Rel::offload_block` / `onload_block`(整块口径)、`Rel::evict_cached`、`account_evicted` | `leg::{plan_offload,commit_offload,plan_onload,commit_onload}` + `leg.drop_cached` 已取代(§15/§16/§21) |
+| **保留门面方法** | `probe` / `match_prefix` / `register_chain` / `ensure_for_len` / `release_table` / `plan_evict` / `report` | 关系层职责(①身份映射 ②召回语义 ③换出单合并 ④报告)—— 委托腿 + 两腿配对 |
+| **KV 面报告** | `report().kv` ← `leg.report()`;`tiers` 只报 store 自管面(状态腿/保留面/弹性面) | KV 块面的真源 = 腿(槽/绑定/宿主计数),不另记一份 |
+| **`Rel::open`** | `(inputs, policy, LegConfig)` —— 几何与每 token 字节从 `LegConfig` 推(`block_bytes / block_tokens`),与 `inputs.kv_bytes_per_token` **交叉校验**(矛盾 = 拒) | 同一件事只有一个入口(旧签名要调用方手抄一遍几何) |
+
+### 23.2 固定池档的准入面:`BudgetInputs.kv_face_bytes`
+
+§2.4 的准入式按**卡级余量**(`V_avail`)判,但那适用于"KV 面随请求增长"的动态池档。
+**本引擎是固定池档**:设备 KV 面在 boot 就预分配好(`nb × block_bytes`),请求来了
+不会再去向驱动要显存 ⇒ 准入的真判据是 **§2.3 的池墙**(`Σ N_j·k + N_i·k + 缓存驻留 ≤ pool·k`),
+卡级 `v_avail` 只回答"池**该有多大**"(容量线①)。
+
+⇒ `BudgetInputs` 加一项、`VramBudget` 加一口:
+
+```rust
+pub struct BudgetInputs {
+    /* …原有八项… */
+    /// **预分配的设备 KV 面**(池字节)。> 0 = 固定池档 ⇒ 准入按它判(池墙);
+    /// `0` = 未预分配(动态池档)⇒ 按 `v_avail` 判(卡级余量)。
+    pub kv_face_bytes: usize,
+}
+
+impl VramBudget {
+    /// 准入判据面(唯一产地):固定池档 = 池;动态档 = 卡级余量。
+    pub fn face_bytes(&self) -> usize {
+        if self.inputs.kv_face_bytes > 0 { self.inputs.kv_face_bytes } else { self.v_avail_bytes() }
+    }
+}
+```
+
+`check_admission` 的阈值一律改用 `face_bytes()`(判据单源)。
+
+**装配纪律(A5.1 的分档)**:固定池档的**准入**不依赖卡级三项(`v_card`/`weights`/
+`runtime_floor`),故 `decompose` 在 `kv_face_bytes > 0` 时允许它们缺项(0)—— 但
+`VramBudget::card_measured()` 必须**可查**(未实测 = 报告面标出来,日志 WARN,
+不是静默)。动态池档仍是全项必需(旧行为不变)。
+
+**保留额账(`Admission`)的拆分规则(curl 本刀定案)**:
+
+```
+reserved_bytes = Σ_active turn 的**设备实占**(引擎每段边界同步;= 块表长 × 块字节)
+cache_bytes    = 池实占 − reserved(可动面 = 可下沉/可驱逐的缓存块)
+elastic_bytes  = 0(留 B 轴:`dense_floor` 之上的灵活面)
+⇒ committed = reserved + cache = **池实占**(精确,不双算)
+⇒ evictable = cache + elastic = 可动面(判 `EvictThen` 用)
+```
+
+`Admission` 加一口 `set_floor(turn, bytes)`(活跃 turn 的实占地板更新 —— 保留额的唯一更新口,
+与 `set_elastic` 同形)。**"保留额不可驱逐" 在本引擎由引用计数兜底**(腿里 `refs > 1` =
+活跃面,`ensure_offloadable`/`evict_candidates` 天然排除),字节账只做**判据与报告**。
+
+### 23.3 engine 侧接线(三处)
+
+| 处 | 改动 |
+|---|---|
+| **boot 装配** | `Engine::{new,on}` 落两个快照:`v_card_bytes`(开卡后 `vram::free_bytes`)、`live_at_new`(`vram::live_bytes`);`run()` **在池与图都落位之后**组装 `BudgetInputs`(表见下)并 `Rel::open` —— 失败 = **响亮拒启动**;`SessionBank` 的构造**移到图装配之后**(它现在要收预算) |
+| **账房换人** | `SessionBank.leg_target: BlockLeg` → `SessionBank.rel: Rel`;engine 全部调用点 `bank.leg_target.X()` → `bank.rel.leg.X()`(数据面 `plan_*`/`commit_*` 的自由函数仍收 `&mut BlockLeg`,形状不变);新增一个私有的 `sync_pool_account()`(段边界/准入/释放后把池实占与活跃实占喂给 `Admission`) |
+| **H1 判决** | `pump()` 的段边界:待准入 turn 的 `need` 先过 `Rel::check(floor, ctx_tokens)`;`Admit` 照旧、`EvictThen` 抬需求(先腾位)、`Queue` 留在队首计时、`Reject` 出 `TurnEvent::Failed`(文案带数字) |
+
+**boot 装配表(逐项真源;实测口径 = §9.6 的探针算术)**:
+
+| 项 | 真源 |
+|---|---|
+| `v_card_bytes` | `Engine::on` 后的 `vram::free_bytes()`(CUDA ctx 已在 free 里扣掉) |
+| `weights_bytes` | `live(装载后) − live(Engine::new)` |
+| `runtime_floor_bytes` | `live(run 末) − live(装载后) − (KV 池 + GDN 格 + 快照池 + 草稿池)` |
+| `kv_face_bytes` | `nb_kv × StatePool::block_bytes()` |
+| `gdn_row_bytes` | `StatePool::gdn_row_bytes()` |
+| `draft_pool_bytes` | `StatePool::draft_pool_bytes()` |
+| `kv_bytes_per_token` | `block_bytes / page` |
+| `host_bytes` / `disk_bytes` | `knobs.host_cache_mb << 20` / 0 |
+| `AdmissionPolicy` | `max_active_turns = knobs.gdn_slots`(正名待 S2b)、`on_full = knobs.admission_on_full` |
+
+**无设备账档**(CPU mock:全 `vram` 账为 0)⇒ 固定池档放宽规则接管:池墙照判,卡级三项记 0
+并在报告面标"未实测";有设备账却算出 `weights = 0` = 测量病 ⇒ 响亮 WARN(不是静默)。
+
+### 23.4 判决映射(§2.4 的四种结果 → engine 行为)
+
+| 判决 | engine 行为 |
+|---|---|
+| `Admit { floor }` | `admission.admit(turn, floor, 0)` → 继续(照旧入队首→schedule 弹) |
+| `EvictThen { floor, need_bytes }` | 把保洁需求抬到 `max(Δ_j, ceil(need_bytes/块字节))`(同一次段边界),搬完**重判**;仍不足 ⇒ 按 `on_full` |
+| `Queue { reason }` | 留队首(不弹),记等待起点;等待 > `max_wait_ms` ⇒ 按 `Reject`(文案带原因与等待时长) |
+| `Reject { reason }` | 弹掉该 turn + `TurnEvent::Failed { turn, err }`(队列继续;文案含**具体数字**) |
+
+**文案纪律**:准入拒**不带** "超预算" 字样 —— 那是"prompt+max_tokens > max_seq"的专用标记
+(server 据此归一化成 `context_length_exceeded` 触发客户端自动 compact)。池墙拒是
+**另一类**(客户端该做的动作是降并发/重试,不是压缩上下文),故用 `准入拒绝:` 前缀,
+server 侧照原样 400 回吐。
+
+### 23.5 per-turn 地板(`TurnOpts.dense_floor`)
+
+`TurnOpts` 加 `dense_floor: Option<TurnFloor>`(请求可指定),缺省走 `knobs.dense_floor`。
+**本刀只实做 `Strict`**:`TurnFloor::Bytes(_)` ⇒ **响亮拒**(文案点明"选择层(B 轴)未落地,
+地板语义无从兑现")—— 宁拒不许静默降级(§2.4 的红线)。
+B 轴落地后放开(那时 `Bytes` 才有物质基础:窗口压缩 + 按需物化)。
+
+### 23.6 门
+
+| 门 | 判据 |
+|---|---|
+| store 单测 | 全绿(收编后用例改写;新增:池墙面、`set_floor` 语义、固定池档卡级缺项装配) |
+| engine lib | 36/36(行为零变化路径)+ 新:准入判决(Admit/EvictThen/Reject/Queue)|
+| 0.8B e2e | 旧场景不回退(§11.2 同一画像) |
+| GPU 三门口(§22) | 换出/回灌/命中 三门口重跑(池压小 + `EvictThen` 主动腾位) |
+| **新门** | ①**池墙拒**:需求 > 池面 ⇒ `Failed` 带数字(不落 `Exhausted`)②**先腾后进**:池满 + 冷链 ⇒ `EvictThen` 下沉后准入成功 ③`Strict` 路径**逐 token 恒等**不回退 |
+
+---
+
+## 24. S3b 实录:`Rel` 接线 + 准入预算落地 · 2026-10-17
+
+> §23 是拍定的设计;本节是**实现后**的实录 —— 含三处**实现期修正**(设计里没写对的地方)+ 门证据。
+> 结论:**engine 经 `Rel` 走**,H1 准入判决在真路径上生效(无卡门 3 + GPU 门回归全绿)。
+
+### 24.1 实现期修正(三条;都是"真源选错会把话说满")
+
+| # | §23 原设计 | 实测发现 | 定案 |
+|---|---|---|---|
+| ① | `Admission` 三个面(reserved/cache/elastic) | idle 会话**持着的历史**既不是活跃地板也不是可动缓存 ⇒ 归 `cache` 会让准入先出 `EvictThen`(允诺腾得出)而搬家时 `Busy`(搬不动),最后仍退回 `Exhausted` | 加**第四面** `session_held_bytes`(非 turn 归属的不可动面);`committed = reserved + session_held + cache` |
+| ② | 池实占取 `leg.report().gpu_bytes`(树绑定面) | 尾部**不满一块**的前缀(`tokens.len()/page` 截断)不进树,但槽已经占了 —— 实测 8 会话占满 8 槽,绑定面只报 6 块 ⇒ 按绑定面判**多放一个 turn 进来**(然后撞 `Exhausted`) | 加 `BlockLeg::occupied_bytes()`(**槽账真源**:已用槽 × 块字节),准入按它算 |
+| ③ | 可动面 = `池实占 − 活跃实占` | 字节相减会把 idle 会话持着的历史算成可动(同①的病) | 加 `BlockLeg::movable_bytes()` = 设备绑定且**引用 = 1** 的块 —— 与 `chain_down_span`/`ensure_offloadable` **同一个判据**(引用账),不是两套口径 |
+
+**两条派生律(实现期新增,已写进代码注释)**:
+
+1. **H1 判决只在"无活跃 turn"时判**。有活跃 turn 时队首 turn 只是在**等位** ——
+   此刻"池被活跃面占着"是常态(它马上会退成缓存),照判会把**正常排队的第二个请求误拒**。
+   准入 = "谁能**开始**"。
+2. **`schedule()` 不许弹已被判排队的 turn**(`admit_wait` 命中队首 ⇒ 回 Idle)。
+   否则"排队"语义形同虚设:弹了就直接撞 `ensure_for_len`。`waited >= max_wait_ms`
+   (上限 0 = 立刻按拒处理,不许"等 0 毫秒"再等一轮)。
+
+### 24.2 落点(与 §23.1/§23.3 一致的部分从略)
+
+| 面 | 变更 |
+|---|---|
+| `store::rel` | `Rel { leg: BlockLeg, state, ledger, policy, admission, budget, evict }` —— 删 `kv`/`host` 两份重复状态与 `offload_block`/`onload_block`/`evict_cached`/`account_evicted`;门面方法一律委托腿(`probe`/`match_prefix`/`register_chain`/`ensure_for_len`/`release_table`/`plan_evict`/`report`);`Rel::open(inputs, policy, LegConfig)` 并从腿几何**交叉校验**每 token 字节与 host 分片(≤ 总账) |
+| `store::budget` | `BudgetInputs.kv_face_bytes`(固定池档的池墙)+ `face_bytes()`(准入判据唯一产地)+ `card_measured()`(固定池档允许卡级缺项,但**必须可查**)+ `Admission::{set_floor, set_session_held}` |
+| `store::leg` | 新增 `occupied_bytes()` / `movable_bytes()` / `note_probe()` / `chain_len()` / `tail_hash()` / `kv_stats()` / `host_free_bytes()`;`LegStats` 加 `block_bytes` / `block_tokens` / `occupied_bytes` / `movable_bytes`(§13.4 对账口) |
+| `engine::engine` | `Engine.boot: BootVram{v_card_bytes, live_at_new}`(构造时快照)+ `assemble_budget()`(实测真源表见 §23.3);**`SessionBank` 构造移到图装配之后**(它现在要收全量固定面) |
+| `engine::session` | `SessionBank { sessions, rel: Rel, leg_mtp }`;`BankPlan` 不变(host 预算与预算入参同源 ⇒ 腿不超总账) |
+| `engine::running` | `sync_pool_account()`(四面对账)+ `admission_gate()`(H1 判决)+ `reject_queued_turn()`(出队 + 焚临时会话 + `Failed` 事件)+ `store_report()`/`leg_stats()`/`queue_len()`(报告面)+ `pump` 的 Idle 分支先回吐 `pending_events`(被判拒的 turn 才发得出去) |
+| `engine::exec::turn_end` | `close_admission(turn_id)`(turn 生死 = 保留额生死;`complete` 与 `abandon` 共用) |
+| `engine::turn` | `TurnOpts.dense_floor`(非 `Strict` 在 **submit 边界响亮拒**:B 轴未落地,地板语义无从兑现) |
+| `engine::scheduler` | 弹 turn 时 `admission.admit(id, 0, 0)`;已排队 turn 不弹 |
+| `apps/server` | `TurnOpts { dense_floor: None }`(OpenAI 面暂无扩展字段;缺省走引擎旋钮) |
+
+**旋钮**:`EngineKnobs::{admission_on_full(OWL_ADMIT_ON_FULL=reject|queue[:ms]), dense_floor(缺省 Strict)}`。
+
+### 24.3 门(全绿)
+
+| 门 | 结果 |
+|---|---|
+| `owl-store` 单测 + e2e | **63 + 2**(新增:池墙面 / `set_floor` 语义 / `session_held` 不变量 / 固定池档卡级缺项) |
+| `owl-engine --lib` | **36/36**(行为零变化路径) |
+| CPU mock 冒烟 | **3/3**(无卡档照旧可 boot —— 固定池档放宽规则接管) |
+| **新准入门**(`crates/engine/tests/store_admission_gate.rs`,无卡可跑) | **4/4**:①**先腾后进**(池 8 槽被可动缓存占满 ⇒ `EvictThen` ⇒ 段边界**下沉 7 块** ⇒ 准入成功;兜底驱逐 0)②**池墙拒**(8 个键控会话占满 8 槽、可动面 0 ⇒ `Failed` 带数字且**不含 "超预算"**)③**排队姿态**(`Queue{1ms}`:首轮 pump 回 Idle + turn 留队 + 零兜底驱逐;超时后 `Failed`「排队 5ms 仍无法腾位」)④**地板语义**(非 `Strict` 在 knobs(boot)与 `TurnOpts`(submit)两处**响亮拒**) |
+| **GPU 三门口**(§22 场景重跑;3080 ordinal 0) | 轮 3 判 `EvictThen` ⇒ **换出 6 块**/自由槽 2/8/宿主 6 块 · 轮 4 **回灌 2 块 1 命令** · 兜底驱逐 **0** |
+| 0.8B 场景回归(GPU) | `prefix_cache_hit` / `two_turns_lifecycle` / `session_continuity` / `multi_session_isolation` / `schedule_decision_surface`(max_seq=64 小档)/ `gdn_slot_cross_probe` / **`spec_identity_gate`(逐 token 恒等)** 全 OK |
+| clippy | 改动面**零告警**(既有告警在 sampler/graph_plan/e4_api 等未触面) |
+
+### 24.4 操作期发现(两条给后人)
+
+1. **CPU mock 档的包络 = 单 prefill chunk**(prompt ≤ `prefill_chunk`)。多 chunk 会炸在
+   `exec/prefill_chunk.rs` 中间块收割的 dtype 口径(`d.hidden × esz` 按**模型 dtype** 算,
+   而 CPU 面**值块恒 f32**)—— 即 §18.5.1 的**既有缺口**,非本刀引入。
+   写无卡门时把负载压在单 chunk 内即可(锚:**n=4 个数字词 ⇒ prompt 27 tok**;n=6 ⇒ 35 tok 已越界)。
+2. **`apps/server` 的 e2e 判据卡在装载暂存区**(`暂存区 raw.in: 本键 635.7MB > 槽 134.2MB`,
+   需 `OWL_LOAD_STAGING_MB` 调大)—— **既有环境问题**(与本刀无关:错误发生在装载相,
+   早于 `run()` 的预算装配)。27B 档要在本机跑 server e2e 需先给该旋钮。
+
+### 24.5 挂账(本刀新增)
+
+1. **`Queue` 无定时器**:重判时机 = 下一次 pump(通常由"活跃 turn 终了"或新提交驱动)——
+   若引擎转 Idle 且无人再提交,排队的 turn 会一直等(客户端自身超时会断开)。
+   要真定时器 = 服务面加轮询/事件源(属于 agent 服务面 A 类债)。
+2. **`reserved` 目前记的是"活跃会话整条链"**(含历史),不是严格意义的"在飞工作集" ——
+   因为二者在引用账上同命(都是 refs > 1)。要拆开 ⇒ 需"会话引用 ≠ 活跃引用"的引用语义刀
+   (与 §2.3 目标模型的差,见 §23.2 注)。
+3. **`gdn_slots` 仍未正名**为 `max_active_turns`(S2b;本刀先按现名取值)。
+4. `OWL_ADMIT_ON_FULL` 的**坏值 = panic**(响亮拒启动)—— 若要改成结构化 boot 错误,随
+   §18.5 的"配置错误静默 exit 1"那条红线一起收。
+
+---
+
+## 25. S2 设计:状态腿三层化 + 引用语义拆分 · 2026-10-17
+
+> 两条目标(用户拍定;§24.5② 的直接承接):
+> **①引用语义拆分**(会话引用 ≠ 活跃引用)⇒ `reserved` 才是真正的"在飞工作集";
+> **②状态腿三层化**(GDN 快照设备 ⇄ 宿主)⇒ 冷快照可下沉,`snap_max` 不再是 idle 会话的容量墙;
+> 两条合成的产物 = **`Rel::Exact` 全链**(块链 + 快照都在,且快照可在宿主机 → 段边界回灌后精确续跑)。
+
+### 25.1① 引用语义拆分:定案 =「**idle 会话不持设备表**」
+
+**现状的病**(§24.5②):会话在 `SessionTable.block_table` 里**长期持着**它整段历史的设备槽引用
+⇒ 那些块 `refs ≥ 2` ⇒ `chain_down_span`/`ensure_offloadable` 一律 `Busy` ⇒
+「idle 会话的历史」既不可动也不可下沉,`reserved` 里混着历史(不是纯在飞工作集)。
+
+**定案(与 §2.3 资源归属律逐字对齐)**:§2.3 表早就写明
+「KV **工作集**(在飞读写)= 活跃 turn 持;KV **历史块**(缓存)= 会话经**前缀缓存**持」
+—— 会话对历史的持有**本来就该走缓存**,不该走设备表。故:
+
+```
+turn 起:块表**按内容身份重建**(leg.match_prefix(tokens) → 槽 + 待回灌单)
+turn 中:会话表 = 活跃 turn 的设备工作集(唯一的设备持有者)
+turn 止:register_chain(历史进前缀缓存)→ **释放设备表**(表清空)
+        ⇒ idle 会话对设备零持有(只有 tokens + cached_len 两个纯 host 字段)
+```
+
+由此**不需要**新的引用类型(`active/idle` 双计数):idle 会话根本不持引用 ⇒
+所有块在 turn 外都是 `refs = 1`(纯缓存) ⇒ **现成的 `chain_down_span`/`movable_bytes` 判据直接成立**
+(少一套账 = 少一处可能对不上的地方)。
+
+**连带裁决(三条)**:
+
+1. **删「会话守卫(hit)」快路**(`scheduler.rs` 的 GuardHit 分支):它的角色被**内容寻址**天然取代
+   ——客户端改写历史 ⇒ 命中自然变短(自回退全量),不需要守卫拦。守卫只留作
+   `cached_tokens` 的**报告**用(`submit` 时给初值;AGT-12 校正帧随后覆盖)。
+2. **turn 止的快照是复用钥匙**:块表重建走 `match_prefix` ⇒ 复用长度被 `reuse_face` 裁到
+   **有快照在场的块边界** ⇒ 关键会话(agent 流量)的跨 turn 复用**依赖 turn 末边界有快照**。
+   现网已在 **decode 每页边界**拍快照(`phases.rs` `fed % page == 0`)⇒ turn 末的最后一个
+   页边界必有快照 ✓(缺口 ≤ 1 页 = 32 token 重算,可忽略)。
+3. **`abandon` 与 `complete` 同规**:两者都释放设备表(ephemeral 焚会话;键控会话保 `tokens`)。
+   半途弃置的链**不进缓存**(没有 `register_chain`)⇒ 下次内容寻址自然不命中 ✓(安全)。
+
+**报告面的收益**:`Admission.reserved_bytes` = 活跃 turn 的表长 × 块字节(**真保留额**);
+`session_held_bytes` ⇒ **恒 0**(不再有"非 turn 归属的不可动面");
+`cache_bytes` = 池里全部纯缓存(含各 idle 会话的历史)—— 它们**可动、可驱、可下沉** ✓。
+
+### 25.2② 状态腿三层化:定案 =「快照池矩阵化 + 独立搬运口 + `StateStore` 为账」
+
+| 面 | 现状 | 定案 |
+|---|---|---|
+| 设备物理 | `snaps: Vec<GdnSnapSlot>`(**每槽**一套 (层×4) 缓冲) | **矩阵化**:每 (层,quad) **一条** 缓冲,长 = `snap_max × 行宽` ⇒ 快照 = 「一种块(槽 × 片)」,直接套 KV 腿的 `SwapPiece`/`SlotTable` 机制 |
+| 账 | 只在引擎(`key`/`last_use` LRU 覆盖写) | **`StateStore` 为真源**:`register_snap(key, bytes)` / `set_tier(key, tier)` / `drop_snap` / `evict_candidates`;引擎的槽位表退化为"设备槽 → key"的索引 |
+| 宿主层 | 无 | `HostTier<SnapKey>`(键泛型化;预算 = store host 总量里分给状态腿的份额) |
+| 搬运口 | 无(快照只在设备) | `Rel` 的**状态腿搬运口**:`plan_snap_offload/commit/abort` + `plan_snap_onload/commit/abort`(与 KV 腿同形:**store 出计划与账,engine 发 `face.swap`**) |
+| 复用判据 | `pool.has_snap(key)`(只看设备) | `Rel::match_prefix(...) → RecallHit.snap_tier`(`Some(Gpu)`/`Some(Host)` 都可复用 ⇒ `RecallMode::Exact`);宿主层快照在 `execute_begin` **段边界回灌** |
+| 槽位不足 | LRU 直接覆盖写(**静默丢状态**) | **先下沉**(最冷的设备快照 → 宿主;内容留),宿主也满 ⇒ 才丢(打点) |
+
+**快照搬运的粒度律(与 KV 腿同构)**:一条快照 = 一个"块"(槽 × (层×4) 片);
+下沉/回灌 = **一条 swap 命令搬 N 片**(不是 N 次往返)。
+
+### 25.3 与 S2b 的分界(不在本刀)
+
+- **本刀**:设备表在 turn 止释放(§25.1①);**GDN 行仍按会话绑**(现状)。
+- **S2b(下一刀)**:行改 turn 借还 + `gdn_slots` 正名 `max_active_turns` ——
+  那时 idle 会话连"行"也不占,跨 turn 状态**只**走快照(本刀已把它三层化)。
+
+### 25.4 门
+
+| 门 | 判据 |
+|---|---|
+| 引用拆分 | ①turn 止后 `session_held_bytes == 0` 且历史块进**可动面**(`movable_bytes` 含之)②idle 会话占满池 ⇒ 新 turn **先腾后进**(不再拒)③键控会话跨 turn **仍命中**(块对齐),答案内容不受影响 |
+| 状态腿 | ④快照 host 往返**逐字节一致**(CPU 档可跑)⑤冷快照下沉后仍能 `Exact` 命中(段边界回灌)⑥`StateStore` 账与设备槽数/宿主字节对账 |
+| 回归 | 0.8B 全场景(session_continuity / multi_session_isolation / prefix_cache_hit / spec 恒等)+ GPU 三门口 + `owl-store`/`owl-engine` 单测 |
+
+---
+
+## 26. S2 实录:引用语义拆分 + 状态腿三层化 · 2026-10-17
+
+> §25 是设计;本节记**实现**与实现期发现。结论:两条目标都落地,**门全绿**
+> (含 GPU 真机:§22 三门口 / 0.8B 全场景 / 新状态腿探针)。
+
+### 26.1 S2-1 引用语义拆分(§25.1①)
+
+| 落点 | 变更 |
+|---|---|
+| `exec/turn_end.rs` | `complete`:登记缓存后 **释放设备表**(`release_turn_table`;`cached_len` 归**块边界**);`abandon` 同规(弃置的链**不进缓存** ⇒ 下次内容寻址自然不命中) |
+| `scheduler.rs` | **删 GuardHit 快路** ⇒ 复用一律走**内容寻址**(会话 = 身份 + token 历史;块表按内容重建) |
+| 效果(实测) | idle 会话占满池后:`session_held_bytes = 0`、`movable_bytes = gpu_bytes`(**全池可动**)⇒ 新 turn 从"池墙拒"变成"**先腾后进**" |
+
+### 26.2 S2-2 状态腿三层化(§25.2)
+
+| 落点 | 变更 |
+|---|---|
+| `store::host` | `HostTier<K = ChainHash>` **键泛型**(状态腿用 `SnapKey`) |
+| `store::state` | `register_snap` / `snap_bytes` / `snaps_in_tier`(分层统计进 `StateStats`) |
+| `store::rel` | `snap_host: HostTier<SnapKey>` + `attach_snap_layout` + **状态腿搬运口**(`plan_snap_offload`/`commit`/`abort` + `plan_snap_onload`/`commit`/`abort` + `drop_snap_host`);`Rel::open` 按"总账 − KV 分片"切状态腿宿主预算 |
+| `engine::state` | 快照池**矩阵化**(每 (层,quad) 一条 `snap_max × 行宽` 缓冲)⇒ 快照 = 「槽 × 片」的一种块;`snap_pick_slot`(原地/空槽/**最冷**) + `snap_pool_layout` + `snap_place/clear_slot/slot_of` |
+| `engine::exec` | `capture_gdn_snap`:槽满 ⇒ **先下沉最冷**(宿主满/关才丢) + `StateStore::register_snap`;`execute_begin`:宿主层快照**段边界回灌**(`snap_ensure_resident`)再 D2D 恢复;`snap_offload`/`snap_onload` 编排(store 出计划 → `face.swap` → 记账) |
+| `engine::scheduler` | `reuse_face` 的"边界快照在场"判据改查 **store 的层账**(设备/宿主都算在场)—— 旧实现只看设备池 ⇒ 下沉后的快照被误裁 |
+
+### 26.3 实现期发现(四条)
+
+1. **宿主预算是两条腿的分片,不是一根旋钮**。S3b 里 `host_cache_mb` 全给了 KV 块腿
+   ⇒ `Rel::open` 算出的状态腿分片 = 0 ⇒ 快照下沉**无位**(静默走"丢"分支)。
+   ⇒ 新增 `EngineKnobs.snap_host_mb`(`OWL_SNAP_HOST_MB`),**总账 = KV 分片 + 状态腿分片**
+   (`Rel::open` 交叉校验分片不超总账)。教训:两个热区完全不同的腿共用一个预算数,
+   只会让一边饿死 —— 预算要**显式分片**。
+2. **一条快照的体量**(布局注册后才看得见):0.8B = **19.3MiB**(18 层 × 4 quad 行宽之和),
+   27B ≈ **162MB** ⇒ 宿主分片的量级感直接决定"能攒多少 idle 会话状态"(27B:1GB ⇒ 6 条)。
+3. **CPU mock 的单 chunk 包络**(§18.5.1 的 dtype 缺口)**挡住了"中途边界快照"**:
+   单 chunk ⇒ 只有 prefill 末(需 32 对齐)与 decode 页边界出快照 ⇒ "同会话跨 turn
+   复用 + 宿主回灌"在无卡档构造不出来。⇒ 引擎级 S2 门改成 **crate 内场景**
+   (`cpu_mock_state_leg_probe`/`gpu_08b_state_leg_probe`;能直接驱动 `snap_ensure_resident`),
+   真机复用由 GPU 场景覆盖。
+4. **三个既有场景的判据要跟着语义升级**(旧判据测的是"会话持设备表"这个已消失的物)——
+   见 26.4。
+
+### 26.4 门(全绿)
+
+| 门 | 结果 |
+|---|---|
+| `owl-store` | **63 + 2(snap_leg) + 2(store_e2e)**;新增 `snap_leg.rs`:快照 host 往返**逐字节一致** / 层账跟着走 / 宿主满响亮拒(零副作用)/ 回灌失败条目删(不留假账)/ 两腿宿主互相独立 |
+| `owl-engine --lib` | 36/36 |
+| CPU 档 | `cpu_mock_smoke` 3/3 · `store_admission_gate` **3/3**(②改判为"**idle 占满池 ⇒ 先腾后进**"+`session_held=0`+全池可动)· `cpu_mock_state_leg_probe` ✓(快照 churn ⇒ 下沉 2 条 / 回灌就位 / 层账回设备) |
+| **GPU 真机**(3080 ordinal 0) | §22 三门口 ✓(换出 6 块/回灌 2 块/兜底 0)· S0 预算探针 ✓ · **S2 状态腿探针 ✓**(设备 1 条 / 宿主 2 条 ⇒ 回灌 ⇒ 恢复)· `spec_identity_gate` ✓(逐 token 恒等不回退) |
+| 0.8B 场景(判据升级后) | `two_turns_lifecycle` ✓ · `session_continuity` ✓(同会话跨 turn 答对)· **`prefix_cache_hit`**(物理共享 → **内容身份共享 9 块**;B 0 chunk/TTFT 129ms vs A 9 chunk/1322ms)✓ · **`multi_session_isolation`**(块表 → 内容链;A 3 块身份不变 + A/B 身份零相交)✓ · `schedule_decision_surface`(GuardHit → **内容寻址 Fresh**)✓ · `gdn_slot_cross_probe` ✓ · `longctx_4k_prefix_qa` ✓(账本块对齐口径) |
+
+### 26.5 挂账(本刀新增)
+
+1. **S2b**(下一刀):GDN 行改 turn 借还 + `gdn_slots` 正名 `max_active_turns` ——
+   本刀已把它的前置(快照三层化 + 会话不钉设备)做完;S2b 之后 idle 会话连"行"也不占。
+2. **快照密度**:prefill 期只在**块边界**(32 对齐)与 decode 页边界出快照 ⇒
+   `prefill_chunk > page` 时中途边界无快照(§22 定谳①)。要更细的复用粒度 ⇒ 要么
+   降 chunk,要么"按需补拍"(代价 = 一条快照的 D2D,27B ≈ 162MB ⇒ 需显式策略)。
+3. **状态腿的驱逐序**:目前"最冷设备槽"= 槽级 LRU(`snap_last_use`);store 的
+   `EvictPolicy` 还没接状态腿(两条腿的策略对象统一是 S2b/后续的事)。
+4. **快照的盘层**:`Carrier::Disk` 位已留;宿主分片满了仍是"丢"(响亮打点)。
+
+---
+
+## 27. A 轴收尾(四小件)· 2026-10-17
+
+> 用户拍板:**先把 A 面做完**(A 轴 = 容量层:身份命中/三层搬运/需求驱动/准入),
+> 再上 B 轴(KVMem 式动态选块)。本节 = A 轴的**边角收尾**(4 件,全部零架构改动)。
+
+| # | 件 | 落点 | 证据 |
+|---|---|---|---|
+| 1 | **P1:快照搬运批命令化** | `StatePool::{capture_snap, restore_snap}` 逐 (层,quad) `copy_block_at` → **一条 `copy_batch`**(0.8B 72 次 / 27B 192 次 actor 往返 ⇒ 1) | `owl-engine --lib` 36 · CPU/GPU 状态腿探针 ✓(拍摄/回灌/恢复全链) |
+| 2 | **状态腿 metrics** | `store.snap.{out,in,drop}` + `.{out,in}.bytes`(KV 腿同族口径;G4 要求命中/换出/回灌可观测) | 编译期接线;计数在 `exec/spec.rs` 的三条路各一处 |
+| 3 | **`Rel` 门面全链** | `schedule`/`step_need` 都改走 `Rel::match_prefix → (ChainHit, RecallHit)`;`reuse_face` 收 `RecallHit`,用 `snap_tier.is_some()` 做**尾边界在场**快路(`RecallMode::Exact` 在调度面的落点) | 同上 + §22 三门口(命中面判定不变) |
+| 4 | **准入旋钮坏值结构化** | `OWL_ADMIT_ON_FULL` 坏值:panic → **响亮拒 + `exit(2)`**(§24.5④ 收口;与"配置错误静默 exit 1"红线同族) | `parse_admission_on_full() -> Result<_, String>` |
+
+**门(全绿)**:`owl-store` 63+2+2 · `owl-engine --lib` 36 · CPU 档(准入门 3 + 状态腿探针)·
+GPU 真机(状态腿探针 + §22 三门口 + `session_continuity`)。
+
+**A 轴剩余**:**S2b**(GDN 行 = 活跃 turn 借还 + `gdn_slots` 正名 `max_active_turns`)——
+唯一还欠的 A 轴主刀;前置(快照三层化、会话不钉设备、`StateStore::borrow_row`/`return_row`)
+已全部就位。**B 轴(S4b)待 S2b 之后立项。**
+
+---
+
+## 28. S2b:GDN 行 = 活跃 turn 借还 + 正名 · 2026-10-17
+
+> A 轴的**最后一刀**。目标(§2.3/§6):行(27B 约 162MB/行)从"会话资源"改成
+> "**turn 资源**" ⇒ idle 会话对设备**零占用**(KV 表不占、行也不占),
+> "能挂多少会话"与"能并发几个 turn"彻底解耦。
+
+### 28.1 落点
+
+| 面 | 变更 |
+|---|---|
+| `store::StateStore` | **账即池**:`borrow_row()` 返回的行号**就是物理行号**(一本账,不两份);`return_row(row, None)` 归还。S1 就埋好的两口,本刀才接上 |
+| `engine::turn` | `ActiveTurn.gdn_slot`(turn 域资源;生命周期随 turn —— 与 spec 态同纪律) |
+| `engine::scheduler` | turn 起:`state.borrow_row()?`(耗尽 = 响亮 `Exhausted`;正常路径由准入面 `max_active_turns` 天花板先挡);行号进 `BeginPlan` + `ActiveTurn` |
+| `engine::exec::turn_end` | `complete`:还行(状态已由边界快照承担);`abandon`:还行且**不落快照**(弃置的 turn 账面不可信) |
+| `engine::session` | `AgentSession.gdn_slot` **删除**;`SessionTable::get_or_create(id)` 不再分配行 ⇒ **"GDN 格耗尽"与"LRU 逐出会话"两条路消失**(`get_or_create_evicting` 退役) |
+| 读行点 | `capture_gdn_snap` / draft / prefill_chunk / decode 相位一律从**活跃 turn**读(`self.turns.active.gdn_slot`) |
+| 正名 | `gdn_slots` → **`max_active_turns`**(knobs / `PoolPlan` / `StatePool` / `OwlConfig.pool` / server config);env `OWL_MAX_ACTIVE_TURNS`(旧名 `OWL_GDN_SLOTS` 兼容 alias) |
+
+### 28.2 为什么现在做是安全的(S2 换来的三件红利)
+
+1. **复用面被裁到"有快照在场的块边界"**(`reuse_face`,§22 定谳①)⇒ 只要复用了前缀,
+   **必然**有快照可恢复;没有快照 ⇒ `m = 0` ⇒ 全量重算 + 零行 ⇒ 状态自洽。
+   —— 行可换,是因为"状态跟**内容身份**走,不跟格号走"。
+2. **快照三层化**(S2)⇒ 行归还后状态不丢(设备槽满 ⇒ 下沉宿主;宿主满 ⇒ 丢并打点)。
+3. **快照拍摄点已覆盖 turn 末**(解码页边界 + prefill 块边界)⇒ 无需新增拍摄点。
+
+### 28.3 门(全绿)
+
+| 门 | 结果 |
+|---|---|
+| **新门⑤**(`store_admission_gate.rs`):idle 会话不占行 | 行池只给 **2 行**、挂 **6 个键控会话**:每轮终了 `rows_free == rows_total`(**2/2**)✓;六会话的状态留在**快照账**(设备 4 条达 cap 后 churn)✓ |
+| `owl-engine --lib` | 36/36(会话表用例改写:不再有"格耗尽"断言) |
+| CPU 档 | `cpu_mock_smoke` 3/3 · `store_admission_gate` **4/4** · `cpu_mock_state_leg_probe` ✓ |
+| GPU 真机(3080) | `gdn_slot_cross_probe` ✓(`gdn_slot == 0` 判据仍成立:借行返回最小空闲号)· `session_continuity` ✓(跨 turn 答对)· `spec_identity_gate` ✓(逐 token 恒等)· `prefix_cache_hit` ✓ · §22 三门口 ✓ · 状态腿探针 ✓ |
+
+### 28.4 挂账(本刀新增)
+
+1. **会话级 LRU 现在没人调**(`SessionTable::lru_victim` 保留但无调用点)—— 留给将来
+   "显式会话上限"策略(§2.3:会话数只该受 host/盘预算约束,故默认不设硬上限)。
+2. **行的借还粒度 = turn**:若将来做"一次准入多个 turn"(批调度),行池要按批借
+   (算式不变:求和)。
+3. **`gdn_slot_profile`/`gdn_slot_fingerprint` 两个探针**仍按行号取样 —— 现在行号是
+   turn 域的,取样语义要跟着改(仅诊断面,不影响生产)。

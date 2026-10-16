@@ -782,10 +782,156 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     full_blocks.saturating_sub(start)
                 ))
             })?;
-            (s.gdn_slot, owl_store::SnapKey::at_boundary(tail))
+            // S2b:快照拍摄用的是**本 turn 的行**(turn 域资源)
+            (
+                self.turns.active.as_ref().map(|a| a.gdn_slot).unwrap_or(0),
+                owl_store::SnapKey::at_boundary(tail),
+            )
         };
+        // **S2(§25.2)**:槽位选择 + 冷快照下沉 —— 快照账的真源是 store 的
+        // `StateStore`;设备池只做槽位索引。槽满时先**下沉最冷的一条**
+        // (内容留宿主),沉不下(宿主满/关)才丢(响亮打点)。
+        let slot = self.snap_ensure_slot(key).await?;
         let face = self.graphs.session.face_mut();
-        self.pool.capture_snap(face, gdn_slot, key).await
+        self.pool.capture_snap(face, gdn_slot, key, Some(slot)).await?;
+        // 登记/触达(层 = 设备)
+        self.bank.rel.state.register_snap(key, self.pool.snap_bytes(), owl_store::Tier::Gpu);
+        Ok(())
+    }
+
+    /// **快照落设备槽**(S2 §25.2;编排:store 出计划 → `face.swap` → 记账)。
+    ///
+    /// - 同 key 已在设备 ⇒ 原地槽(幂等重拍);
+    /// - 空槽 ⇒ 直接用;
+    /// - 池满 ⇒ 最冷的设备快照**先下沉**(内容留);宿主满/关 ⇒ 丢(丢 = 状态没了,
+    ///   下次该边界不可复用 —— 与旧行为同,但现在有账可查);
+    /// - 池关(`snap_max = 0`)⇒ 结构性拒(调用方已先行跳过)。
+    pub(crate) async fn snap_ensure_slot(&mut self, key: owl_store::SnapKey) -> Result<u32> {
+        use crate::state::SnapSlotPick;
+        let pick = self.pool.snap_pick_slot(key).ok_or_else(|| {
+            owl_iface::contract::ModelError::Msg(
+                "GDN 快照池为空(snap_max = 0):调用方应跳过 capture".into(),
+            )
+        })?;
+        match pick {
+            SnapSlotPick::Hit(slot) | SnapSlotPick::Free(slot) => Ok(slot),
+            SnapSlotPick::Victim(slot, victim) => {
+                match self.snap_offload(victim, slot).await {
+                    Ok(()) => {
+                        self.pool.snap_clear_slot(slot);
+                        return Ok(slot);
+                    }
+                    Err(e) => {
+                        eprintln!("DBG-SNAP 下沉失败: {e}");
+                    }
+                }
+                // 沉不下 ⇒ 丢(内容整体消失;宿主副本同步丢)
+                owl_shared::log_debug!(
+                    "store",
+                    "快照槽满且宿主不可用 ⇒ 丢弃最冷快照 {victim:?}(该边界将不可复用)"
+                );
+                self.bank.rel.drop_snap_host(victim)?;
+                if let Err(e) = self.bank.rel.state.drop_snap(victim) {
+                    owl_shared::log_debug!("store", "快照 {victim:?} 出账: {e}");
+                }
+                owl_shared::metrics::with_metrics_store(|m| {
+                    m.counter_add("store.snap.drop", 1, file!(), line!());
+                });
+                self.pool.snap_clear_slot(slot);
+                Ok(slot)
+            }
+        }
+    }
+
+    /// **快照下沉**(设备槽 → 宿主;一条 swap 搬 N 片)。
+    pub(crate) async fn snap_offload(&mut self, key: owl_store::SnapKey, slot: u32) -> Result<()> {
+        let (pieces, table) = self.bank.rel.plan_snap_offload(key, slot)?;
+        let face = self.graphs.session.face_mut();
+        let conn = match face
+            .swap(owl_iface::contract::SwapDir::Out, &pieces, Box::new(table))
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                self.bank.rel.abort_snap_offload(key);
+                return Err(owl_iface::contract::ModelError::Msg(format!(
+                    "快照下沉 swap 失败:{e}"
+                )));
+            }
+        };
+        let table = owl_store::reclaim_slot_table(conn)?;
+        self.bank.rel.commit_snap_offload(key, table)?;
+        owl_shared::metrics::with_metrics_store(|m| {
+            m.counter_add("store.snap.out", 1, file!(), line!());
+            m.counter_add(
+                "store.snap.out.bytes",
+                self.bank.rel.snap_bytes() as u64,
+                file!(),
+                line!(),
+            );
+        });
+        Ok(())
+    }
+
+    /// **快照回灌**(宿主 → 设备槽;一条 swap 搬 N 片)。
+    pub(crate) async fn snap_onload(&mut self, key: owl_store::SnapKey, slot: u32) -> Result<()> {
+        let (pieces, table) = self.bank.rel.plan_snap_onload(key, slot)?;
+        let face = self.graphs.session.face_mut();
+        let conn = match face
+            .swap(owl_iface::contract::SwapDir::In, &pieces, Box::new(table))
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                // 台子随失败的 connector 消失 ⇒ 内容已丢 ⇒ 条目一并删
+                self.bank.rel.abort_snap_onload(key);
+                return Err(owl_iface::contract::ModelError::Msg(format!(
+                    "快照回灌 swap 失败:{e}"
+                )));
+            }
+        };
+        let table = owl_store::reclaim_slot_table(conn)?;
+        self.bank.rel.commit_snap_onload(key, table)?;
+        self.pool.snap_place(slot, key);
+        owl_shared::metrics::with_metrics_store(|m| {
+            m.counter_add("store.snap.in", 1, file!(), line!());
+            m.counter_add(
+                "store.snap.in.bytes",
+                self.bank.rel.snap_bytes() as u64,
+                file!(),
+                line!(),
+            );
+        });
+        Ok(())
+    }
+
+    /// **快照就位到设备**(restore 前置;§25.2):设备层 ⇒ 原槽;宿主层 ⇒
+    /// 先找槽再回灌;不在账 ⇒ 结构性拒(该边界不可复用,调用方应已裁掉)。
+    pub(crate) async fn snap_ensure_resident(
+        &mut self,
+        key: owl_store::SnapKey,
+    ) -> Result<u32> {
+        match self.bank.rel.state.locate(key) {
+            Some(owl_store::Tier::Gpu) => self
+                .pool
+                .snap_slot_of(key)
+                .ok_or_else(|| {
+                    owl_iface::contract::ModelError::Msg(format!(
+                        "快照 {key:?} 账在设备层但池里找不到槽(账目不平)"
+                    ))
+                }),
+            Some(owl_store::Tier::Host) => {
+                let slot = self.snap_ensure_slot(key).await?;
+                self.snap_onload(key, slot).await?;
+                Ok(slot)
+            }
+            Some(owl_store::Tier::Disk) => Err(owl_iface::contract::ModelError::Msg(format!(
+                "快照 {key:?} 在磁盘层(未接线)"
+            ))),
+            None => Err(owl_iface::contract::ModelError::Msg(format!(
+                "快照 {key:?} 不在账(已被逐出)"
+            ))),
+        }
     }
 
     /// 取本 turn 已喂入 KV 的 token 段 `[lo, hi)`(= `prompt_ids ++ out`)。

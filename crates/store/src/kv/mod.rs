@@ -421,6 +421,20 @@ impl KvStore {
             evicted: self.evicted,
         }
     }
+
+    /// **可直接搬动的设备面字节**(设备绑定且引用 = 1;S3b §23.2)。
+    ///
+    /// 真源 = 槽引用账:被会话链/活跃 turn 持着的块不在内 —— 与
+    /// `chain_down_span` / `ensure_offloadable` 的判据同一个数(不是两套口径)。
+    pub fn movable_bytes(&self) -> usize {
+        let mut n = 0usize;
+        self.tree.for_each_bound(|slot| {
+            if self.pool.refs(slot) == 1 {
+                n += 1;
+            }
+        });
+        n * self.block_bytes
+    }
 }
 
 #[cfg(test)]

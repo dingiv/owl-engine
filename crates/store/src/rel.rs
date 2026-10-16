@@ -20,24 +20,19 @@ use crate::budget::{Admission, AdmissionVerdict, BudgetInputs, TurnFloor, VramBu
 use crate::error::{StoreError, StoreResult};
 use crate::host::HostTier;
 use crate::id::{ChainHash, PrefixId, SnapKey};
-use crate::kv::{CacheUpdate, KvStats, KvStore, PrefixMatch};
+use crate::kv::{CacheUpdate, KvStats};
+use crate::leg::{BlockLeg, ChainHit, LegConfig, LegStats};
 use crate::policy::{AdmissionPolicy, EvictCandidate, EvictPolicy, Leg, LruPolicy};
 use crate::state::{StateStats, StateStore};
-use crate::tier::{AssetKind, Tier, TierLedger, TierReport};
-use owl_iface::contract::{Bytes, DeviceClient};
+use crate::host::SlotTable;
+use owl_iface::contract::{ConnSlot, SwapPiece};
+use crate::tier::{Tier, TierLedger, TierReport};
 
 /// KV 腿几何(boot 装配一次;`block_tokens` 本引擎恒 32 —— 设计卷 §3.6.2)。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct KvConfig {
-    /// 池块容量(**管理面**页数;不含 padding dump 页)。
-    pub slots: usize,
-    /// 单块 token 数。
-    pub block_tokens: usize,
-    /// 单块字节(**真源**;见坑册 §42)。
-    pub block_bytes: usize,
-    /// 前缀缓存块数上限(0 = 关缓存)。
-    pub cache_cap: usize,
-}
+///
+/// 收编后本类型只是 [`LegConfig`] 的**别名位**(门面签名可读性用):几何的唯一产地
+/// 是腿自己的 `LegConfig`(§23.1)。
+pub type KvConfig = LegConfig;
 
 /// 召回语义(关系层的核心产物;两腿独立 ⇒ 命中可以只有一半)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,8 +123,12 @@ pub struct StoreReport {
     pub active_turns: usize,
     /// 保留面字节(地板 + 行)。
     pub reserved_bytes: usize,
+    /// 非 turn 归属的不可动面字节(idle 会话持着的历史;§23.2)。
+    pub session_held_bytes: usize,
     /// 弹性面字节(可驱逐)。
     pub elastic_bytes: usize,
+    /// 缓存面字节(可驱逐/可下沉)。
+    pub cache_bytes: usize,
     /// 策略名(驱逐序)。
     pub policy: String,
     /// 宿主层驻留字节。
@@ -139,14 +138,18 @@ pub struct StoreReport {
 }
 
 /// 关系层门面:两个独立管理器 + 一层关联。
+///
+/// **收编后**(§23.1):KV 腿的全部状态(槽池/内容身份树/宿主物理)只住 [`BlockLeg`];
+/// 本层不另记一份 —— `ledger` 只记 store 自管面(状态腿/保留面/弹性面),
+/// KV 块面的真源 = 腿的报告(`LegStats`)。
 pub struct Rel {
-    /// attention 块腿(槽池 + 内容前缀树)。
-    pub kv: KvStore,
-    /// GDN 状态账(行 + 快照)。
+    /// attention 块腿(账 + 宿主物理 + 搬运口 —— 唯一状态持有者)。
+    pub leg: BlockLeg,
+    /// GDN 状态账(行 + 快照;快照的**层**是真源 —— §25.2)。
     pub state: StateStore,
-    /// 宿主层(有界 + 可驱逐 + 缓冲复用;vLLM 式 CPU 卸载层)。
-    pub host: HostTier,
-    /// 三层账。
+    /// 状态腿的宿主层(键 = [`SnapKey`];与 KV 腿各自一本账)。
+    pub snap_host: HostTier<SnapKey>,
+    /// 语义账(状态腿快照/行 + 保留面/弹性面;KV 块面不在此重复记)。
     pub ledger: TierLedger,
     /// 准入策略(boot 装配)。
     pub policy: AdmissionPolicy,
@@ -154,36 +157,106 @@ pub struct Rel {
     pub admission: Admission,
     budget: VramBudget,
     evict: Box<dyn EvictPolicy>,
+    /// 状态腿的设备布局(快照 = 「槽 × 片」;engine 在 boot 注册,§25.2)。
+    snap_layout: Option<crate::leg::PoolLayout>,
+    /// 一条快照的全量字节(布局注册后由 `slot_bytes()` 定谳)。
+    snap_bytes: usize,
 }
 
 impl Rel {
     /// 装配(唯一入口:预算分解失败 = **拒绝启动**,A5.1)。
+    ///
+    /// `kv_cfg` = KV 腿几何(含宿主层预算) —— 每 token KV 字节由它推
+    /// (`block_bytes / block_tokens`),与 `inputs.kv_bytes_per_token`
+    /// **交叉校验**(同一件事只有一个入口;矛盾 = 装配错,响亮拒)。
     pub fn open(
         inputs: BudgetInputs,
         policy: AdmissionPolicy,
-        kv_cfg: KvConfig,
-        kv_bytes_per_token: usize,
+        kv_cfg: LegConfig,
     ) -> StoreResult<Self> {
-        if policy.max_active_turns != 0 && inputs.kv_bytes_per_token != kv_bytes_per_token {
-            return Err(StoreError::Budget("每 token KV 字节不一致(装配参数矛盾)".into()));
-        }
         if kv_cfg.block_bytes == 0 || kv_cfg.block_tokens == 0 || kv_cfg.slots == 0 {
             return Err(StoreError::Budget(format!(
                 "KV 腿几何非法:slots={} block_tokens={} block_bytes={}",
                 kv_cfg.slots, kv_cfg.block_tokens, kv_cfg.block_bytes
             )));
         }
+        let per_token = kv_cfg.block_bytes / kv_cfg.block_tokens;
+        if per_token != inputs.kv_bytes_per_token {
+            return Err(StoreError::Budget(format!(
+                "每 token KV 字节不一致:腿几何算得 {per_token} ≠ 预算入参 {}(装配参数矛盾)",
+                inputs.kv_bytes_per_token
+            )));
+        }
+        // host 预算只有一个总量(`inputs.host_bytes` = 整个 store 的中层预算),腿拿其中
+        // 一段 ⇒ 腿那段不许超过总量(超了就是两套规范,不许静默对不上)。
+        if kv_cfg.host_bytes > inputs.host_bytes {
+            return Err(StoreError::Budget(format!(
+                "KV 腿 host 预算 {} > store host 总量 {}(中层分片不许超总账)",
+                kv_cfg.host_bytes, inputs.host_bytes
+            )));
+        }
         let budget = VramBudget::decompose(inputs, policy.max_active_turns)?;
+        let ledger = TierLedger::new(budget.tier_budget());
+        let state = StateStore::new(policy.max_active_turns, inputs.gdn_row_bytes);
+        // 状态腿宿主层:预算 = store host 总量 − KV 腿分片(负数 = 装配错,响亮拒)
+        let snap_host_bytes = inputs.host_bytes.checked_sub(kv_cfg.host_bytes).ok_or_else(|| {
+            StoreError::Budget(format!(
+                "KV 腿 host 分片 {} > store host 总量 {}",
+                kv_cfg.host_bytes, inputs.host_bytes
+            ))
+        })?;
         Ok(Self {
-            kv: KvStore::new(kv_cfg.slots, kv_cfg.block_tokens, kv_cfg.block_bytes, kv_cfg.cache_cap),
-            host: HostTier::new(kv_cfg.block_bytes, inputs.host_bytes)?,
-            state: StateStore::new(policy.max_active_turns, inputs.gdn_row_bytes),
-            ledger: TierLedger::new(budget.tier_budget()),
+            leg: BlockLeg::open(kv_cfg)?,
+            state,
+            snap_host: HostTier::new(1, snap_host_bytes)?,
+            ledger,
             policy,
             admission: Admission::new(),
             budget,
             evict: Box::new(LruPolicy),
+            snap_layout: None,
+            snap_bytes: 0,
         })
+    }
+
+    /// **注册状态腿的设备布局**(boot 一次;§25.2):快照 = 一种"块"
+    /// (槽 × 片),片 = 每个 (层,quad) 一行宽缓冲。
+    pub fn attach_snap_layout(&mut self, layout: crate::leg::PoolLayout) -> StoreResult<u64> {
+        let bytes = layout.slot_bytes();
+        if bytes == 0 {
+            return Err(StoreError::Invariant("状态腿布局单块字节为 0".into()));
+        }
+        // 宿主层的块粒度 = 一条快照(建 host 时未知,故此处重建:预算不变)
+        let budget = self.snap_host.budget_bytes();
+        self.snap_host = HostTier::new(bytes, budget)?;
+        let epoch = layout.epoch;
+        self.snap_layout = Some(layout);
+        self.snap_bytes = bytes;
+        Ok(epoch)
+    }
+
+    /// 一条快照的字节(布局未注册 = 0)。
+    pub fn snap_bytes(&self) -> usize {
+        self.snap_bytes
+    }
+
+    /// 状态腿宿主层预算(字节;0 = 关层)。
+    pub fn snap_host_budget(&self) -> usize {
+        self.snap_host.budget_bytes()
+    }
+
+    /// 状态腿宿主层驻留字节。
+    pub fn snap_host_used(&self) -> usize {
+        self.snap_host.used_bytes()
+    }
+
+    /// 状态腿宿主层**还能装几条快照**。
+    pub fn snap_host_free_slots(&self) -> usize {
+        let used = self.snap_host.used_bytes() + self.snap_host.free_bytes();
+        self.snap_host
+            .budget_bytes()
+            .saturating_sub(used)
+            / self.snap_bytes.max(1)
     }
 
     /// 卡级预算(只读)。
@@ -201,11 +274,14 @@ impl Rel {
     /// 与 [`Self::match_prefix`] 二选一使用(两条查询路径各自记一次命中账;
     /// 同一次查询不要两条都调,否则计数双算)。
     pub fn probe(&mut self, id: PrefixId) -> RecallHit {
-        let kv_tier = self.kv.locate(id.chain);
+        let kv_tier = self.leg.carrier_of(id.chain).ok().map(|c| match c {
+            crate::leg::Carrier::Device(_) => Tier::Gpu,
+            crate::leg::Carrier::Host => Tier::Host,
+            crate::leg::Carrier::Disk => Tier::Disk,
+        });
         let snap_tier = self.state.locate(id.snap_key());
-        let blocks = if kv_tier.is_some() { self.kv.chain_len(id.chain) } else { 0 };
-        let hit = RecallHit { kv_tier, snap_tier, blocks };
-        self.kv.note_probe(hit.kv_tier.is_some());
+        let hit = RecallHit { kv_tier, snap_tier, blocks: kv_tier.map_or(0, |_| self.leg.chain_len(id.chain)) };
+        self.leg.note_probe(hit.kv_tier.is_some());
         self.state.note_probe(hit.snap_tier.is_some());
         hit
     }
@@ -214,116 +290,34 @@ impl Rel {
     ///
     /// 未绑定的格(`slot = None`)= 内容在宿主层,调用方须在**段边界**回灌
     /// (律③)—— 本方法自身不做设备动作。
-    pub fn match_prefix(&mut self, tokens: &[u32]) -> (PrefixMatch, RecallHit) {
-        let m = self.kv.match_prefix(tokens);
-        let kv_tier = m.tail.and_then(|t| self.kv.locate(t));
-        let snap_tier = m.tail.and_then(|t| self.state.locate(SnapKey::at_boundary(t)));
+    pub fn match_prefix(&mut self, tokens: &[u32]) -> StoreResult<(ChainHit, RecallHit)> {
+        let m = self.leg.match_prefix(tokens)?;
+        let tail = m.hashes.last().copied();
+        let kv_tier = tail.and_then(|t| self.leg.carrier_of(t).ok()).map(|c| match c {
+            crate::leg::Carrier::Device(_) => Tier::Gpu,
+            crate::leg::Carrier::Host => Tier::Host,
+            crate::leg::Carrier::Disk => Tier::Disk,
+        });
+        let snap_tier = tail.and_then(|t| self.state.locate(SnapKey::at_boundary(t)));
         let hit = RecallHit { kv_tier, snap_tier, blocks: m.matched_blocks };
-        (m, hit)
+        Ok((m, hit))
     }
 
-    /// **登记一条前缀链**(turn 收口 L3):缓存取一份绑定引用,容量驱逐同步出账。
+    /// **登记一条前缀链**(turn 收口 L3):缓存取一份绑定引用,容量驱逐同步丢宿主副本。
     ///
     /// 只做 KV 腿;快照腿由 [`StateStore::return_row`] 登记(两腿独立 —— 裁决②)。
-    pub fn register_chain(
-        &mut self,
-        tokens: &[u32],
-        table: &[u32],
-    ) -> StoreResult<CacheUpdate> {
-        let up = self.kv.register_chain(tokens, table)?;
-        let b = self.kv.block_bytes();
-        for _ in &up.inserted {
-            self.ledger.add(Tier::Gpu, AssetKind::KvBlock, b)?;
-        }
-        self.account_evicted(&up.evicted)?;
-        Ok(up)
+    pub fn register_chain(&mut self, tokens: &[u32], table: &[u32]) -> StoreResult<CacheUpdate> {
+        self.leg.register_chain(tokens, table)
     }
 
-    /// 块表增长(engine 每步/每 turn 调;内部含压力驱逐,逐出的宿主条目
-    /// 由门面**同步丢弃宿主副本**)。
-    pub fn ensure_for_len(
-        &mut self,
-        table: &mut Vec<u32>,
-        target_len: usize,
-    ) -> StoreResult<()> {
-        let evicted = self.kv.ensure_for_len(table, target_len)?;
-        self.account_evicted(&evicted)
+    /// 块表增长(engine 每步/每 turn 调;压力驱逐与宿主副本回收均在腿内)。
+    pub fn ensure_for_len(&mut self, table: &mut Vec<u32>, target_len: usize) -> StoreResult<()> {
+        self.leg.ensure_for_len(table, target_len)
     }
 
     /// 归还会话块表。
     pub fn release_table(&mut self, table: &mut Vec<u32>) -> StoreResult<()> {
-        self.kv.release_table(table)
-    }
-
-    /// 按策略点名的驱逐(engine 在段边界执行):逐出缓存条目并出账。
-    pub fn evict_cached(&mut self, n: usize) -> StoreResult<Vec<ChainHash>> {
-        let batch = self.kv.evict_cached(n)?;
-        let mut chains = Vec::with_capacity(batch.len());
-        for (chain, slot) in batch {
-            match slot {
-                Some(_) => self.ledger.remove(Tier::Gpu, AssetKind::KvBlock, self.kv.block_bytes())?,
-                None => {
-                    let _ = self.host.evict(chain)?;
-                    self.ledger.remove(Tier::Host, AssetKind::KvBlock, self.kv.block_bytes())?;
-                }
-            }
-            chains.push(chain);
-        }
-        Ok(chains)
-    }
-
-    /// **卸载一个 attention 块到宿主层**(L2 换出的一半;段边界调用)。
-    ///
-    /// 顺序 = 取宿主缓冲 → `dtoh` → **摘设备绑定 + 还槽**(引用必须为 1;
-    /// 仍有会话在用 = 响亮拒,`arch.md` 律④)→ 落宿主 → 账目 `Gpu → Host`。
-    /// 失败不留半态(绑定未摘则宿主缓冲直接回收)。
-    pub async fn offload_block<D: DeviceClient>(
-        &mut self,
-        face: &mut D,
-        chain: ChainHash,
-        dev: &Bytes,
-    ) -> StoreResult<()> {
-        let bytes = self.kv.block_bytes();
-        let mut buf = self.host.acquire()?;
-        crate::moves::offload_to_host(face, dev, bytes, &mut buf).await?;
-        self.kv.unbind(chain)?;
-        self.host.put(chain, buf)?;
-        self.ledger.remove(Tier::Gpu, AssetKind::KvBlock, bytes)?;
-        self.ledger.add(Tier::Host, AssetKind::KvBlock, bytes)?;
-        Ok(())
-    }
-
-    /// **从宿主层回灌一个块到设备**(段边界调用;`slot` 由调用方在设备上备好)。
-    pub async fn onload_block<D: DeviceClient>(
-        &mut self,
-        face: &mut D,
-        chain: ChainHash,
-        slot: u32,
-        dev: &Bytes,
-    ) -> StoreResult<()> {
-        let bytes = self.kv.block_bytes();
-        let buf = self.host.take(chain)?;
-        crate::moves::onload_from_host(face, &buf, dev, bytes).await?;
-        self.kv.rebind(chain, slot)?;
-        self.ledger.remove(Tier::Host, AssetKind::KvBlock, bytes)?;
-        self.ledger.add(Tier::Gpu, AssetKind::KvBlock, bytes)?;
-        Ok(())
-    }
-
-    /// 逐出条目的跨腿出账(KV 腿已自行摘绑定;此处只对账 + 丢宿主副本)。
-    fn account_evicted(&mut self, evicted: &[(ChainHash, Option<u32>)]) -> StoreResult<()> {
-        let b = self.kv.block_bytes();
-        for (chain, slot) in evicted {
-            match slot {
-                Some(_) => self.ledger.remove(Tier::Gpu, AssetKind::KvBlock, b)?,
-                None => {
-                    // host 条目被逐 = 内容整体消失:宿主副本必须同步丢掉
-                    let _ = self.host.evict(*chain)?;
-                    self.ledger.remove(Tier::Host, AssetKind::KvBlock, b)?;
-                }
-            }
-        }
-        Ok(())
+        self.leg.release_table(table)
     }
 
     /// 准入判决(§2.4 准入式;`evictable` = 缓存面 + 弹性面可动字节)。
@@ -347,7 +341,7 @@ impl Rel {
     /// 换出单(两腿候选 → 统一序;`need_bytes` 满足即停)。
     pub fn plan_evict(&self, need_bytes: usize, protect: &Protected) -> EvictPlan {
         let mut cands: Vec<EvictCandidate> = Vec::new();
-        cands.extend(self.kv.evict_candidates(&protect.chains));
+        cands.extend(self.leg.evict_candidates(&protect.chains));
         cands.extend(self.state.evict_candidates(&protect.snaps));
         cands.sort_by_key(|c| (c.leg, c.chain, c.snap, c.tier));
         cands.dedup_by_key(|c| (c.leg, c.chain, c.snap, c.tier));
@@ -370,19 +364,127 @@ impl Rel {
         EvictPlan { items, freed_bytes: freed }
     }
 
-    /// 报告(三层 + 两腿 + 保留/弹性面)。
+    // ───────────────── 状态腿搬运口(§25.2;与 KV 腿同形:store 出计划与账) ─────────────────
+
+    /// 状态腿的片(逐 (层,quad);`dev_off = 槽 × 行宽`)。
+    fn snap_pieces(&self, slot: u32) -> StoreResult<Vec<SwapPiece>> {
+        let layout = self
+            .snap_layout
+            .as_ref()
+            .ok_or_else(|| StoreError::Invariant("状态腿布局未注册(engine 应在 boot 调 attach_snap_layout)".into()))?;
+        Ok(layout
+            .pieces
+            .iter()
+            .map(|p| SwapPiece {
+                block: p.buf.id,
+                dev_off: slot as usize * p.stride_bytes,
+                conn_off: 0, // 单条快照的宿主槽 = 连续一条(片内偏移在下面补)
+                len: p.stride_bytes,
+                slot: ConnSlot(0),
+            })
+            .collect())
+    }
+
+    /// **快照下沉计划**(设备槽 `slot` 上的快照 → 宿主)。
+    /// `Busy` = 快照不在账/宿主层已满(零副作用,调用方跳过)。
+    pub fn plan_snap_offload(&mut self, key: SnapKey, slot: u32) -> StoreResult<(Vec<SwapPiece>, SlotTable)> {
+        let bytes = self
+            .state
+            .snap_bytes(key)
+            .ok_or_else(|| StoreError::Unknown(format!("快照 {key:?} 不在账")))?;
+        if bytes != self.snap_bytes {
+            return Err(StoreError::Invariant(format!(
+                "快照字节不符:账 {bytes} ≠ 布局 {}",
+                self.snap_bytes
+            )));
+        }
+        let buf = self.snap_host.acquire()?; // 预算在借台处查(超界零副作用)
+        let mut pieces = self.snap_pieces(slot)?;
+        // 片在宿主槽内**首尾相接**(每条快照 = 一个槽)
+        let mut off = 0usize;
+        for p in &mut pieces {
+            p.conn_off = off;
+            off += p.len;
+        }
+        Ok((pieces, SlotTable::one(buf)))
+    }
+
+    /// **快照下沉记账**(搬运成功后;纯 host):内容落宿主 + 换层。
+    pub fn commit_snap_offload(
+        &mut self,
+        key: SnapKey,
+        table: SlotTable,
+    ) -> StoreResult<()> {
+        let buf = table
+            .into_slots()
+            .into_iter()
+            .next()
+            .ok_or_else(|| StoreError::Invariant("快照槽台为空".into()))?;
+        self.snap_host.put(key, buf)?;
+        self.state.set_tier(key, Tier::Host)?;
+        Ok(())
+    }
+
+    /// **快照下沉回滚**(搬运失败):宿主缓冲随失败的 connector 释放,层不动。
+    pub fn abort_snap_offload(&mut self, _key: SnapKey) {}
+
+    /// **快照回灌计划**(宿主 → 设备槽 `slot`)。
+    pub fn plan_snap_onload(&mut self, key: SnapKey, slot: u32) -> StoreResult<(Vec<SwapPiece>, SlotTable)> {
+        let buf = self.snap_host.take(key)?;
+        let mut pieces = self.snap_pieces(slot)?;
+        let mut off = 0usize;
+        for p in &mut pieces {
+            p.conn_off = off;
+            off += p.len;
+        }
+        Ok((pieces, SlotTable::one(buf)))
+    }
+
+    /// **快照回灌记账**(搬运成功后):缓冲回池 + 层回设备。
+    pub fn commit_snap_onload(&mut self, key: SnapKey, table: SlotTable) -> StoreResult<()> {
+        self.snap_host.recycle_many(table.into_slots());
+        self.state.set_tier(key, Tier::Gpu)?;
+        Ok(())
+    }
+
+    /// **快照回灌回滚**(搬运失败):台子已随失败的 connector 移出(内容丢)
+    /// ⇒ 条目一并删(不留假账;与 KV 腿 `abort_offload` 同律)。
+    pub fn abort_snap_onload(&mut self, key: SnapKey) {
+        let _ = self.state.drop_snap(key);
+    }
+
+    /// 丢弃一条快照的宿主副本(内容整体淘汰时;不在宿主 = 幂等)。
+    pub fn drop_snap_host(&mut self, key: SnapKey) -> StoreResult<usize> {
+        match self.snap_host.evict(key) {
+            Ok(n) => Ok(n),
+            Err(StoreError::Unknown(_)) => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// 报告(两腿 + 保留/弹性面)。
+    ///
+    /// KV 块面从**腿**报出(单一真源),`tiers` 只列 store 自管面
+    /// (状态腿/保留面/弹性面)—— 同一字节不两处记(§13.1/§23.1)。
     pub fn report(&self) -> StoreReport {
         StoreReport {
             tiers: self.ledger.report(),
-            kv: self.kv.stats(),
+            kv: self.leg.kv_stats(),
             state: self.state.stats(),
             active_turns: self.admission.active_turns(),
             reserved_bytes: self.admission.reserved_bytes(),
+            session_held_bytes: self.admission.session_held_bytes(),
             elastic_bytes: self.admission.elastic_bytes(),
+            cache_bytes: self.admission.cache_bytes(),
             policy: self.evict.name().to_string(),
-            host_resident_bytes: self.host.used_bytes(),
-            host_free_bytes: self.host.free_bytes(),
+            host_resident_bytes: self.leg.host_used_bytes(),
+            host_free_bytes: self.leg.host_free_bytes(),
         }
+    }
+
+    /// 腿报告(KV 腿的完整面:槽/缓存/宿主/搬运计数 —— 报告与对账口用)。
+    pub fn leg_stats(&self) -> LegStats {
+        self.leg.report()
     }
 }
 
@@ -403,18 +505,39 @@ mod tests {
             draft_pool_bytes: 0,
             gdn_row_bytes: 162_000_000,
             kv_bytes_per_token: 32 * 1024,
-            host_bytes: 16 << 30,
+            host_bytes: 8 << 20,
             disk_bytes: 0,
+            kv_face_bytes: 0,
         }
     }
 
     fn kv_cfg(slots: usize, cache_cap: usize) -> KvConfig {
-        KvConfig { slots, block_tokens: 32, block_bytes: BLOCK_BYTES, cache_cap }
+        KvConfig {
+            slots,
+            block_tokens: 32,
+            block_bytes: BLOCK_BYTES,
+            cache_cap,
+            host_bytes: 8 << 20,
+            class: crate::leg::BlockClass::KvPage,
+            label: "test",
+        }
     }
 
     fn rel(turns: usize) -> Rel {
-        Rel::open(inputs(), AdmissionPolicy::new(turns, QueuePolicy::Reject), kv_cfg(64, 32), 32 * 1024)
-            .expect("装配")
+        let mut r = Rel::open(inputs(), AdmissionPolicy::new(turns, QueuePolicy::Reject), kv_cfg(64, 32))
+            .expect("装配");
+        // 注册池布局(单片段;测试只跑账/计划,不跑真搬运 —— 搬迁在 store_e2e 覆盖)
+        r.leg
+            .attach_pool(crate::leg::PoolLayout {
+                class: crate::leg::BlockClass::KvPage,
+                epoch: 0,
+                pieces: vec![crate::leg::PieceSpec {
+                    buf: owl_iface::contract::Bytes::new(0, 1, owl_iface::contract::Dtype::F32, 1),
+                    stride_bytes: BLOCK_BYTES,
+                }],
+            })
+            .expect("布局");
+        r
     }
 
     fn toks(n: usize) -> Vec<u32> {
@@ -422,14 +545,60 @@ mod tests {
     }
 
     #[test]
-    fn open_rejects_unmeasured_budget() {
+    fn open_rejects_unmeasured_budget_and_geometry() {
+        // 动态池档(无池面兜底):卡级缺项 = 拒
         let mut i = inputs();
         i.weights_bytes = 0;
-        assert!(Rel::open(i, AdmissionPolicy::new(1, QueuePolicy::Reject), kv_cfg(8, 8), 1024).is_err());
+        assert!(Rel::open(i, AdmissionPolicy::new(1, QueuePolicy::Reject), kv_cfg(8, 8)).is_err());
+        // 几何非法 = 拒
         assert!(
-            Rel::open(inputs(), AdmissionPolicy::new(1, QueuePolicy::Reject), kv_cfg(0, 8), 1024).is_err(),
-            "几何非法也要拒"
+            Rel::open(inputs(), AdmissionPolicy::new(1, QueuePolicy::Reject), kv_cfg(0, 8)).is_err()
         );
+        // 每 token 字节与腿几何矛盾 = 拒(同一件事只能有一个入口)
+        let mut i2 = inputs();
+        i2.kv_bytes_per_token = 4096;
+        assert!(Rel::open(i2, AdmissionPolicy::new(1, QueuePolicy::Reject), kv_cfg(8, 8)).is_err());
+    }
+
+    /// @cu: 固定池档:池是准入面,卡级可缺项 —— 但"未实测"必须可查(不许静默)。
+    #[test]
+    fn fixed_pool_rel_opens_without_card_measurements() {
+        let mut i = inputs();
+        i.v_card_bytes = 0;
+        i.weights_bytes = 0;
+        i.runtime_floor_bytes = 0;
+        i.kv_face_bytes = 64 * BLOCK_BYTES;
+        let r = Rel::open(i, AdmissionPolicy::new(1, QueuePolicy::Reject), kv_cfg(64, 32))
+            .expect("固定池档应能装配");
+        assert!(!r.budget().card_measured());
+        assert_eq!(r.budget().face_bytes(), 64 * BLOCK_BYTES, "判据面 = 池");
+    }
+
+    #[test]
+    fn facade_delegates_to_the_leg_single_source() {
+        let mut r = rel(2);
+        let tokens = toks(64);
+        let mut table = Vec::new();
+        r.ensure_for_len(&mut table, 64).expect("块表");
+        assert_eq!(r.leg_stats().slots_total, 64);
+        r.register_chain(&tokens, &table).expect("登记");
+        assert_eq!(r.report().kv.cached_blocks, 2, "缓存条目走腿报告,不另记一份");
+        assert_eq!(r.leg_stats().cached_blocks, 2);
+        // tiers 只记 store 自管面(KV 块面归腿)⇒ 这里恒 0
+        assert_eq!(r.report().tiers.gpu_used, 0, "KV 块不在语义账里重复记");
+
+        // 命中面:门面回 (块腿三元组, 关系层语义) 且两者一致
+        let (hit, recall) = r.match_prefix(&tokens).expect("命中查询");
+        assert_eq!(hit.matched_blocks, 2);
+        assert_eq!(recall.blocks, 2);
+        assert_eq!(recall.kv_tier, Some(Tier::Gpu));
+        assert_eq!(recall.mode(), RecallMode::ContextOnly, "状态腿不在 ⇒ 上下文召回");
+        // 会话表还在 ⇒ 活跃面不可下沉(Busy);归还后 ⇒ 可沉(搬迁本体在 store_e2e 覆盖)
+        let tail = r.leg.tail_hash(&tokens, 2).expect("尾身份");
+        // 会话表还在 ⇒ 活跃面:整条链不出票(§14.6 律②)
+        assert!(matches!(crate::leg::plan_offload(&mut r.leg, tail), Err(StoreError::Busy(_))));
+        r.release_table(&mut table).expect("归还");
+        assert!(crate::leg::plan_offload(&mut r.leg, tail).is_ok(), "缓存独占可搬");
     }
 
     #[test]
@@ -439,7 +608,7 @@ mod tests {
         let mut table = Vec::new();
         r.ensure_for_len(&mut table, 64).expect("块表");
         r.register_chain(&tokens, &table).expect("登记");
-        let tail = r.kv.tail_hash(&tokens, 2).expect("尾身份");
+        let tail = r.leg.tail_hash(&tokens, 2).expect("尾身份");
         let id = PrefixId::new(tail);
 
         let h = r.probe(id);
@@ -463,8 +632,8 @@ mod tests {
             r.ensure_for_len(&mut table, 32).expect("块表");
             r.register_chain(t, &table).expect("登记");
         }
-        let a = r.kv.tail_hash(&ta, 1).expect("A 身份");
-        let b = r.kv.tail_hash(&tb, 1).expect("B 身份");
+        let a = r.leg.tail_hash(&ta, 1).expect("A 身份");
+        let b = r.leg.tail_hash(&tb, 1).expect("B 身份");
         let row = r.state.borrow_row().expect("借行");
         r.state.return_row(row, Some(SnapKey::at_boundary(ChainHash::new(9)))).expect("快照");
 
@@ -482,8 +651,9 @@ mod tests {
         let mut table = Vec::new();
         r.ensure_for_len(&mut table, 32).expect("块表");
         r.register_chain(&tokens, &table).expect("登记");
-        let chain = r.kv.tail_hash(&tokens, 1).expect("身份");
-        r.admission.admit(1, 1 << 20, 0).expect("登记活跃 turn");
+        let chain = r.leg.tail_hash(&tokens, 1).expect("身份");
+        r.admission.admit(1, 0, 0).expect("登记活跃 turn");
+        r.admission.set_floor(1, BLOCK_BYTES).expect("实占更新");
         let plan = r.plan_evict(usize::MAX, &Protected { chains: vec![chain], snaps: vec![] });
         assert!(
             plan.items.iter().all(|i| i.chain != Some(chain)),
@@ -498,88 +668,18 @@ mod tests {
         let mut table = Vec::new();
         r.ensure_for_len(&mut table, 32).expect("块表");
         r.register_chain(&tokens, &table).expect("登记");
-        r.admission.admit(1, 4 << 20, 1 << 20).expect("活跃 turn");
+        r.admission.admit(1, 0, 0).expect("活跃 turn");
+        r.admission.set_floor(1, 4 << 20).expect("实占");
+        r.admission.set_elastic(1, 1 << 20).expect("弹性");
         let rep = r.report();
         assert_eq!(rep.active_turns, 1);
         assert_eq!(rep.reserved_bytes, 4 << 20);
         assert_eq!(rep.elastic_bytes, 1 << 20);
         assert_eq!(rep.policy, "lru");
         assert_eq!(rep.state.rows_total, 2);
-        assert_eq!(rep.kv.cached_blocks, 1, "缓存面 1 块");
-        assert_eq!(rep.tiers.gpu_used, BLOCK_BYTES, "台账只记 store 管的缓存块面");
-    }
-
-    #[tokio::test]
-    async fn kv_block_migrates_gpu_to_host_and_back_with_books_balanced() {
-        let mut r = rel(2);
-        let mut face = owl_cpu::CpuFace::default();
-        let dev = face.alloc(owl_iface::contract::Dtype::F32, BLOCK_BYTES / 4, "t").await.expect("设备块");
-        let tokens = toks(32);
-        let mut table = Vec::new();
-        r.ensure_for_len(&mut table, 32).expect("块表");
-        r.register_chain(&tokens, &table).expect("登记");
-        let chain = r.kv.tail_hash(&tokens, 1).expect("身份");
-
-        // 会话归还 ⇒ 缓存独占 ⇒ 可下沉
-        r.release_table(&mut table).expect("归还");
-        r.offload_block(&mut face, chain, &dev).await.expect("卸载");
-        let hit = r.probe(PrefixId::new(chain));
-        assert_eq!(hit.kv_tier, Some(Tier::Host), "层应下沉");
-        assert_eq!(hit.mode(), RecallMode::ContextOnly, "状态腿不在 ⇒ 上下文召回");
-        assert_eq!(r.report().host_resident_bytes, BLOCK_BYTES);
-        assert_eq!(r.report().tiers.gpu_used, 0, "Gpu/KvBlock 已出账");
-
-        // 回灌:拿一个新槽(旧槽已还池)重绑
-        let mut fresh = Vec::new();
-        r.ensure_for_len(&mut fresh, 32).expect("新槽");
-        r.onload_block(&mut face, chain, fresh[0], &dev).await.expect("回灌");
-        assert_eq!(r.probe(PrefixId::new(chain)).kv_tier, Some(Tier::Gpu));
-        assert_eq!(r.report().host_resident_bytes, 0);
-        assert_eq!(r.report().tiers.gpu_used, BLOCK_BYTES);
-        assert_eq!(r.report().tiers.host_used, 0);
-    }
-
-    #[tokio::test]
-    async fn host_tier_full_is_rejected_loudly() {
-        // host 预算 = 单块 ⇒ 第二块卸载必拒(先驱逐再搬是调用方的顺序责任)
-        let mut i = inputs();
-        i.host_bytes = BLOCK_BYTES;
-        let mut r = Rel::open(i, AdmissionPolicy::new(1, QueuePolicy::Reject), kv_cfg(8, 8), 32 * 1024)
-            .expect("装配");
-        let mut face = owl_cpu::CpuFace::default();
-        let dev = face.alloc(owl_iface::contract::Dtype::F32, BLOCK_BYTES / 4, "t").await.expect("设备块");
-        let ta = toks(32);
-        let tb: Vec<u32> = (100..132).collect();
-        for t in [&ta, &tb] {
-            let mut table = Vec::new();
-            r.ensure_for_len(&mut table, 32).expect("块表");
-            r.register_chain(t, &table).expect("登记");
-            r.release_table(&mut table).expect("归还");
-        }
-        let a = r.kv.tail_hash(&ta, 1).expect("A 身份");
-        let b = r.kv.tail_hash(&tb, 1).expect("B 身份");
-        r.offload_block(&mut face, a, &dev).await.expect("第一块");
-        let err = r.offload_block(&mut face, b, &dev).await.expect_err("第二块必须拒");
-        assert!(matches!(err, StoreError::Exhausted(_)), "得 {err:?}");
-        // 拒后不留半态:A 仍在 host,B 仍在设备
-        assert_eq!(r.probe(PrefixId::new(a)).kv_tier, Some(Tier::Host));
-        assert_eq!(r.probe(PrefixId::new(b)).kv_tier, Some(Tier::Gpu));
-    }
-
-    #[tokio::test]
-    async fn offload_refuses_while_session_holds_the_block() {
-        let mut r = rel(2);
-        let mut face = owl_cpu::CpuFace::default();
-        let dev = face.alloc(owl_iface::contract::Dtype::F32, BLOCK_BYTES / 4, "t").await.expect("设备块");
-        let tokens = toks(32);
-        let mut table = Vec::new();
-        r.ensure_for_len(&mut table, 32).expect("块表");
-        r.register_chain(&tokens, &table).expect("登记");
-        let chain = r.kv.tail_hash(&tokens, 1).expect("身份");
-        // 会话仍持链 ⇒ 活跃面不可下沉(律④)
-        let err = r.offload_block(&mut face, chain, &dev).await.expect_err("必须拒");
-        assert!(matches!(err, StoreError::Invariant(_)), "得 {err:?}");
-        assert_eq!(r.report().tiers.gpu_used, BLOCK_BYTES, "账目未动");
+        assert_eq!(rep.kv.cached_blocks, 1, "缓存面 1 块(腿报)");
+        assert_eq!(rep.kv.gpu_bytes, BLOCK_BYTES, "设备绑定面 1 块");
+        assert_eq!(rep.tiers.gpu_used, 0, "语义账不重复记 KV 块");
     }
 
     #[test]

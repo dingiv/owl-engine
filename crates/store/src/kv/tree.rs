@@ -98,6 +98,15 @@ impl PrefixTree {
         self.entries.values().filter(|e| e.slot.is_some()).count()
     }
 
+    /// 逐个设备绑定条目回吐槽号(只读;可动面统计用 —— 只有槽引用账能判"能否搬")。
+    pub(crate) fn for_each_bound<F: FnMut(u32)>(&self, mut f: F) {
+        for e in self.entries.values() {
+            if let Some(slot) = e.slot {
+                f(slot);
+            }
+        }
+    }
+
     /// 取条目(只读)。
     pub(crate) fn get(&self, chain: ChainHash) -> Option<&Entry> {
         self.entries.get(&chain)

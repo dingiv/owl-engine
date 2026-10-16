@@ -52,21 +52,29 @@ impl HostBlock {
 }
 
 /// 宿主层(有界 + 可驱逐 + 缓冲复用)。`free_cap` = 空转缓冲保留上限。
+///
+/// **键泛型**(S2):KV 腿按 `ChainHash`(内容身份)驻留,状态腿按 [`SnapKey`]
+/// (块边界身份)—— 两腿各自一本账,键类型把"混用"挡在类型上。
 #[derive(Debug)]
-pub struct HostTier {
+pub struct HostTier<K = ChainHash> {
     block_bytes: usize,
     budget_bytes: usize,
     free_cap: usize,
-    resident: BTreeMap<ChainHash, HostBlock>,
+    resident: BTreeMap<K, HostBlock>,
     free: Vec<HostBlock>,
     /// 因容量驱逐而累计释放的字节(报告面)。
     evicted_bytes: u64,
 }
 
+/// 宿主层键(可寻址 + 可打印)。
+pub trait HostKey: Ord + Copy + std::fmt::Debug {}
+impl HostKey for ChainHash {}
+impl HostKey for crate::id::SnapKey {}
+
 /// 空转缓冲默认保留上限(块数)。
 const DEFAULT_FREE_CAP: usize = 4;
 
-impl HostTier {
+impl<K: HostKey> HostTier<K> {
     /// 构造。`budget_bytes = 0` = **关层**(任何落位都拒)。
     pub fn new(block_bytes: usize, budget_bytes: usize) -> StoreResult<Self> {
         if block_bytes == 0 {
@@ -141,7 +149,7 @@ impl HostTier {
     /// **批量落账**(命令回执后:内容已写好,装回驻留表)。
     /// 逐项校验(大小/重复/预算);任一失败即停并上抛(已落的项保留 ——
     /// 内容不丢,调用方据错回滚剩余部分)。
-    pub fn land(&mut self, items: Vec<(ChainHash, HostBlock)>) -> StoreResult<()> {
+    pub fn land(&mut self, items: Vec<(K, HostBlock)>) -> StoreResult<()> {
         for (chain, buf) in items {
             self.put(chain, buf)?;
         }
@@ -156,7 +164,7 @@ impl HostTier {
     }
 
     /// 登记驻留(内容落到宿主层)。
-    pub fn put(&mut self, block: ChainHash, buf: HostBlock) -> StoreResult<()> {
+    pub fn put(&mut self, block: K, buf: HostBlock) -> StoreResult<()> {
         if buf.len() != self.block_bytes {
             return Err(StoreError::Invariant(format!(
                 "宿主块大小不符:{} ≠ {}",
@@ -179,19 +187,19 @@ impl HostTier {
     }
 
     /// 取走驻留内容(回灌设备时用;缓冲所有权移出,由调用方决定复用或释放)。
-    pub fn take(&mut self, block: ChainHash) -> StoreResult<HostBlock> {
+    pub fn take(&mut self, block: K) -> StoreResult<HostBlock> {
         self.resident
             .remove(&block)
             .ok_or_else(|| StoreError::Unknown(format!("块 {block:?} 不在宿主层")))
     }
 
     /// 只读查看。
-    pub fn get(&self, block: ChainHash) -> Option<&HostBlock> {
+    pub fn get(&self, block: K) -> Option<&HostBlock> {
         self.resident.get(&block)
     }
 
     /// 驱逐(内容丢弃;缓冲回小块池,超上限则真释放)。
-    pub fn evict(&mut self, block: ChainHash) -> StoreResult<usize> {
+    pub fn evict(&mut self, block: K) -> StoreResult<usize> {
         let buf = self
             .resident
             .remove(&block)
@@ -203,7 +211,7 @@ impl HostTier {
     }
 
     /// 驻留块号(驱逐序输入;调用方按策略排序)。
-    pub fn resident_blocks(&self) -> Vec<ChainHash> {
+    pub fn resident_blocks(&self) -> Vec<K> {
         self.resident.keys().copied().collect()
     }
 
@@ -331,7 +339,7 @@ mod tests {
 
     #[test]
     fn disabled_tier_rejects_loudly() {
-        let mut t = HostTier::new(1024, 0).expect("构造");
+        let mut t: HostTier = HostTier::new(1024, 0).expect("构造");
         assert!(t.is_disabled());
         let err = t.acquire().expect_err("关层必须拒");
         assert!(matches!(err, StoreError::Exhausted(_)), "得 {err:?}");
@@ -356,7 +364,7 @@ mod tests {
 
     #[test]
     fn budget_is_enforced_and_content_can_be_evicted() {
-        let mut t = HostTier::new(1024, 2048).expect("构造");
+        let mut t: HostTier = HostTier::new(1024, 2048).expect("构造");
         let a = t.acquire().expect("块 A");
         let b = t.acquire().expect("块 B");
         t.put(ChainHash::new(1), a).expect("驻留 A");
@@ -377,7 +385,7 @@ mod tests {
 
     #[test]
     fn free_list_is_capped_so_ram_is_really_returned() {
-        let mut t = HostTier::new(512, 64 * 1024).expect("构造");
+        let mut t: HostTier = HostTier::new(512, 64 * 1024).expect("构造");
         for i in 0..32u64 {
             let b = t.acquire().expect("块");
             t.put(ChainHash::new(i), b).expect("驻留");
@@ -391,7 +399,7 @@ mod tests {
 
     #[test]
     fn double_put_and_unknown_take_are_loud() {
-        let mut t = HostTier::new(256, 4096).expect("构造");
+        let mut t: HostTier = HostTier::new(256, 4096).expect("构造");
         let b = t.acquire().expect("块");
         t.put(ChainHash::new(9), b).expect("驻留");
         let b2 = t.acquire().expect("块");

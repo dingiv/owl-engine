@@ -40,7 +40,7 @@
 //! | model | head_quant | HeadQuant 枚举("off"\|"rtn-int4-g32")/ off(C1;|
 //! |   |   | 竖式/gate 质量门后转正) |
 //! | pool | pool_tokens | Option<usize> / None(=2×单会话) |
-//! | pool | gdn_slots / snap_max | usize / 8、4 |
+//! | pool | max_active_turns / snap_max | usize / 8、4 |
 //! | pool | vram_target / vram_reserve_mb | f64、u64 / 0.97、1024 |
 //! | pool | prefix_cache | bool / true |
 //! | spec | depth / dumb / draft_kv_fp8 | usize 0(off)、flag、flag |
@@ -209,7 +209,7 @@ pub struct ModelCfg {
 #[serde(default, deny_unknown_fields)]
 pub struct PoolCfg {
     pub pool_tokens: Option<usize>,
-    pub gdn_slots: usize,
+    pub max_active_turns: usize,
     pub snap_max: usize,
     pub vram_target: f64,
     pub vram_reserve_mb: u64,
@@ -617,7 +617,7 @@ impl Default for AgentCfg {
 #[serde(default, deny_unknown_fields)]
 pub struct ServerCfg {
     /// 最大并发请求数(在跑 + 排队;超出者排队等待)。
-    /// 默认 8;须 ≤ pool 的 GDN 状态格数(knobs.gdn_slots,每并发会话
+    /// 默认 8;须 ≤ pool 的 GDN 行数(knobs.max_active_turns,每并发会话
     /// 占一格)—— 启动校验不足即拒。本地多副本 agent 各占一并发。
     pub max_concurrency: usize,
 }
@@ -671,7 +671,7 @@ impl Default for PoolCfg {
     fn default() -> Self {
         Self {
             pool_tokens: None,
-            gdn_slots: 8,
+            max_active_turns: 8,
             snap_max: 4,
             vram_target: 0.97,
             vram_reserve_mb: 1024,
@@ -846,12 +846,12 @@ mod tests {
     #[test]
     fn 正语义分派与合法文件() {
         let c = OwlConfig::from_toml_str(
-            "[dispatch]\nqkv_fuse = false\ngdn_fused_decode_v2 = false\n[pool]\ngdn_slots = 1\n",
+            "[dispatch]\nqkv_fuse = false\ngdn_fused_decode_v2 = false\n[pool]\nmax_active_turns = 1\n",
         )
         .expect("合法文件应通过");
         assert!(!c.dispatch.qkv_fuse);
         assert!(!c.dispatch.gdn_fused_decode_v2);
-        assert_eq!(c.pool.gdn_slots, 1);
+        assert_eq!(c.pool.max_active_turns, 1);
     }
 
 }

@@ -18,7 +18,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let act = self.turns.active.as_ref().expect("active 已保证");
             let s = self.bank.sessions.get_mut(act.session_id).expect("账在");
             let before = s.block_table.len();
-            self.bank.leg_target.ensure_for_len(&mut s.block_table, fp + 8)?;
+            self.bank.rel.leg.ensure_for_len(&mut s.block_table, fp + 8)?;
             if s.block_table.len() != before {
                 let sid = act.session_id;
                 self.write_bt(sid).await?;
@@ -105,7 +105,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let (_bt_chain, _) = {
             let act = self.turns.active.as_ref().expect("active 已保证");
             let s = self.bank.sessions.get(act.session_id).expect("账在");
-            (s.block_table.clone(), s.gdn_slot)
+            (s.block_table.clone(), self.turns.active.as_ref().expect("active").gdn_slot)
         };
         let _page = self.pool.page;
         let leaves = self.pool.dflash_kv_leaves().expect("dflash 池");
@@ -186,7 +186,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let (_bt_chain, _) = {
             let act = self.turns.active.as_ref().expect("active 已保证");
             let s = self.bank.sessions.get(act.session_id).expect("账在");
-            (s.block_table.clone(), s.gdn_slot)
+            (s.block_table.clone(), self.turns.active.as_ref().expect("active").gdn_slot)
         };
         let page = self.pool.page;
         // 块表覆盖自保(⑦ propose 跑在 fp = pos+m+1 = 下轮 fed 位,先于
@@ -198,7 +198,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let act = self.turns.active.as_ref().expect("active 已保证");
             let s = self.bank.sessions.get_mut(act.session_id).expect("账在");
             let before = s.block_table.len();
-            self.bank.leg_target.ensure_for_len(&mut s.block_table, pos + 8)?;
+            self.bank.rel.leg.ensure_for_len(&mut s.block_table, pos + 8)?;
             if s.block_table.len() != before {
                 let sid = act.session_id;
                 self.write_bt(sid).await?;
@@ -207,7 +207,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let (bt_chain, _) = {
             let act = self.turns.active.as_ref().expect("active 已保证");
             let s = self.bank.sessions.get(act.session_id).expect("账在");
-            (s.block_table.clone(), s.gdn_slot)
+            (s.block_table.clone(), self.turns.active.as_ref().expect("active").gdn_slot)
         };
         if self.probes.dflash_probe {
             owl_shared::log_debug!("dflash-probe", "propose pos={pos} bt_len={} page={page}", bt_chain.len());
@@ -885,7 +885,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let (bt_chain, _) = {
             let act = self.turns.active.as_ref().expect("active 已保证");
             let s = self.bank.sessions.get(act.session_id).expect("账在");
-            (s.block_table.clone(), s.gdn_slot)
+            (s.block_table.clone(), self.turns.active.as_ref().expect("active").gdn_slot)
         };
         let kv_caches = self.pool.kv_caches();
         let kvs_step: Vec<KvBuffers> = {

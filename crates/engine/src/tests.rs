@@ -270,8 +270,12 @@ pub async fn gpu_schedule_decision_surface() {
         _ => panic!("期望 Step"),
     }
 
-    // GuardHit:账本截短两 token(模拟客户端续发同前缀 prompt),
-    // 同会话续发 → 增量起步 + 不重置 GDN
+    // **S2(§25.1①)后的同会话续发**:GuardHit 快路已删 —— 会话账**不再被信任**
+    // (turn 止即释放设备表),同会话也走**内容寻址**。
+    //
+    // 本场景**从不走完一个 turn**(手工驱动 `schedule`),故缓存里没有这条链
+    // ⇒ 内容寻址命中 0 块 ⇒ Fresh(重置 + 全量起步)。这正是新语义的判据:
+    // "有没有得复用"由**内容身份**说了算,不由会话账说了算。
     {
         let act = eng.turns.active.take().unwrap();
         let s = eng.bank.sessions.get_mut(act.session_id).unwrap();
@@ -282,12 +286,12 @@ pub async fn gpu_schedule_decision_surface() {
     match eng.schedule().unwrap() {
         SchedulerOutput::Step { begin, action } => {
             let b = begin.expect("续 turn 带 begin");
-            assert!(!b.reset_gdn, "GuardHit 不重置");
-            assert!(b.restore_key.is_none(), "GuardHit 非前缀缓存路径");
+            assert!(b.reset_gdn, "无整块可复用 ⇒ 重置(会话账不再是复用依据)");
+            assert!(b.restore_key.is_none(), "Fresh 无快照恢复");
             match action {
                 StepAction::Prefill { base, is_last, .. } => {
-                    assert_eq!(base, n - 2, "增量起步 = cached_len");
-                    assert!(is_last, "2 token 段一块即末块");
+                    assert_eq!(base, 0, "Fresh 全量起步");
+                    assert!(!is_last, "Fresh 首块 = prefill_chunk(4)≠ 全 prompt(10)");
                 }
                 _ => panic!("期望 Prefill"),
             }
@@ -346,6 +350,132 @@ pub async fn cpu_mock_offload_probe() {
     offload_probe_scenario(&mut running).await;
 }
 
+/// **S2 状态腿三层化场景(§25.2;face 无关:GPU 真卡档与 CPU mock 档共用)**。
+///
+/// 验的是**机制**:①快照账进 `StateStore`(设备/宿主分层)②设备槽满 ⇒ 冷快照
+/// **下沉宿主**(内容留,不是丢)③宿主层快照**回灌**回设备槽(层账跟着走)
+/// ④回灌后能正常 `restore_snap` 到会话格(回灌的字节一致性由 store 侧
+/// `snap_leg.rs` 的 CpuFace 门兜底;真机复用由 GPU 三门口兜底)。
+async fn state_leg_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>) {
+    // 跑一个 turn:页边界会拍快照(生成段足够长 ⇒ 跨多个 32 边界);
+    // snap_max=1 ⇒ churn ⇒ 冷的被挤到宿主。
+    // ⚠️ prompt 要短:CPU mock 档只吃单 prefill chunk(§18.5.1 的 dtype 缺口),
+    // 靠**decode 的页边界**出快照(与真机同一条路)。
+    let (_, tid) = running
+        .submit_session(Some(1), "状态腿三层化探针:第一段。", 80)
+        .expect("submit");
+    loop {
+        match running.pump().await.expect("pump") {
+            TurnEvent::Completed { turn, .. } if turn == tid => break,
+            TurnEvent::Failed { turn, err } => panic!("t{turn} 失败: {err}"),
+            TurnEvent::Idle => panic!("turn {tid} 队列丢失"),
+            _ => {}
+        }
+    }
+    let rep = running.store_report();
+    eprintln!(
+        "[s2] 轮 1 后:快照 设备 {:?} / 宿主 {:?}(条, 字节)· 设备槽 {}/{}",
+        rep.state.snap_gpu,
+        rep.state.snap_host,
+        running.pool.snap_used(),
+        running.pool.snap_capacity()
+    );
+    assert!(
+        rep.state.snap_gpu.0 + rep.state.snap_host.0 > 0,
+        "边界快照应进 store 的账(StateStore)"
+    );
+    assert!(
+        rep.state.snap_host.0 > 0,
+        "snap_max=1 + churn ⇒ 冷快照应**下沉宿主**(而不是被静默覆盖)"
+    );
+
+    // ② 宿主 → 设备回灌:找一条宿主层快照,就位到设备槽
+    let host_key = running
+        .bank
+        .rel
+        .state
+        .evict_candidates(&[])
+        .into_iter()
+        .filter_map(|c| c.snap)
+        .find(|k| running.bank.rel.state.locate(*k) == Some(owl_store::Tier::Host))
+        .expect("应有宿主层快照");
+    let slot = running.snap_ensure_resident(host_key).await.expect("回灌就位");
+    assert_eq!(
+        running.bank.rel.state.locate(host_key),
+        Some(owl_store::Tier::Gpu),
+        "回灌后层账应回设备"
+    );
+    assert_eq!(running.pool.snap_slot_of(host_key), Some(slot), "槽位索引应记上");
+
+    // ③ 回灌后的快照能正常恢复到会话格(D2D;不报错即通路成立)
+    let gdn_slot = 0usize;
+    let face = running.graphs.session.face_mut();
+    running
+        .pool
+        .restore_snap(face, gdn_slot, host_key, slot)
+        .await
+        .expect("恢复回灌后的快照");
+    let rep2 = running.store_report();
+    eprintln!(
+        "[s2] 回灌后:快照 设备 {:?} / 宿主 {:?}(条, 字节)· 宿主驻留 {}B",
+        rep2.state.snap_gpu,
+        rep2.state.snap_host,
+        running.bank.rel.snap_host_used()
+    );
+    assert_eq!(
+        rep2.state.snap_host.0 + rep2.state.snap_gpu.0,
+        rep.state.snap_host.0 + rep.state.snap_gpu.0,
+        "回灌只换层,不增删条目"
+    );
+}
+
+/// 状态腿三层化探针(自装载;按需开:`OWL_STATE_LEG_PROBE=1`)。
+/// 档位:snap_max=1(逼出 churn)+ 状态腿宿主分片 64MiB(0.8B 一条快照 ≈19.3MiB)。
+pub async fn gpu_08b_state_leg_probe() {
+    if !owl_shared::env_reader::flag("OWL_STATE_LEG_PROBE") {
+        eprintln!("skip: OWL_STATE_LEG_PROBE 未设(S2 状态腿探针按需开)");
+        return;
+    }
+    let Some(ordinal) = gpu_ordinal() else {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    };
+    let dir = asset_dir();
+    let mut engine = Engine::new(state_leg_probe_config(ordinal)).expect("构造");
+    let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
+    let mut running = engine.run(loaded).await.expect("装配");
+    state_leg_probe_scenario(&mut running).await;
+}
+
+/// 状态腿探针档(snap_max=1 + 状态腿宿主分片;池小 ⇒ 快照 churn 快)
+fn state_leg_probe_config(ordinal: usize) -> EngineConfig {
+    let mut knobs = EngineKnobs { sampler_enabled: false, ..Default::default() };
+    knobs.pool_tokens = Some(256);
+    knobs.host_cache_mb = 8;
+    knobs.snap_host_mb = 64;
+    knobs.snap_max = 1;
+    EngineConfig { device_ordinal: ordinal, max_seq_tokens: 256, prefill_chunk: 32, knobs }
+}
+
+/// **CPU mock 档的状态腿场景**(无卡):同一份机制断言跑在 `CpuFace` 上。
+pub async fn cpu_mock_state_leg_probe() {
+    if !owl_shared::env_reader::flag("OWL_CPU_MOCK")
+        || !owl_shared::env_reader::flag("OWL_STATE_LEG_PROBE")
+    {
+        eprintln!("skip: OWL_CPU_MOCK / OWL_STATE_LEG_PROBE 未设");
+        return;
+    }
+    let face = owl_cpu::CpuFace::mock(owl_cpu::MockLimits {
+        null_kernels: true,
+        graph_capture: true,
+        ..Default::default()
+    });
+    let mut engine = Engine::on(state_leg_probe_config(0), face).expect("构造(CPU mock)");
+    let loaded = engine.loader().load_qwen35_0_8b(&asset_dir()).await.expect("装载");
+    let mut running = engine.run(loaded).await.expect("装配");
+    state_leg_probe_scenario(&mut running).await;
+}
+
 /// 演示台旋钮(两档共用 —— 池/宿主/快照几何与 face 无关)。
 fn offload_probe_config(ordinal: usize) -> EngineConfig {
     let mut knobs = EngineKnobs { sampler_enabled: false, ..Default::default() };
@@ -390,7 +520,7 @@ async fn offload_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>)
     // 保洁按链把 A+B(各 3 块)整条沉到宿主(内容不丢,不是被同步驱逐掉)
     let _ = probe_run_turn(&mut *running, &long).await;
 
-    let rep = running.bank.leg_target.report();
+    let rep = running.bank.rel.leg.report();
     eprintln!(
         "[s3-3b] 轮 3 后:自由槽 {}/{} · 缓存 {} 块 · 宿主 {} 块 / {:.2}MiB · 换出 {} 次 {}KiB(drop {} / 兜底驱逐 {})",
         rep.slots_free,
@@ -415,7 +545,7 @@ async fn offload_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>)
         let mut diag = |tag: &str, p: &str| {
             let wrapped = running.tok.chat_wrap(p);
             let ids = running.tok.encode(&wrapped);
-            let hit = running.bank.leg_target.match_prefix(&ids).expect("match");
+            let hit = running.bank.rel.leg.match_prefix(&ids).expect("match");
             let rows: Vec<String> = hit
                 .hashes
                 .iter()
@@ -425,7 +555,14 @@ async fn offload_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>)
                     format!(
                         "{i}:{}|snap={}",
                         if s.is_some() { "dev" } else { "host" },
-                        if running.pool.has_snap(owl_store::SnapKey::at_boundary(*h)) {
+                        // S2:在场性查 **store 的层账**(设备/宿主都算)
+                        if running
+                            .bank
+                            .rel
+                            .state
+                            .locate(owl_store::SnapKey::at_boundary(*h))
+                            .is_some()
+                        {
                             "Y"
                         } else {
                             "N"
@@ -457,7 +594,7 @@ async fn offload_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>)
     let cold = cold_text.as_deref().expect("轮 1 冷启动基线在场");
     assert_eq!(text, cold, "门③:命中路径输出必须与冷启动逐字节一致");
 
-    let rep2 = running.bank.leg_target.report();
+    let rep2 = running.bank.rel.leg.report();
     eprintln!(
         "[s3-3b] 轮 4 后:宿主 {} 块 / {:.2}MiB · 换出 {} 块/{} 命令 · 回灌 {} 块/{} 命令 · 兜底驱逐 {}",
         rep2.host_blocks,
@@ -552,7 +689,7 @@ pub async fn gpu_08b_budget_probe() {
     snapshot("③run 后");
 
     // 池几何先**拷出来**(下面要 &mut running 跑 turn;借用不重叠)
-    let (nb, nb_kv, page, n_full, n_gdn, kv_fp8, gdn_slots, snap_slots, paged) = {
+    let (nb, nb_kv, page, n_full, n_gdn, kv_fp8, max_active_turns, snap_slots, paged) = {
         let pool = &running.pool;
         (
             pool.nb,
@@ -561,7 +698,7 @@ pub async fn gpu_08b_budget_probe() {
             pool.kvs.len(),
             pool.gdn_count(),
             pool.kv_fp8,
-            pool.gdn_slots,
+            pool.max_active_turns,
             pool.snap_capacity(),
             pool.paged,
         )
@@ -571,7 +708,7 @@ pub async fn gpu_08b_budget_probe() {
         (pool.block_bytes(), pool.gdn_row_bytes())
     };
     let kv_pool = (nb_kv * block_bytes) as u64;
-    let gdn_pool = (gdn_slots * gdn_row_bytes) as u64;
+    let gdn_pool = (max_active_turns * gdn_row_bytes) as u64;
     let (snap_pool, draft_pool) = {
         let pool = &running.pool;
         (pool.snapshot_pool_bytes() as u64, pool.draft_pool_bytes() as u64)
@@ -583,8 +720,8 @@ pub async fn gpu_08b_budget_probe() {
         .saturating_sub(kv_pool + gdn_pool + snap_pool + draft_pool);
 
     eprintln!(
-        "[budget] 池几何 nb={} nb_kv={} page={} n_full={} n_gdn={} kv_fp8={} gdn_slots={} snap_slots={} paged={}",
-        nb, nb_kv, page, n_full, n_gdn, kv_fp8, gdn_slots, snap_slots, paged
+        "[budget] 池几何 nb={} nb_kv={} page={} n_full={} n_gdn={} kv_fp8={} max_active_turns={} snap_slots={} paged={}",
+        nb, nb_kv, page, n_full, n_gdn, kv_fp8, max_active_turns, snap_slots, paged
     );
     eprintln!(
         "[budget] 导出 kv_bytes_per_token={kv_per_tok}B({}KiB) gdn_row={:.2}MiB gdn_pool={:.2}MiB snap_pool={:.2}MiB draft_pool={:.2}MiB",
@@ -969,7 +1106,13 @@ pub async fn gpu_longctx_4k_prefix_qa(shared: Option<&mut RunningEngine<owl_cuda
         eprintln!("[bench] t{t2} 全量回退重灌 + 生成 @ {:?}", t0b.elapsed());
         eprintln!("[test] t{t2} 答: {text2}");
         assert!(!text2.trim().is_empty(), "t{t2} 产出非空");
-        assert!(running.session_len(sid).unwrap_or(0) >= n_tok, "账本收口");
+        // **S2(§25.1①)**:turn 止后账本归到**块边界**(尾块随表释放)⇒
+        // `cached_len` 可比 prompt 少不到一页(≤31 tok),不是"账没收口"。
+        assert!(
+            running.session_len(sid).unwrap_or(0) + 32 > n_tok,
+            "账本收口(块对齐):{} vs prompt {n_tok}",
+            running.session_len(sid).unwrap_or(0)
+        );
     }
 }
 
@@ -1235,15 +1378,26 @@ pub async fn gpu_multi_session_isolation(shared: Option<&mut RunningEngine<owl_c
         }
     };
 
-    let (_, ta1) = running
-        .submit_session(Some(101), "我的代号是阿尔法。", 12)
-        .expect("A1");
+    // **S2(§25.1①)后的口径**:会话在 turn 止不持设备表 ⇒ "块链"这条判据
+    // 移到**内容身份面**(缓存里的链)。而缓存只收**整块**(32 tok)—— 故 A 的
+    // prompt 要够长(短 prompt 一个整块都没有,判据会退化成空集)。
+    let mut a_body = String::from("请记住下面的清单:");
+    let mut i = 0usize;
+    while running.tok.encode(&a_body).len() < 80 {
+        a_body.push_str(&format!("第{i}则:信号强度{i}级。"));
+        i += 1;
+    }
+    let a_prompt = format!("{a_body}我的代号是阿尔法。");
+    let (_, ta1) = running.submit_session(Some(101), a_prompt.as_str(), 12).expect("A1");
     let ta1_text = drive_turn(&mut *running, ta1).await;
     eprintln!("[test] A1: {ta1_text}");
     assert!(!ta1_text.trim().is_empty());
-    let a_table_1 = running.bank.sessions.get(101).expect("A 账在").block_table.clone();
     let a_len_1 = running.session_len(101).expect("A 账在");
-    assert!(!a_table_1.is_empty(), "A 块链非空");
+    assert!(a_len_1 > 0, "A 账本非空");
+    // 判据 = 内容身份面:A 的链在缓存里(≥1 整块),且 B 的 turn 不动它。
+    let a_tokens: Vec<u32> = running.tok.encode(&running.tok.chat_wrap(a_prompt.as_str()));
+    let a_hit_1 = running.bank.rel.leg.match_prefix(&a_tokens).expect("A 命中查询");
+    assert!(a_hit_1.matched_blocks >= 1, "A 的历史应进缓存(内容身份)");
 
     let (_, tb1) = running
         .submit_session(Some(202), "我的代号是贝塔。", 12)
@@ -1252,18 +1406,31 @@ pub async fn gpu_multi_session_isolation(shared: Option<&mut RunningEngine<owl_c
     eprintln!("[test] B1: {tb1_text}");
     assert!(!tb1_text.trim().is_empty());
 
-    // 隔离断言 ①:B 的 turn 后,A 的块链/账本逐字节不变
-    let a_table_2 = running.bank.sessions.get(101).expect("A 账在").block_table.clone();
-    assert_eq!(a_table_1, a_table_2, "B 的 turn 不得扰动 A 块链");
+    // 隔离断言 ①:B 的 turn 后,A 的**内容链**与账本都不变
+    let a_hit_2 = running.bank.rel.leg.match_prefix(&a_tokens).expect("A 命中查询");
+    assert_eq!(
+        a_hit_1.hashes, a_hit_2.hashes,
+        "B 的 turn 不得扰动 A 的内容链(身份逐块一致)"
+    );
     assert_eq!(running.session_len(101), Some(a_len_1), "B 的 turn 不得扰动 A 账本");
-    // 隔离断言 ②:物理块零共享(无前缀缓存 = 全新分配)
-    let b_table = running.bank.sessions.get(202).expect("B 账在").block_table.clone();
-    assert!(b_table.iter().all(|b| !a_table_2.contains(b)), "A/B 物理块互异");
-    eprintln!("[test] 块链 A = {a_table_2:?} / B = {b_table:?}");
+    // 隔离断言 ②:身份零串味(两段内容不同 ⇒ 链哈希不相交)
+    let b_tokens: Vec<u32> = running
+        .tok
+        .encode(&running.tok.chat_wrap("我的代号是贝塔。"));
+    let b_hit = running.bank.rel.leg.match_prefix(&b_tokens).expect("B 命中查询");
+    assert!(
+        b_hit.hashes.iter().all(|h| !a_hit_2.hashes.contains(h)),
+        "A/B 内容身份互异(链哈希不得相交)"
+    );
+    eprintln!(
+        "[test] 内容链 A = {:?}(命中 {})/ B 命中 {}",
+        a_hit_2.hashes, a_hit_2.matched_blocks, b_hit.matched_blocks
+    );
 
     // A 二轮(全量重发,前缀守卫失配回退全量也须稳)
+    let a2_prompt = format!("{a_prompt}我的代号是什么?");
     let (_, ta2) = running
-        .submit_session(Some(101), "我的代号是阿尔法。我的代号是什么?", 12)
+        .submit_session(Some(101), a2_prompt.as_str(), 12)
         .expect("A2");
     let ta2_text = drive_turn(&mut *running, ta2).await;
     eprintln!("[test] A2: {ta2_text}");
@@ -1367,16 +1534,27 @@ pub async fn gpu_prefix_cache_hit(shared: Option<&mut RunningEngine<owl_cuda::Gp
         a_ttft.unwrap()
     );
 
-    // 机械断言:chunk 数骤降 + 块链物理共享 + 账本各自收口
-    let a_chain = running.bank.sessions.get(101).expect("A").block_table.clone();
-    let b_chain = running.bank.sessions.get(202).expect("B").block_table.clone();
+    // 机械断言:chunk 数骤降 + **内容身份共享** + 缓存面在场
     assert!(
         b_prefill_chunks * 4 <= a_prefill_chunks.max(1),
         "B prefill chunk 数应 ≪ A:{b_prefill_chunks} vs {a_prefill_chunks}"
     );
-    let shared = a_chain.iter().filter(|b| b_chain.contains(b)).count();
-    assert!(shared >= 8, "前缀块应物理共享,共享 {shared}");
-    eprintln!("[test] 共享物理块 {shared}(A 链 {} / B 链 {})", a_chain.len(), b_chain.len());
+    // **S2(§25.1①)改判据**:会话在 turn 止**不持设备表**(历史 = 纯缓存)
+    // ⇒ "物理共享"不再能从会话表读出(`block_table` 此时是空的);改为判
+    // **内容身份共享**:同一份缓存块被两条链复用(这才是复用的真身)。
+    let a_ids = running.tok.encode(&running.tok.chat_wrap(prompt_a.as_str()));
+    let b_ids = running.tok.encode(&running.tok.chat_wrap(prompt_b.as_str()));
+    let hit_a = running.bank.rel.leg.match_prefix(&a_ids).expect("A 命中查询");
+    let hit_b = running.bank.rel.leg.match_prefix(&b_ids).expect("B 命中查询");
+    let shared = hit_b.hashes.iter().filter(|h| hit_a.hashes.contains(h)).count();
+    assert!(shared >= 8, "前缀块应**内容身份**共享,共享 {shared}");
+    assert!(hit_b.matched_blocks >= 8, "B 应命中 ≥8 块,得 {}", hit_b.matched_blocks);
+    let rep = running.bank.rel.leg.report();
+    assert!(rep.cached_blocks >= 8, "缓存面应有 ≥8 条目,得 {}", rep.cached_blocks);
+    eprintln!(
+        "[test] 共享内容块 {shared}(A 命中 {} / B 命中 {} · 缓存 {} 条)",
+        hit_a.matched_blocks, hit_b.matched_blocks, rep.cached_blocks
+    );
 }
 
 /// GPU 门控:27B 单卡推理验收(正菜;3090 Ti 24G)—— 真实三问 ×
@@ -1702,7 +1880,7 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
         async fn boot_gate_engine(ordinal: usize, dir: &str) -> RunningEngine<owl_cuda::GpuClient> {
             let mut knobs = EngineKnobs { sampler_enabled: false, ..Default::default() };
             // 24G 贴顶三旋钮(单会话门不需要多格/多快照/前缀缓存)
-            knobs.gdn_slots = 1;
+            knobs.max_active_turns = 1;
             knobs.snap_max = 1;
             knobs.prefix_cache = false;
             // 草稿档一律按投机配置 boot;baseline 轮靠运行时 spec_depth=0 回落
@@ -1807,7 +1985,7 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
             max_new: usize,
         ) -> RunningEngine<owl_cuda::GpuClient> {
             let mut knobs = EngineKnobs { sampler_enabled: false, ..Default::default() };
-            knobs.gdn_slots = 1;
+            knobs.max_active_turns = 1;
             knobs.snap_max = 1;
             knobs.prefix_cache = false;
             // 草稿档一律按**投机**配置 boot(深度 + verify 捕获档);
@@ -2010,7 +2188,7 @@ async fn drive_turn<D: DeviceClient>(running: &mut RunningEngine<D>, id: u64) ->
 /// 当年"45 tok/s"是朴素口径虚高)。门控 OWL_AWQ27B_DIR + OWL_TEST_DEVICE。
 ///
 /// 泄漏案探针(2026-10-10 深夜;slot≥1 崩塌案首刀):
-/// GDN_SLOTS=2 下,turn(slot0) 前后对比 slot1 状态区指纹 ——
+/// MAX_ACTIVE_TURNS=2 下,turn(slot0) 前后对比 slot1 状态区指纹 ——
 /// slot1 变 = 跨 slot 写实锤;不变 = 病在 slot1 核索引/复用路径。
 /// 附:reset_gdn(slot1) 后回读验零(reset 生效性直接判)。
 /// 门控 OWL_TEST_DEVICE。诊断打印,不做硬断言(判决先看数)。
@@ -2019,7 +2197,7 @@ pub async fn gpu_gdn_slot_cross_probe() {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
     };
-    let mut knobs = EngineKnobs { gdn_slots: 2, ..Default::default() };
+    let mut knobs = EngineKnobs { max_active_turns: 2, ..Default::default() };
     knobs.prefix_cache = false;
     let mut engine = Engine::new(EngineConfig {
         device_ordinal: ordinal,
@@ -2069,7 +2247,7 @@ pub async fn gpu_decode_marginal_bench() {
     // 口径与恒等门一致(greedy 单会话三旋钮,显式 knobs)
     async fn gen(ordinal: usize, dir: &str, max_new: usize) -> (f64, usize) {
         let mut knobs = EngineKnobs { sampler_enabled: false, ..Default::default() };
-        knobs.gdn_slots = 1;
+        knobs.max_active_turns = 1;
         knobs.snap_max = 1;
         knobs.prefix_cache = false;
         let mut engine = Engine::new(EngineConfig {

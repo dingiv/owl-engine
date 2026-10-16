@@ -477,7 +477,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let (bt_chain, gdn_slot_v) = {
             let act = self.turns.active.as_ref().expect("active 已保证");
             let s = self.bank.sessions.get(act.session_id).expect("账在");
-            (s.block_table.clone(), s.gdn_slot)
+            (s.block_table.clone(), self.turns.active.as_ref().expect("active").gdn_slot)
         };
         // ── prefill 桶图命中(M2b;设计 §4–§6)──
         // 命中 ⇒ 槽写(真行真值 + 假行 dump 页)+ 1 条 graph_launch + 出图尾;
@@ -718,10 +718,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             if pf_state_check {
                 for (j, g) in gdn_leaves.iter().enumerate() {
                     for (sn, buf, nb) in [
-                        ("convq", &g.conv_q, self.pool.gdn_slots * d.nk * d.hk * 3),
-                        ("convk", &g.conv_k, self.pool.gdn_slots * d.nv * d.hv * 3),
-                        ("convv", &g.conv_v, self.pool.gdn_slots * d.nv * d.hv * 3),
-                        ("rec", &g.rec, self.pool.gdn_slots * d.nv * d.hk * d.hv),
+                        ("convq", &g.conv_q, self.pool.max_active_turns * d.nk * d.hk * 3),
+                        ("convk", &g.conv_k, self.pool.max_active_turns * d.nv * d.hv * 3),
+                        ("convv", &g.conv_v, self.pool.max_active_turns * d.nv * d.hv * 3),
+                        ("rec", &g.rec, self.pool.max_active_turns * d.nv * d.hk * d.hv),
                     ] {
                         let mut sb = vec![0u8; nb * 4];
                         {
@@ -787,10 +787,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             if pf_state_check {
                 for (j, g) in gdn_leaves.iter().enumerate() {
                     for (sn, buf, nb) in [
-                        ("convq", &g.conv_q, self.pool.gdn_slots * d.nk * d.hk * 3),
-                        ("convk", &g.conv_k, self.pool.gdn_slots * d.nv * d.hv * 3),
-                        ("convv", &g.conv_v, self.pool.gdn_slots * d.nv * d.hv * 3),
-                        ("rec", &g.rec, self.pool.gdn_slots * d.nv * d.hk * d.hv),
+                        ("convq", &g.conv_q, self.pool.max_active_turns * d.nk * d.hk * 3),
+                        ("convk", &g.conv_k, self.pool.max_active_turns * d.nv * d.hv * 3),
+                        ("convv", &g.conv_v, self.pool.max_active_turns * d.nv * d.hv * 3),
+                        ("rec", &g.rec, self.pool.max_active_turns * d.nv * d.hk * d.hv),
                     ] {
                         let mut sb = vec![0u8; nb * 4];
                         {

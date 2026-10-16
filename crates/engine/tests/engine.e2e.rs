@@ -108,8 +108,9 @@ async fn e2e_body() {
     }
     let dev = dev.unwrap_or(0);
     if cpu_only {
-        eprintln!("[e2e] 无卡档(OWL_CPU_MOCK):只跑 CPU mock 场景 —— store 演示台三门口");
+        eprintln!("[e2e] 无卡档(OWL_CPU_MOCK):只跑 CPU mock 场景 —— store 演示台三门口 + S2 状态腿");
         run!(cpu_mock_offload_probe);
+        run!(cpu_mock_state_leg_probe);
         eprintln!("[e2e] 无卡档完成,用时 {:.1}s", std::time::Instant::now().elapsed().as_secs_f32());
         return;
     }
@@ -149,6 +150,9 @@ async fn e2e_body() {
     // ── S0 预算实测(自装载;按需开:`OWL_BUDGET_PROBE=1`) ──
     run!(gpu_08b_budget_probe);
 
+    // ── S2 状态腿三层化(自装载;按需开:`OWL_STATE_LEG_PROBE=1`) ──
+    run!(gpu_08b_state_leg_probe);
+
     // ── piecewise 段驱动件(不装模型;纯 GraphPlan 面) ──
     run!(gpu_piecewise_segments);
 
@@ -156,6 +160,7 @@ async fn e2e_body() {
     run!(gpu_schedule_decision_surface); // max_seq=64/chunk=4(切块敏感)
     // §18 CPU mock 档:同一套 store 三门口跑在 CpuFace 上(无卡;OWL_CPU_MOCK 门控)
     run!(cpu_mock_offload_probe);
+    run!(cpu_mock_state_leg_probe);
     run!(gpu_gdn_slot_cross_probe);   // gdn_slots=2 + prefix_cache=false
     run!(gpu_08b_fuse_text_parity);   // greedy + fused_decode 臂
     run!(gpu_longctx_fi_direct_gate); // fp8 池 × {FI 直读, 自研读核}(自装载两回)

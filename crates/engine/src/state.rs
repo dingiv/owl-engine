@@ -1,6 +1,6 @@
 //! 设备状态块池(StatePool;2026-10-01 engine.rs 拆分立)。
 //!
-//! 引擎全部设备侧状态块的**治理对象**:KV paged 池(kvs)/ GDN 状态格
+//! 引擎全部设备侧状态块的**治理对象**:KV paged 池(kvs)/ GDN 行
 //! (gdns)/ GDN 快照池(snaps)/ 持久块表(bt)+ 池几何(page/nb/
 //! paged/x/dims)。职责 = 分配([`StatePool::alloc`])+ 叶子句柄发放
 //! (kv_caches/gdn_caches/bt_leaf)+ 状态治理(reset_gdn/capture_snap/
@@ -27,22 +27,51 @@ pub(crate) type BlockN = (Bytes, usize); // (块句柄, 元素数;重置分块�
 
 
 
-/// GDN 状态格容量(**与会话数绑定,与 max_seq_tokens 解耦**)。
+/// GDN 行容量(**与会话数绑定,与 max_seq_tokens 解耦**)。
 /// 格语义 = 每会话一格(SessionTable 分配/释放);按位分配是历史包袱:
 /// s=4096 时 rec(1 MiB/格/层 × 18 层)将达 72 GB,而真实需求 = 格数。
 /// 8 = 覆盖需求并发上限(§二 并发 ≤8);会话 close 即释放格号。
-/// 槽数 = EngineKnobs.gdn_slots(显式传入;原 OWL_GDN_SLOTS,缺省 8)。
+/// 槽数 = EngineKnobs.max_active_turns(显式传入;原 OWL_MAX_ACTIVE_TURNS,缺省 8)。
 ///
 /// GDN 快照槽(E2c):key = [`SnapKey`](**边界块的内容身份**;逐块父链哈希,
 /// `owl_store::ChainCursor`)。为什么不是物理块号:物理块号是会被回收复用的
 /// 槽号 ⇒ 旧键会命中别人的状态(静默错值;store 卷 §9.1)。键类型来自 store
 /// ⇒ **物理槽号在类型上就进不了快照键**。
-/// bufs = 逐层逐块行宽副本(与 gdns 同序同构,行宽 = elems / GDN_SLOTS)。
+/// bufs = 逐层逐块行宽副本(与 gdns 同序同构,行宽 = elems / MAX_ACTIVE_TURNS)。
 /// 池静态预分配,驱逐 = 换 key 覆盖写(零 alloc/free 往返)。
-pub(crate) struct GdnSnapSlot {
-    key: Option<SnapKey>,
-    last_use: u64,
+/// **快照池(S2 三层化;§25.2)**:矩阵化 —— 每 (层,quad) **一条**缓冲,
+/// 长 = `snap_max × 行宽` ⇒ 一条快照 = 一个"槽"(片 = 逐 (层,quad) 的行宽,
+/// 与 KV 腿的 `PoolLayout` 同构 ⇒ 直接套 store 的 swap 机制)。
+///
+/// **账的真源在 store 的 `StateStore`**(key → 层/字节/新鲜度);本池只做
+/// 设备物理与**槽位索引**(槽 → key)。所以 `last_use` 仍在本池(设备槽的
+/// 替换序是设备面的事),而"内容还在不在(设备/宿主)"归 store。
+/// 槽位选择结果(纯判定;执行在 engine —— store 出账、face 搬运)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SnapSlotPick {
+    /// 同一张快照已在设备(原地覆盖/直接恢复)。
+    Hit(u32),
+    /// 空槽。
+    Free(u32),
+    /// 需替换:最冷的设备快照(槽, 它的 key)。
+    Victim(u32, SnapKey),
+}
+
+/// spec 快照缓冲(E5-M2;独立池,**不参与 LRU** —— 恢复后仍有效)。
+/// 序 = 层 × 4(conv_q/k/v/rec),与 capture/restore 同构。
+pub(crate) struct SpecSnapBuf {
+    pub(crate) bufs: Vec<BlockN>,
+}
+
+pub(crate) struct GdnSnapPool {
+    /// 逐 (层,quad) 的池矩阵(与 `gdns` 同序同构)。
     bufs: Vec<BlockN>,
+    /// 槽 → key(`None` = 空槽)。
+    keys: Vec<Option<SnapKey>>,
+    /// 槽新鲜度(设备槽替换序)。
+    last_use: Vec<u64>,
+    /// 每槽每片字节(= 行宽;`attach` 后由布局定谳)。
+    row_bytes: Vec<usize>,
 }
 
 pub(crate) struct KvBlocks {
@@ -89,7 +118,7 @@ pub(crate) struct GdnLeaf {
     pub(crate) rec: TensorOps,
 }
 
-/// 设备状态块池(KV paged 池 / GDN 状态格 / 快照池 / 持久块表)。
+/// 设备状态块池(KV paged 池 / GDN 行 / 快照池 / 持久块表)。
 /// 治理对象(charter A1 味):S2 图档与执行器只经方法面触碰状态块,
 /// 不直摸块句柄。
 /// 池装配计划(engine run 从 knobs/spec_mode 派生;显式依赖律的
@@ -119,8 +148,8 @@ pub(crate) struct PoolPlan {
     pub xqa_decode: bool,
     /// **XQA prefill 臂**(chunked q=T;同一份 `M_TILESIZE=32` 实例化)
     pub xqa_prefill: bool,
-    /// GDN 状态格容量
-    pub gdn_slots: usize,
+    /// GDN 行容量
+    pub max_active_turns: usize,
     /// spec 快照池深度
     pub snap_max: usize,
     /// VRAM 预算目标占比(0 = 治理禁用)
@@ -138,8 +167,8 @@ pub(crate) struct PoolPlan {
 }
 
 pub(crate) struct StatePool {
-    /// GDN 状态格容量(knobs.gdn_slots,boot 定谳;原自由函数 gdn_slots())
-    pub(crate) gdn_slots: usize,
+    /// GDN 行容量(knobs.max_active_turns,boot 定谳;原自由函数 max_active_turns())
+    pub(crate) max_active_turns: usize,
     /// GDN 画像 dump 全槽(knobs.gdn_dump_all)
     #[allow(dead_code)] // 诊断面字段(写入后当前无读者)
     pub(crate) dump_all: bool,
@@ -153,7 +182,7 @@ pub(crate) struct StatePool {
     pub(crate) kv_fp8: bool,
     pub(crate) dflash_fp8: bool,
     gdns: Vec<GdnBlocks>,
-    snaps: Vec<GdnSnapSlot>,
+    snaps: GdnSnapPool,
     snap_tick: u64,
     bt: Bytes,
     /// v2 分页 decode scratch(E-decode 2026-10-04;paged 时恒分配,
@@ -168,7 +197,7 @@ pub(crate) struct StatePool {
     pub(crate) xqa: Option<owl_models::module::XqaVerifyCtx>,
     /// spec 快照(E5-M2:投机轮回滚缓冲;OWL_SPEC_DEPTH>0 时分配,
     /// 内容 = 轮首 GDN 态 state@B-1;restore 后仍有效,全接受后失效重拍)
-    pub(crate) spec_snap: Option<GdnSnapSlot>,
+    pub(crate) spec_snap: Option<SpecSnapBuf>,
     /// MTP 草稿链 KV 池(E5-M2b;独立页池,1 层;mtp 模式分配)
     pub(crate) mtp_kvs: Option<KvBlocks>,
     /// DFlash2 草稿 KV 池(E5-DF2;独立页池,5 层草稿几何 8/128)
@@ -304,8 +333,8 @@ impl StatePool {
 
     /// **GDN 行字节 / 每活跃 turn**(`owl_store::BudgetInputs::gdn_row_bytes` 真源)。
     ///
-    /// 口径:每层四件(conv_q/conv_k/conv_v/rec)的分配宽 = `gdn_slots × 单槽宽`
-    /// (`StatePool::alloc` 里显式乘过)⇒ **行字节 = 池总字节 ÷ gdn_slots**。
+    /// 口径:每层四件(conv_q/conv_k/conv_v/rec)的分配宽 = `max_active_turns × 单槽宽`
+    /// (`StatePool::alloc` 里显式乘过)⇒ **行字节 = 池总字节 ÷ max_active_turns**。
     /// 读真分配,不按公式重算(0.8B 档实测:18 层 × 1.07MiB ≈ 19.3MiB/行)。
     pub(crate) fn gdn_row_bytes(&self) -> usize {
         let pool: usize = self
@@ -315,15 +344,16 @@ impl StatePool {
                 (g.conv_q.1 + g.conv_k.1 + g.conv_v.1 + g.rec.1) * elem_bytes(g.rec.0.dtype)
             })
             .sum();
-        pool / self.gdn_slots.max(1)
+        pool / self.max_active_turns.max(1)
     }
 
     /// **快照池字节**(E2c 静态预分配;固定面的一项,含 spec 快照缓冲)。
     pub(crate) fn snapshot_pool_bytes(&self) -> usize {
         let pool: usize = self
             .snaps
+            .bufs
             .iter()
-            .map(|s| s.bufs.iter().map(|b| b.1 * elem_bytes(b.0.dtype)).sum::<usize>())
+            .map(|b| b.1 * elem_bytes(b.0.dtype))
             .sum();
         let spec = self
             .spec_snap
@@ -365,7 +395,7 @@ impl StatePool {
         let spec = plan.spec_mode != crate::spec_runtime::SpecMode::Off;
         let mtp = plan.spec_mode == crate::spec_runtime::SpecMode::Mtp;
         let dflash = plan.spec_mode == crate::spec_runtime::SpecMode::DFlash2;
-        let gdn_slots = plan.gdn_slots;
+        let max_active_turns = plan.max_active_turns;
         let snap_max = plan.snap_max;
         let dump_all = plan.dump_all;
         let gdn_dbg = plan.gdn_dbg;
@@ -385,7 +415,7 @@ impl StatePool {
             + if dflash { 5 * 2 * 8 * 128 * 2 } else { 0 }; // 草稿池按 token 线性(页取整后略同)
         // 治理器之后的固定分配(GDN 格/快照 f32 同式;图 slab + ctx + 杂项 flat)
         let gdn_slot_elems = dims.nk * dims.hk * 3 + dims.nv * dims.hv * 3 + dims.nv * dims.hk * dims.hv;
-        let fixed_after = n_gdn * gdn_slots * gdn_slot_elems * 4
+        let fixed_after = n_gdn * max_active_turns * gdn_slot_elems * 4
             + snap_max * n_gdn * gdn_slot_elems * 4
             + (400 << 20); // 图 slab + CUDA ctx + warmup 瞬态 + 杂项
         let vram_reserve = plan.vram_reserve_mb << 20;
@@ -614,24 +644,32 @@ impl StatePool {
         };
         let mut gdns: Vec<GdnBlocks> = Vec::new();
         for _ in 0..n_gdn {
-            let conv_q = zero_block(face, gdn_slots * dims.nk * dims.hk * 3, "gdn.conv_q").await?;
-            let conv_k = zero_block(face, gdn_slots * dims.nv * dims.hv * 3, "gdn.conv_k").await?;
-            let conv_v = zero_block(face, gdn_slots * dims.nv * dims.hv * 3, "gdn.conv_v").await?;
-            let rec = zero_block(face, gdn_slots * dims.nv * dims.hk * dims.hv, "gdn.recurrence").await?;
+            let conv_q = zero_block(face, max_active_turns * dims.nk * dims.hk * 3, "gdn.conv_q").await?;
+            let conv_k = zero_block(face, max_active_turns * dims.nv * dims.hv * 3, "gdn.conv_k").await?;
+            let conv_v = zero_block(face, max_active_turns * dims.nv * dims.hv * 3, "gdn.conv_v").await?;
+            let rec = zero_block(face, max_active_turns * dims.nv * dims.hk * dims.hv, "gdn.recurrence").await?;
             gdns.push(GdnBlocks { conv_q, conv_k, conv_v, rec });
         }
-        // GDN 快照池(E2c):行宽副本 × SNAP_MAX 份;仅 paged 形态
-        let mut snaps: Vec<GdnSnapSlot> = Vec::new();
+        // GDN 快照池(E2c;S2 矩阵化):每 (层,quad) 一条 `snap_max × 行宽`
+        // 缓冲 ⇒ 一条快照 = 一个槽(片 = 行宽)。仅 paged 形态。
+        let mut snaps = GdnSnapPool {
+            bufs: Vec::new(),
+            keys: vec![None; snap_max],
+            last_use: vec![0; snap_max],
+            row_bytes: Vec::new(),
+        };
         if paged {
-            for _ in 0..snap_max {
-                let mut bufs: Vec<BlockN> = Vec::new();
-                for _ in 0..n_gdn {
-                    bufs.push(zero_block(face, dims.nk * dims.hk * 3, "gdn.slot.conv_q").await?);
-                    bufs.push(zero_block(face, dims.nv * dims.hv * 3, "gdn.slot.conv_k").await?);
-                    bufs.push(zero_block(face, dims.nv * dims.hv * 3, "gdn.slot.conv_v").await?);
-                    bufs.push(zero_block(face, dims.nv * dims.hk * dims.hv, "gdn.slot.rec").await?);
+            for _ in 0..n_gdn {
+                for (elems, name) in [
+                    (dims.nk * dims.hk * 3, "gdn.slot.conv_q"),
+                    (dims.nv * dims.hv * 3, "gdn.slot.conv_k"),
+                    (dims.nv * dims.hv * 3, "gdn.slot.conv_v"),
+                    (dims.nv * dims.hk * dims.hv, "gdn.slot.rec"),
+                ] {
+                    let b = zero_block(face, elems * snap_max, name).await?;
+                    snaps.row_bytes.push(elems * elem_bytes(b.0.dtype));
+                    snaps.bufs.push(b);
                 }
-                snaps.push(GdnSnapSlot { key: None, last_use: 0, bufs });
             }
         }
         // 池 dtype 标签随实报(原硬写 "kv f16" 在 fp8 档说谎 —— 2026-10-13)
@@ -657,11 +695,11 @@ impl StatePool {
                 bufs.push(zero_block(face, dims.nv * dims.hv * 3, "gdn.ring.conv_v").await?);
                 bufs.push(zero_block(face, dims.nv * dims.hk * dims.hv, "gdn.ring.rec").await?);
             }
-            Some(GdnSnapSlot { key: None, last_use: 0, bufs })
+            Some(SpecSnapBuf { bufs })
         } else {
             None
         };
-        Ok(StatePool { gdn_slots, dump_all, gdn_dbg, kvs, fi_face, fi_tables, gdn_tables, verify_attn_v2, xqa,
+        Ok(StatePool { max_active_turns, dump_all, gdn_dbg, kvs, fi_face, fi_tables, gdn_tables, verify_attn_v2, xqa,
             kv_fp8, dflash_fp8, gdns, snaps, snap_tick: 0, bt, bt_mtp, spec_snap, mtp_kvs, dflash_kvs, attn_v2, page, nb, nb_kv, dump_page, paged, x, dims })
     }
 
@@ -953,7 +991,7 @@ impl StatePool {
         step: u64,
         verbose: bool,
     ) -> Result<String> {
-        let row = bn.1 / self.gdn_slots;
+        let row = bn.1 / self.max_active_turns;
         let mut buf = vec![0u8; bn.1 * 4];
         face.dtoh(&bn.0, &mut buf).await?;
         let floats: Vec<f32> = buf[gdn_slot * row * 4..(gdn_slot + 1) * row * 4]
@@ -977,10 +1015,10 @@ impl StatePool {
         self.gdns
             .iter()
             .map(|g| GdnLeaf {
-                conv_q: block_leaf(&g.conv_q.0, vec![self.gdn_slots, d.nk * d.hk, 3]),
-                conv_k: block_leaf(&g.conv_k.0, vec![self.gdn_slots, d.nv * d.hv, 3]),
-                conv_v: block_leaf(&g.conv_v.0, vec![self.gdn_slots, d.nv * d.hv, 3]),
-                rec: block_leaf(&g.rec.0, vec![self.gdn_slots, d.nv, d.hk, d.hv]),
+                conv_q: block_leaf(&g.conv_q.0, vec![self.max_active_turns, d.nk * d.hk, 3]),
+                conv_k: block_leaf(&g.conv_k.0, vec![self.max_active_turns, d.nv * d.hv, 3]),
+                conv_v: block_leaf(&g.conv_v.0, vec![self.max_active_turns, d.nv * d.hv, 3]),
+                rec: block_leaf(&g.rec.0, vec![self.max_active_turns, d.nv, d.hk, d.hv]),
             })
             .collect()
     }
@@ -1004,16 +1042,92 @@ impl StatePool {
     /// 快照池容量(`snap_max`;0 = 快照面整体关闭 —— 调用方须跳过 capture,
     /// 否则 `capture_snap` 会因池空而报错,见 agent 专项 A2)
     pub(crate) fn snap_capacity(&self) -> usize {
-        self.snaps.len()
+        self.snaps.keys.len()
     }
 
-    /// 快照池已用槽数(诊断/报告面:在场多少张边界快照)。
+    /// 快照池已用槽数(诊断/报告面:设备上在场多少张边界快照)。
     pub(crate) fn snap_used(&self) -> usize {
-        self.snaps.iter().filter(|s| s.key.is_some()).count()
+        self.snaps.keys.iter().filter(|k| k.is_some()).count()
     }
 
-    pub(crate) fn has_snap(&self, key: SnapKey) -> bool {
-        self.snaps.iter().any(|s| s.key == Some(key))
+
+    /// 快照在设备槽上的位置(`None` = 不在设备层)。
+    pub(crate) fn snap_slot_of(&self, key: SnapKey) -> Option<u32> {
+        self.snaps
+            .keys
+            .iter()
+            .position(|k| *k == Some(key))
+            .map(|i| i as u32)
+    }
+
+    /// **槽位选择**(纯;S2 §25.2):同 key 已在设备 ⇒ 原地;否则空槽;
+    /// 否则**最冷的设备快照**(调用方决定下沉还是丢)。池关闭 ⇒ `None`。
+    pub(crate) fn snap_pick_slot(&self, key: SnapKey) -> Option<SnapSlotPick> {
+        if self.snaps.keys.is_empty() {
+            return None;
+        }
+        if let Some(i) = self.snaps.keys.iter().position(|k| *k == Some(key)) {
+            return Some(SnapSlotPick::Hit(i as u32));
+        }
+        if let Some(i) = self.snaps.keys.iter().position(|k| k.is_none()) {
+            return Some(SnapSlotPick::Free(i as u32));
+        }
+        let (i, _) = self
+            .snaps
+            .last_use
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, t)| **t)?;
+        Some(SnapSlotPick::Victim(i as u32, self.snaps.keys[i]?))
+    }
+
+    /// 片规格(逐 (层,quad);槽内偏移由 store 的 `plan_snap_*` 按
+    /// `dev_off = 槽 × 行宽` 算 —— 布局本身与槽无关)。
+    pub(crate) fn snap_pieces_at(&self, _slot: u32) -> Vec<owl_store::PieceSpec> {
+        self.snaps
+            .bufs
+            .iter()
+            .zip(&self.snaps.row_bytes)
+            .map(|(b, rb)| owl_store::PieceSpec {
+                buf: b.0.clone(),
+                stride_bytes: *rb,
+            })
+            .collect()
+    }
+
+    /// **状态腿设备布局**(boot 注册给 store;§25.2):快照 = 一种"块"
+    /// (槽 × 片),片 = 每 (层,quad) 一行宽。
+    pub(crate) fn snap_pool_layout(&self, epoch: u64) -> owl_store::PoolLayout {
+        owl_store::PoolLayout {
+            class: owl_store::BlockClass::GdnRow,
+            epoch,
+            pieces: self.snap_pieces_at(0),
+        }
+    }
+
+    /// 一条快照的字节(Σ 行宽;布局真源)。
+    pub(crate) fn snap_bytes(&self) -> usize {
+        self.snaps.row_bytes.iter().sum()
+    }
+
+    /// 标记槽上放的是哪张快照(拍摄/回灌落位后)。
+    pub(crate) fn snap_place(&mut self, slot: u32, key: SnapKey) {
+        self.snap_tick += 1;
+        let tick = self.snap_tick;
+        let i = slot as usize;
+        if i < self.snaps.keys.len() {
+            self.snaps.keys[i] = Some(key);
+            self.snaps.last_use[i] = tick;
+        }
+    }
+
+    /// 清槽(快照下沉到宿主后:设备缓冲空出来了)。
+    pub(crate) fn snap_clear_slot(&mut self, slot: u32) {
+        let i = slot as usize;
+        if i < self.snaps.keys.len() {
+            self.snaps.keys[i] = None;
+            self.snaps.last_use[i] = 0;
+        }
     }
 
     /// GDN 状态重置(turn-open;新序列零态语义)。按格重置(offset =
@@ -1034,7 +1148,7 @@ impl StatePool {
                 (&g.rec.0, g.rec.1),
             ];
             for (bn, elems) in blocks {
-                let row = elems / self.gdn_slots;
+                let row = elems / self.max_active_turns;
                 face.memset_zero_at(bn, gdn_slot * row * 4, row * 4).await?;
             }
         }
@@ -1042,7 +1156,7 @@ impl StatePool {
         // 临时诊断(§三十二 会话污染定位;[probes] gdn_dbg 启用,收口后删)
         if self.gdn_dbg {
             let g = &self.gdns[0];
-            let row_elems = g.rec.1 / self.gdn_slots;
+            let row_elems = g.rec.1 / self.max_active_turns;
             let mut buf = vec![0u8; g.rec.1 * 4];
             face.dtoh(&g.rec.0, &mut buf).await?;
             let seg = &buf[gdn_slot * row_elems * 4..(gdn_slot + 1) * row_elems * 4];
@@ -1071,7 +1185,7 @@ impl StatePool {
                 (&g.conv_v.0, g.conv_v.1),
                 (&g.rec.0, g.rec.1),
             ] {
-                let row = elems / self.gdn_slots;
+                let row = elems / self.max_active_turns;
                 let mut buf = vec![0u8; elems * 4]; // 整块回读(f32)
                 face.dtoh(bn, &mut buf).await?;
                 let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -1102,7 +1216,7 @@ impl StatePool {
                 (&g.conv_v.0, g.conv_v.1),
                 (&g.rec.0, g.rec.1),
             ] {
-                let row = elems / self.gdn_slots;
+                let row = elems / self.max_active_turns;
                 let mut buf = vec![0u8; elems * 4]; // 整块回读(f32)
                 face.dtoh(bn, &mut buf).await?;
                 nonzero += buf[slot * row * 4..(slot + 1) * row * 4]
@@ -1114,39 +1228,33 @@ impl StatePool {
         Ok(nonzero)
     }
 
+    /// `slot` = 已选好的设备槽(`None` = 池关 ⇒ 结构性拒);槽由 engine 选
+    /// (`snap_pick_slot`:原地 / 空槽 / 最冷下沉)。
     pub(crate) async fn capture_snap<D: DeviceClient>(
         &mut self,
         face: &mut D,
         gdn_slot: usize,
         key: SnapKey,
+        slot: Option<u32>,
     ) -> Result<()> {
         // 池空(snap_max = 0)不再是 panic(原 `expect("池非空")` 会炸掉整个
         // owl-engine 线程 → 客户端收 503):退化为**结构化错误** —— 调用方
         // (`capture_gdn_snap`)已按 snap_capacity() 先行跳过,故此处只作兜底
         // (agent 专项 A2,2026-10-14)。
-        let idx = match self.snaps.iter().position(|s| s.key == Some(key)) {
-            Some(i) => i,
-            None => {
-                let free = self.snaps.iter().position(|s| s.key.is_none());
-                let lru = self
-                    .snaps
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, s)| s.last_use)
-                    .map(|(i, _)| i);
-                match free.or(lru) {
-                    Some(i) => i,
-                    None => {
-                        return Err(ModelError::Msg(
-                            "GDN 快照池为空(snap_max = 0):调用方应跳过 capture \u{2014}\u{2014} \
-                             见 roadmap.local/agent-服务面-剩余工作项 A2"
-                                .into(),
-                        ))
-                    }
-                }
-            }
+        // 槽位由调用方选好(engine:空槽 / 最冷下沉 / 原地覆盖)—— 见
+        // `snap_pick_slot`;此处只认已定的槽(池关 = 结构性拒)。
+        let Some(slot) = slot else {
+            return Err(ModelError::Msg(
+                "GDN 快照池为空(snap_max = 0):调用方应跳过 capture \u{2014}\u{2014} \
+                 见 roadmap.local/agent-服务面-剩余工作项 A2"
+                    .into(),
+            ));
         };
-        self.snap_tick += 1;
+        let idx = slot as usize;
+        // **P1(§20-A2)**:一条 `copy_batch` 搬完(逐片 await = 0.8B 72 次 /
+        // 27B 192 次 actor 往返 ⇒ 一次命令;与 `capture_spec_snap` 同构)。
+        let mut copies: Vec<(owl_iface::contract::Bytes, usize, owl_iface::contract::Bytes, usize, usize)> =
+            Vec::with_capacity(self.gdns.len() * 4);
         for (li, g) in self.gdns.iter().enumerate() {
             let quads = [
                 (&g.conv_q.0, g.conv_q.1),
@@ -1155,32 +1263,37 @@ impl StatePool {
                 (&g.rec.0, g.rec.1),
             ];
             for (j, (src, elems)) in quads.iter().enumerate() {
-                let row = elems / self.gdn_slots;
-                let dst = &self.snaps[idx].bufs[li * 4 + j];
-                face.copy_block_at(src, gdn_slot * row * 4, &dst.0, 0, row * 4).await?;
+                let row = elems / self.max_active_turns;
+                let dst = &self.snaps.bufs[li * 4 + j];
+                copies.push(((*src).clone(), gdn_slot * row * 4, dst.0.clone(), idx * row * 4, row * 4));
             }
         }
-        let slot = &mut self.snaps[idx];
-        slot.key = Some(key);
-        slot.last_use = self.snap_tick;
+        face.copy_batch(copies.as_slice()).await?;
+        self.snap_place(slot, key);
         Ok(())
     }
 
     /// GDN 快照恢复(E2c;前缀命中时调用):槽位缓冲 → 会话格(D2D
     /// 反向)。同流保序,后续 prefill 天然在恢复态之后。
     /// `key` = 边界块内容身份(与拍摄侧同类型 ⇒ 槽号进不来)。
+    /// `slot` = 快照**已在设备**的槽(engine 先按 store 的层账把宿主层快照
+    /// 回灌到设备再调这里 —— §25.2)。
     pub(crate) async fn restore_snap<D: DeviceClient>(
         &mut self,
         face: &mut D,
         gdn_slot: usize,
         key: SnapKey,
+        slot: u32,
     ) -> Result<()> {
-        let idx = self
-            .snaps
-            .iter()
-            .position(|s| s.key == Some(key))
-            .ok_or_else(|| ModelError::Msg(format!("快照 {key:?} 已被逐出")))?;
-        self.snap_tick += 1;
+        let idx = slot as usize;
+        if self.snaps.keys.get(idx).copied().flatten() != Some(key) {
+            return Err(ModelError::Msg(format!(
+                "快照 {key:?} 不在设备槽 {slot}(先回灌)"
+            )));
+        }
+        // **P1**:一条 `copy_batch` 搬回(与拍摄侧同构)
+        let mut copies: Vec<(owl_iface::contract::Bytes, usize, owl_iface::contract::Bytes, usize, usize)> =
+            Vec::with_capacity(self.gdns.len() * 4);
         for (li, g) in self.gdns.iter().enumerate() {
             let quads = [
                 (&g.conv_q.0, g.conv_q.1),
@@ -1189,10 +1302,16 @@ impl StatePool {
                 (&g.rec.0, g.rec.1),
             ];
             for (j, (dst, elems)) in quads.iter().enumerate() {
-                let row = elems / self.gdn_slots;
-                let src = &self.snaps[idx].bufs[li * 4 + j];
-                face.copy_block_at(&src.0, 0, dst, gdn_slot * row * 4, row * 4).await?;
+                let row = elems / self.max_active_turns;
+                let src = &self.snaps.bufs[li * 4 + j];
+                copies.push((src.0.clone(), idx * row * 4, (*dst).clone(), gdn_slot * row * 4, row * 4));
             }
+        }
+        face.copy_batch(copies.as_slice()).await?;
+        self.snap_tick += 1;
+        let tick = self.snap_tick;
+        if idx < self.snaps.last_use.len() {
+            self.snaps.last_use[idx] = tick;
         }
         Ok(())
     }
@@ -1219,7 +1338,7 @@ impl StatePool {
                 (&g.rec.0, g.rec.1),
             ];
             for (j, (src, elems)) in quads.iter().enumerate() {
-                let row = elems / self.gdn_slots;
+                let row = elems / self.max_active_turns;
                 let dst = &snap.bufs[li * 4 + j];
                 copies.push(((*src).clone(), gdn_slot * row * 4, dst.0.clone(), 0usize, row * 4));
             }
@@ -1250,7 +1369,7 @@ impl StatePool {
                 (&g.rec.0, g.rec.1),
             ];
             for (j, (dst, elems)) in quads.iter().enumerate() {
-                let row = elems / self.gdn_slots;
+                let row = elems / self.max_active_turns;
                 let src = &snap.bufs[li * 4 + j];
                 copies.push((src.0.clone(), 0usize, (*dst).clone(), gdn_slot * row * 4, row * 4));
             }

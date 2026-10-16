@@ -67,6 +67,12 @@ pub struct TurnOpts {
     pub stop: Vec<String>,
     /// RNG 种子覆写(`None` = turn id 派生;同 turn 重放仍确定)
     pub seed: Option<u64>,
+    /// **直接显存地板**(设计卷 §2.4;`None` = 走引擎 `knobs.dense_floor`)。
+    ///
+    /// 语义 = 对 KVMem 式损失的耐受度:`Strict` = 全量 dense 驻留(禁选择层)。
+    /// **本刀只实做 `Strict`** —— 非 `Strict` 在提交边界**响亮拒**(选择层
+    /// B 轴未落地,地板语义无从兼现,§23.5)。
+    pub dense_floor: Option<owl_store::TurnFloor>,
 }
 
 /// turn 终了原因(OpenAI `finish_reason` 真源)
@@ -120,6 +126,10 @@ pub(crate) struct Turn {
 pub(crate) struct ActiveTurn {
     pub(crate) id: u64,
     pub(crate) session_id: u64,
+    /// **GDN 行号(S2b:turn 域资源)** —— turn 起从 `StateStore::borrow_row()`
+    /// 借,终了归还(`return_row`);跨 turn 的状态连续性由**边界快照**承担
+    /// (§25.2),不再靠"会话钉一行"。idle 会话因此对设备**零占用**。
+    pub(crate) gdn_slot: usize,
     pub(crate) ephemeral: bool,
     pub(crate) prompt_ids: Vec<u32>,
     pub(crate) max_new: usize,
@@ -199,6 +209,13 @@ pub(crate) struct TurnLedger {
     pub(crate) next_id: u64,
     /// 多 token 轮的事件队列(pump 逐个出;SpecRound 一轮 m+1 token)
     pub(crate) pending_events: VecDeque<TurnEvent>,
+    /// **准入等待**(§23.4 `Queue` 姿态):(turn, 起始时刻)。
+    ///
+    /// 单线程无定时器 ⇒ 重判时机 = **下一次 pump**(通常由"活跃 turn 终了"
+    /// 或新提交驱动);超 `max_wait_ms` 即拒。这一限制已写进设计卷 §23.4。
+    pub(crate) admit_wait: Option<(u64, std::time::Instant)>,
+    /// 最近终了 turn 的 prompt token 数(诊断/无卡门校准;不参与语义)。
+    pub(crate) last_prompt_len: Option<usize>,
 }
 
 impl TurnLedger {
@@ -208,6 +225,8 @@ impl TurnLedger {
             active: None,
             next_id: 1,
             pending_events: VecDeque::new(),
+            admit_wait: None,
+            last_prompt_len: None,
         }
     }
 

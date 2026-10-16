@@ -35,7 +35,7 @@ type Result<T> = std::result::Result<T, ModelError>;
 pub struct StepProbes {
     /// OWL_STEP_PROFILE(逐相计时)
     pub step_profile: bool,
-    /// OWL_GDN_DUMP(GDN 状态格画像)
+    /// OWL_GDN_DUMP(GDN 行画像)
     pub gdn_dump: bool,
     /// OWL_DEBUG(通用诊断:kv-dump/logits-dump/sample-dump)
     pub debug: bool,
@@ -263,6 +263,18 @@ impl<D: DeviceClient> RunningEngine<D> {
         if prompt_ids.is_empty() {
             return Err(ModelError::Msg("submit: 空 prompt".into()));
         }
+        // 准入地板(S3b §23.5):本刀只实做 Strict(全量 dense 驻留)——
+        // 非 Strict = "允许选择层按需物化",而选择层(B 轴)未落地 ⇒
+        // 接受它就是**静默降级**(§2.4 红线)。响亮拒,把话说明白。
+        if let Some(f) = opts.dense_floor {
+            if !f.is_strict() {
+                return Err(ModelError::Msg(
+                    "submit: 准入面拒绝 TurnFloor::Bytes —— 选择层(B 轴)未落地,\
+                     地板语义无从兑现(设计卷 §23.5);本档只接受 Strict"
+                        .into(),
+                ));
+            }
+        }
         // 预算(会话感知):命中账本的 turn 按 max(prompt, cached) 记账
         // (增量段写 `[cached, prompt)` 行,生成续写其后;失配回退全量时
         // prompt 为准,同一上界)
@@ -306,8 +318,9 @@ impl<D: DeviceClient> RunningEngine<D> {
             }
         };
         let (session_id, ephemeral) = match session {
-            Some(id) => (self.bank.get_or_create_evicting(Some(id), self.cfg.knobs.gdn_slots)?, false),
-            None => (self.bank.get_or_create_evicting(None, self.cfg.knobs.gdn_slots)?, true),
+            // S2b:建会话不再占 GDN 行(行随 turn 借还)⇒ 无逐出重试
+            Some(id) => (self.bank.get_or_create(Some(id))?, false),
+            None => (self.bank.get_or_create(None)?, true),
         };
         let id = self.turns.alloc_id();
         self.turns.queue.push_back(Turn {
@@ -339,6 +352,17 @@ impl<D: DeviceClient> RunningEngine<D> {
             .queued(turn)
             .map(|t| t.prompt_ids.len())
             .or_else(|| self.turns.active_of(turn).map(|a| a.prompt_ids.len()))
+    }
+
+    /// **最近一次终了 turn 的 prompt token 数**(无卡门/诊断用:turn 终了后
+    /// `turn_prompt_len` 已查不到,而测试要按"prompt 是否 32 对齐"做校准)。
+    pub fn last_turn_prompt_len(&self) -> Option<usize> {
+        self.turns.last_prompt_len
+    }
+
+    /// 队列长度(待跑 turn 数;服务面诊断/准入门读)。
+    pub fn queue_len(&self) -> usize {
+        self.turns.queue.len()
     }
 
     /// 提交时**前缀命中量**(usage `cached_tokens` 真源;AGT-12):
@@ -397,8 +421,8 @@ impl<D: DeviceClient> RunningEngine<D> {
         if let Some(t) = self.turns.queue.front() {
             let (sid, plen) = (t.session_id, t.prompt_ids.len());
             let dev = {
-                let hit = self.bank.leg_target.match_prefix(&t.prompt_ids)?;
-                Self::reuse_face(&self.pool, &hit, plen, page).1
+                let (hit, recall) = self.bank.rel.match_prefix(&t.prompt_ids)?;
+                Self::reuse_face(&self.bank.rel, &hit, &recall, plen, page).1
             };
             let have = self.bank.sessions.get(sid).map(|s| s.block_table.len()).unwrap_or(0);
             return Ok(owl_store::Need {
@@ -431,6 +455,138 @@ impl<D: DeviceClient> RunningEngine<D> {
         Ok(owl_store::Need { slots: 0, why: NeedWhy::Idle })
     }
 
+    /// **store 报告面**(设计卷 §2.4 / §13.4 对账口):三层 + 两腿 +
+    /// 保留/弹性/可动面。服务面 `/debug` 与准入门读这里(单一真源)。
+    pub fn store_report(&self) -> owl_store::StoreReport {
+        self.bank.rel.report()
+    }
+
+    /// **KV 腿报告**(槽/缓存/宿主/搬运计数 + 可动面;§13.4 对账口)。
+    pub fn leg_stats(&self) -> owl_store::LegStats {
+        self.bank.rel.leg.report()
+    }
+
+    /// **池账同步**(S3b §23.2):把池实占按"活跃面 / 可动面"拆给准入账 ——
+    /// 真源 = 块腿报告的设备驻留字节 + 活跃 turn 的块表长(引擎知道)。
+    ///
+    /// 恒等式(必须成立,否则判据就偏):
+    /// `reserved(活跃实占) + cache(其余池实占) = 池实占`。
+    /// 单一活跃 turn ⇒ O(1);将来多活跃 = 求和(算式不变)。
+    pub(crate) fn sync_pool_account(&mut self) -> Result<()> {
+        let block_bytes = self.pool.block_bytes();
+        // 池实占 = **槽账**真源(已用槽 × 块字节)—— 不看树绑定面:
+        // 尾部不满一块的前缀不进树,但槽已经占了(实测:8 会话占满 8 槽,
+        // 绑定面只报 6 块 ⇒ 按绑定面判就会多放一个 turn 进来)。
+        let occupied = self.bank.rel.leg.occupied_bytes();
+        // 可动面 = 腿的**引用账**真源(refs = 1 的设备块;§23.2)——
+        // 不用"池实占 − 活跃实占"那种字节相减:那会把 idle 会话持着的
+        // 历史算成可动,准入就说满了话而搬不动(Busy ⇒ 退回 Exhausted)。
+        let movable = self.bank.rel.leg.movable_bytes();
+        let active = self.turns.active.as_ref().map(|a| (a.id, a.session_id));
+        let held = match active {
+            Some((_, sid)) => {
+                self.bank.sessions.get(sid).map_or(0, |s| s.block_table.len()) * block_bytes
+            }
+            None => 0,
+        }
+        .min(occupied.saturating_sub(movable));
+        let ad = &mut self.bank.rel.admission;
+        ad.set_cache_bytes(movable); // 可动面(可下沉/可驱逐)
+        ad.set_session_held(occupied.saturating_sub(movable).saturating_sub(held)); // 会话持有面
+        if let Some((id, _)) = active {
+            ad.set_floor(id, held)?; // 活跃 turn 保留额(G2b)
+        }
+        Ok(())
+    }
+
+    /// **H1 准入判决**(S3b §23.4):待准入 turn 过 `Rel::check` ⇒
+    /// 调需求(EvictThen)/ 拒(Reject)/ 留队(Queue)。
+    ///
+    /// 为什么先于 `ensure_for_len`:那条路是"**占了槽**才发现不够"(Exhausted,
+    /// 中后段才炸,且已写半截账);本判决是"**判在前**"——不够就先腾,
+    /// 腾不够就带数字拒。
+    fn admission_gate(&mut self, need: &mut owl_store::Need) -> Result<()> {
+        use owl_store::AdmissionVerdict;
+        if need.why != owl_store::NeedWhy::Admit {
+            return Ok(());
+        }
+        // **只在真的能起 turn 时判**(无活跃 turn)。有活跃 turn 时队首只是在
+        // 等位 —— 此刻"池被活跃面占着"是常态(它马上会退成缓存),照判会
+        // 把正常排队的第二个请求误拒。准入 = "谁能**开始**"。
+        if self.turns.active.is_some() {
+            return Ok(());
+        }
+        self.sync_pool_account()?;
+        let Some((turn_id, ctx_tokens, floor)) = self.turns.queue.front().map(|t| {
+            (
+                t.id,
+                // 上界 = prompt + 生成长度 + spec 深度(安全方向:多算只是多腾几个槽)
+                t.prompt_ids.len() + t.spec.max_new + self.spec.depth,
+                t.opts.dense_floor.unwrap_or(self.cfg.knobs.dense_floor),
+            )
+        }) else {
+            return Ok(());
+        };
+        match self.bank.rel.check(floor, ctx_tokens) {
+            AdmissionVerdict::Admit { .. } => {
+                self.turns.admit_wait = None;
+            }
+            AdmissionVerdict::EvictThen { need_bytes, .. } => {
+                // 抬需求到"腾够就能进":同一次段边界搬完(下沉不丢内容)
+                let want = need_bytes.div_ceil(self.pool.block_bytes().max(1));
+                need.slots = need.slots.max(want);
+            }
+            AdmissionVerdict::Queue { reason } => {
+                let started = match self.turns.admit_wait {
+                    Some((id, t0)) if id == turn_id => t0,
+                    _ => {
+                        self.turns.admit_wait = Some((turn_id, std::time::Instant::now()));
+                        owl_shared::log_info!("store", "准入：turn {turn_id} 排队等待 — {reason}");
+                        std::time::Instant::now()
+                    }
+                };
+                let waited = started.elapsed().as_millis() as u64;
+                // `>=`:上限 0 = 立刻按拒处理(不许"等 0 毫秒"变成再等一轮)
+                if waited >= self.cfg.knobs.admission_max_wait_ms() {
+                    self.reject_queued_turn(
+                        turn_id,
+                        format!("准入拒绝：排队 {waited}ms 仍无法腾位（{reason}）"),
+                    )?;
+                }
+            }
+            AdmissionVerdict::Reject { reason } => {
+                self.reject_queued_turn(turn_id, format!("准入拒绝：{reason}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// **拒一个待准入 turn**(§23.4):出队 + 临时会话焚毁 + `Failed` 事件入队。
+    ///
+    /// 不掉 `ensure_for_len` 的 `Exhausted` —— 拒的文案不带 "超预算" 字样:
+    /// 那是"prompt + max_tokens > max_seq"的专用标记(服务面据此归一化成
+    /// `context_length_exceeded` 触发客户端自动 compact);池墙拒是另一类,
+    /// 客户端该做的是降并发/重试。
+    fn reject_queued_turn(&mut self, turn_id: u64, why: String) -> Result<()> {
+        let Some(pos) = self.turns.queue.iter().position(|t| t.id == turn_id) else {
+            return Ok(()); // 已被别处取走(幂等)
+        };
+        let t = self.turns.queue.remove(pos).expect("刚定位过");
+        if self.turns.admit_wait.map(|(id, _)| id) == Some(turn_id) {
+            self.turns.admit_wait = None;
+        }
+        if t.ephemeral {
+            self.bank.burn(t.session_id); // 临时会话：历史不落地，链/格随 turn 死
+        }
+        owl_shared::log_warn!("store", "{why}（turn {turn_id}）");
+        owl_shared::metrics::with_metrics_store(|m| {
+            m.counter_add("store.admit.reject", 1, file!(), line!());
+        });
+        self.turns.pending_events.push_back(TurnEvent::Failed { turn: turn_id, err: why });
+        self.sync_pool_account()?;
+        Ok(())
+    }
+
 
 
 
@@ -451,7 +607,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             match item.sink {
                 Sink::Host => {
                     let (blocks, pieces, table) = {
-                        match owl_store::plan_offload(&mut self.bank.leg_target, item.chain) {
+                        match owl_store::plan_offload(&mut self.bank.rel.leg, item.chain) {
                             Ok(p) => (p.blocks, p.pieces, p.table),
                             Err(owl_store::StoreError::Busy(_)) => {
                                 a.skipped_busy += 1;
@@ -467,7 +623,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                     {
                         Ok(c) => c,
                         Err(e) => {
-                            owl_store::abort_offload(&mut self.bank.leg_target, &blocks);
+                            owl_store::abort_offload(&mut self.bank.rel.leg, &blocks);
                             return Err(owl_iface::contract::ModelError::Msg(format!(
                                 "换出 swap 失败(engine 编排):{e}"
                             )));
@@ -475,9 +631,9 @@ impl<D: DeviceClient> RunningEngine<D> {
                     };
                     let table = owl_store::reclaim_slot_table(conn)?;
                     a.offloaded +=
-                        owl_store::commit_offload(&mut self.bank.leg_target, &blocks, table)?;
+                        owl_store::commit_offload(&mut self.bank.rel.leg, &blocks, table)?;
                 }
-                Sink::Drop => match self.bank.leg_target.drop_cached(item.chain) {
+                Sink::Drop => match self.bank.rel.leg.drop_cached(item.chain) {
                     Ok(()) => a.dropped += 1,
                     Err(owl_store::StoreError::Busy(_)) => a.skipped_busy += 1,
                     Err(e) => return Err(e.into()),
@@ -487,7 +643,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         // ② 回灌(Verdict.in_:逐条一条命令;H4 的批量形态在 execute_begin)
         for chain in &verdict.in_ {
             let (cs, slots, pieces, table) = {
-                match owl_store::plan_onload(&mut self.bank.leg_target, std::slice::from_ref(chain)) {
+                match owl_store::plan_onload(&mut self.bank.rel.leg, std::slice::from_ref(chain)) {
                     Ok(p) => (p.chains, p.slots, p.pieces, p.table),
                     Err(e) => return Err(e.into()),
                 }
@@ -499,14 +655,14 @@ impl<D: DeviceClient> RunningEngine<D> {
             {
                 Ok(c) => c,
                 Err(e) => {
-                    owl_store::abort_onload(&mut self.bank.leg_target, &cs, &slots);
+                    owl_store::abort_onload(&mut self.bank.rel.leg, &cs, &slots);
                     return Err(owl_iface::contract::ModelError::Msg(format!(
                         "回灌 swap 失败(engine 编排):{e}"
                     )));
                 }
             };
             let table = owl_store::reclaim_slot_table(conn)?;
-            let _ = owl_store::commit_onload(&mut self.bank.leg_target, &cs, &slots, table)?;
+            let _ = owl_store::commit_onload(&mut self.bank.rel.leg, &cs, &slots, table)?;
             a.onloaded += 1;
         }
         Ok(a)
@@ -522,17 +678,17 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 判定单里的 `deny` = **"即使搬空也不够"的真容量不足预警** ⇒ 响亮 WARN,
     /// 但 `out` 里能搬的照搬(下沉不丢内容);真拒绝由 `ensure_for_len` 兜底。
     async fn pool_housekeeping(&mut self, need: owl_store::Need) -> Result<()> {
-        if !self.bank.leg_target.host_enabled() || need.slots == 0 {
+        if !self.bank.rel.leg.host_enabled() || need.slots == 0 {
             return Ok(());
         }
-        let verdict = owl_store::plan(&self.bank.leg_target, need, &[]);
+        let verdict = owl_store::plan(&self.bank.rel.leg, need, &[]);
         if owl_shared::env_reader::flag("OWL_STORE_HOOK_DEBUG") {
             eprintln!(
                 "[hook] {:?} need={} free={}/{} 判 out={} in={} deny={:?}",
                 need.why,
                 need.slots,
-                self.bank.leg_target.slots_free(),
-                self.bank.leg_target.slots_total(),
+                self.bank.rel.leg.slots_free(),
+                self.bank.rel.leg.slots_total(),
                 verdict.out.len(),
                 verdict.in_.len(),
                 verdict.deny
@@ -584,6 +740,8 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 保洁**先于** `schedule` 里的 `ensure_for_len` ⇒ 正常路径下同步驱逐恒为空
         // (报告面 `ops.ensure_evicted` 可查)。
         let need = self.step_need()?;
+        let mut need = need;
+        self.admission_gate(&mut need)?;
         self.pool_housekeeping(need).await?;
         owl_shared::timer_start!("engine.pump.schedule");
         let t_sched = (prof || true).then(std::time::Instant::now);
@@ -606,7 +764,16 @@ impl<D: DeviceClient> RunningEngine<D> {
                 .tag_prefix("engine.pump."));
         }
         match out {
-            SchedulerOutput::Idle => Ok(TurnEvent::Idle),
+            SchedulerOutput::Idle => {
+                // 准入拒(S3b §23.4)等 host 侧即时终态:先回吐再报 Idle ——
+                // 否则 Idle 会让服务面的泵循环在此断开,被拒 turn 的事件
+                // 要等下一次提交才发得出去。
+                if let Some(ev) = self.turns.pending_events.pop_front() {
+                    Ok(ev)
+                } else {
+                    Ok(TurnEvent::Idle)
+                }
+            }
             SchedulerOutput::Step { begin, action } => {
                 if let Some(b) = begin {
                     self.execute_begin(b).await?;

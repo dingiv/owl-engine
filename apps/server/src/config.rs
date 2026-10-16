@@ -156,7 +156,7 @@ pub struct ServerConfig {
     pub head_quant: owl_shared::config::HeadQuant,
     /// **W4A8 档位**(model.w4a8;S2 2026-10-17;默认 off = 今天行为)
     pub w4a8: bool,
-    /// 最大并发请求(server.max_concurrency;默认 8;须 ≤ knobs.gdn_slots)
+    /// 最大并发请求(server.max_concurrency;默认 8;须 ≤ knobs.max_active_turns)
     pub max_concurrency: usize,
     /// 性能账落盘基名(--perf-dump;None = 不落盘)
     pub perf_dump: Option<PathBuf>,

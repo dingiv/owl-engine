@@ -97,6 +97,38 @@ impl StateStore {
         self.rows_free.len()
     }
 
+    /// **登记快照**(S2:引擎每次 `capture_snap` 后调用;幂等 —— 已存在则只触达)。
+    ///
+    /// `bytes` = 一条快照的全量字节(Σ 层×quad 行宽);`tier` 由调用方给
+    /// (新拍的必在设备层)。
+    pub fn register_snap(&mut self, key: SnapKey, bytes: usize, tier: Tier) {
+        self.tick += 1;
+        let tick = self.tick;
+        match self.snaps.get_mut(&key) {
+            Some(e) => {
+                e.last_use = tick;
+                e.tier = tier;
+                e.bytes = bytes;
+            }
+            None => {
+                self.snaps.insert(key, SnapEntry { tier, bytes, last_use: tick });
+            }
+        }
+    }
+
+    /// 一条快照的字节(不在账 = `None`)。
+    pub fn snap_bytes(&self, key: SnapKey) -> Option<usize> {
+        self.snaps.get(&key).map(|s| s.bytes)
+    }
+
+    /// 按层统计(`(条数, 字节)`;报告/对账口)。
+    pub fn snaps_in_tier(&self, tier: Tier) -> (usize, usize) {
+        self.snaps
+            .values()
+            .filter(|s| s.tier == tier)
+            .fold((0, 0), |(n, b), s| (n + 1, b + s.bytes))
+    }
+
     /// 定位快照(probe:纯查询)。
     pub fn locate(&self, key: SnapKey) -> Option<Tier> {
         self.snaps.get(&key).map(|s| s.tier)
@@ -162,6 +194,8 @@ impl StateStore {
             rows_free: self.rows_free.len(),
             snaps: self.snaps.len(),
             snap_bytes: self.snaps.values().map(|s| s.bytes).sum(),
+            snap_gpu: self.snaps_in_tier(Tier::Gpu),
+            snap_host: self.snaps_in_tier(Tier::Host),
             hits: self.hits,
             misses: self.misses,
         }
@@ -179,6 +213,10 @@ pub struct StateStats {
     pub snaps: usize,
     /// 快照字节合计。
     pub snap_bytes: usize,
+    /// 设备层快照(条数, 字节)。
+    pub snap_gpu: (usize, usize),
+    /// 宿主层快照(条数, 字节)。
+    pub snap_host: (usize, usize),
     /// 命中次数。
     pub hits: u64,
     /// 未命中次数。

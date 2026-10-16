@@ -534,6 +534,11 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
             sampler: req.sampler_override(),
             stop,
             seed: req.seed.map(|s| s as u64),
+            // 直接显存地板(**per-turn**,设计卷 §2.4/§23.5):OpenAI 面暂无
+            // 扩展字段 —— 走引擎 `knobs.dense_floor`(缺省 `Strict`)。
+            // 将来加请求字段时在这里映射;非 `Strict` 由引擎**响亮拒**
+            // (选择层 B 轴未落地,地板语义无从兼现)。
+            dense_floor: None,
         },
         sink: sink_tx,
     };

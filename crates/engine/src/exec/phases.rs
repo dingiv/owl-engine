@@ -13,14 +13,17 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let face = self.graphs.session.face_mut();
             self.pool.reset_gdn(face, b.gdn_slot).await?;
         } else if let Some(key) = b.restore_key {
-            // 前缀命中:恢复边界快照到会话格(免重灌;GDN 态对齐)
+            // 前缀命中:恢复边界快照到会话格(免重灌;GDN 态对齐)。
+            // **S2(§25.2)**:快照可能在宿主层 ⇒ 先按 store 的层账把它
+            // 就位到设备槽(一条 swap 回灌),再 D2D 恢复。
+            let slot = self.snap_ensure_resident(key).await?;
             let face = self.graphs.session.face_mut();
-            self.pool.restore_snap(face, b.gdn_slot, key).await?;
+            self.pool.restore_snap(face, b.gdn_slot, key, slot).await?;
         }
         // **S3-3b:待回灌块**(内容在宿主层)在段边界搬到设备,并把新槽写回块表 ——
         // 必须在 `write_bt` 之前(否则写进设备的是占位坏槽)。搬运实现全在 store。
         if !b.pending_loads.is_empty() {
-            let leg = &mut self.bank.leg_target;
+            let leg = &mut self.bank.rel.leg;
             let face = self.graphs.session.face_mut();
             // §21:搬运由 engine 编排(取计划 → face.swap → 回执 → 记账);
             // **一条命令搬 N 块**(逐块 = 每块一次往返,回灌收益被吃光)。

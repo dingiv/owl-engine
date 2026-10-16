@@ -58,14 +58,32 @@ pub struct EngineKnobs {
     /// **宿主层预算 MiB**(状态存储三层的中层;缺省 **0 = 关层**,REQ C4)。
     /// 环境变量 `OWL_HOST_CACHE_MB`;S3-3b(回灌)接线前开了也没用
     pub host_cache_mb: usize,
+    /// **状态腿宿主预算 MiB**(S2 §25.2;缺省 **0 = 关层**)。`OWL_SNAP_HOST_MB`。
+    ///
+    /// 与 [`Self::host_cache_mb`] 同属 store 中层总账的两个**分片**
+    /// (KV 块腿 / GDN 快照腿)—— 总账 = 两者之和(`Rel::open` 交叉校验分片
+    /// 不超总账)。为什么分开:两条腿的搬运形态与热区完全不同,共用一个数
+    /// 只会让一边饿死(实测:全给 KV 腿 ⇒ 快照下沉无位 ⇒ 冷快照被丢)。
+    pub snap_host_mb: usize,
+    /// **准入满员姿态**(S3b;缺省响亮拒)。`OWL_ADMIT_ON_FULL=reject|queue[:ms]`。
+    ///
+    /// `Reject` = 准入拒(客户端该降并发/重试,不是压缩上下文);
+    /// `Queue { max_wait_ms }` = 留队首等下一次事件重判(超时则拒)。
+    pub admission_on_full: owl_store::QueuePolicy,
+    /// **per-turn 直接显存地板的缺省值**(S3b;设计卷 §2.4)。
+    ///
+    /// `Strict` = 全量 dense 驻留(选择层未落地时的唯一诚实值);
+    /// 请求可用 `TurnOpts::dense_floor` 逐 turn 覆写 —— 非 `Strict` 当前**响亮拒**
+    /// (B 轴未落地,地板语义无从兑现,§23.5)。
+    pub dense_floor: owl_store::TurnFloor,
     /// eager 直发,跳过图捕获(原 OWL_NO_GRAPH;**总闸**)
     pub no_graph: bool,
     /// **prefill 图档位**(P1;`[graph] prefill_bucket`;缺省 `off` = 今天行为)
     pub prefill_bucket: owl_shared::config::PrefillBucket,
     /// TS 探针槽(原 OWL_TS_PROBE)
     pub ts_probe: bool,
-    /// GDN 槽数覆写(缺省 8;原 OWL_GDN_SLOTS)
-    pub gdn_slots: usize,
+    /// GDN 槽数覆写(缺省 8;原 OWL_MAX_ACTIVE_TURNS)
+    pub max_active_turns: usize,
     /// spec 快照轮回滚缓冲槽数(缺省 4;原 OWL_SNAP_MAX)
     pub snap_max: usize,
     /// VRAM 预算目标占比(缺省 0.97;原 OWL_VRAM_TARGET)
@@ -106,10 +124,13 @@ impl Default for EngineKnobs {
             draft: DraftCfg::default(),
             prefix_cache: true,
             host_cache_mb: 0,
+            snap_host_mb: 0,
+            admission_on_full: owl_store::QueuePolicy::Reject,
+            dense_floor: owl_store::TurnFloor::Strict,
             no_graph: false,
             prefill_bucket: owl_shared::config::PrefillBucket::Off,
             ts_probe: false,
-            gdn_slots: 8,
+            max_active_turns: 8,
             snap_max: 4,
             vram_target: 0.97,
             vram_reserve_mb: 1024,
@@ -126,7 +147,37 @@ impl Default for EngineKnobs {
     }
 }
 
+/// 准入满员姿态解析(`OWL_ADMIT_ON_FULL`):`reject`(缺省)/ `queue` / `queue:30000`。
+///
+/// 坏值 = **响亮拒启动**(解析失败不许静默回落到缺省 —— 那就变成"配了没生效")。
+fn parse_admission_on_full() -> std::result::Result<owl_store::QueuePolicy, String> {
+    use owl_store::QueuePolicy;
+    let Some(s) = owl_shared::env_reader::parse::<String>("OWL_ADMIT_ON_FULL") else {
+        return Ok(QueuePolicy::Reject);
+    };
+    let s = s.trim().to_ascii_lowercase();
+    match s.split_once(':') {
+        None if s == "reject" => Ok(QueuePolicy::Reject),
+        None if s == "queue" => Ok(QueuePolicy::Queue { max_wait_ms: 30_000 }),
+        Some(("queue", ms)) => match ms.parse::<u64>() {
+            Ok(max_wait_ms) => Ok(QueuePolicy::Queue { max_wait_ms }),
+            Err(_) => Err(format!("OWL_ADMIT_ON_FULL 坏值:{s}(期望 queue:<毫秒>)")),
+        },
+        _ => Err(format!(
+            "OWL_ADMIT_ON_FULL 坏值:{s}(期望 reject | queue | queue:<毫秒>)"
+        )),
+    }
+}
+
 impl EngineKnobs {
+    /// 准入满员姿态的等待上限(毫秒;`Reject` ⇒ 0 = 不等)。
+    pub fn admission_max_wait_ms(&self) -> u64 {
+        match self.admission_on_full {
+            owl_store::QueuePolicy::Reject => 0,
+            owl_store::QueuePolicy::Queue { max_wait_ms } => max_wait_ms,
+        }
+    }
+
     /// **入口侧组装器**(server config / 测试用例专用):自全量配置对象
     /// [`owl_shared::config::OwlConfig`] 显式组装,引擎内部零 env 读取。
     /// env → OwlConfig 的映射统一在 config loader(总账唯一登记点);
@@ -152,10 +203,24 @@ impl EngineKnobs {
             // 宿主层预算(S3-3):环境的 opt-in 旋钮(不进 OwlConfig —— 未接线前
             // 开它只会让命中/驱逐响亮拒;接线后按档进 config 再谈)
             host_cache_mb: owl_shared::env_reader::parse("OWL_HOST_CACHE_MB").unwrap_or(0),
+            // 状态腿宿主预算(S2):独立旋钮(两条腿各有热区,别互相饿死)
+            snap_host_mb: owl_shared::env_reader::parse("OWL_SNAP_HOST_MB").unwrap_or(0),
+            // 准入姿态(S3b):env 覆盖(`reject` / `queue[:ms]`);缺省响亮拒。
+            // 坏值 = **响亮拒**(§24.5④:不再 panic;启动期结构化失败,
+            // 归 §18.5 的"配置错误静默 exit 1"红线同一族)
+            admission_on_full: parse_admission_on_full().unwrap_or_else(|e| {
+                owl_shared::log_error!("boot", "{e} —— 拒绝启动");
+                std::process::exit(2);
+            }),
+            // per-turn 地板缺省(缺省 Strict = 全量 dense;B 轴前唯一诚实值)
+            dense_floor: owl_store::TurnFloor::Strict,
             no_graph: cfg.graph.no_graph,
             prefill_bucket: cfg.graph.prefill_bucket,
             ts_probe: cfg.dispatch.ts_probe,
-            gdn_slots: cfg.pool.gdn_slots,
+            // S2b 正名:env 新名优先,旧名 `OWL_GDN_SLOTS` 兼容(旧档脚本不炸)
+            max_active_turns: owl_shared::env_reader::parse("OWL_MAX_ACTIVE_TURNS")
+                .or_else(|| owl_shared::env_reader::parse("OWL_GDN_SLOTS"))
+                .unwrap_or(cfg.pool.max_active_turns),
             // 快照池容量:env 覆盖(实测调压;命中面要求边界快照在场)
             snap_max: owl_shared::env_reader::parse("OWL_SNAP_MAX").unwrap_or(cfg.pool.snap_max),
             vram_target: cfg.pool.vram_target,
@@ -222,6 +287,90 @@ pub struct EngineConfig {
 pub struct Engine<D: DeviceClient> {
     face: D,
     cfg: EngineConfig,
+    /// boot 显存快照(准入预算装配的真源;S3b §23.3)
+    boot: BootVram,
+}
+
+/// boot 显存快照(设计卷 §23.3 的实测口径;只读两份数字)
+#[derive(Clone, Copy, Debug, Default)]
+struct BootVram {
+    /// 开卡后 `cuMemGetInfo` free(字节;CUDA ctx 已在 free 里扣掉 —— 不进底价)。
+    /// 无设备账档(CPU mock)= 0。
+    v_card_bytes: u64,
+    /// `Engine::new` 时刻的引擎 live 账(权重 = 装载后 − 此值)。
+    live_at_new: u64,
+}
+
+/// **准入预算装配**(实测真源;设计卷 §23.3 表)。
+///
+/// 纪律:能测的必须测;无设备账档(CPU mock)由**固定池档**放宽规则接管
+/// (`kv_face_bytes > 0` ⇒ 准入走池墙,卡级三项可为 0 —— 但由
+/// `VramBudget::card_measured()` 标出,不装成"测过了")。
+fn assemble_budget(
+    boot: &BootVram,
+    cfg: &EngineConfig,
+    pool: &StatePool,
+    live_loaded: u64,
+    live_now: u64,
+) -> Result<owl_store::BudgetInputs> {
+    // 准入地板语义(S3b §23.5):本刀只实做 **Strict**(全量 dense 驻留)——
+    // 配置面给非 Strict 就是配置错(选择层 B 轴未落地,地板语义无从兑现),
+    // 响亮拒启动,不许静默当 Strict 用。
+    if !cfg.knobs.dense_floor.is_strict() {
+        return Err(owl_iface::contract::ModelError::Msg(
+            "boot: knobs.dense_floor 只接受 Strict —— 选择层(B 轴)未落地,\
+             TurnFloor::Bytes 的地板语义无法兑现(设计卷 §23.5)"
+                .into(),
+        ));
+    }
+    let block_bytes = pool.block_bytes();
+    let page = pool.page.max(1);
+    let kv_pool = (pool.nb as u64).saturating_mul(block_bytes as u64);
+    let gdn_pool = (pool.max_active_turns as u64).saturating_mul(pool.gdn_row_bytes() as u64);
+    let snap_pool = pool.snapshot_pool_bytes() as u64;
+    let draft_pool = pool.draft_pool_bytes() as u64;
+    let weights = live_loaded.saturating_sub(boot.live_at_new);
+    // 运行底价 = run 末 live − 装载后 live − 已归类的池面(KV/GDN/快照/草稿)
+    let runtime_floor = live_now
+        .saturating_sub(live_loaded)
+        .saturating_sub(kv_pool + gdn_pool + snap_pool + draft_pool);
+    let inputs = owl_store::BudgetInputs {
+        v_card_bytes: boot.v_card_bytes as usize,
+        weights_bytes: weights as usize,
+        runtime_floor_bytes: runtime_floor as usize,
+        draft_pool_bytes: draft_pool as usize,
+        gdn_row_bytes: pool.gdn_row_bytes(),
+        kv_bytes_per_token: (block_bytes / page).max(1),
+        // 中层总账 = KV 块腿分片 + 状态腿(快照)分片(S2 §25.2)
+        host_bytes: (cfg.knobs.host_cache_mb + cfg.knobs.snap_host_mb) << 20,
+        disk_bytes: 0,
+        kv_face_bytes: kv_pool as usize,
+    };
+    let mb = |b: u64| b as f64 / 1048576.0;
+    if owl_shared::vram::total_bytes() > 0 && weights == 0 {
+        // 有设备账却算出权重 0 = 测量病(不是"没权重");不许静默
+        owl_shared::log_warn!(
+            "boot",
+            "准入预算:权重字节实测为 0(引擎 live 账未动?装载路径绕过账本?)—— 请核对"
+        );
+    }
+    owl_shared::log_info!(
+        "boot",
+        "准入预算:卡可用 {:.1}MiB · 权重 {:.1}MiB · 运行底价 {:.1}MiB · KV 池面 {:.1}MiB({} 槽 × {}B) · GDN 行 {:.2}MiB × {} · 快照池 {:.1}MiB · 草稿池 {:.1}MiB · host {:.1}MiB · 卡级实测={}",
+        mb(boot.v_card_bytes),
+        mb(weights),
+        mb(runtime_floor),
+        mb(kv_pool),
+        pool.nb,
+        block_bytes,
+        pool.gdn_row_bytes() as f64 / 1048576.0,
+        pool.max_active_turns,
+        mb(snap_pool),
+        mb(draft_pool),
+        mb(cfg.knobs.host_cache_mb as u64 * 1048576),
+        weights > 0 && runtime_floor > 0,
+    );
+    Ok(inputs)
 }
 
 /// boot 序号(metrics 打点命名空间;进程内自增,b1/b2…)
@@ -245,10 +394,19 @@ impl Engine<GpuClient> {
 impl<D: DeviceClient + 'static> Engine<D> {
     /// 注入 face(CPU 测试/自定义后端;唯一构造机制,new 是其 GPU 特化)
     pub fn on(cfg: EngineConfig, face: D) -> Result<Self> {
+        // boot 显存快照(准入预算的真源;S3b §23.3)—— 必须在任何池/权重之前取
+        let boot = BootVram {
+            v_card_bytes: owl_shared::vram::free_bytes(),
+            live_at_new: owl_shared::vram::live_bytes(),
+        };
+        Self::on_with(cfg, face, boot)
+    }
+
+    fn on_with(cfg: EngineConfig, face: D, boot: BootVram) -> Result<Self> {
         // 注:`[graph] prefill_bucket` 的**真接线在 [`Self::run`]**(桶捕获需要
         // 模型与状态池;静止点律 ⇒ 只在 boot 做)。此处不再拒启(2026-10-15
         // M2b 落地;此前的"配了没实现就拒"临时门已被真接线取代)。
-        Ok(Self { face, cfg })
+        Ok(Self { face, cfg, boot })
     }
 
     /// 模型加载器(借用引擎 face;装载即校验,错误在 load 边界落地)
@@ -263,6 +421,8 @@ impl<D: DeviceClient + 'static> Engine<D> {
     #[allow(clippy::arc_with_non_send_sync)]
     pub async fn run(mut self, loaded: LoadedModel) -> Result<RunningEngine<D>> {
         let t_run = std::time::Instant::now();
+        // 装载后的引擎 live 账(权重与运行底价的基线;S3b §23.3)
+        let live_loaded = owl_shared::vram::live_bytes();
         let s = self.cfg.max_seq_tokens;
         let (hq, hkv, hd) = loaded.spec.full_heads;
         let (nk, hk, nv, hv) = loaded.spec.gdn_heads;
@@ -344,7 +504,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
             xqa_verify: self.cfg.knobs.env.attn.verify_xqa,
             xqa_decode: self.cfg.knobs.env.attn.decode_xqa,
             xqa_prefill: self.cfg.knobs.env.attn.xqa_prefill,
-            gdn_slots: self.cfg.knobs.gdn_slots,
+            max_active_turns: self.cfg.knobs.max_active_turns,
             snap_max: self.cfg.knobs.snap_max,
             vram_target: self.cfg.knobs.vram_target,
             vram_reserve_mb: self.cfg.knobs.vram_reserve_mb,
@@ -360,25 +520,6 @@ impl<D: DeviceClient + 'static> Engine<D> {
                 q
             );
         }
-
-        // 会话账 + 双块账房(E2b/E2c;session.rs:target 链前缀缓存挂载 +
-        // MTP 链独立页池 —— 复合构造一次落位)
-        let bank = crate::session::SessionBank::new(
-            crate::session::BankPlan {
-                nb: pool.nb,
-                page: pool.page,
-                block_bytes: pool.block_bytes(),
-                mtp_block_bytes: pool.mtp_block_bytes(),
-                paged: pool.paged,
-                mtp: spec.mode == SpecMode::Mtp,
-                prefix_cache: self.cfg.knobs.prefix_cache,
-                // 宿主层预算(REQ C4:默认关;0 = 关层)—— 开它之前先做 S3-3b(回灌),
-                // 否则命中/驱逐遇宿主格会响亮拒(设计卷 §10.4 律⑤)
-                host_bytes: self.cfg.knobs.host_cache_mb << 20,
-            },
-            pool.pool_layout(0),
-            pool.mtp_pool_layout(0),
-        )?;
 
         // 图族总装配(graph_fleet.rs:① 主会话图(warmup+捕获)→
         // ② verify 桶形图 → ③ fold/DFlash2/MTP 族;face 句柄派生
@@ -402,6 +543,51 @@ impl<D: DeviceClient + 'static> Engine<D> {
             t_run,
         )
         .await?;
+
+        // ── 准入预算组装 + 会话/块账房(S3b;§23.3)──
+        // 此刻固定面全部落位(权重 + 池 + 图 slab + 表件)⇒ 实测数字齐;
+        // 装配失败 = 拒绝启动(A5.1:没有数字的项不许进预算式)。
+        let budget_inputs = assemble_budget(&self.boot, &self.cfg, &pool, live_loaded, owl_shared::vram::live_bytes())?;
+        let admission_policy = owl_store::AdmissionPolicy::new(
+            self.cfg.knobs.max_active_turns.max(1),
+            self.cfg.knobs.admission_on_full,
+        );
+        let host_bytes = self.cfg.knobs.host_cache_mb << 20;
+        // **S2:状态腿三层化**(§25.2)—— 注册快照池布局(快照 = 「槽 × 片」),
+        // 并把 store 的状态腿宿主层挂上(KV 腿宿主分片之外的部分)。
+        // 放在 `SessionBank::new` 之前:布局进 store 后 `Rel` 才知道快照的
+        // 单条字节(宿主层的块粒度)。
+        let bank = {
+            let mut b = crate::session::SessionBank::new(
+                crate::session::BankPlan {
+                    nb: pool.nb,
+                    page: pool.page,
+                    block_bytes: pool.block_bytes(),
+                    mtp_block_bytes: pool.mtp_block_bytes(),
+                    paged: pool.paged,
+                    mtp: spec.mode == SpecMode::Mtp,
+                    prefix_cache: self.cfg.knobs.prefix_cache,
+                    // 宿主层预算(REQ C4:默认关;0 = 关层)—— 与预算入参**同源**
+                    // (腿不得超总账;`Rel::open` 交叉校验)
+                    host_bytes,
+                },
+                budget_inputs,
+                admission_policy,
+                pool.pool_layout(0),
+                pool.mtp_pool_layout(0),
+            )?;
+            if pool.paged && pool.snap_capacity() > 0 {
+                let epoch = b.rel.attach_snap_layout(pool.snap_pool_layout(0))?;
+                owl_shared::log_info!(
+                    "boot",
+                    "状态腿三层化:快照 {} 槽 × {}B/条(布局 epoch {epoch})· 宿主预算 {:.1}MiB",
+                    pool.snap_capacity(),
+                    pool.snap_bytes(),
+                    b.rel.snap_host_budget() as f64 / 1048576.0
+                );
+            }
+            b
+        };
 
         // ── DFlash2 spec × 无 verify 图 = **boot 拒启**(2026-10-14 修)──
         // DFlash2 的 verify 路径**硬依赖 verify 图**(taps 取自图的输出槽,
