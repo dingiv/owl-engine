@@ -13,8 +13,9 @@
 use owl_shared::config::OwlConfig;
 
 fn whitelist(flavor: &str) -> Vec<&'static str> {
-    // flavor 文本是 'static 常量 ⇒ 借出 'static 视图
-    let cfg = OwlConfig::load(Some(flavor), None).expect("flavor 解析");
+    // flavor 名 → 预设文件路径(解析归 server app 面;配置层只认文件)
+    let base = owl_shared::assets::preset_path(flavor).expect("preset 路径");
+    let cfg = OwlConfig::load(Some(&base), None).expect("flavor 解析");
     let list = cfg
         .dispatch
         .allowed_ops

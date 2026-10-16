@@ -77,6 +77,7 @@ pub async fn run_actor<D: DeviceClient>(
     running: &mut RunningEngine<D>,
     mut rx: mpsc::Receiver<EngineReq>,
     perf_dump: Option<std::path::PathBuf>,
+    shutdown: crate::shutdown::Shutdown,
 ) {
     // turn_id → 事件回流(sink;Completed/Failed 后摘除)
     let mut sinks: HashMap<u64, mpsc::Sender<SinkEvent>> = HashMap::new();
@@ -168,6 +169,12 @@ pub async fn run_actor<D: DeviceClient>(
                     // 弃置滞留 = GDN 格泄漏 → 2 格两轮耗尽)+ 广播
                     owl_shared::log_warn!("actor", "pump 错误: {e}");
                     abandon_turn(running, &mut sinks, &format!("engine: {e}")).await;
+                    // **不可恢复**(显存硬预算拒发 / 设备 server 关闭)⇒ 不走"继续跑",
+                    // 直接优雅收摊(释放卡锁 + 有序退出):继续跑只会连环失败
+                    if e.is_fatal() {
+                        owl_shared::log_warn!("actor", "致命引擎错误({e})⇒ 优雅关停");
+                        shutdown.graceful(&format!("引擎不可恢复错误:{e}"));
+                    }
                     break;
                 }
             }

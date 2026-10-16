@@ -77,6 +77,19 @@ impl LoadOpts {
 
 /// **通用装载入口**(解释器化 L2 第一段):`Loadable::layout` 声明 × 起点源
 /// ⇒ 物化。真正的"起点侧"通用化(按 [`CheckpointKind`] 自动开源)见
+/// 装载期设备/池错误的**上下文包裹**:致命错误必须保住结构化类别
+/// (`ModelError::is_fatal()` 是服务面"优雅关停 vs 单请求失败"的判据)。
+/// 2026-10-16 实证:硬预算拒发(`PoolExhausted`)被包成 `Msg` ⇒ `is_fatal=false`
+/// ⇒ 服务面不会走优雅关停 —— 故这里"致命直通 + 记一条带键名的 WARN",其余照包。
+fn key_context(key: &str, e: ModelError) -> ModelError {
+    if e.is_fatal() {
+        owl_shared::log_warn!("load", "装载键 {key} 遇致命错误(保结构化直通):{e}");
+        e
+    } else {
+        ModelError::Msg(format!("Weight '{key}': {e}"))
+    }
+}
+
 /// [`load_from_dir`];本函数是纯加法(旧具名函数仍走 `eval_load`)。
 pub async fn load_component<T, D>(
     face: &mut D,
@@ -737,7 +750,7 @@ async fn load_direct<D: DeviceClient, S: WeightSource + ?Sized>(
         let _s = probe.span("out_alloc");
         face.alloc(w.dtype, n)
             .await
-            .map_err(|e| ModelError::Msg(format!("Weight '{}': {e}", w.key)))?
+            .map_err(|e| key_context(&w.key, e))?
     };
     let chunk_elems = (CHUNK_BYTES / esz).max(1);
     let mut off = 0usize;
@@ -749,7 +762,7 @@ async fn load_direct<D: DeviceClient, S: WeightSource + ?Sized>(
             let _s = probe.span("pinned_alloc");
             face.alloc_pinned(len * esz)
                 .await
-                .map_err(|e| ModelError::Msg(format!("Weight '{}': {e}", w.key)))?
+                .map_err(|e| key_context(&w.key, e))?
         };
         {
             let _s = probe.span("convert");
@@ -763,7 +776,7 @@ async fn load_direct<D: DeviceClient, S: WeightSource + ?Sized>(
             let _s = probe.span("htod");
             face.upload_pinned(lease, &b, off * esz, len * esz)
                 .await
-                .map_err(|e| ModelError::Msg(format!("Weight '{}': {e}", w.key)))?;
+                .map_err(|e| key_context(&w.key, e))?;
         }
         off += len;
         if staging.note_inflight(len * esz) {
@@ -813,7 +826,7 @@ async fn load_direct_device_cast<D: DeviceClient, S: WeightSource + ?Sized>(
         let _s = probe.span("out_alloc");
         face.alloc(w.dtype, n)
             .await
-            .map_err(|e| ModelError::Msg(format!("Weight '{}': {e}", w.key)))?
+            .map_err(|e| key_context(&w.key, e))?
     };
     let out_bytes = crate::contract::Bytes::new(b.id, n, w.dtype, w.shape.len() as u8);
 
@@ -1146,7 +1159,7 @@ async fn load_transposed<D: DeviceClient, S: WeightSource + ?Sized>(
         let _s = probe.span("htod");
         face.htod(dtype, &w.shape, &bytes)
             .await
-            .map_err(|e| ModelError::Msg(format!("Weight '{}': {e}", w.key)))?
+            .map_err(|e| key_context(&w.key, e))?
     };
     probe.done();
     Ok(LoadEntry {
