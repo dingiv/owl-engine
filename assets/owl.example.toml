@@ -11,7 +11,15 @@
 
 [runtime]
 # bind = "127.0.0.1:8135"
-# device = 0                    # CUDA ordinal(测试域另有 test_device,不入 toml)
+# ── 选卡(声明式;2026-10-16)───────────────────────────────────────
+# 三种找法任填,**多填 = 交集**;多命中全部收进列表(为多卡/TP 预留,单卡期取首张):
+# [runtime.device]              # 带 domain 的 BDF
+# bdf = "42:00.0"               # 也接受 "0000:42:00.0"
+# find_name = "3090"            # 设备名子串(大小写不敏感)
+# uuid = "GPU-89dffb90-…"       # 设备 UUID(推荐:跨重启稳定)
+# **整个 device 不写 = 自动挑一张空闲卡**(设备表 ∩ 未被 gpu_lock 占用)
+# 显式 ordinal(测试/特殊场景;与 device 互斥,不走设备表查找):
+# device_ordinal = 1
 # max_seq = 4096                # 单 turn token 预算(KV 直排槽位)
 # prefill_chunk = 512           # 预填块长(2026-10-10 提档;1024+ 收益递减)
 

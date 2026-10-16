@@ -5,13 +5,14 @@
 //! 消费方(engine/cuda/models/server)一律 `from_config(&OwlConfig)`
 //! 组装各自的 knobs/options,**零 env 直读、零散点 parse**。
 //!
-//! **四层叠加**(flavor 机制,2026-10-10;参考 vllm flavors.py 三层律):
+//! **叠加式加载**(2026-10-16:配置层不认识 "flavor" —— 预设档只是预先写好的
+//! 一份配置文件,由入口(`assets::preset_path`)解析成路径当"基准文件"传入):
 //!
 //! ```text
 //! Default(代码缺省) → Flavor(内置命名预设) → 用户文件(toml) → CLI 启动参数
 //! ```
 //!
-//! flavor 只锁"**必须成套**"的旋钮(避免手拼组合踩约束,如 spec depth
+//! 预设档只锁"**必须成套**"的旋钮(避免手拼组合踩约束,如 spec depth
 //! 无草稿目录空转、verify 图撞缺省 slab);实验旋钮在用户文件临时改即可,
 //! 无需绕预设。**env 彻底退出正式配置链**(缩编裁决:env 只剩 OWL_CONFIG
 //! 路径兜底等隐藏键 + 测试域账外自读)。
@@ -159,7 +160,16 @@ impl GraphInstantiateFlags {
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeCfg {
     pub bind: String,
-    pub device: usize,
+    /// **声明式选卡**:`device = { bdf = "42:00.0" }` / `{ find_name = "3090" }` /
+    /// `{ uuid = "GPU-…" }`(多填 = 交集,多命中全收);**整行不写 = 自动挑空闲卡**。
+    /// 与 `device_ordinal` 互斥(同时给 = 拒启)。
+    pub device: crate::device::DeviceSpec,
+    /// 显式 ordinal(测试/特殊场景;不走设备表查找)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_ordinal: Option<usize>,
+    /// **自动选卡的空闲占比阈值**(0..1;默认 0.9):候选卡的 `memory.free/total` 低于它
+    /// ⇒ auto-pick 跳过(避让非 owl 进程/未持锁实例);显式 spec 命中且全被跳 ⇒ 响亮拒启。
+    pub gpu_min_free_ratio: f64,
     pub max_seq: usize,
     pub prefill_chunk: usize,
     /// 测试域设备序(不入 toml;测试入口自填)
@@ -249,6 +259,18 @@ pub struct DispatchCfg {
     /// 4.63ms/层(fp8),而 prefill 族是 qo_len=8 单遍形态 —— 本开关是
     /// 两族 A/B 的唯一入口,定谳后固化其一,不留双路径。
     pub verify_v2: bool,
+    /// **verify 段驱动件**(piecewise):把 verify 图的**注意力核**登记为断点,
+    /// 整图改分段捕获回放(注意力在段间 eager 重放,其余仍在图内)。
+    /// 2026-10-15 立项(V1b):FI 的 split 档 plan 依赖 ctx ⇒ 单图只对一个
+    /// ctx 有效;段驱动件让 plan 每轮在窗外重算。零断点时退化为单图
+    /// (与 `plan` 同形),开关开而臂未登记核时**不**降级为逐步 eager。
+    pub verify_piecewise: bool,
+    /// ⚙ 诊断:断点挂"注意力输出"而非核节点(见 AttnEnv::break_at_out)
+    pub break_at_out: bool,
+    /// **verify 走 FI 断点臂**(V1b;需 `verify_piecewise`)——FI+split 换掉 XQA
+    pub verify_fi: bool,
+    /// **decode(T=1)走 FI 断点臂**(V1c;session 常驻图改分段,断点挂 decode 核)
+    pub decode_fi: bool,
     /// verify 臂改走 **XQA**(kNHD fp8 池 + spec-dec q=1+K;feature `xqa`)。
     /// 2026-10-13 D3:XQA 单算子实测 ctx8192 0.495ms vs v2 2.673ms(5.40×),
     /// 数值 max|XQA−host| 4.5e-4(v2 4.6e-4)。缺省 false(定谳后再翻)。
@@ -627,7 +649,9 @@ impl Default for RuntimeCfg {
     fn default() -> Self {
         Self {
             bind: "127.0.0.1:8135".into(),
-            device: 0,
+            device: crate::device::DeviceSpec::default(),
+            device_ordinal: None,
+            gpu_min_free_ratio: 0.9,
             max_seq: 4096,
             prefill_chunk: 512,
             test_device: None,
@@ -673,6 +697,12 @@ impl Default for DispatchCfg {
             force_naive_prefill: false,
             verify_v2: true,
             verify_xqa: false,
+            // piecewise 段驱动件:**缺省关**(2026-10-15 立项;A/B 先证机制
+            // 零回归,定谱后再翻默认 —— 同 verify_xqa 的翻法)
+            verify_piecewise: false,
+            break_at_out: false,
+            verify_fi: false,
+            decode_fi: false,
             decode_xqa: false,
             xqa_prefill: false,
             fi_min_tokens: 1,
@@ -701,196 +731,6 @@ impl Default for SamplingCfg {
     }
 }
 
-// ============================================================================
-// §4 flavor 预设(只锁"必须成套"的旋钮;每档注释 = 为什么)
-// ============================================================================
-
-/// 内置 flavor 表(name → TOML patch;与用户文件同一 serde 解析路径,
-/// 零额外机制)。`--flavor <name>` 激活;文件在其上覆盖。
-pub const FLAVORS: &[(&str, &str)] = &[
-    (
-        // 0.8B 开发基线(dev 面;= 代码缺省 + bind 明示。CI/冒烟快捷档)
-        "dev-08b",
-        r#"
-[runtime]
-bind = "127.0.0.1:8135"
-"#,
-    ),
-    (
-        // 27B AWQ 生产档(24G 贴顶三旋钮:单会话门不需要多格/多快照/
-        // 前缀缓存 —— 实测各省 ~300MB;greedy = 恒等门口径)
-        // 需配套:model.dir(检查点目录)
-        "awq27b",
-        r#"
-[model]
-kind = "awq27b"
-
-[pool]
-gdn_slots = 1
-snap_max = 1
-prefix_cache = false
-
-[sampling]
-mode = "greedy"
-
-[dispatch]
-# 裸 27B 档白名单(实测 27 个;与 kernels `ops::PROD_AWQ27B_2026_10_13` 一致)
-allowed_ops = [
-        "cublas_gemm_f16", "flashinfer_prefill_paged_fp8kv",
-        "marlin_gemm_w4a16_awq", "owl_add_f16",
-        "owl_argmax_f32idx_f16", "owl_ct_repack_u32",
-        "owl_embed_f16", "owl_fused_add_rmsnorm_f16",
-        "owl_gdn_conv_fwd_f16", "owl_gdn_conv_upd_dual_f16",
-        "owl_gdn_decode_step_v2_f16", "owl_gdn_gating_g_f16",
-        "owl_gdn_l2norm_f16", "owl_gdn_norm_act_f16",
-        "owl_gdn_recurrence_varlen_gqa_f16", "owl_gemv_dual_f16",
-        "owl_narrow_strided_f16", "owl_norm_rope_f16",
-        "owl_qknorm_rope_kv_insert_f16_fp8kv_knhd", "owl_reshape_and_cache_fp8kv_knhd",
-        "owl_rmsnorm_f16", "owl_sigmoid_f16",
-        "owl_sigmoid_gate_mul_f16", "owl_silu_and_mul_f16",
-        "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256", "vllm_paged_attention_v2_fp8_knhd_hd256bs32",
-        "vllm_paged_attention_v2_reduce_f16_hd256",
-]
-"#,
-    ),
-    (
-        // 27B + DFlash2 真草稿生产档(2026-10-10 实测配方;24G 单卡贴顶):
-        // decode 34.56@512(对照 perf-roadmap 首测 fp8 主池+d7 = 35.16,同口径
-        // 吻合)、Captured 零降级、装配 16.6s。
-        // 锁"必须成套":
-        // - d7 + fp8 主池(perf-roadmap 首测口径);
-        // - slots=1(单会话门;slots=8 的 GDN 格 = fixed_after 1.7G,
-        //   budget 直接负 → 池 0 → OOM,实测立案);
-        // - capture_slab 用 hint 定量(**勿设固定档**:160MB × ~10 图族
-        //   = 1.6G,贴顶必死,实测立案);
-        // - vram_target 0.99 + 钉池 4352(治理只做护栏,池由显式钉值定)。
-        // 需配套:model.dir + model.dflash2_dir(检查点目录);
-        // 建议 model.name 显式给(缺省应答名是 0.8b 的,health 会误导)。
-        "spec-dflash",
-        r#"
-[model]
-kind = "awq27b"
-# C1(2026-10-11):lm_head int4 装载期现场 RTN(marlin kU4);质量门
-# 已过(prose/数学 A/B 逐字同,竖式同错=模型固有),数学域 159→177
-head_quant = "rtn-int4-g32"
-
-[runtime]
-# 2026-10-13 重定档(影子池时代旧值 = 2560/池 4352):单池 + FI 直读后
-# 内存不再是约束 —— 实测 vram 治理 `fixed_after=0.68G budget=4.66G
-# per_tok=53248B → 池上限 94024 tok`(fp8 目标池 32KB/tok + DFlash2
-# bf16 草稿池 20KB/tok)。故**池值现为产品选择而非内存必需**:
-# 取 16k ctx(相对旧档 6.4×),实测代价 ~2.5% prefill、~0.5% decode
-# (池/nparts 9472/19 → 16896/33 的 A/B)。
-max_seq = 16384
-
-[spec]
-depth = 7
-
-[server]
-# 单会话语义:GDN 格锁 1 → 并发闸门必须 ≤1(启动 fail-fast 校验
-# gdn_slots ≥ max_concurrency)。2026-10-13 实测:本档原**缺此项** →
-# `--flavor spec-dflash` 独立起不来(此前 e2e/bench 各自在配置文件里
-# 覆盖了 gdn_slots=8 才蒙混过去)。多会话档 = 这里改 8 + gdn_slots=8。
-max_concurrency = 1
-
-[pool]
-pool_tokens = 16896   # = ceil(16384/page)+slack(页 32;528 页;≈0.9G)
-vram_target = 0.99
-vram_reserve_mb = 512
-gdn_slots = 1
-snap_max = 1
-prefix_cache = false
-
-[dispatch]
-kv_fp8 = true
-# **生产算子白名单**(P4 硬门;清单 = 实测台账,与 kernels
-# `ops::PROD_SPEC_DFLASH_2026_10_13` 逐项一致 —— 由 apps/server 的门测试锁死)。
-# 非空 ⇒ 未列出的算子发射即结构化拒(deny-by-default);装配期还会用它跑
-# 池写集穷举审计(读必有人写 + 声明自洽 + 活跃写者不歧义)。
-allowed_ops = [
-        "cublas_gemm_bf16", "cublas_gemm_f16",
-        "flashinfer_prefill_paged_f16", "flashinfer_prefill_paged_fp8kv", "gdn_chunked_delta_rule_fwd",
-        "marlin_gemm_w4a16_awq", "marlin_gemm_w4a16_bf16",
-        "owl_add_bf16", "owl_add_f16",
-        "owl_argmax_f32idx_f16", "owl_cast_bf16_f16",
-        "owl_cast_f16_bf16", "owl_concat_rows_f16",
-        "owl_concat_rows_f32", "owl_ct_repack_u32",
-        "owl_dflash_conv_bf16", "owl_dflash_select_bf16",
-        "owl_embed_f16", "owl_fused_add_rmsnorm_bf16",
-        "owl_fused_add_rmsnorm_f16", "owl_gdn_conv_fwd_f16",
-        "owl_gdn_conv_upd_dual_f16", "owl_gdn_decode_step_v2_f16",
-        "owl_gdn_gating_g_f16", "owl_gdn_l2norm_f16",
-        "owl_gdn_norm_act_f16", "owl_gdn_recurrence_varlen_gqa_f16",
-        "owl_gemv_dual_f16", "owl_naive_attn_nc_bf16_v2",
-        "owl_narrow_strided_f16", "owl_norm_rope_bf16",
-        "owl_norm_rope_f16", "owl_qknorm_rope_kv_insert_f16_fp8kv_knhd",
-        "owl_qknorm_rope_kv_insert_f16_knhd",
-        "owl_reshape_and_cache_fp8kv_knhd", "owl_rmsnorm_bf16",
-        "owl_rmsnorm_f16", "owl_sigmoid_f16",
-        "owl_sigmoid_gate_mul_f16", "owl_silu_and_mul_bf16",
-        "owl_silu_and_mul_f16", "owl_topk16_merge_f16",
-        "owl_topk16_split_f16",
-        "owl_xqa_decode", "owl_xqa_prefill", "owl_xqa_verify",
-        "vllm_chunked_prefill_paged_attn_opt_f16_knhd_hd256",
-        "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256",
-        "vllm_paged_attention_v2_f16_knhd_hd256bs32",
-        "vllm_paged_attention_v2_fp8_knhd_hd256bs32",
-        "vllm_paged_attention_v2_reduce_f16_hd256",
-        "vllm_reshape_and_cache_bf16", "vllm_reshape_and_cache_f16_knhd",
-]
-# 白名单同时含 **fp8 与 f16 两主池族**(2026-10-14 A5 补):`kv_fp8` 决定
-# 实际发射哪一族 —— f16 档不用再拿 `allowed_ops = []` 绕硬门。两族在池
-# 写集审计里按 (池名, dtype) 分组,各自闭环(R3 不撞)。
-# XQA verify 臂(2026-10-13 D3 **转正**):恒等门 3/3 稳定绿(spec ≡ 无 spec
-# 逐 token;fp8 池 + 27B + DFlash2),verify 纯时 65.2→31.2ms、8192 spec
-# decode 27.7→47.0 t/s(+70%,且首次反超同池裸档 36.4)。形状不匹配时层侧
-# 自动回落 v2 臂(graceful)。根因与修法见工单 §2.7(semaphores 走图输入槽,
-# 不用跨账本的 memset 命令)。
-verify_xqa = true
-# 裸 decode 走 XQA(2026-10-13 ②):第二份实例化 `M_TILESIZE=16`。
-# 注:短 ctx 收益略低(512 档 1.90× vs 2048 档 2.25×),但**不缺省加 ctx
-# 阈值门** —— 最小值也在 1.4× 以上,且阈值本身是额外的一支分支/形状面。
-decode_xqa = true
-# GDN prefill 臂(2026-10-11 终版):fork-bf16 全家桶转正 —— g 语义律
-# 修复(kkt/h/o 必须吃 cumsum 而非 raw g;raw g 在深谷 -24 时
-# exp(±24)=e²⁴ 爆炸)。恒等门:四域 vs recurrence 逐位一致;std 矩阵
-# prefill 1299(超 scalar 1294)。fork 六核 bf16 配方全在 handler 肠内。
-gdn_chunked = true
-
-[sampling]
-mode = "greedy"
-"#,
-    ),
-    (
-        // fp8 KV 池档(2026-10-13:FlashInfer **恒启用**,故本档只剩 fp8 KV
-        // 这一维;原"FI 开关 + 27B FI 面挂账"随开关移除一并作废)
-        "fi-kv8",
-        r#"
-[dispatch]
-kv_fp8 = true
-"#,
-    ),
-    (
-        // eager 诊断档(图内/图外行为 A/B 的对照臂;C1 禁 graph 配套)
-        "eager-debug",
-        r#"
-[graph]
-no_graph = true
-
-[probes]
-debug = true
-"#,
-    ),
-];
-
-/// 可用 flavor 名(──list-flavors 消费面)
-pub fn flavor_names() -> impl Iterator<Item = &'static str> {
-    FLAVORS.iter().map(|(n, _)| *n)
-}
-
-fn flavor_toml(name: &str) -> Option<&'static str> {
-    FLAVORS.iter().find(|(n, _)| *n == name).map(|(_, t)| *t)
-}
 
 // ============================================================================
 // §5 统一 loader(四层叠加;deny_unknown 在最终反序列化生效)
@@ -914,17 +754,17 @@ fn merge(base: &mut toml::Value, over: toml::Value) {
 }
 
 impl OwlConfig {
-    /// **统一 loader**(四层叠加:Default → flavor → 文件;CLI 由入口
-    /// 决定前两者的取值)。`deny_unknown_fields` 在最终反序列化生效 ——
-    /// 文件/flavor 里任何账外键、枚举非法值 = Err 拒启。
-    pub fn load(flavor: Option<&str>, file: Option<&Path>) -> Result<Self, String> {
+    /// **统一 loader**(Default → 基准文件(预设档/任意配置) → 覆盖文件;
+    /// CLI 由入口决定前两者的取值)。`deny_unknown_fields` 在最终反序列化生效 ——
+    /// 任一文件里任何账外键、枚举非法值 = Err 拒启。
+    pub fn load(base: Option<&Path>, file: Option<&Path>) -> Result<Self, String> {
         let mut v = toml::Value::Table(toml::map::Map::new());
-        if let Some(name) = flavor {
-            let patch = flavor_toml(name)
-                .ok_or_else(|| format!("未知 flavor {name:?}(可用:{:?})", flavor_names().collect::<Vec<_>>()))?;
-            let pv: toml::Value =
-                toml::from_str(patch).map_err(|e| format!("内置 flavor {name:?} 解析失败: {e}"))?;
-            merge(&mut v, pv);
+        if let Some(b) = base {
+            let raw = file_loader::read_to_string(b)
+                .map_err(|e| format!("基准配置 {} 读取失败: {e}", b.display()))?;
+            let bv: toml::Value = toml::from_str(&raw)
+                .map_err(|e| format!("基准配置 {} 解析失败: {e}", b.display()))?;
+            merge(&mut v, bv);
         }
         if let Some(p) = file {
             let raw = file_loader::read_to_string(p)
@@ -1008,38 +848,6 @@ mod tests {
         assert_eq!(c.pool.gdn_slots, 1);
     }
 
-    #[test]
-    fn flavor_全表可解析且叠加生效() {
-        for (name, patch) in FLAVORS {
-            let c = OwlConfig::from_toml_str(patch)
-                .unwrap_or_else(|e| panic!("flavor {name} 应可解析: {e}"));
-            let _ = c;
-        }
-        // spec-dflash(2026-10-10 实测配方):d7 + fp8 主池 + 贴顶池预算 +
-        // hint slab(勿设固定档,160MB × 图族贴顶必死)
-        let c = OwlConfig::from_toml_str(flavor_toml("spec-dflash").expect("存在")).expect("解析");
-        assert_eq!(c.spec.depth, 7);
-        assert_eq!(c.sampling.mode, SamplerMode::Greedy);
-        assert_eq!(c.model.kind, ModelKind::Awq27b);
-        assert_eq!(c.model.head_quant, HeadQuant::RtnInt4G32, "C1 int4 头(2026-10-11 固化)");
-        assert!(c.dispatch.kv_fp8);
-        assert!(c.cuda.capture_slab_mb.is_none(), "slab 走 hint 定量");
-    }
-
-    #[test]
-    fn load_文件覆盖_flavor_文件优先() {
-        let dir = std::env::temp_dir().join(format!("owl_cfg_test_{}", std::process::id()));
-        file_loader::create_dir_all(&dir).expect("mkdir");
-        let p = dir.join("owl.toml");
-        file_loader::write(&p, "[spec]\ndepth = 5\n").expect("write");
-        let c = OwlConfig::load(Some("spec-dflash"), Some(&p)).expect("load");
-        assert_eq!(c.spec.depth, 5, "文件覆盖 flavor");
-        assert_eq!(c.sampling.mode, SamplerMode::Greedy, "flavor 未覆盖处保留");
-        let _ = std::fs::remove_dir_all(&dir);
-
-        assert!(OwlConfig::load(Some("nope"), None).is_err(), "未知 flavor 拒");
-        assert!(OwlConfig::load(None, Some(Path::new("/nonexistent/owl.toml"))).is_err());
-    }
 }
 
 #[cfg(test)]
@@ -1061,5 +869,22 @@ mod prefill_bucket_tests {
             toml::from_str::<GraphCfg>("prefill_bucket = \"t1024\"").is_err(),
             "非法档位必须拒(不许静默落 off)"
         );
+    }
+
+    /// 基准文件 + 覆盖文件叠加(flavor 不再是配置层概念:入口把预设档解析成路径当基准)
+    #[test]
+    fn load_基准文件与覆盖文件叠加() {
+        let dir = std::env::temp_dir().join(format!("owl_cfg_two_{}", std::process::id()));
+        file_loader::create_dir_all(&dir).expect("mkdir");
+        let over = dir.join("over.toml");
+        file_loader::write(&over, "[spec]\ndepth = 5\n").expect("w");
+        let base = crate::assets::preset_path("spec-dflash").expect("预设档");
+        let c = OwlConfig::load(Some(&base), Some(&over)).expect("load");
+        assert_eq!(c.spec.depth, 5, "覆盖文件优先");
+        assert_eq!(c.sampling.mode, SamplerMode::Greedy, "基准未覆盖处保留");
+        let c2 = OwlConfig::load(Some(&base), None).expect("load base only");
+        assert_eq!(c2.spec.depth, 7, "spec-dflash 预设 = d7");
+        assert_eq!(c2.model.head_quant, HeadQuant::RtnInt4G32, "C1 int4 头");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

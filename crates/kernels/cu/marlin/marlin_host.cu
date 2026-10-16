@@ -511,4 +511,34 @@ int marlin_gemm_v2_awq_ffi(const void* A, const void* B, void* C,
                    /*is_bf16=*/false);
 }
 
+// W4A8 × AWQ **非对称**变体:A = int8(已量化)+ a_scales fp32[M,1];B = kU4 + b_zeros。
+// c_tmp 与 marlin_gemm_v2_w4a8_ffi 同款自管 —— a_is_s8 强制 use_fp32_reduce ⇒
+// slice_count>1 形状走 global_reduce_fp32,缓冲由本发射器流序 malloc/free(暗雷面消除)。
+int marlin_gemm_v2_awq_w4a8_ffi(const void* A, const void* B, void* C,
+                                void* c_tmp, const void* b_scales,
+                                const void* b_zeros, const void* a_scales,
+                                int prob_m, int prob_n, int prob_k,
+                                void* workspace, int group_size, int dev,
+                                uintptr_t stream, int is_bf16) {
+  int sms = 0;
+  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+  int num_groups = (group_size == -1) ? 1 : prob_k / group_size;
+  (void)c_tmp;  // 调用方占位废弃
+  int max_m_block = (prob_m + 15) / 16 * 16;
+  if (max_m_block > 64) max_m_block = 64;
+  void* c_tmp_own = nullptr;
+  if (cudaMallocAsync(&c_tmp_own,
+                      (size_t)sms * max_m_block * 256 * sizeof(float),
+                      (cudaStream_t)stream) != cudaSuccess)
+    return 7;
+  int err = marlin_mm(A, B, C, c_tmp_own, const_cast<void*>(b_scales),
+                      const_cast<void*>(a_scales), /*a_is_s8=*/true,
+                      const_cast<void*>(b_zeros), /*use_zp=*/true,
+                      prob_m, prob_n, prob_k, prob_k, workspace, num_groups,
+                      group_size, dev, (cudaStream_t)stream, -1, -1, sms,
+                      /*is_bf16=*/is_bf16 != 0);
+  cudaFreeAsync(c_tmp_own, (cudaStream_t)stream);
+  return err;
+}
+
 }  // extern "C"

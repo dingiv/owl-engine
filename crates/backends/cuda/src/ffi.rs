@@ -1,3 +1,5 @@
+
+
 //! cudarc 受控再导出(A4:精确到接口粒度,禁止整库 re-export)。
 //! 这是上层(nn/未来的 rocnn)唯一可见的 cudarc 表面。
 //! 扩充本清单 = 扩大 driver 依赖面,须过 backends/README 准入审核并登记。
@@ -102,6 +104,47 @@ pub use cudarc::driver::result::device::{
 /// 驱动初始化(result 层设备枚举的前置条件;幂等)
 pub use cudarc::driver::result::init as driver_init;
 
+/// **枚举设备表**(声明式选卡用;2026-10-16):ordinal + 名字 + BDF + UUID。
+/// 走驱动 API ⇒ 与 `cudaSetDevice` **同序**(不看 nvidia-smi 序)。
+/// 名字/PCI 取不到时留空串(不静默:调用方按需响亮拒绝),UUID 取不到 = Err。
+pub fn device_rows() -> Result<Vec<owl_shared::device::DeviceRow>, String> {
+    use cudarc::driver::sys::{cuDeviceGetAttribute, cuDeviceGetName, CUdevice_attribute, CUresult};
+    driver_init().map_err(|e| format!("driver_init: {e:?}"))?;
+    let n = device_get_count().map_err(|e| format!("device_get_count: {e:?}"))?;
+    let mut out: Vec<owl_shared::device::DeviceRow> = Vec::with_capacity(n as usize);
+    for o in 0..n {
+        let dev = device_get(o).map_err(|e| format!("device_get({o}): {e:?}"))?;
+        let uuid = device_uuid(o as usize).map_err(|e| format!("device_uuid({o}): {e:?}"))?;
+        let mut nbuf = [0i8; 128];
+        let rc = unsafe { cuDeviceGetName(nbuf.as_mut_ptr(), nbuf.len() as i32, dev) };
+        let name = if rc == CUresult::CUDA_SUCCESS {
+            unsafe { std::ffi::CStr::from_ptr(nbuf.as_ptr()) }.to_string_lossy().into_owned()
+        } else {
+            String::new()
+        };
+        let attr = |a: CUdevice_attribute| -> Option<i32> {
+            let mut v: i32 = 0;
+            let rc = unsafe { cuDeviceGetAttribute(&mut v, a, dev) };
+            (rc == CUresult::CUDA_SUCCESS).then_some(v)
+        };
+        let bdf = match (
+            attr(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID),
+            attr(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_PCI_BUS_ID),
+            attr(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID),
+        ) {
+            (Some(d), Some(b), Some(f)) => format!("{d:04x}:{b:02x}:{f:02x}.0"),
+            _ => String::new(),
+        };
+        out.push(owl_shared::device::DeviceRow {
+            ordinal: o as usize,
+            name,
+            bdf,
+            uuid: owl_shared::device::uuid_display(&uuid),
+        });
+    }
+    Ok(out)
+}
+
 /// 取指定 ordinal 的设备 UUID(内部自管 cuInit;UUID 钉卡的配套查询)
 pub fn device_uuid(ordinal: usize) -> Result<[u8; 16], DriverError> {
     driver_init()?;
@@ -138,3 +181,27 @@ pub use cudarc::driver::result::{memcpy_dtoh_async, memcpy_htod_async};
 /// 设备内块→块拷贝(DtoD,流序非阻塞;E2c GDN 快照拍摄/恢复通道)
 pub use cudarc::driver::result::memcpy_dtod_async;
 
+#[cfg(test)]
+mod device_rows_tests {
+    /// 设备枚举门(驱动面,极轻:不建 CUDA 上下文);门控 = `OWL_TEST_DEVICE`(未设 = skip)
+    #[test]
+    fn device_rows_nonempty_and_consistent() {
+        if std::env::var_os("OWL_TEST_DEVICE").is_none() {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return;
+        }
+        let rows = super::device_rows().expect("枚举设备表");
+        assert!(!rows.is_empty(), "至少一台设备");
+        for r in &rows {
+            eprintln!("  ordinal {} | {} | {} | {}", r.ordinal, r.name, r.bdf, r.uuid);
+            assert!(!r.name.is_empty(), "名字非空:{r:?}");
+            assert!(r.bdf.contains(':') && r.bdf.ends_with(".0"), "BDF 形如 domain:bus:dev.0:{r:?}");
+            assert!(r.uuid.starts_with("GPU-") && r.uuid.len() == 40, "UUID 形如 GPU-8-4-4-4-12:{r:?}");
+        }
+        let mut bdfs: Vec<&str> = rows.iter().map(|r| r.bdf.as_str()).collect();
+        let n = bdfs.len();
+        bdfs.sort_unstable();
+        bdfs.dedup();
+        assert_eq!(bdfs.len(), n, "BDF 应唯一");
+    }
+}

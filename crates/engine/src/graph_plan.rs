@@ -32,7 +32,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use owl_iface::contract::{Bytes, DeviceClient, Dtype, GraphId, ModelError};
-use owl_models::interpreters::{eval_ops_multi, eval_ops_multi_scoped_env};
+use owl_models::interpreters::{eval_ops_multi, eval_ops_multi_scoped_env, BreakDecl, SegMode};
 use owl_models::ops::{Op, PlanNode};
 use owl_models::TensorOps;
 
@@ -177,6 +177,17 @@ pub enum PlanOutcome {
 pub struct PlanCtx {
     inputs: HashMap<String, TensorOps>,
     outputs: RefCell<Vec<(String, TensorOps)>>,
+    /// **断点声明**(piecewise;见 [`GraphPlan::plan_piecewise`])。
+    /// 闭包在**建树处**声明断点 —— 那是唯一能同时看见"节点"与"plan 槽块"的地方;
+    /// 驱动件随后按声明形状自行为每个断点分配钉块。
+    /// 用 `Rc<RefCell<…>>` 而非内建 `RefCell`:模型层(注意力臂)在**建树深处**
+    /// 才能看见核节点(它要拿 plan 的槽块)，故采集面要能递进模型(形态同
+    /// `ForwardCtx::gdn_tap`)；`break_sink()` 就是那个递出口。
+    ///
+    /// 元素 = [`BreakDecl`](节点 + 可选**宿主标量槽**):核里"每轮会变的宿主
+    /// 标量"(FI 的 `ctx_total` = plan key)不能在捕获期烘死 ⇒ 回放期按契约下标
+    /// 补进本轮值再送窗外求值。
+    breaks: std::rc::Rc<RefCell<Vec<BreakDecl>>>,
 }
 
 impl PlanCtx {
@@ -205,6 +216,26 @@ impl PlanCtx {
     fn take_outputs(&self) -> Vec<(String, TensorOps)> {
         self.outputs.borrow_mut().split_off(0)
     }
+
+    /// **声明断点**(piecewise 专用):该节点的求值会被移到图**窗外**
+    /// (捕获期跑一次、每轮回放再跑),并写进驱动件分配的**钉块**。
+    /// 只对显式走 [`GraphPlan::plan_piecewise`] 的 plan 有效(其它入口忽略)。
+    pub fn break_node(&self, t: &TensorOps) -> Result<()> {
+        self.breaks.borrow_mut().push(BreakDecl::node(t.clone()));
+        Ok(())
+    }
+
+    /// **断点采集面**(给“模型层自己登记断点”用):拿到的 handle 可直接塞进
+    /// `ForwardCtx::attn_break` 一类采集字段，层侧 push = 本 plan 登记断点
+    /// (节点 + 可选宿主标量槽)。与 [`Self::break_node`] 写同一张表
+    /// (单一拼写点，无旁路)。
+    pub fn break_sink(&self) -> std::rc::Rc<RefCell<Vec<BreakDecl>>> {
+        self.breaks.clone()
+    }
+
+    fn take_breaks(&self) -> Vec<BreakDecl> {
+        self.breaks.borrow_mut().split_off(0)
+    }
 }
 
 // ============================================================================
@@ -230,6 +261,43 @@ struct OutVal {
 enum Mode {
     Eager,
     Captured { graph: GraphId },
+    /// **piecewise**(段列表回放;设计见 `docs/piecewise-断点图-设计与实现.md`)
+    CapturedPiecewise,
+}
+
+/// **断点**(piecewise;**与算子种类无关** —— 只有"节点 + 钉块 + 幂等"三件事)。
+///
+/// 语义:捕获期在**窗外**跑一次(否则下一段拿不到输入),每轮回放再跑一次。
+/// ⇒ 断点算子必须**幂等**; 调用方声明 `idempotent` 为假则整张 plan 回 eager
+/// (不静默、不半途而废)。
+pub struct BreakPoint {
+    /// 断点节点:必须出现在本 plan 声明的输出树里(驱动件会校;按 depth 拓扑序切段)
+    pub node: TensorOps,
+    /// **钉块**:调用方在捕获前分配、plan 持有 ⇒ 捕获/回放两期同一地址。
+    /// 元素数必须等于 `node` 的声明输出元素数(不符 = 结构化拒)。
+    pub out: Bytes,
+    /// 幂等声明(见类型注)
+    pub idempotent: bool,
+    /// **宿主标量槽**(见 [`BreakDecl`]):(标量槽下标, 每轮值)。
+    /// 回放期按当前值改写该槽(新 id),再送窗外求值 —— 核的 plan/调度
+    /// 依赖宿主标量时(FI 的 `ctx_total`)这是唯一不烘死的通路。
+    pub host_scalar: Option<(usize, std::sync::Arc<std::sync::atomic::AtomicUsize>)>,
+}
+
+/// 段运行态(回放期只需"节点 + 钉块 + 宿主标量槽")
+pub(crate) struct BreakRuntime {
+    node: TensorOps,
+    out: Bytes,
+    host_scalar: Option<(usize, std::sync::Arc<std::sync::atomic::AtomicUsize>)>,
+}
+
+/// piecewise 运行态(段 + 断点;**与算子无关**)
+pub(crate) struct PiecewiseRt {
+    /// 每段一张子图;`None` = **空段**(根全在 memo ⇒ 无发射可言;空捕获窗硬错)
+    segs: Vec<Option<GraphId>>,
+    /// 尾段(`None` = 输出全在早段/断点里)
+    tail: Option<GraphId>,
+    breaks: Vec<BreakRuntime>,
 }
 
 pub struct GraphPlan<D: DeviceClient> {
@@ -249,6 +317,10 @@ pub struct GraphPlan<D: DeviceClient> {
     mode: Mode,
     #[allow(clippy::type_complexity)] // 捕获闭包(crate 内部契约)
     forward: Box<dyn Fn(&PlanCtx) -> Result<()>>,
+    /// piecewise 段/断点(`Mode::CapturedPiecewise` 时 Some)
+    pub(crate) pw: Option<PiecewiseRt>,
+    /// piecewise 跨段接力棒(与 `pw` 分字段:回放期要同时可变借 `face`)
+    pub(crate) pw_carry: Option<owl_models::interpreters::EvalCarry>,
 }
 
 impl<D: DeviceClient> GraphPlan<D> {
@@ -304,6 +376,8 @@ impl<D: DeviceClient> GraphPlan<D> {
                 .collect(),
             last: HashMap::new(),
             mode: Mode::Eager,
+            pw: None,
+            pw_carry: None,
             forward: Box::new(forward),
         };
 
@@ -390,6 +464,523 @@ impl<D: DeviceClient> GraphPlan<D> {
         Ok((sess, outcome))
     }
 
+    /// **piecewise 捕获/回放**(设计:`docs/piecewise-断点图-设计与实现.md`)。
+    ///
+    /// 与 [`Self::plan`] 的唯一差别:**闭包声明的树会被断点切成 N+1 段**,
+    /// 每段一张子图;断点在段间**窗外**求值(捕获期真跑一次、每轮回放再跑),
+    /// 写进调用方给的**钉块** ⇒ 捕获/回放两期同一地址。
+    ///
+    /// **通用性(三条硬约束,caller 侧的验收面)**:
+    /// 1. 本函数**不认识**算子:断点只由"节点 + 钉块 + 幂等"给定;
+    /// 2. 段根由断点**推导**(= 断点节点的操作数),不解析模型结构;
+    /// 3. 幂等性由 caller 声明(`BreakPoint::idempotent`);假 ⇒ 整张 plan 回 eager。
+    ///
+    /// 预检失败(非幂等 / 断点不在声明树 / 断点尺寸不符 / 捕获能力)→ `EagerFallback`。
+    pub async fn plan_piecewise(
+        mut face: D,
+        env: owl_models::env::EnvProvider,
+        desc: GraphPlanDesc,
+        // **幂等声明**(所有断点共用):断点会"捕获期一次 + 每轮回放一次",
+        // 假 ⇒ 整张 plan 回 eager(caller 必须表态,不许默认真)
+        idempotent: bool,
+        forward: impl Fn(&PlanCtx) -> Result<()> + 'static,
+    ) -> Result<(Self, PlanOutcome)> {
+        // 槽面(与 plan 同律:持久块 + init 落位)
+        let mut ins: Vec<InSlotDev> = Vec::new();
+        for i in desc.inputs {
+            let mut init = i.init;
+            init.resize(i.len, 0.0);
+            let block = face.htod(Dtype::F32, &vec![i.len], &f32b(&init)).await?;
+            ins.push(InSlotDev {
+                name: i.name,
+                len: i.len,
+                shape: i.shape,
+                dtype: i.dtype,
+                block,
+            });
+        }
+        let mut sess = Self {
+            face,
+            env,
+            debug_probe: desc.debug_probe,
+            reclaim_capture: desc.reclaim_capture,
+            inputs: ins,
+            out_specs: desc
+                .outputs
+                .iter()
+                .map(|o| (o.name.clone(), o.shape.iter().product::<usize>()))
+                .collect(),
+            out_dt: desc.outputs.iter().map(|o| (o.name.clone(), o.dtype)).collect(),
+            last: HashMap::new(),
+            mode: Mode::Eager,
+            forward: Box::new(forward),
+            pw: None,
+            pw_carry: None,
+        };
+        sess.fill_slots(&[]).await?;
+
+        // 预检 0:幂等声明(唯一"caller 必须表态"的东西)
+        if !idempotent {
+            return Ok((sess, fallback("断点未声明幂等 —— piecewise 会跑两遍,拒捕")));
+        }
+        if !desc.capture {
+            return Ok((sess, fallback("未请求捕获")));
+        }
+
+        // 声明一趟:输出树 + 断点表(断点在闭包**建树处**声明 —— 那是唯一
+        // 同时看得见"节点"与"plan 槽块"的地方)
+        let (outs, mut breaks) = sess.declare_all()?;
+        // 树审计(与 `plan` 的预检 1 同律:两条入口一条纪律):Htod 在捕获期禁
+        // —— 捕获窗内的 `from_host` 会当场炸(或烙进图),都是静默雷。
+        if outs.iter().any(|(_, t)| {
+            t.flatten().iter().any(|n| matches!(n.op(), Op::Htod { .. }))
+        }) {
+            return Ok((sess, fallback("输出树含 Htod(捕获期禁)")));
+        }
+        // 钉块由驱动件按**声明形状**分配(plan 持有 ⇒ 两期同址)
+        let mut bs: Vec<BreakPoint> = Vec::with_capacity(breaks.len());
+        for d in breaks.drain(..) {
+            let BreakDecl { node, host_scalar } = d;
+            let elems = node.shape().iter().product::<usize>();
+            let dt = node.dtype();
+            // 宿主标量槽下标校验(**契约槽序**;越界 = 上游违约 ⇒ 结构化拒捕,
+            // 不静默用旧值):`Op::Call` 的标量槽数 = `args.len()`
+            if let Some((idx, _)) = &host_scalar {
+                let n_args = match &node.op() {
+                    Op::Call { .. } => node.n_scalar_args(),
+                    _ => 0,
+                };
+                if *idx >= n_args {
+                    return Ok((sess, fallback(&format!(
+                        "断点宿主标量槽越界:下标 {idx} ≥ 标量槽数 {n_args}(契约槽序见 KernelSpec::PARAMS)"
+                    ))));
+                }
+            }
+            let out = sess.face.alloc(dt, elems).await?;
+            bs.push(BreakPoint { node, out, idempotent: true, host_scalar });
+        }
+        let trees: Vec<TensorOps> = outs.iter().map(|(_, t)| t.clone()).collect();
+        let reach: std::collections::HashSet<u64> =
+            trees.iter().flat_map(|t| t.flatten().into_iter().map(|n| n.id())).collect();
+        for b in &bs {
+            if !reach.contains(&b.node.id()) {
+                return Ok((sess, fallback("断点不在声明输出树里")));
+            }
+        }
+
+        // 断点按**拓扑深度**升序(= 依赖序;驱动件不解析模型结构)
+        bs.sort_by_key(|b| b.node.depth());
+        // 诊断分档(perf 会话排查;**缺省无效果**;只保留前 k 个断点 ——
+        // 被丢的断点退化为普通节点,在尾段里算 ⇒ 可对"第几个断点开始错"二分)
+        if let Some(k) = owl_shared::env_reader::parse::<usize>("OWL_PW_BREAKS") {
+            bs.truncate(k);
+        }
+
+        // 两个接力棒:
+        // - `carry`  = **真捕获**用(跨段块地址就是图里烘焙的那批)
+        // - `dry`    = **逐段干跑计量**用(窗外;给每段自己的 slab 尺寸定价)
+        // 两者的 keep 一致(断点 + 其操作数):干跑侧不 keep 会让后续段重复计算
+        // 整条子链(O(N²));keep 的块是普通池块、量级几十 KB,代价可忽略。
+        let mut carry = owl_models::interpreters::EvalCarry::default();
+        let mut dry = owl_models::interpreters::EvalCarry::default();
+        for b in &bs {
+            for c in [&mut carry, &mut dry] {
+                c.keep.insert(b.node.id());
+                for op in b.node.operands() {
+                    c.keep.insert(op.id());
+                }
+            }
+        }
+
+        // ── **段边界分析**(静态;零算子知识 —— 只用树结构 + 断点序)──
+        //
+        // 为什么必须有(2026-10-15 实测定谳):每段求值后 memo 只留 `keep`,
+        // 没 keep 的值在**后段会被重算**。纯算子重算只是白烧 CPU/GPU;但
+        // **带副作用的节点**(池写 `wr` / GDN conv·rec 递推)重算 = **双写**
+        // ⇒ 状态被推进两遍 ⇒ 首轮即崩(verify 图实测:文本 "用户!!!!…",
+        // 逐核定位到 `r18`(= 第 2 个 GDN 层 tap)在自检里先偏)。
+        //
+        // 判据(静态可算):设 `A_i` = 第 i 段根(断点操作数)的**祖先集**,
+        // `A_N` = 输出树祖先集;则"本段算、后续段还要用" = `A_i` 中满足
+        // `last_need > i` 的节点 —— 一律 keep(块地址由本段 slab 持有 ⇒
+        // 后段按同址读,值由本段每次回放刷新)。
+        let mut needs: Vec<std::collections::HashSet<u64>> = Vec::with_capacity(bs.len() + 1);
+        for b in &bs {
+            let mut m: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            for op in b.node.operands() {
+                for n in op.flatten() {
+                    m.insert(n.id());
+                }
+            }
+            m.insert(b.node.id());
+            needs.push(m);
+        }
+        {
+            let mut m: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            for t in &trees {
+                for n in t.flatten() {
+                    m.insert(n.id());
+                }
+            }
+            needs.push(m);
+        }
+        let mut last_need: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        for (j, m) in needs.iter().enumerate() {
+            for id in m {
+                last_need.insert(*id, j); // j 递增 ⇒ 天然取 max
+            }
+        }
+        // **声明输出也必须 keep**(2026-10-15 补;verify 图实测):输出不都是尾段
+        // 产的 —— 早段算出的输出(如 GDN 层的 fold 记录 `r*`)若在本段末被丢
+        // memo,尾段会把整条子链**重算一遍**(重复发射 + slab 膨胀)。
+        for (_, t) in outs.iter() {
+            for c in [&mut carry, &mut dry] {
+                c.keep.insert(t.id());
+            }
+        }
+
+        // ── 逐段:干跑计量 → 捕获 → 窗外断点 ──
+        // **空段守卫**(通用性):若本段的根全部已在 memo(断点操作数全是叶子
+        // 或已被前段算出),则捕获窗会是空的 —— 后端 `graph_end` 对空窗硬错。
+        // 段表用 `Option<GraphId>` 表达"本段无需回放";段数口径含空段不变。
+        let env = sess.env;
+        // 段内捕获口径**承接调用方声明**(M1 `reclaim_capture`):true ⇒ 窗内锚定
+        // 活性回收(slab 从"总和"降到"峰值");false ⇒ plain(历史口径)。
+        let cap_mode = if desc.reclaim_capture {
+            SegMode::CapturingScoped
+        } else {
+            SegMode::Capturing
+        };
+        let mut segs: Vec<Option<GraphId>> = Vec::with_capacity(bs.len() + 1);
+        for (bi, b) in bs.iter().enumerate() {
+            let ops = b.node.operands();
+            let refs: Vec<&TensorOps> = ops.iter().collect();
+            let empty = refs.iter().all(|r| carry.memo.contains_key(&r.id()));
+            // 本段算、后续段还要用的值 ⇒ 跨段存活(见上方"段边界分析")
+            {
+                let keep_now: Vec<u64> = needs[bi]
+                    .iter()
+                    .copied()
+                    .filter(|id| last_need.get(id).is_some_and(|j| *j > bi))
+                    .collect();
+                for c in [&mut carry, &mut dry] {
+                    for id in &keep_now {
+                        c.keep.insert(*id);
+                    }
+                }
+            }
+
+            // (0) 干跑(窗外):本段的分配总和 ⇒ 本段 slab 尺寸
+            //     (与 `plan` 的 warmup 同一条公式;逐段做 ⇒ 不 N 倍膨胀)
+            let _ = owl_shared::slab_hint::meter_take();
+            owl_models::interpreters::eval_segment(
+                &refs, &mut sess.face, env, &mut dry, SegMode::Eager).await?;
+            let m = owl_shared::slab_hint::meter_take() as usize;
+            if empty {
+                segs.push(None);
+            } else {
+                if !desc.slab_fixed && m > 0 {
+                    owl_shared::slab_hint::set_hint(m + m / 8 + (1 << 20));
+                }
+                // (1) 捕获本段(根 = 本断点的操作数;命中 memo 的历史节点零重算)
+                if let Err(e) = sess.face.graph_begin().await {
+                    return Ok((sess, fallback(&format!("face 无图能力: {e}"))));
+                }
+                if let Err(e) = owl_models::interpreters::eval_segment(
+                    &refs, &mut sess.face, env, &mut carry, cap_mode).await
+                {
+                    // 窗已开:尽力收尾(挂账:graph abort 原语),再上抛
+                    let _ = sess.face.graph_end().await;
+                    return Err(e);
+                }
+                let gid = sess.face.graph_end().await?;
+                segs.push(Some(gid));
+            }
+
+            // (2) 窗外:断点求值(写钉块)。它的操作数在 memo 里 ⇒ 只跑断点自身。
+            let node = b.node.clone();
+            carry.override_out(b.node.id(), b.out.clone());
+            owl_models::interpreters::eval_segment(
+                &[&node], &mut sess.face, env, &mut carry, SegMode::Eager).await?;
+            dry.override_out(b.node.id(), b.out.clone());
+            owl_models::interpreters::eval_segment(
+                &[&node], &mut sess.face, env, &mut dry, SegMode::Eager).await?;
+        }
+
+        // 尾段:声明的输出树(断点全部已 memo ⇒ 只算"断点之后"的部分);
+        // 空尾段(输出全在早段/断点里)同律跳过建图,直接从 memo 取句柄。
+        let refs: Vec<&TensorOps> = trees.iter().collect();
+        let tail_empty = refs.iter().all(|r| carry.memo.contains_key(&r.id()));
+        let _ = owl_shared::slab_hint::meter_take();
+        owl_models::interpreters::eval_segment(
+            &refs, &mut sess.face, env, &mut dry, SegMode::Eager).await?;
+        let m = owl_shared::slab_hint::meter_take() as usize;
+        let (tail, results): (Option<GraphId>, Vec<Bytes>) = if tail_empty {
+            (None, refs.iter().map(|r| carry.memo[&r.id()].clone()).collect())
+        } else {
+            if !desc.slab_fixed && m > 0 {
+                owl_shared::slab_hint::set_hint(m + m / 8 + (1 << 20));
+            }
+            if let Err(e) = sess.face.graph_begin().await {
+                return Ok((sess, fallback(&format!("face 无图能力: {e}"))));
+            }
+            let results =
+                owl_models::interpreters::eval_segment(&refs, &mut sess.face, env, &mut carry, cap_mode)
+                    .await;
+            let results = match results {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = sess.face.graph_end().await;
+                    return Err(e);
+                }
+            };
+            (Some(sess.face.graph_end().await?), results)
+        };
+
+        // 收割(与 try_capture 同律:声明形状守卫)
+        let mut last = HashMap::new();
+        for ((name, _), block) in outs.iter().zip(results.into_iter()) {
+            let want = sess.out_specs[name];
+            if block.len != 0 && block.len != want {
+                return Err(ModelError::Msg(format!(
+                    "piecewise: 输出 {name} 归约 {} 元素 ≠ 声明 {want}",
+                    block.len
+                )));
+            }
+            let dtype = sess.out_dt[name];
+            last.insert(name.clone(), OutVal { block, len: want, dtype });
+        }
+        sess.last = last;
+        sess.pw = Some(PiecewiseRt {
+            segs,
+            tail,
+            breaks: bs
+                .into_iter()
+                .map(|b| BreakRuntime { node: b.node, out: b.out, host_scalar: b.host_scalar })
+                .collect(),
+        });
+        sess.pw_carry = Some(carry);
+        sess.mode = Mode::CapturedPiecewise;
+        owl_shared::slab_hint::clear_hint();
+
+        // ── **图内一致门**(diag;`OWL_PW_SELFCHECK=1`):同一份槽值下,
+        // “分段回放”与“eager 整树”的输出必须一致(同一批核 + 同一序 ⇒
+        // 期望逐位;此处只做数值报告,不硬断)。给“断点接错/段接错”一个
+        // 当场可现的机器面 —— 设计文档 §6 判据 1。
+        if owl_shared::env_reader::flag("OWL_PW_SELFCHECK") {
+            // 捕获期的输出句柄(**值未写**:段图只是被录下来,没跑)⇒ 先回放一次填真值,
+            // 再 eager 整树;两次的槽值相同 ⇒ 同一批核同一序,期望逐位一致。
+            let cap: HashMap<String, OutVal> = std::mem::take(&mut sess.last);
+            sess.replay_piecewise().await?;
+            let mut pw: HashMap<String, Vec<f32>> = HashMap::new();
+            for (name, ov) in cap.iter() {
+                pw.insert(name.clone(), sess.read_vals(ov).await?);
+            }
+            sess.eval_current().await?; // eager 整树(槽值同 capture)
+            let eager: HashMap<String, OutVal> = std::mem::take(&mut sess.last);
+            sess.last = cap;
+            // ⚠️ 诊断面**不回收** eager 块:自检的输出里可能含别名块
+            // (Reshape/SliceView 与父共享块),free 会连带打掉别人引用的块
+            // (实测:boot 期 DeadBlock)。一次性泄漏(~百 MB)只服务自检。
+            let mut worst = (0usize, 0.0f64, String::from("-"));
+            let mut bad = 0usize;
+            for (name, eo) in eager.iter() {
+                let Some(a) = pw.get(name) else { continue };
+                let b = sess.read_vals(eo).await?;
+                if b.len() != a.len() {
+                    owl_shared::log_warn!("piecewise", "selfcheck: {name} 元素数不等(eager {} vs pw {})", b.len(), a.len());
+                    continue;
+                }
+                // ⚠️ **NaN 必须算差**(2026-10-16 定谳):`NaN - y = NaN`,
+                // 而 `NaN > 1e-3 = false` ⇒ 朴素的 max-abs-diff 对 NaN 全域失明
+                // (实测:本门曾对"两臂都 NaN"报"一致")。非数一律记差。
+                let d = a
+                    .iter()
+                    .zip(b.iter())
+                    .map(|(x, y)| {
+                        if x.is_nan() || y.is_nan() {
+                            f64::INFINITY
+                        } else {
+                            (*x as f64 - *y as f64).abs()
+                        }
+                    })
+                    .fold(0.0f64, f64::max);
+                if d > 1e-3 {
+                    bad += 1;
+                }
+                if d > worst.1 {
+                    worst = (a.len(), d, name.clone());
+                }
+            }
+            owl_shared::log_info!(
+                "piecewise",
+                "selfcheck: 输出 {} 个,差>1e-3 的 {} 个;最大差 {:.3e} @{} ({} 元素)",
+                eager.len(),
+                bad,
+                worst.1,
+                worst.2,
+                worst.0
+            );
+        }
+        Ok((sess, PlanOutcome::Captured))
+    }
+
+    /// **断点钉块画像**(诊断面;perf 会话排查用):逐断点 (元素数, NaN 数,
+    /// absmax) —— 判"断裂发生在断点内(核产出非数)还是断点之后(图读未写值)"。
+    pub async fn pw_pin_stats(&mut self) -> Result<Vec<(usize, usize, f32)>> {
+        let blocks: Vec<(u64, usize, Dtype)> = self
+            .pw
+            .as_ref()
+            .map(|p| p.breaks.iter().map(|b| (b.out.id, b.out.len, b.out.dtype)).collect())
+            .unwrap_or_default();
+        let mut out = Vec::with_capacity(blocks.len());
+        for (id, len, dt) in blocks {
+            let ov = OutVal { block: Bytes::new(id, len, dt, 0), len, dtype: dt };
+            let vals = self.read_vals(&ov).await?;
+            let nan = vals.iter().filter(|v| v.is_nan()).count();
+            let mx = vals.iter().fold(0f32, |a, v| a.max(v.abs()));
+            out.push((len, nan, mx));
+        }
+        Ok(out)
+    }
+
+    /// **断点操作数画像**(诊断面):(下标, 元素数, dtype, NaN 数, absmax) ——
+    /// 判"核输入是否已是非数"(上游段没算 / 地址错 / 未写)。
+    pub async fn pw_break_operand_stats(
+        &mut self,
+        bi: usize,
+    ) -> Result<Vec<(usize, usize, Dtype, usize, f32)>> {
+        let ops: Vec<(u64, usize, Dtype)> = match self.pw.as_ref().and_then(|p| p.breaks.get(bi)) {
+            Some(b) => b
+                .node
+                .operands()
+                .iter()
+                .map(|o| (o.id(), o.shape().iter().product::<usize>(), o.dtype()))
+                .collect(),
+            None => return Ok(Vec::new()),
+        };
+        let mut out = Vec::new();
+        for (i, (id, len, dt)) in ops.into_iter().enumerate() {
+            let Some(blk) = self.pw_carry.as_ref().and_then(|c| c.memo.get(&id)).cloned() else {
+                out.push((i, len, dt, usize::MAX, 0.0)); // 未在 memo
+                continue;
+            };
+            let ov = OutVal { block: blk, len, dtype: dt };
+            let vals = self.read_vals(&ov).await?;
+            let nan = vals.iter().filter(|v| v.is_nan()).count();
+            let mx = vals.iter().fold(0f32, |a, v| a.max(v.abs()));
+            out.push((i, len, dt, nan, mx));
+        }
+        Ok(out)
+    }
+
+    /// 读一块为 f32(diag/自检面;按槽 dtype 解码与 [`Self::read_output_f32`] 同律)
+    async fn read_vals(&mut self, out: &OutVal) -> Result<Vec<f32>> {
+        let (esize, f16) = match out.dtype {
+            Dtype::F16 => (2usize, true),
+            _ => (4usize, false),
+        };
+        let mut buf = vec![0u8; out.len * esize];
+        self.face.dtoh(&out.block, &mut buf).await?;
+        Ok(if f16 {
+            buf.chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect()
+        } else {
+            buf.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        })
+    }
+
+    /// piecewise 回放:段 → 断点 → … → 尾段(顺序即语义)
+    async fn replay_piecewise(&mut self) -> Result<()> {
+        let Some(pw) = self.pw.as_ref() else {
+            return Err(ModelError::Msg("piecewise 回放:无段表(未捕获?)".into()));
+        };
+        // 段/断点的 owned 快照(pw 的不可变借用不跨 self.face 的可变调用)
+        let segs: Vec<Option<GraphId>> = pw.segs.clone();
+        let tail = pw.tail;
+        let plan: Vec<(TensorOps, Bytes, Option<(usize, std::sync::Arc<std::sync::atomic::AtomicUsize>)>)> =
+            pw.breaks
+                .iter()
+                .map(|b| (b.node.clone(), b.out.clone(), b.host_scalar.clone()))
+                .collect();
+        // ⚙ 哨兵(OWL_PW_PIN_ZERO=1):回放**前**把钉块清零 ⇒ 回放后仍是零 =
+        // "断点的写没落"(发射没到/写偏);非零 = 落了(值另判)
+        if owl_shared::env_reader::flag("OWL_PW_PIN_ZERO") {
+            for (_, out, _) in plan.iter() {
+                let nbytes = out.len * out.dtype.size_bytes();
+                let blk = Bytes::new(out.id, out.len, out.dtype, 0);
+                self.face.memset_zero(&blk, nbytes).await?;
+            }
+        }
+        let n = plan.len();
+        for i in 0..n {
+            let (base, out, host) = &plan[i];
+            // **宿主标量槽补丁**(本轮值):节点其余逐位不变,id 换新 ⇒
+            // 覆盖/memo 按新节点记账(旧条目摘掉,免逐轮涨)
+            let node = match host {
+                Some((idx, cell)) => {
+                    let v = cell.load(std::sync::atomic::Ordering::Relaxed) as u64;
+                    let fresh = base.clone().with_arg_bits(*idx, v).ok_or_else(|| {
+                        ModelError::Msg(format!("piecewise 回放:宿主标量槽 {idx} 越界(plan 期应已拒)"))
+                    })?;
+                    let old = base.id();
+                    if let Some(c) = self.pw_carry.as_mut() {
+                        c.memo.remove(&old);
+                        c.overrides.remove(&old);
+                    }
+                    fresh
+                }
+                None => base.clone(),
+            };
+            if let Some(g) = segs[i] {
+                self.face.graph_launch(g).await?;
+            }
+            let carry = self
+                .pw_carry
+                .as_mut()
+                .ok_or_else(|| ModelError::Msg("piecewise 回放:无接力棒".into()))?;
+            // ⚠️ **断点必须每轮真跑**:capture 期求值已把 `节点 id → 钉块`
+            // 写进 memo,回放期 `eval_segment` 一见命中就短路 **不发射**
+            // (实测:钉块回放前后逐位相同 = 断点成静态数据,陈旧值一路喂给尾段)。
+            // 摘掉该条 ⇒ 强制重算(钉块由 override 写)。
+            carry.memo.remove(&node.id());
+            carry.override_out(node.id(), out.clone());
+            let _ = owl_models::interpreters::eval_segment(
+                &[&node],
+                &mut self.face,
+                self.env,
+                carry,
+                SegMode::Eager,
+            )
+            .await?;
+            // ⚙ 断点求值后立即读钉块(判 eager 的写落没落)
+            if owl_shared::env_reader::flag("OWL_PW_PIN_ZERO") {
+                let ov = OutVal { block: out.clone(), len: out.len, dtype: out.dtype };
+                let vals = self.read_vals(&ov).await?;
+                let nan = vals.iter().filter(|v| v.is_nan()).count();
+                let mx = vals.iter().fold(0f32, |a, v| a.max(v.abs()));
+                owl_shared::log_info!(
+                    "piecewise",
+                    "[pw-pin-now] 断点#{i} 求值后: n={} nan={nan} absmax={mx:.3e}",
+                    out.len
+                );
+            }
+        }
+        if let Some(g) = tail {
+            self.face.graph_launch(g).await?;
+        }
+        Ok(())
+    }
+
+    /// **段数 / 断点数**(诊断/测试面;非 piecewise = (0,0))。
+    /// 段数口径 = **含尾段**(N 个断点 ⇒ N+1 段;空段也计),与设计文档同尺。
+    pub fn piecewise_shape(&self) -> (usize, usize) {
+        self.pw.as_ref().map(|p| (p.segs.len() + 1, p.breaks.len())).unwrap_or((0, 0))
+    }
+
     /// 相位定相(perf tag 维度;引擎逐相位调用)。
     /// 构造期 env 是**快照**,相位是**逐相位状态** ⇒ 需显式同步
     /// (引擎侧 `RunningEngine::set_phase` 同时更新自身 env 与各 plan)。
@@ -415,6 +1006,7 @@ impl<D: DeviceClient> GraphPlan<D> {
         }
         match self.mode {
             Mode::Captured { graph } => self.face.graph_launch(graph).await?,
+            Mode::CapturedPiecewise => self.replay_piecewise().await?,
             Mode::Eager => self.eval_current().await?,
         }
         Ok(())
@@ -426,6 +1018,7 @@ impl<D: DeviceClient> GraphPlan<D> {
     pub async fn replay(&mut self) -> Result<()> {
         match self.mode {
             Mode::Captured { graph } => self.face.graph_launch(graph).await?,
+            Mode::CapturedPiecewise => self.replay_piecewise().await?,
             Mode::Eager => self.eval_current().await?,
         }
         Ok(())
@@ -523,6 +1116,11 @@ impl<D: DeviceClient> GraphPlan<D> {
 
     /// 闭包声明 + 守卫:返回登记输出(名须在 out_specs)
     fn declare_outputs(&self) -> Result<Vec<(String, TensorOps)>> {
+        Ok(self.declare_all()?.0)
+    }
+
+    /// 声明一趟,同时取回**输出树 + 断点表**(piecewise 入口用)
+    fn declare_all(&self) -> Result<(Vec<(String, TensorOps)>, Vec<BreakDecl>)> {
         let mut inputs = HashMap::new();
         for s in &self.inputs {
             inputs.insert(
@@ -530,15 +1128,21 @@ impl<D: DeviceClient> GraphPlan<D> {
                 TensorOps::of_block(s.block.id, s.dtype, s.shape.clone()),
             );
         }
-        let ctx = PlanCtx { inputs, outputs: RefCell::new(Vec::new()) };
+        let ctx =
+            PlanCtx {
+                inputs,
+                outputs: RefCell::new(Vec::new()),
+                breaks: std::rc::Rc::new(RefCell::new(Vec::new())),
+            };
         (self.forward)(&ctx)?;
         let outs = ctx.take_outputs();
+        let breaks = ctx.take_breaks();
         for (name, _) in &outs {
             if !self.out_specs.contains_key(name) {
                 return Err(ModelError::Msg(format!("step: 未声明输出槽 {name}")));
             }
         }
-        Ok(outs)
+        Ok((outs, breaks))
     }
 
     /// eager 归约:全输出 eval 入 last(读序由 dtoh 读语义保证)
@@ -717,6 +1321,74 @@ mod tests {
     use owl_models::interpreters::eval_ops;
     use owl_shared::config::OwlConfig;
     use owl_macros::owl_test;
+
+    /// **piecewise CPU 档**(无图能力 face):整张 plan 走 `EagerFallback`,
+    /// 且 eager 臂照常可跑(`step` 走 eval)—— 不给半成品、不静默
+    #[tokio::test]
+    async fn piecewise_falls_back_without_graph_capability() {
+        let desc = GraphPlanDesc {
+            reclaim_capture: false,
+            warmup: true,
+            inputs: vec![
+                InputSlot::f32("x", 4).init(vec![1.0; 4]),
+                InputSlot::f32("c", 4).init(vec![1.0; 4]),
+            ],
+            outputs: vec![OutputSlot::f32("out", &[4])],
+            capture: true,
+            slab_fixed: false,
+            debug_probe: false,
+        };
+        let forward = |sc: &PlanCtx| -> Result<()> {
+            let x = sc.input("x")?;
+            let c = sc.input("c")?;
+            let y = x.add(&c);
+            let brk = y.add(&y);
+            sc.break_node(&brk)?;
+            let out = brk.add(&c);
+            sc.output("out", &out)
+        };
+        let (mut p, outcome) =
+            GraphPlan::plan_piecewise(CpuFace::new(), Default::default(), desc, true, forward)
+                .await
+                .expect("plan_piecewise");
+        assert!(
+            matches!(outcome, PlanOutcome::EagerFallback { ref reason } if reason.contains("图能力")),
+            "无图能力应回退,得 {outcome:?}"
+        );
+        assert_eq!(p.piecewise_shape(), (0, 0), "回退态不应留段表");
+        // eager 臂照常出值(x=1,c=1 ⇒ y=2 ⇒ brk=4 ⇒ out=5)
+        p.step(&[("x", &[1.0f32; 4])]).await.expect("eager step");
+        let v = p.read_output_f32("out").await.expect("read out");
+        assert!(v.iter().all(|x| (x - 5.0).abs() < 1e-4), "得 {v:?}");
+    }
+
+    /// **非幂等声明 ⇒ 拒绝捕获**(piecewise 会跑两遍;caller 必须表态)
+    #[tokio::test]
+    async fn piecewise_rejects_non_idempotent() {
+        let desc = GraphPlanDesc {
+            reclaim_capture: false,
+            warmup: true,
+            inputs: vec![InputSlot::f32("x", 4).init(vec![1.0; 4])],
+            outputs: vec![OutputSlot::f32("out", &[4])],
+            capture: true,
+            slab_fixed: false,
+            debug_probe: false,
+        };
+        let forward = |sc: &PlanCtx| -> Result<()> {
+            let x = sc.input("x")?;
+            let brk = x.add(&x);
+            sc.break_node(&brk)?;
+            sc.output("out", &brk)
+        };
+        let (_p, outcome) =
+            GraphPlan::plan_piecewise(CpuFace::new(), Default::default(), desc, false, forward)
+                .await
+                .expect("plan_piecewise");
+        assert!(
+            matches!(outcome, PlanOutcome::EagerFallback { ref reason } if reason.contains("幂等")),
+            "未声明幂等必须拒捕,得 {outcome:?}"
+        );
+    }
 
     fn ones_w() -> TensorOps {
         let bytes: Vec<u8> = [1.0f32; 16].iter().flat_map(|f| f.to_le_bytes()).collect();

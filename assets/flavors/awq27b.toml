@@ -1,0 +1,33 @@
+# owl 引擎预设档 `awq27b`(2026-10-16 从 crates/shared/src/config.rs 下沉)
+# 原文注释:// 27B AWQ 生产档(24G 贴顶三旋钮:单会话门不需要多格/多快照/
+# 前缀缓存 —— 实测各省 ~300MB;greedy = 恒等门口径)
+# 需配套:model.dir(检查点目录)
+[model]
+kind = "awq27b"
+
+[pool]
+gdn_slots = 1
+snap_max = 1
+prefix_cache = false
+
+[sampling]
+mode = "greedy"
+
+[dispatch]
+# 裸 27B 档白名单(实测 27 个;与 kernels `ops::PROD_AWQ27B_2026_10_13` 一致)
+allowed_ops = [
+        "cublas_gemm_f16", "flashinfer_prefill_paged_fp8kv",
+        "marlin_gemm_w4a16_awq", "owl_add_f16",
+        "owl_argmax_f32idx_f16", "owl_ct_repack_u32",
+        "owl_embed_f16", "owl_fused_add_rmsnorm_f16",
+        "owl_gdn_conv_fwd_f16", "owl_gdn_conv_upd_dual_f16",
+        "owl_gdn_decode_step_v2_f16", "owl_gdn_gating_g_f16",
+        "owl_gdn_l2norm_f16", "owl_gdn_norm_act_f16",
+        "owl_gdn_recurrence_varlen_gqa_f16", "owl_gemv_dual_f16",
+        "owl_narrow_strided_f16", "owl_norm_rope_f16",
+        "owl_qknorm_rope_kv_insert_f16_fp8kv_knhd", "owl_reshape_and_cache_fp8kv_knhd",
+        "owl_rmsnorm_f16", "owl_sigmoid_f16",
+        "owl_sigmoid_gate_mul_f16", "owl_silu_and_mul_f16",
+        "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256", "vllm_paged_attention_v2_fp8_knhd_hd256bs32",
+        "vllm_paged_attention_v2_reduce_f16_hd256",
+]

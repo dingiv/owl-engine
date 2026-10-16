@@ -378,6 +378,10 @@ fn build_xqa_assets(out_dir: &std::path::Path) -> Vec<(&'static str, PathBuf)> {
         "-DUSE_SM90_MHA=0",
         "-DGENERATE_CUBIN",
     ];
+    // ⚠️ M_TILESIZE=64 一档**不可行**(2026-10-15 实测):内核 `mha.cu:85`
+    //    `static_assert(nbValidRows <= 32u)` ⇒ verify 的 48 打包单元
+    //    (q=8 × headGrp 6)**结构上**必须分 2 个 token block ⇒ 同 kv head 的
+    //    KV 被读两遍是内核设计约束,不是几何选择。
     let specs: [(&'static str, &[&str]); 2] = [
         ("verify", &["-DSPEC_DEC=1"]),
         ("decode", &["-DSPEC_DEC=1", "-DM_TILESIZE=16"]),
@@ -659,6 +663,8 @@ fn build_marlin() {
                 base.join("vllm_marlin/sm80_kernel_float16_u4b8_float16.cu"), // GPTQ 对称(kU4B8)
                 base.join("vllm_marlin/sm80_kernel_bfloat16_u4b8_bfloat16.cu"), // BF16 激活变体(E5-DF3 草稿 BF16 化)
                 base.join("vllm_marlin/sm80_kernel_s8_u4b8_float16.cu"),      // W4A8 s8→f16(S1;selector 引用之)
+                base.join("vllm_marlin/sm80_kernel_s8_u4_float16.cu"),        // W4A8 s8→f16 × AWQ 非对称(kU4;生产 27B 走这条)
+                base.join("vllm_marlin/sm80_kernel_s8_u4_bfloat16.cu"),       // W4A8 s8→bf16 × kU4(BF16 激活档)
             ];
             let includes = [base.join("vllm_marlin"), base.join("vllm_marlin/shim")];
             let ar = env::var("AR").unwrap_or_else(|_| "ar".into());

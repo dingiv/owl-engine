@@ -144,8 +144,10 @@ pub struct ServerConfig {
     pub model_name: String,
     /// 引擎旋钮(全量配置 engine/cuda/sampling module 的显式搬运)
     pub knobs: owl_engine::EngineKnobs,
-    /// 设备 ordinal(runtime.device)
+    /// 已选设备 ordinal(声明式选卡/自动挑空闲后的结果;交引擎 cudaSetDevice)
     pub device: usize,
+    /// 已选设备 UUID(卡锁 + 日志身份)
+    pub device_uuid: String,
     /// attention 窗上限(runtime.max_seq)
     pub max_seq: usize,
     /// 预填 chunk(runtime.prefill_chunk)
@@ -174,8 +176,18 @@ impl ServerConfig {
     /// boot 边界唯一入口:四层叠加加载 → app 面组装。
     /// `cli` 携带 --perf-dump / --perf-level 两个 app 面覆盖。
     pub fn load(flavor: Option<&str>, file: Option<&Path>, cli: &CliArgs) -> Result<Self, String> {
-        let cfg = OwlConfig::load(flavor, file)?;
+        // 预设档(flavor)= 预先写好的配置文件:入口把名字解析成路径,配置层只认文件
+        let base = match flavor {
+            Some(name) => Some(owl_shared::assets::preset_path(name)?),
+            None => None,
+        };
+        let cfg = OwlConfig::load(base.as_deref(), file)?;
+        // 声明式选卡(2026-10-16):规格 → 设备表过滤 → 剔 gpu_lock 已占 → 取首张
+        // (空规格 = 全部候选 ⇒ 自动挑空闲卡);命中全列日志,无候选/全被占 = 响亮拒启
+        let (device, device_uuid) = resolve_device(&cfg.runtime)?;
         let mut out = Self::from_config(cfg);
+        out.device = device;
+        out.device_uuid = device_uuid;
         if let Some(l) = cli.perf_level.as_deref() {
             out.perf_level =
                 owl_shared::metrics::level::parse(l).ok_or("perf-level 非法")?;
@@ -228,7 +240,9 @@ impl ServerConfig {
                 .clone()
                 .unwrap_or_else(|| DEFAULT_MODEL_NAME.into()),
             knobs: owl_engine::EngineKnobs::from_config(&cfg),
-            device: cfg.runtime.device,
+            // 占位:真值由 `load()` 的声明式选卡回填(设备表 + 卡锁都在那边)
+            device: 0,
+            device_uuid: String::new(),
             max_seq: cfg.runtime.max_seq,
             prefill_chunk: cfg.runtime.prefill_chunk,
             head_quant: cfg.model.head_quant,
@@ -260,4 +274,100 @@ impl ServerConfig {
         }
         m
     }
+}
+
+/// nvidia-smi 实占(按 UUID → 空闲占比)。None = 取不到(命令失败/不可用)
+fn vram_free_ratio_map() -> Option<std::collections::HashMap<String, f64>> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=uuid,memory.free,memory.total", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let map = owl_shared::device::parse_nvidia_smi_mem(&String::from_utf8_lossy(&out.stdout));
+    if map.is_empty() {
+        None
+    } else {
+        Some(map)
+    }
+}
+
+/// **声明式选卡**(2026-10-16):见 `owl_shared::device`。
+/// - `device_ordinal` 显式给 ⇒ 直通(测试/特殊场景;仍查 UUID 供锁用);
+/// - 否则按 `device` 规格从设备表里选(**空规格 = 全部候选**),
+///   再依次用 ①`gpu_lock`(owl 实例)②nvidia-smi 实占内存(阈值 `runtime.gpu_min_free_ratio`)
+///   剔掉不可用的卡,取**首张**;
+/// - 规格未命中任何设备 / 候选全被占 ⇒ 响亮 Err(带设备表或持有者),不静默降级。
+fn resolve_device(rt: &owl_shared::config::RuntimeCfg) -> Result<(usize, String), String> {
+    if let Some(o) = rt.device_ordinal {
+        let uuid = owl_cuda::ffi::device_uuid(o)
+            .map(|b| owl_shared::device::uuid_display(&b))
+            .map_err(|e| format!("device_ordinal={o} 的 UUID 查不到: {e:?}"))?;
+        // 此刻 logger 尚未初始化(log 被丢弃)⇒ 裸 eprintln 保可见(仓规:boot 关键行恒输出)
+        eprintln!("[boot] 选卡(显式 ordinal):{o} → {uuid}");
+        return Ok((o, uuid));
+    }
+    let rows = owl_cuda::ffi::device_rows()?;
+    let hit = rt.device.select(&rows);
+    if hit.is_empty() {
+        let table: Vec<String> = rows
+            .iter()
+            .map(|r| format!("{}[{}|{}]", r.ordinal, r.bdf, r.name))
+            .collect();
+        return Err(format!("device 规格未命中任何设备(spec={:?};设备表={table:?})", rt.device));
+    }
+    let live = owl_shared::gpu_lock::live_locks();
+    let free: Vec<&owl_shared::device::DeviceRow> = hit
+        .iter()
+        .copied()
+        .filter(|r| !live.iter().any(|l| l.uuid == r.uuid))
+        .collect();
+    // ② 实占内存过滤(锁只认 owl 实例;别的进程/未持锁的旧实例也要避让)
+    let (free, mem_ok) = match vram_free_ratio_map() {
+        Some(m) => {
+            let mut keep = Vec::new();
+            let mut skipped: Vec<String> = Vec::new();
+            for r in free {
+                match m.get(&r.uuid) {
+                    Some(ratio) if *ratio < rt.gpu_min_free_ratio => {
+                        skipped.push(format!("{} {} free={:.0}%", r.uuid, r.bdf, ratio * 100.0));
+                    }
+                    _ => keep.push(r),
+                }
+            }
+            if !skipped.is_empty() {
+                eprintln!(
+                    "[boot] 选卡:按实占内存跳过 {} 台(阈值 {:.0}%):{skipped:?}",
+                    skipped.len(),
+                    rt.gpu_min_free_ratio * 100.0
+                );
+            }
+            (keep, true)
+        }
+        // nvidia-smi 不可用 ⇒ 不阻断启动(锁过滤已生效),但响亮提示
+        None => {
+            eprintln!("[boot] 选卡:nvidia-smi 内存查询不可用 ⇒ 跳过实占内存过滤(只按卡锁避让)");
+            (free, false)
+        }
+    };
+    let _ = mem_ok;
+    let picked = free.first().copied().ok_or_else(|| {
+        let holders: Vec<String> = live
+            .iter()
+            .map(|l| format!("{} pid={} port={}", l.uuid, l.pid, l.port))
+            .collect();
+        format!("候选设备全部被占(spec={:?};持有者={holders:?})", rt.device)
+    })?;
+    eprintln!(
+        "[boot] 选卡:命中 {} 台(spec={:?})→ 取 ordinal {} [{}|{}] {};空闲候选 {} 台(logger 前 ⇒ 裸输出)",
+        hit.len(),
+        rt.device,
+        picked.ordinal,
+        picked.bdf,
+        picked.name,
+        picked.uuid,
+        free.len()
+    );
+    Ok((picked.ordinal, picked.uuid.clone()))
 }

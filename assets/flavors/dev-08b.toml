@@ -1,0 +1,4 @@
+# owl 引擎预设档 `dev-08b`(2026-10-16 从 crates/shared/src/config.rs 下沉)
+# 原文注释:// 0.8B 开发基线(dev 面;= 代码缺省 + bind 明示。CI/冒烟快捷档)
+[runtime]
+bind = "127.0.0.1:8135"

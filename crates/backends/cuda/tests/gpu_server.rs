@@ -190,6 +190,51 @@ async fn step_graph_capture_and_replay(client: &mut GpuClient, x: &Bytes) {
     }
 }
 
+/// **步骤 5b:piecewise 骨架 —— 两段捕获 + 段间 eager 写 + 两次回放**
+///
+/// 这是 piecewise 设计(`docs/piecewise-断点图-设计与实现.md`)在 CUDA 面
+/// 依赖的最小机制,先在此钉死(引擎侧 `PiecewisePlan` 复用同一批语义):
+///   seg0(捕获) → **窗外 eager 算子**(断点) → seg1(捕获) → 回放序列 ×2
+/// 判据:① 段间块**地址接力**正确(seg1 读的正是 eager 写的块);
+///       ② 回放**可重复**(同序列两次结果一致 ⇒ 无跨段地址复用/竞态)。
+async fn step_piecewise_two_segments(client: &mut GpuClient, x: &Bytes) {
+    // 输入与跨段"钉块"都在窗外先物化(begin 前)——
+    // 对应设计里"pin 块由 plan 捕获前分配、两期同址"那条不变量
+    let one = client
+        .htod(Dtype::F32, &Shape::from(vec![4]), &le_f32(&[1.0f32; 4]))
+        .await
+        .expect("htod one");
+    let mid = client.alloc(Dtype::F32, 4).await.expect("pin 块(mid)").view(Dtype::F32, 1);
+    let tail = client.alloc(Dtype::F32, 4).await.expect("pin 块(tail)").view(Dtype::F32, 1);
+
+    // ── 段0:out0 = x + one ──
+    let out0 = client.alloc(Dtype::F32, 4).await.expect("carve out0").view(Dtype::F32, 1);
+    client.graph_begin().await.expect("seg0 begin");
+    client.launch(add_msg(x, &one, &out0, 4)).await.expect("seg0 launch");
+    let g0 = client.graph_end().await.expect("seg0 end");
+
+    // ── 断点(窗外 eager):mid = out0 + out0(调用方自行求值,写进钉块)──
+    let eager_mid = || add_msg(&out0, &out0, &mid, 4);
+    client.launch(eager_mid()).await.expect("breakpoint eager");
+
+    // ── 段1:tail = mid + one ──
+    client.graph_begin().await.expect("seg1 begin");
+    client.launch(add_msg(&mid, &one, &tail, 4)).await.expect("seg1 launch");
+    let g1 = client.graph_end().await.expect("seg1 end");
+
+    // ── 回放序列 ×2:seg0 → 断点重放 → seg1 ──
+    for i in 0..2 {
+        client.graph_launch(g0).await.expect("replay g0");
+        client.launch(eager_mid()).await.expect("replay breakpoint");
+        client.graph_launch(g1).await.expect("replay g1");
+        let got = harvest(client, &tail, 4).await;
+        // x=[1.0;4] → out0=2 → mid=4 → tail=5
+        assert_all_close(&got, 5.0, &format!("piecewise 回放 #{i}"));
+        let got_mid = harvest(client, &mid, 4).await;
+        assert_all_close(&got_mid, 4.0, &format!("跨段钉块 mid #{i}"));
+    }
+}
+
 /// 步骤 6:图护栏四连
 async fn step_graph_guardrails(client: &mut GpuClient, x: &Bytes) {
     // a) graph_begin 后做 dtoh → Err
@@ -468,7 +513,8 @@ async fn gpu_server_contract() {
         .htod(Dtype::F32, &Shape::from(vec![4]), &le_f32(&xs))
         .await
         .expect("htod");
-    step_graph_capture_and_replay(&mut client, &x).await; // 5
+    step_graph_capture_and_replay(&mut client, &x).await;
+    step_piecewise_two_segments(&mut client, &x).await; // 5
     step_graph_guardrails(&mut client, &x).await; // 6
 
     // ---- S1 探针:cuGraphLaunch host 成本(微型 vs 大图;零旗标已定谳无关)----

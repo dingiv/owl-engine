@@ -1,0 +1,5 @@
+# owl 引擎预设档 `fi-kv8`(2026-10-16 从 crates/shared/src/config.rs 下沉)
+# 原文注释:// fp8 KV 池档(2026-10-13:FlashInfer **恒启用**,故本档只剩 fp8 KV
+# 这一维;原"FI 开关 + 27B FI 面挂账"随开关移除一并作废)
+[dispatch]
+kv_fp8 = true
