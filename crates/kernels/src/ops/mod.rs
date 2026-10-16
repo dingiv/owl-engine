@@ -29,7 +29,8 @@
 //!    对不上就红,不靠人眼);
 //! 2. 槽序串由 [`crate::spec::token_of`] 从 `PARAMS` 派生 —— 本模块**没有**
 //!    任何手写的 `"T,T,O,..."` 字符串;
-//! 3. 池块 dtype 用 `Dtype::U8`(e4m3/字节池)如实标注,不许拿 U32 冒充。
+//! 3. 池块 dtype **点名格式**:fp8 池 = `Dtype::F8E4M3`、int8 激活 = `Dtype::I8`
+//!    (**不许**再用 `U8` 兜 —— `U8` 只留真正不透明的字节块;2026-10-16 收窄)。
 
 use crate::spec::KernelMeta;
 
@@ -353,6 +354,14 @@ pub const PROD_AWQ27B_2026_10_13: &[&str] = &[
     "owl_ct_repack_a8_u32",
     "owl_add_f16",
     "owl_argmax_f32idx_f16",
+    // **装载域**(2026-10-16 补):checkpoint 的 `embed_tokens`/`lm_head` 是 BF16,
+    // 引擎态是 F16 ⇒ 装载期走**复合命令**(`UploadAndLaunch`,段复合)里的
+    // bf16→f16 铸边界。**本表重启时缺它**,而 `launch_time` 记账只覆盖
+    // `handle_launch`(复合口不进那条路径)⇒ "真跑 + 逐发射记账"的生成方法
+    // **系统性漏装载域算子**(现场:`--flavor awq27b` + 草稿档启动即被准入拒:
+    // `Weight 'model.language_model.embed_tokens.weight': 段复合 contract
+    // owl_cast_bf16_f16 … 未列入`)。
+    "owl_cast_bf16_f16",
     "owl_ct_repack_u32",
     "owl_embed_f16",
     "owl_fused_add_rmsnorm_f16",
@@ -443,6 +452,97 @@ pub const PRODUCTION_UNION_2026_10_13: &[&str] = &[
 
 #[cfg(test)]
 mod tests {
+    /// **池面算子的源定义门**(E1,2026-10-17):从声明面 `POOL` 投影出"触池"的
+    /// **原生**算子,逐个核 `.cu` 源里有定义 —— 这是 models 侧那份手抄核名清单
+    /// 的**派生替身**(手抄清单会漏:新池核忘了写进去 ⇒ 门静默变窄,正是
+    /// `kv_manifest_gate` 的 FIXME)。
+    ///
+    /// 外族(虚核:FI / XQA)不入此门 —— 它们的符号不在 AOT 资产索引里
+    /// (实测 5 名:`flashinfer_prefill_paged_{f16,fp8kv}` / `owl_xqa_{decode,prefill,verify}`),
+    /// 由各自族 runtime 自校验;本门只覆盖 `.cu` 编译进资产的原生核。
+    #[test]
+    fn pool_kernels_are_defined_in_source() {
+        let mut checked = 0usize;
+        let mut foreign = 0usize;
+        for m in super::all() {
+            if m.pool.is_empty() {
+                continue;
+            }
+            if m.family != crate::contract::OpId(crate::spec::NATIVE) {
+                foreign += 1;
+                continue;
+            }
+            assert!(
+                crate::cu_sig::source_defines(m.src, m.entry),
+                "{}: 声明了池访问(POOL)但 .cu 源里无同名定义 —— 池写者/读者漏建,\
+                 或声明面写错了源(池 dtype 改造漏网的机器面)",
+                m.entry
+            );
+            checked += 1;
+        }
+        // 非空门:池面原生算子实测 **63** 名(2026-10-17 全 feature 档;
+        // 外族 FI/XQA 7 名自理);投影断了(如 POOL 声明被清空)本行立刻红
+        assert!(checked >= 30, "池面原生算子仅 {checked} 名 —— 投影异常(实测 63)");
+        eprintln!("[pool-manifest] 原生池面算子 {checked} 名全部有源定义;外族自理 {foreign} 名");
+    }
+
+    /// **8 位族的声明纪律门**(2026-10-16):fp8 / int8 **必须点名格式**,
+    /// 不许用 `U8` 兜底 —— `U8` 只留给真正不透明的字节块。
+    ///
+    /// 为什么要有这道门:F16/BF16 那一案(L3 只认线格式 tag ⇒ "声明 F16 而
+    /// 内容是 bf16" 能静默过)在 8 位族同样存在;点名格式后,
+    /// **语义面(kv_dtype / 池访问)与事实对不上就在此红**,不必等端到端。
+    #[test]
+    fn eight_bit_dtypes_are_named_not_u8() {
+        use crate::contract::Dtype;
+        let mut checked = 0usize;
+        for m in super::all() {
+            // ① 通则:语义槽(kv_dtype / 池访问)禁 U8
+            if let Some(dt) = m.shape.kv_dtype {
+                assert_ne!(
+                    dt, Dtype::U8,
+                    "{}: kv_dtype 不许用 U8 兜(fp8 请点名 F8E4M3/F8E5M2)", m.entry
+                );
+            }
+            for pa in m.pool {
+                if let Some(dt) = pa.dtype {
+                    assert_ne!(
+                        dt, Dtype::U8,
+                        "{}: 池访问({})不许用 U8 兜(点名格式)", m.entry, pa.pool
+                    );
+                }
+            }
+            // ② fp8 算子 ⇒ 点名两种 fp8 之一
+            if m.entry.contains("fp8") {
+                if let Some(dt) = m.shape.kv_dtype {
+                    assert!(
+                        matches!(dt, Dtype::F8E4M3 | Dtype::F8E5M2),
+                        "{}: fp8 算子的 kv_dtype 必须点名(e4m3/e5m2),实得 {dt:?}",
+                        m.entry
+                    );
+                    checked += 1;
+                }
+            }
+            // ③ int8/s8 算子 ⇒ 8 位张量槽必须是 I8
+            if m.entry.contains("int8") || m.entry.contains("_s8") || m.entry.contains("kS8") {
+                for p in m.params {
+                    if let crate::spec::ParamType::Tensor { dtype, .. } = p.ty {
+                        if dtype.size_bytes() == 1 {
+                            assert_eq!(
+                                dtype, Dtype::I8,
+                                "{}::{}: int8 族的 1B 张量槽必须是 I8(有符号),实得 {dtype:?}",
+                                m.entry, p.name
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 10, "本法应该覆盖到十几处 8 位声明,实得 {checked}(门面失明?)");
+        eprintln!("[8bit-gate] 点名格式 OK:覆盖 {checked} 处语义/张量槽");
+    }
+
     use super::*;
     use crate::spec::{meta_of, pools, KernelSpec, LayoutTag, Param, PoolAccess};
 
@@ -554,7 +654,7 @@ mod tests {
         const SRC: &'static str = "";
         const PARAMS: &'static [Param] = &[];
         const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-            kv_dtype: Some(crate::contract::Dtype::U8),
+            kv_dtype: Some(crate::contract::Dtype::F8E4M3),
             head_dim: &[],
             page: &[],
             grp: None,
@@ -563,7 +663,7 @@ mod tests {
         const POOL: &'static [PoolAccess] = &[PoolAccess::read(
             pools::KV_MAIN,
             LayoutTag::Knhd,
-            crate::contract::Dtype::U8,
+            crate::contract::Dtype::F8E4M3,
         )];
     }
     struct Mismatched;
@@ -572,7 +672,7 @@ mod tests {
         const SRC: &'static str = "";
         const PARAMS: &'static [Param] = &[];
         const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-            kv_dtype: Some(crate::contract::Dtype::U8),
+            kv_dtype: Some(crate::contract::Dtype::F8E4M3),
             head_dim: &[],
             page: &[],
             grp: None,
@@ -593,7 +693,7 @@ mod tests {
         const POOL: &'static [PoolAccess] = &[PoolAccess::write(
             pools::KV_MAIN,
             LayoutTag::Knhd,
-            crate::contract::Dtype::U8,
+            crate::contract::Dtype::F8E4M3,
         )];
     }
     struct WriteClassic;
@@ -604,7 +704,7 @@ mod tests {
         const POOL: &'static [PoolAccess] = &[PoolAccess::write(
             pools::KV_MAIN,
             LayoutTag::Classic,
-            crate::contract::Dtype::U8,
+            crate::contract::Dtype::F8E4M3,
         )];
     }
 
@@ -656,8 +756,8 @@ mod tests {
             (crate::family::gdn_chunked::GDN_CHUNKED_FWD, &["q", "k", "v", "beta", "gate", "state", "tables", "out", "t", "slot", "nv", "nk", "kd", "scale_bits", "nt"], &["F16x3", "F16x3", "F16x3", "F16x2", "F16x2", "F32x4", "U32x1", "F16x3", "U64", "U64", "U64", "U64", "U64", "F32Bits", "U64"]),
             (crate::family::gdn_scalar::GDN_SCALAR_FWD, &["q", "k", "v", "beta", "gate", "state", "out", "t", "slot", "ns", "nv", "nk", "kd", "scale_bits"], &["F32x3", "F32x3", "F32x3", "F32x2", "F32x2", "F32x4", "F16x3", "U64", "U64", "U64", "U64", "U64", "U64", "F32Bits"]),
             (crate::family::marlin::GEMM_W4A16_AWQ, &["a", "b", "out", "scales", "zeros", "ws", "c_tmp", "m", "k", "n", "groupsize"], &["F16x2", "U32x2", "F16x2", "F16x2", "U32x2", "U32x1", "U32x1", "U64", "U64", "U64", "U64"]),
-            (crate::family::marlin::GEMM_W4A8_AWQ, &["a", "b", "out", "scales", "zeros", "a_scales", "ws", "c_tmp", "m", "k", "n", "groupsize"], &["U8x2", "U32x2", "F16x2", "F16x2", "U32x2", "F32x2", "U32x1", "U32x1", "U64", "U64", "U64", "U64"]),
-            (crate::family::marlin::GEMM_W4A16_BF16, &["a", "b", "out", "scales", "ws", "c_tmp", "m", "k", "n", "groupsize"], &["BF16x2", "U32x2", "BF16x2", "F16x2", "U32x1", "U32x1", "U64", "U64", "U64", "U64"]),
+            (crate::family::marlin::GEMM_W4A8_AWQ, &["a", "b", "out", "scales", "zeros", "a_scales", "ws", "c_tmp", "m", "k", "n", "groupsize"], &["I8x2", "U32x2", "F16x2", "F16x2", "U32x2", "F32x2", "U32x1", "U32x1", "U64", "U64", "U64", "U64"]),
+            (crate::family::marlin::GEMM_W4A16_BF16, &["a", "b", "out", "scales", "ws", "c_tmp", "m", "k", "n", "groupsize"], &["BF16x2", "U32x2", "BF16x2", "BF16x2", "U32x1", "U32x1", "U64", "U64", "U64", "U64"]),
             (crate::family::marlin::GEMM_W4A16, &["a", "b", "out", "scales", "ws", "c_tmp", "m", "k", "n", "groupsize"], &["F16x2", "U32x2", "F16x2", "F16x2", "U32x1", "U32x1", "U64", "U64", "U64", "U64"]),
             (crate::family::cublas::GEMM_F16, &["a", "b", "out", "m", "k", "n", "nt"], &["F16x2", "F16x2", "F16x2", "U64", "U64", "U64", "U64"]),
             (crate::family::cublas::GEMM_BF16, &["a", "b", "out", "m", "k", "n", "nt"], &["BF16x2", "BF16x2", "BF16x2", "U64", "U64", "U64", "U64"]),

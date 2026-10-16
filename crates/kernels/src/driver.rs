@@ -66,9 +66,14 @@ pub enum DType {
     BF16,
     /// 装载域 ct packed(U32;owl_ct_repack_u32)
     U32,
-    /// **字节承载**(池块 / 量化输出;S1c 激活 int8 量化是首个非激活域输出)。
-    /// 与 [`U32`](Self::U32) 同律:只有**声明里就是 U8** 的算子能收到它;
-    /// 其余算子的 `match` 一律 [`unimplemented!`](unimplemented)(响亮拒)。
+    /// **FP8 · e4m3**(1B;与 e5m2 并列 —— 不是"FP8"一个东西)
+    F8E4M3,
+    /// **FP8 · e5m2**(1B)
+    F8E5M2,
+    /// **INT8**(1B;有符号 —— 与 fp8 不同族)
+    I8,
+    /// **字节承载**(**仅限真正不透明**的字节块;2026-10-16 收窄:
+    /// fp8/int8 必须点名 `F8E4M3`/`I8`,不许用 U8 兜)
     U8,
 }
 
@@ -431,7 +436,7 @@ pub mod gdn {
         KernelPick { name: match dt {
             DType::F16 => "owl_gdn_gating_g_f16",
             DType::F32 => "owl_gdn_gating_g_f32",
-            DType::BF16 | DType::U32 | DType::U8 => unimplemented!("GDN 族无 U32 变体"),
+            DType::BF16 | DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => unimplemented!("GDN 族无 U32 变体"),
         }, shape: SENTINEL_1D }
     }
 
@@ -441,7 +446,7 @@ pub mod gdn {
             name: match dt {
                 DType::F16 => "owl_gdn_l2norm_f16",
                 DType::F32 => "owl_gdn_l2norm_f32",
-                DType::BF16 | DType::U32 | DType::U8 => unimplemented!("GDN 族无 U32 变体"),
+                DType::BF16 | DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => unimplemented!("GDN 族无 U32 变体"),
             },
             shape: Shape { grid: (rows as u32, 1, 1), ..SENTINEL_1D },
         }
@@ -452,7 +457,7 @@ pub mod gdn {
         KernelPick { name: match dt {
             DType::F16 => "owl_gdn_conv_upd_f16",
             DType::F32 => "owl_gdn_conv_upd_f32",
-            DType::BF16 | DType::U32 | DType::U8 => unimplemented!("GDN 族无 U32 变体"),
+            DType::BF16 | DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => unimplemented!("GDN 族无 U32 变体"),
         }, shape: SENTINEL_1D }
     }
 
@@ -471,7 +476,7 @@ pub mod gdn {
             name: match dt {
                 DType::F16 => "owl_gdn_delta_dec_f16",
                 DType::F32 => "owl_gdn_delta_dec_f32",
-                DType::BF16 | DType::U32 | DType::U8 => unimplemented!("GDN 族无 U32 变体"),
+                DType::BF16 | DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => unimplemented!("GDN 族无 U32 变体"),
             },
             shape: Shape {
                 grid: (vd.div_ceil(64) as u32, (batch * nv) as u32, 1),
@@ -556,7 +561,7 @@ pub mod gdn {
             name: match dt {
                 DType::F16 => "owl_gdn_norm_act_f16",
                 DType::F32 => "owl_gdn_norm_act_f32",
-                DType::BF16 | DType::U32 | DType::U8 => unimplemented!("GDN 族无 U32 变体"),
+                DType::BF16 | DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => unimplemented!("GDN 族无 U32 变体"),
             },
             shape: Shape {
                 grid: ((rows * value_dim / group_size) as u32, 1, 1),
@@ -579,7 +584,7 @@ pub mod ops {
             name: match dt {
                 DType::F16 => "owl_sigmoid_f16",
                 DType::F32 => "owl_sigmoid_f32",
-                DType::BF16 | DType::U32 | DType::U8 => unimplemented!("sigmoid 无 BF16/U32 变体"),
+                DType::BF16 | DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => unimplemented!("sigmoid 无 BF16/U32 变体"),
             },
             shape: SENTINEL_1D,
         }
@@ -592,7 +597,7 @@ pub mod ops {
                 DType::F32 => "owl_add_f32",
                 DType::F16 => "owl_add_f16",
                 DType::BF16 => "owl_add_bf16",
-                DType::U32 | DType::U8 => unimplemented!("add 无 U32 变体"),
+                DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => unimplemented!("add 无 U32 变体"),
             },
             shape: SENTINEL_1D,
         }
@@ -605,7 +610,7 @@ pub mod ops {
                 DType::F32 => "owl_mul_f32",
                 DType::F16 => "owl_mul_f16",
                 DType::BF16 => "owl_mul_bf16",
-                DType::U32 | DType::U8 => unimplemented!("mul 无 U32 变体"),
+                DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => unimplemented!("mul 无 U32 变体"),
             },
             shape: SENTINEL_1D,
         }
@@ -617,7 +622,7 @@ pub mod ops {
             name: match dt {
                 DType::F32 => "owl_silu_f32",
                 DType::F16 => "owl_silu_f16",
-                DType::BF16 | DType::U32 | DType::U8 => unimplemented!("silu 无 BF16/U32 变体(MLP 走 silu_and_mul)"),
+                DType::BF16 | DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => unimplemented!("silu 无 BF16/U32 变体(MLP 走 silu_and_mul)"),
             },
             shape: SENTINEL_1D,
         }
@@ -663,7 +668,7 @@ pub mod ops {
             DType::F32 => "owl_rmsnorm_f32",
             DType::F16 => "owl_rmsnorm_f16",
             DType::BF16 => "owl_rmsnorm_bf16",
-            DType::U32 | DType::U8 => unimplemented!("rmsnorm 无 U32 变体"),
+            DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => unimplemented!("rmsnorm 无 U32 变体"),
         };
         let x_total: usize = shapes.first().map(|s| s.iter().product()).unwrap_or(0);
         let cols: usize = shapes.get(1).map(|s| s.iter().product()).unwrap_or(1);
@@ -698,7 +703,7 @@ pub mod dflash {
             name: match dt {
                 DType::F16 => "owl_dflash_conv_f16",
                 DType::BF16 => "owl_dflash_conv_bf16",
-                DType::F32 | DType::U32 | DType::U8 => unimplemented!("dflash_conv 仅 f16/bf16"),
+                DType::F32 | DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => unimplemented!("dflash_conv 仅 f16/bf16"),
             },
             shape: SENTINEL_1D,
         }
@@ -1159,7 +1164,7 @@ pub mod attn {
             name: match dt {
                 DType::F16 => "owl_naive_decode_attn_f16",
                 DType::F32 => "owl_naive_decode_attn_f32",
-                DType::BF16 | DType::U32 | DType::U8 => unimplemented!("naive attn 无 U32 变体"),
+                DType::BF16 | DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => unimplemented!("naive attn 无 U32 变体"),
             },
             shape: SENTINEL_1D,
         }
@@ -1191,7 +1196,7 @@ pub mod attn {
             (DType::BF16, false) => "owl_naive_attn_nc_bf16",
             (DType::F16, true) => "owl_naive_attn_nc_fp8kv_f16",
             (DType::BF16, true) => "owl_naive_attn_nc_fp8kv_bf16",
-            (DType::F32, _) | (DType::U32, _) | (DType::U8, _) => {
+            (DType::F32, _) | (DType::U32, _) | (DType::U8, _) | (DType::F8E4M3, _) | (DType::F8E5M2, _) | (DType::I8, _) => {
                 unimplemented!("naive_nc 仅 f16/bf16")
             }
         };

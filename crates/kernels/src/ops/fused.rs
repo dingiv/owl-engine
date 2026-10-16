@@ -35,14 +35,14 @@ impl KernelSpec for QknormRopeKvInsertF16Fp8Knhd {
         Param::i32("w_off"),
         Param::t_out("q_out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Knhd, Dtype::U8)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F8E4M3)];
     const SELFCHECK: Option<&'static dyn crate::bootcheck::BootCheck> =
         Some(&crate::ops::oracles::qknorm_insert::QknormInsertOracle);
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::U8),
+        kv_dtype: Some(Dtype::F8E4M3),
         head_dim: &[128, 256],
         page: &[16, 32, 64, 128],
         grp: None,
@@ -77,14 +77,14 @@ impl KernelSpec for QknormRopeKvInsertF16Fp8 {
         Param::t_out("q_out", Dtype::F16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[
-        PoolAccess::write(pools::KV_MAIN, LayoutTag::Classic, Dtype::U8),
-        PoolAccess::write(pools::KV_DRAFT, LayoutTag::Classic, Dtype::U8),
+        PoolAccess::write(pools::KV_MAIN, LayoutTag::Classic, Dtype::F8E4M3),
+        PoolAccess::write(pools::KV_DRAFT, LayoutTag::Classic, Dtype::F8E4M3),
     ];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::U8),
+        kv_dtype: Some(Dtype::F8E4M3),
         head_dim: &[128, 256],
         page: &[16, 32, 64, 128],
         grp: None,
