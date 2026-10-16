@@ -41,7 +41,7 @@ impl DeviceRes for &mut dyn DeviceRes {
     fn resolve_len(&self, id: u64) -> Result<usize, OpError> {
         (**self).resolve_len(id)
     }
-    fn alloc(&mut self, bytes: usize, tag: &'static str) -> Result<ScratchBuf, OpError> {
+    fn alloc(&mut self, bytes: usize, tag: &str) -> Result<ScratchBuf, OpError> {
         (**self).alloc(bytes, tag)
     }
     fn capturing(&self) -> Result<bool, OpError> {
@@ -66,7 +66,7 @@ impl DeviceRes for &mut dyn DeviceRes {
     fn download(&mut self, src: DevPtr, dst: &mut [u8]) -> Result<(), OpError> {
         (**self).download(src, dst)
     }
-    fn alloc_block(&mut self, bytes: usize, tag: &'static str) -> Result<crate::contract::Bytes, OpError> {
+    fn alloc_block(&mut self, bytes: usize, tag: &str) -> Result<crate::contract::Bytes, OpError> {
         (**self).alloc_block(bytes, tag)
     }
     fn upload_block(&mut self, b: &crate::contract::Bytes, src: &[u8]) -> Result<(), OpError> {
@@ -112,7 +112,7 @@ pub trait DeviceRes {
     /// 多回传账长);块不在本账本 ⇒ 拒。
     fn resolve_len(&self, id: u64) -> Result<usize, OpError>;
     /// scratch 分配:账本 + 捕获 slab 感知 + A1.7 强租约
-    fn alloc(&mut self, bytes: usize, tag: &'static str) -> Result<ScratchBuf, OpError>;
+    fn alloc(&mut self, bytes: usize, tag: &str) -> Result<ScratchBuf, OpError>;
     /// 捕获状态查询(当前是否处于图捕获窗)
     fn capturing(&self) -> Result<bool, OpError>;
     /// A1.6 登记钩子(捕获窗内的发射原材料;server 组装 CaptureRecord)
@@ -153,7 +153,7 @@ pub trait DeviceRes {
     /// (不进账房 ⇒ 不能被 `resolve` 解析);而 FFI/家族 runtime 的算子参数
     /// 是**块句柄** ⇒ 自检要跑 foreign 算子(marvin/xqa/FI/cublas)就必须能
     /// 拿到"真在册的块"。返回 [`Bytes`](crate::contract::Bytes) 句柄。
-    fn alloc_block(&mut self, bytes: usize, tag: &'static str) -> Result<crate::contract::Bytes, OpError>;
+    fn alloc_block(&mut self, bytes: usize, tag: &str) -> Result<crate::contract::Bytes, OpError>;
 
     /// **按块句柄上传**(装配期自检专用;2026-10-13 P5c)。
     ///

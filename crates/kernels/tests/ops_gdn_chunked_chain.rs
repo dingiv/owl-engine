@@ -27,7 +27,7 @@ struct TestRes {
     ctx: Arc<CudaContext>,
     stream: Arc<cudarc::driver::CudaStream>,
     blocks: HashMap<u64, CudaSlice<u8>>,
-    tags: HashMap<&'static str, (u64, usize)>, // tag → (id, bytes)
+    tags: HashMap<String, (u64, usize)>, // tag → (id, bytes)(String:全量记名后 tag 不再要求 'static)
     next_id: u64,
     notes: std::cell::RefCell<Vec<String>>,
 }
@@ -97,11 +97,11 @@ impl DeviceRes for TestRes {
             }
         })
     }
-    fn alloc(&mut self, bytes: usize, tag: &'static str) -> Result<ScratchBuf, owl_kernels::contract::OpError> {
+    fn alloc(&mut self, bytes: usize, tag: &str) -> Result<ScratchBuf, owl_kernels::contract::OpError> {
         let (id, d) = self.alloc_id(bytes);
         let ptr = d.device_ptr(&self.stream).0;
         self.blocks.insert(id, d);
-        self.tags.insert(tag, (id, bytes));
+        self.tags.insert(tag.to_string(), (id, bytes));
         Ok(ScratchBuf { ptr, bytes })
     }
 
@@ -166,7 +166,7 @@ impl DeviceRes for TestRes {
     fn alloc_block(
         &mut self,
         bytes: usize,
-        tag: &'static str,
+        tag: &str,
     ) -> Result<owl_kernels::contract::Bytes, owl_kernels::contract::OpError> {
         // 测试面:走裸分配 + 在册登记(resolve 可解析)
         let s = unsafe { self.stream.alloc::<u8>(bytes.max(1)) }

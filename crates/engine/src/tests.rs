@@ -97,7 +97,16 @@ pub async fn gpu_piecewise_segments() {
             "回放 #{i} 值应 5.0,得 {v:?}"
         );
     }
-    eprintln!("[piecewise] 两段一断点捕获 + 双回放 值一致 ✓");
+    // **引用计数推送面**(全量记名同轮;2026-10-16):图 plan 的 warmup 探针窗内,
+    // 求值器必须把 `(users, pending)` 推给探针 —— "它凭什么是活的"的数据源。
+    // 判据用**计数器**而非日志(日志受级别过滤;计数是机械事实)。窗口在 plan
+    // 内部 `probe_on/off`,on 时清零 ⇒ 此处读到的是本次 plan 的推送量。
+    let pushed = owl_shared::slab_hint::refs_pushed();
+    assert!(
+        pushed > 0,
+        "两段计划跑完后引用计数推送为 0 ⇒ 数据源断了(记名/OOM dump 的\"为什么活着\"面失效)"
+    );
+    eprintln!("[piecewise] 两段一断点捕获 + 双回放 值一致 ✓(引用计数推送 {pushed} 次)");
 }
 
 fn asset_dir() -> std::path::PathBuf {

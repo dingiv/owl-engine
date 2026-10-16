@@ -21,20 +21,20 @@ impl GpuServer {
 
 
     /// srv.seg.htod 分相(与客户端同名段对账;差值 = 管道/等待)
-    pub(super) fn handle_htod(&mut self, data: Vec<u8>, ack: Ack<Result<Bytes, ModelError>>) {
+    pub(super) fn handle_htod(&mut self, data: Vec<u8>, name: String, ack: Ack<Result<Bytes, ModelError>>) {
         let t0 = std::time::Instant::now();
-        self.handle_htod_inner(data, ack);
+        self.handle_htod_inner(data, &name, ack);
         self.sink.timer("srv.seg.htod", t0.elapsed());
     }
 
-    pub(super) fn handle_htod_inner(&mut self, data: Vec<u8>, ack: Ack<Result<Bytes, ModelError>>) {
+    pub(super) fn handle_htod_inner(&mut self, data: Vec<u8>, name: &str, ack: Ack<Result<Bytes, ModelError>>) {
         let mut ack = Some(ack);
         let n = data.len();
         let stream = match self.ctx().stream(STREAM_H2D) {
             Ok(s) => s.clone(),
             Err(e) => return ack.take().unwrap().send(Err(e)),
         };
-        match self.try_htod(&stream, &data) {
+        match self.try_htod(&stream, &data, name) {
             Ok((id, buf)) => {
                 // 发射账:上传**落定**记 id + 设备地址(A13 类"跨流 UAF"的钥匙:
                 // 该地址的 COMPUTE 读者是否在本次落定**之前**就已发射)
@@ -79,12 +79,13 @@ impl GpuServer {
         &mut self,
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
         data: &[u8],
+        name: &str,
     ) -> Result<(u64, Box<dyn owl_iface::contract::PinnedRegion + Send>), ModelError> {
         let n = data.len();
         // 1. 设备块(流序 malloc;未初始化;字节口径)
         let dst = unsafe { stream.alloc::<u8>(n) }
             .map_err(|e| ModelError::Msg(format!("htod alloc: {e:?}")))?;
-        let id = self.ctx_mut().new_block(dst);
+        let id = self.ctx_mut().new_block(dst, name);
         // 2. pinned 码头 + 异步 memcpy(流序;host 侧必须 pinned 才真异步)。
         //    码头池化(2026-09-26 尾批:原每次 malloc_host 新分配,大权重
         //    锁页分配是装载耗时大头;finish 回调归还池)
@@ -117,6 +118,7 @@ impl GpuServer {
     pub(super) fn handle_alloc_pinned(
         &mut self,
         bytes: usize,
+        name: String,
         ack: Ack<Result<Box<dyn owl_iface::contract::PinnedRegion + Send>, ModelError>>,
     ) {
         // 池取（内部单次加锁；容量 ≥ 请求即命中，逻辑长度由调用方界定）
@@ -129,7 +131,7 @@ impl GpuServer {
         // miss 才 cudaHostAlloc（页锁定；大块 ~300ms —— 装载期主要成本之一）
         owl_shared::counter_inc!("srv.pinned_miss");
         owl_shared::counter_add!("srv.pinned_miss_bytes", bytes as u64);
-        match owl_shared::timer_scope!("srv.pinned_alloc", Staging::alloc(bytes, "alloc_pinned")) {
+        match owl_shared::timer_scope!("srv.pinned_alloc", Staging::alloc(bytes, &name)) {
             Ok(s) => ack.send(Ok(Box::new(s))),
             Err(e) => ack.send(Err(e)),
         }

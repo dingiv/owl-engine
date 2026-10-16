@@ -2499,9 +2499,9 @@ mod f16_tests {
         }
         let mut gpu = gpu_client().await;
         let sh = crate::contract::Shape::from;
-        let dl = gpu.htod(Dtype::F16, &sh(vec![heads]), &hbytes(&a_log)).await.unwrap();
-        let da = gpu.htod(Dtype::F16, &sh(vec![total]), &hbytes(&a)).await.unwrap();
-        let dd = gpu.htod(Dtype::F16, &sh(vec![heads]), &hbytes(&dt)).await.unwrap();
+        let dl = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![heads]), &hbytes(&a_log)).await.unwrap();
+        let da = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![total]), &hbytes(&a)).await.unwrap();
+        let dd = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![heads]), &hbytes(&dt)).await.unwrap();
         let (l, a_, d_) = (
             TensorOps::of_block(dl.id, Dtype::F16, vec![heads]),
             TensorOps::of_block(da.id, Dtype::F16, vec![total / heads, heads]),  // 契约 a r2([行, 头])
@@ -2529,7 +2529,7 @@ mod f16_tests {
             for i in 0..dim { want[r * dim + i] = x[r * dim + i] * inv; }
         }
         let mut gpu = gpu_client().await;
-        let dx = gpu.htod(Dtype::F16, &crate::contract::Shape::from(vec![rows, dim]), &hbytes(&x)).await.unwrap();
+        let dx = owl_iface::htod!(gpu, Dtype::F16, &crate::contract::Shape::from(vec![rows, dim]), &hbytes(&x)).await.unwrap();
         let x_decl = TensorOps::of_block(dx.id, Dtype::F16, vec![rows, dim]);
         let decl = TensorOps::call(SemanticKernel::GdnL2Norm).aux(&[rows]).arg(&x_decl).arg_usize(rows).arg_usize(dim).arg_f32(1e-6)
         .with_shape(Dtype::F16, vec![rows, dim]);
@@ -2563,9 +2563,9 @@ mod f16_tests {
         }
         let mut gpu = gpu_client().await;
         let sh = crate::contract::Shape::from;
-        let dxi = gpu.htod(Dtype::F16, &sh(vec![rows, vd]), &hbytes(&x)).await.unwrap();
-        let dzi = gpu.htod(Dtype::F16, &sh(vec![rows, vd]), &hbytes(&z)).await.unwrap();
-        let dgi = gpu.htod(Dtype::F16, &sh(vec![gs]), &hbytes(&gamma)).await.unwrap();
+        let dxi = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![rows, vd]), &hbytes(&x)).await.unwrap();
+        let dzi = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![rows, vd]), &hbytes(&z)).await.unwrap();
+        let dgi = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![gs]), &hbytes(&gamma)).await.unwrap();
         let (x_, z_, g_) = (
             TensorOps::of_block(dxi.id, Dtype::F16, vec![rows, vd]),
             TensorOps::of_block(dzi.id, Dtype::F16, vec![rows, vd]),
@@ -2602,16 +2602,16 @@ mod f16_tests {
         let rec_b = crate::interpreters::eval_ops(
             TensorOps::zeros(Dtype::F32, vec![slots_n, nv, kd, vd]).step(), &mut gpu).await.unwrap();
         let rec = TensorOps::of_block(rec_b.id, Dtype::F32, vec![slots_n, nv, kd, vd]);
-        let dwb = gpu.htod(Dtype::F16, &sh(vec![d, 4]), &hbytes(&w)).await.unwrap();
-        let dal = gpu.htod(Dtype::F16, &sh(vec![nv]), &hbytes(&a_log)).await.unwrap();
-        let ddt = gpu.htod(Dtype::F16, &sh(vec![nv]), &hbytes(&dt)).await.unwrap();
+        let dwb = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![d, 4]), &hbytes(&w)).await.unwrap();
+        let dal = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![nv]), &hbytes(&a_log)).await.unwrap();
+        let ddt = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![nv]), &hbytes(&dt)).await.unwrap();
         let w_decl = TensorOps::of_block(dwb.id, Dtype::F16, vec![d, 4]);
         let _al_decl = TensorOps::of_block(dal.id, Dtype::F16, vec![nv]);
         let _dt_decl = TensorOps::of_block(ddt.id, Dtype::F16, vec![nv]);
 
         for step in 0..2u32 {
             let x: Vec<f32> = q(&(0..batch * d).map(|i| ((i as f32 + step as f32 * 7.0) * 0.31).sin()).collect::<Vec<_>>());
-            let dxi = gpu.htod(Dtype::F16, &sh(vec![batch, d]), &hbytes(&x)).await.unwrap();
+            let dxi = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![batch, d]), &hbytes(&x)).await.unwrap();
             let x_decl = TensorOps::of_block(dxi.id, Dtype::F16, vec![batch, d]);
             let sl = TensorOps::from_host(Dtype::F32, vec![batch], &f32b(&slots));
             // conv_upd(q 段,w_offset=0)
@@ -2653,11 +2653,11 @@ mod f16_tests {
             let qv: Vec<f32> = q(&(0..batch * nk * kd).map(|i| ((i as f32 + step as f32) * 0.17).sin()).collect::<Vec<_>>());
             let kv: Vec<f32> = q(&(0..batch * nk * kd).map(|i| ((i as f32 + step as f32) * 0.23).cos()).collect::<Vec<_>>());
             let vv: Vec<f32> = q(&(0..batch * nv * vd).map(|i| ((i as f32 + step as f32) * 0.29).sin()).collect::<Vec<_>>());
-            let dq = gpu.htod(Dtype::F16, &sh(vec![batch, nk, kd]), &hbytes(&qv)).await.unwrap();
-            let dk = gpu.htod(Dtype::F16, &sh(vec![batch, nk, kd]), &hbytes(&kv)).await.unwrap();
-            let dv = gpu.htod(Dtype::F16, &sh(vec![batch, nv, vd]), &hbytes(&vv)).await.unwrap();
-            let dg = gpu.htod(Dtype::F16, &sh(vec![batch, nv]), &hbytes(&g_v)).await.unwrap();
-            let db = gpu.htod(Dtype::F16, &sh(vec![batch, nv]), &hbytes(&beta)).await.unwrap();
+            let dq = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![batch, nk, kd]), &hbytes(&qv)).await.unwrap();
+            let dk = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![batch, nk, kd]), &hbytes(&kv)).await.unwrap();
+            let dv = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![batch, nv, vd]), &hbytes(&vv)).await.unwrap();
+            let dg = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![batch, nv]), &hbytes(&g_v)).await.unwrap();
+            let db = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![batch, nv]), &hbytes(&beta)).await.unwrap();
             let (q_, k_, v_, g_, b_) = (
                 TensorOps::of_block(dq.id, Dtype::F16, vec![batch, nk, kd]),
                 TensorOps::of_block(dk.id, Dtype::F16, vec![batch, nk, kd]),
@@ -2718,8 +2718,8 @@ mod f16_tests {
         let st_a_b = crate::interpreters::eval_ops(
             TensorOps::zeros(Dtype::F32, vec![1, d, 3]).step(), &mut gpu).await.unwrap();
         let st_a = TensorOps::of_block(st_a_b.id, Dtype::F32, vec![1, d, 3]);
-        let dwb = gpu.htod(Dtype::F16, &sh(vec![d, 4]), &hbytes(&w)).await.unwrap();
-        let dxb = gpu.htod(Dtype::F16, &sh(vec![t, d]), &hbytes(&x)).await.unwrap();
+        let dwb = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![d, 4]), &hbytes(&w)).await.unwrap();
+        let dxb = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![t, d]), &hbytes(&x)).await.unwrap();
         let w_decl = TensorOps::of_block(dwb.id, Dtype::F16, vec![d, 4]);
         let x_decl = TensorOps::of_block(dxb.id, Dtype::F16, vec![t, d]);
         let sl = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot as f32]));
@@ -2735,7 +2735,7 @@ mod f16_tests {
         let st_b = TensorOps::of_block(st_b_b.id, Dtype::F32, vec![1, d, 3]);
         let mut outs = Vec::new();
         for tk in 0..t {
-            let one = gpu.htod(Dtype::F16, &sh(vec![1, d]), &hbytes(&x[tk * d..(tk + 1) * d])).await.unwrap();
+            let one = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![1, d]), &hbytes(&x[tk * d..(tk + 1) * d])).await.unwrap();
             let one_decl = TensorOps::of_block(one.id, Dtype::F16, vec![1, d]);
             let sl1 = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot as f32]));
             let c = TensorOps::call(SemanticKernel::GdnConvUpd).arg(&one_decl).arg(&w_decl).arg(&st_b).arg(&sl1)
@@ -2780,11 +2780,11 @@ mod f16_tests {
         let st_a_b = crate::interpreters::eval_ops(
             TensorOps::zeros(Dtype::F32, vec![1, nv, kd, vd]).step(), &mut gpu).await.unwrap();
         let st_a = TensorOps::of_block(st_a_b.id, Dtype::F32, vec![1, nv, kd, vd]);
-        let dq = gpu.htod(Dtype::F16, &sh(vec![t, nk, kd]), &hbytes(&qv)).await.unwrap();
-        let dk = gpu.htod(Dtype::F16, &sh(vec![t, nk, kd]), &hbytes(&kv)).await.unwrap();
-        let dv = gpu.htod(Dtype::F16, &sh(vec![t, nv, vd]), &hbytes(&vv)).await.unwrap();
-        let dg = gpu.htod(Dtype::F16, &sh(vec![t, nv]), &hbytes(&gv)).await.unwrap();
-        let db = gpu.htod(Dtype::F16, &sh(vec![t, nv]), &hbytes(&bv)).await.unwrap();
+        let dq = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![t, nk, kd]), &hbytes(&qv)).await.unwrap();
+        let dk = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![t, nk, kd]), &hbytes(&kv)).await.unwrap();
+        let dv = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![t, nv, vd]), &hbytes(&vv)).await.unwrap();
+        let dg = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![t, nv]), &hbytes(&gv)).await.unwrap();
+        let db = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![t, nv]), &hbytes(&bv)).await.unwrap();
         let (q_, k_, v_, g_, b_) = (
             TensorOps::of_block(dq.id, Dtype::F16, vec![t, nk, kd]),
             TensorOps::of_block(dk.id, Dtype::F16, vec![t, nk, kd]),
@@ -2808,11 +2808,11 @@ mod f16_tests {
         let mut outs = Vec::new();
         for tk in 0..t {
             let (rq, rk, rv, rg, rb) = (
-                gpu.htod(Dtype::F16, &sh(vec![1, nk, kd]), &hbytes(&qv[tk * nk * kd..(tk + 1) * nk * kd])).await.unwrap(),
-                gpu.htod(Dtype::F16, &sh(vec![1, nk, kd]), &hbytes(&kv[tk * nk * kd..(tk + 1) * nk * kd])).await.unwrap(),
-                gpu.htod(Dtype::F16, &sh(vec![1, nv, vd]), &hbytes(&vv[tk * nv * vd..(tk + 1) * nv * vd])).await.unwrap(),
-                gpu.htod(Dtype::F16, &sh(vec![1, nv]), &hbytes(&gv[tk * nv..(tk + 1) * nv])).await.unwrap(),
-                gpu.htod(Dtype::F16, &sh(vec![1, nv]), &hbytes(&bv[tk * nv..(tk + 1) * nv])).await.unwrap(),
+                owl_iface::htod!(gpu, Dtype::F16, &sh(vec![1, nk, kd]), &hbytes(&qv[tk * nk * kd..(tk + 1) * nk * kd])).await.unwrap(),
+                owl_iface::htod!(gpu, Dtype::F16, &sh(vec![1, nk, kd]), &hbytes(&kv[tk * nk * kd..(tk + 1) * nk * kd])).await.unwrap(),
+                owl_iface::htod!(gpu, Dtype::F16, &sh(vec![1, nv, vd]), &hbytes(&vv[tk * nv * vd..(tk + 1) * nv * vd])).await.unwrap(),
+                owl_iface::htod!(gpu, Dtype::F16, &sh(vec![1, nv]), &hbytes(&gv[tk * nv..(tk + 1) * nv])).await.unwrap(),
+                owl_iface::htod!(gpu, Dtype::F16, &sh(vec![1, nv]), &hbytes(&bv[tk * nv..(tk + 1) * nv])).await.unwrap(),
             );
             let (q_, k_, v_, g_, b_) = (
                 TensorOps::of_block(rq.id, Dtype::F16, vec![1, nk, kd]),

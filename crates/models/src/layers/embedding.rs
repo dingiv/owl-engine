@@ -225,9 +225,9 @@ mod f16_tests {
         let tokens = 3usize;
 
         let mut gpu = gpu_client().await;
-        let dw = gpu.htod(Dtype::F16, &crate::contract::Shape::from(vec![vocab, d]),
+        let dw = owl_iface::htod!(gpu, Dtype::F16, &crate::contract::Shape::from(vec![vocab, d]),
             &w.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()).await.expect("htod w");
-        let di = gpu.htod(Dtype::F32, &crate::contract::Shape::from(vec![tokens]),
+        let di = owl_iface::htod!(gpu, Dtype::F32, &crate::contract::Shape::from(vec![tokens]),
             &crate::testkit::f32b(&ids)).await.expect("htod ids");
 
         // htod 块 → Block 叶子声明(f16 链不走 CpuFace 的 from_host)

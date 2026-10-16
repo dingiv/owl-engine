@@ -142,15 +142,15 @@ async fn run_case(
     } else {
         a_ref.iter().map(|f| half::f16::from_f32(*f).to_bits()).collect()
     };
-    let da = client.htod(Dtype::F16, &Shape::from(vec![m, k]), &le_u16(&a_bits)).await.expect("htod a");
+    let da = owl_iface::htod!(client, Dtype::F16, &Shape::from(vec![m, k]), &le_u16(&a_bits)).await.expect("htod a");
     // u16 位序 = f16 LE ✓(f16::to_bits 是 u16 表示,LE 字节序正确)
-    let db = client.htod(Dtype::U32, &Shape::from(vec![b_packed.len()]), &le_i32(&b_packed)).await.expect("htod b");
-    let ds = client.htod(Dtype::F16, &Shape::from(vec![s_packed.len()]), &le_u16(&s_packed)).await.expect("htod s");
+    let db = owl_iface::htod!(client, Dtype::U32, &Shape::from(vec![b_packed.len()]), &le_i32(&b_packed)).await.expect("htod b");
+    let ds = owl_iface::htod!(client, Dtype::F16, &Shape::from(vec![s_packed.len()]), &le_u16(&s_packed)).await.expect("htod s");
     let ws_mul: usize = owl_shared::env_reader::parse_or("OWL_WS_MUL", 1);
     let ws_len = owl_kernels::family::marlin::v2_workspace_len(n).max(n / 128 * 16) * ws_mul;
-    let dws = client.alloc(Dtype::U32, ws_len).await.expect("alloc ws");
-    let dctmp = client.alloc(Dtype::U32, 1).await.expect("alloc ctmp");
-    let dc = client.alloc(Dtype::F16, m * n).await.expect("alloc c");
+    let dws = owl_iface::alloc!(client, Dtype::U32, ws_len).await.expect("alloc ws");
+    let dctmp = owl_iface::alloc!(client, Dtype::U32, 1).await.expect("alloc ctmp");
+    let dc = owl_iface::alloc!(client, Dtype::F16, m * n).await.expect("alloc c");
 
     client
         .launch(marlin_launch(
@@ -420,21 +420,21 @@ async fn run_awq_case_g(client: &mut GpuClient, m: usize, n: usize, k: usize, g:
     let z_packed = owl_kernels::family::marlin::repack::pack_marlin_z(&zp_u8, n, groups);
     assert_eq!(z_packed.len(), groups * (n / 8));
 
-    let da = client.htod(Dtype::F16, &Shape::from(vec![m, k]), &le_u16(
+    let da = owl_iface::htod!(client, Dtype::F16, &Shape::from(vec![m, k]), &le_u16(
         &a.iter().map(|f| half::f16::from_f32(*f).to_bits()).collect::<Vec<_>>(),
     )).await.expect("htod a");
-    let db = client.htod(Dtype::U32, &Shape::from(vec![b_packed.len()]), &le_i32(&b_packed)).await.expect("htod b");
-    let ds = client.htod(Dtype::F16, &Shape::from(vec![s_packed.len()]), &le_u16(&s_packed)).await.expect("htod s");
-    let dz = client.htod(Dtype::U32, &Shape::from(vec![z_packed.len()]), &le_i32(&z_packed)).await.expect("htod z");
-    let dws = client.alloc(Dtype::U32, owl_kernels::family::marlin::v2_workspace_len(n)).await.expect("alloc ws");
-    let dctmp = client.alloc(Dtype::U32, 1).await.expect("alloc ctmp");
-    let dc = client.alloc(Dtype::F16, m * n).await.expect("alloc c");
+    let db = owl_iface::htod!(client, Dtype::U32, &Shape::from(vec![b_packed.len()]), &le_i32(&b_packed)).await.expect("htod b");
+    let ds = owl_iface::htod!(client, Dtype::F16, &Shape::from(vec![s_packed.len()]), &le_u16(&s_packed)).await.expect("htod s");
+    let dz = owl_iface::htod!(client, Dtype::U32, &Shape::from(vec![z_packed.len()]), &le_i32(&z_packed)).await.expect("htod z");
+    let dws = owl_iface::alloc!(client, Dtype::U32, owl_kernels::family::marlin::v2_workspace_len(n)).await.expect("alloc ws");
+    let dctmp = owl_iface::alloc!(client, Dtype::U32, 1).await.expect("alloc ctmp");
+    let dc = owl_iface::alloc!(client, Dtype::F16, m * n).await.expect("alloc c");
     // 哨兵填充:-7.0(launch 后若残留 = 内核未写 C)
     {
         let sent: Vec<u8> = (0..m * n)
             .flat_map(|_| half::f16::from_f32(-7.0).to_le_bytes())
             .collect();
-        let dsent = client.htod(Dtype::F16, &Shape::from(vec![m * n]), &sent).await.expect("sent");
+        let dsent = owl_iface::htod!(client, Dtype::F16, &Shape::from(vec![m * n]), &sent).await.expect("sent");
         client.copy_block_at(&dsent, 0, &dc, 0, sent.len()).await.expect("sent copy");
     }
 
@@ -513,8 +513,8 @@ async fn ct_repack_parity() {
         assert_eq!(b_ref.len(), (k / 16) * (rows * 2));
 
         // GPU
-        let dp = client.htod(Dtype::U32, &Shape::from(vec![packed.len()]), &le_i32(&packed)).await.expect("htod packed");
-        let dout = client.alloc(Dtype::U32, b_ref.len()).await.expect("alloc out");
+        let dp = owl_iface::htod!(client, Dtype::U32, &Shape::from(vec![packed.len()]), &le_i32(&packed)).await.expect("htod packed");
+        let dout = owl_iface::alloc!(client, Dtype::U32, b_ref.len()).await.expect("alloc out");
         let msg = LaunchMsg {
             kernel: owl_cuda::KernelSource {
                 name: "owl_ct_repack_u32".into(),

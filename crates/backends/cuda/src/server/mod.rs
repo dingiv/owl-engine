@@ -132,8 +132,16 @@ pub struct GpuServer {
     /// **发射账**(cuda.trace_ring > 0 时建;见 crate::trace 模块头)
     trace: Option<std::sync::Arc<crate::trace::TraceRing>>,
     /// scratch 物理账本(家族 runtime 的 alloc 落此;append-only,
-    /// 释放 = server 销毁 —— 家族 grave 是逻辑侧,这里是物理侧)
-    scratch_ledger: Vec<(u64, CudaSlice<u8>)>,
+    /// 释放 = server 销毁 —— 家族 grave 是逻辑侧,这里是物理侧)。
+    /// `String` = **分配点点名**(全量记名;scratch 是裸指针、**不在块账房**
+    /// ⇒ OOM 按名清单必须另行收录它,否则家族开销在 dump 里隐身)。
+    scratch_ledger: Vec<(u64, CudaSlice<u8>, String)>,
+    /// **峰值快照水位**(诊断;`OWL_VRAM_PEAK_MB` 门开时才动):上次落盘时的
+    /// 引擎账 `vram::live` 水位。新水位超过"上次水位 × 步进"才再落一份 ——
+    /// 既拿到"爬到 OOM 的过程",又不会把 `/tmp` 写爆。
+    peak_watermark_bytes: u64,
+    /// 已落盘的峰值快照数(上界 `OWL_VRAM_PEAK_MAX`,缺省 8)
+    peak_snapshots: u32,
     /// 完成派发出口(host 回调只投递;派发线程执行真正的 finish)
     dispatch: Option<mpsc::Sender<Finish>>,
     /// 逐命令计时账本(OWL_SRV_TIMING;name / count / total_ns / max_ns)
@@ -198,6 +206,8 @@ impl GpuServer {
             allowed_ops: diag.allowed_ops.clone(),
             exec: owl_kernels::device::Exec::new(),
             scratch_ledger: Vec::new(),
+            peak_watermark_bytes: 0,
+            peak_snapshots: 0,
             dispatch: None,
             timings: Vec::new(),
             probes: ServerProbes::from_parts(&diag, debug),
@@ -214,6 +224,212 @@ impl GpuServer {
             diag,
             sink,
         }
+    }
+
+    /// **scratch 账本按名清单**(家族 runtime 的裸指针分配;块账房看不见它们
+    /// 但显存是实打实占的 —— OOM dump 必需面;2026-10-16 全量记名)。
+    fn scratch_report_by_name(&self, top: usize) -> String {
+        let mut agg: std::collections::HashMap<&str, (u64, usize)> =
+            std::collections::HashMap::new();
+        for (_, s, name) in self.scratch_ledger.iter() {
+            let g = agg.entry(name.as_str()).or_insert((0, 0));
+            g.0 += s.len() as u64;
+            g.1 += 1;
+        }
+        if agg.is_empty() {
+            return "(无)".to_string();
+        }
+        let mut rows: Vec<(&str, (u64, usize))> = agg.into_iter().collect();
+        rows.sort_unstable_by_key(|(_, v)| std::cmp::Reverse(v.0));
+        let total: u64 = rows.iter().map(|(_, v)| v.0).sum();
+        let mut s = format!(
+            "家族 scratch {} 笔/{:.1}MiB(按名 top{top}):",
+            self.scratch_ledger.len(),
+            total as f64 / 1048576.0
+        );
+        for (name, (bytes, n)) in rows.iter().take(top) {
+            s.push_str(&format!(
+                " {}={:.1}MiB×{n}",
+                if name.is_empty() { "(未命名!)" } else { name },
+                *bytes as f64 / 1048576.0
+            ));
+        }
+        s
+    }
+
+    /// **显存现场 JSON**(块账 + 家族 scratch;2026-10-16)。
+    ///
+    /// 给机器读的那份(OOM 落盘 / 跨时间比对的输入);人读那份是
+    /// [`Self::ledger_report`]。两者的**聚合口径同源**(都走 state 侧
+    /// 按名聚合与降序)⇒ 不会互相漂移。
+    ///
+    /// 为什么把 scratch 拼在这里:scratch 是**裸指针账本**,不在块账房里
+    /// (`GpuCtx::block_json` 看不见它)—— 少拼这一半就等于把家族开销
+    /// (实测 fi/xqa 共 96MiB)从现场里抹掉。
+    fn ledger_dump_json(&self) -> String {
+        let ts_ms = now_ms();
+        let scratch = {
+            let mut agg: std::collections::HashMap<&str, (u64, usize)> =
+                std::collections::HashMap::new();
+            for (_, s, name) in self.scratch_ledger.iter() {
+                let g = agg.entry(name.as_str()).or_insert((0, 0));
+                g.0 += s.len() as u64;
+                g.1 += 1;
+            }
+            let mut rows: Vec<(&str, (u64, usize))> = agg.into_iter().collect();
+            rows.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(b.0)));
+            let total_bytes: u64 = rows.iter().map(|(_, v)| v.0).sum();
+            let total_blocks: usize = rows.iter().map(|(_, v)| v.1).sum();
+            // 与 `block_json` **同形**(数组 + 自己的 totals)—— 两段各自自洽,
+            // 拼装时不再有"谁的总量跟谁"的归属歧义(见下方拼装注释)。
+            let mut o = String::with_capacity(128 + rows.len() * 64);
+            o.push('{');
+            o.push_str("\"scratch\":[");
+            for (i, (name, (bytes, n))) in rows.iter().enumerate() {
+                if i > 0 {
+                    o.push(',');
+                }
+                o.push('{');
+                o.push_str("\"name\":");
+                o.push_str(&crate::state::json_string(name));
+                o.push_str(&format!(",\"bytes\":{bytes},\"blocks\":{n}"));
+                o.push('}');
+            }
+            o.push(']');
+            o.push_str(&format!(",\"total_bytes\":{total_bytes},\"total_blocks\":{total_blocks}"));
+            o.push('}');
+            o
+        };
+        // 拼装:**两段各是自洽对象**(各自带自己的 `total_*`),对拼即得现场。
+        //
+        // ⚠️ 这里踩过一个结构性坑(2026-10-16,已被 gpu_server 步骤 13 的真解析
+        // 抓出):原先是"剥掉 `block_json` 的外壳、把它的 totals 留在后面"⇒
+        // 渲染成 `{"blocks":[…],"total_bytes":B,"total_blocks":N,"scratch":[…]}`,
+        // 而 totals 出现在 `scratch` **之前** ⇒ **读者会把它当成 scratch 的总量**
+        // (两段的配对整体错位)。教训:JSON 的"配对"靠**嵌套**表达,不靠顺序 ——
+        // 每段自带外壳,归属就没有歧义。
+        let mut out = String::with_capacity(2048);
+        out.push('{');
+        out.push_str(&format!(
+            "\"meta\":{{\"ts_ms\":{ts_ms},\"phase\":{},\"live_bytes\":{}}},\"blocks\":",
+            crate::state::json_string(self.phase_name()),
+            owl_shared::vram::live_bytes()
+        ));
+        out.push_str(&self.ctx().block_json());
+        out.push_str(",\"scratch\":");
+        // `scratch` 段**自带 `"scratch":[…]` 键**(见上)—— 这里的拼装因此是
+        // "值对象 + 键值对" 的互补:避免出现 `{…},{…}` 这种**相邻对象**
+        // (语法错;gpu_server 步骤 13 的正确性门当场抓出)。
+        out.push_str(&scratch);
+        out.push('}');
+        out
+    }
+
+    /// 当前相位名(dump 的"什么时候的现场";诊断词表有界)。
+    fn phase_name(&self) -> &'static str {
+        if self.ctx().capture_stream() {
+            "capture"
+        } else if self.ctx().graph_count() > 0 {
+            "graph"
+        } else {
+            "eager"
+        }
+    }
+
+    /// **OOM 现场落盘**(门:`OWL_VRAM_DUMP`;2026-10-16)。
+    ///
+    /// 家法同 `prompt_dump`(`running.rs`):`OWL_VRAM_DUMP=1` ⇒
+    /// `/tmp/owl-vram-{ms}.json`;给了路径 ⇒ 写该路径。**只在 OOM 时写**
+    /// (峰值/OOM 是唯一真正要看它的一刻;常态写会淹掉 `/tmp`)。
+    /// 失败不覆盖原错:只记一行 log(可失败返回值不吞 —— 见 §门纪律)。
+    fn dump_vram_on_oom(&self) {
+        let Some(target) = owl_shared::env_reader::str("OWL_VRAM_DUMP") else {
+            return;
+        };
+        self.write_vram_dump(&target, "OOM");
+    }
+
+    /// **峰值快照**(门:`OWL_VRAM_PEAK_MB`;2026-10-16)。
+    ///
+    /// 与 OOM 落盘的分工:OOM 那份是"现场",本份是"**爬到现场的阶梯**" ——
+    /// 只看 OOM 那一刻无法回答"是稳态就高,还是某一步突然涨上去的"。
+    ///
+    /// 纪律三条:
+    /// - **门控默认关**(`OWL_VRAM_PEAK_MB` 未设 = 零开销零文件);
+    /// - **步进去重**:新水位 < 上次水位 × 1.05 ⇒ 不写(否则每步都写,`/tmp` 爆);
+    /// - **总数有上界**(`OWL_VRAM_PEAK_MAX`,缺省 8)⇒ 写满即停,失败不清零水位。
+    fn maybe_dump_peak(&mut self) {
+        let Some(threshold_mb) = owl_shared::env_reader::parse::<u64>("OWL_VRAM_PEAK_MB") else {
+            return;
+        };
+        if threshold_mb == 0 {
+            return;
+        }
+        let live = owl_shared::vram::live_bytes();
+        let max = owl_shared::env_reader::parse_or::<u32>("OWL_VRAM_PEAK_MAX", 8);
+        // 三重判据(门值/步进 5%/上界)在 state 侧纯函数里 —— 那边有离线单测
+        let Some(live) = crate::state::peak_should_dump(
+            live,
+            threshold_mb << 20,
+            self.peak_watermark_bytes,
+            self.peak_snapshots,
+            max,
+        ) else {
+            return;
+        };
+        self.peak_watermark_bytes = live;
+        self.peak_snapshots += 1;
+        let path = format!("/tmp/owl-vram-peak-{}-{}MiB.json", now_ms(), live >> 20);
+        let json = self.ledger_dump_json();
+        match std::fs::write(&path, json) {
+            Ok(()) => self.sink.logf(
+                owl_shared::log::LVL_INFO,
+                "vram-peak",
+                format_args!(
+                    "峰值快照 #{}/{} 已落盘:{path}(live={}MiB,相位={})",
+                    self.peak_snapshots,
+                    max,
+                    live >> 20,
+                    self.phase_name()
+                ),
+            ),
+            Err(e) => self.sink.logf(
+                owl_shared::log::LVL_WARN,
+                "vram-peak",
+                format_args!("峰值快照落盘失败({path}):{e}"),
+            ),
+        }
+    }
+
+    /// 统一的现场落盘体(路径解析同源;写失败只留痕、**不掩盖原错**)。
+    fn write_vram_dump(&self, target: &str, why: &str) {
+        let path = crate::state::resolve_vram_dump_path(target, now_ms());
+        match std::fs::write(&path, self.ledger_dump_json()) {
+            Ok(()) => self.sink.logf(
+                owl_shared::log::LVL_WARN,
+                "vram-dump",
+                format_args!("{why} 现场已落盘:{path}"),
+            ),
+            Err(e) => self.sink.logf(
+                owl_shared::log::LVL_WARN,
+                "vram-dump",
+                format_args!("{why} 现场落盘失败({path}):{e}(原错误不被覆盖)"),
+            ),
+        }
+    }
+
+    /// **块账 + scratch 账按名清单**(查询面与 OOM dump 同一渲染 —— 口径单源)。
+    fn ledger_report(&self, top: usize) -> String {
+        let unnamed = self.ctx().unnamed_blocks();
+        format!(
+            "{}{} ‖ {}",
+            self.ctx().block_report_by_name(top),
+            match unnamed {
+                0 => String::new(),
+                n => format!(" ‖ ⚠ 未命名块 {n}(分配点没报名字 ⇒ 记名有漏)"),
+            },
+            self.scratch_report_by_name(top.min(8))
+        )
     }
 
     /// 分配落定入账(id + 设备地址;地址 = 生命周期判据的钥匙)
@@ -284,7 +500,7 @@ impl GpuServer {
                 e.out_id = out_id;
                 e
             }
-            Command::Htod { data, .. } => E::new("htod", "h2d").bytes(data.len()),
+            Command::Htod { data, name, .. } => E::new("htod", "h2d").bytes(data.len()).name(name.clone()),
             Command::HtodChunk { block, data, .. } => {
                 E::new("htod_chunk", "h2d").bytes(data.len()).id(*block)
             }
@@ -297,9 +513,9 @@ impl GpuServer {
             Command::Dtoh { id, want_bytes, .. } => {
                 E::new("dtoh", "d2h").bytes(*want_bytes).id(*id)
             }
-            Command::Alloc { n_bytes, zero, .. } => E::new("alloc", "compute")
+            Command::Alloc { n_bytes, zero, name, .. } => E::new("alloc", "compute")
                 .bytes(*n_bytes)
-                .name(if *zero { "zero" } else { "uninit" }),
+                .name(format!("{}{name}", if *zero { "zero:" } else { "uninit:" })),
             Command::MemsetZero { block, len_bytes, .. } => {
                 let ptrs = resolve(&[*block]);
                 E::new("memset_zero", "compute").bytes(*len_bytes).id(*block).ptrs(ptrs)
@@ -326,7 +542,10 @@ impl GpuServer {
             Command::GraphLaunch { .. } => E::new("graph_launch", "compute"),
             Command::GraphAbort { .. } => E::new("graph_abort", ""),
             Command::GraphDestroy { .. } => E::new("graph_destroy", ""),
-            Command::AllocPinned { bytes, .. } => E::new("alloc_pinned", "").bytes(*bytes),
+            Command::AllocPinned { bytes, name, .. } => E::new("alloc_pinned", "").bytes(*bytes).name(name.clone()),
+            // 查询面:零字节、零流、零地址(它不产设备动作);名字位记 top-N
+            Command::LedgerReport { top, .. } => E::new("ledger_report", "").name(format!("top{top}")),
+            Command::LedgerJson { .. } => E::new("ledger_json", ""),
             Command::Close { .. } => E::new("close", ""),
         }
     }
@@ -645,7 +864,11 @@ impl GpuServer {
         if self.ctx().capture_stream() {
             return match cmd {
                 Command::Launch { msg, ack } => self.handle_launch(msg, ack),
-                Command::Alloc { n_bytes, elems, zero, ack } => self.handle_alloc(n_bytes, elems, zero, ack),
+                Command::Alloc { n_bytes, elems, zero, name, ack } => self.handle_alloc(n_bytes, elems, zero, name, ack),
+                // 块账查询 = **纯读**(不碰设备/不改块账)⇒ 捕获期放行:排障常要
+                // 在窗内看"此刻谁占着",而拒它等于把最有价值的那一刻挖掉。
+                Command::LedgerReport { top, ack } => ack.send(Ok(self.ledger_report(top))),
+            Command::LedgerJson { ack } => ack.send(Ok(self.ledger_dump_json())),
                 Command::MemsetZero { block, offset_bytes, len_bytes, ack } => {
                     self.handle_memset_zero(block, offset_bytes, len_bytes, ack)
                 }
@@ -666,16 +889,18 @@ impl GpuServer {
         }
 
         match cmd {
-            Command::Alloc { n_bytes, elems, zero, ack } => self.handle_alloc(n_bytes, elems, zero, ack),
+            Command::Alloc { n_bytes, elems, zero, name, ack } => self.handle_alloc(n_bytes, elems, zero, name, ack),
             Command::MemsetZero { block, offset_bytes, len_bytes, ack } => {
                 self.handle_memset_zero(block, offset_bytes, len_bytes, ack)
             }
-            Command::Htod { data, ack } => self.handle_htod(data, ack),
+            Command::Htod { data, name, ack } => self.handle_htod(data, name, ack),
             Command::HtodChunks { writes, ack } => self.handle_htod_chunks(writes, ack),
             Command::HtodChunk { block, offset_bytes, data, ack } => {
                 self.handle_htod_chunk(block, offset_bytes, data, ack)
             }
-            Command::AllocPinned { bytes, ack } => self.handle_alloc_pinned(bytes, ack),
+            Command::AllocPinned { bytes, name, ack } => self.handle_alloc_pinned(bytes, name, ack),
+            Command::LedgerReport { top, ack } => ack.send(Ok(self.ledger_report(top))),
+            Command::LedgerJson { ack } => ack.send(Ok(self.ledger_dump_json())),
             Command::UploadPinned { buf, dst, offset_bytes, len_bytes, ack } => {
                 self.handle_upload_pinned(buf, dst, offset_bytes, len_bytes, ack)
             }
@@ -728,6 +953,8 @@ impl GpuServer {
             Command::HtodChunk { ack, .. } => closed!(ack),
             Command::HtodChunks { ack, .. } => closed!(ack),
             Command::AllocPinned { ack, .. } => closed!(ack),
+            Command::LedgerReport { ack, .. } => closed!(ack),
+            Command::LedgerJson { ack, .. } => closed!(ack),
             Command::UploadPinned { ack, .. } => closed!(ack),
             Command::BlockLedgerDump { ack } => closed!(ack),
             Command::MemPoolTrim { ack } => closed!(ack),
@@ -766,6 +993,8 @@ impl GpuServer {
             Command::HtodChunk { .. } => "HtodChunk",
             Command::HtodChunks { .. } => "HtodChunks",
             Command::AllocPinned { .. } => "AllocPinned",
+            Command::LedgerReport { .. } => "LedgerReport",
+            Command::LedgerJson { .. } => "LedgerJson",
             Command::UploadPinned { .. } => "UploadPinned",
             Command::Dtoh { .. } => "Dtoh",
             Command::Free { .. } => "Free",
@@ -788,6 +1017,8 @@ impl GpuServer {
             Command::HtodChunk { ack, .. } => reject!(ack),
             Command::HtodChunks { ack, .. } => reject!(ack),
             Command::AllocPinned { ack, .. } => reject!(ack),
+            Command::LedgerReport { ack, .. } => reject!(ack),
+            Command::LedgerJson { ack, .. } => reject!(ack),
             Command::UploadPinned { ack, .. } => reject!(ack),
             // **E2 负门**:复合命令内含搬运/回读(不可捕获)⇒ 捕获期结构化拒
             Command::BlockLedgerDump { ack } => reject!(ack),
@@ -811,10 +1042,11 @@ impl GpuServer {
         n_bytes: usize,
         elems: usize,
         zero: bool,
+        name: String,
         ack: Ack<Result<Bytes, ModelError>>,
     ) {
         let t0 = std::time::Instant::now();
-        self.handle_alloc_inner(n_bytes, elems, zero, ack);
+        self.handle_alloc_inner(n_bytes, elems, zero, &name, ack);
         self.sink.timer("srv.seg.alloc", t0.elapsed());
     }
 
@@ -823,6 +1055,7 @@ impl GpuServer {
         n_bytes: usize,
         elems: usize,
         zero: bool,
+        name: &str,
         ack: Ack<Result<Bytes, ModelError>>,
     ) {
         // 捕获期:从 slab 切块(零 cudaMalloc;malloc 在捕获窗内非法)。
@@ -832,7 +1065,7 @@ impl GpuServer {
         // (1207 节点 launch/GPU 双税定谳,2026-09-30)
         if self.ctx().capture_stream() {
             let result = (|| {
-                let id = self.ctx_mut().carve_block(n_bytes)?;
+                let id = self.ctx_mut().carve_block(n_bytes, name)?;
                 self.trace_alloc_done(id);
                 if zero {
                     let stream = self.ctx().stream(STREAM_COMPUTE)?.clone();
@@ -886,6 +1119,20 @@ impl GpuServer {
                         owl_shared::vram::live_bytes() >> 20
                     ),
                 );
+                // **按名清单**(全量记名的兑现点;2026-10-16):总量三账只回答
+                // "多满",不回答"谁占着" —— 本行把在册块按名聚合上屏。
+                // ⚠️ 读的是**控制器自己的**块账(块就在本账房里;`blocks` 与
+                // slab 同源)。未命名计数 = 全量记名的漏网信号(>0 即某调用点
+                // 没报名字)。
+                // 与查询面(LedgerReport)/记名门**同一渲染** —— 口径单源。
+                let by_name = format!("按名清单:{}", self.ledger_report(12));
+                self.sink.logf(
+                    owl_shared::log::LVL_WARN,
+                    "vram-ledger",
+                    format_args!("{by_name}"),
+                );
+                // 结构化现场(门控;默认关 ⇒ 常态零文件)
+                self.dump_vram_on_oom();
                 Err(ModelError::Msg(format!("alloc({n_bytes}B / {:.1}MiB): {e:?}", n_bytes as f64 / 1048576.0)))
             }
         }
@@ -908,7 +1155,7 @@ impl GpuServer {
                         )));
                     }
                 }
-                let id = self.ctx_mut().new_block(slice);
+                let id = self.ctx_mut().new_block(slice, name);
                 if zero {
                     // **填坑(2026-10-16)**:memset 是 COMPUTE 上的设备侧异步写,
                     // 而 host→device 搬运在 H2D 流 —— 跨流无序,晚到的 memset 会把
@@ -919,6 +1166,9 @@ impl GpuServer {
                 // 发射账:**分配落定**记 id + 设备地址(trace 条目 alloc 本身
                 // 无 id —— 生命周期判据要它才能把地址钉到块上)
                 self.trace_alloc_done(id);
+                // 峰值快照(门控默认关;见 `maybe_dump_peak`)。放这里而不是
+                // 每步轮询:真分配 = live 账**只可能上升**的点(复用不产生新账)。
+                self.maybe_dump_peak();
                 // **未命名块追凶**(诊断;`OWL_ALLOC_TRACE=1`):64..192KiB 的真分配逐条
                 // 上屏(前 60 条 + 之后每 100 条一条;带 id 单调序 ⇒ 与段/相位对时)。
                 // 背景:段化图的探针"活跃峰值"里冒出一碶**未命名**块(verify:1452 块
@@ -1403,7 +1653,7 @@ unsafe extern "C" fn trampoline(data: *mut std::ffi::c_void) {
 pub(crate) struct GpuRes<'a> {
     /// 可变:`alloc_block`(自检面真账本块分配)要往账房插条目(2026-10-13 P5c)
     pub ctx: &'a mut crate::state::GpuCtx,
-    pub scratch: &'a mut Vec<(u64, CudaSlice<u8>)>,
+    pub scratch: &'a mut Vec<(u64, CudaSlice<u8>, String)>,
     /// 本 actor 账本编号(DeadBlock 定谳:跨账本时能看出"问的是哪个账房")
     pub actor_tag: u64,
 }
@@ -1466,8 +1716,8 @@ impl GpuRes<'_> {
         let (target, cap) = self
             .scratch
             .iter()
-            .find(|(p, _)| *p == dst)
-            .map(|(_, s)| (s.clone(), s.len()))
+            .find(|(p, _, _)| *p == dst)
+            .map(|(_, s, _)| (s.clone(), s.len()))
             .ok_or_else(|| OpError::Contract {
                 op: OP_RES.into(),
                 field: "upload",
@@ -1559,7 +1809,7 @@ impl owl_kernels::device::DeviceRes for GpuRes<'_> {
     fn resolve_len(&self, id: u64) -> Result<usize, OpError> {
         Ok(self.resolve_span(id)?.1)
     }
-    fn alloc(&mut self, bytes: usize, tag: &'static str) -> Result<ScratchBuf, OpError> {
+    fn alloc(&mut self, bytes: usize, tag: &str) -> Result<ScratchBuf, OpError> {
         // 与旧 handler 同机制:stream.alloc_zeros(cudarc 直分配)。append-only
         // 账本,物理释放 = server 销毁。
         //
@@ -1596,7 +1846,7 @@ impl owl_kernels::device::DeviceRes for GpuRes<'_> {
         let ptr = d.device_ptr(&stream).0;
         // 入账:scratch 不在块账房(裸指针,不可 resolve)⇒ 账上只有这一条线索
         self.note_device("fam_alloc", tag, bytes, &[ptr]);
-        self.scratch.push((ptr, d));
+        self.scratch.push((ptr, d, tag.to_string()));
         Ok(ScratchBuf { ptr, bytes })
     }
     fn capturing(&self) -> Result<bool, OpError> {
@@ -1650,7 +1900,7 @@ impl owl_kernels::device::DeviceRes for GpuRes<'_> {
     fn alloc_block(
         &mut self,
         bytes: usize,
-        tag: &'static str,
+        tag: &str,
     ) -> Result<owl_kernels::contract::Bytes, OpError> {
         // 装配期自检用:真账本块(可被 resolve)。**不计 slab/vram 音账** ——
         // 自检块是装配期一次性小额,且池预算在自检之前已按固定面定尺;
@@ -1661,7 +1911,7 @@ impl owl_kernels::device::DeviceRes for GpuRes<'_> {
             stage: owl_kernels::contract::Stage::Load,
             detail: format!("alloc_block[{tag}]({bytes}B): {e:?}"),
         })?;
-        let id = self.ctx.new_block(slice);
+        let id = self.ctx.new_block(slice, tag);
         Ok(owl_kernels::contract::Bytes::new(id, bytes, Dtype::U8, 0))
     }
 
@@ -1748,4 +1998,12 @@ impl owl_kernels::device::DeviceRes for GpuRes<'_> {
     fn device_ordinal(&self) -> Result<i32, OpError> {
         Ok(self.ctx.device_ordinal() as i32)
     }
+}
+
+/// 墙钟毫秒(诊断落盘用;时钟回拨 = 0,非失败路径 —— 与 `prompt_dump` 同律)
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }

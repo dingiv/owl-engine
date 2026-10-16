@@ -425,8 +425,10 @@ impl LoadStaging {
         };
         if ring.slots.is_empty() {
             for _ in 0..2 {
+                // 记名(全量):暂存区名 + 臂 tag(如 `staging.cast_bf16_in`)
+                let nm = format!("staging.{}", arm.tag());
                 let id = face
-                    .alloc_uninit(arm.slot_dtype(), ring.slot_bytes)
+                    .alloc_uninit(arm.slot_dtype(), ring.slot_bytes, &nm)
                     .await
                     .map_err(|e| ModelError::Msg(format!("暂存区 {}: alloc {e}", arm.tag())))?
                     .id;
@@ -733,9 +735,11 @@ async fn load_direct<D: DeviceClient, S: WeightSource + ?Sized>(
     }
     let esz = w.dtype.size_bytes();
     let mut probe = KeyProbe::start(tap, &w.key, n * esz);
+    // 记名(全量):`wt.<键名>` —— 装载期最大的一块块账消费者,名字就是来源键
+    let nm = format!("wt.{}", w.key);
     let b = {
         let _s = probe.span("out_alloc");
-        face.alloc(w.dtype, n)
+        face.alloc(w.dtype, n, &nm)
             .await
             .map_err(|e| ModelError::Msg(format!("Weight '{}': {e}", w.key)))?
     };
@@ -747,7 +751,7 @@ async fn load_direct<D: DeviceClient, S: WeightSource + ?Sized>(
         let len = chunk_elems.min(n - off);
         let mut lease = {
             let _s = probe.span("pinned_alloc");
-            face.alloc_pinned(len * esz)
+            face.alloc_pinned(len * esz, &format!("pin.{}", w.key))
                 .await
                 .map_err(|e| ModelError::Msg(format!("Weight '{}': {e}", w.key)))?
         };
@@ -808,10 +812,11 @@ async fn load_direct_device_cast<D: DeviceClient, S: WeightSource + ?Sized>(
     let esz = Dtype::BF16.size_bytes();
     let mut probe = KeyProbe::start(tap, &w.key, n * esz);
     let mut csum = 0xcbf29ce484222325u64;
-    // 目标块(永久产物)
+    // 目标块(永久产物)。记名:`wt.<键名>`(与 cpu-cast 臂同律)。
+    let nm = format!("wt.{}", w.key);
     let b = {
         let _s = probe.span("out_alloc");
-        face.alloc(w.dtype, n)
+        face.alloc(w.dtype, n, &nm)
             .await
             .map_err(|e| ModelError::Msg(format!("Weight '{}': {e}", w.key)))?
     };
@@ -921,7 +926,7 @@ async fn fill_native_chunks<D: DeviceClient, S: WeightSource + ?Sized>(
         let len = chunk_elems.min(len_total - off);
         let mut lease = {
             let _s = probe.span("pinned_alloc");
-            face.alloc_pinned(len * esz)
+            face.alloc_pinned(len * esz, &format!("pin.{key}"))
                 .await
                 .map_err(|e| ModelError::Msg(format!("Weight '{key}': {e}")))?
         };
@@ -960,7 +965,8 @@ async fn fill_packed_chunks<D: DeviceClient, S: WeightSource + ?Sized>(
         let len = chunk_elems.min(raw_elems - off);
         let mut lease = {
             let _s = probe.span("pinned_alloc");
-            face.alloc_pinned(len * 4)
+            // 记名(全量):与另一条 repack 路同律(`pin.<键名>`)
+            face.alloc_pinned(len * 4, &format!("pin.{key}"))
                 .await
                 .map_err(|e| ModelError::Msg(format!("Weight '{key}': {e}")))?
         };
@@ -1033,7 +1039,7 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
     //    grid/block 契约公式住 driver(load::ct_repack))
     let out_block = {
         let _s = probe.span("out_alloc");
-        face.alloc_uninit(crate::contract::Dtype::U32, n)
+        face.alloc_uninit(crate::contract::Dtype::U32, n, &format!("repack.{}", w.key))
             .await
             .map_err(|e| ModelError::Msg(format!("Weight '{}': out alloc {e}", w.key)))?
     };
@@ -1144,7 +1150,7 @@ async fn load_transposed<D: DeviceClient, S: WeightSource + ?Sized>(
     };
     let b = {
         let _s = probe.span("htod");
-        face.htod(dtype, &w.shape, &bytes)
+        face.htod(dtype, &w.shape, &bytes, &format!("wt.{}", w.key))
             .await
             .map_err(|e| ModelError::Msg(format!("Weight '{}': {e}", w.key)))?
     };

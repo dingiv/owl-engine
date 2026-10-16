@@ -182,6 +182,170 @@ fn assert_ledger(id: u64, ledger: u32) -> Result<(), ModelError> {
     Ok(())
 }
 
+/// 在册块 → **按名聚合**文本(纯函数:OOM dump 与单测共用;2026-10-16)。
+///
+/// 输入是 `(名字, 字节)` 流 —— **不碰 `BlockEntry` 本体**:OOM 现场渲染与
+/// 显存账目本体解耦(单测零 CUDA 依赖:裁决面只考"名字怎么聚、怎么排、怎么
+/// 截断、空名怎么显形"四件事)。
+///
+/// 排序=字节降序(谁占大头在前);`top` 之外折入"…另 N 类"。空名渲染成
+/// `(未命名!)` —— 漏网信号必须显眼,不能静默混入正常名字里。
+pub(crate) fn render_block_report<'a, I>(blocks: I, top: usize) -> String
+where
+    I: Iterator<Item = (&'a str, usize)>,
+{
+    let mut agg: std::collections::HashMap<&str, (u64, usize)> = std::collections::HashMap::new();
+    for (name, bytes) in blocks {
+        let g = agg.entry(name).or_insert((0, 0));
+        g.0 += bytes as u64;
+        g.1 += 1;
+    }
+    if agg.is_empty() {
+        return "(块账空)".to_string();
+    }
+    let mut rows: Vec<(&str, (u64, usize))> = agg.into_iter().collect();
+    rows.sort_unstable_by_key(|(_, v)| std::cmp::Reverse(v.0));
+    let total: u64 = rows.iter().map(|(_, v)| v.0).sum();
+    let nblk: usize = rows.iter().map(|(_, v)| v.1).sum();
+    let mut s = format!(
+        "在册 {} 块 / 合计 {}(按名 top{top}):",
+        nblk,
+        fmt_bytes(total)
+    );
+    for (name, (bytes, n)) in rows.iter().take(top) {
+        s.push_str(&format!(
+            " {}={}×{n}",
+            if name.is_empty() { "(未命名!)" } else { name },
+            fmt_bytes(*bytes)
+        ));
+    }
+    if rows.len() > top {
+        s.push_str(&format!(" …另 {} 类", rows.len() - top));
+    }
+    s
+}
+
+/// 字节 → 人读单位(KB/MiB;2026-10-16)。
+///
+/// 为什么不用"一律 MiB":OOM 现场两头都要看得清 —— 大块(GB 级权重/KV)与
+/// 小块(几十 KB 的常量/表件)同在,一刀切 MiB 会把小块全渲染成 `0.0MiB`。
+fn fmt_bytes(n: u64) -> String {
+    if n >= 1 << 20 {
+        format!("{:.1}MiB", n as f64 / 1048576.0)
+    } else {
+        format!("{:.1}KiB", n as f64 / 1024.0)
+    }
+}
+
+/// 按名清单 → **JSON**(结构化落盘;2026-10-16)。
+///
+/// 为什么要有它:人读的一行够排障,但"跨时间比对/被脚本消费"(例如
+/// 启动前期 vs 稳态、OOM 前 vs OOM 时)需要机器可读。格式故意做成
+/// **行无关的扁平对象**:
+///
+/// ```json
+/// {"blocks":[{"name":"kv.k.0","bytes":16777216,"blocks":1}],"total_bytes":123,"total_blocks":4}
+/// ```
+///
+/// 与 [`render_block_report`] **同源**(同一聚合、同一降序、同一单位律不适用于
+/// JSON —— 这里给**原始字节**),所以两者永不互相漂移。名字原样输出(JSON
+/// 转义由本函数承担:引号/反斜杠/控制字符)。
+pub(crate) fn block_report_json<'a, I>(blocks: I) -> String
+where
+    I: Iterator<Item = (&'a str, usize)>,
+{
+    let mut agg: std::collections::HashMap<&str, (u64, usize)> = std::collections::HashMap::new();
+    for (name, bytes) in blocks {
+        let g = agg.entry(name).or_insert((0, 0));
+        g.0 += bytes as u64;
+        g.1 += 1;
+    }
+    let mut rows: Vec<(&str, (u64, usize))> = agg.into_iter().collect();
+    rows.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(b.0)));
+    let total_bytes: u64 = rows.iter().map(|(_, v)| v.0).sum();
+    let total_blocks: usize = rows.iter().map(|(_, v)| v.1).sum();
+    // **显式拼**(不吃 format 的 `{{`/`}}` 转义):嵌套名字槽 + 花括号叠加时
+    // 转义极易数错,而错了就是"不是合法 JSON"这种无声失效(实测踩过:
+    // `"…{total_blocks}}}"` 少一个 `}` ⇒ 落盘现场不可解析)。逐段 push 之后
+    // 每一处开合都肉眼可数;`gpu_server` 步骤 13 的真解析器是它的门。
+    let mut out = String::with_capacity(256 + rows.len() * 64);
+    out.push('{');
+    out.push_str("\"blocks\":[");
+    for (i, (name, (bytes, n))) in rows.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('{');
+        out.push_str("\"name\":");
+        out.push_str(&json_string(name));
+        out.push_str(&format!(",\"bytes\":{bytes},\"blocks\":{n}"));
+        out.push('}');
+    }
+    out.push(']');
+    out.push_str(&format!(",\"total_bytes\":{total_bytes},\"total_blocks\":{total_blocks}"));
+    out.push('}');
+    out
+}
+
+/// **峰值快照决策**(纯函数:门值/步进/上界三重判据 ⇒ 离线可测)。
+///
+/// 返回 `Some(新水位)` = 该写;`None` = 不写(未到门/未破步进/写满)。
+/// 与 `GpuServer::maybe_dump_peak` 同源(那边只负责取 env + I/O)。
+ pub(crate) fn peak_should_dump(
+ live: u64,
+ threshold_bytes: u64,
+ watermark: u64,
+ written: u32,
+ max: u32,
+ ) -> Option<u64> {
+ if threshold_bytes == 0 || live < threshold_bytes || written >= max {
+     return None;
+ }
+ // 步进 5%:首次(watermark==0)或显著更高才写
+ if watermark > 0 && live < watermark.saturating_mul(105) / 100 {
+     return None;
+ }
+ Some(live)
+ }
+
+/// **OOM 现场落盘路径解析**(纯函数;离线可测,2026-10-16)。
+///
+/// 门值语义(与 `prompt_dump` 家法一致):
+/// - `"1"` / `""` ⇒ `/tmp/owl-vram-{ms}.json`(时间戳防覆盖);
+/// - 其他值 ⇒ 当显式路径用(调用方指定,便于 CI/脚本固定落点)。
+pub(crate) fn resolve_vram_dump_path(target: &str, ms_epoch: u128) -> String {
+    match target {
+        "" | "1" => format!("/tmp/owl-vram-{ms_epoch}.json"),
+        p => p.to_string(),
+    }
+}
+
+/// JSON 字符串字面量(含转义;名字来自调用点,含路径/冒号/引号的可能)。
+pub(crate) fn json_string(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 2);
+    o.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o.push('"');
+    o
+}
+
+/// 未命名块计数(全量记名漏网信号;纯函数,与 [`render_block_report`] 同源)。
+pub(crate) fn count_unnamed<'a, I>(blocks: I) -> usize
+where
+    I: Iterator<Item = (&'a str, usize)>,
+{
+    blocks.filter(|(name, _)| name.is_empty()).count()
+}
 /// 块账条目:块本体 + 账长 + 账本身份 + 布局/类型(§6.2 VramBlock 最小面)。
 ///
 /// `dtype`/`shape` 当前从字节口径填充 —— cuda 池账是字节级分配
@@ -213,6 +377,14 @@ pub(super) struct BlockEntry {
     pub(super) ledger: u32,
     pub(super) dtype: BlockDtype,
     pub(super) shape: Shape,
+    /// **分配点点名**(全量记名;2026-10-16)。
+    ///
+    /// 为什么必须在这里:`[vram-ledger]` 的 OOM 现场只有三笔**总量**
+    /// (池 used/reserved、驱动 free、引擎 live),追不到"谁占着"。名字是
+    /// 分配**调用点**的事实(核名/层名/装载键名),由 `alloc` 面一路带到
+    /// 账房 —— 池命中(复用)时名字保持首次分配的那次(块身份不变,
+    /// 复用它的语义也一致:同一张图的同一个槽)。
+    pub(super) name: String,
 }
 
 // ============================================================================
@@ -910,6 +1082,11 @@ impl GpuCtx {
         self.ordinal
     }
 
+    /// 已登记图数(诊断:dump 的相位判别用 —— 有图则说明图态臂在跑)
+    pub(super) fn graph_count(&self) -> usize {
+        self.graphs.len()
+    }
+
     pub(super) fn capture_stream(&self) -> bool {
         self.capture.is_some()
     }
@@ -1245,7 +1422,16 @@ impl GpuCtx {
     // ======================================================================
 
     /// 登记新块(图外:独立分配)
-    pub(super) fn new_block(&mut self, slice: CudaSlice<u8>) -> u64 {
+    ///
+    /// `name` = 分配点点名(必填;见 [`BlockEntry::name`])。
+    /// **空名 = 调用点违约**(全量记名纪律):debug 构建当场炸(带 stack),
+    /// release 构建不拦但由 `block_report_by_name`/`unnamed_blocks` 计入
+    /// `(未命名!)` —— OOM 现场一眼可见"谁没报名字"。
+    pub(super) fn new_block(&mut self, slice: CudaSlice<u8>, name: &str) -> u64 {
+        debug_assert!(
+            !name.is_empty(),
+            "new_block: 空名 = 分配点未记名(全量记名纪律;见 BlockEntry::name)"
+        );
         let bytes = slice.len();
         let local = self.next_block;
         self.next_block += 1;
@@ -1258,6 +1444,7 @@ impl GpuCtx {
                 ledger: self.ledger,
                 dtype: BlockDtype::Bytes,
                 shape: vec![bytes],
+                name: name.to_string(),
             },
         );
         id
@@ -1273,7 +1460,11 @@ impl GpuCtx {
     /// ⚠️ 对齐前提同旧:向量化核(uint4/float4 16B 访存、cublas、FlashInfer)
     /// 要求基底对齐;旧核全标量未暴露此缺陷(2026-09-27 v1 paged 核
     /// MISALIGNED_ADDRESS 定谳)。
-    pub(super) fn carve_block(&mut self, n: usize) -> Result<u64, ModelError> {
+    pub(super) fn carve_block(&mut self, n: usize, name: &str) -> Result<u64, ModelError> {
+        debug_assert!(
+            !name.is_empty(),
+            "carve_block: 空名 = 分配点未记名(全量记名纪律;见 BlockEntry::name)"
+        );
         let cap = self.capture.as_mut().ok_or_else(|| {
             ModelError::Msg("carve_block: 仅限捕获期(内部护栏违例)".to_string())
         })?;
@@ -1299,6 +1490,7 @@ impl GpuCtx {
                 ledger: self.ledger,
                 dtype: BlockDtype::Bytes,
                 shape: vec![n],
+                name: name.to_string(),
             },
         );
         Ok(id)
@@ -1355,6 +1547,29 @@ impl GpuCtx {
     pub(super) fn block_len(&self, id: u64) -> Result<usize, ModelError> {
         assert_ledger(id, self.ledger)?;
         Ok(self.blocks.get(&id).ok_or(ModelError::DeadBlock { id })?.bytes)
+    }
+
+    /// **块账按名清单**(OOM dump 的"谁占着"面;2026-10-16)。
+    ///
+    /// 三笔总量账([`crate::state::pool_ledger_snapshot`] 的池 used/reserved、
+    /// 驱动 `mem_get_info`、引擎 `vram::live`)只能回答"多满",不能回答"谁"。
+    /// 本方法把**在册块按名聚合**(字节降序),OOM 现场一行看清单。
+    ///
+    /// 口径:账房在册 = 尚未 free 的块(捕获 slab 块含在内;slab 本体另算);
+    /// 名字为分配点所报(空名 = 调用点违约,单独计数上屏 —— 见
+    /// [`Self::unnamed_blocks`],这是"全量记名"的漏网信号)。
+    pub(super) fn block_report_by_name(&self, top: usize) -> String {
+        render_block_report(self.blocks.values().map(|e| (e.name.as_str(), e.bytes)), top)
+    }
+
+    /// 块账结构化清单(JSON;查询/OOM 落盘共用)。
+    pub(super) fn block_json(&self) -> String {
+        block_report_json(self.blocks.values().map(|e| (e.name.as_str(), e.bytes)))
+    }
+
+    /// 未命名块计数(全量记名的漏网信号:>0 即"有分配点没报名字")。
+    pub(super) fn unnamed_blocks(&self) -> usize {
+        count_unnamed(self.blocks.values().map(|e| (e.name.as_str(), e.bytes)))
     }
 
     /// **搬运/清零/拷贝类命令的统一边界校验**(2026-10-15;A13 审计补口)。
@@ -1671,7 +1886,7 @@ impl owl_iface::contract::PinnedRegion for Staging {
 
 impl Staging {
     /// 分配 n 元素的 pinned 缓冲(未初始化)
-    pub(super) fn alloc(n: usize, label: &'static str) -> Result<Self, ModelError> {
+    pub(super) fn alloc(n: usize, label: &str) -> Result<Self, ModelError> {
         // 字节口径(f16 基线,2026-09-26):n = 字节数,DMA 按 byte 计数
         let ptr = unsafe { malloc_host(n, 0) }
             .map_err(|e| ModelError::Msg(format!("malloc_host(n={n}B): {e:?}")))? as *mut u8;
@@ -1726,6 +1941,93 @@ mod tests {
     fn pack_is_injective_across_ledgers() {
         assert_ne!(pack_block_id(1, 11), pack_block_id(2, 11));
         assert_eq!(ledger_of(pack_block_id(3, 99)), 3);
+    }
+
+    // ── 全量记名/OOM 按名清单(纯函数;零 CUDA)────────────────────────
+
+    /// **按名清单**:同名字聚合(字节/个数求和)、字节降序、top-N 截断折入"另 N 类"。
+    /// 这条就是 OOM 现场那行的口径锁——改渲染必改本测试。
+    #[test]
+    fn block_report_aggregates_by_name_and_sorts_desc() {
+        let es: [(&str, usize); 4] = [
+            ("kv.k.0", 1 << 20),
+            ("kv.k.0", 1 << 20),
+            ("dfk.k.0", 3 << 20),
+            ("fi.indices", 512 << 10),
+        ];
+        let rep = render_block_report(es.iter().copied(), 2);
+        assert!(rep.starts_with("在册 4 块 / 合计 5.5MiB(按名 top2):"), "头:{rep}");
+        // 降序:dfk(3MiB) 在 kv(2MiB) 之前;同名字合并 ×2
+        let dfk = rep.find("dfk.k.0=3.0MiB×1").expect("dfk 行");
+        let kv = rep.find("kv.k.0=2.0MiB×2").expect("kv 合并行");
+        assert!(dfk < kv, "必须字节降序:{rep}");
+        // top2 之外的第三类折入计数(名不出现在正文)
+        assert!(rep.ends_with("…另 1 类"), "尾:{rep}");
+        assert!(!rep.contains("fi.indices"), "top-N 之外不得列名:{rep}");
+    }
+
+    /// **空名必须响亮**(负例):漏记名的块渲染成 `(未命名!)` 且被单独计数——
+    /// 否则"全量记名"会退化成"大部分有名",漏网无声无息。
+    #[test]
+    fn unnamed_blocks_are_loud_not_silent() {
+        let es: [(&str, usize); 3] = [("kv.k.0", 1 << 20), ("", 2 << 20), ("tiny.meta", 1536)];
+        let rep = render_block_report(es.iter().copied(), 8);
+        assert!(rep.contains("(未命名!)=2.0MiB×1"), "空名必须显式子项:{rep}");
+        // 单位律:小于 1MiB 的块必须用 KiB 显形(不许渲染成 0.0MiB 而消失量级)
+        assert!(rep.contains("tiny.meta=1.5KiB×1"), "小块必须 KiB 口径:{rep}");
+        assert_eq!(count_unnamed(es.iter().copied()), 1);
+        // 全有名 ⇒ 计数 0(正向对照:门不误报)
+        let ok: [(&str, usize); 1] = [("kv.k.0", 1 << 20)];
+        assert_eq!(count_unnamed(ok.iter().copied()), 0);
+    }
+
+    /// **JSON 结构化清单**:总量/分组/降序/转义。与文本同源 ⇒ 二者总量必须一致。
+    #[test]
+    fn block_json_shape_and_escapes() {
+        let es: [(&str, usize); 3] = [("kv.k.0", 1 << 20), ("kv.k.0", 1 << 20), ("a\"b\\c", 1536)];
+        let js = block_report_json(es.iter().copied());
+        assert!(js.starts_with("{\"blocks\":[{\"name\":\"kv.k.0\",\"bytes\":2097152,\"blocks\":2}"), "头:{js}");
+        assert!(js.contains("{\"name\":\"a\\\"b\\\\c\",\"bytes\":1536,\"blocks\":1}"), "转义:{js}");
+        // 尾判据用"片段在 + 总数字面"而不是 ends_with(尾字符判据脆弱,已踩)
+        assert!(js.contains("\"total_bytes\":2098688"), "total_bytes:{js}");
+        assert!(js.contains("\"total_blocks\":3"), "total_blocks:{js}");
+        // 同源:文本口径的总量(2.0MiB + 1.5KiB)与 JSON 字节数互证
+        assert!(render_block_report(es.iter().copied(), 8).contains("在册 3 块"));
+    }
+
+    /// 峰值快照三重判据:未到门 / 破步进 / 写满 各一条负例 + 两条正例。
+    #[test]
+    fn peak_snapshot_gate_matrix() {
+        let mb = 1u64 << 20;
+        // 未到门 ⇒ 不写
+        assert_eq!(peak_should_dump(100 * mb, 1000 * mb, 0, 0, 8), None);
+        // 到门首次 ⇒ 写,水位 = live
+        assert_eq!(peak_should_dump(1000 * mb, 1000 * mb, 0, 0, 8), Some(1000 * mb));
+        // 到门但只比上次高 4% ⇒ 不写(步进 5%)
+        assert_eq!(peak_should_dump(1040 * mb, 1000 * mb, 1000 * mb, 1, 8), None);
+        // 高 6% ⇒ 写
+        assert_eq!(peak_should_dump(1060 * mb, 1000 * mb, 1000 * mb, 1, 8), Some(1060 * mb));
+        // 写满 ⇒ 不写(即使破步进)
+        assert_eq!(peak_should_dump(9999 * mb, 1000 * mb, 1000 * mb, 8, 8), None);
+        // 门值 0 = 关
+        assert_eq!(peak_should_dump(9999 * mb, 0, 0, 0, 8), None);
+    }
+
+    /// 落盘路径解析:门值三态(默认时间戳 / 显式路径 / 空串视作默认)。
+    #[test]
+    fn vram_dump_path_resolution() {
+        assert_eq!(resolve_vram_dump_path("1", 1234), "/tmp/owl-vram-1234.json");
+        assert_eq!(resolve_vram_dump_path("", 7), "/tmp/owl-vram-7.json");
+        assert_eq!(resolve_vram_dump_path("/tmp/x.json", 9), "/tmp/x.json");
+    }
+
+    /// 空账不炸(捕获窗未开/图外空账都可能读它;报告要能渲染)
+    #[test]
+    fn empty_ledger_report_is_well_formed() {
+        let es: [(&str, usize); 0] = [];
+        assert_eq!(render_block_report(es.iter().copied(), 4), "(块账空)");
+        assert_eq!(block_report_json(es.iter().copied()), "{\"blocks\":[],\"total_bytes\":0,\"total_blocks\":0}");
+        assert_eq!(count_unnamed(es.iter().copied()), 0);
     }
 
     /// 图引用租约(纯簿记,零 CUDA):窗内解析**不入租约**,收窗才入;

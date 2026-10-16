@@ -26,3 +26,8 @@ crates/kernels/cu/flashinfer/*.o
 docs/archive
 # perf 会话产物(2026-10-15):原始账太大、且是本地运行快照,不入库
 perf-runs/
+# bench 原始数据(2026-10-16):只入 .md 战报,数据一律不入库。
+# 教训:数据是**未跟踪**的 ⇒ `git add -A` 会静默把它扫进提交(本仓真踩过:
+# 别人的 stash 残留被我的 `add -A` 带进一笔,事后加了撤销提交)。
+# 进版本 = 真需要当"金标"的数据请显式 `git add -f`。
+docs/bench/data/

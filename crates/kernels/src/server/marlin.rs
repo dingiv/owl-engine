@@ -190,7 +190,7 @@ mod f2_gate {
                 _ => 1 << 20,
             })
         }
-        fn alloc(&mut self, _b: usize, _t: &'static str) -> Result<ScratchBuf, OpError> {
+        fn alloc(&mut self, _b: usize, _t: &str) -> Result<ScratchBuf, OpError> {
             Err(unexpected("alloc"))
         }
         fn capturing(&self) -> Result<bool, OpError> {
@@ -208,7 +208,7 @@ mod f2_gate {
         fn upload_block(&mut self, _b: &crate::contract::Bytes, _s: &[u8]) -> Result<(), OpError> {
             Err(unexpected("upload_block"))
         }
-        fn alloc_block(&mut self, _b: usize, _t: &'static str) -> Result<crate::contract::Bytes, OpError> {
+        fn alloc_block(&mut self, _b: usize, _t: &str) -> Result<crate::contract::Bytes, OpError> {
             Err(unexpected("alloc_block"))
         }
         fn download(&mut self, _s: u64, _d: &mut [u8]) -> Result<(), OpError> {

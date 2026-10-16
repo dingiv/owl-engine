@@ -306,7 +306,7 @@ impl StatePool {
         let nb_kv = nb + dump_page.map(|_| 1).unwrap_or(0);
 
         let mut kvs: Vec<KvBlocks> = Vec::new();
-        for _ in 0..n_full {
+        for l in 0..n_full {
             // B6.2:fp8 池 = U32 字节承载 1B/elem(元素数不变,块大小减半);
             // 读核 *_fp8 变体读入即转 half,写核 K0 转换写
             let (k_elems, k_dt) = if kv_fp8 {
@@ -319,8 +319,8 @@ impl StatePool {
             } else {
                 (nb_kv * dims.hkv * dims.hd * page, dims.dtype)
             };
-            let k_cache = zero_block_dt(face, k_elems, k_dt).await?;
-            let v_cache = zero_block_dt(face, v_elems, v_dt).await?;
+            let k_cache = zero_block_dt(face, k_elems, k_dt, &format!("kv.k.{l}")).await?;
+            let v_cache = zero_block_dt(face, v_elems, v_dt, &format!("kv.v.{l}")).await?;
             kvs.push(KvBlocks { k_cache, v_cache });
         }
         // MTP 草稿链 KV(E5-M2b):独立页池(1 层,几何 = full 层同款,
@@ -328,8 +328,8 @@ impl StatePool {
         // 不可 token 哈希。仅 paged(链吃块表)。
         let mtp_kvs = if mtp && paged {
             Some(KvBlocks {
-                k_cache: zero_block_dt(face, nb * dims.hkv * dims.hd * page, dims.dtype).await?,
-                v_cache: zero_block_dt(face, nb * dims.hkv * dims.hd * page, dims.dtype).await?,
+                k_cache: zero_block_dt(face, nb * dims.hkv * dims.hd * page, dims.dtype, "mtp.kv.k").await?,
+                v_cache: zero_block_dt(face, nb * dims.hkv * dims.hd * page, dims.dtype, "mtp.kv.v").await?,
             })
         } else {
             None
@@ -347,10 +347,10 @@ impl StatePool {
                 (nb * dkv * dhd * page, Dtype::BF16)
             };
             let mut ks = Vec::with_capacity(dlayers);
-            for _ in 0..dlayers {
+            for l in 0..dlayers {
                 ks.push(KvBlocks {
-                    k_cache: zero_block_dt(face, df_elems, df_dt).await?,
-                    v_cache: zero_block_dt(face, df_elems, df_dt).await?,
+                    k_cache: zero_block_dt(face, df_elems, df_dt, &format!("dfk.k.{l}")).await?,
+                    v_cache: zero_block_dt(face, df_elems, df_dt, &format!("dfk.v.{l}")).await?,
                 });
             }
             Some(ks)
@@ -369,7 +369,7 @@ impl StatePool {
         let gdn_tables = if n_gdn > 0 {
             let nt_cap = seq_tokens.div_ceil(owl_models::kernel::GDN_BT).max(1);
             let bytes = owl_models::kernel::gdn_table_bytes(nt_cap);
-            Some(GdnTableBlocks { table: face.alloc(Dtype::F32, bytes.div_ceil(4)).await?, nt_cap })
+            Some(GdnTableBlocks { table: face.alloc(Dtype::F32, bytes.div_ceil(4), "gdn.table").await?, nt_cap })
         } else {
             None
         };
@@ -377,10 +377,10 @@ impl StatePool {
         let fi_face = plan.fi_quant.is_some();
         let fi_tables = if paged && fi_face {
             Some(FiTableBlocks {
-                q_cu: face.alloc(Dtype::F32, 2).await?,
-                indices: face.alloc(Dtype::F32, nb).await?,
-                indptr: face.alloc(Dtype::F32, 2).await?,
-                last_len: face.alloc(Dtype::F32, 1).await?,
+                q_cu: face.alloc(Dtype::F32, 2, "fi.q_cu").await?,
+                indices: face.alloc(Dtype::F32, nb, "fi.indices").await?,
+                indptr: face.alloc(Dtype::F32, 2, "fi.indptr").await?,
+                last_len: face.alloc(Dtype::F32, 1, "fi.last_len").await?,
                 nb_cap: nb,
             })
         } else {
@@ -397,9 +397,9 @@ impl StatePool {
         // (PARTITION=512;boot 一次性持久块,不进竞技场收割面,图安全同 bt)
         let attn_v2 = if paged {
             let nparts = (nb * page).div_ceil(512);
-            let es = zero_block_dt(face, dims.hq * nparts, Dtype::F32).await?;
-            let ml = zero_block_dt(face, dims.hq * nparts, Dtype::F32).await?;
-            let to = zero_block_dt(face, dims.hq * nparts * dims.hd, dims.dtype).await?;
+            let es = zero_block_dt(face, dims.hq * nparts, Dtype::F32, "attn2.exp_sums").await?;
+            let ml = zero_block_dt(face, dims.hq * nparts, Dtype::F32, "attn2.max_logits").await?;
+            let to = zero_block_dt(face, dims.hq * nparts * dims.hd, dims.dtype, "attn2.tmp_out").await?;
             Some(owl_models::module::AttnV2Scratch {
                 exp_sums: block_leaf(&es.0, vec![1, dims.hq * nparts]),
                 max_logits: block_leaf(&ml.0, vec![1, dims.hq * nparts]),
@@ -415,9 +415,9 @@ impl StatePool {
         let verify_attn_v2 = if paged && plan.spec_depth > 0 {
             let nparts = (nb * page).div_ceil(512);
             let seqs = plan.spec_depth + 1;
-            let es = zero_block_dt(face, seqs * dims.hq * nparts, Dtype::F32).await?;
-            let ml = zero_block_dt(face, seqs * dims.hq * nparts, Dtype::F32).await?;
-            let to = zero_block_dt(face, seqs * dims.hq * nparts * dims.hd, dims.dtype).await?;
+            let es = zero_block_dt(face, seqs * dims.hq * nparts, Dtype::F32, "vattn2.exp_sums").await?;
+            let ml = zero_block_dt(face, seqs * dims.hq * nparts, Dtype::F32, "vattn2.max_logits").await?;
+            let to = zero_block_dt(face, seqs * dims.hq * nparts * dims.hd, dims.dtype, "vattn2.tmp_out").await?;
             Some(owl_models::module::AttnV2Scratch {
                 exp_sums: block_leaf(&es.0, vec![seqs, dims.hq * nparts]),
                 max_logits: block_leaf(&ml.0, vec![seqs, dims.hq * nparts]),
@@ -444,7 +444,7 @@ impl StatePool {
             let nb_i = nb;
             // 常量页表:单会话恒等链(0..nb)以 **i32 位型走私**进 f32 账叶
             let pt: Vec<f32> = (0..nb_i).map(|i| f32::from_bits(i as u32)).collect();
-            let ptb = face.alloc(Dtype::F32, nb_i).await?;
+            let ptb = face.alloc(Dtype::F32, nb_i, "xqa.pt").await?;
             face.write_block_f32(&ptb, 0, &pt).await?;
             // 常量掩码:行 i = 块内第 i 个 token,bit k = 允许看第 k 个 key,
             // 因果 = (1<<(i+1))-1(含自身);q=1 只读 index 0(= 1)
@@ -452,12 +452,12 @@ impl StatePool {
             let mask: Vec<f32> = (0..seqs)
                 .map(|i| f32::from_bits((1u32 << (i + 1)) - 1))
                 .collect();
-            let mkb = face.alloc(Dtype::F32, seqs).await?;
+            let mkb = face.alloc(Dtype::F32, seqs, "xqa.mask").await?;
             face.write_block_f32(&mkb, 0, &mask).await?;
             // semaphores:u32[round_up(hkv·batch,2)+2+hkv·batch+2](batch=1);
             // **每次发射前必须清零**(KV-split 归约计数)
             let sem_n = dims.hkv.div_ceil(2) * 2 + 2 + dims.hkv + 2;
-            let sem = zero_block_dt(face, sem_n, Dtype::F32).await?;
+            let sem = zero_block_dt(face, sem_n, Dtype::F32, "xqa.sem").await?;
             // scratch:持久工作区(参考实现 256MiB)
             // 工作区定档 **32MiB**(2026-10-13 定谳):本形状(batch=1、hkv=4、
             // hd256、q=8、ctx≤16k)的 KV-split 归约 partial 只有 ~0.7MB,32MiB
@@ -468,7 +468,7 @@ impl StatePool {
             // 恒等门绿,故先按需定档;治理交互另案。
             const XQA_SCRATCH_MB: usize = 32;
             let scr_mb = XQA_SCRATCH_MB;
-            let scr = zero_block_dt(face, (scr_mb << 20) / 2, Dtype::F16).await?;
+            let scr = zero_block_dt(face, (scr_mb << 20) / 2, Dtype::F16, "xqa.scratch").await?;
             Some(owl_models::module::XqaVerifyCtx {
                 // ⚠️ 四件套 = **图输入槽**(每步写 f32 数值;核按 u32 读同一
                 // 4 字节 = 位型走私)。故叶子注解与输入槽同 dtype = F32
@@ -490,10 +490,10 @@ impl StatePool {
         };
         let mut gdns: Vec<GdnBlocks> = Vec::new();
         for _ in 0..n_gdn {
-            let conv_q = zero_block(face, gdn_slots * dims.nk * dims.hk * 3).await?;
-            let conv_k = zero_block(face, gdn_slots * dims.nv * dims.hv * 3).await?;
-            let conv_v = zero_block(face, gdn_slots * dims.nv * dims.hv * 3).await?;
-            let rec = zero_block(face, gdn_slots * dims.nv * dims.hk * dims.hv).await?;
+            let conv_q = zero_block(face, gdn_slots * dims.nk * dims.hk * 3, "gdn.conv_q").await?;
+            let conv_k = zero_block(face, gdn_slots * dims.nv * dims.hv * 3, "gdn.conv_k").await?;
+            let conv_v = zero_block(face, gdn_slots * dims.nv * dims.hv * 3, "gdn.conv_v").await?;
+            let rec = zero_block(face, gdn_slots * dims.nv * dims.hk * dims.hv, "gdn.recurrence").await?;
             gdns.push(GdnBlocks { conv_q, conv_k, conv_v, rec });
         }
         // GDN 快照池(E2c):行宽副本 × SNAP_MAX 份;仅 paged 形态
@@ -502,10 +502,10 @@ impl StatePool {
             for _ in 0..snap_max {
                 let mut bufs: Vec<BlockN> = Vec::new();
                 for _ in 0..n_gdn {
-                    bufs.push(zero_block(face, dims.nk * dims.hk * 3).await?);
-                    bufs.push(zero_block(face, dims.nv * dims.hv * 3).await?);
-                    bufs.push(zero_block(face, dims.nv * dims.hv * 3).await?);
-                    bufs.push(zero_block(face, dims.nv * dims.hk * dims.hv).await?);
+                    bufs.push(zero_block(face, dims.nk * dims.hk * 3, "gdn.slot.conv_q").await?);
+                    bufs.push(zero_block(face, dims.nv * dims.hv * 3, "gdn.slot.conv_k").await?);
+                    bufs.push(zero_block(face, dims.nv * dims.hv * 3, "gdn.slot.conv_v").await?);
+                    bufs.push(zero_block(face, dims.nv * dims.hk * dims.hv, "gdn.slot.rec").await?);
                 }
                 snaps.push(GdnSnapSlot { key: None, last_use: 0, bufs });
             }
@@ -528,10 +528,10 @@ impl StatePool {
         let spec_snap = if spec && paged {
             let mut bufs = Vec::new();
             for _ in 0..n_gdn {
-                bufs.push(zero_block(face, dims.nk * dims.hk * 3).await?);
-                bufs.push(zero_block(face, dims.nv * dims.hv * 3).await?);
-                bufs.push(zero_block(face, dims.nv * dims.hv * 3).await?);
-                bufs.push(zero_block(face, dims.nv * dims.hk * dims.hv).await?);
+                bufs.push(zero_block(face, dims.nk * dims.hk * 3, "gdn.ring.conv_q").await?);
+                bufs.push(zero_block(face, dims.nv * dims.hv * 3, "gdn.ring.conv_k").await?);
+                bufs.push(zero_block(face, dims.nv * dims.hv * 3, "gdn.ring.conv_v").await?);
+                bufs.push(zero_block(face, dims.nv * dims.hk * dims.hv, "gdn.ring.rec").await?);
             }
             Some(GdnSnapSlot { key: None, last_use: 0, bufs })
         } else {
@@ -1154,10 +1154,10 @@ const XQA_SM_COUNT: usize = 84;
 /// host 零向量 —— 曾用 `vec![0f32; n]` + to_le_bytes 逐元素造 64MB(rec
 /// 单层 16M 元素),debug 循环烧掉 ~90s(F5-4 同款 debug 转换税);池
 /// alloc 无零保证,必须显式 memset(F5-4 已去 fill(0),不能省)
-async fn zero_block_dt<D: DeviceClient>(face: &mut D, n: usize, dt: Dtype) -> Result<BlockN> {
+async fn zero_block_dt<D: DeviceClient>(face: &mut D, n: usize, dt: Dtype, name: &str) -> Result<BlockN> {
     // 2B 激活域显式臂(BF16 曾落 else 按 4B 误解释 —— dtype 表驱动律)
     let esz = if matches!(dt, Dtype::F16 | Dtype::BF16) { 2 } else { 4 };
-    let b = face.alloc(dt, n).await?;
+    let b = face.alloc(dt, n, name).await?;
     face.memset_zero(&b, n * esz).await?;
     Ok((b, n))
 }
@@ -1172,8 +1172,8 @@ fn block_leaf_dt(b: &Bytes, shape: Vec<usize>, dt: Dtype) -> TensorOps {
     TensorOps::of_block(b.id, dt, shape)
 }
 
-async fn zero_block<D: DeviceClient>(face: &mut D, n: usize) -> Result<BlockN> {
-    zero_block_dt(face, n, Dtype::F32).await
+async fn zero_block<D: DeviceClient>(face: &mut D, n: usize, name: &str) -> Result<BlockN> {
+    zero_block_dt(face, n, Dtype::F32, name).await
 }
 
 fn block_leaf(b: &Bytes, shape: Vec<usize>) -> TensorOps {

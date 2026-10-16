@@ -1236,9 +1236,9 @@ pub async fn load_weight<D: DeviceClient, S: WeightSource + ?Sized>(
         (weight.shape.clone(), f32b(&data))
     };
 
-    // 3. 物化(解释层原语:htod → 块句柄)
+    // 3. 物化(解释层原语:htod → 块句柄)。记名:`wt.<键名>`(装载域统一命名)。
     let b = face
-        .htod(Dtype::F32, &shape, &bytes)
+        .htod(Dtype::F32, &shape, &bytes, &format!("wt.{key}"))
         .await
         .map_err(|e| ModelError::Msg(format!("Weight '{key}': {e}")))?;
 

@@ -72,7 +72,7 @@ impl DeviceRes for TestRes {
             got: format!("id={}", id),
         })
     }
-    fn alloc(&mut self, bytes: usize, _tag: &'static str) -> Result<ScratchBuf, OpError> {
+    fn alloc(&mut self, bytes: usize, _tag: &str) -> Result<ScratchBuf, OpError> {
         let s = unsafe { self.stream.alloc::<u8>(bytes.max(1)) }.map_err(|e| OpError::Contract {
             op: "test".into(),
             field: "alloc",
@@ -145,7 +145,7 @@ impl DeviceRes for TestRes {
     fn alloc_block(
         &mut self,
         bytes: usize,
-        _tag: &'static str,
+        _tag: &str,
     ) -> Result<owl_kernels::contract::Bytes, OpError> {
         let s = unsafe { self.stream.alloc::<u8>(bytes.max(1)) }.map_err(|e| OpError::Contract {
             op: "test".into(),

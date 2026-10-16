@@ -314,14 +314,13 @@ mod tests {
         let mut gpu = crate::testkit::gpu_client().await;
         eprintln!("[probe] booted");
         let elems = 1 << 20; // 1M f32 = 4MB
-        let b = gpu
-            .alloc(Dtype::F32, elems)
+        let b = owl_iface::alloc!(gpu, Dtype::F32, elems)
             .await
             .expect("alloc");
         eprintln!("[probe] block {} alloc'd", b.id);
         for round in 0..3 {
             eprintln!("[probe] round {round}: alloc_pinned...");
-            let mut lease = gpu.alloc_pinned(elems * 4).await.expect("alloc_pinned");
+            let mut lease = owl_iface::alloc_pinned!(gpu, elems * 4).await.expect("alloc_pinned");
             eprintln!("[probe] round {round}: fill...");
             // 字节口径租约(F5 尾批):f32 LE 直写
             for (i, d) in lease.slice_bytes_mut().chunks_exact_mut(4).enumerate() {

@@ -101,7 +101,7 @@ fn add_msg(a: &Bytes, b: &Bytes, out: &Bytes, n: usize) -> LaunchMsg {
 
 /// 步骤 1:alloc 零化(N4 图外 memset 回归哨)
 async fn step_alloc_zeroed(client: &mut GpuClient) {
-    let out = client.alloc(Dtype::F32, 8).await.expect("alloc").view(Dtype::F32, 1);
+    let out = owl_iface::alloc!(client, Dtype::F32, 8).await.expect("alloc").view(Dtype::F32, 1);
     let got = harvest(client, &out, 8).await;
     assert!(
         got.iter().all(|&v| v == 0.0),
@@ -112,8 +112,7 @@ async fn step_alloc_zeroed(client: &mut GpuClient) {
 /// 步骤 2:htod/dtoh 往返
 async fn step_htod_dtoh_roundtrip(client: &mut GpuClient) {
     let src = [1.5f32, -2.25, 3.125, 1e-6, 42.0];
-    let block = client
-        .htod(Dtype::F32, &Shape::from(vec![src.len()]), &le_f32(&src))
+    let block = owl_iface::htod!(client, Dtype::F32, &Shape::from(vec![src.len()]), &le_f32(&src))
         .await
         .expect("htod");
     let got = harvest(client, &block, src.len()).await;
@@ -123,14 +122,12 @@ async fn step_htod_dtoh_roundtrip(client: &mut GpuClient) {
 /// 步骤 3:手工 LaunchMsg 发射(kernel + 槽序契约)
 async fn step_launch_scale(client: &mut GpuClient) {
     let xs = [2.0f32; 4];
-    let x = client
-        .htod(Dtype::F32, &Shape::from(vec![4]), &le_f32(&xs))
+    let x = owl_iface::htod!(client, Dtype::F32, &Shape::from(vec![4]), &le_f32(&xs))
         .await
         .expect("htod");
-    let out = client.alloc(Dtype::F32, 4).await.expect("alloc").view(Dtype::F32, 1);
+    let out = owl_iface::alloc!(client, Dtype::F32, 4).await.expect("alloc").view(Dtype::F32, 1);
     let ys = [4.0f32; 4];
-    let y = client
-        .htod(Dtype::F32, &Shape::from(vec![4]), &le_f32(&ys))
+    let y = owl_iface::htod!(client, Dtype::F32, &Shape::from(vec![4]), &le_f32(&ys))
         .await
         .expect("htod y");
     client.launch(add_msg(&x, &y, &out, 4)).await.expect("launch");
@@ -141,14 +138,12 @@ async fn step_launch_scale(client: &mut GpuClient) {
 /// 步骤 4:launch 后 sync 栅栏收割(大数组)
 async fn step_sync_is_barrier(client: &mut GpuClient) {
     let src: Vec<f32> = (0..4096).map(|i| i as f32 * 0.5).collect();
-    let x = client
-        .htod(Dtype::F32, &Shape::from(vec![src.len()]), &le_f32(&src))
+    let x = owl_iface::htod!(client, Dtype::F32, &Shape::from(vec![src.len()]), &le_f32(&src))
         .await
         .expect("htod");
-    let out = client.alloc(Dtype::F32, src.len()).await.expect("alloc").view(Dtype::F32, 1);
+    let out = owl_iface::alloc!(client, Dtype::F32, src.len()).await.expect("alloc").view(Dtype::F32, 1);
     let zeros = vec![0.0f32; src.len()];
-    let y = client
-        .htod(Dtype::F32, &Shape::from(vec![src.len()]), &le_f32(&zeros))
+    let y = owl_iface::htod!(client, Dtype::F32, &Shape::from(vec![src.len()]), &le_f32(&zeros))
         .await
         .expect("htod y");
     client.launch(add_msg(&x, &y, &out, src.len())).await.expect("launch");
@@ -163,15 +158,14 @@ async fn step_sync_is_barrier(client: &mut GpuClient) {
 async fn step_graph_capture_and_replay(client: &mut GpuClient, x: &Bytes) {
     // 捕获窗只放行 Launch/Alloc/MemsetZero/GraphEnd/Close ⇒ 输入须在 begin 之前上卡
     let ones = [1.0f32; 4];
-    let y = client
-        .htod(Dtype::F32, &Shape::from(vec![4]), &le_f32(&ones))
+    let y = owl_iface::htod!(client, Dtype::F32, &Shape::from(vec![4]), &le_f32(&ones))
         .await
         .expect("htod y");
     client.graph_begin().await.expect("graph_begin");
 
     // 捕获期 Alloc(切片块 + memset 进图)+ scale 发射
-    let zeros = client.alloc(Dtype::F32, 4).await.expect("captured alloc").view(Dtype::F32, 1);
-    let out = client.alloc(Dtype::F32, 4).await.expect("captured alloc").view(Dtype::F32, 1);
+    let zeros = owl_iface::alloc!(client, Dtype::F32, 4).await.expect("captured alloc").view(Dtype::F32, 1);
+    let out = owl_iface::alloc!(client, Dtype::F32, 4).await.expect("captured alloc").view(Dtype::F32, 1);
     client.launch(add_msg(x, &y, &out, 4)).await.expect("launch");
 
     let gid = client.graph_end().await.expect("graph_end");
@@ -200,15 +194,14 @@ async fn step_graph_capture_and_replay(client: &mut GpuClient, x: &Bytes) {
 async fn step_piecewise_two_segments(client: &mut GpuClient, x: &Bytes) {
     // 输入与跨段"钉块"都在窗外先物化(begin 前)——
     // 对应设计里"pin 块由 plan 捕获前分配、两期同址"那条不变量
-    let one = client
-        .htod(Dtype::F32, &Shape::from(vec![4]), &le_f32(&[1.0f32; 4]))
+    let one = owl_iface::htod!(client, Dtype::F32, &Shape::from(vec![4]), &le_f32(&[1.0f32; 4]))
         .await
         .expect("htod one");
-    let mid = client.alloc(Dtype::F32, 4).await.expect("pin 块(mid)").view(Dtype::F32, 1);
-    let tail = client.alloc(Dtype::F32, 4).await.expect("pin 块(tail)").view(Dtype::F32, 1);
+    let mid = owl_iface::alloc!(client, Dtype::F32, 4).await.expect("pin 块(mid)").view(Dtype::F32, 1);
+    let tail = owl_iface::alloc!(client, Dtype::F32, 4).await.expect("pin 块(tail)").view(Dtype::F32, 1);
 
     // ── 段0:out0 = x + one ──
-    let out0 = client.alloc(Dtype::F32, 4).await.expect("carve out0").view(Dtype::F32, 1);
+    let out0 = owl_iface::alloc!(client, Dtype::F32, 4).await.expect("carve out0").view(Dtype::F32, 1);
     client.graph_begin().await.expect("seg0 begin");
     client.launch(add_msg(x, &one, &out0, 4)).await.expect("seg0 launch");
     let g0 = client.graph_end().await.expect("seg0 end");
@@ -264,9 +257,9 @@ async fn step_graph_guardrails(client: &mut GpuClient, x: &Bytes) {
 async fn step_graph_ref_lease(client: &mut GpuClient) {
     let ones = [1.0f32; 4];
     // 图外分配/上卡 ⇒ Owned(可回收类;Carved 天然免疫,不在本例)
-    let a = client.htod(Dtype::F32, &Shape::from(vec![4]), &le_f32(&ones)).await.expect("htod a");
-    let b = client.htod(Dtype::F32, &Shape::from(vec![4]), &le_f32(&ones)).await.expect("htod b");
-    let out = client.alloc(Dtype::F32, 4).await.expect("alloc out").view(Dtype::F32, 1);
+    let a = owl_iface::htod!(client, Dtype::F32, &Shape::from(vec![4]), &le_f32(&ones)).await.expect("htod a");
+    let b = owl_iface::htod!(client, Dtype::F32, &Shape::from(vec![4]), &le_f32(&ones)).await.expect("htod b");
+    let out = owl_iface::alloc!(client, Dtype::F32, 4).await.expect("alloc out").view(Dtype::F32, 1);
 
     // 捕获窗内解析三个块 ⇒ 全部入租约
     client.graph_begin().await.expect("graph_begin");
@@ -291,7 +284,7 @@ async fn step_graph_ref_lease(client: &mut GpuClient) {
     assert_all_close(&got2, 2.0, "租约后 eager 发射");
 
     // (b) 正例对照:未被任何图引用的块照常回收 ⇒ 之后再解析 = 结构化 DeadBlock
-    let loose = client.htod(Dtype::F32, &Shape::from(vec![4]), &le_f32(&ones)).await.expect("htod loose");
+    let loose = owl_iface::htod!(client, Dtype::F32, &Shape::from(vec![4]), &le_f32(&ones)).await.expect("htod loose");
     client.free(&[loose.id]).await.expect("free(无租约应照常回收)");
     let r = client.dtoh(&loose, &mut [0u8; 16]).await;
     assert!(
@@ -311,13 +304,13 @@ async fn step_capture_window_reuse(client: &mut GpuClient) {
     const BLK: usize = 4 << 20; // 4 Mi 元素 × f32 = 16 MiB
     const N: usize = 6;
     let ones = [1.0f32; 4];
-    let x = client.htod(Dtype::F32, &Shape::from(vec![4]), &le_f32(&ones)).await.expect("htod x");
-    let y = client.htod(Dtype::F32, &Shape::from(vec![4]), &le_f32(&ones)).await.expect("htod y");
+    let x = owl_iface::htod!(client, Dtype::F32, &Shape::from(vec![4]), &le_f32(&ones)).await.expect("htod x");
+    let y = owl_iface::htod!(client, Dtype::F32, &Shape::from(vec![4]), &le_f32(&ones)).await.expect("htod y");
     client.graph_begin().await.expect("graph_begin");
     let mut live: Option<Bytes> = None;
     let mut total = 0usize;
     for _ in 0..N {
-        let b = client.alloc(Dtype::F32, BLK).await.expect("窗内 alloc(切 slab)");
+        let b = owl_iface::alloc!(client, Dtype::F32, BLK).await.expect("窗内 alloc(切 slab)");
         total += BLK * 4;
         if let Some(prev) = live.take() {
             // 交替释放上一块 ⇒ 活块数恒 ≤ 2(回 slab 内 arena,零 CUDA 调用)
@@ -326,8 +319,25 @@ async fn step_capture_window_reuse(client: &mut GpuClient) {
         live = Some(b);
     }
     // 空窗哨兵③:发射数须 > 0
-    let out = client.alloc(Dtype::F32, 4).await.expect("alloc out").view(Dtype::F32, 1);
+    let out = owl_iface::alloc!(client, Dtype::F32, 4).await.expect("alloc out").view(Dtype::F32, 1);
     client.launch(add_msg(&x, &y, &out, 4)).await.expect("launch");
+    // **捕获窗内也能读块账**(全量记名 26-10-16):carve 出来的窗内块必须在册
+    // 且带名 —— OOM 最常发生在窗内(slab 定尺失准),那刻的"谁占着"就靠这条。
+    // ⚠️ `top` 要够大:窗内块多数是 KiB 级小块,渲染按字节降序取 top-N ⇒
+    // top 小了会落进"…另 N 类"(本测试首版就这么假红了一次 —— 不是没记名,
+    // 是没挤进前列);而"未命名块"计数与 top 无关,是更强的不变量。
+    let rep = client.ledger_report(64).await.expect("窗内 ledger_report 应放行(纯读)");
+    // 窗内那块的调用点已改用 `alloc!` ⇒ 名字是**编译器填的位置**
+    // (`alloc@<文件>:<行>:<列>`)。断言只锁"形态 + 本文件",**不写死行号**
+    // (行号会随编辑漂;写死它就是把脆弱判据请回来 —— 见 §8.2 教训)。
+    assert!(
+        rep.contains("alloc@") && rep.contains("gpu_server.rs"),
+        "窗内 carve 块必须带名在册(top=64):{rep}"
+    );
+    assert!(
+        !rep.contains("未命名块"),
+        "窗内不得出现未命名块(与 top 无关的硬不变量):{rep}"
+    );
     let gid = client.graph_end().await;
     assert!(
         gid.is_ok(),
@@ -349,10 +359,10 @@ async fn step_graph_abort_and_destroy(client: &mut GpuClient) {
     let r = client.graph_abort().await;
     assert!(r.is_err(), "无捕获时 abort 应结构化拒,实得 {r:?}");
     let ones = [1.0f32; 4];
-    let a = client.htod(Dtype::F32, &Shape::from(vec![4]), &le_f32(&ones)).await.expect("htod a");
-    let b = client.htod(Dtype::F32, &Shape::from(vec![4]), &le_f32(&ones)).await.expect("htod b");
+    let a = owl_iface::htod!(client, Dtype::F32, &Shape::from(vec![4]), &le_f32(&ones)).await.expect("htod a");
+    let b = owl_iface::htod!(client, Dtype::F32, &Shape::from(vec![4]), &le_f32(&ones)).await.expect("htod b");
     client.graph_begin().await.expect("graph_begin");
-    let carved = client.alloc(Dtype::F32, 4).await.expect("窗内 alloc").view(Dtype::F32, 1);
+    let carved = owl_iface::alloc!(client, Dtype::F32, 4).await.expect("窗内 alloc").view(Dtype::F32, 1);
     client.launch(add_msg(&a, &b, &carved, 4)).await.expect("launch");
     client.graph_abort().await.expect("abort 应成功");
     // 窗内自产块整批作废(不登记图 ⇒ 永不会被回放)
@@ -360,7 +370,7 @@ async fn step_graph_abort_and_destroy(client: &mut GpuClient) {
     assert!(matches!(r, Err(ModelError::DeadBlock { .. })), "abort 后 slab 块应作废,实得 {r:?}");
     // abort 后引擎仍可正常捕获(窗态已复位 —— 否则第二张图必炸)
     client.graph_begin().await.expect("abort 后再捕获");
-    let out2 = client.alloc(Dtype::F32, 4).await.expect("alloc").view(Dtype::F32, 1);
+    let out2 = owl_iface::alloc!(client, Dtype::F32, 4).await.expect("alloc").view(Dtype::F32, 1);
     client.launch(add_msg(&a, &b, &out2, 4)).await.expect("launch");
     let gid = client.graph_end().await.expect("abort 后 graph_end 应成功");
 
@@ -403,19 +413,18 @@ async fn step_family_window_guard(client: &mut GpuClient) {
     let shape = GdnShape { t: 8, nv: 1, nk: 1, kd: 128 };
     let elems_qkv = shape.t as usize * shape.kd as usize; // nk=nv=1
     let ones_f16: Vec<f32> = vec![0.01; elems_qkv];
-    let q = client.htod(Dtype::F16, &Shape::from(vec![8, 1, 128]), &le_f16(&ones_f16)).await.expect("htod q");
-    let k = client.htod(Dtype::F16, &Shape::from(vec![8, 1, 128]), &le_f16(&ones_f16)).await.expect("htod k");
-    let v = client.htod(Dtype::F16, &Shape::from(vec![8, 1, 128]), &le_f16(&ones_f16)).await.expect("htod v");
-    let beta = client.htod(Dtype::F16, &Shape::from(vec![8, 1]), &le_f16(&[0.5; 8])).await.expect("htod beta");
-    let gate = client.htod(Dtype::F16, &Shape::from(vec![8, 1]), &le_f16(&[-0.01; 8])).await.expect("htod gate");
-    let state = client.alloc(Dtype::F32, 128 * 128).await.expect("alloc state").view(Dtype::F32, 4);
-    let out = client.alloc(Dtype::F16, elems_qkv).await.expect("alloc out").view(Dtype::F16, 3);
+    let q = owl_iface::htod!(client, Dtype::F16, &Shape::from(vec![8, 1, 128]), &le_f16(&ones_f16)).await.expect("htod q");
+    let k = owl_iface::htod!(client, Dtype::F16, &Shape::from(vec![8, 1, 128]), &le_f16(&ones_f16)).await.expect("htod k");
+    let v = owl_iface::htod!(client, Dtype::F16, &Shape::from(vec![8, 1, 128]), &le_f16(&ones_f16)).await.expect("htod v");
+    let beta = owl_iface::htod!(client, Dtype::F16, &Shape::from(vec![8, 1]), &le_f16(&[0.5; 8])).await.expect("htod beta");
+    let gate = owl_iface::htod!(client, Dtype::F16, &Shape::from(vec![8, 1]), &le_f16(&[-0.01; 8])).await.expect("htod gate");
+    let state = owl_iface::alloc!(client, Dtype::F32, 128 * 128).await.expect("alloc state").view(Dtype::F32, 4);
+    let out = owl_iface::alloc!(client, Dtype::F16, elems_qkv).await.expect("alloc out").view(Dtype::F16, 3);
     // P-6b:序列表(cu|coff|idx)现造一块(本测只关心窗内 alloc/upload 守卫,
     // 表内容按 t=8 ⇒ nt=1;表在**窗外**造 —— 表本身归引擎写,不归 runtime)
     let nt = 8usize.div_ceil(owl_kernels::family::gdn_chunked::BT).max(1);
     let tbl_bytes = owl_kernels::family::gdn_chunked::table_host_bytes(8, nt);
-    let tables = client
-        .htod(Dtype::U8, &Shape::from(vec![tbl_bytes.len()]), &tbl_bytes)
+    let tables = owl_iface::htod!(client, Dtype::U8, &Shape::from(vec![tbl_bytes.len()]), &tbl_bytes)
         .await
         .expect("htod tables")
         .view(Dtype::U32, 1);
@@ -457,6 +466,245 @@ async fn step_family_window_guard(client: &mut GpuClient) {
     }
 }
 
+/// **步骤 13:全量记名 —— 名字真的到账了**(2026-10-16)。
+///
+/// 为什么必须端到端验:`cargo check` 只证明**签名带 name**;OOM dump 要的是
+/// 名字**落在块账房**。本步拿客户端查询面读账房真值,锁三件事:
+/// ① 名字原样可见(不是占位/被弄丢);② 字节口径对(512 f32 = 2.0KiB);
+/// ③ **零未命名** —— 本步全用带名 API ⇒ 账房不该出现无名块(门不误报)。
+/// 同时它就是这条链的"整段通路"测试:`alloc`/`htod` → `Command::{Alloc,Htod}`
+/// → `new_block(name)` → `BlockEntry.name` → 按名聚合渲染。
+/// ⚠️ 必须在 `step_close_semantics` **之前**跑(close 后 client 不可用)。
+async fn step_ledger_is_named(client: &mut GpuClient) {
+    // 本步故意用**显式语义名**(而不用 `owl_iface::alloc!` 这类宏):锁"调用点直报名"这条路
+    // 仍然有效(生产代码走的就是它)。宏那条路由本文件另一处(窗内断言)覆盖
+    // ⇒ 两种命名路径各有门。
+    const A_NAME: &str = "ledgerprobe.alloc";
+    const H_NAME: &str = "ledgerprobe.htod";
+    let elems = 512usize;
+    let _a = client.alloc(Dtype::F32, elems, A_NAME).await.expect("alloc 带名");
+    let src = vec![1.0f32; elems];
+    let _h = client
+        .htod(Dtype::F32, &Shape::from(vec![elems]), &le_f32(&src), H_NAME)
+        .await
+        .expect("htod 带名");
+    let rep = client.ledger_report(16).await.expect("ledger_report 查询");
+    assert!(rep.contains(A_NAME), "alloc 名字必须进块账房:{rep}");
+    assert!(rep.contains(H_NAME), "htod 名字必须进块账房:{rep}");
+    assert!(
+        rep.contains(&format!("{A_NAME}=2.0KiB×1")),
+        "名字必须聚到位(512×f32=2KiB ⇒ KiB 口径×1):{rep}"
+    );
+    assert!(!rep.contains("未命名块"), "本步全带名 ⇒ 不得有未命名块:{rep}");
+
+    // **结构化那个面**(OOM 落盘用的是同一序列化器):形状 + 字节数 + 名字。
+    // 这里做"能被解析"的**轻量**校验(不引第三方 JSON 库):括号配平 + 关键片段。
+    // 真解析在验证脚本里做(见 docs/arch/全量记名-与-OOM-dump.md §7 复现命令)。
+    let js = client.ledger_json().await.expect("ledger_json 查询");
+    // ① **真语法校验**(严格栈式;不是数括号那种近似):
+    assert_valid_json(&js);
+    // ② 两段都在(OOM 现场 = 块账 + 家族 scratch;少一半就少一半归因)。
+    // ⚠️ **判据只用"真解析 + 片段在",不用字符串尾部猜形状**:首版写了
+    // `ends_with("}}")` 并据此判红一次 —— 而服务端实测同一串 open/close 各 56
+    // 完全配平(拼装逻辑是对的),错的是"数尾巴"这种脆弱判据本身。
+    // 结构化数据一律交给 `assert_valid_json`(它才是权威)。
+    // meta 段(时间戳/相位/引擎账;跨时间比对与"这是什么时候的现场"的前提)
+    assert!(js.contains("\"meta\":{\"ts_ms\":"), "meta 段必须在:{js}");
+    assert!(
+        js.contains("\"phase\":\"") && (js.contains("\"phase\":\"eager\"") || js.contains("\"phase\":\"graph\"") || js.contains("\"phase\":\"capture\"")),
+        "相位词表有界(eager/graph/capture):{js}"
+    );
+    // 外壳 = 两段各是自洽对象(**嵌套表达归属**,不靠顺序):
+    //   {"blocks":{"blocks":[…],"total_*":…},"scratch":{"scratch":[…],"total_*":…}}
+    assert!(js.starts_with("{\"meta\":{"), "外壳头(meta 在前)不对:{js}");
+    assert!(js.contains("\"blocks\":{\"blocks\":["), "blocks 段(自洽对象)必须在:{js}");
+    assert!(js.contains(",\"scratch\":{\"scratch\":["), "scratch 段(自洽对象)必须在:{js}");
+    assert!(js.contains("\"total_bytes\":") && js.contains("\"total_blocks\":"), "两段都要 totals:{js}");
+    // ③ 内容口径:名字 + 原始字节 + 分组块数
+    assert!(
+        js.contains(&format!(
+            "{{\"name\":\"{A_NAME}\",\"bytes\":{},\"blocks\":1}}",
+            elems * 4
+        )),
+        "结构化的名字/字节/块数不对:{js}"
+    );
+}
+
+
+/// **JSON 语法校验器**(递归下降;判据 = "落盘现场能被标准解析器读")。
+///
+/// 为什么不引 `serde_json`:只为一条测试加依赖会把 `Cargo.lock`/构建图
+/// 都拖进来;而这里要判的只有**结构合法性**。本实现覆盖 JSON 的完整语法
+/// (对象/数组/字符串转义/数字/字面量/空白),失败信息指向第一个坏字符。
+fn assert_valid_json(text: &str) {
+    struct P<'a> {
+        b: &'a [u8],
+        i: usize,
+    }
+    impl<'a> P<'a> {
+        fn ws(&mut self) {
+            while self.i < self.b.len() && matches!(self.b[self.i], b' ' | b'\t' | b'\n' | b'\r') {
+                self.i += 1;
+            }
+        }
+        fn take(&mut self, c: u8) -> bool {
+            self.ws();
+            if self.i < self.b.len() && self.b[self.i] == c {
+                self.i += 1;
+                true
+            } else {
+                false
+            }
+        }
+        fn string(&mut self) -> bool {
+            if !self.take(b'"') {
+                return false;
+            }
+            while self.i < self.b.len() {
+                match self.b[self.i] {
+                    b'\\' => self.i += 2,
+                    b'"' => {
+                        self.i += 1;
+                        return true;
+                    }
+                    _ => self.i += 1,
+                }
+            }
+            false
+        }
+        fn value(&mut self) -> bool {
+            self.ws();
+            if self.i >= self.b.len() {
+                return false;
+            }
+            match self.b[self.i] {
+                b'{' => {
+                    self.i += 1;
+                    self.ws();
+                    if self.take(b'}') {
+                        return true;
+                    }
+                    loop {
+                        if !self.string() {
+                            return false;
+                        }
+                        if !self.take(b':') {
+                            return false;
+                        }
+                        if !self.value() {
+                            return false;
+                        }
+                        if self.take(b',') {
+                            continue;
+                        }
+                        return self.take(b'}');
+                    }
+                }
+                b'[' => {
+                    self.i += 1;
+                    self.ws();
+                    if self.take(b']') {
+                        return true;
+                    }
+                    loop {
+                        if !self.value() {
+                            return false;
+                        }
+                        if self.take(b',') {
+                            continue;
+                        }
+                        return self.take(b']');
+                    }
+                }
+                b'"' => self.string(),
+                b't' => self.lit("true"),
+                b'f' => self.lit("false"),
+                b'n' => self.lit("null"),
+                b'-' | b'0'..=b'9' => {
+                    let start = self.i;
+                    self.i += 1;
+                    while self.i < self.b.len()
+                        && matches!(self.b[self.i], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+                    {
+                        self.i += 1;
+                    }
+                    self.i > start
+                }
+                _ => false,
+            }
+        }
+        fn lit(&mut self, w: &str) -> bool {
+            if self.b[self.i..].starts_with(w.as_bytes()) {
+                self.i += w.len();
+                true
+            } else {
+                false
+            }
+        }
+    }
+    let mut p = P { b: text.as_bytes(), i: 0 };
+    assert!(p.value(), "非法 JSON(offset {}):{:.40}", p.i, &text[p.i.min(text.len())..]);
+    p.ws();
+    assert_eq!(p.i, p.b.len(), "JSON 尾部有残留:{}", &text[p.i..]);
+}
+
+/// **步骤 14:峰值快照门(真机)**——`OWL_VRAM_PEAK_MB` 门控开时,
+/// 越过水位线的一次真分配必须落下一份现场,且那份是**合法 JSON**。
+///
+/// 为什么独立成步:①它验的是"触发面"(分配路径里的 `maybe_dump_peak`),
+/// 与步骤 13 的查询面不同;②门是 env ⇒ 只在设了 env 的运行里生效,
+/// 未设时本步**必须自行 skip**(不许静默假绿)。
+async fn step_peak_snapshot(client: &mut GpuClient) {
+    if std::env::var_os("OWL_VRAM_PEAK_MB").is_none() {
+        eprintln!("[skip] 步骤 14:未设 OWL_VRAM_PEAK_MB(门控默认关)");
+        return;
+    }
+    // ⚠️ 门值是**调用方**给的(测试用 1MiB),而**步进 5%** 是水位判定 ——
+    // 前面的步骤已把 live 抬到 768MiB 级,所以这里必须分配得**足够大**才破
+    // 步进(768×1.05≈806MiB ⇒ 30MiB 已够;给 64MiB 留余量)。首版只分 8MiB
+    // ⇒ 没破步进 ⇒ 读到的是**上一次**的快照(不带本块名),看起来像"触发面断了",
+    // 其实是测试没触发。教训:读"最近文件"这种判据必须与**触发条件**对齐。
+    let before = peak_snapshot_files().len();
+    let _big = client
+        .alloc(Dtype::U32, 16 << 20, "peaksnap.big") // 64MiB
+        .await
+        .expect("大块分配");
+    client.sync().await.expect("sync");
+    // 落盘在 server 线程异步发生 ⇒ 轮询等"**新文件**出现"(比 before 多;带超时)
+    let mut fresh: Option<(std::path::PathBuf, String)> = None;
+    for _ in 0..100 {
+        let mut hits = peak_snapshot_files();
+        hits.sort();
+        if hits.len() > before {
+            let p = hits.last().expect("非空").clone();
+            let body = std::fs::read_to_string(&p).expect("读快照");
+            fresh = Some((p, body));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (path, body) = fresh.expect("破了门却没落下新快照 ⇒ 触发面断了");
+    assert_valid_json(&body);
+    assert!(body.contains("\"meta\":{\"ts_ms\":"), "快照必须带 meta:{path:?}");
+    assert!(body.contains("peaksnap.big"), "新快照里必须能看见刚分配的那块:{path:?}");
+}
+
+/// /tmp 下的峰值快照文件表(测试用;门控开时才有)
+fn peak_snapshot_files() -> Vec<std::path::PathBuf> {
+    std::fs::read_dir("/tmp")
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("owl-vram-peak-") && n.ends_with(".json"))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// 步骤 7:close 语义
 async fn step_close_semantics(client: &mut GpuClient) {
     client.close().await.expect("close 应 Ok");
@@ -465,7 +713,7 @@ async fn step_close_semantics(client: &mut GpuClient) {
         matches!(r, Err(ModelError::ServerClosed)),
         "close 后 sync 应返回 ServerClosed,实得 {r:?}"
     );
-    let r = client.alloc(Dtype::F32, 4).await;
+    let r = owl_iface::alloc!(client, Dtype::F32, 4).await;
     assert!(
         matches!(r, Err(ModelError::ServerClosed)),
         "close 后 alloc 应返回 ServerClosed,实得 {r:?}"
@@ -509,8 +757,7 @@ async fn gpu_server_contract() {
 
     // ---- 图:捕获/重放 + 护栏(需要 Block 输入)----
     let xs = [1.0f32; 4];
-    let x = client
-        .htod(Dtype::F32, &Shape::from(vec![4]), &le_f32(&xs))
+    let x = owl_iface::htod!(client, Dtype::F32, &Shape::from(vec![4]), &le_f32(&xs))
         .await
         .expect("htod");
     step_graph_capture_and_replay(&mut client, &x).await;
@@ -531,6 +778,9 @@ async fn gpu_server_contract() {
     step_family_window_guard(&mut client).await; // 12
 
     // ---- 关机(最后;此后主 client 不可再用)----
+    // 前置:全量记名的端到端门(必须是 close 前最后一步 —— 它要读块账真值)
+    step_ledger_is_named(&mut client).await; // 13
+    step_peak_snapshot(&mut client).await; // 14(未设门 = 自行 skip)
     step_close_semantics(&mut client).await; // 7
 
     eprintln!("[t] 全部步骤完成");
@@ -540,13 +790,12 @@ async fn gpu_server_contract() {
 /// 判决:小图也 ms 级 = 系统性(驱动/环境);大图独有 = 节点规模税。
 async fn step_graph_launch_probe(client: &mut GpuClient, x: &Bytes) {
     let zeros = [0.0f32; 4];
-    let y = client
-        .htod(Dtype::F32, &Shape::from(vec![4]), &le_f32(&zeros))
+    let y = owl_iface::htod!(client, Dtype::F32, &Shape::from(vec![4]), &le_f32(&zeros))
         .await
         .expect("htod y");
     for (tag, launches) in [("小图", 1usize), ("大图", 500usize)] {
         client.graph_begin().await.expect("begin");
-        let out = client.alloc(Dtype::F32, 4).await.expect("alloc").view(Dtype::F32, 1);
+        let out = owl_iface::alloc!(client, Dtype::F32, 4).await.expect("alloc").view(Dtype::F32, 1);
         for _ in 0..launches {
             client.launch(add_msg(x, &y, &out, 4)).await.expect("launch");
         }
@@ -603,9 +852,9 @@ async fn gpu_gemm_f16_matches_host() {
         }
     }
 
-    let da = client.htod(Dtype::F16, &Shape::from(vec![t, k]), &le_f16(&a)).await.expect("htod a");
-    let dw = client.htod(Dtype::F16, &Shape::from(vec![n, k]), &le_f16(&w)).await.expect("htod w");
-    let dout = client.alloc(Dtype::F16, t * n).await.expect("alloc out").view(Dtype::F16, 2); // [m,n]
+    let da = owl_iface::htod!(client, Dtype::F16, &Shape::from(vec![t, k]), &le_f16(&a)).await.expect("htod a");
+    let dw = owl_iface::htod!(client, Dtype::F16, &Shape::from(vec![n, k]), &le_f16(&w)).await.expect("htod w");
+    let dout = owl_iface::alloc!(client, Dtype::F16, t * n).await.expect("alloc out").view(Dtype::F16, 2); // [m,n]
     let msg = LaunchMsg {
         kernel: KernelSource { name: "cublas_gemm_f16".into(), source: String::new() },
         args: vec![

@@ -584,7 +584,7 @@ mod tests {
         fn resolve_len(&self, _id: u64) -> Result<usize, OpError> {
             Err(OpError::Contract { op: "nop".into(), field: "resolve_len", expect: "-".into(), got: "-".into() })
         }
-        fn alloc(&mut self, _bytes: usize, _tag: &'static str) -> Result<crate::device::ScratchBuf, OpError> {
+        fn alloc(&mut self, _bytes: usize, _tag: &str) -> Result<crate::device::ScratchBuf, OpError> {
             Err(OpError::Contract { op: "nop".into(), field: "alloc", expect: "-".into(), got: "-".into() })
         }
         fn capturing(&self) -> Result<bool, OpError> {
@@ -609,7 +609,7 @@ mod tests {
         fn alloc_block(
             &mut self,
             _bytes: usize,
-            _tag: &'static str,
+            _tag: &str,
         ) -> Result<crate::contract::Bytes, OpError> {
             Err(OpError::Contract { op: "nop".into(), field: "alloc_block", expect: "-".into(), got: "-".into() })
         }

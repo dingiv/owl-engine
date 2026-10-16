@@ -37,7 +37,7 @@ fn add_msg_owned(a: &Bytes, b: &Bytes, out_id: u64, n: usize) -> LaunchMsg {
 }
 
 async fn alloc(client: &mut GpuClient, elems: usize) -> Bytes {
-    client.alloc(Dtype::F32, elems).await.expect("alloc")
+    owl_iface::alloc!(client, Dtype::F32, elems).await.expect("alloc")
 }
 
 /// 计时壳:捕获链 → 暖机 3 → 重放 R 次 sync 墙

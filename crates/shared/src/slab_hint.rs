@@ -217,9 +217,17 @@ struct ProbeState {
     peak_live_ids: Vec<u64>,
     peak_live_live: usize,
     peak_live_high: usize,
+    /// **逐块引用计数快照**(块 id → (users, pending);求值器在改动点推。
+    /// 2026-10-16):"活着一大片"时唯一能回答**"它凭什么是活的"**的面 ——
+    /// `users` 抬着(谁还引用)vs `pending` 没减(预波的消费者计数)。
+    /// 插入即留(与 `bytes`/`names` 同律:峰值快照里的块可能已死,报告仍要能画)
+    refs: std::collections::HashMap<u64, (u32, u32)>,
 }
 
 static PROBE: std::sync::Mutex<Option<ProbeState>> = std::sync::Mutex::new(None);
+/// `probe_refs` 被调用的次数(诊断面:**证明"求值器真的在推"** —— 端到端
+/// 断言不该依赖日志级别/报告渲染;`probe_on` 清零)
+static REFS_PUSHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// 最后一次 `probe_end` 的归因报告(文本;调用方取走后自行打日志)
 static PROBE_REPORT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
@@ -430,6 +438,7 @@ const ATTR_TOP: usize = 8;
 pub fn probe_on(on: bool) {
     // 活性账与探针**同窗**:开探针 = 清台(否则上一个窗口的拒因混进来)
     live_diag::reset();
+    REFS_PUSHED.store(0, Ordering::Relaxed);
     if let Ok(mut g) = PROBE.lock() {
         *g = if on {
             Some(ProbeState {
@@ -445,6 +454,7 @@ pub fn probe_on(on: bool) {
                 peak_live_ids: Vec::new(),
                 peak_live_live: 0,
                 peak_live_high: 0,
+                refs: std::collections::HashMap::new(),
             })
         } else {
             None
@@ -497,6 +507,42 @@ pub fn probe_name(id: u64, name: &str) {
             st.names.insert(id, name.to_string());
         }
     }
+}
+
+/// **逐块引用计数推送**(求值器在 `block_users`/`pending` 改动点调用;
+/// 2026-10-16)。探针关 = 零动作(一次 relaxed 原子读)。
+///
+/// 为什么由求值器推而不是探针自己算:两个计数都是**求值器的活状态**
+/// (CPU 侧 HashMap),探针只持"快照"。推送点 = 改动点(三处:
+/// `track_new`/`track_alias`/死亡减一),每次 ~1ns 哈希写 —— 与既有
+/// `live_diag` 原子计数同级。
+pub fn probe_refs(id: u64, users: usize, pending: usize) {
+    if !PROBE_ON.load(Ordering::Relaxed) {
+        return;
+    }
+    REFS_PUSHED.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut g) = PROBE.lock() {
+        if let Some(st) = g.as_mut() {
+            st.refs.insert(id, (users as u32, pending as u32));
+        }
+    }
+}
+
+/// 引用计数推送次数(诊断/门面;探针关时恒 0)。
+///
+/// 存在的意义:让"求值器在改动点推了引用计数"**可机械判定** ——
+/// 报告渲染受日志级别影响,计数不受。
+pub fn refs_pushed() -> u64 {
+    REFS_PUSHED.load(Ordering::Relaxed)
+}
+
+/// 读某块的**引用计数快照** `(users, pending)`(诊断/测试面;探针关 = None)。
+///
+/// 与 [`probe_refs`] 配对:求值器推、外部读。存在的意义是让"求值器真的推了"
+/// 这件事**可判定**(端到端 e2e 里日志可能被级别过滤,机械探针不受影响)。
+pub fn probe_refs_of(id: u64) -> Option<(u32, u32)> {
+    let g = PROBE.lock().ok()?;
+    g.as_ref().and_then(|st| st.refs.get(&id).copied())
 }
 
 /// 探针登记过的块名(诊断:回收出口按名分账用;未登记/探针关 = None)
@@ -643,6 +689,83 @@ fn render_report(st: &ProbeState) -> String {
         st.peak_live_ids.len(),
         sum_total as f64 / 1073741824.0,
     ) + &uname_part
+        + &render_refs(st)
+}
+
+/// **"它凭什么是活的"**(逐块引用计数视图;2026-10-16)。
+///
+/// 输入 = 求值器在改动点推的 `(users, pending)` 快照。三条判读:
+/// - **用户峰值前 N**:按 `users` 降序取前几块(谁被最多消费者抬着);
+///   users 越大越说明"这一块的寿命被谁决定" —— 想缩峰值就去找那个节点。
+/// - **users 直方图**:按字节/块数分桶(1 / 2–3 / ≥4)—— 快速看"大部分
+///   内存是被独占的还是一堆共享的"。
+/// - **⚠ 幽灵块**:`users == 0 && 已死` 之外**仍计入活跃**的块(不该出现:
+///   归零那一刻就该走回收出口)。它非 0 = 活性记账漏了口(历史上真出过)。
+fn render_refs(st: &ProbeState) -> String {
+    if st.refs.is_empty() {
+        return String::new();
+    }
+    // 只统计**当前活跃**的块(已死块留在表里是为了渲染,不该进引用分布)
+    let live: Vec<(u64, (u32, u32))> = st
+        .peak_live_ids
+        .iter()
+        .filter_map(|id| st.refs.get(id).map(|r| (*id, *r)))
+        .collect();
+    if live.is_empty() {
+        return String::new();
+    }
+    let name_of = |id: u64| -> String {
+        let n = st.names.get(&id).cloned().unwrap_or_else(|| "(未命名)".to_string());
+        let bytes = *st.bytes.get(&id).unwrap_or(&0);
+        format!("{n}({:.0}MB)", bytes as f64 / 1048576.0)
+    };
+    // ① 用户峰值前 3
+    let mut top: Vec<(u64, (u32, u32))> = live.clone();
+    top.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+    let tops = top
+        .iter()
+        .take(3)
+        .map(|(id, (u, p))| format!("{}:u{u}/p{p}", name_of(*id)))
+        .collect::<Vec<_>>()
+        .join(" / ");
+    // ② users 直方图(块数 + 字节)
+    let mut buckets = [(0usize, 0u64); 3]; // 1 / 2-3 / >=4
+    for (id, (u, _)) in &live {
+        let bytes = *st.bytes.get(id).unwrap_or(&0) as u64;
+        let idx = match *u {
+            0 | 1 => 0,
+            2..=3 => 1,
+            _ => 2,
+        };
+        buckets[idx].0 += 1;
+        buckets[idx].1 += bytes;
+    }
+    // ③ 幽灵块(users==0 却在活跃集里)
+    let ghosts: Vec<&(u64, (u32, u32))> = live.iter().filter(|(_, (u, _))| *u == 0).collect();
+    let ghost_part = if ghosts.is_empty() {
+        String::new()
+    } else {
+        let names = ghosts
+            .iter()
+            .take(3)
+            .map(|(id, _)| name_of(*id))
+            .collect::<Vec<_>>()
+            .join(" / ");
+        format!(
+            " ‖ ⚠ 幽灵块 {} 个(users=0 却仍活跃 ⇒ 回收记账漏口):{names}",
+            ghosts.len()
+        )
+    };
+    format!(
+        " ‖ 引用分布({} 块):u=1 {}块/{:.0}MB, u=2-3 {}块/{:.0}MB, u≥4 {}块/{:.0}MB ‖ users 前3:{tops}{ghost_part}",
+        live.len(),
+        buckets[0].0,
+        buckets[0].1 as f64 / 1048576.0,
+        buckets[1].0,
+        buckets[1].1 as f64 / 1048576.0,
+        buckets[2].0,
+        buckets[2].1 as f64 / 1048576.0,
+    )
 }
 
 #[cfg(test)]
@@ -762,6 +885,50 @@ mod arena_tests {
         // 关态:零动作(不 panic、不计)
         probe_alloc(4, 1 << 20);
         assert_eq!(probe_end(), 0);
+    }
+
+    /// **引用分布视图**(2026-10-16):"它凭什么是活的" —— users 桶 / users 前 3 /
+    /// 幽灵块(users=0 却仍活跃 = 记账漏口)。三条判据各一条断言。
+    #[test]
+    fn probe_refs_view_buckets_top_and_ghosts() {
+        let _g = PROBE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = take_probe_report();
+        probe_on(true);
+        // 三块进峰值集(尺寸 1MiB/1MiB/2MiB),各推不同引用计数
+        probe_alloc(11, 1 << 20);
+        probe_name(11, "kv.a");
+        probe_alloc(12, 1 << 20);
+        probe_name(12, "kv.b");
+        probe_alloc(13, 2 << 20);
+        probe_name(13, "kv.c");
+        probe_refs(11, 1, 0); // u=1 桶
+        probe_refs(12, 3, 2); // u=2-3 桶,且 pending 非零
+        probe_refs(13, 5, 0); // u>=4 桶
+        let peak = probe_end();
+        assert!(peak > 0);
+        let rep = take_probe_report();
+        assert!(rep.contains("引用分布(3 块)"), "分布段必须在:{rep}");
+        assert!(rep.contains("u=1 1块/1MB"), "u=1 桶:{rep}");
+        assert!(rep.contains("u=2-3 1块/1MB"), "u=2-3 桶:{rep}");
+        assert!(rep.contains("u≥4 1块/2MB"), "u≥4 桶:{rep}");
+        assert!(rep.contains("users 前3:kv.c(2MB):u5/p0"), "users 降序前 3:{rep}");
+        assert!(!rep.contains("幽灵块"), "无幽灵时不得出现警报:{rep}");
+    }
+
+    /// **幽灵块必须响亮**:users 归零却仍在活跃集 = 回收记账漏口(历史真出过),
+    /// 这条是那个不变式的负例门。
+    #[test]
+    fn probe_refs_ghost_blocks_are_loud() {
+        let _g = PROBE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = take_probe_report();
+        probe_on(true);
+        probe_alloc(21, 1 << 20);
+        probe_name(21, "leaky.block");
+        probe_refs(21, 0, 0); // u=0 却仍活 ⇒ 幽灵
+        let _ = probe_end();
+        let rep = take_probe_report();
+        assert!(rep.contains("⚠ 幽灵块 1 个"), "幽灵必须显形:{rep}");
+        assert!(rep.contains("leaky.block"), "幽灵要点名:{rep}");
     }
 
     /// **峰值归因**(2026-10-15):快照 = 高水位刷新时刻的活跃集;

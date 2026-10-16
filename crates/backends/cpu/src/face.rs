@@ -59,7 +59,11 @@ impl DeviceClient for CpuFace {
     /// 显存分配(清零;CPU = Vec;无流参数 —— 同步直调即序)。
     /// f16 基线下 CPU 执行仍 f32-only;但 **F16 清零块放行**(与 htod 的
     /// F16 解码同款 —— 装载门禁测试需在 CPU 落 f16 权重块),BF16/U32 拒。
-    async fn alloc(&mut self, dtype: Dtype, elems: usize) -> Result<Bytes, ModelError> {
+    ///
+    /// `_name`(全量记名):CPU 面无显存账房(值块是 host Vec)⇒ 无 OOM
+    /// 现场可归因,名字无处落 —— 有意不存(不是遗忘;GPU 面由
+    /// `GpuClient`→`Command::Alloc`→块账房 `BlockEntry.name` 承担)。
+    async fn alloc(&mut self, dtype: Dtype, elems: usize, _name: &str) -> Result<Bytes, ModelError> {
         match dtype {
             Dtype::F32 | Dtype::F16 => {}
             other => {
@@ -76,12 +80,13 @@ impl DeviceClient for CpuFace {
         Ok(Bytes::new(id, elems, Dtype::F32, 0))
     }
 
-    /// 装载(host 字节 → f32 值块)
+    /// 装载(host 字节 → f32 值块);`_name` 同 [`CpuFace::alloc`](有意不存)。
     async fn htod(
         &mut self,
         dtype: Dtype,
         shape: &Shape,
         src: &[u8],
+        _name: &str,
     ) -> Result<Bytes, ModelError> {
         let v = ops::htod(dtype, shape, src)?;
         let id = self.next;

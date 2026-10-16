@@ -639,7 +639,10 @@ where
             // **同一块被登记两次**(记账重复 ⇒ users 恒多 1 ⇒ 永不归还;诊断计数)
             owl_shared::slab_hint::live_diag::double_new(id, id, 0, self.memo.len());
         }
-        *self.block_users.entry(id).or_insert(0) += 1;
+        let u = self.block_users.entry(id).or_insert(0);
+        *u += 1;
+        // 引用计数推送(诊断;"它凭什么是活的"面;探针关 = 零动作)
+        owl_shared::slab_hint::probe_refs(id, *u, self.pending.get(&id).copied().unwrap_or(0));
     }
 
     /// **memo 写入单点**:登记节点值;若它属跨段存活白名单,同时登记其产出块
@@ -669,6 +672,12 @@ where
                 owl_shared::slab_hint::live_diag::alias_multi();
             }
             *e += 1;
+            let u = *e;
+            owl_shared::slab_hint::probe_refs(
+                id,
+                u,
+                self.pending.get(&id).copied().unwrap_or(0),
+            );
         }
     }
 
@@ -687,6 +696,7 @@ where
         dtype: Dtype,
         n_elems: usize,
         zeroed: bool,
+        name: &str,
     ) -> Result<Bytes, ModelError> {
         if let Some(b) = self.overrides.get(&node_id) {
             if b.len != n_elems {
@@ -704,14 +714,21 @@ where
             }
             return Ok(b);
         }
-        self.alloc_out(dtype, n_elems, zeroed).await
+        self.alloc_out(dtype, n_elems, zeroed, name).await
     }
 
+    /// 块获取(真分配或池命中)。
+    ///
+    /// `name` = **分配点点名**(全量记名纪律;传给 `face.alloc` ⇒ 服务端块账房
+    /// `BlockEntry.name` ⇒ OOM 现场按名清单)。池**命中**分支无需记名:块 id 不变
+    /// ⇒ 账房里的名字仍是该块**首次出生**时那一次(块身份与"这个槽位是干什么的"
+    /// 语义未变 —— 同一张图的同一个槽)。
     async fn alloc_out(
         &mut self,
         dtype: Dtype,
         n_elems: usize,
         zeroed: bool,
+        name: &str,
     ) -> Result<Bytes, ModelError> {
         let n_bytes = n_elems * dtype.size_bytes();
         let hit = self.pool.as_mut().and_then(|p| p.take(n_bytes));
@@ -731,9 +748,9 @@ where
             return Ok(b);
         }
         let b = if zeroed {
-            self.face.alloc(dtype, n_elems).await?
+            self.face.alloc(dtype, n_elems, name).await?
         } else {
-            self.face.alloc_uninit(dtype, n_elems).await?
+            self.face.alloc_uninit(dtype, n_elems, name).await?
         };
         if let Some(p) = self.pool.as_mut() {
             p.register(b.id, n_bytes);
@@ -900,12 +917,12 @@ where
 
     let out: Bytes = match &t.op {
         Op::Htod { bytes } => {
-            let b = ctx.face.htod(dtype, &shape, bytes).await?;
+            let b = ctx.face.htod(dtype, &shape, bytes, class).await?;
             ctx.track_new(b.id);
             b
         }
         Op::Zeros => {
-            let b = ctx.alloc_out_node(t.id, dtype, n_elems, true).await?.view(dtype, shape.len() as u8);
+            let b = ctx.alloc_out_node(t.id, dtype, n_elems, true, class).await?.view(dtype, shape.len() as u8);
             owl_shared::slab_hint::probe_name(b.id, class);
             ctx.track_new(b.id);
             b
@@ -929,7 +946,7 @@ where
             // k = 内维 = x 声明 shape 末维(C1:只读声明 shape;原取 ins[0].len
             // 在多行 [m,k] 时越界读 —— 此 bug 被"历届测试都单行"掩盖)
             let k = t.parents[0].shape.last().copied().unwrap_or(0);
-            let out = ctx.alloc_out_node(t.id, dtype, m * n, false).await?.view(dtype, shape.len() as u8);
+            let out = ctx.alloc_out_node(t.id, dtype, m * n, false, class).await?.view(dtype, shape.len() as u8);
             owl_shared::slab_hint::probe_name(out.id, class);
             ctx.track_new(out.id);
             if dtype == Dtype::F16 || dtype == Dtype::BF16 {
@@ -1019,7 +1036,7 @@ where
             if let Some(l) = lap.as_mut() {
                 l.lap("interp.host.seg.build");
             }
-            let out = ctx.alloc_out_node(t.id, dtype, n_elems, false).await?.view(dtype, shape.len() as u8);
+            let out = ctx.alloc_out_node(t.id, dtype, n_elems, false, class).await?.view(dtype, shape.len() as u8);
             // 峰值归因:本输出块挂上核名(`class` 已在上面 resolve 处覆写为核名)
             owl_shared::slab_hint::probe_name(out.id, class);
             if let Some(l) = lap.as_mut() {
@@ -1056,6 +1073,7 @@ where
     if ctx.reclaim {
         for (p, b) in t.parents.iter().zip(vals.iter()) {
             let cnt = ctx.pending.entry(p.id).or_insert(0);
+            // 注:此处 cnt 尚未减,pending 推送在减完后(见下方;与 users 同点)
             if *cnt > 0 {
                 *cnt -= 1;
             }
@@ -1073,6 +1091,12 @@ where
                         *u -= 1;
                     }
                     let left_u = *u; // ← 取完即放(下面要调 ctx.* ⇒ 不能揣着可变借)
+                    // 引用计数推送(诊断):此刻 users 已减、pending 已减(上面那行)
+                    owl_shared::slab_hint::probe_refs(
+                        bid,
+                        left_u,
+                        ctx.pending.get(&bid).copied().unwrap_or(0),
+                    );
                     if left_u == 0 {
                         // 回收出口四个判定各记一笔(诊断;见 `slab_hint::live_diag`)
                         use owl_shared::slab_hint::live_diag::{outcome, refuse, Refuse};
@@ -1210,8 +1234,7 @@ mod liveness_tests {
 
         // 断点求值(调用方负责):这里直接在 host 侧"造"出它的值块并登记
         // (GPU 侧这里就是"窗外 eager 跑一次断点算子";CPU 测试用 htod 等价造块)
-        let brk_block = face
-            .htod(Dtype::F32, &vec![1usize].into(), &f32b(&[av + 10.0]))
+        let brk_block = owl_iface::htod!(face, Dtype::F32, &vec![1usize].into(), &f32b(&[av + 10.0]))
             .await
             .expect("断点块");
         carry.resolve(brk.id, brk_block.clone());
@@ -1244,7 +1267,7 @@ mod liveness_tests {
         let x = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[4.0]));
         let n = x.add(&one); // 5
         // "钉块":捕获前分配的那类(带正确元素数;GPU 上由 plan 持有)
-        let pin = face.alloc(Dtype::F32, 1).await.expect("pin 块").view(Dtype::F32, 1);
+        let pin = owl_iface::alloc!(face, Dtype::F32, 1).await.expect("pin 块").view(Dtype::F32, 1);
         let mut carry = EvalCarry::default();
         carry.override_out(n.id, pin.clone());
 
@@ -1268,7 +1291,7 @@ mod liveness_tests {
         let c2 = TensorOps::from_host(Dtype::F32, vec![2], &f32b(&[1.0, 1.0]));
         let x = TensorOps::from_host(Dtype::F32, vec![2], &f32b(&[1.0, 1.0]));
         let n = x.add(&c2); // [2](声明形状相符 ⇒ 触不到声明门,只会撞覆盖尺寸门)
-        let bad = face.alloc(Dtype::F32, 1).await.expect("错尺寸钉块").view(Dtype::F32, 1);
+        let bad = owl_iface::alloc!(face, Dtype::F32, 1).await.expect("错尺寸钉块").view(Dtype::F32, 1);
         let mut carry = EvalCarry::default();
         carry.override_out(n.id, bad);
         let r = eval_segment(&[&n], &mut face, Default::default(), &mut carry, SegMode::Eager).await;
@@ -1333,6 +1356,36 @@ mod liveness_tests {
             .expect("seg1");
         assert_ne!(s0[0].id, s1[0].id, "未 keep ⇒ 应重算出新块");
         assert!((read_f32(&mut face, &s1[0]).await - 8.0).abs() < 1e-6);
+    }
+
+    /// **引用计数推送**(2026-10-16):求值器在改动点把 `(users, pending)` 推给
+    /// 探针 —— 这是"它凭什么是活的"数据源。
+    ///
+    /// 判据用**推送计数器**(`slab_hint::refs_pushed`),不用报告文本:
+    /// 报告渲染受日志级别影响,而"推了几次"是机械事实。CPU 面跑不了真块叶
+    /// (无块账房 ⇒ DeadBlock),所以这里只验"推了且计数随引用增长";
+    /// 真实图路径的端到端断言在 engine 侧(probe 窗口内 `refs_pushed > 0`)。
+    #[tokio::test]
+    async fn eval_pushes_ref_counts_to_probe() {
+        let mut face = owl_cpu::CpuFace::new();
+        owl_shared::slab_hint::probe_on(true);
+        // 菱形:同一块被三处引用(两条边 + 一次透传别名)
+        let x = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[3.0]));
+        let sq = x.mul(&x);
+        let r = x.reshape(vec![1]);
+        let root = sq.mul(&r);
+        // CPU 面执行可能结构化拒(块账房/语义面限制);本测只关心**推送**
+        let _ = eval_ops_scoped(&root, &mut face).await;
+        let pushed = owl_shared::slab_hint::refs_pushed();
+        assert!(
+            pushed > 0,
+            "求值必须推送引用计数(0 次 = 推送面断了)"
+        );
+        owl_shared::slab_hint::probe_on(false);
+        // 关探针后不再推(探针关 = 零动作)
+        let before = owl_shared::slab_hint::refs_pushed();
+        let _ = eval_ops_scoped(&root, &mut face).await;
+        assert_eq!(owl_shared::slab_hint::refs_pushed(), before, "探针关必须零推送");
     }
 
     /// 读回一个 f32 块(测试辅助)
@@ -1494,9 +1547,9 @@ mod dtype_guard_tests {
 
         let mut gpu = gpu_client().await;
         let shape = crate::contract::Shape::from(vec![n]);
-        let dx_b = gpu.htod(Dtype::F16, &shape, &xb).await.expect("htod x");
-        let dy_b = gpu.htod(Dtype::F16, &shape, &yv.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()).await.expect("htod y");
-        let da_b = gpu.htod(Dtype::F16, &shape, &alpha.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()).await.expect("htod alpha");
+        let dx_b = owl_iface::htod!(gpu, Dtype::F16, &shape, &xb).await.expect("htod x");
+        let dy_b = owl_iface::htod!(gpu, Dtype::F16, &shape, &yv.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()).await.expect("htod y");
+        let da_b = owl_iface::htod!(gpu, Dtype::F16, &shape, &alpha.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()).await.expect("htod alpha");
         // 契约:rmsnorm x/out 皆 r2(行视图)
         let dx = TensorOps::of_block(dx_b.id, Dtype::F16, vec![1, n]);
         let dy = TensorOps::of_block(dy_b.id, Dtype::F16, vec![1, n]);
