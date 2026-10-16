@@ -709,6 +709,118 @@ impl AwqSource {
     /// 因子三件恒烘(数据小,且与 B 无关)。
     fn build_linear_a8(&self, base: &str, want_b: bool) -> Result<(), ModelError> {
         use owl_kernels::family::marlin::repack::{pack_marlin_b_a8, pack_marlin_s_a8, pack_marlin_z_a8, unpack_nibbles};
+        // ---- 刀2 虚拟合并键(in_proj_qkvz = row-stack(qkv, z))的 a8 分支 ----
+        // 与 a16 臂同律:**源域行拼接**(scales/zp/nibble 均行主序 ⇒ concat 合法),
+        // 拼完再进 a8 三件套 —— 全局因子取**合并后**尺度的 max(一层一个 a_scales)
+        if let Some((b1, b2)) = split_qkvz(base) {
+            let Some((n1, k1, f1)) = self.linear_form(&b1) else {
+                return Err(ModelError::Msg(format!("awq/a8: 子基 {b1} 形态不可解")));
+            };
+            let Some((n2, k2, f2)) = self.linear_form(&b2) else {
+                return Err(ModelError::Msg(format!("awq/a8: 子基 {b2} 形态不可解")));
+            };
+            if k1 != k2 {
+                return Err(ModelError::Msg(format!(
+                    "awq/a8: 合并键 {base} 两子基 k 不等({k1} vs {k2})"
+                )));
+            }
+            let (QuantForm::Ct { pe: pe1, se: se1, ze: ze1 }, QuantForm::Ct { pe: pe2, se: se2, ze: ze2 }) =
+                (&f1, &f2)
+            else {
+                return Err(ModelError::Msg(format!(
+                    "awq/a8: 合并键 {base} 要求两子均 Ct 形态(cyankiwi 满足)"
+                )));
+            };
+            let out = n1 + n2;
+            let k = k1;
+            let groups = k / 32;
+            let shard = base.bytes().map(|b| b as usize).sum::<usize>() % self.build_locks.len();
+            let _g = self.build_locks[shard].lock().unwrap();
+            let guard_key = if want_b { format!("{base}.qweight_a8") } else { format!("{base}.scales_a8") };
+            {
+                let cache = self.cache.lock().unwrap();
+                if cache.0.contains_key(&guard_key) {
+                    return Ok(());
+                }
+            }
+            let t0 = std::time::Instant::now();
+            // 源域拼接:scales(bf16→f32 两段)/ zp(u8 两段)/ nibble(仅 want_b)
+            let mut s_f32 = bf16_par(&self.maps[se1.map_ix][se1.start..se1.start + se1.nbytes]);
+            s_f32.extend(bf16_par(&self.maps[se2.map_ix][se2.start..se2.start + se2.nbytes]));
+            let mut zp_u8 = unpack_zp_ct(
+                &i32s_par(&self.maps[ze1.map_ix][ze1.start..ze1.start + ze1.nbytes]),
+                n1,
+                groups,
+            );
+            zp_u8.extend(unpack_zp_ct(
+                &i32s_par(&self.maps[ze2.map_ix][ze2.start..ze2.start + ze2.nbytes]),
+                n2,
+                groups,
+            ));
+            for (m, e) in [(se1.map_ix, se1), (se2.map_ix, se2), (ze1.map_ix, ze1), (ze2.map_ix, ze2)] {
+                self.maps[m].dontneed(e.start, e.nbytes);
+            }
+            let (s_bits, factor) = pack_marlin_s_a8(&s_f32, out, groups);
+            let z_buf = pack_marlin_z_a8(&zp_u8, out, groups);
+            let mut inserts: Vec<(String, Arc<[u8]>, usize)> = vec![
+                (
+                    format!("{base}.scales_a8"),
+                    Arc::from(u16s_le_bytes(&s_bits).into_boxed_slice()),
+                    s_bits.len() * 2,
+                ),
+                (
+                    format!("{base}.zeros_a8"),
+                    Arc::from(i32s_le_bytes(&z_buf).into_boxed_slice()),
+                    z_buf.len() * 4,
+                ),
+                (
+                    format!("{base}.a8_factor"),
+                    Arc::from(factor.to_le_bytes().to_vec().into_boxed_slice()),
+                    4,
+                ),
+            ];
+            if want_b {
+                let mut q = unpack_nibbles(
+                    &i32s_par(&self.maps[pe1.map_ix][pe1.start..pe1.start + pe1.nbytes]),
+                    n1,
+                    k,
+                );
+                q.extend(unpack_nibbles(
+                    &i32s_par(&self.maps[pe2.map_ix][pe2.start..pe2.start + pe2.nbytes]),
+                    n2,
+                    k,
+                ));
+                for (m, e) in [(pe1.map_ix, pe1), (pe2.map_ix, pe2)] {
+                    self.maps[m].dontneed(e.start, e.nbytes);
+                }
+                let b_buf = pack_marlin_b_a8(&q, k, out);
+                inserts.push((
+                    format!("{base}.qweight_a8"),
+                    Arc::from(i32s_le_bytes(&b_buf).into_boxed_slice()),
+                    b_buf.len() * 4,
+                ));
+            }
+            let mut cache = self.cache.lock().unwrap();
+            let add: usize = inserts.iter().map(|(_, _, b)| b).sum();
+            if cache.1 + add > CACHE_CAP_BYTES {
+                cache.0.clear();
+                cache.1 = 0;
+            }
+            for (kk, b, nb) in inserts {
+                cache.0.insert(kk, b);
+                cache.1 += nb;
+            }
+            drop(cache);
+            owl_shared::metrics::with_metrics_store(|s| {
+                s.timer_record_tag("load.mat.a8", t0.elapsed(), file!(), line!())
+            });
+            owl_shared::log_info!(
+                "awq",
+                "物化 {base} a8(合并键 out={out}, k={k}, 因子={factor:.3e}) @ {:?}",
+                t0.elapsed()
+            );
+            return Ok(());
+        }
         let Some((out, k, form)) = self.linear_form(base) else {
             return Err(ModelError::Msg(format!("awq/a8: {base} 形态不可解(非量化线性?)")));
         };

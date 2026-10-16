@@ -344,6 +344,99 @@ mod tests {
     use crate::tensor::Dtype;
     use std::collections::HashMap;
 
+    /// **W4A8 验收门(S2;GPU + 真检查点)**:同一条真实 AWQ 层,两条 plan
+    /// (`W4A16Awq` ↔ `W4A8Awq`)**同输入对拍** —— 走全链:装载(a8 键族 /
+    /// 设备重排 a8 核)→ `Linear::forward`(激活 int8 量化 + kS8×kU4 GEMM)→ 回读。
+    ///
+    /// 判据 = **噪声/信号 RMS**(a8 是另一档量化:per-token int8 激活 + int16
+    /// 权重尺度 ⇒ 不逐位;a16 是 f16 激活 + f16 尺度)。阈值 1e-2 远超理论
+    /// 偏差(激活 1/(2·127) ≈ 4e-3 + 尺度 1.2e-4),但足以抓住**布局/接线级**
+    /// 错误(拿错 B 表、a_scales 没接上、因子没折——量级都在 10⁻¹ 以上)。
+    ///
+    /// 跑法:`OWL_TEST_DEVICE=1 OWL_AWQ27B_DIR=<cyankiwi 27B> cargo test -p owl-models
+    ///       --lib gpu_w4a8_matches_w4a16_on_real_layer -- --nocapture`
+    #[tokio::test]
+    async fn gpu_w4a8_matches_w4a16_on_real_layer() {
+        use crate::module::QuantPlan;
+        use crate::testkit::{gpu_client, gpu_enabled};
+        if !gpu_enabled() {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return;
+        }
+        let Some(dir) = owl_shared::env_reader::str("OWL_AWQ27B_DIR") else {
+            eprintln!("skip: OWL_AWQ27B_DIR 未设(cyankiwi 27B 检查点目录)");
+            return;
+        };
+        // 真层:layer0.mlp.gate_proj(17408×5120)——两档都 marlin_eligible。
+        // 局部键 = "gate_proj"(层内惯例);全键由 `map_keys` 在**声明期**改写
+        // (与整模路同一条 `KeyConvention` 语义 —— 这里手写前缀即可)。
+        let (local, prefix) = ("gate_proj", "model.language_model.layers.0.mlp.");
+        let (out_dim, in_dim, m) = (17408usize, 5120usize, 8usize);
+        struct Prefixed<'a>(&'a Linear, &'a str);
+        impl crate::module::Loadable for Prefixed<'_> {
+            fn layout(&self, ctx: &LoaderCtx) -> crate::module::LoaderOps {
+                let p = self.1.to_string();
+                self.0.layout(ctx).map_keys(move |k| format!("{p}{k}"))
+            }
+        }
+        // 确定性输入(r16 对齐:进 f16 域前先舍入,免"装载域 vs 输入域"两套口径)
+        let r16 = |x: f32| half::f16::from_f32(x).to_f32();
+        let xs: Vec<f32> = (0..m * in_dim).map(|i| r16(((i as f32) * 0.013).sin() * 0.8)).collect();
+        let xb: Vec<u8> = xs.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect();
+
+        let mut got: Vec<Vec<f32>> = Vec::new();
+        for plan in [QuantPlan::W4A16Awq, QuantPlan::W4A8Awq] {
+            let lin = Linear::new(local, out_dim, in_dim, plan);
+            let comp = Prefixed(&lin, prefix);
+            let mut gpu = gpu_client().await;
+            let opts = crate::formats::load::LoadOpts::new(&gpu, Dtype::F16);
+            let manifest = crate::formats::load::load_from_dir(
+                std::path::Path::new(&dir),
+                &mut gpu,
+                &comp,
+                opts,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{plan:?} 装载失败: {e}"));
+            let keys: Vec<String> = manifest.entries().iter().map(|e| e.key.clone()).collect();
+            eprintln!("[{plan:?}] 装载 {} 键", keys.len());
+            if matches!(plan, QuantPlan::W4A8Awq) {
+                for suf in [".scales_a8", ".zeros_a8", ".a8_factor"] {
+                    assert!(
+                        keys.iter().any(|k| k.ends_with(suf)),
+                        "a8 档缺键 {suf};实得 {keys:?}"
+                    );
+                }
+            }
+            let x = TensorOps::from_host(Dtype::F16, vec![m, in_dim], &xb);
+            let decl = lin.forward(&x, &crate::module::ForwardCtx::minimal(m));
+            let out = crate::testkit::harvest_f16(&mut gpu, &decl).await;
+            gpu.close().await.expect("关机");
+            got.push(out);
+        }
+        // ---- 判据:噪声/信号 RMS(a8 vs a16)----
+        let (a16, a8) = (&got[0], &got[1]);
+        assert_eq!(a16.len(), a8.len());
+        let n = a16.len();
+        let rms = (a16.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / n as f64).sqrt();
+        let d: f64 = a16
+            .iter()
+            .zip(a8)
+            .map(|(x, y)| ((x - y) as f64).abs())
+            .sum::<f64>()
+            / n as f64;
+        let noise = d / rms.max(1e-9);
+        let nan = a8.iter().filter(|v| !v.is_finite()).count();
+        eprintln!(
+            "[w4a8-ab] 真实层 {prefix}{local} m={m}: 噪声/信号 RMS = {noise:.5}(a16 信号 RMS={rms:.4});a8 非有限 {nan}"
+        );
+        assert_eq!(nan, 0, "a8 输出含非有限值");
+        assert!(
+            noise < 1e-2,
+            "a8 与 a16 偏差过大({noise:.5})—— 布局/接线级错误距此量级 ≫ 10⁻¹"
+        );
+    }
+
     /// **W4A8 接线门(零 GPU)**:plan → 声明面(a8 键族 want)→ 前向面
     /// (量化 → a8 GEMM 的节点链)。这条门锁的是"层把 a8 档接对了",
     /// 数值正确性在 kernels 侧已有(§S1d 对拍 + a8 repack 逐位门)。

@@ -63,6 +63,8 @@ impl KeyConvention for Qwen35Convention {
                     s,
                     "qweight" | "scales" | "zeros" | "ws" | "marlin_ws" | "marlin_ctmp"
                         | "packed_raw"
+                        // W4A8 键族(S2 2026-10-17;同样"后缀已内含")
+                        | "qweight_a8" | "scales_a8" | "zeros_a8" | "a8_factor"
                 ) =>
             {
                 (b, Some(format!(".{s}")))
