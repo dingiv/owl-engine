@@ -356,7 +356,22 @@ where
                 overrides: Default::default() };
         let mut out = Vec::with_capacity(roots.len());
         for r in roots {
-            out.push(_eval_rec(r, &mut ctx).await?);
+            // **错误路径也必须抽干竞技场**(2026-10-16 实测定谳):早退(求值途中
+            // 任一节点失败)会让本次求值的**全部活块整套泄漏**(下面的末尾清扫根本
+            // 跑不到)。27B prefill 一次就是 GB 级 —— 桶族失败链就是这样被毒死的:
+            // 第一个桶 warmup 失败 → 泄漏 ~GB → 后面每个桶(含只需 5MiB 的)都跟着失败。
+            match _eval_rec(r, &mut ctx).await {
+                Ok(b) => out.push(b),
+                Err(e) => {
+                    let _ = ctx.flush_pool().await;
+                    let mut cand: Vec<u64> = std::mem::take(&mut ctx.arena);
+                    cand.retain(|id| ctx.arena_set.contains(id) && !ctx.is_kept(*id));
+                    if !cand.is_empty() {
+                        let _ = ctx.face.free(&cand).await; // 回收失败不掩盖原错
+                    }
+                    return Err(e);
+                }
+            }
         }
         ctx.flush_pool().await?;
         let root_ids: std::collections::HashSet<u64> = out.iter().map(|b| b.id).collect();
@@ -515,7 +530,19 @@ where
         };
         let mut out = Vec::with_capacity(roots.len());
         for r in roots {
-            out.push(_eval_rec(r, &mut ctx).await?);
+            // 错误路径同样要收尾(否则本次求值的活块整套泄漏;同 scoped_env 注释)
+            match _eval_rec(r, &mut ctx).await {
+                Ok(b) => out.push(b),
+                Err(e) => {
+                    let _ = ctx.flush_pool().await;
+                    let mut cand: Vec<u64> = std::mem::take(&mut ctx.arena);
+                    cand.retain(|id| ctx.arena_set.contains(id) && !ctx.is_kept(*id));
+                    if !cand.is_empty() {
+                        let _ = ctx.face.free(&cand).await;
+                    }
+                    return Err(e);
+                }
+            }
         }
         ctx.flush_pool().await?;
         if mode == SegMode::Eager {
@@ -605,8 +632,12 @@ where
     /// 时推 arena,避免候选表出现重复项(重复项不会错值,但会令
     /// `srv.count.free_blocks` / 候选表口径失真)。
     fn track_new(&mut self, id: u64) {
+        owl_shared::slab_hint::live_diag::new_block();
         if self.arena_set.insert(id) {
             self.arena.push(id);
+        } else {
+            // **同一块被登记两次**(记账重复 ⇒ users 恒多 1 ⇒ 永不归还;诊断计数)
+            owl_shared::slab_hint::live_diag::double_new(id, id, 0, self.memo.len());
         }
         *self.block_users.entry(id).or_insert(0) += 1;
     }
@@ -633,7 +664,11 @@ where
     /// 透传别名登记(Reshape/SlotWrite:节点共享父块;仅竞技场原生块)
     fn track_alias(&mut self, id: u64) {
         if self.arena_set.contains(&id) {
-            *self.block_users.entry(id).or_insert(0) += 1;
+            let e = self.block_users.entry(id).or_insert(0);
+            if *e > 0 {
+                owl_shared::slab_hint::live_diag::alias_multi();
+            }
+            *e += 1;
         }
     }
 
@@ -711,11 +746,13 @@ where
         // 跨段存活块**永不归还**:进池/进驱动池都会在下一次 alloc 被复用 ⇒
         // 前一段烘焙的地址会指向别人的数据(piecewise 的唯一硬不变量,落唯一出口)
         if self.is_kept(id) {
+            owl_shared::slab_hint::live_diag::refuse(owl_shared::slab_hint::live_diag::Refuse::Kept);
             return Ok(());
         }
         if self.pool.as_mut().is_some_and(|p| p.give_back(id)) {
             return Ok(());
         }
+        owl_shared::slab_hint::live_diag::freed();
         self.face.free(&[id]).await
     }
 
@@ -870,7 +907,6 @@ where
         Op::Zeros => {
             let b = ctx.alloc_out_node(t.id, dtype, n_elems, true).await?.view(dtype, shape.len() as u8);
             owl_shared::slab_hint::probe_name(b.id, class);
-            let b = ctx.alloc_out_node(t.id, dtype, n_elems, true).await?.view(dtype, shape.len() as u8);
             ctx.track_new(b.id);
             b
         }
@@ -895,7 +931,6 @@ where
             let k = t.parents[0].shape.last().copied().unwrap_or(0);
             let out = ctx.alloc_out_node(t.id, dtype, m * n, false).await?.view(dtype, shape.len() as u8);
             owl_shared::slab_hint::probe_name(out.id, class);
-            let out = ctx.alloc_out_node(t.id, dtype, m * n, false).await?.view(dtype, shape.len() as u8);
             ctx.track_new(out.id);
             if dtype == Dtype::F16 || dtype == Dtype::BF16 {
                 // f16/bf16:foreign-kernel 通道(cuBLAS;nt = owl Linear 惯例)。
@@ -987,7 +1022,6 @@ where
             let out = ctx.alloc_out_node(t.id, dtype, n_elems, false).await?.view(dtype, shape.len() as u8);
             // 峰值归因:本输出块挂上核名(`class` 已在上面 resolve 处覆写为核名)
             owl_shared::slab_hint::probe_name(out.id, class);
-            let out = ctx.alloc_out_node(t.id, dtype, n_elems, false).await?.view(dtype, shape.len() as u8);
             if let Some(l) = lap.as_mut() {
                 l.lap("interp.host.seg.alloc");
             }
@@ -1038,11 +1072,49 @@ where
                     if *u > 0 {
                         *u -= 1;
                     }
-                    if *u == 0 && bid != out.id && ctx.arena_set.contains(&bid) && !ctx.is_kept(bid) {
-                        ctx.arena_set.remove(&bid);
-                        ctx.release_block(bid).await?;
+                    let left_u = *u; // ← 取完即放(下面要调 ctx.* ⇒ 不能揣着可变借)
+                    if left_u == 0 {
+                        // 回收出口四个判定各记一笔(诊断;见 `slab_hint::live_diag`)
+                        use owl_shared::slab_hint::live_diag::{outcome, refuse, Refuse};
+                        // **决定点落账**(按名分账:字节/次数/残余 users)——
+                        // 尺寸口径 = 视图元素数 × dtype(别名块可能小于底层块,量级够用)
+                        let bytes = b.len.saturating_mul(b.dtype.size_bytes());
+                        if bid == out.id {
+                            refuse(Refuse::Alias);
+                            outcome(bid, bytes, Some(Refuse::Alias), left_u);
+                        } else if !ctx.arena_set.contains(&bid) {
+                            refuse(Refuse::NotArena);
+                            outcome(bid, bytes, Some(Refuse::NotArena), left_u);
+                        } else if ctx.is_kept(bid) {
+                            refuse(Refuse::Kept);
+                            outcome(bid, bytes, Some(Refuse::Kept), left_u);
+                        } else {
+                            outcome(bid, bytes, None, 0);
+                            ctx.arena_set.remove(&bid);
+                            ctx.release_block(bid).await?;
+                        }
+                    } else {
+                        owl_shared::slab_hint::live_diag::refuse(
+                            owl_shared::slab_hint::live_diag::Refuse::Users,
+                        );
+                        // 决定点被 users 拦下:落账(残余 users 一并记下)
+                        let bytes = b.len.saturating_mul(b.dtype.size_bytes());
+                        owl_shared::slab_hint::live_diag::outcome(
+                            bid,
+                            bytes,
+                            Some(owl_shared::slab_hint::live_diag::Refuse::Users),
+                            left_u,
+                        );
                     }
+                } else {
+                    owl_shared::slab_hint::live_diag::refuse(
+                        owl_shared::slab_hint::live_diag::Refuse::NotTracked,
+                    );
                 }
+            } else {
+                owl_shared::slab_hint::live_diag::refuse(
+                    owl_shared::slab_hint::live_diag::Refuse::Pending,
+                );
             }
         }
     }
