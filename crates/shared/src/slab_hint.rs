@@ -223,11 +223,213 @@ static PROBE: std::sync::Mutex<Option<ProbeState>> = std::sync::Mutex::new(None)
 /// 最后一次 `probe_end` 的归因报告(文本;调用方取走后自行打日志)
 static PROBE_REPORT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
+// ============================================================================
+// §4 活性回收账(诊断;2026-10-16 —— “活着一大片却一字节没回收”的指认面)
+// ============================================================================
+//
+// 探针(`slab 峰值归因`)只答"多少活着",不答"为什么没回收"。当存活构成与分配
+// 总量构成**逐名同比例**(= 一字节没 free)时,唯一要问的是"回收出口的哪个判定
+// 把块拦下了" —— 本模块给每个出口各记一笔,一行日志指认。
+//
+// 复位口径与探针同窗(`probe_on(true)` 清台)⇒ 与"slab 峰值归因"同源可比。
+// 增量为 relaxed 原子加(每事件 ~1ns,常开不影响热路径形状)。
+pub mod live_diag {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// 新块登记(`EvalCtx::track_new`;竞技场原生块)
+    pub static NEW_BLOCKS: AtomicU64 = AtomicU64::new(0);
+    /// 真回收(`release_block` 走到 `face.free` 的块数;池命中不算)
+    pub static FREE_BLOCKS: AtomicU64 = AtomicU64::new(0);
+    /// 拒因:父节点还有消费者(`pending > 0`)
+    pub static REFUSE_PENDING: AtomicU64 = AtomicU64::new(0);
+    /// 拒因:块仍有别名用户(`block_users > 0`)
+    pub static REFUSE_USERS: AtomicU64 = AtomicU64::new(0);
+    /// 拒因:父块即本节点输出(透传别名)
+    pub static REFUSE_ALIAS: AtomicU64 = AtomicU64::new(0);
+    /// 拒因:块非竞技场原生(`arena_set` 缺席 —— 池件/外部块)
+    pub static REFUSE_NOT_ARENA: AtomicU64 = AtomicU64::new(0);
+    /// 拒因:块在 keep 白名单(跨段存活)
+    pub static REFUSE_KEPT: AtomicU64 = AtomicU64::new(0);
+    /// 拒因:块未登记进 `block_users`(记账缺席 —— 不该发生)
+    pub static REFUSE_NOT_TRACKED: AtomicU64 = AtomicU64::new(0);
+    /// **同一块被 `track_new` 两次**(记账重复 ⇒ users 恒多 1 ⇒ 永不归还;不该发生)
+    pub static DOUBLE_NEW: AtomicU64 = AtomicU64::new(0);
+    /// **同一块被 `track_alias` 两次以上**(别名重复登记)
+    pub static ALIAS_MULTI: AtomicU64 = AtomicU64::new(0);
+
+    /// 回收出口的拒因(枚举 = 判定分支单点)
+    #[derive(Clone, Copy)]
+    pub enum Refuse {
+        Pending,
+        Users,
+        Alias,
+        NotArena,
+        Kept,
+        NotTracked,
+    }
+
+    pub fn new_block() {
+        NEW_BLOCKS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `track_new` 的**重复登记**检测(`insert` 返回 false = 已在竞技场里);
+    /// 前 12 例连 id + 名字上屏(直指来源:哪个张量/哪条臂)
+    pub fn double_new(id: u64, node_id: u64, overrides: usize, memo_len: usize) {
+        let n = DOUBLE_NEW.fetch_add(1, Ordering::Relaxed);
+        if n < 12 {
+            let name = crate::slab_hint::probe_name_of(id)
+                .unwrap_or_else(|| "(未命名)".to_string());
+            eprintln!(
+                "[live-dup] block={id} node={node_id} overrides={overrides} memo={memo_len} name={name}"
+            );
+        }
+    }
+
+    /// 别名重复登记
+    pub fn alias_multi() {
+        ALIAS_MULTI.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn freed() {
+        FREE_BLOCKS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// **回收出口按名分账**(2026-10-16;定谳面):只记**决定点**
+    /// (`pending==0` 那一瞬)—— 即"这个块本来可以还了,最后结果是什么"。
+    /// 前 k-1 次消费**(仍有消费者)不算决定点,不入账(否则重复计)。
+    /// 账目 = (字节, 次数, 残余 users 最大值) 按 (出口, 名字) 聚合 ⇒
+    /// 一行报告就能指认"谁被 users 抬着 / 谁平白无故活着"。
+    pub static BY_NAME: std::sync::Mutex<std::collections::BTreeMap<(u8, String), (u64, u64, u64)>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+    fn code(r: Option<Refuse>) -> u8 {
+        match r {
+            None => 0,
+            Some(Refuse::Pending) => 1,
+            Some(Refuse::Users) => 2,
+            Some(Refuse::Alias) => 3,
+            Some(Refuse::NotArena) => 4,
+            Some(Refuse::Kept) => 5,
+            Some(Refuse::NotTracked) => 6,
+        }
+    }
+
+    fn label(c: u8) -> &'static str {
+        match c {
+            0 => "真回收",
+            1 => "pending",
+            2 => "users",
+            3 => "alias",
+            4 => "非竞技场",
+            5 => "keep",
+            _ => "未登记",
+        }
+    }
+
+    /// 决定点落账(`reason = None` = 真回收;`left_u` = 该刻残余 users)
+    pub fn outcome(block_id: u64, bytes: usize, reason: Option<Refuse>, left_u: usize) {
+        let name = crate::slab_hint::probe_name_of(block_id)
+            .unwrap_or_else(|| "(未命名)".to_string());
+        if let Ok(mut m) = BY_NAME.lock() {
+            let e = m.entry((code(reason), name)).or_insert((0, 0, 0));
+            e.0 += bytes as u64;
+            e.1 += 1;
+            e.2 = e.2.max(left_u as u64);
+        }
+    }
+
+    /// 按名分账的一行摘要(报告尾部追加;空 = 无账)
+    pub fn by_name_report() -> String {
+        let m = match BY_NAME.lock() {
+            Ok(m) => m,
+            Err(_) => return String::new(),
+        };
+        if m.is_empty() {
+            return String::new();
+        }
+        let mut parts: Vec<String> = Vec::new();
+        for c in [0u8, 2, 1, 3, 4, 5, 6] {
+            let rows: Vec<(&String, &(u64, u64, u64))> =
+                m.iter().filter(|((k, _), _)| *k == c).map(|((_, n), v)| (n, v)).collect();
+            if rows.is_empty() {
+                continue;
+            }
+            let tot: u64 = rows.iter().map(|(_, v)| v.0).sum();
+            let cnt: u64 = rows.iter().map(|(_, v)| v.1).sum();
+            let mut top: Vec<(&String, &(u64, u64, u64))> = rows.clone();
+            top.sort_unstable_by_key(|(_, v)| std::cmp::Reverse(v.0));
+            let tops = top
+                .iter()
+                .take(4)
+                .map(|(n, v)| format!("{n} {:.0}MB×{}", v.0 as f64 / 1048576.0, v.1))
+                .collect::<Vec<_>>()
+                .join(" / ");
+            let maxu = rows.iter().map(|(_, v)| v.2).max().unwrap_or(0);
+            parts.push(format!(
+                "{} {:.0}MB×{cnt}(残余users≤{maxu}): {tops}",
+                label(c),
+                tot as f64 / 1048576.0
+            ));
+        }
+        format!(" ‖ 回收出口按名: {}", parts.join(" ｜ "))
+    }
+
+    pub fn refuse(r: Refuse) {
+        let _ = match r {
+            Refuse::Pending => REFUSE_PENDING.fetch_add(1, Ordering::Relaxed),
+            Refuse::Users => REFUSE_USERS.fetch_add(1, Ordering::Relaxed),
+            Refuse::Alias => REFUSE_ALIAS.fetch_add(1, Ordering::Relaxed),
+            Refuse::NotArena => REFUSE_NOT_ARENA.fetch_add(1, Ordering::Relaxed),
+            Refuse::Kept => REFUSE_KEPT.fetch_add(1, Ordering::Relaxed),
+            Refuse::NotTracked => REFUSE_NOT_TRACKED.fetch_add(1, Ordering::Relaxed),
+        };
+    }
+
+    /// 清台(与 `probe_on(true)` 同步)
+    pub fn reset() {
+        if let Ok(mut m) = BY_NAME.lock() {
+            m.clear();
+        }
+        for c in [
+            &NEW_BLOCKS,
+            &FREE_BLOCKS,
+            &REFUSE_PENDING,
+            &REFUSE_USERS,
+            &REFUSE_ALIAS,
+            &REFUSE_NOT_ARENA,
+            &REFUSE_KEPT,
+            &REFUSE_NOT_TRACKED,
+        ] {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// 一行账(**读后清零**;与 `slab 峰值归因` 同窗 ⇒ 同源可比)
+    pub fn take_report() -> String {
+        let g = |c: &AtomicU64| c.swap(0, Ordering::Relaxed);
+        format!(
+            "新块 {} / 真回收 {}(拒:pending {} users {} alias {} 非竞技场 {} keep {} 未登记 {})／重复记账:new {} alias {}",
+            g(&NEW_BLOCKS),
+            g(&FREE_BLOCKS),
+            g(&REFUSE_PENDING),
+            g(&REFUSE_USERS),
+            g(&REFUSE_ALIAS),
+            g(&REFUSE_NOT_ARENA),
+            g(&REFUSE_KEPT),
+            g(&REFUSE_NOT_TRACKED),
+            g(&DOUBLE_NEW),
+            g(&ALIAS_MULTI),
+        ) + &by_name_report()
+    }
+}
+
 /// 归因报告的 top-N 条数
 const ATTR_TOP: usize = 8;
 
 /// 探针开/关(GraphPlan warmup 窗口;关时零开销)
 pub fn probe_on(on: bool) {
+    // 活性账与探针**同窗**:开探针 = 清台(否则上一个窗口的拒因混进来)
+    live_diag::reset();
     if let Ok(mut g) = PROBE.lock() {
         *g = if on {
             Some(ProbeState {
@@ -295,6 +497,12 @@ pub fn probe_name(id: u64, name: &str) {
             st.names.insert(id, name.to_string());
         }
     }
+}
+
+/// 探针登记过的块名(诊断:回收出口按名分账用;未登记/探针关 = None)
+pub fn probe_name_of(id: u64) -> Option<String> {
+    let g = PROBE.lock().ok()?;
+    g.as_ref().and_then(|st| st.names.get(&id).cloned())
 }
 
 /// 影子归还(warmup 的 free 点;未登记/探针关 = 无动作)
@@ -372,6 +580,43 @@ fn render_report(st: &ProbeState) -> String {
     };
     let (bump_part, bump_live) = compose(&st.peak_bump_ids);
     let (live_part, live_sum) = compose(&st.peak_live_ids);
+    // **未命名块画像**(诊断;2026-10-16):"活跃构成里冒出一砦未命名"时必须能一眼
+    // 看出它是**哪种张量**(尺寸直方图)与**什么时候分配的**(块 id 单调 ⇒ 时序面)。
+    // 本轮就是靠它把段化图的 2× 峰值定到 "1452 块 ~90KB 未命名"上。
+    let uname_part = {
+        let mut un: Vec<(u64, usize)> = st
+            .peak_live_ids
+            .iter()
+            .filter(|id| !st.names.contains_key(id))
+            .map(|id| (*id, *st.bytes.get(id).unwrap_or(&0)))
+            .collect();
+        if un.is_empty() {
+            String::new()
+        } else {
+            un.sort_unstable_by_key(|(id, _)| *id);
+            let total: usize = un.iter().map(|(_, n)| *n).sum();
+            let mut hist: std::collections::BTreeMap<usize, usize> =
+                std::collections::BTreeMap::new();
+            for (_, n) in &un {
+                *hist.entry(*n).or_insert(0) += 1;
+            }
+            let mut hs: Vec<(usize, usize)> = hist.into_iter().collect();
+            hs.sort_unstable_by_key(|(_, c)| std::cmp::Reverse(*c));
+            let top = hs
+                .iter()
+                .take(3)
+                .map(|(sz, c)| format!("{sz}B×{c}"))
+                .collect::<Vec<_>>()
+                .join(" / ");
+            format!(
+                " ‖ ⚠未命名块画像:{} 块 {:.1}MB;id ∈ [{}, {}];尺寸 top3 = {top}",
+                un.len(),
+                total as f64 / 1048576.0,
+                un[0].0,
+                un[un.len() - 1].0
+            )
+        }
+    };
     let mut sums: Vec<(String, usize)> = st.per_name_sum.iter().map(|(k, v)| (k.clone(), *v)).collect();
     sums.sort_unstable_by_key(|(_, n)| std::cmp::Reverse(*n));
     let sum_total: usize = sums.iter().map(|(_, n)| *n).sum();
@@ -397,7 +642,7 @@ fn render_report(st: &ProbeState) -> String {
         st.peak_live_high as f64 / 1048576.0,
         st.peak_live_ids.len(),
         sum_total as f64 / 1073741824.0,
-    )
+    ) + &uname_part
 }
 
 #[cfg(test)]

@@ -321,12 +321,22 @@ pub struct GraphPlan<D: DeviceClient> {
     pub(crate) pw: Option<PiecewiseRt>,
     /// piecewise 跨段接力棒(与 `pw` 分字段:回放期要同时可变借 `face`)
     pub(crate) pw_carry: Option<owl_models::interpreters::EvalCarry>,
+    /// **本 plan 的捕获 slab 占用(字节;0 = eager/未捕获/固定档)** ——
+    /// 图显存总账的账源(2026-10-16;此前 piecewise 的 34 条段 slab 在 boot
+    /// 日志里完全不可见,归因只能靠猜)。口径 = 各段 `graph_begin` 真分配的
+    /// 容量之和(= 定尺 hint;piecewise 每段一条 ⇒ 这里是 Σ 段)。
+    slab_bytes: usize,
 }
 
 impl<D: DeviceClient> GraphPlan<D> {
     /// **face 句柄克隆**(诊断投影出口;偶极:server 是 actor,克隆发送端即可)
     pub(crate) fn face_clone(&self) -> Option<D> {
         self.face.face_clone()
+    }
+
+    /// 本 plan 的捕获 slab 占用(字节;图显存总账账源;0 = eager/未捕获)
+    pub fn slab_bytes(&self) -> usize {
+        self.slab_bytes
     }
 
     /// 声明 + warmup + (可选)捕获。流程纪律全部在此闭合:
@@ -379,6 +389,7 @@ impl<D: DeviceClient> GraphPlan<D> {
             pw: None,
             pw_carry: None,
             forward: Box::new(forward),
+            slab_bytes: 0,
         };
 
         // 输入槽装填(init 值落位;捕获/eager 两路都要)
@@ -417,6 +428,13 @@ impl<D: DeviceClient> GraphPlan<D> {
             if !attr.is_empty() {
                 owl_shared::log_info!("graph-plan", "slab 峰值归因:{attr}");
             }
+            // 活性回收账(与归因同窗):一行指认"哪个出口把块拦下了"
+            // —— 存活构成与分配总量同比例(一字节没 free)时的唯一追问面。
+            owl_shared::log_info!(
+                "graph-plan",
+                "活性回收账:{}",
+                owl_shared::slab_hint::live_diag::take_report()
+            );
             warm_res?;
             sess.face.sync().await?;
             // warmup 输出块归还(原 `clear()` 只丢句柄、块留池外 ⇒ 每次
@@ -432,13 +450,16 @@ impl<D: DeviceClient> GraphPlan<D> {
                 // 峰值活跃集(影子高水位);plain(历史口径)⇒ 窗内块常驻 ⇒
                 // 需求 = 分配总和。混用会把族定小 ⇒ 捕获中途耗尽当场炸。
                 let base = if desc.reclaim_capture { peak } else { metered }.max(4 << 20);
-                owl_shared::slab_hint::set_hint(base + base / 8 + (1 << 20));
+                let hint_bytes = base + base / 8 + (1 << 20);
+                owl_shared::slab_hint::set_hint(hint_bytes);
+                sess.slab_bytes = hint_bytes; // 图显存总账账源
                 owl_shared::log_info!(
                     "graph-plan",
-                    "slab 定尺({}):峰值 {}MiB / 总和 {}MiB",
+                    "slab 定尺({}):峰值 {}MiB / 总和 {}MiB ‖ 引擎 live={}MiB",
                     if desc.reclaim_capture { "锚回收·峰值" } else { "plain·总和" },
                     peak >> 20,
-                    metered >> 20
+                    metered >> 20,
+                    owl_shared::vram::live_bytes() >> 20
                 );
             }
         }
@@ -516,6 +537,7 @@ impl<D: DeviceClient> GraphPlan<D> {
             forward: Box::new(forward),
             pw: None,
             pw_carry: None,
+            slab_bytes: 0,
         };
         sess.fill_slots(&[]).await?;
 
@@ -651,6 +673,15 @@ impl<D: DeviceClient> GraphPlan<D> {
         } else {
             SegMode::Capturing
         };
+        // ── **段 slab 账 + 单 slab 口径探针**(2026-10-16;「段 slab 合并」判据面)──
+        // ①`seg_m` / `slab_total` = **现状**(每段一条 slab)的占用;
+        // ②影子探针**跨段累计**(不逐段 reset;keep 集同一批 ⇒ 跨段存活值在两边
+        //   同样不回收)⇒ `probe_end()` 的高水位 = 「一条 slab 走 N 段」落地时的需求。
+        // 两者一比即知段合并值不值得做(此前 piecewise 无任何账)。
+        owl_shared::slab_hint::probe_on(true);
+        let mut seg_m: Vec<usize> = Vec::with_capacity(bs.len() + 1);
+        let mut slab_total: usize = 0;
+        let mut built: usize = 0;
         let mut segs: Vec<Option<GraphId>> = Vec::with_capacity(bs.len() + 1);
         for (bi, b) in bs.iter().enumerate() {
             let ops = b.node.operands();
@@ -676,12 +707,16 @@ impl<D: DeviceClient> GraphPlan<D> {
             owl_models::interpreters::eval_segment(
                 &refs, &mut sess.face, env, &mut dry, SegMode::Eager).await?;
             let m = owl_shared::slab_hint::meter_take() as usize;
+            seg_m.push(m);
             if empty {
                 segs.push(None);
             } else {
                 if !desc.slab_fixed && m > 0 {
-                    owl_shared::slab_hint::set_hint(m + m / 8 + (1 << 20));
+                    let h = m + m / 8 + (1 << 20);
+                    slab_total += h;
+                    owl_shared::slab_hint::set_hint(h);
                 }
+                built += 1;
                 // (1) 捕获本段(根 = 本断点的操作数;命中 memo 的历史节点零重算)
                 if let Err(e) = sess.face.graph_begin().await {
                     return Ok((sess, fallback(&format!("face 无图能力: {e}"))));
@@ -715,12 +750,16 @@ impl<D: DeviceClient> GraphPlan<D> {
         owl_models::interpreters::eval_segment(
             &refs, &mut sess.face, env, &mut dry, SegMode::Eager).await?;
         let m = owl_shared::slab_hint::meter_take() as usize;
+        seg_m.push(m);
         let (tail, results): (Option<GraphId>, Vec<Bytes>) = if tail_empty {
             (None, refs.iter().map(|r| carry.memo[&r.id()].clone()).collect())
         } else {
             if !desc.slab_fixed && m > 0 {
-                owl_shared::slab_hint::set_hint(m + m / 8 + (1 << 20));
+                let h = m + m / 8 + (1 << 20);
+                slab_total += h;
+                owl_shared::slab_hint::set_hint(h);
             }
+            built += 1;
             if let Err(e) = sess.face.graph_begin().await {
                 return Ok((sess, fallback(&format!("face 无图能力: {e}"))));
             }
@@ -736,6 +775,62 @@ impl<D: DeviceClient> GraphPlan<D> {
             };
             (Some(sess.face.graph_end().await?), results)
         };
+
+        // **干跑侧显存归还**(2026-10-16):`dry` 走到这里的残留 = 它 keep 住的
+        // 跨段值(真分配的池块 —— 干跑走 Eager ⇒ 不进 slab)⇒ 此前随 `dry`
+        // 一起 drop = **丢句柄不丢显存** ⇒ 每条 plan 残留 Σ(keep 集)级显存
+        // (boot A/B 里那块"账上找不到的 + 百 MB"的一半)。此处显式归还:
+        // 去重(别名块共享 id;`free_blocks` 幂等但不去重会白跑命令)。
+        {
+            // 保护集 = 真 plan 的活块:干跑与真捕获**共用同一批钉块**
+            // (`BreakPoint.out` 经 `override_out` 进了两边 memo)⇒ 绝不能顺手还掉。
+            let mut live_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            for b in carry.memo.values() {
+                live_ids.insert(b.id);
+            }
+            for b in carry.overrides.values() {
+                live_ids.insert(b.id);
+            }
+            let mut ids: Vec<u64> = Vec::new();
+            let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            for b in dry.memo.values() {
+                if !live_ids.contains(&b.id) && seen.insert(b.id) {
+                    ids.push(b.id);
+                }
+            }
+            if !ids.is_empty() {
+                sess.face.free(&ids).await?;
+            }
+            dry.memo.clear();
+            dry.overrides.clear();
+        }
+
+        // 收尾探针 + 段 slab 账上屏(见上方说明)
+        let plan_peak = owl_shared::slab_hint::probe_end();
+        let attr = owl_shared::slab_hint::take_probe_report();
+        sess.slab_bytes = slab_total;
+        {
+            let sum_m: usize = seg_m.iter().sum();
+            let mut top: Vec<usize> = seg_m.clone();
+            top.sort_unstable_by(|a, b| b.cmp(a));
+            owl_shared::log_info!(
+                "graph-plan",
+                "piecewise 段 slab 账:段={}(建图 {}) 段定尺合计 {}MiB(Σ干跑计量 {}MiB)‖ 单 slab 口径容量峰值 {}MiB(跨段累计探针)｜ 段 m top3 = {:?}MiB ‖ 引擎 live={}MiB{}",
+                seg_m.len(),
+                built,
+                slab_total >> 20,
+                sum_m >> 20,
+                plan_peak >> 20,
+                top.iter().take(3).map(|v| v >> 20).collect::<Vec<_>>(),
+                owl_shared::vram::live_bytes() >> 20,
+                if attr.is_empty() { String::new() } else { format!("‖ {attr}") }
+            );
+            owl_shared::log_info!(
+                "graph-plan",
+                "piecewise 活性回收账:{}",
+                owl_shared::slab_hint::live_diag::take_report()
+            );
+        }
 
         // 收割(与 try_capture 同律:声明形状守卫)
         let mut last = HashMap::new();

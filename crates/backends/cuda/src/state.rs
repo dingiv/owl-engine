@@ -496,6 +496,46 @@ impl Drop for GraphHolder {
     }
 }
 
+// ============================================================================
+// 池账快照(诊断;2026-10-16 "看着有 free 却分不出来"的第一现场面)
+// ============================================================================
+
+/// 默认内存池的账: `(used, used_high, reserved, reserved_high)` 字节。
+///
+/// `used` = 引擎正在用的字节;`reserved` = 池已向驱动映射的字节 —— **两者之差
+/// = 已 free 但池未归还的死页**(`RELEASE_THRESHOLD=u64::MAX` 下永不归还 OS)。
+/// 分配失败时读它即可分辨"真占满了" vs "池把页抱着不放"。
+/// 返回 None = 读不到(池未就绪/接口不可用;调用方降级为文本)。
+pub(super) fn pool_ledger_snapshot() -> Option<(u64, u64, u64, u64)> {
+    use cudarc::driver::sys as cs;
+    unsafe {
+        let mut dev: cs::CUdevice = 0;
+        if cs::cuCtxGetDevice(&mut dev) != cs::CUresult::CUDA_SUCCESS {
+            return None;
+        }
+        let mut pool = std::mem::MaybeUninit::<cs::CUmemoryPool>::uninit();
+        if cs::cuDeviceGetDefaultMemPool(pool.as_mut_ptr(), dev) != cs::CUresult::CUDA_SUCCESS {
+            return None;
+        }
+        let pool = pool.assume_init();
+        let mut get = |attr: cs::CUmemPool_attribute| -> Option<u64> {
+            let mut v: u64 = 0;
+            let rc = cs::cuMemPoolGetAttribute(
+                pool,
+                attr,
+                &mut v as *mut u64 as *mut core::ffi::c_void,
+            );
+            (rc == cs::CUresult::CUDA_SUCCESS).then_some(v)
+        };
+        Some((
+            get(cs::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT)?,
+            get(cs::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_HIGH)?,
+            get(cs::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT)?,
+            get(cs::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH)?,
+        ))
+    }
+}
+
 impl GpuCtx {
     pub(super) fn new(
         selector: &DeviceSelector,

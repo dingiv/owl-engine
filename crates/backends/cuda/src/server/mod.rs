@@ -854,8 +854,41 @@ impl GpuServer {
             Ok(s) => s.clone(),
             Err(e) => return ack.send(Err(e)),
         };
-        let result = unsafe { stream.alloc::<u8>(n_bytes) }
-            .map_err(|e| ModelError::Msg(format!("alloc({n_bytes}B / {:.1}MiB): {e:?}", n_bytes as f64 / 1048576.0)))
+        let result = match unsafe { stream.alloc::<u8>(n_bytes) } {
+            Ok(slice) => Ok(slice),
+            Err(e) => {
+                // **分配失败 = 显存归因第一现场**(2026-10-16):池账(`reserved` 高水
+                // = 已映射但不可复用的死页;`RELEASE_THRESHOLD=u64::MAX` 下池**永不**
+                // 把页归还 OS)+ 驱动账(mem_get_info 视角的 free)+ 引擎账(vram::live)
+                // 一次打全 —— "看着有 free 却分不出来"时这三行即可指认是谁占着。
+                // 不覆盖原错(行为零变化;只多一条 WARN)。
+                let pool = crate::state::pool_ledger_snapshot()
+                    .map(|(u, uh, r, rh)| {
+                        format!(
+                            "池 used={}MiB(高水 {}MiB)/reserved={}MiB(高水 {}MiB)",
+                            u >> 20,
+                            uh >> 20,
+                            r >> 20,
+                            rh >> 20
+                        )
+                    })
+                    .unwrap_or_else(|| "池账不可读".to_string());
+                let free = cudarc::driver::result::mem_get_info()
+                    .map(|(f, t)| format!("驱动 free={}MiB/total={}MiB", f >> 20, t >> 20))
+                    .unwrap_or_else(|e| format!("mem_get_info 失败: {e:?}"));
+                self.sink.logf(
+                    owl_shared::log::LVL_WARN,
+                    "vram-ledger",
+                    format_args!(
+                        "alloc 失败({}B / {:.1}MiB):{e:?} ‖ {pool} ‖ {free} ‖ 引擎 live={}MiB",
+                        n_bytes,
+                        n_bytes as f64 / 1048576.0,
+                        owl_shared::vram::live_bytes() >> 20
+                    ),
+                );
+                Err(ModelError::Msg(format!("alloc({n_bytes}B / {:.1}MiB): {e:?}", n_bytes as f64 / 1048576.0)))
+            }
+        }
             .and_then(|mut slice| {
                 // warmup 计量(slab 定量:owl_shared::slab_hint;仅真分配,
                 // carve 分支不计 —— 捕获窗用 slab 不产生新账)
@@ -886,6 +919,33 @@ impl GpuServer {
                 // 发射账:**分配落定**记 id + 设备地址(trace 条目 alloc 本身
                 // 无 id —— 生命周期判据要它才能把地址钉到块上)
                 self.trace_alloc_done(id);
+                // **未命名块追凶**(诊断;`OWL_ALLOC_TRACE=1`):64..192KiB 的真分配逐条
+                // 上屏(前 60 条 + 之后每 100 条一条;带 id 单调序 ⇒ 与段/相位对时)。
+                // 背景:段化图的探针"活跃峰值"里冒出一碶**未命名**块(verify:1452 块
+                // ~90KB ⇒ 峰值 2×),而命名部分与单图逐字节相同 ⇒ 多出那橲不是三条
+                // 命名臂(htod:`Op::Htod` 树审计已禁;另一条:真 htod/carve 不计)。
+                if owl_shared::env_reader::flag("OWL_ALLOC_TRACE")
+                    && (64 << 10..192 << 10).contains(&n_bytes)
+                {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static N: AtomicU64 = AtomicU64::new(0);
+                    let k = N.fetch_add(1, Ordering::Relaxed);
+                    if k < 60 || k % 100 == 0 {
+                        self.sink.logf(
+                            owl_shared::log::LVL_INFO,
+                            "alloc-trace",
+                            format_args!(
+                                "#{} id={} {}B elems={} zero={} 引擎live={}MiB",
+                                k,
+                                id,
+                                n_bytes,
+                                elems,
+                                zero,
+                                owl_shared::vram::live_bytes() >> 20
+                            ),
+                        );
+                    }
+                }
                 // M1:warmup 影子 arena 登记(探针关 = 零开销;峰值口径的
                 // 来源 —— `probe_free` 在 free_blocks 里配对)
                 owl_shared::slab_hint::probe_alloc(id, n_bytes);
