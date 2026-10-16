@@ -64,6 +64,8 @@ pub enum Command {
         data: Vec<u8>,
         /// 上传落地块的点名(同 [`Command::Alloc`];必填)
         name: String,
+        /// 落点流(0 = H2D 批量面;1 = COMPUTE 参数面 —— 见 `UpStream`)
+        stream: u8,
         ack: Ack<Result<Bytes, ModelError>>,
     },
     /// 块清零(设备侧 memset_d8;引擎 turn-open GDN 状态重置专用;
@@ -80,6 +82,8 @@ pub enum Command {
         block: u64,
         offset_bytes: usize,
         data: Vec<u8>,
+        /// 落点流(0 = H2D 批量面;1 = COMPUTE 参数面 —— 见 `UpStream`)
+        stream: u8,
         ack: Ack<Result<(), ModelError>>,
     },
     /// host → device **批量分块写入**(S1):decode 每步多槽装填合一次
@@ -87,6 +91,8 @@ pub enum Command {
     /// server 逐写池化码头 + H2D 流序,末尾单 notify
     HtodChunks {
         writes: Vec<(u64, usize, Vec<u8>)>,
+        /// 落点流(0 = H2D 批量面;1 = COMPUTE 参数面 —— 见 `UpStream`)
+        stream: u8,
         ack: Ack<Result<(), ModelError>>,
     },
     /// 分配 pinned 租约(流式装载 DMA 源;池优先,miss 才 cudaHostAlloc)

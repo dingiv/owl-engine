@@ -324,7 +324,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .map(|c| f32::from_le_bytes(c.try_into().expect("4 字节")))
                 .collect();
             let face = self.graphs.session.face_mut();
-            face.write_block_f32(&gt.table, 0, &f32bits).await?;
+            // 参数面 → COMPUTE(与紧随的图发射同流;见 graph_plan::fill_slots 注)
+            face.write_block_f32_on(owl_iface::contract::UpStream::Compute, &gt.table, 0, &f32bits)
+                .await?;
         }
         // ── 回放(1 条 graph_launch)──
         // B7:桶路也记 `prefill.chunk`(总时,host 口径;与 eager 同 tag ⇒
@@ -565,12 +567,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let w_ind = bits(&ft.indptr);
             let w_ll = bits(&ft.last_len);
             let face = self.graphs.session.face_mut();
-            face.write_blocks_f32(&[
-                (&fb.q_cu, 0, w_q_cu.as_slice()),
-                (&fb.indices, 0, w_idx.as_slice()),
-                (&fb.indptr, 0, w_ind.as_slice()),
-                (&fb.last_len, 0, w_ll.as_slice()),
-            ])
+            face.write_blocks_f32_on(
+                owl_iface::contract::UpStream::Compute,
+                &[
+                    (&fb.q_cu, 0, w_q_cu.as_slice()),
+                    (&fb.indices, 0, w_idx.as_slice()),
+                    (&fb.indptr, 0, w_ind.as_slice()),
+                    (&fb.last_len, 0, w_ll.as_slice()),
+                ],
+            )
             .await?;
             let q_cu = TensorOps::of_block(fb.q_cu.id, Dtype::U32, vec![2]);
             let indices = TensorOps::of_block(fb.indices.id, Dtype::U32, vec![ft.nb_used]);

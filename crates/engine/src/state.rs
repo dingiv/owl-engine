@@ -830,7 +830,8 @@ impl StatePool {
         for (i, x) in table.iter().enumerate() {
             v[i] = *x as f32;
         }
-        face.write_block_f32(b, 0, &v).await
+        face.write_block_f32_on(owl_iface::contract::UpStream::Compute, b, 0, &v)
+            .await
     }
 
     /// spec 快照缓冲句柄组(E5-M5 fold 图烘焙:状态 args = 快照 buf
@@ -1418,7 +1419,8 @@ impl StatePool {
         for (i, b) in table.iter().enumerate() {
             v[i] = *b as f32;
         }
-        face.write_block_f32(&self.bt, 0, &v).await
+        face.write_block_f32_on(owl_iface::contract::UpStream::Compute, &self.bt, 0, &v)
+            .await
     }
 }
 

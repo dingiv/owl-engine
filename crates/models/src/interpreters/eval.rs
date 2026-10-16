@@ -919,7 +919,17 @@ where
 
     let out: Bytes = match &t.op {
         Op::Htod { bytes } => {
-            let b = ctx.face.htod(dtype, &shape, bytes, class).await?;
+            // **参数面走 COMPUTE 流**(2026-10-17;用户裁决):图/核的输入叶子
+            // (pos/slots/lens/id/gdn_slot/fi_* 等)与消费它的发射同流 FIFO ⇒
+            // 结构上不再依赖"等回执"的时序运气(H2D 流忙时必翻车的那类竞态)。
+            // 大批量(权重/装载材料)仍走 H2D:不占计算流。
+            const ARG_PLANE_MAX_BYTES: usize = 64 << 10;
+            let stream = if n_bytes <= ARG_PLANE_MAX_BYTES {
+                owl_iface::contract::UpStream::Compute
+            } else {
+                owl_iface::contract::UpStream::H2d
+            };
+            let b = ctx.face.htod_on(stream, dtype, &shape, bytes, class).await?;
             ctx.track_new(b.id);
             b
         }

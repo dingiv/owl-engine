@@ -21,16 +21,34 @@ impl GpuServer {
 
 
     /// srv.seg.htod 分相(与客户端同名段对账;差值 = 管道/等待)
-    pub(super) fn handle_htod(&mut self, data: Vec<u8>, name: String, ack: Ack<Result<Bytes, ModelError>>) {
+    pub(super) fn handle_htod(
+        &mut self,
+        data: Vec<u8>,
+        name: String,
+        stream_id: u8,
+        ack: Ack<Result<Bytes, ModelError>>,
+    ) {
         let t0 = std::time::Instant::now();
-        self.handle_htod_inner(data, &name, ack);
+        self.handle_htod_inner_on(data, &name, stream_id, ack);
         self.sink.timer("srv.seg.htod", t0.elapsed());
     }
 
     pub(super) fn handle_htod_inner(&mut self, data: Vec<u8>, name: &str, ack: Ack<Result<Bytes, ModelError>>) {
+        self.handle_htod_inner_on(data, name, STREAM_H2D as u8, ack)
+    }
+
+    /// [`Self::handle_htod_inner`] 的**落点流可选**版(2026-10-17):参数面
+    /// (解释器的 `from_host` 叶子)走 COMPUTE ⇒ 与消费它的发射同流 FIFO。
+    pub(super) fn handle_htod_inner_on(
+        &mut self,
+        data: Vec<u8>,
+        name: &str,
+        stream_id: u8,
+        ack: Ack<Result<Bytes, ModelError>>,
+    ) {
         let mut ack = Some(ack);
         let n = data.len();
-        let stream = match self.ctx().stream(STREAM_H2D) {
+        let stream = match self.ctx().stream(stream_id as u64) {
             Ok(s) => s.clone(),
             Err(e) => return ack.take().unwrap().send(Err(e)),
         };
@@ -247,10 +265,11 @@ impl GpuServer {
     pub(super) fn handle_htod_chunks(
         &mut self,
         writes: Vec<(u64, usize, Vec<u8>)>,
+        stream_id: u8,
         ack: Ack<Result<(), ModelError>>,
     ) {
         let mut ack = Some(ack);
-        let stream = match self.ctx().stream(STREAM_H2D) {
+        let stream = match self.ctx().stream(stream_id as u64) {
             Ok(s) => s.clone(),
             Err(e) => return ack.take().unwrap().send(Err(e)),
         };
@@ -267,8 +286,9 @@ impl GpuServer {
                 }
                 return ack.take().unwrap().send(Err(e));
             }
-            // **清零序**(2026-10-16):见 try_htod 注(H2D 写前等该块 memset)
-            if let Err(e) = self.ctx_mut().wait_zeroing(*block, STREAM_H2D) {
+            // **清零序**(2026-10-16):见 try_htod 注(写前等该块 memset;
+            // 2026-10-17:等待的**落点流 = 命令自述流** —— 参数面走 COMPUTE)
+            if let Err(e) = self.ctx_mut().wait_zeroing(*block, stream_id as u64) {
                 for b in pending {
                     self.pool.put(b);
                 }
@@ -341,9 +361,10 @@ impl GpuServer {
         block: u64,
         offset_bytes: usize,
         data: Vec<u8>,
+        stream_id: u8,
         ack: Ack<Result<(), ModelError>>,
     ) {
-        let stream = match self.ctx().stream(STREAM_H2D) {
+        let stream = match self.ctx().stream(stream_id as u64) {
             Ok(s) => s.clone(),
             Err(e) => return ack.send(Err(e)),
         };
@@ -356,8 +377,9 @@ impl GpuServer {
         {
             return ack.take().unwrap().send(Err(e));
         }
-        // **清零序**(2026-10-16):见 try_htod 注(H2D 写前等该块 memset)
-        if let Err(e) = self.ctx_mut().wait_zeroing(block, STREAM_H2D) {
+        // **清零序**(2026-10-16):见 try_htod 注(写前等该块 memset;
+        // 2026-10-17:等待的**落点流 = 命令自述流**)
+        if let Err(e) = self.ctx_mut().wait_zeroing(block, stream_id as u64) {
             return ack.take().unwrap().send(Err(e));
         }
         let dptr_base = match self.ctx().block_ptr(block, &stream) {

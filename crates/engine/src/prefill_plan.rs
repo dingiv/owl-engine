@@ -117,8 +117,7 @@ pub(crate) struct BucketGraph<D: DeviceClient> {
     pub(crate) dtype: Dtype,
     /// GDN 状态槽口径:Some(s) = 本图把槽 s 烘死(host 槽臂)⇒ 只对槽 s 可用
     pub(crate) gdn_slot_baked: Option<usize>,
-    /// **捕获期的格释放世代**(恒 0:捕获在 boot,任何会话都没建过)。
-    /// 用法见 [`BucketGraph::usable`]:格一旦换过主(逐出/关闭)→ 不再可用。
+    /// **捕获期的格释放世代**(捕获在 boot ⇒ 恒 0)
     pub(crate) slot_epoch_baked: u32,
     /// FI 页链槽的声明容量(= 池管理面页数;`fi_indices` 槽长度)
     fi_nb: usize,
@@ -130,11 +129,13 @@ pub(crate) struct BucketGraph<D: DeviceClient> {
 impl<D: DeviceClient> BucketGraph<D> {
     /// 本桶此刻可用吗(纯判定;可单测)。`false` ⇒ 调用方走 eager 原路。
     ///
-    /// ⚠️ **两道判据**(2026-10-17 定位卷):①槽号相等(host 槽臂烘的是该槽的
-    /// 地址/口径);②**该格自 boot 起没换过主**(`slot_epoch` = 捕获期世代)。
-    /// 只卡①是不够的 —— 逐出释放后新会话重绑同一槽号照样过①,而桶回放会
-    /// **静默产错值**(实测:同格第二个会话;关桶即正常)。②把这种情况逼回
-    /// eager(正确性优先,与"绝不静默串台"同律)。
+    /// 判据:①已捕获;②t 在桶内;③**槽号 = 烘焙槽**;④**该格没换过主**
+    /// (`slot_epoch` = 捕获期世代)。
+    ///
+    /// ④ 是**临时防线**(2026-10-17):桶回放"输入上传 → 图发射"的跨流序已把
+    /// **参数面那半边**做成结构性保证(上传落 COMPUTE 流 ⇒ 同流 FIFO;见
+    /// `graph_plan::fill_slots` 与定位卷 §8/§9),但同族还有**另一半**未点名
+    /// ⇒ 换过主的格先回 eager,撤闸口径见卷 §9。
     pub(crate) fn usable(&self, t_real: usize, gdn_slot: usize, slot_epoch: u32) -> bool {
         bucket_usable(
             self.captured,
@@ -216,7 +217,7 @@ impl<D: DeviceClient> BucketGraph<D> {
 
 /// **桶可用性纯函数**(单一事实源 = [`BucketGraph::usable`];提出来是为了单测)。
 ///
-/// 判据两条(见 `usable` 注):①槽号 = 烘焙槽;②该格世代未变(没换过主)。
+/// 判据四条(见 `usable` 注):已捕获 / t 在桶内 / 槽号 = 烘焙槽 / 格未换主。
 pub(crate) fn bucket_usable(
     captured: bool,
     t_real: usize,
@@ -568,7 +569,6 @@ impl<D: DeviceClient> PrefillBuckets<D> {
             taps,
             dtype,
             gdn_slot_baked: slot_baked,
-            // 捕获在 boot(零会话)⇒ 世代必为 0(见 `SessionTable::slot_epoch`)
             slot_epoch_baked: 0,
             fi_nb: nb,
             replays: 0,

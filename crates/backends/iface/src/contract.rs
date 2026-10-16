@@ -292,6 +292,16 @@ pub trait Connector: Send + 'static {
     fn unbox(self: Box<Self>) -> Box<dyn std::any::Any + Send>;
 }
 
+/// 上传落点流(**参数面 vs 批量面**;见 [`DeviceClient::write_block_f32_on`])。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum UpStream {
+    /// H2D 流:批量面默认(装载/换页/材料);跨流 ⇒ 消费方需事件序
+    #[default]
+    H2d,
+    /// COMPUTE 流:**参数面**(图输入槽/小表)—— 与消费它的发射同流 FIFO
+    Compute,
+}
+
 pub trait DeviceClient: Send {
     /// 执行环境提供(硬件感知;None = 无 GPU 环境,语义调用结构化拒绝)。
     /// 感知发生在引擎/boot 侧(实现者可缓存);kernels/解释器零探测
@@ -383,6 +393,24 @@ pub trait DeviceClient: Send {
         src: &[u8],
         name: &str,
     ) -> impl Future<Output = Result<Bytes, ModelError>> + Send;
+
+    /// **带流选择的整块上传**(2026-10-17):参数面(解释器 `from_host` 叶子 ——
+    /// 小张量、马上被发射消费)走 [`UpStream::Compute`] ⇒ 同流 FIFO 天然有序;
+    /// 批量面(权重/装载)走 H2D 以免占住计算流。默认退化为 [`Self::htod`]。
+    fn htod_on(
+        &mut self,
+        _stream: UpStream,
+        dtype: Dtype,
+        shape: &Shape,
+        src: &[u8],
+        name: &str,
+    ) -> impl Future<Output = Result<Bytes, ModelError>> + Send
+    where
+        Self: Sized,
+    {
+        self.htod(dtype, shape, src, name)
+    }
+
     /// 块读出(**读语义**,2026-09-26 成文):issue 相排空 COMPUTE 后
     /// D2H 异步拷贝 —— 回执时 out = 块在全部先前已回执命令之后的值。
     /// 与 [`DeviceClient::sync`] 的分工:本命令为读数据;sync 为不读
@@ -582,6 +610,39 @@ pub trait DeviceClient: Send {
         async {
             Err(ModelError::Msg("write_block_f32: 此后端未实现".into()))
         }
+    }
+
+    /// **带流选择的块内写入**(2026-10-17;用户裁决"参数面必须与消费方同流"):
+    ///
+    /// 上传落在哪条流 = **顺序义务的归属**。默认口走 H2D 流(批量面:装载/
+    /// 换页,跨流 ⇒ 消费方需事件序);**参数面**(图输入槽/小表 —— 只有几 KB、
+    /// 且紧接着就被同一次发射消费)应走 [`UpStream::Compute`]:与 kernel/图发射
+    /// **同流 FIFO** ⇒ 结构上不可能缺序,同时省掉"等回执"的主机往返。
+    ///
+    /// 默认实现退化到老口(其他后端/mock 零改动)。
+    fn write_block_f32_on(
+        &mut self,
+        _stream: UpStream,
+        dst: &Bytes,
+        offset_elems: usize,
+        data: &[f32],
+    ) -> impl Future<Output = Result<(), ModelError>> + Send
+    where
+        Self: Sized,
+    {
+        self.write_block_f32(dst, offset_elems, data)
+    }
+
+    /// [`Self::write_block_f32_on`] 的批量版(同律)
+    fn write_blocks_f32_on(
+        &mut self,
+        _stream: UpStream,
+        writes: &[(&Bytes, usize, &[f32])],
+    ) -> impl Future<Output = Result<(), ModelError>> + Send
+    where
+        Self: Sized,
+    {
+        self.write_blocks_f32(writes)
     }
 
     /// 批量块内写入(S1,2026-09-30):decode 每步多槽装填合一次设备

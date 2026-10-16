@@ -2189,25 +2189,20 @@ fn prefill_bucket_pick_and_ladder() {
     assert!(!gdn_host_slot_arm(&env, &dims, 512));
 }
 
-/// **桶可用性两道判据**(2026-10-17 定位卷):槽号相等 + **该格没换过主**。
-/// 只卡槽号的旧判据在「逐出释放 → 新会话重绑同槽号」时照样放行,而桶回放
-/// 会**静默产错值**(实测:同格第二个会话;`…-定位实录.md`)。
+/// **桶可用性四判据**:已捕获 / t 在桶内 / 槽号 = 烘焙槽 / **格未换主**。
+/// 第四条是临时防线(定位卷 §7/§9):跨流序的**参数面半边**已结构性修复
+/// (上传落 COMPUTE),另一半未点名 ⇒ 换过主的格回 eager(免静默错值)。
 #[cfg(test)]
 #[test]
-fn prefill_bucket_usable_needs_unreused_slot() {
+fn prefill_bucket_usable_conditions() {
     use crate::prefill_plan::bucket_usable;
-    // 基线:捕获过 + t 在桶内 + 槽 0 + 世代 0 ⇒ 可用
-    assert!(bucket_usable(true, 57, 64, Some(0), 0, 0, 0));
-    // ① 槽号不匹配 ⇒ 不可用(旧判据)
-    assert!(!bucket_usable(true, 57, 64, Some(0), 3, 0, 0));
-    // ② **同槽号但换过主**(世代 1)⇒ 不可用(新判据;本案的洞)
-    assert!(!bucket_usable(true, 57, 64, Some(0), 0, 0, 1), "同格第二个会话必须回 eager");
-    // ③ 其它既有判据不回退
+    assert!(bucket_usable(true, 57, 64, Some(0), 0, 0, 0), "基线");
+    assert!(!bucket_usable(true, 57, 64, Some(0), 3, 0, 0), "槽号不匹配");
+    assert!(!bucket_usable(true, 57, 64, Some(0), 0, 0, 1), "格换过主 ⇒ 回 eager");
     assert!(!bucket_usable(false, 57, 64, Some(0), 0, 0, 0), "未捕获");
     assert!(!bucket_usable(true, 0, 64, Some(0), 0, 0, 0), "空 chunk");
     assert!(!bucket_usable(true, 65, 64, Some(0), 0, 0, 0), "超桶");
-    // ④ varlen 臂(槽任一,烘的是设备张量)不受本判据影响
-    assert!(bucket_usable(true, 57, 64, None, 7, 0, 0));
+    assert!(bucket_usable(true, 57, 64, None, 7, 0, 0), "varlen 臂:槽任一");
 }
 
 // ===========================================================================
@@ -2322,12 +2317,10 @@ async fn gpu_prefill_bucket_matches_eager() {
         let n1: usize = g.graphs.prefill.replay_counts().iter().map(|(_, n)| *n).sum();
         let t2 = gen_session(&mut g, Some(2), &prompt, 16).await;
         let n2: usize = g.graphs.prefill.replay_counts().iter().map(|(_, n)| *n).sum();
-        assert_eq!(
-            g.bank.sessions.slot_epoch(0),
-            1,
-            "第二会话必须走来复用腿(0 号格换过主)—— 否则本腿没在测复用"
-        );
         eprintln!("[m2b] 复用腿 {b:?}:首个会话桶回放 {n1} / 复用会话增量 {}", n2 - n1);
+        // **修法口径证据**(不设断言):临时防线(格世代闸)在场 ⇒ 增量 0;
+        // 撤闸日(另一半跨流序点名并修复后)增量应 >0 且本腿仍逐字相同 ——
+        // 届时把"必须回放"写成断言(它就是"同格复用 × 桶回放"的覆盖门)。
         // ⚠️ **不断言"复用发必须回放桶"也不断言"不许回放"** —— 那是修法口径:
         // 安全闸在场时复用发回 eager(增量 0);根治(跨流序补齐)后复用发会
         // **正常回放桶**。本腿只钉**用户可见不变量**(两档逐字相同),

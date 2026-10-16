@@ -526,7 +526,9 @@ impl GpuServer {
                 e.out_id = out_id;
                 e
             }
-            Command::Htod { data, name, .. } => E::new("htod", "h2d").bytes(data.len()).name(name.clone()),
+            Command::Htod { data, name, stream, .. } => E::new("htod", "h2d")
+                .bytes(data.len())
+                .name(format!("s{stream}:{name}")),
             Command::HtodChunk { block, data, .. } => {
                 E::new("htod_chunk", "h2d").bytes(data.len()).id(*block)
             }
@@ -828,10 +830,13 @@ impl GpuServer {
     fn cmd_stream(c: &Command) -> u8 {
         match c {
             // H2D 流:一切 host→device 搬运
-            Command::Htod { .. }
-            | Command::HtodChunk { .. }
-            | Command::HtodChunks { .. }
-            | Command::UploadPinned { .. } => 1u8 << STREAM_H2D,
+            Command::Htod { stream, .. } => 1u8 << (*stream as usize),
+            // **上传落点流由命令自述**(2026-10-17):参数面走 COMPUTE(同流有序),
+            // 批量面走 H2D(重叠优先);记账/审计据此上屏
+            Command::HtodChunk { stream, .. } | Command::HtodChunks { stream, .. } => {
+                1u8 << (*stream as usize)
+            }
+            Command::UploadPinned { .. } => 1u8 << STREAM_H2D,
             // COMPUTE 流:发射 / 清零分配 / 设备内拷贝 / 图回放
             Command::Launch { .. }
             | Command::Alloc { .. }
@@ -961,10 +966,10 @@ impl GpuServer {
             Command::MemsetZero { block, offset_bytes, len_bytes, ack } => {
                 self.handle_memset_zero(block, offset_bytes, len_bytes, ack)
             }
-            Command::Htod { data, name, ack } => self.handle_htod(data, name, ack),
-            Command::HtodChunks { writes, ack } => self.handle_htod_chunks(writes, ack),
-            Command::HtodChunk { block, offset_bytes, data, ack } => {
-                self.handle_htod_chunk(block, offset_bytes, data, ack)
+            Command::Htod { data, name, stream, ack } => self.handle_htod(data, name, stream, ack),
+            Command::HtodChunks { writes, stream, ack } => self.handle_htod_chunks(writes, stream, ack),
+            Command::HtodChunk { block, offset_bytes, data, stream, ack } => {
+                self.handle_htod_chunk(block, offset_bytes, data, stream, ack)
             }
             Command::AllocPinned { bytes, name, ack } => self.handle_alloc_pinned(bytes, name, ack),
             Command::LedgerReport { top, ack } => ack.send(Ok(self.ledger_report(top))),

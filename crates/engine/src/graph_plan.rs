@@ -1207,7 +1207,12 @@ impl<D: DeviceClient> GraphPlan<D> {
             }
             writes.push((&slot.block, 0, data));
         }
-        self.face.write_blocks_f32(&writes).await
+        // **参数面 → COMPUTE 流**(2026-10-17):输入槽与紧随其后的 GraphLaunch
+        // 同流 FIFO ⇒ 结构上不可能"图读到还没落地的槽"(桶族复用格错值案的根因);
+        // 小表(几 KB)放 COMPUTE 无带宽代价,且省掉"等回执"的主机往返。
+        self.face
+            .write_blocks_f32_on(owl_iface::contract::UpStream::Compute, &writes)
+            .await
     }
 
     /// 闭包声明 + 守卫:返回登记输出(名须在 out_specs)
