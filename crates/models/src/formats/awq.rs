@@ -31,8 +31,8 @@ use crate::formats::split_qkvz;
 use crate::formats::w4a16::{bf16_par, i32s_le_bytes, i32s_par, u16s_le_bytes};
 use crate::module::WeightSource;
 use owl_kernels::family::marlin::repack::{
-    marlin_fused_indices, marlin_scales_index, pack_marlin_b_fused, pack_marlin_b_gather_into,
-    pack_marlin_s_idx,
+    marlin_fused_indices, marlin_scales_index, marlin_scales_index_a8, pack_marlin_b_fused,
+    pack_marlin_b_gather_into, pack_marlin_s_idx,
     pack_marlin_z, unpack_zp_ct,
 };
 use owl_kernels::family::marlin::v2_workspace_len;
@@ -66,6 +66,8 @@ enum IdxKind {
     Fused,
     /// `marlin_scales_index`(scales 转置+perm 的源下标表)
     Scales,
+    /// `marlin_scales_index_a8`(同上,a8 的 32-chunk perm_single 档)
+    ScalesA8,
 }
 
 /// 键字节解析结果(懒物化后的一致字节 + 登记 dtype)
@@ -286,6 +288,41 @@ impl AwqSource {
     fn pack_scales(&self, scales_f32: &[f32], out: usize, k: usize) -> Vec<u16> {
         let groups = k / 32;
         pack_marlin_s_idx(scales_f32, out, groups, &self.scales_index(out, k))
+    }
+
+    /// a8 版 scales 源索引表(perm = 32 元素 `scale_perm_single`;
+    /// [`Self::scales_index`] 的 a8 兄弟,按 (k, out) 形状缓存)。
+    fn scales_index_a8(&self, out: usize, k: usize) -> Arc<Vec<u32>> {
+        self.idx_cache
+            .lock()
+            .unwrap()
+            .entry((k, out, IdxKind::ScalesA8))
+            .or_insert_with(|| Arc::new(marlin_scales_index_a8(out, k / 32)))
+            .clone()
+    }
+
+    /// **a8 scales 单遍融合**(装载热路径;2026-10-17):bf16 源 → 转置+32-perm
+    /// (_a8 表)→ int16 归一(q = round(v/max·4096) clamp 正域)→ LE 2B 直写。
+    ///
+    /// 原链(a8 首版)= `bf16_par`(11MB)+ 标量双循环转置(214MB 级
+    /// 非连续写)+ 逐 32-chunk `to_vec` perm + 独立 normalize 遍历:
+    /// 27B 单键 ~65ms(150 键 ≈10s);本函数 = 一分配一路过(同 a16 的
+    /// `pack_scales_bf16_into` 纪律;`bf16→f32` 零舍入展宽 ⇒ 与旧链**逐位同**)。
+    fn pack_scales_a8_bytes(
+        &self,
+        parts: &[&[u8]],
+        out: usize,
+        k: usize,
+        max: f32,
+    ) -> Vec<u8> {
+        let groups = k / 32;
+        let mut dst = vec![0u8; out * groups * 2];
+        if max == 0.0 {
+            // 全零尺度(旧链同路:早退产全零 + 因子 0)
+            return dst;
+        }
+        pack_scales_a8_bf16_into(parts, out, groups, &self.scales_index_a8(out, k), max, &mut dst);
+        dst
     }
 
     /// **bf16 源 → marlin scales 字节**(单遍融合;装载热路径)。
@@ -744,9 +781,14 @@ impl AwqSource {
                 }
             }
             let t0 = std::time::Instant::now();
-            // 源域拼接:scales(bf16→f32 两段)/ zp(u8 两段)/ nibble(仅 want_b)
-            let mut s_f32 = bf16_par(&self.maps[se1.map_ix][se1.start..se1.start + se1.nbytes]);
-            s_f32.extend(bf16_par(&self.maps[se2.map_ix][se2.start..se2.start + se2.nbytes]));
+            // 源域拼接:scales(bf16 两段 → 单遍索引表直出 a8 字节)/
+            // zp(u8 两段)/ nibble(仅 want_b)
+            let sb1 = &self.maps[se1.map_ix][se1.start..se1.start + se1.nbytes];
+            let sb2 = &self.maps[se2.map_ix][se2.start..se2.start + se2.nbytes];
+            let max = bf16_parts_max(&[sb1, sb2]);
+            let s_a8 = self.pack_scales_a8_bytes(&[sb1, sb2], out, k, max);
+            self.maps[se1.map_ix].dontneed(se1.start, se1.nbytes);
+            self.maps[se2.map_ix].dontneed(se2.start, se2.nbytes);
             let mut zp_u8 = unpack_zp_ct(
                 &i32s_par(&self.maps[ze1.map_ix][ze1.start..ze1.start + ze1.nbytes]),
                 n1,
@@ -757,17 +799,13 @@ impl AwqSource {
                 n2,
                 groups,
             ));
-            for (m, e) in [(se1.map_ix, se1), (se2.map_ix, se2), (ze1.map_ix, ze1), (ze2.map_ix, ze2)] {
+            for (m, e) in [(ze1.map_ix, ze1), (ze2.map_ix, ze2)] {
                 self.maps[m].dontneed(e.start, e.nbytes);
             }
-            let (s_bits, factor) = pack_marlin_s_a8(&s_f32, out, groups);
+            let factor = max / 4096.0;
             let z_buf = pack_marlin_z_a8(&zp_u8, out, groups);
             let mut inserts: Vec<(String, Arc<[u8]>, usize)> = vec![
-                (
-                    format!("{base}.scales_a8"),
-                    Arc::from(u16s_le_bytes(&s_bits).into_boxed_slice()),
-                    s_bits.len() * 2,
-                ),
+                (format!("{base}.scales_a8"), Arc::from(s_a8.into_boxed_slice()), out * groups * 2),
                 (
                     format!("{base}.zeros_a8"),
                     Arc::from(i32s_le_bytes(&z_buf).into_boxed_slice()),
@@ -840,24 +878,28 @@ impl AwqSource {
         }
         let t0 = std::time::Instant::now();
         let groups = k / 32;
-        // 源数据三件:q(nibble u8 行主序 [out,k])/ scales(f32 [out,groups])/
-        // zp(u8 [out,groups])—— ct 形态直取,裸权重形态现场 RTN g32-sym(zp≡8)
-        let (q_u8, scales_f32, zp_u8): (Vec<u8>, Vec<f32>, Vec<u8>) = match form {
+        // 源数据三件:q(nibble u8 行主序 [out,k])/ scales / zp(u8 [out,groups])
+        // —— ct 形态直取(scale 保留 bf16 字节段,单遍索引表直出 a8 字节),
+        // 裸权重形态现场 RTN g32-sym(zp≡8;scale 走 f32 旧链)。
+        let (q_u8, zp_u8, s_a8, factor): (Vec<u8>, Vec<u8>, Vec<u8>, f32) = match form {
             QuantForm::Ct { pe, se, ze } => {
                 let packed = i32s_par(&self.maps[pe.map_ix][pe.start..pe.start + pe.nbytes]);
-                let s = bf16_par(&self.maps[se.map_ix][se.start..se.start + se.nbytes]);
+                let sb = &self.maps[se.map_ix][se.start..se.start + se.nbytes];
                 let zp_i32 = i32s_par(&self.maps[ze.map_ix][ze.start..ze.start + ze.nbytes]);
                 self.maps[pe.map_ix].dontneed(pe.start, pe.nbytes);
                 self.maps[se.map_ix].dontneed(se.start, se.nbytes);
                 self.maps[ze.map_ix].dontneed(ze.start, ze.nbytes);
+                let max = bf16_parts_max(&[sb]);
                 (
                     if want_b { unpack_nibbles(&packed, out, k) } else { Vec::new() },
-                    s,
                     unpack_zp_ct(&zp_i32, out, groups),
+                    self.pack_scales_a8_bytes(&[sb], out, k, max),
+                    max / 4096.0,
                 )
             }
             QuantForm::F16 { we } => {
-                // 裸权重 → f32 → RTN int4 g32 对称(与 a16 臂 F16 兜底同源)
+                // 裸权重 → f32 → RTN int4 g32 对称(与 a16 臂 F16 兜底同源;
+                // 此支非 AWQ 生产路 —— 27B ct 档走上面那条快路)
                 let wb = &self.maps[we.map_ix][we.start..we.start + we.nbytes];
                 let w_f32: Vec<f32> = match we.dtype {
                     safetensors::Dtype::BF16 => bf16_par(wb),
@@ -876,14 +918,16 @@ impl AwqSource {
                     }
                 };
                 self.maps[we.map_ix].dontneed(we.start, we.nbytes);
+                let s_f32 = rtn_g32_sym_scales(&w_f32, out, k);
+                let (s_bits, factor) = pack_marlin_s_a8(&s_f32, out, groups);
                 (
                     if want_b { rtn_g32_sym_packed(&w_f32, out, k) } else { Vec::new() },
-                    rtn_g32_sym_scales(&w_f32, out, k),
                     vec![8u8; out * groups],
+                    u16s_le_bytes(&s_bits),
+                    factor,
                 )
             }
         };
-        let (s_bits, factor) = pack_marlin_s_a8(&scales_f32, out, groups);
         let z_buf = pack_marlin_z_a8(&zp_u8, out, groups);
         let mut inserts: Vec<(String, Arc<[u8]>, usize)> = Vec::new();
         if want_b {
@@ -897,8 +941,8 @@ impl AwqSource {
         inserts.extend([
             (
                 format!("{base}.scales_a8"),
-                Arc::from(u16s_le_bytes(&s_bits).into_boxed_slice()),
-                s_bits.len() * 2,
+                Arc::from(s_a8.into_boxed_slice()),
+                out * groups * 2,
             ),
             (
                 format!("{base}.zeros_a8"),
@@ -1245,20 +1289,7 @@ pub(crate) fn pack_scales_bf16_into(
     let n = out * groups;
     assert_eq!(idx.len(), n, "scales 索引表长度 = (groups,out) 展平");
     assert!(dst.len() >= n * 2, "scales 目标字节不足");
-    // 段数只容 1/2(多于两段 = 亮声拒;合并虚拟键只有左右半)
-    let (a, b, cut) = match parts {
-        [] => panic!("scales 源分段为空"),
-        [a] => (*a, *a, usize::MAX),
-        [a, b] => (*a, *b, a.len() / 2),
-        _ => panic!("scales 源分段 > 2:{} 段未支持", parts.len()),
-    };
-    // 源覆盖度校验(响亮:索引表指到段外 = 编程错,不得静默读错字节)
-    let esrc = a.len() / 2 + if parts.len() == 2 { b.len() / 2 } else { 0 };
-    assert!(
-        a.len() % 2 == 0 && (parts.len() != 2 || b.len() % 2 == 0),
-        "scales 源字节量必须偶数"
-    );
-    assert!(esrc >= n, "scales 源元素数 {esrc} < 目标 {n}");
+    let (a, b, cut) = split_scale_parts(parts, n);
     // 分块并行(块 = 2Ki 输出元素;块内串行递推,免逐元素派发税)
     const BLK: usize = 1 << 11;
     dst[..n * 2]
@@ -1274,6 +1305,94 @@ pub(crate) fn pack_scales_bf16_into(
                 d2.copy_from_slice(&half::f16::from_f32(f).to_le_bytes());
             }
         });
+}
+
+/// 源分段解析(1/2 段;合并虚拟键只有左右半)+ **覆盖度校验**
+/// (索引表指到段外 = 编程错,亮声拒,不得静默读错字节)。
+/// 返回 `(左段, 右段, 右段起点)`;单段时 `cut = usize::MAX`(永不命中右段)。
+fn split_scale_parts<'a>(parts: &[&'a [u8]], n: usize) -> (&'a [u8], &'a [u8], usize) {
+    // 段数只容 1/2(多于两段 = 亮声拒;合并虚拟键只有左右半)
+    let (a, b, cut) = match parts {
+        [] => panic!("scales 源分段为空"),
+        [a] => (*a, *a, usize::MAX),
+        [a, b] => (*a, *b, a.len() / 2),
+        _ => panic!("scales 源分段 > 2:{} 段未支持", parts.len()),
+    };
+    assert!(
+        a.len() % 2 == 0 && (parts.len() != 2 || b.len() % 2 == 0),
+        "scales 源字节量必须偶数"
+    );
+    let esrc = a.len() / 2 + if parts.len() == 2 { b.len() / 2 } else { 0 };
+    assert!(esrc >= n, "scales 源元素数 {esrc} < 目标 {n}");
+    (a, b, cut)
+}
+
+/// **a8 scales 单遍融合 gather**(2026-10-17;装载热路径):与
+/// [`pack_scales_bf16_into`] 同骨架(同分段解析/同分块并行),差别在写侧
+/// —— 目标字节 = **int16 归一后的位型**(`q = round(v/max·4096)` → clamp
+/// 到 i16 正域),与旧链 [`owl_kernels::family::marlin::repack::pack_marlin_s_a8`]
+/// 的算术**逐位同源**(同 bf16→f32 展宽、同表达式序 `f / max * 4096.0`、
+/// 同 `round().clamp`)。
+///
+/// `max` = [`bf16_parts_max`] 的产值;`max == 0.0`(全零尺度)由调用侧早退。
+pub(crate) fn pack_scales_a8_bf16_into(
+    parts: &[&[u8]],
+    out: usize,
+    groups: usize,
+    idx: &[u32],
+    max: f32,
+    dst: &mut [u8],
+) {
+    use rayon::prelude::*;
+    assert!(max > 0.0, "a8 scales 需正的全局因子(0 = 调用侧早退)");
+    let n = out * groups;
+    assert_eq!(idx.len(), n, "a8 scales 索引表长度 = (groups,out) 展平");
+    assert!(dst.len() >= n * 2, "a8 scales 目标字节不足");
+    let (a, b, cut) = split_scale_parts(parts, n);
+    const BLK: usize = 1 << 11;
+    dst[..n * 2]
+        .par_chunks_mut(BLK * 2)
+        .enumerate()
+        .for_each(|(t, dchunk)| {
+            let base = t * BLK;
+            for (k, d2) in dchunk.chunks_exact_mut(2).enumerate() {
+                let g = idx[base + k] as usize;
+                let (src, o) = if g < cut { (a, g) } else { (b, g - cut) };
+                let bits = u16::from_le_bytes([src[o * 2], src[o * 2 + 1]]);
+                let f = f32::from_bits((bits as u32) << 16);
+                let q = (f / max * 4096.0).round();
+                let qi = (q as i64).clamp(0, i16::MAX as i64) as i16 as u16;
+                d2.copy_from_slice(&qi.to_le_bytes());
+            }
+        });
+}
+
+/// bf16 源分段的全局最大(装载热路径;a8 全局因子 `max/4096` 的输入)。
+///
+/// 值与 `bf16_par(..).iter().fold(0.0, f32::max)` **逐位同**(bf16→f32 是
+/// 零舍入展宽;`f32::max` 是选择而非算术 ⇒ 与遍历序无关),但零 f32 中转
+/// 分配、单遍直读源字节。
+pub(crate) fn bf16_parts_max(parts: &[&[u8]]) -> f32 {
+    use rayon::prelude::*;
+    if parts.is_empty() {
+        return 0.0;
+    }
+    for p in parts {
+        assert!(p.len() % 2 == 0, "bf16 源字节量必须偶数");
+    }
+    parts
+        .par_iter()
+        .map(|p| {
+            p.par_chunks(1 << 13)
+                .map(|chunk| {
+                    chunk.chunks_exact(2).fold(0f32, |m, b| {
+                        let bits = u16::from_le_bytes([b[0], b[1]]);
+                        m.max(f32::from_bits((bits as u32) << 16))
+                    })
+                })
+                .reduce(|| 0f32, f32::max)
+        })
+        .reduce(|| 0f32, f32::max)
 }
 
 /// RTN g32-sym 现场量化(q packed U4B8 语义):q = clamp(round(w/s), −8, 7)+8,

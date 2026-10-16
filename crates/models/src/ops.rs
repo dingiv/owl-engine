@@ -309,9 +309,13 @@ pub(crate) fn ddt(dt: crate::contract::Dtype) -> Result<owl_kernels::driver::DTy
         crate::contract::Dtype::BF16 => DType::BF16,
         crate::contract::Dtype::F32 => DType::F32,
         crate::contract::Dtype::U32 => DType::U32,
-        // U8 = 字节承载(池块 / 量化输出):**不是激活域 dtype**,但自 S1c 起
-        // 它可以是**算子输出的真身**(激活 int8 量化;driver 词汇里与 U32 同律
-        // —— 只有声明里就写 U8 的算子能收到它,其余算子的 `match` 响亮拒)。
+        // **8 位三族各自点名**(2026-10-16):fp8-e4m3(fp8 池/激活)、
+        // fp8-e5m2(并列格式)、**int8**(有符号;W4A8 激活)、以及真正不透明的
+        // `U8` 字节块。driver 词汇里它们各自独立 —— 只有声明里写同一 dtype
+        // 的算子才收得到,其余算子的 `match` 响亮拒。
+        crate::contract::Dtype::F8E4M3 => DType::F8E4M3,
+        crate::contract::Dtype::F8E5M2 => DType::F8E5M2,
+        crate::contract::Dtype::I8 => DType::I8,
         crate::contract::Dtype::U8 => DType::U8,
     })
 }
@@ -673,7 +677,7 @@ pub fn quant_int8_row(
         .arg_i32(rows as i32)
         .arg_i32(cols as i32)
         .aux(&[rows])
-        .with_shape(Dtype::U8, vec![rows, cols])
+        .with_shape(Dtype::I8, vec![rows, cols])
 }
 
 // ============================================================================
@@ -784,7 +788,7 @@ mod foreign_call_lock {
                 op: sk.op_id(),
                 env: &env(),
                 // 输出域 = U8(字节承载;自 S1c 起进 driver 词汇,与 U32 同律)
-                dt: owl_kernels::driver::DType::U8,
+                dt: owl_kernels::driver::DType::I8,
                 shapes: &[],
                 aux: &[8],
                 scalars: &[],
@@ -796,14 +800,14 @@ mod foreign_call_lock {
                 "{sk:?}: 几何 = 一 token 一 block(aux[0] = rows)"
             );
             let m = pick.meta().expect("必须有准入声明");
-            assert_eq!(m.out_dtype(), Some(crate::contract::Dtype::U8), "{sk:?}: 出槽 U8");
+            assert_eq!(m.out_dtype(), Some(crate::contract::Dtype::I8), "{sk:?}: 出槽 I8(int8)");
             assert_eq!(m.param_names()[0], "x");
             assert_eq!(m.param_names().last().copied(), Some("q"), "{sk:?}: 出槽末位");
         }
-        // ddt:U8 放行(否则本臂的节点 dtype 过不了 eval)
+        // ddt:I8 放行(否则本臂的节点 dtype 过不了 eval)
         assert_eq!(
-            crate::ops::ddt(crate::contract::Dtype::U8).expect("U8 应放行"),
-            owl_kernels::driver::DType::U8
+            crate::ops::ddt(crate::contract::Dtype::I8).expect("I8 应放行"),
+            owl_kernels::driver::DType::I8
         );
     }
 
