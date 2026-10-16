@@ -8,7 +8,7 @@
 //! [`GpuClient::new`](crate::GpuClient)。
 
 use owl_iface::contract::{Bytes, GraphId, LaunchMsg};
-use owl_iface::contract::ModelError;
+use owl_iface::contract::{Connector, ModelError, SwapDir, SwapPiece};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -105,6 +105,29 @@ pub enum Command {
         want_bytes: usize,
         ack: Ack<Result<Vec<u8>, ModelError>>,
     },
+    /// **带偏移的 device → host**(状态存储搬出面,2026-10-16)。
+    ///
+    /// 与 [`Command::Dtoh`] **同一条执行路径**(老命令 = `off_bytes = 0` 的特例),
+    /// 只是起点可偏移 —— "逻辑块 = 层缓冲内的一个页"必须按槽偏移读
+    /// (设计卷 §10.3;`docs/arch/store-状态存储-设计与迁移.md`)。
+    DtohAt {
+        id: u64,
+        /// 块内字节偏移(= 槽 × 每页字节)
+        off_bytes: usize,
+        want_bytes: usize,
+        ack: Ack<Result<Vec<u8>, ModelError>>,
+    },
+    /// **批量分块 device → host**(状态存储"整块搬出",2026-10-16)。
+    ///
+    /// 一次命令搬一个逻辑块的全部层片段(0.8B 12 段 / 27B 32 段)⇒ **一次往返**;
+    /// 回执 = 各片段按**入参顺序**拼接后的字节(逐段等价于 `DtohAt`)。
+    /// 为什么必须批:不批则每个块 12/32 次 actor 往返,搬出去的收益会被往返吃光
+    /// (设计卷 §10.3 推论 B)。
+    DtohBatch {
+        /// (块 id, 偏移字节, 长度字节)
+        pieces: Vec<(u64, usize, usize)>,
+        ack: Ack<Result<Vec<u8>, ModelError>>,
+    },
     /// 中间块回收(E2a,2026-09-27):调用方声明这批块此后不再引用 ——
     /// 账房移除 Owned 块(CudaSlice drop → 流序 free_async 归还设备池);
     /// Carved 块(slab 切片,图/scratch 生命周期)跳过不删。安全前提:
@@ -112,6 +135,21 @@ pub enum Command {
     Free {
         ids: Vec<u64>,
         ack: Ack<Result<(), ModelError>>,
+    },
+    /// **swap 一条命令**(设计卷 §15;2026-10-16):N 片一次提交、一次 ack。
+    ///
+    /// 语义:
+    /// - `Out` = 设备 → 连接器(D2H 流);`In` = 连接器 → 设备(H2D 流);
+    /// - 一次 ack = 全部片段完成(**回执即落地**);
+    /// - `conn` 随命令进出(回执**原箱奉还**,单主零锁);
+    /// - **层级无关**:server 只按 `Connector` 三件读写,不关心另一端是 RAM 或盘;
+    /// - 捕获窗内 = **结构化拒**(搬运只在段边界,时序归 engine —— §10.3);
+    /// - 中途失败 = 整条失败(不留半态;调用方回滚账)。
+    Swap {
+        dir: SwapDir,
+        pieces: Vec<SwapPiece>,
+        conn: Box<dyn Connector + Send>,
+        ack: Ack<Result<Box<dyn Connector + Send>, ModelError>>,
     },
     /// 设备内块→块拷贝(E2c 快照通道;流序非阻塞)
     CopyBlock {
@@ -197,6 +235,12 @@ impl Command {
             Self::AllocPinned { .. } => "alloc_pinned",
             Self::UploadPinned { .. } => "upload_pinned",
             Self::Dtoh { .. } => "dtoh",
+            Self::DtohAt { .. } => "dtoh_at",
+            Self::DtohBatch { .. } => "dtoh_batch",
+            Self::Swap { dir, .. } => match dir {
+                owl_iface::contract::SwapDir::Out => "swap_out",
+                owl_iface::contract::SwapDir::In => "swap_in",
+            },
             Self::Free { .. } => "free",
             Self::CopyBlock { .. } => "copy_block",
             Self::CopyBatch { .. } => "copy_batch",
@@ -226,6 +270,9 @@ impl Command {
             Self::AllocPinned { ack, .. } => ack.created_at(),
             Self::UploadPinned { ack, .. } => ack.created_at(),
             Self::Dtoh { ack, .. } => ack.created_at(),
+            Self::DtohAt { ack, .. } => ack.created_at(),
+            Self::DtohBatch { ack, .. } => ack.created_at(),
+            Self::Swap { ack, .. } => ack.created_at(),
             Self::Free { ack, .. } => ack.created_at(),
             Self::CopyBlock { ack, .. } => ack.created_at(),
             Self::CopyBatch { ack, .. } => ack.created_at(),
