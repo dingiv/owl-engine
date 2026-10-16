@@ -19,23 +19,32 @@ Rel(关系层门面)  身份映射 · 召回语义(Exact / ContextOnly)· 换出
 公共: tier(三层账/预算) · policy(驱逐与准入策略对象) · host(宿主承载) · moves(搬运自由函数)
 ```
 
-**将立(S3-3,§10)**:
+**已立**(S3-3,§10-§19):
 ```
 BlockLeg(engine 侧唯一门面)= KvStore(身份+槽账)+ HostTier(宿主物理)+ 搬运口
-                              ↑ 布局由 engine 注册(id 级 + epoch);server 执行搬运
-Rel   = 关系层,待**两条腿齐备**(S2 之后)再立 —— 现在只有 KV 一条腿
+                              ↑ 布局由 engine 注册(id 级 + epoch);server 执行搬运(swap 单命令)
+Rel   = 关系层,待**两条腿齐备**(S2 之后)再立 —— 现在只有 KV 一条腿(rel.rs 仍在,未接线)
 ```
 
-## 谁在用(2026-10-16,S3-2 之后;交互契约全文见设计卷 §10)
+## 谁在用(2026-10-17,S3-3 全刀之后;交互契约全文见设计卷 §10、钩子 §14、需求驱动 §17)
 
-`owl-engine` 的 `SessionBank` 直接用本 crate 的块腿(`KvStore`)持有两套块链
-(target / MTP);engine 侧原来的 `blocks.rs`(物理块引用账)与 `prefix_cache.rs`
-(内容前缀树)已**整文件删除** —— 两本账的合并语义在本 crate(见设计卷 §9.5)。
+`owl-engine` 的 `SessionBank` 持两套**块腿**(`BlockLeg`:target / mtp);`KvStore` 已是内部件。
+engine 侧原来的 `blocks.rs` / `prefix_cache.rs` **已整文件删除**(§9.5)。
 
-**尚未接线**:①`BlockLeg`(账 + 宿主物理 + 搬运口;S3-3)—— 立它之后 engine 只认 leg,
-`KvStore` 收成内部件;②`Rel` 关系层(要**两条腿齐备**,S2 之后;只有 KV 一条腿时立它 = 半空门面)。
-在那之前:host 卸载面 = 命中/驱逐出现 `slot = None` 时**响亮拒**,不静默降级。
-**S0 数字已有 0.8B 档**(设计卷 §9.6);27B 待测。
+已经通的:
+
+- **换出/回灌**(§16/§17.7):链级**整条**下沉(链头段也进宿主 ⇒ 命中面从链头就是宿主格)
+  + `onload_blocks` **一条命令搬 N 块**;搬运走 `DeviceClient::swap`(CUDA 单命令 / CPU 池化解码);
+- **需求驱动保洁**(§17):engine 钩子 H1/H2 用与 `schedule` **同源算式**算 need;
+  `ensure_for_len` 的同步驱逐降为兜底(报告面 `ops.ensure_evicted` 监控);
+- **无卡验证**:`tests/store_e2e.rs`(端到端三门口 + 链级粒度,0.00s)
+  与 engine 侧 `cpu_mock_smoke`(boot/装载/warmup/图捕获/turn)。
+
+仍未接线:
+
+1. `Rel` 关系层(**要两条腿齐备**;只有 KV 一条腿时立它 = 半空门面)—— 待 S2/S2b 状态腿;
+2. 盘层(§15.4 的 disk connector;`Carrier::Disk` 位已留);
+3. 挂账清单集中在本包 `docs/arch/store-状态存储-设计与迁移.md` **§20**。
 
 ## 律(违反即 `// CMA:` 标记)
 
