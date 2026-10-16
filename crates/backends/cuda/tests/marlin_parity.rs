@@ -150,7 +150,11 @@ async fn run_case(
     let da = owl_iface::htod!(client, Dtype::F16, &Shape::from(vec![m, k]), &le_u16(&a_bits)).await.expect("htod a");
     // u16 位序 = f16 LE ✓(f16::to_bits 是 u16 表示,LE 字节序正确)
     let db = owl_iface::htod!(client, Dtype::U32, &Shape::from(vec![b_packed.len()]), &le_i32(&b_packed)).await.expect("htod b");
-    let ds = owl_iface::htod!(client, Dtype::F16, &Shape::from(vec![s_packed.len()]), &le_u16(&s_packed)).await.expect("htod s");
+    // 尺度瓦片按**臂**声明(F16 臂吃 f16、bf16 臂吃 bf16 —— 与算子表逐字一致;
+    // 2026-10-16 定谳:此前一律声明 F16 而 bf16 臂实际喂 bf16 字节 = 影子口径,
+    // 任何按声明解字节的读者都会静默拿到 ~15× 错值)
+    let s_dtype = if is_bf16 { Dtype::BF16 } else { Dtype::F16 };
+    let ds = owl_iface::htod!(client, s_dtype, &Shape::from(vec![s_packed.len()]), &le_u16(&s_packed)).await.expect("htod s");
     let ws_mul: usize = owl_shared::env_reader::parse_or("OWL_WS_MUL", 1);
     let ws_len = owl_kernels::family::marlin::v2_workspace_len(n).max(n / 128 * 16) * ws_mul;
     let dws = owl_iface::alloc!(client, Dtype::U32, ws_len).await.expect("alloc ws");
@@ -237,7 +241,21 @@ async fn marlin_w4a16_parity() {
 #[tokio::test]
 async fn marlin_w4a16_bf16_parity() {
     let mut client = assemble();
-    for (m, n, k, g) in [(20usize, 5120usize, 5120usize, 128usize), (8, 5120, 5120, 128), (64, 512, 512, 128)] {
+    // ⚠ **m ≤ 8 是盲区**(2026-10-16 perf-review):
+    //   DFlash2 草稿的 fc = (m=1, n=5120, k=5120, g=128) 的 bf16 臂,
+    //   而原列表只覆盖 m=8/20/64 ⇒ **单 token 形状从未被门覆盖**。
+    //   现场:`gpu_dflash2_27b_loads_and_smokes` 的 fc 对拍方向对(cos 0.987)
+    //   但幅度 ~16.6×(设备读到的组尺度 = 宿主的 17.34× 中位)。本组把 m=1/2/4
+    //   补进臂内 —— **红 = selector 对 m≤8 选了错变体(s_type/几何);绿 = selector 无罪**,
+    //   病在字节链(见审查笔记 §P)。
+    for (m, n, k, g) in [
+        (1usize, 5120usize, 5120usize, 128usize), // ← 草稿 fc 真几何
+        (2, 5120, 5120, 128),
+        (4, 5120, 5120, 128),
+        (20, 5120, 5120, 128),
+        (8, 5120, 5120, 128),
+        (64, 512, 512, 128),
+    ] {
         let (noise_ratio, max_abs) = run_case(&mut client, m, n, k, g, true).await;
         eprintln!("[marlin-bf16] m={m} n={n} k={k} g={g} → 噪声/信号RMS={noise_ratio:.6} max_abs={max_abs:.5}");
         assert!(

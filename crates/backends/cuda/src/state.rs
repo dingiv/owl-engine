@@ -1845,11 +1845,64 @@ pub(super) struct KernelCache {
     pub(super) aot_hits: usize,
     /// 无资产的核名(每名一次;= 拒启清单/机器判据面)
     pub(super) misses: Vec<String>,
+    /// 预加载已完成(boot 期;之后的模块装载 = 声明面漏登,响亮告警)
+    preload_done: bool,
 }
 
 impl KernelCache {
     pub(super) fn new() -> Self {
-        Self { compiled: HashMap::new(), modules: HashMap::new(), aot_hits: 0, misses: Vec::new() }
+        Self {
+            compiled: HashMap::new(),
+            modules: HashMap::new(),
+            aot_hits: 0,
+            misses: Vec::new(),
+            preload_done: false,
+        }
+    }
+
+    /// **算子预加载**(2026-10-17):boot 期把声明面中**有 cubin 资产**的核
+    /// 全部装载(模块 + 符号),把“首发票”–首次请求触发的惰性装载税搬到 boot。
+    ///
+    /// 动机(实测):模块装载(`cuModuleLoadData`)是**首次使用**才付的
+    /// 惰性成本 —— 44 个 .cu / 139 个核里,decode/图族在 warmup 就热身了,
+    /// 而 prefill 族(FI/XQA 变体)只在第一个真请求里首次装载 ⇒ 首发
+    /// prefill 读数偏低(实测 615 vs 稳态 1113 t/s 的那条案;机制上属
+    /// “引擎自己造成的冷启动”,不是吞吐能力)。
+    ///
+    /// 口径:遍历**声明面单源** `owl_kernels::ops::all()`;
+    /// - 有资产(`cubins::asset(src).is_some()`)→ [`Self::ensure_kernel`];
+    /// - 无资产 → **计数跳过**(外族:FI/XQA/marlin-FFI 轮内面,主业是
+    ///   host 侧 C-FFI 调用,不在 AOT 直发表);
+    /// - 资产在场却装不上 → `Err`(真错:代际不匹配/符号缺失 ⇒ 拒启)。
+    ///
+    /// 返回 `(装载核数, 跳过核数)`。不可重入(自己置 `preload_done`,
+    /// 之后的模块装载会响亮标为“漏登”)。
+    pub(super) fn preload_all(
+        &mut self,
+        ctx: &Arc<CudaContext>,
+        sink: owl_shared::log::LogSink,
+    ) -> Result<(usize, usize), ModelError> {
+        let t0 = std::time::Instant::now();
+        let (mut loaded, mut skipped) = (0usize, 0usize);
+        for meta in owl_kernels::ops::all() {
+            if owl_kernels::family::cubins::asset(meta.src).is_none() {
+                skipped += 1;
+                continue;
+            }
+            self.ensure_kernel(ctx, meta.entry, meta.src, sink)?;
+            loaded += 1;
+        }
+        self.preload_done = true;
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+        sink.logf(
+            owl_shared::log::LVL_INFO,
+            "aot",
+            format_args!(
+                "算子预加载:{loaded} 个核 / {} 个模块(外族跳过 {skipped})@ {ms:.1}ms —— 首发票惰性装载已提前付",
+                self.modules.len()
+            ),
+        );
+        Ok((loaded, skipped))
     }
 
     /// 核取用:**构建期 cubin 资产唯一路径**(源哈希查表 → fatbin → 符号)。
@@ -1882,6 +1935,18 @@ impl KernelCache {
         let module = match self.modules.get(asset.module) {
             Some(m) => m.clone(),
             None => {
+                // 预加载后仍走惰性装载 = 声明面/发射面口径不一致(亮声;
+                // 不拒发 —— 资产在,核可用,只是预加载面漏了一行)
+                if self.preload_done {
+                    sink.logf(
+                        owl_shared::log::LVL_WARN,
+                        "aot",
+                        format_args!(
+                            "预加载后仍发生惰性模块装载:{name}(模块 {} —— 声明面漏登?)",
+                            asset.module
+                        ),
+                    );
+                }
                 // fatbin 载入:driver API 与纯 cubin 完全相同(多代际由驱动
                 // 按设备挑最匹配那份)
                 let m = ctx
@@ -1938,12 +2003,19 @@ impl Staging {
         // 字节口径(f16 基线,2026-09-26):n = 字节数,DMA 按 byte 计数
         let ptr = unsafe { malloc_host(n, 0) }
             .map_err(|e| ModelError::Msg(format!("malloc_host(n={n}B): {e:?}")))? as *mut u8;
-        // FIXME(2026-10-13):cudarc 的 `malloc_host` 对失败/零尺寸可能回 Ok(null)
-        // ——这里是裸 assert,拿不到任何上下文。先带上尺寸与原因(下同)。
-        assert!(
-            !ptr.is_null(),
-            "Staging::alloc[{label}]: malloc_host(n={n}B) 返回空指针(锁页内存耗尽?n=0 = 零长块写,上游形状错)"
-        );
+        // cudarc 的 `malloc_host` 对**失败/零尺寸**可能回 Ok(null)(2026-10-13 记录):
+        // 这是**可失败路径**,归 Result 面 —— 原为裸 assert(上下文足却把进程打死,
+        // 上层拿不到 OOM 归因面;C2 2026-10-17)。两种病因分开报。
+        if ptr.is_null() {
+            let why = if n == 0 {
+                "n=0(零长块写:上游形状错,不是内存不足)"
+            } else {
+                "锁页内存耗尽?(检查 ulimit -l / 并发 staging 数)"
+            };
+            return Err(ModelError::Msg(format!(
+                "Staging::alloc[{label}]: malloc_host(n={n}B) 返回空指针 —— {why}"
+            )));
+        }
         Ok(Self { ptr, len: n })
     }
 

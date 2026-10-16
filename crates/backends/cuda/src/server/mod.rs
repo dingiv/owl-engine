@@ -629,6 +629,27 @@ impl GpuServer {
                         }
                     }
                 }
+                // ★ **算子预加载**(2026-10-17)—— 装配门之后、boot 握手之前:
+                //   把声明面里有 cubin 资产的核全部装载(模块+符号),首发请求
+                //   不再付惰性装载税(prefill 族只在真请求里首次装载)。
+                //   失败 = 拒启(资产在场装不上 = 真错),握手上报同拒启一条路。
+                {
+                    let r = self
+                        .kernels
+                        .preload_all(&self.ctx.as_ref().expect("ctx 上线").ctx, self.sink);
+                    if let Err(e) = r {
+                        let msg = format!("算子预加载失败(拒启): {e}");
+                        self.sink.logf(
+                            owl_shared::log::LVL_ERROR,
+                            "aot",
+                            format_args!("❌ {msg}"),
+                        );
+                        if let Some(boot) = self.boot.take() {
+                            let _ = boot.send(Err(msg.clone()));
+                        }
+                        return Err(msg);
+                    }
+                }
                 // ★ boot 全链成功 ⇒ 才发"就绪"(引擎侧此刻才可安全发命令)
                 if let Some(boot) = self.boot.take() {
                     let _ = boot.send(Ok(()));
@@ -1469,6 +1490,30 @@ impl GpuServer {
     /// `enqueue(H2D) → record_tail(H2D) → COMPUTE waitEvent → enqueue(COMPUTE)`。
     /// 客户端口不出现流/事件/槽;零 host 阻塞(实测 record 170~740ns / wait 180ns)。
     fn handle_upload_and_launch(
+        &mut self,
+        dst: Bytes,
+        chunks: Vec<owl_iface::contract::UpChunk>,
+        msg: LaunchMsg,
+        ack: Ack<Result<Bytes, ModelError>>,
+    ) {
+        // **逐发射记账要覆盖复合口**(2026-10-16):原记账只在 `handle_launch`
+        // ⇒ **装载期**的复合命令(段流式上传 + 重排/铸边界核)从不进日志,
+        // 而白名单台账的生成法正是"真跑 + 逐发射记账" ⇒ 系统性漏装载域算子
+        // (现场:`owl_cast_bf16_f16` 就是这幺漏的 —— 而它恰恰是 embed/lm_head
+        // 的 bf16→f16 铸边界核,漏登 = 生产档启动即被准入拒)。
+        // 行格式与 `handle_launch` **逐字一致**(`<耗时> <核名>`),
+        // 以保 `tools/wl-audit.sh` 的解析单一。
+        if self.probes.launch_time && !self.ctx().capture_stream() {
+            let t = std::time::Instant::now();
+            let name = msg.kernel.name.clone();
+            self.handle_upload_and_launch_inner(dst, chunks, msg, ack);
+            self.sink.logf(owl_shared::log::LVL_DEBUG, "launch-time", format_args!("{:?} {}", t.elapsed(), name));
+            return;
+        }
+        self.handle_upload_and_launch_inner(dst, chunks, msg, ack)
+    }
+
+    fn handle_upload_and_launch_inner(
         &mut self,
         dst: Bytes,
         chunks: Vec<owl_iface::contract::UpChunk>,
