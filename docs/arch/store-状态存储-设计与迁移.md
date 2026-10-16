@@ -1,0 +1,1651 @@
+# store = 状态存储(GPU 池 → host pinned → 磁盘)设计与迁移
+
+> 立项:2026-10-16,用户令「KV cache 专项立项」;**落点由用户指定:
+> `packages/owl/crates/store`(新 crate `owl-store`)**。
+> 方法:code-master 模式二(画现状 → 定痛点 → 定目标 → 分阶段迁移)+
+> 工作流四子步(接口 → 链路 → 依赖 → 空间)。
+> 需求源:`docs/arch/requirements.md` REQ-PRE-03(P1)+ C4 风险条款
+> (「默认关闭三级缓存,需要时按场景开」+「host RAM 预算显式配置」);
+> 约束源:`docs/arch/charter.md` A1(图租约)/A5.1(预算分解封闭)/A5.2(一切分配过账本)。
+> 相邻卷:`三流事件序-设计与迁移.md`(搬运的设备端序)、`装载提速-定谳轮-2026-10-16.md`
+> (宿主层 pinned 池/预算两栏/块账的现成先例)。
+> **设计参考(必读)**:`KVMem: Virtualizing Million-Token Agent Workspaces on a Consumer
+> GPU`(Di Chai et al.,arXiv:2609.04852v1,2026-09;本机 `kvmem.pdf`)——
+> 同题(24GB 卡 + Qwen3.8-27B + MTP 跑 1M 工作区),其四机制 = 本卷骨架的对照系(§3.6)。
+
+## 0. 立项口径(边界,先说清楚)
+
+- **做什么**:把引擎的状态(KV/线性注意力状态/草稿/视觉)从「显存容量的函数」
+  变成「存储层的函数」——**GPU 池 → host pinned → 磁盘** 三层,按前缀身份换入换出。
+- **交付线**:262k 单卡可服务(现墙 fp8 128k);重灌命中 TTFT 可测改善;
+  host RAM 预算可配可断言;开启默认关。
+- **不做**(本卷之外,勿混刀):①分布式 store(TP 立项再议,见 §7);
+  ②KV 量化新档(REQ-CTX-03 另案;本卷只留 dtype 轴);③前缀命中语义
+  (E2c 块级缓存不动,本卷只回答「命中之后从哪一层取」)。
+
+### 0.1 立项裁决(用户,2026-10-16)
+
+| # | 裁决 | 结果 |
+|---|---|---|
+| ① | BlockManager/PrefixCache 是否迁入 store | **迁入** —— host 账与设备叶子分家,engine 只留叶子与编排 |
+| ② | attention 块链 × GDN 快照 的耦合方式 | **二者独立管理 + 上层一个「关系层」关联**(不硬绑、不合并成一个管理器) |
+| ③ | 换出/召回粒度 | 见 §3.6.2:定为 **逻辑块 = 32 token = 物理页**(与 KVMem 缺省一致,且天然等于我们 XQA 的 `tokensPerPage`) |
+| ④ | 草稿池一期是否入账 | **推后**(S5 单独立刀) |
+
+## 1. 病根(现状:四类状态、两本账、一张策略表)
+
+### 1.1 现状盘点(代码事实,逐条可查)
+
+| # | 状态 | 落点 | 几何/粒度 | dtype | 容量与上限 | 可共享 |
+|---|---|---|---|---|---|---|
+| ① | **attention KV** | `engine/src/state.rs::StatePool.kvs` | paged classic `kc [nb,Hkv,hd/x,page,x]`、`vc [nb,Hkv,hd,page]`;策略表 `models::module::kv_paged_policy(dtype)` 分发(legacy token-major 为回退) | 随 `spec.dtype` 或 fp8(U32 承载 1B/elem,元素数 ÷4) | `nb=ceil(pool_tokens/page)`(+1 dump page);`pool_tokens` 缺省 = **2× 单会话容量**,再被 `vram_target` 预算夹 | ✅ 块级 ref-count(≥2 = 前缀共享) |
+| ② | **GDN/线性注意力状态** | `StatePool.gdns`(每 GDN 层 4 块:`conv_q/conv_k/conv_v/rec`) | 行宽 = `elems/gdn_slots`;**一格一会话** | **恒 f32** | 格数 = `knobs.gdn_slots`(缺省 8)⇒ **并发上限被格数钉死**(`session.rs` 耗尽报错);27B `rec` ≈ 1MiB/格/层 × 18 层 | ❌ 独占;可**快照** |
+| ③ | **草稿 KV** | `StatePool.mtp_kvs` / `StatePool.dflash_kvs` | MTP:1 层独立页池;DFlash2:5 层 × (8 头 × hd128) | MTP = 主池 dtype;DFlash2 = BF16 或 fp8(`OWL_DFLASH_KV_FP8`) | 两者都**按 `pool_tokens` 全额预留**(无按需/降级账) | ❌(MTP **不接前缀缓存** —— 依赖 hidden,不可 token 哈希) |
+| ④ | **视觉塔** | `models/src/layers/vision.rs` + `models/src/vlm.rs` | 塔权重 `model.visual.*` + **每图一次前向**;输出 `[n_img,D]` 经 `image_scatter` 注入文本序列 | — | 图像 token 的 KV **落进主池**(⇒ 天然可前缀复用);塔自身无驻留 KV | ✅(经文本池) |
+| ⑤ | **GDN 快照池** | `StatePool.snaps`(snap_max)+ `spec_snap` | key = **链尾物理块 id**(内容身份);行宽同 ②;D2D 行拷贝 | f32 | `snap_max` 槽,**LRU 换 key 覆盖写**(零 alloc) | —(是"状态续跑"的钥匙) |
+
+### 1.2 两本账(host 侧 vs 设备侧)
+
+- **设备侧** `StatePool`(`state.rs`)= 分配 + 叶子句柄(`kv_caches`/`gdn_caches`/`bt_leaf`)
+  + 状态治理(`reset_gdn` / `capture_snap` / `restore_snap` / `write_bt`);
+- **host 侧** `BlockManager`(`blocks.rs`)= ref_count(0 空闲/1 独占/≥2 共享)
+  + 空闲 FIFO + `ensure_for_len` **事务性增长** + **压力驱逐**(先逐前缀缓存叶补自由度)
+  + **E2c 块级前缀缓存**(内容链哈希,`prefix_cache.rs` 持索引/LRU);
+- **会话** `SessionTable`(`session.rs`)= `slot_base` + `gdn_slot`;close 释放格号;
+- 全局:**没有任何 host/盘层卸载**(现有 `dtoh/htod` 只出现在取证探针里)。
+
+### 1.3 三条结构性痛点(本卷要治的)
+
+1. **无分层**:状态只在显存 ⇒ 池容量 = 显存剩余的函数。实测(27B + draft,
+   slots2/snap1):**fp8 池 131072 tok READY @ 23358MiB(95.1%);196608 起 OOM**
+   (k-cache 首片 201MB 分配失败);f16 同配置 ≈ 64k。262k 达标线**必须**换层。
+2. **两腿之间没有关系层,且都只有一层**:attention 块链(BlockManager)与 GDN 快照
+   (`snaps`)本就是两套账、两套驱逐 —— 这本身**不是**病(裁决②:它们几何/共享性/
+   复算代价结构性不同,该独立);病在 **①二者之间没有关联层**(没有"这条前缀的
+   两条腿在不在"的统一判定与统一换出序 ⇒ 混合架构只能要么全在、要么全无),
+   **②各自只有显存一层** ⇒ 谁都换不出去。llama.cpp 侧的完整判例在册
+   (`docs/llama.cpp/mtmd-hybrid-缓存失效-排查实录`:中部断前缀 = 全量重灌)。
+3. **草稿池无账**:③ 的两个池都按 `pool_tokens` 全额预留,不吃"按需/切分/降级"
+   的治理 ⇒ 有 draft 的档位相当于第二个主池。
+   附带:**固定面 17.9G live**(权重账面 13.7G,实际 ~17.5G,**~2G 待审计**)
+   —— 归因六件套已就位,可先清(见 §6 刀序 S0)。
+
+### 1.4 前作盘点(源码级):三者同族 =「**身份命中 + 时间序淘汰**」
+
+> 本机源码:`packages/vllm`(v1 kv_offload)、`packages/llama.cpp`(本仓 fork)、
+> `packages/sglang`(HiCache)。结论先行:**它们都假设"该留的历史 = 前缀 ∪ 最近",
+> 命中判定问的是"这段 token 我处理过吗"(身份),不是"哪些历史块与当前查询相关"(相关度)。**
+
+| 系统 | 命中判定(键) | 工作集形状 | 淘汰/准入信号 | 三层 | 复发状态 |
+|---|---|---|---|---|---|
+| **vLLM**(本仓 v1) | **块哈希精确匹配**(`OffloadKey = block_hash + group_idx`,`kv_offload/base.py`)⇒ 前缀链身份 | 连续(前缀)∪ 活跃请求 | **LRU / ARC / chain-LRU**(`kv_offload/cpu/policies/`);`async_lookup.py` = 按哈希**预取**(预测的是"后续块在不在池里",不是"哪些块相关") | ✅ `cpu/` + `tiering/{fs,obj,p2p}`(盘/对象/跨实例) | —(无混合模型概念) |
+| **llama.cpp**(本仓 fork) | **位置对齐 + KV shifting**(`--cache-reuse N` = "min chunk size to reuse from the cache via **KV shifting**",`common.h:626`) | 连续(前缀)∪ 最近 | context shift 丢最老;`--ctx-checkpoints`(缺省 32/槽)= **整态 partial 快照**(带 pos_min/pos_max,含草稿态)做回滚/部分复用,FIFO 淘汰(`server-context.cpp:2363-2416`) | ⚠️ 只有"VRAM ↔ host RAM"(`-nkvo`/`offload_kqv`),**无盘层** | **整态快照**,非分页、非按需 |
+| **sglang HiCache** | **页键(字符串/内容哈希)+ 最长前缀**语义(`hicache_storage.py`: `prefix_keys`、"Longest-prefix semantics") | 连续(前缀) | **LRU 文件驱逐器**(`storage/file/lru_file_evictor.py`) | ✅ GPU/host/盘 | — |
+
+**三条推论(定我们对标姿态)**:
+
+1. **三层化本身是工程活,不是研究活**:vLLM/sglang 的形态 = 「内容键 + 策略对象 +
+   异步 lookup + 分档后端」,可以照抄骨架;它们的瓶颈不在搬运,而在**选择**。
+2. **"相关度"是缺口,也是论文的价值**:KVMem 把命中判定从**身份**换成**相关度**
+   (Mean-K 打分 ⇒ 工作集可以是**稀疏非连续**的、每步重选),代价 = 需要重排/位置重建
+   (§3.6.3 的 A/B)与质量门(§5 G3)。
+   另注:研究界的"相关度"家族分两支 —— **剪枝**(H2O/StreamingLLM:token 级、
+   **丢数据、不可逆**)vs **虚拟化**(KVMem:全量留在层里、只选择物化)。
+   我们对齐后者:**不分页丢数据**;混合架构下剪枝尤其危险(GDN 递推状态被剪即失真)。
+3. **我们的形态三者都没有**:vLLM 无复发状态、llama.cpp 只有整态快照、
+   KVMem 明确**不虚拟化复发状态**(*"recurrent model state continues through the
+   original execution path"*)—— 「attention 块链 + GDN 快照两腿独立、关系层关联」
+   (裁决②)是**本卷相对全部前作的结构增量**。
+
+## 2. 需求 = 端到端链路(触发点 → 终止条件)
+
+| # | 链路 | 触发点 | 终止条件 | 现状 |
+|---|---|---|---|---|
+| **L1** | **重灌命中** | 会话提交 prompt(turn 开始) | 首 token 产出,且**未重算命中部分的 KV/状态** | 只有显存层可命中;超池即整段重算 |
+| **L2** | **压力换出** | 池自由度不足(`ensure_for_len` 判定) | 池可服务(或响亮拒绝) | 只能逐前缀缓存叶;再不够直接报错 |
+| **L3** | **turn 收口登记** | turn 完成 | bundle 在 store 可见可命中 | 只登记前缀缓存块 + 快照 key,不构成可换出对象 |
+| **L4** | **启动预算** | `engine.run` 装配 | 三层预算全部分解完毕,越界**拒绝启动** | 只有显存一层(A5.1) |
+
+### 2.1 两范式:容量层(A)× 选择层(B) —— **互补,不是同题**(2026-10-16 用户定调)
+
+先把"假设集"摆清楚 —— 两个范式对**"活跃序列要驻留多少 KV"**的假设根本不同:
+
+| | **A 容量/搬运范式**(vLLM / sglang HiCache / llama.cpp) | **B 选择/虚拟化范式**(KVMem) |
+|---|---|---|
+| 对活跃序列的假设 | **整条活跃序列的 KV 必须能参与注意力**(dense)⇒ 常驻需求 ∝ **上下文长度** | **参与集合可以是任意有界子集**(selected)⇒ 常驻需求 ∝ **窗口**,与地址空间解耦 |
+| 解决的问题 | **跨请求/多会话的容量**:前缀复用、抢占换出、多租户经济性 | **单请求超窗**:地址空间 ≫ 原生窗口(1M 工作区) |
+| 命中判定 | 身份(块哈希/位置) | 相关度(注意力空间打分) |
+| 索引资产 | 块哈希链(小) | **Mean-K 索引**(层×KV头×块) |
+| 损失性 | **无损**(只搬家) | **近似**(被选中的集合改变了注意力分布)⇒ 必须配质量门 |
+| 谁受益 | 同前缀重复到来的负载(RAG/模板/多轮) | 长轨迹单会话(agent 工作区/长文档) |
+
+**单卡 262k 的算术(本机 27B 实测配置:16 全注意力 + 48 GDN、Hkv=4、hd=256 ⇒ 每 token 64KiB f16 / 32KiB fp8)**:
+
+| 上下文(dense) | KV(fp8) | 单卡(权重 ~17.5G) | TP2(权重 8.75G/卡) |
+|---|---|---|---|
+| 128k | 4.29 GB | **21.8 G ✓**(= 实测 23358MiB,即 128k 墙) | 10.9 G |
+| **262k** | 8.59 GB | **26.1 G ✗(放不下)** | 13.0 G ✓ |
+
+⇒ **定论**:①单卡 262k,dense 路线**无解**(算术,不是调优);要走 A 达到 262k **必须加卡(TP)**;
+②单卡 262k **只能**走 B(常驻 = 执行视图窗口;64K 窗口 fp8 ≈ **2.1GB**,舒适;
+地址空间 262k/1M 落 host/盘);
+③A 与 B **不是二选一** —— **B 决定"这一步该看到什么",A 决定"东西在哪、怎么搬、放不下时丢谁"**。
+B 选出的块必须落在 A 的三层里搬运;A 的 LRU/ARC 在"同优先级候选"里做跨会话容量裁决。
+**本卷两者都做,但门的归属不同**:A → 多会话/前缀复用/抢占(容量经济性);
+B → 单请求超窗(**262k 门在这里**)。
+
+**混合架构的额外账(两范式共同的前提)**:GDN 状态 = **162 MB/会话**(48 层 × 3.38MB,f32;
+`gdn_slots=8 ⇒ 1.3GB`)。它**不可共享、不可内容哈希**,但**任何"续跑/复用"都必须带上它**
+(否则退化成重算)⇒ 这是裁决②「两腿独立 + 关系层」的定量理由(§3.6.4)。
+
+### 2.2 分界点:三条容量线 + 一条性能交叉线(不是一根常数线)
+
+**预算式(单卡,一切判据的来源)**:
+
+```
+V_avail = V_card − B_weights − Σ_live S_gdn − O_runtime − P_draft        ← 可给 KV 的余量
+dense 可服务 ⇔ N_req · k ≤ V_avail            ⇒ N* = V_avail / k        ← 容量线①
+selection 可服务 ⇔ W · k ≤ V_avail  且  N_req ≤ N_pos                    ← 容量线②(+位置墙)
+多会话可服务 ⇔ Σ_i N_i · k ≤ pool 且 并发 ≤ gdn_slots                     ← 容量线③(池墙)
+```
+
+其中(本机 27B 实测锚点):`k = 32 KiB/token(fp8)/ 64 KiB(f16)`;
+`B_weights ≈ 17.5 GB`(账面 13.7G,**2G 待审计**);`S_gdn = 162 MB/会话`;
+`O_runtime` = 图 slab + 激活 + 上下文 + warmup(≈2~3 GB);`P_draft` = MTP/DFlash2 草稿池
+(按 `pool_tokens` 全额预留,DFlash2 fp16 约 20 KiB/token ⇒ 128k 档 ≈ 2.6 GB);
+`W` = 执行视图预算(KVMem 档位 32K/64K);`N_pos` = 位置墙(原生 262k / YaRN 1M)。
+
+**三条容量线(硬墙,越线只能换范式或拒服务)**:
+
+| 线 | 判据 | 本机 24G × 27B 的实测/估算 | 越线后 |
+|---|---|---|---|
+| ① 单请求 dense | `N_req ≤ N*` | **fp8:实测 128k 墙(draft on);清 2G 审计面后 ~190k**;f16 ≈ 64k | 强制 selection(或拒/抢占/整段重算) |
+| ② selection 常驻 | `W ≤ N*` 且 `N_req ≤ N_pos` | W=64K fp8 ⇒ **2.1 GB**(舒适);N_pos = 262k(原生) | 位置墙:上 YaRN 或"紧凑窗口"方案 B(§3.6.3) |
+| ③ 多会话池 | `Σ N_i ≤ pool/k`;`并发 ≤ gdn_slots` | 池缺省 = 2× 单会话容量;`gdn_slots=8` ⇒ GDN 1.3 GB | A 轴(前缀复用/LRU 换出/抢占) |
+
+**一条性能交叉线(不是墙,是"择优"区)**:
+`W < N_req ≤ N*` 时**两种都可行** —— dense 每步读全量 KV(带宽 ∝ N,保真无损);
+selection 每步只物化 W(+索引打分,开销 ∝ 块数)。⇒ **两可区间内按策略择优**
+(默认:dense 优先保真;当 N/W 超过阈值或首 token 延迟吃紧时切 selection)。
+**交叉点不是容量问题,是吞吐/保真权衡 —— 归策略对象,不归硬判据。**
+
+**三条工程结论(本卷据此定形态)**:
+
+1. **线是动的**:`V_avail` 随(并发数 × GDN 格、draft 开关、KV dtype、前缀缓存占块)实时变化
+   ⇒ 判据必须走**实时账本 + per-request admission**(不是 boot 期常数);
+2. **越线要能"就地切"**:一条序列 dense 起步、涨过 N* 后切 selection —— 切换点是一个
+   **段边界**,且必须落 **GDN 快照**(否则递推状态丢,回不去);
+3. **索引必须在 dense 阶段就建**(prefill 顺手采 Mean-K,边际成本≈0;论文同款 incremental
+   indexing)⇒ 任何序列**随时可切**,且历史块天然可被后续会话相关度召回。
+   **这一条是"两范式互补"的工程接缝:索引 = 两范式共用的资产。**
+
+### 2.3 活跃度模型:布局是"活跃 turn 数"的函数,不是会话数的函数(2026-10-16 用户定调)
+
+**定义(本卷用词;代码现状与它不一致的地方 = 改造点)**
+
+| 词 | 定义 | 生命周期 | 常驻成本 |
+|---|---|---|---|
+| **会话(session)** | 客户端身份 + 其历史(块链、快照、索引、元数据);跨多轮存在 | 创建 → `close` / LRU 逐出 | 元数据(µs 级)+ **可驱逐资产的引用** |
+| **turn(轮次)** | 一次提交(prefill → decode 到 stop/abort)= 一个请求 | 提交 → `Completed`/`Failed`/`Abort` | — |
+| **活跃 turn** | 已提交且**未终结**的 turn | 同上 | **不可驱逐资源**(见下表) |
+| **活跃会话** | 当前有活跃 turn 的会话 | — | — |
+| **idle 会话** | 曾经存在、但 turn 已终结(历史还在) | — | **只占可驱逐资产**(快照 + 缓存块) |
+
+**资源归属律(改造后的目标形态)**
+
+| 资源 | 归属 | 借 / 还 | 可驱逐 | 现状(证据) |
+|---|---|---|---|---|
+| KV 工作集(在飞读写) | **活跃 turn** | turn 起 / 止 | ❌ | 现:块由 ref-count 持有,基本正确 |
+| KV 历史块(缓存) | 会话(经前缀缓存) | 登记 / 逐出 | ✅ | 现:E2c 前缀缓存 ✓ |
+| **GDN 行(162 MB/行)** | **活跃 turn**(← 改造点) | turn 起:`restore_snap(链尾)` 命中则填充,否则零起;turn 止:`capture_snap(链尾)` → **还格** | ❌ | 现:**会话级**(`session.rs:159-171` 建会话即占,`close` 才还)⇒ idle 会话白占 162MB |
+| GDN 快照 | 会话(身份 = 链尾块 id) | 登记 / LRU | ✅(且**应可下沉 host/盘**) | 现:`snap_max` 槽 LRU 覆盖写(**不够装 idle 会话**) |
+| 会话元数据 | 会话 | 创建 / close | — | ✓ |
+| 图 slab / 激活 / 工作区 | 引擎 | boot | ❌ | ✓ |
+
+**三条由此而来的结论**
+
+1. **`gdn_slots` 的语义要正名**:其真实含义 = **并发 turn 上限**(`max_active_turns`),
+   **不是"能挂多少会话"**;能挂多少会话只受 **host/盘 + 缓存预算**约束(agent 场景:几十~几百)。
+   现状的"会话数超并发上限"报错 = 历史包袱(会话与并发被同一变量表示)。
+2. **分界点公式按活跃度修正**(取代 §2.2 里"Σ_live"的粗口径):
+   ```
+   V_avail(卡)  = V_card − 权重 − 运行底价 − #active_turn · 162MB − 草稿池(开时)
+   H_avail(host)= host 预算 − Σ_idle 会话快照(162MB/会话,可下沉) − 缓存块驻留
+   准入(turn_i) ⇔ Σ_active N_j·k + N_i·k + 缓存驻留 ≤ pool·k
+                 ∧ #active_turn + 1 ≤ gdn_slots
+                 ∧ 激活/图槽 有余
+   ```
+   ⇒ **分界点由三元组决定:(单请求 N, 活跃 turn 数, idle 会话数×快照常驻)**,
+   而不是单看 N —— 这正是"活跃会话个数直接影响布局"的形式化。
+3. **idle 会话 = 快照(可下沉)+ 缓存块(可驱逐)**:这才使"单卡挂 100 个长尾 agent 会话"
+   成为可能(同时只有 2-4 个活跃 turn,吃 KV 的是它们的**在飞工作集**)。
+   先例:llama.cpp 的 **slot(`-np`)= per-task**,任务结束时把状态存 prompt cache
+   (`llama_state_seq_*`)⇒ 与"行=活跃 turn、idle=快照"同构;vLLM 亦是 per-request KV + radix 持 idle 态。
+   我们比二者多的 = 把这三家都**暗含**的活跃度模型**显式化**,并给它三层。
+
+**改造刀(插入 §6 S2 之后)**
+
+| 刀 | 内容 | 验收 |
+|---|---|---|
+| **S2b** | **GDN 行改"活跃 turn 借还"**:turn 起 `restore_snap(链尾)`(命中即跳过重算)/ turn 止 `capture_snap(链尾)` 后还格;`gdn_slots` 语义正名为并发 turn 上限 | ① idle 会话不再占行(以 `gdn_slot_profile` 证明全零行可复用)② 命中路径与未命中路径**逐 token 恒等**(G3)③ 挂 N 个 idle 会话 + M 个活跃 turn 不冲突(并发门重写) |
+
+> 依赖:**S2b 依赖 S2**(状态腿三层化)—— 否则 idle 会话的快照只能挤 `snap_max` 那几个
+> LRU 槽,互相覆盖 ⇒ 还不了格。两刀分先后,不合并。
+
+### 2.4 两个用户旋钮:boot 的"最大并发 turn 数" × per-turn 的"直接显存地板"
+
+用户要能自己定取舍 —— 两个旋钮各管一头,且**语义互为对偶**:
+
+| 旋钮 | 面 | 落点 | 语义 |
+|---|---|---|---|
+| **`max_active_turns`** | **boot**(flavor/`EngineKnobs`) | 现 `gdn_slots`(`engine.rs:65`,缺省 8)⇒ 正名 | **最多几个 turn 同时在飞**。它是**硬天花板**:同时活跃 turn 数 ≤ 此值(每活跃 turn 要一行 GDN + 一份在飞工作集) |
+| **`dense_floor`(直接显存地板)** | **per-turn**(`TurnOpts`,`turn.rs:61`) | 新增字段:字节数 或 `Strict` 枚举 | 本 turn **要求直接驻留显存的最小 KV 量**。它**就是对 KVMem 式损失的耐受度**:`耐受度 = 1 − dense_floor / (N·k)` |
+
+**语义(一条式子说清两者关系)**:
+
+```
+dense_floor = N·k        ⇔  Strict(零耐受)⇒ **禁用选择层(B)**:本 turn 必须全量 dense 驻留
+dense_floor < N·k        ⇔  容忍 B :差额 (N·k − dense_floor) 落三层的 host/盘,由选择层按需物化
+                            它的执行视图预算 W ≈ dense_floor / k(下限即 W 的下限)
+```
+- `dense_floor` 是**下限而非目标**:引擎给得起就给更多(§2.2 的"两可区间":`W < N ≤ N*` 时默认仍走 dense 保真);
+- **`Strict` + 显存不足 = 响亮拒绝**(或按策略排队),**绝不静默降级**成近似 —— 这是"不耐受"的唯一正确行为;
+- 一个**保留额不变量**:turn 一旦被准入,其 `dense_floor` 部分**不可被驱逐**(reserved floor);
+  A 轴的驱逐只能动 ①idle 会话的缓存块/快照 ②活跃 turn 在 `dense_floor` 之上的**弹性余量**。
+  ⇒ 驱逐面 = `缓存 + 弹性余量`,保留面 = `Σ_active dense_floor`。
+
+**准入式(把 §2.3 的式子补全)**:
+
+```
+准入(turn_i, floor_i) ⇔
+  (a) Σ_active floor_j + floor_i + 缓存驻留 + 弹性余量 + 运行底价 ≤ V_card     ← 保留额 + 非保留
+  (b) floor_i = N_i·k(Strict)时:同上即"全量在卡",无弹性项
+  (c) #active_turn + 1 ≤ max_active_turns
+否则:先按 A 轴驱逐(缓存块/快照下沉)→ 仍不足 ⇒ 拒绝 或 排队(策略对象,见 §3.2)
+```
+
+**为什么必须 per-turn 而不是 per-session**:同一个 agent 会话里,不同 turn 的保真需求不同
+(读文件摘要的 turn 可耐受、算数/取值的 turn 不可耐受)⇒ 旋钮挂在 turn 上。
+服务面口径:OpenAI 兼容扩展字段(或 `TurnOpts` 直通),缺省值由 boot 配置给(如 `dense_floor = 64K`),
+**客户端可不指定**(走缺省)、可指定 `Strict`、可指定任意地板值。
+
+**报告面(可观测即可控)**:每 turn 回吐 `dense_floor 请求值 / 实得值 / 实际物化比(materialized vs workspace)`,
+并可入 metrics ⇒ 客户端能看见自己买到的"保真"。
+
+## 3. 目标架构(四子步)
+
+### 3.1 入口与空间(crate 边界:两个独立管理器 + 一层关系)
+
+**分工(裁决②落地)**:存储面按**状态种类**分成两个互不知道对方的管理器,
+再上叠一层**关系层**把二者按"前缀身份"关联起来 —— 关系层只做映射与配对策略,
+不做数据搬运、不持物理缓冲。
+
+```
+        ┌─────────────────────── owl-store(crates/store)────────────────────────┐
+        │  Rel(关系层):(chain_hash ↔ 块边界 ↔ snap_key) 映射 · 配对策略 ·         │
+        │              召回语义(Exact 续跑 / ContextOnly 上下文召回)              │
+        │  ┌──────────────────────────┐   ┌──────────────────────────────┐      │
+        │  │ KvStore(迁入)            │   │ StateStore(新,与 KvStore 平级) │      │
+        │  │  逻辑块账 + 前缀索引      │   │  GDN 快照/格账(行宽视图)        │      │
+        │  │  (BlockManager+PrefixCache)│  │  key = 块边界标识(同源)        │      │
+        │  │  三层:GPU页表/宿主/盘     │   │  三层:GPU 快照槽/宿主/盘        │      │
+        │  └──────────────────────────┘   └──────────────────────────────┘      │
+        │  公共面:宿主层物理(pinned 池)· 预算账(TierLedger)· 策略 trait        │
+        └──────────────────────────────────────────────────────────────────────┘
+                 ▲ 单向依赖(engine → store;store 只依赖 owl-iface + owl-shared)
+        ┌────────┴─────────────────────────────────────────────────────────────┐
+        │  owl-engine:设备叶子所有权(StatePool 的块句柄)+ 时序编排(段边界/图租约)│
+        │  owl-cuda:命令面(htod/dtoh/copy_block_at/alloc_pinned/复合口 —— 已存在)│
+        └──────────────────────────────────────────────────────────────────────┘
+```
+
+**为什么独立而不是合并**(与请求 B/流水线不同,状态种类差异是结构性的):
+
+| 维度 | attention KV(KvStore) | GDN 状态(StateStore) |
+|---|---|---|
+| 几何 | paged 页(32 tok/页) | 每层 4 块(conv×3 + rec),行宽 = elems/slots |
+| 身份 | **内容可哈希**(token 链)⇒ 可跨会话共享 | **不可内容哈希**(依赖 hidden/递推)⇒ 只能按**块边界**标识 |
+| 共享 | ✅ 多会话同块 | ❌ 一格一会话 |
+| 换出单位 | 逻辑块(32 tok) | 快照行(整层行宽) |
+| 复算代价 | 高(prefill) | 极高(要重跑整段递推) |
+| RoPE | K 位置敏感(见 §3.6.3) | 无位置概念 |
+
+⇒ 二者的**命中条件、驱逐序、搬运形状全不同**,合在一个管理器里必然互相污染
+(1.3 痛点②)。独立 + 关系层是唯一能同时保住"块可共享"与"状态不可共享"的形态。
+
+```
+        ┌───────────────────────────── owl-store(crates/store,叶子 crate)─────────────────────────────┐
+        │  对象模型 KvBundle / 身份(链尾块哈希)/ 三层账(TierLedger)/ 换入换出策略 /                │
+        │  宿主层物理(pinned 池、磁盘文件)/ 预算报告 / 目标口径                                 │
+        └──────────────────────────────────────────────────────────────────────────────────────────┘
+                 ▲ 单向依赖(engine → store;store 只依赖 owl-iface 契约面 + owl-shared 工具面)
+        ┌────────┴──────────────────────────────────────────────────────────────────────────────────┐
+        │  owl-engine:设备叶子所有权(StatePool 的块句柄)+ 时序编排(pump/段边界)+ 图租约           │
+        │  owl-cuda:命令面(htod/dtoh/copy_block_at/alloc_pinned/lease 流完成回调 —— 全部已存在)      │
+        └───────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**分工律**(本卷最重要的一条):
+- **store 持「身份 + 账 + 宿主/盘物理」**——纯策略与簿记,可在 CpuFace 下全量单测;
+- **engine 持「设备叶子句柄」与「时序」**——store 要动设备时,由 engine 把
+  `&mut D`(DeviceClient)借给它,**store 自己发命令**,不新增后端原语;
+- 数据面 I/O 写成 crate 级**自由函数**(host↔device 的块搬运),store 本体方法保持自肃
+  (只改自身字段;不摸别人的变量、不做隐藏在方法里的 I/O)—— 与工作区 AGENTS 纪律同源。
+
+### 3.2 对外接口(伪代码契约;输入/输出/失败/生命周期)
+
+```rust
+/// 前缀身份(关系层的键)—— 两个管理器各自认它的一个投影:
+///   KvStore 认 chain_hash(内容);StateStore 认 last_block(块边界)
+pub struct PrefixId { pub chain_hash: u64, pub last_block: u32 }
+
+/// **召回语义**(关系层产出;二者独立 ⇒ 命中可以只有一半)
+pub enum RecallMode {
+    /// 块链 + 状态快照都在 ⇒ **精确续跑**(位置不重排、状态直接还原)
+    Exact,
+    /// 只有块链 ⇒ 作为**注意力上下文**召回(KVMem 路线:复发状态沿原路,
+    /// 不重算历史)—— 语义是"上下文召回"而非"状态续跑",必须显式标注
+    ContextOnly,
+}
+
+pub struct StoreConfig {
+    pub host_budget_bytes: usize,   // RAM 上限(0 = 关闭本层)——REQ C4「预算显式配置」
+    pub disk_dir: Option<PathBuf>,  // 二期;None = 无磁盘层
+    pub policy: EvictPolicy,        // LRU / 命中优先(策略对象,非硬编码)
+}
+
+/// 关系层(唯一对外门面;两个管理器在它后面)
+impl Rel {
+    /// 启动装配:三层预算分解 + 两管理器就绪;分解失败 = **拒绝启动**(A5.1)
+    pub fn open(cfg: StoreConfig, budget: &BudgetInputs) -> Result<Rel, StoreError>;
+
+    /// 命中查询(**纯 host,零设备副作用、零分配**)——L1 第一步
+    /// 回**分层命中面**:块链在哪层、快照在不在、能到什么语义(Exact/ContextOnly)
+    pub fn probe(&self, id: PrefixId) -> RecallHit;
+
+    /// 换入(两腿按需,各自独立;**失败不留半态** —— 回滚已做的那条腿)
+    pub fn admit<'a>(&'a mut self, face: &mut impl DeviceClient, hit: &RecallHit)
+        -> Result<AdmitLease<'a>, StoreError>;
+
+    /// turn 收口登记(L3):两腿各自登记(块链进 KvStore;快照进 StateStore)
+    pub fn register(&mut self, id: PrefixId, blocks: &[BlockId], snap: Option<SnapRef>) -> Result<(), StoreError>;
+
+    /// 压力换出(L2):两管理器各自出候选,关系层合并成一张**统一换出单**
+    /// (排序 = 策略;执行 = engine 在段边界做)
+    pub fn plan_evict(&mut self, need: EvictNeed, protect: &[PrefixId]) -> EvictPlan;
+
+    /// 预算/命中报告:三层 × 两管理器 + 关系层口径(Exact/ContextOnly 命中数)
+    pub fn report(&self) -> StoreReport;
+}
+
+/// 设备侧叶子的**唯一入口**:engine 把叶子借给 store,store 只经此登记
+/// (store 不持 Bytes 的所有权,只记账 —— 所有权留在 engine,避免双主人)
+pub trait KvLeaves {
+    fn blocks_of(&self, chain: &[BlockId]) -> Vec<LeafRef>; // 逻辑块 → 设备叶子
+    fn snap_rows_of(&self, snap: SnapRef) -> Vec<LeafRef>;
+}
+```
+
+**关系层的最小职责(避免长成第二个上帝对象)**:
+① 映射(`PrefixId` ↔ 两条腿的键);② 语义判定(`Exact` / `ContextOnly`);
+③ 换出单合并(把两腿候选按统一策略排序);④ 报告口径。**不含**任何搬运/分配/驱逐实现。
+
+**不变量(写在类型上,不靠注释)**:
+- `admit` 的租约未 drop 前,该 bundle 的宿主副本**不可被覆写**(宿主层缓冲 = 带租约的池);
+- `plan_evict` 绝不返回 `protect` 里的 bundle,也绝不拆散一个 bundle(§4 裁决②);
+- `probe` 无副作用(可以在任意时刻调,包括图捕获期),`admit` 只能在**段边界**调。
+
+### 3.3 调用链(三条端到端链路)
+
+```
+L1 重灌命中
+  session.submit(prompt) → 块链哈希 → Rel::probe
+    ├ 未命中 → 原路(现行为,零变化)
+    └ 命中(host 层) → [段边界] Rel::admit
+         ├ 自由显存不足 → Rel::plan_evict → engine 执行换出(段边界)→ 再 admit
+         ├ 回灌:attention 块链逐块 H2D(复合口;宿主 lease 由流完成回调还池)
+         ├ 回灌:GDN 快照 D2D(快照槽 → 会话格;与块链**同一批**)
+         └ prefill 只算未命中尾巴 → 首 token
+L2 压力换出
+  KvStore 自由度不足(原 BlockManager.ensure_for_len 语义)→ Rel::plan_evict(victim 序;两腿候选合并)
+    → [段边界] 逐 victim:设备块 → 宿主缓冲(D2H/复合)→ 释放设备块(BlockManager.decref)
+L3 turn 收口登记
+  turn 完成 → capture_snap(GDN 快照槽 key=链尾块 id)→ Rel::register(块链 + snap)
+L4 启动预算
+  engine.run → Rel::open(BudgetInputs{ 权重/池/图/激活/通信/host/盘 })→ 越界拒绝启动
+```
+
+### 3.4 依赖与驱动时序(为什么必须"只在段边界")
+
+- **硬约束**:图捕获期禁 `htod/dtoh`(现有 A2.2 同源约束;捕获窗内只允许
+  D2D/核);所以换入换出**只能**发生在:①piecewise 段的接缝 ②pump 间隙
+  (`Idle`/turn 边界)③prefill 分块之间(**不是** decode 步内)。
+- **搬运的设备端序**:宿主 lease 复用靠 server 侧"流完成回调才还池";与
+  计算流的序走复合口(写等读/读等写),沿用 `三流事件序` 卷的既有机制,**不新造**。
+- **单向依赖**:`engine → store → (iface, shared)`,禁止反向;
+  store 不认识 `GraphPlan`/`StatePool`,只认识 `DeviceClient` 与块 id。
+
+### 3.5 空间预算(A5.1/A5.2 形态)
+
+```
+显存 B = 权重 + KV 池 + 草稿池 + GDN 状态 + 图 slab + 激活峰值 + 通信缓冲 + 底价 + 余量   ← 现有,不变
+host  H = pinned 池上限(可配) + 索引/账目开销(µs 级)                              ← 本卷新增,显式
+磁盘  D = 缓存目录配额(可配;二期)                                                  ← 本卷预留
+```
+- 每条项**没有实测数字就拒绝启动**(A5.1 原话);
+- host/盘占用入 store 自己的 `TierLedger`(可与后端 Governor 对账),`report()` 可 dump;
+- 默认:`host_budget_bytes = 0`(关层)——满足 C4「默认关闭三级缓存」。
+
+### 3.6 与 KVMem(arXiv:2609.04852)的对齐与差异
+
+**3.6.1 直接采纳的四机制**(原样,勿自创):
+
+| 机制 | 内容 | 对我们的落点 |
+|---|---|---|
+| **块级(非 token 级)检索** | 论文定谳:H2O/StreamingLLM 的 token 级打分在百万 token 持久工作区里**索引容量与查询延迟都不可行**;改为逻辑块级 | 我们本来就只到"页"粒度,天然适配 |
+| **Mean-K 索引** | 每 (层, KV 头, 块) 一个**去 RoPE 的位置无关**平均 K 向量;查询同样去 RoPE 后打分,跨块**全局 softmax** 归一,再对层/头取均值 ⇒ 块相关度 \(R_b\) | 索引入 host(我们 host 层已有位置);打分在 GPU 分片流式(KVMem 的 GPU-tiled scoring) |
+| **两条视图分离** | *repository view*(每块的有效副本在哪层)× *execution view*(本步选中的块按时间序进紧凑窗口);用**页表别名**而非密拷贝 | 我们**已有页表**(`xqa_pt_of` / 块表)⇒ 这条几乎是白送 |
+| **三层策略** | ①proactive stage-out(与 chunked prefill 重叠)②retrieval-aware 分层(host 准入看"近期+累计检索频次",非纯 LRU)③打包+流水再物化 | 我们的 prefill 分块/pump 间隙正是天然的 stage-out 窗口 |
+
+**3.6.2 粒度裁决(原文依据)**:论文实测"top-8 块覆盖 66.5% 历史注意力、
+top-16 覆盖 77%",并明确 *"remains efficient at fine granularity. Our implementation
+defaults to **32-token blocks** with Mean-K"*;块越小 = 均值保真损失越小 + 召回分辨率越高,
+代价是索引与块管理开销 ↑。
+
+⇒ **本卷定案:逻辑块 = 32 token**(检索/选择/搬运单位),**与物理页一一对齐**,
+且**天然等于我们 XQA 的 `tokensPerPage=32`**(`docs/bench` 的 xqa 资产自描述行)
+—— 不需要新页几何、不改任何 attention 内核契约。
+
+**3.6.3 位置一致性:论文的 re-RoPE 机器我们可能不需要**(待实测裁决,见 §4-③)
+
+论文的难点在于:被召回的块要**重排进紧凑窗口 ⇒ 位置变了 ⇒ RoPE 失效**,
+故需"raw K 为真源 + 入块重打 RoPE + 常驻块有界 delta re-RoPE(超限重建)"。
+我们的 paged attention 走**页表 + 显式位置向量**(位置由调用方按 token 给,
+XQA 路径 = `xqa_seq`/页表),因此有一条更便宜的路:
+
+- **方案 A(原位置稀疏召回)**:召回块**保留原始逻辑位置**(页表里散放,空洞不参与
+  注意力;内核按页表遍历 ⇒ 计算量 ∝ 命中块数,不 ∝ 逻辑跨度)⇒ **零 re-RoPE、零数值误差**;
+  代价 = 逻辑位置空间不压缩(若位置空间等于原生窗口上限,则召回量受 262k 位置空间约束)。
+- **方案 B(KVMem 紧凑窗口)**:位置空间可无限扩张(地址空间 = 存储层),但需整套
+  raw-K/re-RoPE 机器 + 数值误差界。
+
+⇒ **建议**:一期走 **A**(与现有页表/前缀缓存位置语义一致,复杂度最低),
+二期若要"工作区 > 原生窗口"(1M 级)再上 B —— 这条**请在 §4 拍**(A/B 或 A→B)。
+
+**3.6.4 复发状态(GDN):论文不虚拟化 —— 这正是我们的增量所在**
+
+论文原话:*"It manages the growing KV state of standard RoPE attention layers, while
+**recurrent model state continues through the original execution path**."*
+⇒ 它只虚拟化 attention KV;混合模型的递推状态沿用原路(即"上下文召回"而非"状态续跑")。
+我们的 27B 是 GDN+attention 混合、且**已有** GDN 快照池 ⇒ 我们比论文多一条腿:
+- 用户裁决②给出形态:**两腿独立管理 + 关系层关联**;
+- 关系层据此产出 `RecallMode::{Exact, ContextOnly}`:有快照 = 精确续跑(我们的优势),
+  无快照 = 论文式上下文召回(退化但可用)。**这一对语义是本卷相对论文的主要增量**。
+
+**3.6.5 我们独有、论文没有的约束**(设计必须额外照顾):
+
+1. **图捕获**:我们的 decode 是整图捕获 + piecewise 分段;论文无图。⇒ 搬运**只能**在段边界
+   (捕获窗禁 htod/dtoh),这是 §3.4 的硬约束来源;
+2. **投机解码**(MTP/DFlash2 + spec-aware graph):召回会改变 verify/propose 的形状与
+   草稿 KV,一期把草稿池排除(裁决④);
+3. **量化栈**:marlin W4A16/AWQ + fp8 KV(KVMem 自称不支持 FP8 KV)⇒ 召回路径要
+   同时覆盖 fp16/fp8 两种页格式(页 dtype 是 store 的一个轴);
+4. **前缀缓存已存在**(E2c 块级):我们不从零做"共享",而是把它的命中面**从显存一层扩到三层**;
+5. **宿主层先例已就绪**:装载域的 pinned 池/租约/复合口/预算两栏/块账 —— 直接搬(§0 相邻卷)。
+
+## 4. 裁决台账(录结果;未定项写明待什么)
+
+| # | 裁决 | 状态 | 结果/依据 |
+|---|---|---|---|
+| ① | BlockManager/PrefixCache 迁入 store | ✅ **定:迁入** | 用户 2026-10-16;host 账集中在 `KvStore`,engine 只留设备叶子 |
+| ② | attention × GDN 的耦合方式 | ✅ **定:独立管理 + 关系层** | 用户裁决;落点见 §3.1 分工 + §3.2 `Rel` 最小职责;语义面 = `RecallMode` |
+| ③ | 位置一致性方案(A 原位置稀疏召回 / B 紧凑窗口 + re-RoPE) | ⏳ **待实测**(A 为首发建议,见 §3.6.3) | 判据:一期能否在"位置空间 = 262k"内满足门 G1;若必须 >原生窗口 ⇒ 上 B |
+| ③' | 换出/召回**粒度** | ✅ **定:逻辑块 = 32 token = 物理页** | 论文缺省 32-token;与我们 XQA `tokensPerPage=32` 天然对齐(§3.6.2) |
+| ④ | 草稿池入账 | ✅ **定:推后**(S5) | 用户裁决;牵扯投机路径,单独立刀 |
+| ⑤ | 磁盘层格式 | ⏳ 二次裁决(S6 前) | 是否与 llama.cpp checkpoint 形态对齐(跨引擎可读) |
+| ⑥ | 目标口径 | ✅ **定:单卡 262k 为目标 ⇒ B(选择层)在关键路径;A 为容量底座**(2026-10-16 用户定调) | 依据 = §2.1 算术;若将来把 TP 立项并接受"262k 靠双卡 dense",A 单独即可达标 |
+| ⑦ | 位置一致性 A/B | ⏳ 待实测(§3.6.3) | 一期 A(原位置稀疏召回);若目标改 1M 工作区再上 B |
+| ⑩ | **施工序** | ✅ **定:A 轴(vLLM 式)先行,B 轴(KVMem 选择层)后加**(用户 2026-10-16) | "先把 vLLM 那一套实现出来,再在这个上面加"。A 轴 = 身份命中(块哈希/内容链)+ LRU/ARC + 三层搬运;**B 轴不改 A 的接口**,只在其上加选择层 |
+| ⑧ | **boot 旋钮:最大并发 turn 数** | ✅ **定**(用户 2026-10-16) | 落 `EngineKnobs`(现 `gdn_slots` 正名 `max_active_turns`);硬天花板 |
+| ⑨ | **per-turn 旋钮:直接显存地板 = 损失耐受度** | ✅ **定**(用户 2026-10-16) | 落 `TurnOpts`;`Strict` = 禁 B + 不足即拒/排队;**保留额不可驱逐** |
+| **⑪** | **换入换出的执行分工** | ✅ **定**(用户 2026-10-16) | **server 执行**(地址/DMA/一次 ack)· **engine 决策 + 调用**(何时换/哪条链/保护面)· **store 持实现**(换什么/搬到哪层/账怎么走/宿主缓冲/策略) |
+| **⑫** | **指针 / ID 律** | ✅ **定**(用户 2026-10-16) | **裸指针只有 server 持有**;models / store / engine 只持 **ID + 元数据**;store 必须区分**显存 / 内存 / 磁盘**三类载体(`Carrier`) |
+
+## 5. 验收门
+
+- **G1 262k 可服务**:27B fp8 + 262k 单请求 READY(现墙 128k);重灌场景
+  TTFT 相对现状改善可测(口径:现有 `apps/server/tests/prefix_reuse_probe.py` + std 矩阵);
+- **G2 账目封闭**:开启后**设备峰值 ≤ 关闭时**;`host_budget_bytes` 越界 = 响亮拒;
+  `StoreReport` 三项(设备/host/盘)可与 nvidia-smi/`/debug/blocks` 对账;
+- **G3 正确性恒等(分档,与 per-turn 旋钮对齐)**:
+  ① **Strict turn**:命中/未命中两条链路**逐 token 恒等**(现有恒等门范式;spec 臂按纪律用 spec-off);
+  ② **地板 < N·k 的 turn**:不与 dense 逐位比(定义上允许近似),改用
+  **物化比 + top-k 覆盖率** 与**任务级**判据(G5③),并回吐实得地板(§2.4 报告面);
+- **G2b 保留额门**:活跃 turn 的 `dense_floor` 在任何驱逐压力下**不被换出**(工具:
+  `/debug/blocks` + 逐 turn 实得地板断言);
+- **G4 稳定性**:长跑零崩、零 Xid;命中/换出/回灌/命中延迟入 metrics(默认关,开 <2% 开销);
+- **G5 对照靶**(KVMem 实测,供我们定标;同机不同卡,仅作量级参照):
+  ① 工作区/执行视图比 ≥ 4×(论文:1M 工作区 / 64K 视图 / 24GB 卡);
+  ② 召回延迟亚秒级(论文 1M 工作区 pre-answer 1.81s;对照 Compact+RAG 106s);
+  ③ 命中块覆盖率量级:top-8 块 ≈ 66% 历史注意力(top-16 ≈ 77%)——用于校我们的
+  召回预算与选择策略是否合理;
+  ④ 单会话生成 ~50 tok/s(论文档位;我们的 spec/graph 栈只应更快)。
+
+## 6. 刀序(两轴:底座 / A 容量 / B 选择;每刀独立可验、可回滚)
+
+**底座(两范式共用,先做)**
+| 刀 | 内容 | 验收 |
+|---|---|---|
+| **S0** | 2G 待审计清账(显存归因六件套;固定面 17.9G vs 账面 13.7G) | 固定面逐项有实测数字(可能直接换数万 token 池) |
+| **S1** | 立 `crates/store`:`Rel` + `KvStore` + `StateStore` 骨架 + 三层账/预算分解 + 策略 trait + `arch.md` + 注册 workspace(纯 host,CpuFace 单测) | 预算分解、`probe` 语义、换出单合并 —— 单测全绿;零设备依赖 |
+| **S1b** | **宿主 pinned 层搬运闭环**(设备⇄host,单块往返;复用装载域 pinned 池/复合口) | 往返后设备内容逐块回读一致;host 预算可断言 |
+| **S2** | **GDN 状态腿**:状态三层化 + 关系层 `RecallMode::Exact` 全链(162MB/会话 的账立起来) | 热命中 GDN **零重算**(`gdn_slot_fingerprint` 为证);恒等门 G3 |
+
+**A 轴(容量):跨会话/前缀复用/抢占**
+| 刀 | 内容 | 验收 |
+|---|---|---|
+| **S3** | 迁入 `BlockManager`/`PrefixCache`(裁决①)+ LRU/ARC 策略对象 + 压力换出接真实路径 | 4096 会话压力不报错;命中率/换出入 metrics;TTFT(重复前缀)改善可测 |
+
+**B 轴(选择):单请求超窗——262k 门的唯一路径**
+| 刀 | 内容 | 验收 |
+|---|---|---|
+| **S4b-1** | Mean-K 索引构建(prefill 期顺手采;去 RoPE)+ host 常驻 + GPU 分片打分内核 | 索引开销/显存实测;块相关度与"全量注意力 top-k"覆盖率对齐(G5③) |
+| **S4b-2** | 每步/每步点选块 + **页表别名**组执行视图(位置方案按 ⑥/⑦ 裁决) | **G1:单卡 262k 可服务**,恒等/质量门 G3 通过(近似路径需与 dense 对照) |
+| **S5** | 草稿池入账(裁决④)+ 视觉塔图像嵌入备忘录(§7-1) | 有 draft 档位池按需;同图重放塔零重跑 |
+| **S6** | 磁盘层(冷工作区/跨进程持久) | 冷重灌 TTFT 改善可测;原子写/崩溃恢复 |
+
+> 顺序纪律:**底座 → A → B** 是依赖序(搬运栈是共同前提),但**门不互替**:
+> A 的完成**不**兑现 262k(§2.1 算术);262k 只在 B 落刀后成立。
+
+## 7. 挂账/未决(与本卷相邻,勿混刀)
+
+1. **视觉塔**:图像 KV 已在文本池(设计正确),但①图像前向**无备忘录**(同图重放要
+   重跑塔)②`apps/server` 的 `image_url` 尚未接线(M5 剩件)③视频/多图 token 类型
+   (`token_types`)的缓存键如何进身份 —— S5 一起做;
+2. **TP 下的 store**:每 rank 一份还是共享宿主层?TP 立项时定(A2.6 单进程多实例 ⇒
+   倾向"每实例一份账,宿主层按 rank 分片");
+3. **KV 量化新档**(REQ-CTX-03:int8/fp8/q4-turbo)与 store 的 dtype 轴对齐 —— 另案;
+4. **磁盘格式**:是否与 llama.cpp 的 checkpoint 形态对齐(跨引擎可读)—— 二期再议;
+5. **草稿池的前缀语义**:MTP 不可 token 哈希(依赖 hidden)⇒ 它的"命中"需要别的身份
+   (e.g. hidden 指纹);S5 立项时单独设计。
+
+## 8. 施工单(S0 → S2b;每步 = 交付物 + 门 + 证据)
+
+> 纪律:每步独立可验、可回滚;**不合并刀**;门不过不进下一步。
+
+### S0 · 显存账清账(测量,无代码改动)
+- **交付**:固定面分解表(权重 / 图 slab / 激活峰值 / 工作区 / 上下文 / 杂项)+ **2G 差额定位**
+  (`docs/` 一张表 + 本卷 §2.2 常数更新:`B_weights`、`O_runtime`、`P_draft` 各是多少实测值)。
+- **门**:A5.1 —— 每一项都有实测数字;**没有数字的项禁止进预算式**。
+- **工具**:显存归因六件套(已合入 main:`a374343`)、`/debug/blocks`、`vram 治理` 日志、`GraphPlan::slab_bytes()`。
+
+### S1 · 立 crate(纯 host:账 + 策略)—— ✅ **已落(2026-10-16)**
+- **交付**:`crates/store`(`owl-store`)+ 注册 workspace + `arch.md`;模块面:
+  `id`(身份)/ `tier`(三层账)/ `budget`(预算分解 + 准入判据 + `TurnFloor`)/ `policy`(驱逐与准入策略对象)/
+  `kv`(块账 + 前缀索引)/ `state`(GDN 快照与行账)/ `rel`(关系层门面:probe/register/plan_evict/report)。
+- **门**:①`cargo test -p owl-store` 全绿;②预算分解与准入判据、`Strict` 拒服务、
+  保留额不可驱逐、换出单合并 —— 各有单测;③零 `owl-cuda`/`owl-engine` 依赖(单向律)。
+- **实测**:9 文件 / ~1300 行;**26 单测**;依赖面 = `thiserror`(+测试面 `owl-cpu`);
+  写测试当场抓出三个真缺陷(共享块会被误逐、Strict 拒绝文案漏标、候选按链去重会双算)。
+
+### S1b · 宿主层与搬运闭环(设备 ⇄ host)—— ✅ **已落(2026-10-16)**
+- **交付**:数据面自由函数(host↔device 块搬运)+ 宿主缓冲池租约(复用装载域 pinned 池与复合口);
+  `Rel::admit/evict` 接上真实搬运;注入式失败路径(部分失败 = **整单回滚**)。
+- **门**(全过,9 单测):①**真 face 往返逐字节一致**(`CpuFace`;门内含"清零后回灌复原"
+  与"图样校验"两步);②宿主层预算越界**响亮拒**(含关层 `host_bytes=0`);③长度不符在触设备前拒;
+  ④设备侧失败原样上抛;⑤账目迁移平衡(Gpu/KvBlock ⇄ Host/KvBlock)。
+- **形态定案(vLLM 同款)**:宿主**内容不 pin**(pageable `Vec<u8>`;RAM 可被内核回收),
+  pin 只用于搬运途中的**一次性暂存租约**(`alloc_pinned` → 拷贝 → `upload_pinned`,
+  租约所有权移入 server,流完成回调归还其池);`free_cap` 上限保证驱逐后 RAM 真释放。
+- **⚠️ 实测教训(入坑册 §42)**:块字节**不能**用 `Bytes` 自述长度(`len × dtype`)——
+  CPU 面值块恒 F32、`htod` 回 `len = 0` ⇒ 各 face 元素口径不同。搬运口一律**显式收
+  `len_bytes`**,真源 = store 的块几何常量(`KvStore::block_bytes()`)。
+
+### S2 · GDN 状态腿三层化(快照可下沉)+ 关系层 `Exact` 全链
+- **门**:①热命中路径 GDN **零重算**(`gdn_slot_fingerprint` 为证);②G3①(Strict 逐 token 恒等);
+  ③idle 快照的 host/盘往返往返一致。
+
+### S2b · GDN 行 = 活跃 turn 借还 + `max_active_turns` 正名
+- **交付**:格号借还点从会话生命周期挪到 turn 生命周期;`EngineKnobs` 字段正名;
+  并发门按 `max_active_turns` 重写(挂 N idle 会话 + M 活跃 turn)。
+- **门**:①idle 会话不占行(全零行可复用,`gdn_slot_profile` 证);②命中/未命中**逐 token 恒等**;
+  ③N=100 idle + M=`max_active_turns` 活跃不冲突。
+
+### 后续(**A 轴先行** —— 裁决⑩;见 §6 两轴表)
+| 序 | 刀 | 内容 | 门 |
+|---|---|---|---|
+| 1 | **S2** | GDN 状态腿三层化(快照可下沉)+ 关系层 `Exact` 全链 | 热命中 GDN 零重算 + G3① 逐 token 恒等 |
+| 2 | **S2b** | GDN 行 = 活跃 turn 借还 + `gdn_slots` 正名 `max_active_turns` | 挂 N idle + M 活跃不冲突;idle 不占行 |
+| 3 | **S3** | **迁入 BlockManager/PrefixCache**(裁决①)+ LRU/ARC 策略 + 压力换出接真实路径 | 4096 会话压力不报错;前缀重复 TTFT 改善;命中/换出入 metrics |
+| 4 | **S3b** | per-turn `dense_floor` 接 `TurnOpts` + `AdmissionPolicy` 落地 | G2b 保留额门;实得地板回吐 |
+| 5 | **S4b-1/2** | **B 轴(后加)**:Mean-K 索引 + 每步选块 + 页表别名 | **单卡 262k 门**;G3② 物化比/覆盖率 |
+| 6 | **S5/S6** | 草稿池/视觉备忘录;磁盘层 | 见 §6 |
+
+---
+
+## 9. S3 首刀实录(身份迁移:物理块号 → 内容身份)· 2026-10-16
+
+> 落点:`crates/store`(**未接线到 engine**;engine 接线是 S3-2)。本节的裁决面
+> 只补 §4 台账未覆盖的一处:**"身份用什么"** —— 它是 S3 能不能做 host 卸载的前提。
+
+### 9.1 裁决补记:store 里"是谁"一律用**内容身份**(S3 定案)
+
+**物理槽号不得进入身份。** 槽是可回收资源:`decref` 归零 → 回自由队列 →
+下一次 `acquire` 从**队首**弹出 = 立刻复用(`blocks.rs` 现役行为)。任何以槽号为键的
+账(host 副本键、快照键)在槽复用后都会**指向别人的内容**。
+
+- KV 腿:块身份 = **逐块父链内容哈希**(`ChainHash`;含父链 ⇒ 字面相同但历史不同
+  的两段 token 不是同一块)
+- 状态腿:快照键 = **边界块的内容哈希**(`SnapKey(ChainHash)`)——不是"快照的内容哈希"
+  (递推态不可内容寻址),而是"它对应哪一段内容"的身份(`arch.md` 律②)
+- 宿主层键 = 同一内容身份(`HostTier` 的键从 `BlockId` 改为 `ChainHash`)
+
+**引擎侧现存隐患(本刀发现,尚未修;归 S3-2 或独立微刀)**:GDN 快照键在 engine 里 =
+`block_table[边界]`(**物理块号**,`exec/spec.rs::capture_gdn_snap`),而快照池
+(`state.rs::snaps`)**不随前缀缓存驱逐失效** ⇒ 场景:
+①会话 A 的快照 key = 物理块号 `k`;②A 的块被缓存 LRU 逐出 ⇒ A 表释放后引用归零 ⇒
+槽 `k` 回池;③新会话 B 的链拿到槽 `k` 且**边界恰好落在它上面** ⇒
+`has_snap(k)` 为真(`scheduler.rs:114`)⇒ `restore_snap` 把 **A 的 GDN 态**灌进 B
+= **静默错值**(不报错、不崩,只错)。
+修法:**快照键全部走内容身份**,~70 行,四处:
+
+| # | 落点 | 改动 |
+|---|---|---|
+| ① | `prefix_cache.rs` | `hash_block_chain` 提为模块级自由函数(**身份链唯一产地**:前缀缓存建树 / 游标 / 跨会话匹配同一份)+ 新增 **`ChainCursor`**(会话级懒惰推进:只喂新增整块 ⇒ 全 turn O(n),避免每边界从头算的 O(n²)) |
+| ② | `session.rs` | `AgentSession.chain: ChainCursor`(生命周期随链:`reset()` 归零;前缀命中由调度层 `seed(m, hashes[m-1])` 播种) |
+| ③ | `blocks.rs` / `scheduler.rs` | `match_prefix` 连**内容身份链**一起回;`has_snap(hashes[m-1])` 判定 + `restore_key = hashes[m-1]`(不再碰物理块号) |
+| ④ | `state.rs` / `exec/spec.rs` | 快照键类型 `u32 → u64`;`capture_gdn_snap` 改由游标出键(边界 token 段 = `prompt_ids ++ out`;`fed` 单调不减是前提,已核 spec 回滚只前进不后退);同一边界重复调用 = 幂等跳过 |
+
+**✅ 已修(2026-10-16 同日微刀,用户裁决「先修隐患」)**:engine 侧 7 文件 / +246 行;
+门 = ①engine lib 测试 44/44(新增 3 条:`chain_cursor_matches_cache_hash_chain`
+游标 ≡ 缓存哈希链、`recycled_slots_do_not_forge_snapshot_keys` 槽复用不撞键、
+cursor 回退/段不足响亮拒)②clippy 改动面零告警 ③store 46/46 未受影响。
+**遗留**:G3① 的 GPU 端到端(`gpu_prefix_cache_hit` 等)待设备空闲时跑
+(本机 `OWL_TEST_DEVICE` 未设、GPU2 正被模型服务占用)。
+
+### 9.2 S3 施工分解(每刀独立可验;顺序 = 依赖序)
+
+| 刀 | 内容 | 状态 / 门 |
+|---|---|---|
+| **S3-1** | **`KvStore` 升级**:`kv/slot.rs`(槽池:分配/引用/回收)+ `kv/tree.rs`(内容身份前缀树:匹配/登记/叶 LRU 驱逐)+ `kv/mod.rs`(引擎级 API:`ensure_for_len`/`match_prefix`/`register_chain`/`release_table`/`unbind`/`rebind`);`Rel` 改门面(跨腿台账在门面维护);`id.rs` 去物理 `BlockId` | ✅ **已落**;46/46 单测;与 `BlockManager`+`PrefixCache` **行为逐条对齐**(FIFO 复用、叶 LRU + 惰性校验、断链即停、压力驱逐 ≤4 轮、失败事务性) |
+| **S3-2** | **engine 接线**:`SessionBank` 的 `blocks_m`/`blocks_mtp` 换成 `owl-store` 的块腿(engine 只留 `StatePool` 设备叶子);删 `blocks.rs`/`prefix_cache.rs` 双份 | ✅ **已落**(2026-10-16,见 §9.5);门 = 行为等价(engine lib 36/36 + store 50/50;`prefix_reuse_probe` 待 GPU 空闲补跑) |
+| **S3-3** | **host 换出接真实路径**(形态见 §10):立 `BlockLeg`(账 + 宿主物理 + 搬运口)+ **布局注册制**(id 级,`epoch` 校验)+ 新批搬运面(`DtohBatch`/`HtodBatch`);压力先下沉、命中面 `slot = None` 在段边界回灌 | 待做;门 = 往返逐字节一致(真 face)+ 池压力下命中率/TTFT 改善可测;**迁移本身零行为变化**(`host_bytes = 0` 默认关层) |
+| **S3-4** | **策略对象 + 报告**:ARC/chain-LRU 并列实现(策略是对象,不是分支);命中/换出入 metrics;`S3b` per-turn `dense_floor` 接 `TurnOpts` | 待做;门 = G2b 保留额门 + 实得地板回吐 |
+
+### 9.3 S3-1 的形态要点(给接线刀的接口约定)
+
+- **分配**:`ensure_for_len(table, target_len)` —— 与 engine 现名同,语义同(只增、幂等、
+  事务性、池不足先逐缓存叶);返回被逐条目(内容身份, 槽 `Option`),门面据此维护台账。
+- **命中**:`match_prefix(tokens) -> PrefixMatch { matched_blocks, blocks: Vec<MatchedBlock>, tail }`;
+  `MatchedBlock { chain, slot: Option<u32> }` —— **`slot = None` 就是"内容在 host 层,
+  该回灌"的显式信号**(本刀只立形态,S3-3 接搬运)。
+- **登记**:`register_chain(tokens, table)` —— 引用配对(缓存持一份绑定引用)在**方法内自洽**;
+  engine 现版"调用方手工 `for id in inserted { incref }`"的耦合被消掉。
+- **下沉/回灌**:`unbind`(引用必须为 1,活跃面**响亮拒** —— 律④)/ `rebind(chain, slot)`
+  (回灌绑**新槽**;旧槽早被复用 —— 这正是身份必须内容化的现场证明)。
+- **台账面**:`TierLedger` 的 `Gpu/Host · KvBlock` 记**store 管的缓存面**
+  (`kv.stats().gpu_bytes` 同口径);`Admission` 的保留/弹性面不在 ledger 里(§2.4 面)。
+
+### 9.4 与 S2 的关系(刀序说明)
+
+S3 与 S2 是**两条腿**(裁决②),S3 不依赖 S2;但**跨会话精确复用**(`RecallMode::Exact`)
+需要 S2(快照可下沉)才有意义 —— 否则 host 里的 KV 链命中只能落到 `ContextOnly`
+(复发态沿原路,不能跳过)。⇒ §8"后续"表的 S2 → S3 顺序**保留为推荐**(收益完整度),
+而 S3-1/S3-2 可先行(A 轴容量底座,裁决⑩)。
+
+### 9.5 S3-2 接线实录(engine 块腿迁入 store)· 2026-10-16
+
+**改了什么**
+
+| 面 | 变更 |
+|---|---|
+| 账房 | `SessionBank.blocks_m` / `blocks_mtp`:`engine::blocks::BlockManager` → **`owl_store::KvStore`**(槽池 + 内容身份前缀树);`engine/src/blocks.rs`、`engine/src/prefix_cache.rs` **整文件删除**(两本账的合并语义已在 S3-1 迁入 store) |
+| 几何 | 新增 `session::BankPlan { nb, page, block_bytes, paged, mtp, prefix_cache }`(参数对象,替代 6 个裸参);`block_bytes` 由 `StatePool::block_bytes()` 出(**元素口径真源** —— 坑册 §42:fp8 池 U32 承载 ⇒ 元素数 ÷4、元素宽 ×4) |
+| 复合口 | 块腿复合操作做成**自由函数**(`session::ensure_chain` / `session::match_prefix_chain`):借用只落 `&mut KvStore` 一个字段,与"调用点仍持 `&mut AgentSession`"的借用形状对齐(方法口会整借 bank 而冲突) |
+| 身份 | 快照键类型 `u64` → **`owl_store::SnapKey`**;链游标 → `owl_store::ChainCursor`(哈希原语唯一产地 = `store::kv::chain`)⇒ **物理槽号在类型上进不了快照键** |
+| 未接线面 | 命中/驱逐出现 `slot = None`(宿主承载)= **响亮拒**(`match_prefix_chain` / `ensure_chain` 内),不静默少用几块/丢账 —— 这两处就是 S3-3 的接线点 |
+
+**门**(本机可跑部分全绿):`cargo test -p owl-engine --lib` **36/36**(删掉的 9 条 = 原 `blocks`/`prefix_cache` 单测,语义已在 store 侧以同名用例接管);
+`cargo test -p owl-store` **50/50**;engine 改动面 clippy 零告警。
+**待补**:`prefix_reuse_probe`(需 GPU 空闲;GPU2 正被模型服务占用)。
+
+**挂账(故意不做,别混刀)**
+
+1. **`Rel` 门面未接线**:engine 现在**直接用 `KvStore`**。走 `Rel` 需要 `BudgetInputs` 全套实测
+   (权重/运行底价/草稿池/每 token KV 字节)——那是 **S0 清账**的交付;S0 未做时 `Rel::open`
+   会(正确地)拒绝启动。⇒ **S3-3(host 换出)之前先做 S0 的那几个数字**,或让 Rel 支持
+   "账面子集 + 明确标注未实测项"的降级装配(后者要在卷内再拍一次)。
+2. MTP 链仍是"无前缀缓存"的独立页池(S5 再议)。
+
+### 9.6 S0 实测(0.8B @ RTX 3080,2026-10-16)—— `Rel::open` 的输入齐了
+
+**探针**(engine e2e 场景,按需开):`gpu_08b_budget_probe`
+```bash
+CUDA_VISIBLE_DEVICES=GPU-<3080> OWL_TEST_DEVICE=0 OWL_BUDGET_PROBE=1 OWL_E2E_ONLY=budget_probe \
+  cargo test -p owl-engine --features e2e --test engine_e2e -- --test-threads=1 --nocapture
+```
+口径 = 真分配账(`vram::live` 五相采样 + `StatePool` 三个**真源口**:
+`block_bytes()` / `gdn_row_bytes()` / `snapshot_pool_bytes()` / `draft_pool_bytes()`,
+2026-10-16 新立),**不按公式估**。
+
+| 项 | 实测值 | 说明 |
+|---|---|---|
+| `v_card_bytes` | **20,818,165,760 B**(≈19.39 GiB) | 开卡后 `cuMemGetInfo` free(§2.2 口径);total = 21,082,537,984 |
+| `weights_bytes` | **1,538,340,480 B**(1467 MiB) | live(装载后) − live(Engine::new) |
+| `runtime_floor_bytes` | **5,835,808 B**(5.6 MiB) | 余项 = 图 slab + 表件;**不含 CUDA ctx**(free 口径已扣,实测 ctx+p排保留 ≈250 MiB) |
+| `draft_pool_bytes` | **0** | 本档无投机(关 = 0 是合法实测值) |
+| `gdn_row_bytes` | **20,201,472 B**(19.27 MiB/活跃 turn) | 18 层 × 1.07 MiB;池总 = ×`gdn_slots` |
+| `kv_bytes_per_token` | **12,288 B**(12 KiB) | 6 全注意力层 × 2(k+v) × hkv2 × hd256 × 2B |
+| `host_bytes` / `disk_bytes` | 0 / 0 | 默认关层(REQ C4) |
+| 池几何 | `nb=nb_kv=256`(page 32 ⇒ 8192 tok)、`n_full=6`、`n_gdn=18`、`kv_fp8=false`、`gdn_slots=8`、`snap_max=4` | 0.8B 默认档 |
+
+**固定面分解(开档实测,与 `vram::live` 逐项对上)**:
+权重 1467.1 + KV 池 96.0 + GDN 格 154.1 + 快照池 77.1 + 草稿池 0 + 运行底价 5.6 ≈ **1800 MiB**;
+turn 期 live 峰值 1800.5 MiB(瞬态面 ~1 MiB)。
+
+**容量换算**:`V_avail`(2 活跃 turn)≈ 18,073 MiB ⇒ `N* ≈ 1.54M tok`
+—— 0.8B 档的卡上容量**完全不紧张**,门槛在 **GDN 行 × 并发** 与 host/盘面(正是 store 要治的)。
+
+> **27B 的 2G 待审计仍挂**(需 3090 空闲;同一探针换 boot 27B 即可复跑)。
+> **S3-3 解锁**:0.8B 档的 `BudgetInputs` 现在齐了 ⇒ 可以在 0.8B + 3080 这个测试台上
+> 真开 `Rel`(host 卸载闭环的接线与验证不必等 27B 清账)。
+
+---
+
+## 10. 交互契约(2026-10-16 设计会话定案)—— 与 engine / backend / models 的边界
+
+> **定位**:store 是本引擎里**耦合度最高**的部件 —— 它同时牵住 engine 的时序、backend 的搬运
+> 原语、models 的结构知识。它的相邻模块(GPU server、graph、comm)解耦很好,靠的是"契约窄";
+> store 的契约要变宽(它必须知道"在哪/多大/丢谁"),所以**不靠约定,靠律**。本节是那套律的产权证。
+
+### 10.1 指针 / ID 律(裁决⑫)
+
+> **裸指针只有 server 持有;server 以上的每一层,只准持"ID + 元数据"。**
+
+| 层 | 允许持有 | 绝不允许 |
+|---|---|---|
+| **server**(`GpuServer`/actor 线程) | **地址表**(块 id → 设备指针/偏移)、流、图、pinned 租约 | 块语义、身份、layer/session 概念 |
+| **models** | `TensorOps` = (块 id, dtype, shape) —— 纯逻辑张量 | 任何地址;任何 tier 概念(它永远只看"当前物化视图") |
+| **store** | 身份(内容哈希)、`Carrier`(见下)、宿主物理、三层账、策略 | 裸指针;`Bytes` 所有权;模型类型 |
+| **engine** | 设备池的**所有权与生命周期**、会话表(逻辑块 → 槽)、**时序** | 宿主物理内部、搬运动作细节 |
+
+**store 里"东西在哪"的唯一表达(三层必须区分)**:
+
+```rust
+pub enum Carrier {
+    Device(SlotId),   // 显存:槽号(server 持 槽号 → 每层片段地址)
+    Host(HostId),     // 内存:宿主 slab 槽(store 自己的缓冲池)
+    Disk(FileOff),    // 磁盘:(文件代, 偏移);S6 落地,enum 位现在就留
+}
+pub struct BlockState { pub refs: u32, pub fp: u64, pub carrier: Carrier, pub last_use: u64 }
+```
+
+身份(`ChainHash`)与载体**正交**:换层 = 只换 `Carrier` + 台账挪一行,身份不变 —— 这正是
+"槽会被回收复用、身份不能"那条律的结构化落点(§9.1)。
+
+### 10.2 三分工(裁决⑪)
+
+| 层 | 角色 | 判据 |
+|---|---|---|
+| **engine** | **决策 + 调用** | 何时换(段边界/压力时刻)、哪条链、**保护面**;绝不参与"怎么搬" |
+| **store** | **实现** | 换什么、搬到哪层、账怎么迁、宿主缓冲怎么管、策略怎么出序 |
+| **server** | **执行** | 地址计算、DMA/流序、**一次 ack** |
+
+### 10.3 两条硬推论
+
+**推论 A:** **"块 → 设备片段"的映射是注册制**,不是每次调用传叶子。
+
+上一版草案(engine 每次构造 `BlockLeaf` 传进来)被这两条律否掉:换出的**实现**要在 store 里
+独立完成 ⇒ store 必须自己知道"这块在第几层的哪个偏移"。故:
+
+```rust
+// boot 一次(engine 提供、store 存档;**id 级,不含指针**)
+leg.attach_pool(PoolLayout { epoch: u64, pieces: Vec<PieceSpec>, block_tokens: usize })?;
+pub struct PieceSpec { pub block: u64 /*句柄 id*/, pub stride_bytes: usize, pub len_bytes: usize }
+
+// 之后所有交换只谈"块"
+leg.offload(chain)?;               // store 内:算片段 → 组装批命令 → 账目 → 宿主缓冲
+leg.onload(chain, dst_slot)?;
+```
+收益:①store 的实现完整自洽 ②engine 调用点一行 ③每调用的叶子参数对象消失
+④`epoch` 挡陈旧布局(池重建/几何变化 ⇒ 重注册)。
+
+**推论 B:** **一次交换 = server 的一条命令、一次 ack。**
+
+现状:契约面只有单件 `dtoh`(且回 `Vec<u8>`,server 侧分配)与 D2D `CopyBatch`。而一个逻辑块
+= **层数 × 2** 个片段(0.8B 12 段、27B 32 段)⇒ 不批化就是 N 次往返/块。故后端增量(唯一一个):
+
+```rust
+DtohBatch { pieces: Vec<(Bytes, off_bytes, HostSpan)>, ack }   // D2H:读语义,回执即落地
+HtodBatch { pieces: Vec<(HostSpan, Bytes, off_bytes)>, ack }   // H2D:经一次性 pinned 租约
+// HostSpan = 调用方(store)的宿主缓冲片(ptr+len);与今天 dtoh 的 out: &mut [u8] 同源
+```
+**形态律**:批面为**唯一规范**,单件 = n=1 的糖(实现共享一条路径,不设两套规范)。
+**server 侧额外加一条断言**:捕获窗内收到 Swap 类命令 ⇒ **响亮拒**(时序判断仍归 engine,但
+server 不再"默默照办",焊死"随手搬")。
+
+### 10.4 五条接口律(API 变更的判据)
+
+1. **门面挂叶子字段,不挂组合体**:接口长在 `BlockLeg`/`StateStore` 上,不长在
+   `SessionBank`/`Rel` 上 ⇒ 调用点借用天然分裂(`self.bank.leg.ensure_for_len(&mut s.block_table, n)`
+   合法;`self.bank.ensure_for_len(...)` = E0499 —— 2026-10-16 现场证过,见坑册 §44)。
+2. **控制面同步零 I/O / 数据面自由函数**:判定与记账不得触发设备动作;搬运口显式收
+   `&mut D: DeviceClient`(律⑦)。
+3. **身份 = 内容哈希,槽 = 绑定,载体 = `Carrier`,叶子 = 注册的 id**:store 不缓存 `Bytes`,
+   长度显式传(坑册 §42)。
+4. **段边界独占**:搬运调用点**不得持会话借用** —— 先"收集工作单"(短借用),再"独占执行"。
+5. **一条腿一个管理器;`Rel` 只在两腿齐备时出现**。只有 KV 一条腿时立 `Rel` = 门面里一半是
+   空气(`StateStore`/准入/预算无人用)且把启动绑到未实测数字上 ⇒ **先立 `BlockLeg`,S2 落地
+   后再立 `Rel`**(关系层)。半空门面 = 旁路(工作区明令禁止)。
+
+### 10.5 搬运面与"批命令 ⇒ 调用迁移"
+
+**新面**:`DtohBatch` / `HtodBatch`(§10.3 推论 B);`CopyBatch` **已有**。
+
+**清存量**(已有批面、调用点仍在逐件 await;核过源码):
+
+| 位置 | 现状 | 收益/处置 |
+|---|---|---|
+| `capture_snap` / `restore_snap`(E2c 前缀快照) | **每次 18 层 × 4 = 72 次 `copy_block_at` await**(27B = 192) | **极高**:每个块边界都跑;一次可省 71/191 次往返。D2D `CopyBatch` 已存在,语义等价 |
+| `capture_spec_snap`(spec 快照) | **已批化**(192 → 1) | 现成样板,照抄 |
+| boot `zero_block` 逐层 alloc+memset、`reset_gdn` 逐层清零 | 逐件 | 中低(启动/每 turn 一次),后置 |
+| 采样 `dtoh`(每 token ~1MB logits) | 单件,天生一件一步 | **不批** |
+
+**迁移纪律**:一调用点一刀 + 等价门(逐字节/逐值一致);批的 N 有上限并切块(命令体/ack 负载)。
+
+### 10.6 models ↔ store:这不是"谁依赖谁",是**驻留控制回路**(MoE 是它的正脸)
+
+```
+        结构(谁是可分层的块)  ← models
+                │
+   执行(前向/调度) ← engine(决定:这一批要哪些) → store(实现:驻留/搬运/账) → server(执行)
+                ▲
+        热信号(router 每层命中:谁热)
+```
+
+| 环节 | 归属 | 内容 |
+|---|---|---|
+| 结构 | models | 专家 = **独立可分层的块**(`ExpertBlock{layer, expert_id, pieces, bytes}`);稠密核(attention/router/embed)标 `DenseCore` = 永不驱逐 |
+| 热信号 | models → engine | 每层窗口内专家命中统计(router 输出顺手上报,零额外成本) |
+| 驻留决策 | engine(时机)+ store(实现/策略) | 这一批/下一步的工作集;store 按**类**出序(LRU 给 KV,**热度**给专家) |
+| 执行 | server | 地址 + DMA + 一次 ack |
+
+**量级论证(为什么决策必须在 engine,不能"缺页现搬")**:专家块是 MB 级(4bit 下 ≈6MB/专家;
+fp8 大 MoE 单专家 40MB+),而路由是**每 token 每层**的 ⇒ 40MB/10GB·s⁻¹ ≈ 4ms;一层 8 专家 × 60 层
+= 每 token 十几 GB —— 现缺现搬物理不可行。**可行解只有:大批次 + 热集驻留 + 与计算重叠的提前搬**。
+
+**因此的接口形态**(将来 MoE 落地时启用,现在只留形状):
+
+1. **词汇下沉**:`BlockId` / `BlockClass` / `BlockDesc` / `Tier` 四个小类型放 **`owl-iface`**
+   (它已经是"块句柄 + 契约"的家,`TensorOps` 也依赖它)⇒ **models ⊥ store 各自依赖词汇,
+   互不依赖**,engine 是唯一装配点。避免"store 要吃 models 几何 + models 依赖 store"成环。
+2. **类轴 + 每类策略对象**:`BlockClass { KvPage, GdnRow, Expert, DenseCore }`(现在只立枚举与分发;
+   第一个非 KV 类真接进来时填策略)。
+3. **搬运面留"多块在飞"的形状**:`prefetch(ids) -> Lease` + `lease.wait()`,而不是一次一块 await。
+4. **权重预算拆分**:`weights_bytes` → `core_weights_bytes`(常驻不可驱逐)+ `expert_pool_bytes`
+   (可分层,驻留量由策略定);per-turn 的"地板"语义将来给专家层一个对应物(`expert_floor`)。
+5. **缺页路径**:先做**响亮断言**(前向开始前 engine 保证工作集驻留;缺 = 拒),
+   要真做 fault 再引入 `BlockProvider` trait(声明在 iface,实现在 store,engine 注入)——
+   fault 会把决策权从 engine 漏回 models,与本分工冲突,故非必要不开。
+
+### 10.7 刀序更新(A 轴;形态按 §10 收敛)
+
+| 刀 | 内容 | 状态/门 |
+|---|---|---|
+| **S3-3** | 立 `BlockLeg`(账 + 宿主物理 + 搬运口)+ **注册制**(id 级 + `epoch`)+ 新批搬运面 + engine 调用点收敛到 leg 方法 | 待做;**迁移零行为变化**(`host_bytes = 0` 默认关层);门 = engine 36/store 51/0.8B 场景 |
+| **S3-3b** | 开宿主面(某个档 `host_bytes > 0`):压力先下沉、命中面 `slot = None` 段边界回灌 | 门 = 往返逐字节一致(真 face)+ 命中率/TTFT 改善可测 |
+| **P1**(并行小刀) | E2c 快照迁 `CopyBatch`(72/192 次 await → 1) | 纯收益、零架构改动;门 = 快照恢复值逐字节一致 |
+| **S2 / S2b** | 状态腿三层化 + GDN 行借还 | 见 §6;落定后立 `Rel`(关系层) |
+| **S5/S6+** | 草稿池 / 权重账统一 / **MoE 专家分层**(§10.6)/ 磁盘层 | 各自独立轴 |
+
+### 10.8 待拍(设计会话遗留)
+
+1. 词汇下沉到 `owl-iface`(`BlockId`/`BlockClass`/`BlockDesc`/`Tier`)—— 认否?
+2. `BlockClass` + 每类策略对象:现在就立枚举,还是等第一个非 KV 类落地?(建议现在立)
+3. 权重账统一(engine 装配点注册权重块,只为报告/预算对账,不动所有权)—— 现在做否?
+4. 批面形状:两条(`DtohBatch`/`HtodBatch`)还是一条带方向?(建议两条)
+5. 迁移顺序:P1(E2c 快照批化)与 S3-3 并行,可以吗?
+6. `Disk` 载体:现在只留 enum 位 + 接口,还是这轮落最小文件层?(建议留位)
+
+---
+
+## 11. S3-3 第①层实录(BlockLeg + 注册制)· 2026-10-16
+
+> 目标:把 `KvStore` 收成 store 内部件,engine 侧只认 **一条腿**(`BlockLeg`),
+> 并把"块 → 设备片段"的映射改成**注册制**。**迁移零行为变化**(`host_bytes = 0` 默认关层)。
+
+### 11.1 落点
+
+| 面 | 内容 |
+|---|---|
+| `store::leg` | `BlockClass`(类轴)· `Carrier`(三层载体,身份正交)· `PieceSpec`/`PoolLayout`(id 级布局 + `epoch`)· `LegConfig`/`LegOps`/`LegStats` · **`BlockLeg`**(控制面:`match_prefix`→`ChainHit`/`ensure_for_len`/`register_chain`/`release_table`/`incref`/`evict_candidates`/`carrier_of`/`report`)· **数据面自由函数** `offload_block`/`onload_block`(显式收 `&mut D`) |
+| `store::moves` | **`download_span` / `upload_span`**(带偏移;老口 `offload_to_host`/`onload_from_host` 改为其特例 —— 一套实现) |
+| `store::kv` | `alloc_slot` / `bound_slot` / **`ensure_offloadable`**(换出前置:存在 + 设备绑定 + 引用 = 1) |
+| `owl-iface` | **`dtoh_at`**(带偏移 D2H;默认 = 响亮"未实现") |
+| `owl-cpu` | `dtoh_at` 实现(store 的搬迁单测跑**真 face**) |
+| `engine` | `SessionBank { leg_target, leg_mtp: BlockLeg }`;`BankPlan` 加 `mtp_block_bytes`/`host_bytes`;boot 注册布局(`StatePool::pool_layout`/`mtp_pool_layout`,id 级,`epoch = 0`);`EngineKnobs.host_cache_mb`(`OWL_HOST_CACHE_MB`,默认 **0 = 关层**);删掉 session 侧的两条自由函数包装 |
+
+### 11.2 门(全绿)
+
+- `cargo test -p owl-store`:**55/55**(新增 4 条腿测试:①真 face 上**换出→换回逐字节一致** ②关宿主层第一枪响亮拒 ③活跃面(引用 > 1)响亮拒 ④关层时压力驱逐不碰宿主;老 51 条不动)
+- `cargo test -p owl-engine --lib`:**36/36**
+- 0.8B 套件(`spec_identity_gate` 之外)**12 场景 OK** —— 与迁移前**同一画像**(唯一红 = §45 那条既存机制,且错误文案现在自带链名:`target 链:…`)
+- `apps/server` 二进制照常编译;两侧 clippy 改动面零告警
+
+### 11.3 阻塞点与解消(2026-10-16 同日第二刀)
+
+1. ✅ **`dtoh_at` 已解**(原阻塞①):`Command::DtohAt` + server 侧把偏移并进
+   **唯一执行路径**(`try_dtoh(stream, id, off, want)`;老 `Dtoh` = `off = 0` 的特例 ——
+   老命令迁到新路径上)+ `GpuClient::dtoh_at` + CPU 面实现。
+   门:`crates/backends/cuda/tests/dtoh_at_probe.rs`(3080 实机)——
+   前缀读回归 / **中段** / 尾段 / 末字节逐字节一致 + 越界**响亮拒**(错误原文带块 id 与区间)。
+2. ✅ **批面已解**(原阻塞②):`Command::DtohBatch`(N 段一次命令,回执按序拼接)+
+   契约面 `dtoh_batch`/`htod_batch`(默认 = 逐件循环,语义等价;GPU 面覆写为单命令,
+   H2D 侧复用既有的 `HtodChunks`)+ **D2H 序口抽出**(`d2h_ordered_stream`,三命令共享一处
+   跨流保序);store 的换出/换回**已切到批命令**(一次往返/块)。
+   门:同文件 `dtoh_batch_and_htod_batch_round_trip`(带偏移批量写 → 批量读回逐字节一致;
+   与单段读对照;越界段整条命令响亮拒)。
+   挂账(不阻塞):批读回执仍是 server 侧 `Vec<u8>`(客户端再拷进宿主 slab)——
+   将来可改"**写进调用方缓冲**"省一次拷贝(需命令里带宿主指针,另议)。
+3. **`Rel` 里有重复面**(非阻塞,但欠一刀):`Rel` 自持 `KvStore + HostTier + TierLedger` 与
+   自己的 `offload/onload`(整块口径),与 `BlockLeg` 的(带偏移、注册制)重复
+   ⇒ 下一刀把 `Rel` 收成 `{ leg: BlockLeg, state, admission, budget, policy, evict }`,删掉重复实现
+   与重复测试(腿侧已有等价覆盖)。
+4. **布局代数目前恒 0**:池在 boot 后不变,够用;若将来 dump 页/量化档在运行期变
+   ⇒ 重注册 + `epoch += 1`(API 已备好,调用点要补)。
+
+### 11.4 下一刀顺序(建议;① ② 已解)
+
+**S3-3b 开宿主面真跑换出/回灌**(门 = 往返逐字节 + 命中率/TTFT 改善)→ `Rel` 收编(解③)→
+P1(E2c 快照迁 `copy_batch`,纯收益)→ 批读直写宿主缓冲(省一次拷贝)。
+
+---
+
+## 12. 需求 / 供给 / 约束(淘汰机制的公理;A 轴口径 = B 关)· 2026-10-16
+
+> 起因:S3-3b 实测卡在"**谁该被丢**"上 —— 而任何淘汰机制若不先把需求侧说清,就是在猜。
+> 本节的立场:**先把"需求方要什么、我们手上有多少"写成式子,再谈分配**。
+> 口径:**B(KVMem 选择层)关** ⇒ 不做窗口压缩 ⇒ **活跃 turn 的工作集必须整块 dense 驻留**。
+
+### 12.1 需求侧(四项,各有来源)
+
+| # | 需求项 | 式子 | 现状来源 | 可动性 |
+|---|---|---|---|---|
+| ① | **活跃 turn 工作集** | `D_active = Σ_{i∈active} ceil(N_i / 32)` 块 | `sessions.block_table.len()`(每活跃会话) | **不可动**(硬) |
+| ② | **缓存叶(前缀资产)** | `D_cache = 有内容身份、当前无活跃引用的块数` | `KvStore.cached_blocks − 活跃持有` | **可下沉 → 可驱逐** |
+| ③ | **待准入增量** | `Δ_j = ceil(N_j/32) − 命中块数` | 新 turn 的 prompt 与命中面(`match_prefix`) | 可拒/可排队 |
+| ④ | **运行固定面** | 权重 / GDN 行 / 快照池 / 草稿池 / 图 slab | §9.6 实测表 + `BudgetInputs` | 不可动 |
+
+**需求的驱动量**(用户点题):并发数(**活跃 turn 数** `#active`)与 §④ 的档位;而
+**每 turn 的需求 ∝ 它自己的上下文长度 `N_i`**(B 关 ⇒ 不压缩)。
+⇒ 需求不是常数,是 `(#active, {N_i}, 命中率)` 的函数 —— 与 §2.2 的分界点公式同源。
+
+### 12.2 供给侧(三层,显式)
+
+| 层 | 容量 | 现状旋钮 |
+|---|---|---|
+| 设备 | `S_dev = nb` 槽(槽 = 32 token 页) | `pool_tokens` / `vram_target`(治理夹) |
+| 宿主 | `S_host = host_bytes / slot_bytes` | `host_cache_mb`(**0 = 关层**) |
+| 盘 | `S_disk`(S6;位留着) | — |
+
+### 12.3 约束层级(A 轴 ⇒ 只有一条硬约束)
+
+```
+硬:  D_active ≤ S_dev                              ← 活跃面必须 dense 驻留(B 关)
+     #active ≤ max_active_turns(GDN 行数)          ← 资源归属律 §2.3
+软:  D_cache 驻留 ≤ S_dev − D_active(其余在宿主/被逐)
+     D_cache 总量 ≤ S_host 驻留 + ∞(被逐 = 丢内容)
+判据: 准入(turn_j) ⇔ D_active + Δ_j ≤ S_dev(先做 ② 的下沉/驱逐腾位;仍不足 = 拒/排队)
+```
+
+**次序(唯一正确顺序)**:
+1. **先下沉**(`D_cache` 的叶 → 宿主;`S_host` 有位就搬,内容不丢);
+2. **再驱逐**(宿主满 ⇒ 丢最老叶;内容真丢,下次重算);
+3. **仍不足 ⇒ 拒/排队**(**不许**动活跃面;抢占 = 把整个活跃 turn 的工作集下沉 —— 需 S2b 的状态腿配合,归 A 轴后续)。
+
+### 12.4 由此定下的实现(替换"固定水位"的临时法)
+
+**按需保洁(demand-driven)**:需求由 `schedule()` 早已算出(`ensure_for_len` 的 target),
+所以保洁不该用 `nb/8` 这种常数水位,而应:
+
+```
+段边界:need = 本步/本轮要长的槽数(schedule 已知)
+        free = S_dev − D_active − D_cache(设备侧)
+        if free < need ⇒ 下沉 (need − free) 个缓存叶(引用 = 1 的);
+        仍不足 ⇒ 驱逐;仍不足 ⇒ 该 turn 响亮拒(真容量不足)
+```
+落点:`pump()` 段边界调 `pool_housekeeping(need)`(need 由 schedule 的同一份算式给出),
+而不是等 `ensure_for_len` 自己在同步路径里**先丢内容**(实测教训:小池下条目被撕,
+回灌永远等不到命中)。
+
+**这也解释了 S3-3b 实测的 `matched=0`**:在位的水位太靠后 ⇒ `ensure_for_len` 的同步驱逐
+先一步把整条链**条目**(连宿主副本)撕掉;按需保洁把"下沉"提到"增长"之前即可。
+
+---
+
+## 13. 两本账:物理账(server)× 语义账(store)· 2026-10-16
+
+> 用户定调:**server 的显存账本只按"指针/块"统计 —— 它不管哪块是哪块、是干什么的;
+> "哪一块显存是什么、干啥用、归谁"是 store 的事**。store 记不清这个,调度就无从谈起。
+
+### 13.1 分工(同一个字节,两种视角)
+
+| | **物理账(server)** | **语义账(store)** |
+|---|---|---|
+| 记账单位 | 块(id/指针):`bytes / dtype / 地址` | **语义对象**:内容身份(ChainHash)/ 布局位置(层×槽) |
+| 关心 | 池 `used/reserved`(含高水)、驱动 `free/total`、分配成败 | **用途**(BlockClass)、**载体**(设备槽/宿主槽/盘)、**引用**(谁还持着)、**新鲜度**(LRU/热度) |
+| 认识 | 只认识"块" | 只认识"东西";**不持指针**(裁决⑫) |
+| 现状落点 | `block_ledger` / `pool_ledger_snapshot` / `vram::{live,free,total}` / **硬预算 `vram_budget_guard`** | `KvStore`(身份+槽账+引用+LRU)、`HostTier`(宿主物理)、`BlockLeg`(布局注册 + 载体 + 报告) |
+
+一句话:**server 管"花了多少、还剩多少";store 管"花在谁身上、该不该继续花"。**
+
+### 13.2 store 必须记的六件(逐条对齐现状)
+
+| # | 记什么 | 用途 | 现状 |
+|---|---|---|---|
+| ① | **身份**:每块的内容身份(ChainHash) | 跨会话命中、快照键 | ✅ `KvStore` 内容身份前缀树 |
+| ② | **位置**:它在哪条腿的哪一层哪一槽(`PoolLayout` 注册,id 级) | 搬运时算片段偏移 | ✅ `BlockLeg::attach_pool` + `epoch` |
+| ③ | **载体**:设备槽 / 宿主槽 / 盘 | 决定"能不能搬、搬到哪" | ✅ `Carrier`(设备/宿主/盘位) |
+| ④ | **用途**:KV 页 / GDN 行 / 专家 / 稠密核 | **策略分流**(LRU vs 热度 vs 永不驱逐) | ⚠️ 枚举已立(`BlockClass`),现在**腿级**;真接非 KV 类时升**块级** |
+| ⑤ | **引用**:谁还持着(活跃 turn / 缓存 / 快照) | 判"可不可以动"(`Busy` = 活跃面) | ✅ `SlotPool.refs` + `ensure_offloadable` |
+| ⑥ | **新鲜度/热度**:last_use、(将来)检索/命中频次 | 出驱逐序 | ✅ `last_use`;热度面 = MoE 落地时接(§10.6) |
+
+### 13.3 由两本账得到的**可调度性**(接 §12)
+
+有了 §13.2,§12 的两项需求就能**现算**:
+
+```
+D_active = 活跃 turn 的工作集     ← engine 侧(会话块表)⊕ store 的引用账(⊕ = 对齐校验)
+D_cache  = 有身份、无活跃引用的块 ← store 的条目账(含载体分布)
+"丢谁"   = (用途 ④ → 引用 ⑤ → 新鲜度 ⑥)三段判据 —— 不再是"最老的就丢"
+```
+
+### 13.4 对账口(G2 账目封闭;新立)
+
+两个视角必须能**互相验证**(不许各说各话):
+
+```
+store 报:按类 × 按层的块数/字节(KvPage: n 块 × slot_bytes;host: m 块 …)
+server 报:块账房 used/reserved(/debug/blocks)+ 池高水
+对账:store 的"设备驻留字节" ≤ server 的"池 used";差额 = 非 store 管的块
+      (权重/图 slab/草稿/scratch —— 归 §9.6 固定面表)
+不一致 = **响亮报**(打点 + WARN),不许静默
+```
+
+**落地清单**:①`LegStats` 加"按类 × 按载体"的明细行;②engine 侧加一条 `/debug/blocks`-风的
+对账打印(store 账 × server 账 × 固定面表);③`BlockClass` 升块级(第一个非 KV 类接进来时)。
+
+### 13.5 与 §12 的施工绑定
+
+§12 的"按需保洁"要实现,依赖的正是本节:①**need**(需求)由 engine 的 schedule 给;
+②**"下沉谁"**由 store 的语义账给(用途 + 引用 + 新鲜度);③**搬没搬动**由 server 执行并回账。
+⇒ 下一刀 = `pool_housekeeping(need)`(需求驱动)+ §13.4 的对账口。
+
+---
+
+## 14. 引擎钩子框架(engine hooks)—— store 的插入语义 · 2026-10-16
+
+> 用户定调:engine 里存在**许多特殊的点位**,在这些时间点上可以触发 store 的调度。
+> **store 的插入语义 = "此时我们应该怎么办?给你一个需求,你告诉我:谁应该离开、谁应该进来。"**
+>
+> ⇒ 钩子框架 = ①把那些点位**显式登记**(不再散落成 if);②每个点位两相——**判(纯)与搬(段边界)**;
+> ③store 的产物是一张**决策单**(谁走/谁进/拒),搬运由 server 执行。
+
+### 14.1 每个钩子两相(与三分工严格对齐)
+
+```rust
+/// 相一:**判**(纯 host、零 I/O、可单测) —— 在 schedule 的决策面调用
+pub fn plan(leg/rel, need: Need, protect: &Protected) -> Verdict;   // "谁走、谁进、还是拒"
+
+/// 相二:**搬**(段边界、async、显式收 face) —— 在 exec 的段边界调用
+pub fn apply(leg/rel, face, &Verdict) -> Result<Applied>;           // 执行搬运并回账
+```
+
+- **判**可以在任意时刻(包括图捕获窗内)调用 —— 它只动账(§13.2 的六件);
+- **搬**只在段边界:piecewise 接缝 / pump 间隙 / prefill 分块之间(律③);
+- 两相之间**状态可变**(判完到搬完之间可能有别的 turn 动账)⇒ `apply` 必须**重验**
+  (引用变了就跳过该条:`Busy` = 跳过,不是错误)。
+
+### 14.2 决策单(Verdict)
+
+```rust
+pub struct Verdict {
+    pub out:  Vec<EvictOut>,   // 谁应该离开:下沉(宿主有位)或驱逐(宿主满)
+    pub in_:  Vec<ChainHash>,  // 谁应该进来/留下:需物化的回灌清单 + 建议保留的缓存块
+    pub deny: Option<String>,  // 谁都不该走/进:响亮拒(含具体数字,§12.3 次序走完仍不足)
+}
+```
+`out` 的判据链 = **用途 ④ → 引用 ⑤ → 新鲜度 ⑥**(§13.3),不再"最老的就丢";
+`in_` 的两个来源:**命中面**(S3-3b 的 `pending_host`)+ **准入建议**(值得留的热资产)。
+
+### 14.3 钩子点(engine 侧的第一版清单)
+
+| 钩子 | 点位(engine 落点) | 触发 | 已知量(需求) | 可动面 | 合法性 |
+|---|---|---|---|---|---|
+| **H1 turn 准入** | `schedule()` 起手(submit 后) | 新 turn 要进 | `Δ_j = ceil(N_j/32) − 命中块数` | 缓存叶(全部) | 判 = 自由;搬 = 段边界 |
+| **H2 块表增长** | `ensure_for_len` 之前(prefill chunk 间 / decode 跨页 / spec verify 行) | 要长 `need` 个槽 | `need`(本步/本轮) | 缓存叶 | 判 = 自由;搬 = 段边界 |
+| **H3 turn 收口** | `exec/turn_end`(register_chain 前后) | 链转入缓存资产 | `落账块数`(负需求:供给↑) | 缓存叶 | 段边界 |
+| **H4 前缀命中** | `execute_begin`(write_bt 之前) | 命中面含宿主格 | `pending_host.len()` | 该链自身(回灌) | **段边界**(必须在 write_bt 前) |
+| **H5 空转整理** | `pump()` 得 `Idle` 时 | 无活跃 turn | 全局(把冷资产下沉、热资产留下) | 缓存叶 + 快照 | 段边界 |
+| **H6 引用归零** | `session.close/burn`、LRU 逐出会话 | 可动资产面变化 | — | 该会话链 | 判 = 自由 |
+| **H7 状态腿事件** | GDN 行借还 / 快照下沉(S2/S2b) | 状态腿三层化落地后 | 行/快照 | 快照池 | 段边界 |
+
+**第一版要做**:H1/H2/H3/H4(H5 idle 整理是纯收益,可紧随其后;H6 是记账维护;H7 归 S2)。
+
+### 14.4 与 §12/§13 的关系
+
+```
+§12 需求侧 → 决定"need"(H1/H2 各给一份)
+§13 语义账 → 决定"谁可动、谁该留"(plan 的输入)
+§14 钩子   → 决定"何时问、何时搬"(框架)
+```
+
+### 14.5 落地清单(第一刀)
+
+1. `store` 出 `plan(need, protect) -> Verdict`(**纯判定**,覆盖 §12.3 次序:下沉 → 驱逐 → 拒)
+   与 `apply(face, &Verdict)`(**段边界搬运**,`Busy` 跳过);
+2. engine 侧把现有触发点**改经钩子**(H1/H2 现在各有一处"临时法":`pool_housekeeping(nb/8)` 与
+   `ensure_for_len` 的同步驱逐)⇒ 全部走 `plan`/`apply`;
+3. 打点:每个钩子的 `need / out.len() / in_.len() / deny / 实际搬了多少`(metrics);
+4. 门:演示台(0.8B + 池 8 槽 + 宿主 8MiB)①换出>0 ②**回灌>0** ③命中路径 vs 冷启动 **token 恒等**。
+
+### 14.6 ⚠️ 链级卸载律(2026-10-16 实测定谳;修正 §14.3 的候选粒度)
+
+**现场**:演示台(0.8B + 池 16 槽 + 宿主 8MiB)第 4 轮重复前缀,`matched=0`;钩子诊断显示
+H5 每次只停 **1 块**,而宿主里的那 1 块是**某条链的尾块**。
+
+**根因**:前缀树里**只有叶可动**(逐父节点会孤儿化子链)—— 所以"按 LRU 逐叶下沉"停掉的
+永远是**链尾**。而**前缀匹配是从链头开始走的**;链头不在设备上 ⇒ 整条前缀不可复用
+⇒ 停在宿主的尾块对复用**零贡献**,命中永远落在设备上,回灌永不触发。
+
+**律(A 轴新增)**:
+1. **下沉的粒度 = 链(前缀),不是叶**:卸载一条链时必须**从链尾向链头逐块搬完**
+   (或至少搬到一个"可复用的前缀边界"),不许停在半截 —— 半截链 = 不可复用的碎片;
+2. **驱逐(丢内容)仍可按叶**:丢尾部不动链头,语义上"前缀短了一截",但前缀仍可复用
+   (这正是 LRU 逐叶在**驱逐**面上正确的原因);
+3. 由此,候选面必须**分两种**:
+   - **驱逐候选**:叶(现行 `evict_candidates`)✔
+   - **卸载候选**:**链**(取"最冷的链",整条搬;判据 = 链尾的 `last_use`)
+4. 推论:**"停在什么状态下可复用"是前缀层的概念** —— 与 §12 的准入、§13 的语义账同源:
+   store 记的 ⑥(新鲜度)在链级要按**链尾**取,而不是按块取。
+
+**修法(下一刀)**:`BlockLeg` 加 `chain_offload_candidates(protect, limit) -> Vec<ChainHash>`
+(按链尾 LRU 出**链**)+ `offload_chain(face, chain)`(从尾到头整条搬);
+H5 用它;H2 的"按需下沉"同样用链(不足一条链时退化按叶,并打点)。
+
+---
+
+## 15. Swap 原子命令 + Connector 契约(iface 声明 / store 实现 / server 使用)· 2026-10-16
+
+> 用户定调:①swap **要在 GPU server 上是一条(原子)命令** —— 直接用命令让 server 去做交换;
+> ②server 为此需要一个**接口**,接口**在 iface 里声明**,它接受一个 **`Connector`**
+> —— 可以是 **RAM connector**,也可以是 **disk connector**;
+> ③一条命令就能把"显存里的东西换出到 RAM/盘、再从那里换回来";
+> ④**Connector 的实现者是 store,使用者是 server**。
+
+### 15.1 归属矩阵(这条设计的关键)
+
+| 物 | 声明 | 实现 | 使用 |
+|---|---|---|---|
+| `Connector` trait(+ `SwapDir` / `SwapPiece` / `ConnSlot`) | **owl-iface** | **owl-store**(RAM = `HostTier`;disk = 文件层) | **owl-cuda 的 server**(搬运时逐片读/写) |
+| `DeviceClient::swap(...)`(一条命令的入口) | **owl-iface** | owl-cuda(GpuClient)+ owl-cpu(循环等价) | **owl-store**(`apply` 里调) |
+| 交换的**决策**(谁走谁进) | — | owl-store(`plan`/`Verdict`) | owl-engine(钩子) |
+
+**为什么要这样切**:server 是**唯一持裸指针**的一层(裁决⑫)—— 只有它能把设备字节搬到
+别处;而"别处是什么"(RAM/盘/未来的 NVMe-oF)**不该让 server 知道** ⇒ 抽象成 `Connector`,
+server 只按槽号读写,**层级知识留在 store**。
+
+### 15.2 契约形状(伪代码)
+
+```rust
+// ── iface:声明 ──────────────────────────────────────────────
+/// 宿主/盘侧的一块存储槽(store 分配,server 只按号读写)
+pub struct ConnSlot(pub u64);
+pub enum SwapDir { Out, In }                     // Out:设备→connector(换出);In:反向(换回)
+pub struct SwapPiece { pub block: u64, pub off_bytes: usize, pub len_bytes: usize, pub slot: ConnSlot }
+
+/// 交换的"另一端"(RAM / 磁盘 / …)
+pub trait Connector: Send {
+    /// 写入一片(设备→该层;bytes 由 server 从设备侧拷来)
+    fn put(&mut self, slot: ConnSlot, off_bytes: usize, bytes: &[u8]) -> Result<(), ModelError>;
+    /// 读出一片(该层→设备)
+    fn get(&self, slot: ConnSlot, off_bytes: usize, out: &mut [u8]) -> Result<(), ModelError>;
+    /// 层名(诊断/报告面)
+    fn tier_name(&self) -> &'static str;
+}
+
+// ── iface:DeviceClient 上的一条命令面 ───────────────────────
+/// **swap = 一条原子命令**:N 片一次提交、一次 ack(server 侧按器件序逐片搬);
+/// 捕获窗内 = 结构化拒(时序归 engine,§10.3)。
+fn swap(&mut self, dir: SwapDir, pieces: &[SwapPiece], conn: Box<dyn Connector + Send>)
+    -> impl Future<Output = Result<Box<dyn Connector + Send>, ModelError>> + Send;
+```
+
+- **Connector 随命令进出**:`Box<dyn Connector + Send>` 移入命令、回执时**原箱奉还**
+  ⇒ 单主、零锁(store 在两批 swap 之间持着它);
+- **原子性**:一条命令 = 一次 ack = 全部片段完成(同流保序);中途失败 = 整条失败,
+  由 store 回滚账(引用/载体不变 ⇒ 不留半态);
+- **层级无关**:RAM 与 disk 只差 `Connector` 的实现;server 侧代码零分支。
+
+### 15.3 与现有面(dtoh_at / dtoh_batch / htod_batch)的关系
+
+```
+现在:S3-3b 用 dtoh_batch(设备→内存缓冲)+ htod_batch(内存→设备)——**两条命令、两趟**,
+      且"宿主缓冲"由 client 侧拷贝进 store 的 Vec(多一次 memcpy,§11.3 挂账)
+将来:swap(dir, pieces, conn) —— **一条命令一通**,Connector 直接落盘/落 Vec,
+      省掉 client 侧的中间缓冲与第二次 memcpy
+```
+⇒ 迁移纪律(§10.5 同款):**新面先加、老面保留**(`dtoh_at`/`dtoh_batch` 继续可用),
+store 的 `apply` 里逐刀切到 `swap`;CPU 面给 `swap` 的**循环等价实现**(任何 face 都能跑)。
+
+### 15.4 磁盘层的现实问题(先记着,别踩)
+
+- RAM connector:`put/get` = memcpy ✔ 无阻塞问题;
+- **disk connector 的 I/O 是阻塞的** —— 在 server 命令线程里做文件写会**钉死整条命令管道**
+  (与 dtoh 早期"整流排空"同一个病)。⇒ 二选一(磁盘层落地时拍):
+  ①**专用 I/O 线程 + 队列**:命令把片段投递给 I/O 线程,ack 语义 = "已提交",
+    完成由 store 轮询/回调(交换与计算重叠,符合 §10.6 的 MoE 预热形态);
+  ②`io_uring` 等异步面:ack = 真完成。
+  **v1 只做 RAM**;disk 层按 S6 立项时按 ① 落(它天然支持"多块在飞")。
+
+### 15.5 落地清单
+
+1. `iface`:`ConnSlot`/`SwapDir`/`SwapPiece`/`Connector` + `DeviceClient::swap`(默认实现 =
+   逐片 `dtoh_at`/`upload_pinned` 循环,语义等价 ⇒ 老 face 不改也能跑);
+2. `owl-cuda`:`Command::Swap { dir, pieces, conn, ack }` + server 侧一处 handler
+   (逐片 `memcpy_*` + `conn.put/get`;捕获窗落 reject 臂)+ `GpuClient::swap`;
+3. `owl-store`:`HostTier` 实现 `Connector`(RAM);`apply` 改用 `face.swap` ——
+   **引擎侧零改动**(钩子接口不变);
+4. 门:store 单测(CpuFace 的循环实现)+ 演示台(`OWL_OFFLOAD_PROBE=1`)。
+
+---
+
+## 16. 第三刀实录:链级卸载 + Swap 单命令(2026-10-16)
+
+> 一刀两事,同一现场:**§14.6 的律落地**(链级下沉)+ **§15 的契约落地**(swap 单命令)。
+> 期间翻掉一个**假现场**(诊断口径 bug),修掉一个**静默丢内容**的驱逐 bug。
+
+### 16.0 一句话
+
+```
+沉链不沉叶(链头段进宿主 ⇒ 命中面从链头就是 host 格 ⇒ 回灌真触发);
+搬一趟不漏(swap 单命令 = N 块 × 每层片段,一次 ack;回执 = 连接器原箱奉还)。
+```
+
+### 16.1 现场翻了案:旧诊断口径错(§14.6 的理由要修正)
+
+诊断用 `tok.encode(prompt)` 算命中面,而 `submit_session` 内部是 `tok.encode(chat_wrap(prompt))`
+⇒ 哈希链从第 0 块起就不同 ⇒ 打印出来的 `matched=0` 是**假的**(同时刻生产路径命中 2 块)。
+
+修正口径后现场(0.8B + 16 槽池 + 宿主 8MiB,三轮后):
+
+```
+[s3-3b] 诊断 链0:tokens=89 matched=2 pending=0 · 0:dev|snap=Y 1:dev|snap=Y
+[s3-3b] 诊断 链1:... 全 dev · 链2:... 全 dev
+[s3-3b] 三轮后:缓存 9 块 · 宿主 1 块 / 0.38MiB · 换出 1 次
+```
+
+⇒ 每条链实际是 **3 块**(2 块前缀 + 1 块生成段);旧 H5 只按 `short=1` 沉 **1 个叶**,
+而那个叶是**生成段碎块** —— 不在 89-token 命中面里 ⇒ `pending` 恒 0 ⇒ 回灌永不触发。
+
+**律(§14.6)仍然成立,理由精确化**:
+
+> 命中面**只覆盖完整前缀块**;要让"下沉"对复用有贡献,沉下去的那部分必须**落在命中面里**
+> —— 而命中面从链头开始 ⇒ 必须把**链头段**一起沉。逐叶下沉只会沉到链尾(最新生成段),
+> 那正是命中面之外的部分。⇒ 下沉粒度 = **链**(尾→头整条搬);驱逐(丢内容)仍可按叶。
+
+### 16.2 §14.6 落地(store 侧)
+
+| 新增 | 作用 |
+|---|---|
+| `KvStore::chain_down_span(tail) -> Option<usize>` | 整条链可搬评估:逐块查设备引用 = 1;全链在宿主 ⇒ `None`(不出空票) |
+| `BlockLeg::chain_offload_candidates(protect, budget)` | 按**链尾 LRU** 出**整条链**(`ChainCand{tail, head, dev_blocks, blocks, last_use}`) |
+| `offload_chain(leg, face, tail)` | 先整条校验(`Busy` = 零副作用拒),再**一条 swap**搬完;已在宿主的块幂等跳过 |
+| `PrefixTree::evict_device` | **腾槽语义**:只逐设备叶(host 叶跳过 —— 见坑册 §48) |
+
+`hooks::plan` 次序(A 轴,§12.3 不变,粒度细化):
+
+```
+① 链级下沉(host 有位;株链长度可能**超出** need —— 粒度就是链,打点照记)
+② 叶级下沉(没有可整条沉的链时退化;同律附则)
+③ 叶级驱逐(host 满;丢内容)
+④ 拒(响亮,含具体数字)
+```
+
+`EvictOut` 加 `span`:`span = 1` 单块;`span > 1` = 整条链(`chain` = 链尾)。
+
+### 16.3 §15 落地(三处改动 + 契约补记)
+
+| 层 | 落点 |
+|---|---|
+| iface | `ConnSlot` / `SwapDir` / `SwapPiece{block,dev_off,conn_off,len,slot}` / `Connector{put,get,tier_name,unbox}` + `DeviceClient::swap`(默认实现 = 逐片 `dtoh_at`/`alloc_pinned+upload_pinned` 循环,**语义等价**) |
+| owl-cuda | `Command::Swap` + `handle_swap`(`swap_out`/`swap_in`)+ `GpuClient::swap` + 五处路由(段计时表 / `cmd_stream` / dispatch / closed / **捕获窗 reject**) |
+| owl-store | `SlotTable`(Connector 的 RAM 实现)+ `HostTier::{lend_slots, land, recycle_many}`;`offload_planes`(批量一条命令)/`offload_chain`/`onload_block` 全切 `face.swap` —— **store 内部只此一条搬运面** |
+
+**实现补记(对 §15.2 伪代码的修正,详见坑册 §49)**:
+
+1. `SwapPiece` 的偏移**拆成两个**(`dev_off` 设备块内 / `conn_off` 连接器槽内)—— 两侧布局不同构;
+2. `Connector::unbox` = 原箱奉还的类型安全取回口(不能给默认实现);
+3. **空片段表** = 响亮拒(handler 第一道);
+4. 回执语义:`Out` = 拷贝完成 **且** `conn.put` 完成;`In` = 全部落地(H2D 流序 + 末尾单 notify);
+5. `swap_in` 的 `conn.get` 在**命令线程同步**做(RAM = memcpy);disk 层按 §15.4 另开 I/O 线程;
+6. 错误纪律:任一失败 = 整条失败(未入队 DMA 不投 finish;staging 回池;回执必达)。
+
+### 16.4 门(全绿)
+
+| 门 | 结果 |
+|---|---|
+| `owl-store` 单测 | **60/60**(新增:链级候选/整条搬逐字节/活跃面零副作用拒/腾槽只逐设备叶/SlotTable 越界) |
+| `owl-cuda --test swap_probe` | **2/2**(变长片 + 片序 ≠ 槽序 + 原箱奉还;设备越界/conn 越界/空表三拒) |
+| `owl-engine --lib` | **36/36** |
+| 演示台 `OWL_OFFLOAD_PROBE=1` | **三门口全过** |
+
+演示台现场(修正后):
+
+```
+[s3-3b] 三轮后:自由槽 10/16 · 缓存 9 块 · 宿主 3 块 / 1.12MiB · 换出 3 次 1152KiB
+[s3-3b] 诊断 链0:tokens=89 matched=2 pending=2 · 0:host|snap=Y 1:host|snap=Y
+[s3-3b] 命中轮回吐:"您提供的文本看起来像是某种**信号"
+[s3-3b] 命中轮后:宿主 1 块 / 0.38MiB · 换出 3 · 回灌 2
+```
+
+- 门① 换出 > 0:**3 块**(链级整条,一条命令 3 块 × 12 片 = 36 片一次 ack);
+- 门② 回灌 > 0:**2 块**(链 0 的前缀段 —— 命中面里,正是"链头段也进宿主"的红利);
+- 门③ **命中路径 vs 冷启动逐字节恒等**(断言在演示台里:`text == cold_text`,同 prompt/贪心)。
+
+### 16.5 挂账(下一刀)
+
+1. **回灌批次化**(`onload_chain`:一条命令搬 N 块)—— `execute_begin` 现在逐块 `swap`,
+   命中 2 块 = 2 条命令;批面骨架已在(`SlotTable` 多槽 + `in_pieces(base_slot)`),只差 engine 侧收集;
+   ✅ **已落(§17.7,同日)**:`onload_blocks` + `LegOps::onload_batches`;演示台
+   “回灌 2 块 / 1 命令”。
+2. H2 的按需下沉目前仍先走链级、无链可沉时退化叶级(**打点需区分**,现在只记总量);
+3. H5 水位 = `nb/2` 仍是临时法(§12.4 的 demand-driven 未落);
+   ✅ **已落(§17,同日第三刀)**:改为需求驱动 `step_need`(准入 Δ_j / prefill 增量 /
+   decode 上界 / 空转零需求),`deny` 不再整单丢弃,并加 `ops.ensure_evicted` 计数门。
+4. `Rel` 收编(去重)+ P1(E2c 快照迁 `copy_batch`,72/192 次 await → 1);
+5. disk connector(S6;§15.4 的 I/O 线程形态)。
+
+---
+
+## 17. 需求驱动保洁落地(§12.4 做实)· 2026-10-16
+
+> 上一刀把**搬什么**做对了(链级 + swap 单命令);这一刀把**什么时候搬、搬多少**做对 ——
+> 用**真需求**替换常数水位,并把"同步驱逐"从常态降为兜底。
+
+### 17.1 需求的真源(`step_need`,与 `schedule` 同源算式)
+
+保洁发生在 pump 的段边界,需求**不再猜**,而由与调度决策**同一份算式**给出:
+
+| 情形 | need(要长的槽数) | why |
+|---|---|---|
+| 队列里有待准入 turn | `Δ_j = ceil(N_j/page) − 设备已驻留的命中块数 − 当前表长` | `Admit` |
+| 活跃 turn 在 prefill | `ceil(fed + chunk)/page − 表长`(chunk 走 `prefill_step_chunk` 单源) | `Grow` |
+| 活跃 turn 在 decode | `ceil(pos + spec 深度上界 + 1)/page − 表长`(**上界是安全方向**) | `Grow` |
+| **空转** | **0(不搬)** —— §12.4 明确废弃"总槽/2"这类固定水位 | `Idle` |
+
+**两条关键口径**:
+
+1. **Δ_j 只能减"设备已驻留"的命中块**(§12.1 的修正点):host 命中的块虽然"命中",
+   **回灌时照样要设备槽** —— 少算就会在回灌那一刻 `Exhausted`。
+   ⇒ `reuse_face(...)` 返回 `(m 可复用块数, dev 其中设备驻留的块数)`,需求侧减 `dev`。
+2. **上界安全律**:decode 的 spec 深度用上界(不查降级态)—— 多算只是**多腾几个槽**
+   (内容不丢);少算才会退回 `ensure_for_len` 的同步驱逐(**丢内容**)。方向性错误不对称。
+
+### 17.2 算式单源(不许两套规范)
+
+| 算式 | 单源落点 | 消费者 |
+|---|---|---|
+| prefill 本步块长 | `RunningEngine::prefill_step_chunk(fed, prompt_len, cfg)` | `schedule()` 的 chunk 决策 + `step_need()` |
+| 命中面裁剪(末块对齐 / 快照在场)+ 设备驻留计数 | `RunningEngine::reuse_face(pool, hit, prompt_len, page)` | `schedule()` 的复用决策 + `step_need()` |
+| 表覆盖目标 | 与 `ensure_for_len(target)` 同一批调用点 | 同上 |
+
+### 17.3 判拒语义修正(deny ≠ 整单丢弃)
+
+旧:plan 的 `deny`(凑不够 need)⇒ `pool_housekeeping` 直接 return(**整单不搬**)。
+新:**`deny` = 真容量不足预警** —— 响亮 WARN,但 `out` 里能搬的**照搬**(下沉不丢内容),
+真拒绝留给 `ensure_for_len` 的 `Exhausted`(响亮、带数字)。
+
+### 17.4 可见性:兜底驱逐计数器
+
+`LegOps::ensure_evicted`:凡 `ensure_for_len` 内部触发了压力驱逐,就 +N(报告面可查)。
+语义 = **"需求驱动保洁不够用"的指纹**;需求驱动到位时它应恒为 0。
+
+### 17.5 演示台重做:冷热交替(真需求)
+
+旧演示台靠"H5 空转水位"造下沉(那正是 §12.4 批评的临时法);新场景**只靠真需求**:
+
+```text
+池 = 8 槽(单会话容量下限,page 32)     宿主面 = 8MiB
+轮 1  热链 A(89 tok ⇒ 3 块)         need = 3,free 8 ⇒ 不动
+轮 2  热链 B(3 块)                  need = 3,free 5 ⇒ 不动
+轮 3  长 prompt(7 块)               need = 7,free 2 ⇒ **沉 A+B 整条(6 块)** ⇒ free 8 ⇒ 无驱逐
+轮 4  重发 A(命中 2 块,**都在宿主**)  need = 3(dev=0!)⇒ 沉冷链 D 让路 ⇒ **回灌 2 块**
+```
+
+现场(0.8B @ RTX 3080):
+
+```
+[hook] Admit need=3 free=8/8 判 out=0        ← 轮 1
+[hook] Admit need=3 free=5/8 判 out=0        ← 轮 2
+[hook] Admit need=7 free=2/8 判 out=2        ← 轮 3:整条沉 A+B
+[s3-3b] 轮 3 后:自由槽 2/8 · 缓存 12 块 · 宿主 6 块 / 2.25MiB · 换出 6 次 2304KiB
+[s3-3b] 诊断 链A:tokens=89 matched=2 pending=2 · 0:host|snap=Y 1:host|snap=Y
+[hook] Admit need=3 free=2/8 判 out=1        ← 轮 4:冷链让路
+[s3-3b] 轮 4 后:宿主 10 块 · 换出 12 · 回灌 2 · 兜底驱逐 0
+```
+
+### 17.7 回灌批次化(§15 批面收尾;同刀)
+
+`execute_begin` 原本**逐块** `onload_block`(命中 N 块 = N 次 actor 往返);现改
+`onload_blocks` **一条 swap 搬 N 块**(单块 = N=1 的糖,同一条路径 —— 律 13)。
+`LegOps` 加 `offload_batches` / `onload_batches`(命令次数;块数仍看 `offloads`/`onloads`)。
+
+演示台现场:
+
+```
+[s3-3b] 轮 4 后:宿主 10 块 / 3.75MiB · 换出 12 块/3 命令 · 回灌 2 块/1 命令 · 兜底驱逐 0
+```
+
+⇒ 换出:每条链一命令(链内 N 块一次 ack);回灌:N 块一命令。门 = 演示台断言
+`onload_batches == 1` + store 单测 `onload_blocks_moves_n_blocks_in_one_command`。
+
+### 17.8 门(全绿)
+
+| 门 | 结果 |
+|---|---|
+| 演示台三门口 | 换出 12 块/3 命令(限整条链)/ 回灌 2 块/**1 命令** / 命中 vs 冷启动**逐字节恒等** |
+| **兜底驱逐** | `ensure_evicted == 0` **全程**(需求驱动到位;轮 4 也不靠兜底) |
+| `owl-store` 单测 | **61/61**(含批量回灌门) |
+| `owl-engine --lib` | 36/36 |
+| e2e 场景(0.8B) | `prefix_cache_hit` / `schedule_decision_surface` / `session_continuity` / `multi_session_isolation` 全过 |
+
+### 17.9 挂账
+
+1. **草稿腿的 need 未纳入算式**:`exec/draft.rs` 里 MTP/草稿链的 `ensure_for_len(… + 8)`
+   仍是固定余量(它们多为独立池;spec 轮的 target 腿需求已由 decode 上界覆盖);
+2. **空转预搬**降级为"不做":要把搬运从关键路径挪走(TTFT 优化)应作为**显式策略**
+   (预热/热度预测)立项,而不是恢复常数水位;
+3. **B 轴(KVMem 窗口压缩)落地后** `D_active` 会变小 ⇒ 需求算式要跟着改(现在按"活跃面整块 dense 驻留"算);
+4. H1(准入)现在只在 pump 段边界触发一次;若将来支持"一次准入多个 turn"(批调度),
+   需求要按批合并(算式不变,求和即可)。
+
+---
+
+## 18. CPU mock server 档(无卡 GPU server)· 2026-10-16
+
+> 用户点题:GPU 后端"无非是申请显存、分配、记账"—— **这些动作不需要真动显卡**。
+> ⇒ 把 CPU 面升格为"无卡 GPU server":**命令面等价、账目等价、数值可空转**。
+
+### 18.1 落点:不新造 server,补 `CpuFace`
+
+`owl-cpu::CpuFace` 本来就是 `DeviceClient` 的一个**真实现**(store 的 61 项单测跑在它上面),
+缺的只是"GPU 的形状"。补齐后它**就是** mock server,而且契约单源(同一个 trait、同一份
+捕获/搬运语义)。若另造一套,立刻多出"两套规范"(AGENTS.md 明令禁止)。
+
+### 18.2 补的四件
+
+| # | 能力 | 语义(与 GPU server 对齐) |
+|---|---|---|
+| 1 | **图捕获/重放** | 捕获窗 = **只录不发**(记 kernel+args+out);`graph_end` 空窗**响亮拒且仍留在窗内**(须 `graph_abort` 收尾);重放 = 依次重算(CPU 无指针烤入);**窗内禁** htod/dtoh/sync/copy/memset/upload(与 GPU 的 reject 表同律 —— mock 不放宽捕获契约) |
+| 2 | **命令面补齐** | `upload_and_launch`(装载 cast 写口;按**声明 dtype** 解码 —— F16/BF16 都通)、`block_ledger_dump`(活块投影 + 单调假地址,审计可判定)、`mem_pool_trim` = 0 |
+| 3 | **容量墙** | `MockLimits::vram_bytes`:按**声明 dtype** 记账(`alloc(F16,n)` 占 2n —— 不因 mock 的 f32 存储翻倍,否则"卡能装多少"的账失真);越界 = `PoolExhausted`(真卡同一条语义);`free` 回冲 |
+| 4 | **计算空转** | `MockLimits::null_kernels`:launch 不路由算子、输出清零后返回 —— warmup / 全前向可"跑得过" |
+
+另修:`Value::from_bytes` 补 **BF16 解码**(bf16 = f32 高 16 位)—— 装载 cast 路径的源头字节。
+
+### 18.3 界线(必须说清,否则会被误用)
+
+- **等价面**:账(分配/释放/容量)、搬运(dtoh/htod/swap/复合上传)、命令序、图捕获契约;
+- **不等价面**:数值(空转档输出清零 ⇒ 生成内容是垃圾,但 token 合法不崩);**性能数不可用**。
+- ⇒ mock 档的用途 = **结构与压力测试**(boot 拒启 / 容量不足 / 准入拒绝 / 搬运往返 / 钩子行为),
+  不是跑分,也不是正确性验证的替代品。
+
+### 18.4 门(全绿)
+
+| 门 | 结果 |
+|---|---|
+| `owl-cpu` 单测 | **5/5**(图录放幂等 + 空窗/嵌套/窗内搬运三拒;容量墙 + 注入 + 声明口径;BF16 复合上传;账本投影;空转档) |
+| **`cpu_mock_smoke`**(engine 跑在 CpuFace 上) | **boot / 装载 / warmup / 图捕获 / turn 全链无卡通过** |
+| 容量墙拒启 | `PoolExhausted: cpu-mock(容量墙) 需 508559360B 余 1048576B`(**自带归因**) |
+| 回归 | store 61/61、engine lib 36/36 不变 |
+
+跑法:`OWL_CPU_MOCK=1 cargo test -p owl-engine --test cpu_mock_smoke -- --nocapture`
+(默认 skip:0.8B 装载在 CPU 面上约 70s,不进默认套件)。
+
+### 18.5 挂账
+
+1. **演示台/offload_probe 的 CPU 档**:e2e 场景体已泛型(`RunningEngine<D>`),但装配入口
+   (`Engine::new` → GpuClient)与快照/GDN 门需按 CPU 面补齐 —— 补完即可"无卡跑 store 三门口";
+2. **故障注入扩展**:swap/搬运失败注入(现在只有分配注入);
+3. 若要当 CI 常驻档:装载 70s 需提速(CPU cast 路径)或做装载产物缓存。
+
+#### 18.4.1 补记:CPU 档装载耗时(实测账,免得后人当 bug 查)
+
+| 口径 | 0.8B 装载耗时 | 数值 |
+|---|---|---|
+| 改造前(旧 `upload_pinned` 不管声明 dtype,按 f32 位模式解) | ~25s | **错的**(BF16 字节被当 f32 读 ⇒ 权重垃圾;既有 CPU 测试只查层数/tokenizer,故"通过") |
+| 改造后(按声明 dtype 解码:BF16 → f32 位补齐) | ~65s | 正确(有 `upload_and_launch_decodes_declared_dtype` 门) |
+
+⇒ 这 40s 是**修正数值的代价**,不是回归。优化挂账:装载产物缓存 / 批量位转换(SIMD)——
+若要让 mock 档做 CI 常驻,先做这两件。
+
+#### 18.5.1 挂账①实施细则:CPU 档跑"引擎真前向"的三个缺口(2026-10-16 探路停)
+
+目标(推①)= 让 store 演示台(`offload_probe`)**无卡**跑同一套三门口。
+基础设施已就位并入库:场景体与 face 解耦(`offload_probe_scenario<D>`)、
+旋钮共用(`offload_probe_config`)、无卡入口(`OWL_CPU_MOCK` ⇒ `e2e_body` 只跑 CPU 档)、
+`cpu_mock_offload_probe` 场景。**卡在 engine 侧的三处口径/能力缺口**:
+
+| # | 缺口 | 现象 | 修法(独立刀) |
+|---|---|---|---|
+| 1 | **回读字节口径**:engine 部分 `dtoh` 调用按**模型 dtype** 算字节,而 CpuFace 的存储/布局是 **f32 口径** | `dtoh: 块 2964 字节 131072 != 收割 65536` | 让"设备字节口径"成为 face 的**自述能力**(如 `DeviceClient::block_byte_scale()`),engine 按它算;或 CPU 档统一 f32 |
+| 2 | **分页策略依赖 dtype**:`kv_paged_policy(dtype)` 对 F32 无策略 ⇒ 落 legacy 臂 | 试把 CPU 档 dtype 归一为 F32 ⇒ `attention.rs` 的"v1 臂已退役"panic | 分页策略与执行域 dtype 解耦(F32 也要有 paged 几何) |
+| 3 | **attn v2 scratch 注入**以 paged 为前提 | 同上(缺 `ctx.attn_v2` 才触发退役 panic) | 与 ② 同刀 |
+
+**结论**:CPU mock 档当前能力 = ①账/搬运/命令面/图捕获/容量墙/注入(§18.4 门全绿);
+"engine 真前向跑在 mock 上"需先做 ①②③ 这一刀 —— 那是 **engine 执行域 dtype 收拾**,
+不是 mock 台账的事。**在那之前,无卡档的 store 验证走 store 单测(61 项)+ `cpu_mock_smoke`
+(全链 boot/装载/warmup/图捕获/turn)。**
+
+#### 18.4.2 ⚠️ 65s 疑云:已排除清单(未定谳,2026-10-17 凌晨)
+
+> 起因:用户质疑"0.8B 小模型在 CPU 上装载要 65s?"——**质疑成立**:1.5GB BF16 → f32
+> 的理论成本是内存带宽级(秒级),65s 差 20 倍以上。此前"这是正确性代价"的说法**已撤回**。
+
+**已排除(全部有实测)**:
+
+| 假设 | 实测 | 判定 |
+|---|---|---|
+| 解码转换慢 | 换 65536 项 LUT(与 `half` 逐位一致,有对拍门)⇒ 61s→**52.7s** | ❌ 非主因 |
+| debug 无优化 | `owl-cpu` + `half` 均开 `opt-level=3`(rustc 命令行已确认) | ❌ 无效 |
+| 环境(swap/内存/NUMA/cgroup) | 107GB available、swap 未动、单 NUMA、无 cgroup 限、load 5.4/48 | ❌ 排除 |
+| 长尾(个别慢调用) | 307 次调用**均匀** 57–80 ns/元素 | ❌ 非长尾 |
+| 分配/page fault | `alloc` 段合计 0.26s(块容量 1.5G 元素) | ❌ 排除 |
+
+**现状**:时间 100% 落在 `decode_loop` 段(52.7s),该段只剩"顺序读 `bytes`(1.5GB)
++ LUT 查表 + 顺序写 `dst`(3.2GB)" —— 按带宽应 ~3s,**实测 68ns/元素(≈200 周期)**。
+对照组"纯 f32 写 = 0.00s"**不可信**(疑被编译器当死写消除,缺 `black_box`)。
+
+**下一步(受控微基准,勿再猜)**:在同一块 67M 元素内存上做 4 组带 `black_box` 的对照
+(纯读 / 纯写 / 读+写 / 读+转换+写),把"内存 vs 循环体"一刀切开。**在定谳前**:
+①不要再用"CPU 固有成本"解释;②mock 档保持"按需开"。
+
+**临时插桩(定位后删)**:`owl_cpu::{mock_stats, mock_segments, mock_slow_calls}` +
+`cpu_mock_*` 三个诊断用例;LUT 与 `f16_lut_matches_half_bit_for_bit` 门**保留**(它是净收益)。
+
+#### 18.4.3 定谳:瓶颈在**输入侧 staging**,不在解码循环(2026-10-17)
+
+受控微基准(`bench2`/`bench3`,全部带 `black_box`,Rust 1.97):
+
+| 环境 | 变体 | ns/元素 |
+|---|---|---|
+| 隔离(10M 元素/40MB) | `chunks_exact+zip+lut` / 索引 / 纯写 | 3.8 / **1.8** / 1.0 |
+| 隔离(67M 元素/134MB,超 L3) | `chunks_exact+zip+lut` / 索引 / 纯写 | **2.5** / **1.1** / 0.7 |
+| **真实装载(67M 元素/块,同函数内)** | 解码循环 / **紧跟的热写对照** | **67** / **6.1** |
+
+⇒ 结论:
+1. **解码循环本身不慢**(隔离 2.5ns/元素;`chunks_exact` 比索引约慢 2×,是次要项);
+2. 真实装载里"纯写"已慢 9×(6.1 vs 0.7)⇒ 目标块(6GB 分散 Vec,首次触碰)本就有代价;
+3. **剩下 11 倍(67 vs 6.1)= 读输入 `bytes`** —— 它是 `alloc_pinned` **每次新建的 staging 缓冲**
+   (默认 `HeapRegion(vec![0u8; n])`,每次 33MB),**不复用、每次都冷**。
+
+**修法方向(下一刀,不属 mock 台账)**:
+- ① staging 缓冲**池化复用**(装载路径已有 `LoadStaging`,但它按"臂"分槽 —— 实际每次 `alloc_pinned` 仍新建;
+  让 CPU face 的 `alloc_pinned` 走**自有页锁池**是等价 GPU 语义);
+- ② 或**零中转**:从 safetensors 直读直解(省掉"填 staging → 再读 staging"的一趟)。
+
+**用户的判断部分被证实**:数组切分(`chunks_exact`)确实比索引慢 **2×**(2.5 vs 1.1 ns/元素),
+但**不是** 65s 的主因;主因是输入侧 staging 冷读。
+
+#### 18.4.4 ✅ 定谳与修复:65s → 3.83s(2026-10-17)
+
+**三处叠加**(按贡献排序,全部有对照数据):
+
+| # | 根因 | 证据 | 修法 | 收益 |
+|---|---|---|---|---|
+| 1 | **staging 每次新建**:默认 `alloc_pinned` 每次 `HeapRegion(vec![0u8; n])`(33MB/次),用完即 drop | 池化后命中 **306/307** | `CpuFace::alloc_pinned` 池化 + `upload_pinned` 末尾归池(与 GPU"完成回调归还池"同语义) | 60.9s → 20.5s |
+| 2 | **别名信息丢失**:`bytes` 来自 `Box<dyn PinnedRegion>::as_bytes()`(**虚调用**)⇒ LLVM 无法证明与 `dst` 不别名 ⇒ 每次写后重载源、禁向量化 | 同一循环:独立函数 **0.51ns/元素** vs 函数内 **38ns/元素**(74×);循环前 0.00s / 循环体 29.31s | 抽成自由函数 **`#[inline(never)]`**(签名 `fn decode_into(dtype, src: &[u8], dst: &mut [f32])` ⇒ noalias 交给编译器)。**`#[inline]` 无效** —— 内联会把别名假设传染回去 | 19.23s → 1.83s |
+| 3 | **数组切分**:`chunks_exact(2).zip` | 受控微基准 2.5 vs 索引 1.1 ns/元素 | 索引式循环 | ~2s |
+
+**总账**:
+
+```
+装载墙钟         65s → 3.83s   (17×)
+upload_pinned    60.9s → 1.83s
+engine lib 套件  65s → 4.59s   (含两处 CPU 装载)
+```
+
+**可复用规律(已入坑册 §50)**:热循环里数据若来自 `dyn`/trait-object 边界,LLVM 会丢别名信息
+⇒ 循环失优化;**把循环抽成 `#[inline(never)]` 的独立函数**(参数用切片签名)即恢复。
+判据:同一段代码"独立基准 ≪ 原地循环" ⇒ 先查别名与内联,**不要先怀疑内存带宽**。
+
+**保留物**:`bench_write` / `bench_read` / `bench_decode_f16`(优化 crate 内的性能锚)+ `mock_stats`。
+**诊断插桩全部删除**(PROBE/SCRATCH/SEGA/PB/池计数)。
+
+---
+
+## 19. store 无卡端到端演示(§19)· 2026-10-17
+
+> 背景:engine 侧的 store 演示台需要**真模型前向**(无卡档受执行域 dtype 约束,§18.5.1);
+> 而 store 的**账与搬运**闭环**不需要模型** ⇒ 用 store **自己的公开 API** 复刻同一套三门口。
+
+**落点**:`crates/store/tests/store_e2e.rs`(integration;dev-dep `owl-cpu` 做真搬运,CpuFace 走真字节)。
+
+| 场景 | 内容 | 门 |
+|---|---|---|
+| ① 冷热交替 | 池 6 槽 → 建 A/B 两条热链(池满)→ 钩子判(need=2)⇒ **链级整条沉 A** → 二次命中 ⇒ **一条命令批量回灌** | 换出>0 / 回灌=块数 / `onload_batches == 1` / `ensure_evicted == 0` / **逐字节恒等** |
+| ② 链级粒度 | 整条 `offload_chain` ⇒ 链头段也在宿主 ⇒ 命中面 `pending == 3` | 候选票(dev_blocks=3)+ 载体全 Host |
+
+**耗时 0.00s**(无卡、默认套件内跑)⇒ 这是 store 自己的回归锚,不再依赖 GPU/模型。
+
+**教训(演示脚本也是代码)**:脚本里为取槽号调了 `match_prefix`,它 **touch 使 A 变热** ⇒
+`plan` 就**正确地**去沉更冷的 B。链级候选按**链尾 LRU** 出票 —— 脚本必须尊重这个语义
+(否则会误判 store 有 bug)。已写进测试注释。
+
+#### 18.5.2 裁决(2026-10-17,用户):①②③ **不追** —— 由 §19 覆盖
+
+"engine 真前向跑在 mock 上"需要先做执行域 dtype 收拾(①②③),那是 **engine 侧**的工程;
+**store 需要的无卡验证不需要它** —— store 的账与搬运闭环用**自己的 API** 复刻即可(§19,
+`crates/store/tests/store_e2e.rs`,0.00s)。
+⇒ ①②③ 保留为**将来做"CPU 执行档"时**的入口清单,不再是 store 刀的阻塞项。
