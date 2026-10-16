@@ -358,7 +358,7 @@ impl<D: DeviceClient> GraphPlan<D> {
             } else {
                 f32b(&init)
             };
-            let block = face.htod(i.dtype, &i.shape, &bytes).await?;
+            let block = face.htod(i.dtype, &i.shape, &bytes, &format!("plan.in.{}", i.name)).await?;
             ins.push(InSlotDev {
                 name: i.name,
                 len: i.len,
@@ -432,8 +432,9 @@ impl<D: DeviceClient> GraphPlan<D> {
             // —— 存活构成与分配总量同比例(一字节没 free)时的唯一追问面。
             owl_shared::log_info!(
                 "graph-plan",
-                "活性回收账:{}",
-                owl_shared::slab_hint::live_diag::take_report()
+                "活性回收账:{} ‖ 引用计数推送 {} 次",
+                owl_shared::slab_hint::live_diag::take_report(),
+                owl_shared::slab_hint::refs_pushed()
             );
             warm_res?;
             sess.face.sync().await?;
@@ -511,7 +512,7 @@ impl<D: DeviceClient> GraphPlan<D> {
         for i in desc.inputs {
             let mut init = i.init;
             init.resize(i.len, 0.0);
-            let block = face.htod(Dtype::F32, &vec![i.len], &f32b(&init)).await?;
+            let block = face.htod(Dtype::F32, &vec![i.len], &f32b(&init), &format!("plan.in.{}", i.name)).await?;
             ins.push(InSlotDev {
                 name: i.name,
                 len: i.len,
@@ -578,7 +579,7 @@ impl<D: DeviceClient> GraphPlan<D> {
                     ))));
                 }
             }
-            let out = sess.face.alloc(dt, elems).await?;
+            let out = sess.face.alloc(dt, elems, &format!("piecewise.bp.{}:{dt:?}", node.id())).await?;
             bs.push(BreakPoint { node, out, idempotent: true, host_scalar });
         }
         let trees: Vec<TensorOps> = outs.iter().map(|(_, t)| t.clone()).collect();

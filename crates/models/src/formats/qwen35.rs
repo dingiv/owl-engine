@@ -63,6 +63,8 @@ impl KeyConvention for Qwen35Convention {
                     s,
                     "qweight" | "scales" | "zeros" | "ws" | "marlin_ws" | "marlin_ctmp"
                         | "packed_raw"
+                        // W4A8 键族(S2 2026-10-17;同样"后缀已内含")
+                        | "qweight_a8" | "scales_a8" | "zeros_a8" | "a8_factor"
                 ) =>
             {
                 (b, Some(format!(".{s}")))
@@ -511,8 +513,8 @@ mod tests {
             let d_gf = b_g.iter().zip(b_ref.iter()).filter(|(a, b)| a != b).count();
             eprintln!("[draft-bench] {base}: host gather-vs-fused 差 {d_gf}/{}", b_ref.len());
             // GPU 臂:上传原始 packed → owl_ct_repack_u32 → 回读
-            let raw = gpu.htod(Dtype::U32, &vec![rows, cols], &ph).await.expect("htod raw");
-            let out_b = gpu.alloc_uninit(Dtype::U32, rows * k / 8).await.expect("alloc out");
+            let raw = owl_iface::htod!(gpu, Dtype::U32, &vec![rows, cols], &ph).await.expect("htod raw");
+            let out_b = owl_iface::alloc_uninit!(gpu, Dtype::U32, rows * k / 8).await.expect("alloc out");
             let env = gpu.op_env().expect("GPU env");
             let pick = owl_kernels::driver::resolve(owl_kernels::driver::OpReq {
                 op: owl_kernels::driver::load::CT_REPACK,
@@ -1108,8 +1110,8 @@ mod tests {
             // 形态二:of_block 上传块(htod_f32 后以 Block 叶子引用)
             let sa = vec![m, k];
             let sb = vec![k, n];
-            let ba = gpu.htod_f32(&sa, a.clone()).await?;
-            let bb = gpu.htod_f32(&sb, b.clone()).await?;
+            let ba = gpu.htod_f32(&sa, a.clone(), "testkit.ba").await?;
+            let bb = gpu.htod_f32(&sb, b.clone(), "testkit.bb").await?;
             let a_b = TensorOps::of_block(ba.id, Dtype::F32, vec![m, k]);
             let b_b = TensorOps::of_block(bb.id, Dtype::F32, vec![k, n]);
             let got2 = crate::testkit::harvest(&mut gpu, &a_b.matmul(&b_b)).await;

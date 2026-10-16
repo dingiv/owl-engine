@@ -14,12 +14,12 @@ async fn dma_microbench() {
     client.sync().await.unwrap();
 
     let src: Vec<u8> = vec![0xABu8; MB];
-    let dst = client.alloc(Dtype::U32, MB / 4).await.expect("alloc");
+    let dst = owl_iface::alloc!(client, Dtype::U32, MB / 4).await.expect("alloc");
 
     // 1) htod 单块重复(含 to_vec 拷贝 + staging malloc/free 每次裸付)
     let t0 = Instant::now();
     for _ in 0..20 {
-        let b = client.htod(Dtype::F16, &Shape::from(vec![MB / 2]), &src).await.expect("htod");
+        let b = owl_iface::htod!(client, Dtype::F16, &Shape::from(vec![MB / 2]), &src).await.expect("htod");
         let _ = b;
     }
     client.sync().await.unwrap();
@@ -29,7 +29,7 @@ async fn dma_microbench() {
     // 2) alloc_pinned/upload_pinned 流水(池命中后)
     let t0 = Instant::now();
     for _ in 0..20 {
-        let mut lease = client.alloc_pinned(MB).await.expect("pinned");
+        let mut lease = owl_iface::alloc_pinned!(client, MB).await.expect("pinned");
         lease.slice_bytes_mut().copy_from_slice(&src);
         client.upload_pinned(lease, &dst, 0, MB).await.expect("upload");
     }
@@ -39,7 +39,7 @@ async fn dma_microbench() {
 
     // 3) 对照:首块单独计时(cold,含池 miss + malloc_host)
     let t0 = Instant::now();
-    let lease = client.alloc_pinned(MB * 4).await.expect("pinned cold 32MB");
+    let lease = owl_iface::alloc_pinned!(client, MB * 4).await.expect("pinned cold 32MB");
     let cold = (Instant::now() - t0).as_secs_f64() * 1e3;
     eprintln!("[dma] alloc_pinned 32MB cold: {cold:.2} ms");
     drop(lease);

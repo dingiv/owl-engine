@@ -81,7 +81,7 @@ async fn engine_onload(
 async fn pieces(face: &mut CpuFace, slots: usize) -> Vec<PieceSpec> {
     let mut out = Vec::new();
     for _ in 0..2 {
-        let b = face.alloc(Dtype::F32, PIECE_ELEMS * slots).await.expect("池块");
+        let b = face.alloc(Dtype::F32, PIECE_ELEMS * slots, "t").await.expect("池块");
         out.push(PieceSpec { buf: b, stride_bytes: PIECE_BYTES });
     }
     out

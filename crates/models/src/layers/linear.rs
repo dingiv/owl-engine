@@ -27,6 +27,10 @@ pub struct Linear {
     zs: Option<Weight>,
     ws: Option<Weight>,
     ctmp: Option<Weight>,
+    /// **W4A8 全局因子**(f32[1];装载期由该层权重尺度算出 ——
+    /// `pack_marlin_s_a8` 第二返回值 `max/4096`)。`Some` = 本层走 a8 臂
+    /// (**单一事实源**:因子在则 a8 在)。
+    a8_factor: Option<Weight>,
 }
 
 impl Linear {
@@ -51,11 +55,13 @@ impl Linear {
             zs: None,
             ws: None,
             ctmp: None,
+            a8_factor: None,
         };
         let eligible = crate::formats::w4a16::marlin_eligible(out_dim, in_dim);
         match plan {
             QuantPlan::W4A16 if eligible => lin.quantize_g128(),
             QuantPlan::W4A16Awq if eligible => lin.quantize_awq32(),
+            QuantPlan::W4A8Awq if eligible => lin.quantize_awq_a8(),
             _ => {}
         }
         lin
@@ -117,6 +123,38 @@ impl Linear {
         self.ctmp = Some(Weight::new_typed_u32(key, vec![1]));
         self.quant_group = Some(g);
     }
+
+    /// **W4A8 × AWQ 定形**(S2;构造期私有):与 `quantize_awq32` **同尺寸**
+    /// (B/scales/zp 都在同一套 tile 尺寸下换布局 —— 字节数不变),另加
+    /// `a8_factor` f32[1]。
+    ///
+    /// 容量说明:`a_scales`(per-token 尺度)**不在这里** —— 它是**每轮
+    /// 按调用形状**的瞬态(`TensorOps::zeros(F32, [m,1])`,引擎按形状分配),
+    /// 故层里零容量常量、零预留(装 8192 行也只是一次 32KB memset)。
+    fn quantize_awq_a8(&mut self) {
+        debug_assert!(crate::formats::w4a16::marlin_eligible(self.out_dim, self.in_dim));
+        let g = 32usize;
+        let n_pack = marlin_n_pack(self.out_dim);
+        let key: &'static str = self.w.key();
+        self.qw = Some(Weight::new_typed_u32(
+            key,
+            vec![self.in_dim / 16, n_pack * 16 / 8],
+        ));
+        // scales_a8 线 dtype = F16 槽(int16 归一位型;与 a16 同尺寸)
+        self.sc = Some(Weight::new_typed_f16(
+            key,
+            vec![self.in_dim / g, n_pack],
+        ));
+        self.zs = Some(Weight::new_typed_u32(
+            key,
+            vec![self.in_dim / g, n_pack / 8],
+        ));
+        self.ws = Some(Weight::new_typed_u32(key, vec![crate::ops::marlin_ws_elems(n_pack)]));
+        self.ctmp = Some(Weight::new_typed_u32(key, vec![1]));
+        // 全局因子(装载器填;核侧设备标量块)
+        self.a8_factor = Some(Weight::new_typed(key, vec![1], Dtype::F32));
+        self.quant_group = Some(g);
+    }
 }
 
 impl Module for Linear {
@@ -136,6 +174,43 @@ impl Module for Linear {
 impl Linear {
     /// ctx 无关前向(Embedding::lm_head_matmul 复用;14 个调用点零改动)。
     pub(crate) fn forward_inner(&self, xs: &TensorOps) -> TensorOps {
+        // ---- W4A8 × AWQ 臂(S2):激活量化 → a8 GEMM ----
+        //
+        // 与 a16 臂**同源不同布局**;两处本仓特有的形态:
+        // ① `a_scales` = **每轮瞬态**(`TensorOps::zeros`)—— 引擎按调用形状
+        //    分配(m 行 ⇒ m 个 f32),故无容量常量/无预留、无跨调用竞争;
+        // ② 全局因子 = **设备标量块**(`a8_factor`,装载器填)—— 量化核直接读它,
+        //    零 host 回路零额外发射。
+        if let (Some(g), Some(qw), Some(sc), Some(zs), Some(ws), Some(ctmp), Some(fac)) = (
+            self.quant_group,
+            &self.qw,
+            &self.sc,
+            &self.zs,
+            &self.ws,
+            &self.ctmp,
+            &self.a8_factor,
+        ) {
+            let m: usize = xs.shape()[..xs.shape().len() - 1].iter().product();
+            let n_pack = marlin_n_pack(self.out_dim);
+            let a_scales = TensorOps::zeros(Dtype::F32, vec![m, 1]);
+            let q = crate::ops::quant_int8_row(xs, &fac.decl(), &a_scales, m, self.in_dim);
+            // 槽序(w4a8 表)= a, b, out, scales, zeros, a_scales, ws, c_tmp,
+            // m, k, n, groupsize(out 由装配器按 O 槽插入 —— 声明驱动)
+            let gemm = TensorOps::call(SemanticKernel::MarlinW4A8Awq)
+                .arg(&q)
+                .arg(&qw.decl())
+                .arg(&sc.decl())
+                .arg(&zs.decl())
+                .arg(&a_scales)
+                .arg(&ws.decl())
+                .arg(&ctmp.decl())
+                .arg_usize(m)
+                .arg_usize(self.in_dim)
+                .arg_usize(n_pack)
+                .arg_usize(g)
+                .with_shape(Dtype::F16, vec![m, n_pack]);
+            return narrow_strided(&gemm, m, n_pack, 0, self.out_dim, vec![m, self.out_dim]);
+        }
         if let (Some(g), Some(qw), Some(sc), Some(ws), Some(ctmp)) = (
             self.quant_group, &self.qw, &self.sc, &self.ws, &self.ctmp,
         ) {
@@ -188,6 +263,39 @@ impl Loadable for Linear {
     /// (w4a16.rs)按同款谓词供给。AWQ 臂增 zeros Want(`{w.key}.zeros`,
     /// pack_marlin_z 产物;源 awq.rs 供给)。
     fn layout(&self, ctx: &LoaderCtx) -> LoaderOps {
+        // ---- W4A8 键族(S2):与 a16 键族**并列**,同源不同布局 ----
+        if let (Some(_g), Some(qw), Some(sc), Some(zs), Some(ws), Some(ctmp), Some(fac)) = (
+            self.quant_group,
+            &self.qw,
+            &self.sc,
+            &self.zs,
+            &self.ws,
+            &self.ctmp,
+            &self.a8_factor,
+        ) {
+            let base = self.w.key();
+            let device = ctx.device_repack;
+            let ops = if device {
+                // 设备重排(生产默认):源 packed 直拷上卡 → `owl_ct_repack_a8_u32`
+                // 出 a8 布局 B(与 a16 共用 `load_direct_device_rearrange` 快路)
+                qw.layout_as_device_rearrange(
+                    format!("{base}.packed_raw"),
+                    crate::ops::SemanticKernel::CtRepackA8,
+                    self.out_dim,
+                    self.in_dim / 8,
+                    ctx,
+                )
+            } else {
+                // CPU 懒物化(a8 键族;含因子)
+                qw.layout_as(format!("{base}.qweight_a8"), ctx)
+            };
+            return ops
+                .chain(sc.layout_as(format!("{base}.scales_a8"), ctx))
+                .chain(zs.layout_as(format!("{base}.zeros_a8"), ctx))
+                .chain(ws.layout_as(format!("{base}.marlin_ws"), ctx))
+                .chain(ctmp.layout_as(format!("{base}.marlin_ctmp"), ctx))
+                .chain(fac.layout_as(format!("{base}.a8_factor"), ctx));
+        }
         match (self.quant_group, (&self.qw, &self.sc, &self.ws, &self.ctmp)) {
             (Some(_g), (Some(qw), Some(sc), Some(ws), Some(ctmp))) => {
                 let base = self.w.key();
@@ -235,6 +343,162 @@ mod tests {
     use crate::testkit::{assert_close, f32b, harvest, hf_python, parity_enabled, skip_note, st_read, st_write, tmp_path, Src};
     use crate::tensor::Dtype;
     use std::collections::HashMap;
+
+    /// **W4A8 验收门(S2;GPU + 真检查点)**:同一条真实 AWQ 层,两条 plan
+    /// (`W4A16Awq` ↔ `W4A8Awq`)**同输入对拍** —— 走全链:装载(a8 键族 /
+    /// 设备重排 a8 核)→ `Linear::forward`(激活 int8 量化 + kS8×kU4 GEMM)→ 回读。
+    ///
+    /// 判据 = **噪声/信号 RMS**(a8 是另一档量化:per-token int8 激活 + int16
+    /// 权重尺度 ⇒ 不逐位;a16 是 f16 激活 + f16 尺度)。阈值 1e-2 远超理论
+    /// 偏差(激活 1/(2·127) ≈ 4e-3 + 尺度 1.2e-4),但足以抓住**布局/接线级**
+    /// 错误(拿错 B 表、a_scales 没接上、因子没折——量级都在 10⁻¹ 以上)。
+    ///
+    /// 跑法:`OWL_TEST_DEVICE=1 OWL_AWQ27B_DIR=<cyankiwi 27B> cargo test -p owl-models
+    ///       --lib gpu_w4a8_matches_w4a16_on_real_layer -- --nocapture`
+    #[tokio::test]
+    async fn gpu_w4a8_matches_w4a16_on_real_layer() {
+        use crate::module::QuantPlan;
+        use crate::testkit::{gpu_client, gpu_enabled};
+        if !gpu_enabled() {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return;
+        }
+        let Some(dir) = owl_shared::env_reader::str("OWL_AWQ27B_DIR") else {
+            eprintln!("skip: OWL_AWQ27B_DIR 未设(cyankiwi 27B 检查点目录)");
+            return;
+        };
+        // 真层:layer0.mlp.gate_proj(17408×5120)——两档都 marlin_eligible。
+        // 局部键 = "gate_proj"(层内惯例);全键由 `map_keys` 在**声明期**改写
+        // (与整模路同一条 `KeyConvention` 语义 —— 这里手写前缀即可)。
+        let (local, prefix) = ("gate_proj", "model.language_model.layers.0.mlp.");
+        let (out_dim, in_dim, m) = (17408usize, 5120usize, 8usize);
+        struct Prefixed<'a>(&'a Linear, &'a str);
+        impl crate::module::Loadable for Prefixed<'_> {
+            fn layout(&self, ctx: &LoaderCtx) -> crate::module::LoaderOps {
+                let p = self.1.to_string();
+                self.0.layout(ctx).map_keys(move |k| format!("{p}{k}"))
+            }
+        }
+        // 确定性输入(r16 对齐:进 f16 域前先舍入,免"装载域 vs 输入域"两套口径)
+        let r16 = |x: f32| half::f16::from_f32(x).to_f32();
+        let xs: Vec<f32> = (0..m * in_dim).map(|i| r16(((i as f32) * 0.013).sin() * 0.8)).collect();
+        let xb: Vec<u8> = xs.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect();
+
+        let mut got: Vec<Vec<f32>> = Vec::new();
+        for plan in [QuantPlan::W4A16Awq, QuantPlan::W4A8Awq] {
+            let lin = Linear::new(local, out_dim, in_dim, plan);
+            let comp = Prefixed(&lin, prefix);
+            let mut gpu = gpu_client().await;
+            let opts = crate::formats::load::LoadOpts::new(&gpu, Dtype::F16);
+            let manifest = crate::formats::load::load_from_dir(
+                std::path::Path::new(&dir),
+                &mut gpu,
+                &comp,
+                opts,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{plan:?} 装载失败: {e}"));
+            let keys: Vec<String> = manifest.entries().iter().map(|e| e.key.clone()).collect();
+            eprintln!("[{plan:?}] 装载 {} 键", keys.len());
+            if matches!(plan, QuantPlan::W4A8Awq) {
+                for suf in [".scales_a8", ".zeros_a8", ".a8_factor"] {
+                    assert!(
+                        keys.iter().any(|k| k.ends_with(suf)),
+                        "a8 档缺键 {suf};实得 {keys:?}"
+                    );
+                }
+            }
+            let x = TensorOps::from_host(Dtype::F16, vec![m, in_dim], &xb);
+            let decl = lin.forward(&x, &crate::module::ForwardCtx::minimal(m));
+            let out = crate::testkit::harvest_f16(&mut gpu, &decl).await;
+            gpu.close().await.expect("关机");
+            got.push(out);
+        }
+        // ---- 判据:噪声/信号 RMS(a8 vs a16)----
+        let (a16, a8) = (&got[0], &got[1]);
+        assert_eq!(a16.len(), a8.len());
+        let n = a16.len();
+        let rms = (a16.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / n as f64).sqrt();
+        let d: f64 = a16
+            .iter()
+            .zip(a8)
+            .map(|(x, y)| ((x - y) as f64).abs())
+            .sum::<f64>()
+            / n as f64;
+        let noise = d / rms.max(1e-9);
+        let nan = a8.iter().filter(|v| !v.is_finite()).count();
+        eprintln!(
+            "[w4a8-ab] 真实层 {prefix}{local} m={m}: 噪声/信号 RMS = {noise:.5}(a16 信号 RMS={rms:.4});a8 非有限 {nan}"
+        );
+        assert_eq!(nan, 0, "a8 输出含非有限值");
+        assert!(
+            noise < 1e-2,
+            "a8 与 a16 偏差过大({noise:.5})—— 布局/接线级错误距此量级 ≫ 10⁻¹"
+        );
+    }
+
+    /// **W4A8 接线门(零 GPU)**:plan → 声明面(a8 键族 want)→ 前向面
+    /// (量化 → a8 GEMM 的节点链)。这条门锁的是"层把 a8 档接对了",
+    /// 数值正确性在 kernels 侧已有(§S1d 对拍 + a8 repack 逐位门)。
+    #[test]
+    fn w4a8_plan_declares_a8_keys_and_emits_quant_then_gemm() {
+        use crate::module::{Loadable, LoaderCtx, QuantPlan};
+        // marlin_eligible:out%256==0 && k%128==0
+        let lin = Linear::new("l.w", 256, 256, QuantPlan::W4A8Awq);
+
+        // ---- ① 声明面:键族与 dtype(设备重排档 = 生产默认) ----
+        let ctx = LoaderCtx { device_repack: true, ..Default::default() };
+        let ops = lin.layout(&ctx);
+        let wants: Vec<(String, Dtype)> = ops
+            .wants()
+            .iter()
+            .map(|w| (w.key.clone(), w.dtype))
+            .collect();
+        let has = |suf: &str, dt: Dtype| {
+            wants.iter().any(|(k, d)| k.ends_with(suf) && *d == dt)
+        };
+        assert!(
+            has(".packed_raw", Dtype::U32),
+            "设备重排档:B 走原始 packed 源键(U32 位型;经 a8 repack 核);实得 {wants:?}"
+        );
+        assert!(has(".scales_a8", Dtype::F16), "scales_a8 = int16 位型塞 F16 槽");
+        assert!(has(".zeros_a8", Dtype::U32), "zeros_a8");
+        assert!(has(".a8_factor", Dtype::F32), "全局因子(设备标量块)");
+        assert!(!has(".qweight_a8", Dtype::U32), "设备档不得同时要 CPU 版 B(白跑全模重排)");
+        // CPU 档换键
+        let ctx_cpu = LoaderCtx { device_repack: false, ..Default::default() };
+        let cpu_keys: Vec<String> = lin.layout(&ctx_cpu).wants().iter().map(|w| w.key.clone()).collect();
+        assert!(cpu_keys.iter().any(|k| k.ends_with(".qweight_a8")), "CPU 档要 qweight_a8");
+
+        // ---- ② 前向面:量化(quant_int8_row) → a8 GEMM,7 父 ----
+        let xs = TensorOps::zeros(Dtype::F16, vec![8, 256]);
+        let out = lin.forward_inner(&xs);
+        // 外层是窄视图(与 a16 臂同款的 out_dim 裁切)
+        let gemm = out.parents.first().expect("窄视图的父 = GEMM").clone();
+        match &gemm.op {
+            crate::ops::Op::Call { op, .. } => assert_eq!(
+                op.op_id().0,
+                "marlin.w4a8_awq",
+                "a8 臂必须发 w4a8 语义动作"
+            ),
+            other => panic!("期望 Call(MarlinW4A8Awq),实得 {other:?}"),
+        }
+        assert_eq!(gemm.parents.len(), 7, "a8 槽 7 父:q/b/scales/zeros/a_scales/ws/c_tmp");
+        // 第一父 = 量化输出(其 op 必须是量化动作)
+        let q = gemm.parents[0].clone();
+        match &q.op {
+            crate::ops::Op::Call { op, .. } => assert_eq!(op.op_id().0, "elems.quant_int8_row_f16"),
+            other => panic!("期望量化 Call,实得 {other:?}"),
+        }
+        assert_eq!(q.dtype, Dtype::U8, "量化出 int8(字节承载)");
+        // 量化 3 父:x(f16 激活) / mul(设备标量因子) / scales(每轮瞬态)
+        assert_eq!(q.parents.len(), 3, "量化槽 3 父:x / mul / scales");
+        assert!(
+            matches!(q.parents[2].op, crate::ops::Op::Zeros),
+            "a_scales = 引擎按形状分配的瞬态(Op::Zeros);实得 {:?}",
+            q.parents[2].op
+        );
+    }
 
     #[tokio::test]
     async fn native_nt_matmul_matches_host() {

@@ -25,11 +25,11 @@ async fn dtoh_at_reads_the_requested_span() {
         .expect("spawn server");
     client.sync().await.expect("sync");
 
-    let dev = client.alloc(Dtype::U32, N / 4).await.expect("alloc");
+    let dev = client.alloc(Dtype::U32, N / 4, "probe").await.expect("alloc");
     // 内容:分三段(带偏移)写入 —— 顺带覆盖 upload_pinned 的多段路径
     let all = pattern(N);
     for (off, len) in [(0usize, 2048usize), (2048, 1024), (3072, 1024)] {
-        let mut lease = client.alloc_pinned(len).await.expect("pinned");
+        let mut lease = client.alloc_pinned(len, "probe:dtoh_at").await.expect("pinned");
         lease.slice_bytes_mut()[..len].copy_from_slice(&all[off..off + len]);
         client.upload_pinned(lease, &dev, off, len).await.expect("upload");
     }
@@ -75,10 +75,10 @@ async fn dtoh_batch_and_htod_batch_round_trip() {
         .expect("spawn server");
     client.sync().await.expect("sync");
 
-    let dev = client.alloc(Dtype::U32, N / 4).await.expect("alloc");
+    let dev = client.alloc(Dtype::U32, N / 4, "probe").await.expect("alloc");
     let all = pattern(N);
-    let a = client.alloc(Dtype::U32, 2048 / 4).await.expect("a"); // 两段:0..1024 与 1024..2048
-    let b = client.alloc(Dtype::U32, 4096 / 4).await.expect("b"); // 留出偏移余量
+    let a = client.alloc(Dtype::U32, 2048 / 4, "probe").await.expect("a"); // 两段:0..1024 与 1024..2048
+    let b = client.alloc(Dtype::U32, 4096 / 4, "probe").await.expect("b"); // 留出偏移余量
 
     // 批量写:三段分落两块(带偏移)
     client

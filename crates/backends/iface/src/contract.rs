@@ -19,6 +19,54 @@
 use std::future::Future;
 
 // ============================================================================
+// 分配点宏:位置自动带入(`alloc!` / `htod!` 等五臂)
+// ============================================================================
+//
+// **它解决什么**:全量记名要求每个分配点给名字。生产调用点的名字是**语义**
+// (核名/层名/装载键名 —— 那才是 OOM 现场要看的"谁占着"),但**测试/探针/
+// 例子**里没有语义可得:那些地方真需要的只是"这块是哪一处分配的"。
+// 手写 `"文件名::函数#N.方法"` 一是不便,二是**行号会漂**(改一行就指错地方,
+// 比没有名字更坏 —— 它会误导排障)。
+//
+// 宏在**调用点**展开 ⇒ `file!()`/`line!()`/`column!()` 由编译器填真实位置,
+// 永远不会漂;名字 = `方法@相对路径:行:列`,天然唯一(无需编号)。
+//
+// **纪律**(与 §全量记名 同源;docs/arch/全量记名-与-OOM-dump.md §5):
+// - 生产代码**仍写语义名**(核名/层名/键名)—— 位置名对"谁占着"没有信息量;
+// - 本宏供**测试/探针/example** 使用(它们的诊断口径就是"哪一行");
+// - 两条路都落进同一个 `BlockEntry.name`,口径不分裂。
+#[macro_export]
+macro_rules! alloc {
+    ($f:expr, $dtype:expr, $elems:expr) => {
+        $f.alloc($dtype, $elems, concat!("alloc@", file!(), ":", line!(), ":", column!()))
+    };
+}
+#[macro_export]
+macro_rules! alloc_uninit {
+    ($f:expr, $dtype:expr, $elems:expr) => {
+        $f.alloc_uninit($dtype, $elems, concat!("alloc_uninit@", file!(), ":", line!(), ":", column!()))
+    };
+}
+#[macro_export]
+macro_rules! htod {
+    ($f:expr, $dtype:expr, $shape:expr, $bytes:expr) => {
+        $f.htod($dtype, $shape, $bytes, concat!("htod@", file!(), ":", line!(), ":", column!()))
+    };
+}
+#[macro_export]
+macro_rules! htod_f32 {
+    ($f:expr, $shape:expr, $data:expr) => {
+        $f.htod_f32($shape, $data, concat!("htod_f32@", file!(), ":", line!(), ":", column!()))
+    };
+}
+#[macro_export]
+macro_rules! alloc_pinned {
+    ($f:expr, $bytes:expr) => {
+        $f.alloc_pinned($bytes, concat!("pin@", file!(), ":", line!(), ":", column!()))
+    };
+}
+
+// ============================================================================
 // 标注词汇:Dtype + Shape(线格式的元数据维)
 // —— 2026-10-12 M2 迁往 owl-kernels::contract(契约老家;iface 依赖
 //    kernels 方向不变)。下方 re-export 保旧路径全量可用,零破坏。
@@ -298,7 +346,13 @@ pub trait DeviceClient: Send {
     /// dtype + elems 双参,字节宽由客户端按 size_bytes 换算 —— 传输面
     /// 不再假设 4 字节元素(旧 alloc(n_bytes)/4 在 f16 下静默减半,雷已拆)。
     /// 返回 Bytes.len = **元素数**口径(C1 断言/账本不变)。
-    fn alloc(&mut self, dtype: Dtype, elems: usize)
+    ///
+    /// **`name` = 分配点点名(必填;全量记名,2026-10-16)**:核名/层名/
+    /// 装载键名 —— 传"谁要这块"的**语义名**,不传尺寸/相位(那些账上有)。
+    /// 为什么必填不默认:OOM dump 的"按名清单"(块账房按名聚合)就是
+    /// 靠它;默认值会让漏报静默(空名块在 dump 里单独计 "未命名!",
+    /// 那是漏网信号,不是合法状态)。
+    fn alloc(&mut self, dtype: Dtype, elems: usize, name: &str)
         -> impl Future<Output = Result<Bytes, ModelError>> + Send;
 
     /// 未初始化分配(S1,2026-09-30):scratch 输出块 = 随后 kernel
@@ -312,19 +366,22 @@ pub trait DeviceClient: Send {
         &mut self,
         dtype: Dtype,
         elems: usize,
+        name: &str,
     ) -> impl Future<Output = Result<Bytes, ModelError>> + Send
     where
         Self: Sized,
     {
-        async move { self.alloc(dtype, elems).await }
+        async move { self.alloc(dtype, elems, name).await }
     }
     /// host 数据入块(H2D 流异步拷贝 + finish 回调携 ack):**回执即数据
-    /// 落地**,后续 launch 跨流读安全(顺序语义,见 trait 级文档)
+    /// 落地**,后续 launch 跨流读安全(顺序语义,见 trait 级文档)。
+    /// `name` 同 [`DeviceClient::alloc`](h2d 落地也是一次块出生)。
     fn htod(
         &mut self,
         dtype: Dtype,
         shape: &Shape,
         src: &[u8],
+        name: &str,
     ) -> impl Future<Output = Result<Bytes, ModelError>> + Send;
     /// 块读出(**读语义**,2026-09-26 成文):issue 相排空 COMPUTE 后
     /// D2H 异步拷贝 —— 回执时 out = 块在全部先前已回执命令之后的值。
@@ -392,7 +449,7 @@ pub trait DeviceClient: Send {
             .collect();
         async move {
             for (b, off, data) in &owned {
-                let mut lease = self.alloc_pinned(data.len()).await?;
+                let mut lease = self.alloc_pinned(data.len(), "iface:htod_batch").await?;
                 lease.slice_bytes_mut()[..data.len()].copy_from_slice(data);
                 self.upload_pinned(lease, b, *off, data.len()).await?;
             }
@@ -439,7 +496,7 @@ pub trait DeviceClient: Send {
                     for p in &owned {
                         let mut buf = vec![0u8; p.len];
                         conn.get(p.slot, p.conn_off, &mut buf)?;
-                        let mut lease = self.alloc_pinned(p.len).await?;
+                        let mut lease = self.alloc_pinned(p.len, "iface:swap_in").await?;
                         lease.slice_bytes_mut()[..p.len].copy_from_slice(&buf);
                         self.upload_pinned(lease, &handle(p), p.dev_off, p.len).await?;
                     }
@@ -473,17 +530,21 @@ pub trait DeviceClient: Send {
         &mut self,
         shape: &Shape,
         data: Vec<f32>,
+        name: &str,
     ) -> impl Future<Output = Result<Bytes, ModelError>> + Send {
         async move {
             let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
-            self.htod(Dtype::F32, shape, &bytes).await
+            self.htod(Dtype::F32, shape, &bytes, name).await
         }
     }
 
-    /// pinned 主机缓冲租约(流式装载的 DMA 源;转换直写 → move 上传)
+    /// pinned 主机缓冲租约(流式装载的 DMA 源;转换直写 → move 上传)。
+    /// `_name` = 租约点名(全量记名纪律;本缺省实现是 host 占位面,不建账
+    /// ⇒ 有意不存;GPU 面由 `GpuClient` 把名字带进 `Command::AllocPinned`)
     fn alloc_pinned(
         &mut self,
         bytes: usize,
+        _name: &str,
     ) -> impl Future<Output = Result<Box<dyn PinnedRegion + Send>, ModelError>> + Send
     where
         Self: Sized,

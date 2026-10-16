@@ -97,7 +97,16 @@ pub async fn gpu_piecewise_segments() {
             "回放 #{i} 值应 5.0,得 {v:?}"
         );
     }
-    eprintln!("[piecewise] 两段一断点捕获 + 双回放 值一致 ✓");
+    // **引用计数推送面**(全量记名同轮;2026-10-16):图 plan 的 warmup 探针窗内,
+    // 求值器必须把 `(users, pending)` 推给探针 —— "它凭什么是活的"的数据源。
+    // 判据用**计数器**而非日志(日志受级别过滤;计数是机械事实)。窗口在 plan
+    // 内部 `probe_on/off`,on 时清零 ⇒ 此处读到的是本次 plan 的推送量。
+    let pushed = owl_shared::slab_hint::refs_pushed();
+    assert!(
+        pushed > 0,
+        "两段计划跑完后引用计数推送为 0 ⇒ 数据源断了(记名/OOM dump 的\"为什么活着\"面失效)"
+    );
+    eprintln!("[piecewise] 两段一断点捕获 + 双回放 值一致 ✓(引用计数推送 {pushed} 次)");
 }
 
 fn asset_dir() -> std::path::PathBuf {
@@ -1150,7 +1159,7 @@ pub async fn gpu_awq27b_marlin_e2e(shared: Option<&mut RunningEngine<owl_cuda::G
         .expect("构造");
         let loaded = engine
             .loader()
-            .load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16)
+            .load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16, false)
             .await
             .expect("27B AWQ 装载");
             own = engine.run(loaded).await.expect("装配");
@@ -1399,7 +1408,7 @@ pub async fn gpu_27b_chat_inference(shared: Option<&mut RunningEngine<owl_cuda::
         .expect("构造");
         let loaded = engine
             .loader()
-            .load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16)
+            .load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16, false)
             .await
             .expect("27B AWQ 装载");
             own = engine.run(loaded).await.expect("装配");
@@ -1533,7 +1542,7 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
     let t_load = std::time::Instant::now();
     let loaded = engine
         .loader()
-        .load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16)
+        .load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16, false)
         .await
         .expect("27B AWQ 装载");
     eprintln!("[e2e] 27B 权重装载 {:?}", t_load.elapsed());
@@ -1559,7 +1568,7 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
             device_ordinal: ordinal, max_seq_tokens: 512, prefill_chunk: 128,
             knobs: EngineKnobs::default(),
         }).expect("构造");
-        let loaded = engine.loader().load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16).await.expect("装载");
+        let loaded = engine.loader().load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16, false).await.expect("装载");
         let mut running = engine.run(loaded).await.expect("装配");
         for (qi, q) in ["中国的首都是北京。长城是", "1 2 3 4 5 6"].iter().enumerate() {
             let id = running.submit(*q, 48).expect("submit");
@@ -1720,7 +1729,7 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
             .expect("构造");
             let loaded = engine
                 .loader()
-                .load_qwen38_27b_awq(std::path::Path::new(dir), std::path::Path::new(dir), owl_models::module::QuantPlan::F16)
+                .load_qwen38_27b_awq(std::path::Path::new(dir), std::path::Path::new(dir), owl_models::module::QuantPlan::F16, false)
                 .await
                 .expect("装载");
             engine.run(loaded).await.expect("装配")
@@ -1842,7 +1851,7 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
             .expect("构造");
             let loaded = engine
                 .loader()
-                .load_qwen38_27b_awq(std::path::Path::new(dir), std::path::Path::new(dir), head_plan)
+                .load_qwen38_27b_awq(std::path::Path::new(dir), std::path::Path::new(dir), head_plan, false)
                 .await
                 .expect("装载");
             let running = engine.run(loaded).await.expect("装配");
@@ -2072,7 +2081,7 @@ pub async fn gpu_decode_marginal_bench() {
         .expect("构造");
         let loaded = engine
             .loader()
-            .load_qwen38_27b_awq(std::path::Path::new(dir), std::path::Path::new(dir), owl_models::module::QuantPlan::F16)
+            .load_qwen38_27b_awq(std::path::Path::new(dir), std::path::Path::new(dir), owl_models::module::QuantPlan::F16, false)
             .await
             .expect("装载");
         let mut running = engine.run(loaded).await.expect("装配");

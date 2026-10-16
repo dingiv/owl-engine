@@ -238,6 +238,10 @@ mod tests {
                 crate::family::marlin::GEMM_W4A16_AWQ,
                 crate::client::marlin::PARSE_SLOTS_AWQ,
             ),
+            (
+                crate::family::marlin::GEMM_W4A8_AWQ,
+                crate::client::marlin::PARSE_SLOTS_W4A8,
+            ),
         ]);
         #[cfg(feature = "flashinfer")]
         cases.extend([
@@ -283,6 +287,7 @@ mod tests {
             crate::family::marlin::GEMM_W4A16,
             crate::family::marlin::GEMM_W4A16_BF16,
             crate::family::marlin::GEMM_W4A16_AWQ,
+            crate::family::marlin::GEMM_W4A8_AWQ,
         ]);
         #[cfg(feature = "flashinfer")]
         want.extend([

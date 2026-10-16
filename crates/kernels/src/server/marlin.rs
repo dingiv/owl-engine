@@ -1,9 +1,9 @@
-//! Marlin W4A16 runtime(FFI 直调链路;纯 FFI 零句柄,stream/dev 注入)。
-//! 三名同构:f16 / AWQ / bf16(名路由 → gemm_v2_raw / gemm_v2_raw_bf16)。
+//! Marlin W4A16/W4A8 runtime(FFI 直调链路;纯 FFI 零句柄,stream/dev 注入)。
+//! 四名同构:f16 / AWQ / bf16(W4A16)+ W4A8×AWQ(名路由 → gemm_v2_*_raw)。
 
 use crate::contract::{Bytes, Dtype, LaunchMsg, OpError, OpId, Stage};
 
-use crate::client::marlin::{parse_gemm, GEMM_W4A16_AWQ};
+use crate::client::marlin::{parse_gemm, GEMM_W4A16_AWQ, GEMM_W4A8_AWQ};
 use crate::family::marlin;
 use crate::registry::{FamilyGuard, KernelFamily};
 
@@ -30,9 +30,13 @@ impl KernelFamily for MarlinRuntime {
     }
 
     fn run(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {
-        // AWQ 臂:kU4 has_zp,7 块(独立 FFI);f16/bf16 走 6 块通用臂
+        // AWQ 臂:kU4 has_zp,7 块(独立 FFI);W4A8×AWQ 臂:再加 a_scales,
+        // 8 块(int8 激活;独立 FFI);f16/bf16 走 6 块通用臂
         if msg.kernel.name == GEMM_W4A16_AWQ {
             return self.run_awq(msg, res, exec);
+        }
+        if msg.kernel.name == GEMM_W4A8_AWQ {
+            return self.run_w4a8_awq(msg, res, exec);
         }
         let call = parse_gemm(msg, msg.kernel.name == marlin::GEMM_W4A16_BF16)?;
         let r = |b: &crate::client::marlin::BlockRef| {
@@ -47,6 +51,7 @@ impl KernelFamily for MarlinRuntime {
         check_pack_sizes(&msg.kernel.name, &call, res)?;
         let dev = res.device_ordinal()?;
         let stream = res.stream()?;
+        let (m, n, k) = call.ffi_mnk(); // 槽序 m,k,n → C 形参序 m,n,k(单源)
         res.note_device("fam_ffi_launch", &msg.kernel.name, 0, &[a, b, out]);
         // 排队即回执(fire-and-forget;marlin host launcher 入 COMPUTE 流)
         let rr = if call.bf16 {
@@ -54,7 +59,7 @@ impl KernelFamily for MarlinRuntime {
                 marlin::gemm_v2_raw_bf16(
                     a as *const u16, b as *const i32, out as *mut u16,
                     scales as *const u16, c_tmp as *const std::ffi::c_void,
-                    call.m as i32, call.n as i32, call.k as i32,
+                    m, n, k,
                     ws as *mut i32, call.groupsize, dev,
                     stream.cu_stream() as usize,
                 )
@@ -67,7 +72,7 @@ impl KernelFamily for MarlinRuntime {
                 marlin::gemm_v2_raw(
                     a as *const u16, b as *const i32, out as *mut u16,
                     scales as *const u16, c_tmp as *const std::ffi::c_void,
-                    call.m as i32, call.n as i32, call.k as i32,
+                    m, n, k,
                     ws as *mut i32, call.groupsize, dev,
                     stream.cu_stream() as usize,
                 )
@@ -112,11 +117,12 @@ impl MarlinRuntime {
         // marlin/cublas/FI 三族的 run 都是 FFI 直发(不经 `Exec::launch`),
         // 故各 arm 自报一条;`ptrs` = 本 call 的实参地址(生命周期判据)。
         res.note_device("fam_ffi_launch", &msg.kernel.name, 0, &[a, b, out]);
+        let (m, n, k) = call.ffi_mnk(); // 槽序 m,k,n → C 形参序 m,n,k(单源)
         let rr = unsafe {
             marlin::gemm_v2_awq_raw(
                 a as *const u16, b as *const i32, out as *mut u16,
                 scales as *const u16, zeros as *const i32, c_tmp as *const std::ffi::c_void,
-                call.m as i32, call.n as i32, call.k as i32,
+                m, n, k,
                 ws as *mut i32, call.groupsize, dev,
                 stream.cu_stream() as usize,
             )
@@ -127,6 +133,62 @@ impl MarlinRuntime {
             detail: format!("err {e}: {}", marlin::v2_err_str(e)),
         })?;
         Ok(Bytes::new(call.out.id, msg.out_elems, if call.bf16 { Dtype::BF16 } else { Dtype::F16 }, 2))
+    }
+
+    /// **W4A8 × AWQ 臂**(7 块 = AWQ 槽表后插 `a_scales`;int8 已量化激活 +
+    /// per-token fp32 尺度)。
+    ///
+    /// 与 AWQ 臂唯一的结构差异 = `c_tmp` **传空指针**:C 侧 `a_is_s8=true`
+    /// 强制 `use_fp32_reduce`,c_tmp 由 host 发射器流序自管(槽位仍须在
+    /// 线格式里、仍有实体 —— F2 账长门照旧,见 [`check_pack_sizes`])
+    /// —— 暗雷面在 C 侧已焊缝(见 `marlin_gemm_v2_awq_w4a8_ffi` 注)。
+    fn run_w4a8_awq(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, _exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {
+        let call = crate::client::marlin::parse_gemm_w4a8_awq(msg)?;
+        let r = |b: &crate::client::marlin::BlockRef| {
+            res.resolve(b.id).map(|p| p + b.byte_offset)
+        };
+        let a = r(&call.a)?;
+        let b = r(&call.b)?;
+        let out = r(&call.out)?;
+        let scales = r(&call.scales)?;
+        let zeros = r(call.zeros.as_ref().ok_or_else(|| OpError::Contract {
+            op: msg.kernel.name.clone(),
+            field: "zeros",
+            expect: "W4A8×AWQ 臂必带 zeros 槽".into(),
+            got: "无".into(),
+        })?)?;
+        let a_scales = r(call.a_scales.as_ref().ok_or_else(|| OpError::Contract {
+            op: msg.kernel.name.clone(),
+            field: "a_scales",
+            expect: "W4A8×AWQ 臂必带 a_scales 槽".into(),
+            got: "无".into(),
+        })?)?;
+        let ws = r(&call.ws)?;
+        let c_tmp = r(&call.c_tmp)?;
+        check_pack_sizes(&msg.kernel.name, &call, res)?;
+        let dev = res.device_ordinal()?;
+        let stream = res.stream()?;
+        res.note_device("fam_ffi_launch", &msg.kernel.name, 0, &[a, b, out]);
+        let (m, n, k) = call.ffi_mnk(); // 槽序 m,k,n → C 形参序 m,n,k(单源)
+        let rr = unsafe {
+            marlin::gemm_v2_awq_w4a8_raw(
+                a as *const i8, b as *const i32, out as *mut u16,
+                scales as *const u16, zeros as *const i32, a_scales as *const f32,
+                std::ptr::null(), // c_tmp:host 自管(C 侧 a_is_s8 ⇒ use_fp32_reduce)
+                m, n, k,
+                ws as *mut i32, call.groupsize, dev,
+                stream.cu_stream() as usize,
+            )
+        };
+        // c_tmp 槽仍被 F2 门核账长(线格式契约),但**不进 FFI**(上面传 null)
+        let _ = c_tmp;
+        rr.map_err(|e| OpError::Launch {
+            op: msg.kernel.name.clone(),
+            stage: Stage::Compute,
+            detail: format!("err {e}: {}", marlin::v2_err_str(e)),
+        })?;
+        // W4A8 当前只接 f16 档(wrapper 硬编 is_bf16=0;bf16 档需另接)
+        Ok(Bytes::new(call.out.id, msg.out_elems, Dtype::F16, 2))
     }
 }
 
@@ -190,7 +252,7 @@ mod f2_gate {
                 _ => 1 << 20,
             })
         }
-        fn alloc(&mut self, _b: usize, _t: &'static str) -> Result<ScratchBuf, OpError> {
+        fn alloc(&mut self, _b: usize, _t: &str) -> Result<ScratchBuf, OpError> {
             Err(unexpected("alloc"))
         }
         fn capturing(&self) -> Result<bool, OpError> {
@@ -208,7 +270,7 @@ mod f2_gate {
         fn upload_block(&mut self, _b: &crate::contract::Bytes, _s: &[u8]) -> Result<(), OpError> {
             Err(unexpected("upload_block"))
         }
-        fn alloc_block(&mut self, _b: usize, _t: &'static str) -> Result<crate::contract::Bytes, OpError> {
+        fn alloc_block(&mut self, _b: usize, _t: &str) -> Result<crate::contract::Bytes, OpError> {
             Err(unexpected("alloc_block"))
         }
         fn download(&mut self, _s: u64, _d: &mut [u8]) -> Result<(), OpError> {

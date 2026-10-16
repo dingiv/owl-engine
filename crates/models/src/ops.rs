@@ -65,6 +65,12 @@ pub enum SemanticKernel {
     Concat,
     /// partial rope
     Rope,
+    /// 激活 per-token int8 量化(W4A8 喂料手;S1c:行 absmax → scale → 饱和
+    /// round-nearest-even;`mul` = 权重侧全局因子只进 scales 出口)
+    /// —— 两个 op_id 各一档(输出恒 U8,`dt` 载不了输入档;与 cast 对同律)
+    QuantInt8RowF16,
+    /// 同上,bf16 入
+    QuantInt8RowBf16,
     /// embedding 查表
     Embed,
 
@@ -156,6 +162,8 @@ pub enum SemanticKernel {
     SiluAndMul,
     /// ct packed → marlin B 设备重排(U32;核签名形参即 rows/cols)
     CtRepack,
+    /// W4A8 的 B 重排(S2):同输入契约、同输出字数,tile 几何不同
+    CtRepackA8,
     /// 刀D 层间时间戳探针(链式拷贝 + clock64;标量槽 = idx/n)
     TsStamp,
     /// f16 → bf16 铸边界(草稿装载)
@@ -180,8 +188,11 @@ pub enum SemanticKernel {
     NaiveAttnNc,
     /// 同上 fp8kv 前缀池变体
     NaiveAttnNcFp8kv,
-    /// marlin W4A16 GEMM(三名同 runtime:AWQ 7 父 / bf16 dt / f16,driver 路由)
+    /// marlin W4A16 GEMM(四名同 runtime:AWQ 7 父 / bf16 dt / f16,driver 路由)
     MarlinW4A16,
+    /// marlin W4A8 × AWQ GEMM(int8 激活 + per-token fp32 尺度;8 父块 ——
+    /// W4A8 线,2026-10-16:层侧按档位/选层显式声明而非常见于两档)
+    MarlinW4A8Awq,
     /// FlashInfer paged prefill(f16 KV)
     FiPrefill,
     /// FlashInfer paged prefill(e4m3 KV)
@@ -221,6 +232,8 @@ impl SemanticKernel {
             SemanticKernel::Narrow => "ops.narrow",
             SemanticKernel::Concat => "ops.concat",
             SemanticKernel::Rope => "ops.rope",
+            SemanticKernel::QuantInt8RowF16 => "elems.quant_int8_row_f16",
+            SemanticKernel::QuantInt8RowBf16 => "elems.quant_int8_row_bf16",
             SemanticKernel::Embed => "ops.embed",
             SemanticKernel::CastF16F32 => "elems.cast_f16_f32",
             SemanticKernel::GemvDual => "elems.gemv_dual",
@@ -265,6 +278,7 @@ impl SemanticKernel {
             SemanticKernel::ImageScatter => "vis.image_scatter",
             SemanticKernel::SiluAndMul => "mlp.silu_and_mul",
             SemanticKernel::CtRepack => "load.ct_repack",
+            SemanticKernel::CtRepackA8 => "load.ct_repack_a8",
             SemanticKernel::TsStamp => "ops.ts_stamp",
             SemanticKernel::CastF16Bf16 => "elems.cast_f16_bf16",
             SemanticKernel::CastBf16F16 => "elems.cast_bf16_f16",
@@ -277,6 +291,7 @@ impl SemanticKernel {
             SemanticKernel::NaiveAttnNc => "attn.naive_nc",
             SemanticKernel::NaiveAttnNcFp8kv => "attn.naive_nc_fp8kv",
             SemanticKernel::MarlinW4A16 => "marlin.w4a16",
+            SemanticKernel::MarlinW4A8Awq => "marlin.w4a8_awq",
             SemanticKernel::FiPrefill => "attn.fi_prefill",
             SemanticKernel::FiPrefillFp8kv => "attn.fi_prefill_fp8kv",
             SemanticKernel::XqaVerify => "attn.xqa_verify",
@@ -294,13 +309,10 @@ pub(crate) fn ddt(dt: crate::contract::Dtype) -> Result<owl_kernels::driver::DTy
         crate::contract::Dtype::BF16 => DType::BF16,
         crate::contract::Dtype::F32 => DType::F32,
         crate::contract::Dtype::U32 => DType::U32,
-        // U8 = 字节承载(e4m3 池等):不是激活域 dtype,进不了语义算子拾取
-        // (driver 的 DType 是"激活域"词表)。此路必须显式拒,不得静默降级。
-        crate::contract::Dtype::U8 => {
-            return Err(crate::contract::ModelError::Msg(
-                "ddt: U8 是字节承载(池块),不参与语义算子拾取".to_string(),
-            ))
-        }
+        // U8 = 字节承载(池块 / 量化输出):**不是激活域 dtype**,但自 S1c 起
+        // 它可以是**算子输出的真身**(激活 int8 量化;driver 词汇里与 U32 同律
+        // —— 只有声明里就写 U8 的算子能收到它,其余算子的 `match` 响亮拒)。
+        crate::contract::Dtype::U8 => DType::U8,
     })
 }
 
@@ -627,6 +639,43 @@ pub fn argmax_f32idx(x: &crate::tensor::TensorOps, n: usize, offset: usize) -> c
     .with_shape(Dtype::F32, vec![1])
 }
 
+/// **激活 per-token int8 量化声明**(W4A8 喂料手;S1c)。
+///
+/// `x[rows, cols]` → `q[rows, cols]`(**u8 字节承载 int8**,引擎分配的瞬时块)
+/// + `scales[rows]`(f32;受 `mul` 缩放)。
+///
+/// 槽序与 `ops::elems::QUANT_INT8_ROW_*` 表逐字对齐:
+/// `x / rows(i32) / cols(i32) / mul(设备标量 f32[1]) / scales(入槽,写出) / q(出槽)`。
+/// `rows` 同时进 `aux`(driver 的 grid = rows,与核的"一 token 一 block"对上)。
+///
+/// - **`mul` = 设备标量块**(权重侧全局因子;装载期由尺度数据算出 ⇒ 层声明 want
+///   由装载器填,与 vLLM `input_global_scale` 同构);
+/// - **`scales` 由调用方备块**(写出语义,同 xqa 的 `wr`/`scratch` 先例);
+/// - `q` 是引擎按形状分配的**瞬时输出**(U8 字节承载)。
+#[allow(clippy::too_many_arguments)]
+pub fn quant_int8_row(
+    x: &crate::tensor::TensorOps,
+    mul: &crate::tensor::TensorOps,
+    scales: &crate::tensor::TensorOps,
+    rows: usize,
+    cols: usize,
+) -> crate::tensor::TensorOps {
+    use crate::contract::Dtype;
+    let op = match x.dtype {
+        Dtype::F16 => SemanticKernel::QuantInt8RowF16,
+        Dtype::BF16 => SemanticKernel::QuantInt8RowBf16,
+        other => panic!("quant_int8_row: 激活只可能是 f16/bf16,实得 {other:?}"),
+    };
+    crate::tensor::TensorOps::call(op)
+        .arg(x)
+        .arg(mul)
+        .arg(scales)
+        .arg_i32(rows as i32)
+        .arg_i32(cols as i32)
+        .aux(&[rows])
+        .with_shape(Dtype::U8, vec![rows, cols])
+}
+
 // ============================================================================
 // §6 层↔kernels 隔离面(2026-10-12 用户律:**layers 禁触 owl_kernels**;
 // face builder/名字/槽序签名/OK 谓词知识全部收编本文件 —— 层只供语义
@@ -642,6 +691,7 @@ pub(crate) fn foreign_sig(name: &str) -> Option<&'static str> {
         x if x == owl_kernels::family::gdn_scalar::GDN_SCALAR_FWD => Some(owl_kernels::client::gdn_scalar::SIG),
         x if x == owl_kernels::family::marlin::GEMM_W4A16 => Some(owl_kernels::client::marlin::SIG),
         x if x == owl_kernels::family::marlin::GEMM_W4A16_AWQ => Some(owl_kernels::client::marlin::SIG_AWQ),
+        x if x == owl_kernels::family::marlin::GEMM_W4A8_AWQ => Some(owl_kernels::client::marlin::SIG_W4A8),
         x if x == owl_kernels::family::marlin::GEMM_W4A16_BF16 => Some(owl_kernels::client::marlin::SIG),
         x if x == owl_kernels::family::flashinfer::PREFILL_FI => Some(owl_kernels::client::fi_sig::SIG),
         x if x == owl_kernels::family::flashinfer::PREFILL_FI_FP8KV => Some(owl_kernels::client::fi_sig::SIG),
@@ -720,6 +770,72 @@ mod foreign_call_lock {
             );
             assert!(foreign_sig(pick.name).is_some(), "driver 拾取名必须有家族 sig");
         }
+    }
+
+    /// **S1c 激活量化臂的选择面四点同票**(词表 → driver 拾取名 → 准入声明;
+    /// 输出域 = U8 是本算子独有的,故另锁"node dtype = U8"这条事实面)
+    #[test]
+    fn quant_int8_row_selection_face_is_wired() {
+        for (sk, want) in [
+            (SemanticKernel::QuantInt8RowF16, "owl_quant_int8_row_f16"),
+            (SemanticKernel::QuantInt8RowBf16, "owl_quant_int8_row_bf16"),
+        ] {
+            let pick = owl_kernels::driver::resolve(OpReq {
+                op: sk.op_id(),
+                env: &env(),
+                // 输出域 = U8(字节承载;自 S1c 起进 driver 词汇,与 U32 同律)
+                dt: owl_kernels::driver::DType::U8,
+                shapes: &[],
+                aux: &[8],
+                scalars: &[],
+            });
+            assert_eq!(pick.name, want, "{sk:?}: op_id 应直指该档核名");
+            assert_eq!(
+                (pick.shape.grid, pick.shape.block),
+                ((8, 1, 1), (256, 1, 1)),
+                "{sk:?}: 几何 = 一 token 一 block(aux[0] = rows)"
+            );
+            let m = pick.meta().expect("必须有准入声明");
+            assert_eq!(m.out_dtype(), Some(crate::contract::Dtype::U8), "{sk:?}: 出槽 U8");
+            assert_eq!(m.param_names()[0], "x");
+            assert_eq!(m.param_names().last().copied(), Some("q"), "{sk:?}: 出槽末位");
+        }
+        // ddt:U8 放行(否则本臂的节点 dtype 过不了 eval)
+        assert_eq!(
+            crate::ops::ddt(crate::contract::Dtype::U8).expect("U8 应放行"),
+            owl_kernels::driver::DType::U8
+        );
+    }
+
+    /// **W4A8×AWQ 臂的选择面四点同票**(2026-10-16 C④-3):词表
+    /// (`SemanticKernel::MarlinW4A8Awq`)→ driver 拾取名 → 家族线格式 sig →
+    /// 准入声明(建表)。层侧 S2 接线前先把这四点锁住 —— 任一环缺失
+    /// (加票不加臂/加臂不加 sig/加名不上册)这里就红。
+    #[test]
+    fn w4a8_awq_selection_face_is_wired() {
+        let pick = owl_kernels::driver::resolve(OpReq {
+            op: SemanticKernel::MarlinW4A8Awq.op_id(),
+            env: &env(),
+            dt: owl_kernels::driver::DType::F16,
+            shapes: &[],
+            aux: &[],
+            scalars: &[],
+        });
+        assert_eq!(pick.name, owl_kernels::family::marlin::GEMM_W4A8_AWQ);
+        assert_eq!(
+            (pick.shape.grid, pick.shape.block, pick.shape.smem),
+            ((0, 0, 0), (0, 0, 0), 0),
+            "foreign 臂发射配置应直通"
+        );
+        assert_eq!(
+            foreign_sig(pick.name),
+            Some(owl_kernels::client::marlin::SIG_W4A8),
+            "拾取名必须能查到家族线格式 sig(8 Block + 4 sz)"
+        );
+        assert!(
+            pick.meta().is_some(),
+            "W4A8 臂必须有准入声明(`ops::marlin::W4A8_AWQ` 在建表里)"
+        );
     }
 
     #[test]

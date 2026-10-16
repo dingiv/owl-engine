@@ -555,7 +555,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
 
         // ⑥ 提交:fed = bonus 位(F');发射 = 接受 drafts + bonus(m+1)
         // (A11:采样档 emitted = 采样表前 m+1 位;贪心档 = ids[..=m])
-        let mut toks: Vec<u32> = emitted;
+        let toks: Vec<u32> = emitted;
         {
             let act = self.turns.active.as_mut().expect("活跃");
             act.fed = pos + m + 1;

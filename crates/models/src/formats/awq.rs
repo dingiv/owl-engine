@@ -204,6 +204,20 @@ impl AwqSource {
         if let Some(base) = key.strip_suffix(".zeros") {
             return Some(Resolved::Bytes(self.linear_bytes_for(base, key)?, Dtype::U32));
         }
+        // ---- W4A8 键族(S2;a8 布局三件套 + 全局因子)----
+        // `scales_a8` 线 dtype = **F16**:int16 归一位型塞在 2 字节槽里,
+        // 与 a8 GEMM 的 `scales` 槽(声明 F16)同宽同形
+        if is_a8_key(key) {
+            let dt = if key.ends_with(".a8_factor") {
+                Dtype::F32
+            } else if key.ends_with(".scales_a8") {
+                Dtype::F16
+            } else {
+                Dtype::U32
+            };
+            let base = key.rsplit_once('.').map(|(b, _)| b)?;
+            return Some(Resolved::Bytes(self.linear_bytes_for(base, key)?, dt));
+        }
         // E5-M2b fc 列半拆:mtp.fc_{e,h}.weight = mtp.fc.weight 的 in 维
         // 前/后半(W [out, 2h] 行主序 → 行内去交织,装载一次性 rayon;
         // bf16→f16 归一)。MTP 头双子 Linear 消费,消每轮 narrow 物化。
@@ -305,6 +319,11 @@ impl AwqSource {
             || key.ends_with(".qweight")
             || key.ends_with(".scales")
             || key.ends_with(".zeros")
+            // W4A8 键族(同一份源数据的 a8 布局产物;S2)
+            || key.ends_with(".qweight_a8")
+            || key.ends_with(".scales_a8")
+            || key.ends_with(".zeros_a8")
+            || key.ends_with(".a8_factor")
             || key.ends_with(".packed_raw")
             || key == "mtp.fc_e.weight"
             || key == "mtp.fc_h.weight"
@@ -314,6 +333,19 @@ impl AwqSource {
 /// 量化线性物化(键首触才建;qweight/scales/zeros/weight 四键共享
     /// 一次构建)。双检缓存 + build_lock 串行(w4a16 同款)。
     fn linear_bytes_for(&self, base: &str, key: &str) -> Option<Arc<[u8]>> {
+        // **a8 键族走独立构建**(S2):与 a16 同源不同布局,且**互不物化**
+        // —— a8 路只产 a8 四件,不陪跑 a16 的重排(反之亦然)
+        if is_a8_key(key) {
+            // 设备重排模式下 B 由 GPU 核产出 ⇒ 这里**不做 CPU B 打包**
+            // (先前无条件烘 B 会让设备档白跑一趟全模 CPU 重排)
+            let want_b = key.ends_with(".qweight_a8");
+            if let Err(e) = self.build_linear_a8(base, want_b) {
+                owl_shared::log_info!("awq", "a8 物化失败 {base}: {e}");
+                return None;
+            }
+            let cache = self.cache.lock().unwrap();
+            return cache.0.get(key).cloned();
+        }
         // 刀2 虚拟合并:in_proj_qkvz = row-stack(in_proj_qkv, in_proj_z)。
         // **源域合并后一次构建**(marlin s/z 是全 flat 64-chunk 置换,
         // 构建产物域内拼接错序;源域 packed/scales/zp 均行主序,concat
@@ -659,6 +691,248 @@ impl AwqSource {
         Ok(())
     }
 
+    /// **a8 四件物化**(W4A8 × AWQ;S2):`{base}.{qweight_a8, scales_a8, zeros_a8, a8_factor}`
+    ///
+    /// 与 a16 键族**同源不同布局**(同一份 ct packed/scales/zp):
+    /// - B  → `pack_marlin_b_a8`(32×32 tile;与 a16 的 16×64+1024-PIPE 不同)
+    /// - s  → `pack_marlin_s_a8`(perm_single + **int16 归一**;第二返回值 =
+    ///        **全局因子** `max/4096` —— 它折进激活量化核的设备标量块,故单独
+    ///        出一个 `{base}.a8_factor` f32[1] 键给层声明 want)
+    /// - zp → `pack_marlin_z_a8`(**无 n-interleave**)
+    ///
+    /// ⚠️ a8 **只有 CPU 打包路**(核侧无 a8 repack GPU 核)⇒ 与 27B 生产默认的
+    /// 设备重排不同路;装载耗时增量记 S2 台账(`load.mat.a8` 分相)。
+    ///
+    /// 双检缓存 + build_lock 串行(与 a16 臂同纪律;插入原子 —— 四件同生同灭)。
+    /// `want_b` = 是否烘 CPU 版 B(`{base}.qweight_a8`):**设备重排档为 false**
+    /// —— B 交给 `owl_ct_repack_a8_u32`(与 a16 生产档同一条快路)。scales/zp/
+    /// 因子三件恒烘(数据小,且与 B 无关)。
+    fn build_linear_a8(&self, base: &str, want_b: bool) -> Result<(), ModelError> {
+        use owl_kernels::family::marlin::repack::{pack_marlin_b_a8, pack_marlin_s_a8, pack_marlin_z_a8, unpack_nibbles};
+        // ---- 刀2 虚拟合并键(in_proj_qkvz = row-stack(qkv, z))的 a8 分支 ----
+        // 与 a16 臂同律:**源域行拼接**(scales/zp/nibble 均行主序 ⇒ concat 合法),
+        // 拼完再进 a8 三件套 —— 全局因子取**合并后**尺度的 max(一层一个 a_scales)
+        if let Some((b1, b2)) = split_qkvz(base) {
+            let Some((n1, k1, f1)) = self.linear_form(&b1) else {
+                return Err(ModelError::Msg(format!("awq/a8: 子基 {b1} 形态不可解")));
+            };
+            let Some((n2, k2, f2)) = self.linear_form(&b2) else {
+                return Err(ModelError::Msg(format!("awq/a8: 子基 {b2} 形态不可解")));
+            };
+            if k1 != k2 {
+                return Err(ModelError::Msg(format!(
+                    "awq/a8: 合并键 {base} 两子基 k 不等({k1} vs {k2})"
+                )));
+            }
+            let (QuantForm::Ct { pe: pe1, se: se1, ze: ze1 }, QuantForm::Ct { pe: pe2, se: se2, ze: ze2 }) =
+                (&f1, &f2)
+            else {
+                return Err(ModelError::Msg(format!(
+                    "awq/a8: 合并键 {base} 要求两子均 Ct 形态(cyankiwi 满足)"
+                )));
+            };
+            let out = n1 + n2;
+            let k = k1;
+            let groups = k / 32;
+            let shard = base.bytes().map(|b| b as usize).sum::<usize>() % self.build_locks.len();
+            let _g = self.build_locks[shard].lock().unwrap();
+            let guard_key = if want_b { format!("{base}.qweight_a8") } else { format!("{base}.scales_a8") };
+            {
+                let cache = self.cache.lock().unwrap();
+                if cache.0.contains_key(&guard_key) {
+                    return Ok(());
+                }
+            }
+            let t0 = std::time::Instant::now();
+            // 源域拼接:scales(bf16→f32 两段)/ zp(u8 两段)/ nibble(仅 want_b)
+            let mut s_f32 = bf16_par(&self.maps[se1.map_ix][se1.start..se1.start + se1.nbytes]);
+            s_f32.extend(bf16_par(&self.maps[se2.map_ix][se2.start..se2.start + se2.nbytes]));
+            let mut zp_u8 = unpack_zp_ct(
+                &i32s_par(&self.maps[ze1.map_ix][ze1.start..ze1.start + ze1.nbytes]),
+                n1,
+                groups,
+            );
+            zp_u8.extend(unpack_zp_ct(
+                &i32s_par(&self.maps[ze2.map_ix][ze2.start..ze2.start + ze2.nbytes]),
+                n2,
+                groups,
+            ));
+            for (m, e) in [(se1.map_ix, se1), (se2.map_ix, se2), (ze1.map_ix, ze1), (ze2.map_ix, ze2)] {
+                self.maps[m].dontneed(e.start, e.nbytes);
+            }
+            let (s_bits, factor) = pack_marlin_s_a8(&s_f32, out, groups);
+            let z_buf = pack_marlin_z_a8(&zp_u8, out, groups);
+            let mut inserts: Vec<(String, Arc<[u8]>, usize)> = vec![
+                (
+                    format!("{base}.scales_a8"),
+                    Arc::from(u16s_le_bytes(&s_bits).into_boxed_slice()),
+                    s_bits.len() * 2,
+                ),
+                (
+                    format!("{base}.zeros_a8"),
+                    Arc::from(i32s_le_bytes(&z_buf).into_boxed_slice()),
+                    z_buf.len() * 4,
+                ),
+                (
+                    format!("{base}.a8_factor"),
+                    Arc::from(factor.to_le_bytes().to_vec().into_boxed_slice()),
+                    4,
+                ),
+            ];
+            if want_b {
+                let mut q = unpack_nibbles(
+                    &i32s_par(&self.maps[pe1.map_ix][pe1.start..pe1.start + pe1.nbytes]),
+                    n1,
+                    k,
+                );
+                q.extend(unpack_nibbles(
+                    &i32s_par(&self.maps[pe2.map_ix][pe2.start..pe2.start + pe2.nbytes]),
+                    n2,
+                    k,
+                ));
+                for (m, e) in [(pe1.map_ix, pe1), (pe2.map_ix, pe2)] {
+                    self.maps[m].dontneed(e.start, e.nbytes);
+                }
+                let b_buf = pack_marlin_b_a8(&q, k, out);
+                inserts.push((
+                    format!("{base}.qweight_a8"),
+                    Arc::from(i32s_le_bytes(&b_buf).into_boxed_slice()),
+                    b_buf.len() * 4,
+                ));
+            }
+            let mut cache = self.cache.lock().unwrap();
+            let add: usize = inserts.iter().map(|(_, _, b)| b).sum();
+            if cache.1 + add > CACHE_CAP_BYTES {
+                cache.0.clear();
+                cache.1 = 0;
+            }
+            for (kk, b, nb) in inserts {
+                cache.0.insert(kk, b);
+                cache.1 += nb;
+            }
+            drop(cache);
+            owl_shared::metrics::with_metrics_store(|s| {
+                s.timer_record_tag("load.mat.a8", t0.elapsed(), file!(), line!())
+            });
+            owl_shared::log_info!(
+                "awq",
+                "物化 {base} a8(合并键 out={out}, k={k}, 因子={factor:.3e}) @ {:?}",
+                t0.elapsed()
+            );
+            return Ok(());
+        }
+        let Some((out, k, form)) = self.linear_form(base) else {
+            return Err(ModelError::Msg(format!("awq/a8: {base} 形态不可解(非量化线性?)")));
+        };
+        if !crate::formats::w4a16::marlin_eligible(out, k) {
+            return Err(ModelError::Msg(format!(
+                "awq/a8: {base} (out={out}, k={k}) 不满足 marlin 打包约束(n%256==0 && k%128==0)"
+            )));
+        }
+        let shard = base.bytes().map(|b| b as usize).sum::<usize>() % self.build_locks.len();
+        let _g = self.build_locks[shard].lock().unwrap();
+        let guard_key = if want_b { format!("{base}.qweight_a8") } else { format!("{base}.scales_a8") };
+        {
+            let cache = self.cache.lock().unwrap();
+            if cache.0.contains_key(&guard_key) {
+                return Ok(());
+            }
+        }
+        let t0 = std::time::Instant::now();
+        let groups = k / 32;
+        // 源数据三件:q(nibble u8 行主序 [out,k])/ scales(f32 [out,groups])/
+        // zp(u8 [out,groups])—— ct 形态直取,裸权重形态现场 RTN g32-sym(zp≡8)
+        let (q_u8, scales_f32, zp_u8): (Vec<u8>, Vec<f32>, Vec<u8>) = match form {
+            QuantForm::Ct { pe, se, ze } => {
+                let packed = i32s_par(&self.maps[pe.map_ix][pe.start..pe.start + pe.nbytes]);
+                let s = bf16_par(&self.maps[se.map_ix][se.start..se.start + se.nbytes]);
+                let zp_i32 = i32s_par(&self.maps[ze.map_ix][ze.start..ze.start + ze.nbytes]);
+                self.maps[pe.map_ix].dontneed(pe.start, pe.nbytes);
+                self.maps[se.map_ix].dontneed(se.start, se.nbytes);
+                self.maps[ze.map_ix].dontneed(ze.start, ze.nbytes);
+                (
+                    if want_b { unpack_nibbles(&packed, out, k) } else { Vec::new() },
+                    s,
+                    unpack_zp_ct(&zp_i32, out, groups),
+                )
+            }
+            QuantForm::F16 { we } => {
+                // 裸权重 → f32 → RTN int4 g32 对称(与 a16 臂 F16 兜底同源)
+                let wb = &self.maps[we.map_ix][we.start..we.start + we.nbytes];
+                let w_f32: Vec<f32> = match we.dtype {
+                    safetensors::Dtype::BF16 => bf16_par(wb),
+                    safetensors::Dtype::F16 => wb
+                        .chunks_exact(2)
+                        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                        .collect(),
+                    safetensors::Dtype::F32 => wb
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect(),
+                    _ => {
+                        return Err(ModelError::Msg(format!(
+                            "awq/a8: {base} 裸权重 dtype 不支持"
+                        )))
+                    }
+                };
+                self.maps[we.map_ix].dontneed(we.start, we.nbytes);
+                (
+                    if want_b { rtn_g32_sym_packed(&w_f32, out, k) } else { Vec::new() },
+                    rtn_g32_sym_scales(&w_f32, out, k),
+                    vec![8u8; out * groups],
+                )
+            }
+        };
+        let (s_bits, factor) = pack_marlin_s_a8(&scales_f32, out, groups);
+        let z_buf = pack_marlin_z_a8(&zp_u8, out, groups);
+        let mut inserts: Vec<(String, Arc<[u8]>, usize)> = Vec::new();
+        if want_b {
+            let b_buf = pack_marlin_b_a8(&q_u8, k, out);
+            inserts.push((
+                format!("{base}.qweight_a8"),
+                Arc::from(i32s_le_bytes(&b_buf).into_boxed_slice()),
+                b_buf.len() * 4,
+            ));
+        }
+        inserts.extend([
+            (
+                format!("{base}.scales_a8"),
+                Arc::from(u16s_le_bytes(&s_bits).into_boxed_slice()),
+                s_bits.len() * 2,
+            ),
+            (
+                format!("{base}.zeros_a8"),
+                Arc::from(i32s_le_bytes(&z_buf).into_boxed_slice()),
+                z_buf.len() * 4,
+            ),
+            (
+                format!("{base}.a8_factor"),
+                Arc::from(factor.to_le_bytes().to_vec().into_boxed_slice()),
+                4,
+            ),
+        ]);
+        let mut cache = self.cache.lock().unwrap();
+        let add: usize = inserts.iter().map(|(_, _, b)| b).sum();
+        if cache.1 + add > CACHE_CAP_BYTES {
+            cache.0.clear();
+            cache.1 = 0;
+        }
+        for (kk, b, nb) in inserts {
+            cache.0.insert(kk, b);
+            cache.1 += nb;
+        }
+        drop(cache);
+        owl_shared::metrics::with_metrics_store(|s| {
+            s.timer_record_tag("load.mat.a8", t0.elapsed(), file!(), line!())
+        });
+        owl_shared::log_info!(
+            "awq",
+            "物化 {base} a8 (out={out}, k={k}, 因子={factor:.3e}) @ {:?}",
+            t0.elapsed()
+        );
+        Ok(())
+    }
+
     /// 键全量字节视图(懒物化 / passthrough 归一;take/take_range 用)
     fn key_bytes(&self, key: &str) -> Option<(KeyData, Dtype)> {
         Some(match self.resolve(key)? {
@@ -947,7 +1221,15 @@ impl WeightSource for AwqSource {
     }
 }
 
-    /// **bf16 源 → marlin scales 字节**(单遍融合;装载热路径的内部器)。
+    /// **a8 键族谓词**(S2):W4A8 的四件产物 —— 与 a16 键族并列(层侧按 plan 二选一)
+fn is_a8_key(key: &str) -> bool {
+    key.ends_with(".qweight_a8")
+        || key.ends_with(".scales_a8")
+        || key.ends_with(".zeros_a8")
+        || key.ends_with(".a8_factor")
+}
+
+/// **bf16 源 → marlin scales 字节**(单遍融合;装载热路径的内部器)。
 ///
 /// `parts` = 源 bf16 分段(1 或 2 段;2 段 = 合并虚拟键左右半,按序拼接);
 /// `idx` = [`marlin_scales_index`] 源下标表;逐位等价原链
@@ -1254,6 +1536,56 @@ mod tests {
         let want2 = u16s_le_bytes(&pack_marlin_s(&f32_merged[..out * groups], out, groups));
         assert_eq!(merged, want2, "两段融合逐位");
         let _ = (o1, o2);
+    }
+
+    /// **a8 四件物化对拍**(S2):同源数据经 `AwqSource` 键族取出的字节
+    /// 必须与**直接调用 a8 三件套**逐位相等(+ 全局因子键 = `max/4096`)
+    #[test]
+    fn awq_source_a8_keys_match_packers() {
+        use owl_kernels::family::marlin::repack::{
+            pack_marlin_b_a8, pack_marlin_s_a8, pack_marlin_z_a8, unpack_nibbles,
+        };
+        let (out, k) = (256usize, 256usize); // marlin_eligible:n%256==0 && k%128==0
+        let groups = k / 32;
+        let dir = tmp_path("awq_a8_keys");
+        let packed: Vec<i32> = (0..out * (k / 8))
+            .map(|i| (i as i32).wrapping_mul(0x0BB6_7AE1).wrapping_mul(0x9E37_79B1_u32 as i32))
+            .collect();
+        let zp: Vec<i32> = (0..(out / 8) * groups)
+            .map(|i| (i as i32).wrapping_mul(0x85EB_CA6B_u32 as i32) ^ 0x1234_5678)
+            .collect();
+        let scales: Vec<f32> = (0..out * groups).map(|i| 0.01 + (i % 23) as f32 * 0.002).collect();
+        let sb = f32_to_bf16_bytes(&scales);
+        write_ct_dir(&dir, "l", &packed, &sb, &zp, out, k);
+        let src = AwqSource::open_dir(&dir).expect("open");
+        // ⚠️ 期望必须用**检查点里真正存的** bf16 位型(a8 归一对尺度精度敏感:
+        // 拿裸 f32 做期望会差一个 bf16 舍入 —— 2026-10-16 首跑实测)
+        let scales_bf16 = bf16_par(&sb);
+
+        let take = |key: &str| -> (Vec<u8>, Dtype) {
+            let (d, dt) = src.key_bytes(key).unwrap_or_else(|| panic!("{key} 取不到"));
+            (d.as_slice().to_vec(), dt)
+        };
+        // 期望 = 直接过 a8 三件套(a16 臂同源的 unpack 两步)
+        let want_b = i32s_le_bytes(&pack_marlin_b_a8(&unpack_nibbles(&packed, out, k), k, out));
+        let (s_bits, factor) = pack_marlin_s_a8(&scales_bf16, out, groups);
+        let want_s = u16s_le_bytes(&s_bits);
+        let want_z = i32s_le_bytes(&pack_marlin_z_a8(&unpack_zp_ct(&zp, out, groups), out, groups));
+
+        let (b, dt_b) = take("l.qweight_a8");
+        let (s_, dt_s) = take("l.scales_a8");
+        let (z, dt_z) = take("l.zeros_a8");
+        let (f, dt_f) = take("l.a8_factor");
+        assert_eq!(b, want_b, "qweight_a8 逐位(32×32 tile 布局)");
+        assert_eq!(s_, want_s, "scales_a8 逐位(perm_single + int16 归一)");
+        assert_eq!(z, want_z, "zeros_a8 逐位(无 n-interleave)");
+        assert_eq!(f, factor.to_le_bytes().to_vec(), "a8_factor = max/4096");
+        assert_eq!((dt_b, dt_s, dt_z, dt_f), (Dtype::U32, Dtype::F16, Dtype::U32, Dtype::F32), "线 dtype");
+        // 尺寸自查(位数与 GEMM 槽契约对望)
+        assert_eq!(b.len(), (k / 16) * (out * 16 / 8) * 4, "B 字数 = (k/16, n*2) i32");
+        assert_eq!(s_.len(), groups * out * 2, "scales 字数 = (k/g, n) 2B");
+        assert_eq!(z.len(), groups * (out / 8) * 4, "zp 字数 = (k/g, n/8) i32");
+        assert_eq!(f.len(), 4, "因子 = f32[1]");
     }
 
     /// `pack_marlin_s` 索引表化**逐位对拍**(冻结参考实现 = 原现算表式)

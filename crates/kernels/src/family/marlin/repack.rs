@@ -452,6 +452,27 @@ mod tests {
         assert_eq!(marlin_scale_perm().len(), 64);
     }
 
+    /// a8 与 a16 的 zp 布局**必须真的不同**(否则 a8 分支是死代码,
+    /// 且“skip interleave”这条语义无从验证)
+    ///
+    /// ⚠️ 数据必须沿 **o 轴** 非退化:perm 作用在 (groups, out) 的 out 轴上,
+    /// 若沿 o 有周期 ≤ 8,interleave 就可能逐字节隐形(2026-10-16 实测踩到:
+    /// `(i*3+1)%16` 在 groups=4 下沿 o 周期 4 ⇒ 两条布局逐字节相同)。
+    #[test]
+    fn z_a8_layout_differs_from_a16() {
+        let (out, groups) = (64usize, 4usize);
+        let mut zp = vec![0u8; out * groups];
+        for o in 0..out {
+            for g in 0..groups {
+                zp[o * groups + g] = ((o * 5 + g * 3 + 1) % 16) as u8;
+            }
+        }
+        let a16 = pack_marlin_z(&zp, out, groups);
+        let a8 = pack_marlin_z_a8(&zp, out, groups);
+        assert_eq!(a16.len(), a8.len());
+        assert_ne!(a16, a8, "两条 zp 布局逐字节相同 ⇒ a8 分支没起作用");
+    }
+
     // 2026-10-12 装载提速:unpack_zp_ct / pack_marlin_z / pack_marlin_s_f32
     // 由全串行改为 rayon 并行(装载期 p50 198ms→);本测试把**改前的
     // 串行算法原文**留作参考实现,逐字节对拍 —— 并行化不变量机器锁。
@@ -636,6 +657,51 @@ pub fn pack_marlin_z(zp: &[u8], out: usize, groups: usize) -> Vec<i32> {
     let mut packed = vec![0i32; groups * (n / 8)];
     packed.par_chunks_mut(n / 8).enumerate().for_each(|(g, row)| {
         let src = &il[g * n..(g + 1) * n];
+        for (jc, cell) in row.iter_mut().enumerate() {
+            let mut v: u32 = 0;
+            for nib in 0..8 {
+                v |= (src[jc * 8 + nib] as u32) << (4 * nib);
+            }
+            *cell = v as i32;
+        }
+    });
+    packed
+}
+
+/// `pack_marlin_z` 的 **a8 变体**(port upstream `marlin_zero_points(is_a_8bit=True)`):
+/// 与 a16 版**唯一差异 = 跳过 n-interleave 段**(上游 `if not is_a_8bit:` 包住
+/// 的就是它)—— 其余(转置 → 64-chunk `scale_perm` → 沿 n 8-nibble LSB-first
+/// → `(groups, out/8)` i32)逐字节同源。
+///
+/// 为什么 a8 不要 interleave:W4A8 内核的 zp 读取按 `(tid/32)%2*2+j` 取字节
+/// (`marlin_template.h` is_a_8bit && has_zp 分支),而 a16 走 `frag_qzp` 4-nibble
+/// 交错面 —— 两边期望的列序不同。
+pub fn pack_marlin_z_a8(zp: &[u8], out: usize, groups: usize) -> Vec<i32> {
+    use rayon::prelude::*;
+    assert_eq!(zp.len(), out * groups);
+    let sp = marlin_scale_perm();
+
+    // (out, groups) → (groups, n=out)(与 a16 版同:并发分块、结果位不变)
+    let mut z = vec![0u8; groups * out];
+    z.par_chunks_mut(out).enumerate().for_each(|(g, row)| {
+        for (o, cell) in row.iter_mut().enumerate() {
+            *cell = zp[o * groups + g];
+        }
+    });
+    assert_eq!(z.len() % 64, 0, "groups*n % 64 != 0");
+    z.par_chunks_mut(64).for_each(|chunk| {
+        let mut orig = [0u8; 64];
+        orig.copy_from_slice(chunk);
+        for (dst, src) in sp.iter().enumerate() {
+            chunk[dst] = orig[*src];
+        }
+    });
+    // 沿 n 打包 8 nibble/i32 LSB-first → (groups, out/8)(**无 interleave**)
+    let n = out;
+    assert!(n.is_multiple_of(8), "n % 8 != 0");
+    let mut packed = vec![0i32; groups * (n / 8)];
+    packed.par_chunks_mut(n / 8).enumerate().for_each(|(g, row)| {
+        let src = &z[g * n..(g + 1) * n];
         for (jc, cell) in row.iter_mut().enumerate() {
             let mut v: u32 = 0;
             for nib in 0..8 {

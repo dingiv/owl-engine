@@ -63,28 +63,24 @@ async fn composites_hold_stream_order_and_closed_set_validation() {
     let bv: Vec<f32> = (0..n).map(|i| (i as f32) * -0.25 + 1.0).collect();
     let want: Vec<f32> = av.iter().zip(&bv).map(|(x, y)| x + y).collect();
 
-    let a = c
-        .htod(Dtype::F32, &Shape::from(vec![n]), &le_f32(&av))
+    let a = owl_iface::htod!(c, Dtype::F32, &Shape::from(vec![n]), &le_f32(&av))
         .await
         .expect("htod A");
-    let b = c
-        .alloc(Dtype::F32, n)
+    let b = owl_iface::alloc!(c, Dtype::F32, n)
         .await
         .expect("alloc B")
         .view(Dtype::F32, 1);
-    let out1 = c
-        .alloc(Dtype::F32, n)
+    let out1 = owl_iface::alloc!(c, Dtype::F32, n)
         .await
         .expect("alloc out1")
         .view(Dtype::F32, 1);
-    let out2 = c
-        .alloc(Dtype::F32, n)
+    let out2 = owl_iface::alloc!(c, Dtype::F32, n)
         .await
         .expect("alloc out2")
         .view(Dtype::F32, 1);
 
     // ① UploadAndLaunch:B 由复合命令搬运,**紧接着**的核必须读到它
-    let mut lease = c.alloc_pinned(n * 4).await.expect("pinned");
+    let mut lease = owl_iface::alloc_pinned!(c, n * 4).await.expect("pinned");
     let bb = le_f32(&bv);
     lease.slice_bytes_mut()[..bb.len()].copy_from_slice(&bb);
     let out_b = c
@@ -156,23 +152,20 @@ async fn composites_are_rejected_during_capture() {
     }
     let mut c = assemble();
     let n = 256usize;
-    let a = c
-        .htod(Dtype::F32, &Shape::from(vec![n]), &le_f32(&vec![1.0f32; n]))
+    let a = owl_iface::htod!(c, Dtype::F32, &Shape::from(vec![n]), &le_f32(&vec![1.0f32; n]))
         .await
         .expect("htod A");
-    let b = c
-        .alloc(Dtype::F32, n)
+    let b = owl_iface::alloc!(c, Dtype::F32, n)
         .await
         .expect("alloc B")
         .view(Dtype::F32, 1);
-    let out = c
-        .alloc(Dtype::F32, n)
+    let out = owl_iface::alloc!(c, Dtype::F32, n)
         .await
         .expect("alloc out")
         .view(Dtype::F32, 1);
 
     // 租约在**窗外**取(捕获白名单连 AllocPinned 也拒 —— 白名单之严顺带被本测佐证)
-    let lease = c.alloc_pinned(n * 4).await.expect("pinned");
+    let lease = owl_iface::alloc_pinned!(c, n * 4).await.expect("pinned");
     c.graph_begin().await.expect("捕获开始");
     // 捕获期发复合 #1(内含 H2D)⇒ 必须被白名单拒
     let e1 = c
@@ -215,13 +208,11 @@ async fn block_ledger_is_clean() {
     let mut c = assemble();
     let n = 4096usize;
     // 造一批块(不同尺寸 ⇒ 尽量压到不同尺寸类/复用面)
-    let a = c
-        .htod(Dtype::F32, &Shape::from(vec![n]), &le_f32(&vec![1.0f32; n]))
+    let a = owl_iface::htod!(c, Dtype::F32, &Shape::from(vec![n]), &le_f32(&vec![1.0f32; n]))
         .await
         .expect("htod");
-    let b = c.alloc(Dtype::F32, n).await.expect("alloc").view(Dtype::F32, 1);
-    let big = c
-        .alloc(Dtype::F32, n * 64)
+    let b = owl_iface::alloc!(c, Dtype::F32, n).await.expect("alloc").view(Dtype::F32, 1);
+    let big = owl_iface::alloc!(c, Dtype::F32, n * 64)
         .await
         .expect("alloc big")
         .view(Dtype::F32, 1);

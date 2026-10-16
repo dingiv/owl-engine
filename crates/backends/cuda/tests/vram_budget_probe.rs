@@ -31,11 +31,11 @@ async fn client_with(diag: DiagOpts) -> GpuClient {
 async fn logical_cap_refuses_before_cuda() {
     let mut c = client_with(DiagOpts { vram_budget_mb: Some(1), ..Default::default() }).await;
     // 先占 0.5MiB(在上限内):应放行
-    let ok = c.alloc(Dtype::F32, (512 * 1024) / 4).await.expect("预算内应放行");
+    let ok = c.alloc(Dtype::F32, (512 * 1024) / 4, "probe:budget-ok").await.expect("预算内应放行");
     drop(ok);
     // 再要 2MiB:live(0.5MiB 已归还但账已记)… 直接要 2MiB > 1MiB 上限 ⇒ 拒
     let err = c
-        .alloc(Dtype::F32, (2 * 1024 * 1024) / 4)
+        .alloc(Dtype::F32, (2 * 1024 * 1024) / 4, "probe:budget-over")
         .await
         .expect_err("超上限必须拒发");
     eprintln!("[硬预算门] 逻辑上限拒发: {err}");
@@ -54,7 +54,7 @@ async fn logical_cap_refuses_before_cuda() {
 async fn driver_free_minus_reserve_refuses() {
     let mut c = client_with(DiagOpts { vram_reserve_mb: 1 << 20, ..Default::default() }).await;
     let err = c
-        .alloc(Dtype::F32, 1024)
+        .alloc(Dtype::F32, 1024, "probe")
         .await
         .expect_err("reserve 拉满必须拒发");
     eprintln!("[硬预算门] 驱动账拒发: {err}");
@@ -66,7 +66,7 @@ async fn driver_free_minus_reserve_refuses() {
 #[tokio::test]
 async fn default_budget_still_allocates() {
     let mut c = client_with(DiagOpts::default()).await;
-    let b = c.alloc(Dtype::F32, 1024).await.expect("默认档应放行");
+    let b = c.alloc(Dtype::F32, 1024, "probe").await.expect("默认档应放行");
     let mut out = vec![0u8; 16];
     c.dtoh_at(&b, 0, &mut out).await.expect("回读");
     assert_eq!(out, vec![0u8; 16], "清零分配");

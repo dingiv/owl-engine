@@ -13,9 +13,11 @@
 use owl_shared::config::OwlConfig;
 
 fn whitelist(flavor: &str) -> Vec<&'static str> {
-    // flavor 名 → 预设文件路径(解析归 server app 面;配置层只认文件)
-    let base = owl_shared::assets::preset_path(flavor).expect("preset 路径");
-    let cfg = OwlConfig::load(Some(&base), None).expect("flavor 解析");
+    // **配置层不认识 flavor 名字**(2026-10-16 分层):名字 → 预设档路径是入口
+    // (server `config.rs`)的职责。本测试复用同一个解析口 `preset_path`,
+    // 免第二份“名字怎么变成配置”的语义。
+    let path = owl_shared::assets::preset_path(flavor).expect("预设档路径");
+    let cfg = OwlConfig::load(Some(&path), None).expect("flavor 解析");
     let list = cfg
         .dispatch
         .allowed_ops

@@ -513,7 +513,7 @@ mod tests {
     async fn kv_block_migrates_gpu_to_host_and_back_with_books_balanced() {
         let mut r = rel(2);
         let mut face = owl_cpu::CpuFace::default();
-        let dev = face.alloc(owl_iface::contract::Dtype::F32, BLOCK_BYTES / 4).await.expect("设备块");
+        let dev = face.alloc(owl_iface::contract::Dtype::F32, BLOCK_BYTES / 4, "t").await.expect("设备块");
         let tokens = toks(32);
         let mut table = Vec::new();
         r.ensure_for_len(&mut table, 32).expect("块表");
@@ -547,7 +547,7 @@ mod tests {
         let mut r = Rel::open(i, AdmissionPolicy::new(1, QueuePolicy::Reject), kv_cfg(8, 8), 32 * 1024)
             .expect("装配");
         let mut face = owl_cpu::CpuFace::default();
-        let dev = face.alloc(owl_iface::contract::Dtype::F32, BLOCK_BYTES / 4).await.expect("设备块");
+        let dev = face.alloc(owl_iface::contract::Dtype::F32, BLOCK_BYTES / 4, "t").await.expect("设备块");
         let ta = toks(32);
         let tb: Vec<u32> = (100..132).collect();
         for t in [&ta, &tb] {
@@ -570,7 +570,7 @@ mod tests {
     async fn offload_refuses_while_session_holds_the_block() {
         let mut r = rel(2);
         let mut face = owl_cpu::CpuFace::default();
-        let dev = face.alloc(owl_iface::contract::Dtype::F32, BLOCK_BYTES / 4).await.expect("设备块");
+        let dev = face.alloc(owl_iface::contract::Dtype::F32, BLOCK_BYTES / 4, "t").await.expect("设备块");
         let tokens = toks(32);
         let mut table = Vec::new();
         r.ensure_for_len(&mut table, 32).expect("块表");

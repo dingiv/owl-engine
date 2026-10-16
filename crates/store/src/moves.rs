@@ -69,7 +69,7 @@ pub async fn upload_span<D: DeviceClient>(
 ) -> Result<(), StoreError> {
     let n = src.len();
     let mut lease = face
-        .alloc_pinned(n)
+        .alloc_pinned(n, "store:moves-staging")
         .await
         .map_err(|e| map_err(e, "搬入 alloc_pinned 失败", n))?;
     lease.slice_bytes_mut()[..n].copy_from_slice(src);
@@ -129,10 +129,10 @@ mod tests {
     /// ⚠️ CPU 面值块恒 f32 ⇒ `elems` 按 f32 记账(块字节 = elems × 4)。
     async fn device_block(face: &mut CpuFace, len_bytes: usize) -> (Bytes, usize) {
         let elems = len_bytes / 4;
-        let b = face.alloc(Dtype::F32, elems).await.expect("alloc");
+        let b = face.alloc(Dtype::F32, elems, "t").await.expect("alloc");
         let n = len_bytes;
         let pat: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
-        let mut lease = face.alloc_pinned(n).await.expect("pinned 租约");
+        let mut lease = face.alloc_pinned(n, "t").await.expect("pinned 租约");
         lease.slice_bytes_mut()[..n].copy_from_slice(&pat);
         face.upload_pinned(lease, &b, 0, n).await.expect("upload_pinned");
         face.sync().await.expect("sync");

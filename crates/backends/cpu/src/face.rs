@@ -386,9 +386,14 @@ impl DeviceClient for CpuFace {
     }
 
     /// 显存分配(清零;CPU = Vec;无流参数 —— 同步直调即序)。
+    /// 显存分配(清零;CPU = Vec;无流参数 —— 同步直调即序)。
     /// 声明 dtype 放行 F32/F16/BF16(**存储恒 f32**,声明只入记账/解码口径);
     /// U32/U8 拒(执行面无此值域)。
-    async fn alloc(&mut self, dtype: Dtype, elems: usize) -> Result<Bytes, ModelError> {
+    ///
+    /// `_name`(全量记名):CPU 面无显存账房(值块是 host Vec)⇒ 无 OOM
+    /// 现场可归因,名字无处落 —— 有意不存(不是遗忘;GPU 面由
+    /// `GpuClient`→`Command::Alloc`→块账房 `BlockEntry.name` 承担)。
+    async fn alloc(&mut self, dtype: Dtype, elems: usize, _name: &str) -> Result<Bytes, ModelError> {
         match dtype {
             Dtype::F32 | Dtype::F16 | Dtype::BF16 => {}
             other => {
@@ -410,12 +415,13 @@ impl DeviceClient for CpuFace {
         Ok(Bytes::new(id, elems, Dtype::F32, 0))
     }
 
-    /// 装载(host 字节 → f32 值块)
+    /// 装载(host 字节 → f32 值块);`_name` 同 [`CpuFace::alloc`](有意不存)。
     async fn htod(
         &mut self,
         dtype: Dtype,
         shape: &Shape,
         src: &[u8],
+        _name: &str,
     ) -> Result<Bytes, ModelError> {
         self.capture_guard("htod")?; // 窗内禁搬运(GPU 同律)
         self.charge(src.len())?;
@@ -680,6 +686,7 @@ impl DeviceClient for CpuFace {
     async fn alloc_pinned(
         &mut self,
         bytes: usize,
+        _name: &str,
     ) -> Result<Box<dyn owl_iface::contract::PinnedRegion + Send>, ModelError> {
         Ok(self.pinned_take(bytes))
     }
@@ -870,9 +877,9 @@ mod tests {
     async fn graph_capture_records_and_replay_recomputes() {
         // 图能力 = mock 档显式开(默认档无图,与改造前一致)
         let mut f = CpuFace::mock(MockLimits { graph_capture: true, ..Default::default() });
-        let a = f.alloc(Dtype::F32, 4).await.expect("a");
-        let b = f.alloc(Dtype::F32, 4).await.expect("b");
-        let out = f.alloc(Dtype::F32, 4).await.expect("out");
+        let a = f.alloc(Dtype::F32, 4, "t").await.expect("a");
+        let b = f.alloc(Dtype::F32, 4, "t").await.expect("b");
+        let out = f.alloc(Dtype::F32, 4, "t").await.expect("out");
         f.write_block_f32(&a, 0, &[1.0, 2.0, 3.0, 4.0]).await.expect("写 a");
         f.write_block_f32(&b, 0, &[10.0, 20.0, 30.0, 40.0]).await.expect("写 b");
 
@@ -899,7 +906,7 @@ mod tests {
         assert!(f.graph_end().await.is_err(), "空捕获窗响亮拒");
         assert!(f.graph_begin().await.is_err(), "不可嵌套捕获");
         assert!(
-            f.htod(Dtype::F32, &vec![1], &[0u8; 4]).await.is_err(),
+            f.htod(Dtype::F32, &vec![1], &[0u8; 4], "t").await.is_err(),
             "窗内禁 htod(与 GPU 同律)"
         );
         assert!(f.sync().await.is_err(), "窗内禁 sync");
@@ -917,27 +924,27 @@ mod tests {
     async fn mock_vram_wall_and_fault_injection_are_loud() {
         // 墙:1024 字节 ⇒ 一个 256-elem f32 块正好占满
         let mut f = CpuFace::mock(MockLimits { vram_bytes: 1024, ..Default::default() });
-        let a = f.alloc(Dtype::F32, 256).await.expect("恰满");
+        let a = f.alloc(Dtype::F32, 256, "t").await.expect("恰满");
         assert_eq!(f.vram_used(), 1024);
-        let err = f.alloc(Dtype::F32, 1).await.expect_err("越界必拒");
+        let err = f.alloc(Dtype::F32, 1, "t").await.expect_err("越界必拒");
         assert!(matches!(err, ModelError::PoolExhausted { .. }), "得 {err}");
         assert!(format!("{err}").contains("容量墙"), "{err}");
         // free 回冲(与真卡口径一致)
         f.free(&[a.id]).await.expect("归还");
         assert_eq!(f.vram_used(), 0);
-        let _b = f.alloc(Dtype::F32, 256).await.expect("归还后可再分配");
+        let _b = f.alloc(Dtype::F32, 256, "t").await.expect("归还后可再分配");
 
         // 声明口径:alloc(F16, n) 只记 2n 字节(不按 mock 的 f32 存储翻倍)
         let mut w = CpuFace::mock(MockLimits { vram_bytes: 4096, ..Default::default() });
-        let _h = w.alloc(Dtype::F16, 1024).await.expect("f16 块");
+        let _h = w.alloc(Dtype::F16, 1024, "t").await.expect("f16 块");
         assert_eq!(w.vram_used(), 2048, "按声明 dtype 记账(真卡口径)");
 
         // 注入:第 2 次分配失败(一次性)
         let mut g = CpuFace::mock(MockLimits { fail_alloc_nth: 2, ..Default::default() });
-        let _x = g.alloc(Dtype::F32, 1).await.expect("第 1 次");
-        let err = g.alloc(Dtype::F32, 1).await.expect_err("第 2 次注入");
+        let _x = g.alloc(Dtype::F32, 1, "t").await.expect("第 1 次");
+        let err = g.alloc(Dtype::F32, 1, "t").await.expect_err("第 2 次注入");
         assert!(format!("{err}").contains("故障注入"), "{err}");
-        let _y = g.alloc(Dtype::F32, 1).await.expect("注入是一次性的");
+        let _y = g.alloc(Dtype::F32, 1, "t").await.expect("注入是一次性的");
     }
 
     /// **复合上传口(§18)**:`upload_and_launch` 按**声明 dtype** 解码(BF16 源)
@@ -945,9 +952,9 @@ mod tests {
     #[tokio::test]
     async fn upload_and_launch_decodes_declared_dtype() {
         let mut f = CpuFace::new();
-        let a = f.alloc(Dtype::BF16, 2).await.expect("a(声明 BF16)");
-        let b = f.alloc(Dtype::F32, 2).await.expect("b");
-        let out = f.alloc(Dtype::F32, 2).await.expect("out");
+        let a = f.alloc(Dtype::BF16, 2, "t").await.expect("a(声明 BF16)");
+        let b = f.alloc(Dtype::F32, 2, "t").await.expect("b");
+        let out = f.alloc(Dtype::F32, 2, "t").await.expect("out");
         f.write_block_f32(&b, 0, &[1.0, 1.0]).await.expect("写 b");
         // BF16 源:1.0 = 0x3F80,2.0 = 0x4000
         let src: Vec<u8> = [0x3F80u16, 0x4000u16]
@@ -971,8 +978,8 @@ mod tests {
     #[tokio::test]
     async fn null_kernels_turn_unregistered_ops_into_noops() {
         let mut f = CpuFace::mock(MockLimits { null_kernels: true, ..Default::default() });
-        let a = f.alloc(Dtype::F32, 4).await.expect("a");
-        let out = f.alloc(Dtype::F32, 4).await.expect("out");
+        let a = f.alloc(Dtype::F32, 4, "t").await.expect("a");
+        let out = f.alloc(Dtype::F32, 4, "t").await.expect("out");
         f.write_block_f32(&a, 0, &[7.0; 4]).await.expect("写");
         f.write_block_f32(&out, 0, &[9.0; 4]).await.expect("写 out");
         // 未注册核:空转档不报错
@@ -988,7 +995,7 @@ mod tests {
         assert_eq!(read_f32(&mut f, &out, 4).await, vec![0.0; 4], "输出清零");
         // 默认档仍响亮拒(不放宽)
         let mut g = CpuFace::new();
-        let o2 = g.alloc(Dtype::F32, 4).await.expect("out2");
+        let o2 = g.alloc(Dtype::F32, 4, "t").await.expect("out2");
         let err = g
             .launch(LaunchMsg {
                 kernel: KernelSource { name: "owl_attention_paged_f16".into(), source: String::new() },
@@ -1007,8 +1014,8 @@ mod tests {
     #[tokio::test]
     async fn block_ledger_dump_exposes_live_blocks() {
         let mut f = CpuFace::new();
-        let a = f.alloc(Dtype::F32, 8).await.expect("a");
-        let _b = f.alloc(Dtype::BF16, 8).await.expect("b");
+        let a = f.alloc(Dtype::F32, 8, "t").await.expect("a");
+        let _b = f.alloc(Dtype::BF16, 8, "t").await.expect("b");
         let rows = f.block_ledger_dump().await.expect("账本");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].id, a.id);

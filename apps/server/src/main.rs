@@ -339,7 +339,7 @@ async fn actor_main(
                 let head_plan = owl_engine::head_plan_of(config.head_quant);
                 engine
                     .loader()
-                    .load_qwen38_27b_awq(&config.model_dir, &config.model_dir, head_plan)
+                    .load_qwen38_27b_awq(&config.model_dir, &config.model_dir, head_plan, config.w4a8)
                     .await?
             }
             ModelKind::Qwen35_08b => engine.loader().load_qwen35_0_8b(&config.model_dir).await?,

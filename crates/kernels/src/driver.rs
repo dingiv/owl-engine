@@ -66,6 +66,10 @@ pub enum DType {
     BF16,
     /// 装载域 ct packed(U32;owl_ct_repack_u32)
     U32,
+    /// **字节承载**(池块 / 量化输出;S1c 激活 int8 量化是首个非激活域输出)。
+    /// 与 [`U32`](Self::U32) 同律:只有**声明里就是 U8** 的算子能收到它;
+    /// 其余算子的 `match` 一律 [`unimplemented!`](unimplemented)(响亮拒)。
+    U8,
 }
 
 /// pick 三件的中间形态(const 构造友好)
@@ -274,10 +278,18 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "elems.cast_f16_bf16" => elems::cast_dir(false),
         "elems.cast_bf16_f16" => elems::cast_dir(true),
         "dflash.select" => dflash::select(ax(0) != 0), // aux = [bf16](输入侧;输出恒 f32)
+        // aux = [rows];名字出自声明表单源(两档 = 两个 op_id)
+        "elems.quant_int8_row_f16" => {
+            elems::quant_int8_row(crate::ops::elems::QUANT_INT8_ROW_F16.entry, ax(0))
+        }
+        "elems.quant_int8_row_bf16" => {
+            elems::quant_int8_row(crate::ops::elems::QUANT_INT8_ROW_BF16.entry, ax(0))
+        }
         "dflash.conv" => dflash::conv(dt),
         "attn.naive_nc" => attn::naive_nc(dt, false, req.shapes, req.scalars),
         "attn.naive_nc_fp8kv" => attn::naive_nc(dt, true, req.shapes, req.scalars),
         "marlin.w4a16" => marlin::w4a16(req.shapes, dt),
+        "marlin.w4a8_awq" => marlin::w4a8_awq(),
         "attn.fi_prefill" => attn::fi_prefill(false),
         "attn.fi_prefill_fp8kv" => attn::fi_prefill(true),
         "attn.xqa_verify" => attn::xqa_verify(),
@@ -314,6 +326,12 @@ pub fn resolve(req: OpReq) -> KernelPick {
             let rows = req.shapes.first().map(|s| s[0]).unwrap_or(0);
             let cols = req.shapes.first().map(|s| s.get(1).copied().unwrap_or(0)).unwrap_or(0);
             load::ct_repack(rows, cols)
+        }
+        // W4A8 的 B 重排(S2 补):同输入/同输出字数,只换 tile 几何与块形
+        "load.ct_repack_a8" => {
+            let rows = req.shapes.first().map(|s| s[0]).unwrap_or(0);
+            let cols = req.shapes.first().map(|s| s.get(1).copied().unwrap_or(0)).unwrap_or(0);
+            load::ct_repack_a8(rows, cols)
         }
         other => panic!(
             "driver::resolve(\"{other}\"): 未登记的语义算子命名空间 —— 动作词表住 models::ops::SemanticKernel(op_id 落本表),实现住本模块分派表(两侧须同票)"
@@ -413,7 +431,7 @@ pub mod gdn {
         KernelPick { name: match dt {
             DType::F16 => "owl_gdn_gating_g_f16",
             DType::F32 => "owl_gdn_gating_g_f32",
-            DType::BF16 | DType::U32 => unimplemented!("GDN 族无 U32 变体"),
+            DType::BF16 | DType::U32 | DType::U8 => unimplemented!("GDN 族无 U32 变体"),
         }, shape: SENTINEL_1D }
     }
 
@@ -423,7 +441,7 @@ pub mod gdn {
             name: match dt {
                 DType::F16 => "owl_gdn_l2norm_f16",
                 DType::F32 => "owl_gdn_l2norm_f32",
-                DType::BF16 | DType::U32 => unimplemented!("GDN 族无 U32 变体"),
+                DType::BF16 | DType::U32 | DType::U8 => unimplemented!("GDN 族无 U32 变体"),
             },
             shape: Shape { grid: (rows as u32, 1, 1), ..SENTINEL_1D },
         }
@@ -434,7 +452,7 @@ pub mod gdn {
         KernelPick { name: match dt {
             DType::F16 => "owl_gdn_conv_upd_f16",
             DType::F32 => "owl_gdn_conv_upd_f32",
-            DType::BF16 | DType::U32 => unimplemented!("GDN 族无 U32 变体"),
+            DType::BF16 | DType::U32 | DType::U8 => unimplemented!("GDN 族无 U32 变体"),
         }, shape: SENTINEL_1D }
     }
 
@@ -453,7 +471,7 @@ pub mod gdn {
             name: match dt {
                 DType::F16 => "owl_gdn_delta_dec_f16",
                 DType::F32 => "owl_gdn_delta_dec_f32",
-                DType::BF16 | DType::U32 => unimplemented!("GDN 族无 U32 变体"),
+                DType::BF16 | DType::U32 | DType::U8 => unimplemented!("GDN 族无 U32 变体"),
             },
             shape: Shape {
                 grid: (vd.div_ceil(64) as u32, (batch * nv) as u32, 1),
@@ -538,7 +556,7 @@ pub mod gdn {
             name: match dt {
                 DType::F16 => "owl_gdn_norm_act_f16",
                 DType::F32 => "owl_gdn_norm_act_f32",
-                DType::BF16 | DType::U32 => unimplemented!("GDN 族无 U32 变体"),
+                DType::BF16 | DType::U32 | DType::U8 => unimplemented!("GDN 族无 U32 变体"),
             },
             shape: Shape {
                 grid: ((rows * value_dim / group_size) as u32, 1, 1),
@@ -561,7 +579,7 @@ pub mod ops {
             name: match dt {
                 DType::F16 => "owl_sigmoid_f16",
                 DType::F32 => "owl_sigmoid_f32",
-                DType::BF16 | DType::U32 => unimplemented!("sigmoid 无 BF16/U32 变体"),
+                DType::BF16 | DType::U32 | DType::U8 => unimplemented!("sigmoid 无 BF16/U32 变体"),
             },
             shape: SENTINEL_1D,
         }
@@ -574,7 +592,7 @@ pub mod ops {
                 DType::F32 => "owl_add_f32",
                 DType::F16 => "owl_add_f16",
                 DType::BF16 => "owl_add_bf16",
-                DType::U32 => unimplemented!("add 无 U32 变体"),
+                DType::U32 | DType::U8 => unimplemented!("add 无 U32 变体"),
             },
             shape: SENTINEL_1D,
         }
@@ -587,7 +605,7 @@ pub mod ops {
                 DType::F32 => "owl_mul_f32",
                 DType::F16 => "owl_mul_f16",
                 DType::BF16 => "owl_mul_bf16",
-                DType::U32 => unimplemented!("mul 无 U32 变体"),
+                DType::U32 | DType::U8 => unimplemented!("mul 无 U32 变体"),
             },
             shape: SENTINEL_1D,
         }
@@ -599,7 +617,7 @@ pub mod ops {
             name: match dt {
                 DType::F32 => "owl_silu_f32",
                 DType::F16 => "owl_silu_f16",
-                DType::BF16 | DType::U32 => unimplemented!("silu 无 BF16/U32 变体(MLP 走 silu_and_mul)"),
+                DType::BF16 | DType::U32 | DType::U8 => unimplemented!("silu 无 BF16/U32 变体(MLP 走 silu_and_mul)"),
             },
             shape: SENTINEL_1D,
         }
@@ -645,7 +663,7 @@ pub mod ops {
             DType::F32 => "owl_rmsnorm_f32",
             DType::F16 => "owl_rmsnorm_f16",
             DType::BF16 => "owl_rmsnorm_bf16",
-            DType::U32 => unimplemented!("rmsnorm 无 U32 变体"),
+            DType::U32 | DType::U8 => unimplemented!("rmsnorm 无 U32 变体"),
         };
         let x_total: usize = shapes.first().map(|s| s.iter().product()).unwrap_or(0);
         let cols: usize = shapes.get(1).map(|s| s.iter().product()).unwrap_or(1);
@@ -680,7 +698,7 @@ pub mod dflash {
             name: match dt {
                 DType::F16 => "owl_dflash_conv_f16",
                 DType::BF16 => "owl_dflash_conv_bf16",
-                DType::F32 | DType::U32 => unimplemented!("dflash_conv 仅 f16/bf16"),
+                DType::F32 | DType::U32 | DType::U8 => unimplemented!("dflash_conv 仅 f16/bf16"),
             },
             shape: SENTINEL_1D,
         }
@@ -1141,7 +1159,7 @@ pub mod attn {
             name: match dt {
                 DType::F16 => "owl_naive_decode_attn_f16",
                 DType::F32 => "owl_naive_decode_attn_f32",
-                DType::BF16 | DType::U32 => unimplemented!("naive attn 无 U32 变体"),
+                DType::BF16 | DType::U32 | DType::U8 => unimplemented!("naive attn 无 U32 变体"),
             },
             shape: SENTINEL_1D,
         }
@@ -1173,7 +1191,9 @@ pub mod attn {
             (DType::BF16, false) => "owl_naive_attn_nc_bf16",
             (DType::F16, true) => "owl_naive_attn_nc_fp8kv_f16",
             (DType::BF16, true) => "owl_naive_attn_nc_fp8kv_bf16",
-            (DType::F32, _) | (DType::U32, _) => unimplemented!("naive_nc 仅 f16/bf16"),
+            (DType::F32, _) | (DType::U32, _) | (DType::U8, _) => {
+                unimplemented!("naive_nc 仅 f16/bf16")
+            }
         };
         KernelPick {
             name,
@@ -1475,7 +1495,7 @@ pub mod vis {
         let name = match dt {
             DType::F32 => "owl_vis_attn_full_f32",
             DType::F16 => "owl_vis_attn_full_f16",
-            other => unreachable!("上面已拒"),
+            _ => unreachable!("上面已拒"),
         };
         const TILE: usize = 64;
         let smem = (2 * TILE * head_dim.max(1) * elem) as u32;
@@ -1559,6 +1579,22 @@ pub mod elems {
         }
     }
 
+    /// 激活 per-token int8 量化(W4A8 喂料手;S1c)。
+    ///
+    /// 几何 = **一 token 一 block**(grid = rows,block = 256 —— 上游同款:
+    /// 行内 absmax 要块内归约);`cols` 走核内 strided 循环兜底。
+    ///
+    /// ⚠️ **两档变体走两个 op_id**(`elems.quant_int8_row_{f16,bf16}`),不靠
+    /// `dt` 分流:本算子的**输出恒 U8**(字节承载),`dt` 载的是输出域,
+    /// 输入档由层自己知道 ⇒ 名字由 op_id 定,名字字面量出自声明表
+    /// (`ops::elems::QUANT_INT8_ROW_*`,单源)。与 cast 对同律。
+    pub fn quant_int8_row(name: &'static str, rows: usize) -> KernelPick {
+        KernelPick {
+            name,
+            shape: Shape { grid: (rows as u32, 1, 1), block: (256, 1, 1), smem: 0 },
+        }
+    }
+
     /// embedding 查表(一 token 一 block,block 1)
     pub fn embed(dt: DType, tokens: usize) -> KernelPick {
         KernelPick {
@@ -1585,7 +1621,17 @@ pub mod load {
         })
     }
 
+    /// W4A8 的 B 重排(**同输入契约、同输出字数**,tile 几何不同)
+    pub fn ct_repack_a8(rows: usize, cols: usize) -> KernelPick {
+        KernelPick::of::<crate::ops::load::CtRepackA8U32>(Shape {
+            grid: ((rows / 32) as u32, (cols / 4) as u32, 1),
+            block: (128, 1, 1),
+            smem: 0,
+        })
+    }
+
     pub const CT_REPACK: super::OpId = super::OpId("load.ct_repack"); // OpId 全路径引用,免 import
+    pub const CT_REPACK_A8: super::OpId = super::OpId("load.ct_repack_a8");
 }
 
 // ============================================================================
@@ -1713,7 +1759,7 @@ mod tests {
 pub mod marlin {
     use super::{DType, KernelPick, FOREIGN};
 
-    /// W4A16 GEMM(三名同 runtime;shapes.len = **父数(out 不算)**:
+    /// W4A16 GEMM(四名同 runtime;shapes.len = **父数(out 不算)**:
     /// AWQ 6 父(xs,qw,sc,zs,ws,c_tmp)/ f16·bf16 5 父;bf16 由 dt 路由)
     pub fn w4a16(shapes: &[Vec<usize>], dt: DType) -> KernelPick {
         let name = if shapes.len() == 6 {
@@ -1724,5 +1770,17 @@ pub mod marlin {
             crate::family::marlin::GEMM_W4A16
         };
         KernelPick { name, shape: FOREIGN }
+    }
+
+    /// W4A8 × AWQ GEMM(int8 激活 × kU4 零偏;W4A8 线 2026-10-16)。
+    ///
+    /// 与 [`w4a16`] 的区别**不在 dtype/父数**而在**语义**(激活已量化 +
+    /// per-token 尺度)⇒ 由层侧显式声明新动作(`marlin.w4a8_awq`),
+    /// 不在此按形状猜(猜测 = 两臂静默互换面)。
+    pub fn w4a8_awq() -> KernelPick {
+        KernelPick {
+            name: crate::family::marlin::GEMM_W4A8_AWQ,
+            shape: FOREIGN,
+        }
     }
 }

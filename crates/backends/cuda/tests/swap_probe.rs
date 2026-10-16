@@ -96,14 +96,14 @@ async fn swap_out_then_in_is_byte_exact() {
     let mut client = boot();
     client.sync().await.expect("sync");
 
-    let src = client.alloc(Dtype::U32, BLOCK / 4).await.expect("src");
-    let dst = client.alloc(Dtype::U32, BLOCK / 4).await.expect("dst");
+    let src = client.alloc(Dtype::U32, BLOCK / 4, "probe").await.expect("src");
+    let dst = client.alloc(Dtype::U32, BLOCK / 4, "probe").await.expect("dst");
     // 源块:三段图样(带偏移写入)
     let a = pattern(1024, 1);
     let b = pattern(1024, 2);
     let c = pattern(2048, 3);
     for (data, off) in [(&a, 0usize), (&b, 1024), (&c, 2048)] {
-        let mut lease = client.alloc_pinned(data.len()).await.expect("pinned");
+        let mut lease = client.alloc_pinned(data.len(), "probe:swap").await.expect("pinned");
         lease.slice_bytes_mut()[..data.len()].copy_from_slice(data);
         client.upload_pinned(lease, &src, off, data.len()).await.expect("upload");
     }
@@ -157,7 +157,7 @@ async fn swap_out_then_in_is_byte_exact() {
 async fn swap_rejects_bounds_and_empty_loudly() {
     let mut client = boot();
     client.sync().await.expect("sync");
-    let dev = client.alloc(Dtype::U32, BLOCK / 4).await.expect("dev");
+    let dev = client.alloc(Dtype::U32, BLOCK / 4, "probe").await.expect("dev");
 
     // ① 设备侧越界
     let bad = vec![SwapPiece { block: dev.id, dev_off: BLOCK - 8, conn_off: 0, len: 16, slot: ConnSlot(0) }];

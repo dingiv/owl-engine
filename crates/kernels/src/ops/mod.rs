@@ -287,6 +287,9 @@ pub const PROD_SPEC_DFLASH_2026_10_13: &[&str] = &[
     "owl_add_bf16",
     "owl_add_f16",
     "owl_argmax_f32idx_f16",
+    "marlin_gemm_w4a8_awq",
+    "owl_quant_int8_row_f16",
+    "owl_ct_repack_a8_u32",
     "owl_cast_bf16_f16",
     "owl_cast_f16_bf16",
     "owl_concat_rows_f16",
@@ -344,6 +347,10 @@ pub const PROD_AWQ27B_2026_10_13: &[&str] = &[
     "cublas_gemm_f16",
     "flashinfer_prefill_paged_fp8kv",
     "marlin_gemm_w4a16_awq",
+    // W4A8 档(S2;env `OWL_W4A8=1` 才实际发射 —— 白名单超集无害)
+    "marlin_gemm_w4a8_awq",
+    "owl_quant_int8_row_f16",
+    "owl_ct_repack_a8_u32",
     "owl_add_f16",
     "owl_argmax_f32idx_f16",
     "owl_ct_repack_u32",
@@ -409,6 +416,9 @@ pub const PRODUCTION_UNION_2026_10_13: &[&str] = &[
     // ⇒ 新增机器门 `production_union_equals_flavor_union`:并集与
     // 两档清单的**集合相等**从此是红线(手抄清单不再靠注释自律)
     "owl_qknorm_rope_kv_insert_f16_knhd",
+    "owl_quant_int8_row_f16",
+    "owl_ct_repack_a8_u32",
+    "marlin_gemm_w4a8_awq",
     "owl_topk16_merge_f16",
     "owl_topk16_split_f16",
     "vllm_chunked_prefill_paged_attn_opt_f16_knhd_hd256",
@@ -646,6 +656,7 @@ mod tests {
             (crate::family::gdn_chunked::GDN_CHUNKED_FWD, &["q", "k", "v", "beta", "gate", "state", "tables", "out", "t", "slot", "nv", "nk", "kd", "scale_bits", "nt"], &["F16x3", "F16x3", "F16x3", "F16x2", "F16x2", "F32x4", "U32x1", "F16x3", "U64", "U64", "U64", "U64", "U64", "F32Bits", "U64"]),
             (crate::family::gdn_scalar::GDN_SCALAR_FWD, &["q", "k", "v", "beta", "gate", "state", "out", "t", "slot", "ns", "nv", "nk", "kd", "scale_bits"], &["F32x3", "F32x3", "F32x3", "F32x2", "F32x2", "F32x4", "F16x3", "U64", "U64", "U64", "U64", "U64", "U64", "F32Bits"]),
             (crate::family::marlin::GEMM_W4A16_AWQ, &["a", "b", "out", "scales", "zeros", "ws", "c_tmp", "m", "k", "n", "groupsize"], &["F16x2", "U32x2", "F16x2", "F16x2", "U32x2", "U32x1", "U32x1", "U64", "U64", "U64", "U64"]),
+            (crate::family::marlin::GEMM_W4A8_AWQ, &["a", "b", "out", "scales", "zeros", "a_scales", "ws", "c_tmp", "m", "k", "n", "groupsize"], &["U8x2", "U32x2", "F16x2", "F16x2", "U32x2", "F32x2", "U32x1", "U32x1", "U64", "U64", "U64", "U64"]),
             (crate::family::marlin::GEMM_W4A16_BF16, &["a", "b", "out", "scales", "ws", "c_tmp", "m", "k", "n", "groupsize"], &["BF16x2", "U32x2", "BF16x2", "F16x2", "U32x1", "U32x1", "U64", "U64", "U64", "U64"]),
             (crate::family::marlin::GEMM_W4A16, &["a", "b", "out", "scales", "ws", "c_tmp", "m", "k", "n", "groupsize"], &["F16x2", "U32x2", "F16x2", "F16x2", "U32x1", "U32x1", "U64", "U64", "U64", "U64"]),
             (crate::family::cublas::GEMM_F16, &["a", "b", "out", "m", "k", "n", "nt"], &["F16x2", "F16x2", "F16x2", "U64", "U64", "U64", "U64"]),

@@ -933,12 +933,12 @@ mod tests {
         {
             let mut leases = Vec::new();
             for _ in 0..4 {
-                leases.push(gpu.alloc_pinned(64 << 20).await.expect("warm"));
+                leases.push(owl_iface::alloc_pinned!(gpu, 64 << 20).await.expect("warm"));
             }
             drop(leases); // 先放 4 个回池(池命中路径)
             let t0 = std::time::Instant::now();
             for _ in 0..200 {
-                let l = gpu.alloc_pinned(64 << 20).await.expect("pinned");
+                let l = owl_iface::alloc_pinned!(gpu, 64 << 20).await.expect("pinned");
                 drop(l);
             }
             let dt = t0.elapsed().as_secs_f64();
@@ -951,7 +951,7 @@ mod tests {
         for (i, c) in big.chunks_exact_mut(4096).enumerate() {
             c.fill((i & 0xff) as u8);
         }
-        let blk = gpu.alloc(Dtype::F16, n_big).await.expect("1GB 设备块");
+        let blk = owl_iface::alloc!(gpu, Dtype::F16, n_big).await.expect("1GB 设备块");
         // 单发 1GB(分块 128MB)+ 尾 sync
         for reps in [1usize, 3] {
             let t0 = std::time::Instant::now();
@@ -959,7 +959,7 @@ mod tests {
                 let mut off = 0usize;
                 while off < n_big {
                     let len = (64usize << 20).min(n_big - off);
-                    let mut lease = gpu.alloc_pinned(len * 2).await.expect("pinned");
+                    let mut lease = owl_iface::alloc_pinned!(gpu, len * 2).await.expect("pinned");
                     lease.slice_bytes_mut()[..len * 2].copy_from_slice(&big[off * 2..(off + len) * 2]);
                     gpu.upload_pinned(lease, &blk, off * 2, len * 2).await.expect("upload");
                     off += len;
@@ -975,13 +975,13 @@ mod tests {
         let t0 = std::time::Instant::now();
         let mut futs = Vec::new();
         for (fi, mut f) in faces.into_iter().enumerate() {
-            let blk = f.alloc(Dtype::F16, per).await.expect("分块");
+            let blk = owl_iface::alloc!(f, Dtype::F16, per).await.expect("分块");
             let src = big[..per * 2].to_vec();
             futs.push(async move {
                 let mut off = 0usize;
                 while off < per {
                     let len = (16usize << 20).min(per - off);
-                    let mut lease = f.alloc_pinned(len * 2).await.expect("pinned");
+                    let mut lease = owl_iface::alloc_pinned!(f, len * 2).await.expect("pinned");
                     lease.slice_bytes_mut()[..len * 2].copy_from_slice(&src[off * 2..(off + len) * 2]);
                     f.upload_pinned(lease, &blk, off * 2, len * 2).await.expect("upload");
                     off += len;

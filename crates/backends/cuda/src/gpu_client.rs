@@ -67,6 +67,21 @@ impl GpuClient {
         Self { tx, sink }
     }
 
+    /// **块账按名清单**(诊断查询面;2026-10-16 全量记名)。
+    ///
+    /// 纯读命令:不碰设备/不改块账,捕获期也放行。给 OOM 排障与
+    /// 回归门用 —— "谁占着"的唯一直接答案(总量三账只能答"多满")。
+    /// `top` = 列多少类名字(字节降序);未命名块单独计数并上屏。
+    pub async fn ledger_report(&self, top: usize) -> Result<String, ModelError> {
+        self.submit(move |ack| Command::LedgerReport { top, ack })?.await
+    }
+
+    /// **显存现场 JSON**(块账 + 家族 scratch;OOM 落盘同一序列化器)。
+    /// 纯读、捕获期放行;给脚本/跨时间比对用。
+    pub async fn ledger_json(&self) -> Result<String, ModelError> {
+        self.submit(move |ack| Command::LedgerJson { ack })?.await
+    }
+
     /// 投递信封,返回回执 Future(client 侧 `.await`)。
     ///
     /// Future 的 resolve 时机由 server 决定(见模块注释的语义分级):
@@ -194,18 +209,20 @@ impl DeviceClient for GpuClient {
         self.submit(move |ack| Command::GraphDestroy { graph, ack })?.await
     }
 
-    async fn alloc(&mut self, dtype: Dtype, elems: usize) -> Result<Bytes, ModelError> {
+    async fn alloc(&mut self, dtype: Dtype, elems: usize, name: &str) -> Result<Bytes, ModelError> {
         let n_bytes = elems * dtype.size_bytes();
         // 事实面:句柄自带 dtype(阶数未定形 = 0,由调用点 `view` 或张量视图定)
-        let mut b = self.submit(move |ack| Command::Alloc { n_bytes, elems, zero: true, ack })?.await?;
+        let nm = name.to_string();
+        let mut b = self.submit(move |ack| Command::Alloc { n_bytes, elems, zero: true, name: nm, ack })?.await?;
         b.dtype = dtype;
         b.rank = 0;
         Ok(b)
     }
 
-    async fn alloc_uninit(&mut self, dtype: Dtype, elems: usize) -> Result<Bytes, ModelError> {
+    async fn alloc_uninit(&mut self, dtype: Dtype, elems: usize, name: &str) -> Result<Bytes, ModelError> {
         let n_bytes = elems * dtype.size_bytes();
-        let mut b = self.submit(move |ack| Command::Alloc { n_bytes, elems, zero: false, ack })?.await?;
+        let nm = name.to_string();
+        let mut b = self.submit(move |ack| Command::Alloc { n_bytes, elems, zero: false, name: nm, ack })?.await?;
         b.dtype = dtype;
         b.rank = 0;
         Ok(b)
@@ -214,8 +231,10 @@ impl DeviceClient for GpuClient {
     async fn alloc_pinned(
         &mut self,
         bytes: usize,
+        name: &str,
     ) -> Result<Box<dyn owl_iface::contract::PinnedRegion + Send>, ModelError> {
-        self.submit(move |ack| Command::AllocPinned { bytes, ack })?.await
+        let nm = name.to_string();
+        self.submit(move |ack| Command::AllocPinned { bytes, name: nm, ack })?.await
     }
 
     async fn upload_pinned(
@@ -335,6 +354,7 @@ impl DeviceClient for GpuClient {
         dtype: Dtype,
         shape: &Shape,
         src: &[u8],
+        name: &str,
     ) -> Result<Bytes, ModelError> {
         // 字节直传(字节口径);Bytes.len = 元素数,按 shape 回填。
         //
@@ -343,6 +363,7 @@ impl DeviceClient for GpuClient {
         // 语义错而**无声**。这里做**交叉校验**(不拒非 F16 —— U32 是合法用法):
         // `src` 字节数必须 ≥ `elems × dtype 字节宽`(多给容许:池块可含尾料)。
         let elems: usize = shape.iter().product();
+        let nm = name.to_string();
         let want = elems
             .checked_mul(dtype.size_bytes())
             .ok_or_else(|| ModelError::Msg(format!("htod: elems({elems})×dtype({dtype:?}) 溢出")))?;
@@ -353,7 +374,7 @@ impl DeviceClient for GpuClient {
             )));
         }
         let mut b = self
-            .submit(move |ack| Command::Htod { data: src.to_vec(), ack })?
+            .submit(move |ack| Command::Htod { data: src.to_vec(), name: nm, ack })?
             .await?;
         // 事实面定形:服务端只回句柄(U8/未定形),dtype + 阶数由本面按 (dtype, shape) 回填
         b.len = elems;

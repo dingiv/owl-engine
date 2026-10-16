@@ -285,10 +285,10 @@ mod f16_tests {
 
         let mut gpu = gpu_client().await;
         let sh = crate::contract::Shape::from;
-        let dx = gpu.htod(Dtype::F16, &sh(vec![tokens, heads, hd]), &x.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()).await.expect("x");
-        let dc = gpu.htod(Dtype::F16, &sh(vec![max_pos, half]), &cos.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()).await.expect("cos");
-        let ds = gpu.htod(Dtype::F16, &sh(vec![max_pos, half]), &sin.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()).await.expect("sin");
-        let dp = gpu.htod(Dtype::F32, &sh(vec![1, tokens]), &crate::testkit::f32b(&pos)).await.expect("pos");
+        let dx = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![tokens, heads, hd]), &x.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()).await.expect("x");
+        let dc = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![max_pos, half]), &cos.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()).await.expect("cos");
+        let ds = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![max_pos, half]), &sin.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()).await.expect("sin");
+        let dp = owl_iface::htod!(gpu, Dtype::F32, &sh(vec![1, tokens]), &crate::testkit::f32b(&pos)).await.expect("pos");
         let (x_d, c_d, s_d, p_d) = (
             TensorOps::of_block(dx.id, Dtype::F16, vec![tokens, heads * hd]),  // 契约 x r2(行视图)
             TensorOps::of_block(dc.id, Dtype::F16, vec![max_pos, half]),

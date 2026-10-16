@@ -154,6 +154,8 @@ pub struct ServerConfig {
     pub prefill_chunk: usize,
     /// lm_head 头部量化方案(model.head_quant;C1 2026-10-11;枚举严格)
     pub head_quant: owl_shared::config::HeadQuant,
+    /// **W4A8 档位**(model.w4a8;S2 2026-10-17;默认 off = 今天行为)
+    pub w4a8: bool,
     /// 最大并发请求(server.max_concurrency;默认 8;须 ≤ knobs.gdn_slots)
     pub max_concurrency: usize,
     /// 性能账落盘基名(--perf-dump;None = 不落盘)
@@ -249,6 +251,7 @@ impl ServerConfig {
             prefill_chunk: owl_shared::env_reader::parse("OWL_PREFILL_CHUNK")
                 .unwrap_or(cfg.runtime.prefill_chunk),
             head_quant: cfg.model.head_quant,
+            w4a8: cfg.model.w4a8,
             max_concurrency: cfg.server.max_concurrency,
             perf_dump: None,
             perf_level: cfg.probes.perf_level.to_u8(),

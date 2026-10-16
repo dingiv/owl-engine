@@ -117,14 +117,14 @@ impl DeviceRes for TestRes {
             got: id.to_string(),
         })
     }
-    fn alloc(&mut self, bytes: usize, _tag: &'static str) -> Result<ScratchBuf, OpError> {
+    fn alloc(&mut self, bytes: usize, _tag: &str) -> Result<ScratchBuf, OpError> {
         let d = self.stream.alloc_zeros::<u8>(bytes.max(1)).expect("alloc");
         let ptr = d.device_ptr(&self.stream).0;
         self.blocks.insert(self.next_id, d);
         self.next_id += 1;
         Ok(ScratchBuf { ptr, bytes })
     }
-    fn alloc_block(&mut self, bytes: usize, _tag: &'static str) -> Result<Bytes, OpError> {
+    fn alloc_block(&mut self, bytes: usize, _tag: &str) -> Result<Bytes, OpError> {
         Ok(self.zeros(bytes))
     }
     fn upload_block(&mut self, b: &Bytes, src: &[u8]) -> Result<(), OpError> {

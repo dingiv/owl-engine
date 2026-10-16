@@ -243,6 +243,7 @@ fn production_picks_carry_admission_meta() {
         ("marlin awq", driver::marlin::w4a16(&m6, DType::F16)),
         ("marlin f16", driver::marlin::w4a16(&m5, DType::F16)),
         ("marlin bf16", driver::marlin::w4a16(&m5, DType::BF16)),
+        ("marlin w4a8 awq", driver::marlin::w4a8_awq()),
     ];
     let n = picks.len();
     for (label, p) in picks {

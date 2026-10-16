@@ -620,7 +620,68 @@ pub static OWL_ROPE_HALF_PARTIAL_F16: KernelMeta = meta_of::<RopeHalfPartialF16>
 pub static OWL_ROPE_HALF_PARTIAL_F32: KernelMeta = meta_of::<RopeHalfPartialF32>();
 pub static PROBE_TS_F16: KernelMeta = meta_of::<ProbeTsF16>();
 
+pub static QUANT_INT8_ROW_F16: KernelMeta = meta_of::<QuantInt8RowF16>();
+pub static QUANT_INT8_ROW_BF16: KernelMeta = meta_of::<QuantInt8RowBf16>();
+
 /// 本域全部已建表算子
+// ============================================================================
+// W4A8 前置:激活 per-token int8 量化(S1c;2026-10-16)
+// ============================================================================
+
+/// `owl_quant_int8_row_f16` —— 激活 per-token int8 量化(**W4A8 的喂料手**;
+/// 上游 `dynamic_scaled_int8_quant_kernel` 的逐点 port)。
+///
+/// 语义:`scales[row] = max|x[row,:]|/127 · mul`;`q = cvt.rni.sat.s8(x · 127/absmax)`
+/// (round-nearest-even + 饱和;零行 ⇒ 整行 0)。`mul` = **权重侧全局因子**
+/// (`pack_marlin_s_a8` 第二返回值 `max/4096`;它是**每层常量**,由调用方折入,
+/// 这样运行时零额外发射 —— 见设计卷 §9.2③)。
+///
+/// 槽:`x(f16,2) / rows(i32) / cols(i32) / mul(f32) / scales(f32,2,写) / q(u8,2,出)`
+/// —— `scales` 声明为 `t_in`(由调用方备块,同 xqa 的 `wr`/`scratch` 先例),
+/// `q` 才是本算子回传的输出槽(字节承载 int8,与 W4A8 GEMM 的 `a` 槽同惯例:
+/// 同一块要能同时满足两算子的 dtype/rank 事实门)。
+pub struct QuantInt8RowF16;
+
+impl KernelSpec for QuantInt8RowF16 {
+    const ENTRY: &'static str = "owl_quant_int8_row_f16";
+    const SRC: &'static str = "cu/elems/quant_int8_row.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("x", Dtype::F16, 2),
+        Param::i32("rows"),
+        Param::i32("cols"),
+        // **设备标量块** f32[1]:权重侧全局因子(装载期由尺度数据算出 ⇒
+        // 走 host 标量要给装载器开旁路;设备块与 vLLM `input_global_scale` 同构)
+        Param::t_in("mul", Dtype::F32, 1),
+        // 写出槽:per-token 尺度 [rows,1](调用方备块)
+        Param::t_in("scales", Dtype::F32, 2),
+        Param::t_out("q", Dtype::U8, 2),
+    ];
+    // 出参是 int8:有限性律不适用(饱和已由 `cvt.rni.sat` 保证)—— 故 LAWS 空,
+    // 靠**核内饱和 + 回读对拍**（tests/quant_int8_row_probe.rs）守门
+    const LAWS: &'static [Law] = &[];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+/// `owl_quant_int8_row_bf16` —— 同上,入 f16 → bf16(草稿/DFlash2 路备用)
+pub struct QuantInt8RowBf16;
+
+impl KernelSpec for QuantInt8RowBf16 {
+    const ENTRY: &'static str = "owl_quant_int8_row_bf16";
+    const SRC: &'static str = "cu/elems/quant_int8_row.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("x", Dtype::BF16, 2),
+        Param::i32("rows"),
+        Param::i32("cols"),
+        Param::t_in("mul", Dtype::F32, 1),
+        Param::t_in("scales", Dtype::F32, 2),
+        Param::t_out("q", Dtype::U8, 2),
+    ];
+    const LAWS: &'static [Law] = &[];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
 pub static METAS: &[&KernelMeta] = &[
     &NARROW_STRIDED_F16,
     &GEMV_DUAL_F16,
@@ -653,4 +714,6 @@ pub static METAS: &[&KernelMeta] = &[
     &OWL_ROPE_HALF_PARTIAL_F16,
     &OWL_ROPE_HALF_PARTIAL_F32,
     &PROBE_TS_F16,
+    &QUANT_INT8_ROW_F16,
+    &QUANT_INT8_ROW_BF16,
 ];

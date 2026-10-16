@@ -54,11 +54,16 @@ pub enum Command {
         n_bytes: usize,
         elems: usize,
         zero: bool,
+        /// **分配点点名**(全量记名;2026-10-16):核名/层名/装载键名。
+        /// 必填(空串 = 调用点违约,账房侧计 `未命名!`)。
+        name: String,
         ack: Ack<Result<Bytes, ModelError>>,
     },
     /// host → device(字节传输,f16 基线;Staging 字节码头 + 异步 memcpy)
     Htod {
         data: Vec<u8>,
+        /// 上传落地块的点名(同 [`Command::Alloc`];必填)
+        name: String,
         ack: Ack<Result<Bytes, ModelError>>,
     },
     /// 块清零(设备侧 memset_d8;引擎 turn-open GDN 状态重置专用;
@@ -87,7 +92,24 @@ pub enum Command {
     /// 分配 pinned 租约(流式装载 DMA 源;池优先,miss 才 cudaHostAlloc)
     AllocPinned {
         bytes: usize,
+        /// 租约点名(全量记名;pinned 泄漏也看得见主人)
+        name: String,
         ack: Ack<Result<Box<dyn owl_iface::contract::PinnedRegion + Send>, ModelError>>,
+    },
+    /// **块账按名清单**(诊断查询面;2026-10-16 全量记名)。
+    ///
+    /// 纯读:不改块账/不碰设备。OOM dump 与排障共用同一渲染
+    /// ([`crate::state::render_block_report`])—— 口径单源。
+    /// 捕获期**放行**(读操作不破图);`top` = 列多少类名字。
+    LedgerReport {
+        top: usize,
+        ack: Ack<Result<String, ModelError>>,
+    },
+    /// **显存现场 JSON**(块账 + 家族 scratch;同 [`Command::LedgerReport`] 的
+    /// 结构化姊妹面)。OOM 落盘与机器消费共用同一序列化器 —— 有它才谈得上
+    /// "落盘的内容被验证过"。
+    LedgerJson {
+        ack: Ack<Result<String, ModelError>>,
     },
     /// 上传租约:buf 所有权移入,DMA 到 dst+offset_bytes(字节口径);
     /// 完成后 buf 回池
@@ -233,6 +255,8 @@ impl Command {
             Self::HtodChunk { .. } => "htod_chunk",
             Self::HtodChunks { .. } => "htod_chunks",
             Self::AllocPinned { .. } => "alloc_pinned",
+            Self::LedgerReport { .. } => "ledger_report",
+            Self::LedgerJson { .. } => "ledger_json",
             Self::UploadPinned { .. } => "upload_pinned",
             Self::Dtoh { .. } => "dtoh",
             Self::DtohAt { .. } => "dtoh_at",
@@ -268,6 +292,8 @@ impl Command {
             Self::HtodChunk { ack, .. } => ack.created_at(),
             Self::HtodChunks { ack, .. } => ack.created_at(),
             Self::AllocPinned { ack, .. } => ack.created_at(),
+            Self::LedgerReport { ack, .. } => ack.created_at(),
+            Self::LedgerJson { ack, .. } => ack.created_at(),
             Self::UploadPinned { ack, .. } => ack.created_at(),
             Self::Dtoh { ack, .. } => ack.created_at(),
             Self::DtohAt { ack, .. } => ack.created_at(),

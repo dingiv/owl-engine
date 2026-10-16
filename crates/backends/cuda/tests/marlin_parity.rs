@@ -71,13 +71,18 @@ fn marlin_launch(
             name: if is_bf16 { "marlin_gemm_w4a16_bf16" } else { "marlin_gemm_w4a16" }.into(),
             source: String::new(),
         },
+        // ⚠️ 块事实(rank)**按声明表**显式给:L3 事实门按 op_tables 核 dtype/rank,
+        // 上传句柄的 rank(htod 给 1)与之不符会被准入拒(2026-10-17 实测:
+        // 本族 4 条 parity 自 L3 门落地起一直是红的 —— 那条门没被跑过)
         args: vec![
-            Arg::block(a.id, a.dtype, a.rank),
-            Arg::block(b.id, b.dtype, b.rank),
-            Arg::block(c.id, c.dtype, c.rank),
-            Arg::block(s.id, s.dtype, s.rank),
-            Arg::block(ws.id, ws.dtype, ws.rank),
-            Arg::block(ctmp.id, ctmp.dtype, ctmp.rank),
+            // a/c 的 dtype 随臂走(bf16 臂声明 = BF16;测试上传的是位型,
+            // 事实面须与 op_tables 一致)
+            Arg::block(a.id, if is_bf16 { Dtype::BF16 } else { Dtype::F16 }, 2),
+            Arg::block(b.id, b.dtype, 2),
+            Arg::block(c.id, if is_bf16 { Dtype::BF16 } else { Dtype::F16 }, 2),
+            Arg::block(s.id, s.dtype, 2),
+            Arg::block(ws.id, ws.dtype, 1),
+            Arg::block(ctmp.id, ctmp.dtype, 1),
             Arg::U64(m as u64),
             Arg::U64(k as u64),
             Arg::U64(n as u64),
@@ -142,15 +147,15 @@ async fn run_case(
     } else {
         a_ref.iter().map(|f| half::f16::from_f32(*f).to_bits()).collect()
     };
-    let da = client.htod(Dtype::F16, &Shape::from(vec![m, k]), &le_u16(&a_bits)).await.expect("htod a");
+    let da = owl_iface::htod!(client, Dtype::F16, &Shape::from(vec![m, k]), &le_u16(&a_bits)).await.expect("htod a");
     // u16 位序 = f16 LE ✓(f16::to_bits 是 u16 表示,LE 字节序正确)
-    let db = client.htod(Dtype::U32, &Shape::from(vec![b_packed.len()]), &le_i32(&b_packed)).await.expect("htod b");
-    let ds = client.htod(Dtype::F16, &Shape::from(vec![s_packed.len()]), &le_u16(&s_packed)).await.expect("htod s");
+    let db = owl_iface::htod!(client, Dtype::U32, &Shape::from(vec![b_packed.len()]), &le_i32(&b_packed)).await.expect("htod b");
+    let ds = owl_iface::htod!(client, Dtype::F16, &Shape::from(vec![s_packed.len()]), &le_u16(&s_packed)).await.expect("htod s");
     let ws_mul: usize = owl_shared::env_reader::parse_or("OWL_WS_MUL", 1);
     let ws_len = owl_kernels::family::marlin::v2_workspace_len(n).max(n / 128 * 16) * ws_mul;
-    let dws = client.alloc(Dtype::U32, ws_len).await.expect("alloc ws");
-    let dctmp = client.alloc(Dtype::U32, 1).await.expect("alloc ctmp");
-    let dc = client.alloc(Dtype::F16, m * n).await.expect("alloc c");
+    let dws = owl_iface::alloc!(client, Dtype::U32, ws_len).await.expect("alloc ws");
+    let dctmp = owl_iface::alloc!(client, Dtype::U32, 1).await.expect("alloc ctmp");
+    let dc = owl_iface::alloc!(client, Dtype::F16, m * n).await.expect("alloc c");
 
     client
         .launch(marlin_launch(
@@ -375,13 +380,14 @@ fn marlin_awq_launch(
             source: String::new(),
         },
         args: vec![
-            Arg::block(a.id, a.dtype, a.rank),
-            Arg::block(b.id, b.dtype, b.rank),
-            Arg::block(c.id, c.dtype, c.rank),
-            Arg::block(s.id, s.dtype, s.rank),
-            Arg::block(z.id, z.dtype, z.rank),
-            Arg::block(ws.id, ws.dtype, ws.rank),
-            Arg::block(ctmp.id, ctmp.dtype, ctmp.rank),
+            // 块事实按声明表(同 `marlin_launch` 注:rank 与 op_tables 对齐)
+            Arg::block(a.id, a.dtype, 2),
+            Arg::block(b.id, b.dtype, 2),
+            Arg::block(c.id, c.dtype, 2),
+            Arg::block(s.id, s.dtype, 2),
+            Arg::block(z.id, z.dtype, 2),
+            Arg::block(ws.id, ws.dtype, 1),
+            Arg::block(ctmp.id, ctmp.dtype, 1),
             Arg::U64(m as u64),
             Arg::U64(k as u64),
             Arg::U64(n as u64),
@@ -420,21 +426,21 @@ async fn run_awq_case_g(client: &mut GpuClient, m: usize, n: usize, k: usize, g:
     let z_packed = owl_kernels::family::marlin::repack::pack_marlin_z(&zp_u8, n, groups);
     assert_eq!(z_packed.len(), groups * (n / 8));
 
-    let da = client.htod(Dtype::F16, &Shape::from(vec![m, k]), &le_u16(
+    let da = owl_iface::htod!(client, Dtype::F16, &Shape::from(vec![m, k]), &le_u16(
         &a.iter().map(|f| half::f16::from_f32(*f).to_bits()).collect::<Vec<_>>(),
     )).await.expect("htod a");
-    let db = client.htod(Dtype::U32, &Shape::from(vec![b_packed.len()]), &le_i32(&b_packed)).await.expect("htod b");
-    let ds = client.htod(Dtype::F16, &Shape::from(vec![s_packed.len()]), &le_u16(&s_packed)).await.expect("htod s");
-    let dz = client.htod(Dtype::U32, &Shape::from(vec![z_packed.len()]), &le_i32(&z_packed)).await.expect("htod z");
-    let dws = client.alloc(Dtype::U32, owl_kernels::family::marlin::v2_workspace_len(n)).await.expect("alloc ws");
-    let dctmp = client.alloc(Dtype::U32, 1).await.expect("alloc ctmp");
-    let dc = client.alloc(Dtype::F16, m * n).await.expect("alloc c");
+    let db = owl_iface::htod!(client, Dtype::U32, &Shape::from(vec![b_packed.len()]), &le_i32(&b_packed)).await.expect("htod b");
+    let ds = owl_iface::htod!(client, Dtype::F16, &Shape::from(vec![s_packed.len()]), &le_u16(&s_packed)).await.expect("htod s");
+    let dz = owl_iface::htod!(client, Dtype::U32, &Shape::from(vec![z_packed.len()]), &le_i32(&z_packed)).await.expect("htod z");
+    let dws = owl_iface::alloc!(client, Dtype::U32, owl_kernels::family::marlin::v2_workspace_len(n)).await.expect("alloc ws");
+    let dctmp = owl_iface::alloc!(client, Dtype::U32, 1).await.expect("alloc ctmp");
+    let dc = owl_iface::alloc!(client, Dtype::F16, m * n).await.expect("alloc c");
     // 哨兵填充:-7.0(launch 后若残留 = 内核未写 C)
     {
         let sent: Vec<u8> = (0..m * n)
             .flat_map(|_| half::f16::from_f32(-7.0).to_le_bytes())
             .collect();
-        let dsent = client.htod(Dtype::F16, &Shape::from(vec![m * n]), &sent).await.expect("sent");
+        let dsent = owl_iface::htod!(client, Dtype::F16, &Shape::from(vec![m * n]), &sent).await.expect("sent");
         client.copy_block_at(&dsent, 0, &dc, 0, sent.len()).await.expect("sent copy");
     }
 
@@ -494,6 +500,81 @@ async fn marlin_w4a16_awq_parity() {
 }
 
 // ============================================================================
+// ct packed → marlin B **a8** 设备重排对拍(2026-10-17;S2 补)
+// ============================================================================
+
+/// GPU `owl_ct_repack_a8_u32` 输出 vs CPU `pack_marlin_b_a8` **逐 u32 一致**。
+///
+/// 为什么必须逐位:两个重排核的**输入契约与输出字数完全相同**(都是 ct packed
+/// 进、`k·n/8` u32 出)—— 唯一差别是 tile 几何与 nibble 排布 ⇒ 拿错核**不会
+/// 报错**,只会让 marlin 读到错列(设计卷 §14.3 判别探针实测:a8 布局喂 a16
+/// 表错列、反之亦然)。故本门是这条线的**换核保险**。
+#[tokio::test]
+async fn ct_repack_a8_parity() {
+    let mut client = assemble();
+    // 覆盖 grid 两维(rows/32 × cols/4)+ 非方形 + 生产形状族
+    for (out_dim, k) in [
+        (64usize, 128usize),
+        (256usize, 512usize),
+        (1024usize, 5120usize),
+        (5120usize, 5120usize),
+        (17408usize, 5120usize),
+    ] {
+        let rows = out_dim;
+        let cols = k / 8;
+        let packed: Vec<i32> = (0..rows * cols)
+            .map(|i| (i as i32).wrapping_mul(0x9E37_79B1_u32 as i32) ^ 0x1234_5678)
+            .collect();
+        // CPU 参照 = 真源 pack_marlin_b_a8(unpack_nibbles 后打包)
+        let q = owl_kernels::family::marlin::repack::unpack_nibbles(&packed, out_dim, k);
+        let b_ref = owl_kernels::family::marlin::repack::pack_marlin_b_a8(&q, k, out_dim);
+        assert_eq!(b_ref.len(), k * out_dim / 8, "a8 B 字数 = k·n/8");
+
+        let dp = owl_iface::htod!(client, Dtype::U32, &Shape::from(vec![rows, cols]), &le_i32(&packed)).await.expect("htod packed");
+        let dout = owl_iface::alloc!(client, Dtype::U32, b_ref.len()).await.expect("alloc out");
+        let msg = LaunchMsg {
+            kernel: owl_cuda::KernelSource {
+                name: "owl_ct_repack_a8_u32".into(),
+                source: owl_kernels::ops::source("owl_ct_repack_a8_u32").into(),
+            },
+            args: vec![
+                Arg::block(dp.id, dp.dtype, 2),
+                Arg::U64(rows as u64),
+                Arg::U64(cols as u64),
+                Arg::block(dout.id, dout.dtype, 2),
+            ],
+            // grid = (out/32, (k/8)/4);block 128(契约见 .cu 头注)
+            grid: ((rows / 32) as u32, (cols / 4) as u32, 1),
+            block: (128, 1, 1),
+            shared_mem: 0,
+            out_elems: b_ref.len(),
+        };
+        client.launch(msg).await.expect("a8 repack launch");
+        let mut buf = vec![0u8; b_ref.len() * 4];
+        client.dtoh(&dout, &mut buf).await.expect("dtoh");
+        client.sync().await.expect("sync");
+
+        let mut bad = 0usize;
+        let mut first = None;
+        for (i, w) in buf.chunks_exact(4).enumerate() {
+            let got = i32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+            if got != b_ref[i] {
+                bad += 1;
+                if first.is_none() {
+                    first = Some((i, got, b_ref[i]));
+                }
+            }
+        }
+        eprintln!(
+            "[repack-a8] out={out_dim} k={k}: 坏字 {}/{}",
+            bad,
+            b_ref.len()
+        );
+        assert_eq!(bad, 0, "GPU a8 repack 必须 vs CPU pack_marlin_b_a8 逐位一致;首错 {first:?}");
+    }
+}
+
+// ============================================================================
 // ct packed → marlin B 设备重排对拍(2026-10-01 GPU repack 装载线)
 // ============================================================================
 
@@ -513,18 +594,20 @@ async fn ct_repack_parity() {
         assert_eq!(b_ref.len(), (k / 16) * (rows * 2));
 
         // GPU
-        let dp = client.htod(Dtype::U32, &Shape::from(vec![packed.len()]), &le_i32(&packed)).await.expect("htod packed");
-        let dout = client.alloc(Dtype::U32, b_ref.len()).await.expect("alloc out");
+        // ⚠️ 块事实按**真形状**标注(rank2):L3 事实门按声明表核 dtype/rank,
+        // 标成 rank1 会被准入拒(2026-10-17 实测:本测试自 L3 门落地后一直是红的)
+        let dp = owl_iface::htod!(client, Dtype::U32, &Shape::from(vec![rows, cols]), &le_i32(&packed)).await.expect("htod packed");
+        let dout = owl_iface::alloc!(client, Dtype::U32, b_ref.len()).await.expect("alloc out");
         let msg = LaunchMsg {
             kernel: owl_cuda::KernelSource {
                 name: "owl_ct_repack_u32".into(),
                 source: owl_kernels::ops::source("owl_ct_repack_u32").into(),
             },
             args: vec![
-                Arg::block(dp.id, dp.dtype, dp.rank),
+                Arg::block(dp.id, dp.dtype, 2),
                 Arg::U64(rows as u64),
                 Arg::U64(cols as u64),
-                Arg::block(dout.id, dout.dtype, dout.rank),
+                Arg::block(dout.id, dout.dtype, 2),
             ],
             // grid = (out/64, (k/8)/2);block 32(契约见 .cu 头注)
             grid: ((rows / 64) as u32, (cols / 2) as u32, 1),

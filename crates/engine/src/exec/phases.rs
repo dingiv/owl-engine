@@ -533,7 +533,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         };
         let n = row_bytes * page;
         let face = self.graphs.session.face_mut();
-        let scratch = face.alloc(owl_iface::contract::Dtype::U32, n / 4).await?;
+        // 记名(全量):KV 页 dump 探针的临时块(按 tag 区分调用点)
+        let scratch = face
+            .alloc(owl_iface::contract::Dtype::U32, n / 4, &format!("probe.kv_page.{tag}"))
+            .await?;
         let src = owl_iface::contract::Bytes::new(
             pool_id,
             n / 4,
