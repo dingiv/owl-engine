@@ -228,6 +228,15 @@ impl<D: DeviceClient> PrefillBuckets<D> {
         self.buckets.is_empty()
     }
 
+    /// 桶族 slab 占用(Σ 已捕获桶;图显存总账账源)
+    pub(crate) fn slab_bytes(&self) -> usize {
+        self.buckets
+            .iter()
+            .filter(|b| b.captured)
+            .map(|b| b.plan.slab_bytes())
+            .sum()
+    }
+
     /// 桶族一行摘要(boot 日志/运维;空 = "")
     pub(crate) fn summary(&self) -> String {
         self.buckets

@@ -227,6 +227,35 @@ impl<D: DeviceClient> GraphFleet<D> {
                 boot.pool.kv_fp8,
             );
         }
+        // **图显存总账**(2026-10-16;user 令"先归因"):所有已捕获图的 slab
+        // 容量合计 —— 此前只有非 piecewise 的图能对上账(每条 `slab 定尺`),
+        // 而 piecewise 的 34 条段 slab 在日志里完全不可见 ⇒ 归因靠猜。
+        // 口径 = 各图 `graph_begin` 真分配容量(定尺 hint)之和。
+        {
+            let mb = |v: usize| v >> 20;
+            let s = session.slab_bytes();
+            let v = verify.as_ref().map(|g| g.slab_bytes()).unwrap_or(0);
+            let fo: usize = fold.iter().map(|g| g.slab_bytes()).sum();
+            let pr: usize = propose.iter().map(|g| g.slab_bytes()).sum();
+            let df = dflash.as_ref().map(|g| g.slab_bytes()).unwrap_or(0);
+            let pb = prefill.slab_bytes();
+            let total = s + v + fo + pr + df + pb;
+            owl_shared::log_info!(
+                "boot",
+                "slab 总账:session {}MiB + verify {}MiB + fold {}MiB({}) + propose {}MiB({}) + dflash {}MiB + prefill桶 {}MiB({}) = {}MiB(Σ 已捕获图)‖ 引擎账 vram::live={}MiB(含池/权重/全部真分配)",
+                mb(s),
+                mb(v),
+                mb(fo),
+                fold.len(),
+                mb(pr),
+                propose.len(),
+                mb(df),
+                mb(pb),
+                prefill.summary(),
+                mb(total),
+                owl_shared::vram::live_bytes() >> 20,
+            );
+        }
         Ok(Self {
             session,
             capture_outcome,
