@@ -24,5 +24,5 @@ mod face;
 mod ops;
 mod value;
 
-pub use face::CpuFace;
+pub use face::{bench_decode_f16, bench_read, bench_write, mock_stats, mock_stats_reset, CpuFace, MockLimits};
 pub use value::Value;
