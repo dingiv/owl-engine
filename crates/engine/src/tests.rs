@@ -1053,12 +1053,18 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
         knobs: EngineKnobs::default(),
     })
     .expect("构造");
+    // 装载分相上屏(loader 性能工作台账用:构造 / 权重装载 / 装配+捕获)
+    eprintln!("[e2e] 27B 引擎构造 {:?}", t0.elapsed());
+    let t_load = std::time::Instant::now();
     let loaded = engine
         .loader()
         .load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16)
         .await
         .expect("27B AWQ 装载");
+    eprintln!("[e2e] 27B 权重装载 {:?}", t_load.elapsed());
+    let t_run = std::time::Instant::now();
     let running = engine.run(loaded).await.expect("装配");
+    eprintln!("[e2e] 27B 装配+图捕获 {:?}", t_run.elapsed());
     assert!(
         matches!(running.capture_outcome(), crate::graph_plan::PlanOutcome::Captured),
         "27B 装载应捕获成功(回放态),得 {:?}",
