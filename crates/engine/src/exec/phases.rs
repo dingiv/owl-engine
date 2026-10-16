@@ -320,7 +320,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         mrec("decode.step", t_step.elapsed());
         // B4 降级期草稿同步(§6.24 方案 A):decode 图 taps → 1 行 encode。
         // 毒化带 ≤8 token 即被覆写,探测重入零损;成本 ≈ 0.5ms/tok(2%)
-        if self.tspec_ref().spec_degraded && self.spec.dflash_tap_count > 0 {
+        // 2026-10-17:**播种裸步**走同一臂(两者同构:都要同步草稿池 + 计时进分母)
+        let degraded = self.tspec_ref().spec_degraded;
+        let seeding = self.tspec_ref().bare_seed_step;
+        if (degraded || seeding) && self.spec.dflash_tap_count > 0 {
             // 降级步分相(2026-10-12 探针完善):sync encode 单独计时 ——
             // 9.3 t/s 案的 80ms/步嫌疑犯,一屏定谳
             let t_syn = std::time::Instant::now();
@@ -334,20 +337,28 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 self.prefill_dflash_encode(&taps, pos).await?;
             }
             mrec("decode.sync", t_syn.elapsed());
-            self.tspec().spec_steps_degraded += 1;
+            if degraded {
+                self.tspec().spec_steps_degraded += 1;
+            }
             // 滚动裸步成本 ewma(动态盈亏线分母;α=0.15)
             {
                 let bc = t_step.elapsed().as_secs_f32() * 1000.0;
                 let spec = self.tspec();
-                spec.bare_cost_ewma_ms = if spec.bare_cost_ewma_ms > 0.0 {
-                    spec.bare_cost_ewma_ms * 0.85 + bc * 0.15
-                } else {
+                let was_unmeasured = spec.bare_cost_ewma_ms <= 0.0;
+                spec.bare_cost_ewma_ms = if was_unmeasured {
                     bc
+                } else {
+                    spec.bare_cost_ewma_ms * 0.85 + bc * 0.15
                 };
                 // 采样时的 ctx(换档失效判据;见 SpecDegrade.bare_cost_ctx)
                 spec.bare_cost_ctx = pos;
+                if was_unmeasured {
+                    owl_shared::log_info!("spec-seed", "分母已播种:裸步成本 = {bc:.1}ms(pos={pos})⇒ 盈亏线改用实测比(原兜底常量 2.5)"
+                    );
+                }
             }
-            mrec("decode.step.deg", t_step.elapsed());
+            mrec(if degraded { "decode.step.deg" } else { "decode.step.seed" }, t_step.elapsed());
+            self.tspec().bare_seed_step = false;
         }
         self.sample_and_emit(nt).await
     }

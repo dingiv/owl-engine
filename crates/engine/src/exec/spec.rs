@@ -326,13 +326,16 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             //    (超长轮 150-300ms 下等 16 轮 = 2.4-4.8s,反应太慢);
             // ③ 评估时给出**绝对吞吐**读数(tok/s)便于日志对账。
             let _ctx_sampled = spec.bare_cost_ctx;
-            // ctx 换档**不作废**分母(2026-10-14 实测修正):裸步成本几乎不随
-            // ctx 变(25.3→26.4 ms @610→9010,±5%),而轮时才是 ctx 相关项 ⇒
-            // 保鲜的分母在换档后依然有效;作废只会退到保守兜底并**过度降级**
-            // (实测 ctx 2116→7870 时 AL 2.0 本可盈利,却被兜底 2.5 误降)。
-            // 采样点 `spec.bare_cost_ctx` 作日志/诊断用(_ctx_sampled)。
+            // ⚠️ **2026-10-14 那条结论已被 2026-10-17 实测推翻**:当时看“裸步成本
+            // 几乎不随 ctx 变(25.3→26.4 ms @610→9010,±5%)”⇒ 取消 ctx 作废;
+            // 但在 **32k** 上裸步 = 38.4 ms(pos 564 时为 24.5 ms,**+57%**)——
+            // 那条实测只覆盖到 9k ⇒ 作废规则已**恢复**(`scheduler.rs` “分母与
+            // ctx 配对”),并用**播种步**重采(否则作废后会回到无分母态)。
             let (rc, bc) = (spec.round_cost_ewma_ms, spec.bare_cost_ewma_ms);
-            let break_even = if rc > 0.0 && bc > 0.0 { (rc / bc).clamp(2.0, 6.0) } else { 2.5 };
+            // 盈亏线 = 轮/裸 实测比(夹 [2.0,6.0]);`None` = 分母未测
+            // ⇒ **窗口判据不生效**(2026-10-17:旧兜底常量 2.5 在 32k 会把
+            // 盈利档 AL 2.25 误降级;分母已由首 turn 播种步补上,见 break_even_line)
+            let break_even = crate::exec::break_even_line(rc, bc);
             const WINDOW_ROUNDS: u32 = 16;
             const WINDOW_MS: f32 = 600.0;
             let window_starved =
@@ -342,9 +345,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     spec.recent_rounds = 0;
                     spec.recent_tokens = 0;
                     spec.recent_ms = 0.0;
-                    let starved = avg < break_even;
-                    if starved {
-                        owl_shared::log_warn!("spec-degrade", "窗口 AL={avg:.2} < 盈亏线 {break_even:.2}(轮 {rc:.0}ms/裸 {bc:.0}ms;窗口吞吐 {win_tps:.1} tok/s)"
+                    let starved = break_even.is_some_and(|line| avg < line);
+                    if starved || break_even.is_none() {
+                        let line = crate::exec::break_even_text(break_even);
+                        let why = if break_even.is_none() {
+                            "(分母未测 ⇒ 本轮不判;播种步在首 turn 发出)"
+                        } else {
+                            ""
+                        };
+                        owl_shared::log_warn!("spec-degrade", "窗口 AL={avg:.2} vs 盈亏线 {line}{why}(轮 {rc:.0}ms/裸 {bc:.0}ms;窗口吞吐 {win_tps:.1} tok/s)"
                         );
                     }
                     starved
@@ -353,7 +362,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 };
             let degraded = degraded0 || window_starved;
             if degraded && !spec.spec_degraded {
-                owl_shared::log_warn!("spec-degrade", "m=0×{streak} win_starved={window_starved} 盈亏线={break_even:.2} → 降级裸 decode(probe 每 {probe_every} tok)"
+                let line = crate::exec::break_even_text(break_even);
+                owl_shared::log_warn!("spec-degrade", "m=0×{streak} win_starved={window_starved} 盈亏线={line} → 降级裸 decode(probe 每 {probe_every} tok)"
                 );
                 mcnt("spec.degrade", 1);
                 spec.spec_drafts_host = None;

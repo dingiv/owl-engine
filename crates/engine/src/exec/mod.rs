@@ -23,6 +23,44 @@ pub mod draft;
 pub mod prefill_chunk;
 pub mod turn_end;
 
+#[cfg(test)]
+mod break_even_tests {
+    use super::*;
+
+    /// **盈亏线口径门**(2026-10-17):真值用 32k 实测样本钉住 ——
+    /// 轮 77 ms / 裸 38.4 ms ⇒ 线 **2.0**(下限),而 AL 2.25 应判“盈利”。
+    /// 旧行为(未测时用兑底常量 2.5)会把它误判成亏本 ⇒ 本门同时钉住
+    /// “分母未测 ⇒ None(窗口判据不生效)”。
+    #[test]
+    fn break_even_line_pins_32k_sample() {
+        let line = break_even_line(77.0, 38.4).expect("两分母都有 ⇒ 必有线");
+        assert!((line - 77.0 / 38.4).abs() < 1e-5, "区间内原样取比,实得 {line}");
+        assert!((line - 2.005).abs() < 1e-3, "32k 实测样本 ≈ 2.0(不是旧兑底 2.5)");
+        assert!(
+            2.25 >= line,
+            "AL 2.25 ≥ 真线 {line:.3} ⇒ 应判**盈利**;旧兑底 2.5 会把它误降级"
+        );
+        // 2.9k 生产档样本(§Q):轮 41.79 / 裸 22.48 ⇒ 1.86 → 下限 2.0
+        assert!((break_even_line(41.79, 22.48).unwrap() - 2.0).abs() < 1e-6);
+        // 上限夹取(超长轮/极端比)
+        assert_eq!(break_even_line(600.0, 20.0), Some(6.0));
+        // 中间值原样
+        assert_eq!(break_even_line(120.0, 40.0), Some(3.0));
+    }
+
+    /// 分母未测 ⇒ None(而不是一个会误导判据的常量);
+    /// 零/负输入同样归为“未测”(宁可不算,不可乱算)
+    #[test]
+    fn break_even_line_is_none_when_denominator_unmeasured() {
+        assert_eq!(break_even_line(77.0, 0.0), None);
+        assert_eq!(break_even_line(0.0, 38.4), None);
+        assert_eq!(break_even_line(0.0, 0.0), None);
+        assert_eq!(break_even_line(-1.0, 38.4), None);
+        assert_eq!(break_even_text(None), "未测");
+        assert_eq!(break_even_text(Some(2.0)), "2.00");
+    }
+}
+
 pub(crate) fn spec_degrade_transition(
     streak: usize,
     degraded: bool,
@@ -44,6 +82,37 @@ pub(crate) fn spec_degrade_transition(
     }
 }
 use crate::turn::TurnEvent;
+
+/// **盈亏线夹取区间**(2026-10-09 立;下限 = 32k 实测比,上限 = 防超长轮)
+pub(crate) const BREAK_EVEN_MIN: f32 = 2.0;
+pub(crate) const BREAK_EVEN_MAX: f32 = 6.0;
+
+/// **投机盈亏线**(纯函数;2026-10-17 从 `exec/spec.rs` 的内联式抽出以便单测)。
+///
+/// 口径:`滚动轮成本 / 裸步成本`,夹 [`BREAK_EVEN_MIN`, `BREAK_EVEN_MAX`]。
+/// 返回 `None` = **分母未测**(本进程还没跑过裸步/播种步)⇒ 窗口判据**不生效**
+/// (只记日志),由连击判据守底。
+///
+/// 为什么不能拿一个兜底常数顶:32k 实测 `轮 77ms / 裸 38.4ms ⇒ 真线 2.0`,
+/// 而旧兜底常量 **2.5 把“AL 2.25 的盈利档”误判成亏本** ⇒ 整会话降级裸 decode
+/// (实测 decode 24.56 t/s、214 步里只有 18 个投机轮)。
+/// 分母现在由**播种步**(`TurnSpecState::bare_seed_left`)在首个 turn 内置上:
+/// 见 `roadmap.local/26-10-17-verify核级账-投机盈亏线.md` §3。
+pub(crate) fn break_even_line(round_cost_ms: f32, bare_cost_ms: f32) -> Option<f32> {
+    if round_cost_ms > 0.0 && bare_cost_ms > 0.0 {
+        Some((round_cost_ms / bare_cost_ms).clamp(BREAK_EVEN_MIN, BREAK_EVEN_MAX))
+    } else {
+        None
+    }
+}
+
+/// 盈亏线的**日志文本**(单一措词源;`None` = 未测)
+pub(crate) fn break_even_text(line: Option<f32>) -> String {
+    match line {
+        Some(v) => format!("{v:.2}"),
+        None => "未测".to_string(),
+    }
+}
 
 
 /// E5-M5 spec 分相探针(owl-metrics 直用 API:release 恒开,热路径每轮
