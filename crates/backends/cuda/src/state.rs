@@ -19,8 +19,12 @@ pub struct DiagOpts {
     pub srv_timing: bool,
     /// 捕获期插桩(原 OWL_CAP_PROF)
     pub cap_prof: bool,
-    /// 图回放后同步归因(原 OWL_LAUNCH_SYNC;诊断用,性能杀手勿常开)
-    pub launch_sync: bool,
+    // (原 `launch_sync` 字段已删,2026-10-16):**唯一读者**是 server 侧
+    // `ServerProbes.launch_sync`——而那个字段自己也没人读(逐发射同步
+    // 早已改成 `sync_at(sync_bit::LAUNCH)`,alloc 侧改
+    // `sync_at(sync_bit::ALLOC)`)⇒ 只剩“写进结构体再搬一次”的空转。
+    // 与 `legacy_sync`(2026-10-15)同一形态,故删；“全同步”仍由
+    // 配置面 `cuda.launch_sync` ⇒ `sync_mask = ALL` 表达。
     /// 旁路事件钉序(原 OWL_FREE_LEGACY;崩坏案 A/B 判别)
     pub free_legacy: bool,
     // (原 `legacy_sync` 字段已删,2026-10-15):它的两个消费者早已各自改成
@@ -67,7 +71,6 @@ impl DiagOpts {
         Self {
             srv_timing: c.srv_timing,
             cap_prof: c.cap_prof,
-            launch_sync: mask & (sync_bit::ALLOC | sync_bit::LAUNCH) != 0,
             free_legacy: c.free_legacy,
             sync_mask: mask,
             launch_time: c.launch_time,
@@ -318,6 +321,51 @@ pub(crate) fn resolve_vram_dump_path(target: &str, ms_epoch: u128) -> String {
         "" | "1" => format!("/tmp/owl-vram-{ms_epoch}.json"),
         p => p.to_string(),
     }
+}
+
+/// **现场文件名 → 毫秒戳**(自家两种形态;非自家 = `None`)。
+///
+/// 形态:`owl-vram-{ms}.json`(OOM 现场)与
+/// `owl-vram-peak-{ms}-{MiB}MiB.json`(峰值阶梯)。
+/// 保留裁剪**只认这两种名字** —— 显式路径(用户给的)与陌生文件一律不碰。
+pub(crate) fn vram_dump_stamp(name: &str) -> Option<u128> {
+    let rest = name.strip_prefix("owl-vram-")?.strip_suffix(".json")?;
+    let rest = rest.strip_prefix("peak-").unwrap_or(rest);
+    rest.split('-').next()?.parse::<u128>().ok()
+}
+
+/// **现场保留裁剪**(2026-10-16):把 `dir` 里自家现场裁到最多 `keep` 份(保新)。
+///
+/// 为什么需要:OOM 现场 + 峰值阶梯(`OWL_VRAM_PEAK_MAX` 份/次运行)在
+/// `/tmp` 里**跨运行累积** —— 单进程上界管不住"跑了很多轮测试"的堆积。
+///
+/// 判据全在明处:①只认 [`vram_dump_stamp`] 认得出的名字(陌生文件不动);
+/// ②排序键 = 名字里内嵌的毫秒戳(不依赖 mtime —— 拷贝/恢复会改写 mtime);
+/// ③`keep == 0`(关)或目录读不到 ⇒ 一份不删。返回**实际**删除份数。
+pub(crate) fn prune_vram_dumps(dir: &std::path::Path, keep: usize) -> usize {
+    if keep == 0 {
+        return 0;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut stamps: Vec<(u128, std::path::PathBuf)> = Vec::new();
+    for e in rd.flatten() {
+        let name_os = e.file_name();
+        let Some(name) = name_os.to_str() else { continue };
+        let Some(ms) = vram_dump_stamp(name) else { continue };
+        stamps.push((ms, e.path()));
+    }
+    if stamps.len() <= keep {
+        return 0;
+    }
+    stamps.sort_unstable_by_key(|(ms, _)| *ms);
+    let drop_n = stamps.len() - keep;
+    stamps
+        .into_iter()
+        .take(drop_n)
+        .filter(|(_, p)| std::fs::remove_file(p).is_ok())
+        .count()
 }
 
 /// JSON 字符串字面量(含转义;名字来自调用点,含路径/冒号/引号的可能)。
@@ -690,7 +738,7 @@ pub(super) fn pool_ledger_snapshot() -> Option<(u64, u64, u64, u64)> {
             return None;
         }
         let pool = pool.assume_init();
-        let mut get = |attr: cs::CUmemPool_attribute| -> Option<u64> {
+        let get = |attr: cs::CUmemPool_attribute| -> Option<u64> {
             let mut v: u64 = 0;
             let rc = cs::cuMemPoolGetAttribute(
                 pool,
@@ -2019,6 +2067,45 @@ mod tests {
         assert_eq!(resolve_vram_dump_path("1", 1234), "/tmp/owl-vram-1234.json");
         assert_eq!(resolve_vram_dump_path("", 7), "/tmp/owl-vram-7.json");
         assert_eq!(resolve_vram_dump_path("/tmp/x.json", 9), "/tmp/x.json");
+    }
+
+    /// 现场名字 → 毫秒戳:两种自家形态认得出,陌生形态一律 `None`(不误删)。
+    #[test]
+    fn vram_dump_stamp_forms() {
+        assert_eq!(vram_dump_stamp("owl-vram-1792124456019.json"), Some(1792124456019));
+        assert_eq!(vram_dump_stamp("owl-vram-peak-1792124456019-64MiB.json"), Some(1792124456019));
+        // 陌生/残缺形态 ⇒ None(显式路径恰好长这样也照样不放行)
+        assert_eq!(vram_dump_stamp("x.json"), None);
+        assert_eq!(vram_dump_stamp("owl-vram-abc.json"), None);
+        assert_eq!(vram_dump_stamp("owl-vram-12.json.bak"), None);
+        assert_eq!(vram_dump_stamp("owl-vram-peak-x-1MiB.json"), None);
+        assert_eq!(vram_dump_stamp("owl-vram-12.json"), Some(12));
+    }
+
+    /// 保留裁剪:只删自家现场、保新、陌生文件不动、`keep = 0` 全留。
+    #[test]
+    fn prune_keeps_newest_and_spares_foreign() {
+        let dir = std::env::temp_dir().join(format!("owl-vram-prune-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("临时目录");
+        for ms in [40u128, 10, 30, 20] {
+            std::fs::write(dir.join(format!("owl-vram-{ms}.json")), "{}").expect("写");
+        }
+        std::fs::write(dir.join("owl-vram-peak-5-1MiB.json"), "{}").expect("写");
+        std::fs::write(dir.join("别人的文件.json"), "{}").expect("写");
+        // 5 份自家现场(4 OOM + 1 峰值),keep = 2 ⇒ 删 3 份最旧(戳 5 / 10 / 20)
+        assert_eq!(prune_vram_dumps(&dir, 2), 3);
+        for ms in [30u128, 40] {
+            assert!(dir.join(format!("owl-vram-{ms}.json")).is_file(), "戳 {ms} 应留下");
+        }
+        for gone in ["owl-vram-10.json", "owl-vram-20.json", "owl-vram-peak-5-1MiB.json"] {
+            assert!(!dir.join(gone).is_file(), "{gone} 应被裁掉");
+        }
+        assert!(dir.join("别人的文件.json").is_file(), "陌生文件不得删");
+        // keep = 0 = 关 ⇒ 一份不删
+        assert_eq!(prune_vram_dumps(&dir, 0), 0);
+        // 目录不存在 ⇒ 0(不炸)
+        assert_eq!(prune_vram_dumps(&dir.join("没有这个目录"), 1), 0);
+        std::fs::remove_dir_all(&dir).expect("清理");
     }
 
     /// 空账不炸(捕获窗未开/图外空账都可能读它;报告要能渲染)

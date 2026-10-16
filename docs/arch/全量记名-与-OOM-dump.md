@@ -279,6 +279,15 @@ EOF
 | **users 前 3**(名字 + 大小 + `u{u}/p{p}`) | 缩峰值该去找哪个节点(被最多消费者引用者) |
 | **⚠ 幽灵块**(`users == 0` 却仍在活跃集) | **回收记账漏口**信号(归零那刻就该走出口);非 0 即 bug |
 
+**收尾轮补正(2026-10-16 第二班)—— 幽灵判据的时间基**:
+`peak_live_ids` 是**高水位那一刻的快照**(历史),而 `refs` 是**最新**计数 ——
+两者直接相交,会把"峰值之后**正常**走完生命周期"的块读成幽灵(engine 离线图
+真实假红 2 块)。判据改成 **峰值集 ∩ 当前账**(`st.ids` 存的是此刻仍在账的块,
+`probe_free` 时移除):剩下还报警的就真是"归零了却还活着"。
+离线门 = `slab_hint::arena_tests::dead_after_peak_is_not_a_ghost`(峰值后
+`refs→0` + `probe_free` ⇒ 报告里既无幽灵、块数也只剩健康那一块);
+原负例 `probe_refs_ghost_blocks_are_loud`(活着就归零)仍绿 —— 两边都钉住。
+
 **可判定性**(为什么不信日志):新增计数器 `slab_hint::refs_pushed()`
 (`probe_on` 清零)。门两条:
 
@@ -290,6 +299,34 @@ EOF
 **为什么不做"逐块全表落盘"**:报告按 users 降序取前 3 + 直方图已够定位;
 全表(每节点一块)会把日志/JSON 撑到 MB 级,而信息密度极低。要全表用
 `OWL_ALLOC_TRACE` 那类逐条探针。
+
+### 8.5 现场保留策略(`OWL_VRAM_KEEP`;2026-10-16 收尾轮)
+
+单进程上界(`OWL_VRAM_PEAK_MAX=8`)管不住**跨运行累积** —— 跑多轮测试后
+`/tmp/owl-vram-*.json` 会越堆越多。收尾轮补一条**裁剪**:
+
+| 旋钮 | 语义 | 缺省 |
+|---|---|---|
+| `OWL_VRAM_KEEP` | 每次**我们自己**落一份新现场后,把同类现场裁到最多 N 份(保新) | 16 |
+| `0` | 关(一份不删) | — |
+
+判据在 `state::vram_dump_stamp`(名字 → 毫秒戳)+ `state::prune_vram_dumps`
+(目录 + keep → 实际删除数),两枚纯函数:
+
+- **只认自家两种名字** `owl-vram-{ms}.json` / `owl-vram-peak-{ms}-{MiB}MiB.json`
+  ⇒ 显式路径(用户给的落点)与陌生文件一律不碰;
+- **排序键 = 名字里内嵌的毫秒戳**(不靠 mtime —— 拷贝/恢复会改写 mtime);
+- **由"我们又写了一份"触发**(不主动扫 `/tmp`);删了 > 0 份报一行 info(不静默);
+- 目录读不到 / `keep = 0` ⇒ 一份不删(不炸)。
+
+**离线门**:`state::tests::vram_dump_stamp_forms`(两种自家形态 + 四种陌生形态
+⇒ `None`)、`state::tests::prune_keeps_newest_and_spares_foreign`(临时目录造
+5 份自家 + 1 份陌生 ⇒ keep=2 删 3 保新、陌生不动、`keep=0` 全留、目录不存在=0)。
+
+**真机证据**(`gpu_server` + `OWL_VRAM_PEAK_MB=1`,步骤 14):预置 20 份假现场后
+开跑,峰值阶梯照常落 5 份(64/384/704/768/832 MiB),`/tmp` 计数**收敛到 16**,
+被裁掉的是戳最小的 9 份 —— 且 5 份新现场过标准解析器往返校验(块数
+14/22/32/35/37,scratch 在 768MiB 那档从 7 跳到 22,与 §8.0 表逐项一致)。
 
 ## 9. 未做 / 已知取舍(诚实账)
 
@@ -303,8 +340,87 @@ EOF
 2. **pinned 租约只带名不建账**:`handle_alloc_pinned` 的名字只进错误上下文,
    池命中分支无账目(host 侧泄漏的归因价值低;要做需给 Staging 带标签)。
 3. **未做名字的 `top-N` 之外审计**:OOM 行默认 top12;要全量需调 `top`。
-4. **存量红**(非本轮引入,阻断 `--all-targets` 全绿):`apps/server/tests/ops_whitelist.rs`
-   调 `OwlConfig::load(Some(&str), None)`,而该函数已改收 `Option<&Path>`
-   (main 会话的 config 重构只改了签名,测试没跟上);kernels 若干集成测试
-   缺 `cubins` feature 门(`family::cubins` 不存在)—— 两者都在基线 `c54ff16`
-   上同样失败,与本轮无关。
+4. ~~**存量红**(阻断 `--all-targets` 全绿)~~ —— **2026-10-16 收尾轮已清**
+   (两条都是**别的轮次落下的漂移**,与本特性无关;修法都在**测试侧**,
+   零生产语义改动):
+   - `apps/server/tests/ops_whitelist.rs`:`OwlConfig::load` 已改收**文件路径**
+     (配置层自 2026-10-16 起**不认识 flavor 名字** —— 名字→路径是入口职责)
+     ⇒ 测试改走 `owl_shared::assets::preset_path(flavor)` 同一解析口。
+   - `crates/backends/cuda/tests/marlin_parity.rs` 5 例:L3 事实面(dtype/rank
+     上盘)落地后,老测试还在用**扁平一维 shape** 与写死的 `Dtype::F16`
+     ⇒ 契约门当场拒(`槽 b 期望 rank = 2(声明) 实得 1`)。修法 = 测试补真事实
+     (`b`/`scales`/`zeros` 二维视图、bf16 臂的 a/out 换 BF16 标签、`alloc`
+     出来的块显式 `view` 定形),**声明侧不动** —— 声明才是真契约。改后 7/7 绿。
+   - 仍在(别的轮次的**声明态**):`crates/engine/src/exec/e4_api.rs` 三个
+     `never used` 警告 —— 文件头写明"E4 接入面(声明;未实现)",按对方意图留着。
+5. **kernels 集成测试的 `cubins` feature 门**(`family::cubins` 随
+   `feature = "device"` 出):本轮**没复现**(`--test marlin_parity` /
+   `--lib` 都不需要它);真要 `--all-targets` 全绿时按报错逐条补 `#[cfg(feature)]`
+   或跑带 feature 的那一档。
+
+## 10. 收尾轮(2026-10-16 第二班):验收 + 清账
+
+**验收(真机 3090 Ti;`CUDA_VISIBLE_DEVICES=<UUID>` 先钉卡 + `OWL_TEST_DEVICE=0`)**
+
+| 项 | 结果 |
+|---|---|
+| `cargo check --workspace --all-targets` | **0 error**(全部测试目标都能编;剩余全是警告) |
+| `cargo test -p owl-shared --lib`(带 `OWL_TEST_DEVICE`) | **64/64**(原 62 绿 + 1 **env 假红**,见下) |
+| `cargo test -p owl-kernels --lib` | **72/72** |
+| `cargo test -p owl-engine --lib` | **42/42** |
+| `cargo test -p owl-cuda --lib` | **18/18**(含 §8.5 两条裁剪门) |
+| `cargo test -p owl-cuda --test gpu_server`(步骤 1..14) | **2/2** |
+| `cargo test -p owl-engine --features e2e --test engine_e2e`(全场景) | **1/1,213.0s** |
+| `cargo test -p owl-cuda --test marlin_parity`(清账后) | **7/7,393s**(原 2 绿 5 红) |
+| `cargo test -p server --test ops_whitelist` | **2/2**(原**编译红**) |
+| `cargo test -p owl-models --lib` | **165/166** —— 剩的`gpu_dflash2_27b_loads_and_smokes` 是**存量红**(见末段) |
+
+⚠️ **钉卡教训(本轮当场踩,值一条坑)**:只用 `OWL_TEST_DEVICE` 时 **CUDA
+ordinal ≠ nvidia-smi 序号** —— `OWL_TEST_DEVICE=1` 打到了别人占着的 3090 Ti
+(nvidia-smi 22.3G 已用)上,`gpu_prefill_bucket_matches_eager` 在装载期 OOM
+**假红**。正确姿势 = `CUDA_VISIBLE_DEVICES=<空闲卡 UUID>` 先钉,**再**
+`OWL_TEST_DEVICE=0`(与 pitfall §16 "GPU 套件必须 `--test-threads=1`" 配套;
+kernels 侧 probe 手册里早就是这个写法)。
+
+**顺带清的死码**(都是"搬完家没扫尾",零语义改动;`cargo check` 三个 crate
+回到**零警告**):
+
+| 位置 | 形态 | 为什么删 |
+|---|---|---|
+| `server/mod.rs` `ServerProbes.launch_sync` + `state.rs` `DiagOpts.launch_sync` | 字段无读者 | 逐发射同步早已改 `sync_at(sync_bit::LAUNCH)`(alloc 侧 `sync_at(ALLOC)`)⇒ 字段只剩"写进去再搬一次";与 `legacy_sync`(2026-10-15)同一形态 |
+| `state.rs` `let mut get` / `exec/spec.rs` `let mut toks` | 多余 `mut` | 编译器警告 |
+| `driver.rs` `other => unreachable!` | 未用绑定 | 上一 match 已拒非 F32/F16 ⇒ 改 `_` |
+| `slab_hint::render_refs` | 幽灵判据的时间基 | 峰值集(历史)∩ refs(最新)会把"峰值后正常死掉的块"读成幽灵 ⇒ 改 ∩ **当前账**;新增门 `dead_after_peak_is_not_a_ghost` |
+| `testkit/case.rs` 用例 `注入双臂_文件值与缺省` | **env 依赖型假红** | 它比"文件值 vs 裸 loader",而 `case_config` 无条件用 `OWL_TEST_DEVICE` 回填设备序 ⇒ 只要外部环境带该键(跑 GPU 门的进程必带)就红。修法 = 用例开头 `EnvGuard::unset`(新面,与 `set` 对称:空串 ≠ 未设) |
+
+**这一轮的真教训**:两条"存量红"里,**一条是测试没跟上契约面**(marlin),
+**一条是测试读到了不该读的环境**(testkit),**一条是判据把两个时间基混了**
+(幽灵块)—— 三种形态都不是"算法错",而是"断言的边界没画准";门红的时候
+先问"这个断言在说什么时态的事",比先改代码便宜得多。
+
+### 10.1 剩下一条**非本轮**的存量红(models 165/166)
+
+`owl-models --lib`:`formats::qwen35::tests::gpu_dflash2_27b_loads_and_smokes`
+在投影对拍第一步就红:
+
+```
+[project_memory(fc+hidden_norm)][0] 1.8408203 vs 1.9783204(atol 0.05)
+```
+
+- **已证非本特性引入**:`git stash` 到干净的 `d380d21` 重跑同一条 → 同样红
+  (也说明与本轮 slab_hint/cuda/server 改动无关);
+- 现场:`OWL_DFLASH2_DIR=models/syvai/Qwen3.8-27B-DFlash2-W4A16`(ct 格式
+  `weight_packed`/`weight_scale`/`weight_shape`,153 键),装载走
+  **设备重排臂**(日志 `[draft-mem] U32/DeviceRearrange { op: CtRepack, … }`);
+  参考侧 = `W4A16Source::dequant_linear("fc")`(host 解量化 `weight_packed`)。
+- 判断:**误差 7% 量级、方向未知**,属 AWQ/W4A16 装载与 ct-repack 的
+  **约定面**问题(与 2026-10-16 `装载提速-定谳轮` 的 `.packed_raw` 族同域 ⇒
+  交回该面持有者),不是记名/OOM dump 面的回归。**本轮不碰**(避免踩别家在改的文件)。
+
+> **后记(同日,main 侧)**:`main` 已前进到 `ddb260f`(W4A8 系列),其提交信息里
+> ① `marlin_parity` 的 4 条 + `ct_repack` 2 条**同样自 L3 门落地起一直红**,
+> 修法 = **在 `Arg::block(...)` 上按声明表显式给 rank/dtype**(本卷 §9.4 是
+> 另一条等价修法:改**上传句柄**的视图)。**两处修法会撞** ⇒ 合并时以 main
+> 版为准(那边已 8/8 且在继续扩测),本卷这版留着当"改事实面"的对照。
+> ② models 报告 **171/171**(高于本分支基线的 166)⇒ §10.1 那条 parity 腐化
+> 很可能已在同一族工作里被收走 —— 合并到 main 后请重跑 §10 那张表。

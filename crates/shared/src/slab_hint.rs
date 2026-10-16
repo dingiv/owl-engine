@@ -706,9 +706,14 @@ fn render_refs(st: &ProbeState) -> String {
         return String::new();
     }
     // 只统计**当前活跃**的块(已死块留在表里是为了渲染,不该进引用分布)
+    // 只统计**此刻仍在账**的块:峰值集合是**历史快照**(高水位那一刻),而
+    // `refs` 是**最新**计数 —— 直接相交会把"峰值之后正常死掉的块"读成幽灵
+    // (2026-10-16 收尾轮实测:engine 离线图因此报关 2 块假红)。
+    // 判据改成 "峰值集 ∩ 当前账"(= 归零了却**还活着**才是漏口)。
     let live: Vec<(u64, (u32, u32))> = st
         .peak_live_ids
         .iter()
+        .filter(|id| st.ids.contains_key(*id))
         .filter_map(|id| st.refs.get(id).map(|r| (*id, *r)))
         .collect();
     if live.is_empty() {
@@ -929,6 +934,30 @@ mod arena_tests {
         let rep = take_probe_report();
         assert!(rep.contains("⚠ 幽灵块 1 个"), "幽灵必须显形:{rep}");
         assert!(rep.contains("leaky.block"), "幽灵要点名:{rep}");
+    }
+
+    /// **幽灵判据的时间基**(2026-10-16 收尾轮):峰值集合 = 高水位那一刻的
+    /// 快照(历史),`refs` = 最新计数 ⇒ "峰值后正常走完生命周期"的块不许被
+    /// 读成幽灵(engine 离线图曾因此报 2 块假红)。判据 = 峰值集 ∩ **当前账**。
+    #[test]
+    fn dead_after_peak_is_not_a_ghost() {
+        let _g = PROBE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = take_probe_report();
+        probe_on(true);
+        probe_alloc(31, 1 << 20);
+        probe_name(31, "died.after.peak");
+        probe_refs(31, 1, 0);
+        probe_alloc(32, 1 << 20);
+        probe_name(32, "alive.healthy");
+        probe_refs(32, 2, 0);
+        // 高水位拍下 {31,32} 之后,31 正常走完生命周期:归零(死) + 真回收
+        // (`probe_end` 渲染那一刻才算报告 ⇒ 死亡必须在它之前发生)
+        probe_refs(31, 0, 0);
+        probe_free(31);
+        let _ = probe_end();
+        let rep = take_probe_report();
+        assert!(rep.contains("引用分布(1 块)"), "只剩健康块:{rep}");
+        assert!(!rep.contains("幽灵块"), "峰值后正常死掉的块不是幽灵:{rep}");
     }
 
     /// **峰值归因**(2026-10-15):快照 = 高水位刷新时刻的活跃集;

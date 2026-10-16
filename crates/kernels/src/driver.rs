@@ -1495,7 +1495,7 @@ pub mod vis {
         let name = match dt {
             DType::F32 => "owl_vis_attn_full_f32",
             DType::F16 => "owl_vis_attn_full_f16",
-            other => unreachable!("上面已拒"),
+            _ => unreachable!("上面已拒"),
         };
         const TILE: usize = 64;
         let smem = (2 * TILE * head_dim.max(1) * elem) as u32;

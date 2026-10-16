@@ -71,6 +71,17 @@ impl EnvGuard {
         std::env::set_var(key, value);
         Self { key, prev }
     }
+
+    /// 反向:临时**摘掉**一个键(Drop 时还原)。
+    ///
+    /// 与 `set(key, "")` **不同义**:空串在读者眼里是 `Some("")`
+    /// (`flag` 当假、`parse` 失败、`str` 拿到空串),而摘掉是 `None`。
+    /// 用例:测试要比"裸 loader 复算"而目标函数会**无条件读 env 回填**。
+    pub fn unset(key: &'static str) -> Self {
+        let prev = std::env::var_os(key);
+        std::env::remove_var(key);
+        Self { key, prev }
+    }
 }
 
 impl Drop for EnvGuard {

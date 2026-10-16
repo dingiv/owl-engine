@@ -64,6 +64,11 @@ mod tests {
     #[test]
     fn 注入双臂_文件值与缺省() {
         let _g = env_lock();
+        // `case_config` 会**无条件**用 `OWL_TEST_DEVICE` 回填设备序,而裸
+        // `OwlConfig::load` 不读 env ⇒ 不摘掉这个键时,"与唯一 loader 逐字段同"
+        // 与"未设 = default"两条断言会因**外部环境**而红(实测:带
+        // `OWL_TEST_DEVICE` 跑 GPU 门时同进程内必红)。臂 3 自己会设回去。
+        let _no_dev = crate::env_reader::EnvGuard::unset("OWL_TEST_DEVICE");
         // 臂 1:文件(临时 toml;引擎同款格式,deny_unknown 生效面)
         let path = std::env::temp_dir().join(format!("owl_case_cfg_{}.toml", std::process::id()));
         std::fs::write(&path, "[runtime]\nmax_seq = 128\nprefill_chunk = 32\n")

@@ -76,8 +76,6 @@ struct ServerProbes {
     gpu_prof: bool,
     /// OWL_LAUNCH_TIME(host 提交计时)
     launch_time: bool,
-    /// OWL_LAUNCH_SYNC(逐发射同步)
-    launch_sync: bool,
     /// OWL_D2H_PROF(dtoh 分相)
     d2h_prof: bool,
     /// OWL_CAP_PROF(捕获期插桩)
@@ -94,7 +92,6 @@ impl ServerProbes {
         Self {
             gpu_prof: diag.gpu_prof,
             launch_time: diag.launch_time,
-            launch_sync: diag.launch_sync,
             d2h_prof: diag.d2h_prof,
             cap_prof: diag.cap_prof,
             srv_timing: diag.srv_timing,
@@ -382,17 +379,20 @@ impl GpuServer {
         let path = format!("/tmp/owl-vram-peak-{}-{}MiB.json", now_ms(), live >> 20);
         let json = self.ledger_dump_json();
         match std::fs::write(&path, json) {
-            Ok(()) => self.sink.logf(
-                owl_shared::log::LVL_INFO,
-                "vram-peak",
-                format_args!(
-                    "峰值快照 #{}/{} 已落盘:{path}(live={}MiB,相位={})",
-                    self.peak_snapshots,
-                    max,
-                    live >> 20,
-                    self.phase_name()
-                ),
-            ),
+            Ok(()) => {
+                self.sink.logf(
+                    owl_shared::log::LVL_INFO,
+                    "vram-peak",
+                    format_args!(
+                        "峰值快照 #{}/{} 已落盘:{path}(live={}MiB,相位={})",
+                        self.peak_snapshots,
+                        max,
+                        live >> 20,
+                        self.phase_name()
+                    ),
+                );
+                self.prune_vram_dumps_after(&path);
+            }
             Err(e) => self.sink.logf(
                 owl_shared::log::LVL_WARN,
                 "vram-peak",
@@ -405,16 +405,42 @@ impl GpuServer {
     fn write_vram_dump(&self, target: &str, why: &str) {
         let path = crate::state::resolve_vram_dump_path(target, now_ms());
         match std::fs::write(&path, self.ledger_dump_json()) {
-            Ok(()) => self.sink.logf(
-                owl_shared::log::LVL_WARN,
-                "vram-dump",
-                format_args!("{why} 现场已落盘:{path}"),
-            ),
+            Ok(()) => {
+                self.sink.logf(
+                    owl_shared::log::LVL_WARN,
+                    "vram-dump",
+                    format_args!("{why} 现场已落盘:{path}"),
+                );
+                self.prune_vram_dumps_after(&path);
+            }
             Err(e) => self.sink.logf(
                 owl_shared::log::LVL_WARN,
                 "vram-dump",
                 format_args!("{why} 现场落盘失败({path}):{e}(原错误不被覆盖)"),
             ),
+        }
+    }
+
+    /// **现场保留裁剪**(`OWL_VRAM_KEEP`,缺省 16 份;`0` = 关;2026-10-16)。
+    ///
+    /// 只在**刚写完自家现场**后调用 —— 裁剪由"我们又写了一份"触发,不主动
+    /// 扫 `/tmp`。显式路径(名字不是 `owl-vram-*`)不触发 ⇒ 用户指定的落点
+    /// 归用户管。删除数 > 0 时报一行 info(不静默删别人的东西)。
+    fn prune_vram_dumps_after(&self, written: &str) {
+        let path = std::path::Path::new(written);
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if crate::state::vram_dump_stamp(name).is_none() {
+            return;
+        }
+        let keep = owl_shared::env_reader::parse_or::<usize>("OWL_VRAM_KEEP", 16);
+        let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let removed = crate::state::prune_vram_dumps(dir, keep);
+        if removed > 0 {
+            self.sink.logf(
+                owl_shared::log::LVL_INFO,
+                "vram-dump",
+                format_args!("现场保留裁剪:旧现场 {removed} 份已删(OWL_VRAM_KEEP={keep})"),
+            );
         }
     }
 
