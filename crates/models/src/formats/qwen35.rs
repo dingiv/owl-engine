@@ -386,7 +386,10 @@ mod tests {
             crate::module::QuantPlan::F16,
             crate::module::QuantPlan::F16,
         );
-        load_from_dir(dir, face, &model, LoadOpts::plain(spec.dtype)).await?;
+        let mut opts = LoadOpts::plain(spec.dtype);
+        // 逐键分相账(`OWL_LOAD_DEBUG=1`;装载测速/瓶颈定位用)
+        opts.debug_tap = owl_shared::env_reader::flag("OWL_LOAD_DEBUG");
+        load_from_dir(dir, face, &model, opts).await?;
         Ok(model)
     }
 

@@ -729,10 +729,9 @@ impl GpuCtx {
     /// **登记"本块已清零"事件**(在 `alloc{zero:true}` 的 memset 之后由 server 调)
     pub(super) fn note_zeroing(&mut self, id: u64, stream: StreamId) -> Result<(), ModelError> {
         let st = self.stream(stream)?.clone();
-        let ev = unsafe {
+        let ev =
             crate::ffi::event_create(crate::ffi::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING)
-        }
-        .map_err(|e| ModelError::Msg(format!("note_zeroing({id}): 建事件 {e:?}")))?;
+                .map_err(|e| ModelError::Msg(format!("note_zeroing({id}): 建事件 {e:?}")))?;
         unsafe { crate::ffi::event_record(ev, st.cu_stream()) }
             .map_err(|e| ModelError::Msg(format!("note_zeroing({id}): 记入 {e:?}")))?;
         if let Some(old) = self.zero_ev.insert(id, TailEvent(ev)) {

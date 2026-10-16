@@ -15,6 +15,9 @@ use crate::graph_plan::f32b;
 use crate::scheduler::BeginPlan;
 
 pub mod phases;
+
+/// **E4 接入面(声明;未实现)**——见 `docs/arch/三流事件序-设计与迁移.md` §6
+pub mod e4_api;
 pub mod spec;
 pub mod draft;
 pub mod prefill_chunk;

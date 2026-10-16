@@ -1199,6 +1199,8 @@ impl GpuServer {
     /// 所需数据(dtoh 回执即 COMPUTE 排空);图捕获期由 G2 拒绝臂拦截。
     fn handle_free(&mut self, ids: Vec<u64>, ack: Ack<Result<(), ModelError>>) {
         let t0 = std::time::Instant::now();
+        // 清零账同批清掉(id 复用后误等陈旧事件 = 白等;见 `clear_zeroing` 注)
+        self.ctx_mut().clear_zeroing(&ids);
         let freed = self.ctx_mut().free_blocks(&ids);
         self.sink.timer("srv.seg.free", t0.elapsed());
         self.sink.count("srv.count.free_blocks", freed as u64);

@@ -124,7 +124,9 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
             head_plan,
         );
         // 旋钮:设备重排 = 能力自述裁决(RepackPath::resolve 唯一收口)
-        let opts = LoadOpts::new(self.face, spec.dtype);
+        let mut opts = LoadOpts::new(self.face, spec.dtype);
+        // 逐键分相账(OWL_LOAD_DEBUG=1;装载测速/瓶颈定位用 —— 与测试路同一开关)
+        opts.debug_tap = owl_shared::env_reader::flag("OWL_LOAD_DEBUG");
         load_from_dir(dir, self.face, &model, opts).await?;
         let model = Arc::new(model);
         let tokenizer = load_tokenizer(tokenizer_dir, &spec.tokenizer)?;
