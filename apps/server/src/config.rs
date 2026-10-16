@@ -243,8 +243,11 @@ impl ServerConfig {
             // 占位:真值由 `load()` 的声明式选卡回填(设备表 + 卡锁都在那边)
             device: 0,
             device_uuid: String::new(),
-            max_seq: cfg.runtime.max_seq,
-            prefill_chunk: cfg.runtime.prefill_chunk,
+            // 上下文/池下限:env 覆盖(实测调压用;池容量下限 = 单会话容量 = max_seq/page)
+            max_seq: owl_shared::env_reader::parse("OWL_MAX_SEQ").unwrap_or(cfg.runtime.max_seq),
+            // prefill 块长:env 覆盖(实测调压;它同时决定块边界快照的密度 ⇒ 命中面可复用性,§22)
+            prefill_chunk: owl_shared::env_reader::parse("OWL_PREFILL_CHUNK")
+                .unwrap_or(cfg.runtime.prefill_chunk),
             head_quant: cfg.model.head_quant,
             max_concurrency: cfg.server.max_concurrency,
             perf_dump: None,

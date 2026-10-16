@@ -72,7 +72,8 @@ impl StepProbes {
         Self {
             step_profile: p.step_profile,
             gdn_dump: p.gdn_dump,
-            debug: p.debug,
+            // 既有命名:OWL_DEBUG(通用诊断;preset 的 [probes] debug 可覆盖)
+            debug: p.debug || owl_shared::env_reader::flag("OWL_DEBUG"),
             prefill_cksum: p.prefill_cksum,
             fact_probe: p.fact_probe,
             degrade_after: cfg.spec.degrade_after,

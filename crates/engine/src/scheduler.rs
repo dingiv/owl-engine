@@ -175,7 +175,17 @@ impl<D: DeviceClient> RunningEngine<D> {
                         }
                     }
                     if self.cfg.knobs.probes.debug {
-                        owl_shared::log_debug!("dbg prefix", "match = {matched_raw} blocks / chain = {chain:?}");
+                        let snaps: Vec<bool> = hashes
+                            .iter()
+                            .take(4)
+                            .map(|h| self.pool.has_snap(owl_store::SnapKey::at_boundary(*h)))
+                            .collect();
+                        owl_shared::log_debug!(
+                            "dbg prefix",
+                            "match = {matched_raw} blocks / chain = {chain:?} · snap_used={}/{} 边界快照在场(前4)={snaps:?}",
+                            self.pool.snap_used(),
+                            self.pool.snap_capacity()
+                        );
                     }
                     // 裁剪(末块对齐 + 快照在场)= **单源** `reuse_face`
                     // (需求驱动保洁 §12.4 用同一份算式,不许各算一份)

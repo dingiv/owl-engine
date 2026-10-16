@@ -97,7 +97,11 @@ pub struct EngineKnobs {
 impl Default for EngineKnobs {
     fn default() -> Self {
         Self {
-            probes: crate::running::StepProbes::default(),
+            probes: crate::running::StepProbes {
+                // 命中面/调试打印:env 覆盖(实测排障用 `OWL_PROBES_DEBUG=1`)
+                debug: owl_shared::env_reader::flag("OWL_DEBUG"),
+                ..Default::default()
+            },
             pool_tokens: None,
             draft: DraftCfg::default(),
             prefix_cache: true,
@@ -130,7 +134,8 @@ impl EngineKnobs {
     pub fn from_config(cfg: &owl_shared::config::OwlConfig) -> Self {
         Self {
             probes: crate::running::StepProbes::from_config(cfg),
-            pool_tokens: cfg.pool.pool_tokens,
+            // 池容量:env 覆盖(实测调压必需)> preset > 默认 2×单会话(§22 实测)
+            pool_tokens: owl_shared::env_reader::parse("OWL_POOL_TOKENS").or(cfg.pool.pool_tokens),
             draft: DraftCfg {
                 depth: cfg.spec.depth,
                 dumb: cfg.spec.dumb,
@@ -151,7 +156,8 @@ impl EngineKnobs {
             prefill_bucket: cfg.graph.prefill_bucket,
             ts_probe: cfg.dispatch.ts_probe,
             gdn_slots: cfg.pool.gdn_slots,
-            snap_max: cfg.pool.snap_max,
+            // 快照池容量:env 覆盖(实测调压;命中面要求边界快照在场)
+            snap_max: owl_shared::env_reader::parse("OWL_SNAP_MAX").unwrap_or(cfg.pool.snap_max),
             vram_target: cfg.pool.vram_target,
             vram_reserve_mb: cfg.pool.vram_reserve_mb,
             raw_completion: cfg.probes.raw_completion,

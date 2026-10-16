@@ -1728,3 +1728,55 @@ commit_offload(leg, &blocks, table)?;
 
 **门(全绿)**:store **61 + 2**(单测 + 无卡 e2e)· engine lib 36 · `cpu_mock_smoke` 3 ·
 GPU 演示台(换出 12 块 / 3 命令 · 回灌 2 块 / 1 命令 · 兜底驱逐 0)。
+
+---
+
+## 22. GPU 生产形态实测:换出/回灌/命中三门口(2026-10-17)
+
+> 目标:store 的搬运闭环在**真前向 + 真 GPU + owl server(OpenAI 面)**下验证。
+> 结论:**三门口全绿**;并定谳两条真实机制约束。
+
+### 22.1 现场(3080;owl server;0.8B)
+
+配置:`OWL_HOST_CACHE_MB=512 OWL_MAX_SEQ=384 OWL_POOL_TOKENS=384 OWL_SNAP_MAX=64 OWL_PREFILL_CHUNK=32`
+负载:三轮(长 A → 长 B 不同前缀 → **重复 A**),ephemeral(无 session ⇒ 焚链 ⇒ 缓存独占)。
+
+```
+轮 1  match=0 · 拍 6 张边界快照
+轮 2  Grow: free=0 ⇒ 钩子判 out=1 ⇒ 下沉 6 块(整条链 A 进宿主)
+轮 3  match=5 · chain=[占位符 ×5](全在宿主) · 边界快照在场=[true,true,true,true]
+      [store] 段边界回灌 5 块(session=2;宿主→设备;一条命令)
+      cached_tokens = 160
+```
+
+⇒ ①换出 ✓ ②回灌 ✓(一条命令搬 5 块)③命中复用 160 token ✓;Xid 0、无崩。
+
+### 22.2 定谳①:可复用性 = **块边界快照**密度;快照只在 **prefill chunk 边界**拍
+
+- 首实验(prompt 732、chunk 缺省 512)⇒ `cached=512` = **恰好一个 chunk**;
+- 块边界快照缺失时(match=5 而 `边界快照在场=[false,…]`)⇒ m 被裁到 **0**
+  ⇒ **块全程在设备也不复用**(§17 的快照裁剪律在生产形态显形);
+- `prefill_chunk=32`(= 一页)⇒ 每块边界有快照 ⇒ `cached=160`(5 块)✓
+
+**规律**:跨轮前缀复用的最小粒度 = `min(prefill_chunk, page)`(现即 chunk)。
+生产档若要**块粒度**复用,`prefill_chunk` 必须 = `page`。
+
+### 22.3 定谳②:池压力与命中率互相抵消
+
+命中率高 ⇒ 准入 `need = 总块 − 设备命中` 小 ⇒ **不必腾位** ⇒ 看不到换出。
+要观察换出/回灌,池必须**刚好满**(本例池 12 槽、两轮各 6 块 ⇒ 第三轮 `need=1` 也触发腾位);
+且腾位是**整条链**粒度(§14.6)⇒ **为 1 个槽搬 6 块**(代价,已在挂账口径内)。
+
+### 22.4 净产出(入库)
+
+- **四个 env 旋钮**(实测必需;`OWL_HOST_CACHE_MB` 原有):`OWL_POOL_TOKENS` / `OWL_MAX_SEQ` /
+  `OWL_SNAP_MAX` / `OWL_PREFILL_CHUNK`;`probes.debug` 走既有 **`OWL_DEBUG`**(不新造第二套命名);
+- **诊断**:scheduler 的 `dbg prefix` 打印现在带 `snap_used/cap` 与**前 4 个边界快照在场性**
+  —— 排查"命中面被裁到 0"的第一现场。
+
+### 22.5 事故记录(操作纪律)
+
+清理"残留测试服务"时用 `pgrep -x server`,而进程名 `server` 被**另一个 owl 服务**(单卡 3090Ti
+22GB)占用 ⇒ **误杀**(2026-10-17,已报)。
+**纪律**:杀进程只用 **PID 文件**或精确校验 `cmdline`;**禁止**按进程名 `-x` 匹配杀
+(除 AGENTS 的"pkill -f 匹配自身"之外,新增同类:进程名撞车)。
