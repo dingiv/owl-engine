@@ -100,6 +100,47 @@ pub(crate) struct RawEntry {
     pub shape: Vec<usize>,
 }
 
+impl RawEntry {
+    /// 天然元素宽度(字节)
+    pub(crate) fn esz(&self) -> usize {
+        use safetensors::Dtype as S;
+        match self.dtype {
+            S::F64 | S::I64 | S::U64 => 8,
+            S::F32 | S::I32 | S::U32 => 4,
+            S::F16 | S::BF16 | S::I16 | S::U16 => 2,
+            S::U8 | S::I8 | S::BOOL | S::F8_E5M2 | S::F8_E4M3 | S::F8_E8M0 | S::F8_E4M3FNUZ
+            | S::F8_E5M2FNUZ | S::F4 | S::F6_E2M3 | S::F6_E3M2 => 1,
+            // safetensors::Dtype 是 #[non_exhaustive]:未列出的窄格式按 1B 兜底。
+            // 两条入口(量化源 native_dtype / convert 臂)先经 dtype 白名单筛过,
+            // 未支持 dtype 到不了本函数(dtype 白名单失配 = 上游响亮 None)。
+            _ => 1,
+        }
+    }
+}
+
+/// **公共字节拷贝口**(页缓存直读 → pinned 租约/堆缓冲):大块分线程 memcpy。
+///
+/// 早测账(本机):单线程 memcpy ≈19GB/s、四线程 ≈55GB/s,而 27B 整装
+/// CPU 侧曾是全载最大单相 ⇒ 装载域所有"原样字节"搬运统一走本口
+/// (与 `safetensors::copy_native_into` 同款,2026-10-16 提速同源)。
+pub(crate) fn copy_par(src: &[u8], dst: &mut [u8]) {
+    assert!(dst.len() >= src.len(), "copy_par: 目标缓冲 {} < 源 {}", dst.len(), src.len());
+    let dst = &mut dst[..src.len()];
+    const PAR_THRESHOLD: usize = 8 << 20;
+    if src.len() >= PAR_THRESHOLD {
+        let chunk = src.len().div_ceil(4);
+        let ds: Vec<&mut [u8]> = dst.chunks_mut(chunk).collect();
+        let ss: Vec<&[u8]> = src.chunks(chunk).collect();
+        std::thread::scope(|sc| {
+            for (d, s) in ds.into_iter().zip(ss) {
+                sc.spawn(move || d.copy_from_slice(s));
+            }
+        });
+    } else {
+        dst.copy_from_slice(src);
+    }
+}
+
 
 
 

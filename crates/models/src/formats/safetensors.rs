@@ -207,22 +207,9 @@ impl WeightSource for SafeTensorsSource {
         }
         let s = e.start + offset_elems * esz;
         let src = &self.maps[e.map_ix][s..s + want];
-        // **大块分线程 memcpy**(2026-10-16 装载提速:与 convert_range 同款
-        // 并行阈)—— 单线程 memcpy ~7GB/s = 9GB 权重 1.2s,四线程 ≈ 0.3s,
-        // 让 CPU 侧不再当墙(DMA 才是应然瓶颈)。
-        const PAR_THRESHOLD: usize = 8 << 20;
-        if want >= PAR_THRESHOLD {
-            let chunk = want.div_ceil(4);
-            let dst_slices: Vec<&mut [u8]> = dst[..want].chunks_mut(chunk).collect();
-            let src_slices: Vec<&[u8]> = src.chunks(chunk).collect();
-            std::thread::scope(|scope| {
-                for (d, s) in dst_slices.into_iter().zip(src_slices) {
-                    scope.spawn(move || d.copy_from_slice(s));
-                }
-            });
-        } else {
-            dst[..want].copy_from_slice(src);
-        }
+        // **大块分线程 memcpy**(公共口 `mmap::copy_par`:单线程 ~19GB/s、
+        // 四线程 ~55GB/s,CPU 侧不再当墙 —— DMA 才是应然瓶颈)
+        crate::formats::mmap::copy_par(src, dst);
         self.maps[e.map_ix].dontneed(s, want);
         Some(())
     }
