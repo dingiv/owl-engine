@@ -47,9 +47,20 @@ pub const GEMM_W4A16_BF16: &str = "marlin_gemm_w4a16_bf16";
 pub const GEMM_W4A16_SLOTS: &str =
     "[T a, T b, T out, T scales, T ws, T c_tmp, sz m, sz k, sz n, sz groupsize]";
 
+/// foreign-kernel 虚拟核名(**W4A8 × AWQ 非对称**:int8 激活 × kU4 零偏权重;
+/// 槽序 = GEMM_W4A16_AWQ 的 zeros 之后插 a_scales,共 8 Block + 4 sz)
+pub const GEMM_W4A8_AWQ: &str = "marlin_gemm_w4a8_awq";
+
+/// W4A8 × AWQ 槽序契约(`a_scales` = per-token fp32 `[M,1]`;由激活量化核产出)
+pub const GEMM_W4A8_AWQ_SLOTS: &str =
+    "[T a, T b, T out, T scales, T zeros, T a_scales, T ws, T c_tmp, sz m, sz k, sz n, sz groupsize]";
+
 /// foreign 分派谓词(server handle_launch 前置检查;cublas 同款)
 pub fn is_foreign(name: &str) -> bool {
-    name == GEMM_W4A16 || name == GEMM_W4A16_AWQ || name == GEMM_W4A16_BF16
+    name == GEMM_W4A16
+        || name == GEMM_W4A16_AWQ
+        || name == GEMM_W4A16_BF16
+        || name == GEMM_W4A8_AWQ
 }
 
 pub const V2_ERR_NO_CONFIG: i32 = 3;
@@ -251,6 +262,26 @@ extern "C" {
         dev: i32,
         stream: usize,
     ) -> i32;
+
+    // W4A8 × AWQ(int8 激活 × kU4 零偏):A 已量化 + a_scales fp32[M,1];
+    // c_tmp 由 host 自管(传空指针即可)
+    fn marlin_gemm_v2_awq_w4a8_ffi(
+        a: *const c_void,
+        b: *const c_void,
+        c: *mut c_void,
+        c_tmp: *mut c_void,
+        b_scales: *const c_void,
+        b_zeros: *const c_void,
+        a_scales: *const c_void,
+        prob_m: i32,
+        prob_n: i32,
+        prob_k: i32,
+        workspace: *mut c_void,
+        group_size: i32,
+        dev: i32,
+        stream: usize,
+        is_bf16: i32,
+    ) -> i32;
 }
 
 /// AWQ(kU4 非对称)GEMM(裸指针)。b_zeros 布局契约见
@@ -296,6 +327,48 @@ pub unsafe fn gemm_v2_awq_raw(
     } else {
         Err(err)
     }
+}
+
+/// W4A8 × AWQ GEMM(裸指针):`a` = **int8 已量化激活**,`a_scales` = per-token
+/// fp32 `[M,1]`(全局因子已折入);其余契约同 [`gemm_v2_awq_raw`]。
+///
+/// # Safety
+/// 同 [`gemm_v2_awq_raw`];`a_scales` 须长度 ≥ m。
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_v2_awq_w4a8_raw(
+    a: *const i8,
+    b: *const i32,
+    c: *mut u16,
+    scales: *const u16,
+    zeros: *const i32,
+    a_scales: *const f32,
+    c_tmp: *const c_void,
+    m: i32,
+    n: i32,
+    k: i32,
+    workspace: *mut i32,
+    groupsize: i32,
+    dev: i32,
+    stream: usize,
+) -> Result<(), i32> {
+    let err = marlin_gemm_v2_awq_w4a8_ffi(
+        a as *const c_void,
+        b as *const c_void,
+        c as *mut c_void,
+        c_tmp as *mut c_void,
+        scales as *const c_void,
+        zeros as *const c_void,
+        a_scales as *const c_void,
+        m,
+        n,
+        k,
+        workspace as *mut c_void,
+        groupsize,
+        dev,
+        stream,
+        0, // is_bf16 = false(f16 档;bf16 档待接)
+    );
+    if err == 0 { Ok(()) } else { Err(err) }
 }
 
 #[cfg(feature = "marlin")]

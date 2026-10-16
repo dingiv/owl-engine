@@ -47,6 +47,38 @@ impl KernelSpec for MarlinGemmW4a16Awq {
     const SELFCHECK: Option<&'static dyn crate::bootcheck::BootCheck> = None;
 }
 
+/// `marlin_gemm_w4a8_awq` —— **W4A8 × AWQ 非对称**臂:int8 激活(已量化) ×
+/// kU4 零偏权重。槽序 = AWQ 臂的 `zeros` 之后插 `a_scales`(per-token fp32 `[M,1]`,
+/// 激活量化核产出、全局因子已折入)。权重侧与 W4A16 同布局(零 repack)。
+pub struct MarlinGemmW4a8Awq;
+
+impl KernelSpec for MarlinGemmW4a8Awq {
+    const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::marlin::GEMM_W4A16);
+    const ENTRY: &'static str = crate::family::marlin::GEMM_W4A8_AWQ;
+    /// foreign(静态链接):无 `.cu` 源
+    const SRC: &'static str = "";
+    const PARAMS: &'static [Param] = &[
+        // A = int8 已量化激活(1B/elem ⇒ 按本仓惯例以 U8 字节承载声明;
+        // 语义在核侧,与 fp8 KV 池同款约定)
+        Param::t_in("a", Dtype::U8, 2),
+        Param::t_in("b", Dtype::U32, 2),
+        Param::t_out("out", Dtype::F16, 2),
+        Param::t_in("scales", Dtype::F16, 2),
+        Param::t_in("zeros", Dtype::U32, 2),
+        // per-token 激活尺度(fp32;来自激活量化核)
+        Param::t_in("a_scales", Dtype::F32, 2),
+        Param::t_in("ws", Dtype::U32, 1),
+        Param::t_in("c_tmp", Dtype::U32, 1),
+        Param::sz("m"),
+        Param::sz("k"),
+        Param::sz("n"),
+        Param::sz("groupsize"),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
 /// `marlin_gemm_w4a16_bf16` —— BF16 激活/输出臂(**无 zeros 槽**:6 块 + 4 sz)。
 /// DFlash2 草稿路径(权重原生 BF16)。
 pub struct MarlinGemmW4a16Bf16;
