@@ -726,6 +726,50 @@ impl GpuCtx {
         Ok(rows)
     }
 
+    /// **默认池回收**(内存面;见 `DeviceClient::mem_pool_trim`):
+    /// `cuMemPoolTrimTo(pool, 0)` 把池内**已 free 的缓存块**还给 OS,
+    /// 回 `RESERVED_MEM_CURRENT` 的差值(字节;0 = 无可回收)。
+    ///
+    /// 为什么由本项目负责:池属性 `RELEASE_THRESHOLD=UINT64_MAX`(性能面,
+    /// 见上方池调优注释)⇒ free 后**永不自动还 OS**,装载期那批暂存块
+    /// (27B 档 156MB)会一直占着,把跑图期余量吃掉。装载收尾调一次即可。
+    pub(super) fn mem_pool_trim(&mut self) -> Result<u64, ModelError> {
+        use cudarc::driver::sys as cs;
+        // 池句柄 = 设备默认池(server 的 cudaMallocAsync 都走它)
+        let dev = cudarc::driver::result::device::get(self.ordinal as i32)
+            .map_err(|e| ModelError::Msg(format!("mem_pool_trim: device::get: {e:?}")))?;
+        let mut pool = std::mem::MaybeUninit::<cs::CUmemoryPool>::uninit();
+        // SAFETY:dev 来自 device::get;MaybeUninit 按 CUDA 契约写满
+        let rc = unsafe { cs::cuDeviceGetDefaultMemPool(pool.as_mut_ptr(), dev) };
+        if rc != cs::CUresult::CUDA_SUCCESS {
+            return Err(ModelError::Msg(format!("mem_pool_trim: cuDeviceGetDefaultMemPool: {rc:?}")));
+        }
+        let pool = unsafe { pool.assume_init() };
+        let reserved = |pool: cs::CUmemoryPool| -> Result<u64, ModelError> {
+            let mut v: u64 = 0;
+            // SAFETY:attr 与出参类型按 CUDA 契约配对(RESERVED_MEM_CURRENT = u64)
+            let rc = unsafe {
+                cs::cuMemPoolGetAttribute(
+                    pool,
+                    cs::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
+                    &mut v as *mut u64 as *mut core::ffi::c_void,
+                )
+            };
+            if rc != cs::CUresult::CUDA_SUCCESS {
+                return Err(ModelError::Msg(format!("mem_pool_trim: get RESERVED: {rc:?}")));
+            }
+            Ok(v)
+        };
+        let before = reserved(pool)?;
+        // minBytesToKeep = 0 ⇒ 未使用的缓存块全还
+        let rc = unsafe { cs::cuMemPoolTrimTo(pool, 0) };
+        if rc != cs::CUresult::CUDA_SUCCESS {
+            return Err(ModelError::Msg(format!("mem_pool_trim: cuMemPoolTrimTo: {rc:?}")));
+        }
+        let after = reserved(pool)?;
+        Ok(before.saturating_sub(after))
+    }
+
     /// **登记"本块已清零"事件**(在 `alloc{zero:true}` 的 memset 之后由 server 调)
     pub(super) fn note_zeroing(&mut self, id: u64, stream: StreamId) -> Result<(), ModelError> {
         let st = self.stream(stream)?.clone();

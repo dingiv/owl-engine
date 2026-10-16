@@ -458,6 +458,20 @@ impl LoadStaging {
         if !ids.is_empty() {
             face.free(&ids).await?;
         }
+        // **池回收**(2026-10-16):暂存块 free 后仍被 cudaMallocAsync 池缓存
+        // (池属性 RELEASE_THRESHOLD=UINT64_MAX ⇒ 永不自动还 OS),会把跑图期
+        // 余量吃掉(27B 单卡实测:峰值处 1.7MiB 分配 CUDA_ERROR_OUT_OF_MEMORY)。
+        // 装载收尾是唯一的"暂存全空"时刻 ⇒ 此时还给 OS 最干净。
+        // 门:仅设备面(GPU 池存在;CPU face 不支持 = 预期,不刷告警)。
+        // 失败 = 可见降级(内存面不回退语义;不许静默吞)。
+        if !face.device_kernels() {
+            return Ok(());
+        }
+        match face.mem_pool_trim().await {
+            Ok(0) => {}
+            Ok(n) => eprintln!("[load] 装载收尾池回收:还 OS {:.1}MB", n as f64 / 1e6),
+            Err(e) => owl_shared::log_warn!("load", "装载收尾池回收失败(显存面降级): {e}"),
+        }
         Ok(())
     }
 

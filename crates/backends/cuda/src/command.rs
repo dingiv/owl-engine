@@ -129,6 +129,12 @@ pub enum Command {
         copies: Vec<(u64, usize, u64, usize, usize)>,
         ack: Ack<Result<(), ModelError>>,
     },
+    /// **设备池回收**(内存面):池内已 free 的缓存块还 OS;
+    /// ack 回**释放字节数**(`RESERVED_MEM_CURRENT` 差值;0 = 无可回收)。
+    /// 用法 = 装载收尾(暂存槽 free 之后)—— 见 `DeviceClient::mem_pool_trim`。
+    MemPoolTrim {
+        ack: Ack<Result<u64, ModelError>>,
+    },
     /// **块账本投影**(调试面;`GET /debug/blocks`):全活块 (id, 字节, dtype, 地址, 账本)
     /// —— 判「同 id 两地址」与「两活块区间相交」的唯一权威快照。
     BlockLedgerDump {
@@ -183,6 +189,7 @@ impl Command {
             Self::Htod { .. } => "htod",
             Self::MemsetZero { .. } => "memset_zero",
             Self::BlockLedgerDump { .. } => "block_ledger_dump",
+            Self::MemPoolTrim { .. } => "mem_pool_trim",
             Self::UploadAndLaunch { .. } => "upload_and_launch",
             Self::LaunchAndHarvest { .. } => "launch_and_harvest",
             Self::HtodChunk { .. } => "htod_chunk",
@@ -210,6 +217,7 @@ impl Command {
             Self::Alloc { ack, .. } => ack.created_at(),
             Self::Htod { ack, .. } => ack.created_at(),
             Self::BlockLedgerDump { ack } => ack.created_at(),
+            Self::MemPoolTrim { ack } => ack.created_at(),
             Self::UploadAndLaunch { ack, .. } => ack.created_at(),
             Self::LaunchAndHarvest { ack, .. } => ack.created_at(),
             Self::MemsetZero { ack, .. } => ack.created_at(),

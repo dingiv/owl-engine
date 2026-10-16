@@ -388,6 +388,18 @@ pub trait DeviceClient: Send {
         async { Err(ModelError::Msg("block_ledger_dump: 此后端未实现".into())) }
     }
 
+    /// **设备池回收**(内存面;默认不支持):把 `cudaMallocAsync` 池里
+    /// **已 free 但仍被池缓存**的块还给 OS,回释放字节数。
+    ///
+    /// 为什么需要:池属性 `RELEASE_THRESHOLD=UINT64_MAX`(性能面:不还 OS)
+    /// 意味着**装载期暂存/临时块 free 之后仍占卡**(nvidia-smi 计入 used)。
+    /// 27B AWQ 单卡实测:装载收尾(暂存 free)后跑图期峰值贴顶,0.6MiB 分配
+    /// `CUDA_ERROR_OUT_OF_MEMORY`(2026-10-16 组测确定性复现)⇒ 装载收尾
+    /// 调一次本口,把 156MB 级"死账"还给 OS。
+    fn mem_pool_trim(&mut self) -> impl Future<Output = Result<u64, ModelError>> + Send {
+        async { Err(ModelError::Msg("mem_pool_trim: 此后端未实现".into())) }
+    }
+
     /// 设备内块→块拷贝(E2c:GDN 快照拍摄/恢复 —— 会话格 ↔ 快照缓冲
     /// D2D,免 PCIe 往返;双方偏移字节口径,长度 = 拷贝字节数)。
     /// 默认 = 不支持。

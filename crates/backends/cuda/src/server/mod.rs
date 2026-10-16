@@ -245,6 +245,7 @@ impl GpuServer {
         };
         match cmd {
             Command::BlockLedgerDump { .. } => E::new("block_ledger_dump", ""),
+            Command::MemPoolTrim { .. } => E::new("mem_pool_trim", ""),
             Command::UploadAndLaunch { dst, chunks, .. } => {
                 let n: usize = chunks.iter().map(|c| c.len_bytes).sum();
                 E::new("upload_and_launch", "h2d").bytes(n).id(dst.id)
@@ -689,6 +690,7 @@ impl GpuServer {
             Command::BlockLedgerDump { ack } => {
                 ack.send(self.ctx().block_ledger())
             }
+            Command::MemPoolTrim { ack } => ack.send(self.ctx_mut().mem_pool_trim()),
             Command::UploadAndLaunch { dst, chunks, msg, ack } => {
                 self.handle_upload_and_launch(dst, chunks, msg, ack)
             }
@@ -728,6 +730,7 @@ impl GpuServer {
             Command::AllocPinned { ack, .. } => closed!(ack),
             Command::UploadPinned { ack, .. } => closed!(ack),
             Command::BlockLedgerDump { ack } => closed!(ack),
+            Command::MemPoolTrim { ack } => closed!(ack),
             Command::UploadAndLaunch { ack, .. } => closed!(ack),
             Command::LaunchAndHarvest { ack, .. } => closed!(ack),
             Command::Dtoh { ack, .. } => closed!(ack),
@@ -749,6 +752,7 @@ impl GpuServer {
         let name = |c: &Command| match c {
             // E2 复合(分相计时标签;与 Command::kind() 同名单一真源)
             Command::BlockLedgerDump { .. } => "block_ledger_dump",
+            Command::MemPoolTrim { .. } => "mem_pool_trim",
             Command::UploadAndLaunch { .. } => "upload_and_launch",
             Command::LaunchAndHarvest { .. } => "launch_and_harvest",
             Command::GraphBegin { .. } => "GraphBegin",
@@ -787,6 +791,8 @@ impl GpuServer {
             Command::UploadPinned { ack, .. } => reject!(ack),
             // **E2 负门**:复合命令内含搬运/回读(不可捕获)⇒ 捕获期结构化拒
             Command::BlockLedgerDump { ack } => reject!(ack),
+            // 池回收 = host 侧池操作(与图捕获无关的全局动作)⇒ 捕获期拒
+            Command::MemPoolTrim { ack } => reject!(ack),
             Command::UploadAndLaunch { ack, .. } => reject!(ack),
             Command::LaunchAndHarvest { ack, .. } => reject!(ack),
             Command::Dtoh { ack, .. } => reject!(ack),
