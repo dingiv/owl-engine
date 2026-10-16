@@ -180,8 +180,11 @@ pub enum SemanticKernel {
     NaiveAttnNc,
     /// 同上 fp8kv 前缀池变体
     NaiveAttnNcFp8kv,
-    /// marlin W4A16 GEMM(三名同 runtime:AWQ 7 父 / bf16 dt / f16,driver 路由)
+    /// marlin W4A16 GEMM(四名同 runtime:AWQ 7 父 / bf16 dt / f16,driver 路由)
     MarlinW4A16,
+    /// marlin W4A8 × AWQ GEMM(int8 激活 + per-token fp32 尺度;8 父块 ——
+    /// W4A8 线,2026-10-16:层侧按档位/选层显式声明而非常见于两档)
+    MarlinW4A8Awq,
     /// FlashInfer paged prefill(f16 KV)
     FiPrefill,
     /// FlashInfer paged prefill(e4m3 KV)
@@ -277,6 +280,7 @@ impl SemanticKernel {
             SemanticKernel::NaiveAttnNc => "attn.naive_nc",
             SemanticKernel::NaiveAttnNcFp8kv => "attn.naive_nc_fp8kv",
             SemanticKernel::MarlinW4A16 => "marlin.w4a16",
+            SemanticKernel::MarlinW4A8Awq => "marlin.w4a8_awq",
             SemanticKernel::FiPrefill => "attn.fi_prefill",
             SemanticKernel::FiPrefillFp8kv => "attn.fi_prefill_fp8kv",
             SemanticKernel::XqaVerify => "attn.xqa_verify",
@@ -642,6 +646,7 @@ pub(crate) fn foreign_sig(name: &str) -> Option<&'static str> {
         x if x == owl_kernels::family::gdn_scalar::GDN_SCALAR_FWD => Some(owl_kernels::client::gdn_scalar::SIG),
         x if x == owl_kernels::family::marlin::GEMM_W4A16 => Some(owl_kernels::client::marlin::SIG),
         x if x == owl_kernels::family::marlin::GEMM_W4A16_AWQ => Some(owl_kernels::client::marlin::SIG_AWQ),
+        x if x == owl_kernels::family::marlin::GEMM_W4A8_AWQ => Some(owl_kernels::client::marlin::SIG_W4A8),
         x if x == owl_kernels::family::marlin::GEMM_W4A16_BF16 => Some(owl_kernels::client::marlin::SIG),
         x if x == owl_kernels::family::flashinfer::PREFILL_FI => Some(owl_kernels::client::fi_sig::SIG),
         x if x == owl_kernels::family::flashinfer::PREFILL_FI_FP8KV => Some(owl_kernels::client::fi_sig::SIG),
@@ -720,6 +725,37 @@ mod foreign_call_lock {
             );
             assert!(foreign_sig(pick.name).is_some(), "driver 拾取名必须有家族 sig");
         }
+    }
+
+    /// **W4A8×AWQ 臂的选择面四点同票**(2026-10-16 C④-3):词表
+    /// (`SemanticKernel::MarlinW4A8Awq`)→ driver 拾取名 → 家族线格式 sig →
+    /// 准入声明(建表)。层侧 S2 接线前先把这四点锁住 —— 任一环缺失
+    /// (加票不加臂/加臂不加 sig/加名不上册)这里就红。
+    #[test]
+    fn w4a8_awq_selection_face_is_wired() {
+        let pick = owl_kernels::driver::resolve(OpReq {
+            op: SemanticKernel::MarlinW4A8Awq.op_id(),
+            env: &env(),
+            dt: owl_kernels::driver::DType::F16,
+            shapes: &[],
+            aux: &[],
+            scalars: &[],
+        });
+        assert_eq!(pick.name, owl_kernels::family::marlin::GEMM_W4A8_AWQ);
+        assert_eq!(
+            (pick.shape.grid, pick.shape.block, pick.shape.smem),
+            ((0, 0, 0), (0, 0, 0), 0),
+            "foreign 臂发射配置应直通"
+        );
+        assert_eq!(
+            foreign_sig(pick.name),
+            Some(owl_kernels::client::marlin::SIG_W4A8),
+            "拾取名必须能查到家族线格式 sig(8 Block + 4 sz)"
+        );
+        assert!(
+            pick.meta().is_some(),
+            "W4A8 臂必须有准入声明(`ops::marlin::W4A8_AWQ` 在建表里)"
+        );
     }
 
     #[test]

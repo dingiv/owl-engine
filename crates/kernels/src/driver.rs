@@ -278,6 +278,7 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "attn.naive_nc" => attn::naive_nc(dt, false, req.shapes, req.scalars),
         "attn.naive_nc_fp8kv" => attn::naive_nc(dt, true, req.shapes, req.scalars),
         "marlin.w4a16" => marlin::w4a16(req.shapes, dt),
+        "marlin.w4a8_awq" => marlin::w4a8_awq(),
         "attn.fi_prefill" => attn::fi_prefill(false),
         "attn.fi_prefill_fp8kv" => attn::fi_prefill(true),
         "attn.xqa_verify" => attn::xqa_verify(),
@@ -1713,7 +1714,7 @@ mod tests {
 pub mod marlin {
     use super::{DType, KernelPick, FOREIGN};
 
-    /// W4A16 GEMM(三名同 runtime;shapes.len = **父数(out 不算)**:
+    /// W4A16 GEMM(四名同 runtime;shapes.len = **父数(out 不算)**:
     /// AWQ 6 父(xs,qw,sc,zs,ws,c_tmp)/ f16·bf16 5 父;bf16 由 dt 路由)
     pub fn w4a16(shapes: &[Vec<usize>], dt: DType) -> KernelPick {
         let name = if shapes.len() == 6 {
@@ -1724,5 +1725,17 @@ pub mod marlin {
             crate::family::marlin::GEMM_W4A16
         };
         KernelPick { name, shape: FOREIGN }
+    }
+
+    /// W4A8 × AWQ GEMM(int8 激活 × kU4 零偏;W4A8 线 2026-10-16)。
+    ///
+    /// 与 [`w4a16`] 的区别**不在 dtype/父数**而在**语义**(激活已量化 +
+    /// per-token 尺度)⇒ 由层侧显式声明新动作(`marlin.w4a8_awq`),
+    /// 不在此按形状猜(猜测 = 两臂静默互换面)。
+    pub fn w4a8_awq() -> KernelPick {
+        KernelPick {
+            name: crate::family::marlin::GEMM_W4A8_AWQ,
+            shape: FOREIGN,
+        }
     }
 }
