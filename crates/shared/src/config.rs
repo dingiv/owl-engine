@@ -36,7 +36,8 @@
 //! | model | awq27b_dir | Option<String> / None(27B AWQ 检查点门控) |
 //! | model | dflash2_dir | Option<String>(⚠️ W4A16 量化家族 syvai 系;
 //! |   |   | BF16 源(z-lab)喂引擎 = 草稿全噪声 AL=0,装载期嗅探拒启) |
-//! | model | w4a8 | bool / false(S2;W4A8 档位 —— 权重 a8 布局 + int8 激活) |
+//! | model | quant | QuantScheme 枚举("w4a16"\|"w4a8")/ w4a16(主干量化方案;|
+//! |   |   | W4A8 = 权重 a8 布局 + per-token int8 激活 + kS8×kU4 GEMM) |
 //! | model | head_quant | HeadQuant 枚举("off"\|"rtn-int4-g32")/ off(C1;|
 //! |   |   | 竖式/gate 质量门后转正) |
 //! | pool | pool_tokens | Option<usize> / None(=2×单会话) |
@@ -135,6 +136,31 @@ pub enum HeadQuant {
     // RtnInt8G128(中间档)——加值时同步 loader 映射与质量门台账
 }
 
+/// **主干量化方案**(model.quant;2026-10-17 由 `w4a8: bool` 升格 ——
+/// 量化方案是一等配置面,同 [`HeadQuant`] 先例)。
+///
+/// 命名 = 行业记法 `W{权重精度}A{激活精度}`:**W4A16 = weight-only
+/// quantization(WOQ)**,**W4A8 = weight-and-activation quantization**
+/// (激活侧也量化)。完整方案 = WxAy × 粒度 × 算法 × 动静态,本键只承载
+/// **主干层**这一维(head_quant / 草稿 / mtp 各自独立 plan)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+pub enum QuantScheme {
+    /// W4A16 × AWQ g32-asym(权重 4bit + zp,激活 f16)= **今天行为**
+    #[serde(rename = "w4a16")]
+    #[default]
+    W4a16,
+    /// W4A8 × AWQ 同源权重(权重 = a8 布局三件套;激活 per-token int8 +
+    /// `marlin_gemm_w4a8_awq`(kS8×kU4,int8 张量核))。
+    /// 实测(单卡 3090 Ti @32k):prefill +48~50% / TTFT −33% / decode 不变;
+    /// 代价 = 装载 +14.5s(a8 重物化,设备重排核待补)+ **质量门 S3 待过**
+    /// (非逐字同 —— int8 激活有损)。施工/门/回滚见
+    /// `docs/arch/W4A8-算子家族-设计与施工.md`。
+    #[serde(rename = "w4a8")]
+    W4a8,
+    // 预留:W8A8 / W8A16 / W4A4 —— 加值时同步 loader 映射
+    // (engine::quant_plan_of)与质量门台账。
+}
+
 /// 图实例化旗标(cuda.graph_flags;原裸 u64 魔数 2/4 收口为结构化位面)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -197,11 +223,10 @@ pub struct ModelCfg {
     /// C1(2026-10-11):untied lm_head 头部量化方案(枚举严格;映射点
     /// 在 engine loader:HeadQuant → QuantPlan)。质量门台账见枚举值注。
     pub head_quant: HeadQuant,
-    /// **W4A8 档位**(S2;2026-10-17;默认 off = 今天行为):开 = 权重 a8 布局
-    /// 三件套 + 激活 per-token int8 + kS8×kU4 GEMM(int8 张量核;prefill 2.29×,
-    /// decode 不变)。**只作用于主干层** —— lm_head / 草稿 / mtp 各自独立
-    /// plan(选层排除在本仓是结构性的,不需要名字正则)。
-    pub w4a8: bool,
+    /// **主干量化方案**(量化方案 = 配置枚举,loader 零硬编码;映射点 =
+    /// `engine::quant_plan_of`)。**只作用于主干层** —— lm_head / 草稿 /
+    /// mtp 各自独立 plan(选层排除在本仓是结构性的,不需要名字正则)。
+    pub quant: QuantScheme,
 }
 
 /// 池几何与显存预算(engine StatePool)
@@ -759,6 +784,26 @@ fn merge(base: &mut toml::Value, over: toml::Value) {
     }
 }
 
+/// **退役键迁移门**(2026-10-17):键**改名**不是“静默忽略”,而是响亮拒绝 +
+/// 当面指明新键。`deny_unknown_fields` 本就会拒(unknown field),这里追加的
+/// 是**可操作**的那一半(点名新键 + 值域)—— 使用者不必去翻旧分支。
+///
+/// 新增退役键 = 在表里加一行(`旧写法 → 新写法`)。
+fn reject_retired_keys(v: &toml::Value) -> Result<(), String> {
+    /// (module, 退役键, 迁移指引)
+    const RETIRED: &[(&str, &str, &str)] = &[(
+        "model",
+        "w4a8",
+        "W4A8 档位已从 bool 升格为量化方案枚举 —— 改用 `[model] quant = \"w4a8\"`(值域:\"w4a16\"|\"w4a8\";缺省 \"w4a16\")",
+    )];
+    for (module, key, hint) in RETIRED {
+        if v.get(*module).and_then(|m| m.get(*key)).is_some() {
+            return Err(format!("[{module}] {key} 退役键:{hint}"));
+        }
+    }
+    Ok(())
+}
+
 impl OwlConfig {
     /// **统一 loader**(Default → 基准文件(预设档/任意配置) → 覆盖文件;
     /// CLI 由入口决定前两者的取值)。`deny_unknown_fields` 在最终反序列化生效 ——
@@ -779,13 +824,45 @@ impl OwlConfig {
                 .map_err(|e| format!("配置文件 {} 解析失败: {e}", p.display()))?;
             merge(&mut v, fv);
         }
+        reject_retired_keys(&v)?;
         v.try_into()
             .map_err(|e| format!("配置反序列化失败(账外键或非法枚举值): {e}"))
+            .and_then(|c: Self| {
+                c.validate()?;
+                Ok(c)
+            })
     }
 
-    /// TOML 字符串直载(测试/ops 便捷;与 load 同一反序列化面)
+    /// TOML 字符串直载(测试/ops 便捷;与 load 同一反序列化面 + 同一语义门)
     pub fn from_toml_str(s: &str) -> Result<Self, String> {
-        toml::from_str(s).map_err(|e| format!("配置解析失败(账外键或非法枚举值): {e}"))
+        let v: toml::Value =
+            toml::from_str(s).map_err(|e| format!("配置解析失败(账外键或非法枚举值): {e}"))?;
+        reject_retired_keys(&v)?;
+        let c: Self = v
+            .try_into()
+            .map_err(|e| format!("配置反序列化失败(账外键或非法枚举值): {e}"))?;
+        c.validate()?;
+        Ok(c)
+    }
+
+    /// **跨字段语义门**(D1,2026-10-17):反序列化只能保证**形状**(账外键 /
+    /// 枚举合法),字段之间的**语义**在这里拒 —— 三处入口(server / cli /
+    /// 配置档)同守,不再各自写一份。
+    ///
+    /// 规则①`pool.gdn_slots ≥ server.max_concurrency`:GDN 状态格 = 每并发会话
+    /// 一格;并发超格数 ⇒ 第 N+1 会话把**活跃**会话的状态格 LRU 逐出 =
+    /// 跨会话状态污染(不是“排队等待”那种良性降级)。
+    /// 原写法在 `apps/server/src/main.rs`(server 要读引擎内部容量、直接
+    /// `exit(1)`),且**只有 server 一条入口守** —— 直接构造 engine 的路径
+    /// (tests / cli)裸奔。
+    pub fn validate(&self) -> Result<(), String> {
+        if self.pool.gdn_slots < self.server.max_concurrency {
+            return Err(format!(
+                "[pool] gdn_slots({}) < [server] max_concurrency({})—— GDN 状态格 = 每并发会话一格,\n              并发超格数会把活跃会话的状态格 LRU 逐出(跨会话状态污染);请调 gdn_slots ≥ max_concurrency",
+                self.pool.gdn_slots, self.server.max_concurrency
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -843,10 +920,52 @@ mod tests {
         assert!(OwlConfig::from_toml_str("[no such module]\nx = 1").is_err());
     }
 
+    /// **主干量化方案**(2026-10-17 由 `w4a8: bool` 升格):缺省 = w4a16
+    /// (今天行为);合法值两档;非法值**结构化拒**;**退役键 `w4a8` 响亮拒**
+    /// —— 拒语要点名新键与值域(可行动,不是一律 unknown field)。
+    #[test]
+    fn quant_scheme_枚举与退役键门() {
+        assert_eq!(OwlConfig::default().model.quant, QuantScheme::W4a16);
+        let c = OwlConfig::from_toml_str("[model]\nquant = \"w4a8\"").expect("a8 档");
+        assert_eq!(c.model.quant, QuantScheme::W4a8);
+        let c = OwlConfig::from_toml_str("[model]\nquant = \"w4a16\"").expect("a16 档");
+        assert_eq!(c.model.quant, QuantScheme::W4a16);
+        let e = OwlConfig::from_toml_str("[model]\nquant = \"w4a9\"").expect_err("非法档拒");
+        assert!(e.contains("w4a9"), "拒语应带现场: {e}");
+        for old in ["[model]\nw4a8 = true", "[model]\nw4a8 = false"] {
+            let e = OwlConfig::from_toml_str(old).expect_err("退役键必须拒(开/关同罪)");
+            assert!(
+                e.contains("退役键") && e.contains("quant = \"w4a8\""),
+                "拒语应点名新键: {e}"
+            );
+        }
+    }
+
+    /// **跨字段语义门**(D1,2026-10-17):`gdn_slots < max_concurrency` 必拒,
+    /// 拒语要点出病因(状态格逐出 = 跨会话污染)与调法;合规组合(生产档 1/1、
+    /// 缺省 8/8)必须过。
+    #[test]
+    fn validate_rejects_concurrency_over_gdn_slots() {
+        let e = OwlConfig::from_toml_str("[pool]\ngdn_slots = 1\n[server]\nmax_concurrency = 8\n")
+            .expect_err("1 格 vs 8 并发必须拒");
+        assert!(
+            e.contains("gdn_slots") && e.contains("跨会话状态污染"),
+            "拒语应可行动: {e}"
+        );
+        OwlConfig::from_toml_str("[pool]\ngdn_slots = 1\n[server]\nmax_concurrency = 1\n")
+            .expect("相等 = 合规(生产 spec-dflash 档即此)");
+        OwlConfig::from_toml_str("[pool]\ngdn_slots = 8\n[server]\nmax_concurrency = 2\n")
+            .expect("格多于并发 = 合规");
+        OwlConfig::default().validate().expect("缺省档 8/8");
+    }
+
     #[test]
     fn 正语义分派与合法文件() {
+        // 注:`max_concurrency = 1` 是 **D1 语义门**(2026-10-17)要求的 ——
+        // 本 fixture 原为 `gdn_slots = 1` + 缺省 `max_concurrency = 8`,
+        // 那是“能反序列化但语义非法”的组合(server 侧原先会在 boot 拒启)。
         let c = OwlConfig::from_toml_str(
-            "[dispatch]\nqkv_fuse = false\ngdn_fused_decode_v2 = false\n[pool]\ngdn_slots = 1\n",
+            "[dispatch]\nqkv_fuse = false\ngdn_fused_decode_v2 = false\n[pool]\ngdn_slots = 1\n[server]\nmax_concurrency = 1\n",
         )
         .expect("合法文件应通过");
         assert!(!c.dispatch.qkv_fuse);
