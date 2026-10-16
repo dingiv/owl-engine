@@ -229,17 +229,37 @@ pub fn pack_marlin_b_a8(q: &[u8], k: usize, n: usize) -> Vec<i32> {
 /// (2.78M 元素 7.5ms/键 × 352 键 = 2.6s)。分解与形状 (out,groups) 无关,
 /// 每形状一次即可(装载域按形状缓存;整载只 6 种形状)。
 pub fn marlin_scales_index(out: usize, groups: usize) -> Vec<u32> {
-    use rayon::prelude::*;
     let sp = marlin_scale_perm();
     assert_eq!(sp.len(), 64);
     assert!(groups * out > 0, "scales 形状非空");
+    marlin_scales_index_impl(out, groups, &sp, sp.len())
+}
+
+/// a8 scales 源索引表([`marlin_scales_index`] 的 a8 版):perm 表换成
+/// **32 元素 `scale_perm_single`**(W4A8 的 scale 布局按 8-bit 权重档走,
+/// 见 [`marlin_scale_perm_single`])。语义与 a16 版同构 ——
+/// `idx[i]` = 输出展平下标 `i`(=(groups,out) 行主)在**源**(=(out,groups)
+/// 行主)中的下标,即“转置 + 32-chunk perm”的等价 gather。
+///
+/// 装载热路与 a16 同纪律:表按形状缓存一次,每元素零除法。
+pub fn marlin_scales_index_a8(out: usize, groups: usize) -> Vec<u32> {
+    let sp = marlin_scale_perm_single();
+    assert_eq!(sp.len(), 32);
+    assert!(groups * out > 0, "a8 scales 形状非空");
+    marlin_scales_index_impl(out, groups, &sp, sp.len())
+}
+
+/// 索引表共用骨架(`chunk` = perm 表长度:64 = a16 / 32 = a8)
+fn marlin_scales_index_impl(out: usize, groups: usize, sp: &[usize], chunk: usize) -> Vec<u32> {
+    use rayon::prelude::*;
+    assert!(groups * out % chunk == 0, "scales 展平长度须为 perm 块整数倍");
     let mut idx = vec![0u32; groups * out];
     idx.par_chunks_mut(out)
         .enumerate()
         .for_each(|(gi, row)| {
             for (o, cell) in row.iter_mut().enumerate() {
                 let i = gi * out + o;
-                let src_idx = (i / 64) * 64 + sp[i % 64];
+                let src_idx = (i / chunk) * chunk + sp[i % chunk];
                 let (sg, so) = (src_idx / out, src_idx % out);
                 *cell = (so * groups + sg) as u32;
             }
@@ -864,6 +884,37 @@ pub fn pack_marlin_b_gather_into(
 
 #[cfg(test)]
 mod tests_fused_s {
+    /// a8 scales 源索引表**逐位对拍**(冻结参考 = `pack_marlin_s_a8` 的
+    /// 转置 + 32-chunk perm_single + int16 归一)**。
+    ///
+    /// 新链 = `marlin_scales_index_a8` 索引表 + 同一算术的 gather
+    /// (装载热路;2026-10-17)。两者必须字节同 —— 索引表算错一个源下标
+    /// 就是静默错值。
+    #[test]
+    fn marlin_scales_index_a8_matches_packer() {
+        use super::*;
+        // 形状含生产形状(17408×160 / 16384×160 / 5120×192)与小形状
+        for (out, groups) in [(64usize, 2usize), (256, 1), (5120, 192), (16384, 160), (17408, 160)] {
+            let scales: Vec<f32> = (0..out * groups)
+                .map(|i| 0.001 + ((i % 977) as f32) * 1e-5)
+                .collect();
+            let (bits_ref, factor_ref) = pack_marlin_s_a8(&scales, out, groups);
+            let max = scales.iter().cloned().fold(0f32, f32::max);
+            assert_eq!(factor_ref, max / 4096.0, "out={out} 因子 = max/4096");
+            let idx = marlin_scales_index_a8(out, groups);
+            assert_eq!(idx.len(), out * groups);
+            let mut bad = 0usize;
+            for (i, &src) in idx.iter().enumerate() {
+                let q = (scales[src as usize] / max * 4096.0).round();
+                let want = (q as i64).clamp(0, i16::MAX as i64) as i16 as u16;
+                if want != bits_ref[i] {
+                    bad += 1;
+                }
+            }
+            assert_eq!(bad, 0, "(out={out}, groups={groups}) 索引表与冻结参考逐位不一致 {bad} 处");
+        }
+    }
+
     /// pack_marlin_s(rayon 融合版)与 pack_marlin_s_f32(串行参照)逐位对拍
     #[test]
     fn pack_marlin_s_matches_serial_ref() {

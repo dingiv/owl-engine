@@ -21,7 +21,7 @@ impl KernelSpec for FiPrefillFp8kv {
     const PARAMS: &'static [Param] = &[
         Param::t_in("q", Dtype::F16, 2),
         // fp8 主池句柄:引擎叶子口径 = U32 扁平字节账(与 XQA 同律;
-        // 池的 e4m3 字节语义由 `POOL` 的 `Dtype::U8` 承担)
+        // 池的 e4m3 字节语义由 `POOL` 的 `Dtype::F8E4M3` 承担)
         Param::t_in("k_cache", Dtype::U32, 1),
         Param::t_in("v_cache", Dtype::U32, 1),
         // FI plan 的 host 侧索引表(设备块承载;dtype 由 adapter 定义)
@@ -49,10 +49,10 @@ impl KernelSpec for FiPrefillFp8kv {
         &[crate::spec::PoolAccess::read(
             crate::spec::pools::KV_MAIN,
             crate::spec::LayoutTag::Knhd,
-            Dtype::U8,
+            Dtype::F8E4M3,
         )];
     const SHAPE: ShapeFamily = ShapeFamily {
-        kv_dtype: Some(Dtype::U8),
+        kv_dtype: Some(Dtype::F8E4M3),
         head_dim: &[256],
         page: &[16, 32, 64, 128],
         grp: None,

@@ -276,7 +276,7 @@ impl W4A16Source {
         let buf: Arc<[u8]> = if scales_side {
             let s = pack_marlin_s(&scales, out, k_blk / 128);
             // BF16 激活 marlin 要求 s_type = BF16:f16 位型字节 → bf16 位型
-            Arc::from(f16_bytes_to_bf16_bytes(&u16s_le_bytes(&s)).into_boxed_slice())
+            Arc::from(u16s_le_bytes(&s).into_boxed_slice())
         } else {
             let mut q_buf: Vec<u8> = Vec::new();
             unpack_nibbles_into(&packed, out, k_blk, &mut q_buf);
@@ -367,7 +367,7 @@ impl W4A16Source {
             inserts.push((
                 format!("{base}.scales"),
                 // BF16 激活 marlin:s_type = BF16(位型转换,见 f16_bytes_to_bf16_bytes)
-                Arc::from(f16_bytes_to_bf16_bytes(&u16s_le_bytes(&s)).into_boxed_slice()),
+                Arc::from(u16s_le_bytes(&s).into_boxed_slice()),
                 s.len() * 2,
             ));
         } else if marlin_eligible(out, k) {
@@ -392,7 +392,7 @@ impl W4A16Source {
             inserts.push((
                 format!("{base}.scales"),
                 // BF16 激活 marlin:s_type = BF16(位型转换,见 f16_bytes_to_bf16_bytes)
-                Arc::from(f16_bytes_to_bf16_bytes(&u16s_le_bytes(&s)).into_boxed_slice()),
+                Arc::from(u16s_le_bytes(&s).into_boxed_slice()),
                 s.len() * 2,
             ));
         } else {
@@ -441,6 +441,11 @@ impl W4A16Source {
             Resolved::Bytes(b, dt) => (KeyData::Shared(b), dt),
         })
     }
+}
+
+/// `len × esz` 的检查乘法(溢出/越界 ⇒ None,调用方收割为缺键)
+fn checked_len(len: usize, esz: usize) -> Option<usize> {
+    len.checked_mul(esz)
 }
 
 enum KeyData {
@@ -617,11 +622,24 @@ impl WeightSource for W4A16Source {
                 Some(())
             }
             Resolved::Bytes(b, reg) => {
-                if reg != dtype {
-                    return None;
+                let src_esz = reg.size_bytes();
+                let s = offset_elems * src_esz;
+                let win = b.get(s..s + checked_len(len, src_esz)?)?;
+                if reg == dtype {
+                    // 声明一致 ⇒ 逐字节直拷(零转换)
+                    dst[..need].copy_from_slice(win);
+                    return Some(());
                 }
-                let s = offset_elems * esz;
-                dst[..need].copy_from_slice(b.get(s..s + need)?);
+                // **声明=事实**下的显式转换(2026-10-16 定谳):F16 ↔ BF16
+                // (同为 2B 值域;由调用方按 want 的声明 dtype 决定方向)。
+                // 其余组合(含跨宽度)不支持 ⇒ 响亮拒(绝不静默直拷/截断)。
+                match (reg, dtype) {
+                    (Dtype::F16, Dtype::BF16) => {
+                        dst[..need].copy_from_slice(&f16_bytes_to_bf16_bytes(win))
+                    }
+                    (Dtype::BF16, Dtype::F16) => bf16_bytes_to_f16_bytes(win, &mut dst[..need]),
+                    _ => return None,
+                }
                 Some(())
             }
         }
@@ -738,4 +756,133 @@ fn fc_block_index(base: &str) -> Option<usize> {
     }
     let i = idx.parse::<usize>().ok()?;
     (i < 5).then_some(i)
+}
+
+// ============================================================================
+// 门:派生键 × 权威键 数值对账(**F16/BF16 内容面**;2026-10-16 立)
+// ============================================================================
+//
+// 背景(整类问题的机器判据):派生键的**字节内容**可以与线格式声明不同 ——
+// 现状:`fc_i.scales` 线格式声明 **F16**(与算子表一致,给 L3 校验的是它),
+// 而字节内容其实是 **BF16 位型**(见 `fc_block_bytes` 的三处
+// `f16_bytes_to_bf16_bytes`)。而"内容 dtype"在当前契约里**没有字段**,
+// 于是任何按声明解字节的读者都会静默拿到 ~15× 错值。
+//
+// 为什么不能用"往返定点"当判据:f16 解码 ↔ 编码是**双射**,
+// 声明错了也照样往返成功 ⇒ 必须用"**两条独立来路数值一致**"。
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn draft_dir() -> Option<std::path::PathBuf> {
+        owl_shared::env_reader::str("OWL_DFLASH2_DIR").map(std::path::PathBuf::from)
+    }
+
+    /// 派生 fc 列块 ↔ fused 权威:①尺度(内容口径 BF16)②marlin B(逐字)。
+    ///
+    /// 缺失检查点即 skip(与仓内其他 fixture 档同律;本门**不需要 GPU**)。
+    #[test]
+    fn fc_derived_keys_match_fused_authority() {
+        let Some(dir) = draft_dir() else {
+            eprintln!("skip: OWL_DFLASH2_DIR 未设");
+            return;
+        };
+        let src = W4A16Source::open_dir(&dir).expect("打开草稿目录");
+
+        // ---- 权威面:fused 键(声明与内容一致:packed=I32 字、scale=F16)----
+        // 注:这两把键走不了 `key_bytes`(I32 不在元素通道的 dtype 表里)⇒ 直读 owner 面。
+        let pe = src.index.get("fc.weight_packed").expect("fused packed 索引");
+        let pk = i32s_par(&src.maps[pe.map_ix][pe.start..pe.start + pe.nbytes]);
+        let se = src.index.get("fc.weight_scale").expect("fused scale 索引");
+        assert_eq!(se.dtype, safetensors::Dtype::F16, "fused 尺度声明 F16(内容亦 F16)");
+        let fused_s = scales_par(se.dtype, &src.maps[se.map_ix][se.start..se.start + se.nbytes]);
+
+        const OUT: usize = 5120;
+        const N_FC: usize = 5;
+        const COLS_ALL: usize = 3200; // k_all/8 = 25600/8
+        const SC_ALL: usize = 200; // k_all/g = 25600/128
+        let cols = COLS_ALL / N_FC; // 640
+        let scol = SC_ALL / N_FC; // 40
+        let k_blk = cols * 8; // 5120
+
+        for blk in 0..N_FC {
+            // ---- ① 尺度:派生(按**内容口径 BF16** 解)== fused 列块(按 F16 解)----
+            let skey = format!("fc_{blk}.scales");
+            let (sb, sdt) = src.key_bytes(&skey).expect("派生尺度");
+            assert_eq!(sdt, Dtype::F16, "{skey}: 线格式声明必须保持 F16(算子表口径)");
+            // 派生尺度 = **f16 位型的 marlin S**(声明 F16 ⇒ 事实 F16;bf16 臂的转换在装载侧)
+            let got = f16_par(sb.as_slice());
+            assert_eq!(got.len(), OUT * scol, "{skey}: 元素数");
+            let idx = owl_kernels::family::marlin::repack::marlin_scales_index(OUT, scol);
+            for pos in [0usize, 1, 63, 64, 127, 4096, OUT * scol - 1] {
+                let s = idx[pos] as usize;
+                let (so, sg) = (s / scol, s % scol);
+                let want = fused_s[so * SC_ALL + blk * scol + sg];
+                let g = got[pos];
+                let rel = (g - want).abs() / want.abs().max(1e-9);
+                assert!(
+                    rel < 5e-3,
+                    "{skey}[pos {pos} → (r{so},g{sg})]: 派生 {g:.6} vs 权威 {want:.6}(rel {rel:.4})"
+                );
+            }
+
+            // ---- ② marlin B:派生 == 由 fused 列块现算(逐字)----
+            let qkey = format!("fc_{blk}.qweight");
+            let (qb, qdt) = src.key_bytes(&qkey).expect("派生 qweight");
+            assert_eq!(qdt, Dtype::U32, "{qkey}: B 以 U32 承载");
+            let derived = i32s_par(qb.as_slice());
+            // fused 列块(行主序 [out, cols])→ 解包 → marlin B 期望值
+            let mut block = vec![0i32; OUT * cols];
+            for r in 0..OUT {
+                block[r * cols..(r + 1) * cols].copy_from_slice(
+                    &pk[r * COLS_ALL + blk * cols..r * COLS_ALL + (blk + 1) * cols],
+                );
+            }
+            let mut nib = Vec::new();
+            owl_kernels::family::marlin::repack::unpack_nibbles_into(&block, OUT, k_blk, &mut nib);
+            let gidx = owl_kernels::family::marlin::repack::marlin_gather_indices(k_blk, OUT);
+            let mut want_b: Vec<i32> = Vec::new();
+            owl_kernels::family::marlin::repack::pack_marlin_b_gather_into(
+                &nib,
+                &gidx,
+                OUT * k_blk / 8,
+                &mut want_b,
+            );
+            assert_eq!(derived.len(), want_b.len(), "{qkey}: 字数");
+            let bad = derived.iter().zip(&want_b).filter(|(a, b)| a != b).count();
+            assert_eq!(
+                bad, 0,
+                "{qkey}: 派生 B 与 fused 现算不一致({bad}/{} 字)—— 派生链路(重排/切块/打包)有罪",
+                want_b.len()
+            );
+
+            // ---- ③ 设备重排臂的**输入** `fc_i.packed_raw` == fused 列块**逐字** ----
+            // (设备路线的 B 由 GPU CtRepack 现产;若它的输入切块错了,CPU 路线的绿
+            //  并不能替它背书 —— 2026-10-16 补:这条正是 16.6× 的剩余嫌疑面)
+            let rkey = format!("fc_{blk}.packed_raw");
+            let (rb, rdt) = src.key_bytes(&rkey).expect("派生 packed_raw");
+            assert_eq!(rdt, Dtype::U32, "{rkey}: 原始 ct 字以 U32 承载");
+            let raw = i32s_par(rb.as_slice());
+            let want_raw: Vec<i32> = (0..OUT)
+                .flat_map(|r| pk[r * COLS_ALL + blk * cols..r * COLS_ALL + (blk + 1) * cols].to_vec())
+                .collect();
+            assert_eq!(raw.len(), want_raw.len(), "{rkey}: 字数");
+
+            // ---- ④ **两条 B 打包路必须等价**(2026-10-16 补;纯 CPU) ----
+            // 核的正确性由 parity 档用 `pack_marlin_b`(plain)证明;而本仓装载/派生
+            // 走的是 `pack_marlin_b_gather_into`(gather)。两者若不等价,
+            // "派生 == gather 现算" 就只是自证 —— 必须直接对拍。
+            let plain = owl_kernels::family::marlin::repack::pack_marlin_b(&nib, k_blk, OUT);
+            let mism = plain.iter().zip(&want_b).filter(|(a, b)| a != b).count();
+            assert_eq!(
+                mism, 0,
+                "块{blk}: pack_marlin_b(plain, 核的证明口径)与 pack_marlin_b_gather_into(gather, 装载口径)不等价({mism}/{} 字)",
+                plain.len()
+            );
+        }
+        eprintln!(
+            "[fc-derive] 5 块 × (尺度内容口径 BF16 对账 + marlin B 逐字)全绿(目录 {})",
+            dir.display()
+        );
+    }
 }

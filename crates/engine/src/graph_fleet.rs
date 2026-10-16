@@ -255,6 +255,29 @@ impl<D: DeviceClient> GraphFleet<D> {
                 mb(total),
                 owl_shared::vram::live_bytes() >> 20,
             );
+            // **预算对账**(B1,2026-10-17):预算里的图项是个**校准常数**
+            // (`GRAPH_SLAB_BUDGET`,取自 spec-dflash 档实测),而池上限在**捕获之前**
+            // 就已按它定死 ⇒ 图族/臂换代后若实测变大,池上限就会偏大(请求级 OOM
+            // 的典型形状)。此处把实测 Σ 与预算项摆在一起:超了打 ⚠️。
+            let budget = crate::state::GRAPH_SLAB_BUDGET;
+            let mbf = |v: usize| v as f64 / 1048576.0;
+            if total > budget {
+                owl_shared::log_warn!(
+                    "boot",
+                    "⚠️ 图 slab 预算对账:实测 {:.1}MiB > 预算假设 {}MiB(+{:.1}MiB,图族/臂换代后预算偏小)⇒ 池上限可能偏大(请求级 OOM 风险):把 GRAPH_SLAB_BUDGET 校准为新实测值(engine/src/state.rs),或下调 pool_tokens",
+                    mbf(total),
+                    mb(budget),
+                    mbf(total - budget),
+                );
+            } else {
+                owl_shared::log_info!(
+                    "boot",
+                    "图 slab 预算对账:实测 {:.1}MiB ≤ 预算假设 {}MiB(余量 {:.1}MiB ✓)",
+                    mbf(total),
+                    mb(budget),
+                    mbf(budget - total),
+                );
+            }
         }
         Ok(Self {
             session,

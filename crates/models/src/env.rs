@@ -32,13 +32,66 @@ pub enum HwEnv {
 }
 
 /// KV 量化(REQ-CTX-03;None = f16 与 Q/Out 同精度)
+///
+/// **FP8 的两种格式并列**(2026-10-16):e4m3 与 e5m2 是**两个格式**,
+/// 不许糊成一个"FP8";`dtype()` 是"配置 → 类型"的**单一映射**(禁 bool 传格式)。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum KvQuant {
     /// f16(默认;与对照口径一致)
     #[default]
     None,
-    /// e4m3(FI 软件路径;池/影子 ×0.5;scale 隐式 1.0)
+    /// **e4m3**(FI 软件路径;池/影子 ×0.5;scale 隐式 1.0)
     Fp8E4M3,
+    /// **e5m2**(范围更大、精度更低;与 e4m3 并列的另一种 fp8 ——
+    /// 暂无核臂(选了会在臂选择处**响亮拒**),先让类型体系能表达)
+    Fp8E5M2,
+}
+
+#[cfg(test)]
+mod kvquant_tests {
+    use super::*;
+
+    /// **配置 → 类型 的单一映射门**(2026-10-16):FP8 的两种格式**并列**,
+    /// 且字节数由枚举自己给 —— 禁"用 bool 传格式"(那正是 F16/BF16 案的翻版)。
+    #[test]
+    fn fp8_formats_are_two_and_single_sourced() {
+        use crate::contract::Dtype;
+        assert_eq!(KvQuant::None.dtype(), Dtype::F16);
+        assert_eq!(KvQuant::None.size_bytes(), 2);
+        // 两种 fp8 **并列**,不是"FP8"一个东西
+        assert_eq!(KvQuant::Fp8E4M3.dtype(), Dtype::F8E4M3);
+        assert_eq!(KvQuant::Fp8E5M2.dtype(), Dtype::F8E5M2);
+        assert_ne!(
+            KvQuant::Fp8E4M3.dtype(),
+            KvQuant::Fp8E5M2.dtype(),
+            "e4m3 与 e5m2 必须是两个 dtype"
+        );
+        for q in [KvQuant::Fp8E4M3, KvQuant::Fp8E5M2] {
+            assert_eq!(q.size_bytes(), 1, "fp8 一律 1B/elem");
+        }
+        // 与 int8 不同族(不同 dtype)
+        assert_ne!(Dtype::F8E4M3, Dtype::I8);
+        assert_eq!(Dtype::I8.size_bytes(), 1);
+    }
+}
+
+impl KvQuant {
+    /// 配置 → **存储/声明 dtype**(单一映射;字节算术、池声明、臂选择都取自这里)
+    pub fn dtype(self) -> crate::contract::Dtype {
+        use crate::contract::Dtype;
+        match self {
+            KvQuant::None => Dtype::F16,
+            KvQuant::Fp8E4M3 => Dtype::F8E4M3,
+            // 类型映射**必须**能表达两种 fp8(拒的是"核臂"那一层:见
+            // state.rs 的启动门与 KvEnv 的读者选择子)
+            KvQuant::Fp8E5M2 => Dtype::F8E5M2,
+        }
+    }
+
+    /// 每元素字节(1B = fp8 两族;2B = f16)
+    pub fn size_bytes(self) -> usize {
+        self.dtype().size_bytes()
+    }
 }
 
 /// KV 缓存策略(量化 × 布局几何;原 `kv_paged_policy` 键表收编)。
@@ -102,6 +155,8 @@ impl KvEnv {
         // 单布局(P6-A):knhd 名唯一(臂/名成对律见 kernels::list 不变量门)
         match self.quant {
             KvQuant::Fp8E4M3 => crate::ops::SemanticKernel::K0WriteFp8Knhd,
+            // e5m2 与 e4m3 并列但**暂无核臂** ⇒ 响亮拒(不静默当 e4m3 跑)
+            KvQuant::Fp8E5M2 => unimplemented!("fp8-e5m2 暂无核臂(本仓只有 e4m3)"),
             KvQuant::None => crate::ops::SemanticKernel::K0WriteKnhd,
         }
     }
@@ -111,6 +166,8 @@ impl KvEnv {
         // 单布局(P6-A):knhd 名唯一(臂/名成对律见 kernels::list 不变量门)
         match self.quant {
             KvQuant::Fp8E4M3 => crate::ops::SemanticKernel::PagedPrefillFp8Knhd,
+            // e5m2 与 e4m3 并列但**暂无核臂** ⇒ 响亮拒(不静默当 e4m3 跑)
+            KvQuant::Fp8E5M2 => unimplemented!("fp8-e5m2 暂无核臂(本仓只有 e4m3)"),
             KvQuant::None => crate::ops::SemanticKernel::PagedPrefillKnhd,
         }
     }
@@ -121,6 +178,8 @@ impl KvEnv {
         // 单布局(P6-A):knhd 名唯一(臂/名成对律见 kernels::list 不变量门)
         match self.quant {
             KvQuant::Fp8E4M3 => crate::ops::SemanticKernel::PrefillSplitFp8kvKnhd,
+            // e5m2 与 e4m3 并列但**暂无核臂** ⇒ 响亮拒(不静默当 e4m3 跑)
+            KvQuant::Fp8E5M2 => unimplemented!("fp8-e5m2 暂无核臂(本仓只有 e4m3)"),
             KvQuant::None => crate::ops::SemanticKernel::PrefillSplitKnhd,
         }
     }
@@ -130,6 +189,8 @@ impl KvEnv {
         // 单布局(P6-A):knhd 名唯一(臂/名成对律见 kernels::list 不变量门)
         match self.quant {
             KvQuant::Fp8E4M3 => crate::ops::SemanticKernel::PagedDecodeV2Fp8Knhd,
+            // e5m2 与 e4m3 并列但**暂无核臂** ⇒ 响亮拒(不静默当 e4m3 跑)
+            KvQuant::Fp8E5M2 => unimplemented!("fp8-e5m2 暂无核臂(本仓只有 e4m3)"),
             KvQuant::None => crate::ops::SemanticKernel::PagedDecodeV2Knhd,
         }
     }
@@ -139,6 +200,8 @@ impl KvEnv {
         // 单布局(P6-A):knhd 名唯一(臂/名成对律见 kernels::list 不变量门)
         match self.quant {
             KvQuant::Fp8E4M3 => crate::ops::SemanticKernel::PagedDecodeV2Fp8SeqKnhd,
+            // e5m2 与 e4m3 并列但**暂无核臂** ⇒ 响亮拒(不静默当 e4m3 跑)
+            KvQuant::Fp8E5M2 => unimplemented!("fp8-e5m2 暂无核臂(本仓只有 e4m3)"),
             KvQuant::None => crate::ops::SemanticKernel::PagedDecodeV2SeqKnhd,
         }
     }
@@ -148,6 +211,8 @@ impl KvEnv {
         // 单布局(P6-A):knhd 名唯一(臂/名成对律见 kernels::list 不变量门)
         match self.quant {
             KvQuant::Fp8E4M3 => crate::ops::SemanticKernel::QkvNormRopeInsertFp8kvKnhd,
+            // e5m2 与 e4m3 并列但**暂无核臂** ⇒ 响亮拒(不静默当 e4m3 跑)
+            KvQuant::Fp8E5M2 => unimplemented!("fp8-e5m2 暂无核臂(本仓只有 e4m3)"),
             KvQuant::None => crate::ops::SemanticKernel::QkvNormRopeInsertKnhd,
         }
     }
@@ -157,6 +222,8 @@ impl KvEnv {
     pub fn fi_prefill_name(&self) -> &'static str {
         match self.quant {
             KvQuant::Fp8E4M3 => owl_kernels::family::flashinfer::PREFILL_FI_FP8KV,
+            // e5m2 与 e4m3 并列但**暂无核臂** ⇒ 响亮拒(不静默当 e4m3 跑)
+            KvQuant::Fp8E5M2 => unimplemented!("fp8-e5m2 暂无核臂(本仓只有 e4m3)"),
             KvQuant::None => owl_kernels::family::flashinfer::PREFILL_FI,
         }
     }

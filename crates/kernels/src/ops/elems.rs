@@ -141,6 +141,13 @@ impl KernelSpec for CastBf16F16 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
+/// **首轮拼接的输入槽数**(`owl_concat_rows_{f16,f32}` = `i0..i{7}`;arity 固定)。
+///
+/// 8 = **核声明面的事实**(两张表都恰好 8 槽)–—— 调用方(engine 的“固定槽树”
+/// 把 t 行 pad 到 8 槽)与装配期门**都取本常量**,不许各写一个字面量;
+/// 改核时本处跟着改,`concat_rows_slots_lock` 拿两张表逐槽核。
+pub const CONCAT_ROWS_SLOTS: usize = 8;
+
 /// `owl_concat_rows_f16` —— 8 路行拼接(arity 8 = 固定)
 pub struct ConcatRowsF16;
 
@@ -654,7 +661,7 @@ impl KernelSpec for QuantInt8RowF16 {
         Param::t_in("mul", Dtype::F32, 1),
         // 写出槽:per-token 尺度 [rows,1](调用方备块)
         Param::t_in("scales", Dtype::F32, 2),
-        Param::t_out("q", Dtype::U8, 2),
+        Param::t_out("q", Dtype::I8, 2),
     ];
     // 出参是 int8:有限性律不适用(饱和已由 `cvt.rni.sat` 保证)—— 故 LAWS 空,
     // 靠**核内饱和 + 回读对拍**（tests/quant_int8_row_probe.rs）守门
@@ -675,7 +682,7 @@ impl KernelSpec for QuantInt8RowBf16 {
         Param::i32("cols"),
         Param::t_in("mul", Dtype::F32, 1),
         Param::t_in("scales", Dtype::F32, 2),
-        Param::t_out("q", Dtype::U8, 2),
+        Param::t_out("q", Dtype::I8, 2),
     ];
     const LAWS: &'static [Law] = &[];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -717,3 +724,31 @@ pub static METAS: &[&KernelMeta] = &[
     &QUANT_INT8_ROW_F16,
     &QUANT_INT8_ROW_BF16,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **常量 ↔ 声明面锁**(2026-10-16):`CONCAT_ROWS_SLOTS` 必须等于两张表里
+    /// `i0..i{n-1}` 的个数 —— 改核时忘改常量 = 本门红(否则 engine 的
+    /// 固定槽树会静默 pad 到错槽数)。
+    #[test]
+    fn concat_rows_slots_lock() {
+        for m in [&CONCAT_ROWS_F16, &CONCAT_ROWS_F32] {
+            let slots = m
+                .params
+                .iter()
+                .filter(|p| {
+                    p.name
+                        .strip_prefix('i')
+                        .is_some_and(|n| n.parse::<usize>().is_ok())
+                })
+                .count();
+            assert_eq!(
+                slots, CONCAT_ROWS_SLOTS,
+                "{}: 输入槽数 {slots} ≠ CONCAT_ROWS_SLOTS {CONCAT_ROWS_SLOTS}",
+                m.entry
+            );
+        }
+    }
+}

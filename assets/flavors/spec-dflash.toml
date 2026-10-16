@@ -4,6 +4,13 @@ kind = "awq27b"
 # C1(2026-10-11):lm_head int4 装载期现场 RTN(marlin kU4);质量门
 # 已过(prose/数学 A/B 逐字同,竖式同错=模型固有),数学域 159→177
 head_quant = "rtn-int4-g32"
+# 主干量化方案(与 head_quant 同类档位 —— 声明即事实;行业记法 W{权重}A{激活}):
+#   "w4a16" = 权重 4bit AWQ g32-asym(zp)+ 激活 f16 = 今天行为(生产默认)
+#   "w4a8"  = 同源权重 a8 布局 + per-token int8 激活 + kS8×kU4 GEMM(int8 张量核):
+#             单卡 3090 Ti 实测 prefill +48~50% / TTFT −33% @32k,decode 不变;
+#             代价 = 装载 +14.5s(a8 重物化,设备重排核待补)+ 质量门待过 S3(非逐字同)
+# 施工/门/回滚见 docs/arch/W4A8-算子家族-设计与施工.md(§5.4 开关与回滚 / §6 S3-S4)
+quant = "w4a16"
 
 [runtime]
 # 2026-10-13 重定档(影子池时代旧值 = 2560/池 4352):单池 + FI 直读后
@@ -44,7 +51,7 @@ allowed_ops = [
         "marlin_gemm_w4a16_awq", "marlin_gemm_w4a16_bf16",
         "owl_add_bf16", "owl_add_f16",
         "owl_argmax_f32idx_f16", "owl_cast_bf16_f16",
-        # W4A8 档(2026-10-17;`model.w4a8 = true` 时发射,否则白名单超集无害)
+        # W4A8 档(2026-10-17;`[model] quant = "w4a8"` 时发射,否则白名单超集无害)
         "marlin_gemm_w4a8_awq", "owl_quant_int8_row_f16", "owl_ct_repack_a8_u32",
         "owl_cast_f16_bf16", "owl_concat_rows_f16",
         "owl_concat_rows_f32", "owl_ct_repack_u32",

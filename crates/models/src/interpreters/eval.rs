@@ -166,8 +166,10 @@ pub(crate) fn decode_host(dtype: Dtype, buf: &[u8]) -> Vec<f32> {
             .chunks_exact(4)
             .map(|c| f32::from_bits(u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
             .collect(),
-        // U8(字节池):逐字节转 f32(观测面只用于统计量级;池内容不是激活)
-        Dtype::U8 => buf.iter().map(|b| *b as f32).collect(),
+        // U8(不透明字节)/ F8 两种(字节口径)/ **I8(按有符号解!)** —— 观测面
+        // 只用于统计量级(池内容不是激活);`I8` 若按无符号读会系统性偏 +128
+        Dtype::U8 | Dtype::F8E4M3 | Dtype::F8E5M2 => buf.iter().map(|b| *b as f32).collect(),
+        Dtype::I8 => buf.iter().map(|b| (*b as i8) as f32).collect(),
     }
 }
 

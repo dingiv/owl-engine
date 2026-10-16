@@ -263,6 +263,18 @@ impl<D: DeviceClient + 'static> Engine<D> {
     #[allow(clippy::arc_with_non_send_sync)]
     pub async fn run(mut self, loaded: LoadedModel) -> Result<RunningEngine<D>> {
         let t_run = std::time::Instant::now();
+        // **投机深度定形门**(2026-10-16):verify 块 = `depth + 1` 行,而首轮
+        // 拼接核的输入槽数是**声明面事实**(`CONCAT_ROWS_SLOTS` = 8)⇒ depth 超界
+        // 会在**首个 verify 步**才爆(且那时树已经 pad 到错槽数)。
+        // 放在**任何设备动作之前**(连草稿器都不加载)⇒ 坏配置毫秒级拒。
+        if self.cfg.knobs.draft.depth >= owl_models::kernel::CONCAT_ROWS_SLOTS {
+            return Err(owl_iface::contract::ModelError::Msg(format!(
+                "[spec] depth = {} 超界:verify 行数 = depth+1 必须 ≤ {}(首轮拼接槽数);\
+                 请调小 depth(或关 spec 走 dumb 草稿)",
+                self.cfg.knobs.draft.depth,
+                owl_models::kernel::CONCAT_ROWS_SLOTS
+            )));
+        }
         let s = self.cfg.max_seq_tokens;
         let (hq, hkv, hd) = loaded.spec.full_heads;
         let (nk, hk, nv, hv) = loaded.spec.gdn_heads;
@@ -317,10 +329,15 @@ impl<D: DeviceClient + 'static> Engine<D> {
         .await?;
 
         // B6.2:主 KV 池 fp8 承载(draft_kv_fp8 / kv.fp8 → env.kv.quant)
-        // KV 写者/读者清单门(收口律机器门):按活跃 quant 逐族校验内核
-        // 在登记表与 .cu 源在场;缺族/缺名 = 装配失败(池 dtype 改造漏网
-        // 即启动即拦,不等 E2E 红灯)
-        owl_models::kernel::kv_manifest_gate(env.kv.quant, env.attn.fi)?;
+        // KV 池清单门(收口律机器门;E1 2026-10-17 改为**声明面投影**):
+        // 期望集从每个算子的 `POOL` 声明(`池名/布局/dtype`)投影出来,逐个
+        // 核 `.cu` 源在场;缺声明/缺源 = 装配失败(池 dtype 改造漏网即启动
+        // 即拦,不等 E2E 红灯)。原手抄核名清单已删(新池核忘写清单 ⇒ 门
+        // 静默变窄的那种形状)。
+        owl_models::kernel::kv_manifest_gate(
+            owl_models::kernel::kv_pool_dtype(env.kv.quant, dims.dtype),
+            env.attn.fi,
+        )?;
         if env.kv.quant == owl_models::env::KvQuant::Fp8E4M3 {
             owl_shared::log_info!("boot", "KV 池 fp8 e4m3(容量减半/ctx 翻倍;读核 *_fp8 变体)");
         }

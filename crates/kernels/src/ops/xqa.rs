@@ -20,7 +20,7 @@ use crate::family::xqa;
 const XQA_PARAMS: &[Param] = &[
     Param::t_in("q", Dtype::F16, 2),
     // fp8 主池句柄:引擎叶子口径 = U32 扁平字节账(`bytes/4` 字;2026-10-15
-    // L3 事实面对齐 —— 池的 e4m3 字节语义由 `POOL` 的 `Dtype::U8` 承担)。
+    // L3 事实面对齐 —— 池的 e4m3 字节语义由 `POOL` 的 `Dtype::F8E4M3` 承担)。
     // 旧声明 `U8 rank4` 描述的是核内 kNHD 字节视图,与喂进来的句柄不是同一层。
     Param::t_in("k_cache", Dtype::U32, 1),
     Param::t_in("v_cache", Dtype::U32, 1),
@@ -55,7 +55,7 @@ const XQA_PARAMS: &[Param] = &[
 
 /// kNHD fp8 池 + hd256 + GQA 6:1 的形状族(两臂同)
 const XQA_SHAPE: ShapeFamily = ShapeFamily {
-    kv_dtype: Some(Dtype::U8),
+    kv_dtype: Some(Dtype::F8E4M3),
     head_dim: &[256],
     page: &[16, 32, 64, 128],
     grp: Some(6),
@@ -114,7 +114,7 @@ impl KernelSpec for XqaVerify {
         &[crate::spec::PoolAccess::read(
             crate::spec::pools::KV_MAIN,
             crate::spec::LayoutTag::Knhd,
-            Dtype::U8,
+            Dtype::F8E4M3,
         )];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -138,7 +138,7 @@ impl KernelSpec for XqaDecode {
         &[crate::spec::PoolAccess::read(
             crate::spec::pools::KV_MAIN,
             crate::spec::LayoutTag::Knhd,
-            Dtype::U8,
+            Dtype::F8E4M3,
         )];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -173,7 +173,7 @@ impl KernelSpec for XqaPrefill {
     const SRC: &'static str = "";
     const PARAMS: &'static [Param] = XQA_PARAMS;
     const SHAPE: ShapeFamily = ShapeFamily {
-        kv_dtype: Some(Dtype::U8),
+        kv_dtype: Some(Dtype::F8E4M3),
         head_dim: &[256],
         page: &[16, 32, 64, 128],
         grp: Some(6),
@@ -183,7 +183,7 @@ impl KernelSpec for XqaPrefill {
         &[crate::spec::PoolAccess::read(
             crate::spec::pools::KV_MAIN,
             crate::spec::LayoutTag::Knhd,
-            Dtype::U8,
+            Dtype::F8E4M3,
         )];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;

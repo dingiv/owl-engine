@@ -34,7 +34,10 @@ fn dtype_bytes(d: Dtype) -> usize {
     match d {
         Dtype::F16 | Dtype::BF16 => 2,
         Dtype::F32 | Dtype::U32 => 4,
-        Dtype::U8 => 1,
+        // 8 位族(§S 2026-10-17 dtype 分离):fp8×2 与 int8 各自点名,
+        // 与 `U8`(不透明字节)同宽 —— 本函数只用于块句柄**自述宽**
+        // (真源仍是调用方几何),故三臂同值为 1。
+        Dtype::U8 | Dtype::F8E4M3 | Dtype::F8E5M2 | Dtype::I8 => 1,
     }
 }
 

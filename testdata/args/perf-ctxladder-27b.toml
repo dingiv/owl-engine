@@ -27,7 +27,9 @@ dflash2_dir = "/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16"
 name = "qwen3.8-27b"
 
 [runtime]
-device = 0
+# device = 0  ← 旧 usize ordinal(2026-10-16 DeviceSpec 重构后非法):
+#   卡改由 CUDA_VISIBLE_DEVICES 钉,或用声明式 device = { uuid = "..." } / { bdf = ".." };
+#   留空 = 自动挑(规格筛选 → 剔 gpu_lock 已占 → 取首张)
 max_seq = 40960
 prefill_chunk = 512
 bind = "127.0.0.1:8138"

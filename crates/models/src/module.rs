@@ -1075,6 +1075,11 @@ pub struct Weight {
     shape: Shape,
     transposed: bool,
     cell: SlotCell,
+    /// **尺度槽随激活臂**(2026-10-16 定谳):true ⇒ 装载声明由 `LoaderCtx.dtype`
+    /// 决定(BF16 模型 ⇒ BF16,否则 F16)。为什么必须随臂:C 侧 marlin
+    /// `s_type = c_type`(激活类型)⇒ bf16 臂**吃 bf16 值的尺度**,
+    /// 而 f16 臂吃 f16 —— 声明必须等于事实(不许"声明 F16、内容 bf16")。
+    scales_arm: bool,
     /// 装载 dtype(F5 整模切换):layout 期从 LoaderCtx 写入,decl 按此
     /// 出声明 —— 默认 F32(CPU 单元面);f16 模型经 LoaderCtx 自动跟随,
     /// 层构造器零涟漪(Cell 内部可变;Weight 使用面恒 &self)
@@ -1094,6 +1099,7 @@ impl Weight {
             cell: SlotCell::default(),
             dtype: std::cell::Cell::new(Dtype::F32),
             dtype_override: None,
+            scales_arm: false,
         }
     }
 
@@ -1107,6 +1113,7 @@ impl Weight {
             cell: SlotCell::default(),
             dtype: std::cell::Cell::new(dtype),
             dtype_override: Some(dtype),
+            scales_arm: false,
         }
     }
 
@@ -1120,10 +1127,27 @@ impl Weight {
         Self::new_typed(key, shape, Dtype::F16)
     }
 
+    /// **量化尺度槽**:声明**随激活臂**(bf16 模型 ⇒ BF16;否则 F16)。
+    ///
+    /// 判据(C 侧 `marlin_host.cu`: `s_type = c_type`):bf16 激活 ⇒ bf16 值的
+    /// 尺度;f16 激活 ⇒ f16 值的尺度。声明与实际不符就是"影子口径",
+    /// 任何按声明解字节的读者都会静默错值(2026-10-16 立案)。
+    pub fn new_typed_scales(key: &'static str, shape: Shape) -> Self {
+        Self {
+            key,
+            shape,
+            transposed: false,
+            cell: SlotCell::default(),
+            dtype: std::cell::Cell::new(Dtype::F16),
+            dtype_override: None,
+            scales_arm: true,
+        }
+    }
+
     /// 转置权重:源 [rows, cols] 行主序 → 装载声明 [cols, rows]
     /// (Linear 惯例:forward 直 matmul,decode 零转置)
     pub fn new_transposed(key: &'static str, rows: usize, cols: usize) -> Self {
-        Self { key, shape: vec![cols, rows], transposed: true, cell: SlotCell::default(), dtype: std::cell::Cell::new(Dtype::F32), dtype_override: None }
+        Self { key, shape: vec![cols, rows], transposed: true, cell: SlotCell::default(), dtype: std::cell::Cell::new(Dtype::F32), dtype_override: None, scales_arm: false }
     }
 
     /// 装载生命周期:按语境声明需求(元数据直出 + 回填口;零 src 零数据)
@@ -1136,7 +1160,12 @@ impl Weight {
     pub(crate) fn layout_as(&self, key: impl Into<String>, ctx: &LoaderCtx) -> LoaderOps {
         // decl 与装载同源(F5 整模切换);dtype_override = 量化臂钉死
         // (E3:qweight U32 / scales F16 不随整模 dtype 漂移)
-        let dtype = self.dtype_override.unwrap_or(ctx.dtype);
+        let dtype = if self.scales_arm {
+            // 尺度槽:bf16 臂 ⇒ BF16、f16 臂 ⇒ F16(其余含 F32 单元面落 F16)
+            if ctx.dtype == Dtype::BF16 { Dtype::BF16 } else { Dtype::F16 }
+        } else {
+            self.dtype_override.unwrap_or(ctx.dtype)
+        };
         self.dtype.set(dtype);
         LoaderOps::want(Want {
             key: key.into(),

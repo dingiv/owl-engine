@@ -250,6 +250,12 @@ mod tests {
                 crate::family::flashinfer::PREFILL_FI_FP8KV,
                 crate::client::flashinfer::PARSE_SLOTS,
             ),
+            // 视觉塔 ragged(2026-10-15 立表):**自己一张槽名表**
+            // (与 native `vis.attn_full` 同槽位,但非 FI paged 那套)
+            (
+                crate::family::flashinfer::ATTN_RAGGED_F16,
+                crate::client::flashinfer::ATTN_RAGGED_SLOTS,
+            ),
         ]);
         #[cfg(feature = "xqa")]
         cases.extend([
@@ -293,6 +299,9 @@ mod tests {
         want.extend([
             crate::family::flashinfer::PREFILL_FI,
             crate::family::flashinfer::PREFILL_FI_FP8KV,
+            // 2026-10-16:视觉塔 ragged 有 parse 面(`client::flashinfer::parse_attn_ragged`)
+            // 与槽名锁,但当初漏登本清单 ⇒ 全 feature 档的覆盖门一直是红的。
+            crate::family::flashinfer::ATTN_RAGGED_F16,
         ]);
         #[cfg(feature = "xqa")]
         want.extend([

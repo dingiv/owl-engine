@@ -58,6 +58,11 @@ const CHANNEL_CAPACITY: usize = 64;
 /// accept 失败退避(防 fd 耗尽等错误风暴下忙旋)
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
+/// **引擎 actor 线程栈**(2026-10-17):缺省 2MiB 对 release 够、对 debug 不够
+/// (见 `owl-engine` 线程处的长注)。32MiB 是余量档:虚拟内存代价可忽略
+/// (进程只留 1 个),只买“深链不崩”。
+const ENGINE_STACK_BYTES: usize = 32 << 20;
+
 /// **诊断投影面共享单元**(`/debug/blocks` 的 GPU 命令出口)。
 /// 显式依赖律:不做全局变量 —— `main` 建、actor 装、HTTP 读,全走参数。
 type DbgFace =
@@ -214,19 +219,13 @@ async fn main() {
 
     // ── engine actor:专属线程(构造+装载+泵全在内;RunningEngine 非 Send)──
     // HTTP 侧留 bind/model_name 副本(model_name 回退服务端缺省)
-    // 并发上限守卫(§三十五 server 上层):GDN 状态格 = 每并发会话一格,
-    // max_concurrency 超格数 = 第 N+1 会话状态格耗尽(LRU 逐出活跃会话)
-    // → 跨会话状态污染。不足即拒启(账外组合不静默)。
-    // FIXME: ??? 你server层的东西，你来感知引擎内部的逻辑???
+    // 并发上限守卫(§三十五)**已下沉**:`gdn_slots ≥ max_concurrency` 是
+    // **跨字段配置不变量**,现由 `OwlConfig::validate` 在**配置装载**时拒
+    // (D1 2026-10-17:原写法在本文件里读引擎内部容量 + 直接 exit(1),
+    // 且只有 server 一条入口守;tests/cli 直构 engine 的路径裸奔)。
+    // 此处只留信息行。
     let gdn_slots = config.knobs.gdn_slots;
     let max_concurrency = config.max_concurrency;
-    if gdn_slots < max_concurrency {
-        // 拒启必须可见(A1):默认日志级别 warn 下 log_info 不出 ⇒ 裸 eprintln
-        eprintln!(
-            "[boot] ❌ max_concurrency({max_concurrency}) > GDN 状态格数({gdn_slots})—— 每并发会话占一格,请调 knobs.gdn_slots ≥ max_concurrency 或降低并发"
-        );
-        std::process::exit(1);
-    }
     owl_shared::log_info!("boot", "并发上限 {max_concurrency}(GDN 格 {gdn_slots};本地服务,排队超出请求)"
     );
 
@@ -241,6 +240,12 @@ async fn main() {
     let shutdown_actor = shutdown.clone();
     std::thread::Builder::new()
         .name("owl-engine".into())
+        // **显式栈**(2026-10-17):缺省 2MiB 是 debug 档的暗雷 —— 27B + DFlash2
+        // 草稿的装载/装配链在 debug 下帧深远超 release(实测
+        // `--flavor spec-dflash testdata/args/e2e-27b.toml` 的 debug 二进制
+        // 在 DFlash2 草稿初始化处栈溢出 SIGABRT;`RUST_MIN_STACK=64M` 即复活)
+        // ⇒ 本线程是**唯一**背全模型生命周期的线程,给足栈,别赌优化器。
+        .stack_size(ENGINE_STACK_BYTES)
         .spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -335,11 +340,12 @@ async fn actor_main(
         owl_shared::log_info!("boot", "设备绑定 {:.2}s", t0.elapsed().as_secs_f32());
         let model = match config.model_kind {
             ModelKind::Awq27b => {
-                // 量化方案映射(唯一点 owl_engine::head_plan_of)
+                // 量化方案映射(唯一点 owl_engine::{head_plan_of, quant_plan_of})
                 let head_plan = owl_engine::head_plan_of(config.head_quant);
+                let quant = owl_engine::quant_plan_of(config.quant);
                 engine
                     .loader()
-                    .load_qwen38_27b_awq(&config.model_dir, &config.model_dir, head_plan, config.w4a8)
+                    .load_qwen38_27b_awq(&config.model_dir, &config.model_dir, head_plan, quant)
                     .await?
             }
             ModelKind::Qwen35_08b => engine.loader().load_qwen35_0_8b(&config.model_dir).await?,
