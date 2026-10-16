@@ -17,6 +17,52 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let face = self.graphs.session.face_mut();
             self.pool.restore_snap(face, b.gdn_slot, key).await?;
         }
+        // **S3-3b:待回灌块**(内容在宿主层)在段边界搬到设备,并把新槽写回块表 ——
+        // 必须在 `write_bt` 之前(否则写进设备的是占位坏槽)。搬运实现全在 store。
+        if !b.pending_loads.is_empty() {
+            let leg = &mut self.bank.leg_target;
+            let face = self.graphs.session.face_mut();
+            // §21:搬运由 engine 编排(取计划 → face.swap → 回执 → 记账);
+            // **一条命令搬 N 块**(逐块 = 每块一次往返,回灌收益被吃光)。
+            let chains: Vec<owl_store::ChainHash> =
+                b.pending_loads.iter().map(|(_, c)| *c).collect();
+            let (cs, new_slots, pieces, table) = {
+                let p = owl_store::plan_onload(leg, &chains)?;
+                (p.chains, p.slots, p.pieces, p.table)
+            };
+            let conn = match face
+                .swap(owl_iface::contract::SwapDir::In, &pieces, Box::new(table))
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    owl_store::abort_onload(leg, &cs, &new_slots);
+                    return Err(owl_iface::contract::ModelError::Msg(format!(
+                        "回灌 swap 失败(engine 编排):{e}"
+                    )));
+                }
+            };
+            let table = owl_store::reclaim_slot_table(conn)?;
+            let slots = owl_store::commit_onload(leg, &cs, &new_slots, table)?;
+            let s = self.bank.sessions.get_mut(b.session_id).ok_or_else(|| {
+                owl_iface::contract::ModelError::Msg(format!("回灌:会话 {} 不在账", b.session_id))
+            })?;
+            for ((idx, _), slot) in b.pending_loads.iter().zip(&slots) {
+                if *idx >= s.block_table.len() {
+                    return Err(owl_iface::contract::ModelError::Msg(format!(
+                        "回灌下标 {idx} 越界(表长 {})",
+                        s.block_table.len()
+                    )));
+                }
+                s.block_table[*idx] = *slot;
+            }
+            owl_shared::log_debug!(
+                "store",
+                "段边界回灌 {} 块(session={};宿主→设备;一条命令)",
+                b.pending_loads.len(),
+                b.session_id
+            );
+        }
         self.write_bt(b.session_id).await
     }
 
@@ -35,7 +81,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 调试门:prefill 块粒度(见 owl_shared::stepgate;`--step-gate` 控制)
         owl_shared::step_gate!("engine.prefill").await;
         let last_row = self.prefill_chunk(&chunk_ids, base, is_last).await?;
-        // E2c:块边界跨越 → GDN 快照拍摄(可复用身份 = 链尾块)
+        // E2c:块边界跨越 → GDN 快照拍摄(快照身份 = 边界块**内容身份**,
+        // 由链哈希游标出 —— 物理块号会被回收复用,不可作键)
         let new_fed = base + chunk_ids.len();
         if self.pool.paged && new_fed.is_multiple_of(self.pool.page) {
             self.capture_gdn_snap(sid, new_fed).await?;

@@ -5,7 +5,7 @@
 //! paged/x/dims)。职责 = 分配([`StatePool::alloc`])+ 叶子句柄发放
 //! (kv_caches/gdn_caches/bt_leaf)+ 状态治理(reset_gdn/capture_snap/
 //! restore_snap/write_bt)。块账房(host 侧记账)不在此 —— 那是
-//! BlockManager(blocks.rs);本池只管设备缓冲与池内快照 LRU。
+//! `owl_store` 的块腿(槽池 + 内容身份前缀树);本池只管设备缓冲与池内快照 LRU。
 //!
 //! 布局策略表驱动(REQ-HW-01):KV 布局由 `kv_paged_policy(dtype)` 分发
 //! —— Some = paged classic(kc [nb,Hkv,hd/x,page,x] / vc [nb,Hkv,hd,page];
@@ -16,6 +16,7 @@
 //! (三方先例 + 旧世界律);slots/kv_lens/bt f32(契约 5)。
 
 use owl_iface::contract::{Bytes, DeviceClient, Dtype, ModelError};
+use owl_store::SnapKey;
 use owl_models::interpreters::eval_ops;
 use owl_models::module::kv_paged_policy;
 use owl_models::TensorOps;
@@ -32,11 +33,14 @@ pub(crate) type BlockN = (Bytes, usize); // (块句柄, 元素数;重置分块�
 /// 8 = 覆盖需求并发上限(§二 并发 ≤8);会话 close 即释放格号。
 /// 槽数 = EngineKnobs.gdn_slots(显式传入;原 OWL_GDN_SLOTS,缺省 8)。
 ///
-/// GDN 快照槽(E2c):key = 链尾物理块 id(内容身份);bufs = 逐层逐块
-/// 行宽副本(与 gdns 同序同构,行宽 = elems / GDN_SLOTS)。池静态
-/// 预分配,驱逐 = 换 key 覆盖写(零 alloc/free 往返)。
+/// GDN 快照槽(E2c):key = [`SnapKey`](**边界块的内容身份**;逐块父链哈希,
+/// `owl_store::ChainCursor`)。为什么不是物理块号:物理块号是会被回收复用的
+/// 槽号 ⇒ 旧键会命中别人的状态(静默错值;store 卷 §9.1)。键类型来自 store
+/// ⇒ **物理槽号在类型上就进不了快照键**。
+/// bufs = 逐层逐块行宽副本(与 gdns 同序同构,行宽 = elems / GDN_SLOTS)。
+/// 池静态预分配,驱逐 = 换 key 覆盖写(零 alloc/free 往返)。
 pub(crate) struct GdnSnapSlot {
-    key: Option<u32>,
+    key: Option<SnapKey>,
     last_use: u64,
     bufs: Vec<BlockN>,
 }
@@ -51,6 +55,16 @@ struct GdnBlocks {
     conv_k: BlockN,
     conv_v: BlockN,
     rec: BlockN,
+}
+
+/// 元素字节宽(账口径唯一产地:坑册 §42 —— 块句柄自述 dtype 是标注,
+/// 但**同进程内** GPU 面的 dtype 就是真值;跨 face 的字节真源另见调用方)。
+pub(crate) fn elem_bytes(d: Dtype) -> usize {
+    match d {
+        Dtype::F16 | Dtype::BF16 => 2,
+        Dtype::F32 | Dtype::U32 => 4,
+        Dtype::U8 => 1,
+    }
 }
 
 /// prefill 块构造所需维度账(run 期从 spec 提取;Copy 免 Clone 传播)
@@ -179,7 +193,7 @@ pub(crate) struct StatePool {
     pub(crate) fi_tables: Option<FiTableBlocks>,
     /// paged 池几何(页;legacy 模式 page = 容量,nb = 1)
     pub(crate) page: usize,
-    /// **管理面**页数(BlockManager/会话块表/FI 页链槽只认这些)
+    /// **管理面**页数(store 块腿/会话块表/FI 页链槽只认这些)
     pub(crate) nb: usize,
     /// **物理**页数(含 padding dump 页;= `nb + dump`)
     pub(crate) nb_kv: usize,
@@ -221,6 +235,116 @@ pub(crate) struct FiTableBlocks {
 }
 
 impl StatePool {
+    /// **单逻辑块(页)的设备字节**(账/搬运长度真源,坑册 §42):Σ 全注意力层
+    /// (k+v) 每页实占字节。fp8 池以 U32 承载(1B/elem)⇒ 元素数 ÷4、元素宽 ×4
+    /// ⇒ 每页字节 = hkv×hd×page ×1;f16 ⇒ ×2。dump 页不算(**÷ nb_kv**)。
+    pub(crate) fn block_bytes(&self) -> usize {
+        let total: usize = self
+            .kvs
+            .iter()
+            .map(|kv| {
+                kv.k_cache.1 * elem_bytes(kv.k_cache.0.dtype)
+                    + kv.v_cache.1 * elem_bytes(kv.v_cache.0.dtype)
+            })
+            .sum();
+        total / self.nb_kv.max(1)
+    }
+
+    /// **主池布局**(engine 注册给 store 的 id 级描述;设计卷 §10.3 推论 A)。
+    /// 每层 k/v 各一项;`stride_bytes` = 每页字节(槽步长)。
+    pub(crate) fn pool_layout(&self, epoch: u64) -> owl_store::PoolLayout {
+        let mut pieces = Vec::with_capacity(self.kvs.len() * 2);
+        for kv in &self.kvs {
+            pieces.push(owl_store::PieceSpec {
+                buf: kv.k_cache.0.clone(),
+                stride_bytes: self.per_page_bytes(kv.k_cache.0.dtype, kv.k_cache.1),
+            });
+            pieces.push(owl_store::PieceSpec {
+                buf: kv.v_cache.0.clone(),
+                stride_bytes: self.per_page_bytes(kv.v_cache.0.dtype, kv.v_cache.1),
+            });
+        }
+        owl_store::PoolLayout { class: owl_store::BlockClass::KvPage, epoch, pieces }
+    }
+
+    /// **MTP 草稿链池布局**(独立页池;1 层 × k/v)。未开 = None。
+    pub(crate) fn mtp_pool_layout(&self, epoch: u64) -> Option<owl_store::PoolLayout> {
+        let kv = self.mtp_kvs.as_ref()?;
+        Some(owl_store::PoolLayout {
+            class: owl_store::BlockClass::KvPage,
+            epoch,
+            pieces: vec![
+                owl_store::PieceSpec {
+                    buf: kv.k_cache.0.clone(),
+                    stride_bytes: self.per_page_bytes(kv.k_cache.0.dtype, kv.k_cache.1),
+                },
+                owl_store::PieceSpec {
+                    buf: kv.v_cache.0.clone(),
+                    stride_bytes: self.per_page_bytes(kv.v_cache.0.dtype, kv.v_cache.1),
+                },
+            ],
+        })
+    }
+
+    /// MTP 池的每页字节(= 那条腿的 `block_bytes`;未开 = 0)。
+    pub(crate) fn mtp_block_bytes(&self) -> usize {
+        self.mtp_kvs
+            .as_ref()
+            .map(|kv| {
+                self.per_page_bytes(kv.k_cache.0.dtype, kv.k_cache.1)
+                    + self.per_page_bytes(kv.v_cache.0.dtype, kv.v_cache.1)
+            })
+            .unwrap_or(0)
+    }
+
+    /// 一个缓冲的每页字节(元素数 × 元素宽 ÷ 管理面页数)。
+    fn per_page_bytes(&self, dtype: Dtype, elems: usize) -> usize {
+        elems * elem_bytes(dtype) / self.nb_kv.max(1)
+    }
+
+    /// **GDN 行字节 / 每活跃 turn**(`owl_store::BudgetInputs::gdn_row_bytes` 真源)。
+    ///
+    /// 口径:每层四件(conv_q/conv_k/conv_v/rec)的分配宽 = `gdn_slots × 单槽宽`
+    /// (`StatePool::alloc` 里显式乘过)⇒ **行字节 = 池总字节 ÷ gdn_slots**。
+    /// 读真分配,不按公式重算(0.8B 档实测:18 层 × 1.07MiB ≈ 19.3MiB/行)。
+    pub(crate) fn gdn_row_bytes(&self) -> usize {
+        let pool: usize = self
+            .gdns
+            .iter()
+            .map(|g| {
+                (g.conv_q.1 + g.conv_k.1 + g.conv_v.1 + g.rec.1) * elem_bytes(g.rec.0.dtype)
+            })
+            .sum();
+        pool / self.gdn_slots.max(1)
+    }
+
+    /// **快照池字节**(E2c 静态预分配;固定面的一项,含 spec 快照缓冲)。
+    pub(crate) fn snapshot_pool_bytes(&self) -> usize {
+        let pool: usize = self
+            .snaps
+            .iter()
+            .map(|s| s.bufs.iter().map(|b| b.1 * elem_bytes(b.0.dtype)).sum::<usize>())
+            .sum();
+        let spec = self
+            .spec_snap
+            .as_ref()
+            .map(|s| s.bufs.iter().map(|b| b.1 * elem_bytes(b.0.dtype)).sum::<usize>())
+            .unwrap_or(0);
+        pool + spec
+    }
+
+    /// **草稿池字节**(MTP 链 / DFlash2 五层;关 = 0)。按 `pool_tokens` 全额
+    /// 预留 ⇒ 开 draft 的档等于第二个主池(`BudgetInputs::draft_pool_bytes`)。
+    pub(crate) fn draft_pool_bytes(&self) -> usize {
+        fn kv_bytes(kv: &KvBlocks) -> usize {
+            kv.k_cache.1 * elem_bytes(kv.k_cache.0.dtype)
+                + kv.v_cache.1 * elem_bytes(kv.v_cache.0.dtype)
+        }
+        let mtp = self.mtp_kvs.as_ref().map(kv_bytes).unwrap_or(0);
+        let df: usize = self.dflash_kvs.as_ref().map(|ks| ks.iter().map(kv_bytes).sum()).unwrap_or(0);
+        mtp + df
+    }
+
     /// 分配全部状态块(零初始化;GDN 段每 turn 开始按格重置)。
     /// `pool_tokens` = 块池 token 口径容量(E2b:默认 2 × 单会话容量,
     /// OWL_POOL_TOKENS 可覆写;调用方读 env,本函数只管取整到页)。
@@ -301,7 +425,7 @@ impl StatePool {
         // E2b 块池容量:pool_tokens 向上取整到页;不低于单会话容量
         let nb = if paged { pool_tokens.div_ceil(page) } else { nb }.max(nb);
         // prefill 桶 padding dump 页(M2b;设计 §4.2 律②):物理多 1 页,
-        // **管理面 nb 不变**(BlockManager/块表/页链槽容量都不受影响)。
+        // **管理面 nb 不变**(store 块腿/块表/页链槽容量都不受影响)。
         let dump_page = plan.prefill_dump_page.then_some(nb);
         let nb_kv = nb + dump_page.map(|_| 1).unwrap_or(0);
 
@@ -883,7 +1007,12 @@ impl StatePool {
         self.snaps.len()
     }
 
-    pub(crate) fn has_snap(&self, key: u32) -> bool {
+    /// 快照池已用槽数(诊断/报告面:在场多少张边界快照)。
+    pub(crate) fn snap_used(&self) -> usize {
+        self.snaps.iter().filter(|s| s.key.is_some()).count()
+    }
+
+    pub(crate) fn has_snap(&self, key: SnapKey) -> bool {
         self.snaps.iter().any(|s| s.key == Some(key))
     }
 
@@ -989,7 +1118,7 @@ impl StatePool {
         &mut self,
         face: &mut D,
         gdn_slot: usize,
-        key: u32,
+        key: SnapKey,
     ) -> Result<()> {
         // 池空(snap_max = 0)不再是 panic(原 `expect("池非空")` 会炸掉整个
         // owl-engine 线程 → 客户端收 503):退化为**结构化错误** —— 调用方
@@ -1039,17 +1168,18 @@ impl StatePool {
 
     /// GDN 快照恢复(E2c;前缀命中时调用):槽位缓冲 → 会话格(D2D
     /// 反向)。同流保序,后续 prefill 天然在恢复态之后。
+    /// `key` = 边界块内容身份(与拍摄侧同类型 ⇒ 槽号进不来)。
     pub(crate) async fn restore_snap<D: DeviceClient>(
         &mut self,
         face: &mut D,
         gdn_slot: usize,
-        key: u32,
+        key: SnapKey,
     ) -> Result<()> {
         let idx = self
             .snaps
             .iter()
             .position(|s| s.key == Some(key))
-            .ok_or_else(|| ModelError::Msg(format!("快照 {key} 已被逐出")))?;
+            .ok_or_else(|| ModelError::Msg(format!("快照 {key:?} 已被逐出")))?;
         self.snap_tick += 1;
         for (li, g) in self.gdns.iter().enumerate() {
             let quads = [

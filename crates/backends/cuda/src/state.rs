@@ -47,6 +47,15 @@ pub struct DiagOpts {
     /// 捕获 slab 固定档 MiB(None = warmup 计量定量;原 OWL_CAPTURE_SLAB_MB
     /// —— 24G 贴顶的 27B + spec 双图场景,verify 图按需调小)
     pub capture_slab_mb: Option<usize>,
+    /// **显存硬预算:预留 MiB**(2026-10-16):判据 = 驱动账 `free − reserve ≥ 请求`,
+    /// 否则**主动拒发**(不让 `cudaMallocAsync` 去抛错 —— 那是"已经太晚"的现场)。
+    /// reserve 覆盖未入账面:CUDA ctx(~430MB)/池保留页/瞬态。
+    /// 缺省 256MiB(测试面);生产经 `from_config` 取 `pool.vram_reserve_mb`(1024MiB)
+    /// —— 与引擎池治理**同一个预留**,两个旋钮不打架。
+    pub vram_reserve_mb: u64,
+    /// **显存硬预算:逻辑上限 MiB**(None = 只按驱动账判)。
+    /// 叠一层"引擎 live 账"上限:适合"这台卡只准 owl 用 N GB"的部署口径。
+    pub vram_budget_mb: Option<u64>,
     /// **发射账容量**(cuda.trace_ring;0 = 关)。>0 ⇒ server 记最近 N 条
     /// 命令(launch/htod/dtoh/alloc/free/memset/copy;见 `crate::trace`)。
     pub trace_ring: usize,
@@ -74,6 +83,9 @@ impl DiagOpts {
             free_legacy: c.free_legacy,
             sync_mask: mask,
             launch_time: c.launch_time,
+            // 硬预算:与池治理同一预留(1GiB);逻辑上限走显式配置(暂 None)
+            vram_reserve_mb: cfg.pool.vram_reserve_mb.max(1),
+            vram_budget_mb: owl_shared::env_reader::parse::<u64>("OWL_VRAM_BUDGET_MB"),
             d2h_prof: c.d2h_prof,
             gpu_prof: c.gpu_prof,
             graph_flags: c.graph_flags.to_bits(),
@@ -473,6 +485,46 @@ pub(super) enum FamAct {
 }
 
 /// 严格档开关(进程级一次读取;诊断旋钮 —— 与 `OWL_GDN_FRESH_SCRATCH` 同族)
+/// **显存硬预算判据**(唯一实现;2026-10-16)。
+///
+/// 两段,顺序有义:
+/// ① **驱动账**(主判据):`cuMemGetInfo` 的 free − `reserve` ≥ 请求 —— 覆盖
+///    未入账面(CUDA ctx / 池保留页 / 别的进程);
+/// ② **逻辑上限**(可选):`vram::live + n ≤ budget`。
+///
+/// 不通过 = `PoolExhausted`(**结构化**:要多少 / 还能给多少)⇒ 调用方**拒发**,
+/// 不去 malloc —— CUDA 侧失败是"已经太晚"的现场(错误语义模糊 + 池撕碎)。
+pub(super) fn vram_budget_guard(
+    n_bytes: usize,
+    reserve_bytes: u64,
+    budget_bytes: Option<u64>,
+) -> Result<(), ModelError> {
+    if let Ok((free, _)) = cudarc::driver::result::mem_get_info() {
+        let free = free as u64;
+        owl_shared::vram::free_set(free);
+        let avail = free.saturating_sub(reserve_bytes);
+        if n_bytes as u64 > avail {
+            return Err(ModelError::PoolExhausted {
+                pool: "vram-hard-budget(驱动 free − reserve)".into(),
+                needed: n_bytes as u64,
+                available: avail,
+            });
+        }
+    }
+    if let Some(cap) = budget_bytes {
+        let live = owl_shared::vram::live_bytes();
+        let after = live.saturating_add(n_bytes as u64);
+        if after > cap {
+            return Err(ModelError::PoolExhausted {
+                pool: "vram-hard-budget(live 账上限)".into(),
+                needed: n_bytes as u64,
+                available: cap.saturating_sub(live),
+            });
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn cap_strict() -> bool {
     static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *STRICT.get_or_init(|| {

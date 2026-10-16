@@ -12,7 +12,7 @@ use crate::command::{Ack, Command, Waiter};
 use crate::server::GpuServer;
 use crate::state::DeviceSelector;
 use owl_iface::contract::{Arg, Bytes, DeviceClient, GraphId, LaunchMsg};
-use owl_iface::contract::{Dtype, ModelError, Shape};
+use owl_iface::contract::{Connector, Dtype, ModelError, Shape, SwapDir, SwapPiece};
 use std::future::Future;
 use std::sync::mpsc;
 
@@ -389,6 +389,56 @@ impl DeviceClient for GpuClient {
         let bytes = self.submit(move |ack| Command::Dtoh { id, want_bytes, ack })?.await?;
         out.copy_from_slice(&bytes);
         Ok(())
+    }
+
+    /// 批量分块读:单命令 `DtohBatch`(一次往返;回执 = 按序拼接)
+    async fn dtoh_batch(
+        &mut self,
+        pieces: &[(&Bytes, usize, usize)],
+    ) -> Result<Vec<u8>, ModelError> {
+        let pieces: Vec<(u64, usize, usize)> =
+            pieces.iter().map(|(b, off, len)| (b.id, *off, *len)).collect();
+        self.submit(move |ack| Command::DtohBatch { pieces, ack })?.await
+    }
+
+    /// 批量分块写:单命令 `HtodChunks`(字节口径;一次往返,单 ack 保序)
+    async fn htod_batch(
+        &mut self,
+        writes: &[(&Bytes, usize, &[u8])],
+    ) -> Result<(), ModelError> {
+        let writes: Vec<(u64, usize, Vec<u8>)> = writes
+            .iter()
+            .map(|(b, off, data)| (b.id, *off, data.to_vec()))
+            .collect();
+        self.submit(move |ack| Command::HtodChunks { writes, ack })?.await
+    }
+
+    /// 带偏移读(状态存储搬出面;与 `dtoh` 同一条 server 路径)
+    async fn dtoh_at(
+        &mut self,
+        b: &Bytes,
+        off_bytes: usize,
+        out: &mut [u8],
+    ) -> Result<(), ModelError> {
+        let id = b.id;
+        let want_bytes = out.len();
+        let bytes = self
+            .submit(move |ack| Command::DtohAt { id, off_bytes, want_bytes, ack })?
+            .await?;
+        out.copy_from_slice(&bytes);
+        Ok(())
+    }
+
+    /// **swap 一条命令**(设计卷 §15):N 片一次提交、一次 ack
+    /// (回执 = 原箱奉还的连接器;搬完即落定 —— out 回执含 `conn.put` 完成)。
+    async fn swap(
+        &mut self,
+        dir: SwapDir,
+        pieces: &[SwapPiece],
+        conn: Box<dyn Connector + Send>,
+    ) -> Result<Box<dyn Connector + Send>, ModelError> {
+        let pieces = pieces.to_vec();
+        self.submit(move |ack| Command::Swap { dir, pieces, conn, ack })?.await
     }
 
     // TODO: 考虑改成同步调用, 因为 launch 不用等待, 待定

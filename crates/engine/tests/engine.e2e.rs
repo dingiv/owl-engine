@@ -66,6 +66,17 @@ macro_rules! run {
     }};
 }
 
+// ⚠️ **挂账(2026-10-16 定谳,非本仓逻辑错)**:本入口在**单进程**里连开多个
+// 引擎实例,而引擎的设备内存**从不 Free**(设计前提 = "全进程单引擎" ——
+// `vram.rs` 头注;`Bytes` 是句柄,drop 不发 `Command::Free`,归池只发生在
+// 装载收尾 `mem_pool_trim`)⇒ `vram::live` 只增不减,后续实例的
+// `StatePool::alloc` vram 治理把池夹到**几何下限**(0.8B/3080 实测:池槽 0/4)。
+// 现象:`gpu_spec_identity_gate` 套件内红"KV 块池耗尽"、单跑绿(2026-10-13 已记
+// 症状;2026-10-16 定谳 = 池被夹到 4 块,账目本身自洽)。
+// 候选修法(未拍):①收尾给引擎发 Free(`Drop for StatePool/GraphFleet`)②门档
+// `vram_target=0` 关治理(有真 OOM 风险)③按场景拆进程。**别**用"等 live 回落"
+// 的屏障 —— 实测 20s 也不回落(它压根不释放)。
+
 /// **非 async 入口**:场景含图捕获的声明树走查(深递归),而入口把多层
 /// async 内联进一个 future → libtest 默认栈(8MiB)实测溢出
 /// (`fatal runtime error: stack overflow` @ dflash propose 图捕获)。
@@ -87,10 +98,21 @@ fn e2e() {
 
 async fn e2e_body() {
     // ── env 一次读(缺失 = 整档 skip;不再往场景里散读) ──
-    let Some(dev) = owl_shared::env_reader::parse::<usize>("OWL_TEST_DEVICE") else {
+    // §18:CPU mock 档**无卡**也可入档(OWL_CPU_MOCK 在 + 无 OWL_TEST_DEVICE
+    // ⇒ 只跑 CPU 档场景,GPU 场景一概不触)。
+    let dev = owl_shared::env_reader::parse::<usize>("OWL_TEST_DEVICE");
+    let cpu_only = dev.is_none() && owl_shared::env_reader::flag("OWL_CPU_MOCK");
+    if dev.is_none() && !cpu_only {
         eprintln!("skip: OWL_TEST_DEVICE 未设(engine e2e 整档跳过)");
         return;
-    };
+    }
+    let dev = dev.unwrap_or(0);
+    if cpu_only {
+        eprintln!("[e2e] 无卡档(OWL_CPU_MOCK):只跑 CPU mock 场景 —— store 演示台三门口");
+        run!(cpu_mock_offload_probe);
+        eprintln!("[e2e] 无卡档完成,用时 {:.1}s", std::time::Instant::now().elapsed().as_secs_f32());
+        return;
+    }
     let has_27b = owl_shared::env_reader::str("OWL_AWQ27B_DIR").is_some();
     let has_draft = owl_shared::env_reader::str("OWL_DFLASH2_DIR").is_some();
     eprintln!(
@@ -121,11 +143,19 @@ async fn e2e_body() {
         eprintln!("[e2e] 0.8B 默认档 skip(被 OWL_E2E_ONLY 排除)");
     }
 
+    // ── S3-3b 实证(自装载;按需开:`OWL_OFFLOAD_PROBE=1`) ──
+    run!(gpu_08b_offload_probe);
+
+    // ── S0 预算实测(自装载;按需开:`OWL_BUDGET_PROBE=1`) ──
+    run!(gpu_08b_budget_probe);
+
     // ── piecewise 段驱动件(不装模型;纯 GraphPlan 面) ──
     run!(gpu_piecewise_segments);
 
     // ── 0.8B 其余档:boot 期配置各不相同,各自装载 ──
     run!(gpu_schedule_decision_surface); // max_seq=64/chunk=4(切块敏感)
+    // §18 CPU mock 档:同一套 store 三门口跑在 CpuFace 上(无卡;OWL_CPU_MOCK 门控)
+    run!(cpu_mock_offload_probe);
     run!(gpu_gdn_slot_cross_probe);   // gdn_slots=2 + prefix_cache=false
     run!(gpu_08b_fuse_text_parity);   // greedy + fused_decode 臂
     run!(gpu_longctx_fi_direct_gate); // fp8 池 × {FI 直读, 自研读核}(自装载两回)

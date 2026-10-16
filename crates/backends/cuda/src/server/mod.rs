@@ -539,6 +539,20 @@ impl GpuServer {
             Command::Dtoh { id, want_bytes, .. } => {
                 E::new("dtoh", "d2h").bytes(*want_bytes).id(*id)
             }
+            Command::DtohAt { id, want_bytes, .. } => {
+                E::new("dtoh_at", "d2h").bytes(*want_bytes).id(*id)
+            }
+            Command::DtohBatch { pieces, .. } => E::new("dtoh_batch", "d2h")
+                .bytes(pieces.iter().map(|p| p.2).sum())
+                .ids(pieces.iter().map(|p| p.0)),
+            Command::Swap { dir, pieces, .. } => match dir {
+                owl_iface::contract::SwapDir::Out => E::new("swap_out", "d2h")
+                    .bytes(pieces.iter().map(|p| p.len).sum())
+                    .ids(pieces.iter().map(|p| p.block)),
+                owl_iface::contract::SwapDir::In => E::new("swap_in", "h2d")
+                    .bytes(pieces.iter().map(|p| p.len).sum())
+                    .ids(pieces.iter().map(|p| p.block)),
+            },
             Command::Alloc { n_bytes, zero, name, .. } => E::new("alloc", "compute")
                 .bytes(*n_bytes)
                 .name(format!("{}{name}", if *zero { "zero:" } else { "uninit:" })),
@@ -805,7 +819,14 @@ impl GpuServer {
             | Command::CopyBatch { .. }
             | Command::GraphLaunch { .. } => 1u8 << STREAM_COMPUTE,
             // D2H 流:一切 device→host 回读
-            Command::Dtoh { .. } => 1u8 << STREAM_D2H,
+            Command::Dtoh { .. } | Command::DtohAt { .. } | Command::DtohBatch { .. } => {
+                1u8 << STREAM_D2H
+            }
+            // swap:按方向落流(Out = D2H 回读;In = H2D 上传)
+            Command::Swap { dir, .. } => match dir {
+                owl_iface::contract::SwapDir::Out => 1u8 << STREAM_D2H,
+                owl_iface::contract::SwapDir::In => 1u8 << STREAM_H2D,
+            },
             // 复合:两条腿各触一条流(E2 位图的第一个用例)
             Command::UploadAndLaunch { .. } => (1u8 << STREAM_H2D) | (1u8 << STREAM_COMPUTE),
             Command::LaunchAndHarvest { .. } => (1u8 << STREAM_COMPUTE) | (1u8 << STREAM_D2H),
@@ -931,6 +952,11 @@ impl GpuServer {
                 self.handle_upload_pinned(buf, dst, offset_bytes, len_bytes, ack)
             }
             Command::Dtoh { id, want_bytes, ack } => self.handle_dtoh(id, want_bytes, ack),
+            Command::DtohAt { id, off_bytes, want_bytes, ack } => {
+                self.handle_dtoh_at(id, off_bytes, want_bytes, ack)
+            }
+            Command::DtohBatch { pieces, ack } => self.handle_dtoh_batch(pieces, ack),
+            Command::Swap { dir, pieces, conn, ack } => self.handle_swap(dir, pieces, conn, ack),
             Command::Free { ids, ack } => self.handle_free(ids, ack),
             Command::CopyBlock { src, src_off_bytes, dst, dst_off_bytes, len_bytes, ack } => {
                 self.handle_copy_block(src, src_off_bytes, dst, dst_off_bytes, len_bytes, ack)
@@ -987,6 +1013,9 @@ impl GpuServer {
             Command::UploadAndLaunch { ack, .. } => closed!(ack),
             Command::LaunchAndHarvest { ack, .. } => closed!(ack),
             Command::Dtoh { ack, .. } => closed!(ack),
+            Command::DtohAt { ack, .. } => closed!(ack),
+            Command::DtohBatch { ack, .. } => closed!(ack),
+            Command::Swap { ack, .. } => closed!(ack),
             Command::Free { ack, .. } => closed!(ack),
             Command::CopyBlock { ack, .. } => closed!(ack),
             Command::CopyBatch { ack, .. } => closed!(ack),
@@ -1013,6 +1042,10 @@ impl GpuServer {
             Command::GraphLaunch { .. } => "GraphLaunch",
             Command::GraphAbort { .. } => "GraphAbort",
             Command::GraphDestroy { .. } => "GraphDestroy",
+            Command::Dtoh { .. } => "Dtoh",
+            Command::DtohAt { .. } => "DtohAt",
+            Command::DtohBatch { .. } => "DtohBatch",
+            Command::Swap { .. } => "Swap",
             Command::Alloc { .. } => "Alloc",
             Command::MemsetZero { .. } => "MemsetZero",
             Command::Htod { .. } => "Htod",
@@ -1053,6 +1086,11 @@ impl GpuServer {
             Command::UploadAndLaunch { ack, .. } => reject!(ack),
             Command::LaunchAndHarvest { ack, .. } => reject!(ack),
             Command::Dtoh { ack, .. } => reject!(ack),
+            // 带偏移读同 Dtoh:捕获窗内**结构化拒**(状态存储的搬运只在段边界)
+            Command::DtohAt { ack, .. } => reject!(ack),
+            Command::DtohBatch { ack, .. } => reject!(ack),
+            // **swap 同 Dtoh/Batch**:搬运只在段边界,捕获窗内结构化拒
+            Command::Swap { ack, .. } => reject!(ack),
             Command::Sync { ack, .. } => reject!(ack),
             Command::Free { ack, .. } => reject!(ack),
             Command::CopyBlock { ack, .. } => reject!(ack),
@@ -1106,6 +1144,34 @@ impl GpuServer {
                 Ok(Bytes::new(id, elems, Dtype::U8, 0))
             })();
             return ack.send(result);
+        }
+        // ── 显存硬预算(2026-10-16):**主动拒发**,不去 malloc ──
+        // 判据见 `crate::state::vram_budget_guard`(驱动 free − reserve;可选叠
+        // live 账上限)。拒发 = 结构化 `PoolExhausted` + 一条 WARN(带池账/驱动账)。
+        if let Err(e) = crate::state::vram_budget_guard(
+            n_bytes,
+            self.diag.vram_reserve_mb << 20,
+            self.diag.vram_budget_mb.map(|m| m << 20),
+        ) {
+            let pool = crate::state::pool_ledger_snapshot()
+                .map(|(u, uh, r, rh)| {
+                    format!("池 used={}MiB(高水 {}MiB)/reserved={}MiB(高水 {}MiB)", u >> 20, uh >> 20, r >> 20, rh >> 20)
+                })
+                .unwrap_or_else(|| "池账不可读".to_string());
+            let free = cudarc::driver::result::mem_get_info()
+                .map(|(f, t)| format!("驱动 free={}MiB/total={}MiB", f >> 20, t >> 20))
+                .unwrap_or_else(|e| format!("mem_get_info 失败: {e:?}"));
+            self.sink.logf(
+                owl_shared::log::LVL_WARN,
+                "vram-budget",
+                format_args!(
+                    "硬预算拒发 {}B / {:.1}MiB:{e} ‖ {pool} ‖ {free} ‖ 引擎 live={}MiB",
+                    n_bytes,
+                    n_bytes as f64 / 1048576.0,
+                    owl_shared::vram::live_bytes() >> 20
+                ),
+            );
+            return ack.send(Err(e));
         }
         // 图外:路由 COMPUTE 流;zero = true 时流序清零(契约:Zeros = 清零
         // 分配;uninit 免 memset —— eager 大量 scratch alloc 同税)

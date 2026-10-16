@@ -32,6 +32,7 @@
 //! 面、usage 模型侧真账(现 = 事件面计数)。
 
 mod actor;
+mod shutdown;
 // chat template 渲染器(HF 语义;agent 服务面 §3.2/§7.1)
 mod chat_tpl;
 mod config;
@@ -156,10 +157,14 @@ async fn main() {
         config.device_uuid,
         std::process::id()
     );
+    // **收摊上下文**(SIGTERM 与"引擎不可恢复错误"共用;见 shutdown.rs)
+    let shutdown = shutdown::Shutdown {
+        lock_path: _gpu_lock.path().to_path_buf(),
+        uuid: config.device_uuid.clone(),
+    };
     // 信号:SIGTERM/SIGINT ⇒ 清锁 + 有序退出(`process::exit` 不跑 Drop ⇒ 显式 release)
     {
-        let lock_path = _gpu_lock.path().to_path_buf();
-        let uuid = config.device_uuid.clone();
+        let ctx = shutdown.clone();
         tokio::spawn(async move {
             let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
                 Ok(s) => s,
@@ -176,9 +181,7 @@ async fn main() {
                 }
             };
             tokio::select! { _ = sigterm.recv() => {}, _ = sigint.recv() => {} }
-            owl_shared::log_info!("boot", "收到停止信号 ⇒ 优雅关停(释放卡锁 {uuid} + 显存)");
-            owl_shared::gpu_lock::release(&lock_path);
-            std::process::exit(0);
+            ctx.graceful("收到停止信号(SIGTERM/SIGINT)");
         });
     }
     // 性能框架分级(docs/arch/perf-framework.md §一;off = 零成本基线臂)
@@ -235,6 +238,7 @@ async fn main() {
     let dbg_face_actor = dbg_face.clone();
     let (tx, rx) = mpsc::channel::<EngineReq>(CHANNEL_CAPACITY);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<String, String>>();
+    let shutdown_actor = shutdown.clone();
     std::thread::Builder::new()
         .name("owl-engine".into())
         .spawn(move || {
@@ -242,7 +246,7 @@ async fn main() {
                 .enable_all()
                 .build()
                 .expect("actor runtime");
-            rt.block_on(actor_main(config, rx, &ready_tx, dbg_face_actor));
+            rt.block_on(actor_main(config, rx, &ready_tx, dbg_face_actor, shutdown_actor));
         })
         .expect("actor 线程");
 
@@ -318,6 +322,7 @@ async fn actor_main(
     rx: mpsc::Receiver<EngineReq>,
     ready: &std::sync::mpsc::Sender<Result<String, String>>,
     dbg_face: DbgFace,
+    shutdown: shutdown::Shutdown,
 ) {
     let built: owl_engine::Result<_> = async {
         let t0 = std::time::Instant::now();
@@ -362,7 +367,7 @@ async fn actor_main(
     } else {
         owl_shared::log_info!("boot", "face 克隆不可用 ⇒ /debug/blocks 回 503(该后端不支持)");
     }
-    actor::run_actor(&mut running, rx, config.perf_dump.clone()).await;
+    actor::run_actor(&mut running, rx, config.perf_dump.clone(), shutdown).await;
 }
 
 /// 单连接服务(Connection: close;架子一请求一连接)

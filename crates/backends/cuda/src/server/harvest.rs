@@ -34,6 +34,19 @@ impl GpuServer {
             Ok(s) => s.clone(),
             Err(e) => return ack.take().unwrap().send(Err(e)),
         };
+        // 硬预算(与 alloc 同一条闸;权重/上传块也吃设备内存)
+        if let Err(e) = crate::state::vram_budget_guard(
+            n,
+            self.diag.vram_reserve_mb << 20,
+            self.diag.vram_budget_mb.map(|m| m << 20),
+        ) {
+            self.sink.logf(
+                owl_shared::log::LVL_WARN,
+                "vram-budget",
+                format_args!("硬预算拒发 htod {n}B:{e}"),
+            );
+            return ack.take().unwrap_or_else(|| unreachable!("ack 刚取过")).send(Err(e));
+        }
         match self.try_htod(&stream, &data, name) {
             Ok((id, buf)) => {
                 // 发射账:上传**落定**记 id + 设备地址(A13 类"跨流 UAF"的钥匙:
@@ -405,13 +418,329 @@ impl GpuServer {
         ack: Ack<Result<Vec<u8>, ModelError>>,
     ) {
         let t0 = std::time::Instant::now();
-        self.handle_dtoh_inner(id, want_bytes, ack);
+        self.handle_dtoh_inner(id, 0, want_bytes, ack);
         self.sink.timer("srv.seg.dtoh", t0.elapsed());
+    }
+
+    /// **D2H 序口**(所有 device→host 命令共享的唯一一处)。
+    ///
+    /// 跨流保序(2026-09-26 塔零案 / 2026-10-14 P1′-laneC 定向化):kernel 在
+    /// COMPUTE 流,回读在 D2H 流 —— 跨流无保序,不排空则读块与产出 kernel 竞速
+    /// (实测:真模型单步中途 dtoh 读到全零块)。修法 = **事件定向等待**(在 COMPUTE
+    /// 当前尾记事件、D2H 流 wait 它):保序强度与整流 `synchronize` 同源,但服务端
+    /// **不等**(不钉死命令管道)。`sync_bit::DTOH` = 退回整流 sync(A/B 与回退)。
+    pub(super) fn d2h_ordered_stream(
+        &mut self,
+    ) -> Result<std::sync::Arc<cudarc::driver::CudaStream>, ModelError> {
+        let compute = self.ctx().stream(STREAM_COMPUTE)?.clone();
+        let stream = self.ctx().stream(STREAM_D2H)?.clone();
+        if self.diag.sync_at(owl_shared::config::sync_bit::DTOH) {
+            compute
+                .synchronize()
+                .map_err(|e| ModelError::Msg(format!("sync: {e:?}")))?;
+        } else {
+            let ev = compute
+                .record_event(None)
+                .map_err(|e| ModelError::Msg(format!("dtoh 跨流事件记入: {e:?}")))?;
+            stream
+                .wait(&ev)
+                .map_err(|e| ModelError::Msg(format!("dtoh 跨流事件等待: {e:?}")))?;
+        }
+        Ok(stream)
+    }
+
+    /// **批量分块读**(状态存储"整块搬出"):一次命令搬 N 段,回执 = 按序拼接。
+    pub(super) fn handle_dtoh_batch(
+        &mut self,
+        pieces: Vec<(u64, usize, usize)>,
+        ack: Ack<Result<Vec<u8>, ModelError>>,
+    ) {
+        let t0 = std::time::Instant::now();
+        let total: usize = pieces.iter().map(|p| p.2).sum();
+        let stream = match self.d2h_ordered_stream() {
+            Ok(s) => s,
+            Err(e) => return ack.send(Err(e)),
+        };
+        if let Ok((free, _)) = cudarc::driver::result::mem_get_info() {
+            owl_shared::vram::free_set(free as u64);
+        }
+        let mut ack = Some(ack);
+        match self.try_dtoh_batch(&stream, &pieces, total) {
+            Ok(staging) => {
+                let ack_cell = std::sync::Arc::new(std::sync::Mutex::new(ack.take()));
+                let pool = self.pool.clone();
+                let cell = ack_cell.clone();
+                let finish: Finish = Box::new(move || {
+                    let bytes = staging.as_bytes()[..total].to_vec();
+                    pool.put(staging);
+                    if let Some(a) = cell.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                        a.send(Ok(bytes));
+                    }
+                });
+                if let Err(e) = self.notify(&stream, finish) {
+                    if let Some(a) = ack_cell.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                        a.send(Err(e.clone()));
+                    }
+                    self.notify_failed("dtoh_batch", &e);
+                }
+            }
+            Err(e) => {
+                if let Some(a) = ack.take() {
+                    a.send(Err(e));
+                }
+            }
+        }
+        self.sink.timer("srv.seg.dtoh_batch", t0.elapsed());
+    }
+
+    /// 批读 issue 相:逐段校验 + 顺序 memcpy 进**一块**码头(单 ack 保序)。
+    pub(super) fn try_dtoh_batch(
+        &self,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        pieces: &[(u64, usize, usize)],
+        total: usize,
+    ) -> Result<Box<dyn owl_iface::contract::PinnedRegion + Send>, ModelError> {
+        if pieces.is_empty() {
+            return Err(ModelError::Msg("dtoh_batch: 空片段表".into()));
+        }
+        let mut staging: Box<dyn owl_iface::contract::PinnedRegion + Send> =
+            match self.pool.take(total) {
+                Some(b) => b,
+                None => Box::new(Staging::alloc(total, "dtoh_batch")?),
+            };
+        let mut cursor = 0usize;
+        for (i, (id, off, len)) in pieces.iter().enumerate() {
+            let n = self.ctx().block_len(*id)?;
+            let end = off
+                .checked_add(*len)
+                .ok_or_else(|| ModelError::Msg(format!("dtoh_batch: 第 {i} 段偏移+长度溢出")))?;
+            if end > n {
+                return Err(ModelError::Msg(format!(
+                    "dtoh_batch: 第 {i} 段块 {id} 字节 {n} < 偏移 {off} + 长 {len}"
+                )));
+            }
+            let (dptr, _) = self.ctx().block_ptr(*id, stream)?;
+            unsafe {
+                memcpy_dtoh_async(
+                    &mut staging.slice_bytes_mut()[cursor..cursor + len],
+                    dptr + *off as u64,
+                    stream.cu_stream(),
+                )
+            }
+            .map_err(|e| ModelError::Msg(format!("dtoh_batch async(第 {i} 段): {e:?}")))?;
+            cursor += len;
+        }
+        Ok(staging)
+    }
+
+    /// **swap 一条命令**(设计卷 §15):N 片一次提交、一次 ack。
+    ///
+    /// - `Out`(设备 → 连接器):D2H 序口逐片 memcpy 到 pinned staging;
+    ///   流完成回调里逐片 `conn.put`(**DMA 已完成**;put 是纯 host 拷贝),
+    ///   然后回执(原箱奉还)。
+    /// - `In`(连接器 → 设备):命令线程逐片 `conn.get` 到 staging(RAM = memcpy;
+    ///   **disk 层按 §15.4 另开 I/O 线程**——不在本条同步路),再 H2D 流序
+    ///   逐片 memcpy 入设备,末尾单 notify ⇒ **ack = 全部落地**。
+    ///
+    /// 错误纪律:任一失败 = **整条失败**(未入队 DMA 不得投 finish;
+    /// staging 回池;回执必达,不许断链)。
+    pub(super) fn handle_swap(
+        &mut self,
+        dir: owl_iface::contract::SwapDir,
+        pieces: Vec<owl_iface::contract::SwapPiece>,
+        conn: Box<dyn owl_iface::contract::Connector + Send>,
+        ack: Ack<Result<Box<dyn owl_iface::contract::Connector + Send>, ModelError>>,
+    ) {
+        let t0 = std::time::Instant::now();
+        if pieces.is_empty() {
+            // 空表 = 上游决策面错误(无意义的命令)⇒ 响亮拒,不入搬运路
+            ack.send(Err(ModelError::Msg("swap: 空片段表".into())));
+            self.sink.timer("srv.seg.swap", t0.elapsed());
+            return;
+        }
+        match dir {
+            owl_iface::contract::SwapDir::Out => self.swap_out(pieces, conn, ack),
+            owl_iface::contract::SwapDir::In => self.swap_in(pieces, conn, ack),
+        }
+        self.sink.timer("srv.seg.swap", t0.elapsed());
+    }
+
+    fn swap_out(
+        &mut self,
+        pieces: Vec<owl_iface::contract::SwapPiece>,
+        conn: Box<dyn owl_iface::contract::Connector + Send>,
+        ack: Ack<Result<Box<dyn owl_iface::contract::Connector + Send>, ModelError>>,
+    ) {
+        let total: usize = pieces.iter().map(|p| p.len).sum();
+        let stream = match self.d2h_ordered_stream() {
+            Ok(s) => s,
+            Err(e) => return ack.send(Err(e)),
+        };
+        if let Ok((free, _)) = cudarc::driver::result::mem_get_info() {
+            owl_shared::vram::free_set(free as u64);
+        }
+        let mut staging: Box<dyn owl_iface::contract::PinnedRegion + Send> =
+            match self.pool.take(total) {
+                Some(b) => b,
+                None => match Staging::alloc(total, "swap_out") {
+                    Ok(s) => Box::new(s),
+                    Err(e) => return ack.send(Err(e)),
+                },
+            };
+        // 逐片入队(先校验后入队;任一失败 = 整条失败,已入队的 DMA 无回执意义)
+        let mut cursor = 0usize;
+        for (i, p) in pieces.iter().enumerate() {
+            if let Err(e) = self.ctx().check_range(p.block, p.dev_off, p.len, "swap-out") {
+                self.pool.put(staging);
+                return ack.send(Err(e));
+            }
+            let (dptr, _) = match self.ctx().block_ptr(p.block, &stream) {
+                Ok(x) => x,
+                Err(e) => {
+                    self.pool.put(staging);
+                    return ack.send(Err(e));
+                }
+            };
+            let r = unsafe {
+                memcpy_dtoh_async(
+                    &mut staging.slice_bytes_mut()[cursor..cursor + p.len],
+                    dptr + p.dev_off as u64,
+                    stream.cu_stream(),
+                )
+            };
+            if let Err(e) = r {
+                self.pool.put(staging);
+                return ack.send(Err(ModelError::Msg(format!(
+                    "swap_out async(第 {i} 片): {e:?}"
+                ))));
+            }
+            cursor += p.len;
+        }
+        // 完成回调:逐片 conn.put(DMA 已完成)+ 回池 + 回执
+        let cell = std::sync::Arc::new(std::sync::Mutex::new(Some((conn, ack))));
+        let cell2 = cell.clone();
+        let pool = self.pool.clone();
+        let finish: Finish = Box::new(move || {
+            let (mut conn, ack) = match cell2.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                Some(x) => x,
+                None => return,
+            };
+            let bytes = staging.as_bytes();
+            let mut cursor = 0usize;
+            for p in &pieces {
+                if let Err(e) = conn.put(p.slot, p.conn_off, &bytes[cursor..cursor + p.len]) {
+                    pool.put(staging);
+                    ack.send(Err(e));
+                    return;
+                }
+                cursor += p.len;
+            }
+            pool.put(staging);
+            ack.send(Ok(conn));
+        });
+        if let Err(e) = self.notify(&stream, finish) {
+            if let Some((_, a)) = cell.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                a.send(Err(e.clone()));
+            }
+            self.notify_failed("swap_out", &e);
+        }
+    }
+
+    fn swap_in(
+        &mut self,
+        pieces: Vec<owl_iface::contract::SwapPiece>,
+        conn: Box<dyn owl_iface::contract::Connector + Send>,
+        ack: Ack<Result<Box<dyn owl_iface::contract::Connector + Send>, ModelError>>,
+    ) {
+        let total: usize = pieces.iter().map(|p| p.len).sum();
+        let stream = match self.ctx().stream(STREAM_H2D) {
+            Ok(s) => s.clone(),
+            Err(e) => return ack.send(Err(e)),
+        };
+        let mut staging: Box<dyn owl_iface::contract::PinnedRegion + Send> =
+            match self.pool.take(total) {
+                Some(b) => b,
+                None => match Staging::alloc(total, "swap_in") {
+                    Ok(s) => Box::new(s),
+                    Err(e) => return ack.send(Err(e)),
+                },
+            };
+        // ① 连接器 → staging(host 侧同步拷贝)
+        let mut cursor = 0usize;
+        for p in pieces.iter() {
+            if let Err(e) = conn.get(p.slot, p.conn_off, &mut staging.slice_bytes_mut()[cursor..cursor + p.len]) {
+                self.pool.put(staging);
+                return ack.send(Err(e));
+            }
+            cursor += p.len;
+        }
+        // ② staging → 设备(H2D 流序逐片;末尾单 notify ⇒ ack = 全部落地)
+        let mut cursor = 0usize;
+        for (i, p) in pieces.iter().enumerate() {
+            if let Err(e) = self.ctx().check_range(p.block, p.dev_off, p.len, "swap-in") {
+                self.pool.put(staging);
+                return ack.send(Err(e));
+            }
+            if let Err(e) = self.ctx_mut().wait_zeroing(p.block, STREAM_H2D) {
+                self.pool.put(staging);
+                return ack.send(Err(e));
+            }
+            let (dptr, _) = match self.ctx().block_ptr(p.block, &stream) {
+                Ok(x) => x,
+                Err(e) => {
+                    self.pool.put(staging);
+                    return ack.send(Err(e));
+                }
+            };
+            let r = unsafe {
+                memcpy_htod_async(
+                    dptr + p.dev_off as u64,
+                    &staging.as_bytes()[cursor..cursor + p.len],
+                    stream.cu_stream(),
+                )
+            };
+            if let Err(e) = r {
+                self.pool.put(staging);
+                return ack.send(Err(ModelError::Msg(format!(
+                    "swap_in async(第 {i} 片): {e:?}"
+                ))));
+            }
+            cursor += p.len;
+        }
+        let cell = std::sync::Arc::new(std::sync::Mutex::new(Some((conn, ack))));
+        let cell2 = cell.clone();
+        let pool = self.pool.clone();
+        let finish: Finish = Box::new(move || {
+            pool.put(staging);
+            if let Some((conn, ack)) = cell2.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                ack.send(Ok(conn));
+            }
+        });
+        if let Err(e) = self.notify(&stream, finish) {
+            if let Some((_, a)) = cell.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                a.send(Err(e.clone()));
+            }
+            self.notify_failed("swap_in", &e);
+        }
+    }
+
+    /// 带偏移读(状态存储搬出面);**与 `handle_dtoh` 同一条执行路径**。
+    pub(super) fn handle_dtoh_at(
+        &mut self,
+        id: u64,
+        off_bytes: usize,
+        want_bytes: usize,
+        ack: Ack<Result<Vec<u8>, ModelError>>,
+    ) {
+        let t0 = std::time::Instant::now();
+        self.handle_dtoh_inner(id, off_bytes, want_bytes, ack);
+        self.sink.timer("srv.seg.dtoh_at", t0.elapsed());
     }
 
     pub(super) fn handle_dtoh_inner(
         &mut self,
         id: u64,
+        off_bytes: usize,
         want_bytes: usize,
         ack: Ack<Result<Vec<u8>, ModelError>>,
     ) {
@@ -426,31 +755,12 @@ impl GpuServer {
         // 核之后 —— **保序强度与整流 sync 同源**(事件记在尾上 = 等它 = 等此前全部),
         // 但服务端不等,后续命令照跑。
         // `sync_bit::DTOH`(全同步归因档的 dtoh 半边)= 退回整流 sync(A/B 与回退)。
-        let compute = match self.ctx().stream(STREAM_COMPUTE) {
-            Ok(s) => s.clone(),
-            Err(e) => return ack.send(Err(e)),
-        };
-        let stream = match self.ctx().stream(STREAM_D2H) {
-            Ok(s) => s.clone(),
+        // 序:交给共享的 D2H 序口(与 `DtohAt`/`DtohBatch` 同一条实现)
+        let stream = match self.d2h_ordered_stream() {
+            Ok(s) => s,
             Err(e) => return ack.send(Err(e)),
         };
         let t_d2h = (want_bytes <= 64 && self.probes.d2h_prof).then(std::time::Instant::now);
-        if self.diag.sync_at(owl_shared::config::sync_bit::DTOH) {
-            if let Err(e) = compute.synchronize().map_err(|e| ModelError::Msg(format!("sync: {e:?}"))) {
-                return ack.send(Err(e));
-            }
-        } else {
-            match compute.record_event(None) {
-                Ok(ev) => {
-                    if let Err(e) = stream.wait(&ev) {
-                        return ack.send(Err(ModelError::Msg(format!("dtoh 跨流事件等待: {e:?}"))));
-                    }
-                }
-                Err(e) => {
-                    return ack.send(Err(ModelError::Msg(format!("dtoh 跨流事件记入: {e:?}"))));
-                }
-            }
-        }
         // 取证(B6.3 后泄漏案):每次收割刷新设备余量账(engine 侧逐 turn 打印;
         // cuMemGetInfo µs 级,收割频度下零税)
         if let Ok((free, _)) = cudarc::driver::result::mem_get_info() {
@@ -461,7 +771,7 @@ impl GpuServer {
         }
         let t_d2h2 = t_d2h;
         let mut ack = Some(ack);
-        match self.try_dtoh(&stream, id, want_bytes) {
+        match self.try_dtoh(&stream, id, off_bytes, want_bytes) {
             Ok(staging) => {
                 if let Some(t) = t_d2h2 {
                     self.sink.logf(owl_shared::log::LVL_DEBUG, "d2h-prof", format_args!("issue={:?}", t.elapsed()));
@@ -491,30 +801,41 @@ impl GpuServer {
 
     /// dtoh issue 相(非阻塞):账长校验 + 异步 memcpy 到 pinned 码头。
     /// 返回码头(随 finish 存活至搬运完成后由派发线程释放)。
+    /// dtoh issue 相(非阻塞):账长校验 + 异步 memcpy 到 pinned 码头。
+    /// **唯一执行路径**:`off_bytes = 0` 即老的整块前缀读(`Command::Dtoh`)。
+    /// 返回码头(随 finish 存活至搬运完成后由派发线程释放)。
     pub(super) fn try_dtoh(
         &self,
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
         id: u64,
+        off_bytes: usize,
         want_bytes: usize,
     ) -> Result<Box<dyn owl_iface::contract::PinnedRegion + Send>, ModelError> {
         let n = self.ctx().block_len(id)?; // 块账本 = 字节(2026-09-26 f16 基线)
-        // 前缀读取放行(E5-DF4:池复用块 > 声明尺寸,诊断收割取前缀;
-        // 超读仍拒 —— 真错)。等大读路径不变。
-        if want_bytes > n {
+        // 区间校验:偏移 + 长度 ≤ 块字节(越读 = 真错,响亮拒)
+        let end = off_bytes
+            .checked_add(want_bytes)
+            .ok_or_else(|| ModelError::Msg("dtoh: 偏移 + 长度溢出".into()))?;
+        if end > n {
             return Err(ModelError::Msg(format!(
-                "dtoh: 块 {id} 字节 {n} < 收割 {want_bytes}"
+                "dtoh: 块 {id} 字节 {n} < 偏移 {off_bytes} + 收割 {want_bytes}"
             )));
         }
         let (dptr, _) = self.ctx().block_ptr(id, stream)?;
-        // 码头池化(S1):收割路径同样高频(token 4B/步;logits 大块另计)
+        // 码头池化(S1):收割路径同样高频(token 4B/步;logits 大块另计)。
+        // 容量按 **want_bytes**(偏移读只要这一段;池 take 以尺寸为键)
         let mut staging: Box<dyn owl_iface::contract::PinnedRegion + Send> =
-            match self.pool.take(n) {
+            match self.pool.take(want_bytes) {
                 Some(b) => b,
-                None => Box::new(Staging::alloc(n, "dtoh")?),
+                None => Box::new(Staging::alloc(want_bytes, "dtoh")?),
             };
-        // 拷贝长度钉死 n(池码头容量 ≥ n,整段拷会越读设备块)
+        // 拷贝长度钉死 want_bytes(码头容量 ≥ want_bytes,整段拷会越读设备块)
         unsafe {
-            memcpy_dtoh_async(&mut staging.slice_bytes_mut()[..n], dptr, stream.cu_stream())
+            memcpy_dtoh_async(
+                &mut staging.slice_bytes_mut()[..want_bytes],
+                dptr + off_bytes as u64,
+                stream.cu_stream(),
+            )
         }
         .map_err(|e| ModelError::Msg(format!("dtoh async: {e:?}")))?;
         Ok(staging)
