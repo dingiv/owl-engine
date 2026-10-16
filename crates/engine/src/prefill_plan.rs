@@ -117,6 +117,9 @@ pub(crate) struct BucketGraph<D: DeviceClient> {
     pub(crate) dtype: Dtype,
     /// GDN 状态槽口径:Some(s) = 本图把槽 s 烘死(host 槽臂)⇒ 只对槽 s 可用
     pub(crate) gdn_slot_baked: Option<usize>,
+    /// **捕获期的格释放世代**(恒 0:捕获在 boot,任何会话都没建过)。
+    /// 用法见 [`BucketGraph::usable`]:格一旦换过主(逐出/关闭)→ 不再可用。
+    pub(crate) slot_epoch_baked: u32,
     /// FI 页链槽的声明容量(= 池管理面页数;`fi_indices` 槽长度)
     fi_nb: usize,
     /// 回放次数(证据面:桶被真用了吗;测试/运维读取)
@@ -126,11 +129,22 @@ pub(crate) struct BucketGraph<D: DeviceClient> {
 
 impl<D: DeviceClient> BucketGraph<D> {
     /// 本桶此刻可用吗(纯判定;可单测)。`false` ⇒ 调用方走 eager 原路。
-    pub(crate) fn usable(&self, t_real: usize, gdn_slot: usize) -> bool {
-        self.captured
-            && t_real >= 1
-            && t_real <= self.t_pad
-            && self.gdn_slot_baked.is_none_or(|s| s == gdn_slot)
+    ///
+    /// ⚠️ **两道判据**(2026-10-17 定位卷):①槽号相等(host 槽臂烘的是该槽的
+    /// 地址/口径);②**该格自 boot 起没换过主**(`slot_epoch` = 捕获期世代)。
+    /// 只卡①是不够的 —— 逐出释放后新会话重绑同一槽号照样过①,而桶回放会
+    /// **静默产错值**(实测:同格第二个会话;关桶即正常)。②把这种情况逼回
+    /// eager(正确性优先,与"绝不静默串台"同律)。
+    pub(crate) fn usable(&self, t_real: usize, gdn_slot: usize, slot_epoch: u32) -> bool {
+        bucket_usable(
+            self.captured,
+            t_real,
+            self.t_pad,
+            self.gdn_slot_baked,
+            gdn_slot,
+            self.slot_epoch_baked,
+            slot_epoch,
+        )
     }
 
     /// **回放**:写输入槽(全 `t_pad` 长度)→ 1 条 `graph_launch` → 真行视图。
@@ -200,6 +214,25 @@ impl<D: DeviceClient> BucketGraph<D> {
 // §4 桶族(捕获面)
 // ============================================================================
 
+/// **桶可用性纯函数**(单一事实源 = [`BucketGraph::usable`];提出来是为了单测)。
+///
+/// 判据两条(见 `usable` 注):①槽号 = 烘焙槽;②该格世代未变(没换过主)。
+pub(crate) fn bucket_usable(
+    captured: bool,
+    t_real: usize,
+    t_pad: usize,
+    baked_slot: Option<usize>,
+    gdn_slot: usize,
+    baked_epoch: u32,
+    slot_epoch: u32,
+) -> bool {
+    captured
+        && t_real >= 1
+        && t_real <= t_pad
+        && baked_slot.is_none_or(|s| s == gdn_slot)
+        && slot_epoch == baked_epoch
+}
+
 /// 捕获期 boot 事实(显式依赖;零隐式读取)
 pub(crate) struct BucketBoot<'a> {
     pub(crate) env: EnvProvider,
@@ -256,12 +289,17 @@ impl<D: DeviceClient> PrefillBuckets<D> {
     /// 命中查询:t **向上取整**到最小可用桶;该桶不可用(未捕获/槽不匹配)
     /// ⇒ None(走 eager 原路)。纯 host 判定(零分配、零设备往返)。
     /// (回放面用可变版;只读版不设 —— 命中判定单源在 [`BucketGraph::usable`])
-    pub(crate) fn get_mut(&mut self, t: usize, gdn_slot: usize) -> Option<&mut BucketGraph<D>> {
+    pub(crate) fn get_mut(
+        &mut self,
+        t: usize,
+        gdn_slot: usize,
+        slot_epoch: u32,
+    ) -> Option<&mut BucketGraph<D>> {
         let t_pad = self.t_pad_for(t)?;
         self.buckets
             .iter_mut()
             .find(|b| b.t_pad == t_pad)
-            .filter(|b| b.usable(t, gdn_slot))
+            .filter(|b| b.usable(t, gdn_slot, slot_epoch))
     }
 
     /// 向上取整命中(阶梯来自本族桶表;纯函数同 [`pick_bucket`])
@@ -530,6 +568,8 @@ impl<D: DeviceClient> PrefillBuckets<D> {
             taps,
             dtype,
             gdn_slot_baked: slot_baked,
+            // 捕获在 boot(零会话)⇒ 世代必为 0(见 `SessionTable::slot_epoch`)
+            slot_epoch_baked: 0,
             fi_nb: nb,
             replays: 0,
             plan,

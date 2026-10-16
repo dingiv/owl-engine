@@ -2189,6 +2189,27 @@ fn prefill_bucket_pick_and_ladder() {
     assert!(!gdn_host_slot_arm(&env, &dims, 512));
 }
 
+/// **桶可用性两道判据**(2026-10-17 定位卷):槽号相等 + **该格没换过主**。
+/// 只卡槽号的旧判据在「逐出释放 → 新会话重绑同槽号」时照样放行,而桶回放
+/// 会**静默产错值**(实测:同格第二个会话;`…-定位实录.md`)。
+#[cfg(test)]
+#[test]
+fn prefill_bucket_usable_needs_unreused_slot() {
+    use crate::prefill_plan::bucket_usable;
+    // 基线:捕获过 + t 在桶内 + 槽 0 + 世代 0 ⇒ 可用
+    assert!(bucket_usable(true, 57, 64, Some(0), 0, 0, 0));
+    // ① 槽号不匹配 ⇒ 不可用(旧判据)
+    assert!(!bucket_usable(true, 57, 64, Some(0), 3, 0, 0));
+    // ② **同槽号但换过主**(世代 1)⇒ 不可用(新判据;本案的洞)
+    assert!(!bucket_usable(true, 57, 64, Some(0), 0, 0, 1), "同格第二个会话必须回 eager");
+    // ③ 其它既有判据不回退
+    assert!(!bucket_usable(false, 57, 64, Some(0), 0, 0, 0), "未捕获");
+    assert!(!bucket_usable(true, 0, 64, Some(0), 0, 0, 0), "空 chunk");
+    assert!(!bucket_usable(true, 65, 64, Some(0), 0, 0, 0), "超桶");
+    // ④ varlen 臂(槽任一,烘的是设备张量)不受本判据影响
+    assert!(bucket_usable(true, 57, 64, None, 7, 0, 0));
+}
+
 // ===========================================================================
 // M2b:prefill 桶图(设计 §4–§6;GPU 门控)
 // ===========================================================================
@@ -2222,6 +2243,7 @@ async fn gpu_prefill_bucket_matches_eager() {
         dir: &std::path::Path,
         ordinal: usize,
         b: PrefillBucket,
+        gdn_slots: usize,
     ) -> RunningEngine<owl_cuda::GpuClient> {
         // `EnvProvider::default()` 是 attest=false(诊断 A/B 保留位);生产走
         // `from_config` ⇒ `from_dispatch` 恒真(2026-10-13 用户令)⇒ 本测显式打开。
@@ -2234,6 +2256,7 @@ async fn gpu_prefill_bucket_matches_eager() {
             prefill_chunk: 512,
             knobs: EngineKnobs {
                 prefill_bucket: b,
+                gdn_slots,
                 sampler_enabled: false,
                 env,
                 ..EngineKnobs::default()
@@ -2244,8 +2267,13 @@ async fn gpu_prefill_bucket_matches_eager() {
         engine.run(loaded).await.expect("装配")
     }
     let prompt = "长城是中国古代的军事防御工程,用来抵御北方游牧民族的侵袭。".repeat(40);
-    async fn gen(running: &mut RunningEngine<owl_cuda::GpuClient>, prompt: &str, n: usize) -> String {
-        let id = running.submit(prompt.to_string(), n).expect("submit");
+    async fn gen_session(
+        running: &mut RunningEngine<owl_cuda::GpuClient>,
+        session: Option<u64>,
+        prompt: &str,
+        n: usize,
+    ) -> String {
+        let (_, id) = running.submit_session(session, prompt.to_string(), n).expect("submit");
         loop {
             match running.pump().await.expect("pump") {
                 TurnEvent::Completed { turn, text, .. } if turn == id => return text,
@@ -2255,8 +2283,11 @@ async fn gpu_prefill_bucket_matches_eager() {
             }
         }
     }
+    async fn gen(running: &mut RunningEngine<owl_cuda::GpuClient>, prompt: &str, n: usize) -> String {
+        gen_session(running, None, prompt, n).await
+    }
     // ① 桶档
-    let mut g = boot_bucket(&dir, ordinal, PrefillBucket::Geobuckets).await;
+    let mut g = boot_bucket(&dir, ordinal, PrefillBucket::Geobuckets, 8).await;
     let buckets = g.graphs.prefill.captured_t_pads();
     eprintln!("[m2b] 桶捕获:{:?}(summary = {})", buckets, g.graphs.prefill.summary());
     assert!(
@@ -2271,9 +2302,40 @@ async fn gpu_prefill_bucket_matches_eager() {
     assert!(!used.is_empty(), "桶一个都没回放 ⇒ 图路没生效(本测在测 eager vs eager)");
     assert!(used.contains(&512), "本 prompt(chunk=512)应命中 t512 桶,实测 {used:?}");
     // ② eager 档(同模型同配置,只关桶)
-    let mut e = boot_bucket(&dir, ordinal, PrefillBucket::Off).await;
+    let mut e = boot_bucket(&dir, ordinal, PrefillBucket::Off, 8).await;
     let out_eager = gen(&mut e, &prompt, 24).await;
     eprintln!("[m2b] 桶档 {out_graph:?}\n[m2b] eager {out_eager:?}");
     assert!(!out_graph.trim().is_empty(), "桶档空回答");
     assert_eq!(out_graph, out_eager, "桶图与 eager 的贪心输出必须逐字相同(M2b 跨档门)");
+
+    // ③ **同格复用腿**(2026-10-17 定位卷:`26-10-17-prefill桶图-二次会话污染-定位实录.md`)。
+    //
+    // `gdn_slots = 1` ⇒ 第二个会话**必然**重绑 0 号格(前一会话被 LRU 逐出)。
+    // 桶的 host 槽臂把该格**地址/口径烘死**;旧判据只看"槽号相等" ⇒ 复用照样
+    // 放行 ⇒ 回放产出**静默错值**(服务面实测:第二发空应答、模型读不出 prompt)。
+    // 本腿钉两条:①**用户可见不变量** —— 桶档与 eager 档逐字相同(含复用发);
+    // ②**行为面** —— 复用发不回放桶(`replay_counts` 增量 0;安全闸生效)。
+    let mut reuse: Vec<(String, String)> = Vec::new();
+    for b in [PrefillBucket::Geobuckets, PrefillBucket::Off] {
+        let mut g = boot_bucket(&dir, ordinal, b, 1).await;
+        let t1 = gen_session(&mut g, Some(1), &prompt, 16).await;
+        let n1: usize = g.graphs.prefill.replay_counts().iter().map(|(_, n)| *n).sum();
+        let t2 = gen_session(&mut g, Some(2), &prompt, 16).await;
+        let n2: usize = g.graphs.prefill.replay_counts().iter().map(|(_, n)| *n).sum();
+        assert_eq!(
+            g.bank.sessions.slot_epoch(0),
+            1,
+            "第二会话必须走来复用腿(0 号格换过主)—— 否则本腿没在测复用"
+        );
+        eprintln!("[m2b] 复用腿 {b:?}:首个会话桶回放 {n1} / 复用会话增量 {}", n2 - n1);
+        // ⚠️ **不断言"复用发必须回放桶"也不断言"不许回放"** —— 那是修法口径:
+        // 安全闸在场时复用发回 eager(增量 0);根治(跨流序补齐)后复用发会
+        // **正常回放桶**。本腿只钉**用户可见不变量**(两档逐字相同),
+        // 因此两种修法下都绿、而"复用即错值"的病态在任一种下都红 ✓。
+        reuse.push((t1, t2));
+    }
+    assert_eq!(
+        reuse[0], reuse[1],
+        "同格复用档:桶档与 eager 档逐字相同(定位卷 §1 的回归锁)"
+    );
 }

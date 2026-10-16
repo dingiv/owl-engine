@@ -243,7 +243,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             return Ok(None);
         }
         // 命中判定(向上取整;槽不匹配/未捕获都在 `usable` 里结构化拒)
-        let Some(bg) = self.graphs.prefill.get_mut(t, gdn_slot_v) else {
+        let slot_epoch = self.bank.sessions.slot_epoch(gdn_slot_v);
+        let Some(bg) = self.graphs.prefill.get_mut(t, gdn_slot_v, slot_epoch) else {
             return Ok(None);
         };
         let t_pad = bg.t_pad;

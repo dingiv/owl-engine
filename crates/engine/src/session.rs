@@ -131,6 +131,16 @@ pub struct SessionTable {
     next_id: u64,
     /// E5:LRU 触达时钟(get_or_create 递增;会话账 last_use)
     tick: u64,
+    /// **每格释放世代**(2026-10-17;prefill 桶图安全闸的输入)。
+    ///
+    /// 桶图的 host 槽臂把**一个 GDN 格的地址/口径烘死**(见
+    /// `prefill_plan` 模块头注),而格会被逐出/关闭后**重绑给另一个会话**。
+    /// 实测(`26-10-17-prefill桶图-二次会话污染-定位实录.md`):同格被第二个
+    /// 会话复用时桶回放产出**静默错值**(模型读不出 prompt;关桶即正常)。
+    /// ⇒ 桶的可用性必须不只看**格号**,还要看**该格自 boot 起有没有换过主**。
+    /// 本表每次 `close`(逐出/显式关闭/临时会话烧毁共用的出口)给该格 +1;
+    /// 桶记下捕获期的世代(恒 0),`usable` 要求两者相等 ⇒ 任何换主都回 eager。
+    slot_epoch: std::collections::HashMap<usize, u32>,
 }
 
 impl SessionTable {
@@ -201,10 +211,21 @@ impl SessionTable {
 
     /// 会话结束(客户端显式关闭;KV 区域归还 —— M0.5 单槽 = 账本清理)
     pub fn close(&mut self, id: u64) -> Result<()> {
+        let slot = self.sessions.get(&id).map(|s| s.gdn_slot);
         self.sessions
             .remove(&id)
             .map(|_| ())
-            .ok_or_else(|| owl_iface::contract::ModelError::Msg(format!("session {id} 不存在")))
+            .ok_or_else(|| owl_iface::contract::ModelError::Msg(format!("session {id} 不存在")))?;
+        // 格释放 ⇒ 世代 +1(桶图安全闸;见 `slot_epoch` 字段注)。
+        if let Some(slot) = slot {
+            *self.slot_epoch.entry(slot).or_insert(0) += 1;
+        }
+        Ok(())
+    }
+
+    /// 该格**当前**释放世代(0 = 自 boot 起从未换主 ⇒ 桶图可用)。
+    pub fn slot_epoch(&self, slot: usize) -> u32 {
+        *self.slot_epoch.get(&slot).unwrap_or(&0)
     }
 }
 
@@ -451,6 +472,25 @@ mod tests {
         assert_eq!(s.cached_len, 0);
         assert_eq!(s.gdn_slot, 0, "7 号 close 已释放 0 号格");
     }
+    /// 格释放世代(2026-10-17):close 才 +1(建/复用不动),逐出路径的
+    /// close 也走同一出口 ⇒ 桶图安全闸看得到每一次换主。
+    #[test]
+    fn slot_epoch_bumps_only_on_close() {
+        let mut st = SessionTable::new();
+        let (_, s) = st.get_or_create(Some(1), 4).expect("建 1");
+        assert_eq!(s.gdn_slot, 0);
+        assert_eq!(st.slot_epoch(0), 0, "建会话不动世代");
+        st.get_or_create(Some(1), 4).expect("复用不动世代");
+        assert_eq!(st.slot_epoch(0), 0);
+        st.close(1).expect("关");
+        assert_eq!(st.slot_epoch(0), 1, "释放 ⇒ +1");
+        assert_eq!(st.slot_epoch(1), 0, "未用过的格恒 0");
+        // 重绑同格:世代记得住(桶图从此对该格不可用)
+        let (_, s) = st.get_or_create(Some(2), 4).expect("2 号重绑 0 格");
+        assert_eq!(s.gdn_slot, 0);
+        assert_eq!(st.slot_epoch(0), 1);
+    }
+
     /// E5:LRU 逐出候选 + 已存在会话复用不占格(2026-10-10 实录修复)
     #[test]
     fn session_lru_victim_and_reuse() {
