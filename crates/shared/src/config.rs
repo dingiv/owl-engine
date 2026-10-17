@@ -469,6 +469,18 @@ pub struct ProbesCfg {
     /// 解释器检查点的运行期档位。⚠️ 需以 `--features stepgate` 构建才生效;
     /// 未编入时入口会**可见地告警**(不静默失效)。
     pub step_gate: crate::stepgate::StepMode,
+    /// **FI plan 宿主标量槽的桶化步长**(0 = 关;diag:plan 只在跨桶时重算)
+    /// —— 原 `OWL_FI_BUCKET` env(2026-10-17 审查:从每 decode 步直读收进配置面)
+    #[serde(default)]
+    pub fi_bucket: usize,
+    /// **KV 页字节差分落点**(`<pos>` = 在该 decode 步前后各 d2h 一页,一次;
+    /// 写者足迹取证面)—— 原 `OWL_KV_DUMP` env(同上收编)
+    #[serde(default)]
+    pub kv_dump_at: Option<usize>,
+    /// **verify 行 0..7 的 prompt/门控 dump**(perf 会话排查用)
+    /// —— 原 `OWL_PW_DUMP_TOK` env(同上收编)
+    #[serde(default)]
+    pub pw_dump_tok: bool,
     /// 粘滞档每检查点睡眠毫秒(缺省 50)
     #[serde(default = "default_step_gate_ms")]
     pub step_gate_ms: u64,

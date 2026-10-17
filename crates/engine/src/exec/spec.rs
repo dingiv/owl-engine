@@ -175,7 +175,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let tok_f = vg.read_output_f32("tok").await?;
             // 诊断(perf 会话排查用;`OWL_PW_DUMP_TOK=1`):verify 行 0..7 的
             // 候选 token —— piecewise 断裂时最直接的判据(常量/零 = 读未写值)
-            if owl_shared::env_reader::flag("OWL_PW_DUMP_TOK") {
+            if self.probes.pw_dump_tok {
                 eprintln!("[pw-tok] pos={pos} tok={:?}", tok_f);
                 let h = vg.read_output_f32("hid").await?;
                 let (mut nan, mut mx, mut sum) = (0usize, 0f32, 0f64);

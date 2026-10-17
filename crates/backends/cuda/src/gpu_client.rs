@@ -542,6 +542,11 @@ impl DeviceClient for GpuClient {
         self.submit(move |ack| Command::Launch { msg, ack })?.await
     }
 
+    /// 设备 SM 数(CUDA:服务端 `cuDeviceGetAttribute`;客户端零 CUDA 依赖)
+    async fn sm_count(&mut self) -> Result<usize, ModelError> {
+        self.submit(move |ack| Command::DeviceSmCount { ack })?.await
+    }
+
     /// **块账本投影**(调试面;默认 trait 口"不支持" ⇒ 这里给 GPU 实现)
     async fn block_ledger_dump(
         &mut self,

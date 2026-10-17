@@ -221,15 +221,17 @@ impl GpuServer {
             self.pool.put(buf);
             return Err(e);
         }
-        let t_dma = std::time::Instant::now();
-        let dma = unsafe {
+        // 计时用 `timer_scope!`(作用域表达式形态):非 perf 档宏展开 = 原表达式
+        // ⇒ 不再有"变量只在 debug/perf 被读"的 unused 告警,也不再白读一次时钟
+        // (2026-10-17 审查:原 `let t_dma = Instant::now(); … timer_record!` 在
+        //  release 档既告警又白付一次 clock_gettime)。
+        let dma = owl_shared::timer_scope!("srv.dma_enqueue", unsafe {
             memcpy_htod_async(
                 dptr_base + (offset_bytes as u64),
                 &buf.as_bytes()[..len_bytes],
                 stream.cu_stream(),
             )
-        };
-        owl_shared::timer_record!("srv.dma_enqueue", t_dma.elapsed());
+        });
         owl_shared::counter_add!("srv.dma_bytes", len_bytes as u64);
         if let Err(e) = dma {
             // 建场失败:未入队任何 DMA,finish 不得投递 —— 租约回池 + 返回错误

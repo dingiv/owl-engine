@@ -35,7 +35,10 @@ use crate::launch::issue_launch;
 use crate::state::{DeviceSelector, GpuCtx, KernelCache, Staging};
 use owl_iface::contract::{Arg, Bytes, Dtype, LaunchMsg};
 use crate::state::{STREAM_COMPUTE, STREAM_D2H, STREAM_H2D};
-use crate::state::StreamId;
+
+/// 发射账三表(拆分自本文件的同源三表;见模块头)
+mod trace_map;
+mod capture_gate;
 use owl_iface::contract::ModelError;
 use std::sync::mpsc;
 
@@ -475,124 +478,6 @@ impl GpuServer {
         );
     }
 
-    /// 命令 → 发射账目(派发前调用;块 id 顺带解析成设备地址 —— 地址复用判据)
-    fn trace_entry_of(&self, cmd: &Command) -> crate::trace::TraceEntry {
-        use crate::trace::TraceEntry as E;
-        let resolve = |ids: &[u64]| -> Vec<u64> {
-            let Ok(st) = self.ctx().stream(crate::state::STREAM_COMPUTE) else {
-                return Vec::new();
-            };
-            ids.iter()
-                .map(|id| self.ctx().block_ptr(*id, st).map(|(p, _)| p).unwrap_or(0))
-                .collect()
-        };
-        match cmd {
-            Command::BlockLedgerDump { .. } => E::new("block_ledger_dump", ""),
-            Command::MemPoolTrim { .. } => E::new("mem_pool_trim", ""),
-            Command::UploadAndLaunch { dst, chunks, .. } => {
-                let n: usize = chunks.iter().map(|c| c.len_bytes).sum();
-                E::new("upload_and_launch", "h2d").bytes(n).id(dst.id)
-            }
-            Command::LaunchAndHarvest { id, want_bytes, .. } => {
-                E::new("launch_and_harvest", "d2h").bytes(*want_bytes).id(*id)
-            }
-            Command::Launch { msg, .. } => {
-                let ids: Vec<u64> = msg
-                    .args
-                    .iter()
-                    .filter_map(|a| match a {
-                        Arg::Block { id, .. } => Some(*id),
-                        Arg::BlockSlice { id, .. } => Some(*id),
-                        _ => None,
-                    })
-                    .collect();
-                let ptrs = resolve(&ids);
-                // 契约:最后一个 Block/BlockSlice = 输出(launch.rs 回传口径)
-                let out_id = msg
-                    .args
-                    .iter()
-                    .rev()
-                    .find_map(|a| match a {
-                        Arg::Block { id, .. } => Some(*id),
-                        Arg::BlockSlice { id, .. } => Some(*id),
-                        _ => None,
-                    })
-                    .unwrap_or(0);
-                let mut e = E::new("launch", "compute")
-                    .name(msg.kernel.name.clone())
-                    .grid(msg.grid, msg.block, msg.shared_mem)
-                    .bytes(msg.out_elems)
-                    .ids(ids)
-                    .ptrs(ptrs);
-                e.out_id = out_id;
-                e
-            }
-            Command::Htod { data, name, stream, .. } => E::new("htod", stream_label(*stream))
-                .bytes(data.len())
-                .name(name.clone()),
-            Command::HtodChunk { block, data, stream, .. } => {
-                E::new("htod_chunk", stream_label(*stream)).bytes(data.len()).id(*block)
-            }
-            Command::HtodChunks { writes, stream, .. } => E::new("htod_chunks", stream_label(*stream))
-                .bytes(writes.iter().map(|w| w.2.len()).sum())
-                .ids(writes.iter().map(|w| w.0)),
-            Command::UploadPinned { dst, len_bytes, stream, .. } => {
-                E::new("upload_pinned", stream_label(*stream)).bytes(*len_bytes).id(dst.id)
-            }
-            Command::Dtoh { id, want_bytes, .. } => {
-                E::new("dtoh", "d2h").bytes(*want_bytes).id(*id)
-            }
-            Command::DtohAt { id, want_bytes, .. } => {
-                E::new("dtoh_at", "d2h").bytes(*want_bytes).id(*id)
-            }
-            Command::DtohBatch { pieces, .. } => E::new("dtoh_batch", "d2h")
-                .bytes(pieces.iter().map(|p| p.2).sum())
-                .ids(pieces.iter().map(|p| p.0)),
-            Command::Swap { dir, pieces, .. } => match dir {
-                owl_iface::contract::SwapDir::Out => E::new("swap_out", "d2h")
-                    .bytes(pieces.iter().map(|p| p.len).sum())
-                    .ids(pieces.iter().map(|p| p.block)),
-                owl_iface::contract::SwapDir::In => E::new("swap_in", stream_label(STREAM_COMPUTE as u8))
-                    .bytes(pieces.iter().map(|p| p.len).sum())
-                    .ids(pieces.iter().map(|p| p.block)),
-            },
-            Command::Alloc { n_bytes, zero, name, .. } => E::new("alloc", "compute")
-                .bytes(*n_bytes)
-                .name(format!("{}{name}", if *zero { "zero:" } else { "uninit:" })),
-            Command::MemsetZero { block, len_bytes, .. } => {
-                let ptrs = resolve(&[*block]);
-                E::new("memset_zero", "compute").bytes(*len_bytes).id(*block).ptrs(ptrs)
-            }
-            Command::Free { ids, .. } => {
-                // 回收前解析(此后账房已移除)⇒ free 条目自带地址
-                let ptrs = resolve(ids);
-                E::new("free", "").ids(ids.clone()).ptrs(ptrs)
-            }
-            Command::CopyBlock { src, dst, len_bytes, .. } => {
-                E::new("copy_block", "compute").bytes(*len_bytes).ids([*src, *dst])
-            }
-            Command::CopyBatch { copies, .. } => {
-                let ids: Vec<u64> = copies.iter().flat_map(|c| [c.0, c.2]).collect();
-                let ptrs = resolve(&ids);
-                E::new("copy_batch", "compute")
-                    .bytes(copies.iter().map(|c| c.4).sum())
-                    .ids(ids)
-                    .ptrs(ptrs)
-            }
-            Command::Sync { .. } => E::new("sync", ""),
-            Command::GraphBegin { .. } => E::new("graph_begin", ""),
-            Command::GraphEnd { .. } => E::new("graph_end", ""),
-            Command::GraphLaunch { .. } => E::new("graph_launch", "compute"),
-            Command::GraphAbort { .. } => E::new("graph_abort", ""),
-            Command::GraphDestroy { .. } => E::new("graph_destroy", ""),
-            Command::AllocPinned { bytes, name, .. } => E::new("alloc_pinned", "").bytes(*bytes).name(name.clone()),
-            // 查询面:零字节、零流、零地址(它不产设备动作);名字位记 top-N
-            Command::LedgerReport { top, .. } => E::new("ledger_report", "").name(format!("top{top}")),
-            Command::LedgerJson { .. } => E::new("ledger_json", ""),
-            Command::Close { .. } => E::new("close", ""),
-        }
-    }
-
     /// 事件循环主入口(server 线程生命周期 = 循环生命周期)。
     /// 首行上线设备(本线程 bind_to_thread 一次到位)+ 起派发线程。
     pub fn run(mut self) -> Result<(), String> {
@@ -738,7 +623,7 @@ impl GpuServer {
                 }
                 other if closing => {
                     // Closing 态:拒绝必须用 ServerClosed(客户端可程序化识别)
-                    Self::reject_closed(other);
+                    capture_gate::reject_closed(other);
                 }
                 other => self.dispatch(other),
             }
@@ -823,44 +708,13 @@ impl GpuServer {
     // dispatch:issue 相(全非阻塞;GPU API 提交进流即返回)
     // ======================================================================
 
-    /// 命令的**目标流**(E1 记账表:哪些命令在 GPU 上落活、落在哪条流)。
+    /// **设备 SM 数**(`cuDeviceGetAttribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)`)。
     ///
-    /// 与 `trace_entry_of` 的流标签同表(那里是给 trace 看的字符串;本表是
-    /// 给事件记账看的 StreamId)。**扩充命令面时必须同步**(E2 复合命令按
-    /// 自身语义定流)。
-    fn cmd_stream(c: &Command) -> u8 {
-        match c {
-            // H2D 流:一切 host→device 搬运
-            Command::Htod { stream, .. } => 1u8 << (*stream as usize),
-            // **上传落点流由命令自述**(2026-10-17):参数面走 COMPUTE(同流有序),
-            // 批量面走 H2D(重叠优先);记账/审计据此上屏
-            Command::HtodChunk { stream, .. } | Command::HtodChunks { stream, .. } => {
-                1u8 << (*stream as usize)
-            }
-            Command::UploadPinned { stream, .. } => 1u8 << (*stream as usize),
-            // COMPUTE 流:发射 / 清零分配 / 设备内拷贝 / 图回放
-            Command::Launch { .. }
-            | Command::Alloc { .. }
-            | Command::MemsetZero { .. }
-            | Command::CopyBlock { .. }
-            | Command::CopyBatch { .. }
-            | Command::GraphLaunch { .. } => 1u8 << STREAM_COMPUTE,
-            // D2H 流:一切 device→host 回读
-            Command::Dtoh { .. } | Command::DtohAt { .. } | Command::DtohBatch { .. } => {
-                1u8 << STREAM_D2H
-            }
-            // swap:按方向落流(Out = D2H 回读;**In = COMPUTE 写入** —— 内容
-            // 就是下一步计算要读的状态,同流 FIFO 才结构性有序;见 harvest.rs 注)
-            Command::Swap { dir, .. } => match dir {
-                owl_iface::contract::SwapDir::Out => 1u8 << STREAM_D2H,
-                owl_iface::contract::SwapDir::In => 1u8 << STREAM_COMPUTE,
-            },
-            // 复合:两条腿各触一条流(E2 位图的第一个用例)
-            Command::UploadAndLaunch { .. } => (1u8 << STREAM_H2D) | (1u8 << STREAM_COMPUTE),
-            Command::LaunchAndHarvest { .. } => (1u8 << STREAM_COMPUTE) | (1u8 << STREAM_D2H),
-            // 无 GPU 活/图控制/同步/宿主面:不记账(调试投影亦不触流)
-            _ => 0,
-        }
+    /// 语义:恒定属性 ⇒ 只读、无流、捕获期安全;查询失败 = 结构化拒
+    /// (调用方(引擎 XQA 面)自行决定回退并告警 —— 不在这里猜数字)。
+    fn handle_device_sm_count(&self) -> Result<usize, ModelError> {
+        crate::ffi::device_sm_count(self.ctx().device_ordinal())
+            .map_err(|e| ModelError::Msg(format!("device_sm_count: {e}")))
     }
 
     fn dispatch(&mut self, cmd: Command) {
@@ -873,7 +727,7 @@ impl GpuServer {
             (None, None)
         };
         // E1:本命令的落流(记账用;必须在 dispatch_inner 吞掉 cmd 之前取)
-        let sbits = Self::cmd_stream(&cmd);
+        let sbits = trace_map::cmd_stream(&cmd);
         self.dispatch_inner(cmd);
         // **E1 纯记账**:把本命令的完成点记到该流尾事件(不等待任何东西;
         // 序消费在 E2/E3)。捕获期自动跳过(见 `record_tail`)。
@@ -927,7 +781,7 @@ impl GpuServer {
         // **发射账**(2026-10-14):派发前记一条 —— 得到"host 视角的事实发射序
         // + 流归属 + 块地址"。关账(容量 0)= 此处一个 None 判定,零开销。
         if let Some(tr) = self.trace.as_ref() {
-            let e = self.trace_entry_of(&cmd);
+            let e = trace_map::entry_of(self.ctx(), &cmd);
             tr.push(e);
         }
         // G2 护栏:捕获期间放行清单 = **Launch / Alloc(切 slab) / MemsetZero /
@@ -992,6 +846,8 @@ impl GpuServer {
             Command::CopyBatch { copies, ack } => self.handle_copy_batch(copies, ack),
             Command::Launch { msg, ack } => self.handle_launch(msg, ack),
             // **E2b 接线**:复合 = 设备端事件序(record_tail + waitEvent),零 host 阻塞
+            // 设备 SM 数:宿主面只读属性(无 GPU 活);失败 = 结构化拒(不猜)
+            Command::DeviceSmCount { ack } => ack.send(self.handle_device_sm_count()),
             Command::BlockLedgerDump { ack } => {
                 ack.send(self.ctx().block_ledger())
             }
@@ -1017,115 +873,8 @@ impl GpuServer {
 
     /// 捕获期违规命令的结构化拒绝
     fn reject(cmd: Command, sink: owl_shared::log::LogSink) {
-        Self::reject_with(cmd, "图捕获进行中:该操作被拒 —— 捕获期仅允许 \
+        capture_gate::reject_with(cmd, "图捕获进行中:该操作被拒 —— 捕获期仅允许 \
              Launch/Alloc;同步/搬运/图操作会破坏图捕获".to_string(), sink);
-    }
-
-    /// Closing 态拒绝:每条命令的 ack 都必须回 ServerClosed
-    /// (否则客户端 Future 永远 pending —— 本轮挂死根因)
-    fn reject_closed(cmd: Command) {
-        macro_rules! closed { ($ack:expr) => { $ack.send(Err(ModelError::ServerClosed)) } }
-        match cmd {
-            Command::Close { ack } => ack.send(Ok(())), // 幂等
-            Command::Alloc { ack, .. } => closed!(ack),
-            Command::MemsetZero { ack, .. } => closed!(ack),
-            Command::Htod { ack, .. } => closed!(ack),
-            Command::HtodChunk { ack, .. } => closed!(ack),
-            Command::HtodChunks { ack, .. } => closed!(ack),
-            Command::AllocPinned { ack, .. } => closed!(ack),
-            Command::LedgerReport { ack, .. } => closed!(ack),
-            Command::LedgerJson { ack, .. } => closed!(ack),
-            Command::UploadPinned { ack, .. } => closed!(ack),
-            Command::BlockLedgerDump { ack } => closed!(ack),
-            Command::MemPoolTrim { ack } => closed!(ack),
-            Command::UploadAndLaunch { ack, .. } => closed!(ack),
-            Command::LaunchAndHarvest { ack, .. } => closed!(ack),
-            Command::Dtoh { ack, .. } => closed!(ack),
-            Command::DtohAt { ack, .. } => closed!(ack),
-            Command::DtohBatch { ack, .. } => closed!(ack),
-            Command::Swap { ack, .. } => closed!(ack),
-            Command::Free { ack, .. } => closed!(ack),
-            Command::CopyBlock { ack, .. } => closed!(ack),
-            Command::CopyBatch { ack, .. } => closed!(ack),
-            Command::Launch { ack, .. } => closed!(ack),
-            Command::Sync { ack, .. } => closed!(ack),
-            Command::GraphBegin { ack, .. } => closed!(ack),
-            Command::GraphEnd { ack, .. } => closed!(ack),
-            Command::GraphLaunch { ack, .. } => closed!(ack),
-            Command::GraphAbort { ack, .. } => closed!(ack),
-            Command::GraphDestroy { ack, .. } => closed!(ack),
-        }
-    }
-
-    fn reject_with(cmd: Command, why: String, sink: owl_shared::log::LogSink) {
-        macro_rules! reject { ($ack:expr) => { $ack.send(Err(ModelError::Msg(why.clone()))) } }
-        let name = |c: &Command| match c {
-            // E2 复合(分相计时标签;与 Command::kind() 同名单一真源)
-            Command::BlockLedgerDump { .. } => "block_ledger_dump",
-            Command::MemPoolTrim { .. } => "mem_pool_trim",
-            Command::UploadAndLaunch { .. } => "upload_and_launch",
-            Command::LaunchAndHarvest { .. } => "launch_and_harvest",
-            Command::GraphBegin { .. } => "GraphBegin",
-            Command::GraphEnd { .. } => "GraphEnd",
-            Command::GraphLaunch { .. } => "GraphLaunch",
-            Command::GraphAbort { .. } => "GraphAbort",
-            Command::GraphDestroy { .. } => "GraphDestroy",
-            Command::Dtoh { .. } => "Dtoh",
-            Command::DtohAt { .. } => "DtohAt",
-            Command::DtohBatch { .. } => "DtohBatch",
-            Command::Swap { .. } => "Swap",
-            Command::Alloc { .. } => "Alloc",
-            Command::MemsetZero { .. } => "MemsetZero",
-            Command::Htod { .. } => "Htod",
-            Command::HtodChunk { .. } => "HtodChunk",
-            Command::HtodChunks { .. } => "HtodChunks",
-            Command::AllocPinned { .. } => "AllocPinned",
-            Command::LedgerReport { .. } => "LedgerReport",
-            Command::LedgerJson { .. } => "LedgerJson",
-            Command::UploadPinned { .. } => "UploadPinned",
-            Command::Dtoh { .. } => "Dtoh",
-            Command::Free { .. } => "Free",
-            Command::CopyBlock { .. } => "CopyBlock",
-            Command::CopyBatch { .. } => "CopyBatch",
-            Command::Sync { .. } => "Sync",
-            Command::Launch { .. } => "Launch",
-            Command::Close { .. } => "Close",
-        };
-        sink.logf(owl_shared::log::LVL_WARN, "owl-gpu", format_args!("捕获期拒绝: {} —— {why}", name(&cmd)));
-        match cmd {
-            Command::GraphBegin { ack } => reject!(ack),
-            Command::GraphEnd { ack } => reject!(ack),
-            Command::GraphLaunch { ack, .. } => reject!(ack),
-            Command::GraphAbort { ack, .. } => reject!(ack),
-            Command::GraphDestroy { ack, .. } => reject!(ack),
-            Command::Alloc { ack, .. } => reject!(ack),
-            Command::MemsetZero { ack, .. } => reject!(ack),
-            Command::Htod { ack, .. } => reject!(ack),
-            Command::HtodChunk { ack, .. } => reject!(ack),
-            Command::HtodChunks { ack, .. } => reject!(ack),
-            Command::AllocPinned { ack, .. } => reject!(ack),
-            Command::LedgerReport { ack, .. } => reject!(ack),
-            Command::LedgerJson { ack, .. } => reject!(ack),
-            Command::UploadPinned { ack, .. } => reject!(ack),
-            // **E2 负门**:复合命令内含搬运/回读(不可捕获)⇒ 捕获期结构化拒
-            Command::BlockLedgerDump { ack } => reject!(ack),
-            // 池回收 = host 侧池操作(与图捕获无关的全局动作)⇒ 捕获期拒
-            Command::MemPoolTrim { ack } => reject!(ack),
-            Command::UploadAndLaunch { ack, .. } => reject!(ack),
-            Command::LaunchAndHarvest { ack, .. } => reject!(ack),
-            Command::Dtoh { ack, .. } => reject!(ack),
-            // 带偏移读同 Dtoh:捕获窗内**结构化拒**(状态存储的搬运只在段边界)
-            Command::DtohAt { ack, .. } => reject!(ack),
-            Command::DtohBatch { ack, .. } => reject!(ack),
-            // **swap 同 Dtoh/Batch**:搬运只在段边界,捕获窗内结构化拒
-            Command::Swap { ack, .. } => reject!(ack),
-            Command::Sync { ack, .. } => reject!(ack),
-            Command::Free { ack, .. } => reject!(ack),
-            Command::CopyBlock { ack, .. } => reject!(ack),
-            Command::CopyBatch { ack, .. } => reject!(ack),
-            Command::Launch { ack, .. } => reject!(ack),
-            Command::Close { ack } => ack.send(Ok(())), // 幂等
-        }
     }
 
     /// alloc 段分相(与客户端 `interp.host.seg.alloc` 对账;差值 = 管道)
@@ -2141,19 +1890,6 @@ impl owl_kernels::device::DeviceRes for GpuRes<'_> {
 
     fn device_ordinal(&self) -> Result<i32, OpError> {
         Ok(self.ctx.device_ordinal() as i32)
-    }
-}
-
-/// 墙钟毫秒(诊断落盘用;时钟回拨 = 0,非失败路径 —— 与 `prompt_dump` 同律)
-/// **流位序 → 上屏标签**(单一事实源;发射账 `trace_entry_of` 与事件记账
-/// `GpuServer::cmd_stream` 共用 —— 两处必须同口径。旧版在 trace 侧硬写字符串,
-/// 曾把参数面的写一律标成 "h2d",2026-10-17 桶图复用案排查时被它误导过一轮)。
-fn stream_label(bit: u8) -> &'static str {
-    match bit as StreamId {
-        STREAM_H2D => "h2d",
-        STREAM_COMPUTE => "compute",
-        STREAM_D2H => "d2h",
-        _ => "?",
     }
 }
 

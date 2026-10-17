@@ -704,6 +704,18 @@ impl StatePool {
         // 输入槽(verify 图 vs decode 图各自的 `xqa_seq`/`xqa_sem`)。
         // 掩码:q=1 时只读 index 0,而 index 0 = `(1<<1)-1 = 1` —— 恰好是
         // decode 需要的"bit0 允许自身",**两形状共用同一张量**。
+        // XQA 的 SM 数:**取设备真值**(2026-10-17 审查:原硬编码 84 = sm86 双卡,
+        // 3080 档 = 68 ⇒ 启发式偏大)。查询不可用 = 回退常量 + 响亮告警(不静默)。
+        let xqa_sm_count = match face.sm_count().await {
+            Ok(v) => v,
+            Err(e) => {
+                owl_shared::log_warn!(
+                    "boot",
+                    "设备 SM 数查询不可用({e})⇒ XQA 取回退常量 {XQA_SM_COUNT_FALLBACK}(切分粒度可能偏大)"
+                );
+                XQA_SM_COUNT_FALLBACK
+            }
+        };
         let xqa = if paged
             && (plan.xqa_verify || plan.xqa_decode || plan.xqa_prefill)
             && matches!(plan.kv, owl_models::env::KvQuant::Fp8E4M3)
@@ -753,7 +765,7 @@ impl StatePool {
                 scratch: block_leaf_dt(&scr.0, vec![(scr_mb << 20) / 2], Dtype::F16),
                 q_seq_len: seqs,
                 max_seq_len: nb_i * page,
-                sm_count: XQA_SM_COUNT,
+                sm_count: xqa_sm_count,
             })
         } else {
             None
@@ -786,7 +798,7 @@ impl StatePool {
             owl_models::env::KvQuant::Fp8E5M2 => "kv fp8 e5m2",
             owl_models::env::KvQuant::None => "kv f16",
         };
-        owl_shared::log_info!("boot", "状态块分配 {:.2}s({kv_label} ×{} / gdn ×{},会话容量 {},池 {nb} 页 × {page} tok,页表 nb = {nb},dflash = {df})",
+        owl_shared::log_info!("boot", "状态块分配 {:.2}s({kv_label} ×{} / gdn ×{},会话容量 {},池 {nb} 页 × {page} tok,页表 nb = {nb},dflash = {df},XQA sm = {xqa_sm_count})",
             t.elapsed().as_secs_f32(),
             kvs.len(),
             gdns.len(),
@@ -1424,10 +1436,13 @@ impl StatePool {
     }
 }
 
-/// XQA 的 `multiProcessorCount`(KV-split 启发式;**只影响切分粒度,不影响
-/// 正确性**)。⚠️ FIXME:硬编码 sm86 双卡(SM=84);3080 为 68 —— 挂账:后端
-/// 暴露 multi_processor_count 后改查询(DeviceClient 现无此面)。
-const XQA_SM_COUNT: usize = 84;
+/// XQA 的 `multiProcessorCount`(**回退常量**;2026-10-17 审查收口)。
+///
+/// KV-split 启发式参数,**只影响切分粒度、不影响正确性**。现役取值路径 =
+/// 设备真值(`DeviceClient::sm_count` → `cuDeviceGetAttribute(MULTIPROCESSOR_COUNT)`);
+/// 本常量只在**查询不可用**时兜底(且回退时**响亮告警** —— 不静默:84 = sm86 双卡,
+/// 在 3080(68)上会让启发式系统性偏大)。
+const XQA_SM_COUNT_FALLBACK: usize = 84;
 
 /// 按 dtype 清零分配(KV/GDN 状态块)。**设备侧 alloc + memset**,不走
 /// host 零向量 —— 曾用 `vec![0f32; n]` + to_le_bytes 逐元素造 64MB(rec

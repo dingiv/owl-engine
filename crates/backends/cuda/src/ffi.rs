@@ -145,6 +145,29 @@ pub fn device_rows() -> Result<Vec<owl_shared::device::DeviceRow>, String> {
     Ok(out)
 }
 
+/// **设备 SM（多处理器)数**(按 ordinal;内部自管 cuInit)。
+///
+/// 用途:XQA KV-split 启发式的 `sm_count`(此前引擎侧硬编码 84 = sm86 双卡,
+/// 3080 档 = 68 ⇒ 系统性偏大)。与本文件 `device_rows` 的 PCI 属性查询同族:
+/// 只读驱动属性、零分配、无懒状态(准入铁律 ✓)。
+pub fn device_sm_count(ordinal: usize) -> Result<usize, String> {
+    use cudarc::driver::sys::{cuDeviceGetAttribute, CUdevice_attribute, CUresult};
+    driver_init().map_err(|e| format!("driver_init: {e:?}"))?;
+    let dev = device_get(ordinal as i32).map_err(|e| format!("device_get({ordinal}): {e:?}"))?;
+    let mut v: i32 = 0;
+    let rc = unsafe {
+        cuDeviceGetAttribute(
+            &mut v,
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+            dev,
+        )
+    };
+    if rc != CUresult::CUDA_SUCCESS {
+        return Err(format!("cuDeviceGetAttribute(MULTIPROCESSOR_COUNT): {rc:?}"));
+    }
+    Ok(v.max(1) as usize)
+}
+
 /// 取指定 ordinal 的设备 UUID(内部自管 cuInit;UUID 钉卡的配套查询)
 pub fn device_uuid(ordinal: usize) -> Result<[u8; 16], DriverError> {
     driver_init()?;

@@ -113,10 +113,11 @@ impl GraphGovernor {
                 law: "A1.2",
             });
         }
-        debug_assert!(
-            self.profiles.contains(&profile),
-            "捕获档必须来自规划档位表"
-        );
+        // **响亮拒,不用 debug_assert**(2026-10-17 审查 C1):release 档原会静默
+        // 放行 ⇒ 规划表外的档占掉 live 预算而 preflight 看不见(报数失真)。
+        if !self.profiles.contains(&profile) {
+            return Err(GraphError::ProfileNotPlanned { profile });
+        }
         self.live_graphs += 1;
         self.phase = GraphPhase::Captured;
         Ok(())
@@ -292,4 +293,9 @@ pub enum GraphError {
     /// 定影超限:实测 footprint 超过规划 allowance(A5.4 同族)
     #[error("A5.4 定影超限:实测 {measured}B > allowance {allowance}B,销图处理")]
     OverAllowance { measured: u64, allowance: u64 },
+    /// **捕获档位未规划**(A1.2:档位必须先规划后捕获)。2026-10-17 审查补:
+    /// 原为 `debug_assert!` ⇒ release 静默放行 ⇒ 未规划的档占掉一格 live 预算
+    /// (规划面看不见 ⇒ 后续 preflight 报数失真)。
+    #[error("捕获档位未规划:{profile:?}(档位表外)")]
+    ProfileNotPlanned { profile: GraphProfile },
 }

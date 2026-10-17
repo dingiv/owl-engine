@@ -392,6 +392,14 @@ impl MetricsStore {
     }
 
     /// timer_end 实现:弹栈配对 → 样本落库(**附父 tag = 调用树边**)
+    ///
+    /// `file`/`line` 只在"无配对 start"的**诊断日志**里用(该日志本身受
+    /// `debug_assertions ∨ feature="perf"` 门控)⇒ 非 perf 档它们未被读:
+    /// 显式 `allow`(2026-10-17 审查清告警),不动签名(macro 面契约不变)。
+    #[cfg_attr(
+        not(any(debug_assertions, feature = "perf")),
+        allow(unused_variables)
+    )]
     pub fn timer_end(&self, tag: &str, file: &'static str, line: u32) -> Result<(), MetricsError> {
         if !self.armed(level::HOST) {
             return Ok(());

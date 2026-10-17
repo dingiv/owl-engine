@@ -149,7 +149,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 // ⚙ diag(`OWL_FI_BUCKET=<n>`):把**宿主标量槽**按桶上取整 ⇒ plan
                 // 只在跨桶时重算(表仍按真值写 ⇒ 每行 KV 上界由设备表定)。
                 // 判据:文本仍 ≡ 参考臂(plan 过供给只是多些被掩的 CTA)。
-                let bucket = owl_shared::env_reader::parse::<usize>("OWL_FI_BUCKET").unwrap_or(0);
+                let bucket = self.probes.fi_bucket;
                 let plan_ctx = if bucket > 0 {
                     ctx_total.div_ceil(bucket) * bucket
                 } else {
@@ -180,7 +180,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // ⚙ KV 页字节差分(OWL_KV_DUMP=<pos>,一次):写前/写后各 d2h 一页 ⇒
         // **写者的足迹**直接给出块内元素序(页面连续 vs 8B 小块 strided),
         // 不需要任何参考值(见 docs §11.11「写者 A/B」)。
-        let kv_dump_at = owl_shared::env_reader::parse::<usize>("OWL_KV_DUMP");
+        let kv_dump_at = self.probes.kv_dump_at;
         if kv_dump_at == Some(pos) {
             self.dump_kv_page(sid, kv_slot, "before").await?;
         }

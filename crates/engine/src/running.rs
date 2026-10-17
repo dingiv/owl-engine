@@ -63,6 +63,13 @@ pub struct StepProbes {
     pub gdn_dbg: bool,
     /// prefill H2D 叶子后流栅栏(A13 竞态排障;原 OWL_PF_FENCE)
     pub pf_fence: bool,
+    /// FI plan 宿主标量槽桶化步长(0 = 关;原 OWL_FI_BUCKET —— 2026-10-17 审查
+    /// 从**每 decode 步直读 env** 收进本结构:入口组装一次,内部零 env 读取)
+    pub fi_bucket: usize,
+    /// KV 页差分落点(原 OWL_KV_DUMP,同上收编)
+    pub kv_dump_at: Option<usize>,
+    /// verify 行 dump(原 OWL_PW_DUMP_TOK,同上收编)
+    pub pw_dump_tok: bool,
 }
 
 impl StepProbes {
@@ -87,6 +94,16 @@ impl StepProbes {
             prompt_dump: p.prompt_dump,
             gdn_dbg: p.gdn_dbg,
             pf_fence: p.pf_fence,
+            // 三枚诊断旋钮:配置优先,env 回退(既有用法零迁移;解析失败可见)
+            fi_bucket: if p.fi_bucket > 0 {
+                p.fi_bucket
+            } else {
+                owl_shared::env_reader::parse::<usize>("OWL_FI_BUCKET").unwrap_or(0)
+            },
+            kv_dump_at: p
+                .kv_dump_at
+                .or_else(|| owl_shared::env_reader::parse::<usize>("OWL_KV_DUMP")),
+            pw_dump_tok: p.pw_dump_tok || owl_shared::env_reader::flag("OWL_PW_DUMP_TOK"),
         }
     }
 }

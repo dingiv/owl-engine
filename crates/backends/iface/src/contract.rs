@@ -762,6 +762,19 @@ pub trait DeviceClient: Send {
         None
     }
 
+    /// **设备 SM(多处理器)数** —— 计算单元真值。
+    ///
+    /// 用途:XQA 的 KV-split 启发式参数 `sm_count`(原为引擎里硬编码
+    /// `XQA_SM_COUNT = 84` = sm86 双卡;3080 = 68 ⇒ 启发式系统性偏大)。
+    /// 语义:同步小查询(后端可缓存);**默认 = 不支持** ⇒ 结构化拒(不猜数字),
+    /// 调用方自行决定回退(引擎面回退到既有常量并**响亮告警**)。
+    fn sm_count(&mut self) -> impl Future<Output = Result<usize, ModelError>> + Send
+    where
+        Self: Sized,
+    {
+        async { Err(ModelError::Msg("sm_count: 该后端未提供设备属性查询".into())) }
+    }
+
     /// 设备内批量块→块拷贝(E5-M4:spec 快照 capture/restore 的 192 次
     /// 逐块往返收敛为一次命令;单 ack = 全部已入流)。默认 = 逐条
     /// copy_block_at(CPU face / 未覆写后端语义等价)。

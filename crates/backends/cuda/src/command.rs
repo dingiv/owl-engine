@@ -203,6 +203,11 @@ pub enum Command {
     MemPoolTrim {
         ack: Ack<Result<u64, ModelError>>,
     },
+    /// **设备 SM 数查询**(宿主面只读;`cuDeviceGetAttribute(MULTIPROCESSOR_COUNT)`)。
+    /// 与 `BlockLedgerDump` 同族:无 GPU 活、无流、捕获期可放行(恒定值,不碰设备状态)。
+    DeviceSmCount {
+        ack: Ack<Result<usize, ModelError>>,
+    },
     /// **块账本投影**(调试面;`GET /debug/blocks`):全活块 (id, 字节, dtype, 地址, 账本)
     /// —— 判「同 id 两地址」与「两活块区间相交」的唯一权威快照。
     BlockLedgerDump {
@@ -256,6 +261,7 @@ impl Command {
             Self::Alloc { .. } => "alloc",
             Self::Htod { .. } => "htod",
             Self::MemsetZero { .. } => "memset_zero",
+            Self::DeviceSmCount { .. } => "device_sm_count",
             Self::BlockLedgerDump { .. } => "block_ledger_dump",
             Self::MemPoolTrim { .. } => "mem_pool_trim",
             Self::UploadAndLaunch { .. } => "upload_and_launch",
@@ -292,6 +298,7 @@ impl Command {
             Self::GraphDestroy { ack, .. } => ack.created_at(),
             Self::Alloc { ack, .. } => ack.created_at(),
             Self::Htod { ack, .. } => ack.created_at(),
+            Self::DeviceSmCount { ack } => ack.created_at(),
             Self::BlockLedgerDump { ack } => ack.created_at(),
             Self::MemPoolTrim { ack } => ack.created_at(),
             Self::UploadAndLaunch { ack, .. } => ack.created_at(),
