@@ -968,6 +968,50 @@ pub struct BlockSet {
     pub reserved: usize,
 }
 
+/// **纯近期选择**(无打分、无排序):sink 保底 + recent 保底 + **从尾往前填满**。
+///
+/// 用途:**两次完整召回之间的“廉价边界”**(见 `OWL_RECALL_EVERY`)。
+/// 口径与参考实现的 prefill 压力路径(`pick_prefill_ungrouped`)同构 ——
+/// 那里也只做「sink + mandatory + 从最新往前填」,**不打分不排序**。
+///
+/// 为什么不复用 `select` 传空分:那会让 `score_of` 全 `-inf`,sink/recent 之外的名额
+/// **填不满**(优先级不明确);这里的语义是**明确的近期优先**。
+pub fn select_recency(order: &[ChainHash], budget: SelectBudget) -> BlockSet {
+    let n = order.len();
+    if budget.blocks == 0 || n == 0 {
+        return BlockSet::default();
+    }
+    let sink_n = budget.sink.min(n);
+    let recent_n = budget.recent.min(n.saturating_sub(sink_n));
+    let mut picked: Vec<bool> = vec![false; n];
+    for p in picked.iter_mut().take(sink_n) {
+        *p = true;
+    }
+    for p in picked.iter_mut().skip(n.saturating_sub(recent_n)) {
+        *p = true;
+    }
+    let reserved = picked.iter().filter(|x| **x).count();
+    // 从尾往前填(越近越先留);已被保底占位的不重复计数
+    let mut count = reserved;
+    for i in (0..n).rev() {
+        if count >= budget.blocks {
+            break;
+        }
+        if !picked[i] {
+            picked[i] = true;
+            count += 1;
+        }
+    }
+    let dropped = n - count;
+    let blocks = order
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| picked[*i])
+        .map(|(_, b)| *b)
+        .collect();
+    BlockSet { blocks, dropped, reserved }
+}
+
 /// **选择**(论文 §4.3):sink + recent 保底 → 按分补足 → **按时间序重排**。
 ///
 /// `order` = 候选块的**时间序**(论文的 chronology;不在 `order` 里的候选被忽略)。
@@ -980,9 +1024,17 @@ pub fn select(
     if budget.blocks == 0 {
         return BlockSet::default();
     }
-    let score_of = |b: &ChainHash| -> f32 {
-        scored.iter().find(|(k, _)| k == b).map(|(_, s)| *s).unwrap_or(f32::NEG_INFINITY)
-    };
+    // **分数表一次建完**(2026-10-19 性能修正):原实现把 `score_of` 写成对 `scored`
+    // 的**线性查找**,而建 `rest` 时逐元素调一次 ⇒ **O(B²)**。B=8192 时 =
+    // 3300 万次比对/边界(纯 latent 开销,与打分无关),在“每块边界召回一次”下
+    // 会随 ctx 平方增长。一次建表 ⇒ O(B)。
+    let mut table: std::collections::HashMap<ChainHash, f32> =
+        std::collections::HashMap::with_capacity(scored.len());
+    for (b, s) in scored {
+        table.insert(*b, *s);
+    }
+    let score_of =
+        |b: &ChainHash| -> f32 { table.get(b).copied().unwrap_or(f32::NEG_INFINITY) };
     // ① 保底:sink(时间序最前) + recent(时间序最后)
     let n = order.len();
     let sink_n = budget.sink.min(n);

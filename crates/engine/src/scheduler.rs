@@ -283,11 +283,23 @@ impl<D: DeviceClient> RunningEngine<D> {
                 }
             };
             // E2b:块表确保覆盖 prompt(增量 turn 块链已存,只长新增段)
+            //
+            // **锁①后半(2026-10-19)**:原实现一次长到**整个 prompt** ——
+            // 池 ≥ ctx 时从不暴露;池 < ctx(虚拟化档)时那一步就要几千页槽
+            // ⇒ 必 `Exhausted`。虚拟化档只长到**首个 chunk** 的那几页,
+            // 后面由 `execute_prefill` 逐 chunk 增量长(用到哪长到哪);
+            // 腾位归召回点的驻留调和。
             {
                 let s = self.bank.sessions
                     .get_mut(turn.session_id)
                     .expect("submit 已建会话账");
-                self.bank.rel.leg.ensure_for_len(&mut s.block_table, turn.prompt_ids.len())?;
+                let target = if self.cfg.knobs.kvmem_virtualization {
+                    Self::prefill_step_chunk(0, turn.prompt_ids.len(), self.cfg.prefill_chunk)
+                        .unwrap_or(1)
+                } else {
+                    turn.prompt_ids.len()
+                };
+                self.bank.rel.leg.ensure_for_len(&mut s.block_table, target)?;
             }
             begin = Some(BeginPlan {
                 session_id: turn.session_id,

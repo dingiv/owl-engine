@@ -89,16 +89,71 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         };
         // 调试门:prefill 块粒度(见 owl_shared::stepgate;`--step-gate` 控制)
         owl_shared::step_gate!("engine.prefill").await;
+        // **锁①后半:块表按 chunk 增量长**(只在虚拟化档;2026-10-19)。
+        //
+        // 原行为:turn 起点一次性把块表按**整个 prompt** 长到位
+        // (`scheduler.rs` 的 `ensure_for_len(prompt_len)`)—— 池 ≥ ctx 时从不暴露,
+        // 但池 < ctx 时那一步就要一次性拿到几千页的槽 ⇒ **必 `Exhausted`**。
+        // 虚拟化档改成"**用到哪长到哪**":本 chunk 要写的 `[base, base+t)` 落在
+        // 哪几页就把表长到那几页,每步只增量 `chunk/page` 页;
+        // 腾位由召回点的驻留调和(A/B 两轴)负责 —— 也正是超卖成立的方式。
+        //
+        // 幂等(`ensure_for_len` 只增不减)⇒ 非虚拟化档也调不坏(但为不改旧行为,
+        // 只在本档执行)。
+        if self.cfg.knobs.kvmem_virtualization {
+            let need = base + chunk_ids.len();
+            let s = self
+                .bank
+                .sessions
+                .get_mut(sid)
+                .ok_or_else(|| ModelError::Msg("prefill 块表增长:会话账不在场".into()))?;
+            self.bank.rel.leg.ensure_for_len(&mut s.block_table, need)?;
+        }
         let last_row = self.prefill_chunk(&chunk_ids, base, is_last).await?;
+        // **A0 取证**(`OWL_VRAM_DBG=1`):每 chunk 的显存轨迹 ——
+        // "中间件是否归还"只能由**逐 chunk 的 live 曲线**判定(单点 dump 分不出
+        // "当前 chunk 在飞"与"历史累积")。
+        if std::env::var_os("OWL_VRAM_DBG").is_some() {
+            eprintln!(
+                "[vram-c] chunk@{} t={} ⇒ live={} MiB · 驱动 free={} MiB",
+                base,
+                chunk_ids.len(),
+                owl_shared::vram::live_bytes() >> 20,
+                owl_shared::vram::free_bytes() >> 20
+            );
+        }
         // E2c:块边界跨越 → GDN 快照拍摄(快照身份 = 边界块**内容身份**,
         // 由链哈希游标出 —— 物理块号会被回收复用,不可作键)
         let new_fed = base + chunk_ids.len();
         if self.pool.paged && new_fed.is_multiple_of(self.pool.page) {
             self.capture_gdn_snap(sid, new_fed).await?;
-            // ── B 轴覆盖率探针(Q-2 第三段)──
+            // ── B 轴选择层(生产面 + 可选诊断面)──
             // 必须**晚于**边界事件:索引/快照刚登记完,候选块才齐(§8.4)。
-            if self.cfg.knobs.coverage_probe {
-                self.coverage_analyze(sid, new_fed).await?;
+            // 两扇门:`select_decode`(生产)= 打分/选择/视图/调和;
+            // `coverage_probe`(诊断)= 额外算真实质量与覆盖率读数。
+            if self.cfg.knobs.coverage_probe || self.cfg.knobs.select_decode {
+                // **末个边界**(≠ 末个 chunk):prompt 末尾未必页对齐,而边界只在
+                // **chunk 末且页对齐**处发生 ⇒ 预测「下一条边界会不会来」用的是
+                // 调度器**同一份**块长函数(`Scheduler::prefill_step_chunk`),
+                // 而非在这里另写一套分块算术(接口单源)。
+                // 重诊断缺省只在这条边界做 —— 见 `coverage_analyze` 的采样表。
+                let prompt_len = self
+                    .turns
+                    .active
+                    .as_ref()
+                    .map(|a| a.prompt_ids.len())
+                    .unwrap_or(new_fed);
+                let next_end =
+                    Self::prefill_step_chunk(
+                        new_fed,
+                        prompt_len,
+                        self.cfg.prefill_chunk,
+                    )
+                    .map(|n| new_fed + n)
+                    .unwrap_or(new_fed);
+                let last_boundary =
+                    next_end == new_fed || !next_end.is_multiple_of(self.pool.page);
+                self.coverage_analyze(sid, new_fed, last_boundary).await?;
             }
         }
         self.turns.active.as_mut().expect("活跃").fed += chunk_ids.len();

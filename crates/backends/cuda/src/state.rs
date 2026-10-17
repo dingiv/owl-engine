@@ -504,6 +504,21 @@ pub(super) fn vram_budget_guard(
         owl_shared::vram::free_set(free);
         let avail = free.saturating_sub(reserve_bytes);
         if n_bytes as u64 > avail {
+            // **取证**(2026-10-19):把当时的三个数打全(此前只报"要多少/还剩多少",
+            // 剩下"谁吃掉了"无从判断)。`OWL_VRAM_DBG=1` 时连成功路径也打(看趋势)。
+            let (pu, _puh, pr, _prh) = pool_ledger_snapshot().unwrap_or((0, 0, 0, 0));
+            eprintln!(
+                "[vram-guard] 拒发:要 {} MiB,驱动 free={} MiB,reserve={} MiB,avail={} MiB,\
+                 池 used={} MiB / reserved={} MiB ⇒ **池内可复用 {} MiB**,live 账={} MiB",
+                n_bytes >> 20,
+                free >> 20,
+                reserve_bytes >> 20,
+                avail >> 20,
+                pu >> 20,
+                pr >> 20,
+                pr.saturating_sub(pu) >> 20,
+                owl_shared::vram::live_bytes() >> 20,
+            );
             return Err(ModelError::PoolExhausted {
                 pool: "vram-hard-budget(驱动 free − reserve)".into(),
                 needed: n_bytes as u64,
@@ -1218,6 +1233,21 @@ impl GpuCtx {
         let slab = unsafe { stream.alloc::<u8>(slab_cap) }
             .map_err(|e| ModelError::Msg(format!("graph_begin: 捕获 slab 分配失败({}MiB) {e:?}", slab_cap >> 20)))?;
         owl_shared::vram::live_add(slab_cap as i64); // B6.5(直配不走 handle_alloc)
+        // **取证**(2026-10-19;`OWL_VRAM_DBG=1`):图捕获 slab 是"每图一份、
+        // 按 warmup 计量满额" ⇒ 多图叠加会静默吃掉 GB 级
+        // ("满额 × 图数 = VRAM 爆的工程债")。打印每次捕获量与累计。
+        if std::env::var_os("OWL_VRAM_DBG").is_some() {
+            // 进程内累计(仅取证;不进账)
+            static SLAB_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let t = SLAB_TOTAL.fetch_add(slab_cap as u64, std::sync::atomic::Ordering::Relaxed)
+                + slab_cap as u64;
+            eprintln!(
+                "[graph-slab] 本次 {} MiB · 累计 {} MiB · live 账 {} MiB",
+                slab_cap >> 20,
+                t >> 20,
+                owl_shared::vram::live_bytes() >> 20
+            );
+        }
         let slab = Arc::new(slab);
         stream
             .begin_capture(CAPTURE_MODE_THREAD_LOCAL)
@@ -1734,6 +1764,28 @@ impl GpuCtx {
                 .iter()
                 .partition(|id| self.graph_refs.borrow().is_pinned(**id));
             self.sink.count("srv.count.free_pinned_reject", pinned.len() as u64);
+            // **取证**(2026-10-19):拒收 = 块**永远回不了池**。累计字节(此前只报块数
+            // ⇒ "每 chunk 漏 ~128 MiB"这种量级看不出来)。
+            {
+                static REJ_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                static REJ_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let bytes: u64 = pinned
+                    .iter()
+                    .map(|id| self.blocks.get(id).map(|b| b.bytes as u64).unwrap_or(0))
+                    .sum();
+                let tb =
+                    REJ_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed) + bytes;
+                let tn = REJ_BLOCKS
+                    .fetch_add(pinned.len() as u64, std::sync::atomic::Ordering::Relaxed)
+                    + pinned.len() as u64;
+                eprintln!(
+                    "[free-pinned] 拒收 {} 块 / {} MiB(累计 {} 块 / {} MiB)",
+                    pinned.len(),
+                    bytes >> 20,
+                    tn,
+                    tb >> 20
+                );
+            }
             // 告警带"是哪张图钉的"(refs 字段的实际用途:诊断可行动)
             let holder: Vec<GraphId> = self
                 .graphs

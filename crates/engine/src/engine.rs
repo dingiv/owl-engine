@@ -58,39 +58,44 @@ pub struct EngineKnobs {
     /// **宿主层预算 MiB**(状态存储三层的中层;缺省 **0 = 关层**,REQ C4)。
     /// 环境变量 `OWL_HOST_CACHE_MB`;S3-3b(回灌)接线前开了也没用
     pub host_cache_mb: usize,
-    /// **选择层索引采集(B 轴 B-0;缺省关)**。`OWL_INDEX_PROBE=1`。
+    /// **选择层索引采集(B 轴 B-0;缺省关)**。`OWL_INDEX_PROBE=1` / `[kvmem].index`。
     ///
     /// 开则:块边界(与 GDN 快照同处)回读该页 K → host 逆 RoPE 求 Mean-K →
     /// 登记进 store 的索引账(`AssetKind::Index`,host 层)。
     /// ⚠️ 一期是**回读**形态(每页 ~3MB D2H,一次性建索引);核内累加是后续优化。
+    /// `select_decode` 蕴含它(打分的前置件)。
     pub index_probe: bool,
-    /// **选择层覆盖率探针(B 轴 B-1 前置件;缺省关)**。`OWL_COVERAGE_PROBE=1`。
+    /// **选择层覆盖率探针 —— 诊断面**(缺省关)。`OWL_COVERAGE_PROBE=1`。
     ///
-    /// 开则(与 [`Self::index_probe`] 配套:索引在场才能打分):prefill chunk
-    /// 执行时把本 chunk 的 **post-RoPE Q**(逐全注意力层,`ForwardCtx::q_sink`)
-    /// 与主根**同一遍**归约(`eval_ops_multi_scoped_env` —— 前向带 GDN 状态
-    /// 副作用,**绝不双执行**),随后 host:逆 RoPE 得 `q̃` → `score_blocks` 打分 /
-    /// post-RoPE `q` × 回读 K 点积 = **真实逐块注意力质量** → `coverage_curve`。
-    /// 门 = 论文量级(top-8 ≈ 66.5% / top-16 ≈ 77%;设计卷 §8.6);同时是
-    /// **去 RoPE 配对约定**的实证(约定错 ⇒ 打分退化噪声 ⇒ 覆盖率掉到随机)。
-    /// 诊断档:prefill 桶图**让位 eager**(与 `pf_bisect` 同律,响亮告知一次)。
+    /// 开则额外做**真重诊断**:K/V 全量回读 + host 逐元素解码 +
+    /// `true_block_mass`(逐 query 行 × (层,头) 扫**全 ctx** 的因果 softmax)
+    /// + 论文口径保真对照 + 方案 A/B 对照 + 覆盖率曲线/上界报告。
+    /// 单边界的成本**含 `ctx` 因子** ⇒ 全军一遍是 **O(ctx²)**
+    /// (27B/8k 实测单次 6.3s = 墙钟 32%)⇒ **只在末个边界跑一次**
+    /// (`OWL_COV_ANALYZE_EVERY` 可改)。诊断档另有一个副作用:
+    /// prefill 桶图**让位 eager**(与 `pf_bisect` 同律,响亮告知一次)。
+    ///
+    /// 🔴 **测性能不要把生产面跟它一起开** —— 它会把整跑拖成诊断账
+    /// (生产面只需 `select_decode`)。
     pub coverage_probe: bool,
-    /// **B-3d 选择层视图接进 decode**(缺省关)。`OWL_SELECT_DECODE=1`。
+    /// **选择层接进 decode —— 生产总开关**(缺省关)。`OWL_SELECT_DECODE=1` / `[kvmem].select_decode`。
     ///
     /// 开则:召回点之后的本 turn decode 步,注意力只读**视图页表**
     /// (选中块 ++ 新生成尾部;方案 A = 原位置,**不做 re-RoPE**),
     /// `sel_pt`/`sel_len` 两个图输入槽每步写;召回点之前/无视图 ⇒ 写全量链
     /// (与不开时逐字等价)。
-    /// 前置:`coverage_probe`(召回/视图由探针面产出)+ **图档**(视图走输入槽;
-    /// XPU/无图档另说)。XQA 裸 decode 臂与视图**不共戴**(页表语义两套)⇒
-    /// 当前需 `decode_xqa=0`。
+    /// **前置**:图档(视图走输入槽)+ `index_probe` + 宿主层(超卖档)。
+    /// 不依赖 `coverage_probe` —— 那是诊断面。
+    /// XQA 裸 decode 臂与视图**不共戴**(页表语义两套)⇒ 当前需 `decode_xqa=0`。
     pub select_decode: bool,
-    /// **B-3e-2:部分宿主驻留**(缺省关)。`OWL_SELECT_PARTIAL=1`。
+    /// **B-3e-2:部分宿主驻留**(缺省关)。`OWL_SELECT_PARTIAL=1` / `[kvmem].select_partial`。
     ///
     /// 开则:每个召回点把**被踢出工作集**的链块 `decref` + 逐块下沉到宿主
     /// (会话表写占位),并把选中的宿主块回灌回来;prefill 的"过去"改走
-    /// **子集页链**(否则会读到占位符)。前提:`coverage_probe` + `select_decode`
+    /// **子集页链**(否则会读到占位符)。前提:`select_decode`
     /// + 宿主层(`OWL_HOST_CACHE_MB` / `OWL_SNAP_HOST_MB`)。
+    /// 这正是**低显存档位**(池 < ctx)成立的那一件 —— 不开它,
+    /// 链无法超出池容量。
     pub select_partial: bool,
     /// **驱逐策略**(B-4;缺省 `lru`)。`OWL_EVICT_POLICY=lrfu[:λ]`。
     ///
@@ -99,12 +104,37 @@ pub struct EngineKnobs {
     ///   (`KS ← λ·KS + (1−λ)·hit`)⇒ 出序时"又冷又没被注意力用过"的先下沉。
     ///   我们只**下沉**不丢内容 ⇒ 该策略决定的是"谁的设备副本先让位"。
     pub evict_policy: owl_store::EvictPolicyKind,
+    /// **分析边界目标 ctx**(诊断;0 = 最后一个边界)。`[kvmem].analyze_at_ctx`。
+    pub coverage_analyze_at: usize,
     /// **召回预算**(块数;缺省 64,`OWL_SELECT_BLOCKS`)。视图 = 选中的这些块
     /// ⇒ 这是"选择层丢多少"的唯一旋钮。
     pub select_blocks: usize,
     /// 保底 sink / recent(块;缺省 2 / 4)
     pub select_sink: usize,
     pub select_recent: usize,
+    /// **召回节奏**(块边界):每 k 个边界做一次**完整召回**(打分+按分选择),
+    /// 其余边界**只采索引、不干预驻留**。缺省 **1 = 每个边界都完整召回**
+    /// (旧行为,逐位不变)。`OWL_RECALL_EVERY` / `[kvmem].recall_every`。
+    ///
+    /// 为什么要有这一档:单次打分是 O(块数) **线性**,但"每块边界都打"⇒ 一次
+    /// prefill 累计 **O(块数²)** —— 262k 下 ≈57s(release)/边界数 2048。
+    /// 参考实现把这条曲线压回线性,靠的是**每请求只召回一次**。
+    ///
+    /// 廉价档的语义 = **两次完整召回之间不改变选择**(驻留交给 A 轴,
+    /// 下一次完整召回时一次性对齐)⇒ 搬运量由"选择变了多少"决定,
+    /// 而不是由"过了多少个边界"决定。
+    /// ⚠️ 第一版曾让廉价档走"近期选择 + 调和",**实测净亏**:
+    /// 两份名单互相覆盖 ⇒ 调和 +92% / 下沉回灌翻倍 / 末边界覆盖率读数失真。
+    /// **末个边界永远是完整召回**(decode 消费的视图取自它)。
+    pub recall_every: usize,
+    /// **虚拟化是否开着**(`[kvmem] select_decode && select_partial`;boot 搬运,
+    /// 唯一产地 = `KvmemCfg::virtualization_enabled`)。
+    /// 用途:**所有解锁类护栏的判据** —— 非 Strict 地板、池小于上下文,
+    /// 都只在这条为真时放行。
+    pub kvmem_virtualization: bool,
+    /// **准入地板是否是显式配置的**(`[kvmem].dense_floor_mib` 给了数)。
+    /// 不是 ⇒ boot 在池几何已知后自动填**工作集字节**(见 `run()` 的虚拟化校验)。
+    pub dense_floor_explicit: bool,
     /// **状态腿宿主预算 MiB**(S2 §25.2;缺省 **0 = 关层**)。`OWL_SNAP_HOST_MB`。
     ///
     /// 与 [`Self::host_cache_mb`] 同属 store 中层总账的两个**分片**
@@ -174,12 +204,16 @@ impl Default for EngineKnobs {
             snap_host_mb: 0,
             index_probe: false,
             coverage_probe: false,
+            coverage_analyze_at: 0,
             select_decode: false,
             select_partial: false,
             evict_policy: owl_store::EvictPolicyKind::Lru,
             select_blocks: 64,
             select_sink: 2,
             select_recent: 4,
+            recall_every: 1,
+            kvmem_virtualization: false,
+            dense_floor_explicit: false,
             admission_on_full: owl_store::QueuePolicy::Reject,
             dense_floor: owl_store::TurnFloor::Strict,
             no_graph: false,
@@ -205,35 +239,6 @@ impl Default for EngineKnobs {
 /// 准入满员姿态解析(`OWL_ADMIT_ON_FULL`):`reject`(缺省)/ `queue` / `queue:30000`。
 ///
 /// 坏值 = **响亮拒启动**(解析失败不许静默回落到缺省 —— 那就变成"配了没生效")。
-/// 驱逐策略解析(`OWL_EVICT_POLICY=lru|lrfu[:λ]`;坏值 = 响亮拒 + exit 2,
-/// 与 `parse_admission_on_full` 同律:配置错不许静默降级)。
-fn parse_evict_policy() -> owl_store::EvictPolicyKind {
-    use owl_store::EvictPolicyKind;
-    let Some(raw) = owl_shared::env_reader::str("OWL_EVICT_POLICY") else {
-        return EvictPolicyKind::Lru;
-    };
-    let s = raw.trim();
-    if s.eq_ignore_ascii_case("lru") {
-        return EvictPolicyKind::Lru;
-    }
-    if s.eq_ignore_ascii_case("lrfu") {
-        return EvictPolicyKind::Lrfu(0.9);
-    }
-    if let Some(rest) = s.strip_prefix("lrfu:") {
-        match rest.trim().parse::<f64>() {
-            Ok(l) if l > 0.0 && l < 1.0 => return EvictPolicyKind::Lrfu(l),
-            _ => {
-                owl_shared::log_error!(
-                    "boot",
-                    "OWL_EVICT_POLICY={s}:λ 非法(须 0<λ<1,如 lrfu:0.9)—— 拒绝启动"
-                );
-                std::process::exit(2);
-            }
-        }
-    }
-    owl_shared::log_error!("boot", "OWL_EVICT_POLICY={s} 不可识别(lru | lrfu | lrfu:λ)—— 拒绝启动");
-    std::process::exit(2);
-}
 
 fn parse_admission_on_full() -> std::result::Result<owl_store::QueuePolicy, String> {
     use owl_store::QueuePolicy;
@@ -255,7 +260,81 @@ fn parse_admission_on_full() -> std::result::Result<owl_store::QueuePolicy, Stri
 }
 
 impl EngineKnobs {
+    /// **驱逐策略映射**(单源):`[kvmem].evict_policy` → store 词汇。
+    /// (分层:shared 不依赖 store ⇒ 映射在本层;与地板映射同律。)
+    fn evict_policy_of(cfg: &owl_shared::config::KvmemCfg) -> owl_store::EvictPolicyKind {
+        match cfg.evict_policy {
+            owl_shared::config::EvictPolicyCfg::Lru => owl_store::EvictPolicyKind::Lru,
+            owl_shared::config::EvictPolicyCfg::Lrfu => owl_store::EvictPolicyKind::Lrfu(0.9),
+        }
+    }
+
+    /// **准入地板映射**(单源):配置三态 → `TurnFloor`。
+    /// 配置层只存事实(`virtualization_enabled` + `dense_floor_mib`),
+    /// 到 store 词汇的映射在本层(分层:shared 不得依赖 store)。
+    fn dense_floor_of(cfg: &owl_shared::config::KvmemCfg) -> owl_store::TurnFloor {
+        Self::dense_floor_for(cfg.virtualization_enabled(), cfg.dense_floor_mib)
+    }
+
+    /// 地板映射的**唯一实现**(按两份事实入参;探针/测试档直接构 knobs 时
+    /// 也走这一条 —— 不得在别处再写一次“虚拟化开 ⇒ Bytes(0)”:那样两处
+    /// 迟早对不上)。
+    pub fn dense_floor_for(
+        virtualization: bool,
+        floor_mib: Option<u64>,
+    ) -> owl_store::TurnFloor {
+        if !virtualization {
+            // 虚拟化不在场 ⇒ 唯一诚实值(非 Strict 会被 boot 拦)
+            return owl_store::TurnFloor::Strict;
+        }
+        match floor_mib {
+            Some(mib) => owl_store::TurnFloor::Bytes((mib as usize) << 20),
+            None => owl_store::TurnFloor::Bytes(0),
+        }
+    }
+
+
     /// 准入满员姿态的等待上限(毫秒;`Reject` ⇒ 0 = 不等)。
+    /// **一次运行的条件摘要**(单行;boot 与探针都打)。
+    ///
+    /// 目的 = **让每个数字自带条件** —— 之前"左一个数字右一个数字对不上",
+    /// 就是因为条件散在多个入口/env 里。凡影响行为的旋钮都在这行里;
+    /// 不在这行里的就不影响行为。
+    pub fn digest(&self) -> String {
+        let q = match self.env.kv.quant {
+            owl_models::env::KvQuant::None => "f16",
+            owl_models::env::KvQuant::Fp8E4M3 => "fp8",
+        };
+        let ev = match self.evict_policy {
+            owl_store::EvictPolicyKind::Lru => "lru".to_string(),
+            owl_store::EvictPolicyKind::Lrfu(l) => format!("lrfu:{l}"),
+        };
+        format!(
+            "pool={:?} turns={} snap_max={} host={}M snap_host={}M | kvmem={}[idx={} cov={} view={} part={} budget={}+{}+{} every={} evict={} floor={:?}] | fi={} split={} gdn_chunked={} kv={} graph_off={}",
+            self.pool_tokens,
+            self.max_active_turns,
+            self.snap_max,
+            self.host_cache_mb,
+            self.snap_host_mb,
+            if self.kvmem_virtualization { "ON" } else { "off" },
+            self.index_probe as u8,
+            self.coverage_probe as u8,
+            self.select_decode as u8,
+            self.select_partial as u8,
+            self.select_blocks,
+            self.select_sink,
+            self.select_recent,
+            self.recall_every,
+            ev,
+            self.dense_floor,
+            self.env.attn.fi as u8,
+            self.env.attn.prefill_split as u8,
+            self.env.gdn.chunked as u8,
+            q,
+            self.no_graph as u8,
+        )
+    }
+
     pub fn admission_max_wait_ms(&self) -> u64 {
         match self.admission_on_full {
             owl_store::QueuePolicy::Reject => 0,
@@ -270,8 +349,12 @@ impl EngineKnobs {
     pub fn from_config(cfg: &owl_shared::config::OwlConfig) -> Self {
         Self {
             probes: crate::running::StepProbes::from_config(cfg),
-            // 池容量:env 覆盖(实测调压必需)> preset > 默认 2×单会话(§22 实测)
-            pool_tokens: owl_shared::env_reader::parse("OWL_POOL_TOKENS").or(cfg.pool.pool_tokens),
+            // ── **配置是唯一来源**(2026-10-19 统一)──
+            // 本函数只做 `OwlConfig` → 旋钮的字段搬运,**不读任何 env**
+            // (探针档/生产档走同一条路 ⇒ 同一份配置 = 同一套条件)。
+            // 测试面只保留"运行器级"env(选卡/资产路径/场景过滤),见
+            // `docs/arch/配置面-单一来源.md`。
+            pool_tokens: cfg.pool.pool_tokens,
             draft: DraftCfg {
                 depth: cfg.spec.depth,
                 dumb: cfg.spec.dumb,
@@ -285,22 +368,27 @@ impl EngineKnobs {
                 tapdecl: cfg.spec.tapdecl,
             },
             prefix_cache: cfg.pool.prefix_cache,
-            // 宿主层预算(S3-3):环境的 opt-in 旋钮(不进 OwlConfig —— 未接线前
-            // 开它只会让命中/驱逐响亮拒;接线后按档进 config 再谈)
-            host_cache_mb: owl_shared::env_reader::parse("OWL_HOST_CACHE_MB").unwrap_or(0),
-            // 状态腿宿主预算(S2):独立旋钮(两条腿各有热区,别互相饿死)
-            snap_host_mb: owl_shared::env_reader::parse("OWL_SNAP_HOST_MB").unwrap_or(0),
-            // 选择层索引采集(B 轴 B-0;缺省关)
-            index_probe: owl_shared::env_reader::flag("OWL_INDEX_PROBE"),
-            // B 轴覆盖率探针(B-1 前置件;缺省关;与 index_probe 配套开)
-            coverage_probe: owl_shared::env_reader::flag("OWL_COVERAGE_PROBE"),
-            // B-3d 选择层接进 decode(缺省关;开则须 coverage_probe 同开)
-            select_decode: owl_shared::env_reader::flag("OWL_SELECT_DECODE"),
-            select_partial: owl_shared::env_reader::flag("OWL_SELECT_PARTIAL"),
-            evict_policy: parse_evict_policy(),
-            select_blocks: owl_shared::env_reader::parse("OWL_SELECT_BLOCKS").unwrap_or(64),
-            select_sink: owl_shared::env_reader::parse("OWL_SELECT_SINK").unwrap_or(2),
-            select_recent: owl_shared::env_reader::parse("OWL_SELECT_RECENT").unwrap_or(4),
+            // 宿主层预算(S3-3;`[pool].host_cache_mb`)
+            host_cache_mb: cfg.pool.host_cache_mb,
+            // 状态腿宿主预算(S2;`[pool].snap_host_mb`;两条腿各有热区,别互相饿死)
+            snap_host_mb: cfg.pool.snap_host_mb,
+            // ── KVMem 选择层(B 轴):全部来自 `[kvmem]`,零 env ──
+            // 生产面(`select_decode`/`select_partial`/索引/预算/节奏)与
+            // 诊断面(`coverage_probe`)是**两扇门**:低显存档只开前者。
+            // ⚠️ `index` **蕴含于 `select_decode`**(打分的前置件;少了它
+            // 选择层无从算分)—— 这条只是在旋钮上取并,不是第二个配置项。
+            index_probe: cfg.kvmem.index || cfg.kvmem.select_decode,
+            coverage_probe: cfg.kvmem.coverage_probe,
+            coverage_analyze_at: cfg.kvmem.analyze_at_ctx,
+            select_decode: cfg.kvmem.select_decode,
+            select_partial: cfg.kvmem.select_partial,
+            evict_policy: Self::evict_policy_of(&cfg.kvmem),
+            select_blocks: cfg.kvmem.select_blocks,
+            select_sink: cfg.kvmem.select_sink,
+            select_recent: cfg.kvmem.select_recent,
+            recall_every: cfg.kvmem.recall_every,
+            kvmem_virtualization: cfg.kvmem.virtualization_enabled(),
+            dense_floor_explicit: cfg.kvmem.dense_floor_mib.is_some(),
             // 准入姿态(S3b):env 覆盖(`reject` / `queue[:ms]`);缺省响亮拒。
             // 坏值 = **响亮拒**(§24.5④:不再 panic;启动期结构化失败,
             // 归 §18.5 的"配置错误静默 exit 1"红线同一族)
@@ -308,8 +396,12 @@ impl EngineKnobs {
                 owl_shared::log_error!("boot", "{e} —— 拒绝启动");
                 std::process::exit(2);
             }),
-            // per-turn 地板缺省(缺省 Strict = 全量 dense;B 轴前唯一诚实值)
-            dense_floor: owl_store::TurnFloor::Strict,
+            // per-turn 地板缺省。三态(2026-10-19 配置化):
+            // - 虚拟化未开 ⇒ **Strict**(全量 dense;唯一诚实值)
+            // - 虚拟化开 + `[kvmem].dense_floor_mib = N` ⇒ `Bytes(N MiB)`
+            // - 虚拟化开 + 未给数 ⇒ `Bytes(0)` = "只要工作集装得下就准入"
+            //   (搬运与腾位交给 A/B 两轴;这是低显存档的默认姿态)
+            dense_floor: Self::dense_floor_of(&cfg.kvmem),
             no_graph: cfg.graph.no_graph,
             prefill_bucket: cfg.graph.prefill_bucket,
             ts_probe: cfg.dispatch.ts_probe,
@@ -409,13 +501,19 @@ fn assemble_budget(
     live_loaded: u64,
     live_now: u64,
 ) -> Result<owl_store::BudgetInputs> {
-    // 准入地板语义(S3b §23.5):本刀只实做 **Strict**(全量 dense 驻留)——
-    // 配置面给非 Strict 就是配置错(选择层 B 轴未落地,地板语义无从兑现),
-    // 响亮拒启动,不许静默当 Strict 用。
-    if !cfg.knobs.dense_floor.is_strict() {
+    // 准入地板语义(S3b §23.5):**2026-10-19 拆护栏**。
+    //
+    // 旧护栏:非 Strict 一律拒 —— 因为当时选择层(B 轴)未落地,`Bytes` 的
+    // 地板语义无从兑现。**B 轴已落地并拆出生产门**(`[kvmem].select_decode`),
+    // 所以改成**条件放行**:只有配置里**显式开了虚拟化**
+    // (`[kvmem].select_decode` + `select_partial` 两条同时为真)才允许非 Strict;
+    // 否则依旧响亮拒(不许静默当 Strict 用 —— 那等于把"选择层会不会兜住"
+    // 交给调用方的默认值)。
+    if !cfg.knobs.dense_floor.is_strict() && !cfg.knobs.kvmem_virtualization {
         return Err(owl_iface::contract::ModelError::Msg(
-            "boot: knobs.dense_floor 只接受 Strict —— 选择层(B 轴)未落地,\
-             TurnFloor::Bytes 的地板语义无法兑现(设计卷 §23.5)"
+            "boot: 非 Strict 的 dense_floor 需要**显式开启虚拟化** \
+             ([kvmem].select_decode = true **且** select_partial = true)—— \
+             地板语义只有选择层在场才能兜住;两者任一为假就响亮拒,不静默降级"
                 .into(),
         ));
     }
@@ -588,6 +686,10 @@ impl<D: DeviceClient + 'static> Engine<D> {
         let plan = crate::state::PoolPlan {
             seq_tokens: s,
             pool_tokens,
+            // **锁①门控**:只有虚拟化真的开着(配置显式 `select_decode` +
+            // `select_partial`)才允许池小于上下文 —— 否则链超出池容量必
+            // `Exhausted`(无洞可停,即无选择层可挤)。
+            pool_overcommit: self.cfg.knobs.kvmem_virtualization,
             kv: env.kv.quant,
             fi_quant,
             draft_kv: if self.cfg.knobs.draft.kv_quant == owl_models::env::KvQuant::Fp8E4M3 {
@@ -610,14 +712,30 @@ impl<D: DeviceClient + 'static> Engine<D> {
             prefill_dump_page: self.cfg.knobs.prefill_bucket
                 != owl_shared::config::PrefillBucket::Off,
             gdn_dbg: self.cfg.knobs.probes.gdn_dbg,
-            // B-2:选择层视图面(召回点探针档;与覆盖率探针同开关)
-            select_view: self.cfg.knobs.coverage_probe,
+            // B-2:选择层视图面(**生产档也要** —— 视图是 decode 的消费方;
+            // 与诊断面 `coverage_probe` 解耦)
+            select_view: self.cfg.knobs.coverage_probe || self.cfg.knobs.select_decode,
         };
         // **B-3e-2 前置校验**(响亮拒,不许静默):
         // ① 部分驻留会让会话链**出洞**(占位符)⇒ 必须有"懂洞"的消费方
         //    (视图页表)⇒ `select_decode` 必开;
         // ② XQA 裸 decode 臂的页表直接来自会话链(`xqa_pt_of`)⇒ 洞 = u32::MAX 当页号 =
         //    ILLEGAL_ADDRESS(27B Stage2 实测)。本档**自动关 XQA 并响亮告知**。
+        // **下沉的前提 = 缓存树在场**(2026-10-19 实测定谳):
+        // 下沉机制 = "缓存树 + 会话双持(refs==2) → decref → 缓存独占 → 下沉";
+        // 而 `session.rs` 的 `cache_cap = if paged && prefix_cache { .. } else { 0 }`
+        // ⇒ **prefix_cache 关着 ⇒ 缓存树禁用 ⇒ `insert_inc` 返空 ⇒ 块永远 refs==1
+        // ⇒ 结构性不可沉**(实测:每 chunk 送 4 片、入树 0、下沉 0 块)。
+        // 不许静默:开了 partial 却没开 prefix_cache = 配置错,拒启。
+        if self.cfg.knobs.select_partial && !self.cfg.knobs.prefix_cache {
+            return Err(owl_iface::contract::ModelError::Msg(
+                "boot: `[kvmem].select_partial = true` 要求 `[pool].prefix_cache = true` \
+                 —— 下沉靠「缓存树 + 会话双持」(refs==2)才能 decref 放给宿主;\
+                 关着 prefix_cache ⇒ 缓存树 cap=0 ⇒ 块永远 refs==1 ⇒ **一块都沉不下去** \
+                 (响亮拒:跑起来会白跑一趟还报 '不可沉 N 块')"
+                    .into(),
+            ));
+        }
         if self.cfg.knobs.select_partial && !self.cfg.knobs.select_decode {
             owl_shared::log_error!(
                 "boot",
@@ -633,6 +751,82 @@ impl<D: DeviceClient + 'static> Engine<D> {
             );
         }
         let pool = StatePool::alloc(&mut self.face, dims, &loaded.spec.layer_types, &plan).await?;
+
+        // **锁①:虚拟化档的池容量硬校验**(2026-10-19;响亮拒,不静默落空槽)。
+        //
+        // 几何一律从**池实况**取(`pool.page`/`pool.nb`),不另算一份。
+        //
+        // # 下限的算式(为什么乘 N_active)
+        //
+        // ```text
+        // 池页数 ≥ N_active × (select_blocks + sink + recent + chunk/page)
+        //          └─ 每个活跃 turn 都要**自己一套**工作集与 chunk 工作区
+        // ```
+        //
+        // `N_active` = `max_active_turns`(并发上限)。**这一项不能省** ——
+        // 并发档下每个 turn 各有自己的工作集,池要能同时装下它们。
+        // 27B f16 算例(页 = 32 tok = 2 MiB):
+        //   select_blocks 32 + sink 2 + recent 4 + chunk 256 ⇒ 每 turn 46 页 = 92 MiB
+        //   8 并发 ⇒ 368 页 = 736 MiB ‖ 对照 dense 8 并发 = 8×256 页 = 4 GiB ⇒ 省 5.6×
+        if self.cfg.knobs.kvmem_virtualization {
+            let chunk_pages = self.cfg.prefill_chunk.div_ceil(pool.page.max(1)).max(1);
+            let per_turn = self.cfg.knobs.select_blocks.max(1)
+                + self.cfg.knobs.select_sink
+                + self.cfg.knobs.select_recent
+                + chunk_pages;
+            let n_active = self.cfg.knobs.max_active_turns.max(1);
+            let need = per_turn * n_active;
+            let page_bytes = pool.block_bytes().max(1);
+            if pool.nb < need {
+                return Err(owl_iface::contract::ModelError::Msg(format!(
+                    "boot: 设备池 {} 页装不下 {n_active} 并发 × {per_turn} 页 = {need} 页\
+                     (每 turn = select_blocks {} + sink {} + recent {} + chunk {chunk_pages});\
+                     pool_tokens={} page={} —— 调大池 / 减预算 / 降 max_active_turns\
+                     (响亮拒:跑起来必 Exhausted)",
+                    pool.nb,
+                    self.cfg.knobs.select_blocks,
+                    self.cfg.knobs.select_sink,
+                    self.cfg.knobs.select_recent,
+                    plan.pool_tokens,
+                    pool.page
+                )));
+            }
+            // **准入地板缺省 = 本 turn 工作集字节**(不是 0!)
+            //
+            // 地板语义 = "本 turn 至少多少字节 KV 直接驻留设备"。并发档下若给 0,
+            // N 个 turn 会各自被无条件准入、然后互抢池 ⇒ 抖动;给工作集字节
+            // = "每个进来的 turn 都先留出它自己那套",与上面的池下限算式**同源**
+            // (同一套页数,乘的是字节而不是并发数)。显式给了 `[kvmem].dense_floor_mib`
+            // 则尊重显式值。
+            if !self.cfg.knobs.dense_floor_explicit {
+                let ws_pages = (self.cfg.knobs.select_blocks.max(1)
+                    + self.cfg.knobs.select_sink
+                    + self.cfg.knobs.select_recent)
+                    .max(1);
+                self.cfg.knobs.dense_floor =
+                    owl_store::TurnFloor::Bytes(ws_pages * page_bytes);
+            }
+            owl_shared::log_warn!(
+                "boot",
+                "KVMem 虚拟化档:**池 = {} tok / {} 页** vs 上下文 {} tok / {} 页 ⇒ 超卖 {:.2}×;\
+                 并发上限 {} × 每 turn {} 页(工作集 {}+{}+{} + chunk {}) = {need} 页;\
+                 每页 {} KiB;准入地板 = {:?} / turn;宿主 {} MiB",
+                pool.nb * pool.page,
+                pool.nb,
+                s,
+                s.div_ceil(pool.page.max(1)),
+                s as f64 / (pool.nb * pool.page).max(1) as f64,
+                n_active,
+                per_turn,
+                self.cfg.knobs.select_blocks,
+                self.cfg.knobs.select_sink,
+                self.cfg.knobs.select_recent,
+                chunk_pages,
+                page_bytes / 1024,
+                self.cfg.knobs.dense_floor,
+                self.cfg.knobs.host_cache_mb + self.cfg.knobs.snap_host_mb,
+            );
+        }
         if let Some(q) = fi_quant {
             owl_shared::log_info!("boot", "FlashInfer prefill 面启用(FI 直读主池 kNHD 单池;quant={:?})",
                 q
@@ -765,6 +959,8 @@ impl<D: DeviceClient + 'static> Engine<D> {
             sel_view_fallback: 0,
             stage: crate::running::StageStats::default(),
             partial: crate::running::PartialStats::default(),
+            prof: crate::running::BAxisProfile::default(),
+            sel_keep: Vec::new(),
         })
     }
 }

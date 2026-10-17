@@ -19,16 +19,19 @@ depth = 7
 
 [server]
 # 单会话语义:GDN 格锁 1 → 并发闸门必须 ≤1(启动 fail-fast 校验
-# gdn_slots ≥ max_concurrency)。2026-10-13 实测:本档原**缺此项** →
+# max_active_turns ≥ max_concurrency)。2026-10-13 实测:本档原**缺此项** →
 # `--flavor spec-dflash` 独立起不来(此前 e2e/bench 各自在配置文件里
-# 覆盖了 gdn_slots=8 才蒙混过去)。多会话档 = 这里改 8 + gdn_slots=8。
+# 覆盖了 max_active_turns=8 才蒙混过去)。多会话档 = 这里改 8 + max_active_turns=8。
 max_concurrency = 1
 
 [pool]
 pool_tokens = 16896   # = ceil(16384/page)+slack(页 32;528 页;≈0.9G)
 vram_target = 0.99
 vram_reserve_mb = 512
-gdn_slots = 1
+# ⚠️ 2026-10-19 驱动性修复:字段在 `7c5627f`(A 轴收官)已改名
+# `gdn_slots` → `max_active_turns`,flavor 文本没跟上 ⇒ `deny_unknown_fields`
+# 直接**拒解析**(`预设档清单非空且全部可解析` / `load_基准文件与覆盖文件叠加` 红)。
+max_active_turns = 1
 snap_max = 1
 prefix_cache = false
 

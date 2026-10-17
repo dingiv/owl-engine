@@ -65,7 +65,14 @@ pub(crate) struct CoveragePending {
     pub(crate) hkv: usize,
     pub(crate) hd: usize,
     pub(crate) layers: usize,
-    /// post-RoPE Q:`[层][t × hq × hd]`(层序 = 全注意力层出现序)。
+    /// **本面存的行数**(= `W_QUERY_TOKENS.min(t)`)。
+    ///
+    /// 为什么不是整个 chunk:2026-10-19 相位账实测 —— 原实现把**整个 chunk**
+    /// 的 Q(0.8B/chunk1024 = 6 层 × 4MB = 25MB)全量 D2H + 逐元素解码,
+    /// 而分析面**只用末 8 行** ⇒ 查询面相位 **302ms/边界(占 B 轴 112%)** ——
+    /// 128× 白烧。改为只回读末 W 行(仍一条批命令)⇒ 字节数与解码量同降。
+    pub(crate) w: usize,
+    /// post-RoPE Q:`[层][w × hq × hd]`(层序 = 全注意力层出现序)。
     pub(crate) q: Vec<Vec<f32>>,
 }
 
@@ -584,6 +591,31 @@ impl<D: DeviceClient> RunningEngine<D> {
                 "部分驻留:{not_in_tree} 块本轮未入缓存树 ⇒ 不可下沉(增量注册见 §8.19)"
             );
         }
+        // **A1 取证**(2026-10-19):池被"本轮新写、结构性不可沉"的页填满
+        // ⇒ 下一 chunk 的 `ensure_for_len` 必 `Exhausted`。这里把三条数打出来:
+        // 可沉 / 待回灌 / 不可沉,以及**候选块的 refs 分布**(1=仅会话持,
+        // 2=树+会话双持=可沉)。
+        if std::env::var_os("OWL_RECON_DBG").is_some() {
+            let mut hist = [0usize; 4];
+            for (i, _h) in cands.iter().enumerate().take(n_blocks) {
+                if let Some(slot) = table.get(i).copied() {
+                    if slot != crate::scheduler::PENDING_LOAD_PLACEHOLDER {
+                        let r = self.bank.rel.leg.slot_refs(slot).min(3) as usize;
+                        hist[r] += 1;
+                    }
+                }
+            }
+            eprintln!(
+                "[recon] 候选 {n_blocks} · 表 {} · 可沉 {} · 待回灌 {} · **不可沉 {}** · refs(1/2/3+)={}/{}/{}",
+                table.len(),
+                sink.len(),
+                need.len(),
+                not_in_tree,
+                hist[1],
+                hist[2],
+                hist[3]
+            );
+        }
         let sink = sinkable;
         let n_sink = sink.len();
         let n_need = need.len();
@@ -836,19 +868,41 @@ impl<D: DeviceClient> RunningEngine<D> {
     ) -> Result<()> {
         let d = self.pool.dims;
         let (hq, hkv, hd) = (d.hq, d.hkv, d.hd);
-        let n = t * hq * hd;
+        // **只留 query 窗**(末 W 行;从尾部按行偏移切)—— W 口径与
+        // `coverage_analyze` 同源(`W_QUERY_TOKENS`),此处不得再写第二个数。
+        let w = W_QUERY_TOKENS.min(t);
         let elem = d.dtype.size_bytes();
+        let row_bytes = hq * hd * elem;
+        let off = (t - w) * row_bytes;
+        let len = w * row_bytes;
+        let t_q = std::time::Instant::now();
         let mut q = Vec::with_capacity(q_blocks.len());
         {
-            let face = self.graphs.session.face_mut();
+            // **一条批命令**读完所有层的末 W 行(原实现逐层一次 `dtoh`
+            // ⇒ 层数个往返;此处与 store 的 `dtoh_batch` 同律)
             for b in &q_blocks {
-                let mut buf = vec![0u8; n * elem];
-                face.dtoh(b, &mut buf).await?;
-                let row = decode_row(d.dtype, &buf);
-                if row.len() != n {
+                if b.len < t * hq * hd {
                     return Err(ModelError::Msg(format!(
-                        "覆盖率探针:Q 面解码长不符 {} ≠ {n}(dtype={:?})",
+                        "覆盖率探针:Q 面元素数不符(块 {} < 应有 {})",
+                        b.len,
+                        t * hq * hd
+                    )));
+                }
+            }
+            let pieces: Vec<(&Bytes, usize, usize)> =
+                q_blocks.iter().map(|b| (b, off, len)).collect();
+            let face = self.graphs.session.face_mut();
+            let t_io = std::time::Instant::now();
+            let all = face.dtoh_batch(&pieces).await?;
+            let io_ms = t_io.elapsed().as_secs_f64() * 1000.0;
+            let t_dec = std::time::Instant::now();
+            for chunk in all.chunks_exact(len) {
+                let row = decode_row(d.dtype, chunk);
+                if row.len() != w * hq * hd {
+                    return Err(ModelError::Msg(format!(
+                        "覆盖率探针:Q 面解码长不符 {} ≠ {}(dtype={:?})",
                         row.len(),
+                        w * hq * hd,
                         d.dtype
                     )));
                 }
@@ -856,6 +910,8 @@ impl<D: DeviceClient> RunningEngine<D> {
             }
             let ids: Vec<u64> = q_blocks.iter().map(|b| b.id).collect();
             face.free(&ids).await?;
+            self.prof.q_toh_ms += io_ms;
+            self.prof.q_dec_ms += t_dec.elapsed().as_secs_f64() * 1000.0;
         }
         self.cov_pending = Some(CoveragePending {
             base,
@@ -864,31 +920,83 @@ impl<D: DeviceClient> RunningEngine<D> {
             hkv,
             hd,
             layers: q.len(),
+            w,
             q,
         });
+        // 计时归入“查询面”(Q 回读 + 解码;逆 RoPE 在 `coverage_analyze`)
+        self.prof.q_face_ms += t_q.elapsed().as_secs_f64() * 1000.0;
         Ok(())
     }
 
-    /// **分析**(Q-2 第三段):池内 K(会话真页链)+ 索引账 ⇒ 覆盖率曲线。
+    /// **召回点分析**(Q-2 第三段)。
     ///
     /// 前置:块边界事件已落(索引/快照已登记)⇒ 由 `execute_prefill` 在
     /// `capture_gdn_snap` 之后调用。`ctx_tokens` = 边界位置(页对齐)。
-    pub(crate) async fn coverage_analyze(&mut self, sid: u64, ctx_tokens: usize) -> Result<()> {
+    ///
+    /// # 两扇门(2026-10-19 拆分)
+    ///
+    /// | 面 | 门 | 内容 |
+    /// |---|---|---|
+    /// | **生产面** | `select_decode` | 打分 → 选择 → 视图页表 → 驻留调和 |
+    /// | **诊断面** | `coverage_probe` | 真实质量(K/V 全量回读 + 逐行扫全 ctx)、覆盖率曲线/上界、论文口径对照、方案 A/B 对照、读数报告 |
+    ///
+    /// 拆之前两者共一门 ⇒ **低显存档想开功能就必须背诊断的账**
+    /// (27B/8k 实测诊断 6.3s = 墙钟 32%,生产面只有 6%)。
+    pub(crate) async fn coverage_analyze(
+        &mut self,
+        sid: u64,
+        ctx_tokens: usize,
+        last_boundary: bool,
+    ) -> Result<()> {
+        let t_all = std::time::Instant::now();
         let Some(pid) = self.cov_pending.take() else { return Ok(()) };
+        self.prof.boundaries += 1;
+        // **诊断面总门**:下面所有“重读数/保真对照/报告”都挂它。
+        let diag = self.cfg.knobs.coverage_probe;
         // **方案对照档**(`OWL_SCHEME_PROBE=1`):多读一份 V + host 侧算三种方案的
         // 注意力输出(比"接进 decode 跑两遍"便宜得多,且**同一个口径**可比)
         // `OWL_SCHEME_MIN_CTX`(缺省 0 = 每个边界都算):只在这个 ctx 以上才算
         // ⇒ 规模档只跑最后一次(host 数学与 dense 成正比,小边界算了也白算)
         let scheme_min = owl_shared::env_reader::parse::<usize>("OWL_SCHEME_MIN_CTX").unwrap_or(0);
-        let want_scheme =
-            owl_shared::env_reader::flag("OWL_SCHEME_PROBE") && ctx_tokens >= scheme_min;
-        // **重诊断采样**(`OWL_COV_ANALYZE_EVERY=k`;缺省 1 = 每边界都算)。
-        // 为什么:重诊断 = K/V 全量回读 + host 侧逐元素 f16→f32(27B/8k 每边界
-        // ~2.7 亿次解码)⇒ debug 构建下单边界秒级;选择/视图/驻留(生产面)**不**受影响,
-        // 它们只用索引打分(host 面,零回读)。
-        let analyze_every = owl_shared::env_reader::parse::<usize>("OWL_COV_ANALYZE_EVERY").unwrap_or(1);
-        let analyze_now =
-            analyze_every > 0 && (ctx_tokens / self.pool.page.max(1)) % analyze_every == 0;
+        let want_scheme = diag
+            && owl_shared::env_reader::flag("OWL_SCHEME_PROBE")
+            && ctx_tokens >= scheme_min;
+        // **重诊断采样**(`OWL_COV_ANALYZE_EVERY`;三档):
+        //
+        // | 值 | 语义 |
+        // |---|---|
+        // | 未设(**缺省**) | **只在 prefill 末个边界**(报告读数就取自那一天) |
+        // | `=k>0` | 每 k 块一次(曲线/回归需要多采点时用;`=1` = 每边界) |
+        // | `=0` | 关了(只用生产面) |
+        //
+        // 为何缺省不是「每边界」:重诊断是**真重活** —— 单边界要
+        // ① K/V 全量回读 + 逐元素解码 ② 逐 query 行 × (层,查询头) 对**全部已缓存
+        // token** 做 softmax(`true_block_mass`)⇒ 成本含 `ctx` 因子 ⇒ 全军一遍
+        // = **O(ctx²)**(2026-10-19 相位账实测:0.8B/3072 tok 下重诊断 ≈ **250ms/边界**,
+        // 占 B 轴 95%)。它产出的 mass/curve/oracle/paper_coverage **全是诊断读数**;
+        // 打分/选择/视图/驻留(生产面)一步不省。
+        let analyze_every = owl_shared::env_reader::parse::<usize>("OWL_COV_ANALYZE_EVERY");
+        // **分析边界目标**(`[kvmem].analyze_at_ctx`;0 = 最后一个边界):
+        // 本边界恰好落在该 ctx ⇒ 算诊断(即使它不是最后一个边界)。
+        // 为什么:边界位置随 chunk 漂移 ⇒ 钉住 ctx 才能跨 chunk 比读数。
+        let at = self.cfg.knobs.coverage_analyze_at;
+        let analyze_now = diag
+            && if at != 0 {
+                // **钉住的边界**:只在这一条 ctx 上算诊断(不再叠加"末边界",
+                // 否则末边界会把它冲掉 —— 第一版就是叠加,读数仍随 chunk 漂移)。
+                // `OWL_COV_ANALYZE_EVERY=k` 仍可显式要求多采点(调试用)。
+                match analyze_every {
+                    Some(0) => false,
+                    Some(k) => (ctx_tokens / self.pool.page.max(1)) % k == 0,
+                    None => ctx_tokens == at,
+                }
+            } else {
+                match analyze_every {
+                    Some(0) => false,
+                    Some(k) => (ctx_tokens / self.pool.page.max(1)) % k == 0,
+                    None => last_boundary,
+                }
+            };
         if ctx_tokens != pid.base + pid.t {
             owl_shared::log_debug!(
                 "cov-probe",
@@ -909,12 +1017,6 @@ impl<D: DeviceClient> RunningEngine<D> {
                 "覆盖率探针:几何非法(ctx={ctx_tokens} page={page} 池层数={} 探针层数={layers})",
                 self.pool.kvs.len()
             )));
-        }
-        if self.pool.kv_fp8 {
-            // 一期只接 f16 池:K 回读是**诊断面**,fp8 解码另开一刀(不静默算错值)
-            return Err(ModelError::Msg(
-                "覆盖率探针:fp8 池 K 回读解码未接线(一期只支持 f16 池;见设计卷 §8.6 挂账)".into(),
-            ));
         }
         let n_blocks = ctx_tokens / page;
         let bt: Vec<u32> = self
@@ -939,8 +1041,11 @@ impl<D: DeviceClient> RunningEngine<D> {
         };
         let mut v_post: Vec<Vec<f32>> = Vec::new();
         if analyze_now {
-        let elem = 2usize; // f16 池(上方已拒 fp8)
-        let page_bytes = page * hkv * hd * elem;
+        let t_mass = std::time::Instant::now();
+        // **池页格式从池实况取**(单源;f16 / fp8 e4m3 同一寻址式)
+        let fmt = crate::exec::kvpage::KvPageFormat::of_pool(self.pool.kv_fp8);
+        let _ = fmt.elem_bytes(); // 元素宽已由 KvPageFormat 内部用(此处只留显式读口)
+        let page_bytes = fmt.page_bytes(page, hkv, hd);
         // V 面(方案 A/B 的**输出级对照**要用;同段同布局,Layout = [token][head][dim])
         v_post = if want_scheme {
             vec![vec![0.0f32; ctx_tokens * hkv * hd]; layers]
@@ -993,20 +1098,19 @@ impl<D: DeviceClient> RunningEngine<D> {
                     None
                 };
                 let _ = per_page;
-                // 页内序 = [token][head][dim](knhd_offset 单源)
+                // 页内序 = [token][head][dim](knhd_offset 单源);
+                // 元素→f32 走 `KvPageFormat`(f16 / fp8 e4m3 两支)
+                let mut krow = vec![0.0f32; hd];
+                let mut vrow = vec![0.0f32; hd];
                 for p in 0..page {
                     let tok = lb * page + p;
                     for h in 0..hkv {
-                        let src = (p * hkv + h) * hd * elem;
                         let off = (tok * hkv + h) * hd;
-                        for dd in 0..hd {
-                            let b0 = src + dd * elem;
-                            dst[off + dd] =
-                                half::f16::from_le_bytes([kbuf[b0], kbuf[b0 + 1]]).to_f32();
-                            if let (Some(v), Some(vb)) = (vdst.as_deref_mut(), vbuf) {
-                                v[off + dd] =
-                                    half::f16::from_le_bytes([vb[b0], vb[b0 + 1]]).to_f32();
-                            }
+                        fmt.decode_row(kbuf, p, h, hkv, hd, &mut krow)?;
+                        dst[off..off + hd].copy_from_slice(&krow);
+                        if let (Some(v), Some(vb)) = (vdst.as_deref_mut(), vbuf) {
+                            fmt.decode_row(vb, p, h, hkv, hd, &mut vrow)?;
+                            v[off..off + hd].copy_from_slice(&vrow);
                         }
                     }
                 }
@@ -1018,6 +1122,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 "覆盖率读数口径:{host_skipped}/{n_blocks} 块在宿主(部分驻留)⇒ 真实质量/方案对照只覆盖设备驻留子集"
             );
         }
+        self.prof.mass_ms += t_mass.elapsed().as_secs_f64() * 1000.0;
         } // ← 重诊断(采样)段结束
         // ── ② 打分面:q̃(去 RoPE)+ 候选块链哈希 + Mean-K 索引 ──
         // **query 窗**(论文 §4.3:当前 step 的 query;**单 token 的注意力太局
@@ -1025,6 +1130,15 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 逐行真实质量,再对窗取均值 —— 与论文 Eq.10 的 `Σ_m` 同构。
         let w = W_QUERY_TOKENS.min(pid.t);
         let first = pid.t - w;
+        // **口径单源硬断**:待分析面只留了末 `w` 行(`coverage_take_q` 按同一
+        // `W_QUERY_TOKENS` 切片)⇒ 两侧不得各写一个数,否则行列错位 = 静默错值。
+        if pid.w != w {
+            return Err(ModelError::Msg(format!(
+                "覆盖率探针:query 窗口径不合(面里 {} 行 ≠ 应有 {w} 行)",
+                pid.w
+            )));
+        }
+        let t_qface = std::time::Instant::now();
         let mut face = owl_store::QueryFace::new(hd, layers, hq);
         let mut mass = vec![0.0f32; n_blocks];
         let mut q_post_last: Vec<Vec<f32>> = Vec::new();
@@ -1038,11 +1152,13 @@ impl<D: DeviceClient> RunningEngine<D> {
                     )))
                 }
             };
-            let q_off = qi * hq * hd;
+            // 面内行号 = 绝对行号 − 窗口起点(面只存末 w 行)
+            let q_off = (qi - first) * hq * hd;
             let mut flat = vec![0.0f32; layers * hq * hd];
-            let mut q_post: Vec<Vec<f32>> = Vec::with_capacity(layers);
+            let mut q_post: Vec<Vec<f32>> = Vec::new();
             let mut row = vec![0.0f32; hq * hd];
             let mut qh = vec![0.0f32; hd];
+            let t_derope = std::time::Instant::now();
             for l in 0..layers {
                 row.copy_from_slice(&pid.q[l][q_off..q_off + hq * hd]);
                 for h in 0..hq {
@@ -1050,19 +1166,33 @@ impl<D: DeviceClient> RunningEngine<D> {
                     owl_store::derope_halves_inplace(&mut qh, &cos, &sin)?;
                     flat[(l * hq + h) * hd..(l * hq + h + 1) * hd].copy_from_slice(&qh);
                 }
-                q_post.push(row.clone());
+                // post-RoPE 面**只为真实质量算**(诊断面)⇒ 不在采样档不克隆
+                if analyze_now {
+                    q_post.push(row.clone());
+                }
             }
+            self.prof.q_derope_ms += t_derope.elapsed().as_secs_f64() * 1000.0;
             face.push_token(flat)?;
-            let m = true_block_mass(&q_post, &k_post, (layers, hq, hkv, hd), page, pos + 1);
-            for (a, b) in mass.iter_mut().zip(m) {
-                *a += b;
+            // **真实质量只在采样档算** —— 这是真重诊断:逐 query 行 ×
+            // (层,查询头) 对**全部已缓存 token** 做 softmax ⇒ 单边界
+            // `W × 层 × 头 × ctx × hd` 次 MAC(0.8B/3072 tok 实测 ≈ 每边界秒级)。
+            // 它服务的 mass/curve/oracle/paper_coverage **全是诊断读数**;
+            // 分数面(`scores`/选择/视图)不碰它。⇒ 与 KV 回读同门。
+            if analyze_now {
+                let t_m = std::time::Instant::now();
+                let m = true_block_mass(&q_post, &k_post, (layers, hq, hkv, hd), page, pos + 1);
+                for (a, b) in mass.iter_mut().zip(m) {
+                    *a += b;
+                }
+                self.prof.q_mass_ms += t_m.elapsed().as_secs_f64() * 1000.0;
+                q_post_last = std::mem::take(&mut q_post);
             }
-            q_post_last = q_post;
         }
         let denom = w as f32;
         for a in mass.iter_mut() {
             *a /= denom;
         }
+        self.prof.q_face_ms += t_qface.elapsed().as_secs_f64() * 1000.0;
         let pos = ctx_tokens - 1;
         // 候选块身份 = 本会话 token 链的逐块父链哈希(与索引登记同源:
         // `owl_store::hash_block` 是身份的唯一产地)
@@ -1080,30 +1210,98 @@ impl<D: DeviceClient> RunningEngine<D> {
         };
         let indexed = cands.iter().filter(|c| index.contains(**c)).count();
         let gqa = gqa_map(hq, hkv);
+        // ── **召回节奏**(`OWL_RECALL_EVERY`;缺省 1 = 每边界都完整召回)──
+        //
+        // 完整召回 = 打分(线性) + 按分选择;廉价召回 = **不打分的近期选择**
+        // (sink+recent+从尾往前填,与参考实现的 prefill 压力路径同构)。
+        // 两者**都要**走后面的驻留调和与视图装配 —— 设备侧不会因为跳过一个
+        // 边界就跟视图对不上;变的只是“这一边界的**选择名单**要不要重新算”。
+        //
+        // **末个边界永远是完整召回** —— decode 消费的视图就取自它。
+        let recall_every = self.cfg.knobs.recall_every.max(1);
+        // 用**边界序号**而不是块号做步进:块号是页宽的整数倍(边界只在页对齐处),
+        // 拿它取模会退化 —— 当页宽本身是 k 的倍数时**每个**边界都会命中
+        // (chunk 与页对齐时实测 k=4 仍然 15/15 全完整召回)。
+        //
+        // `analyze_now` **隐含完整召回**:要出诊断读数(mass/curve/oracle/paper)
+        // 的那条边界必须有当场的分数与选中集,否则读数无主。
+        let recall_now =
+            analyze_now || last_boundary || self.prof.boundaries % recall_every == 0;
+        if recall_now {
+            self.prof.recall_full += 1;
+        } else {
+            self.prof.recall_cheap += 1;
+        }
+        // **廉价边界 = 不重新打分,但仍要调和驻留**(两个反面教材都实测过,已废):
+        // ① "近期选择 + 调和":近期名单与上次打分名单**互相覆盖** ⇒ 每次完整召回
+        //    都要把上次沉下去的回灌一遍(调和 +92%、下沉/回灌翻倍);
+        // ② "什么都不做":`ensure_for_len` **驱逐不了会话自己持有的页**(引用在
+        //    会话账上)⇒ 链每 chunk 要新增 `chunk/page` 页,不腾就必然 `Exhausted`
+        //    (实测:池 96 页、链要 100 页 ⇒ "KV 块池耗尽")。
+        // ⇒ 正解:**冻结上次完整召回的选择 + 收进 sink/新尾部**,下游调和/视图照走。
         // ── **B-1 召回点**:打分(快路口径)+ 选择(预算/sink/recent)+ 实时读数 ──
         // 快路 = `ScoreMode::LogitMean`:两层线性折叠(窗 Σ_m + GQA 头 Σ_h),
         // 与论文口径**仅 FP 重排**(排序相同)但便宜 50×~24×(见 store 台账)。
         let t_sc = std::time::Instant::now();
-        let scores = owl_store::score_blocks(
-            index,
-            &face,
-            &cands,
-            &gqa,
-            owl_store::ScoreTuning { scale: 0.0, mode: owl_store::ScoreMode::LogitMean },
-        )?;
+        let scores = if recall_now {
+            owl_store::score_blocks(
+                index,
+                &face,
+                &cands,
+                &gqa,
+                owl_store::ScoreTuning { scale: 0.0, mode: owl_store::ScoreMode::LogitMean },
+            )?
+        } else {
+            Vec::new()
+        };
         let score_ms = t_sc.elapsed().as_secs_f64() * 1000.0;
+        self.prof.score_ms += score_ms;
         let (budget_blocks, sink, recent) = self.recall_budget();
         let t_sel = std::time::Instant::now();
         let scored: Vec<(owl_store::ChainHash, f32)> = cands.iter().copied().zip(scores.iter().copied()).collect();
-        let set = owl_store::select(
-            &scored,
-            &cands,
-            owl_store::SelectBudget::new(budget_blocks.min(n_blocks), sink, recent),
-        );
+        let budget = owl_store::SelectBudget::new(budget_blocks.min(n_blocks), sink, recent);
+        let set = if recall_now {
+            let s = owl_store::select(&scored, &cands, budget);
+            // 冻结名单(供廉价边界复用)+ 记账
+            self.sel_keep = s.blocks.clone();
+            s
+        } else {
+            // **廉价档:冻结上次完整召回的选择 + sink + 新尾部**(不打分)
+            let head = self.cfg.knobs.select_sink;
+            let tail = self.cfg.knobs.select_recent.max(1);
+            let mut keep: Vec<owl_store::ChainHash> = Vec::with_capacity(self.sel_keep.len() + tail + head);
+            for c in cands.iter().take(head.min(cands.len())) {
+                if !keep.contains(c) {
+                    keep.push(*c);
+                }
+            }
+            for c in cands.iter().skip(cands.len().saturating_sub(tail)) {
+                if !keep.contains(c) {
+                    keep.push(*c);
+                }
+            }
+            for c in &self.sel_keep {
+                if !keep.contains(c) {
+                    keep.push(*c);
+                }
+            }
+            let all = n_blocks;
+            keep.sort_by_key(|c| cands.iter().position(|x| x == c).unwrap_or(usize::MAX));
+            owl_store::BlockSet {
+                dropped: all.saturating_sub(keep.len()),
+                reserved: (head + tail).min(keep.len()),
+                blocks: keep,
+            }
+        };
         let select_ms = t_sel.elapsed().as_secs_f64() * 1000.0;
+        self.prof.select_ms += select_ms;
         // **B-4 召回信号**:把"本步被注意力选中"的块告诉策略面
-        // (attention-aware LRFU 的 keep-score;LRU 策略 = 无操作 ⇒ 默认路径零影响)
-        self.bank.rel.note_recall(&set.blocks);
+        // (attention-aware LRFU 的 keep-score;LRU 策略 = 无操作 ⇒ 默认路径零影响)。
+        // ⚠️ **只在完整召回档发信号**:廉价档的名单是**纯近期序**推出来的,不含任何
+        // 注意力信息 ⇒ 拿它喂 LRFU 等于用"最近"冒充"被注意力用过"(自激回路)。
+        if recall_now {
+            self.bank.rel.note_recall(&set.blocks);
+        }
         let picked: Vec<usize> = set
             .blocks
             .iter()
@@ -1111,29 +1309,56 @@ impl<D: DeviceClient> RunningEngine<D> {
             .collect();
         let coverage = coverage_of_set(&mass, &picked);
         let oracle_coverage = oracle_at_budget(&mass, budget_blocks.min(n_blocks));
-        // 论文口径(softmax 均值)在同预算下的覆盖 —— 保真对照(慢,只报数)
-        let paper_scores = owl_store::score_blocks(index, &face, &cands, &gqa, owl_store::ScoreTuning::default())?;
-        let paper_set = {
-            let ps: Vec<(owl_store::ChainHash, f32)> =
-                cands.iter().copied().zip(paper_scores.iter().copied()).collect();
-            owl_store::select(
-                &ps,
+        // 论文口径(softmax 均值)在同预算下的覆盖 —— **保真对照(诊断面)**。
+        //
+        // 为什么不每边界都算(2026-10-19 性能修正):这是慢路 —— store 的
+        // release 延迟门实测 27B 几何下 **1.45ms/块 = 快路的 53×**(8192 块
+        // 11905ms vs 222ms)。而它报的 `paper_coverage` 是**相对于 `mass`(真实
+        // 注意力质量)的覆盖** —— `mass` 本身只在 `analyze_now` 采样档才读得到
+        // (缺它 => `coverage_of_set` 恒 0)。所以采样外重算它 = **纯白烧**,
+        // 且算出来的 0 还会把读数弄脏。⇒ 与 `mass` 同门(这也正是本段上方
+        // 「重诊断采样」注释里已经写下的意图)。
+        let (paper_coverage, paper_ms) = if analyze_now {
+            let t_paper = std::time::Instant::now();
+            let paper_scores = owl_store::score_blocks(
+                index,
+                &face,
                 &cands,
-                owl_store::SelectBudget::new(budget_blocks.min(n_blocks), sink, recent),
+                &gqa,
+                owl_store::ScoreTuning::default(),
+            )?;
+            let paper_set = {
+                let ps: Vec<(owl_store::ChainHash, f32)> =
+                    cands.iter().copied().zip(paper_scores.iter().copied()).collect();
+                owl_store::select(
+                    &ps,
+                    &cands,
+                    owl_store::SelectBudget::new(budget_blocks.min(n_blocks), sink, recent),
+                )
+            };
+            let paper_picked: Vec<usize> = paper_set
+                .blocks
+                .iter()
+                .filter_map(|b| cands.iter().position(|c| c == b))
+                .collect();
+            (
+                coverage_of_set(&mass, &paper_picked),
+                t_paper.elapsed().as_secs_f64() * 1000.0,
             )
+        } else {
+            // 采样外不重算:沿用上一次采样边界的读数(`mass` 不在场时这个数
+            // 本来就不可解释;沿用 > 拿 0 冒充)。
+            (self.cov_last.as_ref().map(|r| r.recall.paper_coverage).unwrap_or(0.0), 0.0)
         };
-        let paper_picked: Vec<usize> = paper_set
-            .blocks
-            .iter()
-            .filter_map(|b| cands.iter().position(|c| c == b))
-            .collect();
-        let paper_coverage = coverage_of_set(&mass, &paper_picked);
+        self.prof.paper_ms += paper_ms;
         // ── B-3e-2 第 2 项:召回点的**下沉 / 回灌**(部分驻留档)──
         // 被踢出工作集的链块 ⇒ `decref`(放开会话引用)+ 逐块下沉 + 表写占位;
         // 选中但内容在宿主的块 ⇒ 回灌 + 写回槽(复用 turn 起点那套 plan/swap/commit)。
         // 先沉后升:沉的这一步**腾出的槽**正是升要用的槽。
         if self.cfg.knobs.select_partial {
+            let t_rec = std::time::Instant::now();
             let (sunk, staged) = self.reconcile_residency(sid, &cands, &set.blocks, n_blocks).await?;
+            self.prof.reconcile_ms += t_rec.elapsed().as_secs_f64() * 1000.0;
             self.partial.sunk += sunk;
             self.partial.staged += staged;
             if sunk + staged > 0 {
@@ -1155,6 +1380,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             .get(sid)
             .map(|s| s.block_table.clone())
             .unwrap_or_default();
+        let t_view = std::time::Instant::now();
         let mut view_pages: Vec<u32> = set
             .blocks
             .iter()
@@ -1190,6 +1416,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 recall_pos: ctx_tokens,
             });
         }
+        self.prof.view_ms += t_view.elapsed().as_secs_f64() * 1000.0;
         // ── B-3c-pre 方案对照(A vs B,各自与 dense 比;host 单 query)──
         let scheme = if want_scheme {
             let mut picked_tok: Vec<usize> = Vec::new();
@@ -1200,7 +1427,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             }
             let q_row: Vec<Vec<f32>> = (0..layers)
                 .map(|l| {
-                    let off = (pid.t - 1) * hq * hd;
+                    let off = (w - 1) * hq * hd;
                     pid.q[l][off..off + hq * hd].to_vec()
                 })
                 .collect();
@@ -1241,7 +1468,6 @@ impl<D: DeviceClient> RunningEngine<D> {
             scheme,
         };
         // 对照:论文口径的逐块分(曲线用;与快路同序 ⇒ 曲线取自 fast)
-        let _ = &paper_scores;
         // ── ③ 覆盖率(真实质量已在上方按 query 窗累均)──
         let _ = &q_post_last; // 末行 post-RoPE 面(诊断保留;后续 B-1 打分器用于 tile 化)
         let ks: Vec<usize> =
@@ -1278,7 +1504,16 @@ impl<D: DeviceClient> RunningEngine<D> {
                 "索引缺口:{indexed}/{n_blocks} 块在场 ⇒ 曲线虚低(边界事件与分析的序?)"
             );
         }
-        self.cov_last = Some(rep);
+        // **只有诊断真跑了的边界才更新报告**(2026-10-19)。
+        //
+        // 原实现每边界都覆盖 ⇒ 后到的边界会把**目标边界**的报告冲掉 ——
+        // 即使那条边界没算诊断(mass 为空/取自别的 ctx),`cov_last` 也会被换成
+        // 它的读数,于是"钉住分析边界"失效(实测仍随 chunk 漂移:3072/3584/3840)。
+        // 现在语义清楚:`cov_last` = **最后一次真诊断**的读数。
+        if analyze_now {
+            self.cov_last = Some(rep);
+        }
+        self.prof.total_ms += t_all.elapsed().as_secs_f64() * 1000.0;
         Ok(())
     }
 }

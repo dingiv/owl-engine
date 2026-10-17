@@ -246,7 +246,12 @@ async fn non_strict_dense_floor_is_refused_loudly() {
     };
     let msg = format!("{err}");
     eprintln!("[gate] 非 Strict 拒启原文: {msg}");
-    assert!(msg.contains("dense_floor"), "{msg}");
+    // 文案在 2026-10-19 改成"需显式开启虚拟化";两个关键词都接
+    assert!(
+        msg.contains("dense_floor") || msg.contains("虚拟化"),
+        "拒启理由应指明地板/虚拟化: {msg}"
+    );
+    assert!(msg.contains("select_decode") || msg.contains("虚拟化"), "{msg}");
 
     // ② 请求面(per-turn)
     let mut running = boot().await;
@@ -291,4 +296,50 @@ async fn idle_sessions_do_not_hold_gdn_rows() {
         st.snap_gpu.0 + st.snap_host.0 > 0,
         "idle 会话的状态应走快照账(行已归还)"
     );
+}
+
+/// **锁②反向门(2026-10-19)**:配置**显式开启虚拟化**后,非 Strict 地板必须
+/// **放行**(而不是像以前那样一律拒)。
+///
+/// 为什么这条门必须有:解锁类护栏的判据变成"配置里有没有开虚拟化"之后,
+/// 可能出现两种坏法 —— ①开也拒(解不开,功能形同虚设);
+/// ②不开也放(静默降级)。本门钉住①,`non_strict_dense_floor_is_refused_loudly`
+/// 钉住②。**两条一起才叫"条件放行"。**
+#[tokio::test]
+async fn non_strict_dense_floor_is_allowed_when_virtualization_is_on() {
+    if skip() {
+        return;
+    }
+    let cfg = EngineConfig {
+        device_ordinal: 0,
+        max_seq_tokens: 256,
+        prefill_chunk: 32,
+        knobs: EngineKnobs {
+            sampler_enabled: false,
+            dense_floor: owl_store::TurnFloor::Bytes(0), // 允许全量下沉
+            kvmem_virtualization: true,                  // 配置面两条门都开
+            select_decode: true,
+            select_partial: true,
+            // 预算必须 **装得进池**(boot 硬校验,且**按并发乘**:
+            //   nb ≥ max_active_turns × (blocks + sink + recent + chunk/page)
+            // 本档 16 页 ⇒ 11 页/turn × 1 并发 ✓;缺省 max_active_turns=8 会拒)
+            max_active_turns: 1,
+            select_blocks: 8,
+            select_sink: 1,
+            select_recent: 1,
+            ..Default::default()
+        },
+    };
+    let face = CpuFace::mock(MockLimits {
+        null_kernels: true,
+        graph_capture: true,
+        ..Default::default()
+    });
+    let mut engine = Engine::on(cfg, face).expect("构造");
+    let loaded = engine.loader().load_qwen35_0_8b(&asset_dir()).await.expect("装载");
+    let running = engine.run(loaded).await;
+    match running {
+        Ok(_) => eprintln!("[gate] 虚拟化开 + Bytes(0) 地板 ⇒ 放行(预期)"),
+        Err(e) => panic!("虚拟化开时非 Strict 地板必须放行,得: {e}"),
+    }
 }

@@ -977,3 +977,572 @@ O(1)、排序时按需折算;时间戳**只读**、**步进由 `order` 推进**(
 
 **(6)环境教训**:`CUDA_VISIBLE_DEVICES=n` 按 **CUDA 序**(FASTEST_FIRST)解释:
 **0/1 = 双 3090 Ti,2/3 = 双 3080**(≠ nvidia-smi 序;我为此吃了一次"选到 3080 就 OOM")。
+
+### 8.23 B 轴**耗时构成实测** + 两刀纯性能修正(2026-10-19)
+
+> **一句话**:先立相位账再动刀 —— 实测把三个猜测全打翻:**①逆 RoPE 只占 0.2ms(不是瓶颈)
+> ②真凶是"诊断面混在生产路径里",单次真实质量扫描 = 6.1s(27B/8k,占墙钟 **31%**)
+> ③生产面 B 轴本身只占 7.4%**。
+
+**(1)相位账(`BAxisProfile`,纯计时零语义)**
+
+落点:`crates/engine/src/running.rs`(`BAxisProfile::line()`)、`exec/coverage.rs`
+(`coverage_analyze` / `coverage_take_q` 分段)、`exec/spec.rs`(`collect_index_for_block`)。
+八相位:索引 / 查询面(设备往返 · host 解码 · 逆 RoPE · 真实质量)/ 重诊断 / 打分 /
+论文口径 / 选择 / 视图 / 调和。读数口与 `PartialStats` 同款(`[cov]` / `[b5-27b]`)。
+
+**(2)两刀修正(零语义)**
+
+| 刀 | 症状 | 修法 |
+|---|---|---|
+| **① 论文口径打分移进采样门** | `paper_scores`(softmax 口径)在**每个**块边界无条件重算 —— store release 延迟门实测它是快路的 **53×**(8192 块 11905ms vs 222ms);而它报的 `paper_coverage` 是**相对 `mass`** 的覆盖,`mass` 不在场时恒 0 ⇒ 采样外重算 = 纯白烧 + 脏读数 | 与 `mass` 同门(代码里"重诊断采样"注释本来就写的是这个意图) |
+| **② 重诊断默认只在"末个边界"** | K/V 全量回读 + **`true_block_mass`**(逐 query 行 × (层,头) 扫**全 ctx**)在每边界都跑 ⇒ 全军 **O(ctx²)** | `analyze_now` 三档:`未设` = 末边界一次 · `=k` = 每 k 块 · `=0` = 关。**末边界**由调度器**同一份**块长函数(`Self::prefill_step_chunk`)预测下一条边界会不会来 —— 而非另写一套分块算术 |
+
+> ⚠️ 口径提醒:`is_last`(末个 **chunk**)≠ **末个边界**:prompt 末尾不页对齐时,
+> 最后一个边界之后还有 chunk,但没有边界了。用 `is_last` 判会导致**一次诊断都不做**。
+
+**(3)0.8B 实测(ctx 3072 / 96 块 / chunk 1024;release)**
+
+| 相位 | 修前(×3 边界) | 修后 |
+|---|---:|---:|
+| **合计** | **793.2ms** | **405.6ms** |
+| 索引 | 74.4 | 71.4 |
+| 查询面 | 751.8 | 431.7 |
+| ├ 设备往返 | — | 91.4(**30ms/边界**) |
+| ├ host 解码 | — | 0.9 |
+| ├ 逆 RoPE | — | **0.2** |
+| └ 真实质量 | — | 339.1 |
+| 重诊断 | 78.7 | 42.9 |
+| 打分(快路) | 1.4 | 1.4 |
+| 论文口径 | 36.7 | 18.4 |
+
+**(4)27B 实测(ctx 8192 / 池 4096(2× 超卖)/ chunk 128;release;墙钟 19.9s)**
+
+```text
+B 轴相位 ×54 边界:合计 7044.6ms
+  真实质量(诊断) 6138.4 ← **单次 6.1s = 墙钟 31%**
+  索引 754.5(14ms/边界) · 打分 220.7(4ms/边界) · 调和 288.3 · 重诊断 105.2
+  论文口径 245.6 · 查询面(非诊断) 202.0 · 选择 0.8 · 视图 4.6
+  ⇒ **生产面合计 ≈ 1470ms = 墙钟 7.4%**
+```
+
+对照 §8.22(同参,debug):625.5s ⇒ **release 19.9s**(debug 的 host 热点 ≈ 30×)。
+门不变:下沉 350 块 / 回灌 166 / 子集表 46 / 视图步 23 / **回退 0** / 输出同形。
+
+**(5)三条反直觉读数(给后续调优)**
+
+1. **逆 RoPE 不是瓶颈**(0.2ms@0.8B / 13.3ms@27B 全军)。原以为"M1 图内取 pre-RoPE K
+   能省掉逆 RoPE"⇒ **收益点判断错了**;图内 tap 的价值在**别的**地方(fp8 池可用、
+   已沉块可采、口径与核内一致),不在算力。
+2. **`dtoh` 的固定成本随 chunk 计算量走,不随字节走**:"读语义"要**排空 COMPUTE** ⇒
+   单次往返 ≈ 该 chunk 的 GPU 时间(0.8B/chunk1024 = **30ms/次**;27B/chunk128 = **1.7ms/次**)。
+   ⇒ 少一次往返 > 少一半字节。
+3. **诊断面 vs 生产面必须分开记账**:在 27B 档,诊断是生产的 **4×**。凡"探针开着测性能"
+   得到的读数,都要先把诊断摘出去看(否则会把诊断的账算到选择层头上)。
+
+**(6)当前挂账(按收益排序)**
+
+| # | 项 | 预期收益(27B/8k 口径) |
+|---|---|---|
+| 1 | **真实质量搬到设备**(或只在小 ctx 采) | **6.1s → ~0**(占墙钟 31%) |
+| 2 | **两次 D2H 并成一条批命令**(索引 K + Q 面) | ~50%(0.8B 档 30ms→15ms/边界) |
+| 3 | **召回节奏**(每边界 → 每 N 块/压力驱动) | 线性(边界数 ↓ k 倍) |
+| 4 | 图内 pre-RoPE K tap(M1) | 非算力收益:解 **fp8 池**与**已沉块**两个结构性限制 |
+
+**(7)第三刀:召回节奏(`OWL_RECALL_EVERY`,2026-10-19 同日)**
+
+**病灶**:单次打分是 O(块数) **线性**,但"每块边界都打"⇒ 一次 prefill 累计 **O(块数²)**。
+参考实现把这条曲线压回线性,靠的是**每请求只召回一次**(中间边界只走不打分的压力路径)。
+
+**两版设计的取舍(第一版实测吃亏,已推翻)**:
+
+| 廉价档语义 | 打分 | 调和 | 下沉/回灌 | 末边界覆盖率读数 | 判决 |
+|---|---:|---:|---:|---:|---|
+| v1:**近期选择 + 调和** | 220.6→60.5ms | **269→545.6ms ↑** | 350/166 → **650/466 ↑** | 74.7% → **41.8%** | ❌ **净亏** |
+| v2:**只采索引,不干预驻留** | 220.6→**63.0ms** | 269→**149.7ms ↓44%** | 350/166 → **231/47** | 74.7% → **70.4%** | ✅ |
+
+- v1 为什么亏:近期名单与上一次的打分名单**互相覆盖** ⇒ 每次完整召回都要把上一次
+  廉价档沉掉的块再回灌一遍;"过了多少边界"成了搬运量的自变量。
+- v2 的语义:**两次完整召回之间不改变选择** —— 驻留交给 A 轴(池满时本来就在按策略淘汰),
+  下一次完整召回时一次性对齐 ⇒ 搬运量由"**选择变了多少**"决定。
+- 41.8% 那条是**读数失真**而非质量下降:驻留子集变了 ⇒ `mass` 的可读面变了
+  (`host_skipped` 块按零计)⇒ **跨配置的覆盖率读数不可直接比**。这条要写进读数口径纪律。
+
+**采样步进用边界序号,不用块号**:块号是页宽的整数倍(边界只在页对齐处),拿它取模会退化
+—— 当页宽本身是 k 的倍数时**每个**边界都命中(实测 chunk 与页对齐时 k=4 仍 15/15 全完整召回)。
+
+**27B/8k 实测(k=1 → k=4;release)**:打分 221→63ms · 调和 269→150ms · 下沉 231/回灌 47 ·
+视图步 23 **回退 0** · 输出同形。⇒ 生产面 B 轴 **1.47s → 1.2s(占墙钟 ~6%)**。
+
+**(8)顺带修掉的 O(B²)**:`store::select()` 的 `score_of` 原是对 `scored` 的**线性查找**,
+建 `rest` 时逐元素调一次 ⇒ **O(B²)**(B=8192 时 3300 万次比对/边界,纯 latent 开销)。
+改一次建表 ⇒ O(B)。新增 `select_recency()`(无打分无排序,参考的 prefill 压力路径同构)。
+
+### 8.24 第四刀:**生产面与诊断面拆分**(低显存档可开)+ 配置面落地(2026-10-19)
+
+> **一句话**:拆之前 B 轴整个挂在 `OWL_COVERAGE_PROBE` 下 ⇒ **低显存档位根本开不了
+> 这个功能**;拆之后 27B/8k/2× 超卖 的墙钟 **19.6s → 13.7s**,生产面 B 轴 =
+> **1480ms(10.8%)**,其中诊断面 0(不再背账)。
+
+**(1)病根:三处门共用同一个诊断旋钮**
+
+| 件 | 旧门 | 新门 |
+|---|---|---|
+| Q 槽接入(`prefill_chunk.rs`) | `coverage_probe` | **`coverage_probe \|\| select_decode`** |
+| 设备视图面(`engine.rs` `select_view`) | `coverage_probe` | **`coverage_probe \|\| select_decode`** |
+| 召回入口(`phases.rs` 边界事件) | `coverage_probe` | **`coverage_probe \|\| select_decode`** |
+| 真重诊断(质量/曲线/上界/论文口径/方案对照) | (无独立门) | **`coverage_probe`**(`diag`) |
+
+**为什么必须拆**:诊断面单边界成本**含 `ctx` 因子**(逐 query 行 × (层,头) 扫全 ctx)
+⇒ 27B/8k 实测单次 **6.3s = 墙钟 32%**,而那时生产面只有 6%。
+"想开功能就先背诊断的账"是不能交付的形态。
+
+**(2)新发现并接住的一处静默风险**
+
+拆分后 `select_decode` 可以在 `coverage_probe` 关闭时生效 —— 而 **prefill 桶图路
+不支持 Q 槽**(Q 槽只在 eager 路接线)。若不处理,生产档会走桶图 ⇒ **Q 面静默为空**
+⇒ 打分在空 query 上算(不报错,只是选错)。⇒ 把 `select_decode` 加入桶图让位条件
+(与诊断档同律,响亮告知一次),并挂账"桶图路学会 Q 槽后生产档就不必让位"。
+
+**(3)27B 实测(纯生产档:`OWL_COVERAGE_PROBE=0`;ctx 8192 / 池 4096(2× 超卖)/ chunk 128)**
+
+| 召回节奏 | 墙钟 | B 轴合计 | 索引 | 查询面 | 打分 | 调和 | 下沉/回灌 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| k=1 | 13.7s | 1481ms | 766 | 207 | 223 | 279 | 350/166 |
+| k=4 | 13.3s | **1136ms** | 723 | 210 | 63 | 139 | 231/47 |
+| k=8 | 12.9s | 1184ms | 749 | 273 | 33 | 130 | 215/31 |
+
+全档 **视图步 23 / 回退 0**;门(下沉>0 · 视图驱动 · 输出非退化)全绿。
+⇒ 生产面 B 轴 ≈ **8.5%**(k≥4);剩下的大头是**索引采集的 D2H 往返**(~750ms = 52%)。
+
+**(4)配置面(`shared/config.rs` + `assets/flavors/`)**
+
+新增 `[kvmem]` 段(`KvmemCfg`):`select_decode` / `select_partial` / `index` /
+`select_blocks` / `select_sink` / `select_recent` / `recall_every`。
+读取优先级同 `pool_tokens` 的既有律:**env 覆盖 > 配置对象 > 缺省**;
+`EngineKnobs::from_config` 是唯一搬运点。
+
+- `assets/flavors/awq27b.toml`(高显存档):显式写 `[kvmem]` **全关** ——
+  池 ≥ ctx 时每个召回点都是纯开销;
+- `assets/flavors/awq27b-kvmem.toml`(**新的低显存档档**):派生自 awq27b +
+  `select_decode/select_partial/index = true`、`select_blocks = 32`、`recall_every = 4`。
+
+**(5)顺手修的既存回归(非本次引入,已如实标注)**
+
+`7c5627f`(A 轴收官)把 `PoolCfg.gdn_slots` 改名 `max_active_turns`,但
+`assets/flavors/{awq27b,spec-dflash}.toml` 的文本没跟上 ⇒ `deny_unknown_fields`
+**直接拒解析**(`owl-shared` 两条测试红)。已改名为新字段名(语义不变:单会话 = 1)。
+
+⚠️ **未修、待你拍**:`awq27b` flavor 的白名单列了 `owl_cast_bf16_f16`,而
+`PROD_AWQ27B_2026_10_13` 台账没有它 ⇒ `server/ops_whitelist` 的
+`flavor_whitelists_match_audited_tables` 红(同为既存)。两个方向(从 flavor 删,
+或补进台账)会改变生产档放行集,**不由我单方面定**。
+
+### 8.25 第五刀:**锁①/锁② 条件解禁 + fp8 池支持**(2026-10-19)
+
+> **一句话**:先纠正一个我此前给出的**错误结论** —— 我说过"fp8 无分页 ⇒ 选择层结构上
+> 不存在",**那是错的**:`kv_paged_policy(dims.dtype)` 收的是**模型 dtype**(F16),
+> `kv_fp8` 是独立开关 ⇒ **fp8 池本来就是分页的**。真正的堵点只有一处:
+> **索引采集把 fp8 页 K 读回来解码**。本刀把它接上,并给两道锁装了**配置门**。
+
+**(1)fp8 池的字节事实(单源 = 池写核)**
+
+`owl_qknorm_rope_kv_insert_f16_{knhd,fp8kv_knhd}`(`kernels/cu/fused/qknorm_insert.cu`):
+
+```text
+key/value_cache: [nb, page, Hkv, hd]      kk = ((block·page + off)·Hkv + kh)·hd + d
+f16 : __half          2B/elem
+fp8 : unsigned char   1B/elem,值 = __nv_fp8_e4m3(n).__x —— **裸 e4m3,无 scale**
+```
+两侧**寻址式逐式相同** ⇒ 分支点只有「每页字节」与「字节→f32」两处。
+
+**(2)落地:单源解码面 `exec/kvpage.rs`**
+
+`KvPageFormat::{F16, Fp8E4M3}`,`of_pool(kv_fp8)` = **从池实况定格式**(不从第二个配置项猜)。
+e4m3 → f32 走 `owl_models::kernel::e4m3_decode`(re-export 自 kernels 的**独立手写、
+已被 GPU 逐字节验证**的参考)⇒ **引擎侧零第二份 e4m3 实现**;
+单测 `fp8行解码与kernels参考同源` 逐位比对,将来若有人写第二份即红。
+索引采集(`spec.rs`)与诊断回读(`coverage.rs`)两处改写,原有 fp8 硬拒全部撤除。
+
+**实测(0.8B / ctx3072 / 96 块 / 池 KV = fp8 e4m3)**:
+
+| 指标 | f16 | **fp8** |
+|---|---:|---:|
+| top8 覆盖率 | 87.5% | **87.5%** |
+| 上界 | 88.7% | 88.8% |
+| 选择器覆盖 / 论文口径 | 97.9% / 97.9% | **97.9% / 97.9%** |
+| 索引在场块 | 96/96 | **96/96** |
+
+⇒ 与 f16 **语义等价**(差异只在 e4m3 量化误差,读数落在千分位)。
+
+**(3)锁①:池下限按配置门控放开**
+
+原 `nb = max(ceil(pool_tokens/page), ceil(seq_tokens/page))` **无条件**把池钉在
+"单会话全量上下文" ⇒ **选择层只省访问面、不省显存**。改:
+
+```
+nb = ceil(pool_tokens/page)                       若 PoolPlan.pool_overcommit
+nb = max(上述, ceil(seq_tokens/page))             否则(缺省 = 旧行为逐位不变)
+```
+`pool_overcommit` 的唯一产地 = `EngineKnobs::kvmem_virtualization`
+= `[kvmem].select_decode && select_partial`。配套 **boot 硬校验**:
+`select_blocks + sink + recent ≤ nb`,装不下直接拒启并报数(不许跑起来才 `Exhausted`),
+同时**响亮告知**池/上下文/超卖倍率/宿主预算。
+
+**(4)锁②:`TurnFloor::Bytes` 条件解禁**
+
+旧护栏"非 Strict 一律拒启"(`engine.rs`)是因为当时 B 轴未落地。现改**条件放行**:
+只有 `[kvmem].select_decode + select_partial` 同时为真才接受非 Strict;
+配套 `[kvmem].dense_floor_mib`(`None` + 虚拟化开 ⇒ `Bytes(0)` = "工作集装得下就准入";
+`Some(n)` ⇒ `n` MiB)。映射归引擎(配置层不依赖 store —— 分层)。
+
+**两侧方向都由 e2e 钉住**(`store_admission_gate`,CPU mock):
+
+| 门 | 场景 | 期望 |
+|---|---|---|
+| `non_strict_dense_floor_is_refused_loudly` | 虚拟化**关** + Bytes 地板 | **拒启**(文案指明虚拟化/select_decode) |
+| `non_strict_dense_floor_is_allowed_when_virtualization_is_on` | 虚拟化**开** + Bytes(0) | **放行** |
+
+后者的第一版**被新校验正确拦下**(池 16 页 < 默认工作集 70 页)⇒ 反过来证明 boot 校验在干活。
+
+**(5)配置面 + flavor**
+
+`[kvmem]` 新增 `dense_floor_mib` / `pool_overcommit`;`KvmemCfg::virtualization_enabled()`
+= **所有解锁类护栏的唯一判据**。
+
+`assets/flavors/awq27b-kvmem.toml` 改成**真正的低显存档配方**(27B/24G 为例):
+
+```text
+上下文 32768 tok = 1024 页        (27B f16: 2 GiB KV)
+设备池  2048 tok =   64 页        (        128 MiB)   ⇒ 超卖 16×
+宿主   非驻留 960 页 ≈ 1.9 GiB    ⇒ OWL_HOST_CACHE_MB=3072
+```
+
+**(6)锁①的**另一半**:块表必须按 chunk 增量长(2026-10-19 实测暴露)**
+
+`nb` 放开之后 27B 首跑仍然挂,原文:
+
+```text
+store: 资源耗尽:target 链:KV 块池耗尽:需 218 块,空闲 64,table=0 —— 缓存压力驱逐后仍不足
+```
+
+**根因不在池,在块表的槽预留模型**:turn 起点 `scheduler.rs` 一次
+`ensure_for_len(block_table, prompt_len)` —— 把**整个 prompt** 的页数一次性要到位。
+池 ≥ ctx 时这一步从不暴露(反正装得下);池 < ctx 时它要几千页槽 ⇒ 必 `Exhausted`。
+
+修法(同样**只在虚拟化档**生效):**用到哪长到哪** ——
+
+| 位置 | 非虚拟化档(缺省) | 虚拟化档 |
+|---|---|---|
+| turn 起点(`scheduler.rs`) | 长到 `prompt_len`(旧行为) | 只长到**首个 chunk** |
+| 每 chunk(`execute_prefill` 前) | 不动 | 长到 `base + t`(增量 `chunk/page` 页) |
+
+腾位归召回点的驻留调和(A/B 两轴)——**这正是超卖成立的方式**。
+配套 boot 硬校验加一项:`select_blocks + sink + recent + chunk/page ≤ nb`。
+
+**(7)27B 低显存档实测:通过(4× 超卖)**
+
+```text
+[b5-27b] ctx=8192 tok · 设备池=2048 tok(超卖 4.0×)· 装配后驱动空闲 4311MiB · live 账 19433MiB
+[b5-27b] 用时 12.6s · 视图步 23 · 回退 0 · 召回 32 页(物化 14.8%)
+[b5-27b] 部分驻留:下沉 268 块 · 回灌 84 块 · prefill 子集表 43 次
+[b5-27b] 池 31/64 槽自由          ← 池真的是 64 页(128 MiB),不是 256 页
+[b5-27b] B 轴相位 ×54 边界:合计 251.2ms | 索引 501 查询面 312 打分 60 调和 168
+         ‖ 召回档:完整 14 · 廉价 40
+```
+
+| 指标 | 池被钉在 ctx(旧) | **池 64 页(本刀)** |
+|---|---:|---:|
+| 设备 KV 面(27B f16) | 512 MiB(256 页) | **128 MiB(64 页)** |
+| 装配后驱动空闲 | 3927 MiB | **4311 MiB(+384 MiB)** |
+| 链长上限 | = 池 | **4× 池**(超卖) |
+| 门(零崩/下沉/视图驱动/回退/输出) | 全绿 | **全绿** |
+
+⇒ **"设备只留工作集、全量 KV 在宿主"第一次在 27B 上成立并省下了显存**(此前只省访问面)。
+
+**(8)一条新读数:超卖档把压力推给了**状态腿**
+
+低显存档下 GDN 快照腿会频繁撞自己的分片上限,响亮打点(不崩):
+
+```text
+DBG-SNAP 下沉失败: 资源耗尽:宿主层越界:637009920 > 536870912(关层请置 0,放量请调大 host_bytes)
+```
+
+⇒ 超卖档必须同时给 **`OWL_SNAP_HOST_MB`** 留量(27B 快照 607 MiB > 场景给的 512 MiB 分片)。
+flavor 注释里已写明;这是**配置配平**问题,不是缺陷(行为 = 沉不下的快照被丢,该边界不可复用)。
+
+### 8.26 **"8K prefill 12s"定谳** + 池下限/并发算式 + 一个既存真 bug(2026-10-19)
+
+> **一句话**:12s 不是 KVMem 造成的 —— 是**三个协议因素叠加**,其中一个是**既存真 bug**
+> (生产主力 prefill 核在本分支上根本开不起来)。同协议对照下,低显存档代价
+> = **+18%**(bare 6.8s vs partial 8.0s),且这 1.2s **全是可优化的回读**。
+
+**(1)三方对质(同一场景/同一 prompt/同一卡,顺序跑)**
+
+| 档 | chunk | 核 | 用时 | t/s |
+|---|---:|---|---:|---:|
+| 裸档基线 `std-bare.csv`(server;f16 池 296 页) | 512 | FI+split | **6366ms** | **1287** |
+| 我最初的跑(KVMem 全开) | 128 | 无 FI、split 撞门 | 12.6s | 553 |
+| **bare 臂**(KVMem 全关) | 128 | 无 FI、split 撞门 | 15.2s | 458 |
+| bare | 512 | FI+split(修后) | **6.1s** | 1143 |
+| **partial 臂**(池 64 页 = 4× 超卖) | 256 | FI+split | **8.0s** | 871 |
+| partial | 512 | — | 差 **2.5 MB** 显存(体量硬墙) | — |
+
+⇒ **三条原因,与 KVMem 无关**:
+
+| # | 原因 | 代价 |
+|---|---|---|
+| 1 | 场景把 `chunk` 压到 **128**(为省显存;512 的工作区 ~3.9GB) | 12.5s → 6.1s(**2×**) |
+| 2 | 测试档 `EnvProvider::default()` ⇒ **`fi = false`**,而生产"FI 恒启用"(`from_dispatch` 原话);生产 prefill 走 FlashInfer | ~2s |
+| 3 | **`prefill_split` 契约 rank bug**(见下) | 挡住 1+2 的生效路径 |
+
+**(2)既存真 bug:`prefill_split` 的 scratch 声明 rank 错(修了)**
+
+```text
+[算子准入] contract owl_prefill_split_f16_knhd_hd256:
+  scr_out 期望 rank = 2(声明) 实得 1(线格式事实)
+```
+- 契约(`kernels/ops/attn.rs` 的 PARAMS):`scr_out` F16 **r2**、`scr_stat` F32 **r2**;
+- `attention.rs` 的 **paged 分块 prefill 路**却把两者声明成 **r1**(一维扁平);
+- 同一内核在 `attention.rs` 另一条调用路声明的是 r2(注释还写着"契约:scr_out/scr_stat 皆 r2")
+  ⇒ **两处规范不一致**,而准入门站在 r2 那边。
+- 后果:**本分支上开 `prefill_split` 必然拒启** ⇒ 所有 27B prefill 读数都是"未开分块核"档。
+- **`main` 上同样存在**(已核:main 的 941 行 r1 / 2680 行 r2)⇒ **既存,非本刀引入**。
+- 修法:**只改声明、零新节点**(`with_shape` 就是那个口子,元素数不变只改 rank)。
+
+**(3)池下限与并发的算式(boot 硬校验,已落地)**
+
+```text
+池页数 ≥ N_active × (select_blocks + sink + recent + ceil(chunk/page))
+         └─ N_active = max_active_turns(每个活跃 turn 都要自己一套)
+准入地板(每 turn) = (select_blocks + sink + recent) 页 × 每页字节   ← 缺省自动填
+```
+**27B f16 算例**(页 = 32 tok × 4 头 × 256 维 × 2(K+V) × 2B × 16 层 = **2 MiB/页**;fp8 = 1 MiB):
+
+| 并发 | 每 turn 页 | 池下限 | 对照 dense |
+|---:|---:|---:|---:|
+| 1 | 32+2+4+8 = 46 页 = 92 MiB | 92 MiB | 512 MiB |
+| 2 | 46 页 | 184 MiB | 1 GiB |
+| **8** | 46 页 | **736 MiB** | **4 GiB** ⇒ **省 5.6×** |
+
+**地板为什么不能用 0**(我上一版是错的):N 个 turn 若都"无条件准入",就会互抢池 ⇒ 抖动。
+缺省自动填 = **本 turn 工作集字节**,与池下限算式**同源**(同一套页数,乘字节而非并发数);
+显式 `[kvmem].dense_floor_mib` 则尊重显式值(`dense_floor_explicit` 标记)。
+
+**校验四层**:
+
+| 层 | 判据 | 时机 | 我的实测 |
+|---|---|---|---|
+| boot | 池 ≥ N_active × 每 turn 页 | 拒启 | 池 64 页 + 2 并发 ⇒ **正确拒启**(报数 92 页) |
+| boot | 池 < ctx 仅虚拟化档 | 拒启 | ✓ |
+| boot | 非 Strict 地板需虚拟化档 | 拒启 | ✓(双向 e2e 门) |
+| 准入 | committed + 本 turn 地板 ≤ 准入面(store 四态) | 每 turn | ✓ |
+| 运行 | slot 不足 ⇒ `Exhausted` 响亮拒 | 每 chunk | ✓ |
+
+**(4)剩下那 1.2s 全是可优化的回读(下一步的靶面)**
+
+partial/chunk256 的相位账:`索引 515ms + 查询面 804ms(其中**设备往返 742ms**)+ 调和 125 + 打分 34`
+⇒ **回读往返 = 1260ms 是全部开销**。两刀已定位:
+
+| 刀 | 做法 | 预期 |
+|---|---|---|
+| **Q 面只在完整召回边界采** | 廉价档根本不需要 query(不打分)⇒ 4 次里省 3 次回读 | −550ms |
+| **索引 GPU 累加** | 参考实现 `kvmem_meank_add` 的做法:设备上累加、块满才 flush | −450ms |
+
+⇒ 两刀后 partial ≈ **7.0s**,与 bare 6.8s 齐平(即**超卖档不再有可测代价**)。
+
+### 8.27 **配置面统一**(2026-10-19):单一来源 + 三个 flavor + 每次跑自证条件
+
+> **病因**(用户点出,成立):此前**条件散在多个入口** —— B 轴的关键开关
+> (`index_probe`/`coverage_probe`/`select_decode`)**只在 `tests.rs` 里读 env**,
+> 根本不在配置面上;其余是 `env > config` 覆盖;探针档自己拼 `EngineKnobs`;
+> 每个数字都换条件 ⇒ **数字对不上**。
+
+**(1)配置成为唯一来源**
+
+| 件 | 之前 | 现在 |
+|---|---|---|
+| `[kvmem]` | 只有 7 项(`select_*`/`index`/`recall_every`/`dense_floor_mib`/`pool_overcommit`) | **11 项**:补 `coverage_probe` / `evict_policy` / `analyze_at_ctx` |
+| `[pool]` | 无宿主两账(靠 `OWL_HOST_CACHE_MB`/`OWL_SNAP_HOST_MB`) | 补 `host_cache_mb` / `snap_host_mb` |
+| `EngineKnobs::from_config` | `env > config > 缺省` | **只读配置,零 env** |
+| 探针档 | 自己拼 knobs(散落 `OWL_SELECT_*`/`OWL_COV_*`) | **走同一条 `OwlConfig::load`**;`OWL_PROBE_FLAVOR` + `OWL_PROBE_OVERLAY` |
+| 已废 env 读取器 | `parse_evict_policy` / `recall_every_from_env` | **删** |
+
+**(2)每次跑自证条件**:`EngineKnobs::digest()` 单行摘要(boot 与探针都打)
+
+```text
+[probe-conf] flavor=awq27b-kvmem overlay=- ⇒
+  pool=Some(3072) turns=1 snap_max=4 host=3072M snap_host=1024M |
+  kvmem=ON[idx=1 cov=0 view=1 part=1 budget=32+2+4 every=4 evict=lru floor=Bytes(0)] |
+  fi=1 split=1 gdn_chunked=1 kv=fp8 graph_off=0
+```
+凡影响行为的旋钮都在这行里;**不在这行里的就不影响行为**。
+
+**(3)flavor 收敛:5 → 3**(按引用计数定,不是按口味)
+
+| flavor | 引用 | 处置 |
+|---|---:|---|
+| `awq27b` | 15 处 | **留**(27B dense 生产档;**`[kvmem]` 显式全关** = 高显存档) |
+| `spec-dflash` | 21 处 | **留**(27B fp8 + 投机 生产档;测试/testdata/文档都在用) |
+| `awq27b-kvmem` | 新增 | **留**(低显存档;重写为自洽配方,见下) |
+| `dev-08b` | 0 → 探针基档 | **留**(0.8B 冒烟 + 0.8B 探针基档) |
+| `eager-debug` / `fi-kv8` | **0 处** | **删** |
+
+**(4)数字必须自洽 —— boot 硬校验就是"统一"的执行者**
+
+`awq27b-kvmem.toml` 现在把三层账写在一个算式里:
+```text
+池页数 ≥ max_active_turns × (select_blocks + sink + recent + ceil(chunk/page))
+96 ≥ 1 × (32 + 2 + 4 + 8) = 46 ✓         页 = 1 MiB(fp8)/2 MiB(f16)
+```
+改数只动三行(`max_seq` / `pool_tokens` / `select_blocks`);不自洽 **boot 直接拒启并报数**。
+`dev-08b` 同样(192 ≥ 2×86 ✓)。实测拦下过两次真实不自洽(池 64 页 vs 2 并发 × 46 页;
+池 16 页 vs 8 并发 × 11 页)—— 这正是它该干的事。
+
+**(5)两处口径修正(读数可比)**
+
+- **`[kvmem].analyze_at_ctx`**(新):**钉住分析边界**。边界只在"chunk 末且页对齐"
+  处发生 ⇒ "最后一个边界"的位置**随 chunk 漂移**(同一 prompt:1024→3072 / 512→3584 /
+  256→3840);钉住 ctx 后 query 面 `[ctx−8, ctx)` 与块数 `ctx/page` **都与 chunk 无关**。
+- **`cov_last` 只由"真跑了诊断"的边界更新**(原实现每边界覆盖 ⇒ 目标边界的报告被冲掉)。
+- **保真档不开视图**:`select_decode` 开了 ⇒ 召回点之后的 prefill 只扫选中块 ⇒
+  之后写下的 K **被自己扰动** ⇒ 质量读数漂。⇒ 保真读数与视图**分开量**。
+
+**(6)平反与挂账**
+
+- ✅ **"8K prefill 12s"定谳(§8.26 的三因)**:chunk 128 + FI 缺省关 + `prefill_split`
+  契约 rank bug(既存,含 `main`)。修后同协议对照:bare 6.8s vs partial 8.0s(+18%)。
+- ⚠️ **挂账(未定谳)**:同一 prompt、同一 `analyze_at_ctx=3072`、同一批块,
+  **只改 chunk** 仍改读数:`1024→87.5%/88.7%` · `512→18.5%/24.7%` · `256→16.4%/22.4%`。
+  已排除:分析边界(已钉)、`select_decode`(已关)、`select_partial`(已关)、预算/节奏。
+  ⇒ **跨 chunk 的读数一律不可比**;`dev-08b` 的 chunk 已**冻结 1024** 并写死注释。
+- ⚠️ **廉价边界的驻留调和**:两版都试过 —— ①"近期选择 + 调和"= 名单互相覆盖(净亏);
+  ②"什么都不做"= `ensure_for_len` **驱逐不了会话自己持有的页** ⇒ 链长不动 ⇒ 池耗尽
+  (实测池 96 页、链要 104 页)。现版 = **冻结上次选择 + sink + 新尾部**,仍会在
+  2.7× 超卖 + chunk 256 下撞"表长 > 池"的墙 ⇒ **下一刀:链增长与调和的时序**
+  (增长前先腾/或把"未入会话引用的页"纳入同步驱逐面)。
+
+### 8.28 **"剩下 4 GB 到哪了"定谳** + 池容量的正确算式(2026-10-19)
+
+> **用户判据成立**:27B 加载后占 ~19.2 GiB,卡 24 GiB,余下 ~4 GiB —— 按 fp8
+> **32 KiB/tok** 算确实该有 ~100K tok 的 KV 空间。而我把池手写成 96 MiB(过小)/
+> 8 GiB(过大)两头错,**根因是没人算这个数**。
+
+**(1)一行数字的真相:`total_set` 其实调了,治理器是活的**
+
+`[vram-gov]` 打出治理器的三输入一产出(本轮新增,取代"猜"):
+
+```text
+[vram-gov] total=23.60G target=97% reserve=128M fixed_after=1.12G live=17.94G
+           per_tok=32768B ⇒ budget=3.71G **cap=121446 tok**(manual=32768)
+```
+
+| 项 | 27B fp8 实数 |
+|---|---|
+| `per_tok_bytes` | 16 层 × 2(K+V) × 4 头 × 256 维 × **1B** = **32 KiB/tok**(f16 翻倍) |
+| 治理器 cap | **121446 tok = 3.71 GiB**(= 用户说的"~100K") |
+| 池页宽 | 32 tok ⇒ 1 MiB/页(fp8) |
+
+⇒ **算式在代码里(`StatePool::alloc` 的 B6.5 治理),不在配置里**;
+配置只该给**安全阀**(`[pool].pool_tokens`),不该手写猜数。已改:`awq27b-kvmem`
+留一行注释 + 一个安全阀值。
+
+**(2)"4 GB"的真实分解(27B / 24 GiB / fp8 / chunk 256 实测)**
+
+```text
+23.60 GiB 卡总(= total)
+ 19.2     权重 + 运行底价(装载后实称 live)
+  1.1     fixed_after:GDN 行 + 快照池 + 图 slab + CUDA ctx
+  3.4     **prefill 中间件:每 chunk ≈128 MiB,27 个 chunk 一路涨,不回收** ← 真凶
+  0.1     图捕获 slab(实测 29 MiB/图)
+  1.0     KV 池(32768 tok = 1024 页)
+```
+⇒ 到第 27 个 chunk:`free = 110 MiB`,守卫(`free − reserve = 0`)拒发 3 MiB。
+**这不是配置错,是运行期的空间累积**(eager 路每 chunk 的中间件没有回收面)。
+
+**(3)新增三行取证(常驻,供以后不再猜)**
+
+| 行 | 位置 | 作用 |
+|---|---|---|
+| `[vram-gov]` | `StatePool::alloc` | 治理器的 total/target/reserve/fixed_after/live/per_tok ⇒ cap(唯一产地) |
+| `[vram-guard]` | `vram_budget_guard` 失败路径 | 要多少 / free / reserve / avail / live 账 |
+| `[vram-big]`(env `OWL_VRAM_DBG`) | server alloc ≥64 MiB | 大额分配归因(实测只有装载期的两笔 2425 MiB) |
+
+**(4)结论与下一步**
+
+- **池容量的正确姿势**:`pool_tokens` = 安全阀(显式),上限由治理器算;
+  它必须 ≥ 工作集下限算式(`N_active × (blocks+sink+recent+chunk/page)`)。
+- **低显存档在 27B/24G 的可达规模**:扣掉 prefill 中间件的 3.4 GiB 后,
+  长期可用池 ≈ **1 GiB(32K tok)** ⇒ 配 `max_seq = 131072` = **4× 超卖**。
+  要"池吃满 ~100K",必须先解决第 (2) 条的中间件累积。
+- **下一刀 = prefill 中间件回收面**(每 chunk 128 MiB × N chunk):查 eager 路的
+  块释放链(`free_blocks` / arena carve)为何不把中间件还给分配器。
+
+### 8.29 **超卖实现**(2026-10-19):4× 超卖跑通 + A0/A1 两条挂账定谳
+
+> **一句话**:27B / fp8 / **ctx 131072** / **设备池 32768 tok(1 GiB)= 4× 超卖** ——
+> 下沉 242 块 · 回灌 58 块 · **不可沉 0** · 子集表 49 次 · 视图步 23 回退 0 · 输出切题。
+> 两个"阻塞点"其实都是**配置面缺一条约束**,不是算法问题。
+
+**(1)A0 定谳:"剩下 4 GB 到哪了" —— 不是泄漏,是 prefill 工作区 ∝ chunk**
+
+逐 chunk 显存轨迹(`OWL_VRAM_DBG=1`,27B / ctx 131072 / 池 1 GiB):
+
+| chunk | live 账 | 驱动 free | ⇒ **工作区** |
+|---:|---:|---:|---:|
+| 64 | 20188 MiB(**恒定**) | 2510 MiB(**恒定**) | **1065 MiB** |
+| 128 | 20188(恒定) | 1454(恒定) | **2121 MiB** |
+| 256 | 20188(恒定) | 110 ⇒ 守卫拒发 | **3465 MiB** |
+
+⇒ **每 chunk 零净增**(与代码注释 "E2a:中间块归池(每 chunk 零净增)" 相符),
+`live` 一动不动 —— **我先前的"每 chunk 漏 128 MiB"是误判,收回**。
+真相是 **单 chunk 的激活面 ∝ chunk**(≈16.5 MiB/token),它是**峰值**不是累积。
+
+**"那 4 GB"的完整分解(shipped 形态)**:
+
+```text
+23.60 GiB 卡总 = 19.2 权重/运行底价 + 1.1 fixed_after(GDN/快照/图/CUDA ctx)
+               + W(chunk 工作区:64→1.07G / 128→2.12G / 256→3.47G)
+               + 池(1.0 GiB)+ 守卫余量(128 MiB)
+```
+⇒ **池容量与 chunk 直接争显存**:装配后 free 3575 MiB 里,chunk 256 时
+`3575 − 3465 − 128 < 0` ⇒ 第 27 个 chunk 起分配必被守卫拒发(实测)。
+本档取 **chunk 128**(工作区 2.12 GiB,运行余量 ~1.4 GiB)。
+
+**(2)A1 定谳:`prefix_cache` 关着 ⇒ 缓存树 cap=0 ⇒ 块结构性不可沉**
+
+`session.rs`:
+```rust
+let cache_cap = if plan.paged && plan.prefix_cache { (plan.nb/2 + host_slots).max(1) } else { 0 };
+```
+而下沉机制 = **缓存树 + 会话双持(refs==2) → decref → 缓存独占 → 下沉**
+(`reconcile_residency` 的可沉性前置)。⇒ `prefix_cache = false` 时:
+每 chunk 送 4 片 → **入树 0**(`insert_inc` 在 `!enabled()` 处直接返空)→
+块永远 `refs==1` → **一块都沉不下去**(实测:下沉 0 / 不可沉 4208)。
+
+`awq27b` 系的 `prefix_cache = false` 是"24G 贴顶省 300MB"的**旧**取舍 —— 与
+虚拟化档**结构性冲突**。⇒ 低显存档必须开它;并在 boot 加**响亮拒**
+(`select_partial = true` 要求 `prefix_cache = true`),不许静默白跑一趟。
+
+**(3)取证面沉淀(三轮 debug 不白做)**
+
+| 行/口 | 位置 | 用途 |
+|---|---|---|
+| `[vram-gov]` | `StatePool::alloc` | 治理器五输入→cap(**池容量唯一产地**:27B fp8 实测 cap=121446 tok) |
+| `[vram-guard]` + 池账 | `vram_budget_guard` | 要多少/free/reserve/**池内可复用**/live |
+| `[vram-c]` | `execute_prefill` 尾(`OWL_VRAM_DBG`) | **逐 chunk 轨迹** —— "累积 vs 峰值"的唯一判别器 |
+| `[vram-big]` / `[graph-slab]` | server alloc / 图捕获 | 大额归因 |
+| `[recon]` refs 直方图 | `reconcile_residency` | **refs(1/2/3+)** —— "能不能沉"的直接读数 |
+| `[chain-inc]` | `capture_gdn_snap` | 送 N 片 / **入树 M** / 被逐 K —— 断链处 |
+| `OWL_VRAM_DUMP` + 块账 dump | `dump_vram_on_oom`(守卫失败也调) | **块名级**归因(`owl_*` 中间件 / `gdn.*` 工作区 / `wt.*` 权重) |
+
+**(4)当前能力与代价(27B / 24G / fp8)**
+
+| 项 | 值 |
+|---|---|
+| 上下文 | **131072 tok(128K)** |
+| 设备 KV 池 | 32768 tok = 1024 页 × 1 MiB = **1 GiB** |
+| 超卖 | **4×** |
+| 宿主 KV 驻留 | 0.18 GiB(下沉 242 块) |
+| 装配后驱动空闲 | 3575 MiB(容得下 chunk 128 的 2.12 GiB 工作区) |
+| B 轴生产面 | 索引 1941ms + 查询面 150 + 打分 63 + 调和 93 ≈ **2.2s / 14.9s(15%)** ⇒ A3 的靶面 |

@@ -6,7 +6,11 @@
 kind = "awq27b"
 
 [pool]
-gdn_slots = 1
+# ⚠️ 2026-10-19 驱动性修复:字段在 `7c5627f`(A 轴收官)已改名
+# `gdn_slots` → `max_active_turns`,而 flavor 文本没跟上 ⇒
+# `deny_unknown_fields` 直接**拒解析**(`预设档清单非空且全部可解析` 红)。
+# 语义不变:单会话语义 = 并发上限 1。
+max_active_turns = 1
 snap_max = 1
 prefix_cache = false
 
@@ -35,3 +39,11 @@ allowed_ops = [
         "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256", "vllm_paged_attention_v2_fp8_knhd_hd256bs32",
         "vllm_paged_attention_v2_reduce_f16_hd256",
 ]
+
+# ── KVMem 选择层(B 轴)──
+# **高显存档:显式关掉**。池 ≥ 上下文长时,每个召回点都是纯开销
+# (没有超卖需求 ⇒ 没有东西可以下沉/回灌)。低显存档用 `awq27b-kvmem`。
+[kvmem]
+select_decode = false
+select_partial = false
+index = false

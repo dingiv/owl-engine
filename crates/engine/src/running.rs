@@ -145,6 +145,15 @@ pub struct RunningEngine<D: DeviceClient> {
     pub(crate) stage: StageStats,
     /// **B-3e-2 部分驻留账**(召回点下沉/回灌/不可沉计数)
     pub(crate) partial: PartialStats,
+    /// **B 轴相位账**(性能面;纯计时零语义;`PartialStats` 同款读数面)
+    pub(crate) prof: BAxisProfile,
+    /// **上次完整召回的选择**(内容身份,时间序)。
+    ///
+    /// 用途:**廉价边界**的驻留调和用**冻结名单**,而不是重新打分 ——
+    /// 也**不能是"什么都不做"**:`ensure_for_len` 驱逐不了会话自己持有的页,
+    /// 链每 chunk 要新增 `chunk/page` 页,不腾就必然 `Exhausted`
+    /// (实测:池 96 页,链要到 100 页 ⇒ 耗尽)。
+    pub(crate) sel_keep: Vec<owl_store::ChainHash>,
 }
 
 /// **stage-in 实测账**(B-3e;宿主 → 设备回灌的块数/字节/耗时)。
@@ -202,6 +211,81 @@ pub struct PartialStats {
     pub not_cacheable: usize,
     /// **prefill 子集表**生效的 chunk 数(= 链上有洞后才换表的次数;第 3 项证据)
     pub prefill_subset: usize,
+}
+
+/// **B 轴相位账**(性能面;**纯计时,零语义**)——
+///
+/// 为什么单独立账:这块是 host 纯逻辑(索引/打分/选择/视图),它不在任何
+/// 设备核的计时里,却直接吃掉 prefill 的墙钟。相位口径与
+/// `coverage_analyze` / `collect_index_for_block` 的段落一一对应:
+///
+/// | 相位 | 含义 |
+/// |---|---|
+/// | `index_ms` | 索引采集(逐块:设备 K 回读 + host 逆 RoPE + 累加) |
+/// | `q_face_ms` | query 面取回(块边界 Q dtoh + 逐行逆 RoPE) |
+/// | `mass_ms` | 重诊断采样段(K/V 全量回读 + host 逐元素解码) |
+/// | `score_ms` | 打分(**生产面**;快路口径) |
+/// | `paper_ms` | 打分(论文口径保真对照;**诊断面**) |
+/// | `select_ms` | 选择(预算 + sink/recent) |
+/// | `view_ms` | 视图装配(页表写 + 引擎视图态) |
+/// | `reconcile_ms` | 召回点驻留调和(下沉/回灌) |
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BAxisProfile {
+    /// 走过的块边界数(每个边界 = 一次召回点)。
+    pub boundaries: usize,
+    /// 其中**完整召回**(打分+按分选择)的次数。
+    pub recall_full: usize,
+    /// 其中**廉价召回**(无打分近期选择)的次数。
+    pub recall_cheap: usize,
+    pub index_ms: f64,
+    pub q_face_ms: f64,
+    /// 查询面细分:设备往返(含读语义的 COMPUTE 排空)
+    pub q_toh_ms: f64,
+    /// 查询面细分:host 解码(f16→f32)
+    pub q_dec_ms: f64,
+    /// 查询面细分:host 逆 RoPE(逐行)
+    pub q_derope_ms: f64,
+    /// 查询面细分:**真实质量**(诊断面;逐 query 行 × 层 × 头 扫全 ctx)
+    pub q_mass_ms: f64,
+    pub mass_ms: f64,
+    pub score_ms: f64,
+    pub paper_ms: f64,
+    pub select_ms: f64,
+    pub view_ms: f64,
+    pub reconcile_ms: f64,
+    pub total_ms: f64,
+}
+
+impl BAxisProfile {
+    /// 人类可读一行(各相位 + 占比)。
+    pub fn line(&self) -> String {
+        let pct = |v: f64| {
+            if self.total_ms > 0.0 { v / self.total_ms * 100.0 } else { 0.0 }
+        };
+        format!(
+            "B 轴相位 ×{} 边界:合计 {:.1}ms | 索引 {:.1}({:.0}%) 查询面 {:.1}({:.0}%) \
+             重诊断 {:.1}({:.0}%) 打分 {:.1}({:.0}%) 论文口径 {:.1}({:.0}%) \
+             选择 {:.1}({:.0}%) 视图 {:.1}({:.0}%) 调和 {:.1}({:.0}%) \
+             ‖ 查询面拆:{:.1} 设备往返 + {:.1} host 解码 + {:.1} 逆RoPE + {:.1} 真实质量 \
+             ‖ 召回档:完整 {} · 廉价 {}",
+            self.boundaries,
+            self.total_ms,
+            self.index_ms, pct(self.index_ms),
+            self.q_face_ms, pct(self.q_face_ms),
+            self.mass_ms, pct(self.mass_ms),
+            self.score_ms, pct(self.score_ms),
+            self.paper_ms, pct(self.paper_ms),
+            self.select_ms, pct(self.select_ms),
+            self.view_ms, pct(self.view_ms),
+            self.reconcile_ms, pct(self.reconcile_ms),
+            self.q_toh_ms,
+            self.q_dec_ms,
+            self.q_derope_ms,
+            self.q_mass_ms,
+            self.recall_full,
+            self.recall_cheap
+        )
+    }
 }
 
 impl PartialStats {
@@ -264,6 +348,11 @@ pub fn budget_clamp(
 }
 
 impl<D: DeviceClient> RunningEngine<D> {
+    /// 本档 prefill 块长(探针排版用;与调度器取**同一份配置** ⇒ 不会对不上)
+    pub(crate) fn cfg_prefill_chunk(&self) -> usize {
+        self.cfg.prefill_chunk
+    }
+
     /// 捕获三态结果(Captured = 回放态;EagerFallback = 同闭包直发)
     /// **face 句柄克隆**(HTTP 调试投影面出口;见 `apps/server` 的 `/debug/blocks`)
     pub fn face_clone(&self) -> Option<D> {

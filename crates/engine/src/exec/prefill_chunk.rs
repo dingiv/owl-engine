@@ -309,13 +309,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             || self.cfg.knobs.pf_stages.is_some()
             || self.probes.dflash_probe
             || self.cfg.knobs.coverage_probe
+            || self.cfg.knobs.select_decode
         {
             mcnt("prefill.bucket.bypass.diag", 1);
             if !BUCKET_BYPASS_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 owl_shared::log_warn!(
                     "prefill-graph",
-                    "诊断档在场(pf_bisect / pf_stages / dflash_probe / coverage_probe)⇒ prefill 桶**全部让位 eager**\
-                     (诊断口径只在 eager 路;要图就关诊断)"
+                    "诊断档/B 轴选择层在场(pf_bisect / pf_stages / dflash_probe / coverage_probe / select_decode)\
+                     ⇒ prefill 桶**全部让位 eager**(Q 槽只在 eager 路接线;要图就关它们)\n                     挂账:桶图路学会 Q 槽后,生产档(select_decode)就不必再让位"
                 );
             }
             return Ok(None);
@@ -672,10 +673,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 16µs)⇒ ~170ms/chunk 白烧。注入面本就存在(verify 图先例 E5-M4:
         // `ctx.seq_cu`),eager prefill 只是没接。
         let seq_cu = TensorOps::from_host(Dtype::F32, vec![2], &f32b(&tb.seq_cu));
-        // ── B 轴覆盖率探针(Q-2 第一段):Q 槽接入 ──
+        // ── B 轴选择层:Q 槽接入 ──
         // 只在**块边界 chunk**采(`(base+t) % page == 0`):分析期索引账才完整
-        // (§8.4)。诊断档;缺省 `coverage_probe = false` ⇒ 槽恒 None、零开销。
-        let cov_sink: Option<crate::exec::coverage::QSink> = (self.cfg.knobs.coverage_probe
+        // (§8.4)。
+        // 🔴 **两扇门**(2026-10-19 拆分):**生产面**(`select_decode`)也要 Q 面 ——
+        // 它才是打分的输入;`coverage_probe` 只是诊断面(额外算真实质量)。
+        // 拆之前两条耦合在一起 ⇒ 低显存档想开功能就**必须**背诊断的账。
+        // 缺省两门全关 ⇒ 槽恒 None、零开销。
+        let cov_sink: Option<crate::exec::coverage::QSink> = ((self.cfg.knobs.coverage_probe
+            || self.cfg.knobs.select_decode)
             && self.pool.paged
             && (base + t).is_multiple_of(self.pool.page))
         .then(|| crate::exec::coverage::QSink::new(Vec::new()));

@@ -578,6 +578,32 @@ async fn coverage_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>
         body.push('。');
     }
     body.push_str("请汇总:上面六份记录里的校准值、编号、页签各是多少?逐条列出来。");
+    // ── **分析边界目标**(读数口径;2026-10-19)──
+    //
+    // 边界只在"**chunk 末**且页对齐"处发生 ⇒ 同一个 prompt 下,"最后一个边界"的
+    // 位置**随 chunk 漂移**(实测 `chunk 1024/512/256 → 分析@3072/3584/3840`),
+    // 而覆盖率读数**强依赖该边界**:针被稀释的倍数不同 ⇒ 87.5% / 12.4% / 6.8%
+    // ⇒ **跨 chunk 完全不可比**。
+    //
+    // 修法 = **钉住分析边界**,不是挪 prompt:
+    // - query 面 = `[ctx−8, ctx)` ⇒ **同一个 ctx 下与 chunk 无关**(同 8 行);
+    // - 块数 = `ctx/page` ⇒ 同样与 chunk 无关;
+    // ⇒ 同 ctx 的读数**逐位可比**。`OWL_COV_AT=<ctx>`(0/未设 = 最后一个边界);
+    // 默认 3072 对 chunk ∈ {256,512,1024} 都是合法边界(见下断言)。
+    //
+    // 为什么不去补 prompt 对齐 chunk(试过,已废):补齐会**撞 ctx 上限**
+    // (4006 → 5120 > max_seq 4096 ⇒ 拒),而且按 token 缺口补词永不落点
+    // (一个词+句号 ≈ 1.17 token)。
+    let at: usize = owl_shared::env_reader::parse::<usize>("OWL_COV_AT").unwrap_or(3072);
+    eprintln!(
+        "[cov] 分析边界目标 ctx={at}(0 = 最后一个边界);chunk={} ⇒ {}",
+        running.cfg_prefill_chunk(),
+        if at == 0 || at % running.cfg_prefill_chunk().max(1) == 0 {
+            "该 ctx 是合法边界".to_string()
+        } else {
+            format!("⚠️ {at} 不是 chunk {} 的整数倍 ⇒ **取不到**该边界,读数不可比", running.cfg_prefill_chunk())
+        }
+    );
     let (_, tid) = running.submit_session(Some(1), &body, 8).expect("submit");
     loop {
         match running.pump().await.expect("pump") {
@@ -592,6 +618,7 @@ async fn coverage_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>
         .as_ref()
         .expect("覆盖率探针无观测:prompt 未跨块边界 / coverage_probe 未开?");
     eprintln!("[cov] {}", rep.line());
+    eprintln!("[cov] {}", running.prof.line());
     let pairs: Vec<(usize, f32, f32)> = (0..rep.blocks)
         .map(|i| {
             let m = rep.mass.get(i).copied().unwrap_or(0.0);
@@ -876,37 +903,73 @@ pub async fn gpu_08b_select_decode_probe() {
 
 /// **B 轴覆盖率探针**(自装载;`OWL_COVERAGE_PROBE=1` + `OWL_INDEX_PROBE=1`)。
 pub async fn gpu_08b_coverage_probe() {
-    if !owl_shared::env_reader::flag("OWL_COVERAGE_PROBE") {
-        eprintln!("skip: OWL_COVERAGE_PROBE 未设(B 轴覆盖率探针按需开)");
-        return;
-    }
-    if !owl_shared::env_reader::flag("OWL_INDEX_PROBE") {
-        eprintln!("skip: OWL_INDEX_PROBE 未设(覆盖率门需索引账在场)");
-        return;
-    }
+    // 门 = **运行器级**(选卡 + 场景过滤);**行为面一律来自配置文件**
+    // (`OWL_PROBE_FLAVOR` 基档 + `OWL_PROBE_OVERLAY` 覆盖件)
     let Some(ordinal) = gpu_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        eprintln!("skip: OWL_TEST_DEVICE 未设(哪张卡)");
         return;
     };
-    let mut engine = Engine::new(coverage_probe_config(ordinal)).expect("构造");
+    let cfg = coverage_probe_config(ordinal);
+    // 装配前响亮告知:本场景**要**覆盖率读数,而读数由配置决定
+    if !cfg.knobs.coverage_probe || !cfg.knobs.index_probe {
+        eprintln!(
+            "skip: 本场景需 `[kvmem].coverage_probe = true`(且 index = true);\
+             基档 {}(改成 true,或用 OWL_PROBE_OVERLAY 给一个覆盖件)",
+            owl_shared::env_reader::str("OWL_PROBE_FLAVOR").unwrap_or_else(|| "dev-08b".into())
+        );
+        return;
+    }
+    let mut engine = Engine::new(cfg).expect("构造");
     let loaded = engine.loader().load_qwen35_0_8b(&asset_dir()).await.expect("装载");
     let mut running = engine.run(loaded).await.expect("装配");
     coverage_probe_scenario(&mut running).await;
 }
 
-/// 覆盖率探针档(池 4096 tok = 128 块;chunk 512 ⇒ 每个 chunk 落在块边界 ⇒
-/// 中段 + 末段**两条分支都走**;尾随 8 token 生成不跨块)。
+// ═══════════════════════════════════════════════════════════════════════════
+// **探针/基准档的统一装载口**(2026-10-19 配置面统一)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 一次探针跑 = **两个配置文件**描述全部行为面(与生产**同一条加载路**):
+///
+/// ```text
+/// OWL_PROBE_FLAVOR=<name>    基准档(assets/flavors/<name>.toml)
+/// OWL_PROBE_OVERLAY=<path>   覆盖文件(可选;同 server 的 [CONFIG] 位置)
+/// ```
+///
+/// 引擎旋钮一律由 [`EngineKnobs::from_config`] 搬 —— 探针档**不再自己拼 knobs**
+/// (那正是"条件不一样、数字对不上"的根因)。要改条件就改文件,改完条件写在
+/// 文件里、每跑一次 `digest()` 自证。
+///
+/// 只剩**运行器级**三件事走 env(它们不属于引擎配置):
+/// - `OWL_TEST_DEVICE`(哪张卡)/ `OWL_E2E_ONLY`(跑哪些场景)
+/// - `OWL_AWQ27B_DIR` / `OWL_DFLASH2_DIR`(资产路径)
+/// - 本函数的两个(读哪个配置文件)
+fn probe_engine_config(ordinal: usize, default_flavor: &str) -> EngineConfig {
+    let flavor = owl_shared::env_reader::str("OWL_PROBE_FLAVOR")
+        .unwrap_or_else(|| default_flavor.to_string());
+    let base = owl_shared::assets::preset_path(&flavor).expect("预设档路径");
+    let overlay = owl_shared::env_reader::str("OWL_PROBE_OVERLAY").map(std::path::PathBuf::from);
+    let cfg = owl_shared::config::OwlConfig::load(Some(&base), overlay.as_deref())
+        .expect("探针配置装载(账外键/非法值 = 拒)");
+    let mut knobs = EngineKnobs::from_config(&cfg);
+    // 探针档**不改变行为面**,只关掉与本档无关的采样(它不影响 prefill/decode 数值)
+    knobs.sampler_enabled = false;
+    eprintln!(
+        "[probe-conf] flavor={flavor} overlay={} ⇒ {}",
+        overlay.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "-".into()),
+        knobs.digest()
+    );
+    EngineConfig {
+        device_ordinal: ordinal,
+        max_seq_tokens: cfg.runtime.max_seq,
+        prefill_chunk: cfg.runtime.prefill_chunk,
+        knobs,
+    }
+}
+
+/// 覆盖率探针档:条件全部来自配置文件(缺省基档 `dev-08b`)。
 fn coverage_probe_config(ordinal: usize) -> EngineConfig {
-    // 规模档覆盖(`OWL_COV_POOL` / `OWL_COV_CHUNK`;缺省 4096/1024 ⇒ 标准快档)
-    let pool: usize = owl_shared::env_reader::parse::<usize>("OWL_COV_POOL").unwrap_or(4096);
-    let chunk: usize = owl_shared::env_reader::parse::<usize>("OWL_COV_CHUNK").unwrap_or(1024);
-    let mut knobs = EngineKnobs { sampler_enabled: false, ..Default::default() };
-    knobs.pool_tokens = Some(pool);
-    knobs.max_active_turns = 8;
-    knobs.index_probe = true;
-    knobs.coverage_probe = true;
-    knobs.snap_host_mb = 128;
-    EngineConfig { device_ordinal: ordinal, max_seq_tokens: pool, prefill_chunk: chunk, knobs }
+    probe_engine_config(ordinal, "dev-08b")
 }
 
 /// **B-3e 场景体:stage-in(宿主 → 设备回灌)实测**(face 无关)。
@@ -1062,29 +1125,47 @@ async fn select_27b_scenario() {
     );
     assert!(dir.exists(), "检查点目录不存在: {dir:?}");
     let ordinal = gpu_ordinal().expect("OWL_TEST_DEVICE");
-    let ctx: usize = owl_shared::env_reader::parse::<usize>("OWL_27B_CTX").unwrap_or(16_384);
-    let pool: usize = owl_shared::env_reader::parse::<usize>("OWL_27B_POOL").unwrap_or(4_096);
+    // **条件全部来自配置文件**(与生产同一条加载路;缺省基档 `awq27b-kvmem`)
+    // —— 要调池/预算/节奏/臂,改文件(或 `OWL_PROBE_OVERLAY` 指向的覆盖文件),
+    //   不再靠散落的 `OWL_27B_*` env(那正是"条件不一样、数字对不上"的根因)。
     let items: usize = owl_shared::env_reader::parse::<usize>("OWL_27B_ITEMS").unwrap_or(2_600);
-    let mut knobs = EngineKnobs { sampler_enabled: false, ..Default::default() };
-    knobs.pool_tokens = Some(pool);
-    // 单卡 24GB 预算紧(权重 ~19.6G + embed 2.5G)⇒ 状态腿/快照/预留都压到最小
-    knobs.max_active_turns = owl_shared::env_reader::parse::<usize>("OWL_27B_TURNS").unwrap_or(2);
-    knobs.snap_max = 2;
+    let cfg = probe_engine_config(ordinal, "awq27b-kvmem");
+    let mut knobs = cfg.knobs;
+    let cfg_ctx = cfg.max_seq_tokens;
+    // ⚠️ 只是**手写值**;真池容量由引擎治理器算(见 `[vram-gov]` 行)—— 别拿它当分配量
+    let cfg_pool = knobs.pool_tokens.unwrap_or(2 * cfg_ctx);
+    // **分段臂**:`bare`(KVMem 全关)/`index`/`view`/`partial`(全开)。
+    // 只在配置文件开着的档位上**往下关**(不越过配置往上开 —— 那会造出第三个规范)。
+    let arm = owl_shared::env_reader::str("OWL_27B_ARM").unwrap_or_else(|| "partial".into());
+    let (ix, sd, sp) = match arm.as_str() {
+        "bare" => (false, false, false),
+        "index" => (true, false, false),
+        "view" => (true, true, false),
+        _ => (
+            knobs.index_probe,
+            knobs.select_decode,
+            knobs.select_partial,
+        ),
+    };
     knobs.vram_reserve_mb = owl_shared::env_reader::parse::<u64>("OWL_27B_RESERVE_MB").unwrap_or(128);
-    knobs.index_probe = true;
-    knobs.coverage_probe = true;
-    knobs.select_decode = true;
-    knobs.select_partial = true;
-    knobs.select_blocks = 32;
-    knobs.host_cache_mb = 4_096; // 4GiB 宿主 KV 面(262k 全量 KV ≈ 16GiB(f16) ⇒ 先给 4GiB)
-    knobs.snap_host_mb = 512;
-    knobs.snap_max = 4;
-    // chunk 压到 128:单 chunk 工作区 ≈ 线性(512 时实测吃掉 3.9GB 空闲)
-    let chunk: usize = owl_shared::env_reader::parse::<usize>("OWL_27B_CHUNK").unwrap_or(128);
+    knobs.index_probe = ix;
+    knobs.select_decode = sd;
+    knobs.select_partial = sp;
+    // 虚拟化开关跟着 partial 走(bare 必须关:否则池仍被钉在 ctx 上,与基线不可比)
+    knobs.kvmem_virtualization = sp;
+    knobs.dense_floor = EngineKnobs::dense_floor_for(
+        sp,
+        owl_shared::env_reader::parse::<u64>("OWL_27B_FLOOR_MIB"),
+    );
+    eprintln!("[b5-27b] 臂={arm}(index={ix} select_decode={sd} select_partial={sp})");
+    // ⚠️ 这里**不再**硬编码任何引擎旋钮(host 预算/chunk/核档/fi)——
+    // 它们全部来自 `awq27b-kvmem.toml`(或 `OWL_PROBE_OVERLAY` 的覆盖件)。
+    // 之前那些硬编码正是"条件不一样、数字对不上"的来源(例如把 flavor 给的
+    // snap_host 1024 MiB 又按回 512 MiB,状态腿随即撞分片上限)。
     let mut engine = Engine::new(EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: ctx,
-        prefill_chunk: chunk,
+        max_seq_tokens: cfg_ctx,
+        prefill_chunk: cfg.prefill_chunk,
         knobs,
     })
     .expect("构造");
@@ -1095,8 +1176,9 @@ async fn select_27b_scenario() {
         .expect("27B 装载");
     let mut running = engine.run(loaded).await.expect("装配");
     eprintln!(
-        "[b5-27b] ctx={ctx} tok · 设备池={pool} tok(超卖 {:.1}×)· 装配后驱动空闲 {:.0}MiB · live 账 {:.0}MiB",
-        ctx as f64 / pool as f64,
+        "[b5-27b] ctx={cfg_ctx} tok · 设备池={:?} tok(超卖 {:.1}×)· 装配后驱动空闲 {:.0}MiB · live 账 {:.0}MiB",
+        cfg_pool,
+        cfg_ctx as f64 / cfg_pool as f64,
         owl_shared::vram::free_bytes() as f64 / 1048576.0,
         owl_shared::vram::live_bytes() as f64 / 1048576.0
     );
@@ -1150,6 +1232,7 @@ async fn select_27b_scenario() {
         rec.materialize_ratio * 100.0
     );
     eprintln!("[b5-27b] {} · {}", pt.line(), st.line());
+    eprintln!("[b5-27b] {}", running.prof.line());
     eprintln!(
         "[b5-27b] 池 {}/{} 槽自由 · 宿主 KV 驻留 {:.2}GiB · 下沉 {} 次 {}GiB",
         rep.kv.slots_free,

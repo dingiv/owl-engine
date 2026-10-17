@@ -208,12 +208,121 @@ pub struct ModelCfg {
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PoolCfg {
+    /// 设备 KV 池(token;`None` = 2 × 单会话容量)。
+    /// **虚拟化档可小于上下文**(`[kvmem].pool_overcommit`;boot 硬校验兜底)。
     pub pool_tokens: Option<usize>,
+    /// 并发上限(每活跃 turn 一套 GDN 行;也是池下限算式的 N_active)
     pub max_active_turns: usize,
+    /// GDN 快照池槽数
     pub snap_max: usize,
+    /// **宿主 KV 腿**(MiB;0 = 关层)。下沉的落点之一。
+    pub host_cache_mb: usize,
+    /// **宿主状态腿**(MiB;0 = 关层)。GDN 快照下沉的落点 ——
+    /// ⚠️ 超卖档会把压力推给它(实测 27B 单快照 607 MiB),别只给 KV 腿留量。
+    pub snap_host_mb: usize,
     pub vram_target: f64,
     pub vram_reserve_mb: u64,
     pub prefix_cache: bool,
+}
+
+/// **驱逐策略**(`[kvmem].evict_policy`;TOML 小写串)
+///
+/// | 值 | 语义 |
+/// |---|---|
+/// | `lru` | 纯近期(现役基线;`last_use` 升序出序) |
+/// | `lrfu` / `lrfu:0.9` | attention-aware LRFU(缺省 λ = 0.9) |
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EvictPolicyCfg {
+    #[default]
+    Lru,
+    Lrfu,
+}
+
+/// **KVMem 选择层(B 轴)** —— 低显存档位的突破项。
+///
+/// 适用区间:**设备 KV 池 < 上下文长**(超卖档)。它让"设备上只留工作集、
+/// 全量 KV 在宿主"成立 —— 同池尺寸下"全量常驻"引擎必然 OOM。
+/// **高显存档不需要它**(池 ≥ ctx 时请关掉:每边界一次召回都是纯开销)。
+///
+/// 语义(与设计卷 `docs/arch/kvmem-选择层-设计与施工.md` 同源):
+/// - 索引 = 逐 (块,层,KV 头) 的 **Mean-K**(按块采,不随召回变);
+/// - 召回点 = **prefill 块边界**:末 W=8 行的 query 面 → 打分 → sink/recent 保底 + 按分 top-k;
+/// - 位置方案 **A**(原位置稀疏):K 一字不改,只换页表 ⇒ 零 re-RoPE;
+/// - 视图只接 **decode**(prefill 用全链);
+/// - `recall_every` 是**唯一改渐近线**的旋钮:单次打分是 O(块数) 线性,
+///   但"每边界都打" ⇒ 一次 prefill 累计 **O(块数²)**。
+///
+/// ⚠️ 与 `probes.coverage_probe` 的分工:那个是**诊断面**(真实质量全量扫描,
+/// 单次成本含 `ctx` 因子 ⇒ 全军 O(ctx²))。**生产档只需 `select_decode`**,
+/// 不要为了开功能而把探针一起打开。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KvmemCfg {
+    /// **生产总开关**:选择层接进 decode(建视图页表 + 每步展开)。
+    pub select_decode: bool,
+    /// **部分宿主驻留**:被逐块下沉到宿主、链上留占位符。
+    /// 需 `select_decode` 同开(链上出洞后必须有懂洞的消费方 = 视图页表);
+    /// 开了它会**自动关 XQA 裸 decode 臂**(页表语义不共戴)。
+    pub select_partial: bool,
+    /// **索引采集**(打分的前置件;`select_decode` 蕴含它,单独开无意义)。
+    pub index: bool,
+    /// 召回预算(块):视图 = 选中的这些块 ⇒ "选择层留多少"的唯一旋钮。
+    pub select_blocks: usize,
+    /// 保底 sink(时间序最前的若干块;论文 always-retained)。
+    pub select_sink: usize,
+    /// 保底 recent(时间序最后的若干块)。
+    pub select_recent: usize,
+    /// **召回节奏**:每 k 个块边界做一次**完整召回**(打分+按分选择),
+    /// 其余边界**只采索引、不干预驻留**(驻留交给 A 轴,下一次完整召回时对齐)。
+    /// **末个边界永远是完整召回**(decode 消费的视图取自它)。
+    pub recall_every: usize,
+    /// **覆盖率探针(诊断面;缺省关)**。开则在末个边界额外做**真重诊断**:
+    /// K/V 全量回读 + host 逐元素解码 + `true_block_mass`(逐 query 行 ×(层,头)
+    /// 扫**全 ctx**)+ 论文口径对照 + 方案 A/B 对照 + 覆盖率/上界报告。
+    /// 单边界成本**含 ctx 因子** ⇒ 全军 O(ctx²)(27B/8k 实测单次 6.3s = 墙钟 32%)。
+    /// 🔴 **测性能不要开它** —— 生产面只需 `select_decode`。
+    pub coverage_probe: bool,
+    /// **分析边界目标 ctx**(诊断面;0/未设 = **最后一个边界**)。
+    ///
+    /// 为什么要有它:边界只在"chunk 末且页对齐"处发生 ⇒ 同一个 prompt 下,
+    /// "最后一个边界"的位置**随 chunk 漂移** ⇒ 覆盖率读数跨 chunk **不可比**
+    /// (实测 chunk 1024/512/256 ⇒ 分析@3072/3584/3840 ⇒ top8 87.5%/12.4%/6.8%)。
+    /// 钉住 ctx 后:query 面 `[ctx−8, ctx)` 与块数 `ctx/page` **都与 chunk 无关**
+    /// ⇒ 读数逐位可比。要求该 ctx 是 chunk 的整数倍(否则取不到该边界)。
+    pub analyze_at_ctx: usize,
+    /// **驱逐策略**(缺省 `lru`):`lru` = 纯近期;`lrfu[:λ]` = attention-aware
+    /// LRFU(召回点选中的块抬 keep-score)⇒ 出序时"又冷又没被注意力用过"的先下沉。
+    pub evict_policy: EvictPolicyCfg,
+    /// **准入地板**(MiB;`None` = 跟随虚拟化姿态)。
+    ///
+    /// 语义 = "本 turn 至少要有多少字节的 KV **直接驻留在设备**"
+    /// (`owl_store::TurnFloor::Bytes`)。它决定**准入判据**:
+    /// - `None` + 虚拟化开 ⇒ **0** = "只要工作集装得下就准入"(低显存档默认);
+    /// - `None` + 虚拟化关 ⇒ **Strict** = 要全量 dense 放得下(旧行为);
+    /// - `Some(n)` ⇒ `n` MiB(仅当虚拟化开才被接受,否则 boot 响亮拒)。
+    #[serde(default)]
+    pub dense_floor_mib: Option<u64>,
+    /// **允许设备池小于上下文**(锁①;缺省关)。
+    ///
+    /// 关着时池有硬下限 `nb ≥ ceil(seq_tokens/page)`(`state.rs`)—— 即
+    /// **选择层只省访问面、不省显存**。开着才允许 `pool_tokens` 真的压小。
+    /// 只有虚拟化开才被接受。
+    #[serde(default)]
+    pub pool_overcommit: bool,
+}
+
+impl KvmemCfg {
+    /// **虚拟化是否真的开着**:两件缺一不可。
+    ///
+    /// - `select_decode` = 有懂洞的消费方(视图页表接进 decode);
+    /// - `select_partial` = 链上会真的出洞(被逐块下沉)。
+    ///
+    /// 两件必须同真才能"让链超出池容量"——否则链要么出洞无人懂(静默错页),
+    /// 要么永远不出洞(池装不下就 `Exhausted`)。这是**所有解锁类护栏的唯一判据**。
+    pub fn virtualization_enabled(&self) -> bool {
+        self.select_decode && self.select_partial
+    }
 }
 
 /// 投机解码(spec 三态/草稿池量化/B4 降级参数/verify 图诊断)
@@ -234,8 +343,7 @@ pub struct SpecCfg {
 /// 采样参数
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct SamplingCfg {
-    pub mode: SamplerMode,
+pub struct SamplingCfg {    pub mode: SamplerMode,
     pub temp: f32,
     pub topk: usize,
     pub topp: f32,
@@ -639,6 +747,7 @@ pub struct OwlConfig {
     pub runtime: RuntimeCfg,
     pub model: ModelCfg,
     pub pool: PoolCfg,
+    pub kvmem: KvmemCfg,
     pub spec: SpecCfg,
     pub sampling: SamplingCfg,
     pub load: LoadCfg,
@@ -673,9 +782,32 @@ impl Default for PoolCfg {
             pool_tokens: None,
             max_active_turns: 8,
             snap_max: 4,
+            host_cache_mb: 0,
+            snap_host_mb: 0,
             vram_target: 0.97,
             vram_reserve_mb: 1024,
             prefix_cache: true,
+        }
+    }
+}
+
+impl Default for KvmemCfg {
+    /// 缺省全关 = "高显存档直接关掉它"(功能只在池 < ctx 的档位有意义)。
+    /// `recall_every = 1` = 每个边界都完整召回(旧行为;逐位可回退)。
+    fn default() -> Self {
+        Self {
+            select_decode: false,
+            select_partial: false,
+            index: false,
+            select_blocks: 64,
+            select_sink: 2,
+            select_recent: 4,
+            recall_every: 1,
+            coverage_probe: false,
+            analyze_at_ctx: 0,
+            evict_policy: EvictPolicyCfg::Lru,
+            dense_floor_mib: None,
+            pool_overcommit: false,
         }
     }
 }

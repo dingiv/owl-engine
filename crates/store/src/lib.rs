@@ -68,9 +68,10 @@ pub use policy::{
 };
 pub use rel::{EvictItem, EvictPlan, KvConfig, Protected, RecallHit, RecallMode, Rel, StoreReport};
 pub use select::{
-    assemble_view, f32_to_f16, score_blocks, select, BlockSet, IndexStats, MeanKEntry, MeanKIndex,
-    block_mass, coverage_curve, derope_halves_inplace, derope_pair, f16_to_f32_pub, MeanKCollector,
-    PosAction, PosFrame, QueryFace, ScoreMode, ScoreTuning, SelectBudget, ViewPlan,
+    assemble_view, f32_to_f16, score_blocks, select, select_recency, BlockSet, IndexStats,
+    MeanKEntry, MeanKIndex, block_mass, coverage_curve, derope_halves_inplace, derope_pair,
+    f16_to_f32_pub, MeanKCollector, PosAction, PosFrame, QueryFace, ScoreMode, ScoreTuning,
+    SelectBudget, ViewPlan,
 };
 pub use state::StateStore;
 pub use tier::{AssetKind, Tier, TierBudget, TierLedger, TierReport};

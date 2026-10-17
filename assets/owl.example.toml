@@ -41,7 +41,7 @@
 
 [pool]
 # pool_tokens = 0               # 块池容量覆写(缺省 = 2×单会话)
-# gdn_slots = 8                 # GDN 状态格容量(24G 贴顶单会话档 = 1,省 ~300MB)
+# max_active_turns = 8         # 并发上限(24G 贴顶单会话档 = 1,省 ~300MB)
 # snap_max = 4                  # spec 快照池深度(贴顶档 = 1)
 # vram_target = 0.97            # 显存预算目标占比(0 = 治理禁用)
 # vram_reserve_mb = 1024        # 图 slab + CUDA ctx + 瞬态预留

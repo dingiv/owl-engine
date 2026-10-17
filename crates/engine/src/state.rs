@@ -125,11 +125,17 @@ pub(crate) struct GdnLeaf {
 /// 参数对象 —— 原散列布尔/数值参数群收编:量化 = KvQuant 枚举,
 /// 投机形态 = SpecMode 枚举,互斥语义由派生保证,调用点零自洽负担)
 #[derive(Clone, Debug)]
-pub(crate) struct PoolPlan {
-    /// 单会话容量(= max_seq_tokens)
+pub(crate) struct PoolPlan {    /// 单会话容量(= max_seq_tokens)
     pub seq_tokens: usize,
     /// 池容量(治理/钉值定谳后的 token 数)
     pub pool_tokens: usize,
+    /// **允许池小于上下文**(锁①;`[kvmem].pool_overcommit`)。
+    ///
+    /// 关着时池有硬下限 `nb ≥ ceil(seq_tokens/page)` ⇒ **选择层只省访问面、
+    /// 不省显存**。开着才允许 `pool_tokens` 真的压小,把 KV 挤到宿主。
+    /// ⚠️ 只有引擎侧已验过"虚拟化真的开着"才会传 true(engine 侧判据已行;
+    /// 本件只执行事实,不做策略)。
+    pub pool_overcommit: bool,
     /// 主池 KV 量化
     pub kv: owl_models::env::KvQuant,
     /// FI 直读面启用的池量化(None = 无 FI 面)。
@@ -434,6 +440,21 @@ impl StatePool {
                 - fixed_after as i64
                 - owl_shared::vram::live_bytes() as i64;
             let cap = (budget.max(0) as u64 / per_tok_bytes.max(1) as u64) as usize;
+            // **A1 取证**(2026-10-19):治理器是"池能多大"的唯一产地;这条打出
+            // 它的三个输入(total/target/reserve/fixed/live)与产出,免得再靠猜
+            // (实测:池没被压时,先看这里)。
+            eprintln!(
+                "[vram-gov] total={:.2}G target={:.0}% reserve={}M fixed_after={:.2}G live={:.2}G per_tok={}B ⇒ budget={:.2}G cap={} tok(manual={})",
+                vram_total as f64 / 1073741824.0,
+                plan.vram_target * 100.0,
+                vram_reserve >> 20,
+                fixed_after as f64 / 1073741824.0,
+                owl_shared::vram::live_bytes() as f64 / 1073741824.0,
+                per_tok_bytes,
+                budget as f64 / 1073741824.0,
+                cap,
+                pool_tokens,
+            );
             owl_shared::log_info!("boot", "vram 治理:total={:.1}G free={:.2}G live={:.1}G target={:.0}% reserve={}MB fixed_after={:.2}G budget={:.2}G per_tok={}B → 池上限 {} tok(manual={})",
                 vram_total as f64 / 1073741824.0,
                 owl_shared::vram::free_bytes() as f64 / 1073741824.0,
@@ -456,12 +477,25 @@ impl StatePool {
         };
 
         let pol = kv_paged_policy(dims.dtype);
+        // 单会话容量(页数)= 旧实现的池下限;`pool_overcommit` 关时仍按它钉住
+        let seq_blocks = seq_tokens.div_ceil(pol.as_ref().map_or(1, |p| p.page).max(1));
         let (page, x, nb, paged) = match &pol {
             Some(p) => (p.page, p.x, seq_tokens.div_ceil(p.page), true),
             None => (seq_tokens, 1usize, 1usize, false),
         };
-        // E2b 块池容量:pool_tokens 向上取整到页;不低于单会话容量
-        let nb = if paged { pool_tokens.div_ceil(page) } else { nb }.max(nb);
+        // E2b 块池容量:pool_tokens 向上取整到页。
+        //
+        // **锁①(2026-10-19)**:原实现是无条件 `.max(nb)` —— 池被钉在
+        // **单会话全量上下文**上,所以选择层只省访问面、不省显存。现在按
+        // `plan.pool_overcommit` 二选一:
+        // - 关(缺省)= 旧行为(`max`),高显存档与现状逐位不变;
+        // - 开 = **允许池小于上下文** → 多出的链块必须靠选择层的下沉
+        //   (占位符)挤到宿主;容量不足时 store 会 `Exhausted` 响亮拒
+        //   (不静默落空槽)。
+        // 两侧都保证不低于"本档必须常住的那部分":开档时靠 boot 的
+        // "工作集装得下" 硬校验(见 engine 侧 `kvmem_boot_checks`)。
+        let nb = if paged { pool_tokens.div_ceil(page) } else { nb };
+        let nb = if plan.pool_overcommit { nb } else { nb.max(seq_blocks) };
         // prefill 桶 padding dump 页(M2b;设计 §4.2 律②):物理多 1 页,
         // **管理面 nb 不变**(store 块腿/块表/页链槽容量都不受影响)。
         let dump_page = plan.prefill_dump_page.then_some(nb);

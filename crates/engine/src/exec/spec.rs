@@ -843,6 +843,19 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 let up = self.bank.rel.leg.register_chain_inc(parent0, &blk_slices)?;
                 mcnt("store.chain.inc.blocks", up.inserted.len() as u64);
                 mcnt("store.chain.inc.evicted", up.evicted.len() as u64);
+                // **A1 取证**(`OWL_RECON_DBG=1`):注册口三数 —— 送入 / 入树 / 被逐。
+                // 入树为 0 就是"块永远 refs==1 ⇒ 不可沉"的直接原因。
+                if std::env::var_os("OWL_RECON_DBG").is_some() {
+                    eprintln!(
+                        "[chain-inc] 送 {} 片 · **入树 {}** · 被逐 {} · parent0={:?}",
+                        blk_slices.len(),
+                        up.inserted.len(),
+                        up.evicted.len(),
+                        parent0
+                    );
+                }
+            } else if std::env::var_os("OWL_RECON_DBG").is_some() {
+                eprintln!("[chain-inc] 空:per_block={} 全被跳过", per_block.len());
             }
         }
         // **B 轴 B-0:索引采集**(同一"块边界"事件;同样逐块、物理页由会话块表定)
@@ -896,20 +909,19 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 "索引几何与池不符:index (dim={dim}, hkv={kv_heads}) ≠ pool (hd={hd}, hkv={hkv})"
             )));
         }
-        if self.pool.kv_fp8 {
-            return Err(owl_iface::contract::ModelError::Msg(
-                "索引采集:fp8 池 K 回读解码未接线(一期只支持 f16 池;见设计卷 §8.6 挂账)"
-                    .into(),
-            ));
-        }
+        // **池页格式从池实况取**(单源:`KvPageFormat::of_pool`)——
+        // f16 / fp8 e4m3 两侧同一寻址式,只差元素宽与转换律
+        // (`owl_models::kernel::e4m3_decode`)。此前写死 f16 并对 fp8 响亮拒 ⇒
+        // **27B 的 fp8 生产档根本开不了选择层**(fp8 才是它在产 KV 格式)。
+        let fmt = crate::exec::kvpage::KvPageFormat::of_pool(self.pool.kv_fp8);
         if self.bank.rel.index.as_ref().is_some_and(|i| i.contains(block_hash)) {
             return Ok(()); // 幂等(同一块重复拍)
         }
         let mut collector = owl_store::MeanKCollector::new(dim, layers, kv_heads)?;
-        let elem = 2usize; // f16 池(上方已拒 fp8)
+        let t_index = std::time::Instant::now();
         // 逐层回读该块的**物理页** K —— **一条批量命令**(原每层一次同步往返:
         // 27B = 16 层 × 每块一次 ⇒ 8192 块 = 13 万次往返,分钟级;设计卷 §10.3 推论 B)
-        let page_bytes = page * hkv * hd * elem;
+        let page_bytes = fmt.page_bytes(page, hkv, hd);
         let mut pieces: Vec<(&owl_iface::contract::Bytes, usize, usize)> = Vec::new();
         for kv in self.pool.kvs.iter().take(layers) {
             pieces.push((&kv.k_cache.0, phys_page * page_bytes, page_bytes));
@@ -918,6 +930,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let face = self.graphs.session.face_mut();
             face.dtoh_batch(&pieces).await?
         };
+        let mut row = vec![0.0f32; hd];
         for (li, _kv) in self.pool.kvs.iter().enumerate().take(layers) {
             let kbuf = &all[li * page_bytes..(li + 1) * page_bytes];
             // 逐 token × 头:逆 RoPE(cos/sin 来自 host 侧同源表)+ 累加
@@ -926,18 +939,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 let pos = block * page + t;
                 let Some((cos, sin)) = self.rope.cos_sin_at(pos) else { continue };
                 for h in 0..hkv {
-                    let mut row = vec![0.0f32; hd];
-                    for (d, v) in row.iter_mut().enumerate() {
-                        let off = (t * hkv + h) * hd + d;
-                        let bits = u16::from_le_bytes([kbuf[off * 2], kbuf[off * 2 + 1]]);
-                        *v = owl_store::f16_to_f32_pub(bits);
-                    }
+                    fmt.decode_row(kbuf, t, h, hkv, hd, &mut row)?;
                     collector.push_post_rope_halves(li, h, &row, cos, sin)?;
                 }
             }
         }
         let entries = collector.finish()?;
         self.bank.rel.index_register(block_hash, entries)?;
+        self.prof.index_ms += t_index.elapsed().as_secs_f64() * 1000.0;
         Ok(())
     }
 
