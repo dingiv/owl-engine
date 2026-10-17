@@ -296,7 +296,7 @@ mod tests {
         let mut src = crate::formats::awq::AwqSource::open_dir(dir).expect("源打开");
         let r16 = |x: f32| half::f16::from_f32(x).to_f32();
         let take = |src: &mut crate::formats::awq::AwqSource, k: &str| -> Vec<f32> {
-            src.take(k).unwrap_or_else(|| panic!("键缺失 {k}"))
+            src.take(k).expect("源").unwrap_or_else(|| panic!("键缺失 {k}"))
         };
         let w_fc = take(&mut src, "mtp.fc.weight").iter().map(|&x| r16(x)).collect::<Vec<_>>();
         let w_pfh = take(&mut src, "mtp.pre_fc_norm_hidden.weight")

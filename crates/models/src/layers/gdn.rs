@@ -582,7 +582,18 @@ impl GatedDeltaNet {
         // nsys 定谳);gemv_dual 权重 0.5MB×2 全在 L2,T≤16 的读放大
         // 无痛。T>16 保持 cublas(真 GEMM 区)。
         let (b, a) = if tokens <= 16 {
-            let hidden_gdn = xs.shape().last().cloned().unwrap_or(0);
+            // 形状律:xs = [T, hidden](空形状 = 声明失守 ⇒ **毒化**,
+            // 原 `unwrap_or(0)` 会把 cols=0 交给核 = 静默错值;2026-10-17 审查)
+            let hidden_gdn = match xs.shape().last() {
+                Some(h) => *h,
+                None => {
+                    return TensorOps::poisoned(
+                        xs.dtype,
+                        xs.shape().to_vec(),
+                        "gdn: xs 形状为空(需 [T, hidden])",
+                    )
+                }
+            };
             let ba = TensorOps::call(SemanticKernel::GemvDual)
                 .arg(&self.in_proj_b.weight_decl()) // [HV, hidden] f16
                 .arg(&self.in_proj_a.weight_decl()) // [HV, hidden] f16
@@ -909,7 +920,18 @@ impl GatedDeltaNet {
         // Linear/cublas。输出 [T, 2·HV] 行堆叠,T=1 时列切 = 连续切片 →
         // BlockSlice 免费视图(刀1))。
         let (b, a) = if xs.dtype == Dtype::F16 {
-            let hidden_gdn = xs.shape().last().cloned().unwrap_or(0);
+            // 形状律:xs = [T, hidden](空形状 = 声明失守 ⇒ **毒化**,
+            // 原 `unwrap_or(0)` 会把 cols=0 交给核 = 静默错值;2026-10-17 审查)
+            let hidden_gdn = match xs.shape().last() {
+                Some(h) => *h,
+                None => {
+                    return TensorOps::poisoned(
+                        xs.dtype,
+                        xs.shape().to_vec(),
+                        "gdn: xs 形状为空(需 [T, hidden])",
+                    )
+                }
+            };
             let ba = TensorOps::call(SemanticKernel::GemvDual)
                 .arg(&self.in_proj_b.weight_decl()) // [HV, hidden] f16
                 .arg(&self.in_proj_a.weight_decl()) // [HV, hidden] f16
