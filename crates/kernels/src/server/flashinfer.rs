@@ -133,7 +133,12 @@ pub struct FiRuntime {
     host_staging: Vec<u8>,
     /// plan 条目表(key = 形状七元组 + 两开关位;桶数量级)
     plans: HashMap<PlanKey, PlanEntry>,
-    /// **int_ws 当前内容**对应的 key(None = 未知/已失效)
+    /// **`active` = 上一次 *窗外* 显式上传的 key**(None = 未知/已失效)。
+    ///
+    /// ⚠️ **它不是"int_ws 现内容"的当前事实**(2026-10-17 定谳):图回放会用
+    /// 窗内烘的 restore 节点把 int_ws 刷成**图自己的** plan,而那次改写 host
+    /// 侧看不见 ⇒ 回放之后本字段是**旧账**。故它的唯一用途 = 窗内去重
+    /// (避免同一窗烘冗余节点);**窗外调用不得凭它跳过重刷**。
     active: Option<PlanKey>,
     /// 捕获窗上升沿检测(见 `activate` 的调用点注释)
     last_capturing: bool,
@@ -195,14 +200,28 @@ impl FiRuntime {
             self.active = Some(key);
             return Ok(());
         }
-        if self.active == Some(key) {
+        let capturing = res.capturing().unwrap_or(false);
+        // 窗内去重(同一捕获窗内同 key 只烘一个 restore 节点)。
+        //
+        // ⚠️ **窗外一律重刷**(`capturing == false` ⇒ 不跳过;2026-10-17 定谳):
+        // 旧行为是`self.active == Some(key)` 就跳过 —— 该判据**只在窗外成立**,
+        // 但**图回放会把 int_ws 刷成图自己的 plan**(窗内烘的 memcpy 节点),
+        // 而 host 侧 `active` 对那次改写**不知情** ⇒ 回放之后同 key 的首次窗外
+        // 调用命中旧账、跳过重刷 ⇒ 核读到**上一个图的调度表**。
+        // 实测(重录档 = 1 格 + geobuckets + 同会话复用格):桶回放后的
+        // **每一步 decode** 都拿桶(T=64/padded=6/tiles=6)的表当 T=1 的表用
+        // ⇒ 整段 decode 崩坏(前 1 发正常 —— 因为窗后首个 decode 的 key
+        // 与 boot 末次激活不同,恰好重刷过一次)。X1 对照:第 1 发只出 1 token
+        // (无 decode 步)⇒ 两发都正常 ⇒ 归因闭合。
+        // 代价 = 每次窗外 FI 发射多一次 ~60…600B 的 COMPUTE 流 H2D
+        // (与消费它的核**同流 FIFO**;`upload_impl` 已走 Compute)。
+        if self.active == Some(key) && capturing {
             return Ok(());
         }
         let int_ws = self.int_ws.as_ref().ok_or_else(|| OpError::Asset {
             op: PREFILL_FI.into(),
             detail: "workspace 未装配".into(),
         })?;
-        let capturing = res.capturing().unwrap_or(false);
         let entry = self.plans.get_mut(&key).ok_or_else(|| OpError::Contract {
             op: PREFILL_FI.into(),
             field: "plan",
@@ -220,7 +239,7 @@ impl FiRuntime {
                 key.t,
                 entry.plan15[0].max(0),
                 entry.tiles,
-                res.capturing().unwrap_or(false),
+                capturing,
             );
         }
         Ok(())
@@ -451,8 +470,14 @@ impl KernelFamily for FiRuntime {
             let born = self.stamp;
             self.stamp += 1;
             self.plans.insert(key, PlanEntry { plan15, staged, mask, tiles, born, graph_owned: false });
-            // C++ plan 自己已把表写进 int_ws ⇒ 内容认知同步(activate 不重刷)
-            self.active = Some(key);
+            // ⚠️ **不再信任 C++ 侧那次写**(2026-10-17):`owl_fi_prefill_plan` 的
+            // `int_ws ← page_locked staging` memcpy 在**C++ 适配器内部**发起
+            // (自有/NULL 流),与本 server 的 COMPUTE 流**无跨流序**;而 FI 核
+            // 在 COMPUTE 流 —— H2D 流繁忙时核可能读到**未落地的调度表**
+            // (实测:同格复用档 decode 中段分叉;纯栅栏即愈的同一族)。
+            // ⇒ 认知置空:紧接着的 `activate` 会从**冻结盒**在本侧(COMPUTE 流)
+            // 重刷一遍 —— 与消费它的核**同流 FIFO**,结构性有序。
+            self.active = None;
             self.evict_stale();
         }
         // ── int_ws 激活(多 plan 共存;M2b 2026-10-15)──

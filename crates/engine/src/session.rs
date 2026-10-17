@@ -131,12 +131,6 @@ pub struct SessionTable {
     next_id: u64,
     /// E5:LRU 触达时钟(get_or_create 递增;会话账 last_use)
     tick: u64,
-    /// **每格释放世代**(2026-10-17;临时防线,见定位卷 §7/§9):
-    /// 桶图的 host 槽臂把一个 GDN 格的地址烘死 ⇒ 格换主后回放会读到**未定序**
-    /// 的输入(实测静默错值)。跨流序的**参数面半边**已结构性修复(上传走
-    /// COMPUTE),但**另一半**尚未点名 ⇒ 本世代闸暂留:换过主的格回 eager。
-    /// 何时撤:另一半点名并修复后与门一起撤(见卷 §9 的验收口径)。
-    slot_epoch: std::collections::HashMap<usize, u32>,
 }
 
 impl SessionTable {
@@ -207,20 +201,11 @@ impl SessionTable {
 
     /// 会话结束(客户端显式关闭;KV 区域归还 —— M0.5 单槽 = 账本清理)
     pub fn close(&mut self, id: u64) -> Result<()> {
-        let slot = self.sessions.get(&id).map(|s| s.gdn_slot);
         self.sessions
             .remove(&id)
             .map(|_| ())
             .ok_or_else(|| owl_iface::contract::ModelError::Msg(format!("session {id} 不存在")))?;
-        if let Some(slot) = slot {
-            *self.slot_epoch.entry(slot).or_insert(0) += 1;
-        }
         Ok(())
-    }
-
-    /// 该格**当前**释放世代(0 = 自 boot 起从未换主 ⇒ 桶图可用)。
-    pub fn slot_epoch(&self, slot: usize) -> u32 {
-        *self.slot_epoch.get(&slot).unwrap_or(&0)
     }
 }
 

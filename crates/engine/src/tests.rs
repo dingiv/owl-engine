@@ -2189,20 +2189,20 @@ fn prefill_bucket_pick_and_ladder() {
     assert!(!gdn_host_slot_arm(&env, &dims, 512));
 }
 
-/// **桶可用性四判据**:已捕获 / t 在桶内 / 槽号 = 烘焙槽 / **格未换主**。
-/// 第四条是临时防线(定位卷 §7/§9):跨流序的**参数面半边**已结构性修复
-/// (上传落 COMPUTE),另一半未点名 ⇒ 换过主的格回 eager(免静默错值)。
+/// **桶可用性三判据**:已捕获 / t 在桶内 / 槽号 = 烘焙槽。
+///
+/// (曾有第四判据「格未换主」= 2026-10-17 的临时防线;真因已在
+/// `FiRuntime::activate` 修好 —— 见 `usable` 头注与定位卷结案。)
 #[cfg(test)]
 #[test]
 fn prefill_bucket_usable_conditions() {
     use crate::prefill_plan::bucket_usable;
-    assert!(bucket_usable(true, 57, 64, Some(0), 0, 0, 0), "基线");
-    assert!(!bucket_usable(true, 57, 64, Some(0), 3, 0, 0), "槽号不匹配");
-    assert!(!bucket_usable(true, 57, 64, Some(0), 0, 0, 1), "格换过主 ⇒ 回 eager");
-    assert!(!bucket_usable(false, 57, 64, Some(0), 0, 0, 0), "未捕获");
-    assert!(!bucket_usable(true, 0, 64, Some(0), 0, 0, 0), "空 chunk");
-    assert!(!bucket_usable(true, 65, 64, Some(0), 0, 0, 0), "超桶");
-    assert!(bucket_usable(true, 57, 64, None, 7, 0, 0), "varlen 臂:槽任一");
+    assert!(bucket_usable(true, 57, 64, Some(0), 0), "基线");
+    assert!(!bucket_usable(true, 57, 64, Some(0), 3), "槽号不匹配");
+    assert!(!bucket_usable(false, 57, 64, Some(0), 0), "未捕获");
+    assert!(!bucket_usable(true, 0, 64, Some(0), 0), "空 chunk");
+    assert!(!bucket_usable(true, 65, 64, Some(0), 0), "超桶");
+    assert!(bucket_usable(true, 57, 64, None, 7), "varlen 臂:槽任一");
 }
 
 // ===========================================================================
@@ -2303,14 +2303,19 @@ async fn gpu_prefill_bucket_matches_eager() {
     assert!(!out_graph.trim().is_empty(), "桶档空回答");
     assert_eq!(out_graph, out_eager, "桶图与 eager 的贪心输出必须逐字相同(M2b 跨档门)");
 
-    // ③ **同格复用腿**(2026-10-17 定位卷:`26-10-17-prefill桶图-二次会话污染-定位实录.md`)。
+    // ③ **同格复用腿**(定位卷:`26-10-17-prefill桶图-二次会话污染-定位实录.md`;
+    //    结案见同卷 §结案)。
     //
     // `gdn_slots = 1` ⇒ 第二个会话**必然**重绑 0 号格(前一会话被 LRU 逐出)。
-    // 桶的 host 槽臂把该格**地址/口径烘死**;旧判据只看"槽号相等" ⇒ 复用照样
-    // 放行 ⇒ 回放产出**静默错值**(服务面实测:第二发空应答、模型读不出 prompt)。
-    // 本腿钉两条:①**用户可见不变量** —— 桶档与 eager 档逐字相同(含复用发);
-    // ②**行为面** —— 复用发不回放桶(`replay_counts` 增量 0;安全闸生效)。
-    let mut reuse: Vec<(String, String)> = Vec::new();
+    // 旧病(服务面实发:第二发读不出 prompt、整段 decode 崩坏)实测**不在**
+    // 格地址/页链(两档寻址逐字相同),而在 **FI plan 的共享 `int_ws`**:
+    // 桶回放会把 int_ws 刷成**桶自己的**调度表(窗内烘的 memcpy 节点),而 host
+    // 侧 `active` 旧账不知情 ⇒ 回放后首个同 key 窗外调用跳过重刷 ⇒ decode 拿
+    // 桶的调度表当自己的用。根因修于 `FiRuntime::activate`(窗外一律重刷),
+    // 故本腿现在钉两条:**①两档逐字相同**(用户可见不变量)②**复用发必须回放
+    // 桶**(增量 >0 —— 它就是"同格复用 × 桶回放"的覆盖门;撤闸前它恒 0,
+    // 是被绕过的路径,现在真跑)。
+    let mut reuse: Vec<(String, String, usize)> = Vec::new();
     for b in [PrefillBucket::Geobuckets, PrefillBucket::Off] {
         let mut g = boot_bucket(&dir, ordinal, b, 1).await;
         let t1 = gen_session(&mut g, Some(1), &prompt, 16).await;
@@ -2318,17 +2323,17 @@ async fn gpu_prefill_bucket_matches_eager() {
         let t2 = gen_session(&mut g, Some(2), &prompt, 16).await;
         let n2: usize = g.graphs.prefill.replay_counts().iter().map(|(_, n)| *n).sum();
         eprintln!("[m2b] 复用腿 {b:?}:首个会话桶回放 {n1} / 复用会话增量 {}", n2 - n1);
-        // **修法口径证据**(不设断言):临时防线(格世代闸)在场 ⇒ 增量 0;
-        // 撤闸日(另一半跨流序点名并修复后)增量应 >0 且本腿仍逐字相同 ——
-        // 届时把"必须回放"写成断言(它就是"同格复用 × 桶回放"的覆盖门)。
-        // ⚠️ **不断言"复用发必须回放桶"也不断言"不许回放"** —— 那是修法口径:
-        // 安全闸在场时复用发回 eager(增量 0);根治(跨流序补齐)后复用发会
-        // **正常回放桶**。本腿只钉**用户可见不变量**(两档逐字相同),
-        // 因此两种修法下都绿、而"复用即错值"的病态在任一种下都红 ✓。
-        reuse.push((t1, t2));
+        reuse.push((t1, t2, n2 - n1));
     }
     assert_eq!(
-        reuse[0], reuse[1],
-        "同格复用档:桶档与 eager 档逐字相同(定位卷 §1 的回归锁)"
+        (reuse[0].0.as_str(), reuse[0].1.as_str()),
+        (reuse[1].0.as_str(), reuse[1].1.as_str()),
+        "同格复用档:桶档与 eager 档逐字相同(定位卷的回归锁)"
     );
+    assert!(
+        reuse[0].2 > 0,
+        "同格复用发必须真回放桶(增量 0 = 又被绕过了;eager 档增量 = {})",
+        reuse[1].2
+    );
+    assert_eq!(reuse[1].2, 0, "Off 档不得有桶回放");
 }
