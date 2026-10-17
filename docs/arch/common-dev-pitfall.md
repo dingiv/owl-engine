@@ -890,3 +890,111 @@ fn decode_into(dtype: Dtype, src: &[u8], dst: &mut [f32]) -> Result<(), ModelErr
 4. 复现手法:测试里**故意**在子线程持锁 panic(`AssertUnwindSafe` 不需要,子线程 panic 即可),
    然后断言后续调用仍可用 —— 本仓已有两条这样的门
    (`metrics::tests::poisoned_lock_still_records` / `log::tests::poisoned_logger_still_emits`)。
+5. **"就地恢复"的三个后续动作(2026-10-17 补,由新加的门当场抓出)**:
+   ① 取回 `into_inner()`;**② 视载荷决定是否清内容**(可重算缓存要 `clear()`,
+   消费式状态则**不许**恢复);**③ 必须 `clear_poison()` 复位标志位** ——
+   `Mutex` 毒化是**粘性**的,不复位 ⇒ 之后每次取用都走恢复分支:
+   可重算缓存(awq/w4a16 的物化缓存)会被**反复清空**(重建→下次取用又清 ⇒ 永不命中);
+   诊断口则每次打一条告警。判据:"恢复"是否只该发生一次?
+   实测两处:`formats::awq::cache_guard`(门 `poisoned_cache_recovers_and_clears`)
+   与 `module::SlotCell::guard`(单 `Option` 载荷 ⇒ 无半写风险,属可安全恢复档)。
+
+## 53. 字节 ↔ 元素折算:**硬编码 4 是病灶指纹**(2026-10-17,三轮/四轮审查)
+
+**现场**(同一条病灶,本仓已**三犯**):
+
+| 位置 | 现象 | 后果 |
+|---|---|---|
+| `backends/cpu`:`memset_zero`/`memset_zero_at`/`copy_block_at`/`dtoh`/`dtoh_at`/`BlockSlice` 折算 | 硬除 4(f32 口径)而记账/解码侧是**声明 dtype** 口径 | F16/BF16 块**静默半做**(8 元素清零只落 4 槽;字节往返把 `[1..8]` 腐蚀成 `[0,1.875,0,2,…]`) |
+| `safetensors::take` | 原 `/4` 硬编码 | bf16 条目返回一半元素(F5 已修,注释留痕) |
+| `cpu::face::launch` 的 `Arg::BlockSlice` | 硬除 4 **且**越界静默保留整块、`shape` 谎报 | 算子拿到超长输入(四轮 §A1 已修) |
+
+**律**:
+
+1. 字节量一律经 **`esz`/`dsz`**(= `dtype.size_bytes()`)折算;**禁止字面 4**;
+2. 允许"除以 4"的**仅两类**(须就地写明,可 grep 辨认):
+   a. **U32/I32 天然 4B 承载**的视图 ⇒ `元素数 = 字节数 / 4`,并指名单一真源
+      (先例:`state.rs` 的 fp8 池"字数 = 字节数/4 ← `KvQuant::size_bytes`");
+   b. f32-only 通道(如 `CHUNK_BYTES / 4` 的 f32 分块);
+3. **同一文件里两种口径并存 = 两套规范**(与 §42 同族):要么全按声明 dtype,要么写明"本面恒 f32 口径"的边界(二者选一,不许混)。
+
+**扫描指纹**(建议入常规审查项):
+
+```bash
+grep -rn "/ 4\|\* 4" --include=*.rs crates/*/src | grep -iE "byte|nbytes|len|off|esz|dsz"
+```
+
+命中后按三档分拣:①真错(折算该用 esz)②有据(U32 视图/f32 通道)③需参数化。
+
+**门**:每个 face 都要有"**非 F32 声明块**"的最小用例 —— 本仓现成
+`backends/cpu/tests/declared_dtype_caliber.rs`(5 门:清零 / 字节级拷贝 /
+`swap` 往返 / 收割编码 / 切片边界)。
+
+## 54. **mock 诚实度三问**(2026-10-17,三轮审查 A1)
+
+**背景**:CPU 面(`owl-cpu::CpuFace`)与其它测试替身承担"无卡开发 + 对拍锚"两职 ——
+它说谎的代价是**测试假绿/假红**,而不是当场报错。
+
+**三问**(对每个替身/伪造面各问一遍):
+
+1. 同一语义面有几种**单位说法**?(字节 / 元素 / 槽 / 某具体 dtype 的元素)
+2. 同一份"声明事实"有几个**副本**?(内部表 vs 返回句柄的字段)**谁是权威**?
+3. 越界 / 长度不符时是**响亮拒**还是**静默钳**(`.min()` / `.max()` / `.ok()`)?
+
+**判据一律以"被信任那一侧"为准**:真卡 `GpuServer::check_range` 是响亮拒 ⇒
+替身不许 `.min()` 静默钳;`testkit::harvest_f16` 送 `n×2` 字节 ⇒ 替身的 `dtoh`
+必须按声明 dtype 编码(不是"替身自己那套 f32 口径")。
+
+**别忘了查掩盖机制**:本仓现场 = `CpuFace::alloc` 恒清零 + 未覆写 `alloc_uninit`
+⇒ "池复用忘 memset"这类差异**在替身上不可能复现**(掩盖了上面三问的后果);
+只有**池命中**与**字节往返**两条路会暴露。
+
+**落地**:三问的答案要变成门(本仓:`declared_dtype_caliber.rs` 5 门 +
+`block_slice_arg_is_bounds_checked`)。
+
+## 55. **接口宽于实际需要 = 潜在假现场**(2026-10-17,四轮审查 C3/C4)
+
+**现象**:`WeightSource::native_dtype` 声明可返回 `F32|BF16|F16`,而**全部消费者
+只匹配 `Some(Dtype::BF16)`**(`load.rs` 两处)⇒ 读代码的人以为"F16 同宽直通已
+实现"(四轮审查一度据此判出一条"性能杠杆",实测撤回:两个兄弟源的同宽分支
+本就是逐字节直拷,且 `safetensors::open_dir` 白名单压根不放行 F16 源)。
+
+**律**:对每个 `Option`/枚举返回口,列出
+
+- **实现会返回的取值集合**;
+- **全部消费者实际用到的取值集合**。
+
+两者不等 ⇒ 记一条:**要么收窄接口**(本例:`fn native_is_bf16(&self, key) -> bool`),
+**要么补测试说明为何保留**(将来的直通预留要有对应门,否则就是空头承诺)。
+
+**复现手法**:`grep -rn "<fn_name>" --include=*.rs crates/` 逐个看调用点的匹配
+模式(只看声明处的注释会得出相反的结论)。
+
+## 56. **mmap 条目切片裸铸 `&[f32]` = UB**(规范不保证 4 对齐)(2026-10-17,四轮审查)
+
+**现场**:`safetensors::convert_chunk_into_bytes` 的 F32→F16 臂
+
+```rust
+unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, len) }
+// 注释原文:"长度 4 对齐由 chunks_exact 保证"
+```
+
+注释把**长度**当成了**地址**:`bytes` 是 mmap 里的条目区间
+(`entry.start + i*4`),`entry.start` 由 safetensors 头的 `data_offsets` 给 ——
+**规范不保证 4 对齐**(官方 writer 只把头 padding 到 8;`F8_E4M3`/奇数元素 BF16
+条目会让后继条目变成 2 mod 4;非 padding writer 任意)。实测现存资产恰好全对齐
+(0.8B:36 个 F32 条目全 4 对齐)⇒ **长期潜伏**。
+
+**症状**:debug 档触发 `slice::from_raw_parts` 前置条件检查 =
+**非捕获性 abort**(`thread caused non-unwinding panic` → SIGABRT),
+不是普通 panic,**测试进程直接毙**。
+
+**律**:
+
+1. mmap/字节缓冲上的**类型化视图**必须走"对齐安全口":按字节读 + `_mm_loadu_*`
+   (本仓:`f16c::f32_bytes_to_f16_bytes`),或显式 `ptr as usize % align == 0` 再选路;
+2. **`align_to` / `align_to_mut` 是安全替代**(它自己切出前缀),同文件 BF16→F32 臂
+   就是这么写的 —— 同一文件里两种写法并存,说明这是"知道但漏了一处";
+3. 裸铸只允许在**对齐由构造保证**处(如 `Vec<f32>` 的 `as_ptr`),且必须写明判据;
+4. 任何"从文件/mmap 取结构化数据"的新入口,都要有**非对齐**用例
+   (门:`f32_to_f16_survives_unaligned_entry_offset`,头补白 0/2/6 三档)。
