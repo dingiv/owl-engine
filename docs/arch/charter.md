@@ -175,24 +175,44 @@
 
 ```
 packages/owl/
-├── crates/signal      依赖追踪栈(thread-local;零后端语义,ROCm 可复用)
+├── crates/signal      M0 期名 —— 已**并入 iface**(`owl-iface::signal`):依赖追踪栈
+│                      (thread-local;零后端语义)。**M2 桩,当前零调用点**
 ├── crates/graph       图运行时:预算登记/捕获治理/定影协议/降级(公理 A1 落点)
-├── crates/comm        TP 通信:尺寸路由/one-shot AR/融合口(公理 A2 落点)
+├── crates/comm        TP 通信:尺寸路由/one-shot AR/融合口(公理 A2 落点)。**M2 桩,零依赖者**
 ├── crates/kernels     算子分发:arch 表(sm86 先行)/可捕获 kernel 契约(A1.5)
 ├── crates/backends/
-│   ├── iface          HAL 契约:Backend/Device/Pool/DevBuf/BufToken(上层唯一入口)
-│   ├── cuda           CUDA 栈(官方 cudarc 封装):CudaBackend/CudaDevice/CudaPool
+│   ├── iface          HAL 契约:**两层**(2026-10-17 订正)
+│   │                  · `contract::DeviceClient` —— **现役唯一入口**(引擎/模型/两个后端全走它)
+│   │                  · `Backend/Device/Pool/DevBuf/BufToken`(本文件原称"上层唯一入口")
+│   │                    = **M2/TP 面桩**:跨卡窄口(`map_remote`/`enable_peer_access`/
+│   │                    `malloc_peer_shared`)与相位机落点,当前**全仓零实现体**
+│   │                  · `signal`(依赖追踪)= M2 桩,当前零调用点
+│   │                    (`cuda-pitfalls.md` P2-1/P2-2/S6 挂账待 A2.6)
+│   ├── cuda           CUDA 栈(官方 cudarc 封装):`GpuServer`(actor 事件循环)/
+│   │                  `GpuClient`(`DeviceClient` 实现)/`Command` 信封
+│   │                  ⚠️ M0 期名 `CudaBackend/CudaDevice/CudaPool` **已随声明式重构退役**
+│   │                  (零实现体;化石 `crates/backends/utils` 2026-10-17 已删)
+│   ├── cpu            `CpuFace` —— `DeviceClient` 的**进程内同步实现**(测试/对拍/无卡开发)
 │   └── rocm           占位(未来厂商栈)
-├── crates/core        内存规划器/scheduler/runner(同步隔离 A3)/健康状态(A2.7)
-├── crates/nn          最小张量层 + NN 算子(池工厂 API,CaptureSafe 契约)
-└── crates/server      tokio API 层(M2 才开)
+├── crates/core        M0 期名 —— 已拆为现役 `crates/engine`(内存规划/scheduler/runner)
+├── crates/nn          M0 期名 —— 已拆为现役 `crates/models`(张量层 + 层实现 + 装载)
+└── crates/server      M0 期名 —— 现役为 `apps/server`(tokio API 层)+ `apps/cli`
 ```
+
+> ⚠️ **本块含 M0 期规划名**:现役 crate 清单以 `Cargo.toml` 的 `workspace.members`
+> 为准(`graph/comm/store/macros/kernels/backends{cuda,cpu,iface}/models/shared/engine`
+> + `apps/{server,cli}`;`backends/utils` 已删)。
 
 依赖方向单向:`server → core → nn → {iface 派生 Device 实现}` 与
 `core → {graph, comm, kernels, signal}`;signal 零后端依赖。
 数据面:官方 cudarc 仅在 backends/cuda 导入,经 `ffi` 白名单受控再导出。
 
-### 三元关系(2026-09-22 裁决,类型化于 iface)
+### 三元关系(M2 面桩;2026-09-22 裁决,类型化于 iface)
+
+> ⚠️ **2026-10-17 订正**:下图的 `Backend/Device/Pool/Buf` 四元面**当前零实现体**
+> (`impl … for` 全仓 0 条),属 **M2(TP/comm)桩**;现役装载/执行/记账户全部走
+> `contract::DeviceClient`(见 §四 crate 划分的 iface 条)。下面这张"三元关系"
+> 保留为 **M2 设计意图**存档,不要据此以为设备面已接线。
 
 ```text
 Backend(厂商栈:枚举/打开)  1:N  Device(一卡 = 一账本 + 一池组 + 一相位机)
