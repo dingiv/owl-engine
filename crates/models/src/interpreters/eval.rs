@@ -85,7 +85,9 @@ fn perf_cnt(tag: &str, n: u64) {
 /// **boot 期定谳**(进程内改 env 不再生效;诊断档本就如此用)。
 fn no_reclaim() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var_os("OWL_NO_RECLAIM").is_some())
+    // env **单一访问口**(2026-10-17 审查 §六轮:原先直读 `std::env::var_os`,
+    // 绕过 `env_reader` —— 与 J1/J4 的收口纪律相悖,且测试面的 EnvGuard 不再生效)
+    *V.get_or_init(|| owl_shared::env_reader::flag("OWL_NO_RECLAIM"))
 }
 
 /// 门 = env `OWL_BLOCK_POOL`(与本文件的 `OWL_NO_RECLAIM` 同一「诊断/调优门」
@@ -904,8 +906,13 @@ where
 
     // C1 边界断言:非 Block 父节点的块账长 = 声明元素数(Block 叶子 len=0 无
     // 语义;SliceView 父 = 块首切片,账长 = 父块全长,不在此检)。维度推导
-    // 一律不用 len(见下方各分支);此处只在 debug 构建拦账变。
-    if cfg!(debug_assertions) {
+    // 一律不用 len(见下方各分支)。
+    //
+    // 门谓词 = 仓内统一 `PERF_BUILD`(2026-10-17 审查 §六轮:原 `cfg!(debug_assertions)`
+    // 是**第二套谓词**;`PERF_BUILD = debug_assertions ∨ feature=perf` ⇒ 非 perf 的
+    // release 里整段常量折叠(逐字节零成本),而 `--features perf` 能在 release 档
+    // 打开这类账本检查 —— 与 `cuda/state.rs` 的既有用法同源)。
+    if owl_shared::metrics::PERF_BUILD {
         for (i, (p, b)) in t.parents.iter().zip(&vals).enumerate() {
             if matches!(p.op, Op::SliceView { .. }) {
                 continue;
@@ -973,6 +980,13 @@ where
             let (m, n) = (shape[0], shape[1]);
             // k = 内维 = x 声明 shape 末维(C1:只读声明 shape;原取 ins[0].len
             // 在多行 [m,k] 时越界读 —— 此 bug 被"历届测试都单行"掩盖)
+            // k = 内维 = x 声明 shape 末维(C1:只读声明 shape;原取 ins[0].len
+            // 在多行 [m,k] 时越界读 —— 此 bug 被"历届测试都单行"掩盖)。
+            // 空形状此处**不可达**(2026-10-17 审查 §六轮定判)两点:
+            // ①`TensorOps::matmul/matmul_nt` 声明面已按 rank ≥ 1 律毒化;
+            // ②本函数在执行本臂前先经父值求值,父节点带毒 ⇒ 更早以
+            // "[毒值落地]" 返回 Err(见上方 `t.err` 门)。故 `unwrap_or(0)` 只是
+            // 形式默认,不会把 0 送进几何。
             let k = t.parents[0].shape.last().copied().unwrap_or(0);
             let out = ctx.alloc_out_node(t.id, dtype, m * n, false, class).await?.view(dtype, shape.len() as u8);
             owl_shared::slab_hint::probe_name(out.id, class);

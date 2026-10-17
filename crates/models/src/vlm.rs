@@ -82,10 +82,19 @@ impl VlmCfg {
             .and_then(|r| r.get("mrope_section"))
             .and_then(|x| x.as_array())
             .map(|a| {
+                // 元素必须是非负整数(2026-10-17 审查 §六轮:原 `as_u64().unwrap_or(0)`
+                // 是静默回退 —— 非数值元素会变成 0 段,切分悄悄变形)
                 a.iter()
-                    .map(|x| x.as_u64().unwrap_or(0) as usize)
-                    .collect::<Vec<usize>>()
+                    .map(|x| {
+                        x.as_u64().map(|v| v as usize).ok_or_else(|| {
+                            ModelError::Msg(format!(
+                                "mrope_section 元素须为非负整数,实得 {x}"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<usize>, ModelError>>()
             })
+            .transpose()?
             .ok_or_else(|| ModelError::Msg("rope_parameters 缺 mrope_section".into()))?;
         if sections.len() != 3 {
             return Err(ModelError::Msg(format!(
@@ -116,7 +125,21 @@ impl VlmCfg {
                     .map(|x| x.as_str() == Some("full_attention"))
                     .collect::<Vec<bool>>()
             })
-            .unwrap_or_else(|| crate::formats::qwen35::hybrid_3to1(g("num_hidden_layers").unwrap_or(0)));
+            // 缺 `layer_types` ⇒ 按**家族规则**派生(3 GDN : 1 FA);
+            // `num_hidden_layers` 缺失/为 0 = 层型表不可定 ⇒ **响亮拒**
+            // (原 `unwrap_or(0)` 会静默生成空层型表 = "没有 GDN/FA 层" 的错模型)
+            .map_or_else(
+                || {
+                    let n = g("num_hidden_layers")?;
+                    if n == 0 {
+                        return Err(ModelError::Msg(
+                            "text_config.num_hidden_layers = 0(层型表不可定)".into(),
+                        ));
+                    }
+                    Ok(crate::formats::qwen35::hybrid_3to1(n))
+                },
+                Ok,
+            )?;
         // eos 字面量:Qwen3.5 家族共享(vocab 248320;`<|im_end|>` = 248044)
         let eos: Vec<&'static str> = if text.get("eos_token_id").is_some() {
             vec!["<|im_end|>"]
@@ -898,19 +921,23 @@ mod tests {
             "model.language_model.layers.0.linear_attn.in_proj_qkvz.weight",
             "model.visual.blocks.0.mlp.linear_fc1.weight",
         ];
-        let n0 = src.elem_len(keys[0]).expect("键");
-        let tot_elems: usize = keys.iter().map(|k| src.elem_len(k).unwrap_or(0)).sum();
+        // 合约检查:源必须知道首键元素数(2026-10-17 清 unused;原绑定 `n0` 无人读)
+        let _ = src.elem_len(keys[0]).expect("源").expect("键");
+        let tot_elems: usize = keys
+            .iter()
+            .map(|k| src.elem_len(k).expect("源").unwrap_or(0))
+            .sum();
         let gb = tot_elems as f64 * 2.0 / 1e9;
         eprintln!("[bench] 样本 {gb:.3}GB(四键)");
 
         // ① CPU 转换 bf16→f16(单键 ×3 轮)
         for k in keys {
-            let n = src.elem_len(k).expect("键");
+            let n = src.elem_len(k).expect("源").expect("键");
             let mut buf = vec![0u8; n * 2];
             let reps = 3;
             let t0 = std::time::Instant::now();
             for _ in 0..reps {
-                src.convert_chunk_into_bytes(k, 0, n, &mut buf, Dtype::F16).expect("convert");
+                src.convert_chunk_into_bytes(k, 0, n, &mut buf, Dtype::F16).expect("源").expect("convert");
             }
             let dt = t0.elapsed().as_secs_f64();
             eprintln!("[bench] ① convert {n:>9} elem: {:.2} GB/s", n as f64 * 2.0 * reps as f64 / 1e9 / dt);
@@ -920,9 +947,9 @@ mod tests {
         let mut raw_gb = 0f64;
         let mut raw_s = 0f64;
         for k in keys {
-            let n = src.elem_len(k).expect("键");
+            let n = src.elem_len(k).expect("源").expect("键");
             let t0 = std::time::Instant::now();
-            let v = src.take_range(k, 0, n).expect("取数"); // 含转换;只作"有数据"对照
+            let v = src.take_range(k, 0, n).expect("源").expect("取数"); // 含转换;只作"有数据"对照
             std::hint::black_box(&v);
             raw_gb += n as f64 * 2.0 / 1e9;
             raw_s += t0.elapsed().as_secs_f64();
