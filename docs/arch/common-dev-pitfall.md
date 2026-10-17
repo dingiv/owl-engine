@@ -866,3 +866,27 @@ fn decode_into(dtype: Dtype, src: &[u8], dst: &mut [f32]) -> Result<(), ModelErr
 
 **代价意识**:去掉去重 ⇒ 每次窗外 FI 发射多一次 ~60…600B 的 COMPUTE 流 H2D
 (与消费核同流 FIFO);用几十 µs 换"结构上不可能读错表"。
+
+## 52. **锁中毒两分法**:诊断面就地恢复、正确性面响亮拒(2026-10-17,次轮审查 A2/C2)
+
+**现场**:同一仓里两种写法长期并存,且没有一句话写清哪面用哪套 ——
+`backends/cuda/src/trace.rs`(发射账)注释写着"**锁中毒就地恢复 —— 记账不许拖垮执行**"
+并用 `unwrap_or_else(|p| p.into_inner())`;而 `shared/src/{metrics,log}.rs`
+(同为记账/诊断面,调用点**更热**:每节点 timer/counter、每条日志)却用 `lock().unwrap()`
+⇒ 一次持锁 panic 会把锁毒化,此后**每一次打点/记日志**都在调用方 panic,把小事故
+放大成"引擎线程死 + 崩溃现场打不出日志"。
+
+**两分法(判据 = 该状态是不是"正确性载荷")**:
+
+| 面 | 判据 | 中毒后怎么办 | 本仓现状 |
+|---|---|---|---|
+| **诊断/记账面**(metrics / log / trace ring / cupti 计数) | 内容只用于观察;**丢/旧都不影响正确性** | **就地取回** `unwrap_or_else(|p| p.into_inner())`,不让诊断拖垮执行 | trace ✓ 本就有;metrics/log **2026-10-17 已归位**(15 处 + 两条毒化门) |
+| **正确性面**(Ack 的 value/waker、租约 cell、staging 空闲表、信号 token 表) | 内容参与调度/所有权;毒化 = 持锁线程死在临界区 = **真 bug** | **响亮拒**(结构化 Err + 日志 + 可判定的降级),既不静默 panic 也不静默恢复 | **未动**(每处需 owner 定语义 —— 就地恢复可能把"已坏的状态"继续用) |
+
+**纪律**:
+1. 新增锁之前先问它属于哪一面;诊断面一律用 `into_inner()` 恢复,别抄 `unwrap()`;
+2. 诊断面恢复**不等于静默**:恢复路径要能被看见(计数器/HTTP 面,见判例 §47 与本卷 §A7);
+3. 正确性面**不许**用"恢复"糊过去 —— 那会把 UAF/半写状态变成静默错值;
+4. 复现手法:测试里**故意**在子线程持锁 panic(`AssertUnwindSafe` 不需要,子线程 panic 即可),
+   然后断言后续调用仍可用 —— 本仓已有两条这样的门
+   (`metrics::tests::poisoned_lock_still_records` / `log::tests::poisoned_logger_still_emits`)。
