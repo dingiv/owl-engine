@@ -710,7 +710,12 @@ where
             let b = b.clone();
             // 覆盖块 = 跨段钉块:永不参与回收(与 keep 同一条守卫)
             self.keep_blocks.insert(b.id);
-            self.track_new(b.id);
+            // ⚠️ **不在此 `track_new`**(2026-10-17 审查定谳):本函数头注就写着
+            // "不在此登记竞技场:track_new 由调用方统一调用(单一拼写)",而这里
+            // 原有多登一次 —— 三个调用方(Zeros/Matmul/Call 族)**各自都会登**
+            // ⇒ `block_users` 恒多 1 ⇒ 该块永不命中中途回收出口(泄漏),且
+            // `slab_hint` 的 DOUBLE_NEW 诊断每次 boot 刷屏(实测 24 条;
+            // 判例见 common-dev-pitfall §51 邻域:记账与执行体各说一套)。
             if zeroed {
                 self.face.memset_zero(&b, n_elems * dtype.size_bytes()).await?;
             }
