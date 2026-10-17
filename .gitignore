@@ -31,3 +31,4 @@ perf-runs/
 # 别人的 stash 残留被我的 `add -A` 带进一笔,事后加了撤销提交)。
 # 进版本 = 真需要当"金标"的数据请显式 `git add -f`。
 docs/bench/data/
+*.local
