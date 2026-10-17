@@ -33,10 +33,6 @@ impl GpuServer {
         self.sink.timer("srv.seg.htod", t0.elapsed());
     }
 
-    pub(super) fn handle_htod_inner(&mut self, data: Vec<u8>, name: &str, ack: Ack<Result<Bytes, ModelError>>) {
-        self.handle_htod_inner_on(data, name, STREAM_H2D as u8, ack)
-    }
-
     /// [`Self::handle_htod_inner`] 的**落点流可选**版(2026-10-17):参数面
     /// (解释器的 `from_host` 叶子)走 COMPUTE ⇒ 与消费它的发射同流 FIFO。
     pub(super) fn handle_htod_inner_on(
@@ -182,17 +178,11 @@ impl GpuServer {
     }
 
     /// **上传核心**(只入队 DMA + 登记租约归还;不 ack)—— 复合命令
-    /// `UploadAndLaunch` 与命令壳共用(mutual: 单机制,无第二套上传路径)
-    pub(super) fn enqueue_upload_pinned(
-        &mut self,
-        buf: Box<dyn owl_iface::contract::PinnedRegion + Send>,
-        dst: Bytes,
-        offset_bytes: usize,
-        len_bytes: usize,
-    ) -> Result<(), ModelError> {
-        self.enqueue_upload_pinned_on(STREAM_H2D, buf, dst, offset_bytes, len_bytes)
-    }
-
+    /// `UploadAndLaunch` 与命令壳共用(mutual: 单机制,无第二套上传路径)。
+    /// 落点流由调用方给:`STREAM_COMPUTE` = 参数面(与消费核同流),
+    /// `STREAM_H2D` = 大批量装载面。**不设无流包装** —— 单一拼写
+    /// (2026-10-17 审查:原 `enqueue_upload_pinned`/`handle_htod_inner` 两个
+    /// legacy 包装已无调用者,删;H2D 面在各自调用点显式指名)。
     /// 同上,但**指定流**(复合命令 `UploadAndLaunch` 用:把搬运放在**消费它的
     /// 那条流**上 ⇒ 单流硬件保序,零事件零栅栏 —— 见 server 侧复合处理体)
     pub(super) fn enqueue_upload_pinned_on(

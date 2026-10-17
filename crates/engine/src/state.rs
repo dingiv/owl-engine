@@ -316,7 +316,11 @@ const WARMUP_MISC_BUDGET: usize = 138 << 20;
 /// **治理器之后的固定分配项**(原为一行 `n_gdn*slots*elems*4 + snap*… + 400MiB`)
 #[derive(Debug, Clone, Copy)]
 struct FixedAfter {
-    /// GDN 状态格(gdn_slots 格 × 每格元素 × f32)
+    /// GDN 状态格(gdn_slots 格 × 每格元素 × f32)。
+    /// **对账口径**:真分配应等于此式(`tests.rs` 用池访问器逐项对账;
+    /// 访问器见 `StatePool::{gdn_row_bytes,snapshot_pool_bytes,draft_pool_bytes}`,
+    /// `#[cfg(test)]` 门控 —— 本预算在池分配之前就要算,故生产面不能读池)。
+    /// 0.8B 档实测 18 层 × 1.07MiB ≈ 19.3MiB/行。
     gdn_grid: usize,
     /// GDN 快照池(同格 × snap_max)
     gdn_snap: usize,
@@ -421,11 +425,16 @@ impl StatePool {
         elems * elem_bytes(dtype) / self.nb_kv.max(1)
     }
 
+    // ── 下面三件：**测试对账面**（`tests.rs` 用它们把"池真分配"与预算算式对账）。
+    // 生产零调用者（预算算式在池分配**之前**就要用 ⇒ 结构上不能读池），
+    // 故 `#[cfg(test)]` 门控 —— 既保住对账能力，也不让 release 面背死代码告警
+    // （2026-10-17 审查：先删后补，补的理由见 commit 信息）。
     /// **GDN 行字节 / 每活跃 turn**(`owl_store::BudgetInputs::gdn_row_bytes` 真源)。
     ///
     /// 口径:每层四件(conv_q/conv_k/conv_v/rec)的分配宽 = `gdn_slots × 单槽宽`
     /// (`StatePool::alloc` 里显式乘过)⇒ **行字节 = 池总字节 ÷ gdn_slots**。
     /// 读真分配,不按公式重算(0.8B 档实测:18 层 × 1.07MiB ≈ 19.3MiB/行)。
+    #[cfg(test)]
     pub(crate) fn gdn_row_bytes(&self) -> usize {
         let pool: usize = self
             .gdns
@@ -438,6 +447,7 @@ impl StatePool {
     }
 
     /// **快照池字节**(E2c 静态预分配;固定面的一项,含 spec 快照缓冲)。
+    #[cfg(test)]
     pub(crate) fn snapshot_pool_bytes(&self) -> usize {
         let pool: usize = self
             .snaps
@@ -454,6 +464,7 @@ impl StatePool {
 
     /// **草稿池字节**(MTP 链 / DFlash2 五层;关 = 0)。按 `pool_tokens` 全额
     /// 预留 ⇒ 开 draft 的档等于第二个主池(`BudgetInputs::draft_pool_bytes`)。
+    #[cfg(test)]
     pub(crate) fn draft_pool_bytes(&self) -> usize {
         fn kv_bytes(kv: &KvBlocks) -> usize {
             kv.k_cache.1 * elem_bytes(kv.k_cache.0.dtype)

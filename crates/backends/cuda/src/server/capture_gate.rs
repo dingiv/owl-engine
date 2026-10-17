@@ -78,7 +78,6 @@ pub(super) fn reject_with(cmd: Command, why: String, sink: owl_shared::log::LogS
             Command::LedgerReport { .. } => "LedgerReport",
             Command::LedgerJson { .. } => "LedgerJson",
             Command::UploadPinned { .. } => "UploadPinned",
-            Command::Dtoh { .. } => "Dtoh",
             Command::Free { .. } => "Free",
             Command::CopyBlock { .. } => "CopyBlock",
             Command::CopyBatch { .. } => "CopyBatch",

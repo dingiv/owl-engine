@@ -230,6 +230,25 @@ mod tests {
         assert_eq!(g.phase(), GraphPhase::Live);
     }
 
+    /// A1.2(2026-10-17 审查 C1):**规划表外的档必须响亮拒**(原 `debug_assert!`
+    /// ⇒ release 静默放行 ⇒ 未规划档占掉 live 预算而 `preflight` 看不见)。
+    #[test]
+    fn end_capture_rejects_unplanned_profile() {
+        let mut g = gov();
+        g.begin_capture().unwrap();
+        // gov() 规划的两档 = {batch1/max_frontier4096, batch4/…};取表外的 batch=3
+        let err = g
+            .end_capture(GraphProfile { batch: 3, max_frontier: 4096 })
+            .unwrap_err();
+        assert!(
+            matches!(err, GraphError::ProfileNotPlanned { .. }),
+            "应报 ProfileNotPlanned,实得 {err:?}"
+        );
+        // 拒后仍停在捕获态(未占预算)⇒ 仍可正常收尾
+        assert_eq!(g.phase(), GraphPhase::Capturing);
+        g.end_capture(GraphProfile { batch: 1, max_frontier: 4096 }).unwrap();
+    }
+
     /// A1.1:图预算必须从池容量中前置扣除
     #[test]
     fn allowance_reserved_before_pool() {

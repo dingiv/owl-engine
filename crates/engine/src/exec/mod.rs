@@ -17,6 +17,7 @@ use crate::scheduler::BeginPlan;
 pub mod phases;
 
 /// **E4 接入面(声明;未实现)**——见 `docs/arch/三流事件序-设计与迁移.md` §6
+#[allow(dead_code)] // E4 声明面(未接线;见模块头:全部 Err(未实现),调用即响亮拒 ⇒ 不静默)
 pub mod e4_api;
 pub mod spec;
 pub mod draft;
