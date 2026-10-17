@@ -23,6 +23,8 @@ pub mod draft;
 pub mod prefill_chunk;
 pub mod turn_end;
 pub mod coverage;
+/// **KV 池页的宿主解码面**(单源;f16 / fp8 e4m3 两侧)
+pub mod kvpage;
 
 pub(crate) fn spec_degrade_transition(
     streak: usize,
