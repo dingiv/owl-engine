@@ -77,6 +77,17 @@ fn perf_cnt(tag: &str, n: u64) {
 
 /// 块池预算(字节;**0 / 缺省 = 关**)。P1″ 2026-10-14。
 ///
+/// `OWL_NO_RECLAIM=1` ⇒ 关掉活性中途回收(诊断/对照臂)。
+///
+/// **OnceLock 记忆化**(2026-10-17 审查):原为每个 `eval_ops` 现场
+/// `std::env::var`(取进程 env 锁 + 分配 String;求值入口 = 逐算子),而本文件
+/// 的兄弟旋钮(`block_pool_budget`)早有 OnceLock 先例 ⇒ 口径归位。语义:该旋钮
+/// **boot 期定谳**(进程内改 env 不再生效;诊断档本就如此用)。
+fn no_reclaim() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("OWL_NO_RECLAIM").is_some())
+}
+
 /// 门 = env `OWL_BLOCK_POOL`(与本文件的 `OWL_NO_RECLAIM` 同一「诊断/调优门」
 /// 先例),**`OnceLock` 缓存一次** ⇒ 热路径零 env 查询。
 /// 引擎侧后续应升格为 `OwlConfig` 键(本 lane 文件面不含 engine/,见报告)。
@@ -265,7 +276,7 @@ where
             EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new(),
                 arena_set: std::collections::HashSet::new(),
                 block_users: std::collections::HashMap::new(),
-                pending: count_pending(t), reclaim: std::env::var("OWL_NO_RECLAIM").is_err(), perf, env,
+                pending: count_pending(t), reclaim: !no_reclaim(), perf, env,
                 pool: (pool_budget > 0).then(|| BlockPool::new(pool_budget)),
                 keep_nodes: Default::default(), keep_blocks: Default::default(),
                 overrides: Default::default() };

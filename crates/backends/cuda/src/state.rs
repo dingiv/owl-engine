@@ -1614,10 +1614,32 @@ impl GpuCtx {
         if self.capture.is_some() && matches!(e.block, Block::Owned(_)) {
             self.graph_refs.borrow_mut().record(id);
         }
-        // 块账自洽(哨兵;cfg! 展开 ⇒ 两档都编译,零热路径语义)
-        debug_assert_eq!(e.ledger, self.ledger, "块条目账本与 id 账本不一致");
-        debug_assert_eq!(numel(&e.shape), e.bytes, "块 shape/账长不一致");
-        debug_assert!(e.dtype.size_bytes() >= 1, "块 dtype 非法");
+        // 块账自洽(哨兵)。**判据升级(2026-10-17 审查)**:原为 `debug_assert!`
+        // ⇒ `--release --features perf`(团队性能档)与生产档**都不查**,账本破损
+        // 只能靠很远处 OOM/错值现形。现按仓内既有谓词 `PERF_BUILD`
+        // (= `debug_assertions ∨ feature="perf"`)门控成**结构化 Err**:
+        // 生产档常量折叠零开销,性能/调试档响亮拒(且不会像 panic 那样带走 actor 线程)。
+        // 注:第一项(ledger)与上面 `assert_ledger` 同源,保留作双保险。
+        if owl_shared::metrics::PERF_BUILD {
+            if e.ledger != self.ledger {
+                return Err(ModelError::Msg(format!(
+                    "块账破损:id={id} 条目账本 {} ≠ 当前账本 {}",
+                    e.ledger, self.ledger
+                )));
+            }
+            if numel(&e.shape) != e.bytes {
+                return Err(ModelError::Msg(format!(
+                    "块账破损:id={id} shape {:?} 元素数 {} ≠ 账长 {} 字节",
+                    e.shape, numel(&e.shape), e.bytes
+                )));
+            }
+            if e.dtype.size_bytes() < 1 {
+                return Err(ModelError::Msg(format!(
+                    "块账破损:id={id} dtype {:?} 尺寸非法",
+                    e.dtype
+                )));
+            }
+        }
         match &e.block {
             Block::Owned(slice) => {
                 let (p, _) = slice.device_ptr(stream);

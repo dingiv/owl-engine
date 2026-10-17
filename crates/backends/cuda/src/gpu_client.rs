@@ -528,10 +528,17 @@ impl DeviceClient for GpuClient {
         self.submit(move |ack| Command::Swap { dir, pieces, conn, ack })?.await
     }
 
-    // TODO: 考虑改成同步调用, 因为 launch 不用等待, 待定
     async fn launch(&mut self, msg: LaunchMsg) -> Result<Bytes, ModelError> {
-        // 槽序契约前置校验(与 launch.rs 的"最后一个 Block"回传一致)
-        debug_assert!(msg.args.iter().any(|a| matches!(a, Arg::Block { .. })));
+        // 槽序契约前置校验(与 launch.rs 的"最后一个 Block"回传一致)。
+        // **响亮拒,不用 debug_assert**(2026-10-17 审查):无 Block 实参 = 调用点
+        // 违约,而 release 档 debug_assert 静默放行 ⇒ 服务端 `out_id` 退化成 0,
+        // 错在很远处才现形。这里每发射一次扫一遍实参(≤数十项),代价可忽略。
+        if !msg.args.iter().any(|a| matches!(a, Arg::Block { .. })) {
+            return Err(ModelError::Msg(format!(
+                "launch 契约违约:实参里没有任何 Block(核 {})",
+                msg.kernel.name
+            )));
+        }
         self.submit(move |ack| Command::Launch { msg, ack })?.await
     }
 
