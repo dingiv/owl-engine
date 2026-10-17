@@ -110,6 +110,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         // 准入账同步(S3b §23.2):turn 生死 = 保留额生死
         self.close_admission(act.id);
+        // **B-3d**:选择层视图态随 turn 收口(视图是 turn 域资源 —— 下一 turn
+        // 的召回点重新产出;不清 = 用旧视图读新会话的块,静默错值)
+        self.sel_view = None;
         let mut text = self.tok.decode(&act.out);
         // stop 串命中(AGT-06):终了文本较交付给客户端的输出多了一截停止串 ⇒
         // 截回命中位置(char 边界安全,不命中则原样)

@@ -130,6 +130,104 @@ pub struct RunningEngine<D: DeviceClient> {
     pub(crate) graphs: GraphFleet<D>,
     /// 引擎级 spec 运行态(spec_runtime.rs;turn 域七件套住 ActiveTurn)
     pub(crate) spec: SpecRuntime,
+    /// **B 轴覆盖率探针**待分析面(Q 已回读;等块边界事件补齐索引账)
+    /// —— `OWL_COVERAGE_PROBE`;缺省 `None`(生产零开销)。
+    pub(crate) cov_pending: Option<crate::exec::coverage::CoveragePending>,
+    /// 覆盖率探针最近一次观测(测试/调试读数面;`None` = 未观测过)
+    pub(crate) cov_last: Option<crate::exec::coverage::CoverageReport>,
+    /// **B-3d 选择层视图态**(召回点产出;`select_decode` 档每步展开成视图页表)
+    pub(crate) sel_view: Option<SelectView>,
+    /// 视图**生效**的 decode 步数(证据面:该臂真的走了视图)
+    pub(crate) select_view_steps: usize,
+    /// 视图输入槽**回退为全量链**的步数(视图态缺位;与上者和 = decode 步数)
+    pub(crate) sel_view_fallback: usize,
+    /// **B-3e stage-in 实测账**(回灌延迟定档;见 `StageStats`)
+    pub(crate) stage: StageStats,
+    /// **B-3e-2 部分驻留账**(召回点下沉/回灌/不可沉计数)
+    pub(crate) partial: PartialStats,
+}
+
+/// **stage-in 实测账**(B-3e;宿主 → 设备回灌的块数/字节/耗时)。
+///
+/// 用途:把"恢复延迟"从论文口号变成我们的数字(论文 174ms@256K ⇒ 我们的
+/// **选中集**回灌:W 块 × 每块字节)。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StageStats {
+    /// 回灌块数 / 字节
+    pub blocks: usize,
+    pub bytes: usize,
+    /// 回灌墙钟(ns;**含** `face.swap` 的发射与回执)
+    pub nanos: u64,
+    /// 来源拆分:召回前置(prefill 段边界)vs 决策单(verdict.in_)
+    pub from_prefill: usize,
+    pub from_verdict: usize,
+}
+
+impl StageStats {
+    /// 每块字节(0 = 无样本)。
+    pub fn bytes_per_block(&self) -> usize {
+        if self.blocks == 0 { 0 } else { self.bytes / self.blocks }
+    }
+    /// 吞吐(MB/s;0 = 无样本)。
+    pub fn mib_per_s(&self) -> f64 {
+        if self.nanos == 0 {
+            0.0
+        } else {
+            self.bytes as f64 / 1048576.0 / (self.nanos as f64 / 1e9)
+        }
+    }
+    /// 人类可读一行。
+    pub fn line(&self) -> String {
+        format!(
+            "stage-in:{} 块 / {:.1}MiB / {:.1}ms(每块 {:.0}KiB · {:.0}MiB/s;前置 {} 决策 {} )",
+            self.blocks,
+            self.bytes as f64 / 1048576.0,
+            self.nanos as f64 / 1e6,
+            self.bytes_per_block() as f64 / 1024.0,
+            self.mib_per_s(),
+            self.from_prefill,
+            self.from_verdict
+        )
+    }
+}
+
+/// **B-3e-2 部分驻留账**(召回点下沉 / 回灌 / 不可沉)。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PartialStats {
+    /// 召回点下沉的块数(会话放手 → 缓存独占 → 宿主)
+    pub sunk: usize,
+    /// 召回点回灌的块数(选中但内容在宿主)
+    pub staged: usize,
+    /// **本轮不可沉**的块数(还没进缓存树 ⇒ 无宿主键;见 §8.19 第 2b 项)
+    pub not_cacheable: usize,
+    /// **prefill 子集表**生效的 chunk 数(= 链上有洞后才换表的次数;第 3 项证据)
+    pub prefill_subset: usize,
+}
+
+impl PartialStats {
+    /// 人类可读一行。
+    pub fn line(&self) -> String {
+        format!(
+            "部分驻留:下沉 {} 块 · 回灌 {} 块 · 不可沉(未入缓存树){} 块 · prefill 子集表 {} 次",
+            self.sunk, self.staged, self.not_cacheable, self.prefill_subset
+        )
+    }
+}
+
+/// **选择层视图态**(B-3d;方案 A = 原位置,不做 re-RoPE)。
+///
+/// 视图 = **选中块(时间序)++ 召回点之后新生成的尾部**:
+/// - 尾部必须带(否则模型看不见自己刚写的 token);
+/// - 尾部在会话链里天然连续,且召回点落在**块边界** ⇒ 尾部从整页起;
+/// - `kv_lens`(注意力上下文长)= 选中 token 数 + `pos+1 − recall_pos`。
+#[derive(Debug, Clone)]
+pub struct SelectView {
+    /// 选中块的物理页(时间序)。
+    pub pages: Vec<u32>,
+    /// 选中块的 token 数(= `pages.len() × page`)。
+    pub tokens: usize,
+    /// 召回点绝对位置(块边界;尾部从这里起)。
+    pub recall_pos: usize,
 }
 
 /// **生成预算的最小保留量**(tok):剩余额度低于它 = 真溢出(连一个像样的
@@ -641,6 +739,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             }
         }
         // ② 回灌(Verdict.in_:逐条一条命令;H4 的批量形态在 execute_begin)
+        let t_stage = std::time::Instant::now();
         for chain in &verdict.in_ {
             let (cs, slots, pieces, table) = {
                 match owl_store::plan_onload(&mut self.bank.rel.leg, std::slice::from_ref(chain)) {
@@ -663,8 +762,12 @@ impl<D: DeviceClient> RunningEngine<D> {
             };
             let table = owl_store::reclaim_slot_table(conn)?;
             let _ = owl_store::commit_onload(&mut self.bank.rel.leg, &cs, &slots, table)?;
+            self.stage.blocks += cs.len();
+            self.stage.bytes += cs.len() * self.pool.block_bytes();
+            self.stage.from_verdict += cs.len();
             a.onloaded += 1;
         }
+        self.stage.nanos += t_stage.elapsed().as_nanos() as u64;
         Ok(a)
     }
 

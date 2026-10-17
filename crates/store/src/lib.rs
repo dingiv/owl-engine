@@ -45,6 +45,7 @@ pub mod kv;
 pub mod leg;
 pub mod policy;
 pub mod rel;
+pub mod select;
 pub mod state;
 pub mod tier;
 
@@ -55,12 +56,21 @@ pub use budget::{check_admission, Admission, AdmissionVerdict, BudgetInputs, Tur
 pub use id::{ChainHash, PrefixId, SnapKey, TOKENS_PER_BLOCK};
 pub use kv::{hash_block, tail_hash, CacheUpdate, ChainCursor, KvStats, KvStore, MatchedBlock, PrefixMatch};
 pub use leg::{
-    abort_offload, abort_onload, commit_offload, commit_onload, plan_offload, plan_onload,
+    abort_offload, abort_onload, commit_offload, commit_onload, is_host_placeholder, plan_offload,
+    plan_offload_blocks, plan_onload, BlockOutPlan, SkipWhy, HOST_PLACEHOLDER,
     reclaim_slot_table, BlockClass, BlockLeg, Carrier, ChainCand, ChainHit, InPlan, LegConfig,
     LegOps, LegStats, OutPlan, PieceSpec, PoolLayout,
 };
 pub use hooks::{plan, Applied, EvictOut, Need, NeedWhy, Sink, Verdict};
-pub use policy::{AdmissionPolicy, EvictCandidate, EvictPolicy, Leg, LruPolicy, QueuePolicy};
+pub use policy::{
+    AdmissionPolicy, EvictCandidate, EvictPolicy, EvictPolicyKind, Leg, LrfuPolicy, LruPolicy,
+    QueuePolicy,
+};
 pub use rel::{EvictItem, EvictPlan, KvConfig, Protected, RecallHit, RecallMode, Rel, StoreReport};
+pub use select::{
+    assemble_view, f32_to_f16, score_blocks, select, BlockSet, IndexStats, MeanKEntry, MeanKIndex,
+    block_mass, coverage_curve, derope_halves_inplace, derope_pair, f16_to_f32_pub, MeanKCollector,
+    PosAction, PosFrame, QueryFace, ScoreMode, ScoreTuning, SelectBudget, ViewPlan,
+};
 pub use state::StateStore;
 pub use tier::{AssetKind, Tier, TierBudget, TierLedger, TierReport};

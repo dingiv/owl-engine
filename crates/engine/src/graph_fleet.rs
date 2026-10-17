@@ -341,14 +341,25 @@ impl<D: DeviceClient> GraphFleet<D> {
             let kv_slot = sc.input("kv_slot")?;
             let gdn_slot = sc.input("gdn_slot")?;
             let ts_buf = sc.input_opt("ts_buf")?;
+            // **B-3d 选择层视图**(`select_decode`;方案 A):页表与上下文长走
+            // **图输入槽** —— 每轮由引擎写"选中页 ++ 新生成尾部"。
+            // 为何必须走输入槽(而不是池里那块视图页表):图烘的是**指针**,
+            // 池块指针虽稳,但 xqa_pt 的教训是「页表内容必须每轮可换」——
+            // 输入槽正是为此存在(§7.6)。
+            let sel_pt = sc.input_opt("sel_pt")?;
+            let sel_len = sc.input_opt("sel_len")?;
+            let (bt_step, len_step) = match (sel_pt, sel_len) {
+                (Some(pt), Some(l)) => (pt, l),
+                _ => (bt_leaf.clone(), kv_len.clone()),
+            };
             let kvs_step: Vec<KvBuffers> = kv_caches
                 .iter()
                 .map(|(k, v)| KvBuffers {
                     k_cache: k.clone(),
                     v_cache: v.clone(),
                     slots: kv_slot.clone(),
-                    kv_lens: kv_len.clone(),
-                    block_tables: bt_leaf.clone(),
+                    kv_lens: len_step.clone(),
+                    block_tables: bt_step.clone(),
                 })
                 .collect();
             let gdns_step: Vec<GdnBuffers> = gdn_caches
@@ -456,6 +467,17 @@ impl<D: DeviceClient> GraphFleet<D> {
                         v.push(InputSlot::f32("xqa_pt", pool.nb).init(
                             (0..pool.nb).map(|i| f32::from_bits(i as u32)).collect(),
                         ));
+                    }
+                    if knobs.select_decode {
+                        // **B-3d 选择层视图**:`sel_pt` = 视图页链(nb 槽,尾补零),
+                        // `sel_len` = 视图内 token 数(≤ 池 token 容量)。
+                        // init = 恒等链 + 全量长(单会话且视图未启用时行为不变)
+                        // 编码 = **数值 f32**(与 `write_bt` 同源:block_tables 在本族
+                        // 声明为 F32 rank2;XQA 的位型编码是另一套,别混)
+                        v.push(InputSlot::f32("sel_pt", pool.nb).init(
+                            (0..pool.nb).map(|i| i as f32).collect(),
+                        ));
+                        v.push(InputSlot::f32("sel_len", 1).init(vec![1.0]));
                     }
                     if knobs.ts_probe {
                         v.push(InputSlot::f32("ts_buf", 4096));

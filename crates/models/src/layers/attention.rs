@@ -145,6 +145,29 @@ impl Attention {
         }
     }
 
+    /// **Q 输出槽写入**(B 轴 KVMem 选择层覆盖率探针;设计卷 §8.7)。
+    ///
+    /// 只把**已有**的节点(Q = qk-norm + RoPE 之后、注意力核之前的那一个)
+    /// 挂进 `ctx.q_sink` 的第 `fi_kvi` 格 —— **不建节点、不换核、不改写目标**:
+    /// 融合臂的 `q` 本就是核的返回节点、prefill 臂的 `q` 本就是 NormRope/
+    /// `Rope` 的返回,本槽只是多一个引用。`q_sink = None`(生产缺省)⇒
+    /// 立即返回:零节点、零开销、路径逐字不变。
+    ///
+    /// 约定(与探针 host 侧**同一份**,写入即定死):**post-RoPE**,形状
+    /// `[tokens, hq·hd]`(行内 `[head][dim]`)。RoPE = **rotate-half +
+    /// partial 直通**(核内 `rotary_half()` = `rotary_dim/2`;尾维不旋 ——
+    /// 与 `MeanKCollector::push_post_rope_halves` 的逆变换严格配对,
+    /// 约定错 = 静默错值 ⇒ 只能靠覆盖率门实证,见 §8.4)。
+    fn tap_q(&self, ctx: &ForwardCtx, q: &TensorOps) {
+        let Some(sink) = ctx.q_sink.as_ref() else { return };
+        let mut slots = sink.borrow_mut();
+        let i = ctx.fi_kvi;
+        if slots.len() <= i {
+            slots.resize_with(i + 1, || None);
+        }
+        slots[i] = Some(q.clone());
+    }
+
     /// 计算声明(decode;xs [T, hidden],T = ctx.tokens;C4 后回归 Module)。
     /// rope 表与 pos / KV 引用由 ctx 注入(rope 全局一份,表已是设备块);
     /// 缺任一动态依赖 → 毒值声明(eval 边界收割,与未装载槽同构)。
@@ -210,6 +233,8 @@ impl Attention {
                 .arg_i32(1)                                 // w_off = ×(1+w)
                 .aux(&[tokens, self.hq, self.hkv, self.hd, rope.rotary_half()])
                 .with_shape(Dtype::F16, vec![tokens, self.hq * self.hd]);
+            // B 轴探针:把融合核返回的 Q(post-RoPE)挂出(缺省槽空 = 零开销)
+            self.tap_q(ctx, &q);
             // 融合分派:v2 优先( scratch 在场 → 在线 softmax 分块 + LSE
             // 归并,wr = q 同款哑槽)否则 v1;均免 K0(cache 已由融合核写)
             if ctx.attn_v2.is_some() {
@@ -261,6 +286,8 @@ impl Attention {
             let k = rope.forward_k(&k, pos, tokens, self.hkv);
             (q, gate, k)
         };
+        // B 轴探针:挂出 post-RoPE Q(非融合/f32 锚链臂;槽空 = 零开销)
+        self.tap_q(ctx, &q);
 
         // naive decode attention(slot 直排;一线程一 (t, q_head));
         // 核名/输出 dtype 跟随 q 声明(F5 整模切换;KV cache f16)
@@ -1106,6 +1133,9 @@ impl Attention {
             let k = rope.forward_k(&k, pos, tokens, self.hkv);
             (q, gate, k)
         };
+        // B 轴探针:挂出 post-RoPE Q(prefill 的 T-token 块 = 覆盖率探针主供料;
+        // 槽空 = 零开销)
+        self.tap_q(ctx, &q);
 
         let dt = q.dtype;
         if dt == Dtype::F16 {
@@ -1293,6 +1323,82 @@ mod tests {
     use crate::testkit::{f32b, harvest, Src};
     use crate::tensor::Dtype;
 
+    /// **B 轴 Q 输出槽**(B-1 前置件;kvmem 卷 §8.7)声明级接线门。
+    ///
+    /// 验三件(都不需要 GPU —— 只关心“哪个节点被挂到哪一格”):
+    /// 1) 槽按 `fi_kvi` **落位**(不是 push 序)且只写自己那一格(别人的账不清);
+    /// 2) 槽里是 `[tokens, hq·hd]` 的非毒节点(dtype 跟随 q_raw);
+    /// 3) prefill 与 decode 两臂都挂(decode 融合臂的独立用例见 f16_tests)。
+    ///
+    /// 数值面(**post-RoPE / rotate-half 约定**)不在 CPU 面验:该约定只能
+    /// 由**覆盖率门**实证(§8.4:约定错 ⇒ 打分退化为噪声 ⇒ 覆盖率掉到随机
+    /// 水平);供料探针 = `OWL_COVERAGE_PROBE`(engine 侧)。
+    #[tokio::test]
+    async fn q_sink_taps_node_per_layer_slot() {
+        let (hq, hkv, hd, hidden) = (2usize, 1usize, 4usize, 3usize);
+        let mut face = owl_cpu::CpuFace::new();
+        let attn = Attention::new(hq, hkv, hd, hidden, 1e-6, QuantPlan::F16);
+        crate::interpreters::eval_load(&attn, &mut face, &six_slots(hq, hkv, hd, hidden), &Default::default())
+            .await
+            .expect("eval_load 六槽");
+        let rp = RopeT::new(64, hd, 2, 10_000.0).expect("rope new");
+        crate::interpreters::eval_load(&rp, &mut face, &rp.tables(), &Default::default())
+            .await
+            .expect("rope 表物化");
+        let t = 3usize;
+        let xs = TensorOps::from_host(Dtype::F32, vec![t, hidden], &f32b(&vec![0.25; t * hidden]));
+        let pos = TensorOps::from_host(Dtype::F32, vec![t], &f32b(&[1.0, 2.0, 3.0]));
+        let slots = TensorOps::from_host(Dtype::F32, vec![t], &f32b(&[0.0, 1.0, 2.0]));
+        let lens = TensorOps::from_host(Dtype::F32, vec![t], &f32b(&[1.0, 2.0, 3.0]));
+        let kv = KvBuffers {
+            k_cache: TensorOps::zeros(Dtype::F32, vec![4, hkv, hd]),
+            v_cache: TensorOps::zeros(Dtype::F32, vec![4, hkv, hd]),
+            slots: slots.clone(),
+            kv_lens: lens.clone(),
+            block_tables: TensorOps::zeros(Dtype::F32, vec![1]),
+        };
+
+        // 槽预置哨兵(第 3 格):写者只能动自己那一格,不得清别人的账
+        let sentinel = TensorOps::zeros(Dtype::F32, vec![1]);
+        let sink = std::cell::RefCell::new(vec![None, None, None, Some(sentinel)]);
+        let mut pctx = crate::module::ForwardCtx::attn_prefill(t, &pos, &kv, &rp, &slots, &lens)
+            .with_q_sink(&sink);
+        pctx.fi_kvi = 5; // 任意层号 ⇒ 落位由 fi_kvi 决定,不是 push 序
+        let out = attn.forward(&xs, &pctx);
+        assert!(!out.is_poisoned(), "prefill 声明不应有毒");
+        {
+            let s = sink.borrow();
+            assert_eq!(s.len(), 6, "槽应长到 fi_kvi+1");
+            for i in [0usize, 1, 2, 4] {
+                assert!(s[i].is_none(), "只写自己那格:槽 {i} 保持空");
+            }
+            let q = s[5].as_ref().expect("fi_kvi=5 应出 Q");
+            assert!(!q.is_poisoned(), "Q 节点不得是毒值");
+            assert_eq!(q.shape(), &[t, hq * hd], "Q = [tokens, hq·hd]");
+            assert_eq!(q.dtype, Dtype::F32, "dtype 跟随 q_raw(F32 锚链档)");
+            let kept = s[3].as_ref().expect("哨兵格不被动");
+            assert_eq!(kept.shape(), &[1], "哨兵格仍是原节点(写者没清别人的账)");
+        }
+
+        // decode 臂(f32 锚链)同律;fi_kvi 缺省 0 ⇒ 只长到 1 格
+        let dpos = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[9.0]));
+        let dslots = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0]));
+        let dkv = KvBuffers {
+            k_cache: TensorOps::zeros(Dtype::F32, vec![4, hkv, hd]),
+            v_cache: TensorOps::zeros(Dtype::F32, vec![4, hkv, hd]),
+            slots: dslots,
+            kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0])),
+            block_tables: TensorOps::zeros(Dtype::F32, vec![1]),
+        };
+        let sink2 = std::cell::RefCell::new(Vec::new());
+        let dctx = crate::module::ForwardCtx::decode(1, &dpos, &dkv, &rp).with_q_sink(&sink2);
+        let d1 = TensorOps::from_host(Dtype::F32, vec![1, hidden], &f32b(&vec![0.5; hidden]));
+        let out_d = attn.forward(&d1, &dctx);
+        assert!(!out_d.is_poisoned(), "decode 声明不应有毒");
+        assert_eq!(sink2.borrow().len(), 1, "fi_kvi=0 ⇒ 只长到 1 格");
+        assert!(sink2.borrow()[0].is_some(), "decode 臂也挂 Q");
+    }
+
     fn six_slots(hq: usize, hkv: usize, hd: usize, hidden: usize) -> Src {
         Src::from([
             ("q_proj".to_string(), (0..hq * hd * 2 * hidden).map(|i| (i as f32 * 0.011) - 0.3).collect()),
@@ -1349,7 +1455,6 @@ mod tests {
         // 毒值契约:未装载容器 → forward 声明立即带毒
         let attn2 = Attention::new(hq, hkv, hd, hidden, 1e-6, QuantPlan::F16);
         assert!(attn2.forward(&xs, &ctx).is_poisoned(), "未装载槽的声明应立即带毒");
-
         // 缺动态依赖的 ctx → 毒值(与未装载槽同构)
         let bare = crate::module::ForwardCtx::minimal(tokens);
         assert!(attn.forward(&xs, &bare).is_poisoned(), "minimal ctx 缺 pos/kv/rope,应毒");
@@ -2478,6 +2583,182 @@ mod owl_port_tests {
         }
         eprintln!("[gate_mul f16] max_diff = {max_diff:.5}");
         assert!(max_diff < 2e-2, "融合门乘容差 2e-2,得 {max_diff}");
+        gpu.close().await.expect("关机");
+    }
+}
+
+#[cfg(test)]
+mod view_alias_tests {
+    use super::*;
+    use crate::contract::DeviceClient as _;
+    use crate::module::AttnV2Scratch;
+    use crate::testkit::{f32b, gpu_client, gpu_enabled, harvest_f16};
+    use crate::tensor::Dtype;
+
+    /// **B-2 机制硬门:页表别名 ≡ 物理搬移**(2026-10-18;设计与施工卷 §8.11)。
+    ///
+    /// 命题:选中的历史块**不搬数据**,只写一张**视图页表**(选中页按时间序)
+    /// + `kv_lens = W`,注意力输出应与“把那几块物理拷到一起”**逐位相同**。
+    ///
+    /// 做法(不需要知道池内布局 —— 只比核在不同页表下的输出):
+    /// 1. 同一批 `(xs, pos)` 写**两处**:源页(2/3/5)与连续副本页(0/1/7);
+    /// 2. 三个页表同 `kv_lens=96`:
+    ///    - `A` = 源页 [2,3,5]  ⇒ **视图**(别名)
+    ///    - `B` = 副本页 [0,1,7] ⇒ **物理搬移**(内容相同)
+    ///    - `C` = 换序 [5,3,2]  ⇒ 对照组(必须不同)
+    ///    - `D` = 恒等 [0..7]  ⇒ “忘了传视图表”的兵棋(必与 A 不同)
+    /// 3. 断言:`A == B`(逐位)· `A ≠ C` · `A ≠ D` · 输出均有限。
+    ///
+    /// 为何是逐位:核读的是同一批字节、同一份 q、同一套参数 —— 差异只可能来自
+    /// 页表本身(即拍不到错=别名真的生效)。
+    #[tokio::test]
+    async fn gpu_paged_view_aliases_selected_pages() {
+        if !gpu_enabled() {
+            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            return;
+        }
+        let (hd, hq, hkv, hidden) = (128usize, 2usize, 1usize, 6usize);
+        let (page, nb) = (32usize, 8usize);
+        let halfb = |v: &[f32]| -> Vec<u8> {
+            v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect()
+        };
+        let mut src = std::collections::HashMap::new();
+        src.insert("q_proj".to_string(), (0..hq * hd * 2 * hidden).map(|i| ((i as f32 + 3.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
+        src.insert("k_proj".to_string(), (0..hkv * hd * hidden).map(|i| ((i as f32 + 4.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
+        src.insert("v_proj".to_string(), (0..hkv * hd * hidden).map(|i| ((i as f32 + 5.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
+        src.insert("o_proj".to_string(), (0..hidden * hq * hd).map(|i| ((i as f32 + 6.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
+        src.insert("q_norm".to_string(), (0..hd).map(|i| ((i as f32 + 7.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
+        src.insert("k_norm".to_string(), (0..hd).map(|i| ((i as f32 + 8.0) * 0.13).sin() * 0.5).collect::<Vec<f32>>());
+        let attn = Attention::new(hq, hkv, hd, hidden, 1e-6, QuantPlan::F16);
+        let mut gpu = gpu_client().await;
+        let lctx = crate::module::LoaderCtx {
+            dtype: Dtype::F16,
+            shard: 1,
+            device_repack: false,
+            verify: false,
+            debug_tap: false,
+        };
+        crate::interpreters::eval_load(&attn, &mut gpu, &src, &lctx).await.expect("attn 装载");
+        let rp = crate::layers::rope::Rope::new(512, hd, 32, 10_000.0).expect("rope");
+        crate::interpreters::eval_load(&rp, &mut gpu, &rp.tables(), &lctx).await.expect("rope 表");
+        // 池(kNHD 有效布局 = [块][token][头][dim];叶形状只承担字节量)
+        let x = 8usize;
+        let kc = crate::interpreters::eval_ops(
+            TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd / x, page, x]).step(), &mut gpu)
+            .await.expect("kc");
+        let vc = crate::interpreters::eval_ops(
+            TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd, page]).step(), &mut gpu)
+            .await.expect("vc");
+        let nparts = (nb * page).div_ceil(512).max(1);
+        let es = crate::interpreters::eval_ops(TensorOps::zeros(Dtype::F32, vec![1, hq * nparts]).step(), &mut gpu).await.expect("es");
+        let ml = crate::interpreters::eval_ops(TensorOps::zeros(Dtype::F32, vec![1, hq * nparts]).step(), &mut gpu).await.expect("ml");
+        let to = crate::interpreters::eval_ops(TensorOps::zeros(Dtype::F16, vec![hq * nparts * hd]).step(), &mut gpu).await.expect("to");
+        let scratch = AttnV2Scratch {
+            exp_sums: TensorOps::of_block(es.id, Dtype::F32, vec![1, hq * nparts]),
+            max_logits: TensorOps::of_block(ml.id, Dtype::F32, vec![1, hq * nparts]),
+            tmp_out: TensorOps::of_block(to.id, Dtype::F16, vec![hq * nparts * hd]),
+            nparts,
+            seqs: 1,
+        };
+        let kc_t = TensorOps::of_block(kc.id, Dtype::F16, vec![nb, hkv, hd / x, page, x]);
+        let vc_t = TensorOps::of_block(vc.id, Dtype::F16, vec![nb, hkv, hd, page]);
+        let kv_of = |slot: u32, bt: Vec<f32>| KvBuffers {
+            k_cache: kc_t.clone(),
+            v_cache: vc_t.clone(),
+            slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot as f32])),
+            kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0])),
+            block_tables: TensorOps::from_host(Dtype::F32, vec![1, nb], &f32b(&bt)),
+        };
+        // ── 写阶段 ──
+        // 内容区 A(视图页 3/5/7)与副本区 B(页 0/1/2)写**同一批** (xs,pos)
+        // ⇒ 两区 K/V 字节相同;之后再往 B 区写一批**不同的**(G2)⇒ 用于
+        // “视图会不会读未选中的页”的对照。
+        let mk_x = |i: usize| -> Vec<f32> {
+            (0..hidden).map(|j| ((i * 7 + j) as f32 * 0.31).sin() * 0.4).collect()
+        };
+        let ident: Vec<f32> = (0..nb).map(|i| i as f32).collect();
+        // 内容 = 3 个 token(pos 130/150/170)
+        let a_slots = [96u32, 160, 224]; // 页 3/5/7
+        let b_slots = [0u32, 32, 64]; // 页 0/1/2
+        for (i, pos) in [130.0f32, 150.0, 170.0].iter().enumerate() {
+            let xs = mk_x(i + 1);
+            let x_t = TensorOps::from_host(Dtype::F16, vec![1, hidden], &halfb(&xs));
+            let pos_t = TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[*pos]));
+            for slot in [a_slots[i], b_slots[i]] {
+                let kv = kv_of(slot, ident.clone());
+                let mut ctx = ForwardCtx::decode(1, &pos_t, &kv, &rp);
+                ctx.attn_v2 = Some(scratch.clone());
+                let decl = attn.forward(&x_t, &ctx);
+                let _ = crate::testkit::harvest_f16(&mut gpu, &decl).await;
+            }
+        }
+        // ── 读阶段:同一 query(槽 192 = 页 6,不在任何被读页表里)──
+        let xs_q = mk_x(9);
+        let x_q = TensorOps::from_host(Dtype::F16, vec![1, hidden], &halfb(&xs_q));
+        let pos_q = TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[200.0]));
+        let run = |bt: Vec<f32>, gpu: &mut _| {
+            let kv = KvBuffers {
+                k_cache: kc_t.clone(),
+                v_cache: vc_t.clone(),
+                slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[192.0])),
+                kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[96.0])),
+                block_tables: TensorOps::from_host(Dtype::F32, vec![1, nb], &f32b(&bt)),
+            };
+            let mut ctx = ForwardCtx::decode(1, &pos_q, &kv, &rp);
+            ctx.attn_v2 = Some(scratch.clone());
+            attn.forward(&x_q, &ctx)
+        };
+        let pad = |pages: [f32; 3]| -> Vec<f32> {
+            let mut v = vec![0f32; nb];
+            v[..3].copy_from_slice(&pages);
+            v
+        };
+        let view_tbl = pad([3.0, 5.0, 7.0]); // **视图**(别名选中页)
+        let copy_tbl = pad([0.0, 1.0, 2.0]); // 物理搬移(内容相同)
+        let dense_tbl = ident.clone(); // “忘了传视图表”的兵棋
+        let decl_a1 = run(view_tbl.clone(), &mut gpu);
+        let out_a1 = harvest_f16(&mut gpu, &decl_a1).await;
+        let decl_b1 = run(copy_tbl.clone(), &mut gpu);
+        let out_b1 = harvest_f16(&mut gpu, &decl_b1).await;
+        // 把副本区(B 页 0/1/2)**改写**成另一批内容 ⇒ 视图不得受影响
+        for (i, pos) in [11.0f32, 23.0, 7.0].iter().enumerate() {
+            let xs = mk_x(i + 41);
+            let x_t = TensorOps::from_host(Dtype::F16, vec![1, hidden], &halfb(&xs));
+            let pos_t = TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[*pos]));
+            let kv = kv_of(b_slots[i], ident.clone());
+            let mut ctx = ForwardCtx::decode(1, &pos_t, &kv, &rp);
+            ctx.attn_v2 = Some(scratch.clone());
+            let decl = attn.forward(&x_t, &ctx);
+            let _ = crate::testkit::harvest_f16(&mut gpu, &decl).await;
+        }
+        let decl_a2 = run(view_tbl, &mut gpu);
+        let out_a2 = harvest_f16(&mut gpu, &decl_a2).await;
+        let decl_b2 = run(copy_tbl, &mut gpu);
+        let out_b2 = harvest_f16(&mut gpu, &decl_b2).await;
+        // 恒等表在**改写后**跑(此时它读到的内容与视图不同 ⇒ 必可辨);
+        // 改写前跑会与视图同内容 —— 那是自己跟自己比(曾踩)
+        let decl_d = run(dense_tbl, &mut gpu);
+        let out_d = harvest_f16(&mut gpu, &decl_d).await;
+        let diff = |a: &[f32], b: &[f32]| -> f32 {
+            a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max)
+        };
+        eprintln!(
+            "[view-alias] |A|={:.4} A1−B1={:.6} **A1−A2={:.6}** B1−B2={:.6} A1−D={:.6}",
+            out_a1.iter().fold(0f32, |m, v| m.max(v.abs())),
+            diff(&out_a1, &out_b1),
+            diff(&out_a1, &out_a2),
+            diff(&out_b1, &out_b2),
+            diff(&out_a1, &out_d)
+        );
+        assert!(out_a1.iter().all(|v| v.is_finite()), "视图输出必须有限: {out_a1:?}");
+        // ① 别名 ≡ 搬移(内容集一致 ⇒ 同结果;单 query 的注意力对页序置换不敏感)
+        assert_eq!(diff(&out_a1, &out_b1), 0.0, "页表别名必须 ≡ 物理搬移(逐位)");
+        // ② **核心门**:未选中的页(0/1/2)被改写 ⇒ 视图输出**逐位不变**
+        assert_eq!(diff(&out_a1, &out_a2), 0.0, "视图读到了未选中的页(页表没生效?)");
+        // ③ 鉴别力对照:同一批页被 rewrite,直读它们的表**必须**变
+        assert!(diff(&out_b1, &out_b2) > 1e-3, "对照组无鉴别力:改写没被任何表看见");
+        // ④ 视图表 vs 恒等表(改写后):未传视图 ⇒ 读到另一批内容 ⇒ 必可辨
+        assert!(diff(&out_a1, &out_d) > 1e-3, "恒等表与视图表不可辨 —— 防“忘了传视图”");
         gpu.close().await.expect("关机");
     }
 }

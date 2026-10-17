@@ -23,6 +23,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // **S3-3b:待回灌块**(内容在宿主层)在段边界搬到设备,并把新槽写回块表 ——
         // 必须在 `write_bt` 之前(否则写进设备的是占位坏槽)。搬运实现全在 store。
         if !b.pending_loads.is_empty() {
+            let t_stage = std::time::Instant::now();
             let leg = &mut self.bank.rel.leg;
             let face = self.graphs.session.face_mut();
             // §21:搬运由 engine 编排(取计划 → face.swap → 回执 → 记账);
@@ -47,6 +48,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             };
             let table = owl_store::reclaim_slot_table(conn)?;
             let slots = owl_store::commit_onload(leg, &cs, &new_slots, table)?;
+            // **B-3e 实测账**:本条命令的块数/字节/墙钟(含发射 + 回执)
+            self.stage.blocks += cs.len();
+            self.stage.bytes += cs.len() * self.pool.block_bytes();
+            self.stage.nanos += t_stage.elapsed().as_nanos() as u64;
+            self.stage.from_prefill += cs.len();
             let s = self.bank.sessions.get_mut(b.session_id).ok_or_else(|| {
                 owl_iface::contract::ModelError::Msg(format!("回灌:会话 {} 不在账", b.session_id))
             })?;
@@ -89,6 +95,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let new_fed = base + chunk_ids.len();
         if self.pool.paged && new_fed.is_multiple_of(self.pool.page) {
             self.capture_gdn_snap(sid, new_fed).await?;
+            // ── B 轴覆盖率探针(Q-2 第三段)──
+            // 必须**晚于**边界事件:索引/快照刚登记完,候选块才齐(§8.4)。
+            if self.cfg.knobs.coverage_probe {
+                self.coverage_analyze(sid, new_fed).await?;
+            }
         }
         self.turns.active.as_mut().expect("活跃").fed += chunk_ids.len();
         if !is_last {
@@ -120,8 +131,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let prof = self.probes.step_profile;
         let t0 = prof.then(std::time::Instant::now);
         let t_step = std::time::Instant::now();
-        // E2b:块链跨页增长 → 重写持久块表(图烘焙 bt 指针)
-        if grew {
+        // E2b:块链跨页增长 → 重写持久块表(图烘焙 bt 指针)。
+        // **B-3e-2**:视图在场时**不写**(本步页表走 `sel_pt` 输入槽;而链上可能有
+        // 洞 = 占位符,写进设备块表就是把 u32::MAX 当页号 —— 守卫会响亮拒且白跑)。
+        if grew && self.sel_view.is_none() {
             self.write_bt(sid).await?;
         }
         // XQA 裸 decode 臂(2026-10-13 ②):`xqa_seq` = kv_len 的 **u32 位型**
@@ -177,6 +190,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     vec![f32::from_bits((ctx_total - (nb_used - 1) * page) as u32)],
                 ));
             }
+        }
+        // **B-3d 选择层视图**:`select_decode` 档 ⇒ 页表与上下文长走视图输入槽
+        // (视图 = 选中页 ++ 新生成尾部;无视图态 ⇒ 写全量链,与不开时等价)
+        if self.graphs.session.has_input("sel_pt") {
+            let (pt, len) = self.select_view_step(sid, pos);
+            step_slots.push(("sel_pt", pt));
+            step_slots.push(("sel_len", vec![len as f32]));
         }
         let step_refs: Vec<(&str, &[f32])> =
             step_slots.iter().map(|(n, v)| (*n, v.as_slice())).collect();

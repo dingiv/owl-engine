@@ -64,6 +64,29 @@ impl ChunkTables {
         fi_face: bool,
         xqa_face: bool,
     ) -> Self {
+        Self::build_view(ids, base, t, paged, page, bt_chain, gdn_slot_v, fi_face, xqa_face, None)
+    }
+
+    /// 同 [`Self::build`],多一个**过去视图**(B-3e-2 第 3 项)。
+    ///
+    /// `past = Some((pages, tokens))` ⇒ 本 chunk 的"过去"由**子集页链**表达
+    /// (选中块;`tokens` = 子集 token 数),`context_lens[t'] = tokens + (p+1−recall)`。
+    /// 语义 = 稀疏注意力:被踢出工作集的块**不参与**本 chunk 的过去。
+    ///
+    /// `slots` **不变**(新 token 仍写自己会话链的槽)⇒ 与下沉/回灌正交。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_view(
+        ids: &[u32],
+        base: usize,
+        t: usize,
+        paged: bool,
+        page: usize,
+        bt_chain: &[u32],
+        gdn_slot_v: usize,
+        fi_face: bool,
+        xqa_face: bool,
+        past: Option<(&[u32], usize)>,
+    ) -> Self {
         let seq = |start: usize, n: usize| -> Vec<f32> {
             (0..n).map(|i| (start + i) as f32).collect()
         };
@@ -77,17 +100,32 @@ impl ChunkTables {
         } else {
             seq(base, t)
         };
-        let fi = fi_face.then(|| fi_tables(base, t, bt_chain, page));
+        // **过去视图**:表 = 子集页链;`lens[t'] = 子集 token + (base + t' + 1 − past_base)`
+        let (tbl, lens, base_for_len) = match past {
+            Some((pages, tokens)) if paged => {
+                let past_base = base + t; // 占位:下面按行重算
+                let _ = past_base;
+                (pages.to_vec(), Vec::new(), tokens)
+            }
+            _ => (bt_chain.to_vec(), seq(base + 1, t), base),
+        };
+        let lens = if lens.is_empty() {
+            // 子集档:每行 = 子集 token + 本 chunk 已见行数(= 本 chunk 位置偏移)
+            (0..t).map(|i| (base_for_len + i + 1) as f32).collect()
+        } else {
+            lens
+        };
+        let fi = fi_face.then(|| fi_tables_view(base, t, &tbl, page));
         Self {
             ids: ids.iter().map(|v| *v as f32).collect(),
             pos: seq(base, t),
             slots,
-            lens: seq(base + 1, t),
+            lens,
             gdn_slot: gdn_slot_v as f32,
             seq_cu: vec![0.0, t as f32],
             fi,
             xqa: xqa_face.then(|| XqaTables {
-                page_table: bt_chain.to_vec(),
+                page_table: tbl,
                 seq_len: (base + t) as u32,
                 mask: causal_mask_words(t),
             }),
@@ -162,6 +200,23 @@ fn fi_tables(base: usize, t: usize, bt_chain: &[u32], page: usize) -> FiTables {
     FiTables {
         q_cu: vec![0, t as u32],
         indices: bt_chain[..nb_used].to_vec(),
+        indptr: vec![0, nb_used as u32],
+        last_len: vec![(ctx_total - (nb_used - 1) * page) as u32],
+        nb_used,
+    }
+}
+
+/// FI 表四件套(**子集档**;B-3e-2 第 3 项):页链 = 传入的 `tbl`(可能 = 子集),
+/// `last_len` = 末页在本**视图**内的有效行数(= 视图 token 数 − (nb_used−1)·page)。
+fn fi_tables_view(base: usize, t: usize, tbl: &[u32], page: usize) -> FiTables {
+    // 视图内 token 数:本 chunk 之前覆盖的页 × page 中**属于视图的部分**
+    // —— 由调用方把 base 换成"视图起点等效偏移"后即 ctx_total 口径自洽
+    let ctx_total = base + t;
+    let nb = tbl.len();
+    let nb_used = ctx_total.div_ceil(page).min(nb).max(1);
+    FiTables {
+        q_cu: vec![0, t as u32],
+        indices: tbl[..nb_used].to_vec(),
         indptr: vec![0, nb_used as u32],
         last_len: vec![(ctx_total - (nb_used - 1) * page) as u32],
         nb_used,
@@ -253,13 +308,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if self.cfg.knobs.pf_bisect
             || self.cfg.knobs.pf_stages.is_some()
             || self.probes.dflash_probe
+            || self.cfg.knobs.coverage_probe
         {
             mcnt("prefill.bucket.bypass.diag", 1);
             if !BUCKET_BYPASS_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 owl_shared::log_warn!(
                     "prefill-graph",
-                    "诊断档在场(pf_bisect / pf_stages / dflash_probe)⇒ prefill 桶**全部让位 eager**\
-                     (图形诊断口径只在 eager 路;要图就关诊断)"
+                    "诊断档在场(pf_bisect / pf_stages / dflash_probe / coverage_probe)⇒ prefill 桶**全部让位 eager**\
+                     (诊断口径只在 eager 路;要图就关诊断)"
                 );
             }
             return Ok(None);
@@ -494,7 +550,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
         }
         // ── host 侧输入表**唯一取值点**(见 [`ChunkTables`])──
-        let tb = ChunkTables::build(
+        // **B-3e-2 第 3 项**:部分驻留档下,本 chunk 的"过去" = **子集页链**
+        // (选中块 ++ 新生成尾部)—— 因为被踢出工作集的块已沉到宿主,会话链上
+        // 是**占位符**,直接读整条链就是静默错页。
+        let past_view = self.past_view_of(base, t);
+        let tb = ChunkTables::build_view(
             ids,
             base,
             t,
@@ -504,7 +564,24 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             gdn_slot_v,
             self.pool.fi_face,
             self.env.attn.xqa_prefill,
+            past_view.as_ref().map(|(pages, tokens)| (pages.as_slice(), *tokens)),
         );
+        // **B-3e-2 第 3 项**:子集档 ⇒ 把本 chunk 的"过去表"写进池里的视图块,
+        // 并把它当作 `block_tables`(eager prefill 无图,块叶直接可用)。
+        let bt_leaf = match past_view.as_ref() {
+            Some((pages, _)) => {
+                {
+                    let face = self.graphs.session.face_mut();
+                    self.pool.write_select_view(face, pages).await?;
+                }
+                self.pool.select_view_leaf().ok_or_else(|| {
+                    owl_iface::contract::ModelError::Msg(
+                        "部分驻留档缺视图表槽(PoolPlan::select_view 未开?)".into(),
+                    )
+                })?
+            }
+            None => self.pool.bt_leaf_flat(),
+        };
         let slots_leaf = TensorOps::from_host(Dtype::F32, vec![t], &f32b(&tb.slots));
         let lens_leaf = TensorOps::from_host(Dtype::F32, vec![t], &f32b(&tb.lens));
         let gdn_slot_leaf = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[tb.gdn_slot]));
@@ -516,7 +593,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 v_cache: v.clone(),
                 slots: slots_leaf.clone(),
                 kv_lens: lens_leaf.clone(),
-                block_tables: self.pool.bt_leaf_flat(),
+                block_tables: bt_leaf.clone(),
             })
             .collect();
         let gdn_caches = self.pool.gdn_caches();
@@ -595,6 +672,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 16µs)⇒ ~170ms/chunk 白烧。注入面本就存在(verify 图先例 E5-M4:
         // `ctx.seq_cu`),eager prefill 只是没接。
         let seq_cu = TensorOps::from_host(Dtype::F32, vec![2], &f32b(&tb.seq_cu));
+        // ── B 轴覆盖率探针(Q-2 第一段):Q 槽接入 ──
+        // 只在**块边界 chunk**采(`(base+t) % page == 0`):分析期索引账才完整
+        // (§8.4)。诊断档;缺省 `coverage_probe = false` ⇒ 槽恒 None、零开销。
+        let cov_sink: Option<crate::exec::coverage::QSink> = (self.cfg.knobs.coverage_probe
+            && self.pool.paged
+            && (base + t).is_multiple_of(self.pool.page))
+        .then(|| crate::exec::coverage::QSink::new(Vec::new()));
         // ── XQA prefill 表件(`dispatch.xqa_prefill`;缺省关)──
         // 三张 U32 位型表(页链/整请求长/因果位掩码)与 FI 四件套同路:
         // **预物化**(eval_ops 往返同步)而非 from_host 叶子 —— Htod 在 H2D
@@ -697,6 +781,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         };
         ctx.gdn_tables = gdn_tables;
         ctx.xqa = xqa_pf;
+        // ── B 轴覆盖率探针(Q-2 第一段):Q 槽接入(ctx 建完即挂)──
+        if let Some(s) = cov_sink.as_ref() {
+            ctx.q_sink = Some(s);
+        }
         ctx.env = self.env;
         ctx.trace_gate = self.cfg.knobs.probes.trace_gate;
         let _vocab = self.model.vocab_size();
@@ -846,10 +934,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 (self.model.last_hidden(&ids_t, &ctx), None)
             };
             let d_model = hidden_full.shape()[1];
-            let (hfb, arena1) = {
-                let face = self.graphs.session.face_mut();
-                eval_ops_scoped_env(hidden_full.step(), face, self.env).await?
-            };
+            let (hfb, arena1, cov_q) = self
+                .eval_root_and_q(&hidden_full, cov_sink.as_ref())
+                .await?;
+            // Q 回读(探针档;设备块当场 free;分析在块边界事件后做)
+            if let Some(qs) = cov_q {
+                self.coverage_take_q(qs, base, t).await?;
+            }
             // E5 崩坏排查·轻探针(OWL_PF_FIN_CHECK;bisect 900 dtoh 强掩蔽
             // 0/10,本探针仅 1 dtoh —— 近零扰判决:fin 翻 = 前向内部腐坏;
             // fin 绿而 pf.last 翻 = lm_head/argmax 面腐坏)
@@ -1011,10 +1102,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             } else {
                 (self.model.last_hidden(&ids_t, &ctx), None)
             };
-            let (b, arena) = {
-                let face = self.graphs.session.face_mut();
-                eval_ops_scoped_env(tree.step(), face, self.env).await?
-            };
+            let (b, arena, cov_q) = self.eval_root_and_q(&tree, cov_sink.as_ref()).await?;
+            if let Some(qs) = cov_q {
+                self.coverage_take_q(qs, base, t).await?;
+            }
             {
                 let face = self.graphs.session.face_mut();
                 let esz = if d.dtype == Dtype::F16 { 2 } else { 4 };

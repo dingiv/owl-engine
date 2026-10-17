@@ -18,7 +18,7 @@ use crate::running::RunningEngine;
 
 /// 待回灌块的**占位槽号**(只活在 schedule → execute_begin 之间;执行器在
 /// `write_bt` 之前必须把全部占位替换成真槽 —— 否则写进设备的就是坏块表)。
-pub(crate) const PENDING_LOAD_PLACEHOLDER: u32 = u32::MAX;
+pub(crate) const PENDING_LOAD_PLACEHOLDER: u32 = owl_store::HOST_PLACEHOLDER;
 
 type Result<T> = std::result::Result<T, ModelError>;
 

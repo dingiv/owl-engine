@@ -164,6 +164,11 @@ pub(crate) struct PoolPlan {
     pub prefill_dump_page: bool,
     /// reset_gdn 后 GDN rec 格画像(诊断面;原 OWL_GDN_DBG)
     pub gdn_dbg: bool,
+    /// **选择层视图块表槽**(B-2;`OWL_COVERAGE_PROBE=1` = 召回点探针档)。
+    /// true ⇒ 主池多分配一个 `[1, nb]` 的视图页表块(内容 = **选中块**的物理页
+    /// 按时间序;每召回点重写),与全量块表 `bt` **并存**(两者都要在场:
+    /// 视图给选择层用,全量给 dense 对照与未选中块的回灌)。
+    pub select_view: bool,
 }
 
 pub(crate) struct StatePool {
@@ -185,6 +190,9 @@ pub(crate) struct StatePool {
     snaps: GdnSnapPool,
     snap_tick: u64,
     bt: Bytes,
+    /// **选择层视图页表**(B-2;`None` = 本档无视图面)。与 `bt` 并存:
+    /// `bt` = 会话真链(dense),本块 = 选中块的物理页按**时间序**。
+    bt_view: Option<Bytes>,
     /// v2 分页 decode scratch(E-decode 2026-10-04;paged 时恒分配,
     /// None = legacy/无页策略;引擎注入 ctx → 层走 v2 + LSE 归并)
     pub(crate) attn_v2: Option<owl_models::module::AttnV2Scratch>,
@@ -519,6 +527,13 @@ impl StatePool {
         } else {
             eval_ops(TensorOps::zeros(Dtype::F32, vec![1]).step(), face).await?
         };
+        // **B-2 选择层视图块表槽**:与 bt 同族(持久块 ⇒ 将来图输入槽/烘焙
+        // 指针稳定);内容由召回点每步重写(§8.11)
+        let bt_view = if paged && plan.select_view {
+            Some(eval_ops(TensorOps::zeros(Dtype::F32, vec![1, nb]).step(), face).await?)
+        } else {
+            None
+        };
         // GDN 序列表持久槽(P-6b):有 GDN 层就建(尺寸 ~KB 级)
         let gdn_tables = if n_gdn > 0 {
             let nt_cap = seq_tokens.div_ceil(owl_models::kernel::GDN_BT).max(1);
@@ -700,7 +715,7 @@ impl StatePool {
             None
         };
         Ok(StatePool { max_active_turns, dump_all, gdn_dbg, kvs, fi_face, fi_tables, gdn_tables, verify_attn_v2, xqa,
-            kv_fp8, dflash_fp8, gdns, snaps, snap_tick: 0, bt, bt_mtp, spec_snap, mtp_kvs, dflash_kvs, attn_v2, page, nb, nb_kv, dump_page, paged, x, dims })
+            kv_fp8, dflash_fp8, gdns, snaps, snap_tick: 0, bt, bt_view, bt_mtp, spec_snap, mtp_kvs, dflash_kvs, attn_v2, page, nb, nb_kv, dump_page, paged, x, dims })
     }
 
     /// MTP 链块表叶子(propose 图烘焙;None = 未启用)
@@ -1386,11 +1401,65 @@ impl StatePool {
         face: &mut D,
         table: &[u32],
     ) -> Result<()> {
+        // **占位符守卫**(B-3e-2):表里含宿主占位符(u32::MAX)⇒ 写进设备 bt 块
+        // 就是把 u32::MAX 当页号喂核 = ILLEGAL_ADDRESS(27B Stage2 实测同类)。
+        // 部分驻留下来的洞**只能**由视图页表表达 ⇒ 这里响亮拒(调用方应先在
+        // 段边界回灌,或改用视图路径)。
+        if let Some(i) = table.iter().position(|b| owl_store::is_host_placeholder(*b)) {
+            return Err(ModelError::Msg(format!(
+                "write_bt:块表第 {i} 项是宿主占位符(部分驻留的链洞)—— 不得写设备块表;                 请先回灌(段边界)或走视图页表"
+            )));
+        }
         let mut v = vec![0f32; self.nb];
         for (i, b) in table.iter().enumerate() {
             v[i] = *b as f32;
         }
         face.write_block_f32(&self.bt, 0, &v).await
+    }
+
+    // ── B-2 选择层视图面(§8.11)──────────────────────────────────────
+
+    /// 视图页表槽是否在场(`OWL_COVERAGE_PROBE` 档才分配)。
+    pub(crate) fn has_select_view(&self) -> bool {
+        self.bt_view.is_some()
+    }
+
+    /// 视图页表容量(块数;= 池管理面页数 `nb`)。
+    pub(crate) fn select_view_capacity(&self) -> usize {
+        self.nb
+    }
+
+    /// 写视图页表(**选中块按时间序**的物理页;零填充到 `nb`)。
+    ///
+    /// 超容量 = **响亮拒**(调用方必须先按预算裁到 `nb` 以内 —— 静默截断 =
+    /// 静默漏块,选择层的账就假了)。
+    pub(crate) async fn write_select_view<D: DeviceClient>(
+        &self,
+        face: &mut D,
+        pages: &[u32],
+    ) -> Result<()> {
+        let b = self.bt_view.as_ref().ok_or_else(|| {
+            ModelError::Msg("选择层视图块表未分配(OWL_COVERAGE_PROBE 未开?)".into())
+        })?;
+        if pages.len() > self.nb {
+            return Err(ModelError::Msg(format!(
+                "视图页表超容量:{} 页 > 槽容量 {}(预算须先裁)",
+                pages.len(),
+                self.nb
+            )));
+        }
+        let mut v = vec![0f32; self.nb];
+        for (i, p) in pages.iter().enumerate() {
+            v[i] = *p as f32;
+        }
+        face.write_block_f32(b, 0, &v).await
+    }
+
+    /// 视图页表叶子(`[1, nb]` f32;喂 `KvBuffers::block_tables`)。
+    pub(crate) fn select_view_leaf(&self) -> Option<TensorOps> {
+        self.bt_view
+            .as_ref()
+            .map(|b| TensorOps::of_block(b.id, Dtype::F32, vec![1, self.nb]))
     }
 }
 

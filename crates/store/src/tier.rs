@@ -34,6 +34,8 @@ pub enum AssetKind {
     Row,
     /// 会话元数据(索引/账目;µs 级,不参与驱逐)。
     Meta,
+    /// **选择层检索索引**(B 轴:Mean-K;host 驻留,可驱逐/可下沉 —— 论文同款)。
+    Index,
 }
 
 impl AssetKind {

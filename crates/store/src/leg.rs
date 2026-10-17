@@ -476,6 +476,15 @@ impl BlockLeg {
     }
 
     /// 归还会话块表。
+    /// **增量链登记**(B-3e-2 第 2b 项;见 [`KvStore::register_chain_inc`])。
+    pub fn register_chain_inc(
+        &mut self,
+        parent0: ChainHash,
+        blocks: &[(&[u32], u32)],
+    ) -> StoreResult<crate::kv::CacheUpdate> {
+        self.kv.register_chain_inc(parent0, blocks)
+    }
+
     pub fn release_table(&mut self, table: &mut Vec<u32>) -> StoreResult<()> {
         self.kv.release_table(table)
     }
@@ -483,6 +492,17 @@ impl BlockLeg {
     /// 引用加一(前缀复用)。
     pub fn incref(&mut self, slot: u32) -> StoreResult<()> {
         self.kv.incref(slot)
+    }
+
+    /// 槽引用数(诊断/前置判定:下沉前必须知道"是不是只有会话持着")。
+    pub fn slot_refs(&self, slot: u32) -> u32 {
+        self.kv.slot_refs(slot)
+    }
+
+    /// **引用减一**(B-3e-2 第 2 项:会话放手一块 —— 下沉前的必经步)。
+    /// 归零 = 槽回自由队列(**不要**在这里放给未持有者:账由 `KvStore` 判)。
+    pub fn decref(&mut self, slot: u32) -> StoreResult<()> {
+        self.kv.decref(slot)
     }
 
     /// 驱逐候选(叶 + 未保护;策略由调用方出序)。
@@ -582,6 +602,101 @@ pub struct OutPlan {
     pub pieces: Vec<SwapPiece>,
     /// 宿主侧槽台(engine 原箱交给 `face.swap`,回执后交还 [`commit_offload`])。
     pub table: SlotTable,
+}
+
+/// **逐块下沉计划**(B-3e-2;2026-10-18):给定"调用方已决定沉下去"的块清单,
+/// **逐块**出票 —— 与链级 [`plan_offload`] 的两处粗化正相反:
+///
+/// | 维度 | 链级 `plan_offload(tail)` | 逐块 `plan_offload_blocks(chains)` |
+/// |---|---|---|
+/// | 单位 | **整条链**(root→tail,all-or-nothing) | **逐块**(给了哪些就办哪些) |
+/// | 活跃引用 | **一块活跃 ⇒ 整链否决**(`Busy`) | 活跃块**跳过并记因**,不连坐别的块 |
+///
+/// 为什么要它:活跃会话的链**部分宿主驻留**是单卡长 ctx(G1 262k)的前置 ——
+/// 工作集(W)留设备、被选择层踢出的块沉走;链级票做不到这件事。
+///
+/// **前置(调用方职责)**:要让某块可沉,必须先**释放会话对它的引用**
+/// (`decref`;否则 `refs != 1`,该块会被记成 [`SkipWhy::LiveRefs`] 跳过)。
+/// 这正是"占位 + 回灌"流程里会话表改写成占位符那一步在账上的对应动作。
+///
+/// 纯 host(算片 + 借台);无票块**不影响**有票块;全无票 ⇒ `blocks` 为空、
+/// 不借宿主台(调用方零副作用即可早退)。
+pub fn plan_offload_blocks(
+    leg: &mut BlockLeg,
+    chains: &[ChainHash],
+) -> StoreResult<BlockOutPlan> {
+    leg.pieces()?; // 未注册布局 = 先拒
+    let mut blocks: Vec<(ChainHash, u32)> = Vec::new();
+    let mut skipped: Vec<(ChainHash, SkipWhy)> = Vec::new();
+    for c in chains {
+        match leg.kv.locate(*c) {
+            None => skipped.push((*c, SkipWhy::Unknown)),
+            Some(crate::tier::Tier::Host) => skipped.push((*c, SkipWhy::AlreadyHost)),
+            Some(crate::tier::Tier::Disk) => skipped.push((*c, SkipWhy::Unknown)), // S6 未接线
+            Some(crate::tier::Tier::Gpu) => {
+                // 逐块判活跃(链级票在这一步是"整链否决")
+                match leg.kv.bound_slot(*c) {
+                    Ok(slot) if leg.kv.slot_refs(slot) == 1 => blocks.push((*c, slot)),
+                    Ok(_) => skipped.push((*c, SkipWhy::LiveRefs)),
+                    Err(_) => skipped.push((*c, SkipWhy::Unknown)),
+                }
+            }
+        }
+    }
+    if blocks.is_empty() {
+        return Ok(BlockOutPlan { blocks, pieces: Vec::new(), table: SlotTable::new(Vec::new()), skipped });
+    }
+    let bufs = leg.host.lend_slots(blocks.len())?; // 预算在借台处查(超界零副作用)
+    let pieces = out_pieces(leg, &blocks)?;
+    Ok(BlockOutPlan { blocks, pieces, table: SlotTable::new(bufs), skipped })
+}
+
+/// **宿主占位符**(B-3e-2):会话块表里表示"该块内容在宿主层、无设备槽"的哨兵。
+///
+/// 为什么需要它:部分驻留档下链上会**出洞**(块被下沉),而会话块表是 `Vec<u32>`
+/// 槽号数组 —— 洞必须有明确编码才会被响亮拒(而不是当页号 0 静默读错页)。
+/// 引擎侧同名常量 = `engine::scheduler::PENDING_LOAD_PLACEHOLDER`(同值 `u32::MAX`;
+/// 两侧同源,store 侧只提供判定函数,不依赖 engine)。
+pub const HOST_PLACEHOLDER: u32 = u32::MAX;
+
+/// 是不是宿主占位符。
+#[inline]
+pub fn is_host_placeholder(slot: u32) -> bool {
+    slot == HOST_PLACEHOLDER
+}
+
+/// 逐块下沉计划(见 [`plan_offload_blocks`])。
+pub struct BlockOutPlan {
+    /// 有票的块(身份, 原设备槽) —— 交给 [`commit_offload`] / [`abort_offload`]。
+    pub blocks: Vec<(ChainHash, u32)>,
+    /// 设备 → 连接器的片(每块 × 每层片段)。
+    pub pieces: Vec<SwapPiece>,
+    /// 宿主侧槽台(engine 原箱交给 `face.swap`)。
+    pub table: SlotTable,
+    /// **无票块 + 原因**(报告面:**不**否决有票块 —— 这正是本函数存在的理由)。
+    pub skipped: Vec<(ChainHash, SkipWhy)>,
+}
+
+impl BlockOutPlan {
+    /// 有票块数。
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
+    /// 一块都没票(调用方可零副作用早退)。
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+}
+
+/// 逐块下沉里**跳过**一块的原因(报告面;由账直接判,不靠调用方猜)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkipWhy {
+    /// 不在缓存树里(传错身份 / 已被驱逐)。
+    Unknown,
+    /// 内容已在宿主层(重复请求;幂等跳过)。
+    AlreadyHost,
+    /// 设备块引用 > 1(仍有会话表持有)⇒ 调用方忘了先 `decref`。
+    LiveRefs,
 }
 
 /// **回灌计划**(纯 host):宿主内容取出 + 设备槽分配 + 组片。

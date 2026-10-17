@@ -111,6 +111,7 @@ async fn e2e_body() {
         eprintln!("[e2e] 无卡档(OWL_CPU_MOCK):只跑 CPU mock 场景 —— store 演示台三门口 + S2 状态腿");
         run!(cpu_mock_offload_probe);
         run!(cpu_mock_state_leg_probe);
+        run!(cpu_mock_index_probe);
         eprintln!("[e2e] 无卡档完成,用时 {:.1}s", std::time::Instant::now().elapsed().as_secs_f32());
         return;
     }
@@ -153,6 +154,18 @@ async fn e2e_body() {
     // ── S2 状态腿三层化(自装载;按需开:`OWL_STATE_LEG_PROBE=1`) ──
     run!(gpu_08b_state_leg_probe);
 
+    // ── B-3e stage-in 回灌实测(自装载;按需开:`OWL_B3E_PROBE=1`) ──
+    run!(gpu_08b_stage_in_probe);
+
+    // ── B-0 选择层索引采集(自装载;按需开:`OWL_INDEX_PROBE=1`) ──
+    run!(gpu_08b_index_probe);
+
+    // ── B 轴覆盖率探针(Q-2;按需开:`OWL_COVERAGE_PROBE=1` + `OWL_INDEX_PROBE=1`) ──
+    run!(gpu_08b_coverage_probe);
+
+    // ── B-3d 选择层接进 decode(按需开:另加 `OWL_SELECT_DECODE=1`) ──
+    run!(gpu_08b_select_decode_probe);
+
     // ── piecewise 段驱动件(不装模型;纯 GraphPlan 面) ──
     run!(gpu_piecewise_segments);
 
@@ -180,6 +193,9 @@ async fn e2e_body() {
     } else {
         eprintln!("[e2e] 27B 默认档 skip(无目录或被 OWL_E2E_ONLY 排除)");
     }
+
+    // ── B-5 Stage 2:27B 单卡 + 选择层 + 部分驻留(自装载;按需开 `OWL_SELECT_27B=1`)──
+    run!(gpu_27b_select_probe);
 
     // ── 27B 其余档:boot 期配置各不相同(草稿类型/池/fp8/slab),各自装载 ──
     run!(gpu_27b_raw_completion_diag);   // greedy + Dumb 草稿 + slab

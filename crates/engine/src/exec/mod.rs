@@ -22,6 +22,7 @@ pub mod spec;
 pub mod draft;
 pub mod prefill_chunk;
 pub mod turn_end;
+pub mod coverage;
 
 pub(crate) fn spec_degrade_transition(
     streak: usize,

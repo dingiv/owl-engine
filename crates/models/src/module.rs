@@ -187,6 +187,20 @@ pub struct ForwardCtx<'a> {
     pub attn_break: Option<std::rc::Rc<std::cell::RefCell<Vec<crate::interpreters::BreakDecl>>>>,
     /// **FI 断点面**(piecewise verify;None = 本树不换 FI 臂)
     pub attn_fi: Option<AttnFiBreak>,
+    /// **Q 输出槽**(B 轴 KVMem 选择层覆盖率探针;`Some` = 逐全注意力层把
+    /// **post-RoPE** 的 Q 节点写进槽 `fi_kvi`)。形态同 `attn_break` ——
+    /// 调用方建、调用方读,层只写。
+    ///
+    /// - Q **本就是声明树里的节点**(decode 融合臂的 `q_out` 返回的即该调用
+    ///   节点;prefill 臂 = NormRope/Rope 的返回),故本槽 = 「已有节点多挂一个
+    ///   引用」,**不产生新节点、不改核的写目标**;
+    /// - 缺省 `None` ⇒ 生产路径逐字不变(臂内一次 `is_some()` 判即返)。
+    ///
+    /// 用途:探针 `dtoh` 该槽 + host 逆 RoPE(rotate-half = 核内约定)
+    /// ⇒ 去 RoPE 的 `q̃` 喂 `score_blocks`;post-RoPE 的 `q` 与回读 K 点积
+    /// ⇒ 真实逐块注意力质量 ⇒ `coverage_curve`。设计见
+    /// `docs/arch/kvmem-选择层-设计与施工.md` §8.7/§8.8。
+    pub q_sink: Option<&'a std::cell::RefCell<Vec<Option<TensorOps>>>>,
 }
 
 impl<'a> ForwardCtx<'a> {
@@ -221,6 +235,7 @@ impl<'a> ForwardCtx<'a> {
             vlm_rope: None,
             attn_break: None,
             attn_fi: None,
+            q_sink: None,
         }
     }
 
@@ -260,6 +275,7 @@ impl<'a> ForwardCtx<'a> {
             vlm_rope: None,
             attn_break: None,
             attn_fi: None,
+            q_sink: None,
         }
     }
 
@@ -294,6 +310,7 @@ impl<'a> ForwardCtx<'a> {
             vlm_rope: None,
             attn_break: None,
             attn_fi: None,
+            q_sink: None,
         }
     }
 
@@ -332,6 +349,7 @@ impl<'a> ForwardCtx<'a> {
             vlm_rope: None,
             attn_break: None,
             attn_fi: None,
+            q_sink: None,
         }
     }
 
@@ -373,6 +391,7 @@ impl<'a> ForwardCtx<'a> {
             vlm_rope: None,
             attn_break: None,
             attn_fi: None,
+            q_sink: None,
         }
     }
 
@@ -414,6 +433,7 @@ impl<'a> ForwardCtx<'a> {
             vlm_rope: None,
             attn_break: None,
             attn_fi: None,
+            q_sink: None,
         }
     }
 
@@ -463,12 +483,24 @@ impl<'a> ForwardCtx<'a> {
             vlm_rope: None,
             attn_break: None,
             attn_fi: None,
+            q_sink: None,
         }
     }
 
     /// 位置通道接管(VLM 行号表:pos[t] = t,真位置住 m-RoPE 表)
     pub fn with_pos(mut self, pos: &'a TensorOps) -> Self {
         self.pos = Some(pos);
+        self
+    }
+
+    /// Q 输出槽接线(B 轴覆盖率探针;与 `with_pos` 同族 —— 只改自身字段,
+    /// 不做 I/O)。调用方持 `RefCell` 并在执行后读;不调 ⇒ 槽恒 `None`,
+    /// 层内零写入(生产路径逐字不变)。
+    pub fn with_q_sink(
+        mut self,
+        sink: &'a std::cell::RefCell<Vec<Option<TensorOps>>>,
+    ) -> Self {
+        self.q_sink = Some(sink);
         self
     }
 

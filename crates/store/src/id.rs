@@ -56,6 +56,11 @@ impl SnapKey {
     pub fn boundary(self) -> ChainHash {
         self.0
     }
+
+    /// 内层内容身份(索引/键共用;`SnapKey` 只是「块边界」的标注)。
+    pub fn into_chain(self) -> ChainHash {
+        self.0
+    }
 }
 
 /// 前缀身份(关系层的键)= 前缀链尾块的内容身份。

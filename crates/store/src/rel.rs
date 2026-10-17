@@ -26,7 +26,7 @@ use crate::policy::{AdmissionPolicy, EvictCandidate, EvictPolicy, Leg, LruPolicy
 use crate::state::{StateStats, StateStore};
 use crate::host::SlotTable;
 use owl_iface::contract::{ConnSlot, SwapPiece};
-use crate::tier::{Tier, TierLedger, TierReport};
+use crate::tier::{AssetKind, Tier, TierLedger, TierReport};
 
 /// KV 腿几何(boot 装配一次;`block_tokens` 本引擎恒 32 —— 设计卷 §3.6.2)。
 ///
@@ -149,6 +149,9 @@ pub struct Rel {
     pub state: StateStore,
     /// 状态腿的宿主层(键 = [`SnapKey`];与 KV 腿各自一本账)。
     pub snap_host: HostTier<SnapKey>,
+    /// **选择层检索索引**(B 轴:Mean-K 块级索引;host 驻留 —— 论文同款)。
+    /// 几何由 engine 在 boot 注册([`Rel::attach_index`])。
+    pub index: Option<crate::select::MeanKIndex>,
     /// 语义账(状态腿快照/行 + 保留面/弹性面;KV 块面不在此重复记)。
     pub ledger: TierLedger,
     /// 准入策略(boot 装配)。
@@ -207,6 +210,7 @@ impl Rel {
         })?;
         Ok(Self {
             leg: BlockLeg::open(kv_cfg)?,
+            index: None,
             state,
             snap_host: HostTier::new(1, snap_host_bytes)?,
             ledger,
@@ -233,6 +237,43 @@ impl Rel {
         self.snap_layout = Some(layout);
         self.snap_bytes = bytes;
         Ok(epoch)
+    }
+
+    /// **注册选择层索引几何**(B 轴 boot 一次;§8):`dim` = head_dim。
+    pub fn attach_index(&mut self, dim: usize, layers: usize, kv_heads: usize) -> StoreResult<()> {
+        self.index = Some(crate::select::MeanKIndex::new(dim, layers, kv_heads)?);
+        Ok(())
+    }
+
+    /// **登记一块的索引面**(B 轴):形状校验在 `MeanKIndex` 内;入账到 host 层。
+    pub fn index_register(
+        &mut self,
+        block: ChainHash,
+        entries: Vec<crate::select::MeanKEntry>,
+    ) -> StoreResult<()> {
+        let ix = self
+            .index
+            .as_mut()
+            .ok_or_else(|| StoreError::Invariant("选择层索引未注册(engine 应在 boot 调 attach_index)".into()))?;
+        let bytes = ix.block_bytes();
+        ix.register(block, entries)?;
+        self.ledger.add(Tier::Host, AssetKind::Index, bytes)
+    }
+
+    /// 丢一块的索引(出账)。
+    pub fn index_drop(&mut self, block: ChainHash) -> StoreResult<()> {
+        let ix = self
+            .index
+            .as_mut()
+            .ok_or_else(|| StoreError::Invariant("选择层索引未注册".into()))?;
+        let bytes = ix.block_bytes();
+        ix.drop_block(block)?;
+        self.ledger.remove(Tier::Host, AssetKind::Index, bytes)
+    }
+
+    /// 索引总字节(0 = 未注册)。
+    pub fn index_bytes(&self) -> usize {
+        self.index.as_ref().map(|i| i.bytes()).unwrap_or(0)
     }
 
     /// 一条快照的字节(布局未注册 = 0)。
@@ -265,6 +306,16 @@ impl Rel {
     }
 
     /// 换驱逐策略(策略对象可换,判据不散 —— §3.2)。
+    /// **召回信号转发**(B-4):召回点选中哪些块 ⇒ 策略面(attention-aware LRFU)。
+    pub fn note_recall(&self, selected: &[ChainHash]) {
+        self.evict.note_recall(selected);
+    }
+
+    /// 驱逐策略名(报告/测试面)。
+    pub fn evict_policy_name(&self) -> &'static str {
+        self.evict.name()
+    }
+
     pub fn set_evict_policy(&mut self, p: Box<dyn EvictPolicy>) {
         self.evict = p;
     }
@@ -680,6 +731,36 @@ mod tests {
         assert_eq!(rep.kv.cached_blocks, 1, "缓存面 1 块(腿报)");
         assert_eq!(rep.kv.gpu_bytes, BLOCK_BYTES, "设备绑定面 1 块");
         assert_eq!(rep.tiers.gpu_used, 0, "语义账不重复记 KV 块");
+    }
+
+    /// **B-0 门(store 侧)**:索引几何注册 + 登记入账(host/Index 行)+ 出账平衡。
+    #[test]
+    fn index_registers_into_the_ledger_and_balances() {
+        let mut r = rel(2);
+        r.attach_index(2, 1, 2).expect("注册几何");
+        assert_eq!(r.index_bytes(), 0);
+        let b = ChainHash::new(42);
+        let entries = vec![
+            crate::select::MeanKEntry { layer: 0, kv_head: 0, k_bar: vec![0, 0] },
+            crate::select::MeanKEntry { layer: 0, kv_head: 1, k_bar: vec![0, 0] },
+        ];
+        r.index_register(b, entries.clone()).expect("登记");
+        let per_block = 2 * 2 * 2; // 条目 × dim × f16
+        assert_eq!(r.index_bytes(), per_block);
+        let rep = r.report();
+        assert_eq!(rep.tiers.host_used, per_block, "索引进 host 层账");
+        assert!(
+            rep.tiers.rows.iter().any(|x| x.kind == AssetKind::Index && x.bytes == per_block),
+            "报告应有 Index 行:{:?}",
+            rep.tiers.rows
+        );
+        // 形状错 = 响亮拒(不进账)
+        assert!(r.index_register(ChainHash::new(43), vec![entries[0].clone()]).is_err());
+        assert_eq!(r.index_bytes(), per_block, "拒后账不动");
+        // 出账
+        r.index_drop(b).expect("出账");
+        assert_eq!(r.index_bytes(), 0);
+        assert_eq!(r.report().tiers.host_used, 0, "出账后 host 层归零");
     }
 
     #[test]

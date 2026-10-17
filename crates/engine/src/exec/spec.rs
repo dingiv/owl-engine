@@ -769,23 +769,40 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         // 2) 取新增整块的 token 段(活跃 turn 的链面)
         let seg = self.tokens_upto(start * page, full_blocks * page)?;
-        // 3) 推进身份链(段长不符 = 结构性拒,不静默)
-        let (gdn_slot, key) = {
+        // 3) 推进身份链(段长不符 = 结构性拒,不静默;逐块哈希在同一处重放
+        //    —— 身份与游标同源 `owl_store::hash_block`)
+        let (gdn_slot, key, per_block, parent0) = {
             let s = self
                 .bank
                 .sessions
                 .get_mut(sid)
                 .ok_or_else(|| ModelError::Msg(format!("会话 {sid} 不在账")))?;
+            let parent0 = s.chain.tail();
             let tail = s.chain.advance(page, &seg, full_blocks).ok_or_else(|| {
                 ModelError::Msg(format!(
                     "链哈希游标推进失败:sid={sid} fed={fed} start={start} 新增 {} 块",
                     full_blocks.saturating_sub(start)
                 ))
             })?;
+            // **B-0 索引面:本事件新增的**每一个**整块身份**(2026-10-18 修:
+            // 原先只登记 `full_blocks-1` 一块 —— chunk 512 时每次事件跨 16 块,
+            // 洋 15 块永不进索引(实测 112 块只有 7 块在场,覆盖率曲线被打崩)。
+            // 游标只留链尾 ⇒ 逐块哈希在此重放一小段;重放尾必与 advance 同值
+            // (dev 档硬断;身份只有一份实现)。
+            let mut per = Vec::with_capacity(full_blocks - start);
+            let mut parent = parent0;
+            for b in start..full_blocks {
+                let lo = (b - start) * page;
+                parent = owl_store::hash_block(parent, &seg[lo..lo + page]);
+                per.push((parent, b));
+            }
+            debug_assert_eq!(parent, tail, "逐块重放尾哈希须与 advance 一致(身份单源)");
             // S2b:快照拍摄用的是**本 turn 的行**(turn 域资源)
             (
                 self.turns.active.as_ref().map(|a| a.gdn_slot).unwrap_or(0),
                 owl_store::SnapKey::at_boundary(tail),
+                per,
+                parent0, // = 本次推进前的链尾(增量登记起点)
             )
         };
         // **S2(§25.2)**:槽位选择 + 冷快照下沉 —— 快照账的真源是 store 的
@@ -796,6 +813,131 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         self.pool.capture_snap(face, gdn_slot, key, Some(slot)).await?;
         // 登记/触达(层 = 设备)
         self.bank.rel.state.register_snap(key, self.pool.snap_bytes(), owl_store::Tier::Gpu);
+        // **B 轴 B-0:同一处顺手采索引**(同一"块边界 + 链尾身份"事件 ⇒
+        // 一次算身份、一次推进游标;索引与 GDN 快照共享边界身份)。
+        // 逐块登记:物理页由**会话块表**定(池可被多会话共享;旧实现拿
+        // 逻辑块号当物理页号 = 单会话且顺序分配才对)。
+        // 会话块表快照(两个块共用:增量登记要真槽、索引采集要物理页)
+        let bt_now: Vec<u32> = self
+            .bank
+            .sessions
+            .get(sid)
+            .map(|s| s.block_table.clone())
+            .unwrap_or_default();
+        // ── **B-3e-2 第 2b 项:轮内增量登记**(`select_partial` 档)──
+        // 宿主层按**缓存树条目**键控 ⇒ 不登记就沉不了(refs == 1;硬沉会造自由槽)。
+        // `parent0` = 本次推进前的链尾(= 上次登记的尾,逐块父链连续)⇒
+        // 每块一次哈希,全 turn O(n)。只登记**真槽**块(占位块本来就在树里)。
+        if self.cfg.knobs.select_partial {
+            let bt = bt_now.clone();
+            let mut blk_slices: Vec<(&[u32], u32)> = Vec::new();
+            for (_, blk) in per_block.iter() {
+                let slot = bt.get(*blk).copied().unwrap_or(u32::MAX);
+                if owl_store::is_host_placeholder(slot) {
+                    continue;
+                }
+                let lo = (*blk - start) * page;
+                blk_slices.push((&seg[lo..lo + page], slot));
+            }
+            if !blk_slices.is_empty() {
+                let up = self.bank.rel.leg.register_chain_inc(parent0, &blk_slices)?;
+                mcnt("store.chain.inc.blocks", up.inserted.len() as u64);
+                mcnt("store.chain.inc.evicted", up.evicted.len() as u64);
+            }
+        }
+        // **B 轴 B-0:索引采集**(同一"块边界"事件;同样逐块、物理页由会话块表定)
+        if self.cfg.knobs.index_probe {
+            for (hash, blk) in per_block {
+                let Some(phys) = bt_now.get(blk).copied() else {
+                    return Err(ModelError::Msg(format!(
+                        "索引采集:逻辑块 {blk} 无物理页(块表 {} 项)",
+                        bt_now.len()
+                    )));
+                };
+                // **占位块跳过**(部分驻留档:内容在宿主 ⇒ 没有设备页可回读)。
+                // 索引是**内容身份**键控的 ⇒ 该块在沉走之前就已采过(幂等早退也会挡),
+                // 拿占位符当页号算 dtoh 偏移 = 越界读(27B Stage2 实测踩出)。
+                if owl_store::is_host_placeholder(phys) {
+                    mcnt("store.index.skip.host", 1);
+                    continue;
+                }
+                let phys = phys as usize;
+                self.collect_index_for_block(hash, blk, phys).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// **B-0 索引采集**(回读形态;§8.1 路 A):块完成 ⇒ 回读该块物理页 K →
+    /// host **逆 RoPE**(核内约定 = rotate-half + partial 直通,见 §8.2)→ 逐
+    /// (层, KV 头) 求 Mean-K → `Rel::index_register`(账 = host/Index)。
+    ///
+    /// - `block_hash` = 该块的**内容身份**(逐块父链哈希,调用方已算 ——
+    ///   与 GDN 快照同源);
+    /// - `logical_block` = 逻辑块号(定**位置** = `logical_block·page + t`);
+    /// - `phys_page` = 会话块表里的**物理页号**(回读偏移的真源;池可共享)。
+    ///
+    /// 关(缺省)= 调用方不调(零开销)。
+    pub(crate) async fn collect_index_for_block(
+        &mut self,
+        block_hash: owl_store::ChainHash,
+        logical_block: usize,
+        phys_page: usize,
+    ) -> Result<()> {
+        let Some(ix_geom) = self.bank.rel.index.as_ref().map(|i| i.geometry()) else {
+            return Ok(()); // 索引未注册(未开采集)
+        };
+        let (dim, layers, kv_heads) = ix_geom;
+        let page = self.pool.page;
+        let block = logical_block;
+        let (hkv, hd) = (self.pool.dims.hkv, self.pool.dims.hd);
+        if hd != dim || hkv != kv_heads {
+            return Err(owl_iface::contract::ModelError::Msg(format!(
+                "索引几何与池不符:index (dim={dim}, hkv={kv_heads}) ≠ pool (hd={hd}, hkv={hkv})"
+            )));
+        }
+        if self.pool.kv_fp8 {
+            return Err(owl_iface::contract::ModelError::Msg(
+                "索引采集:fp8 池 K 回读解码未接线(一期只支持 f16 池;见设计卷 §8.6 挂账)"
+                    .into(),
+            ));
+        }
+        if self.bank.rel.index.as_ref().is_some_and(|i| i.contains(block_hash)) {
+            return Ok(()); // 幂等(同一块重复拍)
+        }
+        let mut collector = owl_store::MeanKCollector::new(dim, layers, kv_heads)?;
+        let elem = 2usize; // f16 池(上方已拒 fp8)
+        // 逐层回读该块的**物理页** K —— **一条批量命令**(原每层一次同步往返:
+        // 27B = 16 层 × 每块一次 ⇒ 8192 块 = 13 万次往返,分钟级;设计卷 §10.3 推论 B)
+        let page_bytes = page * hkv * hd * elem;
+        let mut pieces: Vec<(&owl_iface::contract::Bytes, usize, usize)> = Vec::new();
+        for kv in self.pool.kvs.iter().take(layers) {
+            pieces.push((&kv.k_cache.0, phys_page * page_bytes, page_bytes));
+        }
+        let all = {
+            let face = self.graphs.session.face_mut();
+            face.dtoh_batch(&pieces).await?
+        };
+        for (li, _kv) in self.pool.kvs.iter().enumerate().take(layers) {
+            let kbuf = &all[li * page_bytes..(li + 1) * page_bytes];
+            // 逐 token × 头:逆 RoPE(cos/sin 来自 host 侧同源表)+ 累加
+            // 位置 = **逻辑**位置(logical_block·page + t;物理页号不参与位置)
+            for t in 0..page {
+                let pos = block * page + t;
+                let Some((cos, sin)) = self.rope.cos_sin_at(pos) else { continue };
+                for h in 0..hkv {
+                    let mut row = vec![0.0f32; hd];
+                    for (d, v) in row.iter_mut().enumerate() {
+                        let off = (t * hkv + h) * hd + d;
+                        let bits = u16::from_le_bytes([kbuf[off * 2], kbuf[off * 2 + 1]]);
+                        *v = owl_store::f16_to_f32_pub(bits);
+                    }
+                    collector.push_post_rope_halves(li, h, &row, cos, sin)?;
+                }
+            }
+        }
+        let entries = collector.finish()?;
+        self.bank.rel.index_register(block_hash, entries)?;
         Ok(())
     }
 
@@ -934,10 +1076,19 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
     }
 
-    /// 取本 turn 已喂入 KV 的 token 段 `[lo, hi)`(= `prompt_ids ++ out`)。
+    /// f16 小端字节对 → f32(索引采集解包;不走 half 依赖面)。
+fn f16_le_to_f32(lo: u8, hi: u8) -> f32 {
+    let bits = u16::from_le_bytes([lo, hi]);
+    // 复用 store 的位型转换(同源,避免第二套实现)
+    owl_store::f16_to_f32_pub(bits)
+}
+
+/// 取本 turn 已喂入 KV 的 token 段 `[lo, hi)`(= `prompt_ids ++ out`)。
     /// 越过已喂面 = **结构性拒**(快照边界不得越过 KV 真实内容 —— 静默截断
     /// 会让快照身份与实际内容脱节)。
-    fn tokens_upto(&self, lo: usize, hi: usize) -> Result<Vec<u32>> {
+    /// 本 turn 的 token 链区间 `[lo, hi)`(快照边界段来源;`coverage.rs` 回算
+    /// 块身份同用 —— 链身份必须与索引登记同源)。
+    pub(crate) fn tokens_upto(&self, lo: usize, hi: usize) -> Result<Vec<u32>> {
         let act = self.turns.active.as_ref().ok_or_else(|| {
             ModelError::Msg("无活跃 turn:快照边界必须落在本 turn 的 token 链上".into())
         })?;

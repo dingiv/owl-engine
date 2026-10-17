@@ -58,6 +58,53 @@ pub struct EngineKnobs {
     /// **宿主层预算 MiB**(状态存储三层的中层;缺省 **0 = 关层**,REQ C4)。
     /// 环境变量 `OWL_HOST_CACHE_MB`;S3-3b(回灌)接线前开了也没用
     pub host_cache_mb: usize,
+    /// **选择层索引采集(B 轴 B-0;缺省关)**。`OWL_INDEX_PROBE=1`。
+    ///
+    /// 开则:块边界(与 GDN 快照同处)回读该页 K → host 逆 RoPE 求 Mean-K →
+    /// 登记进 store 的索引账(`AssetKind::Index`,host 层)。
+    /// ⚠️ 一期是**回读**形态(每页 ~3MB D2H,一次性建索引);核内累加是后续优化。
+    pub index_probe: bool,
+    /// **选择层覆盖率探针(B 轴 B-1 前置件;缺省关)**。`OWL_COVERAGE_PROBE=1`。
+    ///
+    /// 开则(与 [`Self::index_probe`] 配套:索引在场才能打分):prefill chunk
+    /// 执行时把本 chunk 的 **post-RoPE Q**(逐全注意力层,`ForwardCtx::q_sink`)
+    /// 与主根**同一遍**归约(`eval_ops_multi_scoped_env` —— 前向带 GDN 状态
+    /// 副作用,**绝不双执行**),随后 host:逆 RoPE 得 `q̃` → `score_blocks` 打分 /
+    /// post-RoPE `q` × 回读 K 点积 = **真实逐块注意力质量** → `coverage_curve`。
+    /// 门 = 论文量级(top-8 ≈ 66.5% / top-16 ≈ 77%;设计卷 §8.6);同时是
+    /// **去 RoPE 配对约定**的实证(约定错 ⇒ 打分退化噪声 ⇒ 覆盖率掉到随机)。
+    /// 诊断档:prefill 桶图**让位 eager**(与 `pf_bisect` 同律,响亮告知一次)。
+    pub coverage_probe: bool,
+    /// **B-3d 选择层视图接进 decode**(缺省关)。`OWL_SELECT_DECODE=1`。
+    ///
+    /// 开则:召回点之后的本 turn decode 步,注意力只读**视图页表**
+    /// (选中块 ++ 新生成尾部;方案 A = 原位置,**不做 re-RoPE**),
+    /// `sel_pt`/`sel_len` 两个图输入槽每步写;召回点之前/无视图 ⇒ 写全量链
+    /// (与不开时逐字等价)。
+    /// 前置:`coverage_probe`(召回/视图由探针面产出)+ **图档**(视图走输入槽;
+    /// XPU/无图档另说)。XQA 裸 decode 臂与视图**不共戴**(页表语义两套)⇒
+    /// 当前需 `decode_xqa=0`。
+    pub select_decode: bool,
+    /// **B-3e-2:部分宿主驻留**(缺省关)。`OWL_SELECT_PARTIAL=1`。
+    ///
+    /// 开则:每个召回点把**被踢出工作集**的链块 `decref` + 逐块下沉到宿主
+    /// (会话表写占位),并把选中的宿主块回灌回来;prefill 的"过去"改走
+    /// **子集页链**(否则会读到占位符)。前提:`coverage_probe` + `select_decode`
+    /// + 宿主层(`OWL_HOST_CACHE_MB` / `OWL_SNAP_HOST_MB`)。
+    pub select_partial: bool,
+    /// **驱逐策略**(B-4;缺省 `lru`)。`OWL_EVICT_POLICY=lrfu[:λ]`。
+    ///
+    /// - `lru` = 现役基线(`last_use` 升序);
+    /// - `lrfu` = **attention-aware LRFU**:召回点选中的块 keep-score 抬升
+    ///   (`KS ← λ·KS + (1−λ)·hit`)⇒ 出序时"又冷又没被注意力用过"的先下沉。
+    ///   我们只**下沉**不丢内容 ⇒ 该策略决定的是"谁的设备副本先让位"。
+    pub evict_policy: owl_store::EvictPolicyKind,
+    /// **召回预算**(块数;缺省 64,`OWL_SELECT_BLOCKS`)。视图 = 选中的这些块
+    /// ⇒ 这是"选择层丢多少"的唯一旋钮。
+    pub select_blocks: usize,
+    /// 保底 sink / recent(块;缺省 2 / 4)
+    pub select_sink: usize,
+    pub select_recent: usize,
     /// **状态腿宿主预算 MiB**(S2 §25.2;缺省 **0 = 关层**)。`OWL_SNAP_HOST_MB`。
     ///
     /// 与 [`Self::host_cache_mb`] 同属 store 中层总账的两个**分片**
@@ -125,6 +172,14 @@ impl Default for EngineKnobs {
             prefix_cache: true,
             host_cache_mb: 0,
             snap_host_mb: 0,
+            index_probe: false,
+            coverage_probe: false,
+            select_decode: false,
+            select_partial: false,
+            evict_policy: owl_store::EvictPolicyKind::Lru,
+            select_blocks: 64,
+            select_sink: 2,
+            select_recent: 4,
             admission_on_full: owl_store::QueuePolicy::Reject,
             dense_floor: owl_store::TurnFloor::Strict,
             no_graph: false,
@@ -150,6 +205,36 @@ impl Default for EngineKnobs {
 /// 准入满员姿态解析(`OWL_ADMIT_ON_FULL`):`reject`(缺省)/ `queue` / `queue:30000`。
 ///
 /// 坏值 = **响亮拒启动**(解析失败不许静默回落到缺省 —— 那就变成"配了没生效")。
+/// 驱逐策略解析(`OWL_EVICT_POLICY=lru|lrfu[:λ]`;坏值 = 响亮拒 + exit 2,
+/// 与 `parse_admission_on_full` 同律:配置错不许静默降级)。
+fn parse_evict_policy() -> owl_store::EvictPolicyKind {
+    use owl_store::EvictPolicyKind;
+    let Some(raw) = owl_shared::env_reader::str("OWL_EVICT_POLICY") else {
+        return EvictPolicyKind::Lru;
+    };
+    let s = raw.trim();
+    if s.eq_ignore_ascii_case("lru") {
+        return EvictPolicyKind::Lru;
+    }
+    if s.eq_ignore_ascii_case("lrfu") {
+        return EvictPolicyKind::Lrfu(0.9);
+    }
+    if let Some(rest) = s.strip_prefix("lrfu:") {
+        match rest.trim().parse::<f64>() {
+            Ok(l) if l > 0.0 && l < 1.0 => return EvictPolicyKind::Lrfu(l),
+            _ => {
+                owl_shared::log_error!(
+                    "boot",
+                    "OWL_EVICT_POLICY={s}:λ 非法(须 0<λ<1,如 lrfu:0.9)—— 拒绝启动"
+                );
+                std::process::exit(2);
+            }
+        }
+    }
+    owl_shared::log_error!("boot", "OWL_EVICT_POLICY={s} 不可识别(lru | lrfu | lrfu:λ)—— 拒绝启动");
+    std::process::exit(2);
+}
+
 fn parse_admission_on_full() -> std::result::Result<owl_store::QueuePolicy, String> {
     use owl_store::QueuePolicy;
     let Some(s) = owl_shared::env_reader::parse::<String>("OWL_ADMIT_ON_FULL") else {
@@ -205,6 +290,17 @@ impl EngineKnobs {
             host_cache_mb: owl_shared::env_reader::parse("OWL_HOST_CACHE_MB").unwrap_or(0),
             // 状态腿宿主预算(S2):独立旋钮(两条腿各有热区,别互相饿死)
             snap_host_mb: owl_shared::env_reader::parse("OWL_SNAP_HOST_MB").unwrap_or(0),
+            // 选择层索引采集(B 轴 B-0;缺省关)
+            index_probe: owl_shared::env_reader::flag("OWL_INDEX_PROBE"),
+            // B 轴覆盖率探针(B-1 前置件;缺省关;与 index_probe 配套开)
+            coverage_probe: owl_shared::env_reader::flag("OWL_COVERAGE_PROBE"),
+            // B-3d 选择层接进 decode(缺省关;开则须 coverage_probe 同开)
+            select_decode: owl_shared::env_reader::flag("OWL_SELECT_DECODE"),
+            select_partial: owl_shared::env_reader::flag("OWL_SELECT_PARTIAL"),
+            evict_policy: parse_evict_policy(),
+            select_blocks: owl_shared::env_reader::parse("OWL_SELECT_BLOCKS").unwrap_or(64),
+            select_sink: owl_shared::env_reader::parse("OWL_SELECT_SINK").unwrap_or(2),
+            select_recent: owl_shared::env_reader::parse("OWL_SELECT_RECENT").unwrap_or(4),
             // 准入姿态(S3b):env 覆盖(`reject` / `queue[:ms]`);缺省响亮拒。
             // 坏值 = **响亮拒**(§24.5④:不再 panic;启动期结构化失败,
             // 归 §18.5 的"配置错误静默 exit 1"红线同一族)
@@ -502,7 +598,8 @@ impl<D: DeviceClient + 'static> Engine<D> {
             spec_mode: spec.mode,
             spec_depth: spec.depth,
             xqa_verify: self.cfg.knobs.env.attn.verify_xqa,
-            xqa_decode: self.cfg.knobs.env.attn.decode_xqa,
+            // B-3e-2:部分驻留档**不带 XQA**(页表语义不共戴;见上方醒目告知)
+            xqa_decode: self.cfg.knobs.env.attn.decode_xqa && !self.cfg.knobs.select_partial,
             xqa_prefill: self.cfg.knobs.env.attn.xqa_prefill,
             max_active_turns: self.cfg.knobs.max_active_turns,
             snap_max: self.cfg.knobs.snap_max,
@@ -513,7 +610,28 @@ impl<D: DeviceClient + 'static> Engine<D> {
             prefill_dump_page: self.cfg.knobs.prefill_bucket
                 != owl_shared::config::PrefillBucket::Off,
             gdn_dbg: self.cfg.knobs.probes.gdn_dbg,
+            // B-2:选择层视图面(召回点探针档;与覆盖率探针同开关)
+            select_view: self.cfg.knobs.coverage_probe,
         };
+        // **B-3e-2 前置校验**(响亮拒,不许静默):
+        // ① 部分驻留会让会话链**出洞**(占位符)⇒ 必须有"懂洞"的消费方
+        //    (视图页表)⇒ `select_decode` 必开;
+        // ② XQA 裸 decode 臂的页表直接来自会话链(`xqa_pt_of`)⇒ 洞 = u32::MAX 当页号 =
+        //    ILLEGAL_ADDRESS(27B Stage2 实测)。本档**自动关 XQA 并响亮告知**。
+        if self.cfg.knobs.select_partial && !self.cfg.knobs.select_decode {
+            owl_shared::log_error!(
+                "boot",
+                "OWL_SELECT_PARTIAL=1 需同时开 OWL_SELECT_DECODE=1(链上出洞后必须有视图消费方)—— 拒绝启动"
+            );
+            std::process::exit(2);
+        }
+        if self.cfg.knobs.select_partial && self.cfg.knobs.env.attn.decode_xqa {
+            owl_shared::log_warn!(
+                "boot",
+                "部分驻留档:本档**关掉 XQA 裸 decode 臂**(其页表语义读整条会话链,遇占位符 = 非法地址;\n                    \
+                 视图×XQA 的对接是挂账,不在此刀)—— 本档走 v2 分页 decode"
+            );
+        }
         let pool = StatePool::alloc(&mut self.face, dims, &loaded.spec.layer_types, &plan).await?;
         if let Some(q) = fi_quant {
             owl_shared::log_info!("boot", "FlashInfer prefill 面启用(FI 直读主池 kNHD 单池;quant={:?})",
@@ -576,6 +694,21 @@ impl<D: DeviceClient + 'static> Engine<D> {
                 pool.pool_layout(0),
                 pool.mtp_pool_layout(0),
             )?;
+            // **B-4 驱逐策略装配**(boot 一次;缺省 LRU ⇒ 与历史逐字一致)
+            b.rel.set_evict_policy(self.cfg.knobs.evict_policy.build());
+            owl_shared::log_info!("store", "驱逐策略 = {}", b.rel.evict_policy_name());
+            if self.cfg.knobs.index_probe {
+                // B 轴索引几何:层 = 全注意力层数,头 = KV 头数,dim = head_dim
+                b.rel.attach_index(dims.hd, pool.kvs.len(), dims.hkv)?;
+                owl_shared::log_info!(
+                    "boot",
+                    "选择层索引:采集开(dim={} 层={} KV 头={};每块 {}B)",
+                    dims.hd,
+                    pool.kvs.len(),
+                    dims.hkv,
+                    b.rel.index.as_ref().map(|i| i.block_bytes()).unwrap_or(0)
+                );
+            }
             if pool.paged && pool.snap_capacity() > 0 {
                 let epoch = b.rel.attach_snap_layout(pool.snap_pool_layout(0))?;
                 owl_shared::log_info!(
@@ -625,6 +758,13 @@ impl<D: DeviceClient + 'static> Engine<D> {
             bank,
             graphs,
             spec,
+            cov_pending: None,
+            cov_last: None,
+            sel_view: None,
+            select_view_steps: 0,
+            sel_view_fallback: 0,
+            stage: crate::running::StageStats::default(),
+            partial: crate::running::PartialStats::default(),
         })
     }
 }

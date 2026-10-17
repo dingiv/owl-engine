@@ -171,48 +171,92 @@ impl PrefixTree {
             return TreeUpdate::default();
         }
         let mut update = TreeUpdate::default();
-        let mut parent: Option<ChainHash> = None;
+        let mut base = ChainHash::new(0); // 从根起(全量登记)
         for (block, &slot) in tokens.chunks(self.block_tokens).take(n).zip(slots) {
-            let base = parent.unwrap_or(ChainHash::new(0));
-            let hash = hash_block(base, block);
-            let fingerprint = content_fingerprint(block);
-            match self.entries.get(&hash) {
-                Some(e) if e.fingerprint == fingerprint => {
-                    // 已是同一块:只触达(缓存仍持着自己那一份绑定,不重复计引用)
-                    let access = self.next_access();
-                    if let Some(e) = self.entries.get_mut(&hash) {
-                        e.access = access;
-                    }
-                    self.touch_leaf(hash);
-                }
-                Some(_) => break, // 哈希碰撞(指纹不符):当断链处理,响亮地不登记
-                None => {
-                    if let Some(p) = parent {
-                        if let Some(pe) = self.entries.get_mut(&p) {
-                            if pe.children == 0 {
-                                self.leaf_set.remove(&p);
-                            }
-                            pe.children += 1;
-                        }
-                    }
-                    let access = self.next_access();
-                    self.entries.insert(
-                        hash,
-                        Entry { parent, children: 0, access, fingerprint, slot: Some(slot) },
-                    );
-                    self.leaf_set.insert(hash);
-                    self.leaf_lru.push_back((hash, access));
-                    update.inserted.push((hash, slot));
-                }
-            }
-            parent = Some(hash);
+            let Some(next) = self.insert_one(base, block, slot, &mut update) else {
+                break; // 哈希碰撞(指纹不符):当断链处理,响亮地不登记
+            };
+            base = next;
         }
+        self.trim(&mut update);
+        update
+    }
 
+    /// **增量登记**(B-3e-2 第 2b 项):从**已注册的链尾** `parent0` 续挂新块。
+    ///
+    /// 与 [`Self::insert`] 的分工:`insert` 从根重走全链(**O(全长)** —— turn 收口
+    /// 一次性登记用);本函数只处理"本次新增的整块"(**每块一次哈希 ⇒ 全 turn O(n)**),
+    /// 用在**轮内**登记(链一写完就进树 ⇒ 该块才可被逐块下沉票选中:宿主层按树条目键控)。
+    ///
+    /// `blocks = &[(tokens_of_block, slot)]`(每项长度必须 = `block_tokens`)。
+    pub(crate) fn insert_inc(&mut self, parent0: ChainHash, blocks: &[(&[u32], u32)]) -> TreeUpdate {
+        if !self.enabled() || blocks.is_empty() {
+            return TreeUpdate::default();
+        }
+        let mut update = TreeUpdate::default();
+        let mut base = parent0;
+        for (block, slot) in blocks {
+            if block.len() != self.block_tokens {
+                break; // 非整块 = 结构错(调用方保证;不静默凑数)
+            }
+            let Some(next) = self.insert_one(base, block, *slot, &mut update) else {
+                break;
+            };
+            base = next;
+        }
+        self.trim(&mut update);
+        update
+    }
+
+    /// **单块登记**(两条入口的唯一实现):返回新块身份;`None` = 哈希碰撞(断链)。
+    fn insert_one(
+        &mut self,
+        base: ChainHash,
+        block: &[u32],
+        slot: u32,
+        update: &mut TreeUpdate,
+    ) -> Option<ChainHash> {
+        let hash = hash_block(base, block);
+        let fingerprint = content_fingerprint(block);
+        match self.entries.get(&hash) {
+            Some(e) if e.fingerprint == fingerprint => {
+                // 已是同一块:只触达(缓存仍持着自己那一份绑定,不重复计引用)
+                let access = self.next_access();
+                if let Some(e) = self.entries.get_mut(&hash) {
+                    e.access = access;
+                }
+                self.touch_leaf(hash);
+            }
+            Some(_) => return None,
+            None => {
+                let parent = if base == ChainHash::new(0) { None } else { Some(base) };
+                if let Some(p) = parent {
+                    if let Some(pe) = self.entries.get_mut(&p) {
+                        if pe.children == 0 {
+                            self.leaf_set.remove(&p);
+                        }
+                        pe.children += 1;
+                    }
+                }
+                let access = self.next_access();
+                self.entries.insert(
+                    hash,
+                    Entry { parent, children: 0, access, fingerprint, slot: Some(slot) },
+                );
+                self.leaf_set.insert(hash);
+                self.leaf_lru.push_back((hash, access));
+                update.inserted.push((hash, slot));
+            }
+        }
+        Some(hash)
+    }
+
+    /// 容量收口(两条入口共用):超 `cap` 的部分按最老叶逐出。
+    fn trim(&mut self, update: &mut TreeUpdate) {
         let excess = self.entries.len().saturating_sub(self.cap);
         if excess > 0 {
             update.evicted = self.evict(excess);
         }
-        update
     }
 
     /// 驱逐 `n` 个叶(从最老开始);返回被逐条目(内容身份, 槽 `Option`)。

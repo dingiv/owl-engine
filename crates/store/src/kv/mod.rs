@@ -191,8 +191,17 @@ impl KvStore {
     }
 
     /// 归还会话整条块表(逆序减引用;共享块自然只剩减引用)。
+    /// 归还会话块表(逐槽 `decref`)。
+    ///
+    /// **占位符跳过**(B-3e-2;2026-10-18):`slot = u32::MAX`([`crate::leg::HOST_PLACEHOLDER`])
+    /// 表示"该块内容在宿主层、无设备槽"(部分驻留档的链洞)。
+    /// 拿它去 `decref` = 触碰越界槽(实测踩:`槽 4294967295 越界`)——
+    /// **没有设备槽就没有引用可还**,按定义跳过。
     pub fn release_table(&mut self, table: &mut Vec<u32>) -> StoreResult<()> {
         for &slot in table.iter().rev() {
+            if crate::leg::is_host_placeholder(slot) {
+                continue;
+            }
             self.pool.decref(slot)?;
         }
         table.clear();
@@ -264,6 +273,32 @@ impl KvStore {
         table: &[u32],
     ) -> StoreResult<CacheUpdate> {
         let up = self.tree.insert(tokens, table);
+        let mut out = CacheUpdate::default();
+        for (chain, slot) in &up.inserted {
+            self.pool.incref(*slot)?;
+            out.inserted.push(*chain);
+        }
+        for (chain, slot) in &up.evicted {
+            if let Some(slot) = slot {
+                self.pool.decref(*slot)?;
+            }
+            self.evicted += 1;
+            out.evicted.push((*chain, *slot));
+        }
+        Ok(out)
+    }
+
+    /// **增量登记**(B-3e-2 第 2b 项):从已注册的链尾续挂本次新增的整块。
+    ///
+    /// 与 [`Self::register_chain`] 同记账(插入 +1 引用、被逐条目 -1 引用),
+    /// 区别只在**代价**:本口每块一次哈希(全 turn O(n)),轮内可调;
+    /// `register_chain` 从根重走(全量 O(全长),turn 收口用)。
+    pub fn register_chain_inc(
+        &mut self,
+        parent0: ChainHash,
+        blocks: &[(&[u32], u32)],
+    ) -> StoreResult<CacheUpdate> {
+        let up = self.tree.insert_inc(parent0, blocks);
         let mut out = CacheUpdate::default();
         for (chain, slot) in &up.inserted {
             self.pool.incref(*slot)?;
@@ -447,6 +482,53 @@ mod tests {
 
     fn kv(slots: usize, cap: usize) -> KvStore {
         KvStore::new(slots, crate::id::TOKENS_PER_BLOCK, 1 << 20, cap)
+    }
+
+    /// **B-3e-2 第 2b 项**:增量登记(从已注册链尾续挂)≡ 全量登记 ——
+    /// 命中面/块数/树引用账三件必须一致(否则"轮内登记"就是第二套身份语义)。
+    #[test]
+    fn incremental_registration_matches_full_registration() {
+        let page = crate::id::TOKENS_PER_BLOCK;
+        let t = toks(page * 4); // 4 块
+        // ① 全量:一次性登记 4 块
+        let mut full = kv(8, 8);
+        let mut tbl_full: Vec<u32> = Vec::new();
+        full.ensure_for_len(&mut tbl_full, t.len()).expect("块表");
+        full.register_chain(&t, &tbl_full).expect("全量登记");
+        let hit_full = full.match_prefix(&t);
+        assert_eq!(hit_full.matched_blocks, 4, "全量:4 块");
+        // ② 增量:第 1 段 2 块(从根起)、第 2 段 2 块(从已注册尾续挂)
+        let mut inc = kv(8, 8);
+        let mut tbl: Vec<u32> = Vec::new();
+        inc.ensure_for_len(&mut tbl, t.len()).expect("块表");
+        let root = ChainHash::new(0);
+        let up1 = inc
+            .register_chain_inc(root, &[(&t[..page], tbl[0]), (&t[page..2 * page], tbl[1])])
+            .expect("增量 1 段");
+        assert_eq!(up1.inserted.len(), 2, "首段两新块");
+        // 段 1 的尾身份 = 从根逐块哈希
+        let tail1 = crate::kv::chain::hash_block(
+            crate::kv::chain::hash_block(root, &t[..page]),
+            &t[page..2 * page],
+        );
+        let up2 = inc
+            .register_chain_inc(
+                tail1,
+                &[(&t[2 * page..3 * page], tbl[2]), (&t[3 * page..], tbl[3])],
+            )
+            .expect("增量 2 段");
+        assert_eq!(up2.inserted.len(), 2, "第二段两新块");
+        let hit_inc = inc.match_prefix(&t);
+        assert_eq!(hit_inc.matched_blocks, 4, "增量:也应 4 块(身份链连续)");
+        let chains = |h: &PrefixMatch| h.blocks.iter().map(|b| b.chain).collect::<Vec<_>>();
+        let slots = |h: &PrefixMatch| h.blocks.iter().map(|b| b.slot).collect::<Vec<_>>();
+        assert_eq!(chains(&hit_inc), chains(&hit_full), "两路身份逐块一致");
+        assert_eq!(slots(&hit_inc), slots(&hit_full), "两路槽序一致");
+        // ③ 重复登记同一段 = 只触达(不重复计引用)
+        let up3 = inc
+            .register_chain_inc(root, &[(&t[..page], tbl[0])])
+            .expect("重复增量");
+        assert!(up3.inserted.is_empty(), "已登记的块不得重复插入");
     }
 
     #[test]

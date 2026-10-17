@@ -469,8 +469,8 @@ XQA 路径 = `xqa_seq`/页表),因此有一条更便宜的路:
 - **方案 B(KVMem 紧凑窗口)**:位置空间可无限扩张(地址空间 = 存储层),但需整套
   raw-K/re-RoPE 机器 + 数值误差界。
 
-⇒ **建议**:一期走 **A**(与现有页表/前缀缓存位置语义一致,复杂度最低),
-二期若要"工作区 > 原生窗口"(1M 级)再上 B —— 这条**请在 §4 拍**(A/B 或 A→B)。
+⇒ **建议(⚠️ 已被 §29.3 更正为 B)**:一期走 **A** 是"未读论文前的纸面倾向";
+读完全文后改判 **B**(紧凑窗口 + re-RoPE)—— 依据与反例见 **§29.3**。
 
 **3.6.4 复发状态(GDN):论文不虚拟化 —— 这正是我们的增量所在**
 
@@ -2218,3 +2218,63 @@ GPU 真机(状态腿探针 + §22 三门口 + `session_continuity`)。
    (算式不变:求和)。
 3. **`gdn_slot_profile`/`gdn_slot_fingerprint` 两个探针**仍按行号取样 —— 现在行号是
    turn 域的,取样语义要跟着改(仅诊断面,不影响生产)。
+
+---
+
+## 29. 论文精读:KVMem / ActKV —— 与 §3.6 的更正 · 2026-10-17
+
+> 触发:用户指令("这个是需要看论文的")。读的是全文(`kvmem.pdf` 1087 行 / `actkv.pdf` 1147 行,
+> `pdftotext -layout` 抽取)。本节 = 逐条事实 + **对本卷 §3.6/§4 的更正**;
+> B 轴的落地设计独立成卷:`docs/arch/kvmem-选择层-设计与施工.md`。
+
+### 29.1 KVMem(arXiv:2609.04852)事实面(逐条可核)
+
+| 面 | 论文事实 |
+|---|---|
+| 目标 | 24GB 笔记本 5090 + Qwen3.6/3.8-27B NVFP4-MTP:虚拟化 **1M token** 工作区(原生窗 256K 的 4×),单会话 ~50 tok/s;执行视图固定 80K |
+| **调度** | step-level:每 step **prefill 后、decode 前**更新一次工作集,decode 全程固定;实测(8 条 OpenHands SWE-bench Lite,128-tok 滑窗)**同 step 内 KL 0.070 bits vs 跨 step 边界 2.59 bits(37.3×)** |
+| **索引** | 每块 × 每层 × 每 KV head 一个**去 RoPE** 的 K 均值 `k̄ = (1/|b|)Σk̃`;缺省 **32-token 块** |
+| **打分** | `R_b = Σ_m mean_{l,h} softmax_{b'∈C}(q·k̄_{b'}/√d)`(**跨候选块全局 softmax**);sink + recent 保底;选择后**按时间序重排**再物化 |
+| **稀疏度** | **top-8 块 = 66.5%** 历史注意力质量、**top-16 = 77.0%**(G5③ 的 66%/77% 逐字对上) |
+| **位置一致性** | raw K(**位置无关**)是**重建权威**;活跃 GPU 页里的 K = 当前紧凑位置编码;**页表别名零拷贝装配**;位置变化用**有界 delta re-RoPE**(超阈值从 raw K 重建一次);V 原样搬 |
+| **三层管理** | ①**主动 stage-out**(与 chunked prefill 重叠,后台 worker 继续落盘)②**检索感知分层**(GPU 命中保物理页;host 准入按**近期 + 累积检索频率**,非纯 LRU)③**packed + pipelined 重物化**(host gather raw K → 一条 H2D → GPU scatter+re-RoPE;三级流水 + 双缓冲 + CUDA event) |
+| 索引放置 | 全量在 **host**,GPU 只 staged **bounded tile** 打分(0.25GiB@256K → 9.5GiB@10M) |
+| 实现 | 自研 **QW3**(C++/CUDA):因为要在 prefill 期拿 Q/K、控制页表/位置/搬运 |
+| 结果 | LongMemEval-S 85.6%(Full 86.6%)· AgentLongBench **60.87% 反超 Full 59.54%** · >256K 档 40.99% vs Compact+RAG 34.80% · pre-answer 延迟 0.38–1.81s vs Compact+RAG 10.6–39.2s(**11.4–53.8×**)· TTFT 0.43s@256K→1.60s@10M · prefill ~2.6k tok/s · decode 78–85 tok/s · DeepSWE Pass@1 48.4 vs 43.8 / **Pass@4 93.8 vs 81.3** / prefill 时间 −55.1% |
+| **自认局限** | ①虚拟化的是**可寻址工作区**,不是单次注意力范围(每步 ≤ min(模型窗, GPU KV 预算));②**KV 复用非数学等价**(历史 KV 在原因果上下文下算出;靠 re-RoPE + 对当前 query 重新 prefill 缓解;检索可能漏块);③存储开销 KV ≫ 文本(10M ⇒ NVMe 324GB) |
+
+**与我们已有的对齐(白送的三件)**:页表别名 ↔ 我们的 `PoolLayout`+槽池;三层账 ↔
+`TierLedger`;packed 的 host 连续槽 ↔ `SlotTable`/`Connector`。**论文为此自研了整个引擎,
+我们的 A 轴已经把这三件做完了** —— 这正是"A 轴先行"的回报。
+
+### 29.2 ActKV(arXiv:2609.31395)事实面
+
+| 面 | 论文事实 |
+|---|---|
+| 定位 | **KV 压缩/淘汰**(不是虚拟化):agentic 推理的显存与吞吐 |
+| **淘汰** | action-critical 条目与 observation/reasoning 偏好**不同**且跨轮**稳定**(AAV:top-p 90% 命中向量);**attention-aware LRFU** `KS_t = λ·KS_{t-1} + Attn_t·{hit}`,每 ORA 轮末 `TopK(KS,B)` |
+| **预算** | token 置信 = top-k 平均 log-prob → 滑窗 **min-pooling** + bottom-b% 分位 → 一阶拟合斜率 α;**α<0(置信下滑)⇒ 预算放大** `B' = min(B·scale_up, B_upper)`;证据:预算过紧 ⇒ 模型出现 "wait / I guess / let me check" 式**低置信补上下文** |
+| **page-aware 原语** | 统一 `CalAttn / Eviction / Compaction`;两核:①**recovery-based 注意力**(用 softmax LSE 反推 `attn=exp(logits−LSE)`)②**conflict-free in-place compaction**(保留条目压到尾部 `X=⌈B/block_size⌉` 块,源/目的槽不相交 ⇒ 一遍并行拷贝) |
+| 结果 | 长轨迹 **98.53% FullKV 准确率 @ 25.98% 峰值显存**;token/task 吞吐 3.97×/3.58×;paged 压缩核平均 **10.41×** 快于 gather 式;块 16 / kv_heads 8 / head_dim 128 |
+
+**归位**:ActKV 是**另一根轴**(丢内容),我们三层是**下沉**(内容保留)⇒ 严格更强;
+但它的 **LRFU** 与**置信度预算**两件可直接摘(接 `EvictPolicy` 与 B 轴的预算在线调节),
+见 B 轴卷 §6。
+
+### 29.3 对本卷的更正(两条;其余 §3.6 经核对**成立**)
+
+1. **§3.6.3 位置方案:A → B**(改判)。原建议"一期走 A(原位置稀疏召回,零 re-RoPE)"
+   是未读全文时的纸面倾向;论文的做法与理由是:
+   - 论文用**紧凑窗口 + re-RoPE**(= 我们的方案 B),且给出完整实现律:raw K 真源 +
+     入块重打 RoPE + **有界 delta re-RoPE**(超阈值重建,防低精度累加);
+   - **页表别名**让装配零拷贝(与我们 A 轴的槽池/页表同构);
+   - 我们的方案 A 要在**原位置**留洞 ⇒ 页表稀疏 + 位置空间 = 原生窗(262k 位置墙)
+     ⇒ 与"工作区 > 原生窗"的目标直接冲突;
+   - B 的紧凑位置与我们 **XQA `tokensPerPage=32` 的连续页表**天然对齐。
+   ⇒ **改判 B**;A 仅作"位置空间足够时的零误差退路"保留。
+2. **§3.6.1 第 4 行"三层策略"补细**:host 准入 = **近期 + 累积检索频率**(非纯 LRU);
+   stage-out **与 chunked prefill 重叠**(后台 worker);重物化 = **packed + pipelined**
+   (host gather → H2D bulk → GPU scatter+re-RoPE,双缓冲 + event)。这三条要写进 B 轴施工序。
+
+**其余 §3.6 条目经全文核对成立**(块级检索、Mean-K、两视图分离、32-token 块、top-8/16 覆盖率、
+"论文不虚拟化复发状态 = 我们的增量")。

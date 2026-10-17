@@ -179,6 +179,7 @@ impl Model {
             vlm_rope: ctx.vlm_rope,
             attn_break: ctx.attn_break.clone(),
             attn_fi: ctx.attn_fi.clone(),
+            q_sink: ctx.q_sink,
         }
     }
 
