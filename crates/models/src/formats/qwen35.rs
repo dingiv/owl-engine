@@ -490,7 +490,7 @@ mod tests {
             let k = cols * 8;
             // CPU 参考:原始 packed → host fused 重排
             let mut ph = vec![0u8; rows * cols * 4];
-            src.convert_chunk_into_bytes(&e.key, 0, rows * cols, &mut ph, Dtype::U32)
+            src.convert_chunk_into_bytes(&e.key, 0, rows * cols, &mut ph, Dtype::U32).expect("源")
                 .expect("源取 packed_raw");
             let p32: Vec<i32> = ph
                 .chunks_exact(4)
@@ -648,9 +648,11 @@ mod tests {
             let mut b = vec![0u8; elems * 2];
             let ok_a = src_cpu
                 .convert_chunk_into_bytes(&e.key, 0, elems, &mut a, Dtype::F16)
+                .expect("源")
                 .is_some();
             let ok_b = src_dev
                 .convert_chunk_into_bytes(&e.key, 0, elems, &mut b, Dtype::F16)
+                .expect("源")
                 .is_some();
             let bad = a.iter().zip(b.iter()).filter(|(x, y)| x != y).count();
             eprintln!(
@@ -1536,8 +1538,8 @@ mod tests {
         use crate::module::WeightSource;
         // host 参考:fc 反量化值(W4A16Source 反量化臂;BF16 源同键直读)
         let src = crate::formats::w4a16::W4A16Source::open_dir(dir).unwrap();
-        let w_fc = src.dequant_linear("fc").expect("fc 源(反量化)");
-        let hn = src.take("hidden_norm.weight").expect("hn 源");
+        let w_fc = src.dequant_linear("fc").expect("源").expect("fc 源(反量化)");
+        let hn = src.take("hidden_norm.weight").expect("源").expect("hn 源");
         let fan = 5 * 5120usize;
         let (hidden_d, row_n) = (5120usize, 5120usize);
         let row: Vec<f32> = (0..row_n)

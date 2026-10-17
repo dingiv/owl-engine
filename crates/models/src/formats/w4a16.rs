@@ -25,7 +25,11 @@
 
 use crate::contract::{Dtype, ModelError};
 use crate::formats::mmap::{open_raw_index, Mmap, RawEntry};
-use crate::module::WeightSource;
+use crate::formats::util::{
+    checked_len, f16_bytes_to_bf16_bytes, f32_bytes_to_f16, i32s_le_bytes, i32s_par,
+    marlin_eligible, marlin_n_pack, scales_par, u16s_le_bytes,
+};
+use crate::module::{Taken, WeightSource};
 use crate::f16c::{bf16_bytes_to_f16_bytes, dequant_u4_affine_f16_bytes};
 use owl_kernels::family::marlin::repack::{
     marlin_gather_indices, pack_marlin_b_gather_into, pack_marlin_s, unpack_nibbles_into,
@@ -37,23 +41,6 @@ use std::sync::{Arc, Mutex};
 
 /// marlin 可承载判定(**g128 暗雷根治后放宽**,2026-09-30):暗雷真凶 =
 /// marlin_host 的 use_fp32_reduce=true + 4B c_tmp 占位(slice_count>1
-/// 形状 global_reduce_fp32 写穿 c_tmp 踩内存,呈「n=2^k 才安全」假象;
-/// 按 a_is_s8 分派修复后 sweep 全绿 512..17408 含全部非 2^k 档与 27B
-/// 维度族,m∈{1,32,4096})。判据回归 kernel/pack 真实约束:
-/// **n%256==0**(repack tile)且 **in%128==0**(g128 分组)。
-pub fn marlin_eligible(out_dim: usize, in_dim: usize) -> bool {
-    out_dim.is_multiple_of(256) && in_dim.is_multiple_of(128)
-}
-
-/// 打包 n 档位(暗雷根治后 = **n 直通**):eligibility 已保证 n%256==0
-/// (repack tile 约束),历史 pad 路线(n → 512×2^k)系暗雷误诊产物,
-/// 已废(pad 实测仍挂;真凶 = use_fp32_reduce/c_tmp,见
-/// [`marlin_eligible`] 文档)。保留函数 = 语义锚点,防再引入 pad。
-pub fn marlin_n_pack(n: usize) -> usize {
-    debug_assert!(n.is_multiple_of(256), "marlin pack 要求 n%256==0(得 {n})");
-    n
-}
-
 /// 懒物化缓存容量上限(字节;超出整表清空 —— 装载按层序推进,
 /// 在途 Arc 由消费方持活,峰值 = cap + 并发在途张量)。
 const CACHE_CAP_BYTES: usize = 512 << 20;
@@ -89,6 +76,46 @@ pub struct W4A16Source {
 impl W4A16Source {
     /// 装载入口:mmap + 索引(毫秒级,零数据拷贝);重排/反量化全部
     /// 懒到键首触。**无缓存文件**(v1 烘焙缓存随 v1 形态一并废除)。
+    /// **可重算缓存**取用口(2026-10-17 审查 §④ 档①:中毒就地取回 + 清空 + 告警)。
+    fn cache_guard(&self) -> std::sync::MutexGuard<'_, (HashMap<String, Arc<[u8]>>, usize)> {
+        match self.cache.lock() {
+            Ok(g) => g,
+            Err(p) => {
+                let mut g = p.into_inner();
+                let n = g.0.len();
+                if n > 0 {
+                    g.0.clear();
+                    g.1 = 0;
+                    owl_shared::log_warn!("w4a16", "物化缓存锁中毒:已清空 {n} 项重算");
+                }
+                self.cache.clear_poison(); // 粘性:见 awq::cache_guard 注
+                g
+            }
+        }
+    }
+
+    /// 索引缓存(可重算)取用口;语义同上。
+    fn idx_guard(&self) -> std::sync::MutexGuard<'_, HashMap<(usize, usize), Arc<Vec<u32>>>> {
+        match self.idx_cache.lock() {
+            Ok(g) => g,
+            Err(p) => {
+                let mut g = p.into_inner();
+                let n = g.len();
+                if n > 0 {
+                    g.clear();
+                    owl_shared::log_warn!("w4a16", "索引缓存锁中毒:已清空 {n} 项重算");
+                }
+                self.idx_cache.clear_poison();
+                g
+            }
+        }
+    }
+
+    /// 建造锁(纯串行化,无载荷):中毒无状态可坏 ⇒ 直接取回。
+    fn build_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.build_lock.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     pub fn open_dir(dir: &Path) -> Result<Self, ModelError> {
         let t0 = std::time::Instant::now();
         let (maps, index) = open_raw_index(dir)?;
@@ -126,19 +153,21 @@ impl W4A16Source {
     }
 
     /// 反量化口(测试/对拍用):量化基线性 → f32(dequant_u4 精确展宽)
-    pub fn dequant_linear(&self, base: &str) -> Option<Vec<f32>> {
-        let (out, k, pe, se) = self.linear_dims(base)?;
+    pub fn dequant_linear(&self, base: &str) -> Taken<Vec<f32>> {
+        let Some((out, k, pe, se)) = self.linear_dims(base)? else {
+            return Ok(None);
+        };
         let packed_bytes = &self.maps[pe.map_ix][pe.start..pe.start + pe.nbytes];
         let packed = i32s_par(packed_bytes);
         let scale_bytes = &self.maps[se.map_ix][se.start..se.start + se.nbytes];
         let scales_f32 = scales_par(se.dtype, scale_bytes);
         let mut dst = vec![0u8; out * k * 2];
         dequant_u4_affine_f16_bytes(&packed, &scales_f32, out, k, &mut dst);
-        Some(
+        Ok(Some(
             dst.chunks_exact(2)
                 .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
                 .collect(),
-        )
+        ))
     }
 
     /// 诊断口:索引键全集(装载面排查/基准用;不含派生键 qweight/scales/ws)
@@ -148,18 +177,22 @@ impl W4A16Source {
 
     /// 量化线性三元组定位:(out, k) 与 packed/scale 条目。
     /// shape 事实:`weight_packed` [out, k/8] i32。
-    fn linear_dims(&self, base: &str) -> Option<(usize, usize, &RawEntry, &RawEntry)> {
-        let pe = self.index.get(&format!("{base}.weight_packed"))?;
-        let se = self.index.get(&format!("{base}.weight_scale"))?;
-        let out = *pe.shape.first()?;
-        let k = pe.shape.get(1)? * 8;
-        Some((out, k, pe, se))
+    fn linear_dims(&self, base: &str) -> Taken<(usize, usize, &RawEntry, &RawEntry)> {
+        let Some(pe) = self.index.get(&format!("{base}.weight_packed")) else { return Ok(None) };
+        let Some(se) = self.index.get(&format!("{base}.weight_scale")) else { return Ok(None) };
+        let Some(out) = pe.shape.first().copied() else {
+            return Ok(None);
+        };
+        let Some(k) = pe.shape.get(1).copied().map(|x| x * 8) else {
+            return Ok(None);
+        };
+        Ok(Some((out, k, pe, se)))
     }
 
     /// 键解析(唯一入口;懒物化在此触发)
-    fn resolve(&self, key: &str) -> Option<Resolved> {
+    fn resolve(&self, key: &str) -> Taken<Resolved> {
         if key.ends_with(".marlin_ws") || key.ends_with(".marlin_ctmp") {
-            return Some(Resolved::Zeroed);
+            return Ok(Some(Resolved::Zeroed));
         }
         // 设备重排原始键(2026-10-13 DFlash2 草稿提速):`{base}.packed_raw`
         // = 检查点原始 ct packed i32 原样(CPU 零重排;重排交 GPU
@@ -170,38 +203,44 @@ impl W4A16Source {
             // 原始 ct packed i32 → **U32 字节**(零重排)。注意:不可用
             // `Resolved::View` —— 它走 passthrough 归一 F16(I32 条目落
             // `_ => None` → 缺键);此处一律 Bytes/U32。
-            return Some(Resolved::Bytes(self.linear_bytes_for(base, key)?, Dtype::U32));
+            let Some(__b) = self.linear_bytes_for(base, key)? else { return Ok(None) };
+            return Ok(Some(Resolved::Bytes(__b, Dtype::U32)));
         }
         // DFlash2 fc 列块五拆派生(E5-DF3.5):`fc_{i}.qweight/.scales` =
         // fc.weight_packed/scale 列块 i(in 维 [i*5120,(i+1)*5120);
         // packed [out, k/8] 列连续 ↔ in 连续,块宽 640/40)
         if let Some(base) = key.strip_suffix(".qweight") {
             if let Some(i) = fc_block_index(base) {
-                return Some(Resolved::Bytes(self.fc_block_bytes(i, false)?, Dtype::U32));
+                let Some(__b) = self.fc_block_bytes(i, false)? else { return Ok(None) };
+                return Ok(Some(Resolved::Bytes(__b, Dtype::U32)));
             }
         }
         if let Some(base) = key.strip_suffix(".scales") {
             if let Some(i) = fc_block_index(base) {
-                return Some(Resolved::Bytes(self.fc_block_bytes(i, true)?, Dtype::F16));
+                let Some(__b) = self.fc_block_bytes(i, true)? else { return Ok(None) };
+                return Ok(Some(Resolved::Bytes(__b, Dtype::F16)));
             }
         }
         if let Some(base) = key.strip_suffix(".qweight") {
-            return Some(Resolved::Bytes(self.linear_bytes_for(base, key)?, Dtype::U32));
+            let Some(__b) = self.linear_bytes_for(base, key)? else { return Ok(None) };
+            return Ok(Some(Resolved::Bytes(__b, Dtype::U32)));
         }
         if let Some(base) = key.strip_suffix(".scales") {
-            return Some(Resolved::Bytes(self.linear_bytes_for(base, key)?, Dtype::F16));
+            let Some(__b) = self.linear_bytes_for(base, key)? else { return Ok(None) };
+            return Ok(Some(Resolved::Bytes(__b, Dtype::F16)));
         }
         // passthrough 优先(norm/conv/embed 等原生存量键)
         if let Some(e) = self.index.get(key) {
-            return Some(Resolved::View(e.clone()));
+            return Ok(Some(Resolved::View(e.clone())));
         }
         // 非门控线性反量化臂(Linear 与本源同谓词,该键只对 non-eligible 出现)
         if let Some(base) = key.strip_suffix(".weight") {
             if self.index.contains_key(&format!("{base}.weight_packed")) {
-                return Some(Resolved::Bytes(self.linear_bytes_for(base, key)?, Dtype::F16));
+                let Some(__b) = self.linear_bytes_for(base, key)? else { return Ok(None) };
+                return Ok(Some(Resolved::Bytes(__b, Dtype::F16)));
             }
         }
-        None
+        Ok(None)
     }
 
     /// fc 列块物化(E5-DF3.5):fc.weight_packed [5120, 3200] I32 列子阵
@@ -211,17 +250,17 @@ impl W4A16Source {
     ///   fc 列块**原始 ct packed** 字节(设备重排核的输入;不做 marlin 重排)
     ///   —— 与 [`Self::fc_block_bytes`] 的区别:后者返回的是**已重排的 marlin B**
     ///   (CPU 臂产物),喂给 GPU CtRepack 会二次重排 = 垃圾(2026-10-13 立案)。
-    fn fc_block_raw_bytes(&self, blk: usize) -> Option<Arc<[u8]>> {
+    fn fc_block_raw_bytes(&self, blk: usize) -> Taken<Arc<[u8]>> {
         let vkey = format!("fc_block_{blk}_raw");
         {
-            let cache = self.cache.lock().unwrap();
+            let cache = self.cache_guard();
             if let Some(b) = cache.0.get(&vkey) {
-                return Some(b.clone());
+                return Ok(Some(b.clone()));
             }
         }
-        let pe = self.index.get("fc.weight_packed")?;
-        let out = *pe.shape.first()?;
-        let packed_cols = *pe.shape.get(1)?;
+        let Some(pe) = self.index.get("fc.weight_packed") else { return Ok(None) };
+        let Some(out) = pe.shape.first().copied() else { return Ok(None) };
+        let Some(packed_cols) = pe.shape.get(1).copied() else { return Ok(None) };
         let n_fc = 5usize;
         let cols = packed_cols / n_fc;
         let packed_bytes = &self.maps[pe.map_ix][pe.start..pe.start + pe.nbytes];
@@ -233,28 +272,32 @@ impl W4A16Source {
             );
         }
         let buf: Arc<[u8]> = Arc::from(i32s_le_bytes(&packed).into_boxed_slice());
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache_guard();
         cache.1 += buf.len();
         cache.0.insert(vkey, buf.clone());
-        Some(buf)
+        Ok(Some(buf))
     }
 
-    fn fc_block_bytes(&self, blk: usize, scales_side: bool) -> Option<Arc<[u8]>> {
+    fn fc_block_bytes(&self, blk: usize, scales_side: bool) -> Taken<Arc<[u8]>> {
         let vkey = format!("fc_block_{blk}_{}", if scales_side { "s" } else { "q" });
         {
-            let cache = self.cache.lock().unwrap();
+            let cache = self.cache_guard();
             if let Some(b) = cache.0.get(&vkey) {
-                return Some(b.clone());
+                return Ok(Some(b.clone()));
             }
         }
-        let pe = self.index.get("fc.weight_packed")?;
-        let se = self.index.get("fc.weight_scale")?;
-        let out = *pe.shape.first()?;
-        let packed_cols = *pe.shape.get(1)?; // k_all / 8 = 3200
+        let Some(pe) = self.index.get("fc.weight_packed") else { return Ok(None) };
+        let Some(se) = self.index.get("fc.weight_scale") else { return Ok(None) };
+        let Some(out) = pe.shape.first().copied() else { return Ok(None) };
+        let Some(packed_cols) = pe.shape.get(1).copied() else {
+            return Ok(None);
+        }; // k_all / 8 = 3200
         let n_fc = 5usize;
         let cols = packed_cols / n_fc; // 640
-        let scol = *se.shape.get(1)? / n_fc; // 40
-        let _g = self.build_lock.lock().unwrap();
+        let Some(scol) = se.shape.get(1).copied().map(|x| x / n_fc) else {
+            return Ok(None);
+        }; // 40
+        let _g = self.build_guard();
         let packed_bytes = &self.maps[pe.map_ix][pe.start..pe.start + pe.nbytes];
         let packed_all = i32s_par(packed_bytes);
         let scale_bytes = &self.maps[se.map_ix][se.start..se.start + se.nbytes];
@@ -281,9 +324,7 @@ impl W4A16Source {
             let mut q_buf: Vec<u8> = Vec::new();
             unpack_nibbles_into(&packed, out, k_blk, &mut q_buf);
             let idx = self
-                .idx_cache
-                .lock()
-                .unwrap()
+                .idx_guard()
                 .entry((k_blk, out))
                 .or_insert_with(|| Arc::new(marlin_gather_indices(k_blk, out)))
                 .clone();
@@ -292,25 +333,25 @@ impl W4A16Source {
             pack_marlin_b_gather_into(&q_buf, &idx, words, &mut b_buf);
             Arc::from(i32s_le_bytes(&b_buf).into_boxed_slice())
         };
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache_guard();
         cache.0.insert(vkey.clone(), buf.clone());
         cache.1 += buf.len();
-        Some(buf)
+        Ok(Some(buf))
     }
 
     /// 量化线性物化(键首触才建;qweight/scales 成对,weight 独立)。
     /// 双检缓存(快路径锁内查;构建在 build_lock 串行内,防并发双建)。
-    fn linear_bytes_for(&self, base: &str, key: &str) -> Option<Arc<[u8]>> {
+    fn linear_bytes_for(&self, base: &str, key: &str) -> Taken<Arc<[u8]>> {
         // 刀2 虚拟合并:in_proj_qkvz = row-stack(in_proj_qkv, in_proj_z)
         // (同 k 行堆叠 = 字节拼接;两子基各自走完整建管)
         if let Some((b1, b2)) = crate::formats::split_qkvz(base) {
             let suffix = &key[base.len()..];
-            let s1 = self.linear_bytes_for(&b1, &format!("{b1}{suffix}"))?;
-            let s2 = self.linear_bytes_for(&b2, &format!("{b2}{suffix}"))?;
+            let Some(s1) = self.linear_bytes_for(&b1, &format!("{b1}{suffix}"))? else { return Ok(None) };
+            let Some(s2) = self.linear_bytes_for(&b2, &format!("{b2}{suffix}"))? else { return Ok(None) };
             let mut buf = Vec::with_capacity(s1.len() + s2.len());
             buf.extend_from_slice(&s1);
             buf.extend_from_slice(&s2);
-            return Some(buf.into());
+            return Ok(Some(buf.into()));
         }
         // 设备重排原始键(2026-10-13 DFlash2 草稿提速):必须在
         // `linear_dims` **之前** —— fc 列块(`fc_0..4`)是派生键,没有
@@ -321,21 +362,22 @@ impl W4A16Source {
                 return self.fc_block_raw_bytes(i);
             }
             if let Some(pe) = self.index.get(&format!("{b}.weight_packed")) {
-                return Some(Arc::from(
+                return Ok(Some(Arc::from(
                     self.maps[pe.map_ix][pe.start..pe.start + pe.nbytes].to_vec(),
-                ));
+                )));
             }
-            return None;
+            return Ok(None);
         }
-        let (out, k, pe, se) = self.linear_dims(base)?;
+        let Some((out, k, pe, se)) = self.linear_dims(base)? else { return Ok(None) };
         {
-            let cache = self.cache.lock().unwrap();
+            let cache = self.cache_guard();
             if let Some(b) = cache.0.get(key) {
-                return Some(b.clone());
+                return Ok(Some(b.clone()));
             }
         }
-        self.build_linear(base, out, k, pe, se).ok()?;
-        self.cache.lock().unwrap().0.get(key).cloned()
+        // 2026-10-17 审查 §③:构建真失败 = **上抛**(原 `.ok()?` 压成 None ⇒ "缺键"假归因)
+        self.build_linear(base, out, k, pe, se)?;
+        Ok(self.cache_guard().0.get(key).cloned())
     }
 
     /// 真构建(串行;内部 rayon 饱和)
@@ -347,7 +389,7 @@ impl W4A16Source {
         pe: &RawEntry,
         se: &RawEntry,
     ) -> Result<(), ModelError> {
-        let _g = self.build_lock.lock().unwrap();
+        let _g = self.build_guard();
         let t0 = std::time::Instant::now();
         // 源视图:i32 packed(rayon 转换,对齐安全)+ bf16 scales → f32
         let packed_bytes = &self.maps[pe.map_ix][pe.start..pe.start + pe.nbytes];
@@ -374,9 +416,7 @@ impl W4A16Source {
             let mut q_buf: Vec<u8> = Vec::new();
             unpack_nibbles_into(&packed, out, k, &mut q_buf);
             let idx = self
-                .idx_cache
-                .lock()
-                .unwrap()
+                .idx_guard()
                 .entry((k, out))
                 .or_insert_with(|| Arc::new(marlin_gather_indices(k, out)))
                 .clone();
@@ -404,7 +444,7 @@ impl W4A16Source {
                 out * k * 2,
             ));
         }
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache_guard();
         let add: usize = inserts.iter().map(|(_, _, b)| b).sum();
         if cache.1 + add > CACHE_CAP_BYTES {
             cache.0.clear();
@@ -423,9 +463,17 @@ impl W4A16Source {
     }
 
     /// 键全量字节视图(懒物化 / passthrough 归一;take/take_range 用)
-    fn key_bytes(&self, key: &str) -> Option<(KeyData, Dtype)> {
-        Some(match self.resolve(key)? {
-            Resolved::Zeroed => (KeyData::Owned(vec![0; self.elem_len(key)? * 4]), Dtype::U32),
+    fn key_bytes(&self, key: &str) -> Taken<(KeyData, Dtype)> {
+        let Some(resolved) = self.resolve(key)? else {
+            return Ok(None);
+        };
+        Ok(Some(match resolved {
+            Resolved::Zeroed => {
+                let Some(n) = self.elem_len(key)? else {
+                    return Ok(None);
+                };
+                (KeyData::Owned(vec![0; n * 4]), Dtype::U32)
+            }
             Resolved::View(e) => {
                 // passthrough 归一 F16 字节(want dtype 恒 F16)
                 let src = &self.maps[e.map_ix][e.start..e.start + e.nbytes];
@@ -434,19 +482,16 @@ impl W4A16Source {
                     safetensors::Dtype::F16 => out.copy_from_slice(src),
                     safetensors::Dtype::BF16 => bf16_bytes_to_f16_bytes(src, &mut out),
                     safetensors::Dtype::F32 => out = f32_bytes_to_f16(src),
-                    _ => return None, // weight_shape 等元数据键不可取
+                    _ => return Ok(None), // weight_shape 等元数据键不可取
                 }
                 (KeyData::Owned(out), Dtype::F16)
             }
             Resolved::Bytes(b, dt) => (KeyData::Shared(b), dt),
-        })
+        }))
     }
 }
 
 /// `len × esz` 的检查乘法(溢出/越界 ⇒ None,调用方收割为缺键)
-fn checked_len(len: usize, esz: usize) -> Option<usize> {
-    len.checked_mul(esz)
-}
 
 enum KeyData {
     Owned(Vec<u8>),
@@ -463,86 +508,87 @@ impl KeyData {
 }
 
 impl WeightSource for W4A16Source {
-    fn take(&self, key: &str) -> Option<Vec<f32>> {
-        let n = self.elem_len(key)?;
+    fn take(&self, key: &str) -> Taken<Vec<f32>> {
+        let Some(n) = self.elem_len(key)? else { return Ok(None) };
         self.take_range(key, 0, n)
     }
 
-    fn elem_len(&self, key: &str) -> Option<usize> {
+    fn elem_len(&self, key: &str) -> Taken<usize> {
         // 元数据键(I64 [out,in])owl 不消费,拒绝可取化
         if key.ends_with(".weight_shape") {
-            return None;
+            return Ok(None);
         }
         // fc 列块派生(E5-DF3.5):fc_{i}.qweight = out*640 U32 /
         // fc_{i}.scales = out*40 F16;fc_{i}.weight = out*5120 F16(反量化)
         if let Some(base) = key.strip_suffix(".qweight") {
             if fc_block_index(base).is_some() {
-                return Some(5120 * 640);
+                return Ok(Some(5120 * 640));
             }
         }
         if let Some(base) = key.strip_suffix(".scales") {
             if fc_block_index(base).is_some() {
-                return Some(5120 * 40);
+                return Ok(Some(5120 * 40));
             }
         }
         if let Some(base) = key.strip_suffix(".weight") {
             if fc_block_index(base).is_some() {
-                return Some(5120 * 5120);
+                return Ok(Some(5120 * 5120));
             }
         }
         // 派生键:尺寸由基线性形状推导;谓词门控(eligible → qweight/scales/
         // ws/ctmp;non-eligible → weight),错位键报 None 免误消费
         if let Some(base) = key.strip_suffix(".marlin_ws") {
-            let (out, k, _, _) = self.linear_dims(base)?;
+            let Some((out, k, _, _)) = self.linear_dims(base)? else { return Ok(None) };
             if !marlin_eligible(out, k) {
-                return None;
+                return Ok(None);
             }
-            return Some(v2_workspace_len(marlin_n_pack(out)));
+            return Ok(Some(v2_workspace_len(marlin_n_pack(out))));
         }
         if let Some(base) = key.strip_suffix(".marlin_ctmp") {
-            let (out, k, _, _) = self.linear_dims(base)?;
+            let Some((out, k, _, _)) = self.linear_dims(base)? else { return Ok(None) };
             if !marlin_eligible(out, k) {
-                return None;
+                return Ok(None);
             }
-            return Some(1);
+            return Ok(Some(1));
         }
         if let Some(base) = key.strip_suffix(".qweight") {
-            let (out, k, _, _) = self.linear_dims(base)?;
+            let Some((out, k, _, _)) = self.linear_dims(base)? else { return Ok(None) };
             if !marlin_eligible(out, k) {
-                return None;
+                return Ok(None);
             }
-            return Some(out * k / 8);
+            return Ok(Some(out * k / 8));
         }
         if let Some(base) = key.strip_suffix(".scales") {
-            let (out, k, _, _) = self.linear_dims(base)?;
+            let Some((out, k, _, _)) = self.linear_dims(base)? else { return Ok(None) };
             if !marlin_eligible(out, k) {
-                return None;
+                return Ok(None);
             }
-            return Some(out * (k / 128));
+            return Ok(Some(out * (k / 128)));
         }
         if let Some(base) = key.strip_suffix(".weight") {
             if !self.index.contains_key(key) {
-                let (out, k, _, _) = self.linear_dims(base)?;
+                let Some((out, k, _, _)) = self.linear_dims(base)? else { return Ok(None) };
                 if marlin_eligible(out, k) {
-                    return None;
+                    return Ok(None);
                 }
-                return Some(out * k);
+                return Ok(Some(out * k));
             }
         }
-        self.index.get(key).map(|e| {
+        Ok(self.index.get(key).map(|e| {
             let elems: usize = e.shape.iter().product();
             elems
-        })
+        }))
     }
 
-    fn take_range(&self, key: &str, offset_elems: usize, len: usize) -> Option<Vec<f32>> {
-        let (data, dtype) = self.key_bytes(key)?;
+    fn take_range(&self, key: &str, offset_elems: usize, len: usize) -> Taken<Vec<f32>> {
+        let Some((data, dtype)) = self.key_bytes(key)? else { return Ok(None) };
         let bytes = data.as_slice();
         let esz = dtype.size_bytes();
-        let s = offset_elems.checked_mul(esz)?;
-        let e = s.checked_add(len.checked_mul(esz)?)?;
-        let win = bytes.get(s..e)?;
-        Some(match dtype {
+        let Some(s) = offset_elems.checked_mul(esz) else { return Ok(None) };
+        let Some(lb) = len.checked_mul(esz) else { return Ok(None) };
+        let Some(e) = s.checked_add(lb) else { return Ok(None) };
+        let Some(win) = bytes.get(s..e) else { return Ok(None) };
+        Ok(Some(match dtype {
             Dtype::F16 => win
                 .chunks_exact(2)
                 .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
@@ -555,7 +601,7 @@ impl WeightSource for W4A16Source {
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect(),
-        })
+        }))
     }
 
     /// 分块转换直写字节租约(主路径):懒物化/passthrough/零填充三臂。
@@ -566,28 +612,35 @@ impl WeightSource for W4A16Source {
         len: usize,
         dst: &mut [u8],
         dtype: Dtype,
-    ) -> Option<()> {
+    ) -> Taken<()> {
         let esz = dtype.size_bytes();
-        let need = len.checked_mul(esz)?;
+        let Some(need) = len.checked_mul(esz) else { return Ok(None) };
+        // 目标缓冲不足 = **调用方违约** ⇒ 响亮拒(旧版返回 None ⇒ 被上层收成"缺键")
         if need > dst.len() {
-            return None;
+            return Err(ModelError::Msg(format!(
+                "w4a16::convert_chunk_into_bytes: dst {}B < 需 {need}B({dtype:?}, len {len})",
+                dst.len()
+            )));
         }
-        match self.resolve(key)? {
+        let Some(resolved) = self.resolve(key)? else {
+            return Ok(None);
+        };
+        match resolved {
             Resolved::Zeroed => {
                 dst[..need].fill(0);
-                Some(())
+                Ok(Some(()))
             }
             Resolved::View(e) => {
                 // F16 want(存量主路径)/ BF16 want(E5-DF3 同日十四;DFlash2
                 // 草稿 BF16 化 —— passthrough 权重原生 BF16,直拷零转换,
                 // sglang .to(bf16) 同位)
                 if dtype != Dtype::F16 && dtype != Dtype::BF16 {
-                    return None;
+                    return Ok(None);
                 }
                 let src_esz = match e.dtype {
                     safetensors::Dtype::BF16 | safetensors::Dtype::F16 => 2,
                     safetensors::Dtype::F32 => 4,
-                    _ => return None,
+                    _ => return Ok(None),
                 };
                 let s = e.start + offset_elems * src_esz;
                 let win = &self.maps[e.map_ix][s..s + len * src_esz];
@@ -616,19 +669,22 @@ impl WeightSource for W4A16Source {
                                 .copy_from_slice(&half::bf16::from_f32(f).to_le_bytes());
                         }
                     }
-                    _ => return None,
+                    _ => return Ok(None),
                 }
                 self.maps[e.map_ix].dontneed(s, len * src_esz);
-                Some(())
+                Ok(Some(()))
             }
             Resolved::Bytes(b, reg) => {
                 let src_esz = reg.size_bytes();
                 let s = offset_elems * src_esz;
-                let win = b.get(s..s + checked_len(len, src_esz)?)?;
+                let Some(sz) = checked_len(len, src_esz) else {
+                    return Ok(None);
+                };
+                let Some(win) = b.get(s..s + sz) else { return Ok(None) };
                 if reg == dtype {
                     // 声明一致 ⇒ 逐字节直拷(零转换)
                     dst[..need].copy_from_slice(win);
-                    return Some(());
+                    return Ok(Some(()));
                 }
                 // **声明=事实**下的显式转换(2026-10-16 定谳):F16 ↔ BF16
                 // (同为 2B 值域;由调用方按 want 的声明 dtype 决定方向)。
@@ -638,9 +694,9 @@ impl WeightSource for W4A16Source {
                         dst[..need].copy_from_slice(&f16_bytes_to_bf16_bytes(win))
                     }
                     (Dtype::BF16, Dtype::F16) => bf16_bytes_to_f16_bytes(win, &mut dst[..need]),
-                    _ => return None,
+                    _ => return Ok(None),
                 }
-                Some(())
+                Ok(Some(()))
             }
         }
     }
@@ -650,106 +706,10 @@ impl WeightSource for W4A16Source {
 // 字节转换助手(rayon;对齐安全 from_le_bytes)—— pub(crate):awq.rs 共享
 // ============================================================================
 
-pub(crate) fn i32s_par(bytes: &[u8]) -> Vec<i32> {
-    use rayon::prelude::*;
-    let n = bytes.len() / 4;
-    let mut v = vec![0i32; n];
-    v.par_chunks_mut(1 << 16)
-        .enumerate()
-        .for_each(|(t, chunk)| {
-            for (i, cell) in chunk.iter_mut().enumerate() {
-                let o = (t * (1 << 16) + i) * 4;
-                *cell = i32::from_le_bytes([
-                    bytes[o],
-                    bytes[o + 1],
-                    bytes[o + 2],
-                    bytes[o + 3],
-                ]);
-            }
-        });
-    v
-}
-
-/// f16 位型字节 → BF16 位型字节(E5-DF3 同日十二:syvai W4A16 的 scales
-/// = F16,而 BF16 激活的 marlin 实例要求 s_type = BF16;值经 f32 中转,
-/// 尾数 10→7 位 ≈ 0.4% 相对误差,远小于量化噪声)。
-fn f16_bytes_to_bf16_bytes(bytes: &[u8]) -> Vec<u8> {
-    bytes
-        .chunks_exact(2)
-        .flat_map(|c| {
-            half::bf16::from_f32(half::f16::from_le_bytes([c[0], c[1]]).to_f32()).to_le_bytes()
-        })
-        .collect::<Vec<u8>>()
-}
-
-pub(crate) fn bf16_par(bytes: &[u8]) -> Vec<f32> {
-    use rayon::prelude::*;
-    let n = bytes.len() / 2;
-    let mut v = vec![0f32; n];
-    v.par_chunks_mut(1 << 16)
-        .enumerate()
-        .for_each(|(t, chunk)| {
-            for (i, cell) in chunk.iter_mut().enumerate() {
-                let o = (t * (1 << 16) + i) * 2;
-                *cell = f32::from_bits(
-                    (u16::from_le_bytes([bytes[o], bytes[o + 1]]) as u32) << 16,
-                );
-            }
-        });
-    v
-}
-
-/// F16 平行读(2026-10-07 E5-DF3 定谳:syvai W4A16 的 weight_scale = F16
-/// 标注 + F16 字节,曾全走 bf16_par 按 BF16 位型读 → 草稿全部 W4A16 权重
-/// = 噪声 → 草稿前向废 → AL=0。scale 读法必须按 index 声明 dtype 分派。
-/// 对照检验:两种读法对 z-lab BF16 源 fc 权重做相关,F16 读 0.977 /
-/// BF16 读 0.016。)
-pub(crate) fn f16_par(bytes: &[u8]) -> Vec<f32> {
-    use rayon::prelude::*;
-    let n = bytes.len() / 2;
-    let mut v = vec![0f32; n];
-    v.par_chunks_mut(1 << 16)
-        .enumerate()
-        .for_each(|(t, chunk)| {
-            for (i, cell) in chunk.iter_mut().enumerate() {
-                let o = (t * (1 << 16) + i) * 2;
-                *cell = half::f16::from_le_bytes([bytes[o], bytes[o + 1]]).to_f32();
-            }
-        });
-    v
-}
-
-/// scale 平行读分派:按 RawEntry 声明 dtype 选 F16/BF16 位型
-pub(crate) fn scales_par(dt: safetensors::Dtype, bytes: &[u8]) -> Vec<f32> {
-    match dt {
-        safetensors::Dtype::F16 => f16_par(bytes),
-        _ => bf16_par(bytes),
-    }
-}
-
-fn f32_bytes_to_f16(bytes: &[u8]) -> Vec<u8> {
-    use rayon::prelude::*;
-    let mut out = vec![0u8; bytes.len() / 2];
-    out.par_chunks_exact_mut(2)
-        .zip(bytes.par_chunks_exact(4))
-        .for_each(|(o, c)| {
-            let h = half::f16::from_f32(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
-            o[0] = h.to_le_bytes()[0];
-            o[1] = h.to_le_bytes()[1];
-        });
-    out
-}
-
-pub(crate) fn i32s_le_bytes(v: &[i32]) -> Vec<u8> {
-    v.iter().flat_map(|x| x.to_le_bytes()).collect()
-}
-
-pub(crate) fn u16s_le_bytes(v: &[u16]) -> Vec<u8> {
-    v.iter().flat_map(|x| x.to_le_bytes()).collect()
-}
-
 /// DFlash2 fc 列块键解析:`fc_{i}`(i < 5)→ Some(i);其余 None。
 fn fc_block_index(base: &str) -> Option<usize> {
+    // ⚠️ 本函数**不在 Taken 链上**(纯键名解析,无 I/O)⇒ 保持 Option:机械改写
+    // 时曾把它的 `return None` 一并升格,编译器当场拦下(2026-10-17)
     let idx = base.strip_prefix("fc_")?;
     if idx.len() != 1 || !idx.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -773,6 +733,8 @@ fn fc_block_index(base: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 测试面专用(生产段不用;放这里 ⇒ 生产构建零 unused 告警)
+    use crate::formats::util::f16_par;
 
     fn draft_dir() -> Option<std::path::PathBuf> {
         owl_shared::env_reader::str("OWL_DFLASH2_DIR").map(std::path::PathBuf::from)
@@ -808,7 +770,7 @@ mod tests {
         for blk in 0..N_FC {
             // ---- ① 尺度:派生(按**内容口径 BF16** 解)== fused 列块(按 F16 解)----
             let skey = format!("fc_{blk}.scales");
-            let (sb, sdt) = src.key_bytes(&skey).expect("派生尺度");
+            let (sb, sdt) = src.key_bytes(&skey).expect("源").expect("派生尺度");
             assert_eq!(sdt, Dtype::F16, "{skey}: 线格式声明必须保持 F16(算子表口径)");
             // 派生尺度 = **f16 位型的 marlin S**(声明 F16 ⇒ 事实 F16;bf16 臂的转换在装载侧)
             let got = f16_par(sb.as_slice());
@@ -828,7 +790,7 @@ mod tests {
 
             // ---- ② marlin B:派生 == 由 fused 列块现算(逐字)----
             let qkey = format!("fc_{blk}.qweight");
-            let (qb, qdt) = src.key_bytes(&qkey).expect("派生 qweight");
+            let (qb, qdt) = src.key_bytes(&qkey).expect("源").expect("派生 qweight");
             assert_eq!(qdt, Dtype::U32, "{qkey}: B 以 U32 承载");
             let derived = i32s_par(qb.as_slice());
             // fused 列块(行主序 [out, cols])→ 解包 → marlin B 期望值
@@ -860,7 +822,7 @@ mod tests {
             // (设备路线的 B 由 GPU CtRepack 现产;若它的输入切块错了,CPU 路线的绿
             //  并不能替它背书 —— 2026-10-16 补:这条正是 16.6× 的剩余嫌疑面)
             let rkey = format!("fc_{blk}.packed_raw");
-            let (rb, rdt) = src.key_bytes(&rkey).expect("派生 packed_raw");
+            let (rb, rdt) = src.key_bytes(&rkey).expect("源").expect("派生 packed_raw");
             assert_eq!(rdt, Dtype::U32, "{rkey}: 原始 ct 字以 U32 承载");
             let raw = i32s_par(rb.as_slice());
             let want_raw: Vec<i32> = (0..OUT)
