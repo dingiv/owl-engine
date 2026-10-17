@@ -1,5 +1,6 @@
 //! spec 轮机器(execute_spec_round)+ 块表写 + GDN 快照
 use super::*;
+use owl_models::ModelError;
 
 impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// 投机轮执行(E5-M2b;施工方案 §9.2):快照 → 草稿到位 → verify
@@ -15,7 +16,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         gdn_slot: usize,
         grew: bool,
     ) -> Result<TurnEvent> {
-        let sid = self.turns.active.as_ref().expect("active 已保证").session_id;
+        let sid = self.turns.active()?.session_id;
         if grew {
             let ts_bt = std::time::Instant::now();
             self.write_bt(sid).await?;
@@ -31,17 +32,17 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let depth = self.spec.depth;
 
         // ① 快照(轮首;恢复后仍有效 → 只在失效时拍)
-        if !self.tspec().spec_snap_valid {
+        if !self.tspec()?.spec_snap_valid {
             let ts = std::time::Instant::now();
             let face = self.graphs.session.face_mut();
             self.pool.capture_spec_snap(face, gdn_slot).await?;
-            self.tspec().spec_snap_valid = true;
+            self.tspec()?.spec_snap_valid = true;
             t_snap = ts.elapsed();
         }
 
         // ② 草稿到位(host 账;轮末 propose 图/eager dtoh 产出。首轮 =
         // prefill seed propose(eager);Dumb = anchor 重复)
-        let drafts: Vec<u32> = if let Some(mut d) = self.tspec().spec_drafts_host.take() {
+        let drafts: Vec<u32> = if let Some(mut d) = self.tspec()?.spec_drafts_host.take() {
             // depth 联动截断(2026-10-09 depth=3 案):⑦ propose 恒产 7
             // 草稿,depth<7 时下轮 block=1+7 行装不进 T=depth+1 捕获图
             // (ids 8≠4 装填拒,pump 退役)。与轮首直调分支的
@@ -58,7 +59,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let ts = std::time::Instant::now();
             self.propose_first(token, pos).await?;
             t_propose += ts.elapsed();
-            self.tspec().spec_drafts_host.take().expect("propose_first 产出")
+            self.tspec()?.spec_drafts_host.take().ok_or_else(|| ModelError::EngineInvariant { what: "propose_first 未产出草稿(上游相位漂移)".into() })?
         } else {
             vec![token; depth] // Dumb:哑草稿 = anchor 重复
         };
@@ -71,16 +72,16 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let rows_n = block.len();
         // A11:采样接受开关 + 采样参数 + 惩罚历史(必须在借 verify_graph 前取好)
         let (sampler_on, sampler_cfg) = {
-            let act = self.turns.active.as_ref().expect("活跃");
+            let act = self.turns.active()?;
             (act.sampler_on, act.sampler)
         };
         let mut hist: Vec<u32> = {
-            let act = self.turns.active.as_ref().expect("活跃");
+            let act = self.turns.active()?;
             let tail = act.prompt_ids.len().saturating_sub(64);
             act.prompt_ids[tail..].iter().chain(act.out.iter()).copied().collect()
         };
         let seed_base = {
-            let act = self.turns.active.as_ref().expect("活跃");
+            let act = self.turns.active()?;
             act.seed.unwrap_or_else(|| act.id.wrapping_mul(0x9E3779B97F4A7C15))
         };
         // XQA 页表:在借 self.graphs.verify 之前算好(自 sessions 取真块链)
@@ -92,7 +93,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let ts = std::time::Instant::now();
             let page = self.pool.page;
             let bt_chain = {
-                let s = self.bank.sessions.get(sid).expect("账在");
+                let s = self.bank.sessions.session(sid)?;
                 s.block_table.clone()
             };
             let ids_f: Vec<f32> = block.iter().map(|&v| v as f32).collect();
@@ -238,11 +239,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             mrec("spec.verify.lgread", t_lg.elapsed());
             mrec("spec.verify.read", t_read_v.elapsed());
             let ids: Vec<u32> = tok_f.iter().map(|&v| v as u32).collect();
-            let hidden = vg.output_block("hid").expect("hid 输出槽");
+            let hidden = vg.output_block("hid").ok_or_else(|| ModelError::EngineInvariant { what: "verify 图输出槽 hid 缺席(图装配与声明不一致)".into() })?;
             let n_rec = self.pool.gdn_count() * 8;
             let records: Vec<Bytes> = (0..n_rec)
-                .map(|i| vg.output_block(&format!("r{i}")).expect("fold 记录槽"))
-                .collect();
+                .map(|i| {
+                    vg.output_block(&format!("r{i}")).ok_or_else(|| ModelError::EngineInvariant {
+                        what: format!("fold 记录槽 r{i} 缺席(图装配与声明不一致)"),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
             t_verify = ts.elapsed();
             (ids, hidden, records, false, row_logits) // 图输出槽:持久,不 free
         } else {
@@ -301,7 +306,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let degraded_now;
         if self.spec.dflash_tap_count > 0 && self.probes.degrade_after > 0 {
             let (degrade_after, probe_every0) = (self.probes.degrade_after, self.probes.probe_every);
-            let spec = self.tspec();
+            let spec = self.tspec()?;
             spec.recent_rounds += 1;
             spec.recent_tokens += (m + 1) as u32;
             // 轮时进窗口(时间门 + 绝对吞吐;t_round 在下方 EWMA 处已用)
@@ -388,7 +393,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             mcnt("spec.al.win", u64::from(spec.recent_tokens * 100 / spec.recent_rounds.max(1)));
             degraded_now = degraded;
         } else {
-            degraded_now = self.tspec_ref().spec_degraded;
+            degraded_now = self.tspec_ref()?.spec_degraded;
         }
         // P0 修(2026-10-12):降级态在 emit 循环前定格 —— 预算/EOS 会在
         // 循环内 complete()(active 被取走),循环后触 tspec() = panic
@@ -439,7 +444,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let ts = std::time::Instant::now();
             let d = self.propose_graph_step(m, &toks, pos).await?;
             t_propose += ts.elapsed();
-            self.tspec().spec_drafts_host = Some(d);
+            self.tspec()?.spec_drafts_host = Some(d);
         } else if self.spec.drafter.is_some() {
             let ts = std::time::Instant::now();
             let nd = self.propose_round(&hidden, m, &toks, pos).await?;
@@ -451,7 +456,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 face.dtoh(&nd, &mut buf).await?;
                 face.free(&[nd.id]).await?;
             }
-            self.tspec().spec_drafts_host = Some(
+            self.tspec()?.spec_drafts_host = Some(
                 buf.chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
                     .collect(),
@@ -561,13 +566,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
             }
         }
-        self.tspec().spec_snap_valid = false;
+        self.tspec()?.spec_snap_valid = false;
 
         // ⑥ 提交:fed = bonus 位(F');发射 = 接受 drafts + bonus(m+1)
         // (A11:采样档 emitted = 采样表前 m+1 位;贪心档 = ids[..=m])
         let toks: Vec<u32> = emitted;
         {
-            let act = self.turns.active.as_mut().expect("活跃");
+            let act = self.turns.active_mut()?;
             act.fed = pos + m + 1;
         }
 
@@ -585,18 +590,23 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             if self.graphs.dflash.is_some() && !self.probes.dflash_eager {
                 let d = self.dflash_graph_round(m, pos, toks[m]).await?;
                 t_propose += ts.elapsed();
-                self.tspec().spec_drafts_host = Some(d);
+                self.tspec()?.spec_drafts_host = Some(d);
             } else {
             let noencode = self.probes.dflash_noencode;
             let taps: Vec<owl_iface::contract::Bytes> = (0..self.spec.dflash_tap_count)
                 .map(|i| {
-                    self.graphs.verify
+                    self.graphs
+                        .verify
                         .as_ref()
-                        .expect("dflash 模式要求 verify 图(taps 输出)")
+                        .ok_or_else(|| ModelError::EngineInvariant {
+                            what: "dflash 模式要求 verify 图(taps 输出)".into(),
+                        })?
                         .output_block(&format!("tap{i}"))
-                        .expect("tap 输出槽")
+                        .ok_or_else(|| ModelError::EngineInvariant {
+                            what: format!("tap{i} 输出槽缺席(草稿档位不一致)"),
+                        })
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             if !noencode {
                 self.dflash_encode(&d2, &taps, m, pos).await?;
             }
@@ -608,13 +618,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 owl_shared::log_debug!("dflash-probe", "pos={fp} bonus={bonus} drafts={d:?} txt={toks_txt:?}");
             }
             t_propose += ts.elapsed();
-            self.tspec().spec_drafts_host = Some(d);
+            self.tspec()?.spec_drafts_host = Some(d);
             }
         } else if !self.graphs.propose.is_empty() && !self.probes.propose_eager {
             let ts = std::time::Instant::now();
             let d = self.propose_graph_step(m, &toks, pos).await?;
             t_propose += ts.elapsed();
-            self.tspec().spec_drafts_host = Some(d);
+            self.tspec()?.spec_drafts_host = Some(d);
         } else if self.spec.drafter.is_some() {
             let ts = std::time::Instant::now();
             let nd = self.propose_round(&hidden, m, &toks, pos).await?;
@@ -626,7 +636,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 face.dtoh(&nd, &mut buf).await?;
                 face.free(&[nd.id]).await?;
             }
-            self.tspec().spec_drafts_host = Some(
+            self.tspec()?.spec_drafts_host = Some(
                 buf.chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
                     .collect(),
@@ -746,7 +756,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     }
 
     pub(crate) async fn write_bt(&mut self, sid: u64) -> Result<()> {
-        let table = self.bank.sessions.get(sid).expect("账在").block_table.clone();
+        let table = self.bank.sessions.session(sid)?.block_table.clone();
         let face = self.graphs.session.face_mut();
         self.pool.write_bt(face, &table).await
     }
@@ -823,3 +833,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         Ok(seg)
     }
 }
+
+
+
+

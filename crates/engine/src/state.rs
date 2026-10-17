@@ -848,7 +848,7 @@ impl StatePool {
         face: &mut D,
         table: &[u32],
     ) -> Result<()> {
-        let b = self.bt_mtp.as_ref().expect("bt_mtp 未分配(mtp 模式)");
+        let b = self.bt_mtp.as_ref().ok_or_else(|| ModelError::EngineInvariant { what: "bt_mtp 未分配(mtp 档位不一致)".into() })?;
         let mut v = vec![0f32; self.nb];
         for (i, x) in table.iter().enumerate() {
             v[i] = *x as f32;

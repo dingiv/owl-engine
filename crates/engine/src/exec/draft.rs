@@ -1,5 +1,6 @@
 //! 草稿器面(DFlash2 单图 encode+propose / eager / MTP 链 / verify 前向)
 use super::*;
+use owl_models::ModelError;
 
 impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// DFlash2 propose 单图一轮(E5-DF4):输入槽装填(tokens/anchor/
@@ -15,8 +16,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let fp = pos + m + 1;
         let _page = self.pool.page;
         {
-            let act = self.turns.active.as_ref().expect("active 已保证");
-            let s = self.bank.sessions.get_mut(act.session_id).expect("账在");
+            let act = self.turns.active()?;
+            let s = self.bank.sessions.session_mut(act.session_id)?;
             let before = s.block_table.len();
             self.bank.leg_target.ensure_for_len(&mut s.block_table, fp + 8)?;
             if s.block_table.len() != before {
@@ -41,7 +42,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let prop_kv_lens: Vec<f32> = (0..8).map(|i| (fp + 1 + i) as f32).collect();
         let kv_len = vec![(fp + 8) as f32];
         let anchor = vec![bonus as f32];
-        let pg = self.graphs.dflash.as_mut().expect("dflash_graph");
+        let pg = self.graphs.dflash.as_mut().ok_or_else(|| ModelError::EngineInvariant { what: "dflash_graph 缺席(档位不一致)".into() })?;
         let prof = self.probes.step_profile;
         let t0 = prof.then(std::time::Instant::now);
         pg.step(&[
@@ -92,7 +93,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             Some(crate::spec_runtime::Drafter::DFlash2(d)) => std::sync::Arc::clone(d),
             _ => unreachable!("prefill_dflash_encode 非 dflash 模式"),
         };
-        let rope = self.spec.draft_rope.as_ref().expect("draft rope").clone();
+        let rope = self.spec.draft_rope.as_ref().ok_or_else(|| ModelError::EngineInvariant { what: "draft rope 缺席(草稿档位不一致)".into() })?.clone();
         let t = tap_views[0].shape()[0];
         let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
         let pos_t = TensorOps::from_host(
@@ -103,12 +104,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 草稿池线性逻辑寻址(slot = 逻辑位;NC 前缀读 [0, prefix) 直排;
         // bt 物理槽仅首 session 重合 —— slot≥1 案修,2026-10-10)
         let (_bt_chain, _) = {
-            let act = self.turns.active.as_ref().expect("active 已保证");
-            let s = self.bank.sessions.get(act.session_id).expect("账在");
+            let act = self.turns.active()?;
+            let s = self.bank.sessions.session(act.session_id)?;
             (s.block_table.clone(), s.gdn_slot)
         };
         let _page = self.pool.page;
-        let leaves = self.pool.dflash_kv_leaves().expect("dflash 池");
+        let leaves = self.pool.dflash_kv_leaves().ok_or_else(|| ModelError::EngineInvariant { what: "dflash KV 池句柄缺席(档位/池几何不一致)".into() })?;
         let bt = self.pool.bt_leaf_flat();
         let kvs: Vec<KvBuffers> = leaves
             .iter()
@@ -165,7 +166,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             Some(crate::spec_runtime::Drafter::DFlash2(d)) => std::sync::Arc::clone(d),
             _ => unreachable!("dflash_propose 非 dflash 模式"),
         };
-        let rope = self.spec.draft_rope.as_ref().expect("draft rope").clone();
+        let rope = self.spec.draft_rope.as_ref().ok_or_else(|| ModelError::EngineInvariant { what: "draft rope 缺席(草稿档位不一致)".into() })?.clone();
         let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
         // 噪声块 token/位置表(8 行定形)
         let mut toks = vec![anchor as f32];
@@ -181,11 +182,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // assign_extend_cache_locs [prefix_len, prefix_len+block_size) 同位;
         // 曾误填 0..8 —— 每轮把位置 0..7 的 memory 前缀 KV 磨成噪声块
         // 残写,永久污染窗口头部 → AL=0 案真凶,2026-10-08 定谳)
-        let leaves = self.pool.dflash_kv_leaves().expect("dflash 池");
+        let leaves = self.pool.dflash_kv_leaves().ok_or_else(|| ModelError::EngineInvariant { what: "dflash KV 池句柄缺席(档位/池几何不一致)".into() })?;
         let bt = self.pool.bt_leaf_flat();
         let (_bt_chain, _) = {
-            let act = self.turns.active.as_ref().expect("active 已保证");
-            let s = self.bank.sessions.get(act.session_id).expect("账在");
+            let act = self.turns.active()?;
+            let s = self.bank.sessions.session(act.session_id)?;
             (s.block_table.clone(), s.gdn_slot)
         };
         let page = self.pool.page;
@@ -195,8 +196,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 伴设备侧重写,否则 scheduler 下轮 grew=false 跳过 write_bt,
         // 烘焙块表停代(gate9 文本分歧 / gate10 空轮两案真凶)
         {
-            let act = self.turns.active.as_ref().expect("active 已保证");
-            let s = self.bank.sessions.get_mut(act.session_id).expect("账在");
+            let act = self.turns.active()?;
+            let s = self.bank.sessions.session_mut(act.session_id)?;
             let before = s.block_table.len();
             self.bank.leg_target.ensure_for_len(&mut s.block_table, pos + 8)?;
             if s.block_table.len() != before {
@@ -205,8 +206,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
         }
         let (bt_chain, _) = {
-            let act = self.turns.active.as_ref().expect("active 已保证");
-            let s = self.bank.sessions.get(act.session_id).expect("账在");
+            let act = self.turns.active()?;
+            let s = self.bank.sessions.session(act.session_id)?;
             (s.block_table.clone(), s.gdn_slot)
         };
         if self.probes.dflash_probe {
@@ -361,7 +362,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     .collect();
                 owl_shared::log_debug!("dflash-probe", "root{i} ({}) |x|前512和 = {s} head={head:?}", pr.shape().iter().map(|v| v.to_string()).collect::<Vec<_>>().join("x"));
             }
-            let lb = outs.last().expect("logits root");
+            let lb = outs.last().ok_or_else(|| ModelError::EngineInvariant { what: "draft:logits root 缺席".into() })?;
             let mut lbuf = vec![0u8; 7 * 248320 * 2];
             {
                 let face = self.graphs.session.face_mut();
@@ -383,9 +384,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     })
                     .collect();
                 let mut top: Vec<(f32, usize)> = row0.into_iter().collect();
-                top.select_nth_unstable_by(7, |a, b| b.0.partial_cmp(&a.0).unwrap());
+                top.select_nth_unstable_by(7, |a, b| b.0.total_cmp(&a.0));
                 top.truncate(8);
-                top.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                top.sort_by(|a, b| b.0.total_cmp(&a.0));
                 owl_shared::log_debug!("dflash-probe", "slot0 lm_head top8 = {:?}", top);
             }
         }
@@ -424,7 +425,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 行数钉 8(verify 块全行;taps 块仅 8 行,m=7 时 m+2=9 越界读 ——
         // 多编行下轮被自块写/重编覆盖,幂等安全;E5-DF4 与图路径同式)
         let rows = (m + 2).min(8);
-        let rope = self.spec.draft_rope.as_ref().expect("draft rope").clone();
+        let rope = self.spec.draft_rope.as_ref().ok_or_else(|| ModelError::EngineInvariant { what: "draft rope 缺席(草稿档位不一致)".into() })?.clone();
         let dtype = self.pool.dims.dtype;
         let views: Vec<TensorOps> = taps
             .iter()
@@ -438,7 +439,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         );
         // 编码槽表 = 线性逻辑位(pos..pos+rows;草稿池线性寻址,同 ②)
         let _page = self.pool.page;
-        let leaves = self.pool.dflash_kv_leaves().expect("dflash 池");
+        let leaves = self.pool.dflash_kv_leaves().ok_or_else(|| ModelError::EngineInvariant { what: "dflash KV 池句柄缺席(档位/池几何不一致)".into() })?;
         let bt = self.pool.bt_leaf_flat();
         let kvs: Vec<KvBuffers> = leaves
             .iter()
@@ -536,7 +537,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     pub(crate) async fn propose_first(&mut self, anchor: u32, pos: usize) -> Result<()> {
         let depth = self.spec.depth;
         let seed = self
-            .tspec()
+            .tspec()?
             .spec_seed_hidden
             .take()
             .ok_or_else(|| owl_models::ModelError::Msg(
@@ -544,7 +545,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             ))?;
         // mtp 链表:覆盖 pos-1(extend 行)+ pos..pos+depth-2(链步)
         let bt = self.mtp_chain_bt(pos + depth - 1)?;
-        let (kc, vc) = self.pool.mtp_kv_leaf().expect("mtp 池");
+        let (kc, vc) = self.pool.mtp_kv_leaf().ok_or_else(|| ModelError::EngineInvariant { what: "MTP KV 池句柄缺席(draft 档位不一致)".into() })?;
         let page = self.pool.page;
         let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
         let bt_t = TensorOps::from_host(
@@ -576,7 +577,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // 链步 decode 读核跟池布局:kNH 池必须走 v2(否则落 v1 classic
             // ↠ 布局错位、草稿全垃圾;2026-10-13 布局守卫捕获)
             let attn_v2 = self.pool.attn_v2_scratch();
-            match self.spec.drafter.as_ref().expect("drafter") {
+            match self.spec.drafter.as_ref().ok_or_else(|| ModelError::EngineInvariant {
+                what: "drafter 句柄缺席(草稿档位不一致)".into(),
+            })? {
                 crate::spec_runtime::Drafter::Mtp(mtp) => mtp.propose(
                     &anchor_t, &seed_view, depth, &self.model.embed, &rope, &kvs, &pos_ts,
                     vocab, env, attn_v2,
@@ -595,7 +598,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let mut buf = vec![0u8; 4 * depth];
             face.dtoh(&b, &mut buf).await?;
             face.free(&[b.id]).await?;
-            self.tspec().spec_drafts_host = Some(
+            self.tspec()?.spec_drafts_host = Some(
                 buf.chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
                     .collect(),
@@ -620,7 +623,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let fp = pos + m + 1;
         // 链步最远位 = fp+depth-2 → 链表需覆盖 token 数 fp+depth-1
         let bt = self.mtp_chain_bt(fp + depth - 1)?;
-        let (kc, vc) = self.pool.mtp_kv_leaf().expect("mtp 池");
+        let (kc, vc) = self.pool.mtp_kv_leaf().ok_or_else(|| ModelError::EngineInvariant { what: "MTP KV 池句柄缺席(draft 档位不一致)".into() })?;
         let page = self.pool.page;
         let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
         let bt_t = TensorOps::from_host(
@@ -681,7 +684,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let vocab = self.model.vocab_size();
             let rope = self.rope.clone();
             let attn_v2 = self.pool.attn_v2_scratch(); // 同上:链步读核走 v2
-            match self.spec.drafter.as_ref().expect("drafter") {
+            match self.spec.drafter.as_ref().ok_or_else(|| ModelError::EngineInvariant {
+                what: "drafter 句柄缺席(草稿档位不一致)".into(),
+            })? {
                 crate::spec_runtime::Drafter::Mtp(mtp) => mtp.propose_ext(
                     &tokens_t, &hiddens, &extend_pos, &extend_kv, &extend_slots, &extend_lens,
                     &cu_t, &chain_refs, &self.model.embed, &rope, vocab, env, attn_v2,
@@ -724,12 +729,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let d = self.pool.dims;
         let page = self.pool.page;
         let bt = {
-            let sid = self.turns.active.as_ref().expect("active 已保证").session_id;
-            let s = self.bank.sessions.get_mut(sid).expect("账在");
+            let sid = self.turns.active()?.session_id;
+            let s = self.bank.sessions.session_mut(sid)?;
             self.bank.leg_mtp.ensure_for_len(&mut s.mtp_block_table, base + t_rows)?;
             s.mtp_block_table.clone()
         };
-        let (kc, vc) = self.pool.mtp_kv_leaf().expect("mtp 池");
+        let (kc, vc) = self.pool.mtp_kv_leaf().ok_or_else(|| ModelError::EngineInvariant { what: "MTP KV 池句柄缺席(draft 档位不一致)".into() })?;
         let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
         let tokens: Vec<u32> = ids[1..=t_rows].to_vec();
         let tok_t = TensorOps::from_host(
@@ -808,8 +813,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let depth = self.spec.depth;
         let page = self.pool.page;
         let bt = {
-            let sid = self.turns.active.as_ref().expect("active 已保证").session_id;
-            let s = self.bank.sessions.get_mut(sid).expect("账在");
+            let sid = self.turns.active()?.session_id;
+            let s = self.bank.sessions.session_mut(sid)?;
             self.bank.leg_mtp.ensure_for_len(&mut s.mtp_block_table, pos + m + depth)?;
             s.mtp_block_table.clone()
         };
@@ -862,8 +867,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// mtp 链表 ensure(E5-M2b;propose eager 路径用 from_host 表,非持久
     /// bt 块 —— 图不烘焙 mtp 链)。返回 host 块链副本。
     pub(crate) fn mtp_chain_bt(&mut self, cover: usize) -> Result<Vec<u32>> {
-        let sid = self.turns.active.as_ref().expect("active 已保证").session_id;
-        let s = self.bank.sessions.get_mut(sid).expect("账在");
+        let sid = self.turns.active()?.session_id;
+        let s = self.bank.sessions.session_mut(sid)?;
         self.bank.leg_mtp.ensure_for_len(&mut s.mtp_block_table, cover)?;
         Ok(s.mtp_block_table.clone())
     }
@@ -883,8 +888,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     ) -> Result<(Vec<u32>, owl_iface::contract::Bytes, Option<Vec<f32>>)> {
         let t = block.len();
         let (bt_chain, _) = {
-            let act = self.turns.active.as_ref().expect("active 已保证");
-            let s = self.bank.sessions.get(act.session_id).expect("账在");
+            let act = self.turns.active()?;
+            let s = self.bank.sessions.session(act.session_id)?;
             (s.block_table.clone(), s.gdn_slot)
         };
         let kv_caches = self.pool.kv_caches();
@@ -1081,3 +1086,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
 
 
 }
+
+
+
+

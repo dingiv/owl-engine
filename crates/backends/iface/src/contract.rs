@@ -101,6 +101,13 @@ pub enum ModelError {
     CaptureViolation { detail: String },
     /// server 不可达/已关闭
     ServerClosed,
+    /// **引擎内部状态不变量失守**(无活跃 turn / 会话账缺失 / 草稿池句柄缺席……)。
+    ///
+    /// 语义(2026-10-17 用户裁决):这类失守是**引擎状态机已经不一致**,
+    /// 但**不许 panic** —— 用显式 `Result` 一路上抛到泵循环,由它
+    /// ①打印 ②丢下该 turn ③`shutdown.graceful()`(释放卡锁 + 有序退出)。
+    /// `is_fatal` = true(继续跑只会连环错值/泄漏)。
+    EngineInvariant { what: String },
     /// 兜底(server 侧透传的结构化细节)
     Msg(String),
 }
@@ -114,7 +121,13 @@ impl ModelError {
     /// 服务面据此走**优雅关停**(释放卡锁 + 有序退出),而不是把错误塞回单个 turn。
     /// 其余变体(形状/键缺失/形状不符/兜底)`= 可归因到具体请求/装载,不致命。
     pub fn is_fatal(&self) -> bool {
-        matches!(self, ModelError::PoolExhausted { .. } | ModelError::ServerClosed)
+        matches!(
+            self,
+            ModelError::PoolExhausted { .. }
+                | ModelError::ServerClosed
+                // 引擎状态不变量失守:状态机已不一致 ⇒ 与"硬预算拒发"同级处理
+                | ModelError::EngineInvariant { .. }
+        )
     }
 }
 
@@ -137,6 +150,9 @@ impl std::fmt::Display for ModelError {
             }
             ModelError::CaptureViolation { detail } => write!(f, "CaptureViolation: {detail}"),
             ModelError::ServerClosed => write!(f, "ServerClosed"),
+            ModelError::EngineInvariant { what } => {
+                write!(f, "EngineInvariant: 引擎状态不变量失守 —— {what}")
+            }
             ModelError::Msg(m) => write!(f, "{m}"),
         }
     }

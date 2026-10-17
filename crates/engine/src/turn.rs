@@ -218,6 +218,28 @@ pub(crate) struct TurnLedger {
 }
 
 impl TurnLedger {
+    /// **活跃 turn**(显式 `Result`;2026-10-17 用户裁决:引擎内部不变量失守
+    /// **不许 panic** —— 一路上抛到泵循环,由它打印 + 丢 turn + 优雅关停)。
+    ///
+    /// 判据:调用点若在"必然有活跃 turn"的相位之外被触发(或相位判定漂移),
+    /// 这里给出**可打印、可归因**的错误,而不是把引擎线程打死。
+    pub(crate) fn active(
+        &self,
+    ) -> std::result::Result<&ActiveTurn, owl_iface::contract::ModelError> {
+        self.active.as_ref().ok_or_else(|| owl_iface::contract::ModelError::EngineInvariant {
+            what: "无活跃 turn(调用点落在 turn 生命周期之外)".into(),
+        })
+    }
+
+    /// 同上(可变)。
+    pub(crate) fn active_mut(
+        &mut self,
+    ) -> std::result::Result<&mut ActiveTurn, owl_iface::contract::ModelError> {
+        self.active.as_mut().ok_or_else(|| owl_iface::contract::ModelError::EngineInvariant {
+            what: "无活跃 turn(调用点落在 turn 生命周期之外)".into(),
+        })
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             queue: VecDeque::new(),
@@ -234,17 +256,21 @@ impl TurnLedger {
         id
     }
 
-    /// 活跃 turn 域 spec 状态(无活跃 = 调用序错误,响亮 panic)
-    pub(crate) fn tspec(&mut self) -> &mut TurnSpecState {
-        &mut self
-            .active
-            .as_mut()
-            .expect("turn 域 spec 状态:无活跃 turn")
-            .spec
+    /// 活跃 turn 域 spec 状态。
+    ///
+    /// **显式 Result**(2026-10-17 用户裁决):无活跃 turn = 调用序错误,但**不许
+    /// panic** —— 一路上抛到泵循环(打印 + 丢 turn + `shutdown.graceful()`)。
+    pub(crate) fn tspec(
+        &mut self,
+    ) -> std::result::Result<&mut TurnSpecState, owl_iface::contract::ModelError> {
+        self.active_mut().map(|a| &mut a.spec)
     }
 
-    pub(crate) fn tspec_ref(&self) -> &TurnSpecState {
-        &self.active.as_ref().expect("turn 域 spec 状态:无活跃 turn").spec
+    /// 只读版(同上)。
+    pub(crate) fn tspec_ref(
+        &self,
+    ) -> std::result::Result<&TurnSpecState, owl_iface::contract::ModelError> {
+        self.active().map(|a| &a.spec)
     }
 
     /// 排队中的 turn(按 id;usage 真账取用面)

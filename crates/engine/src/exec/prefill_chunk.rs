@@ -1,5 +1,6 @@
 //! 块式 prefill(树根装配与执行;taps/encode/BISECT 取证)
 use super::*;
+use owl_iface::contract::ModelError;
 
 // ============================================================================
 // chunk host 侧输入表(自 `feat/prefill-graph` 择取,2026-10-15;**不含图路**)
@@ -425,7 +426,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
         }
         if let Some(hb) = seed_keep {
-            self.tspec().spec_seed_hidden = Some(hb);
+            self.tspec()?.spec_seed_hidden = Some(hb);
         }
         let nt = f32::from_le_bytes(buf_t) as u32;
         mfact(self.boot_seq, "pf.last", nt as u64);
@@ -477,8 +478,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let t = ids.len();
         // E2b:活跃会话块链 + GDN 格(逻辑位 → 物理槽由块表换算)
         let (bt_chain, gdn_slot_v) = {
-            let act = self.turns.active.as_ref().expect("active 已保证");
-            let s = self.bank.sessions.get(act.session_id).expect("账在");
+            let act = self.turns.active()?;
+            let s = self.bank.sessions.session(act.session_id)?;
             (s.block_table.clone(), s.gdn_slot)
         };
         // ── prefill 桶图命中(M2b;设计 §4–§6)──
@@ -552,7 +553,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let fb = self
                 .pool
                 .fi_table_blocks()
-                .expect("FI 槽未分配(pool.fi_face 档恒有)")
+                .ok_or_else(|| ModelError::EngineInvariant { what: "FI 表槽未分配(池几何与档位不一致)".into() })?
                 .clone();
             assert!(
                 ft.nb_used <= fb.nb_cap,
@@ -825,7 +826,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // 块内切片消费 —— SliceView 作根丢偏移,故不走多根 plain eval)
             let (hidden_full, prefill_taps) = if pf_bisect {
                 // bisect fin 块直通(block-leaf 下游 eval 零操作)
-                let (decl, blk) = bisect_fin_block.take().expect("bisect fin");
+                let (decl, blk) = bisect_fin_block.take().ok_or_else(|| ModelError::EngineInvariant { what: "bisect fin 块缺席(诊断档口径)".into() })?;
                 _bisect_fin_blk = Some(blk);
                 (decl, None)
             } else if self.spec.dflash_tap_count > 0 {
@@ -929,9 +930,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         .enumerate()
                         .map(|(i, c)| (half::f16::from_le_bytes([c[0], c[1]]).to_f32(), i as u32))
                         .collect();
-                    top.select_nth_unstable_by(1, |a, b| b.0.partial_cmp(&a.0).unwrap());
+                    top.select_nth_unstable_by(1, |a, b| b.0.total_cmp(&a.0));
                     top.truncate(2);
-                    top.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                    top.sort_by(|a, b| b.0.total_cmp(&a.0));
                     owl_shared::metrics::with_metrics_store(|s| {
                         s.counter_set("prefill.top1", u64::from(top[0].1), file!(), line!());
                         s.counter_set(
@@ -977,7 +978,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
             // seed 块归 turn 域 spec 状态(face 借位结束后落地)
             if let Some(hb) = seed_keep {
-                self.tspec().spec_seed_hidden = Some(hb);
+                self.tspec()?.spec_seed_hidden = Some(hb);
             }
             let nt = f32::from_le_bytes(buf) as u32;
             let bs = self.boot_seq;
@@ -991,7 +992,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // 中间块:last_hidden 根(状态推进完整;lm_head 免算)。
             // DFlash2:同构 concat 单根(taps 随块回收前切片 encode)
             let (tree, prefill_taps) = if pf_bisect {
-                let (decl, blk) = bisect_fin_block.take().expect("bisect fin(非末)");
+                let (decl, blk) = bisect_fin_block.take().ok_or_else(|| ModelError::EngineInvariant { what: "bisect fin(非末)块缺席(诊断档口径)".into() })?;
                 _bisect_fin_blk = Some(blk);
                 (decl, None)
             } else if self.spec.dflash_tap_count > 0 {
@@ -1068,3 +1069,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
 
 
 }
+
+
+
+

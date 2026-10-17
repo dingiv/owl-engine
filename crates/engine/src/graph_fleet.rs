@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use owl_iface::contract::{Bytes, DeviceClient, Dtype};
+use owl_iface::contract::{Bytes, DeviceClient, Dtype, ModelError};
 use owl_models::env::EnvProvider;
 use owl_models::layers::gdn::GdnBuffers;
 use owl_models::module::{FiPrefillCtx, ForwardCtx, KvBuffers, Module};
@@ -124,7 +124,7 @@ impl<D: DeviceClient> GraphFleet<D> {
             && vface.is_some()
             && matches!(capture_outcome, PlanOutcome::Captured)
         {
-            let vface = vface.expect("vface.is_some() 已守门");
+            let vface = vface.ok_or_else(|| ModelError::EngineInvariant { what: "vface 缺席(守卫与用法不一致)".into() })?;
             let (v, cell) = Self::plan_verify(vface, &boot, t0).await?;
             (v, cell)
         } else {
@@ -861,8 +861,12 @@ impl<D: DeviceClient> GraphFleet<D> {
         let mut fold_graphs = Vec::new();
         let n_rec = pool.gdn_count() * 8;
         let rec_blks: Vec<Bytes> = (0..n_rec)
-            .map(|i| vg.output_block(&format!("r{i}")).expect("fold 记录槽"))
-            .collect();
+            .map(|i| {
+                vg.output_block(&format!("r{i}")).ok_or_else(|| ModelError::EngineInvariant {
+                    what: format!("fold 记录槽 r{i} 缺席(图装配与声明不一致)"),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let snap_bufs = pool.spec_snap_bufs();
         let n_roots = pool.gdn_count() * 4;
         for m in 0..boot.spec.depth {
@@ -972,12 +976,16 @@ impl<D: DeviceClient> GraphFleet<D> {
         let env = boot.env;
         let knobs = boot.knobs;
         let tap_blks: Vec<Bytes> = (0..5)
-            .map(|i| vg.output_block(&format!("tap{i}")).expect("tap 输出槽"))
-            .collect();
-        let kv_leaves = pool.dflash_kv_leaves().expect("dflash 池");
+            .map(|i| {
+                vg.output_block(&format!("tap{i}")).ok_or_else(|| ModelError::EngineInvariant {
+                    what: format!("tap{i} 输出槽缺席(草稿档位不一致)"),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let kv_leaves = pool.dflash_kv_leaves().ok_or_else(|| ModelError::EngineInvariant { what: "dflash KV 池句柄缺席(档位/池几何不一致)".into() })?;
         let bt_leaf = pool.bt_leaf_flat();
         let model_df = Arc::clone(&boot.model);
-        let rp_df = boot.spec.draft_rope.as_ref().expect("draft rope").clone();
+        let rp_df = boot.spec.draft_rope.as_ref().ok_or_else(|| ModelError::EngineInvariant { what: "draft rope 缺席(草稿档位不一致)".into() })?.clone();
         let d2g = Arc::clone(d2);
         let hidd = d2.hidden();
         let Some(gface) = extra_faces.pop() else {
@@ -1102,7 +1110,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         let knobs = boot.knobs;
         let spec_depth = boot.spec.depth;
         let mut propose_graphs = Vec::new();
-        let hid_blk = vg.output_block("hid").expect("hid 输出槽");
+        let hid_blk = vg.output_block("hid").ok_or_else(|| ModelError::EngineInvariant { what: "verify 图输出槽 hid 缺席(图装配与声明不一致)".into() })?;
         // 链步 decode 读核 scratch(seqs=1;与 draft.rs eager 路同源):
         // kNHD 池落 v1 = 布局错位 → 草稿垃圾(2026-10-13 守卫捕获)
         let attn_v2_pool = pool.attn_v2_scratch();
@@ -1113,8 +1121,8 @@ impl<D: DeviceClient> GraphFleet<D> {
             let model_p = Arc::clone(&boot.model);
             let mtp = Arc::clone(mtp);
             let rp_p = boot.rope.clone();
-            let kv_leaf = pool.mtp_kv_leaf().expect("mtp 池");
-            let bt_leaf = pool.bt_mtp_leaf().expect("bt_mtp 槽");
+            let kv_leaf = pool.mtp_kv_leaf().ok_or_else(|| ModelError::EngineInvariant { what: "MTP KV 池句柄缺席(draft 档位不一致)".into() })?;
+            let bt_leaf = pool.bt_mtp_leaf().ok_or_else(|| ModelError::EngineInvariant { what: "MTP 块表槽缺席(草稿档位不一致)".into() })?;
             let hid = hid_blk.clone();
             let env_p = env;
             let vocab = boot.model.vocab_size();
@@ -1219,3 +1227,5 @@ fn leaf_flat(b: &crate::state::BlockN) -> TensorOps {
     let n = b.1;
     TensorOps::of_block(b.0.id, Dtype::F32, vec![n])
 }
+
+

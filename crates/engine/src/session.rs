@@ -134,6 +134,25 @@ pub struct SessionTable {
 }
 
 impl SessionTable {
+    /// **会话账查询**(显式 `Result`;2026-10-17 裁决:账缺失**不 panic**)。
+    pub fn session(&self, id: u64) -> Result<&AgentSession> {
+        self.sessions.get(&id).ok_or_else(|| owl_iface::contract::ModelError::EngineInvariant {
+            what: format!("会话账缺失(会话 {id} 不在账)"),
+        })
+    }
+
+    /// 同上(可变)。
+    pub fn session_mut(
+        &mut self,
+        id: u64,
+    ) -> Result<&mut AgentSession> {
+        self.sessions.get_mut(&id).ok_or_else(|| {
+            owl_iface::contract::ModelError::EngineInvariant {
+                what: format!("会话账缺失(会话 {id} 不在账)"),
+            }
+        })
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

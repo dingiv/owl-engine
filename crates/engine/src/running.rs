@@ -198,10 +198,12 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// (见 [`budget_clamp`]),只剩 < 1k 才拒。
     /// turn 域 spec 状态(turn 生命周期;仅活跃 turn 可触 —— 轮执行期
     /// active 恒在;turn 外触碰 = 调用序错误)
-    pub(crate) fn tspec(&mut self) -> &mut TurnSpecState {
+    /// 活跃 turn 的 spec 状态(**显式 Result**;见 [`TurnLedger::tspec`])。
+    pub(crate) fn tspec(&mut self) -> Result<&mut TurnSpecState> {
         self.turns.tspec()
     }
-    pub(crate) fn tspec_ref(&self) -> &TurnSpecState {
+    /// 只读版(同上)。
+    pub(crate) fn tspec_ref(&self) -> Result<&TurnSpecState> {
         self.turns.tspec_ref()
     }
 
