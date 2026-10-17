@@ -238,6 +238,8 @@ async fn main() {
     let (tx, rx) = mpsc::channel::<EngineReq>(CHANNEL_CAPACITY);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<String, String>>();
     let shutdown_actor = shutdown.clone();
+    // 兜底网的**独立句柄**(闭包会把 shutdown_actor move 走 ⇒ 网里要用另一个)
+    let shutdown_net = shutdown.clone();
     std::thread::Builder::new()
         .name("owl-engine".into())
         // **显式栈**(2026-10-17):缺省 2MiB 是 debug 档的暗雷 —— 27B + DFlash2
@@ -251,17 +253,48 @@ async fn main() {
                 .enable_all()
                 .build()
                 .expect("actor runtime");
-            rt.block_on(actor_main(config, rx, &ready_tx, dbg_face_actor, shutdown_actor));
+            // ⚠️ **panic 兜底**(2026-10-17 审查 J2):本线程是全进程**唯一**背引擎
+            // 状态的线程,而引擎热路径以 `expect` 表达状态不变量(`exec/draft.rs` 31 处、
+            // `exec/phases.rs` 8 处…)⇒ 一旦失守,旧行为 = 线程**静默死亡**、
+            // 之后**所有请求悬挂**(HTTP 面 catch 不到,只能等客户端超时;
+            // 运维在日志里也看不到"为什么不再应答")。
+            // 现:捕获 → 响亮日志(带 panic 载荷)→ **exit(70)**(EX_SOFTWARE,
+            // 与"配置错 exit(1)"分开 ⇒ supervisor 能分辨"该不该重启")。
+            // **不续跑**的理由:panic 可能落在锁 / 块账 / 设备状态中途 ⇒ 续跑等于
+            // 拿已损坏的状态继续服务(静默错值,比崩溃坏)。GPU 卡锁按死 pid 自动回收
+            // (`gpu_lock::live_locks_in`),不会挡下次启动。
+            // **最后一道网,不是主路径**(2026-10-17 用户裁决):引擎里的**可失败逻辑
+            // 一律用显式 Result 上抛** —— 泵循环收到 `Err` 就①打印 ②丢该 turn
+            // ③致命者(`is_fatal`,含 `EngineInvariant`)调 `shutdown.graceful()`
+            // 收摊(释放卡锁 + 有序退出)。本网只兜**设计外**的恐慌(索引越界、
+            // 第三方库 unwrap 之类),且**走同一条优雅收摊**,不硬退、不冒烟退出。
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rt.block_on(actor_main(config, rx, &ready_tx, dbg_face_actor, shutdown_actor));
+            }));
+            if let Err(p) = r {
+                let what = panic_payload_str(&p);
+                owl_shared::log_error!(
+                    "boot",
+                    "owl-engine 线程 panic(设计外 —— 应转显式 Result):{what}"
+                );
+                shutdown_net.graceful(&format!("引擎线程 panic(设计外):{what}"));
+            }
         })
         .expect("actor 线程");
 
     // 装配结果(引擎就绪前不开 HTTP 面;架子边界)
-    match ready_rx.recv().expect("actor 线程存活") {
-        Ok(capture) => owl_shared::log_info!("boot", "引擎就绪(捕获态 {capture})"),
-        Err(e) => {
+    match ready_rx.recv() {
+        Ok(Ok(capture)) => owl_shared::log_info!("boot", "引擎就绪(捕获态 {capture})"),
+        Ok(Err(e)) => {
             // 拒启是运维必须看见的事件 ⇒ 恒输出(不经级别门)
             eprintln!("[boot] 引擎装配失败: {e}");
             std::process::exit(1);
+        }
+        // 就绪前通道断开 = actor 线程已死(panic)。旧写法 `.expect("actor 线程存活")`
+        // 会在这里再 panic 一次,把真正的现场(上方 panic 日志)埋掉
+        // ⇒ 走**同一条优雅收摊**(2026-10-17 用户裁决:不硬退)。
+        Err(_) => {
+            shutdown.graceful("actor 线程在就绪前退出(现场见上方 panic 日志)");
         }
     }
 
@@ -374,6 +407,17 @@ async fn actor_main(
         owl_shared::log_info!("boot", "face 克隆不可用 ⇒ /debug/blocks 回 503(该后端不支持)");
     }
     actor::run_actor(&mut running, rx, config.perf_dump.clone(), shutdown).await;
+}
+
+/// panic 载荷 → 可读串(`&str` / `String` 两型覆盖 std 惯例;其余给个兜底)
+fn panic_payload_str(p: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = p.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = p.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "(非字符串 panic 载荷)".to_string()
+    }
 }
 
 /// 单连接服务(Connection: close;架子一请求一连接)
