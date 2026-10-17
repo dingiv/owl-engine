@@ -936,8 +936,21 @@ impl Attention {
         .arg_i32(pol.x as i32)
         .with_shape(dt, vec![1]); // 哑输出(契约 4)
         // ② K1 分块在线 softmax(partial + (m,l) 入 scratch;wr = 树序依赖边)
-        let scr_out = TensorOps::zeros(dt, vec![tokens * self.hq * nparts * self.hd]);
-        let scr_stat = TensorOps::zeros(Dtype::F32, vec![tokens * self.hq * nparts * 2]);
+        //
+        // **契约 rank = 2**(`PrefillSplit*` 的 `scr_out` F16 r2 / `scr_stat` F32 r2;
+        // 见 `kernels/ops/attn.rs` 的 PARAMS)。
+        // 2026-10-19 修复:此处原先声明为 **r1**(一维扁平),而同一内核在
+        // `attention.rs` 另一条调用路(分块 prefill 的独立验径)声明的是 r2
+        // ⇒ **开 `prefill_split` 必撞算子准入门**:
+        //   `scr_out 期望 rank = 2(声明) 实得 1(线格式事实)`。
+        // 后果:生产主力 prefill 核在本分支上**根本开不起来** ⇒ 所有 27B
+        // prefill 读数都是"未开分块核"档(实测与裸档基线差 ≈ 2×)。
+        // 修法 = **只改声明、零新节点**(`with_shape` 就是那个口子):
+        // 元素数不变(`tokens·hq·nparts·hd`),仅 rank 从 1 改 2。
+        let scr_out = TensorOps::zeros(dt, vec![tokens * self.hq * nparts * self.hd])
+            .with_shape(dt, vec![tokens * self.hq * nparts, self.hd]);
+        let scr_stat = TensorOps::zeros(Dtype::F32, vec![tokens * self.hq * nparts * 2])
+            .with_shape(Dtype::F32, vec![tokens * self.hq * nparts, 2]);
         let scale = 1.0 / (self.hd as f32).sqrt();
         // 核按 KV 池档位选(fp8 池 → fp8kv 直读;f16 核读 e4m3 字节池 = 错位雷)
         let sp = TensorOps::call(ctx.env.kv.prefill_split_op())
