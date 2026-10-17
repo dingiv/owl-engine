@@ -479,7 +479,8 @@ pub trait DeviceClient: Send {
             for (b, off, data) in &owned {
                 let mut lease = self.alloc_pinned(data.len(), "iface:htod_batch").await?;
                 lease.slice_bytes_mut()[..data.len()].copy_from_slice(data);
-                self.upload_pinned(lease, b, *off, data.len()).await?;
+                self.upload_pinned_on(UpStream::Compute, lease, b, *off, data.len())
+                    .await?;
             }
             Ok(())
         }
@@ -526,7 +527,8 @@ pub trait DeviceClient: Send {
                         conn.get(p.slot, p.conn_off, &mut buf)?;
                         let mut lease = self.alloc_pinned(p.len, "iface:swap_in").await?;
                         lease.slice_bytes_mut()[..p.len].copy_from_slice(&buf);
-                        self.upload_pinned(lease, &handle(p), p.dev_off, p.len).await?;
+                        self.upload_pinned_on(UpStream::Compute, lease, &handle(p), p.dev_off, p.len)
+                            .await?;
                     }
                 }
             }
@@ -559,10 +561,13 @@ pub trait DeviceClient: Send {
         shape: &Shape,
         data: Vec<f32>,
         name: &str,
-    ) -> impl Future<Output = Result<Bytes, ModelError>> + Send {
+    ) -> impl Future<Output = Result<Bytes, ModelError>> + Send
+    where
+        Self: Sized,
+    {
         async move {
             let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
-            self.htod(Dtype::F32, shape, &bytes, name).await
+            self.htod_on(UpStream::Compute, Dtype::F32, shape, &bytes, name).await
         }
     }
 
@@ -585,6 +590,21 @@ pub trait DeviceClient: Send {
     /// 完成回调归还池。在途块数调用方自限(防码头膨胀)。
     /// 上传租约:buf 所有权移入,DMA/拷贝到 dst+offset_elems;
     /// buf 由后端回收(页锁池/释放)。默认 = 不支持。
+    /// [`Self::upload_pinned`] 的**流可选**版(2026-10-17;参数面走 Compute)
+    fn upload_pinned_on(
+        &mut self,
+        _stream: UpStream,
+        buf: Box<dyn PinnedRegion + Send>,
+        dst: &Bytes,
+        offset_bytes: usize,
+        len_bytes: usize,
+    ) -> impl Future<Output = Result<(), ModelError>> + Send
+    where
+        Self: Sized,
+    {
+        self.upload_pinned(buf, dst, offset_bytes, len_bytes)
+    }
+
     fn upload_pinned(
         &mut self,
         _buf: Box<dyn PinnedRegion + Send>,
@@ -656,8 +676,9 @@ pub trait DeviceClient: Send {
         Self: Sized,
     {
         async move {
+            // 参数面(槽/小表)批量写 ⇒ Compute(同流;H2D 面留给显式批量口)
             for (dst, off, data) in writes {
-                self.write_block_f32(dst, *off, data).await?;
+                self.write_block_f32_on(UpStream::Compute, dst, *off, data).await?;
             }
             Ok(())
         }

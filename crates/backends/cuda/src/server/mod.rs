@@ -35,6 +35,7 @@ use crate::launch::issue_launch;
 use crate::state::{DeviceSelector, GpuCtx, KernelCache, Staging};
 use owl_iface::contract::{Arg, Bytes, Dtype, LaunchMsg};
 use crate::state::{STREAM_COMPUTE, STREAM_D2H, STREAM_H2D};
+use crate::state::StreamId;
 use owl_iface::contract::ModelError;
 use std::sync::mpsc;
 
@@ -526,17 +527,17 @@ impl GpuServer {
                 e.out_id = out_id;
                 e
             }
-            Command::Htod { data, name, stream, .. } => E::new("htod", "h2d")
+            Command::Htod { data, name, stream, .. } => E::new("htod", stream_label(*stream))
                 .bytes(data.len())
-                .name(format!("s{stream}:{name}")),
-            Command::HtodChunk { block, data, .. } => {
-                E::new("htod_chunk", "h2d").bytes(data.len()).id(*block)
+                .name(name.clone()),
+            Command::HtodChunk { block, data, stream, .. } => {
+                E::new("htod_chunk", stream_label(*stream)).bytes(data.len()).id(*block)
             }
-            Command::HtodChunks { writes, .. } => E::new("htod_chunks", "h2d")
+            Command::HtodChunks { writes, stream, .. } => E::new("htod_chunks", stream_label(*stream))
                 .bytes(writes.iter().map(|w| w.2.len()).sum())
                 .ids(writes.iter().map(|w| w.0)),
-            Command::UploadPinned { dst, len_bytes, .. } => {
-                E::new("upload_pinned", "h2d").bytes(*len_bytes).id(dst.id)
+            Command::UploadPinned { dst, len_bytes, stream, .. } => {
+                E::new("upload_pinned", stream_label(*stream)).bytes(*len_bytes).id(dst.id)
             }
             Command::Dtoh { id, want_bytes, .. } => {
                 E::new("dtoh", "d2h").bytes(*want_bytes).id(*id)
@@ -551,7 +552,7 @@ impl GpuServer {
                 owl_iface::contract::SwapDir::Out => E::new("swap_out", "d2h")
                     .bytes(pieces.iter().map(|p| p.len).sum())
                     .ids(pieces.iter().map(|p| p.block)),
-                owl_iface::contract::SwapDir::In => E::new("swap_in", "h2d")
+                owl_iface::contract::SwapDir::In => E::new("swap_in", stream_label(STREAM_COMPUTE as u8))
                     .bytes(pieces.iter().map(|p| p.len).sum())
                     .ids(pieces.iter().map(|p| p.block)),
             },
@@ -836,7 +837,7 @@ impl GpuServer {
             Command::HtodChunk { stream, .. } | Command::HtodChunks { stream, .. } => {
                 1u8 << (*stream as usize)
             }
-            Command::UploadPinned { .. } => 1u8 << STREAM_H2D,
+            Command::UploadPinned { stream, .. } => 1u8 << (*stream as usize),
             // COMPUTE 流:发射 / 清零分配 / 设备内拷贝 / 图回放
             Command::Launch { .. }
             | Command::Alloc { .. }
@@ -848,10 +849,11 @@ impl GpuServer {
             Command::Dtoh { .. } | Command::DtohAt { .. } | Command::DtohBatch { .. } => {
                 1u8 << STREAM_D2H
             }
-            // swap:按方向落流(Out = D2H 回读;In = H2D 上传)
+            // swap:按方向落流(Out = D2H 回读;**In = COMPUTE 写入** —— 内容
+            // 就是下一步计算要读的状态,同流 FIFO 才结构性有序;见 harvest.rs 注)
             Command::Swap { dir, .. } => match dir {
                 owl_iface::contract::SwapDir::Out => 1u8 << STREAM_D2H,
-                owl_iface::contract::SwapDir::In => 1u8 << STREAM_H2D,
+                owl_iface::contract::SwapDir::In => 1u8 << STREAM_COMPUTE,
             },
             // 复合:两条腿各触一条流(E2 位图的第一个用例)
             Command::UploadAndLaunch { .. } => (1u8 << STREAM_H2D) | (1u8 << STREAM_COMPUTE),
@@ -974,8 +976,8 @@ impl GpuServer {
             Command::AllocPinned { bytes, name, ack } => self.handle_alloc_pinned(bytes, name, ack),
             Command::LedgerReport { top, ack } => ack.send(Ok(self.ledger_report(top))),
             Command::LedgerJson { ack } => ack.send(Ok(self.ledger_dump_json())),
-            Command::UploadPinned { buf, dst, offset_bytes, len_bytes, ack } => {
-                self.handle_upload_pinned(buf, dst, offset_bytes, len_bytes, ack)
+            Command::UploadPinned { buf, dst, offset_bytes, len_bytes, stream, ack } => {
+                self.handle_upload_pinned(buf, dst, offset_bytes, len_bytes, stream, ack)
             }
             Command::Dtoh { id, want_bytes, ack } => self.handle_dtoh(id, want_bytes, ack),
             Command::DtohAt { id, off_bytes, want_bytes, ack } => {
@@ -2143,6 +2145,18 @@ impl owl_kernels::device::DeviceRes for GpuRes<'_> {
 }
 
 /// 墙钟毫秒(诊断落盘用;时钟回拨 = 0,非失败路径 —— 与 `prompt_dump` 同律)
+/// **流位序 → 上屏标签**(单一事实源;发射账 `trace_entry_of` 与事件记账
+/// `GpuServer::cmd_stream` 共用 —— 两处必须同口径。旧版在 trace 侧硬写字符串,
+/// 曾把参数面的写一律标成 "h2d",2026-10-17 桶图复用案排查时被它误导过一轮)。
+fn stream_label(bit: u8) -> &'static str {
+    match bit as StreamId {
+        STREAM_H2D => "h2d",
+        STREAM_COMPUTE => "compute",
+        STREAM_D2H => "d2h",
+        _ => "?",
+    }
+}
+
 fn now_ms() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

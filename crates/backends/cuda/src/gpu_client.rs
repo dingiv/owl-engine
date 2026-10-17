@@ -315,6 +315,27 @@ impl DeviceClient for GpuClient {
         self.submit(move |ack| Command::AllocPinned { bytes, name: nm, ack })?.await
     }
 
+    async fn upload_pinned_on(
+        &mut self,
+        stream: owl_iface::contract::UpStream,
+        buf: Box<dyn owl_iface::contract::PinnedRegion + Send>,
+        dst: &Bytes,
+        offset_bytes: usize,
+        len_bytes: usize,
+    ) -> Result<(), ModelError> {
+        let sid = sid_of(stream);
+        let dst = dst.clone();
+        self.submit(move |ack| Command::UploadPinned {
+            buf,
+            dst,
+            offset_bytes,
+            len_bytes,
+            stream: sid,
+            ack,
+        })?
+        .await
+    }
+
     async fn upload_pinned(
         &mut self,
         buf: Box<dyn owl_iface::contract::PinnedRegion + Send>,
@@ -322,15 +343,8 @@ impl DeviceClient for GpuClient {
         offset_bytes: usize,
         len_bytes: usize,
     ) -> Result<(), ModelError> {
-        let dst = dst.clone();
-        self.submit(move |ack| Command::UploadPinned {
-            buf,
-            dst,
-            offset_bytes,
-            len_bytes,
-            ack,
-        })?
-        .await
+        self.upload_pinned_on(owl_iface::contract::UpStream::H2d, buf, dst, offset_bytes, len_bytes)
+            .await
     }
 
     async fn write_block_f32_on(
@@ -470,7 +484,11 @@ impl DeviceClient for GpuClient {
         self.submit(move |ack| Command::DtohBatch { pieces, ack })?.await
     }
 
-    /// 批量分块写:单命令 `HtodChunks`(字节口径;一次往返,单 ack 保序)
+    /// 批量分块写:单命令 `HtodChunks`(字节口径;一次往返,单 ack 保序)。
+    ///
+    /// **落 COMPUTE 流**(2026-10-17):与 trait 默认实现同口径(那里逐段走
+    /// `upload_pinned_on(Compute)`;此前本覆写硬写 H2D = 两套规范)。语义面 =
+    /// 搬入的内容随后就被计算读(参数面/存储搬回),同流 FIFO 即结构性有序。
     async fn htod_batch(
         &mut self,
         writes: &[(&Bytes, usize, &[u8])],
@@ -479,7 +497,7 @@ impl DeviceClient for GpuClient {
             .iter()
             .map(|(b, off, data)| (b.id, *off, data.to_vec()))
             .collect();
-        self.submit(move |ack| Command::HtodChunks { writes, stream: STREAM_H2D as u8, ack })?.await
+        self.submit(move |ack| Command::HtodChunks { writes, stream: STREAM_COMPUTE as u8, ack })?.await
     }
 
     /// 带偏移读(状态存储搬出面;与 `dtoh` 同一条 server 路径)

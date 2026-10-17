@@ -76,7 +76,10 @@ pub async fn upload_span<D: DeviceClient>(
         .await
         .map_err(|e| map_err(e, "搬入 alloc_pinned 失败", n))?;
     lease.slice_bytes_mut()[..n].copy_from_slice(src);
-    face.upload_pinned(lease, dev, dev_off_bytes, n)
+    // **落 COMPUTE 流**:搬入的内容就是随后计算要读的状态 —— 同流 FIFO 即
+    // 结构性有序(放 H2D 流 = 与消费核无跨流序;2026-10-17 与参数面/swap_in
+    // 同律归位。推导见 common-dev-pitfall §51 同族)。
+    face.upload_pinned_on(owl_iface::contract::UpStream::Compute, lease, dev, dev_off_bytes, n)
         .await
         .map_err(|e| map_err(e, "搬入 upload_pinned 失败", n))?;
     Ok(())

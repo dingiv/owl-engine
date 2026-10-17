@@ -125,6 +125,8 @@ pub enum Command {
         offset_bytes: usize,
         /// 字节长度(池租约容量 ≥ 请求;只传前 len_bytes)
         len_bytes: usize,
+        /// 落点流(0 = H2D 批量面;1 = COMPUTE 参数面 —— 见 `UpStream`)
+        stream: u8,
         ack: Ack<Result<(), ModelError>>,
     },
     /// device → host(异步 memcpy 到 pinned 码头;want_bytes 字节口径)

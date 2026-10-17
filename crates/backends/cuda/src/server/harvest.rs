@@ -175,9 +175,10 @@ impl GpuServer {
         dst: Bytes,
         offset_bytes: usize,
         len_bytes: usize,
+        stream_id: u8,
         ack: Ack<Result<(), ModelError>>,
     ) {
-        ack.send(self.enqueue_upload_pinned(buf, dst, offset_bytes, len_bytes));
+        ack.send(self.enqueue_upload_pinned_on(stream_id as u64, buf, dst, offset_bytes, len_bytes));
     }
 
     /// **上传核心**(只入队 DMA + 登记租约归还;不 ack)—— 复合命令
@@ -675,7 +676,12 @@ impl GpuServer {
         ack: Ack<Result<Box<dyn owl_iface::contract::Connector + Send>, ModelError>>,
     ) {
         let total: usize = pieces.iter().map(|p| p.len).sum();
-        let stream = match self.ctx().stream(STREAM_H2D) {
+        // **落 COMPUTE 流**(2026-10-17):写入的内容**就是下一步计算要读的状态**
+        // —— 放 H2D 流 = 与消费核无跨流序(回执只证明"主机侧知道已落地",
+        // 不证明消费流的核排在它之后)。与参数面同律:同流 FIFO 即结构性有序。
+        // (trait 默认实现的 in 腿本就指 Compute —— 此处原为单命令覆写,两套
+        // 规范已归位;推导见 common-dev-pitfall §51 同族。)
+        let stream = match self.ctx().stream(STREAM_COMPUTE) {
             Ok(s) => s.clone(),
             Err(e) => return ack.send(Err(e)),
         };
@@ -696,14 +702,14 @@ impl GpuServer {
             }
             cursor += p.len;
         }
-        // ② staging → 设备(H2D 流序逐片;末尾单 notify ⇒ ack = 全部落地)
+        // ② staging → 设备(COMPUTE 流序逐片;末尾单 notify ⇒ ack = 全部落地)
         let mut cursor = 0usize;
         for (i, p) in pieces.iter().enumerate() {
             if let Err(e) = self.ctx().check_range(p.block, p.dev_off, p.len, "swap-in") {
                 self.pool.put(staging);
                 return ack.send(Err(e));
             }
-            if let Err(e) = self.ctx_mut().wait_zeroing(p.block, STREAM_H2D) {
+            if let Err(e) = self.ctx_mut().wait_zeroing(p.block, STREAM_COMPUTE) {
                 self.pool.put(staging);
                 return ack.send(Err(e));
             }
