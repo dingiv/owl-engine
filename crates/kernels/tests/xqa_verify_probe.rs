@@ -16,6 +16,7 @@
 //!        --test xqa_verify_probe -- --test-threads=1 --nocapture`
 #![cfg(feature = "xqa")]
 
+use owl_macros::owl_test;
 use std::time::Instant;
 
 use cudarc::driver::{CudaContext, DevicePtr, LaunchConfig, PushKernelArg};
@@ -436,12 +437,8 @@ fn run_case_var(ctx: usize, check: bool, mask_all: bool, mask_var: u32) {
     }
 }
 
-#[test]
+#[owl_test(gpu)]
 fn xqa_verify_speed_and_parity() {
-    if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
-        return;
-    }
     // 判据分离:掩码全开(块内全可见)+ host 同口径
     run_case_mm(2048, true, true);
     // 掩码语义 A/B(定谳留档:仅 v=0 因果口径贴 host;v=1 位序反 / v=2 极性反 /

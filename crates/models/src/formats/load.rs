@@ -1492,17 +1492,17 @@ mod generic_entry_tests {
     /// .rs:起点探测([`detect`](crate::formats::kind::detect))→ 维度事实
     /// (`from_ckpt`)→ 通用入口(`load_from_dir`)全链数据驱动。
     ///
-    /// 默认只跑起点侧(探测 + spec,秒级);`OWL_NEW_CKPT_LOAD=1` 追加
+    /// 默认只跑起点侧(探测 + spec,秒级);`ckpt:new_LOAD=1` 追加
     /// **CPU face 整装**(9B f16 ≈18GB host —— GPU 门不参与:换 GPU 验装
     /// 是另一个门的事)。
     #[tokio::test]
     async fn unseen_size_loads_without_code() {
         let dir = std::path::PathBuf::from(
-            std::env::var("OWL_NEW_CKPT")
-                .unwrap_or_else(|_| "/home/div/Documents/codes/models/Qwen/Qwen3.5-9B".into()),
+            owl_shared::testkit::resource("ckpt:new")
+                .unwrap_or_else(|| "/home/div/Documents/codes/models/Qwen/Qwen3.5-9B".into()),
         );
         if !dir.is_dir() {
-            eprintln!("skip: 新档检查点不在({};OWL_NEW_CKPT 可指路)", dir.display());
+            eprintln!("skip: 新档检查点不在({};ckpt:new 可指路)", dir.display());
             return;
         }
         // ① 起点探测(纯索引嗅探)
@@ -1538,8 +1538,8 @@ mod generic_entry_tests {
             assert_eq!(*full, i % 4 == 3, "层 {i} 层型不符 3:1 周期");
         }
         assert_eq!(spec.full_heads.0 * spec.full_heads.2 % spec.hidden, 0, "FA 头维守恒");
-        if std::env::var("OWL_NEW_CKPT_LOAD").ok().as_deref() != Some("1") {
-            eprintln!("[new-ckpt] 起点侧全绿(整装门 OWL_NEW_CKPT_LOAD=1 开启)");
+        if !owl_shared::testkit::resource_flag("flag:new-ckpt-load") {
+            eprintln!("[new-ckpt] 起点侧全绿(整装门 ckpt:new_LOAD=1 开启)");
             return;
         }
         // ③ 通用入口整装(CPU face;9B f16 ≈18GB host)
@@ -1567,8 +1567,8 @@ mod generic_entry_tests {
     #[tokio::test]
     async fn generic_entry_covers_quantized_family() {
         let dir = std::path::PathBuf::from(
-            std::env::var("OWL_CKPT_27B_AWQ")
-                .unwrap_or_else(|_| "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4".into()),
+            owl_shared::testkit::resource("ckpt:27b-awq")
+                .unwrap_or_else(|| "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4".into()),
         );
         if !dir.is_dir() {
             eprintln!("skip: 27B AWQ 检查点不在");

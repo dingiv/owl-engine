@@ -18,6 +18,7 @@
 //! 运行纪律:OWL_TEST_DEVICE 钉卡 + `--test-threads=1`(pitfall §16);
 //! 校准模式 OWL_GOLDEN_CALIBRATE=1 只打印偏差不断言。
 
+use owl_macros::owl_test;
 use cudarc::driver::{CudaContext, DevicePtr, LaunchConfig, PushKernelArg};
 
 const CASES: &[(&str, usize, bool)] = &[
@@ -171,13 +172,9 @@ fn assert_close(name: &str, tag: &str, got: &[f32], want: &[f32], atol: f32, rto
     assert!(worst <= 1.0, "{tag}/{name}: 超容差 ×{worst:.2} @ {wi}({wg} vs {ww})");
 }
 
-#[test]
+#[owl_test(gpu)]
 #[allow(clippy::too_many_lines)]
 fn gdn_chunked_golden_stage_by_stage() {
-    if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
-        return;
-    }
     let dev: usize = owl_cuda::test_device_ordinal_opt().unwrap_or(1);
     let ctx = CudaContext::new(dev).expect("cuda ctx");
     ctx.bind_to_thread().expect("bind");

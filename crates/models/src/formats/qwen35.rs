@@ -444,8 +444,8 @@ mod tests {
             eprintln!("skip: OWL_TEST_DEVICE 未设");
             return;
         }
-        let Some(dir) = owl_shared::env_reader::str("OWL_DFLASH2_DIR") else {
-            eprintln!("skip: OWL_DFLASH2_DIR 未设");
+        let Some(dir) = owl_shared::testkit::resource("ckpt:dflash2") else {
+            eprintln!("skip: ckpt:dflash2 未设");
             return;
         };
         let mut gpu = crate::testkit::gpu_client().await;
@@ -1459,12 +1459,12 @@ mod tests {
         gpu.close().await.expect("关机");
     }
     /// E5-DF1 验收:DFlash2 检查点装载(81 键)+ fc 采样对拍 +
-    /// encode/selector 真几何冒烟。门控 OWL_TEST_DEVICE + OWL_DFLASH2_DIR
+    /// encode/selector 真几何冒烟。门控 OWL_TEST_DEVICE + ckpt:dflash2
     /// (z-lab/Qwen3.8-27B-DFlash2 目录)。
     #[owl_test(gpu)]
     async fn gpu_dflash2_27b_loads_and_smokes() {
-        let Some(dir) = owl_shared::env_reader::str("OWL_DFLASH2_DIR") else {
-            eprintln!("skip: OWL_DFLASH2_DIR 未设(DFlash2 检查点目录)");
+        let Some(dir) = owl_shared::testkit::resource("ckpt:dflash2") else {
+            eprintln!("skip: ckpt:dflash2 未设(DFlash2 检查点目录)");
             return;
         };
         let dir = std::path::Path::new(&dir);

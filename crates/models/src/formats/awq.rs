@@ -1032,7 +1032,7 @@ mod tests {
             eprintln!("skip: OWL_AWQ_IOBENCH 未开");
             return;
         }
-        let dir = std::path::PathBuf::from(owl_shared::env_reader::str("OWL_CKPT_27B_AWQ").unwrap_or_else(|| {
+        let dir = std::path::PathBuf::from(owl_shared::testkit::resource("ckpt:27b-awq").unwrap_or_else(|| {
             "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4".into()
         }));
         let src = AwqSource::open_dir(&dir).expect("源");

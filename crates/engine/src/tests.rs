@@ -1078,7 +1078,7 @@ pub async fn gpu_08b_chunk_invariance_gate() {
 ///
 /// 只剩**运行器级**三件事走 env(它们不属于引擎配置):
 /// - `OWL_TEST_DEVICE`(哪张卡)/ `OWL_E2E_ONLY`(跑哪些场景)
-/// - `OWL_AWQ27B_DIR` / `OWL_DFLASH2_DIR`(资产路径)
+/// - `ckpt:27b-awq` / `ckpt:dflash2`(资产路径)
 /// - 本函数的两个(读哪个配置文件)
 fn probe_engine_config(ordinal: usize, default_flavor: &str) -> EngineConfig {
     let flavor = owl_shared::env_reader::str("OWL_PROBE_FLAVOR")
@@ -1246,7 +1246,7 @@ fn stage_in_config(ordinal: usize) -> EngineConfig {
     EngineConfig { device_ordinal: ordinal, max_seq_tokens: 512, prefill_chunk: 64, knobs }
 }
 
-/// **B-5 Stage 2:27B 单卡 + 选择层 + 部分驻留**(`OWL_SELECT_27B=1` + `OWL_AWQ27B_DIR`)。
+/// **B-5 Stage 2:27B 单卡 + 选择层 + 部分驻留**(`OWL_SELECT_27B=1` + `ckpt:27b-awq`)。
 ///
 /// **场景设计就是"KVMem 虚拟空间"本身**:设备 KV 池**刻意小于** ctx
 /// (池 4k tok / prompt ~16k tok = 4× 超卖)⇒ 中途**必须**把被踢出工作集的块
@@ -1257,7 +1257,7 @@ fn stage_in_config(ordinal: usize) -> EngineConfig {
 /// (`select_view_steps > 0`,零回退)④输出非退化(切题性看打印)。
 async fn select_27b_scenario() {
     let dir = std::path::PathBuf::from(
-        owl_shared::env_reader::str("OWL_AWQ27B_DIR").expect("OWL_AWQ27B_DIR"),
+        owl_shared::testkit::resource("ckpt:27b-awq").expect("ckpt:27b-awq"),
     );
     assert!(dir.exists(), "检查点目录不存在: {dir:?}");
     let ordinal = gpu_ordinal().expect("OWL_TEST_DEVICE");
@@ -1411,8 +1411,8 @@ pub async fn gpu_27b_select_probe() {
         eprintln!("skip: OWL_SELECT_27B 未设(B-5 Stage2 探针按需开)");
         return;
     }
-    if owl_shared::env_reader::str("OWL_AWQ27B_DIR").is_none() || gpu_ordinal().is_none() {
-        eprintln!("skip: 需 OWL_AWQ27B_DIR + OWL_TEST_DEVICE");
+    if owl_shared::testkit::resource("ckpt:27b-awq").is_none() || gpu_ordinal().is_none() {
+        eprintln!("skip: 需 ckpt:27b-awq + OWL_TEST_DEVICE");
         return;
     }
     select_27b_scenario().await;
@@ -2282,12 +2282,12 @@ pub async fn gpu_w4a16_marlin_e2e() {
 
 /// GPU 门控:Qwen3.8-27B AWQ-INT4 全链冒烟(2026-10-01;cyankiwi
 /// g32-asym 检查点)—— 装载(formats/awq.rs 懒物化 + marlin kU4
-/// GEMM_W4A16_AWQ)+ 图捕获 + 生成。门控 OWL_AWQ27B_DIR = 检查点
+/// GEMM_W4A16_AWQ)+ 图捕获 + 生成。门控 ckpt:27b-awq = 检查点
 /// 目录(models/cyankiwi/Qwen3.8-27B-AWQ-INT4);未设则 skip。
 /// VRAM 预算:权重 ~17.5GB + KV/GDN 状态 ~1.3GB → 3090 Ti 24G。
 pub async fn gpu_awq27b_marlin_e2e(shared: Option<&mut RunningEngine<owl_cuda::GpuClient>>) {
-    let Some(dir) = owl_shared::env_reader::str("OWL_AWQ27B_DIR") else {
-        eprintln!("skip: OWL_AWQ27B_DIR 未设(cyankiwi 检查点目录)");
+    let Some(dir) = owl_shared::testkit::resource("ckpt:27b-awq") else {
+        eprintln!("skip: ckpt:27b-awq 未设(cyankiwi 检查点目录)");
         return;
     };
     let dir = std::path::PathBuf::from(dir);
@@ -2571,8 +2571,8 @@ pub async fn gpu_prefix_cache_hit(shared: Option<&mut RunningEngine<owl_cuda::Gp
 /// 无退化复读(启发式:任意 2-8 字片段连现 4 次即退化)。
 /// 输出全文打印供人工判读;复读启发式是底线门不是质量门。
 pub async fn gpu_27b_chat_inference(shared: Option<&mut RunningEngine<owl_cuda::GpuClient>>) {
-    let Some(dir) = owl_shared::env_reader::str("OWL_AWQ27B_DIR") else {
-        eprintln!("skip: OWL_AWQ27B_DIR 未设(cyankiwi 检查点目录)");
+    let Some(dir) = owl_shared::testkit::resource("ckpt:27b-awq") else {
+        eprintln!("skip: ckpt:27b-awq 未设(cyankiwi 检查点目录)");
         return;
     };
     let dir = std::path::PathBuf::from(dir);
@@ -2712,7 +2712,7 @@ pub async fn boot_08b(max_seq: usize) -> RunningEngine<owl_cuda::GpuClient> {
 /// 27B 装载 ~24-32s/次,重复装载 = 纯浪费)。
 pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
     let dir = std::path::PathBuf::from(
-        owl_shared::env_reader::str("OWL_AWQ27B_DIR").expect("OWL_AWQ27B_DIR"),
+        owl_shared::testkit::resource("ckpt:27b-awq").expect("ckpt:27b-awq"),
     );
     assert!(dir.exists(), "检查点目录不存在: {dir:?}");
     let ordinal = gpu_ordinal().expect("OWL_TEST_DEVICE");
@@ -2747,7 +2747,7 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
 
 /// 诊断:裸续写 A/B(模板态病 vs 权重病的鉴别臂)
     pub async fn gpu_27b_raw_completion_diag() {
-        let Some(dir) = owl_shared::env_reader::str("OWL_AWQ27B_DIR") else { return; };
+        let Some(dir) = owl_shared::testkit::resource("ckpt:27b-awq") else { return; };
         let dir = std::path::PathBuf::from(dir);
         if !dir.exists() { return; }
         let ordinal = gpu_ordinal().expect("OWL_TEST_DEVICE");
@@ -2871,14 +2871,14 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
     /// E5-M2b 恒等门(真草稿臂,27B + MTP 头):真草稿下 greedy spec 输出
     /// ≡ 无 spec 输出(逐 token)。同时验证 m>0 真接受路径(部分/全接受)
     /// 与 spec_stats 账目闭合(Σ(m_i+1) = 发射 token 数)。门控
-    /// OWL_AWQ27B_DIR。
+    /// ckpt:27b-awq。
     pub async fn gpu_spec_identity_gate_27b() {
         let Some(ordinal) = gpu_ordinal() else {
             eprintln!("skip: OWL_TEST_DEVICE 未设");
             return;
         };
-        let Some(dir) = owl_shared::env_reader::str("OWL_AWQ27B_DIR") else {
-            eprintln!("skip: OWL_AWQ27B_DIR 未设(cyankiwi 检查点目录)");
+        let Some(dir) = owl_shared::testkit::resource("ckpt:27b-awq") else {
+            eprintln!("skip: ckpt:27b-awq 未设(cyankiwi 检查点目录)");
             return;
         };
         // 域参数化(E5-DF3 AL 排查:PROSE 域 = DFlash2 结构性最差域,
@@ -2964,20 +2964,20 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
     }
 
     /// E5-DF3 恒等门(27B AWQ target + DFlash2 草稿):greedy spec 文本
-    /// ≡ 无 spec 逐位。门控 OWL_TEST_DEVICE + OWL_AWQ27B_DIR +
-    /// OWL_DFLASH2_DIR。**20G 卡贴顶**(target ~13.7G + draft 3.85G +
+    /// ≡ 无 spec 逐位。门控 OWL_TEST_DEVICE + ckpt:27b-awq +
+    /// ckpt:dflash2。**20G 卡贴顶**(target ~13.7G + draft 3.85G +
     /// 池)—— OOM 时降 max_seq_tokens/挪 24G 卡。
     pub async fn gpu_dflash2_identity_gate_27b() {
         let Some(ordinal) = gpu_ordinal() else {
             eprintln!("skip: OWL_TEST_DEVICE 未设");
             return;
         };
-        let Some(dir) = owl_shared::env_reader::str("OWL_AWQ27B_DIR") else {
-            eprintln!("skip: OWL_AWQ27B_DIR 未设(cyankiwi 检查点目录)");
+        let Some(dir) = owl_shared::testkit::resource("ckpt:27b-awq") else {
+            eprintln!("skip: ckpt:27b-awq 未设(cyankiwi 检查点目录)");
             return;
         };
-        let Some(ddir) = owl_shared::env_reader::str("OWL_DFLASH2_DIR") else {
-            eprintln!("skip: OWL_DFLASH2_DIR 未设(DFlash2 草稿目录)");
+        let Some(ddir) = owl_shared::testkit::resource("ckpt:dflash2") else {
+            eprintln!("skip: ckpt:dflash2 未设(DFlash2 草稿目录)");
             return;
         };
         // 域参数化(E5-DF3 AL 排查:PROSE 域 = DFlash2 结构性最差域,
@@ -3196,7 +3196,7 @@ async fn drive_turn<D: DeviceClient>(running: &mut RunningEngine<D>, id: u64) ->
 /// —— 固定成本(prefill 尾步/首步杂项/事件泵)与 EOS 点全部在差分中
 /// 消掉。旧 e2e 的 wall÷max_new 与 gate 生成段 wall÷实际tok 两把尺子
 /// 分别虚高/虚低(差分实测:4d21122 24.3ms vs HEAD 24.8ms = 无回退,
-/// 当年"45 tok/s"是朴素口径虚高)。门控 OWL_AWQ27B_DIR + OWL_TEST_DEVICE。
+/// 当年"45 tok/s"是朴素口径虚高)。门控 ckpt:27b-awq + OWL_TEST_DEVICE。
 ///
 /// 泄漏案探针(2026-10-10 深夜;slot≥1 崩塌案首刀):
 /// MAX_ACTIVE_TURNS=2 下,turn(slot0) 前后对比 slot1 状态区指纹 ——
@@ -3251,8 +3251,8 @@ pub async fn gpu_decode_marginal_bench() {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
     };
-    let Some(dir) = owl_shared::env_reader::str("OWL_AWQ27B_DIR") else {
-        eprintln!("skip: OWL_AWQ27B_DIR 未设");
+    let Some(dir) = owl_shared::testkit::resource("ckpt:27b-awq") else {
+        eprintln!("skip: ckpt:27b-awq 未设");
         return;
     };
     // 口径与恒等门一致(greedy 单会话三旋钮,显式 knobs)

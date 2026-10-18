@@ -658,12 +658,12 @@ mod tests {
     fn visual_weights() -> (std::collections::HashMap<String, Vec<f32>>, VisionCfg) {
         // 默认档 = **Qwen3.5-4B**(用户裁决 2026-10-15:塔更小(hidden 1024/24 层/hd **64**)
         // + 文本 4B ⇒ 单张 3080 装得下;Holo-9B 塔 head_dim 72 不落 FlashInfer 实例化档)。
-        let ckpt = std::env::var("OWL_VISION_CKPT")
-            .unwrap_or_else(|_| "/home/div/Documents/codes/models/Qwen/Qwen3.5-4B".into());
+        let ckpt = owl_shared::testkit::resource("ckpt:qwen35-4b")
+            .unwrap_or_else(|| "/home/div/Documents/codes/models/Qwen/Qwen3.5-4B".into());
         let dir = PathBuf::from(ckpt);
         let mut out = std::collections::HashMap::new();
         let mut shards: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .expect("读模型目录(OWL_VISION_CKPT 可指路)")
+            .expect("读模型目录(ckpt:qwen35-4b 可指路)")
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| {
                 // shard 命名两种:HF 分隔点(`model-00001-of-00002.safetensors`)

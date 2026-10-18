@@ -608,7 +608,7 @@ mod tests {
     }
 
     /// **标记 × 快照耦合门**:解析器的标记字面量必须真的出现在快照渲染产物里
-    /// (仓库内金标,恒跑);模板源(需 `OWL_TPL_DIR`)必须留长形态别名。
+    /// (仓库内金标,恒跑);模板源(需 `tpl:default`)必须留长形态别名。
     /// 模板漂移(上游改标记名)会让解析器**静默失效** —— 这条是警报器。
     #[test]
     fn markers_match_snapshot() {
@@ -619,15 +619,15 @@ mod tests {
         assert!(think_on.contains(MARK_TOOL_OPEN), "tools 档应含工具开标记");
         assert!(think_on.contains(MARK_TOOL_CLOSE), "tools 档应含工具闭标记");
         assert!(think_off.contains(MARK_THINK_CLOSE), "关思考档应含主闭标记");
-        match std::env::var("OWL_TPL_DIR") {
-            Ok(dir) => {
+        match owl_shared::testkit::resource("tpl:default") {
+            Some(dir) => {
                 let src = std::fs::read_to_string(
                     std::path::Path::new(&dir).join("chat_template.jinja"),
                 )
                 .unwrap();
                 assert!(src.contains(MARK_THINK_OPEN_LONG), "模板源应含长形态别名");
             }
-            Err(_) => eprintln!("skip(部分): OWL_TPL_DIR 未设,跳过模板源检查"),
+            None => eprintln!("skip(部分): 资源 tpl:default 不在,跳过模板源检查"),
         }
     }
 

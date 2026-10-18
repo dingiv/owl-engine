@@ -22,6 +22,7 @@
 //!        --test xqa_decode_probe -- --test-threads=1 --nocapture`
 #![cfg(feature = "xqa")]
 
+use owl_macros::owl_test;
 use std::time::Instant;
 
 use cudarc::driver::{CudaContext, DevicePtr, LaunchConfig, PushKernelArg};
@@ -422,12 +423,8 @@ fn run_case(ctx: usize, q_seq_len: usize, decode_inst: bool, check: bool) {
     }
 }
 
-#[test]
+#[owl_test(gpu)]
 fn xqa_decode_speed_and_parity() {
-    if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
-        return;
-    }
     // D1 备选实测:q=1 走现有 SPEC_DEC=1 实例化(M_TILESIZE=32,32 行里只有 6 行有效)
     // XQA_DECODE_ONLY=1 → 只跑 M_TILESIZE=16 实例化;XQA_SM=N → 覆盖 sm_count(split 数)
     let decode_only = owl_shared::env_reader::flag("XQA_DECODE_ONLY");

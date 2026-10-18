@@ -7,6 +7,7 @@
 //! 无 GPU 跳过(OWL_TEST_DEVICE)。
 
 
+use owl_macros::owl_test;
 use cudarc::driver::{CudaContext, DevicePtr, LaunchConfig, PushKernelArg};
 
 const S: usize = 8; // 伪序列数
@@ -143,12 +144,8 @@ fn host_ref_impl(q: &[u16], kc: &[u8], vc: &[u8], lens: &[usize], kv_fp8: bool, 
 /// `kv_knhd_read_parity` 只测 `nparts=1`(归并退化为直拷),而生产长 ctx
 /// 每次 decode 都走 `nparts = ceil(pool/512)`(16k 池 = 33)+ verify 的
 /// seqs=8,故 **"kNHD × 归并" 此前无真值覆盖**(本文件此前只跑 classic 名)。
-#[test]
+#[owl_test(gpu)]
 fn v2_paged_multiseq_matches_host() {
-    if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
-        return;
-    }
     for knhd in [false, true] {
         eprintln!("[case] knhd={knhd}");
         v2_multiseq_case(knhd);

@@ -39,12 +39,22 @@ max_seq = 2048
 > overlay = `testdata/cases/<crate>/<模块路径>/<用例名>.toml`。
 > 缺文件 = 不上这一层；环境档缺失 = 响亮 panic。
 
-## 2. 设备与数据
+## 2. 设备与资源
 
 - **设备**：唯一 env `OWL_TEST_DEVICE`，值 = **PCI BDF**（如 `41:00.0`；用 `nvidia-smi --query-gpu=pci.bus_id` 查）。
   未设 = GPU 用例 auto-skip；**纯数字（CUDA 序号）会被响亮拒绝**。
-- **数据**（检查点 / 金标）：暂按各自 env（`OWL_AWQ27B_DIR` 等）或仓库内路径；
-  拟收进资源清单（设计见 `docs/arch/owl-test-macro.md` §七）。
+- **资源清单**：`testdata/resources.toml`（本机，不进版本；模板见 `resources.toml.example`）——
+  取代 `OWL_AWQ27B_DIR` / `OWL_DFLASH2_DIR` / `OWL_VLM_CKPT` 一族 env：
+
+  ```toml
+  "ckpt:27b-awq"   = "/path/to/Qwen3.8-27B-AWQ-INT4"
+  "ckpt:dflash2"   = "/path/to/Qwen3.8-27B-DFlash2-W4A16"
+  "ckpt:qwen35-4b" = "/path/to/Qwen3.5-4B"
+  "flag:hf-parity" = true          # 开关（未列 = false）
+  ```
+
+  用例侧：`owl_shared::testkit::resource("ckpt:27b-awq")`（缺 = skip，文案点名 key）；
+  宏门控：`#[owl_test(needs = "ckpt:27b-awq")]`。**旧 env 若仍被设置 = 响亮 panic**（附迁移指引）。
 
 ## 3. 目录一览
 
@@ -52,6 +62,7 @@ max_seq = 2048
 |---|---|---|
 | `cases/` | 用例 overlay（本地临时档，可删） | 否（随手写、随手删） |
 | `conf/` | 测试环境档（本地；`OWL_TEST_CONF` 指向） | 否 |
+| `resources.toml` | **资源清单**（本地；检查点/金标路径 + 开关） | 否（`resources.toml.example` 进版本） |
 | `gdn_fla/` | GDN 金标：`gen.py` 生成 `cases/*.bin` | 脚本+manifest 是；大件否 |
 | `args/` | 引擎启动档（索引见 `args/README.md`） | 仅 `perf-ctxladder-27b.toml` |
 | `server/` | agent-serving 自有档 | 否 |

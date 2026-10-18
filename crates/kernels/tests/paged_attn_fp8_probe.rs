@@ -9,6 +9,7 @@
 //! CUDA cuda_fp8.hpp 语义一致(直接对照同输入核内转换)。
 //! 无 GPU 跳过(OWL_TEST_DEVICE)。
 
+use owl_macros::owl_test;
 use cudarc::driver::{CudaContext, DevicePtr, LaunchConfig, PushKernelArg};
 
 const HD: usize = 256;
@@ -98,12 +99,8 @@ fn f16_bits_to_f32(h: u16) -> f32 {
     s * (1.0 + m / 1024.0) * 2f32.powi(e - 15)
 }
 
-#[test]
+#[owl_test(gpu)]
 fn paged_attn_v2_fp8_matches_f16() {
-    if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
-        return;
-    }
     let ctx = CudaContext::new(1).expect("ctx");
     ctx.bind_to_thread().expect("bind");
     let stream = ctx.default_stream();

@@ -12,6 +12,7 @@
 //!
 //! 无 GPU 跳过(OWL_TEST_DEVICE)。
 
+use owl_macros::owl_test;
 use cudarc::driver::{CudaContext, DevicePtr, LaunchConfig, PushKernelArg};
 
 const NK: usize = 16;
@@ -65,12 +66,8 @@ fn dev_u16(s: &std::sync::Arc<cudarc::driver::CudaStream>, n: usize) -> cudarc::
     unsafe { s.alloc::<u16>(n) }.unwrap()
 }
 
-#[test]
+#[owl_test(gpu)]
 fn gdn_decode_step_batch2_equals_serial() {
-    if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
-        return;
-    }
     // nvrtc 懒编译(源 = cu/owl/gdn.cu;自足,仅 <cuda_fp16.h>)
     let ctx = CudaContext::new(1).expect("ctx");
     ctx.bind_to_thread().expect("bind");

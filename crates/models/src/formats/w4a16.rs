@@ -737,7 +737,7 @@ mod tests {
     use crate::formats::util::f16_par;
 
     fn draft_dir() -> Option<std::path::PathBuf> {
-        owl_shared::env_reader::str("OWL_DFLASH2_DIR").map(std::path::PathBuf::from)
+        owl_shared::testkit::resource("ckpt:dflash2").map(std::path::PathBuf::from)
     }
 
     /// 派生 fc 列块 ↔ fused 权威:①尺度(内容口径 BF16)②marlin B(逐字)。
@@ -746,7 +746,7 @@ mod tests {
     #[test]
     fn fc_derived_keys_match_fused_authority() {
         let Some(dir) = draft_dir() else {
-            eprintln!("skip: OWL_DFLASH2_DIR 未设");
+            eprintln!("skip: ckpt:dflash2 未设");
             return;
         };
         let src = W4A16Source::open_dir(&dir).expect("打开草稿目录");

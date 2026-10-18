@@ -65,6 +65,9 @@ flavor(可选,预设档名) → OWL_TEST_CONF(整轮环境档) → 用例 overla
 | `OWL_TEST_CONF` | 任意路径(**唯一**测试 env) | 整轮测试的环境档(TOML,引擎同款 `OwlConfig` 格式):共同口径 + 本机覆盖。未设 = 无此层;设了但文件缺失/解析失败 = **响亮 panic** |
 | 用例 overlay | `testdata/cases/<crate>/<模块路径>/<用例名>.toml` | **零 env**:由宏传入的 `file!()` 推导。临时改一个用例 = 丢个文件;删文件即还原;集成测试(`tests/*.rs`)无此层 |
 
+- **资源门控**:`#[owl_test(needs = "ckpt:27b-awq")]`(可多枚)⇒ 资源清单
+  `testdata/resources.toml` 里该 key 缺失/路径不在 = skip(文案点名 key,
+  见下节);调试/数据判据不再散 env。
 - 三层全不在 ⇒ `OwlConfig::default()`(测试零配置可跑,不 skip);
 - **旧键 `OWL_TEST_CONFIG_<函数名大写>` 已退役**:设了 = 响亮 panic +
   迁移指引(给出该用例应放 overlay 的**确切路径**);
@@ -211,7 +214,7 @@ fn 名() {
 | **用例配置**(引擎旋钮) | `OWL_TEST_CONFIG_<FN>` 每用例一键 | **`OWL_TEST_CONF` 单一入口 + `testdata/cases/**` 约定 overlay**(宏传 `file!()` 推导;`flavor` 复用 `flavors/`) | ✅ **已落地**(2026-10-18) |
 | **整轮共同口径** | 各会话各写一套档 | 同上一入口:一份测试环境档定 flavor + 本机覆盖,大家测的配置一致 | ✅ 已落地 |
 | **设备**(哪张卡) | `OWL_TEST_DEVICE` | 保留为设备专用 env;值 = **PCI BDF**(`41:00.0`;**CUDA 序号已禁用**,纯数字响亮拒);进一步可收进 `testdata/machine.toml` | ✅ 已落地(2026-10-18) |
-| **数据**(检查点/金标) | `OWL_AWQ27B_DIR` / `OWL_DFLASH2_DIR` 等十余键 | **资源清单** `testdata/resources.toml`(`key = "path"`);用例声明 `#[owl_test(needs = ["ckpt:27b-awq"])]`,缺失 = skip 且**点名缺哪个 key** | ⏳ 提案 |
+| **数据**(检查点/金标) | `OWL_AWQ27B_DIR` / `OWL_DFLASH2_DIR` 等十余键 | **资源清单** `testdata/resources.toml`(`key = "path"`);用例声明 `#[owl_test(needs = "ckpt:27b-awq")]`,缺失 = skip 且**点名缺哪个 key**;旧 env = 响亮拒 | ✅ **已落地**(2026-10-18) |
 | **昂贵套件**(parity/bench) | `OWL_HF_PARITY` 等 | 已进宏选项(`hf_parity`);后续并入资源清单 | 部分 |
 
 下一步:资源清单(吃数据门)→ 设备收进 machine 文件。终态 = `#[owl_test]`
@@ -246,3 +249,16 @@ fn 名() {
 - 全仓测试面改走唯一入口:kernels(12 文件;dev-dep owl-cuda)、engine
   (tests/e2e/graph_plan/examples)、cuda 集成测试补 GPU 门(9 文件 / 22 处)、
   cuda examples。实证:BDF 真机跑通、纯数字响亮拒、未设 skip。
+
+### 2026-10-18(深夜):二期 —— 资源清单 + 同步体模式
+
+- **资源清单** `testdata/resources.toml`(本机;示例 `resources.toml.example` 进版本):
+  `owl_shared::testkit::res` 读取(`resource` / `resource_or` / `resource_flag` /
+  `resource_ok` / `missing_reason`);17 个 `OWL_*_DIR`/`CKPT`/`TPL` 键**退役**
+  (设了 = 响亮 panic + 迁移指引),调用面全量迁移(models/engine/apps 13 文件);
+- **宏新选项 `needs = "<key>"`**(可多枚;引号内逗号不分号);
+- **宏收同步体**:`#[owl_test(gpu)] fn probe() {…}` ⇒ 只做门控/配置包装、不建 runtime;
+  kernels 19 文件 / 24 个同步探针从"四行门"收编(dev-dep owl-macros);
+- 终态:**测试域只剩 1 个 env**(`OWL_TEST_DEVICE`,BDF)——
+  `OWL_TEST_CONF`(配置)/ `testdata/cases`(用例 overlay)/ `resources.toml`(资源)
+  全部走文件。

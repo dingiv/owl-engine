@@ -9,6 +9,7 @@
 //! 映射 oracle = 本文件独立重实现(与 env.rs 单源互证,双实现更强)。
 //! 无 GPU 跳过(OWL_TEST_DEVICE;卡 = ordinal 1,3090 空闲卡纪律)。
 
+use owl_macros::owl_test;
 use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, CudaStream, DevicePtr, LaunchConfig, PushKernelArg};
@@ -63,12 +64,8 @@ fn deterministic_u16(i: usize, salt: u32) -> u16 {
     half_bits((((i * 37 + salt as usize * 53) % 199) as f32) / 20.0 - 5.0)
 }
 
-#[test]
+#[owl_test(gpu)]
 fn reshape_and_cache_knhd_parity() {
-    if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
-        return;
-    }
     let ctx = CudaContext::new(1).expect("ctx");
     ctx.bind_to_thread().expect("bind");
     let stream = ctx.default_stream();
@@ -357,12 +354,8 @@ impl PoolIo for u8 {
     }
 }
 
-#[test]
+#[owl_test(gpu)]
 fn fused_insert_knhd_parity() {
-    if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
-        return;
-    }
     let ctx = CudaContext::new(1).expect("ctx");
     ctx.bind_to_thread().expect("bind");
     let stream = ctx.default_stream();

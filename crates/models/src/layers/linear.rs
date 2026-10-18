@@ -392,7 +392,7 @@ mod tests {
     /// 偏差(激活 1/(2·127) ≈ 4e-3 + 尺度 1.2e-4),但足以抓住**布局/接线级**
     /// 错误(拿错 B 表、a_scales 没接上、因子没折——量级都在 10⁻¹ 以上)。
     ///
-    /// 跑法:`OWL_TEST_DEVICE=1 OWL_AWQ27B_DIR=<cyankiwi 27B> cargo test -p owl-models
+    /// 跑法:`OWL_TEST_DEVICE=1 ckpt:27b-awq=<cyankiwi 27B> cargo test -p owl-models
     ///       --lib gpu_w4a8_matches_w4a16_on_real_layer -- --nocapture`
     #[tokio::test]
     async fn gpu_w4a8_matches_w4a16_on_real_layer() {
@@ -402,8 +402,8 @@ mod tests {
             eprintln!("skip: OWL_TEST_DEVICE 未设");
             return;
         }
-        let Some(dir) = owl_shared::env_reader::str("OWL_AWQ27B_DIR") else {
-            eprintln!("skip: OWL_AWQ27B_DIR 未设(cyankiwi 27B 检查点目录)");
+        let Some(dir) = owl_shared::testkit::resource("ckpt:27b-awq") else {
+            eprintln!("skip: ckpt:27b-awq 未设(cyankiwi 27B 检查点目录)");
             return;
         };
         // 真层:layer0.mlp.gate_proj(17408×5120)——两档都 marlin_eligible。

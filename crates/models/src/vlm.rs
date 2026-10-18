@@ -450,17 +450,17 @@ mod tests {
     use super::*;
     use crate::testkit::{f32b, harvest};
 
-    /// 4B 档模型目录(config.json 单源;可 `OWL_VLM_CKPT` 改指)
+    /// 4B 档模型目录(config.json 单源;可 `ckpt:qwen35-4b` 改指)
     fn ckpt_dir() -> std::path::PathBuf {
         std::path::PathBuf::from(
-            std::env::var("OWL_VLM_CKPT")
-                .unwrap_or_else(|_| "/home/div/Documents/codes/models/Qwen/Qwen3.5-4B".into()),
+            owl_shared::testkit::resource("ckpt:qwen35-4b")
+                .unwrap_or_else(|| "/home/div/Documents/codes/models/Qwen/Qwen3.5-4B".into()),
         )
     }
 
     fn cfg4b() -> VlmCfg {
         let raw = owl_shared::file_loader::read(&ckpt_dir().join("config.json"))
-            .expect("config.json 读入(OWL_VLM_CKPT 可指路)");
+            .expect("config.json 读入(ckpt:qwen35-4b 可指路)");
         VlmCfg::from_json(&raw).expect("VlmCfg::from_json")
     }
 
@@ -547,7 +547,7 @@ mod tests {
     }
 
     // ========================================================================
-    // 真权重面(4B;重,双门控 OWL_VLM_REAL=1 + OWL_TEST_DEVICE)
+    // 真权重面(4B;重,双门控 flag:vlm-real=1 + OWL_TEST_DEVICE)
     // ========================================================================
 
     /// 生产面常驻缓冲(f16 模型 ⇒ paged KV:页 32 + kNHD K 池 + 恒等块表;
@@ -637,12 +637,12 @@ mod tests {
     }
 
     /// 4B 真权重:**整装 + 文本 prefill 冒烟**(生产 f16 面;验两段键装载 /
-    /// 缓冲账 / 单树前向)。门控:`OWL_VLM_REAL=1` + `OWL_TEST_DEVICE`。
+    /// 缓冲账 / 单树前向)。门控:`flag:vlm-real=1` + `OWL_TEST_DEVICE`。
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn gpu_real_weights_text_prefill_smoke() {
         use crate::layers::rope::Rope;
-        if std::env::var("OWL_VLM_REAL").ok().as_deref() != Some("1") {
-            eprintln!("skip: OWL_VLM_REAL=1 未开(4B 整装 ~9.3G)");
+        if !owl_shared::testkit::resource_flag("flag:vlm-real") {
+            eprintln!("skip: flag:vlm-real=1 未开(4B 整装 ~9.3G)");
             return;
         }
         if !crate::testkit::gpu_enabled() {
@@ -652,7 +652,7 @@ mod tests {
         let dir = ckpt_dir();
         let t0 = std::time::Instant::now();
         let mut gpu = crate::testkit::gpu_client().await;
-        let dbg = std::env::var("OWL_VLM_LOAD_DEBUG").ok().as_deref() == Some("1");
+        let dbg = owl_shared::testkit::resource_flag("flag:vlm-load-debug");
         if dbg {
             // 分相账本需要 store 上线(测试进程默认未装)
             let _ = owl_shared::metrics::init_metrics(owl_shared::metrics::MetricsStore::new());
@@ -747,13 +747,13 @@ mod tests {
     /// 闭合「shim vs 真身」缺口)② prefill 末位 logits 的 top-1 / top-10 交叠
     /// ③ 贪心 N 步**逐 token** 与 HF 一致 + 打印 owl 自己出的答案文本。
     ///
-    /// 门控:`OWL_VLM_REAL=1` + `OWL_TEST_DEVICE`(4B 整装 ~9G,占一卡)。
+    /// 门控:`flag:vlm-real=1` + `OWL_TEST_DEVICE`(4B 整装 ~9G,占一卡)。
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn gpu_real_image_e2e_matches_hf() {
         use crate::layers::rope::Rope;
         use crate::testkit::{gpu_client, gpu_enabled, skip_note, st_read};
-        if std::env::var("OWL_VLM_REAL").ok().as_deref() != Some("1") {
-            eprintln!("skip: OWL_VLM_REAL=1 未开(4B 整装 ~9G)");
+        if !owl_shared::testkit::resource_flag("flag:vlm-real") {
+            eprintln!("skip: flag:vlm-real=1 未开(4B 整装 ~9G)");
             return;
         }
         if !gpu_enabled() {
@@ -894,7 +894,7 @@ mod tests {
         gpu.close().await.expect("关机");
     }
 
-    /// **装载分相微基准**(定位瓶颈用;门控 `OWL_VLM_BENCH=1` + `OWL_TEST_DEVICE`)。
+    /// **装载分相微基准**(定位瓶颈用;门控 `flag:vlm-bench=1` + `OWL_TEST_DEVICE`)。
     ///
     /// 量三段各自的上限:① bf16→f16 CPU 转换(F16C)② mmap→host memcpy
     /// ③ pinned→device DMA(异步上传 + 尾 sync)。
@@ -903,8 +903,8 @@ mod tests {
         use crate::contract::DeviceClient as _;
         use crate::formats::safetensors::SafeTensorsSource;
         use crate::module::WeightSource;
-        if std::env::var("OWL_VLM_BENCH").ok().as_deref() != Some("1") {
-            eprintln!("skip: OWL_VLM_BENCH=1 未开");
+        if !owl_shared::testkit::resource_flag("flag:vlm-bench") {
+            eprintln!("skip: flag:vlm-bench=1 未开");
             return;
         }
         if !crate::testkit::gpu_enabled() {

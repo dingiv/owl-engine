@@ -31,6 +31,7 @@
 #![cfg(feature = "device")]
 
 mod fi_support;
+use owl_macros::owl_test;
 use fi_support::{f16_to_f32, TestRes, H, HD, HKV, PAGE};
 
 use std::time::Instant;
@@ -373,12 +374,8 @@ fn run_case(t: usize, ctx: usize, host_check: bool, iters: usize) {
 /// **生产 chunk 形状阶梯**(2026-10-18):L4 尾块合并后 chunk 长 ∈ [513,1536],
 /// 加上 T=512 基准与并发批的形状面 —— 先看 FI 核时对 T 的标度是否线性
 /// (线性 ⇒ 无形状级拐点;亚线性 ⇒ 有固定开销;超线性 ⇒ 大 T 效率掉)。
-#[test]
+#[owl_test(gpu)]
 fn fi_prefill_chunk_ladder() {
-    if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
-        return;
-    }
     // (T, ctx, host_check, iters)
     let cases: &[(usize, usize, bool, usize)] = &[
         (256, 16384, false, 20),
@@ -395,12 +392,8 @@ fn fi_prefill_chunk_ladder() {
     }
 }
 
-#[test]
+#[owl_test(gpu)]
 fn fi_prefill_speed_and_parity() {
-    if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
-        return;
-    }
     let only = owl_shared::env_reader::str("FI_PF_ONLY").unwrap_or_default();
     let host_all = owl_shared::env_reader::flag("FI_PF_HOST");
     println!(

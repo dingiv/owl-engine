@@ -276,7 +276,7 @@ mod tests {
     use std::path::Path;
 
     /// E5-M0 验收:cyankiwi 检查点 MTP 头装载(15 键)+ fc 路径 host 对拍。
-    /// 门控 OWL_TEST_DEVICE + OWL_AWQ27B_DIR(cyankiwi 目录)。
+    /// 门控 OWL_TEST_DEVICE + ckpt:27b-awq(cyankiwi 目录)。
     /// host 参考 = 权重源直取(r16 对齐 f16 装载域)→ (1+w) rmsnorm →
     /// concat → fc matmul(全 f32)。
     #[tokio::test]
@@ -285,8 +285,8 @@ mod tests {
             eprintln!("skip: OWL_TEST_DEVICE 未设");
             return;
         }
-        let Some(dir) = owl_shared::env_reader::str("OWL_AWQ27B_DIR") else {
-            eprintln!("skip: OWL_AWQ27B_DIR 未设(cyankiwi 检查点目录)");
+        let Some(dir) = owl_shared::testkit::resource("ckpt:27b-awq") else {
+            eprintln!("skip: ckpt:27b-awq 未设(cyankiwi 检查点目录)");
             return;
         };
         let dir = Path::new(&dir);

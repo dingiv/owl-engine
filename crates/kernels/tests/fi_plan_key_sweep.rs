@@ -33,6 +33,7 @@
 #![cfg(feature = "device")]
 
 mod fi_support;
+use owl_macros::owl_test;
 use fi_support::{f16_to_f32, TestRes, PAGE};
 
 use owl_kernels::contract::{Arg, Dtype, KernelSource, LaunchMsg};
@@ -181,12 +182,8 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 /// **plan 是性能事实,不许改数值**:同形状 + 缓存状态不同 ⇒ 输出必须一致。
 ///
 /// 序列照**引擎的真实节奏**排:同一 `T`,ctx 从 `T` 起逐块长大(1×、2×、4×、8×)。
-#[test]
+#[owl_test(gpu)]
 fn fi_plan_key_ctx_sweep() {
-    if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
-        eprintln!("skip: OWL_TEST_DEVICE 未设(哪张卡)");
-        return;
-    }
     let dev: usize = owl_cuda::test_device_ordinal();
     // 错带(0.8B 几何实测;§8.30)与带外各留几个 —— 带外档必须也过(回归面)
     let ts: Vec<usize> = owl_shared::env_reader::str("FI_SWEEP_TS")

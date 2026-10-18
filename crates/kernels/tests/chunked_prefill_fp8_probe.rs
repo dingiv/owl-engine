@@ -13,6 +13,7 @@
 //! (隐式 float 数值截断,值<1→0/负→UB)= 99.6% 零输出真凶;修 =
 //! `__half_as_ushort` 位拷贝。本探针即当时的复现用例。
 
+use owl_macros::owl_test;
 use std::sync::Arc;
 use cudarc::driver::{CudaContext, DevicePtr, LaunchConfig, PushKernelArg};
 
@@ -296,12 +297,8 @@ fn run_case(
     assert!(mn < 5e-2 && xn < 3e-1, "hd{hd} f16/fp8 粗罔 tripwire(mean {mn}, max {xn})");
 }
 
-#[test]
+#[owl_test(gpu)]
 fn chunked_prefill_fp8_matches_f16() {
-    if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
-        return;
-    }
     let ctx = CudaContext::new(1).expect("ctx");
     ctx.bind_to_thread().expect("bind");
     let stream = ctx.default_stream();

@@ -1,13 +1,16 @@
 //! 算子对拍测试框架(设计见 crates/shared/README.md)。
 //!
-//! `case` = `#[owl_test]` 用例配置注入(隐藏 env → 引擎同款 OwlConfig;
-//! 设计 `docs/arch/owl-test-macro.md`)。
+//! - `case` = `#[owl_test]` 用例配置注入(唯一 env `OWL_TEST_CONF` + 约定 overlay;
+//!   设计 `docs/arch/owl-test-macro.md`);
+//! - `res` = **测试资源清单**(`testdata/resources.toml`;取代 `OWL_*_DIR` 一族 env)。
 
 pub mod case;
 pub mod checks;
+pub mod res;
 pub mod rng;
 
 pub use case::{case_config, TEST_CONF_ENV};
+pub use res::{missing_reason, resource, resource_flag, resource_ok, resource_or};
 
 /// **HF 对拍门**(`OWL_HF_PARITY=1`;`#[owl_test(hf_parity)]` 的判据 —— 与
 /// `models::testkit::parity_enabled` 同语义)

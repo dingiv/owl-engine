@@ -10,8 +10,8 @@
 //!
 //! 运行:
 //! ```bash
-//! OWL_TEST_DEVICE=1 OWL_AWQ27B_DIR=<27B-AWQ> OWL_DFLASH2_DIR=<DFlash2-W4A16> \
-//!   cargo test -p owl-engine --features e2e --test engine.e2e -- --test-threads=1
+//! OWL_TEST_DEVICE=41:00.0 cargo test -p owl-engine --features e2e --test engine.e2e -- --test-threads=1
+//! (27B/草稿等资源来自 `testdata/resources.toml`;见 docs/dev/fixtures.md)
 //! ```
 //! **GPU 必须串行**(pitfall §16:并行 = 多 CUDA 上下文同卡并发图捕获 → 假挂)。
 //!
@@ -115,8 +115,8 @@ async fn e2e_body() {
         eprintln!("[e2e] 无卡档完成,用时 {:.1}s", std::time::Instant::now().elapsed().as_secs_f32());
         return;
     }
-    let has_27b = owl_shared::env_reader::str("OWL_AWQ27B_DIR").is_some();
-    let has_draft = owl_shared::env_reader::str("OWL_DFLASH2_DIR").is_some();
+    let has_27b = owl_shared::testkit::resource("ckpt:27b-awq").is_some();
+    let has_draft = owl_shared::testkit::resource("ckpt:dflash2").is_some();
     eprintln!(
         "[e2e] device={dev} 27B_DIR={} DFLASH2_DIR={}(缺失的组会自行 skip)",
         has_27b, has_draft

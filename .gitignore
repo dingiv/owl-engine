@@ -12,6 +12,9 @@ dev_log
 testdata/*
 # 快速测试系统说明(唯一 env OWL_TEST_CONF + testdata/cases overlay):说明文档进版本
 !testdata/README.md
+# 资源清单:示例进版本,本机路径不进
+!testdata/resources.toml.example
+testdata/resources.toml
 !testdata/gdn_fla/
 testdata/gdn_fla/*
 !testdata/gdn_fla/gen.py

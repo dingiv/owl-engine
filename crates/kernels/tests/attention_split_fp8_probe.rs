@@ -6,6 +6,7 @@
 //! softmax + (m,l) 中性值 + reduce 合并 == 全局 softmax,浮点差 << 门)。
 //! 无 GPU 跳过(OWL_TEST_DEVICE)。
 
+use owl_macros::owl_test;
 use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, DevicePtr, LaunchConfig, PushKernelArg};
@@ -413,12 +414,8 @@ fn run_case(
     of
 }
 
-#[test]
+#[owl_test(gpu)]
 fn split_fp8_matches_f16() {
-    if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
-        return;
-    }
     let ctx = CudaContext::new(1).expect("ctx");
     ctx.bind_to_thread().expect("bind");
     let stream = ctx.default_stream();

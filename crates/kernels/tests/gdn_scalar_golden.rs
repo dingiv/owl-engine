@@ -8,6 +8,7 @@
 //! 是 FLA 侧量化误差,沿既有 5e-2 硬门。
 //! 无 GPU 跳过(OWL_TEST_DEVICE)。
 
+use owl_macros::owl_test;
 use cudarc::driver::{CudaContext, DevicePtr, LaunchConfig, PushKernelArg};
 
 const CASES: &[(&str, usize)] = &[
@@ -71,12 +72,8 @@ fn max_dev(a: &[f32], b: &[f32]) -> (usize, f32) {
     (idx, worst)
 }
 
-#[test]
+#[owl_test(gpu)]
 fn gdn_scalar_golden() {
-    if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
-        return;
-    }
     let ctx = CudaContext::new(1).expect("ctx");
     ctx.bind_to_thread().expect("bind");
     let stream = ctx.default_stream();

@@ -1312,8 +1312,8 @@ mod tests {
     /// 同权重(marlin 装载)—— 逐层定位首个发散算子。
     #[owl_test(gpu)]
     async fn gpu_dflash2_golden_matches() {
-        let Some(dir) = owl_shared::env_reader::str("OWL_DFLASH2_DIR") else {
-            eprintln!("skip: OWL_DFLASH2_DIR 未设");
+        let Some(dir) = owl_shared::testkit::resource("ckpt:dflash2") else {
+            eprintln!("skip: ckpt:dflash2 未设");
             return;
         };
         use crate::module::{LoaderCtx, Loadable};
@@ -1671,8 +1671,8 @@ mod tests {
     /// 参考 = m=20 输出的前 m' 行(marlin 确定性,同权重同输入行)。
     #[owl_test(gpu)]
     async fn gpu_dflash2_fc_m_sweep() {
-        let Some(dir) = owl_shared::env_reader::str("OWL_DFLASH2_DIR") else {
-            eprintln!("skip: OWL_DFLASH2_DIR 未设");
+        let Some(dir) = owl_shared::testkit::resource("ckpt:dflash2") else {
+            eprintln!("skip: ckpt:dflash2 未设");
             return;
         };
         use crate::module::LoaderCtx;
@@ -2408,8 +2408,8 @@ mod tests {
             eprintln!("skip: OWL_TEST_DEVICE 未设");
             return Ok(());
         }
-        let Some(dir) = owl_shared::env_reader::str("OWL_DFLASH2_DIR") else {
-            eprintln!("skip: OWL_DFLASH2_DIR 未设");
+        let Some(dir) = owl_shared::testkit::resource("ckpt:dflash2") else {
+            eprintln!("skip: ckpt:dflash2 未设");
             return Ok(());
         };
         use crate::module::LoaderCtx;

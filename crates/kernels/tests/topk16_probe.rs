@@ -16,6 +16,7 @@
 //!        --test topk16_probe -- --test-threads=1 --nocapture`
 //! (NVRTC 只住测试域;生产路径零运行期编译。)
 
+use owl_macros::owl_test;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -268,12 +269,8 @@ fn compile_module(ctx: &Arc<CudaContext>, src: &str) -> Arc<CudaModule> {
     ctx.load_module(ptx).expect("load module")
 }
 
-#[test]
+#[owl_test(gpu)]
 fn topk16_bench() {
-    if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
-        return;
-    }
     let dev_ord = owl_cuda::test_device_ordinal_opt().unwrap_or(1);
     let ctx = CudaContext::new(dev_ord).expect("ctx");
     ctx.bind_to_thread().expect("bind");
