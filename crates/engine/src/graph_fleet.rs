@@ -61,6 +61,23 @@ pub(crate) struct GraphFleet<D: DeviceClient> {
     /// 空 = 档位 off / 未建(该档全走 eager 原路)
     pub prefill: crate::prefill_plan::PrefillBuckets<D>,
 }
+/// **臂事实**(2026-10-19 审查):boot 自证行原先只报"**面**登记"(`FI 节点登记=true`),
+/// 而**臂**由 models 侧顺序决定 —— 两者可以不一致(实测:flavor `verify_fi=true`
+/// 但 `verify_v2` 缺省 true 抢前 ⇒ 真跑 v2 核)。这里读 models 记的 `attn.arm.*`
+/// 计数(每图 warmup 跑过一遍 ⇒ 生效臂计数 > 0),让报告**名实一致**。
+fn arm_facts(prefix: &str) -> String {
+    let rows = owl_shared::metrics::query_metrics(
+        &owl_shared::metrics::MetricsFilter::new().tag_prefix(prefix),
+    );
+    let mut v: Vec<String> = rows
+        .iter()
+        .filter(|r| r.counter > 0)
+        .map(|r| format!("{}={}", r.tag.trim_start_matches(prefix), r.counter))
+        .collect();
+    v.sort();
+    if v.is_empty() { "无(warmup 未记录)".to_string() } else { v.join(" ") }
+}
+
 
 impl<D: DeviceClient> GraphFleet<D> {
     /// **整族退休**(TP 双 rank 装配面的收尾;S4 ⑤-K2):逐图 `GraphPlan::close`
@@ -583,10 +600,11 @@ impl<D: DeviceClient> GraphFleet<D> {
         owl_shared::log_info!("boot", "GraphPlan plan(warmup+捕获) {:.2}s", t0.elapsed().as_secs_f32());
         owl_shared::log_info!(
             "boot",
-            "decode 面事实:FI 节点登记={} | single_baked={} bake={:?}",
+            "decode 面事实:FI 节点登记={} | single_baked={} bake={:?} | 臂事实(attn.arm.decode.*):{}",
             dfi_node_seen.load(std::sync::atomic::Ordering::Relaxed),
             single_baked,
-            plan_bake
+            plan_bake,
+            arm_facts("attn.arm.decode.")
         );
         Ok((session, capture_outcome, dfi_node_seen.load(std::sync::atomic::Ordering::Relaxed)))
     }
@@ -866,9 +884,10 @@ impl<D: DeviceClient> GraphFleet<D> {
         let (vg, voutcome) = GraphPlan::plan(vface, env, tp, desc, forward).await?;
         owl_shared::log_info!(
             "boot",
-            "verify 面事实:FI 节点登记={} | bake={:?} | 段=0 断点=0",
+            "verify 面事实:FI 节点登记={} | bake={:?} | 段=0 断点=0 | 臂事实(attn.arm.verify.*):{}",
             fi_node_seen.load(std::sync::atomic::Ordering::Relaxed),
-            vfi_bake
+            vfi_bake,
+            arm_facts("attn.arm.verify.")
         );
         match voutcome {
             PlanOutcome::Captured => {

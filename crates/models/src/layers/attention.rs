@@ -72,6 +72,16 @@ pub(crate) struct FiCoreGeom {
 /// **FI 核节点**(单一拼写点:prefill 主臂 + decode/verify 图内臂共用;
 /// 只出"核"本身,输出门/出投影在外)。
 #[allow(clippy::too_many_arguments)]
+/// **臂事实计数**(诊断面;2026-10-19 审查):boot 自证行原先只报"**面**登记"
+/// (`FI 节点登记=true`),而**臂**由本文件的顺序决定 —— 两者可以不一致
+/// (实测:flavor `verify_fi=true` 但 `verify_v2` 缺省 true 抢前 ⇒ 真跑 v2)。
+/// 引擎在 boot 报告里读这些计数(每图 warmup 跑一遍 ⇒ 生效臂的计数 > 0)。
+///
+/// 命名:`attn.arm.{verify|prefill|decode}.{fi|xqa|v2|naive}`。
+fn note_arm(tag: &str) {
+    owl_shared::metrics::with_metrics_store(|s| s.counter_add(tag, 1, file!(), line!()));
+}
+
 pub(crate) fn fi_core_node(
     g: FiCoreGeom,
     dt: Dtype,
@@ -499,6 +509,7 @@ impl Attention {
                     // 图内臂:直接烘上界(当步精确表由引擎窗外刷)
                     fi_ctx_baked,
                 );
+                note_arm("attn.arm.decode.fi");
                 let n = tokens * self.hq * self.hd;
                 let yg = TensorOps::call(SemanticKernel::GateMul)
                     .arg(gate)
@@ -512,6 +523,7 @@ impl Attention {
         // `ctx.xqa` 为 None ⇒ 自动回落 v2 主核(graceful,与 verify 臂同款纪律)。
         if tokens == 1 && ctx.env.attn.decode_xqa {
             if let Some(x) = ctx.xqa.as_ref() {
+                note_arm("attn.arm.decode.xqa");
                 return self.decode_xqa_arm(q, gate, wr, kv, ctx, pol, x);
             }
         }
@@ -1169,6 +1181,7 @@ impl Attention {
                     if tokens <= 16 && ctx.env.attn.verify_xqa {
                         if let Some(x) = ctx.xqa.as_ref() {
                             if x.q_seq_len == tokens {
+                                note_arm("attn.arm.verify.xqa");
                                 return self.xqa_specdec_arm(
                                     SemanticKernel::XqaVerify,
                                     &q, &k, &v, &gate, kv, tokens, ctx, &pol, kv_slots, x,
@@ -1181,7 +1194,15 @@ impl Attention {
                             (ctx.attn_v2.as_ref(), ctx.v2_bt8.as_ref())
                         {
                             if s2.seqs == tokens {
-                                eprintln!("[verify-v2] 臂触发 tokens={tokens} nparts={} nb={}", s2.nparts, bt8.shape().iter().product::<usize>() / s2.seqs);
+                                // F4(2026-10-19 审查):原为**热路径 eprintln!**(每层每轮
+                                // 无条件刷 stderr)⇒ 改臂事实计数 + debug 级日志。
+                                note_arm("attn.arm.verify.v2");
+                                owl_shared::log_debug!(
+                                    "verify-v2",
+                                    "臂触发 tokens={tokens} nparts={} nb={}",
+                                    s2.nparts,
+                                    bt8.shape().iter().product::<usize>() / s2.seqs
+                                );
                                 return self.verify_v2_arm(
                                     &q, &k, &v, &gate, kv, tokens, ctx, &pol, kv_slots, kv_lens, bt8, s2,
                                 );
@@ -1208,6 +1229,12 @@ impl Attention {
                         let fi_min_tokens = ctx.env.attn.fi_min_tokens;
                         if let Some(fi) = &ctx.fi {
                             if tokens >= fi_min_tokens {
+                                // 同一条臂服务 prefill 与 verify;`v2_bt8` 只在 verify 图声明
+                                note_arm(if ctx.v2_bt8.is_some() {
+                                    "attn.arm.verify.fi"
+                                } else {
+                                    "attn.arm.prefill.fi"
+                                });
                                 return self.paged_prefill_fi_output(
                                     &q, &k, &v, &gate, kv, tokens, ctx, &pol, kv_slots, fi,
                                 );

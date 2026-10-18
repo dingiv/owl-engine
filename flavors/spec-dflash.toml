@@ -78,6 +78,14 @@ kv_fp8 = true
 # 每步/每轮 `fi_plan_sync` 刷精确值 ⇒ 图不烘自携 restore。
 verify_fi = true
 decode_fi = true
+# ⚠️ **`verify_v2 = false` 必配**(2026-10-19 审查定谳):verify 注意力臂顺序 =
+# `verify_xqa` → **`verify_v2`(缺省 true!)** → 预填族(FI);不显式关掉 v2,
+# 上面那行 `verify_fi = true` **永远轮不到**(boot 自证行"verify=FI(单图)"报的是
+# **面登记**,不是臂 —— 现已加 `臂事实` 字段)。
+# 实测(生产形,5 轮 @8192):v2 臂 AL=2.33 < 盈亏线 3.09 ⇒ 引擎**正确降级裸 decode**
+# (803/805 步!)⇒ decode 38.8 t/s;**FI 臂零降级 ⇒ 87.2 t/s(+125%)**;
+# @512:79.1 → 107.3(+36%)。verify 轮时 75ms → 42ms。
+verify_v2 = false
 fi_cuda_graph = true
 fi_plan_bake = 0          # 0 = 哨兵「取 [runtime] max_seq」(改档自动跟随)
 fi_plan_restore = false   # 图不烘表 ⇒ host 是表的唯一权威(validate 硬配)
