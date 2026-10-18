@@ -318,6 +318,26 @@ pub enum UpStream {
     Compute,
 }
 
+/// **FI plan 表同步请求**(W3;见 [`DeviceClient::fi_plan_sync`])。
+///
+/// 为什么要它:FI 核进捕获图后,**回放期不再经过 FI 的宿主处理器** ⇒ 那张
+/// 调度表(`int_ws`)没人刷。而 split 档的表必须与**当步真实 ctx** 对应
+/// (运行期 `num_kv_chunks = ceil_div(kv_len, chunk_size)` 与表里的
+/// `o_indptr/merge_indptr` 不同步 ⇒ partial 行 stride 错;实测症状 = 输出
+/// 64 个空 token)。⇒ 引擎在每次图 launch **之前**显式请求一次刷新
+/// (同一 COMPUTE 流 ⇒ FIFO 有序)。
+#[derive(Clone, Copy, Debug)]
+pub struct FiPlanSpec {
+    /// 本轮 q 行数(decode = 1;prefill 桶 = 桶 t)
+    pub t: usize,
+    /// 本轮 KV 总长(plan 键的 ctx 维;**必须给真值**)
+    pub ctx_total: usize,
+    pub hq: usize,
+    pub hkv: usize,
+    pub hd: usize,
+    pub page: usize,
+}
+
 pub trait DeviceClient: Send {
     /// 执行环境提供(硬件感知;None = 无 GPU 环境,语义调用结构化拒绝)。
     /// 感知发生在引擎/boot 侧(实现者可缓存);kernels/解释器零探测
@@ -348,6 +368,24 @@ pub trait DeviceClient: Send {
         &mut self,
         graph: GraphId,
     ) -> impl Future<Output = Result<(), ModelError>> + Send;
+    /// **FI plan 表同步**(W3;仅 CUDA/FI 后端有意义):确保 `spec.ctx_total`
+    /// 对应的调度表在场,并把它的表内容刷进 FI 的 `int_ws`。
+    ///
+    /// 用途 = "FI 核在捕获图内 + 图不烘 plan restore"的档
+    /// (`[dispatch] fi_plan_bake`):表刷新必须由图**外面**的一步完成
+    /// (图回放不会经过宿主处理器)。缺省实现 = **结构化拒**(不静默)。
+    fn fi_plan_sync(
+        &mut self,
+        spec: FiPlanSpec,
+    ) -> impl Future<Output = Result<(), ModelError>> + Send {
+        let _ = spec;
+        async {
+            Err(ModelError::Msg(
+                "fi_plan_sync: 本后端无 FI plan 面(仅 CUDA + flashinfer 族)".into(),
+            ))
+        }
+    }
+
     /// **捕获窗作废**(窗内出错/空窗的收尾):退出捕获态 + 销毁半成品图 +
     /// **窗内自产块整批作废**(slab 随之释放)。
     ///

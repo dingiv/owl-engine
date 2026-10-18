@@ -150,7 +150,7 @@ async fn e2e_body() {
     run!(gpu_08b_budget_probe);
 
     // ── piecewise 段驱动件(不装模型;纯 GraphPlan 面) ──
-    run!(gpu_piecewise_segments);
+    run!(gpu_single_graph_capture_and_replay);
 
     // ── 0.8B 其余档:boot 期配置各不相同,各自装载 ──
     run!(gpu_schedule_decision_surface); // max_seq=64/chunk=4(切块敏感)

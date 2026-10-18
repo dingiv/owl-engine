@@ -142,39 +142,31 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 step_slots.push(("xqa_pt", self.xqa_pt_of(sid)));
             }
         }
-        // **FI 断点臂(V1c;T=1)**:宿主标量槽 ctx_total + 表四件套(位型过线)。
-        // 判据 = 槽在场(与 xqa_seq 同款纪律:`decode_fi` 关时图里没有这些槽)
+        // **FI 图内臂每步 ingress**:**表四件套**(位型过线)。图里 `ctx_total`
+        // 是**烘死的上界**(调度表形状),当步真值靠**表**(下面 `fi_plan_sync` 刷)。
+        // ⚠️ 判据 = **槽在场**(与 xqa_seq 同款纪律):槽属于**图**;曾按"宿主标量
+        // cell 在不在"判 ⇒ 单图档四件套一条不写 ⇒ 核读陈旧页表 ⇒ 输出 64 个空
+        // token(2026-10-18 实测踩过)。
         if self.graphs.session.has_input("fi_q_cu") {
-            if let Some(cell) = self.graphs.decode_fi_ctx() {
-                let ctx_total = pos + 1;
-                // ⚙ diag(`OWL_FI_BUCKET=<n>`):把**宿主标量槽**按桶上取整 ⇒ plan
-                // 只在跨桶时重算(表仍按真值写 ⇒ 每行 KV 上界由设备表定)。
-                // 判据:文本仍 ≡ 参考臂(plan 过供给只是多些被掩的 CTA)。
-                let bucket = self.probes.fi_bucket;
-                let plan_ctx = if bucket > 0 {
-                    ctx_total.div_ceil(bucket) * bucket
-                } else {
-                    ctx_total
-                };
-                cell.store(plan_ctx, std::sync::atomic::Ordering::Relaxed);
-                let page = self.pool.page;
-                let bt_chain = {
-                    let s = self.bank.sessions.session(sid)?;
-                    s.block_table.clone()
-                };
-                let nb_used = ctx_total.div_ceil(page).min(bt_chain.len()).max(1);
-                let mut idx = vec![0f32; self.pool.nb];
-                for (i, b) in bt_chain.iter().take(nb_used).enumerate() {
-                    idx[i] = f32::from_bits(*b);
-                }
-                step_slots.push(("fi_q_cu", vec![0.0, f32::from_bits(1)]));
-                step_slots.push(("fi_indices", idx));
-                step_slots.push(("fi_indptr", vec![0.0, f32::from_bits(nb_used as u32)]));
-                step_slots.push((
-                    "fi_last_len",
-                    vec![f32::from_bits((ctx_total - (nb_used - 1) * page) as u32)],
-                ));
+            let ctx_total = pos + 1;
+            // 四件套:真值(与承载无关 —— 图内/窗外都读同一批槽)
+            let page = self.pool.page;
+            let bt_chain = {
+                let s = self.bank.sessions.session(sid)?;
+                s.block_table.clone()
+            };
+            let nb_used = ctx_total.div_ceil(page).min(bt_chain.len()).max(1);
+            let mut idx = vec![0f32; self.pool.nb];
+            for (i, b) in bt_chain.iter().take(nb_used).enumerate() {
+                idx[i] = f32::from_bits(*b);
             }
+            step_slots.push(("fi_q_cu", vec![0.0, f32::from_bits(1)]));
+            step_slots.push(("fi_indices", idx));
+            step_slots.push(("fi_indptr", vec![0.0, f32::from_bits(nb_used as u32)]));
+            step_slots.push((
+                "fi_last_len",
+                vec![f32::from_bits((ctx_total - (nb_used - 1) * page) as u32)],
+            ));
         }
         let step_refs: Vec<(&str, &[f32])> =
             step_slots.iter().map(|(n, v)| (*n, v.as_slice())).collect();
@@ -184,6 +176,23 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let kv_dump_at = self.probes.kv_dump_at;
         if kv_dump_at == Some(pos) {
             self.dump_kv_page(sid, kv_slot, "before").await?;
+        }
+        // **FI plan 表同步**(W3;`[dispatch] fi_plan_bake` 档):图内 FI 核的回放
+        // **不经过宿主处理器** ⇒ 表(`int_ws`)必须由图外每步显式刷新;否则它读到的
+        // 是别的写者(如逐算子 eager 的 prefill 分块)留下的表,而 split 档的表
+        // 必须与**当步真 ctx** 对应(实测症状:输出 64 个空 token)。
+        // 条件 = 档位在场 + 本图确实带 FI 输入槽(臂身份自证,不猜)。
+        if self.cfg.knobs.fi_plan_bake.is_some() && self.graphs.session.has_input("fi_q_cu") {
+            let d = self.pool.dims;
+            let spec = owl_iface::contract::FiPlanSpec {
+                t: 1,
+                ctx_total: pos + 1,
+                hq: d.hq,
+                hkv: d.hkv,
+                hd: d.hd,
+                page: self.pool.page,
+            };
+            self.graphs.session.face_mut().fi_plan_sync(spec).await?;
         }
         self.graphs.session.step(&step_refs).await?;
         if kv_dump_at == Some(pos) {

@@ -287,6 +287,15 @@ impl DeviceClient for GpuClient {
         self.submit(move |ack| Command::GraphDestroy { graph, ack })?.await
     }
 
+    /// **FI plan 表同步**(W3;见 `DeviceClient::fi_plan_sync` 与
+    /// `Command::FiPlanSync`)。提交即返回,设备侧同 COMPUTE 流 FIFO。
+    async fn fi_plan_sync(
+        &mut self,
+        spec: owl_iface::contract::FiPlanSpec,
+    ) -> Result<(), ModelError> {
+        self.submit(move |ack| Command::FiPlanSync { spec, ack })?.await
+    }
+
     async fn alloc(&mut self, dtype: Dtype, elems: usize, name: &str) -> Result<Bytes, ModelError> {
         let n_bytes = elems * dtype.size_bytes();
         // 事实面:句柄自带 dtype(阶数未定形 = 0,由调用点 `view` 或张量视图定)

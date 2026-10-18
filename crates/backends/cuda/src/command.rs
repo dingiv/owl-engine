@@ -33,6 +33,13 @@ pub enum Command {
         graph: GraphId,
         ack: Ack<Result<(), ModelError>>,
     },
+    /// **FI plan 表同步**(W3):让 FI 族把 `spec.ctx_total` 对应的调度表刷进
+    /// int_ws。用于 "FI 核在捕获图内" 的档 —— 图回放不再经过宿主处理器,
+    /// 表必须由图外一步显式刷新(见 `DeviceClient::fi_plan_sync`)。
+    FiPlanSync {
+        spec: owl_iface::contract::FiPlanSpec,
+        ack: Ack<Result<(), ModelError>>,
+    },
     /// **捕获窗作废**(窗内出错/空窗的收尾;捕获期间**允许** —— 它就是窗内
     /// 收尾手段)。语义 = "这一窗从未存在":退出捕获态 + 销毁半成品图 +
     /// **窗内自产块整批移出账房**(⇒ slab 释放)。不做它则失败捕获会把整条
@@ -258,6 +265,7 @@ impl Command {
             Self::GraphLaunch { .. } => "graph_launch",
             Self::GraphAbort { .. } => "graph_abort",
             Self::GraphDestroy { .. } => "graph_destroy",
+            Self::FiPlanSync { .. } => "fi_plan_sync",
             Self::Alloc { .. } => "alloc",
             Self::Htod { .. } => "htod",
             Self::MemsetZero { .. } => "memset_zero",
@@ -296,6 +304,7 @@ impl Command {
             Self::GraphLaunch { ack, .. } => ack.created_at(),
             Self::GraphAbort { ack } => ack.created_at(),
             Self::GraphDestroy { ack, .. } => ack.created_at(),
+            Self::FiPlanSync { ack, .. } => ack.created_at(),
             Self::Alloc { ack, .. } => ack.created_at(),
             Self::Htod { ack, .. } => ack.created_at(),
             Self::DeviceSmCount { ack } => ack.created_at(),

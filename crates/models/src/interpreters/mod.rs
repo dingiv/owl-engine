@@ -29,8 +29,7 @@ pub mod observe;
 pub mod planner;
 
 pub use eval::{eval, eval_ops, eval_ops_multi, eval_ops_multi_env, eval_ops_multi_scoped_env, eval_ops_env, eval_ops_scoped, eval_ops_scoped_env, eval_ops_tap};
-// 段求值面(piecewise;`docs/piecewise-断点图-设计与实现.md`)
-pub use eval::{eval_segment, BreakDecl, EvalCarry, SegMode};
+// 段求值面(piecewise)已随 W5 退役(2026-10-18)—— 见 `eval.rs` 同名注。
 pub use generate::{eval_generate, GenSpec, Sampling};
 pub use observe::{BlockRef, BlockStats, NodeEvent, StatRecord, StatsTap, Tap, Want};
 

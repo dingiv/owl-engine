@@ -44,6 +44,10 @@ pub struct DiagOpts {
     /// 图实例化旗标(原 OWL_GRAPH_FLAGS;UPLOAD=2 / DEVICE_LAUNCH=4;
     /// 类型化位面经 OwlConfig.cuda.graph_flags → to_bits())
     pub graph_flags: u64,
+    /// **图自携 plan restore**(`[dispatch] fi_plan_restore`;缺省 true = 历史行为)。
+    /// `false` ⇒ 图不烘表,host 每步用 `fi_plan_sync` 刷当步精确表
+    /// (单图档 `[dispatch] fi_plan_bake` 的配套;配置层已校验二者不冲突)。
+    pub fi_plan_restore: bool,
     /// 捕获 slab 固定档 MiB(None = warmup 计量定量;原 OWL_CAPTURE_SLAB_MB
     /// —— 24G 贴顶的 27B + spec 双图场景,verify 图按需调小)
     pub capture_slab_mb: Option<usize>,
@@ -91,6 +95,7 @@ impl DiagOpts {
             graph_flags: c.graph_flags.to_bits(),
             capture_slab_mb: c.capture_slab_mb,
             trace_ring: c.trace_ring,
+            fi_plan_restore: cfg.dispatch.fi_plan_restore,
             allowed_ops: cfg
                 .dispatch
                 .allowed_ops

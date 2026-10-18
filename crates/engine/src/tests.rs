@@ -26,15 +26,18 @@ use owl_shared::config::OwlConfig;
 use owl_macros::owl_test;
 use owl_iface::contract::DeviceClient;
 
-/// **piecewise 段驱动件门**(2026-10-15;A4)—— **不装模型**,纯 `GraphPlan` 面。
+/// **单图捕获 + 双回放门**(原 piecewise 段驱动件门;2026-10-18 W5 改单图)——
+/// **不装模型**,纯 `GraphPlan` 面。
 ///
-/// 判据(与设计 `docs/piecewise-断点图-设计与实现.md` §7 P2 同源):
-/// ① 捕获成功且**段/断点数与声明一致**;
-/// ② **回放两次值一致**(跨段地址接力 + 可重复);
-/// ③ 断点的钉块由驱动件按声明形状分配 ⇒ 两期同址(值由断点算子写入)。
+/// 判据:
+/// ① 捕获成功(`PlanOutcome::Captured`);
+/// ② **回放两次值一致**(图回放可重复);
+/// ③ **引用计数推送面在场**(全量记名/OOM dump 的"它凭什么是活的"数据源):
+///    warmup 探针窗内 `refs_pushed > 0` —— 判据用**计数器**而非日志
+///    (日志受级别过滤;计数是机械事实)。
 ///
-/// 树:`y = x + c`(段0)→ `brk = y + y`(**断点**;窗外)→ `out = brk + c`(尾段)。
-pub async fn gpu_piecewise_segments() {
+/// 树:`y = x + c → out = y + c`(x=c=1 ⇒ out=3)。
+pub async fn gpu_single_graph_capture_and_replay() {
     let Some(ordinal) = gpu_ordinal() else {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
@@ -48,7 +51,7 @@ pub async fn gpu_piecewise_segments() {
     );
     let face = owl_cuda::GpuClient::new(tx);
     std::thread::Builder::new()
-        .name("owl-pw-test".into())
+        .name("owl-graph-test".into())
         .spawn(move || server.run().expect("server run 异常退出"))
         .expect("起 server 线程失败");
 
@@ -67,46 +70,41 @@ pub async fn gpu_piecewise_segments() {
     let forward = |sc: &crate::graph_plan::PlanCtx| -> Result<(), owl_iface::contract::ModelError> {
         let x = sc.input("x")?;
         let c = sc.input("c")?;
-        let y = x.add(&c); // 段0
-        let brk = y.add(&y); // 断点(窗外重放)
-        sc.break_node(&brk)?;
-        let out = brk.add(&c); // 尾段
+        let y = x.add(&c);
+        let out = y.add(&c);
         sc.output("out", &out)
     };
-    let (mut plan, outcome) = crate::graph_plan::GraphPlan::plan_piecewise(
+    let (mut plan, outcome) = crate::graph_plan::GraphPlan::plan(
         face,
         owl_models::env::EnvProvider::default(),
         desc,
-        true,
         forward,
     )
     .await
-    .expect("plan_piecewise");
+    .expect("plan");
     assert!(
         matches!(outcome, crate::graph_plan::PlanOutcome::Captured),
         "应捕获,得 {outcome:?}"
     );
-    assert_eq!(plan.piecewise_shape(), (2, 1), "应两段一断点");
-    // 回放 ×2:x=1,c=1 ⇒ y=2 ⇒ brk=4 ⇒ out=5
+    // 回放 ×2:x=1,c=1 ⇒ y=2 ⇒ out=3
     for i in 0..2 {
         let xs = [1.0f32; 4];
         plan.step(&[("x", &xs)]).await.expect("step");
         let v = plan.read_output_f32("out").await.expect("read out");
         assert!(
-            v.iter().all(|x| (x - 5.0).abs() < 1e-4),
-            "回放 #{i} 值应 5.0,得 {v:?}"
+            v.iter().all(|x| (x - 3.0).abs() < 1e-4),
+            "回放 #{i} 值应 3.0,得 {v:?}"
         );
     }
     // **引用计数推送面**(全量记名同轮;2026-10-16):图 plan 的 warmup 探针窗内,
-    // 求值器必须把 `(users, pending)` 推给探针 —— "它凭什么是活的"的数据源。
-    // 判据用**计数器**而非日志(日志受级别过滤;计数是机械事实)。窗口在 plan
-    // 内部 `probe_on/off`,on 时清零 ⇒ 此处读到的是本次 plan 的推送量。
+    // 求值器必须把 `(users, pending)` 推给探针。窗口在 plan 内部 `probe_on/off`,
+    // on 时清零 ⇒ 此处读到的是本次 plan 的推送量。
     let pushed = owl_shared::slab_hint::refs_pushed();
     assert!(
         pushed > 0,
-        "两段计划跑完后引用计数推送为 0 ⇒ 数据源断了(记名/OOM dump 的\"为什么活着\"面失效)"
+        "单图计划跑完后引用计数推送为 0 ⇒ 数据源断了(记名/OOM dump 的\"为什么活着\"面失效)"
     );
-    eprintln!("[piecewise] 两段一断点捕获 + 双回放 值一致 ✓(引用计数推送 {pushed} 次)");
+    eprintln!("[graph] 单图捕获 + 双回放 值一致 ✓(引用计数推送 {pushed} 次)");
 }
 
 fn asset_dir() -> std::path::PathBuf {
@@ -1611,12 +1609,13 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
                 knobs.draft.depth = 3;
                 knobs.draft.dumb = true;
             }
-            // piecewise A/B 臂(2026-10-15 perf 会话;恒等门用)
-            // **piecewise + FI 断点臂**(2026-10-16 转正门:"断点臂不破文本"红线)——
-            // spec(断点臂)与 baseline(spec_depth=0)贪心 token 流必须逐位一致:
-            // 覆盖"FI 四件套走输入槽 + ctx_total 宿主标量槽 + 段间 eager 重放"全链
+            // **FI 图内臂恒等门**(W5:piecewise/断点面已退役 ⇒ 臂 = 单图 + 窗外刷表)。
+            // spec(verify FI 图内臂)与 baseline(spec_depth=0)贪心 token 流必须逐位
+            // 一致:覆盖"FI 四件套走输入槽 + `ctx_total` 烘上界 + 每步/每轮
+            // `fi_plan_sync` 刷精确表"全链。(env 名保留历史拼写:`OWL_GATE_PIECEWISE`)
             if owl_shared::env_reader::flag("OWL_GATE_PIECEWISE") {
-                knobs.env.attn.verify_piecewise = true;
+                knobs.fi_cuda_graph = true;
+                knobs.fi_plan_bake = Some(128); // ≥ max_seq(本门 max_seq_tokens=128)
                 knobs.env.attn.verify_fi = true;
                 knobs.env.attn.verify_xqa = false;
                 knobs.env.attn.verify_v2 = false;
@@ -1708,12 +1707,13 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
             // 草稿档一律按投机配置 boot;baseline 轮靠运行时 spec_depth=0 回落
             knobs.draft.depth = 3;
             knobs.cuda.capture_slab_mb = Some(160);
-            // piecewise A/B 臂(2026-10-15 perf 会话;恒等门用)
-            // **piecewise + FI 断点臂**(2026-10-16 转正门:"断点臂不破文本"红线)——
-            // spec(断点臂)与 baseline(spec_depth=0)贪心 token 流必须逐位一致:
-            // 覆盖"FI 四件套走输入槽 + ctx_total 宿主标量槽 + 段间 eager 重放"全链
+            // **FI 图内臂恒等门**(W5:piecewise/断点面已退役 ⇒ 臂 = 单图 + 窗外刷表)。
+            // spec(verify FI 图内臂)与 baseline(spec_depth=0)贪心 token 流必须逐位
+            // 一致:覆盖"FI 四件套走输入槽 + `ctx_total` 烘上界 + 每步/每轮
+            // `fi_plan_sync` 刷精确表"全链。(env 名保留历史拼写:`OWL_GATE_PIECEWISE`)
             if owl_shared::env_reader::flag("OWL_GATE_PIECEWISE") {
-                knobs.env.attn.verify_piecewise = true;
+                knobs.fi_cuda_graph = true;
+                knobs.fi_plan_bake = Some(2048); // ≥ max_seq(本门 max_seq_tokens=2048)
                 knobs.env.attn.verify_fi = true;
                 knobs.env.attn.verify_xqa = false;
                 knobs.env.attn.verify_v2 = false;

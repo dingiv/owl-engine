@@ -88,18 +88,6 @@ pub struct RopeTables<'a> {
     pub sin: &'a TensorOps,
 }
 
-/// **FI 断点面**(piecewise verify;`ctx.attn_fi` 在场 = 本树要把 FI 核移出图)。
-///
-/// 格子 = **宿主标量槽**:FI 的 plan key 含 `ctx_total`(每轮随 ctx 长),
-/// 烘死在节点里就只对一个 ctx 有效 ⇒ 引擎逐轮写这个 atomic,
-/// 驱动件在**回放期**把它补进核的契约槽(见 `interpreters::BreakDecl`)。
-/// 零设备流量、零 D2H。
-#[derive(Clone)]
-pub struct AttnFiBreak {
-    /// 每轮 `ctx_total`(= 本轮 kv 总长);引擎在 step 前写
-    pub ctx_total: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-}
-
 pub struct ForwardCtx<'a> {
     /// 本步 token 数(decode = 1;prefill = 块长)
     pub tokens: usize,
@@ -134,6 +122,15 @@ pub struct ForwardCtx<'a> {
     /// prefill:chunk 绝对起点(块首 token 的绝对 pos;split attention 的
     /// partition 网格声明需要 max_ctx = ctx_base + tokens;builder 缺省 0)
     pub ctx_base: usize,
+    /// **FI plan 的建树期 ctx**(`Some` = 覆盖 `ctx_base + tokens` 作为喂 FI 的
+    /// `ctx_total`,**只影响 FI 节点**,不动其它核 arg / 分派决策 / 拓扑)。
+    ///
+    /// 用途(2026-10-18 图档单图立案):FI 进捕获图时,喂进去的 `ctx_total` 被
+    /// **烘死** ⇒ 若沿用占位值(1),烘出的就是"ctx=1 的调度表"(plan 无 split /
+    /// chunk 数与运行期不符)。给桶上界 ⇒ 烘出的表按上界枚举工作项,运行期由
+    /// `chunk_start/end = min(.., kv_len)` 夹取;**T=1 实测与逐 ctx 表逐位同级**
+    /// (`fi_prefill_probe` 的 `FI_PF_PLAN_CTX` 腿)。`None` = 历史行为。
+    pub fi_plan_ctx: Option<usize>,
     /// FlashInfer prefill 面(**FI 恒启用**,engine 按池 dtype/paged 注入;
     /// None = 该轮不走 FI(非 paged 池 / 非 f16 / 小 chunk < FI_MIN_TOKENS))
     pub fi: Option<FiPrefillCtx<'a>>,
@@ -178,15 +175,6 @@ pub struct ForwardCtx<'a> {
     /// GDN 分派门控打印(EngineKnobs.probes.trace_gate 注入;显式依赖律,
     /// 原 OWL_TRACE_GATE 层内直读 —— 热路径零 env)
     pub trace_gate: bool,
-    /// **注意力核断点采集面**(piecewise 捕获图;形态同 `gdn_tap` ——
-    /// 层把**核节点**推进来,不是引擎去认识算子):注意力层在 FI/XQA 那个
-    /// `Call` 节点建好后推入。核 = 唯一「每轮按 ctx 重算 plan」的节点,故
-    /// piecewise 把它移出捕获图、在段间 eager 重放(设计见
-    /// `docs/piecewise-断点图-设计与实现.md`)。None = 非 piecewise
-    /// (一次 `is_some()` 判,热路径零开销)。
-    pub attn_break: Option<std::rc::Rc<std::cell::RefCell<Vec<crate::interpreters::BreakDecl>>>>,
-    /// **FI 断点面**(piecewise verify;None = 本树不换 FI 臂)
-    pub attn_fi: Option<AttnFiBreak>,
 }
 
 impl<'a> ForwardCtx<'a> {
@@ -205,6 +193,7 @@ impl<'a> ForwardCtx<'a> {
             kv_lens: None,
             gdn_slot: None,
             ctx_base: 0,
+            fi_plan_ctx: None,
             fi: None,
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
@@ -219,8 +208,6 @@ impl<'a> ForwardCtx<'a> {
             gdn_tap: None,
             vlm_image: None,
             vlm_rope: None,
-            attn_break: None,
-            attn_fi: None,
         }
     }
 
@@ -244,6 +231,7 @@ impl<'a> ForwardCtx<'a> {
             kv_lens: None,
             gdn_slot: None,
             ctx_base: 0,
+            fi_plan_ctx: None,
             fi: None,
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
@@ -258,8 +246,6 @@ impl<'a> ForwardCtx<'a> {
             gdn_tap: None,
             vlm_image: None,
             vlm_rope: None,
-            attn_break: None,
-            attn_fi: None,
         }
     }
 
@@ -278,6 +264,7 @@ impl<'a> ForwardCtx<'a> {
             kv_lens: None,
             gdn_slot: None,
             ctx_base: 0,
+            fi_plan_ctx: None,
             fi: None,
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
@@ -292,8 +279,6 @@ impl<'a> ForwardCtx<'a> {
             gdn_tap: None,
             vlm_image: None,
             vlm_rope: None,
-            attn_break: None,
-            attn_fi: None,
         }
     }
 
@@ -316,6 +301,7 @@ impl<'a> ForwardCtx<'a> {
             kv_lens: None,
             gdn_slot: Some(gdn_slot),
             ctx_base: 0,
+            fi_plan_ctx: None,
             fi: None,
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
@@ -330,8 +316,6 @@ impl<'a> ForwardCtx<'a> {
             gdn_tap: None,
             vlm_image: None,
             vlm_rope: None,
-            attn_break: None,
-            attn_fi: None,
         }
     }
 
@@ -357,6 +341,7 @@ impl<'a> ForwardCtx<'a> {
             kv_lens: Some(kv_lens),
             gdn_slot: None,
             ctx_base: 0,
+            fi_plan_ctx: None,
             fi: None,
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
@@ -371,8 +356,6 @@ impl<'a> ForwardCtx<'a> {
             gdn_tap: None,
             vlm_image: None,
             vlm_rope: None,
-            attn_break: None,
-            attn_fi: None,
         }
     }
 
@@ -398,6 +381,7 @@ impl<'a> ForwardCtx<'a> {
             kv_lens: None,
             gdn_slot: None,
             ctx_base: 0,
+            fi_plan_ctx: None,
             fi: None,
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
@@ -412,8 +396,6 @@ impl<'a> ForwardCtx<'a> {
             gdn_tap: None,
             vlm_image: None,
             vlm_rope: None,
-            attn_break: None,
-            attn_fi: None,
         }
     }
 
@@ -447,6 +429,7 @@ impl<'a> ForwardCtx<'a> {
             kv_lens: Some(kv_lens),
             gdn_slot: Some(gdn_slot),
             ctx_base,
+            fi_plan_ctx: None,
             fi,
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
@@ -461,8 +444,6 @@ impl<'a> ForwardCtx<'a> {
             gdn_tap: None,
             vlm_image: None,
             vlm_rope: None,
-            attn_break: None,
-            attn_fi: None,
         }
     }
 

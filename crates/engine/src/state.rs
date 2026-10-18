@@ -427,14 +427,17 @@ impl StatePool {
 
     // ── 下面三件：**测试对账面**（`tests.rs` 用它们把"池真分配"与预算算式对账）。
     // 生产零调用者（预算算式在池分配**之前**就要用 ⇒ 结构上不能读池），
-    // 故 `#[cfg(test)]` 门控 —— 既保住对账能力，也不让 release 面背死代码告警
+    // 故按 `tests` 模块同款门控 —— 既保住对账能力，也不让 release 面背死代码告警
     // （2026-10-17 审查：先删后补，补的理由见 commit 信息）。
+    // ⚠️ **门必须是 `any(test, feature = "e2e")`**（2026-10-18 W5 修）：`tests.rs` 在
+    // `feature = "e2e"` 下也会编进 lib（无 cfg(test)）⇒ 只写 `#[cfg(test)]` 会让
+    // **e2e 目标整体编不过**（`engine.e2e.rs` 恒 build 失败 = 那条门从未跑起来）。
     /// **GDN 行字节 / 每活跃 turn**(`owl_store::BudgetInputs::gdn_row_bytes` 真源)。
     ///
     /// 口径:每层四件(conv_q/conv_k/conv_v/rec)的分配宽 = `gdn_slots × 单槽宽`
     /// (`StatePool::alloc` 里显式乘过)⇒ **行字节 = 池总字节 ÷ gdn_slots**。
     /// 读真分配,不按公式重算(0.8B 档实测:18 层 × 1.07MiB ≈ 19.3MiB/行)。
-    #[cfg(test)]
+    #[cfg(any(test, feature = "e2e"))]
     pub(crate) fn gdn_row_bytes(&self) -> usize {
         let pool: usize = self
             .gdns
@@ -447,7 +450,7 @@ impl StatePool {
     }
 
     /// **快照池字节**(E2c 静态预分配;固定面的一项,含 spec 快照缓冲)。
-    #[cfg(test)]
+    #[cfg(any(test, feature = "e2e"))]
     pub(crate) fn snapshot_pool_bytes(&self) -> usize {
         let pool: usize = self
             .snaps
@@ -464,7 +467,7 @@ impl StatePool {
 
     /// **草稿池字节**(MTP 链 / DFlash2 五层;关 = 0)。按 `pool_tokens` 全额
     /// 预留 ⇒ 开 draft 的档等于第二个主池(`BudgetInputs::draft_pool_bytes`)。
-    #[cfg(test)]
+    #[cfg(any(test, feature = "e2e"))]
     pub(crate) fn draft_pool_bytes(&self) -> usize {
         fn kv_bytes(kv: &KvBlocks) -> usize {
             kv.k_cache.1 * elem_bytes(kv.k_cache.0.dtype)

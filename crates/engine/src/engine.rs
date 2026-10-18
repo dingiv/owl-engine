@@ -62,6 +62,12 @@ pub struct EngineKnobs {
     pub no_graph: bool,
     /// **prefill 图档位**(P1;`[graph] prefill_bucket`;缺省 `off` = 今天行为)
     pub prefill_bucket: owl_shared::config::PrefillBucket,
+    /// **FI plan 图档瓦**(`[dispatch] fi_cuda_graph`;2026-10-18 图档单图立案):
+    /// 开 ⇒ 形状对 ctx 全域恒定(可烘图的先决条件)。装配期经
+    /// `owl_kernels::family::flashinfer::configure_plan_env` 投递给核。
+    pub fi_cuda_graph: bool,
+    /// **decode 单图烘 plan 上界**(`[dispatch] fi_plan_bake`;None = 现状 piecewise)
+    pub fi_plan_bake: Option<usize>,
     /// TS 探针槽(原 OWL_TS_PROBE)
     pub ts_probe: bool,
     /// GDN 槽数覆写(缺省 8;原 OWL_GDN_SLOTS)
@@ -108,6 +114,8 @@ impl Default for EngineKnobs {
             host_cache_mb: 0,
             no_graph: false,
             prefill_bucket: owl_shared::config::PrefillBucket::Off,
+            fi_cuda_graph: false,
+            fi_plan_bake: None,
             ts_probe: false,
             gdn_slots: 8,
             snap_max: 4,
@@ -154,6 +162,10 @@ impl EngineKnobs {
             host_cache_mb: owl_shared::env_reader::parse("OWL_HOST_CACHE_MB").unwrap_or(0),
             no_graph: cfg.graph.no_graph,
             prefill_bucket: cfg.graph.prefill_bucket,
+            fi_cuda_graph: cfg.dispatch.fi_cuda_graph,
+            // 哨兵:0 = 取 max_seq(FI 调度表的图档上界 = 单序列 ctx 的天然上界;
+            // 这样档位改 max_seq 时上界跟着走,不必两处手改)
+            fi_plan_bake: cfg.dispatch.fi_plan_bake.map(|b| if b == 0 { cfg.runtime.max_seq } else { b }),
             ts_probe: cfg.dispatch.ts_probe,
             gdn_slots: cfg.pool.gdn_slots,
             // 快照池容量:env 覆盖(实测调压;命中面要求边界快照在场)

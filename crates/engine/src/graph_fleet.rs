@@ -50,10 +50,6 @@ pub(crate) struct GraphFleet<D: DeviceClient> {
     /// **prefill 桶族(M2b)**:一桶一张整段单图(含 KV 写 + FI 注意力);
     /// 空 = 档位 off / 未建(该档全走 eager 原路)
     pub prefill: crate::prefill_plan::PrefillBuckets<D>,
-    /// **FI 断点臂的宿主标量槽**(verify 图 `ctx_total`;None = 该臂未开)
-    pub verify_fi_ctx: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
-    /// **FI 断点臂的宿主标量槽**(session 图 / T=1 decode;None = 该臂未开)
-    pub decode_fi_ctx: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl<D: DeviceClient> GraphFleet<D> {
@@ -118,17 +114,17 @@ impl<D: DeviceClient> GraphFleet<D> {
         // 那时 `face`/`vface` 都已被消费)
         let pface_src = face.face_clone();
         // V1c:decode_fi 开 ⇒ 同图走 piecewise,断点挂 decode 核
-        let (session, capture_outcome, decode_fi_ctx) = Self::plan_session(face, &boot, t0).await?;
+        let (session, capture_outcome, decode_fi_node) = Self::plan_session(face, &boot, t0).await?;
         // ② verify 桶形图(spec 模式且主图捕获成功才有意义)
-        let (verify, fi_ctx) = if boot.spec.depth > 0
+        let (verify, verify_fi_node) = if boot.spec.depth > 0
             && vface.is_some()
             && matches!(capture_outcome, PlanOutcome::Captured)
         {
             let vface = vface.ok_or_else(|| ModelError::EngineInvariant { what: "vface 缺席(守卫与用法不一致)".into() })?;
-            let (v, cell) = Self::plan_verify(vface, &boot, t0).await?;
-            (v, cell)
+            let (v, fi_node) = Self::plan_verify(vface, &boot, t0).await?;
+            (v, fi_node)
         } else {
-            (None, None)
+            (None, false)
         };
         // ③ fold/DFlash2/MTP 族(全部以 verify 图输出块为烘焙叶)
         let (fold, dflash, propose) = if let Some(vg) = verify.as_ref() {
@@ -194,13 +190,12 @@ impl<D: DeviceClient> GraphFleet<D> {
             );
             crate::prefill_plan::PrefillBuckets::empty()
         };
-        // **现役臂自证**(2026-10-16;教训:臂身份必须能查 —— 本轮曾把 v2 当 FI 报过一栏)。
-        // 三条路(prefill/verify/decode)各自的实际臂 + 分段计数 + spec 深度 + 池 dtype。
+        // **现役臂自证**(2026-10-16 立;2026-10-18 改**事实位**)。
+        // ⚠️ 判据 = 建树期"FI 面是否真登记"(`*_fi_node`),**不是旋钮** ——
+        // 按旋钮猜曾把"FI 根本没进图、跑的是回落臂"报成 "FI(单图)"(坑册 §58)。
         {
-            let arm = |pw: (usize, usize), xqa: bool, v2: bool, fi: bool| -> String {
-                if pw.1 > 0 {
-                    format!("FI断点({}段/{}断点)", pw.0, pw.1)
-                } else if fi {
+            let arm = |fi_node: bool, xqa: bool, v2: bool| -> String {
+                if fi_node {
                     "FI(单图)".to_string()
                 } else if xqa {
                     "XQA".to_string()
@@ -210,19 +205,12 @@ impl<D: DeviceClient> GraphFleet<D> {
                     "prefill族".to_string()
                 }
             };
-            let (vs, vb) = verify.as_ref().map(|g| g.piecewise_shape()).unwrap_or((0, 0));
-            let (ss, sb) = session.piecewise_shape();
             owl_shared::log_info!(
                 "boot",
                 "现役臂: prefill={} | verify={} | decode={} | spec=depth{} | kv_fp8={}",
                 if boot.knobs.env.attn.fi { "FI" } else { "自研读核" },
-                arm(
-                    (vs, vb),
-                    boot.knobs.env.attn.verify_xqa,
-                    boot.knobs.env.attn.verify_v2,
-                    boot.knobs.env.attn.verify_fi
-                ),
-                arm((ss, sb), boot.knobs.env.attn.decode_xqa, false, boot.knobs.env.attn.decode_fi),
+                arm(verify_fi_node, boot.knobs.env.attn.verify_xqa, boot.knobs.env.attn.verify_v2),
+                arm(decode_fi_node, boot.knobs.env.attn.decode_xqa, false),
                 boot.spec.depth,
                 boot.pool.kv_fp8,
             );
@@ -287,20 +275,9 @@ impl<D: DeviceClient> GraphFleet<D> {
             propose,
             dflash,
             prefill,
-            verify_fi_ctx: fi_ctx,
-            decode_fi_ctx,
         })
     }
 
-    /// FI 断点臂的宿主标量槽(引擎逐轮写 `ctx_total`;None = 该臂未开)
-    pub(crate) fn verify_fi_ctx(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicUsize>> {
-        self.verify_fi_ctx.clone()
-    }
-
-    /// FI 断点臂(session/T=1)的宿主标量槽(引擎每步写 `ctx_total`)
-    pub(crate) fn decode_fi_ctx(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicUsize>> {
-        self.decode_fi_ctx.clone()
-    }
 
     /// ① 主会话图(槽 → 整模单树;状态句柄捕获,模型 Arc 共享)。
     /// 捕获期禁 Htod:常量标量走持久槽;KV/GDN 双槽分立 ——
@@ -318,11 +295,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         face: D,
         boot: &FleetBoot<'_>,
         t0: T,
-    ) -> Result<(
-        GraphPlan<D>,
-        PlanOutcome,
-        Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
-    )> {
+    ) -> Result<(GraphPlan<D>, PlanOutcome, bool)> {
         let env = boot.env;
         let pool = boot.pool;
         let dims = boot.dims;
@@ -345,16 +318,19 @@ impl<D: DeviceClient> GraphFleet<D> {
         // notaps 同款逃生开关)。tapped_hidden 零额外计算,
         // 仅多 5 个 [1,hidden] 输出槽写;非 dflash 走原 forward(拓扑不变)
         let decode_taps = boot.spec.dflash_tap_count > 0;
-        // V1c:decode_fi 开 ⇒ 本图走段驱动件(断点在 decode 核)
-        let dfi_cell: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>> = knobs
-            .env
-            .attn
-            .decode_fi
-            .then(|| std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)));
-        let fi_cell_c = dfi_cell.clone(); // Option:关时 None(闭包按它分流)
         let fi_kcv: (Vec<TensorOps>, Vec<TensorOps>) = kv_caches.iter().cloned().unzip();
         let fi_nb = pool.nb;
         let dfi_on = knobs.env.attn.decode_fi; // 闭包 'static:先取值(同 xqa_decode_on 纪律)
+        // **图档单图烘 plan 档**(2026-10-18;`[dispatch] fi_plan_bake`):
+        // Some(ctx) = decode **不进 piecewise**,FI 核留图内,且喂 FI 的
+        // `ctx_total` 用该上界烘死 ⇒ 烘出的调度表按上界枚举工作项(运行期
+        // `chunk_start/end = min(.., kv_len)` 夹取;T=1 实测与逐 ctx 表同误差带)。
+        // 上界必须 ≥ 任何可能出现的 ctx(否则表的工作项数 < 运行期 chunk 数 ⇒
+        // V1 那个 stride 错),由配置校验拒启兜底。
+        let plan_bake: Option<usize> = knobs.fi_plan_bake;
+        // **臂事实位**(2026-10-18,同 verify 律):decode 侧 FI 面是否真登记。
+        let dfi_node_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dfi_node_seen_c = dfi_node_seen.clone();
         let forward = move |sc: &PlanCtx| -> Result<()> {
             // FI 面持有处(活得比 ctx 长:FiPrefillCtx 借它们)
             let fi_tensors: (TensorOps, TensorOps, TensorOps, TensorOps);
@@ -406,16 +382,14 @@ impl<D: DeviceClient> GraphFleet<D> {
                     sm_count: x.sm_count,
                 });
             }
-            // FI 断点臂(session/T=1):表四件套槽 → U32 视图 + FiPrefillCtx +
-            // 宿主标量槽(ctx_total 每步由引擎写)
-            // ⚠️ **断点采集面**必须交给模型(与 plan_verify 同律):不交 ⇒
-            // 模型只能"把 FI 核照原样吐回树里" ⇒ 核被烘进图 + plan 用占位
-            // ctx_total 烘死 ⇒ 每步拿 ctx=1 的调度表读 53+ 的池(实测踩过:
-            // "段=1 断点=0" + fi-plan 只有 prefill 两次 + 文本连贯但错)。
-            if dfi_on {
-                ctx.attn_break = Some(sc.break_sink());
-            }
-            if let (true, Some(cell)) = (dfi_on, fi_cell_c.as_ref()) {
+            // **FI 图内臂**(session/T=1;W3 转正 + W5 收口):表四件套槽 → U32
+            // 视图 + FiPrefillCtx + `ctx_total` 烘上界;当步**精确**表由引擎在
+            // 窗外 `fi_plan_sync` 刷(图不烘表)。
+            // ⚠️ 门 = **两件套都在场**(`dfi_on` + `plan_bake`):缺上界 ⇒ 本树
+            // **不**换 FI 臂(回落 v2/XQA),而不是拿占位 ctx 烘表 —— 后者是
+            // "文本连贯但错"的历史来源;校验层另有"FI 臂 ⇒ bake 在场"拒启门。
+            if let (true, Some(bake)) = (dfi_on, plan_bake) {
+                ctx.fi_plan_ctx = Some(bake);
                 let blk_id = |t: &TensorOps| -> Result<u64> {
                     match t.op() {
                         owl_models::ops::Op::Block { id } => Ok(*id),
@@ -439,7 +413,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                     indptr: &fi_tensors.2,
                     last_len: &fi_tensors.3,
                 });
-                ctx.attn_fi = Some(owl_models::module::AttnFiBreak { ctx_total: cell.clone() });
+                dfi_node_seen_c.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             // B4:降级期取数面 —— tapped_hidden 拿末层 hidden + 5 层 taps
             // (零额外前向;l m_head 与 forward 同式)。非 dflash 原路(位等价)
@@ -521,35 +495,45 @@ impl<D: DeviceClient> GraphFleet<D> {
                 reclaim_capture: true,
                 warmup: true,
         };
-        // V1c:decode_fi 开 ⇒ 段驱动件(断点在 decode 核 ⇒ FI plan 每步重算)
-        let (session, capture_outcome) = if dfi_cell.is_some() {
-            let (g, o) = GraphPlan::plan_piecewise(face, env, desc, true, forward).await?;
-            let (ns, nb) = g.piecewise_shape();
-            owl_shared::log_info!("boot", "session 分段捕获(段={ns} 断点={nb}) +{:.2}s", t0.elapsed().as_secs_f32());
+        // **单图**(W3/W5):FI 在图内 + `ctx_total` 烘上界;段驱动件与断点面
+        // 整体退役(它们曾在此承载 decode 的"每步按真 ctx 重算 plan")。
+        let single_baked = plan_bake.is_some() && dfi_on;
+        let (session, capture_outcome) = {
+            let (g, o) = GraphPlan::plan(face, env, desc, forward).await?;
+            if single_baked {
+                owl_shared::log_info!(
+                    "boot",
+                    "session 单图捕获(FI 图内 + plan 上界 {} 烘死) +{:.2}s",
+                    plan_bake.unwrap_or(0),
+                    t0.elapsed().as_secs_f32()
+                );
+            }
             (g, o)
-        } else {
-            GraphPlan::plan(face, env, desc, forward).await?
         };
         if let PlanOutcome::EagerFallback { reason } = &capture_outcome {
             owl_shared::log_warn!("engine", "捕获降级为 eager:{reason}");
         }
         owl_shared::log_info!("boot", "GraphPlan plan(warmup+捕获) {:.2}s", t0.elapsed().as_secs_f32());
-        Ok((session, capture_outcome, dfi_cell))
+        owl_shared::log_info!(
+            "boot",
+            "decode 面事实:FI 节点登记={} | single_baked={} bake={:?}",
+            dfi_node_seen.load(std::sync::atomic::Ordering::Relaxed),
+            single_baked,
+            plan_bake
+        );
+        Ok((session, capture_outcome, dfi_node_seen.load(std::sync::atomic::Ordering::Relaxed)))
     }
 
     /// ② verify 桶形图(E5-M4;T = depth+1 定形;spec 模式专用)—— 消
-    /// 投机轮的整模 eager 发射税(~830 发 × ~25µs)。FI 不入图(T=4
-    /// attention 成本可忽略;回避 plan-in-graph);输出 = tok/hid +
+    /// 投机轮的整模 eager 发射税(~830 发 × ~25µs)。FI **在图内**(W4 转正;
+    /// plan ctx 烘上界 + 引擎每轮窗外刷精确表);输出 = tok/hid +
     /// **GDN fold 记录**(每层 8 件,tap 收集 → 多根共享 memo 单次归约,
     /// 刀 1.6 语义)。捕获失败 → None → 执行器落旧 eager verify+重放路。
     async fn plan_verify(
         vface: D,
         boot: &FleetBoot<'_>,
         t0: T,
-    ) -> Result<(
-        Option<GraphPlan<D>>,
-        Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
-    )> {
+    ) -> Result<(Option<GraphPlan<D>>, bool)> {
         let pool = boot.pool;
         let dims = boot.dims;
         let env = boot.env;
@@ -580,14 +564,13 @@ impl<D: DeviceClient> GraphFleet<D> {
         // **注意力核**移出捕获图(核的 plan 在 split 档依赖 ctx ⇒ 单图只对
         // 一个 ctx 有效)。开关 = `dispatch.verify_piecewise`;设计见
         // `docs/piecewise-断点图-设计与实现.md`。
-        let pw_on = knobs.env.attn.verify_piecewise;
-        // **FI 断点臂**(V1b;需 piecewise):核移出图 ⇒ plan 每轮按本轮 ctx 重算。
-        // 四件套(q_cu/indices/indptr/last_len)走**图输入槽**(引擎逐轮写),
-        // `ctx_total` 走**宿主标量槽**(零设备流量;见 module::AttnFiBreak)。
-        let fi_on = knobs.env.attn.verify_fi && pw_on;
-        let fi_cell = fi_on.then(|| {
-            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(depth1))
-        });
+        //
+        // **verify 单图**(W4 转正 + W5 收口):FI 核留图内 + `ctx_total` 烘上界,
+        // **表由引擎每轮 `fi_plan_sync` 刷当轮精确值**(图不烘自携 restore;
+        // 配置层已校验二者配套)。verify 恒随 `[dispatch] fi_plan_bake`
+        // (`fi_plan_bake_verify` 旋钮已随断点面一并退役)。
+        let vfi_bake: Option<usize> = knobs.fi_plan_bake;
+        let fi_want = knobs.env.attn.verify_fi;
         let mut vouts = vec![
             OutputSlot { name: "tok".into(), shape: vec![depth1, 1], dtype: Dtype::F32 },
             OutputSlot { name: "hid".into(), shape: vec![depth1, dims.hidden], dtype: dims.dtype },
@@ -661,11 +644,16 @@ impl<D: DeviceClient> GraphFleet<D> {
                 reclaim_capture: true,
                 warmup: true,
         };
-        let break_of_this_plan = pw_on;
-        let fi_cell_closure = fi_cell.clone();
+        let fi_want_c = fi_want;
         // kcs/vcs = 主池叶子(FI 与其余臂同池;与 kv_caches 同源)
         let fi_kcv: (Vec<TensorOps>, Vec<TensorOps>) = kv_caches.iter().cloned().unzip();
         let fi_nb = pool.nb; // 闭包 'static:借 boot 的字段必须先取值(同 kv_caches 纪律)
+        // 图内臂把 FI plan 的 ctx 烘成上界(表由引擎每轮 sync 成精确值)
+        let vfi_bake_c = vfi_bake;
+        // **臂事实位**(2026-10-18,同 "槽在场≠节点在场" 律):FI 面是否真登记进本图
+        // —— 臂自证不许再按旋钮猜(本轮假绿的一半就是它)。
+        let fi_node_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fi_node_seen_c = fi_node_seen.clone();
         let forward = move |sc: &PlanCtx| -> Result<()> {
                 // FI 面持有处(活得比 ctx 长:FiPrefillCtx 借它们)
                 let fi_tensors: (TensorOps, TensorOps, TensorOps, TensorOps);
@@ -709,15 +697,9 @@ impl<D: DeviceClient> GraphFleet<D> {
                     None,
                     0, None,
                 );
-                // **断点采集面递进模型**:注意力臂在建树深处才看得见核节点,
-                // 此处把采集 handle 交给 ctx。handle 必须 = `PlanCtx` 的那张表
-                // (`sc.break_sink()`;单一拼写点) —— 自建一张表 = 模型 push 到
-                // 别家表上,驱动件永远看到 0 断点(实测踩过)。
-                if pw_on {
-                    ctx.attn_break = Some(sc.break_sink());
-                }
-                // FI 断点面(四件套槽 + 宿主标量槽)
-                if let Some(cell) = fi_cell_closure.as_ref() {
+                // **FI 图内臂**(四件套槽 + `ctx_total` 烘上界;表由引擎窗外刷):
+                // 门 = 两件套(`verify_fi` 意图 + `fi_plan_bake` 上界)都在场。
+                if let (true, Some(bake)) = (fi_want_c, vfi_bake_c) {
                     // 槽叶按块叶取 **U32 视图**(准入按声明 dtype 校验输入:
                     // FI 表是 u32;值由引擎逐轮以位型写过线)
                     let blk_id = |t: &TensorOps| -> Result<u64> {
@@ -743,7 +725,8 @@ impl<D: DeviceClient> GraphFleet<D> {
                         indptr: &fi_tensors.2,
                         last_len: &fi_tensors.3,
                     });
-                    ctx.attn_fi = Some(owl_models::module::AttnFiBreak { ctx_total: cell.clone() });
+                    ctx.fi_plan_ctx = Some(bake);
+                    fi_node_seen_c.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 ctx.seq_cu = Some(&gdn_cu);
                 ctx.env = env;
@@ -812,34 +795,21 @@ impl<D: DeviceClient> GraphFleet<D> {
                 }
                 Ok(())
         };
-        // 两档:开关开 ⇒ 段驱动件(零断点 = **退化单图**,与 `plan` 同形;故
-        // "臂未登记核"不会静默降级为逐步 eager)；开关关 ⇒ 单图原路。
-        let (vg, voutcome) = if break_of_this_plan {
-            let (vg, vo) = GraphPlan::plan_piecewise(vface, env, desc, true, forward).await?;
-            let (nseg, nbrk) = vg.piecewise_shape();
-            match &vo {
-                PlanOutcome::Captured => owl_shared::log_info!(
-                    "boot",
-                    "verify 分段捕获(T={depth1};段={nseg} 断点={nbrk}) +{:.2}s",
-                    t0.elapsed().as_secs_f32()
-                ),
-                other => owl_shared::log_info!(
-                    "boot",
-                    "verify 分段捕获降级({other:?})→ eager verify+重放路"
-                ),
-            }
-            (vg, vo)
-        } else {
-            GraphPlan::plan(vface, env, desc, forward).await?
-        };
+        let (vg, voutcome) = GraphPlan::plan(vface, env, desc, forward).await?;
+        owl_shared::log_info!(
+            "boot",
+            "verify 面事实:FI 节点登记={} | bake={:?} | 段=0 断点=0",
+            fi_node_seen.load(std::sync::atomic::Ordering::Relaxed),
+            vfi_bake
+        );
         match voutcome {
             PlanOutcome::Captured => {
                 owl_shared::log_info!("boot", "verify 桶形图捕获(T={depth1}) +{:.2}s", t0.elapsed().as_secs_f32());
-                Ok((Some(vg), fi_cell))
+                Ok((Some(vg), fi_node_seen.load(std::sync::atomic::Ordering::Relaxed)))
             }
             other => {
                 owl_shared::log_info!("boot", "verify 图降级({other:?})→ eager verify+重放路");
-                Ok((None, None))
+                Ok((None, false))
             }
         }
     }

@@ -81,20 +81,20 @@ allowed_ops = [
 # 白名单同时含 **fp8 与 f16 两主池族**(2026-10-14 A5 补):`kv_fp8` 决定
 # 实际发射哪一族 —— f16 档不用再拿 `allowed_ops = []` 绕硬门。两族在池
 # 写集审计里按 (池名, dtype) 分组,各自闭环(R3 不撞)。
-# ── verify 注意力臂(2026-10-16 **换代**:FI+split 断点臂转正)──
+# ── verify 注意力臂(2026-10-16 换代 = FI+split;2026-10-18 W5 = 单图)──
 #
 # 旧:XQA verify 臂(2026-10-13 D3 转正;恒等门 3/3 绿)。它的问题在长 ctx:
 # ctx 依赖的 KV-split 全在核内,verify 图墙时随 ctx 线性涨(32k 轮时 69.3ms)。
-# 新:FI+split(核级实测 verify 形状 ≤0.3ms/发 vs XQA 1.54)但 FI 的 plan 依赖
-# ctx ⇒ 必须把核移出捕获图 ⇒ **piecewise(段+断点)** 承载:
-#   verify_piecewise = 段驱动件;verify_fi = 断点走 FI 核(四件套走输入槽,
-#   ctx_total 走宿主标量槽 —— 见 docs/piecewise-断点图-设计与实现.md §11.6)
-# 真机:32k 轮时 69.3 → **48.4ms(−30%)**,轮时对 ctx **变平**(8k 48.6/32k 48.4),
-# 文本/tok/hid 与基线逐位一致;prefill 不动。
-# ⚠️ decode(T=1)已于同日(V1c)同法换装:见下方 decode_xqa/decode_fi 段。
+# 中:FI+split(核级实测 verify 形状 ≤0.3ms/发 vs XQA 1.54);当时 FI 的 plan
+# 依赖 ctx ⇒ 用 **piecewise(段+断点)** 把核移出捕获图(32k 轮 69.3 → 48.4ms)。
+# 今(W5,2026-10-18):plan 依赖 ctx 已由"**图档瓦(形状对 ctx 恒定)+ 引擎窗外
+# `fi_plan_sync` 刷精确表**"解决 ⇒ **FI 核留捕获图内**(单图),piecewise 面
+# **整体退役**(旋钮 `verify_piecewise`/`break_at_out` 一并退役 ⇒ 写了会**拒启**)。
+# 实测(W4 转正门,三档 ctx):发射税 10.9-12.0 → 0.2-0.3 ms、整轮 GPU −5.0%、
+# `reasoning_content` 逐字节恒等、971 轮 soak σ=0.11 ms。
+# ⚠️ decode(T=1)同法(图内臂):见下方 decode_xqa/decode_fi 段。
 verify_xqa = false
 verify_v2 = false
-verify_piecewise = true
 verify_fi = true
 # 裸 decode 走 XQA(2026-10-13 ②):第二份实例化 `M_TILESIZE=16`。
 # 注:短 ctx 收益略低(512 档 1.90× vs 2048 档 2.25×),但**不缺省加 ctx
@@ -105,6 +105,24 @@ decode_xqa = false
 # 文本与 v2/XQA 逐位一致。⚠️ 曾踩:plan_session 少交断点采集面 ⇒ FI 核被烘进图 + plan 用
 # 占位 ctx_total=1 ⇒ 文本连贯但错(见状 §11.13)。
 decode_fi = true
+# ── 图档单图(W3+W4,2026-10-18 转正)──
+#
+# 结构:`FI_CUDA_GRAPH=1` 让 plan 形状**对 ctx 全域恒定**(padded=42/cta=16|64/split=1)
+# ⇒ 一张图可服务任意 ctx,只需换表内容;表由引擎在**窗外**每步/每轮
+# `fi_plan_sync` 刷成**精确值**(T=8 过供给会错 —— 行 stride 与 merge_indptr 打架)。
+# 判据:
+#   · decode(W3):文本与 piecewise 臂逐位一致,ms/tok −4~6%,图 slab −50%
+#   · verify(W4):三档 ctx 的 reasoning_content **逐字节恒等**;
+#     发射税 10.9-12.0 → 0.2-0.3 ms;整轮 GPU 时间 25.94/26.01/26.00 →
+#     24.69/24.72/24.70 ms(−5.0%,对 ctx 平坦);t/s +2.5%;
+#     971 轮 soak 首末十轮 24.70 → 24.87 ms(σ=0.11,零告警)
+#   · ⚠️ 上界:fi_plan_bake **必须 ≥ max_seq** ⇒ 这里用哨兵 `0` = 取 [runtime] max_seq
+#     (档位改 max_seq 时自动跟随;写死值会在改档时被 validate 拒启)
+# 配套硬约束(validate 拒启):fi_plan_bake ⇒ fi_plan_restore = false(图不烘表,
+# host 是表的唯一权威);与 [graph] prefill_bucket 互斥。
+fi_cuda_graph = true
+fi_plan_bake = 0
+fi_plan_restore = false
 # GDN prefill 臂(2026-10-11 终版):fork-bf16 全家桶转正 —— g 语义律
 # 修复(kkt/h/o 必须吃 cumsum 而非 raw g;raw g 在深谷 -24 时
 # exp(±24)=e²⁴ 爆炸)。恒等门:四域 vs recurrence 逐位一致;std 矩阵

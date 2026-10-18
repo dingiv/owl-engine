@@ -97,6 +97,21 @@ async fn main() {
         }
     };
 
+    // **FI plan 档位投递**(配置 → 核):C++ 适配器与 kernels 的 FI server 都用
+    // `getenv("FI_CUDA_GRAPH")` 判档(上游 ABI 不动),而档位必须来自配置面
+    // ⇒ 入口 boot 期**唯一写者**。读侧唯一 = `kernels/src/server/flashinfer.rs`
+    // 的 `fi_cuda_graph()`(同键、同口径);此处零第二套判据。
+    // 必须在任何图捕获/plan 之前(boot 期一次)。
+    std::env::set_var(
+        "FI_CUDA_GRAPH",
+        if config.knobs.fi_cuda_graph { "1" } else { "0" },
+    );
+
+    // 注:**图自携 plan restore** 不再是 env(2026-10-18 用户裁决)。它现在走
+    // 配置 `[dispatch] fi_plan_restore` → `DiagOpts` → 后端 boot 期
+    // `set_plan_restore`(见 cuda `state.rs`/`server/mod.rs`);单图档必须配
+    // `fi_plan_restore = false`,由 `OwlConfig::validate` 拒启兜底。
+
     // 调试门三件套先取局部:下面 `config` 会被 move 进 actor 线程,
     // 而武装点必须在 boot 完成之后(见下方注释)
     let (sg_mode, sg_ms, sg_us, sg_every) = (

@@ -86,8 +86,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         };
         // XQA 页表:在借 self.graphs.verify 之前算好(自 sessions 取真块链)
         let xqa_pt_v = self.xqa_pt_of(sid);
-        // FI 断点臂的宿主标量槽(self.graphs 的可变借用前取好,同 xqa_pt_v 纪律)
-        let fi_ctx_cell = self.graphs.verify_fi_ctx();
         let (ids, hidden, records, hidden_owned, row_logits) =
             if let Some(vg) = self.graphs.verify.as_mut() {
             let ts = std::time::Instant::now();
@@ -130,9 +128,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // ② 表四件套(q_cu/indices/indptr/last_len;u32 位型过线)
             let page_fi = self.pool.page;
             let ctx_total_fi = pos + block.len();
+            // 门 = **槽在场**(槽属于**图**;判"某核在场"必须看节点/槽,不看旋钮)
+            let fi_slots_on = vg.has_input("fi_q_cu");
             let (fi_q_cu_v, fi_idx_v, fi_indptr_v, fi_ll_v): (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) =
-                if let Some(cell) = fi_ctx_cell.as_ref() {
-                    cell.store(ctx_total_fi, std::sync::atomic::Ordering::Relaxed);
+                if fi_slots_on {
+                    // ⚠️ **必须写本轮真值**(verify 不吃桶化):T=8 的 plan split
+                    // chunk 数必须与核运行期 `ceil_div(kv_len, chunk)` 一致,否则
+                    // partial 行 stride 与 `merge_indptr` 打架(同参 A/B:桶 2048
+                    // ⇒ 空文本/`!!!`、42.9 t/s;真值 ⇒ 连贯 71 t/s)。
                     let nb_used = ctx_total_fi
                         .div_ceil(page_fi)
                         .min(bt_chain.len())
@@ -170,48 +173,27 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 ins.push(("fi_indptr", fi_indptr_v.as_slice()));
                 ins.push(("fi_last_len", fi_ll_v.as_slice()));
             }
+            // **FI plan 表同步(W4)**:单图档(`fi_plan_bake`)的 verify 图里 FI 核
+            // 不带自携表 ⇒ 每轮必须由图外刷**当轮精确表**(t=depth+1,ctx=本轮总长)。
+            // 与 decode 同律:表必须与运行期 chunk 数一一对应(T=8 过供给会错)。
+            // 门 = **档位在场** + 槽在场（W5：verify 恒随 `fi_plan_bake`；槽只证
+            // "本图带 FI 面"，档位证"表刷新面有人消费"）。
+            if self.cfg.knobs.fi_plan_bake.is_some() && fi_slots_on {
+                let d = self.pool.dims;
+                let spec = owl_iface::contract::FiPlanSpec {
+                    t: block.len(),
+                    ctx_total: ctx_total_fi,
+                    hq: d.hq,
+                    hkv: d.hkv,
+                    hd: d.hd,
+                    page: self.pool.page,
+                };
+                vg.face_mut().fi_plan_sync(spec).await?;
+            }
             let t_step_v = std::time::Instant::now();
             vg.step(&ins).await?;
             let t_read_v = std::time::Instant::now();
             let tok_f = vg.read_output_f32("tok").await?;
-            // 诊断(perf 会话排查用;`OWL_PW_DUMP_TOK=1`):verify 行 0..7 的
-            // 候选 token —— piecewise 断裂时最直接的判据(常量/零 = 读未写值)
-            if self.probes.pw_dump_tok {
-                eprintln!("[pw-tok] pos={pos} tok={:?}", tok_f);
-                let h = vg.read_output_f32("hid").await?;
-                let (mut nan, mut mx, mut sum) = (0usize, 0f32, 0f64);
-                for v in h.iter() {
-                    if v.is_nan() {
-                        nan += 1;
-                    }
-                    mx = mx.max(v.abs());
-                    sum += *v as f64;
-                }
-                eprintln!(
-                    "[pw-hid] pos={pos} n={} nan={nan} absmax={mx:.3e} mean={:.3e} first4={:?}",
-                    h.len(),
-                    sum / h.len().max(1) as f64,
-                    &h[..4.min(h.len())]
-                );
-                let ops = vg.pw_break_operand_stats(0).await?;
-                eprintln!(
-                    "[pw-op] pos={pos} :: {}",
-                    ops.iter()
-                        .map(|(i, n, dt, nan, mx)| format!("#{i}[{dt:?}] n={n} nan={nan} max={mx:.2e}"))
-                        .collect::<Vec<_>>()
-                        .join(" | ")
-                );
-                let pins = vg.pw_pin_stats().await?;
-                eprintln!(
-                    "[pw-pin] pos={pos} n={} :: {}",
-                    pins.len(),
-                    pins.iter()
-                        .take(4)
-                        .map(|(n, nan, mx)| format!("{n}元素/nan={nan}/max={mx:.2e}"))
-                        .collect::<Vec<_>>()
-                        .join(" | ")
-                );
-            }
             let t_tok = std::time::Instant::now();
             // A11:采样档额外回读 per-row logits([depth1, vocab];仅采样档付)
             let row_logits = if sampler_on {
