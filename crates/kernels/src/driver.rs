@@ -466,7 +466,13 @@ pub mod gdn {
                 DType::F32 => "owl_gdn_l2norm_f32",
                 DType::BF16 | DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => unimplemented!("GDN 族无 U32 变体"),
             },
-            shape: Shape { grid: (rows as u32, 1, 1), ..SENTINEL_1D },
+            shape: Shape {
+                // **一 warp 一行、一 block 8 行**(2026-10-19):旧形一 block 一行
+                // 在 dim=128 时一半线程闲置 + 每行两次 `__syncthreads`;
+                // decode 实测 15.5µs/发而工作量只有 128 个元素 ⇒ 块调度绑死。
+                grid: (rows.div_ceil(8) as u32, 1, 1),
+                ..SENTINEL_1D
+            },
         }
     }
 
@@ -1739,7 +1745,11 @@ mod tests {
     #[test]
     fn row_shapes_and_suffixes() {
         assert_eq!(gdn::l2norm(DType::F32, 7).name, "owl_gdn_l2norm_f32");
-        assert_eq!(gdn::l2norm(DType::F32, 7).shape.grid, (7, 1, 1));
+        assert_eq!(gdn::l2norm(DType::F32, 7).shape.grid, (1, 1, 1));
+        // l2norm 同 norm_act:一 warp 一行(8 行/块)⇒ 块数 = ceil(rows/8)
+        assert_eq!(gdn::l2norm(DType::F16, 8).shape.grid, (1, 1, 1));
+        assert_eq!(gdn::l2norm(DType::F16, 9).shape.grid, (2, 1, 1));
+        assert_eq!(gdn::l2norm(DType::F16, 128).shape.grid, (16, 1, 1));
         // **2026-10-19 norm_act 改一 warp 一单元(8 单元/块)** ⇒ 块数 = ceil(单元数/8)
         // (单元 = rows·value_dim/group_size;旧形块数 = 单元数,一 block 一单元)
         assert_eq!(gdn::norm_act(DType::F16, 4, 2048, 128).shape.grid, (8, 1, 1));

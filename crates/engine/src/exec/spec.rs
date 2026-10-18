@@ -485,12 +485,24 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // 不齐 = 旧"前缀重放"(整模前向)唯一可行路, 该档不做轮内边界快照
             let foldable = records.len() == self.dev.pool.gdn_count() * 8;
             if foldable {
-                if let Some(b) = Self::decode_boundary_in(
-                    pos,
-                    pos + m + 1,
-                    self.dev.pool.page,
-                    self.cfg.knobs.snap_decode_stride,
-                ) {
+                // **消费方门**(2026-10-19,同 prefill 的 `snap_on` 判据):轮内页边界
+                // 快照的唯一消费者 = **前缀复用**(`restore_snap` 只在 prefix 命中时调);
+                // `prefix_cache = false` ⇒ 缓存区份额 0 ⇒ 复用面结构上恒 0
+                // ⇒ 下面的「卷到边界 + 拍 + 卷回」三段是**纯浪费**(实测
+                // `spec.bnd.fold1` 1.17ms + `spec.snap` 0.90ms ≈ 2.1ms/边界)。
+                // 注:`snap_decode_stride = 0` 同样关(两处门同向)。
+                let snap_consumer = self.cfg.knobs.prefix_cache && self.dev.pool.snap_capacity() > 0;
+                if let Some(b) = snap_consumer
+                    .then(|| {
+                        Self::decode_boundary_in(
+                            pos,
+                            pos + m + 1,
+                            self.dev.pool.page,
+                            self.cfg.knobs.snap_decode_stride,
+                        )
+                    })
+                    .flatten()
+                {
                     let t_b = std::time::Instant::now();
                     self.spec_fold_to(gdn_slot, &records, b - pos).await?;
                     let t_fold1 = t_b.elapsed();
