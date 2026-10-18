@@ -694,7 +694,11 @@ impl<D: DeviceClient> RunningEngine<D> {
                 act.prompt_ids.len(),
                 self.cfg.prefill_chunk,
                 self.cfg.knobs.prefill_tail_merge,
-                page,
+                Self::prefill_align_page(
+                    self.cfg.knobs.prefill_align_tail,
+                    self.cfg.knobs.prefix_cache,
+                    self.dev.pool.page,
+                ),
             ) {
                 Some(chunk) => act.fed + chunk,
                 None => act.fed + self.dev.spec_rt.depth + 1, // 生成相位(act.fed = pos)

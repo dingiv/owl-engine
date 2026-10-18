@@ -794,8 +794,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// 之后:关快照面 ⇒ **索引不采 + 块不入树 ⇒ 静默不沉**(实测 `snap_max = 0`
     /// 档:下沉 0 块 / 不可沉 1680 块;prefill 假快 942 tok/s)。
     pub(crate) async fn capture_gdn_snap(&mut self, sid: u64, fed: usize) -> Result<()> {
-        // 快照面开关(只门住第 ④ 步;前三步照走)
-        let snap_on = self.dev.pool.snap_capacity() > 0;
+        // 快照面开关(只门住第 ④ 步;前三步照走)。
+        //
+        // ⚠️ 2026-10-19:再叠一道**消费方门** —— 快照的唯一消费者是**前缀复用**
+        // (`reuse_face` 要求边界快照在场;`restore_snap` 只在 prefix 命中时调用)。
+        // `prefix_cache = false` ⇒ 缓存区份额为 0 ⇒ 复用面结构上恒为 0
+        // ⇒ 每块 152MiB 的 GDN 快照(= 192 片 copy_batch,槽满还要 DtoH 下沉)
+        // 是**纯浪费**,实测 67ms/块(8k 请求 ≈ 1.0s ≈ prefill 的 17%:
+        // `prefill.bnd` 3039ms → 0)。
+        let snap_on = self.dev.pool.snap_capacity() > 0 && self.cfg.knobs.prefix_cache;
         let page = self.dev.pool.page;
         let full_blocks = fed / page;
         if page == 0 || full_blocks == 0 {

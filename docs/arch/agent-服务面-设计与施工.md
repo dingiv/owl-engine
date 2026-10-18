@@ -1026,6 +1026,31 @@ d. `testdata/args/e2e-27b.toml` 被 `.gitignore` 的 `testdata/*` 吞掉,而
    `apps/server/tests/e2e.rs` 用 `include_str!` —— **干净检出无法构建 e2e**。
    修:给该夹具(与本专项的测装)加 `.gitignore` 例外。
 
+### (7) **快照税的门(2026-10-19,prefill 提速会战副产品)**
+
+**现象**:prefill 每**页对齐 chunk 末**拍一次 GDN 边界快照(`capture_gdn_snap` 第 ④ 步),
+27B 上 = 192 片 `copy_batch`(48 层 × 4 状态 = **152 MiB**),槽满还要 DtoH 下沉。
+实测代价 **67~77 ms/块** ⇒ 8k 请求 **≈ 1.0 s ≈ prefill 的 17%**
+(`prefill.bnd` 3039 ms → 0 的 A/B:7962 tok 7.0 s → **6.0 s**,+17%)。
+
+**为什么要门它**:快照的唯一消费者是**前缀复用**(`reuse_face` 要求边界快照在场;
+`restore_snap` 只在 prefix 命中时调用)。`prefix_cache = false` ⇒ 缓存区份额 0
+⇒ 复用面结构上恒 0 ⇒ 快照是**纯浪费**。
+
+**修法**(`crates/engine/src/exec/spec.rs`):
+```rust
+let snap_on = self.dev.pool.snap_capacity() > 0 && self.cfg.knobs.prefix_cache;
+```
+`prefix_cache = true`(生产形)行为**完全不变**(税照付、复用照得:同 prompt 第二发
+0.14 s = 50×)。engine lib 53/53 绿。
+
+**⚠️ 基准口径坑**:std 五点三轮的**第 2/3 轮看不到这笔税** —— 同 session 重复同一
+prompt ⇒ 链游标已推进 ⇒ `start >= full_blocks` 早退(实测:第 1 轮 1106 → 门修后 1367;
+稳态 ~1358 不变)。**该税只在"新内容首轮"付**,即生产真实形态。
+
+**剩余头寸**(留案):生产形(prefix_cache=true)的快照税仍在,候选 = ①下沉 DtoH
+异步/与下一块重叠 ②更粗的拍摄粒度(每 K 个边界)③扩设备槽(152 MiB/条,贵)。
+
 ## §十 变更记录
 
 | 日期 | 版本 | 变更 |

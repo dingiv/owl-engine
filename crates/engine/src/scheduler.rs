@@ -156,6 +156,20 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// L4 档(`prefill_tail_merge = 1024`)会把"从头对齐的长尾段"合并成**尾端
     /// 不对齐**的一大块 —— 前段尾对齐 ≠ 尾段尾对齐。实测该守卫把 1.7k 档的
     /// 复用面从 1728 压到 512(最后一个快照退到第一块)。判据只看**尾端**:
+    /// **末段页对齐的唯一判据**(单源;2026-10-19 审查收口)。
+    ///
+    /// 对齐的**唯一目的** = 让 prompt 尾部的那个页边界**有 GDN 快照可拍**
+    /// (前缀复用面);`prefix_cache = false` ⇒ 复用面结构上恒空 ⇒ 对齐只是
+    /// "白切一刀"(多一个 chunk + 多一份宿主税)⇒ 返回 0 = 不对齐。
+    ///
+    /// ⚠️ 本函数是**四处调用点的公共输入**(`prefill_step_chunk` 的 `page` 实参):
+    /// 分块决策(scheduler) / kvmem 准入估算(scheduler) / 池需求估算(running) /
+    /// 边界预测(phases) —— 曾经各传各的(一处门了、三处没门 ⇒ 估算与真调度
+    /// 打架),现收成这一处。
+    pub(crate) fn prefill_align_page(align_tail: bool, prefix_cache: bool, pool_page: usize) -> usize {
+        if align_tail && prefix_cache { pool_page } else { 0 }
+    }
+
     pub(crate) fn prefill_step_chunk(
         fed: usize,
         prompt_len: usize,
@@ -337,7 +351,11 @@ impl<D: DeviceClient> RunningEngine<D> {
                         turn.prompt_ids.len(),
                         self.cfg.prefill_chunk,
                         self.cfg.knobs.prefill_tail_merge,
-                        if self.cfg.knobs.prefill_align_tail { self.dev.pool.page } else { 0 },
+                        Self::prefill_align_page(
+                            self.cfg.knobs.prefill_align_tail,
+                            self.cfg.knobs.prefix_cache,
+                            self.dev.pool.page,
+                        ),
                     )
                     .unwrap_or(1)
                 } else {
@@ -415,7 +433,11 @@ impl<D: DeviceClient> RunningEngine<D> {
                 act.prompt_ids.len(),
                 self.cfg.prefill_chunk,
                 self.cfg.knobs.prefill_tail_merge,
-                self.dev.pool.page,
+                Self::prefill_align_page(
+                    self.cfg.knobs.prefill_align_tail,
+                    self.cfg.knobs.prefix_cache,
+                    self.dev.pool.page,
+                ),
             )
             .unwrap_or_else(|| remaining.max(1));
             let action = StepAction::Prefill {
