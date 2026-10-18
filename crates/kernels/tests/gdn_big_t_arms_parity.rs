@@ -105,6 +105,11 @@ fn scalar_matches_varlen_big_t() {
         ("deep_t64", 64, 25.0),
         ("mixed_t64", 64, 3.0),
         ("deep_t65", 65, 25.0),
+        // **small-T 快路径**(2026-10-19):T ≤ 16 走「一次 stage + 零同步」新路,
+        // t17 是阈值上的**对照臂**(走原逐步双缓冲路) —— 两路都要与 scalar 臂吻合。
+        ("fast_t8", 8, 0.5),
+        ("fast_t16", 16, 0.5),
+        ("old_t17", 17, 0.5),
     ];
 
     for &(tag, t, g_depth) in cases {
