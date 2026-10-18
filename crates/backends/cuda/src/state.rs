@@ -490,59 +490,126 @@ pub(super) enum FamAct {
 }
 
 /// 严格档开关(进程级一次读取;诊断旋钮 —— 与 `OWL_GDN_FRESH_SCRATCH` 同族)
-/// **显存硬预算判据**(唯一实现;2026-10-16)。
+/// **显存硬预算判据（唯一实现；2026-10-16 立项 / 2026-10-18 缓存化）**。
 ///
-/// 两段,顺序有义:
-/// ① **驱动账**(主判据):`cuMemGetInfo` 的 free − `reserve` ≥ 请求 —— 覆盖
-///    未入账面(CUDA ctx / 池保留页 / 别的进程);
-/// ② **逻辑上限**(可选):`vram::live + n ≤ budget`。
+/// 两段，顺序有义：
+/// ① **驱动账**（主判据）：`cuMemGetInfo` 的 free − `reserve` ≥ 请求 —— 覆盖
+///    未入账面（CUDA ctx / 池保留页 / 别的进程）；
+/// ② **逻辑上限**（可选）：`vram::live + n ≤ budget`。
 ///
-/// 不通过 = `PoolExhausted`(**结构化**:要多少 / 还能给多少)⇒ 调用方**拒发**,
-/// 不去 malloc —— CUDA 侧失败是"已经太晚"的现场(错误语义模糊 + 池撕碎)。
-pub(super) fn vram_budget_guard(
-    n_bytes: usize,
-    reserve_bytes: u64,
-    budget_bytes: Option<u64>,
-) -> Result<(), ModelError> {
-    if let Ok((free, _)) = cudarc::driver::result::mem_get_info() {
-        let free = free as u64;
-        owl_shared::vram::free_set(free);
-        let avail = free.saturating_sub(reserve_bytes);
-        if n_bytes as u64 > avail {
-            // **取证**(2026-10-19):把当时的三个数打全(此前只报"要多少/还剩多少",
-            // 剩下"谁吃掉了"无从判断)。`OWL_VRAM_DBG=1` 时连成功路径也打(看趋势)。
-            let (pu, _puh, pr, _prh) = pool_ledger_snapshot().unwrap_or((0, 0, 0, 0));
-            eprintln!(
-                "[vram-guard] 拒发:要 {} MiB,驱动 free={} MiB,reserve={} MiB,avail={} MiB,\
-                 池 used={} MiB / reserved={} MiB ⇒ **池内可复用 {} MiB**,live 账={} MiB",
-                n_bytes >> 20,
-                free >> 20,
-                reserve_bytes >> 20,
-                avail >> 20,
-                pu >> 20,
-                pr >> 20,
-                pr.saturating_sub(pu) >> 20,
-                owl_shared::vram::live_bytes() >> 20,
-            );
-            return Err(ModelError::PoolExhausted {
-                pool: "vram-hard-budget(驱动 free − reserve)".into(),
-                needed: n_bytes as u64,
-                available: avail,
-            });
-        }
+/// 不通过 = `PoolExhausted`（**结构化**：要多少 / 还能给多少）⇒ 调用方**拒发**，
+/// 不去 malloc —— CUDA 侧失败是“已经太晚”的现场（错误语义模糊 + 池撕碎）。
+///
+/// # 为什么必须是 `&mut self`（缓存化，2026-10-18）
+///
+/// nsys `cuda_api_sum` 实测：**`cuMemGetInfo` = 86.8µs/次**（max 10.4ms），
+/// 而真分配 `cuMemAllocAsync` 只要 **10µs**。原实现逐 alloc 真查 ⇒
+/// 1426 alloc/chunk × 87µs ≈ **121ms/chunk 纯宿主税**（占 prefill 墙 ~30%；
+/// 4-token 尾块的 249ms 里一半是它；2s 窗内 `cuMemGetInfo` 606ms/1673ms）。
+/// 修法 = **真采样只在必要时**：
+/// * ① 首采；② 距上次采样超 [`VramGuard::SAMPLE_TTL`]（防外部进程长期漂移）；
+/// * ③ 估计值逼近边界（`free_est < n + reserve + MARGIN`）—— 只有此刻
+///   才需要精确值，也正是原判据会拒发的窗口。
+///
+/// 两次采样之间用 **live 账增量**做估计：`free_est = free_at − (live_now − live_at)`。
+/// 方向性论证（不变量）：本进程 net live 增长**必然**吃掉驱动 free，而
+/// 池滞留/fragmentation 只会让真 free **更低**（提前采样 = 更保守）⇒ 估计
+/// 不会“比真值更宽松”而放行超预算请求。兜底仍在：真分配失败走
+/// `handle_alloc_inner` 的结构化错误 + 三账上屏（永不静默）。
+pub(super) struct VramGuard {
+    /// 上次真采样：（时刻，驱动 free，采样时 live 账）
+    sample: Option<(std::time::Instant, u64, u64)>,
+}
+
+impl VramGuard {
+    pub(super) const fn new() -> Self {
+        Self { sample: None }
     }
-    if let Some(cap) = budget_bytes {
+
+    /// 采样保鲜期（超时 ⇒ 真查一次；防外部进程吃显存后长期不校准）
+    const SAMPLE_TTL: std::time::Duration = std::time::Duration::from_millis(1000);
+    /// 刷新余量：估计值落进 `n + reserve + MARGIN` 以内才真查（常态零查询；
+    /// 256MiB ≫ 单次 scratch（~6-40MiB），不改变稳态判据语义）
+    const MARGIN_BYTES: u64 = 256 << 20;
+
+    /// **纯函数**：由采样 + 当前 live 账估计驱动 free（可单测；无 CUDA）。
+    fn estimate_free(
+        sample: Option<(std::time::Instant, u64, u64)>,
+        live_now: u64,
+        now: std::time::Instant,
+    ) -> Option<(u64, bool)> {
+        let (t, free_at, live_at) = sample?;
+        let grown = live_now.saturating_sub(live_at);
+        let stale = now.duration_since(t) > Self::SAMPLE_TTL;
+        Some((free_at.saturating_sub(grown), stale))
+    }
+
+    /// 判据入口（见类型文档；`&mut self` 只为刷新采样缓存）。
+    pub(super) fn check(
+        &mut self,
+        n_bytes: usize,
+        reserve_bytes: u64,
+        budget_bytes: Option<u64>,
+    ) -> Result<(), ModelError> {
+        // ② 逻辑上限（可选；纯账，零驱动）
+        if let Some(cap) = budget_bytes {
+            let live = owl_shared::vram::live_bytes();
+            let after = live.saturating_add(n_bytes as u64);
+            if after > cap {
+                return Err(ModelError::PoolExhausted {
+                    pool: "vram-hard-budget(live 账上限)".into(),
+                    needed: n_bytes as u64,
+                    available: cap.saturating_sub(live),
+                });
+            }
+        }
+        // ① 驱动账：先看估计，够用且不陈旧就**不查驱动**
         let live = owl_shared::vram::live_bytes();
-        let after = live.saturating_add(n_bytes as u64);
-        if after > cap {
-            return Err(ModelError::PoolExhausted {
-                pool: "vram-hard-budget(live 账上限)".into(),
-                needed: n_bytes as u64,
-                available: cap.saturating_sub(live),
-            });
+        let now = std::time::Instant::now();
+        let need_sample = match Self::estimate_free(self.sample, live, now) {
+            None => true,
+            Some((free_est, stale)) => {
+                stale
+                    || free_est
+                        < (n_bytes as u64)
+                            .saturating_add(reserve_bytes)
+                            .saturating_add(Self::MARGIN_BYTES)
+            }
+        };
+        if need_sample {
+            if let Ok((free, _)) = cudarc::driver::result::mem_get_info() {
+                let free = free as u64;
+                owl_shared::vram::free_set(free);
+                self.sample = Some((std::time::Instant::now(), free, live));
+            }
         }
+        if let Some((free_est, _)) = Self::estimate_free(self.sample, live, std::time::Instant::now()) {
+            let avail = free_est.saturating_sub(reserve_bytes);
+            if n_bytes as u64 > avail {
+                // **取证**(2026-10-19,main):把当时的数打全(此前只报“要多少/还剩多少”,
+                // 剩下“谁吃掉了”无从判断)。估计路径下 free 报的是**采样时刻**的值。
+                let (pu, _puh, pr, _prh) = pool_ledger_snapshot().unwrap_or((0, 0, 0, 0));
+                eprintln!(
+                    "[vram-guard] 拒发:要 {} MiB,驱动 free(est)={} MiB,reserve={} MiB,avail={} MiB,\
+                     池 used={} MiB / reserved={} MiB ⇒ **池内可复用 {} MiB**,live 账={} MiB",
+                    n_bytes >> 20,
+                    free_est >> 20,
+                    reserve_bytes >> 20,
+                    avail >> 20,
+                    pu >> 20,
+                    pr >> 20,
+                    pr.saturating_sub(pu) >> 20,
+                    owl_shared::vram::live_bytes() >> 20,
+                );
+                return Err(ModelError::PoolExhausted {
+                    pool: "vram-hard-budget(驱动 free − reserve)".into(),
+                    needed: n_bytes as u64,
+                    available: avail,
+                });
+            }
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 pub(super) fn cap_strict() -> bool {
@@ -2169,6 +2236,35 @@ impl Drop for Staging {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── VramGuard 估计函数(纯函数;2026-10-18 缓存化 `cuMemGetInfo`)──────
+
+    /// 估计 = 采样 free − live 增量;live 回退(释放)时不为负、不「涨回」。
+    #[test]
+    fn vram_guard_estimate_follows_live_growth() {
+        let t0 = std::time::Instant::now();
+        let sample = Some((t0, 1u64 << 30, 100u64 << 20)); // free=1GiB @ live=100MiB
+        // live +200MiB ⇒ est 少 200MiB
+        let (est, stale) = VramGuard::estimate_free(sample, 300 << 20, t0 + std::time::Duration::from_millis(100))
+            .expect("采样在场");
+        assert_eq!(est, (1u64 << 30) - (200u64 << 20));
+        assert!(!stale, "TTL 内不陈旧");
+        // live 回退 ⇒ grown 饱和为 0(估计不高于采样值:保守方向)
+        let (est2, _) = VramGuard::estimate_free(sample, 10 << 20, t0 + std::time::Duration::from_millis(100))
+            .expect("采样在场");
+        assert_eq!(est2, 1u64 << 30);
+    }
+
+    /// 无采样 = 必须真采;超 TTL = 必须真采(防外部进程漂移)。
+    #[test]
+    fn vram_guard_requires_fresh_sample() {
+        let t0 = std::time::Instant::now();
+        assert!(VramGuard::estimate_free(None, 0, t0).is_none(), "无采样");
+        let sample = Some((t0, 1u64 << 30, 0));
+        let (_, stale) = VramGuard::estimate_free(sample, 0, t0 + VramGuard::SAMPLE_TTL + std::time::Duration::from_millis(1))
+            .expect("采样在场");
+        assert!(stale, "超 TTL 必须重采");
+    }
 
     /// 跨账本 id 解析 ⇒ 结构化 CrossLedger 错(含 id + 两个 ledger 号)。
     /// 纯解码/断言,不触 CUDA(可在无卡环境跑)。

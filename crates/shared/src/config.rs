@@ -210,6 +210,14 @@ pub struct RuntimeCfg {
     pub gpu_min_free_ratio: f64,
     pub max_seq: usize,
     pub prefill_chunk: usize,
+    /// **尾块合并**(tokens;L4,2026-10-18):`剩余 ≤ prefill_chunk + 本值`
+    /// ⇒ 本步一口气吃完剩余(块长上限 = chunk + tail_merge)。
+    ///
+    /// 动机(实测,`perf-runs/prefill-prof-2026-10-18/REPORT.md` §4):每 chunk
+    /// 有一份**与尺寸无关**的固定宿主税(~250ms:6395 条命令 alloc/launch/free
+    /// 往返;4-token 的尾块也要 249ms)⇒ `<chunk` 的尾块是纯亏。
+    /// 默认 **0 = 关 = 逐字节旧行为**(块长 = min(chunk, 剩余))。
+    pub prefill_tail_merge: usize,
     /// **测试设备门控值**(不入 toml;测试入口自填):`OWL_TEST_DEVICE` 的 **BDF**
     /// (如 `41:00.0`)。`Some` = GPU 门已过。**CUDA 序号禁用**(序会漂)。
     #[serde(skip)]
@@ -906,6 +914,7 @@ impl Default for RuntimeCfg {
             gpu_min_free_ratio: 0.9,
             max_seq: 4096,
             prefill_chunk: 512,
+            prefill_tail_merge: 0,
             test_device: None,
             server_url: None,
         }
@@ -1462,6 +1471,22 @@ mod tests {
         assert_eq!(c.pool.gdn_slots, 1);
     }
 
+}
+
+#[cfg(test)]
+mod prefill_tail_merge_tests {
+    use super::*;
+
+    /// L4(2026-10-18):`[runtime] prefill_tail_merge` 缺省 **0 = 关**(旧行为),
+    /// 显式给值可开;非法(负数)由类型拒。
+    #[test]
+    fn prefill_tail_merge_defaults_off_and_parses() {
+        let c = OwlConfig::from_toml_str("[runtime]\nmax_seq = 128\n").expect("解析");
+        assert_eq!(c.runtime.prefill_tail_merge, 0, "缺省必须关(旧行为)");
+        let c2 = OwlConfig::from_toml_str("[runtime]\nprefill_tail_merge = 1024\n").expect("解析");
+        assert_eq!(c2.runtime.prefill_tail_merge, 1024);
+        assert!(OwlConfig::from_toml_str("[runtime]\nprefill_tail_merge = -1\n").is_err());
+    }
 }
 
 #[cfg(test)]

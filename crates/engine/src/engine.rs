@@ -165,6 +165,10 @@ pub struct EngineKnobs {
     pub dense_floor: owl_store::TurnFloor,
     /// eager 直发,跳过图捕获(原 OWL_NO_GRAPH;**总闸**)
     pub no_graph: bool,
+    /// **prefill 尾块合并**(tokens;L4,2026-10-18;`[runtime] prefill_tail_merge`):
+    /// 剩余 ≤ `prefill_chunk + 本值` ⇒ 本步吃完(消灭与尺寸无关的固定宿主税
+    /// ~250ms/chunk 的尾块;缺省 0 = 关 = 旧行为)。见 `scheduler::prefill_step_chunk`。
+    pub prefill_tail_merge: usize,
     /// **prefill 图档位**(P1;`[graph] prefill_bucket`;缺省 `off` = 今天行为)
     pub prefill_bucket: owl_shared::config::PrefillBucket,
     /// **FI plan 图档瓦**(`[dispatch] fi_cuda_graph`;2026-10-18 图档单图立案):
@@ -234,6 +238,7 @@ impl Default for EngineKnobs {
             admission_on_full: owl_store::QueuePolicy::Reject,
             dense_floor: owl_store::TurnFloor::Strict,
             no_graph: false,
+            prefill_tail_merge: 0,
             prefill_bucket: owl_shared::config::PrefillBucket::Off,
             fi_cuda_graph: false,
             fi_plan_bake: None,
@@ -517,6 +522,7 @@ impl EngineKnobs {
             gdn_slots: owl_shared::env_reader::parse("OWL_MAX_ACTIVE_TURNS")
                 .or_else(|| owl_shared::env_reader::parse("OWL_GDN_SLOTS"))
                 .unwrap_or(cfg.pool.gdn_slots),
+            prefill_tail_merge: cfg.runtime.prefill_tail_merge,
             // 快照池容量:env 覆盖(实测调压;命中面要求边界快照在场)
             snap_max: owl_shared::env_reader::parse("OWL_SNAP_MAX").unwrap_or(cfg.pool.snap_max),
             vram_target: cfg.pool.vram_target,

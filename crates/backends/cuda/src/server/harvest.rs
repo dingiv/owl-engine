@@ -49,7 +49,7 @@ impl GpuServer {
             Err(e) => return ack.take().unwrap().send(Err(e)),
         };
         // 硬预算(与 alloc 同一条闸;权重/上传块也吃设备内存)
-        if let Err(e) = crate::state::vram_budget_guard(
+        if let Err(e) = self.vram_guard.check(
             n,
             self.diag.vram_reserve_mb << 20,
             self.diag.vram_budget_mb.map(|m| m << 20),

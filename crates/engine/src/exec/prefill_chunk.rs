@@ -52,23 +52,7 @@ pub(crate) struct XqaTables {
 }
 
 impl ChunkTables {
-    /// 纯计算:无 await、无设备、无副作用
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn build(
-        ids: &[u32],
-        base: usize,
-        t: usize,
-        paged: bool,
-        page: usize,
-        bt_chain: &[u32],
-        gdn_slot_v: usize,
-        fi_face: bool,
-        xqa_face: bool,
-    ) -> Self {
-        Self::build_view(ids, base, t, paged, page, bt_chain, gdn_slot_v, fi_face, xqa_face, None)
-    }
-
-    /// 同 [`Self::build`],多一个**过去视图**(B-3e-2 第 3 项)。
+    /// 构造本 chunk 的表(纯计算:无 await、无设备、无副作用)。
     ///
     /// `past = Some((pages, tokens))` ⇒ 本 chunk 的"过去"由**子集页链**表达
     /// (选中块;`tokens` = 子集 token 数),`context_lens[t'] = tokens + (p+1−recall)`。
@@ -434,7 +418,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             if !taps.is_empty() {
                 let ts = std::time::Instant::now();
                 self.prefill_dflash_encode(taps, base).await?;
-                eprintln!("[dflash] prefill encode {t} rows @{} {:?}", base, ts.elapsed());
+                // 逐块 dflash encode 计时走 metrics(T1;原为直接打印)
+                mrec("dflash.prefill.encode", ts.elapsed());
             } else if self.spec.drafter.is_some() && t > 1 {
                 self.prefill_extend(root, t - 1, ids, base).await?;
             }
@@ -450,7 +435,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if !taps.is_empty() {
             let ts = std::time::Instant::now();
             self.prefill_dflash_encode(taps, base).await?;
-            eprintln!("[dflash] prefill encode {t} rows @{} {:?}", base, ts.elapsed());
+            mrec("dflash.prefill.encode", ts.elapsed());
         }
         // 末行窄切(**物化**:SliceView 作根丢偏移,根必须真块)
         let last = TensorOps::call(owl_models::ops::SemanticKernel::Narrow)
@@ -1160,7 +1145,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                                 .slice_view((i + 1) * t * (*dd), vec![t, *dd])
                         })
                         .collect();
+                    let ts = std::time::Instant::now();
                     self.prefill_dflash_encode(&tap_views, base).await?;
+                    mrec("dflash.prefill.encode", ts.elapsed());
                 } else if self.spec.drafter.is_some() && t > 1 {
                     let ts = std::time::Instant::now();
                     self.prefill_extend(&b, t - 1, ids, base).await?;

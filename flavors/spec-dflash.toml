@@ -1,38 +1,31 @@
-# owl 预设档 `spec-dflash`(2026-10-16 合并 main FALVORS 表;内容以 main 为准)
+# owl 预设档 `spec-dflash`(27B AWQ-INT4 + DFlash2 d7 生产形状;2026-10-18 精简)
+#
+# 纪律:档内**只列最优且非缺省**的选项 —— 引擎缺省即最优的一律不复述。
+# 站点/部署面(model.dir/dflash2_dir、bind、几何)由配套配置文件给,
+# 启动 = `server --flavor spec-dflash <site.toml>`。
+# 详尽 why 在各设计卷;此处每键一行来源。
+
 [model]
 kind = "awq27b"
-# C1(2026-10-11):lm_head int4 装载期现场 RTN(marlin kU4);质量门
-# 已过(prose/数学 A/B 逐字同,竖式同错=模型固有),数学域 159→177
+# lm_head 装载期现场 RTN int4 g32(marlin kU4);质量门已过
 head_quant = "rtn-int4-g32"
-# 主干量化方案(与 head_quant 同类档位 —— 声明即事实;行业记法 W{权重}A{激活}):
-#   "w4a16" = 权重 4bit AWQ g32-asym(zp)+ 激活 f16 = 今天行为(生产默认)
-#   "w4a8"  = 同源权重 a8 布局 + per-token int8 激活 + kS8×kU4 GEMM(int8 张量核):
-#             单卡 3090 Ti 实测 prefill +48~50% / TTFT −33% @32k,decode 不变;
-#             代价 = 装载 +14.5s(a8 重物化,设备重排核待补)+ 质量门待过 S3(非逐字同)
-# 施工/门/回滚见 docs/arch/W4A8-算子家族-设计与施工.md(§5.4 开关与回滚 / §6 S3-S4)
+# 主干 W4A16(AWQ g32-asym + f16 激活)= 现役最优;W4A8 质量门 S3 过档后改此键
 quant = "w4a16"
 
 [runtime]
-# 2026-10-13 重定档(影子池时代旧值 = 2560/池 4352):单池 + FI 直读后
-# 内存不再是约束 —— 实测 vram 治理 `fixed_after=0.68G budget=4.66G
-# per_tok=53248B → 池上限 94024 tok`(fp8 目标池 32KB/tok + DFlash2
-# bf16 草稿池 20KB/tok)。故**池值现为产品选择而非内存必需**:
-# 取 16k ctx(相对旧档 6.4×),实测代价 ~2.5% prefill、~0.5% decode
-# (池/nparts 9472/19 → 16896/33 的 A/B)。
+# 16k ctx;池值 = 产品选择(相对 9472 档:prefill ~−2.5% / decode ~−0.5%)
 max_seq = 16384
+# 尾块合并:剩余 ≤ 512+本值 ⇒ 本步吃完 —— 消灭与尺寸无关的 ~250ms/chunk 宿主税
+# (516 tok TTFT 651→406ms / 8k −4.4% / 32k −1.5%)。块边界变 ⇒ token 级非逐位。
+# 缺省 0 = 关;perf-runs/prefill-prof-2026-10-18/REPORT.md
+prefill_tail_merge = 1024
 
 [spec]
+# 草稿深度 7(降级首探窗口 probe_every 缺省即 8,见 config.rs 的取法)
 depth = 7
-# 降级首探窗口(tokens):降级后先等这么多 token 就试水一次投机轮,命中即恢复 spec。
-# 8 = 实测取法(裸 decode 27.5ms/token vs spec 5.7ms/token ⇒ 窗口内每 token 亏 22ms;
-# 窗口 64 会让一次偶发 m=0 连击最长罚 1.4s)。退避 ×2 封顶 512 兜持久失败。
-probe_every = 8
 
 [server]
-# 单会话语义:GDN 格锁 1 → 并发闸门必须 ≤1(启动 fail-fast 校验
-# gdn_slots ≥ max_concurrency)。2026-10-13 实测:本档原**缺此项** →
-# `--flavor spec-dflash` 独立起不来(此前 e2e/bench 各自在配置文件里
-# 覆盖了 gdn_slots=8 才蒙混过去)。多会话档 = 这里改 8 + gdn_slots=8。
+# 单会话语义:GDN 格锁 1 ⇒ 并发闸门必须 ≤1(validate 拒启)
 max_concurrency = 1
 
 [pool]
@@ -48,10 +41,17 @@ prefix_cache = false
 
 [dispatch]
 kv_fp8 = true
-# **生产算子白名单**(P4 硬门;清单 = 实测台账,与 kernels
-# `ops::PROD_SPEC_DFLASH_2026_10_13` 逐项一致 —— 由 apps/server 的门测试锁死)。
-# 非空 ⇒ 未列出的算子发射即结构化拒(deny-by-default);装配期还会用它跑
-# 池写集穷举审计(读必有人写 + 声明自洽 + 活跃写者不歧义)。
+# 现役臂(2026-10-18 W3–W5 转正):prefill=FI / verify=FI 单图 / decode=FI 单图。
+# FI 核留捕获图内,`ctx_total` 烘上界(= 0 哨兵取 max_seq),表由引擎窗外
+# 每步/每轮 `fi_plan_sync` 刷精确值 ⇒ 图不烘自携 restore。
+verify_fi = true
+decode_fi = true
+fi_cuda_graph = true
+fi_plan_bake = 0          # 0 = 哨兵「取 [runtime] max_seq」(改档自动跟随)
+fi_plan_restore = false   # 图不烘表 ⇒ host 是表的唯一权威(validate 硬配)
+gdn_chunked = true
+# 生产算子白名单(P4 硬门,deny-by-default;与 kernels ops::PROD_SPEC_DFLASH
+# 逐项一致,由 apps/server 门测试锁死)。两族 fp8/f16 都在 ⇒ f16 档不必绕门。
 allowed_ops = [
         "cublas_gemm_bf16", "cublas_gemm_f16",
         "flashinfer_prefill_paged_f16", "flashinfer_prefill_paged_fp8kv", "gdn_chunked_delta_rule_fwd",
@@ -85,56 +85,6 @@ allowed_ops = [
         "vllm_paged_attention_v2_reduce_f16_hd256",
         "vllm_reshape_and_cache_bf16", "vllm_reshape_and_cache_f16_knhd",
 ]
-# 白名单同时含 **fp8 与 f16 两主池族**(2026-10-14 A5 补):`kv_fp8` 决定
-# 实际发射哪一族 —— f16 档不用再拿 `allowed_ops = []` 绕硬门。两族在池
-# 写集审计里按 (池名, dtype) 分组,各自闭环(R3 不撞)。
-# ── verify 注意力臂(2026-10-16 换代 = FI+split;2026-10-18 W5 = 单图)──
-#
-# 旧:XQA verify 臂(2026-10-13 D3 转正;恒等门 3/3 绿)。它的问题在长 ctx:
-# ctx 依赖的 KV-split 全在核内,verify 图墙时随 ctx 线性涨(32k 轮时 69.3ms)。
-# 中:FI+split(核级实测 verify 形状 ≤0.3ms/发 vs XQA 1.54);当时 FI 的 plan
-# 依赖 ctx ⇒ 用 **piecewise(段+断点)** 把核移出捕获图(32k 轮 69.3 → 48.4ms)。
-# 今(W5,2026-10-18):plan 依赖 ctx 已由"**图档瓦(形状对 ctx 恒定)+ 引擎窗外
-# `fi_plan_sync` 刷精确表**"解决 ⇒ **FI 核留捕获图内**(单图),piecewise 面
-# **整体退役**(旋钮 `verify_piecewise`/`break_at_out` 一并退役 ⇒ 写了会**拒启**)。
-# 实测(W4 转正门,三档 ctx):发射税 10.9-12.0 → 0.2-0.3 ms、整轮 GPU −5.0%、
-# `reasoning_content` 逐字节恒等、971 轮 soak σ=0.11 ms。
-# ⚠️ decode(T=1)同法(图内臂):见下方 decode_xqa/decode_fi 段。
-verify_xqa = false
-verify_v2 = false
-verify_fi = true
-# 裸 decode 走 XQA(2026-10-13 ②):第二份实例化 `M_TILESIZE=16`。
-# 注:短 ctx 收益略低(512 档 1.90× vs 2048 档 2.25×),但**不缺省加 ctx
-# 阈值门** —— 最小值也在 1.4× 以上,且阈值本身是额外的一支分支/形状面。
-decode_xqa = false
-# decode 走 **FI 断点**(V1c;session 常驻图改分段,断点挂 decode 核):
-# 裸 decode 阶梯 8192/32768 = 33.1/47.8 → **27.8/29.0 ms/tok(-16%/-39%,对 ctx 平坦)**,
-# 文本与 v2/XQA 逐位一致。⚠️ 曾踩:plan_session 少交断点采集面 ⇒ FI 核被烘进图 + plan 用
-# 占位 ctx_total=1 ⇒ 文本连贯但错(见状 §11.13)。
-decode_fi = true
-# ── 图档单图(W3+W4,2026-10-18 转正)──
-#
-# 结构:`FI_CUDA_GRAPH=1` 让 plan 形状**对 ctx 全域恒定**(padded=42/cta=16|64/split=1)
-# ⇒ 一张图可服务任意 ctx,只需换表内容;表由引擎在**窗外**每步/每轮
-# `fi_plan_sync` 刷成**精确值**(T=8 过供给会错 —— 行 stride 与 merge_indptr 打架)。
-# 判据:
-#   · decode(W3):文本与 piecewise 臂逐位一致,ms/tok −4~6%,图 slab −50%
-#   · verify(W4):三档 ctx 的 reasoning_content **逐字节恒等**;
-#     发射税 10.9-12.0 → 0.2-0.3 ms;整轮 GPU 时间 25.94/26.01/26.00 →
-#     24.69/24.72/24.70 ms(−5.0%,对 ctx 平坦);t/s +2.5%;
-#     971 轮 soak 首末十轮 24.70 → 24.87 ms(σ=0.11,零告警)
-#   · ⚠️ 上界:fi_plan_bake **必须 ≥ max_seq** ⇒ 这里用哨兵 `0` = 取 [runtime] max_seq
-#     (档位改 max_seq 时自动跟随;写死值会在改档时被 validate 拒启)
-# 配套硬约束(validate 拒启):fi_plan_bake ⇒ fi_plan_restore = false(图不烘表,
-# host 是表的唯一权威);与 [graph] prefill_bucket 互斥。
-fi_cuda_graph = true
-fi_plan_bake = 0
-fi_plan_restore = false
-# GDN prefill 臂(2026-10-11 终版):fork-bf16 全家桶转正 —— g 语义律
-# 修复(kkt/h/o 必须吃 cumsum 而非 raw g;raw g 在深谷 -24 时
-# exp(±24)=e²⁴ 爆炸)。恒等门:四域 vs recurrence 逐位一致;std 矩阵
-# prefill 1299(超 scalar 1294)。fork 六核 bf16 配方全在 handler 肠内。
-gdn_chunked = true
 
 [sampling]
 mode = "greedy"

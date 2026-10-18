@@ -119,6 +119,10 @@ pub struct GpuServer {
     /// 原 OWL_SRV_TIMING/CAP_PROF/LAUNCH_SYNC/FREE_LEGACY/GRAPH_FLAGS/
     /// CAPTURE_SLAB_MB/CUDA_HOME 散点直读 → DiagOpts 一体携带)
     diag: crate::state::DiagOpts,
+    /// **VRAM 硬预算守卫**（缓存化的 `cuMemGetInfo`；见 `state::VramGuard`
+    /// 类型文档：逐 alloc 真查 = 86.8µs × 1426/chunk = 121ms 宿主税）。
+    /// 状态归本结构体（不放全局）：只有本 server 一条分配咽喉。
+    vram_guard: crate::state::VramGuard,
     pool: std::sync::Arc<PinnedPool>,
     /// 上线握手(可选;便捷组装路径用它回传设备上线结果)
     boot: Option<mpsc::Sender<Result<(), String>>>,
@@ -223,6 +227,7 @@ impl GpuServer {
                 }
             },
             diag,
+            vram_guard: crate::state::VramGuard::new(),
             sink,
         }
     }
@@ -952,9 +957,9 @@ impl GpuServer {
             return ack.send(result);
         }
         // ── 显存硬预算(2026-10-16):**主动拒发**,不去 malloc ──
-        // 判据见 `crate::state::vram_budget_guard`(驱动 free − reserve;可选叠
-        // live 账上限)。拒发 = 结构化 `PoolExhausted` + 一条 WARN(带池账/驱动账)。
-        if let Err(e) = crate::state::vram_budget_guard(
+        // 判据见 `crate::state::VramGuard::check`（驱动 free − reserve；可选叠
+        // live 账上限）。拒发 = 结构化 `PoolExhausted` + 一条 WARN（带池账/驱动账）。
+        if let Err(e) = self.vram_guard.check(
             n_bytes,
             self.diag.vram_reserve_mb << 20,
             self.diag.vram_budget_mb.map(|m| m << 20),

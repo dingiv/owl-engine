@@ -177,6 +177,7 @@ pub struct StageStats {
     pub from_verdict: usize,
 }
 
+#[cfg(test)]
 impl StageStats {
     /// 每块字节(0 = 无样本)。
     pub fn bytes_per_block(&self) -> usize {
@@ -264,6 +265,7 @@ pub struct BAxisProfile {
     pub total_ms: f64,
 }
 
+#[cfg(test)]
 impl BAxisProfile {
     /// 人类可读一行(各相位 + 占比)。
     pub fn line(&self) -> String {
@@ -297,6 +299,7 @@ impl BAxisProfile {
     }
 }
 
+#[cfg(test)]
 impl PartialStats {
     /// 人类可读一行。
     pub fn line(&self) -> String {
@@ -358,6 +361,7 @@ pub fn budget_clamp(
 
 impl<D: DeviceClient> RunningEngine<D> {
     /// 本档 prefill 块长(探针排版用;与调度器取**同一份配置** ⇒ 不会对不上)
+    #[cfg(test)]
     pub(crate) fn cfg_prefill_chunk(&self) -> usize {
         self.cfg.prefill_chunk
     }
@@ -640,6 +644,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 act.fed,
                 act.prompt_ids.len(),
                 self.cfg.prefill_chunk,
+                self.cfg.knobs.prefill_tail_merge,
             ) {
                 Some(chunk) => act.fed + chunk,
                 None => act.fed + self.spec.depth + 1, // 生成相位(act.fed = pos)

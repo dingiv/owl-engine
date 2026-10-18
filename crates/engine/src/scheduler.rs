@@ -133,14 +133,25 @@ impl<D: DeviceClient> RunningEngine<D> {
     ///
     /// `None` = 本步不是 prefill（已说完 prompt，或没有活跃 turn）。
     /// 块长 = min(配置块长, 剩余);`max(1)` 保证结尾剩 1 token 也推得动。
+    ///
+    /// **尾块合并（L4，2026-10-18）**：`tail_merge > 0` 且
+    /// `剩余 ≤ chunk_cfg + tail_merge` ⇒ 本步**吃完剩余**（块长上限
+    /// `chunk_cfg + tail_merge`）。动机：每 chunk 有一份与尺寸无关的固定
+    /// 宿主税（实测 ~250ms：6395 条 alloc/launch/free 往返；**4-token 的
+    /// 尾块同样是 249ms**，见 `perf-runs/prefill-prof-2026-10-18/REPORT.md` §4）
+    /// ⇒ `< chunk` 的尾块纯亏。`tail_merge = 0` ⇒ 逐字节旧行为。
     pub(crate) fn prefill_step_chunk(
         fed: usize,
         prompt_len: usize,
         chunk_cfg: usize,
+        tail_merge: usize,
     ) -> Option<usize> {
         let remaining = prompt_len.checked_sub(fed)?;
         if remaining == 0 {
             return None;
+        }
+        if remaining <= chunk_cfg.saturating_add(tail_merge) {
+            return Some(remaining.max(1));
         }
         Some(remaining.min(chunk_cfg).max(1))
     }
@@ -294,8 +305,13 @@ impl<D: DeviceClient> RunningEngine<D> {
                     .get_mut(turn.session_id)
                     .expect("submit 已建会话账");
                 let target = if self.cfg.knobs.kvmem_virtualization {
-                    Self::prefill_step_chunk(0, turn.prompt_ids.len(), self.cfg.prefill_chunk)
-                        .unwrap_or(1)
+                    Self::prefill_step_chunk(
+                        0,
+                        turn.prompt_ids.len(),
+                        self.cfg.prefill_chunk,
+                        self.cfg.knobs.prefill_tail_merge,
+                    )
+                    .unwrap_or(1)
                 } else {
                     turn.prompt_ids.len()
                 };
@@ -366,8 +382,13 @@ impl<D: DeviceClient> RunningEngine<D> {
             let remaining = act.prompt_ids.len() - base;
             // 块长:配置块长 ∩ 剩余(E1 paged 核后无 256 窗钳制;
             // 全局注意力语义,长 ctx 安全)
-            let chunk = Self::prefill_step_chunk(base, act.prompt_ids.len(), self.cfg.prefill_chunk)
-                .unwrap_or_else(|| remaining.max(1));
+            let chunk = Self::prefill_step_chunk(
+                base,
+                act.prompt_ids.len(),
+                self.cfg.prefill_chunk,
+                self.cfg.knobs.prefill_tail_merge,
+            )
+            .unwrap_or_else(|| remaining.max(1));
             let action = StepAction::Prefill {
                 chunk_ids: act.prompt_ids[base..base + chunk].to_vec(),
                 base,
@@ -469,3 +490,37 @@ impl<D: DeviceClient> RunningEngine<D> {
 }
 
 
+
+
+#[cfg(test)]
+mod prefill_tail_merge_tests {
+    use super::RunningEngine;
+
+    /// 纯函数面:本模块的测试不需要设备/引擎实例,只需一个具体的 `D` 占位
+    /// (`prefill_step_chunk` 不使用 `D`;用 `owl_cpu::CpuFace` 作哑元)。
+    type R = RunningEngine<owl_cpu::CpuFace>;
+
+    /// tail_merge = 0 ⇒ 旧行为(min(cfg, 剩余),永不合并)。
+    #[test]
+    fn tail_merge_off_is_old_behavior() {
+        assert_eq!(R::prefill_step_chunk(0, 2048, 512, 0), Some(512));
+        assert_eq!(R::prefill_step_chunk(2048 - 4, 2048, 512, 0), Some(4));
+        assert_eq!(R::prefill_step_chunk(0, 100, 512, 0), Some(100));
+        assert_eq!(R::prefill_step_chunk(100, 100, 512, 0), None);
+    }
+
+    /// tail_merge = 512 ⇒ 剩余 ≤ 1024 一口气吃完(尾块合并;最大块 1024)。
+    #[test]
+    fn tail_merge_merges_small_tail() {
+        // 516 ⇒ 单块(消灭 512+4 的两块结构)
+        assert_eq!(R::prefill_step_chunk(0, 516, 512, 512), Some(516));
+        // 8244:前段仍 512,最后一段 564(合并 512+52)
+        assert_eq!(R::prefill_step_chunk(0, 8244, 512, 512), Some(512));
+        assert_eq!(R::prefill_step_chunk(7680, 8244, 512, 512), Some(564));
+        // 1024 恰在界上 ⇒ 吃完;1025 ⇒ 回 512
+        assert_eq!(R::prefill_step_chunk(0, 1024, 512, 512), Some(1024));
+        assert_eq!(R::prefill_step_chunk(0, 1025, 512, 512), Some(512));
+        // 1 token 也推得动
+        assert_eq!(R::prefill_step_chunk(0, 1, 512, 512), Some(1));
+    }
+}

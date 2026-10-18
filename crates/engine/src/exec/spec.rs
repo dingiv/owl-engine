@@ -1023,7 +1023,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         return Ok(slot);
                     }
                     Err(e) => {
-                        eprintln!("DBG-SNAP 下沉失败: {e}");
+                        // 收编为结构化 WARN(2026-10-18 T1;原为 `DBG-SNAP` 直接打印)
+                        owl_shared::log_warn!("store", "快照下沉失败: {e}");
                     }
                 }
                 // 沉不下 ⇒ 丢(内容整体消失;宿主副本同步丢)
@@ -1135,14 +1136,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
     }
 
-    /// f16 小端字节对 → f32(索引采集解包;不走 half 依赖面)。
-fn f16_le_to_f32(lo: u8, hi: u8) -> f32 {
-    let bits = u16::from_le_bytes([lo, hi]);
-    // 复用 store 的位型转换(同源,避免第二套实现)
-    owl_store::f16_to_f32_pub(bits)
-}
-
-/// 取本 turn 已喂入 KV 的 token 段 `[lo, hi)`(= `prompt_ids ++ out`)。
+    /// 取本 turn 已喂入 KV 的 token 段 `[lo, hi)`(= `prompt_ids ++ out`)。
     /// 越过已喂面 = **结构性拒**(快照边界不得越过 KV 真实内容 —— 静默截断
     /// 会让快照身份与实际内容脱节)。
     /// 本 turn 的 token 链区间 `[lo, hi)`(快照边界段来源;`coverage.rs` 回算

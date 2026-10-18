@@ -17,9 +17,10 @@
 
 ### metrics 常用 tag 族(tag 名字即契约)
 
-- **prefill**:`prefill.chunk`(每 chunk host 墙时)、`prefill.graph`(桶图**发射**成本,异步 ⇒ 天然小)、
+- **prefill**:`prefill.chunk`(每 chunk host 墙时)、`prefill.bnd`(边界事件：快照 + 召回/打分/调和;
+  与 `prefill.chunk` 分「前向 / 边界」两半)、`prefill.graph`(桶图**发射**成本,异步 ⇒ 天然小)、
   `prefill.bucket.hit[.t<n>]` / `.bypass.pad` / `.pad_rows[_skipped]` / `prefill.eager.{chunks,tokens}`、
-  `prefill.extend`(草稿 KV 物化)。
+  `prefill.extend`(草稿 KV 物化)、`dflash.prefill.encode`(逐块 DFlash2 encode)。
 - **spec**:`spec.round[.deg|.spec]` / `spec.verify` / `spec.propose[.step|.read|.btwt]` / `spec.extend` / `spec.snap` / `spec.emit`。
 - **decode**:`decode.step[.deg]` / `decode.sync`。
 - 计数器(counter)与计时器(timer)共用一个 tag 空间:采样面是 `count/total/p50/p99`,事实面是 `counter`。
