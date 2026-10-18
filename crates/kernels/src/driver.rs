@@ -408,6 +408,21 @@ impl KernelPick {
 /// 哨兵 1D 发射形态(逐元素/批量核的公共形态)
 pub const SENTINEL_1D: Shape = Shape { grid: (0, 0, 0), block: (256, 1, 1), smem: 0 };
 
+/// **行归约族的块内和 smem 契约**(2026-10-19 §58 刀③):
+/// `owl_rmsnorm_*` / `owl_fused_add_rmsnorm_*` 用**动态 smem**装"每 warp 一个部分和"
+/// (`extern __shared__ float smem[]`,块大小因此不再被静态数组写死)。
+/// 本函数 = 那条契约的**单源**:调用方必须传 ≥ 本值,否则核内 `smem[warp]` 越界。
+/// 改动此处**必须同步**核内归约结构(`cu/ln/rmsnorm.cu` / `cu/ln/fused_add_rmsnorm.cu`)。
+pub const fn row_reduce_smem(block: u32) -> u32 {
+    ((block + 31) / 32) * 4
+}
+
+/// 行归约族块大小(2026-10-19 §58 刀③:256 → **512**)。
+/// 为什么是 512:单核实测 5120 宽在 64/128/256/512 线程下 = 30.0/16.2/9.35/4.4µs
+/// (旧版逐 `__half` 步进 ⇒ 纯延迟受限);向量化(16B/线程·轮)后每线程仅
+/// 5120/(512·8) = 1.25 轮。块上限 = 1024(动态 smem 4KB 内)。
+pub const ROW_REDUCE_BLOCK: u32 = 512;
+
 /// foreign 家族臂发射形态(2026-10-12 用户律:具名算子入词表):grid/
 /// block 由 server 家族 runtime 单源,发射配置层/解释层零感知 ——
 /// (0,0,0) 直通,server 按名分派后自算网格
@@ -675,7 +690,11 @@ pub mod ops {
         let rows = x_total.checked_div(cols).unwrap_or(0);
         KernelPick {
             name,
-            shape: Shape { grid: (rows as u32, 1, 1), block: (256, 1, 1), smem: 256 * 4 },
+            shape: Shape {
+                grid: (rows as u32, 1, 1),
+                block: (super::ROW_REDUCE_BLOCK, 1, 1),
+                smem: super::row_reduce_smem(super::ROW_REDUCE_BLOCK),
+            },
         }
     }
 }
@@ -1387,7 +1406,8 @@ pub mod ln {
     use super::{DType, KernelPick, Shape};
 
     /// fused_add_rmsnorm:residual 原地 += mixed;out = rmsnorm(residual)·w。
-    /// grid (rows,1,1);block 256;smem 256·4B(行分段归约)。
+    /// grid (rows,1,1);block = [`ROW_REDUCE_BLOCK`](super::ROW_REDUCE_BLOCK);
+    /// 动态 smem = [`row_reduce_smem`](super::row_reduce_smem)(每 warp 一槽)。
     /// aux = [rows, n]。**副作用律**:residual 块原地写(conv_upd 同款)。
     /// BF16 臂(E5-DF3 同日十四;DFlash2 草稿层残差流)。
     pub fn fused_add_rmsnorm(dt: DType, rows: usize, _n: usize) -> KernelPick {
@@ -1398,7 +1418,11 @@ pub mod ln {
         };
         KernelPick {
             name,
-            shape: Shape { grid: (rows as u32, 1, 1), block: (256, 1, 1), smem: (256 * 4) as u32 },
+            shape: Shape {
+                grid: (rows as u32, 1, 1),
+                block: (super::ROW_REDUCE_BLOCK, 1, 1),
+                smem: super::row_reduce_smem(super::ROW_REDUCE_BLOCK),
+            },
         }
     }
 }
@@ -1632,11 +1656,17 @@ pub mod elems {
         }
     }
 
-    /// embedding 查表(一 token 一 block,block 1)
+    /// embedding 查表(一 token 一 block;block = **512**))
+    ///
+    /// ⚠️ **2026-10-19 §58 刀④**:旧值是 `block (1,1,1)` = 一 token **一线程** ⇒
+    /// decode 单线程串行拷 5120 个 half,单核实测 **264µs**(生产 nsys 288µs/步)。
+    /// 核内同时加了 16B 向量拷贝(逐位等价:纯查表)。实测(单卡 3080,
+    /// `tests/ln_elems_bench.rs`):1/64/128/256/512/1024 线程 = 264/13.1/7.2/4.5/3.1/2.6µs。
+    /// 取 512:与核内"每线程 1.25 轮 16B"匹配,且 block 1024 的边际收益 < 0.5µs。
     pub fn embed(dt: DType, tokens: usize) -> KernelPick {
         KernelPick {
             name: dt_name("embed", dt),
-            shape: Shape { grid: (tokens as u32, 1, 1), block: (1, 1, 1), smem: 0 },
+            shape: Shape { grid: (tokens as u32, 1, 1), block: (512, 1, 1), smem: 0 },
         }
     }
 }
@@ -1780,7 +1810,17 @@ mod tests {
         assert_eq!(elems::concat(DType::F32).name, "owl_concat_rows_f32");
         assert_eq!(elems::rope(DType::F16, 40).shape.grid, (40, 1, 1));
         assert_eq!(elems::rope(DType::F16, 40).shape.block, (128, 1, 1));
-        assert_eq!(elems::embed(DType::F32, 5).shape.block, (1, 1, 1));
+        // embed(§58 刀④:block 1 → 512;一 token 一 block 不变)
+        assert_eq!(elems::embed(DType::F32, 5).shape.grid, (5, 1, 1));
+        assert_eq!(elems::embed(DType::F32, 5).shape.block, (512, 1, 1));
+        // 行归约族的 smem 契约(§58 刀③):动态 smem ≥ ceil(block/32)·4
+        let p = ops::rmsnorm(DType::F16, &[vec![4, 5120], vec![5120]]);
+        assert_eq!(p.shape.block, (ROW_REDUCE_BLOCK, 1, 1));
+        assert_eq!(p.shape.smem, row_reduce_smem(ROW_REDUCE_BLOCK));
+        assert!(p.shape.smem >= p.shape.block.0.div_ceil(32) * 4);
+        let p = ln::fused_add_rmsnorm(DType::F16, 4, 5120);
+        assert_eq!(p.shape.block, (ROW_REDUCE_BLOCK, 1, 1));
+        assert_eq!(p.shape.smem, row_reduce_smem(ROW_REDUCE_BLOCK));
         let p = load::ct_repack(5120 / 8 * 4, 64);
         assert_eq!(p.name, "owl_ct_repack_u32");
         assert_eq!(p.shape.grid, (5120 / 8 * 4 / 64, 32, 1));
