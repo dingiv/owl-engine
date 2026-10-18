@@ -163,6 +163,9 @@ async fn e2e_body() {
     // ── B 轴覆盖率探针(Q-2;按需开:`OWL_COVERAGE_PROBE=1` + `OWL_INDEX_PROBE=1`) ──
     run!(gpu_08b_coverage_probe);
 
+    // ── A2 门:切块不变性(同 prompt × 两种 `prefill_chunk` 读数必须一致;§8.30)──
+    run!(gpu_08b_chunk_invariance_gate);
+
     // ── B-3d 选择层接进 decode(按需开:另加 `OWL_SELECT_DECODE=1`) ──
     run!(gpu_08b_select_decode_probe);
 

@@ -541,12 +541,14 @@ async fn index_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>) {
     );
 }
 
-/// **B 轴覆盖率探针场景体**(Q-2;设计卷 §8.6;face 无关)。
+/// **B 轴覆盖率探针:跑一次读数**(Q-2;设计卷 §8.6;face 无关)。
 ///
-/// 门(§8.6):①候选块**全在索引里**(边界/分析序正确)②top-k 覆盖率落在论文
-/// 量级且**显著高于随机基线** `k/块数`(约定错 ⇒ 打分退化噪声 ⇒ 贴线)。
-/// 首测定档:top-8 ≥ 0.45 且 ≥ 2× 随机(实测值见 e2e 日志)。
-async fn coverage_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>) {
+/// **不做门** —— 判据留给调用方。抽出的理由(F2 "切块不变性门",2026-10-19 §8.30):
+/// 那条不变量要跑**两次**同一个体(两种 `prefill_chunk`)再把两次读数**对比**;
+/// 若体内自带断言,劣化档会把"漂移"变成 panic ⇒ 第二次读数根本看不到。
+async fn coverage_run_and_report<D: DeviceClient>(
+    running: &mut RunningEngine<D>,
+) -> crate::exec::coverage::CoverageReport {
     // ── prompt 构造 ──
     // ① 底噪:伪随机词池(重复文本会让注意力质量造假峰 —— 词序按素数步
     //    长错位,同词不连排);
@@ -615,7 +617,7 @@ async fn coverage_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>
     }
     let rep = running
         .cov_last
-        .as_ref()
+        .clone()
         .expect("覆盖率探针无观测:prompt 未跨块边界 / coverage_probe 未开?");
     eprintln!("[cov] {}", rep.line());
     eprintln!("[cov] {}", running.prof.line());
@@ -627,6 +629,15 @@ async fn coverage_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>
         })
         .collect();
     eprintln!("[cov] 逐块(块号, 真实质量, 索引分): {pairs:?}");
+    rep
+}
+
+/// **B 轴覆盖率探针门**(Q-2;设计卷 §8.6):读数本体在 [`coverage_run_and_report`],
+/// 本函数只做判据 —— ①候选块**全在索引里**(边界/分析序正确)②top-k 覆盖率落在
+/// 论文量级且**显著高于随机基线** `k/块数`(约定错 ⇒ 打分退化噪声 ⇒ 贴线)。
+/// 首测定档:top-8 ≥ 0.45 且 ≥ 2× 随机(实测值见 e2e 日志)。
+async fn coverage_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>) {
+    let rep = coverage_run_and_report(running).await;
     assert!(rep.blocks >= 16, "候选块太少({})⇒ 曲线无意义(加长 prompt)", rep.blocks);
     assert_eq!(
         rep.indexed, rep.blocks,
@@ -757,12 +768,42 @@ async fn select_decode_scenario() {
         cfg.knobs.pool_tokens = Some(2048);
         cfg.max_seq_tokens = 2048;
         cfg.prefill_chunk = 512;
+        // 本场景是**单会话对照**(三臂各自一个新引擎)⇒ 并发上限取 1:
+        // 取 flavor 的 2 会让池下限 2×(38+16)=108 页 > 池 64 页 ⇒ 被 boot 拒
+        // (§8.27 的池下限算式**按并发乘**——这正是它该干的事)
+        cfg.knobs.max_active_turns = 1;
+        if mode == "partial" {
+            // §8.29 定谳:`select_partial` 靠"缓存树 + 会话双持(refs==2)"才能下沉 ⇒
+            // `prefix_cache` 必须开(关着 boot 会响亮拒;dev-08b 的 false 是
+            // "24G 贴顶省 300MB"的旧取舍,与本场景的机制门冲突)
+            cfg.knobs.prefix_cache = true;
+        }
         // 视图必须**真的丢块**才有对照意义(缺省 16 < 可用块 ~37);
-        // `OWL_COV_SELECT_BLOCKS` 可探"丢到多少才开始变"
-        // 缺省 32(= 材料化 ~67%):本场景是**机制门**(视图/部分驻留),质量门要
-        // 在材料化 ≥60% 的档位看才有意义(预算 16/48 时丢弃 28% 质量 ⇒ 输出本就该变)
-        cfg.knobs.select_blocks =
-            owl_shared::env_reader::parse::<usize>("OWL_COV_SELECT_BLOCKS").unwrap_or(32);
+        // `OWL_COV_WS_TOKENS` 可探"丢到多少才开始变"(**token 口径**,与生产配置同语言;
+        // 缺省 1216 tok = 38 页 = 保底 6 + top-k 32 ⇒ 物化 ~67%)
+        // ⚠️ 本场景是**机制门**(视图/部分驻留),质量门要在物化 ≥60% 的档位看才有意义
+        // (工作集压到 16 页档时丢弃 28% 质量 ⇒ 输出本就该变)
+        // 召回节奏:本场景 prompt ≈1.2k tok、chunk 512(16 页)⇒ 只有 512/1024 两个
+        // 页对齐边界;flavor 的 `recall_every = 4` 一次完整召回都不会发生 ⇒ 视图恒空。
+        // 机制门要的是"视图真的被走到"⇒ 每个边界都完整召回。
+        cfg.knobs.recall_every = 1;
+        // 诊断面同样钉在 0(= 最后一个边界):flavor 的 `analyze_at_ctx = 3072`
+        // 在这个短 prompt 上永远取不到,读数会空过。
+        cfg.knobs.coverage_analyze_at = 0;
+        const PAGE: usize = 32; // 0.8B 页宽(设计卷 §1 铁律②)
+        // 缺省 1152 tok = 36 页(常驻 36 块 = 保底 6 + top-k 30)⇒ 在本场景的
+        // 召回点(48 块)上物化 ≈75%(<95% 门限:确实丢了块;又 ≥60%:质量门才有意义)。
+        // 调小 ⇒ 输出本就该变(那是另一条律);调大 ⇒ 对照空过。
+        let ws_tokens = owl_shared::env_reader::parse::<usize>("OWL_COV_WS_TOKENS").unwrap_or(1152);
+        let keep = cfg.knobs.select_sink + cfg.knobs.select_recent;
+        let ws_pages = ws_tokens.div_ceil(PAGE).max(1);
+        assert!(
+            ws_pages > keep,
+            "OWL_COV_WS_TOKENS={ws_tokens} tok = {ws_pages} 页 ≤ 保底 {keep} 页 ⇒ 召回预算为 0"
+        );
+        cfg.knobs.workspace_per_req = ws_tokens;
+        // `select_blocks` = **总选中数(含保底)** = 工作集页数(装配期派生同一式)
+        cfg.knobs.select_blocks = ws_pages;
         let mut engine = Engine::new(cfg).expect("构造");
         let loaded = engine.loader().load_qwen35_0_8b(&asset_dir()).await.expect("装载");
         let mut running = engine.run(loaded).await.expect("装配");
@@ -923,6 +964,104 @@ pub async fn gpu_08b_coverage_probe() {
     let loaded = engine.loader().load_qwen35_0_8b(&asset_dir()).await.expect("装载");
     let mut running = engine.run(loaded).await.expect("装配");
     coverage_probe_scenario(&mut running).await;
+}
+
+/// **A2 门:切块不变性**(2026-10-19;设计卷 §8.30 的 F2)。
+///
+/// **判据**:同一 prompt、同一 `[kvmem].analyze_at_ctx`(边界已钉)、同一批块 ——
+/// **只改 `prefill_chunk`**,读数(逐块真实质量 / 覆盖率曲线 / top-8 重合 /
+/// 选择器覆盖)**必须一致**。
+///
+/// 为什么这是**不变量**而不是经验值:一个 token 的可视上下文只由它的**绝对位置**
+/// 决定,与"它落在第几个 chunk 里"无关 ⇒ 任何跨切块的漂移只能来自引擎/核把
+/// `ctx` 带进了本该与 `ctx` 无关的路径(A2 实测定谳 = FI plan 键抹掉了 `ctx`,
+/// 见 §8.30;修后本门转绿)。
+///
+/// 跑法:`OWL_TEST_DEVICE=1 OWL_E2E_ONLY=chunk_invariance cargo test -p owl-engine
+/// --features e2e --test engine_e2e -- --test-threads=1 --nocapture`
+pub async fn gpu_08b_chunk_invariance_gate() {
+    let Some(ordinal) = gpu_ordinal() else {
+        eprintln!("skip: OWL_TEST_DEVICE 未设(哪张卡)");
+        return;
+    };
+    // 两个切块:大档(A2 观测里一直是对的)与小档(错带内)。
+    // 两者都必须能整除 `analyze_at_ctx`(否则取不到同一条边界 ⇒ 读数不可比)。
+    const CHUNKS: [usize; 2] = [1024, 256];
+    let mut reps = Vec::new();
+    for c in CHUNKS {
+        let mut cfg = probe_engine_config(ordinal, "dev-08b");
+        cfg.prefill_chunk = c;
+        if !cfg.knobs.coverage_probe || !cfg.knobs.index_probe {
+            eprintln!(
+                "skip: 本门需 `[kvmem].coverage_probe = true` 且 `index = true`\
+                 (基档 {};见 `OWL_PROBE_FLAVOR` / `OWL_PROBE_OVERLAY`)",
+                owl_shared::env_reader::str("OWL_PROBE_FLAVOR").unwrap_or_else(|| "dev-08b".into())
+            );
+            return;
+        }
+        let at = cfg.knobs.coverage_analyze_at;
+        if at != 0 && at % c != 0 {
+            eprintln!("[chunk-inv] ⚠️ analyze_at_ctx={at} 不是 chunk {c} 的整数倍 ⇒ 取不到同一条边界");
+        }
+        let mut engine = Engine::new(cfg).expect("构造");
+        let loaded = engine.loader().load_qwen35_0_8b(&asset_dir()).await.expect("装载");
+        let mut running = engine.run(loaded).await.expect("装配");
+        let rep = coverage_run_and_report(&mut running).await;
+        reps.push((c, rep));
+    }
+    let (ca, ra) = (&reps[0].0, &reps[0].1);
+    let (cb, rb) = (&reps[1].0, &reps[1].1);
+    assert_eq!(
+        ra.ctx_tokens, rb.ctx_tokens,
+        "两次切块的观测 ctx 必须相同(把 `analyze_at_ctx` 钉在同一条边界上)"
+    );
+    assert_eq!(ra.blocks, rb.blocks, "块数必须相同(同 prompt 同 ctx)");
+    let n = ra.blocks.min(rb.blocks).min(ra.mass.len()).min(rb.mass.len());
+    let worst = (0..n)
+        .map(|i| (i, (ra.mass[i] - rb.mass[i]).abs()))
+        .fold((0usize, 0.0f32), |acc, x| if x.1 > acc.1 { x } else { acc });
+    let curve_d = ra
+        .curve
+        .iter()
+        .zip(rb.curve.iter())
+        .map(|((k1, v1), (k2, v2))| {
+            assert_eq!(k1, k2, "曲线档必须同序");
+            (v1 - v2).abs()
+        })
+        .fold(0.0f64, f64::max);
+    let cov_d = (ra.recall.coverage - rb.recall.coverage).abs();
+    eprintln!(
+        "[chunk-inv] chunk {ca} vs {cb}: ctx={} 块={n} · **max|Δmass|={:.4}**(块 {}) ·\
+         max|Δcurve|={curve_d:.4} · top8 重合 {} vs {} · 选择器覆盖 {:.4} vs {:.4}(Δ={cov_d:.4})",
+        ra.ctx_tokens, worst.1, worst.0, ra.overlap8, rb.overlap8, ra.recall.coverage, rb.recall.coverage
+    );
+    // 失败时要能一眼看出"漂在哪些块上"(定谳靠这段,不靠重跑)
+    let mut shown = 0usize;
+    let mut drifted = 0usize;
+    for i in 0..n {
+        let d = (ra.mass[i] - rb.mass[i]).abs();
+        if d > 1e-3 {
+            drifted += 1;
+            if shown < 8 {
+                shown += 1;
+                eprintln!(
+                    "[chunk-inv] ✗ 块 {i}: 真实质量 {:.4}(chunk {ca}) vs {:.4}(chunk {cb}) · 索引分 {:.3} vs {:.3}",
+                    ra.mass[i], rb.mass[i], ra.scores[i], rb.scores[i]
+                );
+            }
+        }
+    }
+    eprintln!("[chunk-inv] 漂移块数 = {drifted}/{n}(门限 1e-3;仅列前 8)");
+    assert!(
+        worst.1 <= 2e-3,
+        "切块不变性失守:块 {} 的真实质量差 {:.4}(chunk {ca} vs {cb})⇒ 读数不可比(§8.30)",
+        worst.0,
+        worst.1
+    );
+    assert!(curve_d <= 2e-3, "切块不变性失守:覆盖率曲线差 {curve_d:.4}(§8.30)");
+    assert_eq!(ra.overlap8, rb.overlap8, "切块不变性失守:top-8 重合数不同(§8.30)");
+    assert!(cov_d <= 2e-3, "切块不变性失守:选择器覆盖差 {cov_d:.4}(§8.30)");
+    eprintln!("[chunk-inv] 门过:chunk {ca} 与 {cb} 读数一致 ⇒ 切块不变量成立");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
