@@ -65,13 +65,49 @@ decode 已落刀:③④ 小核治理(−1.41ms/步,已验)
 
 ## 3. 刀(P0 → P3;每刀自带判据/量法/预期/回退)
 
-### P0 补测量缺口(便宜;每件 ≤ 1 小时,不动生产代码)
+### P0 补测量缺口 + **上主干对账**(便宜;每件 ≤ 1 小时,不动生产代码)
 
 | 刀 | 做什么 | 判据/量法 | 预期 |
 |---|---|---|---|
+| **P0.0** | **RankDev × 主线骶架对账(TP 上主干的前置)**—— 见下方专节 | 28 文件 / 94 冲突块的干跑已做;验收 = 构建 + 五道门 + 排名词复现 | TP 上主干 |
 | **P0.1** | **prefill 逐核账**:用现成 nsys 工具,把 cfg 换成"只跑 prefill"(长 prompt、出 1 token),给出 prefill 的核表 | `tools/nsys-decode-account.sh`(需小改:按"prefill 段"切,或直接看 `graphId=null` 的 eager 段)| 决定 P1.4 该砍谁 |
-| **P0.2** | **W4A8 A/B**:`[model] w4a8 = true`(白名单已含三件套;**owl 从没量过**)| std A/B(§1);数值面过 `tp_g8_gate` L1 + golden 容差 | xinfer 同卡同族 **prefill +19~49%** |
+| **P0.2** | **W4A8 A/B** —— ⚠️ **上游已量**(见 P0.0 第③条:`model.quant = "w4a8"`,单卡 3090 Ti **prefill +48~50%**)| TP 下复测(主线已建`quant_plan_of` 唯一映射点)| 若在 TP 下也成立 ⇒ **比 AR 更大的 prefill 杠杆** |
 | **P0.3** | **host 尾巴 2.1ms 定谳**:`[probes] step_profile = true` + 在 `phases.rs` 的采样收口段加临时计时(记了要拆)| 每步 `fill+launch` vs 尾巴的分布 | 上限 **decode +10%** |
+
+#### P0.0 详案:RankDev × 主线骶架对账(2026-10-19 立案;干跑已做)
+
+**背景**:`feat/w4a8-p1` 与 `main` 的分叉点 `fc2737db` 之后,主线走了 **80 刀**(store 状态存储 /
+`#[owl_test]` 宏 / prefill 宿主税 / **`model.quant` 方案枚举** / 显式 Result 上抛 / piecewise 退役 /
+B 轴覆盖率与选择层)。干跑合并 = **28 文件 / 94 冲突块**,其中三处是**结构性**的(不是文本冲突):
+
+| # | 面 | 我方(TP 分支)| 主线 | 对账动作 |
+|---|---|---|---|---|
+| 1 | **每 rank 状态** | `RunningEngine { dev: RankDev<D>, peer: Option<RankDev<D>> }`(**TP 镜像设计的地基**)| 平铺 `pool/graphs/spec/env/model/rope` + **新增 9 个字段**(`cov_pending/cov_last/sel_view/select_view_steps/sel_view_fallback/stage/partial/prof/sel_keep`)| 主线的 9 个字段**收进 `RankDev`**;全仓 `self.pool/graphs/spec/env/model/rope` **≈274 处**重指 `self.dev.*`(按文件:`exec/prefill_chunk.rs` 83 · `exec/draft.rs` 68 · `exec/spec.rs` 33 · `exec/phases.rs` 29 · `scheduler.rs` 13 · `running.rs` 10 · `interpreters/eval.rs` 4 · `graph_plan.rs` 4 · `engine.rs` 4 · `backends/cpu/face.rs` 2)|
+| 2 | **快照 API** | `RankDev::snap_dev(gdn_slot, key)` | **`capture_gdn_snap(sid, fed)`**(按 sid/fed 算 —— **语义不同**,不是纯改名)| 我方 4 处调用点(`exec/phases.rs` 块边界/跳页)改签名;删我方旧定义 |
+| 3 | **量化档** | `model.w4a8: bool` | **`model.quant: QuantScheme`**(`w4a16`/`w4a8`) | 采用枚举、删 bool;`engine::quant_plan_of` 是唯一映射点(主线已建)|
+
+**另两条"换风"要跟着走**(散在 21 个待解文件里):
+- **显式 Result 上抛**(主线裁决,panic 面 115→19):`.expect("active")` →
+  `ok_or_else(|| ModelError::EngineInvariant { what: .. })?` —— 我方新代码(tp/phases/prefill_chunk/spec/draft)
+  内所有 `expect/unwrap` 按此收口;
+- **store 块腿迁移**:`bank.blocks_m.cache_seq(..)` → `bank.rel.leg.register_chain(..)`(返回 up/evicted 账),
+  以及主线新的池/图访问面。
+
+**验收(与主线自己的大重构同级)**:
+① `cargo build --release --bin server` + `cargo test -p owl-kernels --lib`(**全特性跑法**);
+② 五道门复跑:`tp_g8_gate`(**L1 = 0 项不同**)· `tp_determinism_gate` · `tp_transport_bits_gate` ·
+   `tp_assemble_gate` · `ar_*`;
+③ **排名词复现**:TP1 973.7 / 33.6 · TP2 1489.5 / 45.1(±噪声);
+④ 顺带验收 **`model.quant = "w4a8"` 在 TP2 下的 prefill**(主线单卡实测 +48~50%)—— 若成立,
+   它比 AR 那 18.3% 大得多;
+⑤ 入档:实录卷新 §N + 施工设计 §10 + 本路线图 §7 勾选。
+
+**已完成的前期工作(重做很快)**:干跑时已解过八个文件的冲突并过 `cargo check -p owl-shared`:
+`Cargo.toml`(取主线:删 `crates/graph`、加 `crates/store`)· `engine/Cargo.toml`(取主线:
+`owl-store`/`owl-cpu`)· `charter.md`(我方:`comm` 已并入 `cuda/src/comm`)· `sampler.rs`(取主线)·
+`exec/turn_end.rs`(取主线:store 块腿迁移)· `models/kernel.rs`(**两边都要**)·
+`kernels/client/mod.rs`(**两边都要**:视觉塔 ragged 锁表)· `shared/device.rs`(**两边都要**:
+BAR1 详查 + `test_device_bdf`;注意 git 会把我方函数的闭合括号当**公共行**)。
 
 ### P1 账已钉死的刀(收益确定;按值排序)
 
@@ -156,8 +192,9 @@ decode 已落刀:③④ 小核治理(−1.41ms/步,已验)
 | 刀 | 状态 | 读数(实测)| 门 | 入档 |
 |---|---|---|---|---|
 | ③④ 小核治理 | ✅ 已落(2026-10-19)| decode 42.1→**45.07**;设备 −1412µs/步 | 全绿 | §58.10 |
+| P0.0 RankDev × 主线骶架对账 | ☐ **立案**(2026-10-19;干跑已做,细案见 §3 P0.0) | 28 文件 / 94 冲突块 · 三处结构性 | | |
 | P0.1 prefill 逐核账 | ☐ 待做 | | | |
-| P0.2 W4A8 A/B | ☐ 待做 | | | |
+| P0.2 W4A8 A/B | ⚠️ **上游已量**(main:`QuantScheme::W4a8`,单卡 3090 Ti prefill **+48~50%**/TTFT −33%/decode 不变;代价 = 装载 +14.5s + 质量门 S3 待过) ⇒ 本刀改为**在 TP2 下复测** | | | |
 | P0.3 host 尾巴定谳 | ☐ 待做 | | | |
 | P1.1 lm_head 词表切 | ☐ 待做 | | | |
 | P1.2 AR 同步面瘦身 | ☐ 待做 | | | |
