@@ -276,13 +276,19 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 hist.push(tok); // 已发出的 token 进惩罚集(与逐 token 解码同语义)
             }
             let m = spec_sampled_accept_prefix(&drafts, &s[..depth]);
-            mcnt("spec.sample.rounds", 1);
-            mcnt("spec.sample.accepted", m as u64);
             (m, s[..=m].to_vec(), s[m])
         } else {
+            // **argmax/greedy 路**:直接拿 verify 行的 ids 比(drafts[i] == ids[i])
             let m = (0..depth).take_while(|&i| drafts[i] == ids[i]).count();
             (m, ids[..=m].to_vec(), ids[m])
         };
+        // **AL 计数提到分支外**(2026-10-19 修):两条路(采样/argmax)都要记 ——
+        // 旧形只挂在采样路 ⇒ `mode = "greedy"` 档的 AL **在仪表上恒为 1.00**
+        // (实测:greedy 跑 22 轮出 64 tok = 真 AL≈2.9,而计数器读 0 ⇒ 判读被带偏;
+        //  引擎行为无错,错的是仪表)。语义 = 每轮接受数;降级态机读的是
+        // `spec.recent_*`(与本计数无关,不受影响)。
+        mcnt("spec.sample.rounds", 1);
+        mcnt("spec.sample.accepted", m as u64);
         // B4 自适应降级态机(§6.24;DFlash2 专属 —— 同步机制走 dflash encode)
         // 2026-10-12 深夜重放 + 滚动 AL 窗口:连击 streak 会被"偶发 m=1"
         // 破解(随机域 AL≈1.1 时 9.3 t/s 案),窗口均值 < 盈亏线即降级
