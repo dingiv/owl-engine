@@ -42,6 +42,11 @@ pub enum EngineReq {
         chat_wrap: bool,
         reply: tokio::sync::oneshot::Sender<Result<owl_engine::TokenizeReply, String>>,
     },
+    /// **store 账查询旁路**(`GET /debug/vram`;第 0 刀):不落 turn、不碰设备。
+    /// 应答 = 三层账 + **owner 维明细**(谁占着多少 —— 泄漏判据面)。
+    VramReport {
+        reply: tokio::sync::oneshot::Sender<owl_store::StoreReport>,
+    },
 }
 
 /// 事件投递(律 #1:不许静默丢弃可失败返回值)。
@@ -260,6 +265,12 @@ async fn handle_req<D: DeviceClient>(
             if reply.send(out).is_err() {
                 // 请求方已断开(不许静默:这是可失败返回值)
                 owl_shared::log_debug!("actor", "tokenize 应答投递失败(请求方已断开)");
+            }
+        }
+        EngineReq::VramReport { reply } => {
+            // 纯读账(store_report 是 &self 的只读投影)⇒ 零副作用、零搬运
+            if reply.send(running.store_report()).is_err() {
+                owl_shared::log_debug!("actor", "vram 账应答投递失败(请求方已断开)");
             }
         }
         req => accept(running, sinks, req).await,

@@ -315,7 +315,7 @@ mod tests {
         let mut gpu = crate::testkit::gpu_client().await;
         eprintln!("[probe] booted");
         let elems = 1 << 20; // 1M f32 = 4MB
-        let b = owl_iface::alloc!(gpu, Dtype::F32, elems)
+        let b = owl_iface::client_alloc!(gpu, Dtype::F32, elems)
             .await
             .expect("alloc");
         eprintln!("[probe] block {} alloc'd", b.id);

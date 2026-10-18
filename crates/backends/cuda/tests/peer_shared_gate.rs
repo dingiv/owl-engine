@@ -192,7 +192,7 @@ async fn peer_shared_gate() {
         a.peer_release(vec![pb.id]).await.is_err(),
         "重复释放应响亮拒(DeadBlock),不许静默 Ok"
     );
-    let plain = owl_iface::alloc!(a, Dtype::F32, 4).await.expect("alloc plain");
+    let plain = owl_iface::client_alloc!(a, Dtype::F32, 4).await.expect("alloc plain");
     let e_plain = a
         .peer_release(vec![plain.id])
         .await

@@ -2595,7 +2595,7 @@ mod owl_port_tests {
         let sh = crate::contract::Shape::from(vec![n]);
         let dg = owl_iface::htod!(gpu, Dtype::F16, &sh, &gate.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>()).await.expect("gate");
         let dxx = owl_iface::htod!(gpu, Dtype::F16, &sh, &x.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>()).await.expect("x");
-        let _dout = owl_iface::alloc!(gpu, Dtype::F16, n).await.expect("alloc");
+        let _dout = owl_iface::client_alloc!(gpu, Dtype::F16, n).await.expect("alloc");
         let g_decl = TensorOps::of_block(dg.id, Dtype::F16, vec![n]);
         let x_decl = TensorOps::of_block(dxx.id, Dtype::F16, vec![n]);
         let decl = TensorOps::call(SemanticKernel::GateMul)
@@ -2815,8 +2815,8 @@ mod naive_attn_f16_tests {
         let _dq = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![2, hq, hd]), &hb(&q)).await.unwrap();
         let _dk = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![2, hkv, hd]), &hb(&k)).await.unwrap();
         let _dv = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![2, hkv, hd]), &hb(&v)).await.unwrap();
-        let kc = owl_iface::alloc!(gpu, Dtype::F16, slots_n * hkv * hd).await.unwrap();
-        let vc = owl_iface::alloc!(gpu, Dtype::F16, slots_n * hkv * hd).await.unwrap();
+        let kc = owl_iface::client_alloc!(gpu, Dtype::F16, slots_n * hkv * hd).await.unwrap();
+        let vc = owl_iface::client_alloc!(gpu, Dtype::F16, slots_n * hkv * hd).await.unwrap();
 
         // 两步:token0(slot0,win[0,0]) → token1(slot1,win[0,1])
         let mut outs = Vec::new();

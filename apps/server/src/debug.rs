@@ -227,3 +227,84 @@ pub fn blocks_json(rows: &[owl_cuda::BlockLedgerRow]) -> Value {
         "blocks": blocks,
     })
 }
+
+// ============================================================================
+// `/debug/vram` —— store 三层账 + **owner 维明细**(第 0 刀)
+// ============================================================================
+
+/// store 报告 → JSON(纯投影,零决策)。
+///
+/// **判据面**:`owners[]` 里同一 owner 的 `bytes` 逐轮**单调爬坡 = 泄漏**;
+/// 持平 = 正常。`system` 桶 = 尚未接线 owner 的存量调用点(随 N4/N5 排空)。
+pub fn vram_json(r: &owl_store::StoreReport) -> Value {
+    let owners: Vec<Value> = r
+        .tiers
+        .owners
+        .iter()
+        .map(|o| {
+            json!({
+                "owner": o.owner.label(),
+                "lifecycle": o.owner.is_lifecycle(),
+                "tier": format!("{:?}", o.tier),
+                "kind": format!("{:?}", o.kind),
+                "bytes": o.bytes,
+                "mib": (o.bytes as f64) / (1024.0 * 1024.0),
+                "entries": o.entries,
+            })
+        })
+        .collect();
+    let cells: Vec<Value> = r
+        .tiers
+        .rows
+        .iter()
+        .map(|c| {
+            json!({
+                "tier": format!("{:?}", c.tier),
+                "kind": format!("{:?}", c.kind),
+                "bytes": c.bytes,
+                "entries": c.entries,
+            })
+        })
+        .collect();
+    json!({
+        "tiers": {
+            "gpu_used": r.tiers.gpu_used,
+            "host_used": r.tiers.host_used,
+            "disk_used": r.tiers.disk_used,
+            "host_cap": r.tiers.host_cap,
+            "disk_cap": r.tiers.disk_cap,
+            "cells": cells,
+        },
+        "owners": owners,
+        "kv": {
+            "slots_total": r.kv.slots_total,
+            "slots_free": r.kv.slots_free,
+            "cached_blocks": r.kv.cached_blocks,
+            "host_blocks": r.kv.host_blocks,
+            "gpu_bytes": r.kv.gpu_bytes,
+            "hits": r.kv.hits,
+            "misses": r.kv.misses,
+            "evicted": r.kv.evicted,
+        },
+        "state": {
+            "rows_total": r.state.rows_total,
+            "rows_free": r.state.rows_free,
+            "snaps": r.state.snaps,
+            "snap_bytes": r.state.snap_bytes,
+            "snap_gpu": r.state.snap_gpu,
+            "snap_host": r.state.snap_host,
+            "hits": r.state.hits,
+            "misses": r.state.misses,
+        },
+        "faces": {
+            "active_turns": r.active_turns,
+            "reserved_bytes": r.reserved_bytes,
+            "session_held_bytes": r.session_held_bytes,
+            "elastic_bytes": r.elastic_bytes,
+            "cache_bytes": r.cache_bytes,
+            "host_resident_bytes": r.host_resident_bytes,
+            "host_free_bytes": r.host_free_bytes,
+            "policy": r.policy,
+        },
+    })
+}

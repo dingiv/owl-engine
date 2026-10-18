@@ -35,8 +35,11 @@ use std::future::Future;
 // - 生产代码**仍写语义名**(核名/层名/键名)—— 位置名对"谁占着"没有信息量;
 // - 本宏供**测试/探针/example** 使用(它们的诊断口径就是"哪一行");
 // - 两条路都落进同一个 `BlockEntry.name`,口径不分裂。
+/// 裸 client 的分配宏(**3 参**:位置名自动填)。名字原为 `alloc!`,
+/// 2026-10-19 让位给 [`crate::alloc!`](DeviceHandle 形式,带 class/语义名/归属)——
+/// 本宏改名 `client_alloc!`(调用点见 cuda 的 tests/probes)。
 #[macro_export]
-macro_rules! alloc {
+macro_rules! client_alloc {
     ($f:expr, $dtype:expr, $elems:expr) => {
         $f.alloc($dtype, $elems, concat!("alloc@", file!(), ":", line!(), ":", column!()))
     };

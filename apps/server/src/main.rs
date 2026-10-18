@@ -823,6 +823,26 @@ async fn handle(
             v["action"] = json!(msg);
             http::respond_json(&mut stream, 200, &v).await?;
         }
+        // **store 账查询面**(第 0 刀;`/debug/vram`):三层账 + **owner 维明细**。
+        // 纯读账(零副作用、零搬运)—— 泄漏判据面:同一 owner 字节逐轮爬坡 = 漏。
+        ("GET", "/debug/vram") => {
+            let (rtx, rrx) = tokio::sync::oneshot::channel();
+            if ctx.tx.clone().send(EngineReq::VramReport { reply: rtx }).await.is_err() {
+                http::respond_json(&mut stream, 503, &openai::error_json("引擎退役")).await?;
+                return Ok(());
+            }
+            match rrx.await {
+                Ok(rep) => http::respond_json(&mut stream, 200, &debug::vram_json(&rep)).await?,
+                Err(_) => {
+                    http::respond_json(
+                        &mut stream,
+                        503,
+                        &openai::error_json("引擎连接中断(vram 账应答通道关闭)"),
+                    )
+                    .await?
+                }
+            }
+        }
         // **块账本投影**(判"同 id 两地址 / 两活块区间相交";与发射账互补:
         // 那张账 = 每次命令的块 id+地址,本投影 = 当前账本的权威快照)
         ("GET", "/debug/blocks") => {

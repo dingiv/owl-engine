@@ -152,8 +152,11 @@ pub struct Rel {
     /// **选择层检索索引**(B 轴:Mean-K 块级索引;host 驻留 —— 论文同款)。
     /// 几何由 engine 在 boot 注册([`Rel::attach_index`])。
     pub index: Option<crate::select::MeanKIndex>,
-    /// 语义账(状态腿快照/行 + 保留面/弹性面;KV 块面不在此重复记)。
-    pub ledger: TierLedger,
+    /// 语义账(状态腿快照/行 + 保留面/弹性面 + **DeviceHandle 事件账**)。
+    ///
+    /// `Rc<RefCell<..>>`(2026-10-19 步 2):DeviceHandle 侧的钩子要**与 store 看同一本账**
+    /// (方案甲)⇒ 共享所有权;引擎单线程 ⇒ 无锁。store 自己的读写走 `borrow()/borrow_mut()`。
+    pub ledger: std::rc::Rc<std::cell::RefCell<TierLedger>>,
     /// 准入策略(boot 装配)。
     pub policy: AdmissionPolicy,
     /// 活跃 turn 在飞账。
@@ -206,7 +209,7 @@ impl Rel {
             )));
         }
         let budget = VramBudget::decompose(inputs, policy.gdn_slots)?;
-        let ledger = TierLedger::new(budget.tier_budget());
+        let ledger = std::rc::Rc::new(std::cell::RefCell::new(TierLedger::new(budget.tier_budget())));
         let state = StateStore::new(policy.gdn_slots, inputs.gdn_row_bytes);
         // 状态腿宿主层:预算 = store host 总量 − KV 腿分片(负数 = 装配错,响亮拒)
         let snap_host_bytes = inputs.host_bytes.checked_sub(kv_cfg.host_bytes).ok_or_else(|| {
@@ -264,7 +267,8 @@ impl Rel {
             .ok_or_else(|| StoreError::Invariant("选择层索引未注册(engine 应在 boot 调 attach_index)".into()))?;
         let bytes = ix.block_bytes();
         ix.register(block, entries)?;
-        self.ledger.add(Tier::Host, AssetKind::Index, bytes)
+        // 第 0 刀:索引面 = **缓存归属**(无单会话归属;跨会话共享)
+        self.ledger.borrow_mut().add_owned(crate::tier::Owner::Cache, Tier::Host, AssetKind::Index, bytes)
     }
 
     /// 丢一块的索引(出账)。
@@ -275,7 +279,7 @@ impl Rel {
             .ok_or_else(|| StoreError::Invariant("选择层索引未注册".into()))?;
         let bytes = ix.block_bytes();
         ix.drop_block(block)?;
-        self.ledger.remove(Tier::Host, AssetKind::Index, bytes)
+        self.ledger.borrow_mut().remove_owned(crate::tier::Owner::Cache, Tier::Host, AssetKind::Index, bytes)
     }
 
     /// 索引总字节(0 = 未注册)。
@@ -595,8 +599,27 @@ impl Rel {
     /// KV 块面从**腿**报出(单一真源),`tiers` 只列 store 自管面
     /// (状态腿/保留面/弹性面)—— 同一字节不两处记(§13.1/§23.1)。
     pub fn report(&self) -> StoreReport {
+        // **第 0.5 刀:腿自报 → owner 行(对账式记账)**
+        //
+        // 为什么先"对账"而不是"事件记账":引擎有几十处直接 poke 腿
+        // (`bank.rel.leg.*` / `bank.rel.state.*`),事件记账要逐个接线(后续);
+        // 而对账在**报告时刻**取腿的权威状态 ⇒ 零漏记风险(腿是唯一真源),
+        // 已能回答"谁占着多少"与"逐轮是否爬坡"(泄漏判据)。
+        // 事件式记账的收益 = 精确区分"仍被持有"vs"未归还",留作接线后的第二步。
+        let mut tiers = self.ledger.borrow().report();
+        let legs = self.leg_accounting();
+        for row in &legs.owners {
+            tiers.rows.push(crate::tier::TierRow {
+                tier: row.tier,
+                kind: row.kind,
+                bytes: row.bytes,
+                entries: row.entries,
+            });
+        }
+        tiers.owners.extend(legs.owners);
+        tiers.owners.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.owner.cmp(&b.owner)));
         StoreReport {
-            tiers: self.ledger.report(),
+            tiers,
             kv: self.leg.kv_stats(),
             state: self.state.stats(),
             active_turns: self.admission.active_turns(),
@@ -608,6 +631,54 @@ impl Rel {
             host_resident_bytes: self.leg.host_used_bytes(),
             host_free_bytes: self.leg.host_free_bytes(),
         }
+    }
+
+    /// **腿自报 → owner 行**(第 0.5 刀;对账式记账的原料)。
+    ///
+    /// 归属规则(有意保守,不猜):
+    /// - KV 块(设备/宿主)= `Cache`(跨会话共享,无单会话归属);
+    /// - 快照(设备/宿主)= `Cache`(Durable 可下沉 / Transient 逐出即丢,都是缓存面);
+    /// - GDN 行 = `System`(逐会话归属需引擎的会话表;接线后再细化,不猜)。
+    fn leg_accounting(&self) -> crate::tier::TierReport {
+        let mut owners: Vec<crate::tier::OwnerRow> = Vec::new();
+        let mut rows: Vec<crate::tier::TierRow> = Vec::new();
+        let push = |owners: &mut Vec<crate::tier::OwnerRow>,
+                    rows: &mut Vec<crate::tier::TierRow>,
+                    owner: crate::tier::Owner,
+                    tier: Tier,
+                    kind: AssetKind,
+                    bytes: usize,
+                    entries: usize| {
+            if bytes == 0 {
+                return;
+            }
+            owners.push(crate::tier::OwnerRow { owner, tier, kind, bytes, entries });
+            rows.push(crate::tier::TierRow { tier, kind, bytes, entries });
+        };
+        // ① KV 腿:设备驻留(gpu_bytes)+ 宿主驻留(host_used_bytes)
+        let kv = self.leg.kv_stats();
+        let kv_dev_entries = kv.cached_blocks.saturating_sub(kv.host_blocks);
+        push(&mut owners, &mut rows, crate::tier::Owner::Cache, Tier::Gpu,
+             AssetKind::KvBlock, kv.gpu_bytes, kv_dev_entries);
+        push(&mut owners, &mut rows, crate::tier::Owner::Cache, Tier::Host,
+             AssetKind::KvBlock, self.leg.host_used_bytes(), kv.host_blocks);
+        // ② 状态腿:快照(设备/宿主)+ 行
+        let st = self.state.stats();
+        push(&mut owners, &mut rows, crate::tier::Owner::Cache, Tier::Gpu,
+             AssetKind::Snap, st.snap_gpu.1, st.snap_gpu.0);
+        push(&mut owners, &mut rows, crate::tier::Owner::Cache, Tier::Host,
+             AssetKind::Snap, st.snap_host.1, st.snap_host.0);
+        let rows_in_use = st.rows_total.saturating_sub(st.rows_free);
+        push(&mut owners, &mut rows, crate::tier::Owner::System, Tier::Gpu,
+             AssetKind::Row, rows_in_use * self.state.row_bytes(), rows_in_use);
+        crate::tier::TierReport { rows, owners, ..Default::default() }
+    }
+
+    /// **账本句柄**(给 `DeviceHandle` 的钩子用;与 `self.ledger` **同一本账**)。
+    ///
+    /// 用途(boot 接线):`DeviceHandle::new(client, Some(Rc::new(RefCell::new(rel.ledger_handle()))))`。
+    pub fn ledger_handle(&self) -> crate::tier::LedgerHandle {
+        crate::tier::LedgerHandle::new(self.ledger.clone())
     }
 
     /// 腿报告(KV 腿的完整面:槽/缓存/宿主/搬运计数 —— 报告与对账口用)。

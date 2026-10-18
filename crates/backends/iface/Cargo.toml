@@ -8,3 +8,11 @@ description = "Backend HAL: unified GPU backend contract (memory/phase/stats); u
 [dependencies]
 owl-kernels = { path = "../../kernels" }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# 测试运行时(DeviceHandle 的 exec/batch 是 async)
+tokio = { version = "1", features = ["macros", "rt"] }
+# ⚠️ 不引 owl-cpu 作 dev-dep:dev-dep 成环会让本 crate **编译两份**
+# ⇒ `CpuFace` 实现的是另一实例的 `DeviceClient`(trait 不通用)。
+# 行为测试(exec/batch/钩子)因此放在 `crates/backends/cpu/tests/device_handle.rs`
+# (那里 owl-iface 是普通依赖,同一实例)。

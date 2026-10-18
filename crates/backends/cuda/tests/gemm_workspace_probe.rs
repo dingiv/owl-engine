@@ -49,9 +49,9 @@ async fn gemm_workspace_footprint() {
 
     // 首个 gemm(触发 handle 创建 + workspace)
     let (t, k, n) = (8usize, 4096usize, 11008usize);
-    let a = owl_iface::alloc!(client, Dtype::F16, t * k).await.unwrap();
-    let w = owl_iface::alloc!(client, Dtype::F16, n * k).await.unwrap();
-    let o = owl_iface::alloc!(client, Dtype::F16, t * n).await.unwrap();
+    let a = owl_iface::client_alloc!(client, Dtype::F16, t * k).await.unwrap();
+    let w = owl_iface::client_alloc!(client, Dtype::F16, n * k).await.unwrap();
+    let o = owl_iface::client_alloc!(client, Dtype::F16, t * n).await.unwrap();
     let _ = (base, &a, &w, &o);
     let after_alloc = vram_used_mib();
     client.launch(gemm_launch(&a, &w, &o, n, k, t, true)).await.expect("gemm 1");
@@ -59,7 +59,7 @@ async fn gemm_workspace_footprint() {
     let after_gemm1 = vram_used_mib();
 
     // 换形状(触发算法重选)
-    let o2 = owl_iface::alloc!(client, Dtype::F16, 512 * n).await.unwrap();
+    let o2 = owl_iface::client_alloc!(client, Dtype::F16, 512 * n).await.unwrap();
     client.launch(gemm_launch(&a, &w, &o2, n, k, 512, true)).await.expect("gemm 2");
     client.sync().await.unwrap();
     let after_gemm2 = vram_used_mib();

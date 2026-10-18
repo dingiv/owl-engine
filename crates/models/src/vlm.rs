@@ -980,7 +980,7 @@ mod tests {
         for (i, c) in big.chunks_exact_mut(4096).enumerate() {
             c.fill((i & 0xff) as u8);
         }
-        let blk = owl_iface::alloc!(gpu, Dtype::F16, n_big).await.expect("1GB 设备块");
+        let blk = owl_iface::client_alloc!(gpu, Dtype::F16, n_big).await.expect("1GB 设备块");
         // 单发 1GB(分块 128MB)+ 尾 sync
         for reps in [1usize, 3] {
             let t0 = std::time::Instant::now();
@@ -1004,7 +1004,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         let mut futs = Vec::new();
         for (fi, mut f) in faces.into_iter().enumerate() {
-            let blk = owl_iface::alloc!(f, Dtype::F16, per).await.expect("分块");
+            let blk = owl_iface::client_alloc!(f, Dtype::F16, per).await.expect("分块");
             let src = big[..per * 2].to_vec();
             futs.push(async move {
                 let mut off = 0usize;

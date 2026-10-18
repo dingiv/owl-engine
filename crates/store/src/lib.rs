@@ -75,4 +75,6 @@ pub use select::{
     SelectBudget, ViewPlan,
 };
 pub use state::{SnapDurability, StateStore};
-pub use tier::{AssetKind, Tier, TierBudget, TierLedger, TierReport};
+pub use tier::{
+    AssetKind, LedgerHandle, Owner, OwnerRow, Tier, TierBudget, TierLedger, TierReport,
+};

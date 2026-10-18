@@ -66,15 +66,15 @@ async fn composites_hold_stream_order_and_closed_set_validation() {
     let a = owl_iface::htod!(c, Dtype::F32, &Shape::from(vec![n]), &le_f32(&av))
         .await
         .expect("htod A");
-    let b = owl_iface::alloc!(c, Dtype::F32, n)
+    let b = owl_iface::client_alloc!(c, Dtype::F32, n)
         .await
         .expect("alloc B")
         .view(Dtype::F32, 1);
-    let out1 = owl_iface::alloc!(c, Dtype::F32, n)
+    let out1 = owl_iface::client_alloc!(c, Dtype::F32, n)
         .await
         .expect("alloc out1")
         .view(Dtype::F32, 1);
-    let out2 = owl_iface::alloc!(c, Dtype::F32, n)
+    let out2 = owl_iface::client_alloc!(c, Dtype::F32, n)
         .await
         .expect("alloc out2")
         .view(Dtype::F32, 1);
@@ -155,11 +155,11 @@ async fn composites_are_rejected_during_capture() {
     let a = owl_iface::htod!(c, Dtype::F32, &Shape::from(vec![n]), &le_f32(&vec![1.0f32; n]))
         .await
         .expect("htod A");
-    let b = owl_iface::alloc!(c, Dtype::F32, n)
+    let b = owl_iface::client_alloc!(c, Dtype::F32, n)
         .await
         .expect("alloc B")
         .view(Dtype::F32, 1);
-    let out = owl_iface::alloc!(c, Dtype::F32, n)
+    let out = owl_iface::client_alloc!(c, Dtype::F32, n)
         .await
         .expect("alloc out")
         .view(Dtype::F32, 1);
@@ -211,8 +211,8 @@ async fn block_ledger_is_clean() {
     let a = owl_iface::htod!(c, Dtype::F32, &Shape::from(vec![n]), &le_f32(&vec![1.0f32; n]))
         .await
         .expect("htod");
-    let b = owl_iface::alloc!(c, Dtype::F32, n).await.expect("alloc").view(Dtype::F32, 1);
-    let big = owl_iface::alloc!(c, Dtype::F32, n * 64)
+    let b = owl_iface::client_alloc!(c, Dtype::F32, n).await.expect("alloc").view(Dtype::F32, 1);
+    let big = owl_iface::client_alloc!(c, Dtype::F32, n * 64)
         .await
         .expect("alloc big")
         .view(Dtype::F32, 1);
