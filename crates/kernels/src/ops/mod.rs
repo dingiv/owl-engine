@@ -42,6 +42,7 @@ pub mod fused;
 pub mod gdn;
 pub mod gdn_chunked;
 pub mod gdn_scalar;
+pub mod comm;
 pub mod ln;
 pub mod load;
 pub mod marlin;
@@ -55,6 +56,7 @@ pub static TABLES: &[&[&KernelMeta]] = &[
     gdn::METAS,
     gdn_chunked::METAS,
     gdn_scalar::METAS,
+    comm::METAS,
     elems::METAS,
     fused::METAS,
     ln::METAS,
@@ -671,6 +673,14 @@ mod tests {
             // prefill 臂:与 verify/decode **同一张 PARAMS 表**(同资产同槽序;
             // 差别只在 host 侧几何 ⇒ 不在这张表的表达面内)
             (crate::family::xqa::PREFILL_XQA, &["q", "k_cache", "v_cache", "page_table", "seq_lens", "mask", "semaphores", "scratch", "wr", "out", "q_seq_len", "hkv", "hd", "page", "max_seq_len", "q_scale_bits", "sm_count", "stride_page", "stride_token", "stride_head"], &["F16x2", "U32x1", "U32x1", "F32x2", "F32x2", "F32x0", "F32x2", "F16x1", "F16x0", "F16x2", "U64", "U64", "U64", "U64", "U64", "F32Bits", "U64", "U64", "U64", "U64"]),
+            // 通信族(TP2 S2;零门 ⇒ 无条件入锁):stage / reduce 各三 dtype。
+            // payload 槽 rank 0(阶数无关:AR 挂任意算子输出);staging 两槽 = U8 字节块。
+            (crate::family::comm::asset::STAGE_F16, &["local", "own", "peer", "bytes", "slot_bytes", "slab_off"], &["F16x0", "U8x1", "U8x1", "U64", "U64", "U64"]),
+            (crate::family::comm::asset::STAGE_BF16, &["local", "own", "peer", "bytes", "slot_bytes", "slab_off"], &["BF16x0", "U8x1", "U8x1", "U64", "U64", "U64"]),
+            (crate::family::comm::asset::STAGE_F32, &["local", "own", "peer", "bytes", "slot_bytes", "slab_off"], &["F32x0", "U8x1", "U8x1", "U64", "U64", "U64"]),
+            (crate::family::comm::asset::REDUCE_F16, &["out", "own", "peer", "bytes", "slot_bytes", "slab_off"], &["F16x0", "U8x1", "U8x1", "U64", "U64", "U64"]),
+            (crate::family::comm::asset::REDUCE_BF16, &["out", "own", "peer", "bytes", "slot_bytes", "slab_off"], &["BF16x0", "U8x1", "U8x1", "U64", "U64", "U64"]),
+            (crate::family::comm::asset::REDUCE_F32, &["out", "own", "peer", "bytes", "slot_bytes", "slab_off"], &["F32x0", "U8x1", "U8x1", "U64", "U64", "U64"]),
         ];
         for (entry, want, want_ty) in EXPECT {
             let m = meta(entry).unwrap_or_else(|| panic!("锁表项 {entry} 不在声明表里"));

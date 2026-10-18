@@ -20,6 +20,8 @@ pub mod flashinfer;
 pub mod gdn_chunked;
 /// GDN scalar AOT cubin(零门)
 pub mod gdn_scalar;
+/// 通信族(TP2 S2:allreduce stage/reduce;族身份 + 资产,零门)
+pub mod comm;
 /// Marlin:族身份 + FFI 声明(零门);**repack** 随 feature=marlin(half/rayon)
 pub mod marlin;
 /// **构建期 cubin 资产登记表**(build.rs 生成;源文本哈希 → fatbin 字节)。

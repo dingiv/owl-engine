@@ -16,6 +16,8 @@ pub mod flashinfer;
 pub mod gdn_chunked;
 /// GDN scalar runtime(零门)
 pub mod gdn_scalar;
+/// 通信族 runtime(TP2 S2;零门)
+pub mod comm;
 /// Marlin runtime(feature=marlin,随底座)
 #[cfg(feature = "marlin")]
 pub mod marlin;
@@ -30,6 +32,8 @@ pub fn family_factories() -> Vec<FamilyFactory> {
     vec![
         gdn_chunked::GdnChunkedRuntime::assemble,
         gdn_scalar::GdnScalarRuntime::assemble,
+        comm::CommArStageRuntime::assemble,
+        comm::CommArReduceRuntime::assemble,
         #[cfg(feature = "cublas")]
         cublas::CublasRuntime::assemble,
         #[cfg(feature = "marlin")]

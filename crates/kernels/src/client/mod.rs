@@ -167,6 +167,8 @@ pub mod gdn_chunked;
 pub mod xqa;
 /// GDN scalar(face;零门)
 pub mod gdn_scalar;
+/// 通信族(face;零门;TP2 S2)
+pub mod comm;
 /// cuBLAS GEMM face(feature=cublas,随底座)
 #[cfg(feature = "cublas")]
 pub mod cublas;
@@ -225,6 +227,15 @@ mod tests {
                 crate::client::gdn_scalar::PARSE_SLOTS,
             ),
         ];
+        // 通信族(TP2 S2;零门 ⇒ 无条件入锁):stage / reduce 各一条(三 dtype 同表)
+        cases.extend([
+            (crate::family::comm::asset::STAGE_F16, crate::client::comm::PARSE_SLOTS),
+            (crate::family::comm::asset::STAGE_BF16, crate::client::comm::PARSE_SLOTS),
+            (crate::family::comm::asset::STAGE_F32, crate::client::comm::PARSE_SLOTS),
+            (crate::family::comm::asset::REDUCE_F16, crate::client::comm::PARSE_SLOTS_REDUCE),
+            (crate::family::comm::asset::REDUCE_BF16, crate::client::comm::PARSE_SLOTS_REDUCE),
+            (crate::family::comm::asset::REDUCE_F32, crate::client::comm::PARSE_SLOTS_REDUCE),
+        ]);
         #[cfg(feature = "cublas")]
         cases.extend([
             (crate::family::cublas::GEMM_F16, crate::client::cublas::PARSE_SLOTS),
@@ -280,6 +291,14 @@ mod tests {
             crate::family::gdn_chunked::GDN_CHUNKED_FWD,
             crate::family::gdn_scalar::GDN_SCALAR_FWD,
         ];
+        want.extend([
+            crate::family::comm::asset::STAGE_F16,
+            crate::family::comm::asset::STAGE_BF16,
+            crate::family::comm::asset::STAGE_F32,
+            crate::family::comm::asset::REDUCE_F16,
+            crate::family::comm::asset::REDUCE_BF16,
+            crate::family::comm::asset::REDUCE_F32,
+        ]);
         #[cfg(feature = "cublas")]
         want.extend([crate::family::cublas::GEMM_F16, crate::family::cublas::GEMM_BF16]);
         #[cfg(feature = "marlin")]
