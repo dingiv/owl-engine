@@ -14,6 +14,9 @@ testdata/*
 !testdata/README.md
 # 资源清单:示例进版本,本机路径不进
 !testdata/resources.toml.example
+!testdata/cases/
+testdata/cases/*
+!testdata/cases/README.md
 testdata/resources.toml
 !testdata/gdn_fla/
 testdata/gdn_fla/*
