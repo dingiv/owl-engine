@@ -267,8 +267,20 @@ pub struct KvmemCfg {
     pub select_partial: bool,
     /// **索引采集**(打分的前置件;`select_decode` 蕴含它,单独开无意义)。
     pub index: bool,
-    /// 召回预算(块):视图 = 选中的这些块 ⇒ "选择层留多少"的唯一旋钮。
-    pub select_blocks: usize,
+    /// **每 turn 工作集(对外口径;`token` 数)** —— 一个**活跃 turn** 在设备 KV
+    /// 池里最多**常驻**多少 KV(含 `select_sink` / `select_recent` 保底)。
+    ///
+    /// 为什么要这个口径而不是"召回预算块数":它同时是
+    /// ①**准入地板**(本 turn 至少要有这么多 KV 直接驻留设备)
+    /// ②**召回预算**(视图 = 保底 + 按分 top-k)
+    /// ③**池下限算式**里每 turn 的那一项
+    /// —— 三处必须是同一个数,所以配置只给**一个** token 数,
+    /// 内部三件(块数/字节/每 turn 页数)在**装配期**由页几何派生
+    /// (唯一产地 = `engine::derive_turn_ws`;boot 打 `[turn-ws]` 自证行)。
+    ///
+    /// 缺省 = 2240 tok(= 70 页 × 32 tok = 保底 6 + 召回 64 块,与旧 `select_blocks=64` 等值)。
+    /// 页宽契约 = 32 token(设计卷 §1 铁律②)。
+    pub workspace_per_req: usize,
     /// 保底 sink(时间序最前的若干块;论文 always-retained)。
     pub select_sink: usize,
     /// 保底 recent(时间序最后的若干块)。
@@ -799,7 +811,8 @@ impl Default for KvmemCfg {
             select_decode: false,
             select_partial: false,
             index: false,
-            select_blocks: 64,
+            // 2240 tok = 70 页 × 32 tok = 保底 6 + 召回 64 块(与旧 `select_blocks=64` 等值)
+            workspace_per_req: 2240,
             select_sink: 2,
             select_recent: 4,
             recall_every: 1,

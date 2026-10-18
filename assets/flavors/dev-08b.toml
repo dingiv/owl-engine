@@ -12,18 +12,18 @@
 bind = "127.0.0.1:8135"
 # 0.8B 冒烟规模(探针 prompt 3072 tok = 96 页 × 32)
 max_seq = 4096
-# ⚠️ **本档 chunk 固定 1024**(2026-10-19 挂账,勿随手改):
-# 同一 prompt、同一 ctx=3072、同一批块,只改 chunk 会改读数 ——
-# `chunk 1024 → top8 87.5%/上界 88.7%`;`512 → 18.5%/24.7%`;`256 → 16.4%/22.4%`。
-# 已排除:分析边界(已钉 ctx)、`select_decode`、`select_partial`、预算/节奏。
-# 未定谳 ⇒ **跨 chunk 的读数一律不可比**;要改 chunk 必须先查清这条(见设计卷 §8.27)。
+# ⚠️ **本档 chunk 曾冻结 1024**(A2 期);2026-10-19 **已解冻**:
+# 漂移根因定谳 = FI plan 键双规范(已缺省对齐,见设计卷 §8.30),且已有机器门
+# 盯着这条不变量:`gpu_08b_chunk_invariance_gate`(同 prompt × 两种切块 ⇒ 读数必须一致)
+# 与核级 `fi_plan_key_sweep`(plan 缓存状态不许改数值)。改 chunk 前跑那两道门即可。
 prefill_chunk = 1024
 
 [pool]
 # 固定池:探针要的是**可复现**,不是自动调压。
 # ⚠️ 池下限算式(虚拟化档 boot 硬校验,见 engine 的"池容量硬校验"):
-#     nb ≥ max_active_turns × (select_blocks + sink + recent + ceil(chunk/32))
-#     192 ≥ 2 × (64 + 2 + 4 + 16) = 172 ✓   (页 = 32 tok)
+#     nb ≥ max_active_turns × (ceil(workspace_per_req/32) + ceil(chunk/32))
+#     192 ≥ 2 × (ceil(2048/32)=64 + 16) = 160 ✓   (页 = 32 tok;
+#                                              工作集 64 页 = sink2 + recent4 + top-k 58)
 pool_tokens = 6144
 max_active_turns = 2
 snap_max = 4
@@ -62,7 +62,8 @@ analyze_at_ctx = 3072
 # ⇒ 池不超卖(池 6144 ≥ ctx 4096)、地板走 Strict ✓
 # 预算/保底/节奏:与 27B 低显存档**同一套**节奏(every=4),
 # 免得跨档比数字时又要解释"条件不一样"
-select_blocks = 64
+# **每 turn 工作集**(token 口径;这里 = 64 页 × 32 tok,与 27B 低显存档**同一套**语义)
+workspace_per_req = 2048                    # 64 页(页 32 tok)= 保底 6 + 召回 top-k 58
 select_sink = 2
 select_recent = 4
 recall_every = 4

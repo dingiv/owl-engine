@@ -320,11 +320,14 @@ async fn non_strict_dense_floor_is_allowed_when_virtualization_is_on() {
             kvmem_virtualization: true,                  // 配置面两条门都开
             select_decode: true,
             select_partial: true,
-            // 预算必须 **装得进池**(boot 硬校验,且**按并发乘**:
-            //   nb ≥ max_active_turns × (blocks + sink + recent + chunk/page)
+            // 工作集必须 **装得进池**(boot 硬校验,且**按并发乘**:
+            //   nb ≥ max_active_turns × (ceil(workspace_per_req/32) + ceil(chunk/32))
             // 本档 16 页 ⇒ 11 页/turn × 1 并发 ✓;缺省 max_active_turns=8 会拒)
             max_active_turns: 1,
-            select_blocks: 8,
+            // 工作集 = 10 页(= 320 tok)⇒ 保底 sink1+recent1 + 召回 top-k 8 块
+            // (⚠️ 配置面只给 `workspace_per_req`;`select_blocks` 是装配期派生量,
+            //  这里不再手写,免得两个数对不上)
+            workspace_per_req: 320,   // 10 页 = 保底 2 + 召回 8(旧 `select_blocks: 8`)
             select_sink: 1,
             select_recent: 1,
             ..Default::default()

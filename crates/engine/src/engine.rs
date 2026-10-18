@@ -106,8 +106,14 @@ pub struct EngineKnobs {
     pub evict_policy: owl_store::EvictPolicyKind,
     /// **分析边界目标 ctx**(诊断;0 = 最后一个边界)。`[kvmem].analyze_at_ctx`。
     pub coverage_analyze_at: usize,
-    /// **召回预算**(块数;缺省 64,`OWL_SELECT_BLOCKS`)。视图 = 选中的这些块
-    /// ⇒ 这是"选择层丢多少"的唯一旋钮。
+    /// **每 turn 工作集的对外事实(配置面)** —— `[kvmem].workspace_per_req`(token;
+    /// 含 sink/recent 保底)。装配期由 [`derive_turn_ws`] 派生下面三件:
+    /// `select_blocks`(召回预算块数)/ `dense_floor`(准入地板字节)/ 池下限里的每 turn 页数。
+    /// **零 env 覆盖**(配置是唯一来源,见 §8.27)。
+    pub workspace_per_req: usize,
+    /// **召回预算**(块数)= `ceil(workspace_per_req/page) − sink − recent`。
+    /// **派生量**(唯一产地 = [`derive_turn_ws`],装配期写;测试档可直接构)。
+    /// 视图 = 保底 + 按分 top-k ⇒ 这是"选择层丢多少"的内部旋钮。
     pub select_blocks: usize,
     /// 保底 sink / recent(块;缺省 2 / 4)
     pub select_sink: usize,
@@ -208,6 +214,7 @@ impl Default for EngineKnobs {
             select_decode: false,
             select_partial: false,
             evict_policy: owl_store::EvictPolicyKind::Lru,
+            workspace_per_req: 2240,
             select_blocks: 64,
             select_sink: 2,
             select_recent: 4,
@@ -294,6 +301,46 @@ impl EngineKnobs {
     }
 
 
+    /// **每 turn 工作集的派生(唯一产地)** —— 对外一个 token 数,内部三件:
+    /// 工作集页数 / 召回预算(块)/ 准入地板(字节)。
+    ///
+    /// 为什么必须单点(2026-10-19):这三件在旧实现里**各算一次**
+    /// (池下限算式算一遍页数、准入地板又算一遍、召回预算再写死一个块数)
+    /// —— 迟早对不上;更糟的是**对外口径**只能靠人脑在"块/字节/token"之间换算。
+    /// 现在配置只给 `workspace_per_req`(token),三件都从它派生,
+    /// 且 boot 打 `[turn-ws]` 自证行(含池下限算式)。
+    ///
+    /// 语义:工作集 = **常驻块数**(含保底)= `sink + recent + 按分 top-k`。
+    /// `top_k = 0`("只留保底")合法;`工作集 < 保底` = 配置不自洽 ⇒ **响亮拒**。
+    /// ⚠️ `select_blocks` 是**总选中数**(`owl_store::select` 的预算就是总数,保底从
+    /// 里面优先占),所以它 = `ws_pages`,**不是** `ws_pages − keep`(2026-10-19 踩过)。
+    fn derive_turn_ws(
+        workspace_tokens: usize,
+        page_tokens: usize,
+        page_bytes: usize,
+        knobs: &mut EngineKnobs,
+    ) -> Result<(usize, usize)> {
+        let page = page_tokens.max(1);
+        let keep = knobs.select_sink + knobs.select_recent;
+        let ws_pages = workspace_tokens.div_ceil(page).max(1);
+        if ws_pages < keep {
+            return Err(owl_iface::contract::ModelError::Msg(format!(
+                "boot: 每 turn 工作集不自洽 —— workspace_per_req={} tok = {} 页 < 保底                  (sink {} + recent {} = {} 页);要么调大工作集,要么调小保底",
+                workspace_tokens, ws_pages, knobs.select_sink, knobs.select_recent, keep
+            )));
+        }
+        // `select_blocks` = **总选中数(含保底)** —— 工作集页数就是它;保底是
+        // 其中被优先占用的那部分(top-k = ws_pages − keep)。
+        knobs.select_blocks = ws_pages;
+        let ws_bytes = ws_pages * page_bytes.max(1);
+        // 地板**只在虚拟化档**落:非虚拟化档的唯一诚实地板是 `Strict`
+        // (boot 会拦非 Strict;dense_floor_for 同一判据),别在这里越权改。
+        if knobs.kvmem_virtualization && !knobs.dense_floor_explicit {
+            knobs.dense_floor = owl_store::TurnFloor::Bytes(ws_bytes);
+        }
+        Ok((ws_pages, ws_bytes))
+    }
+
     /// 准入满员姿态的等待上限(毫秒;`Reject` ⇒ 0 = 不等)。
     /// **一次运行的条件摘要**(单行;boot 与探针都打)。
     ///
@@ -310,7 +357,7 @@ impl EngineKnobs {
             owl_store::EvictPolicyKind::Lrfu(l) => format!("lrfu:{l}"),
         };
         format!(
-            "pool={:?} turns={} snap_max={} host={}M snap_host={}M | kvmem={}[idx={} cov={} view={} part={} budget={}+{}+{} every={} evict={} floor={:?}] | fi={} split={} gdn_chunked={} kv={} graph_off={}",
+            "pool={:?} turns={} snap_max={} host={}M snap_host={}M | kvmem={}[idx={} cov={} view={} part={} ws={}tok(sink{}+recent{}+topk{}@32tok/page) every={} evict={} floor={:?}] | fi={} split={} gdn_chunked={} kv={} graph_off={}",
             self.pool_tokens,
             self.max_active_turns,
             self.snap_max,
@@ -321,9 +368,10 @@ impl EngineKnobs {
             self.coverage_probe as u8,
             self.select_decode as u8,
             self.select_partial as u8,
-            self.select_blocks,
+            self.workspace_per_req,
             self.select_sink,
             self.select_recent,
+            self.select_blocks,
             self.recall_every,
             ev,
             self.dense_floor,
@@ -383,7 +431,10 @@ impl EngineKnobs {
             select_decode: cfg.kvmem.select_decode,
             select_partial: cfg.kvmem.select_partial,
             evict_policy: Self::evict_policy_of(&cfg.kvmem),
-            select_blocks: cfg.kvmem.select_blocks,
+            workspace_per_req: cfg.kvmem.workspace_per_req,
+            // `select_blocks` = 派生量(装配期 `derive_turn_ws` 按池页宽写);
+            // 此处保留构造器缺省,测试档可直接覆盖。
+            select_blocks: 64,
             select_sink: cfg.kvmem.select_sink,
             select_recent: cfg.kvmem.select_recent,
             recall_every: cfg.kvmem.recall_every,
@@ -768,25 +819,70 @@ impl<D: DeviceClient + 'static> Engine<D> {
         // 27B f16 算例(页 = 32 tok = 2 MiB):
         //   select_blocks 32 + sink 2 + recent 4 + chunk 256 ⇒ 每 turn 46 页 = 92 MiB
         //   8 并发 ⇒ 368 页 = 736 MiB ‖ 对照 dense 8 并发 = 8×256 页 = 4 GiB ⇒ 省 5.6×
+        // **每 turn 工作集派生**(唯一产地;对外一个 token 数 ⇒ 内部三件)。
+        // 位置 = 装配期(页几何已知)、**与虚拟化档无关** —— 诊断档(只跑选择器
+        // 读数)也要同一口径,否则配置写了 token 却被静默忽略。
+        let page_bytes = pool.block_bytes().max(1);
+        let (ws_pages, ws_bytes) = EngineKnobs::derive_turn_ws(
+            self.cfg.knobs.workspace_per_req,
+            pool.page,
+            page_bytes,
+            &mut self.cfg.knobs,
+        )?;
+        // chunk 增量页 / 每 turn 页 / 并发下限(与下面的池校验**同一批数**)
+        let keep_pages = self.cfg.knobs.select_sink + self.cfg.knobs.select_recent;
+        let chunk_pages = self.cfg.prefill_chunk.div_ceil(pool.page.max(1)).max(1);
+        let per_turn = ws_pages.max(1) + chunk_pages;
+        let n_active = self.cfg.knobs.max_active_turns.max(1);
+        let need = per_turn * n_active;
+        let vm_on = self.cfg.knobs.kvmem_virtualization;
+        // **boot 自证行**(装配期无条件打):工作集口径与三件派生一次打全 ——
+        // 配置里只写 token,这一行告诉你它变成了几页/几字节/多少找回预算。
+        // 打印用 `eprintln!`(取证行惯例):`log_*` 宏在无 `log` feature 的
+        // 测试/探针构建里被**编译剔除**(`if false`)—— 自证行必须在探针里可见。
+        eprintln!(
+            "[turn-ws] 每 turn 工作集 = {} tok = {} 页 = {} KiB(页 {} tok / {} KiB)⇒ \
+             常驻 {} 块 = 保底 sink {} + recent {} + 召回 top-k {};准入地板 = {} KiB/turn;\
+             池下限 = {} 并发 × (工作集 {} + chunk {} = {} 页) = {} 页(池 {} 页){}\
+             (改工作集只动 `[kvmem].workspace_per_req`;`select_blocks` 是派生量)",
+            self.cfg.knobs.workspace_per_req,
+            ws_pages,
+            ws_bytes >> 10,
+            pool.page,
+            page_bytes >> 10,
+            ws_pages,
+            self.cfg.knobs.select_sink,
+            self.cfg.knobs.select_recent,
+            ws_pages - keep_pages,
+            ws_bytes >> 10,
+            n_active,
+            ws_pages,
+            chunk_pages,
+            per_turn,
+            need,
+            pool.nb,
+            if !vm_on {
+                "(非虚拟化档:不做池下限校验)"
+            } else if pool.nb >= need {
+                " ✓"
+            } else {
+                " ✗"
+            }
+        );
         if self.cfg.knobs.kvmem_virtualization {
-            let chunk_pages = self.cfg.prefill_chunk.div_ceil(pool.page.max(1)).max(1);
-            let per_turn = self.cfg.knobs.select_blocks.max(1)
-                + self.cfg.knobs.select_sink
-                + self.cfg.knobs.select_recent
-                + chunk_pages;
-            let n_active = self.cfg.knobs.max_active_turns.max(1);
-            let need = per_turn * n_active;
-            let page_bytes = pool.block_bytes().max(1);
             if pool.nb < need {
                 return Err(owl_iface::contract::ModelError::Msg(format!(
                     "boot: 设备池 {} 页装不下 {n_active} 并发 × {per_turn} 页 = {need} 页\
-                     (每 turn = select_blocks {} + sink {} + recent {} + chunk {chunk_pages});\
-                     pool_tokens={} page={} —— 调大池 / 减预算 / 降 max_active_turns\
+                     (每 turn = workspace_per_req {} tok = {} 页 + chunk {chunk_pages} 页;\
+                      其中工作集由 sink {} + recent {} + top-k {} 组成);\
+                     pool_tokens={} page={} —— 调大池 / 减工作集 / 降 max_active_turns\
                      (响亮拒:跑起来必 Exhausted)",
                     pool.nb,
-                    self.cfg.knobs.select_blocks,
+                    self.cfg.knobs.workspace_per_req,
+                    ws_pages,
                     self.cfg.knobs.select_sink,
                     self.cfg.knobs.select_recent,
+                    self.cfg.knobs.select_blocks,
                     plan.pool_tokens,
                     pool.page
                 )));
@@ -798,18 +894,13 @@ impl<D: DeviceClient + 'static> Engine<D> {
             // = "每个进来的 turn 都先留出它自己那套",与上面的池下限算式**同源**
             // (同一套页数,乘的是字节而不是并发数)。显式给了 `[kvmem].dense_floor_mib`
             // 则尊重显式值。
-            if !self.cfg.knobs.dense_floor_explicit {
-                let ws_pages = (self.cfg.knobs.select_blocks.max(1)
-                    + self.cfg.knobs.select_sink
-                    + self.cfg.knobs.select_recent)
-                    .max(1);
-                self.cfg.knobs.dense_floor =
-                    owl_store::TurnFloor::Bytes(ws_pages * page_bytes);
-            }
+            // (准入地板**已由 `derive_turn_ws` 按同一个 `ws_pages` 填好** ——
+            //  这里不再二次算式;显式 `[kvmem].dense_floor_mib` 仍优先。)
+            let _ = ws_bytes;
             owl_shared::log_warn!(
                 "boot",
                 "KVMem 虚拟化档:**池 = {} tok / {} 页** vs 上下文 {} tok / {} 页 ⇒ 超卖 {:.2}×;\
-                 并发上限 {} × 每 turn {} 页(工作集 {}+{}+{} + chunk {}) = {need} 页;\
+                 并发上限 {} × 每 turn {} 页(工作集 {} tok=sink{}+recent{}+top-k{} + chunk {}) = {need} 页;\
                  每页 {} KiB;准入地板 = {:?} / turn;宿主 {} MiB",
                 pool.nb * pool.page,
                 pool.nb,
@@ -818,9 +909,10 @@ impl<D: DeviceClient + 'static> Engine<D> {
                 s as f64 / (pool.nb * pool.page).max(1) as f64,
                 n_active,
                 per_turn,
-                self.cfg.knobs.select_blocks,
+                self.cfg.knobs.workspace_per_req,
                 self.cfg.knobs.select_sink,
                 self.cfg.knobs.select_recent,
+                self.cfg.knobs.select_blocks,
                 chunk_pages,
                 page_bytes / 1024,
                 self.cfg.knobs.dense_floor,

@@ -10,7 +10,8 @@
 # ── 三层账(改数只动这三行;算式见 `[pool]` 注释) ─────────────────────
 #   [runtime].max_seq      = 上下文长(逻辑上限)
 #   [pool].pool_tokens     = 设备 KV 池(**可小于 max_seq** —— 省下的显存就是它)
-#   [kvmem].select_blocks  = 设备工作集(选中块数;"留多少活 KV")
+#   [kvmem].workspace_per_req = **每个活跃 turn 在池里的工作集(token)**
+#                               (配置只给这一个数;块数/字节/池下限由引擎装配期派生)
 #
 # 需配套:model.dir(检查点目录)。
 [model]
@@ -29,10 +30,11 @@ max_seq = 131072
 prefill_chunk = 128
 
 [pool]
-# ⚠️ **池下限算式**(boot 硬校验,不满足直接拒启并报数):
+# ⚠️ **池下限算式**(boot 硬校验,不满足直接拒启并报数;装配期打 `[turn-ws]` 自证行):
 #
-#     nb ≥ max_active_turns × (select_blocks + sink + recent + ceil(chunk/32))
-#     96 ≥ 1 × (32 + 2 + 4 + 8) = 46                       ✓
+#     nb ≥ max_active_turns × (ceil(workspace_per_req/32) + ceil(chunk/32))
+#     96 ≥ 1 × (ceil(1024/32)=32 + 8) = 40                 ✓
+#         (工作集 32 页 = 保底 sink2 + recent4 + 召回 top-k 26 块)
 #
 # **池容量 = 让引擎治理器算**(不手写猜数):
 #   `StatePool::alloc` 硬预算治理:
@@ -86,11 +88,14 @@ select_partial = true
 index = true
 # ── 锁①:允许池小于上下文 ──
 pool_overcommit = true
-# ── 锁②:准入地板(缺省 = **本 turn 工作集字节**,即 38 页 × 2 MiB = 76 MiB)──
-# 想保守就显式给 MiB 数:
+# ── 锁②:准入地板(缺省 = **每 turn 工作集字节**,由 workspace_per_req 派生)──
+# 想保守就显式给 MiB 数(显式值优先,派生值不作数):
 # dense_floor_mib = 128
-# ── 工作集与节奏(与 `dev-08b` 同一套节奏,跨档比数字不用再解释条件)──
-select_blocks = 32
+# ── **每 turn 工作集**(本档唯一的容量-质量旋钮;token 口径)──
+#   1024 tok = 32 页(页 32 tok) = 常驻 32 块 = 保底 sink 2 + recent 4 + 召回 top-k 26
+#   ⚠️ 调它就是"用质量换并发":小 ⇒ 池能装更多 turn/decode 每步读更少,
+#      但召回预算跟着小(注意力能看到的块变少);薄档建议先扫"预算→覆盖率"曲线
+workspace_per_req = 1024                    # 32 页(页 32 tok)= 保底 6 + 召回 top-k 26
 select_sink = 2
 select_recent = 4
 recall_every = 4
