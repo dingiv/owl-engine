@@ -345,7 +345,7 @@ EOF
    零生产语义改动):
    - `apps/server/tests/ops_whitelist.rs`:`OwlConfig::load` 已改收**文件路径**
      (配置层自 2026-10-16 起**不认识 flavor 名字** —— 名字→路径是入口职责)
-     ⇒ 测试改走 `owl_shared::assets::preset_path(flavor)` 同一解析口。
+     ⇒ 测试改走 `owl_shared::flavors::preset_path(flavor)` 同一解析口。
    - `crates/backends/cuda/tests/marlin_parity.rs` 5 例:L3 事实面(dtype/rank
      上盘)落地后,老测试还在用**扁平一维 shape** 与写死的 `Dtype::F16`
      ⇒ 契约门当场拒(`槽 b 期望 rank = 2(声明) 实得 1`)。修法 = 测试补真事实

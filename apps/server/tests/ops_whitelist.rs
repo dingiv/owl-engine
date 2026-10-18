@@ -16,7 +16,7 @@ fn whitelist(flavor: &str) -> Vec<&'static str> {
     // **配置层不认识 flavor 名字**(2026-10-16 分层):名字 → 预设档路径是入口
     // (server `config.rs`)的职责。本测试复用同一个解析口 `preset_path`,
     // 免第二份“名字怎么变成配置”的语义。
-    let path = owl_shared::assets::preset_path(flavor).expect("预设档路径");
+    let path = owl_shared::flavors::preset_path(flavor).expect("预设档路径");
     let cfg = OwlConfig::load(Some(&path), None).expect("flavor 解析");
     let list = cfg
         .dispatch

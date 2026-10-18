@@ -7,7 +7,7 @@ pub mod case;
 pub mod checks;
 pub mod rng;
 
-pub use case::case_config;
+pub use case::{case_config, TEST_CONF_ENV};
 
 /// **HF 对拍门**(`OWL_HF_PARITY=1`;`#[owl_test(hf_parity)]` 的判据 —— 与
 /// `models::testkit::parity_enabled` 同语义)

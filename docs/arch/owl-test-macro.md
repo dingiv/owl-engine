@@ -51,19 +51,27 @@ async fn hf_parity_case() { /* 真跑需要 OWL_HF_PARITY=1 + OWL_TEST_DEVICE */
 **选项清单**(逗号分隔、顺序无关,未知项 = compile_error):
 `gpu` / `hf_parity`;判据与 skip 文案全在 `owl_shared::testkit`(宏零逻辑)。
 
-### 2.2 隐藏环境变量:每用例一个配置文件
+### 2.2 配置从哪来:**单一 env + 约定 overlay**(2026-10-18 定稿)
 
-| 键 | 语义 |
-|---|---|
-| `OWL_TEST_CONFIG_<函数名大写>` | **本用例专属配置文件路径**(TOML,引擎同款 `OwlConfig` 格式)。如 `cpu_case` → `OWL_TEST_CONFIG_CPU_CASE=/tmp/x.toml` |
-| 未设 | 用 `OwlConfig::default()`(测试零配置可跑,不 skip) |
-| 文件解析失败 | **响亮 panic**(带路径与 serde 错误;测试配置错误不静默) |
+层链(**后者覆盖前者**):
 
-- **账外键**:与 `OWL_E2E_*`/`OWL_GATE_*` 同类,登记入
-  `config.rs` 账外键清单 —— env 不进正式配置链,但测试域豁免;
-- **引擎同款配置文件**:解析走唯一 loader `OwlConfig::load(None, Some(path))`
-  —— deny_unknown_fields、枚举严格、四层叠加的全部纪律对测试配置同样生效
-  (测试用错键名 = panic,与引擎拒启同语义)。
+```
+flavor(可选,预设档名) → OWL_TEST_CONF(整轮环境档) → 用例 overlay(约定路径)
+```
+
+| 层 | 位置 | 说明 |
+|---|---|---|
+| `flavor` | `flavors/<名>.toml`(仓库顶层) | 配置档里写 `flavor = "spec-dflash"` 即**复用预设当基准**(loader 顶层键,等效 `extends` 到 `flavors/<名>.toml`);测试与站点档同用 |
+| `OWL_TEST_CONF` | 任意路径(**唯一**测试 env) | 整轮测试的环境档(TOML,引擎同款 `OwlConfig` 格式):共同口径 + 本机覆盖。未设 = 无此层;设了但文件缺失/解析失败 = **响亮 panic** |
+| 用例 overlay | `testdata/cases/<crate>/<模块路径>/<用例名>.toml` | **零 env**:由宏传入的 `file!()` 推导。临时改一个用例 = 丢个文件;删文件即还原;集成测试(`tests/*.rs`)无此层 |
+
+- 三层全不在 ⇒ `OwlConfig::default()`(测试零配置可跑,不 skip);
+- **旧键 `OWL_TEST_CONFIG_<函数名大写>` 已退役**:设了 = 响亮 panic +
+  迁移指引(给出该用例应放 overlay 的**确切路径**);
+- 解析走唯一 loader(`load_chain`)—— deny_unknown_fields、枚举严格、
+  `flavor`/`extends` 的环/超深检测对测试配置同样生效(错键名 = panic,
+  与引擎拒启同语义);
+- 目录与用法速查:`testdata/README.md`。
 
 ### 2.3 宏展开契约(属性宏,`syn`/`quote`)
 
@@ -122,12 +130,12 @@ fn 名() {
 ## 四、验收
 
 1. `cargo test -p owl-macros -p owl-shared -p owl-engine --lib` 全绿;
-2. **参数化实证**:设置 `OWL_TEST_CONFIG_<DEMO>` 指向一个改了
-   `runtime.max_seq` 的 TOML,断言测试收到该值(env 清除则收 default —— 双臂
-   单测,用 `EnvGuard` 防踩踏);
+2. **参数化实证**:设 `OWL_TEST_CONF` 指向一份改了 `runtime.max_seq` 的 TOML
+   (或丢一个用例 overlay),断言测试收到该值;env 清除/无 overlay 则收 default
+   —— 双臂/三层单测,用 `EnvGuard` 防踩踏(`testkit::case` 自带 4 项);
 3. 示范测试在 GPU 环境下行为不变(GPU 门控测试:env 未设 = skip 打印逐字同);
 4. `cargo check --workspace` 零新告警;
-5. 账外键清单登记 `OWL_TEST_CONFIG_*`。
+5. 账外键清单登记 `OWL_TEST_CONF`(旧 `OWL_TEST_CONFIG_*` 退役)。
 
 ## 五、施工记录(2026-10-15 同日完工)
 
@@ -195,17 +203,33 @@ fn 名() {
 
 ## 七、走向"零散 env"的测试姿势(**提案**;2026-10-18)
 
-现状:测试域仍在用的 env 键分三类 —— 设备门(`OWL_TEST_DEVICE`)、
-用例配置(`OWL_TEST_CONFIG_<名字>`)、数据门(`OWL_DFLASH2_DIR` 等十余个)。
-AGENTS.md 的立场是"配置显式,env 退出正式链;测试域可放但不推荐"。提案按类型归位:
+现状:测试域 env 键分四类。AGENTS.md 的立场是"配置显式,env 退出正式链;
+测试域可放但不推荐"。归位方案与**进度**:
 
-| 类 | 现状 | 建议姿势 | 收益 |
+| 类 | 旧姿势 | 新姿势 | 状态 |
 |---|---|---|---|
-| **设备**(哪张卡) | `OWL_TEST_DEVICE` | 保留为**唯一** env(机器资源选择器,非引擎行为);进一步可收进 `testdata/machine.toml`(uuid 表)由 runner 读 | 1 个键封顶 |
-| **用例配置**(引擎旋钮) | `OWL_TEST_CONFIG_<FN>` 每用例一个键 | **约定路径**:`testdata/cases/<crate>/<file>::<fn>.toml`;宏用 `file!()`+用例名推导(零 env)。缺文件 = `OwlConfig::default()` | 去掉全部 `OWL_TEST_CONFIG_*` |
-| **数据**(检查点/金标) | `OWL_AWQ27B_DIR` / `OWL_DFLASH2_DIR` / 各种 `*_DIR` | **资源清单** `testdata/resources.toml`:`key = "path"`;用例声明 `#[owl_test(needs = ["ckpt:27b-awq"])]`,缺失 = skip 且**点名缺哪个 key** | 十余个键 → 一份可进版本、可 review 的清单 |
-| **昂贵套件**(HF parity / bench) | `OWL_HF_PARITY` 等开关 | 并入资源清单/配置(`needs = ["hf-parity"]`),不再散键 | 同上 |
+| **用例配置**(引擎旋钮) | `OWL_TEST_CONFIG_<FN>` 每用例一键 | **`OWL_TEST_CONF` 单一入口 + `testdata/cases/**` 约定 overlay**(宏传 `file!()` 推导;`flavor` 复用 `flavors/`) | ✅ **已落地**(2026-10-18) |
+| **整轮共同口径** | 各会话各写一套档 | 同上一入口:一份测试环境档定 flavor + 本机覆盖,大家测的配置一致 | ✅ 已落地 |
+| **设备**(哪张卡) | `OWL_TEST_DEVICE` | 保留为设备专用 env(机器资源选择器);进一步可收进 `testdata/machine.toml` | ⏳ 待定 |
+| **数据**(检查点/金标) | `OWL_AWQ27B_DIR` / `OWL_DFLASH2_DIR` 等十余键 | **资源清单** `testdata/resources.toml`(`key = "path"`);用例声明 `#[owl_test(needs = ["ckpt:27b-awq"])]`,缺失 = skip 且**点名缺哪个 key** | ⏳ 提案 |
+| **昂贵套件**(parity/bench) | `OWL_HF_PARITY` 等 | 已进宏选项(`hf_parity`);后续并入资源清单 | 部分 |
 
-落地顺序建议:① 用例配置改约定路径(改动最小、收益最大)→ ② 资源清单
-(吃数据门)→ ③ 设备收进 machine 文件。① 就绪后,`case_config` 的 env 读取面
-可整体删除,`#[owl_test]` 变成"零 env 的参数化测试"。
+下一步:资源清单(吃数据门)→ 设备收进 machine 文件。终态 = `#[owl_test]`
+用例**零散 env 归零**(仅保留设备选择器)。
+
+
+### 2026-10-18:单一入口落地(替代每用例 env)
+
+- `OWL_TEST_CONF` 成为**唯一**测试 env(整轮环境档);每用例 env 键退役
+  (设了 = 响亮 panic + 迁移指引);
+- 用例 overlay 改**约定路径** `testdata/cases/<crate>/<模块路径>/<用例名>.toml`
+  (零 env);
+- **`flavor` 升格为配置层顶层键**(loader,与 `extends` 同族):任何配置档都能
+  自带预设基准 ⇒ 测试环境档只写差异,复用 `flavors/` 生产档;
+- `flavors/` 目录自 `assets/flavors/` **提到仓库顶层**(模块 `shared::flavors`);
+- loader 新增 `OwlConfig::load_chain(base, &[layers])`(多层叠加,每层支持
+  `flavor`/`extends`);
+- 实证:`testdata/README.md` 速查;`testkit::case` 4 项单测(路径派生/环境档双臂/
+  退役键拒/overlay 生效)+ `engine::tests::case_config_injection` 端到端复算;
+  真机演示:`OWL_TEST_CONF=<flavor+override> cargo test -p owl-engine --lib
+  case_config_injection` 绿。

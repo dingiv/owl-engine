@@ -6,11 +6,17 @@
 //! 组装各自的 knobs/options,**零 env 直读、零散点 parse**。
 //!
 //! **叠加式加载**(2026-10-16:配置层不认识 "flavor" —— 预设档只是预先写好的
-//! 一份配置文件,由入口(`assets::preset_path`)解析成路径当"基准文件"传入):
+//! 一份配置文件,由入口(`flavors::preset_path`)解析成路径当"基准文件"传入):
 //!
 //! ```text
 //! Default(代码缺省) → Flavor(内置命名预设) → 用户文件(toml) → CLI 启动参数
 //! ```
+//!
+//! **继承 `extends`**(2026-10-18):任一被加载的文件可在顶层写
+//! `extends = "other.toml"`(相对路径 = 相对本文件目录)—— 被继承者先合并、
+//! 本文件覆盖之,链可嵌套;环/超深/类型非法 = 响亮拒。子档只写「与 base 不同的
+//! 项」(站点档 base.toml → 设备档 → 实验档)。字符串直载(`from_toml_str`)
+//! 无文件上下文 ⇒ 含 extends 即拒。
 //!
 //! 预设档只锁"**必须成套**"的旋钮(避免手拼组合踩约束,如 spec depth
 //! 无草稿目录空转、verify 图撞缺省 slab);实验旋钮在用户文件临时改即可,
@@ -25,6 +31,10 @@
 //!
 //! | module | 键 | 类型/缺省 |
 //! |---|---|---|
+//! | (顶层) | extends | String / 无 —— 继承另一配置档(相对 = 相对本文件目录;
+//! |   |   | 链可嵌套;环/超深/类型非法 = 拒启。直载 `from_toml_str` 不解析)|
+//! | (顶层) | flavor | String / 无 —— 预设档名(等效 `extends` 到 flavors/<名>.toml;
+//! |   |   | 测试环境档/站点档用它自带基准) |
 //! | runtime | bind | String / "127.0.0.1:8135" |
 //! | runtime | device | usize / 0 |
 //! | runtime | max_seq | usize / 4096 |
@@ -85,8 +95,9 @@
 //! 账外键(不入公共面):测试私有旋钮(OWL_GATE_*/OWL_E2E_*/OWL_SWEEP_*/
 //! OWL_WS_MUL/SPLIT_*/MARLIN_*/FI_DEBUG/OWL_27B_STRICT/OWL_HF_PARITY ——
 //! 测试用例自由直读)、构建期键(build.rs 例外)、OWL_CONFIG(loader 路径
-//! 兜底,server 入口读)、OWL_TEST_CONFIG_*(`#[owl_test]` 每用例配置文件
-//! 路径,见 testkit::case 与 docs/arch/owl-test-macro.md)。
+//! 兜底,server 入口读)、OWL_TEST_CONF(`#[owl_test]` 的**唯一**测试环境档
+//! 入口 —— 每用例 overlay 改走 `testdata/cases/**` 约定路径,见 testkit::case
+//! 与 docs/arch/owl-test-macro.md)。
 
 use std::path::{Path, PathBuf};
 
@@ -1000,7 +1011,8 @@ impl Default for SamplingCfg {
 
 
 // ============================================================================
-// §5 统一 loader(四层叠加;deny_unknown 在最终反序列化生效)
+// §5 统一 loader(Default → 基准文件 → 覆盖文件;两文件均可 `extends` 继承链;
+// deny_unknown 在最终反序列化生效)
 // ============================================================================
 
 /// TOML Value 深合并(覆盖层写回基座;表递归,标量/数组整体覆盖)
@@ -1067,25 +1079,143 @@ fn reject_retired_keys(v: &toml::Value) -> Result<(), String> {
     Ok(())
 }
 
+/// **配置继承**(`extends`;顶层键;2026-10-18)。
+///
+/// 语义:`extends = "other.toml"` ⇒ 先合并 other.toml(相对路径 = 相对本文件
+/// 目录),再合并本文件(本文件覆盖被继承者) ⇒ 子档只写「与 base 不同的项」。
+/// CLI 的 `--flavor` 仍是整条链最底层的基准文件。链可嵌套;环/超深 = 响亮拒。
+const EXTENDS_KEY: &str = "extends";
+/// **预设档引用键**(`flavor = "spec-dflash"`;顶层;2026-10-18)。
+///
+/// 语义与 `extends` 同型,但父档由**名字**解析(`crate::flavors::preset_path`,
+/// 即 `--flavor` 的同一解析面):父链顺序 = `flavor` 预设 → `extends` 父档 →
+/// 自身。用途:测试环境档/站点档自带基准(“以 `spec-dflash` 为底,只改几项”),
+/// 不必让调用方同时记得传 `--flavor`。
+const FLAVOR_KEY: &str = "flavor";
+/// extends 链深上限(含起点;防病态链/手滑)
+const EXTENDS_MAX_DEPTH: usize = 8;
+
+/// TOML 值的类型名(报错用;显式 match —— 不依赖 toml crate 的辅助 API 漂移)
+fn toml_type_name(v: &toml::Value) -> &'static str {
+    match v {
+        toml::Value::String(_) => "字符串",
+        toml::Value::Integer(_) => "整数",
+        toml::Value::Float(_) => "浮点",
+        toml::Value::Boolean(_) => "布尔",
+        toml::Value::Datetime(_) => "日期时间",
+        toml::Value::Array(_) => "数组",
+        toml::Value::Table(_) => "表",
+    }
+}
+
+/// 读一个配置档并**递归展开 `extends`**,把「被继承者 → 自身」依序合并进 `out`。
+///
+/// `depth` = 当前链深;`chain` = 已展开的**规范化**路径(环检测 + 报错直接打印链)。
+/// 只做文件面,不碰配置语义(反序列化/validate 在 `load` 末尾统一做)。
+fn load_config_into(
+    path: &Path,
+    out: &mut toml::Value,
+    depth: usize,
+    chain: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    if depth >= EXTENDS_MAX_DEPTH {
+        let mut shown: Vec<String> = chain.iter().map(|p| p.display().to_string()).collect();
+        shown.push(path.display().to_string());
+        return Err(format!(
+            "extends 链深超上限 {EXTENDS_MAX_DEPTH}:{}",
+            shown.join(" → ")
+        ));
+    }
+    let canon = path
+        .canonicalize()
+        .map_err(|e| format!("配置 {} 读取失败: {e}", path.display()))?;
+    if let Some(pos) = chain.iter().position(|p| p == &canon) {
+        let mut shown: Vec<String> = chain[pos..]
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        shown.push(canon.display().to_string());
+        return Err(format!("extends 成环:{}", shown.join(" → ")));
+    }
+    let raw = file_loader::read_to_string(path)
+        .map_err(|e| format!("配置 {} 读取失败: {e}", path.display()))?;
+    let mut v: toml::Value = toml::from_str(&raw)
+        .map_err(|e| format!("配置 {} 解析失败: {e}", path.display()))?;
+    // 取走顶层 flavor(预设档名 → 路径;与 extends 同为父层,flavor 在前)
+    let flavor_base = match v.as_table_mut().and_then(|t| t.remove(FLAVOR_KEY)) {
+        None => None,
+        Some(toml::Value::String(s)) if !s.trim().is_empty() => {
+            Some(crate::flavors::preset_path(s.trim()).map_err(|e| {
+                format!("配置 {}:{FLAVOR_KEY} 解析失败: {e}", path.display())
+            })?)
+        }
+        Some(toml::Value::String(_)) => {
+            return Err(format!("配置 {}:{FLAVOR_KEY} 不能是空字符串", path.display()))
+        }
+        Some(other) => {
+            return Err(format!(
+                "配置 {}:{FLAVOR_KEY} 必须是预设档名(字符串),得到 {}",
+                path.display(),
+                toml_type_name(&other)
+            ))
+        }
+    };
+    // 取走顶层 extends(必须在最终反序列化前摘掉;类型非法 = 响亮拒,不静默忽略)
+    let parent = match v.as_table_mut().and_then(|t| t.remove(EXTENDS_KEY)) {
+        None => None,
+        Some(toml::Value::String(s)) if !s.trim().is_empty() => Some(PathBuf::from(s)),
+        Some(toml::Value::String(_)) => {
+            return Err(format!("配置 {}:{EXTENDS_KEY} 不能是空字符串", path.display()))
+        }
+        Some(other) => {
+            return Err(format!(
+                "配置 {}:{EXTENDS_KEY} 必须是单个文件路径(字符串),得到 {};\n              多条继承请用链式(父档自己再 extends)",
+                path.display(),
+                toml_type_name(&other)
+            ))
+        }
+    };
+    chain.push(canon);
+    if let Some(p) = flavor_base {
+        load_config_into(&p, out, depth + 1, chain)?;
+    }
+    if let Some(p) = parent {
+        let p = if p.is_absolute() {
+            p
+        } else {
+            path.parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(p)
+        };
+        load_config_into(&p, out, depth + 1, chain)?;
+    }
+    chain.pop();
+    merge(out, v);
+    Ok(())
+}
+
 impl OwlConfig {
-    /// **统一 loader**(Default → 基准文件(预设档/任意配置) → 覆盖文件;
-    /// CLI 由入口决定前两者的取值)。`deny_unknown_fields` 在最终反序列化生效 ——
-    /// 任一文件里任何账外键、枚举非法值 = Err 拒启。
+    /// **统一 loader**(Default → 基准文件 → 覆盖文件;CLI 由入口决定前两者的
+    /// 取值)。每个文件都可声明 `extends` 继承另一档 —— 被继承者先合并、本文件
+    /// 覆盖之(见 [`load_config_into`])。`deny_unknown_fields` 在最终反序列化
+    /// 生效 —— 任一文件里任何账外键、枚举非法值 = Err 拒启。
     pub fn load(base: Option<&Path>, file: Option<&Path>) -> Result<Self, String> {
+        match file {
+            Some(f) => Self::load_chain(base, &[f]),
+            None => Self::load_chain(base, &[]),
+        }
+    }
+
+    /// **多层链加载**(2026-10-18):`base`(可选)→ `layers` 按序叠加。
+    /// 每层都支援 `flavor`(预设档名 → 该层的父层)与 `extends`;后者覆盖前者。
+    /// 用途:`OWL_TEST_CONF → 用例 overlay` 这条测试链(见 `testkit::case`)。
+    pub fn load_chain(base: Option<&Path>, layers: &[&Path]) -> Result<Self, String> {
         let mut v = toml::Value::Table(toml::map::Map::new());
         if let Some(b) = base {
-            let raw = file_loader::read_to_string(b)
-                .map_err(|e| format!("基准配置 {} 读取失败: {e}", b.display()))?;
-            let bv: toml::Value = toml::from_str(&raw)
-                .map_err(|e| format!("基准配置 {} 解析失败: {e}", b.display()))?;
-            merge(&mut v, bv);
+            load_config_into(b, &mut v, 0, &mut Vec::new())?;
         }
-        if let Some(p) = file {
-            let raw = file_loader::read_to_string(p)
-                .map_err(|e| format!("配置文件 {} 读取失败: {e}", p.display()))?;
-            let fv: toml::Value = toml::from_str(&raw)
-                .map_err(|e| format!("配置文件 {} 解析失败: {e}", p.display()))?;
-            merge(&mut v, fv);
+        for p in layers {
+            load_config_into(p, &mut v, 0, &mut Vec::new())?;
         }
         reject_retired_keys(&v)?;
         v.try_into()
@@ -1096,10 +1226,21 @@ impl OwlConfig {
             })
     }
 
-    /// TOML 字符串直载(测试/ops 便捷;与 load 同一反序列化面 + 同一语义门)
+    /// TOML 字符串直载(测试/ops 便捷;与 load 同一反序列化面 + 同一语义门)。
+    /// **不解析 `extends`**(无文件上下文 —— 继承请走文件加载)。
     pub fn from_toml_str(s: &str) -> Result<Self, String> {
         let v: toml::Value =
             toml::from_str(s).map_err(|e| format!("配置解析失败(账外键或非法枚举值): {e}"))?;
+        if v.get(EXTENDS_KEY).is_some() {
+            return Err(format!(
+                "配置含 `{EXTENDS_KEY}`:继承需要文件上下文 —— 用 OwlConfig::load / 服务端配置档(字符串直载不解析 extends)"
+            ));
+        }
+        if v.get(FLAVOR_KEY).is_some() {
+            return Err(format!(
+                "配置含 `{FLAVOR_KEY}`:预设档引用需要文件上下文 —— 用 OwlConfig::load / 服务端配置档(字符串直载不解析 flavor)"
+            ));
+        }
         reject_retired_keys(&v)?;
         let c: Self = v
             .try_into()
@@ -1323,6 +1464,126 @@ mod tests {
 }
 
 #[cfg(test)]
+mod extends_tests {
+    use super::*;
+
+    /// 建临时目录/写档(每个用例一个目录;退出前自清)
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("owl_cfg_ext_{}_{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        file_loader::create_dir_all(&d).expect("mkdir");
+        d
+    }
+    fn write(p: &Path, body: &str) {
+        file_loader::write(p, body).expect("写档");
+    }
+
+    /// 真实链路:flavor(基准) + 站点档(extends 父档) + 子档覆盖。
+    /// 父档提供部署面、子档只写差异 —— 预设档未覆盖处仍保留。
+    #[test]
+    fn extends_父档先合并子档覆盖() {
+        let d = tmp_dir("merge");
+        let site = d.join("site.toml");
+        write(&site, "[runtime]\nmax_seq = 12345\n[pool]\nsnap_max = 2\n");
+        let child = d.join("child.toml");
+        write(&child, "extends = \"site.toml\"\n\n[spec]\ndepth = 5\n");
+        let flavor = crate::flavors::preset_path("spec-dflash").expect("预设档");
+        let c = OwlConfig::load(Some(&flavor), Some(&child)).expect("load");
+        assert_eq!(c.spec.depth, 5, "子档覆盖 flavor/父档");
+        assert_eq!(c.runtime.max_seq, 12345, "父档提供、flavor 未写者生效");
+        assert_eq!(c.pool.snap_max, 2, "父档覆盖 flavor");
+        assert_eq!(c.sampling.mode, SamplerMode::Greedy, "flavor 未被子/父覆盖处保留");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 链式继承(孙 extends 子 extends 父);相对路径 = 相对各自文件目录。
+    #[test]
+    fn extends_链式与相对路径() {
+        let d = tmp_dir("chain");
+        let sub = d.join("sub");
+        file_loader::create_dir_all(&sub).expect("mkdir sub");
+        write(&d.join("grand.toml"), "[runtime]\nmax_seq = 777\n");
+        write(
+            &sub.join("mid.toml"),
+            "extends = \"../grand.toml\"\n[spec]\ndepth = 4\n",
+        );
+        let leaf = sub.join("leaf.toml");
+        write(&leaf, "extends = \"mid.toml\"\n[pool]\nsnap_max = 3\n");
+        let c = OwlConfig::load(None, Some(&leaf)).expect("load");
+        assert_eq!(c.runtime.max_seq, 777, "祖父档向上传递");
+        assert_eq!(c.spec.depth, 4, "子档在链中保留");
+        assert_eq!(c.pool.snap_max, 3, "孙档自己的键在最上层");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 成环 = 响亮拒(不静默截断);报错点名链上文件。
+    #[test]
+    fn extends_成环响亮拒() {
+        let d = tmp_dir("cycle");
+        write(&d.join("a.toml"), "extends = \"b.toml\"\n");
+        write(&d.join("b.toml"), "extends = \"a.toml\"\n");
+        let e = OwlConfig::load(None, Some(&d.join("a.toml"))).expect_err("必须拒");
+        assert!(e.contains("成环"), "报错要点名环:{e}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 非字符串 extends / 空串 / 缺失父档 = 各自响亮拒(带路径与类型名)。
+    #[test]
+    fn extends_非法与缺失都响亮拒() {
+        let d = tmp_dir("bad");
+        let bad_ty = d.join("bad_ty.toml");
+        write(&bad_ty, "extends = 5\n");
+        let e = OwlConfig::load(None, Some(&bad_ty)).expect_err("类型非法必须拒");
+        assert!(e.contains("字符串") && e.contains("整数"), "要点名得到什么:{e}");
+
+        let empty = d.join("empty.toml");
+        write(&empty, "extends = \"  \"\n");
+        let e = OwlConfig::load(None, Some(&empty)).expect_err("空串必须拒");
+        assert!(e.contains("空字符串"), "{e}");
+
+        let missing = d.join("missing.toml");
+        write(&missing, "extends = \"nope.toml\"\n");
+        let e = OwlConfig::load(None, Some(&missing)).expect_err("缺失父档必须拒");
+        assert!(e.contains("nope.toml"), "要点名找不到的父档:{e}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 字符串直载没有文件上下文 ⇒ 含 extends 的文本响亮拒(不静默忽略)。
+    #[test]
+    fn extends_字符串直载拒() {
+        let e = OwlConfig::from_toml_str("extends = \"x.toml\"\n").expect_err("必须拒");
+        assert!(e.contains("文件上下文"), "{e}");
+    }
+
+    /// `flavor = "<预设名>"` = 该文件自带的基准层(复用 flavors/ 而不靠 CLI)。
+    #[test]
+    fn flavor_键解析为预设基准() {
+        let d = tmp_dir("flavor_key");
+        let conf = d.join("test-conf.toml");
+        write(&conf, "flavor = \"spec-dflash\"\n\n[spec]\ndepth = 5\n\n[runtime]\nmax_seq = 2048\n");
+        let c = OwlConfig::load(None, Some(&conf)).expect("load");
+        assert_eq!(c.spec.depth, 5, "文件覆盖预设");
+        assert_eq!(c.runtime.max_seq, 2048, "文件键到手");
+        assert_eq!(c.sampling.mode, SamplerMode::Greedy, "预设未覆盖处保留(spec-dflash)");
+        assert_eq!(c.dispatch.kv_fp8, true, "预设行为面保留");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 未知预设名 / 直载含 flavor = 响亮拒。
+    #[test]
+    fn flavor_非法响亮拒() {
+        let d = tmp_dir("flavor_bad");
+        let bad = d.join("bad.toml");
+        write(&bad, "flavor = \"no-such-flavor\"\n");
+        let e = OwlConfig::load(None, Some(&bad)).expect_err("未知预设必须拒");
+        assert!(e.contains("no-such-flavor"), "{e}");
+        let e2 = OwlConfig::from_toml_str("flavor = \"spec-dflash\"\n").expect_err("直载必须拒");
+        assert!(e2.contains("文件上下文"), "{e2}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
 mod prefill_bucket_tests {
     use super::*;
 
@@ -1350,7 +1611,7 @@ mod prefill_bucket_tests {
         file_loader::create_dir_all(&dir).expect("mkdir");
         let over = dir.join("over.toml");
         file_loader::write(&over, "[spec]\ndepth = 5\n").expect("w");
-        let base = crate::assets::preset_path("spec-dflash").expect("预设档");
+        let base = crate::flavors::preset_path("spec-dflash").expect("预设档");
         let c = OwlConfig::load(Some(&base), Some(&over)).expect("load");
         assert_eq!(c.spec.depth, 5, "覆盖文件优先");
         assert_eq!(c.sampling.mode, SamplerMode::Greedy, "基准未覆盖处保留");

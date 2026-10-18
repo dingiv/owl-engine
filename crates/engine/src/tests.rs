@@ -117,8 +117,8 @@ fn gpu_ordinal() -> Option<usize> {
 }
 
 /// CPU:构造(零执行)+ ModelLoader 装载门禁(权重/tokenizer 解析)
-/// EngineConfig 全件从**用例配置**注入(隐藏 env `OWL_TEST_CONFIG_CPU_CONSTRUCT_AND_LOAD`
-/// → 引擎同款 toml;缺省 = `OwlConfig::default()`)。本用例只到 loader ——
+/// EngineConfig 全件从**用例配置**注入(唯一入口 `OWL_TEST_CONF` 测试环境档;
+/// 缺省 = `OwlConfig::default()`)。本用例只到 loader ——
 /// 三件均不参与断言,注入不改测试行为;换档 = 换 toml 不改代码(S3 收编示范)。
 #[cfg(test)] // dev-dep(owl-macros)门控:单元档专用
 #[owl_test]
@@ -169,15 +169,14 @@ async fn cpu_incremental_decode_multibyte(cfg: &OwlConfig) {
 }
 
 /// **参数化端到端实证**(owl-test-macro.md §四验收 2):wrapper 注入的
-/// `cfg` 必须与「独立按同键 loader 复算」逐字段一致 —— env 未设臂
-/// (default)与文件臂(设 `OWL_TEST_CONFIG_CASE_CONFIG_INJECTION=<toml>`)
+/// `cfg` 必须与「独立按同层链复算」逐字段一致 —— 未设 `OWL_TEST_CONF` 臂
+/// (default)与设档臂(`OWL_TEST_CONF=<toml>`,可含 `flavor` + 覆盖)
 /// 用同一条断言。零装载零 GPU(单元档)。
 #[cfg(test)]
 #[owl_test]
 async fn case_config_injection(cfg: &OwlConfig) {
-    let key = "OWL_TEST_CONFIG_CASE_CONFIG_INJECTION";
-    let mut expect = match owl_shared::env_reader::str(key) {
-        Some(path) => OwlConfig::load(None, Some(std::path::Path::new(&path)))
+    let mut expect = match owl_shared::env_reader::str(owl_shared::testkit::TEST_CONF_ENV) {
+        Some(path) => OwlConfig::load_chain(None, &[std::path::Path::new(&path)])
             .unwrap_or_else(|e| panic!("独立复算失败({path}): {e}")),
         None => OwlConfig::default(),
     };
@@ -482,7 +481,7 @@ pub async fn cpu_mock_state_leg_probe() {
 /// ③**位置不变性**(同一段内容在不同起始位置 ⇒ 同一 `k̄`)—— 后者需要真 K,
 /// 故在 GPU 档打印对照值(CPU mock 的 K 恒零,只验链路)。
 async fn index_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>) {
-    let before = running.bank.rel.index_bytes();
+    let _before = running.bank.rel.index_bytes();
     // 生成段要够长:页边界(32)才出块 ⇒ 才触发采集
     let (_, tid) = running
         .submit_session(Some(1), "索引采集探针:第一段。", 80)
@@ -1069,7 +1068,7 @@ pub async fn gpu_08b_chunk_invariance_gate() {
 /// 一次探针跑 = **两个配置文件**描述全部行为面(与生产**同一条加载路**):
 ///
 /// ```text
-/// OWL_PROBE_FLAVOR=<name>    基准档(assets/flavors/<name>.toml)
+/// OWL_PROBE_FLAVOR=<name>    基准档(flavors/<name>.toml)
 /// OWL_PROBE_OVERLAY=<path>   覆盖文件(可选;同 server 的 [CONFIG] 位置)
 /// ```
 ///
@@ -1084,7 +1083,7 @@ pub async fn gpu_08b_chunk_invariance_gate() {
 fn probe_engine_config(ordinal: usize, default_flavor: &str) -> EngineConfig {
     let flavor = owl_shared::env_reader::str("OWL_PROBE_FLAVOR")
         .unwrap_or_else(|| default_flavor.to_string());
-    let base = owl_shared::assets::preset_path(&flavor).expect("预设档路径");
+    let base = owl_shared::flavors::preset_path(&flavor).expect("预设档路径");
     let overlay = owl_shared::env_reader::str("OWL_PROBE_OVERLAY").map(std::path::PathBuf::from);
     let cfg = owl_shared::config::OwlConfig::load(Some(&base), overlay.as_deref())
         .expect("探针配置装载(账外键/非法值 = 拒)");
@@ -1176,7 +1175,7 @@ async fn stage_in_scenario<D: DeviceClient>(running: &mut RunningEngine<D>) {
         running.bank.rel.leg.report().ops.offload_bytes >> 10,
         rep2.kv.slots_free
     );
-    let stage_before = running.stage.blocks;
+    let _stage_before = running.stage.blocks;
     // ③ 会话 3:原 prompt 再召回 ⇒ 回灌
     {
         let (_, tid) = running.submit_session(Some(3), p1, 4).expect("submit");

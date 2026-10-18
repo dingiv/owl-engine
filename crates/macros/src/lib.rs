@@ -165,7 +165,7 @@ fn expand(opts: Opts, f: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
 
     // 配置加载:有参数或需要门控时才读(纯 runtime 包装用例零 env 读取)
     let load = if param.is_some() || opts.gpu {
-        quote! { let __owl_cfg = ::owl_shared::testkit::case_config(#case); }
+        quote! { let __owl_cfg = ::owl_shared::testkit::case_config(#case, file!()); }
     } else {
         quote! {}
     };

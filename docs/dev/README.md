@@ -6,6 +6,7 @@
 
 | 文档 | 讲什么 | 什么时候看 |
 |---|---|---|
+| [`config.md`](config.md) | 配置链(Default→Flavor→文件→CLI)、`extends` 继承、站点档/实验档组织、拒启错误面 | 起服务、加实验档、改档位 |
 | [`debug-tools.md`](debug-tools.md) | 诊断面速查:`/debug/*` 端点、日志分级、metrics 各族、探针、排障顺序、杀进程纪律 | 服务行为可疑、要量分相、要抓现场 |
 | [`fixtures.md`](fixtures.md) | 夹具与门控:testkit / 金标资产 / 探针测试 / e2e 两入口 / lint 门 / 怎么加新场景 | 写测试、改算子、跑回归 |
 | [`profiling.md`](profiling.md) | nsys 用法 + 统一测速口径(`llm_speedtest`)+ A/B 方法论与常见误读 | 调性能、判收益、写验收表 |

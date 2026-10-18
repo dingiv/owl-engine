@@ -10,6 +10,8 @@ dev_log
 # testdata:bins 大件忽略,但金标生成脚本 + manifest(可复现配方)必须进版本
 # (M1 教训:资产/金标无版本 = 哨兵失明;operator-contract 设计 §4.9)
 testdata/*
+# 快速测试系统说明(唯一 env OWL_TEST_CONF + testdata/cases overlay):说明文档进版本
+!testdata/README.md
 !testdata/gdn_fla/
 testdata/gdn_fla/*
 !testdata/gdn_fla/gen.py

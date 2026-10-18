@@ -181,7 +181,7 @@ impl ServerConfig {
     pub fn load(flavor: Option<&str>, file: Option<&Path>, cli: &CliArgs) -> Result<Self, String> {
         // 预设档(flavor)= 预先写好的配置文件:入口把名字解析成路径,配置层只认文件
         let base = match flavor {
-            Some(name) => Some(owl_shared::assets::preset_path(name)?),
+            Some(name) => Some(owl_shared::flavors::preset_path(name)?),
             None => None,
         };
         let cfg = OwlConfig::load(base.as_deref(), file)?;

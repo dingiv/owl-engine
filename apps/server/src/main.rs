@@ -82,7 +82,7 @@ async fn main() {
     };
     if args.list_flavors {
         eprintln!("可用 flavor:");
-        for n in owl_shared::assets::preset_names() {
+        for n in owl_shared::flavors::preset_names() {
             eprintln!("  {n}");
         }
         return;

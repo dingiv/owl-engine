@@ -95,7 +95,7 @@ for n, c in cnt.most_common():
     print(f"  {c:>7}  {n}")
 
 # flavor 的 allowed_ops
-fl = tomllib.loads((root / "assets/flavors/awq27b.toml").read_text())
+fl = tomllib.loads((root / "flavors/awq27b.toml").read_text())
 flavor = set(fl.get("dispatch", {}).get("allowed_ops", []))
 
 # kernels 台账(PROD_AWQ27B_2026_10_13 的 Rust 列表字面量)

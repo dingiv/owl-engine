@@ -1115,22 +1115,22 @@ B 轴相位 ×54 边界:合计 7044.6ms
 全档 **视图步 23 / 回退 0**;门(下沉>0 · 视图驱动 · 输出非退化)全绿。
 ⇒ 生产面 B 轴 ≈ **8.5%**(k≥4);剩下的大头是**索引采集的 D2H 往返**(~750ms = 52%)。
 
-**(4)配置面(`shared/config.rs` + `assets/flavors/`)**
+**(4)配置面(`shared/config.rs` + `flavors/`)**
 
 新增 `[kvmem]` 段(`KvmemCfg`):`select_decode` / `select_partial` / `index` /
 `select_blocks` / `select_sink` / `select_recent` / `recall_every`。
 读取优先级同 `pool_tokens` 的既有律:**env 覆盖 > 配置对象 > 缺省**;
 `EngineKnobs::from_config` 是唯一搬运点。
 
-- `assets/flavors/awq27b.toml`(高显存档):显式写 `[kvmem]` **全关** ——
+- `flavors/awq27b.toml`(高显存档):显式写 `[kvmem]` **全关** ——
   池 ≥ ctx 时每个召回点都是纯开销;
-- `assets/flavors/awq27b-kvmem.toml`(**新的低显存档档**):派生自 awq27b +
+- `flavors/awq27b-kvmem.toml`(**新的低显存档档**):派生自 awq27b +
   `select_decode/select_partial/index = true`、`select_blocks = 32`、`recall_every = 4`。
 
 **(5)顺手修的既存回归(非本次引入,已如实标注)**
 
 `7c5627f`(A 轴收官)把 `PoolCfg.gdn_slots` 改名 `max_active_turns`,但
-`assets/flavors/{awq27b,spec-dflash}.toml` 的文本没跟上 ⇒ `deny_unknown_fields`
+`flavors/{awq27b,spec-dflash}.toml` 的文本没跟上 ⇒ `deny_unknown_fields`
 **直接拒解析**(`owl-shared` 两条测试红)。已改名为新字段名(语义不变:单会话 = 1)。
 
 ⚠️ **未修、待你拍**:`awq27b` flavor 的白名单列了 `owl_cast_bf16_f16`,而
@@ -1210,7 +1210,7 @@ nb = max(上述, ceil(seq_tokens/page))             否则(缺省 = 旧行为逐
 `[kvmem]` 新增 `dense_floor_mib` / `pool_overcommit`;`KvmemCfg::virtualization_enabled()`
 = **所有解锁类护栏的唯一判据**。
 
-`assets/flavors/awq27b-kvmem.toml` 改成**真正的低显存档配方**(27B/24G 为例):
+`flavors/awq27b-kvmem.toml` 改成**真正的低显存档配方**(27B/24G 为例):
 
 ```text
 上下文 32768 tok = 1024 页        (27B f16: 2 GiB KV)
