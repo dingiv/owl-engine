@@ -118,7 +118,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 由链哈希游标出 —— 物理块号会被回收复用,不可作键)
         let new_fed = base + chunk_ids.len();
         if self.pool.paged && new_fed.is_multiple_of(self.pool.page) {
+            // **边界相位拆分**(`OWL_VRAM_DBG=1`;2026-10-19 A3):
+            // 边界 = 快照拍摄(链哈希 + GDN 拷贝 + 登记)‖ 索引采集 ‖ B 轴(打分/选择/视图/调和)。
+            // 三者优化手段截然不同 ⇒ 必须各算一笔(旧口径只有"边界 {:.0}ms"一个数)。
+            let dbg = std::env::var_os("OWL_VRAM_DBG").is_some();
+            let t_snap = std::time::Instant::now();
+            let idx0 = self.prof.index_ms;
             self.capture_gdn_snap(sid, new_fed).await?;
+            let snap_ms = t_snap.elapsed().as_secs_f64() * 1000.0;
+            let idx_ms = self.prof.index_ms - idx0;
             // ── B 轴选择层(生产面 + 可选诊断面)──
             // 必须**晚于**边界事件:索引/快照刚登记完,候选块才齐(§8.4)。
             // 两扇门:`select_decode`(生产)= 打分/选择/视图/调和;
@@ -145,7 +153,17 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     .unwrap_or(new_fed);
                 let last_boundary =
                     next_end == new_fed || !next_end.is_multiple_of(self.pool.page);
+                let t_cov = std::time::Instant::now();
                 self.coverage_analyze(sid, new_fed, last_boundary).await?;
+                if dbg {
+                    let cov_ms = t_cov.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!(
+                        "[vram-b] 边界@{new_fed}: 快照+索引 {snap_ms:.0}ms(其中索引 {idx_ms:.0})\
+                         ‖ B 轴 {cov_ms:.0}ms"
+                    );
+                }
+            } else if dbg {
+                eprintln!("[vram-b] 边界@{new_fed}: 快照 {snap_ms:.0}ms(选择层关,无索引/B 轴)");
             }
         }
         // **逐 chunk 取证**(`OWL_VRAM_DBG=1`;2026-10-19 262k 冲刺):

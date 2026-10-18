@@ -408,11 +408,18 @@ impl MeanKCollector {
             )));
         }
         let base = self.offset(layer, kv_head)?;
-        // 逆旋**只此一份实现**(`derope_halves_inplace`;约定单源)
-        self.scratch.copy_from_slice(k);
-        derope_halves_inplace(&mut self.scratch, cos, sin)?;
-        for (i, v) in self.scratch.iter().enumerate() {
-            self.sums[base + i] += *v as f64;
+        // 逆旋**只此一份实现**(`derope_pair`;约定单源)——
+        // 直接算进累加器,**不经过 scratch 双拷**(2026-10-19 A3 热路修正:
+        // 每行省一次 1 KiB 拷贝 + 一次 256 元素回读;采集是逐行热路)。
+        let half = cos.len();
+        let acc = &mut self.sums[base..base + self.dim];
+        for i in 0..half {
+            let (nx, ny) = derope_pair(k[i], k[i + half], cos[i], sin[i]);
+            acc[i] += nx as f64;
+            acc[i + half] += ny as f64;
+        }
+        for i in 2 * half..self.dim {
+            acc[i] += k[i] as f64;
         }
         self.count += 1;
         Ok(())

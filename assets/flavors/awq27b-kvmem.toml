@@ -23,18 +23,30 @@ kind = "awq27b"
 # 池由**引擎的显存治理器**算(见 `[pool].pool_tokens` 注释),不由本文件手写猜。
 max_seq = 131072
 # chunk:**与池容量直接争显存** —— 27B prefill 工作区 ∝ chunk(实测 ~16.5 MiB/token):
-#     chunk  64 ⇒ 工作区 1065 MiB ‖ chunk 128 ⇒ 2121 MiB ‖ chunk 256 ⇒ 3465 MiB
-#   装配后驱动 free 3575 MiB(含池 1 GiB)⇒ 用 chunk 256 时 3575−3465−128(守卫 reserve)
-#   = **−18 MiB** ⇒ 第 27 个 chunk 起分配必被守卫拒发(实测)。
-#   ⇒ 本档取 **128**(工作区 2.12 GiB,运行余量 ~1.4 GiB)。
-prefill_chunk = 128
+# ⚠️ **该预算已作废(2026-10-19 A0-bis 之后)**:上面那组"工作区 ∝ chunk"的数字
+# 是在**中途活性回收失效**的年代测的(影子 arena 峰值 2064 MiB @chunk256,真回收
+# 14/1431);`count_pending_multi` 修好后单 chunk 激活面只剩 **~40 MiB 级**
+# (同族档 262k 实测:chunk 512 峰 ~0.7 GiB),实测装配后驱动 free ~3.0 GiB。
+#
+# ── **chunk 定档 = 512**(2026-10-19 实测,~16k tok agent 典型档)──
+# chunk 是**前向吞吐的头号旋钮**(GEMM/attention 的 M 维):debug 档实测 prefill
+# (KVMem partial 全开,16k tok,单张 3090 Ti):
+#     chunk 128 / every 4 = **334 tok/s** ← 旧档
+#     chunk 256 / every 2 = 623
+#     chunk 512 / every 1 = **1086** ✓ 本档
+#     chunk 512 / every 2 = 1105
+#     chunk 1024 / every 1 = **1160**(吞吐最大档;召回节奏也最粗)
+# 参照:同池裸引擎(chunk 512,无 KVMem)= 1151 tok/s ⇒ **超卖代价 ~6%**。
+# 选 512/every1 = **召回节奏与旧档一致**(每 512 tok 一次完整召回),
+# 只换 chunk 粒度 ⇒ 质量面不动、吞吐 3.3×。
+prefill_chunk = 512
 
 [pool]
 # ⚠️ **池下限算式**(boot 硬校验,不满足直接拒启并报数;装配期打 `[turn-ws]` 自证行):
 #
 #     nb ≥ gdn_slots × (ceil(workspace_per_req/32) + ceil(chunk/32))
-#     96 ≥ 1 × (ceil(1024/32)=32 + 8) = 40                 ✓
-#         (工作集 32 页 = 保底 sink2 + recent4 + 召回 top-k 26 块)
+#     1024 ≥ 1 × (ceil(8192/32)=256 + 4) = 260                ✓
+#          (工作集 256 页 = 保底 sink2 + recent4 + 召回 top-k 250 块)
 #
 # **池容量 = 让引擎治理器算**(不手写猜数):
 #   `StatePool::alloc` 硬预算治理:
@@ -56,14 +68,19 @@ prefill_chunk = 128
 #   (要改池只动这一行;它必须 ≥ 上面的下限算式,且 ≤ 治理器的 cap ——
 #    治理器会打 `[vram-gov]` 行给出 cap。)
 pool_tokens = 32768
-# 并发上限:每活跃 turn **各自**一套工作集 ⇒ 每加一个并发就多一份 46 页
+# 并发上限:每活跃 turn **各自**一套工作集 ⇒ 每加一个并发就多一份 260 页
+# (装配期硬校验:池 1024 页,本档 1 并发 ⇒ 260 页用掉四分之一)
 gdn_slots = 1
 snap_max = 4
 # 24 GiB 贴顶档:预留压到最小(**实测 1024 会吃到 0 可用** ——
 # `vram-hard-budget` 池 = 驱动 free − reserve,27B 权重 19.2 GiB 之后没那么多余量)
 vram_reserve_mb = 128
 # ⚠️ **宿主双腿必须给量**(下沉的落点;0 = 关层 ⇒ 沉不下去,响亮打点):
-#   - KV 腿:全量 − 池 =(256−96) 页 × 2 MiB ≈ 320 MiB,给 3072 MiB 留余
+#   - KV 腿:全量 − 池 =(131072−32768) tok × 32 KiB = **3072 MiB**(正好给满)
+#           ⇒ 顶到 max_seq 时无余量;要留余就把 max_seq 或池往下调
+#   - 状态腿:**超卖会把压力推给它**(实测 27B 单个 GDN 快照 607 MiB;
+#             snap_max=4 名义 2.4 GiB ⇒ 本腿 1 GiB 只容得下 1 个多 —— 实测会打
+#             “宿主层越界”点,属**已知薄档症状**,不影响 KV 腿正确性)
 #   - 状态腿:**超卖会把压力推给它**(实测 27B 单个 GDN 快照 607 MiB)
 host_cache_mb = 3072
 snap_host_mb = 1024
@@ -88,17 +105,24 @@ select_partial = true
 index = true
 # ── 锁①:允许池小于上下文 ──
 pool_overcommit = true
-# ── 锁②:准入地板(缺省 = **每 turn 工作集字节**,由 workspace_per_req 派生)──
-# 想保守就显式给 MiB 数(显式值优先,派生值不作数):
+# ── 锁②:准入地板(缺省 = **每 turn 工作集页数**,由 workspace_per_req 派生)──
+# 页口径(A7,2026-10-19):地板 = 页数 × 页字节,与池下限/链增长同一把尺。
+# 想保守就显式给 MiB 数(装配期按池页宽**向上取整**成页;显式值优先):
 # dense_floor_mib = 128
 # ── **每 turn 工作集**(本档唯一的容量-质量旋钮;token 口径)──
-#   1024 tok = 32 页(页 32 tok) = 常驻 32 块 = 保底 sink 2 + recent 4 + 召回 top-k 26
+#   8192 tok = 256 页(页 32 tok) = 常驻 256 块 = 保底 sink 2 + recent 4 + 召回 top-k 250
 #   ⚠️ 调它就是"用质量换并发":小 ⇒ 池能装更多 turn/decode 每步读更少,
-#      但召回预算跟着小(注意力能看到的块变少);薄档建议先扫"预算→覆盖率"曲线
-workspace_per_req = 1024                    # 32 页(页 32 tok)= 保底 6 + 召回 top-k 26
+#      但召回预算跟着小(注意力能看到的块变少)。
+#   📌 **为什么是 8192(A8 定谳,2026-10-19;设计卷 §8.35)**:
+#      ws 1024 在 ~26k tok 上下文上只有 **4% 常驻** ⇒ 细节召唤型问答(多处
+#      散落记录汇总)直接**答不出**(实测输出 2 字);判别实验钉死主因就是比例:
+#        ws1024+every4 红 · ws1024+every1 红(⇒ 节奏不是病因)
+#        ws8192+every1 绿 · ws8192+every4 绿 · items=64(短 ctx)绿
+#      ⚠️ 质量的真值随 ws 单调 ⇒ “重新答对所需的最低保留比”曲线仍未测(挂账 A8③)。
+workspace_per_req = 8192                    # 256 页 = 常驻 256 块(保底 6 + top-k 250)
 select_sink = 2
 select_recent = 4
-recall_every = 4
+recall_every = 1          # 与 chunk 512 配套:每 512 tok 一次完整召回(与旧 128×4 同律)
 # 诊断面:**生产档关**(真实质量扫描单次 6.3s = 墙钟 32%,见设计卷 §8.23)
 coverage_probe = false
 # 分析边界目标:仅诊断面用;生产档不需要

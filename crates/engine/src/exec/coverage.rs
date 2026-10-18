@@ -985,7 +985,9 @@ impl<D: DeviceClient> RunningEngine<D> {
                 q.push(row);
             }
             let ids: Vec<u64> = q_blocks.iter().map(|b| b.id).collect();
+            let t_free = std::time::Instant::now();
             face.free(&ids).await?;
+            self.prof.q_free_ms += t_free.elapsed().as_secs_f64() * 1000.0;
             self.prof.q_toh_ms += io_ms;
             self.prof.q_dec_ms += t_dec.elapsed().as_secs_f64() * 1000.0;
         }

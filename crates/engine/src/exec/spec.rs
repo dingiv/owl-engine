@@ -772,12 +772,22 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// 边界 token 段来源 = 本 turn 的完整 token 链(`prompt_ids ++ out`;
     /// prefill 期落在 prompt 内,decode 期跨到生成段)—— `fed` 单调不减。
     /// 槽位选择/LRU 覆盖写在 StatePool::capture_snap(state.rs)。
+    /// **块边界事件**(唯一入口;一次算身份、三件事共用)。
+    ///
+    /// 三件(2026-10-19 解耦;原先全被 `snap_max == 0` 一起门掉 —— **语义错**):
+    /// ① **链推进 + 逐块身份哈希**(总是;身份是索引与缓存树的共同键);
+    /// ② **增量登记进缓存树**(`select_partial`;不登记 ⇒ 块永远 refs==1 ⇒
+    ///    结构性不可沉,超卖档直接失效);
+    /// ③ **索引采集**(`index_probe`;打分的前置件);
+    /// ④ **GDN 快照拍摄**(仅 `pool.snap_capacity() > 0`;前缀复用面)。
+    ///
+    /// 为什么必须解耦:①③ 是**超卖机制的必需品**,② 是下沉的必需品 ——
+    /// 它们与"要不要拍快照"无关。旧实现把四件塞在一个 `snap_max == 0 ⇒ return`
+    /// 之后:关快照面 ⇒ **索引不采 + 块不入树 ⇒ 静默不沉**(实测 `snap_max = 0`
+    /// 档:下沉 0 块 / 不可沉 1680 块;prefill 假快 942 tok/s)。
     pub(crate) async fn capture_gdn_snap(&mut self, sid: u64, fed: usize) -> Result<()> {
-        // snap_max = 0 ⇒ 快照面整体关闭:跳过(该档无语义需求;不得靠内部错误
-        // 兜底 —— 那是 panic 换 503,见 agent 专项 A2)
-        if self.pool.snap_capacity() == 0 {
-            return Ok(());
-        }
+        // 快照面开关(只门住第 ④ 步;前三步照走)
+        let snap_on = self.pool.snap_capacity() > 0;
         let page = self.pool.page;
         let full_blocks = fed / page;
         if page == 0 || full_blocks == 0 {
@@ -829,11 +839,16 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // **S2(§25.2)**:槽位选择 + 冷快照下沉 —— 快照账的真源是 store 的
         // `StateStore`;设备池只做槽位索引。槽满时先**下沉最冷的一条**
         // (内容留宿主),沉不下(宿主满/关)才丢(响亮打点)。
-        let slot = self.snap_ensure_slot(key).await?;
-        let face = self.graphs.session.face_mut();
-        self.pool.capture_snap(face, gdn_slot, key, Some(slot)).await?;
-        // 登记/触达(层 = 设备)
-        self.bank.rel.state.register_snap(key, self.pool.snap_bytes(), owl_store::Tier::Gpu);
+        if snap_on {
+            let slot = self.snap_ensure_slot(key).await?;
+            let face = self.graphs.session.face_mut();
+            self.pool.capture_snap(face, gdn_slot, key, Some(slot)).await?;
+            // 登记/触达(层 = 设备)
+            self.bank
+                .rel
+                .state
+                .register_snap(key, self.pool.snap_bytes(), owl_store::Tier::Gpu);
+        }
         // **B 轴 B-0:同一处顺手采索引**(同一"块边界 + 链尾身份"事件 ⇒
         // 一次算身份、一次推进游标;索引与 GDN 快照共享边界身份)。
         // 逐块登记:物理页由**会话块表**定(池可被多会话共享;旧实现拿
@@ -951,6 +966,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let face = self.graphs.session.face_mut();
             face.dtoh_batch(&pieces).await?
         };
+        let t_host = std::time::Instant::now();
+        let dtoh_ms = t_host.duration_since(t_index).as_secs_f64() * 1000.0;
         let mut row = vec![0.0f32; hd];
         for (li, _kv) in self.pool.kvs.iter().enumerate().take(layers) {
             let kbuf = &all[li * page_bytes..(li + 1) * page_bytes];
@@ -967,7 +984,19 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         let entries = collector.finish()?;
         self.bank.rel.index_register(block_hash, entries)?;
-        self.prof.index_ms += t_index.elapsed().as_secs_f64() * 1000.0;
+        let el = t_index.elapsed().as_secs_f64() * 1000.0;
+        self.prof.index_ms += el;
+        // **相位拆分**(`OWL_IDX_DBG=1`;A3 定位用,2026-10-19):
+        // 块级索引采集 = ①批量 D2H(排空 COMPUTE)②host 逐 token×头解码/逆RoPE/累加。
+        // 两半的优化手段完全不同(① 合并命令/上设备 ② SIMD/上设备)⇒ 必须分开量。
+        if std::env::var_os("OWL_IDX_DBG").is_some() {
+            let host_ms = t_host.elapsed().as_secs_f64() * 1000.0;
+            eprintln!(
+                "[idx] block={block} 总 {el:.1}ms = D2H {dtoh_ms:.1} + host {host_ms:.1}\
+                 (页 {page} tok × {layers} 层 × {hkv} 头 = {} 行)",
+                page * layers * hkv
+            );
+        }
         Ok(())
     }
 

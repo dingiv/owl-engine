@@ -1290,10 +1290,9 @@ async fn select_27b_scenario() {
     knobs.select_partial = sp;
     // 虚拟化开关跟着 partial 走(bare 必须关:否则池仍被钉在 ctx 上,与基线不可比)
     knobs.kvmem_virtualization = sp;
-    knobs.dense_floor = EngineKnobs::dense_floor_for(
-        sp,
-        owl_shared::env_reader::parse::<u64>("OWL_27B_FLOOR_MIB"),
-    );
+    // 地板 = **事实**(env 给 MiB);页数由装配期按池宽落(A7:同一把尺)
+    knobs.dense_floor_mib = owl_shared::env_reader::parse::<u64>("OWL_27B_FLOOR_MIB");
+    knobs.dense_floor = EngineKnobs::dense_floor_for(sp, knobs.dense_floor_mib);
     eprintln!("[b5-27b] 臂={arm}(index={ix} select_decode={sd} select_partial={sp})");
     // ⚠️ 这里**不再**硬编码任何引擎旋钮(host 预算/chunk/核档/fi)——
     // 它们全部来自 `awq27b-kvmem.toml`(或 `OWL_PROBE_OVERLAY` 的覆盖件)。
@@ -1347,14 +1346,36 @@ async fn select_27b_scenario() {
     body.push_str("请汇总:上面六份记录里的校准值、编号、页签各是多少?");
     let t0 = std::time::Instant::now();
     let (_, tid) = running.submit_session(Some(1), &body, 24).expect("submit");
+    // **预填充吞吐口径**(2026-10-19 加):TTFT = 从 submit 到第一个 Token 事件
+    // = 整段 prompt 的 prefill 墙钟(含逐 chunk 的边界开销)。
+    // 为什么要这一行:超卖档的代价全在 prefill 上(每 chunk 一次边界),
+    // 而旧的"用时"含 decode ⇒ 看不清 prefill 自己的速率。
+    let mut ttft = None;
+    let mut prompt_tok = 0usize;
     let text = loop {
         match running.pump().await.expect("pump") {
+            TurnEvent::Prefill { total, .. } => prompt_tok = prompt_tok.max(total),
+            TurnEvent::Token { turn, .. } if turn == tid && ttft.is_none() => {
+                ttft = Some(t0.elapsed());
+            }
             TurnEvent::Completed { turn, text, .. } if turn == tid => break text,
             TurnEvent::Failed { turn, err } => panic!("t{turn} 失败: {err}"),
             TurnEvent::Idle => panic!("turn {tid} 队列丢失"),
             _ => {}
         }
     };
+    if let Some(ttft) = ttft {
+        let secs = ttft.as_secs_f64().max(1e-6);
+        let n = prompt_tok.max(1);
+        let bnd = running.prof.boundaries.max(1);
+        eprintln!(
+            "[b5-27b] prefill: {n} tok / {secs:.2}s = **{:.0} tok/s** · 边界 {bnd} 次 · \
+             平均 {:.0} ms/边界(B 轴 {:.0} ms/边界)",
+            n as f64 / secs,
+            secs * 1000.0 / bnd as f64,
+            running.prof.total_ms / bnd as f64
+        );
+    }
     let rep = running.store_report();
     let st = running.stage;
     let pt = running.partial;
@@ -3510,4 +3531,52 @@ async fn gpu_prefill_bucket_matches_eager() {
         reuse[1].2
     );
     assert_eq!(reuse[1].2, 0, "Off 档不得有桶回放");
+}
+
+// ============================================================================
+// A7 收口(2026-10-19):准入地板 = 页口径
+// ============================================================================
+
+/// **MiB 事实 → 页数**:向上取整到整页(少一页 = 承诺了又给不够);
+/// `0 MiB` = 允许全量下沉(0 页,不是“未设”)。
+#[test]
+fn dense_floor_mib_converts_up_to_pages() {
+    use owl_store::TurnFloor;
+    let mib = 1usize << 20;
+    assert_eq!(EngineKnobs::dense_floor_with_mib(1, mib), TurnFloor::Pages(1));
+    assert_eq!(EngineKnobs::dense_floor_with_mib(1, mib / 2), TurnFloor::Pages(2), "半页配置 ⇒ 整页");
+    assert_eq!(EngineKnobs::dense_floor_with_mib(3, mib), TurnFloor::Pages(3));
+    assert_eq!(EngineKnobs::dense_floor_with_mib(0, mib), TurnFloor::Pages(0));
+}
+
+/// **装配期单源派生**:一个 `workspace_per_req` 同时落 `select_blocks` 与
+/// 地板页数;显式 MiB 优先(页宽由池给)。三件同源 = 不再各处各算一遍。
+#[test]
+fn derive_turn_ws_sets_blocks_and_floor_from_one_source() {
+    use owl_store::TurnFloor;
+    let page_bytes = 1usize << 20; // 页 = 32 tok × 32KiB
+    // ① 未给 MiB:地板 = 工作集页数
+    let mut k = EngineKnobs { kvmem_virtualization: true, ..Default::default() };
+    k.workspace_per_req = 640; // 20 页
+    k.select_sink = 2;
+    k.select_recent = 4;
+    let (pages, bytes) = EngineKnobs::derive_turn_ws(640, 32, page_bytes, &mut k).expect("派生");
+    assert_eq!((pages, bytes), (20, 20 << 20));
+    assert_eq!(k.select_blocks, 20, "召回预算 = 总选中数(含保底)");
+    assert_eq!(k.dense_floor, TurnFloor::Pages(20), "地板与池下限同一套页数");
+    // ② 显式 MiB:按页宽换成页数(与工作集无关)
+    let mut k = EngineKnobs { kvmem_virtualization: true, ..Default::default() };
+    k.workspace_per_req = 640;
+    k.dense_floor_mib = Some(2);
+    let _ = EngineKnobs::derive_turn_ws(640, 32, page_bytes, &mut k).expect("派生");
+    assert_eq!(k.dense_floor, TurnFloor::Pages(2));
+    // ③ 非虚拟化档:地板不许被改(唯一诚实值 = Strict)
+    let mut k = EngineKnobs { kvmem_virtualization: false, ..Default::default() };
+    k.workspace_per_req = 640;
+    let _ = EngineKnobs::derive_turn_ws(640, 32, page_bytes, &mut k).expect("派生");
+    assert_eq!(k.dense_floor, TurnFloor::Strict, "非虚拟化档地板不动");
+    // ④ 工作集 < 保底 = 配置不自洽 ⇒ 响亮拒
+    let mut k = EngineKnobs { kvmem_virtualization: true, ..Default::default() };
+    k.workspace_per_req = 64; // 2 页 < sink2+recent4 = 6 页
+    assert!(EngineKnobs::derive_turn_ws(64, 32, page_bytes, &mut k).is_err());
 }

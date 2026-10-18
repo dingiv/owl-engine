@@ -100,8 +100,24 @@ impl KvPageFormat {
                 base + hd
             )));
         }
-        for (d, o) in out.iter_mut().enumerate() {
-            *o = self.elem_at(page_bytes, base + d);
+        // **格式分支在循环外 + e4m3 表一次取**(2026-10-19 A3 热路修正):
+        // 原式逐元素 `elem_at`(match + `OnceLock` 原子读)⇒ 11 µs/行;
+        // 本式逐元素只有一次查表/转换(单块 52 万元素的采集热路上是数量级差)。
+        match self {
+            Self::F16 => {
+                let lo = base * 2;
+                let raw = &page_bytes[lo..lo + out.len() * 2];
+                for (o, c) in out.iter_mut().zip(raw.chunks_exact(2)) {
+                    *o = half::f16::from_le_bytes([c[0], c[1]]).to_f32();
+                }
+            }
+            Self::Fp8E4M3 => {
+                let lut = owl_models::kernel::e4m3_lut();
+                let n = out.len();
+                for (o, b) in out.iter_mut().zip(&page_bytes[base..base + n]) {
+                    *o = lut[*b as usize];
+                }
+            }
         }
         Ok(())
     }

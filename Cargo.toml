@@ -60,3 +60,16 @@ opt-level = 3
 # 进未优化的 half 里照样慢)。
 [profile.dev.package.half]
 opt-level = 3
+
+# **同律扩展到引擎与 store 的逐元素热路**(2026-10-19,A3 定谳):
+# 索引采集(`MeanKCollector`)/ Q 面解码(`KvPageFormat::decode_row`)/ 解释器
+# 逐节点粘合层全在这两 crates 里。debug(opt-level 0)实测:
+#   - 索引采集 **10.6 ms/块**(微基准 0.27 ms/块 ⇒ **40× 差**)
+#   - 探针档 prefill 596 tok/s;裸引擎 chunk128 仅 246 tok/s
+# 与 `owl-models`/`owl-cpu`/`half` 同一条纪律:凡“逐元素/逐节点”路径,
+# 测试档必须带优化(否则探针读数与生产读数不是同一个东西)。
+[profile.dev.package.owl-store]
+opt-level = 3
+
+[profile.dev.package.owl-engine]
+opt-level = 3

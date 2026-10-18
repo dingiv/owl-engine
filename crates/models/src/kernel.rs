@@ -27,7 +27,7 @@ pub use owl_kernels::kernel::{
 /// 单源在 `owl_kernels::ops::oracles` —— 那里是**独立手写、已被 GPU 逐字节
 /// 验证过**的 e4m3 参考(`k0_fp8_knhd` oracle:池字节 == host e4m3 RNE 参考)。
 /// 引擎侧**不得**再写第二份 e4m3 解码(AGENTS:接口不唯一 = 两套规范)。
-pub use owl_kernels::ops::oracles::{e4m3_decode, e4m3_encode};
+pub use owl_kernels::ops::oracles::{e4m3_decode, e4m3_encode, e4m3_lut};
 
 // ======================================================================
 // KV 写者/读者清单门(收口律配套;pitfall §14 机器化,2026-10-10)
