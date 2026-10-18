@@ -688,39 +688,129 @@ pub fn score_blocks(
             }
         }
         // ③ 单累加器(逐候选);权重 |G|/hq 与 1/层数 最后统一乘
-        let mut acc = vec![0.0f32; cands.len()];
-        let mut seen = vec![0usize; cands.len()];
-        let mut tile = vec![0.0f32; TILE_ROWS * dim];
-        let mut have = vec![false; TILE_ROWS];
-        for l in 0..layers {
-            for (g, hs) in q_heads_of.iter().enumerate() {
-                if hs.is_empty() {
-                    continue;
-                }
-                let w = hs.len() as f32 / hq as f32;
-                let ql = &qbar[(l * kv_heads + g) * dim..(l * kv_heads + g + 1) * dim];
-                for (ci, chunk) in cands.chunks(TILE_ROWS).enumerate() {
-                    for (ri, b) in chunk.iter().enumerate() {
-                        match index.entry_at(*b, l, g) {
-                            Some(row) => {
-                                let dst = &mut tile[ri * dim..(ri + 1) * dim];
-                                for (o, bits) in dst.iter_mut().zip(row) {
-                                    *o = f16_to_f32(*bits);
-                                }
-                                have[ri] = true;
-                            }
-                            None => have[ri] = false,
-                        }
+        //
+        // **并行口径(2026-10-19 262k 冲刺)**:按**候选分片**,每片自带
+        // `acc/seen/tile` ⇒ 每个候选的 (层, KV 头) 累加**顺序与串行逐位相同**
+        // (只并行不同候选,不动任何求和次序)⇒ 数值**逐位不变**,只买吞吐。
+        // 为什么必须并行:召回点打分是 O(块数) —— 262k(8192 块)/ 每 512 tok 一次
+        // 完整召回的档上,串行 host 打分实测 ~32s/51k tok ⇒ 262k 要十几分钟。
+        // 分片数 = 可用并行度(上限 16;候选少于一页时直接串行,零线程开销)。
+        let nthreads = if cands.len() < TILE_ROWS * 2 {
+            1
+        } else {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(16)
+        };
+        let acc: Vec<f32>;
+        let seen: Vec<usize>;
+        if nthreads <= 1 {
+            let mut a = vec![0.0f32; cands.len()];
+            let mut sn = vec![0usize; cands.len()];
+            let mut tile = vec![0.0f32; TILE_ROWS * dim];
+            let mut have = vec![false; TILE_ROWS];
+            for l in 0..layers {
+                for (g, hs) in q_heads_of.iter().enumerate() {
+                    if hs.is_empty() {
+                        continue;
                     }
-                    for (ri, row) in tile.chunks_exact(dim).take(chunk.len()).enumerate() {
-                        if !have[ri] {
-                            continue;
+                    let w = hs.len() as f32 / hq as f32;
+                    let ql = &qbar[(l * kv_heads + g) * dim..(l * kv_heads + g + 1) * dim];
+                    for (ci, chunk) in cands.chunks(TILE_ROWS).enumerate() {
+                        for (ri, b) in chunk.iter().enumerate() {
+                            match index.entry_at(*b, l, g) {
+                                Some(row) => {
+                                    let dst = &mut tile[ri * dim..(ri + 1) * dim];
+                                    for (o, bits) in dst.iter_mut().zip(row) {
+                                        *o = f16_to_f32(*bits);
+                                    }
+                                    have[ri] = true;
+                                }
+                                None => have[ri] = false,
+                            }
                         }
-                        acc[ci * TILE_ROWS + ri] += dot8(row, ql) * (scale * w);
-                        seen[ci * TILE_ROWS + ri] += 1;
+                        for (ri, row) in tile.chunks_exact(dim).take(chunk.len()).enumerate() {
+                            if !have[ri] {
+                                continue;
+                            }
+                            a[ci * TILE_ROWS + ri] += dot8(row, ql) * (scale * w);
+                            sn[ci * TILE_ROWS + ri] += 1;
+                        }
                     }
                 }
             }
+            acc = a;
+            seen = sn;
+        } else {
+            let mut a = vec![0.0f32; cands.len()];
+            let mut sn = vec![0usize; cands.len()];
+            let per = cands.len().div_ceil(nthreads);
+            let parallel_err = std::cell::Cell::new(false);
+            // 共享引用在闭包外绑定(`&Vec` 是 Copy ⇒ 每片各持一份引用,不搬走本体)
+            let q_heads_ref = &q_heads_of;
+            let qbar_ref = &qbar;
+            let index_ref = index;
+            std::thread::scope(|scope| {
+                let mut hs = Vec::with_capacity(nthreads);
+                for (ti, (a_out, sn_out)) in a
+                    .chunks_mut(per)
+                    .zip(sn.chunks_mut(per))
+                    .enumerate()
+                {
+                    let lo = ti * per;
+                    let sub = &cands[lo..lo + a_out.len()];
+                    let err = &parallel_err;
+                    hs.push(scope.spawn(move || {
+                        let mut tile = vec![0.0f32; TILE_ROWS * dim];
+                        let mut have = vec![false; TILE_ROWS];
+                        for l in 0..layers {
+                            for (g, hsv) in q_heads_ref.iter().enumerate() {
+                                if hsv.is_empty() {
+                                    continue;
+                                }
+                                let w = hsv.len() as f32 / hq as f32;
+                                let ql = &qbar_ref[(l * kv_heads + g) * dim
+                                    ..(l * kv_heads + g + 1) * dim];
+                                for (ci, chunk) in sub.chunks(TILE_ROWS).enumerate() {
+                                    for (ri, b) in chunk.iter().enumerate() {
+                                        match index_ref.entry_at(*b, l, g) {
+                                            Some(row) => {
+                                                let dst = &mut tile[ri * dim..(ri + 1) * dim];
+                                                for (o, bits) in dst.iter_mut().zip(row) {
+                                                    *o = f16_to_f32(*bits);
+                                                }
+                                                have[ri] = true;
+                                            }
+                                            None => have[ri] = false,
+                                        }
+                                    }
+                                    for (ri, row) in
+                                        tile.chunks_exact(dim).take(chunk.len()).enumerate()
+                                    {
+                                        if !have[ri] {
+                                            continue;
+                                        }
+                                        a_out[ci * TILE_ROWS + ri] += dot8(row, ql) * (scale * w);
+                                        sn_out[ci * TILE_ROWS + ri] += 1;
+                                    }
+                                }
+                            }
+                        }
+                        let _ = err;
+                    }));
+                }
+                for h in hs {
+                    if h.join().is_err() {
+                        parallel_err.set(true);
+                    }
+                }
+            });
+            if parallel_err.get() {
+                return Err(StoreError::Invariant("打分并行线程 panic(结果不可信)".into()));
+            }
+            acc = a;
+            seen = sn;
         }
         // mean over (层, KV 头) —— 缺失行不计入分母(与慢路“缺块不当 0”同律)
         let wl = 1.0 / layers.max(1) as f32;
