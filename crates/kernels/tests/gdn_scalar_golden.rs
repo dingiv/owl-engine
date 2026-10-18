@@ -87,6 +87,10 @@ fn gdn_scalar_golden() {
         .expect("fn owl_gdn_chunk_scalar_f32");
 
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/gdn_fla/cases");
+    if !std::path::Path::new(dir).join("c1_t64.q.bin").is_file() {
+        eprintln!("skip: 金标 bin 不在({dir};`gen.py` 生成,或从主树 testdata/gdn_fla/cases 链接)");
+        return;
+    }
 
     for (tag, t) in CASES {
         let case = load_case(dir, tag, *t);

@@ -229,11 +229,11 @@ fn finite(v: &[f32]) -> bool {
 
 #[test]
 fn fi_graph_replay_m2a() {
-    if !std::env::var_os("OWL_TEST_DEVICE").is_some_and(|v| !v.is_empty()) {
+    if owl_cuda::test_device_bdf().is_none() {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
     }
-    let dev: usize = std::env::var("OWL_TEST_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let dev: usize = owl_cuda::test_device_ordinal();
     // 本探针**自带图档 env**(独立二进制 ⇒ 无并行踩踏;与 C++ 侧同源同读法)
     std::env::set_var("FI_CUDA_GRAPH", "1");
     std::env::remove_var("FI_NO_MASK");
