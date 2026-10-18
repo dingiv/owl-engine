@@ -2127,6 +2127,11 @@ fn spec_degrade_transition_branches() {
     // 退避封顶 512
     let (s, d, p) = spec_degrade_transition(9, true, 400, 0, 6, 64);
     assert_eq!((s, d, p), (10, true, 512));
+    // **小首探窗**(2026-10-18 缺省 8):入降级即用 8,探测失败退避到 16
+    let (s, d, p) = spec_degrade_transition(5, false, 8, 0, 6, 8);
+    assert_eq!((s, d, p), (6, true, 8));
+    let (s, d, p) = spec_degrade_transition(6, true, 8, 0, 6, 8);
+    assert_eq!((s, d, p), (7, true, 16));
     // threshold=0 = 禁用(永不入降级)
     let (s, d, p) = spec_degrade_transition(9, false, 64, 0, 0, 64);
     assert_eq!((s, d, p), (10, false, 64));

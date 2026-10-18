@@ -46,7 +46,7 @@
 //! | pool | prefix_cache | bool / true |
 //! | spec | depth / dumb / draft_kv_fp8 | usize 0(off)、flag、flag |
 //! | spec | notaps / tapdecl | flag / false(verify 图诊断) |
-//! | spec | degrade_after / probe_every | usize / 6、64 |
+//! | spec | degrade_after / probe_every | usize / 6、8(降级首探窗口;旧 64 = 长尾税) |
 //! | sampling | mode | SamplerMode 枚举("greedy"\\|"sampling")/ sampling |
 //! | sampling | temp / topk / topp / rep_penalty | 1.0 / 20 / 0.95 / 1.0 |
 //! | load | verify / debug_tap | flag / false |
@@ -252,7 +252,17 @@ pub struct SpecCfg {
     pub notaps: bool,
     /// TAPDECL 二分臂(声明期 tapped 不挂输出槽)
     pub tapdecl: bool,
+    /// **m=0 连击阈值**(达此连击 → 降级裸 decode;0 = 禁用降级)
     pub degrade_after: usize,
+    /// **降级后的首次探测窗口(tokens)** —— 探测 = 跑一个投机轮试水,命中(m≥1)即恢复 spec。
+    ///
+    /// ⚠️ **2026-10-18 定谳:必须小**(缺省 8,旧缺省 64 是**长尾税**):
+    /// 降级后窗口内每 token 走裸 decode(**实测 27.5 ms/token**)而 spec 档
+    /// 6.4 token/轮 ≈ **5.7 ms/token** ⇒ 卡在窗口里一个 token 就是 22 ms 的损失。
+    /// 窗口 64 ⇒ 一次**偶发** m=0 连击最长罚 **1.4 s**;窗口 8 ⇒ 罚 0.18 s。
+    /// 反向成本(探测失败的代价)= 一轮投机轮(36.7ms)换掉一个裸步(27.5ms)
+    /// ≈ **+9 ms/次**,且探测失败后**退避 ×2**(8→16→…→512 封顶)⇒ 持久失败
+    /// (真复读上下文)总浪费 ~0.1 s 量级。**两头都便宜,故取小**。
     pub probe_every: usize,
 }
 
@@ -740,7 +750,7 @@ impl Default for SpecCfg {
             notaps: false,
             tapdecl: false,
             degrade_after: 6,
-            probe_every: 64,
+            probe_every: 8,
         }
     }
 }

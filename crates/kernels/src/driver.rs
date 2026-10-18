@@ -1176,8 +1176,12 @@ pub mod attn {
         KernelPick::of::<crate::ops::elems::SigmoidGateMulF16>(SENTINEL_1D)
     }
 
-    /// 非因果块 attention(DFlash2 草稿;自块直读 + 前缀池;v2 签名:
-    /// grid (T, Hq) × block (hd);t 自 shapes[0][0],hq/hd 自标量槽 0/2)
+    /// 非因果块 attention(DFlash2 草稿;自块直读 + 前缀池)。
+    ///
+    /// **grid 两档**(2026-10-18 propose 立案):v2 核 = **GQA 感知** ⇒
+    /// `(T, Hkv)`(一个 CTA 覆盖一个 kv-head 的全部 q-head;同组 warp 走 L1 共享
+    /// 同一批 K/V 行 ⇒ 流量 ÷ group);旧核 = `(T, Hq)`。block = `(hd)` 恒定。
+    /// 标量槽序:`0 = q_heads, 1 = kv_heads, 2 = d_dim, 3 = page, 4 = x`。
     pub fn naive_nc(
         dt: DType,
         fp8kv: bool,
@@ -1186,10 +1190,23 @@ pub mod attn {
     ) -> KernelPick {
         let t = shapes.first().and_then(|s| s.first().copied()).unwrap_or(1) as u32;
         let hq = scalars.first().copied().unwrap_or(1) as u32;
+        let hkv = scalars.get(1).copied().unwrap_or(1) as u32;
         let hd = scalars.get(2).copied().unwrap_or(128) as u32;
         // v2 臂(2026-10-13 ③):dpl = hd/32 ∈ {4,8} 时走重写核(1.86×);其余旧核。
         // fp8kv 面 v2 未做 ⇒ 一律旧核。
-        let v2 = !fp8kv && matches!(dt, DType::BF16) && matches!(hd, 128 | 256);
+        // **几何门(2026-10-18)**:v2 核要求 CTA 内 warp 能覆盖一个 GQA 组
+        // (`nwarp ≥ group` 且 `nwarp % group == 0`)—— 不满足回落旧核(慢但正确),
+        // 核内另有 `__trap()` 兜底(双保险,不静默)。
+        let group = if hkv > 0 { hq / hkv } else { 0 };
+        let nwarp = (hd / 32).max(1);
+        let v2 = !fp8kv
+            && matches!(dt, DType::BF16)
+            && matches!(hd, 128 | 256)
+            && hkv > 0
+            && hq % hkv == 0
+            && group > 0
+            && nwarp >= group
+            && nwarp % group == 0;
         let name = match (dt, fp8kv) {
             (DType::F16, false) => "owl_naive_attn_nc_f16",
             (DType::BF16, false) if v2 => "owl_naive_attn_nc_bf16_v2",
@@ -1200,9 +1217,24 @@ pub mod attn {
                 unimplemented!("naive_nc 仅 f16/bf16")
             }
         };
+        // **block 宽度 = 4·hd(v2)**:CTA 内 = GQA 组(4 warp)+ **4 路行切片**
+        // (nsub = 4)⇒ 并行 warp 数与旧核 (T,Hq)×hd 持平,而同一批 K/V 行在
+        // CTA 内被 4 个 q-head 共享(L1)⇒ 只砍冗余 HBM 流量,不动占用
+        // (2026-10-18 实测:只改 grid 不补并行度 ⇒ 11.3 vs 9.3 ms,更慢)。
+        // v2 的**动态 smem** = `nwarp*(d_dim+2)*4`(归并 acc + m + l;见 .cu 注释)
+        let v2_nwarp = nwarp * 4; // block = 4·hd ⇒ warp = 4·(hd/32)
+        let smem = if v2 {
+            (v2_nwarp as u64 * (hd as u64 + 2) * 4) as u32
+        } else {
+            0
+        };
         KernelPick {
             name,
-            shape: Shape { grid: (t, hq, 1), block: (hd.max(1), 1, 1), smem: 0 },
+            shape: Shape {
+                grid: if v2 { (t, hkv.max(1), 1) } else { (t, hq, 1) },
+                block: if v2 { (hd.max(1) * 4, 1, 1) } else { (hd.max(1), 1, 1) },
+                smem,
+            },
         }
     }
 

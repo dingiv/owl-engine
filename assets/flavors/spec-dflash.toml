@@ -23,6 +23,10 @@ max_seq = 16384
 
 [spec]
 depth = 7
+# 降级首探窗口(tokens):降级后先等这么多 token 就试水一次投机轮,命中即恢复 spec。
+# 8 = 实测取法(裸 decode 27.5ms/token vs spec 5.7ms/token ⇒ 窗口内每 token 亏 22ms;
+# 窗口 64 会让一次偶发 m=0 连击最长罚 1.4s)。退避 ×2 封顶 512 兜持久失败。
+probe_every = 8
 
 [server]
 # 单会话语义:GDN 格锁 1 → 并发闸门必须 ≤1(启动 fail-fast 校验

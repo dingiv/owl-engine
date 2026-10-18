@@ -13,6 +13,12 @@ use crate::spec::{meta_of, pools, CaptureEvidence, Determinism, KernelMeta, Kern
 ///
 /// v2 = 只换并行结构(lane→连续 dim + warp butterfly + split-K),语义/槽序
 /// 与旧核逐字同一套;实测 prefix2048 2.238 → 1.201ms(1.86×),数值同档。
+///
+/// **2026-10-18(propose 立案):再收 GQA 冗余** —— 同 kv-head 的 `group` 个
+/// q-head 原各起一个 CTA(同一批 K/V 行读 group 遍;草稿档 268 MB/发、~225 GB/s
+/// ⇒ 1.19 ms/发,占 propose 图 66%)。现 **grid (T, Hq) → (T, Hkv)**、CTA 内
+/// `wq = warp % group` / `sub = warp / group`,同组 warp 走 L1 共享同一行。
+/// 结构门:驱动件要求 `nwarp ≥ group` 且整除(否则回落旧核);核内 `__trap()` 兜底。
 pub struct NcAttnBf16V2;
 
 impl KernelSpec for NcAttnBf16V2 {

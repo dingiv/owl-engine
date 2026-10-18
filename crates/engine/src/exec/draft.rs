@@ -44,6 +44,18 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let anchor = vec![bonus as f32];
         let pg = self.graphs.dflash.as_mut().ok_or_else(|| ModelError::EngineInvariant { what: "dflash_graph 缺席(档位不一致)".into() })?;
         let prof = self.probes.step_profile;
+        // **归因探针(2026-10-18 propose 立案;仅 prof 档)**:发射前先把 COMPUTE 流
+        // 排干 ⇒ 把"本相位墙钟"拆成三块,互不污染:
+        //   ① `drain`  = 排水耗时(上一相/回滚/fold 的残余 GPU 工作 —— 首读一直在吸收它,
+        //                而它**不是 propose 的成本**);
+        //   ② `first`  = 排水后**首次**发射+读 = 本图真实首执行 GPU 时间;
+        //   ③ `pure`   = 再发一次+读 = 二次执行(判"首执行是否被冷态/工作集拖慢")。
+        // 无排水 ⇒ 三块混在一起,读数会系统性高估 propose(实测:相位 21 ms 而二次执行 9.4 ms)。
+        let t_drain0 = prof.then(std::time::Instant::now);
+        if prof {
+            let face = self.graphs.session.face_mut();
+            face.sync().await?;
+        }
         let t0 = prof.then(std::time::Instant::now);
         pg.step(&[
             ("tokens", tokens_f.as_slice()),
@@ -59,14 +71,19 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         .await?;
         let t1 = prof.then(std::time::Instant::now);
         let out = pg.read_output_f32("drafts").await?;
-        // 纯 GPU 判别(E5-DF4 性能):首读含队列排水(verify 尾部);同步后
-        // 重发一次图再读 = 图的独占 GPU 时间
-        if prof {
+        // 纯 GPU 判别(E5-DF4 性能;2026-10-18 立案改三段):排水后首次执行 vs 二次执行
+        if let (Some(t_drain), Some(t0v), Some(t1v)) = (t_drain0, t0, t1) {
             let t2 = std::time::Instant::now();
+            let first = t2 - t1v; // 首次发射+读(流已排干 ⇒ 纯本图)
             pg.replay().await?;
             // 失败已 `?` 上报;成功值此处不需要(仅为同步点)
             let _ = pg.read_output_f32("drafts").await?;
-            owl_shared::log_info!("dflash-prof", "pure_gpu={:?}", t2.elapsed());
+            owl_shared::log_info!(
+                "dflash-prof",
+                "drain={:?} first_gpu={first:?} pure_gpu={:?}",
+                t0v - t_drain,
+                t2.elapsed()
+            );
         }
         if let (Some(a), Some(b)) = (t0, t1) {
             // E2 语义勘误(原 fill/launch/read 误导):total = 轮内全程;

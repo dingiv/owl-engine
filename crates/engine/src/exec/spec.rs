@@ -347,7 +347,26 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 } else {
                     false
                 };
-            let degraded = degraded0 || window_starved;
+            // ── **连击判据的闸门**(2026-10-18 实测立案)──
+            //
+            // 连击(m=0×6)只说明"最近 6 轮草稿全灭",**不代表投机本身亏本**:
+            // 实测(重复上下文,ctx 8.5k)一次连击触发降级时,窗口 AL ≈ **2.9-3.9
+            // tok/轮**,而盈亏线 = 轮/裸 ≈ 2.0 ⇒ 留在 spec 每 token ≈ 9.4 ms,
+            // 降级裸步 **27.5 ms/token** ⇒ **一次误降级罚 ~1.4 s**(占该请求
+            // 解码相位 35%)。而连击真正该抓的是"草稿系统性坏掉"(此时窗口 AL
+            // 也会塌到线下)。
+            //
+            // ⇒ 连击只在**窗口 AL 也低于盈亏线**时才降级(用**当前部分窗口**,
+            // 不等 16 轮门);已降级态照旧保持(出口 = 探测命中)。
+            // 分母未测(break_even=None)⇒ 不因连击降级(保守留在 spec;窗口判据
+            // 此时同样不生效,播种步会在首 turn 补上分母)。
+            let al_partial = if spec.recent_rounds > 0 {
+                spec.recent_tokens as f32 / spec.recent_rounds as f32
+            } else {
+                f32::INFINITY
+            };
+            let streak_gate = break_even.is_some_and(|line| al_partial < line);
+            let degraded = window_starved || (degraded0 && (spec.spec_degraded || streak_gate));
             if degraded && !spec.spec_degraded {
                 let line = crate::exec::break_even_text(break_even);
                 owl_shared::log_warn!("spec-degrade", "m=0×{streak} win_starved={window_starved} 盈亏线={line} → 降级裸 decode(probe 每 {probe_every} tok)"
