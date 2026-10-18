@@ -626,6 +626,7 @@ impl Loadable for VisionTower {
 
 #[cfg(test)]
 mod tests {
+    use owl_macros::owl_test;
     use super::*;
     use crate::contract::DeviceClient;
     use crate::testkit::{assert_close, f32_of, st_read, Src};
@@ -804,12 +805,8 @@ mod tests {
 
     /// **M3 首战**:塔 **f16 GPU 路径**(五个新核 + 声明/拾取/线格式全链)
     /// vs HF **f32** 金标(f16 档判据)。数据源 = 真权重(BF16 检查点 → f16 装载)。
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_f16_tower_matches_golden() {
-        if !crate::testkit::gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设(指定空闲卡,如 =2)");
-            return;
-        }
         let goldens = golden_paths();
         let Some(g) = goldens.first() else {
             eprintln!("skip: 金标不在(tools/vision_golden.py 生成)");
@@ -898,12 +895,8 @@ mod tests {
     /// 1280×736 截图(patch 16 ⇒ 网格 80×46 = **3680 patch**,1024 merged token)
     /// ①整塔 f16 前向(装载后 3 次取最好)②仅注意力核(10 次平均)。
     /// 判据(设计文档 §5 M3):整塔 ≤ 150 ms。
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_f16_tower_bench_1280x736() {
-        if !crate::testkit::gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         if !owl_shared::env_reader::flag("OWL_VIS_BENCH") {
             eprintln!("skip: OWL_VIS_BENCH 未开(性能档不随常规测试跑)");
             return;
@@ -1020,12 +1013,8 @@ mod tests {
     /// **真图验收**(R2 闭环;GPU f16 = 生产路径):
     /// `assets/{bird,cat,dog,flower_blue}.png` 经 HF `Qwen3VLProcessor` 真预处理
     /// (缩放 / patchify / **2×2 块序**)⇒ 我们的塔 vs HF 塔同档金标。
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn real_images_gpu_f16_match_golden() {
-        if !crate::testkit::gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         let g = real_golden();
         if !g.exists() {
             eprintln!("skip: 真图金标不在(tools/vision_image_check.py 生成)");

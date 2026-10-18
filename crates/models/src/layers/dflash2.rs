@@ -979,6 +979,7 @@ impl crate::module::Loadable for DfAttn {
 // ============================================================================
 #[cfg(test)]
 mod tests {
+    use owl_macros::owl_test;
     use super::*;
     use crate::module::{LoaderCtx, Loadable};
     use crate::testkit::{assert_close, f32b, gpu_client, gpu_enabled, harvest, harvest_bf16, harvest_f16};
@@ -1000,12 +1001,8 @@ mod tests {
 
     /// 金标 1:conv kernel vs host f32 参考(sglang _grouped_conv 逐式;
     /// prepare/finish 双侧,T=8 位置掩码语义)。
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_dflash_conv_matches_host() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         let (t, hidden, block) = (8usize, 64usize, 8usize);
         let groups = hidden / GROUP;
         let conv = GroupedConv::new(hidden, block, Dtype::F16);
@@ -1081,12 +1078,8 @@ mod tests {
 
     /// 金标 2:selector(lattice 打分 + 贪心 walk)vs host 参考。
     /// tiny 形状:vocab 97,rank 16(核参数化;K=16 烘焙 ≤ vocab 合法)。
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_dflash_selector_matches_host() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         let (vocab, rank, rows) = (97usize, 16usize, DEPTH);
         let sel = CandidateSelector::new(rank, vocab, rank, Dtype::F16); // hidden = rank(pred 维)
         let mut src: HashMap<String, Vec<f32>> = HashMap::new();
@@ -1227,12 +1220,8 @@ mod tests {
 
     /// 金标 3:fc 拆分消费面(reshape 重释 + slice_view)vs host 参考
     /// (Σ tap_i @ W_i^T;W 行主序 [hidden, fan] 列块)。
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_dflash_fc_split_matches_host() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         let (hidden, n) = (32usize, 4usize);
         let fan = n * hidden;
         let draft = DFlash2Draft::new(hidden, hidden, 2, 1, 16, n, 1e-6, 23, false);
@@ -1321,12 +1310,8 @@ mod tests {
     /// 金标 = tools/dflash2_golden.py(torch f32,sglang 逐式)存
     /// testdata/dflash2_golden.safetensors。同输入(公式 E/LM/taps/ids)、
     /// 同权重(marlin 装载)—— 逐层定位首个发散算子。
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_dflash2_golden_matches() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         let Some(dir) = owl_shared::env_reader::str("OWL_DFLASH2_DIR") else {
             eprintln!("skip: OWL_DFLASH2_DIR 未设");
             return;
@@ -1684,12 +1669,8 @@ mod tests {
     /// 2026-10-07 引擎缺列案的混淆变量切分:引擎 fc m=18,golden 测试
     /// m=20/19/8 —— 若本进程 m=18 也缺列则为 marlin m 病(非进程态);
     /// 参考 = m=20 输出的前 m' 行(marlin 确定性,同权重同输入行)。
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_dflash2_fc_m_sweep() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         let Some(dir) = owl_shared::env_reader::str("OWL_DFLASH2_DIR") else {
             eprintln!("skip: OWL_DFLASH2_DIR 未设");
             return;
@@ -1946,12 +1927,8 @@ mod tests {
     /// 金标 4:草稿 KV 写-读往返(K0 write classic 布局 → NC attention
     /// 读)vs host 参考(读回 classic 池解包重算注意力)—— 布局一致性
     /// 与 norm_rope plain 寻址一锤定音。
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_dflash_nc_attn_roundtrip() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         let (hq, hkv, hd, hidden) = (4usize, 2usize, 16usize, 32usize);
         let eps = 1e-6f32;
         let attn = DfAttn::new(hq, hkv, hd, hidden, eps, QuantPlan::F16, Dtype::F16, false);
@@ -2243,12 +2220,8 @@ mod tests {
     /// ① conv bf16 vs host f32 参考(权重经 f32→bf16 装载);② cast
     /// f16→bf16→f16 往返(f16 值域内零损失);③ select bf16(proj/码本
     /// bf16)与 f16 版同 tok 序。用例容差按 bf16 尾数 7~8 位放行。
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_dflash_bf16_smoke() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         let mut gpu = gpu_client().await;
 
         // ---- ① conv bf16(全 bf16:x/delta/base/out;proj 线性 bf16 want)----

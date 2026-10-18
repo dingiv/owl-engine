@@ -366,6 +366,7 @@ pub fn qwen3_8_27b() -> ModelSpec {
 
 #[cfg(test)]
 mod tests {
+    use owl_macros::owl_test;
     use super::*;
     use crate::TensorOps;
     use crate::module::{ForwardCtx, Module};
@@ -1460,12 +1461,8 @@ mod tests {
     /// E5-DF1 验收:DFlash2 检查点装载(81 键)+ fc 采样对拍 +
     /// encode/selector 真几何冒烟。门控 OWL_TEST_DEVICE + OWL_DFLASH2_DIR
     /// (z-lab/Qwen3.8-27B-DFlash2 目录)。
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_dflash2_27b_loads_and_smokes() {
-        if !crate::testkit::gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         let Some(dir) = owl_shared::env_reader::str("OWL_DFLASH2_DIR") else {
             eprintln!("skip: OWL_DFLASH2_DIR 未设(DFlash2 检查点目录)");
             return;

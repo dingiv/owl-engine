@@ -1325,6 +1325,7 @@ impl Loadable for Attention {
 
 #[cfg(test)]
 mod tests {
+    use owl_macros::owl_test;
     use super::*;
     use crate::layers::rope::Rope as RopeT;
     use crate::module::KvBuffers;
@@ -1469,12 +1470,8 @@ mod tests {
     }
 
     /// narrow_strided:GPU-only kernel vs host 参考(OWL_TEST_DEVICE 门控)
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_narrow_matches_host() {
-        if !crate::testkit::gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         let q_raw: Vec<f32> = (0..2 * 32).map(|i| (i as f32 * 0.17) - 1.4).collect();
         let (outer, src_dim, start, out_dim) = (4usize, 16usize, 8usize, 8usize); // start = HD(gate 半段)
 
@@ -1504,12 +1501,8 @@ mod tests {
     }
 
     /// Module 统一入口 GPU 冒烟:装载六槽 + 缺依赖毒值收割(OWL_TEST_DEVICE 门控)
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_module_smoke() {
-        if !crate::testkit::gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         use crate::module::Module as _;
         let mut gpu = crate::testkit::gpu_client().await;
         let attn = Attention::new(2, 1, 8, 3, 1e-6, QuantPlan::F16);
@@ -1529,12 +1522,8 @@ mod tests {
     /// 连续槽窗语义钉(PF1-0 契约锚;OWL_TEST_DEVICE 门控):
     /// 打分窗 = [slot-kv_len+1, slot]。缓存四行已知 k/v,q 对齐第 1 行,
     /// 逐案验证窗口落点 —— 这也是现存“slots 恒 0”接线疑云的定谳探针。
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_attn_window_semantics() {
-        if !crate::testkit::gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         // hq=hkv=1, hd=2;rows: 0=[1,0] 1=[0,3] 2=[.5,.5] 3=[9,9](哨兵行不进窗)
         let k_cache = [1.0, 0.0, 0.0, 3.0, 0.5, 0.5, 9.0, 9.0];
         let v_cache = [1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 9.0, 9.0];
@@ -1585,19 +1574,16 @@ mod tests {
 
 #[cfg(test)]
 mod f16_tests {
+    use owl_macros::owl_test;
     use super::*;
     use crate::contract::DeviceClient as _;
     use crate::module::KvBuffers;
-    use crate::testkit::{f32b, gpu_client, gpu_enabled};
+    use crate::testkit::{f32b, gpu_client};
     use crate::tensor::Dtype;
 
     /// GPU:f16 narrow gather(位型直搬,逐位一致;OWL_TEST_DEVICE 门控)
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_narrow_f16_matches_host() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         // [2, 16] half → start=8 out_dim=8(gate 半段)
         // 源值过 f16 量化(上载即 f16;纯拷贝 = 对量化后参考逐位)
         let src: Vec<f32> = (0..32)
@@ -1643,12 +1629,8 @@ mod f16_tests {
     /// (PARTITION=512)+ LSE 归并 vs prefill 参考(三方同 v1 案;多分区
     /// 归并路径 = 本测主靶,nparts=1 时核内退化直拷)。矩阵含跨分区边界
     /// (t=600 → 分区2 首 token)与 engine 全参档 GQA。
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_attn_v2_decode_matches_prefill_paged() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         v1_isolation_case_inner(256, 2, 1, 200, 8, false, true).await; // nparts=1(归并=直拷臂)
         v1_isolation_case_inner(128, 2, 1, 600, 32, false, true).await; // nparts=2(hd128)
         v1_isolation_case_inner(256, 2, 1, 600, 32, false, true).await; // nparts=2(hd256;跨分区边界)
@@ -1848,12 +1830,8 @@ mod f16_tests {
     // ⚠️ 教训双条:金标自身曾有两处病(p×cos(freq) 运算优先级 /
     // 转置式与被告同构)—— 判决前必须先证金标清白(A 臂双锚 + 直通维)。
     // ═══════════════════════════════════════════════════════════════════
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_w2_fused_kprobe() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         kprobe_case(128, 2, 1, 32).await;
         kprobe_case(256, 2, 1, 32).await;
         kprobe_case(256, 24, 4, 64).await; // 27B 全参档
@@ -2085,12 +2063,8 @@ mod f16_tests {
 
     /// 批P4 验收:T=8 prefill 块 == T×decode 逐步(输出行 + KV 终态位型;
     /// 表/槽/kv_len 均走 [T] 表的正确姿势 —— F16 ctx 装表)
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_attn_prefill_block_matches_token_loop() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         let (hq, hkv, hd, hidden) = (2usize, 1usize, 4usize, 6usize);
         let t_len = 8usize;
         let _row_q = hq * hd;
@@ -2193,12 +2167,8 @@ mod f16_tests {
     }
 
     /// 批P4(f32 锚链变体):模型 fixture = f32 链,展开的 f32 核路同验
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_attn_prefill_block_matches_token_loop_f32() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         let (hq, hkv, hd, hidden) = (2usize, 1usize, 4usize, 6usize);
         let t_len = 8usize;
         let mut src = std::collections::HashMap::new();
@@ -2273,6 +2243,7 @@ mod f16_tests {
 
 #[cfg(test)]
 mod owl_port_tests {
+    use owl_macros::owl_test;
 
     /// **形状律门**(2026-10-17 审查 §五轮):`block_tables` 形状为空 = 声明失守
     /// ⇒ 走 `nb_pages` 必须**毒化**(修前 `.unwrap_or(1)` 静默拿 1 页去算)。
@@ -2300,7 +2271,7 @@ mod owl_port_tests {
     }
     use super::*;
     use crate::contract::DeviceClient as _;
-    use crate::testkit::{gpu_client, gpu_enabled};
+    use crate::testkit::gpu_client;
     use crate::tensor::Dtype;
 
     /// **层内对照**:XQA verify 臂 vs v2 伪序列臂(2026-10-13 D3 立案)。
@@ -2320,12 +2291,8 @@ mod owl_port_tests {
     /// 修法建议:抄 `v1_isolation_case_inner` 的 xs/权重构造(hidden=6/hq=2
     /// 的小档先跑通再放大),或直接比对**注意力层输出**(绕过 o_proj)。
     /// 真正的等价门在 kernels crate(`tests/xqa_verify_probe.rs`)已绿。
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_attn_verify_xqa_matches_v2() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         // 小档:hq/hkv = 6/1 ⇒ grp=6 与 XQA 编译期 HEAD_GRP_SIZE 一致;
         // hidden=6 让 o_proj 项数 = hq*hd = 1536(大档 6144 会把注意力差异
         // 淹进线性斜坡 —— 首版 24/4/hidden8 的教训,见 FIXME)
@@ -2587,12 +2554,8 @@ mod owl_port_tests {
 
     /// GPU:owl_sigmoid_gate_mul_f16(NInfer 移植)vs host f32
     /// 验融合等价:silu 链上的 sigmoid+mul 双发射 → 单核(工单 N 收口锚)
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_sigmoid_gate_mul_f16_matches_host() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         let n = 1024usize; // 偶数(hidden/head_dim 全偶,契约)
         let gate: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.23) - 3.0).sin() * 2.5).collect();
         let x: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.11) - 1.0).cos() * 1.8).collect();
@@ -2624,10 +2587,10 @@ mod owl_port_tests {
 
 #[cfg(test)]
 mod view_alias_tests {
+    use owl_macros::owl_test;
     use super::*;
-    use crate::contract::DeviceClient as _;
     use crate::module::AttnV2Scratch;
-    use crate::testkit::{f32b, gpu_client, gpu_enabled, harvest_f16};
+    use crate::testkit::{f32b, gpu_client, harvest_f16};
     use crate::tensor::Dtype;
 
     /// **B-2 机制硬门:页表别名 ≡ 物理搬移**(2026-10-18;设计与施工卷 §8.11)。
@@ -2646,12 +2609,8 @@ mod view_alias_tests {
     ///
     /// 为何是逐位:核读的是同一批字节、同一份 q、同一套参数 —— 差异只可能来自
     /// 页表本身(即拍不到错=别名真的生效)。
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_paged_view_aliases_selected_pages() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         let (hd, hq, hkv, hidden) = (128usize, 2usize, 1usize, 6usize);
         let (page, nb) = (32usize, 8usize);
         let halfb = |v: &[f32]| -> Vec<u8> {
@@ -2731,7 +2690,7 @@ mod view_alias_tests {
         let xs_q = mk_x(9);
         let x_q = TensorOps::from_host(Dtype::F16, vec![1, hidden], &halfb(&xs_q));
         let pos_q = TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[200.0]));
-        let run = |bt: Vec<f32>, gpu: &mut _| {
+        let run = |bt: Vec<f32>, _gpu: &mut _| {
             let kv = KvBuffers {
                 k_cache: kc_t.clone(),
                 v_cache: vc_t.clone(),
@@ -2800,9 +2759,10 @@ mod view_alias_tests {
 
 #[cfg(test)]
 mod naive_attn_f16_tests {
+    use owl_macros::owl_test;
     use super::*;
     use crate::contract::DeviceClient as _;
-    use crate::testkit::{gpu_client, gpu_enabled};
+    use crate::testkit::gpu_client;
     use crate::tensor::Dtype;
 
     fn hle(f: f32) -> [u8; 2] {
@@ -2811,12 +2771,8 @@ mod naive_attn_f16_tests {
 
     /// GPU:naive_attn f16 窗语义(两 token 递进窗;host f32 参考)
     /// owl 窗契约专属核(上游无对应物;数学沿 f32 版,已探针钉死)
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_naive_attn_f16_matches_host() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         let (hq, hkv, hd, slots_n) = (2usize, 1usize, 8usize, 8usize);
         let q: Vec<f32> = (0..2 * hq * hd).map(|i| ((i as f32 * 0.31) - 2.0).sin()).collect();
         let k: Vec<f32> = (0..2 * hkv * hd).map(|i| ((i as f32 * 0.17) - 1.0).cos()).collect();

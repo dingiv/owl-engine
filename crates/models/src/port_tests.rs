@@ -8,6 +8,7 @@
 //! - 发射 grid = (num_tokens,1,1) **显式**(核内 blockIdx.x = token_idx;
 //!   哨兵自动 1D 会越界读 slot_mapping,禁用 —— port 头注第 3 条)。
 
+use owl_macros::owl_test;
 use crate::contract::DeviceClient as _;
 use crate::ops::SemanticKernel;
 use crate::testkit::{f32b, gpu_client, gpu_enabled};
@@ -29,12 +30,8 @@ fn host_cache_idx(slot: i64, head: usize, d: usize, hkv: usize, hd: usize, p: us
 
 /// K0 验收:reshape_and_cache f16 —— 恒等分页 + 跳块物理槽 + padding 跳写,
 /// 写后读回与 host 参照**逐位一致**(纯拷贝核);空洞槽保持零。
-#[tokio::test]
+#[owl_test(gpu)]
 async fn gpu_reshape_and_cache_f16_matches_host() {
-    if !gpu_enabled() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
-        return;
-    }
     // 形状:hkv=2, hd=8, block_size=4, num_blocks=3;T=10(含 padding)
     let (hkv, hd, p, nb) = (2usize, 8usize, 4usize, 3usize);
     let x = 16usize / 2; // f16 → 8
@@ -320,12 +317,8 @@ async fn gpu_prefill_paged_attn_f16_hd256_impl(t_ctx: usize) {
 }
 
 /// K1:v1 核 nvrtc 编译 + 布局 + 数值(2e-2 rel,f16 链现行容差律)
-#[tokio::test]
+#[owl_test(gpu)]
 async fn gpu_paged_attention_v1_f16_smoke() {
-    if !gpu_enabled() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
-        return;
-    }
     let (hq, hkv, hd, p, nb, t_ctx) = (2usize, 1usize, 128usize, 32usize, 1usize, 24usize);
     let kvh_map: Vec<usize> = (0..hq).map(|h| h / (hq / hkv)).collect();
     let mut gpu = gpu_client().await;
@@ -368,12 +361,8 @@ async fn gpu_paged_attention_v1_f16_smoke() {
 }
 
 /// v1 hd256 档 smoke(qwen3.5-0.8B 真实头维)
-#[tokio::test]
+#[owl_test(gpu)]
 async fn gpu_paged_attention_v1_f16_hd256_smoke() {
-    if !gpu_enabled() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
-        return;
-    }
     let (hq, hkv, hd, p, nb, t_ctx) = (8usize, 2usize, 256usize, 32usize, 1usize, 8usize);
     let kvh_map: Vec<usize> = (0..hq).map(|h| h / (hq / hkv)).collect();
     let mut gpu = gpu_client().await;
@@ -443,12 +432,8 @@ async fn gpu_paged_attention_v1_f16_hd256_smoke() {
 }
 
 /// K2:v2 分片(单 partition)+ reduce 链,与 v1 同参照
-#[tokio::test]
+#[owl_test(gpu)]
 async fn gpu_paged_attention_v2_reduce_f16_smoke() {
-    if !gpu_enabled() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
-        return;
-    }
     let (hq, hkv, hd, p, nb, t_ctx) = (2usize, 1usize, 128usize, 32usize, 1usize, 24usize);
     let kvh_map: Vec<usize> = (0..hq).map(|h| h / (hq / hkv)).collect();
     let mut gpu = gpu_client().await;
@@ -507,12 +492,8 @@ async fn gpu_paged_attention_v2_reduce_f16_smoke() {
 /// prefill 批核真机 smoke:chunked prefill 因果语义(查询 token t 看
 /// [0,t])+ paged 池(BLOCK=32 特化,与 decode 的 16 不同);host 参照 =
 /// 逐 token 因果注意力。
-#[tokio::test]
+#[owl_test(gpu)]
 async fn gpu_prefill_paged_attn_f16_smoke() {
-    if !gpu_enabled() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
-        return;
-    }
     let (hq, hkv, hd, p, nb, t_ctx) = (2usize, 1usize, 128usize, 32usize, 1usize, 24usize);
     let kvh_map: Vec<usize> = (0..hq).map(|h| h / (hq / hkv)).collect();
     let mut gpu = gpu_client().await;
@@ -597,12 +578,8 @@ async fn gpu_prefill_paged_attn_f16_smoke() {
 }
 
 /// 设备 argmax 对拍 host(E3 采样器哨兵):随机 + 平局 + 偏移三用例
-#[tokio::test]
+#[owl_test(gpu)]
 async fn gpu_argmax_f32idx_matches_host() {
-    if !crate::testkit::gpu_enabled() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
-        return;
-    }
     use crate::ops::argmax_f32idx;
     let mut gpu = crate::testkit::gpu_client().await;
 

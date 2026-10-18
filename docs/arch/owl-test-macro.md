@@ -164,20 +164,48 @@ fn 名() {
 
 ## 六、迁移台账(2026-10-18)
 
-### 已迁
-- `crates/models/src/layers/gdn.rs`:**21/22** tokio 测试(剩 1 个 CPU 用例不需要门);
-  +31/−97 行;真机抽测 3 个(`gpu_gating_g` / `gpu_l2norm` / `gpu_norm_act`)全绿。
-
-### 待迁(models 面,按门数量排序;均为**机械转换**)
-| 文件 | 手写 GPU 门 | 备注 |
+### 已迁(models 面:共 **53** 个用例)
+| 文件 | 迁入 | 备注 |
 |---|---:|---|
-| `models/layers/attention.rs` | 12 | 另有 3 个 `#[tokio::test]` 是 CPU/无门 |
-| `models/layers/dflash2.rs` | 8 | |
-| `models/port_tests.rs` | 7 | |
-| `models/layers/vision.rs` / `decoder.rs` / `formats/qwen35.rs` | 3 / 3 / 2 | 部分门是"检查点缺失 ⇒ skip"(数据门,**不**属本宏;保持手写) |
+| `layers/gdn.rs` | 22 | 含 2 个 `gpu, hf_parity`;顺手注册回一个漏写属性的死测试 |
+| `layers/attention.rs` | 12 | |
+| `layers/dflash2.rs` | 7 | |
+| `port_tests.rs` | 6 | |
+| `layers/vision.rs` | 3 | |
+| `layers/decoder.rs` | 2 | 其中一个的门**被注释掉过**(等于无门在跑)—— 本次恢复 |
+| `formats/qwen35.rs` | 1 | |
+| **合计** | **53** | models 内联测试面基本收编完毕 |
+
+### 未迁(有意保留,各有理由)
+- `decoder.rs::pinned_roundtrip_probe`、`dflash2.rs::gpu_dflash2_stage_bench`:
+  返回 `Result<(), E>` ⇒ 门控要 `return Ok(())`,宏现只支持 unit 返回(裸 `return`);
+- `qwen35.rs::gpu_dflash2_draft_load_bench`:`#[tokio::test(flavor = "multi_thread", …)]`,
+  宏固定 current_thread(选项见 §三"不做")；
+- `port_tests.rs::gpu_prefill_paged_attn_f16_hd256_impl`:非测试 helper(由测试调用),门保留;
+- **数据门**(`OWL_*_DIR` / 金标缺失)另属一类,见下节提案。
 
 ### 不在本宏覆盖
 - **kernels 集成测试**(`crates/kernels/tests/*.rs`,~40 个文件):全部是**同步** `#[test]`
   + 四行门,宏当前只收 `async fn`。若要把这批也收编,需给宏加
   **同步体模式**(不建 runtime,仅注入门/配置)—— 待定;e2e 入口(`pub async fn gpu_*`)
   仍按原计划随 e2e 改造另案。
+
+
+---
+
+## 七、走向"零散 env"的测试姿势(**提案**;2026-10-18)
+
+现状:测试域仍在用的 env 键分三类 —— 设备门(`OWL_TEST_DEVICE`)、
+用例配置(`OWL_TEST_CONFIG_<名字>`)、数据门(`OWL_DFLASH2_DIR` 等十余个)。
+AGENTS.md 的立场是"配置显式,env 退出正式链;测试域可放但不推荐"。提案按类型归位:
+
+| 类 | 现状 | 建议姿势 | 收益 |
+|---|---|---|---|
+| **设备**(哪张卡) | `OWL_TEST_DEVICE` | 保留为**唯一** env(机器资源选择器,非引擎行为);进一步可收进 `testdata/machine.toml`(uuid 表)由 runner 读 | 1 个键封顶 |
+| **用例配置**(引擎旋钮) | `OWL_TEST_CONFIG_<FN>` 每用例一个键 | **约定路径**:`testdata/cases/<crate>/<file>::<fn>.toml`;宏用 `file!()`+用例名推导(零 env)。缺文件 = `OwlConfig::default()` | 去掉全部 `OWL_TEST_CONFIG_*` |
+| **数据**(检查点/金标) | `OWL_AWQ27B_DIR` / `OWL_DFLASH2_DIR` / 各种 `*_DIR` | **资源清单** `testdata/resources.toml`:`key = "path"`;用例声明 `#[owl_test(needs = ["ckpt:27b-awq"])]`,缺失 = skip 且**点名缺哪个 key** | 十余个键 → 一份可进版本、可 review 的清单 |
+| **昂贵套件**(HF parity / bench) | `OWL_HF_PARITY` 等开关 | 并入资源清单/配置(`needs = ["hf-parity"]`),不再散键 | 同上 |
+
+落地顺序建议:① 用例配置改约定路径(改动最小、收益最大)→ ② 资源清单
+(吃数据门)→ ③ 设备收进 machine 文件。① 就绪后,`case_config` 的 env 读取面
+可整体删除,`#[owl_test]` 变成"零 env 的参数化测试"。
