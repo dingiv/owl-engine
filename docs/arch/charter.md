@@ -177,7 +177,7 @@
 packages/owl/
 ├── crates/signal      依赖追踪栈(thread-local;零后端语义,ROCm 可复用)
 ├── crates/graph       图运行时:预算登记/捕获治理/定影协议/降级(公理 A1 落点)
-├── crates/comm        TP 通信:尺寸路由/one-shot AR/融合口(公理 A2 落点)
+├── crates/backends/comm  TP 通信:尺寸路由/one-shot AR/融合口(公理 A2 落点)
 ├── crates/kernels     算子分发:arch 表(sm86 先行)/可捕获 kernel 契约(A1.5)
 ├── crates/backends/
 │   ├── iface          HAL 契约:Backend/Device/Pool/DevBuf/BufToken(上层唯一入口)
