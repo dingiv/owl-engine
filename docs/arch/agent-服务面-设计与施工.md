@@ -914,6 +914,118 @@ DAG(lm_head gemm → argmax)核对**命令序是否与求值序一致**(gemm 的
 
 ---
 
+## §9.1 前缀复用闭环实录(2026-10-19;server/engine 服务层专项)
+
+> 目标:**同会话增量 + 跨会话块级缓存**两条路都要真命中,且 `cached_tokens` 是**真值**。
+> 工具:`apps/server/tests/prefix_reuse_probe.py`(五判据)+ `testdata/args/prefix-reuse-27b.toml`
+> (测装)+ `[probes] prompt_dump/debug`(`[dbg prefix]` / `[dbg snap]`)。
+
+### (1) 已修:渲染对称律 R1 的**最后一块**(Rust 侧结构空白)
+
+模板把 assistant 轮渲染成
+
+```text
+<|im_start|>assistant\n<think>\n{trim(reasoning)}\n</think>\n\n{content}<|im_end|>
+```
+
+—— `\n</think>\n\n` 是**模板的结构资产**。三通道切分器旧实现只吞标记本体,
+把它后面的 `\n\n` 漏进 `content`;客户端回填后渲染**多出两个换行 token**
+⇒ 守卫在第一个 content token 失配(实测:`cached_len=13376`、分叉 idx=13360)。
+
+修:`ChannelSplitter` 新增 `swallow_lf`(关思考标记后**至多吞两个 `\n`**,
+流式跨 chunk 时挂起不吐)。单测三条:`think_close_boundary_whitespace_is_structural`
+(吞两个/吞一个/不吞/只吞两个)、`think_close_boundary_survives_chunk_split`(逐字符切分)、
+外加原 `one_shot_xml` 断言按新律更新。
+**首块边界不变**:`<think>\n` 在 prompt 里,reasoning 通道从生成流第一位起。
+
+### (2) 已修(新发现 bug):缓存叶驱逐写死 `passes < 4` ⇒ 长链前缀缓存饿死
+
+`KvStore::ensure_for_len` 池不足时逐缓存叶,旧循环上限 **4 趟**。
+**单链前缀缓存里只有尾块是叶**(每块都有子链),逐掉尾块后其父才变叶
+⇒ 每趟最多腾 1 槽。13k tok prompt(419 页)改一句话 ⇒ 需 419、空闲 306 ⇒
+4 趟只腾 4 页 ⇒ 响亮拒"真实容量不足" = **500**。实测复现两次。
+修:终止条件改"够用 ‖ `evict_device` 返回空(真无可逐)",不再用趟数当边界。
+`owl-store --lib` 81/81 不变;13k 改句子场景不再 500。
+
+### (3) 已落配置:`prefix_cache` 必开 + 快照保留账
+
+| 项 | 事实 |
+|---|---|
+| `pool.prefix_cache` | **paged 池下不开 = 同会话也不复用**(内容寻址是唯一路径;旧"直接复用会话块链"已退役) |
+| `snap_max` | 每条快照 152 MiB(27B);**=1 时解码期每页拍一次 ⇒ 把 prefill 期的检查点顶掉** ⇒ 实测 跨会话 T5 `cached=1536`(8 槽)vs `0`(1 槽) |
+| `pool.snap_host_mb` | 状态腿宿主:快照可下沉(不顶掉);`0` = 沉不下就丢 |
+| `cache_cap` | `nb/2 + host_slots`(硬编码)—— 长 prompt 链 > 半池时,缓存只留一部分,**复用面受它约束**(13k/16.9k 池实测只复用到 1.5k) |
+
+### (4) 已修/已落:**容量定档**(store 自持策略)+ **末段页对齐**
+
+**律(用户 2026-10-19 提醒,本专项据此落地)**:**store 不感知 I/O** —— 它是显存
+管理器:engine 提容量需求,store 回答"谁进显存、谁出去、出去到哪(host/盘/丢)"
+(`plan(need, protect) -> Verdict`,纯 host;engine 按 `apply_verdict` 搬)。
+⇒ "多少块可以留在显存里等复用"是**驻留决策**,算式必须住 store:
+
+- **`owl_store::CachePolicy`**(新):`Off` / `Cap(n)`(测试精确档)/ `Share{permille}`
+  —— 容量 = `份额 × 设备池 + 宿主槽全额`(跨层索引:沉到宿主的条目仍占名额)。
+  旧 `nb/2` 的算式从 engine(`session.rs`)移入 store;engine 只传**政策输入**
+  (`[pool].prefix_cache_share`,缺省 0.5 = 旧行为逐字不变)。
+- flavor 三层账(`spec-dflash`/`awq27b`):`prefix_cache=true` ·
+  `prefix_cache_share=0.75` · `host_cache_mb=4096`(KV 腿宿主:缓存**下沉**而非丢弃) ·
+  `snap_max=4` · `snap_host_mb=3072`(状态腿宿主:旧快照下沉 ⇒ `reuse_face`
+  能回查到更早的边界)。
+- **末段页对齐**(`Scheduler::prefill_step_chunk` 加 `page` 参数 + 新旋钮
+  `[pool] prefill_align_tail`,缺省 true):块边界快照只在**页对齐**处拍 ⇒
+  若最后一段跨页,切在**最后一个整页边界**上(尾巴 <1 页另起一小步)。
+  否则短 prompt **一个快照都没有**(实测 83 tok prompt 复用 0)。
+  ⚠️ **与 L4 尾块合并的交互**(踩过并定谳):生产档 `prefill_tail_merge = 1024`
+  会把"从头对齐的长尾段"合并成**尾端不对齐**的一大块 —— **前段尾对齐 ≠ 尾段尾
+  对齐**。判据必须**只看尾端**("最后一段 + 尾端不对齐 + 有可落的整页边界");
+  曾加过"前段已对齐就不切"的守卫,实测把 1.7k 档复用面从 **1728 压到 512**
+  (最后一个快照退到第一块)。代价 = 单块档多付一份 ~250ms chunk 宿主税。
+
+### (5) 实测(27B/`spec-dflash`/单张 3090 Ti;测装 = `testdata/args/prefix-reuse-27b.toml`)
+
+| 场景 | 定档前 | **定档后** |
+|---|---|---|
+| 短 prompt 同会话(spec 开) | 0(全量重算) | **64/187** ✓ |
+| 短 prompt 跨会话(spec 开) | 0 | **160/187** ✓ |
+| 长 prompt 跨会话(1.7k) | 1536(88%) | **1728/1732(99.8%)** ✓ |
+| 长会话(13.4k)同会话 | 1536(11%)· **12.1s** | **13344(98%)· 2.13s** |
+| 长会话(13.4k)跨会话 | 1024(8%)· 12.75s | **13568(100%)· 1.79s** |
+
+`prefix_reuse_probe.py` = **✅ G4 全绿(spec 开口径)**:同会话命中 / 跨会话命中 /
+sha 等价 / 非空。TTFT 随命中走(12s → 1.2-1.5s)。
+
+**顺带修 2**(测试基建):`#[cfg(test)]` 的四个辅助(`StageStats::{bytes_per_block,
+mib_per_s,line}` / `BAxisProfile::line` / `PartialStats::line` /
+`RunningEngine::cfg_prefill_chunk`)在 `--features e2e` 构建下不可见(该构建不带
+`cfg(test)`,而场景体要它们)⇒ **引擎 e2e 门在 main 上编译不过**;改
+`cfg(any(test, feature = "e2e"))`。
+另报一条**测试基建限制**:`testdata/resources.toml` 补齐 27B 资源后,单进程内
+多个 27B 场景**累积显存**(实测末个场景:卡可用 3.2 GiB / live 账 61 GB ⇒
+预算分解拒);
+⇒ 27B 场景需按进程隔离或分组,不在本笔范围。
+
+**顺带修 1**(被容量改动暴露):服务面 e2e 夹具 `testdata/args/e2e-27b.toml` 开了
+`[graph] prefill_bucket`,与 flavor 的 `[dispatch] fi_plan_bake` **互斥**(validate
+拒启)⇒ **自合并起服务面 e2e 根本起不来**(夹具被 `.gitignore` 吞掉,没人跑过)。
+现改显式 `off` 并注明解禁条件。
+
+### (6) 立案(未修;按优先级)
+
+a. **spec 轮内跨页边界**仍不拍快照(末段页对齐只覆盖 **prefill 段**):
+   捕获图定形 `T=depth+1` ⇒ 不能靠"减 depth 对齐";试过"落点恰好对齐时顺手拍"
+   并**撤回**(`act.out` 提交晚 ⇒ `tokens_upto` 报"token N 未喂")。
+   可行解:用 `fold` 族把状态回卷到边界(`fold[b-pos-1]`)再拍、再卷回。
+   影响 = 生成相位每页一个边界(短 prompt 的尾部复用面受限,现状 64-160 tok);
+   长 prompt 的 prefill 段已覆盖(实测 99.8%)。
+b. ✅ **已落(本节的容量定档)**。余:**池/份额的二次定档** —— 单链 > 池时的
+   复用面仍受 `nb` 约束(`13k 会话 / 16.9k 池` 已到 98%,再长就要加池或分块)。
+c. **`[agent] implicit_session` 缺省 false**:pi 不带 `session` ⇒ 每轮新会话
+   ⇒ **同会话路径对 pi 不适用**,只有跨会话块级缓存能救。是否改缺省 = 产品裁决
+   (并发交错时频繁 reset,慢但不坏)。
+d. `testdata/args/e2e-27b.toml` 被 `.gitignore` 的 `testdata/*` 吞掉,而
+   `apps/server/tests/e2e.rs` 用 `include_str!` —— **干净检出无法构建 e2e**。
+   修:给该夹具(与本专项的测装)加 `.gitignore` 例外。
+
 ## §十 变更记录
 
 | 日期 | 版本 | 变更 |
