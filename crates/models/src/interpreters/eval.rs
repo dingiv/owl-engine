@@ -338,12 +338,10 @@ where
     D: crate::contract::DeviceClient + 'a,
 {
     Box::pin(async move {
-        let mut pending: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
-        for r in roots {
-            for (id, c) in count_pending(r) {
-                *pending.entry(id).or_insert(0) += c;
-            }
-        }
+        // ⚠️ **多根边只数一次**(2026-10-19 §8.31):旧口径逐根相加,在"根套根"
+        // (Q 槽 / DFlash2 taps:根节点在主根子树里)时把共享子树的边数 k 次 ⇒
+        // `pending` 恒多算 ⇒ 中途活性回收整体失效(真回收 14/新块 1431 实测)。
+        let pending = count_pending_multi(roots);
         let perf = PerfCtx::of(&env);
         let pool_budget = block_pool_budget();
         let mut ctx =
@@ -374,6 +372,39 @@ where
             }
         }
         ctx.flush_pool().await?;
+        // **活性收尾归因**(门:`OWL_LIVE_DIAG`;2026-10-19):
+        // "真回收几乎为 0"时唯一要问的 = **memo 里还剩什么、靠什么吊着**:
+        // 节点的 `pending`(预波消费者计数未归零)还是块的 `users`(别名/持有者)。
+        // 打印前 6 大残块的 (bytes, users, pending, name) + 直方图 ⇒ 一眼定位。
+        if std::env::var_os("OWL_LIVE_DIAG").is_some() {
+            let mut hist = [0usize; 4]; // pending==0 / ==1 / ==2 / >=3
+            let mut users_hist = [0usize; 4];
+            let mut live_bytes = 0usize;
+            let mut rows: Vec<(usize, u64, usize, usize, String)> = Vec::new();
+            for (nid, b) in ctx.memo.iter() {
+                let p = ctx.pending.get(nid).copied().unwrap_or(0);
+                let u = ctx.block_users.get(&b.id).copied().unwrap_or(0);
+                hist[p.min(3)] += 1;
+                users_hist[u.min(3)] += 1;
+                let bytes = b.len.saturating_mul(b.dtype.size_bytes());
+                live_bytes += bytes;
+                rows.push((bytes, *nid, u, p, format!("{:?}", b.id)));
+            }
+            rows.sort_unstable_by_key(|r| std::cmp::Reverse(r.0));
+            let top: Vec<String> = rows
+                .iter()
+                .take(6)
+                .map(|(by, nid, u, p, bid)| format!("{:.1}MB node{nid} block{bid} u={u} p={p}", *by as f64 / 1048576.0))
+                .collect();
+            eprintln!(
+                "[live-end] memo 剩 {} 节点 / {} MiB ‖ 节点 pending 直方图 [=0 {}, =1 {}, =2 {}, ≥3 {}] ‖ 块 users 直方图 [=0 {}, =1 {}, =2 {}, ≥3 {}] ‖ 最大残余: {}",
+                ctx.memo.len(),
+                live_bytes >> 20,
+                hist[0], hist[1], hist[2], hist[3],
+                users_hist[0], users_hist[1], users_hist[2], users_hist[3],
+                top.join(" ｜ ")
+            );
+        }
         let root_ids: std::collections::HashSet<u64> = out.iter().map(|b| b.id).collect();
         let mut candidates: Vec<u64> = std::mem::take(&mut ctx.arena);
         candidates.retain(|id| !root_ids.contains(id) && ctx.arena_set.contains(id));
@@ -799,6 +830,45 @@ where
 /// 预波:每节点剩余消费者计数(每条入边 +1;根 +1 = 调用方持根)。
 /// 迭代显式栈(DAG 可数千节点深,避开递归深度);visited 保证每节点
 /// 处理一次,每条边在其消费节点的访问时计一次。
+/// **多根 pending(边只数一次)**(2026-10-19 定谳;设计卷 §8.31)。
+///
+/// 旧口径 = 逐根 `count_pending(r)` 后**相加**。它对"副作用树"(roots 互不相交:
+/// K0 写哑根 / encode,2026-10-10 的立项场景)是对的,但**对"根套根"错**:
+/// `eval_root_and_q` 的 roots = `[hidden, q₁..qₙ]`,而 Q/tap 节点**就在 hidden 的
+/// 子树里** ⇒ 共享子树的每条边被数 k 次,而执行只发生一次(节点求值 + memo)
+/// ⇒ `pending` 恒定多算 ⇒ 活性回收的"归零"永不成立 ⇒ **中途一块都不还**。
+///
+/// 实测(B 轴档 27B prefill chunk 128):真回收 **14** 块 / 新块 1431;影子 arena
+/// 峰值 2064 MiB ≈ 分配总量 2.0 GB(逐名同比例)⇒ 单 chunk 激活面 ≈ 48 层全摊。
+/// 修后同一档峰值应回到"峰值活跃集"量级(1–3 层)。
+///
+/// 不变量:**一张图数边一次**(每个节点只贡献自己的 `parents`),每个根另 +1
+/// (调用方持根 ⇒ 根永不中途回收 —— Q 槽/回灌面在 eval 结束后才读它们)。
+fn count_pending_multi(roots: &[&TensorOps]) -> std::collections::HashMap<u64, usize> {
+    let mut pending: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    let mut visited = std::collections::HashSet::new();
+    for r in roots {
+        // 调用方持有的根:带 +1(与单根口径同律)
+        *pending.entry(r.id).or_insert(0) += 1;
+        let mut stack = vec![*r];
+        while let Some(n) = stack.pop() {
+            // **跨根共享 visited** ⇒ 同一节点只贡献一次边(修的就是这里)
+            if !visited.insert(n.id) {
+                continue;
+            }
+            for p in &n.parents {
+                *pending.entry(p.id).or_insert(0) += 1;
+                if !visited.contains(&p.id) {
+                    stack.push(p);
+                }
+            }
+        }
+    }
+    pending
+}
+
+/// 单根 pending(lease:多根走 [`count_pending_multi`])
+#[allow(dead_code)]
 fn count_pending(root: &TensorOps) -> std::collections::HashMap<u64, usize> {
     let mut pending: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
     let mut visited = std::collections::HashSet::new();
@@ -1365,6 +1435,74 @@ mod liveness_tests {
     /// 报告渲染受日志级别影响,而"推了几次"是机械事实。CPU 面跑不了真块叶
     /// (无块账房 ⇒ DeadBlock),所以这里只验"推了且计数随引用增长";
     /// 真实图路径的端到端断言在 engine 侧(probe 窗口内 `refs_pushed > 0`)。
+    /// **多根"根套根"的活性回收**(2026-10-19;设计卷 §8.31 立案):
+    /// Q 槽(`eval_root_and_q` 的 `[hidden, q₁..qₙ]`)与 DFlash2/MTP taps 正是这种
+    /// 形态 —— **根节点在主根子树里**。旧口径逐根 `count_pending` 相加 ⇒ 共享子树的
+    /// 边被数 k 次、执行只减一次 ⇒ `pending` 永不归零 ⇒ 中途一块不还
+    /// (峰值 = 全图同摊:实测 27B 单 chunk 2064 MiB)。
+    ///
+    /// 判据(**紧**):活块按**块尺寸**定标 —— 每节点 16 KiB,回收正常时峰值活跃集
+    /// 只有个位数块(≤ `8 × NODE`);旧口径会把内层根那半条链(≈48 块)全吊住。
+    /// 过激回收会立刻在值上爆(两根的值都验)。
+    #[tokio::test]
+    async fn multi_root_nested_liveness_reclaimed() {
+        use owl_shared::slab_hint;
+        const N: usize = 4096; // 每节点 16 KiB
+        const NODE: usize = N * 4;
+        const GATE: usize = 8 * NODE; // 峰值活跃集上界(个位数块)
+        let mut face = owl_cpu::CpuFace::new();
+        let c = TensorOps::from_host(Dtype::F32, vec![N], &f32b(&vec![1.0f32; N]));
+        let mut x = TensorOps::from_host(Dtype::F32, vec![N], &f32b(&vec![0.0f32; N]));
+        let mut inner = None;
+        for i in 0..64 {
+            x = x.add(&c);
+            if i == 48 {
+                inner = Some(x.clone()); // 内层根:深处(在主根子树里)
+            }
+        }
+        let inner = inner.expect("内层根");
+
+        // ① 基线:单根口径(既有中途回收)
+        slab_hint::probe_on(true);
+        let (r1, cand1) = eval_ops_scoped(&x, &mut face).await.expect("单根 scoped");
+        let peak_single = slab_hint::probe_end();
+        assert!(cand1.is_empty(), "单根档候选表应为空,得 {}", cand1.len());
+        assert!(
+            peak_single <= GATE,
+            "单根基线峰值 {peak_single}B 就该是个位数块(门 {GATE}B)⇒ 基线本身坏了"
+        );
+
+        // ② 被验档:多根嵌套(两根:[主根, 内层根])
+        slab_hint::probe_on(true);
+        let roots = [&x, &inner];
+        let outs = eval_ops_multi_scoped_env(&roots, &mut face, crate::env::EnvProvider::default())
+            .await
+            .expect("多根 scoped");
+        let peak_multi = slab_hint::probe_end();
+        assert_eq!(outs.len(), 2, "两根本都必须拿到值");
+
+        // 值校验(过激回收 = 读到已还块 ⇒ 立刻错值;`dtoh` 读**整块**)
+        let mut buf = vec![0u8; NODE];
+        face.dtoh(&r1, &mut buf).await.expect("单根 dtoh");
+        let v1 = f32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        assert!((v1 - 64.0).abs() < 1e-4, "单根链值应 64.0,得 {v1}");
+        for (i, b) in outs.iter().enumerate() {
+            let mut bb = vec![0u8; NODE];
+            face.dtoh(b, &mut bb).await.expect("多根 dtoh");
+            let v = f32::from_le_bytes([bb[0], bb[1], bb[2], bb[3]]);
+            let want = if i == 0 { 64.0 } else { 49.0 };
+            assert!((v - want).abs() < 1e-4, "多根根#{i} 值应 {want},得 {v}");
+        }
+
+        // ③ 门:多根嵌套**不许**把峰值抬到图宽同阶(旧口径 = 内层根那半条链被吊住)
+        assert!(
+            peak_multi <= GATE,
+            "多根嵌套活性峰值 {peak_multi}B ≈ {} 块(门 {GATE}B)⇒ 共享子树的 pending \
+             被重复计数(§8.31);单根基线 {peak_single}B",
+            peak_multi / NODE
+        );
+    }
+
     #[tokio::test]
     async fn eval_pushes_ref_counts_to_probe() {
         let mut face = owl_cpu::CpuFace::new();
