@@ -3,6 +3,7 @@
 //! 布局 = 生产 x=8(classic [nb, Hkv, hd/8, bs, 8])。
 //! 无 GPU 跳过(OWL_TEST_DEVICE)。
 
+use owl_macros::owl_test;
 use cudarc::driver::{CudaContext, DevicePtr, LaunchConfig, PushKernelArg};
 
 const HKV: usize = 2;
@@ -67,12 +68,8 @@ fn f16_to_f32(h: u16) -> f32 {
     s * (1.0 + m / 1024.0) * 2f32.powi(e - 15)
 }
 
-#[test]
+#[owl_test(gpu)]
 fn k0_fp8_write_readback() {
-    if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
-        return;
-    }
     let ctx = CudaContext::new(1).expect("ctx");
     ctx.bind_to_thread().expect("bind");
     let stream = ctx.default_stream();

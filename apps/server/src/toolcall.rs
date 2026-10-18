@@ -173,6 +173,19 @@ pub struct ChannelSplitter {
     /// 游标标记计数(如关思考时仍吐 `</thinking>`)—— 一律**吞掉**不泄漏
     /// 进通道,但计数交给上层记日志(不许静默)
     strays: usize,
+    /// **关闭思考标记之后的结构空白吞除余量**(UTF-8 安全:只吞 `\n`)。
+    ///
+    /// 为什么要有它(§4.3 渲染对称律 R1;2026-10-19 实测定谳):模板把一轮
+    /// assistant 渲染成
+    /// ```text
+    /// <|im_start|>assistant\n thinking\n{trim(reasoning)}\n</think>\n\n{content}
+    /// ```
+    /// —— `\n</think>\n\n` 是**模板的结构资产**,不属于任何通道。而生成流里
+    /// 紧跟 ` response` 的那至多两个 `\n` 是**同一个结构**的落地。旧实现只吞
+    /// 标记本体 ⇒ 那两个换行漏进 `content` ⇒ 客户端回填后渲染多出两个 token
+    /// ⇒ **会话守卫在第一个 content token 就失配**(实测:T2 `cached_tokens=0`,
+    /// 前置 83 tok 全对、分叉点正是 `\n\n`)。
+    swallow_lf: u8,
 }
 
 impl ChannelSplitter {
@@ -186,6 +199,7 @@ impl ChannelSplitter {
             tool_index: 0,
             tool_on: true,
             strays: 0,
+            swallow_lf: 0,
         }
     }
 
@@ -222,7 +236,12 @@ impl ChannelSplitter {
         match (self.state, canon(m)) {
             (State::Text, MARK_THINK_OPEN) => State::Think,
             (State::Text, MARK_TOOL_OPEN) => State::InTool,
-            (State::Think, MARK_THINK_CLOSE) => State::Text,
+            (State::Think, MARK_THINK_CLOSE) => {
+                // 模板 `\n</think>\n\n{content}` 里的 `\n\n` 归模板(单源):
+                // 后续至多两个 `\n` 从流里吞掉(不足则按实际吞尽,见 `drain`)
+                self.swallow_lf = 2;
+                State::Text
+            }
             // Think 态遇 `<tool_call>`:模型没关思考直接开工(§4.6)—— 进工具
             // 通道,而不是把整块工具调用吞进思考面板
             (State::Think, MARK_TOOL_OPEN) => State::InTool,
@@ -250,6 +269,18 @@ impl ChannelSplitter {
                 self.state = State::Text;
             }
             State::Text | State::Think => {
+                // 收尾:未消化的结构空白按"归模板"处理(吐给 content 会让
+                // 回填渲染多出换行 —— 与 `drain` 同一律)
+                if self.swallow_lf > 0 {
+                    let n = self
+                        .buf
+                        .bytes()
+                        .take(self.swallow_lf as usize)
+                        .take_while(|b| *b == b'\n')
+                        .count();
+                    self.buf.drain(..n);
+                    self.swallow_lf = 0;
+                }
                 if !self.buf.is_empty() {
                     let text = std::mem::take(&mut self.buf);
                     out.push(Item::Delta { chan: self.chan(), text });
@@ -270,6 +301,23 @@ impl ChannelSplitter {
     fn drain(&mut self) -> Vec<Item> {
         let mut out = Vec::new();
         loop {
+            // **结构空白吞除**(只在关闭思考标记之后;见 `swallow_lf` 注):
+            // 缓冲空 = 不能定谳(流式,等下一个 chunk)⇒ 挂起。
+            if self.swallow_lf > 0 && self.state == State::Text {
+                while self.swallow_lf > 0 {
+                    match self.buf.as_bytes().first() {
+                        Some(b'\n') => {
+                            self.buf.drain(..1);
+                            self.swallow_lf -= 1;
+                        }
+                        Some(_) => self.swallow_lf = 0,
+                        None => break,
+                    }
+                }
+                if self.swallow_lf > 0 {
+                    break;
+                }
+            }
             match self.state {
                 State::InTool => {
                     if let Some(p) = self.buf.find(MARK_TOOL_CLOSE) {
@@ -450,7 +498,9 @@ mod tests {
         let items = s.push(
             "我需要先看目录。\n</think>\n\n好的,我来执行。\n<tool_call>\n<function=bash>\n<parameter=command>\nls -la\n</parameter>\n<parameter=timeout>\n30\n</parameter>\n<parameter=background>\ntrue\n</parameter>\n</function>\n</tool_call>",
         );
-        assert_eq!(split(&items), "R:我需要先看目录。\n|T:\n\n好的,我来执行。\n|", "通道序列");
+        // `</think>` 之后的 `\n\n` = **模板结构资产**(§4.3 R1)⇒ 不进 content:
+        // 回填渲染时模板自己补回,少两个 token 才是对称的(2026-10-19 定谳)
+        assert_eq!(split(&items), "R:我需要先看目录。\n|T:好的,我来执行。\n|", "通道序列");
         assert_eq!(
             items.last(),
             Some(&Item::ToolCall {
@@ -608,7 +658,7 @@ mod tests {
     }
 
     /// **标记 × 快照耦合门**:解析器的标记字面量必须真的出现在快照渲染产物里
-    /// (仓库内金标,恒跑);模板源(需 `OWL_TPL_DIR`)必须留长形态别名。
+    /// (仓库内金标,恒跑);模板源(需 `tpl:default`)必须留长形态别名。
     /// 模板漂移(上游改标记名)会让解析器**静默失效** —— 这条是警报器。
     #[test]
     fn markers_match_snapshot() {
@@ -619,15 +669,15 @@ mod tests {
         assert!(think_on.contains(MARK_TOOL_OPEN), "tools 档应含工具开标记");
         assert!(think_on.contains(MARK_TOOL_CLOSE), "tools 档应含工具闭标记");
         assert!(think_off.contains(MARK_THINK_CLOSE), "关思考档应含主闭标记");
-        match std::env::var("OWL_TPL_DIR") {
-            Ok(dir) => {
+        match owl_shared::testkit::resource("tpl:default") {
+            Some(dir) => {
                 let src = std::fs::read_to_string(
                     std::path::Path::new(&dir).join("chat_template.jinja"),
                 )
                 .unwrap();
                 assert!(src.contains(MARK_THINK_OPEN_LONG), "模板源应含长形态别名");
             }
-            Err(_) => eprintln!("skip(部分): OWL_TPL_DIR 未设,跳过模板源检查"),
+            None => eprintln!("skip(部分): 资源 tpl:default 不在,跳过模板源检查"),
         }
     }
 
@@ -663,4 +713,57 @@ mod tests {
         let items = s.push("<think>思考</think>正文");
         assert_eq!(split(&items), "R:思考|T:正文|");
     }
+    /// **律(§4.3 R1,2026-10-19)**:`</think>` 之后的至多两个 `\n` 是模板
+    /// 结构资产(`…\n</think>\n\n{content}`),**不进任何通道** —— 否则客户端
+    /// 回填后渲染会多出两个 token,会话守卫在第一个 content token 失配。
+    /// 本测钉三件:①吞两个 ②只有一个时吞一个 ③没有时不吞(`答案` 原样)。
+    #[test]
+    fn think_close_boundary_whitespace_is_structural() {
+        let f = |src: &str| {
+            let mut s = ChannelSplitter::new(true, ToolSchemas::default());
+            let mut all = split(&s.push(src));
+            all.push_str(&split(&s.finish()));
+            all
+        };
+        assert_eq!(f("想</think>\n\n答案"), "R:想|T:答案|");
+        assert_eq!(f("想</think>\n答案"), "R:想|T:答案|", "只有一个换行时吞一个");
+        assert_eq!(f("想</think>答案"), "R:想|T:答案|", "无换行 ⇒ 不吞");
+        assert_eq!(f("想</think>\n\n\n答案"), "R:想|T:\n答案|", "只吞两个(其余归正文)");
+    }
+
+    /// **流式切半**:结构空白跨 chunk 到达时必须**挂起**(不许先吐给 content
+    /// 再纠正 —— 通道一旦发出就收不回;客户端会把这两个换行回填)。
+    #[test]
+    fn think_close_boundary_survives_chunk_split() {
+        let mut s = ChannelSplitter::new(true, ToolSchemas::default());
+        // 逐字符切分(最坏情形):通道文本**合并后**比对 —— 分几帧无所谓,
+        // 关键是内容:帧边界不得让结构空白漏进 content
+        let mut merged: Vec<(Chan, String)> = Vec::new();
+        let mut absorb = |items: Vec<Item>| {
+            for it in items {
+                if let Item::Delta { chan, text } = it {
+                    match merged.last_mut() {
+                        Some((c, t)) if *c == chan => t.push_str(&text),
+                        _ => merged.push((chan, text)),
+                    }
+                }
+            }
+        };
+        for piece in ["想", "</think>", "\n", "\n", "答", "案"] {
+            absorb(s.push(piece));
+        }
+        absorb(s.finish());
+        let joined: Vec<String> = merged
+            .iter()
+            .map(|(c, t)| {
+                let tag = match c {
+                    Chan::Text => "T",
+                    Chan::Think => "R",
+                };
+                format!("{tag}:{t}")
+            })
+            .collect();
+        assert_eq!(joined.join("|"), "R:想|T:答案", "切半不得漏出结构空白");
+    }
+
 }

@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "crates/graph",
+    "crates/store",
     "crates/macros",
     "crates/kernels",
     "crates/backends/cuda",
@@ -46,4 +46,28 @@ tracing = "0.1.40"
 bincode = "1.3.3"
 
 [profile.dev.package.owl-models]
+opt-level = 3
+
+# 测试面热点:CPU mock 档的装载解码逐元素路径(§18)——debug 下实测 53MB/s
+# (逐元素+无内联),该 crate 单开优化后回到内存带宽级。只影响本 crate。
+[profile.dev.package.owl-cpu]
+opt-level = 3
+
+# half 的 f16→f32 软件转换在 debug 下逐元素 ~79ns(实测 769M 元素 = 61s);
+# 测试/CPU 档逐元素路径必须带上它一起优化(否则 opt-level 只覆盖调用方,call
+# 进未优化的 half 里照样慢)。
+[profile.dev.package.half]
+opt-level = 3
+
+# **同律扩展到引擎与 store 的逐元素热路**(2026-10-19,A3 定谳):
+# 索引采集(`MeanKCollector`)/ Q 面解码(`KvPageFormat::decode_row`)/ 解释器
+# 逐节点粘合层全在这两 crates 里。debug(opt-level 0)实测:
+#   - 索引采集 **10.6 ms/块**(微基准 0.27 ms/块 ⇒ **40× 差**)
+#   - 探针档 prefill 596 tok/s;裸引擎 chunk128 仅 246 tok/s
+# 与 `owl-models`/`owl-cpu`/`half` 同一条纪律:凡“逐元素/逐节点”路径,
+# 测试档必须带优化(否则探针读数与生产读数不是同一个东西)。
+[profile.dev.package.owl-store]
+opt-level = 3
+
+[profile.dev.package.owl-engine]
 opt-level = 3

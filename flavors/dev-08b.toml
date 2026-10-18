@@ -1,0 +1,78 @@
+# owl 引擎预设档 `dev-08b`(0.8B 开发/冒烟档)
+#
+# **两个用途**:
+# 1. CI/本机冒烟(`--flavor dev-08b`;= 代码缺省 + bind 明示);
+# 2. **0.8B 探针档的基档**(`gpu_08b_*` 系列走 `OWL_PROBE_FLAVOR=dev-08b` 装载)
+#    —— 让探针跑的条件**写在一个文件里**,而不是散在 env 里。
+#
+# ⚠️ 本档**不覆盖模型/权重**;0.8B 资产由测试侧(`OWL_TEST_DEVICE` +
+#    `models/assets/Qwen3.5-0.8B`)决定。
+
+[runtime]
+bind = "127.0.0.1:8135"
+# 0.8B 冒烟规模(探针 prompt 3072 tok = 96 页 × 32)
+max_seq = 4096
+# ⚠️ **本档 chunk 曾冻结 1024**(A2 期);2026-10-19 **已解冻**:
+# 漂移根因定谳 = FI plan 键双规范(已缺省对齐,见设计卷 §8.30),且已有机器门
+# 盯着这条不变量:`gpu_08b_chunk_invariance_gate`(同 prompt × 两种切块 ⇒ 读数必须一致)
+# 与核级 `fi_plan_key_sweep`(plan 缓存状态不许改数值)。改 chunk 前跑那两道门即可。
+prefill_chunk = 1024
+
+[pool]
+# 固定池:探针要的是**可复现**,不是自动调压。
+# ⚠️ 池下限算式(虚拟化档 boot 硬校验,见 engine 的"池容量硬校验"):
+#     nb ≥ gdn_slots × (ceil(workspace_per_req/32) + ceil(chunk/32))
+#     192 ≥ 2 × (ceil(2048/32)=64 + 16) = 160 ✓   (页 = 32 tok;
+#                                              工作集 64 页 = sink2 + recent4 + top-k 58)
+pool_tokens = 6144
+gdn_slots = 2
+snap_max = 4
+# 宿主双腿:0.8B 契约与压力探针都要落点
+host_cache_mb = 256
+snap_host_mb = 128
+prefix_cache = false
+
+[sampling]
+# 冒烟/探针看确定性 ⇒ greedy(数值面不受采样影响)
+mode = "greedy"
+
+[kvmem]
+# B 轴两扇门:**探针档默认两扇全开**(它是"覆盖率高保真读数"档);
+# 要纯生产形态就 `OWL_PROBE_OVERLAY` 指一个 `[kvmem] select_decode=false ...` 的覆盖件,
+# 或直接在覆盖件里关。
+# ⚠️ **保真档不开视图**(2026-10-19 实测定谳):开了 `select_decode` ⇒ 召回点之后
+# 的 prefill **只扫选中块** ⇒ 之后写下的 K 被**自己扰动** ⇒ 真实质量读数随
+# 「召回在哪个 ctx 发生」漂(实测同一 ctx=3072、同一 prompt:关=87.5%,
+# 开=18.5%/16.4% 随 chunk 变)。⇒ **保真读数与视图必须分开量**:
+# 视图/部分驻留的生产行为由 `gpu_08b_select_decode_probe` 那一档测。
+select_decode = false
+# ⚠️ **保真探针档必须不留洞**:`select_partial` 会把非选中块沉走 ⇒ 真实质量的
+# K 回读被挖洞(`host_skipped` 按零计)⇒ 覆盖率读数退化到"数据平"那一类
+# (实测 top8 87.5% → 12.4%)。**部分驻留的生产行为由 `gpu_08b_select_decode_probe`
+# 那一档测**(它有自己的配置),两件事分开量。
+select_partial = false
+index = true
+# 诊断面(真实质量扫描/曲线/上界/论文口径) —— 0.8B 上便宜(单次 ~340ms),
+# 故冒烟档开着;上规模(27B)务必关(单次 6.3s,见 docs/arch/kvmem-选择层 §8.23)
+coverage_probe = true
+# **钉住分析边界**(读数可比;0 = 最后一个边界 —— 那个位置随 chunk 漂移):
+# 3072 对 chunk ∈ {256,512,1024} 都是合法边界 ⇒ 跨 chunk 读数逐位可比
+analyze_at_ctx = 3072
+# 注:这一档下 `select_decode=false` ⇒ `virtualization_enabled=false`
+# ⇒ 池不超卖(池 6144 ≥ ctx 4096)、地板走 Strict ✓
+# 预算/保底/节奏:与 27B 低显存档**同一套**节奏(every=4),
+# 免得跨档比数字时又要解释"条件不一样"
+# **每 turn 工作集**(token 口径;这里 = 64 页 × 32 tok,与 27B 低显存档**同一套**语义)
+workspace_per_req = 2048                    # 64 页(页 32 tok)= 保底 6 + 召回 top-k 58
+select_sink = 2
+select_recent = 4
+recall_every = 4
+# 池不小于上下文 ⇒ 这里**不需要**超卖(超卖是 27B 低显存档的事);
+# 但 `select_partial` 的驻留是**选择驱动**的(不选中的就沉),所以照样会下沉/回灌 ——
+# 覆盖率仪器的读数正需要这个(测选择层的下沉/回灌与视图装配)。
+pool_overcommit = false
+
+[server]
+# 单会话语义(D1 2026-10-17 跨字段校验:`gdn_slots ≥ [server].max_concurrency`)——
+# 超了会把活跃会话的状态格 LRU 逐出(跨会话状态污染),boot 直接拒启。
+max_concurrency = 2

@@ -18,7 +18,7 @@ async fn main() {
         .cloned()
         .unwrap_or_else(|| "请用一句话介绍你自己。".into());
     let max_new: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(24);
-    let ordinal: usize = owl_shared::env_reader::parse_or("OWL_TEST_DEVICE", 0);
+    let ordinal: usize = owl_cuda::test_device_ordinal();
 
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../models/assets/Qwen3.5-0.8B");
 

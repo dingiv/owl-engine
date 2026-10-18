@@ -32,6 +32,7 @@
 use std::collections::HashMap;
 
 use crate::contract::{Dtype, ModelError};
+use crate::module::Taken;
 use crate::module::{Layout, LoaderCtx, LoaderOps, WeightSource};
 use crate::plan::rules::{rule_of, want_axis, WantAxis, WeightRule};
 use crate::plan::span::segments_in_key_units;
@@ -230,7 +231,7 @@ impl<'a, S: WeightSource + ?Sized> ShardedSource<'a, S> {
 }
 
 impl<S: WeightSource + ?Sized> WeightSource for ShardedSource<'_, S> {
-    fn take(&self, key: &str) -> Option<Vec<f32>> {
+    fn take(&self, key: &str) -> Taken<Vec<f32>> {
         match self.spans.get(key) {
             None => self.inner.take(key),
             // ⚠️ 不能"整取再切"(那会把全量读进主机 —— 违背分片装载本意)
@@ -238,25 +239,31 @@ impl<S: WeightSource + ?Sized> WeightSource for ShardedSource<'_, S> {
         }
     }
 
-    fn take_range(&self, key: &str, offset_elems: usize, len: usize) -> Option<Vec<f32>> {
+    fn take_range(&self, key: &str, offset_elems: usize, len: usize) -> Taken<Vec<f32>> {
         if !self.spans.contains_key(key) {
             return self.inner.take_range(key, offset_elems, len);
         }
+        let Some(seq) = self.map(key, offset_elems, len) else {
+            return Ok(None); // 越界/不在表(与内层 take_range 同语义:Ok(None) = 缺)
+        };
         let mut out = Vec::with_capacity(len);
-        for (src_off, n) in self.map(key, offset_elems, len)? {
-            out.extend(self.inner.take_range(key, src_off, n)?);
+        for (src_off, n) in seq {
+            let Some(chunk) = self.inner.take_range(key, src_off, n)? else {
+                return Ok(None);
+            };
+            out.extend(chunk);
         }
-        Some(out)
+        Ok(Some(out))
     }
 
-    fn elem_len(&self, key: &str) -> Option<usize> {
+    fn elem_len(&self, key: &str) -> Taken<usize> {
         match self.spans.get(key) {
-            Some(e) => Some(e.tgt_elems),
+            Some(e) => Ok(Some(e.tgt_elems)),
             None => self.inner.elem_len(key),
         }
     }
 
-    fn native_dtype(&self, key: &str) -> Option<Dtype> {
+    fn native_dtype(&self, key: &str) -> Taken<Dtype> {
         self.inner.native_dtype(key)
     }
 
@@ -266,23 +273,30 @@ impl<S: WeightSource + ?Sized> WeightSource for ShardedSource<'_, S> {
         offset_elems: usize,
         len: usize,
         dst: &mut [u8],
-    ) -> Option<()> {
+    ) -> Taken<()> {
         if !self.spans.contains_key(key) {
             return self.inner.copy_native_into(key, offset_elems, len, dst);
         }
-        // 原始字节直拷:元素宽 = **源**的 native 宽(与内层语义一致)
-        let esz = self.inner.native_dtype(key)?.size_bytes();
+        // 原始字节直拷:元素宽 = **源**的 native 宽(与内层语义一致)。
+        // 内层无原始通道(`Ok(None)`)= 本层也回退(调用方转 convert 路径)。
+        let Some(src_dt) = self.inner.native_dtype(key)? else {
+            return Ok(None);
+        };
+        let esz = src_dt.size_bytes();
+        let Some(seq) = self.map(key, offset_elems, len) else {
+            return Ok(None);
+        };
         let mut tgt_elem = 0usize;
-        for (src_off, n) in self.map(key, offset_elems, len)? {
+        for (src_off, n) in seq {
             let b0 = tgt_elem * esz;
             let b1 = b0 + n * esz;
             if b1 > dst.len() {
-                return None;
+                return Ok(None);
             }
             self.inner.copy_native_into(key, src_off, n, &mut dst[b0..b1])?;
             tgt_elem += n;
         }
-        Some(())
+        Ok(Some(()))
     }
 
     fn convert_chunk_into_bytes(
@@ -292,7 +306,7 @@ impl<S: WeightSource + ?Sized> WeightSource for ShardedSource<'_, S> {
         len: usize,
         dst: &mut [u8],
         dtype: Dtype,
-    ) -> Option<()> {
+    ) -> Taken<()> {
         if !self.spans.contains_key(key) {
             return self
                 .inner
@@ -300,18 +314,21 @@ impl<S: WeightSource + ?Sized> WeightSource for ShardedSource<'_, S> {
         }
         // 目标字节布局:元素宽 = **目标 dtype**
         let esz = dtype.size_bytes();
+        let Some(seq) = self.map(key, offset_elems, len) else {
+            return Ok(None);
+        };
         let mut tgt_elem = 0usize;
-        for (src_off, n) in self.map(key, offset_elems, len)? {
+        for (src_off, n) in seq {
             let b0 = tgt_elem * esz;
             let b1 = b0 + n * esz;
             if b1 > dst.len() {
-                return None;
+                return Ok(None);
             }
             self.inner
                 .convert_chunk_into_bytes(key, src_off, n, &mut dst[b0..b1], dtype)?;
             tgt_elem += n;
         }
-        Some(())
+        Ok(Some(()))
     }
 }
 
@@ -319,25 +336,31 @@ impl<S: WeightSource + ?Sized> WeightSource for ShardedSource<'_, S> {
 mod tests {
     use super::*;
     use crate::module::Want;
-    use crate::plan::rules::{SegKind, WeightRule};
+    use crate::module::Taken;
+use crate::plan::rules::{SegKind, WeightRule};
 
     /// 内存源(全量 f32;`Vec` 值域即"源坐标系")
     struct MemSource {
         data: HashMap<String, Vec<f32>>,
     }
 
+    /// 测试小助手:`Taken` 两层展开(读取错 = panic;缺键 = panic)
+    fn t<T>(r: Taken<T>) -> T {
+        r.expect("读取失败").expect("键不在源")
+    }
+
     impl WeightSource for MemSource {
-        fn take(&self, key: &str) -> Option<Vec<f32>> {
-            self.data.get(key).cloned()
+        fn take(&self, key: &str) -> Taken<Vec<f32>> {
+            Ok(self.data.get(key).cloned())
         }
-        fn take_range(&self, key: &str, off: usize, len: usize) -> Option<Vec<f32>> {
-            self.data.get(key)?.get(off..off + len).map(<[f32]>::to_vec)
+        fn take_range(&self, key: &str, off: usize, len: usize) -> Taken<Vec<f32>> {
+            Ok(self.data.get(key).and_then(|v| v.get(off..off + len)).map(<[f32]>::to_vec))
         }
-        fn elem_len(&self, key: &str) -> Option<usize> {
-            self.data.get(key).map(Vec::len)
+        fn elem_len(&self, key: &str) -> Taken<usize> {
+            Ok(self.data.get(key).map(Vec::len))
         }
-        fn native_dtype(&self, _key: &str) -> Option<Dtype> {
-            Some(Dtype::F32)
+        fn native_dtype(&self, _key: &str) -> Taken<Dtype> {
+            Ok(Some(Dtype::F32))
         }
     }
 
@@ -389,12 +412,12 @@ mod tests {
         let spans = build_shard_pass(&mut ops, &ctx).expect("pass");
         let sharded = ShardedSource::new(&src, spans);
         // 分片后的目标:逐元素读回(经 take_range 分块,验证跨行/跨段拼接)
-        let n = sharded.elem_len(key).expect("elem_len");
+        let n = t(sharded.elem_len(key));
         let mut got = Vec::with_capacity(n);
         for chunk in 0..n.div_ceil(7) {
             let off = chunk * 7;
             let len = 7.min(n - off);
-            got.extend(sharded.take_range(key, off, len).expect("take_range"));
+            got.extend(t(sharded.take_range(key, off, len)));
         }
         assert_eq!(got.len(), n, "{key}: 读回元素数");
         // 参考:按规则"先全量后切"(plan/tp 的切分原语)
@@ -480,8 +503,8 @@ mod tests {
         let spans = build_shard_pass(&mut ops, &ctx).unwrap();
         assert!(spans.is_empty(), "Replicate 不进表");
         let sharded = ShardedSource::new(&src, spans);
-        assert_eq!(sharded.take(key).unwrap(), (0..8).map(|i| i as f32).collect::<Vec<_>>());
-        assert_eq!(sharded.elem_len(key), Some(8), "全量元素数不变");
+        assert_eq!(t(sharded.take(key)), (0..8).map(|i| i as f32).collect::<Vec<_>>());
+        assert_eq!(t(sharded.elem_len(key)), 8, "全量元素数不变");
     }
 
     /// shard = 1 ⇒ 零开销(空表;源直通)

@@ -1,11 +1,11 @@
 //! 设备状态块池(StatePool;2026-10-01 engine.rs 拆分立)。
 //!
-//! 引擎全部设备侧状态块的**治理对象**:KV paged 池(kvs)/ GDN 状态格
+//! 引擎全部设备侧状态块的**治理对象**:KV paged 池(kvs)/ GDN 行
 //! (gdns)/ GDN 快照池(snaps)/ 持久块表(bt)+ 池几何(page/nb/
 //! paged/x/dims)。职责 = 分配([`StatePool::alloc`])+ 叶子句柄发放
 //! (kv_caches/gdn_caches/bt_leaf)+ 状态治理(reset_gdn/capture_snap/
 //! restore_snap/write_bt)。块账房(host 侧记账)不在此 —— 那是
-//! BlockManager(blocks.rs);本池只管设备缓冲与池内快照 LRU。
+//! `owl_store` 的块腿(槽池 + 内容身份前缀树);本池只管设备缓冲与池内快照 LRU。
 //!
 //! 布局策略表驱动(REQ-HW-01):KV 布局由 `kv_paged_policy(dtype)` 分发
 //! —— Some = paged classic(kc [nb,Hkv,hd/x,page,x] / vc [nb,Hkv,hd,page];
@@ -16,6 +16,7 @@
 //! (三方先例 + 旧世界律);slots/kv_lens/bt f32(契约 5)。
 
 use owl_iface::contract::{Bytes, DeviceClient, Dtype, ModelError};
+use owl_store::SnapKey;
 use owl_models::interpreters::eval_ops;
 use owl_models::module::kv_paged_policy;
 use owl_models::TensorOps;
@@ -26,19 +27,51 @@ pub(crate) type BlockN = (Bytes, usize); // (块句柄, 元素数;重置分块�
 
 
 
-/// GDN 状态格容量(**与会话数绑定,与 max_seq_tokens 解耦**)。
+/// GDN 行容量(**与会话数绑定,与 max_seq_tokens 解耦**)。
 /// 格语义 = 每会话一格(SessionTable 分配/释放);按位分配是历史包袱:
 /// s=4096 时 rec(1 MiB/格/层 × 18 层)将达 72 GB,而真实需求 = 格数。
 /// 8 = 覆盖需求并发上限(§二 并发 ≤8);会话 close 即释放格号。
-/// 槽数 = EngineKnobs.gdn_slots(显式传入;原 OWL_GDN_SLOTS,缺省 8)。
+/// 槽数 = EngineKnobs.gdn_slots(显式传入;原 OWL_MAX_ACTIVE_TURNS,缺省 8)。
 ///
-/// GDN 快照槽(E2c):key = 链尾物理块 id(内容身份);bufs = 逐层逐块
-/// 行宽副本(与 gdns 同序同构,行宽 = elems / GDN_SLOTS)。池静态
-/// 预分配,驱逐 = 换 key 覆盖写(零 alloc/free 往返)。
-pub(crate) struct GdnSnapSlot {
-    key: Option<u32>,
-    last_use: u64,
+/// GDN 快照槽(E2c):key = [`SnapKey`](**边界块的内容身份**;逐块父链哈希,
+/// `owl_store::ChainCursor`)。为什么不是物理块号:物理块号是会被回收复用的
+/// 槽号 ⇒ 旧键会命中别人的状态(静默错值;store 卷 §9.1)。键类型来自 store
+/// ⇒ **物理槽号在类型上就进不了快照键**。
+/// bufs = 逐层逐块行宽副本(与 gdns 同序同构,行宽 = elems / MAX_ACTIVE_TURNS)。
+/// 池静态预分配,驱逐 = 换 key 覆盖写(零 alloc/free 往返)。
+/// **快照池(S2 三层化;§25.2)**:矩阵化 —— 每 (层,quad) **一条**缓冲,
+/// 长 = `snap_max × 行宽` ⇒ 一条快照 = 一个"槽"(片 = 逐 (层,quad) 的行宽,
+/// 与 KV 腿的 `PoolLayout` 同构 ⇒ 直接套 store 的 swap 机制)。
+///
+/// **账的真源在 store 的 `StateStore`**(key → 层/字节/新鲜度);本池只做
+/// 设备物理与**槽位索引**(槽 → key)。所以 `last_use` 仍在本池(设备槽的
+/// 替换序是设备面的事),而"内容还在不在(设备/宿主)"归 store。
+/// 槽位选择结果(纯判定;执行在 engine —— store 出账、face 搬运)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SnapSlotPick {
+    /// 同一张快照已在设备(原地覆盖/直接恢复)。
+    Hit(u32),
+    /// 空槽。
+    Free(u32),
+    /// 需替换:最冷的设备快照(槽, 它的 key)。
+    Victim(u32, SnapKey),
+}
+
+/// spec 快照缓冲(E5-M2;独立池,**不参与 LRU** —— 恢复后仍有效)。
+/// 序 = 层 × 4(conv_q/k/v/rec),与 capture/restore 同构。
+pub(crate) struct SpecSnapBuf {
+    pub(crate) bufs: Vec<BlockN>,
+}
+
+pub(crate) struct GdnSnapPool {
+    /// 逐 (层,quad) 的池矩阵(与 `gdns` 同序同构)。
     bufs: Vec<BlockN>,
+    /// 槽 → key(`None` = 空槽)。
+    keys: Vec<Option<SnapKey>>,
+    /// 槽新鲜度(设备槽替换序)。
+    last_use: Vec<u64>,
+    /// 每槽每片字节(= 行宽;`attach` 后由布局定谳)。
+    row_bytes: Vec<usize>,
 }
 
 pub(crate) struct KvBlocks {
@@ -51,6 +84,17 @@ struct GdnBlocks {
     conv_k: BlockN,
     conv_v: BlockN,
     rec: BlockN,
+}
+
+/// 元素字节宽(账口径唯一产地:坑册 §42 —— 块句柄自述 dtype 是标注,
+/// 但**同进程内** GPU 面的 dtype 就是真值;跨 face 的字节真源另见调用方)。
+pub(crate) fn elem_bytes(d: Dtype) -> usize {
+    match d {
+        Dtype::F16 | Dtype::BF16 => 2,
+        Dtype::F32 | Dtype::U32 => 4,
+        // 8 位族(§S 2026-10-17 dtype 分离):fp8×2 / int8 各自点名,同宽 1
+        Dtype::U8 | Dtype::F8E4M3 | Dtype::F8E5M2 | Dtype::I8 => 1,
+    }
 }
 
 /// prefill 块构造所需维度账(run 期从 spec 提取;Copy 免 Clone 传播)
@@ -90,18 +134,24 @@ pub(crate) fn kv_per_tok_bytes(
         + if dflash { 5 * 2 * 8 * 128 * 2 } else { 0 } // 草稿池按 token 线性(页取整后略同)
 }
 
-/// 设备状态块池(KV paged 池 / GDN 状态格 / 快照池 / 持久块表)。
+/// 设备状态块池(KV paged 池 / GDN 行 / 快照池 / 持久块表)。
 /// 治理对象(charter A1 味):S2 图档与执行器只经方法面触碰状态块,
 /// 不直摸块句柄。
 /// 池装配计划(engine run 从 knobs/spec_mode 派生;显式依赖律的
 /// 参数对象 —— 原散列布尔/数值参数群收编:量化 = KvQuant 枚举,
 /// 投机形态 = SpecMode 枚举,互斥语义由派生保证,调用点零自洽负担)
 #[derive(Clone, Debug)]
-pub(crate) struct PoolPlan {
-    /// 单会话容量(= max_seq_tokens)
+pub(crate) struct PoolPlan {    /// 单会话容量(= max_seq_tokens)
     pub seq_tokens: usize,
     /// 池容量(治理/钉值定谳后的 token 数)
     pub pool_tokens: usize,
+    /// **允许池小于上下文**(锁①;`[kvmem].pool_overcommit`)。
+    ///
+    /// 关着时池有硬下限 `nb ≥ ceil(seq_tokens/page)` ⇒ **选择层只省访问面、
+    /// 不省显存**。开着才允许 `pool_tokens` 真的压小,把 KV 挤到宿主。
+    /// ⚠️ 只有引擎侧已验过"虚拟化真的开着"才会传 true(engine 侧判据已行;
+    /// 本件只执行事实,不做策略)。
+    pub pool_overcommit: bool,
     /// 主池 KV 量化
     pub kv: owl_models::env::KvQuant,
     /// FI 直读面启用的池量化(None = 无 FI 面)。
@@ -120,7 +170,7 @@ pub(crate) struct PoolPlan {
     pub xqa_decode: bool,
     /// **XQA prefill 臂**(chunked q=T;同一份 `M_TILESIZE=32` 实例化)
     pub xqa_prefill: bool,
-    /// GDN 状态格容量
+    /// GDN 行容量
     pub gdn_slots: usize,
     /// spec 快照池深度
     pub snap_max: usize,
@@ -136,10 +186,15 @@ pub(crate) struct PoolPlan {
     pub prefill_dump_page: bool,
     /// reset_gdn 后 GDN rec 格画像(诊断面;原 OWL_GDN_DBG)
     pub gdn_dbg: bool,
+    /// **选择层视图块表槽**(B-2;`OWL_COVERAGE_PROBE=1` = 召回点探针档)。
+    /// true ⇒ 主池多分配一个 `[1, nb]` 的视图页表块(内容 = **选中块**的物理页
+    /// 按时间序;每召回点重写),与全量块表 `bt` **并存**(两者都要在场:
+    /// 视图给选择层用,全量给 dense 对照与未选中块的回灌)。
+    pub select_view: bool,
 }
 
 pub(crate) struct StatePool {
-    /// GDN 状态格容量(knobs.gdn_slots,boot 定谳;原自由函数 gdn_slots())
+    /// GDN 行容量(knobs.gdn_slots,boot 定谳;原自由函数 gdn_slots())
     pub(crate) gdn_slots: usize,
     /// GDN 画像 dump 全槽(knobs.gdn_dump_all)
     #[allow(dead_code)] // 诊断面字段(写入后当前无读者)
@@ -154,9 +209,12 @@ pub(crate) struct StatePool {
     pub(crate) kv_fp8: bool,
     pub(crate) dflash_fp8: bool,
     gdns: Vec<GdnBlocks>,
-    snaps: Vec<GdnSnapSlot>,
+    snaps: GdnSnapPool,
     snap_tick: u64,
     bt: Bytes,
+    /// **选择层视图页表**(B-2;`None` = 本档无视图面)。与 `bt` 并存:
+    /// `bt` = 会话真链(dense),本块 = 选中块的物理页按**时间序**。
+    bt_view: Option<Bytes>,
     /// v2 分页 decode scratch(E-decode 2026-10-04;paged 时恒分配,
     /// None = legacy/无页策略;引擎注入 ctx → 层走 v2 + LSE 归并)
     pub(crate) attn_v2: Option<owl_models::module::AttnV2Scratch>,
@@ -169,7 +227,7 @@ pub(crate) struct StatePool {
     pub(crate) xqa: Option<owl_models::module::XqaVerifyCtx>,
     /// spec 快照(E5-M2:投机轮回滚缓冲;OWL_SPEC_DEPTH>0 时分配,
     /// 内容 = 轮首 GDN 态 state@B-1;restore 后仍有效,全接受后失效重拍)
-    pub(crate) spec_snap: Option<GdnSnapSlot>,
+    pub(crate) spec_snap: Option<SpecSnapBuf>,
     /// MTP 草稿链 KV 池(E5-M2b;独立页池,1 层;mtp 模式分配)
     pub(crate) mtp_kvs: Option<KvBlocks>,
     /// DFlash2 草稿 KV 池(E5-DF2;独立页池,5 层草稿几何 8/128)
@@ -194,7 +252,7 @@ pub(crate) struct StatePool {
     pub(crate) fi_tables: Option<FiTableBlocks>,
     /// paged 池几何(页;legacy 模式 page = 容量,nb = 1)
     pub(crate) page: usize,
-    /// **管理面**页数(BlockManager/会话块表/FI 页链槽只认这些)
+    /// **管理面**页数(store 块腿/会话块表/FI 页链槽只认这些)
     pub(crate) nb: usize,
     /// **物理**页数(含 padding dump 页;= `nb + dump`)
     pub(crate) nb_kv: usize,
@@ -235,7 +293,253 @@ pub(crate) struct FiTableBlocks {
     pub nb_cap: usize,
 }
 
+// ============================================================================
+// 显存预算的**具名项**(B1,2026-10-17)
+// ============================================================================
+//
+// 病(原状,首轮审查 §B1):预算 = 一行乘法(`per_tok_bytes`)+ 一锅端
+// `(400<<20)`——图 slab 随图族/臂换代变大时**静默失真** ⇒ 池上限偏大 ⇒
+// 请求级 OOM(20G 档生产 OOM 正是这类形状)。故:①每项具名;②每项在 boot
+// 日志**逐项打印**(可与实测对账);③能用实测的项一律带实测来源(禁裸常数)。
+
+/// DFlash2 草稿池几何(**state.rs 内单源**;数值来源 = z-lab 检查点家族定形
+/// = 5 层 × 8 KV 头 × hd128)。预算项与分配项都必须从这里派生 ——
+/// 原两处各写一遍(`5*2*8*128*2` 逐 token 项 / `(8,128,5)` 分配项)。
+/// (挂账:更远的单源是草稿模型实例自己的 hkv/hd/n_layers —— 需 models 侧
+/// 开只读访问器 + PoolPlan 携几何;本轮只收同文件内两份。)
+#[derive(Debug, Clone, Copy)]
+struct DraftPoolGeom {
+    layers: usize,
+    hkv: usize,
+    hd: usize,
+}
+
+impl DraftPoolGeom {
+    /// 逐 token 字节(K+V 两张量 × 层数 × 头 × hd × elem)
+    fn per_tok_bytes(self, elem: usize) -> usize {
+        self.layers * 2 * self.hkv * self.hd * elem
+    }
+
+    /// 单层池元素数(页口径:K/V 同形,dtype 由调用方按池量化定)
+    fn layer_elems(self, nb: usize, page: usize) -> usize {
+        nb * self.hkv * self.hd * page
+    }
+}
+
+/// 草稿池几何值(z-lab 家族;与 `DFlash2Draft::new_with_plan_dt` 的
+/// hkv/hd/n_layers 同形)
+const DRAFT_POOL: DraftPoolGeom = DraftPoolGeom { layers: 5, hkv: 8, hd: 128 };
+
+/// **逐 token 线性项**:池上限 = 可用预算 / 本值。
+/// 组成 = 主池 KV(全注意层 × K/V × hkv × hd × elem)+ 草稿池(同上,草稿几何)。
+#[derive(Debug, Clone, Copy)]
+struct PerTokBytes {
+    main_kv: usize,
+    draft_pool: usize,
+}
+
+impl PerTokBytes {
+    /// `draft_elem` = `Some(池 elem 字节)` 当且仅当 DFlash2 档(草稿池按 token 线性;
+    /// 页取整后略同)。**elem 来自 `KvQuant::size_bytes` 单一映射** —— 原先草稿池
+    /// 项写死 2B,池改 fp8 时预算不会跟(= 声明没驱动算式)。
+    fn of(dims: &ModelDims, n_full: usize, kv_elem: usize, draft_elem: Option<usize>) -> Self {
+        PerTokBytes {
+            main_kv: n_full * 2 * dims.hkv * dims.hd * kv_elem,
+            draft_pool: draft_elem.map(|e| DRAFT_POOL.per_tok_bytes(e)).unwrap_or(0),
+        }
+    }
+
+    fn total(self) -> usize {
+        self.main_kv + self.draft_pool
+    }
+
+    fn explain(self) -> String {
+        format!("主池 {}B + 草稿池 {}B", self.main_kv, self.draft_pool)
+    }
+}
+
+/// **图 slab 预算项**(实测校准,2026-10-17):spec-dflash 生产档
+/// `slab 总账` = session 32 + verify 165(17 段/16 断点)+ fold 58(7)
+/// + dflash 6 = **261MiB**(ctx16k / fp8 池 / FI 双图;实测精确值略高于 261MiB,
+/// 故取整到 **262MiB** 上界 —— 日志按 MiB 取整打印,常数不得骑在边界上)。
+/// ⚠️ 随图族变(depth / 臂换代 / 桶)⇒ 捕获后由 [`crate::graph_fleet`]
+/// 把**实测 Σ** 与本品对账,超了打 ⚠️(池上限可能偏大 ⇒ 请求级 OOM 风险)。
+pub(crate) const GRAPH_SLAB_BUDGET: usize = 262 << 20;
+
+/// warmup 瞬态 + 杂项(治理器之后、图之外的固定分配)。未单列实测;
+/// = 原一锅端 `400MiB` 减图项后的余量(总分不变 ⇒ 历史治理数字可比):
+/// 400 − 262 = 138MiB。
+const WARMUP_MISC_BUDGET: usize = 138 << 20;
+
+/// **治理器之后的固定分配项**(原为一行 `n_gdn*slots*elems*4 + snap*… + 400MiB`)
+#[derive(Debug, Clone, Copy)]
+struct FixedAfter {
+    /// GDN 状态格(gdn_slots 格 × 每格元素 × f32)。
+    /// **对账口径**:真分配应等于此式(`tests.rs` 用池访问器逐项对账;
+    /// 访问器见 `StatePool::{gdn_row_bytes,snapshot_pool_bytes,draft_pool_bytes}`,
+    /// `#[cfg(test)]` 门控 —— 本预算在池分配之前就要算,故生产面不能读池)。
+    /// 0.8B 档实测 18 层 × 1.07MiB ≈ 19.3MiB/行。
+    gdn_grid: usize,
+    /// GDN 快照池(同格 × snap_max)
+    gdn_snap: usize,
+    /// 图 slab 预算(见 [`GRAPH_SLAB_BUDGET`])
+    graph_slab: usize,
+    /// warmup 瞬态 + 杂项(见 [`WARMUP_MISC_BUDGET`])
+    warmup_misc: usize,
+}
+
+impl FixedAfter {
+    fn of(n_gdn: usize, gdn_slots: usize, gdn_slot_elems: usize, snap_max: usize) -> Self {
+        let grid = n_gdn * gdn_slots * gdn_slot_elems * 4;
+        FixedAfter {
+            gdn_grid: grid,
+            gdn_snap: snap_max * n_gdn * gdn_slot_elems * 4,
+            graph_slab: GRAPH_SLAB_BUDGET,
+            warmup_misc: WARMUP_MISC_BUDGET,
+        }
+    }
+
+    fn total(self) -> usize {
+        self.gdn_grid + self.gdn_snap + self.graph_slab + self.warmup_misc
+    }
+
+    fn explain(self) -> String {
+        let mbf = |v: usize| v as f64 / 1048576.0;
+        format!(
+            "gdn格 {:.0}MiB + gdn快照 {:.0}MiB + 图slab {:.0}MiB + warmup/杂项 {:.0}MiB",
+            mbf(self.gdn_grid),
+            mbf(self.gdn_snap),
+            mbf(self.graph_slab),
+            mbf(self.warmup_misc)
+        )
+    }
+}
+
 impl StatePool {
+    /// **单逻辑块(页)的设备字节**(账/搬运长度真源,坑册 §42):Σ 全注意力层
+    /// (k+v) 每页实占字节。fp8 池以 U32 承载(1B/elem)⇒ 元素数 ÷4、元素宽 ×4
+    /// ⇒ 每页字节 = hkv×hd×page ×1;f16 ⇒ ×2。dump 页不算(**÷ nb_kv**)。
+    pub(crate) fn block_bytes(&self) -> usize {
+        let total: usize = self
+            .kvs
+            .iter()
+            .map(|kv| {
+                kv.k_cache.1 * elem_bytes(kv.k_cache.0.dtype)
+                    + kv.v_cache.1 * elem_bytes(kv.v_cache.0.dtype)
+            })
+            .sum();
+        total / self.nb_kv.max(1)
+    }
+
+    /// **主池布局**(engine 注册给 store 的 id 级描述;设计卷 §10.3 推论 A)。
+    /// 每层 k/v 各一项;`stride_bytes` = 每页字节(槽步长)。
+    pub(crate) fn pool_layout(&self, epoch: u64) -> owl_store::PoolLayout {
+        let mut pieces = Vec::with_capacity(self.kvs.len() * 2);
+        for kv in &self.kvs {
+            pieces.push(owl_store::PieceSpec {
+                buf: kv.k_cache.0.clone(),
+                stride_bytes: self.per_page_bytes(kv.k_cache.0.dtype, kv.k_cache.1),
+            });
+            pieces.push(owl_store::PieceSpec {
+                buf: kv.v_cache.0.clone(),
+                stride_bytes: self.per_page_bytes(kv.v_cache.0.dtype, kv.v_cache.1),
+            });
+        }
+        owl_store::PoolLayout { class: owl_store::BlockClass::KvPage, epoch, pieces }
+    }
+
+    /// **MTP 草稿链池布局**(独立页池;1 层 × k/v)。未开 = None。
+    pub(crate) fn mtp_pool_layout(&self, epoch: u64) -> Option<owl_store::PoolLayout> {
+        let kv = self.mtp_kvs.as_ref()?;
+        Some(owl_store::PoolLayout {
+            class: owl_store::BlockClass::KvPage,
+            epoch,
+            pieces: vec![
+                owl_store::PieceSpec {
+                    buf: kv.k_cache.0.clone(),
+                    stride_bytes: self.per_page_bytes(kv.k_cache.0.dtype, kv.k_cache.1),
+                },
+                owl_store::PieceSpec {
+                    buf: kv.v_cache.0.clone(),
+                    stride_bytes: self.per_page_bytes(kv.v_cache.0.dtype, kv.v_cache.1),
+                },
+            ],
+        })
+    }
+
+    /// MTP 池的每页字节(= 那条腿的 `block_bytes`;未开 = 0)。
+    pub(crate) fn mtp_block_bytes(&self) -> usize {
+        self.mtp_kvs
+            .as_ref()
+            .map(|kv| {
+                self.per_page_bytes(kv.k_cache.0.dtype, kv.k_cache.1)
+                    + self.per_page_bytes(kv.v_cache.0.dtype, kv.v_cache.1)
+            })
+            .unwrap_or(0)
+    }
+
+    /// 一个缓冲的每页字节(元素数 × 元素宽 ÷ 管理面页数)。
+    fn per_page_bytes(&self, dtype: Dtype, elems: usize) -> usize {
+        elems * elem_bytes(dtype) / self.nb_kv.max(1)
+    }
+
+    // ── 下面三件：**测试对账面**（`tests.rs` 用它们把"池真分配"与预算算式对账）。
+    // 生产零调用者（预算算式在池分配**之前**就要用 ⇒ 结构上不能读池），
+    // 故按 `tests` 模块同款门控 —— 既保住对账能力，也不让 release 面背死代码告警
+    // （2026-10-17 审查：先删后补，补的理由见 commit 信息）。
+    // ⚠️ **门必须是 `any(test, feature = "e2e")`**（2026-10-18 W5 修）：`tests.rs` 在
+    // `feature = "e2e"` 下也会编进 lib（无 cfg(test)）⇒ 只写 `#[cfg(test)]` 会让
+    // **e2e 目标整体编不过**（`engine.e2e.rs` 恒 build 失败 = 那条门从未跑起来）。
+    /// **GDN 行字节 / 每活跃 turn**(`owl_store::BudgetInputs::gdn_row_bytes` 真源)。
+    ///
+    /// 口径:每层四件(conv_q/conv_k/conv_v/rec)的分配宽 = `gdn_slots × 单槽宽`
+    /// (`StatePool::alloc` 里显式乘过)⇒ **行字节 = 池总字节 ÷ gdn_slots**。
+    /// 读真分配,不按公式重算(0.8B 档实测:18 层 × 1.07MiB ≈ 19.3MiB/行)。
+    // 调用约束:**池已装配之后**才可读(准入预算组装 `assemble_budget` / 预算探针);
+    // 生产热路径不调。原 `#[cfg(any(test, feature = "e2e"))]` 门对前者过严(2026-10-19 合并)。
+    pub(crate) fn gdn_row_bytes(&self) -> usize {
+        let pool: usize = self
+            .gdns
+            .iter()
+            .map(|g| {
+                (g.conv_q.1 + g.conv_k.1 + g.conv_v.1 + g.rec.1) * elem_bytes(g.rec.0.dtype)
+            })
+            .sum();
+        pool / self.gdn_slots.max(1)
+    }
+
+    /// **快照池字节**(E2c 静态预分配;固定面的一项,含 spec 快照缓冲)。
+    // 调用约束:**池已装配之后**才可读(准入预算组装 `assemble_budget` / 预算探针);
+    // 生产热路径不调。原 `#[cfg(any(test, feature = "e2e"))]` 门对前者过严(2026-10-19 合并)。
+    pub(crate) fn snapshot_pool_bytes(&self) -> usize {
+        let pool: usize = self
+            .snaps
+            .bufs
+            .iter()
+            .map(|b| b.1 * elem_bytes(b.0.dtype))
+            .sum();
+        let spec = self
+            .spec_snap
+            .as_ref()
+            .map(|s| s.bufs.iter().map(|b| b.1 * elem_bytes(b.0.dtype)).sum::<usize>())
+            .unwrap_or(0);
+        pool + spec
+    }
+
+    /// **草稿池字节**(MTP 链 / DFlash2 五层;关 = 0)。按 `pool_tokens` 全额
+    /// 预留 ⇒ 开 draft 的档等于第二个主池(`BudgetInputs::draft_pool_bytes`)。
+    // 调用约束:**池已装配之后**才可读(准入预算组装 `assemble_budget` / 预算探针);
+    // 生产热路径不调。原 `#[cfg(any(test, feature = "e2e"))]` 门对前者过严(2026-10-19 合并)。
+    pub(crate) fn draft_pool_bytes(&self) -> usize {
+        fn kv_bytes(kv: &KvBlocks) -> usize {
+            kv.k_cache.1 * elem_bytes(kv.k_cache.0.dtype)
+                + kv.v_cache.1 * elem_bytes(kv.v_cache.0.dtype)
+        }
+        let mtp = self.mtp_kvs.as_ref().map(kv_bytes).unwrap_or(0);
+        let df: usize = self.dflash_kvs.as_ref().map(|ks| ks.iter().map(kv_bytes).sum()).unwrap_or(0);
+        mtp + df
+    }
+
     /// 分配全部状态块(零初始化;GDN 段每 turn 开始按格重置)。
     /// `pool_tokens` = 块池 token 口径容量(E2b:默认 2 × 单会话容量,
     /// OWL_POOL_TOKENS 可覆写;调用方读 env,本函数只管取整到页)。
@@ -251,8 +555,23 @@ impl StatePool {
         // 布尔和稀泥废除(2026-10-10):量化 = KvQuant 枚举,投机形态 =
         // SpecMode 枚举(快照/MTP 链/草稿池三件由 mode 派生,互斥不再靠
         // 调用点自洽)
-        let kv_fp8 = plan.kv == owl_models::env::KvQuant::Fp8E4M3;
-        let dflash_fp8 = plan.draft_kv == owl_models::env::KvQuant::Fp8E4M3;
+        // 格式从枚举**单一映射**出来(2026-10-16:禁"bool 传格式");
+        // 池的**存储**恒为 U32 扁平字节账(元素数 = 字节/4,见下)。
+        // 池**元素 dtype** 与清单门同源(E1 2026-10-17:`kv_pool_dtype`:
+        // fp8 ⇒ 配置点名的格式;否则 ⇒ 模型 dtype —— 原先此处自己写
+        // `if kv_bytes_elem == 1 {…} else { dims.dtype }`,与门各说各话)
+        let kv_dt = owl_models::kernel::kv_pool_dtype(plan.kv, dims.dtype);
+        let kv_bytes_elem = kv_dt.size_bytes();
+        let kv_fp8 = kv_bytes_elem == 1;
+        let dflash_fp8 = plan.draft_kv.size_bytes() == 1;
+        // 未接臂的格式**响亮拒**(e5m2 暂无核臂;不许静默按 e4m3 跑)
+        for (tag, q) in [("kv", plan.kv), ("draft_kv", plan.draft_kv)] {
+            if q == owl_models::env::KvQuant::Fp8E5M2 {
+                return Err(owl_iface::contract::ModelError::Msg(format!(
+                    "{tag} = fp8-e5m2:本仓尚无 e5m2 核臂(只有 e4m3);请改 kv_fp8 档或等臂接入"
+                )));
+            }
+        }
         let spec = plan.spec_mode != crate::spec_runtime::SpecMode::Off;
         let mtp = plan.spec_mode == crate::spec_runtime::SpecMode::Mtp;
         let dflash = plan.spec_mode == crate::spec_runtime::SpecMode::DFlash2;
@@ -271,32 +590,47 @@ impl StatePool {
         // async 池惰性保留;实测 300MB 在连续 turn 下瞬态 OOM)
         // + 捕获瞬态 + 非追踪惰性保留。OWL_VRAM_TARGET/OWL_VRAM_RESERVE_MB
         // 可调;TOTAL 未落账(=0)或 OWL_VRAM_TARGET=0 → 治理禁用。
-        // FIXME: 大量的硬编码
-        let per_tok_bytes = kv_per_tok_bytes(n_full, &dims, kv_fp8, dflash);
-        // 治理器之后的固定分配(GDN 格/快照 f32 同式;图 slab + ctx + 杂项 flat)
+        // 口径与项来源见 [`PerTokBytes`] / [`FixedAfter`](B1,2026-10-17 具名化)。
+        // 实测对账(spec-dflash 生产档,2026-10-17):per_tok = 32768(主池 fp8)
+        // + 20480(草稿池 bf16) = **53248B**;fixed_after 里图项实测 **261MiB**、
+        // 非追踪实测 = 进程占用 20096MiB − 引擎账 19552MiB = **544MiB**(> reserve 512MB,
+        // 即 reserve 量级正确但零余量 ⇒ 见 graph_fleet 的对账行)。
+        let per_tok = PerTokBytes::of(
+            &dims,
+            n_full,
+            kv_bytes_elem,
+            dflash.then(|| plan.draft_kv.size_bytes()),
+        );
+        // 治理器之后的固定分配(GDN 格/快照 f32 同式;图 slab + warmup 分列)
         let gdn_slot_elems = dims.nk * dims.hk * 3 + dims.nv * dims.hv * 3 + dims.nv * dims.hk * dims.hv;
-        let fixed_after = n_gdn * gdn_slots * gdn_slot_elems * 4
-            + snap_max * n_gdn * gdn_slot_elems * 4
-            + (400 << 20); // 图 slab + CUDA ctx + warmup 瞬态 + 杂项
+        let fixed_after = FixedAfter::of(n_gdn, gdn_slots, gdn_slot_elems, snap_max);
+        let per_tok_bytes = per_tok.total();
         let vram_reserve = plan.vram_reserve_mb << 20;
         let vram_total = owl_shared::vram::total_bytes();
         let pool_cap = if plan.vram_target > 0.0 && plan.vram_target < 1.0 && vram_total > 0 {
             let budget = (vram_total as f64 * plan.vram_target) as i64
                 - vram_reserve as i64
-                - fixed_after as i64
+                - fixed_after.total() as i64
                 - owl_shared::vram::live_bytes() as i64;
             let cap = (budget.max(0) as u64 / per_tok_bytes.max(1) as u64) as usize;
-            owl_shared::log_info!("boot", "vram 治理:total={:.1}G free={:.2}G live={:.1}G target={:.0}% reserve={}MB fixed_after={:.2}G budget={:.2}G per_tok={}B → 池上限 {} tok(manual={})",
+            // **A1 取证**(2026-10-19):治理器是"池能多大"的唯一产地;这条打出
+            // 它的输入与产出(含主干 `FixedAfter`/`PerTokBytes` 的分解),免得再靠猜。
+            // 用 `eprintln!`(取证行惯例):`log_*` 在无 `log` feature 的构建里被编译剔除,
+            // 而本行必须在探针/测试里可见。
+            eprintln!(
+                "[vram-gov] total={:.2}G free={:.2}G target={:.0}% reserve={}M fixed_after={:.2}G[{}] live={:.2}G per_tok={}B[{}] ⇒ budget={:.2}G cap={} tok(manual={})",
                 vram_total as f64 / 1073741824.0,
                 owl_shared::vram::free_bytes() as f64 / 1073741824.0,
-                owl_shared::vram::live_bytes() as f64 / 1073741824.0,
                 plan.vram_target * 100.0,
                 vram_reserve >> 20,
-                fixed_after as f64 / 1073741824.0,
-                budget as f64 / 1073741824.0,
+                fixed_after.total() as f64 / 1073741824.0,
+                fixed_after.explain(),
+                owl_shared::vram::live_bytes() as f64 / 1073741824.0,
                 per_tok_bytes,
+                per_tok.explain(),
+                budget as f64 / 1073741824.0,
                 cap,
-                pool_tokens
+                pool_tokens,
             );
             Some(cap)
         } else {
@@ -308,14 +642,27 @@ impl StatePool {
         };
 
         let pol = kv_paged_policy(dims.dtype);
+        // 单会话容量(页数)= 旧实现的池下限;`pool_overcommit` 关时仍按它钉住
+        let seq_blocks = seq_tokens.div_ceil(pol.as_ref().map_or(1, |p| p.page).max(1));
         let (page, x, nb, paged) = match &pol {
             Some(p) => (p.page, p.x, seq_tokens.div_ceil(p.page), true),
             None => (seq_tokens, 1usize, 1usize, false),
         };
-        // E2b 块池容量:pool_tokens 向上取整到页;不低于单会话容量
-        let nb = if paged { pool_tokens.div_ceil(page) } else { nb }.max(nb);
+        // E2b 块池容量:pool_tokens 向上取整到页。
+        //
+        // **锁①(2026-10-19)**:原实现是无条件 `.max(nb)` —— 池被钉在
+        // **单会话全量上下文**上,所以选择层只省访问面、不省显存。现在按
+        // `plan.pool_overcommit` 二选一:
+        // - 关(缺省)= 旧行为(`max`),高显存档与现状逐位不变;
+        // - 开 = **允许池小于上下文** → 多出的链块必须靠选择层的下沉
+        //   (占位符)挤到宿主;容量不足时 store 会 `Exhausted` 响亮拒
+        //   (不静默落空槽)。
+        // 两侧都保证不低于"本档必须常住的那部分":开档时靠 boot 的
+        // "工作集装得下" 硬校验(见 engine 侧 `kvmem_boot_checks`)。
+        let nb = if paged { pool_tokens.div_ceil(page) } else { nb };
+        let nb = if plan.pool_overcommit { nb } else { nb.max(seq_blocks) };
         // prefill 桶 padding dump 页(M2b;设计 §4.2 律②):物理多 1 页,
-        // **管理面 nb 不变**(BlockManager/块表/页链槽容量都不受影响)。
+        // **管理面 nb 不变**(store 块腿/块表/页链槽容量都不受影响)。
         let dump_page = plan.prefill_dump_page.then_some(nb);
         let nb_kv = nb + dump_page.map(|_| 1).unwrap_or(0);
 
@@ -323,16 +670,15 @@ impl StatePool {
         for l in 0..n_full {
             // B6.2:fp8 池 = U32 字节承载 1B/elem(元素数不变,块大小减半);
             // 读核 *_fp8 变体读入即转 half,写核 K0 转换写
-            let (k_elems, k_dt) = if kv_fp8 {
-                (nb_kv * dims.hkv * dims.hd * page / 4, Dtype::U32)
+            // 存储账:fp8 ⇒ U32 扁平字节账(字节数 = 元素数 ×1B,字数 = /4);
+            // f16/bf16 ⇒ 元素账(2B/dims.dtype)。**由 KvQuant::size_bytes 单一决定**。
+            let kv_elems = nb_kv * dims.hkv * dims.hd * page;
+            let (k_elems, k_dt) = if kv_bytes_elem == 1 {
+                (kv_elems / 4, Dtype::U32)
             } else {
-                (nb_kv * dims.hkv * dims.hd * page, dims.dtype)
+                (kv_elems, kv_dt)
             };
-            let (v_elems, v_dt) = if kv_fp8 {
-                (nb_kv * dims.hkv * dims.hd * page / 4, Dtype::U32)
-            } else {
-                (nb_kv * dims.hkv * dims.hd * page, dims.dtype)
-            };
+            let (v_elems, v_dt) = (k_elems, k_dt);
             let k_cache = zero_block_dt(face, k_elems, k_dt, &format!("kv.k.{l}")).await?;
             let v_cache = zero_block_dt(face, v_elems, v_dt, &format!("kv.v.{l}")).await?;
             kvs.push(KvBlocks { k_cache, v_cache });
@@ -353,12 +699,16 @@ impl StatePool {
         // dtype = BF16(E5-DF3 同日十四;草稿路径 BF16 全程,独立于目标池
         // dims.dtype —— 同 2B/elem,几何 page/x 不变)
         let dflash_kvs = if dflash && paged {
-            let (dkv, dhd, dlayers) = (8usize, 128usize, 5usize);
+            // 几何单源 = [`DRAFT_POOL`](原此处另写 `(8,128,5)`,与预算项两处各一遍)
+            let dlayers = DRAFT_POOL.layers;
             // B6 偷显存:草稿池 e4m3(OWL_DFLASH_KV_FP8;1B/elem,U32 字节承载)
-            let (df_elems, df_dt) = if dflash_fp8 {
-                (nb * dkv * dhd * page / 4, Dtype::U32)
+            // 分配项与预算项共用 `KvQuant::size_bytes` + 几何单源 ⇒ 两处不会再漂
+            let df_bytes_elem = plan.draft_kv.size_bytes();
+            let df_elems = DRAFT_POOL.layer_elems(nb, page);
+            let (df_elems, df_dt) = if df_bytes_elem == 1 {
+                (df_elems / 4, Dtype::U32)
             } else {
-                (nb * dkv * dhd * page, Dtype::BF16)
+                (df_elems, Dtype::BF16)
             };
             let mut ks = Vec::with_capacity(dlayers);
             for l in 0..dlayers {
@@ -378,6 +728,13 @@ impl StatePool {
             eval_ops(TensorOps::zeros(Dtype::F32, vec![1, nb]).step(), face).await?
         } else {
             eval_ops(TensorOps::zeros(Dtype::F32, vec![1]).step(), face).await?
+        };
+        // **B-2 选择层视图块表槽**:与 bt 同族(持久块 ⇒ 将来图输入槽/烘焙
+        // 指针稳定);内容由召回点每步重写(§8.11)
+        let bt_view = if paged && plan.select_view {
+            Some(eval_ops(TensorOps::zeros(Dtype::F32, vec![1, nb]).step(), face).await?)
+        } else {
+            None
         };
         // GDN 序列表持久槽(P-6b):有 GDN 层就建(尺寸 ~KB 级)
         let gdn_tables = if n_gdn > 0 {
@@ -448,6 +805,18 @@ impl StatePool {
         // 输入槽(verify 图 vs decode 图各自的 `xqa_seq`/`xqa_sem`)。
         // 掩码:q=1 时只读 index 0,而 index 0 = `(1<<1)-1 = 1` —— 恰好是
         // decode 需要的"bit0 允许自身",**两形状共用同一张量**。
+        // XQA 的 SM 数:**取设备真值**(2026-10-17 审查:原硬编码 84 = sm86 双卡,
+        // 3080 档 = 68 ⇒ 启发式偏大)。查询不可用 = 回退常量 + 响亮告警(不静默)。
+        let xqa_sm_count = match face.sm_count().await {
+            Ok(v) => v,
+            Err(e) => {
+                owl_shared::log_warn!(
+                    "boot",
+                    "设备 SM 数查询不可用({e})⇒ XQA 取回退常量 {XQA_SM_COUNT_FALLBACK}(切分粒度可能偏大)"
+                );
+                XQA_SM_COUNT_FALLBACK
+            }
+        };
         let xqa = if paged
             && (plan.xqa_verify || plan.xqa_decode || plan.xqa_prefill)
             && matches!(plan.kv, owl_models::env::KvQuant::Fp8E4M3)
@@ -497,7 +866,7 @@ impl StatePool {
                 scratch: block_leaf_dt(&scr.0, vec![(scr_mb << 20) / 2], Dtype::F16),
                 q_seq_len: seqs,
                 max_seq_len: nb_i * page,
-                sm_count: XQA_SM_COUNT,
+                sm_count: xqa_sm_count,
             })
         } else {
             None
@@ -510,26 +879,35 @@ impl StatePool {
             let rec = zero_block(face, gdn_slots * dims.nv * dims.hk * dims.hv, "gdn.recurrence").await?;
             gdns.push(GdnBlocks { conv_q, conv_k, conv_v, rec });
         }
-        // GDN 快照池(E2c):行宽副本 × SNAP_MAX 份;仅 paged 形态
-        let mut snaps: Vec<GdnSnapSlot> = Vec::new();
+        // GDN 快照池(E2c;S2 矩阵化):每 (层,quad) 一条 `snap_max × 行宽`
+        // 缓冲 ⇒ 一条快照 = 一个槽(片 = 行宽)。仅 paged 形态。
+        let mut snaps = GdnSnapPool {
+            bufs: Vec::new(),
+            keys: vec![None; snap_max],
+            last_use: vec![0; snap_max],
+            row_bytes: Vec::new(),
+        };
         if paged {
-            for _ in 0..snap_max {
-                let mut bufs: Vec<BlockN> = Vec::new();
-                for _ in 0..n_gdn {
-                    bufs.push(zero_block(face, dims.nk * dims.hk * 3, "gdn.slot.conv_q").await?);
-                    bufs.push(zero_block(face, dims.nv * dims.hv * 3, "gdn.slot.conv_k").await?);
-                    bufs.push(zero_block(face, dims.nv * dims.hv * 3, "gdn.slot.conv_v").await?);
-                    bufs.push(zero_block(face, dims.nv * dims.hk * dims.hv, "gdn.slot.rec").await?);
+            for _ in 0..n_gdn {
+                for (elems, name) in [
+                    (dims.nk * dims.hk * 3, "gdn.slot.conv_q"),
+                    (dims.nv * dims.hv * 3, "gdn.slot.conv_k"),
+                    (dims.nv * dims.hv * 3, "gdn.slot.conv_v"),
+                    (dims.nv * dims.hk * dims.hv, "gdn.slot.rec"),
+                ] {
+                    let b = zero_block(face, elems * snap_max, name).await?;
+                    snaps.row_bytes.push(elems * elem_bytes(b.0.dtype));
+                    snaps.bufs.push(b);
                 }
-                snaps.push(GdnSnapSlot { key: None, last_use: 0, bufs });
             }
         }
         // 池 dtype 标签随实报(原硬写 "kv f16" 在 fp8 档说谎 —— 2026-10-13)
         let kv_label = match plan.kv {
             owl_models::env::KvQuant::Fp8E4M3 => "kv fp8 e4m3",
+            owl_models::env::KvQuant::Fp8E5M2 => "kv fp8 e5m2",
             owl_models::env::KvQuant::None => "kv f16",
         };
-        owl_shared::log_info!("boot", "状态块分配 {:.2}s({kv_label} ×{} / gdn ×{},会话容量 {},池 {nb} 页 × {page} tok,页表 nb = {nb},dflash = {df})",
+        owl_shared::log_info!("boot", "状态块分配 {:.2}s({kv_label} ×{} / gdn ×{},会话容量 {},池 {nb} 页 × {page} tok,页表 nb = {nb},dflash = {df},XQA sm = {xqa_sm_count})",
             t.elapsed().as_secs_f32(),
             kvs.len(),
             gdns.len(),
@@ -547,12 +925,12 @@ impl StatePool {
                 bufs.push(zero_block(face, dims.nv * dims.hv * 3, "gdn.ring.conv_v").await?);
                 bufs.push(zero_block(face, dims.nv * dims.hk * dims.hv, "gdn.ring.rec").await?);
             }
-            Some(GdnSnapSlot { key: None, last_use: 0, bufs })
+            Some(SpecSnapBuf { bufs })
         } else {
             None
         };
         Ok(StatePool { gdn_slots, dump_all, gdn_dbg, kvs, fi_face, fi_tables, gdn_tables, verify_attn_v2, xqa,
-            kv_fp8, dflash_fp8, gdns, snaps, snap_tick: 0, bt, bt_mtp, spec_snap, mtp_kvs, dflash_kvs, attn_v2, page, nb, nb_kv, dump_page, paged, x, dims })
+            kv_fp8, dflash_fp8, gdns, snaps, snap_tick: 0, bt, bt_view, bt_mtp, spec_snap, mtp_kvs, dflash_kvs, attn_v2, page, nb, nb_kv, dump_page, paged, x, dims })
     }
 
     /// MTP 链块表叶子(propose 图烘焙;None = 未启用)
@@ -568,12 +946,13 @@ impl StatePool {
         face: &mut D,
         table: &[u32],
     ) -> Result<()> {
-        let b = self.bt_mtp.as_ref().expect("bt_mtp 未分配(mtp 模式)");
+        let b = self.bt_mtp.as_ref().ok_or_else(|| ModelError::EngineInvariant { what: "bt_mtp 未分配(mtp 档位不一致)".into() })?;
         let mut v = vec![0f32; self.nb];
         for (i, x) in table.iter().enumerate() {
             v[i] = *x as f32;
         }
-        face.write_block_f32(b, 0, &v).await
+        face.write_block_f32_on(owl_iface::contract::UpStream::Compute, b, 0, &v)
+            .await
     }
 
     /// spec 快照缓冲句柄组(E5-M5 fold 图烘焙:状态 args = 快照 buf
@@ -894,11 +1273,92 @@ impl StatePool {
     /// 快照池容量(`snap_max`;0 = 快照面整体关闭 —— 调用方须跳过 capture,
     /// 否则 `capture_snap` 会因池空而报错,见 agent 专项 A2)
     pub(crate) fn snap_capacity(&self) -> usize {
-        self.snaps.len()
+        self.snaps.keys.len()
     }
 
-    pub(crate) fn has_snap(&self, key: u32) -> bool {
-        self.snaps.iter().any(|s| s.key == Some(key))
+    /// 快照池已用槽数(诊断/报告面:设备上在场多少张边界快照)。
+    pub(crate) fn snap_used(&self) -> usize {
+        self.snaps.keys.iter().filter(|k| k.is_some()).count()
+    }
+
+
+    /// 快照在设备槽上的位置(`None` = 不在设备层)。
+    pub(crate) fn snap_slot_of(&self, key: SnapKey) -> Option<u32> {
+        self.snaps
+            .keys
+            .iter()
+            .position(|k| *k == Some(key))
+            .map(|i| i as u32)
+    }
+
+    /// **槽位选择**(纯;S2 §25.2):同 key 已在设备 ⇒ 原地;否则空槽;
+    /// 否则**最冷的设备快照**(调用方决定下沉还是丢)。池关闭 ⇒ `None`。
+    pub(crate) fn snap_pick_slot(&self, key: SnapKey) -> Option<SnapSlotPick> {
+        if self.snaps.keys.is_empty() {
+            return None;
+        }
+        if let Some(i) = self.snaps.keys.iter().position(|k| *k == Some(key)) {
+            return Some(SnapSlotPick::Hit(i as u32));
+        }
+        if let Some(i) = self.snaps.keys.iter().position(|k| k.is_none()) {
+            return Some(SnapSlotPick::Free(i as u32));
+        }
+        let (i, _) = self
+            .snaps
+            .last_use
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, t)| **t)?;
+        Some(SnapSlotPick::Victim(i as u32, self.snaps.keys[i]?))
+    }
+
+    /// 片规格(逐 (层,quad);槽内偏移由 store 的 `plan_snap_*` 按
+    /// `dev_off = 槽 × 行宽` 算 —— 布局本身与槽无关)。
+    pub(crate) fn snap_pieces_at(&self, _slot: u32) -> Vec<owl_store::PieceSpec> {
+        self.snaps
+            .bufs
+            .iter()
+            .zip(&self.snaps.row_bytes)
+            .map(|(b, rb)| owl_store::PieceSpec {
+                buf: b.0.clone(),
+                stride_bytes: *rb,
+            })
+            .collect()
+    }
+
+    /// **状态腿设备布局**(boot 注册给 store;§25.2):快照 = 一种"块"
+    /// (槽 × 片),片 = 每 (层,quad) 一行宽。
+    pub(crate) fn snap_pool_layout(&self, epoch: u64) -> owl_store::PoolLayout {
+        owl_store::PoolLayout {
+            class: owl_store::BlockClass::GdnRow,
+            epoch,
+            pieces: self.snap_pieces_at(0),
+        }
+    }
+
+    /// 一条快照的字节(Σ 行宽;布局真源)。
+    pub(crate) fn snap_bytes(&self) -> usize {
+        self.snaps.row_bytes.iter().sum()
+    }
+
+    /// 标记槽上放的是哪张快照(拍摄/回灌落位后)。
+    pub(crate) fn snap_place(&mut self, slot: u32, key: SnapKey) {
+        self.snap_tick += 1;
+        let tick = self.snap_tick;
+        let i = slot as usize;
+        if i < self.snaps.keys.len() {
+            self.snaps.keys[i] = Some(key);
+            self.snaps.last_use[i] = tick;
+        }
+    }
+
+    /// 清槽(快照下沉到宿主后:设备缓冲空出来了)。
+    pub(crate) fn snap_clear_slot(&mut self, slot: u32) {
+        let i = slot as usize;
+        if i < self.snaps.keys.len() {
+            self.snaps.keys[i] = None;
+            self.snaps.last_use[i] = 0;
+        }
     }
 
     /// GDN 状态重置(turn-open;新序列零态语义)。按格重置(offset =
@@ -999,39 +1459,33 @@ impl StatePool {
         Ok(nonzero)
     }
 
+    /// `slot` = 已选好的设备槽(`None` = 池关 ⇒ 结构性拒);槽由 engine 选
+    /// (`snap_pick_slot`:原地 / 空槽 / 最冷下沉)。
     pub(crate) async fn capture_snap<D: DeviceClient>(
         &mut self,
         face: &mut D,
         gdn_slot: usize,
-        key: u32,
+        key: SnapKey,
+        slot: Option<u32>,
     ) -> Result<()> {
         // 池空(snap_max = 0)不再是 panic(原 `expect("池非空")` 会炸掉整个
         // owl-engine 线程 → 客户端收 503):退化为**结构化错误** —— 调用方
-        // (`RankDev::snap_dev`;phases.rs 的块边界/跨页拍摄,而 `snap_key_of`
-        // 已按 snap_capacity() 先行跳过)故此处只作兜底(agent 专项 A2,2026-10-14)。
-        let idx = match self.snaps.iter().position(|s| s.key == Some(key)) {
-            Some(i) => i,
-            None => {
-                let free = self.snaps.iter().position(|s| s.key.is_none());
-                let lru = self
-                    .snaps
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, s)| s.last_use)
-                    .map(|(i, _)| i);
-                match free.or(lru) {
-                    Some(i) => i,
-                    None => {
-                        return Err(ModelError::Msg(
-                            "GDN 快照池为空(snap_max = 0):调用方应跳过 capture \u{2014}\u{2014} \
-                             见 roadmap.local/agent-服务面-剩余工作项 A2"
-                                .into(),
-                        ))
-                    }
-                }
-            }
+        // (`capture_gdn_snap`)已按 snap_capacity() 先行跳过,故此处只作兜底
+        // (agent 专项 A2,2026-10-14)。
+        // 槽位由调用方选好(engine:空槽 / 最冷下沉 / 原地覆盖)—— 见
+        // `snap_pick_slot`;此处只认已定的槽(池关 = 结构性拒)。
+        let Some(slot) = slot else {
+            return Err(ModelError::Msg(
+                "GDN 快照池为空(snap_max = 0):调用方应跳过 capture \u{2014}\u{2014} \
+                 见 roadmap.local/agent-服务面-剩余工作项 A2"
+                    .into(),
+            ));
         };
-        self.snap_tick += 1;
+        let idx = slot as usize;
+        // **P1(§20-A2)**:一条 `copy_batch` 搬完(逐片 await = 0.8B 72 次 /
+        // 27B 192 次 actor 往返 ⇒ 一次命令;与 `capture_spec_snap` 同构)。
+        let mut copies: Vec<(owl_iface::contract::Bytes, usize, owl_iface::contract::Bytes, usize, usize)> =
+            Vec::with_capacity(self.gdns.len() * 4);
         for (li, g) in self.gdns.iter().enumerate() {
             let quads = [
                 (&g.conv_q.0, g.conv_q.1),
@@ -1041,30 +1495,36 @@ impl StatePool {
             ];
             for (j, (src, elems)) in quads.iter().enumerate() {
                 let row = elems / self.gdn_slots;
-                let dst = &self.snaps[idx].bufs[li * 4 + j];
-                face.copy_block_at(src, gdn_slot * row * 4, &dst.0, 0, row * 4).await?;
+                let dst = &self.snaps.bufs[li * 4 + j];
+                copies.push(((*src).clone(), gdn_slot * row * 4, dst.0.clone(), idx * row * 4, row * 4));
             }
         }
-        let slot = &mut self.snaps[idx];
-        slot.key = Some(key);
-        slot.last_use = self.snap_tick;
+        face.copy_batch(copies.as_slice()).await?;
+        self.snap_place(slot, key);
         Ok(())
     }
 
     /// GDN 快照恢复(E2c;前缀命中时调用):槽位缓冲 → 会话格(D2D
     /// 反向)。同流保序,后续 prefill 天然在恢复态之后。
+    /// `key` = 边界块内容身份(与拍摄侧同类型 ⇒ 槽号进不来)。
+    /// `slot` = 快照**已在设备**的槽(engine 先按 store 的层账把宿主层快照
+    /// 回灌到设备再调这里 —— §25.2)。
     pub(crate) async fn restore_snap<D: DeviceClient>(
         &mut self,
         face: &mut D,
         gdn_slot: usize,
-        key: u32,
+        key: SnapKey,
+        slot: u32,
     ) -> Result<()> {
-        let idx = self
-            .snaps
-            .iter()
-            .position(|s| s.key == Some(key))
-            .ok_or_else(|| ModelError::Msg(format!("快照 {key} 已被逐出")))?;
-        self.snap_tick += 1;
+        let idx = slot as usize;
+        if self.snaps.keys.get(idx).copied().flatten() != Some(key) {
+            return Err(ModelError::Msg(format!(
+                "快照 {key:?} 不在设备槽 {slot}(先回灌)"
+            )));
+        }
+        // **P1**:一条 `copy_batch` 搬回(与拍摄侧同构)
+        let mut copies: Vec<(owl_iface::contract::Bytes, usize, owl_iface::contract::Bytes, usize, usize)> =
+            Vec::with_capacity(self.gdns.len() * 4);
         for (li, g) in self.gdns.iter().enumerate() {
             let quads = [
                 (&g.conv_q.0, g.conv_q.1),
@@ -1074,9 +1534,15 @@ impl StatePool {
             ];
             for (j, (dst, elems)) in quads.iter().enumerate() {
                 let row = elems / self.gdn_slots;
-                let src = &self.snaps[idx].bufs[li * 4 + j];
-                face.copy_block_at(&src.0, 0, dst, gdn_slot * row * 4, row * 4).await?;
+                let src = &self.snaps.bufs[li * 4 + j];
+                copies.push((src.0.clone(), idx * row * 4, (*dst).clone(), gdn_slot * row * 4, row * 4));
             }
+        }
+        face.copy_batch(copies.as_slice()).await?;
+        self.snap_tick += 1;
+        let tick = self.snap_tick;
+        if idx < self.snaps.last_use.len() {
+            self.snaps.last_use[idx] = tick;
         }
         Ok(())
     }
@@ -1151,18 +1617,71 @@ impl StatePool {
         face: &mut D,
         table: &[u32],
     ) -> Result<()> {
+        // **占位符守卫**(B-3e-2):表里含宿主占位符(u32::MAX)⇒ 写进设备 bt 块
+        // 就是把 u32::MAX 当页号喂核 = ILLEGAL_ADDRESS(27B Stage2 实测同类)。
+        // 部分驻留下来的洞**只能**由视图页表表达 ⇒ 这里响亮拒(调用方应先在
+        // 段边界回灌,或改用视图路径)。
+        if let Some(i) = table.iter().position(|b| owl_store::is_host_placeholder(*b)) {
+            return Err(ModelError::Msg(format!(
+                "write_bt:块表第 {i} 项是宿主占位符(部分驻留的链洞)—— 不得写设备块表;                 请先回灌(段边界)或走视图页表"
+            )));
+        }
         let mut v = vec![0f32; self.nb];
         for (i, b) in table.iter().enumerate() {
             v[i] = *b as f32;
         }
-        face.write_block_f32(&self.bt, 0, &v).await
+        face.write_block_f32_on(owl_iface::contract::UpStream::Compute, &self.bt, 0, &v)
+            .await
+    }
+
+    // ── B-2 选择层视图面(§8.11)──────────────────────────────────────
+
+    /// 视图页表容量(块数;= 池管理面页数 `nb`)。
+    pub(crate) fn select_view_capacity(&self) -> usize {
+        self.nb
+    }
+
+    /// 写视图页表(**选中块按时间序**的物理页;零填充到 `nb`)。
+    ///
+    /// 超容量 = **响亮拒**(调用方必须先按预算裁到 `nb` 以内 —— 静默截断 =
+    /// 静默漏块,选择层的账就假了)。
+    pub(crate) async fn write_select_view<D: DeviceClient>(
+        &self,
+        face: &mut D,
+        pages: &[u32],
+    ) -> Result<()> {
+        let b = self.bt_view.as_ref().ok_or_else(|| {
+            ModelError::Msg("选择层视图块表未分配(OWL_COVERAGE_PROBE 未开?)".into())
+        })?;
+        if pages.len() > self.nb {
+            return Err(ModelError::Msg(format!(
+                "视图页表超容量:{} 页 > 槽容量 {}(预算须先裁)",
+                pages.len(),
+                self.nb
+            )));
+        }
+        let mut v = vec![0f32; self.nb];
+        for (i, p) in pages.iter().enumerate() {
+            v[i] = *p as f32;
+        }
+        face.write_block_f32(b, 0, &v).await
+    }
+
+    /// 视图页表叶子(`[1, nb]` f32;喂 `KvBuffers::block_tables`)。
+    pub(crate) fn select_view_leaf(&self) -> Option<TensorOps> {
+        self.bt_view
+            .as_ref()
+            .map(|b| TensorOps::of_block(b.id, Dtype::F32, vec![1, self.nb]))
     }
 }
 
-/// XQA 的 `multiProcessorCount`(KV-split 启发式;**只影响切分粒度,不影响
-/// 正确性**)。⚠️ FIXME:硬编码 sm86 双卡(SM=84);3080 为 68 —— 挂账:后端
-/// 暴露 multi_processor_count 后改查询(DeviceClient 现无此面)。
-const XQA_SM_COUNT: usize = 84;
+/// XQA 的 `multiProcessorCount`(**回退常量**;2026-10-17 审查收口)。
+///
+/// KV-split 启发式参数,**只影响切分粒度、不影响正确性**。现役取值路径 =
+/// 设备真值(`DeviceClient::sm_count` → `cuDeviceGetAttribute(MULTIPROCESSOR_COUNT)`);
+/// 本常量只在**查询不可用**时兜底(且回退时**响亮告警** —— 不静默:84 = sm86 双卡,
+/// 在 3080(68)上会让启发式系统性偏大)。
+const XQA_SM_COUNT_FALLBACK: usize = 84;
 
 /// 按 dtype 清零分配(KV/GDN 状态块)。**设备侧 alloc + memset**,不走
 /// host 零向量 —— 曾用 `vec![0f32; n]` + to_le_bytes 逐元素造 64MB(rec
@@ -1239,5 +1758,74 @@ mod tp_shard_tests {
         let dd_shard = kv_per_tok_bytes(n_full, &dims27b(Some((0, 2))), false, true)
             - kv_per_tok_bytes(n_full, &dims27b(Some((0, 2))), false, false);
         assert_eq!(dd_shard, 5 * 2 * 8 * 128 * 2, "草稿池不随分片变");
+    }
+}
+
+#[cfg(test)]
+mod vram_budget_tests {
+    use super::*;
+
+    /// 27B 生产档几何(qwen3_8_27b:64 层 = 16 full + 48 GDN;
+    /// `full_heads=(24,4,256)` ⇒ hkv·hd = 4·256 = 1024/层档;GDN `(16,128,48,128)`)
+    fn dims_27b() -> ModelDims {
+        ModelDims {
+            hq: 24,
+            hkv: 4,
+            hd: 256,
+            nk: 16,
+            hk: 128,
+            nv: 48,
+            hv: 128,
+            hidden: 5120,
+            dtype: Dtype::F16,
+        }
+    }
+
+    fn gdn_slot_elems(d: &ModelDims) -> usize {
+        d.nk * d.hk * 3 + d.nv * d.hv * 3 + d.nv * d.hk * d.hv
+    }
+
+    /// 逐 token 项:**复现生产口径**(spec-dflash boot `per_tok=53248B`)且
+    /// 草稿池项随池量化声明走(原先写死 2B ⇒ 池改 fp8 预算不跟)。
+    #[test]
+    fn per_tok_matches_production_and_follows_declaration() {
+        let d = dims_27b();
+        // fp8 主池(1B/elem)+ 草稿池 bf16(2B/elem)
+        let bf16_draft = PerTokBytes::of(&d, 16, 1, Some(2));
+        assert_eq!((bf16_draft.main_kv, bf16_draft.draft_pool), (32768, 20480));
+        assert_eq!(bf16_draft.total(), 53248, "生产档 per_tok(boot 日志实测)");
+        // 草稿池 elem 由 `KvQuant::size_bytes` 驱动
+        let fp8_draft = PerTokBytes::of(&d, 16, 1, Some(1));
+        assert_eq!(fp8_draft.draft_pool, 10240, "草稿池 fp8 ⇒ 逐 token 减半");
+        // 非投机档 = 纯主池(池 f16 2B/elem)
+        assert_eq!(PerTokBytes::of(&d, 16, 2, None).total(), 65536);
+    }
+
+    /// 固定项:GDN 格/快照按几何算,图 slab + warmup 两常数之和**必须仍是
+    /// 历史校准的 400MiB**(B1 拆分不改总分 ⇒ 历史治理数字可比),且 27B 档
+    /// 合计复现 boot 日志 `fixed_after=0.68G`(= 697MiB)。
+    #[test]
+    fn fixed_after_matches_production_and_keeps_historical_total() {
+        assert_eq!(
+            GRAPH_SLAB_BUDGET + WARMUP_MISC_BUDGET,
+            400 << 20,
+            "拆分不得改总分(否则历史治理数字不可比)"
+        );
+        let f = FixedAfter::of(48, 1, gdn_slot_elems(&dims_27b()), 1);
+        assert_eq!(f.gdn_grid, 155_713_536);
+        assert_eq!(f.gdn_snap, 155_713_536);
+        assert_eq!(f.graph_slab, 262 << 20, "图项 = spec-dflash 实测 slab Σ 的 MiB 上界");
+        assert_eq!(f.warmup_misc, 138 << 20);
+        assert_eq!(f.total(), 730_857_472, "boot 实测 fixed_after = 697MiB(0.68G)");
+    }
+
+    /// 草稿池几何单源:逐 token 项与分配项同一来源(原两处各写一遍)
+    #[test]
+    fn draft_pool_geometry_is_single_sourced() {
+        assert_eq!(DRAFT_POOL.per_tok_bytes(1), 10240);
+        assert_eq!(DRAFT_POOL.per_tok_bytes(2), 20480);
+        // 分配项口径:一页同时装 K/V 的同形切片(16k 档 nb=528 / page=32 实测几何)
+        assert_eq!(DRAFT_POOL.layer_elems(528, 32), 528 * 8 * 128 * 32);
+        assert_eq!(DRAFT_POOL.layer_elems(528, 32), 17_301_504);
     }
 }

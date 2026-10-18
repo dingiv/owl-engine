@@ -140,11 +140,11 @@ impl DeviceRes for TestRes {
 
 #[test]
 fn cublas_runtime_matches_host_matmul() {
-    if std::env::var_os("OWL_TEST_DEVICE").is_none() {
+    if owl_cuda::test_device_bdf().is_none() {
         eprintln!("skip");
         return;
     }
-    let dev: usize = std::env::var("OWL_TEST_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let dev: usize = owl_cuda::test_device_ordinal();
     let mut res = TestRes::new(dev);
     let mut exec = Exec::new();
     let mut rt = <CublasRuntime as KernelFamily>::assemble(&mut res, &mut exec).expect("assemble");

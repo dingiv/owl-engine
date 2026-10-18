@@ -108,7 +108,7 @@ fn host_ref(x: &[f32], rows: usize, cols: usize, mul: f32) -> (Vec<i8>, Vec<f32>
 }
 
 fn with_runner<R>(f: impl FnOnce(&mut dyn CheckRunner) -> R) -> Option<R> {
-    let dev = owl_shared::env_reader::parse::<usize>("OWL_TEST_DEVICE")?;
+    let dev = owl_cuda::test_device_ordinal_opt()?;
     let mut res = TestRes::new(dev);
     let mut exec = Exec::new();
     // 自检面:纯 native 发射(`launch_aot`),注册表只服务家族臂 ⇒ None

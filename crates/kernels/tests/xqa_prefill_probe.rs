@@ -23,6 +23,7 @@
 //!       -- --test-threads=1 --nocapture`;debug 下只用 `*_PF_ONLY=<ctx>` 跳 host 检查。
 #![cfg(feature = "xqa")]
 
+use owl_macros::owl_test;
 use std::time::Instant;
 
 use cudarc::driver::{CudaContext, DevicePtr, LaunchConfig, PushKernelArg};
@@ -243,7 +244,7 @@ fn causal_mask_words(t: usize) -> Vec<u32> {
 /// 一次 (T, ctx) 全量测量:XQA 单发 vs chunked prefill 核同池同形状。
 fn run_case(t: usize, ctx: usize, host_check: bool, chunked: bool) {
     let nb = ctx.div_ceil(PAGE);
-    let ctx_c = CudaContext::new(owl_shared::env_reader::parse_or("OWL_TEST_DEVICE", 0)).expect("ctx");
+    let ctx_c = CudaContext::new(owl_cuda::test_device_ordinal()).expect("ctx");
     ctx_c.bind_to_thread().expect("bind");
     let stream = ctx_c.default_stream();
 
@@ -549,12 +550,8 @@ fn run_case(t: usize, ctx: usize, host_check: bool, chunked: bool) {
     assert!(!failed, "T={t} ctx={ctx} 数值门未过(详见上文)");
 }
 
-#[test]
+#[owl_test(gpu)]
 fn xqa_prefill_speed_and_parity() {
-    if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
-        return;
-    }
     let only = owl_shared::env_reader::str("XQA_PF_ONLY").unwrap_or_default();
     let host_all = owl_shared::env_reader::flag("XQA_PF_HOST");
     let only_t = owl_shared::env_reader::parse_or("XQA_PF_T", 0usize);
@@ -586,18 +583,14 @@ fn xqa_prefill_speed_and_parity() {
 // 小形状诊断:定位"1/3 非零"的真凶(掩码字 / 行映射 / 头组映射)
 // 运行:XQA_PF_DIAG=1 ... --test xqa_prefill_diag --nocapture
 // ============================================================================
-#[test]
+#[owl_test(gpu)]
 fn xqa_prefill_diag() {
-    if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
-        return;
-    }
     let (t, ctx) = (
         owl_shared::env_reader::parse_or("XQA_PF_DIAG_T", 64usize),
         owl_shared::env_reader::parse_or("XQA_PF_DIAG_CTX", 64usize),
     );
     let nb = ctx.div_ceil(PAGE);
-    let ctx_c = CudaContext::new(owl_shared::env_reader::parse_or("OWL_TEST_DEVICE", 0)).expect("ctx");
+    let ctx_c = CudaContext::new(owl_cuda::test_device_ordinal()).expect("ctx");
     ctx_c.bind_to_thread().expect("bind");
     let stream = ctx_c.default_stream();
     let pool_elems = nb * HKV * HD * PAGE;

@@ -109,6 +109,14 @@ fn zero_scratch_on() -> bool {
     *Z.get_or_init(|| std::env::var_os("OWL_GDN_ZERO_SCRATCH").is_some_and(|v| v != "0"))
 }
 
+/// 诊断:`OWL_GDN_TOUCH=<区名>`(见调用点注)。**OnceLock 预判门**(2026-10-17 审查):
+/// 原写法每次 handler 调用都现场 `std::env::var`(未开档也读);与同文件
+/// `zero_scratch_on` 同款 —— 先判门,名单串只在门内读。
+fn touch_on() -> bool {
+    static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::env::var_os("OWL_GDN_TOUCH").is_some())
+}
+
 fn f32s(b: &[u8]) -> Vec<f32> {
     b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
 }
@@ -328,7 +336,9 @@ impl KernelFamily for GdnChunkedRuntime {
         // ── 诊断:`OWL_GDN_TOUCH=<区名>` = **内容不变**的 dtoh+htod 往返搬运
         // (只为把 host 挡住 ⇒ 分离「stale 内容」与「host-ahead 时序」两假设:
         //  搬运后仍病 = 内容;搬运后变健康 = 时序窗口)──
-        if let Ok(spec) = std::env::var("OWL_GDN_TOUCH") {
+        if touch_on() {
+            // 名单在门内读(诊断档才付费;与 zero_scratch_on 同款:先判门再读串)
+            let spec = std::env::var("OWL_GDN_TOUCH").unwrap_or_default();
             let all = spec == "1" || spec == "all";
             let want = |n: &str| all || spec.split(',').any(|x| x.trim() == n);
             let bufs: [(u64, usize); 15] = [

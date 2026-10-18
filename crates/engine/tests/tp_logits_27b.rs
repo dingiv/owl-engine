@@ -130,7 +130,7 @@ async fn body(oa: usize, ob: usize, oc: usize, dir: PathBuf) {
     // ── ① TP1 参考 ──
     let l1 = {
         let mut e = Engine::new(cfg_of(oa, chunk)).expect("engine(TP1)");
-        let loaded = e.loader().load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16, false)
+        let loaded = e.loader().load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16, owl_models::module::QuantPlan::W4A16Awq)
             .await
             .expect("TP1 装载");
         let mut r = e.run(loaded).await.expect("TP1 装配");
@@ -146,11 +146,11 @@ async fn body(oa: usize, ob: usize, oc: usize, dir: PathBuf) {
     // ── ② TP2 ──
     let mut e0 = Engine::new(cfg_of(ob, chunk)).expect("engine(r0)");
     let m0 = e0.loader().slice(0, 2)
-        .load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16, false)
+        .load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16, owl_models::module::QuantPlan::W4A16Awq)
         .await.expect("rank0 分片装载");
     let mut e1 = Engine::new(cfg_of(oc, chunk)).expect("engine(r1)");
     let m1 = e1.loader().slice(1, 2)
-        .load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16, false)
+        .load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16, owl_models::module::QuantPlan::W4A16Awq)
         .await.expect("rank1 分片装载");
     let tp = TpEngine::assemble(vec![e0, e1], vec![m0, m1]).await.expect("TP2 装配");
     let mut r = tp.run().expect("TP2 进执行态");

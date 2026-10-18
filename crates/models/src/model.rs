@@ -201,6 +201,7 @@ impl Model {
             kv_lens: ctx.kv_lens,
             gdn_slot: ctx.gdn_slot,
             ctx_base: ctx.ctx_base,
+            fi_plan_ctx: ctx.fi_plan_ctx,
             fi: ctx.fi,
             fi_kvi: kvi,
             seq_cu: ctx.seq_cu,
@@ -215,8 +216,7 @@ impl Model {
             xqa: ctx.xqa.clone(),
             vlm_image: ctx.vlm_image,
             vlm_rope: ctx.vlm_rope,
-            attn_break: ctx.attn_break.clone(),
-            attn_fi: ctx.attn_fi.clone(),
+            q_sink: ctx.q_sink,
         }
     }
 

@@ -1,0 +1,349 @@
+//! **store 无卡端到端演示(§19/§21)**:需求驱动下沉 → 链级整条搬 → 命中批量回灌 →
+//! 内容逐字节恒等 —— 全部用 **store 自己的公开 API** 驱动 + `CpuFace` 做真搬运,
+//! **不依赖 engine / GPU**(秒级,可进默认套件)。
+//!
+//! **编排归属(§21 裁决)**:store **不做 I/O**(连 `face` 都不认)—— 它只出
+//! **计划**(`plan_offload`/`plan_onload`:算片 + 借宿主台)与**记账**
+//! (`commit_*` / `abort_*`)。搬运由 **engine 编排**:取计划 → `face.swap` → 回执 → 记账。
+//! 本文件里的 `engine_offload`/`engine_onload` 就是那段编排的**样板**(生产里在
+//! `engine::running::apply_verdict` / `exec::phases::execute_begin`)。
+//!
+//! 场景(冷热交替;与 engine 演示台同构):
+//! ```text
+//! 池 6 槽 / 宿主 8MiB
+//! 轮 1/2  热链 A、B(各 3 块)⇒ 池满
+//! 轮 3    新需求(need = 2)⇒ 钩子判:链级**整条**沉 A(3 块,内容留宿主)
+//! 轮 4    命中 A ⇒ 前 2 块在宿主 ⇒ **一条命令**批量回灌 ⇒ 逐字节恒等
+//! ```
+
+use owl_cpu::CpuFace;
+use owl_iface::contract::{DeviceClient, Dtype, HeapRegion, PinnedRegion, SwapDir};
+use owl_store::{
+    commit_offload, commit_onload, plan, plan_offload, plan_offload_blocks, plan_onload,
+    reclaim_slot_table, BlockClass, BlockLeg, ChainHash, LegConfig, Need, NeedWhy, PieceSpec,
+    PoolLayout, Sink, SkipWhy, StoreResult,
+};
+
+const PIECE_ELEMS: usize = 64;
+const PIECE_BYTES: usize = PIECE_ELEMS * 4;
+const PAGE_TOKENS: usize = 32;
+
+// ───────────────────────── engine 式编排(样板)─────────────────────────
+//
+// 生产位置:`engine::running::apply_verdict`(决策单逐条执行)与
+// `engine::exec::phases::execute_begin`(段边界回灌)。三者形态必须一致:
+// **取计划 → face.swap → 回执取台 → commit**;失败走 abort(条目删,不留假账)。
+
+/// 换出**整条链**(一条 swap 搬 N 块)。
+async fn engine_offload(
+    leg: &mut BlockLeg,
+    face: &mut CpuFace,
+    tail: ChainHash,
+) -> StoreResult<usize> {
+    let (blocks, pieces, table) = {
+        let p = plan_offload(leg, tail)?; // 纯 host(算片 + 借台);Busy = 零副作用
+        (p.blocks, p.pieces, p.table)
+    };
+    let conn = match face.swap(SwapDir::Out, &pieces, Box::new(table)).await {
+        Ok(c) => c,
+        Err(e) => {
+            owl_store::abort_offload(leg, &blocks); // 内容已丢 ⇒ 条目一并删
+            return Err(owl_store::StoreError::Invariant(format!("swap(Out) 失败:{e}")));
+        }
+    };
+    let table = reclaim_slot_table(conn)?;
+    commit_offload(leg, &blocks, table)
+}
+
+/// 回灌**一批块**(一条 swap 搬 N 块)。
+async fn engine_onload(
+    leg: &mut BlockLeg,
+    face: &mut CpuFace,
+    chains: &[ChainHash],
+) -> StoreResult<Vec<u32>> {
+    let (cs, slots, pieces, table) = {
+        let p = plan_onload(leg, chains)?; // 纯 host(取内容 + 分配槽 + 组片)
+        (p.chains, p.slots, p.pieces, p.table)
+    };
+    let conn = match face.swap(SwapDir::In, &pieces, Box::new(table)).await {
+        Ok(c) => c,
+        Err(e) => {
+            owl_store::abort_onload(leg, &cs, &slots); // 槽归还 + 条目删
+            return Err(owl_store::StoreError::Invariant(format!("swap(In) 失败:{e}")));
+        }
+    };
+    let table = reclaim_slot_table(conn)?;
+    commit_onload(leg, &cs, &slots, table)
+}
+
+// ───────────────────────── 夹具 ─────────────────────────
+
+/// 两片段(= 两层 k/v)× `slots` 槽的设备池。
+async fn pieces(face: &mut CpuFace, slots: usize) -> Vec<PieceSpec> {
+    let mut out = Vec::new();
+    for _ in 0..2 {
+        let b = face.alloc(Dtype::F32, PIECE_ELEMS * slots, "t").await.expect("池块");
+        out.push(PieceSpec { buf: b, stride_bytes: PIECE_BYTES });
+    }
+    out
+}
+
+fn leg(slots: usize) -> BlockLeg {
+    BlockLeg::open(LegConfig {
+        slots,
+        block_tokens: PAGE_TOKENS,
+        block_bytes: PIECE_BYTES * 2, // 两片段 = 一个逻辑块
+        cache: owl_store::CachePolicy::Cap(slots + 8),
+        host_bytes: 8 << 20, // 宿主面开(8MiB ⇒ 可容 40+ 块)
+        class: BlockClass::KvPage,
+        label: "store-e2e",
+    })
+    .expect("开腿")
+}
+
+async fn seed(face: &mut CpuFace, ps: &[PieceSpec], slot: u32, seed: u8) {
+    for p in ps {
+        let pat: Vec<u8> = (0..p.stride_bytes).map(|i| seed.wrapping_add(i as u8)).collect();
+        let lease: Box<dyn PinnedRegion + Send> = Box::new(HeapRegion(pat));
+        face.upload_pinned(lease, &p.buf, slot as usize * p.stride_bytes, p.stride_bytes)
+            .await
+            .expect("seed");
+    }
+}
+
+async fn read_slot(face: &mut CpuFace, ps: &[PieceSpec], slot: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    for p in ps {
+        let mut d = vec![0u8; p.stride_bytes];
+        face.dtoh_at(&p.buf, slot as usize * p.stride_bytes, &mut d).await.expect("读槽");
+        out.extend_from_slice(&d);
+    }
+    out
+}
+
+/// 建一条链(整块登记)→ 归还会话引用(缓存独占 ⇒ 可下沉)。
+async fn build_chain(leg: &mut BlockLeg, tokens: &[u32]) -> Vec<ChainHash> {
+    let mut table = Vec::new();
+    leg.ensure_for_len(&mut table, tokens.len()).expect("块表");
+    leg.register_chain(tokens, &table).expect("登记");
+    let hit = leg.match_prefix(tokens).expect("命中");
+    leg.release_table(&mut table).expect("会话归还");
+    hit.hashes
+}
+
+#[tokio::test]
+async fn offload_and_batch_reload_without_gpu() {
+    let mut face = CpuFace::new();
+    let ps = pieces(&mut face, 6).await;
+    let mut l = leg(6);
+    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps.clone() })
+        .expect("注册布局");
+
+    // ── 轮 1/2:两条热链(各 3 块)⇒ 池满(6 槽)
+    let a_tokens: Vec<u32> = (0..96).collect(); // 96 tok = 3 块
+    let b_tokens: Vec<u32> = (1000..1096).collect();
+    let a = build_chain(&mut l, &a_tokens).await;
+    let b = build_chain(&mut l, &b_tokens).await;
+    assert_eq!((a.len(), b.len()), (3, 3));
+    assert_eq!(l.report().slots_free, 0, "池满(缓存独占)");
+
+    // 给 A 的块种可辨识图样(回灌后逐字节比对)。
+    // ⚠️ 用**固定槽号**(A 先建 ⇒ 槽 0..3):**不得**先调 `match_prefix` ——
+    // 那会 touch A 使其变热,`plan` 就会(正确地)去沉更冷的 B(store 行为对,
+    // 演示脚本错)。链级候选按**链尾 LRU** 出票,脚本要尊重这个语义。
+    let mut before: Vec<Vec<u8>> = Vec::new();
+    for i in 0..3usize {
+        let slot = i as u32;
+        seed(&mut face, &ps, slot, 0x40 * (i as u8 + 1)).await;
+        before.push(read_slot(&mut face, &ps, slot).await);
+    }
+
+    // ── 轮 3:新需求(池满 ⇒ 钩子判:链级整条沉最冷的链 A)
+    let need = Need { slots: 2, why: NeedWhy::Admit };
+    let verdict = plan(&l, need, &[]);
+    assert!(!verdict.out.is_empty(), "池满 + 新需求 ⇒ 必须出单(下沉/驱逐)");
+    // engine 式执行:逐条取计划 → swap → 记账
+    let mut offloaded = 0usize;
+    for item in &verdict.out {
+        match item.sink {
+            Sink::Host => offloaded += engine_offload(&mut l, &mut face, item.chain).await.expect("换出"),
+            Sink::Drop => l.drop_cached(item.chain).expect("驱逐"),
+        }
+    }
+    assert!(offloaded > 0, "需求驱动下沉:应真搬(而非驱逐)");
+    let rep = l.report();
+    assert!(rep.ops.offloads > 0 && rep.ops.offload_batches > 0, "换出门①:{:?}", rep.ops);
+    assert!(rep.host_bytes > 0, "宿主层应有驻留");
+    assert_eq!(rep.ops.ensure_evicted, 0, "全程不得依赖 `ensure_for_len` 的同步驱逐");
+
+    // ── 轮 4:命中 A ⇒ 命中面落在宿主 ⇒ **一条命令**批量回灌
+    let hit = l.match_prefix(&a_tokens).expect("二次命中");
+    let pending = hit.pending_host();
+    assert!(!pending.is_empty(), "A 已被整条沉到宿主 ⇒ 命中面应有待回灌块(A 的链头段也在)");
+    assert!(!hit.all_resident(), "整条链沉 ⇒ 命中面不全驻留");
+    let slots = engine_onload(&mut l, &mut face, &pending).await.expect("批量回灌");
+    assert_eq!(slots.len(), pending.len(), "同序返回槽");
+    let rep2 = l.report();
+    assert_eq!(rep2.ops.onloads as usize, pending.len(), "回灌计数 = 块数");
+    assert_eq!(rep2.ops.onload_batches, 1, "§15 批面:多块回灌必须**一条命令**");
+    assert_eq!(rep2.ops.ensure_evicted, 0, "回灌路径同样不得依赖同步驱逐");
+
+    // ── 门③:内容逐字节恒等(回灌后的新槽 vs 沉之前的旧内容)
+    for (i, slot) in slots.iter().enumerate() {
+        let after = read_slot(&mut face, &ps, *slot).await;
+        assert_eq!(after, before[i], "块 {i} 换出→回灌必须逐字节一致");
+    }
+}
+
+/// **链级整条搬**(§14.6):一次换出把链从尾到头搬完 —— 链头段必须也在宿主
+/// (否则命中面从链头就是设备格,回灌永不触发)。
+#[tokio::test]
+async fn chain_offload_moves_head_to_tail_and_batch_reloads() {
+    let mut face = CpuFace::new();
+    let ps = pieces(&mut face, 4).await;
+    let mut l = leg(4);
+    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps.clone() })
+        .expect("注册布局");
+
+    let tokens: Vec<u32> = (0..96).collect();
+    let chain = build_chain(&mut l, &tokens).await;
+    let (head, tail) = (chain[0], chain[2]);
+
+    // 候选:整条链一张票(dev_blocks = 3)
+    let cands = l.chain_offload_candidates(&[], 1);
+    assert_eq!(cands.len(), 1);
+    assert_eq!((cands[0].tail, cands[0].head), (tail, head));
+    assert_eq!(cands[0].dev_blocks, 3);
+
+    assert_eq!(engine_offload(&mut l, &mut face, tail).await.expect("整条沉"), 3);
+    for (i, h) in chain.iter().enumerate() {
+        assert_eq!(l.carrier_of(*h).expect("在账"), owl_store::Carrier::Host, "第 {i} 块应在宿主");
+    }
+    let hit = l.match_prefix(&tokens).expect("宿主格仍命中");
+    assert_eq!(hit.pending_host().len(), 3, "三段全待回灌(链头段在内)");
+    let n = engine_onload(&mut l, &mut face, &hit.pending_host()).await.expect("批量回灌");
+    assert_eq!(n.len(), 3);
+
+    let rep = l.report();
+    assert_eq!(rep.host_blocks, 0, "回灌后宿主副本应清空");
+    assert_eq!(rep.cached_blocks, 3, "链仍在账");
+}
+
+// ─────────────────── B-3e-2:**逐块**下沉票(2026-10-18) ───────────────────
+//
+// 链级票的两处粗化(整链 all-or-nothing / 一块活跃否决整链)是**我们自己的选择**;
+// 单卡长 ctx 需要的是"工作集留设备、其余沉走" ⇒ 这里把出票粒度降到**逐块**,
+// 并验证:**活跃块自己不沉,但不连坐别的块**(链级票此时是整链 `Busy`)。
+
+/// 逐块出票的编排样板(与 `engine_offload` 同形,只换成块清单)。
+async fn engine_offload_blocks(
+    leg: &mut BlockLeg,
+    face: &mut CpuFace,
+    chains: &[ChainHash],
+) -> StoreResult<(usize, usize)> {
+    let (blocks, pieces, table, skipped) = {
+        let p = plan_offload_blocks(leg, chains)?; // 纯 host
+        (p.blocks, p.pieces, p.table, p.skipped)
+    };
+    if blocks.is_empty() {
+        return Ok((0, skipped.len()));
+    }
+    let conn = match face.swap(SwapDir::Out, &pieces, Box::new(table)).await {
+        Ok(c) => c,
+        Err(e) => {
+            owl_store::abort_offload(leg, &blocks);
+            return Err(owl_store::StoreError::Invariant(format!("swap(Out) 失败:{e}")));
+        }
+    };
+    let table = reclaim_slot_table(conn)?;
+    let n = commit_offload(leg, &blocks, table)?;
+    Ok((n, skipped.len()))
+}
+
+#[tokio::test]
+async fn per_block_offload_skips_live_block_without_vetoing_others() {
+    let mut face = CpuFace::new();
+    let ps = pieces(&mut face, 6).await;
+    let mut l = leg(6);
+    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps.clone() })
+        .expect("注册布局");
+
+    // 链 A = 3 块;归一还会话引用后再**重新持一块**(块 1)= 模拟"会话表仍持有它"
+    let a_tokens: Vec<u32> = (0..96).collect();
+    let a = build_chain(&mut l, &a_tokens).await;
+    assert_eq!(a.len(), 3);
+    // 固定槽号:A 先建 ⇒ 槽 0/1/2(与既有演示脚本同律:别先 match 打热)
+    let live_slot = 1u32;
+    l.incref(live_slot).expect("会话重持块 1");
+    assert_eq!(l.report().slots_free, 3, "另 3 槽空(池 6)");
+
+    // 种图样(沉前/回灌后逐字节比)
+    let mut before: Vec<Vec<u8>> = Vec::new();
+    for i in 0..3usize {
+        seed(&mut face, &ps, i as u32, 0x20 * (i as u8 + 1)).await;
+        before.push(read_slot(&mut face, &ps, i as u32).await);
+    }
+
+    eprintln!(
+        "[b3e-2] 池 {} 槽/自由 {} · 链 A = {:?}(槽 0/1/2)其中**槽 1 被会话持有**",
+        l.report().slots_total,
+        l.report().slots_free,
+        a.iter().map(|h| format!("{:?}", h).chars().take(6).collect::<String>()).collect::<Vec<_>>()
+    );
+    // ── 对照:链级票此时**整链 Busy**(一块活跃 ⇒ 整条链不出票)
+    assert!(
+        matches!(plan_offload(&mut l, *a.last().expect("尾")), Err(owl_store::StoreError::Busy(_))),
+        "链级票的粗化:一块活跃 ⇒ 整链否决(本测试要证的正是它的反面)"
+    );
+
+    // ── 逐块票:请求 [块0, 块1(活跃), 块2] ⇒ 只有 0/2 有票,块 1 记 `LiveRefs`
+    let (n, skipped) = engine_offload_blocks(&mut l, &mut face, &a).await.expect("逐块下沉");
+    let why = plan_offload_blocks(&mut l, &[a[0], a[1], a[2]])
+        .map(|p| p.skipped.len())
+        .unwrap_or(0);
+    eprintln!("[b3e-2] 逐块票:下沉 {n} 块 · 跳过 {skipped} 块(活跃块记 LiveRefs;复询 skipped={why})");
+    assert_eq!(n, 2, "两块应真沉");
+    assert_eq!(skipped, 1, "活跃块应被跳过(不是连坐)");
+    let rep = l.report();
+    assert_eq!(rep.ops.offloads, 2, "下沉计数 = 有票块数");
+    assert_eq!(rep.ops.offload_batches, 1, "§15 批面:两块一条命令");
+    assert!(rep.host_bytes > 0, "宿主层应有驻留");
+
+    // 活跃块**仍在设备**,另两块在宿主(载体查询是现成面 —— B-3e-2 不需要新造)
+    assert_eq!(
+        l.carrier_of(a[1]).expect("块1载体"),
+        owl_store::Carrier::Device(live_slot),
+        "活跃块不沉"
+    );
+    assert_eq!(l.carrier_of(a[0]).expect("块0载体"), owl_store::Carrier::Host, "冷块应沉");
+    assert_eq!(l.carrier_of(a[2]).expect("块2载体"), owl_store::Carrier::Host, "冷块应沉");
+
+    // ── 幂等(趁块还在宿主):重复请求全 `AlreadyHost`,零搬运、不借台
+    let again = plan_offload_blocks(&mut l, &[a[0], a[2]]).expect("重复请求");
+    assert!(again.is_empty(), "已在宿主 ⇒ 无票(不借台、零副作用)");
+    assert!(
+        again.skipped.iter().all(|(_, why)| *why == SkipWhy::AlreadyHost),
+        "重复请求应记 AlreadyHost:{:?}",
+        again.skipped
+    );
+
+    // ── 回灌两块 ⇒ 内容逐字节恒等(新槽 ≠ 原槽:回灌分配新槽)
+    let sunk = vec![a[0], a[2]];
+    let slots = engine_onload(&mut l, &mut face, &sunk).await.expect("回灌");
+    assert_eq!(slots.len(), 2);
+    for (i, slot) in slots.iter().enumerate() {
+        let after = read_slot(&mut face, &ps, *slot).await;
+        assert_eq!(after, before[[0usize, 2][i]], "块 {:?} 沉→回灌必须逐字节一致", sunk[i]);
+    }
+
+    // ── 回灌后它们又回到设备(载体查询可证)⇒ 再请求就又有票(幂等只对"已在宿主"成立)
+    assert!(matches!(
+        l.carrier_of(a[0]).expect("载体"),
+        owl_store::Carrier::Device(_)
+    ));
+
+    // ── 未知身份 ⇒ `Unknown`(不静默当成功)
+    let unk = plan_offload_blocks(&mut l, &[ChainHash::new(0xDEAD)]).expect("未知身份");
+    assert!(unk.is_empty());
+    assert_eq!(unk.skipped[0].1, SkipWhy::Unknown);
+}

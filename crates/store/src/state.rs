@@ -1,0 +1,263 @@
+//! GDN(线性注意力)状态账(`StateStore`)—— 与 `KvStore` **平级独立**(裁决②)。
+//!
+//! 结构性差异(设计卷 §3.1 表):几何 = 每层 4 块(conv×3 + rec)、**一格一会话**、
+//! **不可内容哈希**(依赖 hidden/递推)⇒ 只能按块边界(`SnapKey`)标识。
+//!
+//! 本刀(S1)落**账与生命周期语义**:
+//! - **行(row)= 活跃 turn 借还**(S2b 的目标语义,先在账上成立):
+//!   `borrow_row()` 拿行 → 用毕 `return_row(row, Some(snap))` **落快照后还格**;
+//! - 快照 = 可驱逐资产(所在层由 `Tier` 记账;下沉 host/盘是 S2 的搬运活);
+//! - 行数上限 = `gdn_slots`(**并发 turn 天花板**,不是"能挂多少会话")。
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::error::{StoreError, StoreResult};
+use crate::id::SnapKey;
+use crate::policy::{EvictCandidate, Leg};
+use crate::tier::Tier;
+
+/// 快照账。
+#[derive(Clone, Copy, Debug)]
+struct SnapEntry {
+    tier: Tier,
+    bytes: usize,
+    last_use: u64,
+}
+
+/// GDN 状态账。
+#[derive(Debug)]
+pub struct StateStore {
+    rows_total: usize,
+    rows_free: BTreeSet<usize>,
+    row_bytes: usize,
+    snaps: BTreeMap<SnapKey, SnapEntry>,
+    tick: u64,
+    hits: u64,
+    misses: u64,
+}
+
+impl StateStore {
+    /// 构造。`rows_total` = `gdn_slots`;`row_bytes` = 每会话全 48 层的行合计
+    /// (27B 实测 ≈162MB)。
+    pub fn new(rows_total: usize, row_bytes: usize) -> Self {
+        Self {
+            rows_total,
+            rows_free: (0..rows_total).collect(),
+            row_bytes,
+            snaps: BTreeMap::new(),
+            tick: 0,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// 每行字节(预算/报告用)。
+    pub fn row_bytes(&self) -> usize {
+        self.row_bytes
+    }
+
+    /// 行总数(= 并发 turn 天花板)。
+    pub fn rows_total(&self) -> usize {
+        self.rows_total
+    }
+
+    /// 借行(**活跃 turn 起**)——耗尽 = 响亮拒;调用方应先查 `rows_free()`。
+    pub fn borrow_row(&mut self) -> StoreResult<usize> {
+        let row = *self
+            .rows_free
+            .iter()
+            .next()
+            .ok_or_else(|| StoreError::Exhausted(format!("GDN 行耗尽({} 行)", self.rows_total)))?;
+        self.rows_free.remove(&row);
+        Ok(row)
+    }
+
+    /// 还行(**活跃 turn 止**;`snap = Some` 时先把状态登记为快照)。
+    ///
+    /// 这正是设计卷 §2.3 的改造点:idle 会话只留快照(可驱逐/可下沉),
+    /// **不再占行** —— 于是"能挂多少会话"与"能并发几个 turn"解耦。
+    pub fn return_row(&mut self, row: usize, snap: Option<SnapKey>) -> StoreResult<()> {
+        if row >= self.rows_total {
+            return Err(StoreError::Invariant(format!("行号 {row} 越界(共 {})", self.rows_total)));
+        }
+        if !self.rows_free.insert(row) {
+            return Err(StoreError::Invariant(format!("行 {row} 重复归还")));
+        }
+        if let Some(k) = snap {
+            self.tick += 1;
+            let tick = self.tick;
+            self.snaps
+                .insert(k, SnapEntry { tier: Tier::Gpu, bytes: self.row_bytes, last_use: tick });
+        }
+        Ok(())
+    }
+
+    /// 空闲行数。
+    pub fn rows_free(&self) -> usize {
+        self.rows_free.len()
+    }
+
+    /// **登记快照**(S2:引擎每次 `capture_snap` 后调用;幂等 —— 已存在则只触达)。
+    ///
+    /// `bytes` = 一条快照的全量字节(Σ 层×quad 行宽);`tier` 由调用方给
+    /// (新拍的必在设备层)。
+    pub fn register_snap(&mut self, key: SnapKey, bytes: usize, tier: Tier) {
+        self.tick += 1;
+        let tick = self.tick;
+        match self.snaps.get_mut(&key) {
+            Some(e) => {
+                e.last_use = tick;
+                e.tier = tier;
+                e.bytes = bytes;
+            }
+            None => {
+                self.snaps.insert(key, SnapEntry { tier, bytes, last_use: tick });
+            }
+        }
+    }
+
+    /// 一条快照的字节(不在账 = `None`)。
+    pub fn snap_bytes(&self, key: SnapKey) -> Option<usize> {
+        self.snaps.get(&key).map(|s| s.bytes)
+    }
+
+    /// 按层统计(`(条数, 字节)`;报告/对账口)。
+    pub fn snaps_in_tier(&self, tier: Tier) -> (usize, usize) {
+        self.snaps
+            .values()
+            .filter(|s| s.tier == tier)
+            .fold((0, 0), |(n, b), s| (n + 1, b + s.bytes))
+    }
+
+    /// 定位快照(probe:纯查询)。
+    pub fn locate(&self, key: SnapKey) -> Option<Tier> {
+        self.snaps.get(&key).map(|s| s.tier)
+    }
+
+    /// 触达快照(命中新鲜度)。
+    pub fn touch(&mut self, key: SnapKey) {
+        self.tick += 1;
+        let tick = self.tick;
+        if let Some(s) = self.snaps.get_mut(&key) {
+            s.last_use = tick;
+        }
+    }
+
+    /// 记命中/未命中(报告面)。
+    pub fn note_probe(&mut self, hit: bool) {
+        if hit {
+            self.hits += 1;
+        } else {
+            self.misses += 1;
+        }
+    }
+
+    /// 快照换层(下沉/回灌)。
+    pub fn set_tier(&mut self, key: SnapKey, tier: Tier) -> StoreResult<()> {
+        let s = self
+            .snaps
+            .get_mut(&key)
+            .ok_or_else(|| StoreError::Unknown(format!("快照 {key:?}")))?;
+        s.tier = tier;
+        Ok(())
+    }
+
+    /// 驱逐候选(快照面全部可驱逐;`protect` = 点名保住)。
+    pub fn evict_candidates(&self, protect: &[SnapKey]) -> Vec<EvictCandidate> {
+        self.snaps
+            .iter()
+            .filter(|(k, _)| !protect.contains(k))
+            .map(|(k, s)| EvictCandidate {
+                leg: Leg::State,
+                tier: s.tier,
+                bytes: s.bytes,
+                last_use: s.last_use,
+                chain: None,
+                snap: Some(*k),
+            })
+            .collect()
+    }
+
+    /// 回收快照(调用方已从 `TierLedger` 出账)。
+    pub fn drop_snap(&mut self, key: SnapKey) -> StoreResult<usize> {
+        let s = self
+            .snaps
+            .remove(&key)
+            .ok_or_else(|| StoreError::Unknown(format!("快照 {key:?}")))?;
+        Ok(s.bytes)
+    }
+
+    /// 统计(报告面)。
+    pub fn stats(&self) -> StateStats {
+        StateStats {
+            rows_total: self.rows_total,
+            rows_free: self.rows_free.len(),
+            snaps: self.snaps.len(),
+            snap_bytes: self.snaps.values().map(|s| s.bytes).sum(),
+            snap_gpu: self.snaps_in_tier(Tier::Gpu),
+            snap_host: self.snaps_in_tier(Tier::Host),
+            hits: self.hits,
+            misses: self.misses,
+        }
+    }
+}
+
+/// `StateStore` 统计。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StateStats {
+    /// 行总数。
+    pub rows_total: usize,
+    /// 空闲行数。
+    pub rows_free: usize,
+    /// 快照条数。
+    pub snaps: usize,
+    /// 快照字节合计。
+    pub snap_bytes: usize,
+    /// 设备层快照(条数, 字节)。
+    pub snap_gpu: (usize, usize),
+    /// 宿主层快照(条数, 字节)。
+    pub snap_host: (usize, usize),
+    /// 命中次数。
+    pub hits: u64,
+    /// 未命中次数。
+    pub misses: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::id::ChainHash;
+
+    #[test]
+    fn rows_are_borrowed_per_turn_and_returned_with_snapshot() {
+        let mut s = StateStore::new(2, 162 << 20);
+        let r0 = s.borrow_row().expect("借行");
+        let r1 = s.borrow_row().expect("借行");
+        assert!(s.borrow_row().is_err(), "第三行必须响亮拒(天花板)");
+        // turn 止:落快照 + 还行 ⇒ idle 会话不再占行
+        s.return_row(r0, Some(SnapKey::at_boundary(ChainHash::new(7)))).expect("还行");
+        assert_eq!(s.rows_free(), 1);
+        assert_eq!(s.locate(SnapKey::at_boundary(ChainHash::new(7))), Some(Tier::Gpu));
+        assert_eq!(s.borrow_row().expect("再借"), 0, "还回的行号应可复用");
+        s.return_row(r1, None).expect("无快照也行");
+        assert_eq!(s.rows_free(), 1);
+    }
+
+    #[test]
+    fn double_return_is_loud() {
+        let mut s = StateStore::new(1, 1);
+        let r = s.borrow_row().expect("借行");
+        s.return_row(r, None).expect("还行");
+        assert!(matches!(s.return_row(r, None), Err(StoreError::Invariant(_))));
+    }
+
+    #[test]
+    fn snaps_are_evictable_but_protect_wins() {
+        let mut s = StateStore::new(1, 1024);
+        let k = SnapKey::at_boundary(ChainHash::new(3));
+        let r = s.borrow_row().expect("借行");
+        s.return_row(r, Some(k)).expect("落快照");
+        assert!(s.evict_candidates(&[k]).is_empty(), "点名保住");
+        assert_eq!(s.evict_candidates(&[]).len(), 1);
+    }
+}

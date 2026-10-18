@@ -13,17 +13,19 @@ owl-iface = { path = "../backends/iface" }
 # 声明式模型层(interpreters::eval_ops = 计算解释器)
 owl-models = { path = "../models" }
 # 图治理(A1:预算前置/生命周期律)—— M1 接线
-owl-graph = { path = "../graph" }
+# 状态存储(S3:块腿账 = 槽池 + 内容身份前缀树;engine 只留设备叶子)
+owl-store = { path = "../store" }
 # 绑定设备是引擎职责(models 主依赖零后端;engine 相反,见模块头)
 owl-cuda = { path = "../backends/cuda" }
-# 通信纯逻辑面(peer 分档 PeerPlan/staging 布局 StagingLayout;S4 ⑤-K2)
+# CPU 后端(§18 mock 档:无卡跑 store 演示台 / 压力与错误路径测试)。
+# 方向与 owl-cuda 同:engine → backends/*(无环)。
+owl-cpu = { path = "../backends/cpu" }
 half = "2"
 
 [dev-dependencies]
 # 重排面门(TP 装载:设备块 vs CPU marlin 参考)
 owl-kernels = { path = "../kernels" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
-owl-cpu = { path = "../backends/cpu" }
 owl-macros = { path = "../macros" }
 
 [features]

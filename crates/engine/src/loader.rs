@@ -172,16 +172,19 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
     /// owl_shared::config::HeadQuant → owl_models QuantPlan;量化方案
     /// = 配置枚举,loader 零硬编码)。
     ///
-    /// `w4a8`(S2,2026-10-17):**主干**量化档 —— false = W4A16Awq(今天行为),
-    /// true = W4A8Awq(a8 布局 + 激活 int8 + int8 张量核)。显式参数而非
-    /// env:量化方案改语义(不是诊断旋钮),且入口(server boot)从配置读。
+    /// `quant`(S2,2026-10-17;2026-10-17 由 `w4a8: bool` 升格为方案枚举):
+    /// **主干**量化 plan —— `QuantPlan::W4A16Awq`(今天行为)/ `W4A8Awq`
+    /// (a8 布局 + 激活 int8 + int8 张量核)。显式参数而非 env:量化方案改
+    /// 语义(不是诊断旋钮),且入口(server boot)经 `engine::quant_plan_of`
+    /// 从 `model.quant` 映射。**非主干两位 plan 在此响亮拒**(F16/W4A16
+    /// 走 0.8B 线;馈错 = 静默降级到全部 f16,正是本仓禁止的那类错)。
     #[allow(clippy::arc_with_non_send_sync)]
     pub async fn load_qwen38_27b_awq(
         &mut self,
         dir: &Path,
         tokenizer_dir: &Path,
         head_plan: owl_models::module::QuantPlan,
-        w4a8: bool,
+        quant: owl_models::module::QuantPlan,
     ) -> Result<LoadedModel> {
         // metrics 装载分相(直用 API 恒开;装载一次性路径,release 有数据)
         let _ = owl_shared::metrics::init_metrics(owl_shared::metrics::MetricsStore::new());
@@ -191,14 +194,21 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let (spec, rep) = ModelSpec::from_ckpt(dir, SpecSource::family(&qwen3_8_27b()))?;
         log_spec_report("27B-AWQ", &rep);
         let spec = self.shard_spec(spec)?;
-        let quant_plan = if w4a8 {
-            owl_shared::log_info!(
-                "boot",
-                "W4A8 档位开:权重 a8 布局 + 激活 per-token int8 + kS8×kU4 GEMM"
-            );
-            owl_models::module::QuantPlan::W4A8Awq
-        } else {
-            owl_models::module::QuantPlan::W4A16Awq
+        let quant_plan = match quant {
+            owl_models::module::QuantPlan::W4A16Awq => quant,
+            owl_models::module::QuantPlan::W4A8Awq => {
+                owl_shared::log_info!(
+                    "boot",
+                    "W4A8 档位开(model.quant = \"w4a8\"):权重 a8 布局 + 激活 per-token int8 + kS8×kU4 GEMM"
+                );
+                quant
+            }
+            other => {
+                return Err(ModelError::Msg(format!(
+                    "27B-AWQ 主干量化 plan 非法: {other:?} —— 只接受 W4A16Awq / W4A8Awq\
+                     (engine::quant_plan_of 是唯一映射点)"
+                )));
+            }
         };
         let model = Model::new(
             &spec,

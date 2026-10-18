@@ -44,9 +44,22 @@ pub struct DiagOpts {
     /// 图实例化旗标(原 OWL_GRAPH_FLAGS;UPLOAD=2 / DEVICE_LAUNCH=4;
     /// 类型化位面经 OwlConfig.cuda.graph_flags → to_bits())
     pub graph_flags: u64,
+    /// **图自携 plan restore**(`[dispatch] fi_plan_restore`;缺省 true = 历史行为)。
+    /// `false` ⇒ 图不烘表,host 每步用 `fi_plan_sync` 刷当步精确表
+    /// (单图档 `[dispatch] fi_plan_bake` 的配套;配置层已校验二者不冲突)。
+    pub fi_plan_restore: bool,
     /// 捕获 slab 固定档 MiB(None = warmup 计量定量;原 OWL_CAPTURE_SLAB_MB
     /// —— 24G 贴顶的 27B + spec 双图场景,verify 图按需调小)
     pub capture_slab_mb: Option<usize>,
+    /// **显存硬预算:预留 MiB**(2026-10-16):判据 = 驱动账 `free − reserve ≥ 请求`,
+    /// 否则**主动拒发**(不让 `cudaMallocAsync` 去抛错 —— 那是"已经太晚"的现场)。
+    /// reserve 覆盖未入账面:CUDA ctx(~430MB)/池保留页/瞬态。
+    /// 缺省 256MiB(测试面);生产经 `from_config` 取 `pool.vram_reserve_mb`(1024MiB)
+    /// —— 与引擎池治理**同一个预留**,两个旋钮不打架。
+    pub vram_reserve_mb: u64,
+    /// **显存硬预算:逻辑上限 MiB**(None = 只按驱动账判)。
+    /// 叠一层"引擎 live 账"上限:适合"这台卡只准 owl 用 N GB"的部署口径。
+    pub vram_budget_mb: Option<u64>,
     /// **发射账容量**(cuda.trace_ring;0 = 关)。>0 ⇒ server 记最近 N 条
     /// 命令(launch/htod/dtoh/alloc/free/memset/copy;见 `crate::trace`)。
     pub trace_ring: usize,
@@ -74,11 +87,15 @@ impl DiagOpts {
             free_legacy: c.free_legacy,
             sync_mask: mask,
             launch_time: c.launch_time,
+            // 硬预算:与池治理同一预留(1GiB);逻辑上限走显式配置(暂 None)
+            vram_reserve_mb: cfg.pool.vram_reserve_mb.max(1),
+            vram_budget_mb: owl_shared::env_reader::parse::<u64>("OWL_VRAM_BUDGET_MB"),
             d2h_prof: c.d2h_prof,
             gpu_prof: c.gpu_prof,
             graph_flags: c.graph_flags.to_bits(),
             capture_slab_mb: c.capture_slab_mb,
             trace_ring: c.trace_ring,
+            fi_plan_restore: cfg.dispatch.fi_plan_restore,
             allowed_ops: cfg
                 .dispatch
                 .allowed_ops
@@ -526,6 +543,128 @@ pub(super) enum FamAct {
 }
 
 /// 严格档开关(进程级一次读取;诊断旋钮 —— 与 `OWL_GDN_FRESH_SCRATCH` 同族)
+/// **显存硬预算判据（唯一实现；2026-10-16 立项 / 2026-10-18 缓存化）**。
+///
+/// 两段，顺序有义：
+/// ① **驱动账**（主判据）：`cuMemGetInfo` 的 free − `reserve` ≥ 请求 —— 覆盖
+///    未入账面（CUDA ctx / 池保留页 / 别的进程）；
+/// ② **逻辑上限**（可选）：`vram::live + n ≤ budget`。
+///
+/// 不通过 = `PoolExhausted`（**结构化**：要多少 / 还能给多少）⇒ 调用方**拒发**，
+/// 不去 malloc —— CUDA 侧失败是“已经太晚”的现场（错误语义模糊 + 池撕碎）。
+///
+/// # 为什么必须是 `&mut self`（缓存化，2026-10-18）
+///
+/// nsys `cuda_api_sum` 实测：**`cuMemGetInfo` = 86.8µs/次**（max 10.4ms），
+/// 而真分配 `cuMemAllocAsync` 只要 **10µs**。原实现逐 alloc 真查 ⇒
+/// 1426 alloc/chunk × 87µs ≈ **121ms/chunk 纯宿主税**（占 prefill 墙 ~30%；
+/// 4-token 尾块的 249ms 里一半是它；2s 窗内 `cuMemGetInfo` 606ms/1673ms）。
+/// 修法 = **真采样只在必要时**：
+/// * ① 首采；② 距上次采样超 [`VramGuard::SAMPLE_TTL`]（防外部进程长期漂移）；
+/// * ③ 估计值逼近边界（`free_est < n + reserve + MARGIN`）—— 只有此刻
+///   才需要精确值，也正是原判据会拒发的窗口。
+///
+/// 两次采样之间用 **live 账增量**做估计：`free_est = free_at − (live_now − live_at)`。
+/// 方向性论证（不变量）：本进程 net live 增长**必然**吃掉驱动 free，而
+/// 池滞留/fragmentation 只会让真 free **更低**（提前采样 = 更保守）⇒ 估计
+/// 不会“比真值更宽松”而放行超预算请求。兜底仍在：真分配失败走
+/// `handle_alloc_inner` 的结构化错误 + 三账上屏（永不静默）。
+pub(super) struct VramGuard {
+    /// 上次真采样：（时刻，驱动 free，采样时 live 账）
+    sample: Option<(std::time::Instant, u64, u64)>,
+}
+
+impl VramGuard {
+    pub(super) const fn new() -> Self {
+        Self { sample: None }
+    }
+
+    /// 采样保鲜期（超时 ⇒ 真查一次；防外部进程吃显存后长期不校准）
+    const SAMPLE_TTL: std::time::Duration = std::time::Duration::from_millis(1000);
+    /// 刷新余量：估计值落进 `n + reserve + MARGIN` 以内才真查（常态零查询；
+    /// 256MiB ≫ 单次 scratch（~6-40MiB），不改变稳态判据语义）
+    const MARGIN_BYTES: u64 = 256 << 20;
+
+    /// **纯函数**：由采样 + 当前 live 账估计驱动 free（可单测；无 CUDA）。
+    fn estimate_free(
+        sample: Option<(std::time::Instant, u64, u64)>,
+        live_now: u64,
+        now: std::time::Instant,
+    ) -> Option<(u64, bool)> {
+        let (t, free_at, live_at) = sample?;
+        let grown = live_now.saturating_sub(live_at);
+        let stale = now.duration_since(t) > Self::SAMPLE_TTL;
+        Some((free_at.saturating_sub(grown), stale))
+    }
+
+    /// 判据入口（见类型文档；`&mut self` 只为刷新采样缓存）。
+    pub(super) fn check(
+        &mut self,
+        n_bytes: usize,
+        reserve_bytes: u64,
+        budget_bytes: Option<u64>,
+    ) -> Result<(), ModelError> {
+        // ② 逻辑上限（可选；纯账，零驱动）
+        if let Some(cap) = budget_bytes {
+            let live = owl_shared::vram::live_bytes();
+            let after = live.saturating_add(n_bytes as u64);
+            if after > cap {
+                return Err(ModelError::PoolExhausted {
+                    pool: "vram-hard-budget(live 账上限)".into(),
+                    needed: n_bytes as u64,
+                    available: cap.saturating_sub(live),
+                });
+            }
+        }
+        // ① 驱动账：先看估计，够用且不陈旧就**不查驱动**
+        let live = owl_shared::vram::live_bytes();
+        let now = std::time::Instant::now();
+        let need_sample = match Self::estimate_free(self.sample, live, now) {
+            None => true,
+            Some((free_est, stale)) => {
+                stale
+                    || free_est
+                        < (n_bytes as u64)
+                            .saturating_add(reserve_bytes)
+                            .saturating_add(Self::MARGIN_BYTES)
+            }
+        };
+        if need_sample {
+            if let Ok((free, _)) = cudarc::driver::result::mem_get_info() {
+                let free = free as u64;
+                owl_shared::vram::free_set(free);
+                self.sample = Some((std::time::Instant::now(), free, live));
+            }
+        }
+        if let Some((free_est, _)) = Self::estimate_free(self.sample, live, std::time::Instant::now()) {
+            let avail = free_est.saturating_sub(reserve_bytes);
+            if n_bytes as u64 > avail {
+                // **取证**(2026-10-19,main):把当时的数打全(此前只报“要多少/还剩多少”,
+                // 剩下“谁吃掉了”无从判断)。估计路径下 free 报的是**采样时刻**的值。
+                let (pu, _puh, pr, _prh) = pool_ledger_snapshot().unwrap_or((0, 0, 0, 0));
+                eprintln!(
+                    "[vram-guard] 拒发:要 {} MiB,驱动 free(est)={} MiB,reserve={} MiB,avail={} MiB,\
+                     池 used={} MiB / reserved={} MiB ⇒ **池内可复用 {} MiB**,live 账={} MiB",
+                    n_bytes >> 20,
+                    free_est >> 20,
+                    reserve_bytes >> 20,
+                    avail >> 20,
+                    pu >> 20,
+                    pr >> 20,
+                    pr.saturating_sub(pu) >> 20,
+                    owl_shared::vram::live_bytes() >> 20,
+                );
+                return Err(ModelError::PoolExhausted {
+                    pool: "vram-hard-budget(驱动 free − reserve)".into(),
+                    needed: n_bytes as u64,
+                    available: avail,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 pub(super) fn cap_strict() -> bool {
     static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *STRICT.get_or_init(|| {
@@ -1397,6 +1536,21 @@ impl GpuCtx {
         let slab = unsafe { stream.alloc::<u8>(slab_cap) }
             .map_err(|e| ModelError::Msg(format!("graph_begin: 捕获 slab 分配失败({}MiB) {e:?}", slab_cap >> 20)))?;
         owl_shared::vram::live_add(slab_cap as i64); // B6.5(直配不走 handle_alloc)
+        // **取证**(2026-10-19;`OWL_VRAM_DBG=1`):图捕获 slab 是"每图一份、
+        // 按 warmup 计量满额" ⇒ 多图叠加会静默吃掉 GB 级
+        // ("满额 × 图数 = VRAM 爆的工程债")。打印每次捕获量与累计。
+        if std::env::var_os("OWL_VRAM_DBG").is_some() {
+            // 进程内累计(仅取证;不进账)
+            static SLAB_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let t = SLAB_TOTAL.fetch_add(slab_cap as u64, std::sync::atomic::Ordering::Relaxed)
+                + slab_cap as u64;
+            eprintln!(
+                "[graph-slab] 本次 {} MiB · 累计 {} MiB · live 账 {} MiB",
+                slab_cap >> 20,
+                t >> 20,
+                owl_shared::vram::live_bytes() >> 20
+            );
+        }
         let slab = Arc::new(slab);
         stream
             .begin_capture(CAPTURE_MODE_THREAD_LOCAL)
@@ -1850,10 +2004,32 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
         if self.capture.is_some() && matches!(e.block, Block::Owned(_) | Block::Peer(_)) {
             self.graph_refs.borrow_mut().record(id);
         }
-        // 块账自洽(哨兵;cfg! 展开 ⇒ 两档都编译,零热路径语义)
-        debug_assert_eq!(e.ledger, self.ledger, "块条目账本与 id 账本不一致");
-        debug_assert_eq!(numel(&e.shape), e.bytes, "块 shape/账长不一致");
-        debug_assert!(e.dtype.size_bytes() >= 1, "块 dtype 非法");
+        // 块账自洽(哨兵)。**判据升级(2026-10-17 审查)**:原为 `debug_assert!`
+        // ⇒ `--release --features perf`(团队性能档)与生产档**都不查**,账本破损
+        // 只能靠很远处 OOM/错值现形。现按仓内既有谓词 `PERF_BUILD`
+        // (= `debug_assertions ∨ feature="perf"`)门控成**结构化 Err**:
+        // 生产档常量折叠零开销,性能/调试档响亮拒(且不会像 panic 那样带走 actor 线程)。
+        // 注:第一项(ledger)与上面 `assert_ledger` 同源,保留作双保险。
+        if owl_shared::metrics::PERF_BUILD {
+            if e.ledger != self.ledger {
+                return Err(ModelError::Msg(format!(
+                    "块账破损:id={id} 条目账本 {} ≠ 当前账本 {}",
+                    e.ledger, self.ledger
+                )));
+            }
+            if numel(&e.shape) != e.bytes {
+                return Err(ModelError::Msg(format!(
+                    "块账破损:id={id} shape {:?} 元素数 {} ≠ 账长 {} 字节",
+                    e.shape, numel(&e.shape), e.bytes
+                )));
+            }
+            if e.dtype.size_bytes() < 1 {
+                return Err(ModelError::Msg(format!(
+                    "块账破损:id={id} dtype {:?} 尺寸非法",
+                    e.dtype
+                )));
+            }
+        }
         match &e.block {
             Block::Owned(slice) => {
                 let (p, _) = slice.device_ptr(stream);
@@ -1984,6 +2160,28 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
                 .iter()
                 .partition(|id| self.graph_refs.borrow().is_pinned(**id));
             self.sink.count("srv.count.free_pinned_reject", pinned.len() as u64);
+            // **取证**(2026-10-19):拒收 = 块**永远回不了池**。累计字节(此前只报块数
+            // ⇒ "每 chunk 漏 ~128 MiB"这种量级看不出来)。
+            {
+                static REJ_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                static REJ_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let bytes: u64 = pinned
+                    .iter()
+                    .map(|id| self.blocks.get(id).map(|b| b.bytes as u64).unwrap_or(0))
+                    .sum();
+                let tb =
+                    REJ_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed) + bytes;
+                let tn = REJ_BLOCKS
+                    .fetch_add(pinned.len() as u64, std::sync::atomic::Ordering::Relaxed)
+                    + pinned.len() as u64;
+                eprintln!(
+                    "[free-pinned] 拒收 {} 块 / {} MiB(累计 {} 块 / {} MiB)",
+                    pinned.len(),
+                    bytes >> 20,
+                    tn,
+                    tb >> 20
+                );
+            }
             // 告警带"是哪张图钉的"(refs 字段的实际用途:诊断可行动)
             let holder: Vec<GraphId> = self
                 .graphs
@@ -2423,11 +2621,64 @@ pub(super) struct KernelCache {
     pub(super) aot_hits: usize,
     /// 无资产的核名(每名一次;= 拒启清单/机器判据面)
     pub(super) misses: Vec<String>,
+    /// 预加载已完成(boot 期;之后的模块装载 = 声明面漏登,响亮告警)
+    preload_done: bool,
 }
 
 impl KernelCache {
     pub(super) fn new() -> Self {
-        Self { compiled: HashMap::new(), modules: HashMap::new(), aot_hits: 0, misses: Vec::new() }
+        Self {
+            compiled: HashMap::new(),
+            modules: HashMap::new(),
+            aot_hits: 0,
+            misses: Vec::new(),
+            preload_done: false,
+        }
+    }
+
+    /// **算子预加载**(2026-10-17):boot 期把声明面中**有 cubin 资产**的核
+    /// 全部装载(模块 + 符号),把“首发票”–首次请求触发的惰性装载税搬到 boot。
+    ///
+    /// 动机(实测):模块装载(`cuModuleLoadData`)是**首次使用**才付的
+    /// 惰性成本 —— 44 个 .cu / 139 个核里,decode/图族在 warmup 就热身了,
+    /// 而 prefill 族(FI/XQA 变体)只在第一个真请求里首次装载 ⇒ 首发
+    /// prefill 读数偏低(实测 615 vs 稳态 1113 t/s 的那条案;机制上属
+    /// “引擎自己造成的冷启动”,不是吞吐能力)。
+    ///
+    /// 口径:遍历**声明面单源** `owl_kernels::ops::all()`;
+    /// - 有资产(`cubins::asset(src).is_some()`)→ [`Self::ensure_kernel`];
+    /// - 无资产 → **计数跳过**(外族:FI/XQA/marlin-FFI 轮内面,主业是
+    ///   host 侧 C-FFI 调用,不在 AOT 直发表);
+    /// - 资产在场却装不上 → `Err`(真错:代际不匹配/符号缺失 ⇒ 拒启)。
+    ///
+    /// 返回 `(装载核数, 跳过核数)`。不可重入(自己置 `preload_done`,
+    /// 之后的模块装载会响亮标为“漏登”)。
+    pub(super) fn preload_all(
+        &mut self,
+        ctx: &Arc<CudaContext>,
+        sink: owl_shared::log::LogSink,
+    ) -> Result<(usize, usize), ModelError> {
+        let t0 = std::time::Instant::now();
+        let (mut loaded, mut skipped) = (0usize, 0usize);
+        for meta in owl_kernels::ops::all() {
+            if owl_kernels::family::cubins::asset(meta.src).is_none() {
+                skipped += 1;
+                continue;
+            }
+            self.ensure_kernel(ctx, meta.entry, meta.src, sink)?;
+            loaded += 1;
+        }
+        self.preload_done = true;
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+        sink.logf(
+            owl_shared::log::LVL_INFO,
+            "aot",
+            format_args!(
+                "算子预加载:{loaded} 个核 / {} 个模块(外族跳过 {skipped})@ {ms:.1}ms —— 首发票惰性装载已提前付",
+                self.modules.len()
+            ),
+        );
+        Ok((loaded, skipped))
     }
 
     /// 核取用:**构建期 cubin 资产唯一路径**(源哈希查表 → fatbin → 符号)。
@@ -2460,6 +2711,18 @@ impl KernelCache {
         let module = match self.modules.get(asset.module) {
             Some(m) => m.clone(),
             None => {
+                // 预加载后仍走惰性装载 = 声明面/发射面口径不一致(亮声;
+                // 不拒发 —— 资产在,核可用,只是预加载面漏了一行)
+                if self.preload_done {
+                    sink.logf(
+                        owl_shared::log::LVL_WARN,
+                        "aot",
+                        format_args!(
+                            "预加载后仍发生惰性模块装载:{name}(模块 {} —— 声明面漏登?)",
+                            asset.module
+                        ),
+                    );
+                }
                 // fatbin 载入:driver API 与纯 cubin 完全相同(多代际由驱动
                 // 按设备挑最匹配那份)
                 let m = ctx
@@ -2516,12 +2779,19 @@ impl Staging {
         // 字节口径(f16 基线,2026-09-26):n = 字节数,DMA 按 byte 计数
         let ptr = unsafe { malloc_host(n, 0) }
             .map_err(|e| ModelError::Msg(format!("malloc_host(n={n}B): {e:?}")))? as *mut u8;
-        // FIXME(2026-10-13):cudarc 的 `malloc_host` 对失败/零尺寸可能回 Ok(null)
-        // ——这里是裸 assert,拿不到任何上下文。先带上尺寸与原因(下同)。
-        assert!(
-            !ptr.is_null(),
-            "Staging::alloc[{label}]: malloc_host(n={n}B) 返回空指针(锁页内存耗尽?n=0 = 零长块写,上游形状错)"
-        );
+        // cudarc 的 `malloc_host` 对**失败/零尺寸**可能回 Ok(null)(2026-10-13 记录):
+        // 这是**可失败路径**,归 Result 面 —— 原为裸 assert(上下文足却把进程打死,
+        // 上层拿不到 OOM 归因面;C2 2026-10-17)。两种病因分开报。
+        if ptr.is_null() {
+            let why = if n == 0 {
+                "n=0(零长块写:上游形状错,不是内存不足)"
+            } else {
+                "锁页内存耗尽?(检查 ulimit -l / 并发 staging 数)"
+            };
+            return Err(ModelError::Msg(format!(
+                "Staging::alloc[{label}]: malloc_host(n={n}B) 返回空指针 —— {why}"
+            )));
+        }
         Ok(Self { ptr, len: n })
     }
 
@@ -2544,6 +2814,35 @@ impl Drop for Staging {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── VramGuard 估计函数(纯函数;2026-10-18 缓存化 `cuMemGetInfo`)──────
+
+    /// 估计 = 采样 free − live 增量;live 回退(释放)时不为负、不「涨回」。
+    #[test]
+    fn vram_guard_estimate_follows_live_growth() {
+        let t0 = std::time::Instant::now();
+        let sample = Some((t0, 1u64 << 30, 100u64 << 20)); // free=1GiB @ live=100MiB
+        // live +200MiB ⇒ est 少 200MiB
+        let (est, stale) = VramGuard::estimate_free(sample, 300 << 20, t0 + std::time::Duration::from_millis(100))
+            .expect("采样在场");
+        assert_eq!(est, (1u64 << 30) - (200u64 << 20));
+        assert!(!stale, "TTL 内不陈旧");
+        // live 回退 ⇒ grown 饱和为 0(估计不高于采样值:保守方向)
+        let (est2, _) = VramGuard::estimate_free(sample, 10 << 20, t0 + std::time::Duration::from_millis(100))
+            .expect("采样在场");
+        assert_eq!(est2, 1u64 << 30);
+    }
+
+    /// 无采样 = 必须真采;超 TTL = 必须真采(防外部进程漂移)。
+    #[test]
+    fn vram_guard_requires_fresh_sample() {
+        let t0 = std::time::Instant::now();
+        assert!(VramGuard::estimate_free(None, 0, t0).is_none(), "无采样");
+        let sample = Some((t0, 1u64 << 30, 0));
+        let (_, stale) = VramGuard::estimate_free(sample, 0, t0 + VramGuard::SAMPLE_TTL + std::time::Duration::from_millis(1))
+            .expect("采样在场");
+        assert!(stale, "超 TTL 必须重采");
+    }
 
     /// 跨账本 id 解析 ⇒ 结构化 CrossLedger 错(含 id + 两个 ledger 号)。
     /// 纯解码/断言,不触 CUDA(可在无卡环境跑)。

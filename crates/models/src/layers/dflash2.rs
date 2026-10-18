@@ -40,7 +40,10 @@ use crate::module::{ForwardCtx, KvBuffers, Module, QuantPlan, Weight};
 use crate::ops::SemanticKernel;
 use crate::TensorOps;
 
-// FIXME: 将来要支持其他dflash模型怎么办?
+// FIXME(挂账·非缺陷):下面这组常量是**检查点家族定形事实**(dflash_config 实测,
+// z-lab/Qwen3.8-27B-DFlash2),当前**硬編在层内**。要支持别的 DFlash 家族,
+// 需把它们从 `dflash_config` 读进 `VisionCfg` 式的配置结构(单一真源 + 装载期
+// 校验),而不是逐处改常量。台账:docs/arch/dflash2-施工方案.md(草稿家族一节)。
 // ---- 检查点家族定形常量(dflash_config 实测;z-lab/Qwen3.8-27B-DFlash2)----
 /// conv taps(conv_kernel_size)
 pub const TAPS: usize = 2;
@@ -119,10 +122,8 @@ impl GroupedConv {
     /// 一次卷积(side = 0 输入侧 / 1 输出侧;delta = prepare 产出的
     /// 系数投影 [T, 2·TAPS·G],side-major 布局同 sglang reshape 序)。
     fn conv(&self, x: &TensorOps, delta: &TensorOps, side: usize, ctx: &ForwardCtx) -> TensorOps {
-        let _ = ctx;
+        let _ = ctx; // 接口留白(与兄弟层同签名);conv 无 ctx 依赖
         let t = x.shape()[0];
-        let n = t * self.hidden;
-        let _ = n;
         TensorOps::call(match self.dt {
             Dtype::F16 => SemanticKernel::DflashConv,
             Dtype::BF16 => SemanticKernel::DflashConv,
@@ -862,17 +863,14 @@ impl DFlash2Draft {
         assert_eq!(kvs.len(), self.layers.len(), "草稿 KV 层数");
         // cast 边界①:embed 查表(f16 表,target 共享)→ 草稿主干入口(bf16)
         let mut x = ensure_dt(&embed.embed(tokens, BLOCK), self.dt);
-        let probe = probe_layers.is_some();
-        if probe {
-            probe_layers.as_mut().unwrap().push(x.clone().tag("probe.embed"));
+        // probe 不拆链(2026-10-17 审查):原先 `probe` 布尔 + `as_mut().unwrap()`
+        // 两处 —— "判据在场"由派生布尔维持,不是结构保证
+        if let Some(pl) = probe_layers.as_deref_mut() {
+            pl.push(x.clone().tag("probe.embed"));
         }
         let mut residual: Option<TensorOps> = None;
         for (i, layer) in self.layers.iter().enumerate() {
-            let layer_probe = if probe {
-                probe_layers.as_deref_mut()
-            } else {
-                None
-            };
+            let layer_probe = probe_layers.as_deref_mut();
             let (nx, res) = layer.forward(
                 &x,
                 residual.as_ref(),
@@ -885,12 +883,9 @@ impl DFlash2Draft {
                 layer_probe,
             );
             x = nx;
-            if probe {
+            if let Some(pl) = probe_layers.as_deref_mut() {
                 // 层出口和 = h2 + residual(可观测;add 纯节点)
-                probe_layers
-                    .as_mut()
-                    .unwrap()
-                    .push(x.add(&res).tag(format!("probe.L{i}")));
+                pl.push(x.add(&res).tag(format!("probe.L{i}")));
             }
             residual = Some(res);
         }
@@ -984,6 +979,7 @@ impl crate::module::Loadable for DfAttn {
 // ============================================================================
 #[cfg(test)]
 mod tests {
+    use owl_macros::owl_test;
     use super::*;
     use crate::module::{LoaderCtx, Loadable};
     use crate::testkit::{assert_close, f32b, gpu_client, gpu_enabled, harvest, harvest_bf16, harvest_f16};
@@ -1005,12 +1001,8 @@ mod tests {
 
     /// 金标 1:conv kernel vs host f32 参考(sglang _grouped_conv 逐式;
     /// prepare/finish 双侧,T=8 位置掩码语义)。
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_dflash_conv_matches_host() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         let (t, hidden, block) = (8usize, 64usize, 8usize);
         let groups = hidden / GROUP;
         let conv = GroupedConv::new(hidden, block, Dtype::F16);
@@ -1086,12 +1078,8 @@ mod tests {
 
     /// 金标 2:selector(lattice 打分 + 贪心 walk)vs host 参考。
     /// tiny 形状:vocab 97,rank 16(核参数化;K=16 烘焙 ≤ vocab 合法)。
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_dflash_selector_matches_host() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         let (vocab, rank, rows) = (97usize, 16usize, DEPTH);
         let sel = CandidateSelector::new(rank, vocab, rank, Dtype::F16); // hidden = rank(pred 维)
         let mut src: HashMap<String, Vec<f32>> = HashMap::new();
@@ -1232,12 +1220,8 @@ mod tests {
 
     /// 金标 3:fc 拆分消费面(reshape 重释 + slice_view)vs host 参考
     /// (Σ tap_i @ W_i^T;W 行主序 [hidden, fan] 列块)。
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_dflash_fc_split_matches_host() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         let (hidden, n) = (32usize, 4usize);
         let fan = n * hidden;
         let draft = DFlash2Draft::new(hidden, hidden, 2, 1, 16, n, 1e-6, 23, false);
@@ -1326,14 +1310,10 @@ mod tests {
     /// 金标 = tools/dflash2_golden.py(torch f32,sglang 逐式)存
     /// testdata/dflash2_golden.safetensors。同输入(公式 E/LM/taps/ids)、
     /// 同权重(marlin 装载)—— 逐层定位首个发散算子。
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_dflash2_golden_matches() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
-        let Some(dir) = owl_shared::env_reader::str("OWL_DFLASH2_DIR") else {
-            eprintln!("skip: OWL_DFLASH2_DIR 未设");
+        let Some(dir) = owl_shared::testkit::resource("ckpt:dflash2") else {
+            eprintln!("skip: ckpt:dflash2 未设");
             return;
         };
         use crate::module::{LoaderCtx, Loadable};
@@ -1689,14 +1669,10 @@ mod tests {
     /// 2026-10-07 引擎缺列案的混淆变量切分:引擎 fc m=18,golden 测试
     /// m=20/19/8 —— 若本进程 m=18 也缺列则为 marlin m 病(非进程态);
     /// 参考 = m=20 输出的前 m' 行(marlin 确定性,同权重同输入行)。
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_dflash2_fc_m_sweep() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
-        let Some(dir) = owl_shared::env_reader::str("OWL_DFLASH2_DIR") else {
-            eprintln!("skip: OWL_DFLASH2_DIR 未设");
+        let Some(dir) = owl_shared::testkit::resource("ckpt:dflash2") else {
+            eprintln!("skip: ckpt:dflash2 未设");
             return;
         };
         use crate::module::LoaderCtx;
@@ -1951,12 +1927,8 @@ mod tests {
     /// 金标 4:草稿 KV 写-读往返(K0 write classic 布局 → NC attention
     /// 读)vs host 参考(读回 classic 池解包重算注意力)—— 布局一致性
     /// 与 norm_rope plain 寻址一锤定音。
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_dflash_nc_attn_roundtrip() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         let (hq, hkv, hd, hidden) = (4usize, 2usize, 16usize, 32usize);
         let eps = 1e-6f32;
         let attn = DfAttn::new(hq, hkv, hd, hidden, eps, QuantPlan::F16, Dtype::F16, false);
@@ -2248,12 +2220,8 @@ mod tests {
     /// ① conv bf16 vs host f32 参考(权重经 f32→bf16 装载);② cast
     /// f16→bf16→f16 往返(f16 值域内零损失);③ select bf16(proj/码本
     /// bf16)与 f16 版同 tok 序。用例容差按 bf16 尾数 7~8 位放行。
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_dflash_bf16_smoke() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         let mut gpu = gpu_client().await;
 
         // ---- ① conv bf16(全 bf16:x/delta/base/out;proj 线性 bf16 want)----
@@ -2440,8 +2408,8 @@ mod tests {
             eprintln!("skip: OWL_TEST_DEVICE 未设");
             return Ok(());
         }
-        let Some(dir) = owl_shared::env_reader::str("OWL_DFLASH2_DIR") else {
-            eprintln!("skip: OWL_DFLASH2_DIR 未设");
+        let Some(dir) = owl_shared::testkit::resource("ckpt:dflash2") else {
+            eprintln!("skip: ckpt:dflash2 未设");
             return Ok(());
         };
         use crate::module::LoaderCtx;

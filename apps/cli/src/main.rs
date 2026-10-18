@@ -94,9 +94,18 @@ fn main() {
         print!("\n你› ");
         io::stdout().flush().ok();
         let mut line = String::new();
-        if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 {
-            eprintln!("\n[cli] EOF,退出");
-            break;
+        // 判据(2026-10-17 审查 §三轮-C6):**区分 EOF 与真 I/O 错误** ——
+        // 原先 `unwrap_or(0)` 把读失败一律报成 "EOF,退出"(假现场)
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) => {
+                eprintln!("\n[cli] EOF,退出");
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("\n[cli] 读 stdin 失败: {e}");
+                break;
+            }
         }
         match line.trim() {
             "" => continue,
@@ -126,7 +135,7 @@ fn main() {
                            "max_tokens": cfg.max_tokens, "session": session}),
         };
         match chat_stream(&cfg.host, &body) {
-            Ok(text) => history.push(json!({"role": "assistant", "content": text})),
+            Ok((text, _usage)) => history.push(json!({"role": "assistant", "content": text})),
             Err(e) => {
                 eprintln!("\n[cli] 请求失败: {e}");
                 history.pop(); // 失败轮不入历史,可重发
@@ -154,7 +163,7 @@ fn get_health(host: &str) -> std::io::Result<String> {
 
 /// POST /v1/chat/completions(stream):逐 delta 流式渲染,回吐全文。
 /// 统计:TTFT 首 chunk / chunk 数 / 总耗时(引擎事件即 token 粒度)
-fn chat_stream(host: &str, body: &Value) -> std::io::Result<String> {
+fn chat_stream(host: &str, body: &Value) -> std::io::Result<(String, Option<u64>)> {
     let payload = body.to_string();
     let mut stream = connect(host)?;
     let req = format!(
@@ -183,6 +192,9 @@ fn chat_stream(host: &str, body: &Value) -> std::io::Result<String> {
     let t0 = Instant::now();
     let mut ttft = None;
     let (mut out, mut ntok) = (String::new(), 0usize);
+    // 引擎真账:`usage.completion_tokens`(**禁止**用 SSE chunk 数当 token 数 ——
+    // 合并 chunk 会低估 2.1 倍;测量方法论 §1)
+    let mut usage: Option<u64> = None;
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).unwrap_or(0) == 0 {
@@ -197,6 +209,13 @@ fn chat_stream(host: &str, body: &Value) -> std::io::Result<String> {
         let Ok(v) = serde_json::from_str::<Value>(data) else {
             continue;
         };
+        if let Some(u) = v
+            .get("usage")
+            .and_then(|u| u.get("completion_tokens"))
+            .and_then(|n| n.as_u64())
+        {
+            usage = Some(u);
+        }
         if let Some(err) = v.get("error") {
             eprintln!("\n[cli] 流内错误: {err}");
             break;
@@ -217,13 +236,18 @@ fn chat_stream(host: &str, body: &Value) -> std::io::Result<String> {
     let total = t0.elapsed();
     let tpot = if ntok > 0 { total.as_millis() / ntok as u128 } else { 0 };
     eprintln!(
-        "\n[stat] TTFT {:?} | {} chunks | 总 {:.2}s | {:?}/chunk",
+        "\n[stat] TTFT {:?} | {} chunks | 总 {:.2}s | {:?}/chunk{}",
         ttft.unwrap_or(total),
         ntok,
         total.as_secs_f32(),
-        tpot
+        tpot,
+        match usage {
+            // 真账在场就并排给(与 chunk 数并列 ⇒ 一眼看出合并率)
+            Some(u) => format!(" | usage.completion_tokens = {u}(chunk 数仅供参考)"),
+            None => " | usage.completion_tokens = 未上报".to_string(),
+        }
     );
-    Ok(out)
+    Ok((out, usage))
 }
 
 fn connect(host: &str) -> io::Result<TcpStream> {

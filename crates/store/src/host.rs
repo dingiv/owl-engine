@@ -1,0 +1,409 @@
+//! 宿主层(vLLM 式 CPU 卸载层的形态):**页可换出的宿主存储 + 有界池**。
+//!
+//! 三条形态律(对齐 vLLM 的 CPU KV cache):
+//! 1. **宿主内容不 pin**(pageable `Vec<u8>`):pin 只用在*搬运途中*的暂存租约上
+//!    (vLLM 同款:CPU cache 是普通内存,传输走 pinned staging)⇒ RAM 可被内核回收/换出;
+//! 2. **容量显式有界**(`budget_bytes`,0 = 关层):越界 = **响亮拒**,
+//!    由驱逐序(策略对象)决定谁先让位 —— 不许悄悄超发(C4 风险条款);
+//! 3. **缓冲复用**:小块池(free list)吸收 churn;`evict` 真的把内容还掉
+//!    (超出 `free_cap` 的缓冲直接 drop ⇒ RAM 真释放,不留影)。
+//!
+//! 本文件只做**账与容器**(方法自肃);真搬运(`dtoh`/`upload_pinned`)在
+//! [`crate::moves`] 的自由函数里 —— 见 `arch.md` 律⑦。
+
+use std::collections::BTreeMap;
+
+use owl_iface::contract::{ConnSlot, Connector, ModelError};
+
+use crate::error::{StoreError, StoreResult};
+use crate::id::ChainHash;
+
+/// 宿主层的一块存储(pageable;大小 = 逻辑块字节)。
+#[derive(Debug)]
+pub struct HostBlock {
+    bytes: Vec<u8>,
+}
+
+impl HostBlock {
+    /// 零填构造(大小 = 逻辑块字节)。
+    pub fn zeroed(len: usize) -> Self {
+        Self { bytes: vec![0u8; len] }
+    }
+
+    /// 字节数。
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// 是否空块。
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// 只读字节面。
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// 可写字节面(搬运的落地口)。
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.bytes
+    }
+}
+
+/// 宿主层(有界 + 可驱逐 + 缓冲复用)。`free_cap` = 空转缓冲保留上限。
+///
+/// **键泛型**(S2):KV 腿按 `ChainHash`(内容身份)驻留,状态腿按 [`SnapKey`]
+/// (块边界身份)—— 两腿各自一本账,键类型把"混用"挡在类型上。
+#[derive(Debug)]
+pub struct HostTier<K = ChainHash> {
+    block_bytes: usize,
+    budget_bytes: usize,
+    free_cap: usize,
+    resident: BTreeMap<K, HostBlock>,
+    free: Vec<HostBlock>,
+    /// 因容量驱逐而累计释放的字节(报告面)。
+    evicted_bytes: u64,
+}
+
+/// 宿主层键(可寻址 + 可打印)。
+pub trait HostKey: Ord + Copy + std::fmt::Debug {}
+impl HostKey for ChainHash {}
+impl HostKey for crate::id::SnapKey {}
+
+/// 空转缓冲默认保留上限(块数)。
+const DEFAULT_FREE_CAP: usize = 4;
+
+impl<K: HostKey> HostTier<K> {
+    /// 构造。`budget_bytes = 0` = **关层**(任何落位都拒)。
+    pub fn new(block_bytes: usize, budget_bytes: usize) -> StoreResult<Self> {
+        if block_bytes == 0 {
+            return Err(StoreError::Invariant("宿主层块字节为 0".into()));
+        }
+        if budget_bytes != 0 && budget_bytes < block_bytes {
+            return Err(StoreError::Budget(format!(
+                "宿主层预算 {budget_bytes} 装不下单块 {block_bytes}(按块粒度对齐)"
+            )));
+        }
+        Ok(Self {
+            block_bytes,
+            budget_bytes,
+            free_cap: DEFAULT_FREE_CAP,
+            resident: BTreeMap::new(),
+            free: Vec::new(),
+            evicted_bytes: 0,
+        })
+    }
+
+    /// 单块字节。
+    pub fn block_bytes(&self) -> usize {
+        self.block_bytes
+    }
+
+    /// 本层上限(0 = 关层)。
+    pub fn budget_bytes(&self) -> usize {
+        self.budget_bytes
+    }
+
+    /// 是否关层。
+    pub fn is_disabled(&self) -> bool {
+        self.budget_bytes == 0
+    }
+
+    /// 取一块空缓冲(优先复用;新建时**先判预算** —— 超界响亮拒)。
+    pub fn acquire(&mut self) -> StoreResult<HostBlock> {
+        if let Some(b) = self.free.pop() {
+            return Ok(b);
+        }
+        if self.is_disabled() {
+            return Err(StoreError::Exhausted("宿主层已关闭(host_bytes = 0)".into()));
+        }
+        let after = self.used_bytes() + self.free_bytes() + self.block_bytes;
+        if after > self.budget_bytes {
+            return Err(StoreError::Exhausted(format!(
+                "宿主层越界:{after} > {}(关层请置 0,放量请调大 host_bytes)",
+                self.budget_bytes
+            )));
+        }
+        Ok(HostBlock::zeroed(self.block_bytes))
+    }
+
+    /// **借一批空槽**(swap 命令的台子;§15)。
+    ///
+    /// 预算检查逐块走 [`Self::acquire`] ⇒ 中途越界 = 已借出的缓冲回小块池
+    /// (**不留半台**),错误上抛。
+    pub fn lend_slots(&mut self, n: usize) -> StoreResult<Vec<HostBlock>> {
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            match self.acquire() {
+                Ok(b) => out.push(b),
+                Err(e) => {
+                    self.recycle_many(out);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// **批量落账**(命令回执后:内容已写好,装回驻留表)。
+    /// 逐项校验(大小/重复/预算);任一失败即停并上抛(已落的项保留 ——
+    /// 内容不丢,调用方据错回滚剩余部分)。
+    pub fn land(&mut self, items: Vec<(K, HostBlock)>) -> StoreResult<()> {
+        for (chain, buf) in items {
+            self.put(chain, buf)?;
+        }
+        Ok(())
+    }
+
+    /// **批量回收空转缓冲**(换入后内容已上行;超 `free_cap` 的真释放)。
+    pub fn recycle_many(&mut self, bufs: Vec<HostBlock>) {
+        for b in bufs {
+            self.recycle(b);
+        }
+    }
+
+    /// 登记驻留(内容落到宿主层)。
+    pub fn put(&mut self, block: K, buf: HostBlock) -> StoreResult<()> {
+        if buf.len() != self.block_bytes {
+            return Err(StoreError::Invariant(format!(
+                "宿主块大小不符:{} ≠ {}",
+                buf.len(),
+                self.block_bytes
+            )));
+        }
+        if self.resident.contains_key(&block) {
+            return Err(StoreError::Invariant(format!("块 {block:?} 已在宿主层")));
+        }
+        let after = self.used_bytes() + self.block_bytes;
+        if self.budget_bytes != 0 && after > self.budget_bytes {
+            return Err(StoreError::Exhausted(format!(
+                "宿主层越界:{after} > {}(需先驱逐)",
+                self.budget_bytes
+            )));
+        }
+        self.resident.insert(block, buf);
+        Ok(())
+    }
+
+    /// 取走驻留内容(回灌设备时用;缓冲所有权移出,由调用方决定复用或释放)。
+    pub fn take(&mut self, block: K) -> StoreResult<HostBlock> {
+        self.resident
+            .remove(&block)
+            .ok_or_else(|| StoreError::Unknown(format!("块 {block:?} 不在宿主层")))
+    }
+
+    /// 只读查看。
+    pub fn get(&self, block: K) -> Option<&HostBlock> {
+        self.resident.get(&block)
+    }
+
+    /// 驱逐(内容丢弃;缓冲回小块池,超上限则真释放)。
+    pub fn evict(&mut self, block: K) -> StoreResult<usize> {
+        let buf = self
+            .resident
+            .remove(&block)
+            .ok_or_else(|| StoreError::Unknown(format!("块 {block:?} 不在宿主层")))?;
+        let bytes = buf.len();
+        self.evicted_bytes += bytes as u64;
+        self.recycle(buf);
+        Ok(bytes)
+    }
+
+    /// 驻留块号(驱逐序输入;调用方按策略排序)。
+    pub fn resident_blocks(&self) -> Vec<K> {
+        self.resident.keys().copied().collect()
+    }
+
+    /// 驻留内容字节。
+    pub fn used_bytes(&self) -> usize {
+        self.resident.len() * self.block_bytes
+    }
+
+    /// 空转缓冲字节(真实占用的 RAM,报告面要算上)。
+    pub fn free_bytes(&self) -> usize {
+        self.free.len() * self.block_bytes
+    }
+
+    /// 驱逐累计字节。
+    pub fn evicted_bytes(&self) -> u64 {
+        self.evicted_bytes
+    }
+
+    fn recycle(&mut self, buf: HostBlock) {
+        if self.free.len() < self.free_cap {
+            self.free.push(buf);
+        }
+        // 超出上限:drop ⇒ 真释放
+    }
+}
+
+// ─────────────────── 搬运期槽台(§15 swap 的 Connector) ───────────────────
+
+/// **搬运期的槽台**(设计卷 §15):一块逻辑块 = 一个槽(连续 `slot_bytes`)。
+///
+/// 生命周期:store 建台(借空缓冲)→ 随 `swap` 命令**移入** server(server 按
+/// 槽号 + 槽内偏移逐片读写)→ 回执**原箱奉还** → store 拆台(`HostTier::land`
+/// 落账,或 `recycle_many` 回收)。
+///
+/// **单主零锁**:命令期间台子的所有权在 server(无共享、无 `Mutex`);
+/// **层级知识不外泄** —— server 只看见 [`Connector`] 三件(put/get/tier_name)。
+///
+/// 为什么台子不借自 `HostTier` 本身:宿主层是常驻账(驻留表 + 预算 + LRU),
+/// 而台子是**一次命令的视图** —— 两者生命周期不同,拆开才便于「命令进行中
+/// 宿主账不动」这条审计。
+pub struct SlotTable {
+    slots: Vec<HostBlock>,
+}
+
+impl SlotTable {
+    /// 建台(槽号 = 入参顺序)。
+    pub fn new(slots: Vec<HostBlock>) -> Self {
+        Self { slots }
+    }
+
+    /// 单槽台(单块搬运)。
+    pub fn one(buf: HostBlock) -> Self {
+        Self { slots: vec![buf] }
+    }
+
+    /// 槽数。
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// 是否空台。
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// 拆台取回缓冲(顺序 = 槽号序)。
+    pub fn into_slots(self) -> Vec<HostBlock> {
+        self.slots
+    }
+
+    /// 槽号 → 缓冲(诊断/测试面)。
+    pub fn slot(&self, slot: ConnSlot) -> Option<&HostBlock> {
+        self.slots.get(slot.0 as usize)
+    }
+
+    /// 片窗口(统一越界/溢出检查 —— put/get 同一条口径)。
+    fn window(&self, slot: ConnSlot, off: usize, len: usize) -> Result<std::ops::Range<usize>, ModelError> {
+        let i = slot.0 as usize;
+        let n = self.slots.len();
+        let buf = self
+            .slots
+            .get(i)
+            .ok_or_else(|| ModelError::Msg(format!("槽台越界:槽 {i} ≥ 台面 {n} 槽")))?;
+        let end = off
+            .checked_add(len)
+            .ok_or_else(|| ModelError::Msg(format!("槽 {i} 偏移溢出:{off}+{len}")))?;
+        if end > buf.len() {
+            return Err(ModelError::Msg(format!(
+                "槽 {i} 越界:{off}+{len} > 槽字节 {}",
+                buf.len()
+            )));
+        }
+        Ok(off..end)
+    }
+}
+
+impl Connector for SlotTable {
+    fn put(&mut self, slot: ConnSlot, off: usize, bytes: &[u8]) -> Result<(), ModelError> {
+        let r = self.window(slot, off, bytes.len())?;
+        let i = slot.0 as usize;
+        let buf = self.slots.get_mut(i).expect("window 刚验过");
+        buf.as_mut_slice()[r].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    fn get(&self, slot: ConnSlot, off: usize, out: &mut [u8]) -> Result<(), ModelError> {
+        let r = self.window(slot, off, out.len())?;
+        let buf = self.slots.get(slot.0 as usize).expect("window 刚验过");
+        out.copy_from_slice(&buf.as_slice()[r]);
+        Ok(())
+    }
+
+    fn tier_name(&self) -> &'static str {
+        "ram"
+    }
+
+    fn unbox(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disabled_tier_rejects_loudly() {
+        let mut t: HostTier = HostTier::new(1024, 0).expect("构造");
+        assert!(t.is_disabled());
+        let err = t.acquire().expect_err("关层必须拒");
+        assert!(matches!(err, StoreError::Exhausted(_)), "得 {err:?}");
+    }
+
+    /// 槽台:越界/溢出必须**响亮拒**(不静默截断);多槽按号各就各位。
+    #[test]
+    fn slot_table_is_bounds_checked_and_addressed_by_slot() {
+        let mut t = SlotTable::new(vec![HostBlock::zeroed(16), HostBlock::zeroed(16)]);
+        t.put(ConnSlot(1), 4, &[7u8; 8]).expect("写槽 1");
+        let mut out = [0u8; 8];
+        t.get(ConnSlot(1), 4, &mut out).expect("读槽 1");
+        assert_eq!(out, [7u8; 8]);
+        let mut zero = [9u8; 8];
+        t.get(ConnSlot(0), 4, &mut zero).expect("读槽 0");
+        assert_eq!(zero, [0u8; 8], "槽 0 未被写");
+        assert!(matches!(t.put(ConnSlot(2), 0, &[0u8; 4]), Err(ModelError::Msg(_))), "槽号越界");
+        assert!(matches!(t.put(ConnSlot(0), 12, &[0u8; 8]), Err(ModelError::Msg(_))), "槽内越界");
+        assert!(matches!(t.get(ConnSlot(0), usize::MAX, &mut [0u8; 4]), Err(ModelError::Msg(_))), "偏移溢出");
+        assert_eq!(t.tier_name(), "ram");
+    }
+
+    #[test]
+    fn budget_is_enforced_and_content_can_be_evicted() {
+        let mut t: HostTier = HostTier::new(1024, 2048).expect("构造");
+        let a = t.acquire().expect("块 A");
+        let b = t.acquire().expect("块 B");
+        t.put(ChainHash::new(1), a).expect("驻留 A");
+        t.put(ChainHash::new(2), b).expect("驻留 B");
+        assert_eq!(t.used_bytes(), 2048);
+        // 第三块:预算满 ⇒ 响亮拒(必须先驱逐)
+        assert!(matches!(t.acquire(), Err(StoreError::Exhausted(_))));
+        // 驱逐一块 ⇒ 有位置了
+        let freed = t.evict(ChainHash::new(1)).expect("驱逐");
+        assert_eq!(freed, 1024);
+        assert_eq!(t.used_bytes(), 1024);
+        assert_eq!(t.free_bytes(), 1024, "缓冲进小块池(可复用)");
+        assert_eq!(t.evicted_bytes(), 1024);
+        let c = t.acquire().expect("复用小块池");
+        t.put(ChainHash::new(3), c).expect("驻留 C");
+        assert_eq!(t.resident_blocks(), vec![ChainHash::new(2), ChainHash::new(3)]);
+    }
+
+    #[test]
+    fn free_list_is_capped_so_ram_is_really_returned() {
+        let mut t: HostTier = HostTier::new(512, 64 * 1024).expect("构造");
+        for i in 0..32u64 {
+            let b = t.acquire().expect("块");
+            t.put(ChainHash::new(i), b).expect("驻留");
+        }
+        for i in 0..32u64 {
+            t.evict(ChainHash::new(i)).expect("驱逐");
+        }
+        assert!(t.free_bytes() <= DEFAULT_FREE_CAP * 512, "小块池必须有上限");
+        assert_eq!(t.used_bytes(), 0);
+    }
+
+    #[test]
+    fn double_put_and_unknown_take_are_loud() {
+        let mut t: HostTier = HostTier::new(256, 4096).expect("构造");
+        let b = t.acquire().expect("块");
+        t.put(ChainHash::new(9), b).expect("驻留");
+        let b2 = t.acquire().expect("块");
+        assert!(matches!(t.put(ChainHash::new(9), b2), Err(StoreError::Invariant(_))));
+        assert!(matches!(t.take(ChainHash::new(77)), Err(StoreError::Unknown(_))));
+    }
+}

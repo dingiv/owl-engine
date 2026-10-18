@@ -582,7 +582,18 @@ impl GatedDeltaNet {
         // nsys 定谳);gemv_dual 权重 0.5MB×2 全在 L2,T≤16 的读放大
         // 无痛。T>16 保持 cublas(真 GEMM 区)。
         let (b, a) = if tokens <= 16 {
-            let hidden_gdn = xs.shape().last().cloned().unwrap_or(0);
+            // 形状律:xs = [T, hidden](空形状 = 声明失守 ⇒ **毒化**,
+            // 原 `unwrap_or(0)` 会把 cols=0 交给核 = 静默错值;2026-10-17 审查)
+            let hidden_gdn = match xs.shape().last() {
+                Some(h) => *h,
+                None => {
+                    return TensorOps::poisoned(
+                        xs.dtype,
+                        xs.shape().to_vec(),
+                        "gdn: xs 形状为空(需 [T, hidden])",
+                    )
+                }
+            };
             let ba = TensorOps::call(SemanticKernel::GemvDual)
                 .arg(&self.in_proj_b.weight_decl()) // [HV, hidden] f16
                 .arg(&self.in_proj_a.weight_decl()) // [HV, hidden] f16
@@ -909,7 +920,18 @@ impl GatedDeltaNet {
         // Linear/cublas。输出 [T, 2·HV] 行堆叠,T=1 时列切 = 连续切片 →
         // BlockSlice 免费视图(刀1))。
         let (b, a) = if xs.dtype == Dtype::F16 {
-            let hidden_gdn = xs.shape().last().cloned().unwrap_or(0);
+            // 形状律:xs = [T, hidden](空形状 = 声明失守 ⇒ **毒化**,
+            // 原 `unwrap_or(0)` 会把 cols=0 交给核 = 静默错值;2026-10-17 审查)
+            let hidden_gdn = match xs.shape().last() {
+                Some(h) => *h,
+                None => {
+                    return TensorOps::poisoned(
+                        xs.dtype,
+                        xs.shape().to_vec(),
+                        "gdn: xs 形状为空(需 [T, hidden])",
+                    )
+                }
+            };
             let ba = TensorOps::call(SemanticKernel::GemvDual)
                 .arg(&self.in_proj_b.weight_decl()) // [HV, hidden] f16
                 .arg(&self.in_proj_a.weight_decl()) // [HV, hidden] f16
@@ -1103,7 +1125,8 @@ pub mod fixture {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::{f32b, harvest, harvest_f16, gpu_client, gpu_enabled};
+    use crate::testkit::{f32b, harvest, harvest_f16, gpu_client};
+    use owl_macros::owl_test;
 
     /// host 参考(g 臂;与核同式独立副本)
     #[allow(dead_code)] // 门控测试辅助(host 参考门 / 其 GPU 对拍门现未注册 test)
@@ -1147,12 +1170,8 @@ mod tests {
     /// D1 融合核 GPU vs host(v-conv + l2norm×2 + gating + sigmoid + delta +
     /// norm_act 六算子全链独立副本;q/k conv 产物以 f16 域给定;两步 +
     /// padding 槽;state 跨步持久。门控 OWL_TEST_DEVICE)
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_decode_step_fused_matches_host() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         decode_step_fused_case(false).await; // D1 v1(列并行 4B 装载)
         decode_step_fused_case(true).await; // D1-v2(float4 行组合并装载;sglang 刺探产物)
     }
@@ -1366,12 +1385,8 @@ mod tests {
         }
     }
 
-    #[allow(dead_code)] // 待注册的 GPU 对拍门(现无 #[tokio::test] 属性)
+    #[owl_test(gpu)]
     async fn gpu_gating_g_matches_host() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         let (tokens, heads) = (5usize, 4usize);
         let (a_log, a, dt) = slots(tokens * heads, heads);
 
@@ -1391,13 +1406,9 @@ mod tests {
     }
 
     /// HF golden(g + beta 双臂;门控 OWL_HF_PARITY=1,另需 OWL_TEST_DEVICE)
-    #[tokio::test]
+    #[owl_test(gpu, hf_parity)]
     async fn hf_parity_gating() {
-        use crate::testkit::{assert_close, gpu_enabled, hf_python, parity_enabled, skip_note, st_read, st_write, tmp_path};
-        if !parity_enabled() {
-            skip_note();
-            return;
-        }
+        use crate::testkit::{assert_close, hf_python, st_read, st_write, tmp_path};
         let (tokens, heads) = (4usize, 2usize);
         let (a_log, a, dt) = slots(tokens * heads, heads);
         let b: Vec<f32> = (0..tokens * heads).map(|i| ((i as f32 * 0.23) - 1.5).cos() * 2.0).collect();
@@ -1418,8 +1429,6 @@ mod tests {
         eprintln!("[hf manifest] gdn gating: {manifest}");
         let want_g = st_read(&outp, "g");
         let want_beta = st_read(&outp, "beta");
-
-        assert!(gpu_enabled(), "gdn gating HF parity 需 OWL_TEST_DEVICE(kernel 节点 GPU-only)");
         let mut gpu = gpu_client().await;
         let g_decl = gating_g(
             &TensorOps::from_host(Dtype::F32, vec![heads], &f32b(&a_log)),
@@ -1464,12 +1473,8 @@ mod tests {
     }
 
     /// GPU vs host + 单位范数性质(门控 OWL_TEST_DEVICE)
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_l2norm_matches_host() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         let (rows, dim) = (6usize, 16usize);
         let x: Vec<f32> = (0..rows * dim).map(|i| ((i as f32 * 0.19) - 2.5).sin() * 3.0).collect();
 
@@ -1492,13 +1497,9 @@ mod tests {
     }
 
     /// HF golden(门控 OWL_HF_PARITY=1,另需 OWL_TEST_DEVICE)
-    #[tokio::test]
+    #[owl_test(gpu, hf_parity)]
     async fn hf_parity_l2norm() {
-        use crate::testkit::{assert_close, gpu_enabled, hf_python, parity_enabled, skip_note, st_read, st_write, tmp_path};
-        if !parity_enabled() {
-            skip_note();
-            return;
-        }
+        use crate::testkit::{assert_close, hf_python, st_read, st_write, tmp_path};
         let (rows, dim) = (5usize, 8usize);
         let x: Vec<f32> = (0..rows * dim).map(|i| ((i as f32 * 0.29) - 1.8).cos() * 2.5).collect();
 
@@ -1509,8 +1510,6 @@ mod tests {
         let manifest = hf_python("gdn.py", &[inp.to_str().unwrap(), outp.to_str().unwrap(), &contract]);
         eprintln!("[hf manifest] gdn l2norm: {manifest}");
         let want = st_read(&outp, "y");
-
-        assert!(gpu_enabled(), "gdn l2norm HF parity 需 OWL_TEST_DEVICE");
         let mut gpu = gpu_client().await;
         let decl = l2norm(
             &TensorOps::from_host(Dtype::F32, vec![rows, dim], &f32b(&x)),
@@ -1560,12 +1559,8 @@ mod tests {
     }
 
     /// GPU vs host:两步跨槽(state 持久)+ padding 行(门控 OWL_TEST_DEVICE)
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_conv_upd_matches_host() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         use crate::contract::DeviceClient;
         let (max_slots, dim) = (8usize, 12usize);
         let w: Vec<f32> = (0..dim * 4).map(|i| (i as f32 * 0.13) - 0.7).collect();
@@ -1621,15 +1616,10 @@ mod tests {
     // ======================================================================
 
     /// HF golden conv_upd(门控 OWL_HF_PARITY=1 + OWL_TEST_DEVICE)
-    #[tokio::test]
+    #[owl_test(gpu, hf_parity)]
     async fn hf_parity_conv_upd() {
         use crate::contract::DeviceClient;
-        use crate::testkit::{assert_close, gpu_enabled, hf_python, parity_enabled, skip_note, st_read, st_write, tmp_path};
-        if !parity_enabled() {
-            skip_note();
-            return;
-        }
-        assert!(gpu_enabled(), "conv_upd HF parity 需 OWL_TEST_DEVICE");
+        use crate::testkit::{assert_close, hf_python, st_read, st_write, tmp_path};
         let (max_slots, dim, batch) = (4usize, 6usize, 3usize);
         let x: Vec<f32> = (0..batch * dim).map(|i| ((i as f32 * 0.21) - 1.0).sin()).collect();
         let w: Vec<f32> = (0..dim * 4).map(|i| (i as f32 * 0.11) - 0.5).collect();
@@ -1720,12 +1710,8 @@ mod tests {
     }
 
     /// GPU vs host:GQA(kv_group=2)+ 跨步 + padding + state 终态(门控 OWL_TEST_DEVICE)
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_delta_dec_matches_host() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         use crate::contract::DeviceClient;
         let (max_slots, nv, nk, kd, vd) = (8usize, 4usize, 2usize, 8usize, 16usize);
         let gen = |n: usize, seed: f32| (0..n).map(|i| ((i as f32 + seed) * 0.17).sin() * 0.8).collect::<Vec<f32>>();
@@ -1781,15 +1767,10 @@ mod tests {
 
     /// HF golden(torch_recurrent_gated_delta_rule 直跑;out + state;
     /// 门控 OWL_HF_PARITY=1 + OWL_TEST_DEVICE)
-    #[tokio::test]
+    #[owl_test(gpu, hf_parity)]
     async fn hf_parity_delta_dec() {
         use crate::contract::DeviceClient;
-        use crate::testkit::{assert_close, gpu_enabled, hf_python, parity_enabled, skip_note, st_read, st_write, tmp_path};
-        if !parity_enabled() {
-            skip_note();
-            return;
-        }
-        assert!(gpu_enabled(), "delta_dec HF parity 需 OWL_TEST_DEVICE");
+        use crate::testkit::{assert_close, hf_python, st_read, st_write, tmp_path};
         let (max_slots, nv, nk, kd, vd) = (4usize, 2usize, 2usize, 4usize, 4usize);
         let batch = 2usize;
         let gen = |n: usize, seed: f32| (0..n).map(|i| ((i as f32 + seed) * 0.23).cos() * 0.7).collect::<Vec<f32>>();
@@ -1868,12 +1849,8 @@ mod tests {
     }
 
     /// GPU vs host(门控 OWL_TEST_DEVICE)
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_norm_act_matches_host() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         let (rows, vd, gs) = (4usize, 12usize, 4usize);
         let x: Vec<f32> = (0..rows * vd).map(|i| ((i as f32 * 0.31) - 2.0).sin() * 2.0).collect();
         let z: Vec<f32> = (0..rows * vd).map(|i| ((i as f32 * 0.13) - 0.5).cos() * 1.5).collect();
@@ -1894,14 +1871,9 @@ mod tests {
     }
 
     /// HF golden(Qwen3_5RMSNormGated 直跑;门控 OWL_HF_PARITY=1 + OWL_TEST_DEVICE)
-    #[tokio::test]
+    #[owl_test(gpu, hf_parity)]
     async fn hf_parity_norm_act() {
-        use crate::testkit::{assert_close, gpu_enabled, hf_python, parity_enabled, skip_note, st_read, st_write, tmp_path};
-        if !parity_enabled() {
-            skip_note();
-            return;
-        }
-        assert!(gpu_enabled(), "norm_act HF parity 需 OWL_TEST_DEVICE");
+        use crate::testkit::{assert_close, hf_python, st_read, st_write, tmp_path};
         let (rows, vd, gs) = (3usize, 8usize, 4usize);
         let x: Vec<f32> = (0..rows * vd).map(|i| ((i as f32 * 0.27) - 1.2).sin() * 2.2).collect();
         let z: Vec<f32> = (0..rows * vd).map(|i| ((i as f32 * 0.41) - 0.7).cos() * 1.8).collect();
@@ -2108,12 +2080,8 @@ mod tests {
     }
 
     /// GPU 全链两步 decode vs host(门控 OWL_TEST_DEVICE)
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_layer_decode_matches_host() {
-        if !crate::testkit::gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         let max_slots = 4usize;
         let (key_dim, value_dim) = (NK * HK_DIM, NV * HV_DIM);
         let src = weight_src();
@@ -2168,15 +2136,12 @@ mod tests {
 mod f16_tests {
     use super::*;
     use crate::contract::DeviceClient as _;
-    use crate::testkit::{gpu_client, gpu_enabled};
+    use crate::testkit::gpu_client;
+    use owl_macros::owl_test;
     use crate::tensor::Dtype;
     /// 批P1:concat_rows 核对拍(位型拷贝,期望逐位相等)
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_concat_rows_matches_host() {
-        if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         let (n, r, d) = (3usize, 2usize, 4usize);
         let ins: Vec<Vec<f32>> = (0..n)
             .map(|k| (0..r * d).map(|i| ((k * 100 + i) as f32) * 0.25 - 1.0).collect())
@@ -2267,9 +2232,8 @@ mod f16_tests {
 
     /// 批P3 验收:T=8 prefill 块 == T×decode 逐步(输出 + conv/rec 终态;
     /// 语义定义 = pf1-port-design §二 2.2)
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_gdn_prefill_block_matches_token_loop() {
-        if !gpu_enabled() { eprintln!("skip"); return; }
         let (nk, hkd, nv, hvd, hidden) = (2usize, 4usize, 2usize, 4usize, 6usize);
         let t_len = 8usize;
         let slot = 2.0f32;
@@ -2343,9 +2307,8 @@ mod f16_tests {
 
     /// 批P3(f32 锚链变体):模型 fixture 走 f32 链 —— 展开的 f32 核路
     /// 同样必须满足「块 == 逐步」(f16 变体已证,此处证 dtype 路由)
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_gdn_prefill_block_matches_token_loop_f32() {
-        if !gpu_enabled() { eprintln!("skip"); return; }
         let (nk, hkd, nv, hvd, hidden) = (2usize, 4usize, 2usize, 4usize, 6usize);
         let t_len = 8usize;
         let slot = 2.0f32;
@@ -2412,9 +2375,8 @@ mod f16_tests {
 
     /// 批P6 验收:T=64 批核 == 64×decode 逐步 + 耗时记账(§六:批核节点
     /// 坍缩 → GPU-bound;此处实测回填)
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_gdn_prefill_t64_batch_vs_loop() {
-        if !gpu_enabled() { eprintln!("skip"); return; }
         let (nk, hkd, nv, hvd, hidden) = (2usize, 4usize, 2usize, 4usize, 6usize);
         let t_len = 64usize;
         let slot = 1.0f32;
@@ -2489,9 +2451,8 @@ mod f16_tests {
     }
 
     /// (工单 G-1)gating g 臂:g = -exp(A_log)·softplus(a + dt_bias)
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_gating_g_f16_matches_host() {
-        if !gpu_enabled() { eprintln!("skip"); return; }
         let (total, heads) = (12usize, 4usize);
         let a_log: Vec<f32> = q(&(0..heads).map(|i| (i as f32 * 0.31) - 1.0).collect::<Vec<_>>());
         let a: Vec<f32> = q(&(0..total).map(|i| ((i as f32 * 0.7) - 4.0).sin()).collect::<Vec<_>>());
@@ -2522,9 +2483,8 @@ mod f16_tests {
     }
 
     /// (工单 G-2)l2norm:行末维归一
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_l2norm_f16_matches_host() {
-        if !gpu_enabled() { eprintln!("skip"); return; }
         let (rows, dim) = (4usize, 64usize);
         let x: Vec<f32> = q(&(0..rows * dim).map(|i| ((i as f32 * 0.23) - 2.0).sin()).collect::<Vec<_>>());
         let mut want = vec![0f32; rows * dim];
@@ -2546,9 +2506,8 @@ mod f16_tests {
     }
 
     /// (工单 G-3)norm_act:rmsnorm(x 组内)·gamma·silu(z)
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_norm_act_f16_matches_host() {
-        if !gpu_enabled() { eprintln!("skip"); return; }
         // 维度可经 env 覆盖(2026-10-17):真实档 = **rows=分块长(62/128)、
         // vd=value_dim(分片 3072 / 全量 6144)、gs=hv_dim(128)** —— 原档
         // (3,32,8) 对 27B 的"组数 × 组长"零覆盖。
@@ -2593,9 +2552,8 @@ mod f16_tests {
 
     /// (工单 G-4)conv_upd + delta_dec:两步连续 + state f32 连续性
     /// (padding slot 负值跳写;GQA kv_group=1 简档)
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_conv_delta_f16_two_steps() {
-        if !gpu_enabled() { eprintln!("skip"); return; }
         let (nk, nv, kd, vd, batch, slots_n) = (2usize, 2usize, 16usize, 32usize, 2usize, 4usize);
         let d = nk * kd; // conv 段简化:只测 q 段(d = key_dim)
         let w: Vec<f32> = q(&(0..d * 4).map(|i| ((i as f32 * 0.13) - 0.5).sin()).collect::<Vec<_>>());
@@ -2714,9 +2672,8 @@ mod f16_tests {
 
     /// (工单 G-5)PF1b:conv_fwd varlen(单序列 T=8)== T×conv_upd 展开
     /// (PF1a 展开形态 vs 批核的核级对拍;out + state 双锚)
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_conv_fwd_varlen_matches_expansion() {
-        if !gpu_enabled() { eprintln!("skip"); return; }
         let (nk, kd, t, slot) = (2usize, 16usize, 8usize, 0usize);
         // 通道维 d 可经 env 覆盖(2026-10-17):conv 是**逐通道**深度卷积,正确性
         // 理应无关 d —— 但 27B 分片档的 d = value_dim = **3072**(全量 6144)、
@@ -2781,9 +2738,8 @@ mod f16_tests {
 
     /// (工单 G-6)PF1b:recurrence varlen gqa(单序列 T=8)== T×delta_dec 展开
     /// (out + 终态 f32 双锚;两步连续的批核侧验证)
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_recurrence_varlen_matches_expansion() {
-        if !gpu_enabled() { eprintln!("skip"); return; }
         // ⚠️ **GQA 比必须覆盖**(2026-10-17):原档只有 ratio 1(nk=nv=2),
         //    而 **27B 是 nk=16 / nv=48(ratio 3)**、0.8B 是 ratio 1
         //    —— 只测 ratio 1 = 27B 的真实路径零覆盖(同 AR 载荷尺寸/马林

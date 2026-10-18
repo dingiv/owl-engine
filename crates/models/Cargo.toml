@@ -44,3 +44,5 @@ owl-cpu = { path = "../backends/cpu" }
 # GPU 端到端样例的执行器(客户驱动 server;仅 dev —— 主依赖不含任何后端)
 owl-cuda = { path = "../backends/cuda" }
 safetensors = "0.8.0"
+# 测试样板收编(#[owl_test]:隐藏 env 配置注入 + GPU/对拍门控)
+owl-macros = { path = "../macros" }

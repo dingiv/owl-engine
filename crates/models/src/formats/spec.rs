@@ -223,8 +223,9 @@ impl ModelSpec {
 mod tests {
     use super::*;
 
-    fn dir(env: &str, default: &str) -> Option<std::path::PathBuf> {
-        let p = std::path::PathBuf::from(std::env::var(env).unwrap_or_else(|_| default.to_string()));
+    /// 资源目录(清单优先,缺则默认路径;`key` = 资源清单键)
+    fn dir(key: &str, default: &str) -> Option<std::path::PathBuf> {
+        let p = std::path::PathBuf::from(owl_shared::testkit::resource_or(key, default));
         p.is_dir().then_some(p)
     }
 
@@ -245,13 +246,13 @@ mod tests {
     fn matches_handwritten_specs() {
         for (env, default, want_fn, tag) in [
             (
-                "OWL_CKPT_0_8B",
+                "ckpt:0.8b",
                 "/home/div/Documents/codes/models/Qwen/Qwen3.5-0.8B",
                 crate::formats::qwen35::qwen3_5_0_8b as fn() -> ModelSpec,
                 "0.8B",
             ),
             (
-                "OWL_CKPT_27B_AWQ",
+                "ckpt:27b-awq",
                 "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4",
                 crate::formats::qwen35::qwen3_8_27b as fn() -> ModelSpec,
                 "27B-AWQ",
@@ -278,12 +279,12 @@ mod tests {
     fn reads_component_draft_spec() {
         for (env, default, tag) in [
             (
-                "OWL_DFLASH2_DIR",
+                "ckpt:dflash2",
                 "/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16",
                 "W4A16",
             ),
             (
-                "OWL_DFLASH2_BF16_DIR",
+                "ckpt:dflash2-bf16",
                 "/home/div/Documents/codes/models/z-lab/Qwen3.8-27B-DFlash2",
                 "BF16",
             ),
@@ -313,7 +314,7 @@ mod tests {
     /// 4B-VL:from_ckpt 的文本 spec == `VlmCfg::from_json` 的 text_spec(同一份 config 两条读法)
     #[test]
     fn matches_vlm_text_spec() {
-        let Some(d) = dir("OWL_CKPT_4B_VL", "/home/div/Documents/codes/models/Qwen/Qwen3.5-4B") else {
+        let Some(d) = dir("ckpt:qwen35-4b", "/home/div/Documents/codes/models/Qwen/Qwen3.5-4B") else {
             eprintln!("skip: 4B-VL 检查点不在");
             return;
         };

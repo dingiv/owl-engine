@@ -405,9 +405,17 @@ impl TensorOps {
         if let Some(e) = self.shape_rule(b, "matmul", |a, b| a.last() == b.first()) {
             return self.poisoned_local(e);
         }
+        // rank ≥ 1 律(2026-10-17 审查:原 `shape.len() - 1` 在空形状上
+        // **usize 下溢 panic**,现在先取末维 ⇒ 毒化)
+        let (Some(n), Ok(_)) = (b.shape.last().copied(), self.dim_last()) else {
+            return self.poisoned_local(LazyError {
+                at_depth: self.depth + 1,
+                detail: format!("matmul: 空形状(self {:?} / b {:?},需 rank ≥ 1)", self.shape, b.shape),
+            });
+        };
         let mut shape = self.shape.clone();
         let last = shape.len() - 1;
-        shape[last] = b.shape.last().copied().unwrap_or(0);
+        shape[last] = n;
         let meta = (self.dtype, shape);
         self.join(Op::Matmul, Some(b), meta, vec![])
     }
@@ -418,10 +426,16 @@ impl TensorOps {
         if let Some(e) = self.shape_rule(b, "matmul_nt", |a, b| a.last() == b.last()) {
             return self.poisoned_local(e);
         }
+        // rank ≥ 1 律(同上:空形状 ⇒ 毒化,不 panic;nt 的 n = B 行数)
+        let (Some(n), Ok(_)) = (b.shape.first().copied(), self.dim_last()) else {
+            return self.poisoned_local(LazyError {
+                at_depth: self.depth + 1,
+                detail: format!("matmul_nt: 空形状(self {:?} / b {:?},需 rank ≥ 1)", self.shape, b.shape),
+            });
+        };
         let mut shape = self.shape.clone();
         let last = shape.len() - 1;
-        // nt:n = B 的**行数**(B [n,k],k = 内维 = a.last == b.last)
-        shape[last] = b.shape.first().copied().unwrap_or(0);
+        shape[last] = n;
         let meta = (self.dtype, shape);
         self.join(Op::MatmulNt, Some(b), meta, vec![])
     }
@@ -586,7 +600,10 @@ impl TensorOps {
     /// 标量槽 = dim(sz);父序 = h / merged / idx(**构造序** —— idx 在末位,与
     /// `vis.pos_embed` 的 table/idx/wts 同款“索引量殿后”惯例)。
     pub fn image_scatter(&self, merged: &TensorOps, idx: &TensorOps) -> TensorOps {
-        let dim = self.shape.last().copied().unwrap_or(0);
+        let dim = match self.dim_last() {
+            Ok(d) => d,
+            Err(e) => return self.poisoned_local(e),
+        };
         if dim == 0 || self.shape.len() != 2 || merged.shape.len() != 2 {
             return self.poisoned_local(LazyError {
                 at_depth: self.depth + 1,
@@ -599,7 +616,10 @@ impl TensorOps {
                 detail: format!("image_scatter: merged 宽 {:?} ≠ h 宽 {dim}", merged.shape),
             });
         }
-        let rows: usize = self.shape.first().copied().unwrap_or(0);
+        let rows = match self.dim_first() {
+            Ok(r) => r,
+            Err(e) => return self.poisoned_local(e),
+        };
         if idx.shape.iter().product::<usize>() != rows {
             return self.poisoned_local(LazyError {
                 at_depth: self.depth + 1,
@@ -626,15 +646,24 @@ impl TensorOps {
                 detail: format!("pos_embed: idx 形状 {:?} ≠ wts 形状 {:?}", idx.shape, wts.shape),
             });
         }
-        let dim = self.shape.last().copied().unwrap_or(0);
-        let taps = idx.shape.last().copied().unwrap_or(0);
+        let dim = match self.dim_last() {
+            Ok(d) => d,
+            Err(e) => return self.poisoned_local(e),
+        };
+        let taps = match idx.dim_last() {
+            Ok(t) => t,
+            Err(e) => return self.poisoned_local(e),
+        };
         if dim == 0 || taps == 0 {
             return self.poisoned_local(LazyError {
                 at_depth: self.depth + 1,
                 detail: format!("pos_embed: dim/taps 为 0(table {dim}, idx {taps})"),
             });
         }
-        let rows: usize = idx.shape.first().copied().unwrap_or(0);
+        let rows = match idx.dim_first() {
+            Ok(r) => r,
+            Err(e) => return self.poisoned_local(e),
+        };
         let meta = (self.dtype, vec![rows, dim]);
         self.join(
             Op::Call { op: SemanticKernel::PosEmbedBilinear, aux: vec![] },
@@ -763,6 +792,27 @@ impl TensorOps {
         (!ok(&self.shape, &b.shape)).then(|| LazyError {
             at_depth: self.depth + 1,
             detail: format!("{who}: 形状不符 {:?} vs {:?}", self.shape, b.shape),
+        })
+    }
+
+    /// 声明形状**末维**(律:**rank ≥ 1**)
+    ///
+    /// 空形状 = 声明失守 ⇒ `Err`(调用点 `poisoned_local` 收口)。2026-10-17
+    /// 审查 §六轮:原先七处写成 `shape.last().copied().unwrap_or(0)` —— 把
+    /// "形状失守"与"维度是 0"混成同一个值(读起来像静默回退,且 0 会一路
+    /// 流进核标量/几何推导)。
+    fn dim_last(&self) -> Result<usize, LazyError> {
+        self.shape.last().copied().ok_or_else(|| LazyError {
+            at_depth: self.depth + 1,
+            detail: format!("形状为空(需 rank ≥ 1;op {:?})", self.op),
+        })
+    }
+
+    /// 声明形状**首维**(律同 [`Self::dim_last`])
+    fn dim_first(&self) -> Result<usize, LazyError> {
+        self.shape.first().copied().ok_or_else(|| LazyError {
+            at_depth: self.depth + 1,
+            detail: format!("形状为空(需 rank ≥ 1;op {:?})", self.op),
         })
     }
 
@@ -940,5 +990,26 @@ mod tests {
         assert!(bad.is_poisoned(), "元素数不守恒 → 毒");
         let err = reduce(bad.step(), &mut CpuInterpreter::new()).unwrap_err();
         assert!(format!("{err:?}").contains("reshape"), "{err:?}");
+    }
+
+    /// **rank ≥ 1 律门**(2026-10-17 审查 §六轮):空形状声明失守 ⇒ 相关 op
+    /// **毒化**(修前:`shape.len() - 1` **usize 下溢 panic**;另 7 处
+    /// `shape.last().copied().unwrap_or(0)` 读起来像静默回退)。
+    #[test]
+    fn empty_shape_poisons_instead_of_zero_or_panic() {
+        let a = t(&[1., 2., 3., 4.], vec![2, 2]);
+        let empty = TensorOps::zeros(Dtype::F32, vec![]);
+        // matmul / matmul_nt:空 b 或空 self ⇒ 毒(不 panic、不静默 0)
+        assert!(a.matmul(&empty).is_poisoned(), "matmul(空 b)");
+        assert!(empty.matmul(&a).is_poisoned(), "matmul(空 self)");
+        assert!(a.matmul_nt(&empty).is_poisoned(), "matmul_nt(空 b)");
+        assert!(empty.matmul_nt(&a).is_poisoned(), "matmul_nt(空 self)");
+        // image_scatter / pos_embed:空 self/idx ⇒ 毒
+        assert!(empty.image_scatter(&a, &a).is_poisoned(), "image_scatter(空 h)");
+        assert!(empty.pos_embed_bilinear(&a, &a).is_poisoned(), "pos_embed(空 table)");
+        assert!(a.pos_embed_bilinear(&empty, &empty).is_poisoned(), "pos_embed(空 idx)");
+        // 对照组:正常形状不毒
+        assert!(!a.matmul(&a).is_poisoned(), "正常 matmul 不该毒");
+        assert!(!a.image_scatter(&a, &t(&[1., 2.], vec![2])).is_poisoned(), "正常 scatter 不该毒");
     }
 }

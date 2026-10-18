@@ -79,6 +79,24 @@ pub trait KernelFamily: Send {
         res: &mut dyn crate::device::DeviceRes,
         exec: &mut crate::device::Exec,
     ) -> Result<Bytes, OpError>;
+
+    /// **FI plan 表同步**(W3;仅 FI 族实现)。缺省 = **结构化拒**(不静默):
+    /// 非 FI 族被要求刷 plan 表即调用方违约。
+    fn plan_sync(
+        &mut self,
+        _t: usize,
+        _ctx_total: usize,
+        _hq: usize,
+        _hkv: usize,
+        _hd: usize,
+        _page: usize,
+        _res: &mut dyn crate::device::DeviceRes,
+    ) -> Result<(), OpError> {
+        Err(OpError::Asset {
+            op: self.id().0.into(),
+            detail: "本族无 FI plan 同步面(仅 flashinfer 族实现)".into(),
+        })
+    }
 }
 
 // ============================================================================
@@ -164,6 +182,23 @@ impl<F: KernelFamily + 'static> KernelFamily for FamilyGuard<F> {
         exec: &mut crate::device::Exec,
     ) -> Result<Bytes, OpError> {
         self.family_mut().run(msg, res, exec)
+    }
+
+    /// **转发**(2026-10-18 W3):守卫层必须显式转发每个新方法 —— 否则
+    /// `Box<dyn KernelFamily>` 走的是 guard 的**缺省实现**(实测症状:
+    /// `本族无 FI plan 同步面` 而内层族明明实现了它)。新增 trait 方法时
+    /// 请连带检查本 impl(与 `run`/`close` 同律)。
+    fn plan_sync(
+        &mut self,
+        t: usize,
+        ctx_total: usize,
+        hq: usize,
+        hkv: usize,
+        hd: usize,
+        page: usize,
+        res: &mut dyn crate::device::DeviceRes,
+    ) -> Result<(), OpError> {
+        self.family_mut().plan_sync(t, ctx_total, hq, hkv, hd, page, res)
     }
 }
 
@@ -479,6 +514,29 @@ impl OpRegistry {
             }
         })?;
         self.families[idx].run(msg, res, exec)
+    }
+
+    /// **FI plan 表同步**(W3):按名字路由到族(与 [`Self::execute`] 同表同行纪律;
+    /// 名字不在表 ⇒ 结构化拒)。调用方 = 后端 server 命令层。
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_sync(
+        &mut self,
+        name: &str,
+        t: usize,
+        ctx_total: usize,
+        hq: usize,
+        hkv: usize,
+        hd: usize,
+        page: usize,
+        res: &mut dyn crate::device::DeviceRes,
+    ) -> Result<(), OpError> {
+        let idx = *self.route.get(name).ok_or_else(|| OpError::Contract {
+            op: name.to_string(),
+            field: "name",
+            expect: "已注册家族".into(),
+            got: format!("{name}(未注册)"),
+        })?;
+        self.families[idx].plan_sync(t, ctx_total, hq, hkv, hd, page, res)
     }
 }
 

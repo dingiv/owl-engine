@@ -229,11 +229,11 @@ fn finite(v: &[f32]) -> bool {
 
 #[test]
 fn fi_graph_replay_m2a() {
-    if !std::env::var_os("OWL_TEST_DEVICE").is_some_and(|v| !v.is_empty()) {
+    if owl_cuda::test_device_bdf().is_none() {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
     }
-    let dev: usize = std::env::var("OWL_TEST_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let dev: usize = owl_cuda::test_device_ordinal();
     // 本探针**自带图档 env**(独立二进制 ⇒ 无并行踩踏;与 C++ 侧同源同读法)
     std::env::set_var("FI_CUDA_GRAPH", "1");
     std::env::remove_var("FI_NO_MASK");
@@ -355,7 +355,10 @@ fn fi_graph_replay_m2a() {
     // 一个 plan"决定所有图读到什么(多桶/草稿面共存皆可踩)。
     // 判据:A 捕获后,用**别的形状**把 int_ws 刷掉,再回放 A ⇒ 仍 ≡ A 的
     // eager 基线(即 A 的图自携了 A 的 plan)。
-    // 取证档:`OWL_FI_NO_PLAN_RESTORE=1` 下本判据**必须红**(机制承重证据)。
+    // 取证档:`owl_kernels::server::flashinfer::set_plan_restore(false)` 下本
+    // 判据**必须红**(机制承重证据)。⚠️ 该档 2026-10-18 从 env 收编成
+    // **进程级 setter**(配置 `[dispatch] fi_plan_restore` 为唯一写者);
+    // 探针要跑红档就手动 `set_plan_restore(false)` 再跑本腿(见 README/注释)。
     {
         let t = 128usize;
         let mut f = Fi::new(dev, t, 128, t * H * HD * 2, 731);
@@ -396,7 +399,7 @@ fn fi_graph_replay_m2a() {
         let ws_restored = restored[..2048] == before[..2048];
         let d = maxdiff(&base, &after);
         println!(
-            "[④] 多 plan 共存:B 调用后 int_ws 变了={b_differs}(首个差异字节 {first_diff:?}) | 回放 A 后 int_ws 复位={ws_restored} | 输出 |Δ| = {d:.3e}(取证档 OWL_FI_NO_PLAN_RESTORE=1 应红)"
+            "[④] 多 plan 共存:B 调用后 int_ws 变了={b_differs}(首个差异字节 {first_diff:?}) | 回放 A 后 int_ws 复位={ws_restored} | 输出 |Δ| = {d:.3e}(取证档 set_plan_restore(false) 应红)"
         );
         assert!(b_differs, "④ 前提不成立:B 的 plan 没写进 int_ws(本实验是空转)");
         assert!(ws_restored, "④ int_ws 自携失败(回放读到了别的 plan 的调度表)");

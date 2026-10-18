@@ -1,10 +1,27 @@
 # Piecewise(可断)捕获图 —— 设计与实现方案(2026-10-15;perf 会话立项)
 
+> 🔴 **已退役(2026-10-18,W5)** —— 本卷保留为**历史设计与实录**,机构已整体删除:
+> 本卷的代码面(`plan_piecewise` / `replay_piecewise` / `BreakPoint`·`PiecewiseRt` /
+> `pw_carry` 接力棒 / `BreakDecl`+`EvalCarry`+`SegMode`+`eval_segment` / 断点登记面
+> `attn_break`·`AttnFiBreak` / 旋钮 `verify_piecewise`·`break_at_out`·`fi_bucket`·
+> `pw_dump_tok`)已从工作树删除;**配了旧键的配置会响亮拒启**(迁移门,见
+> `config.rs::reject_retired_keys`)。
+>
+> ⚠️ **2026-10-18 testdata 精简**:本卷引用的一次性配置档(`testdata/args/`
+> 的 `perf-ab-*` / `perf-ctxladder-27b-{fi,pw}` / `dec*` / `spec-27b-prod` 等)
+> 已删除;复现请按文中描述重建等价档(flavor `spec-dflash` + 文中那条差异)。
+>
+> **为什么退役**:W3/W4 之后 FI 核留捕获图内、调度表由窗外 `fi_plan_sync` 刷
+> ⇒ 断点面零消费者;而它正是"接力棒每步只增 ⇒ 段末 `memo.retain` 每步 16×O(N)
+> ⇒ 端到端 O(步数²)"那条慢化病的宿主(设计卷 §3.3)。现行形态见
+> `docs/arch/图档-FI-单图-设计与施工.md`(§6 W4 转正 / §7 终版组合)。
+> 需要分段求值时从 git 历史取回(本卷即那时的设计依据)。
+
 ## §0 现状与用法(先读这一页;实录从 §1 起)
 
 | 项 | 值 |
 |---|---|
-| **状态** | ✅ **已转正**(2026-10-16):prefill / verify / decode **三条路全部 FI+split** |
+| **状态** | 🔴 **已退役**(2026-10-18 W5;见卷头)—— 历史转正记录:prefill / verify / decode 三条路 FI+split 的**分段承载**已被单图 + 窗外刷表取代 |
 | **开关**(flavor `spec-dflash`,已置位) | `verify_piecewise = true`、`verify_fi = true`、`verify_xqa = false`、`verify_v2 = false`、`decode_fi = true`、`decode_xqa = false`(外加既有 `kv_fp8 = true`) |
 | **回退** | 把 `verify_piecewise/verify_fi/decode_fi` 关掉 ⇒ 回 XQA/v2(**不改代码**);⚠️ **args 档覆盖 flavor**(深合并),`testdata/args/spec-27b-prod.toml` 等本地档必须同步改,否则静默跑回旧臂 |
 | **拓扑** | 27B:verify = 17 段/16 断点(T=8);session = 17 段/16 断点(T=1 每步) |

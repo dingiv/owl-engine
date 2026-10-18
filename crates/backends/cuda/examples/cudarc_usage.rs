@@ -1,5 +1,9 @@
 //! playground:声明式 Tensor 链式 API 的 CPU 可跑玩具(值语义版;2026-09-23)。
 //!
+//! ⚠️ **历史参考,勿照抄进生产**(2026-10-17 审查标注):`demo5` 走 **NVRTC 运行期
+//! 编译**(`use cudarc::nvrtc::safe::…`)—— owl 生产面零运行期编译(AOT cubin;
+//! 判据见 `crates/backends/README.md` 准入铁律)。本文件其余部分是纯 CPU 玩具。
+//!
 //! ⚡ 存储裁决(2026-09-23 用户拍板):**不用 Arc**。每个节点持有完整的
 //! 遍历树(值语义,clone = 深拷贝)。理由:
 //!   - 声明树是**配置面**产物:只在启动期构建一次,不在热路径;
@@ -498,7 +502,7 @@ fn eval_gpu(
 fn demo5_gpu_executor() {
     use gpu_exec::GpuExecutor;
     println!("== demo5:GPU 执行器(同一棵归约树,逐节点真发射) ==");
-    let ordinal = owl_shared::env_reader::parse_or("OWL_TEST_DEVICE", 0);
+    let ordinal = owl_cuda::test_device_ordinal();
     let ex = GpuExecutor::new(ordinal).expect("GpuExecutor::new");
     println!("   device: {}", ex.ctx.name().unwrap());
 

@@ -41,11 +41,12 @@ fn main() {
             Some(b) => b.to_string(),
             None => {
                 // passthrough(F16/BF16/F32)
-                if let Some(n) = src.elem_len(&name) {
+                if let Some(n) = src.elem_len(&name).expect("源") {
                     let len = n.min(64);
                     let mut dst = vec![0u8; len * 2];
                     assert!(
                         src.convert_chunk_into_bytes(&name, 0, len, &mut dst, Dtype::F16)
+                            .expect("源")
                             .is_some(),
                         "passthrough 触达失败 {name}"
                     );
@@ -66,11 +67,13 @@ fn main() {
             (".weight", Dtype::F16, 2),
         ] {
             let key = format!("{base}{suffix}");
-            if let Some(n) = src.elem_len(&key) {
+            if let Some(n) = src.elem_len(&key).expect("源") {
                 let len = n.min(64);
                 let mut dst = vec![0u8; len * esz];
                 assert!(
-                    src.convert_chunk_into_bytes(&key, 0, len, &mut dst, dtype).is_some(),
+                    src.convert_chunk_into_bytes(&key, 0, len, &mut dst, dtype)
+                        .expect("源")
+                        .is_some(),
                     "触达失败 {key}"
                 );
                 touched += 1;

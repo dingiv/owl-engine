@@ -10,6 +10,19 @@ dev_log
 # testdata:bins 大件忽略,但金标生成脚本 + manifest(可复现配方)必须进版本
 # (M1 教训:资产/金标无版本 = 哨兵失明;operator-contract 设计 §4.9)
 testdata/*
+# 快速测试系统说明(唯一 env OWL_TEST_CONF + testdata/cases overlay):说明文档进版本
+!testdata/README.md
+# 资源清单:示例进版本,本机路径不进
+!testdata/resources.toml.example
+!testdata/cases/
+testdata/cases/*
+!testdata/cases/README.md
+testdata/resources.toml
+# E2E/专项夹具必须进版本(`e2e.rs` 用 `include_str!` 读它 —— 缺了干净检出构建不了)
+!testdata/args/
+testdata/args/*
+!testdata/args/e2e-27b.toml
+!testdata/args/prefix-reuse-27b.toml
 !testdata/gdn_fla/
 testdata/gdn_fla/*
 !testdata/gdn_fla/gen.py
@@ -31,3 +44,4 @@ perf-runs/
 # 别人的 stash 残留被我的 `add -A` 带进一笔,事后加了撤销提交)。
 # 进版本 = 真需要当"金标"的数据请显式 `git add -f`。
 docs/bench/data/
+*.local

@@ -1,0 +1,18 @@
+[package]
+name = "owl-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "State store: KV/state virtualization across GPU / host / disk tiers"
+# 依赖纪律见 arch.md 律①:只允许 owl-iface(契约面)+ owl-shared(工具面)。
+# S1(账与策略)零依赖;S1b(搬运)加 owl-iface 的 DeviceClient。
+
+[dependencies]
+owl-iface = { path = "../backends/iface" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# 测试面允许:owl-cpu 是**契约面(owl-iface::DeviceClient)的一个真实现体** ——
+# 用真 face 测搬运闭环,胜过手写假 face(见 arch.md 律① 补注)。
+owl-cpu = { path = "../backends/cpu" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

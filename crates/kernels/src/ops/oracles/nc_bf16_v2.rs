@@ -18,7 +18,8 @@ const DFLASH2_F16: &str = "cu/attn/naive_attn_nc.cu";
 
 use super::{bf16_to_f32, lcg_bf16};
 
-/// 自检几何(滑窗生效:prefix > 2048)
+/// 自检几何(滑窗生效:prefix > 2048)。**HKV=1 ⇒ group=4=CTA warp 数**
+/// (GQA 感知核的 `nsub=1` 分支:每 warp 全量行 + 一次组内归并)。
 const T: usize = 8;
 const HQ: usize = 4;
 const HKV: usize = 1;
@@ -153,12 +154,17 @@ pub fn run_case(r: &mut dyn CheckRunner, c: &Case) -> Result<Vec<f32>, OpError> 
         LaunchVal::I32(X as i32),
         LaunchVal::Ptr(d_out.ptr),
     ];
+    // ⚠️ grid = **(T, HKV)**、block = **4·HD**、smem = `nwarp·(d_dim+2)·4`
+    // (2026-10-18 GQA 感知核:CTA 内 = GQA 组 4 warp × 4 路行切片)。
+    // 本几何 HKV=1 ⇒ group=HQ=4;nwarp=4·(HD/32)=16 ⇒ nsub=4。
+    let nwarp = 4 * (HD / 32);
+    let smem = (nwarp * (HD + 2) * 4) as u32;
     r.launch_aot(
         "owl_naive_attn_nc_bf16_v2",
         DFLASH2_F16,
-        (T as u32, HQ as u32, 1),
-        (HD as u32, 1, 1),
-        0,
+        (T as u32, HKV as u32, 1),
+        ((HD * 4) as u32, 1, 1),
+        smem,
         &vals,
     )?;
     r.sync()?;

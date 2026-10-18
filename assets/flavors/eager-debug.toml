@@ -1,7 +1,0 @@
-# owl 引擎预设档 `eager-debug`(2026-10-16 从 crates/shared/src/config.rs 下沉)
-# 原文注释:// eager 诊断档(图内/图外行为 A/B 的对照臂;C1 禁 graph 配套)
-[graph]
-no_graph = true
-
-[probes]
-debug = true

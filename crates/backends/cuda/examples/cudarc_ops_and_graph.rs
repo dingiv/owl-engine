@@ -1,5 +1,10 @@
 //! 裸 cudarc 参考示例:算子发射(nvrtc 编译 kernel)+ 流捕获 → 图回放。
 //!
+//! ⚠️ **历史参考,勿照抄进生产**(2026-10-17 审查标注):本文件用 **NVRTC 运行期
+//! 编译** —— 而 owl 生产面**零运行期编译**(44 源 cubin + fatbin 全 AOT;判据见
+//! `crates/backends/README.md` 的第三方准入铁律)。留它只为"没有治理时原厂 API
+//! 长什么样"的对照阅读面;`cargo check --all-targets` 会编到它,故不许被当作范本。
+//!
 //! 目的:与 owl 的治理层(owl-cuda 的相位机/池/租约)对照,展示
 //! "没有治理时"原厂 safe API 的样子与坑。文件自带全部语义注释,
 //! 可作为图捕获语义的速查样板。
@@ -35,7 +40,7 @@ extern "C" __global__ void saxpy_f32(
 "#;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ordinal: usize = owl_shared::env_reader::parse_or("OWL_TEST_DEVICE", 0);
+    let ordinal: usize = owl_cuda::test_device_ordinal();
 
     // ---- 1. 上下文与流(cudarc 每卡一个 CudaContext;clone = Arc 克隆)----
     let ctx = CudaContext::new(ordinal)?;

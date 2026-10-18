@@ -8,7 +8,7 @@
 //! [`GpuClient::new`](crate::GpuClient)。
 
 use owl_iface::contract::{Bytes, GraphId, LaunchMsg};
-use owl_iface::contract::ModelError;
+use owl_iface::contract::{Connector, ModelError, SwapDir, SwapPiece};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -31,6 +31,13 @@ pub enum Command {
     /// 图重放(流序异步提交;捕获期间拒绝)
     GraphLaunch {
         graph: GraphId,
+        ack: Ack<Result<(), ModelError>>,
+    },
+    /// **FI plan 表同步**(W3):让 FI 族把 `spec.ctx_total` 对应的调度表刷进
+    /// int_ws。用于 "FI 核在捕获图内" 的档 —— 图回放不再经过宿主处理器,
+    /// 表必须由图外一步显式刷新(见 `DeviceClient::fi_plan_sync`)。
+    FiPlanSync {
+        spec: owl_iface::contract::FiPlanSpec,
         ack: Ack<Result<(), ModelError>>,
     },
     /// **捕获窗作废**(窗内出错/空窗的收尾;捕获期间**允许** —— 它就是窗内
@@ -89,6 +96,8 @@ pub enum Command {
         data: Vec<u8>,
         /// 上传落地块的点名(同 [`Command::Alloc`];必填)
         name: String,
+        /// 落点流(0 = H2D 批量面;1 = COMPUTE 参数面 —— 见 `UpStream`)
+        stream: u8,
         ack: Ack<Result<Bytes, ModelError>>,
     },
     /// **PeerShared 分配**(TP2 S1;A2.6 修正后的唯一跨卡分配口)。
@@ -142,6 +151,8 @@ pub enum Command {
         block: u64,
         offset_bytes: usize,
         data: Vec<u8>,
+        /// 落点流(0 = H2D 批量面;1 = COMPUTE 参数面 —— 见 `UpStream`)
+        stream: u8,
         ack: Ack<Result<(), ModelError>>,
     },
     /// host → device **批量分块写入**(S1):decode 每步多槽装填合一次
@@ -149,6 +160,8 @@ pub enum Command {
     /// server 逐写池化码头 + H2D 流序,末尾单 notify
     HtodChunks {
         writes: Vec<(u64, usize, Vec<u8>)>,
+        /// 落点流(0 = H2D 批量面;1 = COMPUTE 参数面 —— 见 `UpStream`)
+        stream: u8,
         ack: Ack<Result<(), ModelError>>,
     },
     /// 分配 pinned 租约(流式装载 DMA 源;池优先,miss 才 cudaHostAlloc)
@@ -181,12 +194,37 @@ pub enum Command {
         offset_bytes: usize,
         /// 字节长度(池租约容量 ≥ 请求;只传前 len_bytes)
         len_bytes: usize,
+        /// 落点流(0 = H2D 批量面;1 = COMPUTE 参数面 —— 见 `UpStream`)
+        stream: u8,
         ack: Ack<Result<(), ModelError>>,
     },
     /// device → host(异步 memcpy 到 pinned 码头;want_bytes 字节口径)
     Dtoh {
         id: u64,
         want_bytes: usize,
+        ack: Ack<Result<Vec<u8>, ModelError>>,
+    },
+    /// **带偏移的 device → host**(状态存储搬出面,2026-10-16)。
+    ///
+    /// 与 [`Command::Dtoh`] **同一条执行路径**(老命令 = `off_bytes = 0` 的特例),
+    /// 只是起点可偏移 —— "逻辑块 = 层缓冲内的一个页"必须按槽偏移读
+    /// (设计卷 §10.3;`docs/arch/store-状态存储-设计与迁移.md`)。
+    DtohAt {
+        id: u64,
+        /// 块内字节偏移(= 槽 × 每页字节)
+        off_bytes: usize,
+        want_bytes: usize,
+        ack: Ack<Result<Vec<u8>, ModelError>>,
+    },
+    /// **批量分块 device → host**(状态存储"整块搬出",2026-10-16)。
+    ///
+    /// 一次命令搬一个逻辑块的全部层片段(0.8B 12 段 / 27B 32 段)⇒ **一次往返**;
+    /// 回执 = 各片段按**入参顺序**拼接后的字节(逐段等价于 `DtohAt`)。
+    /// 为什么必须批:不批则每个块 12/32 次 actor 往返,搬出去的收益会被往返吃光
+    /// (设计卷 §10.3 推论 B)。
+    DtohBatch {
+        /// (块 id, 偏移字节, 长度字节)
+        pieces: Vec<(u64, usize, usize)>,
         ack: Ack<Result<Vec<u8>, ModelError>>,
     },
     /// 中间块回收(E2a,2026-09-27):调用方声明这批块此后不再引用 ——
@@ -196,6 +234,21 @@ pub enum Command {
     Free {
         ids: Vec<u64>,
         ack: Ack<Result<(), ModelError>>,
+    },
+    /// **swap 一条命令**(设计卷 §15;2026-10-16):N 片一次提交、一次 ack。
+    ///
+    /// 语义:
+    /// - `Out` = 设备 → 连接器(D2H 流);`In` = 连接器 → 设备(H2D 流);
+    /// - 一次 ack = 全部片段完成(**回执即落地**);
+    /// - `conn` 随命令进出(回执**原箱奉还**,单主零锁);
+    /// - **层级无关**:server 只按 `Connector` 三件读写,不关心另一端是 RAM 或盘;
+    /// - 捕获窗内 = **结构化拒**(搬运只在段边界,时序归 engine —— §10.3);
+    /// - 中途失败 = 整条失败(不留半态;调用方回滚账)。
+    Swap {
+        dir: SwapDir,
+        pieces: Vec<SwapPiece>,
+        conn: Box<dyn Connector + Send>,
+        ack: Ack<Result<Box<dyn Connector + Send>, ModelError>>,
     },
     /// 设备内块→块拷贝(E2c 快照通道;流序非阻塞)
     CopyBlock {
@@ -218,6 +271,11 @@ pub enum Command {
     /// 用法 = 装载收尾(暂存槽 free 之后)—— 见 `DeviceClient::mem_pool_trim`。
     MemPoolTrim {
         ack: Ack<Result<u64, ModelError>>,
+    },
+    /// **设备 SM 数查询**(宿主面只读;`cuDeviceGetAttribute(MULTIPROCESSOR_COUNT)`)。
+    /// 与 `BlockLedgerDump` 同族:无 GPU 活、无流、捕获期可放行(恒定值,不碰设备状态)。
+    DeviceSmCount {
+        ack: Ack<Result<usize, ModelError>>,
     },
     /// **块账本投影**(调试面;`GET /debug/blocks`):全活块 (id, 字节, dtype, 地址, 账本)
     /// —— 判「同 id 两地址」与「两活块区间相交」的唯一权威快照。
@@ -271,9 +329,11 @@ impl Command {
             Self::CaptureRoute { .. } => "capture_route",
             Self::CaptureJoin { .. } => "capture_join",
             Self::GraphDestroy { .. } => "graph_destroy",
+            Self::FiPlanSync { .. } => "fi_plan_sync",
             Self::Alloc { .. } => "alloc",
             Self::Htod { .. } => "htod",
             Self::MemsetZero { .. } => "memset_zero",
+            Self::DeviceSmCount { .. } => "device_sm_count",
             Self::BlockLedgerDump { .. } => "block_ledger_dump",
             Self::MemPoolTrim { .. } => "mem_pool_trim",
             Self::UploadAndLaunch { .. } => "upload_and_launch",
@@ -285,6 +345,12 @@ impl Command {
             Self::LedgerJson { .. } => "ledger_json",
             Self::UploadPinned { .. } => "upload_pinned",
             Self::Dtoh { .. } => "dtoh",
+            Self::DtohAt { .. } => "dtoh_at",
+            Self::DtohBatch { .. } => "dtoh_batch",
+            Self::Swap { dir, .. } => match dir {
+                owl_iface::contract::SwapDir::Out => "swap_out",
+                owl_iface::contract::SwapDir::In => "swap_in",
+            },
             Self::Free { .. } => "free",
             Self::CopyBlock { .. } => "copy_block",
             Self::CopyBatch { .. } => "copy_batch",
@@ -307,8 +373,10 @@ impl Command {
             Self::CaptureRoute { ack, .. } => ack.created_at(),
             Self::CaptureJoin { ack } => ack.created_at(),
             Self::GraphDestroy { ack, .. } => ack.created_at(),
+            Self::FiPlanSync { ack, .. } => ack.created_at(),
             Self::Alloc { ack, .. } => ack.created_at(),
             Self::Htod { ack, .. } => ack.created_at(),
+            Self::DeviceSmCount { ack } => ack.created_at(),
             Self::BlockLedgerDump { ack } => ack.created_at(),
             Self::MemPoolTrim { ack } => ack.created_at(),
             Self::UploadAndLaunch { ack, .. } => ack.created_at(),
@@ -321,6 +389,9 @@ impl Command {
             Self::LedgerJson { ack, .. } => ack.created_at(),
             Self::UploadPinned { ack, .. } => ack.created_at(),
             Self::Dtoh { ack, .. } => ack.created_at(),
+            Self::DtohAt { ack, .. } => ack.created_at(),
+            Self::DtohBatch { ack, .. } => ack.created_at(),
+            Self::Swap { ack, .. } => ack.created_at(),
             Self::Free { ack, .. } => ack.created_at(),
             Self::CopyBlock { ack, .. } => ack.created_at(),
             Self::CopyBatch { ack, .. } => ack.created_at(),

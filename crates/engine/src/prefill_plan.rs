@@ -129,12 +129,26 @@ pub(crate) struct BucketGraph<D: DeviceClient> {
 }
 
 impl<D: DeviceClient> BucketGraph<D> {
-    /// 本桶此刻可用吗(纯判定;可单测)。`false` ⇒ 调用方走 eager 原路。
+    /// **本桶此刻可用吗**(纯判定;可单测)。`false` ⇒ 调用方走 eager 原路。
+    ///
+    /// 判据:①已捕获;②t 在桶内;③**槽号 = 烘焙槽**。
+    ///
+    /// ③ 是结构性约束:host 槽臂把**格地址**烘进图 ⇒ 槽号不同 = 图读写别人的格。
+    ///
+    /// ⚠️ 曾另有第 4 条「格世代相等」(2026-10-17 临时防线):当时"同格复用即静默
+    /// 错值"的**根因未点名**(记为"另一半跨流序")。根因同日定谳:**FI plan 的共享
+    /// `int_ws` 调度表被图回放改写,而 host 侧 `active` 旧账不知情** ⇒ 复用发的
+    /// decode 读到桶的调度表(修于 `FiRuntime::activate`:窗外一律重刷;
+    /// 结案见 `roadmap.local/26-10-17-prefill桶图-二次会话污染-定位实录.md`)。
+    /// 真因修好后世代与桶无关 ⇒ 第 4 条已撤(格换主后回放实测正常)。
     pub(crate) fn usable(&self, t_real: usize, gdn_slot: usize) -> bool {
-        self.captured
-            && t_real >= 1
-            && t_real <= self.t_pad
-            && self.gdn_slot_baked.is_none_or(|s| s == gdn_slot)
+        bucket_usable(
+            self.captured,
+            t_real,
+            self.t_pad,
+            self.gdn_slot_baked,
+            gdn_slot,
+        )
     }
 
     /// **回放**:写输入槽(全 `t_pad` 长度)→ 1 条 `graph_launch` → 真行视图。
@@ -203,6 +217,22 @@ impl<D: DeviceClient> BucketGraph<D> {
 // ============================================================================
 // §4 桶族(捕获面)
 // ============================================================================
+
+/// **桶可用性纯函数**(单一事实源 = [`BucketGraph::usable`];提出来是为了单测)。
+///
+/// 判据三条(见 `usable` 注):已捕获 / t 在桶内 / 槽号 = 烘焙槽。
+pub(crate) fn bucket_usable(
+    captured: bool,
+    t_real: usize,
+    t_pad: usize,
+    baked_slot: Option<usize>,
+    gdn_slot: usize,
+) -> bool {
+    captured
+        && t_real >= 1
+        && t_real <= t_pad
+        && baked_slot.is_none_or(|s| s == gdn_slot)
+}
 
 /// 捕获期 boot 事实(显式依赖;零隐式读取)
 pub(crate) struct BucketBoot<'a> {

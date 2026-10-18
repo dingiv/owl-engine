@@ -18,6 +18,7 @@
 //! 运行:`OWL_TEST_DEVICE=1 cargo test --release -p owl-kernels \
 //!        --test dflash2_nc_probe -- --test-threads=1 --nocapture`
 
+use owl_macros::owl_test;
 use std::time::Instant;
 
 use cudarc::driver::{CudaContext, DevicePtr, LaunchConfig, PushKernelArg};
@@ -230,12 +231,8 @@ fn run_case(prefix: usize, check: bool) {
     }
 }
 
-#[test]
+#[owl_test(gpu)]
 fn dflash2_nc_speed_and_parity() {
-    if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
-        return;
-    }
     // 生产窗口点(滑窗生效:prefix > 2048)+ host 参考
     run_case(2048, true);
     // 短 ctx(滑窗不生效)+ 长 ctx(滑窗钳死)只测速
@@ -403,12 +400,8 @@ fn run_diag(prefix: usize, variant: &str) {
     println!("  {variant:<10} {:.3} ms", t0.elapsed().as_secs_f64() * 1e3 / iters as f64);
 }
 
-#[test]
+#[owl_test(gpu)]
 fn dflash2_nc_bottleneck_split() {
-    if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
-        return;
-    }
     for prefix in [2048usize, 8192] {
         println!("=== 拆分(prefix={prefix}, 窗口 {} + 自块 {T})===", prefix.min(2048));
         for v in ["diag_kv", "diag_k", "diag_v", "diag_none"] {

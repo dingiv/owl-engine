@@ -8,6 +8,7 @@
 //! owl_prefill_split(f16/fp8kv)。映射 oracle 独立重实现(与 env.rs 互证)。
 //! 无 GPU 跳过(OWL_TEST_DEVICE;卡 = ordinal 1)。
 
+use owl_macros::owl_test;
 use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, CudaStream, DevicePtr, LaunchConfig, PushKernelArg};
@@ -99,12 +100,8 @@ fn fill_pools_u8(kind: PoolKind, gen: impl Fn(usize, usize, usize) -> u8) -> (Ve
     (c, k)
 }
 
-#[test]
+#[owl_test(gpu)]
 fn paged_decode_v2_knhd_parity() {
-    if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
-        return;
-    }
     let ctx = CudaContext::new(1).expect("ctx");
     ctx.bind_to_thread().expect("bind");
     let stream: Arc<CudaStream> = ctx.default_stream();
@@ -409,12 +406,8 @@ fn paged_decode_v2_knhd_parity() {
     assert!(out_c8.iter().any(|&v| v != 0), "v2 fp8 全零输出(装配错)");
 }
 
-#[test]
+#[owl_test(gpu)]
 fn prefill_split_knhd_parity() {
-    if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
-        return;
-    }
     let ctx = CudaContext::new(1).expect("ctx");
     ctx.bind_to_thread().expect("bind");
     let stream: Arc<CudaStream> = ctx.default_stream();

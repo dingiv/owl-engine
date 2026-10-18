@@ -1,0 +1,113 @@
+# owl 引擎预设档 `awq27b-262k`(冲刺档:**单张 3090/24GB 跑 262144 tok 上下文**)
+#
+# **一句话**:设备池装不下 262k(24GB 卡上约 8 GiB KV),所以device 只留工作集、
+# 全量 KV 分两腿(设备 + 宿主)⇒ **单卡 262k**(超卖 ≈2.2×)。
+#
+# ── 24 GB 卡的账(改数先看这张) ────────────────────────────────────────
+#   23.60 GiB 卡总 = 19.2 权重/运行底价 + 1.1 fixed_after(GDN/快照/图/CUDA ctx)
+#                  + W(chunk 激活面:chunk 128 实测 **~40 MiB**)  ← §8.31 修后
+#                  + 池(治理器 cap ≈ 3.7 GiB ⇒ ~120k tok)
+#                  + 守卫余量 128 MiB
+#   KV 全量 = 262144 tok × **32 KiB/tok**(fp8;16 层 × 2 × 4 头 × 256 维 × 1B)
+#            = **8 GiB**
+#     ・设备腿 = 池(~3.6 GiB ⇒ ~118k tok)
+#     ・宿主腿 = 6 GiB(`host_cache_mb`,装其余 ~144k tok ≈ 4.4 GiB)✓
+#   ⇒ **262144 / ~118000 ≈ 2.2× 超卖**
+#
+# ── 三层账(改数只动这三行) ────────────────────────────────────────────
+#   [runtime].max_seq        = 262144(逻辑上限)
+#   [pool].pool_tokens       = **意图值**(治理器按 `[vram-gov]` 的 cap 夹;**不手写猜数**)
+#   [kvmem].workspace_per_req = 每活跃 turn 在设备池里的工作集(token;含保底)
+#
+# 需配套:model.dir(检查点目录)。
+[model]
+kind = "awq27b"
+
+[runtime]
+# 262k:本档的目的就是这个数
+max_seq = 262144
+# chunk 512(**2026-10-19 实测定档**):同 prompt 下 247 tok/s vs chunk 128 的 ~170-183
+# (1.4×;小 chunk 的 GEMM M=128 太小),且 512 档**跑得完**。
+#   - 激活面:chunk 512 ⇒ 驱动 free 462 MiB(128 档 718 MiB)⇒ 仍有余量;
+#   - 边界数 = 262144/512 = 512 ⇒ 索引/快照/召回调和的次数随之降 4×
+#     (索引成本仍按**块**走 ⇒ 不随 chunk 降,那是 A3 的靶面);
+#   - `recall_every = 1`:保持"每 512 tok 一次完整召回"的节奏(与 128 档 every=4 同律)。
+prefill_chunk = 512
+
+[pool]
+# **意图值**(2026-10-19 实测定档 = **3 GiB / 98304 tok**):
+#   治理器 cap ≈130950 tok(4.0 GiB),但**吃满会把 chunk 激活面的余量挤掉** ——
+#   实测池 4 GiB 时装配后 free 823 MiB,chunk 512 的峰值(~0.7 GiB)把 free 压到
+#   129 MiB ⇒ 守卫拒发(响亮,不是静默)。留 ~1.8 GiB 余量 ⇒ 池取 3 GiB。
+#   缺口由宿主腿背(6 GiB ⇒ ~196k tok)⇒ 设备+宿主合计 294k ≥ 262k ✓
+#   (`pool_tokens = min(本行, cap)`)。boot 另有**池下限**硬校验:
+#     nb ≥ gdn_slots × (ceil(workspace_per_req/32) + ceil(chunk/32))
+#     304 ≥ 1 × (32 + 4) = 36                                  ✓
+pool_tokens = 98304
+gdn_slots = 1
+snap_max = 2
+# 24 GiB 贴顶:预留压到最小(本档实测装完池后 free ≈ 数百 MiB,守卫仍留 128 MiB)
+vram_reserve_mb = 128
+# **宿主双腿必须给量**(262k 的非驻留 KV 全落在这):
+#   - KV 腿:**实测 196k 时下沉 6090 块 ⇒ 6.09 GiB > 6 GiB ⇒ 守卫拒发**(2026-10-19);
+#     262k 全量 = (262144/32 − 常驻) ≈ **8160 块 = 8.0 GiB** ⇒ 给 **9 GiB**
+#     (设备池只留工作集 ⇒ 非驻留块**全部**得在宿主有位置,腿不能按"池的差额"算)
+#   - 状态腿:GDN 快照 576 MiB/张;2048 个边界会让它反复下沉/丢 ⇒ 给 2 GiB(可装 ~3 张)
+host_cache_mb = 9216
+snap_host_mb = 2048
+# ⚠️ 虚拟化档**必须开**(原地:下沉机制 = 缓存树 + 会话双持;boot 另有硬校验)
+prefix_cache = true
+
+[sampling]
+mode = "greedy"
+
+[kvmem]
+# ── 虚拟化两扇门(**同时为真**;所有解锁类护栏的唯一判据)──
+select_decode = true
+select_partial = true
+index = true
+# ── 锁①:允许池小于上下文(本档的核心) ──
+pool_overcommit = true
+# ── **每 turn 工作集**(token;含保底 sink/recent)──
+#   1024 tok = 32 页 = 常驻 32 块 = 保底 6 + 召回 top-k 26
+#   262k 下 8192 个候选块里只留 32 块 ⇒ 视图物化比 ≈0.4%;
+#   调大它 = 长 ctx 上"看得更全"(召回预算更大),代价是设备池工作集与每步读页数
+workspace_per_req = 1024
+select_sink = 2
+select_recent = 4
+recall_every = 1          # 与 chunk 512 配套:每 512 tok 一次完整召回
+# 诊断面:**生产档关**(真实质量扫描单次 6.3s = 墙钟 32%,见 §8.23)
+coverage_probe = false
+analyze_at_ctx = 0
+
+[dispatch]
+# fp8 池(生产 KV 类型)+ 索引采集的 fp8 页回读(见 `exec/kvpage.rs`)
+kv_fp8 = true
+prefill_split = true
+gdn_chunked = true
+allowed_ops = [
+        "gdn_chunked_delta_rule_fwd",
+        "cublas_gemm_f16", "flashinfer_prefill_paged_fp8kv",
+        "marlin_gemm_w4a16_awq",
+        # ---- W4A8 档(env `OWL_W4A8=1` 才实际发射)----
+        "marlin_gemm_w4a8_awq", "owl_quant_int8_row_f16", "owl_ct_repack_a8_u32",
+        "owl_add_f16",
+        "owl_argmax_f32idx_f16", "owl_cast_bf16_f16",
+        "owl_ct_repack_u32",
+        "owl_embed_f16", "owl_fused_add_rmsnorm_f16",
+        "owl_gdn_conv_fwd_f16", "owl_gdn_conv_upd_dual_f16",
+        "owl_gdn_decode_step_v2_f16", "owl_gdn_gating_g_f16",
+        "owl_gdn_l2norm_f16", "owl_gdn_norm_act_f16",
+        "owl_gdn_recurrence_varlen_gqa_f16", "owl_gemv_dual_f16",
+        "owl_narrow_strided_f16", "owl_norm_rope_f16",
+        "owl_qknorm_rope_kv_insert_f16_fp8kv_knhd", "owl_reshape_and_cache_fp8kv_knhd",
+        "owl_rmsnorm_f16", "owl_sigmoid_f16",
+        "owl_sigmoid_gate_mul_f16", "owl_silu_and_mul_f16",
+        "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256", "vllm_paged_attention_v2_fp8_knhd_hd256bs32",
+        "vllm_paged_attention_v2_reduce_f16_hd256",
+]
+
+[server]
+# 单会话语义(D1 2026-10-17 跨字段校验:`gdn_slots ≥ [server].max_concurrency`)——
+# 超了会把活跃会话的状态格 LRU 逐出(跨会话状态污染),boot 直接拒启。
+max_concurrency = 1

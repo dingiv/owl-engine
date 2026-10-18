@@ -31,6 +31,7 @@
 #![cfg(feature = "device")]
 
 mod fi_support;
+use owl_macros::owl_test;
 use fi_support::{f16_to_f32, TestRes, H, HD, HKV, PAGE};
 
 use std::time::Instant;
@@ -227,7 +228,9 @@ fn host_ref_knhd(q: &[u16], kc: &[u8], vc: &[u8], t: usize, ctx: usize) -> Vec<f
 // ============================================================================
 fn run_case(t: usize, ctx: usize, host_check: bool, iters: usize) {
     let nb = ctx.div_ceil(PAGE);
-    let mut res = TestRes::new(owl_shared::env_reader::parse_or("OWL_TEST_DEVICE", 0));
+    // 过供给探针(缺省 = 与真值同 ⇒ 历史口径零变化)
+    let plan_ctx = owl_shared::env_reader::parse::<usize>("FI_PF_PLAN_CTX").unwrap_or(ctx);
+    let mut res = TestRes::new(owl_cuda::test_device_ordinal());
     let mut exec = Exec::new();
     // 激活集 = 本探针要发射的那一个算子(A20/A16 之后:白名单外的声明不审
     // 孤儿 —— 见 registry::init_all_inner 的射程注)
@@ -278,7 +281,12 @@ fn run_case(t: usize, ctx: usize, host_check: bool, iters: usize) {
             Arg::Block { id: wr_b.id, dtype: Dtype::F16, rank: 1 },
             Arg::Block { id: out_b.id, dtype: Dtype::F16, rank: 2 },
             Arg::U64(t as u64),      // total_rows
-            Arg::U64(ctx as u64),    // ctx_total
+            // ⚠️ **过供给腿**(2026-10-18 图档桶化立案):`FI_PF_PLAN_CTX=<大 ctx>`
+            // ⇒ plan 按大上界算(表布局/瓦片数按上界),而**池表四件套仍按真 ctx**
+            // ⇒ 核内用真 kv_len 夹取、多出来的 kv_tile 落空 ⇒ 正是"信封上界 +
+            // 运行期夹取"的模拟(图档 plan 烘图后的形态)。判据 = host oracle。
+            Arg::U64(plan_ctx as u64), // ctx_total(plan 面)
+
             Arg::U64(t as u64),      // T
             Arg::U64(H as u64),      // hq
             Arg::U64(HKV as u64),    // hkv
@@ -363,12 +371,29 @@ fn run_case(t: usize, ctx: usize, host_check: bool, iters: usize) {
     }
 }
 
-#[test]
-fn fi_prefill_speed_and_parity() {
-    if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
-        return;
+/// **生产 chunk 形状阶梯**(2026-10-18):L4 尾块合并后 chunk 长 ∈ [513,1536],
+/// 加上 T=512 基准与并发批的形状面 —— 先看 FI 核时对 T 的标度是否线性
+/// (线性 ⇒ 无形状级拐点;亚线性 ⇒ 有固定开销;超线性 ⇒ 大 T 效率掉)。
+#[owl_test(gpu)]
+fn fi_prefill_chunk_ladder() {
+    // (T, ctx, host_check, iters)
+    let cases: &[(usize, usize, bool, usize)] = &[
+        (256, 16384, false, 20),
+        (512, 16384, false, 20),
+        (768, 16384, false, 20),
+        (1024, 16384, false, 20),
+        (1536, 16384, false, 20),
+        (2048, 16384, false, 20),
+        (512, 32768, false, 10),
+        (1024, 32768, false, 10),
+    ];
+    for &(t, ctx, hc, it) in cases {
+        run_case(t, ctx, hc, it);
     }
+}
+
+#[owl_test(gpu)]
+fn fi_prefill_speed_and_parity() {
     let only = owl_shared::env_reader::str("FI_PF_ONLY").unwrap_or_default();
     let host_all = owl_shared::env_reader::flag("FI_PF_HOST");
     println!(

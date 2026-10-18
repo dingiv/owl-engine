@@ -23,8 +23,36 @@ pub mod qknorm_insert;
 // 共享 host 参考件(与 `.cu` 语义手写对齐;零复用被测代码)
 // ============================================================================
 
-/// e4m3 码 → f32(OCP e4m3;0x7F = NaN)
+/// e4m3 码 → f32(OCP e4m3;0x7F = NaN)。
+///
+/// **实现 = 256 项查表**(2026-10-19,A3 实测):解析式每元素一次
+/// `2f32.powi(e−7)`(libm 调用,≈50 ns/elem)。在“逐 (块,层,头,token,维)”
+/// 的采集热路上那是致命开销 —— 27B fp8 池单块 **52 万元素 ⇒ 31 ms/块**
+/// (实测:`[idx]` 相位拆分 D2H 0.5 ms + host 30.9 ms),而每 512 tok 就要采
+/// 16 块 ⇒ **500 ms/边界**(超卖档 prefill 的头号开销)。
+///
+/// 表由 [`e4m3_decode_exact`](本模块的单源解析式)构造一次 ⇒ **语义逐位不变**
+/// (NaN 位型不保证,但仍是 NaN)。保留解析式 = 参考可读、可对照。
+#[inline]
 pub fn e4m3_decode(b: u8) -> f32 {
+    e4m3_lut()[b as usize]
+}
+
+/// **e4m3 全码表**(256 项)。热路应当**一次取引用**再逐元素查
+/// (`e4m3_decode` 单元素版每元素一次 `OnceLock` 原子读,在逐元素循环里不划算)。
+pub fn e4m3_lut() -> &'static [f32; 256] {
+    static LUT: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut t = [0.0f32; 256];
+        for (c, v) in t.iter_mut().enumerate() {
+            *v = e4m3_decode_exact(c as u8);
+        }
+        t
+    })
+}
+
+/// e4m3 码 → f32 的**解析式**(单源参考;[`e4m3_decode`] 的表就是它建的)。
+pub fn e4m3_decode_exact(b: u8) -> f32 {
     let s = if b & 0x80 != 0 { -1.0 } else { 1.0 };
     let e = ((b >> 3) & 0x0F) as i32;
     let m = (b & 0x07) as i32;

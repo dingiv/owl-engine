@@ -84,16 +84,23 @@ impl Tokenizer {
 
     /// 文本 → token id(不自动加特殊 token;调用方经 chat_wrap 拼模板)
     pub fn encode(&self, text: &str) -> Vec<u32> {
-        self.inner
-            .encode(text, false)
-            .map(|e| e.get_ids().to_vec())
-            .unwrap_or_default()
+        self.inner.encode(text, false).map(|e| e.get_ids().to_vec()).unwrap_or_else(|e| {
+            // 不静默(2026-10-17 审查 §六轮):编码失败 = 空 token 序列会让上层
+            // 以为"这段文本是空的" ⇒ 必须留下痕迹。**签名升 `Result` 是正解**,
+            // 影响面 = 16 处调用(engine 的 exec/detokenize 链),另案。
+            owl_shared::log_warn!("tok", "encode 失败({e});回退空序列");
+            Vec::new()
+        })
     }
 
     /// token id → 文本(skip special;增量解码 = 全量解码后取后缀差分,
     /// byte-level BPE 的多字节字符跨 token 场景由全量重解天然兜住)
     pub fn decode(&self, ids: &[u32]) -> String {
-        self.inner.decode(ids, true).unwrap_or_default()
+        self.inner.decode(ids, true).unwrap_or_else(|e| {
+            // 同上:失败 = 空串(上层会当成"没有输出")⇒ 留下痕迹
+            owl_shared::log_warn!("tok", "decode 失败({e});回退空串");
+            String::new()
+        })
     }
 
     /// 终止 token 判定(生成循环停机条件)

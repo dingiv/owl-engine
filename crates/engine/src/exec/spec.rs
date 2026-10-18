@@ -1,5 +1,6 @@
 //! spec 轮机器(execute_spec_round)+ 块表写 + GDN 快照
 use super::*;
+use owl_models::ModelError;
 
 impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// 投机轮执行(E5-M2b;施工方案 §9.2):快照 → 草稿到位 → verify
@@ -15,7 +16,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         gdn_slot: usize,
         grew: bool,
     ) -> Result<TurnEvent> {
-        let sid = self.turns.active.as_ref().expect("active 已保证").session_id;
+        let sid = self.turns.active()?.session_id;
         if grew {
             let ts_bt = std::time::Instant::now();
             self.write_bt(sid).await?;
@@ -31,17 +32,17 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let depth = self.dev.spec_rt.depth;
 
         // ① 快照(轮首;恢复后仍有效 → 只在失效时拍)
-        if !self.tspec().spec_snap_valid {
+        if !self.tspec()?.spec_snap_valid {
             let ts = std::time::Instant::now();
             let face = self.dev.graphs.session.face_mut();
             self.dev.pool.capture_spec_snap(face, gdn_slot).await?;
-            self.tspec().spec_snap_valid = true;
+            self.tspec()?.spec_snap_valid = true;
             t_snap = ts.elapsed();
         }
 
         // ② 草稿到位(host 账;轮末 propose 图/eager dtoh 产出。首轮 =
         // prefill seed propose(eager);Dumb = anchor 重复)
-        let drafts: Vec<u32> = if let Some(mut d) = self.tspec().spec_drafts_host.take() {
+        let drafts: Vec<u32> = if let Some(mut d) = self.tspec()?.spec_drafts_host.take() {
             // depth 联动截断(2026-10-09 depth=3 案):⑦ propose 恒产 7
             // 草稿,depth<7 时下轮 block=1+7 行装不进 T=depth+1 捕获图
             // (ids 8≠4 装填拒,pump 退役)。与轮首直调分支的
@@ -58,7 +59,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let ts = std::time::Instant::now();
             self.propose_first(token, pos).await?;
             t_propose += ts.elapsed();
-            self.tspec().spec_drafts_host.take().expect("propose_first 产出")
+            self.tspec()?.spec_drafts_host.take().ok_or_else(|| ModelError::EngineInvariant { what: "propose_first 未产出草稿(上游相位漂移)".into() })?
         } else {
             vec![token; depth] // Dumb:哑草稿 = anchor 重复
         };
@@ -71,28 +72,27 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let rows_n = block.len();
         // A11:采样接受开关 + 采样参数 + 惩罚历史(必须在借 verify_graph 前取好)
         let (sampler_on, sampler_cfg) = {
-            let act = self.turns.active.as_ref().expect("活跃");
+            let act = self.turns.active()?;
             (act.sampler_on, act.sampler)
         };
         let mut hist: Vec<u32> = {
-            let act = self.turns.active.as_ref().expect("活跃");
+            let act = self.turns.active()?;
             let tail = act.prompt_ids.len().saturating_sub(64);
             act.prompt_ids[tail..].iter().chain(act.out.iter()).copied().collect()
         };
         let seed_base = {
-            let act = self.turns.active.as_ref().expect("活跃");
+            let act = self.turns.active()?;
             act.seed.unwrap_or_else(|| act.id.wrapping_mul(0x9E3779B97F4A7C15))
         };
         // XQA 页表:在借 self.dev.graphs.verify 之前算好(自 sessions 取真块链)
         let xqa_pt_v = self.xqa_pt_of(sid);
-        // FI 断点臂的宿主标量槽(self.dev.graphs 的可变借用前取好,同 xqa_pt_v 纪律)
-        let fi_ctx_cell = self.dev.graphs.verify_fi_ctx();
+
         let (ids, hidden, records, hidden_owned, row_logits) =
             if let Some(vg) = self.dev.graphs.verify.as_mut() {
             let ts = std::time::Instant::now();
             let page = self.dev.pool.page;
             let bt_chain = {
-                let s = self.bank.sessions.get(sid).expect("账在");
+                let s = self.bank.sessions.session(sid)?;
                 s.block_table.clone()
             };
             let ids_f: Vec<f32> = block.iter().map(|&v| v as f32).collect();
@@ -129,9 +129,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // ② 表四件套(q_cu/indices/indptr/last_len;u32 位型过线)
             let page_fi = self.dev.pool.page;
             let ctx_total_fi = pos + block.len();
+            // 门 = **槽在场**(槽属于**图**;判"某核在场"必须看节点/槽,不看旋钮)
+            let fi_slots_on = vg.has_input("fi_q_cu");
             let (fi_q_cu_v, fi_idx_v, fi_indptr_v, fi_ll_v): (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) =
-                if let Some(cell) = fi_ctx_cell.as_ref() {
-                    cell.store(ctx_total_fi, std::sync::atomic::Ordering::Relaxed);
+                if fi_slots_on {
+                    // ⚠️ **必须写本轮真值**(verify 不吃桶化):T=8 的 plan split
+                    // chunk 数必须与核运行期 `ceil_div(kv_len, chunk)` 一致,否则
+                    // partial 行 stride 与 `merge_indptr` 打架(同参 A/B:桶 2048
+                    // ⇒ 空文本/`!!!`、42.9 t/s;真值 ⇒ 连贯 71 t/s)。
                     let nb_used = ctx_total_fi
                         .div_ceil(page_fi)
                         .min(bt_chain.len())
@@ -169,48 +174,27 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 ins.push(("fi_indptr", fi_indptr_v.as_slice()));
                 ins.push(("fi_last_len", fi_ll_v.as_slice()));
             }
+            // **FI plan 表同步(W4)**:单图档(`fi_plan_bake`)的 verify 图里 FI 核
+            // 不带自携表 ⇒ 每轮必须由图外刷**当轮精确表**(t=depth+1,ctx=本轮总长)。
+            // 与 decode 同律:表必须与运行期 chunk 数一一对应(T=8 过供给会错)。
+            // 门 = **档位在场** + 槽在场（W5：verify 恒随 `fi_plan_bake`；槽只证
+            // "本图带 FI 面"，档位证"表刷新面有人消费"）。
+            if self.cfg.knobs.fi_plan_bake.is_some() && fi_slots_on {
+                let d = self.dev.pool.dims;
+                let spec = owl_iface::contract::FiPlanSpec {
+                    t: block.len(),
+                    ctx_total: ctx_total_fi,
+                    hq: d.hq,
+                    hkv: d.hkv,
+                    hd: d.hd,
+                    page: self.dev.pool.page,
+                };
+                vg.face_mut().fi_plan_sync(spec).await?;
+            }
             let t_step_v = std::time::Instant::now();
             vg.step(&ins).await?;
             let t_read_v = std::time::Instant::now();
             let tok_f = vg.read_output_f32("tok").await?;
-            // 诊断(perf 会话排查用;`OWL_PW_DUMP_TOK=1`):verify 行 0..7 的
-            // 候选 token —— piecewise 断裂时最直接的判据(常量/零 = 读未写值)
-            if owl_shared::env_reader::flag("OWL_PW_DUMP_TOK") {
-                eprintln!("[pw-tok] pos={pos} tok={:?}", tok_f);
-                let h = vg.read_output_f32("hid").await?;
-                let (mut nan, mut mx, mut sum) = (0usize, 0f32, 0f64);
-                for v in h.iter() {
-                    if v.is_nan() {
-                        nan += 1;
-                    }
-                    mx = mx.max(v.abs());
-                    sum += *v as f64;
-                }
-                eprintln!(
-                    "[pw-hid] pos={pos} n={} nan={nan} absmax={mx:.3e} mean={:.3e} first4={:?}",
-                    h.len(),
-                    sum / h.len().max(1) as f64,
-                    &h[..4.min(h.len())]
-                );
-                let ops = vg.pw_break_operand_stats(0).await?;
-                eprintln!(
-                    "[pw-op] pos={pos} :: {}",
-                    ops.iter()
-                        .map(|(i, n, dt, nan, mx)| format!("#{i}[{dt:?}] n={n} nan={nan} max={mx:.2e}"))
-                        .collect::<Vec<_>>()
-                        .join(" | ")
-                );
-                let pins = vg.pw_pin_stats().await?;
-                eprintln!(
-                    "[pw-pin] pos={pos} n={} :: {}",
-                    pins.len(),
-                    pins.iter()
-                        .take(4)
-                        .map(|(n, nan, mx)| format!("{n}元素/nan={nan}/max={mx:.2e}"))
-                        .collect::<Vec<_>>()
-                        .join(" | ")
-                );
-            }
             let t_tok = std::time::Instant::now();
             // A11:采样档额外回读 per-row logits([depth1, vocab];仅采样档付)
             let row_logits = if sampler_on {
@@ -238,11 +222,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             mrec("spec.verify.lgread", t_lg.elapsed());
             mrec("spec.verify.read", t_read_v.elapsed());
             let ids: Vec<u32> = tok_f.iter().map(|&v| v as u32).collect();
-            let hidden = vg.output_block("hid").expect("hid 输出槽");
+            let hidden = vg.output_block("hid").ok_or_else(|| ModelError::EngineInvariant { what: "verify 图输出槽 hid 缺席(图装配与声明不一致)".into() })?;
             let n_rec = self.dev.pool.gdn_count() * 8;
             let records: Vec<Bytes> = (0..n_rec)
-                .map(|i| vg.output_block(&format!("r{i}")).expect("fold 记录槽"))
-                .collect();
+                .map(|i| {
+                    vg.output_block(&format!("r{i}")).ok_or_else(|| ModelError::EngineInvariant {
+                        what: format!("fold 记录槽 r{i} 缺席(图装配与声明不一致)"),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
             t_verify = ts.elapsed();
             (ids, hidden, records, false, row_logits) // 图输出槽:持久,不 free
         } else {
@@ -301,7 +289,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let degraded_now;
         if self.dev.spec_rt.dflash_tap_count > 0 && self.probes.degrade_after > 0 {
             let (degrade_after, probe_every0) = (self.probes.degrade_after, self.probes.probe_every);
-            let spec = self.tspec();
+            let spec = self.tspec()?;
             spec.recent_rounds += 1;
             spec.recent_tokens += (m + 1) as u32;
             // 轮时进窗口(时间门 + 绝对吞吐;t_round 在下方 EWMA 处已用)
@@ -326,13 +314,16 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             //    (超长轮 150-300ms 下等 16 轮 = 2.4-4.8s,反应太慢);
             // ③ 评估时给出**绝对吞吐**读数(tok/s)便于日志对账。
             let _ctx_sampled = spec.bare_cost_ctx;
-            // ctx 换档**不作废**分母(2026-10-14 实测修正):裸步成本几乎不随
-            // ctx 变(25.3→26.4 ms @610→9010,±5%),而轮时才是 ctx 相关项 ⇒
-            // 保鲜的分母在换档后依然有效;作废只会退到保守兜底并**过度降级**
-            // (实测 ctx 2116→7870 时 AL 2.0 本可盈利,却被兜底 2.5 误降)。
-            // 采样点 `spec.bare_cost_ctx` 作日志/诊断用(_ctx_sampled)。
+            // ⚠️ **2026-10-14 那条结论已被 2026-10-17 实测推翻**:当时看“裸步成本
+            // 几乎不随 ctx 变(25.3→26.4 ms @610→9010,±5%)”⇒ 取消 ctx 作废;
+            // 但在 **32k** 上裸步 = 38.4 ms(pos 564 时为 24.5 ms,**+57%**)——
+            // 那条实测只覆盖到 9k ⇒ 作废规则已**恢复**(`scheduler.rs` “分母与
+            // ctx 配对”),并用**播种步**重采(否则作废后会回到无分母态)。
             let (rc, bc) = (spec.round_cost_ewma_ms, spec.bare_cost_ewma_ms);
-            let break_even = if rc > 0.0 && bc > 0.0 { (rc / bc).clamp(2.0, 6.0) } else { 2.5 };
+            // 盈亏线 = 轮/裸 实测比(夹 [2.0,6.0]);`None` = 分母未测
+            // ⇒ **窗口判据不生效**(2026-10-17:旧兜底常量 2.5 在 32k 会把
+            // 盈利档 AL 2.25 误降级;分母已由首 turn 播种步补上,见 break_even_line)
+            let break_even = crate::exec::break_even_line(rc, bc);
             const WINDOW_ROUNDS: u32 = 16;
             const WINDOW_MS: f32 = 600.0;
             let window_starved =
@@ -342,18 +333,44 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     spec.recent_rounds = 0;
                     spec.recent_tokens = 0;
                     spec.recent_ms = 0.0;
-                    let starved = avg < break_even;
-                    if starved {
-                        owl_shared::log_warn!("spec-degrade", "窗口 AL={avg:.2} < 盈亏线 {break_even:.2}(轮 {rc:.0}ms/裸 {bc:.0}ms;窗口吞吐 {win_tps:.1} tok/s)"
+                    let starved = break_even.is_some_and(|line| avg < line);
+                    if starved || break_even.is_none() {
+                        let line = crate::exec::break_even_text(break_even);
+                        let why = if break_even.is_none() {
+                            "(分母未测 ⇒ 本轮不判;播种步在首 turn 发出)"
+                        } else {
+                            ""
+                        };
+                        owl_shared::log_warn!("spec-degrade", "窗口 AL={avg:.2} vs 盈亏线 {line}{why}(轮 {rc:.0}ms/裸 {bc:.0}ms;窗口吞吐 {win_tps:.1} tok/s)"
                         );
                     }
                     starved
                 } else {
                     false
                 };
-            let degraded = degraded0 || window_starved;
+            // ── **连击判据的闸门**(2026-10-18 实测立案)──
+            //
+            // 连击(m=0×6)只说明"最近 6 轮草稿全灭",**不代表投机本身亏本**:
+            // 实测(重复上下文,ctx 8.5k)一次连击触发降级时,窗口 AL ≈ **2.9-3.9
+            // tok/轮**,而盈亏线 = 轮/裸 ≈ 2.0 ⇒ 留在 spec 每 token ≈ 9.4 ms,
+            // 降级裸步 **27.5 ms/token** ⇒ **一次误降级罚 ~1.4 s**(占该请求
+            // 解码相位 35%)。而连击真正该抓的是"草稿系统性坏掉"(此时窗口 AL
+            // 也会塌到线下)。
+            //
+            // ⇒ 连击只在**窗口 AL 也低于盈亏线**时才降级(用**当前部分窗口**,
+            // 不等 16 轮门);已降级态照旧保持(出口 = 探测命中)。
+            // 分母未测(break_even=None)⇒ 不因连击降级(保守留在 spec;窗口判据
+            // 此时同样不生效,播种步会在首 turn 补上分母)。
+            let al_partial = if spec.recent_rounds > 0 {
+                spec.recent_tokens as f32 / spec.recent_rounds as f32
+            } else {
+                f32::INFINITY
+            };
+            let streak_gate = break_even.is_some_and(|line| al_partial < line);
+            let degraded = window_starved || (degraded0 && (spec.spec_degraded || streak_gate));
             if degraded && !spec.spec_degraded {
-                owl_shared::log_warn!("spec-degrade", "m=0×{streak} win_starved={window_starved} 盈亏线={break_even:.2} → 降级裸 decode(probe 每 {probe_every} tok)"
+                let line = crate::exec::break_even_text(break_even);
+                owl_shared::log_warn!("spec-degrade", "m=0×{streak} win_starved={window_starved} 盈亏线={line} → 降级裸 decode(probe 每 {probe_every} tok)"
                 );
                 mcnt("spec.degrade", 1);
                 spec.spec_drafts_host = None;
@@ -378,7 +395,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             mcnt("spec.al.win", u64::from(spec.recent_tokens * 100 / spec.recent_rounds.max(1)));
             degraded_now = degraded;
         } else {
-            degraded_now = self.tspec_ref().spec_degraded;
+            degraded_now = self.tspec_ref()?.spec_degraded;
         }
         // P0 修(2026-10-12):降级态在 emit 循环前定格 —— 预算/EOS 会在
         // 循环内 complete()(active 被取走),循环后触 tspec() = panic
@@ -429,7 +446,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let ts = std::time::Instant::now();
             let d = self.propose_graph_step(m, &toks, pos).await?;
             t_propose += ts.elapsed();
-            self.tspec().spec_drafts_host = Some(d);
+            self.tspec()?.spec_drafts_host = Some(d);
         } else if self.dev.spec_rt.drafter.is_some() {
             let ts = std::time::Instant::now();
             let nd = self.propose_round(&hidden, m, &toks, pos).await?;
@@ -441,7 +458,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 face.dtoh(&nd, &mut buf).await?;
                 face.free(&[nd.id]).await?;
             }
-            self.tspec().spec_drafts_host = Some(
+            self.tspec()?.spec_drafts_host = Some(
                 buf.chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
                     .collect(),
@@ -551,15 +568,22 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
             }
         }
-        self.tspec().spec_snap_valid = false;
+        self.tspec()?.spec_snap_valid = false;
 
         // ⑥ 提交:fed = bonus 位(F');发射 = 接受 drafts + bonus(m+1)
         // (A11:采样档 emitted = 采样表前 m+1 位;贪心档 = ids[..=m])
         let toks: Vec<u32> = emitted;
         {
-            let act = self.turns.active.as_mut().expect("活跃");
+            let act = self.turns.active_mut()?;
             act.fed = pos + m + 1;
         }
+        // ⚠️ **不要在 spec 轮里拍页边界快照**(2026-10-19 试过并撤回):
+        // ①`act.out` 的提交在本函数更后面 ⇒ 此处 `fed` 领先 `out`,
+        // `capture_gdn_snap` 的 `tokens_upto` 立刻报"token N 未喂"(实测);
+        // ②即便挪到提交之后,spec 轮**大多跨过**边界、状态已过界 ⇒ 按边界键存
+        // = 静默错值。中段回卷法(用 `fold` 族把状态卷到边界再拍)见
+        // `docs/arch/agent-服务面-设计与施工.md` §9.1(5)a —— 未做。
+        let _ = sid;
 
         // ⑦ extend + propose(同迭代消费 verify hidden;产出下轮草稿
         // host 账)。DFlash2 = encode + 噪声块 propose;图态 = 桶 m 一发
@@ -575,18 +599,23 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             if self.dev.graphs.dflash.is_some() && !self.probes.dflash_eager {
                 let d = self.dflash_graph_round(m, pos, toks[m]).await?;
                 t_propose += ts.elapsed();
-                self.tspec().spec_drafts_host = Some(d);
+                self.tspec()?.spec_drafts_host = Some(d);
             } else {
             let noencode = self.probes.dflash_noencode;
             let taps: Vec<owl_iface::contract::Bytes> = (0..self.dev.spec_rt.dflash_tap_count)
                 .map(|i| {
-                    self.dev.graphs.verify
+                    self.dev.graphs
+                        .verify
                         .as_ref()
-                        .expect("dflash 模式要求 verify 图(taps 输出)")
+                        .ok_or_else(|| ModelError::EngineInvariant {
+                            what: "dflash 模式要求 verify 图(taps 输出)".into(),
+                        })?
                         .output_block(&format!("tap{i}"))
-                        .expect("tap 输出槽")
+                        .ok_or_else(|| ModelError::EngineInvariant {
+                            what: format!("tap{i} 输出槽缺席(草稿档位不一致)"),
+                        })
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             if !noencode {
                 self.dflash_encode(&d2, &taps, m, pos).await?;
             }
@@ -598,13 +627,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 owl_shared::log_debug!("dflash-probe", "pos={fp} bonus={bonus} drafts={d:?} txt={toks_txt:?}");
             }
             t_propose += ts.elapsed();
-            self.tspec().spec_drafts_host = Some(d);
+            self.tspec()?.spec_drafts_host = Some(d);
             }
         } else if !self.dev.graphs.propose.is_empty() && !self.probes.propose_eager {
             let ts = std::time::Instant::now();
             let d = self.propose_graph_step(m, &toks, pos).await?;
             t_propose += ts.elapsed();
-            self.tspec().spec_drafts_host = Some(d);
+            self.tspec()?.spec_drafts_host = Some(d);
         } else if self.dev.spec_rt.drafter.is_some() {
             let ts = std::time::Instant::now();
             let nd = self.propose_round(&hidden, m, &toks, pos).await?;
@@ -616,7 +645,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 face.dtoh(&nd, &mut buf).await?;
                 face.free(&[nd.id]).await?;
             }
-            self.tspec().spec_drafts_host = Some(
+            self.tspec()?.spec_drafts_host = Some(
                 buf.chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
                     .collect(),
@@ -736,34 +765,456 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     }
 
     pub(crate) async fn write_bt(&mut self, sid: u64) -> Result<()> {
-        let table = self.bank.sessions.get(sid).expect("账在").block_table.clone();
+        let table = self.bank.sessions.session(sid)?.block_table.clone();
         let face = self.dev.graphs.session.face_mut();
         self.dev.pool.write_bt(face, &table).await
     }
 
-    /// **快照键与槽**(host 侧推导;`None` = 该档无快照面/块链不足)。
-    /// 取键一次、两 rank 共用(键 = 边界覆盖块;两 rank 块链同构)。
-    pub(crate) fn snap_key_of(&self, sid: u64, fed: usize) -> Option<(usize, u32)> {
-        if self.dev.pool.snap_capacity() == 0 {
-            return None;
+
+    /// GDN 快照拍摄(E2c;块边界跨越时调用):会话格状态 → 槽位缓冲。
+    ///
+    /// **key = 边界块的内容身份**(逐块父链哈希;`owl_store::ChainCursor`)
+    /// —— **不是**物理块号:物理块号是会被回收复用的槽号(`decref` 归零 →
+    /// 自由队列 → 下次分配即拿回),拿它当键 ⇒ 槽复用后 `has_snap(旧槽号)`
+    /// 命中**别人的状态** = 静默错值(定谳见 store 设计卷 §9.1)。
+    /// 边界 token 段来源 = 本 turn 的完整 token 链(`prompt_ids ++ out`;
+    /// prefill 期落在 prompt 内,decode 期跨到生成段)—— `fed` 单调不减。
+    /// 槽位选择/LRU 覆盖写在 StatePool::capture_snap(state.rs)。
+    /// **块边界事件**(唯一入口;一次算身份、三件事共用)。
+    ///
+    /// 三件(2026-10-19 解耦;原先全被 `snap_max == 0` 一起门掉 —— **语义错**):
+    /// ① **链推进 + 逐块身份哈希**(总是;身份是索引与缓存树的共同键);
+    /// ② **增量登记进缓存树**(`select_partial`;不登记 ⇒ 块永远 refs==1 ⇒
+    ///    结构性不可沉,超卖档直接失效);
+    /// ③ **索引采集**(`index_probe`;打分的前置件);
+    /// ④ **GDN 快照拍摄**(仅 `pool.snap_capacity() > 0`;前缀复用面)。
+    ///
+    /// 为什么必须解耦:①③ 是**超卖机制的必需品**,② 是下沉的必需品 ——
+    /// 它们与"要不要拍快照"无关。旧实现把四件塞在一个 `snap_max == 0 ⇒ return`
+    /// 之后:关快照面 ⇒ **索引不采 + 块不入树 ⇒ 静默不沉**(实测 `snap_max = 0`
+    /// 档:下沉 0 块 / 不可沉 1680 块;prefill 假快 942 tok/s)。
+    pub(crate) async fn capture_gdn_snap(&mut self, sid: u64, fed: usize) -> Result<()> {
+        // 快照面开关(只门住第 ④ 步;前三步照走)
+        let snap_on = self.dev.pool.snap_capacity() > 0;
+        let page = self.dev.pool.page;
+        let full_blocks = fed / page;
+        if page == 0 || full_blocks == 0 {
+            return Ok(()); // 边界 0 = 无已完整块,无状态可拍
         }
-        let s = self.bank.sessions.get(sid).expect("账在");
-        let bi = fed / self.dev.pool.page - 1;
-        Some((s.gdn_slot, *s.block_table.get(bi)?))
+        // 1) 纯读游标位置(借用即散)
+        let start = self.bank.sessions.get(sid).map(|s| s.chain.blocks()).unwrap_or(0);
+        if self.cfg.knobs.probes.debug {
+            owl_shared::log_debug!(
+                "dbg snap",
+                "fed={fed} full_blocks={full_blocks} start={start} snap_on={snap_on} cap={} used={}",
+                self.dev.pool.snap_capacity(),
+                self.dev.pool.snap_used()
+            );
+        }
+        if start >= full_blocks {
+            return Ok(()); // 幂等:同一 fed 不重复拍(状态由同一 token 链唯一确定)
+        }
+        // 2) 取新增整块的 token 段(活跃 turn 的链面)
+        let seg = self.tokens_upto(start * page, full_blocks * page)?;
+        // 3) 推进身份链(段长不符 = 结构性拒,不静默;逐块哈希在同一处重放
+        //    —— 身份与游标同源 `owl_store::hash_block`)
+        let (gdn_slot, key, per_block, parent0) = {
+            let s = self
+                .bank
+                .sessions
+                .get_mut(sid)
+                .ok_or_else(|| ModelError::Msg(format!("会话 {sid} 不在账")))?;
+            let parent0 = s.chain.tail();
+            let tail = s.chain.advance(page, &seg, full_blocks).ok_or_else(|| {
+                ModelError::Msg(format!(
+                    "链哈希游标推进失败:sid={sid} fed={fed} start={start} 新增 {} 块",
+                    full_blocks.saturating_sub(start)
+                ))
+            })?;
+            // **B-0 索引面:本事件新增的**每一个**整块身份**(2026-10-18 修:
+            // 原先只登记 `full_blocks-1` 一块 —— chunk 512 时每次事件跨 16 块,
+            // 洋 15 块永不进索引(实测 112 块只有 7 块在场,覆盖率曲线被打崩)。
+            // 游标只留链尾 ⇒ 逐块哈希在此重放一小段;重放尾必与 advance 同值
+            // (dev 档硬断;身份只有一份实现)。
+            let mut per = Vec::with_capacity(full_blocks - start);
+            let mut parent = parent0;
+            for b in start..full_blocks {
+                let lo = (b - start) * page;
+                parent = owl_store::hash_block(parent, &seg[lo..lo + page]);
+                per.push((parent, b));
+            }
+            debug_assert_eq!(parent, tail, "逐块重放尾哈希须与 advance 一致(身份单源)");
+            // S2b:快照拍摄用的是**本 turn 的行**(turn 域资源)
+            (
+                self.turns.active.as_ref().map(|a| a.gdn_slot).unwrap_or(0),
+                owl_store::SnapKey::at_boundary(tail),
+                per,
+                parent0, // = 本次推进前的链尾(增量登记起点)
+            )
+        };
+        // **S2(§25.2)**:槽位选择 + 冷快照下沉 —— 快照账的真源是 store 的
+        // `StateStore`;设备池只做槽位索引。槽满时先**下沉最冷的一条**
+        // (内容留宿主),沉不下(宿主满/关)才丢(响亮打点)。
+        if snap_on {
+            let slot = self.snap_ensure_slot(key).await?;
+            // 两 rank 各拍各自的池(镜像分配 ⇒ slot 号同构);
+            // store 的 state 账是 **host 单份** ⇒ 身份只登记一次(内容相同)。
+            {
+                let (dev, peer) = (&mut self.dev, self.peer.as_mut());
+                match peer {
+                    None => dev.snap_dev(gdn_slot, key, slot).await?,
+                    Some(p) => {
+                        let (r0, r1) = join2(
+                            dev.snap_dev(gdn_slot, key, slot),
+                            p.snap_dev(gdn_slot, key, slot),
+                        )
+                        .await;
+                        r0?;
+                        r1?;
+                    }
+                }
+            }
+            if self.cfg.knobs.probes.debug {
+                owl_shared::log_debug!(
+                    "dbg snap",
+                    "捕获 fed={fed} key={key:?} slot={slot} ⇒ used={}",
+                    self.dev.pool.snap_used()
+                );
+            }
+            // 登记/触达(层 = 设备)
+            self.bank
+                .rel
+                .state
+                .register_snap(key, self.dev.pool.snap_bytes(), owl_store::Tier::Gpu);
+        }
+        // **B 轴 B-0:同一处顺手采索引**(同一"块边界 + 链尾身份"事件 ⇒
+        // 一次算身份、一次推进游标;索引与 GDN 快照共享边界身份)。
+        // 逐块登记:物理页由**会话块表**定(池可被多会话共享;旧实现拿
+        // 逻辑块号当物理页号 = 单会话且顺序分配才对)。
+        // 会话块表快照(两个块共用:增量登记要真槽、索引采集要物理页)
+        let bt_now: Vec<u32> = self
+            .bank
+            .sessions
+            .get(sid)
+            .map(|s| s.block_table.clone())
+            .unwrap_or_default();
+        // ── **B-3e-2 第 2b 项:轮内增量登记**(`select_partial` 档)──
+        // 宿主层按**缓存树条目**键控 ⇒ 不登记就沉不了(refs == 1;硬沉会造自由槽)。
+        // `parent0` = 本次推进前的链尾(= 上次登记的尾,逐块父链连续)⇒
+        // 每块一次哈希,全 turn O(n)。只登记**真槽**块(占位块本来就在树里)。
+        if self.cfg.knobs.select_partial {
+            let bt = bt_now.clone();
+            let mut blk_slices: Vec<(&[u32], u32)> = Vec::new();
+            for (_, blk) in per_block.iter() {
+                let slot = bt.get(*blk).copied().unwrap_or(u32::MAX);
+                if owl_store::is_host_placeholder(slot) {
+                    continue;
+                }
+                let lo = (*blk - start) * page;
+                blk_slices.push((&seg[lo..lo + page], slot));
+            }
+            if !blk_slices.is_empty() {
+                let up = self.bank.rel.leg.register_chain_inc(parent0, &blk_slices)?;
+                mcnt("store.chain.inc.blocks", up.inserted.len() as u64);
+                mcnt("store.chain.inc.evicted", up.evicted.len() as u64);
+                // **A1 取证**(`OWL_RECON_DBG=1`):注册口三数 —— 送入 / 入树 / 被逐。
+                // 入树为 0 就是"块永远 refs==1 ⇒ 不可沉"的直接原因。
+                if std::env::var_os("OWL_RECON_DBG").is_some() {
+                    eprintln!(
+                        "[chain-inc] 送 {} 片 · **入树 {}** · 被逐 {} · parent0={:?}",
+                        blk_slices.len(),
+                        up.inserted.len(),
+                        up.evicted.len(),
+                        parent0
+                    );
+                }
+            } else if std::env::var_os("OWL_RECON_DBG").is_some() {
+                eprintln!("[chain-inc] 空:per_block={} 全被跳过", per_block.len());
+            }
+        }
+        // **B 轴 B-0:索引采集**(同一"块边界"事件;同样逐块、物理页由会话块表定)
+        if self.cfg.knobs.index_probe {
+            for (hash, blk) in per_block {
+                let Some(phys) = bt_now.get(blk).copied() else {
+                    return Err(ModelError::Msg(format!(
+                        "索引采集:逻辑块 {blk} 无物理页(块表 {} 项)",
+                        bt_now.len()
+                    )));
+                };
+                // **占位块跳过**(部分驻留档:内容在宿主 ⇒ 没有设备页可回读)。
+                // 索引是**内容身份**键控的 ⇒ 该块在沉走之前就已采过(幂等早退也会挡),
+                // 拿占位符当页号算 dtoh 偏移 = 越界读(27B Stage2 实测踩出)。
+                if owl_store::is_host_placeholder(phys) {
+                    mcnt("store.index.skip.host", 1);
+                    continue;
+                }
+                let phys = phys as usize;
+                self.collect_index_for_block(hash, blk, phys).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// **B-0 索引采集**(回读形态;§8.1 路 A):块完成 ⇒ 回读该块物理页 K →
+    /// host **逆 RoPE**(核内约定 = rotate-half + partial 直通,见 §8.2)→ 逐
+    /// (层, KV 头) 求 Mean-K → `Rel::index_register`(账 = host/Index)。
+    ///
+    /// - `block_hash` = 该块的**内容身份**(逐块父链哈希,调用方已算 ——
+    ///   与 GDN 快照同源);
+    /// - `logical_block` = 逻辑块号(定**位置** = `logical_block·page + t`);
+    /// - `phys_page` = 会话块表里的**物理页号**(回读偏移的真源;池可共享)。
+    ///
+    /// 关(缺省)= 调用方不调(零开销)。
+    pub(crate) async fn collect_index_for_block(
+        &mut self,
+        block_hash: owl_store::ChainHash,
+        logical_block: usize,
+        phys_page: usize,
+    ) -> Result<()> {
+        let Some(ix_geom) = self.bank.rel.index.as_ref().map(|i| i.geometry()) else {
+            return Ok(()); // 索引未注册(未开采集)
+        };
+        let (dim, layers, kv_heads) = ix_geom;
+        let page = self.dev.pool.page;
+        let block = logical_block;
+        let (hkv, hd) = (self.dev.pool.dims.hkv, self.dev.pool.dims.hd);
+        if hd != dim || hkv != kv_heads {
+            return Err(owl_iface::contract::ModelError::Msg(format!(
+                "索引几何与池不符:index (dim={dim}, hkv={kv_heads}) ≠ pool (hd={hd}, hkv={hkv})"
+            )));
+        }
+        // **池页格式从池实况取**(单源:`KvPageFormat::of_pool`)——
+        // f16 / fp8 e4m3 两侧同一寻址式,只差元素宽与转换律
+        // (`owl_models::kernel::e4m3_decode`)。此前写死 f16 并对 fp8 响亮拒 ⇒
+        // **27B 的 fp8 生产档根本开不了选择层**(fp8 才是它在产 KV 格式)。
+        let fmt = crate::exec::kvpage::KvPageFormat::of_pool(self.dev.pool.kv_fp8);
+        if self.bank.rel.index.as_ref().is_some_and(|i| i.contains(block_hash)) {
+            return Ok(()); // 幂等(同一块重复拍)
+        }
+        let mut collector = owl_store::MeanKCollector::new(dim, layers, kv_heads)?;
+        let t_index = std::time::Instant::now();
+        // 逐层回读该块的**物理页** K —— **一条批量命令**(原每层一次同步往返:
+        // 27B = 16 层 × 每块一次 ⇒ 8192 块 = 13 万次往返,分钟级;设计卷 §10.3 推论 B)
+        let page_bytes = fmt.page_bytes(page, hkv, hd);
+        let mut pieces: Vec<(&owl_iface::contract::Bytes, usize, usize)> = Vec::new();
+        for kv in self.dev.pool.kvs.iter().take(layers) {
+            pieces.push((&kv.k_cache.0, phys_page * page_bytes, page_bytes));
+        }
+        let all = {
+            let face = self.dev.graphs.session.face_mut();
+            face.dtoh_batch(&pieces).await?
+        };
+        let t_host = std::time::Instant::now();
+        let dtoh_ms = t_host.duration_since(t_index).as_secs_f64() * 1000.0;
+        let mut row = vec![0.0f32; hd];
+        for (li, _kv) in self.dev.pool.kvs.iter().enumerate().take(layers) {
+            let kbuf = &all[li * page_bytes..(li + 1) * page_bytes];
+            // 逐 token × 头:逆 RoPE(cos/sin 来自 host 侧同源表)+ 累加
+            // 位置 = **逻辑**位置(logical_block·page + t;物理页号不参与位置)
+            for t in 0..page {
+                let pos = block * page + t;
+                let Some((cos, sin)) = self.dev.rope.cos_sin_at(pos) else { continue };
+                for h in 0..hkv {
+                    fmt.decode_row(kbuf, t, h, hkv, hd, &mut row)?;
+                    collector.push_post_rope_halves(li, h, &row, cos, sin)?;
+                }
+            }
+        }
+        let entries = collector.finish()?;
+        self.bank.rel.index_register(block_hash, entries)?;
+        let el = t_index.elapsed().as_secs_f64() * 1000.0;
+        self.prof.index_ms += el;
+        // **相位拆分**(`OWL_IDX_DBG=1`;A3 定位用,2026-10-19):
+        // 块级索引采集 = ①批量 D2H(排空 COMPUTE)②host 逐 token×头解码/逆RoPE/累加。
+        // 两半的优化手段完全不同(① 合并命令/上设备 ② SIMD/上设备)⇒ 必须分开量。
+        if std::env::var_os("OWL_IDX_DBG").is_some() {
+            let host_ms = t_host.elapsed().as_secs_f64() * 1000.0;
+            eprintln!(
+                "[idx] block={block} 总 {el:.1}ms = D2H {dtoh_ms:.1} + host {host_ms:.1}\
+                 (页 {page} tok × {layers} 层 × {hkv} 头 = {} 行)",
+                page * layers * hkv
+            );
+        }
+        Ok(())
+    }
+
+    /// **快照落设备槽**(S2 §25.2;编排:store 出计划 → `face.swap` → 记账)。
+    ///
+    /// - 同 key 已在设备 ⇒ 原地槽(幂等重拍);
+    /// - 空槽 ⇒ 直接用;
+    /// - 池满 ⇒ 最冷的设备快照**先下沉**(内容留);宿主满/关 ⇒ 丢(丢 = 状态没了,
+    ///   下次该边界不可复用 —— 与旧行为同,但现在有账可查);
+    /// - 池关(`snap_max = 0`)⇒ 结构性拒(调用方已先行跳过)。
+    pub(crate) async fn snap_ensure_slot(&mut self, key: owl_store::SnapKey) -> Result<u32> {
+        use crate::state::SnapSlotPick;
+        let pick = self.dev.pool.snap_pick_slot(key).ok_or_else(|| {
+            owl_iface::contract::ModelError::Msg(
+                "GDN 快照池为空(snap_max = 0):调用方应跳过 capture".into(),
+            )
+        })?;
+        match pick {
+            SnapSlotPick::Hit(slot) | SnapSlotPick::Free(slot) => Ok(slot),
+            SnapSlotPick::Victim(slot, victim) => {
+                match self.snap_offload(victim, slot).await {
+                    Ok(()) => {
+                        self.dev.pool.snap_clear_slot(slot);
+                        return Ok(slot);
+                    }
+                    Err(e) => {
+                        // 收编为结构化 WARN(2026-10-18 T1;原为 `DBG-SNAP` 直接打印)
+                        owl_shared::log_warn!("store", "快照下沉失败: {e}");
+                    }
+                }
+                // 沉不下 ⇒ 丢(内容整体消失;宿主副本同步丢)
+                owl_shared::log_debug!(
+                    "store",
+                    "快照槽满且宿主不可用 ⇒ 丢弃最冷快照 {victim:?}(该边界将不可复用)"
+                );
+                self.bank.rel.drop_snap_host(victim)?;
+                if let Err(e) = self.bank.rel.state.drop_snap(victim) {
+                    owl_shared::log_debug!("store", "快照 {victim:?} 出账: {e}");
+                }
+                owl_shared::metrics::with_metrics_store(|m| {
+                    m.counter_add("store.snap.drop", 1, file!(), line!());
+                });
+                self.dev.pool.snap_clear_slot(slot);
+                Ok(slot)
+            }
+        }
+    }
+
+    /// **快照下沉**(设备槽 → 宿主;一条 swap 搬 N 片)。
+    pub(crate) async fn snap_offload(&mut self, key: owl_store::SnapKey, slot: u32) -> Result<()> {
+        let (pieces, table) = self.bank.rel.plan_snap_offload(key, slot)?;
+        let face = self.dev.graphs.session.face_mut();
+        let conn = match face
+            .swap(owl_iface::contract::SwapDir::Out, &pieces, Box::new(table))
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                self.bank.rel.abort_snap_offload(key);
+                return Err(owl_iface::contract::ModelError::Msg(format!(
+                    "快照下沉 swap 失败:{e}"
+                )));
+            }
+        };
+        let table = owl_store::reclaim_slot_table(conn)?;
+        self.bank.rel.commit_snap_offload(key, table)?;
+        owl_shared::metrics::with_metrics_store(|m| {
+            m.counter_add("store.snap.out", 1, file!(), line!());
+            m.counter_add(
+                "store.snap.out.bytes",
+                self.bank.rel.snap_bytes() as u64,
+                file!(),
+                line!(),
+            );
+        });
+        Ok(())
+    }
+
+    /// **快照回灌**(宿主 → 设备槽;一条 swap 搬 N 片)。
+    pub(crate) async fn snap_onload(&mut self, key: owl_store::SnapKey, slot: u32) -> Result<()> {
+        let (pieces, table) = self.bank.rel.plan_snap_onload(key, slot)?;
+        let face = self.dev.graphs.session.face_mut();
+        let conn = match face
+            .swap(owl_iface::contract::SwapDir::In, &pieces, Box::new(table))
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                // 台子随失败的 connector 消失 ⇒ 内容已丢 ⇒ 条目一并删
+                self.bank.rel.abort_snap_onload(key);
+                return Err(owl_iface::contract::ModelError::Msg(format!(
+                    "快照回灌 swap 失败:{e}"
+                )));
+            }
+        };
+        let table = owl_store::reclaim_slot_table(conn)?;
+        self.bank.rel.commit_snap_onload(key, table)?;
+        self.dev.pool.snap_place(slot, key);
+        owl_shared::metrics::with_metrics_store(|m| {
+            m.counter_add("store.snap.in", 1, file!(), line!());
+            m.counter_add(
+                "store.snap.in.bytes",
+                self.bank.rel.snap_bytes() as u64,
+                file!(),
+                line!(),
+            );
+        });
+        Ok(())
+    }
+
+    /// **快照就位到设备**(restore 前置;§25.2):设备层 ⇒ 原槽;宿主层 ⇒
+    /// 先找槽再回灌;不在账 ⇒ 结构性拒(该边界不可复用,调用方应已裁掉)。
+    pub(crate) async fn snap_ensure_resident(
+        &mut self,
+        key: owl_store::SnapKey,
+    ) -> Result<u32> {
+        match self.bank.rel.state.locate(key) {
+            Some(owl_store::Tier::Gpu) => self
+                .dev
+                .pool
+                .snap_slot_of(key)
+                .ok_or_else(|| {
+                    owl_iface::contract::ModelError::Msg(format!(
+                        "快照 {key:?} 账在设备层但池里找不到槽(账目不平)"
+                    ))
+                }),
+            Some(owl_store::Tier::Host) => {
+                let slot = self.snap_ensure_slot(key).await?;
+                self.snap_onload(key, slot).await?;
+                Ok(slot)
+            }
+            Some(owl_store::Tier::Disk) => Err(owl_iface::contract::ModelError::Msg(format!(
+                "快照 {key:?} 在磁盘层(未接线)"
+            ))),
+            None => Err(owl_iface::contract::ModelError::Msg(format!(
+                "快照 {key:?} 不在账(已被逐出)"
+            ))),
+        }
+    }
+
+    /// 取本 turn 已喂入 KV 的 token 段 `[lo, hi)`(= `prompt_ids ++ out`)。
+    /// 越过已喂面 = **结构性拒**(快照边界不得越过 KV 真实内容 —— 静默截断
+    /// 会让快照身份与实际内容脱节)。
+    /// 本 turn 的 token 链区间 `[lo, hi)`(快照边界段来源;`coverage.rs` 回算
+    /// 块身份同用 —— 链身份必须与索引登记同源)。
+    pub(crate) fn tokens_upto(&self, lo: usize, hi: usize) -> Result<Vec<u32>> {
+        let act = self.turns.active.as_ref().ok_or_else(|| {
+            ModelError::Msg("无活跃 turn:快照边界必须落在本 turn 的 token 链上".into())
+        })?;
+        let plen = act.prompt_ids.len();
+        let mut seg = Vec::with_capacity(hi.saturating_sub(lo));
+        for i in lo..hi {
+            if i < plen {
+                seg.push(act.prompt_ids[i]);
+            } else {
+                let j = i - plen;
+                seg.push(*act.out.get(j).ok_or_else(|| {
+                    ModelError::Msg(format!(
+                        "快照边界越界:token {i} 未喂(plen={plen} out={})",
+                        act.out.len()
+                    ))
+                })?);
+            }
+        }
+        Ok(seg)
     }
 }
 
 impl<D: DeviceClient> crate::engine::RankDev<D> {
-    /// GDN 快照拍摄设备半(E2c;块边界跨越时调用,两 rank 各拍各的池):
-    /// 会话格状态 → 槽位缓冲,key = **边界覆盖块**
-    /// (`block_table[fed/page - 1]`,即快照边界最后一块的物理 id)。
-    /// 槽位选择/LRU 覆盖写在 StatePool::capture_snap(state.rs)。
+    /// **GDN 快照拍摄设备半**(两 rank 各拍各自的池;键 = 边界块**内容身份**)。
     ///
-    /// K3 起唯一调用方 = `exec/phases.rs`(单卡直调 / TP2 走 `join2` 双调);
-    /// 旧的整机方法 `capture_gdn_snap`(用 `self.bank` + `self.dev.pool`)
-    /// 已在 S4 ⑤ 收尾清理中删除(同一功能,不保留两个入口)。
-    pub(crate) async fn snap_dev(&mut self, gdn_slot: usize, key: u32) -> Result<()> {
+    /// `slot` 由 host 侧 `snap_ensure_slot` 选好(store 的 state 账是单份,
+    /// 镜像分配 ⇒ 每 rank 的池同槽号);本方法只做 D2D 拍摄。
+    pub(crate) async fn snap_dev(
+        &mut self,
+        gdn_slot: usize,
+        key: owl_store::SnapKey,
+        slot: u32,
+    ) -> Result<()> {
         let face = self.graphs.session.face_mut();
-        self.pool.capture_snap(face, gdn_slot, key).await
+        self.pool.capture_snap(face, gdn_slot, key, Some(slot)).await
     }
 }

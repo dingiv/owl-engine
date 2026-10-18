@@ -101,10 +101,17 @@ impl VisionCfg {
     }
 
     /// 位置表边长(= √num_pos;Qwen 视觉塔恒为完全平方)
-    pub fn grid_side(&self) -> usize {
+    pub fn grid_side(&self) -> Result<usize, ModelError> {
         let s = (self.num_pos as f64).sqrt().round() as usize;
-        debug_assert_eq!(s * s, self.num_pos, "num_pos 非完全平方");
-        s
+        // release 也要拦(2026-10-17 审查:原 debug_assert ⇒ 非完全平方时
+        // 静默取整,后续 tap/index 全按错误边长算 = 静默错值)
+        if s * s != self.num_pos {
+            return Err(ModelError::Msg(format!(
+                "grid_side: num_pos {} 非完全平方(表边长不可定)",
+                self.num_pos
+            )));
+        }
+        Ok(s)
     }
 
     /// patch 展平宽 = in_channels · temporal · patch²
@@ -157,7 +164,7 @@ impl VisionTables {
             return Err(ModelError::Msg("VisionTables::build: grid_thw 为空".into()));
         }
         let merge = cfg.merge;
-        let side = cfg.grid_side();
+        let side = cfg.grid_side()?;
         let half = cfg.half();
         let n_pos = cfg.num_pos;
 
@@ -204,9 +211,16 @@ impl VisionTables {
                                 let (wt, ww) = axis_taps(col, w, side);
                                 for kk in 0..2 {
                                     for jj in 0..2 {
-                                        let tap = (ht[kk] * side + wt[jj]) as f32;
-                                        debug_assert!(tap < n_pos as f32);
-                                        idx.push(tap);
+                                        let tap = ht[kk] * side + wt[jj];
+                                        // 越界 tap 会被 pos-embed 核拿去查表(读越界/静默错值);
+                                        // release 也要拦(2026-10-17 审查:原 debug_assert)
+                                        if tap >= n_pos {
+                                            return Err(ModelError::Msg(format!(
+                                                "VisionTables::build: tap {tap} 越出表行数 {n_pos}\
+                                                 (grid {t},{h},{w} / side {side})"
+                                            )));
+                                        }
+                                        idx.push(tap as f32);
                                         wts.push(hw[kk] * ww[jj]);
                                     }
                                 }
@@ -612,6 +626,7 @@ impl Loadable for VisionTower {
 
 #[cfg(test)]
 mod tests {
+    use owl_macros::owl_test;
     use super::*;
     use crate::contract::DeviceClient;
     use crate::testkit::{assert_close, f32_of, st_read, Src};
@@ -643,12 +658,12 @@ mod tests {
     fn visual_weights() -> (std::collections::HashMap<String, Vec<f32>>, VisionCfg) {
         // 默认档 = **Qwen3.5-4B**(用户裁决 2026-10-15:塔更小(hidden 1024/24 层/hd **64**)
         // + 文本 4B ⇒ 单张 3080 装得下;Holo-9B 塔 head_dim 72 不落 FlashInfer 实例化档)。
-        let ckpt = std::env::var("OWL_VISION_CKPT")
-            .unwrap_or_else(|_| "/home/div/Documents/codes/models/Qwen/Qwen3.5-4B".into());
+        let ckpt = owl_shared::testkit::resource("ckpt:qwen35-4b")
+            .unwrap_or_else(|| "/home/div/Documents/codes/models/Qwen/Qwen3.5-4B".into());
         let dir = PathBuf::from(ckpt);
         let mut out = std::collections::HashMap::new();
         let mut shards: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .expect("读模型目录(OWL_VISION_CKPT 可指路)")
+            .expect("读模型目录(ckpt:qwen35-4b 可指路)")
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| {
                 // shard 命名两种:HF 分隔点(`model-00001-of-00002.safetensors`)
@@ -790,12 +805,8 @@ mod tests {
 
     /// **M3 首战**:塔 **f16 GPU 路径**(五个新核 + 声明/拾取/线格式全链)
     /// vs HF **f32** 金标(f16 档判据)。数据源 = 真权重(BF16 检查点 → f16 装载)。
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_f16_tower_matches_golden() {
-        if !crate::testkit::gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设(指定空闲卡,如 =2)");
-            return;
-        }
         let goldens = golden_paths();
         let Some(g) = goldens.first() else {
             eprintln!("skip: 金标不在(tools/vision_golden.py 生成)");
@@ -885,12 +896,8 @@ mod tests {
     /// 1280×736 截图(patch 16 ⇒ 网格 80×46 = **3680 patch**,1024 merged token)
     /// ①整塔 f16 前向(装载后 3 次取最好)②仅注意力核(10 次平均)。
     /// 判据(设计文档 §5 M3):整塔 ≤ 150 ms。
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_f16_tower_bench_1280x736() {
-        if !crate::testkit::gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         if !owl_shared::env_reader::flag("OWL_VIS_BENCH") {
             eprintln!("skip: OWL_VIS_BENCH 未开(性能档不随常规测试跑)");
             return;
@@ -1007,12 +1014,8 @@ mod tests {
     /// **真图验收**(R2 闭环;GPU f16 = 生产路径):
     /// `assets/{bird,cat,dog,flower_blue}.png` 经 HF `Qwen3VLProcessor` 真预处理
     /// (缩放 / patchify / **2×2 块序**)⇒ 我们的塔 vs HF 塔同档金标。
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn real_images_gpu_f16_match_golden() {
-        if !crate::testkit::gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         let g = real_golden();
         if !g.exists() {
             eprintln!("skip: 真图金标不在(tools/vision_image_check.py 生成)");
@@ -1190,6 +1193,19 @@ mod tests {
             eprintln!("[vis] merged 归一化误差 {worst:.3e}(@[{at}] |Δ| {:.3e})", (got[at] - want[at]).abs());
             assert!(worst <= 1.0, "merged: 归一化误差 {worst:.3e} > 1");
         }
+    }
+
+    /// **完全平方门**(2026-10-17 审查 §五轮):`num_pos` 非完全平方时表边长
+    /// 不可定 ⇒ `grid_side` 必须**响亮拒**(修前 debug_assert ⇒ release 静默取整,
+    /// 后续 tap/index 全按错误边长算)。
+    #[test]
+    fn grid_side_is_loud_on_non_square() {
+        let mut cfg = VisionCfg::holo(); // 任意基线,只改 num_pos
+        cfg.num_pos = 5; // 非完全平方
+        let e = cfg.grid_side().expect_err("非完全平方必须拒");
+        assert!(format!("{e}").contains("完全平方"), "{e}");
+        cfg.num_pos = 4;
+        assert_eq!(cfg.grid_side().expect("4 = 2²"), 2);
     }
 }
 

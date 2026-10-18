@@ -133,8 +133,9 @@ pub fn detect(dir: &Path) -> Result<Detection, ModelError> {
 mod tests {
     use super::*;
 
-    fn dir(env: &str, default: &str) -> Option<PathBuf> {
-        let p = PathBuf::from(std::env::var(env).unwrap_or_else(|_| default.to_string()));
+    /// 资源目录(清单优先,缺则默认路径;`key` = 资源清单键)
+    fn dir(key: &str, default: &str) -> Option<PathBuf> {
+        let p = PathBuf::from(owl_shared::testkit::resource_or(key, default));
         p.is_dir().then_some(p)
     }
 
@@ -142,16 +143,16 @@ mod tests {
     #[test]
     fn detects_safetensors_family() {
         for (env, default, entries) in [
-            ("OWL_CKPT_0_8B", "/home/div/Documents/codes/models/Qwen/Qwen3.5-0.8B", 488),
-            ("OWL_CKPT_4B_VL", "/home/div/Documents/codes/models/Qwen/Qwen3.5-4B", 738),
+            ("ckpt:0.8b", "/home/div/Documents/codes/models/Qwen/Qwen3.5-0.8B", 488),
+            ("ckpt:qwen35-4b", "/home/div/Documents/codes/models/Qwen/Qwen3.5-4B", 738),
             (
-                "OWL_CKPT_DFLASH2",
+                "ckpt:dflash2-bf16",
                 "/home/div/Documents/codes/models/z-lab/Qwen3.8-27B-DFlash2",
                 81,
             ),
         ] {
             let Some(d) = dir(env, default) else {
-                eprintln!("skip: {default} 不在({env} 可指路)");
+                eprintln!("skip: {default} 不在(资源清单 {env})");
                 continue;
             };
             let det = detect(&d).expect("detect");
@@ -165,10 +166,10 @@ mod tests {
     #[test]
     fn detects_pack_quantized_family() {
         let Some(d) = dir(
-            "OWL_CKPT_27B_AWQ",
+            "ckpt:27b-awq",
             "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4",
         ) else {
-            eprintln!("skip: 27B AWQ 检查点不在");
+            eprintln!("skip: 资源 ckpt:27b-awq 不在(testdata/resources.toml)");
             return;
         };
         let det = detect(&d).expect("detect");

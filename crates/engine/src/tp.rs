@@ -180,6 +180,8 @@ pub struct TpEngine<D: DeviceClient> {
     tokenizer: Tokenizer,
     /// rank0 的旋钮/预算(装配期已消费;出口给诊断面)
     cfg: EngineConfig,
+    /// rank0 的 boot 显存快照(host 侧单份 ⇒ `into_running` 的预算装配用它)
+    boot: crate::engine::BootVram,
 }
 
 impl<D: DeviceClient + 'static> TpEngine<D> {
@@ -203,8 +205,10 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
                 loadeds.len()
             ));
         }
+        // boot 快照(host 单份;`into_running` 的预算装配用它)
+        let boot = engines[0].boot_vram();
         let mut it = engines.into_iter();
-        let (face0, cfg) = it.next().expect("world = 2 已守门").into_parts();
+        let (face0, mut cfg) = it.next().expect("world = 2 已守门").into_parts();
         let (face1, _cfg1) = it.next().expect("world = 2 已守门").into_parts();
         // ── v1 范围护栏(响亮拒;分相纪律的边界)──────────────────────
         // ① 投机草稿:verify/fold/propose 族图与草稿 prefill extend 是**双 rank
@@ -270,10 +274,10 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
         // ── 两 rank **顺序**装配(**零协调**)────────────────────────────
         // 装配期的 AR 已被 `eval_current_dry` 从 warmup/干跑里摘掉 ⇒ 每 rank
         // 独立完成,无需对端在场(确定性分片协议的"零协调"落实到装配面)。
-        let dev0 = boot_rank(face0, &cfg, rm0, Some(ctx0), std::time::Instant::now())
+        let dev0 = boot_rank(face0, &mut cfg, rm0, Some(ctx0), std::time::Instant::now())
             .await
             .map_err(|e| ModelError::Msg(format!("TP rank0 装配失败:{e}")))?;
-        let dev1 = boot_rank(face1, &cfg, rm1, Some(ctx1), std::time::Instant::now())
+        let dev1 = boot_rank(face1, &mut cfg, rm1, Some(ctx1), std::time::Instant::now())
             .await
             .map_err(|e| ModelError::Msg(format!("TP rank1 装配失败:{e}")))?;
         // ── 装配后自证:warmup 的 AR 已**对称配对**(produced == consumed、err = 0)──
@@ -308,16 +312,17 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
             TpRank { plan: plan0, staging: staging0, dev: dev0 },
             TpRank { plan: plan1, staging: staging1, dev: dev1 },
         ];
-        Ok(Self { ranks, tokenizer: tokenizer.expect("rank0 必在"), cfg })
+        Ok(Self { ranks, tokenizer: tokenizer.expect("rank0 必在"), cfg, boot })
     }
 
     /// **进执行态**(S4 ⑤-K3):rank0 束 = 主设备面,rank1 束 = `peer`
     /// (设备侧程序镜像目标);host 侧账本单一(tokenizer/会话/旋钮取 rank0)。
     pub fn run(self) -> Result<crate::running::RunningEngine<D>> {
+        let boot = self.boot; // Copy:先取(下一行 `self.ranks` 会被 part-move)
         let mut it = self.ranks.into_iter();
         let r0 = it.next().ok_or_else(|| ModelError::Msg("TP run: rank0 缺".into()))?;
         let r1 = it.next().ok_or_else(|| ModelError::Msg("TP run: rank1 缺".into()))?;
-        Ok(crate::engine::into_running(self.cfg, self.tokenizer, r0.dev, Some(r1.dev)))
+        crate::engine::into_running(self.cfg, self.tokenizer, boot, r0.dev, Some(r1.dev))
     }
 
     /// rank 数(= world;v1 恒 2)
@@ -424,7 +429,7 @@ impl TpEngine<GpuClient> {
         );
         // ── ② staging 对称握手(**建图之前**)───────────────────────────
         let mut it = engines.into_iter();
-        let (face0, cfg) = it.next().expect("world = 2 已守门").into_parts();
+        let (face0, mut cfg) = it.next().expect("world = 2 已守门").into_parts();
         let (face1, _cfg1) = it.next().expect("world = 2 已守门").into_parts();
         let mut face0 = face0;
         let mut face1 = face1;
@@ -484,7 +489,7 @@ impl TpEngine<GpuClient> {
             owl_cuda::comm::ar::HEADER_BYTES,
         );
         let mut it = engines.into_iter();
-        let (face0, cfg) = it.next().expect("world = 2 已守门").into_parts();
+        let (face0, mut cfg) = it.next().expect("world = 2 已守门").into_parts();
         let (face1, _cfg1) = it.next().expect("world = 2 已守门").into_parts();
         let mut face0 = face0;
         let mut face1 = face1;

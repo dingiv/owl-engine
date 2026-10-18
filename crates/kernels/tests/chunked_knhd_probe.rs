@@ -6,6 +6,7 @@
 //! kv_head_stride = hd(元素序)。判据:f16 vs host max < 2e-2;
 //! fp8 vs host max < 1e-2。无 GPU 跳过(OWL_TEST_DEVICE;卡 = ordinal 1)。
 
+use owl_macros::owl_test;
 use std::sync::Arc;
 use cudarc::driver::{CudaContext, DevicePtr, LaunchConfig, PushKernelArg};
 
@@ -326,12 +327,8 @@ fn run_case(stream: &Arc<cudarc::driver::CudaStream>, m: &Arc<cudarc::driver::Cu
     assert!(m8 < 2e-3 && x8 < 1e-2, "hd{hd} chunked knhd fp8 超门(mean {m8}, max {x8})");
 }
 
-#[test]
+#[owl_test(gpu)]
 fn chunked_knhd_parity() {
-    if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
-        return;
-    }
     let ctx = CudaContext::new(1).expect("ctx");
     ctx.bind_to_thread().expect("bind");
     let stream = ctx.default_stream();

@@ -150,7 +150,11 @@ async fn run_case(
     let da = owl_iface::htod!(client, Dtype::F16, &Shape::from(vec![m, k]), &le_u16(&a_bits)).await.expect("htod a");
     // u16 位序 = f16 LE ✓(f16::to_bits 是 u16 表示,LE 字节序正确)
     let db = owl_iface::htod!(client, Dtype::U32, &Shape::from(vec![b_packed.len()]), &le_i32(&b_packed)).await.expect("htod b");
-    let ds = owl_iface::htod!(client, Dtype::F16, &Shape::from(vec![s_packed.len()]), &le_u16(&s_packed)).await.expect("htod s");
+    // 尺度瓦片按**臂**声明(F16 臂吃 f16、bf16 臂吃 bf16 —— 与算子表逐字一致;
+    // 2026-10-16 定谳:此前一律声明 F16 而 bf16 臂实际喂 bf16 字节 = 影子口径,
+    // 任何按声明解字节的读者都会静默拿到 ~15× 错值)
+    let s_dtype = if is_bf16 { Dtype::BF16 } else { Dtype::F16 };
+    let ds = owl_iface::htod!(client, s_dtype, &Shape::from(vec![s_packed.len()]), &le_u16(&s_packed)).await.expect("htod s");
     let ws_mul: usize = owl_shared::env_reader::parse_or("OWL_WS_MUL", 1);
     let ws_len = owl_kernels::family::marlin::v2_workspace_len(n).max(n / 128 * 16) * ws_mul;
     let dws = owl_iface::alloc!(client, Dtype::U32, ws_len).await.expect("alloc ws");
@@ -217,6 +221,10 @@ async fn run_case(
 
 #[tokio::test]
 async fn marlin_w4a16_parity() {
+    if owl_cuda::test_device_bdf().is_none() {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    }
     let mut client = assemble();
     // 形状矩阵:decode(m=1)+ 短 prefill(m=64);k/n 满足 v2 约束(k%16==0)
     // 形状约束(pack/upstream Layer 校验):k%128==0、n%256==0、g ∈ {64,128,-1}
@@ -236,8 +244,26 @@ async fn marlin_w4a16_parity() {
 /// BF16 激活 W4A16 parity(E5-DF3 同日十二:草稿路径 BF16 化;fc 形状)
 #[tokio::test]
 async fn marlin_w4a16_bf16_parity() {
+    if owl_cuda::test_device_bdf().is_none() {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    }
     let mut client = assemble();
-    for (m, n, k, g) in [(20usize, 5120usize, 5120usize, 128usize), (8, 5120, 5120, 128), (64, 512, 512, 128)] {
+    // ⚠ **m ≤ 8 是盲区**(2026-10-16 perf-review):
+    //   DFlash2 草稿的 fc = (m=1, n=5120, k=5120, g=128) 的 bf16 臂,
+    //   而原列表只覆盖 m=8/20/64 ⇒ **单 token 形状从未被门覆盖**。
+    //   现场:`gpu_dflash2_27b_loads_and_smokes` 的 fc 对拍方向对(cos 0.987)
+    //   但幅度 ~16.6×(设备读到的组尺度 = 宿主的 17.34× 中位)。本组把 m=1/2/4
+    //   补进臂内 —— **红 = selector 对 m≤8 选了错变体(s_type/几何);绿 = selector 无罪**,
+    //   病在字节链(见审查笔记 §P)。
+    for (m, n, k, g) in [
+        (1usize, 5120usize, 5120usize, 128usize), // ← 草稿 fc 真几何
+        (2, 5120, 5120, 128),
+        (4, 5120, 5120, 128),
+        (20, 5120, 5120, 128),
+        (8, 5120, 5120, 128),
+        (64, 512, 512, 128),
+    ] {
         let (noise_ratio, max_abs) = run_case(&mut client, m, n, k, g, true).await;
         eprintln!("[marlin-bf16] m={m} n={n} k={k} g={g} → 噪声/信号RMS={noise_ratio:.6} max_abs={max_abs:.5}");
         assert!(
@@ -253,6 +279,10 @@ async fn marlin_w4a16_bf16_parity() {
 /// 判决目标:非 2^k n 的 repack 分歧 vs kernel selector 罪责二选一)
 #[tokio::test]
 async fn marlin_golden_dump() {
+    if owl_cuda::test_device_bdf().is_none() {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    }
     let mut client = assemble();
     let dir = std::path::Path::new("/tmp/marlin_golden");
     owl_shared::file_loader::create_dir_all(dir).expect("mkdir");
@@ -283,6 +313,10 @@ async fn marlin_golden_dump() {
 /// 单案 memcheck 入口(compute-sanitizer 配套;OWL_SWEEP_CASE="m,n,k,g")
 #[tokio::test]
 async fn marlin_shape_case() {
+    if owl_cuda::test_device_bdf().is_none() {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    }
     let Some(spec) = owl_shared::env_reader::str("OWL_SWEEP_CASE") else {
         eprintln!("skip: OWL_SWEEP_CASE 未设(m,n,k,g)");
         return;
@@ -298,6 +332,10 @@ async fn marlin_shape_case() {
 
 #[tokio::test]
 async fn marlin_shape_sweep() {
+    if owl_cuda::test_device_bdf().is_none() {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    }
     let mut client = assemble();
     // 基础档(0.512k 网格)+ 27B 维度族(Qwen3.8-27B:5120/6144/10240/
     // 14336/17408;暗雷根治后应全绿)
@@ -470,6 +508,10 @@ async fn run_awq_case_g(client: &mut GpuClient, m: usize, n: usize, k: usize, g:
 /// m8 路径(m=1,kv-proj 形状 n=1024)与多 m-block 路径(m=32,o-proj 形状)。
 #[tokio::test]
 async fn marlin_w4a16_awq_parity() {
+    if owl_cuda::test_device_bdf().is_none() {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    }
     let mut client = assemble();
     // 2026-10-14 A13:m 维**生产档**补位 —— 原列表只有 m=1/32,而 27B prefill
     // 的 AWQ(kU4/g=32/zp)实际跑 m=分块长(512/443/256…)。本组先做 m 扫描
@@ -527,6 +569,10 @@ async fn marlin_w4a16_awq_parity() {
 /// 表错列、反之亦然)。故本门是这条线的**换核保险**。
 #[tokio::test]
 async fn ct_repack_a8_parity() {
+    if owl_cuda::test_device_bdf().is_none() {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    }
     let mut client = assemble();
     // 覆盖 grid 两维(rows/32 × cols/4)+ 非方形 + 生产形状族
     for (out_dim, k) in [
@@ -598,6 +644,10 @@ async fn ct_repack_a8_parity() {
 /// 形状覆盖 grid 两维(rows/64 × cols/2);ct packed 伪随机。
 #[tokio::test]
 async fn ct_repack_parity() {
+    if owl_cuda::test_device_bdf().is_none() {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    }
     let mut client = assemble();
     // **27B 分片(T2=2)真形状**(2026-10-17 追加):此前只有全量维
     // (1024/5120/17408 × 5120)⇒ **分片档的 GPU 重排零覆盖** —— 而

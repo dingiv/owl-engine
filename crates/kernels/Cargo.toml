@@ -29,6 +29,10 @@ cudarc = { version = "0.19", default-features = false, features = [
 half = { version = "2.7.1" }
 # 测试探针旋钮统一读取面(env reader;lib 零依赖律不破 —— 仅 dev 侧)
 owl-shared = { path = "../shared" }
+# 测试域设备解析(BDF→ordinal;唯一实现 = owl-cuda。dev 循环依赖允许)
+owl-cuda = { path = "../backends/cuda" }
+# 测试样板收编(#[owl_test(gpu)];同步体模式 —— 不建 runtime)
+owl-macros = { path = "../macros" }
 
 [dependencies]
 # 官方 cudarc:仅 device/cublas feature 使用(Exec/家族发射;feature 化,

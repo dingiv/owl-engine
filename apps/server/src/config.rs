@@ -206,8 +206,9 @@ pub struct ServerConfig {
     pub prefill_chunk: usize,
     /// lm_head 头部量化方案(model.head_quant;C1 2026-10-11;枚举严格)
     pub head_quant: owl_shared::config::HeadQuant,
-    /// **W4A8 档位**(model.w4a8;S2 2026-10-17;默认 off = 今天行为)
-    pub w4a8: bool,
+    /// **主干量化方案**(model.quant;S2 2026-10-17;枚举严格 —— 原
+    /// `w4a8: bool` 已退役,旧键响亮拒)
+    pub quant: owl_shared::config::QuantScheme,
     /// 最大并发请求(server.max_concurrency;默认 8;须 ≤ knobs.gdn_slots)
     pub max_concurrency: usize,
     /// **TP 通信数据腿:push 档**(runtime.tp_push;2026-10-18 §36.6)⇒ 交 `TpOpts`
@@ -234,7 +235,7 @@ impl ServerConfig {
     pub fn load(flavor: Option<&str>, file: Option<&Path>, cli: &CliArgs) -> Result<Self, String> {
         // 预设档(flavor)= 预先写好的配置文件:入口把名字解析成路径,配置层只认文件
         let base = match flavor {
-            Some(name) => Some(owl_shared::assets::preset_path(name)?),
+            Some(name) => Some(owl_shared::flavors::preset_path(name)?),
             None => None,
         };
         let cfg = OwlConfig::load(base.as_deref(), file)?;
@@ -298,12 +299,15 @@ impl ServerConfig {
                 .clone()
                 .unwrap_or_else(|| DEFAULT_MODEL_NAME.into()),
             knobs: owl_engine::EngineKnobs::from_config(&cfg),
-            // 占位:真值由 `load()` 的选卡回填(设备表 + 卡锁都在那边)
+            // 占位:真值由 `load()` 的声明式选卡回填(设备表 + 卡锁都在那边)
             devices: Devices::placeholder(),
-            max_seq: cfg.runtime.max_seq,
-            prefill_chunk: cfg.runtime.prefill_chunk,
+            // 上下文/池下限:env 覆盖(实测调压用;池容量下限 = 单会话容量 = max_seq/page)
+            max_seq: owl_shared::env_reader::parse("OWL_MAX_SEQ").unwrap_or(cfg.runtime.max_seq),
+            // prefill 块长:env 覆盖(实测调压;它同时决定块边界快照的密度 ⇒ 命中面可复用性,§22)
+            prefill_chunk: owl_shared::env_reader::parse("OWL_PREFILL_CHUNK")
+                .unwrap_or(cfg.runtime.prefill_chunk),
             head_quant: cfg.model.head_quant,
-            w4a8: cfg.model.w4a8,
+            quant: cfg.model.quant,
             tp_push: cfg.runtime.tp_push,
             max_concurrency: cfg.server.max_concurrency,
             perf_dump: None,

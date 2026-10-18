@@ -58,9 +58,9 @@ impl KernelSpec for MarlinGemmW4a8Awq {
     /// foreign(静态链接):无 `.cu` 源
     const SRC: &'static str = "";
     const PARAMS: &'static [Param] = &[
-        // A = int8 已量化激活(1B/elem ⇒ 按本仓惯例以 U8 字节承载声明;
+        // A = **int8 已量化激活**(有符号;`Dtype::I8` —— 与 fp8 **不同族**,禁混称;
         // 语义在核侧,与 fp8 KV 池同款约定)
-        Param::t_in("a", Dtype::U8, 2),
+        Param::t_in("a", Dtype::I8, 2),
         Param::t_in("b", Dtype::U32, 2),
         Param::t_out("out", Dtype::F16, 2),
         Param::t_in("scales", Dtype::F16, 2),
@@ -100,7 +100,11 @@ impl KernelSpec for MarlinGemmW4a16Bf16 {
         Param::t_in("a", Dtype::BF16, 2),
         Param::t_in("b", Dtype::U32, 2),
         Param::t_out("out", Dtype::BF16, 2),
-        Param::t_in("scales", Dtype::F16, 2),
+        // **BF16 —— 声明即事实**(2026-10-16 定谳):本臂 C 侧 `s_type = c_type`
+        // = kBFloat16 ⇒ **吃 bf16 值的尺度**。原先这里写 F16(与 f16 臂抄一份)
+        // 而实际喂的是 bf16 字节 ⇒ 声明与实际不符,任何"按声明解字节"的读者
+        // (元素转换路径/工具/测试)都会拿到 ~15× 错值;L3 也因此拦不住。
+        Param::t_in("scales", Dtype::BF16, 2),
         Param::t_in("ws", Dtype::U32, 1),
         Param::t_in("c_tmp", Dtype::U32, 1),
         Param::sz("m"),
@@ -197,7 +201,7 @@ mod tests {
             other => panic!("槽 {i} 不是张量槽: {other:?}"),
         };
         assert_eq!(meta_of::<MarlinGemmW4a8Awq>().params[0].name, "a");
-        assert_eq!(dt_of(0), Dtype::U8, "int8 激活 = 字节承载(与 fp8 池同惯例)");
+        assert_eq!(dt_of(0), Dtype::I8, "int8 激活 = I8(有符号;与 fp8 池 F8E4M3 不同族)");
         // a_scales = f32(与同形的 U32 槽可区分 —— 同型槽对调由事实门拦)
         assert_eq!(dt_of(5), Dtype::F32);
         assert_eq!(meta_of::<MarlinGemmW4a8Awq>().params[5].name, "a_scales");

@@ -77,6 +77,19 @@ fn perf_cnt(tag: &str, n: u64) {
 
 /// 块池预算(字节;**0 / 缺省 = 关**)。P1″ 2026-10-14。
 ///
+/// `OWL_NO_RECLAIM=1` ⇒ 关掉活性中途回收(诊断/对照臂)。
+///
+/// **OnceLock 记忆化**(2026-10-17 审查):原为每个 `eval_ops` 现场
+/// `std::env::var`(取进程 env 锁 + 分配 String;求值入口 = 逐算子),而本文件
+/// 的兄弟旋钮(`block_pool_budget`)早有 OnceLock 先例 ⇒ 口径归位。语义:该旋钮
+/// **boot 期定谳**(进程内改 env 不再生效;诊断档本就如此用)。
+fn no_reclaim() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // env **单一访问口**(2026-10-17 审查 §六轮:原先直读 `std::env::var_os`,
+    // 绕过 `env_reader` —— 与 J1/J4 的收口纪律相悖,且测试面的 EnvGuard 不再生效)
+    *V.get_or_init(|| owl_shared::env_reader::flag("OWL_NO_RECLAIM"))
+}
+
 /// 门 = env `OWL_BLOCK_POOL`(与本文件的 `OWL_NO_RECLAIM` 同一「诊断/调优门」
 /// 先例),**`OnceLock` 缓存一次** ⇒ 热路径零 env 查询。
 /// 引擎侧后续应升格为 `OwlConfig` 键(本 lane 文件面不含 engine/,见报告)。
@@ -166,8 +179,10 @@ pub(crate) fn decode_host(dtype: Dtype, buf: &[u8]) -> Vec<f32> {
             .chunks_exact(4)
             .map(|c| f32::from_bits(u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
             .collect(),
-        // U8(字节池):逐字节转 f32(观测面只用于统计量级;池内容不是激活)
-        Dtype::U8 => buf.iter().map(|b| *b as f32).collect(),
+        // U8(不透明字节)/ F8 两种(字节口径)/ **I8(按有符号解!)** —— 观测面
+        // 只用于统计量级(池内容不是激活);`I8` 若按无符号读会系统性偏 +128
+        Dtype::U8 | Dtype::F8E4M3 | Dtype::F8E5M2 => buf.iter().map(|b| *b as f32).collect(),
+        Dtype::I8 => buf.iter().map(|b| (*b as i8) as f32).collect(),
     }
 }
 
@@ -199,8 +214,6 @@ where
                 arena_set: std::collections::HashSet::new(),
                 block_users: std::collections::HashMap::new(),
                 pending: std::collections::HashMap::new(), reclaim: false, perf, env, pool: None,
-                keep_nodes: Default::default(), keep_blocks: Default::default(),
-                overrides: Default::default(),
             tp: tp.cloned(),
         };
         let root = _eval_rec(t, &mut ctx).await?;
@@ -269,10 +282,8 @@ where
             EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new(),
                 arena_set: std::collections::HashSet::new(),
                 block_users: std::collections::HashMap::new(),
-                pending: count_pending(t), reclaim: std::env::var("OWL_NO_RECLAIM").is_err(), perf, env,
+                pending: count_pending(t), reclaim: !no_reclaim(), perf, env,
                 pool: (pool_budget > 0).then(|| BlockPool::new(pool_budget)),
-                keep_nodes: Default::default(), keep_blocks: Default::default(),
-                overrides: Default::default(),
             tp: tp.cloned(),
         };
         let r = _eval_rec(t, &mut ctx).await;
@@ -324,8 +335,6 @@ where
                 arena_set: std::collections::HashSet::new(),
                 block_users: std::collections::HashMap::new(),
                 pending: std::collections::HashMap::new(), reclaim: false, perf, env, pool: None,
-                keep_nodes: Default::default(), keep_blocks: Default::default(),
-                overrides: Default::default(),
             tp: tp.cloned(),
         };
         let mut out = Vec::with_capacity(roots.len());
@@ -352,12 +361,10 @@ where
     D: crate::contract::DeviceClient + 'a,
 {
     Box::pin(async move {
-        let mut pending: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
-        for r in roots {
-            for (id, c) in count_pending(r) {
-                *pending.entry(id).or_insert(0) += c;
-            }
-        }
+        // ⚠️ **多根边只数一次**(2026-10-19 §8.31):旧口径逐根相加,在"根套根"
+        // (Q 槽 / DFlash2 taps:根节点在主根子树里)时把共享子树的边数 k 次 ⇒
+        // `pending` 恒多算 ⇒ 中途活性回收整体失效(真回收 14/新块 1431 实测)。
+        let pending = count_pending_multi(roots);
         let perf = PerfCtx::of(&env);
         let pool_budget = block_pool_budget();
         let mut ctx =
@@ -366,8 +373,6 @@ where
                 block_users: std::collections::HashMap::new(),
                 pending, reclaim: true, perf, env,
                 pool: (pool_budget > 0).then(|| BlockPool::new(pool_budget)),
-                keep_nodes: Default::default(), keep_blocks: Default::default(),
-                overrides: Default::default(),
             tp: tp.cloned(),
         };
         let mut out = Vec::with_capacity(roots.len());
@@ -381,7 +386,7 @@ where
                 Err(e) => {
                     let _ = ctx.flush_pool().await;
                     let mut cand: Vec<u64> = std::mem::take(&mut ctx.arena);
-                    cand.retain(|id| ctx.arena_set.contains(id) && !ctx.is_kept(*id));
+                    cand.retain(|id| ctx.arena_set.contains(id));
                     if !cand.is_empty() {
                         let _ = ctx.face.free(&cand).await; // 回收失败不掩盖原错
                     }
@@ -390,6 +395,39 @@ where
             }
         }
         ctx.flush_pool().await?;
+        // **活性收尾归因**(门:`OWL_LIVE_DIAG`;2026-10-19):
+        // "真回收几乎为 0"时唯一要问的 = **memo 里还剩什么、靠什么吊着**:
+        // 节点的 `pending`(预波消费者计数未归零)还是块的 `users`(别名/持有者)。
+        // 打印前 6 大残块的 (bytes, users, pending, name) + 直方图 ⇒ 一眼定位。
+        if std::env::var_os("OWL_LIVE_DIAG").is_some() {
+            let mut hist = [0usize; 4]; // pending==0 / ==1 / ==2 / >=3
+            let mut users_hist = [0usize; 4];
+            let mut live_bytes = 0usize;
+            let mut rows: Vec<(usize, u64, usize, usize, String)> = Vec::new();
+            for (nid, b) in ctx.memo.iter() {
+                let p = ctx.pending.get(nid).copied().unwrap_or(0);
+                let u = ctx.block_users.get(&b.id).copied().unwrap_or(0);
+                hist[p.min(3)] += 1;
+                users_hist[u.min(3)] += 1;
+                let bytes = b.len.saturating_mul(b.dtype.size_bytes());
+                live_bytes += bytes;
+                rows.push((bytes, *nid, u, p, format!("{:?}", b.id)));
+            }
+            rows.sort_unstable_by_key(|r| std::cmp::Reverse(r.0));
+            let top: Vec<String> = rows
+                .iter()
+                .take(6)
+                .map(|(by, nid, u, p, bid)| format!("{:.1}MB node{nid} block{bid} u={u} p={p}", *by as f64 / 1048576.0))
+                .collect();
+            eprintln!(
+                "[live-end] memo 剩 {} 节点 / {} MiB ‖ 节点 pending 直方图 [=0 {}, =1 {}, =2 {}, ≥3 {}] ‖ 块 users 直方图 [=0 {}, =1 {}, =2 {}, ≥3 {}] ‖ 最大残余: {}",
+                ctx.memo.len(),
+                live_bytes >> 20,
+                hist[0], hist[1], hist[2], hist[3],
+                users_hist[0], users_hist[1], users_hist[2], users_hist[3],
+                top.join(" ｜ ")
+            );
+        }
         let root_ids: std::collections::HashSet<u64> = out.iter().map(|b| b.id).collect();
         let mut candidates: Vec<u64> = std::mem::take(&mut ctx.arena);
         candidates.retain(|id| !root_ids.contains(id) && ctx.arena_set.contains(id));
@@ -401,186 +439,16 @@ where
 }
 
 // ============================================================================
-// 段求值面(piecewise;2026-10-15 perf 会话立项)
+// 段求值面 —— **已随 piecewise 退役**(2026-10-18,W5)
 // ============================================================================
 //
-// **为什么在这一层**:可变分段(断点)是**求值面**的概念,不是图/捕获/算子的概念 ——
-// 调用方要的只是"把这个可达子图算出来、把我要的值留到下一段"。把这条语义放在解释器
-// 层,任何上层(piecewise 图、断点调试、分段 profiling)都能用,且与算子种类无关。
+// 原址:`BreakDecl`(断点登记)/ `EvalCarry`(跨段接力棒)/ `SegMode`(段求值口径)/
+// `eval_segment`(分段求值 + 钉块覆盖 + 宿主标量槽补丁)。
 //
-// **形态**:调用方按断点把树切成若干段,**每段的根 = 下一个断点的操作数**(或最终输出),
-// 逐段调用 `eval_segment`;断点本身由调用方在段间自行求值(写进 `carry.memo`)。
-// ⇒ 不需要"暂停/回调"机制:命中 `carry.memo` 的节点零计算,`carry.keep` 里登记的值
-//   连同其块**活过本段**(两个回收出口都绕开),其余一律按 scoped 口径回收。
-//
-// **不变量**(缺一即静默错值):
-//   S-1 断点的输出必须由调用方写进 `carry.memo` 并把其**节点 id** 放进 `carry.keep`;
-//   S-2 `keep` 命中的值在后续段里**地址不变**(块被保护,永不归还/入池);
-//   S-3 调用方自行保证被断开的节点是**幂等**的(段求值面不管这个)。
-
-/// **断点登记**(模型层产出 ⇒ 驱动件消费;见 `docs/piecewise-断点图-设计与实现.md`)。
-///
-/// 与"段/断点/钉块"三概念对齐:节点 = 被移出图的那次求值;
-/// `host_scalar` = **宿主标量槽**——节点里"每轮会变的宿主标量"的显式通路。
-///
-/// 为什么需要:核的标量参数在**建树期烘死**,而有些标量是 plan/调度的输入
-/// (典型:FI 的 `ctx_total` —— plan key 含它,而它每轮随 ctx 增长)。
-/// 捕获图里烘死它 ⇒ 一张图只对一个 ctx 有效;piecewise 把核移出图后,
-/// 仍必须把**本轮**的值补进那个槽,否则窗外求值拿到的还是 capture 期的值。
-///
-/// 通路形状:`(标量槽下标, 每轮值)` —— 下标 = **kernel 契约里的 sz 槽序**
-/// (权威 = `KernelSpec::PARAMS`),不是魔法数;值由调用方(引擎)每轮写。
-/// 设备侧的量(页表/indptr/…)仍走图输入槽,两类输入边界清晰。
-pub struct BreakDecl {
-    /// 断点节点(= 移出图的求值;操作数全是稳定块叶或上段产出)
-    pub node: TensorOps,
-    /// 宿主标量槽:`arg_idx` 越界在 plan 期结构化拒捕(不静默用旧值)
-    pub host_scalar: Option<(usize, std::sync::Arc<std::sync::atomic::AtomicUsize>)>,
-}
-
-impl BreakDecl {
-    /// 静态断点(无宿主标量):核里没有每轮变的标量
-    pub fn node(node: TensorOps) -> Self {
-        Self { node, host_scalar: None }
-    }
-
-    /// 带宿主标量槽的断点(核含每轮变的宿主标量;见类型注)
-    pub fn with_host_scalar(
-        node: TensorOps,
-        arg_idx: usize,
-        cell: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    ) -> Self {
-        Self { node, host_scalar: Some((arg_idx, cell)) }
-    }
-}
-
-/// 段求值接力棒(**段间最小状态**;与图/捕获/算子种类无关)。
-#[derive(Default, Clone, Debug)]
-pub struct EvalCarry {
-    /// 跨段接力:节点 id → 值。进入时命中即复用(零计算);
-    /// 出来时只保留 `keep` 命中的项(其余块已被本段回收/归还)。
-    pub memo: std::collections::HashMap<u64, Bytes>,
-    /// 跨段存活白名单(**节点 id**):其产出必须活过本段
-    /// (段末候选表与中途活性回收都绕开这些块)。
-    pub keep: std::collections::HashSet<u64>,
-    /// **输出覆盖**:节点 id → 指定输出块。命中该节点的求值写进给定块
-    /// (而不是新分配)—— piecewise 断点用它把"捕获/回放两期同一地址"钉死。
-    /// 语义与 `keep` 配套:覆盖块一律视为跨段存活(不参与回收)。
-    pub overrides: std::collections::HashMap<u64, Bytes>,
-}
-
-impl EvalCarry {
-    /// 把"外部已决"的节点值放进接力棒(断点求值完的调用方拼图点)。
-    /// 同时登记进 `keep`:它的块必须活到后续段。
-    pub fn resolve(&mut self, node_id: u64, b: Bytes) {
-        self.keep.insert(node_id);
-        self.memo.insert(node_id, b);
-    }
-
-    /// 登记"该节点的输出写进这个块"(piecewise 断点的钉块面)。
-    /// 与 [`Self::resolve`] 的区别:它在**求值前**生效(调用方还没求值),
-    /// 而 `resolve` 是"外部已决"(求值完/根本不由本解释器求值)。
-    pub fn override_out(&mut self, node_id: u64, b: Bytes) {
-        self.keep.insert(node_id);
-        self.overrides.insert(node_id, b);
-    }
-}
-
-/// **段求值口径**(与调用点所处的窗口绑定;**选错即硬错或泄漏**):
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SegMode {
-    /// **捕获窗内**(`graph_begin..graph_end` 之间):块所有权归 slab —— 禁一切
-    /// 回收(捕获期 free 被服务端白名单拒:实测 "图捕获进行中:该操作被拒";
-    /// 且 Carved 块本就不可还)。口径 = 单图 path 的 `eval_ops_multi`
-    /// (那个入口从不复用/不回收)。
-    Capturing,
-    /// **窗外**(干跑计量 / 断点求值 / 诊断):per-node 活性回收 + 段末候选清扫。
-    Eager,
-    /// **捕获窗内 + 锚定活性回收**(M1 `GraphPlanDesc::reclaim_capture=true` 的段内版):
-    /// 窗内死块即时 free(后端 `GraphRefs`/`free_blocks` 已证"只归还不可达中间块"),
-    /// slab 容量从"分配总和"降到"峰值活跃集"。段末**不**清扫(清扫落在窗内 = 违规;
-    /// 中间块已由活性回收归还)。
-    CapturingScoped,
-}
-
-/// **段求值**(piecewise 求值面原语,见本段头注):
-/// 在 `carry` 接力下求值 `roots` 的可达子图,返回各根的块句柄。
-/// `mode` = 本段求值所处的窗口([`SegMode`];捕获窗内零回收)。
-/// `tp` 注入口同 [`eval_ops_env`](piecewise 各段独立求值 ⇒ 必须逐段带上,
-/// 否则段内行并行层的 allreduce 全丢)。
-pub fn eval_segment<'a, D>(
-    roots: &'a [&'a TensorOps],
-    face: &'a mut D,
-    env: crate::env::EnvProvider,
-    tp: Option<&'a crate::module::TpCtx>,
-    carry: &'a mut EvalCarry,
-    mode: SegMode,
-) -> Pin<Box<dyn Future<Output = Result<Vec<Bytes>, ModelError>> + Send + 'a>>
-where
-    D: crate::contract::DeviceClient + 'a,
-{
-    Box::pin(async move {
-        let mut pending: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
-        for r in roots {
-            for (id, c) in count_pending(r) {
-                *pending.entry(id).or_insert(0) += c;
-            }
-        }
-        let perf = PerfCtx::of(&env);
-        // 捕获口径:零池;回收按调用方声明(plain = 零回收,scoped = 锚定活性回收)
-        let capt = matches!(mode, SegMode::Capturing | SegMode::CapturingScoped);
-        let scoped_in_win = mode == SegMode::CapturingScoped;
-        let pool_budget = if capt { 0 } else { block_pool_budget() };
-        let mut ctx = EvalCtx {
-            face,
-            memo: std::mem::take(&mut carry.memo),
-            tap: None,
-            arena: Vec::new(),
-            arena_set: std::collections::HashSet::new(),
-            block_users: std::collections::HashMap::new(),
-            pending,
-            reclaim: scoped_in_win || !capt,
-            perf,
-            env,
-            pool: (pool_budget > 0).then(|| BlockPool::new(pool_budget)),
-            keep_nodes: carry.keep.clone(),
-            keep_blocks: std::collections::HashSet::new(),
-            overrides: carry.overrides.clone(),
-            tp: tp.cloned(),
-        };
-        let mut out = Vec::with_capacity(roots.len());
-        for r in roots {
-            // 错误路径同样要收尾(否则本次求值的活块整套泄漏;同 scoped_env 注释)
-            match _eval_rec(r, &mut ctx).await {
-                Ok(b) => out.push(b),
-                Err(e) => {
-                    let _ = ctx.flush_pool().await;
-                    let mut cand: Vec<u64> = std::mem::take(&mut ctx.arena);
-                    cand.retain(|id| ctx.arena_set.contains(id) && !ctx.is_kept(*id));
-                    if !cand.is_empty() {
-                        let _ = ctx.face.free(&cand).await;
-                    }
-                    return Err(e);
-                }
-            }
-        }
-        ctx.flush_pool().await?;
-        if mode == SegMode::Eager {
-            let root_ids: std::collections::HashSet<u64> = out.iter().map(|b| b.id).collect();
-            let mut candidates: Vec<u64> = std::mem::take(&mut ctx.arena);
-            candidates.retain(|id| {
-                !root_ids.contains(id) && ctx.arena_set.contains(id) && !ctx.is_kept(*id)
-            });
-            if !candidates.is_empty() {
-                ctx.face.free(&candidates).await?;
-            }
-        }
-        // 段末接力:**只**把 keep 命中的值留给下一段(其余块已回收/归还)
-        ctx.memo.retain(|node_id, _| carry.keep.contains(node_id));
-        carry.memo = ctx.memo;
-        Ok(out)
-    })
-}
+// **为什么退役**:W3/W4 之后 FI 核留在捕获图内、调度表由窗外 `fi_plan_sync` 刷
+// ⇒ 断点面零消费者;而它正是"接力棒每步只增(新节点 id)⇒ 段末 `memo.retain`
+// 每步 16×O(N) ⇒ 端到端 O(步数²)"那条慢化病的宿主(设计卷 §3.3)。
+// 需要分段求值时从 git 历史取回(`docs/piecewise-断点图-设计与实现.md` 已标退役)。
 
 /// 带观测的求值(interpreter-tap.md §4.2):归约语义与 [`eval_ops`]
 /// 完全一致,仅在每个节点 After 窗口发事件 —— 数据读取(Stats/Bytes)
@@ -601,8 +469,6 @@ where
                 arena_set: std::collections::HashSet::new(),
                 block_users: std::collections::HashMap::new(),
                 pending: std::collections::HashMap::new(), reclaim: false, perf, pool: None,
-                keep_nodes: Default::default(), keep_blocks: Default::default(),
-                overrides: Default::default(),
             tp: None,
         };
         _eval_rec(t, &mut ctx).await
@@ -636,13 +502,6 @@ struct EvalCtx<'a, D> {
     /// 只在 scoped(reclaim=true)入口装载 —— plain/multi/tap 口径
     /// (图捕获面)零改动:捕获窗分配会烙进图,不能改分配模式。
     pool: Option<BlockPool>,
-    /// **跨段存活白名单**(piecewise 段求值面;缺省空 = 历史口径零影响)。
-    /// `keep_nodes` = 节点 id;`keep_blocks` = 其产出块 id(在 [`Self::memo_put`] 命中时登记)。
-    /// 两个回收出口(中途 block_users 归零、段末 candidates)都绕开 `keep_blocks`。
-    keep_nodes: std::collections::HashSet<u64>,
-    keep_blocks: std::collections::HashSet<u64>,
-    /// 输出覆盖(见 [`EvalCarry::overrides`];缺省空 = 历史口径零影响)
-    overrides: std::collections::HashMap<u64, Bytes>,
     /// **张量并行上下文**(S4 ③';`None` = 单卡)。解释器在求值尾部按节点的
     /// [`TensorOps::tp_role`](crate::tensor::TensorOps::tp_role) 标记统一追加
     /// allreduce(层只给标记,不构造通信节点 —— 用户裁决 2026-10-17)。
@@ -671,23 +530,9 @@ where
         owl_shared::slab_hint::probe_refs(id, *u, self.pending.get(&id).copied().unwrap_or(0));
     }
 
-    /// **memo 写入单点**:登记节点值;若它属跨段存活白名单,同时登记其产出块
-    /// (piecewise 段求值面;非白名单 = 与历史语义逐字相同)。
+    /// **memo 写入单点**:登记节点值。
     fn memo_put(&mut self, node_id: u64, b: Bytes) {
-        if self.keep_nodes.contains(&node_id) {
-            self.keep_blocks.insert(b.id);
-        }
         self.memo.insert(node_id, b);
-    }
-
-    /// 该块是否被跨段存活白名单保护(回收出口的唯一判据)
-    fn is_kept(&self, block_id: u64) -> bool {
-        self.keep_blocks.contains(&block_id)
-    }
-
-    /// 该**节点**是否属跨段存活白名单(值/handle 也必须留;见活性回收处)
-    fn is_kept_node(&self, node_id: u64) -> bool {
-        self.keep_nodes.contains(&node_id)
     }
 
     /// 透传别名登记(Reshape/SlotWrite:节点共享父块;仅竞技场原生块)
@@ -713,36 +558,6 @@ where
     /// 池块内容 = 上一位使用者的旧值(契约:Zeros 即零化)。
     /// **不在此登记竞技场**:`track_new` 由调用方统一调用(单一拼写;
     /// 命中/未命中在调用方眼里都是「一个新输出块」)。
-    /// 输出块获取(**按节点 id**):命中 [`EvalCarry::overrides`] ⇒ 直接用给定块
-    /// (piecewise 断点:捕获/回放两期同址),并把它钉进 `keep_blocks`。
-    /// 其余语义与 [`Self::alloc_out`] 逐字相同。
-    async fn alloc_out_node(
-        &mut self,
-        node_id: u64,
-        dtype: Dtype,
-        n_elems: usize,
-        zeroed: bool,
-        name: &str,
-    ) -> Result<Bytes, ModelError> {
-        if let Some(b) = self.overrides.get(&node_id) {
-            if b.len != n_elems {
-                return Err(ModelError::Msg(format!(
-                    "输出覆盖尺寸不符(节点 {node_id}):覆盖块 {} 元素,声明 {n_elems}",
-                    b.len
-                )));
-            }
-            let b = b.clone();
-            // 覆盖块 = 跨段钉块:永不参与回收(与 keep 同一条守卫)
-            self.keep_blocks.insert(b.id);
-            self.track_new(b.id);
-            if zeroed {
-                self.face.memset_zero(&b, n_elems * dtype.size_bytes()).await?;
-            }
-            return Ok(b);
-        }
-        self.alloc_out(dtype, n_elems, zeroed, name).await
-    }
-
     /// ★ **1-stage 的输出槽**(2026-10-18;`TP2-施工设计.md` §35):
     /// 把"要做 AR 的那一个输出"**直接放进对称槽** —— 上游 GEMM 写它 ⇒ 对端就
     /// 能读它 ⇒ 融合核(`owl_comm_ar_1stage_*`)原地加,**stage 段整段消失**。
@@ -812,12 +627,6 @@ where
 
     /// 归还一个已死块(DAG 上再无消费者):入池 = **零命令**;否则真 free。
     async fn release_block(&mut self, id: u64) -> Result<(), ModelError> {
-        // 跨段存活块**永不归还**:进池/进驱动池都会在下一次 alloc 被复用 ⇒
-        // 前一段烘焙的地址会指向别人的数据(piecewise 的唯一硬不变量,落唯一出口)
-        if self.is_kept(id) {
-            owl_shared::slab_hint::live_diag::refuse(owl_shared::slab_hint::live_diag::Refuse::Kept);
-            return Ok(());
-        }
         if self.pool.as_mut().is_some_and(|p| p.give_back(id)) {
             return Ok(());
         }
@@ -851,6 +660,45 @@ where
 /// 预波:每节点剩余消费者计数(每条入边 +1;根 +1 = 调用方持根)。
 /// 迭代显式栈(DAG 可数千节点深,避开递归深度);visited 保证每节点
 /// 处理一次,每条边在其消费节点的访问时计一次。
+/// **多根 pending(边只数一次)**(2026-10-19 定谳;设计卷 §8.31)。
+///
+/// 旧口径 = 逐根 `count_pending(r)` 后**相加**。它对"副作用树"(roots 互不相交:
+/// K0 写哑根 / encode,2026-10-10 的立项场景)是对的,但**对"根套根"错**:
+/// `eval_root_and_q` 的 roots = `[hidden, q₁..qₙ]`,而 Q/tap 节点**就在 hidden 的
+/// 子树里** ⇒ 共享子树的每条边被数 k 次,而执行只发生一次(节点求值 + memo)
+/// ⇒ `pending` 恒定多算 ⇒ 活性回收的"归零"永不成立 ⇒ **中途一块都不还**。
+///
+/// 实测(B 轴档 27B prefill chunk 128):真回收 **14** 块 / 新块 1431;影子 arena
+/// 峰值 2064 MiB ≈ 分配总量 2.0 GB(逐名同比例)⇒ 单 chunk 激活面 ≈ 48 层全摊。
+/// 修后同一档峰值应回到"峰值活跃集"量级(1–3 层)。
+///
+/// 不变量:**一张图数边一次**(每个节点只贡献自己的 `parents`),每个根另 +1
+/// (调用方持根 ⇒ 根永不中途回收 —— Q 槽/回灌面在 eval 结束后才读它们)。
+fn count_pending_multi(roots: &[&TensorOps]) -> std::collections::HashMap<u64, usize> {
+    let mut pending: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    let mut visited = std::collections::HashSet::new();
+    for r in roots {
+        // 调用方持有的根:带 +1(与单根口径同律)
+        *pending.entry(r.id).or_insert(0) += 1;
+        let mut stack = vec![*r];
+        while let Some(n) = stack.pop() {
+            // **跨根共享 visited** ⇒ 同一节点只贡献一次边(修的就是这里)
+            if !visited.insert(n.id) {
+                continue;
+            }
+            for p in &n.parents {
+                *pending.entry(p.id).or_insert(0) += 1;
+                if !visited.contains(&p.id) {
+                    stack.push(p);
+                }
+            }
+        }
+    }
+    pending
+}
+
+/// 单根 pending(lease:多根走 [`count_pending_multi`])
+#[allow(dead_code)]
 fn count_pending(root: &TensorOps) -> std::collections::HashMap<u64, usize> {
     let mut pending: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
     let mut visited = std::collections::HashSet::new();
@@ -938,8 +786,13 @@ where
 
     // C1 边界断言:非 Block 父节点的块账长 = 声明元素数(Block 叶子 len=0 无
     // 语义;SliceView 父 = 块首切片,账长 = 父块全长,不在此检)。维度推导
-    // 一律不用 len(见下方各分支);此处只在 debug 构建拦账变。
-    if cfg!(debug_assertions) {
+    // 一律不用 len(见下方各分支)。
+    //
+    // 门谓词 = 仓内统一 `PERF_BUILD`(2026-10-17 审查 §六轮:原 `cfg!(debug_assertions)`
+    // 是**第二套谓词**;`PERF_BUILD = debug_assertions ∨ feature=perf` ⇒ 非 perf 的
+    // release 里整段常量折叠(逐字节零成本),而 `--features perf` 能在 release 档
+    // 打开这类账本检查 —— 与 `cuda/state.rs` 的既有用法同源)。
+    if owl_shared::metrics::PERF_BUILD {
         for (i, (p, b)) in t.parents.iter().zip(&vals).enumerate() {
             if matches!(p.op, Op::SliceView { .. }) {
                 continue;
@@ -969,12 +822,22 @@ where
 
     let out: Bytes = match &t.op {
         Op::Htod { bytes } => {
-            let b = ctx.face.htod(dtype, &shape, bytes, class).await?;
+            // **参数面走 COMPUTE 流**(2026-10-17;用户裁决):图/核的输入叶子
+            // (pos/slots/lens/id/gdn_slot/fi_* 等)与消费它的发射同流 FIFO ⇒
+            // 结构上不再依赖"等回执"的时序运气(H2D 流忙时必翻车的那类竞态)。
+            // 大批量(权重/装载材料)仍走 H2D:不占计算流。
+            const ARG_PLANE_MAX_BYTES: usize = 64 << 10;
+            let stream = if n_bytes <= ARG_PLANE_MAX_BYTES {
+                owl_iface::contract::UpStream::Compute
+            } else {
+                owl_iface::contract::UpStream::H2d
+            };
+            let b = ctx.face.htod_on(stream, dtype, &shape, bytes, class).await?;
             ctx.track_new(b.id);
             b
         }
         Op::Zeros => {
-            let b = ctx.alloc_out_node(t.id, dtype, n_elems, true, class).await?.view(dtype, shape.len() as u8);
+            let b = ctx.alloc_out(dtype, n_elems, true, class).await?.view(dtype, shape.len() as u8);
             owl_shared::slab_hint::probe_name(b.id, class);
             ctx.track_new(b.id);
             b
@@ -997,6 +860,13 @@ where
             let (m, n) = (shape[0], shape[1]);
             // k = 内维 = x 声明 shape 末维(C1:只读声明 shape;原取 ins[0].len
             // 在多行 [m,k] 时越界读 —— 此 bug 被"历届测试都单行"掩盖)
+            // k = 内维 = x 声明 shape 末维(C1:只读声明 shape;原取 ins[0].len
+            // 在多行 [m,k] 时越界读 —— 此 bug 被"历届测试都单行"掩盖)。
+            // 空形状此处**不可达**(2026-10-17 审查 §六轮定判)两点:
+            // ①`TensorOps::matmul/matmul_nt` 声明面已按 rank ≥ 1 律毒化;
+            // ②本函数在执行本臂前先经父值求值,父节点带毒 ⇒ 更早以
+            // "[毒值落地]" 返回 Err(见上方 `t.err` 门)。故 `unwrap_or(0)` 只是
+            // 形式默认,不会把 0 送进几何。
             let k = t.parents[0].shape.last().copied().unwrap_or(0);
             // ★ **1-stage(§35)**:Matmul 的输出就是 AR 的 payload(最常见的那条)
             // —— 必须也走对称槽,否则融合核永远拿不到 out。
@@ -1009,7 +879,7 @@ where
             ) {
                 Some(b) => b.view(dtype, shape.len() as u8),
                 None => ctx
-                    .alloc_out_node(t.id, dtype, m * n, false, class)
+                    .alloc_out(dtype, m * n, false, class)
                     .await?
                     .view(dtype, shape.len() as u8),
             };
@@ -1111,7 +981,7 @@ where
             ) {
                 Some(b) => b.view(dtype, shape.len() as u8),
                 None => ctx
-                    .alloc_out_node(t.id, dtype, n_elems, false, class)
+                    .alloc_out(dtype, n_elems, false, class)
                     .await?
                     .view(dtype, shape.len() as u8),
             };
@@ -1275,13 +1145,7 @@ where
                 *cnt -= 1;
             }
             if *cnt == 0 {
-                // ⚠️ **keep 节点的 memo 条目不摘**(2026-10-15 P0 门抓到):
-                // 本段的活性分析只看得见**本段**的消费者,而 keep 的语义正是
-                // "下一段还要用" ⇒ 摘了 handle 就等于丢了跨段接线(块虽被保护,
-                // 但下一段拿不到它)。非 keep = 历史语义逐字不变。
-                if !ctx.is_kept_node(p.id) {
-                    ctx.memo.remove(&p.id);
-                }
+                ctx.memo.remove(&p.id);
                 let bid = b.id;
                 if let Some(u) = ctx.block_users.get_mut(&bid) {
                     if *u > 0 {
@@ -1306,9 +1170,6 @@ where
                         } else if !ctx.arena_set.contains(&bid) {
                             refuse(Refuse::NotArena);
                             outcome(bid, bytes, Some(Refuse::NotArena), left_u);
-                        } else if ctx.is_kept(bid) {
-                            refuse(Refuse::Kept);
-                            outcome(bid, bytes, Some(Refuse::Kept), left_u);
                         } else {
                             outcome(bid, bytes, None, 0);
                             ctx.arena_set.remove(&bid);
@@ -1496,156 +1357,6 @@ mod liveness_tests {
         assert!((v - 129.0).abs() < 1e-5, "链值应 129.0,得 {v}");
     }
 
-    /// **段求值面**(piecewise;2026-10-15):两段一断点 ≡ 一次整树求值。
-    /// 树:`x --add c--> a --(断点:外部给值)--> b --add c--> r`。
-    /// 段0 求 `a`(断点的操作数)并 keep;调用方把断点值 `a+10` 写进 carry;
-    /// 段1 求 `r`。⇒ 逐值对拍"整树直算"。
-    #[tokio::test]
-    async fn eval_segment_piecewise_equals_whole_tree() {
-        let mut face = owl_cpu::CpuFace::new();
-        let one = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0]));
-        let c10 = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[10.0]));
-        let x = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[3.0]));
-        let a = x.add(&one); // 4
-        // 断点节点 = a.add(&c10) —— 由调用方在段间"外部求值"
-        let brk = a.add(&c10);
-        let r = brk.add(&one); // 期望 16
-
-        let mut carry = EvalCarry::default();
-        carry.keep.insert(a.id);
-        let seg0 = eval_segment(&[&a], &mut face, Default::default(), None, &mut carry, SegMode::Eager)
-            .await
-            .expect("seg0");
-        assert_eq!(seg0.len(), 1);
-        let av = read_f32(&mut face, &seg0[0]).await;
-        assert!((av - 4.0).abs() < 1e-6, "段0 值应 4.0,得 {av}");
-        assert!(carry.memo.contains_key(&a.id), "keep 命中必须接力 a");
-
-        // 断点求值(调用方负责):这里直接在 host 侧"造"出它的值块并登记
-        // (GPU 侧这里就是"窗外 eager 跑一次断点算子";CPU 测试用 htod 等价造块)
-        let brk_block = owl_iface::htod!(face, Dtype::F32, &vec![1usize].into(), &f32b(&[av + 10.0]))
-            .await
-            .expect("断点块");
-        carry.resolve(brk.id, brk_block.clone());
-        assert!(carry.keep.contains(&brk.id), "resolve 必须同时登记 keep");
-
-        let seg1 = eval_segment(&[&r], &mut face, Default::default(), None, &mut carry, SegMode::Eager)
-            .await
-            .expect("seg1");
-        let rv = read_f32(&mut face, &seg1[0]).await;
-        assert!((rv - 15.0).abs() < 1e-6, "尾段值应 15.0(4+10+1),得 {rv}");
-
-        // 对照:整树直算(用同一批常量,但独立树)
-        let x2 = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[3.0]));
-        let one2 = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0]));
-        let c102 = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[10.0]));
-        let whole = x2.add(&one2).add(&c102).add(&one2);
-        let w = eval_ops_scoped(&whole, &mut face).await.expect("whole").0;
-        assert!(
-            (read_f32(&mut face, &w).await - rv).abs() < 1e-6,
-            "分段 ≠ 整树"
-        );
-    }
-
-    /// **输出覆盖**(A4.1):被覆盖的节点写进**给定块**(不是新分配),
-    /// 且该块被钉住 —— 这是 piecewise 断点"捕获/回放两期同址"的求值面保证。
-    #[tokio::test]
-    async fn eval_segment_override_writes_into_given_block() {
-        let mut face = owl_cpu::CpuFace::new();
-        let one = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0]));
-        let x = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[4.0]));
-        let n = x.add(&one); // 5
-        // "钉块":捕获前分配的那类(带正确元素数;GPU 上由 plan 持有)
-        let pin = owl_iface::alloc!(face, Dtype::F32, 1).await.expect("pin 块").view(Dtype::F32, 1);
-        let mut carry = EvalCarry::default();
-        carry.override_out(n.id, pin.clone());
-
-        let outs = eval_segment(&[&n], &mut face, Default::default(), None, &mut carry, SegMode::Eager)
-            .await
-            .expect("eval");
-        assert_eq!(outs[0].id, pin.id, "覆盖点必须写进给定块(而不是新分配)");
-        assert!((read_f32(&mut face, &pin).await - 5.0).abs() < 1e-6, "覆盖块值错");
-        assert!(
-            !face.freed_ids().contains(&pin.id),
-            "覆盖块必须被钉住;归还账 = {:?}",
-            face.freed_ids()
-        );
-        assert!(carry.memo.contains_key(&n.id), "覆盖点必须进接力棒(跨段可见)");
-    }
-
-    /// **覆盖尺寸校验**:声明元素数与给定块不符 ⇒ 结构化拒(不静默截断)
-    #[tokio::test]
-    async fn eval_segment_override_size_mismatch_rejected() {
-        let mut face = owl_cpu::CpuFace::new();
-        let c2 = TensorOps::from_host(Dtype::F32, vec![2], &f32b(&[1.0, 1.0]));
-        let x = TensorOps::from_host(Dtype::F32, vec![2], &f32b(&[1.0, 1.0]));
-        let n = x.add(&c2); // [2](声明形状相符 ⇒ 触不到声明门,只会撞覆盖尺寸门)
-        let bad = owl_iface::alloc!(face, Dtype::F32, 1).await.expect("错尺寸钉块").view(Dtype::F32, 1);
-        let mut carry = EvalCarry::default();
-        carry.override_out(n.id, bad);
-        let r = eval_segment(&[&n], &mut face, Default::default(), None, &mut carry, SegMode::Eager).await;
-        let e = r.err().expect("尺寸不符必须拒").to_string();
-        assert!(e.contains("输出覆盖尺寸不符"), "拒语应指向覆盖尺寸,得 {e}");
-    }
-
-    /// **跨段地址稳定**(S-2):keep 命中的**中间节点**活过本段 —— 它在本段结束后
-    /// 已死(无消费者),若不保护必进归还账;同时用"未保护的死块**确实被归还**"
-    /// 做**阳性对照**(证明回收真的跑了,判据不是空转)。且再请求该节点 = 同块。
-    #[tokio::test]
-    async fn eval_segment_kept_block_survives_and_is_stable() {
-        let mut face = owl_cpu::CpuFace::new();
-        let one = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0]));
-        let x = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[2.0]));
-        let kept = x.add(&one); // 3   ← 本段结束后即死,但登记了 keep
-        let dead = kept.add(&one); // 4 ← 未登记 keep 的死块(阳性对照)
-        let root = dead.add(&one); // 5 ← 段根
-
-        let mut carry = EvalCarry::default();
-        carry.keep.insert(kept.id);
-        let s0 = eval_segment(&[&root], &mut face, Default::default(), None, &mut carry, SegMode::Eager)
-            .await
-            .expect("seg0");
-        let root_bid = s0[0].id;
-        let kept_bid = carry.memo.get(&kept.id).expect("keep 必须接力").id;
-        let dead_bid = root_bid.wrapping_add(0); // 占位,下面用差值判阳性
-        let _ = (root_bid, dead_bid);
-
-        let freed = face.freed_ids();
-        assert!(
-            !freed.contains(&kept_bid),
-            "keep 的中间块被归还 ⇒ 地址会不稳定;归还账 = {freed:?}"
-        );
-        assert!(
-            freed.len() >= 1,
-            "阳性对照失败:本段一个死块都没归还 ⇒ 回收没跑(判据空转)"
-        );
-        // 再请求 kept = 命中 memo 的同块(零重算)
-        let s1 = eval_segment(&[&kept], &mut face, Default::default(), None, &mut carry, SegMode::Eager)
-            .await
-            .expect("seg1");
-        assert_eq!(s1[0].id, kept_bid, "keep 节点应命中 memo 返回同块");
-        assert!((read_f32(&mut face, &s1[0]).await - 3.0).abs() < 1e-6);
-    }
-
-    /// **非 keep 不接力**(S-1 的反面):没登记 keep 的节点值不带下一段 ⇒
-    /// 再请求它会重算(块 id 变),契约显式、不留惊喜。
-    #[tokio::test]
-    async fn eval_segment_unkept_value_is_not_carried() {
-        let mut face = owl_cpu::CpuFace::new();
-        let one = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0]));
-        let x = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[7.0]));
-        let n = x.add(&one);
-        let mut carry = EvalCarry::default(); // 不登记 keep
-        let s0 = eval_segment(&[&n], &mut face, Default::default(), None, &mut carry, SegMode::Eager)
-            .await
-            .expect("seg0");
-        assert!(carry.memo.is_empty(), "未 keep 的值不该出现在接力棒里");
-        let s1 = eval_segment(&[&n], &mut face, Default::default(), None, &mut carry, SegMode::Eager)
-            .await
-            .expect("seg1");
-        assert_ne!(s0[0].id, s1[0].id, "未 keep ⇒ 应重算出新块");
-        assert!((read_f32(&mut face, &s1[0]).await - 8.0).abs() < 1e-6);
-    }
 
     /// **引用计数推送**(2026-10-16):求值器在改动点把 `(users, pending)` 推给
     /// 探针 —— 这是"它凭什么是活的"数据源。
@@ -1654,6 +1365,75 @@ mod liveness_tests {
     /// 报告渲染受日志级别影响,而"推了几次"是机械事实。CPU 面跑不了真块叶
     /// (无块账房 ⇒ DeadBlock),所以这里只验"推了且计数随引用增长";
     /// 真实图路径的端到端断言在 engine 侧(probe 窗口内 `refs_pushed > 0`)。
+    /// **多根"根套根"的活性回收**(2026-10-19;设计卷 §8.31 立案):
+    /// Q 槽(`eval_root_and_q` 的 `[hidden, q₁..qₙ]`)与 DFlash2/MTP taps 正是这种
+    /// 形态 —— **根节点在主根子树里**。旧口径逐根 `count_pending` 相加 ⇒ 共享子树的
+    /// 边被数 k 次、执行只减一次 ⇒ `pending` 永不归零 ⇒ 中途一块不还
+    /// (峰值 = 全图同摊:实测 27B 单 chunk 2064 MiB)。
+    ///
+    /// 判据(**紧**):活块按**块尺寸**定标 —— 每节点 16 KiB,回收正常时峰值活跃集
+    /// 只有个位数块(≤ `8 × NODE`);旧口径会把内层根那半条链(≈48 块)全吊住。
+    /// 过激回收会立刻在值上爆(两根的值都验)。
+    #[tokio::test]
+    async fn multi_root_nested_liveness_reclaimed() {
+        use owl_shared::slab_hint;
+        const N: usize = 4096; // 每节点 16 KiB
+        const NODE: usize = N * 4;
+        const GATE: usize = 8 * NODE; // 峰值活跃集上界(个位数块)
+        let mut face = owl_cpu::CpuFace::new();
+        let c = TensorOps::from_host(Dtype::F32, vec![N], &f32b(&vec![1.0f32; N]));
+        let mut x = TensorOps::from_host(Dtype::F32, vec![N], &f32b(&vec![0.0f32; N]));
+        let mut inner = None;
+        for i in 0..64 {
+            x = x.add(&c);
+            if i == 48 {
+                inner = Some(x.clone()); // 内层根:深处(在主根子树里)
+            }
+        }
+        let inner = inner.expect("内层根");
+
+        // ① 基线:单根口径(既有中途回收)
+        slab_hint::probe_on(true);
+        let (r1, cand1) = eval_ops_scoped(&x, &mut face).await.expect("单根 scoped");
+        let peak_single = slab_hint::probe_end();
+        assert!(cand1.is_empty(), "单根档候选表应为空,得 {}", cand1.len());
+        assert!(
+            peak_single <= GATE,
+            "单根基线峰值 {peak_single}B 就该是个位数块(门 {GATE}B)⇒ 基线本身坏了"
+        );
+
+        // ② 被验档:多根嵌套(两根:[主根, 内层根])
+        slab_hint::probe_on(true);
+        let roots = [&x, &inner];
+        let outs =
+            eval_ops_multi_scoped_env(&roots, &mut face, crate::env::EnvProvider::default(), None)
+                .await
+            .expect("多根 scoped");
+        let peak_multi = slab_hint::probe_end();
+        assert_eq!(outs.len(), 2, "两根本都必须拿到值");
+
+        // 值校验(过激回收 = 读到已还块 ⇒ 立刻错值;`dtoh` 读**整块**)
+        let mut buf = vec![0u8; NODE];
+        face.dtoh(&r1, &mut buf).await.expect("单根 dtoh");
+        let v1 = f32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        assert!((v1 - 64.0).abs() < 1e-4, "单根链值应 64.0,得 {v1}");
+        for (i, b) in outs.iter().enumerate() {
+            let mut bb = vec![0u8; NODE];
+            face.dtoh(b, &mut bb).await.expect("多根 dtoh");
+            let v = f32::from_le_bytes([bb[0], bb[1], bb[2], bb[3]]);
+            let want = if i == 0 { 64.0 } else { 49.0 };
+            assert!((v - want).abs() < 1e-4, "多根根#{i} 值应 {want},得 {v}");
+        }
+
+        // ③ 门:多根嵌套**不许**把峰值抬到图宽同阶(旧口径 = 内层根那半条链被吊住)
+        assert!(
+            peak_multi <= GATE,
+            "多根嵌套活性峰值 {peak_multi}B ≈ {} 块(门 {GATE}B)⇒ 共享子树的 pending \
+             被重复计数(§8.31);单根基线 {peak_single}B",
+            peak_multi / NODE
+        );
+    }
+
     #[tokio::test]
     async fn eval_pushes_ref_counts_to_probe() {
         let mut face = owl_cpu::CpuFace::new();
@@ -1675,13 +1455,6 @@ mod liveness_tests {
         let before = owl_shared::slab_hint::refs_pushed();
         let _ = eval_ops_scoped(&root, &mut face).await;
         assert_eq!(owl_shared::slab_hint::refs_pushed(), before, "探针关必须零推送");
-    }
-
-    /// 读回一个 f32 块(测试辅助)
-    async fn read_f32(face: &mut owl_cpu::CpuFace, b: &Bytes) -> f32 {
-        let mut buf = vec![0u8; 4];
-        face.dtoh(b, &mut buf).await.expect("dtoh");
-        f32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])
     }
 
     /// 菱形 + 透传别名:x 被四方引用(mul 两参 + reshape 透传 + mul 右参)

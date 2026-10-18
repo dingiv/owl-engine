@@ -29,7 +29,8 @@
 //! 模板渲染不稳定)**回退全量重算**(正确性优先,缓存命中其次);
 //! 真前缀匹配/radix 树随 M2 continuous batching 立项。
 
-use crate::blocks::BlockManager;
+use owl_store::{BlockClass, BlockLeg, ChainCursor, LegConfig, PoolLayout, Rel};
+
 use crate::Result;
 
 /// 客户端会话账(引擎侧感知面;KV cache 连续性的记账形态)
@@ -52,15 +53,20 @@ pub struct AgentSession {
     /// MTP 草稿链块链(E5-M2b):独立页池的第二链;mtp 模式由
     /// propose 路径 ensure_for_len,与 target 链同步跨 turn 存续
     pub mtp_block_table: Vec<u32>,
-    /// GDN 状态格号(E2b 多会话隔离;格 = 每会话一格,容量 GDN_SLOTS)
-    pub gdn_slot: usize,
+    // (S2b:GDN 行不再是会话资源 —— 行随 **turn** 借还,见 `ActiveTurn.gdn_slot`
+    //  与 `StateStore::{borrow_row, return_row}`;会话只剩身份 + token 历史)
     /// E5:LRU 触达时间(SessionTable.tick;越小越老,逐出候选)
     pub last_use: u64,
+    /// **链哈希游标**(快照键真源):已哈希整块数 + 链尾内容身份。
+    /// 懒惰推进(只喂新增整块)⇒ 全 turn O(n);键必须是**内容身份**
+    /// (物理块号会被回收复用 —— `owl_store::ChainCursor` 头注)。
+    /// 生命周期跟随链:前缀失配 `reset()` 归零;前缀命中由调度层 `seed()`。
+    pub(crate) chain: ChainCursor,
 }
 
 impl AgentSession {
     /// 新会话(零缓存起步;块表空,首次 turn 由账房分配)
-    pub fn new(id: u64, slot_base: usize, gdn_slot: usize) -> Self {
+    pub fn new(id: u64, slot_base: usize) -> Self {
         Self {
             id,
             cached_len: 0,
@@ -68,8 +74,8 @@ impl AgentSession {
             tokens: Vec::new(),
             block_table: Vec::new(),
             mtp_block_table: Vec::new(),
-            gdn_slot,
             last_use: 0,
+            chain: ChainCursor::new(),
         }
     }
 
@@ -80,11 +86,23 @@ impl AgentSession {
         prompt.len() >= self.cached_len && self.tokens[..self.cached_len] == prompt[..self.cached_len]
     }
 
+    /// **首个分叉位置**(诊断;`None` = 前缀全同)。
+    ///
+    /// 用途:`[dbg prefix]` 取证 —— 守卫失配时告诉人"第几个 token 开始不同、
+    /// 两侧各是什么",而不是只报一个 `cached_tokens=0`(那要人肉二分)。
+    /// 上界 = `min(cached_len, prompt.len())`(守卫已保证不会越界读)。
+    pub fn first_divergence(&self, prompt: &[u32]) -> Option<usize> {
+        let n = self.cached_len.min(prompt.len());
+        (0..n).find(|&i| self.tokens[i] != prompt[i])
+    }
+
     /// 账本重置(前缀失配回退):清账 + 清块表(块归还由引擎调账房,
-    /// 本函数只负责账面 —— 引擎在 reset 路径调 `release_table`)
+    /// 本函数只负责账面 —— 引擎在 reset 路径调 `release_table`)。
+    /// 链哈希游标一并归零(新链从零起 —— 身份跟着链走)。
     pub fn reset(&mut self) {
         self.cached_len = 0;
         self.tokens.clear();
+        self.chain.reset();
     }
 
     /// 会话 KV 预算校验:全量 prompt + 本 turn 生成长度 ≤ 槽区容量
@@ -125,20 +143,35 @@ pub struct SessionTable {
 }
 
 impl SessionTable {
+    /// **会话账查询**(显式 `Result`;2026-10-17 裁决:账缺失**不 panic**)。
+    pub fn session(&self, id: u64) -> Result<&AgentSession> {
+        self.sessions.get(&id).ok_or_else(|| owl_iface::contract::ModelError::EngineInvariant {
+            what: format!("会话账缺失(会话 {id} 不在账)"),
+        })
+    }
+
+    /// 同上(可变)。
+    pub fn session_mut(
+        &mut self,
+        id: u64,
+    ) -> Result<&mut AgentSession> {
+        self.sessions.get_mut(&id).ok_or_else(|| {
+            owl_iface::contract::ModelError::EngineInvariant {
+                what: format!("会话账缺失(会话 {id} 不在账)"),
+            }
+        })
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
 
     /// 取或建(首次 submit 隐式建会话;session_id = 0 起步)。
-    /// GDN 格分配 = 扫描首个未被存活会话占用的格号;格耗尽报错
-    /// (并发上限 = GDN_SLOTS,需求 ≤8 会话;引擎层 LRU 逐出后重试)。
-    /// 已存在的会话直接复用(不占新格;旧实现先扫格后查存在,
-    /// 格满时重提交既有会话被误拒 —— 2026-10-10 实录修复)
-    pub fn get_or_create(
-        &mut self,
-        id: Option<u64>,
-        gdn_slots: usize,
-    ) -> Result<(u64, &mut AgentSession)> {
+    ///
+    /// **S2b(§28)**:会话**不再占 GDN 行**(行 = 活跃 turn 的资源,随 turn 借还)
+    /// ⇒ 建会话不再有"格耗尽"这条路,也不再需要"LRU 逐出会话"来腾格。
+    /// 能挂多少会话只受**缓存面 + 宿主预算**约束(§2.3 的目标形态)。
+    pub fn get_or_create(&mut self, id: Option<u64>) -> Result<(u64, &mut AgentSession)> {
         let id = id.unwrap_or_else(|| {
             let id = self.next_id;
             self.next_id += 1;
@@ -155,19 +188,7 @@ impl SessionTable {
             unreachable!("contains_key 已判定");
         }
         let next = self.next_id;
-        let used: std::collections::HashSet<usize> =
-            self.sessions.values().map(|s| s.gdn_slot).collect();
-        let gdn_slot = (0..gdn_slots)
-            .find(|g| !used.contains(g))
-            .ok_or_else(|| {
-                owl_iface::contract::ModelError::Msg(format!(
-                    "GDN 状态格耗尽({gdn_slots} 格;会话数超并发上限)"
-                ))
-            })?;
-        let s = self
-            .sessions
-            .entry(id)
-            .or_insert_with(|| AgentSession::new(id, 0, gdn_slot));
+        let s = self.sessions.entry(id).or_insert_with(|| AgentSession::new(id, 0));
         s.last_use = tick;
         self.next_id = next.max(id + 1);
         Ok((id, s))
@@ -195,7 +216,8 @@ impl SessionTable {
         self.sessions
             .remove(&id)
             .map(|_| ())
-            .ok_or_else(|| owl_iface::contract::ModelError::Msg(format!("session {id} 不存在")))
+            .ok_or_else(|| owl_iface::contract::ModelError::Msg(format!("session {id} 不存在")))?;
+        Ok(())
     }
 }
 
@@ -204,110 +226,145 @@ impl SessionTable {
 // 按状态域拆解 —— 本节收编**会话账 + 双块账房**及其复合操作)
 // ===========================================================================
 
+/// 块腿几何(boot 一次;S3-3 后 engine 只认 `BlockLeg`,`KvStore` 收成 store 内部件)。
+pub(crate) struct BankPlan {
+    /// 池块容量(**管理面**页数)
+    pub nb: usize,
+    /// 单块 token 数(页)
+    pub page: usize,
+    /// target 池每页字节(`StatePool::block_bytes()`)
+    pub block_bytes: usize,
+    /// MTP 池每页字节(`StatePool::mtp_block_bytes()`;未开 = 0)
+    pub mtp_block_bytes: usize,
+    /// paged 池(legacy 无块表)
+    pub paged: bool,
+    /// MTP 草稿链页池启用
+    pub mtp: bool,
+    /// 前缀缓存开关(容量策略见 [`owl_store::CachePolicy`])
+    pub prefix_cache: bool,
+    /// **前缀缓存份额**(千分比;`[pool].prefix_cache_share` × 1000)。
+    /// 容量算式住 store(`CachePolicy::Share`:份额 × 设备池 + 宿主槽全额)。
+    pub cache_share_permille: u16,
+    /// target 腿宿主层预算(字节;0 = 关层,REQ C4 默认关)
+    pub host_bytes: usize,
+}
+
 /// 会话 + 块账房(组合叶;RunningEngine 持有)。会话账与两套物理块链
 /// (target 链 / MTP 草稿链)的变更永远两者同屋 —— 逐出/关闭/重置
 /// 都是"账 + 链"复合操作,拆散在两处曾是泄漏温床。
+///
+/// **S3-2(2026-10-16)**:两本账(物理块引用账 + 前缀内容树)已自 engine
+/// 迁入 `owl-store`(`KvStore` = 槽池 + 内容身份前缀树),engine 只留
+/// 会话块表(`Vec<u32>`)与设备叶子 —— 裁决①的落点。设备叶子(池缓冲)
+/// 仍归 `StatePool`;store 只发槽号与身份。
+/// **S3b(2026-10-17)**:target 链从裸 `BlockLeg` 升为 **`Rel` 门面**
+/// (块腿 + 状态账 + 预算 + 准入账;设计卷 §23.1)—— engine 经门面走,
+/// 准入判决也从这里出。MTP 链仍为裸腿(独立页池,裁决④推后 S5)。
 pub(crate) struct SessionBank {
     /// 会话账(GDN 格分配/LRU 逐出/前缀守卫)
     pub sessions: SessionTable,
-    /// target 链块账房(E2b;块链按会话分派,池内 ref 计数)
-    pub blocks_m: BlockManager,
-    /// MTP 链页账房(E5-M2b;独立页池,无前缀缓存)
-    pub blocks_mtp: BlockManager,
+    /// target 链门面(块腿 = `rel.leg`;预算/准入账同屋)
+    pub rel: Rel,
+    /// MTP 链块腿(独立页池,无前缀缓存;宿主面恒关 —— 裁决④推后)
+    pub leg_mtp: BlockLeg,
 }
 
 impl SessionBank {
-    /// boot 构造(target 链账房 + MTP 链账房;几何随池)。前缀缓存
+    /// boot 构造(target 链门面 + MTP 链账房;几何随池)。前缀缓存
     /// 只挂 target 链(容量 = 池半);MTP 链无前缀缓存,非 mtp 模式
     /// 0 块 —— 误用 = 结构化报错(池耗尽语义)。
+    ///
+    /// `inputs`/`policy` = 准入预算与姿态(engine 在池/图落位后实测组装;
+    /// 见 `Engine::run`)。装配失败 = **启动失败**(A5.1:没有数字不跑)。
     pub(crate) fn new(
-        pool_nb: usize,
-        pool_page: usize,
-        paged: bool,
-        mtp: bool,
-        prefix_cache: bool,
-        debug: bool,
-    ) -> Self {
-        let mut blocks_m = BlockManager::new(pool_nb, pool_page);
-        blocks_m.debug = debug;
-        if paged && prefix_cache {
-            blocks_m.enable_prefix_cache((pool_nb / 2).max(1));
+        plan: BankPlan,
+        inputs: owl_store::BudgetInputs,
+        policy: owl_store::AdmissionPolicy,
+        target_layout: PoolLayout,
+        mtp_layout: Option<PoolLayout>,
+    ) -> Result<Self> {
+        // **缓存容量 = store 自决**(2026-10-19 容量定档):engine 只给两件事实
+        // (设备页数/宿主预算)与一条**份额政策**,容量算式住在 store
+        // (`CachePolicy::Share`;含"宿主槽全额"的跨层索引语义)。
+        // 份额来自 `[pool].prefix_cache_share`(缺省 0.5 = 旧 `nb/2` 行为)。
+        let cache = if plan.paged && plan.prefix_cache {
+            owl_store::CachePolicy::Share { permille: plan.cache_share_permille }
+        } else {
+            owl_store::CachePolicy::Off
+        };
+        let mut rel = Rel::open(
+            inputs,
+            policy,
+            LegConfig {
+                slots: plan.nb,
+                block_tokens: plan.page,
+                block_bytes: plan.block_bytes,
+                cache,
+                host_bytes: plan.host_bytes,
+                class: BlockClass::KvPage,
+                label: "target",
+            },
+        )?;
+        rel.leg.attach_pool(target_layout)?;
+        let mut leg_mtp = BlockLeg::open(LegConfig {
+            slots: if plan.mtp { plan.nb } else { 0 },
+            block_tokens: plan.page,
+            block_bytes: if plan.mtp { plan.mtp_block_bytes } else { 1 },
+            cache: owl_store::CachePolicy::Off,
+            host_bytes: 0,
+            class: BlockClass::KvPage,
+            label: "mtp",
+        })?;
+        if let Some(l) = mtp_layout {
+            leg_mtp.attach_pool(l)?;
         }
-        let mut blocks_mtp = BlockManager::new(if mtp { pool_nb } else { 0 }, pool_page);
-        blocks_mtp.debug = debug;
-        Self {
-            sessions: SessionTable::new(),
-            blocks_m,
-            blocks_mtp,
-        }
+        Ok(Self { sessions: SessionTable::new(), rel, leg_mtp })
     }
 
-    /// E5:取或建 + 格耗尽 LRU 逐出重试(提交与泵不相交,无活跃 turn,
-    /// 全部存活会话皆可逐;块链归账房,格随 close 回收)。键控与
-    /// ephemeral 两臂共用 —— ephemeral 流量为主的服务面,老键控会话
-    /// 必须让位(2026-10-10 sweep 实录:8 个键控会话存活时全部
-    /// ephemeral 请求 400)
-    pub(crate) fn get_or_create_evicting(
-        &mut self,
-        id: Option<u64>,
-        gdn_slots: usize,
-    ) -> Result<u64> {
-        match self.sessions.get_or_create(id, gdn_slots) {
-            Ok(x) => Ok(x.0),
-            Err(e) if format!("{e}").contains("GDN 状态格耗尽") => {
-                let mut last = e;
-                loop {
-                    let Some(victim) = self.sessions.lru_victim() else {
-                        return Err(last);
-                    };
-                    self.release_session_chains(victim);
-                    // 会话关闭失败 = 块表归还/状态回收失败:不许静默(律 #1)
-                    if let Err(e) = self.sessions.close(victim) {
-                        owl_shared::log_warn!("session", "LRU 逐出 #{victim} 关闭失败: {e}");
-                    }
-                    owl_shared::metrics::with_metrics_store(|m| {
-                        m.counter_add("session.evict", 1, file!(), line!())
-                    });
-                    owl_shared::log_warn!("session", "LRU 逐出 #{victim}(GDN 格回收)→ 重试");
-                    match self.sessions.get_or_create(id, gdn_slots) {
-                        Ok(x) => return Ok(x.0),
-                        Err(e2) if format!("{e2}").contains("GDN 状态格耗尽") => {
-                            last = e2;
-                        }
-                        Err(e2) => return Err(e2),
-                    }
-                }
-            }
-            Err(e) => Err(e),
-        }
+    // （块腿的复合口做成**自由函数**:借用只落在 `&mut KvStore` 那一个字段上
+    //   —— 调用点多处仍持 `&mut AgentSession`(会话表另行借出),方法口会整借
+    //   bank 而冲突;自由函数与"字段不相交"的借用形状对齐。）
+
+    /// 取或建(S2b 后**无逐出**):会话不再占 GDN 行 ⇒ 没有"格耗尽"这条路。
+    /// 历史资源的回收由**缓存面 LRU + 宿主预算**负责(§2.3 目标形态);
+    /// 会话表本身只存元数据(µs 级)。
+    pub(crate) fn get_or_create(&mut self, id: Option<u64>) -> Result<u64> {
+        self.sessions.get_or_create(id).map(|(id, _)| id)
     }
 
     /// 显式关会话(客户端声明不再续;账本清票,双链归还账房 ——
     /// 与 evict/burn 三路径同构;2026-10-15 结案拆分时挂的 FIXME:
     /// 原只还 target 链漏 MTP 页,mtp 模式下显式 close = 页池泄漏)。
     pub(crate) fn close(&mut self, id: u64) -> Result<()> {
-        self.release_session_chains(id);
+        self.release_session_chains(id)?;
         self.sessions.close(id)
     }
 
     /// 临时会话烧毁(complete/abandon 共用;块链归账房 + 表移除释放格,
     /// 双链同还)。关闭失败不许静默(律 #1)。
     pub(crate) fn burn(&mut self, session_id: u64) {
-        self.release_session_chains(session_id);
+        if let Err(e) = self.release_session_chains(session_id) {
+            owl_shared::log_warn!("session", "临时会话 #{session_id} 链归还失败: {e}");
+        }
         if let Err(e) = self.sessions.close(session_id) {
             owl_shared::log_warn!("session", "临时会话 #{session_id} 关闭失败: {e}");
         }
     }
 
     /// 单会话双链归还(target 链 + MTP 链;逐出/关闭/烧毁共用的
-    /// 复合操作 —— 链归还必须与账本操作同屋,防单边清理)
-    fn release_session_chains(&mut self, id: u64) {
+    /// 复合操作 —— 链归还必须与账本操作同屋,防单边清理)。
+    /// 归还失败(槽引用账不平)**不许静默**:记 warn 再抛(律 #1)。
+    fn release_session_chains(&mut self, id: u64) -> Result<()> {
+        // 先摘表(借用随块结束),再归还 —— 归还口是 self 的方法(账房自肃)
+        let mut table = Vec::new();
+        let mut mtp_table = Vec::new();
         if let Some(s) = self.sessions.get_mut(id) {
-            let mut table = std::mem::take(&mut s.block_table);
-            self.blocks_m.release_table(&mut table);
-            let mut mtp_table = std::mem::take(&mut s.mtp_block_table);
-            self.blocks_mtp.release_table(&mut mtp_table);
+            table = std::mem::take(&mut s.block_table);
+            mtp_table = std::mem::take(&mut s.mtp_block_table);
         }
+        self.rel.release_table(&mut table)?;
+        self.leg_mtp.release_table(&mut mtp_table)?;
+        Ok(())
     }
 }
 
@@ -318,9 +375,8 @@ mod tests {
     #[test]
     fn session_delta_guard_and_commit() {
         let mut st = SessionTable::new();
-        let (id, s) = st.get_or_create(None, 8).expect("建会话");
+        let (id, s) = st.get_or_create(None).expect("建会话");
         assert_eq!(id, 0);
-        assert_eq!(s.gdn_slot, 0, "首会话绑 0 号格");
         assert_eq!(s.cached_len, 0);
 
         // turn1:全量 10 token → 零缓存守卫恒真,全量 prefill;收口账本
@@ -363,44 +419,40 @@ mod tests {
     #[test]
     fn session_table_lifecycle() {
         let mut st = SessionTable::new();
-        let (a, sa) = st.get_or_create(Some(7), 2).expect("显式 id");
+        let (a, _sa) = st.get_or_create(Some(7)).expect("显式 id");
         assert_eq!(a, 7, "显式 id 直取");
-        assert_eq!(sa.gdn_slot, 0);
-        let (b, sb) = st.get_or_create(None, 2).expect("自动分配");
+        let (b, _sb) = st.get_or_create(None).expect("自动分配");
         assert_eq!(b, 8, "自动分配递增");
-        assert_eq!(sb.gdn_slot, 1, "第二会话绑下一格");
-        // 格耗尽:两格全占后再建报错(close 前)
-        let err = st.get_or_create(None, 2).unwrap_err();
-        assert!(format!("{err}").contains("GDN 状态格耗尽"));
+        // **S2b**:建会话不再受"行上限"约束(行是 turn 的资源)——
+        // 会话只受缓存面/宿主预算约束(§2.3 目标形态)
+        assert!(st.get_or_create(None).is_ok(), "会话数不再有硬上限");
         assert!(st.get(7).is_some());
         st.close(7).expect("close");
         assert!(st.get(7).is_none());
         assert!(st.close(7).is_err(), "重复 close 报错");
         // 复活:close 后同 id 重建 = 零缓存新会话(重新绑格)
-        let (_, s) = st.get_or_create(Some(7), 2).expect("复活");
+        let (_, s) = st.get_or_create(Some(7)).expect("复活");
         assert_eq!(s.cached_len, 0);
-        assert_eq!(s.gdn_slot, 0, "7 号 close 已释放 0 号格");
     }
     /// E5:LRU 逐出候选 + 已存在会话复用不占格(2026-10-10 实录修复)
     #[test]
     fn session_lru_victim_and_reuse() {
         let mut st = SessionTable::new();
         for i in 0..4u64 {
-            st.get_or_create(Some(100 + i), 4).expect("建");
+            st.get_or_create(Some(100 + i)).expect("建");
         }
-        // 触达 100 与 102(变新鲜);100 是最老 → 候选
-        st.get_or_create(Some(100), 4).expect("复用");
-        st.get_or_create(Some(102), 4).expect("复用");
+        // 触达 100 与 102(变新鲜);101 是最老 → 候选(会话级 LRU 仍可用于
+        // 将来的"显式上限"策略;S2b 后它不再是行耗尽的重试路径)
+        st.get_or_create(Some(100)).expect("复用");
+        st.get_or_create(Some(102)).expect("复用");
         assert_eq!(st.lru_victim(), Some(101), "101 未再触达 = 最老");
-        // 复用不占新格:格满时重提交既有会话必须成功(旧实现误拒)
-        st.get_or_create(Some(103), 4).expect("第 4 格");
-        let err = st.get_or_create(Some(999), 4).unwrap_err();
-        assert!(format!("{err}").contains("GDN 状态格耗尽"), "新会话仍受格上限");
-        st.get_or_create(Some(102), 4).expect("格满复用既有会话 = 成功");
+        st.get_or_create(Some(999)).expect("S2b:新会话不再受行上限");
+        // 会话级 LRU 仍可作为**将来显式上限**的候选源(现在没人调 —— 见 §28)
+        st.get_or_create(Some(102)).expect("复用既有会话 = 成功");
         // 逐出后新会话可入
         let v = st.lru_victim().expect("有候选");
         st.close(v).expect("close");
-        st.get_or_create(Some(999), 4).expect("逐出后可建");
+        st.get_or_create(Some(999)).expect("逐出后可建");
     }
 }
 
@@ -410,31 +462,80 @@ mod bank_tests {
 
     /// T4 结案门(2026-10-15):显式 close 必须双链同还 —— MTP 链曾漏还
     /// (与 evict/burn 不对称,mtp 模式下显式关会话 = 页池泄漏)。
+    fn plan(nb: usize, page: usize, mtp: bool, prefix_cache: bool) -> BankPlan {
+        BankPlan {
+            nb,
+            page,
+            block_bytes: 1 << 20,
+            mtp_block_bytes: 1 << 20,
+            paged: true,
+            mtp,
+            prefix_cache,
+            cache_share_permille: if prefix_cache { 500 } else { 0 },
+            host_bytes: 0,
+        }
+    }
+
+    /// 测试用装配:布局 = 单片段(只跑账,不跑搬运)
+    fn bank_of(p: BankPlan) -> SessionBank {
+        let target = PoolLayout {
+            class: BlockClass::KvPage,
+            epoch: 0,
+            pieces: vec![owl_store::PieceSpec {
+                buf: owl_iface::contract::Bytes::new(0, 1, owl_iface::contract::Dtype::F32, 1),
+                stride_bytes: p.block_bytes,
+            }],
+        };
+        let mtp = p.mtp.then(|| PoolLayout {
+            class: BlockClass::KvPage,
+            epoch: 0,
+            pieces: vec![owl_store::PieceSpec {
+                buf: owl_iface::contract::Bytes::new(0, 1, owl_iface::contract::Dtype::F32, 1),
+                stride_bytes: p.mtp_block_bytes,
+            }],
+        });
+        // 测试用预算:固定池档(池面 = 块字节 × 槽;准入按池墙判)
+        let inputs = owl_store::BudgetInputs {
+            v_card_bytes: 8 << 30,
+            weights_bytes: 1 << 30,
+            runtime_floor_bytes: 64 << 20,
+            draft_pool_bytes: 0,
+            gdn_row_bytes: 1 << 20,
+            kv_bytes_per_token: (p.block_bytes / p.page.max(1)).max(1),
+            page_tokens: p.page.max(1),
+            host_bytes: p.host_bytes,
+            disk_bytes: 0,
+            kv_face_bytes: p.nb * p.block_bytes,
+        };
+        let policy = owl_store::AdmissionPolicy::new(4, owl_store::QueuePolicy::Reject);
+        SessionBank::new(p, inputs, policy, target, mtp).expect("装配块腿")
+    }
+
     #[test]
     fn close_releases_both_chains() {
-        let mut bank = SessionBank::new(64, 8, true, true, false, false);
-        let mtp_before = bank.blocks_mtp.free_blocks();
-        let tgt_before = bank.blocks_m.free_blocks();
+        let mut bank = bank_of(plan(64, 8, true, false));
+        let mtp_before = bank.leg_mtp.report().slots_free;
+        let tgt_before = bank.rel.leg.report().slots_free;
 
-        let (id, s) = bank.sessions.get_or_create(Some(7), 4).expect("建会话");
+        let (id, s) = bank.sessions.get_or_create(Some(7)).expect("建会话");
         assert_eq!(id, 7);
         // target 链 2 块(24 tok / 块 8)+ MTP 链 1 块(9 tok)
-        bank.blocks_m.ensure_for_len(&mut s.block_table, 24).expect("target 块");
-        bank.blocks_mtp.ensure_for_len(&mut s.mtp_block_table, 9).expect("mtp 块");
-        assert!(bank.blocks_mtp.free_blocks() < mtp_before, "mtp 已占用");
+        bank.rel.leg.ensure_for_len(&mut s.block_table, 24).expect("target 块");
+        bank.leg_mtp.ensure_for_len(&mut s.mtp_block_table, 9).expect("mtp 块");
+        assert!(bank.leg_mtp.report().slots_free < mtp_before, "mtp 已占用");
 
         bank.close(id).expect("close");
-        assert_eq!(bank.blocks_mtp.free_blocks(), mtp_before, "MTP 链必须归还");
-        assert_eq!(bank.blocks_m.free_blocks(), tgt_before, "target 链归还");
+        assert_eq!(bank.leg_mtp.report().slots_free, mtp_before, "MTP 链必须归还");
+        assert_eq!(bank.rel.leg.report().slots_free, tgt_before, "target 链归还");
         assert!(bank.sessions.get(id).is_none(), "账本移除");
     }
 
     /// 无 mtp 模式回归:0 块页池,release 空表 = no-op,close 正常。
     #[test]
     fn close_without_mtp_is_noop_on_empty_chain() {
-        let mut bank = SessionBank::new(32, 8, true, false, true, false);
-        let (id, s) = bank.sessions.get_or_create(Some(1), 4).expect("建会话");
-        bank.blocks_m.ensure_for_len(&mut s.block_table, 8).expect("target 块");
+        let mut bank = bank_of(plan(32, 8, false, true));
+        let (id, s) = bank.sessions.get_or_create(Some(1)).expect("建会话");
+        bank.rel.leg.ensure_for_len(&mut s.block_table, 8).expect("target 块");
         bank.close(id).expect("close");
         assert!(bank.sessions.get(id).is_none());
     }

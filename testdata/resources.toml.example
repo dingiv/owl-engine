@@ -1,0 +1,9 @@
+# 测试资源清单(示例;复制为同目录 `resources.toml` 后按本机路径改)
+# —— 取代 OWL_AWQ27B_DIR / OWL_DFLASH2_DIR / OWL_VLM_CKPT … 一族 env。
+"ckpt:27b-awq" = "/path/to/Qwen3.8-27B-AWQ-INT4"
+"ckpt:dflash2"  = "/path/to/Qwen3.8-27B-DFlash2-W4A16"
+"ckpt:qwen35-4b" = "/path/to/Qwen3.5-4B"
+"ckpt:0.8b"     = "/path/to/Qwen3.5-0.8B"
+
+# 开关(未列 = false)
+# "flag:hf-parity" = true

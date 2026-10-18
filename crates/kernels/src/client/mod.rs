@@ -267,6 +267,7 @@ mod tests {
             // 视觉塔 ragged 注意力(2026-10-15 vision 提交;与 native `vis.attn_full` 同槽位)
             // —— 2026-10-19 补:它当时只落了声明表 + client 面,漏了本锁的两张清单
             // (全特性 `cargo test -p owl-kernels --lib` 从那时起就红,属漏跟)
+            // 槽名表**自己一张**(与 native `vis.attn_full` 同槽位,但非 FI paged 那套)
             (
                 crate::family::flashinfer::ATTN_RAGGED_F16,
                 crate::client::flashinfer::ATTN_RAGGED_SLOTS,
@@ -327,6 +328,8 @@ mod tests {
         want.extend([
             crate::family::flashinfer::PREFILL_FI,
             crate::family::flashinfer::PREFILL_FI_FP8KV,
+            // 2026-10-16:视觉塔 ragged 有 parse 面(`client::flashinfer::parse_attn_ragged`)
+            // 与槽名锁,但当初漏登本清单 ⇒ 全 feature 档的覆盖门一直是红的。
             crate::family::flashinfer::ATTN_RAGGED_F16,
         ]);
         #[cfg(feature = "xqa")]

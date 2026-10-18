@@ -73,6 +73,23 @@ impl Rope {
     }
 
     /// 容器内表源(执行器取数用;借用层内表,生命周期随层)
+    /// **host 侧 cos/sin 取用**(B 轴索引采集用;与设备表**同源** `cos_data`/`sin_data`,
+    /// 不重算、不回读)。返回该位置的 `(cos, sin)`,长 = `rotary_dim/2`。
+    pub fn cos_sin_at(&self, pos: usize) -> Option<(&[f32], &[f32])> {
+        let half = self.rotary_dim / 2;
+        let lo = pos.checked_mul(half)?;
+        let hi = lo + half;
+        if hi > self.cos_data.len() || hi > self.sin_data.len() {
+            return None;
+        }
+        Some((&self.cos_data[lo..hi], &self.sin_data[lo..hi]))
+    }
+
+    /// 旋转维数(`rotary_dim ≤ head_dim`;超出部分**直通**,核内同律)。
+    pub fn rotary_dim(&self) -> usize {
+        self.rotary_dim
+    }
+
     pub fn tables(&self) -> crate::module::TableSource<'_> {
         crate::module::TableSource::new(vec![
             ("cos_table", &self.cos_data),

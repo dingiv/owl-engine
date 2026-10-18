@@ -13,6 +13,7 @@ use owl_iface::contract::DeviceClient;
 use owl_models::layers::rope::Rope;
 
 use crate::Result;
+use owl_iface::contract::ModelError;
 
 /// E5-M2b:spec 模式三态(C7 回退挂钩)。裁决在 boot:
 /// depth>0 且检查点有 mtp.* → Mtp;dumb 诊断位 → Dumb(哑草稿 =
@@ -136,7 +137,7 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
     // 草稿器装载(C7;embed/lm_head 均共享 target)
     let drafter = match mode {
         SpecMode::Mtp => {
-            let dir = inp.mtp_dir.expect("Mtp 模式必有 mtp_dir(上游模式裁决已守)");
+            let dir = inp.mtp_dir.ok_or_else(|| ModelError::EngineInvariant { what: "Mtp 模式缺 mtp_dir(模式裁决与输入不一致)".into() })?;
             // 声明构造走起点事实(同一份 27B 检查点的 spec;报告已由主模型装载
             // 路径上屏,此处不重报);装载走通用入口
             let (spec, _rep) = owl_models::model::ModelSpec::from_ckpt(
@@ -152,7 +153,7 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
             Some(Drafter::Mtp(Arc::new(mtp)))
         }
         SpecMode::DFlash2 => {
-            let dir = inp.dflash2_dir.expect("DFlash2 模式必有 dflash2_dir(上游模式裁决已守)");
+            let dir = inp.dflash2_dir.ok_or_else(|| ModelError::EngineInvariant { what: "DFlash2 模式缺 dflash2_dir(模式裁决与输入不一致)".into() })?;
             let t_draft = std::time::Instant::now();
             // 声明:草稿检查点自己的 config(组件档)+ 起点格式探测 → fc 臂;
             // 装载走通用入口(BF16 全程;设备重排 = 能力自述裁决)
@@ -203,3 +204,4 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
         carry_ctx: 0,
     })
 }
+

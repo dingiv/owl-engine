@@ -40,7 +40,31 @@ pub fn f32_of(buf: &[u8]) -> Vec<f32> {
 /// 重算 —— 纯函数小对拍用;**带状态层(GDN conv/delta 写状态)禁用**
 /// (每观测一次多执行一遍,观测污染被观测系统)。带状态观测走
 /// `interpreters::eval_ops_tap` + [`crate::interpreters::StatsTap`] 单遍曲线。
+/// 收割器的口径门(2026-10-17 立):**函数名 = 声明的断言**。
+///
+/// 历史教训(立案 §P/R,2026-10-16 烧掉一整轮):`harvest_f16` 被拿去收割
+/// **BF16** 张量 ⇒ bf16 位型按 f16 读(同符号/同指数域,仅尾数截断)⇒ 得到
+/// "随量级漂移的 ~2× 假幅度错"(cos≈0.85、比值 0.48~0.85、单块 16.6×),
+/// 被误判成"尺度按错格式读"——一路追到 marlin 装载/声明链,全是伪影。
+/// 终判(2026-10-17 探针):设备侧 fc 逐 tap **cos=1.0000 / |d|/|h|=1.000**、
+/// norm 逐点相等;病在**收割口径与 host 参照**两处。
+/// 故:声明的 dtype 与所选收割器不符一律**响亮拒**,不许静默按另一种解码。
+fn assert_declared(t: &TensorOps, want: crate::contract::Dtype, fname: &str) {
+    assert_eq!(
+        t.dtype, want,
+        "{fname}: 张量声明 {:?} ≠ {want:?} —— 收割器按名取 dtype,口径必须与声明一致\
+         (选对应收割器;历史 §P 假幅度错即此坑)",
+        t.dtype
+    );
+}
+
+/// 声明求值 + dtoh 收割(测试/对拍公共路径)。
+/// ⚠️ **重放语义**(interpreter-tap.md §一):每次调用独立 eval_ops 整链
+/// 重算 —— 纯函数小对拍用;**带状态层(GDN conv/delta 写状态)禁用**
+/// (每观测一次多执行一遍,观测污染被观测系统)。带状态观测走
+/// `interpreters::eval_ops_tap` + [`crate::interpreters::StatsTap`] 单遍曲线。
 pub async fn harvest<D: DeviceClient>(face: &mut D, t: &TensorOps) -> Vec<f32> {
+    assert_declared(t, crate::contract::Dtype::F32, "harvest");
     let n: usize = t.shape().iter().product();
     let bytes = crate::interpreters::eval_ops(t.step(), face)
         .await
@@ -53,6 +77,7 @@ pub async fn harvest<D: DeviceClient>(face: &mut D, t: &TensorOps) -> Vec<f32> {
 /// f16 声明收割(F5 整模切换;eval + dtoh 2B/elem + half→f32 解码)。
 /// 重放语义同 [`harvest`](观测污染警示同样适用:带状态层禁用)。
 pub async fn harvest_f16<D: DeviceClient>(face: &mut D, t: &TensorOps) -> Vec<f32> {
+    assert_declared(t, crate::contract::Dtype::F16, "harvest_f16");
     let n: usize = t.shape().iter().product();
     let bytes = crate::interpreters::eval_ops(t.step(), face)
         .await
@@ -67,6 +92,7 @@ pub async fn harvest_f16<D: DeviceClient>(face: &mut D, t: &TensorOps) -> Vec<f3
 /// bf16 声明收割(E5-DF3 同日十四;DFlash2 草稿 BF16 面对拍)。
 /// 重放语义同 [`harvest`]。
 pub async fn harvest_bf16<D: DeviceClient>(face: &mut D, t: &TensorOps) -> Vec<f32> {
+    assert_declared(t, crate::contract::Dtype::BF16, "harvest_bf16");
     let n: usize = t.shape().iter().product();
     let bytes = crate::interpreters::eval_ops(t.step(), face)
         .await
@@ -147,9 +173,10 @@ pub fn skip_note() {
     eprintln!("skip: OWL_HF_PARITY=1 未开(首次会同步 torch CPU 轮)");
 }
 
-/// GPU 后端门控(OWL_TEST_DEVICE 已设;与 owl-cuda 测试同一约定)
+/// GPU 后端门控(`OWL_TEST_DEVICE` 已设且为 **BDF**;与 owl-cuda 同一约定)。
+/// CUDA 序号形态在解析层被拒(`resolve_ordinal_by_bdf`)。
 pub fn gpu_enabled() -> bool {
-    owl_shared::env_reader::flag("OWL_TEST_DEVICE")
+    owl_shared::device::test_device_bdf().is_some()
 }
 
 /// GPU face(owl-cuda actor;门控已过才调用)

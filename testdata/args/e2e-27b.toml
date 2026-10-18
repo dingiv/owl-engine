@@ -1,0 +1,40 @@
+# e2e 黑盒测试 server 配置(apps/server/tests/e2e.rs 用 include_str! 读)
+#
+# 由 e2e.rs 在运行时写到 $TMPDIR/owl-e2e-server.toml,再以
+#   server --flavor spec-dflash <该文件>
+# 拉起(端口 8135,设备 CUDA ordinal 1 = 3090 Ti)。
+#
+# 口径来由(§三十三):8448/8704 + prefill_split = 数学 gate 判据干净的配置
+# (nb/max_seq 边界已定谳;池 8704 = 272 页 × 32 tok)。
+#
+# ⚠️ 路径为本机资产(workspace models/ 下),换机需改。
+
+[model]
+dir = "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
+dflash2_dir = "/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16"
+name = "qwen3.8-27b"
+
+[runtime]
+# 2026-10-16 回归复跑:旧写法 `device = 1`(整数)在新 schema(DeviceSpec 表)
+# 下反序列化即拒启(P0-2 同族);测试资产改显式 ordinal,指向空闲卡(本 boot CUDA0=41:00)
+device_ordinal = 0
+max_seq = 8448
+
+[pool]
+pool_tokens = 8704
+gdn_slots = 8
+
+[dispatch]
+prefill_split = true
+
+# M2b prefill 桶图覆盖(2026-10-16 B3 转正后加):本门是**唯一**跑真 server 的
+# e2e,把桶族打开 ⇒ L1/L2/L3 与多轮前缀复用都走"桶图回放"路径
+# (预填 27B 生产档;图路与 eager 的逐位等价由 engine 门
+#  `gpu_prefill_bucket_matches_eager` 负责,本门负责服务面不回归)。
+[graph]
+# ⚠️ **显式 off**(2026-10-19):flavor `spec-dflash` 带 `[dispatch] fi_plan_bake = 0`
+# (单图烘 plan 上界),二者**互斥**(validate 拒启:桶图没接 plan sync)⇒
+# 旧值 `"geobuckets"` 让本门**自合并起根本起不来**(夹具被 `.gitignore` 吞掉,
+# 没人跑过 ⇒ 缺陷被掩盖)。桶路径的服务面覆盖待"桶路接 plan sync"解禁后再开;
+# 桶图与 eager 的逐位等价由 engine 门 `gpu_prefill_bucket_matches_eager` 负责。
+prefill_bucket = "off"

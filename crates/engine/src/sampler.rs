@@ -281,6 +281,7 @@ mod tests {
         assert_eq!(l[5], 8.0, "rep_penalty=1.0 不得改动 logits");
     }
 
+    /// top-p 截断后采样集中于头部(尖峰分布 + 大词表)。
     #[test]
     fn topp_mass_concentrates_head() {
         // 尖峰分布 + 大词表:top-p 截断后采样几乎全落头部

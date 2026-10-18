@@ -9,6 +9,8 @@
 //! | [`spec`] | 起点维度事实(config.json 优先 + 形状兜底) | [`spec::ModelSpec`](crate::model::ModelSpec) |
 //! | [`qwen35`] | 模型档事实(Qwen3.5/3.8 族:维度预设 + 键约定 + 检查点特例) | [`qwen35::Qwen35Convention`] |
 //! | [`load`] | 装载域解释器(Loadable::layout → 取数/变换/物化/流水) | [`load::load_from_dir`] |
+//! | [`awq_build`] | AWQ 源的**字节物化面**(缓存取用口/打包器;自 awq.rs 拆出) | [`awq_build`] |
+//! | [`util`] | **格式无关共享助手**(marlin 谓词 / 位型转换;两源同用,不得寄生于某一源) | [`util::marlin_eligible`] |
 //!
 //! 分层纪律:**源(safetensors/w4a16)只管「键 → 字节」**,执行(load)
 //! 只管「字节 → 设备块」—— 源不懂设备,执行不懂格式。新格式(如
@@ -20,6 +22,7 @@
 //! 经 interpreters 模块 shim 转发(历史调用面不动)。
 
 pub mod awq;
+pub(crate) mod awq_build;
 pub mod kind;
 pub mod load;
 pub mod mmap;
@@ -28,6 +31,7 @@ pub mod safetensors;
 /// **装载面分片化**(S4 ②;确定性分片协议:pass + 源包装)
 pub mod shard;
 pub mod spec;
+pub mod util;
 pub mod w4a16;
 
 /// 刀2 虚拟合并键:{base}in_proj_qkvz = row-stack({base}in_proj_qkv,
@@ -44,4 +48,5 @@ pub use kind::{detect, CheckpointKind, Detection, QuantScheme};
 pub use load::{eval_load, load_component, load_from_dir, LoadOpts};
 pub use qwen35::{hybrid_3to1, load_tokenizer, qwen3_5_0_8b, qwen3_8_27b, Qwen35Convention};
 pub use safetensors::SafeTensorsSource;
-pub use w4a16::{marlin_eligible, marlin_n_pack, W4A16Source};
+pub use util::{marlin_eligible, marlin_n_pack};
+pub use w4a16::W4A16Source;

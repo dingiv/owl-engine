@@ -8,6 +8,19 @@
 //! **纯样板搬运,零逻辑**:配置解析/门控逻辑全在
 //! `owl_shared::testkit::case_config`;本 crate 只做签名校验 + 展开。
 //!
+//! **选项**(逗号分隔、顺序无关;判据与 skip 文案均在
+//! `owl_shared::testkit`,本 crate 零逻辑):
+//! - `gpu`:`runtime.test_device` 无值(= `OWL_TEST_DEVICE` 未设)⇒ skip;
+//! - `hf_parity`:`OWL_HF_PARITY=1` 未开 ⇒ skip(与手写 `parity_enabled`/
+//!   `skip_note` 同文案);可与 `gpu` 叠用(`#[owl_test(gpu, hf_parity)]`);
+//! - `needs = "<key>"`(可多枚):**资源清单**(`testdata/resources.toml`)里该
+//!   key 不可用 ⇒ skip,文案点名缺哪个 key(`testkit::res`)。
+//!
+//! **async / 同步都可收**(2026-10-18):async fn ⇒ 宏建 current_thread runtime
+//! (`#[tokio::test]` 等价);同步 fn ⇒ 只做门控/配置包装,不建 runtime。
+//! - `needs = "<key>"`(可多枚):**资源清单**(`testdata/resources.toml`)里该
+//!   key 不可用 ⇒ skip,文案点名缺哪个 key(`testkit::res`)。
+//!
 //! 消费方约定(与 `#[tokio::test]` 同款纪律):
 //! - 加本 crate 为 **dev-dependency**;
 //! - 调用点必须在 `cfg(test)` 之下(`#[cfg(test)]` 写在 `#[owl_test]`
@@ -25,26 +38,88 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{parse_macro_input, FnArg, ItemFn, Pat, ReturnType, Type};
 
-/// 属性宏入口。选项:`gpu`(GPU 门控)。其余属性透传到生成的 `#[test]`。
+/// 属性选项(`#[owl_test(gpu, hf_parity, needs = "ckpt:27b-awq")]`;逗号分隔、顺序无关)。
+#[derive(Clone, Default)]
+struct Opts {
+    /// GPU 门控:`runtime.test_device` 无值(= `OWL_TEST_DEVICE` 未设)⇒ skip
+    gpu: bool,
+    /// HF 对拍门控:`OWL_HF_PARITY=1` 未开 ⇒ skip(与手写 `parity_enabled`/`skip_note` 同文案)
+    hf_parity: bool,
+    /// **资源门控**(可多枚):`needs = "<key>"` —— 资源清单里该 key 不可用 ⇒ skip
+    /// (判据/文案见 `owl_shared::testkit::res`)
+    needs: Vec<String>,
+}
+
+/// 逗号分隔(**引号内逗号不分**;`needs = "a:b"` 值里可能带标点)
+fn split_opts(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_str = false;
+    for c in s.chars() {
+        match c {
+            '"' => {
+                in_str = !in_str;
+                cur.push(c);
+            }
+            ',' if !in_str => {
+                out.push(cur.trim().to_string());
+                cur.clear();
+            }
+            _ => cur.push(c),
+        }
+    }
+    let last = cur.trim().to_string();
+    if !last.is_empty() {
+        out.push(last);
+    }
+    out
+}
+
+/// 选项解析(未知选项 = 响亮拒;逻辑零 —— 判据都在 `owl_shared::testkit`)
+fn parse_opts(attr: &TokenStream) -> Result<Opts, String> {
+    let mut o = Opts::default();
+    let s = attr.to_string();
+    if s.trim().is_empty() {
+        return Ok(o);
+    }
+    for part in split_opts(&s) {
+        if part == "gpu" {
+            o.gpu = true;
+        } else if part == "hf_parity" {
+            o.hf_parity = true;
+        } else if let Some(rest) = part.strip_prefix("needs") {
+            let rest = rest.trim();
+            let val = rest.strip_prefix('=').map(str::trim).unwrap_or("");
+            let key = val.trim_matches('"').trim();
+            if !rest.starts_with('=') || key.is_empty() {
+                return Err(format!(
+                    "#[owl_test] needs 需要值:`needs = \"<资源 key>\"`(如 `needs = \"ckpt:27b-awq\"`),得 {part:?}"
+                ));
+            }
+            o.needs.push(key.to_string());
+        } else {
+            return Err(format!(
+                "#[owl_test] 未知选项 {part:?}(支持:`gpu`、`hf_parity`、`needs = \"<key>\"`,逗号分隔)"
+            ));
+        }
+    }
+    Ok(o)
+}
+
+/// 属性宏入口。选项:`gpu`(GPU 门控)、`hf_parity`(HF 对拍门控);
+/// 逗号分隔,顺序无关。其余属性透传到生成的 `#[test]`。
 #[proc_macro_attribute]
 pub fn owl_test(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let opts = attr.to_string();
-    let gpu = match opts.trim() {
-        "" => false,
-        "gpu" => true,
-        other => {
-            return syn::Error::new(
-                proc_macro2::Span::call_site(),
-                format!(
-                    "#[owl_test] 未知选项 {other:?}(仅支持 #[owl_test] 或 #[owl_test(gpu)])"
-                ),
-            )
-            .to_compile_error()
-            .into();
+    let opts = match parse_opts(&attr) {
+        Ok(o) => o,
+        Err(msg) => {
+            return syn::Error::new(proc_macro2::Span::call_site(), msg)
+                .to_compile_error()
+                .into()
         }
     };
     let func = parse_macro_input!(item as ItemFn);
-    match expand(gpu, func) {
+    match expand(opts, func) {
         Ok(ts) => ts.into(),
         Err(e) => e.to_compile_error().into(),
     }
@@ -67,26 +142,22 @@ fn type_last_ident(ty: &Type) -> Option<String> {
     }
 }
 
-fn expand(gpu: bool, f: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
+fn expand(opts: Opts, f: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     let sig = &f.sig;
     let name = &sig.ident;
     let err = |msg: String| syn::Error::new(sig.ident.span(), msg);
 
     // ── 校验(响亮拒绝清单;设计文档 §2.3)──
-    if sig.asyncness.is_none() {
-        return Err(err(format!(
-            "#[owl_test] 只收 async fn(宏负责建 runtime 包装);`{name}` 是同步 fn → 用普通 #[test]"
-        )));
-    }
+    // async = 宏建 runtime;同步 fn = 只做门控/配置包装(不建 runtime)
     if !sig.generics.params.is_empty() {
         return Err(err(format!(
             "#[owl_test] 不支持泛型 fn(`{name}`);测试用例请写具体类型"
         )));
     }
-    if !ret_is_unit(&sig.output) && gpu {
+    if !ret_is_unit(&sig.output) && (opts.gpu || opts.hf_parity || !opts.needs.is_empty()) {
         return Err(err(format!(
-            "#[owl_test(gpu)] 要求返回 ()(门控跳过用裸 return);`{name}` 返回非 unit —— \
-             门内自行处理 Result,或去掉 gpu 选项"
+            "#[owl_test(…, …)] 有门控时要求返回 ()(门控跳过用裸 return);`{name}` 返回非 unit —— \
+             门内自行处理 Result,或去掉门控选项"
         )));
     }
 
@@ -134,13 +205,14 @@ fn expand(gpu: bool, f: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     let where_c = &sig.generics.where_clause;
 
     // 配置加载:有参数或需要门控时才读(纯 runtime 包装用例零 env 读取)
-    let load = if param.is_some() || gpu {
-        quote! { let __owl_cfg = ::owl_shared::testkit::case_config(#case); }
+    let load = if param.is_some() || opts.gpu {
+        quote! { let __owl_cfg = ::owl_shared::testkit::case_config(#case, file!()); }
     } else {
         quote! {}
     };
-    // GPU 门控(S2 收编;skip 文案与旧样板逐字同,保 grep 兼容)
-    let gate = if gpu {
+    // 门控(S2 收编;skip 文案与旧样板逐字同,保 grep 兼容)。
+    // 判据/文案全在 `owl_shared::testkit`;宏零逻辑。
+    let gpu_gate = if opts.gpu {
         quote! {
             if __owl_cfg.runtime.test_device.is_none() {
                 ::std::eprintln!("skip: OWL_TEST_DEVICE 未设");
@@ -150,16 +222,59 @@ fn expand(gpu: bool, f: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     } else {
         quote! {}
     };
+    let parity_gate = if opts.hf_parity {
+        quote! {
+            if !::owl_shared::testkit::hf_parity_enabled() {
+                ::std::eprintln!("{}", ::owl_shared::testkit::HF_PARITY_SKIP);
+                return;
+            }
+        }
+    } else {
+        quote! {}
+    };
+    let needs_gate = if opts.needs.is_empty() {
+        quote! {}
+    } else {
+        let checks = opts.needs.iter().map(|k| {
+            quote! {
+                if !::owl_shared::testkit::resource_ok(#k) {
+                    ::std::eprintln!("{}", ::owl_shared::testkit::missing_reason(#k));
+                    return;
+                }
+            }
+        });
+        quote! { #(#checks)* }
+    };
+    let gate = quote! { #parity_gate #gpu_gate #needs_gate };
     let arg = match param {
         Some(_) => quote! { (&__owl_cfg) },
         None => quote! { () },
     };
+    // 同步体模式(2026-10-18 二期):不建 runtime,直接调体 —— 供 kernels 等
+    // 同步探针用例收编(`#[owl_test(gpu)] fn probe() {…}`)。
+    let is_async = sig.asyncness.is_some();
+    let body_decl = if is_async {
+        quote! { async fn #body(#inputs) #where_c #ret }
+    } else {
+        quote! { fn #body(#inputs) #where_c #ret }
+    };
+    let call = if is_async {
+        quote! {
+            let __owl_rt = ::tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("owl_test: tokio runtime 构建失败");
+            __owl_rt.block_on(#body #arg)
+        }
+    } else {
+        quote! { #body #arg }
+    };
 
     Ok(quote! {
-        // ① 原 async fn 降为具名 body(cfg(test) 双保险:宏调用点已门控,
-        //    输出再钉一层 ⇒ 非测试构建绝不触 tokio/owl-shared 测试面)
+        // ① 原 fn 降为具名 body(cfg(test) 双保险:宏调用点已门控,
+        //    输出再钉一层 ⇒ 非测试构建绝不触测试面)
         #[cfg(test)]
-        async fn #body(#inputs) #where_c #ret {
+        #body_decl {
             #block
         }
 
@@ -170,11 +285,7 @@ fn expand(gpu: bool, f: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         #vis fn #name() #ret {
             #load
             #gate
-            let __owl_rt = ::tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("owl_test: tokio runtime 构建失败");
-            __owl_rt.block_on(#body #arg)
+            #call
         }
     })
 }

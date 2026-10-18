@@ -82,10 +82,19 @@ impl VlmCfg {
             .and_then(|r| r.get("mrope_section"))
             .and_then(|x| x.as_array())
             .map(|a| {
+                // 元素必须是非负整数(2026-10-17 审查 §六轮:原 `as_u64().unwrap_or(0)`
+                // 是静默回退 —— 非数值元素会变成 0 段,切分悄悄变形)
                 a.iter()
-                    .map(|x| x.as_u64().unwrap_or(0) as usize)
-                    .collect::<Vec<usize>>()
+                    .map(|x| {
+                        x.as_u64().map(|v| v as usize).ok_or_else(|| {
+                            ModelError::Msg(format!(
+                                "mrope_section 元素须为非负整数,实得 {x}"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<usize>, ModelError>>()
             })
+            .transpose()?
             .ok_or_else(|| ModelError::Msg("rope_parameters 缺 mrope_section".into()))?;
         if sections.len() != 3 {
             return Err(ModelError::Msg(format!(
@@ -116,7 +125,21 @@ impl VlmCfg {
                     .map(|x| x.as_str() == Some("full_attention"))
                     .collect::<Vec<bool>>()
             })
-            .unwrap_or_else(|| crate::formats::qwen35::hybrid_3to1(g("num_hidden_layers").unwrap_or(0)));
+            // 缺 `layer_types` ⇒ 按**家族规则**派生(3 GDN : 1 FA);
+            // `num_hidden_layers` 缺失/为 0 = 层型表不可定 ⇒ **响亮拒**
+            // (原 `unwrap_or(0)` 会静默生成空层型表 = "没有 GDN/FA 层" 的错模型)
+            .map_or_else(
+                || {
+                    let n = g("num_hidden_layers")?;
+                    if n == 0 {
+                        return Err(ModelError::Msg(
+                            "text_config.num_hidden_layers = 0(层型表不可定)".into(),
+                        ));
+                    }
+                    Ok(crate::formats::qwen35::hybrid_3to1(n))
+                },
+                Ok,
+            )?;
         // eos 字面量:Qwen3.5 家族共享(vocab 248320;`<|im_end|>` = 248044)
         let eos: Vec<&'static str> = if text.get("eos_token_id").is_some() {
             vec!["<|im_end|>"]
@@ -429,17 +452,17 @@ mod tests {
     use super::*;
     use crate::testkit::{f32b, harvest};
 
-    /// 4B 档模型目录(config.json 单源;可 `OWL_VLM_CKPT` 改指)
+    /// 4B 档模型目录(config.json 单源;可 `ckpt:qwen35-4b` 改指)
     fn ckpt_dir() -> std::path::PathBuf {
         std::path::PathBuf::from(
-            std::env::var("OWL_VLM_CKPT")
-                .unwrap_or_else(|_| "/home/div/Documents/codes/models/Qwen/Qwen3.5-4B".into()),
+            owl_shared::testkit::resource("ckpt:qwen35-4b")
+                .unwrap_or_else(|| "/home/div/Documents/codes/models/Qwen/Qwen3.5-4B".into()),
         )
     }
 
     fn cfg4b() -> VlmCfg {
         let raw = owl_shared::file_loader::read(&ckpt_dir().join("config.json"))
-            .expect("config.json 读入(OWL_VLM_CKPT 可指路)");
+            .expect("config.json 读入(ckpt:qwen35-4b 可指路)");
         VlmCfg::from_json(&raw).expect("VlmCfg::from_json")
     }
 
@@ -526,7 +549,7 @@ mod tests {
     }
 
     // ========================================================================
-    // 真权重面(4B;重,双门控 OWL_VLM_REAL=1 + OWL_TEST_DEVICE)
+    // 真权重面(4B;重,双门控 flag:vlm-real=1 + OWL_TEST_DEVICE)
     // ========================================================================
 
     /// 生产面常驻缓冲(f16 模型 ⇒ paged KV:页 32 + kNHD K 池 + 恒等块表;
@@ -616,12 +639,12 @@ mod tests {
     }
 
     /// 4B 真权重:**整装 + 文本 prefill 冒烟**(生产 f16 面;验两段键装载 /
-    /// 缓冲账 / 单树前向)。门控:`OWL_VLM_REAL=1` + `OWL_TEST_DEVICE`。
+    /// 缓冲账 / 单树前向)。门控:`flag:vlm-real=1` + `OWL_TEST_DEVICE`。
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn gpu_real_weights_text_prefill_smoke() {
         use crate::layers::rope::Rope;
-        if std::env::var("OWL_VLM_REAL").ok().as_deref() != Some("1") {
-            eprintln!("skip: OWL_VLM_REAL=1 未开(4B 整装 ~9.3G)");
+        if !owl_shared::testkit::resource_flag("flag:vlm-real") {
+            eprintln!("skip: flag:vlm-real=1 未开(4B 整装 ~9.3G)");
             return;
         }
         if !crate::testkit::gpu_enabled() {
@@ -631,7 +654,7 @@ mod tests {
         let dir = ckpt_dir();
         let t0 = std::time::Instant::now();
         let mut gpu = crate::testkit::gpu_client().await;
-        let dbg = std::env::var("OWL_VLM_LOAD_DEBUG").ok().as_deref() == Some("1");
+        let dbg = owl_shared::testkit::resource_flag("flag:vlm-load-debug");
         if dbg {
             // 分相账本需要 store 上线(测试进程默认未装)
             let _ = owl_shared::metrics::init_metrics(owl_shared::metrics::MetricsStore::new());
@@ -726,13 +749,13 @@ mod tests {
     /// 闭合「shim vs 真身」缺口)② prefill 末位 logits 的 top-1 / top-10 交叠
     /// ③ 贪心 N 步**逐 token** 与 HF 一致 + 打印 owl 自己出的答案文本。
     ///
-    /// 门控:`OWL_VLM_REAL=1` + `OWL_TEST_DEVICE`(4B 整装 ~9G,占一卡)。
+    /// 门控:`flag:vlm-real=1` + `OWL_TEST_DEVICE`(4B 整装 ~9G,占一卡)。
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn gpu_real_image_e2e_matches_hf() {
         use crate::layers::rope::Rope;
         use crate::testkit::{gpu_client, gpu_enabled, skip_note, st_read};
-        if std::env::var("OWL_VLM_REAL").ok().as_deref() != Some("1") {
-            eprintln!("skip: OWL_VLM_REAL=1 未开(4B 整装 ~9G)");
+        if !owl_shared::testkit::resource_flag("flag:vlm-real") {
+            eprintln!("skip: flag:vlm-real=1 未开(4B 整装 ~9G)");
             return;
         }
         if !gpu_enabled() {
@@ -873,7 +896,7 @@ mod tests {
         gpu.close().await.expect("关机");
     }
 
-    /// **装载分相微基准**(定位瓶颈用;门控 `OWL_VLM_BENCH=1` + `OWL_TEST_DEVICE`)。
+    /// **装载分相微基准**(定位瓶颈用;门控 `flag:vlm-bench=1` + `OWL_TEST_DEVICE`)。
     ///
     /// 量三段各自的上限:① bf16→f16 CPU 转换(F16C)② mmap→host memcpy
     /// ③ pinned→device DMA(异步上传 + 尾 sync)。
@@ -882,8 +905,8 @@ mod tests {
         use crate::contract::DeviceClient as _;
         use crate::formats::safetensors::SafeTensorsSource;
         use crate::module::WeightSource;
-        if std::env::var("OWL_VLM_BENCH").ok().as_deref() != Some("1") {
-            eprintln!("skip: OWL_VLM_BENCH=1 未开");
+        if !owl_shared::testkit::resource_flag("flag:vlm-bench") {
+            eprintln!("skip: flag:vlm-bench=1 未开");
             return;
         }
         if !crate::testkit::gpu_enabled() {
@@ -900,19 +923,23 @@ mod tests {
             "model.language_model.layers.0.linear_attn.in_proj_qkvz.weight",
             "model.visual.blocks.0.mlp.linear_fc1.weight",
         ];
-        let n0 = src.elem_len(keys[0]).expect("键");
-        let tot_elems: usize = keys.iter().map(|k| src.elem_len(k).unwrap_or(0)).sum();
+        // 合约检查:源必须知道首键元素数(2026-10-17 清 unused;原绑定 `n0` 无人读)
+        let _ = src.elem_len(keys[0]).expect("源").expect("键");
+        let tot_elems: usize = keys
+            .iter()
+            .map(|k| src.elem_len(k).expect("源").unwrap_or(0))
+            .sum();
         let gb = tot_elems as f64 * 2.0 / 1e9;
         eprintln!("[bench] 样本 {gb:.3}GB(四键)");
 
         // ① CPU 转换 bf16→f16(单键 ×3 轮)
         for k in keys {
-            let n = src.elem_len(k).expect("键");
+            let n = src.elem_len(k).expect("源").expect("键");
             let mut buf = vec![0u8; n * 2];
             let reps = 3;
             let t0 = std::time::Instant::now();
             for _ in 0..reps {
-                src.convert_chunk_into_bytes(k, 0, n, &mut buf, Dtype::F16).expect("convert");
+                src.convert_chunk_into_bytes(k, 0, n, &mut buf, Dtype::F16).expect("源").expect("convert");
             }
             let dt = t0.elapsed().as_secs_f64();
             eprintln!("[bench] ① convert {n:>9} elem: {:.2} GB/s", n as f64 * 2.0 * reps as f64 / 1e9 / dt);
@@ -922,9 +949,9 @@ mod tests {
         let mut raw_gb = 0f64;
         let mut raw_s = 0f64;
         for k in keys {
-            let n = src.elem_len(k).expect("键");
+            let n = src.elem_len(k).expect("源").expect("键");
             let t0 = std::time::Instant::now();
-            let v = src.take_range(k, 0, n).expect("取数"); // 含转换;只作"有数据"对照
+            let v = src.take_range(k, 0, n).expect("源").expect("取数"); // 含转换;只作"有数据"对照
             std::hint::black_box(&v);
             raw_gb += n as f64 * 2.0 / 1e9;
             raw_s += t0.elapsed().as_secs_f64();

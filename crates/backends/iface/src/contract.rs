@@ -101,8 +101,34 @@ pub enum ModelError {
     CaptureViolation { detail: String },
     /// server 不可达/已关闭
     ServerClosed,
+    /// **引擎内部状态不变量失守**(无活跃 turn / 会话账缺失 / 草稿池句柄缺席……)。
+    ///
+    /// 语义(2026-10-17 用户裁决):这类失守是**引擎状态机已经不一致**,
+    /// 但**不许 panic** —— 用显式 `Result` 一路上抛到泵循环,由它
+    /// ①打印 ②丢下该 turn ③`shutdown.graceful()`(释放卡锁 + 有序退出)。
+    /// `is_fatal` = true(继续跑只会连环错值/泄漏)。
+    EngineInvariant { what: String },
     /// 兜底(server 侧透传的结构化细节)
     Msg(String),
+}
+
+impl ModelError {
+    /// **不可恢复?**(2026-10-16) —— 与"单个请求失败"分开:
+    ///
+    /// - `PoolExhausted`:池/显存**硬预算拒绝**或真耗尽 ⇒ 继续跑只会连环失败;
+    /// - `ServerClosed`:设备 server 已关闭 ⇒ 引擎已无设备面。
+    ///
+    /// 服务面据此走**优雅关停**(释放卡锁 + 有序退出),而不是把错误塞回单个 turn。
+    /// 其余变体(形状/键缺失/形状不符/兜底)`= 可归因到具体请求/装载,不致命。
+    pub fn is_fatal(&self) -> bool {
+        matches!(
+            self,
+            ModelError::PoolExhausted { .. }
+                | ModelError::ServerClosed
+                // 引擎状态不变量失守:状态机已不一致 ⇒ 与"硬预算拒发"同级处理
+                | ModelError::EngineInvariant { .. }
+        )
+    }
 }
 
 impl std::fmt::Display for ModelError {
@@ -124,6 +150,9 @@ impl std::fmt::Display for ModelError {
             }
             ModelError::CaptureViolation { detail } => write!(f, "CaptureViolation: {detail}"),
             ModelError::ServerClosed => write!(f, "ServerClosed"),
+            ModelError::EngineInvariant { what } => {
+                write!(f, "EngineInvariant: 引擎状态不变量失守 —— {what}")
+            }
             ModelError::Msg(m) => write!(f, "{m}"),
         }
     }
@@ -216,6 +245,99 @@ pub struct UpChunk {
     pub lease: Box<dyn PinnedRegion + Send>,
 }
 
+// ============================================================================
+// 状态存储的交换面(设计卷 §15;iface 声明 / store 实现 / server 使用)
+// ============================================================================
+
+/// 连接器侧的一块存储槽(store 分配号;server 只按号读写)。
+///
+/// **层级知识留在 store**:RAM / 磁盘 / NVMe-oF 的差别不外泄给 server ——
+/// server 是唯一持裸指针的一层(裁决⑫),只负责"把字节从这里搬到那里",
+/// "那里是什么"由 [`Connector`] 决定。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ConnSlot(pub u64);
+
+/// 交换方向。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwapDir {
+    /// 设备 → 连接器(换出/下沉)。
+    Out,
+    /// 连接器 → 设备(换回/回灌)。
+    In,
+}
+
+/// **交换的一片**。
+///
+/// 一个逻辑块 = 每层片段各一片(0.8B 12 片 / 27B 32 片):设备上块是**分层**
+/// 存储的,一层一片;而连接器侧一个逻辑块占**一个槽**(连续 `slot_bytes`),
+/// 故两侧偏移各说各话(`dev_off` vs `conn_off`)。
+#[derive(Clone, Copy, Debug)]
+pub struct SwapPiece {
+    /// 设备块句柄 id(server 解析地址;沿用 `dtoh_at` 的"只取 id"口径)。
+    pub block: u64,
+    /// 设备块内字节偏移(= 槽 × 每页字节)。
+    pub dev_off: usize,
+    /// 连接器槽内字节偏移(该层片段在逻辑块内的起点)。
+    pub conn_off: usize,
+    /// 字节长度(= 该层每页字节)。
+    pub len: usize,
+    /// 本片所属逻辑块的连接器槽。
+    pub slot: ConnSlot,
+}
+
+/// **交换的"另一端"**(RAM / 磁盘 / …)—— 实现者是 store,使用者是 server。
+///
+/// 契约:
+/// - `put`/`get` 只谈**槽号 + 槽内偏移 + 字节**,不得假设设备侧布局;
+/// - 错误**响亮**(不许静默丢片:片错了 = 该逻辑块内容错,必须上抛让
+///   调用方回滚账);
+/// - 实现必须 `Send`(随命令在命令线程与本层之间转移,单主零锁)。
+pub trait Connector: Send + 'static {
+    /// 写入一片(server 已从设备侧拷出 `bytes`;out 语义 = 落定)。
+    fn put(&mut self, slot: ConnSlot, off: usize, bytes: &[u8]) -> Result<(), ModelError>;
+    /// 读出一片(server 随后上传到设备)。
+    fn get(&self, slot: ConnSlot, off: usize, out: &mut [u8]) -> Result<(), ModelError>;
+    /// 层名(诊断/报告面:`ram` / `disk` / …)。
+    fn tier_name(&self) -> &'static str;
+    /// **解箱取回**(单主语义的回收口):命令回执把 connector 原箱奉还,
+    /// 调用方据此 `downcast` 回自己的具体类型(每块只是移动一个 `Vec`,零拷贝)。
+    ///
+    /// 实现侧写一行 `fn unbox(self: Box<Self>) -> Box<dyn Any + Send> { self }`
+    /// (不能给默认实现:trait object 上 `Self` 无尺寸,默认体的 coercion 编不过;
+    /// 具体实现里 `Self: Sized` 恒成立)。
+    fn unbox(self: Box<Self>) -> Box<dyn std::any::Any + Send>;
+}
+
+/// 上传落点流(**参数面 vs 批量面**;见 [`DeviceClient::write_block_f32_on`])。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum UpStream {
+    /// H2D 流:批量面默认(装载/换页/材料);跨流 ⇒ 消费方需事件序
+    #[default]
+    H2d,
+    /// COMPUTE 流:**参数面**(图输入槽/小表)—— 与消费它的发射同流 FIFO
+    Compute,
+}
+
+/// **FI plan 表同步请求**(W3;见 [`DeviceClient::fi_plan_sync`])。
+///
+/// 为什么要它:FI 核进捕获图后,**回放期不再经过 FI 的宿主处理器** ⇒ 那张
+/// 调度表(`int_ws`)没人刷。而 split 档的表必须与**当步真实 ctx** 对应
+/// (运行期 `num_kv_chunks = ceil_div(kv_len, chunk_size)` 与表里的
+/// `o_indptr/merge_indptr` 不同步 ⇒ partial 行 stride 错;实测症状 = 输出
+/// 64 个空 token)。⇒ 引擎在每次图 launch **之前**显式请求一次刷新
+/// (同一 COMPUTE 流 ⇒ FIFO 有序)。
+#[derive(Clone, Copy, Debug)]
+pub struct FiPlanSpec {
+    /// 本轮 q 行数(decode = 1;prefill 桶 = 桶 t)
+    pub t: usize,
+    /// 本轮 KV 总长(plan 键的 ctx 维;**必须给真值**)
+    pub ctx_total: usize,
+    pub hq: usize,
+    pub hkv: usize,
+    pub hd: usize,
+    pub page: usize,
+}
+
 pub trait DeviceClient: Send {
     /// 执行环境提供(硬件感知;None = 无 GPU 环境,语义调用结构化拒绝)。
     /// 感知发生在引擎/boot 侧(实现者可缓存);kernels/解释器零探测
@@ -246,6 +368,24 @@ pub trait DeviceClient: Send {
         &mut self,
         graph: GraphId,
     ) -> impl Future<Output = Result<(), ModelError>> + Send;
+    /// **FI plan 表同步**(W3;仅 CUDA/FI 后端有意义):确保 `spec.ctx_total`
+    /// 对应的调度表在场,并把它的表内容刷进 FI 的 `int_ws`。
+    ///
+    /// 用途 = "FI 核在捕获图内 + 图不烘 plan restore"的档
+    /// (`[dispatch] fi_plan_bake`):表刷新必须由图**外面**的一步完成
+    /// (图回放不会经过宿主处理器)。缺省实现 = **结构化拒**(不静默)。
+    fn fi_plan_sync(
+        &mut self,
+        spec: FiPlanSpec,
+    ) -> impl Future<Output = Result<(), ModelError>> + Send {
+        let _ = spec;
+        async {
+            Err(ModelError::Msg(
+                "fi_plan_sync: 本后端无 FI plan 面(仅 CUDA + flashinfer 族)".into(),
+            ))
+        }
+    }
+
     /// **捕获窗作废**(窗内出错/空窗的收尾):退出捕获态 + 销毁半成品图 +
     /// **窗内自产块整批作废**(slab 随之释放)。
     ///
@@ -307,12 +447,149 @@ pub trait DeviceClient: Send {
         src: &[u8],
         name: &str,
     ) -> impl Future<Output = Result<Bytes, ModelError>> + Send;
+
+    /// **带流选择的整块上传**(2026-10-17):参数面(解释器 `from_host` 叶子 ——
+    /// 小张量、马上被发射消费)走 [`UpStream::Compute`] ⇒ 同流 FIFO 天然有序;
+    /// 批量面(权重/装载)走 H2D 以免占住计算流。默认退化为 [`Self::htod`]。
+    fn htod_on(
+        &mut self,
+        _stream: UpStream,
+        dtype: Dtype,
+        shape: &Shape,
+        src: &[u8],
+        name: &str,
+    ) -> impl Future<Output = Result<Bytes, ModelError>> + Send
+    where
+        Self: Sized,
+    {
+        self.htod(dtype, shape, src, name)
+    }
+
     /// 块读出(**读语义**,2026-09-26 成文):issue 相排空 COMPUTE 后
     /// D2H 异步拷贝 —— 回执时 out = 块在全部先前已回执命令之后的值。
     /// 与 [`DeviceClient::sync`] 的分工:本命令为读数据;sync 为不读
     /// 数据的显式栅栏(计时/步边界/捕获前净空)
     fn dtoh(&mut self, b: &Bytes, out: &mut [u8])
         -> impl Future<Output = Result<(), ModelError>> + Send;
+    /// **带偏移的设备→主机读**(状态存储的搬出面,2026-10-16):
+    /// `dtoh` 只能读块前缀,而"逻辑块 = 层缓冲内的一个页"必须按**槽偏移**读
+    /// (`off_bytes = slot × 每页字节`)⇒ 补这条。语义与 [`DeviceClient::dtoh`]
+    /// 同(读语义:回执时 out = 块在全部先前已回执命令之后的那一段)。
+    ///
+    /// 默认 = **响亮"未实现"**(后端逐个补齐;CPU 面已给实现供 store 单测)。
+    /// 批面(`DtohBatch`,一次命令搬一个块的全部层片段)是它的下一步 —— 见
+    /// `docs/arch/store-状态存储-设计与迁移.md` §10.3 推论 B。
+    fn dtoh_at(
+        &mut self,
+        _b: &Bytes,
+        _off_bytes: usize,
+        _out: &mut [u8],
+    ) -> impl Future<Output = Result<(), ModelError>> + Send {
+        async { Err(ModelError::Msg("dtoh_at: 此后端未实现".into())) }
+    }
+    /// **批量分块读**(状态存储"整块搬出",2026-10-16):一次命令搬 N 段
+    /// (`(块, 偏移字节, 长度字节)`),回执 = 各段按**入参顺序**拼接的字节。
+    ///
+    /// 为什么必须批:一个逻辑块 = 层数 × 2 个片段(0.8B 12 段 / 27B 32 段),
+    /// 不批则每次搬出 12/32 次 actor 往返,收益被往返吃光(设计卷 §10.3 推论 B)。
+    /// 默认实现 = 逐段 [`DeviceClient::dtoh_at`] 拼接(语义等价;GPU 面覆写为
+    /// 单命令 `DtohBatch`)。
+    fn dtoh_batch(
+        &mut self,
+        pieces: &[(&Bytes, usize, usize)],
+    ) -> impl Future<Output = Result<Vec<u8>, ModelError>> + Send
+    where
+        Self: Sized,
+    {
+        #[allow(clippy::unnecessary_to_owned)]
+        let owned: Vec<(Bytes, usize, usize)> =
+            pieces.iter().map(|(b, o, l)| ((*b).clone(), *o, *l)).collect();
+        async move {
+            let mut out = Vec::new();
+            for (b, off, len) in &owned {
+                let at = out.len();
+                out.resize(at + *len, 0);
+                self.dtoh_at(b, *off, &mut out[at..]).await?;
+            }
+            Ok(out)
+        }
+    }
+
+    /// **批量分块写**(host → device,带偏移;状态存储"整块搬回")。
+    /// 默认 = 逐段 pinned 租约上传(语义等价;GPU 面覆写为单命令 `HtodChunks`)。
+    fn htod_batch(
+        &mut self,
+        writes: &[(&Bytes, usize, &[u8])],
+    ) -> impl Future<Output = Result<(), ModelError>> + Send
+    where
+        Self: Sized,
+    {
+        #[allow(clippy::unnecessary_to_owned)]
+        let owned: Vec<(Bytes, usize, Vec<u8>)> = writes
+            .iter()
+            .map(|(b, off, data)| ((*b).clone(), *off, data.to_vec()))
+            .collect();
+        async move {
+            for (b, off, data) in &owned {
+                let mut lease = self.alloc_pinned(data.len(), "iface:htod_batch").await?;
+                lease.slice_bytes_mut()[..data.len()].copy_from_slice(data);
+                self.upload_pinned_on(UpStream::Compute, lease, b, *off, data.len())
+                    .await?;
+            }
+            Ok(())
+        }
+    }
+
+    /// **swap = 一条原子命令**(设计卷 §15;2026-10-16):N 片一次提交、一次 ack。
+    ///
+    /// 语义:
+    /// - **一次 ack = 全部片段完成**(同流保序)⇒ store 侧"落账"只需一次 await;
+    /// - `conn` 随命令**进出**(移入、回执时原箱奉还)⇒ 单主、零锁;
+    /// - 中途失败 = **整条失败**(不得留半态;调用方负责回滚账 / 响亮上抛);
+    /// - 捕获窗内 = 结构化拒(时序归 engine,§10.3)。
+    ///
+    /// 层级无关:RAM 与 disk 只差 [`Connector`] 实现,server 侧代码零分支。
+    /// 默认实现 = 逐片 `dtoh_at` / `alloc_pinned + upload_pinned` 循环
+    /// (**语义等价**,任何 face 都能跑);GPU 面覆写为单命令 `Swap`。
+    ///
+    /// 回执奉还的 connector 用 [`Connector::unbox`] 取回具体类型。
+    fn swap(
+        &mut self,
+        dir: SwapDir,
+        pieces: &[SwapPiece],
+        conn: Box<dyn Connector + Send>,
+    ) -> impl Future<Output = Result<Box<dyn Connector + Send>, ModelError>> + Send
+    where
+        Self: Sized,
+    {
+        let owned: Vec<SwapPiece> = pieces.to_vec();
+        async move {
+            let mut conn = conn;
+            // 句柄只取 id(与 `dtoh_at` 同口径 —— 字节级搬运不参与 dtype 校验)
+            let handle = |p: &SwapPiece| Bytes::new(p.block, 0, Dtype::U8, 0);
+            match dir {
+                SwapDir::Out => {
+                    for p in &owned {
+                        let mut buf = vec![0u8; p.len];
+                        self.dtoh_at(&handle(p), p.dev_off, &mut buf).await?;
+                        conn.put(p.slot, p.conn_off, &buf)?;
+                    }
+                }
+                SwapDir::In => {
+                    for p in &owned {
+                        let mut buf = vec![0u8; p.len];
+                        conn.get(p.slot, p.conn_off, &mut buf)?;
+                        let mut lease = self.alloc_pinned(p.len, "iface:swap_in").await?;
+                        lease.slice_bytes_mut()[..p.len].copy_from_slice(&buf);
+                        self.upload_pinned_on(UpStream::Compute, lease, &handle(p), p.dev_off, p.len)
+                            .await?;
+                    }
+                }
+            }
+            Ok(conn)
+        }
+    }
+
     /// 算子发射(COMPUTE 流,火后不理):Ok = 提交成功;同流保序,
     /// 与数据搬运的跨流先后靠回执时序/sync 建立(顺序语义,见 trait 级文档)
     fn launch(&mut self, msg: LaunchMsg)
@@ -338,10 +615,13 @@ pub trait DeviceClient: Send {
         shape: &Shape,
         data: Vec<f32>,
         name: &str,
-    ) -> impl Future<Output = Result<Bytes, ModelError>> + Send {
+    ) -> impl Future<Output = Result<Bytes, ModelError>> + Send
+    where
+        Self: Sized,
+    {
         async move {
             let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
-            self.htod(Dtype::F32, shape, &bytes, name).await
+            self.htod_on(UpStream::Compute, Dtype::F32, shape, &bytes, name).await
         }
     }
 
@@ -364,6 +644,21 @@ pub trait DeviceClient: Send {
     /// 完成回调归还池。在途块数调用方自限(防码头膨胀)。
     /// 上传租约:buf 所有权移入,DMA/拷贝到 dst+offset_elems;
     /// buf 由后端回收(页锁池/释放)。默认 = 不支持。
+    /// [`Self::upload_pinned`] 的**流可选**版(2026-10-17;参数面走 Compute)
+    fn upload_pinned_on(
+        &mut self,
+        _stream: UpStream,
+        buf: Box<dyn PinnedRegion + Send>,
+        dst: &Bytes,
+        offset_bytes: usize,
+        len_bytes: usize,
+    ) -> impl Future<Output = Result<(), ModelError>> + Send
+    where
+        Self: Sized,
+    {
+        self.upload_pinned(buf, dst, offset_bytes, len_bytes)
+    }
+
     fn upload_pinned(
         &mut self,
         _buf: Box<dyn PinnedRegion + Send>,
@@ -391,6 +686,39 @@ pub trait DeviceClient: Send {
         }
     }
 
+    /// **带流选择的块内写入**(2026-10-17;用户裁决"参数面必须与消费方同流"):
+    ///
+    /// 上传落在哪条流 = **顺序义务的归属**。默认口走 H2D 流(批量面:装载/
+    /// 换页,跨流 ⇒ 消费方需事件序);**参数面**(图输入槽/小表 —— 只有几 KB、
+    /// 且紧接着就被同一次发射消费)应走 [`UpStream::Compute`]:与 kernel/图发射
+    /// **同流 FIFO** ⇒ 结构上不可能缺序,同时省掉"等回执"的主机往返。
+    ///
+    /// 默认实现退化到老口(其他后端/mock 零改动)。
+    fn write_block_f32_on(
+        &mut self,
+        _stream: UpStream,
+        dst: &Bytes,
+        offset_elems: usize,
+        data: &[f32],
+    ) -> impl Future<Output = Result<(), ModelError>> + Send
+    where
+        Self: Sized,
+    {
+        self.write_block_f32(dst, offset_elems, data)
+    }
+
+    /// [`Self::write_block_f32_on`] 的批量版(同律)
+    fn write_blocks_f32_on(
+        &mut self,
+        _stream: UpStream,
+        writes: &[(&Bytes, usize, &[f32])],
+    ) -> impl Future<Output = Result<(), ModelError>> + Send
+    where
+        Self: Sized,
+    {
+        self.write_blocks_f32(writes)
+    }
+
     /// 批量块内写入(S1,2026-09-30):decode 每步多槽装填合一次设备
     /// 往返(单 ack 保序协议不变 —— ack = 全部写完)。默认 = 逐块循环
     /// write_block_f32;GPU 后端覆写为批量命令(省 per-write 回执税)。
@@ -402,8 +730,9 @@ pub trait DeviceClient: Send {
         Self: Sized,
     {
         async move {
+            // 参数面(槽/小表)批量写 ⇒ Compute(同流;H2D 面留给显式批量口)
             for (dst, off, data) in writes {
-                self.write_block_f32(dst, *off, data).await?;
+                self.write_block_f32_on(UpStream::Compute, dst, *off, data).await?;
             }
             Ok(())
         }
@@ -485,6 +814,19 @@ pub trait DeviceClient: Send {
         Self: Sized,
     {
         None
+    }
+
+    /// **设备 SM(多处理器)数** —— 计算单元真值。
+    ///
+    /// 用途:XQA 的 KV-split 启发式参数 `sm_count`(原为引擎里硬编码
+    /// `XQA_SM_COUNT = 84` = sm86 双卡;3080 = 68 ⇒ 启发式系统性偏大)。
+    /// 语义:同步小查询(后端可缓存);**默认 = 不支持** ⇒ 结构化拒(不猜数字),
+    /// 调用方自行决定回退(引擎面回退到既有常量并**响亮告警**)。
+    fn sm_count(&mut self) -> impl Future<Output = Result<usize, ModelError>> + Send
+    where
+        Self: Sized,
+    {
+        async { Err(ModelError::Msg("sm_count: 该后端未提供设备属性查询".into())) }
     }
 
     /// 设备内批量块→块拷贝(E5-M4:spec 快照 capture/restore 的 192 次

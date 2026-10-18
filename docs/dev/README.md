@@ -6,6 +6,8 @@
 
 | 文档 | 讲什么 | 什么时候看 |
 |---|---|---|
+| [`config.md`](config.md) | 配置链(Default→Flavor→文件→CLI)、`extends` 继承、站点档/实验档组织、拒启错误面 | 起服务、加实验档、改档位 |
+| [`testing.md`](testing.md) | **测试工作流 v2**:用例 overlay 自动解析、环境档、资源清单、`#[owl_test]` 选项、决策表与反模式 | 写/改测试、加检查点、调测试口径 |
 | [`debug-tools.md`](debug-tools.md) | 诊断面速查:`/debug/*` 端点、日志分级、metrics 各族、探针、排障顺序、杀进程纪律 | 服务行为可疑、要量分相、要抓现场 |
 | [`fixtures.md`](fixtures.md) | 夹具与门控:testkit / 金标资产 / 探针测试 / e2e 两入口 / lint 门 / 怎么加新场景 | 写测试、改算子、跑回归 |
 | [`profiling.md`](profiling.md) | nsys 用法 + 统一测速口径(`llm_speedtest`)+ A/B 方法论与常见误读 | 调性能、判收益、写验收表 |
@@ -18,6 +20,28 @@
    (`cargo test ... -- --test-threads=1`)。
 3. **卡是共享资源,本工作区多会话**:起机前查卡占位、`/proc/vmstat` 看 `oom_kill`、
    被外部 kill 是常态(判定顺序见 `debug-tools.md` §5)。
+
+## 新工作树开箱(两条隐性前置 + 冷建成本)
+
+`git worktree add` 出来的新树**开箱不能构建/跑测试** —— 两件前置资产在 git 里没有
+(2026-10-17 审查实录:一位 agent 在这上面花了十几分钟)。
+
+```bash
+# ① triton venv(不建 = `kernels/build.rs` 直接 panic:"gdn_chunked 六核 AOT
+#    需要 Python+triton 环境")。两条路,选一:
+uv sync --project /home/div/Documents/codes/packages/owl-worktrees/<新树>/crates/kernels
+# 或(更快)把构建指到主树 venv —— build.rs 自带旋钮,不必复制 venv:
+export GDN_TRITON_PY=/home/div/Documents/codes/packages/owl/crates/kernels/.venv/bin/python
+
+# ② 0.8B 测试资产(不建 = `engine --lib` 3 项红:"models/assets/Qwen3.5-0.8B/
+#    config.json: No such file"。2.5G,勿复制,软链即可):
+mkdir -p /home/div/Documents/codes/packages/owl-worktrees/<新树>/crates/models/assets
+for d in /home/div/Documents/codes/packages/owl/crates/models/assets/*; do
+  ln -sfn "$d" "$(dirname "$d")/../.."/crates/models/assets/$(basename "$d") 2>/dev/null || true
+done
+```
+
+冷建一次 **~9 分钟**(44 源 cubin 全编;之后增量 10-20s)。工作树位置与清理纪律见包根 `AGENTS.md`。
 
 ## 维护约定
 

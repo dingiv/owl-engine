@@ -32,6 +32,7 @@
 //! 面、usage 模型侧真账(现 = 事件面计数)。
 
 mod actor;
+mod shutdown;
 // chat template 渲染器(HF 语义;agent 服务面 §3.2/§7.1)
 mod chat_tpl;
 mod config;
@@ -57,6 +58,11 @@ const CHANNEL_CAPACITY: usize = 64;
 /// accept 失败退避(防 fd 耗尽等错误风暴下忙旋)
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
+/// **引擎 actor 线程栈**(2026-10-17):缺省 2MiB 对 release 够、对 debug 不够
+/// (见 `owl-engine` 线程处的长注)。32MiB 是余量档:虚拟内存代价可忽略
+/// (进程只留 1 个),只买“深链不崩”。
+const ENGINE_STACK_BYTES: usize = 32 << 20;
+
 /// **诊断投影面共享单元**(`/debug/blocks` 的 GPU 命令出口)。
 /// 显式依赖律:不做全局变量 —— `main` 建、actor 装、HTTP 读,全走参数。
 type DbgFace =
@@ -76,7 +82,7 @@ async fn main() {
     };
     if args.list_flavors {
         eprintln!("可用 flavor:");
-        for n in owl_shared::assets::preset_names() {
+        for n in owl_shared::flavors::preset_names() {
             eprintln!("  {n}");
         }
         return;
@@ -90,6 +96,21 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    // **FI plan 档位投递**(配置 → 核):C++ 适配器与 kernels 的 FI server 都用
+    // `getenv("FI_CUDA_GRAPH")` 判档(上游 ABI 不动),而档位必须来自配置面
+    // ⇒ 入口 boot 期**唯一写者**。读侧唯一 = `kernels/src/server/flashinfer.rs`
+    // 的 `fi_cuda_graph()`(同键、同口径);此处零第二套判据。
+    // 必须在任何图捕获/plan 之前(boot 期一次)。
+    std::env::set_var(
+        "FI_CUDA_GRAPH",
+        if config.knobs.fi_cuda_graph { "1" } else { "0" },
+    );
+
+    // 注:**图自携 plan restore** 不再是 env(2026-10-18 用户裁决)。它现在走
+    // 配置 `[dispatch] fi_plan_restore` → `DiagOpts` → 后端 boot 期
+    // `set_plan_restore`(见 cuda `state.rs`/`server/mod.rs`);单图档必须配
+    // `fi_plan_restore = false`,由 `OwlConfig::validate` 拒启兜底。
 
     // 调试门三件套先取局部:下面 `config` 会被 move 进 actor 线程,
     // 而武装点必须在 boot 完成之后(见下方注释)
@@ -164,8 +185,16 @@ async fn main() {
         config.devices.uuids().join(" + "),
         std::process::id()
     );
+    // **收摊上下文**(SIGTERM 与"引擎不可恢复错误"共用;见 shutdown.rs)
+    // TP 档可能多把卡锁;`Shutdown` 带 rank0 那把(其余由信号处理统一释放)
+    let shutdown = shutdown::Shutdown {
+        lock_path: _gpu_locks[0].path().to_path_buf(),
+        uuid: config.devices.uuids().join(" + "),
+    };
     // 信号:SIGTERM/SIGINT ⇒ 清锁 + 有序退出(`process::exit` 不跑 Drop ⇒ 显式 release)
     {
+        let ctx = shutdown.clone();
+        // TP 档:每 rank 一把卡锁 ⇒ 收集**全部**(停服统一释放;`graceful` 只带一把)
         let lock_paths: Vec<std::path::PathBuf> =
             _gpu_locks.iter().map(|g| g.path().to_path_buf()).collect();
         let uuids = config.devices.uuids().join(" + ");
@@ -189,7 +218,7 @@ async fn main() {
             for p in &lock_paths {
                 owl_shared::gpu_lock::release(p);
             }
-            std::process::exit(0);
+            ctx.graceful("收到停止信号(SIGTERM/SIGINT)");
         });
     }
     // 性能框架分级(docs/arch/perf-framework.md §一;off = 零成本基线臂)
@@ -222,19 +251,13 @@ async fn main() {
 
     // ── engine actor:专属线程(构造+装载+泵全在内;RunningEngine 非 Send)──
     // HTTP 侧留 bind/model_name 副本(model_name 回退服务端缺省)
-    // 并发上限守卫(§三十五 server 上层):GDN 状态格 = 每并发会话一格,
-    // max_concurrency 超格数 = 第 N+1 会话状态格耗尽(LRU 逐出活跃会话)
-    // → 跨会话状态污染。不足即拒启(账外组合不静默)。
-    // FIXME: ??? 你server层的东西，你来感知引擎内部的逻辑???
+    // 并发上限守卫(§三十五)**已下沉**:`gdn_slots ≥ max_concurrency` 是
+    // **跨字段配置不变量**,现由 `OwlConfig::validate` 在**配置装载**时拒
+    // (D1 2026-10-17:原写法在本文件里读引擎内部容量 + 直接 exit(1),
+    // 且只有 server 一条入口守;tests/cli 直构 engine 的路径裸奔)。
+    // 此处只留信息行。
     let gdn_slots = config.knobs.gdn_slots;
     let max_concurrency = config.max_concurrency;
-    if gdn_slots < max_concurrency {
-        // 拒启必须可见(A1):默认日志级别 warn 下 log_info 不出 ⇒ 裸 eprintln
-        eprintln!(
-            "[boot] ❌ max_concurrency({max_concurrency}) > GDN 状态格数({gdn_slots})—— 每并发会话占一格,请调 knobs.gdn_slots ≥ max_concurrency 或降低并发"
-        );
-        std::process::exit(1);
-    }
     owl_shared::log_info!("boot", "并发上限 {max_concurrency}(GDN 格 {gdn_slots};本地服务,排队超出请求)"
     );
 
@@ -246,24 +269,64 @@ async fn main() {
     let dbg_face_actor = dbg_face.clone();
     let (tx, rx) = mpsc::channel::<EngineReq>(CHANNEL_CAPACITY);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<String, String>>();
+    let shutdown_actor = shutdown.clone();
+    // 兜底网的**独立句柄**(闭包会把 shutdown_actor move 走 ⇒ 网里要用另一个)
+    let shutdown_net = shutdown.clone();
     std::thread::Builder::new()
         .name("owl-engine".into())
+        // **显式栈**(2026-10-17):缺省 2MiB 是 debug 档的暗雷 —— 27B + DFlash2
+        // 草稿的装载/装配链在 debug 下帧深远超 release(实测
+        // `--flavor spec-dflash testdata/args/e2e-27b.toml` 的 debug 二进制
+        // 在 DFlash2 草稿初始化处栈溢出 SIGABRT;`RUST_MIN_STACK=64M` 即复活)
+        // ⇒ 本线程是**唯一**背全模型生命周期的线程,给足栈,别赌优化器。
+        .stack_size(ENGINE_STACK_BYTES)
         .spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("actor runtime");
-            rt.block_on(actor_main(config, rx, &ready_tx, dbg_face_actor));
+            // ⚠️ **panic 兜底**(2026-10-17 审查 J2):本线程是全进程**唯一**背引擎
+            // 状态的线程,而引擎热路径以 `expect` 表达状态不变量(`exec/draft.rs` 31 处、
+            // `exec/phases.rs` 8 处…)⇒ 一旦失守,旧行为 = 线程**静默死亡**、
+            // 之后**所有请求悬挂**(HTTP 面 catch 不到,只能等客户端超时;
+            // 运维在日志里也看不到"为什么不再应答")。
+            // 现:捕获 → 响亮日志(带 panic 载荷)→ **exit(70)**(EX_SOFTWARE,
+            // 与"配置错 exit(1)"分开 ⇒ supervisor 能分辨"该不该重启")。
+            // **不续跑**的理由:panic 可能落在锁 / 块账 / 设备状态中途 ⇒ 续跑等于
+            // 拿已损坏的状态继续服务(静默错值,比崩溃坏)。GPU 卡锁按死 pid 自动回收
+            // (`gpu_lock::live_locks_in`),不会挡下次启动。
+            // **最后一道网,不是主路径**(2026-10-17 用户裁决):引擎里的**可失败逻辑
+            // 一律用显式 Result 上抛** —— 泵循环收到 `Err` 就①打印 ②丢该 turn
+            // ③致命者(`is_fatal`,含 `EngineInvariant`)调 `shutdown.graceful()`
+            // 收摊(释放卡锁 + 有序退出)。本网只兜**设计外**的恐慌(索引越界、
+            // 第三方库 unwrap 之类),且**走同一条优雅收摊**,不硬退、不冒烟退出。
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rt.block_on(actor_main(config, rx, &ready_tx, dbg_face_actor, shutdown_actor));
+            }));
+            if let Err(p) = r {
+                let what = panic_payload_str(&p);
+                owl_shared::log_error!(
+                    "boot",
+                    "owl-engine 线程 panic(设计外 —— 应转显式 Result):{what}"
+                );
+                shutdown_net.graceful(&format!("引擎线程 panic(设计外):{what}"));
+            }
         })
         .expect("actor 线程");
 
     // 装配结果(引擎就绪前不开 HTTP 面;架子边界)
-    match ready_rx.recv().expect("actor 线程存活") {
-        Ok(capture) => owl_shared::log_info!("boot", "引擎就绪(捕获态 {capture})"),
-        Err(e) => {
+    match ready_rx.recv() {
+        Ok(Ok(capture)) => owl_shared::log_info!("boot", "引擎就绪(捕获态 {capture})"),
+        Ok(Err(e)) => {
             // 拒启是运维必须看见的事件 ⇒ 恒输出(不经级别门)
             eprintln!("[boot] 引擎装配失败: {e}");
             std::process::exit(1);
+        }
+        // 就绪前通道断开 = actor 线程已死(panic)。旧写法 `.expect("actor 线程存活")`
+        // 会在这里再 panic 一次,把真正的现场(上方 panic 日志)埋掉
+        // ⇒ 走**同一条优雅收摊**(2026-10-17 用户裁决:不硬退)。
+        Err(_) => {
+            shutdown.graceful("actor 线程在就绪前退出(现场见上方 panic 日志)");
         }
     }
 
@@ -283,7 +346,7 @@ async fn main() {
         );
     }
 
-    // 并发上限守卫(§三十五 server 上层):GDN 状态格 = 每并发会话一格,
+    // 并发上限守卫(§三十五 server 上层):GDN 行 = 每并发会话一格,
     // max_concurrency 超格数 = 第 N+1 会话状态格耗尽(LRU 逐出活跃会话)
     // → 跨会话状态污染。不足即拒启(账外组合不静默)。
     // 并发闸门(permit = max_concurrency;在跑 + 排队 ≤ 上限,超出排队等待)
@@ -347,10 +410,11 @@ async fn load_shard(
     let mut loader = engine.loader().slice(rank, world);
     match config.model_kind {
         ModelKind::Awq27b => {
-            // 量化方案映射(唯一点 owl_engine::head_plan_of)
+            // 量化方案映射(唯一点 owl_engine::{head_plan_of, quant_plan_of})
             let head_plan = owl_engine::head_plan_of(config.head_quant);
+            let quant = owl_engine::quant_plan_of(config.quant);
             loader
-                .load_qwen38_27b_awq(&config.model_dir, &config.model_dir, head_plan, config.w4a8)
+                .load_qwen38_27b_awq(&config.model_dir, &config.model_dir, head_plan, quant)
                 .await
         }
         ModelKind::Qwen35_08b => loader.load_qwen35_0_8b(&config.model_dir).await,
@@ -364,6 +428,7 @@ async fn actor_main(
     rx: mpsc::Receiver<EngineReq>,
     ready: &std::sync::mpsc::Sender<Result<String, String>>,
     dbg_face: DbgFace,
+    shutdown: shutdown::Shutdown,
 ) {
     let built: owl_engine::Result<_> = async {
         let t0 = std::time::Instant::now();
@@ -373,7 +438,14 @@ async fn actor_main(
         match world {
             // ── 单卡档(原路径;分片 = 恒等)─────────────────────────────
             1 => {
-                let model = load_shard(&config, &mut engine, 0, 1).await?;
+                // 装载 = 模型档分发(唯一点 owl_engine::{head_plan_of, quant_plan_of})
+                let model = match config.model_kind {
+                    // 量化方案映射在 `load_shard` 内部(唯一映射点)
+                    ModelKind::Awq27b => load_shard(&config, &mut engine, 0, 1).await?,
+                    ModelKind::Qwen35_08b => {
+                        engine.loader().load_qwen35_0_8b(&config.model_dir).await?
+                    }
+                };
                 owl_shared::log_info!("boot", "权重/tokenizer/rope 装载 {:.2}s", t0.elapsed().as_secs_f32());
                 let running = engine.run(model).await?;
                 owl_shared::log_info!("boot", "引擎装配(run)总计 {:.2}s", t0.elapsed().as_secs_f32());
@@ -443,7 +515,18 @@ async fn actor_main(
     } else {
         owl_shared::log_info!("boot", "face 克隆不可用 ⇒ /debug/blocks 回 503(该后端不支持)");
     }
-    actor::run_actor(&mut running, rx, config.perf_dump.clone()).await;
+    actor::run_actor(&mut running, rx, config.perf_dump.clone(), shutdown).await;
+}
+
+/// panic 载荷 → 可读串(`&str` / `String` 两型覆盖 std 惯例;其余给个兜底)
+fn panic_payload_str(p: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = p.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = p.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "(非字符串 panic 载荷)".to_string()
+    }
 }
 
 /// 单连接服务(Connection: close;架子一请求一连接)

@@ -436,13 +436,13 @@ mod tests {
 
     /// **G0 金标门**:快照模板 × HF oracle 逐字节对拍。
     ///
-    /// 需 `OWL_TPL_DIR` 指向模型快照(27B);未设 = 跳过(GPU 用例同纪律,
+    /// 需 `tpl:default` 指向模型快照(27B);未设 = 跳过(GPU 用例同纪律,
     /// 模型目录是机器资产、不在仓库内)。金标 = `tests/fixtures/chat_tpl/*.txt`
     /// (由 `gen_fixtures.py` 用 HF `apply_chat_template` 生成,见该目录 README)。
     #[test]
     fn golden_snapshot_templates() {
-        let Ok(dir) = std::env::var("OWL_TPL_DIR") else {
-            eprintln!("skip: OWL_TPL_DIR 未设(指向 27B 快照目录)");
+        let Some(dir) = owl_shared::testkit::resource("tpl:default") else {
+            eprintln!("skip: tpl:default 未设(指向 27B 快照目录)");
             return;
         };
         let fx = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -459,7 +459,7 @@ mod tests {
         // 家族通用性:另一份快照(上游原版 153 行模板;可选)。
         // ⚠️ 注意用**自己的**金标文件(qwen35_0.8b_ctx1.txt)—— 模板不同,
         //    拿 27B 金标比 0.8B 渲染必红(本行曾因复制粘贴踩过,见 §7.2 教训)。
-        if let Ok(dir8) = std::env::var("OWL_TPL_DIR_QWEN35") {
+        if let Some(dir8) = owl_shared::testkit::resource("tpl:qwen35") {
             let t8 = ChatTpl::load(std::path::Path::new(&dir8)).expect("装载 0.8B 模板");
             let case: Json = serde_json::from_str(
                 &std::fs::read_to_string(fx.join("ctx1_tools.json")).unwrap(),

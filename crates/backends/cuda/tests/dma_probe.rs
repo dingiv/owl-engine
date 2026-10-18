@@ -6,6 +6,10 @@ use std::time::Instant;
 #[ignore = "bench: DMA/pinned 微基准(装载提速口径)"]
 #[tokio::test]
 async fn dma_microbench() {
+    if owl_cuda::test_device_bdf().is_none() {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    }
     const MB: usize = 8 * 1024 * 1024; // 8MB 块(CHUNK_BYTES 量级)
     let (tx, rx) = std::sync::mpsc::channel::<owl_cuda::Command>();
     let server = GpuServer::new(rx, DeviceSelector::Ordinal(test_device_ordinal()), None);

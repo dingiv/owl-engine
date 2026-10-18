@@ -366,6 +366,7 @@ pub fn qwen3_8_27b() -> ModelSpec {
 
 #[cfg(test)]
 mod tests {
+    use owl_macros::owl_test;
     use super::*;
     use crate::TensorOps;
     use crate::module::{ForwardCtx, Module};
@@ -445,8 +446,8 @@ mod tests {
             eprintln!("skip: OWL_TEST_DEVICE 未设");
             return;
         }
-        let Some(dir) = owl_shared::env_reader::str("OWL_DFLASH2_DIR") else {
-            eprintln!("skip: OWL_DFLASH2_DIR 未设");
+        let Some(dir) = owl_shared::testkit::resource("ckpt:dflash2") else {
+            eprintln!("skip: ckpt:dflash2 未设");
             return;
         };
         let mut gpu = crate::testkit::gpu_client().await;
@@ -492,7 +493,7 @@ mod tests {
             let k = cols * 8;
             // CPU 参考:原始 packed → host fused 重排
             let mut ph = vec![0u8; rows * cols * 4];
-            src.convert_chunk_into_bytes(&e.key, 0, rows * cols, &mut ph, Dtype::U32)
+            src.convert_chunk_into_bytes(&e.key, 0, rows * cols, &mut ph, Dtype::U32).expect("源")
                 .expect("源取 packed_raw");
             let p32: Vec<i32> = ph
                 .chunks_exact(4)
@@ -577,7 +578,9 @@ mod tests {
             .map(|i| TensorOps::from_host(Dtype::F16, vec![2, 5120], &mk0(i as f32 + 1.0)))
             .collect();
         let mem_d0 = draft_dev.project_memory(&taps_d0, &fctx0);
-        let got_d0 = crate::testkit::harvest_f16(&mut gpu, &mem_d0).await;
+        // 收割口径 = 声明(草稿档恒 BF16 ⇒ mem 是 BF16 块;用 harvest_f16
+        // 等于把 bf16 位型按 f16 读 = 假幅度错,立案 §P 同坑)
+        let got_d0 = crate::testkit::harvest_bf16(&mut gpu, &mem_d0).await;
         eprintln!(
             "[draft-bench] 设备臂 memory 前 4 值 = {:?}",
             &got_d0[..4.min(got_d0.len())]
@@ -607,9 +610,9 @@ mod tests {
             .collect();
         let fctx = ForwardCtx::minimal(2);
         let mem_d = draft_dev.project_memory(&taps_d, &fctx);
-        let got_d = crate::testkit::harvest_f16(&mut gpu, &mem_d).await;
+        let got_d = crate::testkit::harvest_bf16(&mut gpu, &mem_d).await;
         let mem_c = draft_cpu.project_memory(&taps_c, &fctx);
-        let got_c = crate::testkit::harvest_f16(&mut gpu, &mem_c).await;
+        let got_c = crate::testkit::harvest_bf16(&mut gpu, &mem_c).await;
         let d_bad = got_d
             .iter()
             .zip(got_c.iter())
@@ -648,9 +651,11 @@ mod tests {
             let mut b = vec![0u8; elems * 2];
             let ok_a = src_cpu
                 .convert_chunk_into_bytes(&e.key, 0, elems, &mut a, Dtype::F16)
+                .expect("源")
                 .is_some();
             let ok_b = src_dev
                 .convert_chunk_into_bytes(&e.key, 0, elems, &mut b, Dtype::F16)
+                .expect("源")
                 .is_some();
             let bad = a.iter().zip(b.iter()).filter(|(x, y)| x != y).count();
             eprintln!(
@@ -1457,16 +1462,12 @@ mod tests {
         gpu.close().await.expect("关机");
     }
     /// E5-DF1 验收:DFlash2 检查点装载(81 键)+ fc 采样对拍 +
-    /// encode/selector 真几何冒烟。门控 OWL_TEST_DEVICE + OWL_DFLASH2_DIR
+    /// encode/selector 真几何冒烟。门控 OWL_TEST_DEVICE + ckpt:dflash2
     /// (z-lab/Qwen3.8-27B-DFlash2 目录)。
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_dflash2_27b_loads_and_smokes() {
-        if !crate::testkit::gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
-        let Some(dir) = owl_shared::env_reader::str("OWL_DFLASH2_DIR") else {
-            eprintln!("skip: OWL_DFLASH2_DIR 未设(DFlash2 检查点目录)");
+        let Some(dir) = owl_shared::testkit::resource("ckpt:dflash2") else {
+            eprintln!("skip: ckpt:dflash2 未设(DFlash2 检查点目录)");
             return;
         };
         let dir = std::path::Path::new(&dir);
@@ -1537,8 +1538,8 @@ mod tests {
         use crate::module::WeightSource;
         // host 参考:fc 反量化值(W4A16Source 反量化臂;BF16 源同键直读)
         let src = crate::formats::w4a16::W4A16Source::open_dir(dir).unwrap();
-        let w_fc = src.dequant_linear("fc").expect("fc 源(反量化)");
-        let hn = src.take("hidden_norm.weight").expect("hn 源");
+        let w_fc = src.dequant_linear("fc").expect("源").expect("fc 源(反量化)");
+        let hn = src.take("hidden_norm.weight").expect("源").expect("hn 源");
         let fan = 5 * 5120usize;
         let (hidden_d, row_n) = (5120usize, 5120usize);
         let row: Vec<f32> = (0..row_n)
@@ -1551,15 +1552,24 @@ mod tests {
         );
         let ctx = crate::module::ForwardCtx::minimal(1);
         let mem = draft.project_memory(&[row_t.clone(), row_t.clone(), row_t.clone(), row_t.clone(), row_t.clone()], &ctx);
-        let got = crate::testkit::harvest_f16(&mut gpu, &mem).await;
+        // **收割口径 = 张量声明**(2026-10-17 定谳 §P/§R):本档 opts.dtype=BF16
+        // ⇒ memory 是 **BF16** 块;此前用 `harvest_f16` 收割 = 把 bf16 位型按
+        // f16 读(同指数域、仅尾数截断 ⇒ **随量级漂移的 ~2× 假幅度错**,
+        // cos≈0.85、比值 0.48~0.85)。§P 追了一整轮的“尺度按错格式读”全是
+        // 它的伪影:探针(同 tap 同权)实测设备侧 fc 逐 tap cos=1.0000、
+        // |d|/|h|=1.000,norm 逐点相等 —— 设备无罪。
+        assert_eq!(mem.dtype, crate::contract::Dtype::BF16, "草稿 memory 档 = bf16");
+        let got = crate::testkit::harvest_bf16(&mut gpu, &mem).await;
         let r16 = |x: f32| half::f16::from_f32(x).to_f32();
+        let bn = |x: f32| half::bf16::from_f32(x).to_f32();
         // 完整行 host 重建(1 行 fc = 131M MAC;debug 逐元素循环偏慢属预期)
+        // 激活 = **bf16 铸后的 row**(设备侧 bf16 档 = taps→bf16;参照同口径)
         let mut fc_out = vec![0f32; hidden_d];
         for (o, out) in fc_out.iter_mut().enumerate() {
             // 五 taps 恒等 → y[o] = Σ_{j<fan} row[j % 5120]·W[o][j](全列块)
             let mut acc = 0f32;
             for j in 0..fan {
-                acc += row[j % row_n] * r16(w_fc[o * fan + j]);
+                acc += bn(row[j % row_n]) * r16(w_fc[o * fan + j]);
             }
             *out = acc;
         }
@@ -1567,7 +1577,10 @@ mod tests {
         let inv = 1.0 / (ms + 1e-6).sqrt();
         let mut want = vec![0f32; 5120];
         for c in 0..5120 {
-            want[c] = fc_out[c] * inv * (1.0 + r16(hn[c]));
+            // **6.18 律**:hidden_norm = plain ×w(非 ×(1+w);后者曾是 AL=0
+            // 真根因,见 dflash2.rs 金标 3 与 qk-norm 注释)。本测试残留旧式
+            // 参照,叠加上面收割口径错 ⇒ 长期红
+            want[c] = fc_out[c] * inv * bn(hn[c]);
         }
         crate::testkit::assert_close(&got, &want, 5e-2, "project_memory(fc+hidden_norm)");
 
@@ -1583,38 +1596,48 @@ mod tests {
             vec![rows, vocab],
             &logits.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>(),
         );
+        // Topk16 线契约 = **out r1 单缓冲** [rows·2K]扁平(台账
+        // `elems::Topk16F16`:t_out rank 1;行数走 aux)。此处曾声明
+        // `[rows, 32]`(rank 2)—— 2026-10-17 L3 事实门当场拒
+        // (“out 期望 rank = 1(声明) 实得 2”),是**测试声明陈旧**,
+        // 生产调用点(dflash2.rs `select_with_logits`)始终 r1。
         let topk = crate::TensorOps::call(crate::ops::SemanticKernel::Topk16)
             .aux(&[rows])
         .arg(&logits_t)
         .arg_i32(vocab as i32)
-        .with_shape(crate::contract::Dtype::F32, vec![rows, 32]);
+        .with_shape(crate::contract::Dtype::F32, vec![rows * 2 * 16]);
         let topk_full = crate::testkit::harvest(&mut gpu, &topk).await;
-        let cand: Vec<f32> = (0..rows)
-            .flat_map(|r| topk_full[r * 32 + 16..(r + 1) * 32].to_vec())
-            .collect();
-        let unary: Vec<f32> = (0..rows)
-            .flat_map(|r| topk_full[r * 32..r * 32 + 16].to_vec())
-            .collect();
-        // proj = hidden_projection(hidden)[rows, 256];hidden 随机 f16
+        // 布局 = **两段连续**(值区 [rows·K) + 索引区 [rows·K, rows·2K);
+        // 非逐行交错 —— 旧切法 `[r*32+16..]` 读的是错位数据(旧对拍只查
+        // 越界/整除,静默滑过;现改与 dflash2.rs 契约测试同切)
+        let unary: Vec<f32> = topk_full[..rows * 16].to_vec();
+        let cand: Vec<f32> = topk_full[rows * 16..rows * 32].to_vec();
+        // proj = hidden_projection(hidden)[rows, 256];hidden 随机 **BF16**
+        // (草稿档 = bf16:proj 是非量化 Linear ⇒ 走 cublas,而 gemm 臂由
+        // **激活声明**定 ⇒ 喂 f16 会选 cublas_gemm_f16 撞 bf16 权重被 L3 门拒
+        // “b 期望 dtype = F16 实得 BF16”—— 测试声明必须跟模型档走)
         let hidden: Vec<f32> = (0..(rows + 1) * 5120)
-            .map(|i| half::f16::from_f32(((i as f32) * 0.019).cos() * 0.3).to_f32())
+            .map(|i| half::bf16::from_f32(((i as f32) * 0.019).cos() * 0.3).to_f32())
             .collect();
         let hidden_t = crate::TensorOps::from_host(
-            crate::contract::Dtype::F16,
+            crate::contract::Dtype::BF16,
             vec![rows + 1, 5120],
-            &hidden.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>(),
+            &hidden.iter().flat_map(|f| half::bf16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>(),
         );
         let pred = hidden_t.slice_view(5120, vec![rows, 5120]);
         let proj = crate::interpreters::eval_ops(
             draft.selector().proj().forward(&pred, &ctx).step(), &mut gpu)
             .await
             .expect("proj eval");
-        let proj_t = crate::TensorOps::of_block(proj.id, crate::contract::Dtype::F16, vec![rows, 256]);
+        let proj_t = crate::TensorOps::of_block(proj.id, crate::contract::Dtype::BF16, vec![rows, 256]);
         let anchor_t = crate::TensorOps::from_host(
             crate::contract::Dtype::F32, vec![1], &crate::testkit::f32b(&[42.0]),
         );
         let sel_out = crate::TensorOps::call(crate::ops::SemanticKernel::DflashSelect)
-            .aux(&[0])
+            // 臂 = **模型声明**(与生产同式 dflash2.rs:574 `(self.dt == BF16) as usize`);
+            // 漂移≠节点 dt(输出恒 f32)⇒ 路由只能吃 aux。此处曾写死 0(f16)
+            // ⇒ bf16 proj/码本 被 f16 表拒(“proj 期望 F16 实得 BF16”)
+            .aux(&[(draft.dtype() == crate::contract::Dtype::BF16) as usize])
         .arg(&crate::TensorOps::from_host(crate::contract::Dtype::F32, vec![rows, 16], &crate::testkit::f32b(&cand)))
         .arg(&crate::TensorOps::from_host(crate::contract::Dtype::F32, vec![rows, 16], &crate::testkit::f32b(&unary)))
         .arg(&proj_t)

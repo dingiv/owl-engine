@@ -311,16 +311,20 @@ fn max_dev(got: &[f32], want: &[f32]) -> f32 {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn gdn_chunked_new_chain_matches_golden() {
-    if !std::env::var_os("OWL_TEST_DEVICE").is_some() {
+    if owl_cuda::test_device_bdf().is_none() {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
     }
-    let dev: usize = std::env::var("OWL_TEST_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let dev: usize = owl_cuda::test_device_ordinal();
     let mut res = TestRes::new(dev);
     let mut exec = Exec::new();
     let mut rt = <GdnChunkedRuntime as KernelFamily>::assemble(&mut res, &mut exec).expect("runtime assemble");
 
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/gdn_fla/cases");
+    if !std::path::Path::new(dir).join("c1_t64.q.bin").is_file() {
+        eprintln!("skip: 金标 bin 不在({dir};`gen.py` 生成,或从主树 testdata/gdn_fla/cases 链接)");
+        return;
+    }
     // (tag, T, tight)
     let cases: &[(&str, usize, bool)] = &[
         ("c1_t64", 64, false),
@@ -448,11 +452,11 @@ fn take_f32_unused() {}
 #[test]
 #[allow(clippy::too_many_lines)]
 fn gdn_chunked_nt_decomposition_identity() {
-    if std::env::var_os("OWL_TEST_DEVICE").is_none() {
+    if owl_cuda::test_device_bdf().is_none() {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
     }
-    let dev: usize = std::env::var("OWL_TEST_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let dev: usize = owl_cuda::test_device_ordinal();
     let mut res = TestRes::new(dev);
     let mut exec = Exec::new();
     let mut rt = <GdnChunkedRuntime as KernelFamily>::assemble(&mut res, &mut exec).expect("runtime assemble");
@@ -513,7 +517,7 @@ fn gdn_chunked_nt_decomposition_identity() {
     };
 
     // ── 输入块(整块 + 8 段切片各一套)──
-    let mut run_arm = |rt: &mut Box<dyn KernelFamily>, res: &mut TestRes, exec: &mut Exec,
+    let run_arm = |rt: &mut Box<dyn KernelFamily>, res: &mut TestRes, exec: &mut Exec,
                        t: usize, slice: Option<usize>| -> (Vec<f32>, Vec<f32>) {
         // slice = Some(i) → 取第 i 段 T_SM 行;None → 整块 T_BIG 行
         let (off_qk, rows_qk, off_v, rows_v, off_h, rows_h) = match slice {
@@ -637,11 +641,11 @@ fn gdn_chunked_nt_decomposition_identity() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn gdn_chunked_matches_varlen_fn_level() {
-    if std::env::var_os("OWL_TEST_DEVICE").is_none() {
+    if owl_cuda::test_device_bdf().is_none() {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
     }
-    let dev: usize = std::env::var("OWL_TEST_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let dev: usize = owl_cuda::test_device_ordinal();
     let mut res = TestRes::new(dev);
     let mut exec = Exec::new();
     let mut rt = <GdnChunkedRuntime as KernelFamily>::assemble(&mut res, &mut exec).expect("runtime assemble");

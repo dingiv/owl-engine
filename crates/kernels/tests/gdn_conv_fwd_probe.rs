@@ -23,7 +23,7 @@ const BLOCK: u32 = 256;
 const TILE_ROWS: usize = 32;
 
 fn dev_ordinal() -> Option<usize> {
-    owl_shared::env_reader::parse("OWL_TEST_DEVICE")
+    owl_cuda::test_device_ordinal_opt()
 }
 
 fn conv_asset() -> &'static owl_kernels::family::cubins::CubinAsset {
@@ -446,7 +446,7 @@ fn conv_fwd_latency_probe() {
         block_dim: (BLOCK, 1, 1),
         shared_mem_bytes: 0,
     };
-    let mut fire = || unsafe {
+    let fire = || unsafe {
         stream
             .launch_builder(&f)
             .arg(&px)

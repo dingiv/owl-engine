@@ -288,6 +288,10 @@ struct Inner {
 /// logger 本体(可与全局指针并存直接持有 —— 测试/多实例)
 pub struct Logger {
     level: AtomicU8,
+    /// ⚠️ **锁中毒就地取回**(`unwrap_or_else(|p| p.into_inner())`):日志是
+    /// 诊断面且被**错误路径**调用 ⇒ 毒化后 `unwrap()` 会让每一次记日志在调用
+    /// 方 panic(把小事故放大成死循环式崩溃)。与 `backends/cuda/trace.rs`
+    /// 同纪律(2026-10-17 全仓审查统一)。
     inner: Mutex<Inner>,
 }
 
@@ -332,14 +336,14 @@ impl Logger {
 
     /// 替换 tag 过滤(空 allow = 全放行;deny 优先)
     pub fn set_tags(&self, allow: Vec<String>, deny: Vec<String>) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.tags_allow = allow;
         inner.tags_deny = deny;
     }
 
     /// 当前 tag 过滤(诊断)
     pub fn tags(&self) -> (Vec<String>, Vec<String>) {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         (inner.tags_allow.clone(), inner.tags_deny.clone())
     }
 
@@ -350,7 +354,7 @@ impl Logger {
         if thr == LVL_OFF || level > thr {
             return false;
         }
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if inner.tags_deny.iter().any(|p| tag.starts_with(p.as_str())) {
             return false;
         }
@@ -368,21 +372,21 @@ impl Logger {
         }
         let mut line = String::with_capacity(msg.len() + tag.len() + 16);
         {
-            let inner = self.inner.lock().unwrap();
+            let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             if inner.timestamp {
                 line.push_str(&iso_ms(SystemTime::now()));
                 line.push(' ');
             }
             line.push_str(&format!("[{}] [{}] {}\n", level_tag(level), tag, msg));
             if let Some(buf) = &inner.memory {
-                buf.lock().unwrap().push(line.clone());
+                buf.lock().unwrap_or_else(|p| p.into_inner()).push(line.clone());
             }
             if inner.to_stderr {
                 let _ = std::io::stderr().write_all(line.as_bytes());
             }
         }
         // 文件单独持锁(不与内存/stderr 的长临界区混合)
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(f) = inner.file.as_mut() {
             if let Err(e) = f.write_line(&line) {
                 // 落盘失败不吞:降级到 stderr 一次(避免日志系统本身静默失联)
@@ -769,6 +773,26 @@ mod tests {
             std::process::id(),
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos()
         ))
+    }
+
+    /// **中毒的 logger 仍要能记日志**(2026-10-17 审查统一纪律;与 trace.rs 同律):
+    /// 另一线程持锁 panic ⇒ 锁毒化,后续 emit 不得 panic(就地取回 Inner)。
+    #[test]
+    fn poisoned_logger_still_emits() {
+        let (cfg, buf) = mem_cfg(LVL_INFO);
+        let l = Arc::new(Logger::new(cfg).expect("mem logger"));
+        let _ = std::thread::spawn({
+            let l = Arc::clone(&l);
+            move || {
+                let _g = l.inner.lock().expect("首次加锁");
+                panic!("故意毒化(持锁 panic)");
+            }
+        })
+        .join();
+        assert!(l.inner.is_poisoned(), "本门前提 = 锁已被毒化");
+        l.emit(LVL_ERROR, "boot", "post-poison");
+        let got = buf.lock().unwrap().clone();
+        assert!(got.iter().any(|s| s.contains("post-poison")), "中毒后仍应落账:{got:?}");
     }
 
     #[test]

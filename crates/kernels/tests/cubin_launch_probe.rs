@@ -33,7 +33,7 @@ const N: usize = 1024;
 const BLOCK: u32 = 256;
 
 fn dev_ordinal() -> Option<usize> {
-    owl_shared::env_reader::parse("OWL_TEST_DEVICE")
+    owl_cuda::test_device_ordinal_opt()
 }
 
 fn bits(v: &[f16]) -> Vec<u16> {

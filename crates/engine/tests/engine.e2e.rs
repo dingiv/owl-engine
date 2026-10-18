@@ -10,8 +10,8 @@
 //!
 //! 运行:
 //! ```bash
-//! OWL_TEST_DEVICE=1 OWL_AWQ27B_DIR=<27B-AWQ> OWL_DFLASH2_DIR=<DFlash2-W4A16> \
-//!   cargo test -p owl-engine --features e2e --test engine.e2e -- --test-threads=1
+//! OWL_TEST_DEVICE=41:00.0 cargo test -p owl-engine --features e2e --test engine.e2e -- --test-threads=1
+//! (27B/草稿等资源来自 `testdata/resources.toml`;见 docs/dev/fixtures.md)
 //! ```
 //! **GPU 必须串行**(pitfall §16:并行 = 多 CUDA 上下文同卡并发图捕获 → 假挂)。
 //!
@@ -66,6 +66,17 @@ macro_rules! run {
     }};
 }
 
+// ⚠️ **挂账(2026-10-16 定谳,非本仓逻辑错)**:本入口在**单进程**里连开多个
+// 引擎实例,而引擎的设备内存**从不 Free**(设计前提 = "全进程单引擎" ——
+// `vram.rs` 头注;`Bytes` 是句柄,drop 不发 `Command::Free`,归池只发生在
+// 装载收尾 `mem_pool_trim`)⇒ `vram::live` 只增不减,后续实例的
+// `StatePool::alloc` vram 治理把池夹到**几何下限**(0.8B/3080 实测:池槽 0/4)。
+// 现象:`gpu_spec_identity_gate` 套件内红"KV 块池耗尽"、单跑绿(2026-10-13 已记
+// 症状;2026-10-16 定谳 = 池被夹到 4 块,账目本身自洽)。
+// 候选修法(未拍):①收尾给引擎发 Free(`Drop for StatePool/GraphFleet`)②门档
+// `vram_target=0` 关治理(有真 OOM 风险)③按场景拆进程。**别**用"等 live 回落"
+// 的屏障 —— 实测 20s 也不回落(它压根不释放)。
+
 /// **非 async 入口**:场景含图捕获的声明树走查(深递归),而入口把多层
 /// async 内联进一个 future → libtest 默认栈(8MiB)实测溢出
 /// (`fatal runtime error: stack overflow` @ dflash propose 图捕获)。
@@ -87,12 +98,25 @@ fn e2e() {
 
 async fn e2e_body() {
     // ── env 一次读(缺失 = 整档 skip;不再往场景里散读) ──
-    let Some(dev) = owl_shared::env_reader::parse::<usize>("OWL_TEST_DEVICE") else {
+    // §18:CPU mock 档**无卡**也可入档(OWL_CPU_MOCK 在 + 无 OWL_TEST_DEVICE
+    // ⇒ 只跑 CPU 档场景,GPU 场景一概不触)。
+    let dev = owl_cuda::test_device_ordinal_opt();
+    let cpu_only = dev.is_none() && owl_shared::env_reader::flag("OWL_CPU_MOCK");
+    if dev.is_none() && !cpu_only {
         eprintln!("skip: OWL_TEST_DEVICE 未设(engine e2e 整档跳过)");
         return;
-    };
-    let has_27b = owl_shared::env_reader::str("OWL_AWQ27B_DIR").is_some();
-    let has_draft = owl_shared::env_reader::str("OWL_DFLASH2_DIR").is_some();
+    }
+    let dev = dev.unwrap_or(0);
+    if cpu_only {
+        eprintln!("[e2e] 无卡档(OWL_CPU_MOCK):只跑 CPU mock 场景 —— store 演示台三门口 + S2 状态腿");
+        run!(cpu_mock_offload_probe);
+        run!(cpu_mock_state_leg_probe);
+        run!(cpu_mock_index_probe);
+        eprintln!("[e2e] 无卡档完成,用时 {:.1}s", std::time::Instant::now().elapsed().as_secs_f32());
+        return;
+    }
+    let has_27b = owl_shared::testkit::resource("ckpt:27b-awq").is_some();
+    let has_draft = owl_shared::testkit::resource("ckpt:dflash2").is_some();
     eprintln!(
         "[e2e] device={dev} 27B_DIR={} DFLASH2_DIR={}(缺失的组会自行 skip)",
         has_27b, has_draft
@@ -121,11 +145,38 @@ async fn e2e_body() {
         eprintln!("[e2e] 0.8B 默认档 skip(被 OWL_E2E_ONLY 排除)");
     }
 
+    // ── S3-3b 实证(自装载;按需开:`OWL_OFFLOAD_PROBE=1`) ──
+    run!(gpu_08b_offload_probe);
+
+    // ── S0 预算实测(自装载;按需开:`OWL_BUDGET_PROBE=1`) ──
+    run!(gpu_08b_budget_probe);
+
+    // ── S2 状态腿三层化(自装载;按需开:`OWL_STATE_LEG_PROBE=1`) ──
+    run!(gpu_08b_state_leg_probe);
+
+    // ── B-3e stage-in 回灌实测(自装载;按需开:`OWL_B3E_PROBE=1`) ──
+    run!(gpu_08b_stage_in_probe);
+
+    // ── B-0 选择层索引采集(自装载;按需开:`OWL_INDEX_PROBE=1`) ──
+    run!(gpu_08b_index_probe);
+
+    // ── B 轴覆盖率探针(Q-2;按需开:`OWL_COVERAGE_PROBE=1` + `OWL_INDEX_PROBE=1`) ──
+    run!(gpu_08b_coverage_probe);
+
+    // ── A2 门:切块不变性(同 prompt × 两种 `prefill_chunk` 读数必须一致;§8.30)──
+    run!(gpu_08b_chunk_invariance_gate);
+
+    // ── B-3d 选择层接进 decode(按需开:另加 `OWL_SELECT_DECODE=1`) ──
+    run!(gpu_08b_select_decode_probe);
+
     // ── piecewise 段驱动件(不装模型;纯 GraphPlan 面) ──
-    run!(gpu_piecewise_segments);
+    run!(gpu_single_graph_capture_and_replay);
 
     // ── 0.8B 其余档:boot 期配置各不相同,各自装载 ──
     run!(gpu_schedule_decision_surface); // max_seq=64/chunk=4(切块敏感)
+    // §18 CPU mock 档:同一套 store 三门口跑在 CpuFace 上(无卡;OWL_CPU_MOCK 门控)
+    run!(cpu_mock_offload_probe);
+    run!(cpu_mock_state_leg_probe);
     run!(gpu_gdn_slot_cross_probe);   // gdn_slots=2 + prefix_cache=false
     run!(gpu_08b_fuse_text_parity);   // greedy + fused_decode 臂
     run!(gpu_longctx_fi_direct_gate); // fp8 池 × {FI 直读, 自研读核}(自装载两回)
@@ -145,6 +196,9 @@ async fn e2e_body() {
     } else {
         eprintln!("[e2e] 27B 默认档 skip(无目录或被 OWL_E2E_ONLY 排除)");
     }
+
+    // ── B-5 Stage 2:27B 单卡 + 选择层 + 部分驻留(自装载;按需开 `OWL_SELECT_27B=1`)──
+    run!(gpu_27b_select_probe);
 
     // ── 27B 其余档:boot 期配置各不相同(草稿类型/池/fp8/slab),各自装载 ──
     run!(gpu_27b_raw_completion_diag);   // greedy + Dumb 草稿 + slab

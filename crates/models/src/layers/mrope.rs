@@ -199,8 +199,15 @@ impl MropeCfg {
             }
             i = j;
         }
-        let delta = pos.iter().flat_map(|p| p.iter()).copied().max().unwrap_or(0) + 1
-            - ttypes.len() as i64;
+        // 空输入 = 退化输入(克分子表为空);原 `unwrap_or(0)` 会算出一个
+        // 无意义的 delta(1 − ttypes.len(),可为负)传给位置计算 —— 静默错值
+        // ⇒ 2026-10-17 审查改响亮拒
+        let Some(maxpos) = pos.iter().flat_map(|p| p.iter()).copied().max() else {
+            return Err(ModelError::Msg(
+                "rope_index: 位置表为空(token 类型表为空?需至少一个 token)".into(),
+            ));
+        };
+        let delta = maxpos + 1 - ttypes.len() as i64;
         Ok(MropeIndex { pos, delta })
     }
 
@@ -385,8 +392,8 @@ mod tests {
         use crate::module::WeightSource;
         let rp = Rope::new(l, 256, 64, 1e7).expect("rope");
         let table = rp.tables();
-        let cos_ref = table.take("cos_table").expect("cos 表源");
-        let sin_ref = table.take("sin_table").expect("sin 表源");
+        let cos_ref = table.take("cos_table").expect("源").expect("cos 表源");
+        let sin_ref = table.take("sin_table").expect("源").expect("sin 表源");
         for t in 0..l {
             for j in 0..32 {
                 let i = t * 32 + j;
@@ -551,5 +558,14 @@ mod tests {
         // j%3==1 槽位同、j%3==2 槽位异
         assert_eq!(cos[half + 1], cos[2 * half + 1], "同 h 行:H 维相同");
         assert_ne!(cos[half + 2], cos[2 * half + 2], "同 h 行:W 维不同");
+    }
+
+    /// **空输入门**(2026-10-17 审查 §五轮):位置表为空 = 退化输入 ⇒ 响亮拒
+    /// (修前 `max().unwrap_or(0)` 会算出无意义 delta 传下去)。
+    #[test]
+    fn rope_index_rejects_empty_input() {
+        let c = cfg4b();
+        let e = c.rope_index(&[], &[], &[], &[]);
+        assert!(e.is_err(), "空输入必须拒,得 {e:?}");
     }
 }

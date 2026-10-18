@@ -202,7 +202,7 @@ fn bench_shape_a8(
 #[ignore = "bench: marlin W4A8 vs W4A16 杠杆(bench 全线前置判据)"]
 #[test]
 fn marlin_w4a8_vs_w4a16_lever() {
-    let Some(dev) = owl_shared::env_reader::parse::<usize>("OWL_TEST_DEVICE")
+    let Some(dev) = owl_cuda::test_device_ordinal_opt()
     else {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
@@ -248,7 +248,7 @@ fn marlin_w4a8_vs_w4a16_lever() {
 #[ignore = "bench: marlin 带宽微基准(E5 性能会战)"]
 #[test]
 fn marlin_bandwidth_27b_shapes() {
-    let Some(dev) = owl_shared::env_reader::parse::<usize>("OWL_TEST_DEVICE")
+    let Some(dev) = owl_cuda::test_device_ordinal_opt()
     else {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;

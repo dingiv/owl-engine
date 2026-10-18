@@ -127,7 +127,7 @@ async fn body(oa: usize, ob: usize, dir: PathBuf) {
     assert_eq!(tp.spec(0).inter, tp.spec(1).inter, "两 rank 同形(分片协议对称)");
 
     // ── ④ staging 账(两侧同额 + 领主账)────────────────────────────
-    let layout = owl_comm::ar::StagingLayout::default_layout();
+    let layout = owl_cuda::comm::ar::StagingLayout::default_layout();
     for r in 0..2 {
         assert_eq!(tp.staging(r).total_bytes(), layout.total_bytes(), "rank{r} staging 额度");
         assert_eq!(tp.slot_bytes(), layout.slot_bytes, "slot 两侧同参");

@@ -174,6 +174,7 @@ const _: Dtype = Dtype::F32;
 
 #[cfg(test)]
 mod tests {
+    use owl_macros::owl_test;
     use super::*;
 
     fn src_map(entries: &[(&str, usize, f32)]) -> std::collections::HashMap<String, Vec<f32>> {
@@ -341,14 +342,10 @@ mod tests {
     }
 
     /// Full 分支单步 decode vs host(门控 OWL_TEST_DEVICE)
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_full_layer_matches_host() {
         use crate::layers::rope::Rope;
         use crate::module::KvBuffers;
-        if !crate::testkit::gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
-            return;
-        }
         let (hq, hkv, hd, hidden, inter) = (2usize, 1usize, 4usize, 3usize, 5usize);
         let layer = DecoderLayer::new_full(hq, hkv, hd, hidden, inter, EPS, QuantPlan::F16);
         let mut gpu = crate::testkit::gpu_client().await;
@@ -470,13 +467,9 @@ mod tests {
     }
 
     /// Gdn 分支单步 decode vs host(手搭 mixer 链逐段收割;门控 OWL_TEST_DEVICE)
-    #[tokio::test]
+    #[owl_test(gpu)]
     async fn gpu_gdn_layer_matches_host() {
         use crate::layers::gdn::GdnBuffers;
-        // if !crate::testkit::gpu_enabled() {
-        //     eprintln!("skip: OWL_TEST_DEVICE 未设");
-        //     return;
-        // }
         let (nk, hk_dim, nv, hv_dim, hidden, inter) = (2usize, 4usize, 2usize, 4usize, 6usize, 5usize);
         let key_dim = nk * hk_dim;
         let value_dim = nv * hv_dim;

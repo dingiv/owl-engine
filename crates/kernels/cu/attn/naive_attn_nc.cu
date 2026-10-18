@@ -699,6 +699,16 @@ extern "C" __global__ void owl_naive_attn_nc_fp8kv_bf16_knhd(
 //   ⇒ **同步链占 58%**,是唯一值得砍的大项(设计稿 D2 判断正确;V 的 sector
 //   放大只值 0.36ms —— L2 把它兜住了,原估的"16× 放大"不成立)。
 //
+// **GQA 感知(2026-10-18,propose 立案;grid 由 (T,Hq) 改 (T,Hkv))**:
+//   同一 kv-head 的 `group = q_heads/kv_heads` 个 q-head 曾各起一个 CTA
+//   ⇒ 同一批 K/V 行被读 group 遍(草稿档 group=4:实测 268 MB/发、~225 GB/s
+//   ⇒ 1.19 ms,占 propose 图 66%)。现改:**一个 CTA 覆盖一个 kv-head 的全部
+//   q-head** —— CTA 内 warp 映射 `wq = warp % group`(组内 q-head)、
+//   `sub = warp / group`(行切片,`nsub = nwarp/group`),同组 warp 走 L1 共享
+//   同一行 ⇒ HBM 流量 ÷ group,且行遍历同序 ⇒ 数值序不变(除 split-K 归并宽度)。
+//   结构门:仅当 `nwarp ≥ group` 且 `nwarp % group == 0` 时可用(驱动件选核;
+//   越界 = `__trap()` 硬错,不静默)。
+//
 // 结构(lane→连续 dim + warp butterfly + split-K + 收尾一次归并):
 //   ① 每 lane 持 DPL = d_dim/32 个**连续** dim(sr 与 q 同布局);
 //   ② 逐行:lane 内点积 → **warp butterfly(__shfl_xor_sync × 5)** ⇒ 每个 lane
@@ -772,42 +782,53 @@ __device__ __forceinline__ void nc_attn_loop(
     int page, int x,
     T* __restrict__ out) {
     const int t = blockIdx.x;
-    const int h = blockIdx.y;
+    const int kvh = blockIdx.y;   // ← GQA:一个 CTA = 一个 kv-head(其全部 q-head)
     const int tid = threadIdx.x;
     const int warp = tid >> 5;
     const int lane = tid & 31;
     const int nwarp = blockDim.x >> 5;
+    const int group = q_heads / kv_heads;   // GQA 组宽
+    // **结构门**:驱动件只在本几何下选本核;越界 = 硬错(不静默、不半跑)
+    if (group <= 0 || nwarp < group || (nwarp % group) != 0) {
+        __trap();
+    }
+    const int wq = warp % group;            // 组内 q-head 序号
+    const int sub = warp / group;           // 行切片序号
+    const int nsub = nwarp / group;         // 行切片数
+    const int h = kvh * group + wq;         // 全局 q-head
     // DPL>0 = 编译期定死(可矢量读);DPL==0 = 运行时 dpl(标量兜底)
     const int dpl = (DPL > 0) ? DPL : (d_dim >> 5);
     const int d0 = lane * dpl;
-    const int kvh = h / (q_heads / kv_heads);
     const int hd_x = d_dim / x;
     const int kv_len = (int)kv_len_p[0];
     const int prefix_len = kv_len - gridDim.x;
     const float scale = rsqrtf((float)d_dim);
 
     const T* qs = q + ((long long)t * q_heads + h) * d_dim;
-    float qd[OWL_NC_DPL_MAX];
+    constexpr int DPLN = (DPL > 0) ? DPL : OWL_NC_DPL_MAX;
+    float qd[DPLN];
 #pragma unroll
-    for (int j = 0; j < OWL_NC_DPL_MAX; ++j) {
+    for (int j = 0; j < DPLN; ++j) {
         qd[j] = (j < dpl) ? NcConv<T>::tof(qs[d0 + j]) : 0.0f;
     }
 
     // D2 滑窗:前缀只取最近 OWL_NC_SLIDING_WINDOW 行(自块恒全可见)
     const int srow_begin =
         (prefix_len > OWL_NC_SLIDING_WINDOW) ? (prefix_len - OWL_NC_SLIDING_WINDOW) : 0;
-    // 本 warp 的行切片(连续均分;余数归前几片)
+    // 本 warp 的行切片(同 q-head 的 nsub 个 warp 连续均分;余数归前几片)
     const int nrow = kv_len - srow_begin;
-    const int per = (nrow + nwarp - 1) / nwarp;
-    const int lo = srow_begin + warp * per;
+    const int per = (nrow + nsub - 1) / nsub;
+    const int lo = srow_begin + sub * per;
     const int hi = (lo + per < kv_len) ? (lo + per) : kv_len;
 
     float m = -3.0e38f;
     float l = 0.0f;
-    float acc[OWL_NC_DPL_MAX];
+    float acc[DPLN];
 #pragma unroll
-    for (int j = 0; j < OWL_NC_DPL_MAX; ++j) acc[j] = 0.0f;
+    for (int j = 0; j < DPLN; ++j) acc[j] = 0.0f;
 
+    // ⚠️ **不展开行循环**(2026-10-18 实测):`#pragma unroll 4` 会让编译器把
+    // online-softmax 的累加重排 ⇒ 装配期 oracle 门(2e-2)当场红 ⇒ 保持串行序。
     for (int srow = lo; srow < hi; ++srow) {
         const bool pre = (srow < prefix_len);
         const int b = pre ? (srow / page) : 0;
@@ -831,7 +852,7 @@ __device__ __forceinline__ void nc_attn_loop(
             const long long base = ((long long)b * kv_heads + kvh) * hd_x * page * x
                                    + (long long)off * x;
 #pragma unroll
-            for (int j = 0; j < OWL_NC_DPL_MAX; ++j) {
+            for (int j = 0; j < DPLN; ++j) {
                 if (j < dpl) {
                     const int dim = d0 + j;
                     dot += qd[j]
@@ -843,7 +864,7 @@ __device__ __forceinline__ void nc_attn_loop(
             const int st = srow - prefix_len;
             const T* ks = k_self + ((long long)st * kv_heads + kvh) * d_dim;
 #pragma unroll
-            for (int j = 0; j < OWL_NC_DPL_MAX; ++j) {
+            for (int j = 0; j < DPLN; ++j) {
                 if (j < dpl) dot += qd[j] * NcConv<T>::tof(ks[d0 + j]);
             }
         }
@@ -861,7 +882,7 @@ __device__ __forceinline__ void nc_attn_loop(
         if (pre) {
             const long long base = ((long long)b * kv_heads + kvh) * (long long)d_dim * page;
 #pragma unroll
-            for (int j = 0; j < OWL_NC_DPL_MAX; ++j) {
+            for (int j = 0; j < DPLN; ++j) {
                 if (j < dpl) {
                     acc[j] = acc[j] * resc
                              + p * NcConv<T>::tof(vc[base + (long long)(d0 + j) * page + off]);
@@ -871,43 +892,53 @@ __device__ __forceinline__ void nc_attn_loop(
             const int st = srow - prefix_len;
             const T* vs = v_self + ((long long)st * kv_heads + kvh) * d_dim;
 #pragma unroll
-            for (int j = 0; j < OWL_NC_DPL_MAX; ++j) {
+            for (int j = 0; j < DPLN; ++j) {
                 if (j < dpl) acc[j] = acc[j] * resc + p * NcConv<T>::tof(vs[d0 + j]);
             }
         }
     }
 
-    // ---- 收尾:每 block 一次跨 warp 归并(flash-decoding 式;1 次 __syncthreads)----
-    __shared__ float s_acc[8][256];
-    __shared__ float s_m[8];
-    __shared__ float s_l[8];
+    // ---- 收尾:每 block 一次归并(**只并同 q-head 的 nsub 个 warp**;
+    //      warp 下标 = wq + s2*group;1 次 __syncthreads)----
+    // ⚠️ **动态 smem**(不是 `__shared__` 静态):本函数被 DPL=4/8/0 三个实例化
+    // 共用,静态声明会**各自占一份**(3×16KB ⇒ 超 48KB 静态上限,ptxas 报
+    // "too much shared data")。布局由驱动件按 `nwarp*(d_dim+2)*4` 申报:
+    //   [nwarp][d_dim] 归并 acc ‖ [nwarp] m ‖ [nwarp] l
+    extern __shared__ float s_nc[];
+    float* s_acc = s_nc;                        // nwarp × d_dim
+    float* s_m = s_nc + nwarp * d_dim;
+    float* s_l = s_m + nwarp;
     if (lane == 0) {
         s_m[warp] = m;
         s_l[warp] = l;
     }
 #pragma unroll
-    for (int j = 0; j < OWL_NC_DPL_MAX; ++j) {
-        if (j < dpl) s_acc[warp][d0 + j] = acc[j];
+    for (int j = 0; j < DPLN; ++j) {
+        if (j < dpl) s_acc[warp * d_dim + d0 + j] = acc[j];
     }
     __syncthreads();
     float mg = -3.0e38f;
-    for (int w = 0; w < nwarp; ++w) mg = fmaxf(mg, s_m[w]);
+    for (int s2 = 0; s2 < nsub; ++s2) mg = fmaxf(mg, s_m[wq + s2 * group]);
     float lg = 0.0f;
-    float ag[OWL_NC_DPL_MAX];
+    float ag[DPLN];
 #pragma unroll
-    for (int j = 0; j < OWL_NC_DPL_MAX; ++j) ag[j] = 0.0f;
-    for (int w = 0; w < nwarp; ++w) {
+    for (int j = 0; j < DPLN; ++j) ag[j] = 0.0f;
+    for (int s2 = 0; s2 < nsub; ++s2) {
+        const int w = wq + s2 * group;
         const float e = __expf(s_m[w] - mg);
         lg += s_l[w] * e;
 #pragma unroll
-        for (int j = 0; j < OWL_NC_DPL_MAX; ++j) {
-            if (j < dpl) ag[j] += s_acc[w][d0 + j] * e;
+        for (int j = 0; j < DPLN; ++j) {
+            if (j < dpl) ag[j] += s_acc[w * d_dim + d0 + j] * e;
         }
     }
-    T* o = out + ((long long)t * q_heads + h) * d_dim;
+    // 落盘只由切片 0 做(同组各 warp 的归并结果逐位相同 ⇒ 冗余写无必要)
+    if (sub == 0) {
+        T* o = out + ((long long)t * q_heads + h) * d_dim;
 #pragma unroll
-    for (int j = 0; j < OWL_NC_DPL_MAX; ++j) {
-        if (j < dpl) o[d0 + j] = NcConv<T>::fromf(ag[j] / lg);
+        for (int j = 0; j < DPLN; ++j) {
+            if (j < dpl) o[d0 + j] = NcConv<T>::fromf(ag[j] / lg);
+        }
     }
 }
 

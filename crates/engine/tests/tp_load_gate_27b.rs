@@ -315,9 +315,9 @@ fn read_all<S: owl_models::module::WeightSource + ?Sized>(
     key: &str,
     dtype: owl_models::contract::Dtype,
 ) -> Option<Vec<u8>> {
-    let n = src.elem_len(key)?;
+    let n = src.elem_len(key).ok()??;
     let mut buf = vec![0u8; n * dtype.size_bytes()];
-    src.convert_chunk_into_bytes(key, 0, n, &mut buf, dtype)?;
+    src.convert_chunk_into_bytes(key, 0, n, &mut buf, dtype).ok()??;
     Some(buf)
 }
 
@@ -406,7 +406,8 @@ async fn source_body(dir: &Path) {
             let mut got = vec![0u8; n_s * w_s.dtype.size_bytes()];
             sharded
                 .convert_chunk_into_bytes(key, 0, n_s, &mut got, w_s.dtype)
-                .unwrap_or_else(|| panic!("{key}: 分片源读失败"));
+                .unwrap_or_else(|_| panic!("{key}: 分片源读失败"))
+                .unwrap_or_else(|| panic!("{key}: 分片源缺键"));
 
             // 参考 = plan_span 的正向读序列(与装载面同一纯算术)
             let segs: Vec<usize> = match rule {
@@ -541,7 +542,7 @@ async fn repack_body(dir: &Path, ordinal: usize) {
             face.dtoh(&e.block, &mut got).await.expect("dtoh 设备块");
             // 源矩形(与装载同一条 ShardedSource)
             let mut raw = vec![0u8; n * 4]; // U32 字
-            let ok = sharded.convert_chunk_into_bytes(key, 0, n, &mut raw, e.dtype).is_some();
+            let ok = sharded.convert_chunk_into_bytes(key, 0, n, &mut raw, e.dtype).ok().flatten().is_some();
             if !ok {
                 fails.push(format!("{key}: 源矩形读失败(参考面)"));
                 continue;

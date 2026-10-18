@@ -1,24 +1,13 @@
-# ============================================================================
-# 长 ctx 归因档(perf 会话自建;2026-10-15;基座 = spec-27b-prod.toml)
-# ============================================================================
-# 目的:把「长上下文下 prefill/decode 变慢」按算子/步骤归因。
-# 启动(必需 flavor = **spec-dflash**,同生产形状):
-#   CUDA_VISIBLE_DEVICES=GPU-89dffb90-... \
-#     ./target/release/server --flavor spec-dflash testdata/args/perf-ctxladder-27b.toml \
-#       --log-level info
+# 长 ctx 阶梯档 —— 扫到 32768,故几何放大到 40960/41216(生产 16384/16896);
+# 行为面(量化/注意力臂/池 dtype/采样/白名单)全取 flavor `spec-dflash`。
 #
-# 与生产档的三处**有意**差异:
-#  1. 几何放大到 **40960 / 41216**(生产 16384/16896):要扫到 32768 点;
-#     fp8 池 per_tok 53248B ⇒ 41216 tok ≈ 2.2G(3090 Ti 24G 容得下)。
-#  2. `sampling`(生产 greedy):随机词池 OOD 下 greedy 秒 EOS ⇒ decode 读数伪影
-#     (bench-27b-std.toml 头注同款教训)。
-#  3. `[probes] perf_level = "host"` 显式钉死 + `[cuda] trace_ring` 开(发射账)。
-#     host 档零/近零税(实测 0.29%,perf-framework §8.5);要逐核再在**线**切
-#     `gpu` 档(同一二进制;CUPTI 有 ~5.4% 税,不与 host 基线混算)。
+# **自包含**:站点面(模型路径 / 端口)写死在本档 —— 不依赖任何本地档;
+# 换机器 = 改下面 [model] 的两行路径(其余不动)。
 #
-# 其余行为面(白名单/臂/池 dtype)全部来自 flavor `spec-dflash`,不在此重复 ——
-# 换了 flavor 就是换了引擎(见 testdata/args/README.md)。
-# ============================================================================
+# 启动: ./target/release/server --flavor spec-dflash testdata/args/perf-ctxladder-27b.toml \
+#         --log-level info [--perf-level gpu]
+# 钉卡: CUDA_VISIBLE_DEVICES=<UUID>(建议)或 [runtime] device = { bdf = "41:00.0" }
+# 发射账(只在做宿主命令账时显式加回,缺省不开):[cuda] trace_ring = 65536
 
 [model]
 kind = "awq27b"
@@ -27,31 +16,8 @@ dflash2_dir = "/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16"
 name = "qwen3.8-27b"
 
 [runtime]
-device = 0
 max_seq = 40960
-prefill_chunk = 512
 bind = "127.0.0.1:8138"
 
 [pool]
 pool_tokens = 41216
-gdn_slots = 8          # 单并发测速用不到;留格给后续并发点(启动校验 ≥ max_concurrency)
-snap_max = 1
-prefix_cache = false   # 交叉会话前缀命中会把 prefill 数字拉飞(bench 档同款纪律)
-
-[spec]
-depth = 7
-
-[sampling]
-mode = "sampling"
-temp = 1.0
-topk = 20
-topp = 0.95
-rep_penalty = 1.0
-
-[probes]
-step_profile = false   # 诊断时开:量 verify 图独占墙时([verify-prof];吃 decode +50ms/轮)
-perf_level = "host"
-
-[cuda]
-trace_ring = 65536     # 发射账(27B 一次 prefill+decode ≈ 3.6 万条)
-srv_timing = false     # 图节点类型直方图(boot 期 debug 级;A/B 已结)
