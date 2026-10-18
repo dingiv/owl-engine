@@ -1108,6 +1108,12 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
                     .collect();
                 let mut b_ref: Vec<i32> = Vec::new();
                 owl_kernels::family::marlin::repack::pack_marlin_b_fused(&p32, &idx, rows * k / 8, &mut b_ref);
+                // 现场账(2026-10-17):GPU 块字数 n vs CPU 参考字数 b_ref.len()
+                // —— 分片档实测两者不等(⇒ 索引表/字数口径在分片维上错位)
+                eprintln!(
+                    "[load-verify] {} rows={rows} cols={cols} k={k} n={n} p32={} idx={} b_ref={}",
+                    w.key, p32.len(), idx.len(), b_ref.len()
+                );
                 let mut bad = 0usize;
                 for (i, w) in gbuf.chunks_exact(4).enumerate() {
                     let got = i32::from_le_bytes([w[0], w[1], w[2], w[3]]);

@@ -33,7 +33,8 @@ use std::collections::HashMap;
 
 use crate::contract::{Dtype, ModelError};
 use crate::module::{Layout, LoaderCtx, LoaderOps, WeightSource};
-use crate::plan::rules::{rule_of, WeightRule};
+use crate::plan::rules::{rule_of, want_axis, WantAxis, WeightRule};
+use crate::plan::span::segments_in_key_units;
 use crate::plan::span::{plan_span, SourceSpan};
 use crate::plan::tp::TpPlan;
 
@@ -56,34 +57,45 @@ pub struct SpanEntry {
 /// 为什么需要:层的 `Want.shape` 已经是**按分片 spec 建的分片形状**
 /// (`ModelSpec::sharded` 先行)—— 而 [`SourceSpan`] 的映射基准是**源的全量
 /// 形状**。等分切分的逆是唯一的:全量 = 分片 × shard(分段切逐段同律)。
+///
+/// `axis`(2026-10-17):量化 marlin 产物是 **k-major** ⇒ "切 out" 落在第 1 维。
 fn inflate(
     shape: &[usize],
     rule: WeightRule,
     plan: TpPlan,
     segs: &[usize],
+    axis: WantAxis,
 ) -> Result<Vec<usize>, String> {
     let mut full = shape.to_vec();
+    let w = plan.world();
+    let mul = |v: usize| -> Result<usize, String> {
+        v.checked_mul(w).ok_or_else(|| "inflate: 维溢出".to_string())
+    };
+    // 规则 → want 自身坐标系的维度(与 `plan_span` 同一套映射)
+    let dim_of_out = if axis == WantAxis::KMajor { 1 } else { 0 };
+    let dim_of_k = if axis == WantAxis::KMajor { 0 } else { 1 };
     match rule {
         WeightRule::Replicate => {}
-        WeightRule::UniformCol | WeightRule::PerHead => {
-            full[0] = shape[0]
-                .checked_mul(plan.world())
-                .ok_or_else(|| "inflate: out 维溢出".to_string())?;
+        WeightRule::PerHead => {
+            full[0] = mul(shape[0])?;
+        }
+        WeightRule::UniformCol => {
+            full[dim_of_out] = mul(shape[dim_of_out])?;
         }
         WeightRule::UniformRow => {
             if shape.len() < 2 {
                 return Err(format!("inflate: UniformRow 需要 ≥2 维(得 {shape:?})"));
             }
-            full[1] = shape[1]
-                .checked_mul(plan.world())
-                .ok_or_else(|| "inflate: in 维溢出".to_string())?;
+            full[dim_of_k] = mul(shape[dim_of_k])?;
         }
         WeightRule::SegmentedCol(_) => {
-            // 段长是**分片口径**(层按分片 spec 声明)→ 全量段长 = 每段 × shard
-            let seg_sum: usize = segs.iter().sum();
-            full[0] = seg_sum
-                .checked_mul(plan.world())
-                .ok_or_else(|| "inflate: 段长溢出".to_string())?;
+            // 全量维 = 分片维 × shard(**键自身维口径**)。
+            // ⚠️ 不能用"段长合计 × shard":段长声明是**逻辑单位**(q_gate/k_dim/
+            //    v_dim),而打包派生键的 n 侧单位不同(`zeros` = n_pack/8)——
+            //    2026-10-17 首跑就栽在这(算出 [160, 8192] vs 层侧 [160, 1024])。
+            //    段长→键单位的换算在下面 ①b 单独做。
+            let _ = segs;
+            full[dim_of_out] = mul(shape[dim_of_out])?;
         }
     }
     Ok(full)
@@ -110,15 +122,40 @@ pub fn build_shard_pass(
     let plan = TpPlan::new(ctx.slice_id, ctx.shard).map_err(ModelError::Msg)?;
     for w in ops.wants_mut() {
         let rule = rule_of(&w.key);
+        let axis = want_axis(&w.key);
         let shard_segs: &[usize] = w.segments.as_deref().unwrap_or(&[]);
         if rule == WeightRule::Replicate {
             continue; // 不切:直通
         }
+        // ⚠️ **CPU marlin 物化键不可矩形切**(2026-10-17):`.qweight`/`.qweight_a8`
+        //    的 flat 序是 marlin B 的 **tile 排列**,分片的 marlin B **不是**全量的
+        //    子矩形(换序也不成)⇒ 分片档必须走 `device_repack`(源侧取原始
+        //    packed 矩形,上卡后由 `owl_ct_repack` 出本 rank 的 marlin B)。
+        //    响亮拒,不静默出错值。
+        if ctx.shard > 1 && (w.key.ends_with(".qweight") || w.key.ends_with(".qweight_a8")) {
+            return Err(ModelError::Msg(format!(
+                "build_shard_pass: {} 是 CPU marlin 物化键,不可矩形切(shard={})—— \
+                 分片档请开 device_repack(源侧取 packed_raw 矩形 + 设备重排)",
+                w.key, ctx.shard
+            )));
+        }
         // ① 分片形状 → 源全量形状(段长同为分片口径 ⇒ 每段 × shard)
-        let full_shape = inflate(&w.shape, rule, plan, shard_segs).map_err(ModelError::Msg)?;
-        let full_segs: Vec<usize> = shard_segs.iter().map(|s| s * plan.world()).collect();
+        let full_shape = inflate(&w.shape, rule, plan, shard_segs, axis).map_err(ModelError::Msg)?;
+        let mut full_segs: Vec<usize> = shard_segs.iter().map(|s| s * plan.world()).collect();
+        // ①b **段长单位换算**(层侧逻辑单位 → 键自身维单位;唯一实现见
+        //    `plan::span::segments_in_key_units`;2026-10-17 定谳)
+        if matches!(rule, WeightRule::SegmentedCol(_)) {
+            let dim = if axis == WantAxis::KMajor { 1 } else { 0 };
+            full_segs = segments_in_key_units(
+                &full_segs,
+                full_shape[dim],
+                &w.key,
+                dim,
+            )
+            .map_err(ModelError::Msg)?;
+        }
         // ② 全量形状 → 读计划 + 期望分片形状
-        let (span, expect_shard) = plan_span(rule, &full_shape, plan, &full_segs)
+        let (span, expect_shard) = plan_span(rule, &full_shape, plan, &full_segs, axis)
             .map_err(ModelError::Msg)?
             .ok_or_else(|| {
                 ModelError::Msg(format!(
@@ -138,13 +175,31 @@ pub fn build_shard_pass(
         let src_elems: usize = full_shape.iter().product();
         let tgt_elems: usize = w.shape.iter().product();
 
-        // 布局同步:DeviceRearrange 的 rows = out、cols = in/8(源口径)→ 分片口径
-        if let Layout::DeviceRearrange { op, rows, cols } = w.layout {
-            let (r, c) = match rule {
-                WeightRule::UniformRow => (rows, plan.shard_len(cols).map_err(ModelError::Msg)?),
-                _ => (plan.shard_len(rows).map_err(ModelError::Msg)?, cols),
-            };
-            w.layout = Layout::DeviceRearrange { op, rows: r, cols: c };
+        // 布局同步(**2026-10-17 定谳修正**):`DeviceRearrange{rows,cols}` 由**层**
+        // 按**分片 spec** 声明(`rows = out_shard`、`cols = k_shard/8`)—— 与
+        // `w.shape` **同尺**。故分片 pass **不得再切一次**:
+        //   原实现在此又 `plan.shard_len` 了一道 ⇒ **双切** ⇒ staged 矩形
+        //   (`rows*cols`)与发射 grid 都只剩**一半** ⇒ GPU 重排只写了 marlin B
+        //   的前半,**后半是未初始化内存** ⇒ 27B TP2 前向爆炸(NaN)。
+        //   实测证据:门 `tp_load_gate_27b::tp_repack_27b` 的对照臂 —— `shard=1`
+        //   22 键全绿(不走本 pass)、`shard=2` 44 键全红;装载器自带
+        //   `OWL_LOAD_VERIFY` 现场账 `rows=4096 cols=640 n=5242880`(n 对、
+        //   rows 只有一半)一锤定音。
+        // **不变量**(这里显式钉死):rows/cols == `w.shape`(分片形状)。
+        if let Layout::DeviceRearrange { op, .. } = w.layout {
+            if axis != WantAxis::Logical {
+                return Err(ModelError::Msg(format!(
+                    "build_shard_pass: {} 是 KMajor 序却挂了 DeviceRearrange(rows/cols 语义不明;拒绝)",
+                    w.key
+                )));
+            }
+            if w.shape.len() != 2 {
+                return Err(ModelError::Msg(format!(
+                    "build_shard_pass: {} 挂 DeviceRearrange 但形状非 2 维({:?};拒绝)",
+                    w.key, w.shape
+                )));
+            }
+            w.layout = Layout::DeviceRearrange { op, rows: w.shape[0], cols: w.shape[1] };
         }
         spans.insert(
             w.key.clone(),

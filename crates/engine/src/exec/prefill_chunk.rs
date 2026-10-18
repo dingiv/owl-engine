@@ -472,6 +472,14 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         Ok(Some(PrefillTail { tok: b, seed_hidden: seed_keep }))
     }
 
+    /// 取证面 rank 标识(TP2 双 rank 同进程 ⇒ 同一 `boot_seq`、同一 tag;
+    /// `mfact` 是 `counter_set` 语义 ⇒ 后写覆盖、前值丢失。pf 系列打点必须带
+    /// rank,否则"单卡 vs 双卡"对拍拿到的是混合值(2026-10-17 实测踩到)。
+    /// 单卡档恒 0(与历史 tag 语义等价)。
+    fn tp_rank(&self) -> usize {
+        self.tp.as_ref().map(|t| t.plan.rank()).unwrap_or(0)
+    }
+
     /// fin 校验(dtoh 一块 hidden 打点):`pf_fin_check` 走 FNV 指纹(mfact),
     /// `prefill_cksum` 走 |x| 之和(两档历史打点各自保留 —— 字段语义不同,
     /// 不能合并成一套)
@@ -802,7 +810,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                         }
                         mfact(
                             host.boot_seq,
-                            &format!("pf.c{}.pre.g{j}.{sn}", base),
+                            &format!("pf.r{}.c{}.pre.g{j}.{sn}", self.tp_rank(), base),
                             fnv_bytes(&sb) & 0x7fff_ffff_ffff_ffff,
                         );
                     }
@@ -833,7 +841,18 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             };
             for (i, r) in roots.iter().enumerate() {
                 let n: usize = r.shape().iter().product();
-                let mut b = vec![0u8; n * 2];
+                // 形状/元素数上屏(2026-10-17 三版;env 门控 —— 判读量级前
+                // **必须先看形状**(形状不同时量级不可比,踩过)
+                if i < 24 && owl_shared::env_reader::flag("OWL_PF_TAPS") {
+                    eprintln!(
+                        "[pf-tap] rank{} {} shape={:?} dtype={:?} n={n}",
+                        self.tp_rank(), names[i], r.shape(), r.dtype()
+                    );
+                }
+                // ⚠️ **按 dtype 定宽**(2026-10-17 三版):原硬编码 `n*2` ⇒
+                // **f32 拍只 dtoh 一半字节**,再按 f32 解 = 垃圾(量级探针
+                // 的 2308/64928 就是这类伪影,不是模型值)。
+                let mut b = vec![0u8; n * r.dtype().size_bytes()];
                 {
                     let face = self.graphs.session.face_mut();
                     let res = face.dtoh(&outs[i], &mut b).await;
@@ -844,9 +863,66 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                 }
                 mfact(
                     host.boot_seq,
-                    &format!("pf.c{base}.{}", names[i]),
+                    &format!("pf.r{}.c{base}.{}", self.tp_rank(), names[i]),
                     fnv_bytes(&b) & 0x7fff_ffff_ffff_ffff,
                 );
+                // **量级探针**(2026-10-17 S6 诊断):逐层 |x| 和(f16 位型解回)。
+                // 为什么另立一条:哈希面对"多根 eval 的块覆盖"敏感(实测单卡/双卡
+                // 全异,零信息量),而**量级**即便被覆盖也只在同阶内跳 —— 逐层
+                // 爆炸/塌陷仍一眼可见(定位 TP 前向在哪层溢出)。
+                {
+                    // 读法 = **均值 |x|**(形状无关:分片与全量的元素数不同,
+                    // 和不可比 —— 2026-10-17 首版踩到)+ 非有限计数 + 元素数。
+                    // 打包:高 20 位 = 非有限数,低 40 位 = mean|x| × 1e4,
+                    // 再各留一格:元素数以 2^20 为单位塞进次高位。
+                    // **dtype 感知**(2026-10-17 二版:首版硬按 f16 解,f32 拍
+                    // 出来的均值是垃圾 ⇒ 单卡/双卡的"同一拍"可能 dtype 不同,
+                    // 比值全乱)。
+                    let dt = r.dtype();
+                    let (w, mut sum, mut bad, mut cnt, mut mx) =
+                        (dt.size_bytes(), 0f64, 0usize, 0usize, 0f32);
+                    for c in b.chunks_exact(w) {
+                        let v = match dt {
+                            owl_iface::contract::Dtype::F16 => {
+                                half::f16::from_le_bytes([c[0], c[1]]).to_f32()
+                            }
+                            owl_iface::contract::Dtype::F32 => {
+                                f32::from_le_bytes([c[0], c[1], c[2], c[3]])
+                            }
+                            _ => f32::NAN,
+                        };
+                        cnt += 1;
+                        if v.is_finite() {
+                            sum += (v as f64).abs();
+                            if v.abs() > mx {
+                                mx = v.abs();
+                            }
+                        } else {
+                            bad += 1;
+                        }
+                    }
+                    let mean = if cnt > 0 { sum / cnt as f64 } else { 0.0 };
+                    let mean_q = ((mean * 1e4) as u64).min(0xff_ffff_ffff);
+                    mfact(
+                        host.boot_seq,
+                        &format!("pf.m.r{}.c{base}.{}", self.tp_rank(), names[i]),
+                        ((bad.min(0xffff) as u64) << 40) | mean_q,
+                    );
+                    // **max|x|**(2026-10-17 二版):均值会掩盖离群 —— 判"输入是否
+                    // 有界"(RMSNorm 输出应 ~γ 量级)必须看 max。
+                    let maxq = ((mx * 1e3) as u64).min(0xff_ffff_ffff);
+                    let dt_code = match dt {
+                        owl_iface::contract::Dtype::F16 => 1u64,
+                        owl_iface::contract::Dtype::F32 => 2,
+                        owl_iface::contract::Dtype::BF16 => 3,
+                        _ => 9,
+                    };
+                    mfact(
+                        host.boot_seq,
+                        &format!("pf.x.r{}.c{base}.{}", self.tp_rank(), names[i]),
+                        (dt_code << 56) | maxq,
+                    );
+                }
                 if i == roots.len() - 1 {
                     let d_model = d.hidden;
                     bisect_fin_block = Some((
@@ -871,7 +947,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                         }
                         mfact(
                             host.boot_seq,
-                            &format!("pf.c{}.post.g{j}.{sn}", base),
+                            &format!("pf.r{}.c{}.post.g{j}.{sn}", self.tp_rank(), base),
                             fnv_bytes(&sb) & 0x7fff_ffff_ffff_ffff,
                         );
                     }

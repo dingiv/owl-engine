@@ -480,6 +480,22 @@ async fn marlin_w4a16_awq_parity() {
             .map(|m| (m, 1024usize, 512usize))
             .collect();
     cases.push((512, 5120, 5120)); // 生产:qkvz/o-proj 同维族(m=chunk)
+    // **27B 分片(T2=2)真实形状**(2026-10-17 S6 追加):TP 后每 rank 的
+    // n/k 都减半 —— 此前本表**零覆盖**(全量维度也没覆盖,只有 0.8B 族)。
+    // 列的是 27B 各 Linear 的 (m=chunk 64, n_shard, k_shard):
+    //   out_proj   n=5120 k=3072(nv/2*hv)  · down_proj n=5120 k=8704(inter/2)
+    //   gate/up    n=8704 k=5120           · q_proj    n=6144 k=5120
+    //   k/v_proj   n=512  k=5120           · in_proj_qkvz n=8192 k=5120
+    for (m, n, k) in [
+        (64usize, 5120usize, 3072usize),
+        (64, 5120, 8704),
+        (64, 8704, 5120),
+        (64, 6144, 5120),
+        (64, 512, 5120),
+        (64, 8192, 5120),
+    ] {
+        cases.push((m, n, k));
+    }
     for (m, n, k) in cases {
         let (noise_ratio, max_abs) = run_awq_case(&mut client, m, n, k).await;
         eprintln!("[awq] m={m} n={n} k={k} g=32 → 噪声/信号RMS={noise_ratio:.6} max_abs={max_abs:.5}");
@@ -583,7 +599,22 @@ async fn ct_repack_a8_parity() {
 #[tokio::test]
 async fn ct_repack_parity() {
     let mut client = assemble();
-    for (out_dim, k) in [(1024usize, 5120usize), (5120usize, 5120usize), (17408usize, 5120usize)] {
+    // **27B 分片(T2=2)真形状**(2026-10-17 追加):此前只有全量维
+    // (1024/5120/17408 × 5120)⇒ **分片档的 GPU 重排零覆盖** —— 而
+    // `packed_raw`(量化权重唯一真实数据面)的分片档正是走这条 GPU 重排
+    // (`DeviceRearrange`),装载门的字节对拍**必须跳过它**(重排不可交换)。
+    for (out_dim, k) in [
+        (1024usize, 5120usize),
+        (5120usize, 5120usize),
+        (17408usize, 5120usize),
+        // 27B 各 Linear 的 (n_shard, k_shard):
+        (8704, 5120), // gate/up
+        (5120, 8704), // down_proj(k 切)
+        (5120, 3072), // out_proj(k 切)
+        (6144, 5120), // q_proj
+        (512, 5120),  // k/v_proj
+        (8192, 5120), // in_proj_qkvz
+    ] {
         let rows = out_dim;
         let cols = k / 8;
         let packed: Vec<i32> = (0..rows * cols).map(|i| (i as i32).wrapping_mul(0x9E3779B1_u32 as i32) ^ 0x1234_5678).collect();

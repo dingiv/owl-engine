@@ -82,8 +82,83 @@ pub(crate) fn tail(key: &str, pat: &str) -> bool {
     }
 }
 
+/// **派生键尾巴**(量化族:同一份源数据的**布局产物**,不是语义键)。
+/// 规则表按**语义键**匹配 ⇒ 查规则前必须先剥掉它们(2026-10-17 定谳:
+/// 不剥 ⇒ 回落 `Replicate` ⇒ 分片区间不翻译 ⇒ 两 rank 读同一段)。
+pub const DERIVED_SUFFIXES: &[&str] = &[
+    ".qweight",
+    ".qweight_a8",
+    ".packed_raw",
+    ".scales",
+    ".scales_a8",
+    ".zeros",
+    ".zeros_a8",
+    ".marlin_ws",
+    ".marlin_ctmp",
+    ".a8_factor",
+];
+
+/// 剥派生后缀 → 语义基键(未命中则原样返回)。
+pub fn base_key(key: &str) -> &str {
+    for s in DERIVED_SUFFIXES {
+        if let Some(b) = key.strip_suffix(s) {
+            return b;
+        }
+    }
+    key
+}
+
+/// **非数据派生件**(scratch / 标量):形状由层按分片 spec 直接声明,
+/// **不参与区间翻译** —— 规则一律 [`WeightRule::Replicate`](内容无意义:
+/// `marlin_ws` 是内核暂存区、`marlin_ctmp`/`a8_factor` 是单元素/标量)。
+/// 不排除它们 = 会被当成融合权重的段切目标而形状不符 ⇒ 无谓拒启。
+const SCRATCH_SUFFIXES: &[&str] = &[".marlin_ws", ".marlin_ctmp", ".a8_factor"];
+
+/// 是否非数据派生件(见 [`SCRATCH_SUFFIXES`])
+pub fn is_scratch_key(key: &str) -> bool {
+    SCRATCH_SUFFIXES.iter().any(|s| key.ends_with(s))
+}
+
+/// **want 形状的坐标序**(规则表按**逻辑** `[out, k]` 写)。
+///
+/// 量化族的 marlin 布局产物是 **k-major**(`[k 侧, n 侧]`;物理序由打包函数
+/// 定死,改序会让内核读错):`scales`/`zeros` 的打包索引就是 `g*out + o`
+/// (`pack_marlin_z` 注释"(out, groups) → 转置 (groups, n=out)"),
+/// `qweight` 的 marlin B 视图同理。
+/// `packed_raw`(原始 AWQ packed)反而是 **n-major** `[out, k/8]` ⇒ Logical。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WantAxis {
+    /// `[out, k…]`(规则表原生坐标):`.weight` / `.packed_raw` / `A_log` …
+    Logical,
+    /// `[k…, out…]`(marlin 布局产物):`.qweight` / `.scales` / `.zeros`(含 a8 族)
+    KMajor,
+}
+
+/// 键 → 坐标序(唯一映射点;span 层据此把规则的"切哪一维"落到真实维度)。
+pub fn want_axis(key: &str) -> WantAxis {
+    const KMAJOR: &[&str] = &[
+        ".qweight",
+        ".qweight_a8",
+        ".scales",
+        ".scales_a8",
+        ".zeros",
+        ".zeros_a8",
+    ];
+    if KMAJOR.iter().any(|s| key.ends_with(s)) {
+        WantAxis::KMajor
+    } else {
+        WantAxis::Logical
+    }
+}
+
 /// **键 → 规则**(唯一入口;探测顺序从具体到一般)。
 pub fn rule_of(key: &str) -> WeightRule {
+    // 非数据派生件(scratch/标量):一律不切(形状已按分片 spec 声明)
+    if is_scratch_key(key) {
+        return WeightRule::Replicate;
+    }
+    // 派生键(量化布局产物)与语义键**同规则** ⇒ 先剥后缀(2026-10-17)
+    let key = base_key(key);
     // 去掉 `.weight`/`.bias` 尾巴(规则按语义 token 匹配)
     let k = key
         .strip_suffix(".weight")

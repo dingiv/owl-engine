@@ -21,6 +21,8 @@ owl-comm = { path = "../backends/comm" }
 half = "2"
 
 [dev-dependencies]
+# 重排面门(TP 装载:设备块 vs CPU marlin 参考)
+owl-kernels = { path = "../kernels" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 owl-cpu = { path = "../backends/cpu" }
 owl-macros = { path = "../macros" }

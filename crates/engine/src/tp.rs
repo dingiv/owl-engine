@@ -193,6 +193,17 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
                 "TP v1 不支持读数类探针 {bad_probes:?}(入队半必须零同步;见 on_peer 契约)"
             ));
         }
+        // ④ 量化档:2026-10-17 定谳的"两 rank 读同一段"已修(§22.4 落地;
+        //    派生键规则 + want 坐标序 + 列段切)。此处只做**一致性自证** ——
+        //    两 rank 的量化方案必须同档(混档 = 权重语义不同,比的是两台机器)。
+        if loadeds[0].quant_plan() != loadeds[1].quant_plan() {
+            return loud(format!(
+                "TP 两 rank 量化方案不一致(rank0={:?} / rank1={:?})—— 权重语义不同,拒绝",
+                loadeds[0].quant_plan(),
+                loadeds[1].quant_plan()
+            ));
+        }
+
         let mut loadeds = loadeds.into_iter();
         let (l0, l1) = (
             loadeds.next().expect("world = 2 已守门"),
@@ -498,7 +509,39 @@ async fn retire_rank(dev: &mut RankDev<GpuClient>, tag: &str) -> Option<ModelErr
     first
 }
 
+/// 单 rank 的 staging 游标三元组(`(produced, consumed, err)`;见
+/// [`RunningEngine::tp_staging_state`])。
+async fn staging_state_of(dev: &mut RankDev<GpuClient>) -> Result<(u64, u64, u32)> {
+    let Some(tp) = dev.tp.clone() else {
+        return loud("TP staging: 无 TpCtx(装配路径错)");
+    };
+    let Some(mut f) = dev.graphs.face_clone() else {
+        return loud("TP staging: face 句柄耗尽");
+    };
+    let mut buf = [0u8; 32];
+    f.dtoh(&tp.own, &mut buf).await?;
+    Ok((
+        u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+        u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+        u32::from_le_bytes(buf[28..32].try_into().unwrap()),
+    ))
+}
+
 impl RunningEngine<GpuClient> {
+    /// **TP staging 游标三元组**(诊断出口;文档 §20.4 的工具口):
+    /// `(rank0 的 (produced, consumed, err), rank1 的同款)`;单卡 = `None`。
+    ///
+    /// 判据(**每 turn 之后**):两侧都必须 `produced == consumed` 且 `err == 0`
+    /// —— 否则 AR 未配对(超时 / 头校验失败 / 序列不同步)。装配期自证在
+    /// [`TpEngine::assemble`];本口是每 turn 之后的同一判据。
+    pub async fn tp_staging_state(&mut self) -> Result<Option<((u64, u64, u32), (u64, u64, u32))>> {
+        let Some(p) = self.peer.as_mut() else { return Ok(None) };
+        let a = staging_state_of(&mut self.dev).await?;
+        let b = staging_state_of(p).await?;
+        Ok(Some((a, b)))
+    }
+
+
     /// **执行态 TP 收尾**(T1 门与生产停止路径共用):rank0 束 + peer 束各走
     /// [`retire_rank`](卸图 → `PeerRelease`)。
     ///

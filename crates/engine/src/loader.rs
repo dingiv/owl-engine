@@ -49,6 +49,12 @@ pub(crate) struct RankModel {
 }
 
 impl LoadedModel {
+    /// 量化方案(装配期护栏消费面;S6 2026-10-17:TP 档暂不支持量化档,
+    /// 见 `tp.rs` 的 ④ 护栏与 `docs/arch/TP2-施工设计.md` §22)。
+    pub fn quant_plan(&self) -> owl_models::module::QuantPlan {
+        self.quant_plan
+    }
+
     /// 拆件:`(rank 侧模型件, tokenizer)`。
     pub(crate) fn into_parts(self) -> (RankModel, Tokenizer) {
         let LoadedModel { model, tokenizer, rope, spec, quant_plan, mtp_dir } = self;

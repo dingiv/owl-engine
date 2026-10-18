@@ -2549,7 +2549,12 @@ mod f16_tests {
     #[tokio::test]
     async fn gpu_norm_act_f16_matches_host() {
         if !gpu_enabled() { eprintln!("skip"); return; }
-        let (rows, vd, gs) = (3usize, 32usize, 8usize);
+        // 维度可经 env 覆盖(2026-10-17):真实档 = **rows=分块长(62/128)、
+        // vd=value_dim(分片 3072 / 全量 6144)、gs=hv_dim(128)** —— 原档
+        // (3,32,8) 对 27B 的"组数 × 组长"零覆盖。
+        let ev = |k: &str, d: usize| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+        let (rows, vd, gs) = (ev("OWL_NA_ROWS", 3), ev("OWL_NA_VD", 32), ev("OWL_NA_GS", 8));
+        eprintln!("[norm-act] rows={rows} vd={vd} gs={gs}(组数 {})", vd / gs);
         let x: Vec<f32> = q(&(0..rows * vd).map(|i| ((i as f32 * 0.41) - 3.0).sin()).collect::<Vec<_>>());
         let z: Vec<f32> = q(&(0..rows * vd).map(|i| ((i as f32 * 0.19) - 1.0).cos()).collect::<Vec<_>>());
         let gamma: Vec<f32> = q(&(0..gs).map(|i| (i as f32 * 0.05) - 0.1).collect::<Vec<_>>());
@@ -2713,7 +2718,14 @@ mod f16_tests {
     async fn gpu_conv_fwd_varlen_matches_expansion() {
         if !gpu_enabled() { eprintln!("skip"); return; }
         let (nk, kd, t, slot) = (2usize, 16usize, 8usize, 0usize);
-        let d = nk * kd;
+        // 通道维 d 可经 env 覆盖(2026-10-17):conv 是**逐通道**深度卷积,正确性
+        // 理应无关 d —— 但 27B 分片档的 d = value_dim = **3072**(全量 6144)、
+        // 原档只有 d=32 ⇒ 真实维度零覆盖(同"门没覆盖的那一格"律)。
+        let d = std::env::var("OWL_CONV_D")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(nk * kd);
+        eprintln!("[conv-fwd] d={d}");
         let w: Vec<f32> = q(&(0..d * 4).map(|i| ((i as f32 * 0.13) - 0.5).sin()).collect::<Vec<_>>());
         let x: Vec<f32> = q(&(0..t * d).map(|i| ((i as f32 * 0.31) - 1.0).sin()).collect::<Vec<_>>());
 
@@ -2772,9 +2784,36 @@ mod f16_tests {
     #[tokio::test]
     async fn gpu_recurrence_varlen_matches_expansion() {
         if !gpu_enabled() { eprintln!("skip"); return; }
-        let (nk, nv, kd, vd, t, slot) = (2usize, 2usize, 16usize, 32usize, 8usize, 0usize);
+        // ⚠️ **GQA 比必须覆盖**(2026-10-17):原档只有 ratio 1(nk=nv=2),
+        //    而 **27B 是 nk=16 / nv=48(ratio 3)**、0.8B 是 ratio 1
+        //    —— 只测 ratio 1 = 27B 的真实路径零覆盖(同 AR 载荷尺寸/马林
+        //    分片形状两案:门覆盖不到的那一格就是 bug 藏身处)。
+        // 档 = (nk, nv, kd, vd):
+        //   ① ratio 1 小维(原档)· ② ratio 3 小维 · ③ **27B 分片真维**
+        //   (nk=8/nv=24/kd=128/vd=128;`kd ≤ 128` 是 s_buf 寄存器硬上界 —— 压线)
+        for (nk, nv, kd, vd) in [
+            (2usize, 2usize, 16usize, 32usize),
+            (2, 6, 16, 32),
+            (8, 24, 128, 128),
+        ] {
+            eprintln!("[gdn-recur] GQA 比 {} nk={nk} nv={nv} kd={kd} vd={vd}", nv / nk);
+            recur_vs_expansion(nk, nv, kd, vd).await;
+        }
+    }
+
+    /// 单档:recurrence varlen == T×delta_dec 展开(原体;维度由调用方给)
+    async fn recur_vs_expansion(nk: usize, nv: usize, kd: usize, vd: usize) {
+        let (t, slot) = (8usize, 0usize);
         let qv: Vec<f32> = q(&(0..t * nk * kd).map(|i| ((i as f32 * 0.17) - 1.0).sin()).collect::<Vec<_>>());
-        let kv: Vec<f32> = q(&(0..t * nk * kd).map(|i| ((i as f32 * 0.23) - 0.5).cos()).collect::<Vec<_>>());
+        // ⚠️ **k 必须归一化**(2026-10-17):delta 规则的收缩性依赖 |k|²≈1;
+        //    未归一化时 |k|² = kd ⇒ kd=128 档状态每步放大 ~64× ⇒ **两核都
+        //    f16 溢出**(-inf vs -inf),判据失效(实测踩到)。除 √kd 后各档
+        //    量级一致,才比得出核的真错。
+        let kv: Vec<f32> = q(
+            &(0..t * nk * kd)
+                .map(|i| ((i as f32 * 0.23) - 0.5).cos() / (kd as f32).sqrt())
+                .collect::<Vec<_>>(),
+        );
         let vv: Vec<f32> = q(&(0..t * nv * vd).map(|i| ((i as f32 * 0.29) + 0.3).sin()).collect::<Vec<_>>());
         let gv: Vec<f32> = q(&(0..t * nv).map(|i| -0.05 - (i as f32 % 4.0) * 0.02).collect::<Vec<_>>());
         let bv: Vec<f32> = q(&(0..t * nv).map(|i| 0.9 - (i as f32 % 4.0) * 0.05).collect::<Vec<_>>());
@@ -2839,7 +2878,11 @@ mod f16_tests {
         }
         let mut abuf = vec![0u8; t * nv * vd * 2];
         gpu.dtoh(&out_a, &mut abuf).await.unwrap();
-        assert_close_rel(&unhalf(&abuf), &outs, 1e-4, "recurrence vs expansion");
+        // 容差口径(2026-10-17 校正):输出是 **f16**,量级 ~26 时其自身
+        // 舍入 = 26×2⁻¹⁰ ≈ 0.025(相对 ~1e-3)⇒ 1e-4 是**假红**(两核求和序
+        // 不同,差异本就该在 f16 精度内)。取 2e-3:仍能抓结构错(错值/错头),
+        // 不再被 f16 噪声打红。
+        assert_close_rel(&unhalf(&abuf), &outs, 2e-3, "recurrence vs expansion");
         // 终态双锚
         let mut sa = vec![0u8; nv * kd * vd * 4];
         let mut sb = vec![0u8; nv * kd * vd * 4];
@@ -2847,8 +2890,11 @@ mod f16_tests {
         gpu.dtoh(&st_b_b, &mut sb).await.unwrap();
         for (i, (a, b)) in sa.chunks_exact(4).zip(sb.chunks_exact(4)).enumerate() {
             let (va, vb) = (f32::from_le_bytes(a.try_into().unwrap()), f32::from_le_bytes(b.try_into().unwrap()));
-            // varlen = warp 树归约 / 展开 = 顺序累加:求和序不同,容差取相对
-            assert!((va - vb).abs() <= 1e-5 * (1.0 + vb.abs()), "state[{i}] {va} vs {vb}");
+            // varlen = warp 树归约 / 展开 = 顺序累加:求和序不同,容差取相对。
+            // 2026-10-17 校正:1e-5 对 t=8 步的 f32 递推**过紧**(实测 ratio 3
+            // 时 7.6e-5 相对 = 纯求和序噪声),放宽到 1e-4 —— 仍能抓结构错
+            // (错头/错步 = 量级差)。
+            assert!((va - vb).abs() <= 1e-4 * (1.0 + vb.abs()), "state[{i}] {va} vs {vb}");
         }
         gpu.close().await.unwrap();
     }

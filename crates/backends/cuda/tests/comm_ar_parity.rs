@@ -245,13 +245,21 @@ async fn comm_ar_parity() {
         (10 << 10, Dtype::F32),
         (10 << 10, Dtype::F16),
     ];
+    // **27B 真实载荷尺寸**(2026-10-17 S6 追加):hidden 5120 f16
+    //   · 1 行(解码)= 10KB;· 128 行(chunk 128)= 1.31MB;· 1024 行 = 10.5MB
+    //   —— f16 大载荷此前**未被覆盖**(原表 1MB/32MiB 只测 f32)
+    let tp27b: [(usize, Dtype); 3] = [
+        (5120 * 2, Dtype::F16),
+        (128 * 5120 * 2, Dtype::F16),
+        (1024 * 5120 * 2, Dtype::F16),
+    ];
     let big: [(usize, Dtype); 3] = [
         (1 << 20, Dtype::F32),
         ((SLOT as usize), Dtype::F32),
         ((SLOT as usize) + 1, Dtype::F32),
     ];
     let mut g1_cases = 0usize;
-    for (i, (bytes, dt)) in small.iter().chain(big.iter()).enumerate() {
+    for (i, (bytes, dt)) in small.iter().chain(tp27b.iter()).chain(big.iter()).enumerate() {
         eprintln!("[G1] case {i}: {bytes}B {dt:?} …");
         let w = width(*dt);
         // 元素取整:参与 AR 的完整元素 = bytes/w;分配 = 向上取整(尾部不满元素

@@ -28,7 +28,7 @@ use owl_models::formats::qwen35::{qwen3_5_0_8b, Qwen35Convention};
 use owl_models::formats::spec::SpecSource;
 use owl_models::model::{Model, ModelSpec};
 use owl_models::module::{LoadEntry, LoadManifest, QuantPlan};
-use owl_models::plan::rules::{rule_of, WeightRule};
+use owl_models::plan::rules::{rule_of, want_axis, WeightRule};
 use owl_models::plan::span::plan_span;
 use owl_models::plan::tp::TpPlan;
 
@@ -80,6 +80,7 @@ fn entry_by_tail<'a>(m: &'a LoadManifest, tail: &str) -> Option<&'a LoadEntry> {
 
 /// 按规则把全量向量切成"本 slice 的那一段"(参考实现 = plan/tp 原语)
 fn expected_slice(
+    key: &str,
     rule: WeightRule,
     shape: &[usize],
     plan: TpPlan,
@@ -89,7 +90,7 @@ fn expected_slice(
     // 参考 = plan_span 的"全量 → 分片"正向读序列(与装载面同一条纯算术;
     // ⚠️ 行宽两维不同:目标 = 分片行宽,源 = **全量**行宽 —— 列切时二者不等,
     // 这正是 2026-10-17 首跑踩到的错位)
-    let (span, shard_shape) = plan_span(rule, shape, plan, segs).expect("plan_span").expect("需切分");
+    let (span, shard_shape) = plan_span(rule, shape, plan, segs, want_axis(key)).expect("plan_span").expect("需切分");
     let tgt_w = shard_shape[1..].iter().product::<usize>().max(1);
     let src_w = shape[1..].iter().product::<usize>().max(1);
     let n_tgt: usize = shard_shape.iter().product();
@@ -170,7 +171,7 @@ async fn tp_load_body(dir: &Path) {
             _ => Vec::new(),
         };
         // ① 形状:分片 shape == plan_span 的期望
-        let (_span, want_shape) = plan_span(rule, &ef.shape, plan, &segs)
+        let (_span, want_shape) = plan_span(rule, &ef.shape, plan, &segs, want_axis(&ef.key))
             .expect("plan_span")
             .unwrap_or_else(|| panic!("{tail} 应当被切分"));
         assert_eq!(es.shape, want_shape, "{tail}: 分片形状");
@@ -179,7 +180,7 @@ async fn tp_load_body(dir: &Path) {
         let ns: usize = es.shape.iter().product();
         let vf = dtoh_f32(&mut face, ef.block.id, nf).await;
         let vs = dtoh_f32(&mut face, es.block.id, ns).await;
-        let want = expected_slice(rule, &ef.shape, plan, &segs, &vf);
+        let want = expected_slice(&ef.key, rule, &ef.shape, plan, &segs, &vf);
         assert_eq!(vs.len(), want.len(), "{tail}: 元素数");
         if vs != want {
             let pos = vs.iter().zip(want.iter()).position(|(a, b)| a != b);

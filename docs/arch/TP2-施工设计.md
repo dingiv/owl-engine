@@ -1222,3 +1222,317 @@ top-N**(N 默认 5,`OWL_G8B_TOPN` 可调),否则硬失败;**分歧即止**;首�
     cargo test -p owl-engine --test tp_determinism_gate -- --nocapture   # G8-a
   # … --test tp_g8_gate(OWL_G8B_TOPN 调 N)· --test tp_transport_bits_gate(OWL_TP_SAME_DEV 指同卡档卡)
   ```
+
+---
+
+## 22. S6 前哨:27B TP 乱码定谳(2026-10-17;TP 性能测试被此阻断)
+
+### 22.1 现象(可复现,确定性)
+
+| 臂 | 产物 |
+|---|---|
+| TP1 单卡 27B AWQ | 连贯(长城介绍通顺;17×23 = 391) |
+| TP2 27B(3080 对 2/3、3090 Ti 对 0/1;chunk 128/1024;w4a16/w4a8) | **纯乱码**,且跨卡对**逐字复现**(确定性) |
+| TP2 0.8B(f16) | 连贯(17×23 = 391)—— 与 T1–T3 门一致 |
+
+boot 面全绿:分档 Window / staging 握手 / 自证 `produced=0 consumed=0 err=0` /
+两 rank 图捕获;每卡 12.5G(27B @3080)。
+
+### 22.2 ★ 根因:`rule_of` 不认量化派生键 ⇒ 分片区间**没翻译**
+
+`crates/models/src/plan/rules.rs::rule_of` 只剥 `.weight`/`.bias` 尾巴。而
+**量化档的 want 键是派生键**(`{base}.qweight` / `.packed_raw` / `.scales` /
+`.zeros` / `.marlin_ws` / `.marlin_ctmp`)⇒ 一律回落 `WeightRule::Replicate`
+⇒ `build_shard_pass` **`continue` 跳过**(不进 span 表)⇒ `ShardedSource` 直通
+内层源 ⇒ **两个 rank 读到同一段(全量前段)**。
+
+**硬证据**(新门 `crates/engine/tests/tp_load_gate_27b.rs`,真 27B 检查点、
+只截 4 层、GPU face、`device_repack=false`):
+
+```
+✗ …layers.0.mlp.gate_proj.qweight: slice0 变了(len 22282240 vs 44564480;== 全量前段? true)
+✗ …layers.0.mlp.gate_proj.qweight: slice1 变了(len 22282240 vs 44564480;== 全量前段? true)
+… 160 条全同型(复制键检查 252 次 / 分片键检查 30 次;失败 160)
+```
+
+两 rank 读同一段 ⇒ 两侧部分和**逐位相同** ⇒ AR 把同一份部分和加了两遍 ⇒
+输出全错。这也解释了 `pf_bisect` 实测"rank0 == rank1 全层一致"。
+
+**为什么 0.8B 门全绿**:0.8B 是 f16,键名以 `.weight` 结尾 ⇒ `rule_of` 命中
+⇒ 区间正常翻译。**f16 分片路径无罪,量化派生键路径从未被门覆盖。**
+
+### 22.3 附带定谳(取证面两条,防后人重踩)
+
+1. **`pf_bisect` 逐层 checksum 不能用于"单卡 vs 双卡"对拍** —— 0.8B(输出
+   正确)上 `c0.embed` 同样不一致(多根 eval 的块覆盖,§18.5.1 的"只信孤立
+   eval"是同一条);本机实测 450/450 全异,零信息量。
+2. **`mfact` 打点双 rank 同 tag**:`boot_seq` 在 `into_running` 只分配一次,
+   两 rank 共用 ⇒ `counter_set` 后写覆盖、前值丢失(单卡/双卡对拍会拿到
+   混合值)。已在 `exec/prefill_chunk.rs` 的 pf 系列打点加 **rank 前缀**
+   (`pf.r{rank}.…`);`mfact` 的原注("AR 后两侧同值 ⇒ 幂等")只对**真的同值**
+   成立 —— 本次就是"两侧同值但都错"的反例。
+
+### 22.4 修法(设计;未施工)
+
+**核心矛盾:派生键的 want 形状坐标系不统一**(规则表按逻辑 `[out, k]` 写):
+
+| 键(27B gate_proj,full) | want 形状 | out 在哪维 | k 在哪维 | 规则表要求 |
+|---|---|---|---|---|
+| `packed_raw`(生产档) | `[17408, 640]` = `[out, k/8]` | dim0 | dim1 | Col→dim0 ✓ |
+| `scales` | `[160, 17408]` = `[k/32, out]` | **dim1** | dim0 | Col→dim0 ✗ |
+| `zeros` | `[160, 2176]` = `[k/32, out/8]` | **dim1** | dim0 | Col→dim0 ✗ |
+| `qweight`(CPU 物化档) | `[320, 34816]` = `[k/16, out×2]`(marlin 视图) | **dim1** | dim0 | Col→dim0 ✗ |
+
+两条候选路(择一,须用户裁决):
+
+- **A(推荐,单一约定)**:把**全部**量化派生 want 规范化到**逻辑序**
+  (`n 侧 = dim0`,`k 侧 = dim1`),物理序(转置/marlin 平铺)由
+  `Layout::DeviceRearrange{rows, cols}` 与源适配器承载。这样 `rule_of`
+  只需补"剥派生后缀",span 数学与段切**原样复用**;代价 = 动 `Linear::layout`
+  的声明形状 + `AwqSource` 的供数序(或加一个转置视图)。
+- **B(局部补丁)**:`build_shard_pass` 里对派生键**换维**(Col↔Row),并给
+  `SourceSpan` 加"列段切"能力。**不推荐** —— 段切(`q_proj`/`in_proj_qkvz`/
+  `conv1d` 的量化变体)在转置序下是 dim1 段,现有词汇
+  (`Rows`/`RowsSeg`/`Cols` 单窗)表达不了,要扩词汇;两套坐标系并存 = 本仓
+  最忌的"接口不唯一"。
+
+**门的归属**:`tp_load_gate_27b` 是本次新增的**真检查点**门(0.8B 门覆盖不到
+派生键/合成键/段切/打包口径四件);修好后它必须转绿,并纳入 S6 回归。
+
+### 22.5 本轮落地清单(worktree `feat/w4a8-p1`,未提交)
+
+- **server TP 启动档**(S4e 引擎双 actor 的 v1 形态):
+  `RuntimeCfg.tp_ordinals`(`shared/config.rs`)+ `Devices` 设备束 /
+  `resolve_tp_devices`(`apps/server/src/config.rs`)+ `actor_main` TP 分支
+  与双卡锁(`apps/server/src/main.rs`);**actor/HTTP 面零改动**。
+- **flavor `tp27b`**(`assets/flavors/`;TP 形状 + f16 族白名单 + 通信族两项)
+  与对照档 `testdata/args/bench-27b-tp{1,2}.toml`。
+- **门 `tp_load_gate_27b`**(上文)+ **pf 打点 rank 前缀**(取证面修)。
+- **量化档护栏(已落)**:`tp_v1_check_quant(QuantPlan)`(engine 唯一判据)
+  在 `assemble_with_staging` 的第 ④ 条护栏上,非 `F16` ⇒ **响亮拒**并指到
+  本节;实测 27B TP2 启动即拒(消息含修法指向),f16 TP2 照常起。
+  ⚠️ 临时件 —— §22.4 的 A 刀落地后撤。
+- 顺带查出(本基座存量,main 上可能已修):flavor `awq27b` 缺
+  `max_concurrency = 1`(单卡也起不来)+ 白名单是 fp8 族而缺省 `kv_fp8=false`。
+
+### 22.6 TP2 吞吐实测(2026-10-17;**权重错误档**,仅供吞吐参考)
+
+护栏临时旁路(`TEMP-BENCH`)后跑 std 五点三轮(`--ignore-eos`;3080 对 =
+CUDA ordinal 2/3;档 = `tp27b`,max_seq/pool 8704、chunk 1024、greedy;
+与 TP1 基准档**逐项同参**,唯一差别 = rank 数)。数据
+`/tmp/owl-bench/tp2-3080-std.{csv,json}`(TP1 = `tp1-3080-std.csv`)。
+
+⚠️ **口径警告**:本档权重是错的(§22.2 的 bug),但**计算形状/AR 流量/访存
+与修好后完全一致** ⇒ 吞吐数字**有参考价值**;输出内容不可用。
+
+| ctx | TP2 prefill t/s | TP2 decode t/s | TP2 TTFT | TP1 prefill | TP1 decode | TP1 TTFT |
+|---:|---:|---:|---:|---:|---:|---:|
+| 512 | 234.3 | 38.72 | 2186.7ms | 961.8 | 32.43 | 534.1ms |
+| 1024 | 236.4 | 38.59 | 4334.5ms | 978.3 | 32.20 | 1048.7ms |
+| 2048 | 236.4 | 37.87 | 8663.7ms | 985.7 | 31.93 | 2079.9ms |
+| 4096 | 236.5 | 38.47 | 17323.2ms | 982.1 | 31.98 | 4172.7ms |
+| 8192 | 236.2 | 38.22 | 34690.1ms | 963.0 | 31.06 | 8509.2ms |
+
+**比值:prefill 0.24×(!!)· decode 1.20× · TTFT@8192 4.07×**。
+
+#### 定谳候选 1:AR 的**大载荷**代价失控(prefill 崩盘的直接账)
+
+- decode 面:TP2 26.0ms/tok vs TP1 31.3ms/tok ⇒ 省 5.3ms;而"权重读减半"的
+  理论收益 = 15.2G→7.6G/rank ⇒ 20ms→10ms(**应省 10ms**)⇒ AR 吃掉约
+  4.7ms/tok;按 64 层 × 2 处行并行 ≈ 128 次 AR ⇒ **≈ 37µs/AR**(PCIe 往返
+  + 自旋,量级合理)。
+- prefill 面:TP2 512 tok 用 2.18s,TP1 0.53s ⇒ 多出 1.65s;同样 ~128 次 AR
+  ⇒ **≈ 12.9ms/AR**。载荷 = 512×5120×2B = **5.24MB** ⇒ 有效 **~400MB/s**
+  (对 P2P 13.2GB/s 差 **33×**)。
+- **两侧差 350×**(37µs vs 12.9ms)⇒ 不是"AR 慢",是**大载荷路径**另有
+  串行化(候选:分片传输逐段同步 / 入队半-收割半强制 host 往返 / staging
+  槽 32MiB 下的分段回环)。**这是 TP 线的头号性能立案**。
+- 另注:prefill 逐点**完全平坦**(234~236),说明代价与 ctx 无关而与
+  **token 数**(= AR 载荷)成正比 ⇒ 与"每 AR 固定开销"一致。
+
+#### 定谳候选 2:TP2 跑 8 点后**段错误**(新立案)
+
+第 8 点(第 2 轮 @2048)返回 `out=0` / 耗时 14.2s,随后 server
+**SIGSEGV(core dumped)**。前 7 点全正常。初判方向:池累积(8 请求 KV)+
+AR/staging 交互(或 §22.2 的错误权重把某处索引带飞)。**未定位**,列 TP 线
+第二个立案;复现配方 = 上述 std 臂(8 点即现)。
+
+---
+
+## 23. S6 前哨②:27B TP 前向 NaN 定位链(2026-10-17 深夜;未结)
+
+### 23.1 现象(最小复现)
+
+- TP1 27B 单卡:正常(logits min −10.4 / max 27.1);
+- TP2 27B(3080 对 2/3 或 3090 Ti 对 0/1):**logits = ±f32::MAX + NaN**,
+  输出与输入**无关**(两个不同 prompt 逐字同串),贪心 = `"!!!!…"`、sampling
+  同串 ⇒ **前向数值爆炸**,不是采样/模板问题;
+- TP2 **0.8B**:正常 ⇒ 与"双 rank 机制"无关。
+
+**最小复现(单层)**:`tools/trunc_ckpt_layers.py <N>` 造截断检查点(改
+safetensors 头 + 重排 data_offsets;**索引 JSON 无用** —— `open_raw_index` 是
+扫文件头),`OWL_27B_DIR=<截断目录>` 指向它即可。**N=1 单层 GDN 已复现 NaN**
+⇒ 病灶在**一层之内**,不需要跨层二分。
+
+### 23.2 已洗清(每条都有门/实证,勿重开)
+
+| 面 | 证据 |
+|---|---|
+| **装载(全部键)** | 新门 `tp_load_gate_27b`:源级对拍 **142 次全过**(含 `packed_raw` 这唯一真实权重数据面;绕开重排直拍源字节) |
+| **AR 核** | `comm_ar_parity` 扩 3 档 = **27B 真实载荷**(1.31MB / 10.5MB f16)→ 11 case 全绿 |
+| **AR 接线** | turn 后游标 r0=r1=(128,128,0) err=0;`tp.ar` 计数对称(256/256);两 rank 逐层 tap 一致 |
+| **marlin AWQ GEMM** | `marlin_parity` 扩 **6 个 27B 分片形状**(out_proj/down_proj/gate/up/q/k/v/in_proj_qkvz)→ 噪声 5e-4 全绿 |
+| **GDN recurrence** | `gpu_recurrence_varlen_matches_expansion` 扩 **27B 真维 (nk=8,nv=24,kd=128,vd=128)** → 三档全绿 |
+| **RowParallel 切法** | 层侧 `in_dim` = 分片 k 宽 ⇒ 装载映射到全量 k 的**对应段** ⇒ 与各 rank 的 ColParallel 输出匹配(手核,无双重切) |
+
+途中修掉的**门自身伪影**(都是"门覆盖不到 ⇒ 假绿/假红"):
+① `pf_bisect` 逐层 checksum **不可**用于单卡/双卡对拍(0.8B 正常模型上 170/170 全异);
+② 量级探针必须 **dtype 感知 + 用均值**(形状不同时和不可比);
+③ GDN 门原用**未归一化 k**(|k|²=kd ⇒ kd=128 时两核同溢出)+ 容差 1e-4 对
+f16 量级 26 是假红(state 1e-5 → 1e-4 同为伪影)。
+
+### 23.3 已定位(单层 tap 量级,17 根 → 无覆盖,可信)
+
+`OWL_PF_STAGES=0` + `pf_bisect` 在 **N=1 模型**上(TP1 vs TP2-r0/r1):
+
+| 站点 | TP1 | TP2 | 比值 | 备注 |
+|---|---:|---:|---:|---|
+| embed / n1 | 0.00800 / 0.66040 | 同 | **1.00** | 层输入逐位相同 ✓ |
+| gq / gk / gv | 1.91 / 1.94 / 2.10 | 1.25 / 1.35 / 1.24 | 0.65/0.70/0.59 | 分片头数统计差异(可接受) |
+| **gvc** | 0.1815 | 0.0425 | **0.23** | ⚠️ conv 输出 4× 偏小 |
+| gqn / gkn / gg / gbeta | — | — | 1.18/1.30/0.75/1.00 | 可接受 |
+| **mixed** | 0.0178 | **1.4187** | **79.7** | ✗ **首个爆炸点**;r0==r1 ⇒ AR 无辜 |
+| h / n2 | 0.0204 / 0.0743 | 1.4189 / 0.729 | 69.6 / 9.8 | 残差流被污染 |
+| **mlp** | 0.0138 | **2308.8** | **167303** | ✗ f16 溢出 ⇒ inf |
+| fin | 0.2211 | 0.9996 | 4.5 | 已 NaN/含非有限 |
+
+**读法**:`mixed` = `out_proj(norm_act(rec) ⊙ gate)`(GDN mixer 输出,**AR 后**)
+—— 而 `norm_act` 是 RMSNorm(有界)⇒ **79.7× 不可能来自 recurrence 的量级**;
+两侧一致 ⇒ **AR 无辜**。⇒ 病灶在 **GDN mixer 的"norm_act → ⊙gate → out_proj"
+段或 `gvc` 那条 v 链**。
+
+### 23.4 下一步(留给下一刀)
+
+1. **`gvc` = 0.23× 是唯一"输入侧"异常** ⇒ 先查 conv 链:
+   `owl_gdn_conv_fwd_f16` / `owl_gdn_conv_upd_dual_f16` 在 **分片 value_dim
+   (3072)与全量(6144)** 的覆盖 —— 现有 conv 门用 nk=2/kd=16(d=32)/dim=12
+   **完全没覆盖真实维度**(与 AR 载荷、marlin 形状、GDN 真维三案同型:
+   **门没覆盖的那一格就是 bug 藏身处**)。
+2. 若 conv 无罪:给 mixer 内部加 tap(`y` = recurrence 输出、`gated` = norm_act
+   输出)—— 注意 `ctx.gdn_tap` 是 **8 件定长契约**(DFlash fold 按序消费),
+   加件必须同步 fold,或另开一条 `gdn_tap2` 诊断链。
+3. 定位后:`tp_load_gate_27b` + 上述四门作为回归;再撤 §22 的量化护栏(若已撤,
+   则补回一次冒烟)。
+
+---
+
+## 24. ★ S6 定谳:`DeviceRearrange` 双切 —— 27B TP 前向爆炸的总根因(2026-10-17 结案)
+
+### 24.1 根因(一行代码)
+
+`formats/shard.rs::build_shard_pass` 里,量化权重键(`packed_raw`)的**布局**
+被**又切了一道**:
+
+```rust
+// 原(错):rows/cols 再 shard_len 一次
+WeightRule::UniformRow => (rows, plan.shard_len(cols)?),
+_ => (plan.shard_len(rows)?, cols),
+```
+
+而**层是按分片 spec 声明**这个布局的 —— `Linear::layout` 传的是
+`self.out_dim`(**分片后的 out**)、`self.in_dim/8`(**分片后的 k/8**)⇒
+`DeviceRearrange{rows,cols}` 与 `w.shape` **同尺**。⇒ 再切一次 = **双切**:
+
+| | 正确 | 双切后 |
+|---|---|---|
+| `w.shape`(= `n` 来源) | `[8192, 640]` | 同(未动) |
+| `DeviceRearrange.rows/cols` | `(8192, 640)` | **`(4096, 640)`** ✗ |
+| staged 矩形(`rows×cols`) | 5,242,880 字 | **2,621,440 字(一半)** ✗ |
+| 发射 grid `(rows/64, cols/2)` | `(128, 320)` | **`(64, 320)`(一半)** ✗ |
+
+⇒ GPU 重排只写了 marlin B 的**前半**,**后半是未初始化显存** ⇒ 量化 Linear
+的 B 矩阵半垃圾 ⇒ 前向逐层放大到 f16 溢出 ⇒ **NaN**。
+（0.8B 是 f16、无 `packed_raw` 键 ⇒ 从未踩到;`shard=1` 不走本 pass ⇒
+对照臂永远绿 —— 这正是"门覆盖不到的那一格"。）
+
+### 24.2 证据链(为什么能一路查到这一格)
+
+1. **`tp_load_gate_27b::tp_repack_27b`(本轮新建,重排面门)**:设备字节 vs
+   **CPU 参考**(源矩形 → `pack_marlin_b_fused`)。
+   - **对照臂 `shard=1`:22 键全绿**(⇒ 参考实现正确,不是假红);
+   - `shard=2`:44 键全红 ⇒ **病灶在分片路径**;
+2. **装载器自带 `OWL_LOAD_VERIFY=1` 现场账**一锤定音:
+   `rows=4096 cols=640 k=5120 n=5242880 p32=2621440 idx=20971520 b_ref=2621440`
+   —— `n` 对(5,242,880 = 8192×640)、`p32` 只有一半、`idx` 表 8× 过长;
+3. **单层复现**(`tools/trunc_ckpt_layers.py 1`)把病灶锁进一层之内;
+4. 此前已逐项洗清:装载源读取(142 键源级对拍)、AR(载荷尺寸 3 档 + 游标)、
+   marlin GEMM(6 个分片形状)、GDN recurrence(真维)、conv(真维)、
+   norm_act(真维)、silu_mul(逐元素)、GPU 重排核(9 个分片形状)——
+   **每一格单独都对,错的是"分片 pass 与层声明不同尺"这一格**。
+
+### 24.3 修法(已落)
+
+```rust
+// 不变量:rows/cols == w.shape(分片形状)—— 显式钉死,不再二次切分
+if let Layout::DeviceRearrange { op, .. } = w.layout {
+    if axis != WantAxis::Logical { /* 响亮拒 */ }
+    if w.shape.len() != 2 { /* 响亮拒 */ }
+    w.layout = Layout::DeviceRearrange { op, rows: w.shape[0], cols: w.shape[1] };
+}
+```
+
+### 24.4 验收(全绿)
+
+- **重排面门:66 键全绿**(原 44 红);
+- **TP2 27B 冒烟连贯**:长城(完整中文推理)+ `17×23 = 391` ✓;
+- **std 15/15 全绿**(含此前必崩的第 8 点 —— **段错误随垃圾权重一起消失**);
+- 回归:`owl-models` 206/206 · workspace check 0 错 · 0.8B 装载门 8/8 ·
+  源级门 142/142。
+
+### 24.5 性能现状(同二进制 A/B,3080 单卡 vs 3080 对)
+
+| 指标 | TP1 单卡 | TP2 双卡 | 比 |
+|---|---:|---:|---:|
+| prefill t/s | **968.66** | 236.20 | **0.244×** |
+| decode t/s | 32.01 | **38.65** | **1.207×** |
+| TTFT@512 | 534ms | 2179ms | 4.1× |
+| TTFT@8192 | 8579ms | 34669ms | 4.0× |
+
+⇒ **正确性已闭环;性能瓶颈 100% 在 AR 通道**(prefill ≈ **12.9ms/AR** vs
+decode ≈ **37µs/AR**;AR 核 = **单 block 256 线程** `family/comm.rs::BLOCK`)。
+这与"通道要单独拉出去测/提速"的判断一致 —— 通道是独立工作面(载荷 1.31MB
+时有效带宽仅 ~400MB/s,对 P2P 13.2GB/s 差 33×)。
+
+### 24.6 教训提炼(四条律 + 取证面五纪律;下次遇"门全绿但前向错"先照此表走)
+
+**① 门覆盖律 —— "门没覆盖的那一格就是 bug 藏身处"**。本轮**四次同型**命中:
+AR 核门只测 10KB/1MB **f32** ⇒ 27B 的 **1.31MB f16** 载荷零覆盖;marlin 对拍
+只测**全量维** ⇒ **分片**形状零覆盖;GDN recurrence 门只有 **ratio 1** ⇒ 27B
+是 **ratio 3** 且 `kd=128` 压线;GPU 重排门只有全量形状 ⇒ 分片形状零覆盖。
+⇒ 新档位(TP / 新维 / 新 dtype)上线前,**先补该档"最极端格子"的门**(成本 ~10 行)。
+
+**② 对照臂纪律(门必须自证)**。门要自带"**已知绿**"的对照臂,否则无法区分
+"参考写错(假红)"与"被测错(真红)"。本轮:`shard=1` 22 键全绿 / `shard=2` 44 键
+全红 ⇒ 一句话钉到分片路径;无对照臂时那 44 条红只会被当成"门不可靠"而放过。
+
+**③ 声明面同尺不变量(双切/双算之根)**。两处声明同一件事时(层声明的
+`DeviceRearrange{rows,cols}` vs pass 推的"分片形状"),**必须钉死二者相等** ——
+各推一遍 = **双切**,且**两处单独看都对**,只有乘积错。⇒ 凡"声明 + 推导"并存,
+**推导处必须 `断言 == 声明`**,声明为唯一真源,推导量不得被下游当"源"再用。
+
+**④ 爆炸三件一起读:形状 → max → 非有限计数**。"均值 79.7×"曾把人引偏
+(norm_act 有界 ⇒ 不可能);真凶是**"输入有界(max 7.03)却输出饱和(max 64928
+≈ f16 上限)"**这条非线性矛盾。⇒ 先读**形状**(不同形状的和不可比)、再读
+**max**(均值掩盖离群)、再读**非有限计数**(首个 inf 的位置 = 病灶段)。
+
+**⑤ 取证探针自身五纪律**(本轮修掉 4 处伪影 + 1 处探针 bug):
+哈希面**不可跨 rank 数比**(0.8B 正常模型上 170/170 全异;`mfact` 双 rank 同 tag
++ `counter_set` = 后写覆盖 ⇒ 打点必须带 **rank 前缀**);`dtoh` 缓冲**按 dtype 定宽**
+(原硬编码 `n*2` ⇒ f32 拍半读 = 垃圾);**容差匹配 dtype 精度**(f16 量级 26 时
+1 ulp ≈ 1e-3 ⇒ 1e-4 是假红);**合成输入满足算子数值前提**(delta 规则要 `|k|²≈1`,
+否则 kd=128 时两核**同溢出** = 判据失效);**诊断路径 ≠ 生产路径**
+(`forward_bisect_stages` 用分离 add/rmsnorm,真实前向用 `FusedAddRmsnorm` 原地副作用)。
+
+**⑥ "三流无保序"已证伪为本 bug 成因**(`launch_sync = true` ⇒ 数值逐字不变),
+但隐患面真实:`Htod`/`UploadPinned` → **只 H2D**、`Launch` → **只 COMPUTE**
+(无隐式序;staging header 初始化已有显式 `sync`)⇒ 单列工作面。

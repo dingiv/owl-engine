@@ -981,9 +981,16 @@ impl LoaderOps {
 
     /// **定向标注段长**(S4 ②;推荐形态):只对键尾匹配的 want 生效
     /// (`in_proj_qkvz` / `conv1d` / `q_proj` 这类融合权重,由它们的构造者声明)。
+    ///
+    /// **匹配面 = 语义基键**(2026-10-17):量化档的 want 键是派生键
+    /// (`q_proj.packed_raw` / `q_proj.scales` / …),只用 `tail` 会**漏标**
+    /// ⇒ 段切键在 `plan_span` 处"段长为空"拒启。段长声明 = **语义单位**
+    /// (q_gate / k_dim / v_dim);派生键的 n 侧若是打包单位(scales: n_pack、
+    /// zeros: n_pack/8),由 `build_shard_pass` 按形状等比换算(非整除则拒)。
     pub fn with_segments_for(mut self, key_tail: &str, segs: Vec<usize>) -> Self {
         for w in &mut self.wants {
-            if crate::plan::rules::tail(&w.key, key_tail) {
+            let bk = crate::plan::rules::base_key(&w.key);
+            if crate::plan::rules::tail(bk, key_tail) {
                 w.segments = Some(segs.clone());
             }
         }
