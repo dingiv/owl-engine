@@ -34,6 +34,14 @@ pub enum EngineReq {
     /// **窄语义**:只终结**当前活跃** turn(GDN 格/块链正常回收,
     /// 引擎可继续接新请求);无活跃 turn 时为 no-op。
     Abort { session: u64 },
+    /// **tokenize 旁路**(G5③;`POST /tokenize`):不落 turn、不碰池/图。
+    /// 应答走 oneshot(取消安全:请求方走了则发失败,不许静默)。
+    Tokenize {
+        text: String,
+        /// 先套家族单轮包装(与裸文本提交同一律);false = 纯文本编码
+        chat_wrap: bool,
+        reply: tokio::sync::oneshot::Sender<Result<owl_engine::TokenizeReply, String>>,
+    },
 }
 
 /// 事件投递(律 #1:不许静默丢弃可失败返回值)。
@@ -92,19 +100,10 @@ pub async fn run_actor<D: DeviceClient>(
     loop {
         // ① 阻塞等首个请求(通道关 = 引擎退役)
         let Some(req) = rx.recv().await else { return };
-        // 取消请求(AoT 客户端主动 abort):立刻弃置活跃 turn
-        if let EngineReq::Abort { session } = &req {
-            drop_turn(running, &mut sinks, *session).await;
-        } else {
-            accept(running, &mut sinks, req).await;
-        }
+        handle_req(running, &mut sinks, req).await;
         // ② 排空积压(pump 前收完,保证收发不相交)
         while let Ok(req) = rx.try_recv() {
-            if let EngineReq::Abort { session } = &req {
-                drop_turn(running, &mut sinks, *session).await;
-            } else {
-                accept(running, &mut sinks, req).await;
-            }
+            handle_req(running, &mut sinks, req).await;
         }
         // ③ 泵到排空,事件按 turn 路由
         loop {
@@ -130,14 +129,14 @@ pub async fn run_actor<D: DeviceClient>(
                         ev,
                         TurnEvent::Completed { .. } | TurnEvent::Failed { .. }
                     );
-                    if terminal {
-                        if let Some(turn) = event_turn(&ev) {
-                            cache_reported.remove(&turn);
-                            pending_cache.remove(&turn);
-                        }
-                    }
                     // AGT-12:本 turn 首个事件之前先把真值 `cached_tokens` 发出去
                     // (块级前缀缓存命中只有 begin 后才知道;短 turn 无第二次机会)
+                    //
+                    // ⚠️ **次序纪律(2026-10-19 修)**:本段必须在**终态清理之前** ——
+                    // 旧序把 `pending_cache.remove` 放在 terminal 分支里先跑,把
+                    // "终态前一帧"静默删掉 ⇒ 客户端看到 submit 估值(新会话 = 0)而
+                    // 引擎实际命中 9k(实测 9130-tok 冷会话整前缀:引擎日志 复用面
+                    // m=285/285=9120,客户端 cached=0)。丢帧 = 已记账的 bug,顺序固定。
                     if let Some(t) = event_turn(&ev) {
                         if let Some(cached) = pending_cache.remove(&t) {
                             if cache_reported.insert(t) {
@@ -148,6 +147,18 @@ pub async fn run_actor<D: DeviceClient>(
                                     )
                                     .await;
                                 }
+                            }
+                        }
+                    }
+                    if terminal {
+                        if let Some(turn) = event_turn(&ev) {
+                            cache_reported.remove(&turn);
+                            // 兜底:正常已被上面取走(留下的 = 号不匹配的脏项)
+                            if pending_cache.remove(&turn).is_some() {
+                                owl_shared::log_debug!(
+                                    "actor",
+                                    "turn {turn} 终态时仍有待发校正帧(已丢弃)"
+                                );
                             }
                         }
                     }
@@ -228,6 +239,31 @@ async fn drop_turn<D: DeviceClient>(
     session: u64,
 ) {
     abandon_turn(running, sinks, &format!("客户端 abort(session {session:#x})")).await;
+}
+
+/// 单条请求处置:Abort = 弃置活跃 turn;Tokenize = 旁路(不落 turn);
+/// Chat = 交 [`accept`]。
+///
+/// ⚠️ **Tokenize 在 actor 线程内跑**(与采样同线程 ⇒ 排在当前 turn 之后):
+/// 这是“tokenizer 单一真源”(归属 `RunningEngine`)的代价;工量 = 毫秒级 CPU。
+/// 若将来要“生成期间也能查”,把 tokenizer 克隆进 HTTP 层的前提是引擎侧
+/// 先导出 `chat_wrap + try_encode` 的组合面(否则包装律两份)—— 另案。
+async fn handle_req<D: DeviceClient>(
+    running: &mut RunningEngine<D>,
+    sinks: &mut HashMap<u64, mpsc::Sender<SinkEvent>>,
+    req: EngineReq,
+) {
+    match req {
+        EngineReq::Abort { session } => drop_turn(running, sinks, session).await,
+        EngineReq::Tokenize { text, chat_wrap, reply } => {
+            let out = running.tokenize(&text, chat_wrap);
+            if reply.send(out).is_err() {
+                // 请求方已断开(不许静默:这是可失败返回值)
+                owl_shared::log_debug!("actor", "tokenize 应答投递失败(请求方已断开)");
+            }
+        }
+        req => accept(running, sinks, req).await,
+    }
 }
 
 /// 登记并提交(预算越界/空 prompt 在 submit 边界落地为 Rejected)

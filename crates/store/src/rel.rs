@@ -23,7 +23,7 @@ use crate::id::{ChainHash, PrefixId, SnapKey};
 use crate::kv::{CacheUpdate, KvStats};
 use crate::leg::{BlockLeg, ChainHit, LegConfig, LegStats};
 use crate::policy::{AdmissionPolicy, EvictCandidate, EvictPolicy, Leg, LruPolicy};
-use crate::state::{StateStats, StateStore};
+use crate::state::{SnapDurability, StateStats, StateStore};
 use crate::host::SlotTable;
 use owl_iface::contract::{ConnSlot, SwapPiece};
 use crate::tier::{AssetKind, Tier, TierLedger, TierReport};
@@ -298,6 +298,19 @@ impl Rel {
         self.snap_host.used_bytes()
     }
 
+    /// 状态腿宿主块**大页提示未生效的块数**（0 = 全生效）。
+    /// >0 不是错误：只是冷写回到 4 KiB 缺页速度（159 MiB 约 80ms vs 12ms）——
+    /// 引擎在下沉点打点上报（不许静默）。
+    pub fn snap_host_hint_failures(&self) -> usize {
+        self.snap_host.hint_failures()
+    }
+
+    /// 状态腿宿主层**累计逐出的字节**(政策面:宿主满时逐最冷条目)。
+    /// 引擎在下沉点读差分上报(store 不引日志依赖)。
+    pub fn snap_host_evicted_bytes(&self) -> u64 {
+        self.snap_host.evicted_bytes()
+    }
+
     /// 状态腿宿主层**还能装几条快照**。
     pub fn snap_host_free_slots(&self) -> usize {
         let used = self.snap_host.used_bytes() + self.snap_host.free_bytes();
@@ -446,18 +459,74 @@ impl Rel {
 
     /// **快照下沉计划**(设备槽 `slot` 上的快照 → 宿主)。
     /// `Busy` = 快照不在账/宿主层已满(零副作用,调用方跳过)。
+    ///
+    /// **不重要就不搬**(2026-10-19):生成段边界快照逐出即丢 —— 下沉一条
+    /// 159 MiB ≈ **50 ms**(实测,页锁定外的 PCIe 速),而生成段每 32 tok 就出
+    /// 一条 ⇒ 全下沉 = 每 token 数 MiB 级 PCIe 流量,不可承受。拒语即事实
+    /// (调用方回落已有"沉不下⇒丢"路;见 [`SnapDurability`])。
     pub fn plan_snap_offload(&mut self, key: SnapKey, slot: u32) -> StoreResult<(Vec<SwapPiece>, SlotTable)> {
         let bytes = self
             .state
             .snap_bytes(key)
             .ok_or_else(|| StoreError::Unknown(format!("快照 {key:?} 不在账")))?;
+        if self.state.snap_durability(key) != Some(SnapDurability::Durable) {
+            return Err(StoreError::Invariant(format!(
+                "快照 {key:?} 不可下沉(生成段边界:链一推进就被取代 ⇒ 逐出即丢)"
+            )));
+        }
         if bytes != self.snap_bytes {
             return Err(StoreError::Invariant(format!(
                 "快照字节不符:账 {bytes} ≠ 布局 {}",
                 self.snap_bytes
             )));
         }
-        let buf = self.snap_host.acquire()?; // 预算在借台处查(超界零副作用)
+        // **宿主满 ⇒ 先逐最冷**(2026-10-19 政策补口;G3 定档轮实测立案)。
+        //
+        // 旧行为:`acquire()` 预算越界直接 `Exhausted` ⇒ 调用方回落"丢**新**
+        // 快照" ⇒ **宿主梯从不逐出**。实测后果:开机做过几轮会话后,3 GB 宿主
+        // 梯被旧链边界占满 ⇒ 14k prompt 的 28 个边界里 **18 个被丢** ⇒ 后来
+        // 的"部分前缀"复用面从 ~97% 塔到 29%(7k 共享只复用 2k = 白重算 5k
+        // token ≈ 5 s/请求)。
+        //
+        // 政策 = **同一份策略对象**(`EvictPolicy`,与 KV 腿共用):只比 `Tier::Host`
+        // 的候选,排序后取第一个。代价说明:先逐后搬 ⇒ 若接下来的 DMA 失败
+        // (`abort_snap_offload`),冷条目已丢(比"丢新条目"代价小 —— 冷条目
+        // 本来就要被逐)。
+        let last = self.snap_host.used_bytes();
+        let mut guard = 0usize;
+        let buf = loop {
+            match self.snap_host.acquire() {
+                Ok(b) => break b,
+                Err(StoreError::Exhausted(why)) => {
+                    let mut cands: Vec<EvictCandidate> = self
+                        .state
+                        .evict_candidates(&[])
+                        .into_iter()
+                        .filter(|c| c.tier == Tier::Host)
+                        .collect();
+                    if cands.is_empty() {
+                        // 宿主账与层账不一致(账说满而层无可逐)—— 不许静默
+                        return Err(StoreError::Invariant(format!(
+                            "宿主梯满且无 Host 层候选可逐({why};层账={last}B)"
+                        )));
+                    }
+                    self.evict.order(&mut cands);
+                    let v = cands[0]
+                        .snap
+                        .ok_or_else(|| StoreError::Invariant("驱逐候选缺 snap 键".into()))?;
+                    let freed = self.snap_host.evict(v)?;
+                    self.state.drop_snap(v)?;
+                    let _ = freed;
+                    guard += 1;
+                    if guard > 16 {
+                        return Err(StoreError::Invariant(
+                            "宿主梯逐出循环超限(16):预算与释放字节不一致".into(),
+                        ));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        };
         let mut pieces = self.snap_pieces(slot)?;
         // 片在宿主槽内**首尾相接**(每条快照 = 一个槽)
         let mut off = 0usize;

@@ -187,14 +187,16 @@ fn http_post_sse(path: &str, body: &str) -> Result<(u16, String), String> {
         body.len()
     );
     s.write_all(req.as_bytes()).map_err(|e| format!("写请求: {e}"))?;
-    let mut out = String::new();
+    // 字节级累积(不再逐读 from_utf8_lossy:多字节字符跨读边界会被截成替换符 ——
+    // chunk 体里的中文一旦被截,后面的 chunked 解帧就跟着错位)
+    let mut raw: Vec<u8> = Vec::new();
     let mut buf = [0u8; 8192];
     loop {
         match s.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                out.push_str(&String::from_utf8_lossy(&buf[..n]));
-                if out.contains("data: [DONE]") {
+                raw.extend_from_slice(&buf[..n]);
+                if find_bytes(&raw, b"data: [DONE]").is_some() {
                     break;
                 }
             }
@@ -202,12 +204,13 @@ fn http_post_sse(path: &str, body: &str) -> Result<(u16, String), String> {
                 // 已收到部分帧:报错并把现场带出(不许静默吞)
                 return Err(format!(
                     "流式读失败({e});已收到 {} 字节: {}",
-                    out.len(),
-                    out.chars().take(200).collect::<String>()
+                    raw.len(),
+                    String::from_utf8_lossy(&raw).chars().take(200).collect::<String>()
                 ))
             }
         }
     }
+    let out = String::from_utf8_lossy(&raw).to_string();
     if !out.contains("data: [DONE]") {
         return Err(format!(
             "流式响应未见 `data: [DONE]`(连接提前结束);已收到: {}",
@@ -220,7 +223,45 @@ fn http_post_sse(path: &str, body: &str) -> Result<(u16, String), String> {
         .nth(1)
         .and_then(|x| x.parse().ok())
         .ok_or_else(|| format!("状态行非法: {}", out.chars().take(80).collect::<String>()))?;
-    Ok((status, out))
+    // **G5④:SSE 走 chunked 定界** —— 测试侧裸 socket 得自己解帧
+    // (真客户端 undici/fetch/http.client 原生支持;旧实现靠连接关闭定界)
+    let (head, body) = match out.split_once("\r\n\r\n") {
+        Some((h, b)) => (h.to_string(), b.to_string()),
+        None => (out.clone(), String::new()),
+    };
+    let body = if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+        dechunk(&body)?
+    } else {
+        body
+    };
+    Ok((status, format!("{head}\r\n\r\n{body}")))
+}
+
+/// chunked 解帧(`<hex>[;ext]\r\n<data>\r\n` … `0\r\n\r\n`);
+/// 失败**显式上报**(不静默返回半截 —— 与 http.rs 读侧同律)
+fn dechunk(raw: &str) -> Result<String, String> {
+    let mut out = String::new();
+    let mut rest = raw;
+    loop {
+        let (line, after) = rest.split_once("\r\n").ok_or_else(|| {
+            format!("chunk 头缺 CRLF:{}", rest.chars().take(60).collect::<String>())
+        })?;
+        let n = usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
+            .map_err(|e| format!("chunk 长度非法({line:?}): {e}"))?;
+        if n == 0 {
+            return Ok(out);
+        }
+        if after.len() < n + 2 {
+            return Err(format!("chunk 体截断(需 {}B,余 {}B)", n + 2, after.len()));
+        }
+        out.push_str(&after[..n]);
+        rest = &after[n + 2..];
+    }
+}
+
+/// 字节级子串查找(SSE 判据不看字符边界,只看 `data: [DONE]` 出现)
+fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 fn chat(session: &str, prompt: &str, max_tokens: u32) -> Result<(u16, serde_json::Value), String> {
@@ -587,6 +628,12 @@ fn e2e_server_suite() {
     );
     assert!(uv["usage"]["prompt_tokens_details"]["cached_tokens"].is_u64(),
         "AGT-12:cached_tokens 必须透出:{uv}");
+    // G5:思考相位真账(两形态单源;reasoning ≤ completion 恒成立)
+    let rt = uv["usage"]["completion_tokens_details"]["reasoning_tokens"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("G5:reasoning_tokens 必须透出:{uv}"));
+    let ct = uv["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+    assert!(rt <= ct, "reasoning_tokens({rt}) 不得超过 completion_tokens({ct}):{uv}");
     assert!(sse.contains("\"reasoning_content\"") || sse.contains("\"content\""),
         "三通道至少一路有内容");
     println!(

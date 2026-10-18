@@ -422,11 +422,24 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         self.turns.active_mut()?.fed += 1;
         // E2c:decode 跨页边界 → 快照拍摄(同流保序,先拍再采样)
+        //
+        // **档 = Transient**(2026-10-19):生成段边界链一往前就被取代 ⇒ 逐出即丢,
+        // 不下沉宿主(下沉一条 159 MiB ≈ 50 ms;生成段每 32 tok 就出一条 ——
+        // 旧档(可沉)曾把 prefill 检查点顶出去并制造 PCIe 尖刺,见 §9.1(3))。
+        // 链头那条永远最新 ⇒ 永远在设备(LRU)⇒ 复用面无损。
         {
             let act = self.turns.active()?;
             if self.dev.pool.paged && act.fed.is_multiple_of(self.dev.pool.page) {
-                // 同 prefill:唯一入口 `capture_gdn_snap`(内部 TP 感知)
-                self.capture_gdn_snap(act.session_id, act.fed).await?;
+                // 同 prefill:唯一入口 `capture_gdn_snap`(内部 TP 感知);
+                // **档 = Transient** —— 生成段边界链一往前就被取代
+                // (见 §9.1(7)/(8):下沉一条 159 MiB 实测 ≈ 100ms,不值得)
+                self.capture_gdn_snap_tail(
+                    act.session_id,
+                    act.fed,
+                    &[],
+                    owl_store::SnapDurability::Transient,
+                )
+                .await?;
             }
         }
         // D1 取证:GDN 状态格画像(OWL_GDN_DUMP;前 6 步,首末层 conv_v/rec)

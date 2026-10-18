@@ -35,5 +35,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 half = { version = "2.7.1", features = ["use-intrinsics"] }
+# 探针用:宿主层冷写的大页提示 A/B(`madvise(MADV_HUGEPAGE)`)
+libc = "0.2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 # TP2 AR 门(G1/G2/G3):chunk 计划展开与 staging 布局的**单源**(comm 侧)

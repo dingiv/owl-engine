@@ -901,8 +901,12 @@ impl<D: DeviceClient> GraphFleet<D> {
         }
     }
 
-    /// ③a fold 桶形图族(E5-M5;index = m;状态 = spec 快照 buf 就地,
-    /// slot 恒 0 —— 快照即工作缓冲,fold 后 restore 回写会话格;
+    /// ③a fold 桶形图族(E5-M5;index = m,状态叶子 = **池 GDN 态**,
+    /// `slots` 输入 = 会话行号 —— 与 eager 折叠**同形**(2026-10-19 §9.1(6)a):
+    /// 旧形是"就地在 spec 快照缓冲里重放,再 restore 回池",快照缓冲被写成
+    /// state@fed ⇒ 轮内**只能折一次**。改写池后:缓冲在轮内保持 pristine
+    /// (= state@pos)⇒ 轮内可**多次**回卷(state@b 拍边界快照 → 再回卷
+    /// state@fed),而每轮拷贝次数不增(restore 从尾部调到首部)。
     /// 记录 = verify 图输出块前缀视图,指针捕获期烘焙)。96 发射的
     /// eager fold → 单 graph_launch。
     async fn plan_fold_family(
@@ -925,13 +929,11 @@ impl<D: DeviceClient> GraphFleet<D> {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let snap_bufs = pool.spec_snap_bufs();
         let n_roots = pool.gdn_count() * 4;
         for m in 0..boot.spec.depth {
             let m1 = m + 1;
             let model_f = Arc::clone(&boot.model);
             let gdn_caches = pool.gdn_caches();
-            let snap = snap_bufs.clone();
             let rec_blks = rec_blks.clone();
             let scalar = env.gdn.scalar;
             let d = dims;
@@ -987,12 +989,13 @@ impl<D: DeviceClient> GraphFleet<D> {
                             TensorOps::of_block(b.id, d.dtype, shape)
                         })
                         .collect();
-                    let gdns: Vec<GdnBuffers> = (0..gdn_caches.len())
-                        .map(|li| GdnBuffers {
-                            conv_q: leaf_flat(&snap[li * 4]),
-                            conv_k: leaf_flat(&snap[li * 4 + 1]),
-                            conv_v: leaf_flat(&snap[li * 4 + 2]),
-                            rec: leaf_flat(&snap[li * 4 + 3]),
+                    let gdns: Vec<GdnBuffers> = gdn_caches
+                        .iter()
+                        .map(|l| GdnBuffers {
+                            conv_q: l.conv_q.clone(),
+                            conv_k: l.conv_k.clone(),
+                            conv_v: l.conv_v.clone(),
+                            rec: l.rec.clone(),
                             slots: slots.clone(),
                         })
                         .collect();
@@ -1283,12 +1286,4 @@ impl<D: DeviceClient> GraphFleet<D> {
         Ok(propose_graphs)
     }
 }
-
-/// E5-M5:fold 图的状态叶子(flat 单槽行;slot 恒 0 = 基指针;
-/// 自由函数 —— 图闭包 move 语义不可借 self)
-fn leaf_flat(b: &crate::state::BlockN) -> TensorOps {
-    let n = b.1;
-    TensorOps::of_block(b.0.id, Dtype::F32, vec![n])
-}
-
 

@@ -12,6 +12,7 @@
 //! - [`actor`]:engine actor(收件/泵不相交纪律 + 事件路由);
 //! - [`openai`]:OpenAI 协议面(请求解析/应答 JSON/chat 事件流消费);
 //! - [`debug`]:`/debug/metrics` 投影(纯函数,路由只转发);
+//! - [`agent_trace`]:`/debug/agent` 诊断环(最近 N 轮结构现场;G5②);
 //! - [`http`]:HTTP 帧解析/回写(协议无关)。
 //!
 //! 本文件只留编排:CLI 解析 → config 四层叠加(Default → Flavor →
@@ -27,12 +28,14 @@
 //!   -d '{"messages":[{"role":"user","content":"你好"}],"max_tokens":24,"stream":true,"session":"demo"}'
 //! ```
 //!
-//! 架子边界(挂账):chat 模板 naive 渲染(openai.rs)、keep-alive/chunked
-//! (http.rs)、turn abort(actor.rs pump Err 处置)、引擎就绪前的 503 健康
-//! 面、usage 模型侧真账(现 = 事件面计数)。
+//! 架子边界(挂账):chat 模板 naive 渲染(openai.rs)、turn abort
+//! (actor.rs pump Err 处置)、引擎就绪前的 503 健康面、usage 模型侧真账
+//! (现 = 事件面计数)。keep-alive/chunked 已于 G5④ 落地(见 http.rs 头注)。
 
 mod actor;
 mod shutdown;
+// `/debug/agent` 诊断环(最近 N 轮:请求事实 / 渲染 prompt / usage / 轨迹;G5②)
+mod agent_trace;
 // chat template 渲染器(HF 语义;agent 服务面 §3.2/§7.1)
 mod chat_tpl;
 mod config;
@@ -45,7 +48,6 @@ mod toolcall;
 use std::time::Duration;
 
 use serde_json::json;
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
@@ -57,6 +59,17 @@ const CHANNEL_CAPACITY: usize = 64;
 
 /// accept 失败退避(防 fd 耗尽等错误风暴下忙旋)
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// **keep-alive 空闲超时**(G5④):两次请求之间静默超过它 ⇒ 服务端主动关。
+///
+/// 设计选择:固定常量,不添配置键 —— ①它不影响引擎行为/测量口径(纯传输层);
+/// ②值域没过窄到需要现场调(pi/undici 的连接池空闲回收 ≪ 30s);
+/// ③真要调时的落点已定:`[server] keep_alive_secs`(添键即插,现不添)。
+const KEEP_ALIVE_IDLE: Duration = Duration::from_secs(30);
+
+/// **单连接请求数上限**(G5④):防“一个连接永远不换”在长时运行里变成 fd/任务的
+/// 无限累积;达上限主动关(客户端重建连接,行为无感)。
+const MAX_REQUESTS_PER_CONN: usize = 1024;
 
 /// **引擎 actor 线程栈**(2026-10-17):缺省 2MiB 对 release 够、对 debug 不够
 /// (见 `owl-engine` 线程处的长注)。32MiB 是余量档:虚拟内存代价可忽略
@@ -267,6 +280,9 @@ async fn main() {
     // **诊断投影面共享单元**(见 `DbgFace` 注):actor 装、HTTP 读
     let dbg_face: DbgFace = std::sync::Arc::new(std::sync::OnceLock::new());
     let dbg_face_actor = dbg_face.clone();
+    // **agent 诊断环**(G5②):固定深 `agent_trace::TURNS`,容量与 ctx 无关
+    // (prompt 快照截断;内存上界见该模块头注)。显式依赖:main 建 → serve → chat
+    let agent_trace = std::sync::Arc::new(agent_trace::AgentTrace::default());
     let (tx, rx) = mpsc::channel::<EngineReq>(CHANNEL_CAPACITY);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<String, String>>();
     let shutdown_actor = shutdown.clone();
@@ -362,17 +378,20 @@ async fn main() {
     loop {
         match listener.accept().await {
             Ok((stream, _peer)) => {
-                let tx = tx.clone();
-                let dbg_face = dbg_face.clone();
-                let model_name = model_name.clone();
-                let tpl = tpl.clone();
-                let agent = agent.clone();
-                let gate = concurrency_gate.clone();
+                let ctx = ConnCtx {
+                    tx: tx.clone(),
+                    model_name: model_name.clone(),
+                    tpl: tpl.clone(),
+                    agent: agent.clone(),
+                    dbg_face: dbg_face.clone(),
+                    trace: agent_trace.clone(),
+                    // 并发闸门(**每请求**获取,不是每连接 —— G5④:
+                    // keep-alive 下连接会长时间存活,连接级 permit =
+                    // 空闲连接占死并发位)
+                    gate: concurrency_gate.clone(),
+                };
                 tokio::spawn(async move {
-                    // 并发闸门:permit 获取排队(超出 max_concurrency 等待);
-                    // 获取后持有至该连接服务完毕(长连接 = 占一并发位)
-                    let _permit = gate.acquire().await;
-                    if let Err(e) = serve(stream, tx, model_name, tpl, agent, dbg_face.get().cloned()).await {
+                    if let Err(e) = serve(stream, ctx).await {
                         owl_shared::log_warn!("conn", "{e}");
                     }
                 });
@@ -529,36 +548,107 @@ fn panic_payload_str(p: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-/// 单连接服务(Connection: close;架子一请求一连接)
-async fn serve(
-    mut stream: tokio::net::TcpStream,
+/// HTTP 面共享句柄(2026-10-19,G5② 收拢:参数逐个下传已到临界;
+/// `/debug/agent` 是接入的第四方依赖 —— 再堆参数就要靠注释对位了)。
+#[derive(Clone)]
+struct ConnCtx {
     tx: mpsc::Sender<EngineReq>,
     model_name: String,
     tpl: std::sync::Arc<chat_tpl::ChatTpl>,
     agent: std::sync::Arc<owl_shared::config::AgentCfg>,
-    // 诊断投影用的 face 句柄(`GET /debug/blocks`):engine 侧 `face_clone()`
-    // 得到的同 actor 发送端;None = 该后端不支持克隆(端点回 503)
-    dbg_face: Option<std::sync::Arc<tokio::sync::Mutex<owl_cuda::GpuClient>>>,
+    /// `/debug/blocks` 的 GPU 命令出口(engine `face_clone()`;None = 不支持)
+    dbg_face: DbgFace,
+    /// `/debug/agent` 诊断环(G5②;显式依赖,不做全局变量)
+    trace: std::sync::Arc<agent_trace::AgentTrace>,
+    /// 并发闸门(G5④:**每请求**获取;在跑 + 排队 ≤ max_concurrency)
+    gate: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+/// 单连接服务(**keep-alive 请求循环**;G5④)。
+///
+/// 连接生命周期纪律:
+/// - **permit 每请求获取**:空闲等待(读下一请求/排队)不占并发位;
+/// - **空闲超时** [`KEEP_ALIVE_IDLE`] / **请求数上限** [`MAX_REQUESTS_PER_CONN`];
+/// - **非 HTTP/1.1 请求响亮拒**(505 + 关)—— chunked 应答是 1.1 语法,
+///   静默降级成 close 定界会让“复用判定”与“帧语法”两套律打架;
+/// - 处理函数返 Err(含 SSE 中途写失败)= 帧不可信 ⇒ 关连接不重用。
+async fn serve(mut stream: tokio::net::TcpStream, ctx: ConnCtx) -> std::io::Result<()> {
+    let mut served = 0usize;
+    loop {
+        // 等下一个请求(空闲超时 = 正常收摊,不报错不静默丢日志)
+        let req = match tokio::time::timeout(KEEP_ALIVE_IDLE, http::read_request(&mut stream)).await
+        {
+            Ok(Ok(Some(r))) => r,
+            Ok(Ok(None)) => return Ok(()), // 对端关
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                owl_shared::log_debug!(
+                    "conn",
+                    "keep-alive 空闲 {:?} 无请求 ⇒ 关连接(已服务 {served} 个)",
+                    KEEP_ALIVE_IDLE
+                );
+                return Ok(());
+            }
+        };
+        let close_after = !req.keep_alive;
+        if !req.http_11 {
+            http::respond_json(
+                &mut stream,
+                505,
+                &openai::error_json(
+                    "只接 HTTP/1.1(chunked 应答是 1.1 语法;HTTP/1.0 请先升版)",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+        // 并发闸门:permit 在本请求处理期间持有(G5④:从连接级改成请求级)
+        let _permit = ctx.gate.acquire().await;
+        handle(&mut stream, &req, &ctx).await?;
+        served += 1;
+        if close_after || served >= MAX_REQUESTS_PER_CONN {
+            return Ok(());
+        }
+    }
+}
+
+/// 单请求路由(与连接生命周期解耦:serve 只管读/写与何时关)
+async fn handle(
+    stream: &mut tokio::net::TcpStream,
+    req: &http::Request,
+    ctx: &ConnCtx,
 ) -> std::io::Result<()> {
-    let Some(req) = http::read_request(&mut stream).await? else {
-        return Ok(());
-    };
+    let mut stream = stream;
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/health") => {
-            http::respond_json(&mut stream, 200, &json!({"ok": true, "model": model_name})).await?;
+            http::respond_json(&mut stream, 200, &json!({"ok": true, "model": ctx.model_name})).await?;
         }
         ("GET", "/v1/models") => {
             http::respond_json(
                 &mut stream,
                 200,
                 &json!({"object": "list", "data": [{
-                    "id": model_name, "object": "model", "owned_by": "owl",
+                    "id": ctx.model_name, "object": "model", "owned_by": "owl",
                 }]}),
             )
             .await?;
         }
         ("POST", "/v1/chat/completions") => {
-            openai::chat(&mut stream, &req.body, tx, &model_name, &tpl, &agent).await?;
+            openai::chat(
+                &mut stream,
+                &req.body,
+                ctx.tx.clone(),
+                &ctx.model_name,
+                &ctx.tpl,
+                &ctx.agent,
+                &ctx.trace,
+            )
+            .await?;
+        }
+        // **tokenize 面**(G5③):纯文本/家族包装两模式;
+        // 延迟说明见 `openai::tokenize` 头注(actor 单线程)
+        ("POST", "/tokenize") => {
+            openai::tokenize(&mut stream, &req.body, ctx.tx.clone()).await?;
         }
         // 日志面入口(/debug/log[/level/<name>])
         ("GET", p) if p == "/debug/log" || p.starts_with("/debug/log/") => {
@@ -737,7 +827,7 @@ async fn serve(
         // 那张账 = 每次命令的块 id+地址,本投影 = 当前账本的权威快照)
         ("GET", "/debug/blocks") => {
             use owl_cuda::DeviceClient as _;
-            match dbg_face.as_ref() {
+            match ctx.dbg_face.get() {
                 Some(f) => match f.lock().await.block_ledger_dump().await {
                     Ok(rows) => {
                         http::respond_json(&mut stream, 200, &debug::blocks_json(&rows)).await?
@@ -760,6 +850,37 @@ async fn serve(
                     .await?
                 }
             }
+        }
+        // **agent 诊断面**(G5②;进程内环形,不落盘):
+        //   GET  /debug/agent             最近全仓(旧→新;含 prompt 头/尾与解析器轨迹)
+        //   GET  /debug/agent/<n>         最近 n 轮(夹到仓深)
+        //   POST /debug/agent/clear       清仓(返回清掉轮数)
+        ("POST", "/debug/agent/clear") => {
+            let n = ctx.trace.clear();
+            http::respond_json(&mut stream, 200, &json!({"ok": true, "cleared": n})).await?;
+        }
+        ("GET", p) if p == "/debug/agent" || p.starts_with("/debug/agent/") => {
+            let rest = p.strip_prefix("/debug/agent").unwrap_or("").trim_start_matches('/');
+            // 空段 = 全仓(0 与 `snapshot` 的取值约定一致);非法段拒绝而不静默回缺省
+            let n = if rest.is_empty() {
+                0
+            } else {
+                match rest.parse::<usize>() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        http::respond_json(
+                            &mut stream,
+                            400,
+                            &openai::error_json(format!(
+                                "/debug/agent 路径段只接轮数(或 clear),得到 {rest:?}"
+                            )),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
+            };
+            http::respond_json(&mut stream, 200, &ctx.trace.snapshot(n)).await?;
         }
         // **发射账查询面**(cuda::trace;`[cuda] trace_ring = <N>` 开启):
         //   GET /debug/launches[/<n>[/<kind>]]  —— 最近 n 条(缺省 200)按发射序;
@@ -816,5 +937,7 @@ async fn serve(
             .await?;
         }
     }
-    stream.shutdown().await
+    // 注:**不调 `stream.shutdown()`** —— 那是“一请求一连接”时代的收尾(发 FIN),
+    // keep-alive 下会把连接直接杀掉(G5④ 实测踩过:客户端复用时报 dead)
+    Ok(())
 }

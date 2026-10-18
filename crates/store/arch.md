@@ -48,7 +48,9 @@ engine 侧原来的 `blocks.rs` / `prefix_cache.rs` **已整文件删除**(§9.5
 
 ## 律(违反即 `// CMA:` 标记)
 
-1. **分层单向**:本 crate 只依赖 `owl-iface`(契约面)+ `owl-shared`(工具面);
+1. **分层单向**:本 crate 只依赖 `owl-iface`(契约面)+ `owl-shared`(工具面)+
+   **`libc`(仅内存布局提示:宿主块 `madvise(MADV_HUGEPAGE)`,2026-10-19 记注于
+   `crates/store/Cargo.toml`)**;
    **禁止**依赖 `owl-cuda` / `owl-engine` / `owl-models` 内部(engine → store 单向)。
    补注(**测试面例外**):dev-dependency 允许 `owl-cpu` —— 它是契约面
    (`owl-iface::DeviceClient`)的一个真实现体,用真 face 测搬运闭环胜过手写假 face;

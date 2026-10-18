@@ -197,6 +197,29 @@ impl<D: DeviceClient> RunningEngine<D> {
         Some(step)
     }
 
+    /// **本轮该拍的页边界**(纯函数;`[pool] snap_decode_stride`;§9.1(6)a)。
+    ///
+    /// 语义 = 本轮提交 `(pos, fed_new]` 跨过的**最大**页边界 `b`,且该边界
+    /// 页号是 `stride` 的整数倍(spec 轮提交 ≤ depth+1 ≤ 8 行 < 页 32 ⇒
+    /// 一轮最多跨一个边界;`stride` 只是节流,不参与位置)。
+    /// `None` = 本轮不拍(未跨边界 / 跨的边界不在步长上 / 关或页宽为 0)。
+    ///
+    /// **为何取最大**:链身份与快照只增不减 ⇒ 下一个 turn 的复用面只认
+    /// "离链头最近的那个在场边界";小的边界留给旧调用点(prefill 段已逐块
+    /// 拍,见 `capture_gdn_snap` 的链推进)。
+    pub(crate) fn decode_boundary_in(
+        pos: usize,
+        fed_new: usize,
+        page: usize,
+        stride: usize,
+    ) -> Option<usize> {
+        if page == 0 || stride == 0 {
+            return None;
+        }
+        let b = fed_new / page * page; // 最大页边界 ≤ fed_new
+        (b > pos && (b / page).is_multiple_of(stride)).then_some(b)
+    }
+
     /// 调度决策(纯主机侧)：turn 启动判定(会话守卫/前缀匹配/快照
     /// 边界)+ 相位决策(prefill chunk / decode 步,host 派生量备齐)。
     /// 只动账(队列/会话账/块账房/活跃 turn),**零 await**。
@@ -253,27 +276,28 @@ impl<D: DeviceClient> RunningEngine<D> {
                         }
                     }
                     if self.cfg.knobs.probes.debug {
-                        // 在场性 = **store 的层账**(设备/宿主都算);层号一并打出
-                        let snaps: Vec<&str> = hashes
+                        // 在场性 = **store 的层账**(设备/宿主都算);层号一并打出。
+                        // 头尾都要看(2026-10-19):复用面只认**最靠近链头**的在场面 ⇒
+                        // "前 4 全 '-'"曾把"链头那张缺位"误读成"全丢";故头 4 + 尾 6。
+                        let tier_of = |h: &owl_store::ChainHash| {
+                            match self.bank.rel.state.locate(owl_store::SnapKey::at_boundary(*h)) {
+                                Some(owl_store::Tier::Gpu) => "dev",
+                                Some(owl_store::Tier::Host) => "host",
+                                Some(owl_store::Tier::Disk) => "disk",
+                                None => "-",
+                            }
+                        };
+                        let head: Vec<&str> = hashes.iter().take(4).map(tier_of).collect();
+                        let tail: Vec<&str> = hashes
                             .iter()
-                            .take(4)
-                            .map(|h| {
-                                match self
-                                    .bank
-                                    .rel
-                                    .state
-                                    .locate(owl_store::SnapKey::at_boundary(*h))
-                                {
-                                    Some(owl_store::Tier::Gpu) => "dev",
-                                    Some(owl_store::Tier::Host) => "host",
-                                    Some(owl_store::Tier::Disk) => "disk",
-                                    None => "-",
-                                }
-                            })
+                            .rev()
+                            .take(6)
+                            .rev()
+                            .map(tier_of)
                             .collect();
                         owl_shared::log_debug!(
                             "dbg prefix",
-                            "match = {matched_raw} blocks / chain = {chain:?} · snap_used={}/{} 边界快照在场(前4)={snaps:?}",
+                            "match = {matched_raw} blocks / chain = {chain:?} · snap_used={}/{} 边界在场 头4={head:?} 尾6={tail:?}",
                             self.dev.pool.snap_used(),
                             self.dev.pool.snap_capacity()
                         );
@@ -287,6 +311,23 @@ impl<D: DeviceClient> RunningEngine<D> {
                         turn.prompt_ids.len(),
                         self.dev.pool.page,
                     );
+                    if self.cfg.knobs.probes.debug {
+                        // 裁剪结果 = 复用面真值(块);页对齐后 = 可复用 token 数
+                        let found = if m > 0 {
+                            match self.bank.rel.state.locate(owl_store::SnapKey::at_boundary(hashes[m - 1])) {
+                                Some(owl_store::Tier::Gpu) => "dev",
+                                Some(owl_store::Tier::Host) => "host",
+                                _ => "?",
+                            }
+                        } else {
+                            "(无)"
+                        };
+                        owl_shared::log_debug!(
+                            "dbg prefix",
+                            "复用面 m={m}/{matched_raw} 块(= {} tok)/ 落在边界层={found}",
+                            m * self.dev.pool.page
+                        );
+                    }
                     if m > 0 {
                         // 只对**已驻留**块加会话引用(宿主格的引用由回灌侧
                         // `alloc_slot` + `rebind` 建立;占位值不参与账)
@@ -600,5 +641,34 @@ mod prefill_tail_merge_tests {
         assert_eq!(R::prefill_step_chunk(8192, 8244, 512, 0, 32), Some(32));
         // 关对齐(page = 0)= 纯 L4
         assert_eq!(R::prefill_step_chunk(0, 83, 512, 512, 0), Some(83));
+    }
+
+    /// **生成相位页边界快照的一轮判定**(`decode_boundary_in`)——
+    /// 本轮提交 `(pos, fed_new]` 跨过哪张边界、步长何时把它节掉。
+    #[test]
+    fn decode_boundary_is_largest_crossed_page() {
+        let page = 32;
+        // 跨过 160(pos=158,m+1=5 ⇒ fed_new=163)⇒ 拍 160
+        assert_eq!(R::decode_boundary_in(158, 163, page, 1), Some(160));
+        // 恰好落在边界上(fed_new = 160)也算跨过(状态就在那)—— 但 pos=160 时不算
+        assert_eq!(R::decode_boundary_in(155, 160, page, 1), Some(160));
+        assert_eq!(R::decode_boundary_in(160, 160, page, 1), None);
+        // 边界在 pos 之下(本轮未跨)⇒ 不拍
+        assert_eq!(R::decode_boundary_in(161, 168, page, 1), None);
+        // 一步跨多个边界(页宽 < 提交行数;现役 page=32 不会发生)⇒ 取最大
+        assert_eq!(R::decode_boundary_in(30, 70, 8, 1), Some(64));
+        // 节流:只在页号是 stride 倍数的边界拍(stride=4 ⇒ 页 4/8/12…)
+        assert_eq!(R::decode_boundary_in(158, 163, page, 4), None); // 页 5
+        assert_eq!(R::decode_boundary_in(222, 228, page, 4), None); // 页 7
+        assert_eq!(R::decode_boundary_in(250, 257, page, 4), Some(256)); // 页 8 ✓
+        assert_eq!(R::decode_boundary_in(250, 257, page, 8), Some(256)); // 页 8 ✓(stride 8)
+        assert_eq!(R::decode_boundary_in(186, 193, page, 8), None); // 页 6
+        assert_eq!(R::decode_boundary_in(186, 193, page, 2), Some(192)); // 页 6 ✓(stride 2)
+        // 关(stride=0)/无页(page=0)
+        assert_eq!(R::decode_boundary_in(158, 163, page, 0), None);
+        assert_eq!(R::decode_boundary_in(158, 163, 0, 1), None);
+        // 尾首:pos=0 且 fed_new 已过第一页 ⇒ 拍
+        assert_eq!(R::decode_boundary_in(0, 33, page, 1), Some(32));
+        assert_eq!(R::decode_boundary_in(0, 31, page, 1), None);
     }
 }

@@ -142,7 +142,7 @@
 | 编号 | 需求 | 说明 |
 |---|---|---|
 | **REQ-AGT-10** | **取消(abort)**:客户端断流 ⇒ 引擎侧尽早停放当前 turn | ✅ **已落地(2026-10-14)**:服务面写失败 ⇒ `EngineReq::Abort`;actor 侧投递失败 ⇒ 弃置(≤1 采样步);实测 curl 断开后 `弃置 turn N` |
-| **REQ-AGT-11** | HTTP 硬化:keep-alive 或至少 undici 兼容性实测;chunked 请求体 | ✅ **chunked 已落地**(单测 4 + curl 实测);keep-alive 挂 hyper 迁移(permit 语义理由见 `http.rs` 头注) |
+| **REQ-AGT-11** | HTTP 硬化:keep-alive 或至少 undici 兼容性实测;chunked 请求体 | ✅ **均已落地**:chunked 请求体(单测 4 + curl);**keep-alive**(G5④,2026-10-19:请求循环 + 每请求 permit + 空闲超时 30s + SSE 改 chunked 定界;裸 socket 探针 `keep_alive_probe.py` 6 项全绿)。客户端侧仍需真 pi/undici 实测(未做) |
 | **REQ-AGT-12** | `prompt_tokens_details.cached_tokens` 透出前缀命中 | ✅ **已落地**:含**块级缓存命中**真值(`SinkEvent::Session` 校正帧);G4 探针数字与引擎日志逐项吻合 |
 | **REQ-AGT-13** | 长 ctx 定档:16384 → 32k/64k,补 std 长点回归 | ✅ **已评估定档**:维持 **16384**;32k/64k 已实测可用(见 §7.9 G5 数字),因 A8 + prefill −17% 不转正 |
 | **REQ-AGT-14** | 并发:子代理并行(`max_concurrency`/`gdn_slots`) | ✅ **已实测**:4 并发墙钟 **0.94×**(单槽串行,无并行);真加速依赖 B5.1 批桶(非本专项) |
@@ -299,10 +299,96 @@ data: [DONE]
   fed(会话守卫命中 **+ 块级前缀缓存命中**),经 `SinkEvent::Session` 校正帧在**该 turn
   首个事件之前**发出(块级命中在 submit 时尚未决定 ⇒ Accepted 只能报估值;短 turn 在
   单次 pump 内跑完,校正帧必须抢在事件前发 —— 否则 sink 已摘除而丢帧,实测踩过)。
-- `reasoning_tokens` 仍未透出(可选字段,pi 会把它计入 output 显示);实现需按通道
-  计 token 数(现只有文本聚合),归 M-C 挂账。
+- **`reasoning_tokens` 已透出(2026-10-19,G5①)**:真源 = **解析器相位归因** ——
+  引擎 1 个 `TurnEvent::Token` = 1 采样步 = 1 token,而协议层每 token 调一次
+  `ChannelSplitter::push`,故以 **push 入口时的解析器状态**判该 token 属不属于思考
+  相位(`ChannelSplitter::reasoning_steps`;**含 `</think>` 标记本体** —— 它由思考段生成;
+  其后首个正文 token 已落 Text 态)。**不用 tokenizer 反数**:标记文本被解析器吞掉,
+  反数与真值天然不等,且多一次 CAS 往返。流式(usage 帧)与非流式(`completion_json`)
+  **两形态同源**(单点 `usage.reasoning`)。
+  真机实测(dev-08b / 3090 Ti):thinking 开 ⇒ 80/80;单 token 边界(思考与答案同
+  token)⇒ 1/1;thinking 关 ⇒ 0。门 = `agent_wire_smoke.py`(两形态断言)+
+  `toolcall::tests::reasoning_steps_are_phased_by_channel`(三档相位)。
 
-### 3.6 错误面
+### 3.6 诊断面 `GET /debug/agent`(G5②,2026-10-19)
+
+**路径语**(与 `/debug/launches` 同构,空段 = 全仓;非法段 400 而不静默回缺省):
+
+| 面 | 语义 |
+|---|---|
+| `GET /debug/agent` | 全仓(旧→新;缺省深 `agent_trace::TURNS = 8`) |
+| `GET /debug/agent/<n>` | 最近 n 轮(夹到仓深) |
+| `POST /debug/agent/clear` | 清仓 → `{"ok":true,"cleared":N}` |
+
+**一轮记录五面**(`turns[]` 元素):
+```json
+{"seq":5,"at_unix_ms":1792354106000,
+ "req":{"model":"…","stream":false,"messages":1,"roles":"user","tools":0,
+        "thinking":true,"reasoning_effort":null,"session":null,"max_new":8,
+        "ignore_eos":false,"stop":1},
+ "prompt":{"bytes":120069,"chars":…,"head":"<前 8 KiB>","tail":"<后 24 KiB>",
+           "omitted_bytes":87303,"truncated":true},
+ "usage":{"prompt_tokens":13,"completion_tokens":8,"cached_tokens":0,"reasoning_tokens":8},
+ "outcome":{"finish_reason":"length","tools_called":0,"strays":0,"malformed":0,
+            "ttft_ms":140,"elapsed_ms":327,"error":null},
+ "events":["state think→text","swallow_lf 2","tool #0 bash args=12B","finish text held=0B"]}
+```
+- `events` = **解析器结构轨迹**(`toolcall::StructEvent::line`):**只记结构**(状态迁移 /
+  吞空白 / 游标 / 工具块 / 畸形 / 收尾),**不记 delta 文本** —— 不做第二份输出副本。
+- **失败与拒绝同样留痕**:`outcome.error` 非空(如
+  `"提交被拒:submit: prompt 24012 + 生成 8 超预算 4096"`;提前返回则由
+  `TurnLedger` 的 `Drop` 兑底网记 `未结算`)—— 短 turn / 异常路径不靠“猜日志”。
+- **内存上界**:`TURNS × (PROMPT_HEAD + PROMPT_TAIL + 轨迹) ≈ 8 × 32 KiB = 256 KiB`,
+  与 ctx 无关(截断 + 显式 `omitted_bytes` 记账);**不落盘、不打日志**,
+  转储 = 显式 GET(诊断面不主动泄漏会话内容)。
+
+### 3.7 工具面 `POST /tokenize`(G5③,2026-10-19)
+
+请求(**最小面**;`deny_unknown_fields` **开着** —— owl 自有面,不背兼容史,
+多传字段 = 调用方预期落空 ⇒ 响亮拒):
+```json
+{"model":"qwen3.8-27b","prompt":"…","mode":"raw|chat","add_special_tokens":false}
+```
+| 字段 | 语义 |
+|---|---|
+| `prompt` | **必填非空**(本端点不做 `messages` 渲染) |
+| `mode` | `raw`(缺省)= 纯文本编码;`chat` = 先套**家族单轮包装**(与裸文本提交同一律:`Tokenizer::chat_wrap`) |
+| `add_special_tokens` | 只接 `false`/缺省;`true` → **400** —— 本引擎编码恒 `false`(不静默接受一个不生效的开关);要包装用 `mode="chat"` |
+
+应答:
+```json
+{"count":6,"max_model_len":4096,"tokens":[…],"mode":"raw","model":"…"}
+```
+- `max_model_len` = 本档 `max_seq_tokens`(引擎侧唯一产地,经 actor 应答捎回)。
+- **单一真源**:tokenizer 常驻引擎(`RunningEngine`),HTTP 层**不二次装载**
+  ⇒ 包装律/特殊 token 律只有一份。代价 = 本请求排在**当前 turn 之后**
+  (actor 单线程“收件与泵不相交”),工量毫秒级 CPU;生成期间调用会等本轮结束
+  (要“随时可查”得把 tokenizer 克隆进 HTTP 层,前提是引擎侧先导出
+  `chat_wrap + try_encode` 组合面 —— 另案)。
+- **显式失败**:走 `Tokenizer::try_encode`(新增,Result 版);旧 `encode`
+  吞错回退空序列(线上 16 处调用,签名升 Result 另案)—— `/tokenize` 不用它:
+  “编码失败”与“文本是空的”必须可分。
+
+### 3.8 传输面:keep-alive 与 SSE chunked 定界(G5④,2026-10-19)
+
+| 面 | 语义 |
+|---|---|
+| 连接复用 | HTTP/1.1 缺省**复用**;`Connection: close` 尊重;HTTP/1.0 只认显式 `Connection: keep-alive`(缺省关) |
+| JSON/文本应答 | `Content-Length` 自定界,**不发 `Connection` 头**(关不关由 serve 循环定) |
+| SSE 应答 | **`Transfer-Encoding: chunked`**,以终止块 `0\r\n\r\n` 收口(**每个流必调 `http::sse_end`**) |
+| 并发闸门 | permit **每请求**获取(旧:每连接 —— keep-alive 下空闲连接会占死并发位) |
+| 收摊条件 | `Connection: close` / 空闲 **30s** / 单连接 **1024** 请求 / 非 1.1(505)/ 处理函数返 Err(帧不可信) |
+| 非 HTTP/1.1 | **505 + 关**:chunked 应答是 1.1 语法,静默降级成 close 定界会让“复用判定”与“帧语法”两套律打架 |
+
+- **为什么 SSE 必须 chunked**:旧路用“连接关闭”定界 ⇒ 一连接只能服务一个请求;
+  pi/undici 连接池会把并发位耗在空闲连接上(keep-alive 的真正动机)。
+- **空闲超时/请求数上限是常量**(`main.rs`:`KEEP_ALIVE_IDLE` / `MAX_REQUESTS_PER_CONN`),
+  **不是配置键**:纯传输层、不影响引擎行为/测量口径;真要调的落点已定
+  (`[server] keep_alive_secs`,添键即插)。
+- **客户端要求**:SSE 客户端必须支持 chunked(undici/fetch/urllib/http.client 原生支持;
+  手写裸 socket 客户端需自己解帧 —— 本仓 `e2e.rs` 的 `dechunk` 就是样板)。
+
+### 3.9 错误面
 
 | 场景 | 响应 |
 |---|---|
@@ -727,7 +813,7 @@ per-turn 参数进不了图。候选:① 采样参数走图输入槽(与 `xqa_pt
 | AGT-07 | `reasoning_effort` 直通模板 + pi compat 打开 | 模板值域自持,零自造映射 |
 | AGT-09 | `[agent] implicit_session` | lag_probe 4/4(交错提问)+ G4 同会话命中 88% |
 | AGT-10 | 断流 ⇒ Abort/弃置 | curl 3s 断开实测:日志 `弃置 turn N`,后继请求正常 |
-| AGT-11 | chunked 请求体 | 单测 4 + curl chunked 200;keep-alive 挂 hyper 迁移(permit 语义理由已记) |
+| AGT-11 | chunked 请求体 + keep-alive | chunked:单测 4 + curl;keep-alive:**G5④ 已落地**(裸 socket 探针 6 项 + wire smoke + e2e 27B 回归);真 pi/undici 实测挂账 |
 | AGT-12 | `cached_tokens` 真值(含块级命中) | G4 探针数字与引擎 `prefill encode @M` 逐项吻合 |
 | AGT-13 | 定档决策:**维持 16384** | G5:16k 1264 t/s / 32k 1044(TTFT@30k 28.7s)/ 64k 850(70.6s);32k/64k 可用不转正(A8 + prefill −17%) |
 | B1/B2 | `[agent]` 配置模块 + 模板覆盖 | 账外键拒/枚举严格单测 |
@@ -907,8 +993,8 @@ DAG(lm_head gemm → argmax)核对**命令序是否与求值序一致**(gemm 的
 3. `auto_disable_thinking_with_tools` 的产品选择(有工具时是否关思考)—— **旋钮已就位**,需真机 A/B 数据(D2)。
 4. 视觉/图像输入(`<|vision_start|>` 分支)保留未启用。
 5. undo/rollback 会话级重置接口(pi 的 compaction 触发后的显式 reset,避免残留块链)。
-6. `/debug/agent` 诊断面(最近一次渲染 prompt 原文 + 解析器状态机轨迹;现只有 prompt 落盘(`[probes] prompt_dump`,原 OWL_PROMPT_DUMP))—— **对 A7/A8 排查也有用**。
-7. `completion_tokens_details.reasoning_tokens`(需按通道计 token 数;现只有文本聚合)。
+6. ~~`/debug/agent` 诊断面(最近一次渲染 prompt 原文 + 解析器状态机轨迹;现只有 prompt 落盘(`[probes] prompt_dump`,原 OWL_PROMPT_DUMP))—— **对 A7/A8 排查也有用**~~ ✅ **已结(G5②,2026-10-19)**:最近 8 轮的请求事实 / prompt 头尾快照 / usage 真账 / 结局 / 解析器结构轨迹;见 §3.6 与 §9.2(2)。
+7. ~~`completion_tokens_details.reasoning_tokens`(需按通道计 token 数;现只有文本聚合)~~ ✅ **已结(G5①,2026-10-19)**:解析器相位归因,两形态透出,见 §3.5 与 §9.2。
 8. **A8(spec 臂 token 级非稳定)** —— 见 §7.8;与 A7 疑同源,合并排查。
 9. **A7(工具调用遵循度)** —— 台账第一优先;AGT-06 已落地,复测应在新的采样面下做。
 
@@ -1011,14 +1097,11 @@ mib_per_s,line}` / `BAxisProfile::line` / `PartialStats::line` /
 
 ### (6) 立案(未修;按优先级)
 
-a. **spec 轮内跨页边界**仍不拍快照(末段页对齐只覆盖 **prefill 段**):
-   捕获图定形 `T=depth+1` ⇒ 不能靠"减 depth 对齐";试过"落点恰好对齐时顺手拍"
-   并**撤回**(`act.out` 提交晚 ⇒ `tokens_upto` 报"token N 未喂")。
-   可行解:用 `fold` 族把状态回卷到边界(`fold[b-pos-1]`)再拍、再卷回。
-   影响 = 生成相位每页一个边界(短 prompt 的尾部复用面受限,现状 64-160 tok);
-   长 prompt 的 prefill 段已覆盖(实测 99.8%)。
-b. ✅ **已落(本节的容量定档)**。余:**池/份额的二次定档** —— 单链 > 池时的
-   复用面仍受 `nb` 约束(`13k 会话 / 16.9k 池` 已到 98%,再长就要加池或分块)。
+a. ✅ **已结(2026-10-19;本轮)** —— **spec 轮内跨页边界快照**(生成相位逐页拍)。
+   详见下文 **(8)**。
+b. ✅ **已落(本节的容量定档)**。余:**池/份额/宿主梯的二次定档** ——
+   单链 > 池时的复用面仍受 `nb` 约束(`13k 会话 / 16.9k 池` 已到 98%,再长就要加池或分块)。
+   既有税**已结(2026-10-19)** —— 见下文 **(9)**。
 c. **`[agent] implicit_session` 缺省 false**:pi 不带 `session` ⇒ 每轮新会话
    ⇒ **同会话路径对 pi 不适用**,只有跨会话块级缓存能救。是否改缺省 = 产品裁决
    (并发交错时频繁 reset,慢但不坏)。
@@ -1037,7 +1120,9 @@ d. `testdata/args/e2e-27b.toml` 被 `.gitignore` 的 `testdata/*` 吞掉,而
 `restore_snap` 只在 prefix 命中时调用)。`prefix_cache = false` ⇒ 缓存区份额 0
 ⇒ 复用面结构上恒 0 ⇒ 快照是**纯浪费**。
 
-**修法**(`crates/engine/src/exec/spec.rs`):
+**修法**(`crates/engine/src/exec/spec.rs`;**2026-10-19 与下文 (8) 的轮内快照合流**:
+函数已拆成 `capture_gdn_snap`(前缀段,Durable)→ `capture_gdn_snap_tail`(带 `tail` +
+`durability`),本门与容量门在两处**共用同一条 `snap_on`**):
 ```rust
 let snap_on = self.dev.pool.snap_capacity() > 0 && self.cfg.knobs.prefix_cache;
 ```
@@ -1051,10 +1136,395 @@ prompt ⇒ 链游标已推进 ⇒ `start >= full_blocks` 早退(实测:第 1 轮
 **剩余头寸**(留案):生产形(prefix_cache=true)的快照税仍在,候选 = ①下沉 DtoH
 异步/与下一块重叠 ②更粗的拍摄粒度(每 K 个边界)③扩设备槽(152 MiB/条,贵)。
 
+### (8) ✅ 已结(2026-10-19):spec 轮内跨页边界快照(§9.1(6)a)
+
+**问题**:`prefill_align_tail` 只管 **prefill 段**;生成相位的页边界从不拍快照
+(spec 轮一次提交 `(pos, pos+m]` 多为**跨过**边界而非落在边界 ⇒ 状态已过界,
+而捕获图定形 `T=depth+1` 不能靠减 depth 对齐)。⇒ 下一轮的复用面 = **prompt 段
+最后一个整页**(实测 187 tok 档只复用 64;501 tok 生成长度 ⇒ 只用到 32/544 = 6%)。
+
+**修法(三步,均已落)**:
+
+1. **fold 族状态叶子改"写池"**(`graph_fleet::plan_fold_family`):旧形是"就地
+   在 `spec_snap` 缓冲里重放 + restore 回写池" ⇒ 缓冲被写成 state@fed,**一轮只能折一次**。
+   现改为叶子 = **池 GDN 态**(`slots` 输入 = 会话行号)—— 与 **eager 路径同形**
+   (少一条"两套规范"旁路),且 `spec_snap` 在轮内**保持 pristine**(= state@pos)
+   ⇒ 轮内可**多次**回卷。每轮拷贝次数不增(restore 从尾部调到首部)。
+2. **回卷拍快照**(`RunningEngine::spec_fold_to` + `capture_gdn_snap_tail`):
+   本轮提交跨过页边界 `b`(`Scheduler::decode_boundary_in`,纯函数,判据 = 
+   `(pos, fed_new]` 内最大的 `stride` 倍数页边界)⇒ `restore → fold[b-pos]`
+   得到 state@b ⇒ 拍快照 ⇒ `restore → fold[m+1]` 回到 state@fed。
+   尾 token:提交在 emit **之前**,`act.out` 还差本轮那几枚 ⇒ `tokens_upto_with`
+   接受显式 `tail`(越界仍响亮拒)。**`m == depth` 全接受轮不拍**(该桶无 fold 图;
+   代价 = 少一个边界,均值 <16 tok 复用面,已记账)。
+3. **快照重要性档**(`owl_store::SnapDurability`;store 定政策):
+   | 档 | 来源 | 逐出时 |
+   |---|---|---|
+   | `Durable` | **前缀段**(prefill chunk 边界 / 行归还快照) | 可下沉宿主(跨会话共享前缀靠它) |
+   | `Transient` | **生成段**(逐页边界;spec 轮内 + 裸 decode 步) | **丢** |
+   逐出优先级 `rank` 传进 `StatePool::snap_pick_slot`(小者先出,同档 LRU)
+   ⇒ 先丢生成段、后动前缀段 ⇒ **链头那条永远最新、永远是设备命中**。
+   动机 = 实测:生成段每 32 tok 出一条,**下沉一条 159 MiB ≈ 208 ms**
+   (旧档全下沉 = 每 token 数 MiB 级 PCIe + 每 32 tok 一个 200ms 级尖刺)。
+
+**实测(27B/`spec-dflash`/单张 3090 Ti;同二进制 + 单键 A/B)**:
+
+| 项 | `snap_decode_stride = 0`(旧行为) | **= 1(新)** |
+|---|---|---|
+| `prefix_reuse_probe` T2(187 tok 同会话) | 64/187 | **160/187**(上界 = ⌊165/32⌋·32 = 160 ✓) |
+| 512 tok 生成长文本 → 下一轮 cached(572 tok prompt) | **32 / 544 = 5.9%** | **544 / 544 = 100%** |
+| 该下一轮墙钟 | 1.39 s | **1.00 s** |
+| 本轮生成开销(18 张边界) | — | fold 1.63ms + 拍 1.01ms = **~2.6ms/边界** |
+| turn 1 墙钟(512 tok 生成) | 12.05 s | 12.26 s(+1.7%;均在噪声内) |
+
+**验收(全绿)**:`prefix_reuse_probe` G4 ✅ / `lag_probe` 4/4 ✅ / `agent_wire_smoke` 全过 ✅ /
+单测 store **81+3+3** · shared **81** · engine **51** · server **36** + ops_whitelist **2/2** ✅ /
+**spec 恒等门**(`OWL_E2E_ONLY=spec_identity`)✅ —— 且输出 sha 与**改前基线逐字相同**
+(`670671cd97404156` / `565339bc4d33d728`)⇒ fold 改叶子为纯搬移,零数值漂移。
+
+**新键**:`[pool] snap_decode_stride`(缺省 **1** = 每页一拍;0 = 关;N = 每 N 页一节流)。
+**新读数**:`spec.bnd.fold1` / `spec.bnd.snap`(轮内边界分相计时)、
+`store.snap.drop` / `store.snap.out{,.bytes}`(逐出归向)。
+**未做(另账)**:`m == depth` 轮的边界(代价 <16 tok 复用面);
+池/份额/宿主梯的二次定档(G2/§9.1(6)b)。
+
+### (9) ✅ 已结(2026-10-19):快照下沉的"冷写缺页税"(§9.1(6)b 立案)
+
+**现象(立案数字)**:8417 tok 冷 prompt ⇒ 16 个 prefill chunk 边界 ⇒ 12 次状态腿快照
+下沉(每次 159 MiB=1.91 GB)⇒ `prefill.bnd` avg **71.6ms**(p99 212ms)≈ 该请求
+**TTFT 16%**。连发实测:第 3 发宿主梯满 ⇒ 0 次下沉 ⇒ `prefill.bnd` **1.0ms/边界**
+⇒ 边际成本 ≈ **107 ms/条**(0.75 s/GB,1.6 GB/s 级)。
+
+**定点取证**(新探针 `crates/backends/cuda/tests/swap_econ_probe.rs`,`--ignored`):
+
+| 实验 | 结果 | 读法 |
+|---|---|---|
+| 片数扫描 1 / 4 / 24 / 192 片(同 159 MiB) | 293 / 186 / 107 / 106 ms | **片数越多越快** ⇒ 不是逐片开销 |
+| host memcpy 到**冷** pageable 目的(159 MiB) | **95 ms = 1.67 GB/s** | ✅ 真凶 = 目的页**首次写缺页**(4 万次 4 KiB) |
+| 同缓冲复拷(warm) | 7.5 ms = 21 GB/s | 热了就快 13× |
+| 冷写 A/B:`MADV_HUGEPAGE`(2 MiB 页) | **12 ms = 13.6 GB/s** | 缺页数 ÷512 ⇒ 6.6× |
+
+⇒ 100 ms ≈ **95 ms 冷写 + ~10 ms DMA**。根因:`HostBlock::zeroed` 的 `vec![0u8; n]`
+= 新 mmap ⇒ 首次写逐页缺页(本机 THP = `[madvise]`,不申请就不给大页)。
+
+**修法(与"宿主不 pin"形态律兼容 —— 不动 pin,只要大页)**
+`store::host::HostBlock::zeroed` 分配后对 **2 MiB 对齐内区间** `madvise(MADV_HUGEPAGE)`
+(`libc` 入 `owl-store` 依赖;区间不对齐会 EINVAL ⇒ 先对齐再呼)。
+**不静默**:提示结果记在块上(`HostBlock::hugepage`),`HostTier::hint_failures`
+汇总,引擎在下沉点打 `store.host.hint_fail` 指标 + 点名日志;
+单测 `hugepage_hint_is_counted` 钉记账律(环境无关)。
+
+**实测(同机同档,三连发 8424 tok 冷 prompt)**:
+
+| 项 | 修前(4 KiB) | **修后(2 MiB)** |
+|---|---|---|
+| 第 1 发 `prefill.bnd` | 1181.9 ms(73.9/边界) | **445.8 ms(27.9)** |
+| 第 2 发 | 880.8 ms(55.0) | **280.0 ms(17.5)** |
+| 第 3 发(宿主满 ⇒ 零下沉) | 16.7 ms(1.0) | 18.7 ms(1.2) |
+| 第 1/2 发墙钟 | 8.65 / 8.33 s | **7.89 / 7.67 s(−8.8% / −7.9%)** |
+| 单次下沉边际成本 | 107 ms | **38.8 ms**(2.8×) |
+
+**验收**:store 81+3+3 ✅ · e2e `gpu_08b_offload_probe` / `gpu_08b_state_leg_probe` ✅ ·
+G4 探针 160/187 + 1728/1732(sha 与基线逐字同)✅ · lag 4/4 ✅ · wire 全过 ✅。
+**未做(可选)**:①启动期预热宿主梯(19 槽 × 12 ms ≈ 0.23 s 启动税换请求内 −12 ms/槽)。
+②逐项拆解**已做**,见 (10.2) —— 38.8 ms ≈ DMA 12.6 + 宿主拷贝 ~17(THP)+ 链路 ~9;
+DMA 已到 PCIe 上限,要再降只剩"宿主内容 pin"(被形态律 1 否)。
+
+### (10) ✅ 已结(2026-10-19):池/份额/宿主梯**二次定档**(§9.1(6)b;G3)
+
+#### (10.1) 定档面事实(定档前必读)
+
+| 键 | 现值 | 事实 |
+|---|---|---|
+| `pool_tokens` | 16896(528 MiB) | **预算上限是 85251 tok(4.23 GB)**([vram-gov] 行:卡 23.6G、fixed 1.12G、live 17.52G ⇒ budget 4.23G)⇒ 池只用了 1/8。**当前 16k ctx 下不是约束**(单会话 512 页 ≤ 528;实测 13.4k 命中 98%);改 ctx(32k/64k)才需同步扩 |
+| `prefix_cache_share` | 0.75 | 缓存可占 396 页 ≈ 12.7k tok;单链命中 98% 已证充分 |
+| `snap_max` | 4(637 MiB 显存) | 设备槽 = 链头边界的常驻位;透明档逐出优先丢 Transient ⇒ **保留 4** |
+| `snap_host_mb` | 3072(20 槽) | **原本是硬天花板**(满即拒 ⇒ 新快照被丢);修政策后 = 有界 LRU ⇒ **保留 3072** |
+| `prefill_tail_merge` | 1024 | TTFT 赢(516 tok:651→406 ms);粒度代价见 (9.4)F1 |
+
+#### (10.2) 下沉成本逐项实测(`swap_econ_probe` 扩项)
+
+| 环节 | 耗时(159 MiB/条) | 读法 |
+|---|---|---|
+| 192 片 Out → **丢弃型**连接器(DMA + pinned staging) | **12.6 ms**(12.6 GB/s) | = PCIe 4.0 x16 实际上限,**不可再降** |
+| 192 片 Out → 宿主块(**THP 冷写**) | **29.5 ms** | 宿主拷贝 ≈ 17 ms(THP;4 KiB 时 90 ms) |
+| 生产实测单条 | 38.8 ms | 差额 ≈ 链路(块指针/校验/回执)~9 ms |
+
+⇒ 再省只能靠"宿主内容 pin"(律 1 明拦)⇒ **换路线:降"次数"而不是"单价"**(下条)。
+
+#### (10.3) 两个真 bug(G3 测量把他们拓出来了)
+
+**bug①:AGT-12 真值帧被终态静默丢掉**(`apps/server/src/actor.rs`)。
+旧序:终态分支先 `pending_cache.remove`,再轮"送校正帧" ⇒ **首 token 后即 EOS 的短 turn**
+(实测 "只回答:OK" ⇒ completion=1)下一帧就落进了被删的槽 ⇒ 引擎日志说
+`复用面 m=285/285 = 9120` 而客户端 `cached=0` ✗(pi 的 cacheRead 记账 → 误判需压缩)。
+修:把送帧段提到终态清理**之前**;终态清理变兵底且**叫名日记**(不再静默)。
+验:1-token EOS 形态三连会话 —— 修前会话 2/3 `cached=0`,修后 **9120** ✓。
+
+**bug②:宿主梯从不驱逐**(`crates/store/src/rel.rs::plan_snap_offload`)。
+旧行为:宿主满 ⇒ `acquire()` 直接 `Exhausted` ⇒ 引擎回落"丢**新**快照"
+⇒ 开机做过几轮会话后,3 GB 宿主梯被旧链边界**永久占满** ⇒ 14k prompt 的 28 个边界里
+**18 个被丢**。
+修:**满 ⇒ 先用同一份 `EvictPolicy` 逐最冷的 `Tier::Host` 条目**(政策住 store,
+与 KV 腿共用一本策略;逐出量经 `snap_host_evicted_bytes` 差分上报 + `store.snap.host_evict_bytes`
+指标——store 零日志依赖)。store 门 `snap_leg.rs::③` 从"满即拒"改写为"满⇒逐最冷腾位"(含零副作用/un 断言)。
+
+#### (10.4) 实测(同二进制 + 同"脏"启动状态,前置三连 9.1k 会话污染宿主梯)
+
+| 场景 | 修前 | **修后** |
+|---|---|---|
+| 14k 冷 prompt(28 边界) | 8 下沉 + **18 丢** | **26 下沉 + 0 丢** |
+| 后续新会话:共享 3.5k 前缀 | 2048(57.8%)· 1.60 s | **3072(86.7%)· 0.85 s** |
+| 共享 7.0k 前缀 | **2048(29.1%)· 4.79 s** ✗ | **6656(94.6%)· 1.36 s** |
+| 共享 10.5k 前缀 | 5632(53.4%)· 4.53 s | **10240(97.2%)· 0.90 s** |
+| pi 型同会话历史重发(9.1k) | — | **9120/9148 = 99.7%**、0.64 s(1 分块) |
+
+**F1(粒度上界,已记非 bug)**:跨会话**部分**前缀的复用面 = 最近一个**在场快照**
+≤ 共享长度;而快照只在 **chunk 尾**(512,经 L4 合并可到 1024)出现 ⇒ 最多丢 ~1 个
+合并块(实测:5.6k 共享拿 4608 = 82%,差 ~1k tok ≈ 1 s/新会话)。
+pi 的**历史重发不受影响**(共享段尾 = 上轮生成末页,已由 (8) 的逐页快照覆盖 ✓)。
+候选修法(未做):①降 chunk 宿主税(~250 ms/chunk ⇒ 只 32 tok 一块)——prefill-graph M0 的
+“命令批/零回执”做完才划算;②导出 FLA chunked 核的**逐 chunk 状态**(核内已有,
+导出即可得 64-128 tok 粒度)。
+
+#### (10.5) 定档结论 + 未做
+
+- **不动尺寸**:`snap_max=4` / `snap_host_mb=3072` / `prefix_cache_share=0.75` / `pool_tokens=16896`
+  —— 修政策后实测均充分(上表)。
+- **改的是政策**(无新旋钮、无需配档):宿主梯**有界 LRU** + 真值帧**次序**。
+- 未做:①F1 两条候选;②启动期预热宿主梯;③ctx 升档时池/份额的联动算式(现在写在
+  `flavors/*.toml` 注释里:`pool_tokens ≈ ctx/page + 1 页余量`,升级时直接套)。
+
+
+
+
+## §9.2 G5 服务面能力缺口实录(2026-10-19;server/engine 服务层专项)
+
+立案 = `roadmap.local/agent-服务面-剩余工作项-2026-10-14.md` §G 的 **G5** 行:
+keep-alive ・`/v1/completions` ・`/tokenize` ・Responses API ・`/debug/agent` ・
+undo/rollback ・`reasoning_tokens`。**施工序**(风险从低到高):
+① `reasoning_tokens` ② `/debug/agent` ③ `/tokenize` ④ keep-alive(唯一动协议面 ——
+连接级 permit / SSE chunked / 空闲超时)。
+
+### (1) ✅ `reasoning_tokens` 分通道计数(2026-10-19)
+
+**契约**见 §3.5。实现两处:
+- `apps/server/src/toolcall.rs`:`ChannelSplitter` 加 `reasoning: usize` + 访问器
+  `reasoning_steps()`;`push()` **入口**判相位(入口态 = Think ⇒ +1)。调用契约钉在
+  方法 doc 上:**一个引擎 token 恰好调一次 `push`**(批量合并多个 token 会低估)。
+- `apps/server/src/openai.rs`:`Usage.reasoning`;`Completed` 帧处取
+  `splitter.reasoning_steps()` 终值;流式 usage 帧与 `completion_json` **两形态单源**。
+
+**为什么不用 tokenizer 反数**:标记文本(`</think>` 等)被解析器吞掉,反数与会话真值
+天然不等;且多一次 CAS 往返不値当 —— 引擎侧“1 token = 1 采样步”,而协议层每 token
+调一次 `push`,已是**精确账**。
+
+**边界口径(有意为之)**:`</think>` **标记本体计为思考 token** —— 它由思考段生成;
+而“思考与答案同一 token”的病态边界(实机 0.8B 见过:1 token 同时关思考 + 出答案)
+按**入口相位**判 ⇒ 计 1。这是“相位归属”而不是“文本归属”;口径稳、不需额外状态。
+
+**真机验证(dev-08b / 3090 Ti@41:00 / 8135;非流式 usage 读数)**:
+
+| 场景 | `completion_tokens` | `reasoning_tokens` |
+|---|---|---|
+| thinking 关(`enable_thinking=false`) | 1 | **0** |
+| thinking 开,长思考 | 80 | **80** |
+| thinking 开,单 token 关思考 + 出答案 | 1 | **1** |
+| 工具历史 + 思考档(345 tok prompt) | 24 | **24** |
+
+**门**:`agent_wire_smoke.py` **全 PASS**(新增两形态断言:流式 usage 帧与
+非流式 usage 都有 `completion_tokens_details.reasoning_tokens`,且 `0 ≤ R ≤ completion`)、
+`cargo test -p server --bins` **37/37**(新增
+`toolcall::tests::reasoning_steps_are_phased_by_channel` 三档相位)、
+`cargo check -p server --tests` 干净。
+
+**未跑** `apps/server/tests/e2e.rs`(27B 黑盒门;新增断言 = 两形态透出 +
+`reasoning ≤ completion`)—— 与后续 G5 项合并跑一轮。
+
+### (2) ✅ `/debug/agent` 诊断环(2026-10-19)
+
+**契约**见 §3.6。实现三块:
+- `apps/server/src/agent_trace.rs`(**新模块**,486 行):五面事实 struct
+  (`ReqFacts`/`PromptFacts`/`UsageFacts`/`OutcomeFacts`/`TurnTrace`)+ 环形仓
+  `AgentTrace`(固定深 `TURNS = 8`)+ 施工期账本 `TurnLedger`。
+- `apps/server/src/toolcall.rs`:`ChannelSplitter` 加**结构轨迹**
+  (`Vec<StructEvent>`,`TRACE_CAP = 512` + `trace_dropped` 记账;`malformed()` 计数)。
+- `apps/server/src/main.rs`:模块接入 + **`ConnCtx` 收拢**(serve 参数从 6 个涨到 7 个
+  时收口 —— 再逐个下传就要靠注释对位了)+ 三条路由。
+- `apps/server/src/openai.rs`:`chat(…, trace)` 开账 → 逐帧记账 → `commit`。
+
+**几条设计选择(为什么这么写)**:
+- **不做全局变量**:`main` 建 `Arc<AgentTrace>` → `ConnCtx` → `chat`(同 `/debug/blocks`
+  的 face 律:显式依赖)。
+- **不设新配置键**:深度固定 8、内存上界 ~256 KiB(截断 + 账号),不值得开档位旋钮
+  (且 `crates/shared/src/config.rs` 正被 prefill-parallel 线占用 —— 不添交叉)。
+- **不许静默丢**(律 #1):①轨迹超限计 `trace_dropped`(尾行 `…(+N dropped)`);
+  ② prompt 截断计 `omitted_bytes`(账面平);③每轮**必留一条** —— `TurnLedger::drop`
+  是兑底网(提前返回/`?` 传播也会显形为 `error = 未结算(提前返回;见服务端日志)`)。
+- **只记结构不记 delta**:轨迹是排查骨架,不做第二份输出副本(不然内存/隐私两面都输)。
+- **失败与拒绝同样留痕**:显式 `led.fail(...)`(Rejected / turn Failed / 协议序错乱 /
+  客户端断开 / 引擎通道关闭)⇒ “短 turn 看不到真账”这类 A7 族盲区不再靠猜。
+
+**真机验证(dev-08b / 3090 Ti@41:00 / 8135)**:
+| 场景 | 读数 |
+|---|---|
+| 一轮正常生成后 `GET /debug/agent` | 5 轮留痕(cap 8);末轮 usage/outcome/events 全在场,`ttft_ms=140`/`elapsed_ms=327` |
+| 超预算请求(prompt 24012 + 生成 8 > 4096) | **拒绝也留痕**:`error = "提交被拒:submit: prompt 24012 + 生成 8 超预算 4096"` |
+| 大 prompt(120069 B) | 截断账面平:`head 8190 + tail 24576 + omitted 87303 = 120069` ✓ |
+| `GET /debug/agent/1` / `POST /debug/agent/clear` / `GET /debug/agent/abc` | 1 轮 / `cleared:5` / **400**(不静默回缺省) |
+
+**门**:`agent_wire_smoke.py` **全 PASS**(新增 4 项:有轮次记录 / 含请求事实+usage 真账 /
+含结构轨迹 / prompt 快照含本轮用户文本;并断言非法段 400)、
+`cargo test -p server --bins` **43/43**(新增 agent_trace 5 条 + 轨迹 1 条)。
+
+**未做**:`e2e.rs`(27B 黑盒门;与后续 G5 项合并跑);预算/排队面的诊断(易做,
+暂区——现有 outcome 已能看出异常)。
+
+### (3) ✅ `POST /tokenize` 工具面(2026-10-19)
+
+**契约**见 §3.7。实现四块:
+- `crates/models/src/tokenizer.rs`:**`try_encode`(Result 版)**;旧 `encode`
+  改为薄封装(保留吞错回退 + 日志)—— 新调用方走显式路。
+- `crates/engine/src/running.rs`:**`RunningEngine::tokenize(text, chat_wrap)`**
+  (+ 新类型 `TokenizeReply { tokens, max_seq_tokens }`,已从 crate 根导出);
+  `chat_wrap` 分支复用 `Tokenizer::chat_wrap`(与裸文本提交**同一律**,不重写)。
+- `apps/server/src/actor.rs`:`EngineReq::Tokenize { text, chat_wrap, reply(oneshot) }`
+  —— **不落 turn、不碰池/图**;首收与积压两处共同收拢到新 `handle_req`
+  (Abort / Tokenize / Chat 三路由,不再在两个地方写两份 if-let)。
+- `apps/server/src/openai.rs`:`tokenize_plan`(**纯校验**,可单测)+ `tokenize`
+  (oneshot 往返;投递失败/通道关都以 503 显式上抛);`main.rs` 一条路由。
+
+**为什么不做 vLLM 全兼容**:vLLM 的 `add_special_tokens` 默认 true、`messages`
+要 chat_template、还会回 `token_strs`。我们只做**能说真话**的子集:
+`mode=raw|chat` 两模式显式化,`add_special_tokens=true` **响亮拒**
+(而不是静默接受一个不生效的开关)。
+
+**真机验证(dev-08b / 3090 Ti@41:00 / 8135,`agent_wire_smoke.py` 实测)**:
+
+| 项 | 读数 |
+|---|---|
+| `raw`(“用一句话说明什么是目录。”) | `count 6 == len(tokens)`,`max_model_len 4096` |
+| `chat`(同文本,家族包装) | **18** —— 与**同文本走 chat 面的 `prompt_tokens = 18` 逐字对上**(单轮下“模板渲染 ≈ chat_wrap”;两路各自独立算账) |
+| 响亮拒 | 空 prompt / `mode=tokens` / `add_special_tokens=true` / 未知字段 → **全 400** |
+
+**门**:`agent_wire_smoke.py` **全 PASS**(新增 6 项:`count==len(tokens)`、
+`max_model_len`、`chat > raw`、四类 400);`cargo test -p server --bins` **44/44**
+(新增 `tokenize_plan_modes_and_rejects`);`cargo check -p server --all-targets` 干净。
+
+**未做**:`messages` 渲染(候选:把 chat 的渲染参数构造抽成公共面即可复用)、
+`token_strs`(逐 token 文本,vLLM 有)、生成期间可查(见 §3.7 单源/延迟说明)。
+
+### (4) ✅ keep-alive + SSE chunked 定界(2026-10-19)
+
+**契约**见 §3.8。实现四块:
+- `apps/server/src/http.rs`:请求行版本 + `Connection` 语义解析(`Request.keep_alive` /
+  `.http_11`;列表形 `keep-alive, close` 也认);`respond_json`/`respond_text` 去掉
+  `Connection: close`(自定界);`respond_sse_head` 改 `Transfer-Encoding: chunked`;
+  `sse_data` 加 chunk 帧;新增 `sse_end`(`0\r\n\r\n`)。
+- `apps/server/src/main.rs`:**serve = 请求循环**(空闲超时 / 请求数上限 /
+  per-request permit / 非 1.1 ⇒ 505 + 关);路由拆到 `handle`(连接生命周期与
+  单请求处置解耦)。
+- `apps/server/src/openai.rs`:三处 SSE 收口都调 `sse_end`(正常完成 / 错误流 /
+  环外 break);流式写入失败仍走 Err ⇒ 连接不重用(帧不可信)。
+- `apps/server/tests/keep_alive_probe.py`(新):**裸 socket** 六项探针。
+
+**战役教训(插桩定位,值得记)**:首版实现后连接仍一请求即死,表象是
+“客户端复用时报 dead / 服务端读到 EOF”。真因 = `handle` 尾部残留旧时代的
+`stream.shutdown().await`(一请求一连接时代的“发 FIN 收尾”)——
+**keep-alive 下它把每条连接在首响应后直接杀掉**。定位路径:
+① 裸 socket 复现(排除客户端);② `ss -tn` 看到 `FIN-WAIT-2`(服务端主动 FIN);
+③ 在 serve 四个返回分支插 `eprintln` ⇒ 命中 `read=0(peer EOF)`;
+④ 全文搜 `shutdown(` ⇒ 一行定罪。教训:**协议面改造要把“旧时代的收尾动作”
+一起清点**(半关闭、flush、close 都算)。
+
+**真机验证(dev-08b / 3090 Ti@41:00 / 8135)**:
+
+| 项 | 读数 |
+|---|---|
+| 同连接两请求(JSON) | 两应答均完整,连接不断 |
+| SSE | `Transfer-Encoding: chunked` + 终止块;**流后同连接再发 `/health` 仍 200** |
+| `Connection: close` | 应答后关连接(尊重) |
+| `HTTP/1.0` | **505 + 关** |
+| curl 双 URL | “Connection #0 left intact” 后**不再 dead**(修复前必 dead) |
+
+**门**:`keep_alive_probe.py` **6/6**;`agent_wire_smoke.py` 全 PASS(urllib 原生吃
+chunked —— 这就是“真客户端形状”的验证);`e2e.rs` 27B **46.4s 全 PASS**
+(**需同步改测试侧**:裸 socket SSE 读侧加 `dechunk` + 字节级累积;
+否则 chunk 长度行会污染 usage 帧 JSON);单测 **46/46**(新增 keep-alive 判定 +
+chunk 帧两项)。
+
+**未做**:真 pi/undici 实测(需起真机客户端);`/debug/perf` 等大文本面的分块
+(现仍 Content-Length,够用);HTTP/2 不在路线图。
+
+### (5) ✅ pi 真机验证 + 日志面两修(2026-10-19)
+
+**验证形状**:真 **pi(undici 连接池)** → 27B 生产档(`spec-dflash` + `prefix-reuse-27b.toml`,8137)
+多轮 + 工具调用。
+
+| 读数 | 值 |
+|---|---|
+| 会话 | 4 轮(第 2 轮带 13 tools 的 agent 形状) |
+| 传输面 | **`[conn]` 警告 0 / abort·error·fail 0** —— keep-alive + chunked 在真客户端下零异常 |
+| 工具 | 第 2 轮 `finish=tool_calls`,解析器轨迹 `tool #0 bash args=83B` |
+| 前缀复用 | 第 3 轮 cached **13952/14112 = 98.9%**、第 4 轮 **14208/14229 = 99.85%**;TTFT 12.4s(冷 prefill 13.8k)→ **1.0-1.3s** |
+| reasoning | 41 / 59 / 43(均 ≤ completion) |
+| `/debug/agent` | 四轮全在场(usage/outcome/events),零 `error` |
+
+**日志面两修(真机暴露,已修并复验)**:
+1. `[WARN] [owl-gpu] free: N/M 块归池` **刷屏**(单会话 **49920** 行,把真信号淹了)
+   —— 常规路径改 **DEBUG**;只有 `freed ≠ 请求数`(**账目不平** = 真异常)才升 WARN。
+   实测(dev-08b):1500 tok 生成下 debug 档 546 行 DEBUG / warn 档 **0** 行 / 账目不平 **0**。
+2. `[WARN] [store] 快照下沉失败: … 不可下沉(生成段边界…)`(单会话 9 条)——
+   **设计行为被报成故障**:生成段快照(Transient)本就是“逐出即丢”,store 的不变量
+   拒它下沉**是对的**,错在引擎“先试下沉再丢”。改:Victim 是 Transient ⇒ **不试下沉**
+   (DEBUG 记账);只有 Durable 才走下沉重试。实测:1500 tok ⇒ **47** 条“逐出生成段快照”
+   DEBUG(与 1500/32 ≈ 47 个页边界逐一对应)、**0** 条失败 WARN。
+
+**未做(挂账)**:pi 发的 `store` 未知字段(无害,已记日志)。
+
+### (6) ✅ pi 口径定档 64k(2026-10-19;上一节的后续)
+
+**起因**:上节把 pi 的 `contextWindow` 对齐到当时跑的 **16k** 档 —— 但本工作区 pi 会话
+(系统提示 + 工具 + AGENTS.md + 历史)远超 16k ⇒ 真机直接“Response was truncated”。
+口径错在“拿小档当常态”:16k 是 **AGT-13 的 agent 定档**,不是能力上限。
+
+**处置**:
+- 新测装 `testdata/args/pi-27b-64k.toml`(gitignored;基座 = `spec-dflash`,
+  只改 `max_seq=65536` + `pool_tokens=66048`,`prompt_dump=false`)——
+  启动命令与口径注在文件头;
+- pi 侧 `~/.pi/agent/models.json`:**contextWindow 65536 / maxTokens 8192**(备份
+  `models.json.bak-agent-1019-pi-align`);
+- 实测池:2064 页 = 66048 tok(治理器 cap 85251 ⇒ 未被夹),per_tok 53248B
+  (主池 32768 + 草稿池 20480,DFlash2 仍在);**>16k 实测**:16064 tok prompt
+  200 OK / prefill ≈1036 t/s / 墙钟 15.5s / **零“预算收缩”告警**。
+
+**pi 真机第二轮(64k 档,7 轮)**:
+
+| 轮 | prompt | cached | TTFT | 结局 |
+|---|---|---|---|---|
+| #2(冷) | 13857 | **0** | 12.25 s | length(1 tok) |
+| #3 | 13857 | **13856 = 100.0%** | **0.42 s** | `tool_calls`(`tool #0 bash args=83B`) |
+| #4 | 14112 | 13952 = 98.9% | 0.46 s | stop |
+| #5 | 13858 | 12800 = 92.4% | 1.33 s | `tool_calls` |
+| #6 | 14103 | 13920 = 98.7% | 0.76 s | stop |
+| #7 | 14223 | 14176 = 99.7% | 0.77 s | stop(comp 331) |
+
+**日志面(两修后的效果实证)**:整轮 pi 会话日志 **117 行**(修前同形状会话 50097 行);
+`[conn]` 警告 **0** / abort·error·fail **0** / “预算收缩” **0**;仅 6 条
+`未知字段 ["store"]`(pi 发的,无害)。
+
+**待办**:若将来要更大,`flavors/awq27b-262k.toml` 是单卡 262144 超卖档
+(设备 3 GiB + 宿主 9 GiB、fp8 KV、需虚拟化两扇门),代价 = **无 DFlash2 投机**。
 ## §十 变更记录
 
 | 日期 | 版本 | 变更 |
 |---|---|---|
+| 2026-10-19 | v0.15 | **pi 口径定档 64k**(测装 `pi-27b-64k.toml` + pi `contextWindow 65536/maxTokens 8192`;>16k 实测 16064 tok OK;pi 真机 7 轮:冷 12.25s → cached 100.0%/98.9%/92.4%/98.7%/99.7%,TTFT 0.42-1.33s;日志 117 行/零 conn 警告/零收缩)—— 见 §9.2(6) |
+| 2026-10-19 | v0.14 | **G5 真机收口**:pi(undici)真客户端验证——keep-alive/chunked 零 `[conn]` 警告,4 轮含工具调用;前缀复用 cached 98.9%→99.85%,TTFT 12.4s→1.0-1.3s;`/debug/agent` 四轮全在场。**日志面两修**:①`owl-gpu` free 刷屏(49920 行/会话)降 DEBUG,仅账目不平升 WARN;②生成段快照(Transient)不再试下沉(设计行为曾被报成故障 WARN)—— 见 §9.2(5) |
+| 2026-10-19 | v0.13 | **G5(4) keep-alive 落地**(请求循环 + 每请求 permit + 空闲 30s + 请求数上限;SSE 改 **chunked 定界**;JSON/文本自带定界;非 1.1 ⇒ 505);战役教训:**旧 `stream.shutdown()` 残留会每响应发 FIN 掐死复用连接**(插桩定位);门 = 裸 socket 探针 6 项 + wire smoke + e2e 27B(46.4s)+ 单测 46/46 —— 见 §3.8 / §9.2(4) |
+| 2026-10-19 | v0.12 | **G5(3)`POST /tokenize` 落地**(raw/chat 两模式;单一真源=引擎 tokenizer;`add_special_tokens=true` 等四类响亮拒;`Tokenizer::try_encode` 显式 Result 版);门 = wire smoke 6 项断言 + 单测 44/44;真机 raw 6 / chat 18(与 chat 面 prompt_tokens 对上)—— 见 §3.7 / §9.2(3) |
+| 2026-10-19 | v0.11 | **G5(2)`/debug/agent` 诊断环落地**(最近 8 轮:请求事实 / prompt 头尾快照 / usage 真账 / 结局 / 解析器结构轨迹;`TurnLedger` Drop 兑底网;接 `ConnCtx`);门 = wire smoke 4 项断言 + 单测 43/43 + 真机四场景 —— 见 §3.6 / §9.2(2) |
+| 2026-10-19 | v0.10 | **G5(1)`reasoning_tokens` 落地**(解析器相位归因;流式/非流式两形态单源;门 = wire smoke 两形态断言 + server 单测 37/37;真机 0.8B 四场景实测)—— 见 §3.5 / §9.2(1) |
 | 2026-10-14 | v0.9 | **§7.11:A7/A8 深挖** —— 定谳到 **prefill 末行 logits 的布局相关错读**(布局运气律:所有变量都是扰动而非因;`prefill_split` 由核发射账证伪)⇒ 真凶 = 释放块**设备地址复用**(UAF 类),**未根治**,已落 plain-eval 缓解 + 立案 A13;**A11 spec 臂采样化落地**(verify 出 logits 槽 + 抽-比式接受,分布精确,单测+真机);G4 口径定谳(token 级只在 spec-off);pi 真机进步到"发 `<tool_call>` 未闭合"(残余归 D2) |\n| 2026-10-14 | v0.8 | **第二批交付**:AGT-06(per-turn 采样/stop/seed,引擎侧 `TurnOpts`)/07(reasoning_effort 直通)/09(implicit_session)/10(abort)/11(chunked)/12(cached_tokens 真值含块级命中)/13(定档维持 16k);B1-B4(`[agent]` 配置模块 + e2e agent L1 七段 + `agent_gates.sh`);A3/A4/A5 ✅;D1 ✅(**两层前缀复用 + G4 真值门**:同会话 88% / 跨会话 89%)、D3(agent 域 AL 2.68)、D4(4 并发无并行);**新增 §7.8 A8 = spec 臂 token 级非路径稳定**(与 A7 疑同源,恒等/真值门一律 spec-off 跑);实测数字全部入 §7.9。 |
 | 2026-10-14 | v0.7 | 清 A 组引擎债三项:**A1 拒启可见**(四项真机实测)/ **A2 `snap_max=0` 不再 panic**(真机 4/4、零 503)/ **A6 think 别名**(+单测);生产档回归绿(wire 17/17、lag 4/4、pi 全链 1 次成功)。**新增 A7:工具调用遵循度实测 1/9**(模型倾向直接作答+幻觉完成,日志证明非解析丢失)= 现第一优先,台账见 `roadmap.local/agent-服务面-剩余工作项-2026-10-14.md`。 |
 | 2026-10-14 | v0.6 | **T7 PASS + §7.7 结案**:病灶 = `rep_penalty` 逐元素施加 ⇒ `1.15^k` 指数累积(短输出无感、长思考必崩),已修(去重 + 默认 1.0,单测 7/7);真机生产形状(froggeric + spec d7 + fp8/XQA)pi↔owl 全链跑通,产物文件落地。**M-A 达成**。另记:本轮另修引擎 3 项(XQA 页表恒等链 × 多会话、配置错误静默 exit、`snap_max=0` panic 立案)。 |

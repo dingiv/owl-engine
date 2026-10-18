@@ -1513,7 +1513,23 @@ impl GpuServer {
         self.sink.timer("srv.seg.free", t0.elapsed());
         self.sink.count("srv.count.free_blocks", freed as u64);
         if self.probes.debug {
-            self.sink.logf(owl_shared::log::LVL_WARN, "owl-gpu", format_args!("free: {}/{} 块归池", freed, ids.len()));
+            // 常规路径 **DEBUG**(每 chunk 一次,不该占 WARN);只有账目不平
+            // (freed ≠ 请求数 = 真异常)才升 WARN —— 2026-10-19 pi 真机实测:
+            // WARN 档下一次会话刷 49920 行,把真信号淹了
+            if freed == ids.len() {
+                self.sink.logf(
+                    owl_shared::log::LVL_DEBUG,
+                    "owl-gpu",
+                    format_args!("free: {}/{} 块归池", freed, ids.len()),
+                );
+            } else {
+                // 账目不平 = 真异常 ⇒ 升 WARN(响亮;不静默也不刷屏)
+                self.sink.logf(
+                    owl_shared::log::LVL_WARN,
+                    "owl-gpu",
+                    format_args!("free: {}/{} 块归池(**账目不平**)", freed, ids.len()),
+                );
+            }
         }
         ack.send(Ok(()));
     }

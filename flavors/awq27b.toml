@@ -27,6 +27,9 @@ gdn_slots = 1
 # ③ 状态腿快照(`snap_max` + `snap_host_mb`):复用要求**边界快照在场**
 #    (GDN 态对不上就不能复用)。每条 152 MiB;`snap_host_mb > 0` 让旧快照
 #    **下沉**而不是被顶掉 ⇒ `reuse_face` 能回查到更早的边界。
+# ④ 生成相位逐页边界快照(`snap_decode_stride` 缺省 1;§9.1(7)):带 spec 时
+#    轮内 fold 回卷拍边界,不带 spec 那档走裸 decode 的逐页捕获 —— 两者均记
+#    `Transient`(逐出即丢),前缀段边界记 `Durable`(可下沉)。
 # VRAM 账(27B/24G):设备池 528 MiB + 快照 4×152=608 MiB(原 1×152);
 # 宿主账:KV 4096 MiB + 状态腿 3072 MiB(与 `[pool].host_cache_mb` 同源校验)。
 prefix_cache = true

@@ -84,13 +84,25 @@ impl Tokenizer {
 
     /// 文本 → token id(不自动加特殊 token;调用方经 chat_wrap 拼模板)
     pub fn encode(&self, text: &str) -> Vec<u32> {
-        self.inner.encode(text, false).map(|e| e.get_ids().to_vec()).unwrap_or_else(|e| {
-            // 不静默(2026-10-17 审查 §六轮):编码失败 = 空 token 序列会让上层
-            // 以为"这段文本是空的" ⇒ 必须留下痕迹。**签名升 `Result` 是正解**,
-            // 影响面 = 16 处调用(engine 的 exec/detokenize 链),另案。
-            owl_shared::log_warn!("tok", "encode 失败({e});回退空序列");
-            Vec::new()
-        })
+        match self.try_encode(text) {
+            Ok(ids) => ids,
+            Err(e) => {
+                // 不静默(2026-10-17 审查 §六轮):编码失败 = 空 token 序列会让上层
+                // 以为"这段文本是空的" ⇒ 必须留下痕迹。**新调用方用 [`try_encode`]**
+                // (显式 Result);这里保留旧行为是为了不动线上 16 处调用(另案)。
+                owl_shared::log_warn!("tok", "{e};回退空序列");
+                Vec::new()
+            }
+        }
+    }
+
+    /// **显式 Result 版编码**(G5③:服务面 `/tokenize`)—— 不走 [`encode`]
+    /// 的吞错回退:"编码失败"与"文本是空的"必须可分。
+    pub fn try_encode(&self, text: &str) -> Result<Vec<u32>, String> {
+        self.inner
+            .encode(text, false)
+            .map(|e| e.get_ids().to_vec())
+            .map_err(|e| format!("tokenize 失败: {e}"))
     }
 
     /// token id → 文本(skip special;增量解码 = 全量解码后取后缀差分,

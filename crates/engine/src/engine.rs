@@ -182,6 +182,10 @@ pub struct EngineKnobs {
     /// 重算。开 ⇒ 单块档切一刀(尾巴 <1 页,多付一份 ~250ms chunk 宿主税),
     /// 换"prompt 最靠后的整页"有快照;多 chunk 档不受影响(前段尾本来就对齐)。
     pub prefill_align_tail: bool,
+    /// **生成相位页边界快照页步长**(§9.1(6)a;`[pool] snap_decode_stride`,缺省 1)。
+    /// spec 轮提交跨过页边界 ⇒ 用 fold 把 GDN 态回卷到边界拍一张再卷回;
+    /// 本键节流(`边界页号 % stride == 0` 才拍)。0 = 关(旧行为:生成相位不拍)。
+    pub snap_decode_stride: usize,
     /// **prefill 图档位**(P1;`[graph] prefill_bucket`;缺省 `off` = 今天行为)
     pub prefill_bucket: owl_shared::config::PrefillBucket,
     /// **FI plan 图档瓦**(`[dispatch] fi_cuda_graph`;2026-10-18 图档单图立案):
@@ -259,6 +263,7 @@ impl Default for EngineKnobs {
             no_graph: false,
             prefill_tail_merge: 0,
             prefill_align_tail: true,
+            snap_decode_stride: 1,
             prefill_bucket: owl_shared::config::PrefillBucket::Off,
             fi_cuda_graph: false,
             fi_plan_bake: None,
@@ -433,7 +438,7 @@ impl EngineKnobs {
             }
         };
         format!(
-            "pool={:?} turns={} snap_max={} host={}M snap_host={}M prefix_cache={}:{:.2} align_tail={} | kvmem={}[idx={} cov={} view={} part={} ws={}tok(sink{}+recent{}+topk{}@32tok/page) every={} evict={} floor={}] | fi={} split={} gdn_chunked={} kv={} graph_off={}",
+            "pool={:?} turns={} snap_max={} host={}M snap_host={}M prefix_cache={}:{:.2} align_tail={} bnd_stride={} | kvmem={}[idx={} cov={} view={} part={} ws={}tok(sink{}+recent{}+topk{}@32tok/page) every={} evict={} floor={}] | fi={} split={} gdn_chunked={} kv={} graph_off={}",
             self.pool_tokens,
             self.gdn_slots,
             self.snap_max,
@@ -442,6 +447,7 @@ impl EngineKnobs {
             self.prefix_cache as u8,
             self.prefix_cache_share,
             self.prefill_align_tail as u8,
+            self.snap_decode_stride,
             if self.kvmem_virtualization { "ON" } else { "off" },
             self.index_probe as u8,
             self.coverage_probe as u8,
@@ -550,6 +556,7 @@ impl EngineKnobs {
                 .unwrap_or(cfg.pool.gdn_slots),
             prefill_tail_merge: cfg.runtime.prefill_tail_merge,
             prefill_align_tail: cfg.pool.prefill_align_tail,
+            snap_decode_stride: cfg.pool.snap_decode_stride,
             // 快照池容量:env 覆盖(实测调压;命中面要求边界快照在场)
             snap_max: owl_shared::env_reader::parse("OWL_SNAP_MAX").unwrap_or(cfg.pool.snap_max),
             vram_target: cfg.pool.vram_target,

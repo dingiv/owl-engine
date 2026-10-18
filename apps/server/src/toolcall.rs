@@ -98,6 +98,56 @@ fn canon(m: &str) -> &'static str {
 /// 工具块长度上限(病态保护:未闭合工具块不得吃满内存)
 const MAX_TOOL_BYTES: usize = 1 << 20;
 
+/// 结构轨迹**硬上限**(每 turn;超出计 `dropped`,不静默丢)
+const TRACE_CAP: usize = 512;
+
+/// 解析器**结构轨迹事件**(G5②:`/debug/agent` 的“状态机轨迹”)。
+///
+/// **只记结构**(状态迁移 / 吞空白 / 游标 / 工具块 / 收尾),
+/// **不记 delta 文本** —— 轨迹是排查用的骨架,不做第二份输出副本。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StructEvent {
+    /// 状态迁移(think / text / tool 三态;由标记驱动)
+    State { from: &'static str, to: &'static str },
+    /// 结构空白吞除量(关思考标记之后的 `\n`;模板资产,见 `swallow_lf`)
+    SwallowLf(usize),
+    /// 游标标记(当前态下不该出现的标记;已吞掉不泄漏)
+    Stray(&'static str),
+    /// 工具调用闭合(解析成功)
+    Tool { index: usize, name: String, arg_bytes: usize },
+    /// 畸形工具块(未闭合/超限/参数不可解析;上层记日志)
+    Malformed { kind: &'static str, bytes: usize },
+    /// 生成流结束时的状态与尾巴余量
+    Finish { state: &'static str, held_bytes: usize },
+}
+
+impl StructEvent {
+    /// 单行紧凑形态(JSON 数组里的字符串;人读 + grep 两用)
+    pub fn line(&self) -> String {
+        match self {
+            StructEvent::State { from, to } => format!("state {from}→{to}"),
+            StructEvent::SwallowLf(n) => format!("swallow_lf {n}"),
+            StructEvent::Stray(m) => format!("stray {m}"),
+            StructEvent::Tool { index, name, arg_bytes } => {
+                format!("tool #{index} {name} args={arg_bytes}B")
+            }
+            StructEvent::Malformed { kind, bytes } => format!("malformed {kind} {bytes}B"),
+            StructEvent::Finish { state, held_bytes } => {
+                format!("finish {state} held={held_bytes}B")
+            }
+        }
+    }
+}
+
+/// 状态 → 轨迹里的短名(轨迹只存 `&'static str`,不外露 `State`)
+fn state_name(s: State) -> &'static str {
+    match s {
+        State::Text => "text",
+        State::Think => "think",
+        State::InTool => "tool",
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
     Text,
@@ -173,6 +223,21 @@ pub struct ChannelSplitter {
     /// 游标标记计数(如关思考时仍吐 `</thinking>`)—— 一律**吞掉**不泄漏
     /// 进通道,但计数交给上层记日志(不许静默)
     strays: usize,
+    /// **思考相位的采样步数**(G5:`completion_tokens_details.reasoning_tokens`)。
+    ///
+    /// 口径:引擎 1 个 `TurnEvent::Token` = 1 次采样 = 1 个 token,而协议层
+    /// 每 token 调一次 [`push`](Self::push) ⇒ 以 **push 入口时的解析器状态**
+    /// 归因:Think 态 ⇒ 该 token 是思考相位产出(含 `</think>` 标记本体,
+    /// 它确实由思考段生成;其后的首个正文 token 已落 Text 态)。
+    /// 不用 tokenizer 反数 —— 标记文本会被解析器吞掉,反数与真值天然不等。
+    reasoning: usize,
+    /// 结构轨迹(G5②;有界 `TRACE_CAP`,超出计 `trace_dropped`)
+    trace: Vec<StructEvent>,
+    /// 轨迹超出上限而被省略的事件数(**不静默**)
+    trace_dropped: usize,
+    /// 畸形工具块计数(G5②`/debug/agent` 的 `outcome.malformed`;
+    /// 三个入口:未闭合 / 超限 / 参数不可解析 —— 每一处都已落日志)
+    malformed: usize,
     /// **关闭思考标记之后的结构空白吞除余量**(UTF-8 安全:只吞 `\n`)。
     ///
     /// 为什么要有它(§4.3 渲染对称律 R1;2026-10-19 实测定谳):模板把一轮
@@ -199,6 +264,10 @@ impl ChannelSplitter {
             tool_index: 0,
             tool_on: true,
             strays: 0,
+            reasoning: 0,
+            trace: Vec::new(),
+            trace_dropped: 0,
+            malformed: 0,
             swallow_lf: 0,
         }
     }
@@ -229,11 +298,42 @@ impl ChannelSplitter {
         self.strays
     }
 
+    /// 本 turn 思考相位的采样步数(= `completion_tokens_details.reasoning_tokens`
+    /// 真源;见字段 `reasoning` 的口径注)
+    pub fn reasoning_steps(&self) -> usize {
+        self.reasoning
+    }
+
+    /// **结构轨迹**(G5②`/debug/agent`):只含结构事件,行序 = 发生序。
+    /// 超上限的尾巴以一条显式记账行收口(`…(+N dropped)`)。
+    pub fn structural_trace(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.trace.iter().map(StructEvent::line).collect();
+        if self.trace_dropped > 0 {
+            out.push(format!("…(+{} dropped)", self.trace_dropped));
+        }
+        out
+    }
+
+    /// 畸形工具块计数(诊断面;非零 = 上限层值得一条日志,已有)
+    pub fn malformed(&self) -> usize {
+        self.malformed
+    }
+
+    /// 记一条结构事件(满即计数,不静默丢)
+    fn trace_event(&mut self, e: StructEvent) {
+        if self.trace.len() < TRACE_CAP {
+            self.trace.push(e);
+        } else {
+            self.trace_dropped += 1;
+        }
+    }
+
     /// 标记 → 目标态。当前状态下不该出现的标记(Text 遇 `</thinking>`/
     /// `</tool_call>`;Think 遇 `<thinking>`)一律**吞掉不泄漏**(否则原文
     /// 会漏进正文/思考面板),并计数
     fn next_state(&mut self, m: &str) -> State {
-        match (self.state, canon(m)) {
+        let from = self.state;
+        let to = match (self.state, canon(m)) {
             (State::Text, MARK_THINK_OPEN) => State::Think,
             (State::Text, MARK_TOOL_OPEN) => State::InTool,
             (State::Think, MARK_THINK_CLOSE) => {
@@ -247,13 +347,24 @@ impl ChannelSplitter {
             (State::Think, MARK_TOOL_OPEN) => State::InTool,
             _ => {
                 self.strays += 1;
+                self.trace_event(StructEvent::Stray(canon(m)));
                 self.state
             }
+        };
+        if to != from {
+            self.trace_event(StructEvent::State { from: state_name(from), to: state_name(to) });
         }
+        to
     }
 
     /// 推进一个增量文本块 → 产出事件序列
+    ///
+    /// 调用契约:**一个引擎 token 恰好调一次**(reasoning 计数按调用入口
+    /// 状态归因;批量合并多个 token 会低估思考步数)。
     pub fn push(&mut self, chunk: &str) -> Vec<Item> {
+        if self.state == State::Think {
+            self.reasoning += 1;
+        }
         self.buf.push_str(chunk);
         self.drain()
     }
@@ -265,6 +376,11 @@ impl ChannelSplitter {
         match self.state {
             State::InTool => {
                 let raw = std::mem::take(&mut self.buf);
+                self.trace_event(StructEvent::Malformed {
+                    kind: "tool_call_unclosed",
+                    bytes: raw.len(),
+                });
+                self.malformed += 1;
                 out.push(Item::Malformed { kind: "tool_call_unclosed", raw });
                 self.state = State::Text;
             }
@@ -280,6 +396,9 @@ impl ChannelSplitter {
                         .count();
                     self.buf.drain(..n);
                     self.swallow_lf = 0;
+                    if n > 0 {
+                        self.trace_event(StructEvent::SwallowLf(n));
+                    }
                 }
                 if !self.buf.is_empty() {
                     let text = std::mem::take(&mut self.buf);
@@ -287,6 +406,10 @@ impl ChannelSplitter {
                 }
             }
         }
+        self.trace_event(StructEvent::Finish {
+            state: state_name(self.state),
+            held_bytes: self.buf.len(),
+        });
         out
     }
 
@@ -304,15 +427,20 @@ impl ChannelSplitter {
             // **结构空白吞除**(只在关闭思考标记之后;见 `swallow_lf` 注):
             // 缓冲空 = 不能定谳(流式,等下一个 chunk)⇒ 挂起。
             if self.swallow_lf > 0 && self.state == State::Text {
+                let mut swallowed = 0usize;
                 while self.swallow_lf > 0 {
                     match self.buf.as_bytes().first() {
                         Some(b'\n') => {
                             self.buf.drain(..1);
                             self.swallow_lf -= 1;
+                            swallowed += 1;
                         }
                         Some(_) => self.swallow_lf = 0,
                         None => break,
                     }
+                }
+                if swallowed > 0 {
+                    self.trace_event(StructEvent::SwallowLf(swallowed));
                 }
                 if self.swallow_lf > 0 {
                     break;
@@ -329,6 +457,11 @@ impl ChannelSplitter {
                     }
                     if self.buf.len() > MAX_TOOL_BYTES {
                         let raw = std::mem::take(&mut self.buf);
+                        self.trace_event(StructEvent::Malformed {
+                            kind: "tool_call_overflow",
+                            bytes: raw.len(),
+                        });
+                        self.malformed += 1;
                         out.push(Item::Malformed { kind: "tool_call_overflow", raw });
                         self.state = State::Text;
                         continue;
@@ -389,9 +522,18 @@ impl ChannelSplitter {
         match parse_tool_body(body, &self.schemas) {
             Ok((name, args)) => {
                 self.tool_index += 1;
+                self.trace_event(StructEvent::Tool {
+                    index,
+                    name: name.clone(),
+                    arg_bytes: args.len(),
+                });
                 Item::ToolCall { index, name, arguments: args }
             }
-            Err(kind) => Item::Malformed { kind, raw: body.to_string() },
+            Err(kind) => {
+                self.trace_event(StructEvent::Malformed { kind, bytes: body.len() });
+                self.malformed += 1;
+                Item::Malformed { kind, raw: body.to_string() }
+            }
         }
     }
 }
@@ -624,6 +766,71 @@ mod tests {
         let items = s.push("直接回答\n\n</think>\n\n续答");
         assert_eq!(split(&items), "T:直接回答\n\n|T:\n\n续答|");
         assert_eq!(s.strays(), 1, "游标标记要计数(上限层记日志)");
+    }
+
+    /// **G5 `reasoning_tokens` 真源**:按 `push` 入口状态归因。
+    /// ①开思考起步 ⇒ 思考 token 与 `</think>` 本体计,正文 token 不计;
+    /// ②关思考起步 ⇒ 恒 0(即使模型吐游标 `</think>` 也不计);
+    /// ③未关思考直接开工具 ⇒ 只计入工具前一 token,工具态不再计。
+    #[test]
+    fn reasoning_steps_are_phased_by_channel() {
+        let mut s = ChannelSplitter::new(true, tools());
+        s.push("想");        // Think ⇒ 1
+        s.push("</think>"); // 入口仍 Think(标记本体属思考段)⇒ 2
+        s.push("答");        // 入口 Text ⇒ 不计
+        s.push("案");
+        assert_eq!(s.reasoning_steps(), 2);
+
+        let mut s = ChannelSplitter::new(false, tools());
+        s.push("直接回答");
+        s.push("</think>"); // 游标:Text 入口 ⇒ 不计
+        assert_eq!(s.reasoning_steps(), 0);
+
+        let mut s = ChannelSplitter::new(true, tools());
+        s.push("<tool_call>"); // 入口 Think ⇒ 1(进工具态)
+        s.push("<function=bash>"); // InTool ⇒ 不计
+        assert_eq!(s.reasoning_steps(), 1);
+    }
+
+    /// **G5② 结构轨迹**:只记结构事件(绝不记 delta 文本),行序 = 发生序,
+    /// 畸形计数与事件同源。
+    #[test]
+    fn structural_trace_records_structure_not_text() {
+        let mut s = ChannelSplitter::new(true, tools());
+        s.push("想");        // 无结构事件(纯内容)
+        s.push("</think>"); // think→text
+        s.push("\n\n答");    // 吞两个结构换行
+        let tr = s.structural_trace();
+        assert!(tr.iter().any(|l| l == "state think→text"), "{tr:?}");
+        assert!(tr.iter().any(|l| l == "swallow_lf 2"), "{tr:?}");
+        assert!(
+            !tr.iter().any(|l| l.contains('想') || l.contains('答')),
+            "轨迹不得含 delta 文本:{tr:?}"
+        );
+
+        // 工具调用:tool 事件带序号/名/参数字节;正常路径 malformed = 0
+        let mut s = ChannelSplitter::new(true, tools());
+        let items = s.push(
+            "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>",
+        );
+        assert!(items.iter().any(|i| matches!(i, Item::ToolCall { .. })));
+        let tr = s.structural_trace();
+        assert!(tr.iter().any(|l| l.starts_with("tool #0 bash")), "{tr:?}");
+        assert!(tr.iter().any(|l| l == "state think→tool"), "{tr:?}");
+        assert_eq!(s.malformed(), 0);
+
+        // 未闭合工具块:malformed 计数 + 事件(与日志同源,不静默)
+        let mut s = ChannelSplitter::new(false, tools());
+        let _ = s.push("<tool_call><function=bash>");
+        let _ = s.finish();
+        assert_eq!(s.malformed(), 1, "未闭合要计数");
+        assert!(
+            s.structural_trace()
+                .iter()
+                .any(|l| l.starts_with("malformed tool_call_unclosed")),
+            "{:?}",
+            s.structural_trace()
+        );
     }
 
     /// I4:任何出口的 arguments 必须能被 JSON 解析

@@ -1,11 +1,17 @@
 //! 极简 HTTP/1.1 服务面(**架子**:锁文件零 HTTP 栈依赖,手写最小面)。
 //!
-//! 现状:每请求 `Connection: close`,SSE 用 close 定界(无 chunked 响应);
-//! 请求体支持 **Content-Length 与 `Transfer-Encoding: chunked` 两定界**
-//!(AGT-11,2026-10-14)。**挂账**:keep-alive —— 非不能,而是与并发闸门
-//! 语义相冲:现在"一连接 = 一个 permit"(main.rs),keep-alive 会让空闲
-//! 连接长期占住 permit(pi 各连接池数个死连接 × max_concurrency=4 ⇒
-//! 饿死)。正确修法是连接级 permit + 空闲超时,归 axum/hyper 迁移一并做。
+//! 现状(**2026-10-19 G5④:keep-alive 已开**):
+//! - 请求体支持 **Content-Length 与 `Transfer-Encoding: chunked` 两定界**
+//!   (AGT-11,2026-10-14);
+//! - 应答:JSON/文本 = `Content-Length` 定界(自定界 ⇒ 可复用连接);
+//!   **SSE = `Transfer-Encoding: chunked`**(见下);
+//! - 连接复用判定在 [`read_request`] 里落地(HTTP/1.1 缺省 keep-alive;
+//!   `Connection: close` 尊重;HTTP/1.0 只认显式 `keep-alive`)——
+//!   **连接的生命周期由 serve 循环掌握**(空闲超时/请求数上限/非 1.1 拒)。
+//!
+//! 为什么 SSE 必须 chunked:旧路用“连接关闭”定界 ⇒ 一次只能服务一个请求
+//! (pi 的连接池会因此把所有并发位耗在空闲连接上)。chunked 让流自带终止块
+//! (`0\r\n\r\n`,见 [`sse_end`]),连接随后可复用。
 
 use std::io;
 
@@ -20,6 +26,11 @@ pub struct Request {
     /// 不含 query 的路径
     pub path: String,
     pub body: Vec<u8>,
+    /// 本连接**可否复用**(HTTP/1.1 缺省 true;`Connection: close` ⇒ false;
+    /// HTTP/1.0 只认显式 `Connection: keep-alive` ⇒ 缺省 false)
+    pub keep_alive: bool,
+    /// 请求行是否为 `HTTP/1.1`(非 1.1 = 服务面拒:chunked 应答是 1.1 语法)
+    pub http_11: bool,
 }
 
 /// 读一个请求(对端关闭 = None)。请求体定界 = Content-Length **或**
@@ -47,8 +58,13 @@ pub async fn read_request<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<Opti
     let (Some(method), Some(target)) = (parts.next(), parts.next()) else {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "请求行非法"));
     };
+    // 版本:请求行第三段(缺省/异形 = 非 1.1 ⇒ 后续 serve 拒;
+    // chunked 应答是 1.1 语法,静默降级会跟复用判定撞车)
+    let http_11 = request_line.split_whitespace().nth(2) == Some("HTTP/1.1");
     let mut content_length = 0usize;
     let mut chunked = false;
+    let mut conn_close = false;
+    let mut conn_keep_alive = false;
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
             if k.trim().eq_ignore_ascii_case("content-length") {
@@ -57,9 +73,20 @@ pub async fn read_request<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<Opti
                 && v.to_ascii_lowercase().contains("chunked")
             {
                 chunked = true;
+            } else if k.trim().eq_ignore_ascii_case("connection") {
+                let v = v.to_ascii_lowercase();
+                // 逐 token 判(允许 `keep-alive, close` 这类列表形)
+                for tok in v.split(',') {
+                    match tok.trim() {
+                        "close" => conn_close = true,
+                        "keep-alive" => conn_keep_alive = true,
+                        _ => {}
+                    }
+                }
             }
         }
     }
+    let keep_alive = if http_11 { !conn_close } else { conn_keep_alive && !conn_close };
     if content_length > MAX_BODY {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "body 过大"));
     }
@@ -83,6 +110,8 @@ pub async fn read_request<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<Opti
         method: method.to_string(),
         path: target.split('?').next().unwrap_or("/").to_string(),
         body,
+        keep_alive,
+        http_11,
     }))
 }
 
@@ -146,7 +175,8 @@ fn status_text(code: u16) -> &'static str {
     }
 }
 
-/// JSON 应答(Connection: close;写完由调用方关流)
+/// JSON 应答(`Content-Length` 自定界 ⇒ **不发 `Connection` 头**:
+/// HTTP/1.1 缺省即复用;关不关由 serve 循环决定,见 [`crate::http`] 头注)
 pub async fn respond_json<W: AsyncWriteExt + Unpin>(
     w: &mut W,
     code: u16,
@@ -154,7 +184,7 @@ pub async fn respond_json<W: AsyncWriteExt + Unpin>(
 ) -> io::Result<()> {
     let body = serde_json::to_vec(v).map_err(io::Error::other)?;
     let head = format!(
-        "HTTP/1.1 {code} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {code} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
         status_text(code),
         body.len()
     );
@@ -163,7 +193,6 @@ pub async fn respond_json<W: AsyncWriteExt + Unpin>(
     w.flush().await
 }
 
-/// SSE 响应头(close 定界;无 Content-Length —— HTTP/1.1 连接关闭即报文完)
 /// 纯文本应答(诊断面:/debug/perf 的树状报告 —— 人读优先,不过 JSON)
 pub async fn respond_text<W: AsyncWriteExt + Unpin>(
     w: &mut W,
@@ -171,7 +200,7 @@ pub async fn respond_text<W: AsyncWriteExt + Unpin>(
     body: &str,
 ) -> io::Result<()> {
     let head = format!(
-        "HTTP/1.1 {code} {}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {code} {}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
         status_text(code),
         body.len()
     );
@@ -180,15 +209,26 @@ pub async fn respond_text<W: AsyncWriteExt + Unpin>(
     w.flush().await
 }
 
+/// SSE 响应头(**chunked 定界**:流自带终止块,连接可复用 —— G5④)
 pub async fn respond_sse_head<W: AsyncWriteExt + Unpin>(w: &mut W) -> io::Result<()> {
-    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n\r\n";
     w.write_all(head.as_bytes()).await?;
     w.flush().await
 }
 
-/// 一条 SSE data 事件(json 文本须已单行化 —— serde_json 序列化天然无换行)
+/// 一条 SSE data 事件(chunked 帧;json 文本须已单行化 —— serde_json 天然无换行)
 pub async fn sse_data<W: AsyncWriteExt + Unpin>(w: &mut W, data: &str) -> io::Result<()> {
-    w.write_all(format!("data: {data}\n\n").as_bytes()).await?;
+    let payload = format!("data: {data}\n\n");
+    w.write_all(format!("{:x}\r\n", payload.len()).as_bytes()).await?;
+    w.write_all(payload.as_bytes()).await?;
+    w.write_all(b"\r\n").await?;
+    w.flush().await
+}
+
+/// SSE 终止块(`0\r\n\r\n`)—— **每个 chunked 流都必须调**(否则客户端永远
+/// 等下一个 chunk;G5④ 起 SSE 不再用连接关闭定界)
+pub async fn sse_end<W: AsyncWriteExt + Unpin>(w: &mut W) -> io::Result<()> {
+    w.write_all(b"0\r\n\r\n").await?;
     w.flush().await
 }
 
@@ -198,7 +238,7 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::read_request;
+    use super::{read_request, respond_sse_head, sse_data, sse_end, Request};
 
     /// AGT-11:chunked 请求体解码(含分块切碎到多读、扩展参数、跨读边界)
     #[tokio::test]
@@ -244,5 +284,50 @@ mod tests {
         let raw = "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab";
         let mut cur = raw.as_bytes();
         assert!(read_request(&mut cur).await.is_err(), "截断应报错");
+    }
+
+    /// **G5④ 复用判定**:HTTP/1.1 缺省复用;`Connection: close` 尊重
+    /// (含列表形);HTTP/1.0 只认显式 `keep-alive` —— 且版本信号必须透出
+    /// (非 1.1 的 chunked 应答是非法语法,serve 据此拒)
+    #[tokio::test]
+    async fn keep_alive_defaults_and_close_honored() {
+        async fn read1(raw: &'static str) -> Request {
+            let mut cur = raw.as_bytes();
+            read_request(&mut cur).await.expect("read").expect("some")
+        }
+        let r = read1("GET /x HTTP/1.1\r\n\r\n").await;
+        assert!(r.keep_alive && r.http_11, "1.1 缺省 = 复用");
+        let r = read1("GET /x HTTP/1.1\r\nConnection: close\r\n\r\n").await;
+        assert!(!r.keep_alive, "显式 close 要尊重");
+        let r = read1("GET /x HTTP/1.1\r\nConnection: keep-alive, close\r\n\r\n").await;
+        assert!(!r.keep_alive, "列表形里的 close 也要认");
+        let r = read1("GET /x HTTP/1.0\r\n\r\n").await;
+        assert!(!r.keep_alive && !r.http_11, "1.0 缺省 = 关");
+        let r = read1("GET /x HTTP/1.0\r\nConnection: keep-alive\r\n\r\n").await;
+        assert!(r.keep_alive && !r.http_11, "1.0 显式 keep-alive 才复用");
+    }
+
+    /// **G5④ SSE 帧**:chunked 长度行 + 后随 CRLF + 终止块 —— 不再 close 定界
+    #[tokio::test]
+    async fn sse_is_chunked_and_terminated() {
+        let mut out: Vec<u8> = Vec::new();
+        respond_sse_head(&mut out).await.expect("head");
+        sse_data(&mut out, "[DONE]").await.expect("data");
+        sse_end(&mut out).await.expect("end");
+        let s = String::from_utf8(out).expect("utf8");
+        assert!(s.starts_with("HTTP/1.1 200 OK\r\n"), "{s:?}");
+        assert!(s.contains("Transfer-Encoding: chunked\r\n"), "{s:?}");
+        assert!(!s.contains("Connection: close"), "SSE 不再 close 定界:{s:?}");
+        assert!(
+            s.contains("\r\ndata: [DONE]\n\n\r\n"),
+            "chunk 帧 = 长度行 + 体 + CRLF:{s:?}"
+        );
+        // chunk 帧 = 十六进制长度行 + 体 + CRLF(长度按实际字节算,不写死)
+        let payload = "data: [DONE]\n\n";
+        assert!(
+            s.contains(&format!("\r\n{:x}\r\n{payload}\r\n", payload.len())),
+            "{s:?}"
+        );
+        assert!(s.ends_with("0\r\n\r\n"), "终止块:{s:?}");
     }
 }

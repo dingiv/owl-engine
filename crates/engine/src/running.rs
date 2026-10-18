@@ -90,6 +90,14 @@ impl StepProbes {
     }
 }
 
+/// `/tokenize` 应答面(G5③;引擎侧唯一产地:token 序列 + 上下文上限)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenizeReply {
+    pub tokens: Vec<u32>,
+    /// 本档正文长度上限(token;服务面字段名 `max_model_len`)
+    pub max_seq_tokens: usize,
+}
+
 /// 执行态引擎(请求入口)。
 ///
 /// # 结构(2026-10-14 拆分:35 字段万能袋 → 状态域组合)
@@ -104,8 +112,7 @@ impl StepProbes {
 /// 生命周期分层:turn 域状态住 ActiveTurn(随 turn 生死);引擎级
 /// spec 状态住 SpecRuntime(跨 turn)—— 两层不混居(2026-10-10
 /// 生命周期收口教训)。
-pub struct RunningEngine<D: DeviceClient> {
-    /// 步级探针(boot 解析;不可变)
+pub struct RunningEngine<D: DeviceClient> {    /// 步级探针(boot 解析;不可变)
     pub(crate) probes: StepProbes,
     pub(crate) cfg: EngineConfig,
     pub(crate) tok: Tokenizer,
@@ -392,6 +399,19 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 判据面 —— 与 `gpu_spec_identity_gate` 同一条 token 级硬判)。`None` = 无此会话。
     pub fn session_token_ids(&self, sid: u64) -> Option<Vec<u32>> {
         self.bank.sessions.get(sid).map(|s| s.tokens.clone())
+    }
+
+    /// **tokenize 出口**(G5③:服务面 `POST /tokenize`):纯 CPU,不落 turn、
+    /// 不碰池/图。`chat_wrap = true` = 先套家族单轮包装(与裸文本提交同一律,
+    /// 见 [`owl_models::tokenizer::Tokenizer::chat_wrap`]);否则纯文本编码。
+    /// 编码失败**显式上抛**(不用会吞错误的 `encode` —— 空序列 ≡ “文本是空的”)。
+    pub fn tokenize(&self, text: &str, chat_wrap: bool) -> std::result::Result<TokenizeReply, String> {
+        let tokens = if chat_wrap {
+            self.tok.try_encode(&self.tok.chat_wrap(text))?
+        } else {
+            self.tok.try_encode(text)?
+        };
+        Ok(TokenizeReply { tokens, max_seq_tokens: self.cfg.max_seq_tokens })
     }
 
     /// 提交 turn(临时会话:每 turn 独立,终了即焚;行为同 M0.5)。

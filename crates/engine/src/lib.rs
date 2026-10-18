@@ -67,7 +67,7 @@ pub fn head_plan_of(hq: owl_shared::config::HeadQuant) -> owl_models::module::Qu
         owl_shared::config::HeadQuant::RtnInt4G32 => QuantPlan::W4A16Awq,
     }
 }
-pub use running::RunningEngine;
+pub use running::{RunningEngine, TokenizeReply};
 pub use tp::{TpEngine, TpOpts, TpStaging};
 pub use graph_plan::{GraphPlan, GraphPlanDesc, PlanOutcome};
 pub use session::{AgentSession, SessionTable};

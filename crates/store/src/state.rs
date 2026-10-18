@@ -22,6 +22,30 @@ struct SnapEntry {
     tier: Tier,
     bytes: usize,
     last_use: u64,
+    /// 重要性档(引擎给的事实;政策在 `plan_snap_offload`)
+    durability: SnapDurability,
+}
+
+/// 快照的重要性档(2026-10-19;§9.1(6)a 轮内页边界快照的配套)。
+///
+/// 事实面:块边界快照有两类来源 —— **前缀段**(prompt 的页边界,内容跨会话
+/// 可共享)与**生成段**(解码相位逐页边界,链一往前就只剩"更短前缀"这点价值)。
+/// store 据此定政策:
+///
+/// | 档 | 逐出时 | 理由 |
+/// |---|---|---|
+/// | [`Durable`](Self::Durable) | 可下沉宿主(占宿主带宽) | 跨会话共享前缀靠它 |
+/// | [`Transient`](Self::Transient) | **丢** | 下沉一条 159 MiB ≈ **50 ms**(实测),
+///   而生成段每 32 tok 就出一条 ⇒ 全下沉 = 每 token 5 MiB 级 PCIe 流量,不可承受 |
+///
+/// ⚠️ 不变量:**最新的一条必须留在设备**(调用方每拍必取槽;LRU 保证最新最热 ⇒
+/// 逐出的总是最旧的 ⇒ 链头那条在看)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapDurability {
+    /// 前缀段边界(长期价值;可下沉)
+    Durable,
+    /// 生成段边界(随链推进即被取代;逐出即丢)
+    Transient,
 }
 
 /// GDN 状态账。
@@ -86,8 +110,17 @@ impl StateStore {
         if let Some(k) = snap {
             self.tick += 1;
             let tick = self.tick;
-            self.snaps
-                .insert(k, SnapEntry { tier: Tier::Gpu, bytes: self.row_bytes, last_use: tick });
+            // 行归还时的快照 = **链头**(turn 收口那一刻的态;idle 会话靠它复活)
+            // ⇒ 长期价值 ⇒ Durable(可下沉)
+            self.snaps.insert(
+                k,
+                SnapEntry {
+                    tier: Tier::Gpu,
+                    bytes: self.row_bytes,
+                    last_use: tick,
+                    durability: SnapDurability::Durable,
+                },
+            );
         }
         Ok(())
     }
@@ -100,8 +133,14 @@ impl StateStore {
     /// **登记快照**(S2:引擎每次 `capture_snap` 后调用;幂等 —— 已存在则只触达)。
     ///
     /// `bytes` = 一条快照的全量字节(Σ 层×quad 行宽);`tier` 由调用方给
-    /// (新拍的必在设备层)。
-    pub fn register_snap(&mut self, key: SnapKey, bytes: usize, tier: Tier) {
+    /// (新拍的必在设备层);`durability` = 重要性档(见 [`SnapDurability`])。
+    pub fn register_snap(
+        &mut self,
+        key: SnapKey,
+        bytes: usize,
+        tier: Tier,
+        durability: SnapDurability,
+    ) {
         self.tick += 1;
         let tick = self.tick;
         match self.snaps.get_mut(&key) {
@@ -109,9 +148,10 @@ impl StateStore {
                 e.last_use = tick;
                 e.tier = tier;
                 e.bytes = bytes;
+                e.durability = durability;
             }
             None => {
-                self.snaps.insert(key, SnapEntry { tier, bytes, last_use: tick });
+                self.snaps.insert(key, SnapEntry { tier, bytes, last_use: tick, durability });
             }
         }
     }
@@ -119,6 +159,19 @@ impl StateStore {
     /// 一条快照的字节(不在账 = `None`)。
     pub fn snap_bytes(&self, key: SnapKey) -> Option<usize> {
         self.snaps.get(&key).map(|s| s.bytes)
+    }
+
+    /// 一条快照的重要性档(不在账 = `None`)。
+    pub fn snap_durability(&self, key: SnapKey) -> Option<SnapDurability> {
+        self.snaps.get(&key).map(|s| s.durability)
+    }
+
+    /// 逐页生成段快照的条数(诊断口径:应≈设备槽数,不应无限增长)
+    pub fn snaps_transient(&self) -> usize {
+        self.snaps
+            .values()
+            .filter(|s| s.durability == SnapDurability::Transient)
+            .count()
     }
 
     /// 按层统计(`(条数, 字节)`;报告/对账口)。

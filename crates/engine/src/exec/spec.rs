@@ -472,91 +472,60 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         // ⑥ fold(尾部:图发射异步,restore 单命令;下一轮 verify 流序
         // 排其后,GPU ~1ms 藏于前端)
+        //
+        // **轮内页边界快照**(§9.1(6)a;`[pool] snap_decode_stride`):本轮提交
+        // `(pos, pos+m]` 跨过页边界 b ⇒ 先把池态卷到 state@b 拍一张,再卷到
+        // state@fed —— 这样生成相位的每个页边界都有快照(旧状:只有 prefill 段有
+        // ⇒ 短 prompt 的尾部复用面受限于 prompt 里最后一个整页)。
+        // 可行前提 = `spec_snap` 缓冲在本轮**保持 pristine**(= state@pos):
+        // fold 族自本日起与 eager 路径同形(**写池**,不再就地写缓冲)。
         if m < depth {
             let ts = std::time::Instant::now();
-            if !self.dev.graphs.fold.is_empty() {
-                // 图态 fold(E5-M5):快照 buf 就地重放(state@F-1 →
-                // state@F+m;slot 恒 0)→ restore 回写会话格。单 graph_launch。
-                let fg = &mut self.dev.graphs.fold[m];
-                fg.step(&[("slots", &[0.0f32])]).await?;
+            // 记录齐 = 可折(图态桶 / eager fold_tree 两路都吃记录);
+            // 不齐 = 旧"前缀重放"(整模前向)唯一可行路, 该档不做轮内边界快照
+            let foldable = records.len() == self.dev.pool.gdn_count() * 8;
+            if foldable {
+                if let Some(b) = Self::decode_boundary_in(
+                    pos,
+                    pos + m + 1,
+                    self.dev.pool.page,
+                    self.cfg.knobs.snap_decode_stride,
+                ) {
+                    let t_b = std::time::Instant::now();
+                    self.spec_fold_to(gdn_slot, &records, b - pos).await?;
+                    let t_fold1 = t_b.elapsed();
+                    // 尾 token = 本轮已提交、尚未进 `act.out` 的那几枚
+                    let tail = &toks[..b - 1 - pos];
+                    self.capture_gdn_snap_tail(
+                        sid,
+                        b,
+                        tail,
+                        owl_store::SnapDurability::Transient,
+                    )
+                    .await?;
+                    let t_snap = t_b.elapsed() - t_fold1;
+                    // 分相计时(2026-10-19;判"轮内边界值不值"的账:
+                    // 卷/拍/回卷三段与 prefill 边界同粒度)
+                    mrec("spec.bnd.fold1", t_fold1);
+                    mrec("spec.bnd.snap", t_snap);
+                    if self.cfg.knobs.probes.debug {
+                        owl_shared::log_debug!(
+                            "dbg snap",
+                            "轮内边界 fed={b}(pos={pos} m={m})⇒ 快照已拍(卷 {:.2}ms/拍 {:.2}ms),卷回 state@{}",
+                            t_fold1.as_secs_f64() * 1000.0,
+                            t_snap.as_secs_f64() * 1000.0,
+                            pos + m + 1
+                        );
+                    }
+                }
+                self.spec_fold_to(gdn_slot, &records, m + 1).await?;
+            } else {
+                // eager fallback:旧路 —— 前缀重放(整模前向,已接受行
+                // KV 覆写幂等;m=0 也重放 anchor 一行)
                 {
                     let face = self.dev.graphs.session.face_mut();
                     self.dev.pool.restore_spec_snap(face, gdn_slot).await?;
                 }
-                t_rollback = ts.elapsed();
-            } else {
-            {
-                let face = self.dev.graphs.session.face_mut();
-                self.dev.pool.restore_spec_snap(face, gdn_slot).await?;
-            }
-            if records.len() == self.dev.pool.gdn_count() * 8 {
-                // fold(E5-M4):快照态 + verify 记录前缀 → state@F+m,
-                // **零整模前向**(96 副作用根一次 multi-root eval)
-                let m1 = m + 1;
-                let d = self.dev.pool.dims;
-                let key_dim = d.nk * d.hk;
-                let value_dim = d.nv * d.hv;
-                let views: Vec<TensorOps> = records
-                    .iter()
-                    .enumerate()
-                    .map(|(i, b)| {
-                        let shape = match i % 8 {
-                            0 | 1 => vec![m1, key_dim],
-                            2 => vec![m1, value_dim],
-                            3 | 4 => vec![m1, d.nk, d.hk],
-                            5 => vec![m1, d.nv, d.hv],
-                            _ => vec![m1, d.nv],
-                        };
-                        TensorOps::of_block(b.id, d.dtype, shape)
-                    })
-                    .collect();
-                let slots_t = TensorOps::from_host(
-                    Dtype::F32,
-                    vec![1],
-                    &[gdn_slot as f32]
-                        .iter()
-                        .flat_map(|f| f.to_le_bytes())
-                        .collect::<Vec<u8>>(),
-                );
-                let gdns: Vec<owl_models::layers::gdn::GdnBuffers> = self
-                    .dev.pool
-                    .gdn_caches()
-                    .into_iter()
-                    .map(|l| owl_models::layers::gdn::GdnBuffers {
-                        conv_q: l.conv_q,
-                        conv_k: l.conv_k,
-                        conv_v: l.conv_v,
-                        rec: l.rec,
-                        slots: slots_t.clone(),
-                    })
-                    .collect();
-                let cu_t = TensorOps::from_host(
-                    Dtype::F32,
-                    vec![2],
-                    &[0.0f32, m1 as f32]
-                        .iter()
-                        .flat_map(|f| f.to_le_bytes())
-                        .collect::<Vec<u8>>(),
-                );
-                let roots = owl_models::spec::fold_tree(
-                    &self.dev.model,
-                    &views,
-                    &gdns,
-                    &slots_t,
-                    &cu_t,
-                    gdn_slot,
-                    m,
-                    self.dev.env.gdn.scalar,
-                )?;
-                {
-                    let face = self.dev.graphs.session.face_mut();
-                    let refs: Vec<&TensorOps> = roots.iter().collect();
-                    owl_models::interpreters::eval_ops_multi_scoped_env(&refs, face, self.dev.env, self.dev.tp.as_ref()).await?;
-                }
-                t_rollback = ts.elapsed();
-            } else {
-                // eager fallback:旧路 —— 前缀重放(整模前向,已接受行
-                // KV 覆写幂等;m=0 也重放 anchor 一行)
                 let replay: Vec<u32> = std::iter::once(token)
                     .chain(drafts[..m].iter().copied())
                     .collect();
@@ -564,9 +533,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     self.verify_forward(&replay, pos, gdn_slot, false).await?;
                 let face = self.dev.graphs.session.face_mut();
                 face.free(&[replay_hidden.id]).await?;
-                t_rollback = ts.elapsed();
             }
-            }
+            t_rollback = ts.elapsed();
         }
         self.tspec()?.spec_snap_valid = false;
 
@@ -746,6 +714,109 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     }
 
 
+    /// **回卷到 state@(pos + rows)**（spec 轮内唯一折叠口；§9.1(6)a）。
+    ///
+    /// 语义：`spec_snap` 缓冲（轮内**保持 pristine** = state@pos）→ 池，
+    /// 再把 verify 记录的前 `rows` 行重放进池（行 0 = anchor）。
+    ///
+    /// - **图态** = 桶 `rows-1` 一发（fold 族叶子 = 池 GDN 态，`slots` = 会话行；
+    ///   与 eager 路径**同形**）⇒ 缓冲不被写 ⇒ 同一轮可多次调用
+    ///   （跨页边界： state@b 拍快照 → 再 state@fed）；
+    /// - **eager 档**（无图）= 记录前缀一次 multi-root eval（零整模前向）。
+    ///
+    /// 调用方保证 `records` 齐（= 8 × GDN 层数）且 `1 ≤ rows ≤ depth`。
+    ///
+    /// ⚠️ **TP 面现状**（对齐 `capture_gdn_snap` 的双 rank 形态看缺口）：rollback
+    /// 目前只走本 rank（`self.dev`）；capture 已是 dual-rank（`snap_dev` + `join2`）。
+    /// 两半不对称 = TP 真开时 fold 需同样补 peer 臂（W4A8-TP 的 lane，见其卷）。
+    async fn spec_fold_to(
+        &mut self,
+        gdn_slot: usize,
+        records: &[Bytes],
+        rows: usize,
+    ) -> Result<()> {
+        debug_assert!(rows >= 1 && rows <= self.dev.spec_rt.depth, "fold 行数越界: {rows}");
+        {
+            let face = self.dev.graphs.session.face_mut();
+            self.dev.pool.restore_spec_snap(face, gdn_slot).await?;
+        }
+        if !self.dev.graphs.fold.is_empty() {
+            let fg = &mut self.dev.graphs.fold[rows - 1];
+            fg.step(&[("slots", &[gdn_slot as f32])]).await?;
+            return Ok(());
+        }
+        // eager fold（E5-M4）：快照态 + 记录前缀 → state@pos+rows，
+        // **零整模前向**（96 副作用根一次 multi-root eval）
+        let m1 = rows;
+        let m = rows - 1;
+        let d = self.dev.pool.dims;
+        let key_dim = d.nk * d.hk;
+        let value_dim = d.nv * d.hv;
+        let views: Vec<TensorOps> = records
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                let shape = match i % 8 {
+                    0 | 1 => vec![m1, key_dim],
+                    2 => vec![m1, value_dim],
+                    3 | 4 => vec![m1, d.nk, d.hk],
+                    5 => vec![m1, d.nv, d.hv],
+                    _ => vec![m1, d.nv],
+                };
+                TensorOps::of_block(b.id, d.dtype, shape)
+            })
+            .collect();
+        let slots_t = TensorOps::from_host(
+            Dtype::F32,
+            vec![1],
+            &[gdn_slot as f32]
+                .iter()
+                .flat_map(|f| f.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        );
+        let gdns: Vec<owl_models::layers::gdn::GdnBuffers> = self
+            .dev
+            .pool
+            .gdn_caches()
+            .into_iter()
+            .map(|l| owl_models::layers::gdn::GdnBuffers {
+                conv_q: l.conv_q,
+                conv_k: l.conv_k,
+                conv_v: l.conv_v,
+                rec: l.rec,
+                slots: slots_t.clone(),
+            })
+            .collect();
+        let cu_t = TensorOps::from_host(
+            Dtype::F32,
+            vec![2],
+            &[0.0f32, m1 as f32]
+                .iter()
+                .flat_map(|f| f.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        );
+        let roots = owl_models::spec::fold_tree(
+            &self.dev.model,
+            &views,
+            &gdns,
+            &slots_t,
+            &cu_t,
+            gdn_slot,
+            m,
+            self.dev.env.gdn.scalar,
+        )?;
+        let face = self.dev.graphs.session.face_mut();
+        let refs: Vec<&TensorOps> = roots.iter().collect();
+        owl_models::interpreters::eval_ops_multi_scoped_env(
+            &refs,
+            face,
+            self.dev.env,
+            self.dev.tp.as_ref(),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// 活跃会话块表 → 持久 bt 块(设备;StatePool::write_bt 落地,
     /// 本壳只解析会话块链)
     /// XQA 页表实时值 = **会话真块链**(`f32::from_bits(block_id)`;
@@ -794,14 +865,35 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// 之后:关快照面 ⇒ **索引不采 + 块不入树 ⇒ 静默不沉**(实测 `snap_max = 0`
     /// 档:下沉 0 块 / 不可沉 1680 块;prefill 假快 942 tok/s)。
     pub(crate) async fn capture_gdn_snap(&mut self, sid: u64, fed: usize) -> Result<()> {
+        // **前缀段**(prefill chunk 边界)专用:prompt 页边界有跨会话共享价值
+        // ⇒ Durable(可下沉宿主)。生成段边界另走
+        // [`Self::capture_gdn_snap_tail`] 的 Transient 档。
+        self.capture_gdn_snap_tail(sid, fed, &[], owl_store::SnapDurability::Durable)
+            .await
+    }
+
+    /// 同上,但 `tail` = 最后几个**已提交尚未入 `act.out`** 的 token
+    /// (spec 轮内边界快照:提交在 emit 之前,`out` 还差本轮那几枚;
+    /// 位置 = `out` 尾的下一枚起 —— `out` 不变式:`out.len() = fed - prompt_len + 1`)、
+    /// `durability` = 重要性档(生成段逐页边界 = [`Transient`](owl_store::SnapDurability::Transient):
+    /// 链一往前就被取代 ⇒ 逐出即丢,不下沉宿主)。
+    pub(crate) async fn capture_gdn_snap_tail(
+        &mut self,
+        sid: u64,
+        fed: usize,
+        tail: &[u32],
+        durability: owl_store::SnapDurability,
+    ) -> Result<()> {
         // 快照面开关(只门住第 ④ 步;前三步照走)。
         //
-        // ⚠️ 2026-10-19:再叠一道**消费方门** —— 快照的唯一消费者是**前缀复用**
-        // (`reuse_face` 要求边界快照在场;`restore_snap` 只在 prefix 命中时调用)。
-        // `prefix_cache = false` ⇒ 缓存区份额为 0 ⇒ 复用面结构上恒为 0
-        // ⇒ 每块 152MiB 的 GDN 快照(= 192 片 copy_batch,槽满还要 DtoH 下沉)
-        // 是**纯浪费**,实测 67ms/块(8k 请求 ≈ 1.0s ≈ prefill 的 17%:
-        // `prefill.bnd` 3039ms → 0)。
+        // ⚠️ 2026-10-19 **两道门合并**(两条线各自加的,合入时叠加,都留):
+        // ① **消费方门**(perf 线):快照的唯一消费者是**前缀复用**
+        //    (`reuse_face` 要求边界快照在场;`restore_snap` 只在 prefix 命中时调用)。
+        //    `prefix_cache = false` ⇒ 缓存区份额为 0 ⇒ 复用面结构上恒为 0
+        //    ⇒ 每块 152MiB 的 GDN 快照(= 192 片 copy_batch,槽满还要 DtoH 下沉)
+        //    是**纯浪费**,实测 67ms/块(8k 请求 ≈ 1.0s ≈ prefill 的 17%:
+        //    `prefill.bnd` 3039ms → 0)。
+        // ② **容量门**(本线):`snap_max = 0` ⇒ 池结构上无槽(调用方已先行跳过)。
         let snap_on = self.dev.pool.snap_capacity() > 0 && self.cfg.knobs.prefix_cache;
         let page = self.dev.pool.page;
         let full_blocks = fed / page;
@@ -821,8 +913,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if start >= full_blocks {
             return Ok(()); // 幂等:同一 fed 不重复拍(状态由同一 token 链唯一确定)
         }
-        // 2) 取新增整块的 token 段(活跃 turn 的链面)
-        let seg = self.tokens_upto(start * page, full_blocks * page)?;
+        // 2) 取新增整块的 token 段(活跃 turn 的链面;轮内调用带 `tail`)
+        let seg = self.tokens_upto_with(start * page, full_blocks * page, tail)?;
         // 3) 推进身份链(段长不符 = 结构性拒,不静默;逐块哈希在同一处重放
         //    —— 身份与游标同源 `owl_store::hash_block`)
         let (gdn_slot, key, per_block, parent0) = {
@@ -888,11 +980,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     self.dev.pool.snap_used()
                 );
             }
-            // 登记/触达(层 = 设备)
-            self.bank
-                .rel
-                .state
-                .register_snap(key, self.dev.pool.snap_bytes(), owl_store::Tier::Gpu);
+            // 登记/触达(层 = 设备;档 = 调用方给的事实)
+            self.bank.rel.state.register_snap(
+                key,
+                self.dev.pool.snap_bytes(),
+                owl_store::Tier::Gpu,
+                durability,
+            );
         }
         // **B 轴 B-0:同一处顺手采索引**(同一"块边界 + 链尾身份"事件 ⇒
         // 一次算身份、一次推进游标;索引与 GDN 快照共享边界身份)。
@@ -1054,7 +1148,21 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// - 池关(`snap_max = 0`)⇒ 结构性拒(调用方已先行跳过)。
     pub(crate) async fn snap_ensure_slot(&mut self, key: owl_store::SnapKey) -> Result<u32> {
         use crate::state::SnapSlotPick;
-        let pick = self.dev.pool.snap_pick_slot(key).ok_or_else(|| {
+        // **逐出优先级 = store 的事实(重要性档)**;排序在池里(纯)。
+        // 生成段快照(Transient)先出 —— 逐出即丢、零代价;前缀段(Durable)
+        // 有跨会话共享价值,且下沉一条 159 MiB ≈ **208 ms**(实测 2026-10-19)
+        // ⇒ 只在**没有可丢的**时候才动它。
+        let pick = {
+            let state = &self.bank.rel.state;
+            let rank = |k: owl_store::SnapKey| -> u8 {
+                match state.snap_durability(k) {
+                    Some(owl_store::SnapDurability::Transient) => 0,
+                    _ => 1, // Durable / 未登账(保守:不动)
+                }
+            };
+            self.dev.pool.snap_pick_slot(key, &rank)
+        }
+        .ok_or_else(|| {
             owl_iface::contract::ModelError::Msg(
                 "GDN 快照池为空(snap_max = 0):调用方应跳过 capture".into(),
             )
@@ -1062,14 +1170,28 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         match pick {
             SnapSlotPick::Hit(slot) | SnapSlotPick::Free(slot) => Ok(slot),
             SnapSlotPick::Victim(slot, victim) => {
-                match self.snap_offload(victim, slot).await {
-                    Ok(()) => {
-                        self.dev.pool.snap_clear_slot(slot);
-                        return Ok(slot);
-                    }
-                    Err(e) => {
-                        // 收编为结构化 WARN(2026-10-18 T1;原为 `DBG-SNAP` 直接打印)
-                        owl_shared::log_warn!("store", "快照下沉失败: {e}");
+                // **生成段(Transient)= 逐出即丢**:store 的不变量本就拒它下沉
+                // ⇒ 试了只会换来一条“失败”WARN(把设计行为报成故障)。
+                // 2026-10-19 pi 真机实测:一次会话 9 条。
+                let transient = matches!(
+                    self.bank.rel.state.snap_durability(victim),
+                    Some(owl_store::SnapDurability::Transient)
+                );
+                if transient {
+                    owl_shared::log_debug!(
+                        "store",
+                        "逐出生成段快照 {victim:?}(逐出即丢,不下沉)"
+                    );
+                } else {
+                    match self.snap_offload(victim, slot).await {
+                        Ok(()) => {
+                            self.dev.pool.snap_clear_slot(slot);
+                            return Ok(slot);
+                        }
+                        Err(e) => {
+                            // 收编为结构化 WARN(2026-10-18 T1;原为 `DBG-SNAP` 直接打印)
+                            owl_shared::log_warn!("store", "快照下沉失败: {e}");
+                        }
                     }
                 }
                 // 沉不下 ⇒ 丢(内容整体消失;宿主副本同步丢)
@@ -1091,7 +1213,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     }
 
     /// **快照下沉**(设备槽 → 宿主;一条 swap 搬 N 片)。
+    ///
+    /// ⚠️ 宿主梯满时由 **store 政策**先逐最冷条目(见 `plan_snap_offload`)——
+    /// 逐出量在此上报(store 零日志依赖:`evicted_bytes` 差分)。
     pub(crate) async fn snap_offload(&mut self, key: owl_store::SnapKey, slot: u32) -> Result<()> {
+        let ev0 = self.bank.rel.snap_host_evicted_bytes();
         let (pieces, table) = self.bank.rel.plan_snap_offload(key, slot)?;
         let face = self.dev.graphs.session.face_mut();
         let conn = match face
@@ -1108,6 +1234,16 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         };
         let table = owl_store::reclaim_slot_table(conn)?;
         self.bank.rel.commit_snap_offload(key, table)?;
+        let ev = self.bank.rel.snap_host_evicted_bytes().saturating_sub(ev0);
+        if ev > 0 {
+            owl_shared::metrics::with_metrics_store(|m| {
+                m.counter_add("store.snap.host_evict_bytes", ev, file!(), line!());
+            });
+            owl_shared::log_debug!(
+                "store",
+                "宿主梯满 ⇒ 逐最冷快照 {ev}B(政策 = 与 KV 腿同一份 EvictPolicy;被逐边界从此不可复用)"
+            );
+        }
         owl_shared::metrics::with_metrics_store(|m| {
             m.counter_add("store.snap.out", 1, file!(), line!());
             m.counter_add(
@@ -1117,6 +1253,18 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 line!(),
             );
         });
+        // **大页提示可观测面**(2026-10-19):宿主块若未拿到大页,冷写回到 4KiB
+        // 缺页速度(159 MiB 约 80ms vs 12ms)⇒ 不许静默(指标 + 首次点名)。
+        let hint_fail = self.bank.rel.snap_host_hint_failures();
+        if hint_fail > 0 {
+            owl_shared::metrics::with_metrics_store(|m| {
+                m.counter_add("store.host.hint_fail", hint_fail as u64, file!(), line!());
+            });
+            owl_shared::log_debug!(
+                "store",
+                "宿主块大页提示未生效 {hint_fail} 块:冷写按 4KiB 缺页(下沉会更慢;查 THP 姿态 /sys/kernel/mm/transparent_hugepage/enabled)"
+            );
+        }
         Ok(())
     }
 
@@ -1188,6 +1336,17 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// 本 turn 的 token 链区间 `[lo, hi)`(快照边界段来源;`coverage.rs` 回算
     /// 块身份同用 —— 链身份必须与索引登记同源)。
     pub(crate) fn tokens_upto(&self, lo: usize, hi: usize) -> Result<Vec<u32>> {
+        self.tokens_upto_with(lo, hi, &[])
+    }
+
+    /// 同上,但 `hi` 越过 `act.out` 尾时由 `tail` 补(spec 轮内边界快照专用:
+    /// 本轮已提交的 token 还在 `toks` 里,尚未进 `out`)。越界 = 响亮拒。
+    pub(crate) fn tokens_upto_with(
+        &self,
+        lo: usize,
+        hi: usize,
+        tail: &[u32],
+    ) -> Result<Vec<u32>> {
         let act = self.turns.active.as_ref().ok_or_else(|| {
             ModelError::Msg("无活跃 turn:快照边界必须落在本 turn 的 token 链上".into())
         })?;
@@ -1198,12 +1357,21 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 seg.push(act.prompt_ids[i]);
             } else {
                 let j = i - plen;
-                seg.push(*act.out.get(j).ok_or_else(|| {
-                    ModelError::Msg(format!(
-                        "快照边界越界:token {i} 未喂(plen={plen} out={})",
-                        act.out.len()
-                    ))
-                })?);
+                // `out` 在先,`tail` 接在 `out` 尾之后(单源位置:不乱猜)
+                let t = match act.out.get(j) {
+                    Some(t) => Some(*t),
+                    None => j.checked_sub(act.out.len()).and_then(|k| tail.get(k)).copied(),
+                };
+                match t {
+                    Some(t) => seg.push(t),
+                    None => {
+                        return Err(ModelError::Msg(format!(
+                            "快照边界越界:token {i} 未喂(plen={plen} out={} tail={})",
+                            act.out.len(),
+                            tail.len()
+                        )))
+                    }
+                }
             }
         }
         Ok(seg)

@@ -3,6 +3,9 @@
 //! 三条形态律(对齐 vLLM 的 CPU KV cache):
 //! 1. **宿主内容不 pin**(pageable `Vec<u8>`):pin 只用在*搬运途中*的暂存租约上
 //!    (vLLM 同款:CPU cache 是普通内存,传输走 pinned staging)⇒ RAM 可被内核回收/换出;
+//!    **但分配带大页提示**(2026-10-19):pageable 的代价是首次写逐页缺页 ——
+//!    159 MiB 的 4 KiB 缺页 ≈ 80 ms(≈2 GB/s)而 2 MiB 大页 ≈ 12 ms ⇒ 这是"快照
+//!    下沉一条 ≈100 ms"的主因。提示不是 pin(仍可换出/回收),见 `HostBlock::zeroed`。
 //! 2. **容量显式有界**(`budget_bytes`,0 = 关层):越界 = **响亮拒**,
 //!    由驱逐序(策略对象)决定谁先让位 —— 不许悄悄超发(C4 风险条款);
 //! 3. **缓冲复用**:小块池(free list)吸收 churn;`evict` 真的把内容还掉
@@ -19,15 +22,60 @@ use crate::error::{StoreError, StoreResult};
 use crate::id::ChainHash;
 
 /// 宿主层的一块存储(pageable;大小 = 逻辑块字节)。
+///
+/// **分配带大页提示**(2026-10-19;§9.1(6)b):块第一次被**写**时内核逐页缺页,
+/// 159 MiB 的 4 KiB 缺页(4 万次)≈ **80 ms**(≈2 GB/s,实测),而 2 MiB 大页 ≈ **12 ms**
+/// —— 这就是"快照下沉一条 ≈100 ms"的主因(实测 = 大页冷写 + DMA)。
+/// 内核 THP 姿态在本机 = `[madvise]` ⇒ 必须显式申请;提示失败**不影响正确性**
+/// (只是回到 4 KiB 缺页速度),故不阻断、只一次性可见告知。
 #[derive(Debug)]
 pub struct HostBlock {
     bytes: Vec<u8>,
+    /// 大页提示是否生效(可观测面:失败 = 冷写回到 4 KiB 缺页速度;
+    /// 纠错/报告靠它 —— 不许静默吞掉)。
+    hugepage: bool,
+}
+
+/// 大页提示:把 `bytes` 的 **2 MiB 对齐内区间**申请为 THP(边缘不足一页的段
+/// 不碰 —— `madvise` 要求区间对齐,部分页会 EINVAL)。
+/// 返回 `Err(os error)` = 提示没生效(调用方自行决定报不报)。
+#[cfg(target_os = "linux")]
+fn hint_hugepage(bytes: &mut [u8]) -> std::io::Result<()> {
+    const HP: usize = 2 << 20;
+    let base = bytes.as_mut_ptr() as usize;
+    let lo = (base + HP - 1) & !(HP - 1);
+    let hi = (base + bytes.len()) & !(HP - 1);
+    if hi <= lo {
+        return Ok(()); // 块 < 一页大页:没东西可提示(小 KV 块走这条路)
+    }
+    let r = unsafe {
+        libc::madvise(lo as *mut libc::c_void, hi - lo, libc::MADV_HUGEPAGE)
+    };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn hint_hugepage(_bytes: &mut [u8]) -> std::io::Result<()> {
+    Ok(())
 }
 
 impl HostBlock {
-    /// 零填构造(大小 = 逻辑块字节)。
+    /// 零填构造(大小 = 逻辑块字节)。大页提示失败 ⇒ **记在块上**
+    /// ([`Self::hugepage`]),由 [`HostTier::hint_failures`] 汇总上报 ——
+    /// 不阻断(提示只影响速度,不影响内容/正确性),但**不静默**。
     pub fn zeroed(len: usize) -> Self {
-        Self { bytes: vec![0u8; len] }
+        let mut bytes = vec![0u8; len];
+        let hugepage = hint_hugepage(&mut bytes).is_ok();
+        Self { bytes, hugepage }
+    }
+
+    /// 本块的大页提示是否生效。
+    pub fn hugepage(&self) -> bool {
+        self.hugepage
     }
 
     /// 字节数。
@@ -64,6 +112,9 @@ pub struct HostTier<K = ChainHash> {
     free: Vec<HostBlock>,
     /// 因容量驱逐而累计释放的字节(报告面)。
     evicted_bytes: u64,
+    /// 大页提示未生效的块数(可观测面;0 = 全部生效)。
+    /// 它不等于错误:提示只影响"冷写缺页速度"(159 MiB: 12ms vs 80ms),不影响内容。
+    hint_failures: usize,
 }
 
 /// 宿主层键(可寻址 + 可打印)。
@@ -92,6 +143,7 @@ impl<K: HostKey> HostTier<K> {
             resident: BTreeMap::new(),
             free: Vec::new(),
             evicted_bytes: 0,
+            hint_failures: 0,
         })
     }
 
@@ -125,7 +177,17 @@ impl<K: HostKey> HostTier<K> {
                 self.budget_bytes
             )));
         }
-        Ok(HostBlock::zeroed(self.block_bytes))
+        let b = HostBlock::zeroed(self.block_bytes);
+        if !b.hugepage() {
+            self.hint_failures += 1;
+        }
+        Ok(b)
+    }
+
+    /// 大页提示未生效的块数(0 = 全部生效;>0 = 冷写回到 4 KiB 缺页速度 ——
+    /// 159 MiB 约 80ms vs 12ms)。上报方:引擎在快照下沉点打点。
+    pub fn hint_failures(&self) -> usize {
+        self.hint_failures
     }
 
     /// **借一批空槽**(swap 命令的台子;§15)。
@@ -343,6 +405,31 @@ mod tests {
         assert!(t.is_disabled());
         let err = t.acquire().expect_err("关层必须拒");
         assert!(matches!(err, StoreError::Exhausted(_)), "得 {err:?}");
+    }
+
+    /// **大页提示的记账律**(2026-10-19;§9.1(6)b):
+    /// ① 块自述提示结果(`HostBlock::hugepage`);
+    /// ② `HostTier::hint_failures` = 借出块里提示未生效的**块数**(可观测面,不许静默);
+    /// ③ 环境无关:本机 THP 姿态若不开,断言仍然成立(只声明二者一致)。
+    #[test]
+    fn hugepage_hint_is_counted() {
+        let mut t: HostTier = HostTier::new(1024, 4096).expect("构造");
+        let mut ok = 0usize;
+        let mut fail = 0usize;
+        for _ in 0..3 {
+            let b = t.acquire().expect("借块");
+            if b.hugepage() {
+                ok += 1;
+            } else {
+                fail += 1;
+            }
+        }
+        assert_eq!(ok + fail, 3);
+        assert_eq!(t.hint_failures(), fail, "上报计数须与块自述一致(ok={ok} fail={fail})");
+        // 大块 ≥ 2MiB 在 Linux+THP[madvise] 上应拿到提示(拿不到也不断言,只打印事实)
+        let big = HostBlock::zeroed(4 << 20);
+        eprintln!("[host] 4MiB 块大页提示生效 = {}(本机 THP 姿态见 /sys/kernel/mm/transparent_hugepage/enabled)", big.hugepage());
+        assert_eq!(big.len(), 4 << 20);
     }
 
     /// 槽台:越界/溢出必须**响亮拒**(不静默截断);多槽按号各就各位。

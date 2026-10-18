@@ -74,5 +74,5 @@ pub use select::{
     f16_to_f32_pub, MeanKCollector, PosAction, PosFrame, QueryFace, ScoreMode, ScoreTuning,
     SelectBudget, ViewPlan,
 };
-pub use state::StateStore;
+pub use state::{SnapDurability, StateStore};
 pub use tier::{AssetKind, Tier, TierBudget, TierLedger, TierReport};

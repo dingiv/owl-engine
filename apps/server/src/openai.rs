@@ -24,6 +24,7 @@ use owl_engine::{TurnEvent, TurnOpts, TurnSampler};
 use owl_shared::config::AgentCfg;
 
 use crate::actor::{EngineReq, SinkEvent};
+use crate::agent_trace::{AgentTrace, OutcomeFacts, ReqFacts, TurnLedger, UsageFacts};
 use crate::chat_tpl::{ChatTpl, RenderArgs};
 use crate::http;
 use crate::toolcall::{Chan, ChannelSplitter, Item, ToolSchemas};
@@ -321,6 +322,7 @@ pub fn completion_json(
     prompt_tokens: usize,
     completion_tokens: usize,
     cached_tokens: usize,
+    reasoning_tokens: usize,
 ) -> Value {
     json!({
         "id": id,
@@ -337,6 +339,7 @@ pub fn completion_json(
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
             "prompt_tokens_details": {"cached_tokens": cached_tokens},
+            "completion_tokens_details": {"reasoning_tokens": reasoning_tokens},
         },
     })
 }
@@ -440,6 +443,9 @@ enum ReplyMode {
 struct Usage {
     prompt: usize,
     completion: usize,
+    /// 思考相位采样步数(`completion_tokens_details.reasoning_tokens`;
+    /// 真源 = [`ChannelSplitter::reasoning_steps`],在 Completed 时取终值)
+    reasoning: usize,
     cached: usize,
 }
 
@@ -467,6 +473,8 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
     model_name: &str,
     tpl: &Arc<ChatTpl>,
     agent: &AgentCfg,
+    // `/debug/agent` 诊断环(G5②):每轮必落一条(`TurnLedger` 的 Drop 是兜底网)
+    trace: &Arc<AgentTrace>,
 ) -> std::io::Result<()> {
     let mut req: ChatRequest = match serde_json::from_slice::<ChatRequest>(body) {
         Ok(r) => r,
@@ -525,6 +533,27 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
         None if agent.implicit_session => Some(IMPLICIT_SESSION),
         None => None,
     };
+    // G5②:诊断环开账(此后的每一条返回路径都可见 —— 显式 fail 或 Drop 兜底)
+    let mut led = TurnLedger::new(trace);
+    led.set_req(ReqFacts {
+        model: model_name.to_string(),
+        stream: mode == ReplyMode::Stream,
+        messages: req.messages.len(),
+        roles: req
+            .messages
+            .iter()
+            .filter_map(|m| m.get("role").and_then(|r| r.as_str()))
+            .collect::<Vec<_>>()
+            .join(","),
+        tools: req.tools.as_ref().map(|t| t.len()).unwrap_or(0),
+        thinking: req.enable_thinking(),
+        reasoning_effort: req.reasoning_effort.clone(),
+        session,
+        max_new,
+        ignore_eos: req.ignore_eos,
+        stop: stop.len(),
+    });
+    led.set_prompt(&prompt);
     let engine_req = EngineReq::Chat {
         session,
         prompt,
@@ -564,6 +593,7 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
         Some(SinkEvent::Rejected { err }) => {
             // 预算越界 ⇒ 归一化为 pi 能认的 context-overflow 报文
             // (否则 pi 不自动 compact;见 `error_json_for_reject` 注)
+            led.fail(format!("提交被拒:{err}"));
             return http::respond_json(w, 400, &error_json_for_reject(err)).await
         }
         // 契约:首笔必为 Accepted/Rejected(actor 在 pump 前投递)⇒ 不会走到
@@ -613,6 +643,7 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
         match sink_rx.recv().await {
             Some(SinkEvent::Turn(TurnEvent::Token { delta, .. })) => {
                 usage.completion += 1;
+                led.first_token(); // TTFT(幂等)
                 let items = splitter.push(&delta);
                 emit!(items);
             }
@@ -635,6 +666,8 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
             Some(SinkEvent::Turn(TurnEvent::Completed { text, finish, .. })) => {
                 let items = splitter.finish();
                 emit!(items);
+                // 思考相位真账(在 finish 之后取:本 turn 再无 push)
+                usage.reasoning = splitter.reasoning_steps();
                 // 有工具调用 ⇒ finish_reason = tool_calls(pi 的 mapStopReason 只认
                 // stop/length/tool_calls 三者);strays 非零 = 值得一条日志
                 if splitter.strays() > 0 {
@@ -653,6 +686,23 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
                         owl_engine::turn::FinishReason::Length => "length",
                     }
                 };
+                // G5②:结算诊断环(结构轨迹 + usage + 结局;与 wire 同一份账)
+                led.set_events(splitter.structural_trace());
+                led.commit(
+                    UsageFacts {
+                        prompt: usage.prompt,
+                        completion: usage.completion,
+                        cached: usage.cached,
+                        reasoning: usage.reasoning,
+                    },
+                    OutcomeFacts {
+                        finish: Some(reason),
+                        tools_called: splitter.tool_calls(),
+                        strays: splitter.strays(),
+                        malformed: splitter.malformed(),
+                        ..Default::default()
+                    },
+                );
                 return match mode {
                     ReplyMode::Stream => {
                         let chunk = chunk_json(&id, model_name, json!({}), Some(reason));
@@ -667,10 +717,13 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
                                 "completion_tokens": usage.completion,
                                 "total_tokens": usage.prompt + usage.completion,
                                 "prompt_tokens_details": {"cached_tokens": usage.cached},
+                                "completion_tokens_details": {"reasoning_tokens": usage.reasoning},
                             });
                             http::sse_data(w, &u.to_string()).await?;
                         }
                         http::sse_data(w, "[DONE]").await?;
+                        // chunked 终止块(不调 = 复用连接上的客户端永远等下一 chunk)
+                        http::sse_end(w).await?;
                         owl_shared::log_info!(
                             "chat",
                             "turn {:?} 完成({reason};tools={};think={}B/text={}B):{}",
@@ -695,6 +748,7 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
                                 usage.prompt,
                                 usage.completion,
                                 usage.cached,
+                                usage.reasoning,
                             ),
                         )
                         .await
@@ -702,6 +756,7 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
                 };
             }
             Some(SinkEvent::Turn(TurnEvent::Failed { err, .. })) => {
+                led.fail(format!("turn 失败:{err}"));
                 return match mode {
                     // SSE 中途错误:协议无标准错误帧,error json + DONE 收口
                     ReplyMode::Stream => {
@@ -711,6 +766,10 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
                         }
                         if let Err(e) = http::sse_data(w, "[DONE]").await {
                             owl_shared::log_info!("chat", "流式收尾帧写失败(客户端可能已断开): {e}");
+                        }
+                        // 错误流也要收口(chunked 终止块;失败 = 客户端已走)
+                        if let Err(e) = http::sse_end(w).await {
+                            owl_shared::log_info!("chat", "流式终止块写失败(客户端可能已断开): {e}");
                         }
                         Ok(())
                     }
@@ -722,15 +781,28 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
             Some(SinkEvent::Accepted { .. }) | Some(SinkEvent::Rejected { .. })
                 if mode == ReplyMode::Stream =>
             {
+                led.fail("协议序错乱:受理帧之后再现受理/拒绝帧");
                 break
             }
             Some(SinkEvent::Accepted { .. }) | Some(SinkEvent::Rejected { .. }) => {
+                led.fail("引擎连接中断(受理帧之后)");
                 return http::respond_json(w, 503, &error_json("引擎连接中断")).await;
             }
-            None if mode == ReplyMode::Stream => break,
+            None if mode == ReplyMode::Stream => {
+                led.fail("客户端断开(流式;引擎 turn 由 actor 侧弃置)");
+                break
+            }
             None => {
+                led.fail("引擎连接中断(通道关闭)");
                 return http::respond_json(w, 503, &error_json("引擎连接中断")).await;
             }
+        }
+    }
+    // 环外到达 = 流式被 break(协议序错乱 / 客户端断开):补终止块,让复用连接
+    // 上的下一个请求有干净帧界(写失败 = 客户端已走,记一条但不改结局)
+    if mode == ReplyMode::Stream {
+        if let Err(e) = http::sse_end(w).await {
+            owl_shared::log_debug!("chat", "SSE 终止块写失败(客户端可能已断开): {e}");
         }
     }
     Ok(())
@@ -813,6 +885,99 @@ async fn emit_items<W: tokio::io::AsyncWrite + Unpin>(
         }
     }
     Ok(())
+}
+
+// ============================================================================
+// §3 `/tokenize`(G5③;契约见《设计》§3.7)
+// ============================================================================
+
+/// `/tokenize` 请求体(**最小面**)。
+///
+/// 与 `/v1/chat/completions` 不同,本端点 `deny_unknown_fields` **开着**:
+/// 它是 owl 自有面(无 pi 兼容史要背),多传字段 = 调用方预期落空 ⇒ 响亮拒。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TokenizeRequest {
+    /// 回显用(不校验与本进程模型名一致 —— 单模型服务)
+    model: Option<String>,
+    /// 待编码文本(**必填**;本端点不做 messages 渲染)
+    prompt: Option<String>,
+    /// `raw`(缺省)= 纯文本编码;`chat` = 先套家族单轮包装
+    mode: Option<String>,
+    /// vLLM 同名字段:**只接 false/缺省** —— true = 响亮拒
+    /// (本引擎编码恒 `add_special_tokens=false`;要家族包装用 `mode="chat"`)
+    add_special_tokens: Option<bool>,
+}
+
+/// 请求 → `(text, chat_wrap, mode)` 的**纯校验**(不碰网络/引擎;可单测)
+fn tokenize_plan(req: &TokenizeRequest) -> Result<(String, bool, &'static str), String> {
+    let text = match req.prompt.as_deref() {
+        Some(t) if !t.is_empty() => t.to_string(),
+        _ => {
+            return Err(
+                "prompt 必填且非空(messages 渲染未做 —— 需要时先自己渲染再送本端点)".into(),
+            )
+        }
+    };
+    let mode = req.mode.as_deref().unwrap_or("raw");
+    let (chat_wrap, mode_canon) = match mode {
+        "raw" => (false, "raw"),
+        // 家族单轮包装(与裸文本提交同一律):问“这轮用户内容实际花多少 token”
+        "chat" => (true, "chat"),
+        other => return Err(format!("mode 只接 raw|chat,得到 {other:?}")),
+    };
+    if req.add_special_tokens == Some(true) {
+        return Err(
+            "add_special_tokens=true 未支持(本引擎编码恒不加特殊 token;要家族单轮包装用 mode=\"chat\")"
+                .into(),
+        );
+    }
+    Ok((text, chat_wrap, mode_canon))
+}
+
+/// `POST /tokenize`:校验 → 旁路引擎 tokenize → 回兼容形状的 JSON。
+///
+/// ⚠️ **延迟说明**:引擎 actor 单线程且“收件与泵不相交” ⇒ 本请求排在当前
+/// turn 之后(生成期间调用会等到本轮结束)。毫秒级 CPU 工,单源真理优先。
+pub(crate) async fn tokenize<W: tokio::io::AsyncWrite + Unpin>(
+    w: &mut W,
+    body: &[u8],
+    tx: mpsc::Sender<EngineReq>,
+) -> std::io::Result<()> {
+    let req: TokenizeRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => return http::respond_json(w, 400, &error_json(format!("请求体非法: {e}"))).await,
+    };
+    let (text, chat_wrap, mode) = match tokenize_plan(&req) {
+        Ok(v) => v,
+        Err(e) => return http::respond_json(w, 400, &error_json(e)).await,
+    };
+    let (rtx, rrx) = tokio::sync::oneshot::channel();
+    if tx.send(EngineReq::Tokenize { text, chat_wrap, reply: rtx }).await.is_err() {
+        return http::respond_json(w, 503, &error_json("引擎退役")).await;
+    }
+    match rrx.await {
+        Ok(Ok(rep)) => {
+            http::respond_json(
+                w,
+                200,
+                &json!({
+                    "count": rep.tokens.len(),
+                    "max_model_len": rep.max_seq_tokens,
+                    "tokens": rep.tokens,
+                    "mode": mode,
+                    "model": req.model,
+                }),
+            )
+            .await
+        }
+        // 编码失败(显式上抛;不混淆“文本是空的”)
+        Ok(Err(e)) => http::respond_json(w, 400, &error_json(e)).await,
+        Err(_) => {
+            http::respond_json(w, 503, &error_json("引擎连接中断(tokenize 应答通道关闭)"))
+                .await
+        }
+    }
 }
 
 /// 非流式 message(三通道聚合;pi 的 AssistantMessage 同形)
@@ -982,5 +1147,30 @@ mod tests {
         let plain = error_json_for_reject("messages 为空".into());
         assert!(plain["error"].get("code").is_none());
         assert_eq!(plain["error"]["message"], "messages 为空");
+    }
+
+    /// **G5③ `/tokenize` 纯校验面**:两模式 + 三类响亮拒(不静默回缺省)
+    #[test]
+    fn tokenize_plan_modes_and_rejects() {
+        let plan = |j: &str| {
+            let req: TokenizeRequest = serde_json::from_str(j).expect("请求体应可解析");
+            tokenize_plan(&req)
+        };
+        assert_eq!(plan(r#"{"prompt":"你好"}"#).unwrap(), ("你好".into(), false, "raw"));
+        assert_eq!(
+            plan(r#"{"prompt":"你好","mode":"chat"}"#).unwrap(),
+            ("你好".into(), true, "chat")
+        );
+        assert!(plan(r#"{"prompt":"你好","add_special_tokens":false}"#).is_ok(), "false 可接");
+        assert!(plan(r#"{"prompt":""}"#).unwrap_err().contains("prompt 必填"), "空 prompt 拒");
+        assert!(plan(r#"{"mode":"chat"}"#).unwrap_err().contains("prompt 必填"), "缺 prompt 拒");
+        assert!(plan(r#"{"prompt":"x","mode":"tokens"}"#).unwrap_err().contains("raw|chat"));
+        assert!(
+            plan(r#"{"prompt":"x","add_special_tokens":true}"#)
+                .unwrap_err()
+                .contains("add_special_tokens=true 未支持")
+        );
+        // 未知字段:本端点开着 deny_unknown_fields(自有面,不背兼容史)
+        assert!(serde_json::from_str::<TokenizeRequest>(r#"{"prompt":"x","nope":1}"#).is_err());
     }
 }

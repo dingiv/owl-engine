@@ -54,6 +54,8 @@
 //! | pool | gdn_slots / snap_max | usize / 8、4 |
 //! | pool | vram_target / vram_reserve_mb | f64、u64 / 0.97、1024 |
 //! | pool | prefix_cache | bool / true |
+//! | pool | prefill_align_tail | bool / **true**(块边界快照须页对齐;单块档多切一刀) |
+//! | pool | snap_decode_stride | usize / 1(生成相位页边界快照页步长;0 = 关) |
 //! | spec | depth / dumb / draft_kv_fp8 | usize 0(off)、flag、flag |
 //! | spec | notaps / tapdecl | flag / false(verify 图诊断) |
 //! | spec | degrade_after / probe_every | usize / 6、8(降级首探窗口;旧 64 = 长尾税) |
@@ -282,6 +284,15 @@ pub struct PoolCfg {
     /// 切点 = 最后一个整页边界(下一轮复用面最大);**多 chunk 档不受影响**
     /// (前段 chunk 尾本来就对齐)。
     pub prefill_align_tail: bool,
+    /// **生成相位页边界快照的页步长**(缺省 1 = 每页一拍;0 = 关)。
+    ///
+    /// 背景(§9.1(6)a):`prefill_align_tail` 只覆盖 **prefill 段**;生成相位的
+    /// 每个页边界此前**不拍快照**(spec 轮提交跨过边界 ⇒ 状态已过界)⇒ 短 prompt
+    /// 的**尾部复用面**受限于 prompt 里最后一个整页(实测 187 tok 档只复用 64)。
+    /// 现在 spec 轮内用 fold 把 GDN 态回卷到边界拍一张再卷回;本键是**节流**:
+    /// 只在 `边界页号 % stride == 0` 的边界拍(快照 27B ≈ 152 MiB/条 ⇒ 拍得越密,
+    /// 宿主下沉流量越大;1 = 每个页边界都拍)。
+    pub snap_decode_stride: usize,
     /// **前缀缓存份额**(0..1;`prefix_cache` 开时生效;缺省 0.5)。
     ///
     /// 语义 = "设备池里最多多少比例的页可以留在缓存树上等复用"
@@ -962,6 +973,7 @@ impl Default for PoolCfg {
             gdn_slots: 8,
             prefix_cache_share: 0.5,
             prefill_align_tail: true,
+            snap_decode_stride: 1,
             snap_max: 4,
             host_cache_mb: 0,
             snap_host_mb: 0,

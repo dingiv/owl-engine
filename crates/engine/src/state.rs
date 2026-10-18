@@ -961,16 +961,6 @@ impl StatePool {
             .await
     }
 
-    /// spec 快照缓冲句柄组(E5-M5 fold 图烘焙:状态 args = 快照 buf
-    /// 就地,slot 恒 0;fold 后 restore 回写会话格)。序 = 层 × 4
-    /// (conv_q/k/v/rec),与 capture/restore 同构。
-    pub(crate) fn spec_snap_bufs(&self) -> Vec<BlockN> {
-        self.spec_snap
-            .as_ref()
-            .map(|s| s.bufs.clone())
-            .unwrap_or_default()
-    }
-
     /// GDN 层数(fold 记录槽计数用)
     pub(crate) fn gdn_count(&self) -> usize {
         self.gdns.len()
@@ -1299,7 +1289,16 @@ impl StatePool {
 
     /// **槽位选择**(纯;S2 §25.2):同 key 已在设备 ⇒ 原地;否则空槽;
     /// 否则**最冷的设备快照**(调用方决定下沉还是丢)。池关闭 ⇒ `None`。
-    pub(crate) fn snap_pick_slot(&self, key: SnapKey) -> Option<SnapSlotPick> {
+    ///
+    /// `rank` = 逐出优先级(小者先出;调用方给事实,本函数只排序):
+    /// 生成段快照(Transient)逐出即丢、零代价 ⇒ 排在前(先丢它);
+    /// 前缀段快照(Durable)有跨会话共享价值 ⇒ 排在后。同档内照旧 LRU
+    /// ⇒ **链头那条永远最新、永远不是 victim** ⇒ 复用面无损。
+    pub(crate) fn snap_pick_slot(
+        &self,
+        key: SnapKey,
+        rank: &dyn Fn(SnapKey) -> u8,
+    ) -> Option<SnapSlotPick> {
         if self.snaps.keys.is_empty() {
             return None;
         }
@@ -1311,10 +1310,11 @@ impl StatePool {
         }
         let (i, _) = self
             .snaps
-            .last_use
+            .keys
             .iter()
             .enumerate()
-            .min_by_key(|(_, t)| **t)?;
+            .filter_map(|(i, k)| k.map(|k| (i, k)))
+            .min_by_key(|(i, k)| (rank(*k), self.snaps.last_use[*i]))?;
         Some(SnapSlotPick::Victim(i as u32, self.snaps.keys[i]?))
     }
 

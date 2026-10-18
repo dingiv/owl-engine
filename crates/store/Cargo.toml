@@ -10,6 +10,11 @@ description = "State store: KV/state virtualization across GPU / host / disk tie
 [dependencies]
 owl-iface = { path = "../backends/iface" }
 thiserror = { workspace = true }
+# 宿主块分配的**大页提示**(`madvise(MADV_HUGEPAGE)`;Linux)。
+# 为何住这里:本 crate 是宿主块的分配者 —— 缺页成本就出在分配出来的那页面上。
+# 数据:159 MiB 冷写 = 4 万次 4KiB 缺页 ≈ **80 ms**;2MiB 大页(内核 THP =
+# `[madvise]`)≈ **12 ms**(6.6×;§9.1(6)b 立案的定量与修法)。
+libc = "0.2"
 
 [dev-dependencies]
 # 测试面允许:owl-cpu 是**契约面(owl-iface::DeviceClient)的一个真实现体** ——
