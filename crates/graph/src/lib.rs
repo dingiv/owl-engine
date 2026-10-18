@@ -113,10 +113,11 @@ impl GraphGovernor {
                 law: "A1.2",
             });
         }
-        debug_assert!(
-            self.profiles.contains(&profile),
-            "捕获档必须来自规划档位表"
-        );
+        // **响亮拒,不用 debug_assert**(2026-10-17 审查 C1):release 档原会静默
+        // 放行 ⇒ 规划表外的档占掉 live 预算而 preflight 看不见(报数失真)。
+        if !self.profiles.contains(&profile) {
+            return Err(GraphError::ProfileNotPlanned { profile });
+        }
         self.live_graphs += 1;
         self.phase = GraphPhase::Captured;
         Ok(())
@@ -229,6 +230,25 @@ mod tests {
         assert_eq!(g.phase(), GraphPhase::Live);
     }
 
+    /// A1.2(2026-10-17 审查 C1):**规划表外的档必须响亮拒**(原 `debug_assert!`
+    /// ⇒ release 静默放行 ⇒ 未规划档占掉 live 预算而 `preflight` 看不见)。
+    #[test]
+    fn end_capture_rejects_unplanned_profile() {
+        let mut g = gov();
+        g.begin_capture().unwrap();
+        // gov() 规划的两档 = {batch1/max_frontier4096, batch4/…};取表外的 batch=3
+        let err = g
+            .end_capture(GraphProfile { batch: 3, max_frontier: 4096 })
+            .unwrap_err();
+        assert!(
+            matches!(err, GraphError::ProfileNotPlanned { .. }),
+            "应报 ProfileNotPlanned,实得 {err:?}"
+        );
+        // 拒后仍停在捕获态(未占预算)⇒ 仍可正常收尾
+        assert_eq!(g.phase(), GraphPhase::Capturing);
+        g.end_capture(GraphProfile { batch: 1, max_frontier: 4096 }).unwrap();
+    }
+
     /// A1.1:图预算必须从池容量中前置扣除
     #[test]
     fn allowance_reserved_before_pool() {
@@ -292,4 +312,9 @@ pub enum GraphError {
     /// 定影超限:实测 footprint 超过规划 allowance(A5.4 同族)
     #[error("A5.4 定影超限:实测 {measured}B > allowance {allowance}B,销图处理")]
     OverAllowance { measured: u64, allowance: u64 },
+    /// **捕获档位未规划**(A1.2:档位必须先规划后捕获)。2026-10-17 审查补:
+    /// 原为 `debug_assert!` ⇒ release 静默放行 ⇒ 未规划的档占掉一格 live 预算
+    /// (规划面看不见 ⇒ 后续 preflight 报数失真)。
+    #[error("捕获档位未规划:{profile:?}(档位表外)")]
+    ProfileNotPlanned { profile: GraphProfile },
 }

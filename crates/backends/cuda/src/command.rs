@@ -33,6 +33,13 @@ pub enum Command {
         graph: GraphId,
         ack: Ack<Result<(), ModelError>>,
     },
+    /// **FI plan 表同步**(W3):让 FI 族把 `spec.ctx_total` 对应的调度表刷进
+    /// int_ws。用于 "FI 核在捕获图内" 的档 —— 图回放不再经过宿主处理器,
+    /// 表必须由图外一步显式刷新(见 `DeviceClient::fi_plan_sync`)。
+    FiPlanSync {
+        spec: owl_iface::contract::FiPlanSpec,
+        ack: Ack<Result<(), ModelError>>,
+    },
     /// **捕获窗作废**(窗内出错/空窗的收尾;捕获期间**允许** —— 它就是窗内
     /// 收尾手段)。语义 = "这一窗从未存在":退出捕获态 + 销毁半成品图 +
     /// **窗内自产块整批移出账房**(⇒ slab 释放)。不做它则失败捕获会把整条
@@ -64,6 +71,8 @@ pub enum Command {
         data: Vec<u8>,
         /// 上传落地块的点名(同 [`Command::Alloc`];必填)
         name: String,
+        /// 落点流(0 = H2D 批量面;1 = COMPUTE 参数面 —— 见 `UpStream`)
+        stream: u8,
         ack: Ack<Result<Bytes, ModelError>>,
     },
     /// 块清零(设备侧 memset_d8;引擎 turn-open GDN 状态重置专用;
@@ -80,6 +89,8 @@ pub enum Command {
         block: u64,
         offset_bytes: usize,
         data: Vec<u8>,
+        /// 落点流(0 = H2D 批量面;1 = COMPUTE 参数面 —— 见 `UpStream`)
+        stream: u8,
         ack: Ack<Result<(), ModelError>>,
     },
     /// host → device **批量分块写入**(S1):decode 每步多槽装填合一次
@@ -87,6 +98,8 @@ pub enum Command {
     /// server 逐写池化码头 + H2D 流序,末尾单 notify
     HtodChunks {
         writes: Vec<(u64, usize, Vec<u8>)>,
+        /// 落点流(0 = H2D 批量面;1 = COMPUTE 参数面 —— 见 `UpStream`)
+        stream: u8,
         ack: Ack<Result<(), ModelError>>,
     },
     /// 分配 pinned 租约(流式装载 DMA 源;池优先,miss 才 cudaHostAlloc)
@@ -119,6 +132,8 @@ pub enum Command {
         offset_bytes: usize,
         /// 字节长度(池租约容量 ≥ 请求;只传前 len_bytes)
         len_bytes: usize,
+        /// 落点流(0 = H2D 批量面;1 = COMPUTE 参数面 —— 见 `UpStream`)
+        stream: u8,
         ack: Ack<Result<(), ModelError>>,
     },
     /// device → host(异步 memcpy 到 pinned 码头;want_bytes 字节口径)
@@ -195,6 +210,11 @@ pub enum Command {
     MemPoolTrim {
         ack: Ack<Result<u64, ModelError>>,
     },
+    /// **设备 SM 数查询**(宿主面只读;`cuDeviceGetAttribute(MULTIPROCESSOR_COUNT)`)。
+    /// 与 `BlockLedgerDump` 同族:无 GPU 活、无流、捕获期可放行(恒定值,不碰设备状态)。
+    DeviceSmCount {
+        ack: Ack<Result<usize, ModelError>>,
+    },
     /// **块账本投影**(调试面;`GET /debug/blocks`):全活块 (id, 字节, dtype, 地址, 账本)
     /// —— 判「同 id 两地址」与「两活块区间相交」的唯一权威快照。
     BlockLedgerDump {
@@ -245,9 +265,11 @@ impl Command {
             Self::GraphLaunch { .. } => "graph_launch",
             Self::GraphAbort { .. } => "graph_abort",
             Self::GraphDestroy { .. } => "graph_destroy",
+            Self::FiPlanSync { .. } => "fi_plan_sync",
             Self::Alloc { .. } => "alloc",
             Self::Htod { .. } => "htod",
             Self::MemsetZero { .. } => "memset_zero",
+            Self::DeviceSmCount { .. } => "device_sm_count",
             Self::BlockLedgerDump { .. } => "block_ledger_dump",
             Self::MemPoolTrim { .. } => "mem_pool_trim",
             Self::UploadAndLaunch { .. } => "upload_and_launch",
@@ -282,8 +304,10 @@ impl Command {
             Self::GraphLaunch { ack, .. } => ack.created_at(),
             Self::GraphAbort { ack } => ack.created_at(),
             Self::GraphDestroy { ack, .. } => ack.created_at(),
+            Self::FiPlanSync { ack, .. } => ack.created_at(),
             Self::Alloc { ack, .. } => ack.created_at(),
             Self::Htod { ack, .. } => ack.created_at(),
+            Self::DeviceSmCount { ack } => ack.created_at(),
             Self::BlockLedgerDump { ack } => ack.created_at(),
             Self::MemPoolTrim { ack } => ack.created_at(),
             Self::UploadAndLaunch { ack, .. } => ack.created_at(),

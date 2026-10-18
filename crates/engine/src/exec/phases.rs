@@ -1,6 +1,7 @@
 //! 调度三相位执行(begin/prefill/decode)+ 采样收口 + GDN 画像
 use super::*;
 use owl_models::ops::PlanNode; // ⚙ diag:池叶 → 块 id(写者足迹取证)
+use owl_iface::contract::ModelError;
 
 impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// turn 启动执行(设备侧照办):GDN 格重置 / 边界快照恢复 + 持久
@@ -84,7 +85,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         is_last: bool,
     ) -> Result<TurnEvent> {
         let (turn_id, sid) = {
-            let act = self.turns.active.as_ref().expect("活跃");
+            let act = self.turns.active()?;
             (act.id, act.session_id)
         };
         // 调试门:prefill 块粒度(见 owl_shared::stepgate;`--step-gate` 控制)
@@ -163,10 +164,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 bnd_ms
             );
         }
-        self.turns.active.as_mut().expect("活跃").fed += chunk_ids.len();
+        self.turns.active_mut()?.fed += chunk_ids.len();
         if !is_last {
             // 块落定,无文本产出 —— 不谎报 Idle
-            let act = self.turns.active.as_ref().expect("活跃");
+            let act = self.turns.active()?;
             return Ok(TurnEvent::Prefill {
                 turn: turn_id,
                 fed: act.fed,
@@ -174,7 +175,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             });
         }
         // 末块:末行采样(eos / 预算 / Token)
-        self.sample_and_emit(last_row.expect("末块必有 logits")).await
+        self.sample_and_emit(last_row.ok_or_else(|| ModelError::EngineInvariant { what: "末块缺 logits(采样面与声明不一致)".into() })?).await
     }
 
 
@@ -187,7 +188,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         gdn_slot: usize,
         grew: bool,
     ) -> Result<TurnEvent> {
-        let sid = self.turns.active.as_ref().expect("活跃").session_id;
+        let sid = self.turns.active()?.session_id;
         // 调试门:decode 步粒度
         owl_shared::step_gate!("engine.decode").await;
         let prof = self.probes.step_profile;
@@ -219,39 +220,31 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 step_slots.push(("xqa_pt", self.xqa_pt_of(sid)));
             }
         }
-        // **FI 断点臂(V1c;T=1)**:宿主标量槽 ctx_total + 表四件套(位型过线)。
-        // 判据 = 槽在场(与 xqa_seq 同款纪律:`decode_fi` 关时图里没有这些槽)
+        // **FI 图内臂每步 ingress**:**表四件套**(位型过线)。图里 `ctx_total`
+        // 是**烘死的上界**(调度表形状),当步真值靠**表**(下面 `fi_plan_sync` 刷)。
+        // ⚠️ 判据 = **槽在场**(与 xqa_seq 同款纪律):槽属于**图**;曾按"宿主标量
+        // cell 在不在"判 ⇒ 单图档四件套一条不写 ⇒ 核读陈旧页表 ⇒ 输出 64 个空
+        // token(2026-10-18 实测踩过)。
         if self.graphs.session.has_input("fi_q_cu") {
-            if let Some(cell) = self.graphs.decode_fi_ctx() {
-                let ctx_total = pos + 1;
-                // ⚙ diag(`OWL_FI_BUCKET=<n>`):把**宿主标量槽**按桶上取整 ⇒ plan
-                // 只在跨桶时重算(表仍按真值写 ⇒ 每行 KV 上界由设备表定)。
-                // 判据:文本仍 ≡ 参考臂(plan 过供给只是多些被掩的 CTA)。
-                let bucket = owl_shared::env_reader::parse::<usize>("OWL_FI_BUCKET").unwrap_or(0);
-                let plan_ctx = if bucket > 0 {
-                    ctx_total.div_ceil(bucket) * bucket
-                } else {
-                    ctx_total
-                };
-                cell.store(plan_ctx, std::sync::atomic::Ordering::Relaxed);
-                let page = self.pool.page;
-                let bt_chain = {
-                    let s = self.bank.sessions.get(sid).expect("账在");
-                    s.block_table.clone()
-                };
-                let nb_used = ctx_total.div_ceil(page).min(bt_chain.len()).max(1);
-                let mut idx = vec![0f32; self.pool.nb];
-                for (i, b) in bt_chain.iter().take(nb_used).enumerate() {
-                    idx[i] = f32::from_bits(*b);
-                }
-                step_slots.push(("fi_q_cu", vec![0.0, f32::from_bits(1)]));
-                step_slots.push(("fi_indices", idx));
-                step_slots.push(("fi_indptr", vec![0.0, f32::from_bits(nb_used as u32)]));
-                step_slots.push((
-                    "fi_last_len",
-                    vec![f32::from_bits((ctx_total - (nb_used - 1) * page) as u32)],
-                ));
+            let ctx_total = pos + 1;
+            // 四件套:真值(与承载无关 —— 图内/窗外都读同一批槽)
+            let page = self.pool.page;
+            let bt_chain = {
+                let s = self.bank.sessions.session(sid)?;
+                s.block_table.clone()
+            };
+            let nb_used = ctx_total.div_ceil(page).min(bt_chain.len()).max(1);
+            let mut idx = vec![0f32; self.pool.nb];
+            for (i, b) in bt_chain.iter().take(nb_used).enumerate() {
+                idx[i] = f32::from_bits(*b);
             }
+            step_slots.push(("fi_q_cu", vec![0.0, f32::from_bits(1)]));
+            step_slots.push(("fi_indices", idx));
+            step_slots.push(("fi_indptr", vec![0.0, f32::from_bits(nb_used as u32)]));
+            step_slots.push((
+                "fi_last_len",
+                vec![f32::from_bits((ctx_total - (nb_used - 1) * page) as u32)],
+            ));
         }
         // **B-3d 选择层视图**:`select_decode` 档 ⇒ 页表与上下文长走视图输入槽
         // (视图 = 选中页 ++ 新生成尾部;无视图态 ⇒ 写全量链,与不开时等价)
@@ -265,9 +258,26 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // ⚙ KV 页字节差分(OWL_KV_DUMP=<pos>,一次):写前/写后各 d2h 一页 ⇒
         // **写者的足迹**直接给出块内元素序(页面连续 vs 8B 小块 strided),
         // 不需要任何参考值(见 docs §11.11「写者 A/B」)。
-        let kv_dump_at = owl_shared::env_reader::parse::<usize>("OWL_KV_DUMP");
+        let kv_dump_at = self.probes.kv_dump_at;
         if kv_dump_at == Some(pos) {
             self.dump_kv_page(sid, kv_slot, "before").await?;
+        }
+        // **FI plan 表同步**(W3;`[dispatch] fi_plan_bake` 档):图内 FI 核的回放
+        // **不经过宿主处理器** ⇒ 表(`int_ws`)必须由图外每步显式刷新;否则它读到的
+        // 是别的写者(如逐算子 eager 的 prefill 分块)留下的表,而 split 档的表
+        // 必须与**当步真 ctx** 对应(实测症状:输出 64 个空 token)。
+        // 条件 = 档位在场 + 本图确实带 FI 输入槽(臂身份自证,不猜)。
+        if self.cfg.knobs.fi_plan_bake.is_some() && self.graphs.session.has_input("fi_q_cu") {
+            let d = self.pool.dims;
+            let spec = owl_iface::contract::FiPlanSpec {
+                t: 1,
+                ctx_total: pos + 1,
+                hq: d.hq,
+                hkv: d.hkv,
+                hd: d.hd,
+                page: self.pool.page,
+            };
+            self.graphs.session.face_mut().fi_plan_sync(spec).await?;
         }
         self.graphs.session.step(&step_refs).await?;
         if kv_dump_at == Some(pos) {
@@ -280,17 +290,17 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let total = t0.unwrap().elapsed();
             owl_shared::log_info!("step-prof", "pos={pos} step-total={total:?} wall2={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100000);
         }
-        self.turns.active.as_mut().expect("活跃").fed += 1;
+        self.turns.active_mut()?.fed += 1;
         // E2c:decode 跨页边界 → 快照拍摄(同流保序,先拍再采样)
         {
-            let act = self.turns.active.as_ref().expect("活跃");
+            let act = self.turns.active()?;
             if self.pool.paged && act.fed.is_multiple_of(self.pool.page) {
                 self.capture_gdn_snap(act.session_id, act.fed).await?;
             }
         }
         // D1 取证:GDN 状态格画像(OWL_GDN_DUMP;前 6 步,首末层 conv_v/rec)
         if self.probes.gdn_dump {
-            let step = self.turns.active.as_ref().expect("活跃").out.len() as u64;
+            let step = self.turns.active()?.out.len() as u64;
             self.probe_gdn_dump(gdn_slot, step).await?;
         }
         // E3 设备采样:4B token 回读(旧 = 600KB logits dtoh + host argmax)。
@@ -302,14 +312,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 采样开/关(AGT-06):**请求带采样参数则以请求为准**
         // (`temperature=0` = 本 turn 贪心);未带 = 引擎 knobs(flavor 语义)。
         // 旧行为不变(GDN 恒等门类测试不带请求参数)。
-        let eff_sampler = self.turns.active.as_ref().expect("活跃").sampler;
-        let sampler_on = self.turns.active.as_ref().expect("活跃").sampler_on;
+        let eff_sampler = self.turns.active()?.sampler;
+        let sampler_on = self.turns.active()?.sampler_on;
         let nt = if sampler_on {
             let mut logits = self.graphs.session.read_output_f32("logits").await?;
             // 诊断:分布形状(绝对尺度 / top1-top2 gap / 候选词面)——
             // 复读病理定位的仪表盘(OWL_DEBUG 门控,前 16 步)
             let (turn_id, step) = {
-                let act = self.turns.active.as_ref().expect("活跃");
+                let act = self.turns.active()?;
                 (act.id, act.out.len() as u64)
             };
             // 诊断:KV 池回读(取证图内 K0 写是否落盘)—— 槽 2 = prompt
@@ -371,9 +381,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     .filter(|(_, &v)| v.is_finite())
                     .map(|(i, &v)| (v, i as u32))
                     .collect();
-                top.select_nth_unstable_by(7, |a, b| b.0.partial_cmp(&a.0).unwrap());
+                top.select_nth_unstable_by(7, |a, b| b.0.total_cmp(&a.0));
                 top.truncate(8);
-                top.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                top.sort_by(|a, b| b.0.total_cmp(&a.0));
                 let pretty: Vec<String> = top
                     .iter()
                     .map(|(v, i)| {
@@ -384,15 +394,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
             // RNG seed = turn id ⊕ 步数(同 turn 重放确定性,跨 turn 独立);
             // 请求给了 `seed` ⇒ 以它为基(AGT-06)
-            let seed_base = self.turns.active
-                .as_ref()
-                .expect("活跃")
+            let seed_base = self.turns.active()?
                 .seed
                 .unwrap_or_else(|| turn_id.wrapping_mul(0x9E3779B97F4A7C15));
             let mut rng = seed_base ^ step.wrapping_mul(0xBF58476D1CE4E5B9);
             // 惩罚集 = prompt 尾(64)+ 已生成(反循环;llama.cpp 同语义)
             let history: Vec<u32> = {
-                let act = self.turns.active.as_ref().expect("活跃");
+                let act = self.turns.active()?;
                 let tail = act.prompt_ids.len().saturating_sub(64);
                 act.prompt_ids[tail..]
                     .iter()
@@ -420,7 +428,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // 采样分支同格式 —— 基线/融合 A/B 对比用)
             if self.probes.debug {
                 let (turn_id, step) = {
-                    let act = self.turns.active.as_ref().expect("活跃");
+                    let act = self.turns.active()?;
                     (act.id, act.out.len() as u64)
                 };
                 if step < 16 {
@@ -431,9 +439,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         .filter(|(_, &v)| v.is_finite())
                         .map(|(i, &v)| (v, i as u32))
                         .collect();
-                    top.select_nth_unstable_by(7, |a, b| b.0.partial_cmp(&a.0).unwrap());
+                    top.select_nth_unstable_by(7, |a, b| b.0.total_cmp(&a.0));
                     top.truncate(8);
-                    top.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                    top.sort_by(|a, b| b.0.total_cmp(&a.0));
                     let pretty: Vec<String> = top
                         .iter()
                         .map(|(v, i)| {
@@ -452,7 +460,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         mrec("decode.step", t_step.elapsed());
         // B4 降级期草稿同步(§6.24 方案 A):decode 图 taps → 1 行 encode。
         // 毒化带 ≤8 token 即被覆写,探测重入零损;成本 ≈ 0.5ms/tok(2%)
-        if self.tspec_ref().spec_degraded && self.spec.dflash_tap_count > 0 {
+        // 2026-10-17:**播种裸步**走同一臂(两者同构:都要同步草稿池 + 计时进分母)
+        let degraded = self.tspec_ref()?.spec_degraded;
+        let seeding = self.tspec_ref()?.bare_seed_step;
+        if (degraded || seeding) && self.spec.dflash_tap_count > 0 {
             // 降级步分相(2026-10-12 探针完善):sync encode 单独计时 ——
             // 9.3 t/s 案的 80ms/步嫌疑犯,一屏定谳
             let t_syn = std::time::Instant::now();
@@ -466,20 +477,28 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 self.prefill_dflash_encode(&taps, pos).await?;
             }
             mrec("decode.sync", t_syn.elapsed());
-            self.tspec().spec_steps_degraded += 1;
+            if degraded {
+                self.tspec()?.spec_steps_degraded += 1;
+            }
             // 滚动裸步成本 ewma(动态盈亏线分母;α=0.15)
             {
                 let bc = t_step.elapsed().as_secs_f32() * 1000.0;
-                let spec = self.tspec();
-                spec.bare_cost_ewma_ms = if spec.bare_cost_ewma_ms > 0.0 {
-                    spec.bare_cost_ewma_ms * 0.85 + bc * 0.15
-                } else {
+                let spec = self.tspec()?;
+                let was_unmeasured = spec.bare_cost_ewma_ms <= 0.0;
+                spec.bare_cost_ewma_ms = if was_unmeasured {
                     bc
+                } else {
+                    spec.bare_cost_ewma_ms * 0.85 + bc * 0.15
                 };
                 // 采样时的 ctx(换档失效判据;见 SpecDegrade.bare_cost_ctx)
                 spec.bare_cost_ctx = pos;
+                if was_unmeasured {
+                    owl_shared::log_info!("spec-seed", "分母已播种:裸步成本 = {bc:.1}ms(pos={pos})⇒ 盈亏线改用实测比(原兜底常量 2.5)"
+                    );
+                }
             }
-            mrec("decode.step.deg", t_step.elapsed());
+            mrec(if degraded { "decode.step.deg" } else { "decode.step.seed" }, t_step.elapsed());
+            self.tspec()?.bare_seed_step = false;
         }
         self.sample_and_emit(nt).await
     }
@@ -516,7 +535,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// 采样 + 事件产出(Greedy;E3 设备 argmax,token id 直入)。
     /// eos 命中或预算尽 → Completed;否则 Token(delta = 解码文本增量)。
     pub(crate) async fn sample_and_emit(&mut self, nt: u32) -> Result<TurnEvent> {
-        let turn_id = self.turns.active.as_ref().expect("active 已保证").id;
+        let turn_id = self.turns.active()?.id;
         {
             // 崩坏排查打点:首 token / EOS 事实(decode 与 spec 两路汇合)
             let bs = self.boot_seq;
@@ -537,7 +556,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             return self.complete(crate::turn::FinishReason::Stop).await;
         }
         let budget_done = {
-            let act = self.turns.active.as_mut().expect("active 已保证");
+            let act = self.turns.active_mut()?;
             act.out.push(nt);
             // `decoded` 由全量重解差分维护(delta 本步统一从 `emitted` 切片取,
             // 以便 stop 尾缓冲能回吐);返回值丢弃是有意的
@@ -551,7 +570,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         //    (否则半截停止串已流给客户端,命中时收不回来)。
         // 空 stop 列表 = 零额外开销(`safe_end` 直接返回全长)。
         let (delta, stop_hit) = {
-            let act = self.turns.active.as_mut().expect("active 已保证");
+            let act = self.turns.active_mut()?;
             let hit = if act.stop.is_empty() {
                 None
             } else {
@@ -607,7 +626,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let esize = if self.pool.kv_fp8 { 1 } else { d.dtype.size_bytes() };
         let row_bytes = hkv * hd * esize;
         let blk = {
-            let s = self.bank.sessions.get(sid).expect("账在");
+            let s = self.bank.sessions.session(sid)?;
             let p = (kv_slot as usize) / page;
             s.block_table.get(p).copied().unwrap_or(0)
         };
@@ -659,3 +678,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     }
 
 }
+
+
+
+

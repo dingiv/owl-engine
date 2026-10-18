@@ -1,5 +1,6 @@
 //! turn 终局(burn_ephemeral / abandon / complete)
 use super::*;
+use owl_iface::contract::ModelError;
 
 impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// **turn 末释放设备表**(S2 引用拆分;§25.1①):表出账归还(引用减一),
@@ -63,8 +64,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     }
 
     pub(crate) async fn complete(&mut self, reason: crate::turn::FinishReason) -> Result<TurnEvent> {
-        let act = self.turns.active.take().expect("active");
-        self.turns.last_prompt_len = Some(act.prompt_ids.len());
+        let act = self.turns.active.take().ok_or_else(|| ModelError::EngineInvariant { what: "turn_end:无活跃 turn".into() })?;
         // B4 分母保鲜回写(下一 turn 种入;见 RunningEngine::bare_cost_carry_ms)
         self.spec.carry_ms = act.spec.bare_cost_ewma_ms;
         self.spec.carry_ctx = act.spec.bare_cost_ctx;
@@ -123,3 +123,4 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         Ok(TurnEvent::Completed { turn: act.id, text, finish: reason })
     }
 }
+

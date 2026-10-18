@@ -313,6 +313,13 @@ struct Inner {
 
 /// metrics 存储(内存态;线程安全 = 单把 Mutex —— 打点粒度微秒级,
 /// 锁开销远小于被测段,不优化)
+///
+/// ⚠️ **锁中毒就地取回(`unwrap_or_else(|p| p.into_inner())`),不 panic**
+/// (2026-10-17 全仓审查统一):本面是**记账/诊断面**,调用点全在热路径
+/// (每节点/每步的 timer/counter)⇒ 一旦某线程持锁 panic 把锁毒化,旧写法
+/// `lock().unwrap()` 会让**此后每一次打点**在调用方热路径上 panic(把小事故
+/// 放大成引擎线程死)。发射账(`backends/cuda/trace.rs`)早有此纪律
+/// ("记账不许拖垮执行"),本文件此前漏了 ⇒ 两套口径,现归位。
 pub struct MetricsStore {
     inner: Mutex<Inner>,
     cap_per_tag: usize,
@@ -373,7 +380,7 @@ impl MetricsStore {
         if !self.armed(level::HOST) {
             return;
         }
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let t = self.thread_no(&mut inner);
         let stack = inner.open.entry(t).or_default();
         if stack.len() >= MAX_OPEN_PER_THREAD {
@@ -385,13 +392,21 @@ impl MetricsStore {
     }
 
     /// timer_end 实现:弹栈配对 → 样本落库(**附父 tag = 调用树边**)
+    ///
+    /// `file`/`line` 只在"无配对 start"的**诊断日志**里用(该日志本身受
+    /// `debug_assertions ∨ feature="perf"` 门控)⇒ 非 perf 档它们未被读:
+    /// 显式 `allow`(2026-10-17 审查清告警),不动签名(macro 面契约不变)。
+    #[cfg_attr(
+        not(any(debug_assertions, feature = "perf")),
+        allow(unused_variables)
+    )]
     pub fn timer_end(&self, tag: &str, file: &'static str, line: u32) -> Result<(), MetricsError> {
         if !self.armed(level::HOST) {
             return Ok(());
         }
         let now = Instant::now();
         let at = SystemTime::now();
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let t = self.thread_no(&mut inner);
         let stack = inner.open.entry(t).or_default();
         // 严格 LIFO 优先;栈顶不符时向下找最近匹配(乱序容错 + 计数)
@@ -442,7 +457,7 @@ impl MetricsStore {
         if !self.armed(level::HOST) {
             return;
         }
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let t = self.thread_no(&mut inner);
         let sample =
             Sample { dur, at: SystemTime::now(), file, line, thread: t, parent: None };
@@ -459,7 +474,7 @@ impl MetricsStore {
         if !self.armed(level::COUNTERS) {
             return;
         }
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let e = inner.counters.entry(tag.to_string()).or_insert((0, file, line));
         e.0 += n;
         e.1 = file;
@@ -472,7 +487,7 @@ impl MetricsStore {
         if !self.armed(level::COUNTERS) {
             return;
         }
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let e = inner.counters.entry(tag.to_string()).or_insert((0, file, line));
         e.0 = v;
         e.1 = file;
@@ -482,7 +497,7 @@ impl MetricsStore {
     /// 聚合 + 过滤(query 数据面)。含**排他时间**计算:
     /// self = total − Σ(以本 tag 为直接父的样本时长)。
     pub fn collect(&self, filter: &MetricsFilter) -> Vec<TagReport> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         // 父 → 子时长和(一次扫描;调用树边已在样本里)
         let mut child_sum: HashMap<&str, Duration> = HashMap::new();
         for dq in inner.samples.values() {
@@ -587,7 +602,7 @@ impl MetricsStore {
 
     /// 清空全部记录(store 本体保留;全局指针不动)
     pub fn reset(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.open.clear();
         inner.samples.clear();
         inner.counters.clear();
@@ -604,13 +619,13 @@ impl MetricsStore {
     /// 此机制)
     pub fn mark_epoch(&self) -> SystemTime {
         let now = SystemTime::now();
-        self.inner.lock().unwrap().epoch = Some(now);
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).epoch = Some(now);
         now
     }
 
     /// 当前 epoch 时刻(未打标 = None)
     pub fn epoch(&self) -> Option<SystemTime> {
-        self.inner.lock().unwrap().epoch
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).epoch
     }
 
     /// 按 epoch 过滤(未打标 = 全量)
@@ -1164,6 +1179,27 @@ mod tests {
 
     fn dur_ms(d: Duration) -> f64 {
         d.as_nanos() as f64 / 1e6
+    }
+
+    /// **锁中毒不许拖垮记账**(2026-10-17 审查统一纪律):另一线程持锁 panic ⇒
+    /// store 中毒,此后打点仍须可用(就地取回 Inner)。反例:旧 `lock().unwrap()`
+    /// ⇒ 中毒后热路径上每次 timer/counter 都 panic。
+    #[test]
+    fn poisoned_lock_still_records() {
+        let store = std::sync::Arc::new(MetricsStore::with_cap(64));
+        let _ = std::thread::spawn({
+            let s = std::sync::Arc::clone(&store);
+            move || {
+                let _g = s.inner.lock().expect("首次加锁");
+                panic!("故意毒化(持锁 panic)");
+            }
+        })
+        .join();
+        assert!(store.inner.is_poisoned(), "本门前提 = 锁已被毒化");
+        // 中毒后仍能打点(不 panic),且样本真的落了账
+        store.timer_record("t.poison", Duration::from_millis(1), file!(), line!());
+        let reps = store.collect(&MetricsFilter::new().tag("t.poison"));
+        assert_eq!(reps.len(), 1, "中毒后仍应完成记账:{reps:?}");
     }
 
     #[test]

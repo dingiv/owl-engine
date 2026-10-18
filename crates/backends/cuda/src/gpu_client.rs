@@ -10,7 +10,7 @@
 
 use crate::command::{Ack, Command, Waiter};
 use crate::server::GpuServer;
-use crate::state::DeviceSelector;
+use crate::state::{DeviceSelector, STREAM_COMPUTE, STREAM_H2D};
 use owl_iface::contract::{Arg, Bytes, DeviceClient, GraphId, LaunchMsg};
 use owl_iface::contract::{Connector, Dtype, ModelError, Shape, SwapDir, SwapPiece};
 use std::future::Future;
@@ -170,6 +170,84 @@ impl GpuClient {
     }
 }
 
+/// 小工具 + **上传/写槽内核的固有实现面**(trait impl 之外;两个流选择口共用)。
+fn f32_bytes(data: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(data.len() * 4);
+    for f in data {
+        bytes.extend_from_slice(&f.to_le_bytes());
+    }
+    bytes
+}
+
+fn sid_of(stream: owl_iface::contract::UpStream) -> u8 {
+    (match stream {
+        owl_iface::contract::UpStream::H2d => STREAM_H2D,
+        owl_iface::contract::UpStream::Compute => STREAM_COMPUTE,
+    }) as u8
+}
+
+impl GpuClient {
+    /// 单块写入(落点流可选)
+    async fn write_chunk_on(
+        &mut self,
+        stream: owl_iface::contract::UpStream,
+        block: u64,
+        offset_bytes: usize,
+        bytes: Vec<u8>,
+    ) -> Result<(), ModelError> {
+        let sid = sid_of(stream);
+        self.submit(move |ack| Command::HtodChunk { block, offset_bytes, data: bytes, stream: sid, ack })?
+            .await
+    }
+
+    /// 批量写入(落点流可选)
+    async fn write_chunks_on(
+        &mut self,
+        stream: owl_iface::contract::UpStream,
+        writes: Vec<(u64, usize, Vec<u8>)>,
+    ) -> Result<(), ModelError> {
+        let sid = sid_of(stream);
+        self.submit(move |ack| Command::HtodChunks { writes, stream: sid, ack })?.await
+    }
+
+    /// **htod 内核**(落点流可选;2026-10-17):trait 的 `htod`(H2D 批量面)
+    /// 与 `htod_on`(流可选)共用本实现 —— 单机制,无第二套上传路径。
+    async fn htod_with_stream(
+        &mut self,
+        sid: u8,
+        dtype: Dtype,
+        shape: &Shape,
+        src: &[u8],
+        name: &str,
+    ) -> Result<Bytes, ModelError> {
+        // 字节直传(字节口径);Bytes.len = 元素数,按 shape 回填。
+        //
+        // ⚠️ **dtype 不再静默忽略**(2026-10-15 审查补):旧实现 `let _ = dtype;`
+        // ⇒ 调用方传错 dtype(非 f16 基线,如 U32 打包权重)时 `Bytes.len`
+        // 语义错而**无声**。这里做**交叉校验**(不拒非 F16 —— U32 是合法用法):
+        // `src` 字节数必须 ≥ `elems × dtype 字节宽`(多给容许:池块可含尾料)。
+        let elems: usize = shape.iter().product();
+        let nm = name.to_string();
+        let want = elems
+            .checked_mul(dtype.size_bytes())
+            .ok_or_else(|| ModelError::Msg(format!("htod: elems({elems})×dtype({dtype:?}) 溢出")))?;
+        if src.len() < want {
+            return Err(ModelError::Msg(format!(
+                "htod: src {}B < elems({elems})×dtype({dtype:?})={want}B —— dtype/shape 与字节数不一致",
+                src.len()
+            )));
+        }
+        let mut b = self
+            .submit(move |ack| Command::Htod { data: src.to_vec(), name: nm, stream: sid, ack })?
+            .await?;
+        // 事实面定形:服务端只回句柄(U8/未定形),dtype + 阶数由本面按 (dtype, shape) 回填
+        b.len = elems;
+        b.dtype = dtype;
+        b.rank = shape.len() as u8;
+        Ok(b)
+    }
+}
+
 impl DeviceClient for GpuClient {
     /// 执行环境提供(被动律:感知在本侧/boot,kernels 零探测)。
     /// arch 占位 Sm86 —— boot 时从 driver API/CC 查询接真感知,接口零改动。
@@ -209,6 +287,15 @@ impl DeviceClient for GpuClient {
         self.submit(move |ack| Command::GraphDestroy { graph, ack })?.await
     }
 
+    /// **FI plan 表同步**(W3;见 `DeviceClient::fi_plan_sync` 与
+    /// `Command::FiPlanSync`)。提交即返回,设备侧同 COMPUTE 流 FIFO。
+    async fn fi_plan_sync(
+        &mut self,
+        spec: owl_iface::contract::FiPlanSpec,
+    ) -> Result<(), ModelError> {
+        self.submit(move |ack| Command::FiPlanSync { spec, ack })?.await
+    }
+
     async fn alloc(&mut self, dtype: Dtype, elems: usize, name: &str) -> Result<Bytes, ModelError> {
         let n_bytes = elems * dtype.size_bytes();
         // 事实面:句柄自带 dtype(阶数未定形 = 0,由调用点 `view` 或张量视图定)
@@ -237,6 +324,27 @@ impl DeviceClient for GpuClient {
         self.submit(move |ack| Command::AllocPinned { bytes, name: nm, ack })?.await
     }
 
+    async fn upload_pinned_on(
+        &mut self,
+        stream: owl_iface::contract::UpStream,
+        buf: Box<dyn owl_iface::contract::PinnedRegion + Send>,
+        dst: &Bytes,
+        offset_bytes: usize,
+        len_bytes: usize,
+    ) -> Result<(), ModelError> {
+        let sid = sid_of(stream);
+        let dst = dst.clone();
+        self.submit(move |ack| Command::UploadPinned {
+            buf,
+            dst,
+            offset_bytes,
+            len_bytes,
+            stream: sid,
+            ack,
+        })?
+        .await
+    }
+
     async fn upload_pinned(
         &mut self,
         buf: Box<dyn owl_iface::contract::PinnedRegion + Send>,
@@ -244,15 +352,31 @@ impl DeviceClient for GpuClient {
         offset_bytes: usize,
         len_bytes: usize,
     ) -> Result<(), ModelError> {
-        let dst = dst.clone();
-        self.submit(move |ack| Command::UploadPinned {
-            buf,
-            dst,
-            offset_bytes,
-            len_bytes,
-            ack,
-        })?
-        .await
+        self.upload_pinned_on(owl_iface::contract::UpStream::H2d, buf, dst, offset_bytes, len_bytes)
+            .await
+    }
+
+    async fn write_block_f32_on(
+        &mut self,
+        stream: owl_iface::contract::UpStream,
+        dst: &Bytes,
+        offset_elems: usize,
+        data: &[f32],
+    ) -> Result<(), ModelError> {
+        self.write_chunk_on(stream, dst.id, offset_elems * 4, f32_bytes(data))
+            .await
+    }
+
+    async fn write_blocks_f32_on(
+        &mut self,
+        stream: owl_iface::contract::UpStream,
+        writes: &[(&Bytes, usize, &[f32])],
+    ) -> Result<(), ModelError> {
+        let writes: Vec<(u64, usize, Vec<u8>)> = writes
+            .iter()
+            .map(|(b, off, data)| (b.id, off * 4, f32_bytes(data)))
+            .collect();
+        self.write_chunks_on(stream, writes).await
     }
 
     async fn write_block_f32(
@@ -261,37 +385,13 @@ impl DeviceClient for GpuClient {
         offset_elems: usize,
         data: &[f32],
     ) -> Result<(), ModelError> {
-        // f32 标量专用(slots/kv_lens 契约 5 恒 f32);字节化传输入口
-        let mut bytes = Vec::with_capacity(data.len() * 4);
-        for f in data {
-            bytes.extend_from_slice(&f.to_le_bytes());
-        }
-        self.submit(move |ack| Command::HtodChunk {
-            block: dst.id,
-            offset_bytes: offset_elems * 4,
-            data: bytes,
-            ack,
-        })?
+        self.write_chunk_on(
+            owl_iface::contract::UpStream::H2d,
+            dst.id,
+            offset_elems * 4,
+            f32_bytes(data),
+        )
         .await
-    }
-
-    /// 批量块内写入(S1):decode 每步多槽装填合一次命令/一次往返
-    async fn write_blocks_f32(
-        &mut self,
-        writes: &[(&Bytes, usize, &[f32])],
-    ) -> Result<(), ModelError> {
-        let writes: Vec<(u64, usize, Vec<u8>)> = writes
-            .iter()
-            .map(|(b, off, data)| {
-                let mut bytes = Vec::with_capacity(data.len() * 4);
-                for f in *data {
-                    bytes.extend_from_slice(&f.to_le_bytes());
-                }
-                (b.id, off * 4, bytes)
-            })
-            .collect();
-        self.submit(move |ack| Command::HtodChunks { writes, ack })?
-            .await
     }
 
     fn loader_faces(&self, k: usize) -> Option<Vec<Self>>
@@ -356,32 +456,24 @@ impl DeviceClient for GpuClient {
         src: &[u8],
         name: &str,
     ) -> Result<Bytes, ModelError> {
-        // 字节直传(字节口径);Bytes.len = 元素数,按 shape 回填。
-        //
-        // ⚠️ **dtype 不再静默忽略**(2026-10-15 审查补):旧实现 `let _ = dtype;`
-        // ⇒ 调用方传错 dtype(非 f16 基线,如 U32 打包权重)时 `Bytes.len`
-        // 语义错而**无声**。这里做**交叉校验**(不拒非 F16 —— U32 是合法用法):
-        // `src` 字节数必须 ≥ `elems × dtype 字节宽`(多给容许:池块可含尾料)。
-        let elems: usize = shape.iter().product();
-        let nm = name.to_string();
-        let want = elems
-            .checked_mul(dtype.size_bytes())
-            .ok_or_else(|| ModelError::Msg(format!("htod: elems({elems})×dtype({dtype:?}) 溢出")))?;
-        if src.len() < want {
-            return Err(ModelError::Msg(format!(
-                "htod: src {}B < elems({elems})×dtype({dtype:?})={want}B —— dtype/shape 与字节数不一致",
-                src.len()
-            )));
-        }
-        let mut b = self
-            .submit(move |ack| Command::Htod { data: src.to_vec(), name: nm, ack })?
-            .await?;
-        // 事实面定形:服务端只回句柄(U8/未定形),dtype + 阶数由本面按 (dtype, shape) 回填
-        b.len = elems;
-        b.dtype = dtype;
-        b.rank = shape.len() as u8;
-        Ok(b)
+        self.htod_with_stream(STREAM_H2D as u8, dtype, shape, src, name).await
     }
+
+    async fn htod_on(
+        &mut self,
+        stream: owl_iface::contract::UpStream,
+        dtype: Dtype,
+        shape: &Shape,
+        src: &[u8],
+        name: &str,
+    ) -> Result<Bytes, ModelError> {
+        let sid = match stream {
+            owl_iface::contract::UpStream::H2d => STREAM_H2D,
+            owl_iface::contract::UpStream::Compute => STREAM_COMPUTE,
+        } as u8;
+        self.htod_with_stream(sid, dtype, shape, src, name).await
+    }
+
 
     async fn dtoh(&mut self, b: &Bytes, out: &mut [u8]) -> Result<(), ModelError> {
         let id = b.id;
@@ -401,7 +493,11 @@ impl DeviceClient for GpuClient {
         self.submit(move |ack| Command::DtohBatch { pieces, ack })?.await
     }
 
-    /// 批量分块写:单命令 `HtodChunks`(字节口径;一次往返,单 ack 保序)
+    /// 批量分块写:单命令 `HtodChunks`(字节口径;一次往返,单 ack 保序)。
+    ///
+    /// **落 COMPUTE 流**(2026-10-17):与 trait 默认实现同口径(那里逐段走
+    /// `upload_pinned_on(Compute)`;此前本覆写硬写 H2D = 两套规范)。语义面 =
+    /// 搬入的内容随后就被计算读(参数面/存储搬回),同流 FIFO 即结构性有序。
     async fn htod_batch(
         &mut self,
         writes: &[(&Bytes, usize, &[u8])],
@@ -410,7 +506,7 @@ impl DeviceClient for GpuClient {
             .iter()
             .map(|(b, off, data)| (b.id, *off, data.to_vec()))
             .collect();
-        self.submit(move |ack| Command::HtodChunks { writes, ack })?.await
+        self.submit(move |ack| Command::HtodChunks { writes, stream: STREAM_COMPUTE as u8, ack })?.await
     }
 
     /// 带偏移读(状态存储搬出面;与 `dtoh` 同一条 server 路径)
@@ -441,11 +537,23 @@ impl DeviceClient for GpuClient {
         self.submit(move |ack| Command::Swap { dir, pieces, conn, ack })?.await
     }
 
-    // TODO: 考虑改成同步调用, 因为 launch 不用等待, 待定
     async fn launch(&mut self, msg: LaunchMsg) -> Result<Bytes, ModelError> {
-        // 槽序契约前置校验(与 launch.rs 的"最后一个 Block"回传一致)
-        debug_assert!(msg.args.iter().any(|a| matches!(a, Arg::Block { .. })));
+        // 槽序契约前置校验(与 launch.rs 的"最后一个 Block"回传一致)。
+        // **响亮拒,不用 debug_assert**(2026-10-17 审查):无 Block 实参 = 调用点
+        // 违约,而 release 档 debug_assert 静默放行 ⇒ 服务端 `out_id` 退化成 0,
+        // 错在很远处才现形。这里每发射一次扫一遍实参(≤数十项),代价可忽略。
+        if !msg.args.iter().any(|a| matches!(a, Arg::Block { .. })) {
+            return Err(ModelError::Msg(format!(
+                "launch 契约违约:实参里没有任何 Block(核 {})",
+                msg.kernel.name
+            )));
+        }
         self.submit(move |ack| Command::Launch { msg, ack })?.await
+    }
+
+    /// 设备 SM 数(CUDA:服务端 `cuDeviceGetAttribute`;客户端零 CUDA 依赖)
+    async fn sm_count(&mut self) -> Result<usize, ModelError> {
+        self.submit(move |ack| Command::DeviceSmCount { ack })?.await
     }
 
     /// **块账本投影**(调试面;默认 trait 口"不支持" ⇒ 这里给 GPU 实现)

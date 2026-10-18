@@ -111,6 +111,33 @@ pub fn f32_slice_to_f16_bytes(src: &[f32], dst: &mut [u8]) {
     }
 }
 
+/// f32 **字节** → f16 字节;源地址对齐**任意**(mmap 条目偏移不保证 4 对齐)。
+///
+/// 为什么要单开这个口(`f32_slice_to_f16_bytes` 不同):源字节常直接指向 mmap
+/// 条目区(`entry.start + i*4`),而构 `&[f32]` **要求 4 字节对齐** —— 官方
+/// writer 会把头 padding 到 8,但**规范不保证**(F8/奇数元素 BF16 条目会让
+/// 后继条目变成 2 mod 4;非 padding writer 更是任意),强行 `from_raw_parts`
+/// 就是 **UB**。病史(2026-10-17 审查):`safetensors::convert_chunk_into_bytes`
+/// 的 F32→F16 臂正是这么写的,debug 档触发前置条件检查 = **非捕获性 abort**
+/// (由新增的 dtype 矩阵门当场抓出;现存资产恰好全对齐 ⇒ 长期潜伏)。
+/// 本口按字节读、用 `_mm_loadu_ps` 载入 ⇒ 与对齐无关,零拷贝零中间缓冲。
+#[inline]
+pub fn f32_bytes_to_f16_bytes(src: &[u8], dst: &mut [u8]) {
+    debug_assert!(dst.len() >= (src.len() / 4) * 2);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_f16c() {
+            // SAFETY:运行时已探明 f16c;只读 4·n 字节、只写 2·n 字节,src/dst 不重叠
+            unsafe { f32_bytes_to_f16_f16c(src, dst) };
+            return;
+        }
+    }
+    for (i, c) in src.chunks_exact(4).enumerate() {
+        let f = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        dst[i * 2..i * 2 + 2].copy_from_slice(&half::f16::from_f32(f).to_le_bytes());
+    }
+}
+
 // ⚠️ 下方两个 SIMD 环不能 #[inline(always)] —— E0755:inline(always)
 // 与 #[target_feature] 互斥。调用税已被「每 buffer 一次调用」摊薄,
 // 环体性能 = std arch intrinsic 的 O0 就地展开效果,微基准门验收。
@@ -153,6 +180,29 @@ unsafe fn f32_to_f16_f16c(src: &[f32], dst: &mut [u8]) {
     }
     for k in i..n {
         let b = half::f16::from_f32(*sp.add(k)).to_le_bytes();
+        std::ptr::copy_nonoverlapping(b.as_ptr(), dp.add(k * 2), 2);
+    }
+}
+
+/// 字节源版(未对齐安全):从头指针按 4 字节载入(`_mm_loadu_ps`)。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "f16c")]
+unsafe fn f32_bytes_to_f16_f16c(src: &[u8], dst: &mut [u8]) {
+    use std::arch::x86_64::*;
+    let n = src.len() / 4;
+    let sp = src.as_ptr();
+    let dp = dst.as_mut_ptr();
+    let mut i = 0;
+    while i + 4 <= n {
+        let f = _mm_loadu_ps(sp.add(i * 4) as *const f32);
+        let h = _mm_cvtps_ph::<0>(f);
+        _mm_storel_epi64(dp.add(i * 2) as *mut __m128i, h);
+        i += 4;
+    }
+    for k in i..n {
+        let c = std::slice::from_raw_parts(sp.add(k * 4), 4);
+        let f = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        let b = half::f16::from_f32(f).to_le_bytes();
         std::ptr::copy_nonoverlapping(b.as_ptr(), dp.add(k * 2), 2);
     }
 }

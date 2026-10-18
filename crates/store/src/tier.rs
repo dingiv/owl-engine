@@ -30,7 +30,7 @@ pub enum AssetKind {
     Elastic,
     /// GDN 状态快照(可驱逐;可下沉 host/盘)。
     Snap,
-    /// 活跃 turn 占用的 GDN 行(不可驱逐;行数受 `max_active_turns` 约束)。
+    /// 活跃 turn 占用的 GDN 行(不可驱逐;行数受 `gdn_slots` 约束)。
     Row,
     /// 会话元数据(索引/账目;µs 级,不参与驱逐)。
     Meta,

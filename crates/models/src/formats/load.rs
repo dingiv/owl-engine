@@ -328,7 +328,11 @@ impl LoadStaging {
     /// `slot = min(不可流式峰值, 上限)`;可流式那栏只供日志与段规,
     /// **不把槽撑大**(否则 embed/lm_head 的 2.54GB 会把整载期暂存拉到
     /// 上限 —— 2026-10-16 实测:共享环被 128MB 上限撑成 2×134MB)。
-    fn plan<S: WeightSource + ?Sized>(want: &LoaderOps, src: &S, cap_bytes: usize) -> (Self, StagingPlan) {
+    fn plan<S: WeightSource + ?Sized>(
+        want: &LoaderOps,
+        src: &S,
+        cap_bytes: usize,
+    ) -> Result<(Self, StagingPlan), ModelError> {
         use std::collections::BTreeMap;
         // 不可流式(重排臂;单一入槽 raw.in)
         let mut nostream: BTreeMap<StageArm, usize> = BTreeMap::new();
@@ -336,11 +340,14 @@ impl LoadStaging {
         let mut stream: BTreeMap<StageArm, usize> = BTreeMap::new();
         for w in want.wants() {
             let n: usize = w.shape.iter().product();
+            // **探测必须在 match 之前**:`native_dtype` 现在返回 `Taken`
+            // (2026-10-17 审查 §③),而 match guard 里写不了 `?`(类型层不允许)
+            let native = src.native_dtype(&w.key)?;
             let arm = match w.layout {
                 // 设备重排臂:源 packed 整键上卡(rows × cols × 4B)
                 Layout::DeviceRearrange { rows, cols, .. } => Some((&mut nostream, StageArm::RawIn, rows * cols * 4)),
                 // 设备 cast 臂:want F16 而源天然 BF16 ⇒ 原始字节上卡落槽(2B/元素)
-                Layout::Direct if w.dtype == Dtype::F16 && src.native_dtype(&w.key) == Some(Dtype::BF16) => {
+                Layout::Direct if w.dtype == Dtype::F16 && native == Some(Dtype::BF16) => {
                     Some((&mut stream, StageArm::RawIn, n * 2))
                 }
                 _ => None,
@@ -365,13 +372,18 @@ impl LoadStaging {
                 continue; // 本档不用该臂
             }
             let cap = if cap_bytes == 0 { declared } else { arm.cap_bytes(cap_bytes) };
-            // 槽规 = min(不可流式栏, 上限);不可流式栏为 0(只有 cast 用本臂)时
-            // 取上限(纯段流,槽规由段出槽的上限统辖)
-            let slot_bytes = if ns == 0 { st.min(cap) } else { ns.min(cap) }.max(1);
+            // **槽规**(2026-10-16 第二修):
+            //  - 有"不可流式"键(重排臂)⇒ 槽**必须**容下它 —— 该臂没有分段流式路,
+            //    超槽 = 装不进(响亮拒);⇒ 这里**不能**用旋钮削它。
+            //    现场:生产档 `head_quant = rtn-int4-g32` 的 `lm_head`
+            //    (248320×5120 BF16 → u4 打包 635.7MB)被旋钮缺省 128MB 削到
+            //    134MB ⇒ 启动期 `引擎装配失败`(而计划期已算得出 635.7MB)。
+            //  - 只有可流式键 ⇒ `min(声明峰值, 上限)`,超槽键走段流(槽不随键长)。
+            let slot_bytes = if ns > 0 { ns } else { st.min(cap) }.max(1);
             per_arm.push((arm, declared, slot_bytes));
             rings.insert(arm, SlotRing { slot_bytes, slots: Vec::new(), next: 0 });
         }
-        (Self { rings, inflight_bytes: 0 }, StagingPlan { per_arm, cap_bytes })
+        Ok((Self { rings, inflight_bytes: 0 }, StagingPlan { per_arm, cap_bytes }))
     }
 
     /// **在飞字节入账**(上传口调用;返回 true = 该排空了)。
@@ -404,6 +416,16 @@ impl LoadStaging {
                 *declared as f64 / 1e6,
                 *slot as f64 / 1e6
             ));
+            // 槽超过旋钮 = 不可流式栏(重排臂)抬上来的 —— 必须可见:
+            // 这是 VRAM 代价,不是错误,但读者要知道钱花在哪
+            if plan.cap_bytes > 0 && *slot > plan.cap_bytes {
+                eprintln!(
+                    "[load] ⚠ {} 槽 {:.1}MB > 旋钮 {}MB —— 该臂**不可流式**(重排整键上卡)\n        ⇒ 槽必须容下最大重排键(嘬平 = 装不进);要降本:换档/关 head_quant/或减小该键",
+                    arm.tag(),
+                    *slot as f64 / 1e6,
+                    plan.cap_bytes >> 20
+                );
+            }
         }
         eprintln!(
             "[load] 暂存区(固定预算):{};合计 {:.1}MB(上限 {})",
@@ -562,7 +584,7 @@ async fn eval_want<D: DeviceClient, S: WeightSource + ?Sized>(
 ) -> Result<LoadManifest, ModelError> {
     // 单路径(2026-10-16 用户裁决:别用并行 DMA;实测并行桶 ≈1.2GB/s 反劣)
     // 暂存区 = 声明驱动(装载前一行账;固定预算,2026-10-16 收尾)
-    let (mut staging, plan) = LoadStaging::plan(want, src, LoadStaging::cap_from_env());
+    let (mut staging, plan) = LoadStaging::plan(want, src, LoadStaging::cap_from_env())?;
     LoadStaging::log_plan(&plan);
     eval_want_sequential(want, face, src, tap, verify, &mut staging).await
 }
@@ -742,7 +764,7 @@ async fn load_direct<D: DeviceClient, S: WeightSource + ?Sized>(
     // CpuFace 的 alloc 只认 F32/F16(2026-10-16 由 L2 等价门当场抓出)
     if face.device_kernels()
         && w.dtype == crate::contract::Dtype::F16
-        && src.native_dtype(&w.key) == Some(crate::contract::Dtype::BF16)
+        && src.native_dtype(&w.key)? == Some(crate::contract::Dtype::BF16)
     {
         return load_direct_device_cast(face, w, src, n, tap, staging, verify).await;
     }
@@ -770,8 +792,21 @@ async fn load_direct<D: DeviceClient, S: WeightSource + ?Sized>(
         };
         {
             let _s = probe.span("convert");
-            src.convert_chunk_into_bytes(&w.key, off, len, lease.slice_bytes_mut(), w.dtype)
+            src.convert_chunk_into_bytes(&w.key, off, len, lease.slice_bytes_mut(), w.dtype)?
                 .ok_or_else(|| attribution(src, &w.key, n))?;
+        }
+        if let Some(pat) = owl_shared::env_reader::str("OWL_LOAD_DUMP") {
+            if w.key.contains(&pat) {
+                let sb = lease.slice_bytes_mut();
+                let head: Vec<String> = sb[..8.min(sb.len())]
+                    .chunks_exact(2)
+                    .map(|c| {
+                        let b = u16::from_le_bytes([c[0], c[1]]);
+                        format!("{:04X}(f16={:.5},bf16={:.5})", b, half::f16::from_bits(b).to_f32(), half::bf16::from_bits(b).to_f32())
+                    })
+                    .collect();
+                eprintln!("[dump] key={} want_dtype={:?} head={:?}", w.key, w.dtype, head);
+            }
         }
         if verify {
             csum = fnv1a(&lease.slice_bytes_mut()[..len * esz], csum);
@@ -945,7 +980,7 @@ async fn fill_native_chunks<D: DeviceClient, S: WeightSource + ?Sized>(
         };
         {
             let _s = probe.span("raw_copy");
-            src.copy_native_into(key, src_off + off, len, lease.slice_bytes_mut())
+            src.copy_native_into(key, src_off + off, len, lease.slice_bytes_mut())?
                 .ok_or_else(|| attribution(src, key, src_off + len_total))?;
         }
         if verify {
@@ -991,7 +1026,7 @@ async fn fill_packed_chunks<D: DeviceClient, S: WeightSource + ?Sized>(
                 len,
                 lease.slice_bytes_mut(),
                 crate::contract::Dtype::U32,
-            )
+            )?
             .ok_or_else(|| attribution(src, key, raw_elems))?;
         }
         if let Some(ph) = packed_host.as_mut() {
@@ -1039,10 +1074,16 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
         .acquire(face, StageArm::RawIn, raw_elems * 4)
         .await?
         .ok_or_else(|| {
-            ModelError::Msg(LoadStaging::over_cap_msg(
-                StageArm::RawIn,
-                raw_elems * 4,
-                staging.slot_bytes(StageArm::RawIn),
+            // 带**键名**(2026-10-16:原文案只说"本键多大" —— 现场靠算
+            // `raw_elems*4` 反推是哪个键,等于让人重建账)
+            ModelError::Msg(format!(
+                "Weight '{}': {}",
+                w.key,
+                LoadStaging::over_cap_msg(
+                    StageArm::RawIn,
+                    raw_elems * 4,
+                    staging.slot_bytes(StageArm::RawIn),
+                )
             ))
         })?;
     let raw = crate::contract::Bytes::new(raw_slot.id, raw_elems, crate::contract::Dtype::U32, 2);
@@ -1144,7 +1185,7 @@ async fn load_transposed<D: DeviceClient, S: WeightSource + ?Sized>(
     let mut probe = KeyProbe::start(tap, &w.key, n * w.dtype.size_bytes());
     let data = {
         let _s = probe.span("decode");
-        src.take_range(&w.key, 0, n)
+        src.take_range(&w.key, 0, n)?
             .ok_or_else(|| attribution(src, &w.key, n))?
     };
     let t = {
@@ -1365,7 +1406,7 @@ pub fn manifest_mem_ledger(manifest: &crate::module::LoadManifest, tag: &str) {
             * match e.dtype {
                 Dtype::F16 | Dtype::BF16 => 2,
                 Dtype::F32 | Dtype::U32 => 4,
-                Dtype::U8 => 1,
+                Dtype::F8E4M3 | Dtype::F8E5M2 | Dtype::I8 | Dtype::U8 => 1,
             };
         let key = format!("{:?}/{:?}", e.dtype, e.layout);
         let e2 = agg.entry(key).or_insert((0, 0));
@@ -1379,7 +1420,9 @@ pub fn manifest_mem_ledger(manifest: &crate::module::LoadManifest, tag: &str) {
 
 /// 装载取数失败归因:键不在 = 缺键;在但长度不符 = 元素数错误
 fn attribution<S: WeightSource + ?Sized>(src: &S, key: &str, n: usize) -> ModelError {
-    match src.elem_len(key) {
+    // **错误报告期不许再失败**(2026-10-17 审查 §③-N1):`elem_len` 现返回 `Taken`,
+    // 但这里已在造错误消息 ⇒ 探测失败退化为"归因不可用",绝不叠第二个错误
+    match src.elem_len(key).unwrap_or(None) {
         Some(l) => ModelError::Msg(format!(
             "Weight '{key}': 元素 {l} != 期望 {n}"
         )),

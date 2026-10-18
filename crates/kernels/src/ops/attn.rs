@@ -13,6 +13,12 @@ use crate::spec::{meta_of, pools, CaptureEvidence, Determinism, KernelMeta, Kern
 ///
 /// v2 = 只换并行结构(lane→连续 dim + warp butterfly + split-K),语义/槽序
 /// 与旧核逐字同一套;实测 prefix2048 2.238 → 1.201ms(1.86×),数值同档。
+///
+/// **2026-10-18(propose 立案):再收 GQA 冗余** —— 同 kv-head 的 `group` 个
+/// q-head 原各起一个 CTA(同一批 K/V 行读 group 遍;草稿档 268 MB/发、~225 GB/s
+/// ⇒ 1.19 ms/发,占 propose 图 66%)。现 **grid (T, Hq) → (T, Hkv)**、CTA 内
+/// `wq = warp % group` / `sub = warp / group`,同组 warp 走 L1 共享同一行。
+/// 结构门:驱动件要求 `nwarp ≥ group` 且整除(否则回落旧核);核内 `__trap()` 兜底。
 pub struct NcAttnBf16V2;
 
 impl KernelSpec for NcAttnBf16V2 {
@@ -63,7 +69,7 @@ pub struct PagedAttnV2Fp8KnhdHd256Bs32;
 const PAGED_V2_FP8_KNHD_PARAMS: &[Param] = &[
         Param::t_in("q", Dtype::F16, 2),
         // fp8 主池句柄:引擎叶子 = U32 扁平字节账(`bytes/4` 字;池的 e4m3
-        // 字节语义由 `POOL` 的 `Dtype::U8` 承担)。旧声明 U8x4 描述的是核内
+        // 字节语义由 `POOL` 的 `Dtype::F8E4M3` 承担)。旧声明 U8x4 描述的是核内
         // kNHD 字节视图,与喂进来的句柄不是同一层(2026-10-15 事实面对齐)
         Param::t_in("k_cache", Dtype::U32, 1),
         Param::t_in("v_cache", Dtype::U32, 1),
@@ -95,13 +101,13 @@ impl KernelSpec for PagedAttnV2Fp8KnhdHd256Bs32 {
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::U8),
+        kv_dtype: Some(Dtype::F8E4M3),
         head_dim: &[256],
         page: &[32],
         grp: None,
         tile: None,
     };
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::U8)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F8E4M3)];
 }
 
 /// `vllm_paged_attention_v2_reduce_f16_hd256` —— 分区 partial 归并
@@ -154,14 +160,14 @@ impl KernelSpec for K0WriteFp8Knhd {
         // 假输出(ABI 需要末位输出块;内核不写内容)
         Param::t_out("out", Dtype::F16, 1),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Knhd, Dtype::U8)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F8E4M3)];
     const SELFCHECK: Option<&'static dyn crate::bootcheck::BootCheck> =
         Some(&crate::ops::oracles::k0_fp8_knhd::K0Fp8KnhdOracle);
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::U8),
+        kv_dtype: Some(Dtype::F8E4M3),
         head_dim: &[128, 256],
         page: &[16, 32, 64, 128],
         grp: None,
@@ -207,12 +213,12 @@ impl KernelSpec for ChunkedPrefillFp8KnhdHd256 {
         Param::i32("use_sinks_flag"),
         Param::t_out("out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::U8)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F8E4M3)];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::U8),
+        kv_dtype: Some(Dtype::F8E4M3),
         head_dim: &[256],
         page: &[16, 32, 64, 128],
         grp: None,
@@ -230,14 +236,14 @@ impl KernelSpec for K0WriteFp8Classic {
     const SRC: &'static str = "cu/attn/reshape_and_cache_fp8kv.cu";
     const PARAMS: &'static [Param] = K0_PARAMS;
     const POOL: &'static [PoolAccess] = &[
-        PoolAccess::write(pools::KV_MAIN, LayoutTag::Classic, Dtype::U8),
-        PoolAccess::write(pools::KV_DRAFT, LayoutTag::Classic, Dtype::U8),
+        PoolAccess::write(pools::KV_MAIN, LayoutTag::Classic, Dtype::F8E4M3),
+        PoolAccess::write(pools::KV_DRAFT, LayoutTag::Classic, Dtype::F8E4M3),
     ];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::U8),
+        kv_dtype: Some(Dtype::F8E4M3),
         head_dim: &[128, 256],
         page: &[16, 32, 64, 128],
         grp: None,
@@ -249,8 +255,8 @@ impl KernelSpec for K0WriteFp8Classic {
 const K0_PARAMS: &[Param] = &[
     Param::t_in("key", Dtype::F16, 3),
     Param::t_in("value", Dtype::F16, 3),
-    Param::t_in("key_cache", Dtype::U8, 4),
-    Param::t_in("value_cache", Dtype::U8, 4),
+    Param::t_in("key_cache", Dtype::F8E4M3, 4),
+    Param::t_in("value_cache", Dtype::F8E4M3, 4),
     Param::t_in("slot_mapping", Dtype::F32, 2),
     Param::i32("key_stride"),
     Param::i32("value_stride"),
@@ -316,13 +322,13 @@ impl KernelSpec for NcAttnFp8kvBf16 {
         Param::i32("x"),
         Param::t_out("out", Dtype::BF16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Classic, Dtype::U8)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Classic, Dtype::F8E4M3)];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
         // 草稿池 fp8 档(前缀池 e4m3 字节;自块直读保持 bf16)
-        kv_dtype: Some(Dtype::U8),
+        kv_dtype: Some(Dtype::F8E4M3),
         head_dim: &[128, 256],
         page: &[16, 32, 64, 128],
         grp: None,
@@ -450,7 +456,7 @@ macro_rules! paged_v2_variant {
             const SRC: &'static str = "cu/attn/pagedattention_f16.cu";
             // 池句柄视图随池 dtype 分家(fp8 = U32 扁平字节账;f16 = kNHD 分页视图)
             const PARAMS: &'static [Param] = match $pool_dt {
-                Dtype::U8 => PAGED_V2_FP8_KNHD_PARAMS,
+                Dtype::F8E4M3 => PAGED_V2_FP8_KNHD_PARAMS,
                 _ => PAGED_V2_F16_KNHD_PARAMS,
             };
             const LAWS: &'static [Law] = &[Law::OutputFinite];
@@ -475,13 +481,13 @@ paged_v2_variant!(PagedV2F16KnhdHd128Bs32, "vllm_paged_attention_v2_f16_knhd_hd1
 paged_v2_variant!(PagedV2F16KnhdHd256Bs32, "vllm_paged_attention_v2_f16_knhd_hd256bs32", Dtype::F16, 256, &[32], &[256]);
 paged_v2_variant!(PagedV2F16KnhdHd128, "vllm_paged_attention_v2_f16_knhd_hd128", Dtype::F16, 128, &[16], &[128]);
 paged_v2_variant!(PagedV2F16KnhdHd256, "vllm_paged_attention_v2_f16_knhd_hd256", Dtype::F16, 256, &[16], &[256]);
-paged_v2_variant!(PagedV2Fp8Hd128, "vllm_paged_attention_v2_fp8_hd128", Dtype::U8, 128, &[16], &[128]);
-paged_v2_variant!(PagedV2Fp8Hd256, "vllm_paged_attention_v2_fp8_hd256", Dtype::U8, 256, &[16], &[256]);
-paged_v2_variant!(PagedV2Fp8Hd128Bs32, "vllm_paged_attention_v2_fp8_hd128bs32", Dtype::U8, 128, &[32], &[128]);
-paged_v2_variant!(PagedV2Fp8Hd256Bs32, "vllm_paged_attention_v2_fp8_hd256bs32", Dtype::U8, 256, &[32], &[256]);
-paged_v2_variant!(PagedV2Fp8KnhdHd128Bs32, "vllm_paged_attention_v2_fp8_knhd_hd128bs32", Dtype::U8, 128, &[32], &[128]);
-paged_v2_variant!(PagedV2Fp8KnhdHd256, "vllm_paged_attention_v2_fp8_knhd_hd256", Dtype::U8, 256, &[16], &[256]);
-paged_v2_variant!(PagedV2Fp8KnhdHd128, "vllm_paged_attention_v2_fp8_knhd_hd128", Dtype::U8, 128, &[16], &[128]);
+paged_v2_variant!(PagedV2Fp8Hd128, "vllm_paged_attention_v2_fp8_hd128", Dtype::F8E4M3, 128, &[16], &[128]);
+paged_v2_variant!(PagedV2Fp8Hd256, "vllm_paged_attention_v2_fp8_hd256", Dtype::F8E4M3, 256, &[16], &[256]);
+paged_v2_variant!(PagedV2Fp8Hd128Bs32, "vllm_paged_attention_v2_fp8_hd128bs32", Dtype::F8E4M3, 128, &[32], &[128]);
+paged_v2_variant!(PagedV2Fp8Hd256Bs32, "vllm_paged_attention_v2_fp8_hd256bs32", Dtype::F8E4M3, 256, &[32], &[256]);
+paged_v2_variant!(PagedV2Fp8KnhdHd128Bs32, "vllm_paged_attention_v2_fp8_knhd_hd128bs32", Dtype::F8E4M3, 128, &[32], &[128]);
+paged_v2_variant!(PagedV2Fp8KnhdHd256, "vllm_paged_attention_v2_fp8_knhd_hd256", Dtype::F8E4M3, 256, &[16], &[256]);
+paged_v2_variant!(PagedV2Fp8KnhdHd128, "vllm_paged_attention_v2_fp8_knhd_hd128", Dtype::F8E4M3, 128, &[16], &[128]);
 
 /// `vllm_paged_attention_v2_reduce_f16_hd128` —— 分区归并(hd128 变体)
 pub struct PagedV2ReduceF16Hd128;
@@ -665,9 +671,9 @@ impl KernelSpec for NaiveAttnNcFp8KvF16 {
         Param::i32("x"),
         Param::t_out("out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Classic, Dtype::U8)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Classic, Dtype::F8E4M3)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::U8), head_dim: &[128], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F8E4M3), head_dim: &[128], page: &[16, 32, 64, 128], grp: None, tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -785,9 +791,9 @@ impl KernelSpec for ReshapeAndCacheFp8KvBf16 {
         Param::i32("x"),
         Param::t_out("out", Dtype::BF16, 1),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Classic, Dtype::U8)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Classic, Dtype::F8E4M3)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::U8), head_dim: &[128, 256], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F8E4M3), head_dim: &[128, 256], page: &[16, 32, 64, 128], grp: None, tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -815,9 +821,9 @@ impl KernelSpec for ReshapeAndCacheFp8KvBf16Knhd {
         Param::i32("x"),
         Param::t_out("out", Dtype::BF16, 1),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Knhd, Dtype::U8)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F8E4M3)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::U8), head_dim: &[128, 256], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F8E4M3), head_dim: &[128, 256], page: &[16, 32, 64, 128], grp: None, tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -1156,9 +1162,9 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptFp8Hd128 {
         Param::i32("use_sinks_flag"),
         Param::t_out("out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::U8)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::F8E4M3)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::U8), head_dim: &[128], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F8E4M3), head_dim: &[128], page: &[16, 32, 64, 128], grp: None, tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -1197,9 +1203,9 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptFp8Hd256 {
         Param::i32("use_sinks_flag"),
         Param::t_out("out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::U8)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::F8E4M3)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::U8), head_dim: &[256], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F8E4M3), head_dim: &[256], page: &[16, 32, 64, 128], grp: None, tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -1238,9 +1244,9 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptFp8KnhdHd128 {
         Param::i32("use_sinks_flag"),
         Param::t_out("out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::U8)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F8E4M3)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::U8), head_dim: &[128], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F8E4M3), head_dim: &[128], page: &[16, 32, 64, 128], grp: None, tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -1308,9 +1314,9 @@ impl KernelSpec for PrefillSplitFp8KvHd256 {
         Param::i32("hq"),
         Param::t_out("dummy", Dtype::F16, 0),  // 哨兵槽:调用方传 K0 写输出(r1)⇒ 不约束(2026-10-15 B6)
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::U8)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::F8E4M3)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::U8), head_dim: &[256], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F8E4M3), head_dim: &[256], page: &[16, 32, 64, 128], grp: None, tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -1378,9 +1384,9 @@ impl KernelSpec for PrefillSplitFp8KvKnhdHd256 {
         Param::i32("hq"),
         Param::t_out("dummy", Dtype::F16, 0),  // 哨兵槽:调用方传 K0 写输出(r1)⇒ 不约束(2026-10-15 B6)
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::U8)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F8E4M3)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::U8), head_dim: &[256], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F8E4M3), head_dim: &[256], page: &[16, 32, 64, 128], grp: None, tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -1603,9 +1609,9 @@ impl KernelSpec for NaiveAttnNcFp8KvF16Knhd {
         Param::i32("x"),
         Param::t_out("out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Knhd, Dtype::U8)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Knhd, Dtype::F8E4M3)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::U8), head_dim: &[128], page: &[32], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F8E4M3), head_dim: &[128], page: &[32], grp: None, tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -1635,9 +1641,9 @@ impl KernelSpec for NaiveAttnNcFp8KvBf16Knhd {
         Param::i32("x"),
         Param::t_out("out", Dtype::BF16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Knhd, Dtype::U8)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Knhd, Dtype::F8E4M3)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::U8), head_dim: &[128], page: &[32], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F8E4M3), head_dim: &[128], page: &[32], grp: None, tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -1786,7 +1792,7 @@ mod tests {
     #[test]
     fn k0_declares_shape_family() {
         let m = meta_of::<K0WriteFp8Knhd>();
-        assert_eq!(m.shape.kv_dtype, Some(Dtype::U8));
+        assert_eq!(m.shape.kv_dtype, Some(Dtype::F8E4M3));
         assert_eq!(m.shape.head_dim, &[128, 256]);
         assert_eq!(m.shape.page, &[16, 32, 64, 128]);
     }

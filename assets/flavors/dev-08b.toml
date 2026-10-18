@@ -21,11 +21,11 @@ prefill_chunk = 1024
 [pool]
 # 固定池:探针要的是**可复现**,不是自动调压。
 # ⚠️ 池下限算式(虚拟化档 boot 硬校验,见 engine 的"池容量硬校验"):
-#     nb ≥ max_active_turns × (ceil(workspace_per_req/32) + ceil(chunk/32))
+#     nb ≥ gdn_slots × (ceil(workspace_per_req/32) + ceil(chunk/32))
 #     192 ≥ 2 × (ceil(2048/32)=64 + 16) = 160 ✓   (页 = 32 tok;
 #                                              工作集 64 页 = sink2 + recent4 + top-k 58)
 pool_tokens = 6144
-max_active_turns = 2
+gdn_slots = 2
 snap_max = 4
 # 宿主双腿:0.8B 契约与压力探针都要落点
 host_cache_mb = 256
@@ -71,3 +71,8 @@ recall_every = 4
 # 但 `select_partial` 的驻留是**选择驱动**的(不选中的就沉),所以照样会下沉/回灌 ——
 # 覆盖率仪器的读数正需要这个(测选择层的下沉/回灌与视图装配)。
 pool_overcommit = false
+
+[server]
+# 单会话语义(D1 2026-10-17 跨字段校验:`gdn_slots ≥ [server].max_concurrency`)——
+# 超了会把活跃会话的状态格 LRU 逐出(跨会话状态污染),boot 直接拒启。
+max_concurrency = 2

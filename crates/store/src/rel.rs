@@ -198,9 +198,9 @@ impl Rel {
                 kv_cfg.host_bytes, inputs.host_bytes
             )));
         }
-        let budget = VramBudget::decompose(inputs, policy.max_active_turns)?;
+        let budget = VramBudget::decompose(inputs, policy.gdn_slots)?;
         let ledger = TierLedger::new(budget.tier_budget());
-        let state = StateStore::new(policy.max_active_turns, inputs.gdn_row_bytes);
+        let state = StateStore::new(policy.gdn_slots, inputs.gdn_row_bytes);
         // 状态腿宿主层:预算 = store host 总量 − KV 腿分片(负数 = 装配错,响亮拒)
         let snap_host_bytes = inputs.host_bytes.checked_sub(kv_cfg.host_bytes).ok_or_else(|| {
             StoreError::Budget(format!(

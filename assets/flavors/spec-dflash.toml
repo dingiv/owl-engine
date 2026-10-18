@@ -4,6 +4,13 @@ kind = "awq27b"
 # C1(2026-10-11):lm_head int4 装载期现场 RTN(marlin kU4);质量门
 # 已过(prose/数学 A/B 逐字同,竖式同错=模型固有),数学域 159→177
 head_quant = "rtn-int4-g32"
+# 主干量化方案(与 head_quant 同类档位 —— 声明即事实;行业记法 W{权重}A{激活}):
+#   "w4a16" = 权重 4bit AWQ g32-asym(zp)+ 激活 f16 = 今天行为(生产默认)
+#   "w4a8"  = 同源权重 a8 布局 + per-token int8 激活 + kS8×kU4 GEMM(int8 张量核):
+#             单卡 3090 Ti 实测 prefill +48~50% / TTFT −33% @32k,decode 不变;
+#             代价 = 装载 +14.5s(a8 重物化,设备重排核待补)+ 质量门待过 S3(非逐字同)
+# 施工/门/回滚见 docs/arch/W4A8-算子家族-设计与施工.md(§5.4 开关与回滚 / §6 S3-S4)
+quant = "w4a16"
 
 [runtime]
 # 2026-10-13 重定档(影子池时代旧值 = 2560/池 4352):单池 + FI 直读后
@@ -16,12 +23,16 @@ max_seq = 16384
 
 [spec]
 depth = 7
+# 降级首探窗口(tokens):降级后先等这么多 token 就试水一次投机轮,命中即恢复 spec。
+# 8 = 实测取法(裸 decode 27.5ms/token vs spec 5.7ms/token ⇒ 窗口内每 token 亏 22ms;
+# 窗口 64 会让一次偶发 m=0 连击最长罚 1.4s)。退避 ×2 封顶 512 兜持久失败。
+probe_every = 8
 
 [server]
 # 单会话语义:GDN 格锁 1 → 并发闸门必须 ≤1(启动 fail-fast 校验
-# max_active_turns ≥ max_concurrency)。2026-10-13 实测:本档原**缺此项** →
+# gdn_slots ≥ max_concurrency)。2026-10-13 实测:本档原**缺此项** →
 # `--flavor spec-dflash` 独立起不来(此前 e2e/bench 各自在配置文件里
-# 覆盖了 max_active_turns=8 才蒙混过去)。多会话档 = 这里改 8 + max_active_turns=8。
+# 覆盖了 gdn_slots=8 才蒙混过去)。多会话档 = 这里改 8 + gdn_slots=8。
 max_concurrency = 1
 
 [pool]
@@ -29,9 +40,9 @@ pool_tokens = 16896   # = ceil(16384/page)+slack(页 32;528 页;≈0.9G)
 vram_target = 0.99
 vram_reserve_mb = 512
 # ⚠️ 2026-10-19 驱动性修复:字段在 `7c5627f`(A 轴收官)已改名
-# `gdn_slots` → `max_active_turns`,flavor 文本没跟上 ⇒ `deny_unknown_fields`
+# `gdn_slots` → `gdn_slots`,flavor 文本没跟上 ⇒ `deny_unknown_fields`
 # 直接**拒解析**(`预设档清单非空且全部可解析` / `load_基准文件与覆盖文件叠加` 红)。
-max_active_turns = 1
+gdn_slots = 1
 snap_max = 1
 prefix_cache = false
 
@@ -47,7 +58,7 @@ allowed_ops = [
         "marlin_gemm_w4a16_awq", "marlin_gemm_w4a16_bf16",
         "owl_add_bf16", "owl_add_f16",
         "owl_argmax_f32idx_f16", "owl_cast_bf16_f16",
-        # W4A8 档(2026-10-17;`model.w4a8 = true` 时发射,否则白名单超集无害)
+        # W4A8 档(2026-10-17;`[model] quant = "w4a8"` 时发射,否则白名单超集无害)
         "marlin_gemm_w4a8_awq", "owl_quant_int8_row_f16", "owl_ct_repack_a8_u32",
         "owl_cast_f16_bf16", "owl_concat_rows_f16",
         "owl_concat_rows_f32", "owl_ct_repack_u32",
@@ -77,20 +88,20 @@ allowed_ops = [
 # 白名单同时含 **fp8 与 f16 两主池族**(2026-10-14 A5 补):`kv_fp8` 决定
 # 实际发射哪一族 —— f16 档不用再拿 `allowed_ops = []` 绕硬门。两族在池
 # 写集审计里按 (池名, dtype) 分组,各自闭环(R3 不撞)。
-# ── verify 注意力臂(2026-10-16 **换代**:FI+split 断点臂转正)──
+# ── verify 注意力臂(2026-10-16 换代 = FI+split;2026-10-18 W5 = 单图)──
 #
 # 旧:XQA verify 臂(2026-10-13 D3 转正;恒等门 3/3 绿)。它的问题在长 ctx:
 # ctx 依赖的 KV-split 全在核内,verify 图墙时随 ctx 线性涨(32k 轮时 69.3ms)。
-# 新:FI+split(核级实测 verify 形状 ≤0.3ms/发 vs XQA 1.54)但 FI 的 plan 依赖
-# ctx ⇒ 必须把核移出捕获图 ⇒ **piecewise(段+断点)** 承载:
-#   verify_piecewise = 段驱动件;verify_fi = 断点走 FI 核(四件套走输入槽,
-#   ctx_total 走宿主标量槽 —— 见 docs/piecewise-断点图-设计与实现.md §11.6)
-# 真机:32k 轮时 69.3 → **48.4ms(−30%)**,轮时对 ctx **变平**(8k 48.6/32k 48.4),
-# 文本/tok/hid 与基线逐位一致;prefill 不动。
-# ⚠️ decode(T=1)已于同日(V1c)同法换装:见下方 decode_xqa/decode_fi 段。
+# 中:FI+split(核级实测 verify 形状 ≤0.3ms/发 vs XQA 1.54);当时 FI 的 plan
+# 依赖 ctx ⇒ 用 **piecewise(段+断点)** 把核移出捕获图(32k 轮 69.3 → 48.4ms)。
+# 今(W5,2026-10-18):plan 依赖 ctx 已由"**图档瓦(形状对 ctx 恒定)+ 引擎窗外
+# `fi_plan_sync` 刷精确表**"解决 ⇒ **FI 核留捕获图内**(单图),piecewise 面
+# **整体退役**(旋钮 `verify_piecewise`/`break_at_out` 一并退役 ⇒ 写了会**拒启**)。
+# 实测(W4 转正门,三档 ctx):发射税 10.9-12.0 → 0.2-0.3 ms、整轮 GPU −5.0%、
+# `reasoning_content` 逐字节恒等、971 轮 soak σ=0.11 ms。
+# ⚠️ decode(T=1)同法(图内臂):见下方 decode_xqa/decode_fi 段。
 verify_xqa = false
 verify_v2 = false
-verify_piecewise = true
 verify_fi = true
 # 裸 decode 走 XQA(2026-10-13 ②):第二份实例化 `M_TILESIZE=16`。
 # 注:短 ctx 收益略低(512 档 1.90× vs 2048 档 2.25×),但**不缺省加 ctx
@@ -101,6 +112,24 @@ decode_xqa = false
 # 文本与 v2/XQA 逐位一致。⚠️ 曾踩:plan_session 少交断点采集面 ⇒ FI 核被烘进图 + plan 用
 # 占位 ctx_total=1 ⇒ 文本连贯但错(见状 §11.13)。
 decode_fi = true
+# ── 图档单图(W3+W4,2026-10-18 转正)──
+#
+# 结构:`FI_CUDA_GRAPH=1` 让 plan 形状**对 ctx 全域恒定**(padded=42/cta=16|64/split=1)
+# ⇒ 一张图可服务任意 ctx,只需换表内容;表由引擎在**窗外**每步/每轮
+# `fi_plan_sync` 刷成**精确值**(T=8 过供给会错 —— 行 stride 与 merge_indptr 打架)。
+# 判据:
+#   · decode(W3):文本与 piecewise 臂逐位一致,ms/tok −4~6%,图 slab −50%
+#   · verify(W4):三档 ctx 的 reasoning_content **逐字节恒等**;
+#     发射税 10.9-12.0 → 0.2-0.3 ms;整轮 GPU 时间 25.94/26.01/26.00 →
+#     24.69/24.72/24.70 ms(−5.0%,对 ctx 平坦);t/s +2.5%;
+#     971 轮 soak 首末十轮 24.70 → 24.87 ms(σ=0.11,零告警)
+#   · ⚠️ 上界:fi_plan_bake **必须 ≥ max_seq** ⇒ 这里用哨兵 `0` = 取 [runtime] max_seq
+#     (档位改 max_seq 时自动跟随;写死值会在改档时被 validate 拒启)
+# 配套硬约束(validate 拒启):fi_plan_bake ⇒ fi_plan_restore = false(图不烘表,
+# host 是表的唯一权威);与 [graph] prefill_bucket 互斥。
+fi_cuda_graph = true
+fi_plan_bake = 0
+fi_plan_restore = false
 # GDN prefill 臂(2026-10-11 终版):fork-bf16 全家桶转正 —— g 语义律
 # 修复(kkt/h/o 必须吃 cumsum 而非 raw g;raw g 在深谷 -24 时
 # exp(±24)=e²⁴ 爆炸)。恒等门:四域 vs recurrence 逐位一致;std 矩阵

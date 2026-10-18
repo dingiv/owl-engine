@@ -9,7 +9,7 @@ use crate::contract::Dtype;
 use crate::ops::SemanticKernel;
 use crate::layers::narrow_strided;
 use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, QuantPlan, Weight};
-use crate::formats::w4a16::marlin_n_pack;
+use crate::formats::util::marlin_n_pack;
 use crate::TensorOps;
 
 pub struct Linear {
@@ -57,7 +57,7 @@ impl Linear {
             ctmp: None,
             a8_factor: None,
         };
-        let eligible = crate::formats::w4a16::marlin_eligible(out_dim, in_dim);
+        let eligible = crate::formats::util::marlin_eligible(out_dim, in_dim);
         match plan {
             QuantPlan::W4A16 if eligible => lin.quantize_g128(),
             QuantPlan::W4A16Awq if eligible => lin.quantize_awq32(),
@@ -76,7 +76,16 @@ impl Linear {
     /// (foreign 通道),装载换三件套(qweight marlin-packed i32 / scales
     /// f16 / workspace 零初始化)。
     fn quantize_g128(&mut self) {
-        debug_assert!(crate::formats::w4a16::marlin_eligible(self.out_dim, self.in_dim));
+        // 构造期前置(**响亮**,release 也拦 —— 2026-10-17 审查 §五轮-C2):
+        // 唯一调用点(`new` 的 match)已用同一谓词门控,这里是私有函数自己的
+        // 不变式;原先 `debug_assert` ⇒ release 静默放行(将来新增调用点漏门 =
+        // 按非法形态建 plan)。
+        assert!(
+            crate::formats::util::marlin_eligible(self.out_dim, self.in_dim),
+            "g128: marlin 形态不满足(out {}, in {}),构造点漏了 eligible 门",
+            self.out_dim,
+            self.in_dim
+        );
         let g = 128usize;
         let n_pack = marlin_n_pack(self.out_dim); // 直通(eligible 保证 n%256==0)
         let key: &'static str = self.w.key();
@@ -84,7 +93,7 @@ impl Linear {
             key,
             vec![self.in_dim / 16, n_pack * 16 / 8],
         ));
-        self.sc = Some(Weight::new_typed_f16(
+        self.sc = Some(Weight::new_typed_scales(
             key,
             vec![self.in_dim / g, n_pack],
         ));
@@ -102,7 +111,16 @@ impl Linear {
     /// 增 zeros 槽(pack_marlin_z 产物 [in/g, out/8] U32),GEMM 换
     /// kU4(has_zp)内核;组大小 32(group_blocks = 32/16 = 2 幂次合法)。
     fn quantize_awq32(&mut self) {
-        debug_assert!(crate::formats::w4a16::marlin_eligible(self.out_dim, self.in_dim));
+        // 构造期前置(**响亮**,release 也拦 —— 2026-10-17 审查 §五轮-C2):
+        // 唯一调用点(`new` 的 match)已用同一谓词门控,这里是私有函数自己的
+        // 不变式;原先 `debug_assert` ⇒ release 静默放行(将来新增调用点漏门 =
+        // 按非法形态建 plan)。
+        assert!(
+            crate::formats::util::marlin_eligible(self.out_dim, self.in_dim),
+            "awq-g32: marlin 形态不满足(out {}, in {}),构造点漏了 eligible 门",
+            self.out_dim,
+            self.in_dim
+        );
         let g = 32usize;
         let n_pack = marlin_n_pack(self.out_dim);
         let key: &'static str = self.w.key();
@@ -110,7 +128,7 @@ impl Linear {
             key,
             vec![self.in_dim / 16, n_pack * 16 / 8],
         ));
-        self.sc = Some(Weight::new_typed_f16(
+        self.sc = Some(Weight::new_typed_scales(
             key,
             vec![self.in_dim / g, n_pack],
         ));
@@ -132,7 +150,16 @@ impl Linear {
     /// 按调用形状**的瞬态(`TensorOps::zeros(F32, [m,1])`,引擎按形状分配),
     /// 故层里零容量常量、零预留(装 8192 行也只是一次 32KB memset)。
     fn quantize_awq_a8(&mut self) {
-        debug_assert!(crate::formats::w4a16::marlin_eligible(self.out_dim, self.in_dim));
+        // 构造期前置(**响亮**,release 也拦 —— 2026-10-17 审查 §五轮-C2):
+        // 唯一调用点(`new` 的 match)已用同一谓词门控,这里是私有函数自己的
+        // 不变式;原先 `debug_assert` ⇒ release 静默放行(将来新增调用点漏门 =
+        // 按非法形态建 plan)。
+        assert!(
+            crate::formats::util::marlin_eligible(self.out_dim, self.in_dim),
+            "w4a8: marlin 形态不满足(out {}, in {}),构造点漏了 eligible 门",
+            self.out_dim,
+            self.in_dim
+        );
         let g = 32usize;
         let n_pack = marlin_n_pack(self.out_dim);
         let key: &'static str = self.w.key();
@@ -141,7 +168,7 @@ impl Linear {
             vec![self.in_dim / 16, n_pack * 16 / 8],
         ));
         // scales_a8 线 dtype = F16 槽(int16 归一位型;与 a16 同尺寸)
-        self.sc = Some(Weight::new_typed_f16(
+        self.sc = Some(Weight::new_typed_scales(
             key,
             vec![self.in_dim / g, n_pack],
         ));
@@ -220,6 +247,18 @@ impl Linear {
             // 激活 dtype 决定臂:F16 → GEMM_W4A16;BF16 → GEMM_W4A16_BF16
             // (E5-DF3 同日十二:草稿路径 BF16 化,scales 保持 F16 装载,
             // a/c=BF16 的 marlin 实例;s_type = F16 两族一致)
+            // **臂由装载事实决定**(2026-10-16 定谳):尺度槽的声明 dtype = 装载期
+            // 按模型 dtype 钉的(bf16 模型 ⇒ BF16,见 `Weight::new_typed_scales`)。
+            // 激活若与它不符(f16 探针 / 混合臂),**显式铸**过去 —— 绝不能落进
+            // “另一条臂”按错口径读尺度:C 侧 `s_type = c_type`,实测 bf16 尺度被
+            // f16 臂按 f16 读 ⇒ 单块幅度 ~15×、端到端残留 7%(立案 §P)。
+            let sc_dt = sc.dtype();
+            let xs_aligned = if xs.dtype == sc_dt {
+                None
+            } else {
+                Some(crate::layers::dflash2::ensure_dt(xs, sc_dt))
+            };
+            let xs: &TensorOps = xs_aligned.as_ref().unwrap_or(xs);
             let bf16_act = xs.dtype == Dtype::BF16;
             // marlin 臂(2026-10-12 三形态归一 Call):语义动作声明,
             // 名字路由归 driver(zs 在场 = AWQ 7 父;dt = BF16 → bf16 臂)
@@ -490,7 +529,7 @@ mod tests {
             crate::ops::Op::Call { op, .. } => assert_eq!(op.op_id().0, "elems.quant_int8_row_f16"),
             other => panic!("期望量化 Call,实得 {other:?}"),
         }
-        assert_eq!(q.dtype, Dtype::U8, "量化出 int8(字节承载)");
+        assert_eq!(q.dtype, Dtype::I8, "量化出 int8(有符号)");
         // 量化 3 父:x(f16 激活) / mul(设备标量因子) / scales(每轮瞬态)
         assert_eq!(q.parents.len(), 3, "量化槽 3 父:x / mul / scales");
         assert!(

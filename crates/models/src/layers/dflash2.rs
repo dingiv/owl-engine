@@ -40,7 +40,10 @@ use crate::module::{ForwardCtx, KvBuffers, Module, QuantPlan, Weight};
 use crate::ops::SemanticKernel;
 use crate::TensorOps;
 
-// FIXME: 将来要支持其他dflash模型怎么办?
+// FIXME(挂账·非缺陷):下面这组常量是**检查点家族定形事实**(dflash_config 实测,
+// z-lab/Qwen3.8-27B-DFlash2),当前**硬編在层内**。要支持别的 DFlash 家族,
+// 需把它们从 `dflash_config` 读进 `VisionCfg` 式的配置结构(单一真源 + 装载期
+// 校验),而不是逐处改常量。台账:docs/arch/dflash2-施工方案.md(草稿家族一节)。
 // ---- 检查点家族定形常量(dflash_config 实测;z-lab/Qwen3.8-27B-DFlash2)----
 /// conv taps(conv_kernel_size)
 pub const TAPS: usize = 2;
@@ -119,10 +122,8 @@ impl GroupedConv {
     /// 一次卷积(side = 0 输入侧 / 1 输出侧;delta = prepare 产出的
     /// 系数投影 [T, 2·TAPS·G],side-major 布局同 sglang reshape 序)。
     fn conv(&self, x: &TensorOps, delta: &TensorOps, side: usize, ctx: &ForwardCtx) -> TensorOps {
-        let _ = ctx;
+        let _ = ctx; // 接口留白(与兄弟层同签名);conv 无 ctx 依赖
         let t = x.shape()[0];
-        let n = t * self.hidden;
-        let _ = n;
         TensorOps::call(match self.dt {
             Dtype::F16 => SemanticKernel::DflashConv,
             Dtype::BF16 => SemanticKernel::DflashConv,
@@ -862,17 +863,14 @@ impl DFlash2Draft {
         assert_eq!(kvs.len(), self.layers.len(), "草稿 KV 层数");
         // cast 边界①:embed 查表(f16 表,target 共享)→ 草稿主干入口(bf16)
         let mut x = ensure_dt(&embed.embed(tokens, BLOCK), self.dt);
-        let probe = probe_layers.is_some();
-        if probe {
-            probe_layers.as_mut().unwrap().push(x.clone().tag("probe.embed"));
+        // probe 不拆链(2026-10-17 审查):原先 `probe` 布尔 + `as_mut().unwrap()`
+        // 两处 —— "判据在场"由派生布尔维持,不是结构保证
+        if let Some(pl) = probe_layers.as_deref_mut() {
+            pl.push(x.clone().tag("probe.embed"));
         }
         let mut residual: Option<TensorOps> = None;
         for (i, layer) in self.layers.iter().enumerate() {
-            let layer_probe = if probe {
-                probe_layers.as_deref_mut()
-            } else {
-                None
-            };
+            let layer_probe = probe_layers.as_deref_mut();
             let (nx, res) = layer.forward(
                 &x,
                 residual.as_ref(),
@@ -885,12 +883,9 @@ impl DFlash2Draft {
                 layer_probe,
             );
             x = nx;
-            if probe {
+            if let Some(pl) = probe_layers.as_deref_mut() {
                 // 层出口和 = h2 + residual(可观测;add 纯节点)
-                probe_layers
-                    .as_mut()
-                    .unwrap()
-                    .push(x.add(&res).tag(format!("probe.L{i}")));
+                pl.push(x.add(&res).tag(format!("probe.L{i}")));
             }
             residual = Some(res);
         }

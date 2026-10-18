@@ -23,12 +23,12 @@
 //! |---|---|---|
 //! | ① 单请求 dense | `N·k ≤ V_avail` | 强制选择层(或拒/排队) |
 //! | ② selection 常驻 | `W·k ≤ V_avail` 且 `N ≤ N_pos` | 触位置墙 ⇒ YaRN / 紧凑窗口 |
-//! | ③ 多会话池 | `ΣN_i·k ≤ pool` 且 `活跃 turn ≤ max_active_turns` | A 轴驱逐序 |
+//! | ③ 多会话池 | `ΣN_i·k ≤ pool` 且 `活跃 turn ≤ gdn_slots` | A 轴驱逐序 |
 //! | ④ 性能交叉 | `W < N ≤ N*` 两可 ⇒ 择优 | dense 保真 vs selection 省带宽 |
 //!
 //! # 两个用户旋钮(设计卷 §2.4)
 //!
-//! - boot:**`max_active_turns`**(最多几个 turn 同时在飞;硬天花板);
+//! - boot:**`gdn_slots`**(最多几个 turn 同时在飞;硬天花板);
 //! - per-turn:**`TurnFloor`**(直接显存地板 = KVMem 式损失的耐受度;
 //!   `Strict` = 零耐受 ⇒ 禁选择层,不足即响亮拒)。
 

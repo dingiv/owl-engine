@@ -63,6 +63,8 @@ pub struct StepProbes {
     pub gdn_dbg: bool,
     /// prefill H2D 叶子后流栅栏(A13 竞态排障;原 OWL_PF_FENCE)
     pub pf_fence: bool,
+    /// KV 页差分落点(原 OWL_KV_DUMP,同上收编)
+    pub kv_dump_at: Option<usize>,
 }
 
 impl StepProbes {
@@ -87,6 +89,9 @@ impl StepProbes {
             prompt_dump: p.prompt_dump,
             gdn_dbg: p.gdn_dbg,
             pf_fence: p.pf_fence,
+            kv_dump_at: p
+                .kv_dump_at
+                .or_else(|| owl_shared::env_reader::parse::<usize>("OWL_KV_DUMP")),
         }
     }
 }
@@ -368,10 +373,12 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// (见 [`budget_clamp`]),只剩 < 1k 才拒。
     /// turn 域 spec 状态(turn 生命周期;仅活跃 turn 可触 —— 轮执行期
     /// active 恒在;turn 外触碰 = 调用序错误)
-    pub(crate) fn tspec(&mut self) -> &mut TurnSpecState {
+    /// 活跃 turn 的 spec 状态(**显式 Result**;见 [`TurnLedger::tspec`])。
+    pub(crate) fn tspec(&mut self) -> Result<&mut TurnSpecState> {
         self.turns.tspec()
     }
-    pub(crate) fn tspec_ref(&self) -> &TurnSpecState {
+    /// 只读版(同上)。
+    pub(crate) fn tspec_ref(&self) -> Result<&TurnSpecState> {
         self.turns.tspec_ref()
     }
 

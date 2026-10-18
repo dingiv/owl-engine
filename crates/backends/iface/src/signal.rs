@@ -73,21 +73,29 @@ pub fn enter(sink: Sink) -> TrackingHandle {
 /// 栈空(untracked,如 E 阶段)→ **no-op**,零分配零锁。
 pub fn emit(t: Token) {
     // try_with:同 Drop——线程析构期 emit = 追踪窗口已关,no-op
+    // **借用不横跨 sink 回调**(2026-10-17 审查实测):先把 sink clone 出来、
+    // 释放 `RefCell` 借用,再回调 —— 否则 sink 内再 `enter()`(需可变借用)
+    // 当场 `RefCell already borrowed` panic(内部不变量失守式 crash,
+    // 不是响亮错误)。
     let _ = STACK.try_with(|s| {
-        if let Some(frame) = s.borrow().last() {
-            (Arc::clone(&frame.sink))(t);
+        let sink = s.borrow().last().map(|f| Arc::clone(&f.sink));
+        if let Some(sink) = sink {
+            sink(t);
         }
     });
 }
 
 /// 当前是否处于追踪作用域内(E 阶段 = false,热路径判读一次)
+///
+/// try_with:同 `emit`/`Drop` —— 线程析构期视为 untracked
+/// (原先用 `.with`,析构期访问 TLS 会 panic;与同文件另两处口径不一致)
 pub fn tracked() -> bool {
-    STACK.with(|s| !s.borrow().is_empty())
+    STACK.try_with(|s| !s.borrow().is_empty()).unwrap_or(false)
 }
 
-/// 当前作用域 id(调试/断言用)
+/// 当前作用域 id(调试/断言用;析构期视为无作用域)
 pub fn current_scope() -> Option<ScopeId> {
-    STACK.with(|s| s.borrow().last().map(|f| f.id))
+    STACK.try_with(|s| s.borrow().last().map(|f| f.id)).unwrap_or(None)
 }
 
 #[cfg(test)]
@@ -141,6 +149,39 @@ mod tests {
         emit(Token { id: 7, gen: 3 });
         assert_eq!(b.lock().unwrap().len(), 1);
         assert_eq!(a.lock().unwrap().len(), 0);
+    }
+
+    /// **借用不横跨 sink 回调**(2026-10-17 审查 §C5,实测):sink 内再
+    /// `enter()`(需可变借用)曾是 `RefCell already borrowed` panic。
+    #[test]
+    fn sink_reentrant_enter_is_safe() {
+        let outer = Arc::new(Mutex::new(Vec::<Token>::new()));
+        let inner = Arc::new(Mutex::new(Vec::<Token>::new()));
+        let il = Arc::clone(&inner);
+        let sink: Sink = Arc::new(move |t: Token| {
+            let inner_sink: Sink = {
+                let il = Arc::clone(&il);
+                Arc::new(move |x| il.lock().unwrap().push(x))
+            };
+            // 回调内再开一层作用域 + 发射(修前此处 panic)
+            let _g = enter(inner_sink);
+            emit(t);
+        });
+        let _g = enter(sink);
+        emit(Token { id: 1, gen: 1 });
+        assert_eq!(inner.lock().unwrap().len(), 1, "内层作用域收到 token");
+        assert_eq!(outer.lock().unwrap().len(), 0, "外层 sink 不再被投递");
+    }
+
+    /// 作用域外 `tracked()` = false;析构期口径走 `try_with`(不 panic)。
+    #[test]
+    fn untracked_after_drop() {
+        assert!(!tracked());
+        let g = enter(sink_vec(Arc::new(Mutex::new(Vec::new()))));
+        assert!(tracked());
+        drop(g);
+        assert!(!tracked());
+        assert!(current_scope().is_none());
     }
 
     /// scope id 单调

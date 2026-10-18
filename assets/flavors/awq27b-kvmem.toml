@@ -32,7 +32,7 @@ prefill_chunk = 128
 [pool]
 # ⚠️ **池下限算式**(boot 硬校验,不满足直接拒启并报数;装配期打 `[turn-ws]` 自证行):
 #
-#     nb ≥ max_active_turns × (ceil(workspace_per_req/32) + ceil(chunk/32))
+#     nb ≥ gdn_slots × (ceil(workspace_per_req/32) + ceil(chunk/32))
 #     96 ≥ 1 × (ceil(1024/32)=32 + 8) = 40                 ✓
 #         (工作集 32 页 = 保底 sink2 + recent4 + 召回 top-k 26 块)
 #
@@ -57,7 +57,7 @@ prefill_chunk = 128
 #    治理器会打 `[vram-gov]` 行给出 cap。)
 pool_tokens = 32768
 # 并发上限:每活跃 turn **各自**一套工作集 ⇒ 每加一个并发就多一份 46 页
-max_active_turns = 1
+gdn_slots = 1
 snap_max = 4
 # 24 GiB 贴顶档:预留压到最小(**实测 1024 会吃到 0 可用** ——
 # `vram-hard-budget` 池 = 驱动 free − reserve,27B 权重 19.2 GiB 之后没那么多余量)
@@ -134,3 +134,8 @@ allowed_ops = [
         "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256", "vllm_paged_attention_v2_fp8_knhd_hd256bs32",
         "vllm_paged_attention_v2_reduce_f16_hd256",
 ]
+
+[server]
+# 单会话语义(D1 2026-10-17 跨字段校验:`gdn_slots ≥ [server].max_concurrency`)——
+# 超了会把活跃会话的状态格 LRU 逐出(跨会话状态污染),boot 直接拒启。
+max_concurrency = 1

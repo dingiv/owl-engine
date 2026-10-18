@@ -7,7 +7,7 @@
 //! - **行(row)= 活跃 turn 借还**(S2b 的目标语义,先在账上成立):
 //!   `borrow_row()` 拿行 → 用毕 `return_row(row, Some(snap))` **落快照后还格**;
 //! - 快照 = 可驱逐资产(所在层由 `Tier` 记账;下沉 host/盘是 S2 的搬运活);
-//! - 行数上限 = `max_active_turns`(**并发 turn 天花板**,不是"能挂多少会话")。
+//! - 行数上限 = `gdn_slots`(**并发 turn 天花板**,不是"能挂多少会话")。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -37,7 +37,7 @@ pub struct StateStore {
 }
 
 impl StateStore {
-    /// 构造。`rows_total` = `max_active_turns`;`row_bytes` = 每会话全 48 层的行合计
+    /// 构造。`rows_total` = `gdn_slots`;`row_bytes` = 每会话全 48 层的行合计
     /// (27B 实测 ≈162MB)。
     pub fn new(rows_total: usize, row_bytes: usize) -> Self {
         Self {

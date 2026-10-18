@@ -1,5 +1,6 @@
 //! 块式 prefill(树根装配与执行;taps/encode/BISECT 取证)
 use super::*;
+use owl_iface::contract::ModelError;
 
 // ============================================================================
 // chunk host 侧输入表(自 `feat/prefill-graph` 择取,2026-10-15;**不含图路**)
@@ -387,7 +388,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .map(|c| f32::from_le_bytes(c.try_into().expect("4 字节")))
                 .collect();
             let face = self.graphs.session.face_mut();
-            face.write_block_f32(&gt.table, 0, &f32bits).await?;
+            // 参数面 → COMPUTE(与紧随的图发射同流;见 graph_plan::fill_slots 注)
+            face.write_block_f32_on(owl_iface::contract::UpStream::Compute, &gt.table, 0, &f32bits)
+                .await?;
         }
         // ── 回放(1 条 graph_launch)──
         // B7:桶路也记 `prefill.chunk`(总时,host 口径;与 eager 同 tag ⇒
@@ -487,7 +490,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
         }
         if let Some(hb) = seed_keep {
-            self.tspec().spec_seed_hidden = Some(hb);
+            self.tspec()?.spec_seed_hidden = Some(hb);
         }
         let nt = f32::from_le_bytes(buf_t) as u32;
         mfact(self.boot_seq, "pf.last", nt as u64);
@@ -539,9 +542,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let t = ids.len();
         // E2b:活跃会话块链 + GDN 格(逻辑位 → 物理槽由块表换算)
         let (bt_chain, gdn_slot_v) = {
-            let act = self.turns.active.as_ref().expect("active 已保证");
-            let s = self.bank.sessions.get(act.session_id).expect("账在");
-            (s.block_table.clone(), self.turns.active.as_ref().expect("active").gdn_slot)
+            let act = self.turns.active()?;
+            let s = self.bank.sessions.session(act.session_id)?;
+            // GDN 行 = **turn 域资源**(§28 行借还:行号就是账里的行号)
+            (s.block_table.clone(), act.gdn_slot)
         };
         // ── prefill 桶图命中(M2b;设计 §4–§6)──
         // 命中 ⇒ 槽写(真行真值 + 假行 dump 页)+ 1 条 graph_launch + 出图尾;
@@ -635,7 +639,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let fb = self
                 .pool
                 .fi_table_blocks()
-                .expect("FI 槽未分配(pool.fi_face 档恒有)")
+                .ok_or_else(|| ModelError::EngineInvariant { what: "FI 表槽未分配(池几何与档位不一致)".into() })?
                 .clone();
             assert!(
                 ft.nb_used <= fb.nb_cap,
@@ -649,12 +653,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let w_ind = bits(&ft.indptr);
             let w_ll = bits(&ft.last_len);
             let face = self.graphs.session.face_mut();
-            face.write_blocks_f32(&[
-                (&fb.q_cu, 0, w_q_cu.as_slice()),
-                (&fb.indices, 0, w_idx.as_slice()),
-                (&fb.indptr, 0, w_ind.as_slice()),
-                (&fb.last_len, 0, w_ll.as_slice()),
-            ])
+            face.write_blocks_f32_on(
+                owl_iface::contract::UpStream::Compute,
+                &[
+                    (&fb.q_cu, 0, w_q_cu.as_slice()),
+                    (&fb.indices, 0, w_idx.as_slice()),
+                    (&fb.indptr, 0, w_ind.as_slice()),
+                    (&fb.last_len, 0, w_ll.as_slice()),
+                ],
+            )
             .await?;
             let q_cu = TensorOps::of_block(fb.q_cu.id, Dtype::U32, vec![2]);
             let indices = TensorOps::of_block(fb.indices.id, Dtype::U32, vec![ft.nb_used]);
@@ -819,10 +826,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             if pf_state_check {
                 for (j, g) in gdn_leaves.iter().enumerate() {
                     for (sn, buf, nb) in [
-                        ("convq", &g.conv_q, self.pool.max_active_turns * d.nk * d.hk * 3),
-                        ("convk", &g.conv_k, self.pool.max_active_turns * d.nv * d.hv * 3),
-                        ("convv", &g.conv_v, self.pool.max_active_turns * d.nv * d.hv * 3),
-                        ("rec", &g.rec, self.pool.max_active_turns * d.nv * d.hk * d.hv),
+                        ("convq", &g.conv_q, self.pool.gdn_slots * d.nk * d.hk * 3),
+                        ("convk", &g.conv_k, self.pool.gdn_slots * d.nv * d.hv * 3),
+                        ("convv", &g.conv_v, self.pool.gdn_slots * d.nv * d.hv * 3),
+                        ("rec", &g.rec, self.pool.gdn_slots * d.nv * d.hk * d.hv),
                     ] {
                         let mut sb = vec![0u8; nb * 4];
                         {
@@ -888,10 +895,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             if pf_state_check {
                 for (j, g) in gdn_leaves.iter().enumerate() {
                     for (sn, buf, nb) in [
-                        ("convq", &g.conv_q, self.pool.max_active_turns * d.nk * d.hk * 3),
-                        ("convk", &g.conv_k, self.pool.max_active_turns * d.nv * d.hv * 3),
-                        ("convv", &g.conv_v, self.pool.max_active_turns * d.nv * d.hv * 3),
-                        ("rec", &g.rec, self.pool.max_active_turns * d.nv * d.hk * d.hv),
+                        ("convq", &g.conv_q, self.pool.gdn_slots * d.nk * d.hk * 3),
+                        ("convk", &g.conv_k, self.pool.gdn_slots * d.nv * d.hv * 3),
+                        ("convv", &g.conv_v, self.pool.gdn_slots * d.nv * d.hv * 3),
+                        ("rec", &g.rec, self.pool.gdn_slots * d.nv * d.hk * d.hv),
                     ] {
                         let mut sb = vec![0u8; nb * 4];
                         {
@@ -921,7 +928,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // 块内切片消费 —— SliceView 作根丢偏移,故不走多根 plain eval)
             let (hidden_full, prefill_taps) = if pf_bisect {
                 // bisect fin 块直通(block-leaf 下游 eval 零操作)
-                let (decl, blk) = bisect_fin_block.take().expect("bisect fin");
+                let (decl, blk) = bisect_fin_block.take().ok_or_else(|| ModelError::EngineInvariant { what: "bisect fin 块缺席(诊断档口径)".into() })?;
                 _bisect_fin_blk = Some(blk);
                 (decl, None)
             } else if self.spec.dflash_tap_count > 0 {
@@ -1030,9 +1037,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         .enumerate()
                         .map(|(i, c)| (half::f16::from_le_bytes([c[0], c[1]]).to_f32(), i as u32))
                         .collect();
-                    top.select_nth_unstable_by(1, |a, b| b.0.partial_cmp(&a.0).unwrap());
+                    top.select_nth_unstable_by(1, |a, b| b.0.total_cmp(&a.0));
                     top.truncate(2);
-                    top.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                    top.sort_by(|a, b| b.0.total_cmp(&a.0));
                     owl_shared::metrics::with_metrics_store(|s| {
                         s.counter_set("prefill.top1", u64::from(top[0].1), file!(), line!());
                         s.counter_set(
@@ -1078,7 +1085,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
             // seed 块归 turn 域 spec 状态(face 借位结束后落地)
             if let Some(hb) = seed_keep {
-                self.tspec().spec_seed_hidden = Some(hb);
+                self.tspec()?.spec_seed_hidden = Some(hb);
             }
             let nt = f32::from_le_bytes(buf) as u32;
             let bs = self.boot_seq;
@@ -1092,7 +1099,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // 中间块:last_hidden 根(状态推进完整;lm_head 免算)。
             // DFlash2:同构 concat 单根(taps 随块回收前切片 encode)
             let (tree, prefill_taps) = if pf_bisect {
-                let (decl, blk) = bisect_fin_block.take().expect("bisect fin(非末)");
+                let (decl, blk) = bisect_fin_block.take().ok_or_else(|| ModelError::EngineInvariant { what: "bisect fin(非末)块缺席(诊断档口径)".into() })?;
                 _bisect_fin_blk = Some(blk);
                 (decl, None)
             } else if self.spec.dflash_tap_count > 0 {
@@ -1173,6 +1180,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
 
 
 }
+
+// =====================================================================
 
 // ============================================================================
 // **chunk 活性归因诊断**(门:`OWL_LIVE_DIAG`;2026-10-19)

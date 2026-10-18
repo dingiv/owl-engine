@@ -194,19 +194,19 @@ impl EvictPolicy for LrfuPolicy {
     }
 }
 
-/// 准入策略(boot 装配一次;`max_active_turns` 是硬天花板)。
+/// 准入策略(boot 装配一次;`gdn_slots` 是硬天花板)。
 #[derive(Debug)]
 pub struct AdmissionPolicy {
     /// 最多几个 turn 同时在飞(boot 旋钮;正名自 `gdn_slots`)。
-    pub max_active_turns: usize,
+    pub gdn_slots: usize,
     /// 满员姿态。
     pub on_full: QueuePolicy,
 }
 
 impl AdmissionPolicy {
     /// 构造(上限为 0 = 装配错,响亮拒 —— 由 `VramBudget::decompose` 兜底)。
-    pub fn new(max_active_turns: usize, on_full: QueuePolicy) -> Self {
-        Self { max_active_turns, on_full }
+    pub fn new(gdn_slots: usize, on_full: QueuePolicy) -> Self {
+        Self { gdn_slots, on_full }
     }
 }
 

@@ -5,7 +5,7 @@
 //! N*(dense 上限) = V_avail / k                      ← 容量线①
 //! 准入面(face)  = kv_face_bytes > 0 ? 池 : V_avail  ← 固定池档 / 动态池档(§23.2)
 //! 准入(turn_i) ⇔ Σ_active floor_j + floor_i + 缓存驻留 + 弹性余量 ≤ face
-//!                ∧ #active_turn + 1 ≤ max_active_turns
+//!                ∧ #active_turn + 1 ≤ gdn_slots
 //! ```
 //!
 //! **A5.1 律**:`BudgetInputs` 的每一项都必须来自实测;缺项(0)在 `decompose` 里
@@ -72,7 +72,7 @@ impl TurnFloor {
 pub struct VramBudget {
     inputs: BudgetInputs,
     /// 本档允许的活跃 turn 上限(boot 旋钮;硬天花板)。
-    max_active_turns: usize,
+    gdn_slots: usize,
     /// 卡级三项是否实测(`v_card`/权重/底价)。固定池档允许缺项 —— 报告面必须能看见。
     card_measured: bool,
 }
@@ -81,13 +81,13 @@ impl VramBudget {
     /// 分解(唯一入口)。
     ///
     /// 失败条件(A5.1 响亮拒):权重或运行底价为 0(说明没有实测数字)、
-    /// `max_active_turns == 0`、或按上限满编的活跃 turn 行都放不下。
-    pub fn decompose(inputs: BudgetInputs, max_active_turns: usize) -> StoreResult<Self> {
+    /// `gdn_slots == 0`、或按上限满编的活跃 turn 行都放不下。
+    pub fn decompose(inputs: BudgetInputs, gdn_slots: usize) -> StoreResult<Self> {
         if inputs.kv_bytes_per_token == 0 {
             return Err(StoreError::Budget("每 token KV 字节为 0".into()));
         }
-        if max_active_turns == 0 {
-            return Err(StoreError::Budget("max_active_turns = 0(没有任何 turn 能跑)".into()));
+        if gdn_slots == 0 {
+            return Err(StoreError::Budget("gdn_slots = 0(没有任何 turn 能跑)".into()));
         }
         // 固定池档(池已预分配)⇒ 准入判据不看卡级三项 ⇒ 允许未实测(记 0 + 标记);
         // 动态池档 ⇒ 卡级三项是判据本身,缺项 = 分解失败(A5.1)。
@@ -101,7 +101,7 @@ impl VramBudget {
         }
         let rows = inputs
             .gdn_row_bytes
-            .checked_mul(max_active_turns)
+            .checked_mul(gdn_slots)
             .ok_or_else(|| StoreError::Budget("GDN 行预算溢出".into()))?;
         let fixed = inputs
             .weights_bytes
@@ -113,11 +113,11 @@ impl VramBudget {
             return Err(StoreError::Budget(format!(
                 "固定面 {fixed} ≥ 卡可用 {}:装不下权重+底价+{}×{}MB 行+草稿",
                 inputs.v_card_bytes,
-                max_active_turns,
+                gdn_slots,
                 inputs.gdn_row_bytes / (1 << 20)
             )));
         }
-        Ok(Self { inputs, max_active_turns, card_measured })
+        Ok(Self { inputs, gdn_slots, card_measured })
     }
 
     /// 卡级三项(`v_card`/权重/底价)是否实测。固定池档允许缺项 —— 缺了不是
@@ -141,7 +141,7 @@ impl VramBudget {
             .v_card_bytes
             .saturating_sub(self.inputs.weights_bytes)
             .saturating_sub(self.inputs.runtime_floor_bytes)
-            .saturating_sub(self.inputs.gdn_row_bytes.saturating_mul(self.max_active_turns))
+            .saturating_sub(self.inputs.gdn_row_bytes.saturating_mul(self.gdn_slots))
             .saturating_sub(self.inputs.draft_pool_bytes)
     }
 
@@ -156,8 +156,8 @@ impl VramBudget {
     }
 
     /// 活跃 turn 上限(硬天花板)。
-    pub fn max_active_turns(&self) -> usize {
-        self.max_active_turns
+    pub fn gdn_slots(&self) -> usize {
+        self.gdn_slots
     }
 
     /// 三层预算(交给 `TierLedger`)。
@@ -310,7 +310,7 @@ pub enum AdmissionVerdict {
 /// 准入判据(自由函数:I/O 与判定分离;`Admission` 只提供状态)。
 ///
 /// 判据顺序(设计卷 §2.4 准入式):
-/// ① 并发天花板(`max_active_turns`)→ ② 直接地板能否放下(含驱逐面)→
+/// ① 并发天花板(`gdn_slots`)→ ② 直接地板能否放下(含驱逐面)→
 /// ③ `Strict` 时还需"全量在卡"(不满足即拒/排队)。
 pub fn check_admission(
     budget: &VramBudget,
@@ -321,11 +321,11 @@ pub fn check_admission(
     on_full: crate::policy::QueuePolicy,
 ) -> AdmissionVerdict {
     let inp = budget.inputs();
-    if admission.active_turns() >= budget.max_active_turns() {
+    if admission.active_turns() >= budget.gdn_slots() {
         let reason = format!(
             "活跃 turn 已达天花板({}/{})",
             admission.active_turns(),
-            budget.max_active_turns()
+            budget.gdn_slots()
         );
         return verdict_for_full(on_full, reason);
     }

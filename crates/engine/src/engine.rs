@@ -163,10 +163,16 @@ pub struct EngineKnobs {
     pub no_graph: bool,
     /// **prefill 图档位**(P1;`[graph] prefill_bucket`;缺省 `off` = 今天行为)
     pub prefill_bucket: owl_shared::config::PrefillBucket,
+    /// **FI plan 图档瓦**(`[dispatch] fi_cuda_graph`;2026-10-18 图档单图立案):
+    /// 开 ⇒ 形状对 ctx 全域恒定(可烘图的先决条件)。装配期经
+    /// `owl_kernels::family::flashinfer::configure_plan_env` 投递给核。
+    pub fi_cuda_graph: bool,
+    /// **decode 单图烘 plan 上界**(`[dispatch] fi_plan_bake`;None = 现状 piecewise)
+    pub fi_plan_bake: Option<usize>,
     /// TS 探针槽(原 OWL_TS_PROBE)
     pub ts_probe: bool,
     /// GDN 槽数覆写(缺省 8;原 OWL_MAX_ACTIVE_TURNS)
-    pub max_active_turns: usize,
+    pub gdn_slots: usize,
     /// spec 快照轮回滚缓冲槽数(缺省 4;原 OWL_SNAP_MAX)
     pub snap_max: usize,
     /// VRAM 预算目标占比(缺省 0.97;原 OWL_VRAM_TARGET)
@@ -225,8 +231,10 @@ impl Default for EngineKnobs {
             dense_floor: owl_store::TurnFloor::Strict,
             no_graph: false,
             prefill_bucket: owl_shared::config::PrefillBucket::Off,
+            fi_cuda_graph: false,
+            fi_plan_bake: None,
             ts_probe: false,
-            max_active_turns: 8,
+            gdn_slots: 8,
             snap_max: 4,
             vram_target: 0.97,
             vram_reserve_mb: 1024,
@@ -351,6 +359,8 @@ impl EngineKnobs {
         let q = match self.env.kv.quant {
             owl_models::env::KvQuant::None => "f16",
             owl_models::env::KvQuant::Fp8E4M3 => "fp8",
+            // 主干新增变体(暂无核臂,选了会响亮拒);digest 只做标注
+            owl_models::env::KvQuant::Fp8E5M2 => "fp8e5m2",
         };
         let ev = match self.evict_policy {
             owl_store::EvictPolicyKind::Lru => "lru".to_string(),
@@ -359,7 +369,7 @@ impl EngineKnobs {
         format!(
             "pool={:?} turns={} snap_max={} host={}M snap_host={}M | kvmem={}[idx={} cov={} view={} part={} ws={}tok(sink{}+recent{}+topk{}@32tok/page) every={} evict={} floor={:?}] | fi={} split={} gdn_chunked={} kv={} graph_off={}",
             self.pool_tokens,
-            self.max_active_turns,
+            self.gdn_slots,
             self.snap_max,
             self.host_cache_mb,
             self.snap_host_mb,
@@ -455,11 +465,15 @@ impl EngineKnobs {
             dense_floor: Self::dense_floor_of(&cfg.kvmem),
             no_graph: cfg.graph.no_graph,
             prefill_bucket: cfg.graph.prefill_bucket,
+            fi_cuda_graph: cfg.dispatch.fi_cuda_graph,
+            // 哨兵:0 = 取 max_seq(FI 调度表的图档上界 = 单序列 ctx 的天然上界;
+            // 这样档位改 max_seq 时上界跟着走,不必两处手改)
+            fi_plan_bake: cfg.dispatch.fi_plan_bake.map(|b| if b == 0 { cfg.runtime.max_seq } else { b }),
             ts_probe: cfg.dispatch.ts_probe,
             // S2b 正名:env 新名优先,旧名 `OWL_GDN_SLOTS` 兼容(旧档脚本不炸)
-            max_active_turns: owl_shared::env_reader::parse("OWL_MAX_ACTIVE_TURNS")
+            gdn_slots: owl_shared::env_reader::parse("OWL_MAX_ACTIVE_TURNS")
                 .or_else(|| owl_shared::env_reader::parse("OWL_GDN_SLOTS"))
-                .unwrap_or(cfg.pool.max_active_turns),
+                .unwrap_or(cfg.pool.gdn_slots),
             // 快照池容量:env 覆盖(实测调压;命中面要求边界快照在场)
             snap_max: owl_shared::env_reader::parse("OWL_SNAP_MAX").unwrap_or(cfg.pool.snap_max),
             vram_target: cfg.pool.vram_target,
@@ -571,7 +585,7 @@ fn assemble_budget(
     let block_bytes = pool.block_bytes();
     let page = pool.page.max(1);
     let kv_pool = (pool.nb as u64).saturating_mul(block_bytes as u64);
-    let gdn_pool = (pool.max_active_turns as u64).saturating_mul(pool.gdn_row_bytes() as u64);
+    let gdn_pool = (pool.gdn_slots as u64).saturating_mul(pool.gdn_row_bytes() as u64);
     let snap_pool = pool.snapshot_pool_bytes() as u64;
     let draft_pool = pool.draft_pool_bytes() as u64;
     let weights = live_loaded.saturating_sub(boot.live_at_new);
@@ -609,7 +623,7 @@ fn assemble_budget(
         pool.nb,
         block_bytes,
         pool.gdn_row_bytes() as f64 / 1048576.0,
-        pool.max_active_turns,
+        pool.gdn_slots,
         mb(snap_pool),
         mb(draft_pool),
         mb(cfg.knobs.host_cache_mb as u64 * 1048576),
@@ -668,6 +682,18 @@ impl<D: DeviceClient + 'static> Engine<D> {
         let t_run = std::time::Instant::now();
         // 装载后的引擎 live 账(权重与运行底价的基线;S3b §23.3)
         let live_loaded = owl_shared::vram::live_bytes();
+        // **投机深度定形门**(2026-10-16):verify 块 = `depth + 1` 行,而首轮
+        // 拼接核的输入槽数是**声明面事实**(`CONCAT_ROWS_SLOTS` = 8)⇒ depth 超界
+        // 会在**首个 verify 步**才爆(且那时树已经 pad 到错槽数)。
+        // 放在**任何设备动作之前**(连草稿器都不加载)⇒ 坏配置毫秒级拒。
+        if self.cfg.knobs.draft.depth >= owl_models::kernel::CONCAT_ROWS_SLOTS {
+            return Err(owl_iface::contract::ModelError::Msg(format!(
+                "[spec] depth = {} 超界:verify 行数 = depth+1 必须 ≤ {}(首轮拼接槽数);\
+                 请调小 depth(或关 spec 走 dumb 草稿)",
+                self.cfg.knobs.draft.depth,
+                owl_models::kernel::CONCAT_ROWS_SLOTS
+            )));
+        }
         let s = self.cfg.max_seq_tokens;
         let (hq, hkv, hd) = loaded.spec.full_heads;
         let (nk, hk, nv, hv) = loaded.spec.gdn_heads;
@@ -722,10 +748,15 @@ impl<D: DeviceClient + 'static> Engine<D> {
         .await?;
 
         // B6.2:主 KV 池 fp8 承载(draft_kv_fp8 / kv.fp8 → env.kv.quant)
-        // KV 写者/读者清单门(收口律机器门):按活跃 quant 逐族校验内核
-        // 在登记表与 .cu 源在场;缺族/缺名 = 装配失败(池 dtype 改造漏网
-        // 即启动即拦,不等 E2E 红灯)
-        owl_models::kernel::kv_manifest_gate(env.kv.quant, env.attn.fi)?;
+        // KV 池清单门(收口律机器门;E1 2026-10-17 改为**声明面投影**):
+        // 期望集从每个算子的 `POOL` 声明(`池名/布局/dtype`)投影出来,逐个
+        // 核 `.cu` 源在场;缺声明/缺源 = 装配失败(池 dtype 改造漏网即启动
+        // 即拦,不等 E2E 红灯)。原手抄核名清单已删(新池核忘写清单 ⇒ 门
+        // 静默变窄的那种形状)。
+        owl_models::kernel::kv_manifest_gate(
+            owl_models::kernel::kv_pool_dtype(env.kv.quant, dims.dtype),
+            env.attn.fi,
+        )?;
         if env.kv.quant == owl_models::env::KvQuant::Fp8E4M3 {
             owl_shared::log_info!("boot", "KV 池 fp8 e4m3(容量减半/ctx 翻倍;读核 *_fp8 变体)");
         }
@@ -754,7 +785,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
             // B-3e-2:部分驻留档**不带 XQA**(页表语义不共戴;见上方醒目告知)
             xqa_decode: self.cfg.knobs.env.attn.decode_xqa && !self.cfg.knobs.select_partial,
             xqa_prefill: self.cfg.knobs.env.attn.xqa_prefill,
-            max_active_turns: self.cfg.knobs.max_active_turns,
+            gdn_slots: self.cfg.knobs.gdn_slots,
             snap_max: self.cfg.knobs.snap_max,
             vram_target: self.cfg.knobs.vram_target,
             vram_reserve_mb: self.cfg.knobs.vram_reserve_mb,
@@ -814,7 +845,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
         //          └─ 每个活跃 turn 都要**自己一套**工作集与 chunk 工作区
         // ```
         //
-        // `N_active` = `max_active_turns`(并发上限)。**这一项不能省** ——
+        // `N_active` = `gdn_slots`(并发上限)。**这一项不能省** ——
         // 并发档下每个 turn 各有自己的工作集,池要能同时装下它们。
         // 27B f16 算例(页 = 32 tok = 2 MiB):
         //   select_blocks 32 + sink 2 + recent 4 + chunk 256 ⇒ 每 turn 46 页 = 92 MiB
@@ -833,7 +864,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
         let keep_pages = self.cfg.knobs.select_sink + self.cfg.knobs.select_recent;
         let chunk_pages = self.cfg.prefill_chunk.div_ceil(pool.page.max(1)).max(1);
         let per_turn = ws_pages.max(1) + chunk_pages;
-        let n_active = self.cfg.knobs.max_active_turns.max(1);
+        let n_active = self.cfg.knobs.gdn_slots.max(1);
         let need = per_turn * n_active;
         let vm_on = self.cfg.knobs.kvmem_virtualization;
         // **boot 自证行**(装配期无条件打):工作集口径与三件派生一次打全 ——
@@ -875,7 +906,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
                     "boot: 设备池 {} 页装不下 {n_active} 并发 × {per_turn} 页 = {need} 页\
                      (每 turn = workspace_per_req {} tok = {} 页 + chunk {chunk_pages} 页;\
                       其中工作集由 sink {} + recent {} + top-k {} 组成);\
-                     pool_tokens={} page={} —— 调大池 / 减工作集 / 降 max_active_turns\
+                     pool_tokens={} page={} —— 调大池 / 减工作集 / 降 gdn_slots\
                      (响亮拒:跑起来必 Exhausted)",
                     pool.nb,
                     self.cfg.knobs.workspace_per_req,
@@ -953,7 +984,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
         // 装配失败 = 拒绝启动(A5.1:没有数字的项不许进预算式)。
         let budget_inputs = assemble_budget(&self.boot, &self.cfg, &pool, live_loaded, owl_shared::vram::live_bytes())?;
         let admission_policy = owl_store::AdmissionPolicy::new(
-            self.cfg.knobs.max_active_turns.max(1),
+            self.cfg.knobs.gdn_slots.max(1),
             self.cfg.knobs.admission_on_full,
         );
         let host_bytes = self.cfg.knobs.host_cache_mb << 20;

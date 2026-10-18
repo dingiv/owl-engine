@@ -227,6 +227,8 @@ fn host_ref_knhd(q: &[u16], kc: &[u8], vc: &[u8], t: usize, ctx: usize) -> Vec<f
 // ============================================================================
 fn run_case(t: usize, ctx: usize, host_check: bool, iters: usize) {
     let nb = ctx.div_ceil(PAGE);
+    // 过供给探针(缺省 = 与真值同 ⇒ 历史口径零变化)
+    let plan_ctx = owl_shared::env_reader::parse::<usize>("FI_PF_PLAN_CTX").unwrap_or(ctx);
     let mut res = TestRes::new(owl_shared::env_reader::parse_or("OWL_TEST_DEVICE", 0));
     let mut exec = Exec::new();
     // 激活集 = 本探针要发射的那一个算子(A20/A16 之后:白名单外的声明不审
@@ -278,7 +280,12 @@ fn run_case(t: usize, ctx: usize, host_check: bool, iters: usize) {
             Arg::Block { id: wr_b.id, dtype: Dtype::F16, rank: 1 },
             Arg::Block { id: out_b.id, dtype: Dtype::F16, rank: 2 },
             Arg::U64(t as u64),      // total_rows
-            Arg::U64(ctx as u64),    // ctx_total
+            // ⚠️ **过供给腿**(2026-10-18 图档桶化立案):`FI_PF_PLAN_CTX=<大 ctx>`
+            // ⇒ plan 按大上界算(表布局/瓦片数按上界),而**池表四件套仍按真 ctx**
+            // ⇒ 核内用真 kv_len 夹取、多出来的 kv_tile 落空 ⇒ 正是"信封上界 +
+            // 运行期夹取"的模拟(图档 plan 烘图后的形态)。判据 = host oracle。
+            Arg::U64(plan_ctx as u64), // ctx_total(plan 面)
+
             Arg::U64(t as u64),      // T
             Arg::U64(H as u64),      // hq
             Arg::U64(HKV as u64),    // hkv

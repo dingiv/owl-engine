@@ -101,10 +101,17 @@ impl VisionCfg {
     }
 
     /// 位置表边长(= √num_pos;Qwen 视觉塔恒为完全平方)
-    pub fn grid_side(&self) -> usize {
+    pub fn grid_side(&self) -> Result<usize, ModelError> {
         let s = (self.num_pos as f64).sqrt().round() as usize;
-        debug_assert_eq!(s * s, self.num_pos, "num_pos 非完全平方");
-        s
+        // release 也要拦(2026-10-17 审查:原 debug_assert ⇒ 非完全平方时
+        // 静默取整,后续 tap/index 全按错误边长算 = 静默错值)
+        if s * s != self.num_pos {
+            return Err(ModelError::Msg(format!(
+                "grid_side: num_pos {} 非完全平方(表边长不可定)",
+                self.num_pos
+            )));
+        }
+        Ok(s)
     }
 
     /// patch 展平宽 = in_channels · temporal · patch²
@@ -157,7 +164,7 @@ impl VisionTables {
             return Err(ModelError::Msg("VisionTables::build: grid_thw 为空".into()));
         }
         let merge = cfg.merge;
-        let side = cfg.grid_side();
+        let side = cfg.grid_side()?;
         let half = cfg.half();
         let n_pos = cfg.num_pos;
 
@@ -204,9 +211,16 @@ impl VisionTables {
                                 let (wt, ww) = axis_taps(col, w, side);
                                 for kk in 0..2 {
                                     for jj in 0..2 {
-                                        let tap = (ht[kk] * side + wt[jj]) as f32;
-                                        debug_assert!(tap < n_pos as f32);
-                                        idx.push(tap);
+                                        let tap = ht[kk] * side + wt[jj];
+                                        // 越界 tap 会被 pos-embed 核拿去查表(读越界/静默错值);
+                                        // release 也要拦(2026-10-17 审查:原 debug_assert)
+                                        if tap >= n_pos {
+                                            return Err(ModelError::Msg(format!(
+                                                "VisionTables::build: tap {tap} 越出表行数 {n_pos}\
+                                                 (grid {t},{h},{w} / side {side})"
+                                            )));
+                                        }
+                                        idx.push(tap as f32);
                                         wts.push(hw[kk] * ww[jj]);
                                     }
                                 }
@@ -1189,6 +1203,19 @@ mod tests {
             eprintln!("[vis] merged 归一化误差 {worst:.3e}(@[{at}] |Δ| {:.3e})", (got[at] - want[at]).abs());
             assert!(worst <= 1.0, "merged: 归一化误差 {worst:.3e} > 1");
         }
+    }
+
+    /// **完全平方门**(2026-10-17 审查 §五轮):`num_pos` 非完全平方时表边长
+    /// 不可定 ⇒ `grid_side` 必须**响亮拒**(修前 debug_assert ⇒ release 静默取整,
+    /// 后续 tap/index 全按错误边长算)。
+    #[test]
+    fn grid_side_is_loud_on_non_square() {
+        let mut cfg = VisionCfg::holo(); // 任意基线,只改 num_pos
+        cfg.num_pos = 5; // 非完全平方
+        let e = cfg.grid_side().expect_err("非完全平方必须拒");
+        assert!(format!("{e}").contains("完全平方"), "{e}");
+        cfg.num_pos = 4;
+        assert_eq!(cfg.grid_side().expect("4 = 2²"), 2);
     }
 }
 

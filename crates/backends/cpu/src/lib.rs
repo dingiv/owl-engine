@@ -19,6 +19,21 @@
 //!
 //! 纪律:本 crate 只依赖 owl-iface(契约),**不依赖任何前端 crate**
 //! (2026-09-25 后端不依赖前端裁决;与 owl-cuda 同律)。
+//!
+//! # 能力边界(继承 `DeviceClient` 默认面的那部分 —— 2026-10-17 审查 §三轮-C2 成文)
+//!
+//! 测试作者必须知道"哪些面在 CPU 上**不是**生产语义":
+//!
+//! | 面 | CPU 档行为 | 与真卡的差别 |
+//! |---|---|---|
+//! | `swap` | **host 兜底**(逐片 `dtoh_at` + `upload_pinned`) | 真卡是**设备侧单命令**(`Command::Swap` + connector)⇒ store 在 CPU 面测的是兜底路径,不是生产路径 |
+//! | `launch_and_harvest` | `Err("未实现")` | 真卡有实现;CPU 面不可跑该面(响亮拒,不静默) |
+//! | `alloc_uninit` | 默认 = `alloc`(**清零**);`MockLimits::poison_uninit` 置位才填 NaN | 真卡"未初始化"无零保证 ⇒ 默认档对"忘 memset"类缺陷是**乐观的** |
+//! | `op_env` / `face_clone` / `loader_faces` | `None` | 无设备属性/无多 face ⇒ 装载自动回退 CPU 打包与串行 |
+//! | `sm_count` | `Err`(引擎回退常量 + **响亮告警**) | 真卡取 `multiProcessorCount` |
+//! | `htod_batch` / `dtoh_batch` / `copy_batch` / `write_blocks_f32` / `htod_f32` / `upload_pinned_on` | 逐片循环(等价) | 无流概念,语义等价 ✓ |
+//!
+//! 判据:**以 CPU 面跑绿推断生产绿之前,先看该面是否在上表**。
 
 mod face;
 mod ops;

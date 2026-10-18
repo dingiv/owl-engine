@@ -71,5 +71,16 @@ pub use graph_plan::{GraphPlan, GraphPlanDesc, PlanOutcome};
 pub use session::{AgentSession, SessionTable};
 pub use turn::{TurnEvent, TurnOpts, TurnSampler, TurnSpec};
 
+/// 主干量化方案映射(**唯一点**:配置枚举 → owl_models QuantPlan;
+/// 同 [`head_plan_of`] 的范式 —— app 层不碰 owl_models,新方案 =
+/// 加枚举值 + 此处加臂 + 质量门台账)
+pub fn quant_plan_of(q: owl_shared::config::QuantScheme) -> owl_models::module::QuantPlan {
+    use owl_shared::config::QuantScheme::*;
+    match q {
+        W4a16 => owl_models::module::QuantPlan::W4A16Awq,
+        W4a8 => owl_models::module::QuantPlan::W4A8Awq,
+    }
+}
+
 /// 本 crate 的结果别名:错误权威 = iface `ModelError`(线上一族,不另立)
 pub type Result<T> = std::result::Result<T, owl_iface::contract::ModelError>;

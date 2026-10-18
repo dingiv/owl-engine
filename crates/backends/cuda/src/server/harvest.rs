@@ -21,16 +21,30 @@ impl GpuServer {
 
 
     /// srv.seg.htod 分相(与客户端同名段对账;差值 = 管道/等待)
-    pub(super) fn handle_htod(&mut self, data: Vec<u8>, name: String, ack: Ack<Result<Bytes, ModelError>>) {
+    pub(super) fn handle_htod(
+        &mut self,
+        data: Vec<u8>,
+        name: String,
+        stream_id: u8,
+        ack: Ack<Result<Bytes, ModelError>>,
+    ) {
         let t0 = std::time::Instant::now();
-        self.handle_htod_inner(data, &name, ack);
+        self.handle_htod_inner_on(data, &name, stream_id, ack);
         self.sink.timer("srv.seg.htod", t0.elapsed());
     }
 
-    pub(super) fn handle_htod_inner(&mut self, data: Vec<u8>, name: &str, ack: Ack<Result<Bytes, ModelError>>) {
+    /// [`Self::handle_htod_inner`] 的**落点流可选**版(2026-10-17):参数面
+    /// (解释器的 `from_host` 叶子)走 COMPUTE ⇒ 与消费它的发射同流 FIFO。
+    pub(super) fn handle_htod_inner_on(
+        &mut self,
+        data: Vec<u8>,
+        name: &str,
+        stream_id: u8,
+        ack: Ack<Result<Bytes, ModelError>>,
+    ) {
         let mut ack = Some(ack);
         let n = data.len();
-        let stream = match self.ctx().stream(STREAM_H2D) {
+        let stream = match self.ctx().stream(stream_id as u64) {
             Ok(s) => s.clone(),
             Err(e) => return ack.take().unwrap().send(Err(e)),
         };
@@ -157,23 +171,18 @@ impl GpuServer {
         dst: Bytes,
         offset_bytes: usize,
         len_bytes: usize,
+        stream_id: u8,
         ack: Ack<Result<(), ModelError>>,
     ) {
-        ack.send(self.enqueue_upload_pinned(buf, dst, offset_bytes, len_bytes));
+        ack.send(self.enqueue_upload_pinned_on(stream_id as u64, buf, dst, offset_bytes, len_bytes));
     }
 
     /// **上传核心**(只入队 DMA + 登记租约归还;不 ack)—— 复合命令
-    /// `UploadAndLaunch` 与命令壳共用(mutual: 单机制,无第二套上传路径)
-    pub(super) fn enqueue_upload_pinned(
-        &mut self,
-        buf: Box<dyn owl_iface::contract::PinnedRegion + Send>,
-        dst: Bytes,
-        offset_bytes: usize,
-        len_bytes: usize,
-    ) -> Result<(), ModelError> {
-        self.enqueue_upload_pinned_on(STREAM_H2D, buf, dst, offset_bytes, len_bytes)
-    }
-
+    /// `UploadAndLaunch` 与命令壳共用(mutual: 单机制,无第二套上传路径)。
+    /// 落点流由调用方给:`STREAM_COMPUTE` = 参数面(与消费核同流),
+    /// `STREAM_H2D` = 大批量装载面。**不设无流包装** —— 单一拼写
+    /// (2026-10-17 审查:原 `enqueue_upload_pinned`/`handle_htod_inner` 两个
+    /// legacy 包装已无调用者,删;H2D 面在各自调用点显式指名)。
     /// 同上,但**指定流**(复合命令 `UploadAndLaunch` 用:把搬运放在**消费它的
     /// 那条流**上 ⇒ 单流硬件保序,零事件零栅栏 —— 见 server 侧复合处理体)
     pub(super) fn enqueue_upload_pinned_on(
@@ -202,15 +211,17 @@ impl GpuServer {
             self.pool.put(buf);
             return Err(e);
         }
-        let t_dma = std::time::Instant::now();
-        let dma = unsafe {
+        // 计时用 `timer_scope!`(作用域表达式形态):非 perf 档宏展开 = 原表达式
+        // ⇒ 不再有"变量只在 debug/perf 被读"的 unused 告警,也不再白读一次时钟
+        // (2026-10-17 审查:原 `let t_dma = Instant::now(); … timer_record!` 在
+        //  release 档既告警又白付一次 clock_gettime)。
+        let dma = owl_shared::timer_scope!("srv.dma_enqueue", unsafe {
             memcpy_htod_async(
                 dptr_base + (offset_bytes as u64),
                 &buf.as_bytes()[..len_bytes],
                 stream.cu_stream(),
             )
-        };
-        owl_shared::timer_record!("srv.dma_enqueue", t_dma.elapsed());
+        });
         owl_shared::counter_add!("srv.dma_bytes", len_bytes as u64);
         if let Err(e) = dma {
             // 建场失败:未入队任何 DMA,finish 不得投递 —— 租约回池 + 返回错误
@@ -247,10 +258,11 @@ impl GpuServer {
     pub(super) fn handle_htod_chunks(
         &mut self,
         writes: Vec<(u64, usize, Vec<u8>)>,
+        stream_id: u8,
         ack: Ack<Result<(), ModelError>>,
     ) {
         let mut ack = Some(ack);
-        let stream = match self.ctx().stream(STREAM_H2D) {
+        let stream = match self.ctx().stream(stream_id as u64) {
             Ok(s) => s.clone(),
             Err(e) => return ack.take().unwrap().send(Err(e)),
         };
@@ -267,8 +279,9 @@ impl GpuServer {
                 }
                 return ack.take().unwrap().send(Err(e));
             }
-            // **清零序**(2026-10-16):见 try_htod 注(H2D 写前等该块 memset)
-            if let Err(e) = self.ctx_mut().wait_zeroing(*block, STREAM_H2D) {
+            // **清零序**(2026-10-16):见 try_htod 注(写前等该块 memset;
+            // 2026-10-17:等待的**落点流 = 命令自述流** —— 参数面走 COMPUTE)
+            if let Err(e) = self.ctx_mut().wait_zeroing(*block, stream_id as u64) {
                 for b in pending {
                     self.pool.put(b);
                 }
@@ -341,9 +354,10 @@ impl GpuServer {
         block: u64,
         offset_bytes: usize,
         data: Vec<u8>,
+        stream_id: u8,
         ack: Ack<Result<(), ModelError>>,
     ) {
-        let stream = match self.ctx().stream(STREAM_H2D) {
+        let stream = match self.ctx().stream(stream_id as u64) {
             Ok(s) => s.clone(),
             Err(e) => return ack.send(Err(e)),
         };
@@ -356,8 +370,9 @@ impl GpuServer {
         {
             return ack.take().unwrap().send(Err(e));
         }
-        // **清零序**(2026-10-16):见 try_htod 注(H2D 写前等该块 memset)
-        if let Err(e) = self.ctx_mut().wait_zeroing(block, STREAM_H2D) {
+        // **清零序**(2026-10-16):见 try_htod 注(写前等该块 memset;
+        // 2026-10-17:等待的**落点流 = 命令自述流**)
+        if let Err(e) = self.ctx_mut().wait_zeroing(block, stream_id as u64) {
             return ack.take().unwrap().send(Err(e));
         }
         let dptr_base = match self.ctx().block_ptr(block, &stream) {
@@ -653,7 +668,12 @@ impl GpuServer {
         ack: Ack<Result<Box<dyn owl_iface::contract::Connector + Send>, ModelError>>,
     ) {
         let total: usize = pieces.iter().map(|p| p.len).sum();
-        let stream = match self.ctx().stream(STREAM_H2D) {
+        // **落 COMPUTE 流**(2026-10-17):写入的内容**就是下一步计算要读的状态**
+        // —— 放 H2D 流 = 与消费核无跨流序(回执只证明"主机侧知道已落地",
+        // 不证明消费流的核排在它之后)。与参数面同律:同流 FIFO 即结构性有序。
+        // (trait 默认实现的 in 腿本就指 Compute —— 此处原为单命令覆写,两套
+        // 规范已归位;推导见 common-dev-pitfall §51 同族。)
+        let stream = match self.ctx().stream(STREAM_COMPUTE) {
             Ok(s) => s.clone(),
             Err(e) => return ack.send(Err(e)),
         };
@@ -674,14 +694,14 @@ impl GpuServer {
             }
             cursor += p.len;
         }
-        // ② staging → 设备(H2D 流序逐片;末尾单 notify ⇒ ack = 全部落地)
+        // ② staging → 设备(COMPUTE 流序逐片;末尾单 notify ⇒ ack = 全部落地)
         let mut cursor = 0usize;
         for (i, p) in pieces.iter().enumerate() {
             if let Err(e) = self.ctx().check_range(p.block, p.dev_off, p.len, "swap-in") {
                 self.pool.put(staging);
                 return ack.send(Err(e));
             }
-            if let Err(e) = self.ctx_mut().wait_zeroing(p.block, STREAM_H2D) {
+            if let Err(e) = self.ctx_mut().wait_zeroing(p.block, STREAM_COMPUTE) {
                 self.pool.put(staging);
                 return ack.send(Err(e));
             }

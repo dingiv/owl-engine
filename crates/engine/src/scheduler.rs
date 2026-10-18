@@ -167,7 +167,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             self.turns.admit_wait = None;
             // **S2b(§28):turn 起借 GDN 行**(账在 store:行 = 活跃 turn 的资源;
             // 物理行号就是账里的行号 —— 一本账,不两份)。行耗尽 = 响亮拒
-            // (`Exhausted`;正常路径由准入面 `max_active_turns` 天花板先挡)。
+            // (`Exhausted`;正常路径由准入面 `gdn_slots` 天花板先挡)。
             let gdn_row = self.bank.rel.state.borrow_row()?;
             // E2c 复用形态:**PrefixHit(内容寻址,块链复用 + 快照恢复)/ Fresh(全量)**
             //
@@ -352,13 +352,15 @@ impl<D: DeviceClient> RunningEngine<D> {
                     // 其余 spec 态仍全零 = 生命周期收口纪律不动
                     bare_cost_ewma_ms: self.spec.carry_ms,
                     bare_cost_ctx: self.spec.carry_ctx,
+                    // 分母未测 ⇒ 本 turn 发播种裸步(见 TurnSpecState::bare_seed_left)
+                    bare_seed_left: if self.spec.carry_ms > 0.0 { 0 } else { crate::turn::SPEC_SEED_SAMPLES },
                     ..Default::default()
                 },
             });
         }
 
         // 相位决策:prompt 相位(块式 prefill;W1/PF1)优先
-        let act = self.turns.active.as_ref().expect("begin 或已有活跃");
+        let act = self.turns.active()?;
         if act.fed < act.prompt_ids.len() {
             let base = act.fed;
             let remaining = act.prompt_ids.len() - base;
@@ -376,8 +378,8 @@ impl<D: DeviceClient> RunningEngine<D> {
 
         // 生成相位:decode 单步 / 投机轮(host 派生量备齐 —— 物理槽/跨页增长)
         let (sid, token, pos) = {
-            let act = self.turns.active.as_ref().expect("活跃");
-            (act.session_id, *act.out.last().expect("生成中"), act.fed)
+            let act = self.turns.active()?;
+            (act.session_id, *act.out.last().ok_or_else(|| ModelError::EngineInvariant { what: "生成相位但 out 为空(相位判定漂移)".into() })?, act.fed)
         };
         // B4 自适应降级(§6.24):降级态发裸 Decode(草稿池逐 token 同步);
         // 每 probe_every 步发一轮真 SpecRound 探测(m≥1 → 解除降级,
@@ -385,12 +387,42 @@ impl<D: DeviceClient> RunningEngine<D> {
         // B4 三态在 ActiveTurn.spec(turn 生命周期;2026-10-10 收口)
         let spec = if self.spec.depth == 0 {
             0
-        } else if !self.turns.active.as_ref().expect("活跃").spec.spec_degraded {
-            self.spec.depth
-        } else if self.turns.active.as_ref().expect("活跃").spec.spec_steps_degraded
-            >= self.turns.active.as_ref().expect("活跃").spec.spec_probe_every
+        } else if !self.turns.active()?.spec.spec_degraded {
+            // **分母与 ctx 配对**(2026-10-17):裸步成本**并非** ctx 不变 ——
+            // 实测 24.1ms@pos564 → 41.7ms@32k(**+73%**);那条"±5%"的实测只
+            // 覆盖到 9k,2026-10-14 据此取消“ctx 换档作废分母”= 长 ctx 上分母
+            // 偏小 ⇒ 盈亏线偏高 ⇒ **把盈利档误降级**(32k:线 3.22 vs 真线 2.06,
+            // AL 2.25 ⇒ 实测 decode 24.5 t/s,而修后 38.0 t/s)。
+            // ⇒ **上行超 25% 即作废并重新播种**(播种 = 唯一实测重采路径);
+            // **下行不作废**:真实比在各档实测都是 1.86–2.06,而 [`BREAK_EVEN_MIN`]
+            // = 2.0 的下限把它卡住 ⇒ 陈旧的大分母对判据无影响(少发无谓播种步)。
+            {
+                let a = &mut self.turns.active_mut()?.spec;
+                if a.bare_cost_ctx > 0 && pos as f32 > a.bare_cost_ctx as f32 * 1.25 {
+                    a.bare_cost_ewma_ms = 0.0;
+                    a.bare_seed_left = crate::turn::SPEC_SEED_SAMPLES;
+                }
+            }
+            // **分母播种**:盈亏线的分母(裸步成本)只在降级期采样 ⇒ 新进程
+            // 首个窗口没分母(旧:兑底常量 2.5 ⇒ 长 ctx 误降级)。分母未测
+            // 时先跑 `SPEC_SEED_SAMPLES` 步裸 decode(合法产出)把它量出来。
+            let seed_due = {
+                let a = &self.turns.active()?.spec;
+                a.bare_cost_ewma_ms <= 0.0 && a.bare_seed_left > 0
+            };
+            if seed_due {
+                let a = &mut self.turns.active_mut()?.spec;
+                a.bare_seed_left -= 1;
+                a.bare_seed_step = true;
+                owl_shared::log_info!("spec-seed", "分母未测 ⇒ 本步发播种裸 decode(还欠 {} 步)", a.bare_seed_left);
+                0
+            } else {
+                self.spec.depth
+            }
+        } else if self.turns.active()?.spec.spec_steps_degraded
+            >= self.turns.active()?.spec.spec_probe_every
         {
-            self.turns.active.as_mut().expect("活跃").spec.spec_steps_degraded = 0;
+            self.turns.active_mut()?.spec.spec_steps_degraded = 0;
             self.spec.depth
         } else {
             0
@@ -399,7 +431,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             owl_iface::contract::ModelError::Msg("decode 相位:无活跃 turn(行号真源缺失)".into())
         })?;
         let (kv_slot, kv_slots, gdn_slot, grew) = {
-            let s = self.bank.sessions.get_mut(sid).expect("账在");
+            let s = self.bank.sessions.session_mut(sid)?;
             let need = pos + spec + 1;
             let before = s.block_table.len();
             self.bank.rel.leg.ensure_for_len(&mut s.block_table, need)?;
@@ -435,3 +467,5 @@ impl<D: DeviceClient> RunningEngine<D> {
         }
     }
 }
+
+

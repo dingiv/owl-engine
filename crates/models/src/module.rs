@@ -88,18 +88,6 @@ pub struct RopeTables<'a> {
     pub sin: &'a TensorOps,
 }
 
-/// **FI 断点面**(piecewise verify;`ctx.attn_fi` 在场 = 本树要把 FI 核移出图)。
-///
-/// 格子 = **宿主标量槽**:FI 的 plan key 含 `ctx_total`(每轮随 ctx 长),
-/// 烘死在节点里就只对一个 ctx 有效 ⇒ 引擎逐轮写这个 atomic,
-/// 驱动件在**回放期**把它补进核的契约槽(见 `interpreters::BreakDecl`)。
-/// 零设备流量、零 D2H。
-#[derive(Clone)]
-pub struct AttnFiBreak {
-    /// 每轮 `ctx_total`(= 本轮 kv 总长);引擎在 step 前写
-    pub ctx_total: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-}
-
 pub struct ForwardCtx<'a> {
     /// 本步 token 数(decode = 1;prefill = 块长)
     pub tokens: usize,
@@ -134,6 +122,15 @@ pub struct ForwardCtx<'a> {
     /// prefill:chunk 绝对起点(块首 token 的绝对 pos;split attention 的
     /// partition 网格声明需要 max_ctx = ctx_base + tokens;builder 缺省 0)
     pub ctx_base: usize,
+    /// **FI plan 的建树期 ctx**(`Some` = 覆盖 `ctx_base + tokens` 作为喂 FI 的
+    /// `ctx_total`,**只影响 FI 节点**,不动其它核 arg / 分派决策 / 拓扑)。
+    ///
+    /// 用途(2026-10-18 图档单图立案):FI 进捕获图时,喂进去的 `ctx_total` 被
+    /// **烘死** ⇒ 若沿用占位值(1),烘出的就是"ctx=1 的调度表"(plan 无 split /
+    /// chunk 数与运行期不符)。给桶上界 ⇒ 烘出的表按上界枚举工作项,运行期由
+    /// `chunk_start/end = min(.., kv_len)` 夹取;**T=1 实测与逐 ctx 表逐位同级**
+    /// (`fi_prefill_probe` 的 `FI_PF_PLAN_CTX` 腿)。`None` = 历史行为。
+    pub fi_plan_ctx: Option<usize>,
     /// FlashInfer prefill 面(**FI 恒启用**,engine 按池 dtype/paged 注入;
     /// None = 该轮不走 FI(非 paged 池 / 非 f16 / 小 chunk < FI_MIN_TOKENS))
     pub fi: Option<FiPrefillCtx<'a>>,
@@ -184,9 +181,7 @@ pub struct ForwardCtx<'a> {
     /// piecewise 把它移出捕获图、在段间 eager 重放(设计见
     /// `docs/piecewise-断点图-设计与实现.md`)。None = 非 piecewise
     /// (一次 `is_some()` 判,热路径零开销)。
-    pub attn_break: Option<std::rc::Rc<std::cell::RefCell<Vec<crate::interpreters::BreakDecl>>>>,
     /// **FI 断点面**(piecewise verify;None = 本树不换 FI 臂)
-    pub attn_fi: Option<AttnFiBreak>,
     /// **Q 输出槽**(B 轴 KVMem 选择层覆盖率探针;`Some` = 逐全注意力层把
     /// **post-RoPE** 的 Q 节点写进槽 `fi_kvi`)。形态同 `attn_break` ——
     /// 调用方建、调用方读,层只写。
@@ -219,6 +214,7 @@ impl<'a> ForwardCtx<'a> {
             kv_lens: None,
             gdn_slot: None,
             ctx_base: 0,
+            fi_plan_ctx: None,
             fi: None,
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
@@ -233,8 +229,6 @@ impl<'a> ForwardCtx<'a> {
             gdn_tap: None,
             vlm_image: None,
             vlm_rope: None,
-            attn_break: None,
-            attn_fi: None,
             q_sink: None,
         }
     }
@@ -259,6 +253,7 @@ impl<'a> ForwardCtx<'a> {
             kv_lens: None,
             gdn_slot: None,
             ctx_base: 0,
+            fi_plan_ctx: None,
             fi: None,
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
@@ -273,8 +268,6 @@ impl<'a> ForwardCtx<'a> {
             gdn_tap: None,
             vlm_image: None,
             vlm_rope: None,
-            attn_break: None,
-            attn_fi: None,
             q_sink: None,
         }
     }
@@ -294,6 +287,7 @@ impl<'a> ForwardCtx<'a> {
             kv_lens: None,
             gdn_slot: None,
             ctx_base: 0,
+            fi_plan_ctx: None,
             fi: None,
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
@@ -308,8 +302,6 @@ impl<'a> ForwardCtx<'a> {
             gdn_tap: None,
             vlm_image: None,
             vlm_rope: None,
-            attn_break: None,
-            attn_fi: None,
             q_sink: None,
         }
     }
@@ -333,6 +325,7 @@ impl<'a> ForwardCtx<'a> {
             kv_lens: None,
             gdn_slot: Some(gdn_slot),
             ctx_base: 0,
+            fi_plan_ctx: None,
             fi: None,
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
@@ -347,8 +340,6 @@ impl<'a> ForwardCtx<'a> {
             gdn_tap: None,
             vlm_image: None,
             vlm_rope: None,
-            attn_break: None,
-            attn_fi: None,
             q_sink: None,
         }
     }
@@ -375,6 +366,7 @@ impl<'a> ForwardCtx<'a> {
             kv_lens: Some(kv_lens),
             gdn_slot: None,
             ctx_base: 0,
+            fi_plan_ctx: None,
             fi: None,
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
@@ -389,8 +381,6 @@ impl<'a> ForwardCtx<'a> {
             gdn_tap: None,
             vlm_image: None,
             vlm_rope: None,
-            attn_break: None,
-            attn_fi: None,
             q_sink: None,
         }
     }
@@ -417,6 +407,7 @@ impl<'a> ForwardCtx<'a> {
             kv_lens: None,
             gdn_slot: None,
             ctx_base: 0,
+            fi_plan_ctx: None,
             fi: None,
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
@@ -431,8 +422,6 @@ impl<'a> ForwardCtx<'a> {
             gdn_tap: None,
             vlm_image: None,
             vlm_rope: None,
-            attn_break: None,
-            attn_fi: None,
             q_sink: None,
         }
     }
@@ -467,6 +456,7 @@ impl<'a> ForwardCtx<'a> {
             kv_lens: Some(kv_lens),
             gdn_slot: Some(gdn_slot),
             ctx_base,
+            fi_plan_ctx: None,
             fi,
             fi_kvi: 0,
             env: crate::env::EnvProvider::default(),
@@ -481,8 +471,6 @@ impl<'a> ForwardCtx<'a> {
             gdn_tap: None,
             vlm_image: None,
             vlm_rope: None,
-            attn_break: None,
-            attn_fi: None,
             q_sink: None,
         }
     }
@@ -624,51 +612,73 @@ pub trait Module {
 // §2 数据源:执行器的取数对象(测试 HashMap / 将来 safetensors / 层内表)
 // ============================================================================
 
+/// **取值三态**(2026-10-17 审查 §③:错误面升 `Result`)。
+///
+/// 为什么不能只用 `Option`:`None` 要同时表达"**正常语义**"与"**真错误**",
+/// 结果把 mmap/打包/索引失败全压成"数据源缺键"(假归因) ——
+/// 现场:`AwqSource::build_linear` 的 `Result` 被 `.ok()?` 抹平,
+/// 运维看到"缺键"去查键名,真因可能是坏分片。
+///
+/// - `Ok(Some(v))` —— 拿到了;
+/// - `Ok(None)` —— **正常语义**:键不归我管 / 区间越界 / 该口未实现
+///   (调用方收割为缺键/形状错,**不许 panic**,见各口 doc);
+/// - `Err(e)` —— **真错误**:读失败 / 打包失败 / 索引损坏 / 锁中毒 ⇒
+///   响亮上抛到装载入口(全链顶层恒为 `Result<_, ModelError>`)。
+pub type Taken<T> = Result<Option<T>, ModelError>;
+
 /// 权重数据源(流式,2026-09-26 M-e:查键即**取走所有权** ——
 /// 数据经变换/上传后随宿主消亡,源驻留随装载单调下降,主机上永远
 /// 只有"在途"的一份;同键多 Want(tied 双槽)由装载域按键分组,
 /// 一次 take 供全组)。
 pub trait WeightSource {
-    fn take(&self, key: &str) -> Option<Vec<f32>>;
+    fn take(&self, key: &str) -> Taken<Vec<f32>>;
 
     /// 区间取数(流式大张量:分块转换上传,主机在途 = 单块)。
     /// 默认 = 整取切片;流式源(mmap)覆写为按需转换区间,且
     /// **不移除条目**(同一键的多块重复取)。
-    fn take_range(&self, key: &str, offset_elems: usize, len: usize) -> Option<Vec<f32>> {
-        // 越界 = None(调用方收割为缺键/形状错;禁 panic)
+    fn take_range(&self, key: &str, offset_elems: usize, len: usize) -> Taken<Vec<f32>> {
+        // 越界 = `Ok(None)`(调用方收割为缺键/形状错;禁 panic)
         let v = self.take(key)?;
-        v.get(offset_elems..offset_elems + len).map(<[f32]>::to_vec)
+        Ok(v.and_then(|v| v.get(offset_elems..offset_elems + len).map(<[f32]>::to_vec)))
     }
 
-    /// 键的元素数(错误归因用:缺键 vs 长度不符;默认 None = 未知)
-    fn elem_len(&self, _key: &str) -> Option<usize> {
-        None
+    /// 键的元素数(错误归因用:缺键 vs 长度不符;默认 `Ok(None)` = 未知)
+    fn elem_len(&self, _key: &str) -> Taken<usize> {
+        Ok(None)
     }
 
-    /// **源天然元素 dtype**(原始字节通道可用时;None = 无原始通道 ⇒
+    /// **源天然元素 dtype**(原始字节通道可用时;`Ok(None)` = 无原始通道 ⇒
     /// 走元素转换路径)。供"原始字节上卡 + 设备端转换"臂判定
     /// (2026-10-16 装载提速:CPU 只 memcpy,转换挪到 GPU)。
-    fn native_dtype(&self, _key: &str) -> Option<Dtype> {
-        None
+    ///
+    /// ⚠️ **当前消费集 = 仅 `Some(Dtype::BF16)`**(`load.rs` 两处:暂存槽 sizing 与
+    /// 设备 cast 臂门)—— 实现里返回的 F32/F16 是**源的事实陈述**,不是已接线的能力;
+    /// 谁要用这两档,必须连带把消费侧(臂条件)一起改,并补"两臂逐位一致"的门。
+    /// 2026-10-17 审查 §55:接口宽于消费集 ⇒ 此处写实,防后来者把它当"已实现"。
+    fn native_dtype(&self, _key: &str) -> Taken<Dtype> {
+        Ok(None)
     }
 
     /// 原始字节区间直拷(零元素转换;`dst.len() ≥ len × 天然宽度`)。
     /// 上卡后由设备 cast 核完成 dtype 转换 —— 本口只保证"字节原样"。
-    /// 默认 None = 不支持(调用方回退到 [`Self::convert_chunk_into_bytes`])。
+    /// `Ok(None)` = 不支持(调用方回退到 [`Self::convert_chunk_into_bytes`])。
     fn copy_native_into(
         &self,
         _key: &str,
         _offset_elems: usize,
         _len: usize,
         _dst: &mut [u8],
-    ) -> Option<()> {
-        None
+    ) -> Taken<()> {
+        Ok(None)
     }
 
     /// 分块转换**直写**目标缓冲(2026-09-26 二拷贝预算:转换这 1 次
     /// 直达 pinned 租约,不再有中间 Vec;流式源覆写为 mmap 直解码)。
     /// f16 基线尾批:字节口径 + dtype 参数化 —— F32 写 f32 LE、F16 写
     /// half LE;流式源(BF16 条目)直写,免 f32 中间 Vec。
+    ///
+    /// `dst` 太小 = **调用方违约**,响亮拒(旧版返回 `None` ⇒ 被上层
+    /// 收成"缺键",假归因);`Ok(None)` 只留给"目标 dtype 不支持"。
     fn convert_chunk_into_bytes(
         &self,
         key: &str,
@@ -676,51 +686,46 @@ pub trait WeightSource {
         len: usize,
         dst: &mut [u8],
         dtype: Dtype,
-    ) -> Option<()> {
-        let v = self.take_range(key, offset_elems, len)?;
-        match dtype {
-            Dtype::F32 => {
-                if dst.len() < len * 4 {
-                    return None;
-                }
-                for (i, f) in v.iter().enumerate() {
-                    dst[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
-                }
-                Some(())
-            }
-            Dtype::F16 => {
-                if dst.len() < len * 2 {
-                    return None;
-                }
-                for (i, f) in v.iter().enumerate() {
-                    dst[i * 2..i * 2 + 2].copy_from_slice(&half::f16::from_f32(*f).to_le_bytes());
-                }
-                Some(())
-            }
-            Dtype::BF16 => {
-                // BF16 want(E5-DF3 同日十四;DFlash2 草稿 BF16 面测试源)
-                if dst.len() < len * 2 {
-                    return None;
-                }
-                for (i, f) in v.iter().enumerate() {
-                    dst[i * 2..i * 2 + 2].copy_from_slice(&half::bf16::from_f32(*f).to_le_bytes());
-                }
-                Some(())
-            }
-            _ => None,
+    ) -> Taken<()> {
+        let Some(v) = self.take_range(key, offset_elems, len)? else {
+            return Ok(None);
+        };
+        let need = match dtype {
+            Dtype::F32 => len * 4,
+            Dtype::F16 | Dtype::BF16 => len * 2,
+            _ => return Ok(None),
+        };
+        if dst.len() < need {
+            return Err(ModelError::Msg(format!(
+                "convert_chunk_into_bytes: dst {}B < 需 {need}B({dtype:?}, len {len})",
+                dst.len()
+            )));
         }
+        for (i, f) in v.iter().enumerate() {
+            match dtype {
+                Dtype::F32 => dst[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes()),
+                Dtype::F16 => {
+                    dst[i * 2..i * 2 + 2].copy_from_slice(&half::f16::from_f32(*f).to_le_bytes())
+                }
+                Dtype::BF16 => {
+                    dst[i * 2..i * 2 + 2].copy_from_slice(&half::bf16::from_f32(*f).to_le_bytes())
+                }
+                _ => unreachable!("上面已筛过 dtype"),
+            }
+        }
+        Ok(Some(()))
     }
 }
 
 /// Arc 转发(F5-3:并行装载所有权入任务;全方法直通内层)
 impl<S: WeightSource + ?Sized> WeightSource for std::sync::Arc<S> {
-    fn take(&self, key: &str) -> Option<Vec<f32>> {
+    fn take(&self, key: &str) -> Taken<Vec<f32>> {
         (**self).take(key)
     }
-    fn take_range(&self, key: &str, offset_elems: usize, len: usize) -> Option<Vec<f32>> {
+    fn take_range(&self, key: &str, offset_elems: usize, len: usize) -> Taken<Vec<f32>> {
         (**self).take_range(key, offset_elems, len)
     }
-    fn elem_len(&self, key: &str) -> Option<usize> {
+    fn elem_len(&self, key: &str) -> Taken<usize> {
         (**self).elem_len(key)
     }
     fn convert_chunk_into_bytes(
@@ -730,17 +735,17 @@ impl<S: WeightSource + ?Sized> WeightSource for std::sync::Arc<S> {
         len: usize,
         dst: &mut [u8],
         dtype: Dtype,
-    ) -> Option<()> {
+    ) -> Taken<()> {
         (**self).convert_chunk_into_bytes(key, offset_elems, len, dst, dtype)
     }
 }
 
 impl WeightSource for std::collections::HashMap<String, Vec<f32>> {
-    fn take(&self, key: &str) -> Option<Vec<f32>> {
-        self.get(key).cloned()
+    fn take(&self, key: &str) -> Taken<Vec<f32>> {
+        Ok(self.get(key).cloned())
     }
-    fn elem_len(&self, key: &str) -> Option<usize> {
-        self.get(key).map(|v| v.len())
+    fn elem_len(&self, key: &str) -> Taken<usize> {
+        Ok(self.get(key).map(|v| v.len()))
     }
 }
 
@@ -756,12 +761,12 @@ impl<'a> TableSource<'a> {
 }
 
 impl WeightSource for TableSource<'_> {
-    fn take(&self, key: &str) -> Option<Vec<f32>> {
-        self.entries.iter().find(|(k, _)| *k == key).map(|(_, v)| v.to_vec())
+    fn take(&self, key: &str) -> Taken<Vec<f32>> {
+        Ok(self.entries.iter().find(|(k, _)| *k == key).map(|(_, v)| v.to_vec()))
     }
 
-    fn elem_len(&self, key: &str) -> Option<usize> {
-        self.entries.iter().find(|(k, _)| *k == key).map(|(_, v)| v.len())
+    fn elem_len(&self, key: &str) -> Taken<usize> {
+        Ok(self.entries.iter().find(|(k, _)| *k == key).map(|(_, v)| v.len()))
     }
 
     /// 表即 host f32:直接切片转写字节 —— F16 走 crate::f16c(F16C 单
@@ -774,29 +779,41 @@ impl WeightSource for TableSource<'_> {
         len: usize,
         dst: &mut [u8],
         dtype: Dtype,
-    ) -> Option<()> {
-        let v = self.entries.iter().find(|(k, _)| *k == key)?.1;
-        let src = v.get(offset_elems..offset_elems + len)?;
+    ) -> Taken<()> {
+        let Some(v) = self.entries.iter().find(|(k, _)| *k == key).map(|(_, v)| *v) else {
+            return Ok(None);
+        };
+        let Some(src) = v.get(offset_elems..offset_elems + len) else {
+            return Ok(None);
+        };
         match dtype {
             Dtype::F16 => {
                 if dst.len() < len * 2 {
-                    return None;
+                    return Err(ModelError::Msg(format!(
+                        "convert_chunk_into_bytes(表源): dst {}B < 需 {}B",
+                        dst.len(),
+                        len * 2
+                    )));
                 }
                 crate::f16c::f32_slice_to_f16_bytes(src, &mut dst[..len * 2]);
-                Some(())
+                Ok(Some(()))
             }
             Dtype::F32 => {
                 if dst.len() < len * 4 {
-                    return None;
+                    return Err(ModelError::Msg(format!(
+                        "convert_chunk_into_bytes(表源): dst {}B < 需 {}B",
+                        dst.len(),
+                        len * 4
+                    )));
                 }
                 // LE 主机:f32 位型即 LE 字节 —— 整块 memcpy(逐元素
                 // to_le_bytes 循环在 debug 档 ~25ns/elem,曾占 211ms)
                 let bytes =
                     unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u8, len * 4) };
                 dst[..len * 4].copy_from_slice(bytes);
-                Some(())
+                Ok(Some(()))
             }
-            _ => None,
+            _ => Ok(None),
         }
     }
 }
@@ -857,12 +874,34 @@ pub(crate) fn f32b(v: &[f32]) -> Vec<u8> {
 pub struct SlotCell(Arc<Mutex<Option<Bytes>>>);
 
 impl SlotCell {
+    /// **锁取用口**(2026-10-17 审查 §六轮,按判例 §52 两分法定档)。
+    ///
+    /// 载荷 = 单 `Option<Bytes>`(空包 → 装载产物句柄),**写入是单次 move**
+    /// ⇒ 持锁线程 panic 不会留下"半写"状态;且中毒**粘性**(`lock()` 之后恒
+    /// Err)⇒ 取值 = 就地取回 + **复位毒标** + 告警(恢复可见、且不每取一次
+    /// 走一遍恢复分支)。档位 = **可安全恢复**(非消费式状态,与 safetensors
+    /// 的索引相反 —— 那里必须响亮拒)。
+    fn guard(&self) -> std::sync::MutexGuard<'_, Option<Bytes>> {
+        match self.0.lock() {
+            Ok(g) => g,
+            Err(p) => {
+                let g = p.into_inner();
+                owl_shared::log_warn!(
+                    "load",
+                    "SlotCell 锁中毒:就地取回(单 Option 载荷,无半写风险)并复位毒标"
+                );
+                self.0.clear_poison();
+                g
+            }
+        }
+    }
+
     fn deliver(&self, b: Bytes) {
-        *self.0.lock().unwrap() = Some(b);
+        *self.guard() = Some(b);
     }
 
     fn loaded(&self) -> Option<Bytes> {
-        self.0.lock().unwrap().clone()
+        self.guard().clone()
     }
 }
 
@@ -1107,6 +1146,11 @@ pub struct Weight {
     shape: Shape,
     transposed: bool,
     cell: SlotCell,
+    /// **尺度槽随激活臂**(2026-10-16 定谳):true ⇒ 装载声明由 `LoaderCtx.dtype`
+    /// 决定(BF16 模型 ⇒ BF16,否则 F16)。为什么必须随臂:C 侧 marlin
+    /// `s_type = c_type`(激活类型)⇒ bf16 臂**吃 bf16 值的尺度**,
+    /// 而 f16 臂吃 f16 —— 声明必须等于事实(不许"声明 F16、内容 bf16")。
+    scales_arm: bool,
     /// 装载 dtype(F5 整模切换):layout 期从 LoaderCtx 写入,decl 按此
     /// 出声明 —— 默认 F32(CPU 单元面);f16 模型经 LoaderCtx 自动跟随,
     /// 层构造器零涟漪(Cell 内部可变;Weight 使用面恒 &self)
@@ -1126,6 +1170,7 @@ impl Weight {
             cell: SlotCell::default(),
             dtype: std::cell::Cell::new(Dtype::F32),
             dtype_override: None,
+            scales_arm: false,
         }
     }
 
@@ -1139,6 +1184,7 @@ impl Weight {
             cell: SlotCell::default(),
             dtype: std::cell::Cell::new(dtype),
             dtype_override: Some(dtype),
+            scales_arm: false,
         }
     }
 
@@ -1152,10 +1198,27 @@ impl Weight {
         Self::new_typed(key, shape, Dtype::F16)
     }
 
+    /// **量化尺度槽**:声明**随激活臂**(bf16 模型 ⇒ BF16;否则 F16)。
+    ///
+    /// 判据(C 侧 `marlin_host.cu`: `s_type = c_type`):bf16 激活 ⇒ bf16 值的
+    /// 尺度;f16 激活 ⇒ f16 值的尺度。声明与实际不符就是"影子口径",
+    /// 任何按声明解字节的读者都会静默错值(2026-10-16 立案)。
+    pub fn new_typed_scales(key: &'static str, shape: Shape) -> Self {
+        Self {
+            key,
+            shape,
+            transposed: false,
+            cell: SlotCell::default(),
+            dtype: std::cell::Cell::new(Dtype::F16),
+            dtype_override: None,
+            scales_arm: true,
+        }
+    }
+
     /// 转置权重:源 [rows, cols] 行主序 → 装载声明 [cols, rows]
     /// (Linear 惯例:forward 直 matmul,decode 零转置)
     pub fn new_transposed(key: &'static str, rows: usize, cols: usize) -> Self {
-        Self { key, shape: vec![cols, rows], transposed: true, cell: SlotCell::default(), dtype: std::cell::Cell::new(Dtype::F32), dtype_override: None }
+        Self { key, shape: vec![cols, rows], transposed: true, cell: SlotCell::default(), dtype: std::cell::Cell::new(Dtype::F32), dtype_override: None, scales_arm: false }
     }
 
     /// 装载生命周期:按语境声明需求(元数据直出 + 回填口;零 src 零数据)
@@ -1168,7 +1231,12 @@ impl Weight {
     pub(crate) fn layout_as(&self, key: impl Into<String>, ctx: &LoaderCtx) -> LoaderOps {
         // decl 与装载同源(F5 整模切换);dtype_override = 量化臂钉死
         // (E3:qweight U32 / scales F16 不随整模 dtype 漂移)
-        let dtype = self.dtype_override.unwrap_or(ctx.dtype);
+        let dtype = if self.scales_arm {
+            // 尺度槽:bf16 臂 ⇒ BF16、f16 臂 ⇒ F16(其余含 F32 单元面落 F16)
+            if ctx.dtype == Dtype::BF16 { Dtype::BF16 } else { Dtype::F16 }
+        } else {
+            self.dtype_override.unwrap_or(ctx.dtype)
+        };
         self.dtype.set(dtype);
         LoaderOps::want(Want {
             key: key.into(),
@@ -1249,8 +1317,10 @@ pub async fn load_weight<D: DeviceClient, S: WeightSource + ?Sized>(
     let key = weight.key;
 
     // 1. 取数:容器内表没有(表走 layout 清单),数据槽直查源(取走所有权)
+    // 三态(2026-10-17 审查 §③):`Err` = 源的真错误,**先上抛**(不再被收成"缺键");
+    // `Ok(None)` 才是"缺键"正常语义
     let data = src
-        .take(key)
+        .take(key)?
         .ok_or_else(|| ModelError::Msg(format!("Weight '{key}': 数据源缺键")))?;
 
     // 2. 长度校验 + 布局变换 → (装载形状, LE 字节)

@@ -26,15 +26,18 @@ use owl_shared::config::OwlConfig;
 use owl_macros::owl_test;
 use owl_iface::contract::DeviceClient;
 
-/// **piecewise 段驱动件门**(2026-10-15;A4)—— **不装模型**,纯 `GraphPlan` 面。
+/// **单图捕获 + 双回放门**(原 piecewise 段驱动件门;2026-10-18 W5 改单图)——
+/// **不装模型**,纯 `GraphPlan` 面。
 ///
-/// 判据(与设计 `docs/piecewise-断点图-设计与实现.md` §7 P2 同源):
-/// ① 捕获成功且**段/断点数与声明一致**;
-/// ② **回放两次值一致**(跨段地址接力 + 可重复);
-/// ③ 断点的钉块由驱动件按声明形状分配 ⇒ 两期同址(值由断点算子写入)。
+/// 判据:
+/// ① 捕获成功(`PlanOutcome::Captured`);
+/// ② **回放两次值一致**(图回放可重复);
+/// ③ **引用计数推送面在场**(全量记名/OOM dump 的"它凭什么是活的"数据源):
+///    warmup 探针窗内 `refs_pushed > 0` —— 判据用**计数器**而非日志
+///    (日志受级别过滤;计数是机械事实)。
 ///
-/// 树:`y = x + c`(段0)→ `brk = y + y`(**断点**;窗外)→ `out = brk + c`(尾段)。
-pub async fn gpu_piecewise_segments() {
+/// 树:`y = x + c → out = y + c`(x=c=1 ⇒ out=3)。
+pub async fn gpu_single_graph_capture_and_replay() {
     let Some(ordinal) = gpu_ordinal() else {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
@@ -48,7 +51,7 @@ pub async fn gpu_piecewise_segments() {
     );
     let face = owl_cuda::GpuClient::new(tx);
     std::thread::Builder::new()
-        .name("owl-pw-test".into())
+        .name("owl-graph-test".into())
         .spawn(move || server.run().expect("server run 异常退出"))
         .expect("起 server 线程失败");
 
@@ -67,46 +70,41 @@ pub async fn gpu_piecewise_segments() {
     let forward = |sc: &crate::graph_plan::PlanCtx| -> Result<(), owl_iface::contract::ModelError> {
         let x = sc.input("x")?;
         let c = sc.input("c")?;
-        let y = x.add(&c); // 段0
-        let brk = y.add(&y); // 断点(窗外重放)
-        sc.break_node(&brk)?;
-        let out = brk.add(&c); // 尾段
+        let y = x.add(&c);
+        let out = y.add(&c);
         sc.output("out", &out)
     };
-    let (mut plan, outcome) = crate::graph_plan::GraphPlan::plan_piecewise(
+    let (mut plan, outcome) = crate::graph_plan::GraphPlan::plan(
         face,
         owl_models::env::EnvProvider::default(),
         desc,
-        true,
         forward,
     )
     .await
-    .expect("plan_piecewise");
+    .expect("plan");
     assert!(
         matches!(outcome, crate::graph_plan::PlanOutcome::Captured),
         "应捕获,得 {outcome:?}"
     );
-    assert_eq!(plan.piecewise_shape(), (2, 1), "应两段一断点");
-    // 回放 ×2:x=1,c=1 ⇒ y=2 ⇒ brk=4 ⇒ out=5
+    // 回放 ×2:x=1,c=1 ⇒ y=2 ⇒ out=3
     for i in 0..2 {
         let xs = [1.0f32; 4];
         plan.step(&[("x", &xs)]).await.expect("step");
         let v = plan.read_output_f32("out").await.expect("read out");
         assert!(
-            v.iter().all(|x| (x - 5.0).abs() < 1e-4),
-            "回放 #{i} 值应 5.0,得 {v:?}"
+            v.iter().all(|x| (x - 3.0).abs() < 1e-4),
+            "回放 #{i} 值应 3.0,得 {v:?}"
         );
     }
     // **引用计数推送面**(全量记名同轮;2026-10-16):图 plan 的 warmup 探针窗内,
-    // 求值器必须把 `(users, pending)` 推给探针 —— "它凭什么是活的"的数据源。
-    // 判据用**计数器**而非日志(日志受级别过滤;计数是机械事实)。窗口在 plan
-    // 内部 `probe_on/off`,on 时清零 ⇒ 此处读到的是本次 plan 的推送量。
+    // 求值器必须把 `(users, pending)` 推给探针。窗口在 plan 内部 `probe_on/off`,
+    // on 时清零 ⇒ 此处读到的是本次 plan 的推送量。
     let pushed = owl_shared::slab_hint::refs_pushed();
     assert!(
         pushed > 0,
-        "两段计划跑完后引用计数推送为 0 ⇒ 数据源断了(记名/OOM dump 的\"为什么活着\"面失效)"
+        "单图计划跑完后引用计数推送为 0 ⇒ 数据源断了(记名/OOM dump 的\"为什么活着\"面失效)"
     );
-    eprintln!("[piecewise] 两段一断点捕获 + 双回放 值一致 ✓(引用计数推送 {pushed} 次)");
+    eprintln!("[graph] 单图捕获 + 双回放 值一致 ✓(引用计数推送 {pushed} 次)");
 }
 
 fn asset_dir() -> std::path::PathBuf {
@@ -771,7 +769,7 @@ async fn select_decode_scenario() {
         // 本场景是**单会话对照**(三臂各自一个新引擎)⇒ 并发上限取 1:
         // 取 flavor 的 2 会让池下限 2×(38+16)=108 页 > 池 64 页 ⇒ 被 boot 拒
         // (§8.27 的池下限算式**按并发乘**——这正是它该干的事)
-        cfg.knobs.max_active_turns = 1;
+        cfg.knobs.gdn_slots = 1;
         if mode == "partial" {
             // §8.29 定谳:`select_partial` 靠"缓存树 + 会话双持(refs==2)"才能下沉 ⇒
             // `prefix_cache` 必须开(关着 boot 会响亮拒;dev-08b 的 false 是
@@ -1245,7 +1243,7 @@ fn stage_in_config(ordinal: usize) -> EngineConfig {
     // (`reuse_face` 要求边界有快照 ⇒ 没它复用面会被裁到 0,回灌永不发生)
     knobs.snap_host_mb = 32;
     knobs.snap_max = 8;
-    knobs.max_active_turns = 8;
+    knobs.gdn_slots = 8;
     EngineConfig { device_ordinal: ordinal, max_seq_tokens: 512, prefill_chunk: 64, knobs }
 }
 
@@ -1310,7 +1308,7 @@ async fn select_27b_scenario() {
     .expect("构造");
     let loaded = engine
         .loader()
-        .load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16, false)
+        .load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16, owl_models::module::QuantPlan::W4A16Awq)
         .await
         .expect("27B 装载");
     let mut running = engine.run(loaded).await.expect("装配");
@@ -1438,7 +1436,7 @@ pub async fn cpu_mock_index_probe() {
 fn index_probe_config(ordinal: usize) -> EngineConfig {
     let mut knobs = EngineKnobs { sampler_enabled: false, ..Default::default() };
     knobs.pool_tokens = Some(256);
-    knobs.max_active_turns = 8;
+    knobs.gdn_slots = 8;
     knobs.index_probe = true;
     // 索引账落在 store 的 **host 层总账**上(与 KV/快照分片共用总账;
     // 索引自己的淘汰序 = 近期 + 累积频率,见 `MeanKIndex::evict_candidates`)
@@ -1680,7 +1678,7 @@ pub async fn gpu_08b_budget_probe() {
     snapshot("③run 后");
 
     // 池几何先**拷出来**(下面要 &mut running 跑 turn;借用不重叠)
-    let (nb, nb_kv, page, n_full, n_gdn, kv_fp8, max_active_turns, snap_slots, paged) = {
+    let (nb, nb_kv, page, n_full, n_gdn, kv_fp8, gdn_slots, snap_slots, paged) = {
         let pool = &running.pool;
         (
             pool.nb,
@@ -1689,7 +1687,7 @@ pub async fn gpu_08b_budget_probe() {
             pool.kvs.len(),
             pool.gdn_count(),
             pool.kv_fp8,
-            pool.max_active_turns,
+            pool.gdn_slots,
             pool.snap_capacity(),
             pool.paged,
         )
@@ -1699,7 +1697,7 @@ pub async fn gpu_08b_budget_probe() {
         (pool.block_bytes(), pool.gdn_row_bytes())
     };
     let kv_pool = (nb_kv * block_bytes) as u64;
-    let gdn_pool = (max_active_turns * gdn_row_bytes) as u64;
+    let gdn_pool = (gdn_slots * gdn_row_bytes) as u64;
     let (snap_pool, draft_pool) = {
         let pool = &running.pool;
         (pool.snapshot_pool_bytes() as u64, pool.draft_pool_bytes() as u64)
@@ -1711,8 +1709,8 @@ pub async fn gpu_08b_budget_probe() {
         .saturating_sub(kv_pool + gdn_pool + snap_pool + draft_pool);
 
     eprintln!(
-        "[budget] 池几何 nb={} nb_kv={} page={} n_full={} n_gdn={} kv_fp8={} max_active_turns={} snap_slots={} paged={}",
-        nb, nb_kv, page, n_full, n_gdn, kv_fp8, max_active_turns, snap_slots, paged
+        "[budget] 池几何 nb={} nb_kv={} page={} n_full={} n_gdn={} kv_fp8={} gdn_slots={} snap_slots={} paged={}",
+        nb, nb_kv, page, n_full, n_gdn, kv_fp8, gdn_slots, snap_slots, paged
     );
     eprintln!(
         "[budget] 导出 kv_bytes_per_token={kv_per_tok}B({}KiB) gdn_row={:.2}MiB gdn_pool={:.2}MiB snap_pool={:.2}MiB draft_pool={:.2}MiB",
@@ -2293,7 +2291,7 @@ pub async fn gpu_awq27b_marlin_e2e(shared: Option<&mut RunningEngine<owl_cuda::G
         .expect("构造");
         let loaded = engine
             .loader()
-            .load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16, false)
+            .load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16, owl_models::module::QuantPlan::W4A16Awq)
             .await
             .expect("27B AWQ 装载");
             own = engine.run(loaded).await.expect("装配");
@@ -2577,7 +2575,7 @@ pub async fn gpu_27b_chat_inference(shared: Option<&mut RunningEngine<owl_cuda::
         .expect("构造");
         let loaded = engine
             .loader()
-            .load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16, false)
+            .load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16, owl_models::module::QuantPlan::W4A16Awq)
             .await
             .expect("27B AWQ 装载");
             own = engine.run(loaded).await.expect("装配");
@@ -2711,7 +2709,7 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
     let t_load = std::time::Instant::now();
     let loaded = engine
         .loader()
-        .load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16, false)
+        .load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16, owl_models::module::QuantPlan::W4A16Awq)
         .await
         .expect("27B AWQ 装载");
     eprintln!("[e2e] 27B 权重装载 {:?}", t_load.elapsed());
@@ -2737,7 +2735,7 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
             device_ordinal: ordinal, max_seq_tokens: 512, prefill_chunk: 128,
             knobs: EngineKnobs::default(),
         }).expect("构造");
-        let loaded = engine.loader().load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16, false).await.expect("装载");
+        let loaded = engine.loader().load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16, owl_models::module::QuantPlan::W4A16Awq).await.expect("装载");
         let mut running = engine.run(loaded).await.expect("装配");
         for (qi, q) in ["中国的首都是北京。长城是", "1 2 3 4 5 6"].iter().enumerate() {
             let id = running.submit(*q, 48).expect("submit");
@@ -2780,12 +2778,13 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
                 knobs.draft.depth = 3;
                 knobs.draft.dumb = true;
             }
-            // piecewise A/B 臂(2026-10-15 perf 会话;恒等门用)
-            // **piecewise + FI 断点臂**(2026-10-16 转正门:"断点臂不破文本"红线)——
-            // spec(断点臂)与 baseline(spec_depth=0)贪心 token 流必须逐位一致:
-            // 覆盖"FI 四件套走输入槽 + ctx_total 宿主标量槽 + 段间 eager 重放"全链
+            // **FI 图内臂恒等门**(W5:piecewise/断点面已退役 ⇒ 臂 = 单图 + 窗外刷表)。
+            // spec(verify FI 图内臂)与 baseline(spec_depth=0)贪心 token 流必须逐位
+            // 一致:覆盖"FI 四件套走输入槽 + `ctx_total` 烘上界 + 每步/每轮
+            // `fi_plan_sync` 刷精确表"全链。(env 名保留历史拼写:`OWL_GATE_PIECEWISE`)
             if owl_shared::env_reader::flag("OWL_GATE_PIECEWISE") {
-                knobs.env.attn.verify_piecewise = true;
+                knobs.fi_cuda_graph = true;
+                knobs.fi_plan_bake = Some(128); // ≥ max_seq(本门 max_seq_tokens=128)
                 knobs.env.attn.verify_fi = true;
                 knobs.env.attn.verify_xqa = false;
                 knobs.env.attn.verify_v2 = false;
@@ -2871,18 +2870,19 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
         async fn boot_gate_engine(ordinal: usize, dir: &str) -> RunningEngine<owl_cuda::GpuClient> {
             let mut knobs = EngineKnobs { sampler_enabled: false, ..Default::default() };
             // 24G 贴顶三旋钮(单会话门不需要多格/多快照/前缀缓存)
-            knobs.max_active_turns = 1;
+            knobs.gdn_slots = 1;
             knobs.snap_max = 1;
             knobs.prefix_cache = false;
             // 草稿档一律按投机配置 boot;baseline 轮靠运行时 spec_depth=0 回落
             knobs.draft.depth = 3;
             knobs.cuda.capture_slab_mb = Some(160);
-            // piecewise A/B 臂(2026-10-15 perf 会话;恒等门用)
-            // **piecewise + FI 断点臂**(2026-10-16 转正门:"断点臂不破文本"红线)——
-            // spec(断点臂)与 baseline(spec_depth=0)贪心 token 流必须逐位一致:
-            // 覆盖"FI 四件套走输入槽 + ctx_total 宿主标量槽 + 段间 eager 重放"全链
+            // **FI 图内臂恒等门**(W5:piecewise/断点面已退役 ⇒ 臂 = 单图 + 窗外刷表)。
+            // spec(verify FI 图内臂)与 baseline(spec_depth=0)贪心 token 流必须逐位
+            // 一致:覆盖"FI 四件套走输入槽 + `ctx_total` 烘上界 + 每步/每轮
+            // `fi_plan_sync` 刷精确表"全链。(env 名保留历史拼写:`OWL_GATE_PIECEWISE`)
             if owl_shared::env_reader::flag("OWL_GATE_PIECEWISE") {
-                knobs.env.attn.verify_piecewise = true;
+                knobs.fi_cuda_graph = true;
+                knobs.fi_plan_bake = Some(2048); // ≥ max_seq(本门 max_seq_tokens=2048)
                 knobs.env.attn.verify_fi = true;
                 knobs.env.attn.verify_xqa = false;
                 knobs.env.attn.verify_v2 = false;
@@ -2898,7 +2898,7 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
             .expect("构造");
             let loaded = engine
                 .loader()
-                .load_qwen38_27b_awq(std::path::Path::new(dir), std::path::Path::new(dir), owl_models::module::QuantPlan::F16, false)
+                .load_qwen38_27b_awq(std::path::Path::new(dir), std::path::Path::new(dir), owl_models::module::QuantPlan::F16, owl_models::module::QuantPlan::W4A16Awq)
                 .await
                 .expect("装载");
             engine.run(loaded).await.expect("装配")
@@ -2976,7 +2976,7 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
             max_new: usize,
         ) -> RunningEngine<owl_cuda::GpuClient> {
             let mut knobs = EngineKnobs { sampler_enabled: false, ..Default::default() };
-            knobs.max_active_turns = 1;
+            knobs.gdn_slots = 1;
             knobs.snap_max = 1;
             knobs.prefix_cache = false;
             // 草稿档一律按**投机**配置 boot(深度 + verify 捕获档);
@@ -3020,7 +3020,7 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
             .expect("构造");
             let loaded = engine
                 .loader()
-                .load_qwen38_27b_awq(std::path::Path::new(dir), std::path::Path::new(dir), head_plan, false)
+                .load_qwen38_27b_awq(std::path::Path::new(dir), std::path::Path::new(dir), head_plan, owl_models::module::QuantPlan::W4A16Awq)
                 .await
                 .expect("装载");
             let running = engine.run(loaded).await.expect("装配");
@@ -3188,7 +3188,7 @@ pub async fn gpu_gdn_slot_cross_probe() {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
     };
-    let mut knobs = EngineKnobs { max_active_turns: 2, ..Default::default() };
+    let mut knobs = EngineKnobs { gdn_slots: 2, ..Default::default() };
     knobs.prefix_cache = false;
     let mut engine = Engine::new(EngineConfig {
         device_ordinal: ordinal,
@@ -3238,7 +3238,7 @@ pub async fn gpu_decode_marginal_bench() {
     // 口径与恒等门一致(greedy 单会话三旋钮,显式 knobs)
     async fn gen(ordinal: usize, dir: &str, max_new: usize) -> (f64, usize) {
         let mut knobs = EngineKnobs { sampler_enabled: false, ..Default::default() };
-        knobs.max_active_turns = 1;
+        knobs.gdn_slots = 1;
         knobs.snap_max = 1;
         knobs.prefix_cache = false;
         let mut engine = Engine::new(EngineConfig {
@@ -3250,7 +3250,7 @@ pub async fn gpu_decode_marginal_bench() {
         .expect("构造");
         let loaded = engine
             .loader()
-            .load_qwen38_27b_awq(std::path::Path::new(dir), std::path::Path::new(dir), owl_models::module::QuantPlan::F16, false)
+            .load_qwen38_27b_awq(std::path::Path::new(dir), std::path::Path::new(dir), owl_models::module::QuantPlan::F16, owl_models::module::QuantPlan::W4A16Awq)
             .await
             .expect("装载");
         let mut running = engine.run(loaded).await.expect("装配");
@@ -3296,6 +3296,11 @@ fn spec_degrade_transition_branches() {
     // 退避封顶 512
     let (s, d, p) = spec_degrade_transition(9, true, 400, 0, 6, 64);
     assert_eq!((s, d, p), (10, true, 512));
+    // **小首探窗**(2026-10-18 缺省 8):入降级即用 8,探测失败退避到 16
+    let (s, d, p) = spec_degrade_transition(5, false, 8, 0, 6, 8);
+    assert_eq!((s, d, p), (6, true, 8));
+    let (s, d, p) = spec_degrade_transition(6, true, 8, 0, 6, 8);
+    assert_eq!((s, d, p), (7, true, 16));
     // threshold=0 = 禁用(永不入降级)
     let (s, d, p) = spec_degrade_transition(9, false, 64, 0, 0, 64);
     assert_eq!((s, d, p), (10, false, 64));
@@ -3358,6 +3363,22 @@ fn prefill_bucket_pick_and_ladder() {
     assert!(!gdn_host_slot_arm(&env, &dims, 512));
 }
 
+/// **桶可用性三判据**:已捕获 / t 在桶内 / 槽号 = 烘焙槽。
+///
+/// (曾有第四判据「格未换主」= 2026-10-17 的临时防线;真因已在
+/// `FiRuntime::activate` 修好 —— 见 `usable` 头注与定位卷结案。)
+#[cfg(test)]
+#[test]
+fn prefill_bucket_usable_conditions() {
+    use crate::prefill_plan::bucket_usable;
+    assert!(bucket_usable(true, 57, 64, Some(0), 0), "基线");
+    assert!(!bucket_usable(true, 57, 64, Some(0), 3), "槽号不匹配");
+    assert!(!bucket_usable(false, 57, 64, Some(0), 0), "未捕获");
+    assert!(!bucket_usable(true, 0, 64, Some(0), 0), "空 chunk");
+    assert!(!bucket_usable(true, 65, 64, Some(0), 0), "超桶");
+    assert!(bucket_usable(true, 57, 64, None, 7), "varlen 臂:槽任一");
+}
+
 // ===========================================================================
 // M2b:prefill 桶图(设计 §4–§6;GPU 门控)
 // ===========================================================================
@@ -3391,6 +3412,7 @@ async fn gpu_prefill_bucket_matches_eager() {
         dir: &std::path::Path,
         ordinal: usize,
         b: PrefillBucket,
+        gdn_slots: usize,
     ) -> RunningEngine<owl_cuda::GpuClient> {
         // `EnvProvider::default()` 是 attest=false(诊断 A/B 保留位);生产走
         // `from_config` ⇒ `from_dispatch` 恒真(2026-10-13 用户令)⇒ 本测显式打开。
@@ -3403,6 +3425,7 @@ async fn gpu_prefill_bucket_matches_eager() {
             prefill_chunk: 512,
             knobs: EngineKnobs {
                 prefill_bucket: b,
+                gdn_slots,
                 sampler_enabled: false,
                 env,
                 ..EngineKnobs::default()
@@ -3413,8 +3436,13 @@ async fn gpu_prefill_bucket_matches_eager() {
         engine.run(loaded).await.expect("装配")
     }
     let prompt = "长城是中国古代的军事防御工程,用来抵御北方游牧民族的侵袭。".repeat(40);
-    async fn gen(running: &mut RunningEngine<owl_cuda::GpuClient>, prompt: &str, n: usize) -> String {
-        let id = running.submit(prompt.to_string(), n).expect("submit");
+    async fn gen_session(
+        running: &mut RunningEngine<owl_cuda::GpuClient>,
+        session: Option<u64>,
+        prompt: &str,
+        n: usize,
+    ) -> String {
+        let (_, id) = running.submit_session(session, prompt.to_string(), n).expect("submit");
         loop {
             match running.pump().await.expect("pump") {
                 TurnEvent::Completed { turn, text, .. } if turn == id => return text,
@@ -3424,8 +3452,11 @@ async fn gpu_prefill_bucket_matches_eager() {
             }
         }
     }
+    async fn gen(running: &mut RunningEngine<owl_cuda::GpuClient>, prompt: &str, n: usize) -> String {
+        gen_session(running, None, prompt, n).await
+    }
     // ① 桶档
-    let mut g = boot_bucket(&dir, ordinal, PrefillBucket::Geobuckets).await;
+    let mut g = boot_bucket(&dir, ordinal, PrefillBucket::Geobuckets, 8).await;
     let buckets = g.graphs.prefill.captured_t_pads();
     eprintln!("[m2b] 桶捕获:{:?}(summary = {})", buckets, g.graphs.prefill.summary());
     assert!(
@@ -3440,9 +3471,43 @@ async fn gpu_prefill_bucket_matches_eager() {
     assert!(!used.is_empty(), "桶一个都没回放 ⇒ 图路没生效(本测在测 eager vs eager)");
     assert!(used.contains(&512), "本 prompt(chunk=512)应命中 t512 桶,实测 {used:?}");
     // ② eager 档(同模型同配置,只关桶)
-    let mut e = boot_bucket(&dir, ordinal, PrefillBucket::Off).await;
+    let mut e = boot_bucket(&dir, ordinal, PrefillBucket::Off, 8).await;
     let out_eager = gen(&mut e, &prompt, 24).await;
     eprintln!("[m2b] 桶档 {out_graph:?}\n[m2b] eager {out_eager:?}");
     assert!(!out_graph.trim().is_empty(), "桶档空回答");
     assert_eq!(out_graph, out_eager, "桶图与 eager 的贪心输出必须逐字相同(M2b 跨档门)");
+
+    // ③ **同格复用腿**(定位卷:`26-10-17-prefill桶图-二次会话污染-定位实录.md`;
+    //    结案见同卷 §结案)。
+    //
+    // `gdn_slots = 1` ⇒ 第二个会话**必然**重绑 0 号格(前一会话被 LRU 逐出)。
+    // 旧病(服务面实发:第二发读不出 prompt、整段 decode 崩坏)实测**不在**
+    // 格地址/页链(两档寻址逐字相同),而在 **FI plan 的共享 `int_ws`**:
+    // 桶回放会把 int_ws 刷成**桶自己的**调度表(窗内烘的 memcpy 节点),而 host
+    // 侧 `active` 旧账不知情 ⇒ 回放后首个同 key 窗外调用跳过重刷 ⇒ decode 拿
+    // 桶的调度表当自己的用。根因修于 `FiRuntime::activate`(窗外一律重刷),
+    // 故本腿现在钉两条:**①两档逐字相同**(用户可见不变量)②**复用发必须回放
+    // 桶**(增量 >0 —— 它就是"同格复用 × 桶回放"的覆盖门;撤闸前它恒 0,
+    // 是被绕过的路径,现在真跑)。
+    let mut reuse: Vec<(String, String, usize)> = Vec::new();
+    for b in [PrefillBucket::Geobuckets, PrefillBucket::Off] {
+        let mut g = boot_bucket(&dir, ordinal, b, 1).await;
+        let t1 = gen_session(&mut g, Some(1), &prompt, 16).await;
+        let n1: usize = g.graphs.prefill.replay_counts().iter().map(|(_, n)| *n).sum();
+        let t2 = gen_session(&mut g, Some(2), &prompt, 16).await;
+        let n2: usize = g.graphs.prefill.replay_counts().iter().map(|(_, n)| *n).sum();
+        eprintln!("[m2b] 复用腿 {b:?}:首个会话桶回放 {n1} / 复用会话增量 {}", n2 - n1);
+        reuse.push((t1, t2, n2 - n1));
+    }
+    assert_eq!(
+        (reuse[0].0.as_str(), reuse[0].1.as_str()),
+        (reuse[1].0.as_str(), reuse[1].1.as_str()),
+        "同格复用档:桶档与 eager 档逐字相同(定位卷的回归锁)"
+    );
+    assert!(
+        reuse[0].2 > 0,
+        "同格复用发必须真回放桶(增量 0 = 又被绕过了;eager 档增量 = {})",
+        reuse[1].2
+    );
+    assert_eq!(reuse[1].2, 0, "Off 档不得有桶回放");
 }

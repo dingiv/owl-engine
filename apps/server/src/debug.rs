@@ -17,6 +17,19 @@ fn total_ms(row: &Value) -> f64 {
     row["total_ms"].as_f64().unwrap_or(0.0)
 }
 
+/// **slab 活性诊断计数**(非消费快照;见 [`owl_shared::slab_hint::live_diag::counters`])。
+///
+/// 为什么挂在这里:这些计数原本只有"图规划期取一次(读后清零)"的出口 ⇒
+/// 之后发生的异常(实测 `live.dup_new` 一次 boot 刷 12 条)在 HTTP 面看不到。
+/// `live.dup_new`/`live.alias_multi` **非 0 即异常**,可当门用。
+fn slab_live_json() -> Value {
+    let mut m = serde_json::Map::new();
+    for (tag, v) in owl_shared::slab_hint::live_diag::counters() {
+        m.insert(tag.to_string(), json!(v));
+    }
+    Value::Object(m)
+}
+
 /// metrics 查询投影(纯函数;HTTP 面 [&super::main] 只做路由)
 pub fn metrics_json(prefix: &str) -> Value {
     let mut filter = MetricsFilter::new().limit(ROWS_LIMIT);
@@ -37,7 +50,7 @@ pub fn metrics_json(prefix: &str) -> Value {
         })
         .collect();
     rows.sort_by(|a, b| total_ms(b).partial_cmp(&total_ms(a)).unwrap_or(std::cmp::Ordering::Equal));
-    json!({ "rows": rows })
+    json!({ "rows": rows, "slab_live": slab_live_json() })
 }
 
 // ============================================================================

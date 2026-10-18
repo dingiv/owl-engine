@@ -258,11 +258,22 @@ pub mod live_diag {
     pub static REFUSE_NOT_ARENA: AtomicU64 = AtomicU64::new(0);
     /// 拒因:块在 keep 白名单(跨段存活)
     pub static REFUSE_KEPT: AtomicU64 = AtomicU64::new(0);
-    /// 拒因:块未登记进 `block_users`(记账缺席 —— 不该发生)
+    /// 退场块不在 `block_users` 里 —— 实测 = **叶子/外部块**(图输入槽、持久件、
+    /// 池件的父块退场)的正常路径:它们本就不经 `track_new`/`track_alias`。
+    ///
+    /// ⚠️ **实测语义(2026-10-17 审查)**:生产 boot 实测 **2651** 次 ⇒
+    /// 原文案"记账缺席 —— 不该发生"**误导**(会让人去追一个不存在的 bug)。
+    /// 判据:唯一能绕过登记的就是 `Op::Block` 叶子(`Bytes::new(id, …)`)。
     pub static REFUSE_NOT_TRACKED: AtomicU64 = AtomicU64::new(0);
     /// **同一块被 `track_new` 两次**(记账重复 ⇒ users 恒多 1 ⇒ 永不归还;不该发生)
     pub static DOUBLE_NEW: AtomicU64 = AtomicU64::new(0);
-    /// **同一块被 `track_alias` 两次以上**(别名重复登记)
+    /// 别名登记时该块**已有归属**(`track_alias` 落到已计数块)。
+    ///
+    /// ⚠️ **实测语义(2026-10-17 审查)**:实现是"`users > 0` 就记一笔"
+    /// (`eval.rs::track_alias`),而生产块的常态正是"产者已置 1 → 视图再 +1"
+    /// ⇒ 本计数在生产 boot 里**恒非 0**(实测 672),**不是**"不该发生"。
+    /// 原文案("同一块被 track_alias 两次以上")与实现不符,属**假现场**一类;
+    /// 未改判定(改判定要按块记别名次数 = 新状态),此处先把话写实。
     pub static ALIAS_MULTI: AtomicU64 = AtomicU64::new(0);
 
     /// 回收出口的拒因(枚举 = 判定分支单点)
@@ -410,6 +421,28 @@ pub mod live_diag {
         ] {
             c.store(0, Ordering::Relaxed);
         }
+    }
+
+    /// **非消费快照**(2026-10-17 审查补):上面 `take_report` 是"读后清零",
+    /// 而它只在**图规划期**被取一次 —— 之后才发生的重复登记/拒因就再没有出口
+    /// (实测:一次 boot 的 `[live-dup]` 刷了 12 条,而报告里 `重复记账:new 0`)。
+    /// 本函数只读不清,供 `/debug/metrics` 之类的**随时可查**面使用
+    /// ⇒ A1 那类"记账重复"回归从此可断言(counter == 0)。
+    pub fn counters() -> Vec<(&'static str, u64)> {
+        let g = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        vec![
+            ("live.new_blocks", g(&NEW_BLOCKS)),
+            ("live.free_blocks", g(&FREE_BLOCKS)),
+            ("live.refuse.pending", g(&REFUSE_PENDING)),
+            ("live.refuse.users", g(&REFUSE_USERS)),
+            ("live.refuse.alias", g(&REFUSE_ALIAS)),
+            ("live.refuse.not_arena", g(&REFUSE_NOT_ARENA)),
+            ("live.refuse.kept", g(&REFUSE_KEPT)),
+            ("live.retire.untracked", g(&REFUSE_NOT_TRACKED)),
+            // **非 0 即异常**(块被登记两遍 ⇒ users 恒多 1 ⇒ 永不中途回收)
+            ("live.dup_new", g(&DOUBLE_NEW)),
+            ("live.alias.on_tracked", g(&ALIAS_MULTI)),
+        ]
     }
 
     /// 一行账(**读后清零**;与 `slab 峰值归因` 同窗 ⇒ 同源可比)

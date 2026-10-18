@@ -36,16 +36,17 @@
 //! | model | awq27b_dir | Option<String> / None(27B AWQ 检查点门控) |
 //! | model | dflash2_dir | Option<String>(⚠️ W4A16 量化家族 syvai 系;
 //! |   |   | BF16 源(z-lab)喂引擎 = 草稿全噪声 AL=0,装载期嗅探拒启) |
-//! | model | w4a8 | bool / false(S2;W4A8 档位 —— 权重 a8 布局 + int8 激活) |
+//! | model | quant | QuantScheme 枚举("w4a16"\|"w4a8")/ w4a16(主干量化方案;|
+//! |   |   | W4A8 = 权重 a8 布局 + per-token int8 激活 + kS8×kU4 GEMM) |
 //! | model | head_quant | HeadQuant 枚举("off"\|"rtn-int4-g32")/ off(C1;|
 //! |   |   | 竖式/gate 质量门后转正) |
 //! | pool | pool_tokens | Option<usize> / None(=2×单会话) |
-//! | pool | max_active_turns / snap_max | usize / 8、4 |
+//! | pool | gdn_slots / snap_max | usize / 8、4 |
 //! | pool | vram_target / vram_reserve_mb | f64、u64 / 0.97、1024 |
 //! | pool | prefix_cache | bool / true |
 //! | spec | depth / dumb / draft_kv_fp8 | usize 0(off)、flag、flag |
 //! | spec | notaps / tapdecl | flag / false(verify 图诊断) |
-//! | spec | degrade_after / probe_every | usize / 6、64 |
+//! | spec | degrade_after / probe_every | usize / 6、8(降级首探窗口;旧 64 = 长尾税) |
 //! | sampling | mode | SamplerMode 枚举("greedy"\\|"sampling")/ sampling |
 //! | sampling | temp / topk / topp / rep_penalty | 1.0 / 20 / 0.95 / 1.0 |
 //! | load | verify / debug_tap | flag / false |
@@ -135,6 +136,31 @@ pub enum HeadQuant {
     // RtnInt8G128(中间档)——加值时同步 loader 映射与质量门台账
 }
 
+/// **主干量化方案**(model.quant;2026-10-17 由 `w4a8: bool` 升格 ——
+/// 量化方案是一等配置面,同 [`HeadQuant`] 先例)。
+///
+/// 命名 = 行业记法 `W{权重精度}A{激活精度}`:**W4A16 = weight-only
+/// quantization(WOQ)**,**W4A8 = weight-and-activation quantization**
+/// (激活侧也量化)。完整方案 = WxAy × 粒度 × 算法 × 动静态,本键只承载
+/// **主干层**这一维(head_quant / 草稿 / mtp 各自独立 plan)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+pub enum QuantScheme {
+    /// W4A16 × AWQ g32-asym(权重 4bit + zp,激活 f16)= **今天行为**
+    #[serde(rename = "w4a16")]
+    #[default]
+    W4a16,
+    /// W4A8 × AWQ 同源权重(权重 = a8 布局三件套;激活 per-token int8 +
+    /// `marlin_gemm_w4a8_awq`(kS8×kU4,int8 张量核))。
+    /// 实测(单卡 3090 Ti @32k):prefill +48~50% / TTFT −33% / decode 不变;
+    /// 代价 = 装载 +14.5s(a8 重物化,设备重排核待补)+ **质量门 S3 待过**
+    /// (非逐字同 —— int8 激活有损)。施工/门/回滚见
+    /// `docs/arch/W4A8-算子家族-设计与施工.md`。
+    #[serde(rename = "w4a8")]
+    W4a8,
+    // 预留:W8A8 / W8A16 / W4A4 —— 加值时同步 loader 映射
+    // (engine::quant_plan_of)与质量门台账。
+}
+
 /// 图实例化旗标(cuda.graph_flags;原裸 u64 魔数 2/4 收口为结构化位面)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -197,11 +223,10 @@ pub struct ModelCfg {
     /// C1(2026-10-11):untied lm_head 头部量化方案(枚举严格;映射点
     /// 在 engine loader:HeadQuant → QuantPlan)。质量门台账见枚举值注。
     pub head_quant: HeadQuant,
-    /// **W4A8 档位**(S2;2026-10-17;默认 off = 今天行为):开 = 权重 a8 布局
-    /// 三件套 + 激活 per-token int8 + kS8×kU4 GEMM(int8 张量核;prefill 2.29×,
-    /// decode 不变)。**只作用于主干层** —— lm_head / 草稿 / mtp 各自独立
-    /// plan(选层排除在本仓是结构性的,不需要名字正则)。
-    pub w4a8: bool,
+    /// **主干量化方案**(量化方案 = 配置枚举,loader 零硬编码;映射点 =
+    /// `engine::quant_plan_of`)。**只作用于主干层** —— lm_head / 草稿 /
+    /// mtp 各自独立 plan(选层排除在本仓是结构性的,不需要名字正则)。
+    pub quant: QuantScheme,
 }
 
 /// 池几何与显存预算(engine StatePool)
@@ -212,7 +237,7 @@ pub struct PoolCfg {
     /// **虚拟化档可小于上下文**(`[kvmem].pool_overcommit`;boot 硬校验兜底)。
     pub pool_tokens: Option<usize>,
     /// 并发上限(每活跃 turn 一套 GDN 行;也是池下限算式的 N_active)
-    pub max_active_turns: usize,
+    pub gdn_slots: usize,
     /// GDN 快照池槽数
     pub snap_max: usize,
     /// **宿主 KV 腿**(MiB;0 = 关层)。下沉的落点之一。
@@ -348,7 +373,17 @@ pub struct SpecCfg {
     pub notaps: bool,
     /// TAPDECL 二分臂(声明期 tapped 不挂输出槽)
     pub tapdecl: bool,
+    /// **m=0 连击阈值**(达此连击 → 降级裸 decode;0 = 禁用降级)
     pub degrade_after: usize,
+    /// **降级后的首次探测窗口(tokens)** —— 探测 = 跑一个投机轮试水,命中(m≥1)即恢复 spec。
+    ///
+    /// ⚠️ **2026-10-18 定谳:必须小**(缺省 8,旧缺省 64 是**长尾税**):
+    /// 降级后窗口内每 token 走裸 decode(**实测 27.5 ms/token**)而 spec 档
+    /// 6.4 token/轮 ≈ **5.7 ms/token** ⇒ 卡在窗口里一个 token 就是 22 ms 的损失。
+    /// 窗口 64 ⇒ 一次**偶发** m=0 连击最长罚 **1.4 s**;窗口 8 ⇒ 罚 0.18 s。
+    /// 反向成本(探测失败的代价)= 一轮投机轮(36.7ms)换掉一个裸步(27.5ms)
+    /// ≈ **+9 ms/次**,且探测失败后**退避 ×2**(8→16→…→512 封顶)⇒ 持久失败
+    /// (真复读上下文)总浪费 ~0.1 s 量级。**两头都便宜,故取小**。
     pub probe_every: usize,
 }
 
@@ -385,14 +420,31 @@ pub struct DispatchCfg {
     /// 4.63ms/层(fp8),而 prefill 族是 qo_len=8 单遍形态 —— 本开关是
     /// 两族 A/B 的唯一入口,定谳后固化其一,不留双路径。
     pub verify_v2: bool,
-    /// **verify 段驱动件**(piecewise):把 verify 图的**注意力核**登记为断点,
-    /// 整图改分段捕获回放(注意力在段间 eager 重放,其余仍在图内)。
-    /// 2026-10-15 立项(V1b):FI 的 split 档 plan 依赖 ctx ⇒ 单图只对一个
-    /// ctx 有效;段驱动件让 plan 每轮在窗外重算。零断点时退化为单图
-    /// (与 `plan` 同形),开关开而臂未登记核时**不**降级为逐步 eager。
-    pub verify_piecewise: bool,
-    /// ⚙ 诊断:断点挂"注意力输出"而非核节点(见 AttnEnv::break_at_out)
-    pub break_at_out: bool,
+    /// **decode 走"单图烘 plan"**(2026-10-18 图档单图 W3):
+    /// `Some(ctx)` = ① decode **不进 piecewise**(FI 核留捕获图内);
+    /// ② 喂 FI 的 `ctx_total` 用该上界烘死 ⇒ 图自携该上界的调度表。
+    /// **上界必须 ≥ 任何可能出现的 ctx**(校验拒启兜底)。
+    /// **`0` = 哨兵「取 [`RuntimeCfg::max_seq`]」** —— 单序列 ctx 的天然上界,
+    /// 且它随档位走(不同 max_seq 的档不必手改上界)。
+    /// `None`(缺省)= 现状(piecewise 断点 + 每步重算精确表)。
+    #[serde(default)]
+    pub fi_plan_bake: Option<usize>,
+    /// **图自携 plan restore**(缺省 `true` = 捕获窗内把本 plan 的表烘进图的
+    /// memcpy 节点;prefill 桶图靠它)。
+    /// `false` = 图不烘表 ⇒ **host 为表的唯一权威**:引擎每次图 launch 前
+    /// 用 `fi_plan_sync` 刷当步**精确**表(单图档 `fi_plan_bake` 的标配)。
+    /// ⚠️ 与 `fi_plan_bake` 必须配套(false),冲突配置由 `validate` 拒启。
+    #[serde(default = "default_true")]
+    pub fi_plan_restore: bool,
+    /// **FI plan 走图档瓦**(上游 `enable_cuda_graph=true`):`cta_tile_q` 取最坏情形、
+    /// `padded_batch_size = max(2·SM/hkv, tiles)` ⇒ **plan 形状对 ctx 全域恒定**
+    /// (2026-10-18 实测:ctx 32→262144 一条直线 `padded=42/cta=16|64/split=1/int_bytes=618|650`)
+    /// ⇒ 这是"FI 进捕获图"的结构前提(形状恒定 ⇒ 一张图 + 换表内容即可)。
+    /// 关 = eager 瓦(历史行为;形状随 ctx 跳变 16 段)。
+    /// 投递:C++ 侧读 `getenv("FI_CUDA_GRAPH")`,故由引擎 boot 期经
+    /// `owl_kernels::family::flashinfer::configure_plan_env` **唯一**写入。
+    #[serde(default)]
+    pub fi_cuda_graph: bool,
     /// **verify 走 FI 断点臂**(V1b;需 `verify_piecewise`)——FI+split 换掉 XQA
     pub verify_fi: bool,
     /// **decode(T=1)走 FI 断点臂**(V1c;session 常驻图改分段,断点挂 decode 核)
@@ -526,6 +578,11 @@ pub struct LogCfg {
     pub timestamp: bool,
 }
 
+/// serde 缺省 = true(布尔配置项的显式缺省;避免 `#[serde(default)]` 落到 false)
+fn default_true() -> bool {
+    true
+}
+
 /// 诊断探针族(全域布尔;boot 一次解析,热路径零 env)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -564,6 +621,10 @@ pub struct ProbesCfg {
     /// 解释器检查点的运行期档位。⚠️ 需以 `--features stepgate` 构建才生效;
     /// 未编入时入口会**可见地告警**(不静默失效)。
     pub step_gate: crate::stepgate::StepMode,
+    /// **KV 页字节差分落点**(`<pos>` = 在该 decode 步前后各 d2h 一页,一次;
+    /// 写者足迹取证面)—— 原 `OWL_KV_DUMP` env(同上收编)
+    #[serde(default)]
+    pub kv_dump_at: Option<usize>,
     /// 粘滞档每检查点睡眠毫秒(缺省 50)
     #[serde(default = "default_step_gate_ms")]
     pub step_gate_ms: u64,
@@ -737,7 +798,7 @@ impl Default for AgentCfg {
 #[serde(default, deny_unknown_fields)]
 pub struct ServerCfg {
     /// 最大并发请求数(在跑 + 排队;超出者排队等待)。
-    /// 默认 8;须 ≤ pool 的 GDN 行数(knobs.max_active_turns,每并发会话
+    /// 默认 8;须 ≤ pool 的 GDN 行数(knobs.gdn_slots,每并发会话
     /// 占一格)—— 启动校验不足即拒。本地多副本 agent 各占一并发。
     pub max_concurrency: usize,
 }
@@ -792,7 +853,7 @@ impl Default for PoolCfg {
     fn default() -> Self {
         Self {
             pool_tokens: None,
-            max_active_turns: 8,
+            gdn_slots: 8,
             snap_max: 4,
             host_cache_mb: 0,
             snap_host_mb: 0,
@@ -834,7 +895,7 @@ impl Default for SpecCfg {
             notaps: false,
             tapdecl: false,
             degrade_after: 6,
-            probe_every: 64,
+            probe_every: 8,
         }
     }
 }
@@ -850,8 +911,11 @@ impl Default for DispatchCfg {
             verify_xqa: false,
             // piecewise 段驱动件:**缺省关**(2026-10-15 立项;A/B 先证机制
             // 零回归,定谱后再翻默认 —— 同 verify_xqa 的翻法)
-            verify_piecewise: false,
-            break_at_out: false,
+            fi_plan_bake: None,
+            fi_plan_restore: true,
+            // FI plan 图档瓦(2026-10-18 图档单图立案):**缺省关** —— 图档单图的
+            // 其余件(W2 关自携 / W3 单图)未落地前开它只是换瓦片口径,不产生图。
+            fi_cuda_graph: false,
             verify_fi: false,
             decode_fi: false,
             decode_xqa: false,
@@ -904,6 +968,53 @@ fn merge(base: &mut toml::Value, over: toml::Value) {
     }
 }
 
+/// **退役键迁移门**(2026-10-17):键**改名**不是“静默忽略”,而是响亮拒绝 +
+/// 当面指明新键。`deny_unknown_fields` 本就会拒(unknown field),这里追加的
+/// 是**可操作**的那一半(点名新键 + 值域)—— 使用者不必去翻旧分支。
+///
+/// 新增退役键 = 在表里加一行(`旧写法 → 新写法`)。
+fn reject_retired_keys(v: &toml::Value) -> Result<(), String> {
+    /// (module, 退役键, 迁移指引)
+    const RETIRED: &[(&str, &str, &str)] = &[
+        (
+            "model",
+            "w4a8",
+            "W4A8 档位已从 bool 升格为量化方案枚举 —— 改用 `[model] quant = \"w4a8\"`(值域:\"w4a16\"|\"w4a8\";缺省 \"w4a16\")",
+        ),
+        (
+            "dispatch",
+            "verify_piecewise",
+            "piecewise(分段捕获 + 断点)已整体退役(2026-10-18 W5):FI 核恒留捕获图内、表由 `fi_plan_sync` 窗外刷 —— 删掉该键",
+        ),
+        (
+            "dispatch",
+            "break_at_out",
+            "断点面随 piecewise 退役(W5):该诊断键无数据源 —— 删掉该键",
+        ),
+        (
+            "dispatch",
+            "fi_plan_bake_verify",
+            "verify 恒随 `fi_plan_bake` 走单图(W4 转正 + W5) —— 删掉该键",
+        ),
+        (
+            "probes",
+            "fi_bucket",
+            "FI plan 桶化随宿主标量槽退役(W5;表恒按当轮精确 ctx 刷) —— 删掉该键",
+        ),
+        (
+            "probes",
+            "pw_dump_tok",
+            "piecewise 断点面已退役(W5):该 dump 无数据源 —— 删掉该键",
+        ),
+    ];
+    for (module, key, hint) in RETIRED {
+        if v.get(*module).and_then(|m| m.get(*key)).is_some() {
+            return Err(format!("[{module}] {key} 退役键:{hint}"));
+        }
+    }
+    Ok(())
+}
+
 impl OwlConfig {
     /// **统一 loader**(Default → 基准文件(预设档/任意配置) → 覆盖文件;
     /// CLI 由入口决定前两者的取值)。`deny_unknown_fields` 在最终反序列化生效 ——
@@ -924,13 +1035,94 @@ impl OwlConfig {
                 .map_err(|e| format!("配置文件 {} 解析失败: {e}", p.display()))?;
             merge(&mut v, fv);
         }
+        reject_retired_keys(&v)?;
         v.try_into()
             .map_err(|e| format!("配置反序列化失败(账外键或非法枚举值): {e}"))
+            .and_then(|c: Self| {
+                c.validate()?;
+                Ok(c)
+            })
     }
 
-    /// TOML 字符串直载(测试/ops 便捷;与 load 同一反序列化面)
+    /// TOML 字符串直载(测试/ops 便捷;与 load 同一反序列化面 + 同一语义门)
     pub fn from_toml_str(s: &str) -> Result<Self, String> {
-        toml::from_str(s).map_err(|e| format!("配置解析失败(账外键或非法枚举值): {e}"))
+        let v: toml::Value =
+            toml::from_str(s).map_err(|e| format!("配置解析失败(账外键或非法枚举值): {e}"))?;
+        reject_retired_keys(&v)?;
+        let c: Self = v
+            .try_into()
+            .map_err(|e| format!("配置反序列化失败(账外键或非法枚举值): {e}"))?;
+        c.validate()?;
+        Ok(c)
+    }
+
+    /// **跨字段语义门**(D1,2026-10-17):反序列化只能保证**形状**(账外键 /
+    /// 枚举合法),字段之间的**语义**在这里拒 —— 三处入口(server / cli /
+    /// 配置档)同守,不再各自写一份。
+    ///
+    /// 规则①`pool.gdn_slots ≥ server.max_concurrency`:GDN 状态格 = 每并发会话
+    /// 一格;并发超格数 ⇒ 第 N+1 会话把**活跃**会话的状态格 LRU 逐出 =
+    /// 跨会话状态污染(不是“排队等待”那种良性降级)。
+    /// 原写法在 `apps/server/src/main.rs`(server 要读引擎内部容量、直接
+    /// `exit(1)`),且**只有 server 一条入口守** —— 直接构造 engine 的路径
+    /// (tests / cli)裸奔。
+    pub fn validate(&self) -> Result<(), String> {
+        if self.pool.gdn_slots < self.server.max_concurrency {
+            return Err(format!(
+                "[pool] gdn_slots({}) < [server] max_concurrency({})—— GDN 状态格 = 每并发会话一格,\n              并发超格数会把活跃会话的状态格 LRU 逐出(跨会话状态污染);请调 gdn_slots ≥ max_concurrency",
+                self.pool.gdn_slots, self.server.max_concurrency
+            ));
+        }
+        // **FI 单图烘 plan 的上界律**(2026-10-18 W3):喂进去的 `ctx_total` 被烘死
+        // ⇒ 图自携的表按该上界枚举工作项;若真实 ctx 超过它,运行期算出的 chunk 数
+        // 会超过表里的工作项数 ⇒ partial 行 stride 错(设计卷 §2.2 的 V1 形态,
+        // 实测 T=8 max|Δ|=1.39)。**只许上界 ≥ 任何可能 ctx**,这里 fail-fast。
+        // bake 档与 prefill 桶图**互斥**:桶图的 FI 表靠"图自携 restore",
+        // 而 bake 档全进程关掉了 restore(host 每步 `fi_plan_sync` 为唯一权威);
+        // 桶图没有那条刷新面 ⇒ 会读到别人的表。要同时用 = 先给桶路也接 sync。
+        // 单图烘 plan 档必须"图不烘表"(否则回放那次 memcpy 把同步进去的表盖掉
+        // ⇒ 又回 inert 表)。**拒启**而不是自动纠正:静默改语义比拒启危险。
+        if self.dispatch.fi_plan_bake.is_some() && self.dispatch.fi_plan_restore {
+            return Err(
+                "[dispatch] fi_plan_bake 需要 fi_plan_restore = false \
+                 (单图档的 plan 表由 host 每步 `fi_plan_sync` 刷新,图内不得再烘自携 restore)"
+                    .to_string(),
+            );
+        }
+        if self.dispatch.fi_plan_bake.is_some()
+            && self.graph.prefill_bucket != crate::config::PrefillBucket::Off
+        {
+            return Err(
+                "[graph] prefill_bucket 与 [dispatch] fi_plan_bake **互斥**(待桶路接 plan sync 后解禁)"
+                    .to_string(),
+            );
+        }
+        // **W5 意图配套门**（2026-10-18）：FI 臂只有"图内臂"一种承载（核留图内 +
+        // `ctx_total` 烘上界 + 表由 `fi_plan_sync` 窗外刷）。缺上界 ⇒ 捕获期会拿
+        // **占位 ctx** 烘表（文本连贯但错，历史踩过）⇒ 响亮拒绝，不给静默错值。
+        if (self.dispatch.decode_fi || self.dispatch.verify_fi)
+            && self.dispatch.fi_plan_bake.is_none()
+        {
+            return Err(
+                "[dispatch] decode_fi/verify_fi 需要 fi_plan_bake 在场（断点面已退役：FI 核只能走                 图内臂 + 窗外刷表）—— 要么设 `fi_plan_bake`（0 = 取 max_seq），要么关掉 FI 臂"
+                    .to_string(),
+            );
+        }
+        if self.dispatch.fi_plan_bake.is_some() && !self.dispatch.fi_cuda_graph {
+            return Err(
+                "[dispatch] fi_plan_bake 需要 fi_cuda_graph = true（图档瓦让 plan 形状对 ctx 恒定，                 单图才可能服务任意 ctx）"
+                    .to_string(),
+            );
+        }
+        if let Some(bake) = self.dispatch.fi_plan_bake {
+            if bake != 0 && bake < self.runtime.max_seq {
+                return Err(format!(
+                    "[dispatch] fi_plan_bake({bake}) < [runtime] max_seq({})—— \n                                   单图烘 plan 的上界必须 ≥ 引擎能服务的最大 ctx(否则表的工作项数\n                                  少于运行期 chunk 数 ⇒ partial 行 stride 错);请设 fi_plan_bake ≥ max_seq",
+                    self.runtime.max_seq
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -988,15 +1180,57 @@ mod tests {
         assert!(OwlConfig::from_toml_str("[no such module]\nx = 1").is_err());
     }
 
+    /// **主干量化方案**(2026-10-17 由 `w4a8: bool` 升格):缺省 = w4a16
+    /// (今天行为);合法值两档;非法值**结构化拒**;**退役键 `w4a8` 响亮拒**
+    /// —— 拒语要点名新键与值域(可行动,不是一律 unknown field)。
+    #[test]
+    fn quant_scheme_枚举与退役键门() {
+        assert_eq!(OwlConfig::default().model.quant, QuantScheme::W4a16);
+        let c = OwlConfig::from_toml_str("[model]\nquant = \"w4a8\"").expect("a8 档");
+        assert_eq!(c.model.quant, QuantScheme::W4a8);
+        let c = OwlConfig::from_toml_str("[model]\nquant = \"w4a16\"").expect("a16 档");
+        assert_eq!(c.model.quant, QuantScheme::W4a16);
+        let e = OwlConfig::from_toml_str("[model]\nquant = \"w4a9\"").expect_err("非法档拒");
+        assert!(e.contains("w4a9"), "拒语应带现场: {e}");
+        for old in ["[model]\nw4a8 = true", "[model]\nw4a8 = false"] {
+            let e = OwlConfig::from_toml_str(old).expect_err("退役键必须拒(开/关同罪)");
+            assert!(
+                e.contains("退役键") && e.contains("quant = \"w4a8\""),
+                "拒语应点名新键: {e}"
+            );
+        }
+    }
+
+    /// **跨字段语义门**(D1,2026-10-17):`gdn_slots < max_concurrency` 必拒,
+    /// 拒语要点出病因(状态格逐出 = 跨会话污染)与调法;合规组合(生产档 1/1、
+    /// 缺省 8/8)必须过。
+    #[test]
+    fn validate_rejects_concurrency_over_gdn_slots() {
+        let e = OwlConfig::from_toml_str("[pool]\ngdn_slots = 1\n[server]\nmax_concurrency = 8\n")
+            .expect_err("1 格 vs 8 并发必须拒");
+        assert!(
+            e.contains("gdn_slots") && e.contains("跨会话状态污染"),
+            "拒语应可行动: {e}"
+        );
+        OwlConfig::from_toml_str("[pool]\ngdn_slots = 1\n[server]\nmax_concurrency = 1\n")
+            .expect("相等 = 合规(生产 spec-dflash 档即此)");
+        OwlConfig::from_toml_str("[pool]\ngdn_slots = 8\n[server]\nmax_concurrency = 2\n")
+            .expect("格多于并发 = 合规");
+        OwlConfig::default().validate().expect("缺省档 8/8");
+    }
+
     #[test]
     fn 正语义分派与合法文件() {
+        // 注:`max_concurrency = 1` 是 **D1 语义门**(2026-10-17)要求的 ——
+        // 本 fixture 原为 `gdn_slots = 1` + 缺省 `max_concurrency = 8`,
+        // 那是“能反序列化但语义非法”的组合(server 侧原先会在 boot 拒启)。
         let c = OwlConfig::from_toml_str(
-            "[dispatch]\nqkv_fuse = false\ngdn_fused_decode_v2 = false\n[pool]\nmax_active_turns = 1\n",
+            "[dispatch]\nqkv_fuse = false\ngdn_fused_decode_v2 = false\n[pool]\ngdn_slots = 1\n[server]\nmax_concurrency = 1\n",
         )
         .expect("合法文件应通过");
         assert!(!c.dispatch.qkv_fuse);
         assert!(!c.dispatch.gdn_fused_decode_v2);
-        assert_eq!(c.pool.max_active_turns, 1);
+        assert_eq!(c.pool.gdn_slots, 1);
     }
 
 }

@@ -19,6 +19,28 @@
 3. **卡是共享资源,本工作区多会话**:起机前查卡占位、`/proc/vmstat` 看 `oom_kill`、
    被外部 kill 是常态(判定顺序见 `debug-tools.md` §5)。
 
+## 新工作树开箱(两条隐性前置 + 冷建成本)
+
+`git worktree add` 出来的新树**开箱不能构建/跑测试** —— 两件前置资产在 git 里没有
+(2026-10-17 审查实录:一位 agent 在这上面花了十几分钟)。
+
+```bash
+# ① triton venv(不建 = `kernels/build.rs` 直接 panic:"gdn_chunked 六核 AOT
+#    需要 Python+triton 环境")。两条路,选一:
+uv sync --project /home/div/Documents/codes/packages/owl-worktrees/<新树>/crates/kernels
+# 或(更快)把构建指到主树 venv —— build.rs 自带旋钮,不必复制 venv:
+export GDN_TRITON_PY=/home/div/Documents/codes/packages/owl/crates/kernels/.venv/bin/python
+
+# ② 0.8B 测试资产(不建 = `engine --lib` 3 项红:"models/assets/Qwen3.5-0.8B/
+#    config.json: No such file"。2.5G,勿复制,软链即可):
+mkdir -p /home/div/Documents/codes/packages/owl-worktrees/<新树>/crates/models/assets
+for d in /home/div/Documents/codes/packages/owl/crates/models/assets/*; do
+  ln -sfn "$d" "$(dirname "$d")/../.."/crates/models/assets/$(basename "$d") 2>/dev/null || true
+done
+```
+
+冷建一次 **~9 分钟**(44 源 cubin 全编;之后增量 10-20s)。工作树位置与清理纪律见包根 `AGENTS.md`。
+
 ## 维护约定
 
 - 改了**接口/旋钮/端点/门控** ⇒ 顺手改本目录对应段;**文档里出现的命令必须可直接复制执行**。

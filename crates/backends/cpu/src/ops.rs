@@ -432,6 +432,14 @@ pub(crate) fn rmsnorm(
     w_off: bool,
 ) -> Result<Value, ModelError> {
     let cols = cols.max(1);
+    // 长度响亮拒(2026-10-17 审查:同文件 layernorm/bias_add 都查了,唯此处缺
+    // ⇒ 短 alpha 直取 `alpha.f32[c]` = release 索引 panic)
+    if alpha.f32.len() < cols {
+        return Err(ModelError::Msg(format!(
+            "owl_rmsnorm: alpha 长 {} < cols {cols}",
+            alpha.f32.len()
+        )));
+    }
     let rows = x.f32.len() / cols;
     let mut out = vec![0.0f32; x.f32.len()];
     for r in 0..rows {
@@ -444,4 +452,22 @@ pub(crate) fn rmsnorm(
         }
     }
     Ok(Value { f32: out, shape: x.shape.clone() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 长度契约**响亮拒**(2026-10-17 审查 §A3):短 alpha 不许走到索引 panic;
+    /// 同文件 `layernorm` / `bias_add` 早有此查,唯 `rmsnorm` 缺。
+    #[test]
+    fn rmsnorm_rejects_short_alpha_loudly() {
+        let x = Value::new(vec![1.0; 8], vec![2, 4]);
+        let alpha = Value::new(vec![1.0, 1.0], vec![2]); // 短于 cols=4
+        let err = rmsnorm(&x, &alpha, 4, 1e-6, false).expect_err("短 alpha 必须拒");
+        assert!(format!("{err}").contains("alpha"), "{err}");
+        // 齐长则正常
+        let ok = Value::new(vec![1.0, 1.0, 1.0, 1.0], vec![4]);
+        assert!(rmsnorm(&x, &ok, 4, 1e-6, false).is_ok());
+    }
 }

@@ -61,7 +61,7 @@ async fn boot_with(on_full: owl_store::QueuePolicy) -> owl_engine::RunningEngine
     boot_rows(12, on_full).await
 }
 
-/// `rows` = GDN 行池大小(= 并发 turn 天花板,`max_active_turns`)
+/// `rows` = GDN 行池大小(= 并发 turn 天花板,`gdn_slots`)
 async fn boot_rows(
     rows: usize,
     on_full: owl_store::QueuePolicy,
@@ -75,7 +75,7 @@ async fn boot_rows(
             pool_tokens: Some(POOL_TOKENS),
             host_cache_mb: 16, // 整条链(8 块 ≈ 6.3MB)要放得下宿主层
             // 会话不再占行(S2b)⇒ 这一项现在只是"行池大小"(并发 turn 天花板)
-            max_active_turns: rows,
+            gdn_slots: rows,
             admission_on_full: on_full,
             ..Default::default()
         },
@@ -321,9 +321,9 @@ async fn non_strict_dense_floor_is_allowed_when_virtualization_is_on() {
             select_decode: true,
             select_partial: true,
             // 工作集必须 **装得进池**(boot 硬校验,且**按并发乘**:
-            //   nb ≥ max_active_turns × (ceil(workspace_per_req/32) + ceil(chunk/32))
-            // 本档 16 页 ⇒ 11 页/turn × 1 并发 ✓;缺省 max_active_turns=8 会拒)
-            max_active_turns: 1,
+            //   nb ≥ gdn_slots × (ceil(workspace_per_req/32) + ceil(chunk/32))
+            // 本档 16 页 ⇒ 11 页/turn × 1 并发 ✓;缺省 gdn_slots=8 会拒)
+            gdn_slots: 1,
             // 工作集 = 10 页(= 320 tok)⇒ 保底 sink1+recent1 + 召回 top-k 8 块
             // (⚠️ 配置面只给 `workspace_per_req`;`select_blocks` 是装配期派生量,
             //  这里不再手写,免得两个数对不上)

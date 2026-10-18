@@ -79,6 +79,13 @@ pub struct MockLimits {
     /// **默认档与改造前逐条一致**(引擎的"无图能力 ⇒ 回 eager"降级路径
     /// 仍由默认档守着);mock 档置 true 才启用捕获/重放。
     pub graph_capture: bool,
+    /// **未初始化块填毒**(默认 **关** = 现状:块按零初始化)。
+    ///
+    /// 置 true 后 `alloc_uninit` 的新块填 **NaN** 位型 ⇒ "池复用忘 memset /
+    /// 依赖 alloc 恒零"这一缺陷类别在 mock 上**当场显形**(真卡无零保证 ⇒
+    /// 默认档的零初始化本是乐观的)。2026-10-17 审查 §三轮-C1 落地。
+    /// 默认 false ⇒ 存量用例行为逐条不变。
+    pub poison_uninit: bool,
 }
 
 /// 捕获窗里录下的一条发射(重放所需的最小集 —— `LaunchMsg` 本无 `Clone`)。
@@ -215,10 +222,51 @@ impl CpuFace {
         self.pinned_free.len()
     }
 
-    /// 声明事实(`dtype`, 字节数);缺失 = F32(未登记块的兼容默认)
-    fn decl(&self, id: u64) -> (Dtype, usize) {
-        let (d, _) = *self.declared.get(&id).unwrap_or(&(Dtype::F32, 0));
-        (d, d.size_bytes())
+    /// 声明 dtype(**唯一真源** = `declared` 表;缺失 = F32 兼容默认)。
+    ///
+    /// 返回句柄上的 `Bytes.dtype` 只是它的投影 —— 2026-10-17 审查定谳:
+    /// 此前 `alloc` 把句柄钉成 F32、内部表记真 dtype,两个副本各说一套。
+    fn decl_dtype(&self, id: u64) -> Dtype {
+        self.declared.get(&id).map(|(d, _)| *d).unwrap_or(Dtype::F32)
+    }
+
+    /// **设备字节 ↔ 值平面槽位**的唯一折算口(声明 dtype 是权威)。
+    ///
+    /// 值平面恒 f32(一元素一槽),而设备字节数是**声明 dtype** 口径
+    /// (`len × dsz`)。所有入参字节数必须过这里:非整除 / 越界 = **响亮拒**
+    /// (与真卡 `GpuServer::check_range` 同一条语义)。
+    ///
+    /// 病史(2026-10-17 审查 §A1,实测):清零/拷贝/往返四处曾**硬除 4** +
+    /// `.min()` 静默钳位 ⇒ F16/BF16 声明块**静默半做**(8 元素清零只落 4 槽;
+    /// `swap` 字节往返把 [1..8] 腐蚀成 [0,1.875,0,2,…])。
+    fn slots_at(
+        &self,
+        id: u64,
+        off_bytes: usize,
+        len_bytes: usize,
+        what: &str,
+    ) -> Result<std::ops::Range<usize>, ModelError> {
+        let dtype = self.decl_dtype(id);
+        let dsz = dtype.size_bytes();
+        let n = self
+            .blocks
+            .get(&id)
+            .ok_or(ModelError::DeadBlock { id })?
+            .f32
+            .len();
+        if dsz == 0 || off_bytes % dsz != 0 || len_bytes % dsz != 0 {
+            return Err(ModelError::Msg(format!(
+                "CpuFace::{what}: 偏移/长度须按声明 dtype 对齐(块 {id} 声明 {dtype:?} dsz {dsz};off {off_bytes}B len {len_bytes}B)"
+            )));
+        }
+        let (off, slots) = (off_bytes / dsz, len_bytes / dsz);
+        if off + slots > n {
+            return Err(ModelError::Msg(format!(
+                "CpuFace::{what}: 块 {id} 越界(槽 {n};需 {off}..{})",
+                off + slots
+            )));
+        }
+        Ok(off..off + slots)
     }
 
     /// 分配前置:故障注入 + 容量墙(越界 = `PoolExhausted`,响亮 ——
@@ -286,23 +334,32 @@ fn launch_out_facts(msg: &LaunchMsg) -> Result<(u64, (Dtype, u8)), ModelError> {
 /// 的假设传染回调用者，循环重新失优化（实测 19s vs 0.95s）。
 #[inline(never)]
 fn decode_into(dtype: Dtype, src: &[u8], dst: &mut [f32]) -> Result<(), ModelError> {
-    let n = dst.len().min(src.len() / dtype.size_bytes().max(1));
+    let dsz = dtype.size_bytes();
+    // **长度必须精确**(2026-10-17 审查:原先 `.min()` 静默截断 ⇒ 短源被无声吃掉一半)
+    if dsz == 0 || src.len() != dst.len() * dsz {
+        return Err(ModelError::Msg(format!(
+            "decode_into: 字节数 {} ≠ {} 槽 × {dsz}({:?})—— 长度须精确,不许截断",
+            src.len(),
+            dst.len(),
+            dtype
+        )));
+    }
     match dtype {
         Dtype::F32 => {
-            for (i, d) in dst[..n].iter_mut().enumerate() {
+            for (i, d) in dst.iter_mut().enumerate() {
                 let b = 4 * i;
                 *d = f32::from_le_bytes([src[b], src[b + 1], src[b + 2], src[b + 3]]);
             }
         }
         Dtype::F16 => {
             let lut = f16_lut();
-            for (i, d) in dst[..n].iter_mut().enumerate() {
+            for (i, d) in dst.iter_mut().enumerate() {
                 let b = 2 * i;
                 *d = lut[u16::from_le_bytes([src[b], src[b + 1]]) as usize];
             }
         }
         Dtype::BF16 => {
-            for (i, d) in dst[..n].iter_mut().enumerate() {
+            for (i, d) in dst.iter_mut().enumerate() {
                 let b = 2 * i;
                 *d = f32::from_bits((u16::from_le_bytes([src[b], src[b + 1]]) as u32) << 16);
             }
@@ -310,6 +367,47 @@ fn decode_into(dtype: Dtype, src: &[u8], dst: &mut [f32]) -> Result<(), ModelErr
         other => {
             return Err(ModelError::Msg(format!(
                 "decode_into: 不支持的声明 dtype {other:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// **值平面 → 设备字节**(`decode_into` 的逆;同一张 dtype 表)。
+///
+/// 契约:槽数 × dsz == 目标字节数(不等 = 响亮拒)。BF16 与 `decode_into`
+/// 同族:**高 16 位截断**(round-trip 逐位可逆;不用 `from_f32` 的舍入,
+/// 否则 f32→bf16→f32 不再恒等,字节级往返门会假红)。
+#[inline(never)]
+fn encode_from(dtype: Dtype, src: &[f32], dst: &mut [u8]) -> Result<(), ModelError> {
+    let dsz = dtype.size_bytes();
+    if dsz == 0 || dst.len() != src.len() * dsz {
+        return Err(ModelError::Msg(format!(
+            "encode_from: 字节数 {} ≠ {} 槽 × {dsz}({:?})",
+            dst.len(),
+            src.len(),
+            dtype
+        )));
+    }
+    match dtype {
+        Dtype::F32 => {
+            for (i, v) in src.iter().enumerate() {
+                dst[4 * i..4 * i + 4].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        Dtype::F16 => {
+            for (i, v) in src.iter().enumerate() {
+                dst[2 * i..2 * i + 2].copy_from_slice(&half::f16::from_f32(*v).to_le_bytes());
+            }
+        }
+        Dtype::BF16 => {
+            for (i, v) in src.iter().enumerate() {
+                dst[2 * i..2 * i + 2].copy_from_slice(&((v.to_bits() >> 16) as u16).to_le_bytes());
+            }
+        }
+        other => {
+            return Err(ModelError::Msg(format!(
+                "encode_from: 不支持的声明 dtype {other:?}"
             )));
         }
     }
@@ -385,7 +483,29 @@ impl DeviceClient for CpuFace {
         Ok(())
     }
 
-    /// 显存分配(清零;CPU = Vec;无流参数 —— 同步直调即序)。
+    /// **未初始化分配**(2026-10-17 审查 §三轮-C1):默认 = 与 `alloc` 同(清零,
+    /// 存量行为不变 —— 真卡的"未初始化"无零保证,而 mock 此前恒清零,把
+    /// "忘 memset"这一类别整体掩盖);`MockLimits::poison_uninit` 置位 ⇒ 新块
+    /// 填 **NaN** 位型(`0x7FC0_0000`,判据 = 与自身不相等)。
+    async fn alloc_uninit(
+        &mut self,
+        dtype: Dtype,
+        elems: usize,
+        name: &str,
+    ) -> Result<Bytes, ModelError> {
+        let b = self.alloc(dtype, elems, name).await?;
+        if self.mock.poison_uninit {
+            let v = self
+                .blocks
+                .get_mut(&b.id)
+                .ok_or(ModelError::DeadBlock { id: b.id })?;
+            for x in v.f32.iter_mut() {
+                *x = f32::from_bits(0x7FC0_0000);
+            }
+        }
+        Ok(b)
+    }
+
     /// 显存分配(清零;CPU = Vec;无流参数 —— 同步直调即序)。
     /// 声明 dtype 放行 F32/F16/BF16(**存储恒 f32**,声明只入记账/解码口径);
     /// U32/U8 拒(执行面无此值域)。
@@ -411,8 +531,10 @@ impl DeviceClient for CpuFace {
         self.next += 1;
         self.blocks.insert(id, v);
         self.note_alloc(id, dtype, bytes);
-        // CPU 面值块恒 f32;阶数由客户端定形
-        Ok(Bytes::new(id, elems, Dtype::F32, 0))
+        // 值平面恒 f32(一槽一元素),但**句柄 dtype = 声明 dtype**
+        // (2026-10-17 审查:原钉 F32 ⇒ 下游用 `len × dtype.size_bytes()`
+        //  推字节的调用点(graph_plan 段/覆盖块)按 4B 算,与真卡 2B 分家)
+        Ok(Bytes::new(id, elems, dtype, 0))
     }
 
     /// 装载(host 字节 → f32 值块);`_name` 同 [`CpuFace::alloc`](有意不存)。
@@ -430,7 +552,9 @@ impl DeviceClient for CpuFace {
         self.next += 1;
         self.blocks.insert(id, v);
         self.note_alloc(id, dtype, src.len());
-        Ok(Bytes::new(id, 0, dtype, shape.len() as u8))
+        // 句柄事实:len = **元素数**(契约 `Bytes.len` 元素口径;原先恒 0 ⇒
+        // "len × dsz" 推字节的调用点全得 0)
+        Ok(Bytes::new(id, owl_iface::contract::numel(shape), dtype, shape.len() as u8))
     }
 
     /// 归还(记账面覆写;见 [`CpuFace::freed_ids`])—— **不焚数据**:
@@ -454,53 +578,40 @@ impl DeviceClient for CpuFace {
         out: &mut [u8],
     ) -> Result<(), ModelError> {
         self.capture_guard("dtoh_at")?;
-        // **CPU 档口径**:设备字节 = f32(与 engine 在 CPU 面的块布局同口径)
+        // 口径 = **声明 dtype**(与 GpuServer 的 `D2H` 同一条:字节数由调用方
+        // 按声明 dtype 给;此前硬除 4 ⇒ F16/BF16 块读半段并当 f32 编码)
+        let dtype = self.decl_dtype(b.id);
+        let range = self.slots_at(b.id, off_bytes, out.len(), "dtoh_at")?;
         let v = self
             .blocks
             .get(&b.id)
             .ok_or(ModelError::DeadBlock { id: b.id })?;
-        if off_bytes % 4 != 0 || out.len() % 4 != 0 {
-            return Err(ModelError::Msg(format!(
-                "dtoh_at: 偏移/长度须按 4 字节对齐(off={off_bytes} len={})",
-                out.len()
-            )));
-        }
-        let lo = off_bytes / 4;
-        let n = out.len() / 4;
-        if lo + n > v.f32.len() {
-            return Err(ModelError::Msg(format!(
-                "dtoh_at: 块 {} 字节 {} < 偏移 {} + 长 {}",
-                b.id,
-                v.f32.len() * 4,
-                off_bytes,
-                out.len()
-            )));
-        }
-        for (c, d) in out.chunks_exact_mut(4).zip(&v.f32[lo..lo + n]) {
-            c.copy_from_slice(&d.to_le_bytes());
-        }
-        Ok(())
+        encode_from(dtype, &v.f32[range], out)
     }
 
-    /// 收割(f32 口径字节;长度须与块一致)
+    /// 收割(**声明 dtype 字节**;长度须与块一致)
     async fn dtoh(&mut self, b: &Bytes, out: &mut [u8]) -> Result<(), ModelError> {
         self.capture_guard("dtoh")?;
+        let dtype = self.decl_dtype(b.id);
+        let n = self
+            .blocks
+            .get(&b.id)
+            .ok_or(ModelError::DeadBlock { id: b.id })?
+            .f32
+            .len();
+        let want = n * dtype.size_bytes();
+        if want != out.len() {
+            return Err(ModelError::Msg(format!(
+                "dtoh: 块 {} 声明 {dtype:?} 共 {want}B != 收割 {}",
+                b.id,
+                out.len()
+            )));
+        }
         let v = self
             .blocks
             .get(&b.id)
             .ok_or(ModelError::DeadBlock { id: b.id })?;
-        if v.f32.len() * 4 != out.len() {
-            return Err(ModelError::Msg(format!(
-                "dtoh: 块 {} 字节 {} != 收割 {}",
-                b.id,
-                v.f32.len() * 4,
-                out.len()
-            )));
-        }
-        for (c, d) in out.chunks_exact_mut(4).zip(&v.f32) {
-            c.copy_from_slice(&d.to_le_bytes());
-        }
-        Ok(())
+        encode_from(dtype, &v.f32, out)
     }
 
     /// 发射:按 kernel 名路由到朴素算子(动作表的 CPU 面;
@@ -547,19 +658,32 @@ impl DeviceClient for CpuFace {
                     )
                 }
                 Arg::BlockSlice { id, byte_offset, elems, .. } => {
-                    // 刀1:连续切片视图 —— host 真值直接切片(CPU 面零指针;
-                    // byte_offset 字节 ÷ 4 = f32 元素偏移,F32 单一执行面)
+                    // 刀1:连续切片视图 —— host 真值直接切片(CPU 面零指针)。
+                    // 折算口径 = **声明 dtype**(与 `slots_at` 同一折算;F32 块 = /4,
+                    // 与既有行为一致)。2026-10-17 审查:原硬除 4 + 越界**静默保留整块**
+                    // ⇒ 非 F32 块偏移错位、且 `v.shape = vec![n]` 对着整块数据撒谎。
+                    let (byte_offset, n) = (*byte_offset as usize, *elems as usize);
+                    let dsz = self.decl_dtype(*id).size_bytes();
                     let full = self
                         .blocks
                         .get(id)
                         .cloned()
                         .ok_or(ModelError::DeadBlock { id: *id })?;
-                    let off = (byte_offset / 4) as usize;
-                    let n = (*elems) as usize;
-                    let mut v = full;
-                    if off + n <= v.f32.len() {
-                        v.f32 = v.f32[off..off + n].to_vec();
+                    if dsz == 0 || byte_offset % dsz != 0 {
+                        return Err(ModelError::Msg(format!(
+                            "launch(BlockSlice): 字节偏移 {byte_offset} 未按声明 dtype 对齐(块 {id} dsz {dsz})"
+                        )));
                     }
+                    let off = byte_offset / dsz;
+                    if off + n > full.f32.len() {
+                        return Err(ModelError::Msg(format!(
+                            "launch(BlockSlice): 块 {id} 越界(槽 {};需 {off}..{})",
+                            full.f32.len(),
+                            off + n
+                        )));
+                    }
+                    let mut v = full;
+                    v.f32 = v.f32[off..off + n].to_vec();
                     v.shape = vec![n];
                     vals.push(v);
                 }
@@ -657,24 +781,22 @@ impl DeviceClient for CpuFace {
         let __t = std::time::Instant::now();
         // CPU 面 = f32 存储世界，但**解码按声明 dtype**（F32/F16/BF16）；
         // **索引式循环**（§18.4.3 实测：比 `chunks_exact+zip` 快约 2×）。
-        let (dtype, esz) = self.decl(dst.id);
+        // 长度/偏移的非整除与越界在 `slots_at` 里响亮拒(不许静默截尾)。
+        let dtype = self.decl_dtype(dst.id);
+        if len_bytes > buf.as_bytes().len() {
+            return Err(ModelError::Msg(format!(
+                "upload_pinned: 租约 {}B < 声明上传 {len_bytes}B(块 {})",
+                buf.as_bytes().len(),
+                dst.id
+            )));
+        }
         let bytes = &buf.as_bytes()[..len_bytes];
-        let elems = len_bytes / esz;
+        let range = self.slots_at(dst.id, offset_bytes, len_bytes, "upload_pinned")?;
         let v = self
             .blocks
             .get_mut(&dst.id)
             .ok_or(ModelError::DeadBlock { id: dst.id })?;
-        let off = offset_bytes / esz.max(1);
-        let end = off + elems;
-        if v.f32.len() < end {
-            return Err(ModelError::Msg(format!(
-                "upload_pinned: 块 {} 长 {} < 写入终点 {end}(dtype={dtype:?})",
-                dst.id,
-                v.f32.len()
-            )));
-        }
-        let dst = &mut v.f32[off..end];
-        decode_into(dtype, bytes, dst)?;
+        decode_into(dtype, bytes, &mut v.f32[range])?;
         MOCK_CALLS[2].fetch_add(1, Ordering::Relaxed);
         MOCK_NS[2].fetch_add(__t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         // **租约归还池**(与 GPU 面"完成回调归还其池"同语义;§18.4.3)
@@ -757,21 +879,24 @@ impl DeviceClient for CpuFace {
         Ok(())
     }
 
-    /// 块清零(按**声明字节**口径折算元素)
+    /// 块清零(按**声明 dtype** 口径折算元素;越界/非整除 = 响亮拒)
     async fn memset_zero(&mut self, dst: &Bytes, len_bytes: usize) -> Result<(), ModelError> {
         self.capture_guard("memset_zero")?;
+        let range = self.slots_at(dst.id, 0, len_bytes, "memset_zero")?;
         let v = self
             .blocks
             .get_mut(&dst.id)
             .ok_or(ModelError::DeadBlock { id: dst.id })?;
-        let n = (len_bytes / 4).min(v.f32.len());
-        for x in v.f32.iter_mut().take(n) {
+        for x in &mut v.f32[range] {
             *x = 0.0;
         }
         Ok(())
     }
 
-    /// 设备内块→块拷贝(CPU 面 = Vec 片段复制;E2c 快照通道)
+    /// 设备内块→块拷贝(CPU 面 = 声明 dtype 字节的编解码中转;E2c 快照通道)。
+    ///
+    /// 释义 = **字节级拷贝**(真卡 `cudaMemcpyAsync` 同义):源端编码 →
+    /// 目标端解码 ⇒ src/dst 声明 dtype 不同也正确(槽数不必相等)。
     async fn copy_block_at(
         &mut self,
         src: &Bytes,
@@ -781,28 +906,26 @@ impl DeviceClient for CpuFace {
         len_bytes: usize,
     ) -> Result<(), ModelError> {
         self.capture_guard("copy_block_at")?;
-        // **CPU 档口径**:字节 = f32(与 engine 的 CPU 布局一致)
-        let (start, end) = {
+        let (src_dtype, src_range) =
+            (self.decl_dtype(src.id), self.slots_at(src.id, src_off_bytes, len_bytes, "copy_block_at(src)")?);
+        let dst_range = self.slots_at(dst.id, dst_off_bytes, len_bytes, "copy_block_at(dst)")?;
+        // 源 -> 设备字节
+        let bytes = {
             let v = self.blocks.get(&src.id).ok_or(ModelError::DeadBlock { id: src.id })?;
-            let start = (src_off_bytes / 4).min(v.f32.len());
-            (start, (start + len_bytes / 4).min(v.f32.len()))
+            let mut buf = vec![0u8; len_bytes];
+            encode_from(src_dtype, &v.f32[src_range], &mut buf)?;
+            buf
         };
-        let piece: Vec<f32> = {
-            let v = self.blocks.get(&src.id).ok_or(ModelError::DeadBlock { id: src.id })?;
-            v.f32[start..end].to_vec()
-        };
-        let dstart = (dst_off_bytes / 4).min(
-            self.blocks.get(&dst.id).ok_or(ModelError::DeadBlock { id: dst.id })?.f32.len(),
-        );
+        // 设备字节 -> 目标
+        let dtype = self.decl_dtype(dst.id);
         let v = self
             .blocks
             .get_mut(&dst.id)
             .ok_or(ModelError::DeadBlock { id: dst.id })?;
-        v.f32[dstart..dstart + piece.len()].copy_from_slice(&piece);
-        Ok(())
+        decode_into(dtype, &bytes, &mut v.f32[dst_range])
     }
 
-    /// 带偏移的块清零(E2b:GDN 按格重置;CPU 面 = 切片段填零)
+    /// 带偏移的块清零(E2b:GDN 按格重置;声明 dtype 口径)
     async fn memset_zero_at(
         &mut self,
         dst: &Bytes,
@@ -810,13 +933,12 @@ impl DeviceClient for CpuFace {
         len_bytes: usize,
     ) -> Result<(), ModelError> {
         self.capture_guard("memset_zero_at")?;
+        let range = self.slots_at(dst.id, offset_bytes, len_bytes, "memset_zero_at")?;
         let v = self
             .blocks
             .get_mut(&dst.id)
             .ok_or(ModelError::DeadBlock { id: dst.id })?;
-        let start = (offset_bytes / 4).min(v.f32.len());
-        let end = (start + len_bytes / 4).min(v.f32.len());
-        for x in v.f32[start..end].iter_mut() {
+        for x in &mut v.f32[range] {
             *x = 0.0;
         }
         Ok(())
