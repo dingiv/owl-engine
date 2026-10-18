@@ -34,7 +34,7 @@ use crate::command::{Ack, Command};
 use crate::launch::issue_launch;
 use crate::state::{DeviceSelector, GpuCtx, KernelCache, Staging};
 use owl_iface::contract::{Arg, Bytes, Dtype, LaunchMsg};
-use crate::state::{STREAM_COMPUTE, STREAM_D2H, STREAM_H2D};
+use crate::state::{STREAM_COMPUTE, STREAM_COMPUTE_AUX, STREAM_D2H, STREAM_H2D};
 use owl_iface::contract::ModelError;
 use std::sync::mpsc;
 
@@ -498,6 +498,9 @@ impl GpuServer {
             Command::PeerAlloc { bytes, .. } => E::new("peer_alloc", "").bytes(*bytes),
             Command::PeerImport { bytes, .. } => E::new("peer_import", "").bytes(*bytes),
             Command::PeerRelease { .. } => E::new("peer_release", ""),
+            // 捕获期发射路由切换(图内 fork/join;B1 门):不触流(只建图的依赖边)
+            Command::CaptureRoute { .. } => E::new("capture_route", ""),
+            Command::CaptureJoin { .. } => E::new("capture_join", ""),
             Command::UploadAndLaunch { dst, chunks, .. } => {
                 let n: usize = chunks.iter().map(|c| c.len_bytes).sum();
                 E::new("upload_and_launch", "h2d").bytes(n).id(dst.id)
@@ -772,7 +775,7 @@ impl GpuServer {
         }
         self.scratch_ledger.clear();
         if let Some(ctx) = &self.ctx {
-            for sid in [STREAM_H2D, STREAM_COMPUTE, STREAM_D2H] {
+            for sid in [STREAM_H2D, STREAM_COMPUTE, STREAM_COMPUTE_AUX, STREAM_D2H] {
                 if let Ok(s) = ctx.stream(sid) {
                     let _ = s.synchronize();
                 }
@@ -840,7 +843,7 @@ impl GpuServer {
         // 序消费在 E2/E3)。捕获期自动跳过(见 `record_tail`)。
         if sbits != 0 {
             let t_ev = if timing { Some(std::time::Instant::now()) } else { None };
-            for sid in [STREAM_H2D, STREAM_COMPUTE, STREAM_D2H] {
+            for sid in [STREAM_H2D, STREAM_COMPUTE, STREAM_COMPUTE_AUX, STREAM_D2H] {
                 if sbits & (1u8 << sid) == 0 {
                     continue;
                 }
@@ -912,6 +915,11 @@ impl GpuServer {
                 // 窗内出错/空窗的收尾手段 ⇒ 捕获期必须允许(否则只能等
                 // 窗自然结束,slab 留尸)
                 Command::GraphAbort { ack } => ack.send(self.ctx_mut().graph_abort()),
+                // ★ **捕获期专属口**:它就是"图内多流"的 fork/join 边(B1 门)
+                Command::CaptureRoute { sid, ack } => {
+                    ack.send(self.ctx_mut().capture_route_to(sid as u64))
+                }
+                Command::CaptureJoin { ack } => ack.send(self.ctx_mut().capture_join()),
                 // **M1:捕获窗内放行 Free** —— 锚定活性回收(reclaim_capture)
                 // 的必要条件。窗内 `free_blocks` 三条路**零 CUDA 调用**:
                 // ①跨流事件栅栏本就在 `capture.is_none()` 守卫下跳过;
@@ -931,7 +939,7 @@ impl GpuServer {
                 //   —— 这条正是白名单存在的**真正理由**,而它已经满足;
                 // · 与相邻核**同流保序**(memcpy 节点与 Launch 节点同在 COMPUTE 流)。
                 // ⚠️ 新增节点类型 ⇒ 必须有"图回放 ≡ eager 逐位"的判据:
-                //   门的落点 = `owl-comm` 的 `ar_stress_gate::ar_stress_graph`(20 轮回放
+                //   门的落点 = `owl-cuda` 的 `ar_stress_gate::ar_stress_graph`(20 轮回放
                 //   逐位)+ `ar_transport_gate` 的 G3。
                 Command::CopyBlock { src, src_off_bytes, dst, dst_off_bytes, len_bytes, ack } => {
                     self.handle_copy_block(src, src_off_bytes, dst, dst_off_bytes, len_bytes, ack)
@@ -947,8 +955,8 @@ impl GpuServer {
                 self.handle_memset_zero(block, offset_bytes, len_bytes, ack)
             }
             Command::PeerAlloc { bytes, name, ack } => self.handle_peer_alloc(bytes, name, ack),
-            Command::PeerImport { credential, bytes, peer_uuid, name, ack } => {
-                self.handle_peer_import(credential, bytes, peer_uuid, name, ack)
+            Command::PeerImport { credential, bytes, peer_uuid, name, rw, ack } => {
+                self.handle_peer_import(credential, bytes, peer_uuid, name, rw, ack)
             }
             Command::PeerRelease { ids, ack } => self.handle_peer_release(ids, ack),
             Command::Htod { data, name, ack } => self.handle_htod(data, name, ack),
@@ -984,6 +992,11 @@ impl GpuServer {
             Command::GraphBegin { ack } => ack.send(self.ctx_mut().graph_begin()),
             Command::GraphEnd { ack } => ack.send(self.ctx_mut().graph_end()),
             Command::GraphAbort { ack } => ack.send(self.ctx_mut().graph_abort()),
+            // ★ 捕获期发射路由切换(图内 fork/join;B1 门)
+            Command::CaptureRoute { sid, ack } => {
+                ack.send(self.ctx_mut().capture_route_to(sid as u64))
+            }
+            Command::CaptureJoin { ack } => ack.send(self.ctx_mut().capture_join()),
             Command::GraphDestroy { graph, ack } => ack.send(self.ctx_mut().graph_destroy(graph)),
             Command::GraphLaunch { graph, ack } => {
                 ack.send(self.ctx_mut().graph_launch(graph))
@@ -1031,6 +1044,8 @@ impl GpuServer {
             Command::GraphEnd { ack, .. } => closed!(ack),
             Command::GraphLaunch { ack, .. } => closed!(ack),
             Command::GraphAbort { ack, .. } => closed!(ack),
+            Command::CaptureRoute { ack, .. } => closed!(ack),
+            Command::CaptureJoin { ack, .. } => closed!(ack),
             Command::GraphDestroy { ack, .. } => closed!(ack),
         }
     }
@@ -1050,6 +1065,8 @@ impl GpuServer {
             Command::GraphEnd { .. } => "GraphEnd",
             Command::GraphLaunch { .. } => "GraphLaunch",
             Command::GraphAbort { .. } => "GraphAbort",
+            Command::CaptureRoute { .. } => "CaptureRoute",
+            Command::CaptureJoin { .. } => "CaptureJoin",
             Command::GraphDestroy { .. } => "GraphDestroy",
             Command::Alloc { .. } => "Alloc",
             Command::MemsetZero { .. } => "MemsetZero",
@@ -1099,6 +1116,10 @@ impl GpuServer {
             Command::CopyBlock { ack, .. } => reject!(ack),
             Command::CopyBatch { ack, .. } => reject!(ack),
             Command::Launch { ack, .. } => reject!(ack),
+            // CaptureRoute 与捕获期**互为表里**:捕获期在白名单里放行,
+            // 非捕获期落到这里(该命令本就不该在窗外调 —— 图已建,流已定)。
+            Command::CaptureRoute { ack, .. } => reject!(ack),
+            Command::CaptureJoin { ack, .. } => reject!(ack),
             Command::Close { ack } => ack.send(Ok(())), // 幂等
         }
     }
@@ -1135,7 +1156,8 @@ impl GpuServer {
                 let id = self.ctx_mut().carve_block(n_bytes, name)?;
                 self.trace_alloc_done(id);
                 if zero {
-                    let stream = self.ctx().stream(STREAM_COMPUTE)?.clone();
+                    // ★ 与发射**同流**(捕获期 = 路由流):memset 与写该块的核必须同序
+                    let stream = self.ctx().launch_stream()?;
                     let (dptr, _) = self.ctx().block_ptr(id, &stream)?;
                     if self.probes.cap_prof {
                         self.sink.logf(owl_shared::log::LVL_DEBUG, "cap-prof", format_args!("carve-memset {}B", n_bytes));
@@ -1281,7 +1303,8 @@ impl GpuServer {
         len_bytes: usize,
         ack: Ack<Result<(), ModelError>>,
     ) {
-        let stream = match self.ctx().stream(STREAM_COMPUTE) {
+        // ★ 与发射**同流**(捕获期 = 路由流) —— B1 多流图
+        let stream = match self.ctx().launch_stream() {
             Ok(s) => s.clone(),
             Err(e) => return ack.send(Err(e)),
         };
@@ -1471,7 +1494,13 @@ impl GpuServer {
             Some(c) => c,
             None => return Err(ModelError::Msg("server 未上线".to_string())),
         };
-        let stream = match ctx.stream(STREAM_COMPUTE) {
+        // ★★ **捕获期走路由流**(2026-10-18 §39 修):这一处是 §33「发射路由跟着捕获走」
+        // 的**核心那处**,却一直写死 COMPUTE —— 后果是 `capture_route_to` 对**核发射
+        // 完全无效**(只有 memset/copy 三处跟了路由)⇒ 所有"图内多流"实验其实都是
+        // **单流**,`graph_multistream_gate` M1-M5 的"双流"判据与 §38.3 的
+        // "图内串行 1.000" **全部作废**。
+        // 图外行为不变:`launch_stream()` 无捕获时 = `stream(STREAM_COMPUTE)`。
+        let stream = match ctx.launch_stream() {
             Ok(s) => s.clone(),
             Err(e) => return Err(e),
         };
@@ -1604,7 +1633,11 @@ impl GpuServer {
         len_bytes: usize,
         ack: Ack<Result<(), ModelError>>,
     ) {
-        let stream = match self.ctx().stream(STREAM_COMPUTE) {
+        // ★ **捕获期走路由流**(2026-10-18 §38 修):D2D 搬运也是图节点,必须与
+        // fork/join 的路由一致 —— 否则图内搬运永远落在 COMPUTE,双流对它无效
+        // (§33 的落地记录写的是"四处都跟着捕获走",实测**只有 launch/memset 两处**;
+        //  copy_block/copy_batch 仍是写死的 COMPUTE)。
+        let stream = match self.ctx().launch_stream() {
             Ok(s) => s.clone(),
             Err(e) => return ack.send(Err(e)),
         };
@@ -1624,6 +1657,9 @@ impl GpuServer {
             }
             .map_err(|e| ModelError::Msg(format!("copy_block: {e:?}")))
         })();
+        if result.is_ok() {
+            self.ctx_mut().note_copy();
+        }
         ack.send(result);
     }
 
@@ -1664,7 +1700,7 @@ impl GpuServer {
         // 排空点:三条流全部 synchronize(阻塞 actor 至全部完成;语义栅栏)。
         // host 回调的 finish 由派发线程独立送达,与本栅栏互不依赖。
         let result = (|| {
-            for sid in [STREAM_H2D, STREAM_COMPUTE, STREAM_D2H] {
+            for sid in [STREAM_H2D, STREAM_COMPUTE, STREAM_COMPUTE_AUX, STREAM_D2H] {
                 self.ctx()
                     .stream(sid)?
                     .synchronize()

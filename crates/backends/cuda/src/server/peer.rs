@@ -122,20 +122,22 @@ impl GpuServer {
         bytes: usize,
         peer_uuid: String,
         name: String,
+        rw: bool,
         ack: Ack<Result<Bytes, ModelError>>,
     ) {
         let t0 = std::time::Instant::now();
         let result = (|| {
             let (mapped, fd) = cred_decode(&credential)?;
-            let id = self.ctx_mut().peer_import(fd, mapped, bytes, &peer_uuid, &name)?;
+            let id = self.ctx_mut().peer_import(fd, mapped, bytes, &peer_uuid, &name, rw)?;
             self.trace_alloc_done(id);
             self.sink.logf(
                 owl_shared::log::LVL_INFO,
                 "peer",
                 format_args!(
-                    "PeerImport id={id} 请求 {}MiB / 对端映射 {}MiB(peer={peer_uuid} name={name})",
+                    "PeerImport id={id} 请求 {}MiB / 对端映射 {}MiB(peer={peer_uuid} name={name} 权限={})",
                     bytes >> 20,
-                    mapped >> 20
+                    mapped >> 20,
+                    if rw { "RW(push)" } else { "R" }
                 ),
             );
             Ok(Bytes::new(id, bytes, Dtype::U8, 1))

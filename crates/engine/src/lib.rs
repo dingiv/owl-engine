@@ -70,7 +70,7 @@ pub fn head_plan_of(hq: owl_shared::config::HeadQuant) -> owl_models::module::Qu
     }
 }
 pub use running::RunningEngine;
-pub use tp::{TpEngine, TpStaging};
+pub use tp::{TpEngine, TpOpts, TpStaging};
 pub use graph_plan::{GraphPlan, GraphPlanDesc, PlanOutcome};
 pub use session::{AgentSession, SessionTable};
 pub use turn::{TurnEvent, TurnOpts, TurnSampler, TurnSpec};

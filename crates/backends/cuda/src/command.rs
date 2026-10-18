@@ -40,6 +40,31 @@ pub enum Command {
     GraphAbort {
         ack: Ack<Result<(), ModelError>>,
     },
+    /// ★ **捕获期的发射路由切换**(图内 fork/join,2026-10-18;B1 门)。
+    ///
+    /// `sid` = 目标流(0=H2D / 1=COMPUTE / 2=D2H / 3=COMPUTE_AUX;
+    /// 数值与 `state::STREAM_*` 同源 —— 线上只有 u8,防枚举漂移)。
+    /// 语义三条(实现见 `state.rs::capture_route_to`):
+    /// 1. 在**当前**路由流记一个 `DISABLE_TIMING` 事件,目标流 `wait` 它
+    ///    —— 这条依赖边**被捕获进图** ⇒ 目标流被卷入同一张图;
+    /// 2. 之后本窗的 `Launch`/`CopyBlock`/`Memset` **路由到目标流**;
+    /// 3. `graph_end` 仍在 **origin**(发起捕获那条)上收窗。
+    ///
+    /// 为何是**独立命令**而不是给 `Launch` 加流字段:§3.2 的立场是**流不暴露给
+    /// 客户端**(序由意图复合、策略由 server 独占) —— 这条同样落在 server 侧,
+    /// 且它只在**捕获期**合法(回放期的流由图自己记)。
+    CaptureRoute {
+        sid: u8,
+        ack: Ack<Result<(), ModelError>>,
+    },
+    /// ★ **捕获期的 join**(主链等支链;2026-10-18)。
+    ///
+    /// 在当前路由流记一个 `DISABLE_TIMING` 事件,**origin 等它**,路由切回 origin。
+    /// 只在**有人真的要消费支链结果**时用 —— 拿它当"切流程"用会把两条链拴成
+    /// 串行(`capture_route_to` 的 M5 教训同源)。
+    CaptureJoin {
+        ack: Ack<Result<(), ModelError>>,
+    },
     /// **销毁已登记图**(单图退休:LRU 驱逐 / plan `close()` 底层)。三件事:
     /// 排空回放 → 解除本图块租约(归零即解钉)→ 本图 slab 块整批移出账房
     GraphDestroy {
@@ -90,6 +115,11 @@ pub enum Command {
         bytes: usize,
         peer_uuid: String,
         name: String,
+        /// **导入侧访问级别**(2026-10-18;TP2 施工设计 §36.6):
+        /// `false` = `PROT_READ`(v1 只读对端,现役行为);
+        /// `true` = `PROT_READWRITE`(**push 协议前置** —— 本端要写对端槽)。
+        /// 授权对象始终是**本端设备**(`set_access_self`),不是 peer。
+        rw: bool,
         ack: Ack<Result<Bytes, ModelError>>,
     },
     /// **peer 资源释放**(TP2 S1;D2 裁决:显式释放 + `Drop` 兜底)。
@@ -238,6 +268,8 @@ impl Command {
             Self::GraphEnd { .. } => "graph_end",
             Self::GraphLaunch { .. } => "graph_launch",
             Self::GraphAbort { .. } => "graph_abort",
+            Self::CaptureRoute { .. } => "capture_route",
+            Self::CaptureJoin { .. } => "capture_join",
             Self::GraphDestroy { .. } => "graph_destroy",
             Self::Alloc { .. } => "alloc",
             Self::Htod { .. } => "htod",
@@ -272,6 +304,8 @@ impl Command {
             Self::GraphEnd { ack } => ack.created_at(),
             Self::GraphLaunch { ack, .. } => ack.created_at(),
             Self::GraphAbort { ack } => ack.created_at(),
+            Self::CaptureRoute { ack, .. } => ack.created_at(),
+            Self::CaptureJoin { ack } => ack.created_at(),
             Self::GraphDestroy { ack, .. } => ack.created_at(),
             Self::Alloc { ack, .. } => ack.created_at(),
             Self::Htod { ack, .. } => ack.created_at(),

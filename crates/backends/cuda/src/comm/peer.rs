@@ -14,16 +14,18 @@
 //! 额度核算与拒绝(`PeerPlan::plan`)/ staging 布局(`ar::StagingLayout`)
 //! —— 全部可在 CPU 上单测。
 //!
-//! **握手编排(分配→导出→导入→授予)不在本 crate**:它要同时持有两侧
-//! actor 句柄(`peer_alloc`/`peer_import`),而 `owl-comm` 不依赖 `owl-cuda`
-//! —— 实现落在 `owl-engine::tp`(S4 ⑤-K2;`TpEngine::assemble`),那里
-//! 消费本模块的 `PeerPlan` 作为唯一判定。
+//! **握手编排(分配→导出→导入→授予)不在本模块**:它要同时持有两侧
+//! actor 句柄(`peer_alloc`/`peer_import`)—— 2026-10-18 两包合并前它落在
+//! `owl-engine::tp`(S4 ⑤-K2;`TpEngine::assemble`),那里消费本模块的
+//! `PeerPlan` 作为唯一判定。
+//! (合并后本模块已在 `owl-cuda` 内,但**编排仍留在 engine** —— 它持的是
+//! "两侧引擎"这个上层概念,不是 server 的内部状态。)
 
-use crate::CommError;
+use super::CommError;
 
 // 三个额度常量**单源在 `owl_shared::device`**(2026-10-16 C1:执行层
 // `owl-cuda` 也要读同一份 —— 不许两边各写一套)。此处 re-export 保持
-// 本模块 API 路径(`crate::peer::PEER_ALLOC_HARD_CAP`)稳定。
+// 本模块 API 路径(`crate::comm::peer::PEER_ALLOC_HARD_CAP`)稳定。
 pub use owl_shared::device::{PEER_ALLOC_HARD_CAP, STATIC_BAR1_MIN, WINDOW_BAR1_RESERVE};
 
 /// 单卡的对等体能力描述(boot 期探测一次;热路径零探测 —— A2.4)。
@@ -108,7 +110,7 @@ pub struct PeerPlan {
 impl PeerPlan {
     /// 计划:分档 → 上限 → 额度核算。**额度超限 = 结构化拒绝**(不静默缩容)。
     ///
-    /// `staging_bytes` 由调用方按 [`crate::ar::StagingLayout::total_bytes`] 算出
+    /// `staging_bytes` 由调用方按 [`super::ar::StagingLayout::total_bytes`] 算出
     /// (两 rank 必须同值 —— 协议对称性前提)。
     pub fn plan(
         a: &PeerCaps,
@@ -191,7 +193,7 @@ mod tests {
 
     #[test]
     fn plan_rejects_over_limit_and_zero() {
-        let m = 2 * (32 << 20) + crate::ar::HEADER_BYTES; // 64MiB + 64B
+        let m = 2 * (32 << 20) + crate::comm::ar::HEADER_BYTES; // 64MiB + 64B
         // 正常:3080 对 staging 64MiB 在 192MiB 内
         let p = PeerPlan::plan(&narrow(), &narrow(), m).expect("3080 对计划应成立");
         assert_eq!(p.mechanism, PeerMechanism::Window);

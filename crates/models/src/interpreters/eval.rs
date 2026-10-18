@@ -743,6 +743,32 @@ where
         self.alloc_out(dtype, n_elems, zeroed, name).await
     }
 
+    /// ★ **1-stage 的输出槽**(2026-10-18;`TP2-施工设计.md` §35):
+    /// 把"要做 AR 的那一个输出"**直接放进对称槽** —— 上游 GEMM 写它 ⇒ 对端就
+    /// 能读它 ⇒ 融合核(`owl_comm_ar_1stage_*`)原地加,**stage 段整段消失**。
+    ///
+    /// 返回 `None` 的两种情况(**都退回 v1 两段**,不静默错):
+    /// ① 引擎没开 arena(老路径 / 单卡);② 槽装不下本次载荷。
+    /// 槽选择 = `TpArenaSlots::next_pair()`(乒乓 + 建图期递增序号)。
+    ///
+    /// ⚠️ 返回值是**重新构造**的 `Bytes`(元素数 = `n_elems`)—— 因为槽本身是
+    /// `U8` 块(`len` 是字节数),直接 `view` 会让 `len` 单位与 dtype 错位。
+    fn symmetric_out_slot(&self, is_ar: bool, dtype: Dtype, n_elems: usize) -> Option<Bytes> {
+        if !is_ar {
+            return None;
+        }
+        let a = self.tp.as_ref()?.arena.as_ref()?;
+        let need = n_elems * dtype.size_bytes();
+        if (a.slot_bytes as usize) < need {
+            return None; // 槽装不下 ⇒ 回退 v1(载荷 > slot_bytes 在注入点另有响亮拒)
+        }
+        let (own, _peer) = a.next_pair();
+        // ⚠️ rank 留 0:由调用点 `.view(dtype, shape.len())` 定形 —— 与私有块路径
+        // **逐参同款**(算子准入按声明校验 rank;2026-10-18 这里给 1 撞过
+        // `cublas_gemm_f16: out 期望 rank = 2 实得 1`)。
+        Some(Bytes::new(own.id, n_elems, dtype, 0))
+    }
+
     /// 块获取(真分配或池命中)。
     ///
     /// `name` = **分配点点名**(全量记名纪律;传给 `face.alloc` ⇒ 服务端块账房
@@ -972,7 +998,21 @@ where
             // k = 内维 = x 声明 shape 末维(C1:只读声明 shape;原取 ins[0].len
             // 在多行 [m,k] 时越界读 —— 此 bug 被"历届测试都单行"掩盖)
             let k = t.parents[0].shape.last().copied().unwrap_or(0);
-            let out = ctx.alloc_out_node(t.id, dtype, m * n, false, class).await?.view(dtype, shape.len() as u8);
+            // ★ **1-stage(§35)**:Matmul 的输出就是 AR 的 payload(最常见的那条)
+            // —— 必须也走对称槽,否则融合核永远拿不到 out。
+            // ⚠️ 2026-10-18 踩过:只改了 `Op::Call` 的 alloc 点 ⇒ 1-stage **从未执行**
+            // (融合核 0 次、两段核照跑 1344 次),而门全绿 ⇒ "中性"结论是假的。
+            let out = match ctx.symmetric_out_slot(
+                t.tp_role == crate::plan::rules::WeightRule::UniformRow,
+                dtype,
+                m * n,
+            ) {
+                Some(b) => b.view(dtype, shape.len() as u8),
+                None => ctx
+                    .alloc_out_node(t.id, dtype, m * n, false, class)
+                    .await?
+                    .view(dtype, shape.len() as u8),
+            };
             owl_shared::slab_hint::probe_name(out.id, class);
             ctx.track_new(out.id);
             if dtype == Dtype::F16 || dtype == Dtype::BF16 {
@@ -1062,7 +1102,19 @@ where
             if let Some(l) = lap.as_mut() {
                 l.lap("interp.host.seg.build");
             }
-            let out = ctx.alloc_out_node(t.id, dtype, n_elems, false, class).await?.view(dtype, shape.len() as u8);
+            // ★ **1-stage(§35)**:要做 AR 的输出直接落进对称槽(GEMM 写它 ⇒ 对端可读)。
+            // 无 arena / 槽装不下 = 退回私有块 + v1 两段(不静默错)。
+            let out = match ctx.symmetric_out_slot(
+                t.tp_role == crate::plan::rules::WeightRule::UniformRow,
+                dtype,
+                n_elems,
+            ) {
+                Some(b) => b.view(dtype, shape.len() as u8),
+                None => ctx
+                    .alloc_out_node(t.id, dtype, n_elems, false, class)
+                    .await?
+                    .view(dtype, shape.len() as u8),
+            };
             // 峰值归因:本输出块挂上核名(`class` 已在上面 resolve 处覆写为核名)
             owl_shared::slab_hint::probe_name(out.id, class);
             if let Some(l) = lap.as_mut() {
@@ -1118,26 +1170,83 @@ where
                     t.label(),
                     tp.slot_bytes
                 );
-                let stage = owl_kernels::client::comm::ArStageCall::new(
-                    out.clone(),
-                    tp.own.clone(),
-                    tp.peer.clone(),
-                    n_bytes as u64,
-                    tp.slot_bytes,
-                    0,
-                )
-                .to_launch();
-                ctx.face.launch(stage).await?;
-                let reduce = owl_kernels::client::comm::ArReduceCall::new(
-                    out.clone(),
-                    tp.own.clone(),
-                    tp.peer.clone(),
-                    n_bytes as u64,
-                    tp.slot_bytes,
-                    0,
-                )
-                .to_launch();
-                ctx.face.launch(reduce).await?;
+                // ★ **1-stage(§35)**:本次输出落在对称槽里 ⇒ 融合核**原地加对端槽**
+                // (没有 stage 段、没有拷贝、少一个图节点)。判据 = `out.id` 是不是
+                // arena 的槽(alloc 时选的那一个)—— 不需额外字段/标志。
+                // ★ **路径存在性判据**(2026-10-18):`tp.ar.1stage` / `tp.ar.v1`
+                // 两个 counter —— 门断言"开 1-stage 时前者 > 0 且后者 == 0"。
+                // 动机是现场教训:融合核写好了、门全绿,但它**一次都没被走到**
+                // (只改了 `Op::Call` 的 alloc,payload 却来自 `Op::Matmul`)。
+                let fused = match tp.arena.as_ref() {
+                    Some(a) => match a.own_slots.iter().position(|s| s.id == out.id) {
+                        Some(i) => {
+                            let call = owl_kernels::client::comm::Ar1StageCall::new(
+                                out.clone(),
+                                a.own_hdr.clone(),
+                                a.peer_hdr.clone(),
+                                a.peer_slots[i].clone(),
+                                n_bytes as u64,
+                            )
+                            .to_launch();
+                            ctx.face.launch(call).await?;
+                            owl_shared::metrics::with_metrics_store(|s| {
+                                s.counter_add("tp.ar.1stage", 1, file!(), line!())
+                            });
+                            true
+                        }
+                        None => false,
+                    },
+                    None => false,
+                };
+                if !fused {
+                    // ★ **push 档(§36.6/§36.7)**:两核把 `own`/`peer` **实参对调** ——
+                    //   v1 : stage 写**本端**槽 → reduce 读**对端**槽（数据腿 = 读对端）
+                    //   push: stage 写**对端**槽 → reduce 读**本端**槽（数据腿 = 写对端）
+                    // 协议（credit / produced / rendezvous / 两级等待）**逐字不变** ——
+                    // 两个游标的相对比较在两种绑法下都成立（推导见 §36.6）。
+                    // ★ **push 档(§36.6/§36.7)**:header(`own`/`peer`)两档**都不变**;
+                    // 变的只是**数据块** —— stage 写哪里 / reduce 读哪里。
+                    //   v1 : stage 写**本端**槽 → reduce 读**对端**槽(数据腿 = 读对端)
+                    //   push: stage 写**对端**槽 → reduce 读**本端**槽(数据腿 = 写对端)
+                    // 为什么 header 不动:`wait_done`/`blocks_done` 是**本核内部的块间
+                    // 令牌** —— 把它们搬到对端会让 15 个 block 紧自旋**远端读**,实测把
+                    // AR 从 601µs 拉到 1225µs(§36.8)。协议(credit/produced/rendezvous)
+                    // 在两种绑法下都成立(推导见 §36.6)。
+                    let (stage_data, reduce_data) = if tp.push {
+                        owl_shared::metrics::with_metrics_store(|s| {
+                            s.counter_add("tp.ar.push", 1, file!(), line!())
+                        });
+                        (tp.peer.clone(), tp.own.clone())
+                    } else {
+                        owl_shared::metrics::with_metrics_store(|s| {
+                            s.counter_add("tp.ar.v1", 1, file!(), line!())
+                        });
+                        (tp.own.clone(), tp.peer.clone())
+                    };
+                    // 两段(私有 payload ⇒ 先 stage 到 staging,再归约对端/本端 slot)
+                    let stage = owl_kernels::client::comm::ArStageCall::new(
+                        out.clone(),
+                        tp.own.clone(),
+                        tp.peer.clone(),
+                        stage_data,
+                        n_bytes as u64,
+                        tp.slot_bytes,
+                        0,
+                    )
+                    .to_launch();
+                    ctx.face.launch(stage).await?;
+                    let reduce = owl_kernels::client::comm::ArReduceCall::new(
+                        out.clone(),
+                        tp.own.clone(),
+                        tp.peer.clone(),
+                        reduce_data,
+                        n_bytes as u64,
+                        tp.slot_bytes,
+                        0,
+                    )
+                    .to_launch();
+                    ctx.face.launch(reduce).await?;
+                }
                 out // 别名:payload 原地累加
             }
             None => out, // 单卡:无 TP 上下文
@@ -1301,6 +1410,8 @@ mod tp_injection_tests {
             own,
             peer,
             slot_bytes: 64,
+            arena: None,
+            push: false,
         };
         let err = eval_ops_scoped_env(
             &row_node(),
@@ -1336,6 +1447,8 @@ mod tp_injection_tests {
             own,
             peer,
             slot_bytes: 4, // < 载荷 8B
+            arena: None,
+            push: false,
         };
         let err = eval_ops_scoped_env(
             &row_node(),

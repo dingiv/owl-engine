@@ -32,6 +32,7 @@ mod server;
 mod state;
 mod vmm;
 
+pub mod comm;
 pub mod ffi;
 pub mod trace;
 
@@ -44,6 +45,8 @@ pub use gpu_client::GpuClient;
 pub use state::DiagOpts;
 pub use server::GpuServer;
 pub use state::DeviceSelector;
+/// ★ 第二条计算流 id(图内 fork/join 的目标;B1 门)—— 测试/探针引它,别写数字
+pub use state::STREAM_COMPUTE_AUX;
 
 /// 单笔 peer 分配硬上限(192 MiB;**单源** = `owl_shared::device`;
 /// server 侧额度门与 comm 策略分档读同一份 —— 2026-10-16 C1)

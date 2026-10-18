@@ -397,8 +397,18 @@ async fn actor_main(
                     ord[1],
                     t0.elapsed().as_secs_f32()
                 );
-                let tp = owl_engine::TpEngine::assemble(vec![engine, engine1], vec![model0, model1])
-                    .await?;
+                let tp = owl_engine::TpEngine::assemble_with(
+                    vec![engine, engine1],
+                    vec![model0, model1],
+                    owl_engine::TpOpts { push: config.tp_push },
+                )
+                .await?;
+                if config.tp_push {
+                    owl_shared::log_info!(
+                        "boot",
+                        "TP2 **push 档**已开(runtime.tp_push):数据腿 = 写对端槽(RW 别名)"
+                    );
+                }
                 owl_shared::log_info!(
                     "boot",
                     "TP2 装配完成(分档 + staging 握手 + 双 rank 图捕获):{:.2}s",

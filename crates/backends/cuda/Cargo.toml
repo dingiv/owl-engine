@@ -37,4 +37,3 @@ thiserror = { workspace = true }
 half = { version = "2.7.1", features = ["use-intrinsics"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 # TP2 AR 门(G1/G2/G3):chunk 计划展开与 staging 布局的**单源**(comm 侧)
-owl-comm = { path = "../comm" }

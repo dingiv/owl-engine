@@ -6,7 +6,7 @@
 //! **F2 尺寸自证**(家族直发前):payload 与 staging 两块都按账长校验
 //! "请求落在块内" —— 内核越界不会当场报错(写进邻块),必须在这里结构化拒。
 
-use crate::client::comm::{ArReduceCall, ArStageCall};
+use crate::client::comm::{Ar1StageCall, ArReduceCall, ArStageCall};
 use crate::contract::{Bytes, Dtype, LaunchMsg, OpError, OpId};
 use crate::device::{Exec, LaunchVal};
 use crate::family::comm::asset;
@@ -115,6 +115,7 @@ fn launch_ar(
     a: u64,
     own: u64,
     peer: u64,
+    data: u64,
     bytes: u64,
     slot_bytes: u64,
     slab_off: u64,
@@ -132,6 +133,7 @@ fn launch_ar(
             LaunchVal::Ptr(a),
             LaunchVal::Ptr(own),
             LaunchVal::Ptr(peer),
+            LaunchVal::Ptr(data),
             LaunchVal::U64(bytes),
             LaunchVal::U64(slot_bytes),
             LaunchVal::U64(slab_off),
@@ -190,8 +192,9 @@ impl KernelFamily for CommArStageRuntime {
         let local_p = res.resolve(call.local().id)?;
         let own_p = res.resolve(call.own().id)?;
         let peer_p = res.resolve(call.peer().id)?;
+        let data_p = res.resolve(call.data().id)?;
         launch_ar(
-            Self::ID, "ar_stage", res, exec, k, local_p, own_p, peer_p, call.bytes(),
+            Self::ID, "ar_stage", res, exec, k, local_p, own_p, peer_p, data_p, call.bytes(),
             call.slot_bytes(), call.slab_off(),
             ar_reduce_grid(call.local().dtype, call.bytes()),
         )?;
@@ -247,10 +250,105 @@ impl KernelFamily for CommArReduceRuntime {
         let out_p = res.resolve(call.out().id)?;
         let own_p = res.resolve(call.own().id)?;
         let peer_p = res.resolve(call.peer().id)?;
+        let data_p = res.resolve(call.data().id)?;
         let grid = ar_reduce_grid(call.out().dtype, call.bytes());
         launch_ar(
-            Self::ID, "ar_reduce", res, exec, k, out_p, own_p, peer_p, call.bytes(),
+            Self::ID, "ar_reduce", res, exec, k, out_p, own_p, peer_p, data_p, call.bytes(),
             call.slot_bytes(), call.slab_off(), grid,
+        )?;
+        Ok(out)
+    }
+}
+
+// ============================================================================
+// 1-stage 族(对称缓冲 ⇒ 融合核,无 stage 段;`TP2-施工设计.md` §35)
+// ============================================================================
+
+/// 1-stage 发射(`out, own_hdr, peer_hdr, peer_data, bytes` —— 比 2-stage 少两个参数:
+/// 槽即块,没有 `slot_bytes`/`slab_off`)
+#[allow(clippy::too_many_arguments)]
+fn launch_ar_1stage(
+    op: OpId,
+    kernel: &'static str,
+    res: &mut dyn crate::device::DeviceRes,
+    exec: &mut Exec,
+    k: &K,
+    out: u64,
+    own: u64,
+    peer: u64,
+    peer_data: u64,
+    bytes: u64,
+    grid: (u32, u32, u32),
+) -> Result<(), OpError> {
+    exec.launch(
+        res,
+        op,
+        k,
+        kernel,
+        grid,
+        (asset::BLOCK, 1, 1),
+        0,
+        &[
+            LaunchVal::Ptr(out),
+            LaunchVal::Ptr(own),
+            LaunchVal::Ptr(peer),
+            LaunchVal::Ptr(peer_data),
+            LaunchVal::U64(bytes),
+        ],
+    )
+}
+
+/// allreduce 1-stage runtime(`comm_ar_1stage`)
+pub struct CommAr1StageRuntime {
+    k_f32: Option<K>,
+    k_f16: Option<K>,
+    k_bf16: Option<K>,
+}
+
+impl CommAr1StageRuntime {
+    pub const ID: OpId = OpId(crate::family::comm::COMM_AR_1STAGE);
+}
+
+impl KernelFamily for CommAr1StageRuntime {
+    fn id(&self) -> OpId {
+        Self::ID
+    }
+
+    fn assemble(
+        res: &mut dyn crate::device::DeviceRes,
+        exec: &mut Exec,
+    ) -> Result<Box<dyn KernelFamily>, OpError> {
+        let me = CommAr1StageRuntime {
+            k_f32: Some(exec.load_aot(res, asset::ONE_STAGE_SRC, asset::ONE_STAGE_F32, Self::ID)?),
+            k_f16: Some(exec.load_aot(res, asset::ONE_STAGE_SRC, asset::ONE_STAGE_F16, Self::ID)?),
+            k_bf16: Some(exec.load_aot(res, asset::ONE_STAGE_SRC, asset::ONE_STAGE_BF16, Self::ID)?),
+        };
+        Ok(FamilyGuard::boxed(me))
+    }
+
+    fn run(
+        &mut self,
+        msg: &LaunchMsg,
+        res: &mut dyn crate::device::DeviceRes,
+        exec: &mut Exec,
+    ) -> Result<Bytes, OpError> {
+        let (call, out) = Ar1StageCall::parse(msg)?;
+        let k = pick(Self::ID, call.out().dtype, &self.k_f32, &self.k_f16, &self.k_bf16)?;
+        // 尺寸自证:**槽即数据**(没有 header 偏移)⇒ 两端都必须装得下载荷
+        let out_len = res.resolve_len(call.out().id)?;
+        let peer_len = res.resolve_len(call.peer_data().id)?;
+        let _ = res.resolve_len(call.own().id)?; // 两个 header 也必须在册
+        let _ = res.resolve_len(call.peer().id)?;
+        check_payload_span(Self::ID, "out", out_len, 0, call.bytes())?;
+        check_payload_span(Self::ID, "peer_data", peer_len, 0, call.bytes())?;
+        let out_p = res.resolve(call.out().id)?;
+        let own_p = res.resolve(call.own().id)?;
+        let peer_p = res.resolve(call.peer().id)?;
+        let peer_data_p = res.resolve(call.peer_data().id)?;
+        let grid = ar_reduce_grid(call.out().dtype, call.bytes());
+        launch_ar_1stage(
+            Self::ID, "ar_1stage", res, exec, k, out_p, own_p, peer_p, peer_data_p,
+            call.bytes(), grid,
         )?;
         Ok(out)
     }

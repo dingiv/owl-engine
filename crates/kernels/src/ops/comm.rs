@@ -26,6 +26,7 @@ impl KernelSpec for CommArStageF16 {
         Param::t_in("local", Dtype::F16, 0),
         Param::t_out("own", Dtype::U8, 1),
         Param::t_in("peer", Dtype::U8, 1),
+        Param::t_in("data", Dtype::U8, 1),
         Param::sz("bytes"),
         Param::sz("slot_bytes"),
         Param::sz("slab_off"),
@@ -45,6 +46,7 @@ impl KernelSpec for CommArStageBf16 {
         Param::t_in("local", Dtype::BF16, 0),
         Param::t_out("own", Dtype::U8, 1),
         Param::t_in("peer", Dtype::U8, 1),
+        Param::t_in("data", Dtype::U8, 1),
         Param::sz("bytes"),
         Param::sz("slot_bytes"),
         Param::sz("slab_off"),
@@ -64,6 +66,7 @@ impl KernelSpec for CommArStageF32 {
         Param::t_in("local", Dtype::F32, 0),
         Param::t_out("own", Dtype::U8, 1),
         Param::t_in("peer", Dtype::U8, 1),
+        Param::t_in("data", Dtype::U8, 1),
         Param::sz("bytes"),
         Param::sz("slot_bytes"),
         Param::sz("slab_off"),
@@ -87,6 +90,7 @@ impl KernelSpec for CommArReduceF16 {
         Param::t_out("out", Dtype::F16, 0),
         Param::t_in("own", Dtype::U8, 1),
         Param::t_in("peer", Dtype::U8, 1),
+        Param::t_in("data", Dtype::U8, 1),
         Param::sz("bytes"),
         Param::sz("slot_bytes"),
         Param::sz("slab_off"),
@@ -106,6 +110,7 @@ impl KernelSpec for CommArReduceBf16 {
         Param::t_out("out", Dtype::BF16, 0),
         Param::t_in("own", Dtype::U8, 1),
         Param::t_in("peer", Dtype::U8, 1),
+        Param::t_in("data", Dtype::U8, 1),
         Param::sz("bytes"),
         Param::sz("slot_bytes"),
         Param::sz("slab_off"),
@@ -125,9 +130,68 @@ impl KernelSpec for CommArReduceF32 {
         Param::t_out("out", Dtype::F32, 0),
         Param::t_in("own", Dtype::U8, 1),
         Param::t_in("peer", Dtype::U8, 1),
+        Param::t_in("data", Dtype::U8, 1),
         Param::sz("bytes"),
         Param::sz("slot_bytes"),
         Param::sz("slab_off"),
+    ];
+    const LAWS: &'static [Law] = &[];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+// ============================================================================
+// 1-stage(对称缓冲 ⇒ 融合核;TP2-施工设计.md §35)—— 无 stage 段、零拷贝
+// ============================================================================
+
+/// `owl_comm_ar_1stage_f16`(out 就是本端槽;peer_data 是对端槽的别名)
+pub struct CommAr1StageF16;
+impl KernelSpec for CommAr1StageF16 {
+    const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::comm::COMM_AR_1STAGE);
+    const ENTRY: &'static str = "owl_comm_ar_1stage_f16";
+    const SRC: &'static str = "cu/comm/ar_reduce.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_out("out", Dtype::F16, 0),
+        Param::t_in("own", Dtype::U8, 1),
+        Param::t_in("peer", Dtype::U8, 1),
+        Param::t_in("peer_data", Dtype::U8, 1),
+        Param::sz("bytes"),
+    ];
+    const LAWS: &'static [Law] = &[];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+/// `owl_comm_ar_1stage_bf16`
+pub struct CommAr1StageBf16;
+impl KernelSpec for CommAr1StageBf16 {
+    const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::comm::COMM_AR_1STAGE);
+    const ENTRY: &'static str = "owl_comm_ar_1stage_bf16";
+    const SRC: &'static str = "cu/comm/ar_reduce.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_out("out", Dtype::BF16, 0),
+        Param::t_in("own", Dtype::U8, 1),
+        Param::t_in("peer", Dtype::U8, 1),
+        Param::t_in("peer_data", Dtype::U8, 1),
+        Param::sz("bytes"),
+    ];
+    const LAWS: &'static [Law] = &[];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+/// `owl_comm_ar_1stage_f32`
+pub struct CommAr1StageF32;
+impl KernelSpec for CommAr1StageF32 {
+    const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::comm::COMM_AR_1STAGE);
+    const ENTRY: &'static str = "owl_comm_ar_1stage_f32";
+    const SRC: &'static str = "cu/comm/ar_reduce.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_out("out", Dtype::F32, 0),
+        Param::t_in("own", Dtype::U8, 1),
+        Param::t_in("peer", Dtype::U8, 1),
+        Param::t_in("peer_data", Dtype::U8, 1),
+        Param::sz("bytes"),
     ];
     const LAWS: &'static [Law] = &[];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -140,6 +204,9 @@ pub static AR_STAGE_F32: KernelMeta = meta_of::<CommArStageF32>();
 pub static AR_REDUCE_F16: KernelMeta = meta_of::<CommArReduceF16>();
 pub static AR_REDUCE_BF16: KernelMeta = meta_of::<CommArReduceBf16>();
 pub static AR_REDUCE_F32: KernelMeta = meta_of::<CommArReduceF32>();
+pub static AR_1STAGE_F16: KernelMeta = meta_of::<CommAr1StageF16>();
+pub static AR_1STAGE_BF16: KernelMeta = meta_of::<CommAr1StageBf16>();
+pub static AR_1STAGE_F32: KernelMeta = meta_of::<CommAr1StageF32>();
 
 /// 本域全部已建表算子
 pub static METAS: &[&KernelMeta] = &[
@@ -149,4 +216,7 @@ pub static METAS: &[&KernelMeta] = &[
     &AR_REDUCE_F16,
     &AR_REDUCE_BF16,
     &AR_REDUCE_F32,
+    &AR_1STAGE_F16,
+    &AR_1STAGE_BF16,
+    &AR_1STAGE_F32,
 ];

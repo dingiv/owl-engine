@@ -11,10 +11,12 @@
 pub const COMM_AR_STAGE: &str = "comm_ar_stage";
 /// foreign-kernel 虚拟核名(reduce)
 pub const COMM_AR_REDUCE: &str = "comm_ar_reduce";
+/// foreign-kernel 虚拟核名(**1-stage 融合核**;对称缓冲版,`TP2-施工设计.md` §35)
+pub const COMM_AR_1STAGE: &str = "comm_ar_1stage";
 
 /// foreign 分派谓词(server `handle_launch` 前置检查)
 pub fn is_foreign(name: &str) -> bool {
-    name == COMM_AR_STAGE || name == COMM_AR_REDUCE
+    name == COMM_AR_STAGE || name == COMM_AR_REDUCE || name == COMM_AR_1STAGE
 }
 
 /// payload dtype → stage 发射名(**单源**;client 与 driver 共读)。
@@ -42,6 +44,17 @@ pub fn reduce_entry(dt: crate::driver::DType) -> &'static str {
     }
 }
 
+/// payload dtype → 1-stage 发射名(单源)
+pub fn one_stage_entry(dt: crate::driver::DType) -> &'static str {
+    use crate::driver::DType;
+    match dt {
+        DType::F32 => asset::ONE_STAGE_F32,
+        DType::F16 => asset::ONE_STAGE_F16,
+        DType::BF16 => asset::ONE_STAGE_BF16,
+        other => panic!("comm.ar_1stage: 不支持 dtype {other:?}(f32/f16/bf16 三实例)"),
+    }
+}
+
 /// 设备码资产 + 发射常量(源在树 ⇒ build.rs 目录扫描自动纳入;
 /// 资产 id 与 `ops::comm` 的 `SRC` **同值** —— 改一处必改另一处,门会红)。
 pub mod asset {
@@ -54,6 +67,12 @@ pub mod asset {
     pub const REDUCE_F32: &str = "owl_comm_ar_reduce_f32";
     pub const REDUCE_F16: &str = "owl_comm_ar_reduce_f16";
     pub const REDUCE_BF16: &str = "owl_comm_ar_reduce_bf16";
+
+    /// **1-stage 与 reduce 同源文件**(同族两种形态;共享 dtype 桥与向量循环)
+    pub const ONE_STAGE_SRC: &str = "cu/comm/ar_reduce.cu";
+    pub const ONE_STAGE_F32: &str = "owl_comm_ar_1stage_f32";
+    pub const ONE_STAGE_F16: &str = "owl_comm_ar_1stage_f16";
+    pub const ONE_STAGE_BF16: &str = "owl_comm_ar_1stage_bf16";
 
     /// 发射几何(v1 单 block 256 线程;设计 §3.2 —— 单写者游标的前提)
     ///

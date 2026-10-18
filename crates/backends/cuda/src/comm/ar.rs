@@ -41,7 +41,36 @@ pub const HEADER_BYTES: u64 = 64;
 pub const SLOT_BYTES: u64 = 32 << 20;
 
 /// slot 环深度(2 = 乒乓;credit 上限由它决定)。
+///
+/// ⚠️ **生产(TP2 引擎)自 2026-10-17 起用 [`N_SLOTS_CE`] = 1**;本常量仍是
+/// v1/基准/门的默认档(两条路都合法 —— 核自 2026-10-17 起接受 `n_slots ≥ 1`)。
 pub const N_SLOTS: u32 = 2;
+
+/// **CE 刀起用的槽数(`n_slots = 1`;2026-10-17,TP2-施工设计 §29)**。
+///
+/// ⚠️ **当前未启用**(2026-10-18):CE 路线已全链落地并实测 —— **生产形状下无收益**
+/// (`ar_channel_bench` 的 `A3` 三段探针:5.24 MB 与 v1 持平、10 KB 倒赔 35%;生产
+/// decode −7.2% / prefill +1.1%),故接线已回退。**本常量保留**,因为它承载
+/// "为什么 CE 必须 `n_slots=1`"这条论证(与 §29 的寻址坎文档成对)。
+/// 将来若解决"多一个图节点的派发税"或走双流,先跑 `A3` 探针再决定 ——
+/// 详账与纪律 ⑭(单边探针不能预测双边生产)见 `TP2-施工设计.md` §32。
+///
+/// ## 论证(为什么必须是 1)
+/// CE 拷(`memcpy_dtod_async`)的**偏移是 host 侧烘进图节点的**
+/// (与 `graph_launch` 同律,回放不会变),而乒乓环让数据落在
+/// `HDR + (produced % 2) * slot_bytes` —— **奇偶只有设备知道** ⇒ 主机侧无从发射。
+/// 固定成 1 格后槽位恒 0 ⇒ **两端都是固定地址** ⇒ 不烘奇偶 ⇒ 图回放安全。
+///
+/// 安全性(实证 + 论证;权威注记在 `cu/comm/ar_stage.cu` 头注 ④):credit 变
+/// **严格一深环**(`need = prod`),由两条**现役**机制兜住 ——
+/// ①代发 credit 写在 credit 检查**之前**(两侧先发布后检查 ⇒ 不死锁);
+/// ②尾部 rendezvous(发布 produced 后等 `peer.produced`⇒ 单格不会被两端同时用)。
+/// 门:`ar_stress_gate` 的 `OWL_STRESS_SLOTS=1` 档(40 轮逐位 + 20 轮回放,3080 对)。
+///
+/// ⚠️ **2026-10-17 踩过的坑**:`ar_stage.cu` 曾有一条 `n_slots < 2 ⇒ err=3` 的
+/// 守卫,与本常量**直接冲突** —— stage 核一进门就被打死(从不发 produced)
+/// ⇒ 对端 reduce 5s 超时、payload 一个字节没加。已放宽为 `≥ 1`。
+pub const N_SLOTS_CE: u32 = 1;
 
 /// header 字段偏移(与 `.cu` 侧必须逐字节一致 —— 改动 = 双侧同改 + 门重跑)。
 ///
@@ -194,7 +223,7 @@ impl AllReduce {
     /// 流序,见 `GpuClient::launch`),归引擎/后端;本层只对"发什么、按什么
     /// 序"负责 —— 而**两侧序列同构**(I5)正是由本函数保证的(两侧同 plan
     /// ⇒ 同序列)。调用方把每个 `(phase, chunk)` 转成 LaunchMsg:
-    /// `stage` 用 [`crate::ar::ArChunk`] 的 `(offset, bytes)` 填 slab_off/bytes。
+    /// `stage` 用 [`crate::comm::ar::ArChunk`] 的 `(offset, bytes)` 填 slab_off/bytes。
     pub fn steps(&self) -> Vec<(ArPhase, ArChunk)> {
         let mut out = Vec::with_capacity(self.plan.calls as usize * 2);
         for i in 0..self.plan.calls {
@@ -216,7 +245,7 @@ mod tests {
         let l = StagingLayout::default_layout();
         assert_eq!(l.total_bytes(), HEADER_BYTES + 2 * (32 << 20));
         // 预算账:64MiB + 64B ≤ 硬上限 192MiB(施工设计 §6)
-        assert!(l.total_bytes() < crate::peer::PEER_ALLOC_HARD_CAP);
+        assert!(l.total_bytes() < crate::comm::peer::PEER_ALLOC_HARD_CAP);
     }
 
     #[test]

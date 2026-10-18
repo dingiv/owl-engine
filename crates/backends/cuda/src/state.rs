@@ -106,6 +106,14 @@ const EVENT_POOL_N: usize = 8;
 pub(super) const STREAM_H2D: StreamId = 0;
 pub(super) const STREAM_COMPUTE: StreamId = 1;
 pub(super) const STREAM_D2H: StreamId = 2;
+/// ★ **第二条计算流**(2026-10-18;B1 门 / 微批重叠的地基)。
+///
+/// 用途:图内**多流分支** —— 两条独立链(例:两个 token 微批的 forward)
+/// 拴进**同一张图**,回放时由硬件并行调度。平时不发射任何东西。
+///
+/// 对外导出(`lib.rs` 的 `pub use`)—— **单一真源**:测试/探针里的 `sid` 字面量
+/// 必须引它,不得再写一份(声明面同尺纪律)。
+pub const STREAM_COMPUTE_AUX: StreamId = 3;
 
 // ============================================================================
 // 设备选择(UUID 钉卡;数字序事故免疫)
@@ -700,12 +708,28 @@ pub(super) struct GpuCtx {
 pub(super) struct CaptureNodes {
     /// 发射总数(原生 + 家族;= 原 `launches` 哨兵值)
     pub total: usize,
+    /// **图内 D2D 搬运**计数(`CopyBlock`/`CopyBatch`;2026-10-18 §38)
+    ///
+    /// 为什么要单列:它们是**合法的图节点**(§32 放开了捕获白名单),但**不是内核发射**
+    /// —— 空窗哨兵若只数 `total`,一张"纯搬运"的图会被误判成空窗而响亮拒
+    /// (实测:纯 CE 链的捕获窗被 `graph_end` 拒掉)。⇒ 哨兵判据 = `total + copies`。
+    pub copies: usize,
     /// 内核名 → 次数(键 = `String`:原生路径给的是 `LaunchMsg.kernel.name`,
     /// 家族路径给 `&'static str`;窗口内一次性分摊,不值得为省几个 String 分叉)
     by_kernel: std::collections::HashMap<String, usize>,
 }
 
 impl CaptureNodes {
+    /// 图内 D2D 搬运节点(不占 `by_kernel` —— 它不是内核)
+    pub(super) fn add_copy(&mut self) {
+        self.copies += 1;
+    }
+
+    /// 空窗哨兵判据(内核发射 + 搬运;两者皆 0 才算空)
+    pub(super) fn is_empty(&self) -> bool {
+        self.total == 0 && self.copies == 0
+    }
+
     pub(super) fn add(&mut self, kernel: &str) {
         self.total += 1;
         *self.by_kernel.entry(kernel.to_string()).or_insert(0) += 1;
@@ -726,7 +750,31 @@ impl CaptureNodes {
 
 /// 捕获会话:目标流 + 切块 slab + 发射计数(空窗哨兵用)
 struct CaptureState {
+    /// ★ **发起捕获的流**(`cuStreamEndCapture` 必须用它 —— 与"当前路由流"分离;
+    /// 图内 fork 到别的流后 `stream` 会变,但收窗仍在 origin)。
+    origin: Arc<CudaStream>,
+    /// ★ **当前发射路由流**(`capture_route_to` 可切;见 `launch_stream()`)
     stream: Arc<CudaStream>,
+    /// **本窗分支簿记**(2026-10-18 §39;用户口径:"攒内存,最后集中 dump"):
+    /// 图里到底有没有 fork 出去的分支、AUX 上有多少节点 —— **图结构统计的真源**。
+    /// 零驱动调用、零热路径成本(发射时一次整数自增)。
+    ///
+    /// 为什么不用驱动的 `cuGraphGetEdges`/`cuGraphNodeGetDependencies`:两者在本
+    /// crate 的 cudarc feature 集下**被门控掉**;而**图的边本来就是 owl 自己建的**
+    /// (同流顺序边 + fork 边 + join 边)⇒ 自己的簿记就是真源。
+    pub(super) aux_nodes: usize,
+    /// fork 边数(`capture_route_to` 首次切到某条非 origin 流)
+    pub(super) forks: usize,
+    /// join 边数(`capture_join`)
+    pub(super) joins: usize,
+    /// **本窗已卷入的流**(首次切到非 origin 流时建**一次** fork 边;
+    /// 之后的切换是**纯切换、不建边**)
+    ///
+    /// ⚠️ **2026-10-18 血的教训(M5 探针)**:初版把"切到哪条流就在那条流上等前一条"
+    /// 当成通用语义 ⇒ 每次切换都建一条依赖边 ⇒ **两条本该平行的链被拴成串行**
+    /// (实测 dual/single = 1.986 ≈ 2.0,零并行)。fork 与 join 是**两件不同的事**:
+    /// fork = 支链**等**主链的某个点(起点一次就够);join = 主链**等**支链(显式收口)。
+    involved: Vec<Arc<CudaStream>>,
     slab: Arc<CudaSlice<u8>>,
     /// slab 内分配器(bump + 尺寸类回收;S1.5 ⇒ 容量 = 峰值活跃集而非总和)
     arena: owl_shared::slab_hint::SlabArena,
@@ -947,7 +995,12 @@ impl GpuCtx {
             }
         }
         let mut streams = HashMap::new();
-        for (id, _role) in [(STREAM_H2D, "h2d"), (STREAM_COMPUTE, "compute"), (STREAM_D2H, "d2h")] {
+        for (id, _role) in [
+            (STREAM_H2D, "h2d"),
+            (STREAM_COMPUTE, "compute"),
+            (STREAM_D2H, "d2h"),
+            (STREAM_COMPUTE_AUX, "compute-aux"),
+        ] {
             let s = ctx.new_stream().map_err(|e| format!("建流({_role}): {e:?}"))?;
             streams.insert(id, s);
         }
@@ -1199,6 +1252,124 @@ impl GpuCtx {
         self.capture.is_some()
     }
 
+    /// ★ **发射路由流**(2026-10-18;B1 多流图的唯一入口):
+    /// **捕获期 = 当前路由流**(`capture.stream`,可被 [`Self::capture_route_to`] 切换);
+    /// **平时 = `COMPUTE`**。
+    ///
+    /// 为什么"路由跟着捕获走"而不是"给命令加流字段":§3.2 的立场是**流不暴露给
+    /// 客户端**(序由意图复合、策略由 server 独占) —— 本条同样落在 server 侧。
+    pub(super) fn launch_stream(&self) -> Result<Arc<CudaStream>, ModelError> {
+        match &self.capture {
+            Some(c) => Ok(c.stream.clone()),
+            None => Ok(self.stream(STREAM_COMPUTE)?.clone()),
+        }
+    }
+
+    /// ★ **捕获期的发射路由切换(图内 fork)**(2026-10-18;B1 门).
+    ///
+    /// 语义(只在捕获期合法):
+    /// 1. **首次**切到某条非 origin 流时:在 **origin** 上记一个
+    ///    `CU_EVENT_DISABLE_TIMING` 事件,目标流 `wait` 它 —— 这条依赖边
+    ///    **被捕获进图** ⇒ 目标流由此被卷入同一张图;
+    /// 2. 之后本窗的 `Launch`/`CopyBlock`/`Memset` **路由到目标流**;
+    /// 3. `graph_end` 仍在 **origin**(发起捕获的那条流)上收窗 —— CUDA 要求。
+    ///
+    /// ⚠️ **只有"首次切出"建边**(2026-10-18 M5 探针定谳):若每次切换都建边,
+    /// 两条本应平行的链会被拴成**串行**(实测 dual/single = 1.99)。
+    /// 切回 origin 也**不建边** —— 要"主链等支链"请显式 [`Self::capture_join`]。
+    ///
+    /// ⚠️ 为什么必须有 fork 边:`CAPTURE_MODE_THREAD_LOCAL` 下,同线程 fork 出去的
+    /// 操作会被捕获;而**没有任何依赖边的独立流不会被卷入** —— 那条 wait 就是把
+    /// 支链拴进同一张图的那根绳。
+    pub(super) fn capture_route_to(&mut self, sid: StreamId) -> Result<(), ModelError> {
+        let (cur, dst) = {
+            let c = self.capture.as_ref().ok_or_else(|| {
+                ModelError::Msg(
+                    "capture_route_to: 不在捕获期(该口只服务**图内多流**;回放期的流由图自己记 — 见 GraphHolder.stream)"
+                        .into(),
+                )
+            })?;
+            (c.stream.clone(), self.stream(sid)?.clone())
+        };
+        if Arc::ptr_eq(&cur, &dst) {
+            return Ok(()); // 幂等:切到当前流 = 无操作
+        }
+        let need_fork = {
+            let c = self.capture.as_ref().expect("上面刚查过 capture 在场");
+            !Arc::ptr_eq(&c.origin, &dst) && !c.involved.iter().any(|s| Arc::ptr_eq(s, &dst))
+        };
+        if need_fork {
+            if let Some(c) = self.capture.as_mut() {
+                c.forks += 1;
+            }
+            // fork 边从 **origin** 记(不是从当前流 —— 支链与主链要从同一时刻出发)
+            let origin = self.capture.as_ref().expect("上面刚查过").origin.clone();
+            let ev = origin
+                .record_event(None)
+                .map_err(|e| ModelError::Msg(format!("capture_route_to({sid}): 记入事件 {e:?}")))?;
+            dst.wait(&ev)
+                .map_err(|e| ModelError::Msg(format!("capture_route_to({sid}): 等待 {e:?}")))?;
+        }
+        if let Some(c) = self.capture.as_mut() {
+            if need_fork {
+                c.involved.push(dst.clone());
+            }
+            c.stream = dst;
+        }
+        Ok(())
+    }
+
+    /// ★ **捕获期的 join(主链等支链)**(2026-10-18)。
+    ///
+    /// 在当前路由流上记事件,**origin 等它**,并把路由切回 origin。
+    /// 语义 = “主链从这里开始依赖支链的当前点”—— 只在**真的有人要消费支链结果**时用;
+    /// 用它去"切流程"会把两条链拴成串行(见 `capture_route_to` 的 ⚠️)。
+    pub(super) fn capture_join(&mut self) -> Result<(), ModelError> {
+        // ★ **统一语义(2026-10-18 §39 修)**:join = **"origin 等支流的当前链尾"** ——
+        // 与"当前路由在哪条流"**无关**。取 `involved` 里最后一条非 origin 流。
+        //
+        // 为什么要改:旧实现只在"当前流 ≠ origin"时建边,**在 origin 上调用直接 no-op**
+        // ⇒ "两条独立分支 + 末尾 join"这个形状**根本表达不出来**(唯一的 join 时机会
+        // 把 origin 的后续工作挡在支流之后)。而 CUDA 的 `StreamWaitEvent` **只影响
+        // 之后发射的工作** ⇒ 正确写法是:**两条链都发射完,再在 origin 上记 join**
+        // (给 origin 的**尾部**建边),这样两条链中段互不等待、末尾又合法 join。
+        //
+        // 旧实现还把"在 origin 上调用"当静默 no-op —— 静默失败,已按纪律改掉。
+        let (origin, target) = {
+            let c = self.capture.as_ref().ok_or_else(|| {
+                ModelError::Msg("capture_join: 不在捕获期".into())
+            })?;
+            let t = c
+                .involved
+                .iter()
+                .rev()
+                .find(|s| !Arc::ptr_eq(s, &c.origin))
+                .cloned();
+            (c.origin.clone(), t)
+        };
+        let target = target.ok_or_else(|| {
+            ModelError::Msg(
+                "capture_join: **本窗没有 fork 出去的支流**(`involved` 只有 origin)⇒ 没有边可建。\n\
+                 正确顺序:`capture_route_to(AUX)` → 在 AUX 上发射 → … → `capture_join()`。\n\
+                 若你只是想「切回 origin 继续发射」,用 `capture_route_to(origin)`(纯切换、不建边)。"
+                    .to_string(),
+            )
+        })?;
+        if let Some(c) = self.capture.as_mut() {
+            c.joins += 1;
+        }
+        let ev = target
+            .record_event(None)
+            .map_err(|e| ModelError::Msg(format!("capture_join: 记入事件 {e:?}")))?;
+        origin
+            .wait(&ev)
+            .map_err(|e| ModelError::Msg(format!("capture_join: 等待 {e:?}")))?;
+        if let Some(c) = self.capture.as_mut() {
+            c.stream = origin;
+        }
+        Ok(())
+    }
+
     /// 图捕获开始(G1 不可嵌套;slab 在捕获**前**分配 —— 捕获期零 cudaMalloc)。
     /// 捕获流恒为 COMPUTE(路由策略:Launch/Alloc 全在 COMPUTE)。
     pub(super) fn graph_begin(&mut self) -> Result<(), ModelError> {
@@ -1231,6 +1402,11 @@ impl GpuCtx {
             .begin_capture(CAPTURE_MODE_THREAD_LOCAL)
             .map_err(|e| ModelError::Msg(format!("graph_begin: {e:?}")))?;
         self.capture = Some(CaptureState {
+            aux_nodes: 0,
+            forks: 0,
+            joins: 0,
+            origin: stream.clone(),
+            involved: vec![stream.clone()],
             stream,
             slab,
             arena: owl_shared::slab_hint::SlabArena::default(),
@@ -1241,6 +1417,35 @@ impl GpuCtx {
         Ok(())
     }
 
+
+/// **`graph_end` 的错误翻译**(2026-10-18;§38.4)。
+///
+/// 驱动的 `CUDA_ERROR_STREAM_CAPTURE_UNJOINED` 原文只有一句
+/// "capturing stream has unjoined work" —— **读不出该改什么**。本函数把它翻成
+/// 可操作诊断(语义 + 两条判据 + 口径门位置)。
+///
+/// ⚠️ **生产现状(零风险,但要知道为什么)**:引擎侧**没有任何调用点**用
+/// `capture_route_to`(只有 `owl-cuda` 的测试在用)⇒ 捕获窗恒不 fork ⇒
+/// `launch_stream()` 恒 = `stream(STREAM_COMPUTE)` ⇒ `copy_block` 的捕获路由
+/// 改动对生产是**零行为变化**。这条翻译是给"将来真有人 fork"时的现场准备的。
+fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
+    let raw = format!("{e:?}");
+    if raw.contains("UNJOINED") {
+        return ModelError::Msg(format!(
+            "graph_end: **捕获窗里有 fork 出去的支流没 join 回来**(驱动原文:{raw})。\n\
+             语义:`capture_route_to` 卷入的支流必须沿依赖边回到 origin,否则**整窗作废**\n\
+             (不是「图有个洞」,是这次捕获被驱动拒掉 —— 发生在**捕获期**,不是回放期)。\n\
+             · 支流上的**核节点**:不需要 join(实测合法);\n\
+             · 支流上的 **CE 搬运节点**(`copy_block`/`copy_batch` = `cudaMemcpyAsync`):\n\
+               **必须显式 join** —— 且 `capture_join()` 只能在**支流上**调用\n\
+               (切回 origin 之后它是 no-op,边不会建);\n\
+             · 最省事的形态:把 CE 搬运留在 origin 流(别 fork)。\n\
+             口径门:`crates/backends/cuda/tests/graph_multistream_gate.rs::m6_capture_join_semantics`(四形状)"
+        ));
+    }
+    ModelError::Msg(format!("graph_end: {raw}"))
+}
+
     /// 图捕获结束(实例化 + 登记)。空捕获窗拒绝(哨兵③:发射数须 > 0)。
     pub(super) fn graph_end(&mut self) -> Result<GraphId, ModelError> {
         let cap = self
@@ -1248,11 +1453,12 @@ impl GpuCtx {
             .take()
             .ok_or_else(|| ModelError::Msg("graph_end: 当前没有进行中的捕获".to_string()))?;
         let mut cap = cap;
-        // 哨兵③:空捕获窗(begin_capture 后一次发射都没有;原生与家族同计)
-        if cap.nodes.total == 0 {
+        // 哨兵③:空捕获窗(begin_capture 后**一个图节点都没有**;内核与搬运同计)
+        if cap.nodes.is_empty() {
             // 仍须 end_capture 退出捕获态;空图被驱动以 NULL 返回
-            let g = unsafe { crate::ffi::stream_end_capture(cap.stream.cu_stream()) }
-                .map_err(|e| ModelError::Msg(format!("graph_end: {e:?}")))?;
+            // ⚠️ 用 **origin**(发起捕获的那条流)—— fork 过的窗里 `cap.stream` 已变
+            let g = unsafe { crate::ffi::stream_end_capture(cap.origin.cu_stream()) }
+                .map_err(Self::end_capture_err)?;
             if !g.is_null() {
                 let _ = unsafe { crate::ffi::graph_destroy(g) };
             }
@@ -1271,10 +1477,30 @@ impl GpuCtx {
                 "graph_end: 空捕获窗(发射数 = 0;先在捕获期发射 ≥ 1 个 kernel)".to_string(),
             ));
         }
+        // ★ **图结构统计 → metrics(攒内存,最后 dump;2026-10-18 §39)**
+        // 用户口径:热路径不打印 —— 这里是**捕获期一次**,记进共享 store,
+        // 由 `metrics::dump` 在跑完后集中出表(见 `tp_perf_split_probe` 的用法)。
+        let shape = crate::ffi::GraphShape {
+            nodes: cap.nodes.total + cap.nodes.copies,
+            aux_nodes: cap.aux_nodes,
+            forks: cap.forks,
+            joins: cap.joins,
+            copies: cap.nodes.copies,
+        };
+        owl_shared::metrics::with_metrics_store(|st| {
+            st.counter_add("graph.nodes", shape.nodes as u64, file!(), line!());
+            st.counter_add("graph.aux_nodes", shape.aux_nodes as u64, file!(), line!());
+            st.counter_add("graph.forks", shape.forks as u64, file!(), line!());
+            st.counter_add("graph.joins", shape.joins as u64, file!(), line!());
+            st.counter_add("graph.copies", shape.copies as u64, file!(), line!());
+            if shape.has_branches() {
+                st.counter_add("graph.with_branches", 1, file!(), line!());
+            }
+        });
         // 裸端捕获 + 零旗标实例化(AUTO_FREE_ON_LAUNCH 定谳见 ffi.rs;
         // 图执行语义与 safe 版逐位一致 —— 同 cuGraphLaunch 入 COMPUTE 流)
-        let cu_graph = unsafe { crate::ffi::stream_end_capture(cap.stream.cu_stream()) }
-            .map_err(|e| ModelError::Msg(format!("graph_end: {e:?}")))?;
+        let cu_graph = unsafe { crate::ffi::stream_end_capture(cap.origin.cu_stream()) }
+            .map_err(Self::end_capture_err)?;
         if cu_graph.is_null() {
             return Err(ModelError::Msg(
                 "graph_end: 空捕获窗(发射数 = 0;哨兵③)".to_string(),
@@ -1651,6 +1877,17 @@ impl GpuCtx {
     pub(super) fn note_launch(&mut self, kernel: &str) {
         if let Some(cap) = &mut self.capture {
             cap.nodes.add(kernel);
+            // ★ 分支簿记:发射落在**非 origin 流**上 ⇒ 该节点属于 fork 出去的分支
+            if !Arc::ptr_eq(&cap.stream, &cap.origin) {
+                cap.aux_nodes += 1;
+            }
+        }
+    }
+
+    /// 图内 D2D 搬运记账(空窗哨兵用;见 [`CaptureNodes::copies`])
+    pub(super) fn note_copy(&mut self) {
+        if let Some(cap) = &mut self.capture {
+            cap.nodes.add_copy();
         }
     }
 
@@ -2000,6 +2237,9 @@ impl GpuCtx {
     ///
     /// `mapped_bytes` = 对端映射大小(凭据携带);`want_bytes` = 本端账长。
     /// **不 close fd**(同进程:fd 属于分配侧)。
+    ///
+    /// `rw` = 导入侧访问级别(**push 协议前置**,2026-10-18 §36.6):
+    /// `false` = `PROT_READ`(v1 现役);`true` = `PROT_READWRITE`(本端可写对端槽)。
     pub(super) fn peer_import(
         &mut self,
         fd: i32,
@@ -2007,6 +2247,7 @@ impl GpuCtx {
         want_bytes: usize,
         peer_uuid: &str,
         name: &str,
+        rw: bool,
     ) -> Result<u64, ModelError> {
         debug_assert!(
             !name.is_empty(),
@@ -2021,7 +2262,7 @@ impl GpuCtx {
             )));
         }
         let (map, gran) = crate::vmm::import_mapped(self.ordinal, fd, mapped_bytes)?;
-        if let Err(e) = crate::vmm::set_access_self(&map, self.ordinal, false) {
+        if let Err(e) = crate::vmm::set_access_self(&map, self.ordinal, rw) {
             return Err(crate::vmm::fail_with_rollback(map, e));
         }
         let id = self.new_peer_block(

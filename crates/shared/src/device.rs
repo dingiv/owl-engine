@@ -13,7 +13,7 @@
 //! # 附:peer 额度常量(TP2 S1)
 //!
 //! 单笔 peer 可映射缓冲的三个硬约束常量(判据出处见各常量注释)。
-//! **单源**在此:通信策略层(`owl-comm::peer` 的 re-export)与执行层
+//! **单源**在此:通信策略层(`owl_cuda::comm::peer` 的 re-export)与执行层
 //! (`owl-cuda` 的 server 侧硬门)读同一份 —— 两边不许各写一套。
 
 /// 单笔 peer 可映射缓冲的**硬上限**(192 MiB)。
@@ -84,7 +84,7 @@ pub fn parse_nvidia_smi_mem(text: &str) -> std::collections::HashMap<String, f64
 ///
 /// 形如(每个设备一段;BDF 行 `GPU 00000000:41:00.0` + 段内
 /// `BAR1 Memory Usage / Total : 32768 MiB`)。用途:TP 分档
-/// (`owl_comm::peer::PeerCaps.bar1_bytes`)—— CUDA 无 BAR1 属性、
+/// (`owl_cuda::comm::peer::PeerCaps.bar1_bytes`)—— CUDA 无 BAR1 属性、
 /// NVML 不在依赖面,而 `--query-gpu` **没有** `bar1.total` 字段(实测
 /// 该字段在 615 驱动上返回 rc=2)⇒ 只能走详查面。
 /// 非法/缺段行跳过(缺哪张卡由调用方按 BDF 响亮拒)。

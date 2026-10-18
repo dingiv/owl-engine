@@ -58,11 +58,27 @@ fn reduce_entry(dt: Dtype) -> &'static str {
     }
 }
 
+/// payload dtype → **1-stage** 发射名(单源同上;2026-10-18 §35)
+fn one_stage_entry(dt: Dtype) -> &'static str {
+    use crate::driver::DType as D;
+    match dt {
+        Dtype::F32 => crate::family::comm::one_stage_entry(D::F32),
+        Dtype::F16 => crate::family::comm::one_stage_entry(D::F16),
+        Dtype::BF16 => crate::family::comm::one_stage_entry(D::BF16),
+        other => panic!("comm_ar_1stage: 非法 payload dtype {other:?}(f32/f16/bf16)"),
+    }
+}
+
 /// stage 的 parse 槽名(声明序;F3 成对律 —— `client::tests::
 /// parse_slots_are_exactly_declared` 与 `ops` 的槽序锁双双锁死)
-pub const PARSE_SLOTS: &[&str] = &["local", "own", "peer", "bytes", "slot_bytes", "slab_off"];
-/// reduce 的 parse 槽名(声明序)
-pub const PARSE_SLOTS_REDUCE: &[&str] = &["out", "own", "peer", "bytes", "slot_bytes", "slab_off"];
+///
+/// ⚠️ **push 档(§36.7)第 4 槽 = `data`**(slot 数据写哪里:v1 = `own` / push = `peer`)。
+/// 2026-10-19 修复:上一轮只给 `ArStageCall` 加了 `data` 字段与 `parse`/`to_launch`,
+/// **漏了这张常量表** ⇒ `cargo test -p owl-kernels --lib` 两条槽序锁红(F3 铁律现场:
+/// 真源有两处就会漂 —— 两把锁存在的理由就是把这类漏跟当场抹出来)。
+pub const PARSE_SLOTS: &[&str] = &["local", "own", "peer", "data", "bytes", "slot_bytes", "slab_off"];
+/// reduce 的 parse 槽名(声明序;push 档同律 —— 第 4 槽 = `data`)
+pub const PARSE_SLOTS_REDUCE: &[&str] = &["out", "own", "peer", "data", "bytes", "slot_bytes", "slab_off"];
 
 /// stage 调用(解析/组装双向同型)。
 #[derive(Clone, Debug)]
@@ -70,35 +86,43 @@ pub struct ArStageCall {
     local: Bytes,
     own: Bytes,
     peer: Bytes,
+    /// ★ **数据块**(2026-10-18;push 档 §36.7):slot 数据写哪里。
+    /// v1 = `own`(写本端槽);push = `peer`(写对端槽)。header 两档都是 `own`/`peer`。
+    data: Bytes,
     bytes: u64,
     slot_bytes: u64,
     slab_off: u64,
 }
 
 impl ArStageCall {
-    /// 直接构造(调用方已备好三块:payload / 本端 staging / 对端别名)。
+    /// 直接构造(调用方已备好四块:payload / 本端 staging / 对端别名 / **数据块**)。
+    ///
+    /// `data` = slot 数据写哪里:v1 传 `own`(写本端槽),push 传 `peer`(写对端槽)。
     pub fn new(
         local: Bytes,
         own: Bytes,
         peer: Bytes,
+        data: Bytes,
         bytes: u64,
         slot_bytes: u64,
         slab_off: u64,
     ) -> Self {
-        Self { local, own, peer, bytes, slot_bytes, slab_off }
+        Self { local, own, peer, data, bytes, slot_bytes, slab_off }
     }
 
-    /// 反序列化(6 槽;按名取址)。
+    /// 反序列化(7 槽;按名取址)。
     pub fn parse(msg: &LaunchMsg) -> Result<(Self, Bytes), OpError> {
         let s = crate::client::NamedSlots::new(msg)?;
         let local = s.flat_block("local")?;
         // stage 的输出槽 = own(被写入的 staging;`out_elems` 由调用方按字节口径给)
         let own = s.out_block("own", msg.out_elems)?;
         let peer = s.flat_block("peer")?;
+        let data = s.flat_block("data")?;
         let me = Self {
             local,
             own: own.clone(),
             peer,
+            data,
             bytes: s.u64("bytes")?,
             slot_bytes: s.u64("slot_bytes")?,
             slab_off: s.u64("slab_off")?,
@@ -117,6 +141,7 @@ impl ArStageCall {
                 Arg::block(self.local.id, self.local.dtype, self.local.rank),
                 Arg::block(self.own.id, self.own.dtype, self.own.rank),
                 Arg::block(self.peer.id, self.peer.dtype, self.peer.rank),
+                Arg::block(self.data.id, self.data.dtype, self.data.rank),
                 Arg::U64(self.bytes),
                 Arg::U64(self.slot_bytes),
                 Arg::U64(self.slab_off),
@@ -137,6 +162,10 @@ impl ArStageCall {
     pub fn peer(&self) -> &Bytes {
         &self.peer
     }
+    /// ★ **数据块**(v1 = own / push = peer;见 `new` 的说明)
+    pub fn data(&self) -> &Bytes {
+        &self.data
+    }
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
@@ -154,21 +183,26 @@ pub struct ArReduceCall {
     out: Bytes,
     own: Bytes,
     peer: Bytes,
+    /// ★ **数据块**(2026-10-18;push 档 §36.7):slot 数据读哪里。
+    /// v1 = `peer`(读对端槽);push = `own`(读本端槽 —— 对端已写进来)。
+    data: Bytes,
     bytes: u64,
     slot_bytes: u64,
     slab_off: u64,
 }
 
 impl ArReduceCall {
+    /// `data` = slot 数据读哪里:v1 传 `peer`(读对端槽),push 传 `own`(读本端槽)。
     pub fn new(
         out: Bytes,
         own: Bytes,
         peer: Bytes,
+        data: Bytes,
         bytes: u64,
         slot_bytes: u64,
         slab_off: u64,
     ) -> Self {
-        Self { out, own, peer, bytes, slot_bytes, slab_off }
+        Self { out, own, peer, data, bytes, slot_bytes, slab_off }
     }
 
     pub fn parse(msg: &LaunchMsg) -> Result<(Self, Bytes), OpError> {
@@ -176,10 +210,12 @@ impl ArReduceCall {
         let out = s.out_block("out", msg.out_elems)?;
         let own = s.flat_block("own")?;
         let peer = s.flat_block("peer")?;
+        let data = s.flat_block("data")?;
         let me = Self {
             out: out.clone(),
             own,
             peer,
+            data,
             bytes: s.u64("bytes")?,
             slot_bytes: s.u64("slot_bytes")?,
             slab_off: s.u64("slab_off")?,
@@ -197,6 +233,7 @@ impl ArReduceCall {
                 Arg::block(self.out.id, self.out.dtype, self.out.rank),
                 Arg::block(self.own.id, self.own.dtype, self.own.rank),
                 Arg::block(self.peer.id, self.peer.dtype, self.peer.rank),
+                Arg::block(self.data.id, self.data.dtype, self.data.rank),
                 Arg::U64(self.bytes),
                 Arg::U64(self.slot_bytes),
                 Arg::U64(self.slab_off),
@@ -217,6 +254,10 @@ impl ArReduceCall {
     pub fn peer(&self) -> &Bytes {
         &self.peer
     }
+    /// ★ **数据块**(v1 = peer / push = own;见 `new` 的说明)
+    pub fn data(&self) -> &Bytes {
+        &self.data
+    }
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
@@ -225,5 +266,87 @@ impl ArReduceCall {
     }
     pub fn slab_off(&self) -> u64 {
         self.slab_off
+    }
+}
+
+// ============================================================================
+// 1-stage(对称缓冲 ⇒ 融合核;`TP2-施工设计.md` §35)
+// ============================================================================
+
+/// 1-stage 线格式(`O,T,T,T,sz`):`out`(= **本端槽**)· `own` hdr · `peer` hdr ·
+/// `peer_data`(= **对端槽的跨卡别名**)· `bytes`
+pub const SIG_1STAGE: &str = "O,T,T,T,sz";
+/// `SIG_1STAGE` 的槽名表(与 `ops::comm::CommAr1Stage*::PARAMS` **逐位对应**;
+/// `client::tests::parse_slots_are_exactly_declared` 锁)
+pub const PARSE_SLOTS_1STAGE: &[&str] = &["out", "own", "peer", "peer_data", "bytes"];
+
+/// **1-stage allreduce 调用**(对称缓冲;融合核 —— 没有 stage 段、零拷贝)。
+///
+/// 语义:`out += peer_data`(**原地**),同时由**同一个核**维护 header 的
+/// `produced`/`consumed` 与 credit(`cu/comm/ar_reduce.cu` 的 1-stage 头注)。
+///
+/// ⚠️ **`out` 就是本端那个对称槽本身** —— 上游算子(GEMM)必须**直接写它**,
+/// 否则"发布 produced = 数据就绪"就是谎话(前置清单 ④)。
+#[derive(Clone, Debug)]
+pub struct Ar1StageCall {
+    out: Bytes,
+    own: Bytes,
+    peer: Bytes,
+    peer_data: Bytes,
+    bytes: u64,
+}
+
+impl Ar1StageCall {
+    pub fn new(out: Bytes, own: Bytes, peer: Bytes, peer_data: Bytes, bytes: u64) -> Self {
+        Self { out, own, peer, peer_data, bytes }
+    }
+
+    pub fn parse(msg: &LaunchMsg) -> Result<(Self, Bytes), OpError> {
+        let s = crate::client::NamedSlots::new(msg)?;
+        let out = s.out_block("out", msg.out_elems)?;
+        let me = Self {
+            out: out.clone(),
+            own: s.flat_block("own")?,
+            peer: s.flat_block("peer")?,
+            peer_data: s.flat_block("peer_data")?,
+            bytes: s.u64("bytes")?,
+        };
+        Ok((me, out))
+    }
+
+    pub fn to_launch(&self) -> LaunchMsg {
+        LaunchMsg {
+            kernel: crate::contract::KernelSource {
+                name: one_stage_entry(self.out.dtype).to_string(),
+                source: String::new(),
+            },
+            args: vec![
+                Arg::block(self.out.id, self.out.dtype, self.out.rank),
+                Arg::block(self.own.id, self.own.dtype, self.own.rank),
+                Arg::block(self.peer.id, self.peer.dtype, self.peer.rank),
+                Arg::block(self.peer_data.id, self.peer_data.dtype, self.peer_data.rank),
+                Arg::U64(self.bytes),
+            ],
+            grid: (0, 0, 0),
+            block: (0, 0, 0),
+            shared_mem: 0,
+            out_elems: self.bytes as usize,
+        }
+    }
+
+    pub fn out(&self) -> &Bytes {
+        &self.out
+    }
+    pub fn own(&self) -> &Bytes {
+        &self.own
+    }
+    pub fn peer(&self) -> &Bytes {
+        &self.peer
+    }
+    pub fn peer_data(&self) -> &Bytes {
+        &self.peer_data
+    }
+    pub fn bytes(&self) -> u64 {
+        self.bytes
     }
 }

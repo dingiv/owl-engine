@@ -235,6 +235,9 @@ mod tests {
             (crate::family::comm::asset::REDUCE_F16, crate::client::comm::PARSE_SLOTS_REDUCE),
             (crate::family::comm::asset::REDUCE_BF16, crate::client::comm::PARSE_SLOTS_REDUCE),
             (crate::family::comm::asset::REDUCE_F32, crate::client::comm::PARSE_SLOTS_REDUCE),
+            (crate::family::comm::asset::ONE_STAGE_F16, crate::client::comm::PARSE_SLOTS_1STAGE),
+            (crate::family::comm::asset::ONE_STAGE_BF16, crate::client::comm::PARSE_SLOTS_1STAGE),
+            (crate::family::comm::asset::ONE_STAGE_F32, crate::client::comm::PARSE_SLOTS_1STAGE),
         ]);
         #[cfg(feature = "cublas")]
         cases.extend([
@@ -260,6 +263,13 @@ mod tests {
             (
                 crate::family::flashinfer::PREFILL_FI_FP8KV,
                 crate::client::flashinfer::PARSE_SLOTS,
+            ),
+            // 视觉塔 ragged 注意力(2026-10-15 vision 提交;与 native `vis.attn_full` 同槽位)
+            // —— 2026-10-19 补:它当时只落了声明表 + client 面,漏了本锁的两张清单
+            // (全特性 `cargo test -p owl-kernels --lib` 从那时起就红,属漏跟)
+            (
+                crate::family::flashinfer::ATTN_RAGGED_F16,
+                crate::client::flashinfer::ATTN_RAGGED_SLOTS,
             ),
         ]);
         #[cfg(feature = "xqa")]
@@ -298,6 +308,11 @@ mod tests {
             crate::family::comm::asset::REDUCE_F16,
             crate::family::comm::asset::REDUCE_BF16,
             crate::family::comm::asset::REDUCE_F32,
+            // 1-stage 融合核(§35;三 dtype 同表)—— 2026-10-19 补:上轮只进了 cases,
+            // 漏了这张面清单 ⇒ 覆盖门当场红(它就是为了逼"新增族算子成对改")
+            crate::family::comm::asset::ONE_STAGE_F16,
+            crate::family::comm::asset::ONE_STAGE_BF16,
+            crate::family::comm::asset::ONE_STAGE_F32,
         ]);
         #[cfg(feature = "cublas")]
         want.extend([crate::family::cublas::GEMM_F16, crate::family::cublas::GEMM_BF16]);
@@ -312,6 +327,7 @@ mod tests {
         want.extend([
             crate::family::flashinfer::PREFILL_FI,
             crate::family::flashinfer::PREFILL_FI_FP8KV,
+            crate::family::flashinfer::ATTN_RAGGED_F16,
         ]);
         #[cfg(feature = "xqa")]
         want.extend([

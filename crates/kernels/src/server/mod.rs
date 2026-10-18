@@ -34,6 +34,7 @@ pub fn family_factories() -> Vec<FamilyFactory> {
         gdn_scalar::GdnScalarRuntime::assemble,
         comm::CommArStageRuntime::assemble,
         comm::CommArReduceRuntime::assemble,
+        comm::CommAr1StageRuntime::assemble,
         #[cfg(feature = "cublas")]
         cublas::CublasRuntime::assemble,
         #[cfg(feature = "marlin")]

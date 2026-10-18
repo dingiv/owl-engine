@@ -119,7 +119,7 @@ pub mod sys {
         };
     }
 
-    /// **P2P 能力查询**(S4 ⑤-K2 的 TP 分档输入;`owl_comm::peer::PeerCaps`
+    /// **P2P 能力查询**(S4 ⑤-K2 的 TP 分档输入;`owl_cuda::comm::peer::PeerCaps`
     /// 的 `p2p_supported` 字段)。
     ///
     /// 准入(A4):设备级查询(无上下文/无流/零分配/零阻塞),只读一个 bool。
@@ -264,3 +264,49 @@ mod device_rows_tests {
         assert_eq!(bdfs.len(), n, "BDF 应唯一");
     }
 }
+
+/// **图结构统计 —— 从 owl 自己的捕获簿记生成**(2026-10-18 §39)。
+///
+/// **为什么不用驱动 API**:`cuGraphGetEdges` / `cuGraphNodeGetDependencies` 在本 crate 的
+/// cudarc feature 集下**被门控掉**(实测 "found an item that was configured out");
+/// 而**图的边本来就是 owl 自己建的**(同流顺序边 + `capture_route_to` 的 fork 边 +
+/// `capture_join` 的 join 边)⇒ **自己的簿记就是真源**,且**零驱动调用、零热路径成本**
+/// (发射时一次整数自增)。
+///
+/// ⚠️ **采集纪律(用户口径 2026-10-18)**:**攒内存,最后集中 dump** —— 捕获期记一次,
+/// 进 `owl_shared::metrics`(见 `state::graph_end`),由 `metrics::dump` 在跑完后出表;
+/// **不在热路径打印**。
+///
+/// 判据:`has_branches()` ⇒ 图里**真有** fork 出去的分支(否则"图内并行"根本无从谈起)。
+#[derive(Debug, Clone, Default)]
+pub struct GraphShape {
+    /// 捕获窗内发射的节点总数(内核 + 搬运)
+    pub nodes: usize,
+    /// 其中落在**非 origin 流**(fork 出去)的节点数
+    pub aux_nodes: usize,
+    /// fork 边数(首次切到某条非 origin 流)
+    pub forks: usize,
+    /// join 边数(`capture_join`)
+    pub joins: usize,
+    /// 图内 D2D 搬运节点数
+    pub copies: usize,
+}
+
+impl std::fmt::Display for GraphShape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "nodes={} aux_nodes={} forks={} joins={} copies={}",
+            self.nodes, self.aux_nodes, self.forks, self.joins, self.copies
+        )
+    }
+}
+
+impl GraphShape {
+    /// 图里**有没有** fork 出去的分支(有 ⇒ 才有"图内并行"这回事)
+    pub fn has_branches(&self) -> bool {
+        self.aux_nodes > 0
+    }
+}
+
+

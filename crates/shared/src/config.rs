@@ -174,6 +174,15 @@ pub struct RuntimeCfg {
     /// "尽力而为"与分片协议的"确定双卡"是两条规范,并存会让卡身份有两个真源。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tp_ordinals: Option<Vec<usize>>,
+    /// **TP 通信数据腿:push(写对端)档**(2026-10-18;`TP2-施工设计.md` §36.6/§36.7)。
+    ///
+    /// `false`(缺省)= v1:两核"stage 写本端槽 → reduce 读对端槽",跨 PCIe 是**读**。
+    /// `true` = **指针对调**:"stage 写**对端**槽 → reduce 读**本端**槽",跨 PCIe 只剩
+    /// **写**(posted)。同会话实测(3080 对 2/3,f16):双向读 9.52GB/s vs 双向写
+    /// **12.52GB/s**(+31%)—— 因为 non-posted 读在双向档争完成通道。
+    /// 副作用:staging 别名改授 `PROT_READWRITE`。
+    #[serde(default)]
+    pub tp_push: bool,
     /// **自动选卡的空闲占比阈值**(0..1;默认 0.9):候选卡的 `memory.free/total` 低于它
     /// ⇒ auto-pick 跳过(避让非 owl 进程/未持锁实例);显式 spec 命中且全被跳 ⇒ 响亮拒启。
     pub gpu_min_free_ratio: f64,
@@ -664,6 +673,7 @@ impl Default for RuntimeCfg {
             device: crate::device::DeviceSpec::default(),
             device_ordinal: None,
             tp_ordinals: None,
+            tp_push: false,
             gpu_min_free_ratio: 0.9,
             max_seq: 4096,
             prefill_chunk: 512,

@@ -41,8 +41,17 @@
 //    ⇒ 这就是本核加 `n_slots >= 2` 之外**唯一无法自检**的一条,必须在分配侧保证
 //    (见 `ar.rs::hdr` 注释与 boot 期握手)。
 // ③ **载荷 ≤ `slot_bytes`**(v1 单块):超了是调用方错,解释器层已响亮拒。
-// ④ **`n_slots >= 2`**:credit 环靠"上一轮那格已被对端读走"兜底;`n_slots == 1`
-//    会让本端立刻覆盖对端正要读的那一格 ⇒ 本核**响亮拒**(err=3;2026-10-17 加)。
+// ④ **`n_slots ≥ 1`**(2026-10-17 **放宽**;原 `≥ 2`,那道守卫把 CE 刀打死了 ——
+//    见 TP2-施工设计 §29/§31):
+//    · `n_slots == 0` = **没有格可写**(调用方错)⇒ 响亮拒(err=3);
+//    · `n_slots == 1` = **严格一深环**:本核必须等 `peer.consumed ≥ produced`
+//      (`need = prod − n_slots + 1 = prod`)才覆盖 slot 0。安全性由**两条现役机制**保证:
+//      (a) **代发 credit**(见核内 `*own_cons = prod0`)写在 credit 检查**之前**
+//          ⇒ 两侧"先发布后检查" ⇒ **不死锁**;
+//      (b) **尾部 rendezvous**(发布 produced 后等 `peer.produced ≥ want`)
+//          ⇒ 一步之内两端都完成 stage 才放行 ⇒ **单格不会被覆盖在两方之间**。
+//      v1 语义下同样安全:credit = 对端 reduce 的**真消费**,等到 `prod` 即已读走 `prod` 次。
+//      CE 语义下 `staging.consumed` 的**唯一写者**就是本核的代发(add 核绑到 inbox)。
 // ⑤ **发射几何**:block 尺寸纯发射参数(核内全用 `blockDim.x` / `gridDim.x`);
 //    grid 由 `server::comm::MAX_THREADS / BLOCK` 算 ⇒ 与核无耦合,故两 rank 之间
 //    **不要求同 grid**(它只决定本端工作的摊法,不进协议)。
@@ -134,6 +143,10 @@ __device__ __forceinline__ void owl_ar_copy_bytes(
     extern "C" __global__ void NAME PARAMS {                                          \
         unsigned char* own_b = reinterpret_cast<unsigned char*>(own);                      \
         const unsigned char* peer_b = reinterpret_cast<const unsigned char*>(peer);   \
+        /* ★ **数据块**(2026-10-18;push 档 §36.7):slot 数据写哪里。            \
+         * v1 = `own`(写本端槽);push = `peer`(写对端槽 —— posted write)。   \
+         * header(`own`/`peer`)两档都不变 ⇒ 块间令牌留在本端(§36.8)。 */    \
+        unsigned char* data_b = reinterpret_cast<unsigned char*>(data);      \
         volatile unsigned long long* own_prod =                                       \
             reinterpret_cast<volatile unsigned long long*>(own_b + OWL_AR_OFF_PRODUCED); \
         volatile unsigned long long* own_cons =                                       \
@@ -165,8 +178,9 @@ __device__ __forceinline__ void owl_ar_copy_bytes(
             } else if ((size_t)(*own_slot_bytes) != slot_bytes) {                     \
                 *own_err = 3u; /* 声明与 header 漂移(两处不同改的哨兵) */            \
                 s_fail = 1;                                                           \
-            } else if (*own_nslots < 2u) {                                            \
-                /* 前置清单 ④:单格环会让本端立刻覆盖对端正要读的那格 ⇒ 响亮拒 */    \
+            } else if (*own_nslots == 0u) {                                           \
+                /* 前置清单 ④:0 格 = 无格可写(调用方错)⇒ 响亮拒。                     \
+                 * 1 格**合法**(严格一深环;安全性论证见头注 ④/代发 credit)。 */      \
                 *own_err = 3u;                                                        \
                 s_fail = 1;                                                           \
             } else {                                                                  \
@@ -227,7 +241,7 @@ __device__ __forceinline__ void owl_ar_copy_bytes(
         }                                                                             \
         const unsigned int slot =                                                     \
             (unsigned int)(s_prod % (unsigned long long)(*own_nslots));               \
-        owl_ar_copy_bytes(reinterpret_cast<unsigned char*>(own) + OWL_AR_HDR_BYTES +  \
+        owl_ar_copy_bytes(data_b + OWL_AR_HDR_BYTES +  \
                               (size_t)slot * slot_bytes,                              \
                           reinterpret_cast<const unsigned char*>(local) + slab_off,   \
                           bytes);                                                     \
@@ -264,6 +278,6 @@ __device__ __forceinline__ void owl_ar_copy_bytes(
         }                                                                              \
     }
 
-OWL_AR_STAGE_KERNEL(owl_comm_ar_stage_f32, float, (const float* __restrict__ local, unsigned char* __restrict__ own, const unsigned char* __restrict__ peer, const size_t bytes, const size_t slot_bytes, const size_t slab_off))
-OWL_AR_STAGE_KERNEL(owl_comm_ar_stage_f16, __half, (const __half* __restrict__ local, unsigned char* __restrict__ own, const unsigned char* __restrict__ peer, const size_t bytes, const size_t slot_bytes, const size_t slab_off))
-OWL_AR_STAGE_KERNEL(owl_comm_ar_stage_bf16, __nv_bfloat16, (const __nv_bfloat16* __restrict__ local, unsigned char* __restrict__ own, const unsigned char* __restrict__ peer, const size_t bytes, const size_t slot_bytes, const size_t slab_off))
+OWL_AR_STAGE_KERNEL(owl_comm_ar_stage_f32, float, (const float* __restrict__ local, unsigned char* __restrict__ own, const unsigned char* __restrict__ peer, unsigned char* __restrict__ data, const size_t bytes, const size_t slot_bytes, const size_t slab_off))
+OWL_AR_STAGE_KERNEL(owl_comm_ar_stage_f16, __half, (const __half* __restrict__ local, unsigned char* __restrict__ own, const unsigned char* __restrict__ peer, unsigned char* __restrict__ data, const size_t bytes, const size_t slot_bytes, const size_t slab_off))
+OWL_AR_STAGE_KERNEL(owl_comm_ar_stage_bf16, __nv_bfloat16, (const __nv_bfloat16* __restrict__ local, unsigned char* __restrict__ own, const unsigned char* __restrict__ peer, unsigned char* __restrict__ data, const size_t bytes, const size_t slot_bytes, const size_t slab_off))

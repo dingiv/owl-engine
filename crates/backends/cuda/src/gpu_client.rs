@@ -182,6 +182,7 @@ impl GpuClient {
     }
 
     /// **对端映射**(S1):把凭据导入为本卡 VA 别名(返回别名块句柄)。
+    /// **导入对端分配(只读)** —— v1 语义:本端只读对端 staging。
     pub async fn peer_import(
         &self,
         credential: Vec<u8>,
@@ -189,8 +190,32 @@ impl GpuClient {
         peer_uuid: impl Into<String>,
         name: impl Into<String>,
     ) -> Result<Bytes, ModelError> {
+        self.peer_import_ex(credential, bytes, peer_uuid, name, false).await
+    }
+
+    /// **导入对端分配(可写)** —— push 协议前置:本端要 `st.global` 写对端槽
+    /// (TP2 施工设计 §36.6:实测 `cuMemSetAccess(self, PROT_READWRITE)` 在导入的
+    /// 对端映射上可成,且 posted 写逐字节落地)。
+    pub async fn peer_import_rw(
+        &self,
+        credential: Vec<u8>,
+        bytes: usize,
+        peer_uuid: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Result<Bytes, ModelError> {
+        self.peer_import_ex(credential, bytes, peer_uuid, name, true).await
+    }
+
+    async fn peer_import_ex(
+        &self,
+        credential: Vec<u8>,
+        bytes: usize,
+        peer_uuid: impl Into<String>,
+        name: impl Into<String>,
+        rw: bool,
+    ) -> Result<Bytes, ModelError> {
         let (peer_uuid, name) = (peer_uuid.into(), name.into());
-        self.submit(move |ack| Command::PeerImport { credential, bytes, peer_uuid, name, ack })?
+        self.submit(move |ack| Command::PeerImport { credential, bytes, peer_uuid, name, rw, ack })?
             .await
     }
 
@@ -203,6 +228,26 @@ impl GpuClient {
     /// 后线程退出。本调用回执 = 关机流程已启动并完成排空。
     pub async fn close(&self) -> Result<(), ModelError> {
         self.submit(move |ack| Command::Close { ack })?.await
+    }
+}
+
+impl GpuClient {
+    /// ★ **捕获期发射路由**(图内 fork/join;2026-10-18;B1 门)。
+    ///
+    /// `sid`:0=H2D · 1=COMPUTE · 2=D2H · **3=COMPUTE_AUX**(与 `state::STREAM_*`
+    /// 同源)。只在捕获期合法 —— 它会把后续 `Launch`/`CopyBlock`/`Memset` 路由到
+    /// 目标流,并在图上留一条 fork 依赖边。
+    ///
+    /// **固有方法(不进 `DeviceClient` 契约)**:多流是 CUDA 后端的调度能力,
+    /// CPU face 无此概念。
+    pub async fn capture_route_to(&mut self, sid: u8) -> Result<(), ModelError> {
+        self.submit(move |ack| Command::CaptureRoute { sid, ack })?.await
+    }
+
+    /// ★ **捕获期的 join**(主链等支链;2026-10-18):当前路由流 → origin 建一条依赖边,
+    /// 路由切回 origin。与 `capture_route_to` 分工见其文档(拿它当"切流程"用 = 串行化)。
+    pub async fn capture_join(&mut self) -> Result<(), ModelError> {
+        self.submit(move |ack| Command::CaptureJoin { ack })?.await
     }
 }
 
@@ -240,6 +285,7 @@ impl DeviceClient for GpuClient {
     async fn graph_abort(&mut self) -> Result<(), ModelError> {
         self.submit(move |ack| Command::GraphAbort { ack })?.await
     }
+
 
     async fn graph_destroy(&mut self, graph: GraphId) -> Result<(), ModelError> {
         self.submit(move |ack| Command::GraphDestroy { graph, ack })?.await

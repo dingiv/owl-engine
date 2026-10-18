@@ -3,7 +3,7 @@
 //! 设计出处:`docs/arch/TP2-施工设计.md` §14.2(S4 分刀)/ §15.6(双 actor 形态)。
 //!
 //! 职责四件(顺序有语义,勿重排):
-//! 1. **分档判定**(`owl_comm::peer::PeerPlan`):UUID + BAR1 + P2P 能力
+//! 1. **分档判定**(`owl_cuda::comm::peer::PeerPlan`):UUID + BAR1 + P2P 能力
 //!    (混插/不支持 ⇒ **响亮拒**,D5)⇒ 单笔上限与 staging 额度核算;
 //! 2. **staging 的 VMM 对称握手**(`peer_alloc` → fd 交叉 → `peer_import`):
 //!    **必须在建图之前完成** —— 捕获期拒三个 `Peer*` 命令(护栏在
@@ -14,12 +14,12 @@
 //! 两侧**同一份代码**(对称);每 rank 装载走 `ModelLoader::slice(id, world)`
 //! —— 确定性分片协议 ⇒ 零协调(装载本身在调用方手里)。
 
-use owl_comm::ar::StagingLayout;
-use owl_comm::peer::{PeerCaps, PeerPlan};
+use owl_cuda::comm::ar::StagingLayout;
+use owl_cuda::comm::peer::{PeerCaps, PeerPlan};
 use owl_cuda::{DeviceClient, GpuClient};
 use owl_iface::contract::{Bytes, ModelError};
 use owl_models::model::ModelSpec;
-use owl_models::module::TpCtx;
+use owl_models::module::{TpArenaSlots, TpCtx};
 use owl_models::plan::tp::TpPlan;
 use owl_models::tokenizer::Tokenizer;
 
@@ -38,7 +38,19 @@ fn loud<T>(msg: impl Into<String>) -> Result<T> {
 // §1 staging(双块 + 布局量)
 // ============================================================================
 
-/// staging 的双块与布局量(布局算术单源 = `owl_comm::ar::StagingLayout` ——
+/// **装配选项**(2026-10-18;`TpEngine::assemble_with` 传入)。
+///
+/// 为什么是**显式选项**而不是 env:owl 的显式依赖律 —— 引擎内部零 env 读取,
+/// 开关由入口(server config / 测试用例)经结构体显式传入。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TpOpts {
+    /// **push 档**:两核把 `own`/`peer` 指针对调 ⇒ 数据腿从"读对端"变"写对端"
+    /// (`TP2-施工设计.md` §36.6/§36.7)。**副作用**:staging 别名改授
+    /// `PROT_READWRITE`(v1 是 `PROT_READ`)。
+    pub push: bool,
+}
+
+/// staging 的双块与布局量(布局算术单源 = `owl_cuda::comm::ar::StagingLayout` ——
 /// 本模块不重写 header/slot 偏移)。
 #[derive(Debug, Clone)]
 pub struct TpStaging {
@@ -46,6 +58,11 @@ pub struct TpStaging {
     own: Bytes,
     /// 对端 staging 的跨卡别名(peer;stage 读 `consumed` / reduce 读 slots)
     peer: Bytes,
+    /// ★ **1-stage 对称 arena**(2026-10-18;`None` = 走 v1 两段 —— 见 §35)
+    arena: Option<std::sync::Arc<TpArenaSlots>>,
+    /// ★ **push 档**(2026-10-18;§36.6/§36.7):`true` ⇒ 两核把 `own`/`peer`
+    /// **指针对调**(数据腿从"读对端"变成"写对端"),别名块必须已授 `PROT_READWRITE`。
+    push: bool,
     pub(crate) layout: StagingLayout,
 }
 
@@ -58,6 +75,14 @@ impl TpStaging {
     pub fn peer(&self) -> &Bytes {
         &self.peer
     }
+    /// 1-stage 对称槽束(`None` = v1 两段路径)
+    pub fn arena(&self) -> Option<&std::sync::Arc<TpArenaSlots>> {
+        self.arena.as_ref()
+    }
+    /// **push 档**(数据腿走写对端;见 `TpOpts::push`)
+    pub fn push(&self) -> bool {
+        self.push
+    }
     /// slot 字节数(两侧同参)
     pub fn slot_bytes(&self) -> u64 {
         self.layout.slot_bytes
@@ -68,25 +93,32 @@ impl TpStaging {
     }
 
     fn ctx(&self, plan: TpPlan) -> TpCtx {
-        TpCtx { plan, own: self.own.clone(), peer: self.peer.clone(), slot_bytes: self.layout.slot_bytes }
+        TpCtx {
+            plan,
+            own: self.own.clone(),
+            peer: self.peer.clone(),
+            slot_bytes: self.layout.slot_bytes,
+            arena: self.arena.clone(),
+            push: self.push,
+        }
     }
 }
 
-/// staging header(64B)字节(**布局权威 = `owl_comm::ar::hdr` 常量**;与 cuda 门
+/// staging header(64B)字节(**布局权威 = `owl_cuda::comm::ar::hdr` 常量**;与 cuda 门
 /// `write_hdr` 同法):`produced`/`consumed` 归零 + 自描述 `slot_bytes`/`n_slots`
 /// + `magic`(核的串块/未初始化校验门)。
 fn staging_header_bytes(layout: StagingLayout) -> Vec<u8> {
-    let mut b = vec![0u8; owl_comm::ar::HEADER_BYTES as usize];
+    let mut b = vec![0u8; owl_cuda::comm::ar::HEADER_BYTES as usize];
     b[16..20].copy_from_slice(&(layout.slot_bytes as u32).to_le_bytes());
     b[20..24].copy_from_slice(&layout.slots.to_le_bytes());
-    b[24..28].copy_from_slice(&owl_comm::ar::MAGIC.to_le_bytes());
+    b[24..28].copy_from_slice(&owl_cuda::comm::ar::MAGIC.to_le_bytes());
     // ★ **前置清单②(2026-10-17 显式化)**:`produced` / `consumed` /
     // `wait_done` / `blocks_done` **四格必须全 0**。这里靠"Vec 初始化为零 +
     // 只写 0..28"成立 —— 但那是**隐含**的,故补一条断言把它钉住:
     // `wait_done` 若留非 0 残值且 ≥ 本轮 want,非 0 号 block 会**跳过两级等待**
     // ⇒ 静默读到未就绪的对端数据(核**无法自检**,只能在这里保证)。
     debug_assert!(
-        b.len() == owl_comm::ar::HEADER_BYTES as usize
+        b.len() == owl_cuda::comm::ar::HEADER_BYTES as usize
             && b[28..].iter().all(|&x| x == 0),
         "staging header 的 28..64(含 wait_done@32 / blocks_done@40)必须全 0;\
          核无法自检这一条 —— 残值会导致非 0 号 block 跳过等待、静默读到未就绪数据"
@@ -107,7 +139,7 @@ async fn init_staging_header<D: DeviceClient>(
     layout: StagingLayout,
     tag: &str,
 ) -> Result<()> {
-    let n = owl_comm::ar::HEADER_BYTES as usize;
+    let n = owl_cuda::comm::ar::HEADER_BYTES as usize;
     let mut pin = face.alloc_pinned(n, tag).await?;
     // ⚠️ 租约是**池化区域**(容量 ≥ 请求)⇒ 只写前 n 字节
     pin.slice_bytes_mut()[..n].copy_from_slice(&staging_header_bytes(layout));
@@ -117,7 +149,7 @@ async fn init_staging_header<D: DeviceClient>(
 
 /// 读回 header(装配后自证用)
 async fn read_staging_header<D: DeviceClient>(face: &mut D, own: &Bytes) -> Result<[u8; 64]> {
-    let mut buf = vec![0u8; owl_comm::ar::HEADER_BYTES as usize];
+    let mut buf = vec![0u8; owl_cuda::comm::ar::HEADER_BYTES as usize];
     face.dtoh(own, &mut buf).await?;
     let mut out = [0u8; 64];
     out.copy_from_slice(&buf);
@@ -351,6 +383,15 @@ impl TpEngine<GpuClient> {
     /// 装载在调用方手里完成(每 rank `engine.loader().slice(id, world)` ——
     /// 确定性分片协议,零协调)。
     pub async fn assemble(engines: Vec<Engine<GpuClient>>, loadeds: Vec<LoadedModel>) -> Result<Self> {
+        Self::assemble_with(engines, loadeds, TpOpts::default()).await
+    }
+
+    /// 同 [`Self::assemble`],但显式给装配选项(生产入口用;测试默认走 `assemble`)。
+    pub async fn assemble_with(
+        engines: Vec<Engine<GpuClient>>,
+        loadeds: Vec<LoadedModel>,
+        opts: TpOpts,
+    ) -> Result<Self> {
         if engines.len() != 2 || loadeds.len() != 2 {
             return loud(format!(
                 "TP v1 只支持 world = 2(engines={} loadeds={})",
@@ -379,7 +420,7 @@ impl TpEngine<GpuClient> {
             layout.total_bytes() >> 20,
             layout.slots,
             layout.slot_bytes >> 20,
-            owl_comm::ar::HEADER_BYTES,
+            owl_cuda::comm::ar::HEADER_BYTES,
         );
         // ── ② staging 对称握手(**建图之前**)───────────────────────────
         let mut it = engines.into_iter();
@@ -388,7 +429,7 @@ impl TpEngine<GpuClient> {
         let mut face0 = face0;
         let mut face1 = face1;
         let (staging0, staging1) =
-            handshake_staging(&mut face0, &mut face1, &caps0.uuid, &caps1.uuid, layout).await?;
+            handshake_staging(&mut face0, &mut face1, &caps0.uuid, &caps1.uuid, layout, opts).await?;
         // ── ③ 通用装配(每 rank boot_rank;图捕获在此发生)──────────────
         let engines = vec![
             Engine::on(cfg.clone(), face0)
@@ -440,7 +481,7 @@ impl TpEngine<GpuClient> {
             layout.total_bytes() >> 20,
             layout.slots,
             layout.slot_bytes >> 20,
-            owl_comm::ar::HEADER_BYTES,
+            owl_cuda::comm::ar::HEADER_BYTES,
         );
         let mut it = engines.into_iter();
         let (face0, cfg) = it.next().expect("world = 2 已守门").into_parts();
@@ -449,7 +490,8 @@ impl TpEngine<GpuClient> {
         let mut face1 = face1;
         let uuid = caps0.uuid.clone();
         let (staging0, staging1) =
-            handshake_staging(&mut face0, &mut face1, &uuid, &uuid, layout).await?;
+            handshake_staging(&mut face0, &mut face1, &uuid, &uuid, layout, TpOpts::default())
+                .await?;
         let engines = vec![
             Engine::on(cfg.clone(), face0)
                 .map_err(|e| ModelError::Msg(format!("同卡档重装 rank0 引擎壳失败:{e}")))?,
@@ -510,7 +552,15 @@ async fn retire_rank(dev: &mut RankDev<GpuClient>, tag: &str) -> Option<ModelErr
                 &mut first,
             ),
             Some(tp) => {
-                let ids = vec![tp.own.id, tp.peer.id];
+                // ★ **staging 两块 + 1-stage arena 六块**(2 槽 + 1 header,各有分配侧
+                // 与别名侧)—— 2026-10-18 补:漏掉 arena 会泄 66MB/rank(装配门实测捉到)。
+                let mut ids = vec![tp.own.id, tp.peer.id];
+                if let Some(a) = tp.arena.as_ref() {
+                    ids.push(a.own_hdr.id);
+                    ids.push(a.peer_hdr.id);
+                    ids.extend(a.own_slots.iter().map(|b| b.id));
+                    ids.extend(a.peer_slots.iter().map(|b| b.id));
+                }
                 if let Err(e) = face.peer_release(ids).await {
                     note(ModelError::Msg(format!("{tag} PeerRelease 失败:{e}")), &mut first);
                 }
@@ -591,6 +641,7 @@ async fn handshake_staging(
     uuid0: &str,
     uuid1: &str,
     layout: StagingLayout,
+    opts: TpOpts,
 ) -> Result<(TpStaging, TpStaging)> {
     let bytes = layout.total_bytes() as usize;
     let (own0, cred0) = face0
@@ -601,17 +652,47 @@ async fn handshake_staging(
         .peer_alloc(bytes, "tp.staging.r1")
         .await
         .map_err(|e| ModelError::Msg(format!("TP staging 分配失败(rank1):{e}")))?;
-    let peer0 = face0
-        .peer_import(cred1, bytes, uuid1.to_string(), "tp.peer.r0")
-        .await
-        .map_err(|e| ModelError::Msg(format!("TP staging 导入失败(rank0 ← rank1):{e}")))?;
-    let peer1 = face1
-        .peer_import(cred0, bytes, uuid0.to_string(), "tp.peer.r1")
-        .await
-        .map_err(|e| ModelError::Msg(format!("TP staging 导入失败(rank1 ← rank0):{e}")))?;
+    // ★ **push 档 ⇒ 别名授 RW**(§36.6/§36.7):push 的两核要把本端 payload
+    // **写进对端槽**(`st.global` 跨 PCIe),只读授予会当场 ILLEGAL_ADDRESS。
+    // v1 保持只读(现役行为零变化;RW 只是**访问级别**不同,不额外占窗口预算)。
+    let (peer0, peer1) = if opts.push {
+        let p0 = face0
+            .peer_import_rw(cred1, bytes, uuid1.to_string(), "tp.peer.rw.r0")
+            .await
+            .map_err(|e| ModelError::Msg(format!("TP staging RW 导入失败(rank0 ← rank1):{e}")))?;
+        let p1 = face1
+            .peer_import_rw(cred0, bytes, uuid0.to_string(), "tp.peer.rw.r1")
+            .await
+            .map_err(|e| ModelError::Msg(format!("TP staging RW 导入失败(rank1 ← rank0):{e}")))?;
+        owl_shared::log_info!("tp", "TP2 staging 别名已授 **PROT_READWRITE**(push 档;写对端槽)");
+        (p0, p1)
+    } else {
+        let p0 = face0
+            .peer_import(cred1, bytes, uuid1.to_string(), "tp.peer.r0")
+            .await
+            .map_err(|e| ModelError::Msg(format!("TP staging 导入失败(rank0 ← rank1):{e}")))?;
+        let p1 = face1
+            .peer_import(cred0, bytes, uuid0.to_string(), "tp.peer.r1")
+            .await
+            .map_err(|e| ModelError::Msg(format!("TP staging 导入失败(rank1 ← rank0):{e}")))?;
+        (p0, p1)
+    };
+    // ★ **1-stage 对称 arena**(2026-10-18;§35)—— 开关见 `one_stage_enabled()`
+    // ⚠️ **与 push 互斥**(两者都改写数据腿;同时开只会让 push 静默不生效)。
+    let (arena0, arena1) = if one_stage_enabled() && !opts.push {
+        // 槽大小:按 staging 的 slot_bytes 会白占显存(0.8B 的 payload 只有 ~1MiB,
+        // 而 SLOT_BYTES = 32MiB ⇒ 2 槽 = 64MiB/rank,实测在 3080 上直接
+        // `cuMemSetAccess` OOM)。**上限 8MiB** —— 超出的载荷由 `eval::symmetric_out_slot`
+        // 的容量检查**回退 v1**(不会静默错),槽装不下只是不省那一段。
+        let slot = layout.slot_bytes.min(8 << 20);
+        let (a0, a1) = handshake_arena(face0, face1, uuid0, uuid1, slot).await?;
+        (Some(a0), Some(a1))
+    } else {
+        (None, None)
+    };
     Ok((
-        TpStaging { own: own0, peer: peer0, layout },
-        TpStaging { own: own1, peer: peer1, layout },
+        TpStaging { own: own0, peer: peer0, arena: arena0, push: opts.push, layout },
+        TpStaging { own: own1, peer: peer1, arena: arena1, push: opts.push, layout },
     ))
 }
 
@@ -670,4 +751,91 @@ fn query_bar1_bytes() -> Result<std::collections::HashMap<String, u64>> {
         return loud("TP 探测:bar1 表为空(nvidia-smi -q -d MEMORY 输出无 BAR1 段)");
     }
     Ok(m)
+}
+
+// ============================================================================
+// ★ 1-stage 对称 arena(2026-10-18;`TP2-施工设计.md` §35)
+// ============================================================================
+
+/// 1-stage 开关(env `OWL_TP_1STAGE=1`;**缺省关** —— 2026-10-18 同会话 std A/B 定谳:
+/// **性能中性**(v1 1477.66 / 1-stage 1479.52,±0.4% 噪声内),而它每 rank 多占
+/// 64MiB(2 × 32MiB 槽)+ 6 笔 VMM 映射 ⇒ **没有理由让它当默认**。
+///
+/// 保留它的理由不是收益,是**地基**:它是"对称缓冲 ⇒ 1-stage"的完整可运行实现
+/// (核 · 握手 · 一次性 rÉT 换块 · 门),而下一步要查的就是"**为什么没收益**"——
+/// 最大嫌疑 = **GEMM 直写 peer-shared 块的写代价**(VMM 映射内存的写路径)正好
+/// 抵消了省下的 stage 协议(`TP2-施工设计.md` §35)。
+///
+/// 纪律:任何"结构更对但中性"的改动都该这样处置 —— **能力留在树里、默认走老的**,
+/// 直到有人量出它到底赚在哪(或亏在哪)。
+fn one_stage_enabled() -> bool {
+    matches!(std::env::var("OWL_TP_1STAGE").as_deref(), Ok("1") | Ok("true"))
+}
+
+/// **1-stage 对称槽束握手**:每侧 **3 个独立块** —— 2 个 payload 槽(乒乓)+ 1 个 header。
+///
+/// 为什么槽是**独立块**(而不是 v1 那样把 header + slot×2 放同一块):
+/// 上游 GEMM 要**直接写槽**,而分配接口的最小单位是**块**(算子的输出参数只有块 id)
+/// —— 同一块布局会把"块内偏移"这层新接口扯进来,那才是真正的跨切面改动。
+/// 代价 = 每侧多 2 次 `peer_alloc` + 2 次 `import`;显存与 v1 的 staging 同量级。
+async fn handshake_arena(
+    face0: &mut GpuClient,
+    face1: &mut GpuClient,
+    uuid0: &str,
+    uuid1: &str,
+    slot_bytes: u64,
+) -> Result<(std::sync::Arc<TpArenaSlots>, std::sync::Arc<TpArenaSlots>)> {
+    let layout = StagingLayout::new(slot_bytes, 2); // header 自描述用(槽数 = 乒乓)
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+    let sb = layout.slot_bytes as usize;
+    let hb = owl_cuda::comm::ar::HEADER_BYTES as usize;
+    fn e(what: &str, err: ModelError) -> ModelError {
+        ModelError::Msg(format!("TP arena {what}: {err}"))
+    }
+
+    // ── 分配(每侧:2 槽 + 1 header)────────────────────────────────
+    let (d00, c00) = face0.peer_alloc(sb, "tp.arena.r0.s0").await.map_err(|er| e("r0.s0 alloc", er))?;
+    let (d01, c01) = face0.peer_alloc(sb, "tp.arena.r0.s1").await.map_err(|er| e("r0.s1 alloc", er))?;
+    let (h0, hc0) = face0.peer_alloc(hb, "tp.arena.hdr.r0").await.map_err(|er| e("r0.hdr alloc", er))?;
+    let (d10, c10) = face1.peer_alloc(sb, "tp.arena.r1.s0").await.map_err(|er| e("r1.s0 alloc", er))?;
+    let (d11, c11) = face1.peer_alloc(sb, "tp.arena.r1.s1").await.map_err(|er| e("r1.s1 alloc", er))?;
+    let (h1, hc1) = face1.peer_alloc(hb, "tp.arena.hdr.r1").await.map_err(|er| e("r1.hdr alloc", er))?;
+
+    // ── 交叉导入(各自看对端的 3 个块)────────────────────────────
+    let (u1, u0) = (uuid1.to_string(), uuid0.to_string());
+    let pd10 = face0.peer_import(c10, sb, u1.clone(), "tp.arena.peer.r0.s0").await.map_err(|er| e("r0←r1 s0", er))?;
+    let pd11 = face0.peer_import(c11, sb, u1.clone(), "tp.arena.peer.r0.s1").await.map_err(|er| e("r0←r1 s1", er))?;
+    let ph1 = face0.peer_import(hc1, hb, u1, "tp.arena.peer.hdr.r0").await.map_err(|er| e("r0←r1 hdr", er))?;
+    let pd00 = face1.peer_import(c00, sb, u0.clone(), "tp.arena.peer.r1.s0").await.map_err(|er| e("r1←r0 s0", er))?;
+    let pd01 = face1.peer_import(c01, sb, u0.clone(), "tp.arena.peer.r1.s1").await.map_err(|er| e("r1←r0 s1", er))?;
+    let ph0 = face1.peer_import(hc0, hb, u0, "tp.arena.peer.hdr.r1").await.map_err(|er| e("r1←r0 hdr", er))?;
+
+    // ── header 落地(建图前;与 staging 同款:漏了 = 核 err=3 空转)──
+    init_staging_header(face0, &h0, layout, "tp.arena.hdr.init.r0").await?;
+    init_staging_header(face1, &h1, layout, "tp.arena.hdr.init.r1").await?;
+
+    let a0 = Arc::new(TpArenaSlots {
+        own_slots: [d00, d01],
+        peer_slots: [pd10, pd11],
+        own_hdr: h0,
+        peer_hdr: ph1,
+        slot_bytes: layout.slot_bytes,
+        call: AtomicU64::new(0),
+    });
+    let a1 = Arc::new(TpArenaSlots {
+        own_slots: [d10, d11],
+        peer_slots: [pd00, pd01],
+        own_hdr: h1,
+        peer_hdr: ph0,
+        slot_bytes: layout.slot_bytes,
+        call: AtomicU64::new(0),
+    });
+    owl_shared::log_info!(
+        "tp",
+        "1-stage arena 就绪:每侧 2 槽 × {}MiB + {}B header(槽 = 独立块 ⇒ GEMM 可直写;§35)",
+        layout.slot_bytes >> 20,
+        owl_cuda::comm::ar::HEADER_BYTES
+    );
+    Ok((a0, a1))
 }
