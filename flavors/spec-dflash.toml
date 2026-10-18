@@ -36,8 +36,22 @@ vram_reserve_mb = 512
 # `gdn_slots` → `gdn_slots`,flavor 文本没跟上 ⇒ `deny_unknown_fields`
 # 直接**拒解析**(`预设档清单非空且全部可解析` / `load_基准文件与覆盖文件叠加` 红)。
 gdn_slots = 1
-snap_max = 1
-prefix_cache = false
+# ── **前缀复用三层账**(2026-10-19 容量定档;架构 = store 决策/engine 搬运)──
+# ① KV 腿宿主层(`host_cache_mb`):缓存块**下沉**而非丢弃 —— 容量算式
+#    `cache_cap = 份额×设备池 + 宿主槽`(住 store:`CachePolicy::Share`);
+#    宿主 0 时卸载即丢 ⇒ 复用面只剩设备侧那点(实测 13k 会话只复用到 1.5k tok)。
+# ② 份额(`prefix_cache_share`):缓存可占设备池的比例(0.75 ⇒ 528 页里 396 页);
+#    再 **+ 宿主槽全额**(跨层索引:沉到宿主的条目仍占名额)。
+# ③ 状态腿快照(`snap_max` + `snap_host_mb`):复用要求**边界快照在场**
+#    (GDN 态对不上就不能复用)。每条 152 MiB;`snap_host_mb > 0` 让旧快照
+#    **下沉**而不是被顶掉 ⇒ `reuse_face` 能回查到更早的边界。
+# VRAM 账(27B/24G):设备池 528 MiB + 快照 4×152=608 MiB(原 1×152);
+# 宿主账:KV 4096 MiB + 状态腿 3072 MiB(与 `[pool].host_cache_mb` 同源校验)。
+prefix_cache = true
+prefix_cache_share = 0.75
+host_cache_mb = 4096
+snap_max = 4
+snap_host_mb = 3072
 
 [dispatch]
 kv_fp8 = true

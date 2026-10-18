@@ -1,0 +1,43 @@
+# ============================================================================
+# 前缀复用闭环测装(server/engine 服务层专项;2026-10-19)
+# ============================================================================
+# 基座 = flavor `spec-dflash`(生产形状:27B AWQ-INT4 + DFlash2 投机 depth 7)。
+# 本桶只声明**测装差异**,其余(白名单/臂/池 dtype/spec 深度)一律来自 flavor。
+#
+# 启动(CUDA 序与 nvidia-smi 序不同:1 = 3090 Ti;用 UUID 钉卡):
+#   cd packages/owl-worktrees/server-engine
+#   CUDA_VISIBLE_DEVICES=GPU-e565c505-4921-9979-2e0f-2b83490b7aed \
+#     ./target/debug/server --flavor spec-dflash testdata/args/prefix-reuse-27b.toml
+#
+# 门(三层前缀复用的判据器;退出码 0 = 三门全绿):
+#   python3 apps/server/tests/prefix_reuse_probe.py \
+#     --base-url http://127.0.0.1:8137 --model qwen3.8-27b
+#
+# 被测项(`[pool].prefix_cache`)的 A/B:
+#   基线 = flavor 值(false,跨会话块级缓存关);
+#   目标 = 本文件显式的 true ⇒ 探针判据 ④⑤(跨会话命中 + 真值等价)才可判。
+# ============================================================================
+[model]
+kind = "awq27b"
+dir = "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
+dflash2_dir = "/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16"
+name = "qwen3.8-27b"
+
+[runtime]
+# 生产 ctx(与 flavor 同值;显式写出 = 本档条件自证)
+max_seq = 16384
+prefill_chunk = 512
+bind = "127.0.0.1:8137"
+
+[pool]
+# **容量面全部继承 flavor**(2026-10-19 容量定档后):`prefix_cache=true` /
+# `prefix_cache_share=0.75` / `host_cache_mb=4096` / `snap_max=4` / `snap_host_mb=2048`
+# 都在 `assets/flavors/spec-dflash.toml` 里(三层账与 VRAM 算式见该档注释)。
+# 本测装**不再覆盖**它们 —— 测的就是生产档的真实容量策略。
+gdn_slots = 1
+
+[probes]
+# token 级取证(§4.3 对称律排查):渲染后完整 prompt 落盘 /tmp/owl-prompt-<ms>.txt
+# + `[dbg prefix]` 守卫读数。平时关(落盘 + 日志有成本)。
+prompt_dump = true
+debug = true

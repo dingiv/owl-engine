@@ -66,6 +66,7 @@ pub use policy::{
     AdmissionPolicy, EvictCandidate, EvictPolicy, EvictPolicyKind, Leg, LrfuPolicy, LruPolicy,
     QueuePolicy,
 };
+pub use leg::CachePolicy;
 pub use rel::{EvictItem, EvictPlan, KvConfig, Protected, RecallHit, RecallMode, Rel, StoreReport};
 pub use select::{
     assemble_view, f32_to_f16, score_blocks, select, select_recency, BlockSet, IndexStats,

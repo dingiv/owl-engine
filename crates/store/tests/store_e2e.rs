@@ -93,7 +93,7 @@ fn leg(slots: usize) -> BlockLeg {
         slots,
         block_tokens: PAGE_TOKENS,
         block_bytes: PIECE_BYTES * 2, // 两片段 = 一个逻辑块
-        cache_cap: slots + 8,
+        cache: owl_store::CachePolicy::Cap(slots + 8),
         host_bytes: 8 << 20, // 宿主面开(8MiB ⇒ 可容 40+ 块)
         class: BlockClass::KvPage,
         label: "store-e2e",

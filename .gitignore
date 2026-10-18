@@ -18,6 +18,11 @@ testdata/*
 testdata/cases/*
 !testdata/cases/README.md
 testdata/resources.toml
+# E2E/专项夹具必须进版本(`e2e.rs` 用 `include_str!` 读它 —— 缺了干净检出构建不了)
+!testdata/args/
+testdata/args/*
+!testdata/args/e2e-27b.toml
+!testdata/args/prefix-reuse-27b.toml
 !testdata/gdn_fla/
 testdata/gdn_fla/*
 !testdata/gdn_fla/gen.py

@@ -43,7 +43,7 @@ fn rel(host_bytes: usize) -> Rel {
         slots: 8,
         block_tokens: 32,
         block_bytes: 1 << 20,
-        cache_cap: 8,
+        cache: owl_store::CachePolicy::Cap(8),
         host_bytes: 0, // KV 腿关宿主:host 总量全给状态腿(本测只看状态腿)
         class: BlockClass::KvPage,
         label: "snap-test",

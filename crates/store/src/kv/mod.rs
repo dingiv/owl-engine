@@ -156,8 +156,20 @@ impl KvStore {
         let delta = need - table.len();
         let mut evicted = Vec::new();
         if self.pool.free() < delta {
-            let mut passes = 0;
-            while self.pool.free() < delta && passes < 4 {
+            // **缓存叶逐出:逐到够为止**(2026-10-19 修,`prefix_cache` 闭环必路)。
+            //
+            // 旧实现写死 `passes < 4`:当时只想到"池里散着几条叶"。**单链前缀
+            // 缓存里只有尾块是叶**(每个块都有子链),逐一条尾块后它的父才变叶
+            // ⇒ **每趟最多腾 1 槽**。于是长链一改(agent 编辑/压缩历史)就变成:
+            // 需 419 页、空闲 306 ⇒ 4 趟只腾 4 页 ⇒ 响亮拒"真实容量不足"——
+            // 而实际上缓存里就势着 222 页可逐(实测 13k tok prompt 改一句话必 500)。
+            //
+            // 终止条件 = 够用 ‖ **真的无可逐**(`evict_device` 返回空 = 池里
+            // 只剩会话/活跃面,那是真容量不足)。不再用趟数当终止(它是伪边界)。
+            loop {
+                if self.pool.free() >= delta {
+                    break;
+                }
                 let shortage = delta - self.pool.free();
                 // 腾**设备槽**只逐设备叶:host 叶被逐不腾槽却丢内容(§16 定谳)
                 let batch = self.tree.evict_device(shortage);
@@ -173,7 +185,6 @@ impl KvStore {
                 }
                 self.evicted += batch.len() as u64;
                 evicted.extend(batch);
-                passes += 1;
             }
         }
         if self.pool.free() < delta {

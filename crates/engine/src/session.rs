@@ -86,6 +86,16 @@ impl AgentSession {
         prompt.len() >= self.cached_len && self.tokens[..self.cached_len] == prompt[..self.cached_len]
     }
 
+    /// **首个分叉位置**(诊断;`None` = 前缀全同)。
+    ///
+    /// 用途:`[dbg prefix]` 取证 —— 守卫失配时告诉人"第几个 token 开始不同、
+    /// 两侧各是什么",而不是只报一个 `cached_tokens=0`(那要人肉二分)。
+    /// 上界 = `min(cached_len, prompt.len())`(守卫已保证不会越界读)。
+    pub fn first_divergence(&self, prompt: &[u32]) -> Option<usize> {
+        let n = self.cached_len.min(prompt.len());
+        (0..n).find(|&i| self.tokens[i] != prompt[i])
+    }
+
     /// 账本重置(前缀失配回退):清账 + 清块表(块归还由引擎调账房,
     /// 本函数只负责账面 —— 引擎在 reset 路径调 `release_table`)。
     /// 链哈希游标一并归零(新链从零起 —— 身份跟着链走)。
@@ -230,8 +240,11 @@ pub(crate) struct BankPlan {
     pub paged: bool,
     /// MTP 草稿链页池启用
     pub mtp: bool,
-    /// 前缀缓存开关(容量 = 池半)
+    /// 前缀缓存开关(容量策略见 [`owl_store::CachePolicy`])
     pub prefix_cache: bool,
+    /// **前缀缓存份额**(千分比;`[pool].prefix_cache_share` × 1000)。
+    /// 容量算式住 store(`CachePolicy::Share`:份额 × 设备池 + 宿主槽全额)。
+    pub cache_share_permille: u16,
     /// target 腿宿主层预算(字节;0 = 关层,REQ C4 默认关)
     pub host_bytes: usize,
 }
@@ -270,20 +283,14 @@ impl SessionBank {
         target_layout: PoolLayout,
         mtp_layout: Option<PoolLayout>,
     ) -> Result<Self> {
-        // **缓存容量 = 设备槽 + 宿主槽**(S3-3b 定案):前缀索引**跨三层** ——
-        // 卸载到宿主的块仍占一个条目名额,若容量只按设备池算(旧:`nb/2`),
-        // 卸载后的条目会被容量驱逐立刻淘汰 ⇒ 宿主层攒不住东西(实测:换出 2 块
-        // 后条目即被逐,回灌永远不触发)。宿主面关闭时 = 旧行为。
-        let host_slots = if plan.host_bytes > 0 && plan.block_bytes > 0 {
-            plan.host_bytes / plan.block_bytes
+        // **缓存容量 = store 自决**(2026-10-19 容量定档):engine 只给两件事实
+        // (设备页数/宿主预算)与一条**份额政策**,容量算式住在 store
+        // (`CachePolicy::Share`;含"宿主槽全额"的跨层索引语义)。
+        // 份额来自 `[pool].prefix_cache_share`(缺省 0.5 = 旧 `nb/2` 行为)。
+        let cache = if plan.paged && plan.prefix_cache {
+            owl_store::CachePolicy::Share { permille: plan.cache_share_permille }
         } else {
-            0
-        };
-        // 宿主面关闭(host_slots = 0)= **旧行为逐字不变**(nb/2);开宿主面才扩容
-        let cache_cap = if plan.paged && plan.prefix_cache {
-            (plan.nb / 2 + host_slots).max(1)
-        } else {
-            0
+            owl_store::CachePolicy::Off
         };
         let mut rel = Rel::open(
             inputs,
@@ -292,7 +299,7 @@ impl SessionBank {
                 slots: plan.nb,
                 block_tokens: plan.page,
                 block_bytes: plan.block_bytes,
-                cache_cap,
+                cache,
                 host_bytes: plan.host_bytes,
                 class: BlockClass::KvPage,
                 label: "target",
@@ -303,7 +310,7 @@ impl SessionBank {
             slots: if plan.mtp { plan.nb } else { 0 },
             block_tokens: plan.page,
             block_bytes: if plan.mtp { plan.mtp_block_bytes } else { 1 },
-            cache_cap: 0,
+            cache: owl_store::CachePolicy::Off,
             host_bytes: 0,
             class: BlockClass::KvPage,
             label: "mtp",
@@ -464,6 +471,7 @@ mod bank_tests {
             paged: true,
             mtp,
             prefix_cache,
+            cache_share_permille: if prefix_cache { 500 } else { 0 },
             host_bytes: 0,
         }
     }

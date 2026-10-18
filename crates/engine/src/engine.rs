@@ -55,6 +55,9 @@ pub struct EngineKnobs {
     pub draft: DraftCfg,
     /// 前缀缓存(缺省开;原 OWL_PREFIX_CACHE≠"0")
     pub prefix_cache: bool,
+    /// **前缀缓存份额**(0..1;`[pool].prefix_cache_share`;缺省 0.5 = 旧 `nb/2`)。
+    /// 容量算式在 store(`CachePolicy::Share`),这里只是**政策输入**。
+    pub prefix_cache_share: f64,
     /// **宿主层预算 MiB**(状态存储三层的中层;缺省 **0 = 关层**,REQ C4)。
     /// 环境变量 `OWL_HOST_CACHE_MB`;S3-3b(回灌)接线前开了也没用
     pub host_cache_mb: usize,
@@ -169,6 +172,12 @@ pub struct EngineKnobs {
     /// 剩余 ≤ `prefill_chunk + 本值` ⇒ 本步吃完(消灭与尺寸无关的固定宿主税
     /// ~250ms/chunk 的尾块;缺省 0 = 关 = 旧行为)。见 `scheduler::prefill_step_chunk`。
     pub prefill_tail_merge: usize,
+    /// **末段页对齐**(前缀复用闭环,2026-10-19;`[pool] prefill_align_tail`,
+    /// 缺省 **true**)。块边界快照只在**页对齐**处拍 ⇒ 单块档(整个 prompt 落进
+    /// 一个 chunk)L4 会把尾端不对齐地一口吃完 ⇒ 一个快照都没有 ⇒ 下一轮全量
+    /// 重算。开 ⇒ 单块档切一刀(尾巴 <1 页,多付一份 ~250ms chunk 宿主税),
+    /// 换"prompt 最靠后的整页"有快照;多 chunk 档不受影响(前段尾本来就对齐)。
+    pub prefill_align_tail: bool,
     /// **prefill 图档位**(P1;`[graph] prefill_bucket`;缺省 `off` = 今天行为)
     pub prefill_bucket: owl_shared::config::PrefillBucket,
     /// **FI plan 图档瓦**(`[dispatch] fi_cuda_graph`;2026-10-18 图档单图立案):
@@ -220,6 +229,7 @@ impl Default for EngineKnobs {
             pool_tokens: None,
             draft: DraftCfg::default(),
             prefix_cache: true,
+            prefix_cache_share: 0.5,
             host_cache_mb: 0,
             snap_host_mb: 0,
             index_probe: false,
@@ -239,6 +249,7 @@ impl Default for EngineKnobs {
             dense_floor: owl_store::TurnFloor::Strict,
             no_graph: false,
             prefill_tail_merge: 0,
+            prefill_align_tail: true,
             prefill_bucket: owl_shared::config::PrefillBucket::Off,
             fi_cuda_graph: false,
             fi_plan_bake: None,
@@ -412,12 +423,15 @@ impl EngineKnobs {
             }
         };
         format!(
-            "pool={:?} turns={} snap_max={} host={}M snap_host={}M | kvmem={}[idx={} cov={} view={} part={} ws={}tok(sink{}+recent{}+topk{}@32tok/page) every={} evict={} floor={}] | fi={} split={} gdn_chunked={} kv={} graph_off={}",
+            "pool={:?} turns={} snap_max={} host={}M snap_host={}M prefix_cache={}:{:.2} align_tail={} | kvmem={}[idx={} cov={} view={} part={} ws={}tok(sink{}+recent{}+topk{}@32tok/page) every={} evict={} floor={}] | fi={} split={} gdn_chunked={} kv={} graph_off={}",
             self.pool_tokens,
             self.gdn_slots,
             self.snap_max,
             self.host_cache_mb,
             self.snap_host_mb,
+            self.prefix_cache as u8,
+            self.prefix_cache_share,
+            self.prefill_align_tail as u8,
             if self.kvmem_virtualization { "ON" } else { "off" },
             self.index_probe as u8,
             self.coverage_probe as u8,
@@ -471,6 +485,7 @@ impl EngineKnobs {
                 tapdecl: cfg.spec.tapdecl,
             },
             prefix_cache: cfg.pool.prefix_cache,
+            prefix_cache_share: cfg.pool.prefix_cache_share,
             // 宿主层预算(S3-3;`[pool].host_cache_mb`)
             host_cache_mb: cfg.pool.host_cache_mb,
             // 状态腿宿主预算(S2;`[pool].snap_host_mb`;两条腿各有热区,别互相饿死)
@@ -523,6 +538,7 @@ impl EngineKnobs {
                 .or_else(|| owl_shared::env_reader::parse("OWL_GDN_SLOTS"))
                 .unwrap_or(cfg.pool.gdn_slots),
             prefill_tail_merge: cfg.runtime.prefill_tail_merge,
+            prefill_align_tail: cfg.pool.prefill_align_tail,
             // 快照池容量:env 覆盖(实测调压;命中面要求边界快照在场)
             snap_max: owl_shared::env_reader::parse("OWL_SNAP_MAX").unwrap_or(cfg.pool.snap_max),
             vram_target: cfg.pool.vram_target,
@@ -1059,6 +1075,9 @@ impl<D: DeviceClient + 'static> Engine<D> {
                     paged: pool.paged,
                     mtp: spec.mode == SpecMode::Mtp,
                     prefix_cache: self.cfg.knobs.prefix_cache,
+                    cache_share_permille: (self.cfg.knobs.prefix_cache_share * 1000.0)
+                        .round()
+                        .clamp(0.0, 1000.0) as u16,
                     // 宿主层预算(REQ C4:默认关;0 = 关层)—— 与预算入参**同源**
                     // (腿不得超总账;`Rel::open` 交叉校验)
                     host_bytes,

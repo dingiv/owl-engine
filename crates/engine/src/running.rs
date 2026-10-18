@@ -177,7 +177,7 @@ pub struct StageStats {
     pub from_verdict: usize,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "e2e"))] // e2e 场景面也消费(渲染行/吞吐)
 impl StageStats {
     /// 每块字节(0 = 无样本)。
     pub fn bytes_per_block(&self) -> usize {
@@ -265,7 +265,7 @@ pub struct BAxisProfile {
     pub total_ms: f64,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "e2e"))]
 impl BAxisProfile {
     /// 人类可读一行(各相位 + 占比)。
     pub fn line(&self) -> String {
@@ -299,7 +299,7 @@ impl BAxisProfile {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "e2e"))]
 impl PartialStats {
     /// 人类可读一行。
     pub fn line(&self) -> String {
@@ -361,7 +361,7 @@ pub fn budget_clamp(
 
 impl<D: DeviceClient> RunningEngine<D> {
     /// 本档 prefill 块长(探针排版用;与调度器取**同一份配置** ⇒ 不会对不上)
-    #[cfg(test)]
+    #[cfg(any(test, feature = "e2e"))]
     pub(crate) fn cfg_prefill_chunk(&self) -> usize {
         self.cfg.prefill_chunk
     }
@@ -486,12 +486,43 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 预算(会话感知):命中账本的 turn 按 max(prompt, cached) 记账
         // (增量段写 `[cached, prompt)` 行,生成续写其后;失配回退全量时
         // prompt 为准,同一上界)
-        let cached_hit = session
-            .and_then(|id| self.bank.sessions.get(id).map(|s| (s.cached_len, s.guard(&prompt_ids))))
-            .filter(|&(_, guard)| guard)
-            // 无会话 / 守卫未命中 → cached 0(语义默认,非失败)
-            .map(|(cached, _)| cached)
-            .unwrap_or(0);
+        let cached_hit = {
+            let probe = session
+                .and_then(|id| self.bank.sessions.get(id).map(|s| (id, s.cached_len, s.guard(&prompt_ids))));
+            match probe {
+                Some((_, cached, true)) => cached,
+                // **守卫失配取证**(`[probes] debug`;§4.3):报首个分叉的**位置 +
+                // 两侧 id 窗口**。渲染对称律的判据就是这一行:分叉在
+                // "assistant 轮边界" = 渲染/切分不对称;分叉在别处 = 客户端回填不同。
+                Some((id, cached, false)) => {
+                    if self.probes.debug {
+                        let s = self.bank.sessions.get(id).expect("刚查过");
+                        match s.first_divergence(&prompt_ids) {
+                            Some(i) => {
+                                let lo = i;
+                                let hi_old = (i + 8).min(s.tokens.len());
+                                let hi_new = (i + 8).min(prompt_ids.len());
+                                let (a, b) = (&s.tokens[lo..hi_old], &prompt_ids[lo..hi_new]);
+                                eprintln!(
+                                    "[dbg prefix] 守卫失配 session={id} cached_len={cached} 首个分叉 idx={i} \
+                                     旧(已入 KV)={a:?} ⇒ {:?} ‖ 新(本轮)={b:?} ⇒ {:?}",
+                                    self.tok.decode(a),
+                                    self.tok.decode(b)
+                                );
+                            }
+                            None => eprintln!(
+                                "[dbg prefix] 守卫失配 session={id} cached_len={cached} 但前缀全同\
+                                 (长度不足?prompt={} )",
+                                prompt_ids.len()
+                            ),
+                        }
+                    }
+                    0
+                }
+                // 无会话 → cached 0(语义默认,非失败)
+                None => 0,
+            }
+        };
         // 预算(会话感知):base = max(prompt, cached,命中增量段时前缀仍占槽)
         // 不足 ⇒ **先收缩生成长度**(不是直接拒):agent 客户端(pi)每轮重发
         // 系统提示 + 工具 schema + 历史,工作区 `AGENTS.md`+skills 一注入
@@ -645,6 +676,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 act.prompt_ids.len(),
                 self.cfg.prefill_chunk,
                 self.cfg.knobs.prefill_tail_merge,
+                page,
             ) {
                 Some(chunk) => act.fed + chunk,
                 None => act.fed + self.spec.depth + 1, // 生成相位(act.fed = pos)

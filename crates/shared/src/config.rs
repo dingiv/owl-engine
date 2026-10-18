@@ -258,6 +258,22 @@ pub struct PoolCfg {
     pub pool_tokens: Option<usize>,
     /// 并发上限(每活跃 turn 一套 GDN 行;也是池下限算式的 N_active)
     pub gdn_slots: usize,
+    /// **末段页对齐**(缺省 `true`;前缀复用闭环)。
+    ///
+    /// 背景:块边界快照只在**页对齐**处拍;而 L4 尾块合并(`prefill_tail_merge`)
+    /// 会把"整个 prompt 落进一个 chunk"的档**尾端不对齐地**吃完 ⇒ 该 turn
+    /// **一个快照都没有** ⇒ 下一轮同/跨会话复用 0(实测 83 tok 档复用 0 / 全量
+    /// 重算)。开 ⇒ 单块档切一刀(尾巴 <1 页,多付一份 ~250ms chunk 宿主税),
+    /// 切点 = 最后一个整页边界(下一轮复用面最大);**多 chunk 档不受影响**
+    /// (前段 chunk 尾本来就对齐)。
+    pub prefill_align_tail: bool,
+    /// **前缀缓存份额**(0..1;`prefix_cache` 开时生效;缺省 0.5)。
+    ///
+    /// 语义 = "设备池里最多多少比例的页可以留在缓存树上等复用"
+    /// (再 **+ 宿主槽全额**:下沉到宿主的条目仍占条目名额)。
+    /// **容量算式住在 store**(`owl_store::CachePolicy::Share`)—— 它是显存
+    /// 管理者;配置只给这条政策输入。缺省 0.5 = 旧 `nb/2` 行为逐字不变。
+    pub prefix_cache_share: f64,
     /// GDN 快照池槽数
     pub snap_max: usize,
     /// **宿主 KV 腿**(MiB;0 = 关层)。下沉的落点之一。
@@ -927,6 +943,8 @@ impl Default for PoolCfg {
         Self {
             pool_tokens: None,
             gdn_slots: 8,
+            prefix_cache_share: 0.5,
+            prefill_align_tail: true,
             snap_max: 4,
             host_cache_mb: 0,
             snap_host_mb: 0,
@@ -1270,6 +1288,14 @@ impl OwlConfig {
     /// `exit(1)`),且**只有 server 一条入口守** —— 直接构造 engine 的路径
     /// (tests / cli)裸奔。
     pub fn validate(&self) -> Result<(), String> {
+        // **前缀缓存份额**:0..=1(0 = 不留缓存设备份额;1 = 可占满设备池)。
+        // 越界 = 配置错(算式在 store,静默夹会让"我要 150% 池"变成别的东西)。
+        if !(0.0..=1.0).contains(&self.pool.prefix_cache_share) {
+            return Err(format!(
+                "[pool] prefix_cache_share({}) 越界:须 0..=1(份额 × 设备池 = 缓存可占页数)",
+                self.pool.prefix_cache_share
+            ));
+        }
         if self.pool.gdn_slots < self.server.max_concurrency {
             return Err(format!(
                 "[pool] gdn_slots({}) < [server] max_concurrency({})—— GDN 状态格 = 每并发会话一格,\n              并发超格数会把活跃会话的状态格 LRU 逐出(跨会话状态污染);请调 gdn_slots ≥ max_concurrency",

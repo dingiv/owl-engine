@@ -147,6 +147,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         prompt_len,
                         self.cfg.prefill_chunk,
                         self.cfg.knobs.prefill_tail_merge,
+                        self.pool.page,
                     )
                     .map(|n| new_fed + n)
                     .unwrap_or(new_fed);

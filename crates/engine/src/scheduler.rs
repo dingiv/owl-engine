@@ -140,20 +140,47 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 宿主税（实测 ~250ms：6395 条 alloc/launch/free 往返；**4-token 的
     /// 尾块同样是 249ms**，见 `perf-runs/prefill-prof-2026-10-18/REPORT.md` §4）
     /// ⇒ `< chunk` 的尾块纯亏。`tail_merge = 0` ⇒ 逐字节旧行为。
+    ///
+    /// **末段页对齐**(`page = 0` 可关;2026-10-19 前缀复用闭环):块边界快照
+    /// 只在**页对齐**处拍。与 L4 **只在一处冲突** —— "整个 prompt 落进一个块"
+    /// 时 L4 会一口吃完(尾端不对齐 ⇒ **一个快照都没有** ⇒ 下一轮全量重算:
+    /// 实测 83 tok prompt 复用 0 / 12s)。⇒ 判据 = **"至今没有任何对齐边界"**
+    /// (`!(fed > 0 && fed % page == 0)`):多 chunk 档前面的 chunk 尾本来就对齐
+    /// (快照已在)⇒ L4 照旧、不多付那 250ms 宿主税;只有单块档切一刀。
+    ///
+    /// 切点取**最后一个整页边界**(而不是第一个):切出一小步尾巴,但换来
+    /// "prompt 里最靠后的那个整页"也有快照 ⇒ 下一轮复用面最大
+    /// (83 tok 档:64+19 ⇒ 复用 64;187 tok 档:160+27 ⇒ 复用 160)。
+    ///
+    /// ⚠️ **不要加"前段已对齐就不切"的守卫**(2026-10-19 踩过):生产 flavor 的
+    /// L4 档(`prefill_tail_merge = 1024`)会把"从头对齐的长尾段"合并成**尾端
+    /// 不对齐**的一大块 —— 前段尾对齐 ≠ 尾段尾对齐。实测该守卫把 1.7k 档的
+    /// 复用面从 1728 压到 512(最后一个快照退到第一块)。判据只看**尾端**:
     pub(crate) fn prefill_step_chunk(
         fed: usize,
         prompt_len: usize,
         chunk_cfg: usize,
         tail_merge: usize,
+        page: usize,
     ) -> Option<usize> {
         let remaining = prompt_len.checked_sub(fed)?;
         if remaining == 0 {
             return None;
         }
-        if remaining <= chunk_cfg.saturating_add(tail_merge) {
-            return Some(remaining.max(1));
+        // L4:尾块合并(与尺寸无关的宿主税)
+        let mut step = if remaining <= chunk_cfg.saturating_add(tail_merge) {
+            remaining.max(1)
+        } else {
+            remaining.min(chunk_cfg).max(1)
+        };
+        // 页对齐(**只看尾端**:最后一段 + 尾端不对齐 + 有可落的整页边界)
+        if page > 0 && step == remaining && !(fed + step).is_multiple_of(page) {
+            let last_boundary = (fed + step) / page * page;
+            if last_boundary > fed {
+                step = last_boundary - fed;
+            }
         }
-        Some(remaining.min(chunk_cfg).max(1))
+        Some(step)
     }
 
     /// 调度决策(纯主机侧)：turn 启动判定(会话守卫/前缀匹配/快照
@@ -310,6 +337,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                         turn.prompt_ids.len(),
                         self.cfg.prefill_chunk,
                         self.cfg.knobs.prefill_tail_merge,
+                        if self.cfg.knobs.prefill_align_tail { self.pool.page } else { 0 },
                     )
                     .unwrap_or(1)
                 } else {
@@ -387,6 +415,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 act.prompt_ids.len(),
                 self.cfg.prefill_chunk,
                 self.cfg.knobs.prefill_tail_merge,
+                self.pool.page,
             )
             .unwrap_or_else(|| remaining.max(1));
             let action = StepAction::Prefill {
@@ -503,24 +532,51 @@ mod prefill_tail_merge_tests {
     /// tail_merge = 0 ⇒ 旧行为(min(cfg, 剩余),永不合并)。
     #[test]
     fn tail_merge_off_is_old_behavior() {
-        assert_eq!(R::prefill_step_chunk(0, 2048, 512, 0), Some(512));
-        assert_eq!(R::prefill_step_chunk(2048 - 4, 2048, 512, 0), Some(4));
-        assert_eq!(R::prefill_step_chunk(0, 100, 512, 0), Some(100));
-        assert_eq!(R::prefill_step_chunk(100, 100, 512, 0), None);
+        // (page = 0 = 关页对齐 ⇒ 纯 L4 语义;与旧断言逐字相同)
+        assert_eq!(R::prefill_step_chunk(0, 2048, 512, 0, 0), Some(512));
+        assert_eq!(R::prefill_step_chunk(2048 - 4, 2048, 512, 0, 0), Some(4));
+        assert_eq!(R::prefill_step_chunk(0, 100, 512, 0, 0), Some(100));
+        assert_eq!(R::prefill_step_chunk(100, 100, 512, 0, 0), None);
     }
 
     /// tail_merge = 512 ⇒ 剩余 ≤ 1024 一口气吃完(尾块合并;最大块 1024)。
     #[test]
     fn tail_merge_merges_small_tail() {
         // 516 ⇒ 单块(消灭 512+4 的两块结构)
-        assert_eq!(R::prefill_step_chunk(0, 516, 512, 512), Some(516));
+        assert_eq!(R::prefill_step_chunk(0, 516, 512, 512, 0), Some(516));
         // 8244:前段仍 512,最后一段 564(合并 512+52)
-        assert_eq!(R::prefill_step_chunk(0, 8244, 512, 512), Some(512));
-        assert_eq!(R::prefill_step_chunk(7680, 8244, 512, 512), Some(564));
+        assert_eq!(R::prefill_step_chunk(0, 8244, 512, 512, 0), Some(512));
+        assert_eq!(R::prefill_step_chunk(7680, 8244, 512, 512, 0), Some(564));
         // 1024 恰在界上 ⇒ 吃完;1025 ⇒ 回 512
-        assert_eq!(R::prefill_step_chunk(0, 1024, 512, 512), Some(1024));
-        assert_eq!(R::prefill_step_chunk(0, 1025, 512, 512), Some(512));
+        assert_eq!(R::prefill_step_chunk(0, 1024, 512, 512, 0), Some(1024));
+        assert_eq!(R::prefill_step_chunk(0, 1025, 512, 512, 0), Some(512));
         // 1 token 也推得动
-        assert_eq!(R::prefill_step_chunk(0, 1, 512, 512), Some(1));
+        assert_eq!(R::prefill_step_chunk(0, 1, 512, 512, 0), Some(1));
+    }
+
+    /// **页对齐**(page = 32;前缀复用闭环):只在"至今没有对齐边界"的单块档
+    /// 切一刀,切点 = **最后一个整页边界**;多 chunk 档(L4 合并)不受影响。
+    #[test]
+    fn page_align_only_for_single_chunk_prompts() {
+        // 单块 + 尾端不对齐 ⇒ 切在最后一个整页边界(64 + 19)
+        assert_eq!(R::prefill_step_chunk(0, 83, 512, 512, 32), Some(64));
+        assert_eq!(R::prefill_step_chunk(64, 83, 512, 512, 32), Some(19));
+        // 187 tok(探针 T2 形状)⇒ 160 + 27
+        assert_eq!(R::prefill_step_chunk(0, 187, 512, 512, 32), Some(160));
+        // 尾端**恰好对齐** ⇒ 不动(已有边界)
+        assert_eq!(R::prefill_step_chunk(0, 128, 512, 512, 32), Some(128));
+        // 短于一页 ⇒ 切了也没边界可落 ⇒ 不动
+        assert_eq!(R::prefill_step_chunk(0, 20, 512, 512, 32), Some(20));
+        // **中途段**仍按配置(不是最后一段 ⇒ 不动)
+        assert_eq!(R::prefill_step_chunk(512, 8244, 512, 512, 32), Some(512));
+        // **L4 长尾段**(生产档 tail_merge=1024):尾端不对齐 ⇒ 切在最后一个整页
+        // (8244 → 8224),尾巴 20 另一步 —— 这一刀换来"1728 有快照"级别的复用面
+        assert_eq!(R::prefill_step_chunk(7680, 8244, 512, 1024, 32), Some(544));
+        assert_eq!(R::prefill_step_chunk(8224, 8244, 512, 1024, 32), Some(20));
+        // tail_merge=0 ⇒ 564 拆成 512 + 52(尾段再按对齐切 32 + 20)
+        assert_eq!(R::prefill_step_chunk(7680, 8244, 512, 0, 32), Some(512));
+        assert_eq!(R::prefill_step_chunk(8192, 8244, 512, 0, 32), Some(32));
+        // 关对齐(page = 0)= 纯 L4
+        assert_eq!(R::prefill_step_chunk(0, 83, 512, 512, 0), Some(83));
     }
 }

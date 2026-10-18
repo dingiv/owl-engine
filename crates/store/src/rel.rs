@@ -576,7 +576,7 @@ mod tests {
             slots,
             block_tokens: 32,
             block_bytes: BLOCK_BYTES,
-            cache_cap,
+            cache: crate::leg::CachePolicy::Cap(cache_cap),
             host_bytes: 8 << 20,
             class: crate::leg::BlockClass::KvPage,
             label: "test",

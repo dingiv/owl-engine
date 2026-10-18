@@ -576,6 +576,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let act = self.turns.active_mut()?;
             act.fed = pos + m + 1;
         }
+        // ⚠️ **不要在 spec 轮里拍页边界快照**(2026-10-19 试过并撤回):
+        // ①`act.out` 的提交在本函数更后面 ⇒ 此处 `fed` 领先 `out`,
+        // `capture_gdn_snap` 的 `tokens_upto` 立刻报"token N 未喂"(实测);
+        // ②即便挪到提交之后,spec 轮**大多跨过**边界、状态已过界 ⇒ 按边界键存
+        // = 静默错值。中段回卷法(用 `fold` 族把状态卷到边界再拍)见
+        // `docs/arch/agent-服务面-设计与施工.md` §9.1(5)a —— 未做。
+        let _ = sid;
 
         // ⑦ extend + propose(同迭代消费 verify hidden;产出下轮草稿
         // host 账)。DFlash2 = encode + 噪声块 propose;图态 = 桶 m 一发
@@ -795,6 +802,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         // 1) 纯读游标位置(借用即散)
         let start = self.bank.sessions.get(sid).map(|s| s.chain.blocks()).unwrap_or(0);
+        if self.cfg.knobs.probes.debug {
+            owl_shared::log_debug!(
+                "dbg snap",
+                "fed={fed} full_blocks={full_blocks} start={start} snap_on={snap_on} cap={} used={}",
+                self.pool.snap_capacity(),
+                self.pool.snap_used()
+            );
+        }
         if start >= full_blocks {
             return Ok(()); // 幂等:同一 fed 不重复拍(状态由同一 token 链唯一确定)
         }
@@ -843,6 +858,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let slot = self.snap_ensure_slot(key).await?;
             let face = self.graphs.session.face_mut();
             self.pool.capture_snap(face, gdn_slot, key, Some(slot)).await?;
+            if self.cfg.knobs.probes.debug {
+                owl_shared::log_debug!(
+                    "dbg snap",
+                    "捕获 fed={fed} key={key:?} slot={slot} ⇒ used={}",
+                    self.pool.snap_used()
+                );
+            }
             // 登记/触达(层 = 设备)
             self.bank
                 .rel

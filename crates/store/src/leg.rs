@@ -109,6 +109,28 @@ pub struct ChainCand {
     pub last_use: u64,
 }
 
+/// **前缀缓存容量策略**(store 自决 —— 它是显存管理者;engine 只给事实与份额)。
+///
+/// 为什么放在 store:容量 = "多少块可以留在显存里等复用",这是**驻留决策**,
+/// 与 `plan(need, protect) -> Verdict` 同一层。engine 只该给两件事实
+/// (设备池页数 / 宿主预算)和一条**份额**政策,不该自己算 `nb/2`。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CachePolicy {
+    /// 关缓存:树不匹配、不登记。
+    Off,
+    /// **显式条数上限**(测试/特殊档:绕开份额算式,语义精确)。
+    Cap(usize),
+    /// **按份额**:设备池的 `permille‰` + **宿主槽全额**。
+    ///
+    /// 为什么加宿主槽:前缀索引**跨三层** —— 卸载到宿主的块仍占一个条目名额;
+    /// 容量只按设备池算(旧 `nb/2`)会让"卸载后的条目立刻被容量逐出",
+    /// 宿主层攒不住东西(实测:换出 2 块后条目即被逐 ⇒ 回灌永不触发)。
+    Share {
+        /// 设备池占比(千分比;1000 = 允许缓存与设备池等量)。
+        permille: u16,
+    },
+}
+
 /// 开腿配置(boot 一次)。
 #[derive(Clone, Copy, Debug)]
 pub struct LegConfig {
@@ -118,8 +140,8 @@ pub struct LegConfig {
     pub block_tokens: usize,
     /// 单块设备字节(**真源**,坑册 §42)。
     pub block_bytes: usize,
-    /// 前缀缓存块数上限(0 = 关缓存)。
-    pub cache_cap: usize,
+    /// 前缀缓存容量策略(见 [`CachePolicy`])。
+    pub cache: CachePolicy,
     /// 宿主层预算(字节;**0 = 关层**,REQ C4 默认关)。
     pub host_bytes: usize,
     /// 块类。
@@ -204,7 +226,30 @@ impl BlockLeg {
             )));
         }
         Ok(Self {
-            kv: KvStore::new(cfg.slots, cfg.block_tokens, cfg.block_bytes, cfg.cache_cap),
+            // **缓存容量 = store 自决**(单源;见 `CachePolicy`):份额 × 设备池
+            // + 宿主槽全额(跨层索引:沉到宿主的条目仍占名额)。
+            kv: KvStore::new(
+                cfg.slots,
+                cfg.block_tokens,
+                cfg.block_bytes,
+                match cfg.cache {
+                    CachePolicy::Off => 0,
+                    CachePolicy::Cap(n) => n,
+                    CachePolicy::Share { permille } => {
+                        if permille == 0 {
+                            0
+                        } else {
+                            let dev = (cfg.slots as u128 * permille as u128 / 1000) as usize;
+                            let host_slots = if cfg.host_bytes > 0 && cfg.block_bytes > 0 {
+                                cfg.host_bytes / cfg.block_bytes
+                            } else {
+                                0
+                            };
+                            dev.max(1) + host_slots
+                        }
+                    }
+                },
+            ),
             host: HostTier::new(cfg.block_bytes, cfg.host_bytes)?,
             layout: None,
             ops: LegOps::default(),
@@ -941,7 +986,7 @@ mod tests {
             slots,
             block_tokens: TOKENS_PER_BLOCK,
             block_bytes: PIECE_ELEMS * 4 * 2, // 两片段合计 = 一个逻辑块
-            cache_cap: 4 + slots,
+            cache: CachePolicy::Cap(4 + slots),
             host_bytes: 1 << 20,
             class: BlockClass::KvPage,
             label: "test",
@@ -984,7 +1029,7 @@ mod tests {
             slots: 0,
             block_tokens: 32,
             block_bytes: 1,
-            cache_cap: 0,
+            cache: CachePolicy::Cap(0),
             host_bytes: 0,
             class: BlockClass::KvPage,
             label: "off",
@@ -1057,7 +1102,7 @@ mod tests {
             slots: 2,
             block_tokens: TOKENS_PER_BLOCK,
             block_bytes: PIECE_ELEMS * 4 * 2,
-            cache_cap: 4,
+            cache: CachePolicy::Cap(4),
             host_bytes: 0,
             class: BlockClass::KvPage,
             label: "closed",
@@ -1220,7 +1265,7 @@ mod tests {
             slots: 2,
             block_tokens: TOKENS_PER_BLOCK,
             block_bytes: 1 << 20,
-            cache_cap: 2,
+            cache: CachePolicy::Cap(2),
             host_bytes: 0,
             class: BlockClass::KvPage,
             label: "no-host",
