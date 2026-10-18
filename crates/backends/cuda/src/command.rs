@@ -66,6 +66,38 @@ pub enum Command {
         name: String,
         ack: Ack<Result<Bytes, ModelError>>,
     },
+    /// **PeerShared 分配**(TP2 S1;A2.6 修正后的唯一跨卡分配口)。
+    ///
+    /// 语义:VMM(`cuMemCreate` 取设备最小粒度,向上取整)拼块 + 本地 RW 授予,
+    /// 返回块句柄(同 `Alloc` 的 `Bytes`),并登记对端可导入的凭据。
+    ///
+    /// 纪律(设计出处 `docs/arch/TP2-施工设计.md` §2):
+    /// - 单笔 ≤ `per_alloc_limit`(Window 档 = BAR1 − 64MiB 预留);**超限 = 响亮拒**;
+    /// - **捕获期拒绝**(peer 授予必须发生在建图之前);
+    /// - 全程**不调** `cudaDeviceEnablePeerAccess`(3080 档进程级急切映射 = 预算墙)。
+    ///
+    /// `credential` = 驱动可共享凭据的序列化(当前口径 POSIX fd / shareable handle;
+    /// S1 定形)。空 = 分配侧尚未实现时的桩路径(当前壳子即此)。
+    PeerAlloc {
+        bytes: usize,
+        name: String,
+        ack: Ack<Result<(Bytes, Vec<u8>), ModelError>>,
+    },
+    /// **对端映射**(TP2 S1):消费对端 `PeerAlloc` 的凭据,导入为本卡 VA 别名,
+    /// 返回别名的块句柄(供 AR 核读对端 staging)。
+    PeerImport {
+        credential: Vec<u8>,
+        bytes: usize,
+        peer_uuid: String,
+        name: String,
+        ack: Ack<Result<Bytes, ModelError>>,
+    },
+    /// **peer 资源释放**(TP2 S1;D2 裁决:显式释放 + `Drop` 兜底)。
+    /// `ids` 同时接受分配块与别名块的 id(与 `Free` 的块账语义一致)。
+    PeerRelease {
+        ids: Vec<u64>,
+        ack: Ack<Result<(), ModelError>>,
+    },
     /// 块清零(设备侧 memset_d8;引擎 turn-open GDN 状态重置专用;
     /// E2b 增 offset_bytes = 按格重置,多会话各清各格)
     MemsetZero {
@@ -226,6 +258,9 @@ impl Command {
             Self::CopyBatch { .. } => "copy_batch",
             Self::Launch { .. } => "launch",
             Self::Sync { .. } => "sync",
+            Self::PeerAlloc { .. } => "peer_alloc",
+            Self::PeerImport { .. } => "peer_import",
+            Self::PeerRelease { .. } => "peer_release",
             Self::Close { .. } => "close",
         }
     }
@@ -257,6 +292,9 @@ impl Command {
             Self::CopyBatch { ack, .. } => ack.created_at(),
             Self::Launch { ack, .. } => ack.created_at(),
             Self::Sync { ack, .. } => ack.created_at(),
+            Self::PeerAlloc { ack, .. } => ack.created_at(),
+            Self::PeerImport { ack, .. } => ack.created_at(),
+            Self::PeerRelease { ack, .. } => ack.created_at(),
             Self::Close { ack, .. } => ack.created_at(),
         }
     }

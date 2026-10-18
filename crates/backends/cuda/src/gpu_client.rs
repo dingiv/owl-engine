@@ -163,6 +163,42 @@ impl GpuClient {
         Ok(Self::with_sink(tx, sink))
     }
 
+    // ── peer 面(TP2 S1 壳子;设计 `docs/arch/TP2-施工设计.md` §2)────────
+    //
+    // 客户端与 server 两侧对称落地;执行臂见 `server/peer.rs`(现为结构化桩)。
+    // 客户端**不吞错**:桩路径会把 server 的结构化错误原样透传给调用方。
+
+    /// **PeerShared 分配**(S1):VMM 拼块 + 本地 RW 授予;
+    /// 返回 `(块句柄, 对端可导入凭据)`,凭据交给对端的 [`Self::peer_import`]。
+    ///
+    /// 单笔额度门在 server 侧(BAR1−64MiB;硬上限 192MiB)——**超限响亮拒**。
+    pub async fn peer_alloc(
+        &self,
+        bytes: usize,
+        name: impl Into<String>,
+    ) -> Result<(Bytes, Vec<u8>), ModelError> {
+        let name = name.into();
+        self.submit(move |ack| Command::PeerAlloc { bytes, name, ack })?.await
+    }
+
+    /// **对端映射**(S1):把凭据导入为本卡 VA 别名(返回别名块句柄)。
+    pub async fn peer_import(
+        &self,
+        credential: Vec<u8>,
+        bytes: usize,
+        peer_uuid: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Result<Bytes, ModelError> {
+        let (peer_uuid, name) = (peer_uuid.into(), name.into());
+        self.submit(move |ack| Command::PeerImport { credential, bytes, peer_uuid, name, ack })?
+            .await
+    }
+
+    /// **peer 资源释放**(S1;D2 = 显式释放 + Drop 兜底)。
+    pub async fn peer_release(&self, ids: Vec<u64>) -> Result<(), ModelError> {
+        self.submit(move |ack| Command::PeerRelease { ids, ack })?.await
+    }
+
     /// 优雅关机:server 进入 Closing —— 排空积压(结构化拒绝)+ 设备栅栏
     /// 后线程退出。本调用回执 = 关机流程已启动并完成排空。
     pub async fn close(&self) -> Result<(), ModelError> {

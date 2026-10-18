@@ -9,6 +9,28 @@
 //!
 //! 本模块只做**纯匹配**(可 CPU 单测);枚举设备(ordinal/name/bdf/uuid)由
 //! 后端提供,占用过滤由 `crate::gpu_lock` 提供。
+//!
+//! # 附:peer 额度常量(TP2 S1)
+//!
+//! 单笔 peer 可映射缓冲的三个硬约束常量(判据出处见各常量注释)。
+//! **单源**在此:通信策略层(`owl-comm::peer` 的 re-export)与执行层
+//! (`owl-cuda` 的 server 侧硬门)读同一份 —— 两边不许各写一套。
+
+/// 单笔 peer 可映射缓冲的**硬上限**(192 MiB)。
+///
+/// 由来:3080 档 BAR1 256 MiB − 64 MiB 驱动预留 = 192 MiB;超限时驱动
+/// 预算检查硬拒(`docs/llama.cpp/v3基线不通-立案排查.md` §10.5 约束 1,
+/// 原件:`docs/llama.cpp/vmm-p2p-3080会战-测试报告.md` 坑 3/7)。
+/// 纪律(2026-10-16 用户裁决):**peer 单笔 ≤ 192MB**。
+pub const PEER_ALLOC_HARD_CAP: u64 = 192 << 20;
+
+/// Window 档的 BAR1 预留量(驱动侧 `nv_dynbar1_reserve_mb` 的对账口径)。
+pub const WINDOW_BAR1_RESERVE: u64 = 64 << 20;
+
+/// 判为 Static(宽 BAR1,不走动态窗口)所需的 BAR1 下限:2 GiB。
+///
+/// 实测对照(本机):3090 Ti = 32768 MiB(Static)· 3080 20G 魔改 = 256 MiB(Window)。
+pub const STATIC_BAR1_MIN: u64 = 2 << 30;
 
 /// 一台设备的事实(由后端枚举填;uuid 稳定,ordinal 只作最终下发给引擎的序号)
 #[derive(Debug, Clone, PartialEq, Eq)]

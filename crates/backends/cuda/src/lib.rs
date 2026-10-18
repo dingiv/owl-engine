@@ -30,6 +30,7 @@ mod gpu_client;
 mod launch;
 mod server;
 mod state;
+mod vmm;
 
 pub mod ffi;
 pub mod trace;
@@ -43,6 +44,10 @@ pub use gpu_client::GpuClient;
 pub use state::DiagOpts;
 pub use server::GpuServer;
 pub use state::DeviceSelector;
+
+/// 单笔 peer 分配硬上限(192 MiB;**单源** = `owl_shared::device`;
+/// server 侧额度门与 comm 策略分档读同一份 —— 2026-10-16 C1)
+pub use owl_shared::device::PEER_ALLOC_HARD_CAP;
 
 // 线格式与词汇再导出(契约权威 = owl-iface::contract,前后端共同依赖;
 // 2026-09-25 解除 owl-cuda → owl-models 反向依赖,客户只依赖 owl-cuda

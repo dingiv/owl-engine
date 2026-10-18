@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "crates/graph",
-    "crates/comm",
+    "crates/backends/comm",
     "crates/macros",
     "crates/kernels",
     "crates/backends/cuda",

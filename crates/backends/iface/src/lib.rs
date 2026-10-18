@@ -1,5 +1,23 @@
 //! owl-iface —— 后端硬件抽象层(HAL)。
 //!
+//! ---
+//! ## ⚠️ 历史设计记录(非规范)—— 2026-10-16 登记(D1 派生裁决)
+//!
+//! 本文件的 `Backend`/`Device`/`Pool` 三 trait 及其 peer 三件套
+//! (`Pool::malloc_peer_shared` / `Device::enable_peer_access` /
+//! `Device::map_remote`)是 **A6 声明面**。**全仓零实现零调用**
+//! (无 `impl Device for` / `impl Pool for`;peer 三件套 0 引用)。
+//!
+//! **peer 面的当前规范** = `owl-cuda::command` 的
+//! `PeerAlloc` / `PeerImport` / `PeerRelease` 三命令 + `GpuCtx` 账房
+//! (裁决 D1:直扩 `Command`,不实现 iface 池 trait —— 出处
+//! `docs/arch/TP2-施工设计.md` §7.0)。
+//! **实现/调用 peer 面前先读施工设计,不要照本文件的声明。**
+//!
+//! 保留本文件的理由:① 它是 A6 的设计出处(历史考古);② 本文件的
+//! `contract` 面(`Bytes`/`DeviceClient`/`numel`/…)仍是**现役**。
+//! ---
+//!
 //! 分层契约(charter §四 + REQ-HW-01 的后端级推广):
 //!
 //! ```text
@@ -256,6 +274,9 @@ pub trait Pool: Send + Sync {
     /// A2.8 跨卡共享分配:VMM(cuMemCreate,粒度取设备最小值,向上
     /// 取整),本地 RW 映射。仅接受 PoolKind::PeerShared 池。
     /// 注意:VMM 背面**不清零**,调用方负责 memset 或整块覆盖。
+    ///
+    /// ⚠️ **历史声明(非规范)**:见文件头注 —— 现役实现面 = `owl-cuda`
+    /// 的 `PeerAlloc` 命令(TP2 施工设计 §2;单笔额度门在 server 侧)。
     fn malloc_peer_shared(&self, bytes: u64) -> Result<<Self::Dev as Device>::Bytes, BackendError>;
 }
 
@@ -282,6 +303,11 @@ pub trait Device: Clone + Send + Sync + 'static {
     }
 
     // ---- 跨卡窄口(A2.6 唯一例外通道;一切映射入本卡账本)----
+    //
+    // ⚠️ 以下三件套均为**历史声明(非规范)**(见文件头注):现役实现面 =
+    // `owl-cuda` 的 Peer* 三命令。特别注:`enable_peer_access` 在任何形态下
+    // **都不得作为实现依据** —— A2.6 修正:3080 档 enable = 进程级急切映射
+    // = BAR1 预算墙;唯一合法姿势 = VMM 显式授予。
     /// 开启对本卡的 P2P 访问授权(peer = 对端 Device 实例,同进程)。
     /// 对称:两卡各调一次、互为 peer。授权本身不分配显存,仅记审计。
     fn enable_peer_access(&self, peer: &Self) -> Result<(), BackendError>;

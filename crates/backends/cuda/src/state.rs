@@ -144,14 +144,59 @@ impl DeviceSelector {
 // 池块账房
 // ============================================================================
 
-/// 块的两种形态:
+/// 块的三种形态:
 /// - Owned:图外独立分配(cudaMallocAsync)
 /// - Carved:捕获期从 capture slab 切出的切片(零分配;slab 随块保活)
 ///   `cap_n` = 该块**可用容量**(对齐后;S1.5 回收凭它 —— `bytes` 是账长,
 ///   两者可不同:切 1000B 得 cap_n=1024B)
+/// - Peer:peer 面 VMM 显式授予(TP2 S1;见 [`PeerBlock`])—— 生命周期
+/// 不走设备池:唯一释放口 = `Command::PeerRelease`(D2 裁决)
 pub(super) enum Block {
     Owned(CudaSlice<u8>),
     Carved { slab: Arc<CudaSlice<u8>>, off: usize, n: usize, cap_n: usize },
+    Peer(PeerBlock),
+}
+
+/// peer 块的两种形态(TP2 S1;设计出处 `docs/arch/TP2-施工设计.md` §2.2)。
+pub(super) enum PeerBlock {
+    /// **本端分配**:VMM(reserve→create→map→setAccess RW→export 凭据);
+    /// 经 fd 被对端映射(AR stage 核写它)
+    Shared(PeerShared),
+    /// **对端映射**:VMM(import→reserve→map→setAccess R);
+    /// AR reduce 核经它读对端 staging
+    Alias(PeerAlias),
+}
+
+impl PeerBlock {
+    pub(super) fn map(&self) -> &crate::vmm::VmmMapping {
+        match self {
+            Self::Shared(s) => &s.map,
+            Self::Alias(a) => &a.map,
+        }
+    }
+
+    /// 映射字节(粒度对齐后;释放/记账都用它,不是账长)
+    pub(super) fn mapped_bytes(&self) -> usize {
+        self.map().bytes
+    }
+}
+
+/// 本端分配的 peer 块(资源所有权证)。
+pub(super) struct PeerShared {
+    /// VMM 映射(va/size/handle;释放序列见 `crate::vmm::release`)
+    pub(super) map: crate::vmm::VmmMapping,
+    /// 已导出的 fd(**本端拥有**;释放时 close —— 见 `vmm::export_fd` 所有权注)
+    pub(super) fds: Vec<i32>,
+    /// 分配粒度(诊断/对端对齐口径)
+    pub(super) gran: u64,
+}
+
+/// 对端块的 VA 别名(只读)。
+pub(super) struct PeerAlias {
+    pub(super) map: crate::vmm::VmmMapping,
+    /// 对端 UUID(诊断;钉卡凭据 —— 数字序不可表达)
+    pub(super) peer_uuid: String,
+    pub(super) gran: u64,
 }
 
 /// 账本内块 id 位编码(裁决 2,2026-10-13):单 u64 高位 ledger、低 40 位
@@ -617,6 +662,17 @@ pub(super) struct GpuCtx {
     /// 块账房:id → 块条目(账长/账本身份/dtype/shape)
     blocks: HashMap<u64, BlockEntry>,
     next_block: u64,
+    /// **peer 账(TP2 S1;G5 门)**:本端分配的 peer 映射字节
+    /// (真实占本卡 FB ⇒ 计入 `vram::live`)
+    peer_shared_bytes: u64,
+    /// **peer 账**:对端块的 VA 别名字节(映射的是对端 FB,不占本卡显存;
+    /// 但占本卡 VA/动态窗口额度 —— 预算账口径见施工设计 §6)
+    peer_alias_bytes: u64,
+    /// peer 映射笔数(shared + alias;生命周期闭合判据之一)
+    peer_mappings: usize,
+    /// **单笔 peer 分配硬上限**(server 权威门 —— **不是**调用方自觉;
+    /// 默认 = `owl_shared::device::PEER_ALLOC_HARD_CAP`,纪律出处见常量注释)
+    peer_alloc_cap: u64,
     /// 本账本编号(= GpuServer actor 序号;块 id 高位编码此值)
     ledger: u32,
     /// 动态 smem 每块上限(CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK
@@ -920,6 +976,10 @@ impl GpuCtx {
             next_graph: 1,
             blocks: HashMap::new(),
             next_block: 1,
+            peer_shared_bytes: 0,
+            peer_alias_bytes: 0,
+            peer_mappings: 0,
+            peer_alloc_cap: owl_shared::device::PEER_ALLOC_HARD_CAP,
             ledger,
             sink,
             smem_optin,
@@ -1556,10 +1616,12 @@ impl GpuCtx {
         // 图引用租约登记:捕获窗内的每次解析 = "这个块会被烘进图"
         // (死块在上面已拒 ⇒ 不记野 id)。窗外的解析与图无关,零开销。
         //
-        // ⚠️ **只登记 `Owned`**:`Carved` 的安全由**类型**保证(捕获后 free
-        // 一律 no-op;窗内 free = 回 arena 复用 —— 正是 M1 峰值口径的来源,
-        // 不能被租约拦下)。租约要补的恰是 `Owned`(池件/输入槽)那一半。
-        if self.capture.is_some() && matches!(e.block, Block::Owned(_)) {
+        // ⚠️ **登记 `Owned` 与 `Peer`**:两者的共同点 = 块可以**被显式回收**
+        // (`Free` / `PeerRelease`)⇒ 释放后地址会被设备池/驱动重发,图变
+        // 陈旧指针。`Carved` 的安全由**类型**保证(捕获后 free 一律 no-op;
+        // 窗内 free = 回 arena 复用 —— 正是 M1 峰值口径的来源,不能被租约
+        // 拦下)。Peer 块由 `peer_release` 的前置校验读租约(拒收被钉块)。
+        if self.capture.is_some() && matches!(e.block, Block::Owned(_) | Block::Peer(_)) {
             self.graph_refs.borrow_mut().record(id);
         }
         // 块账自洽(哨兵;cfg! 展开 ⇒ 两档都编译,零热路径语义)
@@ -1576,6 +1638,9 @@ impl GpuCtx {
                 let (p, _) = view.device_ptr(stream);
                 Ok((p, *n))
             }
+            // peer 块(TP2 S1):裸 VA + 映射字节(AR 核参数直吃);账长可能
+            // 是请求值(≤ 映射值),这里给**真实可用长度**
+            Block::Peer(p) => Ok((p.map().va, p.mapped_bytes())),
         }
     }
 
@@ -1750,6 +1815,9 @@ impl GpuCtx {
             let Some((kind, off, cap_n)) = self.blocks.get(id).map(|e| match &e.block {
                 Block::Owned(_) => (0u8, 0usize, 0usize),
                 Block::Carved { off, cap_n, .. } => (1u8, *off, *cap_n),
+                // peer 块(TP2 S1):普通 Free **不碰** —— VMM 生命周期专属
+                // `PeerRelease`(D2);走该分支 = 响亮计数(不静默、不致命)
+                Block::Peer(_) => (2u8, 0usize, 0usize),
             }) else {
                 continue;
             };
@@ -1785,6 +1853,10 @@ impl GpuCtx {
                 // ── Carved 且**捕获后**:地址已烘进图 ⇒ **保持 no-op**
                 //    (不可再发放,否则图内已烘焙地址被无关张量覆盖 ——
                 //    施工文档 §5.2)。真要回收只能走 `graph_destroy`(整图退休)。
+                // ── Peer(TP2 S1):普通 Free 不碰(见上面 2u8);响亮计数
+                2 => {
+                    self.sink.count("srv.count.free_peer_reject", 1);
+                }
                 _ => {
                     self.sink.count("srv.count.free_carved_noop", 1);
                 }
@@ -1820,6 +1892,271 @@ impl GpuCtx {
             }
         }
         out
+    }
+
+    // ======================================================================
+    // peer 面(TP2 S1;VMM 显式授予 —— 设计出处 `docs/arch/TP2-施工设计.md` §2)
+    // ======================================================================
+    //
+    // 三条纪律(全部来自施工设计与用户裁决;实现者别绕):
+    // 1. **单笔硬门在 `peer_alloc` 里**(server 权威,不是调用方自觉);
+    // 2. **不调** enable peer access(A2.6 修正:VMM 显式授予是唯一合法姿势,
+    //    3080 档 enable = 进程级急切映射 = BAR1 预算墙);
+    // 3. **释放唯一口** = `peer_release`(D2:同时收 shared 与 alias);`Free`
+    //    对 peer 块是响亮计数 no-op,`Drop`(GpuCtx 级)是兜底。
+
+    /// peer 账结构化段(G5 门读它;JSON 与 `LedgerJson` 同源)
+    pub(super) fn peer_json(&self) -> String {
+        format!(
+            "{{\"shared_bytes\":{},\"alias_bytes\":{},\"mappings\":{},\"cap_bytes\":{}}}",
+            self.peer_shared_bytes, self.peer_alias_bytes, self.peer_mappings, self.peer_alloc_cap
+        )
+    }
+
+    /// peer 账一行 + 逐块明细(账报追加段;无 peer 时显式报“无”)
+    pub(super) fn peer_report(&self) -> String {
+        if self.peer_mappings == 0 {
+            return "peer: 无".to_string();
+        }
+        let mut s = format!(
+            "peer: shared={}MiB alias={}MiB(本卡 VA 映射合计 {}MiB / cap {}MiB;n={}):",
+            self.peer_shared_bytes >> 20,
+            self.peer_alias_bytes >> 20,
+            (self.peer_shared_bytes + self.peer_alias_bytes) >> 20,
+            self.peer_alloc_cap >> 20,
+            self.peer_mappings
+        );
+        // 逐块明细(低频查询面;peer 块数量很小)—— gran/peer_uuid 在这里兑现用途
+        for (id, e) in &self.blocks {
+            let Block::Peer(p) = &e.block else { continue };
+            match p {
+                PeerBlock::Shared(sb) => s.push_str(&format!(
+                    " id{id}=shared({}MiB,g{}KiB,fd×{})",
+                    sb.map.bytes >> 20,
+                    sb.gran >> 10,
+                    sb.fds.len()
+                )),
+                PeerBlock::Alias(ab) => s.push_str(&format!(
+                    " id{id}=alias(peer={},{}MiB,g{}KiB)",
+                    ab.peer_uuid,
+                    ab.map.bytes >> 20,
+                    ab.gran >> 10
+                )),
+            }
+        }
+        s
+    }
+
+    /// 本端 peer 分配(TP2 S1):VMM `reserve→create→map→setAccess(RW)→export`。
+    ///
+    /// 返回 `(块 id, 导出 fd, 映射字节)`;fd 交给对端 `peer_import`(同进程
+    /// fd 表直传;**所有权归本端**,对端不得 close —— 见 `vmm::export_fd`)。
+    ///
+    /// 单笔超 `peer_alloc_cap` ⇒ **响亮拒**(G4 门判据;不缩容)。
+    pub(super) fn peer_alloc(
+        &mut self,
+        bytes: usize,
+        name: &str,
+    ) -> Result<(u64, i32, u64), ModelError> {
+        debug_assert!(
+            !name.is_empty(),
+            "peer_alloc: 空名 = 分配点未记名(全量记名纪律;见 BlockEntry::name)"
+        );
+        // ① 守卫(响亮拒,不缩容)
+        if bytes == 0 {
+            return Err(ModelError::Msg("peer_alloc: bytes = 0(拒绝)".into()));
+        }
+        if bytes as u64 > self.peer_alloc_cap {
+            return Err(ModelError::Msg(format!(
+                "peer_alloc 超单笔上限:请求 {} MiB > cap {} MiB(判据 = BAR1−64MiB ∩ 192MiB 硬上限;\
+                 见 docs/arch/TP2-施工设计.md §2.1)⇒ 拒绝,不缩容",
+                bytes >> 20,
+                self.peer_alloc_cap >> 20
+            )));
+        }
+        // ② VMM 三段 + 授予 + 导出(中间失败 = 回滚,两个错误都不丢)
+        let (map, gran) = crate::vmm::alloc_mapped(self.ordinal, bytes as u64)?;
+        if let Err(e) = crate::vmm::set_access_self(&map, self.ordinal, true) {
+            return Err(crate::vmm::fail_with_rollback(map, e));
+        }
+        let fd = match crate::vmm::export_fd(&map) {
+            Ok(fd) => fd,
+            Err(e) => return Err(crate::vmm::fail_with_rollback(map, e)),
+        };
+        // ③ 记账 + 入册(账长 = 请求值;映射值在 PeerShared.map 里)
+        let mapped = map.bytes as u64;
+        let id = self.new_peer_block(
+            PeerBlock::Shared(PeerShared { map, fds: vec![fd], gran }),
+            bytes,
+            name,
+        );
+        self.peer_shared_bytes += mapped;
+        owl_shared::vram::live_add(mapped as i64);
+        Ok((id, fd, mapped))
+    }
+
+    /// 对端映射(TP2 S1):消费对端 fd → 本卡 VA 别名(只读;
+    /// AR reduce 核经它读对端 staging)。
+    ///
+    /// `mapped_bytes` = 对端映射大小(凭据携带);`want_bytes` = 本端账长。
+    /// **不 close fd**(同进程:fd 属于分配侧)。
+    pub(super) fn peer_import(
+        &mut self,
+        fd: i32,
+        mapped_bytes: u64,
+        want_bytes: usize,
+        peer_uuid: &str,
+        name: &str,
+    ) -> Result<u64, ModelError> {
+        debug_assert!(
+            !name.is_empty(),
+            "peer_import: 空名 = 分配点未记名(全量记名纪律)"
+        );
+        if want_bytes == 0 {
+            return Err(ModelError::Msg("peer_import: bytes = 0(拒绝)".into()));
+        }
+        if mapped_bytes < want_bytes as u64 {
+            return Err(ModelError::Msg(format!(
+                "peer_import: 对端映射 {mapped_bytes} B 不足以覆盖请求 {want_bytes} B(拒绝;凭据与请求不对称)"
+            )));
+        }
+        let (map, gran) = crate::vmm::import_mapped(self.ordinal, fd, mapped_bytes)?;
+        if let Err(e) = crate::vmm::set_access_self(&map, self.ordinal, false) {
+            return Err(crate::vmm::fail_with_rollback(map, e));
+        }
+        let id = self.new_peer_block(
+            PeerBlock::Alias(PeerAlias { map, peer_uuid: peer_uuid.to_string(), gran }),
+            want_bytes,
+            name,
+        );
+        self.peer_alias_bytes += mapped_bytes;
+        Ok(id)
+    }
+
+    /// peer 释放(TP2 S1;D2 = 显式释放 + Drop 兜底)。
+    ///
+    /// 两段:① **校验**(全有或全无 —— 任一 id 非法则不动任何资源,含
+    /// 图引用租约拒收);② **执行**(逐个 `unmap→release→addressFree`,
+    /// 失败不短路、聚合上报)。返回实际释放的块数。
+    pub(super) fn peer_release(&mut self, ids: &[u64]) -> Result<usize, ModelError> {
+        // ① 校验阶段
+        for id in ids {
+            assert_ledger(*id, self.ledger)?;
+            let Some(e) = self.blocks.get(id) else {
+                return Err(ModelError::DeadBlock { id: *id });
+            };
+            if !matches!(e.block, Block::Peer(_)) {
+                return Err(ModelError::Msg(format!(
+                    "peer_release: 块 {id} 不是 peer 块(普通块走 Free;拒绝)"
+                )));
+            }
+            if self.graph_refs.borrow().is_pinned(*id) {
+                return Err(ModelError::Msg(format!(
+                    "peer_release: 块 {id} 被图引用租约钉住(地址已烘进图;先 graph_destroy)\
+                     —— 释放会让图踩陈旧 VA"
+                )));
+            }
+        }
+        // ② 执行阶段
+        let mut errs: Vec<String> = Vec::new();
+        let mut n = 0usize;
+        for id in ids {
+            let Some(e) = self.blocks.remove(id) else { continue };
+            let Block::Peer(p) = e.block else { continue };
+            match p {
+                PeerBlock::Shared(s) => {
+                    // fd 所有权 = 分配侧(对端不得 close);先关 fd 再释放映射
+                    for fd in &s.fds {
+                        crate::vmm::close_fd(*fd);
+                    }
+                    self.peer_shared_bytes = self.peer_shared_bytes.saturating_sub(s.map.bytes as u64);
+                    owl_shared::vram::live_add(-(s.map.bytes as i64));
+                    if let Err(er) = crate::vmm::release(s.map) {
+                        errs.push(format!("id={id}(shared): {er}"));
+                    }
+                }
+                PeerBlock::Alias(a) => {
+                    self.peer_alias_bytes = self.peer_alias_bytes.saturating_sub(a.map.bytes as u64);
+                    if let Err(er) = crate::vmm::release(a.map) {
+                        errs.push(format!("id={id}(alias): {er}"));
+                    }
+                }
+            }
+            self.peer_mappings = self.peer_mappings.saturating_sub(1);
+            n += 1;
+        }
+        if errs.is_empty() {
+            Ok(n)
+        } else {
+            Err(ModelError::Msg(format!(
+                "peer_release 存在失败步骤({n} 块已处理;逐条):{}",
+                errs.join(" ‖ ")
+            )))
+        }
+    }
+
+    /// 内部:peer 块入册(账长 = 请求值;映射值在 `PeerBlock` 里)
+    fn new_peer_block(&mut self, block: PeerBlock, req_bytes: usize, name: &str) -> u64 {
+        let local = self.next_block;
+        self.next_block += 1;
+        let id = pack_block_id(self.ledger, local);
+        self.blocks.insert(
+            id,
+            BlockEntry {
+                block: Block::Peer(block),
+                bytes: req_bytes,
+                ledger: self.ledger,
+                dtype: BlockDtype::Bytes,
+                shape: vec![req_bytes],
+                name: name.to_string(),
+            },
+        );
+        self.peer_mappings += 1;
+        id
+    }
+}
+
+impl Drop for GpuCtx {
+    /// **peer 块兜底释放**(D2:显式释放 + Drop 兜底)。
+    ///
+    /// 走到这里 = 调用方没显式 `PeerRelease`(异常路径/进程收尾)⇒
+    /// 按 `vmm::release` 序列收回并 **WARN 记日志**(不静默);失败逐条上屏。
+    /// 其余块(Owned/Carved)仍走各自类型的 Drop(行为不变)。
+    fn drop(&mut self) {
+        let sink = self.sink;
+        let mut leaked = 0usize;
+        let mut errs: Vec<String> = Vec::new();
+        for (id, e) in self.blocks.drain() {
+            let Block::Peer(p) = e.block else { continue };
+            leaked += 1;
+            match p {
+                PeerBlock::Shared(s) => {
+                    for fd in &s.fds {
+                        crate::vmm::close_fd(*fd);
+                    }
+                    if let Err(er) = crate::vmm::release(s.map) {
+                        errs.push(format!("id={id}(shared): {er}"));
+                    }
+                }
+                PeerBlock::Alias(a) => {
+                    if let Err(er) = crate::vmm::release(a.map) {
+                        errs.push(format!("id={id}(alias): {er}"));
+                    }
+                }
+            }
+        }
+        if leaked > 0 {
+            sink.logf(
+                owl_shared::log::LVL_WARN,
+                "peer-drop",
+                format_args!(
+                    "GpuCtx 销毁时回收 {leaked} 个未显式释放的 peer 块(调用方漏 PeerRelease;兜底已收)"
+                ),
+            );
+        }
+        for e in &errs {
+            sink.logf(owl_shared::log::LVL_WARN, "peer-drop", format_args!("兜底释放失败: {e}"));
+        }
     }
 }
 

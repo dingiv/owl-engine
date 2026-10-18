@@ -1,0 +1,14 @@
+[package]
+name = "owl-comm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TP communication: size-routed backends, capture-awareness, fusion seams"
+
+[dependencies]
+owl-graph = { path = "../../graph" }
+# 额度常量单源(`owl_shared::device`);comm 只读 shared,shared 不反向依赖 —— 无环
+# (shared 的 module map 已被 cuda/comm 双方共识:C1 peer 常量上移 2026-10-16)
+owl-shared = { path = "../../shared", default-features = false }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }

@@ -86,6 +86,38 @@ pub mod sys {
             cublasSetStream_v2, cublasSetWorkspace_v2, cublasSgemm_v2, cublasStatus_t,
         };
     }
+
+    /// **VMM(虚拟内存管理)面 —— TP2 S1 的 peer 授予路径**(2026-10-16 C1)。
+    ///
+    /// 准入(A4 / `docs/arch/charter.md` §二):**为什么是这一组**——
+    /// 显式授予(
+    /// `reserve → create → map → setAccess → export/import`)是 3080 档唯一
+    /// 合法的 P2P 姿势;`cudaDeviceEnablePeerAccess` 触发进程级急切映射 ⇒
+    /// BAR1 预算墙(A2.6 修正,出处 `docs/llama.cpp/vmm-p2p-3080会战-测试报告.md`
+    /// 坑 3/7/8)。十条全部只取句柄/裸 VA,**零 host 阻塞、零编译、零懒状态**
+    /// (与既有白名单同款铁律);生命周期不对称(create/import 取句柄,unmap/
+    /// release/addressFree 放回)是 VMM 的 API 语义本身。
+    /// 证据(cudarc 0.19.10 `driver/sys/mod.rs` 行号,逐条):
+    ///   粒度查询 :13467 · VA 预留 :13158 · 创建 :13321 · 映射 :13679 ·
+    ///   授权 :14002 · 导出 :13371 · 导入 :13663 ·
+    ///   解映射 :14035 · 句柄释放 :13970 · VA 释放 :13142
+    ///
+    /// ⚠️ 类型形态随 CUDA 版本分支(cudarc 的 `cuda-1xxxx` feature):
+    /// `CUmemLocation` 在 13.2+ 里是 `{ type_, __bindgen_anon_1: { id } }`
+    /// (12.x 是直接 `{ type_, id }`)。本仓构建 = CUDA 13.2 ⇒ 用 13.x 形态
+    /// (`vmm.rs` 里有唯一一处构造点,升/降 CUDA 大版本时改那处)。
+    pub mod vmm {
+        pub use cudarc::driver::sys::{
+            CUmemAccess_flags, CUmemAccessDesc, CUmemAllocationGranularity_flags,
+            CUmemAllocationHandleType, CUmemAllocationProp, CUmemAllocationType,
+            CUmemGenericAllocationHandle, CUmemLocation, CUmemLocationType, CUresult,
+            // 结构体字面量字段类型(bindgen 生成;构造 prop/location 必需)
+            CUmemAllocationProp_st__bindgen_ty_1, CUmemLocation_st__bindgen_ty_1,
+            cuMemAddressFree, cuMemAddressReserve, cuMemCreate, cuMemExportToShareableHandle,
+            cuMemGetAllocationGranularity, cuMemImportFromShareableHandle, cuMemMap, cuMemRelease,
+            cuMemSetAccess, cuMemUnmap,
+        };
+    }
 }
 
 // ============================================================================

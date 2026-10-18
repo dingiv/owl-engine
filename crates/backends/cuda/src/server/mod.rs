@@ -101,6 +101,7 @@ impl ServerProbes {
 }
 
 mod harvest;
+mod peer;
 
 /// actor 编号(全局静态计数;DeadBlock 跨账本定谳用:每个 GpuServer = 一个
 /// 独立账本,id 从 1 各自计数)
@@ -318,6 +319,9 @@ impl GpuServer {
         // "值对象 + 键值对" 的互补:避免出现 `{…},{…}` 这种**相邻对象**
         // (语法错;gpu_server 步骤 13 的正确性门当场抓出)。
         out.push_str(&scratch);
+        // peer 段(TP2 S1;G5 门机器可读面 —— 与账报文本 `peer_report` 同源)
+        out.push_str(",\"peer\":");
+        out.push_str(&self.ctx().peer_json());
         out.push('}');
         out
     }
@@ -444,17 +448,19 @@ impl GpuServer {
         }
     }
 
-    /// **块账 + scratch 账按名清单**(查询面与 OOM dump 同一渲染 —— 口径单源)。
+    /// **块账 + scratch 账 + peer 账按名清单**(查询面与 OOM dump 同一渲染 —— 口径单源)。
     fn ledger_report(&self, top: usize) -> String {
         let unnamed = self.ctx().unnamed_blocks();
         format!(
-            "{}{} ‖ {}",
+            "{}{} ‖ {} ‖ {}",
             self.ctx().block_report_by_name(top),
             match unnamed {
                 0 => String::new(),
                 n => format!(" ‖ ⚠ 未命名块 {n}(分配点没报名字 ⇒ 记名有漏)"),
             },
-            self.scratch_report_by_name(top.min(8))
+            self.scratch_report_by_name(top.min(8)),
+            // peer 账(TP2 S1;G5 门读它:生命周期闭合)
+            self.ctx().peer_report()
         )
     }
 
@@ -488,6 +494,10 @@ impl GpuServer {
         match cmd {
             Command::BlockLedgerDump { .. } => E::new("block_ledger_dump", ""),
             Command::MemPoolTrim { .. } => E::new("mem_pool_trim", ""),
+            // peer 面(TP2 S1 壳子):VMM 分配/映射不触计算流 ⇒ 流列留空
+            Command::PeerAlloc { bytes, .. } => E::new("peer_alloc", "").bytes(*bytes),
+            Command::PeerImport { bytes, .. } => E::new("peer_import", "").bytes(*bytes),
+            Command::PeerRelease { .. } => E::new("peer_release", ""),
             Command::UploadAndLaunch { dst, chunks, .. } => {
                 let n: usize = chunks.iter().map(|c| c.len_bytes).sum();
                 E::new("upload_and_launch", "h2d").bytes(n).id(dst.id)
@@ -919,6 +929,11 @@ impl GpuServer {
             Command::MemsetZero { block, offset_bytes, len_bytes, ack } => {
                 self.handle_memset_zero(block, offset_bytes, len_bytes, ack)
             }
+            Command::PeerAlloc { bytes, name, ack } => self.handle_peer_alloc(bytes, name, ack),
+            Command::PeerImport { credential, bytes, peer_uuid, name, ack } => {
+                self.handle_peer_import(credential, bytes, peer_uuid, name, ack)
+            }
+            Command::PeerRelease { ids, ack } => self.handle_peer_release(ids, ack),
             Command::Htod { data, name, ack } => self.handle_htod(data, name, ack),
             Command::HtodChunks { writes, ack } => self.handle_htod_chunks(writes, ack),
             Command::HtodChunk { block, offset_bytes, data, ack } => {
@@ -973,6 +988,9 @@ impl GpuServer {
         macro_rules! closed { ($ack:expr) => { $ack.send(Err(ModelError::ServerClosed)) } }
         match cmd {
             Command::Close { ack } => ack.send(Ok(())), // 幂等
+            Command::PeerAlloc { ack, .. } => closed!(ack),
+            Command::PeerImport { ack, .. } => closed!(ack),
+            Command::PeerRelease { ack, .. } => closed!(ack),
             Command::Alloc { ack, .. } => closed!(ack),
             Command::MemsetZero { ack, .. } => closed!(ack),
             Command::Htod { ack, .. } => closed!(ack),
@@ -1008,6 +1026,9 @@ impl GpuServer {
             Command::MemPoolTrim { .. } => "mem_pool_trim",
             Command::UploadAndLaunch { .. } => "upload_and_launch",
             Command::LaunchAndHarvest { .. } => "launch_and_harvest",
+            Command::PeerAlloc { .. } => "PeerAlloc",
+            Command::PeerImport { .. } => "PeerImport",
+            Command::PeerRelease { .. } => "PeerRelease",
             Command::GraphBegin { .. } => "GraphBegin",
             Command::GraphEnd { .. } => "GraphEnd",
             Command::GraphLaunch { .. } => "GraphLaunch",
@@ -1032,6 +1053,9 @@ impl GpuServer {
         };
         sink.logf(owl_shared::log::LVL_WARN, "owl-gpu", format_args!("捕获期拒绝: {} —— {why}", name(&cmd)));
         match cmd {
+            Command::PeerAlloc { ack, .. } => reject!(ack),
+            Command::PeerImport { ack, .. } => reject!(ack),
+            Command::PeerRelease { ack, .. } => reject!(ack),
             Command::GraphBegin { ack } => reject!(ack),
             Command::GraphEnd { ack } => reject!(ack),
             Command::GraphLaunch { ack, .. } => reject!(ack),
