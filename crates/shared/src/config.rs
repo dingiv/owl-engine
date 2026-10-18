@@ -1375,6 +1375,43 @@ impl OwlConfig {
                 ));
             }
         }
+        // **白名单 ↔ 池档位自洽门**(2026-10-19):`allowed_ops` 与 `kv_fp8` 是
+        // **两处真源**、靠人手同步 ⇒ 已两次同型事故:
+        //   ① `awq27b` 白名单是 fp8 族而 `kv_fp8` 未设(缺省 false)⇒ 池 f16 /
+        //      白名单 fp8 ⇒ **首次发射**撞算子准入门
+        //      (`owl_qknorm_rope_kv_insert_f16_knhd 未列入`)⇒ 该档根本起不来;
+        //   ② `W4A8…设计与施工` §18.5 的 cast 项(同型,另一族)。
+        // 门 = 白名单必须覆盖**当前池 dtype**的「prefill 注意力族 + KV 写入族」;
+        // 缺了就在 boot 期拒启(而不是等第一发请求才炸)。
+        // 注:显式 `allowed_ops = []` = 门关(诊断态,是有意为之);不写 = None = 门关。
+        if let Some(ops) = self.dispatch.allowed_ops.as_ref().filter(|v| !v.is_empty()) {
+            const F16_POOL: [&str; 3] = [
+                "flashinfer_prefill_paged_f16",
+                "owl_qknorm_rope_kv_insert_f16_knhd",
+                "vllm_reshape_and_cache_f16_knhd",
+            ];
+            const FP8_POOL: [&str; 3] = [
+                "flashinfer_prefill_paged_fp8kv",
+                "owl_qknorm_rope_kv_insert_f16_fp8kv_knhd",
+                "owl_reshape_and_cache_fp8kv_knhd",
+            ];
+            let (pool, need): (&str, &[&str; 3]) = if self.dispatch.kv_fp8 {
+                ("fp8(KV 池 = fp8_e4m3)", &FP8_POOL)
+            } else {
+                ("f16", &F16_POOL)
+            };
+            let missing: Vec<&str> = need
+                .iter()
+                .copied()
+                .filter(|n| !ops.iter().any(|o| o == n))
+                .collect();
+            if !missing.is_empty() {
+                return Err(format!(
+                    "[dispatch] allowed_ops 与池档位不自洽:池 = {pool}(kv_fp8 = {}),白名单缺 {missing:?}\n              —— 该档会在**首次发射**撞算子准入门(系统级缺档,不是运行期偶发)。\n              修法:① 池档位与白名单同族(fp8 池配 fp8 族 / f16 池配 f16 族,\n              通常就是在档里显式写 `kv_fp8`);② 或显式 `allowed_ops = []`(门关,仅诊断态)。",
+                    self.dispatch.kv_fp8
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -1457,6 +1494,42 @@ mod tests {
     /// **跨字段语义门**(D1,2026-10-17):`gdn_slots < max_concurrency` 必拒,
     /// 拒语要点出病因(状态格逐出 = 跨会话污染)与调法;合规组合(生产档 1/1、
     /// 缺省 8/8)必须过。
+    /// **白名单 ↔ 池档位自洽门**(2026-10-19):两次同型事故(awq27b 起不来)的回归门。
+    #[test]
+    fn 白名单与池档位必须同族() {
+        // ① 病态:fp8 白名单 + 池缺省(f16)⇒ 拒启,且文案点明不自洽
+        let e = OwlConfig::from_toml_str(
+            "[dispatch]\nallowed_ops = [\"flashinfer_prefill_paged_fp8kv\", \
+             \"owl_qknorm_rope_kv_insert_f16_fp8kv_knhd\", \"owl_reshape_and_cache_fp8kv_knhd\"]\n",
+        )
+        .expect_err("fp8 白名单 + f16 池应拒启");
+        assert!(e.contains("不自洽"), "错误文案应点明属性:{e}");
+        assert!(e.contains("kv_fp8"), "错误文案应指向 kv_fp8:{e}");
+        // ② fp8 池 + fp8 白名单 ⇒ 过
+        OwlConfig::from_toml_str(
+            "[dispatch]\nkv_fp8 = true\nallowed_ops = [\"flashinfer_prefill_paged_fp8kv\", \
+             \"owl_qknorm_rope_kv_insert_f16_fp8kv_knhd\", \"owl_reshape_and_cache_fp8kv_knhd\"]\n",
+        )
+        .expect("fp8 池 + fp8 白名单应过");
+        // ③ f16 池 + f16 白名单 ⇒ 过
+        OwlConfig::from_toml_str(
+            "[dispatch]\nkv_fp8 = false\nallowed_ops = [\"flashinfer_prefill_paged_f16\", \
+             \"owl_qknorm_rope_kv_insert_f16_knhd\", \"vllm_reshape_and_cache_f16_knhd\"]\n",
+        )
+        .expect("f16 池 + f16 白名单应过");
+        // ④ 两族共存(生产 spec-dflash 就是两族都收,池 dtype 决定发射哪族)⇒ 过
+        OwlConfig::from_toml_str(
+            "[dispatch]\nkv_fp8 = false\nallowed_ops = [\"flashinfer_prefill_paged_f16\", \
+             \"flashinfer_prefill_paged_fp8kv\", \"owl_qknorm_rope_kv_insert_f16_knhd\", \
+             \"vllm_reshape_and_cache_f16_knhd\", \"owl_qknorm_rope_kv_insert_f16_fp8kv_knhd\", \
+             \"owl_reshape_and_cache_fp8kv_knhd\"]\n",
+        )
+        .expect("两族共存的白名单(f16 池)应过");
+        // ⑤ 门关:空列表(诊断态)/ 不写 ⇒ 不校验
+        OwlConfig::from_toml_str("[dispatch]\nallowed_ops = []\n").expect("空 = 门关,应过");
+        assert!(OwlConfig::default().dispatch.allowed_ops.is_none());
+    }
+
     #[test]
     fn validate_rejects_concurrency_over_gdn_slots() {
         let e = OwlConfig::from_toml_str("[pool]\ngdn_slots = 1\n[server]\nmax_concurrency = 8\n")
