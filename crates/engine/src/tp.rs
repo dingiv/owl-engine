@@ -80,6 +80,17 @@ fn staging_header_bytes(layout: StagingLayout) -> Vec<u8> {
     b[16..20].copy_from_slice(&(layout.slot_bytes as u32).to_le_bytes());
     b[20..24].copy_from_slice(&layout.slots.to_le_bytes());
     b[24..28].copy_from_slice(&owl_comm::ar::MAGIC.to_le_bytes());
+    // ★ **前置清单②(2026-10-17 显式化)**:`produced` / `consumed` /
+    // `wait_done` / `blocks_done` **四格必须全 0**。这里靠"Vec 初始化为零 +
+    // 只写 0..28"成立 —— 但那是**隐含**的,故补一条断言把它钉住:
+    // `wait_done` 若留非 0 残值且 ≥ 本轮 want,非 0 号 block 会**跳过两级等待**
+    // ⇒ 静默读到未就绪的对端数据(核**无法自检**,只能在这里保证)。
+    debug_assert!(
+        b.len() == owl_comm::ar::HEADER_BYTES as usize
+            && b[28..].iter().all(|&x| x == 0),
+        "staging header 的 28..64(含 wait_done@32 / blocks_done@40)必须全 0;\
+         核无法自检这一条 —— 残值会导致非 0 号 block 跳过等待、静默读到未就绪数据"
+    );
     b
 }
 

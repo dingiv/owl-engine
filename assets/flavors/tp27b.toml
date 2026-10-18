@@ -7,15 +7,16 @@
 # 装配面见 `crates/engine/src/tp.rs` 模块头;设计出处
 # `docs/arch/TP2-施工设计.md`(§6 预算账 / §14.2 分刀 / §15 实施方案)。
 #
-# 🔴 **本档当前会被 TP v1 护栏响亮拒**(2026-10-17 定谳):27B 是**量化档**
-#   (`model.w4a8` false/true 都算),而量化派生键(`.qweight`/`.packed_raw`/
-#   `.scales`/`.zeros`)的分片区间翻译**未接线** ⇒ 两 rank 读同一段权重、
-#   输出全错(证据与修法:`docs/arch/TP2-施工设计.md` §22)。护栏 = 装配期
-#   `tp_v1_check_quant`(唯一判据;临时,§22.4 的 A 刀落地后撤)。
-#   ⇒ 在此之前本档只作**档位声明**(几何/白名单/旋钮)与将来修好后的回归靶;
-#   要跑 TP 性能请用 **f16 检查点**(0.8B 档)。
+# ✅ **本档已可跑**(2026-10-17 两刀落地;原 🔴 声明已作废)
+#   ① 量化派生键(`.qweight`/`.packed_raw`/`.scales`/`.zeros`)的分片区间翻译
+#      已接线 —— 见 `docs/arch/TP2-施工设计.md` §22(立案)/§24(总根因
+#      `DeviceRearrange` 双切定谳)/§25(通道提速);
+#   ② 装配期临时护栏 `tp_v1_check_quant` 已撤(修好后无理由拒)。
+#   ⇒ 生产读数(std 五点三轮/3080 对,`docs/bench/data/owl-tp-2026-10-17/`):
+#      prefill **1353 t/s**(TP1 单卡 970 的 **1.40×**)/ decode **43.6 t/s**(1.36×)
+#      / TTFT@512 **392ms**(优于 TP1 的 534ms)。
 #
-# ⚠️ **TP v1 范围护栏**(`TpEngine::assemble` 响亮拒,本档因此不配):
+# ⚠️ **TP v1 范围约束**(仍在;越界 `TpEngine::assemble` 响亮拒):
 #   ① 投机草稿 draft.depth = 0(草稿族双 rank 未接线)
 #   ② prefill 桶族 prefill_bucket = off(桶出图尾自带读数,撞入队半零同步)
 #   ③ 读数类探针 prefill_cksum / pf_fin_check / pf_fence / dflash_probe 全关

@@ -74,6 +74,36 @@ fn check_staging(op: OpId, what: &'static str, len: usize, slot_bytes: u64) -> R
     Ok(())
 }
 
+/// **reduce 的 grid 选择**(2026-10-17 §27.7;单 block 打不满本地访存 ——
+/// 实测本地 RMW 37GB/s vs stage 核(copy)114GB/s vs 硬件 500+GB/s)。
+///
+/// 判据 = "每线程约 8 个 16B 向量"(`OWL_AR_VEC_PER_THREAD`),再夹到
+/// `[1, MAX_BLOCKS]`:
+/// - 小载荷(decode 10KB = 640 向量)⇒ grid 仍为 1(多块只添两级等待的钱);
+/// - 大载荷(5.24MB = 327680 向量 / 256 线程 / 8)⇒ 夹到 MAX_BLOCKS。
+///
+/// **那一维 = 块数 × 块内线程数(在飞线程总数)**,两者都扫过:
+/// - 块数:32 块 = 600.5µs / 64 块 = 627.8µs(`L dev` 6.23 vs 16.94)⇒ **32 更好**,
+///   与 vLLM "too many SMs will cause contention on the bus"(它取 36)同向;
+/// - 块内线程数:`asset::BLOCK` = **512**(256 → 512:`AR(5.24MB)` 608.6 → 590.2µs);
+/// ⇒ 故上限记成**在飞线程总数** `MAX_THREADS`,grid = 它 / BLOCK(256 → 32 块;
+///   512 → 16 块;1024 → 8 块 —— 三者扫出来 512 最好)。
+
+fn ar_reduce_grid(dt: Dtype, bytes: u64) -> (u32, u32, u32) {
+    /// 每线程的 16B 向量数
+    const VEC_PER_THREAD: u64 = 8;
+    let per_vec = 16u64 / (dt.size_bytes().max(1) as u64).min(16); // 16B/元素宽
+    let n_vec = (bytes / (dt.size_bytes().max(1) as u64)).max(1) / per_vec.max(1);
+    let blk = asset::BLOCK as u64;
+    let want = n_vec.div_ceil(blk * VEC_PER_THREAD).max(1);
+    let cap = (MAX_THREADS / blk).max(1);
+    (want.min(cap) as u32, 1, 1)
+}
+
+/// **在飞线程总数上限**(见上注:块数×块内线程数才是那一维)。
+pub(crate) const MAX_THREADS: u64 = 32 * 256; // = 8192;块数甜点 32 × 块内 256
+
+
 /// 公共发射参数(两族同型:6 槽)
 #[allow(clippy::too_many_arguments)]
 fn launch_ar(
@@ -88,13 +118,14 @@ fn launch_ar(
     bytes: u64,
     slot_bytes: u64,
     slab_off: u64,
+    grid: (u32, u32, u32),
 ) -> Result<(), OpError> {
     exec.launch(
         res,
         op,
         k,
         kernel,
-        (1, 1, 1),
+        grid,
         (asset::BLOCK, 1, 1),
         0,
         &[
@@ -162,6 +193,7 @@ impl KernelFamily for CommArStageRuntime {
         launch_ar(
             Self::ID, "ar_stage", res, exec, k, local_p, own_p, peer_p, call.bytes(),
             call.slot_bytes(), call.slab_off(),
+            ar_reduce_grid(call.local().dtype, call.bytes()),
         )?;
         Ok(out)
     }
@@ -215,9 +247,10 @@ impl KernelFamily for CommArReduceRuntime {
         let out_p = res.resolve(call.out().id)?;
         let own_p = res.resolve(call.own().id)?;
         let peer_p = res.resolve(call.peer().id)?;
+        let grid = ar_reduce_grid(call.out().dtype, call.bytes());
         launch_ar(
             Self::ID, "ar_reduce", res, exec, k, out_p, own_p, peer_p, call.bytes(),
-            call.slot_bytes(), call.slab_off(),
+            call.slot_bytes(), call.slab_off(), grid,
         )?;
         Ok(out)
     }

@@ -61,6 +61,19 @@ pub mod hdr {
     /// `u32` **错误码**(核写;host 在下次同步点读 —— D4 "全有或全无"):
     /// 0 正常 · 1 stage credit 超时 · 2 reduce 数据超时 · 3 header 校验失败
     pub const ERR: u64 = 28;
+    /// `u64` **多 block 的两级等待令牌**(2026-10-17;32..40)。
+    ///
+    /// 语义:**单调递增** = `本端 consumed + 1`(不是布尔!)⇒ 与游标同源、
+    /// **图回放安全**(不需要每次重置,也就不存在"重置与下一次读的竞态")。
+    /// 写者 = block 0(它去 PCIe 上轮询对端 `produced`);读者 = 其余 block
+    /// (**读本端 header = 本地 L2**,避免 N 个 block 同时用 PCIe 轮询对端
+    /// 同一行 —— 那是"多 block 化"最容易顺手引入的坏账)。
+    pub const WAIT_DONE: u64 = 32;
+    /// `u32` **完成块计数**(40..44;reduce 尾"最后一块发布 consumed")。
+    /// 每 block 数据收尾后 `atomicAdd(+1)`;计数达 `gridDim.x` 的那一块
+    /// **回零**并发布 `consumed`(对端 stage 的 credit)。回零发生在同一核内、
+    /// 且在所有块都加过之后 ⇒ 下一次调用(同流保序)必定看到 0。
+    pub const BLOCKS_DONE: u64 = 40;
 }
 
 /// 错误码(与 `.cu` 的 `*own_err = N` 同值;host 侧判据面)

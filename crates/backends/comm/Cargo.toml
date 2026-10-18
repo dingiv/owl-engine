@@ -12,3 +12,16 @@ owl-graph = { path = "../../graph" }
 owl-shared = { path = "../../shared", default-features = false }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# ⚠️ **dev 环**:`owl-cuda` 的正常依赖里有 `owl-comm`(它在 `crates/backends/cuda/
+# Cargo.toml` 的 `[dependencies]`)⇒ 这里回指它是**dev-dependency 环**。
+# Cargo 允许(dev 边不进 lib 目标图),但必须在 Cargo.toml 里写明理由,否则
+# 后人以为是手滑。代价 = `cargo test -p owl-comm` 会连带编 owl-cuda + owl-kernels
+# (真机通信套件本来也需要它们)。
+owl-cuda = { path = "../cuda" }
+# 真机套件直接发射 AR 两核(与生产同一条客户端线格式)⇒ 也 dev 引 kernels
+owl-kernels = { path = "../../kernels", features = ["cublas", "marlin", "flashinfer", "xqa", "device"] }
+# 版本口径照抄 `crates/backends/cuda/Cargo.toml` 的 dev-dependencies(同仓同源)
+half = { version = "2.7.1", features = ["use-intrinsics"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

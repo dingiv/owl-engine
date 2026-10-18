@@ -30,6 +30,10 @@
 //!   cargo test -p owl-engine --test tp_load_gate_27b -- --nocapture
 //! ```
 //! 未设 `OWL_27B_DIR` ⇒ 试 workspace 缺省路径;不存在即 skip。
+//!
+//! ⚠️ **本门三测都要吞多 GB host 内存(每个 ~11GB 释放账)** ⇒ 并行跑会
+//! 互相挤爆(2026-10-17 `cargo test --workspace` 实测假红,`join: Any`)。
+//! **必须 `-- --test-threads=1`**(单跑三测全绿 150s)。
 
 use std::path::{Path, PathBuf};
 
