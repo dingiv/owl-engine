@@ -40,7 +40,7 @@ extends = "base.toml"     # 相对路径 = 相对本文件目录;也可绝对路
 | 档 | 内容 |
 |---|---|
 | `testdata/args/base.toml` | **站点档**(本地,未入库):model 路径 + bind |
-| `testdata/args/perf-ctxladder-27b.toml` | `extends = "base.toml"` + 32k 几何(40960/41216) |
+| `testdata/args/perf-ctxladder-27b.toml` | **自包含**(站点路径写死 + 32k 几何 40960/41216;入库的复现档) |
 | `testdata/args/prefill-prof-bare-27b.toml` | 同上 + `[spec] depth = 0`(裸臂) |
 
 实验档 = 复制 ladder 改一行,不再整档复述。

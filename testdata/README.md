@@ -90,7 +90,7 @@ overlay 抄整档 / 为"只差一行"新开测试文件。
 | `cases/` | **用例 overlay**(约定路径;规范见 `cases/README.md`) | 仅该 README |
 | `conf/` | 测试环境档(本地;`OWL_TEST_CONF` 指向) | 否 |
 | `resources.toml` | **资源清单**(检查点/金标路径 + 开关) | 否(`resources.toml.example` 是) |
-| `args/` | 引擎启动档(索引见 `args/README.md`;站点档 `base.toml` + `extends` 链) | 仅 `perf-ctxladder-27b.toml` |
+| `args/` | 引擎启动档(索引见 `args/README.md`);入库的 `perf-ctxladder-27b.toml` **自包含**(路径写死在档内) | 仅该档 |
 | `gdn_fla/` | GDN 金标:脚本 + `cases/*.manifest.json`;`*.bin` 由 `gen.py` 生成(大件可跨树符号链接) | 脚本+manifest 是;大件否 |
 | `server/` | agent-serving 自有档 | 否 |
 | `dflash2_golden.safetensors` 等 | 算子金标(tools/ 生成) | 否 |
