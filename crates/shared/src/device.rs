@@ -58,6 +58,18 @@ pub fn parse_nvidia_smi_mem(text: &str) -> std::collections::HashMap<String, f64
     out
 }
 
+/// **测试设备门控值**(`OWL_TEST_DEVICE`;2026-10-18 用户裁决:**唯一形态 = BDF**,
+/// CUDA 序号禁用)。未设/空串 = `None`(GPU 用例据此 skip)。
+///
+/// 为什么是 BDF:CUDA 序号是 FASTEST_FIRST 序,随驱动/换卡/重启漂移;本机已有
+/// 多次"数字序钉错卡"判例(见 AGENTS.md)。BDF 稳定,且与 `DeviceSpec.bdf` 同一
+/// 套归一/匹配(`bdf_norm`)。
+pub fn test_device_bdf() -> Option<String> {
+    let s = crate::env_reader::str("OWL_TEST_DEVICE")?;
+    let t = s.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
 /// 选卡规格(全 `None` = 不指定 ⇒ 全部候选)
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]

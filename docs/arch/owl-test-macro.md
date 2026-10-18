@@ -210,7 +210,7 @@ fn 名() {
 |---|---|---|---|
 | **用例配置**(引擎旋钮) | `OWL_TEST_CONFIG_<FN>` 每用例一键 | **`OWL_TEST_CONF` 单一入口 + `testdata/cases/**` 约定 overlay**(宏传 `file!()` 推导;`flavor` 复用 `flavors/`) | ✅ **已落地**(2026-10-18) |
 | **整轮共同口径** | 各会话各写一套档 | 同上一入口:一份测试环境档定 flavor + 本机覆盖,大家测的配置一致 | ✅ 已落地 |
-| **设备**(哪张卡) | `OWL_TEST_DEVICE` | 保留为设备专用 env(机器资源选择器);进一步可收进 `testdata/machine.toml` | ⏳ 待定 |
+| **设备**(哪张卡) | `OWL_TEST_DEVICE` | 保留为设备专用 env;值 = **PCI BDF**(`41:00.0`;**CUDA 序号已禁用**,纯数字响亮拒);进一步可收进 `testdata/machine.toml` | ✅ 已落地(2026-10-18) |
 | **数据**(检查点/金标) | `OWL_AWQ27B_DIR` / `OWL_DFLASH2_DIR` 等十余键 | **资源清单** `testdata/resources.toml`(`key = "path"`);用例声明 `#[owl_test(needs = ["ckpt:27b-awq"])]`,缺失 = skip 且**点名缺哪个 key** | ⏳ 提案 |
 | **昂贵套件**(parity/bench) | `OWL_HF_PARITY` 等 | 已进宏选项(`hf_parity`);后续并入资源清单 | 部分 |
 
@@ -233,3 +233,16 @@ fn 名() {
   退役键拒/overlay 生效)+ `engine::tests::case_config_injection` 端到端复算;
   真机演示:`OWL_TEST_CONF=<flavor+override> cargo test -p owl-engine --lib
   case_config_injection` 绿。
+
+### 2026-10-18(晚):设备门改 BDF
+
+- `OWL_TEST_DEVICE` **唯一形态 = PCI BDF**(如 `41:00.0`);纯数字(CUDA 序号)
+  在解析层**响亮拒绝**("CUDA 序号已禁用");未设 = skip。
+- 读取面 `owl_shared::device::test_device_bdf()`;解析面
+  `owl_cuda::{resolve_ordinal_by_bdf, test_device_ordinal, test_device_ordinal_opt}`
+  (设备表枚举 + `DeviceSpec` 同一套归一;未命中 = 报可用 BDF 表)。
+- `[runtime] test_device` 类型 `Option<usize>` → `Option<String>`(BDF);
+  `#[owl_test(gpu)]` 门控语义不变。
+- 全仓测试面改走唯一入口:kernels(12 文件;dev-dep owl-cuda)、engine
+  (tests/e2e/graph_plan/examples)、cuda 集成测试补 GPU 门(9 文件 / 22 处)、
+  cuda examples。实证:BDF 真机跑通、纯数字响亮拒、未设 skip。

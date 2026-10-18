@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
-use owl_kernels::contract::{Bytes, Dtype, OpError};
+use owl_kernels::contract::{Dtype, OpError};
 use owl_kernels::device::{DeviceRes, Exec, LaunchNote, ScratchBuf};
 use owl_kernels::ops::oracles::{
     cublas_gemm as cb, k0_fp8_knhd as k0, nc_bf16_v2 as nc, qknorm_insert as qk,
@@ -35,7 +35,7 @@ struct TestRes {
 
 impl TestRes {
     fn new() -> Option<Self> {
-        let ordinal = owl_shared::env_reader::parse::<usize>("OWL_TEST_DEVICE")?;
+        let ordinal = owl_cuda::test_device_ordinal_opt()?;
         let ctx = CudaContext::new(ordinal).expect("ctx");
         ctx.bind_to_thread().expect("bind");
         let stream = ctx.default_stream();

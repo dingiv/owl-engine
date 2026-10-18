@@ -221,6 +221,10 @@ async fn run_case(
 
 #[tokio::test]
 async fn marlin_w4a16_parity() {
+    if owl_cuda::test_device_bdf().is_none() {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    }
     let mut client = assemble();
     // 形状矩阵:decode(m=1)+ 短 prefill(m=64);k/n 满足 v2 约束(k%16==0)
     // 形状约束(pack/upstream Layer 校验):k%128==0、n%256==0、g ∈ {64,128,-1}
@@ -240,6 +244,10 @@ async fn marlin_w4a16_parity() {
 /// BF16 激活 W4A16 parity(E5-DF3 同日十二:草稿路径 BF16 化;fc 形状)
 #[tokio::test]
 async fn marlin_w4a16_bf16_parity() {
+    if owl_cuda::test_device_bdf().is_none() {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    }
     let mut client = assemble();
     // ⚠ **m ≤ 8 是盲区**(2026-10-16 perf-review):
     //   DFlash2 草稿的 fc = (m=1, n=5120, k=5120, g=128) 的 bf16 臂,
@@ -271,6 +279,10 @@ async fn marlin_w4a16_bf16_parity() {
 /// 判决目标:非 2^k n 的 repack 分歧 vs kernel selector 罪责二选一)
 #[tokio::test]
 async fn marlin_golden_dump() {
+    if owl_cuda::test_device_bdf().is_none() {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    }
     let mut client = assemble();
     let dir = std::path::Path::new("/tmp/marlin_golden");
     owl_shared::file_loader::create_dir_all(dir).expect("mkdir");
@@ -301,6 +313,10 @@ async fn marlin_golden_dump() {
 /// 单案 memcheck 入口(compute-sanitizer 配套;OWL_SWEEP_CASE="m,n,k,g")
 #[tokio::test]
 async fn marlin_shape_case() {
+    if owl_cuda::test_device_bdf().is_none() {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    }
     let Some(spec) = owl_shared::env_reader::str("OWL_SWEEP_CASE") else {
         eprintln!("skip: OWL_SWEEP_CASE 未设(m,n,k,g)");
         return;
@@ -316,6 +332,10 @@ async fn marlin_shape_case() {
 
 #[tokio::test]
 async fn marlin_shape_sweep() {
+    if owl_cuda::test_device_bdf().is_none() {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    }
     let mut client = assemble();
     // 基础档(0.512k 网格)+ 27B 维度族(Qwen3.8-27B:5120/6144/10240/
     // 14336/17408;暗雷根治后应全绿)
@@ -488,6 +508,10 @@ async fn run_awq_case_g(client: &mut GpuClient, m: usize, n: usize, k: usize, g:
 /// m8 路径(m=1,kv-proj 形状 n=1024)与多 m-block 路径(m=32,o-proj 形状)。
 #[tokio::test]
 async fn marlin_w4a16_awq_parity() {
+    if owl_cuda::test_device_bdf().is_none() {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    }
     let mut client = assemble();
     // 2026-10-14 A13:m 维**生产档**补位 —— 原列表只有 m=1/32,而 27B prefill
     // 的 AWQ(kU4/g=32/zp)实际跑 m=分块长(512/443/256…)。本组先做 m 扫描
@@ -529,6 +553,10 @@ async fn marlin_w4a16_awq_parity() {
 /// 表错列、反之亦然)。故本门是这条线的**换核保险**。
 #[tokio::test]
 async fn ct_repack_a8_parity() {
+    if owl_cuda::test_device_bdf().is_none() {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    }
     let mut client = assemble();
     // 覆盖 grid 两维(rows/32 × cols/4)+ 非方形 + 生产形状族
     for (out_dim, k) in [
@@ -600,6 +628,10 @@ async fn ct_repack_a8_parity() {
 /// 形状覆盖 grid 两维(rows/64 × cols/2);ct packed 伪随机。
 #[tokio::test]
 async fn ct_repack_parity() {
+    if owl_cuda::test_device_bdf().is_none() {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    }
     let mut client = assemble();
     for (out_dim, k) in [(1024usize, 5120usize), (5120usize, 5120usize), (17408usize, 5120usize)] {
         let rows = out_dim;

@@ -33,6 +33,10 @@ fn le_i32(v: &[i32]) -> Vec<u8> {
 #[ignore = "probe: 外来大核图内派发税(刀D 立案②)"]
 #[tokio::test]
 async fn marlin_graph_dispatch_probe() {
+    if owl_cuda::test_device_bdf().is_none() {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    }
     let mut client = assemble();
     client.sync().await.unwrap();
 
@@ -140,6 +144,10 @@ extern "C" __global__ void probe_add_f32(
 #[ignore = "probe: 外来大核图内派发税(刀D 立案②)"]
 #[tokio::test]
 async fn cublas_graph_dispatch_probe() {
+    if owl_cuda::test_device_bdf().is_none() {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    }
     let mut client = assemble();
     client.sync().await.unwrap();
     // b/a 同款 gemv 形状:nt [48, 5120] × [1, 5120] → [1, 48]

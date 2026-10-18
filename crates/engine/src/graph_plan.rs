@@ -750,7 +750,6 @@ mod tests {
     use super::*;
     use owl_cpu::CpuFace;
     use owl_models::interpreters::eval_ops;
-    use owl_shared::config::OwlConfig;
     use owl_macros::owl_test;
 
     fn ones_w() -> TensorOps {
@@ -928,11 +927,10 @@ mod tests {
 
     /// GPU 门控:回放 == eager 数值对拍(捕获正确性的直接证据)。
     /// 权重块化(捕获期禁 Htod);同卡双 actor,纯函数树无状态污染。
-    /// 门控与设备序由 `#[owl_test(gpu)]` 注入(S2 样板收编:
-    /// env 未设 = 逐字同旧文案 skip;设了 = `test_device` 回填)。
+    /// 门控由 `#[owl_test(gpu)]` 注入;设备由 `OWL_TEST_DEVICE`(**BDF**)解析。
     #[owl_test(gpu)]
-    async fn gpu_capture_matches_eager(cfg: &OwlConfig) {
-        let ordinal = cfg.runtime.test_device.expect("gpu 门控已回填");
+    async fn gpu_capture_matches_eager() {
+        let ordinal = owl_cuda::test_device_ordinal(); // OWL_TEST_DEVICE(BDF)→ ordinal(唯一入口)
         let f_eager = owl_cuda::GpuClient::spawn(owl_cuda::DeviceSelector::Ordinal(ordinal))
             .expect("gpu boot(eager 锚)");
         let mut f_cap = owl_cuda::GpuClient::spawn(owl_cuda::DeviceSelector::Ordinal(ordinal))
@@ -1008,7 +1006,7 @@ mod tests {
     /// 只差 `reclaim_capture` 一位)。
     #[tokio::test]
     async fn gpu_capture_reclaim_matches_eager() {
-        let Some(ordinal) = owl_shared::env_reader::parse::<usize>("OWL_TEST_DEVICE") else {
+        let Some(ordinal) = owl_cuda::test_device_ordinal_opt() else {
             eprintln!("skip: OWL_TEST_DEVICE 未设");
             return;
         };

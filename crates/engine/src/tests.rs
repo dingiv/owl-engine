@@ -113,7 +113,7 @@ fn asset_dir() -> std::path::PathBuf {
 }
 
 fn gpu_ordinal() -> Option<usize> {
-    owl_shared::env_reader::parse::<usize>("OWL_TEST_DEVICE")
+    owl_cuda::test_device_ordinal_opt()
 }
 
 /// CPU:构造(零执行)+ ModelLoader 装载门禁(权重/tokenizer 解析)
@@ -125,7 +125,7 @@ fn gpu_ordinal() -> Option<usize> {
 async fn cpu_construct_and_load(cfg: &OwlConfig) {
     let mut engine = Engine::on(
         EngineConfig {
-            device_ordinal: cfg.runtime.test_device.or(cfg.runtime.device_ordinal).unwrap_or(0),
+            device_ordinal: cfg.runtime.device_ordinal.unwrap_or(0),
             max_seq_tokens: cfg.runtime.max_seq,
             prefill_chunk: cfg.runtime.prefill_chunk,
             knobs: EngineKnobs::from_config(cfg),
@@ -145,7 +145,7 @@ async fn cpu_construct_and_load(cfg: &OwlConfig) {
 async fn cpu_incremental_decode_multibyte(cfg: &OwlConfig) {
     let mut engine = Engine::on(
         EngineConfig {
-            device_ordinal: cfg.runtime.test_device.or(cfg.runtime.device_ordinal).unwrap_or(0),
+            device_ordinal: cfg.runtime.device_ordinal.unwrap_or(0),
             max_seq_tokens: cfg.runtime.max_seq,
             prefill_chunk: cfg.runtime.prefill_chunk,
             knobs: EngineKnobs::from_config(cfg),
@@ -180,7 +180,7 @@ async fn case_config_injection(cfg: &OwlConfig) {
             .unwrap_or_else(|e| panic!("独立复算失败({path}): {e}")),
         None => OwlConfig::default(),
     };
-    expect.runtime.test_device = owl_shared::env_reader::parse("OWL_TEST_DEVICE");
+    expect.runtime.test_device = owl_shared::device::test_device_bdf();
     assert_eq!(cfg, &expect, "宏注入配置必须与唯一 loader 独立复算逐字段同");
 }
 

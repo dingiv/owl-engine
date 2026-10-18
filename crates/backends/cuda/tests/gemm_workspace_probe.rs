@@ -35,6 +35,10 @@ fn vram_used_mib() -> usize {
 #[ignore = "probe: cuBLAS 账外显存实测(F1 治理)"]
 #[tokio::test]
 async fn gemm_workspace_footprint() {
+    if owl_cuda::test_device_bdf().is_none() {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    }
     let (tx, rx) = std::sync::mpsc::channel::<owl_cuda::Command>();
     let server = GpuServer::new(rx, DeviceSelector::Ordinal(test_device_ordinal()), None);
     let mut client = GpuClient::new(tx);

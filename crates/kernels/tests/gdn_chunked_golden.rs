@@ -178,7 +178,7 @@ fn gdn_chunked_golden_stage_by_stage() {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
     }
-    let dev: usize = owl_shared::env_reader::parse("OWL_TEST_DEVICE").unwrap_or(1);
+    let dev: usize = owl_cuda::test_device_ordinal_opt().unwrap_or(1);
     let ctx = CudaContext::new(dev).expect("cuda ctx");
     ctx.bind_to_thread().expect("bind");
     let stream = ctx.default_stream();

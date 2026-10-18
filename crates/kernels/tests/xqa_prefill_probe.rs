@@ -243,7 +243,7 @@ fn causal_mask_words(t: usize) -> Vec<u32> {
 /// 一次 (T, ctx) 全量测量:XQA 单发 vs chunked prefill 核同池同形状。
 fn run_case(t: usize, ctx: usize, host_check: bool, chunked: bool) {
     let nb = ctx.div_ceil(PAGE);
-    let ctx_c = CudaContext::new(owl_shared::env_reader::parse_or("OWL_TEST_DEVICE", 0)).expect("ctx");
+    let ctx_c = CudaContext::new(owl_cuda::test_device_ordinal()).expect("ctx");
     ctx_c.bind_to_thread().expect("bind");
     let stream = ctx_c.default_stream();
 
@@ -597,7 +597,7 @@ fn xqa_prefill_diag() {
         owl_shared::env_reader::parse_or("XQA_PF_DIAG_CTX", 64usize),
     );
     let nb = ctx.div_ceil(PAGE);
-    let ctx_c = CudaContext::new(owl_shared::env_reader::parse_or("OWL_TEST_DEVICE", 0)).expect("ctx");
+    let ctx_c = CudaContext::new(owl_cuda::test_device_ordinal()).expect("ctx");
     ctx_c.bind_to_thread().expect("bind");
     let stream = ctx_c.default_stream();
     let pool_elems = nb * HKV * HD * PAGE;

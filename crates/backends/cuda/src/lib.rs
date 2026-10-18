@@ -53,7 +53,56 @@ pub use owl_iface::contract::{
 };
 pub use owl_iface::contract::{Dtype, Shape};
 
-/// 测试/示例的设备序号(OWL_TEST_DEVICE,默认 0)
+/// 测试设备门控值(`OWL_TEST_DEVICE`;**唯一形态 = BDF**,如 `41:00.0`)。
+/// 未设/空串 = None(GPU 用例据此 skip)。
+pub fn test_device_bdf() -> Option<String> {
+    owl_shared::device::test_device_bdf()
+}
+
+/// **BDF → 本进程 CUDA ordinal**(枚举设备表 + `DeviceSpec` 同一套归一匹配)。
+///
+/// 显式拒绝纯数字(旧的 CUDA 序号写法);找不到 = Err 带**可用 BDF 表**。
+pub fn resolve_ordinal_by_bdf(bdf: &str) -> Result<usize, String> {
+    if bdf.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!(
+            "OWL_TEST_DEVICE={bdf:?} 是纯数字 —— **CUDA 序号已禁用**,请用 BDF(如 `41:00.0`)"
+        ));
+    }
+    let spec = owl_shared::device::DeviceSpec { bdf: Some(bdf.to_string()), ..Default::default() };
+    let rows = crate::ffi::device_rows()?;
+    let hit = spec.select(&rows);
+    match hit.first() {
+        Some(r) => Ok(r.ordinal),
+        None => {
+            let table: Vec<String> = rows
+                .iter()
+                .map(|r| format!("{}[ordinal={} {}]", r.bdf, r.ordinal, r.name))
+                .collect();
+            Err(format!(
+                "OWL_TEST_DEVICE={bdf:?} 未命中任何设备 —— 可用:{table:?}"
+            ))
+        }
+    }
+}
+
+/// 同 [`test_device_ordinal`] 的**可失败形态**:未设 = `None`(调用点据此 skip);
+/// 设了但不是合法 BDF / 未命中 = **panic**(不静默当未设)。
+pub fn test_device_ordinal_opt() -> Option<usize> {
+    test_device_bdf().map(|b| {
+        resolve_ordinal_by_bdf(&b).unwrap_or_else(|e| panic!("[owl-cuda] {e}"))
+    })
+}
+
+/// 测试/示例的设备序(**测试域唯一入口**):`OWL_TEST_DEVICE`(BDF)→ ordinal。
+/// 未设/非法 = **panic**(调用点必须先过 GPU 门;测试面拒绝隐式 CUDA 序号)。
 pub fn test_device_ordinal() -> usize {
-    owl_shared::env_reader::parse_or("OWL_TEST_DEVICE", 0)
+    match test_device_bdf() {
+        Some(bdf) => {
+            resolve_ordinal_by_bdf(&bdf).unwrap_or_else(|e| panic!("[owl-cuda] {e}"))
+        }
+        None => panic!(
+            "[owl-cuda] OWL_TEST_DEVICE 未设:测试钉卡唯一形态 = BDF(如 `41:00.0`);\
+             用例应先过 GPU 门(未设 = skip)"
+        ),
+    }
 }

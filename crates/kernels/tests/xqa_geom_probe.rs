@@ -112,7 +112,7 @@ fn run_one(ctx_c: &std::sync::Arc<CudaContext>, cfg: &Cfg) -> Vec<u16> {
     let d_v = dev_u8(&v_fp8);
     let mut d_q = unsafe { stream.alloc::<u16>(q_f16.len()) }.unwrap();
     stream.memcpy_htod(&q_f16, &mut d_q).unwrap();
-    let mut d_out = unsafe { stream.alloc::<u16>(S * H * HD) }.unwrap();
+    let d_out = unsafe { stream.alloc::<u16>(S * H * HD) }.unwrap();
     let mut d_bt = unsafe { stream.alloc::<i32>(nb) }.unwrap();
     stream.memcpy_htod(&(0..nb as i32).collect::<Vec<_>>(), &mut d_bt).unwrap();
     let mut d_seq = unsafe { stream.alloc::<u32>(1) }.unwrap();
@@ -123,7 +123,7 @@ fn run_one(ctx_c: &std::sync::Arc<CudaContext>, cfg: &Cfg) -> Vec<u16> {
     let sem_len = HKV.div_ceil(2) * 2 + 2 + HKV + 2;
     let mut d_sem = unsafe { stream.alloc::<u32>(sem_len) }.unwrap();
     stream.memcpy_htod(&vec![0u32; sem_len], &mut d_sem).unwrap();
-    let mut d_scratch = unsafe { stream.alloc::<u8>(256 << 20) }.unwrap();
+    let d_scratch = unsafe { stream.alloc::<u8>(256 << 20) }.unwrap();
 
     let (kernel, consts) =
         owl_kernels::family::xqa::load_for_probe(&ctx_c, cfg.name).expect("载 xqa 资产");
@@ -200,8 +200,11 @@ fn run_one(ctx_c: &std::sync::Arc<CudaContext>, cfg: &Cfg) -> Vec<u16> {
 
 #[test]
 fn xqa_verify_geometry_scan() {
-    let dev: usize =
-        owl_shared::env_reader::parse("OWL_TEST_DEVICE").unwrap_or(0);
+    if owl_cuda::test_device_bdf().is_none() {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    }
+    let dev: usize = owl_cuda::test_device_ordinal();
     let ctx_c = CudaContext::new(dev).expect("cuda ctx");
     ctx_c.bind_to_thread().expect("bind");
     let stream = ctx_c.default_stream();

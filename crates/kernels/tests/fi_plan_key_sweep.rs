@@ -187,7 +187,7 @@ fn fi_plan_key_ctx_sweep() {
         eprintln!("skip: OWL_TEST_DEVICE 未设(哪张卡)");
         return;
     }
-    let dev: usize = owl_shared::env_reader::parse_or("OWL_TEST_DEVICE", 0);
+    let dev: usize = owl_cuda::test_device_ordinal();
     // 错带(0.8B 几何实测;§8.30)与带外各留几个 —— 带外档必须也过(回归面)
     let ts: Vec<usize> = owl_shared::env_reader::str("FI_SWEEP_TS")
         .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())

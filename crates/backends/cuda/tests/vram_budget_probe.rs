@@ -1,7 +1,7 @@
 //! **显存硬预算门**(2026-10-16):server 侧**主动拒发**超出限度的分配请求 ——
 //! 不让 `cudaMallocAsync` 去抛错(那是"已经太晚"的现场:错误语义模糊 + 池被撕碎)。
 //!
-//! 两条判据(见 `cuda::state::vram_budget_guard`):
+//! 两条判据(见 `cuda::state::VramGuard::check`):
 //! ① 驱动账:`free − reserve ≥ 请求`;② 逻辑上限(可选):`live + n ≤ budget`。
 //! 拒发 = **结构化** `PoolExhausted`(要多少/还能给多少)+ `is_fatal() == true`
 //! ⇒ 服务面据此走优雅关停(见 `apps/server/src/shutdown.rs`)。
@@ -29,6 +29,10 @@ async fn client_with(diag: DiagOpts) -> GpuClient {
 /// ② 逻辑上限:预算 1MiB ⇒ 2MiB 请求必被拒(且**不依赖卡上余量**,可重复)
 #[tokio::test]
 async fn logical_cap_refuses_before_cuda() {
+    if owl_cuda::test_device_bdf().is_none() {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    }
     let mut c = client_with(DiagOpts { vram_budget_mb: Some(1), ..Default::default() }).await;
     // 先占 0.5MiB(在上限内):应放行
     let ok = c.alloc(Dtype::F32, (512 * 1024) / 4, "probe:budget-ok").await.expect("预算内应放行");
@@ -52,6 +56,10 @@ async fn logical_cap_refuses_before_cuda() {
 /// ① 驱动账:reserve 拉满(1TiB)⇒ 任何请求都被拒,且**一次 malloc 都没发**
 #[tokio::test]
 async fn driver_free_minus_reserve_refuses() {
+    if owl_cuda::test_device_bdf().is_none() {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    }
     let mut c = client_with(DiagOpts { vram_reserve_mb: 1 << 20, ..Default::default() }).await;
     let err = c
         .alloc(Dtype::F32, 1024, "probe")
@@ -65,6 +73,10 @@ async fn driver_free_minus_reserve_refuses() {
 /// 对照:默认预算 ⇒ 正常小分配照常放行(硬预算不是"一律拒绝")
 #[tokio::test]
 async fn default_budget_still_allocates() {
+    if owl_cuda::test_device_bdf().is_none() {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    }
     let mut c = client_with(DiagOpts::default()).await;
     let b = c.alloc(Dtype::F32, 1024, "probe").await.expect("默认档应放行");
     let mut out = vec![0u8; 16];

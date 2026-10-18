@@ -40,7 +40,7 @@ extern "C" __global__ void saxpy_f32(
 "#;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ordinal: usize = owl_shared::env_reader::parse_or("OWL_TEST_DEVICE", 0);
+    let ordinal: usize = owl_cuda::test_device_ordinal();
 
     // ---- 1. 上下文与流(cudarc 每卡一个 CudaContext;clone = Arc 克隆)----
     let ctx = CudaContext::new(ordinal)?;

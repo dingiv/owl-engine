@@ -86,7 +86,11 @@ fn plan_one(res: &mut TestRes, t: usize, ctx: usize) -> (i64, i64, i32, usize) {
 
 #[test]
 fn scan_plan_shape() {
-    let dev = owl_shared::env_reader::parse_or("OWL_TEST_DEVICE", 0);
+    if owl_cuda::test_device_bdf().is_none() {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    }
+    let dev = owl_cuda::test_device_ordinal();
     let mut res = TestRes::new(dev);
     println!("mode,t,ctx,nb_pages,padded,cta_tile_q,split,int_bytes");
     for graph in [0u32, 1u32] {

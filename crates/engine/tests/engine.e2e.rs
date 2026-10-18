@@ -100,7 +100,7 @@ async fn e2e_body() {
     // ── env 一次读(缺失 = 整档 skip;不再往场景里散读) ──
     // §18:CPU mock 档**无卡**也可入档(OWL_CPU_MOCK 在 + 无 OWL_TEST_DEVICE
     // ⇒ 只跑 CPU 档场景,GPU 场景一概不触)。
-    let dev = owl_shared::env_reader::parse::<usize>("OWL_TEST_DEVICE");
+    let dev = owl_cuda::test_device_ordinal_opt();
     let cpu_only = dev.is_none() && owl_shared::env_reader::flag("OWL_CPU_MOCK");
     if dev.is_none() && !cpu_only {
         eprintln!("skip: OWL_TEST_DEVICE 未设(engine e2e 整档跳过)");

@@ -17,6 +17,10 @@ fn pattern(n: usize) -> Vec<u8> {
 
 #[tokio::test]
 async fn dtoh_at_reads_the_requested_span() {
+    if owl_cuda::test_device_bdf().is_none() {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    }
     let (tx, rx) = std::sync::mpsc::channel::<owl_cuda::Command>();
     let server = GpuServer::new(rx, DeviceSelector::Ordinal(test_device_ordinal()), None);
     let mut client = GpuClient::new(tx);
@@ -67,6 +71,10 @@ async fn dtoh_at_reads_the_requested_span() {
 /// `HtodBatch` 写回后逐段读出必须一致。
 #[tokio::test]
 async fn dtoh_batch_and_htod_batch_round_trip() {
+    if owl_cuda::test_device_bdf().is_none() {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    }
     let (tx, rx) = std::sync::mpsc::channel::<owl_cuda::Command>();
     let server = GpuServer::new(rx, DeviceSelector::Ordinal(test_device_ordinal()), None);
     let mut client = GpuClient::new(tx);
@@ -75,7 +83,7 @@ async fn dtoh_batch_and_htod_batch_round_trip() {
         .expect("spawn server");
     client.sync().await.expect("sync");
 
-    let dev = client.alloc(Dtype::U32, N / 4, "probe").await.expect("alloc");
+    let _dev = client.alloc(Dtype::U32, N / 4, "probe").await.expect("alloc");
     let all = pattern(N);
     let a = client.alloc(Dtype::U32, 2048 / 4, "probe").await.expect("a"); // 两段:0..1024 与 1024..2048
     let b = client.alloc(Dtype::U32, 4096 / 4, "probe").await.expect("b"); // 留出偏移余量

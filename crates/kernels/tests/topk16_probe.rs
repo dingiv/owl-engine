@@ -274,7 +274,7 @@ fn topk16_bench() {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
     }
-    let dev_ord = owl_shared::env_reader::parse::<usize>("OWL_TEST_DEVICE").unwrap_or(1);
+    let dev_ord = owl_cuda::test_device_ordinal_opt().unwrap_or(1);
     let ctx = CudaContext::new(dev_ord).expect("ctx");
     ctx.bind_to_thread().expect("bind");
     let stream = ctx.default_stream();
@@ -337,8 +337,8 @@ fn topk16_bench() {
     let nparts = 16usize;
     let np_i = nparts as i32;
     let npart_buf = ROWS * nparts * BLK * K; // 逐线程直写形态(W 变体)需全量槽
-    let mut d_pv = unsafe { stream.alloc::<f32>(npart_buf) }.unwrap();
-    let mut d_pi = unsafe { stream.alloc::<f32>(npart_buf) }.unwrap();
+    let d_pv = unsafe { stream.alloc::<f32>(npart_buf) }.unwrap();
+    let d_pi = unsafe { stream.alloc::<f32>(npart_buf) }.unwrap();
     let pv_p = d_pv.device_ptr(&stream).0;
     let pi_p = d_pi.device_ptr(&stream).0;
     let cfg_split = LaunchConfig { grid_dim: ((ROWS * nparts) as u32, 1, 1), block_dim: (BLK as u32, 1, 1), shared_mem_bytes: 0 };
@@ -358,8 +358,8 @@ fn topk16_bench() {
         for (kname, need_w) in [("diag_split_new_f16", false), ("diag_split_old_f16", false)] {
             let _ = need_w;
             let buf = ROWS * np * K;
-            let mut d_pv = unsafe { stream.alloc::<f32>(buf) }.unwrap();
-            let mut d_pi = unsafe { stream.alloc::<f32>(buf) }.unwrap();
+            let d_pv = unsafe { stream.alloc::<f32>(buf) }.unwrap();
+            let d_pi = unsafe { stream.alloc::<f32>(buf) }.unwrap();
             let pv_p = d_pv.device_ptr(&stream).0;
             let pi_p = d_pi.device_ptr(&stream).0;
             let n_pi = np as i32;
@@ -396,7 +396,7 @@ fn topk16_bench() {
     let f_merge2 = base_mod.load_function("owl_topk16_merge_f16").unwrap();
     for &np in &[4usize, 8, 12, 16, 24, 32] {
         let buf = 2 * ROWS * np * K;
-        let mut d_tmp = unsafe { stream.alloc::<f32>(buf) }.unwrap();
+        let d_tmp = unsafe { stream.alloc::<f32>(buf) }.unwrap();
         let tmp_p = d_tmp.device_ptr(&stream).0;
         let n_pi = np as i32;
         let cfg_s = LaunchConfig { grid_dim: ((ROWS * np) as u32, 1, 1), block_dim: (BLK as u32, 1, 1), shared_mem_bytes: 0 };
@@ -429,8 +429,8 @@ fn topk16_bench() {
     println!("=== E) merge 单核隔离(grid={ROWS})===");
     for &np in &[4usize, 16, 64] {
         let buf = ROWS * np * K;
-        let mut d_pv = unsafe { stream.alloc::<f32>(buf) }.unwrap();
-        let mut d_pi = unsafe { stream.alloc::<f32>(buf) }.unwrap();
+        let d_pv = unsafe { stream.alloc::<f32>(buf) }.unwrap();
+        let d_pi = unsafe { stream.alloc::<f32>(buf) }.unwrap();
         let pv_p = d_pv.device_ptr(&stream).0;
         let pi_p = d_pi.device_ptr(&stream).0;
         let n_pi = np as i32;

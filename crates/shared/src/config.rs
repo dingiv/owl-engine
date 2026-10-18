@@ -210,9 +210,10 @@ pub struct RuntimeCfg {
     pub gpu_min_free_ratio: f64,
     pub max_seq: usize,
     pub prefill_chunk: usize,
-    /// 测试域设备序(不入 toml;测试入口自填)
+    /// **测试设备门控值**(不入 toml;测试入口自填):`OWL_TEST_DEVICE` 的 **BDF**
+    /// (如 `41:00.0`)。`Some` = GPU 门已过。**CUDA 序号禁用**(序会漂)。
     #[serde(skip)]
-    pub test_device: Option<usize>,
+    pub test_device: Option<String>,
     /// cli 上行端点(不入 toml;cli 入口自填)
     #[serde(skip)]
     pub server_url: Option<String>,

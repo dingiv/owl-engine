@@ -47,8 +47,8 @@ fn case_overlay_path(file: &str, name: &str) -> Option<PathBuf> {
 /// **用例配置注入**(宏 wrapper 唯一调用点)。
 ///
 /// `name` = 用例函数名;`file` = 宏调用点的 `file!()`(推导 overlay 路径)。
-/// `runtime.test_device` 无条件回填 `OWL_TEST_DEVICE`(serde(skip) 不入 toml,
-/// 设备序只能来自 env —— GPU 门控据此判跳)。
+/// `runtime.test_device` 无条件回填 `OWL_TEST_DEVICE` 的 **BDF**(serde(skip) 不入
+/// toml;CUDA 序号禁用 —— GPU 门控据此判跳)。
 ///
 /// # Panics
 /// - `OWL_TEST_CONF` 指向的文件缺失 / 解析失败 / 含账外键 ⇒ **响亮 panic**;
@@ -86,7 +86,7 @@ pub fn case_config(name: &str, file: &str) -> OwlConfig {
         panic!("[owl_test] 用例 {name} 配置加载失败(层:{layers:?}): {e}")
     });
     // 设备序回填(隐藏 env 的另一半;GPU 门控判据)
-    cfg.runtime.test_device = crate::env_reader::parse::<usize>("OWL_TEST_DEVICE");
+    cfg.runtime.test_device = crate::device::test_device_bdf();
     cfg
 }
 
@@ -135,9 +135,10 @@ mod tests {
         drop(_c);
         std::fs::remove_file(&path).ok();
         // 臂 3:设备序回填
-        let _d = crate::env_reader::EnvGuard::set("OWL_TEST_DEVICE", "2");
+        let _d = crate::env_reader::EnvGuard::set("OWL_TEST_DEVICE", "41:00.0");
         let cfg3 = case_config("env_conf_dev", "crates/shared/src/testkit/case.rs");
-        assert_eq!(cfg3.runtime.test_device, Some(2), "OWL_TEST_DEVICE 回填");
+        assert_eq!(cfg3.runtime.test_device.as_deref(), Some("41:00.0"), "OWL_TEST_DEVICE(BDF)回填");
+        assert_eq!(crate::device::test_device_bdf().as_deref(), Some("41:00.0"), "唯一门控读取面");
     }
 
     /// 退役键 = 响亮 panic(带迁移指引)。

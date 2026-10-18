@@ -173,9 +173,10 @@ pub fn skip_note() {
     eprintln!("skip: OWL_HF_PARITY=1 未开(首次会同步 torch CPU 轮)");
 }
 
-/// GPU 后端门控(OWL_TEST_DEVICE 已设;与 owl-cuda 测试同一约定)
+/// GPU 后端门控(`OWL_TEST_DEVICE` 已设且为 **BDF**;与 owl-cuda 同一约定)。
+/// CUDA 序号形态在解析层被拒(`resolve_ordinal_by_bdf`)。
 pub fn gpu_enabled() -> bool {
-    owl_shared::env_reader::flag("OWL_TEST_DEVICE")
+    owl_shared::device::test_device_bdf().is_some()
 }
 
 /// GPU face(owl-cuda actor;门控已过才调用)

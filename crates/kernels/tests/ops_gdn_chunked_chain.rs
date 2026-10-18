@@ -513,7 +513,7 @@ fn gdn_chunked_nt_decomposition_identity() {
     };
 
     // ── 输入块(整块 + 8 段切片各一套)──
-    let mut run_arm = |rt: &mut Box<dyn KernelFamily>, res: &mut TestRes, exec: &mut Exec,
+    let run_arm = |rt: &mut Box<dyn KernelFamily>, res: &mut TestRes, exec: &mut Exec,
                        t: usize, slice: Option<usize>| -> (Vec<f32>, Vec<f32>) {
         // slice = Some(i) → 取第 i 段 T_SM 行;None → 整块 T_BIG 行
         let (off_qk, rows_qk, off_v, rows_v, off_h, rows_h) = match slice {

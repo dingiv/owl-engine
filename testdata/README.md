@@ -41,7 +41,8 @@ max_seq = 2048
 
 ## 2. 设备与数据
 
-- **设备**：唯一 env `OWL_TEST_DEVICE`（CUDA 序号；未设 = GPU 用例自动 skip）。
+- **设备**：唯一 env `OWL_TEST_DEVICE`，值 = **PCI BDF**（如 `41:00.0`；用 `nvidia-smi --query-gpu=pci.bus_id` 查）。
+  未设 = GPU 用例 auto-skip；**纯数字（CUDA 序号）会被响亮拒绝**。
 - **数据**（检查点 / 金标）：暂按各自 env（`OWL_AWQ27B_DIR` 等）或仓库内路径；
   拟收进资源清单（设计见 `docs/arch/owl-test-macro.md` §七）。
 
