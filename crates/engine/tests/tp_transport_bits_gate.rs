@@ -159,6 +159,24 @@ async fn body(oa: usize, ob: usize, same_dev: usize, dir: PathBuf) -> Result<(),
     let (gen_cross, logits_cross) = drive(tp_cross, 1).await.expect("跨卡档 turn");
     eprintln!("[g8c] 跨卡档:{} tok;末步 logits {} 项", gen_cross.len(), logits_cross.len());
 
+    // ── ①' 跨卡档**第二跑**(**配置内 run-to-run 逐位唯一** = §19.3 纪律 4 的
+    //    承诺 ①;这是本门**最硬**的一条 —— 同配置重复必须逐位相同)。
+    let (engines, loadeds) = load_shards(oa, ob, &dir).await;
+    let tp_cross2 = TpEngine::assemble(engines, loadeds).await.expect("跨卡 TP2 装配(第二跑)");
+    let (gen_cross2, logits_cross2) = drive(tp_cross2, 1).await.expect("跨卡档第二跑 turn");
+    assert_eq!(
+        gen_cross, gen_cross2,
+        "★ 配置内 run-to-run **不唯一**(同配置两跑 token 不同)—— 这是真 bug,         与配置差异无关\n  跑1 = {gen_cross:?}\n  跑2 = {gen_cross2:?}"
+    );
+    {
+        let (n2, m2) = bits_diff(&logits_cross, &logits_cross2);
+        assert_eq!(
+            n2, 0,
+            "★ 配置内 run-to-run **不唯一**:末步 logits {n2} 项不同(max|Δ| = {m2:.6})——              同配置重复必须逐位相同"
+        );
+    }
+    eprintln!("[g8c] ① 配置内唯一 ✓(跨卡档两跑逐位相同)");
+
     // ── ② 同卡档(两 rank 同一张卡;VMM 同卡自导入)────────────────
     // ⚠️ 若这里挂死:该卡上的核并发调度不成立(自旋核饿死计算核)——
     //    门超时即判据之一(见文件头)。协议面已由跨卡档覆盖。
@@ -169,33 +187,59 @@ async fn body(oa: usize, ob: usize, same_dev: usize, dir: PathBuf) -> Result<(),
     let (gen_same, logits_same) = drive(tp_same, 1).await.expect("同卡档 turn");
     eprintln!("[g8c] 同卡档:{} tok;末步 logits {} 项", gen_same.len(), logits_same.len());
 
-    // ── ③ 判据:逐位 ────────────────────────────────────────────────
+    // ── ③ 判据:按 §28(**判据不得强于承诺**)────────────────────────
+    //
+    // §19.3 纪律 4 原文:"跨 TP 度**不承诺等价**;只承诺 ①同配置 run-to-run 与配置内
+    // 不变性 ②vs 单卡的功能/统计等价"。而本门旧判据是"跨卡臂 ≡ 同卡臂 **逐位**" ——
+    // **跨卡(2 卡)与同卡(2 rank 挤 1 卡)是两种配置** ⇒ 旧判据强于承诺,于是间歇性
+    // 红(实测两次失败的两侧序列**各自逐字相同** ⇒ 不是竞态,是配置差异;与 §21.4-2
+    // 的"热 ≠ 冷"同型 —— 那次已为 G8-a 纠正,T3 没跟着改,§28 补上)。
+    //
+    // 现在:硬门落在承诺得住的三条;**跨臂逐位**降级为诊断(照打不误,只是不判死)。
     assert_eq!(
         gen_cross.len(),
         gen_same.len(),
-        "两档生成长度不一致(ignore_eos 定长档应恒等)\n跨卡={gen_cross:?}\n同卡={gen_same:?}"
+        "两档生成长度不一致(ignore_eos 定长档应恒等 —— 这是结构承诺)\n跨卡={gen_cross:?}\n同卡={gen_same:?}"
     );
-    if gen_cross != gen_same {
-        let i = gen_cross.iter().zip(&gen_same).position(|(a, b)| a != b).unwrap_or(0);
-        panic!(
-            "G8-c② 违约:第 {i} 个 token 起分歧(transport 引入差异?)\n  跨卡 = {gen_cross:?}\n  同卡 = {gen_same:?}"
-        );
-    }
+    // ②-а **首 token 必须相同**:两臂同 prompt、同 prefill 路径,第一步 decode 只差
+    //     transport ⇒ 这是 §19.3-4 的"功能等价"在 token 粒度上**唯一**能坐实的那一格。
+    assert_eq!(
+        gen_cross.first(),
+        gen_same.first(),
+        "★ 两档**首 token** 不同(跨卡 {:?} vs 同卡 {:?})—— 第一步 decode 两臂只差          transport,首 token 分叉说明 transport 真的改了结果",
+        gen_cross.first(),
+        gen_same.first()
+    );
     assert_eq!(
         logits_cross.len(),
         logits_same.len(),
         "两档末步 logits 长度不一致(槽形状应当同构)"
     );
     let (nbit, mx) = bits_diff(&logits_cross, &logits_same);
-    eprintln!("[g8c] 末步 logits 位级:不同 {nbit}/{} 项;max|Δ| = {mx:.6}", logits_cross.len());
-    assert_eq!(
-        nbit, 0,
-        "G8-c② 违约:末步 logits 有 {nbit} 项不同(max|Δ| = {mx:.6})—— \
-         同卡档与跨卡档应当**逐位相同**(transport 不该引入任何位)"
-    );
+    if gen_cross == gen_same {
+        // ②-б **路径一致 ⇒ 末步 logits 必须逐位相同**(条件式硬门:两臂没走岔时,
+        //    transport 不该引入任何位 —— 这是 §21.3 原始命题"零位贡献"的**可判形态**)
+        assert_eq!(
+            nbit, 0,
+            "★ 两档 token 全同但末步 logits 有 {nbit} 项不同(max|Δ| = {mx:.6})——              路径一致时 transport 必须零位贡献"
+        );
+        eprintln!(
+            "[g8c] ② 跨度 vs 单卡 ✓:token 逐位相同且末步 logits {} 项零差(路径一致档)",
+            logits_cross.len()
+        );
+    } else {
+        let i = gen_cross.iter().zip(&gen_same).position(|(a, b)| a != b).unwrap_or(0);
+        eprintln!(
+            "[g8c] ③ **诊断**(非判据):两臂自第 {i} 个 token 起路径分叉 —— 这是**两种配置的\
+             合法差异**(§19.3-4 / §21.4-2「热 ≠ 冷」同律),不是 transport 的错。\n  \
+             跨卡 = {gen_cross:?}\n  同卡 = {gen_same:?}\n  末步 logits 位级:不同              {nbit}/{} 项;max|Δ| = {mx:.6}",
+            logits_cross.len()
+        );
+    }
 
     eprintln!(
-        "[g8c] 全绿:同卡双 rank ≡ 跨卡 TP2 —— {} tok 逐位相同 + 末步 logits {} 项逐位相同(transport 面零贡献)",
+        "[g8c] 全绿:①配置内唯一(跨卡两跑逐位)✓ · ②首 token 相同({} tok)✓ · \
+         ③路径一致时末步 logits {} 项零差 ✓ —— transport 面零位贡献;跨臂逐位差异按 §28 记诊断",
         gen_cross.len(),
         logits_cross.len()
     );

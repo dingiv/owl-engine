@@ -920,6 +920,23 @@ impl GpuServer {
                 //    不该出现 Owned 死块,释放会烙 MEM_FREE 节点)
                 Command::Free { ids, ack } => self.handle_free(ids, ack),
                 Command::Close { ack } => ack.send(Ok(())), // 防御性幂等回执
+                // ★ **设备内 D2D 搬运进图**(2026-10-17;AR 的 CE 对端交换要在图里跑)。
+                // 判据(逐条核过,不是"顺手放行"):
+                // · CUDA **允许** D2D 异步拷贝作内存搬移节点(`cudaGraphAddMemcpyNode`)
+                //   —— 它不破坏捕获;
+                // · 本命令**无同步、无回读**(只是 `memcpy_dtod_async` 入 COMPUTE 流)
+                //   ⇒ 不触"捕获期禁同步/回读"那条;
+                // · 两端块由 `handle_copy_block` 内的 `block_ptr` 解析 ⇒
+                //   **图引用租约自动登记**(`GraphRefs` 的窗口集就是这么收的,见其注)
+                //   —— 这条正是白名单存在的**真正理由**,而它已经满足;
+                // · 与相邻核**同流保序**(memcpy 节点与 Launch 节点同在 COMPUTE 流)。
+                // ⚠️ 新增节点类型 ⇒ 必须有"图回放 ≡ eager 逐位"的判据:
+                //   门的落点 = `owl-comm` 的 `ar_stress_gate::ar_stress_graph`(20 轮回放
+                //   逐位)+ `ar_transport_gate` 的 G3。
+                Command::CopyBlock { src, src_off_bytes, dst, dst_off_bytes, len_bytes, ack } => {
+                    self.handle_copy_block(src, src_off_bytes, dst, dst_off_bytes, len_bytes, ack)
+                }
+                Command::CopyBatch { copies, ack } => self.handle_copy_batch(copies, ack),
                 other => Self::reject(other, self.sink),
             };
         }
