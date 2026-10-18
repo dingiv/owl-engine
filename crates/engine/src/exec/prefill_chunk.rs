@@ -74,7 +74,7 @@ impl ChunkTables {
         fi_face: bool,
         xqa_face: bool,
         past: Option<(&[u32], usize)>,
-    ) -> Self {
+    ) -> Result<Self> {
         let seq = |start: usize, n: usize| -> Vec<f32> {
             (0..n).map(|i| (start + i) as f32).collect()
         };
@@ -110,8 +110,8 @@ impl ChunkTables {
         // ⚠️ **传 `base_for_len`(视图等效偏移),不是 `base`** —— 子集档下两者差
         // `base − recall_pos`(随 ctx 增长);传错的后果 = 注意力窗口 = 全 ctx
         // (O(ctx)/chunk ⇒ 总 O(ctx²))+ 末页读越界(2026-10-19 定谳)。
-        let fi = fi_face.then(|| fi_tables_view(base_for_len, t, &tbl, page));
-        Self {
+        let fi = if fi_face { Some(fi_tables_view(base_for_len, t, &tbl, page)?) } else { None };
+        Ok(Self {
             ids: ids.iter().map(|v| *v as f32).collect(),
             pos: seq(base, t),
             slots,
@@ -124,7 +124,7 @@ impl ChunkTables {
                 seq_len: (base + t) as u32,
                 mask: causal_mask_words(t),
             }),
-        }
+        })
     }
 
     /// **桶布局表(M2b)**:槽面按布局 `t_pad` 行铸,但**语义全真** —— 真行真值,
@@ -150,7 +150,7 @@ impl ChunkTables {
         gdn_slot_v: usize,
         fi_face: bool,
         dump_slot_base: usize,
-    ) -> Self {
+    ) -> Result<Self> {
         debug_assert!(t_real >= 1 && t_real <= t_pad, "桶几何非法:{t_real}/{t_pad}");
         let mut out = Self {
             ids: vec![0.0; t_pad],
@@ -159,7 +159,7 @@ impl ChunkTables {
             lens: vec![0.0; t_pad],
             gdn_slot: gdn_slot_v as f32,
             seq_cu: vec![0.0, t_real as f32],
-            fi: fi_face.then(|| fi_tables(base, t_real, bt_chain, page)),
+            fi: if fi_face { Some(fi_tables(base, t_real, bt_chain, page)?) } else { None },
             xqa: None,
         };
         for i in 0..t_pad {
@@ -175,14 +175,14 @@ impl ChunkTables {
                 out.lens[i] = (base + t_real) as f32;
             }
         }
-        out
+        Ok(out)
     }
 }
 
 /// FlashInfer 表四件套(`nb_used` 按本 chunk **实际覆盖页数**截断;
 /// 桶布局下传 `t = t_real` —— 设备表读的 `qo_len` 必须与 `kv_len` 同口径,
 /// 否则因果窗口错位 `t_pad - t_real`(见设计 §4.1c 推论 A 的落地注记)。
-fn fi_tables(base: usize, t: usize, bt_chain: &[u32], page: usize) -> FiTables {
+fn fi_tables(base: usize, t: usize, bt_chain: &[u32], page: usize) -> Result<FiTables> {
     let ctx_total = base + t;
     let nb = bt_chain.len();
     // ⚠️ **块链可能长于「本 chunk 已覆盖页数」** —— 块表按**全 prompt**
@@ -191,31 +191,52 @@ fn fi_tables(base: usize, t: usize, bt_chain: &[u32], page: usize) -> FiTables {
     // 在 nb 过大时下溢(debug panic)/回绕成巨值(release → FI plan 拿着
     // 巨 last_len 越界读 indices 数组外)。2026-10-13 由
     // gpu_longctx_fi_direct_gate 首跑暴露。
-    let nb_used = ctx_total.div_ceil(page).min(nb).max(1);
-    FiTables {
+    // ⚠️ **响亮拒(2026-10-19 审查)**:`.min(nb)` 只防了"链**过长**"(2026-10-13
+    // 修过),没防"链**过短**" —— 那时 `nb_used < ceil(ctx/page)` ⇒
+    // `last_len = ctx_total − (nb_used−1)·page > page`(结构非法)⇒ 核拿巨 last_len
+    // 越界读 `indices` 数组外(与旧 bug 同一失败模式,方向相反)。内部不变量失守
+    // 一律结构化 Err 上抛(仓规:不许静默夹取)。
+    let need = ctx_total.div_ceil(page.max(1)).max(1);
+    if nb < need {
+        return Err(ModelError::Msg(format!(
+            "FI 表失守:块链 {nb} 页 < 本 chunk 需要 {need} 页(base={base} t={t} page={page} ctx={ctx_total});\
+             旧行为会静默夹成 last_len > page ⇒ 核越界读页链"
+        )));
+    }
+    let nb_used = need;
+    Ok(FiTables {
         q_cu: vec![0, t as u32],
         indices: bt_chain[..nb_used].to_vec(),
         indptr: vec![0, nb_used as u32],
         last_len: vec![(ctx_total - (nb_used - 1) * page) as u32],
         nb_used,
-    }
+    })
 }
 
 /// FI 表四件套(**子集档**;B-3e-2 第 3 项):页链 = 传入的 `tbl`(可能 = 子集),
 /// `last_len` = 末页在本**视图**内的有效行数(= 视图 token 数 − (nb_used−1)·page)。
-fn fi_tables_view(base: usize, t: usize, tbl: &[u32], page: usize) -> FiTables {
+fn fi_tables_view(base: usize, t: usize, tbl: &[u32], page: usize) -> Result<FiTables> {
     // 视图内 token 数:本 chunk 之前覆盖的页 × page 中**属于视图的部分**
     // —— 由调用方把 base 换成"视图起点等效偏移"后即 ctx_total 口径自洽
     let ctx_total = base + t;
     let nb = tbl.len();
-    let nb_used = ctx_total.div_ceil(page).min(nb).max(1);
-    FiTables {
+    // 同 `fi_tables`:链短于覆盖页数 = 账本失守 ⇒ 响亮拒(子集档的 `tbl` 是
+    // **视图页链**,其长度必须与"视图 token 数 ÷ 页"自洽 —— 契约见
+    // `coverage.rs::past_view_of` 与本文件 §等效偏移注)。
+    let need = ctx_total.div_ceil(page.max(1)).max(1);
+    if nb < need {
+        return Err(ModelError::Msg(format!(
+            "FI 视图表失守:视图页链 {nb} 页 < 视图需要 {need} 页(base={base} t={t} page={page} ctx={ctx_total})"
+        )));
+    }
+    let nb_used = need;
+    Ok(FiTables {
         q_cu: vec![0, t as u32],
         indices: tbl[..nb_used].to_vec(),
         indptr: vec![0, nb_used as u32],
         last_len: vec![(ctx_total - (nb_used - 1) * page) as u32],
         nb_used,
-    }
+    })
 }
 
 /// XQA SPEC_DEC 因果位掩码:`[t, ceil(t/32)]` u32,行 i 的 bit 0..i 置 1。
@@ -400,7 +421,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             gdn_slot_v,
             self.pool.fi_face,
             dump_slot,
-        );
+        )?;
         // 注:FI 四件在**图路**走输入槽(`BucketGraph::replay` 里按布局长度装填)
         // —— 池里那套持久块(`StatePool.fi_tables`)是 **eager 路**的表,这里不写
         // (写了也没人读:图烘的是槽指针)。GDN 序列表不同:图烘的就是池块,
@@ -669,7 +690,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             self.pool.fi_face,
             self.env.attn.xqa_prefill,
             past_view.as_ref().map(|(pages, tokens)| (pages.as_slice(), *tokens)),
-        );
+        )?;
         // **B-3e-2 第 3 项**:子集档 ⇒ 把本 chunk 的"过去表"写进池里的视图块,
         // 并把它当作 `block_tables`(eager prefill 无图,块叶直接可用)。
         let bt_leaf = match past_view.as_ref() {

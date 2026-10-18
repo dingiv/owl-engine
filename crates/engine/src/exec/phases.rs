@@ -349,7 +349,17 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 let s = self.bank.sessions.session(sid)?;
                 s.block_table.clone()
             };
-            let nb_used = ctx_total.div_ceil(page).min(bt_chain.len()).max(1);
+            // ⚠️ **响亮拒(2026-10-19 审查)**:`.min(bt_chain.len())` 只防"链过长",
+            // 链过短时 `nb_used < ceil(ctx/page)` ⇒ `fi_last_len > page`(结构非法)
+            // ⇒ 核越界读页链。与 prefill 侧 `fi_tables` 同型,一并改成结构化 Err。
+            let need = ctx_total.div_ceil(page.max(1)).max(1);
+            if bt_chain.len() < need {
+                return Err(ModelError::Msg(format!(
+                    "decode FI 表失守:块链 {} 页 < 本步需要 {need} 页(pos={pos} page={page} ctx={ctx_total})",
+                    bt_chain.len()
+                )));
+            }
+            let nb_used = need;
             let mut idx = vec![0f32; self.dev.pool.nb];
             for (i, b) in bt_chain.iter().take(nb_used).enumerate() {
                 idx[i] = f32::from_bits(*b);
