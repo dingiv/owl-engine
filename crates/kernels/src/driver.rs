@@ -582,7 +582,11 @@ pub mod gdn {
                 DType::BF16 | DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => unimplemented!("GDN 族无 U32 变体"),
             },
             shape: Shape {
-                grid: ((rows * value_dim / group_size) as u32, 1, 1),
+                // **一 warp 一单元、一 block 8 个 warp**(2026-10-19):旧形一 block 一单元
+                // 在 group_size=128 时一半线程闲置 + 每单元两次 `__syncthreads`;
+                // 27B prefill chunk 1024 ⇒ 49152 块/发(实测只跑到带宽 1/4,块调度绑死)。
+                // 块数 = ceil(单元数 / 8);blockDim 仍 256(SENTINEL_1D)。
+                grid: ((rows * value_dim / group_size).div_ceil(8) as u32, 1, 1),
                 ..SENTINEL_1D
             },
         }
@@ -1736,7 +1740,13 @@ mod tests {
     fn row_shapes_and_suffixes() {
         assert_eq!(gdn::l2norm(DType::F32, 7).name, "owl_gdn_l2norm_f32");
         assert_eq!(gdn::l2norm(DType::F32, 7).shape.grid, (7, 1, 1));
-        assert_eq!(gdn::norm_act(DType::F16, 4, 2048, 128).shape.grid, (64, 1, 1));
+        // **2026-10-19 norm_act 改一 warp 一单元(8 单元/块)** ⇒ 块数 = ceil(单元数/8)
+        // (单元 = rows·value_dim/group_size;旧形块数 = 单元数,一 block 一单元)
+        assert_eq!(gdn::norm_act(DType::F16, 4, 2048, 128).shape.grid, (8, 1, 1));
+        // 向上取整律(单元数不整除 8 时不得漏算末尾单元)
+        assert_eq!(gdn::norm_act(DType::F16, 1, 128, 128).shape.grid, (1, 1, 1));
+        assert_eq!(gdn::norm_act(DType::F16, 9, 128, 128).shape.grid, (2, 1, 1));
+        assert_eq!(gdn::norm_act(DType::F16, 1024, 6144, 128).shape.grid, (6144, 1, 1));
         // N1(2026-10-14):grid = (ceil(d/256), tiles=ceil(tokens/32), batch);
         // tiles 只由 tokens 决定 ⇒ 几何自证(含 0/32/33 边界与 batch 维)
         assert_eq!(gdn::conv_fwd(DType::F16, 6144, 0, 1).shape.grid, (24, 1, 1));
