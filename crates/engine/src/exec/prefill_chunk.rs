@@ -426,6 +426,30 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             face.write_block_f32_on(owl_iface::contract::UpStream::Compute, &gt.table, 0, &f32bits)
                 .await?;
         }
+        // ── **FI plan 表同步**(2026-10-19;桶路 × 单图档)──
+        // `fi_plan_restore = false` ⇒ 图**不**自携 plan 表(捕获窗内不烘 memcpy)
+        // ⇒ `int_ws` 是**共享区**,桶回放前必须由宿主把**本桶**的表刷回去;
+        // 否则读到的是别的写者(解码步/上一条 eager 分块)留下的表。
+        // 与 decode/verify 同律(`exec::phases` / `exec::spec`),参数取**本桶的
+        // 烘焙口径**:`total_rows = t_pad`(图内 FI 节点的标量),`ctx_total = t_pad`
+        // (桶捕获时同一值 —— 该 key 在 capture warmup 已算好并登记 graph_owned)。
+        // `fi_plan_restore = true`(缺省)时整段跳过:桶图自携表,旧行为逐字节不变。
+        if bg.needs_plan_sync {
+            let d = self.pool.dims;
+            let spec = owl_iface::contract::FiPlanSpec {
+                t: t_pad,
+                // **本块的真实 ctx 上界**(= 本块末 token 的绝对位置;与 decode/verify
+                // 的 `pos+1` / `ctx_total_fi` 同义)。用 `t_pad` 是错的:FI 表的
+                // 工作项数随 ctx 走,表比真 ctx 小时长上下文会读错 KV(实测:
+                // 7860 tok needle 答错、4460 tok 正确 —— 与 ctx 阈值吻合)。
+                ctx_total: base + t,
+                hq: d.hq,
+                hkv: d.hkv,
+                hd: d.hd,
+                page: self.pool.page,
+            };
+            bg.plan.face_mut().fi_plan_sync(spec).await?;
+        }
         // ── 回放(1 条 graph_launch)──
         // B7:桶路也记 `prefill.chunk`(总时,host 口径;与 eager 同 tag ⇒
         // 运维/仪表盘不丢行);`prefill.graph` 另记"回放发射"那一段。

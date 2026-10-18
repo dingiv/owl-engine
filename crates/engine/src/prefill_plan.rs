@@ -123,6 +123,8 @@ pub(crate) struct BucketGraph<D: DeviceClient> {
     pub(crate) gdn_slot_baked: Option<usize>,
     /// FI 页链槽的声明容量(= 池管理面页数;`fi_indices` 槽长度)
     fi_nb: usize,
+    /// 回放前是否要宿主刷 FI plan 表(= `!fi_plan_restore`;图不自携表时必需)
+    pub(crate) needs_plan_sync: bool,
     /// 回放次数(证据面:桶被真用了吗;测试/运维读取)
     replays: usize,
     pub(crate) plan: GraphPlan<D>,
@@ -248,6 +250,9 @@ pub(crate) struct BucketBoot<'a> {
     pub(crate) taps: usize,
     /// 桶阶梯(t_pad 升序;档位 → `ladder()`)
     pub(crate) ladder: &'static [usize],
+    /// `[dispatch] fi_plan_restore`(2026-10-19):false ⇒ 桶图**不自携** FI plan 表,
+    /// 回放前由引擎窗外 `fi_plan_sync` 刷(与 decode/verify 同律)。
+    pub(crate) fi_plan_restore: bool,
 }
 
 /// 桶族(RunningEngine 持有;空 = 档位 off/未启用)
@@ -581,6 +586,7 @@ impl<D: DeviceClient> PrefillBuckets<D> {
             dtype,
             gdn_slot_baked: slot_baked,
             fi_nb: nb,
+            needs_plan_sync: !boot.fi_plan_restore,
             replays: 0,
             plan,
         })

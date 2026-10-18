@@ -216,6 +216,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                         dims: boot.dims,
                         taps: boot.spec.dflash_tap_count,
                         ladder: crate::prefill_plan::ladder(boot.knobs.prefill_bucket),
+                        fi_plan_restore: boot.knobs.fi_plan_restore,
                     };
                     let buckets = crate::prefill_plan::PrefillBuckets::capture(&pf, &boot_pg).await;
                     owl_shared::log_info!(

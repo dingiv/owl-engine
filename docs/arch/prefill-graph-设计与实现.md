@@ -834,3 +834,59 @@ prefill_bucket = "off"      # prefill **专属**档位(缺省 off = 今天行为
 5. **新(二轮·显存,§4.3b)**:走哪条?① **S-1 小桶裁桶**(45 MiB,零代码)② **S-1+S-2 惰性+LRU**
    (45–85 MiB,需 `warmup:false` + 固定 slab 档)③ **S-1+S-3 三档覆盖全区间**(255 MiB,零新机制)。
    注:显存换的是 KV 上下文容量(0.69 × 池 = ~11.5k token),而 agent 面实测 prompt 达 12.7k ⇒ 这笔账偏向"小桶"。
+
+---
+
+## 9. 解禁:`prefill_bucket` × `fi_plan_bake`(2026-10-19)—— **W5 之后重新可用**
+
+### 9.1 为什么曾被锁死
+
+2026-10-18 的 W5(FI 单图,见 `图档-FI-单图-设计与施工.md`)把 `fi_plan_bake` 升成 FI 臂的
+**强制前置**(防"占位 ctx 烘表"的静默错值),而它与桶路在 `validate` 里写成**互斥**:
+- 单图档:host 是 plan 表唯一权威(`fi_plan_restore = false` + 每步 `fi_plan_sync`);
+- 桶图档(M2b):plan **自携**进图(`fi_plan_restore = true`,捕获期烘 memcpy)。
+两条承载没接上 ⇒ `prefill_bucket ≠ off` 直接拒启。生产档因此一直跑 eager prefill。
+
+### 9.2 接线(本轮)
+
+1. **解禁**:`validate` 删互斥检查,保留 `fi_plan_bake ⇒ !fi_plan_restore`;
+2. **桶路接 sync**:`EngineKnobs += fi_plan_restore`;`BucketBoot`/`BucketGraph += needs_plan_sync`
+   (= `!restore`,捕获期定);`exec::prefill_chunk` 在**每次桶回放前**调
+   `fi_plan_sync(t = t_pad, ctx_total = base + t_real, …)`(与 decode 的 `pos+1`、
+   verify 的 `ctx_total_fi` 同律);
+3. `restore = true`(缺省)时整段跳过 ⇒ 旧行为逐字节不变。
+
+### 9.3 ★ 关键坑(必须写进任何后续实现)
+
+**`ctx_total` 必须是"本块真实 ctx"(= `base + t_real`),不能用桶的 `t_pad`。**
+FI plan 的工作项按 **ctx 页数**枚举(`nb_pages = ctx_total / page`);用 `t_pad`(=512)
+铸出的表只看前 16 页 ⇒ **长 ctx 读错 KV**。实测:4460 tok needle 对、**7860 tok 答错**
+(输出 `2`,eager 为 `55021`),且与前缀缓存无关(隔离过)。修后
+needle 1.6k/4.9k/7.9k/9.3k 全对。
+
+> 附带的"假快":错 plan 少枚举工作项 = 少干活 ⇒ @8192 读 1386~1399;修后 1358。
+
+### 9.4 实测(单 3090 Ti;std 五点三轮;同二进制;唯一差别 `prefill_bucket`)
+
+| ctx | eager | geobuckets | Δ | TTFT(geo) |
+|---:|---:|---:|---:|---:|
+| 512 | 1387.7 | 1423.7 | +2.6% | 362 ms |
+| 1024 | 1417.0 | 1432.7 | +1.1% | 717 ms |
+| 2048 | 1396.1 | 1417.3 | +1.5% | 1447 ms |
+| 4096 | 1356.1 | 1394.0 | +2.8% | 2940 ms |
+| **8192** | **1310.6** | **1358.0** | **+3.6%** | **6034 ms(−3.5%)** |
+
+- 逐轮:@8192 geo = 1201/1359/1357,**无冷启爬坡**(eager = 1148/1311/1311 且单点可爬到 1356);
+- 正确性:needle 4 档全对 + 17/30 tok 与 eager **逐字相同**;
+- 代价:桶族 slab **+203 MiB**(总 296.5)⇒ `GRAPH_SLAB_BUDGET` 262 → **320 MiB**;
+  ⚠️ 同轮稍后阶梯尾档 **+t1024**(chunk 1024 生产档)把桶族 Σ 抬到 **502.3 MiB**
+  ⇒ 预算最终定在 **640 MiB**(总治理 400 → 778 MiB);见 `state.rs` 与 §9.6 追注;
+  桶命中(std 相)~100%;`pad > 4` 行的尾块自动让位 eager。
+
+### 9.5 已知缺口
+
+1. **`gpu_prefill_bucket_matches_eager`(0.8B)在干净 main 上就红**
+   (`CUDA_ERROR_ILLEGAL_ADDRESS` @ `record_tail(stream 1)`;stash 对照确认预存)。
+   ⇒ 桶路当前**没有绿的硬等价门**,本轮的证据是 27B 真机探针 + std;
+2. plan sync 首轮成本 ~1.5 ms/块(同 ctx 的第二轮起缓存命中)⇒ 可做请求级 plan 预热;
+3. 1400 t/s 未达(1358):差头寸 = 非 GEMM ~52 ms/块(attention 18.2 + GDN/FLA ~20 + norms/silu ~12)。

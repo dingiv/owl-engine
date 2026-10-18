@@ -3435,6 +3435,7 @@ async fn gpu_prefill_bucket_matches_eager() {
         ordinal: usize,
         b: PrefillBucket,
         gdn_slots: usize,
+        fi_plan_restore: bool,
     ) -> RunningEngine<owl_cuda::GpuClient> {
         // `EnvProvider::default()` 是 attest=false(诊断 A/B 保留位);生产走
         // `from_config` ⇒ `from_dispatch` 恒真(2026-10-13 用户令)⇒ 本测显式打开。
@@ -3448,6 +3449,7 @@ async fn gpu_prefill_bucket_matches_eager() {
             knobs: EngineKnobs {
                 prefill_bucket: b,
                 gdn_slots,
+                fi_plan_restore,
                 sampler_enabled: false,
                 env,
                 ..EngineKnobs::default()
@@ -3478,7 +3480,7 @@ async fn gpu_prefill_bucket_matches_eager() {
         gen_session(running, None, prompt, n).await
     }
     // ① 桶档
-    let mut g = boot_bucket(&dir, ordinal, PrefillBucket::Geobuckets, 8).await;
+    let mut g = boot_bucket(&dir, ordinal, PrefillBucket::Geobuckets, 8, true).await;
     let buckets = g.dev.graphs.prefill.captured_t_pads();
     eprintln!("[m2b] 桶捕获:{:?}(summary = {})", buckets, g.dev.graphs.prefill.summary());
     assert!(
@@ -3493,11 +3495,27 @@ async fn gpu_prefill_bucket_matches_eager() {
     assert!(!used.is_empty(), "桶一个都没回放 ⇒ 图路没生效(本测在测 eager vs eager)");
     assert!(used.contains(&512), "本 prompt(chunk=512)应命中 t512 桶,实测 {used:?}");
     // ② eager 档(同模型同配置,只关桶)
-    let mut e = boot_bucket(&dir, ordinal, PrefillBucket::Off, 8).await;
+    let mut e = boot_bucket(&dir, ordinal, PrefillBucket::Off, 8, true).await;
     let out_eager = gen(&mut e, &prompt, 24).await;
     eprintln!("[m2b] 桶档 {out_graph:?}\n[m2b] eager {out_eager:?}");
     assert!(!out_graph.trim().is_empty(), "桶档空回答");
     assert_eq!(out_graph, out_eager, "桶图与 eager 的贪心输出必须逐字相同(M2b 跨档门)");
+
+    // ②-b **host plan sync 腿**(2026-10-19:桶路 × `fi_plan_restore = false`)
+    // 图不烘表 ⇒ 每个桶回放前由引擎窗外 `fi_plan_sync` 刷本桶表(int_ws 共享区)。
+    // 判据同②:与 eager 逐字相同;并验"桶真回放"(否则退化成 eager vs eager)。
+    let mut g2 = boot_bucket(&dir, ordinal, PrefillBucket::Geobuckets, 8, false).await;
+    let out_sync = gen(&mut g2, &prompt, 24).await;
+    let counts2 = g2.dev.graphs.prefill.replay_counts();
+    eprintln!("[m2b-sync] 桶回放次数:{counts2:?}");
+    assert!(
+        counts2.iter().any(|(_, n)| *n > 0),
+        "host-sync 腿桶一个都没回放 ⇒ 图路没生效"
+    );
+    assert_eq!(
+        out_sync, out_eager,
+        "桶图(host plan sync)与 eager 的贪心输出必须逐字相同"
+    );
 
     // ③ **同格复用腿**(定位卷:`26-10-17-prefill桶图-二次会话污染-定位实录.md`;
     //    结案见同卷 §结案)。
@@ -3513,7 +3531,7 @@ async fn gpu_prefill_bucket_matches_eager() {
     // 是被绕过的路径,现在真跑)。
     let mut reuse: Vec<(String, String, usize)> = Vec::new();
     for b in [PrefillBucket::Geobuckets, PrefillBucket::Off] {
-        let mut g = boot_bucket(&dir, ordinal, b, 1).await;
+        let mut g = boot_bucket(&dir, ordinal, b, 1, true).await;
         let t1 = gen_session(&mut g, Some(1), &prompt, 16).await;
         let n1: usize = g.dev.graphs.prefill.replay_counts().iter().map(|(_, n)| *n).sum();
         let t2 = gen_session(&mut g, Some(2), &prompt, 16).await;

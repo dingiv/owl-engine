@@ -1323,23 +1323,18 @@ impl OwlConfig {
         // ⇒ 图自携的表按该上界枚举工作项;若真实 ctx 超过它,运行期算出的 chunk 数
         // 会超过表里的工作项数 ⇒ partial 行 stride 错(设计卷 §2.2 的 V1 形态,
         // 实测 T=8 max|Δ|=1.39)。**只许上界 ≥ 任何可能 ctx**,这里 fail-fast。
-        // bake 档与 prefill 桶图**互斥**:桶图的 FI 表靠"图自携 restore",
-        // 而 bake 档全进程关掉了 restore(host 每步 `fi_plan_sync` 为唯一权威);
-        // 桶图没有那条刷新面 ⇒ 会读到别人的表。要同时用 = 先给桶路也接 sync。
         // 单图烘 plan 档必须"图不烘表"(否则回放那次 memcpy 把同步进去的表盖掉
         // ⇒ 又回 inert 表)。**拒启**而不是自动纠正:静默改语义比拒启危险。
+        //
+        // ✅ 2026-10-19 解禁:`[graph] prefill_bucket` × `[dispatch] fi_plan_bake`
+        // 不再是互斥对 —— **桶路也接了窗外 `fi_plan_sync`**(桶回放前由引擎把
+        // 本桶的 plan 表刷回共享 `int_ws`;见 `exec::prefill_chunk` 的回放点)。
+        // 于是两条 FI 表承载(图自携 restore / host 每步 sync)对桶图都成立,
+        // 由 `fi_plan_restore` 唯一选择:`true` = 桶自携(旧行为),`false` = host 刷。
         if self.dispatch.fi_plan_bake.is_some() && self.dispatch.fi_plan_restore {
             return Err(
                 "[dispatch] fi_plan_bake 需要 fi_plan_restore = false \
                  (单图档的 plan 表由 host 每步 `fi_plan_sync` 刷新,图内不得再烘自携 restore)"
-                    .to_string(),
-            );
-        }
-        if self.dispatch.fi_plan_bake.is_some()
-            && self.graph.prefill_bucket != crate::config::PrefillBucket::Off
-        {
-            return Err(
-                "[graph] prefill_bucket 与 [dispatch] fi_plan_bake **互斥**(待桶路接 plan sync 后解禁)"
                     .to_string(),
             );
         }

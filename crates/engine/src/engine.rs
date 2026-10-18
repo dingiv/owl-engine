@@ -190,6 +190,11 @@ pub struct EngineKnobs {
     pub fi_cuda_graph: bool,
     /// **decode 单图烘 plan 上界**(`[dispatch] fi_plan_bake`;None = 现状 piecewise)
     pub fi_plan_bake: Option<usize>,
+    /// **图自携 FI plan restore**(`[dispatch] fi_plan_restore`;缺省 true):
+    /// true = 捕获窗内把本 plan 表烘成图内 memcpy(桶图旧行为);
+    /// false = 图不烘表 ⇒ **host 是唯一权威**,每个图回放前窗外 `fi_plan_sync`
+    /// (decode/verify 既有;2026-10-19 起 prefill 桶也走这条)。
+    pub fi_plan_restore: bool,
     /// TS 探针槽(原 OWL_TS_PROBE)
     pub ts_probe: bool,
     /// GDN 槽数覆写(缺省 8;原 OWL_MAX_ACTIVE_TURNS)
@@ -257,6 +262,7 @@ impl Default for EngineKnobs {
             prefill_bucket: owl_shared::config::PrefillBucket::Off,
             fi_cuda_graph: false,
             fi_plan_bake: None,
+            fi_plan_restore: true,
             ts_probe: false,
             gdn_slots: 8,
             snap_max: 4,
@@ -536,6 +542,7 @@ impl EngineKnobs {
             // 哨兵:0 = 取 max_seq(FI 调度表的图档上界 = 单序列 ctx 的天然上界;
             // 这样档位改 max_seq 时上界跟着走,不必两处手改)
             fi_plan_bake: cfg.dispatch.fi_plan_bake.map(|b| if b == 0 { cfg.runtime.max_seq } else { b }),
+            fi_plan_restore: cfg.dispatch.fi_plan_restore,
             ts_probe: cfg.dispatch.ts_probe,
             // S2b 正名:env 新名优先,旧名 `OWL_GDN_SLOTS` 兼容(旧档脚本不炸)
             gdn_slots: owl_shared::env_reader::parse("OWL_MAX_ACTIVE_TURNS")
