@@ -810,6 +810,7 @@ mod tests {
         let lctx = crate::module::LoaderCtx {
             dtype: Dtype::F16,
             shard: 1,
+            slice_id: 0,
             device_repack: false,
             verify: false,
             debug_tap: false,
@@ -830,7 +831,7 @@ mod tests {
             let d = single.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
             eprintln!("[vis-mr2] f16 单根 blk_00 对金标 max|Δ| = {d:.3e}");
         }
-        let vals = crate::interpreters::eval_ops_multi(&roots, &mut gpu).await.expect("eval_multi(gpu)");
+        let vals = crate::interpreters::eval_ops_multi(&roots, &mut gpu, None).await.expect("eval_multi(gpu)");
 
         for (i, b) in vals.iter().take(cfg.depth).enumerate() {
             let n = tb.rows * cfg.hidden;
@@ -903,7 +904,7 @@ mod tests {
             .collect();
         let tower = VisionTower::new(cfg);
         let mut gpu = crate::testkit::gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
         crate::interpreters::eval_load(&tower, &mut gpu, &Src::from(weights), &lctx)
             .await
             .expect("塔 f16 装载");
@@ -916,7 +917,7 @@ mod tests {
         // 27 层全部中间块留活 ⇒ 实测 7.8 GB 常驻,第二轮即撞池碎片化 OOM。
         let trees: Vec<TensorOps> = roots.iter().map(|t| (*t).clone()).collect();
         let refs: Vec<&TensorOps> = trees.iter().collect();
-        let _ = crate::interpreters::eval_ops_multi_scoped_env(&refs, &mut gpu, crate::env::EnvProvider::default())
+        let _ = crate::interpreters::eval_ops_multi_scoped_env(&refs, &mut gpu, crate::env::EnvProvider::default(), None)
             .await
             .expect("warmup");
         gpu.sync().await.expect("sync");
@@ -929,7 +930,7 @@ mod tests {
         for _ in 0..3 {
             gpu.sync().await.expect("sync");
             let t0 = std::time::Instant::now();
-            let _ = crate::interpreters::eval_ops_multi_scoped_env(&refs, &mut gpu, crate::env::EnvProvider::default())
+            let _ = crate::interpreters::eval_ops_multi_scoped_env(&refs, &mut gpu, crate::env::EnvProvider::default(), None)
                 .await
                 .expect("bench");
             gpu.sync().await.expect("sync"); // ⚠️ server 是异步提交 ⇒ 必须 sync 才含设备时间
@@ -1020,7 +1021,7 @@ mod tests {
         let (weights, cfg) = visual_weights();
         let mut gpu = crate::testkit::gpu_client().await;
         let tower = VisionTower::new(cfg);
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
         crate::interpreters::eval_load(&tower, &mut gpu, &Src::from(weights), &lctx)
             .await
             .expect("塔 f16 装载");
@@ -1032,7 +1033,7 @@ mod tests {
             let inputs = tb.inputs(&pv, Dtype::F16).expect("inputs(f16)");
             let out = tower.forward(&inputs);
             let roots: Vec<&TensorOps> = vec![&out.pre_merger, &out.merged];
-            let vals = crate::interpreters::eval_ops_multi(&roots, &mut gpu).await.expect("eval(gpu)");
+            let vals = crate::interpreters::eval_ops_multi(&roots, &mut gpu, None).await.expect("eval(gpu)");
             for (i, (name, want_key)) in
                 [("pre_merger", format!("h.{tag}.pre_merger")), ("merged", format!("h.{tag}.merged"))]
                     .iter()
@@ -1092,7 +1093,7 @@ mod tests {
         let (weights, cfg) = visual_weights();
         let mut cpu = owl_cpu::CpuFace::new();
         let tower = VisionTower::new(cfg);
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F32, shard: 1, device_repack: false, verify: false, debug_tap: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F32, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
         crate::interpreters::eval_load(&tower, &mut cpu, &Src::from(weights), &lctx)
             .await
             .expect("塔 f32 装载");
@@ -1151,7 +1152,7 @@ mod tests {
         let mut roots: Vec<&TensorOps> = out.blocks.iter().collect();
         roots.push(&out.pre_merger);
         roots.push(&out.merged);
-        let blocks = crate::interpreters::eval_ops_multi(&roots, &mut face).await.expect("eval_multi");
+        let blocks = crate::interpreters::eval_ops_multi(&roots, &mut face, None).await.expect("eval_multi");
 
         for (i, b) in blocks.iter().take(cfg.depth).enumerate() {
             let n = tb.rows * cfg.hidden;

@@ -1026,7 +1026,7 @@ mod tests {
         src.insert("kernel_projection".into(), gen(2 * TAPS * groups * hidden, 1.0));
 
         let mut gpu = gpu_client().await;
-        crate::interpreters::eval_load(&conv, &mut gpu, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false })
+        crate::interpreters::eval_load(&conv, &mut gpu, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false })
             .await
             .expect("conv 装载");
 
@@ -1103,7 +1103,7 @@ mod tests {
         src.insert("successor_codebook".into(), b_tab.clone());
 
         let mut gpu = gpu_client().await;
-        crate::interpreters::eval_load(&sel, &mut gpu, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false })
+        crate::interpreters::eval_load(&sel, &mut gpu, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false })
             .await
             .expect("selector 装载");
 
@@ -1267,7 +1267,7 @@ mod tests {
                 fc.chain(self.0.hidden_norm().layout(_ctx))
             }
         }
-        crate::interpreters::eval_load(&FcOnly(&draft), &mut gpu, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false })
+        crate::interpreters::eval_load(&FcOnly(&draft), &mut gpu, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false })
             .await
             .expect("fc 装载");
 
@@ -1362,7 +1362,7 @@ mod tests {
                 self.0.layout(ctx).chain(self.0.layout_lm_head(ctx).unwrap())
             }
         }
-        let lctx = LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false };
+        let lctx = LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
         let mut gpu = gpu_client().await;
         crate::interpreters::eval_load(&EmbLoad(&embed), &mut gpu, &esrc, &lctx)
             .await
@@ -1434,7 +1434,7 @@ mod tests {
             refs.push(&fc0_root);
             let face = &mut gpu;
             let enc_outs =
-                crate::interpreters::eval_ops_multi(&refs, face).await.expect("encode");
+                crate::interpreters::eval_ops_multi(&refs, face, None).await.expect("encode");
             for (tag, o) in [("memory", &enc_outs[enc_roots.len()]), ("fc0", &enc_outs[enc_roots.len() + 1])] {
                 let mut mb = vec![0u8; 20 * 5120 * 2];
                 gpu.dtoh(o, &mut mb).await.expect("dtoh");
@@ -1469,7 +1469,7 @@ mod tests {
         roots.push(logits_t.clone()); // 全量 logits(视图根会透传底层块)
         roots.push(drafts_t.clone());
         let refs: Vec<&TensorOps> = roots.iter().collect();
-        let outs = crate::interpreters::eval_ops_multi(&refs, &mut gpu)
+        let outs = crate::interpreters::eval_ops_multi(&refs, &mut gpu, None)
             .await
             .expect("单遍求值");
         let mut harvested: Vec<Vec<f32>> = Vec::with_capacity(outs.len());
@@ -1614,7 +1614,7 @@ mod tests {
                 ("slice1[7]".into(), logits_t.clone()),
             ];
             let rs: Vec<&TensorOps> = variants.iter().map(|(_, t)| t).collect();
-            let outs2 = crate::interpreters::eval_ops_multi(&rs, &mut gpu)
+            let outs2 = crate::interpreters::eval_ops_multi(&rs, &mut gpu, None)
                 .await
                 .expect("gemm 诊断");
             for ((name, t), o) in variants.iter().zip(&outs2) {
@@ -1654,7 +1654,7 @@ mod tests {
             // eval3:hidden 再求值一次(第三次),看 hidden 块内容是否随求值漂移
             {
                 let rs3: Vec<&TensorOps> = vec![&hidden_t, &logits_t];
-                let outs3 = crate::interpreters::eval_ops_multi(&rs3, &mut gpu)
+                let outs3 = crate::interpreters::eval_ops_multi(&rs3, &mut gpu, None)
                     .await
                     .expect("eval3");
                 let hb = &outs3[0];
@@ -1702,7 +1702,7 @@ mod tests {
         use crate::module::LoaderCtx;
         use owl_iface::DeviceClient as _;
         let mut gpu = gpu_client().await;
-        let lctx = LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false };
+        let lctx = LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
         let draft = DFlash2Draft::new_with_plan(
             5120, 17408, 32, 8, 128, 5, 1e-6, 248320, QuantPlan::W4A16, false,
         );
@@ -1890,7 +1890,7 @@ mod tests {
                 roots.push(draft.debug_fci(i, &taps_all[i], &ctx));
             }
             let refs: Vec<&TensorOps> = roots.iter().collect();
-            let outs = crate::interpreters::eval_ops_multi(&refs, &mut gpu)
+            let outs = crate::interpreters::eval_ops_multi(&refs, &mut gpu, None)
                 .await
                 .expect("合埣 eval");
             for (i, o) in outs.iter().enumerate() {
@@ -1969,7 +1969,7 @@ mod tests {
         src.insert("q_norm".into(), gen(hd, 26.0));
 
         let mut gpu = gpu_client().await;
-        crate::interpreters::eval_load(&attn, &mut gpu, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false })
+        crate::interpreters::eval_load(&attn, &mut gpu, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false })
             .await
             .expect("attn 装载");
 
@@ -1991,7 +1991,7 @@ mod tests {
             block_tables: bt,
         };
         let rope = Rope::new(64, hd, hd, 10_000.0).expect("rope");
-        crate::interpreters::eval_load(&rope, &mut gpu, &rope.tables(), &LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false })
+        crate::interpreters::eval_load(&rope, &mut gpu, &rope.tables(), &LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false })
             .await
             .expect("rope 表");
 
@@ -2270,7 +2270,7 @@ mod tests {
         let mut src: HashMap<String, Vec<f32>> = HashMap::new();
         src.insert("base_kernel".into(), base.clone());
         src.insert("kernel_projection".into(), w_proj.clone());
-        crate::interpreters::eval_load(&conv, &mut gpu, &src, &LoaderCtx { dtype: Dtype::BF16, shard: 1, device_repack: false, verify: false, debug_tap: false })
+        crate::interpreters::eval_load(&conv, &mut gpu, &src, &LoaderCtx { dtype: Dtype::BF16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false })
             .await
             .expect("conv bf16 装载");
 
@@ -2348,7 +2348,7 @@ mod tests {
         src2.insert("hidden_projection".into(), w2.clone());
         src2.insert("predecessor_codebook".into(), a_tab.clone());
         src2.insert("successor_codebook".into(), b_tab.clone());
-        crate::interpreters::eval_load(&sel, &mut gpu, &src2, &LoaderCtx { dtype: Dtype::BF16, shard: 1, device_repack: false, verify: false, debug_tap: false })
+        crate::interpreters::eval_load(&sel, &mut gpu, &src2, &LoaderCtx { dtype: Dtype::BF16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false })
             .await
             .expect("selector bf16 装载");
         let hidden_h = gen((rows + 1) * rank, 6.0);
@@ -2447,7 +2447,7 @@ mod tests {
         use crate::module::LoaderCtx;
         use owl_iface::DeviceClient as _;
         let mut gpu = gpu_client().await;
-        let lctx = LoaderCtx { dtype: Dtype::BF16, shard: 1, device_repack: false, verify: false, debug_tap: false };
+        let lctx = LoaderCtx { dtype: Dtype::BF16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
         let draft = DFlash2Draft::new_with_plan_dt(
             5120, 17408, 32, 8, 128, 5, 1e-6, 248320, QuantPlan::W4A16, Dtype::BF16, false,
         );
@@ -2469,7 +2469,7 @@ mod tests {
         };
         let (_hq, hkv, hd, hidden) = (32usize, 8usize, 128usize, 5120usize);
         let rope = Rope::new(262_144, hd, hd, 1.0e7).expect("rope");
-        crate::interpreters::eval_load(&rope, &mut gpu, &rope.tables(), &LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false })
+        crate::interpreters::eval_load(&rope, &mut gpu, &rope.tables(), &LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false })
             .await
             .expect("rope 表");
 
@@ -2537,7 +2537,7 @@ mod tests {
                 let s = std::time::Instant::now();
                 let roots = draft.encode_kv(&mem, &pos_t, &kvs, &rope, &ctx);
                 let refs: Vec<&TensorOps> = roots.iter().collect();
-                let _ = crate::interpreters::eval_ops_multi(&refs, &mut gpu).await?;
+                let _ = crate::interpreters::eval_ops_multi(&refs, &mut gpu, None).await?;
                 gpu.sync().await.expect("sync");
                 t.push(s.elapsed());
             }

@@ -36,6 +36,10 @@ use std::time::{Duration, Instant};
 pub struct LoadOpts {
     /// 目标 dtype(计算档事实;`None` = 由调用方/spec 决定,必给)
     pub dtype: crate::contract::Dtype,
+    /// **切片总数**(S4 ②;1 = 单卡。与 `slice_id` 配对 = 确定性分片协议)
+    pub shard: usize,
+    /// **本切片 id**(S4 ②;`0..shard`)
+    pub slice_id: usize,
     /// 设备重排(量化族;**已裁决结果**;`None` = 能力自述裁决)
     pub device_repack: Option<bool>,
     /// 装载校验(整块回读对账)
@@ -49,6 +53,8 @@ impl LoadOpts {
     pub fn new<D: DeviceClient>(face: &D, dtype: crate::contract::Dtype) -> Self {
         Self {
             dtype,
+            shard: 1,
+            slice_id: 0,
             device_repack: Some(
                 crate::module::RepackPath::resolve(None, face.device_kernels()).is_device(),
             ),
@@ -60,14 +66,15 @@ impl LoadOpts {
     /// 非量化/固定档(无设备重排 + 零探针):裸 safetensors f16 直拷、
     /// W4A16-CPU 重排等"不需要能力裁决"的装载点。
     pub fn plain(dtype: crate::contract::Dtype) -> Self {
-        Self { dtype, device_repack: Some(false), verify: false, debug_tap: false }
+        Self { dtype, shard: 1, slice_id: 0, device_repack: Some(false), verify: false, debug_tap: false }
     }
 
     /// 装载 ctx(旋钮 → LoaderCtx;唯一产地)
     pub fn ctx(&self) -> crate::module::LoaderCtx {
         crate::module::LoaderCtx {
             dtype: self.dtype,
-            shard: 1,
+            shard: self.shard,
+            slice_id: self.slice_id,
             device_repack: self.device_repack.unwrap_or(false),
             verify: self.verify,
             debug_tap: self.debug_tap,
@@ -177,7 +184,7 @@ where
 /// 解释器自己调用层钩子并为它传递 LoaderCtx —— 使用者只给层与源。
 ///
 /// ```rust,ignore
-/// eval_load(&model, face, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false }).await?;
+/// eval_load(&model, face, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false }).await?;
 /// ```
 pub async fn eval_load<M, D, S>(
     layer: &M,
@@ -190,10 +197,16 @@ where
     D: DeviceClient,
     S: WeightSource + ?Sized,
 {
-    let want = layer.layout(ctx); // 声明:层产出需求清单(ctx 引用透传)
+    let mut want = layer.layout(ctx); // 声明:层产出需求清单(ctx 引用透传)
+    // ★ S4 ② **确定性分片**(用户裁决 2026-10-16):按 `(slice_id, shard)` 就地
+    // 改写 want 形状(→ 分片形状;DeviceRearrange 的 rows/cols 同步),并把源
+    // 包成"只读本片"的视图 —— 6 条装载路径**零改动**(它们只经 WeightSource 取数)。
+    // `shard = 1` 时 pass 返回空表、源直通(零开销)。
+    let spans = crate::formats::shard::build_shard_pass(&mut want, ctx)?;
+    let sharded = crate::formats::shard::ShardedSource::new(src, spans);
     let tap = if ctx.debug_tap { Some(std::sync::Mutex::new(Box::new(StderrTap) as Box<dyn LoadTap>)) } else { None }; // 观测:ctx.debug_tap 门控,缺省零开销
     let t0 = std::time::Instant::now();
-    let manifest = eval_want(&want, face, src, tap.as_ref(), ctx.verify).await?;
+    let manifest = eval_want(&want, face, &sharded, tap.as_ref(), ctx.verify).await?;
     // 上载栅栏:全部 DMA 落定后方可进入计算域(upload_pinned 入队即回执,
     // 完成语义由本栅栏一次总代价兜底)
     let t_fence = std::time::Instant::now();
@@ -1402,6 +1415,8 @@ mod generic_entry_tests {
         let mut face = owl_cpu::CpuFace::new();
         let opts = LoadOpts {
             dtype: spec.dtype,
+            shard: 1,
+            slice_id: 0,
             device_repack: Some(false),
             verify: false,
             debug_tap: false,
@@ -1541,6 +1556,8 @@ mod generic_entry_tests {
         let mut face = crate::testkit::gpu_client().await;
         let opts = LoadOpts {
             dtype: crate::contract::Dtype::F16,
+            shard: 1,
+            slice_id: 0,
             device_repack: Some(true), // 生产档(设备 marlin 重排)
             verify: false,
             debug_tap: false,

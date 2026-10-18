@@ -12,7 +12,9 @@ pub use owl_kernels::family::gdn_chunked::{
     table_bytes as gdn_table_bytes, table_host_bytes as gdn_table_host_bytes, BT as GDN_BT,
 };
 
-pub use owl_kernels::cu_sig::{cu_text, parse_cu_sig, source_defines};
+/// **GDN host 槽臂形状谓词**(单源在 `owl_kernels::family::gdn_chunked` 的验证
+/// 清单;engine 经本垫子消费 —— 与 `gdn_table_bytes` 同款"核词汇从核的家来")
+pub use owl_kernels::family::gdn_chunked::host_slot_arm_shape_ok;
 pub use owl_kernels::kernel::{
     kernel, kernel_with, launch_shape, lookup, source, with_pick, Kernel, LaunchShape,
 };

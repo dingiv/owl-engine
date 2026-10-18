@@ -156,6 +156,9 @@ pub fn resolve(req: OpReq) -> KernelPick {
         // Call 通道;名字 = family 单源,发射配置 = FOREIGN 哨兵直通)
         "gdn.chunked_delta" => gdn::chunked_delta(),
         "gdn.scalar_delta" => gdn::scalar_delta(),
+        // 通信族(TP2 S4;dtype ⇒ 三实例之一;族 runtime 自持单 block 几何 —— FOREIGN 哨兵)
+        "comm.ar_stage" => KernelPick { name: crate::family::comm::stage_entry(dt), shape: FOREIGN },
+        "comm.ar_reduce" => KernelPick { name: crate::family::comm::reduce_entry(dt), shape: FOREIGN },
         "ops.sigmoid" => ops::sigmoid(dt),
         "ops.add" => ops::add(dt),
         "ops.mul" => ops::mul(dt),

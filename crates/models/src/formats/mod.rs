@@ -25,6 +25,8 @@ pub mod load;
 pub mod mmap;
 pub mod qwen35;
 pub mod safetensors;
+/// **装载面分片化**(S4 ②;确定性分片协议:pass + 源包装)
+pub mod shard;
 pub mod spec;
 pub mod w4a16;
 

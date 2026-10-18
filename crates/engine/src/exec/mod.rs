@@ -14,6 +14,39 @@ use owl_models::TensorOps;
 use crate::graph_plan::f32b;
 use crate::scheduler::BeginPlan;
 
+/// **手工 join 两 future**(S4 ⑤-K3):引擎 lib **不依赖 async 运行时/组合器**
+/// (只有 owl-* + half)—— 两 rank 的设备半必须**并发推进**(见
+/// `phases.rs` 的 TP 驱动注:单边先行会让对端的 AR 撞 5s 自旋超时)。
+/// 语义 = `futures::join!`:两 future 都推进到完成,返回各自结果。
+pub(crate) async fn join2<A, B>(a: A, b: B) -> (A::Output, B::Output)
+where
+    A: std::future::Future,
+    B: std::future::Future,
+{
+    use std::task::Poll;
+    let (mut a, mut b) = (Box::pin(a), Box::pin(b));
+    let (mut ra, mut rb) = (None, None);
+    std::future::poll_fn(|cx| {
+        if ra.is_none() {
+            if let Poll::Ready(v) = a.as_mut().poll(cx) {
+                ra = Some(v);
+            }
+        }
+        if rb.is_none() {
+            if let Poll::Ready(v) = b.as_mut().poll(cx) {
+                rb = Some(v);
+            }
+        }
+        if ra.is_some() && rb.is_some() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    (ra.expect("join2 a"), rb.expect("join2 b"))
+}
+
 pub mod phases;
 
 /// **E4 接入面(声明;未实现)**——见 `docs/arch/三流事件序-设计与迁移.md` §6
@@ -60,8 +93,10 @@ fn mcnt(tag: &str, n: u64) {
 /// 事实计数器(E5-DF4 崩坏排查):per-boot 命名空间记事实值
 /// (token id / m / pos……counter 累计语义下每 tag 只记一次 = 事实值)
 fn mfact(boot: u64, fact: &str, v: u64) {
+    // **置值语义**(`counter_set`)而非累加:S4 ⑤-K3 起双 rank 会各写一次同名事实
+    // (AR 之后两侧同值 ⇒ 幂等);累加会让 63 位 checksum 当场溢出(实测定谳)。
     owl_shared::metrics::with_metrics_store(|s| {
-        s.counter_add(&format!("b{boot}.{fact}"), v, file!(), line!());
+        s.counter_set(&format!("b{boot}.{fact}"), v, file!(), line!());
     });
 }
 /// FNV-1a 64(逐层 checksum;与装载校验同款字批量混入)

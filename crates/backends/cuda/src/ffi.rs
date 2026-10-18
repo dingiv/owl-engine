@@ -118,6 +118,15 @@ pub mod sys {
             cuMemSetAccess, cuMemUnmap,
         };
     }
+
+    /// **P2P 能力查询**(S4 ⑤-K2 的 TP 分档输入;`owl_comm::peer::PeerCaps`
+    /// 的 `p2p_supported` 字段)。
+    ///
+    /// 准入(A4):设备级查询(无上下文/无流/零分配/零阻塞),只读一个 bool。
+    /// 证据:cudarc 0.19.10 `driver/sys/mod.rs:9342`。
+    pub mod p2p {
+        pub use cudarc::driver::sys::{cuDeviceCanAccessPeer, CUdevice, CUresult};
+    }
 }
 
 // ============================================================================
@@ -183,6 +192,24 @@ pub fn device_uuid(ordinal: usize) -> Result<[u8; 16], DriverError> {
     let dev = device_get(ordinal as i32)?;
     let u = device_get_uuid(dev)?;
     Ok(u.bytes.map(|b| b as u8))
+}
+
+/// **一对设备之间能否 P2P**(`cuDeviceCanAccessPeer`;S4 ⑤-K2 的 TP 分档输入)。
+///
+/// 语义 = “在 `a` 上分配的上下文能否访问 `b` 的内存”;设备级查询,
+/// **无需当前上下文/流**,boot 期一次(A2.4:热路径零探测)。
+/// 拿不到答案 = `Err`(不静默回退为 true/false —— 分档不许猜)。
+pub fn peer_supported(a: usize, b: usize) -> Result<bool, String> {
+    use cudarc::driver::sys::{cuDeviceCanAccessPeer, CUresult};
+    driver_init().map_err(|e| format!("driver_init: {e:?}"))?;
+    let da = device_get(a as i32).map_err(|e| format!("device_get({a}): {e:?}"))?;
+    let db = device_get(b as i32).map_err(|e| format!("device_get({b}): {e:?}"))?;
+    let mut can: std::ffi::c_int = 0;
+    let rc = unsafe { cuDeviceCanAccessPeer(&mut can, da, db) };
+    if rc != CUresult::CUDA_SUCCESS {
+        return Err(format!("cuDeviceCanAccessPeer({a},{b}) 失败: {rc:?}"));
+    }
+    Ok(can != 0)
 }
 
 /// 图句柄 safe 面(捕获产物;非 Send —— 钉死 actor 线程使用)

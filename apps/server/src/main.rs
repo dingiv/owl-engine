@@ -133,33 +133,42 @@ async fn main() {
     // ── 礼仪启动 + 优雅关停(2026-10-16)────────────────────────────────
     // 一卡一锁(文件名 = 卡 UUID):被占 ⇒ 立即响亮拒绝(不抢占、不 OOM);
     // 退出路径双保险:① 正常返回 ⇒ LockGuard::Drop ② 信号 ⇒ release(见下)。
-    let _gpu_lock = {
+    let _gpu_locks = {
+        let mut guards = Vec::with_capacity(config.devices.world());
         let port = config
             .bind
             .rsplit(':')
             .next()
             .and_then(|p| p.parse::<u16>().ok())
             .unwrap_or(0);
-        let info = owl_shared::gpu_lock::LockInfo::new(&config.device_uuid, port, None);
-        match owl_shared::gpu_lock::LockGuard::acquire(&info) {
-            Ok(g) => g,
-            Err(e) => {
-                owl_shared::log_error!("boot", "卡锁失败(拒绝启动): {e}");
-                eprintln!("[boot] 卡锁失败(拒绝启动): {e}");
-                std::process::exit(2);
+        for uuid in config.devices.uuids() {
+            let info = owl_shared::gpu_lock::LockInfo::new(uuid, port, None);
+            match owl_shared::gpu_lock::LockGuard::acquire(&info) {
+                Ok(g) => guards.push(g),
+                Err(e) => {
+                    // 已取到的锁显式还(`process::exit` 不走 Drop)
+                    for g in &guards {
+                        owl_shared::gpu_lock::release(g.path());
+                    }
+                    owl_shared::log_error!("boot", "卡锁失败(拒绝启动): {e}");
+                    eprintln!("[boot] 卡锁失败(拒绝启动): {e}");
+                    std::process::exit(2);
+                }
             }
         }
+        guards
     };
     owl_shared::log_info!(
         "boot",
         "已锁卡 {} (pid {};停服 = kill -TERM <pid>,自动清锁)",
-        config.device_uuid,
+        config.devices.uuids().join(" + "),
         std::process::id()
     );
     // 信号:SIGTERM/SIGINT ⇒ 清锁 + 有序退出(`process::exit` 不跑 Drop ⇒ 显式 release)
     {
-        let lock_path = _gpu_lock.path().to_path_buf();
-        let uuid = config.device_uuid.clone();
+        let lock_paths: Vec<std::path::PathBuf> =
+            _gpu_locks.iter().map(|g| g.path().to_path_buf()).collect();
+        let uuids = config.devices.uuids().join(" + ");
         tokio::spawn(async move {
             let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
                 Ok(s) => s,
@@ -176,8 +185,10 @@ async fn main() {
                 }
             };
             tokio::select! { _ = sigterm.recv() => {}, _ = sigint.recv() => {} }
-            owl_shared::log_info!("boot", "收到停止信号 ⇒ 优雅关停(释放卡锁 {uuid} + 显存)");
-            owl_shared::gpu_lock::release(&lock_path);
+            owl_shared::log_info!("boot", "收到停止信号 ⇒ 优雅关停(释放卡锁 {uuids} + 显存)");
+            for p in &lock_paths {
+                owl_shared::gpu_lock::release(p);
+            }
             std::process::exit(0);
         });
     }
@@ -311,6 +322,41 @@ async fn main() {
     }
 }
 
+/// 单 rank 引擎壳构造(设备绑定;装载走 [`load_shard`])。
+fn engine_of(
+    config: &ServerConfig,
+    ordinal: usize,
+) -> owl_engine::Result<owl_engine::Engine<owl_cuda::GpuClient>> {
+    owl_engine::Engine::new(owl_engine::EngineConfig {
+        device_ordinal: ordinal,
+        max_seq_tokens: config.max_seq,
+        prefill_chunk: config.prefill_chunk,
+        knobs: config.knobs.clone(),
+    })
+}
+
+/// 单 rank 分片装载(**单卡档 `world = 1` = 恒等分片**,与旧路径字节同源)。
+/// TP 档由 [`actor_main`] 逐 rank 调用(rank 序 = `devices` 序)—— 确定性分片
+/// 协议:两侧零协调,各自按同一张规则表切(切分见 `crates/engine/src/loader.rs`)。
+async fn load_shard(
+    config: &ServerConfig,
+    engine: &mut owl_engine::Engine<owl_cuda::GpuClient>,
+    rank: usize,
+    world: usize,
+) -> owl_engine::Result<owl_engine::LoadedModel> {
+    let mut loader = engine.loader().slice(rank, world);
+    match config.model_kind {
+        ModelKind::Awq27b => {
+            // 量化方案映射(唯一点 owl_engine::head_plan_of)
+            let head_plan = owl_engine::head_plan_of(config.head_quant);
+            loader
+                .load_qwen38_27b_awq(&config.model_dir, &config.model_dir, head_plan, config.w4a8)
+                .await
+        }
+        ModelKind::Qwen35_08b => loader.load_qwen35_0_8b(&config.model_dir).await,
+    }
+}
+
 /// actor 线程主:引擎生命周期 facade(装配)→ 事件泵(actor::run_actor)。
 /// 装配决策已在 config 落地 —— 本函数零 env 读取,档位分派 = 枚举查表。
 async fn actor_main(
@@ -321,28 +367,53 @@ async fn actor_main(
 ) {
     let built: owl_engine::Result<_> = async {
         let t0 = std::time::Instant::now();
-        let mut engine = owl_engine::Engine::new(owl_engine::EngineConfig {
-            device_ordinal: config.device,
-            max_seq_tokens: config.max_seq,
-            prefill_chunk: config.prefill_chunk,
-            knobs: config.knobs,
-        })?;
+        let world = config.devices.world();
+        let mut engine = engine_of(&config, config.devices.device())?;
         owl_shared::log_info!("boot", "设备绑定 {:.2}s", t0.elapsed().as_secs_f32());
-        let model = match config.model_kind {
-            ModelKind::Awq27b => {
-                // 量化方案映射(唯一点 owl_engine::head_plan_of)
-                let head_plan = owl_engine::head_plan_of(config.head_quant);
-                engine
-                    .loader()
-                    .load_qwen38_27b_awq(&config.model_dir, &config.model_dir, head_plan, config.w4a8)
-                    .await?
+        match world {
+            // ── 单卡档(原路径;分片 = 恒等)─────────────────────────────
+            1 => {
+                let model = load_shard(&config, &mut engine, 0, 1).await?;
+                owl_shared::log_info!("boot", "权重/tokenizer/rope 装载 {:.2}s", t0.elapsed().as_secs_f32());
+                let running = engine.run(model).await?;
+                owl_shared::log_info!("boot", "引擎装配(run)总计 {:.2}s", t0.elapsed().as_secs_f32());
+                Ok(running)
             }
-            ModelKind::Qwen35_08b => engine.loader().load_qwen35_0_8b(&config.model_dir).await?,
-        };
-        owl_shared::log_info!("boot", "权重/tokenizer/rope 装载 {:.2}s", t0.elapsed().as_secs_f32());
-        let running = engine.run(model).await?;
-        owl_shared::log_info!("boot", "引擎装配(run)总计 {:.2}s", t0.elapsed().as_secs_f32());
-        Ok(running)
+            // ── TP 档(S6 2026-10-17;v1 恒 world = 2)────────────────────
+            // 装配顺序有语义(见 `crates/engine/src/tp.rs` 模块头):
+            // 分片装载 → `TpEngine::assemble`(分档 / staging 对称握手**在建图
+            // 之前** / 每 rank `boot_rank`)→ `run`(rank0 束 = 主设备面,
+            // rank1 束 = peer)。**actor/HTTP 面零改动** —— `run()` 返回同型
+            // `RunningEngine<GpuClient>`。
+            2 => {
+                let ord = config.devices.ordinals();
+                let model0 = load_shard(&config, &mut engine, 0, 2).await?;
+                let mut engine1 = engine_of(&config, ord[1])?;
+                let model1 = load_shard(&config, &mut engine1, 1, 2).await?;
+                owl_shared::log_info!(
+                    "boot",
+                    "TP2 分片装载(rank0 ordinal {} / rank1 ordinal {}):{:.2}s",
+                    ord[0],
+                    ord[1],
+                    t0.elapsed().as_secs_f32()
+                );
+                let tp = owl_engine::TpEngine::assemble(vec![engine, engine1], vec![model0, model1])
+                    .await?;
+                owl_shared::log_info!(
+                    "boot",
+                    "TP2 装配完成(分档 + staging 握手 + 双 rank 图捕获):{:.2}s",
+                    t0.elapsed().as_secs_f32()
+                );
+                let running = tp.run()?;
+                owl_shared::log_info!("boot", "引擎装配(run)总计 {:.2}s", t0.elapsed().as_secs_f32());
+                Ok(running)
+            }
+            // world 的合法值由 config 层守(`resolve_tp_devices` 只放 2 项);
+            // 到这里 = 内部不变量破了 ⇒ 响亮拒,不静默降级成单卡
+            n => Err(owl_iface::contract::ModelError::Msg(format!(
+                "TP 档只支持 world = 2(设备束给了 {n} 项;config 层守门漏了)"
+            ))),
+        }
     }
     .await;
     let mut running = match built {

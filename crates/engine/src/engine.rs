@@ -30,13 +30,17 @@
 //! - [`crate::exec`]:执行器(设备侧照办)+ 采样收口 + decode_delta
 //! - [`crate::state`]:StatePool 设备状态块治理(KV 池/GDN 格/快照/块表)
 
+use std::sync::Arc;
+
 use owl_cuda::{DeviceSelector, GpuClient};
+use owl_models::layers::rope::Rope;
+use owl_models::model::{Model, ModelSpec};
 use owl_iface::contract::{DeviceClient, ModelError};
 
 use crate::graph_fleet::{FleetBoot, GraphFleet};
-use crate::loader::{LoadedModel, ModelLoader};
+use crate::loader::{LoadedModel, ModelLoader, RankModel};
 use crate::running::RunningEngine;
-use crate::spec_runtime::{SpecBootInput, SpecMode};
+use crate::spec_runtime::{SpecBootInput, SpecMode, SpecRuntime};
 use crate::state::{ModelDims, StatePool};
 
 type Result<T> = std::result::Result<T, ModelError>;
@@ -247,34 +251,126 @@ impl<D: DeviceClient + 'static> Engine<D> {
     /// 返回执行态引擎(请求入口)。
     // A3 同步隔离:引擎单线程模型(每卡一线程);Arc 仅作共享句柄,
     // 不跨线程发送 —— clippy 的 Send+Sync 建议不适用。
+    /// 模型交引擎:状态块/槽/Session 组建 + warmup —— 仍不跑任何 turn,
+    /// 返回执行态引擎(请求入口)。
+    // A3 同步隔离:引擎单线程模型(每卡一线程);Arc 仅作共享句柄,
+    // 不跨线程发送 —— clippy 的 Send+Sync 建议不适用。
     #[allow(clippy::arc_with_non_send_sync)]
-    pub async fn run(mut self, loaded: LoadedModel) -> Result<RunningEngine<D>> {
+    pub async fn run(self, loaded: LoadedModel) -> Result<RunningEngine<D>> {
         let t_run = std::time::Instant::now();
-        let s = self.cfg.max_seq_tokens;
-        let (hq, hkv, hd) = loaded.spec.full_heads;
-        let (nk, hk, nv, hv) = loaded.spec.gdn_heads;
+        let Engine { face, cfg } = self;
+        let (rm, tokenizer) = loaded.into_parts();
+        // 设备侧装配(单卡:tp = None;双 rank 走 `TpEngine` 的同一 `boot_rank`)
+        let dev = boot_rank(face, &cfg, rm, None, t_run).await?;
+        Ok(into_running(cfg, tokenizer, dev, None))
+    }
+
+    /// **拆件**(TP 双 rank 装配面:face/cfg 同源单持有;S4 ⑤-K2)
+    pub(crate) fn into_parts(self) -> (D, EngineConfig) {
+        (self.face, self.cfg)
+    }
+
+    /// 绑定设备序号(TP 探测面:UUID/BAR1/P2P 按 ordinal 查)
+    pub(crate) fn device_ordinal(&self) -> usize {
+        self.cfg.device_ordinal
+    }
+}
+
+/// **进执行态**(RunningEngine 组装):host 侧账本单一,设备束 = rank0(+可选
+/// peer rank1);单卡 `Engine::run` 与双 rank `TpEngine::run` 共用。
+pub(crate) fn into_running<D: DeviceClient>(
+    cfg: EngineConfig,
+    tokenizer: owl_models::tokenizer::Tokenizer,
+    dev: RankDev<D>,
+    peer: Option<RankDev<D>>,
+) -> RunningEngine<D> {
+    // 会话账 + 双块账房(E2b/E2c;session.rs:target 链前缀缓存挂载 +
+    // MTP 链独立页池 —— 复合构造一次落位)
+    let bank = crate::session::SessionBank::new(
+        dev.pool.nb,
+        dev.pool.page,
+        dev.pool.paged,
+        dev.spec_rt.mode == SpecMode::Mtp,
+        cfg.knobs.prefix_cache,
+        cfg.knobs.probes.debug,
+    );
+    RunningEngine {
+        probes: cfg.knobs.probes,
+        tok: tokenizer,
+        cfg,
+        sched_acc_ns: 0,
+        sched_cnt: 0,
+        boot_seq: BOOT_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1,
+        turns: crate::turn::TurnLedger::new(),
+        bank,
+        dev,
+        peer,
+    }
+}
+
+/// **rank 束**(S4 ⑤-K2/K3):一个 rank 的**全部**状态 —— 模型件 + 执行环境 +
+/// 运行态 + 状态池 + 图族。`Engine::run`(单卡)与 `TpEngine`(双 rank)
+/// 共用同一装配(`boot_rank`)与同一执行码(设备侧体 = 本类型的方法)。
+pub(crate) struct RankDev<D: DeviceClient> {
+    // ── 每 rank 的模型件(权重是分片的)──
+    /// 模型声明树
+    pub(crate) model: Arc<Model>,
+    /// rope 表(Replicate;每 rank 一份设备表)
+    pub(crate) rope: Rope,
+    /// **分片 spec**(形状单源;池与层同源)
+    pub(crate) spec: ModelSpec,
+    // ── 执行环境与运行态 ──
+    /// 解释器执行环境(池量化/几何/硬件档已合入)
+    pub(crate) env: owl_models::env::EnvProvider,
+    /// 引擎级 spec 运行态(模式/深度/草稿器)
+    pub(crate) spec_rt: SpecRuntime,
+    /// 张量并行上下文(本 rank 的;`None` = 单卡)—— 执行面所有求值调用
+    /// 把它传给解释器(行并行 allreduce 注入靠它;装配期填入,烘进每张图)
+    pub(crate) tp: Option<owl_models::module::TpCtx>,
+    /// 状态块池(KV/GDN/快照;按 dims 分配)
+    pub(crate) pool: StatePool,
+    /// 图族(捕获完成 / eager 降级;每 rank 自成一族)
+    pub(crate) graphs: GraphFleet<D>,
+}
+
+/// **rank 设备侧装配(唯实现)**:几何 → 环境 → spec 域 → KV 写者门 →
+/// 状态池 → 图族(warmup + 捕获)。
+///
+/// `tp` = 张量并行上下文(**必须在图捕获之前**传入 —— 捕获期拒三个 `Peer*`
+/// 命令;staging 的 VMM 握手由调用方在更早完成,见 `tp.rs`)。
+#[allow(clippy::arc_with_non_send_sync)]
+pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
+    mut face: D,
+    cfg: &EngineConfig,
+    rm: RankModel,
+    tp: Option<owl_models::module::TpCtx>,
+    t_run: std::time::Instant,
+) -> Result<RankDev<D>> {
+        let s = cfg.max_seq_tokens;
+        let (hq, hkv, hd) = rm.spec.full_heads;
+        let (nk, hk, nv, hv) = rm.spec.gdn_heads;
         let dims = ModelDims {
             hq, hkv, hd, nk, hk, nv, hv,
-            hidden: loaded.spec.hidden, dtype: loaded.spec.dtype,
+            hidden: rm.spec.hidden, dtype: rm.spec.dtype,
         };
 
         // 解释器执行环境(EnvProvider;E1.5 抽象):旋钮携带(入口经
         // from_config 填充)+ 硬件档自 iface op_env 合入(被动律:引擎 = 环境事实来源)
-        let mut env = self.cfg.knobs.env;
-        if let Some(oe) = self.face.op_env() {
+        let mut env = cfg.knobs.env;
+        if let Some(oe) = face.op_env() {
             env.hw = owl_models::env::HwEnv::Cuda(oe.hw.arch);
         }
         // 模型几何事实合入(2026-10-13 P4:算子准入的几何门对账面)——
         // 与 hw 同律:引擎 = 环境事实来源,算子层零探测
         env.kv.head_dim = hd;
         env.kv.grp = hq.checked_div(hkv).unwrap_or(0);
-        env.quant = loaded.quant_plan;
+        env.quant = rm.quant_plan;
         // FI 面启用(量化恒 = 主池;影子池已删,本值只作"启用 + 池量化"携带)
         // FI 面启用条件 = **能力条件**(f16 池 + paged 页表),不是开关:
         // 2026-10-13 起配置面无 flashinfer 选项,FI 恒启用(env.attn.fi 仅门/诊断用)
         let fi_quant = if env.attn.fi
             && env.kv.paged
-            && loaded.spec.dtype == owl_models::tensor::Dtype::F16
+            && rm.spec.dtype == owl_models::tensor::Dtype::F16
         {
             Some(env.kv.quant)
         } else {
@@ -285,14 +381,14 @@ impl<D: DeviceClient + 'static> Engine<D> {
         // E5-M2b/C7 —— depth>0 且检查点有 mtp.* → Mtp;dumb 诊断位 → Dumb;
         // 否则 Off 回落 DecodeBatch,无草稿器不白发 verify 税)
         let spec = crate::spec_runtime::load_spec_runtime(
-            &mut self.face,
+            &mut face,
             SpecBootInput {
-                depth_raw: self.cfg.knobs.draft.depth,
-                dflash2_dir: self.cfg.knobs.draft.dflash2_dir.as_deref(),
-                mtp_dir: loaded.mtp_dir.as_deref(),
-                dumb: self.cfg.knobs.draft.dumb,
-                draft_kv_fp8: self.cfg.knobs.draft.kv_quant == owl_models::env::KvQuant::Fp8E4M3,
-                notaps: self.cfg.knobs.draft.notaps,
+                depth_raw: cfg.knobs.draft.depth,
+                dflash2_dir: cfg.knobs.draft.dflash2_dir.as_deref(),
+                mtp_dir: rm.mtp_dir.as_deref(),
+                dumb: cfg.knobs.draft.dumb,
+                draft_kv_fp8: cfg.knobs.draft.kv_quant == owl_models::env::KvQuant::Fp8E4M3,
+                notaps: cfg.knobs.draft.notaps,
             },
         )
         .await?;
@@ -309,68 +405,58 @@ impl<D: DeviceClient + 'static> Engine<D> {
         // 状态块(StatePool::alloc,零初始化;GDN 段每 turn 开始按格重置)。
         // KV 布局表驱动(kv_paged_policy;REQ-HW-01);块池容量 E2b:
         // 默认 = 2 × 单会话容量(两会话满载共存),knobs.pool_tokens 覆写
-        let pool_tokens = self.cfg.knobs.pool_tokens.unwrap_or(2 * s);
+        let pool_tokens = cfg.knobs.pool_tokens.unwrap_or(2 * s);
         let plan = crate::state::PoolPlan {
             seq_tokens: s,
             pool_tokens,
             kv: env.kv.quant,
             fi_quant,
-            draft_kv: if self.cfg.knobs.draft.kv_quant == owl_models::env::KvQuant::Fp8E4M3 {
+            draft_kv: if cfg.knobs.draft.kv_quant == owl_models::env::KvQuant::Fp8E4M3 {
                 owl_models::env::KvQuant::Fp8E4M3
             } else {
                 owl_models::env::KvQuant::None
             },
             spec_mode: spec.mode,
             spec_depth: spec.depth,
-            xqa_verify: self.cfg.knobs.env.attn.verify_xqa,
-            xqa_decode: self.cfg.knobs.env.attn.decode_xqa,
-            xqa_prefill: self.cfg.knobs.env.attn.xqa_prefill,
-            gdn_slots: self.cfg.knobs.gdn_slots,
-            snap_max: self.cfg.knobs.snap_max,
-            vram_target: self.cfg.knobs.vram_target,
-            vram_reserve_mb: self.cfg.knobs.vram_reserve_mb,
-            dump_all: self.cfg.knobs.gdn_dump_all,
+            xqa_verify: cfg.knobs.env.attn.verify_xqa,
+            xqa_decode: cfg.knobs.env.attn.decode_xqa,
+            xqa_prefill: cfg.knobs.env.attn.xqa_prefill,
+            gdn_slots: cfg.knobs.gdn_slots,
+            snap_max: cfg.knobs.snap_max,
+            vram_target: cfg.knobs.vram_target,
+            vram_reserve_mb: cfg.knobs.vram_reserve_mb,
+            dump_all: cfg.knobs.gdn_dump_all,
             // prefill 桶 padding 的 dump 页(M2b):档位非 off 才多分配那 1 页
-            prefill_dump_page: self.cfg.knobs.prefill_bucket
+            prefill_dump_page: cfg.knobs.prefill_bucket
                 != owl_shared::config::PrefillBucket::Off,
-            gdn_dbg: self.cfg.knobs.probes.gdn_dbg,
+            gdn_dbg: cfg.knobs.probes.gdn_dbg,
         };
-        let pool = StatePool::alloc(&mut self.face, dims, &loaded.spec.layer_types, &plan).await?;
+        let pool = StatePool::alloc(&mut face, dims, &rm.spec.layer_types, &plan).await?;
         if let Some(q) = fi_quant {
             owl_shared::log_info!("boot", "FlashInfer prefill 面启用(FI 直读主池 kNHD 单池;quant={:?})",
                 q
             );
         }
 
-        // 会话账 + 双块账房(E2b/E2c;session.rs:target 链前缀缓存挂载 +
-        // MTP 链独立页池 —— 复合构造一次落位)
-        let bank = crate::session::SessionBank::new(
-            pool.nb,
-            pool.page,
-            pool.paged,
-            spec.mode == SpecMode::Mtp,
-            self.cfg.knobs.prefix_cache,
-            self.cfg.knobs.probes.debug,
-        );
-
         // 图族总装配(graph_fleet.rs:① 主会话图(warmup+捕获)→
         // ② verify 桶形图 → ③ fold/DFlash2/MTP 族;face 句柄派生
         // vface + extra_faces(pop 消费桶))
-        let vface = self.face.face_clone();
+        let vface = face.face_clone();
         // E5-M5:fold/propose 桶形图族的 face 句柄(depth × 2)
-        let extra_faces: Vec<D> = (0..2 * spec.depth.max(1) + 2).filter_map(|_| self.face.face_clone()).collect();
+        let extra_faces: Vec<D> = (0..2 * spec.depth.max(1) + 2).filter_map(|_| face.face_clone()).collect();
         let graphs = GraphFleet::assemble(
-            self.face,
+            face,
             vface,
             extra_faces,
             FleetBoot {
                 env,
+                tp: tp.clone(),
                 dims,
                 pool: &pool,
-                model: std::sync::Arc::clone(&loaded.model),
-                rope: loaded.rope.clone(),
+                model: std::sync::Arc::clone(&rm.model),
+                rope: rm.rope.clone(),
                 spec: &spec,
-                knobs: &self.cfg.knobs,
+                knobs: &cfg.knobs,
             },
             t_run,
         )
@@ -397,21 +483,16 @@ impl<D: DeviceClient + 'static> Engine<D> {
                     .to_string(),
             ));
         }
-        Ok(RunningEngine {
-            probes: self.cfg.knobs.probes,
-            tok: loaded.tokenizer,
-            cfg: self.cfg,
-            pool,
-            model: loaded.model,
-            rope: loaded.rope,
-            env,
-            sched_acc_ns: 0,
-            sched_cnt: 0,
-            boot_seq: BOOT_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1,
-            turns: crate::turn::TurnLedger::new(),
-            bank,
-            graphs,
-            spec,
-        })
-    }
+
+    Ok(RankDev {
+        model: rm.model,
+        rope: rm.rope,
+        spec: rm.spec,
+        env,
+        spec_rt: spec,
+        tp,
+        pool,
+        graphs,
+    })
 }
+

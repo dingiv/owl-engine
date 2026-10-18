@@ -11,9 +11,10 @@
 //! - [`ar`]:allreduce 的 staging 布局与 chunk 计划(S2;协议不变量 I1-I5)
 //! - 本文件:策略骨架(`CommCap`/`CommBackend`/`CommRouter`/`Topology`)
 //!
-//! **壳子状态**:纯逻辑已落地可测;碰设备的两处入口
-//! ([`peer::PeerPlan::open`] / [`ar::AllReduce::enqueue`])是结构化
-//! `NotYetImplemented` 桩 —— 按 AGENTS 纪律,可失败逻辑不得写成静默空函数。
+//! **职责边界**:本 crate 是**策略 + 纯算术**(分档/额度/布局/chunk 计划),
+//! 全部可 CPU 单测;碰设备的执行臂在 (`owl-cuda` 的 `Peer*` 三命令 +
+//! VMM 授予,握手编排 = `owl-engine::tp`)与 (`owl-kernels` 的 ar 两核)。
+//! 本 crate 不再留任何桩(2026-10-17 S4 ⑤-K2 清账:`PeerPlan::open` 退役)。
 
 pub mod ar;
 pub mod peer;
@@ -148,9 +149,6 @@ pub enum CommError {
         limit: u64,
         mechanism: peer::PeerMechanism,
     },
-    /// 施工中未实现的阶段(**不许改成静默 `Ok(())`**;S1/S2 落地后逐条删)
-    #[error("未实现(TP2 施工): {stage}")]
-    NotYetImplemented { stage: &'static str },
 }
 
 #[cfg(test)]

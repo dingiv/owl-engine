@@ -441,7 +441,7 @@ mod wiring_tests {
         src.insert("mtp.pre_fc_norm_embedding.weight".into(), gen(hidden, 14.0));
 
         let mut gpu = gpu_client().await;
-        let lctx = LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false };
+        let lctx = LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
 
         let mtp = MtpPredictor::new(hidden, inter, hq, hkv, hd, eps);
         crate::interpreters::eval_load(&mtp, &mut gpu, &src, &lctx).await.expect("mtp 装载");

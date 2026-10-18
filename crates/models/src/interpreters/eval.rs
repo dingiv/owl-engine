@@ -178,14 +178,16 @@ pub fn eval_ops<'a, D>(
 where
     D: crate::contract::DeviceClient + 'a,
 {
-    eval_ops_env(t, face, crate::env::EnvProvider::default())
+    eval_ops_env(t, face, crate::env::EnvProvider::default(), None)
 }
 
-/// 带环境的求值(EnvProvider;engine 供给,Call 臂按 hw/page/trace 执行)
+/// 带环境的求值(EnvProvider;engine 供给,Call 臂按 hw/page/trace 执行)。
+/// `tp` = 张量并行上下文(**S4 ⑤ 注入口**;`None` = 单卡,零分支代价)。
 pub fn eval_ops_env<'a, D>(
     t: &'a TensorOps,
     face: &'a mut D,
     env: crate::env::EnvProvider,
+    tp: Option<&'a crate::module::TpCtx>,
 ) -> Pin<Box<dyn Future<Output = Result<Bytes, ModelError>> + Send + 'a>>
 where
     D: crate::contract::DeviceClient + 'a,
@@ -198,7 +200,9 @@ where
                 block_users: std::collections::HashMap::new(),
                 pending: std::collections::HashMap::new(), reclaim: false, perf, env, pool: None,
                 keep_nodes: Default::default(), keep_blocks: Default::default(),
-                overrides: Default::default() };
+                overrides: Default::default(),
+            tp: tp.cloned(),
+        };
         let root = _eval_rec(t, &mut ctx).await?;
         // 非 scoped 口径:竞技场原样丢弃(块常驻,历史行为不变)
         Ok(root)
@@ -229,20 +233,21 @@ pub fn eval_ops_scoped<'a, D>(
 where
     D: crate::contract::DeviceClient + 'a,
 {
-    eval_ops_scoped_env(t, face, crate::env::EnvProvider::default())
+    eval_ops_scoped_env(t, face, crate::env::EnvProvider::default(), None)
 }
 
-/// 带环境的 scoped 求值(EnvProvider;engine 供给)
+/// 带环境的 scoped 求值(EnvProvider;engine 供给;`tp` 注入口同 [`eval_ops_env`])
 #[allow(clippy::type_complexity)] // 手写 boxed async fn 返回型
 pub fn eval_ops_scoped_env<'a, D>(
     t: &'a TensorOps,
     face: &'a mut D,
     env: crate::env::EnvProvider,
+    tp: Option<&'a crate::module::TpCtx>,
 ) -> Pin<Box<dyn Future<Output = Result<(Bytes, Vec<u64>), ModelError>> + Send + 'a>>
 where
     D: crate::contract::DeviceClient + 'a,
 {
-    eval_ops_scoped_env_pool(t, face, env, block_pool_budget())
+    eval_ops_scoped_env_pool(t, face, env, tp, block_pool_budget())
 }
 
 /// scoped 求值 + **显式块池预算**(0 = 关;P1″)。
@@ -252,6 +257,7 @@ pub(crate) fn eval_ops_scoped_env_pool<'a, D>(
     t: &'a TensorOps,
     face: &'a mut D,
     env: crate::env::EnvProvider,
+    tp: Option<&'a crate::module::TpCtx>,
     pool_budget: usize,
 ) -> Pin<Box<dyn Future<Output = Result<(Bytes, Vec<u64>), ModelError>> + Send + 'a>>
 where
@@ -266,7 +272,9 @@ where
                 pending: count_pending(t), reclaim: std::env::var("OWL_NO_RECLAIM").is_err(), perf, env,
                 pool: (pool_budget > 0).then(|| BlockPool::new(pool_budget)),
                 keep_nodes: Default::default(), keep_blocks: Default::default(),
-                overrides: Default::default() };
+                overrides: Default::default(),
+            tp: tp.cloned(),
+        };
         let r = _eval_rec(t, &mut ctx).await;
         // 池**无论成败都要抽干**:错误路径不抽 = 缓存块被遗弃而 server 仍认
         // 它们 owned(真漏显存)。主路错优先(池错只降级不掩盖)。
@@ -290,18 +298,21 @@ where
 pub fn eval_ops_multi<'a, D>(
     roots: &'a [&'a TensorOps],
     face: &'a mut D,
+    tp: Option<&'a crate::module::TpCtx>,
 ) -> Pin<Box<dyn Future<Output = Result<Vec<Bytes>, ModelError>> + Send + 'a>>
 where
     D: crate::contract::DeviceClient + 'a,
 {
-    eval_ops_multi_env(roots, face, crate::env::EnvProvider::default())
+    eval_ops_multi_env(roots, face, crate::env::EnvProvider::default(), tp)
 }
 
-/// 多根 + 环境(E5-DF2;prefill taps 同树多根,层声明 env 与执行 env 双通)
+/// 多根 + 环境(E5-DF2;prefill taps 同树多根,层声明 env 与执行 env 双通;
+/// `tp` 注入口同 [`eval_ops_env`])
 pub fn eval_ops_multi_env<'a, D>(
     roots: &'a [&'a TensorOps],
     face: &'a mut D,
     env: crate::env::EnvProvider,
+    tp: Option<&'a crate::module::TpCtx>,
 ) -> Pin<Box<dyn Future<Output = Result<Vec<Bytes>, ModelError>> + Send + 'a>>
 where
     D: crate::contract::DeviceClient + 'a,
@@ -314,7 +325,9 @@ where
                 block_users: std::collections::HashMap::new(),
                 pending: std::collections::HashMap::new(), reclaim: false, perf, env, pool: None,
                 keep_nodes: Default::default(), keep_blocks: Default::default(),
-                overrides: Default::default() };
+                overrides: Default::default(),
+            tp: tp.cloned(),
+        };
         let mut out = Vec::with_capacity(roots.len());
         for r in roots {
             out.push(_eval_rec(r, &mut ctx).await?);
@@ -333,6 +346,7 @@ pub fn eval_ops_multi_scoped_env<'a, D>(
     roots: &'a [&'a TensorOps],
     face: &'a mut D,
     env: crate::env::EnvProvider,
+    tp: Option<&'a crate::module::TpCtx>,
 ) -> Pin<Box<dyn Future<Output = Result<Vec<Bytes>, ModelError>> + Send + 'a>>
 where
     D: crate::contract::DeviceClient + 'a,
@@ -353,7 +367,9 @@ where
                 pending, reclaim: true, perf, env,
                 pool: (pool_budget > 0).then(|| BlockPool::new(pool_budget)),
                 keep_nodes: Default::default(), keep_blocks: Default::default(),
-                overrides: Default::default() };
+                overrides: Default::default(),
+            tp: tp.cloned(),
+        };
         let mut out = Vec::with_capacity(roots.len());
         for r in roots {
             // **错误路径也必须抽干竞技场**(2026-10-16 实测定谳):早退(求值途中
@@ -490,10 +506,13 @@ pub enum SegMode {
 /// **段求值**(piecewise 求值面原语,见本段头注):
 /// 在 `carry` 接力下求值 `roots` 的可达子图,返回各根的块句柄。
 /// `mode` = 本段求值所处的窗口([`SegMode`];捕获窗内零回收)。
+/// `tp` 注入口同 [`eval_ops_env`](piecewise 各段独立求值 ⇒ 必须逐段带上,
+/// 否则段内行并行层的 allreduce 全丢)。
 pub fn eval_segment<'a, D>(
     roots: &'a [&'a TensorOps],
     face: &'a mut D,
     env: crate::env::EnvProvider,
+    tp: Option<&'a crate::module::TpCtx>,
     carry: &'a mut EvalCarry,
     mode: SegMode,
 ) -> Pin<Box<dyn Future<Output = Result<Vec<Bytes>, ModelError>> + Send + 'a>>
@@ -527,6 +546,7 @@ where
             keep_nodes: carry.keep.clone(),
             keep_blocks: std::collections::HashSet::new(),
             overrides: carry.overrides.clone(),
+            tp: tp.cloned(),
         };
         let mut out = Vec::with_capacity(roots.len());
         for r in roots {
@@ -582,7 +602,9 @@ where
                 block_users: std::collections::HashMap::new(),
                 pending: std::collections::HashMap::new(), reclaim: false, perf, pool: None,
                 keep_nodes: Default::default(), keep_blocks: Default::default(),
-                overrides: Default::default() };
+                overrides: Default::default(),
+            tp: None,
+        };
         _eval_rec(t, &mut ctx).await
     })
 }
@@ -621,6 +643,10 @@ struct EvalCtx<'a, D> {
     keep_blocks: std::collections::HashSet<u64>,
     /// 输出覆盖(见 [`EvalCarry::overrides`];缺省空 = 历史口径零影响)
     overrides: std::collections::HashMap<u64, Bytes>,
+    /// **张量并行上下文**(S4 ③';`None` = 单卡)。解释器在求值尾部按节点的
+    /// [`TensorOps::tp_role`](crate::tensor::TensorOps::tp_role) 标记统一追加
+    /// allreduce(层只给标记,不构造通信节点 —— 用户裁决 2026-10-17)。
+    tp: Option<crate::module::TpCtx>,
 }
 
 impl<'a, D> EvalCtx<'a, D>
@@ -1057,6 +1083,68 @@ where
         #[allow(unreachable_patterns)] // 防御臂:Op 新增变体时给运行时错值而非静默
         other => return Err(ModelError::Msg(format!("eval 未覆盖: {other:?}"))),
     };
+    // ★ **S4 ③':TP 行并行 ⇒ 解释器统一追加 allreduce**(层只给标记;
+    //   用户裁决 2026-10-17:感知下沉到解释器层)。
+    //   标记来源 = 节点上的 `tp_role`(`Linear::new` 从规则表算好透传);
+    //   语义 = payload 原地累加(输出仍是 `out` 的同块别名)。
+    let out: Bytes = if t.tp_role == crate::plan::rules::WeightRule::UniformRow {
+        match ctx.tp.as_ref() {
+            Some(tp) => {
+                if n_bytes as u64 > tp.slot_bytes {
+                    return Err(ModelError::Msg(format!(
+                        "TP allreduce: 载荷 {n_bytes}B > slot {}B(v1 单块;多块是 S5 ——                          调大 staging 或改计划)",
+                        tp.slot_bytes
+                    )));
+                }
+                // ★ **rank 标记点(K1;用户裁决"注入点打标")** —— 层键不在
+                //   节点上(layer 零改动的代价),故标记 = 静态 tag 计数(per
+                //   rank;store 缺席 = 静默跳过,纯观测面)+ debug 日志(节点
+                //   id/label/字节数;log 未开 = 编译期零成本)。
+                //   位置 = 决策点(发射之前):即便发射失败,标记也如实记下
+                //   "此处该 AR"(观测与执行解耦)。
+                let rank = tp.plan.rank();
+                let tag = match rank {
+                    0 => "tp.ar.r0",
+                    1 => "tp.ar.r1",
+                    _ => "tp.ar.rN",
+                };
+                owl_shared::metrics::with_metrics_store(|s| {
+                    s.counter_add(tag, 1, file!(), line!())
+                });
+                owl_shared::log_debug!(
+                    "tp",
+                    "AR 注入 rank={rank} node={} label={:?} bytes={n_bytes} slot={}",
+                    t.id(),
+                    t.label(),
+                    tp.slot_bytes
+                );
+                let stage = owl_kernels::client::comm::ArStageCall::new(
+                    out.clone(),
+                    tp.own.clone(),
+                    tp.peer.clone(),
+                    n_bytes as u64,
+                    tp.slot_bytes,
+                    0,
+                )
+                .to_launch();
+                ctx.face.launch(stage).await?;
+                let reduce = owl_kernels::client::comm::ArReduceCall::new(
+                    out.clone(),
+                    tp.own.clone(),
+                    tp.peer.clone(),
+                    n_bytes as u64,
+                    tp.slot_bytes,
+                    0,
+                )
+                .to_launch();
+                ctx.face.launch(reduce).await?;
+                out // 别名:payload 原地累加
+            }
+            None => out, // 单卡:无 TP 上下文
+        }
+    } else {
+        out
+    };
     ctx.memo_put(t.id, out.clone());
     // ── 性能面:本节点账落地(排他宿主时;tag = interp.host.node.<phase>.<class>)──
     if let Some(t0) = t_node {
@@ -1177,6 +1265,94 @@ where
 }
 
 #[cfg(test)]
+mod tp_injection_tests {
+    //! **S4 ⑤-K1 注入口门**:解释器尾部按 `ctx.tp` 注入 allreduce ——
+    //! ① 单卡(`tp = None`)零注入(求值照常成功);
+    //! ② `tp = Some` ⇒ 真走到 comm 发射(CpuFace 无该核 ⇒ 响亮拒,
+    //!    错误文本必须点名 **stage 核** —— 证明注入口生效且顺序不是乱发);
+    //! ③ 标记:per-rank 计数进 metrics(决策点打标;静态 tag)。
+    use super::*;
+    use crate::contract::DeviceClient as _;
+    use crate::plan::rules::WeightRule;
+    use crate::plan::tp::TpPlan;
+    use crate::tensor::TensorOps;
+
+    fn row_node() -> TensorOps {
+        TensorOps::zeros(Dtype::F32, vec![1, 2]).with_tp_role(WeightRule::UniformRow)
+    }
+
+    /// 单卡:tap 未开、无 TP 上下文 ⇒ 零发射(历史行为不变)
+    #[tokio::test]
+    async fn no_tp_means_no_injection() {
+        let mut face = owl_cpu::CpuFace::new();
+        let r = eval_ops_scoped_env(&row_node(), &mut face, crate::env::EnvProvider::default(), None).await;
+        assert!(r.is_ok(), "tp = None 不应触发任何 comm 发射:{:?}", r.err());
+    }
+
+    /// TP:注入 stage→reduce;CpuFace 在 stage 核上响亮拒(且名字可断言)
+    #[tokio::test]
+    async fn tp_injects_ar_and_marks_rank() {
+        let _ = owl_shared::metrics::init_metrics(owl_shared::metrics::MetricsStore::new());
+        let mut face = owl_cpu::CpuFace::new();
+        let own = face.alloc(Dtype::F32, 16, "tp.own").await.expect("own staging 块(64B)");
+        let peer = face.alloc(Dtype::F32, 16, "tp.peer").await.expect("peer staging 块(64B)");
+        let tp = crate::module::TpCtx {
+            plan: TpPlan::new(1, 2).expect("rank 1/2"),
+            own,
+            peer,
+            slot_bytes: 64,
+        };
+        let err = eval_ops_scoped_env(
+            &row_node(),
+            &mut face,
+            crate::env::EnvProvider::default(),
+            Some(&tp),
+        )
+        .await
+        .expect_err("tp = Some 必须走到 comm 发射(CpuFace 无此核 ⇒ 响亮拒)");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("owl_comm_ar_stage"),
+            "注入的应是 stage 核(顺序：stage → reduce);实得: {msg}"
+        );
+        // 标记面:rank=1 的静态 tag 计数 ≥ 1(注入口在决策点打标)
+        let hits: u64 = owl_shared::metrics::query_metrics(
+            &owl_shared::metrics::MetricsFilter::new().tag("tp.ar.r1"),
+        )
+        .iter()
+        .map(|r| r.counter)
+        .sum();
+        assert!(hits >= 1, "rank 标记缺失(metrics tp.ar.r1;实得 {hits})");
+    }
+
+    /// **载荷超 slot ⇒ 响亮拒**(v1 单块;多块留给 S5)
+    #[tokio::test]
+    async fn payload_over_slot_is_loud() {
+        let mut face = owl_cpu::CpuFace::new();
+        let own = face.alloc(Dtype::F32, 4, "tp.own").await.expect("own(16B)");
+        let peer = face.alloc(Dtype::F32, 4, "tp.peer").await.expect("peer(16B)");
+        let tp = crate::module::TpCtx {
+            plan: TpPlan::new(0, 2).expect("rank 0/2"),
+            own,
+            peer,
+            slot_bytes: 4, // < 载荷 8B
+        };
+        let err = eval_ops_scoped_env(
+            &row_node(),
+            &mut face,
+            crate::env::EnvProvider::default(),
+            Some(&tp),
+        )
+        .await
+        .expect_err("超 slot 必须响亮拒");
+        assert!(
+            format!("{err}").contains("TP allreduce"),
+            "拒收消息须点名 TP allreduce;实得: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod liveness_tests {
     use super::*;
     use crate::contract::DeviceClient as _;
@@ -1224,7 +1400,7 @@ mod liveness_tests {
 
         let mut carry = EvalCarry::default();
         carry.keep.insert(a.id);
-        let seg0 = eval_segment(&[&a], &mut face, Default::default(), &mut carry, SegMode::Eager)
+        let seg0 = eval_segment(&[&a], &mut face, Default::default(), None, &mut carry, SegMode::Eager)
             .await
             .expect("seg0");
         assert_eq!(seg0.len(), 1);
@@ -1240,7 +1416,7 @@ mod liveness_tests {
         carry.resolve(brk.id, brk_block.clone());
         assert!(carry.keep.contains(&brk.id), "resolve 必须同时登记 keep");
 
-        let seg1 = eval_segment(&[&r], &mut face, Default::default(), &mut carry, SegMode::Eager)
+        let seg1 = eval_segment(&[&r], &mut face, Default::default(), None, &mut carry, SegMode::Eager)
             .await
             .expect("seg1");
         let rv = read_f32(&mut face, &seg1[0]).await;
@@ -1271,7 +1447,7 @@ mod liveness_tests {
         let mut carry = EvalCarry::default();
         carry.override_out(n.id, pin.clone());
 
-        let outs = eval_segment(&[&n], &mut face, Default::default(), &mut carry, SegMode::Eager)
+        let outs = eval_segment(&[&n], &mut face, Default::default(), None, &mut carry, SegMode::Eager)
             .await
             .expect("eval");
         assert_eq!(outs[0].id, pin.id, "覆盖点必须写进给定块(而不是新分配)");
@@ -1294,7 +1470,7 @@ mod liveness_tests {
         let bad = owl_iface::alloc!(face, Dtype::F32, 1).await.expect("错尺寸钉块").view(Dtype::F32, 1);
         let mut carry = EvalCarry::default();
         carry.override_out(n.id, bad);
-        let r = eval_segment(&[&n], &mut face, Default::default(), &mut carry, SegMode::Eager).await;
+        let r = eval_segment(&[&n], &mut face, Default::default(), None, &mut carry, SegMode::Eager).await;
         let e = r.err().expect("尺寸不符必须拒").to_string();
         assert!(e.contains("输出覆盖尺寸不符"), "拒语应指向覆盖尺寸,得 {e}");
     }
@@ -1313,7 +1489,7 @@ mod liveness_tests {
 
         let mut carry = EvalCarry::default();
         carry.keep.insert(kept.id);
-        let s0 = eval_segment(&[&root], &mut face, Default::default(), &mut carry, SegMode::Eager)
+        let s0 = eval_segment(&[&root], &mut face, Default::default(), None, &mut carry, SegMode::Eager)
             .await
             .expect("seg0");
         let root_bid = s0[0].id;
@@ -1331,7 +1507,7 @@ mod liveness_tests {
             "阳性对照失败:本段一个死块都没归还 ⇒ 回收没跑(判据空转)"
         );
         // 再请求 kept = 命中 memo 的同块(零重算)
-        let s1 = eval_segment(&[&kept], &mut face, Default::default(), &mut carry, SegMode::Eager)
+        let s1 = eval_segment(&[&kept], &mut face, Default::default(), None, &mut carry, SegMode::Eager)
             .await
             .expect("seg1");
         assert_eq!(s1[0].id, kept_bid, "keep 节点应命中 memo 返回同块");
@@ -1347,11 +1523,11 @@ mod liveness_tests {
         let x = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[7.0]));
         let n = x.add(&one);
         let mut carry = EvalCarry::default(); // 不登记 keep
-        let s0 = eval_segment(&[&n], &mut face, Default::default(), &mut carry, SegMode::Eager)
+        let s0 = eval_segment(&[&n], &mut face, Default::default(), None, &mut carry, SegMode::Eager)
             .await
             .expect("seg0");
         assert!(carry.memo.is_empty(), "未 keep 的值不该出现在接力棒里");
-        let s1 = eval_segment(&[&n], &mut face, Default::default(), &mut carry, SegMode::Eager)
+        let s1 = eval_segment(&[&n], &mut face, Default::default(), None, &mut carry, SegMode::Eager)
             .await
             .expect("seg1");
         assert_ne!(s0[0].id, s1[0].id, "未 keep ⇒ 应重算出新块");
@@ -1433,7 +1609,7 @@ mod liveness_tests {
             let a = x.mul(&c).add(&one);
             let v = a.add(&TensorOps::zeros(Dtype::F32, vec![4]));
             let (root, cands) = eval_ops_scoped_env_pool(
-                &v, &mut face, crate::env::EnvProvider::default(), budget,
+                &v, &mut face, crate::env::EnvProvider::default(), None, budget,
             )
             .await
             .expect("scoped eval");
@@ -1466,7 +1642,7 @@ mod liveness_tests {
         };
         let mut f_off = owl_cpu::CpuFace::new();
         let (r_off, _) = eval_ops_scoped_env_pool(
-            &build(), &mut f_off, crate::env::EnvProvider::default(), 0,
+            &build(), &mut f_off, crate::env::EnvProvider::default(), None, 0,
         )
         .await
         .expect("池关");
@@ -1474,7 +1650,7 @@ mod liveness_tests {
         f_off.dtoh(&r_off, &mut off).await.expect("dtoh off");
         let mut f_on = owl_cpu::CpuFace::new();
         let (r_on, cands_on) = eval_ops_scoped_env_pool(
-            &build(), &mut f_on, crate::env::EnvProvider::default(), 1 << 20,
+            &build(), &mut f_on, crate::env::EnvProvider::default(), None, 1 << 20,
         )
         .await
         .expect("池开");

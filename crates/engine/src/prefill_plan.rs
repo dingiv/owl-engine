@@ -42,7 +42,7 @@ use owl_models::env::EnvProvider;
 use owl_models::layers::gdn::GdnBuffers;
 use owl_models::layers::rope::Rope;
 use owl_models::model::Model;
-use owl_models::module::{FiPrefillCtx, ForwardCtx, GdnTableSlot, KvBuffers};
+use owl_models::module::{FiPrefillCtx, ForwardCtx, GdnTableSlot, KvBuffers, TpCtx};
 use owl_models::TensorOps;
 
 use crate::exec::prefill_chunk::ChunkTables;
@@ -79,8 +79,12 @@ pub(crate) fn gdn_host_slot_arm(env: &EnvProvider, dims: &ModelDims, t_pad: usiz
     if t_pad < 64 {
         return false; // 小 T 恒走 varlen(层侧同门:`tokens >= 64`)
     }
-    let chunked_shape_ok =
-        dims.nv == 48 && dims.nk == 16 && dims.hk == 128 && dims.hv == 128;
+    // 形状判据**单源在核的家**(`kernels::family::gdn_chunked`:验证清单 + 谓词;
+    // engine 零数字 —— 2026-10-17 用户裁决"别写成硬编码机制")。
+    // `nk/nv` 是**每 rank 的头数**(TP 分片后减半)⇒ 清单里含分片档。
+    let chunked_shape_ok = dims.hk == 128
+        && dims.hv == 128
+        && owl_models::kernel::host_slot_arm_shape_ok(dims.nk, dims.nv);
     let scalar_shape_ok = dims.hk == 128 && dims.hv == 128;
     (env.gdn.scalar && !env.gdn.chunked && scalar_shape_ok)
         || (env.gdn.chunked && chunked_shape_ok)
@@ -203,6 +207,9 @@ impl<D: DeviceClient> BucketGraph<D> {
 /// 捕获期 boot 事实(显式依赖;零隐式读取)
 pub(crate) struct BucketBoot<'a> {
     pub(crate) env: EnvProvider,
+    /// **张量并行上下文(S4 ⑤;`None` = 单卡)** —— 与 env 同律：
+    /// 每桶图装配期烘进求值路(eager/捕获两路都带)。
+    pub(crate) tp: Option<TpCtx>,
     pub(crate) model: Arc<Model>,
     pub(crate) rope: Rope,
     pub(crate) pool: &'a StatePool,
@@ -235,6 +242,19 @@ impl<D: DeviceClient> PrefillBuckets<D> {
             .filter(|b| b.captured)
             .map(|b| b.plan.slab_bytes())
             .sum()
+    }
+
+    /// **桶族退休**(与 `GraphFleet::close` 同律:逐图卸图 + 归槽,
+    /// 失败仅告警 + 记首错不短路)
+    pub(crate) async fn close(&mut self) -> crate::Result<()> {
+        let mut first: Option<owl_iface::contract::ModelError> = None;
+        for b in self.buckets.iter_mut() {
+            crate::graph_fleet::record_close(&mut first, b.plan.close().await);
+        }
+        match first {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// 桶族一行摘要(boot 日志/运维;空 = "")
@@ -520,7 +540,7 @@ impl<D: DeviceClient> PrefillBuckets<D> {
             reclaim_capture: true,
             warmup: true,
         };
-        let (plan, outcome) = GraphPlan::plan(face, boot.env, desc, forward).await?;
+        let (plan, outcome) = GraphPlan::plan(face, boot.env, boot.tp.clone(), desc, forward).await?;
         let captured = matches!(outcome, PlanOutcome::Captured);
         Ok(BucketGraph {
             t_pad,
@@ -538,3 +558,27 @@ impl<D: DeviceClient> PrefillBuckets<D> {
 }
 
 // (无外部辅助:face 句柄由 `face_clone` 逐桶派生)
+
+#[cfg(test)]
+mod tp_shard_arm_tests {
+    //! S4 ④:GDN 图档判据的**分片档**(保守白名单:world=2 已列,未验证档不放行)
+    use super::*;
+
+    fn dims(nk: usize, nv: usize) -> ModelDims {
+        ModelDims {
+            hq: 12, hkv: 2, hd: 256, nk, hk: 128, nv, hv: 128,
+            hidden: 5120, dtype: owl_models::tensor::Dtype::F16,
+        }
+    }
+
+    #[test]
+    fn gdn_host_slot_arm_accepts_full_and_tp2_shard_only() {
+        let mut env = owl_models::env::EnvProvider::default();
+        env.gdn.chunked = true;
+        env.gdn.scalar = false;
+        assert!(gdn_host_slot_arm(&env, &dims(16, 48), 128), "全量档 (16,48) 应放行");
+        assert!(gdn_host_slot_arm(&env, &dims(8, 24), 128), "TP=2 分片档 (8,24) 应放行");
+        assert!(!gdn_host_slot_arm(&env, &dims(4, 12), 128), "未验证档 (4,12) 不放行");
+        assert!(!gdn_host_slot_arm(&env, &dims(16, 48), 32), "小 T 恒走 varlen");
+    }
+}

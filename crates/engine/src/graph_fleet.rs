@@ -15,7 +15,7 @@ use std::sync::Arc;
 use owl_iface::contract::{Bytes, DeviceClient, Dtype};
 use owl_models::env::EnvProvider;
 use owl_models::layers::gdn::GdnBuffers;
-use owl_models::module::{FiPrefillCtx, ForwardCtx, KvBuffers, Module};
+use owl_models::module::{FiPrefillCtx, ForwardCtx, KvBuffers, Module, TpCtx};
 use owl_models::ops::PlanNode; // `TensorOps::op()`(槽叶 → 块 id)
 use owl_models::model::Model;
 use owl_models::tensor::TensorOps;
@@ -27,6 +27,16 @@ use crate::state::{ModelDims, StatePool};
 use crate::Result;
 
 type T = std::time::Instant;
+
+/// 拆卸口径的小帮手(图示/桶族共用):记首错 + 告警,不短路。
+pub(crate) fn record_close(slot: &mut Option<owl_iface::contract::ModelError>, r: crate::Result<()>) {
+    if let Err(e) = r {
+        owl_shared::log_warn!("graph-fleet", "图退役失败(继续拆卸):{e}");
+        if slot.is_none() {
+            *slot = Some(e);
+        }
+    }
+}
 
 /// 图族(组合叶;RunningEngine 持有)。字段 pub(crate) 供 exec 直读
 /// (`graphs.session.face_mut()` 等),相位扇出走方法。
@@ -57,6 +67,34 @@ pub(crate) struct GraphFleet<D: DeviceClient> {
 }
 
 impl<D: DeviceClient> GraphFleet<D> {
+    /// **整族退休**(TP 双 rank 装配面的收尾;S4 ⑤-K2):逐图 `GraphPlan::close`
+    /// (销毁图 + 归还输入槽)。
+    ///
+    /// 次序:图在时其钉块(staging/槽)被**图租约**钉住 ⇒ `PeerRelease`/
+    /// `free_blocks` 一律被响亮拒 —— 所以必须先卸图,后释放外部资源。
+    /// 拆卸面不允许把控制流带跑:失败仅告警 + 记首错,不短路(全量尝试)。
+    pub(crate) async fn close(&mut self) -> Result<()> {
+        let mut first: Option<owl_iface::contract::ModelError> = None;
+        record_close(&mut first, self.session.close().await);
+        if let Some(g) = self.verify.as_mut() {
+            record_close(&mut first, g.close().await);
+        }
+        for g in self.fold.iter_mut() {
+            record_close(&mut first, g.close().await);
+        }
+        for g in self.propose.iter_mut() {
+            record_close(&mut first, g.close().await);
+        }
+        if let Some(g) = self.dflash.as_mut() {
+            record_close(&mut first, g.close().await);
+        }
+        record_close(&mut first, self.prefill.close().await);
+        match first {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     /// 相位定相扇出(唯一入口;引擎 env 快照与各图 env 同步 ——
     /// GraphPlan 构造期只拿到 env 快照 ⇒ 逐相位显式下发,
     /// perf-framework.md §十.3)。
@@ -87,6 +125,10 @@ impl<D: DeviceClient> GraphFleet<D> {
 pub(crate) struct FleetBoot<'a> {
     /// 解释器执行环境(捕获期烘焙进各图闭包;EnvProvider: Copy)
     pub(crate) env: EnvProvider,
+    /// **张量并行上下文(S4 ⑤;`None` = 单卡)** —— 与 env 同律：装配期
+    /// 烘进本族每张图(eager/捕获/piecewise 三路求值都带上);`clone` 为
+    /// 轻句柄(每个 GraphPlan/桶各自持一份)。
+    pub(crate) tp: Option<TpCtx>,
     /// 模型几何(hq/hkv/…/hidden/dtype;Copy)
     pub(crate) dims: ModelDims,
     pub(crate) pool: &'a StatePool,
@@ -171,6 +213,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                 Some(pf) => {
                     let boot_pg = crate::prefill_plan::BucketBoot {
                         env: boot.env,
+                        tp: boot.tp.clone(),
                         model: Arc::clone(&boot.model),
                         rope: boot.rope.clone(),
                         pool: boot.pool,
@@ -301,6 +344,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     )> {
         let env = boot.env;
+        let tp = boot.tp.clone();
         let pool = boot.pool;
         let dims = boot.dims;
         let model = Arc::clone(&boot.model);
@@ -500,12 +544,12 @@ impl<D: DeviceClient> GraphFleet<D> {
         };
         // V1c:decode_fi 开 ⇒ 段驱动件(断点在 decode 核 ⇒ FI plan 每步重算)
         let (session, capture_outcome) = if dfi_cell.is_some() {
-            let (g, o) = GraphPlan::plan_piecewise(face, env, desc, true, forward).await?;
+            let (g, o) = GraphPlan::plan_piecewise(face, env, tp, desc, true, forward).await?;
             let (ns, nb) = g.piecewise_shape();
             owl_shared::log_info!("boot", "session 分段捕获(段={ns} 断点={nb}) +{:.2}s", t0.elapsed().as_secs_f32());
             (g, o)
         } else {
-            GraphPlan::plan(face, env, desc, forward).await?
+            GraphPlan::plan(face, env, tp, desc, forward).await?
         };
         if let PlanOutcome::EagerFallback { reason } = &capture_outcome {
             owl_shared::log_warn!("engine", "捕获降级为 eager:{reason}");
@@ -530,6 +574,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         let pool = boot.pool;
         let dims = boot.dims;
         let env = boot.env;
+        let tp = boot.tp.clone();
         let knobs = boot.knobs;
         let spec_mode = boot.spec.mode;
         let depth1 = boot.spec.depth + 1;
@@ -792,7 +837,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         // 两档:开关开 ⇒ 段驱动件(零断点 = **退化单图**,与 `plan` 同形;故
         // "臂未登记核"不会静默降级为逐步 eager)；开关关 ⇒ 单图原路。
         let (vg, voutcome) = if break_of_this_plan {
-            let (vg, vo) = GraphPlan::plan_piecewise(vface, env, desc, true, forward).await?;
+            let (vg, vo) = GraphPlan::plan_piecewise(vface, env, tp, desc, true, forward).await?;
             let (nseg, nbrk) = vg.piecewise_shape();
             match &vo {
                 PlanOutcome::Captured => owl_shared::log_info!(
@@ -807,7 +852,7 @@ impl<D: DeviceClient> GraphFleet<D> {
             }
             (vg, vo)
         } else {
-            GraphPlan::plan(vface, env, desc, forward).await?
+            GraphPlan::plan(vface, env, tp, desc, forward).await?
         };
         match voutcome {
             PlanOutcome::Captured => {
@@ -834,6 +879,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         let pool = boot.pool;
         let dims = boot.dims;
         let env = boot.env;
+        let tp = boot.tp.clone();
         let knobs = boot.knobs;
         let mut fold_graphs = Vec::new();
         let n_rec = pool.gdn_count() * 8;
@@ -867,6 +913,7 @@ impl<D: DeviceClient> GraphFleet<D> {
             let (fg, fout) = GraphPlan::plan(
                 fface,
                 env,
+                tp.clone(),
                 GraphPlanDesc {
                     inputs: vec![
                         InputSlot::f32("slots", 1).init(vec![0.0]),
@@ -947,6 +994,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         };
         let pool = boot.pool;
         let env = boot.env;
+        let tp = boot.tp.clone();
         let knobs = boot.knobs;
         let tap_blks: Vec<Bytes> = (0..5)
             .map(|i| vg.output_block(&format!("tap{i}")).expect("tap 输出槽"))
@@ -964,6 +1012,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         let (dg, dout) = GraphPlan::plan(
             gface,
             env,
+            tp,
             GraphPlanDesc {
                 inputs: vec![
                     InputSlot::f32("tokens", 8),
@@ -1076,6 +1125,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         let pool = boot.pool;
         let dims = boot.dims;
         let env = boot.env;
+        let tp = boot.tp.clone();
         let knobs = boot.knobs;
         let spec_depth = boot.spec.depth;
         let mut propose_graphs = Vec::new();
@@ -1110,6 +1160,7 @@ impl<D: DeviceClient> GraphFleet<D> {
             let (pg, pout) = GraphPlan::plan(
                 pface,
                 env,
+                tp.clone(),
                 GraphPlanDesc {
                     inputs: pins,
                     outputs: vec![OutputSlot { name: "drafts".into(), shape: vec![spec_depth, 1], dtype: Dtype::F32 }],

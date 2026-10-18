@@ -76,6 +76,7 @@ pub async fn gpu_piecewise_segments() {
     let (mut plan, outcome) = crate::graph_plan::GraphPlan::plan_piecewise(
         face,
         owl_models::env::EnvProvider::default(),
+        None,
         desc,
         true,
         forward,
@@ -247,7 +248,7 @@ pub async fn gpu_schedule_decision_surface() {
         act.out.push(7);
     }
 
-    let page = eng.pool.page;
+    let page = eng.dev.pool.page;
     match eng.schedule().unwrap() {
         SchedulerOutput::Step { begin, action } => {
             assert!(begin.is_none());
@@ -782,7 +783,7 @@ pub async fn gpu_awq27b_marlin_e2e(shared: Option<&mut RunningEngine<owl_cuda::G
     );
     // 刀D 取证:层间原生时间线(OWL_TS_PROBE;clock64 @~1.98GHz)
     if owl_shared::env_reader::flag("OWL_TS_PROBE") {
-        let raw = match running.graphs.session.read_input_slot_bytes("ts_buf").await {
+        let raw = match running.dev.graphs.session.read_input_slot_bytes("ts_buf").await {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("[ts] 读回失败 {e}");
@@ -1256,7 +1257,7 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
                 eprintln!("[spec-gate] 预算尽门(ignore_eos): {n} tok,文本 {text_ie:?}");
                 assert!(n >= 8, "预算尽 turn 应跑满 8 tok,得 {n}(终态事件是否送达见 panic 信息)");
             }
-            let st = running.spec.stats;
+            let st = running.dev.spec_rt.stats;
             eprintln!(
                 "[spec-gate] stats: rounds={} sum_m={} full={} partial={} zero={}",
                 st.rounds, st.sum_m, st.full, st.partial, st.zero
@@ -1341,14 +1342,14 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
             prompt: &str,
             tag: &str,
         ) -> (String, Vec<u32>) {
-            running.spec.depth = spec_depth;
+            running.dev.spec_rt.depth = spec_depth;
             let (sid, id) = running.submit_session(Some(7), prompt, 40).expect("submit");
             let text = drive_turn(running, id).await;
             let toks = running.bank.sessions
                 .get(sid)
                 .map(|s| s.tokens.clone())
                 .unwrap_or_default();
-            let st = running.spec.stats;
+            let st = running.dev.spec_rt.stats;
             eprintln!(
                 "[spec-gate-27b] {tag} spec_depth={spec_depth} stats: rounds={} sum_m={} full={} partial={} zero={}",
                 st.rounds, st.sum_m, st.full, st.partial, st.zero
@@ -1472,7 +1473,7 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
             tag: &str,
         ) -> (String, Vec<u32>) {
             let prompt_len = prompt.chars().count(); // 近似(测试口径)
-            running.spec.depth = spec_depth;
+            running.dev.spec_rt.depth = spec_depth;
             let (sid, id) = running.submit_session(Some(7), prompt, max_new).expect("submit");
             let tg = std::time::Instant::now();
             let text = drive_turn(running, id).await;
@@ -1482,7 +1483,7 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
                 .map(|s| s.tokens.clone())
                 .unwrap_or_default();
             let gen_n = toks.len().saturating_sub(prompt_len);
-            let st = running.spec.stats;
+            let st = running.dev.spec_rt.stats;
             let al = if st.rounds > 0 { st.sum_m as f64 / st.rounds as f64 } else { 0.0 };
             eprintln!(
                 "[dflash-gate] 生成段: {} tok / {t_gen:.1?} = {:.1} tok/s({tag})",
@@ -1632,8 +1633,8 @@ pub async fn gpu_gdn_slot_cross_probe() {
     let mut running = engine.run(loaded).await.expect("装配");
 
     // ① boot 后初始态:双 slot 指纹 + slot1 非零字节数(alloc 应已清零)
-    let s1_0 = running.pool.gdn_slot_fingerprint(running.graphs.session.face_mut(), 1).await.unwrap();
-    let nz0 = running.pool.gdn_slot_zero_check(running.graphs.session.face_mut(), 1).await.unwrap();
+    let s1_0 = running.dev.pool.gdn_slot_fingerprint(running.dev.graphs.session.face_mut(), 1).await.unwrap();
+    let nz0 = running.dev.pool.gdn_slot_zero_check(running.dev.graphs.session.face_mut(), 1).await.unwrap();
     eprintln!("[slot-probe] boot 后 slot1 非零字节 = {nz0}(期望 0 = alloc 清零生效)");
 
     // ② turn(slot0,新 session)
@@ -1644,9 +1645,9 @@ pub async fn gpu_gdn_slot_cross_probe() {
     let _ = sid;
 
     // ③ turn 后双 slot 指纹
-    let s1_1 = running.pool.gdn_slot_fingerprint(running.graphs.session.face_mut(), 1).await.unwrap();
-    let s0_1 = running.pool.gdn_slot_fingerprint(running.graphs.session.face_mut(), 0).await.unwrap();
-    let s1_nz = running.pool.gdn_slot_zero_check(running.graphs.session.face_mut(), 1).await.unwrap();
+    let s1_1 = running.dev.pool.gdn_slot_fingerprint(running.dev.graphs.session.face_mut(), 1).await.unwrap();
+    let s0_1 = running.dev.pool.gdn_slot_fingerprint(running.dev.graphs.session.face_mut(), 0).await.unwrap();
+    let s1_nz = running.dev.pool.gdn_slot_zero_check(running.dev.graphs.session.face_mut(), 1).await.unwrap();
     eprintln!("[slot-probe] turn 后 slot1 非零字节 = {s1_nz}(>0 = turn(slot0) 跨写了 slot1)");
     let same1 = s1_0 == s1_1;
     eprintln!("[slot-probe] slot1 指纹 turn 前后相同 = {same1}(false = 跨 slot 写实锤)");
@@ -1856,14 +1857,14 @@ async fn gpu_prefill_bucket_matches_eager() {
     }
     // ① 桶档
     let mut g = boot_bucket(&dir, ordinal, PrefillBucket::Geobuckets).await;
-    let buckets = g.graphs.prefill.captured_t_pads();
-    eprintln!("[m2b] 桶捕获:{:?}(summary = {})", buckets, g.graphs.prefill.summary());
+    let buckets = g.dev.graphs.prefill.captured_t_pads();
+    eprintln!("[m2b] 桶捕获:{:?}(summary = {})", buckets, g.dev.graphs.prefill.summary());
     assert!(
         buckets.len() >= 3,
         "geobuckets 至少应捕获小桶若干(实测 {buckets:?});捕获失败看 warn 证据面"
     );
     let out_graph = gen(&mut g, &prompt, 24).await;
-    let counts = g.graphs.prefill.replay_counts();
+    let counts = g.dev.graphs.prefill.replay_counts();
     eprintln!("[m2b] 桶回放次数:{counts:?}");
     // **证据面**:图路确实被走了(批 180 tok / chunk 128 ⇒ 命中 t128 + t64)
     let used: Vec<usize> = counts.iter().filter(|(_, n)| *n > 0).map(|(t, _)| *t).collect();

@@ -10,19 +10,13 @@
 //! KV 由「kv_len 窗口 + 先写后打分」语义天然隔离);真并发随调度层铺开
 //! S3 拼批换入,submit/pump 形状不变。
 
-use std::sync::Arc;
 
 use owl_iface::contract::{DeviceClient, ModelError};
-use owl_models::layers::rope::Rope;
-use owl_models::model::Model;
 use owl_models::tokenizer::Tokenizer;
 
-use crate::engine::EngineConfig;
-use crate::graph_fleet::GraphFleet;
+use crate::engine::{EngineConfig, RankDev};
 use crate::scheduler::{SchedulerOutput, StepAction};
 use crate::session::SessionBank;
-use crate::spec_runtime::SpecRuntime;
-use crate::state::StatePool;
 use crate::turn::{Turn, TurnEvent, TurnLedger, TurnSpec, TurnSpecState};
 
 type Result<T> = std::result::Result<T, ModelError>;
@@ -109,13 +103,6 @@ pub struct RunningEngine<D: DeviceClient> {
     pub(crate) probes: StepProbes,
     pub(crate) cfg: EngineConfig,
     pub(crate) tok: Tokenizer,
-    /// 设备状态块池(KV paged 池/GDN 格/快照池/持久块表;state.rs)
-    pub(crate) pool: StatePool,
-    /// prefill 块式喂入(W1)的模型面:树根构造
-    pub(crate) model: Arc<Model>,
-    pub(crate) rope: Rope,
-    /// 解释器执行环境(EnvProvider;逐 chunk/step 注入 ctx)
-    pub(crate) env: owl_models::env::EnvProvider,
     /// boot 序号(metrics 打点命名空间;进程内自增,b1/b2…)
     pub(crate) boot_seq: u64,
     /// E5 性能:schedule 累计账(轮间 host 成本剖析)
@@ -123,12 +110,13 @@ pub struct RunningEngine<D: DeviceClient> {
     pub(crate) sched_cnt: usize,
     /// turn 运行账(turn.rs)
     pub(crate) turns: TurnLedger,
-    /// 会话 + 块账房(session.rs)
+    /// 会话 + 块账房(session.rs;host 侧 —— 两 rank 共用一份)
     pub(crate) bank: SessionBank,
-    /// 图族(graph_fleet.rs:主会话图 + verify/fold/propose/dflash)
-    pub(crate) graphs: GraphFleet<D>,
-    /// 引擎级 spec 运行态(spec_runtime.rs;turn 域七件套住 ActiveTurn)
-    pub(crate) spec: SpecRuntime,
+    /// **rank0 设备束**(池/图/模型/env/spec 运行态/tp;S4 ⑤-K3 收编)
+    pub(crate) dev: RankDev<D>,
+    /// **TP peer 束(rank1;`None` = 单卡)** —— 设备侧程序镜像的目标
+    /// (S4 ⑤-K3:同一份设备侧代码,换装到 peer 束上再跑一遍)
+    pub(crate) peer: Option<RankDev<D>>,
 }
 
 /// **生成预算的最小保留量**(tok):剩余额度低于它 = 真溢出(连一个像样的
@@ -168,11 +156,41 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 捕获三态结果(Captured = 回放态;EagerFallback = 同闭包直发)
     /// **face 句柄克隆**(HTTP 调试投影面出口;见 `apps/server` 的 `/debug/blocks`)
     pub fn face_clone(&self) -> Option<D> {
-        self.graphs.face_clone()
+        self.dev.graphs.face_clone()
     }
 
     pub fn capture_outcome(&self) -> &crate::graph_plan::PlanOutcome {
-        &self.graphs.capture_outcome
+        &self.dev.graphs.capture_outcome
+    }
+
+    /// 是否带 TP peer 束(双 rank 执行态;单卡 = false)
+    pub fn has_peer(&self) -> bool {
+        self.peer.is_some()
+    }
+
+    /// **诊断出口**:读主 rank(rank0)会话图的命名输出(如 `logits`/`token`)。
+    /// `None` = 该图无此输出槽。G8 对拍/数值归因用(S4 ⑤-K3)。
+    pub async fn read_output_f32(&mut self, name: &str) -> Result<Option<Vec<f32>>> {
+        if !self.dev.graphs.session.has_output(name) {
+            return Ok(None);
+        }
+        Ok(Some(self.dev.graphs.session.read_output_f32(name).await?))
+    }
+
+    /// **诊断出口**:读 peer(rank1)会话图输出(TP 对拍;**单卡 = None**)。
+    /// 用途:G8 的"两 rank 同值"实证(AR 后两 rank 应**逐位相同**)。
+    pub async fn read_peer_output_f32(&mut self, name: &str) -> Result<Option<Vec<f32>>> {
+        let Some(p) = self.peer.as_mut() else { return Ok(None) };
+        if !p.graphs.session.has_output(name) {
+            return Ok(None);
+        }
+        Ok(Some(p.graphs.session.read_output_f32(name).await?))
+    }
+
+    /// **会话 token 账**(诊断/门面:prompt + 已生成,逐 token;S4 ⑤-K3 的 G8
+    /// 判据面 —— 与 `gpu_spec_identity_gate` 同一条 token 级硬判)。`None` = 无此会话。
+    pub fn session_token_ids(&self, sid: u64) -> Option<Vec<u32>> {
+        self.bank.sessions.get(sid).map(|s| s.tokens.clone())
     }
 
     /// 提交 turn(临时会话:每 turn 独立,终了即焚;行为同 M0.5)。
@@ -367,8 +385,8 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 相位是 perf tag 维度(`interp.host.node.<phase>.<核>`),GraphPlan
     /// 构造期只拿到 env 快照 ⇒ 逐相位显式下发(perf-framework.md §十.3)。
     pub(crate) fn set_phase(&mut self, p: owl_models::env::EvalPhase) {
-        self.env.phase = p;
-        self.graphs.set_phase(p);
+        self.dev.env.phase = p;
+        self.dev.graphs.set_phase(p);
     }
 
     pub async fn pump(&mut self) -> Result<TurnEvent> {
@@ -413,7 +431,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                         // 性能面:相位定相 + 包络 span(perf-framework.md §四)。
                         // 引擎 actor = current_thread 运行时 ⇒ 单线程栈配对安全;
                         // 解释器节点钩子按 env.phase 打 tag,两者同源。
-                        let saved = self.env.phase;
+                        let saved = self.dev.env.phase;
                         self.set_phase(owl_models::env::EvalPhase::Prefill);
                         owl_shared::timer_start!("engine.phase.prefill");
                         let r = self.execute_prefill(chunk_ids, base, is_last).await;
@@ -422,7 +440,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                         r
                     }
                     StepAction::Decode { token, pos, kv_slot, gdn_slot, grew } => {
-                        let saved = self.env.phase;
+                        let saved = self.dev.env.phase;
                         self.set_phase(owl_models::env::EvalPhase::Decode);
                         owl_shared::timer_start!("engine.phase.decode");
                         let r = self.execute_decode(token, pos, kv_slot, gdn_slot, grew).await;
@@ -431,7 +449,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                         r
                     }
                     StepAction::SpecRound { token, pos, kv_slots, gdn_slot, grew } => {
-                        let saved = self.env.phase;
+                        let saved = self.dev.env.phase;
                         self.set_phase(owl_models::env::EvalPhase::Spec);
                         owl_shared::timer_start!("engine.phase.spec");
                         let r =

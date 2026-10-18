@@ -134,6 +134,13 @@ RTX 30 系(Ampere sm_86:3080/3090)一等公民;RTX 40 系(Ada sm_89)编入
 | P5 投机解码 | REQ-DEC-02、REQ-CTX-04 |
 | P6 验收 | 全表 + REQ-PRE-03(三级 KV)、REQ-CTX-02(PP 对拍)、03/05 不排期项确认 |
 
+**REQ-PRE-02 验收面(v1.3 增补)**:TP 数值门 = 三段式 —— ①**配置内不变性**(同 world 下变
+batch 形状/chunk 切分/缓存状态 ⇒ 输出唯一;SGLang "Unique samples: 1" 判据)②**vs 单卡功能等价**
+(贪心 token 相同 **或** 互为对方 top-N,分歧即止;vLLM `check_logprobs_close` 判据)③**位级
+transport**(两 rank 逐位 + 跨卡 ≡ 同卡双 rank)。**跨 TP 度不承诺逐位等价**(与 vLLM/SGLang 同款
+免责)。纪律:AR 的归约块数/树形**必须与 shape 无关**(v1 单 chunk 是既有资产;S5 多块/流水前
+必须守住,否则 G8-a 必红)。全部细节:`TP2-施工设计.md` §19/§20。
+
 注:REQ-PRE-02(TP/IPC)贯穿 P1-P6(xinfer runner 即多进程,IPC 通道是其
 既有机制,UUID 钉卡与 P2P 姿态对齐本工作区纪律);REQ-DEC-04(metrics)
 骨架随 P1 建,字段随阶段增。
@@ -158,6 +165,8 @@ RTX 30 系(Ampere sm_86:3080/3090)一等公民;RTX 40 系(Ada sm_89)编入
 | 2026-09-20 | v1.0-draft | 需求阐述轮:全量需求编号化 + 矛盾裁决 8 条 | 本会话需求阐述 + docs/README.md 口径 + 会战/调研数据 |
 | 2026-09-20 | v1.1 | 订正 REQ-CODE-01:trait 优先 = 泛型静态分发,dyn 仅限配置期(C2 同步改写);新增 REQ-CTX-06 YaRN(P2 延后) | 用户订正 |
 | 2026-09-20 | v1.2 | 新增 REQ-DEC-05 GDN CUDA 算子(port lmdeploy turbomind legacy 路径);克隆 lmdeploy 原材料 | GDN CUDA 实现存在性调研收口 |
+| 2026-10-17 | v1.3 | **REQ-PRE-02 验收面增补**:TP 数值门改**三段式**(G8-a 配置内不变性 / G8-b vs 单卡 rank 判据 / G8-c 位级 transport),并加 AR 归约序纪律(见 `TP2-施工设计.md` §19) | 实测定谳(AR 固有数值语义)+ vLLM/SGLang 判例现场核对 |
+| 2026-10-17 | v1.4 | **三段门全部落地**(T1 G8-a / T2 G8-b / T3 位级 transport 实测全绿)+ 纪律增补两条(复用路径不复位:同会话 guard 不受 prefix_cache 控制,热≠冷是预期;读数槽:写槽路径必须与产 token 路径同一条) | 收尾轮(t1 27.0s·t2 10.0s·t3 10.7s,3080 对);施工设计 §21 |
 
 ## 十、开放问题(不阻塞开工)
 

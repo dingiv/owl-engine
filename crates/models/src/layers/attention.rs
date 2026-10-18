@@ -1275,12 +1275,15 @@ impl Module for Attention {
 
 impl Loadable for Attention {
     fn layout(&self, ctx: &LoaderCtx) -> LoaderOps {
+        let q_gate = self.hq * self.hd; // q_proj = q ⊕ gate(各 hq 头 × hd)
         self.q_proj.layout(ctx)
             .chain(self.k_proj.layout(ctx))
             .chain(self.v_proj.layout(ctx))
             .chain(self.o_proj.layout(ctx))
             .chain(self.q_norm.layout(ctx))
             .chain(self.k_norm.layout(ctx))
+            // **融合权重的段长事实**(S4 ②;q_proj = value|gate per-head 拼接)
+            .with_segments_for("q_proj", vec![q_gate, q_gate])
     }
 }
 
@@ -1564,7 +1567,7 @@ mod f16_tests {
         let attn = Attention::new(hq, hkv, hd, hidden, 1e-6, QuantPlan::F16);
 
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
         crate::interpreters::eval_load(&attn, &mut gpu, &src, &lctx)
             .await
             .expect("attention f16 装载");
@@ -1772,7 +1775,7 @@ mod f16_tests {
         let attn = Attention::new(hq, hkv, hd, hidden, eps, QuantPlan::F16);
 
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
         crate::interpreters::eval_load(&attn, &mut gpu, &src, &lctx)
             .await
             .expect("attention f16 装载");
@@ -1996,7 +1999,7 @@ mod f16_tests {
         let attn = Attention::new(hq, hkv, hd, hidden, 1e-6, QuantPlan::F16);
 
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
         crate::interpreters::eval_load(&attn, &mut gpu, &src, &lctx)
             .await
             .expect("attention f16 装载");
@@ -2098,7 +2101,7 @@ mod f16_tests {
         let attn = Attention::new(hq, hkv, hd, hidden, 1e-6, QuantPlan::F16);
 
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F32, shard: 1, device_repack: false, verify: false, debug_tap: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F32, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
         crate::interpreters::eval_load(&attn, &mut gpu, &src, &lctx)
             .await
             .expect("attention f32 装载");
@@ -2202,6 +2205,7 @@ mod owl_port_tests {
         let lctx = crate::module::LoaderCtx {
             dtype: Dtype::F16,
             shard: 1,
+            slice_id: 0,
             device_repack: false,
             verify: false,
             debug_tap: false,

@@ -31,6 +31,9 @@ pub struct Linear {
     /// `pack_marlin_s_a8` 第二返回值 `max/4096`)。`Some` = 本层走 a8 臂
     /// (**单一事实源**:因子在则 a8 在)。
     a8_factor: Option<Weight>,
+    /// **TP 角色标记**(S4 ③';构造期从规则表算一次 —— **纯标注,零决策**:
+    /// 层不构造通信节点,只把它透传到图节点上,解释器统一追加 allreduce)
+    tp_role: crate::plan::rules::WeightRule,
 }
 
 impl Linear {
@@ -56,6 +59,7 @@ impl Linear {
             ws: None,
             ctmp: None,
             a8_factor: None,
+            tp_role: crate::plan::rules::rule_of(key),
         };
         let eligible = crate::formats::w4a16::marlin_eligible(out_dim, in_dim);
         match plan {
@@ -166,8 +170,11 @@ impl Module for Linear {
     /// AWQ 臂(2026-10-01):同构但换 GEMM_W4A16_AWQ(7 Block = scales 后
     /// 插 zeros 槽;kU4 has_zp 内核,组大小 32)。
     fn forward(&self, xs: &TensorOps, ctx: &ForwardCtx) -> TensorOps {
-        let _ = ctx;
-        self.forward_inner(xs)
+        let _ = ctx; // 层**不读 ctx 的 TP 面**(S4 ③':决策在解释器)
+        // ★ **S4 ③':TP 只给标记** —— 构造期已由规则表算好([`Self::tp_role`]),
+        //   这里**纯透传**到图节点;解释器在求值尾部按标记统一追加 allreduce。
+        //   (用户裁决 2026-10-17:感知下沉到解释器层,原子 layer 只留标记。)
+        self.forward_inner(xs).with_tp_role(self.tp_role)
     }
 }
 
@@ -336,6 +343,47 @@ impl Loadable for Linear {
     }
 }
 
+
+#[cfg(test)]
+mod tp_marking_tests {
+    //! S4 ③':TP **标记**面(纯逻辑;插入动作在解释器 —— 真机数值由 G8 验)。
+    use super::*;
+    use crate::plan::rules::WeightRule;
+
+    /// 构造期标记:行并行(down_proj/o_proj/out_proj)⇒ `UniformRow`;
+    /// 列并行(gate_proj/up_proj)⇒ `UniformCol`;小权重 ⇒ `Replicate`
+    #[test]
+    fn new_marks_tp_role_from_rule_table() {
+        let cases: &[(&'static str, WeightRule)] = &[
+            ("down_proj", WeightRule::UniformRow),
+            ("o_proj", WeightRule::UniformRow),
+            ("out_proj", WeightRule::UniformRow),
+            ("gate_proj", WeightRule::UniformCol),
+            ("up_proj", WeightRule::UniformCol),
+            ("q_proj", WeightRule::SegmentedCol(crate::plan::rules::SegKind::QGate)),
+            ("in_proj_qkvz", WeightRule::SegmentedCol(crate::plan::rules::SegKind::QKVZ)),
+            ("in_proj_a", WeightRule::PerHead),
+        ];
+        for (key, want) in cases {
+            let lin = Linear::new(key, 8, 16, QuantPlan::F16);
+            assert_eq!(lin.tp_role, *want, "{key}: 构造期标记");
+        }
+    }
+
+    /// **forward 纯透传**:图节点的 tp_role == 构造期标记(层零决策)
+    #[test]
+    fn forward_passes_mark_through() {
+        use crate::module::ForwardCtx;
+        let row = Linear::new("down_proj", 8, 16, QuantPlan::F16);
+        let x = TensorOps::zeros(Dtype::F16, vec![1, 16]);
+        let y = row.forward(&x, &ForwardCtx::minimal(1));
+        assert_eq!(y.tp_role(), WeightRule::UniformRow, "标记应透传到图节点");
+        assert_eq!(y.shape(), &[1, 8], "输出形状不被标记改变");
+        let col = Linear::new("gate_proj", 8, 16, QuantPlan::F16);
+        let y2 = col.forward(&x, &ForwardCtx::minimal(1));
+        assert_eq!(y2.tp_role(), WeightRule::UniformCol);
+    }
+}
 
 #[cfg(test)]
 mod tests {

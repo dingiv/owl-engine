@@ -131,6 +131,59 @@ impl CliArgs {
     }
 }
 
+/// **本进程持有的设备束**(boot 边界定形;rank 序 = 列表序)。
+///
+/// 单卡档 world = 1(声明式选卡/自动挑空闲的结果);TP 档 world = 2
+/// (`runtime.tp_ordinals`;S6 2026-10-17)。**唯一真源** —— 引擎 ordinal、卡锁、
+/// 日志身份全从这里取,单卡/TP 两条路径不各存一份。
+#[derive(Clone, Debug)]
+pub struct Devices {
+    /// 引擎 ordinal(rank 序 = 列表序;交引擎 cudaSetDevice)
+    ordinals: Vec<usize>,
+    /// 设备 UUID(卡锁 + 日志身份;与 `ordinals` 同长同序)
+    uuids: Vec<String>,
+}
+
+impl Devices {
+    /// 构造即校验(空/长度不齐 = 拒;字段私有 ⇒ 这是唯一入口)
+    fn new(ordinals: Vec<usize>, uuids: Vec<String>) -> Result<Self, String> {
+        if ordinals.is_empty() {
+            return Err("设备束为空(至少要一张卡)".into());
+        }
+        if ordinals.len() != uuids.len() {
+            return Err(format!(
+                "设备束长度不齐:ordinals={} uuids={}(内部不变量)",
+                ordinals.len(),
+                uuids.len()
+            ));
+        }
+        Ok(Self { ordinals, uuids })
+    }
+
+    /// `from_config` 用的占位(world = 1、ordinal 0、UUID 空)—— 真值由
+    /// [`ServerConfig::load`] 的选卡回填;喂 `from_config` 的测试不碰设备面。
+    fn placeholder() -> Self {
+        Self { ordinals: vec![0], uuids: vec![String::new()] }
+    }
+
+    /// rank 数(单卡 = 1;TP v1 恒 2)
+    pub fn world(&self) -> usize {
+        self.ordinals.len()
+    }
+    /// 全部 rank 的 ordinal(rank 序 = 列表序)
+    pub fn ordinals(&self) -> &[usize] {
+        &self.ordinals
+    }
+    /// 全部 rank 的 UUID(与 [`Self::ordinals`] 同长同序)
+    pub fn uuids(&self) -> &[String] {
+        &self.uuids
+    }
+    /// rank0(单卡档即唯一那张)的引擎 ordinal
+    pub fn device(&self) -> usize {
+        self.ordinals[0]
+    }
+}
+
 /// 服务配置(唯一构造口 [`ServerConfig::load`];boot 后只读)
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -144,10 +197,9 @@ pub struct ServerConfig {
     pub model_name: String,
     /// 引擎旋钮(全量配置 engine/cuda/sampling module 的显式搬运)
     pub knobs: owl_engine::EngineKnobs,
-    /// 已选设备 ordinal(声明式选卡/自动挑空闲后的结果;交引擎 cudaSetDevice)
-    pub device: usize,
-    /// 已选设备 UUID(卡锁 + 日志身份)
-    pub device_uuid: String,
+    /// **本进程持有的设备束**(单卡 world = 1 / TP world = 2;rank 序 = 列表序)。
+    /// 单卡档 = 声明式选卡/自动挑空闲的结果;TP 档 = `runtime.tp_ordinals`。
+    pub devices: Devices,
     /// attention 窗上限(runtime.max_seq)
     pub max_seq: usize,
     /// 预填 chunk(runtime.prefill_chunk)
@@ -184,12 +236,14 @@ impl ServerConfig {
             None => None,
         };
         let cfg = OwlConfig::load(base.as_deref(), file)?;
-        // 声明式选卡(2026-10-16):规格 → 设备表过滤 → 剔 gpu_lock 已占 → 取首张
-        // (空规格 = 全部候选 ⇒ 自动挑空闲卡);命中全列日志,无候选/全被占 = 响亮拒启
-        let (device, device_uuid) = resolve_device(&cfg.runtime)?;
+        // 选卡(S6 2026-10-17 起两条规范:单卡声明式 / TP 显式双卡;互斥):
+        //   单卡 = 声明式选卡(2026-10-16):规格 → 设备表过滤 → 剔 gpu_lock 已占
+        //          → 取首张(空规格 = 全部候选 ⇒ 自动挑空闲卡);
+        //   TP   = `runtime.tp_ordinals` 显式双卡(零自动挑卡,见 resolve_tp_devices);
+        //   命中全列日志,无候选/全被占/口径混填 = 响亮拒启。
+        let devices = resolve_devices(&cfg.runtime)?;
         let mut out = Self::from_config(cfg);
-        out.device = device;
-        out.device_uuid = device_uuid;
+        out.devices = devices;
         if let Some(l) = cli.perf_level.as_deref() {
             out.perf_level =
                 owl_shared::metrics::level::parse(l).ok_or("perf-level 非法")?;
@@ -242,9 +296,8 @@ impl ServerConfig {
                 .clone()
                 .unwrap_or_else(|| DEFAULT_MODEL_NAME.into()),
             knobs: owl_engine::EngineKnobs::from_config(&cfg),
-            // 占位:真值由 `load()` 的声明式选卡回填(设备表 + 卡锁都在那边)
-            device: 0,
-            device_uuid: String::new(),
+            // 占位:真值由 `load()` 的选卡回填(设备表 + 卡锁都在那边)
+            devices: Devices::placeholder(),
             max_seq: cfg.runtime.max_seq,
             prefill_chunk: cfg.runtime.prefill_chunk,
             head_quant: cfg.model.head_quant,
@@ -294,6 +347,66 @@ fn vram_free_ratio_map() -> Option<std::collections::HashMap<String, f64>> {
     } else {
         Some(map)
     }
+}
+
+/// **选卡总入口**:两条规范互斥 —— `runtime.tp_ordinals` 给值 ⇒ TP 双卡档
+/// (零自动挑卡);不给 ⇒ 单卡档(声明式选卡/自动挑空闲)。
+fn resolve_devices(rt: &owl_shared::config::RuntimeCfg) -> Result<Devices, String> {
+    match &rt.tp_ordinals {
+        None => {
+            let (o, u) = resolve_device(rt)?;
+            Devices::new(vec![o], vec![u])
+        }
+        Some(ord) => resolve_tp_devices(rt, ord),
+    }
+}
+
+/// **TP 档选卡**(S6 2026-10-17;`runtime.tp_ordinals`)。
+///
+/// 与单卡档的差别 = **不做自动挑卡**:分片协议要的是"确定的双卡 + 确定的
+/// rank 序",而自动挑卡结果随当下占用漂移(同 uuid 会撞 `TpEngine::assemble`
+/// 的同卡护栏;挑到混插对会被 `PeerPlan::plan` 拒)。故此处:
+/// - 必须正好 2 项(v1 world = 2 边界),且互不相同;
+/// - 与 `device` / `device_ordinal` 互斥(同时给 = 拒启,不静默取一方 ——
+///   否则卡身份有两个真源);
+/// - 每项查 UUID 作身份(卡锁 + 日志);查不到 ⇒ 响亮 Err。
+fn resolve_tp_devices(
+    rt: &owl_shared::config::RuntimeCfg,
+    ord: &[usize],
+) -> Result<Devices, String> {
+    if !rt.device.is_empty() {
+        return Err(format!(
+            "选卡口径混填:`runtime.tp_ordinals = {ord:?}` 与 `runtime.device = {:?}` 互斥(TP 档不自动挑卡)",
+            rt.device
+        ));
+    }
+    if let Some(o) = rt.device_ordinal {
+        return Err(format!(
+            "选卡口径混填:`runtime.tp_ordinals = {ord:?}` 与 `runtime.device_ordinal = {o}` 互斥"
+        ));
+    }
+    if ord.len() != 2 {
+        return Err(format!("TP v1 只支持 world = 2(tp_ordinals 得 {} 项 {ord:?})", ord.len()));
+    }
+    if ord[0] == ord[1] {
+        return Err(format!(
+            "TP 两个 rank 指向同一张卡(ordinal {};双 rank 协议要求两张不同的卡)",
+            ord[0]
+        ));
+    }
+    let mut uuids = Vec::with_capacity(ord.len());
+    for &o in ord {
+        let uuid = owl_cuda::ffi::device_uuid(o)
+            .map(|b| owl_shared::device::uuid_display(&b))
+            .map_err(|e| format!("TP rank 的 device_ordinal={o} 的 UUID 查不到: {e:?}"))?;
+        uuids.push(uuid);
+    }
+    // 此刻 logger 尚未初始化(log 被丢弃)⇒ 裸 eprintln 保可见(仓规:boot 关键行恒输出)
+    eprintln!(
+        "[boot] 选卡(TP 档):rank0 = ordinal {} → {};rank1 = ordinal {} → {}(rank 序 = 列表序;logger 前 ⇒ 裸输出)",
+        ord[0], uuids[0], ord[1], uuids[1]
+    );
+    Devices::new(ord.to_vec(), uuids)
 }
 
 /// **声明式选卡**(2026-10-16):见 `owl_shared::device`。

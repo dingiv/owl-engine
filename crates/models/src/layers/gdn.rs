@@ -1057,6 +1057,7 @@ impl Module for GatedDeltaNet {
 
 impl Loadable for GatedDeltaNet {
     fn layout(&self, ctx: &LoaderCtx) -> LoaderOps {
+        let (k_dim, v_dim) = (self.key_dim(), self.value_dim());
         self.in_proj_qkvz.layout(ctx)
             .chain(self.in_proj_b.layout(ctx))
             .chain(self.in_proj_a.layout(ctx))
@@ -1065,6 +1066,10 @@ impl Loadable for GatedDeltaNet {
             .chain(self.a_log.layout(ctx))
             .chain(self.dt_bias.layout(ctx))
             .chain(self.norm_w.layout(ctx))
+            // **融合权重的段长事实**(S4 ②;TP 分段切按它展开 —— 切分逻辑在
+            // 装载面,这里只声明"本张量怎么拼的"):narrow 顺序 = q|k|v|z 与 q|k|v
+            .with_segments_for("in_proj_qkvz", vec![k_dim, k_dim, v_dim, v_dim])
+            .with_segments_for("conv1d", vec![k_dim, k_dim, v_dim])
     }
 }
 
@@ -2281,7 +2286,7 @@ mod f16_tests {
                 .collect();
 
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
         crate::interpreters::eval_load(&layer, &mut gpu, &src, &lctx)
             .await
             .expect("层 f16 装载");
@@ -2356,7 +2361,7 @@ mod f16_tests {
                 .collect();
 
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F32, shard: 1, device_repack: false, verify: false, debug_tap: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F32, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
         crate::interpreters::eval_load(&layer, &mut gpu, &src, &lctx)
             .await
             .expect("层 f32 装载");
@@ -2426,7 +2431,7 @@ mod f16_tests {
                 .collect();
 
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
         crate::interpreters::eval_load(&layer, &mut gpu, &src, &lctx)
             .await
             .expect("层 f16 装载");

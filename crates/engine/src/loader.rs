@@ -35,15 +35,75 @@ pub struct LoadedModel {
     pub(crate) mtp_dir: Option<std::path::PathBuf>,
 }
 
+/// **rank 侧模型件**(TP 装配面):`LoadedModel` 去掉 tokenizer ——
+/// tokenizer 是 host 侧唯一物(两侧各留一份纯浪费);其余件每 rank 各一份。
+pub(crate) struct RankModel {
+    pub(crate) model: Arc<Model>,
+    pub(crate) rope: Rope,
+    /// **分片 spec**(形状单源;与设备池/层同源)
+    pub(crate) spec: ModelSpec,
+    /// 量化方案(环境真值;EnvProvider.quant 注入源)
+    pub(crate) quant_plan: owl_models::module::QuantPlan,
+    /// MTP 头检查点目录(E5-M2b;Some = 检查点自带 mtp.*)
+    pub(crate) mtp_dir: Option<std::path::PathBuf>,
+}
+
+impl LoadedModel {
+    /// 拆件:`(rank 侧模型件, tokenizer)`。
+    pub(crate) fn into_parts(self) -> (RankModel, Tokenizer) {
+        let LoadedModel { model, tokenizer, rope, spec, quant_plan, mtp_dir } = self;
+        (RankModel { model, rope, spec, quant_plan, mtp_dir }, tokenizer)
+    }
+}
+
 /// 面向上层的模型加载器(经引擎的 face;spec 声明驱动)
 pub struct ModelLoader<'a, D: DeviceClient> {
     face: &'a mut D,
+    /// `(slice_id, shard)`;缺省 `(0, 1)` = 单卡全量(S4 ②;见 [`ModelLoader::slice`])
+    slice: (usize, usize),
 }
 
 impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
     /// 构造(工厂;face 由 [`Engine::loader`](crate::Engine::loader) 借出)
     pub(crate) fn new<'a>(face: &'a mut D) -> ModelLoader<'a, D> {
-        ModelLoader { face }
+        ModelLoader { face, slice: (0, 1) }
+    }
+
+    /// **切片装载**(S4 ②;确定性分片协议):`(slice_id, shard)` —— 本 rank 只装
+    /// 模型的 `1/shard`(形状与权重都按规则表切;零协调,多 rank 可并行装载)。
+    /// `shard = 1`(缺省)= 单卡全量。
+    pub fn slice(mut self, slice_id: usize, shard: usize) -> Self {
+        self.slice = (slice_id, shard);
+        self
+    }
+
+    /// 分片 spec(形状单源 = [`ModelSpec::sharded`];`shard = 1` 恒等)
+    fn shard_spec(&self, spec: ModelSpec) -> Result<ModelSpec> {
+        let (id, n) = self.slice;
+        if n <= 1 {
+            return Ok(spec);
+        }
+        spec.sharded(owl_models::plan::tp::TpPlan::new(id, n).map_err(ModelError::Msg)?)
+            .map_err(ModelError::Msg)
+    }
+
+    /// 装载选项(带上本 slice 的 (slice_id, shard))
+    fn shard_opts(&self, dtype: owl_models::contract::Dtype) -> LoadOpts {
+        let (id, n) = self.slice;
+        LoadOpts { shard: n, slice_id: id, ..LoadOpts::plain(dtype) }
+    }
+
+    /// rope 表装载 ctx(同 slice 口径;rope 是 Replicate,但保持一致)
+    fn shard_ctx(&self, dtype: owl_models::contract::Dtype) -> owl_models::module::LoaderCtx {
+        let (id, n) = self.slice;
+        owl_models::module::LoaderCtx {
+            dtype,
+            shard: n,
+            slice_id: id,
+            device_repack: false,
+            verify: false,
+            debug_tap: false,
+        }
     }
 
     /// Qwen3.5-0.8B(维度/键基座从**检查点**读:config.json 优先 + 形状
@@ -53,18 +113,19 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
     pub async fn load_qwen35_0_8b(&mut self, dir: &Path) -> Result<LoadedModel> {
         let (spec, rep) = ModelSpec::from_ckpt(dir, SpecSource::family(&qwen3_5_0_8b()))?;
         log_spec_report("0.8B", &rep);
+        let spec = self.shard_spec(spec)?;
         let model = Model::new(
             &spec,
             Qwen35Convention::new(convention_base(&rep)),
             owl_models::module::QuantPlan::F16,
             owl_models::module::QuantPlan::F16,
         );
-        load_from_dir(dir, self.face, &model, LoadOpts::plain(spec.dtype)).await?;
+        load_from_dir(dir, self.face, &model, self.shard_opts(spec.dtype)).await?;
         let model = Arc::new(model);
         let tokenizer = load_tokenizer(dir, &spec.tokenizer)?;
         let rope = Rope::new(262_144, 256, 64, 10_000_000.0)?;
         let quant_plan = owl_models::module::QuantPlan::F16;
-        let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1, device_repack: false, verify: false, debug_tap: false };
+        let ctx = self.shard_ctx(spec.dtype);
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
         Ok(LoadedModel { model, tokenizer, rope, spec, quant_plan, mtp_dir: None })
 
@@ -80,6 +141,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
     ) -> Result<LoadedModel> {
         let (spec, rep) = ModelSpec::from_ckpt(dir, SpecSource::family(&qwen3_5_0_8b()))?;
         log_spec_report("0.8B-W4A16", &rep);
+        let spec = self.shard_spec(spec)?;
         let model = Model::new(
             &spec,
             Qwen35Convention::new(convention_base(&rep)),
@@ -87,12 +149,12 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
             owl_models::module::QuantPlan::F16,
         );
         // 设备重排 = 关(与历史一致:0.8B 走 CPU 两步重排,量小不值 GPU 往返)
-        load_from_dir(dir, self.face, &model, LoadOpts::plain(spec.dtype)).await?;
+        load_from_dir(dir, self.face, &model, self.shard_opts(spec.dtype)).await?;
         let model = Arc::new(model);
         let tokenizer = load_tokenizer(tokenizer_dir, &spec.tokenizer)?;
         let rope = Rope::new(262_144, 256, 64, 10_000_000.0)?;
         let quant_plan = owl_models::module::QuantPlan::W4A16;
-        let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1, device_repack: false, verify: false, debug_tap: false };
+        let ctx = self.shard_ctx(spec.dtype);
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
         Ok(LoadedModel { model, tokenizer, rope, spec, quant_plan, mtp_dir: None })
 
@@ -122,6 +184,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         });
         let (spec, rep) = ModelSpec::from_ckpt(dir, SpecSource::family(&qwen3_8_27b()))?;
         log_spec_report("27B-AWQ", &rep);
+        let spec = self.shard_spec(spec)?;
         let quant_plan = if w4a8 {
             owl_shared::log_info!(
                 "boot",
@@ -139,6 +202,9 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         );
         // 旋钮:设备重排 = 能力自述裁决(RepackPath::resolve 唯一收口)
         let mut opts = LoadOpts::new(self.face, spec.dtype);
+        // S4 ②:本 slice 的 (slice_id, shard)
+        opts.shard = self.slice.1;
+        opts.slice_id = self.slice.0;
         // 逐键分相账(OWL_LOAD_DEBUG=1;装载测速/瓶颈定位用 —— 与测试路同一开关)
         opts.debug_tap = owl_shared::env_reader::flag("OWL_LOAD_DEBUG");
         // 装载后整块回读校验(OWL_LOAD_VERIFY=1;纠错面 —— 装载数据面大改时的硬门)
@@ -147,7 +213,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let model = Arc::new(model);
         let tokenizer = load_tokenizer(tokenizer_dir, &spec.tokenizer)?;
         let rope = Rope::new(262_144, 256, 64, 10_000_000.0)?;
-        let ctx = owl_models::module::LoaderCtx { dtype: spec.dtype, shard: 1, device_repack: false, verify: false, debug_tap: false };
+        let ctx = self.shard_ctx(spec.dtype);
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
         owl_shared::metrics::with_metrics_store(|s| {
             let _ = s.timer_end("load.27b.total", file!(), line!());

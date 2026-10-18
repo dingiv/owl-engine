@@ -176,6 +176,7 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
             let ctx = owl_models::module::LoaderCtx {
                 dtype: owl_models::contract::Dtype::F16,
                 shard: 1,
+                slice_id: 0,
                 device_repack: false,
                 verify: false,
                 debug_tap: false,

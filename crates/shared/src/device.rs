@@ -80,6 +80,43 @@ pub fn parse_nvidia_smi_mem(text: &str) -> std::collections::HashMap<String, f64
     out
 }
 
+/// 解析 `nvidia-smi -q -d MEMORY` 输出 → `BDF(规范) → BAR1 bytes`。
+///
+/// 形如(每个设备一段;BDF 行 `GPU 00000000:41:00.0` + 段内
+/// `BAR1 Memory Usage / Total : 32768 MiB`)。用途:TP 分档
+/// (`owl_comm::peer::PeerCaps.bar1_bytes`)—— CUDA 无 BAR1 属性、
+/// NVML 不在依赖面,而 `--query-gpu` **没有** `bar1.total` 字段(实测
+/// 该字段在 615 驱动上返回 rc=2)⇒ 只能走详查面。
+/// 非法/缺段行跳过(缺哪张卡由调用方按 BDF 响亮拒)。
+pub fn parse_nvidia_smi_bar1(text: &str) -> std::collections::HashMap<String, u64> {
+    let mut out = std::collections::HashMap::new();
+    let mut cur: Option<String> = None;
+    let mut in_bar1 = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("GPU ") {
+            cur = Some(bdf_norm(rest));
+            in_bar1 = false;
+            continue;
+        }
+        if t.starts_with("BAR1 Memory Usage") {
+            in_bar1 = true;
+            continue;
+        }
+        if in_bar1 {
+            if let Some(v) = t.strip_prefix("Total") {
+                let v = v.trim_start_matches([' ', ':', '\t']);
+                let mib = v.split_whitespace().next().and_then(|x| x.parse::<u64>().ok());
+                if let (Some(bdf), Some(mib)) = (cur.as_ref(), mib) {
+                    out.insert(bdf.clone(), mib << 20);
+                }
+                in_bar1 = false;
+            }
+        }
+    }
+    out
+}
+
 /// 选卡规格(全 `None` = 不指定 ⇒ 全部候选)
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -129,8 +166,15 @@ impl DeviceSpec {
 pub fn bdf_norm(s: &str) -> String {
     let low = s.trim().to_ascii_lowercase();
     let body = match low.split_once(':') {
-        // 带 domain(`0000:42:00.0`)⇒ 去 domain
-        Some((dom, rest)) if dom.len() == 4 && dom.chars().all(|c| c.is_ascii_hexdigit()) => rest,
+        // 带 domain ⇒ 去 domain。两源写法都要认:驱动枚举给 `0000:42:00.0`
+        // (4 位),`nvidia-smi -q` 给 `00000000:41:00.0`(**8 位**)—— 2026-10-17
+        // K2 探测当场踩到(两源归一后必须可比:TP 分档按 BDF 对账 BAR1)。
+        Some((dom, rest))
+            if (dom.len() == 4 || dom.len() == 8)
+                && dom.chars().all(|c| c.is_ascii_hexdigit()) =>
+        {
+            rest
+        }
         _ => low.as_str(),
     };
     // 只比 `bus:dev`(GPU 功能号恒 0,忽略)· 统一分隔符 · 去前导零
@@ -228,5 +272,29 @@ mod tests {
         assert!((m["GPU-aaaa"] - 24148.0 / 24564.0).abs() < 1e-9);
         assert!(m["GPU-bbbb"] < 0.01, "空卡占比≈0 被占");
         assert!(parse_nvidia_smi_mem("").is_empty());
+    }
+
+    /// nvidia-smi BAR1 解析(`-q -d MEMORY` 详查面):BDF → bytes
+    #[test]
+    fn nvidia_smi_bar1_parse() {
+        let text = "==============NVSMI LOG==============\n\
+                    Attached GPUs : 2\n\
+                    GPU 00000000:41:00.0\n\
+                    \x20   FB Memory Usage\n\
+                    \x20       Total : 24564 MiB\n\
+                    \x20   BAR1 Memory Usage\n\
+                    \x20       Total : 32768 MiB\n\
+                    \x20       Used : 15 MiB\n\
+                    GPU 00000000:01:00.0\n\
+                    \x20   BAR1 Memory Usage\n\
+                    \x20       Total : 256 MiB\n";
+        let m = parse_nvidia_smi_bar1(text);
+        assert_eq!(m.len(), 2, "两张卡各一条");
+        // 键 = `bdf_norm` 规范形(驱动枚举与 nvidia-smi 两源同归一)
+        assert_eq!(m[&bdf_norm("00000000:41:00.0")], 32768 << 20, "3090 Ti = 32GiB");
+        assert_eq!(m[&bdf_norm("00000000:01:00.0")], 256 << 20, "3080 魔改 = 256MiB");
+        // 两源可比(8 位 domain vs 4 位 domain;2026-10-17 K2 探测踩坑回归)
+        assert_eq!(bdf_norm("00000000:41:00.0"), bdf_norm("0000:41:00.0"));
+        assert!(parse_nvidia_smi_bar1("").is_empty());
     }
 }

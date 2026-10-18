@@ -1,4 +1,5 @@
 //! 调度三相位执行(begin/prefill/decode)+ 采样收口 + GDN 画像
+use super::prefill_chunk::ChunkHost;
 use super::*;
 use owl_models::ops::PlanNode; // ⚙ diag:池叶 → 块 id(写者足迹取证)
 
@@ -9,17 +10,42 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 性能面:本轮 epoch 起点(/debug/perf?epoch=1 = 只看本轮;不 reset,
         // 历史样本仍可全量查询 —— perf-framework.md §三)
         owl_shared::metrics::mark_epoch();
-        if b.reset_gdn {
-            let face = self.graphs.session.face_mut();
-            self.pool.reset_gdn(face, b.gdn_slot).await?;
-        } else if let Some(key) = b.restore_key {
-            // 前缀命中:恢复边界快照到会话格(免重灌;GDN 态对齐)
-            let face = self.graphs.session.face_mut();
-            self.pool.restore_snap(face, b.gdn_slot, key).await?;
+        let table = self.bank.sessions.get(b.session_id).expect("账在").block_table.clone();
+        let (reset_gdn, restore_key, gdn_slot) = (b.reset_gdn, b.restore_key, b.gdn_slot);
+        {
+            let (dev, peer) = (&mut self.dev, self.peer.as_mut());
+            match peer {
+                None => dev.begin_dev(reset_gdn, restore_key, gdn_slot, &table).await?,
+                Some(p) => {
+                    // **两 rank 并发推进**(S4 ⑤-K3;单边先行 = 对端 AR 撞 5s 自旋)
+                    let (r0, r1) = join2(
+                        dev.begin_dev(reset_gdn, restore_key, gdn_slot, &table),
+                        p.begin_dev(reset_gdn, restore_key, gdn_slot, &table),
+                    )
+                    .await;
+                    r0?;
+                    r1?;
+                }
+            }
         }
-        self.write_bt(b.session_id).await
+        Ok(())
     }
 
+    /// **prefill 收割半(主 rank)**:读 token + 记账 + seed 落地(host 写只在主 rank)
+    async fn harvest_prefill(
+        &mut self,
+        tail: Option<crate::exec::prefill_chunk::PrefillTail>,
+        boot_seq: u64,
+    ) -> Result<Option<u32>> {
+        let Some(t) = tail else { return Ok(None) };
+        let h = self.dev.prefill_harvest(t, true).await?;
+        mfact(boot_seq, "pf.last", h.token as u64);
+        mfact(boot_seq, "pf.eos", self.tok.is_eos(h.token) as u64);
+        if let Some(hb) = h.seed_hidden {
+            self.tspec().spec_seed_hidden = Some(hb);
+        }
+        Ok(Some(h.token))
+    }
 
     /// prefill chunk 执行(设备侧;块已在决策面切好)
     pub(crate) async fn execute_prefill(
@@ -34,11 +60,69 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         };
         // 调试门:prefill 块粒度(见 owl_shared::stepgate;`--step-gate` 控制)
         owl_shared::step_gate!("engine.prefill").await;
-        let last_row = self.prefill_chunk(&chunk_ids, base, is_last).await?;
-        // E2c:块边界跨越 → GDN 快照拍摄(可复用身份 = 链尾块)
+        // ── 主机侧事实(唯一取值点;两 rank 共用)────────────────────────
+        let (bt_chain, gdn_slot) = {
+            let s = self.bank.sessions.get(sid).expect("账在");
+            (s.block_table.clone(), s.gdn_slot)
+        };
+        let mut host0 = ChunkHost {
+            boot_seq: self.boot_seq,
+            probes: self.probes,
+            knobs: &self.cfg.knobs,
+            sid,
+            bt_chain: &bt_chain,
+            gdn_slot,
+            bank: Some(&mut self.bank),
+        };
+        let mut host1 = ChunkHost {
+            boot_seq: self.boot_seq,
+            probes: self.probes,
+            knobs: &self.cfg.knobs,
+            sid,
+            bt_chain: &bt_chain,
+            gdn_slot,
+            bank: None, // peer:镜像路不给账房(草稿臂在本路响亮拒)
+        };
+        // ── ① 两 rank **并发**入队半(同一份设备侧代码,各自 rank 束)──────
+        // ⚠️ 必须并发:单边先行 ⇒ 对端 AR 自旋 5s 超时 + 游标永久失步
+        // (2026-10-17 G8 定谳;host 在入队半里存在设备等待点,串行必死)
+        let boot_seq = host0.boot_seq;
+        let tail0 = {
+            let (dev, peer) = (&mut self.dev, self.peer.as_mut());
+            match peer {
+                None => dev.prefill_chunk_enqueue(&mut host0, &chunk_ids, base, is_last).await?,
+                Some(p) => {
+                    let (r0, r1) = join2(
+                        dev.prefill_chunk_enqueue(&mut host0, &chunk_ids, base, is_last),
+                        p.prefill_chunk_enqueue(&mut host1, &chunk_ids, base, is_last),
+                    )
+                    .await;
+                    let tail0 = r0?;
+                    let tail1 = r1?;
+                    // peer 归块(不读 —— 读数只在主 rank)
+                    if let Some(t1) = tail1 {
+                        let _ = p.prefill_harvest(t1, false).await?;
+                    }
+                    tail0
+                }
+            }
+        };
+        // 主 rank 收割(**两 rank 都已入队之后**才读;borrow 已释放)
+        let last_row = self.harvest_prefill(tail0, boot_seq).await?;
+        // E2c:块边界跨越 → GDN 快照拍摄(可复用身份 = 链尾块;每 rank 各拍各的池)
         let new_fed = base + chunk_ids.len();
-        if self.pool.paged && new_fed.is_multiple_of(self.pool.page) {
-            self.capture_gdn_snap(sid, new_fed).await?;
+        if self.dev.pool.paged && new_fed.is_multiple_of(self.dev.pool.page) {
+            if let Some((gdn_slot, key)) = self.snap_key_of(sid, new_fed) {
+                let (dev, peer) = (&mut self.dev, self.peer.as_mut());
+                match peer {
+                    None => dev.snap_dev(gdn_slot, key).await?,
+                    Some(p) => {
+                        let (r0, r1) = join2(dev.snap_dev(gdn_slot, key), p.snap_dev(gdn_slot, key)).await;
+                        r0?;
+                        r1?;
+                    }
+                }
+            }
         }
         self.turns.active.as_mut().expect("活跃").fed += chunk_ids.len();
         if !is_last {
@@ -71,9 +155,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let t0 = prof.then(std::time::Instant::now);
         let t_step = std::time::Instant::now();
         // E2b:块链跨页增长 → 重写持久块表(图烘焙 bt 指针)
-        if grew {
-            self.write_bt(sid).await?;
-        }
+        // (host 侧取表;**设备半在 step 之前**,两 rank 同表同序)
+        let grow_bt = grew.then(|| self.bank.sessions.get(sid).expect("账在").block_table.clone());
         // XQA 裸 decode 臂(2026-10-13 ②):`xqa_seq` = kv_len 的 **u32 位型**
         // (核按 `const uint32_t*` 读;`(pos+1) as f32` 会拿到浮点位型);
         // `xqa_sem` 每轮清零(KV-split 归约计数 —— 参考实现 `sem.zero_()`)。
@@ -85,19 +168,19 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             ("kv_slot", vec![kv_slot as f32]),
             ("gdn_slot", vec![gdn_slot as f32]),
         ];
-        if self.graphs.session.has_input("xqa_seq") {
+        if self.dev.graphs.session.has_input("xqa_seq") {
             step_slots.push(("xqa_seq", vec![f32::from_bits((pos + 1) as u32)]));
-            let n = self.graphs.session.input_len("xqa_sem").unwrap_or(0);
+            let n = self.dev.graphs.session.input_len("xqa_sem").unwrap_or(0);
             step_slots.push(("xqa_sem", vec![0.0; n]));
             // XQA 页表 = 本会话真页链(不喂 = 图里恒等链 = 读到别家 KV;§7.6)
-            if self.graphs.session.has_input("xqa_pt") {
+            if self.dev.graphs.session.has_input("xqa_pt") {
                 step_slots.push(("xqa_pt", self.xqa_pt_of(sid)));
             }
         }
         // **FI 断点臂(V1c;T=1)**:宿主标量槽 ctx_total + 表四件套(位型过线)。
         // 判据 = 槽在场(与 xqa_seq 同款纪律:`decode_fi` 关时图里没有这些槽)
-        if self.graphs.session.has_input("fi_q_cu") {
-            if let Some(cell) = self.graphs.decode_fi_ctx() {
+        if self.dev.graphs.session.has_input("fi_q_cu") {
+            if let Some(cell) = self.dev.graphs.decode_fi_ctx() {
                 let ctx_total = pos + 1;
                 // ⚙ diag(`OWL_FI_BUCKET=<n>`):把**宿主标量槽**按桶上取整 ⇒ plan
                 // 只在跨桶时重算(表仍按真值写 ⇒ 每行 KV 上界由设备表定)。
@@ -109,13 +192,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     ctx_total
                 };
                 cell.store(plan_ctx, std::sync::atomic::Ordering::Relaxed);
-                let page = self.pool.page;
+                let page = self.dev.pool.page;
                 let bt_chain = {
                     let s = self.bank.sessions.get(sid).expect("账在");
                     s.block_table.clone()
                 };
                 let nb_used = ctx_total.div_ceil(page).min(bt_chain.len()).max(1);
-                let mut idx = vec![0f32; self.pool.nb];
+                let mut idx = vec![0f32; self.dev.pool.nb];
                 for (i, b) in bt_chain.iter().take(nb_used).enumerate() {
                     idx[i] = f32::from_bits(*b);
                 }
@@ -137,7 +220,21 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if kv_dump_at == Some(pos) {
             self.dump_kv_page(sid, kv_slot, "before").await?;
         }
-        self.graphs.session.step(&step_refs).await?;
+        // 设备半(两 rank **并发**):块表重写(跨页)+ 会话图入队 —— **零同步**
+        // (并发理由同 prefill:单边先行 ⇒ 对端 AR 5s 自旋超时)
+        let (dev, peer) = (&mut self.dev, self.peer.as_mut());
+        match peer {
+            None => dev.decode_dev(&step_refs, grow_bt.as_deref()).await?,
+            Some(p) => {
+                let (r0, r1) = join2(
+                    dev.decode_dev(&step_refs, grow_bt.as_deref()),
+                    p.decode_dev(&step_refs, grow_bt.as_deref()),
+                )
+                .await;
+                r0?;
+                r1?;
+            }
+        }
         if kv_dump_at == Some(pos) {
             self.dump_kv_page(sid, kv_slot, "after").await?;
         }
@@ -152,8 +249,18 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // E2c:decode 跨页边界 → 快照拍摄(同流保序,先拍再采样)
         {
             let act = self.turns.active.as_ref().expect("活跃");
-            if self.pool.paged && act.fed.is_multiple_of(self.pool.page) {
-                self.capture_gdn_snap(act.session_id, act.fed).await?;
+            if self.dev.pool.paged && act.fed.is_multiple_of(self.dev.pool.page) {
+                if let Some((gdn_slot, key)) = self.snap_key_of(act.session_id, act.fed) {
+                    let (dev, peer) = (&mut self.dev, self.peer.as_mut());
+                    match peer {
+                        None => dev.snap_dev(gdn_slot, key).await?,
+                        Some(p) => {
+                            let (r0, r1) = join2(dev.snap_dev(gdn_slot, key), p.snap_dev(gdn_slot, key)).await;
+                            r0?;
+                            r1?;
+                        }
+                    }
+                }
             }
         }
         // D1 取证:GDN 状态格画像(OWL_GDN_DUMP;前 6 步,首末层 conv_v/rec)
@@ -173,7 +280,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let eff_sampler = self.turns.active.as_ref().expect("活跃").sampler;
         let sampler_on = self.turns.active.as_ref().expect("活跃").sampler_on;
         let nt = if sampler_on {
-            let mut logits = self.graphs.session.read_output_f32("logits").await?;
+            let mut logits = self.dev.graphs.session.read_output_f32("logits").await?;
             // 诊断:分布形状(绝对尺度 / top1-top2 gap / 候选词面)——
             // 复读病理定位的仪表盘(OWL_DEBUG 门控,前 16 步)
             let (turn_id, step) = {
@@ -187,14 +294,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // B6.3:fp8 池字节域同序(1B/elem,e4m3);A/B 池对拍仪表
             // (f16 boot 半值 vs fp8 boot 字节,host RNE 桥对)
             if self.probes.debug && step < 16 {
-                let fp8 = self.pool.kv_fp8;
+                let fp8 = self.dev.pool.kv_fp8;
                 let esz = if fp8 { 1usize } else { 2usize };
-                let kv0 = &self.pool.kvs[0].k_cache;
+                let kv0 = &self.dev.pool.kvs[0].k_cache;
                 let mut whole = vec![0u8; kv0.1 * esz];
-                let face = self.graphs.session.face_mut();
+                let face = self.dev.graphs.session.face_mut();
                 face.dtoh(&kv0.0, &mut whole).await?;
-                let (hkv, hd) = (self.pool.dims.hkv, self.pool.dims.hd);
-                let _page = self.pool.page;
+                let (hkv, hd) = (self.dev.pool.dims.hkv, self.dev.pool.dims.hd);
+                let _page = self.dev.pool.page;
                 let k_off =
                     |slot: usize, d: usize| -> usize { owl_models::env::knhd_offset(slot, 0, d, hkv, hd) };
                 let probe = |slot: usize| -> usize {
@@ -277,8 +384,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 owl_shared::log_debug!("sample-dump", "t{turn_id} s{step}: sampled={nt} hist={} pen={}", history.len(), eff_sampler.rep_penalty);
             }
             nt
-        } else if self.env.diag.host_argmax {
-            let logits = self.graphs.session.read_output_f32("logits").await?;
+        } else if self.dev.env.diag.host_argmax {
+            let logits = self.dev.graphs.session.read_output_f32("logits").await?;
             logits.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |a, (i, &v)| {
                 if v > a.1 { (i, v) } else { a }
             })
@@ -292,7 +399,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     (act.id, act.out.len() as u64)
                 };
                 if step < 16 {
-                    let logits = self.graphs.session.read_output_f32("logits").await?;
+                    let logits = self.dev.graphs.session.read_output_f32("logits").await?;
                     let mut top: Vec<(f32, u32)> = logits
                         .iter()
                         .enumerate()
@@ -311,7 +418,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     owl_shared::log_debug!("logits-dump", "t{turn_id} s{step}: {}", pretty.join(" | "));
                 }
             }
-            let tok_f = self.graphs.session.read_output_f32("token").await?;
+            let tok_f = self.dev.graphs.session.read_output_f32("token").await?;
             tok_f[0] as u32
         };
         if prof {
@@ -320,18 +427,18 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         mrec("decode.step", t_step.elapsed());
         // B4 降级期草稿同步(§6.24 方案 A):decode 图 taps → 1 行 encode。
         // 毒化带 ≤8 token 即被覆写,探测重入零损;成本 ≈ 0.5ms/tok(2%)
-        if self.tspec_ref().spec_degraded && self.spec.dflash_tap_count > 0 {
+        if self.tspec_ref().spec_degraded && self.dev.spec_rt.dflash_tap_count > 0 {
             // 降级步分相(2026-10-12 探针完善):sync encode 单独计时 ——
             // 9.3 t/s 案的 80ms/步嫌疑犯,一屏定谳
             let t_syn = std::time::Instant::now();
-            let dtype = self.pool.dims.dtype;
-            let hidden = self.pool.dims.hidden;
-            let taps: Vec<TensorOps> = (0..self.spec.dflash_tap_count)
-                .filter_map(|i| self.graphs.session.output_block(&format!("tap{i}")))
+            let dtype = self.dev.pool.dims.dtype;
+            let hidden = self.dev.pool.dims.hidden;
+            let taps: Vec<TensorOps> = (0..self.dev.spec_rt.dflash_tap_count)
+                .filter_map(|i| self.dev.graphs.session.output_block(&format!("tap{i}")))
                 .map(|b| TensorOps::of_block(b.id, dtype, vec![1, hidden]))
                 .collect();
-            if taps.len() == self.spec.dflash_tap_count {
-                self.prefill_dflash_encode(&taps, pos).await?;
+            if taps.len() == self.dev.spec_rt.dflash_tap_count {
+                self.dev.prefill_dflash_encode(self.probes, &taps, pos).await?;
             }
             mrec("decode.sync", t_syn.elapsed());
             self.tspec().spec_steps_degraded += 1;
@@ -370,8 +477,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             return Ok(());
         }
         let lines = {
-            let face = self.graphs.session.face_mut();
-            self.pool.gdn_slot_profile(face, gdn_slot, step, self.cfg.knobs.gdn_dump_all).await?
+            let face = self.dev.graphs.session.face_mut();
+            self.dev.pool.gdn_slot_profile(face, gdn_slot, step, self.cfg.knobs.gdn_dump_all).await?
         };
         for l in lines {
             // GDN 画像行(probes.gdn_dump 门内;行体自含格式,只挂 tag)
@@ -468,24 +575,24 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// ⚙ diag:把"当前槽所在页"的 KV 字节 d2h 落盘(层 0 的 k 池;写者足迹取证)。
     /// 落 `/tmp/kv-{tag}.bin` + `/tmp/kv-meta.txt`(blk/off/hkv/hd/page/字节数)。
     async fn dump_kv_page(&mut self, sid: u64, kv_slot: u32, tag: &str) -> Result<()> {
-        let d = &self.pool.dims;
-        let page = self.pool.page;
+        let d = &self.dev.pool.dims;
+        let page = self.dev.pool.page;
         let (hkv, hd) = (d.hkv, d.hd);
         // fp8 池 = 1B/元素(扁平 u8 账);f16 池 = 2B ✓
-        let esize = if self.pool.kv_fp8 { 1 } else { d.dtype.size_bytes() };
+        let esize = if self.dev.pool.kv_fp8 { 1 } else { d.dtype.size_bytes() };
         let row_bytes = hkv * hd * esize;
         let blk = {
             let s = self.bank.sessions.get(sid).expect("账在");
             let p = (kv_slot as usize) / page;
             s.block_table.get(p).copied().unwrap_or(0)
         };
-        let pool_leaf = self.pool.kv_caches()[0].0.clone();
+        let pool_leaf = self.dev.pool.kv_caches()[0].0.clone();
         let pool_id = match pool_leaf.op() {
             owl_models::ops::Op::Block { id } => *id,
             _ => return Ok(()),
         };
         let n = row_bytes * page;
-        let face = self.graphs.session.face_mut();
+        let face = self.dev.graphs.session.face_mut();
         // 记名(全量):KV 页 dump 探针的临时块(按 tag 区分调用点)
         let scratch = face
             .alloc(owl_iface::contract::Dtype::U32, n / 4, &format!("probe.kv_page.{tag}"))
@@ -526,4 +633,42 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         Ok(())
     }
 
+}
+
+impl<D: DeviceClient> crate::engine::RankDev<D> {
+    /// **begin 设备半**(S4 ⑤-K3):GDN 重置 / 快照恢复 / 块表重写 ——
+    /// 现役字段 = 当前 rank 束(peer 镜像时已换装)。零读数(TP 镜像块契约)。
+    pub(crate) async fn begin_dev(
+        &mut self,
+        reset_gdn: bool,
+        restore_key: Option<u32>,
+        gdn_slot: usize,
+        table: &[u32],
+    ) -> Result<()> {
+        if reset_gdn {
+            let face = self.graphs.session.face_mut();
+            self.pool.reset_gdn(face, gdn_slot).await?;
+        } else if let Some(key) = restore_key {
+            // 前缀命中:恢复边界快照到会话格(免重灌;GDN 态对齐)
+            let face = self.graphs.session.face_mut();
+            self.pool.restore_snap(face, gdn_slot, key).await?;
+        }
+        let face = self.graphs.session.face_mut();
+        self.pool.write_bt(face, table).await
+    }
+
+
+    /// **decode 设备半**(S4 ⑤-K3):块表重写(跨页)+ 会话图入队 ——
+    /// **零同步**(TP 镜像块契约;读数全在采样面)。
+    pub(crate) async fn decode_dev(
+        &mut self,
+        refs: &[(&str, &[f32])],
+        bt: Option<&[u32]>,
+    ) -> Result<()> {
+        if let Some(table) = bt {
+            let face = self.graphs.session.face_mut();
+            self.pool.write_bt(face, table).await?;
+        }
+        self.graphs.session.step(refs).await
+    }
 }

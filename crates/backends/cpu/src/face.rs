@@ -18,6 +18,9 @@ use std::collections::HashMap;
 /// CPU 后端(与 GPU server 同一契约;测试/对拍/CPU 推理路径)
 pub struct CpuFace {
     blocks: HashMap<u64, Value>,
+    /// **块声明 dtype**(alloc/htod 时记录;`upload_pinned` 的字节解码按它 ——
+    /// S4 ② 分片装载门要在 CPU 面落 **f16 权重块**,而块值域恒 f32)
+    declared: HashMap<u64, Dtype>,
     next: u64,
     /// **归还记账面**(2026-10-15 段求值 P0):`free` 的 id 顺序入账。
     /// 语义:CPU 面**不真焚数据**(存量用例依赖"free 后仍可读"),但把"谁被归还"
@@ -34,7 +37,7 @@ impl Default for CpuFace {
 
 impl CpuFace {
     pub fn new() -> Self {
-        Self { blocks: HashMap::new(), next: 1, freed: Vec::new() }
+        Self { blocks: HashMap::new(), declared: HashMap::new(), next: 1, freed: Vec::new() }
     }
 
     /// 已归还块 id(记账面;见字段注释)
@@ -76,6 +79,7 @@ impl DeviceClient for CpuFace {
         let id = self.next;
         self.next += 1;
         self.blocks.insert(id, v);
+        self.declared.insert(id, dtype);
         // CPU 面值块恒 f32;阶数由客户端定形
         Ok(Bytes::new(id, elems, Dtype::F32, 0))
     }
@@ -92,6 +96,7 @@ impl DeviceClient for CpuFace {
         let id = self.next;
         self.next += 1;
         self.blocks.insert(id, v);
+        self.declared.insert(id, dtype);
         Ok(Bytes::new(id, 0, dtype, shape.len() as u8))
     }
 
@@ -258,15 +263,29 @@ impl DeviceClient for CpuFace {
         offset_bytes: usize,
         len_bytes: usize,
     ) -> Result<(), ModelError> {
-        // CPU 面 = f32 世界:字节租约按 f32 LE 解码入账(f16 装载路径不走
-        // CPU;若将来要,可在这是加 F16 解码分支 —— 结构已就位)
+        // CPU 面 = f32 值域,但**声明 dtype 决定字节解码**(S4 ②:分片装载门
+        // 要在 CPU 面落 f16 权重块 —— 2026-10-17 由 `tp_load_gate` 当场抓出:
+        // 旧的"一律按 f32 解码"会把 f16 字节只写一半元素、且值全错)
+        let declared = *self
+            .declared
+            .get(&dst.id)
+            .ok_or(ModelError::DeadBlock { id: dst.id })?;
+        let esz = match declared {
+            Dtype::F32 => 4,
+            Dtype::F16 => 2,
+            other => {
+                return Err(ModelError::Msg(format!(
+                    "CpuFace::upload_pinned: 声明 dtype {other:?} 不支持(F32/F16)"
+                )))
+            }
+        };
         let v = self
             .blocks
             .get_mut(&dst.id)
             .ok_or(ModelError::DeadBlock { id: dst.id })?;
         let bytes = &buf.as_bytes()[..len_bytes];
-        let offset_elems = offset_bytes / 4;
-        let elems = len_bytes / 4;
+        let offset_elems = offset_bytes / esz;
+        let elems = len_bytes / esz;
         let end = offset_elems + elems;
         if v.f32.len() < end || bytes.len() != len_bytes {
             return Err(ModelError::Msg(format!(
@@ -275,8 +294,19 @@ impl DeviceClient for CpuFace {
                 v.f32.len()
             )));
         }
-        for (i, c) in bytes.chunks_exact(4).enumerate() {
-            v.f32[offset_elems + i] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        match declared {
+            Dtype::F32 => {
+                for (i, c) in bytes.chunks_exact(4).enumerate() {
+                    v.f32[offset_elems + i] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                }
+            }
+            Dtype::F16 => {
+                for (i, c) in bytes.chunks_exact(2).enumerate() {
+                    let bits = u16::from_le_bytes([c[0], c[1]]);
+                    v.f32[offset_elems + i] = half::f16::from_bits(bits).to_f32();
+                }
+            }
+            _ => unreachable!("上方已拒"),
         }
         Ok(())
     }

@@ -405,6 +405,8 @@ mod tests {
         let draft = dflash2_draft(dir, kv_fp8)?;
         let opts = LoadOpts {
             dtype: Dtype::BF16,
+            shard: 1,
+            slice_id: 0,
             device_repack: Some(
                 crate::module::RepackPath::resolve(device_repack, face.device_kernels())
                     .is_device(),
@@ -803,6 +805,7 @@ mod tests {
             &crate::module::LoaderCtx {
                 dtype: Dtype::F16,
                 shard: 1,
+                slice_id: 0,
                 device_repack: false,
                 verify: false,
                 debug_tap: false,
@@ -986,7 +989,7 @@ mod tests {
         );
         let manifest = {
             let src = crate::formats::safetensors::SafeTensorsSource::open_dir(&dir)?;
-            let ctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false };
+            let ctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
             crate::interpreters::eval_load(&model, &mut gpu, &src, &ctx).await?
         };
         eprintln!("[chk] manifest {} 条", manifest.entries().len());
@@ -1153,7 +1156,7 @@ mod tests {
         let model = load_0_8b(&dir, &mut gpu).await.expect("load_0_8b(真权重)");
         let rp = Rope::new(262_144, HD, 64, 10_000_000.0).expect("rope");
         crate::interpreters::eval_load(&rp, &mut gpu, &rp.tables(),
-            &crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, device_repack: false, verify: false, debug_tap: false })
+            &crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false })
             .await.expect("rope 表(f16 正确姿势)");
 
         // 常驻缓冲 ×2 套(ref / prefill;KV 8 槽,GDN 状态格用 0)

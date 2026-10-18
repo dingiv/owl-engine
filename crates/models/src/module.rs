@@ -100,6 +100,33 @@ pub struct AttnFiBreak {
     pub ctx_total: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
+/// **张量并行的运行期上下文**(S4 ③;引擎在装配期构造并注入 `ForwardCtx.tp`)。
+///
+/// 层结构体**零感知**(用户裁决:切分不进结构体):唯一读它的地方是
+/// 解释器求值尾部的 allreduce 注入(节点标记 = [`TensorOps::tp_role`]);
+/// 装载期的 `needs_ar` 查询 = 规则表单源。
+///
+/// `Clone` = 轻句柄克隆(`Bytes` 为小 POD;每个图/每次求值各自持一份)。
+#[derive(Clone)]
+pub struct TpCtx {
+    /// 本 rank 的分片计划(`(slice_id, n_slices)` 确定性分片协议)
+    pub plan: crate::plan::tp::TpPlan,
+    /// 本端 staging(常驻;**建图前**已完成 VMM 握手)
+    pub own: crate::contract::Bytes,
+    /// 对端 staging 的跨卡别名(常驻;只读槽)
+    pub peer: crate::contract::Bytes,
+    /// staging 的 slot 字节数(`comm::ar::StagingLayout::slot_bytes`)
+    pub slot_bytes: u64,
+}
+
+impl TpCtx {
+    /// 该权重键所在层的输出是否为**部分和**(需要 allreduce;规则表单源)
+    pub fn needs_ar(&self, key: &str) -> bool {
+        crate::plan::rules::needs_ar(key)
+    }
+
+}
+
 pub struct ForwardCtx<'a> {
     /// 本步 token 数(decode = 1;prefill = 块长)
     pub tokens: usize,
@@ -868,6 +895,12 @@ impl Sink {
     pub(crate) fn deliver(&self, b: Bytes) {
         self.0.deliver(b);
     }
+
+    /// 测试专用空口(S4 ② 分片装载的单测要裸造 Want,不挂真实槽)
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self(SlotCell(Arc::new(Mutex::new(None))))
+    }
 }
 
 /// 单条数据需求(纯元数据 + 回填口)。key 为 owned:容器聚合
@@ -879,6 +912,13 @@ pub struct Want {
     pub dtype: Dtype,
     pub shape: Shape,
     pub layout: Layout,
+    /// **融合权重的段长**(源坐标系;S4 ②)。`Some` = 本张量是拼接而来
+    /// (q⊕gate / q⊕k⊕v / conv 通道),分段切按它展开;`None` = 不分段。
+    ///
+    /// 为什么挂在 Want 上:段长是**权重的事实**(这个张量怎么拼的),由它的
+    /// 构造者(Attention/GDN)用 [`LoaderOps::with_segments`] 声明;
+    /// **怎么切**仍归装载面(规则表 `plan::rules::rule_of`)—— 层不感知切分。
+    pub segments: Option<Vec<usize>>,
     pub(crate) sink: Sink,
 }
 
@@ -915,6 +955,39 @@ impl LoaderOps {
 
     pub fn wants(&self) -> &[Want] {
         &self.wants
+    }
+
+    /// **可变访问**(S4 ②:装载面的分片化 pass 就地改写 shape / 布局)
+    pub fn wants_mut(&mut self) -> &mut [Want] {
+        &mut self.wants
+    }
+
+    /// **声明融合权重段长**(S4 ②;仅对**单 Want** 的链调用 —— 如
+    /// `qw.layout_as_device_rearrange(..).with_segments(vec![nk*hk, nk*hk, nv*hv])`)。
+    ///
+    /// 语义:本 Want 的源张量是 `Σsegs` 行拼接而成(源坐标系),分段切时
+    /// 每段独立等分([`plan::span::plan_span`])。
+    pub fn with_segments(mut self, segs: Vec<usize>) -> Self {
+        for w in &mut self.wants {
+            w.segments = Some(segs.clone());
+        }
+        self
+    }
+
+    /// 便捷:单 Want 的链(debug 断言:段长只对单 Want 有意义)
+    pub fn is_single(&self) -> bool {
+        self.wants.len() == 1
+    }
+
+    /// **定向标注段长**(S4 ②;推荐形态):只对键尾匹配的 want 生效
+    /// (`in_proj_qkvz` / `conv1d` / `q_proj` 这类融合权重,由它们的构造者声明)。
+    pub fn with_segments_for(mut self, key_tail: &str, segs: Vec<usize>) -> Self {
+        for w in &mut self.wants {
+            if crate::plan::rules::tail(&w.key, key_tail) {
+                w.segments = Some(segs.clone());
+            }
+        }
+        self
     }
 }
 
@@ -990,8 +1063,14 @@ pub enum QuantPlan {
 pub struct LoaderCtx {
     /// 目标 dtype(权重按语境声明需求;F32 起步)
     pub dtype: Dtype,
-    /// 并行度(shard 形状切分的词汇;1 = 单卡;TP 随多卡立项)
+    /// 并行度(shard 形状切分的词汇;1 = 单卡)
     pub shard: usize,
+    /// **本切片 id**(S4 ②;`0..shard`;`shard = 1` 时忽略)。
+    ///
+    /// `(slice_id, shard)` = **确定性分片协议**的入参:每个 rank 独立算出
+    /// 自己该读源的哪一块 —— 零协调、零通信、可并行装载(用户裁决
+    /// 2026-10-16;TP/PP/EP 同一函数)。
+    pub slice_id: usize,
     /// 设备重排装载(AWQ 线;**已裁决结果,唯一产地 =
     /// [`RepackPath::resolve`]** —— 能力否决/显式参数/默认 GPU;
     /// 本字段不再承载决策,消费点 = linear layout + awq source 物化)
@@ -1042,7 +1121,7 @@ impl RepackPath {
 
 impl Default for LoaderCtx {
     fn default() -> Self {
-        Self { dtype: Dtype::F32, shard: 1, device_repack: false, verify: false, debug_tap: false }
+        Self { dtype: Dtype::F32, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false }
     }
 }
 
@@ -1143,6 +1222,7 @@ impl Weight {
             dtype,
             shape: self.shape.clone(),
             layout: if self.transposed { Layout::Transposed } else { Layout::Direct },
+            segments: None,
             sink: Sink(self.cell.clone()),
         })
     }
@@ -1166,6 +1246,7 @@ impl Weight {
             dtype,
             shape: vec![rows, cols],
             layout: Layout::DeviceRearrange { op, rows, cols },
+            segments: None,
             sink: Sink(self.cell.clone()),
         })
     }

@@ -43,6 +43,10 @@ use crate::TensorOps;
 // ============================================================================
 
 /// 模型结构参数(旧世界 Config 的主干切片;全部声明期常量)
+///
+/// **TP 切分的形状单源**(S4a):[`ModelSpec::sharded`] 是本结构唯一的
+/// 切分入口 —— 层构造照常从本结构取维度 ⇒ **层代码零感知切分**。
+#[derive(Clone)]
 pub struct ModelSpec {
     pub vocab: usize,
     pub hidden: usize,
@@ -63,6 +67,39 @@ pub struct ModelSpec {
     /// tie_word_embeddings(true = lm_head 复用 embed;tied 仓特例;
     /// Qwen3.8-27B 等独立 lm_head 仓 = false)
     pub tied: bool,
+}
+
+impl ModelSpec {
+    /// **形状级切分**(S4a):全量 spec → 本 rank 的分片 spec(纯函数)。
+    ///
+    /// 逐字段语义(设计 §15.2):
+    /// - `hidden` **不切**(层间通道保持全宽;切它要在每层入口 allgather,不划算);
+    /// - `inter` 切(MLP gate/up 是 ColParallel(out),down 是 RowParallel(in));
+    /// - `full_heads` 切 `(hq, hkv)`、`hd` 不切(GQA 比例保持 ⇒ 两者都要整除);
+    /// - `gdn_heads` 切 `(nk, nv)`、`(hk, hv)` 不切;
+    /// - `vocab` 不切(v1 复制 lm_head;AG 词表切分是将来项);
+    /// - `dtype`/`eps`/`layer_types`/`tokenizer`/`tied` 原样。
+    ///
+    /// **整除硬门**:任一切分维不被 world 整除 ⇒ 结构化拒(不许 pad)。
+    pub fn sharded(&self, plan: crate::plan::tp::TpPlan) -> Result<ModelSpec, String> {
+        if plan.is_single() {
+            return Ok(self.clone());
+        }
+        let (hq, hkv, hd) = self.full_heads;
+        let (nk, hk, nv, hv) = self.gdn_heads;
+        Ok(ModelSpec {
+            vocab: self.vocab,
+            hidden: self.hidden,
+            inter: plan.shard_len(self.inter)?,
+            dtype: self.dtype,
+            full_heads: (plan.shard_len(hq)?, plan.shard_len(hkv)?, hd),
+            gdn_heads: (plan.shard_len(nk)?, hk, plan.shard_len(nv)?, hv),
+            eps: self.eps,
+            layer_types: self.layer_types.clone(),
+            tokenizer: self.tokenizer.clone(),
+            tied: self.tied,
+        })
+    }
 }
 
 // ============================================================================
@@ -151,6 +188,7 @@ impl Model {
         gi: usize,
     ) -> ForwardCtx<'a> {
         ForwardCtx {
+
             tokens: ctx.tokens,
             kind: ctx.kind,
             pos: ctx.pos,
@@ -366,6 +404,98 @@ const _: Dtype = Dtype::F32;
 // ============================================================================
 // 测试:fixture 装载 + 声明良构(CPU)+ 两步 decode vs host 全链(GPU)
 // ============================================================================
+
+#[cfg(test)]
+mod spec_shard_tests {
+    //! S4a:`ModelSpec::sharded` 的形状级切分(纯逻辑;27B 真实维度)。
+    use super::ModelSpec;
+    use crate::plan::tp::TpPlan;
+
+    fn plan(r: usize, w: usize) -> TpPlan {
+        TpPlan::new(r, w).expect("合法计划")
+    }
+
+    /// 27B 真实维度 × world=2:逐字段切分正确(设计 §15.2)
+    #[test]
+    fn sharded_27b_world2_matches_design() {
+        let full = crate::formats::qwen35::qwen3_8_27b();
+        let s = full.sharded(plan(0, 2)).expect("27B 可切");
+        assert_eq!(s.hidden, 5120, "hidden 不切");
+        assert_eq!(s.vocab, 248320, "vocab 不切(v1 复制)");
+        assert_eq!(s.inter, 8704, "inter 切半");
+        assert_eq!(s.full_heads, (12, 2, 256), "(hq,hkv) 切半,hd 不切");
+        assert_eq!(s.gdn_heads, (8, 128, 24, 128), "(nk,nv) 切半,(hk,hv) 不切");
+        assert_eq!(s.layer_types, full.layer_types, "层型表原样");
+        assert_eq!(s.tied, full.tied);
+        // 两 rank 的分片尺寸相同(等分)
+        let s1 = full.sharded(plan(1, 2)).expect("rank1");
+        assert_eq!((s1.inter, s1.full_heads, s1.gdn_heads), (s.inter, s.full_heads, s.gdn_heads));
+    }
+
+    /// world=1 = 逐字段恒等(退化路径零特判)
+    #[test]
+    fn sharded_single_is_identity() {
+        let full = crate::formats::qwen35::qwen3_8_27b();
+        let s = full.sharded(TpPlan::single()).expect("单卡退化");
+        assert_eq!(s.hidden, full.hidden);
+        assert_eq!(s.inter, full.inter);
+        assert_eq!(s.full_heads, full.full_heads);
+        assert_eq!(s.gdn_heads, full.gdn_heads);
+        assert_eq!(s.vocab, full.vocab);
+    }
+
+    /// 整除硬门:任一切分维不被 world 整除 ⇒ 响亮拒(不许 pad)
+    #[test]
+    fn sharded_rejects_non_divisible() {
+        let full = crate::formats::qwen35::qwen3_8_27b();
+        // 17408 = 2^10×17 ⇒ world=3 / 5 都不整除
+        assert!(full.sharded(plan(0, 3)).is_err(), "inter 不整除应拒");
+        assert!(full.sharded(plan(0, 5)).is_err(), "inter 不整除应拒");
+        // hkv = 4:world=3 时 inter 也拒(先撞哪个都算拒)
+        assert!(full.sharded(plan(0, 3)).is_err());
+        // 0.8B:inter 3584 = 2^9×7 ⇒ world=3 拒
+        let small = crate::formats::qwen35::qwen3_5_0_8b();
+        assert!(small.sharded(plan(0, 3)).is_err());
+        // 0.8B world=2:hq 8→4, hkv 2→1, gdn (16,16)→(8,8);inter 1792
+        let s = small.sharded(plan(0, 2)).expect("0.8B 可切");
+        assert_eq!((s.inter, s.full_heads, s.gdn_heads), (1792, (4, 1, 256), (8, 128, 8, 128)));
+    }
+
+    /// **几何闭合**:所有 rank 的分片**拼接回全量**(被切维),未切维原样
+    /// —— 这是层构造"内外关系闭合"的前提(q_proj 输出 = hq·hd = o_proj 输入,
+    /// 由同一 spec 派生 ⇒ 自动一致)
+    #[test]
+    fn sharded_geometry_tiles_back_to_full() {
+        let full = crate::formats::qwen35::qwen3_8_27b();
+        for world in [1usize, 2] {
+            let (mut inter, mut hq, mut hkv, mut nk, mut nv) = (0usize, 0, 0, 0, 0);
+            for r in 0..world {
+                let s = full.sharded(plan(r, world)).unwrap();
+                inter += s.inter;
+                hq += s.full_heads.0;
+                hkv += s.full_heads.1;
+                nk += s.gdn_heads.0;
+                nv += s.gdn_heads.2;
+                // 未切维:每个 rank 都保持全量
+                assert_eq!(s.hidden, full.hidden, "hidden 每 rank 全量");
+                assert_eq!(s.full_heads.2, full.full_heads.2, "hd 每 rank 全量");
+                assert_eq!(s.gdn_heads.1, full.gdn_heads.1, "hk 每 rank 全量");
+                assert_eq!(s.gdn_heads.3, full.gdn_heads.3, "hv 每 rank 全量");
+            }
+            assert_eq!(
+                (inter, hq, hkv, nk, nv),
+                (
+                    full.inter,
+                    full.full_heads.0,
+                    full.full_heads.1,
+                    full.gdn_heads.0,
+                    full.gdn_heads.2
+                ),
+                "world={world}:分片拼接 ≠ 全量(切分丢/多)"
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

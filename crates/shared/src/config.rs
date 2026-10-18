@@ -168,6 +168,12 @@ pub struct RuntimeCfg {
     /// 显式 ordinal(测试/特殊场景;不走设备表查找)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_ordinal: Option<usize>,
+    /// **TP 档设备序**(S6 2026-10-17;v1 恒 2 项 = world 2)。给值 ⇒ 双 rank
+    /// 分片装载 + `TpEngine` 装配(rank 序 = 列表序)。
+    /// **与 `device` / `device_ordinal` 互斥**(同时给 = 拒启)—— 自动挑卡的
+    /// "尽力而为"与分片协议的"确定双卡"是两条规范,并存会让卡身份有两个真源。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tp_ordinals: Option<Vec<usize>>,
     /// **自动选卡的空闲占比阈值**(0..1;默认 0.9):候选卡的 `memory.free/total` 低于它
     /// ⇒ auto-pick 跳过(避让非 owl 进程/未持锁实例);显式 spec 命中且全被跳 ⇒ 响亮拒启。
     pub gpu_min_free_ratio: f64,
@@ -657,6 +663,7 @@ impl Default for RuntimeCfg {
             bind: "127.0.0.1:8135".into(),
             device: crate::device::DeviceSpec::default(),
             device_ordinal: None,
+            tp_ordinals: None,
             gpu_min_free_ratio: 0.9,
             max_seq: 4096,
             prefill_chunk: 512,

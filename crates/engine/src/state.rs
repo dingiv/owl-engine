@@ -75,6 +75,21 @@ pub(crate) struct GdnLeaf {
     pub(crate) rec: TensorOps,
 }
 
+/// **每 token KV 字节**(纯函数;S4 ④ 提取 —— 池容量公式的被测点)。
+///
+/// 口径(与 `StatePool::alloc` 同源):主池 = 每层每 token `2(K+V) × hkv × hd`
+/// × 元素宽(f16=2 / fp8=1);草稿池按 token 线性。**TP 分片自动生效**:
+/// `dims.hkv/hd` 来自 sharded spec ⇒ 每 rank 的 KV 体积按头数切分。
+pub(crate) fn kv_per_tok_bytes(
+    n_full: usize,
+    dims: &ModelDims,
+    kv_fp8: bool,
+    dflash: bool,
+) -> usize {
+    (n_full * 2 * dims.hkv * dims.hd) * if kv_fp8 { 1 } else { 2 }
+        + if dflash { 5 * 2 * 8 * 128 * 2 } else { 0 } // 草稿池按 token 线性(页取整后略同)
+}
+
 /// 设备状态块池(KV paged 池 / GDN 状态格 / 快照池 / 持久块表)。
 /// 治理对象(charter A1 味):S2 图档与执行器只经方法面触碰状态块,
 /// 不直摸块句柄。
@@ -257,8 +272,7 @@ impl StatePool {
         // + 捕获瞬态 + 非追踪惰性保留。OWL_VRAM_TARGET/OWL_VRAM_RESERVE_MB
         // 可调;TOTAL 未落账(=0)或 OWL_VRAM_TARGET=0 → 治理禁用。
         // FIXME: 大量的硬编码
-        let per_tok_bytes = (n_full * 2 * dims.hkv * dims.hd) * if kv_fp8 { 1 } else { 2 }
-            + if dflash { 5 * 2 * 8 * 128 * 2 } else { 0 }; // 草稿池按 token 线性(页取整后略同)
+        let per_tok_bytes = kv_per_tok_bytes(n_full, &dims, kv_fp8, dflash);
         // 治理器之后的固定分配(GDN 格/快照 f32 同式;图 slab + ctx + 杂项 flat)
         let gdn_slot_elems = dims.nk * dims.hk * 3 + dims.nv * dims.hv * 3 + dims.nv * dims.hk * dims.hv;
         let fixed_after = n_gdn * gdn_slots * gdn_slot_elems * 4
@@ -993,8 +1007,8 @@ impl StatePool {
     ) -> Result<()> {
         // 池空(snap_max = 0)不再是 panic(原 `expect("池非空")` 会炸掉整个
         // owl-engine 线程 → 客户端收 503):退化为**结构化错误** —— 调用方
-        // (`capture_gdn_snap`)已按 snap_capacity() 先行跳过,故此处只作兜底
-        // (agent 专项 A2,2026-10-14)。
+        // (`RankDev::snap_dev`;phases.rs 的块边界/跨页拍摄,而 `snap_key_of`
+        // 已按 snap_capacity() 先行跳过)故此处只作兜底(agent 专项 A2,2026-10-14)。
         let idx = match self.snaps.iter().position(|s| s.key == Some(key)) {
             Some(i) => i,
             None => {
@@ -1178,4 +1192,52 @@ async fn zero_block<D: DeviceClient>(face: &mut D, n: usize, name: &str) -> Resu
 
 fn block_leaf(b: &Bytes, shape: Vec<usize>) -> TensorOps {
     TensorOps::of_block(b.id, Dtype::F32, shape)
+}
+
+#[cfg(test)]
+mod tp_shard_tests {
+    //! S4 ④:`ModelDims` 派生 + 池公式的**分片感知**(纯逻辑;零设备)。
+    use super::*;
+
+    /// 从(可选分片的)27B spec 造 dims —— 与 `Engine::run` 同式
+    fn dims27b(shard: Option<(usize, usize)>) -> ModelDims {
+        use owl_models::plan::tp::TpPlan;
+        let full = owl_models::formats::qwen35::qwen3_8_27b();
+        let spec = match shard {
+            Some((id, n)) => full.sharded(TpPlan::new(id, n).unwrap()).unwrap(),
+            None => full,
+        };
+        let (hq, hkv, hd) = spec.full_heads;
+        let (nk, hk, nv, hv) = spec.gdn_heads;
+        ModelDims { hq, hkv, hd, nk, hk, nv, hv, hidden: spec.hidden, dtype: spec.dtype }
+    }
+
+    /// 分片 spec ⇒ dims **自动分片**(头减半;hd/hidden 不变)—— 引擎零改动即得
+    #[test]
+    fn dims_follow_sharded_spec() {
+        let d = dims27b(None);
+        let s = dims27b(Some((1, 2)));
+        assert_eq!((d.hq, d.hkv, d.hd), (24, 4, 256));
+        assert_eq!((s.hq, s.hkv, s.hd), (12, 2, 256), "头切半,hd 不变");
+        assert_eq!((d.nk, d.nv), (16, 48));
+        assert_eq!((s.nk, s.nv), (8, 24), "GDN 头切半");
+        assert_eq!(s.hidden, d.hidden, "hidden 不切");
+        // GQA 比例保持(XQA 判据 `hq/hkv == 6` 因此不受分片影响)
+        assert_eq!(d.hq / d.hkv, s.hq / s.hkv);
+    }
+
+    /// **每 token KV 字节**:TP=2 正好减半(20G 卡的关键账);fp8 再减半;
+    /// 草稿池部分不随分片变(固定 8×128 编)
+    #[test]
+    fn kv_per_tok_halves_under_tp2() {
+        let n_full = 40usize; // 27B 的 full 层数(3:1 中 16 层?—— 此处只作线性因子)
+        let full = kv_per_tok_bytes(n_full, &dims27b(None), false, false);
+        let shard = kv_per_tok_bytes(n_full, &dims27b(Some((0, 2))), false, false);
+        assert_eq!(shard * 2, full, "TP=2 ⇒ 每 token KV 减半");
+        let full_fp8 = kv_per_tok_bytes(n_full, &dims27b(None), true, false);
+        assert_eq!(full_fp8 * 2, full, "fp8 KV ⇒ 减半");
+        let dd_shard = kv_per_tok_bytes(n_full, &dims27b(Some((0, 2))), false, true)
+            - kv_per_tok_bytes(n_full, &dims27b(Some((0, 2))), false, false);
+        assert_eq!(dd_shard, 5 * 2 * 8 * 128 * 2, "草稿池不随分片变");
+    }
 }

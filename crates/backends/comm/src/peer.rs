@@ -8,12 +8,16 @@
 //! `owl-iface` 根模块里那套 `Pool::malloc_peer_shared` / `Device::enable_peer_access`
 //! / `Device::map_remote` 声明是**历史设计记录(非规范)**,不得作为实现依据。
 //!
-//! # 本文件现状(壳子阶段)
+//! # 职责边界(S4 ⑤-K2 定稿)
 //!
-//! 只有**纯逻辑**:`PeerCaps` / `classify` / `per_alloc_limit` / `PeerPlan::plan`
-//! —— 全部可在 CPU 上单测。真正的握手(分配→导出→导入→授予)留 S1,入口是
-//! [`PeerPlan::open`](PeerPlan::open)(现在是结构化 `NotYetImplemented` 桩,
-//! **不是**静默空实现)。
+//! 本模块 = **策略**:能力分档(`classify`)/ 单笔上限(`per_alloc_limit`)/
+//! 额度核算与拒绝(`PeerPlan::plan`)/ staging 布局(`ar::StagingLayout`)
+//! —— 全部可在 CPU 上单测。
+//!
+//! **握手编排(分配→导出→导入→授予)不在本 crate**:它要同时持有两侧
+//! actor 句柄(`peer_alloc`/`peer_import`),而 `owl-comm` 不依赖 `owl-cuda`
+//! —— 实现落在 `owl-engine::tp`(S4 ⑤-K2;`TpEngine::assemble`),那里
+//! 消费本模块的 `PeerPlan` 作为唯一判定。
 
 use crate::CommError;
 
@@ -141,13 +145,6 @@ impl PeerPlan {
         Ok(Self { mechanism, per_alloc_limit: limit, staging_bytes })
     }
 
-    /// 对称握手:分配 → 导出 → 导入 → 授予(施工设计 §2.2 的序列)。
-    ///
-    /// **S1 实现**(下一会话)。现在返回结构化 `NotYetImplemented` ——
-    /// 按 AGENTS 纪律:可失败逻辑不得写成静默空函数。
-    pub fn open(&self) -> Result<(), CommError> {
-        Err(CommError::NotYetImplemented { stage: "PeerPlan::open(S1: Peer* 三命令 + VMM 白名单)" })
-    }
 }
 
 #[cfg(test)]
@@ -208,15 +205,6 @@ mod tests {
         assert!(matches!(
             PeerPlan::plan(&wide(), &narrow(), m).unwrap_err(),
             CommError::PeerRejected { .. }
-        ));
-    }
-
-    #[test]
-    fn open_is_loud_stub_not_silent() {
-        let p = PeerPlan::plan(&narrow(), &narrow(), 2 * (32 << 20) + crate::ar::HEADER_BYTES).unwrap();
-        assert!(matches!(
-            p.open().unwrap_err(),
-            CommError::NotYetImplemented { .. }
         ));
     }
 }

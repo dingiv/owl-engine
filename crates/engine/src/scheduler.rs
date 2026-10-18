@@ -100,18 +100,18 @@ impl<D: DeviceClient> RunningEngine<D> {
                 // 直连引擎 / token 级续写的调用方仍能命中)。
                 if s.guard(&turn.prompt_ids) && s.cached_len > 0 {
                     (s.cached_len, s.gdn_slot, None)
-                } else if self.pool.paged {
+                } else if self.dev.pool.paged {
                     // 前缀缓存匹配(先匹配后释放旧链;内容寻址 = 跨会话)
                     let (mut m, chain) = self.bank.blocks_m.match_prefix(&turn.prompt_ids);
                     if self.bank.blocks_m.debug {
                         owl_shared::log_debug!("dbg prefix", "match = {m} blocks / chain = {chain:?}");
                     }
-                    if m > 0 && m * self.pool.page == turn.prompt_ids.len() {
+                    if m > 0 && m * self.dev.pool.page == turn.prompt_ids.len() {
                         m -= 1; // 完全对齐保留末块重算(非空 prefill;xinfer 同语义)
                     }
                     while m > 0 {
                         let key = chain[m - 1];
-                        if self.pool.has_snap(key) {
+                        if self.dev.pool.has_snap(key) {
                             break;
                         }
                         m -= 1; // 无快照的边界不可复用(GDN 态对不上)
@@ -130,8 +130,8 @@ impl<D: DeviceClient> RunningEngine<D> {
                         let mut mold = std::mem::take(&mut s.mtp_block_table);
                         self.bank.blocks_mtp.release_table(&mut mold);
                         s.reset();
-                        s.cached_len = m * self.pool.page;
-                        (m * self.pool.page, s.gdn_slot, Some(chain[m - 1]))
+                        s.cached_len = m * self.dev.pool.page;
+                        (m * self.dev.pool.page, s.gdn_slot, Some(chain[m - 1]))
                     } else {
                         let mut table = std::mem::take(&mut s.block_table);
                         self.bank.blocks_m.release_table(&mut table);
@@ -203,8 +203,8 @@ impl<D: DeviceClient> RunningEngine<D> {
                 spec: crate::turn::TurnSpecState {
                     // B4 分母**跨 turn 保鲜**(见 RunningEngine::bare_cost_carry_ms);
                     // 其余 spec 态仍全零 = 生命周期收口纪律不动
-                    bare_cost_ewma_ms: self.spec.carry_ms,
-                    bare_cost_ctx: self.spec.carry_ctx,
+                    bare_cost_ewma_ms: self.dev.spec_rt.carry_ms,
+                    bare_cost_ctx: self.dev.spec_rt.carry_ctx,
                     ..Default::default()
                 },
             });
@@ -235,15 +235,15 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 每 probe_every 步发一轮真 SpecRound 探测(m≥1 → 解除降级,
         // 见 execute_spec_round 尾态机)。非降级 = 原调度,零变化。
         // B4 三态在 ActiveTurn.spec(turn 生命周期;2026-10-10 收口)
-        let spec = if self.spec.depth == 0 {
+        let spec = if self.dev.spec_rt.depth == 0 {
             0
         } else if !self.turns.active.as_ref().expect("活跃").spec.spec_degraded {
-            self.spec.depth
+            self.dev.spec_rt.depth
         } else if self.turns.active.as_ref().expect("活跃").spec.spec_steps_degraded
             >= self.turns.active.as_ref().expect("活跃").spec.spec_probe_every
         {
             self.turns.active.as_mut().expect("活跃").spec.spec_steps_degraded = 0;
-            self.spec.depth
+            self.dev.spec_rt.depth
         } else {
             0
         };
@@ -253,7 +253,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             let before = s.block_table.len();
             self.bank.blocks_m.ensure_for_len(&mut s.block_table, need)?;
             let grew = s.block_table.len() != before;
-            let page = self.pool.page;
+            let page = self.dev.pool.page;
             let slot_at = |p: usize| {
                 let b = s.block_table[p / page];
                 b * page as u32 + (p % page) as u32

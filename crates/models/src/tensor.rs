@@ -129,6 +129,11 @@ pub struct TensorOps {
     /// label**,克隆保留;执行路径零参与。见 interpreters/observe.rs 与
     /// docs/arch/interpreter-tap.md §三)
     pub(crate) label: Option<std::sync::Arc<str>>,
+    /// **TP 角色标记**(S4 ③';**纯标注,零决策**)——
+    /// 由层在**构造期**从规则表算出(`Linear::new` 缓存一次)并透传到本节点;
+    /// **解释器**在求值尾部按它统一追加 allreduce(行并行 ⇒ 输出是部分和)。
+    /// 层不构造任何通信节点,只"给标记"(用户裁决 2026-10-17)。
+    pub(crate) tp_role: crate::plan::rules::WeightRule,
 }
 
 impl TensorOps {
@@ -185,6 +190,18 @@ impl TensorOps {
     /// 打标:语义坐标(观测面 tap 的定位键;interpreter-tap.md §三)。
     /// clone 本节点设标注 —— 同 id 不变(CSE memo/双锚对齐不受影响),
     /// O(1)(parents Arc 共享,浅拷贝)。层根自动打标见 Model::last_hidden。
+    /// **TP 角色标记**(S4 ③';纯标注 —— 见 [`TensorOps::tp_role`] 字段注)。
+    /// 层构造期算一次、forward 期透传;**决策在解释器**。
+    pub fn with_tp_role(mut self, role: crate::plan::rules::WeightRule) -> TensorOps {
+        self.tp_role = role;
+        self
+    }
+
+    /// 本节点的 TP 角色(解释器读它)
+    pub fn tp_role(&self) -> crate::plan::rules::WeightRule {
+        self.tp_role
+    }
+
     pub fn tag(self, s: impl Into<std::sync::Arc<str>>) -> TensorOps {
         let mut c = self;
         c.label = Some(s.into());
@@ -226,6 +243,7 @@ impl TensorOps {
             args: vec![],
             err: None,
             label: None,
+            tp_role: crate::plan::rules::WeightRule::Replicate,
         }
     }
 
@@ -247,6 +265,7 @@ impl TensorOps {
             args: vec![],
             err: None,
             label: None,
+            tp_role: crate::plan::rules::WeightRule::Replicate,
         }
     }
 
@@ -265,6 +284,7 @@ impl TensorOps {
             args: vec![],
             err: None,
             label: None,
+            tp_role: crate::plan::rules::WeightRule::Replicate,
         }
     }
 
@@ -283,6 +303,7 @@ impl TensorOps {
             args: vec![],
             err: None,
             label: None,
+            tp_role: crate::plan::rules::WeightRule::Replicate,
         }
     }
 
@@ -314,6 +335,7 @@ impl TensorOps {
             args: vec![],
             err: Some(LazyError { at_depth: 0, detail: detail.into() }),
             label: None,
+            tp_role: crate::plan::rules::WeightRule::Replicate,
         }
     }
 
@@ -755,6 +777,7 @@ impl TensorOps {
             args: vec![],
             err: self.err.clone().or(Some(e)),
             label: None,
+            tp_role: crate::plan::rules::WeightRule::Replicate,
         }
     }
 
@@ -777,6 +800,7 @@ impl TensorOps {
             args,
             err,
             label: None,
+            tp_role: crate::plan::rules::WeightRule::Replicate,
         }
     }
 }

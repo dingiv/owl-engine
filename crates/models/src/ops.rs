@@ -48,6 +48,12 @@ pub enum SemanticKernel {
     /// foreign 家族臂:scalar 单核(lmdeploy pre_sm90 port)
     GdnScalarDelta,
 
+    // ---- comm.*(TP2 S4:allreduce 的语义面;家族臂)----
+    /// AR stage:本端 payload → 本端 staging slot(发布 produced)
+    CommArStage,
+    /// AR reduce:原地累加对端 staging slot(发布 consumed)
+    CommArReduce,
+
     // ---- ops.* ----
     /// 逐元素 sigmoid(attn_output_gate 门 / GDN beta 同族)
     Sigmoid,
@@ -224,6 +230,8 @@ impl SemanticKernel {
             SemanticKernel::GdnNormAct => "gdn.norm_act",
             SemanticKernel::GdnChunkedDelta => "gdn.chunked_delta",
             SemanticKernel::GdnScalarDelta => "gdn.scalar_delta",
+            SemanticKernel::CommArStage => "comm.ar_stage",
+            SemanticKernel::CommArReduce => "comm.ar_reduce",
             SemanticKernel::Sigmoid => "ops.sigmoid",
             SemanticKernel::Add => "ops.add",
             SemanticKernel::Mul => "ops.mul",
@@ -383,6 +391,7 @@ pub enum Op {
     /// KV 写槽:声明"本节目写 kv manager 的这些格"——
     /// 跨节目依赖机械可导:同一 kv 格的写/读节目之间插事件边。
     SlotWrite,
+
 }
 
 // ============================================================================
@@ -695,6 +704,13 @@ pub(crate) fn foreign_sig(name: &str) -> Option<&'static str> {
         x if x == owl_kernels::family::marlin::GEMM_W4A16_BF16 => Some(owl_kernels::client::marlin::SIG),
         x if x == owl_kernels::family::flashinfer::PREFILL_FI => Some(owl_kernels::client::fi_sig::SIG),
         x if x == owl_kernels::family::flashinfer::PREFILL_FI_FP8KV => Some(owl_kernels::client::fi_sig::SIG),
+        // 通信族(TP2 S4;三 dtype 同 sig —— 槽序不随 dtype 变)
+        x if x == owl_kernels::family::comm::asset::STAGE_F32 => Some(owl_kernels::client::comm::SIG),
+        x if x == owl_kernels::family::comm::asset::STAGE_F16 => Some(owl_kernels::client::comm::SIG),
+        x if x == owl_kernels::family::comm::asset::STAGE_BF16 => Some(owl_kernels::client::comm::SIG),
+        x if x == owl_kernels::family::comm::asset::REDUCE_F32 => Some(owl_kernels::client::comm::SIG_REDUCE),
+        x if x == owl_kernels::family::comm::asset::REDUCE_F16 => Some(owl_kernels::client::comm::SIG_REDUCE),
+        x if x == owl_kernels::family::comm::asset::REDUCE_BF16 => Some(owl_kernels::client::comm::SIG_REDUCE),
         x if x == owl_kernels::family::xqa::VERIFY_XQA => Some(owl_kernels::family::xqa::VERIFY_XQA_SIG),
         x if x == owl_kernels::family::xqa::DECODE_XQA => Some(owl_kernels::family::xqa::DECODE_XQA_SIG),
         _ => None,
@@ -757,6 +773,9 @@ mod foreign_call_lock {
         for (op, want) in [
             (SemanticKernel::GdnChunkedDelta, owl_kernels::family::gdn_chunked::GDN_CHUNKED_FWD),
             (SemanticKernel::GdnScalarDelta, owl_kernels::family::gdn_scalar::GDN_SCALAR_FWD),
+            // 通信族(TP2 S4;本测试 dt = F16 ⇒ 期望 F16 实例名)
+            (SemanticKernel::CommArStage, owl_kernels::family::comm::asset::STAGE_F16),
+            (SemanticKernel::CommArReduce, owl_kernels::family::comm::asset::REDUCE_F16),
         ] {
             let pick = owl_kernels::driver::resolve(OpReq {
                 op: op.op_id(), env: &env(), dt: owl_kernels::driver::DType::F16,

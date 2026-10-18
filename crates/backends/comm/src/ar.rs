@@ -23,6 +23,16 @@
 //! 发射是设备面(async 命令/流序)—— 调用方(引擎/门测试)把每个
 //! `(phase, chunk)` 转成 LaunchMsg;两个核与家族在 `owl-kernels`
 //! (`cu/comm/ar_*.cu` + `server::comm`)。
+//!
+//! # 纪律:归约序必须与 shape 解耦(`TP2-施工设计.md` §19.3-①;S5 前置)
+//!
+//! v1 的"固定核 + 相对游标 + **单 chunk**"是**确定性资产**:载荷 > slot 时
+//! **响亮拒**(绝不静默分块)⇒ **归约块数/树形与 batch 形状无关** —— 这正是 SGLang
+//! 给 TP=2 的 "consistent floating-point addition order"。
+//!
+//! S5 放开多块/流水时**必须**守住:(a) 切法固定(块数与 shape 无关)或
+//! (b) 显式"确定性档"固定单一路径。**验收 = `tp_determinism_gate`(G8-a)在 S5 之后
+//! 仍绿**。反例参照:SGLang TP4-prefix 模式下"切分随 shape 变"导致的非确定(issue #10785)。
 
 /// staging header 字节数(64 B:两条 cache line,避免与 slot 数据同线伪共享)。
 pub const HEADER_BYTES: u64 = 64;

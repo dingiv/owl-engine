@@ -49,6 +49,7 @@ pub(crate) mod sampler;
 pub(crate) mod scheduler;
 pub(crate) mod spec_runtime;
 pub(crate) mod state;
+pub(crate) mod tp;
 // 测试分层(test-architecture.md):单元测试走 cfg(test);
 // e2e 场景面(源文件里的 pub async fn,无 #[test])走 feature `e2e`,
 // 由 crates/engine/tests/engine.e2e.rs 手动调用。
@@ -69,6 +70,7 @@ pub fn head_plan_of(hq: owl_shared::config::HeadQuant) -> owl_models::module::Qu
     }
 }
 pub use running::RunningEngine;
+pub use tp::{TpEngine, TpStaging};
 pub use graph_plan::{GraphPlan, GraphPlanDesc, PlanOutcome};
 pub use session::{AgentSession, SessionTable};
 pub use turn::{TurnEvent, TurnOpts, TurnSampler, TurnSpec};

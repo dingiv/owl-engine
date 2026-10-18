@@ -91,6 +91,25 @@ pub const GDN_CHUNKED_SLOTS: &str =
      sz T, sz slot, sz hv, sz nk, sz kd, sz scale_bits, sz nt]";
 
 /// foreign 分派谓词
+/// **host 槽烘死臂的已验证档位**(`(nk, nv)`;engine 的图档判据消费 ——
+/// `prefill_plan::gdn_host_slot_arm`)。
+///
+/// ⚠️ 这是**验证清单,不是数学约束**:家族核对 `nk/nv` 是参数化的(无结构
+/// 硬约束),列在这里的是**已过真机验证**的档位 —— 原因:host 槽臂把某个
+/// GDN 槽地址烘进图(只对该槽可用),形状错误的影响面比 eager 大。
+/// 新档(如 world=4 的 `(4,12)`)必须先过 27B 真机图档验证再入表
+/// (设计 `docs/arch/TP2-施工设计.md` §15.5b)——
+/// **本表是唯一产地**:engine 侧零数字。
+pub const HOST_SLOT_ARM_SHAPES: &[(usize, usize)] = &[
+    (16, 48), // 全量(27B 生产档)
+    (8, 24),  // TP=2 分片档(S4 ④;**待 G8 真机复核**——验证后此注释升级为"已验证")
+];
+
+/// host 槽臂形状谓词(engine 消费;**与核同源,随核演进**)
+pub fn host_slot_arm_shape_ok(nk: usize, nv: usize) -> bool {
+    HOST_SLOT_ARM_SHAPES.contains(&(nk, nv))
+}
+
 pub fn is_foreign(name: &str) -> bool {
     name == GDN_CHUNKED_FWD
 }
@@ -191,5 +210,20 @@ mod table_layout_tests {
         for i in 0..nt {
             assert_eq!((i64_at(super::IDX_OFF, 2 * i), i64_at(super::IDX_OFF, 2 * i + 1)), (0, i as i64));
         }
+    }
+}
+
+#[cfg(test)]
+mod host_slot_arm_shape_tests {
+    //! 验证清单与谓词同源(**唯一产地**:engine 零数字)
+    use super::*;
+
+    #[test]
+    fn shape_predicate_matches_list() {
+        for &(nk, nv) in HOST_SLOT_ARM_SHAPES {
+            assert!(host_slot_arm_shape_ok(nk, nv), "({nk},{nv}) 在表内应放行");
+        }
+        assert!(!host_slot_arm_shape_ok(4, 12), "未验证档(world=4)不放行");
+        assert!(!host_slot_arm_shape_ok(16, 24), "混搭档不放行");
     }
 }

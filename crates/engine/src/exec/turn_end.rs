@@ -25,8 +25,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     pub(crate) async fn complete(&mut self, reason: crate::turn::FinishReason) -> Result<TurnEvent> {
         let act = self.turns.active.take().expect("active");
         // B4 分母保鲜回写(下一 turn 种入;见 RunningEngine::bare_cost_carry_ms)
-        self.spec.carry_ms = act.spec.bare_cost_ewma_ms;
-        self.spec.carry_ctx = act.spec.bare_cost_ctx;
+        self.dev.spec_rt.carry_ms = act.spec.bare_cost_ewma_ms;
+        self.dev.spec_rt.carry_ctx = act.spec.bare_cost_ctx;
         // 取证(B6.3 后泄漏案):每 turn 设备余量打点(free 账由 cuda 侧 dtoh
         // 收割刷新;泄漏 = 线性下降)
         owl_shared::log_debug!("vram-trace", "turn end: free={:.0}MiB out={}",
@@ -38,7 +38,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if let Some(s) = self.bank.sessions.get_mut(act.session_id) {
             s.commit_turn(&act.prompt_ids, &act.out);
             // E2c:块链登记前缀缓存(缓存持引用;会话释放后块仍驻留)
-            if self.pool.paged {
+            if self.dev.pool.paged {
                 self.bank.blocks_m.cache_seq(&s.tokens, &s.block_table);
             }
         }
