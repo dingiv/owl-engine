@@ -180,8 +180,6 @@ pub(crate) struct SchemeStats {
     /// 相对 L2 误差 `|out−dense| / |dense|`(对 (层,头) 取均)
     pub(crate) rel_a: f64,
     pub(crate) rel_b: f64,
-    /// dense / A / B 的输出均方根(量级参考)
-    pub(crate) rms_dense: f64,
     /// 三种方案下注意力“集中度”(softmax 最大权重,均值) —— 解释差异用
     pub(crate) topw_dense: f64,
     pub(crate) topw_a: f64,
@@ -211,7 +209,7 @@ pub(crate) fn scheme_compare(
     let scale = 1.0 / (hd as f32).sqrt();
     let per_kv = (hq / hkv.max(1)).max(1);
     let (mut ca, mut cb, mut ra, mut rb) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
-    let (mut rd, mut td, mut ta, mut tb) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    let (mut td, mut ta, mut tb) = (0.0f64, 0.0f64, 0.0f64);
     let mut n = 0usize;
     let mut idx_dense: Vec<usize> = (0..ctx_tokens).collect();
     idx_dense.truncate(ctx_tokens);
@@ -342,7 +340,6 @@ pub(crate) fn scheme_compare(
             let eb: f64 = (0..hd).map(|d| (out_b[d] as f64 - out_d[d] as f64).powi(2)).sum::<f64>().sqrt();
             ra += ea / nd;
             rb += eb / nd;
-            rd += nd;
             td += topw as f64;
             ta += topa as f64;
             tb += topb as f64;
@@ -358,7 +355,6 @@ pub(crate) fn scheme_compare(
         cos_b: cb / k,
         rel_a: ra / k,
         rel_b: rb / k,
-        rms_dense: rd / k,
         topw_dense: td / k,
         topw_a: ta / k,
         topw_b: tb / k,

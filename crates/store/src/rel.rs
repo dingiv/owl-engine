@@ -323,6 +323,7 @@ impl Rel {
         self.evict.name()
     }
 
+    /// 换驱逐策略(`[kvmem] evict_policy`;装配期一次)。
     pub fn set_evict_policy(&mut self, p: Box<dyn EvictPolicy>) {
         self.evict = p;
     }

@@ -245,7 +245,6 @@ mod tests {
         assert!(with_pen < 120, "惩罚后应实质让位: {with_pen}/200");
     }
 
-    #[test]
     /// **去重律**:同一 token 出现 k 次只罚一次(回归门;原实现 = 1.15^k 累积)
     #[test]
     fn rep_penalty_once_per_distinct_token() {
@@ -282,6 +281,8 @@ mod tests {
         assert_eq!(l[5], 8.0, "rep_penalty=1.0 不得改动 logits");
     }
 
+    /// top-p 截断后采样集中于头部(尖峰分布 + 大词表)。
+    #[test]
     fn topp_mass_concentrates_head() {
         // 尖峰分布 + 大词表:top-p 截断后采样几乎全落头部
         let mut logits = vec![-20f32; 10000];

@@ -57,10 +57,6 @@ async fn boot() -> owl_engine::RunningEngine<CpuFace> {
     boot_rows(12, owl_store::QueuePolicy::Reject).await
 }
 
-async fn boot_with(on_full: owl_store::QueuePolicy) -> owl_engine::RunningEngine<CpuFace> {
-    boot_rows(12, on_full).await
-}
-
 /// `rows` = GDN 行池大小(= 并发 turn 天花板,`gdn_slots`)
 async fn boot_rows(
     rows: usize,

@@ -412,7 +412,7 @@ mod tests {
     #[test]
     fn session_table_lifecycle() {
         let mut st = SessionTable::new();
-        let (a, sa) = st.get_or_create(Some(7)).expect("显式 id");
+        let (a, _sa) = st.get_or_create(Some(7)).expect("显式 id");
         assert_eq!(a, 7, "显式 id 直取");
         let (b, _sb) = st.get_or_create(None).expect("自动分配");
         assert_eq!(b, 8, "自动分配递增");

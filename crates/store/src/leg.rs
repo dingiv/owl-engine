@@ -485,6 +485,7 @@ impl BlockLeg {
         self.kv.register_chain_inc(parent0, blocks)
     }
 
+    /// 释放整张表的引用(表回空;与逐块 `release` 同源)。
     pub fn release_table(&mut self, table: &mut Vec<u32>) -> StoreResult<()> {
         self.kv.release_table(table)
     }

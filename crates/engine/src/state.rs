@@ -1621,11 +1621,6 @@ impl StatePool {
 
     // ── B-2 选择层视图面(§8.11)──────────────────────────────────────
 
-    /// 视图页表槽是否在场(`OWL_COVERAGE_PROBE` 档才分配)。
-    pub(crate) fn has_select_view(&self) -> bool {
-        self.bt_view.is_some()
-    }
-
     /// 视图页表容量(块数;= 池管理面页数 `nb`)。
     pub(crate) fn select_view_capacity(&self) -> usize {
         self.nb

@@ -7,6 +7,10 @@
 > `pw_dump_tok`)已从工作树删除;**配了旧键的配置会响亮拒启**(迁移门,见
 > `config.rs::reject_retired_keys`)。
 >
+> ⚠️ **2026-10-18 testdata 精简**:本卷引用的一次性配置档(`testdata/args/`
+> 的 `perf-ab-*` / `perf-ctxladder-27b-{fi,pw}` / `dec*` / `spec-27b-prod` 等)
+> 已删除;复现请按文中描述重建等价档(flavor `spec-dflash` + 文中那条差异)。
+>
 > **为什么退役**:W3/W4 之后 FI 核留捕获图内、调度表由窗外 `fi_plan_sync` 刷
 > ⇒ 断点面零消费者;而它正是"接力棒每步只增 ⇒ 段末 `memo.retain` 每步 16×O(N)
 > ⇒ 端到端 O(步数²)"那条慢化病的宿主(设计卷 §3.3)。现行形态见

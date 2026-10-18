@@ -1175,13 +1175,6 @@ mod liveness_tests {
         assert_eq!(owl_shared::slab_hint::refs_pushed(), before, "探针关必须零推送");
     }
 
-    /// 读回一个 f32 块(测试辅助)
-    async fn read_f32(face: &mut owl_cpu::CpuFace, b: &Bytes) -> f32 {
-        let mut buf = vec![0u8; 4];
-        face.dtoh(b, &mut buf).await.expect("dtoh");
-        f32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])
-    }
-
     /// 菱形 + 透传别名:x 被四方引用(mul 两参 + reshape 透传 + mul 右参)
     /// → 块归属按块计数;候选空且无双重 free(若误焚,host 值读回即花);
     /// 值 = x⁴ = 81(x=3:mul(x,x)=9;reshape 透传;9×3=27… 改:root =
