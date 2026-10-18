@@ -15,6 +15,11 @@ quant = "w4a16"
 [runtime]
 # 16k ctx;池值 = 产品选择(相对 9472 档:prefill ~−2.5% / decode ~−0.5%)
 max_seq = 16384
+# **prefill chunk = 1024**(2026-10-19):注意力 T 标度(38.4→44.4 TFLOPS)+ marlin m 效率
+# (核时 −11%)双料;实测 std 五点三轮 @8192 1357 → 1358~1378(稳态),曲线更平
+# (衰减 −5.3% → −3.9%)。桶阶梯同步 +t1024(否则大块回 eager 白丢桶的宿主税节省)。
+# 代价:slab 203 → ~520MiB(GRAPH_SLAB_BUDGET 已 320→640 校准);短档(512)约 −2%。
+prefill_chunk = 1024
 # 尾块合并:剩余 ≤ 512+本值 ⇒ 本步吃完 —— 消灭与尺寸无关的 ~250ms/chunk 宿主税
 # (516 tok TTFT 651→406ms / 8k −4.4% / 32k −1.5%)。块边界变 ⇒ token 级非逐位。
 # 缺省 0 = 关;perf-runs/prefill-prof-2026-10-18/REPORT.md

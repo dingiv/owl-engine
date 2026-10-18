@@ -364,7 +364,13 @@ impl PerTokBytes {
 /// 故取整到 **262MiB** 上界 —— 日志按 MiB 取整打印,常数不得骑在边界上)。
 /// ⚠️ 随图族变(depth / 臂换代 / 桶)⇒ 捕获后由 [`crate::graph_fleet`]
 /// 把**实测 Σ** 与本品对账,超了打 ⚠️(池上限可能偏大 ⇒ 请求级 OOM 风险)。
-pub(crate) const GRAPH_SLAB_BUDGET: usize = 262 << 20;
+/// ⚠️ **2026-10-19 两轮校准:262 → 320 → 640 MiB**(同日在两个旋钮上各加一次图):
+///   ① 桶族上线(`[graph] prefill_bucket = geobuckets`,五点阶梯):slab Σ = **296.5 MiB**
+///      (session 5 + verify 23 + fold 58 + dflash 5 + prefill桶 203)⇒ 262 会让
+///      "池上限"少算 34.5MiB(boot 的"图 slab 预算对账"warning 就是它);
+///   ② 阶梯尾档 +t1024(chunk 1024 生产档):桶族 Σ = **502.3 MiB** ⇒ 320 又不够。
+/// 总治理口径 400 → 778 MiB(WARMUP_MISC 138 不变),代价 = KV 池少 ~378MiB(≈7 页)。
+pub(crate) const GRAPH_SLAB_BUDGET: usize = 640 << 20;
 
 /// warmup 瞬态 + 杂项(治理器之后、图之外的固定分配)。未单列实测;
 /// = 原一锅端 `400MiB` 减图项后的余量(总分不变 ⇒ 历史治理数字可比):
@@ -1806,17 +1812,21 @@ mod vram_budget_tests {
     /// 合计复现 boot 日志 `fixed_after=0.68G`(= 697MiB)。
     #[test]
     fn fixed_after_matches_production_and_keeps_historical_total() {
+        // ⚠️ 2026-10-19 校准后总分 400 → **458 MiB**(= 320 图 + 138 杂项):
+        // prefill 桶族(`prefill_bucket = geobuckets`)实测 slab Σ = 296.5MiB,
+        // 旧 262 的上界会让池多算 34.5MiB(长 ctx 请求 OOM 风险;boot 有对账 warning)。
+        // 代价 = KV 池少 ~58MiB(≈1 页)。历史数字与新数字都在本测里显式钉死。
         assert_eq!(
             GRAPH_SLAB_BUDGET + WARMUP_MISC_BUDGET,
-            400 << 20,
-            "拆分不得改总分(否则历史治理数字不可比)"
+            778 << 20,
+            "拆分不得改总分(2026-10-19 二轮校准:桶族 +t1024 ⇒ 图项 320→640;改预算同步本测)"
         );
         let f = FixedAfter::of(48, 1, gdn_slot_elems(&dims_27b()), 1);
         assert_eq!(f.gdn_grid, 155_713_536);
         assert_eq!(f.gdn_snap, 155_713_536);
-        assert_eq!(f.graph_slab, 262 << 20, "图项 = spec-dflash 实测 slab Σ 的 MiB 上界");
+        assert_eq!(f.graph_slab, 640 << 20, "图项 = 桶族含 t1024 的量级");
         assert_eq!(f.warmup_misc, 138 << 20);
-        assert_eq!(f.total(), 730_857_472, "boot 实测 fixed_after = 697MiB(0.68G)");
+        assert_eq!(f.total(), 730_857_472 + (378 << 20), "boot 实测 fixed_after 随图项(262→640)+378MiB");
     }
 
     /// 草稿池几何单源:逐 token 项与分配项同一来源(原两处各写一遍)

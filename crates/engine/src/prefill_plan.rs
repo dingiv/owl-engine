@@ -64,7 +64,10 @@ pub(crate) fn ladder(b: owl_shared::config::PrefillBucket) -> &'static [usize] {
     match b {
         B::Off => &[],
         B::T512 => &[512],
-        B::Geobuckets => &[32, 64, 128, 256, 512],
+        // 2026-10-19:尾档 +**1024**(chunk 1024 档的生产形态;注意力 T 标度 +20%
+        // 与 marlin m 效率 −11% 都要靠"大块",而桶只到 512 会让大块回 eager)。
+        // slab 代价 ≈ +320MiB(见 GRAPH_SLAB_BUDGET 校准)。
+        B::Geobuckets => &[32, 64, 128, 256, 512, 1024],
     }
 }
 

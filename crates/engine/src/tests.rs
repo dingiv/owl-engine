@@ -3358,7 +3358,8 @@ fn prefill_bucket_pick_and_ladder() {
     // 阶梯:off 空;t512 单桶;geobuckets 五点
     assert!(ladder(PrefillBucket::Off).is_empty());
     assert_eq!(ladder(PrefillBucket::T512), &[512]);
-    assert_eq!(ladder(PrefillBucket::Geobuckets), &[32, 64, 128, 256, 512]);
+    // 2026-10-19:尾档 +t1024(chunk 1024 生产档)
+    assert_eq!(ladder(PrefillBucket::Geobuckets), &[32, 64, 128, 256, 512, 1024]);
     // 向上取整(不向下):512 档下 t=1..=512 全命中 512;t>512 不命中
     for t in [1usize, 33, 128, 511, 512] {
         assert_eq!(pick_bucket(ladder(PrefillBucket::T512), t), Some(512));
@@ -3366,10 +3367,11 @@ fn prefill_bucket_pick_and_ladder() {
     assert_eq!(pick_bucket(ladder(PrefillBucket::T512), 513), None);
     // geobuckets:边界贴着阶梯走
     let l = ladder(PrefillBucket::Geobuckets);
-    for (t, want) in [(1usize, 32usize), (32, 32), (33, 64), (65, 128), (257, 512), (512, 512)] {
+    for (t, want) in [(1usize, 32usize), (32, 32), (33, 64), (65, 128), (257, 512), (512, 512), (513, 1024), (1024, 1024)] {
         assert_eq!(pick_bucket(l, t), Some(want), "t={t}");
     }
-    assert_eq!(pick_bucket(l, 900), None);
+    assert_eq!(pick_bucket(l, 900), Some(1024), "900 ⇒ 升到 t1024 桶");
+    assert_eq!(pick_bucket(l, 1025), None, "超出阶梯顶 ⇒ eager");
     // GDN host 槽臂:27B 几何 + chunked ⇒ t≥64 才吃 host 槽(小 T 走 varlen)
     let mut env = owl_models::env::EnvProvider::default();
     let dims = crate::state::ModelDims {
