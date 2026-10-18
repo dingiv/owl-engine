@@ -8,6 +8,12 @@
 //! **纯样板搬运,零逻辑**:配置解析/门控逻辑全在
 //! `owl_shared::testkit::case_config`;本 crate 只做签名校验 + 展开。
 //!
+//! **选项**(逗号分隔、顺序无关;判据与 skip 文案均在
+//! `owl_shared::testkit`,本 crate 零逻辑):
+//! - `gpu`:`runtime.test_device` 无值(= `OWL_TEST_DEVICE` 未设)⇒ skip;
+//! - `hf_parity`:`OWL_HF_PARITY=1` 未开 ⇒ skip(与手写 `parity_enabled`/
+//!   `skip_note` 同文案);可与 `gpu` 叠用(`#[owl_test(gpu, hf_parity)]`)。
+//!
 //! 消费方约定(与 `#[tokio::test]` 同款纪律):
 //! - 加本 crate 为 **dev-dependency**;
 //! - 调用点必须在 `cfg(test)` 之下(`#[cfg(test)]` 写在 `#[owl_test]`
@@ -25,26 +31,50 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{parse_macro_input, FnArg, ItemFn, Pat, ReturnType, Type};
 
-/// 属性宏入口。选项:`gpu`(GPU 门控)。其余属性透传到生成的 `#[test]`。
+/// 属性选项(`#[owl_test(gpu, hf_parity)]`;逗号分隔,顺序无关)。
+#[derive(Clone, Copy, Default)]
+struct Opts {
+    /// GPU 门控:`runtime.test_device` 无值(= `OWL_TEST_DEVICE` 未设)⇒ skip
+    gpu: bool,
+    /// HF 对拍门控:`OWL_HF_PARITY=1` 未开 ⇒ skip(与手写 `parity_enabled`/`skip_note` 同文案)
+    hf_parity: bool,
+}
+
+/// 选项解析(未知选项 = 响亮拒;逻辑零 —— 判据都在 `owl_shared::testkit`)
+fn parse_opts(attr: &TokenStream) -> Result<Opts, String> {
+    let mut o = Opts::default();
+    let s = attr.to_string();
+    if s.trim().is_empty() {
+        return Ok(o);
+    }
+    for part in s.split(',') {
+        match part.trim() {
+            "gpu" => o.gpu = true,
+            "hf_parity" => o.hf_parity = true,
+            other => {
+                return Err(format!(
+                    "#[owl_test] 未知选项 {other:?}(支持:`gpu`、`hf_parity`,逗号分隔)"
+                ))
+            }
+        }
+    }
+    Ok(o)
+}
+
+/// 属性宏入口。选项:`gpu`(GPU 门控)、`hf_parity`(HF 对拍门控);
+/// 逗号分隔,顺序无关。其余属性透传到生成的 `#[test]`。
 #[proc_macro_attribute]
 pub fn owl_test(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let opts = attr.to_string();
-    let gpu = match opts.trim() {
-        "" => false,
-        "gpu" => true,
-        other => {
-            return syn::Error::new(
-                proc_macro2::Span::call_site(),
-                format!(
-                    "#[owl_test] 未知选项 {other:?}(仅支持 #[owl_test] 或 #[owl_test(gpu)])"
-                ),
-            )
-            .to_compile_error()
-            .into();
+    let opts = match parse_opts(&attr) {
+        Ok(o) => o,
+        Err(msg) => {
+            return syn::Error::new(proc_macro2::Span::call_site(), msg)
+                .to_compile_error()
+                .into()
         }
     };
     let func = parse_macro_input!(item as ItemFn);
-    match expand(gpu, func) {
+    match expand(opts, func) {
         Ok(ts) => ts.into(),
         Err(e) => e.to_compile_error().into(),
     }
@@ -67,7 +97,7 @@ fn type_last_ident(ty: &Type) -> Option<String> {
     }
 }
 
-fn expand(gpu: bool, f: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
+fn expand(opts: Opts, f: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     let sig = &f.sig;
     let name = &sig.ident;
     let err = |msg: String| syn::Error::new(sig.ident.span(), msg);
@@ -83,10 +113,10 @@ fn expand(gpu: bool, f: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             "#[owl_test] 不支持泛型 fn(`{name}`);测试用例请写具体类型"
         )));
     }
-    if !ret_is_unit(&sig.output) && gpu {
+    if !ret_is_unit(&sig.output) && (opts.gpu || opts.hf_parity) {
         return Err(err(format!(
-            "#[owl_test(gpu)] 要求返回 ()(门控跳过用裸 return);`{name}` 返回非 unit —— \
-             门内自行处理 Result,或去掉 gpu 选项"
+            "#[owl_test(…, …)] 有门控时要求返回 ()(门控跳过用裸 return);`{name}` 返回非 unit —— \
+             门内自行处理 Result,或去掉门控选项"
         )));
     }
 
@@ -134,13 +164,14 @@ fn expand(gpu: bool, f: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     let where_c = &sig.generics.where_clause;
 
     // 配置加载:有参数或需要门控时才读(纯 runtime 包装用例零 env 读取)
-    let load = if param.is_some() || gpu {
+    let load = if param.is_some() || opts.gpu {
         quote! { let __owl_cfg = ::owl_shared::testkit::case_config(#case); }
     } else {
         quote! {}
     };
-    // GPU 门控(S2 收编;skip 文案与旧样板逐字同,保 grep 兼容)
-    let gate = if gpu {
+    // 门控(S2 收编;skip 文案与旧样板逐字同,保 grep 兼容)。
+    // 判据/文案全在 `owl_shared::testkit`;宏零逻辑。
+    let gpu_gate = if opts.gpu {
         quote! {
             if __owl_cfg.runtime.test_device.is_none() {
                 ::std::eprintln!("skip: OWL_TEST_DEVICE 未设");
@@ -150,6 +181,17 @@ fn expand(gpu: bool, f: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     } else {
         quote! {}
     };
+    let parity_gate = if opts.hf_parity {
+        quote! {
+            if !::owl_shared::testkit::hf_parity_enabled() {
+                ::std::eprintln!("{}", ::owl_shared::testkit::HF_PARITY_SKIP);
+                return;
+            }
+        }
+    } else {
+        quote! {}
+    };
+    let gate = quote! { #parity_gate #gpu_gate };
     let arg = match param {
         Some(_) => quote! { (&__owl_cfg) },
         None => quote! { () },

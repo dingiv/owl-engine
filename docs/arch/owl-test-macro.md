@@ -42,7 +42,14 @@ async fn gpu_case(cfg: &OwlConfig) {
     let ordinal = cfg.runtime.test_device.unwrap();  // 宏已回填
     // ...
 }
+
+/// 叠用门控(2026-10-18):对拍门 OWL_HF_PARITY 未开也 skip(与手写 skip_note 同文案)
+#[owl_test(gpu, hf_parity)]
+async fn hf_parity_case() { /* 真跑需要 OWL_HF_PARITY=1 + OWL_TEST_DEVICE */ }
 ```
+
+**选项清单**(逗号分隔、顺序无关,未知项 = compile_error):
+`gpu` / `hf_parity`;判据与 skip 文案全在 `owl_shared::testkit`(宏零逻辑)。
 
 ### 2.2 隐藏环境变量:每用例一个配置文件
 
@@ -101,8 +108,12 @@ fn 名() {
 + graph_plan 1 个 GPU 门控测试,共 3 处证明 S1/S2/参数化全链)+
 配置文件真实生效的回归测试 + 文档。
 
+**做(2026-10-18 起,试点已落地)**:按 crate 分批迁移 `#[tokio::test]` + 手写门
+—— 试点 `models/layers/gdn.rs`:22 个 tokio 测试中 21 个迁到宏(19 个 `gpu` +
+2 个 `gpu, hf_parity`),并**注册了一个漏写属性的死测试**(`gpu_gating_g_matches_host`,
+注册后真机通过);净 **−66 行**。余量见 §六。
+
 **不做**(列挂账):
-- 全仓 106 处 `#[tokio::test]` 迁移 —— 机械量大,按 crate 分批另立单;
 - e2e 场景(`pub async fn gpu_*`,无 `#[test]`)不适用本宏 —— 它们由
   e2e 入口统一驱动,配置化随 e2e 入口改造另案;
 - `stack_mb` 深栈选项(e2e 入口的 64MiB 栈问题在单测域未复现)、
@@ -147,3 +158,26 @@ fn 名() {
   `cargo check -p owl-engine --features e2e` 实测通过。
 - **遗留**(已在 §三列范围外):106 处 `#[tokio::test]` 分批迁移、
   e2e 场景配置化(随 e2e 入口另案)。
+
+
+---
+
+## 六、迁移台账(2026-10-18)
+
+### 已迁
+- `crates/models/src/layers/gdn.rs`:**21/22** tokio 测试(剩 1 个 CPU 用例不需要门);
+  +31/−97 行;真机抽测 3 个(`gpu_gating_g` / `gpu_l2norm` / `gpu_norm_act`)全绿。
+
+### 待迁(models 面,按门数量排序;均为**机械转换**)
+| 文件 | 手写 GPU 门 | 备注 |
+|---|---:|---|
+| `models/layers/attention.rs` | 12 | 另有 3 个 `#[tokio::test]` 是 CPU/无门 |
+| `models/layers/dflash2.rs` | 8 | |
+| `models/port_tests.rs` | 7 | |
+| `models/layers/vision.rs` / `decoder.rs` / `formats/qwen35.rs` | 3 / 3 / 2 | 部分门是"检查点缺失 ⇒ skip"(数据门,**不**属本宏;保持手写) |
+
+### 不在本宏覆盖
+- **kernels 集成测试**(`crates/kernels/tests/*.rs`,~40 个文件):全部是**同步** `#[test]`
+  + 四行门,宏当前只收 `async fn`。若要把这批也收编,需给宏加
+  **同步体模式**(不建 runtime,仅注入门/配置)—— 待定;e2e 入口(`pub async fn gpu_*`)
+  仍按原计划随 e2e 改造另案。
