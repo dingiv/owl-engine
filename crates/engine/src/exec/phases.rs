@@ -109,19 +109,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .ok_or_else(|| ModelError::Msg("prefill 块表增长:会话账不在场".into()))?;
             self.bank.rel.leg.ensure_for_len(&mut s.block_table, need)?;
         }
+        let t_fwd = std::time::Instant::now();
         let last_row = self.prefill_chunk(&chunk_ids, base, is_last).await?;
-        // **A0 取证**(`OWL_VRAM_DBG=1`):每 chunk 的显存轨迹 ——
-        // "中间件是否归还"只能由**逐 chunk 的 live 曲线**判定(单点 dump 分不出
-        // "当前 chunk 在飞"与"历史累积")。
-        if std::env::var_os("OWL_VRAM_DBG").is_some() {
-            eprintln!(
-                "[vram-c] chunk@{} t={} ⇒ live={} MiB · 驱动 free={} MiB",
-                base,
-                chunk_ids.len(),
-                owl_shared::vram::live_bytes() >> 20,
-                owl_shared::vram::free_bytes() >> 20
-            );
-        }
+        let fwd_ms = t_fwd.elapsed().as_secs_f64() * 1000.0;
+        let t_bnd = std::time::Instant::now();
         // E2c:块边界跨越 → GDN 快照拍摄(快照身份 = 边界块**内容身份**,
         // 由链哈希游标出 —— 物理块号会被回收复用,不可作键)
         let new_fed = base + chunk_ids.len();
@@ -155,6 +146,22 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     next_end == new_fed || !next_end.is_multiple_of(self.pool.page);
                 self.coverage_analyze(sid, new_fed, last_boundary).await?;
             }
+        }
+        // **逐 chunk 取证**(`OWL_VRAM_DBG=1`;2026-10-19 262k 冲刺):
+        // ①显存轨迹(live/free,判"中间件是否归还")②**计时对**:前向 vs 边界事件
+        // (快照 + 召回/打分/调和)—— "每 chunk 随 ctx 变慢"先分清是哪一半在长。
+        // ⚠️ live/free 现在测在**边界之后**(旧口径在前向之后);趋势口径不变。
+        if std::env::var_os("OWL_VRAM_DBG").is_some() {
+            let bnd_ms = t_bnd.elapsed().as_secs_f64() * 1000.0;
+            eprintln!(
+                "[vram-c] chunk@{} t={} ⇒ live={} MiB · 驱动 free={} MiB · 前向 {:.0}ms · 边界 {:.0}ms",
+                base,
+                chunk_ids.len(),
+                owl_shared::vram::live_bytes() >> 20,
+                owl_shared::vram::free_bytes() >> 20,
+                fwd_ms,
+                bnd_ms
+            );
         }
         self.turns.active.as_mut().expect("活跃").fed += chunk_ids.len();
         if !is_last {

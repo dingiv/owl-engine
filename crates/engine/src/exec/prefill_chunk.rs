@@ -103,8 +103,12 @@ impl ChunkTables {
         // **过去视图**:表 = 子集页链;`lens[t'] = 子集 token + (base + t' + 1 − past_base)`
         let (tbl, lens, base_for_len) = match past {
             Some((pages, tokens)) if paged => {
-                let past_base = base + t; // 占位:下面按行重算
-                let _ = past_base;
+                // `tokens` = **本 chunk 起点**处的可见 token 数(视图等效偏移;
+                // 契约见 `coverage.rs::past_view_of`)。它同时喂两处:
+                //   ① `lens[i] = tokens + i + 1`(本 chunk 第 i 行的可见数 —— 因果正确)
+                //   ② `fi_tables_view(base_for_len, ..)` —— **等效偏移**契约:
+                //      核按 `ctx_total = base_for_len + t` 反推因果前缀长与末页有效数;
+                //      误传真实 `base` ⇒ `last_len` ≈ 全 ctx ⇒ 注意力窗口 O(ctx)。
                 (pages.to_vec(), Vec::new(), tokens)
             }
             _ => (bt_chain.to_vec(), seq(base + 1, t), base),
@@ -115,7 +119,10 @@ impl ChunkTables {
         } else {
             lens
         };
-        let fi = fi_face.then(|| fi_tables_view(base, t, &tbl, page));
+        // ⚠️ **传 `base_for_len`(视图等效偏移),不是 `base`** —— 子集档下两者差
+        // `base − recall_pos`(随 ctx 增长);传错的后果 = 注意力窗口 = 全 ctx
+        // (O(ctx)/chunk ⇒ 总 O(ctx²))+ 末页读越界(2026-10-19 定谳)。
+        let fi = fi_face.then(|| fi_tables_view(base_for_len, t, &tbl, page));
         Self {
             ids: ids.iter().map(|v| *v as f32).collect(),
             pos: seq(base, t),
@@ -940,10 +947,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 (self.model.last_hidden(&ids_t, &ctx), None)
             };
             let d_model = hidden_full.shape()[1];
-            let (hfb, arena1, cov_q) = self
-                .eval_root_and_q(&hidden_full, cov_sink.as_ref())
-                .await?;
+            let ld = live_diag_begin();
+            let r_eval = self.eval_root_and_q(&hidden_full, cov_sink.as_ref()).await;
+            live_diag_end(ld, base, t);
+            let (hfb, arena1, cov_q) = r_eval?;
             // Q 回读(探针档;设备块当场 free;分析在块边界事件后做)
+            self.dump_hidden_row(&hfb, base, t, d_model).await?;
             if let Some(qs) = cov_q {
                 self.coverage_take_q(qs, base, t).await?;
             }
@@ -1108,7 +1117,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             } else {
                 (self.model.last_hidden(&ids_t, &ctx), None)
             };
-            let (b, arena, cov_q) = self.eval_root_and_q(&tree, cov_sink.as_ref()).await?;
+            let ld = live_diag_begin();
+            let r_eval = self.eval_root_and_q(&tree, cov_sink.as_ref()).await;
+            live_diag_end(ld, base, t);
+            let (b, arena, cov_q) = r_eval?;
+            self.dump_hidden_row(&b, base, t, d.hidden).await?;
             if let Some(qs) = cov_q {
                 self.coverage_take_q(qs, base, t).await?;
             }
@@ -1159,4 +1172,47 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     }
 
 
+}
+
+// ============================================================================
+// **chunk 活性归因诊断**(门:`OWL_LIVE_DIAG`;2026-10-19)
+// ============================================================================
+//
+// 问题面:"27B prefill chunk 的激活面 16.5 MiB/token"(单 chunk 峰值 ~2-3 GiB,
+// 直接把 KV 池挤到剩 1 GiB)。解释器侧**已有**中途活性回收(refcount 归零即
+// free),所以"为什么还这么大"只能靠归因面回答:
+//   - 影子 arena 双口径(容量峰值 vs 活跃峰值)的**构成 top-N**(按块名);
+//   - 每个回收出口的**拒因直方图**(pending/users/alias/非竞技场/keep)+ 按名分账;
+//   - 引用计数推送次数(证明求值器真在推,不是面断了)。
+//
+// 用法:`OWL_LIVE_DIAG=1`,跑一个 prefill 档,看 `[live-diag]` 四行。
+fn live_diag_begin() -> bool {
+    if std::env::var_os("OWL_LIVE_DIAG").is_none() {
+        return false;
+    }
+    owl_shared::slab_hint::probe_on(true);
+    true
+}
+
+fn live_diag_end(on: bool, base: usize, t: usize) {
+    if !on {
+        return;
+    }
+    let peak = owl_shared::slab_hint::probe_end();
+    eprintln!(
+        "[live-diag] chunk@{base} t={t}:影子 arena 高水位 = {} MiB",
+        peak >> 20
+    );
+    let rep = owl_shared::slab_hint::take_probe_report();
+    if !rep.is_empty() {
+        eprintln!("[live-diag] 峰值构成:{rep}");
+    }
+    eprintln!(
+        "[live-diag] 回收出口:{}",
+        owl_shared::slab_hint::live_diag::take_report()
+    );
+    eprintln!(
+        "[live-diag] 引用计数推送 {} 次",
+        owl_shared::slab_hint::refs_pushed()
+    );
 }
