@@ -250,18 +250,68 @@ pub struct PoolCfg {
     pub prefix_cache: bool,
 }
 
-/// **驱逐策略**(`[kvmem].evict_policy`;TOML 小写串)
+/// **驱逐策略**(`[kvmem].evict_policy`;TOML 字符串)
 ///
 /// | 值 | 语义 |
 /// |---|---|
 /// | `lru` | 纯近期(现役基线;`last_use` 升序出序) |
-/// | `lrfu` / `lrfu:0.9` | attention-aware LRFU(缺省 λ = 0.9) |
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+/// | `lrfu` | attention-aware LRFU(缺省 λ = 0.9) |
+/// | `lrfu:0.8` | 同上,显式 λ(**0 < λ < 1**) |
+///
+/// ⚠️ 这条是**配置面单源**:λ 只在这里解析(非法值 = boot 响亮拒),
+/// `engine::EngineKnobs::evict_policy_of` 只做词汇映射。
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum EvictPolicyCfg {
-    #[default]
+    /// 纯近期(按 `last_use` 升序出序)。
     Lru,
-    Lrfu,
+    /// attention-aware LRFU:被召回点命中的块 keep-score 抬升。
+    Lrfu {
+        /// 衰减系数(0,1);`lrfu` 缺省 = 0.9。
+        lambda: f32,
+    },
+}
+
+impl Default for EvictPolicyCfg {
+    fn default() -> Self {
+        Self::Lru
+    }
+}
+
+impl EvictPolicyCfg {
+    /// **LRFU 缺省 λ**(与 `owl_store::LrfuPolicy::new` 的文档同值)。
+    pub const LRFU_DEFAULT_LAMBDA: f32 = 0.9;
+}
+
+impl<'de> Deserialize<'de> for EvictPolicyCfg {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        let s = String::deserialize(d)?;
+        match s.as_str() {
+            "lru" => Ok(Self::Lru),
+            "lrfu" => Ok(Self::Lrfu { lambda: Self::LRFU_DEFAULT_LAMBDA }),
+            other => {
+                let Some(raw) = other.strip_prefix("lrfu:") else {
+                    return Err(D::Error::custom(format!(
+                        "[kvmem].evict_policy = \"{other}\" 非法:期望 `lru` | `lrfu` | `lrfu:<λ>`(0<λ<1)"
+                    )));
+                };
+                let lambda: f32 = raw.parse().map_err(|_| {
+                    D::Error::custom(format!(
+                        "[kvmem].evict_policy = \"{other}\" 非法:λ 不是数(期望 0<λ<1 的浮点)"
+                    ))
+                })?;
+                if !(lambda > 0.0 && lambda < 1.0) {
+                    return Err(D::Error::custom(format!(
+                        "[kvmem].evict_policy = \"{other}\" 非法:λ={lambda} 须 0<λ<1(0=只记最近一次,1=永不衰减)"
+                    )));
+                }
+                Ok(Self::Lrfu { lambda })
+            }
+        }
+    }
 }
 
 /// **KVMem 选择层(B 轴)** —— 低显存档位的突破项。
@@ -281,7 +331,7 @@ pub enum EvictPolicyCfg {
 /// ⚠️ 与 `probes.coverage_probe` 的分工:那个是**诊断面**(真实质量全量扫描,
 /// 单次成本含 `ctx` 因子 ⇒ 全军 O(ctx²))。**生产档只需 `select_decode`**,
 /// 不要为了开功能而把探针一起打开。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KvmemCfg {
     /// **生产总开关**:选择层接进 decode(建视图页表 + 每步展开)。
@@ -330,11 +380,13 @@ pub struct KvmemCfg {
     pub analyze_at_ctx: usize,
     /// **驱逐策略**(缺省 `lru`):`lru` = 纯近期;`lrfu[:λ]` = attention-aware
     /// LRFU(召回点选中的块抬 keep-score)⇒ 出序时"又冷又没被注意力用过"的先下沉。
+    /// λ 参数在此解析(A4 收口,2026-10-19)。
     pub evict_policy: EvictPolicyCfg,
     /// **准入地板**(MiB;`None` = 跟随虚拟化姿态)。
     ///
-    /// 语义 = "本 turn 至少要有多少字节的 KV **直接驻留在设备**"
-    /// (`owl_store::TurnFloor::Bytes`)。它决定**准入判据**:
+    /// 语义 = "本 turn 至少要有多少 **KV 页**直接驻留在设备"
+    /// (`owl_store::TurnFloor::Pages`)。MiB 在装配期按**池页宽**换成页数
+    /// (向上取整;与池下限算式同一把尺)。它决定**准入判据**:
     /// - `None` + 虚拟化开 ⇒ **0** = "只要工作集装得下就准入"(低显存档默认);
     /// - `None` + 虚拟化关 ⇒ **Strict** = 要全量 dense 放得下(旧行为);
     /// - `Some(n)` ⇒ `n` MiB(仅当虚拟化开才被接受,否则 boot 响亮拒)。
@@ -1217,6 +1269,41 @@ mod tests {
         OwlConfig::from_toml_str("[pool]\ngdn_slots = 8\n[server]\nmax_concurrency = 2\n")
             .expect("格多于并发 = 合规");
         OwlConfig::default().validate().expect("缺省档 8/8");
+    }
+
+    /// **A4 收口(2026-10-19)**:`lrfu:λ` 解析回配置面。
+    ///
+    /// 病根 = 配置枚举只落 `lru|lrfu`(单元枚举),λ 固定 0.9 ⇒ 文档写的
+    /// `lrfu:0.8` 在 `deny_unknown_fields` 下**直接拒启**(配置面/实现两边不一致)。
+    /// 本门钉三条:①三档字面量 ②λ 真传下去 ③非法值(boot 边界)响亮拒。
+    #[test]
+    fn evict_policy_parses_lambda() {
+        let get = |toml: &str| -> EvictPolicyCfg {
+            toml::from_str::<KvmemCfg>(toml).expect("解析").evict_policy
+        };
+        assert_eq!(get(""), EvictPolicyCfg::Lru, "缺省 = lru");
+        assert_eq!(get("evict_policy = \"lru\""), EvictPolicyCfg::Lru);
+        assert_eq!(get("evict_policy = \"lrfu\""), EvictPolicyCfg::Lrfu { lambda: 0.9 });
+        assert_eq!(
+            get("evict_policy = \"lrfu:0.8\""),
+            EvictPolicyCfg::Lrfu { lambda: 0.8 },
+            "λ 必须真进枚举(旧版这里直接拒)"
+        );
+        assert_eq!(get("evict_policy = \"lrfu:0.25\""), EvictPolicyCfg::Lrfu { lambda: 0.25 });
+        // λ 边界与拼写错 = 结构化拒(不许静默落 lru / 0.9)
+        for bad in [
+            "[kvmem]\nevict_policy = \"lru:0.5\"",
+            "[kvmem]\nevict_policy = \"lrfu:0\"",
+            "[kvmem]\nevict_policy = \"lrfu:1\"",
+            "[kvmem]\nevict_policy = \"lrfu:1.5\"",
+            "[kvmem]\nevict_policy = \"lrfu:-0.1\"",
+            "[kvmem]\nevict_policy = \"lrfu:x\"",
+            "[kvmem]\nevict_policy = \"LRFU\"",
+            "[kvmem]\nevict_policy = \"\"",
+        ] {
+            let e = OwlConfig::from_toml_str(bad).expect_err("必须拒");
+            assert!(e.contains("evict_policy"), "拒语应点名键: {e}");
+        }
     }
 
     #[test]

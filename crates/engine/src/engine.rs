@@ -138,9 +138,11 @@ pub struct EngineKnobs {
     /// 用途:**所有解锁类护栏的判据** —— 非 Strict 地板、池小于上下文,
     /// 都只在这条为真时放行。
     pub kvmem_virtualization: bool,
-    /// **准入地板是否是显式配置的**(`[kvmem].dense_floor_mib` 给了数)。
-    /// 不是 ⇒ boot 在池几何已知后自动填**工作集字节**(见 `run()` 的虚拟化校验)。
-    pub dense_floor_explicit: bool,
+    /// **准入地板的事实(配置面)** = `[kvmem].dense_floor_mib`(MiB;`None` = 未给)。
+    /// 装配期按**池页宽**换成页数(`ceil(MiB/page_bytes)`,页数 0 保留 0)。
+    /// `None` = 跟随虚拟化姿态:开 ⇒ 页数 = 工作集页数;关 ⇒ `Strict`。
+    /// **配置只存 MiB 事实,页数在装配期落**(A7:地板与池下限同一把尺)。
+    pub dense_floor_mib: Option<u64>,
     /// **状态腿宿主预算 MiB**(S2 §25.2;缺省 **0 = 关层**)。`OWL_SNAP_HOST_MB`。
     ///
     /// 与 [`Self::host_cache_mb`] 同属 store 中层总账的两个**分片**
@@ -153,11 +155,13 @@ pub struct EngineKnobs {
     /// `Reject` = 准入拒(客户端该降并发/重试,不是压缩上下文);
     /// `Queue { max_wait_ms }` = 留队首等下一次事件重判(超时则拒)。
     pub admission_on_full: owl_store::QueuePolicy,
-    /// **per-turn 直接显存地板的缺省值**(S3b;设计卷 §2.4)。
+    /// **per-turn 直接显存地板的缺省值**(S3b;设计卷 §2.4;**页口径**)。
     ///
-    /// `Strict` = 全量 dense 驻留(选择层未落地时的唯一诚实值);
-    /// 请求可用 `TurnOpts::dense_floor` 逐 turn 覆写 —— 非 `Strict` 当前**响亮拒**
-    /// (B 轴未落地,地板语义无从兑现,§23.5)。
+    /// 装配期由 [`Self::derive_turn_ws`] 落值(`dense_floor_mib` 事实 × 池页宽)。
+    /// `Strict` = 全量 dense 驻留(非虚拟化档的唯一诚实值);
+    /// 请求可用 `TurnOpts::dense_floor` 逐 turn 覆写 —— 覆写面当前只认 `Strict`
+    /// (**响亮拒**,见 `running::submit_session_opts`:接受非 Strict 而无执行面
+    /// 就是静默降级)。
     pub dense_floor: owl_store::TurnFloor,
     /// eager 直发,跳过图捕获(原 OWL_NO_GRAPH;**总闸**)
     pub no_graph: bool,
@@ -226,7 +230,7 @@ impl Default for EngineKnobs {
             select_recent: 4,
             recall_every: 1,
             kvmem_virtualization: false,
-            dense_floor_explicit: false,
+            dense_floor_mib: None,
             admission_on_full: owl_store::QueuePolicy::Reject,
             dense_floor: owl_store::TurnFloor::Strict,
             no_graph: false,
@@ -280,20 +284,30 @@ impl EngineKnobs {
     fn evict_policy_of(cfg: &owl_shared::config::KvmemCfg) -> owl_store::EvictPolicyKind {
         match cfg.evict_policy {
             owl_shared::config::EvictPolicyCfg::Lru => owl_store::EvictPolicyKind::Lru,
-            owl_shared::config::EvictPolicyCfg::Lrfu => owl_store::EvictPolicyKind::Lrfu(0.9),
+            owl_shared::config::EvictPolicyCfg::Lrfu { lambda } => {
+                owl_store::EvictPolicyKind::Lrfu(lambda as f64)
+            }
         }
     }
 
-    /// **准入地板映射**(单源):配置三态 → `TurnFloor`。
+    /// **准入地板映射**(单源):配置三态 → `TurnFloor`(装配期定谳)。
     /// 配置层只存事实(`virtualization_enabled` + `dense_floor_mib`),
     /// 到 store 词汇的映射在本层(分层:shared 不得依赖 store)。
+    ///
+    /// ⚠️ 这里只能给**页几何未知时的占位**:
+    /// - 非虚拟化 ⇒ `Strict`(唯一诚实值,不会变);
+    /// - 虚拟化 ⇒ `Pages(0)`,真值由 [`Self::derive_turn_ws`] 在池页宽已知后落
+    ///   (显式 MiB → 页 / 未给 ⇒ 工作集页数)。
     fn dense_floor_of(cfg: &owl_shared::config::KvmemCfg) -> owl_store::TurnFloor {
         Self::dense_floor_for(cfg.virtualization_enabled(), cfg.dense_floor_mib)
     }
 
     /// 地板映射的**唯一实现**(按两份事实入参;探针/测试档直接构 knobs 时
-    /// 也走这一条 —— 不得在别处再写一次“虚拟化开 ⇒ Bytes(0)”:那样两处
+    /// 也走这一条 —— 不得在别处再写一次“虚拟化开 ⇒ Pages(0)”:那样两处
     /// 迟早对不上)。
+    ///
+    /// `floor_mib = Some(n)` 时仍需页宽才能定页数 ⇒ 本函数给的是
+    /// `Pages(0)` 占位,**真值在装配期**(见 [`Self::dense_floor_with_mib`])。
     pub fn dense_floor_for(
         virtualization: bool,
         floor_mib: Option<u64>,
@@ -302,15 +316,24 @@ impl EngineKnobs {
             // 虚拟化不在场 ⇒ 唯一诚实值(非 Strict 会被 boot 拦)
             return owl_store::TurnFloor::Strict;
         }
-        match floor_mib {
-            Some(mib) => owl_store::TurnFloor::Bytes((mib as usize) << 20),
-            None => owl_store::TurnFloor::Bytes(0),
-        }
+        // 页宽未知:先落 0 页占位(装配期 `derive_turn_ws` 用池页宽覆盖)。
+        let _ = floor_mib;
+        owl_store::TurnFloor::Pages(0)
+    }
+
+    /// **MiB 事实 → 页数地板**(唯一换算;页宽已知时用)。
+    ///
+    /// 向上取整到整页(少一页 = “承诺了又给不够”);`0 MiB` ⇒ `0 页`
+    /// (= 允许全量下沉)。
+    pub fn dense_floor_with_mib(mib: u64, page_bytes: usize) -> owl_store::TurnFloor {
+        let page_bytes = page_bytes.max(1);
+        let bytes = (mib as usize).saturating_mul(1 << 20);
+        owl_store::TurnFloor::Pages(bytes.div_ceil(page_bytes))
     }
 
 
     /// **每 turn 工作集的派生(唯一产地)** —— 对外一个 token 数,内部三件:
-    /// 工作集页数 / 召回预算(块)/ 准入地板(字节)。
+    /// 工作集页数 / 召回预算(块)/ 准入地板(**页数**,A7 起)。
     ///
     /// 为什么必须单点(2026-10-19):这三件在旧实现里**各算一次**
     /// (池下限算式算一遍页数、准入地板又算一遍、召回预算再写死一个块数)
@@ -322,7 +345,7 @@ impl EngineKnobs {
     /// `top_k = 0`("只留保底")合法;`工作集 < 保底` = 配置不自洽 ⇒ **响亮拒**。
     /// ⚠️ `select_blocks` 是**总选中数**(`owl_store::select` 的预算就是总数,保底从
     /// 里面优先占),所以它 = `ws_pages`,**不是** `ws_pages − keep`(2026-10-19 踩过)。
-    fn derive_turn_ws(
+    pub(crate) fn derive_turn_ws(
         workspace_tokens: usize,
         page_tokens: usize,
         page_bytes: usize,
@@ -342,9 +365,16 @@ impl EngineKnobs {
         knobs.select_blocks = ws_pages;
         let ws_bytes = ws_pages * page_bytes.max(1);
         // 地板**只在虚拟化档**落:非虚拟化档的唯一诚实地板是 `Strict`
-        // (boot 会拦非 Strict;dense_floor_for 同一判据),别在这里越权改。
-        if knobs.kvmem_virtualization && !knobs.dense_floor_explicit {
-            knobs.dense_floor = owl_store::TurnFloor::Bytes(ws_bytes);
+        // (boot 会拦非 Strict),别在这里越权改。
+        //
+        // A7(2026-10-19):地板是**页口径** —— 显式 MiB 按池页宽向上取整成页数;
+        // 未给数则“地板 = 工作集页数”(与池下限/召回预算**同一套页数**,
+        // 不再各处各算一遍字节)。
+        if knobs.kvmem_virtualization {
+            knobs.dense_floor = match knobs.dense_floor_mib {
+                Some(mib) => Self::dense_floor_with_mib(mib, page_bytes),
+                None => owl_store::TurnFloor::Pages(ws_pages),
+            };
         }
         Ok((ws_pages, ws_bytes))
     }
@@ -366,8 +396,18 @@ impl EngineKnobs {
             owl_store::EvictPolicyKind::Lru => "lru".to_string(),
             owl_store::EvictPolicyKind::Lrfu(l) => format!("lrfu:{l}"),
         };
+        // 地板一列打**事实**(配置面口径),不打占位页数(A7):
+        // 页数要在池页宽已知的装配期才定 ⇒ 真值在 `[turn-ws]` 自证行。
+        let fl = if !self.kvmem_virtualization {
+            "Strict".to_string()
+        } else {
+            match self.dense_floor_mib {
+                Some(mib) => format!("{mib}MiB→页"),
+                None => format!("ws({}tok)→页", self.workspace_per_req),
+            }
+        };
         format!(
-            "pool={:?} turns={} snap_max={} host={}M snap_host={}M | kvmem={}[idx={} cov={} view={} part={} ws={}tok(sink{}+recent{}+topk{}@32tok/page) every={} evict={} floor={:?}] | fi={} split={} gdn_chunked={} kv={} graph_off={}",
+            "pool={:?} turns={} snap_max={} host={}M snap_host={}M | kvmem={}[idx={} cov={} view={} part={} ws={}tok(sink{}+recent{}+topk{}@32tok/page) every={} evict={} floor={}] | fi={} split={} gdn_chunked={} kv={} graph_off={}",
             self.pool_tokens,
             self.gdn_slots,
             self.snap_max,
@@ -384,7 +424,7 @@ impl EngineKnobs {
             self.select_blocks,
             self.recall_every,
             ev,
-            self.dense_floor,
+            fl,
             self.env.attn.fi as u8,
             self.env.attn.prefill_split as u8,
             self.env.gdn.chunked as u8,
@@ -449,7 +489,8 @@ impl EngineKnobs {
             select_recent: cfg.kvmem.select_recent,
             recall_every: cfg.kvmem.recall_every,
             kvmem_virtualization: cfg.kvmem.virtualization_enabled(),
-            dense_floor_explicit: cfg.kvmem.dense_floor_mib.is_some(),
+            // 地板 = **事实**(MiB 配置项);页数在装配期按池页宽落(`derive_turn_ws`)。
+            dense_floor_mib: cfg.kvmem.dense_floor_mib,
             // 准入姿态(S3b):env 覆盖(`reject` / `queue[:ms]`);缺省响亮拒。
             // 坏值 = **响亮拒**(§24.5④:不再 panic;启动期结构化失败,
             // 归 §18.5 的"配置错误静默 exit 1"红线同一族)
@@ -457,11 +498,13 @@ impl EngineKnobs {
                 owl_shared::log_error!("boot", "{e} —— 拒绝启动");
                 std::process::exit(2);
             }),
-            // per-turn 地板缺省。三态(2026-10-19 配置化):
+            // per-turn 地板缺省。三态(2026-10-19 配置化;A7 改页口径):
             // - 虚拟化未开 ⇒ **Strict**(全量 dense;唯一诚实值)
-            // - 虚拟化开 + `[kvmem].dense_floor_mib = N` ⇒ `Bytes(N MiB)`
-            // - 虚拟化开 + 未给数 ⇒ `Bytes(0)` = "只要工作集装得下就准入"
+            // - 虚拟化开 + `[kvmem].dense_floor_mib = N` ⇒ `Pages(ceil(N·MiB / 页字节))`
+            // - 虚拟化开 + 未给数 ⇒ `Pages(工作集页数)` = "只要自己那套装得下就准入"
             //   (搬运与腾位交给 A/B 两轴;这是低显存档的默认姿态)
+            // 两个虚拟化分支的真值都由 `derive_turn_ws`(页宽已知)落 —— 这里
+            // 只放 `dense_floor_of` 的三态占位。
             dense_floor: Self::dense_floor_of(&cfg.kvmem),
             no_graph: cfg.graph.no_graph,
             prefill_bucket: cfg.graph.prefill_bucket,
@@ -600,6 +643,7 @@ fn assemble_budget(
         draft_pool_bytes: draft_pool as usize,
         gdn_row_bytes: pool.gdn_row_bytes(),
         kv_bytes_per_token: (block_bytes / page).max(1),
+        page_tokens: page,
         // 中层总账 = KV 块腿分片 + 状态腿(快照)分片(S2 §25.2)
         host_bytes: (cfg.knobs.host_cache_mb + cfg.knobs.snap_host_mb) << 20,
         disk_bytes: 0,
@@ -871,9 +915,18 @@ impl<D: DeviceClient + 'static> Engine<D> {
         // 配置里只写 token,这一行告诉你它变成了几页/几字节/多少找回预算。
         // 打印用 `eprintln!`(取证行惯例):`log_*` 宏在无 `log` feature 的
         // 测试/探针构建里被**编译剔除**(`if false`)—— 自证行必须在探针里可见。
+        //
+        // 地板一列打**装配后的真值**(A7):非虚拟化档 = `Strict`,虚拟化档 =
+        // 工作集页数或显式 MiB 换来的页数 —— 不再拿 `ws_bytes` 冒充地板。
+        let floor_desc = match self.cfg.knobs.dense_floor {
+            owl_store::TurnFloor::Strict => "Strict(全 ctx 页)".to_string(),
+            owl_store::TurnFloor::Pages(n) => {
+                format!("{n} 页 = {} KiB/turn", (n * page_bytes) >> 10)
+            }
+        };
         eprintln!(
             "[turn-ws] 每 turn 工作集 = {} tok = {} 页 = {} KiB(页 {} tok / {} KiB)⇒ \
-             常驻 {} 块 = 保底 sink {} + recent {} + 召回 top-k {};准入地板 = {} KiB/turn;\
+             常驻 {} 块 = 保底 sink {} + recent {} + 召回 top-k {};准入地板 = {};\
              池下限 = {} 并发 × (工作集 {} + chunk {} = {} 页) = {} 页(池 {} 页){}\
              (改工作集只动 `[kvmem].workspace_per_req`;`select_blocks` 是派生量)",
             self.cfg.knobs.workspace_per_req,
@@ -885,7 +938,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
             self.cfg.knobs.select_sink,
             self.cfg.knobs.select_recent,
             ws_pages - keep_pages,
-            ws_bytes >> 10,
+            floor_desc,
             n_active,
             ws_pages,
             chunk_pages,
@@ -918,21 +971,19 @@ impl<D: DeviceClient + 'static> Engine<D> {
                     pool.page
                 )));
             }
-            // **准入地板缺省 = 本 turn 工作集字节**(不是 0!)
+            // **准入地板缺省 = 本 turn 工作集页数**(不是 0 页!)
             //
-            // 地板语义 = "本 turn 至少多少字节 KV 直接驻留设备"。并发档下若给 0,
-            // N 个 turn 会各自被无条件准入、然后互抢池 ⇒ 抖动;给工作集字节
+            // 地板语义 = "本 turn 至少多少 KV **页**直接驻留设备"。并发档下若给 0,
+            // N 个 turn 会各自被无条件准入、然后互抢池 ⇒ 抖动;给工作集页数
             // = "每个进来的 turn 都先留出它自己那套",与上面的池下限算式**同源**
-            // (同一套页数,乘的是字节而不是并发数)。显式给了 `[kvmem].dense_floor_mib`
-            // 则尊重显式值。
-            // (准入地板**已由 `derive_turn_ws` 按同一个 `ws_pages` 填好** ——
-            //  这里不再二次算式;显式 `[kvmem].dense_floor_mib` 仍优先。)
+            // (同一套页数)。显式给了 `[kvmem].dense_floor_mib` 则尊重显式值。
+            // (两件都**已由 `derive_turn_ws` 按池页宽填好** —— 这里不再二次算式。)
             let _ = ws_bytes;
             owl_shared::log_warn!(
                 "boot",
                 "KVMem 虚拟化档:**池 = {} tok / {} 页** vs 上下文 {} tok / {} 页 ⇒ 超卖 {:.2}×;\
                  并发上限 {} × 每 turn {} 页(工作集 {} tok=sink{}+recent{}+top-k{} + chunk {}) = {need} 页;\
-                 每页 {} KiB;准入地板 = {:?} / turn;宿主 {} MiB",
+                 每页 {} KiB;准入地板 = {} / turn;宿主 {} MiB",
                 pool.nb * pool.page,
                 pool.nb,
                 s,
@@ -946,7 +997,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
                 self.cfg.knobs.select_blocks,
                 chunk_pages,
                 page_bytes / 1024,
-                self.cfg.knobs.dense_floor,
+                floor_desc,
                 self.cfg.knobs.host_cache_mb + self.cfg.knobs.snap_host_mb,
             );
         }

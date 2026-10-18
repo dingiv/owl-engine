@@ -31,6 +31,13 @@ pub struct BudgetInputs {
     pub gdn_row_bytes: usize,
     /// 每 token KV 字节(27B:`k` = 32KiB fp8 / 64KiB f16)。
     pub kv_bytes_per_token: usize,
+    /// **页宽(token/页)**。与 `kv_bytes_per_token` 合起来定义页字节
+    /// = `page_tokens × kv_bytes_per_token`(`Rel::open` 与 KV 腿几何交叉校验)。
+    ///
+    /// 为什么进预算入参(A7 收口,2026-10-19):准入地板与池下限算式必须是
+    /// **同一把尺** —— 块表/池容量都按页粒度走(`div_ceil(seq/page)`),
+    /// 地板若按字节算,页宽或布局一变就会“各说各话”。
+    pub page_tokens: usize,
     /// host 层上限(0 = 关层;要求 C4 显式配置)。
     pub host_bytes: usize,
     /// 磁盘层上限(0 = 关层)。
@@ -44,21 +51,43 @@ pub struct BudgetInputs {
 }
 
 /// per-turn 预算诉求 = **KVMem 式损失的耐受度**(设计卷 §2.4)。
+///
+/// **单位 = 页**(页宽由 `BudgetInputs::page_tokens` 定义) —— A7 收口
+/// (2026-10-19):旧版是 `Bytes`,与块表/池容量的页口径各算一套;现在地板
+/// 与池下限/(链增长)共用同一把尺。字节只在**报告面**由 `floor_bytes` 派生。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TurnFloor {
-    /// 零耐受:`dense_floor = N·k` ⇒ **禁用选择层**,不足即响亮拒/排队。
+    /// 零耐受:`dense_floor = ceil(N/page)` 页 ⇒ **禁用选择层**,不足即响亮拒/排队。
     Strict,
-    /// 直接显存地板(字节);越小 = 越耐受近似。`0` = 允许全量下沉(仅受窗口墙约束)。
-    Bytes(usize),
+    /// 直接显存地板(**页数**);越小 = 越耐受近似。`0` = 允许全量下沉
+    /// (仅受窗口墙约束)。高于本 turn 的 `ctx` 页数时按 `ctx` 页数封顶。
+    Pages(usize),
 }
 
 impl TurnFloor {
-    /// 本 turn 的直接显存地板字节数。
-    pub fn floor_bytes(self, ctx_tokens: usize, kv_bytes_per_token: usize) -> usize {
+    /// 本 turn 的**页数地板**(未封顶的入参 → 实际生效页数)。
+    pub fn floor_pages(self, ctx_tokens: usize, page_tokens: usize) -> usize {
+        let page = page_tokens.max(1);
+        let ctx_pages = ctx_tokens.div_ceil(page);
         match self {
-            TurnFloor::Strict => ctx_tokens.saturating_mul(kv_bytes_per_token),
-            TurnFloor::Bytes(b) => b.min(ctx_tokens.saturating_mul(kv_bytes_per_token)),
+            TurnFloor::Strict => ctx_pages,
+            TurnFloor::Pages(n) => n.min(ctx_pages),
         }
+    }
+
+    /// 本 turn 的直接显存地板字节数。
+    ///
+    /// **页粒度**:`floor_pages × page_tokens × kv_bytes_per_token` —— 与
+    /// 链增长(`div_ceil`)同源;`ctx` 非页对齐时地板**向上取整到页数**
+    /// (与设备上的整页分配一致)。
+    pub fn floor_bytes(
+        self,
+        ctx_tokens: usize,
+        page_tokens: usize,
+        kv_bytes_per_token: usize,
+    ) -> usize {
+        let page = page_tokens.max(1);
+        self.floor_pages(ctx_tokens, page).saturating_mul(page).saturating_mul(kv_bytes_per_token)
     }
 
     /// 是否零耐受(禁选择层)。
@@ -85,6 +114,9 @@ impl VramBudget {
     pub fn decompose(inputs: BudgetInputs, gdn_slots: usize) -> StoreResult<Self> {
         if inputs.kv_bytes_per_token == 0 {
             return Err(StoreError::Budget("每 token KV 字节为 0".into()));
+        }
+        if inputs.page_tokens == 0 {
+            return Err(StoreError::Budget("页宽(page_tokens)为 0(地板/池下限无从按页对齐)".into()));
         }
         if gdn_slots == 0 {
             return Err(StoreError::Budget("gdn_slots = 0(没有任何 turn 能跑)".into()));
@@ -329,8 +361,8 @@ pub fn check_admission(
         );
         return verdict_for_full(on_full, reason);
     }
-    let floor_bytes = floor.floor_bytes(ctx_tokens, inp.kv_bytes_per_token);
-    let ctx_bytes = ctx_tokens.saturating_mul(inp.kv_bytes_per_token);
+    let floor_bytes = floor.floor_bytes(ctx_tokens, inp.page_tokens, inp.kv_bytes_per_token);
+    let ctx_pages = ctx_tokens.div_ceil(inp.page_tokens.max(1));
     // 已用 = 保留面 + 会话持有面 + 弹性面 + 缓存面;固定面(权重/底价/行/草稿)已从 V_avail 扣掉
     let committed = admission.reserved_bytes()
         + admission.session_held_bytes()
@@ -339,27 +371,22 @@ pub fn check_admission(
     // 判据面 = 固定池档的池墙 / 动态池档的卡级余量(§23.2,一产地)
     let face = budget.face_bytes();
     if committed.saturating_add(floor_bytes) <= face {
-        // 地板放得下;Strict 还需全量
-        if floor.is_strict() && ctx_bytes > floor_bytes {
-            return AdmissionVerdict::Reject {
-                reason: format!(
-                    "Strict turn 需全量 {ctx_bytes} 字节,地板仅 {floor_bytes}(语义:零耐受 ⇏ 禁选择层)"
-                ),
-            };
-        }
+        // 地板放得下。`Strict` 的语义已由 `floor_pages = ctx 页数` 直接兑现
+        // (A7:不再需要“精确 ctx 字节 > 地板”的二次判定 —— 两者同源)。
         return AdmissionVerdict::Admit { floor_bytes };
     }
     let short = (committed + floor_bytes).saturating_sub(face);
     if evictable_bytes >= short {
         return AdmissionVerdict::EvictThen { floor_bytes, need_bytes: short };
     }
+    let pages = floor.floor_pages(ctx_tokens, inp.page_tokens);
     let reason = if floor.is_strict() {
         format!(
-            "Strict turn(零耐受)显存不足:需 {floor_bytes} 字节(欠 {short}),可驱逐面仅 {evictable_bytes};ctx={ctx_tokens} tok"
+            "Strict turn(零耐受)显存不足:需 {pages} 页(={floor_bytes} 字节,ctx {ctx_tokens} tok = {ctx_pages} 页,欠 {short}),可驱逐面仅 {evictable_bytes}"
         )
     } else {
         format!(
-            "显存不足:需 {floor_bytes} 字节(欠 {short}),可驱逐面仅 {evictable_bytes};ctx={ctx_tokens} tok"
+            "显存不足:需 {pages} 页(={floor_bytes} 字节,ctx {ctx_tokens} tok,欠 {short}),可驱逐面仅 {evictable_bytes}"
         )
     };
     if floor.is_strict() {
@@ -398,6 +425,7 @@ mod tests {
             draft_pool_bytes: 0,
             gdn_row_bytes: 162_000_000,
             kv_bytes_per_token: 32 * 1024,
+            page_tokens: 32,
             host_bytes: 16 << 30,
             disk_bytes: 0,
             kv_face_bytes: 0,
@@ -415,6 +443,7 @@ mod tests {
             draft_pool_bytes: 0,
             gdn_row_bytes: 1,
             kv_bytes_per_token: 32 * 1024,
+            page_tokens: 32,
             host_bytes: 0,
             disk_bytes: 0,
             kv_face_bytes: face,
@@ -431,6 +460,7 @@ mod tests {
             draft_pool_bytes: 0,
             gdn_row_bytes: 1,
             kv_bytes_per_token: 1,
+            page_tokens: 32,
             host_bytes: 0,
             disk_bytes: 0,
             kv_face_bytes: 0, // 也没有池面兑底 ⇒ 必须拒
@@ -501,6 +531,34 @@ mod tests {
         assert!((150_000..165_000).contains(&n_star), "N* = {n_star}");
     }
 
+    /// **A7 收口(2026-10-19)**:地板是**页口径** —— 与链增长/池下限同一把尺。
+    #[test]
+    fn floor_is_page_granular_and_capped() {
+        // 页 = 32 tok × 32KiB = 1 MiB
+        assert_eq!(TurnFloor::Strict.floor_pages(100, 32), 4, "100 tok 占 4 页(ceil)");
+        assert_eq!(
+            TurnFloor::Strict.floor_bytes(100, 32, 32 * 1024),
+            4 << 20,
+            "Strict = 整页粒度(不是精确 100 tok)"
+        );
+        assert_eq!(TurnFloor::Strict.floor_pages(96, 32), 3, "对齐不浪费页");
+        assert_eq!(TurnFloor::Pages(2).floor_pages(100, 32), 2);
+        assert_eq!(TurnFloor::Pages(9).floor_pages(100, 32), 4, "高于 ctx 页数 ⇒ 封顶到 ctx");
+        assert_eq!(
+            TurnFloor::Pages(0).floor_bytes(100, 32, 32 * 1024),
+            0,
+            "0 页 = 允许全量下沉(不是“未设”)"
+        );
+        assert_eq!(TurnFloor::Pages(1).floor_bytes(0, 32, 32 * 1024), 0, "零长 ctx = 零地板");
+    }
+
+    #[test]
+    fn decompose_rejects_zero_page_width() {
+        let mut inp = pool_budget(1, 1 << 20).inputs();
+        inp.page_tokens = 0;
+        assert!(matches!(VramBudget::decompose(inp, 1), Err(StoreError::Budget(_))));
+    }
+
     #[test]
     fn strict_turn_beyond_capacity_is_rejected_loudly() {
         let b = budget(1);
@@ -518,7 +576,7 @@ mod tests {
         let b = budget(1);
         let a = Admission::new();
         // 地板只要 2.1GB(64K 执行视图)⇒ 放得下 ⇒ 准入
-        let floor = TurnFloor::Bytes(64 * 1024 * 32 * 1024 / 1024);
+        let floor = TurnFloor::Pages(64);
         let v = check_admission(&b, &a, floor, 262_144, 0, QueuePolicy::Reject);
         assert!(matches!(v, AdmissionVerdict::Admit { .. }), "得 {v:?}");
     }
@@ -530,7 +588,7 @@ mod tests {
         // 两个满编 turn 把 v_avail 吃掉
         let v_avail = b.v_avail_bytes();
         a.admit(1, v_avail, 0).expect("占满");
-        let v = check_admission(&b, &a, TurnFloor::Bytes(1 << 20), 4096, 0, QueuePolicy::Reject);
+        let v = check_admission(&b, &a, TurnFloor::Pages(1), 4096, 0, QueuePolicy::Reject);
         // 剩余 0 ⇒ 拒(不会给出 0 字节地板假装成功)
         assert!(matches!(v, AdmissionVerdict::Reject { .. }), "得 {v:?}");
     }
@@ -541,7 +599,7 @@ mod tests {
         let mut a = Admission::new();
         let v_avail = b.v_avail_bytes();
         a.set_cache_bytes(v_avail - (1 << 20)); // 缓存几乎占满
-        let v = check_admission(&b, &a, TurnFloor::Bytes(4 << 20), 8192, 8 << 20, QueuePolicy::Reject);
+        let v = check_admission(&b, &a, TurnFloor::Pages(4), 8192, 8 << 20, QueuePolicy::Reject);
         assert!(matches!(v, AdmissionVerdict::EvictThen { .. }), "得 {v:?}");
     }
 
@@ -550,12 +608,12 @@ mod tests {
         let b = budget(1);
         let mut a = Admission::new();
         a.admit(1, 1 << 20, 0).expect("第一个");
-        let v = check_admission(&b, &a, TurnFloor::Bytes(1), 32, 1 << 30, QueuePolicy::Reject);
+        let v = check_admission(&b, &a, TurnFloor::Pages(1), 32, 1 << 30, QueuePolicy::Reject);
         match v {
             AdmissionVerdict::Reject { reason } => assert!(reason.contains("天花板"), "{reason}"),
             other => panic!("应拒,得 {other:?}"),
         }
-        let q = check_admission(&b, &a, TurnFloor::Bytes(1), 32, 1 << 30, QueuePolicy::Queue { max_wait_ms: 50 });
+        let q = check_admission(&b, &a, TurnFloor::Pages(1), 32, 1 << 30, QueuePolicy::Queue { max_wait_ms: 50 });
         assert!(matches!(q, AdmissionVerdict::Queue { .. }), "得 {q:?}");
     }
 }

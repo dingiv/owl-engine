@@ -190,6 +190,13 @@ impl Rel {
                 inputs.kv_bytes_per_token
             )));
         }
+        if kv_cfg.block_tokens != inputs.page_tokens {
+            return Err(StoreError::Budget(format!(
+                "页宽不一致:腿几何 block_tokens={} ≠ 预算入参 page_tokens={}\
+                 (地板按页口径算、链增长也按页 —— 两把尺必须同一把)",
+                kv_cfg.block_tokens, inputs.page_tokens
+            )));
+        }
         // host 预算只有一个总量(`inputs.host_bytes` = 整个 store 的中层预算),腿拿其中
         // 一段 ⇒ 腿那段不许超过总量(超了就是两套规范,不许静默对不上)。
         if kv_cfg.host_bytes > inputs.host_bytes {
@@ -556,6 +563,7 @@ mod tests {
             draft_pool_bytes: 0,
             gdn_row_bytes: 162_000_000,
             kv_bytes_per_token: 32 * 1024,
+            page_tokens: 32,
             host_bytes: 8 << 20,
             disk_bytes: 0,
             kv_face_bytes: 0,
@@ -609,6 +617,10 @@ mod tests {
         let mut i2 = inputs();
         i2.kv_bytes_per_token = 4096;
         assert!(Rel::open(i2, AdmissionPolicy::new(1, QueuePolicy::Reject), kv_cfg(8, 8)).is_err());
+        // 页宽与腿几何矛盾 = 拒(A7:地板按页算、链增长也按页 ⇒ 同一把尺)
+        let mut i3 = inputs();
+        i3.page_tokens = 16;
+        assert!(Rel::open(i3, AdmissionPolicy::new(1, QueuePolicy::Reject), kv_cfg(8, 8)).is_err());
     }
 
     /// @cu: 固定池档:池是准入面,卡级可缺项 —— 但"未实测"必须可查(不许静默)。
@@ -768,7 +780,7 @@ mod tests {
         let r = rel(1);
         let v = r.check(TurnFloor::Strict, 262_144);
         assert!(matches!(v, AdmissionVerdict::Reject { .. }), "得 {v:?}");
-        let v = r.check(TurnFloor::Bytes(2 << 30), 262_144);
+        let v = r.check(TurnFloor::Pages(2048), 262_144);
         assert!(matches!(v, AdmissionVerdict::Admit { .. }), "有耐受 ⇒ 准入,得 {v:?}");
     }
 }

@@ -112,6 +112,63 @@ async fn run_turn(
     }
 }
 
+/// **虚拟化档装配**(可调工作集;A7-bis 的两条门共用)。
+///
+/// 与 `boot_rows` 的区别:开虚拟化两扇门 + 地板走 per-turn 覆写面,
+/// 工作集由调用方给(池下限 `nb ≥ 1 × (ws_pages + 1)` 必须装得进 8 槽池)。
+async fn boot_virt(ws_tokens: usize) -> owl_engine::RunningEngine<CpuFace> {
+    let cfg = EngineConfig {
+        device_ordinal: 0,
+        max_seq_tokens: MAX_SEQ,
+        prefill_chunk: 32,
+        knobs: EngineKnobs {
+            sampler_enabled: false,
+            pool_tokens: Some(POOL_TOKENS),
+            host_cache_mb: 16,
+            gdn_slots: 1,
+            dense_floor: owl_store::TurnFloor::Pages(0),
+            kvmem_virtualization: true,
+            select_decode: true,
+            select_partial: true,
+            workspace_per_req: ws_tokens,
+            select_sink: 1,
+            select_recent: 1,
+            ..Default::default()
+        },
+    };
+    let face =
+        CpuFace::mock(MockLimits { null_kernels: true, graph_capture: true, ..Default::default() });
+    let mut engine = Engine::on(cfg, face).expect("构造(CPU face)");
+    let loaded = engine.loader().load_qwen35_0_8b(&asset_dir()).await.expect("装载");
+    engine.run(loaded).await.expect("装配")
+}
+
+/// 提交一个 turn(带 `TurnOpts`)并泵到终态;返回(事件, prompt token 数)。
+async fn run_turn_opts(
+    running: &mut owl_engine::RunningEngine<CpuFace>,
+    session: Option<u64>,
+    base: u32,
+    n: u32,
+    max_new: usize,
+    opts: owl_engine::TurnOpts,
+) -> (TurnEvent, usize) {
+    let (_sid, tid) = running
+        .submit_session_opts(session, num_prompt(base, n), max_new, opts)
+        .expect("submit");
+    let pt = running.turn_prompt_len(tid).unwrap_or(0);
+    loop {
+        match running.pump().await.expect("pump") {
+            ev @ (TurnEvent::Completed { turn, .. } | TurnEvent::Failed { turn, .. })
+                if turn == tid =>
+            {
+                return (ev, pt)
+            }
+            TurnEvent::Idle => panic!("泵到 Idle 而 turn {tid} 未终了(准入排队中?)"),
+            _ => {}
+        }
+    }
+}
+
 /// **门①先腾后进**:池被**可动**缓存占满 ⇒ `EvictThen` ⇒ 主动下沉 ⇒ 准入。
 #[tokio::test(flavor = "current_thread")]
 async fn cold_cache_is_offloaded_before_the_new_turn_is_admitted() {
@@ -233,7 +290,7 @@ async fn non_strict_dense_floor_is_refused_loudly() {
         prefill_chunk: 32,
         knobs: EngineKnobs {
             sampler_enabled: false,
-            dense_floor: owl_store::TurnFloor::Bytes(1 << 20),
+            dense_floor: owl_store::TurnFloor::Pages(1),
             ..Default::default()
         },
     };
@@ -257,7 +314,7 @@ async fn non_strict_dense_floor_is_refused_loudly() {
     let mut running = boot().await;
     let err = running
         .submit_session_opts(None, num_prompt(0, WORDS), 5, owl_engine::TurnOpts {
-            dense_floor: Some(owl_store::TurnFloor::Bytes(1 << 20)),
+            dense_floor: Some(owl_store::TurnFloor::Pages(1)),
             ..Default::default()
         })
         .expect_err("请求面非 Strict 必须拒");
@@ -316,7 +373,7 @@ async fn non_strict_dense_floor_is_allowed_when_virtualization_is_on() {
         prefill_chunk: 32,
         knobs: EngineKnobs {
             sampler_enabled: false,
-            dense_floor: owl_store::TurnFloor::Bytes(0), // 允许全量下沉
+            dense_floor: owl_store::TurnFloor::Pages(0), // 允许全量下沉
             kvmem_virtualization: true,                  // 配置面两条门都开
             select_decode: true,
             select_partial: true,
@@ -340,9 +397,80 @@ async fn non_strict_dense_floor_is_allowed_when_virtualization_is_on() {
     });
     let mut engine = Engine::on(cfg, face).expect("构造");
     let loaded = engine.loader().load_qwen35_0_8b(&asset_dir()).await.expect("装载");
-    let running = engine.run(loaded).await;
-    match running {
-        Ok(_) => eprintln!("[gate] 虚拟化开 + Bytes(0) 地板 ⇒ 放行(预期)"),
+    let mut running = match engine.run(loaded).await {
+        Ok(r) => r,
         Err(e) => panic!("虚拟化开时非 Strict 地板必须放行,得: {e}"),
+    };
+    eprintln!("[gate] 虚拟化开 + Pages(0) 地板 ⇒ 放行(预期)");
+
+    // ② **per-turn 覆写面**(A7-bis 接线):非 Strict 地板必须**真收进去并跑完**。
+    //    地板 = 4 页(≤ 本档工作集 10 页)⇒ 准入通过、实得 4 页、turn 正常终了。
+    let (ev, _n) = run_turn_opts(
+        &mut running,
+        None,
+        0,
+        WORDS,
+        8,
+        owl_engine::TurnOpts {
+            dense_floor: Some(owl_store::TurnFloor::Pages(4)),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        matches!(ev, TurnEvent::Completed { .. }),
+        "虚拟化档 per-turn 非 Strict 地板应跑完,得 {ev:?}"
+    );
+    eprintln!("[gate] per-turn 地板 Pages(4) ⇒ 准入并跑完 ✓");
+}
+
+/// **A7-bis 门②**:per-turn 地板的**上限 = 本档工作集**（视图只能保这么多常驻）
+/// ⇒ 超了必须**响亮拒**(不静默夹）。
+///
+/// ⚠️ 为什么单开一档:上一条测试的档 `max_seq(256 tok = 8 页) ≤ 工作集(320 tok = 10 页)`
+/// ⇒ `floor_pages = min(请求页, ctx 页) ≤ 8 < 10` —— **上限结构性触发不到**。
+/// 本档把工作集压到 **96 tok = 3 页**(> 保底 2 页),ctx 上限 8 页 ⇒ 可触发。
+#[tokio::test(flavor = "current_thread")]
+async fn per_turn_floor_above_workspace_is_refused_loudly() {
+    if skip() {
+        return;
+    }
+    let mut running = boot_virt(96).await; // 3 页工作集(保底 sink1+recent1)
+    // ① 请求 2 页 ≤ 3 页 ⇒ 收(并跑完)
+    let (ev, _n) = run_turn_opts(
+        &mut running,
+        None,
+        0,
+        WORDS,
+        8,
+        owl_engine::TurnOpts {
+            dense_floor: Some(owl_store::TurnFloor::Pages(2)),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(matches!(ev, TurnEvent::Completed { .. }), "2 页 ≤ 工作集 3 页应放行,得 {ev:?}");
+    // ② 请求 4 页 > 3 页(ctx 上界 251 tok = 8 页 ⇒ 不被 ctx 夹)⇒ 响亮拒
+    let (ev2, _n2) = run_turn_opts(
+        &mut running,
+        None,
+        100,
+        WORDS,
+        224,
+        owl_engine::TurnOpts {
+            dense_floor: Some(owl_store::TurnFloor::Pages(4)),
+            ..Default::default()
+        },
+    )
+    .await;
+    match ev2 {
+        TurnEvent::Failed { err, .. } => {
+            eprintln!("[gate] 超工作集地板拒原文: {err}");
+            assert!(
+                err.contains("工作集") && err.contains("workspace_per_req"),
+                "拒语应点名病因与调法: {err}"
+            );
+        }
+        other => panic!("超工作集地板必须响亮拒,得 {other:?}"),
     }
 }

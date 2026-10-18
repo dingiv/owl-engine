@@ -248,6 +248,9 @@ pub struct BAxisProfile {
     pub q_toh_ms: f64,
     /// 查询面细分:host 解码(f16→f32)
     pub q_dec_ms: f64,
+    /// 查询面细分:Q 块 `free`(释放命令墙钟;从 `q_dec_ms` 窗口里剔出单记 ——
+    /// 原口径把释放命令算进"host 解码",读数虚高)
+    pub q_free_ms: f64,
     /// 查询面细分:host 逆 RoPE(逐行)
     pub q_derope_ms: f64,
     /// 查询面细分:**真实质量**(诊断面;逐 query 行 × 层 × 头 扫全 ctx)
@@ -271,7 +274,7 @@ impl BAxisProfile {
             "B 轴相位 ×{} 边界:合计 {:.1}ms | 索引 {:.1}({:.0}%) 查询面 {:.1}({:.0}%) \
              重诊断 {:.1}({:.0}%) 打分 {:.1}({:.0}%) 论文口径 {:.1}({:.0}%) \
              选择 {:.1}({:.0}%) 视图 {:.1}({:.0}%) 调和 {:.1}({:.0}%) \
-             ‖ 查询面拆:{:.1} 设备往返 + {:.1} host 解码 + {:.1} 逆RoPE + {:.1} 真实质量 \
+             ‖ 查询面拆:{:.1} 设备往返 + {:.1} host 解码 + {:.1} 释放 {:.1} 逆RoPE + {:.1} 真实质量 \
              ‖ 召回档:完整 {} · 廉价 {}",
             self.boundaries,
             self.total_ms,
@@ -284,7 +287,8 @@ impl BAxisProfile {
             self.view_ms, pct(self.view_ms),
             self.reconcile_ms, pct(self.reconcile_ms),
             self.q_toh_ms,
-            self.q_dec_ms,
+            self.q_dec_ms - self.q_free_ms,
+            self.q_free_ms,
             self.q_derope_ms,
             self.q_mass_ms,
             self.recall_full,
@@ -457,14 +461,20 @@ impl<D: DeviceClient> RunningEngine<D> {
         if prompt_ids.is_empty() {
             return Err(ModelError::Msg("submit: 空 prompt".into()));
         }
-        // 准入地板(S3b §23.5):本刀只实做 Strict(全量 dense 驻留)——
-        // 非 Strict = "允许选择层按需物化",而选择层(B 轴)未落地 ⇒
-        // 接受它就是**静默降级**(§2.4 红线)。响亮拒,把话说明白。
+        // 准入地板(S3b §23.5 / A7-bis 接线 2026-10-19):
+        //
+        // 非 Strict 地板 = "允许选择层按需物化" ⇒ **必须有执行面**才收:
+        // 判据 = 引擎的**虚拟化两扇门**(`select_decode` + `select_partial`,
+        // 唯一产地 `kvmem_virtualization`)。没开就响亮拒(接受=静默降级)。
+        // 开着的档位:地板进 `admission_gate`(准入判据 + 实得地板回吐),
+        // 页数上限在准入处按**本档工作集**再校一遍(ctx 长度那时才知道)。
         if let Some(f) = opts.dense_floor {
-            if !f.is_strict() {
+            if !f.is_strict() && !self.cfg.knobs.kvmem_virtualization {
                 return Err(ModelError::Msg(
-                    "submit: 准入面拒绝 TurnFloor::Bytes —— 选择层(B 轴)未落地,\
-                     地板语义无从兑现(设计卷 §23.5);本档只接受 Strict"
+                    "submit: per-turn 非 Strict 地板需要**虚拟化两扇门**\
+                     ([kvmem].select_decode = true **且** select_partial = true)——\
+                     地板语义只有选择层在场才能兜住(设计卷 §2.4/§23.5);\
+                     两者任一为假 = 响亮拒,不静默降级"
                         .into(),
                 ));
             }
@@ -693,6 +703,30 @@ impl<D: DeviceClient> RunningEngine<D> {
         Ok(())
     }
 
+    /// **实得地板回吐**(设计卷 §2.4 的"报告面"):一行说清
+    /// **请求页 / 实得页 / 上下文页**——实得 < 请求 = 有耐受档的合法压缩
+    /// (差额推给三层),但**必须看得见**(不许静默)。
+    fn log_floor_grant(
+        &self,
+        turn_id: u64,
+        floor: owl_store::TurnFloor,
+        ctx_tokens: usize,
+        page: usize,
+        page_bytes: usize,
+        granted_bytes: usize,
+    ) {
+        let req_pages = floor.floor_pages(ctx_tokens, page);
+        let got_pages = granted_bytes.div_ceil(page_bytes.max(1));
+        let ctx_pages = ctx_tokens.div_ceil(page.max(1));
+        owl_shared::log_info!(
+            "store",
+            "准入：turn {turn_id} 地板请求 {req_pages} 页 / **实得 {got_pages} 页**\
+             (={} KiB)‖ ctx {ctx_tokens} tok = {ctx_pages} 页 ‖ 档 {}",
+            granted_bytes >> 10,
+            if floor.is_strict() { "Strict" } else { "耐受" }
+        );
+    }
+
     /// **H1 准入判决**(S3b §23.4):待准入 turn 过 `Rel::check` ⇒
     /// 调需求(EvictThen)/ 拒(Reject)/ 留队(Queue)。
     ///
@@ -721,14 +755,34 @@ impl<D: DeviceClient> RunningEngine<D> {
         }) else {
             return Ok(());
         };
+        // **per-turn 地板的上限校验**(A7-bis):视图只能保持"本档工作集"那么多页
+        // 常驻 ⇒ 请求地板 > 工作集 = 承诺无法兑现 ⇒ **响亮拒**(不静默夹）。
+        // 只有 ctx 长度到了这里才知道,所以校在这里而不是 submit 处。
+        let page = self.pool.page.max(1);
+        let page_bytes = self.pool.block_bytes().max(1);
+        let ws_pages = self.cfg.knobs.select_blocks.max(1);
+        let req_pages = floor.floor_pages(ctx_tokens, page);
+        if !floor.is_strict() && req_pages > ws_pages {
+            let reason = format!(
+                "per-turn 地板 {req_pages} 页 > 本档工作集 {ws_pages} 页(视图只能保这么多常驻)\
+                 —— 调大 [kvmem].workspace_per_req 或调小请求地板"
+            );
+            self.reject_queued_turn(turn_id, format!("准入拒绝：{reason}"))?;
+            return Ok(());
+        }
         match self.bank.rel.check(floor, ctx_tokens) {
-            AdmissionVerdict::Admit { .. } => {
+            AdmissionVerdict::Admit { floor_bytes } => {
                 self.turns.admit_wait = None;
+                // **实得地板回吐**(设计卷 §2.4 报告面):请求页 / 实得页 / 上下文页。
+                self.log_floor_grant(turn_id, floor, ctx_tokens, page, page_bytes, floor_bytes);
             }
-            AdmissionVerdict::EvictThen { need_bytes, .. } => {
+            AdmissionVerdict::EvictThen { need_bytes, floor_bytes } => {
                 // 抬需求到"腾够就能进":同一次段边界搬完(下沉不丢内容)
                 let want = need_bytes.div_ceil(self.pool.block_bytes().max(1));
                 need.slots = need.slots.max(want);
+                self.log_floor_grant(
+                    turn_id, floor, ctx_tokens, page, page_bytes, floor_bytes,
+                );
             }
             AdmissionVerdict::Queue { reason } => {
                 let started = match self.turns.admit_wait {

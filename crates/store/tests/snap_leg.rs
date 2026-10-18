@@ -34,6 +34,7 @@ fn rel(host_bytes: usize) -> Rel {
         draft_pool_bytes: 0,
         gdn_row_bytes: 1 << 20,
         kv_bytes_per_token: 32 * 1024,
+        page_tokens: 32,
         host_bytes,
         disk_bytes: 0,
         kv_face_bytes: 8 * (1 << 20),

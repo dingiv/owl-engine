@@ -494,6 +494,7 @@ mod bank_tests {
             draft_pool_bytes: 0,
             gdn_row_bytes: 1 << 20,
             kv_bytes_per_token: (p.block_bytes / p.page.max(1)).max(1),
+            page_tokens: p.page.max(1),
             host_bytes: p.host_bytes,
             disk_bytes: 0,
             kv_face_bytes: p.nb * p.block_bytes,
