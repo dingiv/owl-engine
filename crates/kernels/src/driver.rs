@@ -1657,6 +1657,19 @@ pub mod elems {
         })
     }
 
+    /// **gemv_i8w:int8 权重 × f16 激活的 GEMV**(m=1 decode;P1.5-a)。
+    ///
+    /// 一 warp 一行、**8 warp/块**(块内共用一份 x 行缓存,`smem = cols·2 B`);
+    /// 每 lane 一次读 16 B(16 个 int8)⇒ 要求 `cols % 16 == 0`。
+    pub fn gemv_i8w(rows: usize, cols: usize, tokens: usize) -> KernelPick {
+        assert!(cols % 16 == 0, "gemv_i8w 要求 cols % 16 == 0(每 lane 16 B 对齐),得 {cols}");
+        KernelPick::of::<crate::ops::elems::GemvI8wF16>(Shape {
+            grid: (rows.div_ceil(8) as u32, tokens as u32, 1),
+            block: (256, 1, 1),
+            smem: (cols * 2) as u32,
+        })
+    }
+
     /// 行栈 concat(arity ≤ 8;哨兵 1D)
     pub fn concat(dt: DType) -> KernelPick {
         KernelPick { name: dt_name("concat", dt), shape: SENTINEL_1D }

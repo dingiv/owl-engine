@@ -511,6 +511,25 @@ int marlin_gemm_v2_awq_ffi(const void* A, const void* B, void* C,
                    /*is_bf16=*/false);
 }
 
+// **配置可注**(2026-10-19 P5-Q2):与 awq_ffi 逐字同一路,只把 thread_k/thread_n
+// 透传(实参 -1 全程等价 auto)⇒ 台子可扫"实例化档"里的小批 tile(见
+// docs/arch/TP2-实录卷.md §71 的 m=1 带宽扫描)。生产仍走 auto。
+int marlin_gemm_v2_awq_cfg_ffi(const void* A, const void* B, void* C,
+                               const void* b_scales, const void* b_zeros,
+                               int prob_m, int prob_n, int prob_k, void* workspace,
+                               int group_size, int dev, uintptr_t stream,
+                               int thread_k, int thread_n) {
+  int sms = 0;
+  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+  int num_groups = (group_size == -1) ? 1 : prob_k / group_size;
+  return marlin_mm(A, B, C, /*c_tmp=*/nullptr, const_cast<void*>(b_scales),
+                   /*a_s=*/nullptr, /*a_is_s8=*/false,
+                   const_cast<void*>(b_zeros), /*use_zp=*/true,
+                   prob_m, prob_n, prob_k, prob_k, workspace, num_groups,
+                   group_size, dev, (cudaStream_t)stream, thread_k, thread_n, sms,
+                   /*is_bf16=*/false);
+}
+
 // W4A8 × AWQ **非对称**变体:A = int8(已量化)+ a_scales fp32[M,1];B = kU4 + b_zeros。
 // c_tmp 与 marlin_gemm_v2_w4a8_ffi 同款自管 —— a_is_s8 强制 use_fp32_reduce ⇒
 // slice_count>1 形状走 global_reduce_fp32,缓冲由本发射器流序 malloc/free(暗雷面消除)。
