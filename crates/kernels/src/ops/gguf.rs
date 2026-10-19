@@ -69,6 +69,50 @@ gguf_gemm_spec!(GgufGemmQ4K, crate::family::gguf::GEMM_Q4K);
 gguf_gemm_spec!(GgufGemmQ5K, crate::family::gguf::GEMM_Q5K);
 gguf_gemm_spec!(GgufGemmQ6K, crate::family::gguf::GEMM_Q6K);
 
+// ---- **smem 复用臂(W-2b;prefill 的算术杠杆)** ————————————————
+//
+// 与 MMVQ/复用臂**不同槽序**:本臂吃**原始 f16 激活**(不经 q8_1)——
+// 少一发量化核,且比 q8_1 更准;权重仍是 GGUF 块字节。
+
+/// `owl_gguf_gemm_smem_q8_0` —— smem 复用 GEMM(Q8_0)
+pub struct GgufSmemQ8_0;
+/// 同上(Q4_K)
+pub struct GgufSmemQ4K;
+/// 同上(Q5_K)
+pub struct GgufSmemQ5K;
+/// 同上(Q6_K)
+pub struct GgufSmemQ6K;
+
+/// smem 臂槽序(与 `gguf_smem.cu` 实例行逐参对位)
+const SMEM_PARAMS: &[Param] = &[
+    Param::t_in("weights", Dtype::U8, 2),
+    Param::t_in("x", Dtype::F16, 2),
+    Param::t_out("out", Dtype::F16, 2),
+    Param::i32("m"),
+    Param::i32("n"),
+    Param::i32("k"),
+    Param::i32("out_off"),
+    Param::i32("out_ld"),
+];
+
+macro_rules! gguf_smem_spec {
+    ($t:ty, $entry:expr) => {
+        impl KernelSpec for $t {
+            const ENTRY: &'static str = $entry;
+            const SRC: &'static str = crate::family::gguf::SMEM_SRC;
+            const PARAMS: &'static [Param] = SMEM_PARAMS;
+            const LAWS: &'static [Law] = &[Law::OutputFinite];
+            const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+            const DETERMINISM: Determinism = Determinism::Deterministic;
+        }
+    };
+}
+
+gguf_smem_spec!(GgufSmemQ8_0, crate::family::gguf::GEMM_SMEM_Q8_0);
+gguf_smem_spec!(GgufSmemQ4K, crate::family::gguf::GEMM_SMEM_Q4K);
+gguf_smem_spec!(GgufSmemQ5K, crate::family::gguf::GEMM_SMEM_Q5K);
+gguf_smem_spec!(GgufSmemQ6K, crate::family::gguf::GEMM_SMEM_Q6K);
+
 // ---- **复用臂(W-2;prefill)** ————————————————————————————————
 //
 // 与 MMVQ **同槽序**(`GEMM_PARAMS` 逐字相同)—— 两者是同一语义动作的两种
@@ -248,6 +292,12 @@ pub static TILE_Q4K: KernelMeta = meta_of::<GgufTileQ4K>();
 pub static TILE_Q5K: KernelMeta = meta_of::<GgufTileQ5K>();
 pub static TILE_Q6K: KernelMeta = meta_of::<GgufTileQ6K>();
 
+// ---- smem 复用臂的元数据表项 ----
+pub static SMEM_Q8_0: KernelMeta = meta_of::<GgufSmemQ8_0>();
+pub static SMEM_Q4K: KernelMeta = meta_of::<GgufSmemQ4K>();
+pub static SMEM_Q5K: KernelMeta = meta_of::<GgufSmemQ5K>();
+pub static SMEM_Q6K: KernelMeta = meta_of::<GgufSmemQ6K>();
+
 pub static METAS: &[&KernelMeta] = &[
     &GEMM_Q8_0,
     &GEMM_Q4K,
@@ -257,6 +307,10 @@ pub static METAS: &[&KernelMeta] = &[
     &TILE_Q4K,
     &TILE_Q5K,
     &TILE_Q6K,
+    &SMEM_Q8_0,
+    &SMEM_Q4K,
+    &SMEM_Q5K,
+    &SMEM_Q6K,
     &QUANT_ACT_F16,
     &QUANT_ACT_BF16,
     &QUANT_ACT_F16_TILED,

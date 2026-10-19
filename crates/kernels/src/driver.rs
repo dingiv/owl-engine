@@ -172,6 +172,13 @@ pub fn resolve(req: OpReq) -> KernelPick {
             ax(1),
             ax(2),
         ),
+        // **smem 复用臂**(W-2b):同 aux = [ty, m, n];几何按 MT/NT 切窗 + 大 smem
+        "gguf.gemm_smem" => gguf::gemm_smem(
+            crate::family::gguf::GgmlTy::from_code(ax(0) as u32)
+                .unwrap_or_else(|| panic!("driver::resolve(\"gguf.gemm_smem\"): 未知 ggml 型码 {}", ax(0))),
+            ax(1),
+            ax(2),
+        ),
         // aux = [rows, k_padded](网格从它们算;与 gemm 的 aux = [ty, m, n] 区分)
         // 两个 op_id 各一档:输出恒 U8 ⇒ `dt` 载不了输入档(与 QuantInt8Row* 同律)
         "gguf.quant_act_f16" => gguf::quant_act(DType::F16, ax(0), ax(1)),
@@ -519,6 +526,24 @@ pub mod gguf {
             GgmlTy::Q6K => KernelPick::of::<crate::ops::gguf::GgufTileQ6K>(shape),
             other => panic!(
                 "owl_gguf_gemm_tile: {} 未移植(复用臂集 = {:?})",
+                other.name(),
+                fam::PORTED
+            ),
+        }
+    }
+
+    /// **smem 复用 GEMM**(prefill 的算术杠杆;W-2b):`grid = (ceil(n/NT), ceil(m/MT))`
+    /// + **动态 smem 66048B**(>48KB ⇒ server 走 opt-in 通道)
+    pub fn gemm_smem(ty: GgmlTy, m: usize, n: usize) -> KernelPick {
+        let (grid, block) = fam::smem_geom(m, n);
+        let shape = Shape { grid, block, smem: fam::smem_bytes() as u32 };
+        match ty {
+            GgmlTy::Q8_0 => KernelPick::of::<crate::ops::gguf::GgufSmemQ8_0>(shape),
+            GgmlTy::Q4K => KernelPick::of::<crate::ops::gguf::GgufSmemQ4K>(shape),
+            GgmlTy::Q5K => KernelPick::of::<crate::ops::gguf::GgufSmemQ5K>(shape),
+            GgmlTy::Q6K => KernelPick::of::<crate::ops::gguf::GgufSmemQ6K>(shape),
+            other => panic!(
+                "owl_gguf_gemm_smem: {} 未移植(smem 臂集 = {:?})",
                 other.name(),
                 fam::PORTED
             ),

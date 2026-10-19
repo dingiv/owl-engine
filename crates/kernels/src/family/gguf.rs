@@ -294,6 +294,54 @@ pub const QUANT_ACT_F16_TILED: &str = "owl_gguf_quant_act_f16_tiled";
 /// 同上,bf16 入
 pub const QUANT_ACT_BF16_TILED: &str = "owl_gguf_quant_act_bf16_tiled";
 
+// ---- **smem 复用臂**(W-2b;prefill 的算术杠杆)------------------------------
+/// `owl_gguf_gemm_smem_q8_0`
+pub const GEMM_SMEM_Q8_0: &str = "owl_gguf_gemm_smem_q8_0";
+/// 同上(Q4_K)
+pub const GEMM_SMEM_Q4K: &str = "owl_gguf_gemm_smem_q4k";
+/// 同上(Q5_K)
+pub const GEMM_SMEM_Q5K: &str = "owl_gguf_gemm_smem_q5k";
+/// 同上(Q6_K)
+pub const GEMM_SMEM_Q6K: &str = "owl_gguf_gemm_smem_q6k";
+/// smem 臂的资产 id
+pub const SMEM_SRC: &str = "cu/gguf/gguf_smem.cu";
+
+/// 型 → **smem 复用臂**入口名(`None` = 未移植)
+pub const fn smem_entry_for(ty: GgmlTy) -> Option<&'static str> {
+    match ty {
+        GgmlTy::Q8_0 => Some(GEMM_SMEM_Q8_0),
+        GgmlTy::Q4K => Some(GEMM_SMEM_Q4K),
+        GgmlTy::Q5K => Some(GEMM_SMEM_Q5K),
+        GgmlTy::Q6K => Some(GEMM_SMEM_Q6K),
+        _ => None,
+    }
+}
+
+/// smem 臂的几何常量(**与 `cu/gguf/gguf_smem.cu` 的 `namespace` 互锁**;
+/// 单测 `smem_geom_matches_cu` 逐项比对)。
+pub const SMEM_MT: usize = 64;
+/// 每 CTA 权重行窗
+pub const SMEM_NT: usize = 64;
+/// 每次 k 块(= 一个 K-quant 超块)
+pub const SMEM_KC: usize = 256;
+/// smem 行 padding(halfs;`STRIDE = KC + PAD`)
+pub const SMEM_PAD: usize = 2;
+/// 每 CTA warp 数(512 线程:1 CTA/SM 也有 16 warp 在飞)
+pub const SMEM_NW: usize = 16;
+
+/// smem 字节数(`(MT + NT) × (KC + PAD) × 2B` = 66048 > 48KB ⇒ 走 opt-in 通道)
+pub const fn smem_bytes() -> usize {
+    (SMEM_MT + SMEM_NT) * (SMEM_KC + SMEM_PAD) * 2
+}
+
+/// **smem 臂发射几何**:`grid = (ceil(n/NT), ceil(m/MT))`,`block = (32, NW)`,
+/// `smem = smem_bytes()`(核内 `extern __shared__`)。
+pub fn smem_geom(m: usize, n: usize) -> ((u32, u32, u32), (u32, u32, u32)) {
+    let gx = (n.div_ceil(SMEM_NT)).max(1) as u32;
+    let gy = (m.div_ceil(SMEM_MT)).max(1) as u32;
+    ((gx, gy, 1), (32, SMEM_NW as u32, 1))
+}
+
 /// **已移植的型**(加型 = `.cu` 加一行实例 + 本表加一项 + `ops/gguf.rs` 加一条声明)
 pub const PORTED: &[GgmlTy] = &[GgmlTy::Q8_0, GgmlTy::Q4K, GgmlTy::Q5K, GgmlTy::Q6K];
 

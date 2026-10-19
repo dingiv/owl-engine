@@ -163,6 +163,102 @@ mod tests {
         }
     }
 
+    /// **smem 复用臂 ↔ MMVQ 对拍门**(W-2b;2026-10-19)。
+    ///
+    /// 两臂**不位级相同**(本臂喂原始 f16 激活,MMVQ 先量化成 q8_1)⇒ 判据 =
+    /// `max|Δ|/max|ref| < 2e-2`(q8_1 的量化噪声量级;错窗/错块/错分块会给 O(1))。
+    /// 覆盖 `m = MT`(整窗)与 `m = MT + 37`(尾窗 + 非整块 token 数)两档 × 四型。
+    #[owl_test(gpu)]
+    async fn gpu_gguf_smem_gemm_matches_mmvq() {
+        if !resource_ok("gguf:4b") {
+            eprintln!("skip: 资源清单缺 \"gguf:4b\"");
+            return;
+        }
+        const MT: usize = owl_kernels::family::gguf::SMEM_MT;
+        let path = PathBuf::from(resource("gguf:4b").expect("resource_ok 已过"));
+        let g = Gguf::open(&path).expect("open 4B");
+        let cases: &[(&str, &str)] = &[
+            ("blk.0.attn_gate.weight", "Q4_K"),
+            ("blk.0.ssm_out.weight", "Q8_0"),
+            ("blk.0.attn_qkv.weight", "Q6_K"),
+            ("blk.3.attn_k.weight", "Q5_K"),
+        ];
+        let mut gpu = crate::testkit::gpu_client().await;
+        for (tname, want_ty) in cases.iter().copied() {
+            let ti = g.get_tensor(tname).unwrap_or_else(|| panic!("缺张量 {tname}"));
+            let ix = g.index_of(tname).unwrap();
+            let bytes = g.bytes(ix);
+            let (rows, inner) = (ti.rows() as usize, ti.inner() as usize);
+            let (be, bb) = ti.ty.block();
+            let row_bytes = inner / be * bb;
+            let wblk = TensorOps::from_host(Dtype::U8, vec![rows, row_bytes], bytes);
+            for m in [MT, MT + 37] {
+                let xv: Vec<f32> = (0..m * inner)
+                    .map(|i| {
+                        half::f16::from_f32(((i as f32 * 0.0137).cos() * 1.3).clamp(-2.5, 2.5))
+                            .to_f32()
+                    })
+                    .collect();
+                let xb: Vec<u8> =
+                    xv.iter().flat_map(|v| half::f16::from_f32(*v).to_le_bytes()).collect();
+                let x = TensorOps::from_host(Dtype::F16, vec![m, inner], &xb);
+                let xq = TensorOps::call(SemanticKernel::GgufQuantActF16)
+                    .arg(&x)
+                    .arg_i32(inner as i32)
+                    .arg_i32(inner as i32)
+                    .aux(&[m, inner])
+                    .with_shape(Dtype::U8, vec![m, inner / 32 * XQ_BLOCK]);
+                let a = harvest_f16(
+                    &mut gpu,
+                    &TensorOps::call(SemanticKernel::GgufGemm)
+                        .arg(&wblk)
+                        .arg(&xq)
+                        .arg_i32(m as i32)
+                        .arg_i32(rows as i32)
+                        .arg_i32(inner as i32)
+                        .arg_i32(inner as i32)
+                        .arg_i32(0)
+                        .arg_i32(rows as i32)
+                        .aux(&[want_ty_code(want_ty), m, rows])
+                        .with_shape(Dtype::F16, vec![m, rows]),
+                )
+                .await;
+                let b = harvest_f16(
+                    &mut gpu,
+                    &TensorOps::call(SemanticKernel::GgufGemmSmem)
+                        .arg(&wblk)
+                        .arg(&x)
+                        .arg_i32(m as i32)
+                        .arg_i32(rows as i32)
+                        .arg_i32(inner as i32)
+                        .arg_i32(0)
+                        .arg_i32(rows as i32)
+                        .aux(&[want_ty_code(want_ty), m, rows])
+                        .with_shape(Dtype::F16, vec![m, rows]),
+                )
+                .await;
+                let scale = a.iter().fold(0f32, |acc, v| acc.max(v.abs())).max(1e-12);
+                let mut maxd = 0f32;
+                let mut worst = 0usize;
+                for (i, (p, q)) in a.iter().zip(&b).enumerate() {
+                    let d = (p - q).abs();
+                    if d > maxd {
+                        maxd = d;
+                        worst = i;
+                    }
+                }
+                let rel = maxd / scale;
+                eprintln!(
+                    "[gguf-gpu] {tname}({want_ty}, {rows}×{inner}, m={m}):smem vs MMVQ max|Δ|/max = {rel:.3e} @ {worst}"
+                );
+                assert!(
+                    rel < 2e-2,
+                    "{tname}({want_ty}) m={m}:smem 臂与 MMVQ 差 {rel:.4e}(超出 q8_1 量化噪声量级 ⇒ 错窗/错分块)"
+                );
+            }
+        }
+    }
+
     /// **复用臂 ↔ MMVQ 位级门**(W-2;2026-10-19):同一权重/激活/形状下,两臂
     /// 的输出必须**逐位相同**。
     ///

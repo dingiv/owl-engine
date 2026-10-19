@@ -29,9 +29,10 @@
 # 双卡实测(2026-10-19,3090 Ti 对 41/42):首 token " Paris" · 两 rank logits
 # 0 项不同 · AR 注入 r0=r1=256 · decode 30.9 tok/s(debug 构建)。
 #
-# ⚠️ **prefill 现在很慢**(MMVQ-only,无 tile 臂 ⇒ 估 ~50 t/s @4k):
-# M2 的 std 五点三轮要等 prefill tile 臂(设计 §八 R2)。本档先服务正确性与
-# 长上下文可用性,不拿它比 prefill。
+# **prefill(W-2 后)**:MMVQ 的权重流量 = m × 权重字节 ⇒ 带宽上限 53 t/s
+# (实测 48.5)。W-2a 权重复用臂 + W-2b smem 复用臂(权重窗解量化进 smem 一次、
+# 寄存器 4×4 分块)后实测 **121.4 t/s @1001-token prompt(chunk 512)** = 2.5×;
+# 4B 同口径 333 → **819.5 t/s**(2.46×)。见设计 §十六/§十七。
 
 [model]
 kind = "gguf"

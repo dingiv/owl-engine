@@ -41,6 +41,18 @@ fn gguf_tile_arm_enabled() -> bool {
     !matches!(std::env::var("OWL_GGUF_TILE").as_deref(), Ok("0"))
 }
 
+/// **smem 复用臂的最小 token 数**(W-2b)。窗 = `MT = 64`,故 `m ≥ 64` 才吃满;
+/// 8..63 仍是 vec_dot 复用臂(1.65×),decode/verify 仍 MMVQ。
+pub(crate) const GGUF_SMEM_MIN_M: usize = 64;
+
+/// smem 臂开关(诊断/对拍;缺省开)。`OWL_GGUF_SMEM=0` ⇒ 回退 vec_dot 复用臂。
+///
+/// ⚠️ 两臂**不位级相同**(smem 臂喂原始 f16 激活,MMVQ/复用臂喂 q8_1)⇒
+/// 切换只影响数值末位;门 = `kernel_gate::gpu_gguf_smem_gemm_matches_mmvq`。
+fn gguf_smem_arm_enabled() -> bool {
+    !matches!(std::env::var("OWL_GGUF_SMEM").as_deref(), Ok("0"))
+}
+
 pub(crate) fn gguf_quant_gemm(
     w: &Weight,
     ty: GgmlTy,
@@ -55,6 +67,31 @@ pub(crate) fn gguf_quant_gemm(
     }
     let m: usize = xs.shape()[..xs.shape().len() - 1].iter().product();
     let k = in_dim;
+    // **smem 复用臂**(W-2b;prefill 的算术杠杆):权重窗解量化进 smem **每窗一次**,
+    // 激活直吃 f16(不再 q8_1),寄存器 4×4 分块点积 —— 少一发核且更准。
+    //
+    // 三条适用门(缺一即回退,不静默):
+    // 1. `k % SMEM_KC == 0`(窗 = 整个超块;尾块处理留到需要时再加);
+    // 2. 激活 = **F16**(本臂不做 bf16 臂;bf16 档回退 vec_dot 复用臂);
+    // 3. **无内维列序表**(A2 表是单卡 `ssm_out` 的 tiled 列序;本臂的 x 暂存
+    //    不做置换 ⇒ 有表就回退,别静默算错)。
+    if m >= GGUF_SMEM_MIN_M
+        && k % owl_kernels::family::gguf::SMEM_KC == 0
+        && xs.dtype == Dtype::F16
+        && col_index.is_none()
+        && gguf_smem_arm_enabled()
+    {
+        return TensorOps::call(SemanticKernel::GgufGemmSmem)
+            .arg(&w.decl())
+            .arg(xs)
+            .arg_i32(m as i32)
+            .arg_i32(out_dim as i32)
+            .arg_i32(k as i32)
+            .arg_i32(0)
+            .arg_i32(out_dim as i32)
+            .aux(&[ty.code() as usize, m, out_dim])
+            .with_shape(Dtype::F16, vec![m, out_dim]);
+    }
     if k % 32 != 0 {
         return TensorOps::poisoned(
             Dtype::F16,

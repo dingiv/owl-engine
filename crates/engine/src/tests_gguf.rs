@@ -613,3 +613,52 @@ async fn gpu_gguf_prefill_probe() {
         assert!(tile < mmvq, "chunk={chunk}:复用臂没更快({tile:.3}s vs {mmvq:.3}s)");
     }
 }
+
+/// **4B prefill 单程探针**(性能剖析靶位;nsys/CUPTI 用)。
+///
+/// 只跑**一次**长 prompt 的 prefill(不复用臂 A/B、不换 chunk)—— 给外部
+/// 剖析器一个干净、可重复的负载窗口。跑法:
+///
+/// ```bash
+/// OWL_TEST_DEVICE=41:00.0 OWL_GGUF_TILE=1 \
+/// nsys profile -o /tmp/gguf4b --force-overwrite true \
+///   --trace=cuda,nvtx --stats=true \
+///   cargo test -p owl-engine --lib gpu_gguf_prefill_4b_probe -- --nocapture
+/// ```
+#[cfg(test)]
+#[owl_test(gpu)]
+async fn gpu_gguf_prefill_4b_probe() {
+    if !resource_ok("gguf:4b") {
+        eprintln!("skip: 资源清单缺 \"gguf:4b\"");
+        return;
+    }
+    let path = std::path::PathBuf::from(resource("gguf:4b").expect("列了就有"));
+    let prompt: String = "The quick brown fox jumps over the lazy dog. ".repeat(100);
+    let chunk: usize = std::env::var("OWL_GGUF_CHUNK").ok().and_then(|s| s.parse().ok()).unwrap_or(512);
+    let ord = owl_cuda::test_device_ordinal();
+    let mut cfg = gguf_cfg(ord, 8192, 8192, 1);
+    cfg.prefill_chunk = chunk;
+    let mut engine = Engine::new(cfg).expect("引擎");
+    let loaded = engine.loader().load_gguf(&path).await.expect("装载");
+    let mut running = engine.run(loaded).await.expect("装配");
+    // 预热一次(图捕获/桶装配落在窗外;剖析看的是**第二次**)
+    for i in 0..2 {
+        let (_, tid) = running.submit_session(Some(10 + i), &prompt, 1).expect("submit");
+        let ntok = running.turn_prompt_len(tid).unwrap_or(0);
+        let t0 = std::time::Instant::now();
+        loop {
+            match running.pump().await.expect("pump") {
+                TurnEvent::Token { turn, .. } if turn == tid => break,
+                TurnEvent::Completed { turn, .. } if turn == tid => break,
+                TurnEvent::Failed { turn, err } => panic!("t{turn} 失败: {err}"),
+                _ => {}
+            }
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        eprintln!(
+            "[gguf-4b-prefill] 第 {} 趟 · chunk={chunk} · prompt {ntok} tok · {dt:.3}s ⇒ {:.1} tok/s",
+            i + 1,
+            ntok as f64 / dt.max(1e-9)
+        );
+    }
+}
