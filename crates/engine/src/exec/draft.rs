@@ -195,7 +195,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let face = self.dev.graphs.session.face_mut();
             let refs: Vec<&TensorOps> = roots.iter().collect();
             // 副作用根口径:encode 的末位出参 = 契约 4 占位(核就地写池),没人读 ⇒ 收尾一并归还
-            owl_models::interpreters::eval_ops_side_effect_env(&refs, face, self.dev.env, self.dev.tp.as_ref()).await?;
+            // env = **草稿自己的**(hd/grp 取草稿几何;见 SpecRuntime::draft_env)
+            owl_models::interpreters::eval_ops_side_effect_env(&refs, face, self.dev.spec_rt.draft_env, self.dev.tp.as_ref()).await?;
         }
         // 探针:首回合 memory 落盘(python 重算 fc 对拍;真块 dtoh 合法。
         // taps 由调用方从 concat 父块整块落盘 —— 切片视图 dtoh 整父块契约)
@@ -288,7 +289,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             })
             .collect();
         let mut ctx = ForwardCtx::minimal(8);
-        ctx.env = self.dev.env;
+        // 草稿算子环境:几何 = **草稿自己**(hd=128 / GQA 比),其余随引擎 env
+        ctx.env = self.dev.spec_rt.draft_env;
         // 探针:草稿池 K 前缀行 NaN 检查(定谳 encode vs NC 核;解析 dtype
         // 随草稿池 —— 同日十四后 = BF16)
         if self.probes.dflash_probe {
@@ -426,7 +428,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             None
         };
         let (b, arena) = {
-            let env0 = self.dev.env;
+            let env0 = self.dev.spec_rt.draft_env;
             let tp0 = self.dev.tp.clone();
             // peer 树必须在借 face 之前建(`peer_tree` 要 `&mut p` 读池/模型)
             let peer_t = match self.peer.as_mut() {
@@ -443,7 +445,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     // ★ **双 rank 镜像**(P2.1-c):草稿体里有 RowParallel 的 allreduce
                     // ⇒ 两 rank 必须同跑(否则 AR 失步)。单卡档 = 原路。
                     // 读数只取主 rank(确定性 ⇒ 两 rank 同值);**两半都校验**。
-                    let env1 = p.env;
+                    let env1 = p.spec_rt.draft_env;
                     let tp1 = p.tp.clone();
                     let (f0, f1) = (dev.graphs.session.face_mut(), p.graphs.session.face_mut());
                     let peer_fut = async move {
@@ -481,7 +483,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let refs: Vec<&TensorOps> = roots.iter().collect();
             let outs = {
                 let face = self.dev.graphs.session.face_mut();
-                owl_models::interpreters::eval_ops_multi_env(&refs, face, self.dev.env, self.dev.tp.as_ref()).await?
+                owl_models::interpreters::eval_ops_multi_env(&refs, face, self.dev.spec_rt.draft_env, self.dev.tp.as_ref()).await?
             };
             for (i, pr) in probe_roots.iter().enumerate() {
                 let n: usize = pr.shape().iter().product();
@@ -665,7 +667,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let face = self.dev.graphs.session.face_mut();
             let refs: Vec<&TensorOps> = roots.iter().collect();
             // 副作用根口径:encode 的末位出参 = 契约 4 占位(核就地写池),没人读 ⇒ 收尾一并归还
-            owl_models::interpreters::eval_ops_side_effect_env(&refs, face, self.dev.env, self.dev.tp.as_ref()).await?;
+            owl_models::interpreters::eval_ops_side_effect_env(&refs, face, self.dev.spec_rt.draft_env, self.dev.tp.as_ref()).await?;
         }
         if probe {
             let (k0, _) = &leaves[0];
@@ -1033,7 +1035,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let (b, arena) = owl_models::interpreters::eval_ops_scoped_env(
             drafts.step(),
             face,
-            self.dev.env,
+            self.dev.spec_rt.draft_env,
             self.dev.tp.as_ref(),
         )
         .await?;
@@ -1228,7 +1230,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             let face = self.graphs.session.face_mut();
             let refs: Vec<&TensorOps> = roots.iter().collect();
             // 副作用根口径(同 encode 主路:末位出参是契约 4 占位,没人读)
-            owl_models::interpreters::eval_ops_side_effect_env(&refs, face, self.env, self.tp.as_ref()).await?;
+            owl_models::interpreters::eval_ops_side_effect_env(&refs, face, self.spec_rt.draft_env, self.tp.as_ref()).await?;
         }
         // 探针:首回合 memory 落盘(python 重算 fc 对拍;真块 dtoh 合法。
         // taps 由调用方从 concat 父块整块落盘 —— 切片视图 dtoh 整父块契约)

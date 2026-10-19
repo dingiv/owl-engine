@@ -48,8 +48,12 @@ impl KernelSpec for NcAttnBf16V2 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
         // 草稿池(bfloat16;classic 布局 —— 布局声明在 PoolAccess)
+        // head_dim:草稿族定形 128(z-lab/syvai 同族)。**2026-10-19 收窄**:
+        // 原声明 `[128, 256]` 把"主模型几何被拿来解析草稿"这种错配放行了
+        // (hd=256 是目标模型的数,草稿永远不是)⇒ 静默错几何;现在错配在
+        // boot 期就响亮拒(草稿自己的 env 见 SpecRuntime::draft_env)。
         kv_dtype: Some(Dtype::BF16),
-        head_dim: &[128, 256],
+        head_dim: &[128],
         page: &[16, 32, 64, 128],
         grp: None,
         tile: None,

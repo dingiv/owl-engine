@@ -61,7 +61,17 @@ pub(crate) struct SpecRuntime {
     /// **草稿池几何**(层数, hkv, hd;**分片后**;P2.1-b)—— 池分配/预算的单源。
     /// `None` = 非 DFlash2 档(池不分配)
     pub draft_geom: Option<(usize, usize, usize)>,
-    /// 草稿**权重/激活/池**的 dtype(检查点事实:量化族 = BF16;未量化族 = F16)
+    /// **草稿算子环境**(2026-10-19):池面之外的另一半几何事实 ——
+    /// `head_dim`/`grp` 取**草稿自己的**(DFlash2 = 128 / hq÷hkv),其余字段
+    /// (硬件档/池量化/分派旋钮)与引擎 env 同源。
+    ///
+    /// **为什么单列**:草稿与主模型共用同一个 face ⇒ `face.op_env()` 只有
+    /// 目标几何(hd=256);草稿的 `attn.naive_nc`(hd=**128**)若按目标几何解析,
+    /// F16 变体在几何门响亮拒,BF16 变体的 ShapeFamily 曾过宽 ⇒ **静默按错几何**
+    /// (2026-10-10 悬案的真因)。MTP/无草稿档 = 引擎 env(同一份)。
+    pub draft_env: owl_models::env::EnvProvider,
+    /// 草稿**权重/激活/池**的 dtype(单源 `qwen35::draft_exec_dt` = 恒 BF16;
+    /// F16 路在 propose 残差流上溢出 —— 定谳见该函数注)
     pub draft_dt: owl_models::contract::Dtype,
     /// spec 接受账(M2b 恒等门覆盖断言:三路 m 分布 + 账目闭合)
     pub stats: SpecStats,
@@ -106,6 +116,9 @@ pub(crate) struct SpecBootInput<'a> {
     pub(crate) tp: Option<owl_models::plan::tp::TpPlan>,
     /// **装载旋钮**(`[load]`;与主干 loader 同源 —— 一处配置两处消费)
     pub(crate) load: owl_shared::config::LoadCfg,
+    /// **引擎 env 快照**(已合入目标几何/硬件档;草稿环境以它为基底 ——
+    /// 只覆盖草稿自己的几何,见 [`SpecRuntime::draft_env`])
+    pub(crate) base_env: owl_models::env::EnvProvider,
 }
 
 /// **E5-M2b/C7:spec 模式三态裁决** + 草稿器装载(草稿 embed/lm_head
@@ -186,14 +199,9 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
                     inp.draft_kv_fp8,
                 )?,
             };
-            // 草稿装载 dtype 随**检查点事实**(2026-10-19):量化族 = BF16(sglang 对齐);
-            // 未量化族(z-lab)= **F16** —— 普通 Linear/fc 路只有 F16 算子变体,
-            // 两端(模型 dt / 装载 dtype)必须同一判据,否则 BF16 数据喂 F16 核。
-            draft_dt = if owl_models::formats::qwen35::draft_is_quantized(std::path::Path::new(dir))? {
-                owl_models::contract::Dtype::BF16
-            } else {
-                owl_models::contract::Dtype::F16
-            };
+            // 草稿装载 dtype = **草稿执行 dtype 单源**(恒 BF16;F16 路在
+            // propose 残差流上溢出 —— 定谳见 `qwen35::draft_exec_dt` 注)
+            draft_dt = owl_models::formats::qwen35::draft_exec_dt();
             let opts = draft_load_opts(face, draft_dt, inp.tp, &inp.load);
             let draft_manifest =
                 owl_models::formats::load::load_from_dir(std::path::Path::new(dir), face, &d2, opts).await?;
@@ -229,15 +237,21 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
     // DFlash2 target taps 数(dflash 模式 = 5 层;notaps 退 last_hidden = 0)
     let dflash_tap_count = if mode == SpecMode::DFlash2 && !inp.notaps { 5 } else { 0 };
     // 草稿池几何(**分片后**;P2.1-b):从检查点声明 + 本 rank 计划算(不再用写死的 const)
-    let draft_geom = match (&drafter, inp.dflash2_dir) {
+    let (draft_geom, draft_env) = match (&drafter, inp.dflash2_dir) {
         (Some(Drafter::DFlash2(_)), Some(dir)) => {
             let tp = inp.tp.unwrap_or_else(owl_models::plan::tp::TpPlan::single);
-            Some(owl_models::formats::qwen35::dflash2_draft_geom(
+            let g = owl_models::formats::qwen35::dflash2_draft_geom(
                 std::path::Path::new(dir),
                 tp,
-            )?)
+            )?;
+            // 草稿算子环境 = 引擎 env + **草稿几何**(几何门对账的单一来源;
+            // 主模型路径不消费本字段 ⇒ 逐字节不变)
+            let mut env = inp.base_env;
+            env.kv.head_dim = g.hd;
+            env.kv.grp = g.grp();
+            (Some((g.layers, g.hkv, g.hd)), env)
         }
-        _ => None,
+        _ => (None, inp.base_env),
     };
     Ok(SpecRuntime {
         depth,
@@ -246,6 +260,7 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
         draft_rope,
         dflash_tap_count,
         draft_geom,
+        draft_env,
         draft_dt,
         stats: SpecStats::default(),
         mem_dumped: false,

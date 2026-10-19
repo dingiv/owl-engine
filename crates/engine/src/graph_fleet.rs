@@ -1055,7 +1055,10 @@ impl<D: DeviceClient> GraphFleet<D> {
             return Ok(None);
         };
         let pool = boot.pool;
-        let env = boot.env;
+        // **草稿环境**(非目标环境):草稿的 `attn.naive_nc` 等臂按草稿几何
+        // (hd=128 / GQA 比)解析 —— 捕获期就固化在算子拾取里;用目标 env
+        // (hd=256)会几何门拒(F16 路)或静默错几何(BF16 旧变体门过宽)。
+        let env = boot.spec.draft_env;
         let tp = boot.tp.clone();
         let knobs = boot.knobs;
         let tap_blks: Vec<Bytes> = (0..5)
@@ -1165,7 +1168,9 @@ impl<D: DeviceClient> GraphFleet<D> {
                         block_tables: bt.clone(),
                     })
                     .collect();
-                let ctx = ForwardCtx::minimal(8);
+                let mut ctx = ForwardCtx::minimal(8);
+                // 草稿 ctx 的环境与图环境同源(层侧读 ctx.env 时零分歧)
+                ctx.env = env;
                 let mem = d2g.project_memory(&taps, &ctx);
                 let enc_roots = d2g.encode_kv(&mem, &enc_pos, &enc_kvs, &rp_df, &ctx);
                 for (i, r) in enc_roots.iter().enumerate() {

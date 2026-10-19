@@ -269,32 +269,71 @@ pub fn shard_draft_spec(
     Ok(out)
 }
 
-/// **草稿池几何**(P2.1-b;分片后)—— `(层数, hkv, hd)`。
+/// **草稿几何事实**(P2.1-b;分片后)—— 池分配与**草稿算子环境**的同一单源。
 ///
 /// 为什么单列:草稿池此前用 `state.rs` 的 `const DRAFT_POOL{hkv: 8}` **写死**,
 /// 双 rank 下草稿的 KV 头是**分片后**的(4)⇒ 池会多算一倍且与注意力几何不符。
-/// 本函数把"几何事实"从**检查点声明 + 本 rank 计划**算出来(单源)。
+///
+/// 2026-10-19 扩为结构体:除池要的 `(layers, hkv, hd)` 外,草稿的**算子几何门**
+/// 还要 GQA 分组比 `hq/hkv`(`driver::resolve` 的 `ShapeQuery.grp`)。池与算子
+/// 环境共用本结构 ⇒ 不会再出现"池按草稿、算子按目标"的双规范(10-10 悬案根因)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DraftGeom {
+    /// 草稿层数
+    pub layers: usize,
+    /// 本 rank 的 query 头数(分片后)
+    pub hq: usize,
+    /// 本 rank 的 kv 头数(分片后)
+    pub hkv: usize,
+    /// 注意力头维(草稿 = 128;与池几何同一事实)
+    pub hd: usize,
+}
+
+impl DraftGeom {
+    /// GQA 分组比 hq/hkv(0 = 不可用 —— 与 `KvEnv.grp` 的"未知"同义)
+    pub fn grp(&self) -> usize {
+        self.hq.checked_div(self.hkv).unwrap_or(0)
+    }
+}
+
+/// **草稿池几何**(P2.1-b;分片后)—— 从检查点声明 + 本 rank 计划求 [`DraftGeom`]。
 pub fn dflash2_draft_geom(
     dir: &Path,
     tp: crate::plan::tp::TpPlan,
-) -> Result<(usize, usize, usize), ModelError> {
+) -> Result<DraftGeom, ModelError> {
     let (spec, _rep) = ModelSpec::from_ckpt(
         dir,
         crate::formats::spec::SpecSource::family(&qwen3_8_27b()),
     )?;
     let spec = shard_draft_spec(spec, tp)?;
-    let (_hq, hkv, hd) = spec.full_heads;
-    Ok((spec.layer_types.len(), hkv, hd))
+    let (hq, hkv, hd) = spec.full_heads;
+    Ok(DraftGeom { layers: spec.layer_types.len(), hq, hkv, hd })
 }
 
 /// 草稿检查点是否**量化族**(单一真源;`dflash2_draft` 与 `load_dflash2_draft` 共用)。
-/// 未量化(BF16 原生,z-lab)= 普通 Linear 路 —— 该路的算子面按 **F16** 选
-/// (F16T/fc + 普通 GEMM 皆 F16 变体);此前两端都硬编 BF16 ⇒ 权重/激活 BF16
-/// 撞 F16 算子(2026-10-19 立案:z-lab 草稿提案全噪声、AL 恒 1.0)。
+/// 影响面**只剩** `plan`(W4A16 / F16 普通路)—— **不再影响 dtype**(见
+/// [`draft_exec_dt`])。
 pub fn draft_is_quantized(dir: &Path) -> Result<bool, ModelError> {
     use crate::formats::kind::CheckpointKind;
     let kind = crate::formats::kind::detect(dir)?.kind;
     Ok(matches!(kind, CheckpointKind::PackQuantized | CheckpointKind::AwqGemm))
+}
+
+/// **草稿执行 dtype 单源**(权重 / 激活 / 草稿池三处同一判据)= **恒 BF16**。
+///
+/// 为什么恒 BF16(2026-10-19 深夜**定谳**;推翻了同日早些时候的"未量化族走 F16"):
+/// - F16 路的**数值域不够**:逐层探针(OWL_DFLASH_PROBE)实测 propose 残差流
+///   `attn_fin` 2.5e4 → 逐层累加到 6.3e4 → 第 3 层起 `INF/NaN`(全 8×5120 行)
+///   ⇒ 草稿提案纯噪声、AL 恒 1.0。这不是算子面问题,F16 就是装不下;
+/// - BF16 指数域同 f32,sglang 参考实现也是 BF16(权重原生 BF16 直载,零舍入)。
+/// - 该路需要的 BF16 算子面**已经齐备**(conv/select/norm_rope/rmsnorm/silu/
+///   fused_add_rmsnorm/naive_attn_nc_v2/reshape_cache/gemm …;缺的就补算子,
+///   **不许再拿数值域换算子面** —— 那条路会静默错到底)。
+///
+/// 同一判据必须贯穿:模型 dt(`DFlash2Draft::from_spec`)、装载 opts、草稿池
+/// 分配与池叶子注解(`spec_runtime::draft_dt` → `PoolPlan::draft_dt`)。
+pub fn draft_exec_dt() -> crate::contract::Dtype {
+    crate::contract::Dtype::BF16
 }
 
 pub fn dflash2_draft(
@@ -316,12 +355,16 @@ pub fn dflash2_draft(
     let kind = crate::formats::kind::detect(dir)?.kind;
     let is_q = matches!(kind, CheckpointKind::PackQuantized | CheckpointKind::AwqGemm);
     if !is_q {
-        // ⚠️ BF16 原生家族(z-lab)分支警示(2026-10-10 立案):本分支草稿
-        // 在 27B+draft 服务形态实测全拒(AL=1.000 恒 m0,三域/双 dtype 主池
-        // 同象)→ spec 退化为裸 decode−税(数学域 36 vs W4A16 家族 157 t/s)。
-        // 生产一律用 W4A16(syvai);本分支死活另案(golden 参考/对照臂用途)。
+        // 未量化原生家族(z-lab,81 键)分支(**2026-10-10 悬案已结**):
+        // 旧的“实测全拒 AL=1.0”不是精度/家族问题,而是三个缺陷叠加——
+        // ① 草稿算子按**目标几何**解析(hd=256 vs 草稿 128);
+        // ② `load_transposed` 对非 F16 走 F32 分支 ⇒ fc 块 **F32 字节冒充**
+        //    声明 dtype(memory 与参考实现 cos ≈ 0);
+        // ③ 中途尝试的 F16 执行域在 propose 残差流上溢出(INF/NaN)。
+        // 修后实测 AL = 3.10 / 4.96(同机 W4A16 syvai = 2.86 / 5.42)——
+        // **精度不抬 AL**(4-bit 草稿不是瓶颈)。
         eprintln!(
-            "[boot] ⚠️ DFlash2 草稿 = BF16 原生家族:实测草稿全拒(AL=1.0),\n         生产请用 W4A16 家族(syvai/...-DFlash2-W4A16);分支死活另案"
+            "[boot] DFlash2 草稿 = 未量化原生家族(BF16 直载;AL 实测 3.10/4.96,\n         与 W4A16 家族同量级 —— 生产仍推荐 W4A16 省显存)"
         );
         eprintln!("[boot] dflash draft-pool kv_fp8 = {kv_fp8}");
     }
@@ -330,9 +373,8 @@ pub fn dflash2_draft(
     } else {
         crate::module::QuantPlan::F16
     };
-    // dt:量化族 = BF16(sglang 对齐;marlin 有 bf16 激活变体);
-    //     未量化族 = **F16**(普通 Linear/fc 只有 F16 变体 —— 见 `draft_is_quantized` 注)
-    let dt = if is_q { crate::contract::Dtype::BF16 } else { crate::contract::Dtype::F16 };
+    // dt = 草稿执行 dtype 单源(恒 BF16 —— 理由见 `draft_exec_dt`)
+    let dt = draft_exec_dt();
     Ok(crate::layers::dflash2::DFlash2Draft::from_spec(
         &spec,
         plan,
@@ -367,7 +409,7 @@ pub fn dflash2_draft_sharded(
     Ok(crate::layers::dflash2::DFlash2Draft::from_spec(
         &spec,
         plan,
-        crate::contract::Dtype::BF16,
+        draft_exec_dt(),
         kv_fp8,
     ))
 }
@@ -502,8 +544,8 @@ mod tests {
     ) -> Result<(crate::layers::dflash2::DFlash2Draft, crate::module::LoadManifest), ModelError> {
         let draft = dflash2_draft(dir, kv_fp8)?;
         let opts = LoadOpts {
-            // 未量化草稿 = F16(与 `dflash2_draft` 的 dt 同一判据,见 `draft_is_quantized`)
-            dtype: if draft_is_quantized(dir)? { Dtype::BF16 } else { Dtype::F16 },
+            // 与 `dflash2_draft` 的 dt 同一判据(草稿执行 dtype 单源)
+            dtype: draft_exec_dt(),
             shard: 1,
             slice_id: 0,
             device_repack: Some(

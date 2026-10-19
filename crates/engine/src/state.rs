@@ -166,7 +166,8 @@ pub(crate) struct PoolPlan {    /// 单会话容量(= max_seq_tokens)
     /// **草稿池几何**(层数, hkv, hd;**分片后**;P2.1-b)。`None` = 非 DFlash2 档
     /// ⇒ 池不分配;`Some` ⇒ 用它替掉写死的 `DRAFT_POOL`(双 rank 下 hkv 减半)
     pub draft_geom: Option<(usize, usize, usize)>,
-    /// 草稿 dtype(与 `spec_runtime::draft_dt` 同源:量化族 BF16 / 未量化族 F16)
+    /// 草稿 dtype(与 `spec_runtime::draft_dt` 同源:恒 BF16 —— 单源
+    /// `qwen35::draft_exec_dt`)
     pub draft_dt: Dtype,
     /// 投机形态(快照/MTP 链/草稿池三件的唯一事实来源)
     pub spec_mode: crate::spec_runtime::SpecMode,

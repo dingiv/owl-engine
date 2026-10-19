@@ -672,8 +672,8 @@ pub struct DFlash2Draft {
     /// B6 偷显存:草稿池 e4m3(encode 写/NC 读走 fp8kv;默认 false)
     #[allow(dead_code)]
     pub(crate) kv_fp8: bool,
-    /// 草稿激活 dtype(F16 存量测试面 / BF16 生产,sglang 对齐 ——
-    /// 真实权重激活超 f16 范围,E5-DF3 同日十四定谳)
+    /// 草稿激活 dtype(**恒 BF16** —— 单源 `qwen35::draft_exec_dt`;F16 仅存量
+    /// 测试面:propose 残差流实测到 6.3e4 → INF/NaN,装不下)
     dt: Dtype,
 }
 
@@ -837,11 +837,10 @@ impl DFlash2Draft {
             // 47456+16168+… → INF → NaN 塌缩(golden 测试 taps ~0.7 从不触发,
             // 故单测全绿引擎崩)。rms 对行尺度不变 → fc 前预乘 2⁻⁸(f16 纯指
             // 数移位,零舍入损失),norm 后语义严格等价。sglang bf16 无此问题。
-            // ⚠️ **未量化草稿 = F16 普通路**(2026-10-19):该路的算子面只有 F16 变体
-            // (`cublas_gemm_f16` / `owl_mul_f16` …),而 taps 来自目标模型 = **BF16**
-            // ⇒ 必须在此**先铸 F16**,否则 BF16 数据喂进 F16 核(装配门会响亮拒:
-            // `cublas_gemm_f16: b 期望 F16(声明) 实得 BF16`;门关时则静默出错值 ——
-            // 这正是 z-lab BF16 草稿"AL 恒 1.0"的真因:**不是装载错,是算子面覆盖缺口**)。
+            // ⚠️ F16 分支 = **存量测试面 / 历史路径**,不是未量化草稿的生产路
+            // (2026-10-19 定谳:未量化草稿也走 BF16 —— 见 `qwen35::draft_exec_dt`;
+            // F16 在 propose 残差流上溢出到 INF/NaN)。此处仍保留 2⁻⁸ 预缩放 +
+            // taps 铸 F16,仅供 tiny/golden 测试与小几何用。
             let taps: Vec<TensorOps> = if self.dt == Dtype::F16 && taps[0].dtype != Dtype::F16 {
                 taps.iter()
                     .map(|tp| {
