@@ -584,7 +584,6 @@ async fn pool_reuses_released_temp_blocks() {
 /// 直接上抛)。已确认:①释放确实入池(`pool_counters().1 == 1`)②请求尺寸不同(64B vs 池内 32B)
 /// ③桩只注入一次错误。待查 = `drain_pool_to_driver` 里 `dyn AllocLedger::pool_drain`
 /// 的动态派发是否走到了桩实现(与"同名解析"同族嫌疑);收口后去掉 `#[ignore]`。
-#[ignore = "N6-step1 未收口:排空路径未触发,见测试内 FIXME"]
 #[tokio::test]
 async fn pool_drain_heals_pool_exhausted_alloc() {
     let (cell, rec) = cell();

@@ -1017,7 +1017,19 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
                 self.inner.memset_zero(&b, elems * dtype.size_bytes()).await?;
                 return Ok(b);
             }
-            let b = self.inner.alloc(dtype, elems, name).await?;
+            let b = match self.inner.alloc(dtype, elems, name).await {
+                Ok(b) => b,
+                Err(e) if matches!(e, ModelError::PoolExhausted { .. }) => {
+                    let n = self.drain_pool_to_driver().await;
+                    if n > 0 {
+                        eprintln!("[device-handle] 分配遇 PoolExhausted ⇒ 排空复用池 {n} 块后重试");
+                        self.inner.alloc(dtype, elems, name).await?
+                    } else {
+                        return Err(e);
+                    }
+                }
+                Err(e) => return Err(e),
+            };
             let mut ev = Vec::new();
             // 上下文读**先落变量**:实参里的 `self.ctx()` 临时 guard 会活到语句末,
             // 而 `note_birth` 内部还要再锁同一把 —— std Mutex 不可重入 ⇒ 自锁死。
@@ -1042,7 +1054,20 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
                 self.note_pool_hit();
                 return Ok(Bytes::new(id, elems, dtype, 0));
             }
-            let b = self.inner.alloc_uninit(dtype, elems, name).await?;
+            let b = match self.inner.alloc_uninit(dtype, elems, name).await {
+                Ok(b) => b,
+                // **N6 压力自愈**:硬预算/池耗尽 ⇒ 先把复用池还给驱动,再试一次
+                Err(e) if matches!(e, ModelError::PoolExhausted { .. }) => {
+                    let n = self.drain_pool_to_driver().await;
+                    if n > 0 {
+                        eprintln!("[device-handle] 分配遇 PoolExhausted ⇒ 排空复用池 {n} 块后重试");
+                        self.inner.alloc_uninit(dtype, elems, name).await?
+                    } else {
+                        return Err(e);
+                    }
+                }
+                Err(e) => return Err(e),
+            };
             let mut ev = Vec::new();
             // 上下文读**先落变量**:实参里的 `self.ctx()` 临时 guard 会活到语句末,
             // 而 `note_birth` 内部还要再锁同一把 —— std Mutex 不可重入 ⇒ 自锁死。

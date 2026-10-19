@@ -664,10 +664,14 @@ device_ledger 2(断言"turn 后池非空 + hits+misses>0")· 真机三轮同上�
   (唯一同时握有"池"与"驱动口"的一层:决策 = store,执行 = 本层;释放失败**回池不销账**);
 - `alloc_uninit` 遇 `ModelError::PoolExhausted { .. }` ⇒ 排空 + 重试一次;仍失败才上抛。
 
-**门状态(诚实标注)**:`store 88 · iface 11 · cpu 17(+1 ignored)· engine 54` 全绿;
-新门 `pool_drain_heals_pool_exhausted_alloc` **`#[ignore]` + FIXME** —— 实测"排空未发生"
-(首次错误直接上抛)。已确认:释放确实入池、请求尺寸不同(64B vs 池内 32B)、桩只注入一次错误;
-待查 = `drain_pool_to_driver` 里 `dyn AllocLedger::pool_drain` 的动态派发(与"同名解析"同族嫌疑)。
+**门状态(已收口)**:`store 88 · iface 11 · cpu 18 · engine 54 · workspace check` 全绿;
+`pool_drain_heals_pool_exhausted_alloc` **转正**(去掉 `#[ignore]`)。实测输出:
+`[device-handle] 分配遇 PoolExhausted ⇒ 排空复用池 1 块后重试`。
+
+**根因(第二次"静默失败"教训,值得单列)**:"排空未发生"的真因**不是**动态派发 ——
+是上一轮打补丁时**重试代码根本没插进文件**(脚本用 `str.replace` 但没断言匹配,
+空替换静默通过)。⇒ **改代码的脚本必须对每处替换断言 `count == 1`**(本仓已多次踩:
+文档措辞漂移、同名方法解析、现在是"改了个寂寞")。这条纪律建议进 `AGENTS.md` 的工程动作清单。
 
 **下一步(N6 正刀)**:验通该门后接 `plan(Pressure)` 次序 ——
 ① H5 整链下沉(内容不丢)→ ② 池排空(本刀)→ ③ 弹性面驱逐(按叶)→ ④ **降级**
