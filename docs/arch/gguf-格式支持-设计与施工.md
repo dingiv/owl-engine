@@ -1398,3 +1398,55 @@ chunk 的收益与桶无关,它来自"每 chunk 解一遍 17.7 GB 权重"被摊�
 3. **开桶的真正理由不是吞吐**(release 口径下 eager 的 host 开销已经很小,
    `std 1024 点` 1016 ms 墙钟 vs 内核总时长同量级),而是**形态纪律**
    (每 chunk 一条 launch、host 抖动与 P50 稳定、以及 prefill/decode 同图族)。
+
+## 二十一、对手实测:llama.cpp 的 nsys 算子分布(2026-10-19)
+
+**方法**:`packages/llama.cpp/build-master2/bin/llama-server`(与本仓对照同一二进制/同一
+GGUF/同一张 3090 Ti 41:00.0)挂 `nsys profile --trace=cuda`;发 3 个 ≈833-token 与
+1 个 3216-token 的纯 prefill 请求(`max_tokens=1`),**按 GPU busy 切窗**;再把
+"prefill 段"与"decode 步"分开(decode = 第一发 `mul_mat_vec_q` 起)。
+
+### 21.1 分布(seg3 = 833 token 的纯 prefill:551.9 ms ⇒ **1510 t/s**)
+
+| 类 | 时间 | 占比 | 次数 | 备注 |
+|---|---:|---:|---:|---|
+| 权重 matmul `mul_mat_q<Q4_K,128>` | 279.7 ms | 50.7% | 192 | = 64 层 × 3 个 ffn |
+| 同上 `Q8_0` | 103.1 | 18.7% | 192 | 48 GDN×3 + 16 attn×3 |
+| 同上 `Q6_K` | 9.7 | 1.8% | 16 | attn_output(头只在 decode 算) |
+| **GDN `gated_delta_net_cuda<128>`** | **78.5** | **14.2%** | 48 | 1.64 ms/层 |
+| silu/gate `unary_gated_op` | 14.7 | 2.7% | 112 | |
+| **激活量化 `quantize_mmq_q8_1`** | **16.0** | **2.9%** | 496 | layout D4 + DS4 两档 |
+| add(残差)/norm/concat | 7.1+12+5.9 | 4.7% | | |
+| **attention `flash_attn_ext_f16<256,256,8,8>`** | **5.2** | **0.9%** | 16 | **324 µs/层** |
+
+**⇒ 权重 matmul 合计 392.5 ms / 833 token = 40.5 TFLOP ⇒ 103 TFLOPS 等效**
+(int8 MMA:GA102 int8 峰值 160 TOPS 密 ⇒ 本副本跑到 32%)。
+
+decode 步(1 token)对照:**28.9 ms**(MMVQ 22.3 + 量化 0.83 + …)⇒ ≈34.6 t/s。
+
+### 21.2 与 owl 的逐类对账(折算到 1001 token,ms)
+
+| 类 | llama.cpp(×1001/833) | owl(实测) | 差 |
+|---|---:|---:|---:|
+| 权重 matmul | **472**(int8 MMA,103 TFLOPS) | **730**(cuBLAS f16×f32,66 TFLOPS) | **−258** |
+| 激活量化 / 权重解量化 | **19**(q8_1_mmq) | **88**(dequant→f16) | **−69** |
+| attention | **6**(324 µs/层) | **148**(4.6 ms/层,2.7 TFLOPS) | **−142** |
+| GDN | **94**(1.64 ms/层 ×48) | **133**(2.77 ms/层 ×48) | **−39** |
+| norm/silu/残差/concat | 72 | ~40 | **+32** |
+| **合计** | **663** | **1016** | **−353** |
+
+### 21.3 结论(改写了 §20.6 的优先级)
+
+1. **int8-MMA MMQ 值 1.5× matmul**(103 vs 66 TFLOPS),不是"2× 峰值";
+   连带的激活量化他们也要付(2.9%,496 发)⇒ 我们"省一发量化"的优势很小,
+   但**我们的 dequant 88 ms 是他们的 3 倍**(他们零权重搬运)。
+   ⇒ 移植收益 ≈ 258 + 69 = **327 ms / 32%**。
+2. **attention 是第二大窟窿:我们慢 10×**(324 µs vs 4.6 ms/层)⇒ 142 ms / 14%。
+   他们的 flash_attn 跑到 26 TFLOPS;我们 2.7 TFLOPS。
+3. GDN 差 1.4×(39 ms),decode 已对齐(我们 36.6 vs 他们 34.6 t/s)。
+4. **他们全程 eager**(整条 trace `cudaGraphLaunch = 0`,23 913 发 kernel)⇒
+   "开桶"不是追平对手的关键,**kernel 质量才是**;同时说明我们的 eager 不是劣势。
+5. 口径提醒:std 口径差 1.31×(1265 vs 964@chunk1024)/**纯 GPU 口径差 1.51×**
+   (1510 vs ≈1000)—— std 里两侧的 HTTP/首 token 开销不同,别混用。
+
+原始件:`/tmp/llama_w2e.nsys-rep`(+ `.sqlite`;本表由 sqlite 逐核聚合复算)。
