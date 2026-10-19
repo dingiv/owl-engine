@@ -14,7 +14,7 @@
 #   tools/tp-ab-std.sh tp2 --extra --ignore-eos   # `--extra` 之后原样转给 cli
 #
 # 口径纪律(**改任一条都会让两臂不可比**):
-#   · 档位几何/白名单在 flavor(`assets/flavors/tp27b.toml` vs `awq27b.toml`);
+#   · 档位几何/白名单在 flavor(`flavors/tp27b.toml` vs `awq27b.toml`);
 #     运行档 `testdata/args/bench-27b-tp{1,2}.toml` 只管模型路径与卡位;
 #   · **TP1 与 TP2 必须逐项同参** —— 唯一允许的差别 = rank 数(单卡 vs 双卡);
 #   · `--ignore-eos` = greedy 档跑满 256 tok(否则 OOD 词池下提前停 ⇒ decode 成伪影);
@@ -25,6 +25,19 @@
 #    3090 Ti 对 = 0/1。**起服前先确认目标卡空闲**
 #    (`nvidia-smi --query-compute-apps=pid,process_name,gpu_uuid --format=csv`)——
 #    本机常有别的 agent 会话在 0/1 或 2/3 上跑 e2e(实测过一次,让基准读数失真)。
+#
+# 🔴 **端口纪律(2026-10-19 现场立案)**:本机可能同时有**多个 agent 会话**在别的
+#    worktree(`packages/owl-worktrees/*`)里跑 owl server,而大家默认都绑 **8137**。
+#    两边脚本若都“按端口收旧实例”,就会**互相击杀**(症状:客户端 `ConnectError:
+#    All connection attempts failed` + **服务端日志无任何错** + 进程已消失 ⇒ 看上去
+#    像“引擎静默崩”,实为被别的会话清掉。当天两次 A/B 就这样废了)。
+#    ⇒ 规矩两条:
+#      ① 端口占用时**只收自己 worktree 的实例**,别人的 ⇒ **响亮拒**(不禁自)
+#         —— 见下面 preflight;
+#      ② 与别的会话并行跑时用**专属端口**,且**运行档里必须声明同一个 `bind`**
+#         (server 的 bind 来自配置文件,不是 `$PORT`:flavor 里是 8137 ⇒ 要用
+#          `PORT=8141` + 一份把 `[runtime] bind` 改成 8141 的运行档):
+#            PORT=8141 TP1_CFG=/tmp/xxx/tp1-8141.toml TP2_CFG=… tools/tp-ab-std.sh ab
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -59,9 +72,24 @@ run_arm() {
   local tag="$1" flavor="$2" cfg="$3"
   local log="$OUT_DIR/$tag.log" csv="$OUT_DIR/$tag-std.csv" json="$OUT_DIR/$tag-std.json"
   : > "$log"
-  # 军规:按监听 PID 收旧实例,不用 `pkill -f`(模式会匹配自身命令行而自杀)
-  for p in $(ss -ltnp 2>/dev/null | awk -v pat="127.0.0.1:$PORT" '$0 ~ pat {print $NF}' \
-             | grep -o 'pid=[0-9]*' | cut -d= -f2); do kill "$p" 2>/dev/null || true; done
+  # 军规:按监听 PID 收旧实例,不用 `pkill -f`(模式会匹配自身命令行而自杀);
+  # 且**只收自己 worktree 的**:别的会话的实例 ⇒ 响亮拒(不互相击杀,见文件头端口纪律)
+  # 匹配**任意地址**上的该端口(0.0.0.0/[::]/127.0.0.1)—— 原实现只匹配
+  # `127.0.0.1:$PORT`,别的会话绑 `0.0.0.0` 时漏检 ⇒ 装载完才在 bind 处 panic
+  # (2026-10-19 现场:白装一次 27B)。`([^0-9]|$)` 防 `8137` 误配 `81370`。
+  for p in $(ss -ltnp 2>/dev/null | grep -E ":$PORT([^0-9]|$)" | grep -o 'pid=[0-9]*' | cut -d= -f2); do
+    cmd=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null || true)
+    # 归属判定:cmdline 含 ROOT **或 cwd == ROOT**(2026-10-19 现场:自己起的实例
+    # 用 `./target/release/server` 相对路径 ⇒ cmdline 里没有 ROOT 字样 ⇒ 原判据
+    # 把自家实例误判成"别的会话"而拒跑。cwd 判定补上这条缝)
+    pcwd=$(readlink "/proc/$p/cwd" 2>/dev/null || true)
+    case "$cmd$pcwd" in
+      *"$ROOT"*) echo "[$tag] 收旧实例 pid=$p(本 worktree)"; kill "$p" 2>/dev/null || true ;;
+      *) echo "[$tag] ❌ 端口 $PORT 被**别的会话**占用:pid=$p ⇒ $cmd";
+         echo "[$tag]    规矩:换 PORT(并在运行档里声明同一 bind),或先等它跑完 —— 本脚本不代为清理"
+         return 3 ;;
+    esac
+  done
   sleep 3
   setsid nohup ./target/release/server --flavor "$flavor" "$cfg" --log-level warn \
     >> "$log" 2>&1 < /dev/null &
