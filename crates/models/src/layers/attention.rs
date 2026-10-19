@@ -1689,7 +1689,7 @@ mod f16_tests {
         let attn = Attention::new(hq, hkv, hd, hidden, 1e-6, QuantPlan::F16);
 
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false };
         crate::interpreters::eval_load(&attn, &mut gpu, &src, &lctx)
             .await
             .expect("attention f16 装载");
@@ -1893,7 +1893,7 @@ mod f16_tests {
         let attn = Attention::new(hq, hkv, hd, hidden, eps, QuantPlan::F16);
 
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false };
         crate::interpreters::eval_load(&attn, &mut gpu, &src, &lctx)
             .await
             .expect("attention f16 装载");
@@ -2113,7 +2113,7 @@ mod f16_tests {
         let attn = Attention::new(hq, hkv, hd, hidden, 1e-6, QuantPlan::F16);
 
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false };
         crate::interpreters::eval_load(&attn, &mut gpu, &src, &lctx)
             .await
             .expect("attention f16 装载");
@@ -2211,7 +2211,7 @@ mod f16_tests {
         let attn = Attention::new(hq, hkv, hd, hidden, 1e-6, QuantPlan::F16);
 
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F32, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F32, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false };
         crate::interpreters::eval_load(&attn, &mut gpu, &src, &lctx)
             .await
             .expect("attention f32 装载");
@@ -2343,6 +2343,8 @@ mod owl_port_tests {
             device_repack: false,
             verify: false,
             debug_tap: false,
+            staging_mb: 128,
+            dump: false,
         };
         // 六槽源(本模块本地化;兄弟模块的同名 helper 私有)
         let src = crate::testkit::Src::from([
@@ -2663,6 +2665,8 @@ mod view_alias_tests {
             device_repack: false,
             verify: false,
             debug_tap: false,
+            staging_mb: 128,
+            dump: false,
         };
         crate::interpreters::eval_load(&attn, &mut gpu, &src, &lctx).await.expect("attn 装载");
         let rp = crate::layers::rope::Rope::new(512, hd, 32, 10_000.0).expect("rope");

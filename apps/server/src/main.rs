@@ -491,9 +491,15 @@ async fn actor_main(
                 let tp = owl_engine::TpEngine::assemble_with(
                     vec![engine, engine1],
                     vec![model0, model1],
-                    owl_engine::TpOpts { push: config.tp_push },
+                    owl_engine::TpOpts { push: config.tp_push, ar_f8: config.tp_ar_f8 },
                 )
                 .await?;
+                if config.tp_ar_f8 {
+                    owl_shared::log_info!(
+                        "boot",
+                        "TP2 **AR fp8 载荷档**已开(runtime.tp_ar_f8):载荷 e4m3(1.031×)"
+                    );
+                }
                 if config.tp_push {
                     owl_shared::log_info!(
                         "boot",

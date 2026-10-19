@@ -65,14 +65,16 @@ impl LoadedModel {
 /// 面向上层的模型加载器(经引擎的 face;spec 声明驱动)
 pub struct ModelLoader<'a, D: DeviceClient> {
     face: &'a mut D,
+    /// **装载旋钮**(`[load]` 段;从配置来 —— 用户裁决 2026-10-19:不读 env)
+    load: owl_shared::config::LoadCfg,
     /// `(slice_id, shard)`;缺省 `(0, 1)` = 单卡全量(S4 ②;见 [`ModelLoader::slice`])
     slice: (usize, usize),
 }
 
 impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
     /// 构造(工厂;face 由 [`Engine::loader`](crate::Engine::loader) 借出)
-    pub(crate) fn new<'a>(face: &'a mut D) -> ModelLoader<'a, D> {
-        ModelLoader { face, slice: (0, 1) }
+    pub(crate) fn new<'a>(face: &'a mut D, load: owl_shared::config::LoadCfg) -> ModelLoader<'a, D> {
+        ModelLoader { face, load, slice: (0, 1) }
     }
 
     /// **切片装载**(S4 ②;确定性分片协议):`(slice_id, shard)` —— 本 rank 只装
@@ -96,7 +98,15 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
     /// 装载选项(带上本 slice 的 (slice_id, shard))
     fn shard_opts(&self, dtype: owl_models::contract::Dtype) -> LoadOpts {
         let (id, n) = self.slice;
-        LoadOpts { shard: n, slice_id: id, ..LoadOpts::plain(dtype) }
+        LoadOpts {
+            shard: n,
+            slice_id: id,
+            verify: self.load.verify,
+            debug_tap: self.load.debug_tap,
+            staging_mb: self.load.staging_mb,
+            dump: self.load.dump,
+            ..LoadOpts::plain(dtype)
+        }
     }
 
     /// rope 表装载 ctx(同 slice 口径;rope 是 Replicate,但保持一致)
@@ -109,6 +119,8 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
             device_repack: false,
             verify: false,
             debug_tap: false,
+            staging_mb: self.load.staging_mb,
+            dump: false,
         }
     }
 
@@ -221,10 +233,18 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         // S4 ②:本 slice 的 (slice_id, shard)
         opts.shard = self.slice.1;
         opts.slice_id = self.slice.0;
-        // 逐键分相账(OWL_LOAD_DEBUG=1;装载测速/瓶颈定位用 —— 与测试路同一开关)
-        opts.debug_tap = owl_shared::env_reader::flag("OWL_LOAD_DEBUG");
-        // 装载后整块回读校验(OWL_LOAD_VERIFY=1;纠错面 —— 装载数据面大改时的硬门)
-        opts.verify = owl_shared::env_reader::flag("OWL_LOAD_VERIFY");
+        // **装载旋钮从配置来**(`[load]` 段;原 OWL_LOAD_DEBUG/OWL_LOAD_VERIFY env
+        // 已退役 —— 用户裁决 2026-10-19:参数入配置文件)
+        opts.debug_tap = self.load.debug_tap;
+        opts.verify = self.load.verify;
+        opts.staging_mb = self.load.staging_mb;
+        opts.dump = self.load.dump;
+        // 设备重排三态(auto = 能力自述裁决;非法值在配置校验处已拒)
+        opts.device_repack = self
+            .load
+            .repack_device()
+            .map_err(|e| ModelError::Msg(e))?
+            .or(opts.device_repack);
         load_from_dir(dir, self.face, &model, opts).await?;
         let model = Arc::new(model);
         let tokenizer = load_tokenizer(tokenizer_dir, &spec.tokenizer)?;

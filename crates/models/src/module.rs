@@ -161,6 +161,10 @@ pub struct TpCtx {
     /// stage 写**对端**槽、reduce 读**本端**槽 ⇒ 跨 PCIe 只剩**写**(posted)。
     /// 要求别名块是 RW 导入的(`TpOpts::push` 会在握手期用 `peer_import_rw`)。
     pub push: bool,
+    /// ★ **fp8 载荷档**(§47 第二步;2026-10-19):`true` ⇒ AR 两条腿的载荷走
+    /// e4m3(1B/元素 + 64 元素/尺度 f16 ⇒ 1.031× 原字节)。两侧必须同档
+    /// (rank 同装配 ⇒ 同值)。缺省 false ⇒ 与历史逐字一致。
+    pub ar_f8: bool,
 }
 
 impl TpCtx {
@@ -1214,6 +1218,11 @@ pub struct LoaderCtx {
     pub verify: bool,
     /// 装载观测 tap(stderr 逐键打印;原 OWL_LOAD_DEBUG env 直读)
     pub debug_tap: bool,
+    /// **装载暂存槽上限 MiB**(原 `OWL_LOAD_STAGING_MB`;从配置来 —— 用户裁决 2026-10-19)
+    pub staging_mb: usize,
+    /// 逐键字节 dump(原 `OWL_LOAD_DUMP`;诊断面)
+    pub dump: bool,
+
 }
 
 /// repack 路径(装载域**唯一收口**;2026-10-01 用户裁决:默认 GPU 优先,
@@ -1255,7 +1264,7 @@ impl RepackPath {
 
 impl Default for LoaderCtx {
     fn default() -> Self {
-        Self { dtype: Dtype::F32, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false }
+        Self { dtype: Dtype::F32, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false }
     }
 }
 

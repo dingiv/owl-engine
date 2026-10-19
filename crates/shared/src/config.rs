@@ -222,6 +222,9 @@ pub struct RuntimeCfg {
     /// 副作用:staging 别名改授 `PROT_READWRITE`。
     #[serde(default)]
     pub tp_push: bool,
+    /// **TP 通信数据腿:fp8 载荷**(runtime.tp_ar_f8;§47 第二步 2026-10-19)
+    /// ⇒ 交 `TpOpts.ar_f8`。**两侧同装配 ⇒ 同档**(不同档 = 收端按错 dtype 解读)。
+    pub tp_ar_f8: bool,
     /// **自动选卡的空闲占比阈值**(0..1;默认 0.9):候选卡的 `memory.free/total` 低于它
     /// ⇒ auto-pick 跳过(避让非 owl 进程/未持锁实例);显式 spec 命中且全被跳 ⇒ 响亮拒启。
     pub gpu_min_free_ratio: f64,
@@ -487,6 +490,11 @@ pub struct SpecCfg {
     pub notaps: bool,
     /// TAPDECL 二分臂(声明期 tapped 不挂输出槽)
     pub tapdecl: bool,
+    /// **TP 档放行投机解码**(P2.1-c;缺省 false = 响亮拒)。
+    /// 打开 = "草稿族双 rank 化"这条路的显式闸门:草稿 spec/权重按本 rank 计划
+    /// 分片、草稿池几何按分片 hkv、草稿 AR 与主干共用同一条 AR 序列。
+    /// **配置显式声明**(不读 env)—— 分相纪律:未验完的档不许静默放行。
+    pub tp_draft: bool,
     /// **m=0 连击阈值**(达此连击 → 降级裸 decode;0 = 禁用降级)
     pub degrade_after: usize,
     /// **降级后的首次探测窗口(tokens)** —— 探测 = 跑一个投机轮试水,命中(m≥1)即恢复 spec。
@@ -512,11 +520,39 @@ pub struct SamplingCfg {    pub mode: SamplerMode,
 }
 
 /// 装载域(校验/观测)
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LoadCfg {
     pub verify: bool,
     pub debug_tap: bool,
+    /// **暂存槽上限 MiB**(原 `OWL_LOAD_STAGING_MB`;缺省 128)。
+    /// 单键超过它就按段流式装载(`0` = 不设上限)。**从配置来,不读 env**(用户裁决 2026-10-19)。
+    pub staging_mb: usize,
+    /// **设备重排裁决**:"auto"(缺省;能力自述 `RepackPath::resolve`)/ "device" / "cpu"。
+    /// 装载旋钮入配置面(此前只有隐式裁决,无显式入口)。
+    pub repack: String,
+    /// 逐键字节 dump(原 `OWL_LOAD_DUMP`;诊断面)
+    pub dump: bool,
+}
+
+impl LoadCfg {
+    /// `repack` 三态解析(非法值**响亮拒**;缺省 auto)
+    pub fn repack_device(&self) -> Result<Option<bool>, String> {
+        match self.repack.as_str() {
+            "auto" | "" => Ok(None),
+            "device" => Ok(Some(true)),
+            "cpu" => Ok(Some(false)),
+            other => Err(format!(
+                "[load] repack = {other:?} 非法(只认 auto|device|cpu)"
+            )),
+        }
+    }
+}
+
+impl Default for LoadCfg {
+    fn default() -> Self {
+        Self { verify: false, debug_tap: false, staging_mb: 128, repack: "auto".into(), dump: false }
+    }
 }
 
 /// 解释器分派面(models EnvProvider 组装源;**正语义** —— true = 开,
@@ -955,6 +991,7 @@ impl Default for RuntimeCfg {
             device_ordinal: None,
             tp_ordinals: None,
             tp_push: false,
+            tp_ar_f8: false,
             gpu_min_free_ratio: 0.9,
             max_seq: 4096,
             prefill_chunk: 512,
@@ -1009,6 +1046,7 @@ impl Default for KvmemCfg {
 impl Default for SpecCfg {
     fn default() -> Self {
         Self {
+            tp_draft: false,
             depth: 0,
             dumb: false,
             draft_kv_fp8: false,

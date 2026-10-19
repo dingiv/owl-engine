@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use crate::contract::{Dtype, ModelError};
 use crate::module::Taken;
 use crate::module::{Layout, LoaderCtx, LoaderOps, WeightSource};
-use crate::plan::rules::{rule_of, want_axis, WantAxis, WeightRule};
+use crate::plan::rules::{rule_of, rule_of_want, want_axis, WantAxis, WeightRule};
 use crate::plan::span::segments_in_key_units;
 use crate::plan::span::{plan_span, SourceSpan};
 use crate::plan::tp::TpPlan;
@@ -122,7 +122,9 @@ pub fn build_shard_pass(
     }
     let plan = TpPlan::new(ctx.slice_id, ctx.shard).map_err(ModelError::Msg)?;
     for w in ops.wants_mut() {
-        let rule = rule_of(&w.key);
+        // **带段长事实**的规则推导(P2.1-a):同名键在「融合/不融合」两个模型里
+        // 语义不同 —— 段长由层声明,缺声明 ⇒ 不按段切(见 `rule_of_want`)
+        let rule = rule_of_want(&w.key, w.segments.as_deref());
         let axis = want_axis(&w.key);
         let shard_segs: &[usize] = w.segments.as_deref().unwrap_or(&[]);
         if rule == WeightRule::Replicate {
@@ -216,11 +218,46 @@ pub fn build_shard_pass(
 pub struct ShardedSource<'a, S: WeightSource + ?Sized> {
     inner: &'a S,
     spans: HashMap<String, SpanEntry>,
+    /// **全键读缓存**(k 切键专治;2026-10-19 定谳):
+    ///
+    /// 病灶现场:草稿分片装载 `layers.0.mlp.down_proj.packed_raw`(UniformRow = k 切)
+    /// 的映射是 **5120 段**(每目标行一段,源步长 2176、段长 1088);逐段调内层源时,
+    /// **每段都重做一次懒物化**(`[w4a16] 物化 … @ 13.5ms`)⇒ 5120 × ~88ms =
+    /// **分钟级**"挂住"假象(实测 300s 只走到 2048/5120 段;不是死锁,是病态慢)。
+    ///
+    /// 治法:**整键读一次**进缓存,再在内存里按映射段拷 —— 内层源只被调一次,
+    /// 与单卡档同价。守卫:超 [`FULL_CACHE_CAP`] 的大键(embed/lm_head 2.5GB 级)
+    /// **不进缓存**(逐段直调:慢但内存不爆;而那类键是**行切**=段数极少,无此病态)。
+    full: std::sync::Mutex<Option<(String, Dtype, Vec<u8>)>>,
 }
+
+/// 全键缓存上限(字节;超出 ⇒ 退回逐段直调)
+const FULL_CACHE_CAP: usize = 256 << 20;
 
 impl<'a, S: WeightSource + ?Sized> ShardedSource<'a, S> {
     pub fn new(inner: &'a S, spans: HashMap<String, SpanEntry>) -> Self {
-        Self { inner, spans }
+        Self { inner, spans, full: std::sync::Mutex::new(None) }
+    }
+
+    /// 取全键字节(缓存未命中则整读一次;`dtype` 变了要重读)
+    fn full_bytes(&self, key: &str, dtype: Dtype, src_elems: usize) -> Taken<()> {
+        let esz = dtype.size_bytes();
+        let mut g = self
+            .full
+            .lock()
+            .map_err(|_| ModelError::Msg("ShardedSource 全键缓存锁中毒".into()))?;
+        let hit = matches!(&*g, Some((k, d, _)) if k == key && *d == dtype);
+        if !hit {
+            let mut buf = vec![0u8; src_elems * esz];
+            let Some(()) = self
+                .inner
+                .convert_chunk_into_bytes(key, 0, src_elems, &mut buf, dtype)?
+            else {
+                return Ok(None);
+            };
+            *g = Some((key.to_string(), dtype, buf));
+        }
+        Ok(Some(()))
     }
 
     /// 目标 `[off, len)` → 源读序列(`None` = 越界/不在表)
@@ -317,17 +354,56 @@ impl<S: WeightSource + ?Sized> WeightSource for ShardedSource<'_, S> {
         let Some(seq) = self.map(key, offset_elems, len) else {
             return Ok(None);
         };
+        // **k 切键专治**(见 `full` 字段注):整键读一次 ⇒ 段数再多也只调内层源一次
+        let ent = &self.spans[key];
+        if ent.src_elems * esz <= FULL_CACHE_CAP {
+            self.full_bytes(key, dtype, ent.src_elems)?;
+            let g = self
+                .full
+                .lock()
+                .map_err(|_| ModelError::Msg("ShardedSource 全键缓存锁中毒".into()))?;
+            let buf = &g.as_ref().expect("刚填过").2;
+            let mut tgt_elem = 0usize;
+            for (src_off, n) in seq {
+                let b0 = tgt_elem * esz;
+                let b1 = b0 + n * esz;
+                let s0 = src_off * esz;
+                let s1 = s0 + n * esz;
+                if b1 > dst.len() || s1 > buf.len() {
+                    return Ok(None);
+                }
+                dst[b0..b1].copy_from_slice(&buf[s0..s1]);
+                tgt_elem += n;
+            }
+            return Ok(Some(()));
+        }
         let mut tgt_elem = 0usize;
-        for (src_off, n) in seq {
+        let n_seg = seq.len();
+        owl_shared::log_debug!(
+            "load-rearrange",
+            "{key}: 映射 off={offset_elems} len={len} ⇒ {n_seg} 段(目标行宽 {} / 源行宽 {})",
+            self.spans[key].tgt_row_width,
+            self.spans[key].src_row_width
+        );
+        for (si, (src_off, n)) in seq.into_iter().enumerate() {
             let b0 = tgt_elem * esz;
             let b1 = b0 + n * esz;
             if b1 > dst.len() {
                 return Ok(None);
             }
+            // 进度账:段数可能上千(k 切键 = 每目标行一段)⇒ 每 512 段打一行,
+            // 用来区分"**慢**"与"**卡**"(判据:同一行是否推进)
+            if si % 512 == 0 {
+                owl_shared::log_debug!(
+                    "load-rearrange",
+                    "{key}: 段 {si}/{n_seg} src_off={src_off} n={n}"
+                );
+            }
             self.inner
                 .convert_chunk_into_bytes(key, src_off, n, &mut dst[b0..b1], dtype)?;
             tgt_elem += n;
         }
+        owl_shared::log_debug!("load-rearrange", "{key}: {n_seg} 段读完");
         Ok(Some(()))
     }
 }

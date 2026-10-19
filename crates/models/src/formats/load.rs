@@ -46,6 +46,10 @@ pub struct LoadOpts {
     pub verify: bool,
     /// 逐键分相探针(stderr)
     pub debug_tap: bool,
+    /// **暂存槽上限 MiB**(原 `OWL_LOAD_STAGING_MB`;缺省 128 = 现行为)
+    pub staging_mb: usize,
+    /// 逐键字节 dump(原 `OWL_LOAD_DUMP`;诊断面)
+    pub dump: bool,
 }
 
 impl LoadOpts {
@@ -60,13 +64,15 @@ impl LoadOpts {
             ),
             verify: false,
             debug_tap: false,
+            staging_mb: 128,
+            dump: false,
         }
     }
 
     /// 非量化/固定档(无设备重排 + 零探针):裸 safetensors f16 直拷、
     /// W4A16-CPU 重排等"不需要能力裁决"的装载点。
     pub fn plain(dtype: crate::contract::Dtype) -> Self {
-        Self { dtype, shard: 1, slice_id: 0, device_repack: Some(false), verify: false, debug_tap: false }
+        Self { dtype, shard: 1, slice_id: 0, device_repack: Some(false), verify: false, debug_tap: false, staging_mb: 128, dump: false }
     }
 
     /// 装载 ctx(旋钮 → LoaderCtx;唯一产地)
@@ -78,6 +84,8 @@ impl LoadOpts {
             device_repack: self.device_repack.unwrap_or(false),
             verify: self.verify,
             debug_tap: self.debug_tap,
+            staging_mb: self.staging_mb,
+            dump: self.dump,
         }
     }
 }
@@ -197,7 +205,7 @@ where
 /// 解释器自己调用层钩子并为它传递 LoaderCtx —— 使用者只给层与源。
 ///
 /// ```rust,ignore
-/// eval_load(&model, face, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false }).await?;
+/// eval_load(&model, face, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false }).await?;
 /// ```
 pub async fn eval_load<M, D, S>(
     layer: &M,
@@ -219,7 +227,7 @@ where
     let sharded = crate::formats::shard::ShardedSource::new(src, spans);
     let tap = if ctx.debug_tap { Some(std::sync::Mutex::new(Box::new(StderrTap) as Box<dyn LoadTap>)) } else { None }; // 观测:ctx.debug_tap 门控,缺省零开销
     let t0 = std::time::Instant::now();
-    let manifest = eval_want(&want, face, &sharded, tap.as_ref(), ctx.verify).await?;
+    let manifest = eval_want(&want, face, &sharded, tap.as_ref(), ctx.verify, ctx.staging_mb).await?;
     // 上载栅栏:全部 DMA 落定后方可进入计算域(upload_pinned 入队即回执,
     // 完成语义由本栅栏一次总代价兜底)
     let t_fence = std::time::Instant::now();
@@ -452,8 +460,9 @@ impl LoadStaging {
     /// 缺省值的理由:128MB 是 CHUNK_BYTES(上传分块口径),槽=块 ⇒ 整键单发
     /// 时不会多切一刀;而绝大多数键(27B AWQ 最大 44.6MB)都在槽内 ⇒ 常规路
     /// 零额外栅栏,只有 embed/lm_head 这类巨键(0.5~2GB)走分段。
-    fn cap_from_env() -> usize {
-        owl_shared::env_reader::parse_or("OWL_LOAD_STAGING_MB", 128usize).max(1) << 20
+    /// 上限字节数(**从配置来**:`[load] staging_mb`;0/1 = 最小 1MB 兜底)
+    fn cap_bytes(mb: usize) -> usize {
+        mb.max(1) << 20
     }
 
     /// 借槽(固定环轮转;首借开环 = 2 块 × 槽规)。
@@ -594,10 +603,11 @@ async fn eval_want<D: DeviceClient, S: WeightSource + ?Sized>(
     src: &S,
     tap: Option<&Mutex<Box<dyn LoadTap>>>,
     verify: bool,
+    staging_mb: usize,
 ) -> Result<LoadManifest, ModelError> {
     // 单路径(2026-10-16 用户裁决:别用并行 DMA;实测并行桶 ≈1.2GB/s 反劣)
     // 暂存区 = 声明驱动(装载前一行账;固定预算,2026-10-16 收尾)
-    let (mut staging, plan) = LoadStaging::plan(want, src, LoadStaging::cap_from_env())?;
+    let (mut staging, plan) = LoadStaging::plan(want, src, LoadStaging::cap_bytes(staging_mb))?;
     LoadStaging::log_plan(&plan);
     eval_want_sequential(want, face, src, tap, verify, &mut staging).await
 }
@@ -1006,6 +1016,7 @@ async fn fill_native_chunks<D: DeviceClient, S: WeightSource + ?Sized>(
         });
         off += len;
     }
+    owl_shared::log_debug!("load-rearrange", "{key}: fill 完成 {} 段", chunks.len());
     Ok(chunks)
 }
 
@@ -1022,8 +1033,18 @@ async fn fill_packed_chunks<D: DeviceClient, S: WeightSource + ?Sized>(
     let chunk_elems = (CHUNK_BYTES / 4).max(1);
     let mut chunks = Vec::new();
     let mut off = 0usize;
+    let n_chunks = raw_elems.div_ceil(chunk_elems);
+    owl_shared::log_debug!(
+        "load-rearrange",
+        "{key}: fill 开始 raw_elems={raw_elems} chunk_elems={chunk_elems} ⇒ {n_chunks} 段"
+    );
     while off < raw_elems {
         let len = chunk_elems.min(raw_elems - off);
+        owl_shared::log_debug!(
+            "load-rearrange",
+            "{key}: 段 {} 借租约前 off={off} len={len}",
+            chunks.len()
+        );
         let mut lease = {
             let _s = probe.span("pinned_alloc");
             // 记名(全量):与另一条 repack 路同律(`pin.<键名>`)
@@ -1031,6 +1052,7 @@ async fn fill_packed_chunks<D: DeviceClient, S: WeightSource + ?Sized>(
                 .await
                 .map_err(|e| ModelError::Msg(format!("Weight '{key}': {e}")))?
         };
+        owl_shared::log_debug!("load-rearrange", "{key}: 段 {} 租约到手", chunks.len());
         {
             let _s = probe.span("convert");
             src.convert_chunk_into_bytes(
@@ -1042,6 +1064,7 @@ async fn fill_packed_chunks<D: DeviceClient, S: WeightSource + ?Sized>(
             )?
             .ok_or_else(|| attribution(src, key, raw_elems))?;
         }
+        owl_shared::log_debug!("load-rearrange", "{key}: 段 {} 取数完成", chunks.len());
         if let Some(ph) = packed_host.as_mut() {
             ph[off * 4..(off + len) * 4].copy_from_slice(&lease.slice_bytes_mut()[..len * 4]);
         }
@@ -1052,6 +1075,7 @@ async fn fill_packed_chunks<D: DeviceClient, S: WeightSource + ?Sized>(
         });
         off += len;
     }
+    owl_shared::log_debug!("load-rearrange", "{key}: fill 完成 {} 段", chunks.len());
     Ok(chunks)
 }
 
@@ -1125,6 +1149,19 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
             aux: &[],
             scalars: &[],
         });
+        // 排障面(加载器与解释器同级;P2.1-a 草稿分片挂住立案):发射前把**几何账**
+        // 打全 —— 键/核名/rows/cols/字数/槽,分片档下第一处不等就在这里现形
+        owl_shared::log_debug!(
+            "load-rearrange",
+            "{}: op={:?} 核={} rows={} cols={} n={} raw_elems={}",
+            w.key,
+            op,
+            pick.name,
+            rows,
+            cols,
+            n,
+            raw_elems
+        );
         let msg = crate::contract::LaunchMsg {
             kernel: crate::contract::KernelSource {
                 name: pick.name.to_string(),
@@ -1482,6 +1519,8 @@ mod generic_entry_tests {
             device_repack: Some(false),
             verify: false,
             debug_tap: false,
+            staging_mb: 128,
+            dump: false,
         };
 
         // 对照臂:同一声明 + 同一源,直接 eval_load(不经起点探测/开箱)
@@ -1623,6 +1662,8 @@ mod generic_entry_tests {
             device_repack: Some(true), // 生产档(设备 marlin 重排)
             verify: false,
             debug_tap: false,
+            staging_mb: 128,
+            dump: false,
         };
         let src = crate::formats::awq::AwqSource::open_dir(&dir).expect("awq 源");
         let old = eval_load(&mk(), &mut face, &src, &opts.ctx()).await.expect("eval_load(awq)");
