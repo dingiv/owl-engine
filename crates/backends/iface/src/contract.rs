@@ -405,6 +405,26 @@ pub trait DeviceClient: Send {
         &mut self,
         graph: GraphId,
     ) -> impl Future<Output = Result<(), ModelError>> + Send;
+    /// **FI plan 开关下发**(2026-10-19;单源 = 引擎 `knobs`)
+    ///
+    /// - `self_carry`(`knobs.fi_plan_restore`):捕获窗内是否把本 plan 的调度表
+    ///   烘成图内 restore 节点。`true` = 图自携表;`false` = host 每步 `fi_plan_sync`。
+    /// - `cuda_graph`(`knobs.fi_cuda_graph`):plan 用**图档瓦**(形状对 ctx 恒定)。
+    ///   ⚠️ 桶图 + 窗外刷表**要求**它为真 —— 否则 plan 形状随 ctx 跳变,而图内
+    ///   烘的是捕获期那一份 ⇒ 尾块(ctx ≠ t_pad)对不上。
+    ///
+    /// ⚠️ 为什么由**引擎**下发:这是配置面事实(`[dispatch] fi_plan_restore`),
+    /// 而"图是否自携"与"引擎是否在回放前刷表"必须**同一判据** —— 两条源各读
+    /// 各的会出现"图不烘表 + 引擎也不刷"的空档(实测 0.8B 桶门:回放读到上一个
+    /// plan 的调度表 ⇒ `q_indptr[5]` 越界 / 静默错值)。
+    ///
+    /// 缺省 = 无操作(**无 FI 面的后端没有这个概念**;不是静默失败 —— 没有
+    /// 这个开关可失)。
+    fn configure_fi_plan(&mut self, self_carry: bool, cuda_graph: bool) -> Result<(), ModelError> {
+        let _ = (self_carry, cuda_graph);
+        Ok(())
+    }
+
     /// **FI plan 表同步**(W3;仅 CUDA/FI 后端有意义):确保 `spec.ctx_total`
     /// 对应的调度表在场,并把它的表内容刷进 FI 的 `int_ws`。
     ///

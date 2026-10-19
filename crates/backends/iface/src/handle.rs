@@ -979,6 +979,10 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
         self.inner.graph_launch(graph)
     }
 
+    fn configure_fi_plan(&mut self, self_carry: bool, cuda_graph: bool) -> Result<(), ModelError> {
+        self.inner.configure_fi_plan(self_carry, cuda_graph)
+    }
+
     fn fi_plan_sync(&mut self, spec: FiPlanSpec) -> impl Future<Output = Result<(), ModelError>> + Send {
         self.inner.fi_plan_sync(spec)
     }

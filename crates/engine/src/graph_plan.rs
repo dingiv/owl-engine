@@ -292,7 +292,24 @@ impl<D: DeviceClient> GraphPlan<D> {
             } else {
                 f32b(&init)
             };
-            let block = face.htod(i.dtype, &i.shape, &bytes, &format!("plan.in.{}", i.name)).await?;
+            // **参数面走 COMPUTE 流**(2026-10-19 定谳;桶门 0.8B IMA 的根因):
+            // 槽块由 `cuMemAllocAsync` **按流**落定,而槽的每步装填
+            // (`fill_slots` → `write_blocks_f32_on(Compute)`)与消费它的发射都在
+            // COMPUTE 上 ⇒ 若槽块在 **H2D** 流分配/首次上传,COMPUTE 读者与
+            // 该分配之间**没有序**(A13 同族:跨流"用前未分配")。
+            // 大模型 boot 慢、中间有栅栏 ⇒ 侥幸不炸;0.8B 小几何 boot 极快 ⇒
+            // 首个 warmup 就撞上(compute-sanitizer:`owl_embed_f16` 读
+            // `plan.in.frontier`、地址"potentially made before memory is allocated")。
+            // 修法 = 与 2026-10-17 参数同流律对齐:**同流 FIFO,结构上无竞态**。
+            let block = face
+                .htod_on(
+                    owl_iface::contract::UpStream::Compute,
+                    i.dtype,
+                    &i.shape,
+                    &bytes,
+                    &format!("plan.in.{}", i.name),
+                )
+                .await?;
             ins.push(InSlotDev {
                 name: i.name,
                 len: i.len,

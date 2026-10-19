@@ -1143,6 +1143,41 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
     tp: Option<owl_models::module::TpCtx>,
     t_run: std::time::Instant,
 ) -> Result<RankDev<DeviceHandle<D>>> {
+        // **FI plan 自携开关:引擎 = 配置持有者 ⇒ 装配期下发**(2026-10-19 桶门立案)。
+        //
+        // 双源曾分叉:引擎旋钮 `knobs.fi_plan_restore`(桶图用它决定"图自携 vs
+        // host 步前刷表")与后端 `DiagOpts.fi_plan_restore`(家族用它决定"窗内
+        // 烘不烘 restore 节点")各读各的。测试档只设前者 ⇒ 家族按 false 跑
+        // ⇒ **图里没有 restore 节点、引擎又不刷表** ⇒ 回放读到上一个 plan 的
+        // 调度表 ⇒ 0.8B 桶门 IMA(`q_indptr[5]` 越界)/错值。
+        // 单源 = 引擎旋钮(生产两处同源于 `[dispatch]`,行为不变;测试/直连档
+        // 以后者为准)。写点必须在**图族装配之前**(boot_rank 内)。
+        face.configure_fi_plan(cfg.knobs.fi_plan_restore, cfg.knobs.fi_cuda_graph)?;
+        // **桶图 × FI plan 承载的定形门**(2026-10-19 桶门定谳):
+        // 桶图在捕获期按 `t_pad` 烘 FI 节点(plan 形状 + 表内容),而回放期
+        // `ctx = base + t` 可能 > `t_pad`(尾块)⇒ 只有"图档瓦(形状对 ctx 恒定)
+        // + 窗外刷表(内容对 ctx 精确)"这一组合同构才成立。
+        // - 图自携(restore=true):表内容 = 捕获期 ctx=t_pad 的那份 ⇒ 尾块读到
+        //   截断的 KV 覆盖(实测 0.8B:输出退化成"重复、重复…");
+        // - eager 瓦(cuda_graph=false):plan 形状随 ctx 跳变 ⇒ 图内烘的
+        //   offsets/padded/split 与窗外刷进去的表不同构(实测 IMA `q_indptr[5]`).
+        // 生产档(`[dispatch] fi_plan_restore=false` + `fi_cuda_graph=true`)本就满足;
+        // 这里把"凑巧"变成不变量(测试/直连档不许再走错组合)。
+        if cfg.knobs.prefill_bucket != owl_shared::config::PrefillBucket::Off {
+            if cfg.knobs.fi_plan_restore {
+                return Err(owl_iface::contract::ModelError::Msg(
+                    "prefill 桶图要求 `fi_plan_restore = false`(图不烘表,host 每桶回放前 \
+                     `fi_plan_sync` 刷精确表)—— 图自携的是捕获期 ctx=t_pad 的表,尾块\
+                     (ctx>t_pad)会读错 KV".into(),
+                ));
+            }
+            if !cfg.knobs.fi_cuda_graph {
+                return Err(owl_iface::contract::ModelError::Msg(
+                    "prefill 桶图要求 `fi_cuda_graph = true`(图档瓦让 plan 形状对 ctx \
+                     恒定)—— 否则图内烘的 offsets/padded/split 与窗外刷的表不同构".into(),
+                ));
+            }
+        }
         // **投机深度定形门**(2026-10-16):verify 块 = `depth + 1` 行,而首轮
         // 拼接核的输入槽数是**声明面事实**(`CONCAT_ROWS_SLOTS` = 8)⇒ depth 超界
         // 会在**首个 verify 步**才爆(且那时树已经 pad 到错槽数)。

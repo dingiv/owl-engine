@@ -3933,6 +3933,10 @@ async fn gpu_prefill_bucket_matches_eager() {
                 prefill_bucket: b,
                 gdn_slots,
                 fi_plan_restore,
+                // 桶图 × FI 的**生产定形**(2026-10-19 桶门定谳;见 boot_rank 的门):
+                // 图档瓦(plan 形状对 ctx 恒定)+ 窗外刷表(内容对 ctx 精确)。
+                // eager 瓦下 plan 形状随 ctx 跳变 ⇒ 尾块与图内烘的参数不同构。
+                fi_cuda_graph: true,
                 sampler_enabled: false,
                 env,
                 ..EngineKnobs::default()
@@ -3962,8 +3966,9 @@ async fn gpu_prefill_bucket_matches_eager() {
     async fn gen(running: &mut RunningEngine<crate::GpuFace>, prompt: &str, n: usize) -> String {
         gen_session(running, None, prompt, n).await
     }
-    // ① 桶档
-    let mut g = boot_bucket(&dir, ordinal, PrefillBucket::Geobuckets, 8, true).await;
+    // ① 桶档(**生产定形**:图不烘表 + host 每桶刷表;图自携档对尾块不成立 ——
+    //    捕获期 ctx=t_pad 的表盖不住 ctx>t_pad 的尾块,见 `boot_rank` 的定形门)
+    let mut g = boot_bucket(&dir, ordinal, PrefillBucket::Geobuckets, 8, false).await;
     let buckets = g.dev.graphs.prefill.captured_t_pads();
     eprintln!("[m2b] 桶捕获:{:?}(summary = {})", buckets, g.dev.graphs.prefill.summary());
     assert!(
@@ -4014,7 +4019,7 @@ async fn gpu_prefill_bucket_matches_eager() {
     // 是被绕过的路径,现在真跑)。
     let mut reuse: Vec<(String, String, usize)> = Vec::new();
     for b in [PrefillBucket::Geobuckets, PrefillBucket::Off] {
-        let mut g = boot_bucket(&dir, ordinal, b, 1, true).await;
+        let mut g = boot_bucket(&dir, ordinal, b, 1, false).await;
         let t1 = gen_session(&mut g, Some(1), &prompt, 16).await;
         let n1: usize = g.dev.graphs.prefill.replay_counts().iter().map(|(_, n)| *n).sum();
         let t2 = gen_session(&mut g, Some(2), &prompt, 16).await;

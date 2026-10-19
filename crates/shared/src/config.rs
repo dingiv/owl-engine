@@ -1439,8 +1439,35 @@ impl OwlConfig {
         // ✅ 2026-10-19 解禁:`[graph] prefill_bucket` × `[dispatch] fi_plan_bake`
         // 不再是互斥对 —— **桶路也接了窗外 `fi_plan_sync`**(桶回放前由引擎把
         // 本桶的 plan 表刷回共享 `int_ws`;见 `exec::prefill_chunk` 的回放点)。
-        // 于是两条 FI 表承载(图自携 restore / host 每步 sync)对桶图都成立,
-        // 由 `fi_plan_restore` 唯一选择:`true` = 桶自携(旧行为),`false` = host 刷。
+        //
+        // ⚠️ **但桶图 × FI 只有一种承载组合成立**(2026-10-19 桶门定谳,原注释
+        // "两条承载对桶图都成立"是**错的**):
+        // 桶图捕获期按 `t_pad` 烘 FI 节点(plan 形状 + 表内容),回放期
+        // `ctx = base + t` 可能 > `t_pad`(尾块)⇒
+        //   · 图自携(restore=true):表内容 = 捕获期 ctx=t_pad 的那份 ⇒ 尾块
+        //     读到截断的 KV 覆盖(0.8B 实测:输出退化成"重复、重复…");
+        //   · eager 瓦(cuda_graph=false):plan 形状随 ctx 跳变 ⇒ 图内 offsets/
+        //     padded/split 与窗外刷进去的表不同构(实测 IMA:核读 `q_indptr[5]`
+        //     —— 8 字节的 2 元表被按 6 元索引)。
+        // ⇒ 桶图硬配 `fi_plan_restore = false` + `fi_cuda_graph = true`。
+        if self.graph.prefill_bucket != PrefillBucket::Off {
+            if self.dispatch.fi_plan_restore {
+                return Err(
+                    "[graph] prefill_bucket 需要 fi_plan_restore = false \
+                     (图自携的是捕获期 ctx=t_pad 的表;尾块 ctx>t_pad 会读错 KV —— \
+                     由 host 每桶回放前 `fi_plan_sync` 刷精确表)"
+                        .to_string(),
+                );
+            }
+            if !self.dispatch.fi_cuda_graph {
+                return Err(
+                    "[graph] prefill_bucket 需要 fi_cuda_graph = true \
+                     (图档瓦让 plan 形状对 ctx 恒定;eager 瓦下形状随 ctx 跳变 ⇒ \
+                     图内烘的 offsets/padded/split 与窗外刷的表不同构)"
+                        .to_string(),
+                );
+            }
+        }
         if self.dispatch.fi_plan_bake.is_some() && self.dispatch.fi_plan_restore {
             return Err(
                 "[dispatch] fi_plan_bake 需要 fi_plan_restore = false \
