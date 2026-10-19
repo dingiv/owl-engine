@@ -1,0 +1,73 @@
+# owl 引擎预设档 `gguf27b`(GGUF 单文件档 M2 靶位;2026-10-19 gguf 轮)
+#
+# 靶位 = `models/ggml-org/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf`
+# (17.66 GiB / 851 张 / **混型**:Q4_K 193 · Q8_0 288 · Q6_K 17 · F32 353 /
+#  **untied**(`output.weight` 在场)+ 64 层 = 16 full + 48 GDN)。
+#
+# **单卡档**:27B 在**一张** 3090 Ti 上跑通(权重 17.7 GiB 压缩驻留 + 小池
+# 即可装下 24G)。
+#
+# **双卡档(W-1,2026-10-19)**:GGUF + TP2 已通 —— 分片几何**住在源里**
+# (`formats/gguf/shard.rs` + `WeightSource::owns_shard`):块对齐列切 +
+# v-head **grouped 序装载期聚合**(TP 档**不需要** A2 激活侧列序表)。
+# 每 rank 量化驻留 9.64 GiB(文件 17.67);首 token 与单卡/llama.cpp 一致,
+# 两 rank logits 逐位相同。**注意** TP2 与单卡的 logits 不等价是引擎既有
+# numerics(AWQ 对照 max|Δ| 10.83 / GGUF 6.36),见设计 §15.6 —— 判据钉
+# 首 token + 两 rank 一致,不是逐 token 相同。
+# 双卡起机见 `docs/arch/gguf-格式支持-设计与施工.md` §15.4(占位:设备束给
+# 两张 3090 Ti 的 UUID;`world = 2` 走 `TpEngine` 装配)。
+#
+# 起机:
+#   CUDA_VISIBLE_DEVICES=GPU-<UUID> target/release/server --flavor gguf27b <用户档.toml>
+#   # 用户档里写 [model] dir = "<...>/Qwen3.8-27B-Q4_K_M.gguf"
+#
+# 实测(2026-10-19,单 3090 Ti `41:00.0`):
+#   装载 **6.14s** · 设备 live **17.69 GiB** vs 文件 17.67(比 1.001)·
+#   `decode.step` **26.3ms/步**(≈38 t/s 引擎内;客户端口径见 llm_speedtest)
+#   · 首 token 与 llama.cpp 同文件**逐字相同**,24 token 全同(见 tests_gguf)
+#
+# 双卡实测(2026-10-19,3090 Ti 对 41/42):首 token " Paris" · 两 rank logits
+# 0 项不同 · AR 注入 r0=r1=256 · decode 30.9 tok/s(debug 构建)。
+#
+# ⚠️ **prefill 现在很慢**(MMVQ-only,无 tile 臂 ⇒ 估 ~50 t/s @4k):
+# M2 的 std 五点三轮要等 prefill tile 臂(设计 §八 R2)。本档先服务正确性与
+# 长上下文可用性,不拿它比 prefill。
+
+[model]
+kind = "gguf"
+
+[runtime]
+bind = "127.0.0.1:8139"
+# 27B:池 = 全 ctx 常驻(单卡 24G:权重 17.7 + KV 1G@32k + 状态/图 ~0.8 ⇒ 留足)
+max_seq = 32768
+prefill_chunk = 1024
+
+[pool]
+# 池 = max_seq(全 ctx 常驻;别再走宿主下沉 —— 4B 测速档的教训见 gguf4b.toml)
+pool_tokens = 32768
+gdn_slots = 1
+snap_max = 2
+host_cache_mb = 512
+snap_host_mb = 256
+# 对拍/测速口径:关前缀缓存(要长会话复用请打开并抬 `host_cache_mb`)
+prefix_cache = false
+
+[server]
+# `gdn_slots = 1` ⇒ 并发上限必须 = 1
+max_concurrency = 1
+
+[sampling]
+mode = "greedy"
+
+[dispatch]
+# ⚠️ **本档暂不设 `allowed_ops` 白名单**(门关):
+# 白名单要按**发射账并集**生成(方法写在 `gguf4b.toml` 的 [dispatch] 注释里),
+# 而 27B 的臂集与 4B 不同(prefill 走 FI 的 hd256 k/v 变体 + decode v2 hd256 族,
+# 且 GDN 层数 ×2)。要硬化时按同一流程收账,并把清单入
+# `owl_kernels::ops::PROD_GGUF27B_2026_10_19` + `apps/server/tests/ops_whitelist.rs`
+# 的两处锁(教训:新 flavor 不加进那两个门 = 白名单**没被审计**)。
+
+[kvmem]
+select_decode = false
+select_partial = false
+index = false

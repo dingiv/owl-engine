@@ -7,3 +7,8 @@
 
 # 开关(未列 = false)
 # "flag:hf-parity" = true
+
+# ---- GGUF 起点族(2026-10-19)----
+# "gguf:9b"   = "<Holo-3.1-9B-Q5_K_M.gguf>"
+# "gguf:27b"  = "<Qwen3.8-27B-Q4_K_M.gguf>"
+# "gguf:draft-q4" = "<Qwen3.8-27B-DFlash2-Q4_K_M.gguf>"

@@ -1,0 +1,110 @@
+# owl 引擎预设档 `gguf4b`(GGUF 单文件档 M1 靶位;2026-10-19 gguf 轮)
+#
+# 靶位 = `models/bartowski/Qwen_Qwen3.5-4B-GGUF/Qwen_Qwen3.5-4B-Q4_K_M.gguf`
+# (3.0G / 441 张 / 五型混合 Q4_K·Q5_K·Q6_K·Q8_0·F32 / tied + MTP 块 32)。
+#
+# **单文件自给**:超参(`qwen35.*` KV)· 词表(`tokenizer.ggml.*`)·
+# chat 模板(`tokenizer.chat_template`)· rope(`rope.dimension_count`/`freq_base`)·
+# 权重(压缩块字节原样,零解量化)全部从**同一个 .gguf** 读
+# —— `model.dir` 必须是 **.gguf 单文件路径**(不是目录);词表/模板不回落 HF 目录。
+#
+# 起机(单卡 3090 Ti;卡位用 CUDA_VISIBLE_DEVICES=UUID 钉 —— 禁用数字序,
+# 见 `docs/dev/README.md` 的 UUID 钉卡纪律):
+#   CUDA_VISIBLE_DEVICES=GPU-89dffb90-d810-7ce7-f649-60d781508f21 \
+#   target/release/server --flavor gguf4b <用户档.toml> --log-level info
+#   # 用户档里写: [model] dir = "<...>/Qwen_Qwen3.5-4B-Q4_K_M.gguf" 
+#
+# ⚠️ **量化的两个键在本档无效**(写了也不读):GGUF 的量化型是**逐张量**事实
+# (`Q4_K/Q5_K/Q6_K/Q8_0/F32` 混存),没有"全模型一个方案"可言 ——
+# `QuantPlan::Gguf(ty)` 由逐键计划表给(`GgufPlan`)。故本档不写 `quant`/`head_quant`。
+#
+# 实测(4591 号会话;单 3090 Ti,`OWL_TEST_DEVICE=0000:42:00.0`):
+#   装载 2.05s(容器 0.07 + 权重 0.7 + 词表 0.6 + rope) · 设备 2.70 GiB(文件 2.81)
+#   裸文本贪心 decode ≈ 105 tok/s · e2e 门见 `crates/engine/src/tests_gguf.rs`
+
+[model]
+kind = "gguf"
+
+[runtime]
+bind = "127.0.0.1:8138"
+# 4B 档:上下文给足(池小、单会话)
+max_seq = 32768
+prefill_chunk = 1024
+
+[pool]
+# 单会话语义(并发 1)⇒ GDN 状态格 1。
+#
+# ⚠️ **池 = max_seq(全 ctx 常驻)**(2026-10-19 实测教训):池 8192 而
+# `max_seq` 32768 ⇒ 8448 token 的那一点要走**宿主下沉**,而宿主档 512MiB
+# 不够(`资源耗尽:宿主层越界:537919488 > 536870912`)⇒ 请求被弃置、
+# 测速点降级为本地估算。4B 权重只占 2.7G,1G KV 池在 24G 卡上不心疼。
+pool_tokens = 32768
+gdn_slots = 1
+snap_max = 2
+host_cache_mb = 512
+snap_host_mb = 128
+# **对拍/测速口径:关前缀缓存**(std 矩阵每点都是新 prompt ⇒ 复用为零,
+# 开着只会把 KV 往宿主层推、把可复现性押在宿主预算上)。要长会话复用请
+# 打开本项并把 `host_cache_mb` 提到 2048(见 `awq27b` 档的三层账注释)。
+prefix_cache = false
+
+[server]
+# `gdn_slots = 1` ⇒ 并发上限必须 = 1(跨会话状态污染会被 boot 拒)
+max_concurrency = 1
+
+[sampling]
+# 对拍/验收口径 = 贪心(与 llama.cpp `/completion` 的 temp=0 同律)
+mode = "greedy"
+
+[dispatch]
+# **算子白名单(deny-by-default;生成 ≠ 手抄)**。
+#
+# 为什么是生成:`awq27b` 档曾因白名单手抄漏一条(`owl_cast_bf16_f16`)、又因
+# `kv_fp8` 与白名单不同族而**整档起不来** —— 手抄清单与真实发射面是两处真源。
+# 本档的清单来自**真实发射账**(唯一证据面):
+#   ① 用户档加 `[cuda] trace_ring = 40000`(或足够大);
+#   ② 依次打 `11 / ~512 / ~1024 / ~2048 / ~4096 / ~8192` token 的请求
+#      (覆盖短 prefill + FI 多 chunk 预填充 + decode 捕获图);
+#   ③ 每轮 `GET /debug/launches/40000` 取 `cmd=="launch"` 的 `name` **取并集**
+#      (⚠️ ring 会绕圈:只 dump 一次会漏掉被冲掉的臂 —— 本轮实测漏 5 个);
+#   ④ 去重排序写回本表。
+# 换文件(不同量化型混布)/换档(开 spec、改 kv_fp8)/改池或臂 ⇒ **重跑 ①-④**;
+# 漏列不会静默错值,而是**发射期响亮拒**(`admission_check` 点名 allowed_ops)。
+allowed_ops = [
+    "cublas_gemm_f16",
+    "flashinfer_prefill_paged_f16",
+    "owl_add_f16",
+    "owl_argmax_f32idx_f16",
+    "owl_fused_add_rmsnorm_f16",
+    "owl_gdn_conv_fwd_f16",
+    "owl_gdn_conv_upd_dual_f16",
+    "owl_gdn_decode_step_v2_f16",
+    "owl_gdn_gating_g_f16",
+    "owl_gdn_l2norm_f16",
+    "owl_gdn_norm_act_f16",
+    "owl_gdn_recurrence_varlen_gqa_f16",
+    "owl_gemv_dual_f16",
+    "owl_gguf_dequant_rows_q6k",
+    "owl_gguf_gemm_q4k",
+    "owl_gguf_gemm_q5k",
+    "owl_gguf_gemm_q6k",
+    "owl_gguf_gemm_q8_0",
+    "owl_gguf_quant_act_f16",
+    "owl_gguf_quant_act_f16_tiled",
+    "owl_narrow_strided_f16",
+    "owl_norm_rope_f16",
+    "owl_qknorm_rope_kv_insert_f16_knhd",
+    "owl_rmsnorm_f16",
+    "owl_sigmoid_f16",
+    "owl_sigmoid_gate_mul_f16",
+    "owl_silu_and_mul_f16",
+    "vllm_paged_attention_v2_f16_knhd_hd256bs32",
+    "vllm_paged_attention_v2_reduce_f16_hd256",
+    "vllm_reshape_and_cache_f16_knhd",
+]
+
+[kvmem]
+# 4B 单卡:池足够,选择层关(没有超卖需求 ⇒ 没有东西可以下沉/回灌)
+select_decode = false
+select_partial = false
+index = false
