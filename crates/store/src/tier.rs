@@ -39,6 +39,14 @@ pub enum AssetKind {
     /// **临时工作区**(chunk 激活面 / plan sync 缓冲 / eager 回退 / logits 中转;
     /// 2026-10-19 DeviceHandle 事件账引入 —— 生命周期挂 turn,N4 归还)。
     Temp,
+    /// **权重与装载产物**(常驻;装载相位 —— 2026-10-19 用户裁决扩词表)。
+    Weight,
+    /// **图 slab 与图内自产块**(随图存活;捕获窗)。
+    Graph,
+    /// **池骨架**(KV/GDN/快照/草稿池的容器块;boot 期)。
+    Pool,
+    /// **未分类兜底**(尚未接线相位的分配;**可见** —— 字节数是迁移进度指标)。
+    Unclassified,
 }
 
 impl From<owl_iface::handle::AssetClass> for AssetKind {
@@ -54,19 +62,35 @@ impl From<owl_iface::handle::AssetClass> for AssetKind {
             A::Meta => AssetKind::Meta,
             A::Index => AssetKind::Index,
             A::Temp => AssetKind::Temp,
+            A::Weight => AssetKind::Weight,
+            A::Graph => AssetKind::Graph,
+            A::Pool => AssetKind::Pool,
+            A::Unclassified => AssetKind::Unclassified,
         }
     }
 }
 
 impl AssetKind {
     /// 本类别是否属于**保留面**(驱逐面之外)。
+    ///
+    /// 常驻系统面(Weight/Graph/Pool)也是保留面 —— 它们不参与 store 的
+    /// 驱逐/下沉决策(不是池的可回收块)。`Unclassified` **不声称**保留
+    /// (分类未知就不许替决策面下结论;当前决策面根本不读本函数)。
     pub fn is_reserved(self) -> bool {
-        matches!(self, AssetKind::Floor | AssetKind::Row | AssetKind::Meta)
+        matches!(
+            self,
+            AssetKind::Floor
+                | AssetKind::Row
+                | AssetKind::Meta
+                | AssetKind::Weight
+                | AssetKind::Graph
+                | AssetKind::Pool
+        )
     }
 }
 
 /// 各层上限(字节;GPU 层不用此值 —— 卡级约束在 `budget.rs`)。
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TierBudget {
     /// host pinned 上限(0 = 关层;要求 C4「预算显式配置」)。
     pub host_bytes: usize,
@@ -83,6 +107,16 @@ impl TierBudget {
             Tier::Disk => Some(self.disk_bytes),
         }
     }
+}
+
+/// **中层预算的唯一算式**(2026-10-19):boot 造账(`Engine::on`)与准入预算入参
+/// (`BudgetInputs.host_bytes`)必须**同源** —— 两处各算一遍必然漂,而漂了之后
+/// `Rel::open` 的交叉校验会把启动拒掉(好过静默两把尺)。
+///
+/// 口径:`host_cache_mb` = KV 块腿的宿主分片,`snap_host_mb` = 状态腿(快照)分片;
+/// 两者之和 = store 的中层总账。磁盘层二期(恒 0)。
+pub fn tier_budget_of(host_cache_mb: usize, snap_host_mb: usize) -> TierBudget {
+    TierBudget { host_bytes: (host_cache_mb + snap_host_mb) << 20, disk_bytes: 0 }
 }
 
 /// 单层单类别的账目。
@@ -102,6 +136,23 @@ pub struct OwnerRow {
     /// 归属主体。
     pub owner: Owner,
     /// 所在层。
+    pub tier: Tier,
+    /// 资产类别。
+    pub kind: AssetKind,
+    /// 占用字节。
+    pub bytes: usize,
+    /// 条目数。
+    pub entries: usize,
+}
+
+/// **事件账的一行**(rank × owner × tier × kind 聚合;`/debug/vram` 的事件面)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EventRow {
+    /// 设备序(TP 分卡;单卡恒 0)。
+    pub rank: u8,
+    /// 归属主体。
+    pub owner: Owner,
+    /// 所在层(换层时跟着变)。
     pub tier: Tier,
     /// 资产类别。
     pub kind: AssetKind,
@@ -401,77 +452,128 @@ mod tests {
 
     /// **步 2 门 ①**:事件账与 store 账**同一本**(alloc→free 账平 + 登记清空)
     #[test]
-    fn ledger_handle_alloc_free_balances_same_book() {
+    fn ledger_book_alloc_free_balances_same_book() {
         use owl_iface::handle::{AllocEvent, AllocLedger, AssetClass, FreeEvent, Owner as IfOwner};
-        let l = std::rc::Rc::new(std::cell::RefCell::new(ledger(1 << 20)));
-        let mut h = LedgerHandle::new(l.clone());
+        let cell = shared_ledger(TierBudget { host_bytes: 1 << 20, disk_bytes: 0 });
+        let mut h = LedgerEntry { book: cell.clone() };
         h.on_alloc(&AllocEvent {
             id: 1,
             bytes: 4096,
             name: "kv.workspace".into(),
             class: AssetClass::Temp,
             owner: IfOwner::Turn(7),
+            rank: 0,
         });
-        assert_eq!(h.open_count(), 1);
-        assert_eq!(h.open_bytes(IfOwner::Turn(7)), 4096);
-        // store 自己的账立刻看到(同一本)
-        assert_eq!(l.borrow().kind_bytes(Tier::Gpu, AssetKind::Temp), 4096);
-        assert_eq!(l.borrow().owner_bytes(IfOwner::Turn(7)), 4096);
+        {
+            let b = book_lock(&cell);
+            assert_eq!(b.open_count(), 1);
+            assert_eq!(b.open_bytes(IfOwner::Turn(7)), 4096);
+            assert_eq!(b.open_total_bytes(), 4096);
+            // store 自己的账立刻看到(同一本)
+            assert_eq!(b.tiers().kind_bytes(Tier::Gpu, AssetKind::Temp), 4096);
+            assert_eq!(b.tiers().owner_bytes(IfOwner::Turn(7)), 4096);
+            assert_eq!(b.open_rows().len(), 1, "出借明细(owner×kind)");
+        }
         h.on_free(&FreeEvent { id: 1, bytes: 0 }); // 字节按登记扣
-        assert_eq!(h.open_count(), 0);
-        assert_eq!(l.borrow().kind_bytes(Tier::Gpu, AssetKind::Temp), 0);
-        assert_eq!(h.hook_fail(), 0);
+        let b = book_lock(&cell);
+        assert_eq!(b.open_count(), 0);
+        assert_eq!(b.tiers().kind_bytes(Tier::Gpu, AssetKind::Temp), 0);
+        assert_eq!(b.open_total_bytes(), 0);
+        assert_eq!(b.hook_fail(), 0);
     }
 
     /// **步 2 门 ②**:双持 / 幽灵归还**响亮拒**(计数,不 panic、不静默)
     #[test]
-    fn ledger_handle_rejects_double_alloc_and_ghost_free() {
+    fn ledger_book_rejects_double_alloc_and_ghost_free() {
         use owl_iface::handle::{AllocEvent, AllocLedger, AssetClass, FreeEvent, Owner as IfOwner};
-        let l = std::rc::Rc::new(std::cell::RefCell::new(ledger(1 << 20)));
-        let mut h = LedgerHandle::new(l.clone());
+        let cell = shared_ledger(TierBudget { host_bytes: 1 << 20, disk_bytes: 0 });
+        let mut h = LedgerEntry { book: cell.clone() };
         let ev = AllocEvent {
             id: 9,
             bytes: 128,
             name: "dup".into(),
             class: AssetClass::Elastic,
             owner: IfOwner::Session(1),
+            rank: 0,
         };
         h.on_alloc(&ev);
         h.on_alloc(&ev); // 双持
-        assert_eq!(h.hook_fail(), 1, "双持必须计数");
-        assert_eq!(l.borrow().kind_bytes(Tier::Gpu, AssetKind::Elastic), 128, "只入账一次");
+        {
+            let b = book_lock(&cell);
+            assert_eq!(b.hook_fail(), 1, "双持必须计数");
+            assert_eq!(b.tiers().kind_bytes(Tier::Gpu, AssetKind::Elastic), 128, "只入账一次");
+        }
         h.on_free(&FreeEvent { id: 999, bytes: 0 }); // 幽灵
-        assert_eq!(h.hook_fail(), 2, "幽灵归还必须计数");
-        assert_eq!(h.open_count(), 1, "合法那条仍在场");
+        let b = book_lock(&cell);
+        assert_eq!(b.hook_fail(), 2, "幽灵归还必须计数");
+        assert_eq!(b.open_count(), 1, "合法那条仍在场");
     }
 
-    /// **步 2 门 ③**:换层 = **不注销**(owner/entries 不变;tier 迁移)
+    /// **步 2 门 ③**:换层 = **不注销**(owner/entries 不变;tier 迁移);
+    /// 部分换层(片和 ≠ 登记)响亮拒。
     #[test]
-    fn ledger_handle_move_keeps_owner_and_entries() {
-        use owl_iface::handle::{AllocEvent, AllocLedger, AssetClass, MoveDir, MoveEvent, Owner as IfOwner};
-        let l = std::rc::Rc::new(std::cell::RefCell::new(ledger(1 << 20)));
-        let mut h = LedgerHandle::new(l.clone());
+    fn ledger_book_move_keeps_owner_and_rejects_partial() {
+        use owl_iface::handle::{
+            AllocEvent, AllocLedger, AssetClass, MoveDir, MoveEvent, Owner as IfOwner,
+        };
+        let cell = shared_ledger(TierBudget { host_bytes: 1 << 20, disk_bytes: 0 });
+        let mut h = LedgerEntry { book: cell.clone() };
         h.on_alloc(&AllocEvent {
             id: 5,
             bytes: 8192,
             name: "snap.1".into(),
             class: AssetClass::Snap,
             owner: IfOwner::Cache,
+            rank: 0,
         });
         h.on_move(&MoveEvent { id: 5, bytes: 8192, dir: MoveDir::Out });
         {
-            let b = l.borrow();
-            assert_eq!(b.kind_bytes(Tier::Gpu, AssetKind::Snap), 0, "设备层已清");
-            assert_eq!(b.kind_bytes(Tier::Host, AssetKind::Snap), 8192, "宿主层在位");
-            assert_eq!(b.owner_bytes(IfOwner::Cache), 8192, "owner 不变(下沉≠归还)");
-            let rows = b.detail();
+            let b = book_lock(&cell);
+            assert_eq!(b.tiers().kind_bytes(Tier::Gpu, AssetKind::Snap), 0, "设备层已清");
+            assert_eq!(b.tiers().kind_bytes(Tier::Host, AssetKind::Snap), 8192, "宿主层在位");
+            assert_eq!(b.tiers().owner_bytes(IfOwner::Cache), 8192, "owner 不变(下沉≠归还)");
+            let rows = b.tiers().detail();
             assert_eq!(rows.len(), 1, "换层不多出一条:{rows:?}");
             assert_eq!(rows[0].entries, 1, "entries 跟着走");
+            assert_eq!(b.open_rows()[0].tier, Tier::Host, "登记跟着换层");
+            assert_eq!(b.hook_fail(), 0);
         }
-        assert_eq!(h.hook_fail(), 0);
         // 方向不符(Host 上再 Out)= 响亮拒
         h.on_move(&MoveEvent { id: 5, bytes: 8192, dir: MoveDir::Out });
-        assert_eq!(h.hook_fail(), 1, "方向不符必须计数");
+        assert_eq!(book_lock(&cell).hook_fail(), 1, "方向不符必须计数");
+        // **部分换层**(片和 ≠ 登记整块)= 响亮拒(账只按逻辑块记)
+        h.on_move(&MoveEvent { id: 5, bytes: 4096, dir: MoveDir::In });
+        let b = book_lock(&cell);
+        assert_eq!(b.hook_fail(), 2, "部分换层必须计数");
+        assert_eq!(b.tiers().kind_bytes(Tier::Host, AssetKind::Snap), 8192, "账未被部分搬运搅动");
+    }
+
+    /// **步 3 门 ⑥**:词表映射**全单射**(12 类 iface ↔ 12 类 store;无遗漏)
+    #[test]
+    fn asset_class_maps_onto_asset_kind_injectively() {
+        use owl_iface::handle::AssetClass as A;
+        let all = [
+            A::KvBlock,
+            A::Floor,
+            A::Elastic,
+            A::Snap,
+            A::Row,
+            A::Meta,
+            A::Index,
+            A::Temp,
+            A::Weight,
+            A::Graph,
+            A::Pool,
+            A::Unclassified,
+        ];
+        let kinds: Vec<AssetKind> = all.iter().map(|c| AssetKind::from(*c)).collect();
+        let mut uniq = kinds.clone();
+        uniq.sort_by_key(|k| format!("{k:?}"));
+        uniq.dedup();
+        assert_eq!(uniq.len(), all.len(), "映射必须单射(两类别落同一 AssetKind = 记账混淆):{kinds:?}");
+        assert!(AssetKind::from(A::Weight).is_reserved(), "权重是常驻面");
+        assert!(AssetKind::from(A::Pool).is_reserved(), "池骨架是常驻面");
+        assert!(!AssetKind::from(A::Unclassified).is_reserved(), "未分类不声称保留");
     }
 
     /// **第 0 刀:owner 维**(每字节唯一归属;出账逐 owner 判,不替他人平账)
@@ -505,28 +607,52 @@ mod tests {
 }
 
 // ============================================================================
-// §6 账本句柄:`AllocLedger` 的 store 实现(DeviceHandle 钩子的落点)
+// §6 共享账本:`AllocLedger` 的 store 实现(DeviceHandle 钩子的落点)
 // ============================================================================
 
-/// **账本句柄**(实现 `owl_iface::handle::AllocLedger`;供 `DeviceHandle` 在客户端侧调用)。
+/// **出借登记的一行**(事件账:`id` → 归属/类别/层/字节/点名)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Loan {
+    /// 设备序(TP 两 rank 共用一本账时的分卡键;单卡恒 0)。
+    pub rank: u8,
+    /// 归属主体。
+    pub owner: Owner,
+    /// 资产类别(iface 中性类别的 store 映射)。
+    pub kind: AssetKind,
+    /// 当前所在层(换层时跟着变)。
+    pub tier: Tier,
+    /// 全量字节(登记值 —— 出账/换层都按它扣)。
+    pub bytes: usize,
+    /// 分配点点名(排障:哪一处要的这块)。
+    pub name: String,
+}
+
+/// **共享账本单元** = 三层账(决策面)+ 出借登记(事件面)。
 ///
-/// 与 [`TierLedger`] 是**同一本账**(共享 `Rc<RefCell<TierLedger>>`):事件进来即入账,
-/// store 自己的 `report()/detail()` 立刻看到同样的数 —— 这正是"store 主管显存账"的落点,
-/// 而 store 依然**零 I/O、零句柄**(它只被调用)。
+/// 为什么两件事同屋:它们必须**同时改**(一笔出借既进三层账,也进登记 ——
+/// 出账时要按登记扣字节)。分两处就会分叉。
 ///
-/// **出借登记**(`open`):`id → (owner, kind, tier, bytes)`。
-/// `FreeEvent` 只带 id ⇒ 字节/归属按登记扣;双持(同 id 重复 alloc)与幽灵归还
-/// (未登记就 free/move)**响亮拒**并计入 `hook_fail`(不 panic、不静默)。
-pub struct LedgerHandle {
-    ledger: std::rc::Rc<std::cell::RefCell<TierLedger>>,
-    open: BTreeMap<u64, (Owner, AssetKind, Tier, usize)>,
+/// **store 依然零 I/O、零句柄**:它只被调用(`on_*` 改自己的账)。
+pub struct LedgerBook {
+    tiers: TierLedger,
+    open: BTreeMap<u64, Loan>,
     hook_fail: u64,
 }
 
-impl LedgerHandle {
-    /// 构造(唯一入口:账本随句柄走)。
-    pub fn new(ledger: std::rc::Rc<std::cell::RefCell<TierLedger>>) -> Self {
-        Self { ledger, open: BTreeMap::new(), hook_fail: 0 }
+impl LedgerBook {
+    /// 构造(唯一入口:预算随账走)。
+    pub fn new(budget: TierBudget) -> Self {
+        Self { tiers: TierLedger::new(budget), open: BTreeMap::new(), hook_fail: 0 }
+    }
+
+    /// 三层账(决策/报告面)。
+    pub fn tiers(&self) -> &TierLedger {
+        &self.tiers
+    }
+
+    /// 三层账(可变;store 自查入口,如索引腿 `add_owned`)。
+    pub fn tiers_mut(&mut self) -> &mut TierLedger {
+        &mut self.tiers
     }
 
     /// 钩子失败计数(非零 = 有事件没入账;**不许静默**)。
@@ -534,59 +660,139 @@ impl LedgerHandle {
         self.hook_fail
     }
 
-    /// 当前出借条数(诊断面:与腿自报的条目数**互相校验**)。
+    /// 当前出借条数(诊断面:与块账房/腿自报**互相校验**)。
     pub fn open_count(&self) -> usize {
         self.open.len()
     }
 
     /// 某 owner 的出借字节(诊断面)。
     pub fn open_bytes(&self, owner: Owner) -> usize {
-        self.open.values().filter(|(o, _, _, _)| *o == owner).map(|(_, _, _, b)| *b).sum()
+        self.open.values().filter(|l| l.owner == owner).map(|l| l.bytes).sum()
+    }
+
+    /// 出借总字节(与块账房全等门的左值)。
+    pub fn open_total_bytes(&self) -> usize {
+        self.open.values().map(|l| l.bytes).sum()
+    }
+
+    /// **出借明细**(按 rank × owner × tier × kind 聚合;字节降序 —— 事件账报告面)。
+    pub fn open_rows(&self) -> Vec<EventRow> {
+        let mut agg: BTreeMap<(u8, Owner, Tier, AssetKind), (usize, usize)> = BTreeMap::new();
+        for l in self.open.values() {
+            let e = agg.entry((l.rank, l.owner, l.tier, l.kind)).or_insert((0, 0));
+            e.0 += l.bytes;
+            e.1 += 1;
+        }
+        let mut rows: Vec<EventRow> = agg
+            .into_iter()
+            .map(|((rank, owner, tier, kind), (bytes, entries))| EventRow {
+                rank,
+                owner,
+                tier,
+                kind,
+                bytes,
+                entries,
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            b.bytes.cmp(&a.bytes).then(a.rank.cmp(&b.rank)).then(a.owner.cmp(&b.owner))
+        });
+        rows
+    }
+
+    /// 出借块 id 集(与块账房做**全等门**用;`rank = None` = 全部)。
+    pub fn open_ids(&self, rank: Option<u8>) -> Vec<u64> {
+        self.open
+            .iter()
+            .filter(|(_, l)| rank.is_none_or(|r| l.rank == r))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// **逐 rank 的出借 id 集**(与块账房做**全等门**的原料;按 rank 升序)。
+    pub fn open_ids_by_rank(&self) -> Vec<(u8, Vec<u64>)> {
+        let mut agg: BTreeMap<u8, Vec<u64>> = BTreeMap::new();
+        for (id, l) in &self.open {
+            agg.entry(l.rank).or_default().push(*id);
+        }
+        agg.into_iter().collect()
+    }
+
+    /// 某 rank 的出借字节(`None` = 全部)。
+    pub fn open_total_bytes_rank(&self, rank: Option<u8>) -> usize {
+        self.open
+            .values()
+            .filter(|l| rank.is_none_or(|r| l.rank == r))
+            .map(|l| l.bytes)
+            .sum()
+    }
+
+    /// 出借条目数(`None` = 全部)。
+    pub fn open_count_rank(&self, rank: Option<u8>) -> usize {
+        self.open.values().filter(|l| rank.is_none_or(|r| l.rank == r)).count()
     }
 
     /// 记账失败:计数 + 一条裸日志(store 无日志依赖 ⇒ eprintln;机读面 = `hook_fail`)。
     fn fail(&mut self, what: &str, detail: String) {
-        self.hook_fail += 1;
+        self.hook_fail = self.hook_fail.saturating_add(1);
         eprintln!("[store.ledger] {what} 未入账:{detail}");
     }
-}
 
-impl owl_iface::handle::AllocLedger for LedgerHandle {
-    fn on_alloc(&mut self, ev: &owl_iface::handle::AllocEvent) {
+    /// 出借(登记 + 入账)。失败**响亮计数**,不 panic、不静默。
+    pub fn on_alloc(&mut self, ev: &owl_iface::handle::AllocEvent) {
         if self.open.contains_key(&ev.id) {
             self.fail("双持(同 id 重复 alloc)", format!("id={} name={}", ev.id, ev.name));
             return;
         }
         let kind = AssetKind::from(ev.class);
         // 分配发生在设备侧 ⇒ tier = Gpu(下沉/回加载另发 on_move)
-        // 借用先物化再判(否则 `self.fail(&mut self)` 与 RefCell 临时借用冲突)
-        let res = self.ledger.borrow_mut().add_owned(ev.owner, Tier::Gpu, kind, ev.bytes);
+        let res = self.tiers.add_owned(ev.owner, Tier::Gpu, kind, ev.bytes);
         match res {
             Ok(()) => {
-                self.open.insert(ev.id, (ev.owner, kind, Tier::Gpu, ev.bytes));
+                self.open.insert(
+                    ev.id,
+                    Loan {
+                        rank: ev.rank,
+                        owner: ev.owner,
+                        kind,
+                        tier: Tier::Gpu,
+                        bytes: ev.bytes,
+                        name: ev.name.clone(),
+                    },
+                );
             }
             Err(e) => self.fail("入账失败", format!("id={} {e}", ev.id)),
         }
     }
 
-    fn on_free(&mut self, ev: &owl_iface::handle::FreeEvent) {
-        let Some((owner, kind, tier, bytes)) = self.open.remove(&ev.id) else {
+    /// 归还(注销 + 出账;字节按**登记**扣 —— 事件只带 id)。
+    pub fn on_free(&mut self, ev: &owl_iface::handle::FreeEvent) {
+        let Some(l) = self.open.remove(&ev.id) else {
             self.fail("幽灵归还(未登记)", format!("id={}", ev.id));
             return;
         };
-        let res = self.ledger.borrow_mut().remove_owned(owner, tier, kind, bytes);
+        let res = self.tiers.remove_owned(l.owner, l.tier, l.kind, l.bytes);
         if let Err(e) = res {
             self.fail("出账失败", format!("id={} {e}", ev.id));
         }
     }
 
-    fn on_move(&mut self, ev: &owl_iface::handle::MoveEvent) {
+    /// 换层(**不注销**:owner/entries 不变;tier 迁移)。
+    /// 部分搬运(片和 ≠ 登记整块字节)= **响亮拒**(不许把"沉了一半"记成"整块下沉")。
+    pub fn on_move(&mut self, ev: &owl_iface::handle::MoveEvent) {
         use owl_iface::handle::MoveDir;
-        let Some((owner, kind, from, bytes)) = self.open.get(&ev.id).copied() else {
+        let Some(l) = self.open.get(&ev.id).cloned() else {
             self.fail("幽灵换层(未登记)", format!("id={}", ev.id));
             return;
         };
-        let to = match (ev.dir, from) {
+        if ev.bytes != 0 && ev.bytes != l.bytes {
+            self.fail(
+                "部分换层(片和 ≠ 登记整块;账本按逻辑块记账)",
+                format!("id={} 片和={} 登记={} name={}", ev.id, ev.bytes, l.bytes, l.name),
+            );
+            return;
+        }
+        let to = match (ev.dir, l.tier) {
             (MoveDir::Out, Tier::Gpu) => Tier::Host,
             (MoveDir::In, Tier::Host) => Tier::Gpu,
             (d, t) => {
@@ -594,11 +800,68 @@ impl owl_iface::handle::AllocLedger for LedgerHandle {
                 return;
             }
         };
-        let res = self.ledger.borrow_mut().move_owned(owner, kind, from, to, bytes);
+        let res = self.tiers.move_owned(l.owner, l.kind, l.tier, to, l.bytes);
         if let Err(e) = res {
             self.fail("换层失败", format!("id={} {e}", ev.id));
             return;
         }
-        self.open.insert(ev.id, (owner, kind, to, bytes));
+        if let Some(m) = self.open.get_mut(&ev.id) {
+            m.tier = to;
+        }
     }
+}
+
+/// **共享账本句柄**(单一真源:client 钩子与 store 自查**共看同一本**)。
+///
+/// 为什么 `Arc<Mutex>` 而不是 `Rc<RefCell>`(2026-10-19 用户裁决):`DeviceClient`
+/// 的 `Send` 是硬约束,且 `/debug/blocks` 的 `face_clone()` 会把句柄真的送进
+/// HTTP 线程 ⇒ `Rc` 在那条路径上是真的 UB。单线程热路径无争用锁 ≈ ns 级。
+pub type SharedLedger = std::sync::Arc<std::sync::Mutex<LedgerBook>>;
+
+/// **建账**(boot 唯一入口;预算只能在这里给一次)。
+pub fn shared_ledger(budget: TierBudget) -> SharedLedger {
+    std::sync::Arc::new(std::sync::Mutex::new(LedgerBook::new(budget)))
+}
+
+/// **加锁取账**:锁中毒 = 有 panic 发生在持账期间(设计上不应发生)⇒
+/// 取回内部数据继续(**不许 panic 级联**),并计数可见(`hook_fail`)。
+pub fn book_lock(cell: &SharedLedger) -> std::sync::MutexGuard<'_, LedgerBook> {
+    let poisoned = cell.is_poisoned();
+    let mut g = match cell.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if poisoned {
+        g.fail("账本锁中毒", "已续用内部数据(计数 +1)".into());
+    }
+    g
+}
+
+/// **事件入口**(`DeviceHandle` 的账本面):薄转发到 [`LedgerBook`]。
+///
+/// 两层锁的分工:**外层**锁的是"事件入口对象"(iface 侧 `LedgerCell` 是
+/// `Arc<Mutex<dyn AllocLedger>>`),**内层**锁的是账本本体(store 自查也要它)。
+/// 两层都只在同步段里短暂持有,绝不跨 await;内层锁持有时不回调任何外部代码。
+pub struct LedgerEntry {
+    book: SharedLedger,
+}
+
+impl owl_iface::handle::AllocLedger for LedgerEntry {
+    fn on_alloc(&mut self, ev: &owl_iface::handle::AllocEvent) {
+        book_lock(&self.book).on_alloc(ev);
+    }
+    fn on_free(&mut self, ev: &owl_iface::handle::FreeEvent) {
+        book_lock(&self.book).on_free(ev);
+    }
+    fn on_move(&mut self, ev: &owl_iface::handle::MoveEvent) {
+        book_lock(&self.book).on_move(ev);
+    }
+}
+
+/// **boot 接线**:账本单元 → `DeviceHandle` 的事件入口(`LedgerCell`)。
+///
+/// 用途:`DeviceHandle::new(client, Some(ledger_entry(&cell)))`,
+/// 同时把 `cell` 交给 `Rel::open`(两边看**同一本账**)。
+pub fn ledger_entry(cell: &SharedLedger) -> owl_iface::handle::LedgerCell {
+    std::sync::Arc::new(std::sync::Mutex::new(LedgerEntry { book: cell.clone() }))
 }

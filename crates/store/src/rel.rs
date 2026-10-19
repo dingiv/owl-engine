@@ -26,7 +26,7 @@ use crate::policy::{AdmissionPolicy, EvictCandidate, EvictPolicy, Leg, LruPolicy
 use crate::state::{SnapDurability, StateStats, StateStore};
 use crate::host::SlotTable;
 use owl_iface::contract::{ConnSlot, SwapPiece};
-use crate::tier::{AssetKind, Tier, TierLedger, TierReport};
+use crate::tier::{AssetKind, Tier, TierReport};
 
 /// KV 腿几何(boot 装配一次;`block_tokens` 本引擎恒 32 —— 设计卷 §3.6.2)。
 ///
@@ -135,6 +135,23 @@ pub struct StoreReport {
     pub host_resident_bytes: usize,
     /// 宿主层空转缓冲字节(真实 RAM;报告必须算上)。
     pub host_free_bytes: usize,
+    /// **事件账**(DeviceHandle 钩子的出借登记;与腿自报互为校验 —— 两独立来源)。
+    pub events: EventBook,
+}
+
+/// **事件账报告**(`LedgerBook` 的出借登记面投影)。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EventBook {
+    /// rank × owner × tier × kind 明细(字节降序)。
+    pub rows: Vec<crate::tier::EventRow>,
+    /// 在借条目数。
+    pub entries: usize,
+    /// 在借总字节。
+    pub bytes: usize,
+    /// 记账失败计数(非零 = 有事件没入账;**不许静默**)。
+    pub hook_fail: u64,
+    /// **逐 rank 在借 id 集**(与块账房做全等门的原料)。
+    pub ids: Vec<(u8, Vec<u64>)>,
 }
 
 /// 关系层门面:两个独立管理器 + 一层关联。
@@ -154,9 +171,12 @@ pub struct Rel {
     pub index: Option<crate::select::MeanKIndex>,
     /// 语义账(状态腿快照/行 + 保留面/弹性面 + **DeviceHandle 事件账**)。
     ///
-    /// `Rc<RefCell<..>>`(2026-10-19 步 2):DeviceHandle 侧的钩子要**与 store 看同一本账**
-    /// (方案甲)⇒ 共享所有权;引擎单线程 ⇒ 无锁。store 自己的读写走 `borrow()/borrow_mut()`。
-    pub ledger: std::rc::Rc<std::cell::RefCell<TierLedger>>,
+    /// `Arc<Mutex<..>>`(2026-10-19 用户裁决):DeviceHandle 侧的钩子要**与 store 看同一本账**
+    /// ⇒ 共享所有权。为何不是方案甲字面的 `Rc<RefCell>`:`DeviceClient` 的 `Send`
+    /// 是硬约束,且 `/debug/blocks` 的 `face_clone()` 会把句柄真的送进 HTTP 线程
+    /// ⇒ `Rc` 在那条路径上是真的 UB。单线程热路径无争用锁 ≈ ns 级。
+    /// store 自己的读写统一走 [`crate::tier::book_lock`]。
+    pub ledger: crate::tier::SharedLedger,
     /// 准入策略(boot 装配)。
     pub policy: AdmissionPolicy,
     /// 活跃 turn 在飞账。
@@ -179,6 +199,7 @@ impl Rel {
         inputs: BudgetInputs,
         policy: AdmissionPolicy,
         kv_cfg: LegConfig,
+        ledger: crate::tier::SharedLedger,
     ) -> StoreResult<Self> {
         if kv_cfg.block_bytes == 0 || kv_cfg.block_tokens == 0 || kv_cfg.slots == 0 {
             return Err(StoreError::Budget(format!(
@@ -209,7 +230,18 @@ impl Rel {
             )));
         }
         let budget = VramBudget::decompose(inputs, policy.gdn_slots)?;
-        let ledger = std::rc::Rc::new(std::cell::RefCell::new(TierLedger::new(budget.tier_budget())));
+        // **账本预算交叉校验**(2026-10-19):账本由 boot 先造(DeviceHandle 要拿着它
+        // 包住装载/捕获期的分配),这里**必须**与预算分解算出的三层预算**逐字相符** ——
+        // 不符 = 两处算式漂了(响亮拒,不是静默采信任何一方)。
+        {
+            let want = budget.tier_budget();
+            let got = crate::tier::book_lock(&ledger).tiers().budget();
+            if got != want {
+                return Err(StoreError::Budget(format!(
+                    "账本预算与分解不符:账本 {got:?} ≠ 分解 {want:?}(boot 的算式与 `BudgetInputs` 漂了)"
+                )));
+            }
+        }
         let state = StateStore::new(policy.gdn_slots, inputs.gdn_row_bytes);
         // 状态腿宿主层:预算 = store host 总量 − KV 腿分片(负数 = 装配错,响亮拒)
         let snap_host_bytes = inputs.host_bytes.checked_sub(kv_cfg.host_bytes).ok_or_else(|| {
@@ -268,7 +300,12 @@ impl Rel {
         let bytes = ix.block_bytes();
         ix.register(block, entries)?;
         // 第 0 刀:索引面 = **缓存归属**(无单会话归属;跨会话共享)
-        self.ledger.borrow_mut().add_owned(crate::tier::Owner::Cache, Tier::Host, AssetKind::Index, bytes)
+        crate::tier::book_lock(&self.ledger).tiers_mut().add_owned(
+            crate::tier::Owner::Cache,
+            Tier::Host,
+            AssetKind::Index,
+            bytes,
+        )
     }
 
     /// 丢一块的索引(出账)。
@@ -279,7 +316,12 @@ impl Rel {
             .ok_or_else(|| StoreError::Invariant("选择层索引未注册".into()))?;
         let bytes = ix.block_bytes();
         ix.drop_block(block)?;
-        self.ledger.borrow_mut().remove_owned(crate::tier::Owner::Cache, Tier::Host, AssetKind::Index, bytes)
+        crate::tier::book_lock(&self.ledger).tiers_mut().remove_owned(
+            crate::tier::Owner::Cache,
+            Tier::Host,
+            AssetKind::Index,
+            bytes,
+        )
     }
 
     /// 索引总字节(0 = 未注册)。
@@ -606,7 +648,7 @@ impl Rel {
         // 而对账在**报告时刻**取腿的权威状态 ⇒ 零漏记风险(腿是唯一真源),
         // 已能回答"谁占着多少"与"逐轮是否爬坡"(泄漏判据)。
         // 事件式记账的收益 = 精确区分"仍被持有"vs"未归还",留作接线后的第二步。
-        let mut tiers = self.ledger.borrow().report();
+        let mut tiers = crate::tier::book_lock(&self.ledger).tiers().report();
         let legs = self.leg_accounting();
         for row in &legs.owners {
             tiers.rows.push(crate::tier::TierRow {
@@ -630,6 +672,17 @@ impl Rel {
             policy: self.evict.name().to_string(),
             host_resident_bytes: self.leg.host_used_bytes(),
             host_free_bytes: self.leg.host_free_bytes(),
+            events: {
+                // 事件账(出借登记;与腿自报互为校验 —— 两个独立来源)
+                let b = crate::tier::book_lock(&self.ledger);
+                EventBook {
+                    rows: b.open_rows(),
+                    entries: b.open_count_rank(None),
+                    bytes: b.open_total_bytes_rank(None),
+                    hook_fail: b.hook_fail(),
+                    ids: b.open_ids_by_rank(),
+                }
+            },
         }
     }
 
@@ -674,11 +727,9 @@ impl Rel {
         crate::tier::TierReport { rows, owners, ..Default::default() }
     }
 
-    /// **账本句柄**(给 `DeviceHandle` 的钩子用;与 `self.ledger` **同一本账**)。
-    ///
-    /// 用途(boot 接线):`DeviceHandle::new(client, Some(Rc::new(RefCell::new(rel.ledger_handle()))))`。
-    pub fn ledger_handle(&self) -> crate::tier::LedgerHandle {
-        crate::tier::LedgerHandle::new(self.ledger.clone())
+    /// **账本单元**(boot 接线:DeviceHandle 的事件入口与 store 的 `Rel` 要**同一本**)
+    pub fn ledger_cell(&self) -> crate::tier::SharedLedger {
+        self.ledger.clone()
     }
 
     /// 腿报告(KV 腿的完整面:槽/缓存/宿主/搬运计数 —— 报告与对账口用)。
@@ -711,6 +762,14 @@ mod tests {
         }
     }
 
+    /// 测试用账本单元(预算 = 入参的 host/disk 总量 —— 与 boot 同式)
+    fn cell_for(i: &BudgetInputs) -> crate::tier::SharedLedger {
+        crate::tier::shared_ledger(crate::tier::TierBudget {
+            host_bytes: i.host_bytes,
+            disk_bytes: i.disk_bytes,
+        })
+    }
+
     fn kv_cfg(slots: usize, cache_cap: usize) -> KvConfig {
         KvConfig {
             slots,
@@ -724,8 +783,10 @@ mod tests {
     }
 
     fn rel(turns: usize) -> Rel {
-        let mut r = Rel::open(inputs(), AdmissionPolicy::new(turns, QueuePolicy::Reject), kv_cfg(64, 32))
-            .expect("装配");
+        let i = inputs();
+        let mut r =
+            Rel::open(i.clone(), AdmissionPolicy::new(turns, QueuePolicy::Reject), kv_cfg(64, 32), cell_for(&i))
+                .expect("装配");
         // 注册池布局(单片段;测试只跑账/计划,不跑真搬运 —— 搬迁在 store_e2e 覆盖)
         r.leg
             .attach_pool(crate::leg::PoolLayout {
@@ -749,19 +810,25 @@ mod tests {
         // 动态池档(无池面兜底):卡级缺项 = 拒
         let mut i = inputs();
         i.weights_bytes = 0;
-        assert!(Rel::open(i, AdmissionPolicy::new(1, QueuePolicy::Reject), kv_cfg(8, 8)).is_err());
+        assert!(Rel::open(i.clone(), AdmissionPolicy::new(1, QueuePolicy::Reject), kv_cfg(8, 8), cell_for(&i)).is_err());
         // 几何非法 = 拒
         assert!(
-            Rel::open(inputs(), AdmissionPolicy::new(1, QueuePolicy::Reject), kv_cfg(0, 8)).is_err()
+            Rel::open(inputs(), AdmissionPolicy::new(1, QueuePolicy::Reject), kv_cfg(0, 8), cell_for(&inputs())).is_err()
         );
         // 每 token 字节与腿几何矛盾 = 拒(同一件事只能有一个入口)
         let mut i2 = inputs();
         i2.kv_bytes_per_token = 4096;
-        assert!(Rel::open(i2, AdmissionPolicy::new(1, QueuePolicy::Reject), kv_cfg(8, 8)).is_err());
+        assert!(Rel::open(i2.clone(), AdmissionPolicy::new(1, QueuePolicy::Reject), kv_cfg(8, 8), cell_for(&i2)).is_err());
         // 页宽与腿几何矛盾 = 拒(A7:地板按页算、链增长也按页 ⇒ 同一把尺)
         let mut i3 = inputs();
         i3.page_tokens = 16;
-        assert!(Rel::open(i3, AdmissionPolicy::new(1, QueuePolicy::Reject), kv_cfg(8, 8)).is_err());
+        assert!(Rel::open(i3.clone(), AdmissionPolicy::new(1, QueuePolicy::Reject), kv_cfg(8, 8), cell_for(&i3)).is_err());
+        // **账本预算不一致 = 响亮拒**(boot 的算式与 BudgetInputs 漂了)
+        let wrong = crate::tier::shared_ledger(crate::tier::TierBudget { host_bytes: 1, disk_bytes: 0 });
+        assert!(
+            Rel::open(inputs(), AdmissionPolicy::new(1, QueuePolicy::Reject), kv_cfg(8, 8), wrong).is_err(),
+            "账本预算与分解不符必须拒"
+        );
     }
 
     /// @cu: 固定池档:池是准入面,卡级可缺项 —— 但"未实测"必须可查(不许静默)。
@@ -772,7 +839,7 @@ mod tests {
         i.weights_bytes = 0;
         i.runtime_floor_bytes = 0;
         i.kv_face_bytes = 64 * BLOCK_BYTES;
-        let r = Rel::open(i, AdmissionPolicy::new(1, QueuePolicy::Reject), kv_cfg(64, 32))
+        let r = Rel::open(i.clone(), AdmissionPolicy::new(1, QueuePolicy::Reject), kv_cfg(64, 32), cell_for(&i))
             .expect("固定池档应能装配");
         assert!(!r.budget().card_measured());
         assert_eq!(r.budget().face_bytes(), 64 * BLOCK_BYTES, "判据面 = 池");

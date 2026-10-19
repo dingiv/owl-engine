@@ -4,26 +4,44 @@
 //! ① **收编所有显存申请** —— engine/models 不再手动碰分配,但 **store 是纯状态机(不做 I/O)**,
 //!    所以"摸显存"的只能是**客户端侧**的咽喉;钩子**挂在客户端**(不许挂到 server:跨线程)。
 //! ② **接口倒置**:[`AllocLedger`] 由 **store 实现**;client 侧只依赖这个 trait
-//!    (方案甲:`Rc<RefCell<dyn AllocLedger>>`,引擎单线程 ⇒ 无锁、无跨线程)。
+//!    (方案甲:`Arc<Mutex<dyn AllocLedger>>`,真 `Send` —— 见 §1.1)。
 //! ③ **命令面**:[`Command`](链式构造)+ [`DeviceHandle::exec`] 单条 / [`DeviceHandle::batch`] 多条
 //!    + [`alloc!`](crate::alloc) / [`free!`](crate::free) 宏。
 //!
 //! # 纪律
 //! - **本模块一行不改 `cuda` 里实现的 [`DeviceClient`]**:这里是**薄转发 + 钩子**;
-//! - **钩子在客户端侧发**(调用者线程 = 引擎线程)⇒ 无跨线程、无锁;
+//! - **钩子在客户端侧发**(调用者线程 = 引擎线程)⇒ 无跨线程、无锁争用;
 //! - **下沉 ≠ 归还**:[`MoveEvent`] 只换层,只有 [`FreeEvent`] 才注销(账本律);
-//! - **不许静默**:钩子失败计入 `hook_fail` 并 WARN;骨架期未接线的命令**响亮拒**(返回结构化错误)。
+//! - **不许静默**:钩子失败计入 `hook_fail`;骨架期未接线的命令**响亮拒**(返回结构化错误)。
 //!
-//! # 骨架期边界(诚实标注)
-//! 本轮只搭架子:`exec/batch` 已接线 `Alloc/AllocUninit/Free/Sync/Launch`;
-//! `Htod/Dtoh/Swap` 的转发待接线(**响亮拒**,不是静默 no-op)。
+//! # 归属与类别上下文(2026-10-19 用户裁决 ②:扩 4 类 + 相位上下文)
+//! `owner`(谁持有:turn/session/cache/system)由**生命周期节点**设(N1/N4/N5);
+//! `class`(哪类资产)由**相位**设(装载=Weight / 捕获=Graph / 池=Pool / 执行=Temp),
+//! 缺省 = [`AssetClass::Unclassified`](**可见**的兜底桶 —— 不许猜、不许谎报)。
+//! 二者都住在**共享上下文**(`Arc<Mutex<Ctx>>`):`face_clone()` 出来的句柄与本体
+//! **同源** ⇒ 节点设一次,全族生效(图族每张图各持一个句柄,逐个设 = 漏设的温床)。
+//!
+//! # 钩子覆盖(2026-10-19 用户裁决 ③:全出生/死亡 + 全等门)
+//! 块**出生** = `alloc` / `alloc_uninit` / `htod` / `htod_on` / `htod_f32`;
+//! 块**死亡** = `free`(成功收口后才销);**换层** = `swap`(Out/In ⇒ 每逻辑块一条 `MoveEvent`);
+//! **图窗**:`graph_begin` 开窗 → 窗内出生的块记在窗里(捕获期后端走 slab 切片 ⇒ 块**随图存活**)
+//! → `graph_end` 成功 ⇒ 挂到 `GraphId` 名下(等 `graph_destroy` 补发归还);
+//! `graph_end` 失败 / `graph_abort` 的销账口径由**后端自述**决定
+//! ([`DeviceClient::window_blocks_auto_reclaimed`](crate::contract::DeviceClient::window_blocks_auto_reclaimed)
+//! 契约三条:CUDA = 整批回收;host mock = 交调用方 free)—— 本层**不猜**:
+//! 后端不回收的场合保留窗与 id,计 `window_unclosed`(可见),由调用方显式 `free` 收。
+//!
+//! **`launch` 不算出生**:输出块 = 实参里最后一个 `Block`(调用方先 `alloc` 再发射;
+//! 服务端 `launch.rs` 只发核,零分配)⇒ 出生只在分配族。
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::collections::BTreeMap;
+use std::future::Future;
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use owl_kernels::contract::{Bytes, Dtype, LaunchMsg};
-
-use crate::contract::{DeviceClient, ModelError};
+use crate::contract::{
+    BlockLedgerRow, Bytes, Connector, DeviceClient, Dtype, FiPlanSpec, GraphId, LaunchMsg,
+    ModelError, PinnedRegion, Shape, SwapDir, SwapPiece, UpChunk, UpStream,
+};
 
 // ============================================================================
 // §1 归属与资产类别(与 store 的 TierLedger 同构;store 侧 impl 时做映射)
@@ -66,6 +84,10 @@ impl Owner {
 }
 
 /// **资产类别**(中性名;与 store 的 `AssetKind` 同构,映射在 store 侧做)。
+///
+/// 前八类是**store 自管面**的词表(KV/地板/弹性/快照/行/元数据/索引/临时);
+/// 后四类是 2026-10-19 用户裁决新增的**转发面**词表 —— 裸 `DeviceClient` 的
+/// 分配没有类别参数,靠相位上下文补;缺省落 `Unclassified`(可见兜底)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AssetClass {
     /// attention 历史块(可驱逐缓存面)。
@@ -84,10 +106,38 @@ pub enum AssetClass {
     Index,
     /// **临时工作区**(chunk 激活面 / plan sync 缓冲 / eager 回退 / logits 中转)。
     Temp,
+    /// **权重与装载产物**(常驻;装载相位)。
+    Weight,
+    /// **图 slab 与图内自产块**(随图存活;捕获窗)。
+    Graph,
+    /// **池骨架**(KV/GDN/快照/草稿池的容器块;boot 期)。
+    Pool,
+    /// **未分类兜底**(尚未接线相位的分配;**可见** —— 它的字节是迁移进度指标)。
+    Unclassified,
+}
+
+impl AssetClass {
+    /// 短名(报告/日志)。
+    pub fn label(&self) -> &'static str {
+        match self {
+            AssetClass::KvBlock => "kv",
+            AssetClass::Floor => "floor",
+            AssetClass::Elastic => "elastic",
+            AssetClass::Snap => "snap",
+            AssetClass::Row => "row",
+            AssetClass::Meta => "meta",
+            AssetClass::Index => "index",
+            AssetClass::Temp => "temp",
+            AssetClass::Weight => "weight",
+            AssetClass::Graph => "graph",
+            AssetClass::Pool => "pool",
+            AssetClass::Unclassified => "unclassified",
+        }
+    }
 }
 
 // ============================================================================
-// §2 账本接口(由 store 实现;client 只依赖它 —— 依赖倒置)
+// §1.1 账本接口(由 store 实现;client 只依赖它 —— 依赖倒置)
 // ============================================================================
 
 /// **分配事件**(出借;`id` = 设备块 id,与 server 块账房同源)。
@@ -100,12 +150,15 @@ pub struct AllocEvent {
     pub class: AssetClass,
     /// 归属(由 [`DeviceHandle`] 的 owner 上下文填)。
     pub owner: Owner,
+    /// **设备序(TP 两 rank 共用一本账时区分卡)**;单卡恒 0。
+    pub rank: u8,
 }
 
 /// **归还事件**(注销)。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FreeEvent {
     pub id: u64,
+    /// 字节(事件可留 0 —— 账本按**出借登记**扣,登记才是权威)。
     pub bytes: usize,
 }
 
@@ -119,6 +172,10 @@ pub enum MoveDir {
 }
 
 /// **换层事件**:只换 tier,**不改 owner、不注销**(账本律:下沉 ≠ 归还)。
+///
+/// `bytes` = 本次搬运的**逻辑块全量字节**(引擎按块聚合后发一条;
+/// 服务端 `swap` 是多片命令,片在 handle 侧聚合)。部分搬运(片和 ≠ 登记的
+/// 整块字节)由账本**响亮拒**,不许把"沉了一半"记成"整块下沉"。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MoveEvent {
     pub id: u64,
@@ -132,7 +189,10 @@ pub struct MoveEvent {
 /// 1. **下沉 ≠ 归还**:`on_move` 只换层;只有 `on_free`/逐出才注销;
 /// 2. **双持与幽灵归还响亮拒**:同 id 重复 `on_alloc` / 未登记 `on_free` = 不变量违反;
 /// 3. **失败必留痕**:实现侧记 `hook_fail` 计数 + 一条 WARN,**不得**让记账失败中断主流程。
-pub trait AllocLedger {
+///
+/// `Send` = 硬要求(见 [`LedgerCell`]):账本进 `Arc<Mutex<..>>`,而
+/// [`DeviceClient`] 自身就是 `Send`(句柄要能随 face 走)。
+pub trait AllocLedger: Send {
     /// 出借(登记 + 入账)。
     fn on_alloc(&mut self, ev: &AllocEvent);
     /// 归还(注销 + 出账)。
@@ -141,8 +201,16 @@ pub trait AllocLedger {
     fn on_move(&mut self, ev: &MoveEvent);
 }
 
+/// **账本单元**(共享句柄;**同一本账**被 client 钩子与 store 自查共看)。
+///
+/// 为什么是 `Arc<Mutex>` 而不是方案甲字面的 `Rc<RefCell>`(2026-10-19 用户裁决):
+/// [`DeviceClient`] 的 `Send` 是**硬约束**,而 `/debug/blocks` 的 `face_clone()`
+/// 会把句柄**真的**送进 HTTP 线程 ⇒ `Rc` 在那条路径上是真的 UB,不是理论问题。
+/// 单线程热路径上无争用锁 ≈ ns 级(相对一次分配/一发命令的 µs 可忽略)。
+pub type LedgerCell = Arc<Mutex<dyn AllocLedger>>;
+
 // ============================================================================
-// §3 命令面(Command + 链式构造)
+// §2 命令面(Command + 链式构造)
 // ============================================================================
 
 /// 三维尺寸(grid/block)。
@@ -170,10 +238,7 @@ pub enum Command {
     /// 归还(→ server 归池;复用即在此层发生)。
     Free { ids: Vec<u64> },
     /// 核发射(链式:`Command::Launch(msg).grid(..).block(..).args(..)`)。
-    Launch {
-        msg: LaunchMsg,
-        name: String,
-    },
+    Launch { msg: LaunchMsg, name: String },
     /// 流同步。
     Sync,
     /// 设备 → 宿主(下沉)。骨架期**未接线**(响亮拒)。
@@ -252,11 +317,15 @@ impl Command {
 
 /// 单条命令的执行结果。
 ///
-/// ⚠️ `Launch` 也**产出块**(输出块)—— 契约里 `launch` 的返回就是 `Bytes`,
+/// ⚠️ `Launch` 也**产出块句柄**(输出块)—— 契约里 `launch` 的返回就是 `Bytes`,
 /// 不许丢(全仓律 #1)⇒ 统一走 [`Outcome::Buf`]。
+///
+/// 注意:**产出句柄 ≠ 块出生**。服务端 `launch.rs` 的输出块 = 实参里最后一个
+/// `Block`(调用方先 `alloc` 再发射)⇒ 记账意义上的"出生"只发生在分配族
+/// ([`AllocEvent`] 只在 `alloc/alloc_uninit/htod` 系上发)。
 #[derive(Clone, Debug)]
 pub enum Outcome {
-    /// 产出一个设备块(`Alloc` / `AllocUninit` / `Launch` 的输出块)。
+    /// 产出一个设备块句柄(`Alloc` / `AllocUninit` / `Launch` 的输出块)。
     Buf(Bytes),
     /// 无返回值(`Free` / `Sync`)。
     Done,
@@ -279,6 +348,119 @@ impl BatchOutcome {
 }
 
 // ============================================================================
+// §3 共享上下文(owner/class/图窗/失败计数)
+// ============================================================================
+
+/// **捕获窗**(`graph_begin` → `graph_end`):窗内出生的块随图存活,
+/// 服务端在 `graph_destroy`/`graph_abort` 时**整批移出块账房**(客户端不发 `free`)
+/// ⇒ 本窗登记就是"图销毁时要补发的归还清单"。
+#[derive(Default, Clone, Debug)]
+struct Window {
+    /// 窗内出生、**尚未归还**的块 id(客户端归还过的会被摘掉)。
+    ids: Vec<u64>,
+    /// 窗内发射数(镜像服务端 `cap.nodes` 空判据:零发射 ⇒ 空窗,服务端整批回收)。
+    nodes: u64,
+}
+
+/// 句柄的**共享上下文**(所有克隆同源:face_clone / loader_faces 出来的句柄
+/// 与本体看同一份归属、同一条窗栈、同一个失败计数)。
+struct Ctx {
+    owner: Owner,
+    class: AssetClass,
+    /// 本引擎的设备序(单卡 0;TP rank1 = 1)—— 事件按它分组,卡不混账。
+    dev_rank: u8,
+    /// 本上下文发出的事件条数(诊断 + `adopt_ledger` 的 boot 期判据;
+    /// 放共享上下文 ⇒ 克隆句柄的发事件也算“本引擎已开始记账”)。
+    events_sent: u64,
+    hook_fail: u64,
+    /// 捕获窗栈(服务端禁嵌套;栈式写法对"误嵌套"也天然正确)。
+    windows: Vec<Window>,
+    /// `graph_end` 成功后按图存档的"待补归还"清单(`graph_destroy` 时销)。
+    graphs: BTreeMap<GraphId, Vec<u64>>,
+    /// 服务端留尸计数(窗失败且窗内有发射 ⇒ 服务端不回收;**可见**不静默)。
+    window_unclosed: u64,
+}
+
+impl Ctx {
+    fn new() -> Self {
+        Self {
+            owner: Owner::default_owner(),
+            class: AssetClass::Unclassified,
+            dev_rank: 0,
+            events_sent: 0,
+            hook_fail: 0,
+            windows: Vec::new(),
+            graphs: BTreeMap::new(),
+            window_unclosed: 0,
+        }
+    }
+
+    /// 记账失败:计数 + 一条裸日志(iface 无日志依赖;机读面 = `hook_fail`)。
+    fn bump(&mut self, what: &str, detail: String) {
+        self.hook_fail = self.hook_fail.saturating_add(1);
+        eprintln!("[device-handle] {what}:{detail}");
+    }
+}
+
+/// **归属/类别作用域**(RAII:出作用域自动还原;装载/捕获/池/执行相位用)。
+///
+/// 为什么用 RAII 而不是"设完记得还原":相位里**任何**早退(`?`)都会让手工还原
+/// 漏掉 ⇒ 后续分配归错账(比不记账更坏)。
+pub struct CtxScope {
+    /// 持有共享单元本身(**不借句柄**)—— 否则"作用域内还要 &mut 用句柄"
+    /// 会撞借用检查(实测:`face.scoped_ctx(..)` + `StatePool::alloc(&mut face, ..)`)。
+    /// `None` = 空作用域(无账本的裸 client:没有归属可谈)。
+    ctx: Option<Arc<Mutex<Ctx>>>,
+    saved: (Owner, AssetClass),
+}
+
+impl CtxScope {
+    /// 空作用域(裸 client 的缺省实现:进出都不改任何东西 —— 不是"静默失败",
+    /// 而是**无账本 ⇒ 无归属可谈**)。
+    pub fn noop() -> Self {
+        Self { ctx: None, saved: (Owner::default_owner(), AssetClass::Unclassified) }
+    }
+}
+
+impl Drop for CtxScope {
+    fn drop(&mut self) {
+        let Some(ctx) = self.ctx.as_ref() else { return };
+        let mut c = lock_ctx(ctx);
+        c.owner = self.saved.0;
+        c.class = self.saved.1;
+    }
+}
+
+/// 上下文加锁(**锁中毒不许 panic 级联**:取回内层数据 + 计数可见)。
+fn lock_ctx(m: &Mutex<Ctx>) -> MutexGuard<'_, Ctx> {
+    let poisoned = m.is_poisoned();
+    let mut g = match m.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if poisoned {
+        g.bump("ctx-lock", "上下文锁中毒(已续用内部数据)".into());
+    }
+    g
+}
+
+/// 按块聚合 `swap` 的片段 ⇒ 每逻辑块一条 [`MoveEvent`](整块下沉/回加载)。
+///
+/// 为什么在客户端聚合:服务端 `swap` 是**多片一条命令**(一个逻辑块 = 层数 × 2 片),
+/// 而账本是按**逻辑块**记账的(一条资产一行)⇒ 片必须在进账前合成块。
+fn swap_moves(dir: SwapDir, pieces: &[SwapPiece]) -> Vec<MoveEvent> {
+    let mut by_block: BTreeMap<u64, usize> = BTreeMap::new();
+    for p in pieces {
+        *by_block.entry(p.block).or_insert(0) += p.len;
+    }
+    let d = match dir {
+        SwapDir::Out => MoveDir::Out,
+        SwapDir::In => MoveDir::In,
+    };
+    by_block.into_iter().map(|(id, bytes)| MoveEvent { id, bytes, dir: d }).collect()
+}
+
+// ============================================================================
 // §4 DeviceHandle:薄转发 + 钩子 + 命令面
 // ============================================================================
 
@@ -286,34 +468,105 @@ impl BatchOutcome {
 ///
 /// - `ledger = None` ⇒ **纯转发**(迁移态:零行为变化,便于灰度);
 /// - `ledger = Some(..)` ⇒ 每次分配/归还/换层发事件(客户端侧,同线程);
-/// - `owner` = 当前归属上下文(由生命周期节点设置:N1/N4/N5)。
+/// - `owner`/`class` = **共享**归属与类别上下文(生命周期节点 / 相位设置)。
 pub struct DeviceHandle<D: DeviceClient> {
     inner: D,
-    ledger: Option<Rc<RefCell<dyn AllocLedger>>>,
-    owner: Owner,
-    /// 记账失败计数(**不许静默**:失败也看得见)。
-    hook_fail: u64,
+    ledger: Option<LedgerCell>,
+    ctx: Arc<Mutex<Ctx>>,
 }
 
 impl<D: DeviceClient> DeviceHandle<D> {
     /// 构造(唯一入口)。`ledger = None` = 纯转发(迁移态)。
-    pub fn new(inner: D, ledger: Option<Rc<RefCell<dyn AllocLedger>>>) -> Self {
-        Self { inner, ledger, owner: Owner::System, hook_fail: 0 }
+    pub fn new(inner: D, ledger: Option<LedgerCell>) -> Self {
+        Self { inner, ledger, ctx: Arc::new(Mutex::new(Ctx::new())) }
     }
 
+    // ── 上下文面(节点/相位调;`&self` 即可 —— 内部共享可变)──────────────
+
     /// **归属上下文**(生命周期节点调用:N1 `Turn(t)` / N5 `Session(s)` / N4 复位 `System`)。
-    pub fn set_owner(&mut self, o: Owner) {
-        self.owner = o;
+    pub fn set_owner(&self, o: Owner) {
+        self.ctx().owner = o;
     }
 
     /// 当前归属。
     pub fn owner(&self) -> Owner {
-        self.owner
+        self.ctx().owner
+    }
+
+    /// **类别上下文**(相位设置:装载=Weight / 捕获=Graph / 池=Pool / 执行=Temp)。
+    pub fn set_class(&self, c: AssetClass) {
+        self.ctx().class = c;
+    }
+
+    /// 当前类别。
+    pub fn class(&self) -> AssetClass {
+        self.ctx().class
+    }
+
+    /// **设备序**(TP:rank1 的 boot 装配在**任何分配之前**调一次;单卡不用)。
+    pub fn set_dev_rank(&self, rank: u8) {
+        self.ctx().dev_rank = rank;
+    }
+
+    /// 当前设备序。
+    pub fn dev_rank(&self) -> u8 {
+        self.ctx().dev_rank
+    }
+
+    /// **boot 期账本接管**(TP:两 rank 必须写**同一本**账)。
+    ///
+    /// 判据 = 本句柄**尚未发过任何事件**(发过就不是 boot 期了)；违反 ⇒ 响亮拒
+    /// (接管会把已有事件丢进孤儿账 —— 静默丢账比拒更坏)。
+    pub fn adopt_ledger(&mut self, ledger: LedgerCell) -> Result<(), ModelError> {
+        let sent = self.ctx().events_sent;
+        if sent != 0 {
+            return Err(ModelError::Msg(format!(
+                "adopt_ledger: 本引擎已发过 {sent} 条事件,只允许 boot 期(零事件)接管                  —— 接管会把已有事件丢进孤儿账(静默丢账比拒更坏)"
+            )));
+        }
+        self.ledger = Some(ledger);
+        Ok(())
+    }
+
+    /// **作用域化设置**(RAII 还原;相位代码用这个,不要手工 set/还原)。
+    pub fn scoped_ctx(&self, owner: Owner, class: AssetClass) -> CtxScope {
+        let saved = {
+            let mut c = self.ctx();
+            let saved = (c.owner, c.class);
+            c.owner = owner;
+            c.class = class;
+            saved
+        };
+        CtxScope { ctx: Some(self.ctx.clone()), saved }
     }
 
     /// 记账失败计数(诊断面;非零 = 有钩子调用失败过)。
     pub fn hook_fail(&self) -> u64 {
-        self.hook_fail
+        self.ctx().hook_fail
+    }
+
+    /// **诊断三元组** `(hook_fail, window_unclosed, 窗内未归还块数)`。
+    ///
+    /// ⚠️ 三条读数**必须各自落变量**:元组表达式里的临时 guard 活到**语句末**
+    /// (不是子表达式末)⇒ 直接写 `(self.hook_fail(), self.window_unclosed(), ..)`
+    /// 会在第二次取锁时**自锁死**(std Mutex 不可重入;实测踩到过)。
+    pub fn ledger_probe(&self) -> (u64, u64, usize) {
+        let hf = self.hook_fail();
+        let wu = self.window_unclosed();
+        let owb = self.open_window_blocks();
+        (hf, wu, owb)
+    }
+
+    /// **窗未收次数**(诊断面;非零 = 有窗收尾时去向未定,见 [`Window`])。
+    pub fn window_unclosed(&self) -> u64 {
+        self.ctx().window_unclosed
+    }
+
+    /// 当前捕获窗内**尚未归还**的块数(诊断面;非 0 且非捕获期 = 有图未退休)。
+    pub fn open_window_blocks(&self) -> usize {
+        let c = self.ctx();
+        c.windows.iter().map(|w| w.ids.len()).sum::<usize>()
+            + c.graphs.values().map(|v| v.len()).sum::<usize>()
     }
 
     /// 只读直通(查询类不走命令面、不记账)。
@@ -325,6 +578,8 @@ impl<D: DeviceClient> DeviceHandle<D> {
     pub fn client_mut(&mut self) -> &mut D {
         &mut self.inner
     }
+
+    // ── 命令面 ──────────────────────────────────────────────────────────
 
     /// **单条命令**([`Self::batch`] 的特例:实现单源)。
     pub async fn exec(&mut self, cmd: Command) -> Result<Outcome, ModelError> {
@@ -361,7 +616,7 @@ impl<D: DeviceClient> DeviceHandle<D> {
             outcomes.push(r);
         }
         // 收口:入账(失败条已在上方被拦 ⇒ 这里全是成功事件)
-        self.commit_events(&events, &frees, &moves);
+        self.send_events(&events, &frees, &moves);
         Ok(BatchOutcome { outcomes, first_err, segments })
     }
 
@@ -371,29 +626,17 @@ impl<D: DeviceClient> DeviceHandle<D> {
         cmd: Command,
         events: &mut Vec<AllocEvent>,
         frees: &mut Vec<FreeEvent>,
-        _moves: &mut Vec<MoveEvent>, // 骨架期无命令产生 MoveEvent(Htod/Dtoh 待接线)
+        _moves: &mut Vec<MoveEvent>, // 命令面无换层命令(swap 走 DeviceClient 转发)
     ) -> Result<Outcome, ModelError> {
         match cmd {
             Command::Alloc { class, dtype, elems, name } => {
                 let b = self.inner.alloc(dtype, elems, &name).await?;
-                events.push(AllocEvent {
-                    id: b.id,
-                    bytes: b.len * dtype.size_bytes(),
-                    name,
-                    class,
-                    owner: self.owner,
-                });
+                self.note_birth(&b, elems * dtype.size_bytes(), class, &name, events);
                 Ok(Outcome::Buf(b))
             }
             Command::AllocUninit { class, dtype, elems, name } => {
                 let b = self.inner.alloc_uninit(dtype, elems, &name).await?;
-                events.push(AllocEvent {
-                    id: b.id,
-                    bytes: b.len * dtype.size_bytes(),
-                    name,
-                    class,
-                    owner: self.owner,
-                });
+                self.note_birth(&b, elems * dtype.size_bytes(), class, &name, events);
                 Ok(Outcome::Buf(b))
             }
             Command::Free { ids } => {
@@ -401,11 +644,12 @@ impl<D: DeviceClient> DeviceHandle<D> {
                 for id in ids {
                     // 字节数在账本侧反查(FreeEvent 只带 id);此处留 0 = 由账本按登记扣
                     frees.push(FreeEvent { id, bytes: 0 });
+                    self.untrack(id);
                 }
                 Ok(Outcome::Done)
             }
             Command::Launch { msg, .. } => {
-                // 输出块不许丢(律 #1):原样带出
+                // 输出块不许丢(律 #1):原样带出。**不算出生**(块 = 实参里的 Block)
                 Ok(Outcome::Buf(self.inner.launch(msg).await?))
             }
             Command::Sync => {
@@ -422,44 +666,548 @@ impl<D: DeviceClient> DeviceHandle<D> {
         }
     }
 
-    /// 收口入账(钩子调用点;**失败必须可见**,但不中断主流程)。
-    fn commit_events(
-        &mut self,
-        events: &[AllocEvent],
-        frees: &[FreeEvent],
-        moves: &[MoveEvent],
+    // ── 钩子(全部同步短锁;绝不跨 await 持锁)────────────────────────────
+
+    fn ctx(&self) -> MutexGuard<'_, Ctx> {
+        lock_ctx(&self.ctx)
+    }
+
+    /// 出生记账:事件入账 + 记进当前捕获窗(图销毁时整批补发归还)。
+    fn note_birth(
+        &self,
+        b: &Bytes,
+        bytes: usize,
+        class: AssetClass,
+        name: &str,
+        sink: &mut Vec<AllocEvent>,
     ) {
-        let Some(ledger) = self.ledger.clone() else { return }; // 纯转发态
-        let mut l = match ledger.try_borrow_mut() {
-            Ok(g) => g,
-            Err(_) => {
-                // 重入 = 实现侧违约(设计卷 §十 风险 1);响亮计数,不 panic
-                self.hook_fail += 1;
-                // iface 无日志依赖 ⇒ 裸 eprintln(机读面 = `hook_fail` 计数)
-                eprintln!(
-                    "[device-handle] 账本借用重入(实现侧违约)⇒ 本批 {} 条事件未入账",
-                    events.len() + frees.len() + moves.len()
-                );
-                return;
-            }
+        let (owner, rank, in_window) = {
+            let c = self.ctx();
+            (c.owner, c.dev_rank, !c.windows.is_empty())
         };
-        for ev in events {
-            l.on_alloc(ev);
+        // **窗内出生 ⇒ Graph 类**(服务端捕获期恒走 `carve_block`,块随图存活;
+        // 这不是猜测而是机制事实 —— 窗内不可能出 Owned 块)。
+        let class = if in_window { AssetClass::Graph } else { class };
+        sink.push(AllocEvent { id: b.id, bytes, name: name.to_string(), class, owner, rank });
+        let mut c = self.ctx();
+        if let Some(w) = c.windows.last_mut() {
+            w.ids.push(b.id);
         }
-        for ev in frees {
-            l.on_free(ev);
+    }
+
+    /// 归还记账:从捕获窗/图存档里摘掉(它们只在**未归还**时才需要补发)。
+    fn untrack(&self, id: u64) {
+        let mut c = self.ctx();
+        for w in c.windows.iter_mut() {
+            w.ids.retain(|x| *x != id);
         }
-        for ev in moves {
-            l.on_move(ev);
+        for v in c.graphs.values_mut() {
+            v.retain(|x| *x != id);
         }
+        c.graphs.retain(|_, v| !v.is_empty());
+    }
+
+    /// 窗内发射计数(镜像服务端 `cap.nodes`:零发射 ⇒ 空窗 ⇒ 服务端整批回收)。
+    fn note_node(&self) {
+        let mut c = self.ctx();
+        if let Some(w) = c.windows.last_mut() {
+            w.nodes += 1;
+        }
+    }
+
+    /// 发事件(客户端侧;**短锁**,绝不跨 await)。
+    ///
+    /// 锁中毒 = 有 panic 发生在持账期间(设计上不应发生):取回内层数据继续,
+    /// 并**计数可见**(不许静默,也不许 panic 级联)。
+    fn send_events(&self, births: &[AllocEvent], frees: &[FreeEvent], moves: &[MoveEvent]) {
+        if births.is_empty() && frees.is_empty() && moves.is_empty() {
+            return;
+        }
+        let Some(cell) = self.ledger.as_ref() else { return }; // 纯转发态
+        let poisoned = cell.is_poisoned();
+        {
+            // 借用范围收在块内 ⇒ 绝不跨 await(本函数同步)
+            let mut guard = match cell.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            for ev in births {
+                guard.on_alloc(ev);
+            }
+            for ev in frees {
+                guard.on_free(ev);
+            }
+            for ev in moves {
+                guard.on_move(ev);
+            }
+        }
+        let n = (births.len() + frees.len() + moves.len()) as u64;
+        {
+            let mut c = self.ctx();
+            c.events_sent = c.events_sent.saturating_add(n);
+            if poisoned {
+                c.bump("ledger-lock", "事件入口锁中毒(已续用内部数据)".into());
+            }
+        }
+    }
+
+    /// 补发归还(图窗整批回收:abort / 空窗失败 / graph_destroy)。
+    fn emit_free(&self, ids: &[u64]) {
+        if ids.is_empty() {
+            return;
+        }
+        let frees: Vec<FreeEvent> = ids.iter().map(|id| FreeEvent { id: *id, bytes: 0 }).collect();
+        self.send_events(&[], &frees, &[]);
+    }
+
+}
+
+// ============================================================================
+// §5 `DeviceClient` 实现:薄转发(39 法)+ 出生/死亡/换层/图窗钩子
+// ============================================================================
+//
+// **纪律**:所有方法一律**显式转发**到 `self.inner` —— 绝不用 trait 缺省实现。
+// 缺省实现会**静默换语义**(例:`alloc_uninit` 缺省 = 委托 `alloc` ⇒ 捕获窗内
+// 多烙 memset 节点;`htod_on` 缺省 = 退化 H2D 流 ⇒ 顺序义务错位)。
+impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
+    // ── 上下文面(泛型面:引擎内核按 `D: DeviceClient` 写,拿不到具名句柄类型
+    //    ⇒ 这三条必须在 trait 上;具名的 [`DeviceHandle::set_owner`] 等是同一操作
+    //    的具名入口,行为逐字一致)────────────────────────────────────
+    fn set_owner(&self, o: Owner) {
+        self.ctx().owner = o;
+    }
+
+    fn set_class(&self, c: AssetClass) {
+        self.ctx().class = c;
+    }
+
+    fn scoped_ctx(&self, o: Owner, c: AssetClass) -> CtxScope {
+        DeviceHandle::scoped_ctx(self, o, c)
+    }
+
+    fn ledger_probe(&self) -> (u64, u64, usize) {
+        DeviceHandle::ledger_probe(self)
+    }
+
+    fn op_env(&self) -> Option<owl_kernels::driver::OpEnv> {
+        self.inner.op_env()
+    }
+
+    fn device_kernels(&self) -> bool {
+        self.inner.device_kernels()
+    }
+
+    fn graph_begin(&mut self) -> impl Future<Output = Result<(), ModelError>> + Send {
+        async move {
+            self.inner.graph_begin().await?;
+            self.ctx().windows.push(Window::default());
+            Ok(())
+        }
+    }
+
+    fn graph_end(&mut self) -> impl Future<Output = Result<GraphId, ModelError>> + Send {
+        async move {
+            let r = self.inner.graph_end().await;
+            let win = self.ctx().windows.pop();
+            match (r, win) {
+                (Ok(gid), Some(w)) => {
+                    if !w.ids.is_empty() {
+                        self.ctx().graphs.entry(gid).or_default().extend(w.ids);
+                    }
+                    Ok(gid)
+                }
+                (Ok(gid), None) => Ok(gid), // 窗栈空(内层自管捕获;本层不记账)
+                (Err(e), Some(w)) => {
+                    // **窗失败 ⇒ 不猜**:块去向是后端知识(见 `window_blocks_auto_reclaimed` 契约)。
+                    // 唯一可判的空窗例外(契约③:后端已整批回收且窗已关)才销账;
+                    // 其余情况**保留窗与 id**并计数可见 —— 后续 `graph_abort` 成功
+                    // (契约①)或调用方显式 `free` 才是真销账点。
+                    let auto = self.inner.window_blocks_auto_reclaimed();
+                    if auto && w.nodes == 0 {
+                        self.emit_free(&w.ids);
+                    } else {
+                        let n = w.ids.len();
+                        self.ctx().window_unclosed += 1;
+                        if n > 0 {
+                            eprintln!(
+                                "[device-handle] 捕获窗失败(窗内发射 {}):{n} 块去向由后端定,先不销账(graph_end 错:{e})",
+                                w.nodes
+                            );
+                        }
+                        // 窗放回栈顶(调用方的 abort/显式 free 才收)
+                        self.ctx().windows.push(w);
+                    }
+                    Err(e)
+                }
+                (Err(e), None) => Err(e),
+            }
+        }
+    }
+
+    fn graph_launch(&mut self, graph: GraphId) -> impl Future<Output = Result<(), ModelError>> + Send {
+        self.note_node();
+        self.inner.graph_launch(graph)
+    }
+
+    fn fi_plan_sync(&mut self, spec: FiPlanSpec) -> impl Future<Output = Result<(), ModelError>> + Send {
+        self.inner.fi_plan_sync(spec)
+    }
+
+    fn graph_abort(&mut self) -> impl Future<Output = Result<(), ModelError>> + Send {
+        async move {
+            let r = self.inner.graph_abort().await;
+            // 同律:scrutinee 的临时 guard 活过整个 match ⇒ 先落变量再 match
+            let popped = self.ctx().windows.pop();
+            match popped {
+                // 契约①:`abort` 成功 ⇒ 后端整批回收 ⇒ 补发归还
+                Some(w) if r.is_ok() => {
+                    if self.inner.window_blocks_auto_reclaimed() {
+                        self.emit_free(&w.ids);
+                    }
+                }
+                // `abort` 失败 = 窗已不在(或收尾失败):不销账、放回、计数可见
+                Some(w) => {
+                    self.ctx().window_unclosed += 1;
+                    if !w.ids.is_empty() {
+                        eprintln!(
+                            "[device-handle] graph_abort 失败:{}(窗未收,{} 块去向未定)",
+                            r.as_ref().err().map(|e| e.to_string()).unwrap_or_default(),
+                            w.ids.len()
+                        );
+                    }
+                    self.ctx().windows.push(w);
+                }
+                None => {}
+            }
+            r
+        }
+    }
+
+    fn graph_destroy(&mut self, graph: GraphId) -> impl Future<Output = Result<(), ModelError>> + Send {
+        async move {
+            let r = self.inner.graph_destroy(graph).await;
+            if r.is_ok() {
+                // 契约②:图退休 ⇒ 后端把本图自产块整批移出账房 ⇒ 补发归还
+                let ids = self.ctx().graphs.remove(&graph).unwrap_or_default();
+                if self.inner.window_blocks_auto_reclaimed() {
+                    self.emit_free(&ids);
+                }
+            }
+            r
+        }
+    }
+
+    fn alloc(
+        &mut self,
+        dtype: Dtype,
+        elems: usize,
+        name: &str,
+    ) -> impl Future<Output = Result<Bytes, ModelError>> + Send {
+        async move {
+            let b = self.inner.alloc(dtype, elems, name).await?;
+            let mut ev = Vec::new();
+            // 上下文读**先落变量**:实参里的 `self.ctx()` 临时 guard 会活到语句末,
+            // 而 `note_birth` 内部还要再锁同一把 —— std Mutex 不可重入 ⇒ 自锁死。
+            let class = self.ctx().class;
+            self.note_birth(&b, elems * dtype.size_bytes(), class, name, &mut ev);
+            self.send_events(&ev, &[], &[]);
+            Ok(b)
+        }
+    }
+
+    fn alloc_uninit(
+        &mut self,
+        dtype: Dtype,
+        elems: usize,
+        name: &str,
+    ) -> impl Future<Output = Result<Bytes, ModelError>> + Send {
+        async move {
+            let b = self.inner.alloc_uninit(dtype, elems, name).await?;
+            let mut ev = Vec::new();
+            // 上下文读**先落变量**:实参里的 `self.ctx()` 临时 guard 会活到语句末,
+            // 而 `note_birth` 内部还要再锁同一把 —— std Mutex 不可重入 ⇒ 自锁死。
+            let class = self.ctx().class;
+            self.note_birth(&b, elems * dtype.size_bytes(), class, name, &mut ev);
+            self.send_events(&ev, &[], &[]);
+            Ok(b)
+        }
+    }
+
+    fn htod(
+        &mut self,
+        dtype: Dtype,
+        shape: &Shape,
+        src: &[u8],
+        name: &str,
+    ) -> impl Future<Output = Result<Bytes, ModelError>> + Send {
+        async move {
+            let b = self.inner.htod(dtype, shape, src, name).await?;
+            let mut ev = Vec::new();
+            let class = self.ctx().class;
+            self.note_birth(&b, src.len(), class, name, &mut ev);
+            self.send_events(&ev, &[], &[]);
+            Ok(b)
+        }
+    }
+
+    fn htod_on(
+        &mut self,
+        stream: UpStream,
+        dtype: Dtype,
+        shape: &Shape,
+        src: &[u8],
+        name: &str,
+    ) -> impl Future<Output = Result<Bytes, ModelError>> + Send {
+        async move {
+            let b = self.inner.htod_on(stream, dtype, shape, src, name).await?;
+            let mut ev = Vec::new();
+            let class = self.ctx().class;
+            self.note_birth(&b, src.len(), class, name, &mut ev);
+            self.send_events(&ev, &[], &[]);
+            Ok(b)
+        }
+    }
+
+    fn dtoh(&mut self, b: &Bytes, out: &mut [u8]) -> impl Future<Output = Result<(), ModelError>> + Send {
+        self.inner.dtoh(b, out)
+    }
+
+    fn dtoh_at(
+        &mut self,
+        b: &Bytes,
+        off_bytes: usize,
+        out: &mut [u8],
+    ) -> impl Future<Output = Result<(), ModelError>> + Send {
+        self.inner.dtoh_at(b, off_bytes, out)
+    }
+
+    fn dtoh_batch(
+        &mut self,
+        pieces: &[(&Bytes, usize, usize)],
+    ) -> impl Future<Output = Result<Vec<u8>, ModelError>> + Send {
+        self.inner.dtoh_batch(pieces)
+    }
+
+    fn htod_batch(
+        &mut self,
+        writes: &[(&Bytes, usize, &[u8])],
+    ) -> impl Future<Output = Result<(), ModelError>> + Send {
+        // **不算出生**:写进已存在的块(dst 早已在账上)
+        self.inner.htod_batch(writes)
+    }
+
+    fn swap(
+        &mut self,
+        dir: SwapDir,
+        pieces: &[SwapPiece],
+        conn: Box<dyn Connector + Send>,
+    ) -> impl Future<Output = Result<Box<dyn Connector + Send>, ModelError>> + Send {
+        let moves = swap_moves(dir, pieces);
+        async move {
+            let conn = self.inner.swap(dir, pieces, conn).await?;
+            // 换层 ≠ 归还:只报 tier 迁移(失败不发事件 —— 整条 swap 要么全成要么响亮失败)
+            self.send_events(&[], &[], &moves);
+            Ok(conn)
+        }
+    }
+
+    fn launch(&mut self, msg: LaunchMsg) -> impl Future<Output = Result<Bytes, ModelError>> + Send {
+        self.note_node();
+        self.inner.launch(msg)
+    }
+
+    fn sync(&mut self) -> impl Future<Output = Result<(), ModelError>> + Send {
+        self.inner.sync()
+    }
+
+    fn free(&mut self, ids: &[u64]) -> impl Future<Output = Result<(), ModelError>> + Send {
+        async move {
+            self.inner.free(ids).await?;
+            let frees: Vec<FreeEvent> = ids.iter().map(|id| FreeEvent { id: *id, bytes: 0 }).collect();
+            self.send_events(&[], &frees, &[]);
+            for id in ids {
+                self.untrack(*id);
+            }
+            Ok(())
+        }
+    }
+
+    fn htod_f32(
+        &mut self,
+        shape: &Shape,
+        data: Vec<f32>,
+        name: &str,
+    ) -> impl Future<Output = Result<Bytes, ModelError>> + Send {
+        let bytes = data.len() * std::mem::size_of::<f32>();
+        async move {
+            let b = self.inner.htod_f32(shape, data, name).await?;
+            let mut ev = Vec::new();
+            let class = self.ctx().class;
+            self.note_birth(&b, bytes, class, name, &mut ev);
+            self.send_events(&ev, &[], &[]);
+            Ok(b)
+        }
+    }
+
+    fn alloc_pinned(
+        &mut self,
+        bytes: usize,
+        name: &str,
+    ) -> impl Future<Output = Result<Box<dyn PinnedRegion + Send>, ModelError>> + Send {
+        // pinned 是**宿主**面(服务端 pinned 池自成一本账,不在设备块账房)⇒ 不进设备账
+        self.inner.alloc_pinned(bytes, name)
+    }
+
+    fn upload_pinned_on(
+        &mut self,
+        stream: UpStream,
+        buf: Box<dyn PinnedRegion + Send>,
+        dst: &Bytes,
+        offset_bytes: usize,
+        len_bytes: usize,
+    ) -> impl Future<Output = Result<(), ModelError>> + Send {
+        self.inner.upload_pinned_on(stream, buf, dst, offset_bytes, len_bytes)
+    }
+
+    fn upload_pinned(
+        &mut self,
+        buf: Box<dyn PinnedRegion + Send>,
+        dst: &Bytes,
+        offset_bytes: usize,
+        len_bytes: usize,
+    ) -> impl Future<Output = Result<(), ModelError>> + Send {
+        self.inner.upload_pinned(buf, dst, offset_bytes, len_bytes)
+    }
+
+    fn write_block_f32(
+        &mut self,
+        dst: &Bytes,
+        offset_elems: usize,
+        data: &[f32],
+    ) -> impl Future<Output = Result<(), ModelError>> + Send {
+        self.inner.write_block_f32(dst, offset_elems, data)
+    }
+
+    fn write_block_f32_on(
+        &mut self,
+        stream: UpStream,
+        dst: &Bytes,
+        offset_elems: usize,
+        data: &[f32],
+    ) -> impl Future<Output = Result<(), ModelError>> + Send {
+        self.inner.write_block_f32_on(stream, dst, offset_elems, data)
+    }
+
+    fn write_blocks_f32_on(
+        &mut self,
+        stream: UpStream,
+        writes: &[(&Bytes, usize, &[f32])],
+    ) -> impl Future<Output = Result<(), ModelError>> + Send {
+        self.inner.write_blocks_f32_on(stream, writes)
+    }
+
+    fn write_blocks_f32(
+        &mut self,
+        writes: &[(&Bytes, usize, &[f32])],
+    ) -> impl Future<Output = Result<(), ModelError>> + Send {
+        self.inner.write_blocks_f32(writes)
+    }
+
+    fn memset_zero(
+        &mut self,
+        dst: &Bytes,
+        len_bytes: usize,
+    ) -> impl Future<Output = Result<(), ModelError>> + Send {
+        // memset 是合法图节点 ⇒ 记节点(空窗判据)
+        self.note_node();
+        self.inner.memset_zero(dst, len_bytes)
+    }
+
+    fn upload_and_launch(
+        &mut self,
+        dst: &Bytes,
+        chunks: Vec<UpChunk>,
+        msg: LaunchMsg,
+    ) -> impl Future<Output = Result<Bytes, ModelError>> + Send {
+        self.note_node();
+        self.inner.upload_and_launch(dst, chunks, msg)
+    }
+
+    fn launch_and_harvest(
+        &mut self,
+        msg: LaunchMsg,
+        id: u64,
+        want_bytes: usize,
+    ) -> impl Future<Output = Result<Vec<u8>, ModelError>> + Send {
+        self.note_node();
+        self.inner.launch_and_harvest(msg, id, want_bytes)
+    }
+
+    fn block_ledger_dump(&mut self) -> impl Future<Output = Result<Vec<BlockLedgerRow>, ModelError>> + Send {
+        self.inner.block_ledger_dump()
+    }
+
+    fn mem_pool_trim(&mut self) -> impl Future<Output = Result<u64, ModelError>> + Send {
+        self.inner.mem_pool_trim()
+    }
+
+    fn copy_block_at(
+        &mut self,
+        src: &Bytes,
+        src_off_bytes: usize,
+        dst: &Bytes,
+        dst_off_bytes: usize,
+        len_bytes: usize,
+    ) -> impl Future<Output = Result<(), ModelError>> + Send {
+        self.note_node();
+        self.inner.copy_block_at(src, src_off_bytes, dst, dst_off_bytes, len_bytes)
+    }
+
+    fn face_clone(&self) -> Option<Self> {
+        // 克隆 = **同一本账 + 同一份上下文**(节点设一次全族生效)
+        self.inner.face_clone().map(|c| Self {
+            inner: c,
+            ledger: self.ledger.clone(),
+            ctx: self.ctx.clone(),
+        })
+    }
+
+    fn sm_count(&mut self) -> impl Future<Output = Result<usize, ModelError>> + Send {
+        self.inner.sm_count()
+    }
+
+    fn copy_batch(
+        &mut self,
+        copies: &[(Bytes, usize, Bytes, usize, usize)],
+    ) -> impl Future<Output = Result<(), ModelError>> + Send {
+        self.note_node();
+        self.inner.copy_batch(copies)
+    }
+
+    fn memset_zero_at(
+        &mut self,
+        dst: &Bytes,
+        offset_bytes: usize,
+        len_bytes: usize,
+    ) -> impl Future<Output = Result<(), ModelError>> + Send {
+        self.note_node();
+        self.inner.memset_zero_at(dst, offset_bytes, len_bytes)
+    }
+
+    fn loader_faces(&self, k: usize) -> Option<Vec<Self>> {
+        self.inner.loader_faces(k).map(|v| {
+            v.into_iter()
+                .map(|c| Self { inner: c, ledger: self.ledger.clone(), ctx: self.ctx.clone() })
+                .collect()
+        })
     }
 }
 
 // ============================================================================
-// §5 宏(调用点短;自动带 owner + 自动记账)
+// §6 宏(调用点短;自动带 owner + 自动记账)
 // ============================================================================
 
-/// 清零分配(handle 形式):`dev_alloc!(dev, AssetClass::Temp, Dtype::F16, 4096, "kv.workspace")`
+/// 清零分配(handle 形式):`alloc!(dev, AssetClass::Temp, Dtype::F16, 4096, "kv.workspace")`
 /// ⇒ `dev.exec(..).await`。
 ///
 /// 宏只做"构造 + exec",**不隐藏错误**(返回 `Result`;全仓"不许吞返回值"律)。
@@ -532,5 +1280,51 @@ mod tests {
         assert_eq!(Owner::Cache.label(), "cache");
         assert_eq!(Owner::System.label(), "system");
         assert_eq!(Owner::System, Owner::default_owner(), "缺省归属 = system");
+    }
+
+    /// 步 3 门 ④:**类别词表**(12 类;短名唯一 —— 报告面聚合键)
+    #[test]
+    fn asset_class_vocabulary_is_complete_and_labelled() {
+        let all = [
+            AssetClass::KvBlock,
+            AssetClass::Floor,
+            AssetClass::Elastic,
+            AssetClass::Snap,
+            AssetClass::Row,
+            AssetClass::Meta,
+            AssetClass::Index,
+            AssetClass::Temp,
+            AssetClass::Weight,
+            AssetClass::Graph,
+            AssetClass::Pool,
+            AssetClass::Unclassified,
+        ];
+        let mut names: Vec<&str> = all.iter().map(|c| c.label()).collect();
+        names.sort_unstable();
+        let n = names.len();
+        names.dedup();
+        assert_eq!(names.len(), n, "短名必须唯一(报告面聚合键):{names:?}");
+        assert_eq!(all.len(), 12);
+    }
+
+    /// 步 3 门 ⑤:**swap 片段按逻辑块聚合**(多片 → 每块一条 MoveEvent)
+    #[test]
+    fn swap_pieces_aggregate_per_block() {
+        let piece = |block: u64, len: usize| SwapPiece {
+            block,
+            dev_off: 0,
+            conn_off: 0,
+            len,
+            slot: crate::contract::ConnSlot(1),
+        };
+        let pieces = [piece(7, 4096), piece(9, 2048), piece(7, 2048)];
+        let out = swap_moves(SwapDir::Out, &pieces);
+        assert_eq!(out.len(), 2, "两块 ⇒ 两条(不是三板):{out:?}");
+        assert_eq!(out[0].id, 7);
+        assert_eq!(out[0].bytes, 6144, "同块片段求和");
+        assert_eq!(out[0].dir, MoveDir::Out);
+        assert_eq!(out[1].id, 9);
+        let back = swap_moves(SwapDir::In, &pieces);
+        assert_eq!(back[0].dir, MoveDir::In);
     }
 }

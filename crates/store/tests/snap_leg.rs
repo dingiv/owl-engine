@@ -49,7 +49,11 @@ fn rel(host_bytes: usize) -> Rel {
         class: BlockClass::KvPage,
         label: "snap-test",
     };
-    Rel::open(inputs, AdmissionPolicy::new(2, QueuePolicy::Reject), kv_cfg).expect("装配")
+    let cell = owl_store::shared_ledger(owl_store::TierBudget {
+        host_bytes: inputs.host_bytes,
+        disk_bytes: inputs.disk_bytes,
+    });
+    Rel::open(inputs, AdmissionPolicy::new(2, QueuePolicy::Reject), kv_cfg, cell).expect("装配")
 }
 
 async fn seed(face: &mut CpuFace, ps: &[PieceSpec], slot: u32, seed: u8) {

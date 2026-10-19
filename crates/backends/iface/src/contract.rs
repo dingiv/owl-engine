@@ -342,6 +342,31 @@ pub struct FiPlanSpec {
 }
 
 pub trait DeviceClient: Send {
+    // ── 归属/类别上下文(账本面;2026-10-19 步 3)────────────────────────
+    //
+    // 为什么在契约上:引擎内核按 `D: DeviceClient` 泛型写(N1/N4/N5 节点要设上下文,
+    // 装载相位要给"权重"类),而**账本归属**只有装了账本的 face 才有意义。
+    // 缺省 = **空实现**(无账本 ⇒ 无归属可谈 —— 不是静默失败);`DeviceHandle` 覆写
+    // 为真设置。三条语义:`set_owner` = 生命周期节点(N1/N4/N5);`set_class` = 相位
+    // (装载/池/执行);`scoped_ctx` = 相位 RAII(出作用域自动还原)。
+
+    /// **归属上下文**(谁持有:turn/session/cache/system)。
+    fn set_owner(&self, _o: crate::handle::Owner) {}
+
+    /// **类别上下文**(哪类资产:权重/图/池/临时/…)。
+    fn set_class(&self, _c: crate::handle::AssetClass) {}
+
+    /// **作用域化上下文**(RAII:出作用域自动还原;缺省 = 空作用域)。
+    fn scoped_ctx(&self, _o: crate::handle::Owner, _c: crate::handle::AssetClass) -> crate::handle::CtxScope {
+        crate::handle::CtxScope::noop()
+    }
+
+    /// **记账诊断三元组** `(hook_fail, window_unclosed, 窗内未归还块数)` —— 报告面用。
+    /// 无账本的裸 face ⇒ 全 0(**真值**:没有账可失,也没有图窗簿记)。
+    fn ledger_probe(&self) -> (u64, u64, usize) {
+        (0, 0, 0)
+    }
+
     /// 执行环境提供(硬件感知;None = 无 GPU 环境,语义调用结构化拒绝)。
     /// 感知发生在引擎/boot 侧(实现者可缓存);kernels/解释器零探测
     /// (被动律)。page 项由解释器从页策略单源补齐,实现者可置 0。
@@ -807,6 +832,25 @@ pub trait DeviceClient: Send {
         async {
             Err(ModelError::Msg("copy_block_at: 此后端未实现".into()))
         }
+    }
+
+    /// **图窗块的回收语义**(2026-10-19 步 3):捕获窗内自产的块是否**由后端回收**
+    /// (客户端不必 `free`)。
+    ///
+    /// - CUDA 档:`true` —— 捕获期 `alloc` 走 `carve_block`(slab 切片),`graph_destroy`
+    ///   / `graph_abort` 把窗内自产块**整批移出块账房**;空窗 `graph_end` 失败也整批回收。
+    /// - 纯 host mock:`false`(默认)—— 块交给调用方后续 `free`。
+    ///
+    /// **契约(设 `true` 的后端必须三条都满足)**:
+    /// ① `graph_abort` 成功 ⇒ 本窗自产块整批回收;
+    /// ② `graph_destroy(gid)` 成功 ⇒ 该图自产块整批回收;
+    /// ③ `graph_end` **空窗失败**(窗内零发射)⇒ 整批回收(窗随之关闭)。
+    ///
+    /// 为什么要有这条自述:`DeviceHandle` 的**事件账**必须与块账房**逐块对齐** ——
+    /// 而"窗失败/图退休时那些块去哪了"是后端知识(两档语义真的不同:GPU 整批回收 /
+    /// host mock 交调用方)。猜 = 静默错账;自述 = 显式契约。
+    fn window_blocks_auto_reclaimed(&self) -> bool {
+        false
     }
 
     /// 面句柄克隆(E5-M4:verify 图第二个 GraphPlan 需要独立 face 句柄;

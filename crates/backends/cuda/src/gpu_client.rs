@@ -378,6 +378,13 @@ impl DeviceClient for GpuClient {
         self.submit(move |ack| Command::FiPlanSync { spec, ack })?.await
     }
 
+    /// **窗内自产块由后端回收**(契约三条见 trait 文档):捕获期 `alloc` 走
+    /// `carve_block`(slab 切片),`graph_destroy`/`graph_abort`/空窗失败三处
+    /// 都把窗内自产块整批移出块账房。
+    fn window_blocks_auto_reclaimed(&self) -> bool {
+        true
+    }
+
     async fn alloc(&mut self, dtype: Dtype, elems: usize, name: &str) -> Result<Bytes, ModelError> {
         let n_bytes = elems * dtype.size_bytes();
         // 事实面:句柄自带 dtype(阶数未定形 = 0,由调用点 `view` 或张量视图定)

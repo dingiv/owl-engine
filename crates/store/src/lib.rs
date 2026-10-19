@@ -67,7 +67,7 @@ pub use policy::{
     QueuePolicy,
 };
 pub use leg::CachePolicy;
-pub use rel::{EvictItem, EvictPlan, KvConfig, Protected, RecallHit, RecallMode, Rel, StoreReport};
+pub use rel::{EvictItem, EvictPlan, EventBook, KvConfig, Protected, RecallHit, RecallMode, Rel, StoreReport};
 pub use select::{
     assemble_view, f32_to_f16, score_blocks, select, select_recency, BlockSet, IndexStats,
     MeanKEntry, MeanKIndex, block_mass, coverage_curve, derope_halves_inplace, derope_pair,
@@ -76,5 +76,7 @@ pub use select::{
 };
 pub use state::{SnapDurability, StateStore};
 pub use tier::{
-    AssetKind, LedgerHandle, Owner, OwnerRow, Tier, TierBudget, TierLedger, TierReport,
+    AssetKind, EventRow, LedgerBook, LedgerEntry, Loan, Owner, OwnerRow, SharedLedger, Tier,
+    TierBudget,
+    TierLedger, TierReport, book_lock, ledger_entry, shared_ledger, tier_budget_of,
 };
