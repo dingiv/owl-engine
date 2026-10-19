@@ -51,6 +51,8 @@ type Result<T> = std::result::Result<T, ModelError>;
 /// [`Default`] = 生产基线)。
 #[derive(Clone, Debug)]
 pub struct EngineKnobs {
+    /// **装载旋钮**(`[load]` 段;从配置文件来,不读 env —— 用户裁决 2026-10-19)
+    pub load: owl_shared::config::LoadCfg,
     /// 步级探针(诊断面;Default = 全关)
     pub probes: crate::running::StepProbes,
     /// 块池容量覆写(None = 2 × 单会话容量;原 OWL_POOL_TOKENS)
@@ -234,6 +236,7 @@ pub struct EngineKnobs {
 impl Default for EngineKnobs {
     fn default() -> Self {
         Self {
+            load: owl_shared::config::LoadCfg::default(),
             probes: crate::running::StepProbes {
                 // 命中面/调试打印:env 覆盖(实测排障用 `OWL_PROBES_DEBUG=1`)
                 debug: owl_shared::env_reader::flag("OWL_DEBUG"),
@@ -481,6 +484,7 @@ impl EngineKnobs {
     /// 本函数只做 module → 旋钮的字段搬运。
     pub fn from_config(cfg: &owl_shared::config::OwlConfig) -> Self {
         Self {
+            load: cfg.load.clone(),
             probes: crate::running::StepProbes::from_config(cfg),
             // ── **配置是唯一来源**(2026-10-19 统一)──
             // 本函数只做 `OwlConfig` → 旋钮的字段搬运,**不读任何 env**
@@ -499,6 +503,7 @@ impl EngineKnobs {
                 },
                 notaps: cfg.spec.notaps,
                 tapdecl: cfg.spec.tapdecl,
+                tp_draft: cfg.spec.tp_draft,
             },
             prefix_cache: cfg.pool.prefix_cache,
             prefix_cache_share: cfg.pool.prefix_cache_share,
@@ -590,11 +595,14 @@ pub struct DraftCfg {
     pub notaps: bool,
     /// TAPDECL 二分臂(声明期 tapped 不挂输出槽)
     pub tapdecl: bool,
+    /// **TP 档放行投机**(`[spec] tp_draft`;缺省 false ⇒ `tp.rs` 的 v1 护栏仍拒)
+    pub tp_draft: bool,
 }
 
 impl Default for DraftCfg {
     fn default() -> Self {
         Self {
+            tp_draft: false,
             depth: 0,
             dumb: false,
             dflash2_dir: None,
@@ -754,7 +762,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
 
     /// 模型加载器(借用引擎 face;装载即校验,错误在 load 边界落地)
     pub fn loader(&mut self) -> ModelLoader<'_, D> {
-        ModelLoader::new(&mut self.face)
+        ModelLoader::new(&mut self.face, self.cfg.knobs.load.clone())
     }
 
     /// 模型交引擎:状态块/槽/Session 组建 + warmup —— 仍不跑任何 turn,
@@ -985,6 +993,9 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
                 dumb: cfg.knobs.draft.dumb,
                 draft_kv_fp8: cfg.knobs.draft.kv_quant == owl_models::env::KvQuant::Fp8E4M3,
                 notaps: cfg.knobs.draft.notaps,
+                // P2.1-a:本 rank 的 TP 计划(单卡 = None ⇒ 旧行为)
+                tp: tp.as_ref().map(|c| c.plan),
+                load: cfg.knobs.load.clone(),
             },
         )
         .await?;
@@ -1021,6 +1032,12 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
             } else {
                 owl_models::env::KvQuant::None
             },
+            // P2.1-b:草稿池几何(**分片后**;来自草稿声明 + 本 rank 计划)
+            draft_geom: spec.draft_geom,
+            // 治理器按卡摊 `live`(TP2 下 LIVE 含两卡之和;2026-10-19 定谳)
+            tp_ranks: tp.as_ref().map(|c| c.plan.world()).unwrap_or(1),
+            // 草稿池 dtype 同源(量化族 BF16 / 未量化族 F16;见 spec_runtime::draft_dt)
+            draft_dt: spec.draft_dt,
             spec_mode: spec.mode,
             spec_depth: spec.depth,
             xqa_verify: cfg.knobs.env.attn.verify_xqa,

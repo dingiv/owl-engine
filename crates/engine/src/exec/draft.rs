@@ -57,7 +57,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             face.sync().await?;
         }
         let t0 = prof.then(std::time::Instant::now);
-        pg.step(&[
+        // ★ **双 rank 镜像**(P2.1-c,2026-10-19):草稿 propose **捕获图里烘焙着 AR**
+        // ⇒ 两 rank 必须各自回放(否则 AR 失步)。单卡档 = 原路(零分支)。
+        // 读数(`drafts`)只由主 rank 消费;两半都校验。
+        let ins: [(&str, &[f32]); 9] = [
             ("tokens", tokens_f.as_slice()),
             ("anchor", anchor.as_slice()),
             ("enc_pos", enc_pos.as_slice()),
@@ -67,9 +70,40 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             ("prop_slots", prop_slots.as_slice()),
             ("prop_kv_lens", prop_kv_lens.as_slice()),
             ("kv_len", kv_len.as_slice()),
-        ])
-        .await?;
+        ];
+        {
+            let (dev, peer) = (&mut self.dev, self.peer.as_mut());
+            match peer {
+                None => {
+                    dev.graphs
+                        .dflash
+                        .as_mut()
+                        .ok_or_else(|| ModelError::EngineInvariant {
+                            what: "dflash_graph 缺席(档位不一致)".into(),
+                        })?
+                        .step(&ins)
+                        .await?;
+                }
+                Some(p) => {
+                    let g0 = dev.graphs.dflash.as_mut().ok_or_else(|| {
+                        ModelError::EngineInvariant { what: "dflash_graph 缺席(档位不一致)".into() }
+                    })?;
+                    let g1 = p.graphs.dflash.as_mut().ok_or_else(|| {
+                        ModelError::EngineInvariant { what: "peer dflash_graph 缺席".into() }
+                    })?;
+                    let (r0, r1) = crate::exec::join2(g0.step(&ins), g1.step(&ins)).await;
+                    r1?;
+                    r0?;
+                }
+            }
+        }
         let t1 = prof.then(std::time::Instant::now);
+        let pg = self
+            .dev
+            .graphs
+            .dflash
+            .as_mut()
+            .ok_or_else(|| ModelError::EngineInvariant { what: "dflash_graph 缺席(档位不一致)".into() })?;
         let out = pg.read_output_f32("drafts").await?;
         // 纯 GPU 判别(E5-DF4 性能;2026-10-18 立案改三段):排水后首次执行 vs 二次执行
         if let (Some(t_drain), Some(t0v), Some(t1v)) = (t_drain0, t0, t1) {
@@ -304,6 +338,50 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             &toks_t, &pos_t, &anchor_t, &kvs, &rope, &self.dev.model.embed, &kv_len_t, &ctx,
             if probe_on { Some(&mut probe_roots) } else { None },
         );
+        // ★ **peer 侧草稿树(按 peer 自己的块重建)**(P2.1-c,2026-10-19)
+        //
+        // 为什么不能复用 rank0 的树:ops 树里挂的是**设备块句柄**(embed 权重 /
+        // 草稿池叶子 / 块表)—— rank0 的块在 peer 账本里**不存在** ⇒ peer 求值当场拒
+        // (`owl_embed_f16: 槽 0 的块不在本账本`);而 `join2` 会等 rank0 到底 ⇒
+        // 现场表现 = "挂住"(错被掩住 —— 纪律:可失败返回值不许丢)。
+        // host 输入(tokens/pos/slots/kv_lens/bt_chain)两 rank 同值 ⇒ 只换块。
+        let peer_tree = |p: &mut crate::engine::RankDev<D>| -> Result<owl_models::TensorOps> {
+            let leaves_p = p.pool.dflash_kv_leaves().ok_or_else(|| {
+                ModelError::EngineInvariant { what: "peer 草稿 KV 池句柄缺席".into() }
+            })?;
+            let bt_p = p.pool.bt_leaf_flat();
+            let kvs_p: Vec<KvBuffers> = leaves_p
+                .iter()
+                .map(|(k, v)| KvBuffers {
+                    k_cache: k.clone(),
+                    v_cache: v.clone(),
+                    slots: TensorOps::from_host(Dtype::F32, vec![8], &f32b(&self_slots)),
+                    kv_lens: TensorOps::from_host(
+                        Dtype::F32,
+                        vec![8],
+                        &f32b(&(0..8).map(|i| (pos + 1 + i) as f32).collect::<Vec<_>>()),
+                    ),
+                    block_tables: bt_p.clone(),
+                })
+                .collect();
+            // ⚠️ 用 **peer 自己的 drafter / rope**(每 rank 各一份实例、各一套设备块;
+            // 用 rank0 的 `d2`/`rope` 建树 ⇒ 权重块不在 peer 账本 ⇒ 当场拒)
+            let d2_p = match p.spec_rt.drafter.as_ref() {
+                Some(crate::spec_runtime::Drafter::DFlash2(d)) => std::sync::Arc::clone(d),
+                _ => {
+                    return Err(ModelError::EngineInvariant {
+                        what: "peer 草稿器缺席/非 DFlash2(镜像装配不一致)".into(),
+                    })
+                }
+            };
+            let rope_p = p.spec_rt.draft_rope.as_ref().ok_or_else(|| {
+                ModelError::EngineInvariant { what: "peer 草稿 rope 缺席".into() }
+            })?;
+            let (_, d_p, _, _) = d2_p.propose_block(
+                &toks_t, &pos_t, &anchor_t, &kvs_p, rope_p, &p.model.embed, &kv_len_t, &ctx, None,
+            );
+            Ok(d_p)
+        };
         // 探针:首个 propose 的 hidden + 全部探针根落盘(python 逐阶段对拍;
         // **逐根独立 eval** —— multi 后段会把早根块回收复用,dtoh 读到陈旧
         // 块(root0 曾读出 1e6 级垃圾假象);单链重执行确定性,值可信)
@@ -342,8 +420,52 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             None
         };
         let (b, arena) = {
-            let face = self.dev.graphs.session.face_mut();
-            owl_models::interpreters::eval_ops_scoped_env(drafts.step(), face, self.dev.env, self.dev.tp.as_ref()).await?
+            let env0 = self.dev.env;
+            let tp0 = self.dev.tp.clone();
+            // peer 树必须在借 face 之前建(`peer_tree` 要 `&mut p` 读池/模型)
+            let peer_t = match self.peer.as_mut() {
+                Some(p) => Some(peer_tree(p)?),
+                None => None,
+            };
+            let (dev, peer) = (&mut self.dev, self.peer.as_mut());
+            match (peer, peer_t) {
+                (None, _) => {
+                    let face = dev.graphs.session.face_mut();
+                    owl_models::interpreters::eval_ops_scoped_env(drafts.step(), face, env0, tp0.as_ref()).await?
+                }
+                (Some(p), Some(pt)) => {
+                    // ★ **双 rank 镜像**(P2.1-c):草稿体里有 RowParallel 的 allreduce
+                    // ⇒ 两 rank 必须同跑(否则 AR 失步)。单卡档 = 原路。
+                    // 读数只取主 rank(确定性 ⇒ 两 rank 同值);**两半都校验**。
+                    let env1 = p.env;
+                    let tp1 = p.tp.clone();
+                    let (f0, f1) = (dev.graphs.session.face_mut(), p.graphs.session.face_mut());
+                    let peer_fut = async move {
+                        let r = owl_models::interpreters::eval_ops_scoped_env(
+                            pt.step(), f1, env1, tp1.as_ref(),
+                        )
+                        .await;
+                        if let Err(ref e) = r {
+                            // **响亮**:peer 的错不许静默(join2 会等 rank0 到底 ⇒
+                            // 不主动打就永远看不见;现场第一版就是"挂"的样子)
+                            owl_shared::log_error!("spec-mirror", "peer 草稿 eval 失败: {e}");
+                        }
+                        r
+                    };
+                    let (r0, r1) = crate::exec::join2(
+                        owl_models::interpreters::eval_ops_scoped_env(drafts.step(), f0, env0, tp0.as_ref()),
+                        peer_fut,
+                    )
+                    .await;
+                    r1?;
+                    r0?
+                }
+                (Some(_), None) => {
+                    return Err(ModelError::EngineInvariant {
+                        what: "peer 束在场但草稿树缺席(镜像装配不一致)".into(),
+                    });
+                }
+            }
         };
         if let Some(lp) = logits_probe {
             // 单遍 multi(共享 memo;独立 eval 重执行副作用层 = 原地
@@ -812,6 +934,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// 消费);树二 = lm_head → 逐行 argmax → 行栈(引用树一根)。返回
     /// (各行 argmax = 各位置贪心提名,hidden 块 [t, hidden];调用方在
     /// extend 后显式 free)。
+    /// **eager verify(回滚/重放路)** —— 双 rank 镜像(P2.1-c):设备半在
+    /// [`crate::engine::RankDev::verify_forward_dev`];单卡档 = 原路(零分支)。
     pub(crate) async fn verify_forward(
         &mut self,
         block: &[u32],
@@ -819,187 +943,39 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         gdn_slot: usize,
         want_logits: bool,
     ) -> Result<(Vec<u32>, owl_iface::contract::Bytes, Option<Vec<f32>>)> {
-        let t = block.len();
-        let (bt_chain, _) = {
+        let bt_chain = {
             let act = self.turns.active.as_ref().expect("active 已保证");
             let s = self.bank.sessions.get(act.session_id).expect("账在");
-            (s.block_table.clone(), act.gdn_slot)
+            s.block_table.clone()
         };
-        let kv_caches = self.dev.pool.kv_caches();
-        let kvs_step: Vec<KvBuffers> = {
-            let page = self.dev.pool.page;
-            let phys: Vec<f32> = (base..base + t)
-                .map(|p| {
-                    let b = bt_chain[p / page];
-                    (b * page as u32 + (p % page) as u32) as f32
-                })
-                .collect();
-            let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
-            kv_caches
-                .iter()
-                .map(|(k, v)| KvBuffers {
-                    k_cache: k.clone(),
-                    v_cache: v.clone(),
-                    slots: TensorOps::from_host(Dtype::F32, vec![t], &f32b(&phys)),
-                    kv_lens: TensorOps::from_host(
-                        Dtype::F32,
-                        vec![t],
-                        &f32b(&((base + 1..=base + t).map(|v| v as f32).collect::<Vec<_>>())),
-                    ),
-                    block_tables: self.dev.pool.bt_leaf_flat(),
-                })
-                .collect()
+        let (dev, peer) = (&mut self.dev, self.peer.as_mut());
+        let out = match peer {
+            None => {
+                dev.verify_forward_dev(block, base, gdn_slot, want_logits, &bt_chain)
+                    .await?
+            }
+            Some(p) => {
+                // 两半都校验(纪律:`join2` 等另一半到底,吞错 = 挂住)
+                let bt_p = bt_chain.clone();
+                let peer_fut = async move {
+                    let r = p
+                        .verify_forward_dev(block, base, gdn_slot, want_logits, &bt_p)
+                        .await;
+                    if let Err(ref e) = r {
+                        owl_shared::log_error!("spec-mirror", "peer verify_forward 失败: {e}");
+                    }
+                    r
+                };
+                let (r0, r1) = crate::exec::join2(
+                    dev.verify_forward_dev(block, base, gdn_slot, want_logits, &bt_chain),
+                    peer_fut,
+                )
+                .await;
+                r1?;
+                r0?
+            }
         };
-        let gdns_step: Vec<GdnBuffers> = {
-            let gdn_caches = self.dev.pool.gdn_caches();
-            gdn_caches
-                .iter()
-                .map(|g| GdnBuffers {
-                    conv_q: g.conv_q.clone(),
-                    conv_k: g.conv_k.clone(),
-                    conv_v: g.conv_v.clone(),
-                    rec: g.rec.clone(),
-                    slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[gdn_slot as f32])),
-                })
-                .collect()
-        };
-        let ids_t = TensorOps::from_host(
-            Dtype::F32,
-            vec![t],
-            &block.iter().flat_map(|v| (*v as f32).to_le_bytes()).collect::<Vec<u8>>(),
-        );
-        let pos_t = TensorOps::from_host(
-            Dtype::F32,
-            vec![t],
-            &f32b(&(base..base + t).map(|v| v as f32).collect::<Vec<_>>()),
-        );
-        let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
-        let slots_t = TensorOps::from_host(
-            Dtype::F32,
-            vec![t],
-            &f32b(&{
-                let page = self.dev.pool.page;
-                (base..base + t)
-                    .map(|p| {
-                        let b = bt_chain[p / page];
-                        (b * page as u32 + (p % page) as u32) as f32
-                    })
-                    .collect::<Vec<_>>()
-            }),
-        );
-        let lens_t = TensorOps::from_host(
-            Dtype::F32,
-            vec![t],
-            &f32b(&((base + 1..=base + t).map(|v| v as f32).collect::<Vec<_>>())),
-        );
-        let gdn_slot_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[gdn_slot as f32]));
-
-        // FI 表四件套(与 prefill_chunk 同款;ctx_total = base + t)
-        let i32le = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
-        let fi_tensors;
-        let fi = if self.dev.pool.fi_face {
-            let page = self.dev.pool.page;
-            let ctx_total = base + t;
-            let nb = bt_chain.len();
-            let k_fi_leaf = self.dev.pool.kv_fi_leaves();
-            let face = self.dev.graphs.session.face_mut();
-            let q_cu_b = owl_models::interpreters::eval_ops(
-                TensorOps::from_host(Dtype::U32, vec![2], &i32le(&[0, t as i32])).step(), face)
-                .await?;
-            let idx_b = owl_models::interpreters::eval_ops(
-                TensorOps::from_host(Dtype::U32, vec![nb],
-                    &i32le(&bt_chain.iter().map(|&b| b as i32).collect::<Vec<_>>())).step(), face)
-                .await?;
-            let ind_b = owl_models::interpreters::eval_ops(
-                TensorOps::from_host(Dtype::U32, vec![2], &i32le(&[0, nb as i32])).step(), face)
-                .await?;
-            let ll_b = owl_models::interpreters::eval_ops(
-                TensorOps::from_host(Dtype::U32, vec![1],
-                    &i32le(&[(ctx_total - nb * page + page) as i32])).step(), face)
-                .await?;
-            let q_cu = TensorOps::of_block(q_cu_b.id, Dtype::U32, vec![2]);
-            let indices = TensorOps::of_block(idx_b.id, Dtype::U32, vec![nb]);
-            let indptr = TensorOps::of_block(ind_b.id, Dtype::U32, vec![2]);
-            let last_len = TensorOps::of_block(ll_b.id, Dtype::U32, vec![1]);
-            let (kcs, vcs): (Vec<TensorOps>, Vec<TensorOps>) =
-                k_fi_leaf.iter().map(|(k, v)| (k.clone(), v.clone())).unzip();
-            fi_tensors = (kcs, vcs, q_cu, indices, indptr, last_len);
-            Some(FiPrefillCtx {
-                kcs: &fi_tensors.0,
-                vcs: &fi_tensors.1,
-                q_cu: &fi_tensors.2,
-                indices: &fi_tensors.3,
-                indptr: &fi_tensors.4,
-                last_len: &fi_tensors.5,
-            })
-        } else {
-            None
-        };
-
-        // P1′(2026-10-14):同 prefill_chunk —— cu_seqlens 每轮一次(替代
-        // 逐层 from_host 兜底;48 次 8B H2D × ~3.5ms 往返)
-        let seq_cu = TensorOps::from_host(Dtype::F32, vec![2], &f32b(&[0.0, t as f32]));
-        let mut ctx = owl_models::module::ForwardCtx::model_prefill(
-            t, &pos_t, &kvs_step, &self.dev.rope, &gdns_step, &slots_t, &lens_t, &gdn_slot_t,
-            Some(gdn_slot), // A13:host 槽真值(verify T≤16 不走 chunked 臂;注入即真值)
-            base, fi,
-        );
-        ctx.seq_cu = Some(&seq_cu);
-        ctx.env = self.dev.env;
-        let face = self.dev.graphs.session.face_mut();
-        let vocab = self.dev.model.vocab_size();
-        // 树一:hidden 根([t, hidden];E5-M2b:extend 同迭代消费 → 根块
-        // 存活返回,中间块即焚)。原单树版的 argmax 根与 _arena 均 drop 未
-        // free(每轮泄漏 verify 全部中间块 —— M2a 存量雷,本轮修复)。
-        let hidden = self.dev.model.last_hidden(&ids_t, &ctx);
-        let hd = hidden.shape()[1];
-        let (hb, arena1) =
-            owl_models::interpreters::eval_ops_scoped_env(hidden.step(), face, self.dev.env, self.dev.tp.as_ref()).await?;
-        // 树二:lm_head + 逐行 argmax(引用树一根块,不重建整模前向)
-        let hview = TensorOps::of_block(hb.id, self.dev.pool.dims.dtype, vec![t, hd]);
-        let logits = self.dev.model.embed.lm_head_matmul(&hview);
-        let rows: Vec<TensorOps> =
-            (0..t).map(|r| owl_models::ops::argmax_f32idx(&logits, vocab, r * vocab)).collect();
-        let refs: Vec<&TensorOps> = rows.iter().collect();
-        let mut root = TensorOps::call(owl_models::ops::SemanticKernel::Concat);
-        // FIXME(2026-10-13,律 #1):`refs.get(i).unwrap_or(refs[0])` 在
-        // `t < 8` 时**静默用第 0 行补齐** —— 若属"固定 8 行图族"的按设计补齐,
-        // 应写成显式的 pad(并断言 t≥1);若属越界,静默回退会生成**错树**
-        // 且极难查。当前语义未定谳,故先挂牌不改行为(改动可能误伤 pad 路径)。
-        for i in 0..8 {
-            root = root.arg(refs.get(i).copied().unwrap_or(refs[0]));
-        }
-        let root = root.arg_usize(t).arg_usize(1).arg_usize(1).with_shape(Dtype::F32, vec![t, 1]);
-        let (b, arena2) =
-            owl_models::interpreters::eval_ops_scoped_env(root.step(), face, self.dev.env, self.dev.tp.as_ref()).await?;
-        let mut buf = vec![0u8; 4 * t];
-        face.dtoh(&b, &mut buf).await?;
-        // A11:采样接受需要各行**目标分布**(不只 argmax)⇒ 按需物化
-        // [t, vocab] 行 logits(f16 → host f32;仅采样档付这份 D2H)
-        let row_logits: Option<Vec<f32>> = if want_logits {
-            let (lb, arena3) =
-                owl_models::interpreters::eval_ops_scoped_env(logits.step(), face, self.dev.env, self.dev.tp.as_ref()).await?;
-            let mut lbuf = vec![0u8; 2 * t * vocab];
-            face.dtoh(&lb, &mut lbuf).await?;
-            face.free(&[lb.id]).await?;
-            face.free(&arena3).await?;
-            Some(
-                lbuf.chunks_exact(2)
-                    .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
-                    .collect(),
-            )
-        } else {
-            None
-        };
-        // 显式归还:argmax 根 + 两树中间块(hidden 根 hb 存活,随返回值)
-        face.free(&[b.id]).await?;
-        face.free(&arena2).await?;
-        face.free(&arena1).await?;
-        let ids: Vec<u32> = buf
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
-            .collect();
-        Ok((ids, hb, row_logits))
+        Ok(out)
     }
 
     // ====================================================================

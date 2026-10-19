@@ -515,7 +515,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                 let ts = std::time::Instant::now();
                 self.prefill_dflash_encode(host.probes, taps, base).await?;
                 mrec("dflash.prefill.encode", ts.elapsed());
-            } else if self.spec_rt.drafter.is_some() && t > 1 {
+            } else if matches!(self.spec_rt.drafter.as_ref(), Some(crate::spec_runtime::Drafter::Mtp(_))) && t > 1 {
                 let sid = host.sid;
                 let bank = host.bank_mut()?;
                 self.prefill_extend(bank, sid, root, t - 1, ids, base).await?;
@@ -554,7 +554,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             let tok = owl_models::ops::argmax_f32idx(&logits, vocab, 0);
             eval_ops_scoped_env(tok.step(), face, self.env, self.tp.as_ref()).await?
         };
-        if self.spec_rt.drafter.is_some() && t > 1 {
+        if matches!(self.spec_rt.drafter.as_ref(), Some(crate::spec_runtime::Drafter::Mtp(_))) && t > 1 {
             let sid = host.sid;
             let bank = host.bank_mut()?;
             self.prefill_extend(bank, sid, root, t - 1, ids, base).await?;
@@ -1270,7 +1270,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                     face.copy_block_at(lb, 0, &slot, 0, n).await?;
                 }
             }
-            if self.spec_rt.drafter.is_some() && t > 1 {
+            if matches!(self.spec_rt.drafter.as_ref(), Some(crate::spec_runtime::Drafter::Mtp(_))) && t > 1 {
                 // prefill extend(E5-M5):本 chunk 行 0..T-1 的 mtp KV
                 // (行 T-1 的配对需下一 chunk 首 token,由其 extend 补;
                 // 末位 P-1 由首轮 propose_first 的 extend 行补)
@@ -1370,7 +1370,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                         })
                         .collect();
                     self.prefill_dflash_encode(host.probes, &tap_views, base).await?;
-                } else if self.spec_rt.drafter.is_some() && t > 1 {
+                } else if matches!(self.spec_rt.drafter.as_ref(), Some(crate::spec_runtime::Drafter::Mtp(_))) && t > 1 {
                     let ts = std::time::Instant::now();
                     let sid = host.sid;
                     let bank = host.bank_mut()?;

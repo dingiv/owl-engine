@@ -48,6 +48,9 @@ pub struct TpOpts {
     /// (`TP2-施工设计.md` §36.6/§36.7)。**副作用**:staging 别名改授
     /// `PROT_READWRITE`(v1 是 `PROT_READ`)。
     pub push: bool,
+    /// **fp8 载荷档**(§47 第二步;2026-10-19):AR 载荷走 e4m3(载荷 1.031×)。
+    /// 由入口(server config)显式传入 —— 引擎内部零 env 读取(与 push 同律)。
+    pub ar_f8: bool,
 }
 
 /// staging 的双块与布局量(布局算术单源 = `owl_cuda::comm::ar::StagingLayout` ——
@@ -63,6 +66,8 @@ pub struct TpStaging {
     /// ★ **push 档**(2026-10-18;§36.6/§36.7):`true` ⇒ 两核把 `own`/`peer`
     /// **指针对调**(数据腿从"读对端"变成"写对端"),别名块必须已授 `PROT_READWRITE`。
     push: bool,
+    /// **fp8 载荷档**(与 `TpOpts::ar_f8` 同值;`ctx()` 把它写进 `TpCtx`)
+    ar_f8: bool,
     pub(crate) layout: StagingLayout,
 }
 
@@ -100,6 +105,7 @@ impl TpStaging {
             slot_bytes: self.layout.slot_bytes,
             arena: self.arena.clone(),
             push: self.push,
+            ar_f8: self.ar_f8,
         }
     }
 }
@@ -216,9 +222,11 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
         // ② prefill 桶族:桶出图尾自带读数(与"入队半零同步"分相冲突);
         // ③ 读数类探针:prefill 入队半里的 dtoh/sync 会撞 AR 自旋(见 on_peer 契约)。
         let k = &cfg.knobs;
-        if k.draft.depth != 0 {
+        if k.draft.depth != 0 && !k.draft.tp_draft {
             return loud(format!(
-                "TP v1 不支持投机草稿(draft.depth = {};双 rank 草稿族未接线)",
+                "TP v1 不支持投机草稿(draft.depth = {};双 rank 草稿族未接线)。\
+                 若要走 P2.1 的草稿双 rank 路,显式开 `[spec] tp_draft = true`\
+                 (草稿 spec/权重按本 rank 计划分片 + 草稿池几何按分片 hkv)",
                 k.draft.depth
             ));
         }
@@ -684,6 +692,14 @@ async fn handshake_staging(
     };
     // ★ **1-stage 对称 arena**(2026-10-18;§35)—— 开关见 `one_stage_enabled()`
     // ⚠️ **与 push 互斥**(两者都改写数据腿;同时开只会让 push 静默不生效)。
+    // 诊断面(2026-10-19):1-stage 的启用条件一次打全 —— 它是"融合核被走到"的
+    // 唯一前提,而 §57 的教训正是"核写好了但一次没被走到"。
+    eprintln!(
+        "[tp] 1-stage 启用判据:env OWL_TP_1STAGE={:?} · push={} ⇒ arena {}",
+        std::env::var("OWL_TP_1STAGE").ok(),
+        opts.push,
+        if one_stage_enabled() && !opts.push { "装配" } else { "不装(走 v1 两段)" }
+    );
     let (arena0, arena1) = if one_stage_enabled() && !opts.push {
         // 槽大小:按 staging 的 slot_bytes 会白占显存(0.8B 的 payload 只有 ~1MiB,
         // 而 SLOT_BYTES = 32MiB ⇒ 2 槽 = 64MiB/rank,实测在 3080 上直接
@@ -696,8 +712,8 @@ async fn handshake_staging(
         (None, None)
     };
     Ok((
-        TpStaging { own: own0, peer: peer0, arena: arena0, push: opts.push, layout },
-        TpStaging { own: own1, peer: peer1, arena: arena1, push: opts.push, layout },
+        TpStaging { own: own0, peer: peer0, arena: arena0, push: opts.push, ar_f8: opts.ar_f8, layout },
+        TpStaging { own: own1, peer: peer1, arena: arena1, push: opts.push, ar_f8: opts.ar_f8, layout },
     ))
 }
 
