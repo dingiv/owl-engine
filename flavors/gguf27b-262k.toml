@@ -1,0 +1,122 @@
+# ============================================================================
+# owl 引擎预设档 `gguf27b-262k` —— **GGUF 单文件 × KVMem 虚拟化 × 262144 tok
+# 单卡 3090 Ti(24 GB)**(2026-10-20 GGUF×KVMem 联调轮)
+# ============================================================================
+#
+# **一句话**:设备上只留工作集(1 GiB 池),全量 KV(8 GiB fp8)在宿主;
+# 设备池 = 上下文的 **1/8**(超卖 8×),选择层每 512 tok 召回一次。
+#
+# 靶位(用户档里给 `[model] dir`):
+#   models/ggml-org/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf
+#   17.66 GiB / 851 张 / 混型(Q4_K 193 · Q8_0 288 · Q6_K 17 · F32 353)
+#   untied + 64 层(16 full attn + 48 GDN)+ 原生 context_length 262144
+#
+# 起机:
+#   CUDA_VISIBLE_DEVICES=GPU-<3090Ti 的 UUID> \
+#     target/release/server --flavor gguf27b-262k <用户档.toml>
+#   # 用户档只写 [model] dir/name + [runtime] device/bind 即可
+#
+# 实测(2026-10-20,单张 3090 Ti 41:00.0;详见
+#   docs/arch/gguf-格式支持-设计与施工.md §二十三):
+#   · **258 486 tok prompt(≈1280 tok 短于上限)一次跑通,190.3 s**(≈1360 tok/s),
+#     needle 放 50% 处,**recall 命中**(答出 passcode);峰值占 20.4 GB / 24 GB;
+#   · 219 057 tok prompt:161.1 s(≈1360 tok/s),同样命中;
+#   · 同前缀二次请求(22 906 tok):18.7 s → **3.2 s**(快照恢复 + 宿主 KV 命中);
+#   · 全程零 Xid、零下沉 Exhausted、N4 未归还清单为空(修复后)。
+#
+# ── 三层账(改数只动这三行;算式见 [kvmem]/[pool] 注释)────────────────────
+#   [runtime].max_seq        = 262144(逻辑上限;GGUF 原生支持,无需 YaRN)
+#   [pool].pool_tokens       = **设备 KV 池**(可 ≪ 上下文 —— 这就是超卖)
+#   [kvmem].workspace_per_req = 每活跃 turn 在设备池里的工作集(token;含保底)
+#
+# 24 GB 卡的账(实测):
+#   17.69 GiB 权重/运行底价(live)
+#   +1.19 GiB  治理器固定项(GDN 格 148M + 快照池 297M + 图 slab 640M + warmup 138M)
+#   +1.00 GiB  设备 KV 池(32768 tok / 1024 页)—— **工作集,不是缓存**
+#   +~0.25 GiB prefill 激活面(chunk 512 实测峰值 ~226 MiB)+ 守卫 128 MiB
+#   ≈ 20.1 GiB ⇒ 余 ~4 GiB(258k 实测峰值 20.4 GB)
+#   KV 全量 = 262144 tok × 32 KiB(fp8)= **8 GiB** ⇒ 非驻留块**全部**在宿主腿
+#   ⇒ `host_cache_mb = 9216`(实测 258k 下沉 8045 块 = 7.86 GiB,腿内)
+#
+# ⚠️ **池越小 = 前缀复用越浅**:二次请求的**整段命中链要一次性回灌设备**
+#   (`phases.rs` 的 `pending_loads` 不设上限)⇒ 池 1 GiB 支持约 3.2 万 tok 的
+#   前缀回灌(实测 22.9k 复跑 3.2 s)。**同前缀 26 万 tok 的整链复跑会撞
+#   「槽池耗尽」**(需 >1024 槽;这是已知限制,见设计 §二十三.4 —— 修法 =
+#   回灌按工作集截断,待立项)。要长前缀复跑就调大 `pool_tokens`(每次
+#   1 GiB ≈ 3.2 万 tok 回灌面),代价是 prefill 激活面余量变小。
+#
+# 需配套:`[model] dir`(GGUF 单文件)。
+[model]
+kind = "gguf"
+
+[runtime]
+# 262k:GGUF 文件自带 context_length = 262144(§十四.1),无需扩表
+max_seq = 262144
+# chunk 512(KVMem 档定档;与 awq27b-262k 同律):
+#   · 边界 = 每 512 tok 一次完整召回(recall_every = 1);chunk 越小边界越密、
+#     召回越勤,但 GEMM 的 M 维越小;
+#   · 实测(GGUF 27B,int8-MMA 臂)262k 窗内 ≈1360 tok/s(含边界开销);
+#   · 改它要成对改 `[kvmem].recall_every` 的节奏(见 awq27b-262k 注释)。
+prefill_chunk = 512
+
+[pool]
+# **设备池 = 工作集**(1024 页 = 1 GiB = 32768 tok;超卖 8×)。
+# 为什么不是更大:设备池是"热面",而 262k 的非驻留块结构性全在宿主;
+# 池只保证 ①每 turn 工作集 32 页 ②chunk 增量 16 页 ③前缀回灌面(见上)。
+# boot 硬校验:nb ≥ gdn_slots × (ceil(workspace_per_req/32) + ceil(chunk/32))
+#   1024 ≥ 1 × (32 + 16) = 48 ✓
+pool_tokens = 32768
+gdn_slots = 1
+snap_max = 2
+# 24 GiB 贴顶:预留压到最小(治理器 cap 实测 127266 tok,本档只用 32768)
+vram_reserve_mb = 128
+# **宿主双腿必须给量**(262k 的非驻留 KV 全落这里):
+#   - KV 腿:262k 全量 8192 块 − 工作集 ~48 块 = 8144 MiB ⇒ 给 9216 MiB
+#     (实测 258k 时 host_blocks = 8045 = 7.86 GiB)
+#   - 状态腿:GDN 快照 159 MB/张;512 个边界 ⇒ 只留最近 ~13 张 ⇒ 给 2048 MiB
+host_cache_mb = 9216
+snap_host_mb = 2048
+# ⚠️ 虚拟化档**必须开**:下沉机制 = 缓存树 + 会话双持(refs==2)→ decref →
+# 缓存独占 → 下沉;关着 prefix_cache ⇒ 缓存树 cap=0 ⇒ **结构性不可沉**(boot 拒启)
+prefix_cache = true
+
+[server]
+# `gdn_slots = 1` ⇒ 并发上限必须 = 1(boot 跨字段校验)
+max_concurrency = 1
+
+[sampling]
+# 长档诊断/验收口径 = greedy(与恒等门/对拍一致)
+mode = "greedy"
+
+[dispatch]
+# fp8 池:容量 ×2(KV 32 KiB/tok)+ FI/XQA 读核前提
+kv_fp8 = true
+# GDN prefill 臂 = chunked(T 并行分块 delta-rule;varlen 顺序扫描 2.42 ms/层
+# 对 chunked 0.65 ms/层)。**GGUF 档此前漏配**,已由 gguf27b 固化。
+gdn_chunked = true
+# 本档**不设** allowed_ops 白名单(门关):与 gguf27b 同理 —— 白名单要按
+# **发射账并集**生成(方法见 gguf4b.toml 的 [dispatch] 注释),而 KVMem 档的
+# 臂集额外包含选择层/下沉/回灌族(swap/写视图页表)。硬化时按同流程收账。
+
+[kvmem]
+# ── 虚拟化两扇门(**同时为真**;所有解锁类护栏的唯一判据)──
+#   select_decode  = 视图页表接进 decode(洞的消费方)
+#   select_partial = 链上真的出洞(被逐块下沉到宿主)
+select_decode = true
+select_partial = true
+index = true
+# ── 锁①:允许池小于上下文(本档的核心) ──
+pool_overcommit = true
+# ── **每 turn 工作集**(token;含保底)──
+#   1024 tok = 32 页 = 常驻 32 块 = 保底 6 + 召回 top-k 26
+#   262k 下 8192 个候选块里只留 32 块(视图物化比 ≈0.4%);
+#   实测 50% 处的 needle 在 56k/219k/258k 三档全部召回命中。
+#   调大它 = 长 ctx 上看更全,代价是每步读页数与池下限。
+workspace_per_req = 1024
+select_sink = 2
+select_recent = 4
+# 与 chunk 512 配套:每 512 tok 一次完整召回(节奏 = 旧档 every=4/chunk128 同律)
+recall_every = 1
+# 诊断面:**生产档关**(真重诊断单次含 ctx 因子;要读数再单开)
+coverage_probe = false
+analyze_at_ctx = 0

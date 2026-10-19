@@ -1670,3 +1670,98 @@ nsys 的 31.8 ms **GPU busy 不可能成立**(否则 41.2 t/s 不成立),2246 �
 
 ⚠️ 语义提醒:`launch`/`alloc` 文档写的是“issue 即 send → 立即 resolve”,**实测 15-19 µs**
 说明回执走了完整唤醒路径 ⇒ 这一条本身就是实现与文档的偏差。
+
+## 二十三、GGUF × KVMem 联调:262k 单卡档(2026-10-20)
+
+**目标**(用户裁决):把 GGUF 单文件档接进 **KVMem 虚拟化**(设备池 < 上下文,
+全量 KV 在宿主),在**单张 3090 Ti(24 GB)** 上给出 `max_seq = 262144` 的可用配置。
+
+**交付**:`flavors/gguf27b-262k.toml`(起机/三层账/纪律全在该文件注释)。
+
+### 23.1 三层账(实测;与 `awq27b-262k` 同构,少 1.5 GiB 权重 ⇒ 池可给 1 GiB)
+
+```text
+权重/底价 17.69 + fixed_after 1.19(GDN 格 148M + 快照 297M + 图 slab 640M + warmup 138M)
++ 设备 KV 池 1.00(32768 tok / 1024 页) + prefill 激活面 ~0.25(chunk 512 峰值 226 MiB)
++ 守卫 0.128 ≈ 20.1 GiB ⇒ 余 ~4 GiB(258k 实测峰值 20.4 GB)
+
+KV 全量 = 262144 tok × 32 KiB(fp8) = 8 GiB ⇒ 非驻留块**全部**落宿主
+  ⇒ host_cache_mb = 9216(258k 实测下沉 8045 块 = 7.86 GiB)
+  ⇒ snap_host_mb = 2048(GDN 快照 159 MB/张,512 个边界只留最近 ~13 张)
+```
+
+`max_seq = 262144` **是本文件的原生事实**(`qwen35.context_length`),无需 YaRN/扩表。
+
+### 23.2 实测(单张 3090 Ti 41:00.0;greedy;needle 置于 prompt 50%)
+
+| 场景 | prompt tok | 墙钟 | 说明 |
+|---|---:|---:|---|
+| 冷 prefill(首跑) | **258 486** | **190.3 s**(≈1360 tok/s) | needle 召回**命中**,答出 passcode;峰值 20.4 GB |
+| 冷 prefill | 219 057 | 161.1 s | 同上(内核/边界口径可比) |
+| 同前缀复跑 | 22 906 | 18.7 → **3.2 s** | 快照恢复 + 宿主 KV 命中 + 尾块重算 |
+| 56k 档 | 56 107 | 40.3 s | 50% needle 命中 |
+
+口径与纪律:prompt 用**随机词池**生成(≈1.13 tok/词;足够长时提前估算 token 数),
+`usage.prompt_tokens` 为准;全程零 Xid;`pool 8192`(256 页)与 `pool 32768`(1024 页)
+两档都跑过 258k —— 前者设备余量更大、后者前缀回灌面更大(见 §23.4)。
+
+### 23.3 联调抓出的三个缺陷(都已修,都有门)
+
+**(1)临时块复用池的多次顶出泄漏**(`LedgerBook::pool_release`;最重)
+
+`pool_release` 超上限时为腾容量要顶出**多块**,旧实现 `evicted = Some(old)`
+**每轮覆盖** ⇒ 只把**最后一块**交回调用方释放;前面被摘出池的块**设备内存永不释放、
+loan 永远 `pooled=true` 且不在池里**。表现为每 chunk 泄漏数 MiB(27B GGUF 实测:
+10 chunk 泄漏 53 MiB,54 chunk 泄漏 325 MiB),`/debug/vram` 的 turn 账与池账对不上。
+修:**逐块收集、全量返回**(`pool_release -> Vec<u64>`),`drain` 失败回填路径同修。
+门:`tier::tests::pool_cap_evicts_oldest_and_hands_back_id`(单块)+ 逐块返回语义。
+
+**(2)N4「未归还清单」把**池内复用块**当泄漏**(`running.rs::n4_report_unreturned`)
+
+`pool_release` 入池时 loan 仍开着(`pooled=true`,这是设计),旧报告不看
+`pooled` ⇒ 每 turn 都喊几百 MiB,真泄漏反而被噪声淹没。修:分开统计 ——
+**池内块走 debug 一行、真未归还才 WARN**(本次联调靠这条把 (1) 顶出来)。
+
+**(3)部分复用面下的树绑定失配**(`KvStore`/`PrefixTree`;小池档必踩)
+
+前缀命中 `matched` 个块,但 `reuse_face` 为对齐 GDN 快照把复用面裁到 `m < matched`
+⇒ 被裁掉的段**重算并写入新槽**,而缓存树里的同内容条目仍绑**老槽**
+⇒ 新槽 `refs==1`(只有会话)⇒ **结构性不可沉** ⇒ 池被不可沉块填满 ⇒
+`KV 块池耗尽`(实测:60k 首跑正常,70k 续跑 500;小池 256 页 ~8k tok 即撞)。
+修两件:
+
+| 件 | 内容 |
+|---|---|
+| **树重绑定** | `TreeUpdate::rebound`(同哈希、指纹同、**槽不同** ⇒ 改绑新槽)+ `CacheUpdate::host_drop`(旧绑定在宿主 ⇒ 上层 `host.evict` 丢幽灵副本);`apply_tree_update` 统一三条出口(inserted/rebound/evicted)的槽引用账 |
+| **占位符归一** | `insert_one` 把 `Some(u32::MAX)`(`HOST_PLACEHOLDER`,内容在宿主)**归一成 `None`** —— 旧实现把它当真槽存进 `Entry.slot`,turn 收口的整链登记会把 `u32::MAX` 拿去 `incref/decref` ⇒ `槽越界`(虚拟化档必踩;重绑定分支放大了它) |
+
+门:`kv::tests::rebind_repoints_tree_entry_to_new_slot`(新槽 refs==2、旧槽树引用释放、
+命中面槽序 = 新槽)+ `Rel::register_chain_inc` 同步补 `drop_host_evicted`(增量登记
+原先漏丢宿主副本,属同族账漏)。
+
+修后复测:60k→70k 续跑 **双双成功**;22.9k 同前缀复跑 3.2 s。
+
+### 23.4 已知限制(明确挂账,不当"已完成")
+
+1. **整段命中链回灌不设上限**(`phases.rs::execute_begin` 一次搬完 `pending_loads`)
+   ⇒ 复跑所需设备槽 = 命中链的**宿主块数**;池 1 GiB(1024 槽)只支持
+   **~3.2 万 tok** 的前缀复跑。**同前缀 26 万 tok 整链复跑会撞「槽池耗尽」**
+   (修法 = 回灌按工作集/召回面截断,其余维持占位符,由选择层按需回灌;待立项)。
+   短前缀(agent 典型 <32k)不受影响 —— 实测 22.9k 复跑 3.2 s。
+2. **分叉前缀的复用面被快照保留度裁剪**:快照只留最近 ~13-15 张(设备 2 + 宿主 13)
+   ⇒ 与历史前缀分叉的请求只能复用"最近一个**在场**快照边界";裁短后走重算
+   —— 修 (3) 之前这会 500,之后只是**慢**(正确性无损)。
+3. `pool_tokens` 是"工作集 vs 回灌面"的旋钮:调大 ⇒ 回灌面大、prefill 激活余量小;
+   本档取 1 GiB / 32768 tok(单跑 258k 时池内实测常驻仅 ~34 块,余量都在宿主)。
+
+### 23.5 起机与测法
+
+```bash
+# 用户档只写 [model] dir/name + [runtime] device/bind
+CUDA_VISIBLE_DEVICES=GPU-<3090Ti UUID> \
+  target/release/server --flavor gguf27b-262k /tmp/gguf-262k.toml --log-level info
+# 关键自证行:[vram-gov] / [turn-ws] / KVMem 虚拟化档(池 vs 上下文 / 超卖倍数)
+```
+
+> 观察面:`/debug/vram`(`kv.host_blocks` = 宿主腿实占、`slots_free` = 池),
+> `N4 未归还清单`(修复后**应为空**;非空即真泄漏,名字直接指分配点)。
