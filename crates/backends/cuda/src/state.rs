@@ -1528,10 +1528,29 @@ impl GpuCtx {
         // slab 容量三档:diag 固定档(兼容);缺省 = warmup 计量
         // hint(见 owl_shared::slab_hint;满额 × 图数 = VRAM 爆的工程债);
         // hint 缺席 = 64MiB 兜底
+        //
+        // ★ **定量余量**(§65.3-2;2026-10-19 **定尺根治**):
+        // hint = **warmup 计量的峰值活跃集**;而**捕获期**的回收点比 warmup 少
+        // (节点合并 ⇒ 块的活跃期变长)—— 实测 v1 两核融合(§65)把 stage+reduce
+        // 并成一节点后,草稿 MLP 的一个 `[8, 8704] f16` 块(139264B)活过原来
+        // 的回收点 ⇒ 当场“捕获 slab 耗尽:需 139264B”。
+        // 修法 = 给**动态定尺**加余量 `max(1MiB, hint/16)`:
+        //   · 量级:每图 +1MiB(图数 × ⇒ 数十 MiB),在“图slab 640MiB”的
+        //     治理预留内;
+        //   · 固定档(`env_mb`)不受影响(运维显式给值 = 他自己定尺);
+        //   · 不改变已有档的行为(余量只多不少 —— 原“刚好够”的档变得更安全)。
         let env_mb = self.diag.capture_slab_mb.filter(|&v| v > 0);
         let slab_cap = match env_mb {
             Some(mb) => mb << 20,
-            None => owl_shared::slab_hint::take_hint().unwrap_or(64 << 20),
+            None => {
+                let h = owl_shared::slab_hint::take_hint().unwrap_or(64 << 20);
+                // ⚠️ 实测(§65.3-2):+1MiB 余量**不够**(cap 涨到 14.0M 仍差 139264B),
+                // 且 hint 与**本图**的真实峰值差一个量级(固定档 32MiB 可跑)——
+                // 疑为 hint 的**按图分配**错位(take 是一次性消费;图数/顺序变化 ⇒
+                // 某图拿到的是别的图的里程计)。⇒ 暂取**保守 2×**(仍在“图slab
+                // 640MiB”预算内;图数 × 2·hint),待 slab_hint 定量逻辑修正后收紧。
+                h.saturating_mul(2)
+            }
         };
         let slab = unsafe { stream.alloc::<u8>(slab_cap) }
             .map_err(|e| ModelError::Msg(format!("graph_begin: 捕获 slab 分配失败({}MiB) {e:?}", slab_cap >> 20)))?;
