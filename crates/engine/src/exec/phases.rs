@@ -682,7 +682,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             mrec(if degraded { "decode.step.deg" } else { "decode.step.seed" }, t_step.elapsed());
             self.tspec()?.bare_seed_step = false;
         }
-        self.sample_and_emit(nt).await
+        // P2.2 侦察(2026-10-19):`sample_and_emit` = tokenizer 解码差分 + stop 检查
+        // + 事件构造 —— "函数外 1.55ms" 的主嫌疑(它在 exec-main 打点之后)。
+        let t_emit = prof.then(std::time::Instant::now);
+        let ev = self.sample_and_emit(nt).await?;
+        if let Some(t) = t_emit {
+            owl_shared::log_info!("step-prof", "pos={pos} sample-and-emit={:?}", t.elapsed());
+        }
+        Ok(ev)
     }
 
     // ====================================================================

@@ -1183,6 +1183,8 @@ impl<D: DeviceClient> RunningEngine<D> {
             return Ok(ev);
         }
         let prof = self.cfg.knobs.probes.step_profile;
+        // P2.2 侦察(2026-10-19):pump 内分段墙钟(pop-events / 头 / sched / exec / 尾)
+        let t_ph0 = prof.then(std::time::Instant::now);
         // metrics 框架接线(2026-10-01 合并示范):schedule 分相计时入
         // owl_shared 全局 store(debug 展开/release 零开销);prof 时查询
         // 打印。其余 STEP_PROFILE 打点保留原样(gl-prof/srv-timing 工具链
@@ -1202,9 +1204,11 @@ impl<D: DeviceClient> RunningEngine<D> {
         self.admission_gate(&mut need)?;
         self.pool_housekeeping(need).await?;
         let loophead_ms = t_loophead.map(|t| t.elapsed().as_secs_f64() * 1e3).unwrap_or(0.0);
+        let t_lh1 = prof.then(std::time::Instant::now); // 循环头之后
         owl_shared::timer_start!("engine.pump.schedule");
         let t_sched = (prof || true).then(std::time::Instant::now);
         let out = self.schedule()?;
+        let t_sc1 = prof.then(std::time::Instant::now); // schedule 之后
         if let Some(ts) = t_sched {
             let d = ts.elapsed();
             self.sched_acc_ns += d.as_nanos() as u64;
@@ -1220,8 +1224,20 @@ impl<D: DeviceClient> RunningEngine<D> {
         }
         owl_shared::timer_end!("engine.pump.schedule");
         if prof {
-            owl_shared::metrics::query_metrics(&owl_shared::metrics::MetricsFilter::new()
-                .tag_prefix("engine.pump."));
+            // ⚠️ **降频**(P2.2 立案;2026-10-19):原**每步**查一次 metrics ⇒
+            // 实测 **1.63ms/步**（"探针观测即污染"—— 它把 `step_profile` 档的
+            // 读数整体抬高 ~8%,还让"循环外 1.55ms"成为 **探针假象**:分段打点
+            // 显示 `sched→exec` 1.63ms、而 schedule 本身 ≈0 ⇒ 靶就是这一句）。
+            // 改成每 64 步一次(泵循环探针面足够;静态计数零结构改动)。
+            static PUMP_METRIC_TICK: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            if PUMP_METRIC_TICK
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .is_multiple_of(64)
+            {
+                owl_shared::metrics::query_metrics(&owl_shared::metrics::MetricsFilter::new()
+                    .tag_prefix("engine.pump."));
+            }
         }
         match out {
             SchedulerOutput::Idle => {
@@ -1255,7 +1271,19 @@ impl<D: DeviceClient> RunningEngine<D> {
                         let saved = self.dev.env.phase;
                         self.set_phase(owl_models::env::EvalPhase::Decode);
                         owl_shared::timer_start!("engine.phase.decode");
+                        let t_ex0 = t_ph0.map(|_| std::time::Instant::now());
                         let r = self.execute_decode(token, pos, kv_slot, gdn_slot, grew).await;
+                        if let (Some(p0), Some(ex0)) = (t_ph0, t_ex0) {
+                            let head = ex0.duration_since(p0);
+                            let exec = ex0.elapsed();
+                            let lh = t_lh1.map(|t| t.duration_since(p0)).unwrap_or_default();
+                            let sc = t_sc1.map(|t| t.duration_since(t_lh1.unwrap_or(t))).unwrap_or_default();
+                            let tail_head = t_sc1.map(|t| ex0.duration_since(t)).unwrap_or_default();
+                            owl_shared::log_info!(
+                                "pump-phases",
+                                "head={head:?} [entry→lh={lh:?} lh→sched={sc:?} sched→exec={tail_head:?}] exec={exec:?}"
+                            );
+                        }
                         owl_shared::timer_end!("engine.phase.decode");
                         self.set_phase(saved);
                         r

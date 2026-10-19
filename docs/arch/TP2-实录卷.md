@@ -5167,3 +5167,33 @@ host（engine）:
 
 **打点留存**(恒开、纳秒级、零行为影响):`[sched] loophead=`(循环头 ✓ ≈0)、
 `step-prof exec-main=`(函数本体 18.9ms)。
+
+#### 66.5 ★★ 定谳修正：那 1.55ms 是**探针假象**（P2.2 结案）
+
+分段打点（`pump-phases`）把 `head` 1.63ms 精确定位到 **`sched→exec` 段**
+（`entry→lh` 300ns、`lh→sched` 400ns、**`sched→exec` 1.63ms**）——而 `schedule()`
+本身 ≈0 ⇒ 读码：`pump` 开头
+
+```rust
+if prof { owl_shared::metrics::query_metrics(&MetricsFilter::new().tag_prefix("engine.pump.")); }
+```
+
+**每步执行** ⇒ **实测 1.63ms/步**（**探针观测即污染**）。
+
+**修**：降频到每 64 步一次（静态计数，零结构改动）⇒ 复测：`head` **800ns**
+（原 1.63ms）、`sched→exec` **110ns**、`pump` **18.7–19.0ms**（原 20.1–20.8ms）。
+
+**⇒ 对 host 尾巴账的修正（推翻 66.1 的结论行）**：
+
+| 项 | 修正前（探针档）| 修正后（真实）|
+|---|---:|---:|
+| host 暴露/步 | ~2.0ms（~10%）| **≈ 0.6ms（~3%）** = fill+launch 0.25 + host-sample 0.35 |
+| 循环尾 | 1.55ms | **≈ 0**（探针假象）|
+| §2.1 旧账 "host 2.3ms" | — | 同为**探针污染读数**（那轮也开了 `step_profile`）|
+
+**⇒ P2.2 结案**：无大头可修（剩下 0.6ms 全是必要工作：图入队 + host 采样）。
+"上限 decode +10%" 改写为 **"+3% 且已触底"**。
+
+**方法论坑（记为纪律㊲）**：**`step_profile` 会改变被测对象**（每步 +1.6ms）——
+凡用它做的长跑读数（decode t/s、相位比），要么**先扣探针开销**，要么看
+`pump-phases` 的 `head`/`sched→exec` 是否为 ns 级自证。
