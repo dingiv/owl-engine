@@ -525,6 +525,31 @@ only_block_ids = [1099511627777 … +17]   ⇒ 账本 id 1 的前 18 个块
 而**未 flush** ⇒ 块既不在 arena 也不被 free。**下一步 = 在 `eval_ops_scoped_env` 出口
 `flush_pool`(与 scoped 多根同口径)并加门**;或证明它们是"读数据的根"而需显式在轮末归还。
 
+
+### 12.9 刀 N4-b:根块无条件归还(2 块/轮 → 1 块/轮;2026-10-19)
+
+**取证方式(按"不猜"纪律)**:开 `[cuda] trace_ring`,把在借块的 id 拿到**发射账**里比对 ——
+`owl_narrow_strided_f16`:`alloc_done(10240B) → launch owl_narrow_strided_f16 → launch
+marlin_gemm_w4a16_awq(吃它) → 此后无 free`;`owl_dflash_select_bf16`:`alloc → select →
+**dtoh(引擎回读)** → 此后无 free`。
+
+**定谳(两条)**:
+1. `exec/draft.rs::dflash_propose` 的 harvest:根块 `b` = **drafts 的 select 单缓冲**
+   (`b` 只是它的 SliceView);`face.dtoh(&b, ..)` 回读后**只还了 arena,没还 `b`** ⇒ 每轮一条。
+   修:`let mut ids = arena; ids.push(b.id);` 一并还。
+2. `exec/draft.rs::dflash_spec_extend` 的扩展 eval:根块原写作 **`_b`(弃值)** ——
+   那正是漏点的形状(没人读、也没人还)。修:`let (b, arena)` + 与 arena 一起还。
+
+**实测(同档 3 轮)**:`1 / 2 / 3` 条(每轮 **+1**,只剩 `owl_narrow_strided_f16` 10 KiB);
+`recon only_block` 恒 18 · `hook_fail` 0 · `window_unclosed` 0。
+累计:**每轮 +7 → +1**。
+
+**遗留(N4-c)**:`owl_narrow_strided_f16` 1 条/轮。发射账已给出形状:它是草稿 fc 路
+(`五拆 marlin:fc_i 整块 GEMM 直吃 tap_i`)里被 GEMM 消费的**中间块**,却没进 scoped 的
+`arena` 候选 —— 候选 = `arena − root`;**下一步假设**:该 eval 走的是 plain/multi(块常驻,
+为捕获铺路)口径,或 tap 的 narrow 块在 eval 之外构造。取证入口同上(开 trace_ring 看
+`alloc_done` 之后有没有进 arena/有没有 free)。
+
 ## §十一 变更记录
 
 | 日期 | 版本 | 变更 |

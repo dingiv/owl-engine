@@ -417,7 +417,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // [S·(K·K+1) f32],取前 S 个(dflash2.rs select 同坑,测试侧同修)
             let mut buf = vec![0u8; 7196];
             face.dtoh(&b, &mut buf).await?;
-            face.free(&arena).await?;
+            // 根块 = drafts 的 **select 单缓冲**(`b` 是它的 SliceView)——
+            // harvest 完就是 turn 域死块:必须与 arena 一起还,否则每轮漏一条
+            // (`/debug/vram` 的 `turn:N` 列逐轮爬坡;2026-10-19 发射账取证:
+            //  alloc→select→dtoh 三条之后既无 free 也不在 arena 候选里)。
+            let mut ids = arena;
+            ids.push(b.id);
+            face.free(&ids).await?;
             buf.chunks_exact(4)
                 .take(7) // 父块 = select 单缓冲(SliceView dtoh 回整块);草稿仅前 7
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
@@ -1164,7 +1170,8 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             &tok_t, &hid_view, &pos_t, &kv, &slots_t, &lens_t, &cu_t,
             &self.model.embed, &self.rope, self.env,
         );
-        let (_b, arena) = {
+        // 原为 `_b`(弃值)—— 那正是漏点的形状:根块没人读也没人还
+        let (b, arena) = {
             let face = self.graphs.session.face_mut();
             owl_models::interpreters::eval_ops_scoped_env(root.step(), face, self.env, self.tp.as_ref()).await?
         };
@@ -1172,7 +1179,12 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         mrec("spec.extend", t_all.elapsed());
         {
             let face = self.graphs.session.face_mut();
-            face.free(&arena).await?;
+            // **根块一并无条件归还**:本路只在图外扩展草稿池槽,根的值**无人读**
+            // (只借它触发执行)—— 单根 scoped 的 root 不在 `arena` 候选里,
+            // 不显式还就是每轮一条的漏(turn 列爬坡的第二条指纹)。
+            let mut ids = arena;
+            ids.push(b.id);
+            face.free(&ids).await?;
         }
         Ok(())
     }
