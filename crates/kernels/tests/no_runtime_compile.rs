@@ -128,3 +128,139 @@ fn banned_matcher_is_sensitive() {
         "一行同时含白名单词与禁词时不得被豁免"
     );
 }
+
+// ============================================================================
+// §2 **GGUF 族的源码级 I-4 门**(2026-10-19 gguf 轮;设计 §六 I-4 / REQ-GGUF-06)
+//
+// I-4 原文:`cu/gguf/*.cu` 无 `cudaMalloc*` / `cudaMemset*` /
+// `cudaGetDeviceProperties`。为什么必须是**源码级**门(而不是运行期断言):
+// ① 账外分配在捕获期才炸(A5.2:一切分配过账本),而运行期断言只证明"本轮没踩";
+// ② 运行期设备查询(H2)是"只在别的卡/别的 CC 才走到"的隐蔽分支 ——
+//    正是 `mistral.rs flashinfer` 与上游 `gguf_gemm()` 的原始形态。
+//
+// ⚠️ **注释剥离是刻意的**:本族 `.cu` 的**头注逐字引用了这些禁词**去讲"上游这么干、
+// 本仓改掉了"(H1/H2 条目)—— 引文不是违规。故本门只看**代码行**
+// (`//` 行注释与 `/* */` 块注释先剔),与 §1 的 `.rs` 门(`注释行也报`)口径不同,
+// 差别及理由写在这里,不许两处各说各话。
+// ============================================================================
+
+/// GGUF 族源码根(相对 workspace 根)
+const GGUF_CU_ROOT: &str = "crates/kernels/cu/gguf";
+
+/// I-4 禁词(设备源码里出现即红)
+const GGUF_BANNED: &[&str] = &[
+    "cudaMalloc",
+    "cudaFree",
+    "cudaMemset",
+    "cudaGetDeviceProperties",
+    "cudaMemGetInfo",
+];
+
+/// 剥掉 C/C++ 注释(块注释先、行注释后;字符串里的 `//` 本族源不存在,不做词法级处理)
+fn strip_c_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let (mut i, mut in_block) = (0usize, false);
+    let mut in_line = false;
+    while i < bytes.len() {
+        let two = |k: usize| -> &[u8] { &bytes[k..(k + 2).min(bytes.len())] };
+        if in_line {
+            if bytes[i] == b'\n' {
+                in_line = false;
+                out.push('\n');
+            } else {
+                out.push(' ');
+            }
+            i += 1;
+        } else if in_block {
+            if two(i) == b"*/" {
+                in_block = false;
+                out.push_str("  ");
+                i += 2;
+            } else {
+                if bytes[i] == b'\n' {
+                    out.push('\n');
+                }
+                i += 1;
+            }
+        } else if two(i) == b"/*" {
+            in_block = true;
+            out.push_str("  ");
+            i += 2;
+        } else if two(i) == b"//" {
+            in_line = true;
+            out.push_str("  ");
+            i += 2;
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+#[test]
+fn gguf_kernels_never_allocate_or_query_device() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace 根")
+        .to_path_buf();
+    let dir = root.join(GGUF_CU_ROOT);
+    let mut files: Vec<PathBuf> = Vec::new();
+    collect_cu(&dir, &mut files);
+    assert!(
+        files.len() >= 3,
+        "扫描面异常小({} 个 .cu/.cuh,期望 ≥3:gemm/quant/rows)—— 路径推导错了?",
+        files.len()
+    );
+    let mut hits: Vec<String> = Vec::new();
+    for f in &files {
+        let Ok(text) = std::fs::read_to_string(f) else { continue };
+        let code = strip_c_comments(&text);
+        for (ln, line) in code.lines().enumerate() {
+            for pat in GGUF_BANNED {
+                if line.contains(pat) {
+                    let rel = f.strip_prefix(&root).unwrap_or(f).display().to_string();
+                    hits.push(format!("{rel}:{} [{pat}] {}", ln + 1, line.trim()));
+                }
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "I-4 被破:GGUF 族设备源码出现分配/设备查询调用(设计 §六 I-4 / REQ-GGUF-06;\n  \
+         A5.2 一切分配过账本 + 热路径禁 host 查询):\n  {}",
+        hits.join("\n  ")
+    );
+    eprintln!("[I-4] GGUF 族 {} 个源文件零 cudaMalloc*/Free/Memset*/GetDeviceProperties ✓", files.len());
+}
+
+/// 递归收集 `.cu`/`.cuh`(与 [`collect`] 同律的姊妹;源码门专用)
+fn collect_cu(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect_cu(&p, out);
+        } else if matches!(p.extension().and_then(|s| s.to_str()), Some("cu" | "cuh")) {
+            out.push(p);
+        }
+    }
+}
+
+/// 反证面:注释剥离与禁词匹配都要**能抓到违规**(防"扫描器坏了 ⇒ 永远绿")
+#[test]
+fn gguf_i4_matcher_is_sensitive() {
+    let viol = "static __device__ void f() { void * p; cudaMalloc(&p, 64); }";
+    let code = strip_c_comments(viol);
+    assert!(GGUF_BANNED.iter().any(|p| code.contains(p)), "禁词匹配失灵");
+    // 引文(注释里提到禁词)必须**不算违规** —— 否则头注的 H1/H2 条目会误红
+    let doc = "// 上游 gguf_gemm() 用 cudaGetDeviceProperties 查 CC\n/* cudaMallocAsync 装中间缓冲 */\n";
+    let code = strip_c_comments(doc);
+    assert!(
+        !GGUF_BANNED.iter().any(|p| code.contains(p)),
+        "注释剥离漏了(引文被当成代码)"
+    );
+    assert!(code.matches('\n').count() >= 1, "行号保真丢了");
+}
