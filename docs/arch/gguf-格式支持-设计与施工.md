@@ -1424,29 +1424,96 @@ GGUF/同一张 3090 Ti 41:00.0)挂 `nsys profile --trace=cuda`;发 3 个 ≈833-
 
 decode 步(1 token)对照:**28.9 ms**(MMVQ 22.3 + 量化 0.83 + …)⇒ ≈34.6 t/s。
 
-### 21.2 与 owl 的逐类对账(折算到 1001 token,ms)
+### 21.2 ⚠️ **定谳更正(同日)**:owl 侧必须用 **server 档**量,不能用探针档
 
-| 类 | llama.cpp(×1001/833) | owl(实测) | 差 |
+首版本节的对账用的是 **debug 探针**(`gpu_gguf_prefill_single` → `gguf_cfg`)的 nsys:
+该档的池 **非 paged** ⇒ `fi_quant=None` ⇒ **FI 面关** ⇒ prefill 注意力退到
+`vllm_chunked_prefill_paged_attn`(4.6 ms/层)。**生产 server 档 FI 是开的**。
+按 server(`--flavor gguf27b`,3 个 ≈864-token 请求)重测:
+
+| 类 | 时间 | 占比 | 次数 | 备注 |
+|---|---:|---:|---:|---|
+| GEMM(cuBLAS 三档 tile) | 1877 ms | 72.2% | 2304 | `192x128`/`128x128`/`96x128` 混档 |
+| **GDN** | 348 | 13.3% | 144 | **2.42 ms/层**(48 层 × 3 请求) |
+| **权重解量化** | 270 | 10.4% | 2640 | q4k 151 + q8_0 114 + q6k 5 |
+| silu/norm/conv/add/narrow/… | ~96 | 3.7% | | |
+| **attention(FI)** | **9.9** | **0.4%** | 48 | **0.206 ms/层** |
+
+⇒ **我们的 prefill 注意力已经和 llama.cpp 同档(0.206 vs 0.324 ms/层,反而更快)**
+—— §21.1 的"attention 慢 10×"是探针档的假象,已作废。
+
+**逐类对账(per token,ms;两侧都是纯 GPU busy)**
+
+| 类 | llama.cpp(0.663 ms/tok) | owl server(1.009 ms/tok) | 差 |
 |---|---:|---:|---:|
-| 权重 matmul | **472**(int8 MMA,103 TFLOPS) | **730**(cuBLAS f16×f32,66 TFLOPS) | **−258** |
-| 激活量化 / 权重解量化 | **19**(q8_1_mmq) | **88**(dequant→f16) | **−69** |
-| attention | **6**(324 µs/层) | **148**(4.6 ms/层,2.7 TFLOPS) | **−142** |
-| GDN | **94**(1.64 ms/层 ×48) | **133**(2.77 ms/层 ×48) | **−39** |
-| norm/silu/残差/concat | 72 | ~40 | **+32** |
-| **合计** | **663** | **1016** | **−353** |
+| 权重 matmul | **0.472**(int8 MMA,103 TFLOPS) | **0.724**(cuBLAS f16×f32,66 TFLOPS) | **−0.252** |
+| 激活量化 / 权重解量化 | 0.019 | 0.104 | **−0.085** |
+| GDN | 0.094 | 0.134 | **−0.040** |
+| attention | 0.006 | **0.004** | **+0.002** |
+| norm/silu/残差/concat | 0.072 | 0.043 | **+0.029** |
+| **合计** | **0.663** | **1.009** | **−0.346**(1.52×) |
 
-### 21.3 结论(改写了 §20.6 的优先级)
+### 21.3 结论(2026-10-19 更正版)
 
-1. **int8-MMA MMQ 值 1.5× matmul**(103 vs 66 TFLOPS),不是"2× 峰值";
-   连带的激活量化他们也要付(2.9%,496 发)⇒ 我们"省一发量化"的优势很小,
-   但**我们的 dequant 88 ms 是他们的 3 倍**(他们零权重搬运)。
-   ⇒ 移植收益 ≈ 258 + 69 = **327 ms / 32%**。
-2. **attention 是第二大窟窿:我们慢 10×**(324 µs vs 4.6 ms/层)⇒ 142 ms / 14%。
-   他们的 flash_attn 跑到 26 TFLOPS;我们 2.7 TFLOPS。
-3. GDN 差 1.4×(39 ms),decode 已对齐(我们 36.6 vs 他们 34.6 t/s)。
-4. **他们全程 eager**(整条 trace `cudaGraphLaunch = 0`,23 913 发 kernel)⇒
-   "开桶"不是追平对手的关键,**kernel 质量才是**;同时说明我们的 eager 不是劣势。
-5. 口径提醒:std 口径差 1.31×(1265 vs 964@chunk1024)/**纯 GPU 口径差 1.51×**
-   (1510 vs ≈1000)—— std 里两侧的 HTTP/首 token 开销不同,别混用。
+1. **唯一的大杠杆 = int8-MMA MMQ**:matmul 1.53×(103 vs 66 TFLOPS)+ 零权重搬运
+   ⇒ 合计 **−0.337 ms/tok = −33%**。连带的激活量化他们也要付(0.019),
+   所以净账 = 0.724+0.104 → 0.472+0.019。
+2. **attention 不是问题**(我们 0.206 ms/层 已快于他们 0.324);GDN 是第二项
+   (0.040 ms/tok = 4%,我们核 vs 他们核 1.47×)。
+3. **他们全程 eager**(整条 trace `cudaGraphLaunch = 0`,23 913 发 kernel)⇒
+   "开桶"不是追平对手的关键,**kernel 质量才是**;我们的 eager 不是劣势。
+4. 口径提醒:std 口径差 1.31×(1265 vs 964@chunk1024)/**纯 GPU 口径差 1.52×**
+   (1510 vs 991)—— std 里两侧的 HTTP/首 token 开销不同,别混用。
+5. **口径纪律(本轮教训)**:引擎侧任何"逐核"结论必须用 **server 档**取数;
+   探针档(`gguf_cfg`)= 非 paged ⇒ FI 面关 ⇒ 会把注意力读数放大 20×。
 
 原始件:`/tmp/llama_w2e.nsys-rep`(+ `.sqlite`;本表由 sqlite 逐核聚合复算)。
+
+## 二十二、W-2f 立案:port **head 版 int8-MMA MMQ**(§21 之后的唯一大杠杆)
+
+### 22.1 为什么必须是 head 版
+
+§18 薅的是 `llama.cpp@1b1e27cb49`(2024-05)的 MMQ —— 那一代**没有 int8 张量核**
+(`vecdotq.cuh` 里 0 条 `mma` 指令,所谓 "tensor cores" 只改 tile 配置),
+dp4a 档实测 27B prefill 557 t/s(§20 之前)。**103 TFLOPS 的 matmul 只存在于
+`mma.sync.m16n8k16.s8` 路径**,即 head/fork 版 `mmq.cu + mmq-vec-dot + mma.cuh`。
+
+### 22.2 可行性 spike(2026-10-19,**已过**)
+
+```bash
+# 直接用 fork 自己的树编译(零改动、零 shell):
+nvcc -DGGML_CUDA_USE_GRAPHS -DGGML_SCHED_MAX_COPIES=4 \
+     -I packages/llama.cpp/ggml/src -I packages/llama.cpp/ggml/include \
+     -O3 -std=c++17 "--generate-code=arch=compute_86,code=[sm_86]" \
+     -use_fast_math -extended-lambda -x cu -c \
+     packages/llama.cpp/ggml/src/ggml-cuda/mmq.cu -o /tmp/mmq_fork.o
+# ⇒ 214 KB .o,**一次通过**(依赖闭包 = mmq.cuh + mmq-load-tiles + mmq-vec-dot
+#   + vecdotq + mma + common.cuh + ggml-common.h + ggml 头)
+```
+
+**关键发现**:`common.cuh` 的 `ggml_backend_cuda_context` 是**纯字段结构**
+(device + streams 数组),不需要 `ggml-cuda.cu` 的实现;profiled 核名
+`mul_mat_q<(ggml_type)12, (int)128, (bool)0>` ⇒ 内核模板 = **`<type, J, fallback>`**,
+`nthreads/occupancy/I/sram_layout/K_vram/stream_k` 全在**设备侧 constexpr**
+(`ggml_cuda_mmq_get_config`)⇒ host 侧只需"选 J + 按 J 分档发射"。
+
+### 22.3 落地清单(下一刀)
+
+| # | 件 | 来源 | 说明 |
+|---|---|---|---|
+| 1 | `cu/gguf/vendor2/` | fork `ggml/src/ggml-cuda/` 的 `mmq.cu/mmq.cuh/mmq-load-tiles.cuh/mmq-vec-dot.cuh/mmq-config-*.cuh/vecdotq.cuh/mma.cuh/common.cuh/ggml-common.h` | 逐字 vendoring(含 LICENSE);`ggml/src` + `ggml/include` 两个头目录一并收编(它们的 `ggml.h/ggml-backend-impl.h/ggml-impl.h`) |
+| 2 | `block_q8_1_mmq` 激活布局 | 同 fork `mmq.cuh`(144 B = 4×block_q8_1) | **新**激活量化核:`quantize_mmq_q8_1<layout>`(fork `quantize.cu` 里 458 行那支);DS 布局由型定(Q4_K/Q5_K=DS4、Q6_K/Q8_0=D4) |
+| 3 | host 胶水 | 仿 `mul_mat_q_case`(mmq.cuh:1561,~100 行) | 选 `J = min(m,512)` 向下对齐 8 + `fallback = (n % 128 != 0)`;`cudaFuncSetAttribute(dynamic smem)` **boot 期一次**(H2:捕获期禁) |
+| 4 | owl 入口 | `gguf_mmq2.cu` | `extern "C" owl_gguf_mmq2_<ty>(w, xq, out, n, m, k, stream)`:填 `mmq_args` + 调 case;输出 f16 [m,n] |
+| 5 | 分派 | `layers/linear.rs` | 新臂 `m ≥ 64` 优先于 cuBLAS;`OWL_GGUF_MMQ2=0` 一键回退;`ssm_out` 走既有 gather 后同路 |
+| 6 | 门 | `kernel_gate.rs` | ①vs cuBLAS 臂 `max|Δ|/max < 2e-2`(真实张量 4B+27B × m=128/512/1024)②prefill 探针两臂首 token 同 ③std 五点三轮 A/B |
+| 7 | 验收线 | `llm_speedtest std` | GEMM 0.724 → ≤0.50 ms/tok、dequant 归零 ⇒ 总 ≤0.72 ms/tok ⇒ **≥1380 t/s**(llama.cpp 1510 的 91%;再叠 GDN 4% 即追平) |
+
+### 22.4 风险与先手
+
+- **StreamK**:fork 默认对部分形状开 `stream_k`(多一个 fixup 核 + 原子累加)⇒ 首版
+  **强制关**(`stream_k=false`),牺牲少量大 m 收益换零新机制;
+- **动态 smem**:`cudaFuncSetAttribute` 必须在任何捕获之前 ⇒ boot 期按 (type,J) 全集预置;
+- **`ggml_cuda_info()`**:我们按 H2 改成**boot 期常量**(cc=86 + smem 上限),沿用 §18 的壳思路;
+- **数值**:int8 MMA 的 d/s 布局与 q8_1 不同 ⇒ 参考臂只能对 **cuBLAS 臂**(f16 输入,更准)
+  给 allclose,不给位级门;判据沿用 §19.5 的 2e-2 口径。
