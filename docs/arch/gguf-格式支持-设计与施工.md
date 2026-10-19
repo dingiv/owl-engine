@@ -1573,3 +1573,29 @@ nvcc -DGGML_CUDA_USE_GRAPHS -DGGML_SCHED_MAX_COPIES=4 \
 
 **下一步**(按 §21.3 的账,只剩 GDN 4%):`owl_gdn_recurrence_varlen_gqa_f16`
 2.42 ms/层 vs llama 1.64;以及 m=512 段仍偏慢(1450 vs 1531,GEMM 小 m 效率)。
+
+### 22.6 W-2g:GDN prefill 换 **chunked 臂**(2026-10-19)—— std avg 1504.7 → **1778.3(+18.2%)**
+
+**定性** = **配置漏配**,不是代码问题:`[dispatch] gdn_chunked` 缺省 `false`(走
+`varlen` **顺序扫描**),而 AWQ 生产档(`awq27b-262k/-kvmem`)早就开它;GGUF 档一直
+没开 ⇒ 每层 GDN 2.42 ms @T=1024 = prefill 的 18%。
+
+分块臂(T 并行分块 delta-rule)每层 **~0.65 ms** ⇒
+
+| | varlen(旧) | **chunked(新)** |
+|---|---:|---:|
+| std avg | 1504.7 | **1778.3(+18.2%)** |
+| @1024 | 1531 | **1841** |
+| @8192 | 1496 | **1770** |
+| TTFT@8192 | 5465 ms | **4620 ms** |
+| decode | 36.6 | 36.5(不动)|
+
+**正确性(门全绿)**:`gdn_chunked_matches_varlen_fn_level`(与 varlen 臂**逐值**)、
+`gdn_chunked_golden`(分阶段金标)、`gdn_chunked_nt_decomposition_identity`(T=512 ≡
+8×T=64 链式,逐位);另跑一次 `/v1/chat/completions` 文本连贯("…Berlin")。
+
+**新的 prefill 预算**(1024 token ≈ 556 ms):**GEMM int8 450 ms(81%)** · GDN 31(6%)·
+激活量化 20(4%)· attention 10(2%)· 杂项 45(8%)。
+⇒ 剩下唯一的量级项是 **GEMM 的核质量**:marlin-a8 实测 145 TFLOPS 对 llava-MMQ 的
+103(-29%),即还有 ~110 ms(≈+20% 吞吐)可挖;GDN 已从"劣势"翻成"优势"
+(0.63 µs/token vs llama.cpp 的 1.97)。

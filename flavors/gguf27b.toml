@@ -78,6 +78,14 @@ max_concurrency = 1
 mode = "greedy"
 
 [dispatch]
+# **GDN prefill 臂 = chunked(T 并行分块扫描;2026-10-19 W-2g)**
+# 缺省 `gdn_chunked = false` 走 `varlen` 顺序扫描(每层 ~2.42 ms @T=1024);
+# 分块臂 ~0.65 ms ⇒ std avg **1504.7 → 1778.3(+18.2%)**、TTFT@8192 5465 → 4620 ms。
+# 正确性:门 `gdn_chunked_matches_varlen_fn_level`(与 varlen 臂逐值)+ 金标
+# `gdn_chunked_golden` + NT 分解恒等 全绿;AWQ 生产档(`awq27b-262k/-kvmem`)
+# 早就开着它 —— GGUF 档此前是漏配(不是代码问题)。
+# 注:AWQ 档的 `allowed_ops` 需要多一条 `gdn_chunked_delta_rule_fwd`;本档无白名单。
+gdn_chunked = true
 # ⚠️ **本档暂不设 `allowed_ops` 白名单**(门关):
 # 白名单要按**发射账并集**生成(方法写在 `gguf4b.toml` 的 [dispatch] 注释里),
 # 而 27B 的臂集与 4B 不同(prefill 走 FI 的 hd256 k/v 变体 + decode v2 hd256 族,
