@@ -620,6 +620,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         b,
                         tail,
                         owl_store::SnapDurability::Transient,
+                        true,
                     )
                     .await?;
                     owl_shared::log_debug!("spec-round", "边界:snap_tail 完");
@@ -1035,12 +1036,29 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// 它们与"要不要拍快照"无关。旧实现把四件塞在一个 `snap_max == 0 ⇒ return`
     /// 之后:关快照面 ⇒ **索引不采 + 块不入树 ⇒ 静默不沉**(实测 `snap_max = 0`
     /// 档:下沉 0 块 / 不可沉 1680 块;prefill 假快 942 tok/s)。
-    pub(crate) async fn capture_gdn_snap(&mut self, sid: u64, fed: usize) -> Result<()> {
+    pub(crate) async fn capture_gdn_snap(
+        &mut self,
+        sid: u64,
+        fed: usize,
+        snap_keep: bool,
+    ) -> Result<()> {
         // **前缀段**(prefill chunk 边界)专用:prompt 页边界有跨会话共享价值
         // ⇒ Durable(可下沉宿主)。生成段边界另走
         // [`Self::capture_gdn_snap_tail`] 的 Transient 档。
-        self.capture_gdn_snap_tail(sid, fed, &[], owl_store::SnapDurability::Durable)
-            .await
+        //
+        // `snap_keep` = 本边界**是否值得留快照**(2026-10-20 节奏化):
+        // 链推进 / 增量登记 / 索引采集**每边界必做**(它们不是为了复用),
+        // 只有"拍快照 + 槽满 DtoH 下沉(159 MB ≈ 31 ms)"这一半按节奏做 ——
+        // 冷长 prefill 每 512/1024 tok 都拍 = 纯开销;复用只需要**末边界** +
+        // 稀疏锚点(见 `phases.rs` 的 `SNAP_EVERY`)。
+        self.capture_gdn_snap_tail(
+            sid,
+            fed,
+            &[],
+            owl_store::SnapDurability::Durable,
+            snap_keep,
+        )
+        .await
     }
 
     /// 同上,但 `tail` = 最后几个**已提交尚未入 `act.out`** 的 token
@@ -1054,6 +1072,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         fed: usize,
         tail: &[u32],
         durability: owl_store::SnapDurability,
+        snap_keep: bool,
     ) -> Result<()> {
         // 快照面开关(只门住第 ④ 步;前三步照走)。
         //
@@ -1065,7 +1084,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         //    是**纯浪费**,实测 67ms/块(8k 请求 ≈ 1.0s ≈ prefill 的 17%:
         //    `prefill.bnd` 3039ms → 0)。
         // ② **容量门**(本线):`snap_max = 0` ⇒ 池结构上无槽(调用方已先行跳过)。
-        let snap_on = self.dev.pool.snap_capacity() > 0 && self.cfg.knobs.prefix_cache;
+        let snap_on = snap_keep && self.dev.pool.snap_capacity() > 0 && self.cfg.knobs.prefix_cache;
         let page = self.dev.pool.page;
         let full_blocks = fed / page;
         if page == 0 || full_blocks == 0 {
@@ -1084,6 +1103,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if start >= full_blocks {
             return Ok(()); // 幂等:同一 fed 不重复拍(状态由同一 token 链唯一确定)
         }
+        let t_diag = std::time::Instant::now();
         // 2) 取新增整块的 token 段(活跃 turn 的链面;轮内调用带 `tail`)
         let seg = self.tokens_upto_with(start * page, full_blocks * page, tail)?;
         // 3) 推进身份链(段长不符 = 结构性拒,不静默;逐块哈希在同一处重放
@@ -1163,6 +1183,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 full_blocks,
             );
         }
+        let snap_ms = t_diag.elapsed().as_secs_f64() * 1000.0;
         // **B 轴 B-0:同一处顺手采索引**(同一"块边界 + 链尾身份"事件 ⇒
         // 一次算身份、一次推进游标;索引与 GDN 快照共享边界身份)。
         // 逐块登记:物理页由**会话块表**定(池可被多会话共享;旧实现拿
@@ -1209,10 +1230,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 eprintln!("[chain-inc] 空:per_block={} 全被跳过", per_block.len());
             }
         }
-        // **B 轴 B-0:索引采集**(同一"块边界"事件;同样逐块、物理页由会话块表定)
+        let reg_ms = t_diag.elapsed().as_secs_f64() * 1000.0;
+        // **B 轴 B-0:索引采集**(同一"块边界"事件;物理页由会话块表定)
         if self.cfg.knobs.index_probe {
-            for (hash, blk) in per_block {
-                let Some(phys) = bt_now.get(blk).copied() else {
+            let mut todo: Vec<(owl_store::ChainHash, usize, usize)> =
+                Vec::with_capacity(per_block.len());
+            for (hash, blk) in &per_block {
+                let Some(phys) = bt_now.get(*blk).copied() else {
                     return Err(ModelError::Msg(format!(
                         "索引采集:逻辑块 {blk} 无物理页(块表 {} 项)",
                         bt_now.len()
@@ -1225,35 +1249,44 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     mcnt("store.index.skip.host", 1);
                     continue;
                 }
-                let phys = phys as usize;
-                self.collect_index_for_block(hash, blk, phys).await?;
+                todo.push((*hash, *blk, phys as usize));
             }
+            self.collect_index_for_blocks(&todo).await?;
+        }
+        if std::env::var_os("OWL_VRAM_DBG").is_some() {
+            let idx_ms = t_diag.elapsed().as_secs_f64() * 1000.0;
+            eprintln!(
+                "[snap] fed={fed} 快照段 {snap_ms:.0}ms(含链/槽/拷贝/登记)· 增量登记 {:.0}ms · 索引 {:.0}ms",
+                reg_ms - snap_ms,
+                idx_ms - reg_ms
+            );
         }
         Ok(())
     }
 
-    /// **B-0 索引采集**(回读形态;§8.1 路 A):块完成 ⇒ 回读该块物理页 K →
-    /// host **逆 RoPE**(核内约定 = rotate-half + partial 直通,见 §8.2)→ 逐
-    /// (层, KV 头) 求 Mean-K → `Rel::index_register`(账 = host/Index)。
+    /// **B-0 索引采集(批版)**(回读形态;§8.1 路 A;2026-10-20 批化+并行):
+    /// 块边界新增的 N 块**一次 D2H** + **多线程 host 解码**,再逐块登记。
     ///
-    /// - `block_hash` = 该块的**内容身份**(逐块父链哈希,调用方已算 ——
-    ///   与 GDN 快照同源);
-    /// - `logical_block` = 逻辑块号(定**位置** = `logical_block·page + t`);
-    /// - `phys_page` = 会话块表里的**物理页号**(回读偏移的真源;池可共享)。
+    /// 旧实现逐块 `dtoh_batch` + 单线程逐元素解码/逆 RoPE:27B/GGUF chunk1024
+    /// 实测 **60 ms/边界**(32 块)—— 占 prefill 的 6%,且随 chunk 线性。
+    /// 本版两条都不改语义:每块的 (层,头) 累加顺序与旧版**逐位相同**(线程按块
+    /// 切分,块内循环不变);D2H 片序 = (块, 层)。
     ///
-    /// 关(缺省)= 调用方不调(零开销)。
-    pub(crate) async fn collect_index_for_block(
+    /// - `items` = `(block_hash, logical_block, phys_page)`;
+    /// - 幂等:已在索引账的块跳过(重复边界只会是重拍);
+    /// - 关(缺省)= 调用方不调(零开销)。
+    pub(crate) async fn collect_index_for_blocks(
         &mut self,
-        block_hash: owl_store::ChainHash,
-        logical_block: usize,
-        phys_page: usize,
+        items: &[(owl_store::ChainHash, usize, usize)],
     ) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
         let Some(ix_geom) = self.bank.rel.index.as_ref().map(|i| i.geometry()) else {
             return Ok(()); // 索引未注册(未开采集)
         };
         let (dim, layers, kv_heads) = ix_geom;
         let page = self.dev.pool.page;
-        let block = logical_block;
         let (hkv, hd) = (self.dev.pool.dims.hkv, self.dev.pool.dims.hd);
         if hd != dim || hkv != kv_heads {
             return Err(owl_iface::contract::ModelError::Msg(format!(
@@ -1261,21 +1294,27 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             )));
         }
         // **池页格式从池实况取**(单源:`KvPageFormat::of_pool`)——
-        // f16 / fp8 e4m3 两侧同一寻址式,只差元素宽与转换律
-        // (`owl_models::kernel::e4m3_decode`)。此前写死 f16 并对 fp8 响亮拒 ⇒
-        // **27B 的 fp8 生产档根本开不了选择层**(fp8 才是它在产 KV 格式)。
+        // f16 / fp8 e4m3 两侧同一寻址式,只差元素宽与转换律。
         let fmt = crate::exec::kvpage::KvPageFormat::of_pool(self.dev.pool.kv_fp8);
-        if self.bank.rel.index.as_ref().is_some_and(|i| i.contains(block_hash)) {
-            return Ok(()); // 幂等(同一块重复拍)
+        let todo: Vec<&(owl_store::ChainHash, usize, usize)> = items
+            .iter()
+            .filter(|(h, _, _)| {
+                !self.bank.rel.index.as_ref().is_some_and(|i| i.contains(*h))
+            })
+            .collect();
+        if todo.is_empty() {
+            return Ok(());
         }
-        let mut collector = owl_store::MeanKCollector::new(dim, layers, kv_heads)?;
         let t_index = std::time::Instant::now();
-        // 逐层回读该块的**物理页** K —— **一条批量命令**(原每层一次同步往返:
-        // 27B = 16 层 × 每块一次 ⇒ 8192 块 = 13 万次往返,分钟级;设计卷 §10.3 推论 B)
         let page_bytes = fmt.page_bytes(page, hkv, hd);
-        let mut pieces: Vec<(&owl_iface::contract::Bytes, usize, usize)> = Vec::new();
-        for kv in self.dev.pool.kvs.iter().take(layers) {
-            pieces.push((&kv.k_cache.0, phys_page * page_bytes, page_bytes));
+        let per_block_bytes = layers * page_bytes;
+        // 一条批命令读完 N 块 × layers 层的 K 页(片序 = 块, 层)
+        let mut pieces: Vec<(&owl_iface::contract::Bytes, usize, usize)> =
+            Vec::with_capacity(todo.len() * layers);
+        for (_, _, phys) in &todo {
+            for kv in self.dev.pool.kvs.iter().take(layers) {
+                pieces.push((&kv.k_cache.0, *phys * page_bytes, page_bytes));
+            }
         }
         let all = {
             let face = self.dev.graphs.session.face_mut();
@@ -1283,33 +1322,101 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         };
         let t_host = std::time::Instant::now();
         let dtoh_ms = t_host.duration_since(t_index).as_secs_f64() * 1000.0;
-        let mut row = vec![0.0f32; hd];
-        for (li, _kv) in self.dev.pool.kvs.iter().enumerate().take(layers) {
-            let kbuf = &all[li * page_bytes..(li + 1) * page_bytes];
-            // 逐 token × 头:逆 RoPE(cos/sin 来自 host 侧同源表)+ 累加
-            // 位置 = **逻辑**位置(logical_block·page + t;物理页号不参与位置)
-            for t in 0..page {
-                let pos = block * page + t;
-                let Some((cos, sin)) = self.dev.rope.cos_sin_at(pos) else { continue };
-                for h in 0..hkv {
-                    fmt.decode_row(kbuf, t, h, hkv, hd, &mut row)?;
-                    collector.push_post_rope_halves(li, h, &row, cos, sin)?;
+        // **cos/sin 表在主机线程取好**(位置 = 逻辑块;`Rope` 句柄不跨线程共享)
+        let ropes: Vec<Vec<(Vec<f32>, Vec<f32>)>> = todo
+            .iter()
+            .map(|(_, blk, _)| {
+                (0..page)
+                    .map(|t| {
+                        self.dev
+                            .rope
+                            .cos_sin_at(blk * page + t)
+                            .map(|(c, s)| (c.to_vec(), s.to_vec()))
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            })
+            .collect();
+        let n_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, 16)
+            .min(todo.len());
+        // 原子游标放在 scope **外**:scoped 线程借用它到 scope 结束
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let results: Vec<(usize, Vec<owl_store::MeanKEntry>)> = std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(n_threads);
+            for _ in 0..n_threads {
+                let (next, todo, all, ropes) = (&next, &todo, &all, &ropes);
+                handles.push(s.spawn(
+                    move || -> Result<Vec<(usize, Vec<owl_store::MeanKEntry>)>> {
+                        let mut local = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if i >= todo.len() {
+                                break;
+                            }
+                            let kbuf = &all[i * per_block_bytes..(i + 1) * per_block_bytes];
+                            let mut collector = owl_store::MeanKCollector::new(dim, layers, kv_heads)?;
+                            let mut row = vec![0.0f32; hd];
+                            for li in 0..layers {
+                                let lb = &kbuf[li * page_bytes..(li + 1) * page_bytes];
+                                for t in 0..page {
+                                    let Some((cos, sin)) = ropes[i].get(t) else { continue };
+                                    if cos.is_empty() {
+                                        continue; // 位置超 rope 表(与旧版 `continue` 同)
+                                    }
+                                    for h in 0..hkv {
+                                        fmt.decode_row(lb, t, h, hkv, hd, &mut row)?;
+                                        collector.push_post_rope_halves(li, h, &row, cos, sin)?;
+                                    }
+                                }
+                            }
+                            local.push((i, collector.finish()?));
+                        }
+                        Ok(local)
+                    },
+                ));
+            }
+            let mut acc = Vec::new();
+            let mut err: Option<owl_iface::contract::ModelError> = None;
+            for h in handles {
+                match h.join() {
+                    Ok(Ok(v)) => acc.extend(v),
+                    Ok(Err(e)) => {
+                        err.get_or_insert(e);
+                    }
+                    Err(_) => {
+                        err.get_or_insert(owl_iface::contract::ModelError::Msg(
+                            "索引采集线程 panic(设计外)".into(),
+                        ));
+                    }
                 }
             }
+            match err {
+                Some(e) => Err(e),
+                None => Ok(acc),
+            }
+        })?;
+        // 顺序登记(身份 → 条目),与旧版同序
+        let mut by_idx: Vec<Option<Vec<owl_store::MeanKEntry>>> =
+            (0..todo.len()).map(|_| None).collect();
+        for (i, e) in results {
+            by_idx[i] = Some(e);
         }
-        let entries = collector.finish()?;
-        self.bank.rel.index_register(block_hash, entries)?;
+        for (i, entries) in by_idx.into_iter().enumerate() {
+            let (hash, _, _) = todo[i];
+            self.bank.rel.index_register(*hash, entries.ok_or_else(|| {
+                owl_iface::contract::ModelError::Msg(format!("索引采集漏块:第 {i} 块无条目"))
+            })?)?;
+        }
         let el = t_index.elapsed().as_secs_f64() * 1000.0;
         self.prof.index_ms += el;
-        // **相位拆分**(`OWL_IDX_DBG=1`;A3 定位用,2026-10-19):
-        // 块级索引采集 = ①批量 D2H(排空 COMPUTE)②host 逐 token×头解码/逆RoPE/累加。
-        // 两半的优化手段完全不同(① 合并命令/上设备 ② SIMD/上设备)⇒ 必须分开量。
         if std::env::var_os("OWL_IDX_DBG").is_some() {
             let host_ms = t_host.elapsed().as_secs_f64() * 1000.0;
             eprintln!(
-                "[idx] block={block} 总 {el:.1}ms = D2H {dtoh_ms:.1} + host {host_ms:.1}\
-                 (页 {page} tok × {layers} 层 × {hkv} 头 = {} 行)",
-                page * layers * hkv
+                "[idx] 批 {} 块 / {layers} 层:总 {el:.1}ms = D2H {dtoh_ms:.1} + host {host_ms:.1} ({n_threads} 线程)",
+                todo.len()
             );
         }
         Ok(())

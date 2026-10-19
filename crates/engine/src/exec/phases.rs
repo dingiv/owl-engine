@@ -5,6 +5,15 @@ use owl_models::module::Module; // 合批 eager:整模 `forward`
 use owl_models::ops::PlanNode; // ⚙ diag:池叶 → 块 id(写者足迹取证)
 use owl_iface::contract::ModelError;
 
+/// **GDN 快照节奏**(2026-10-20):prefill 每 N 个 chunk 留一个**锚点**快照
+/// (末边界另保)。链推进 / 增量登记 / 索引采集**每边界照走**;只有
+/// "拍快照 + 槽满 DtoH 下沉(159 MB ≈ 31 ms)"按节奏做。
+///
+/// 为什么是 4:分叉前缀的复用面按 `4 × chunk` 对齐(1024 档 = 4096 tok,
+/// 与 agent 会话压缩/编辑的粒度同量级);冷长 prefill 的快照开销降 4×,
+/// 而 append 场景所需的**末边界快照**永远在。
+const SNAP_EVERY: usize = 4;
+
 impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// turn 启动执行(设备侧照办):GDN 格重置 / 边界快照恢复 + 持久
     /// 块表重写(write_bt;图烘焙 bt 指针,内容重写指针稳定图不重捕)
@@ -230,10 +239,40 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 物理块号会被回收复用,不可作键)
         let new_fed = base + chunk_ids.len();
         if self.dev.pool.paged && new_fed.is_multiple_of(self.dev.pool.page) {
+            // **末边界预测**(纯 host;必须在拍快照**之前**算 —— 节奏化要用它):
+            // 与 `coverage_analyze` 同一份调度算式(接口单源)。
+            let prompt_len = self
+                .turns
+                .active
+                .first()
+                .map(|a| a.prompt_ids.len())
+                .unwrap_or(new_fed);
+            let next_end = Self::prefill_step_chunk(
+                new_fed,
+                prompt_len,
+                self.cfg.prefill_chunk,
+                self.cfg.knobs.prefill_tail_merge,
+                Self::prefill_align_page(
+                    self.cfg.knobs.prefill_align_tail,
+                    self.cfg.knobs.prefix_cache,
+                    self.dev.pool.page,
+                ),
+            )
+            .map(|n| new_fed + n)
+            .unwrap_or(new_fed);
+            let last_boundary =
+                next_end == new_fed || !next_end.is_multiple_of(self.dev.pool.page);
+            // GDN 快照**节奏化**(2026-10-20):末边界 + 每 `SNAP_EVERY` 个 chunk 一个锚点。
+            // 冷 prefill 每边界都拍 = 槽满后每拍一次 DtoH(159 MB ≈ 31 ms);
+            // 复用只需要**末边界**(append 场景)与稀疏锚点(分叉场景)。
+            let every = self.cfg.prefill_chunk.max(1) * SNAP_EVERY;
+            let snap_keep = last_boundary || new_fed.is_multiple_of(every);
             // GDN 快照拍摄(**唯一入口** `capture_gdn_snap`:链推进 + 增量登记 +
             // 索引采集 + 快照;内部已 TP 感知 —— peer 在场时两 rank 各拍各自的池,
             // store 的 state 账仍单份)。
-            self.capture_gdn_snap(sid, new_fed).await?;
+            let t_snap = std::time::Instant::now();
+            self.capture_gdn_snap(sid, new_fed, snap_keep).await?;
+            let snap_ms = t_snap.elapsed().as_secs_f64() * 1000.0;
             // **边界相位拆分**(`OWL_VRAM_DBG=1`;2026-10-19 A3):
             // 边界 = 快照拍摄(链哈希 + GDN 拷贝 + 登记)‖ 索引采集 ‖ B 轴(打分/选择/视图/调和)。
             let dbg = std::env::var_os("OWL_VRAM_DBG").is_some();
@@ -242,36 +281,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // 两扇门:`select_decode`(生产)= 打分/选择/视图/调和;
             // `coverage_probe`(诊断)= 额外算真实质量与覆盖率读数。
             if self.cfg.knobs.coverage_probe || self.cfg.knobs.select_decode {
-                // **末个边界**(≠ 末个 chunk):prompt 末尾未必页对齐,而边界只在
-                // **chunk 末且页对齐**处发生 ⇒ 预测「下一条边界会不会来」用的是
-                // 调度器**同一份**块长函数(`Scheduler::prefill_step_chunk`),
-                // 而非在这里另写一套分块算术(接口单源)。
-                let prompt_len = self
-                    .turns
-                    .active
-                    .first()
-                    .map(|a| a.prompt_ids.len())
-                    .unwrap_or(new_fed);
-                let next_end = Self::prefill_step_chunk(
-                    new_fed,
-                    prompt_len,
-                    self.cfg.prefill_chunk,
-                    self.cfg.knobs.prefill_tail_merge,
-                    Self::prefill_align_page(
-                        self.cfg.knobs.prefill_align_tail,
-                        self.cfg.knobs.prefix_cache,
-                        self.dev.pool.page,
-                    ),
-                )
-                .map(|n| new_fed + n)
-                .unwrap_or(new_fed);
-                let last_boundary =
-                    next_end == new_fed || !next_end.is_multiple_of(self.dev.pool.page);
+                // 末边界/下一边界预测已在**拍快照之前**算好(`last_boundary`)
                 let t_cov = std::time::Instant::now();
                 self.coverage_analyze(sid, new_fed, last_boundary).await?;
                 if dbg {
                     let cov_ms = t_cov.elapsed().as_secs_f64() * 1000.0;
-                    eprintln!("[vram-b] 边界@{new_fed}: B 轴 {cov_ms:.0}ms");
+                    eprintln!(
+                        "[vram-b] 边界@{new_fed}: 快照 {snap_ms:.0}ms + B 轴 {cov_ms:.0}ms"
+                    );
                 }
             } else if dbg {
                 eprintln!("[vram-b] 边界@{new_fed}: 选择层关,无索引/B 轴");
@@ -456,6 +473,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     act.fed,
                     &[],
                     owl_store::SnapDurability::Transient,
+                    true,
                 )
                 .await?;
             }
@@ -863,6 +881,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     fed,
                     &[],
                     owl_store::SnapDurability::Transient,
+                    true,
                 )
                 .await?;
             }
