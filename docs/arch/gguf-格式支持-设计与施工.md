@@ -1240,3 +1240,45 @@ cublasGemmEx(..., CUBLAS_OP_T, CUBLAS_OP_N,
    `8..63` → MMQ(现 335);`≤ 7` → MMVQ;`ssm_out`(A2 表)→ smem 回退;
 5. 门:vs MMVQ `max|Δ|/max < 3e-2`(f16 累加比 f32 累加宽一档)、首 token、
    **llm_speedtest std 同工具**(验收:avg ≥ 1100 t/s,TTFT@8192 ≤ 7 s)。
+
+### 19.5 W-2d 落地实录(2026-10-19):port 完成,但**没赢过 MMQ** —— 三处定位
+
+按 §19.4 全部落地(两个引擎机制 + 行窗解量化 + cuBLAS 写列窗 + 分派 + 门):
+
+| 件 | 落点 | 状态 |
+|---|---|---|
+| M1 无清零 scratch | `Op::Uninit`(eval 臂: `alloc_out(zeroed=false)`) | ✅ |
+| M2 写既有块 | `Op::CallDst`(dest = `parents[0]`;eval 返回同块别名;不 `track_new`) | ✅ |
+| 行窗解量化 | `owl_gguf_dequant_range_{q8_0,q4k,q5k,q6k}`(复用 `RowDeq`;32 线程;Q5_K/Q6_K 两趟) | ✅ |
+| cuBLAS 写列窗 | `cublas_gemm_f16_dst`(`ldc`/`off`;槽序 9 参) | ✅ |
+| 分派 | `m ≥ 64` → 本臂;`8..63` → MMQ;`≤7` → MMVQ;`ssm_out`(A2 表) → tile 臂 | ✅ |
+| 门 | `gpu_gguf_cublas_dst_arm_matches_mmvq`:4B+27B 真实张量(含 k=17408)× m=128/512,`2.6e-3 ~ 1.1e-2` | ✅ |
+
+**★ 一个必须记的坑(门内测不出)**:上游那条路用 **`CUBLAS_COMPUTE_16F`**
+(f16 累加);照抄后 **27B chunk=512 首 token 变垃圾**,而 chunk=128 正常、门内
+温和激活也正常 ⇒ **真实激活量级下 f16 累加溢出/失真**。改 **`CUBLAS_COMPUTE_32F`**
+(仍是张量核 f16 输入)后两档都对。⇒ 本仓口径:**f32 累加,不要照抄 f16 累加**。
+
+**实测(27B,1001-token prompt)**:
+
+| 臂 | chunk=128 | chunk=512 |
+|---|---:|---:|
+| MMQ(dp4a 档,现役) | 287 t/s | **332 t/s** |
+| **dequant+cuBLAS(W-2d)** | 179 t/s | **333 t/s** |
+
+即**打平**,没追上 llama.cpp 的 1211/1374。nsys 逐核(两 chunk 混合)给出三处定位:
+
+1. **`ssm_out` 仍走自研 vec_dot tile 臂**(`owl_gguf_gemm_tile_q8_0` 19%,均值
+   **2.67 ms/次**):MMQ/cuBLAS 两臂都因 A2 内维列序表跳过它。**修法已明确**:
+   行窗解量化加 `_tiled` 变体(写 f16 时按表做**列**置换 —— f16 元素面零成本)⇒
+   权重直接以 grouped 序落地,激活不再需要置换,自研臂从热路径消失。
+2. **解量化占 ~21%**(`dequant_range_q8_0` 13.3% + `q4k` 7.5%):每 chunk 要把
+   17.7 GB 权重解成 35 GB f16(再被 cuBLAS 读一遍);tile 尺寸/网格还没调
+   (当前 `(rows, k/qk)` 一 CTA 一块 = 256 元素/32 线程)。
+3. **cuBLAS 分块形状未调**:当前按"每块 ≤ 32 MiB scratch"取 960/2048 行,
+   而 cutlass/ampere 的 `s16816gemm` 各变体在不同 `m(行)×n(token)` 下效率差数倍
+   (profile 里 96x128 / 64x64 / 64x128 / 128x128 混着出现)。
+
+⇒ W-2e 清单(下一刀,按收益排序):①`ssm_out` 的 `_tiled` 行窗解量化(去掉
+2.67 ms 的热点)②解量化网格/tile 调优(或"每个 Linear 解一次进 f16 常驻"对
+小权重档)③cuBLAS 形状扫描(按 `m` 选 tile)。

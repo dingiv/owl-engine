@@ -41,6 +41,15 @@ fn gguf_tile_arm_enabled() -> bool {
     !matches!(std::env::var("OWL_GGUF_TILE").as_deref(), Ok("0"))
 }
 
+/// **dequant+cuBLAS 臂的最小 token 数**(W-2d)。上游按 `ne11 ≥ 64` 分流
+/// (`ggml_cuda_should_use_mmq` 的 NVIDIA 条件)⇒ 本仓同门槛。
+pub(crate) const GGUF_CUBLAS_MIN_M: usize = 64;
+
+/// dequant+cuBLAS 臂开关(诊断/对拍;缺省开)。`OWL_GGUF_CUBLAS=0` ⇒ 回退 MMQ。
+fn gguf_cublas_arm_enabled() -> bool {
+    !matches!(std::env::var("OWL_GGUF_CUBLAS").as_deref(), Ok("0"))
+}
+
 /// **官方 MMQ 的最小 token 数**(W-2c)。
 ///
 /// 上游的批分界:MMVQ 用于小批、MMQ 用于大批(`MMVQ_MAX_BATCH_SIZE = 8`)。
@@ -79,6 +88,71 @@ pub(crate) fn gguf_quant_gemm(
     }
     let m: usize = xs.shape()[..xs.shape().len() - 1].iter().product();
     let k = in_dim;
+    // **dequant + cuBLAS 臂**(W-2d;llama.cpp 的 prefill 正路 —— 见设计 §十九)
+    //
+    // 形态(与上游同构):把权重按**行窗**反量化成 f16 scratch,再逐窗 cuBLAS
+    // 写进 `y[:, n0..]`(`ldc` = y 行宽)。四个适用门(缺一回退下一臂):
+    // 1. `m ≥ GGUF_CUBLAS_MIN_M`(上游对 `ne11 ≥ 64` 才走这条路);
+    // 2. 激活 = F16(本臂直吃 f16,不做量化);
+    // 3. 无内维列序表(`ssm_out` 单卡档的 tiled 列序要激活侧置换);
+    // 4. 型有行窗解量化入口。
+    if m >= GGUF_CUBLAS_MIN_M
+        && xs.dtype == Dtype::F16
+        && col_index.is_none()
+        && gguf_cublas_arm_enabled()
+        && owl_kernels::family::gguf::range_entry_for(ty).is_some()
+    {
+        // 行窗预算:单块 scratch ≤ 32 MiB(峰值 = 2 块,发射序串行);
+        // `OWL_GGUF_CUBLAS_TILE` 可强制行窗(诊断/调参用;0 = 预算档)
+        let budget_rows = (32usize << 20) / (k.max(1) * 2);
+        let mut tile = budget_rows.clamp(128, 2048) / 64 * 64;
+        if let Ok(v) = std::env::var("OWL_GGUF_CUBLAS_TILE") {
+            if let Ok(v) = v.parse::<usize>() {
+                if v > 0 {
+                    tile = v;
+                }
+            }
+        }
+        let tile = tile.max(64);
+        // 首 tile 用**普通 Call**(由 eval 分配并 `track_new` 整块 y —— 账本上
+        // "这个块是新分配的"必须只说一次);后续 tile 用 `CallDst` 写同一块
+        // (同块别名,链式)。若首 tile 也用 CallDst,块从未被 `track_new`,
+        // 其"使用者计数"起不来 ⇒ 早期释放/复用(实测 27B chunk=512 出垃圾 token)。
+        let mut last: Option<TensorOps> = None;
+        let mut n0 = 0usize;
+        while n0 < out_dim {
+            let r = tile.min(out_dim - n0);
+            // ① 行窗解量化 → scratch(dest = scratch,`CallDst`)
+            let s = TensorOps::uninit(Dtype::F16, vec![r, k]);
+            let dq = TensorOps::call_dst(&s, SemanticKernel::GgufCvtRange)
+                .arg(&w.decl())
+                .arg_i32(n0 as i32)
+                .arg_i32(r as i32)
+                .arg_i32(k as i32)
+                .aux(&[ty.code() as usize, r, k])
+                .with_shape(Dtype::F16, vec![r, k]);
+            // ② cuBLAS 写列窗(dest = **上一 tile 的节点值** —— 同块别名;
+            //    `eval` 是树形求值,同一节点**只能有一个消费者** ⇒ 用链式既保
+            //    "写进同一个 y" 的语义,又给出显式顺序边)
+            let node = match last.as_ref() {
+                None => TensorOps::call(SemanticKernel::GgufCublasDst),
+                Some(prev) => TensorOps::call_dst(prev, SemanticKernel::GgufCublasDst),
+            };
+            last = Some(
+                node.arg(xs)
+                    .arg(&dq)
+                    .arg_usize(r)
+                    .arg_usize(k)
+                    .arg_usize(m)
+                    .arg_usize(1)
+                    .arg_usize(out_dim)
+                    .arg_usize(n0)
+                    .with_shape(Dtype::F16, vec![m, out_dim]),
+            );
+            n0 += r;
+        }
+        return last.expect("out_dim > 0 ⇒ 至少一个 tile");
+    }
     // **官方 MMQ**(W-2c;tensor-core prefill):llama.cpp 的 `mul_mat_q`。
     // 适用门(缺一即回退到下一臂,不静默):
     // 1. `m ≥ GGUF_MMQ_MIN_M`(小批让位给 MMVQ —— 上游同款分界思想);

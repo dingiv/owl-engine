@@ -172,6 +172,18 @@ pub fn resolve(req: OpReq) -> KernelPick {
             ax(1),
             ax(2),
         ),
+        // **行窗解量化**(W-2d):aux = [ty, rows, k]
+        "gguf.dequant_range" => gguf::dequant_range(
+            crate::family::gguf::GgmlTy::from_code(ax(0) as u32)
+                .unwrap_or_else(|| panic!("driver::resolve(\"gguf.dequant_range\"): 未知 ggml 型码 {}", ax(0))),
+            ax(1),
+            ax(2),
+        ),
+        // cuBLAS 写列窗(foreign;形状 = FOREIGN 哨兵,server 家族 runtime 自管)
+        "cublas.gemm_f16_dst" => KernelPick {
+            name: crate::family::cublas::GEMM_F16_DST,
+            shape: FOREIGN,
+        },
         // **smem 复用臂**(W-2b):同 aux = [ty, m, n];几何按 MT/NT 切窗 + 大 smem
         "gguf.gemm_smem" => gguf::gemm_smem(
             crate::family::gguf::GgmlTy::from_code(ax(0) as u32)
@@ -568,6 +580,21 @@ pub mod gguf {
             GgmlTy::Q5K => KernelPick::of::<crate::ops::gguf::GgufMmqQ5K>(shape),
             GgmlTy::Q6K => KernelPick::of::<crate::ops::gguf::GgufMmqQ6K>(shape),
             other => panic!("owl_gguf_mmq: {} 未移植(MMQ 集 = Q4_K/Q5_K/Q6_K/Q8_0)", other.name()),
+        }
+    }
+
+    /// **行窗解量化**(W-2d;dequant+cuBLAS 的喂料手)
+    pub fn dequant_range(ty: GgmlTy, rows: usize, k: usize) -> KernelPick {
+        let (grid, block) = fam::range_geom(ty, rows, k).unwrap_or_else(|| {
+            panic!("owl_gguf_dequant_range: {} 未移植或 k={k} 非块整数倍", ty.name())
+        });
+        let shape = Shape { grid, block, smem: 0 };
+        match ty {
+            GgmlTy::Q8_0 => KernelPick::of::<crate::ops::gguf::GgufRangeQ8_0>(shape),
+            GgmlTy::Q4K => KernelPick::of::<crate::ops::gguf::GgufRangeQ4K>(shape),
+            GgmlTy::Q5K => KernelPick::of::<crate::ops::gguf::GgufRangeQ5K>(shape),
+            GgmlTy::Q6K => KernelPick::of::<crate::ops::gguf::GgufRangeQ6K>(shape),
+            other => panic!("owl_gguf_dequant_range: {} 未移植", other.name()),
         }
     }
 

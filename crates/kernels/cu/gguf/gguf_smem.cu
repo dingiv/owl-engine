@@ -240,6 +240,53 @@ __device__ __forceinline__ void body(
 
 } // namespace owl_gguf_smem
 
+// ============================================================================
+// **行窗解量化**(W-2d 的 dequant+cuBLAS 臂用):`[n0, n0+rows)` 行 → f16 `[rows, k]`
+//
+// 几何:`grid = (rows, k / qk)`,`block = (32, 1, 1)` —— 一个 CTA 解一个块;
+// 逐型行解量化**复用本文件的 `RowDeq`**(与 smem 臂同一份数学,零第二实现;
+// Q5_K/Q6_K 的 64 线程型由 `RowDeq::run` 的两趟覆盖吸收)。
+// ============================================================================
+template <typename block_q_t, int qk, void (*ROW)(const void *, __half *, int)>
+__device__ __forceinline__ void range_body(const void * __restrict__ w,
+                                           __half * __restrict__ out, int n0, int rows, int k) {
+    const int r = blockIdx.x;
+    const int b = blockIdx.y;
+    if (r >= rows) {
+        return;
+    }
+    const int nb = k / qk;
+    if (b >= nb) {
+        return;
+    }
+    const block_q_t * rowp =
+        reinterpret_cast<const block_q_t *>(w) + (size_t) (n0 + r) * (size_t) nb;
+    owl_gguf_smem::RowDeq<block_q_t, qk, ROW>::run(
+        reinterpret_cast<const void *>(rowp + b), out + (size_t) r * (size_t) k + (size_t) b * qk,
+        threadIdx.x);
+}
+
+extern "C" __global__ void owl_gguf_dequant_range_q8_0(const void * __restrict__ w,
+                                                        __half * __restrict__ out, int n0,
+                                                        int rows, int k) {
+    range_body<block_q8_0, QK8_0, owl_gguf_smem::row_q8_0>(w, out, n0, rows, k);
+}
+extern "C" __global__ void owl_gguf_dequant_range_q4k(const void * __restrict__ w,
+                                                      __half * __restrict__ out, int n0, int rows,
+                                                      int k) {
+    range_body<block_q4_K, QK_K, owl_gguf_smem::row_q4_K>(w, out, n0, rows, k);
+}
+extern "C" __global__ void owl_gguf_dequant_range_q5k(const void * __restrict__ w,
+                                                      __half * __restrict__ out, int n0, int rows,
+                                                      int k) {
+    range_body<block_q5_K, QK_K, owl_gguf_smem::row_q5_K>(w, out, n0, rows, k);
+}
+extern "C" __global__ void owl_gguf_dequant_range_q6k(const void * __restrict__ w,
+                                                      __half * __restrict__ out, int n0, int rows,
+                                                      int k) {
+    range_body<block_q6_K, QK_K, owl_gguf_smem::row_q6_K>(w, out, n0, rows, k);
+}
+
 // ---- M1 实例集(四型)----
 extern "C" __global__ void owl_gguf_gemm_smem_q8_0(
     const void * __restrict__ weights, const __half * __restrict__ x,

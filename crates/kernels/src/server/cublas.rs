@@ -5,7 +5,7 @@
 
 use crate::contract::{Bytes, Dtype, LaunchMsg, OpError, OpId};
 
-use crate::client::cublas::{parse_gemm, GEMM_BF16, GEMM_F16};
+use crate::client::cublas::{parse_gemm, parse_gemm_dst, GEMM_BF16, GEMM_F16, GEMM_F16_DST};
 use crate::registry::{FamilyGuard, KernelFamily};
 use crate::family::cublas::OwlCublas;
 
@@ -51,7 +51,28 @@ impl KernelFamily for CublasRuntime {
     }
 
     fn run(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, _exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {
-        // 变体(f16/bf16)按【核名】路由;线内 nt sz = cublas 转置标志
+        // 变体(f16/bf16/**写列窗**)按【核名】路由;线内 nt sz = cublas 转置标志
+        if msg.kernel.name == GEMM_F16_DST {
+            let call = parse_gemm_dst(msg)?;
+            let a = res.resolve(call.a.id)? + call.a.byte_offset;
+            let b = res.resolve(call.b.id)? + call.b.byte_offset;
+            let out = res.resolve(call.out.id)? + call.out.byte_offset;
+            let blas = self.blas.as_ref().ok_or_else(|| OpError::Asset {
+                op: GEMM_F16.into(),
+                detail: "cublas 句柄未装配".into(),
+            })?;
+            res.note_device("fam_ffi_launch", &msg.kernel.name, 0, &[a, b, out]);
+            blas.gemm_f16_dst(a, b, out, call.m, call.k, call.n, call.nt, call.ldc, call.off)
+                .map_err(|e| OpError::Launch {
+                    op: msg.kernel.name.clone(),
+                    stage: crate::contract::Stage::Compute,
+                    detail: format!(
+                        "m={} k={} n={} nt={} ldc={} off={}: {e}",
+                        call.m, call.k, call.n, call.nt, call.ldc, call.off
+                    ),
+                })?;
+            return Ok(Bytes::new(call.out.id, msg.out_elems, Dtype::F16, 2));
+        }
         let bf16 = msg.kernel.name == GEMM_BF16;
         let call = parse_gemm(msg)?;
         let a = res.resolve(call.a.id)? + call.a.byte_offset;

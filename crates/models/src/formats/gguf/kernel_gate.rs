@@ -700,4 +700,137 @@ mod tests {
         assert!(t.code() > 0, "{name} 型码为 0(与本门 aux 约定冲突)");
         t.code() as usize
     }
+
+    /// **dequant+cuBLAS 臂 ↔ MMVQ 对拍门**(W-2d;2026-10-19)。
+    ///
+    /// 本臂走新引擎机制(`Op::Uninit` scratch + `Op::CallDst` 写列窗)⇒ 这条门同时
+    /// 钉三件事:①行窗解量化(含 Q5_K/Q6_K 两趟覆盖)②cuBLAS `ldc`/`off` 列窗
+    /// ③f16 累加口径的误差量级(`CUBLAS_COMPUTE_16F`,上游同路)。
+    ///
+    /// 覆盖:**4B 与 27B 的真实张量**(27B 的 `ffn_down` k=17408 是最长行窗;
+    /// `attn_q` n=12288) × `m = 128 / 512`(512 = 上游 `ne11` 档,也是引擎
+    /// chunk 512 的形状)。
+    #[owl_test(gpu)]
+    async fn gpu_gguf_cublas_dst_arm_matches_mmvq() {
+        let mut gpu = crate::testkit::gpu_client().await;
+        for (res_key, cases) in [
+            (
+                "gguf:4b",
+                &[
+                    ("blk.0.attn_gate.weight", "Q4_K"),
+                    ("blk.0.ssm_out.weight", "Q8_0"),
+                    ("blk.0.attn_qkv.weight", "Q6_K"),
+                    ("blk.3.attn_k.weight", "Q5_K"),
+                ][..],
+            ),
+            (
+                "gguf:27b",
+                &[
+                    ("blk.0.ffn_down.weight", "Q4_K"),
+                    ("blk.0.attn_gate.weight", "Q8_0"),
+                    ("blk.3.attn_q.weight", "Q8_0"),
+                ][..],
+            ),
+        ] {
+            if !resource_ok(res_key) {
+                eprintln!("skip: 资源清单缺 \"{res_key}\"");
+                continue;
+            }
+            let g = Gguf::open(&PathBuf::from(resource(res_key).expect("列了就有"))).expect("open");
+            for (tname, want_ty) in cases.iter().copied() {
+                let ti = g.get_tensor(tname).unwrap_or_else(|| panic!("缺张量 {tname}"));
+                let ix = g.index_of(tname).unwrap();
+                let bytes = g.bytes(ix);
+                let (rows, inner) = (ti.rows() as usize, ti.inner() as usize);
+                let (be, bb) = ti.ty.block();
+                let row_bytes = inner / be * bb;
+                let wblk = TensorOps::from_host(Dtype::U8, vec![rows, row_bytes], bytes);
+                for m in [128usize, 512] {
+                    let xv: Vec<f32> = (0..m * inner)
+                        .map(|i| {
+                            half::f16::from_f32(((i as f32 * 0.0097).cos() * 1.5).clamp(-2.5, 2.5))
+                                .to_f32()
+                        })
+                        .collect();
+                    let xb: Vec<u8> =
+                        xv.iter().flat_map(|v| half::f16::from_f32(*v).to_le_bytes()).collect();
+                    let x = TensorOps::from_host(Dtype::F16, vec![m, inner], &xb);
+                    // 参考:MMVQ(q8_1 激活)
+                    let xq = TensorOps::call(SemanticKernel::GgufQuantActF16)
+                        .arg(&x)
+                        .arg_i32(inner as i32)
+                        .arg_i32(inner as i32)
+                        .aux(&[m, inner])
+                        .with_shape(Dtype::U8, vec![m, inner / 32 * XQ_BLOCK]);
+                    let a = harvest_f16(
+                        &mut gpu,
+                        &TensorOps::call(SemanticKernel::GgufGemm)
+                            .arg(&wblk)
+                            .arg(&xq)
+                            .arg_i32(m as i32)
+                            .arg_i32(rows as i32)
+                            .arg_i32(inner as i32)
+                            .arg_i32(inner as i32)
+                            .arg_i32(0)
+                            .arg_i32(rows as i32)
+                            .aux(&[want_ty_code(want_ty), m, rows])
+                            .with_shape(Dtype::F16, vec![m, rows]),
+                    )
+                    .await;
+                    // 新臂:首 tile 普通 Call(分配 y),其后 CallDst 链式写同块
+                    let tile = (32usize << 20) / (inner.max(1) * 2);
+                    let tile = tile.clamp(128, 2048) / 64 * 64;
+                    let mut last: Option<TensorOps> = None;
+                    let mut n0 = 0usize;
+                    while n0 < rows {
+                        let r = tile.min(rows - n0);
+                        let s = TensorOps::uninit(Dtype::F16, vec![r, inner]);
+                        let dq = TensorOps::call_dst(&s, SemanticKernel::GgufCvtRange)
+                            .arg(&wblk)
+                            .arg_i32(n0 as i32)
+                            .arg_i32(r as i32)
+                            .arg_i32(inner as i32)
+                            .aux(&[want_ty_code(want_ty), r, inner])
+                            .with_shape(Dtype::F16, vec![r, inner]);
+                        let node = match last.as_ref() {
+                            None => TensorOps::call(SemanticKernel::GgufCublasDst),
+                            Some(prev) => TensorOps::call_dst(prev, SemanticKernel::GgufCublasDst),
+                        };
+                        last = Some(
+                            node.arg(&x)
+                                .arg(&dq)
+                                .arg_usize(r)
+                                .arg_usize(inner)
+                                .arg_usize(m)
+                                .arg_usize(1)
+                                .arg_usize(rows)
+                                .arg_usize(n0)
+                                .with_shape(Dtype::F16, vec![m, rows]),
+                        );
+                        n0 += r;
+                    }
+                    let b = harvest_f16(&mut gpu, &last.expect("至少一个 tile")).await;
+                    let scale = a.iter().fold(0f32, |acc, v| acc.max(v.abs())).max(1e-12);
+                    let mut maxd = 0f32;
+                    let mut worst = 0usize;
+                    for (i, (p, q)) in a.iter().zip(&b).enumerate() {
+                        let d = (p - q).abs();
+                        if d > maxd {
+                            maxd = d;
+                            worst = i;
+                        }
+                    }
+                    let rel = maxd / scale;
+                    eprintln!(
+                        "[gguf-gpu] {res_key} {tname}({want_ty}, {rows}×{inner}, m={m}, tile={tile}):cuBLAS 臂 vs MMVQ max|Δ|/max = {rel:.3e} @ {worst}"
+                    );
+                    assert!(
+                        rel < 3e-2,
+                        "{tname}({want_ty}, m={m}):cuBLAS 臂与 MMVQ 差 {rel:.4e}(行窗/ldc/off 错位会给 O(1))"
+                    );
+                }
+            }
+        }
+    }
+
 }

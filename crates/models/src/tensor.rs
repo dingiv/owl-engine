@@ -247,6 +247,41 @@ impl TensorOps {
         }
     }
 
+    /// **无清零分配声明**(scratch;内容未定义 —— 见 [`Op::Uninit`] 契约)
+    pub fn uninit(dtype: Dtype, shape: Shape) -> TensorOps {
+        TensorOps {
+            id: next_id(),
+            parents: vec![],
+            depth: 0,
+            op: crate::ops::Op::Uninit,
+            dtype,
+            shape,
+            args: vec![],
+            err: None,
+            label: None,
+            tp_role: crate::plan::rules::WeightRule::Replicate,
+        }
+    }
+
+    /// **写入既有块的语义调用**(dest = `dst`;返回节点值 = 同块别名)。
+    ///
+    /// 之后按普通 `Call` 的写法链式追加**输入**与标量(不含 dest —— 它已是
+    /// `parents[0]`);`with_shape` 应声明 dest 的形状(同块)。
+    pub fn call_dst(dst: &TensorOps, op: crate::ops::SemanticKernel) -> TensorOps {
+        TensorOps {
+            id: next_id(),
+            parents: vec![std::sync::Arc::new(dst.clone())],
+            depth: 0,
+            op: crate::ops::Op::CallDst { op, aux: Vec::new() },
+            dtype: dst.dtype,
+            shape: dst.shape.clone(),
+            args: vec![],
+            err: None,
+            label: None,
+            tp_role: crate::plan::rules::WeightRule::Replicate,
+        }
+    }
+
     /// host 数据声明(pinned 码头直填归 server;契约 3)。
     /// 值语义:数据随树走。
     pub fn from_host(dtype: Dtype, shape: Shape, data: &[u8]) -> TensorOps {
@@ -310,7 +345,7 @@ impl TensorOps {
     /// 拾取推导常数(层语义几何:kd/vd/batch/rows…;**非核参数**,不进
     /// 签名 —— 序 = 各族 driver 文档;核签名标量仍走 arg_usize/arg_i32)
     pub fn aux(mut self, v: &[usize]) -> TensorOps {
-        if let crate::ops::Op::Call { aux, .. } = &mut self.op {
+        if let crate::ops::Op::Call { aux, .. } | crate::ops::Op::CallDst { aux, .. } = &mut self.op {
             aux.extend_from_slice(v);
         }
         self

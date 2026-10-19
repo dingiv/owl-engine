@@ -34,9 +34,16 @@ pub const GEMM_F16: &str = "cublas_gemm_f16";
 /// kernel_projection/hidden_projection 消费;槽序契约同 GEMM_F16)
 pub const GEMM_BF16: &str = "cublas_gemm_bf16";
 
+/// **写列窗的 f16 GEMM**(W-2d;GGUF prefill 的 dequant+cuBLAS 臂):
+/// 槽序 = `GEMM_F16` + `ldc` + `off` —— 把 tile 写进 `out` 的列窗
+/// (`C = out + off·2B`,`ldc = out 行宽`)。计算用 **`CUBLAS_COMPUTE_16F` +
+/// `TENSOR_OP`**(照 llama.cpp `ggml_cuda_op_mul_mat_cublas` 同代实现;
+/// 见设计 §19.2)。
+pub const GEMM_F16_DST: &str = "cublas_gemm_f16_dst";
+
 /// foreign 分派谓词(server handle_launch 前置检查)
 pub fn is_foreign(name: &str) -> bool {
-    name == GEMM_F16 || name == GEMM_BF16
+    name == GEMM_F16 || name == GEMM_BF16 || name == GEMM_F16_DST
 }
 
 #[cfg(feature = "cublas")]
@@ -119,6 +126,64 @@ impl OwlCublas {
             )
         };
         r.map_err(|e| format!("gemm_ex: {e:?}"))
+    }
+
+    /// **写列窗 f16 GEMM**(W-2d;GGUF prefill 的 dequant+cuBLAS 臂)。
+    ///
+    /// 与 [`Self::gemm_f16`] 同式,差别两处:
+    /// ① `out_ptr = out + off_elems·2B`、`ldc = ldc` ⇒ 写进 `y[:, off..]`
+    ///    (一个输出由多个分块核拼出来,`Op::CallDst` 提供 dest);
+    /// ② 计算档 **`CUBLAS_COMPUTE_16F` + `CUBLAS_GEMM_DEFAULT_TENSOR_OP`**
+    ///    —— 照上游同代 `ggml_cuda_op_mul_mat_cublas`(设计 §19.2),精度换速度。
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16_dst(
+        &self,
+        a: u64,
+        b: u64,
+        out: u64,
+        m: usize,
+        k: usize,
+        n: usize,
+        nt: bool,
+        ldc: usize,
+        off_elems: usize,
+    ) -> Result<(), String> {
+        let (transa, lda) = if nt {
+            (sys::cublasOperation_t::CUBLAS_OP_T, k as i32)
+        } else {
+            (sys::cublasOperation_t::CUBLAS_OP_N, m as i32)
+        };
+        let b_ptr = b; // cublas A 操作数 = 权重(nt)
+        let c_ptr = (out as usize + off_elems * 2) as u64;
+        // ⚠️ **f32 累加**(上游同代用 `CUBLAS_COMPUTE_16F`;本仓实测该档在真实
+        // 激活量级下会溢出/失真 —— 27B chunk=512 首 token 变垃圾,而 m=128 正常;
+        // 门内温和激活测不出)。f16 输入 × f32 累加仍是张量核路径,先保正确。
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        let r = unsafe {
+            cb::gemm_ex(
+                *self.blas.handle(),
+                transa,
+                sys::cublasOperation_t::CUBLAS_OP_N,
+                m as i32,
+                n as i32,
+                k as i32,
+                &alpha as *const f32 as *const _,
+                b_ptr as *const _,
+                sys::cudaDataType::CUDA_R_16F,
+                lda,
+                a as *const _,
+                sys::cudaDataType::CUDA_R_16F,
+                k as i32,
+                &beta as *const f32 as *const _,
+                c_ptr as *mut _,
+                sys::cudaDataType::CUDA_R_16F,
+                ldc as i32,
+                sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+            )
+        };
+        r.map_err(|e| format!("gemm_ex(dst): {e:?}"))
     }
 
     /// BF16 GEMM(E5-DF3 同日十四):与 gemm_f16 同式,A/B/out =

@@ -127,6 +127,8 @@ fn builtin_class(op: &Op) -> &'static str {
         Op::SlotWrite => "slot_write",
         Op::Matmul | Op::MatmulNt => "gemm",
         Op::Call { .. } => "call",
+        Op::Uninit => "uninit",
+        Op::CallDst { .. } => "call_dst",
         #[allow(unreachable_patterns)]
         _ => "other",
     }
@@ -842,6 +844,13 @@ where
             ctx.track_new(b.id);
             b
         }
+        // 无清零分配(scratch;内容未定义 —— 契约见 `Op::Uninit`)
+        Op::Uninit => {
+            let b = ctx.alloc_out(dtype, n_elems, false, class).await?.view(dtype, shape.len() as u8);
+            owl_shared::slab_hint::probe_name(b.id, class);
+            ctx.track_new(b.id);
+            b
+        }
         // 裸块叶:事实取本节点声明(dtype + 阶数)
         Op::Block { id } => Bytes::new(*id, 0, dtype, shape.len() as u8),
         // 纯元数据视图:透传父块(零拷贝)—— 但**事实面按本节点视图重定形**
@@ -903,7 +912,12 @@ where
             }
             out
         }
-        Op::Call { op, aux } => {
+        Op::Call { op, aux } | Op::CallDst { op, aux } => {
+            // **CallDst**:parents[0] = dest(写入既有块;不新分配)。余下父 = 核输入。
+            let dst_in = if matches!(t.op, Op::CallDst { .. }) { Some(vals[0].clone()) } else { None };
+            let is_dst = dst_in.is_some();
+            let slot_ins: &[crate::contract::Arg] =
+                if dst_in.is_some() { &ins[1..] } else { &ins[..] };
             // 性能面:宿主链分段(选核 / 构件 / 分配 / 线格式构造 / 发射)
             let mut lap = if perf.host() { Some(LapTimer::start()) } else { None };
             // 硬件感知拾取(被动律):环境必传 —— hw 自 face(引擎感知),
@@ -922,7 +936,9 @@ where
             // 几何事实自 env 单源补齐(与页同律:解释器 = env 注入点)
             env.head_dim = ctx.env.kv.head_dim;
             env.grp = ctx.env.kv.grp;
-            let shapes: Vec<Vec<usize>> = t.parents.iter().map(|p| p.shape.clone()).collect();
+            let skip = if dst_in.is_some() { 1 } else { 0 };
+            let shapes: Vec<Vec<usize>> =
+                t.parents.iter().skip(skip).map(|p| p.shape.clone()).collect();
             let scalars: Vec<i64> = t.args.iter().filter_map(|a| match a {
                 crate::ops::KernelArg::Bits(v) => Some(*v as i64),
                 crate::ops::KernelArg::I32(v) => Some(*v as i64),
@@ -974,24 +990,35 @@ where
             }
             // ★ **1-stage(§35)**:要做 AR 的输出直接落进对称槽(GEMM 写它 ⇒ 对端可读)。
             // 无 arena / 槽装不下 = 退回私有块 + v1 两段(不静默错)。
-            let out = match ctx.symmetric_out_slot(
-                t.tp_role == crate::plan::rules::WeightRule::UniformRow,
-                dtype,
-                n_elems,
-            ) {
-                Some(b) => b.view(dtype, shape.len() as u8),
-                None => ctx
-                    .alloc_out(dtype, n_elems, false, class)
-                    .await?
-                    .view(dtype, shape.len() as u8),
+            let out = match dst_in {
+                // dest = 既有块(同块别名;不分配、不 memset)
+                Some(b) => {
+                    ctx.track_alias(b.id);
+                    b
+                }
+                None => match ctx.symmetric_out_slot(
+                    t.tp_role == crate::plan::rules::WeightRule::UniformRow,
+                    dtype,
+                    n_elems,
+                ) {
+                    Some(b) => b.view(dtype, shape.len() as u8),
+                    None => ctx
+                        .alloc_out(dtype, n_elems, false, class)
+                        .await?
+                        .view(dtype, shape.len() as u8),
+                },
             };
             // 峰值归因:本输出块挂上核名(`class` 已在上面 resolve 处覆写为核名)
             owl_shared::slab_hint::probe_name(out.id, class);
             if let Some(l) = lap.as_mut() {
                 l.lap("interp.host.seg.alloc");
             }
-            ctx.track_new(out.id);
-            let msg = crate::ops::lower_kernel(&kernel, &t.args, &ins, &out, n_elems);
+            // dest 复用既有块 ⇒ **不**新记一次(否则同一块被当两个 node 记账,
+            // live 账虚高、槽位判断误伤;实测 27B 触发 `live-dup` 与池耗尽)
+            if !is_dst {
+                ctx.track_new(out.id);
+            }
+            let msg = crate::ops::lower_kernel(&kernel, &t.args, slot_ins, &out, n_elems);
             if let Some(l) = lap.as_mut() {
                 l.lap("interp.host.seg.lower");
             }

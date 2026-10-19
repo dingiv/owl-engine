@@ -69,6 +69,46 @@ gguf_gemm_spec!(GgufGemmQ4K, crate::family::gguf::GEMM_Q4K);
 gguf_gemm_spec!(GgufGemmQ5K, crate::family::gguf::GEMM_Q5K);
 gguf_gemm_spec!(GgufGemmQ6K, crate::family::gguf::GEMM_Q6K);
 
+// ---- **行窗解量化**(W-2d;dequant+cuBLAS 的喂料手)———————————————
+//
+// 槽序:`w[U8 块], out[F16], n0(i32), rows(i32), k(i32)`
+// —— 输出块是**调用方给的 scratch**(`Op::CallDst` 的 dest,不分配)。
+
+/// `owl_gguf_dequant_range_q8_0`
+pub struct GgufRangeQ8_0;
+/// 同上(Q4_K)
+pub struct GgufRangeQ4K;
+/// 同上(Q5_K)
+pub struct GgufRangeQ5K;
+/// 同上(Q6_K)
+pub struct GgufRangeQ6K;
+
+const RANGE_PARAMS: &[Param] = &[
+    Param::t_in("weights", Dtype::U8, 2),
+    Param::t_out("out", Dtype::F16, 2),
+    Param::i32("n0"),
+    Param::i32("rows"),
+    Param::i32("k"),
+];
+
+macro_rules! gguf_range_spec {
+    ($t:ty, $entry:expr) => {
+        impl KernelSpec for $t {
+            const ENTRY: &'static str = $entry;
+            const SRC: &'static str = crate::family::gguf::SMEM_SRC;
+            const PARAMS: &'static [Param] = RANGE_PARAMS;
+            const LAWS: &'static [Law] = &[Law::OutputFinite];
+            const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+            const DETERMINISM: Determinism = Determinism::Deterministic;
+        }
+    };
+}
+
+gguf_range_spec!(GgufRangeQ8_0, crate::family::gguf::RANGE_Q8_0);
+gguf_range_spec!(GgufRangeQ4K, crate::family::gguf::RANGE_Q4K);
+gguf_range_spec!(GgufRangeQ5K, crate::family::gguf::RANGE_Q5K);
+gguf_range_spec!(GgufRangeQ6K, crate::family::gguf::RANGE_Q6K);
+
 // ---- **官方 MMQ**(W-2c;tensor-core prefill)———————————————
 //
 // 槽序 = 适配 TU `gguf_mmq.cu` 的形参序(6 参:3 张量 + 3 标量);几何由
@@ -334,6 +374,12 @@ pub static TILE_Q4K: KernelMeta = meta_of::<GgufTileQ4K>();
 pub static TILE_Q5K: KernelMeta = meta_of::<GgufTileQ5K>();
 pub static TILE_Q6K: KernelMeta = meta_of::<GgufTileQ6K>();
 
+// ---- 行窗解量化的元数据表项 ----
+pub static RANGE_Q8_0: KernelMeta = meta_of::<GgufRangeQ8_0>();
+pub static RANGE_Q4K: KernelMeta = meta_of::<GgufRangeQ4K>();
+pub static RANGE_Q5K: KernelMeta = meta_of::<GgufRangeQ5K>();
+pub static RANGE_Q6K: KernelMeta = meta_of::<GgufRangeQ6K>();
+
 // ---- MMQ 的元数据表项 ----
 pub static MMQ_Q8_0: KernelMeta = meta_of::<GgufMmqQ8_0>();
 pub static MMQ_Q4K: KernelMeta = meta_of::<GgufMmqQ4K>();
@@ -363,6 +409,10 @@ pub static METAS: &[&KernelMeta] = &[
     &MMQ_Q4K,
     &MMQ_Q5K,
     &MMQ_Q6K,
+    &RANGE_Q8_0,
+    &RANGE_Q4K,
+    &RANGE_Q5K,
+    &RANGE_Q6K,
     &QUANT_ACT_F16,
     &QUANT_ACT_BF16,
     &QUANT_ACT_F16_TILED,

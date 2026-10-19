@@ -294,6 +294,39 @@ pub const QUANT_ACT_F16_TILED: &str = "owl_gguf_quant_act_f16_tiled";
 /// 同上,bf16 入
 pub const QUANT_ACT_BF16_TILED: &str = "owl_gguf_quant_act_bf16_tiled";
 
+// ---- **行窗解量化**(W-2d;dequant+cuBLAS 臂的喂料手)--------------------------
+/// `owl_gguf_dequant_range_q8_0`
+pub const RANGE_Q8_0: &str = "owl_gguf_dequant_range_q8_0";
+/// 同上(Q4_K)
+pub const RANGE_Q4K: &str = "owl_gguf_dequant_range_q4k";
+/// 同上(Q5_K)
+pub const RANGE_Q5K: &str = "owl_gguf_dequant_range_q5k";
+/// 同上(Q6_K)
+pub const RANGE_Q6K: &str = "owl_gguf_dequant_range_q6k";
+
+/// 型 → 行窗解量化入口(`None` = 未移植)
+pub const fn range_entry_for(ty: GgmlTy) -> Option<&'static str> {
+    match ty {
+        GgmlTy::Q8_0 => Some(RANGE_Q8_0),
+        GgmlTy::Q4K => Some(RANGE_Q4K),
+        GgmlTy::Q5K => Some(RANGE_Q5K),
+        GgmlTy::Q6K => Some(RANGE_Q6K),
+        _ => None,
+    }
+}
+
+/// 行窗解量化几何:`grid = (rows, k / qk)`,`block = (32, 1, 1)`
+/// (Q5_K/Q6_K 的 64 线程型由 `RowDeq` 两趟覆盖 ⇒ 32 线程即可)。
+pub fn range_geom(ty: GgmlTy, rows: usize, k: usize) -> Option<((u32, u32, u32), (u32, u32, u32))> {
+    let (be, _) = ty.block();
+    if range_entry_for(ty).is_none() || be == 0 || k % be != 0 {
+        return None;
+    }
+    let gx = rows.max(1) as u32;
+    let gy = (k / be).max(1) as u32;
+    Some(((gx, gy, 1), (32, 1, 1)))
+}
+
 // ---- **官方 MMQ**(W-2c;tensor-core prefill)--------------------------------
 /// `owl_gguf_mmq_q8_0`(= llama.cpp `mul_mat_q<Q8_0>` 的 C 入口;见 `vendor/README.md`)
 pub const MMQ_Q8_0: &str = "owl_gguf_mmq_q8_0";

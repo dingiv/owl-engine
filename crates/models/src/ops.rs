@@ -219,6 +219,12 @@ pub enum SemanticKernel {
     /// **GGUF 官方 MMQ**(tensor-core prefill;内核 = llama.cpp vendoring)。
     /// 与 smem/vec_dot 臂同槽序?**不**:MMQ 只吃 (weights, xq, out, k, n, m)。
     GgufMmq,
+    /// **GGUF 行窗解量化**(W-2d):量化块行窗 `[n0, n0+rows)` → f16 `[rows, k]`
+    /// (写进调用方给的 scratch;配 `Op::CallDst`)
+    GgufCvtRange,
+    /// **写列窗 f16 GEMM**(W-2d;foreign cuBLAS):`C = y + off`,`ldc = y 行宽`
+    /// —— 照 llama.cpp `ggml_cuda_op_mul_mat_cublas` 同代实现(f16 累加)
+    GgufCublasDst,
     /// **GGUF 量化表的行解量化**(查表臂;`token_embd` 在 GGUF 里是量化块,
     /// 既不是 f16 表也不可解量化驻留 ⇒ 查表自带解量化;块型住 `aux[0]`,几何 = `rows_geom`)
     GgufDequantRows,
@@ -333,6 +339,8 @@ impl SemanticKernel {
             SemanticKernel::GgufGemmTile => "gguf.gemm_tile",
             SemanticKernel::GgufGemmSmem => "gguf.gemm_smem",
             SemanticKernel::GgufMmq => "gguf.mmq",
+            SemanticKernel::GgufCvtRange => "gguf.dequant_range",
+            SemanticKernel::GgufCublasDst => "cublas.gemm_f16_dst",
             SemanticKernel::GgufDequantRows => "gguf.dequant_rows",
             SemanticKernel::GgufQuantActTiledF16 => "gguf.quant_act_f16_tiled",
             SemanticKernel::GgufQuantActTiledBf16 => "gguf.quant_act_bf16_tiled",
@@ -400,6 +408,23 @@ pub enum Op {
     Htod { bytes: Vec<u8> },
     /// 清零分配
     Zeros,
+    /// **无清零分配**(scratch 块;内容未定义)。
+    ///
+    /// 唯一合法用法 = **下一位写者先整体覆盖**(W-2d 的"反量化进 scratch"就是):
+    /// 用 `Zeros` 会让每次 memset 吃掉省下的带宽(27B 一档 = 每 chunk 数十 GB)。
+    /// 消费者若在写者之前读它 ⇒ 读到上一位使用者的旧值(契约:**调用方负责**,
+    /// 与 `Block` 的"数据已在"是同一条纪律的两面)。
+    Uninit,
+    /// **写入既有块**(dest = `parents[0]`)。
+    ///
+    /// 语义:本节点把结果写进 `parents[0]` 的(子)窗口,节点值 = **同块别名**
+    /// (eval 返回 `ins[0].clone()` 并 `track_alias`)。用途 = 一个输出由多个
+    /// 分块核拼出来(W-2d 的 cuBLAS 列窗:每个 tile 写 `y[:, n0..]`,ldc = 行宽)。
+    ///
+    /// 序纪律:各分块节点之间**没有数据边**,靠"单计算流 + 尾序发射"保证先后
+    /// (与 `SlotWrite` 的显式边不同 —— 那需要跨节目可导;这里是同一节点树内的
+    /// 顺序发射,cuBLAS 与该流同序)。
+    CallDst { op: SemanticKernel, aux: Vec<usize> },
     /// 引用已物化数据(rt::Tensor 的池块;id = 其全局唯一身份证)。
     /// eval 时零操作(数据已在),仅把"真数据"接进声明图的叶子。
     Block { id: u64 },

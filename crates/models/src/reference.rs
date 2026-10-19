@@ -322,6 +322,11 @@ fn reduce_rec(
             "CPU 参考解释器未覆盖动作 {op:?}(server/引擎路径实现)"
         ))),
         Op::SlotWrite => itp.slot_write(&ins[0]),
+        // scratch 分配(内容未定义;CPU 面给零,便于确定性对拍)
+        Op::Uninit => itp.zeros(t.dtype, &t.shape),
+        // 写入既有块(dest = parents[0]):CPU 面只做别名透传 —— host 解释器
+        // 的语义臂按值搬运(不模拟原地写),与 GPU 面的"同块别名"外形一致
+        Op::CallDst { .. } => Ok(Value { f32: ins[0].f32.clone(), shape: t.shape.clone() }),
         Op::Reshape => Ok(Value { f32: ins[0].f32.clone(), shape: t.shape.clone() }),
         Op::SliceView { .. } => Ok(Value { f32: ins[0].f32.clone(), shape: t.shape.clone() }),
         Op::Block { id } => itp.block(*id, t.dtype, &t.shape),

@@ -243,6 +243,7 @@ mod tests {
         cases.extend([
             (crate::family::cublas::GEMM_F16, crate::client::cublas::PARSE_SLOTS),
             (crate::family::cublas::GEMM_BF16, crate::client::cublas::PARSE_SLOTS),
+            (crate::family::cublas::GEMM_F16_DST, crate::client::cublas::PARSE_SLOTS_DST),
         ]);
         #[cfg(feature = "marlin")]
         cases.extend([

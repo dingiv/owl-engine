@@ -9,7 +9,8 @@ description = "Operator dispatch + unified kernel home: .cu sources, nvrtc compi
 # 源码之家(sources)纯 include_str 零依赖 —— models 等上层引源不拖链接
 "default" = []
 # cuBLAS 封装(f16 基线 F1;独立 feature —— 引源码之家不拖链接)
-"cublas" = ["dep:cudarc"]
+# half:W-2d 的 `gemm_f16_dst` 用 f16 标量(alpha/beta;CUBLAS_COMPUTE_16F 口径)
+"cublas" = ["dep:cudarc", "dep:half"]
 # Marlin W4A16(f16 激活 × u4 权重;build.rs nvcc/预编 .a + foreign-kernel)
 "marlin" = ["dep:rayon", "dep:half"]
 # FlashInfer prefill(预编 .a + foreign-kernel;E1.5 工作包)
