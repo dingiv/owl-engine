@@ -380,6 +380,7 @@ fn bench_one(res: &mut TestRes, entry: &'static str, src: &'static str, t: usize
         VD,
         nv,
         KD,
+        1,
     );
     let grid = prod.shape.grid;
     let block = prod.shape.block;

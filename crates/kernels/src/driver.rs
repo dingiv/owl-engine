@@ -155,7 +155,7 @@ pub fn resolve(req: OpReq) -> KernelPick {
             req.shapes.first().map(|s| s.first().copied().unwrap_or(0)).unwrap_or(0),
             req.scalars.first().map(|b| (*b).max(0) as usize).unwrap_or(1),
         ),
-        "gdn.recurrence_varlen_gqa" => gdn::recurrence_varlen_gqa(dt, ax(2), ax(0), ax(1)), // aux = [nv, kd, vd]
+        "gdn.recurrence_varlen_gqa" => gdn::recurrence_varlen_gqa(dt, ax(2), ax(0), ax(1), ax(3)), // aux = [nv, kd, vd, batch]
         "gdn.norm_act" => gdn::norm_act(dt, ax(0), ax(1), ax(2)), // aux = [rows, value_dim, group_size]
         // foreign 家族臂(2026-10-12 用户律:gdn 两臂入词表,与 native 同一
         // Call 通道;名字 = family 单源,发射配置 = FOREIGN 哨兵直通)
@@ -582,14 +582,16 @@ pub mod gdn {
         kd == 128 && vd % 2 == 0
     }
 
-    pub fn recurrence_varlen_gqa(dt: DType, vd: usize, nv: usize, kd: usize) -> KernelPick {
+    pub fn recurrence_varlen_gqa(dt: DType, vd: usize, nv: usize, kd: usize, batch: usize) -> KernelPick {
         assert!(
             matches!(dt, DType::F16),
             "owl_gdn_recurrence_varlen_gqa 仅有 f16 变体(dt={dt:?})"
         );
         let fast = recurrence_varlen_gqa_fast(kd, vd);
         KernelPick::of::<crate::ops::gdn::RecurrenceVarlenGqaF16>(Shape {
-            grid: (vd.div_ceil(if fast { 16 } else { 8 }) as u32, nv as u32, 1),
+            // grid.y = batch × nv(核内 seq_head = blockIdx.y,按 seq_idx = seq_head/nv
+            // 取 slots[seq_idx];单序列时与旧形逐位一致)
+            grid: (vd.div_ceil(if fast { 16 } else { 8 }) as u32, (nv * batch.max(1)) as u32, 1),
             block: (32, 8, 1),
             smem: ((4 * kd + 4) * 4) as u32,
         })
@@ -1791,7 +1793,7 @@ mod tests {
     fn recurrence_smem_contract() {
         // kd=128 ⇒ **快路**(2 列/warp ⇒ x 步长 16);smem 契约保持原值(快路不用,
         // legacy 回落时才是真契约 —— 同一个入口,故仍按 (4·kd+4)·4 传)
-        let p = gdn::recurrence_varlen_gqa(DType::F16, 128, 16, 128);
+        let p = gdn::recurrence_varlen_gqa(DType::F16, 128, 16, 128, 1);
         assert_eq!(p.name, "owl_gdn_recurrence_varlen_gqa_f16");
         assert_eq!(p.shape.grid, (8, 16, 1), "快路:ceil(128/16)");
         assert_eq!(p.shape.block, (32, 8, 1));
@@ -1813,7 +1815,7 @@ mod tests {
         ];
         for (kd, vd, fast, gx) in cases {
             assert_eq!(gdn::recurrence_varlen_gqa_fast(kd, vd), fast, "判据 kd={kd} vd={vd}");
-            let p = gdn::recurrence_varlen_gqa(DType::F16, vd, 16, kd);
+            let p = gdn::recurrence_varlen_gqa(DType::F16, vd, 16, kd, 1);
             assert_eq!(p.shape.grid.0, gx, "grid.x kd={kd} vd={vd}");
             // 覆盖性:快路须 ≥ vd/2 组(每组 2 列),legacy 须 ≥ vd 列
             let covered = if gdn::recurrence_varlen_gqa_fast(kd, vd) {
