@@ -5229,3 +5229,101 @@ if prof { owl_shared::metrics::query_metrics(&MetricsFilter::new().tag_prefix("e
 
 `peak` 的**捕获期 liveness 直接跟踪**（现在是 warmup peak + 2× 余量兜）——
 或 carve 失败自动放大重试（**受 `FnOnce` 闭包限制不可行**，见 §65.3-2）。
+
+---
+
+## 68. ★★★ P1.4 GDN prefill 布局重写 —— 逐位相同 1.61×,端到端 prefill **+5.7%**(2026-10-19)
+
+### 68.0 立案:为什么不是 S5
+
+本轮开工时路线图的"下一刀"是 **P2.4/S5(AR 分块流水,把 AR 藏进算里)**,但账已翻过:
+
+| 出处 | 形状 | 结论 |
+|---|---|---|
+| §48.3 | **单发**:先发 64 个小读核、再发 64 个 GEMM | [读 ‖ GEMM] 重叠 **97%** |
+| §49.3 | **链式**(`G→AR→G→AR`,= 生产依赖形状),N=2/3/4 微批 | 吞吐比**卡死 1.21–1.28×**,N 变大无用 |
+| §49.4 | 定量 | 总时间 ≈ `总 PCIe + 总 GEMM`(**串行度 ≈ 1.000**)|
+| §41.3 | 写腿 ‖ 本地 | **0%** |
+
+⇒ "把 AR 藏进本层计算"在**核级没有地基**,S5 不是"改协议"能解决的;
+**P1.4(GDN prefill,19% 未调研)才是当下最大的一块**。
+
+### 68.1 先校准形状(**本轮第一个坑**)
+
+P0.1 账里 `owl_gdn_recurrence_varlen_gqa_f16` = 664 ms/卡(19%)、768 发。
+我按 27B 的 `nv=48/nk=16` 建台,**量出 3.29 µs/token、对不上生产 1.73**——
+回 nsys 查该核的 **grid 才发现是 `(16, 24, 1)`**:
+
+> **TP 把 linear-attention 的 value 头也切了** ⇒ 每 rank **nv=24 / nk=8**(`kv_group=3`)。
+> 按此重建台子后 **T=1024 → 1771 µs**,与生产 1730 µs 逐点吻合 ✓
+
+**纪律(新增 @39)**:任何"从端到端反推的单核读数",上核台前**先用 nsys 的 grid/block 核对形状**;
+TP 档的"每 rank 头数"是**配置声明`/world`**,不是 config.json 的字面值。
+
+### 68.2 归因阶梯(`tools/gdn-rec-probe.cu`;3080 ord2,nv=24,nk=8,T=1024,8k 预热后 1.9 GHz)
+
+| 臂 | µs/token | Δ | 病根 |
+|---|---:|---:|---|
+| **V0 现役** | **1.74** | — | 生产同形 |
+| V1 warp 自治(去 `__syncthreads`) | 1.50 | −0.24 | 8 个 warp 之间**零数据依赖**,barrier 纯税 |
+| V3 = V1 + 寄存器预取 4 | 1.40 | −0.10 | 装载延迟(只剩 6%,不是主因) |
+| D0 = V1 去**两次 32-lane 归约** | 0.98 | **−0.42** | 一列一 warp ⇒ 归约按列重复 |
+| B1 = D0 再删 **q/k 装载** | 0.53 | **−0.45** | 块内 8 warp 各读同一份 256B(8× 冗余)|
+| B3 = B1 再删 **out 写** | 0.34 | **−0.18** | 每 token 一条**单 lane 2B** 写(32B sector) |
+| B4 = 再删 state 口 | 0.33 | −0.01 | 纯算术骨架 = 19% |
+
+**⇒ 81% 是布局税,不是算术**(序列长度 T 的串行链本身只值 0.33 µs/token)。
+
+### 68.3 新形(`_cols2`):一个 warp 管 2 个相邻 v 列
+
+| 改动 | 效果 |
+|---|---|
+| C=2 列/warp ⇒ 归约树 2 列共用 | 每列 shfl **10 → 2.5** |
+| 同一份 q/k 摊给 C 列;`g`/`beta` 是**每 head 一个标量** ⇒ 每 token 只取 1 次 | 装载指令 ÷(2×) |
+| **删 shared / 删 barrier**(warp 自治) | −0.24 µs |
+| out:2 列合一 **4B** 写 | −0.10 µs |
+| 寄存器预取深度 2(槽索引**恒编译期**) | −0.10 µs |
+
+**★ 算术序逐位不变** ⇒ 判据是 `out`/`state` 与旧核**逐字节相同**(不是容差)。
+⚠️ 中途自踩两次,都值得记:
+1. **环形槽用 `t % D` 运行期索引 ⇒ 退化成 local memory**(4.8 µs/token,比不预取还慢 3×)
+   ⇒ 必须把 t 循环**按 D 展开**让槽号成常量;
+2. 预取实现里 `y[c]` 被**复用**成 delta(状态对、out 全错)⇒ 台子的"逐字节对拍"当场抓到;
+   **没有它,这个 bug 会以"out 合理但偏 3e-4"的形态流进生产**。
+
+C 的扫描:C=1 1.41 / **C=2 1.087** / C=4 1.20(C=4 让并行 warp 数掉到 1/4,
+延迟藏不住)⇒ 取 **C=2,D=2**。
+
+### 68.4 落地
+
+- `crates/kernels/cu/gdn/gdn_recurrence.cu`:入口名/签名/槽序**不变**;新增 `gdn_rec_cols2`
+  快路 + **原形体逐字保留**为回落(kd≠128 或 vd 奇);`gdn_rec_fast_shape` 判据;
+- `crates/kernels/src/driver.rs`:`recurrence_varlen_gqa_fast`(与核内判据**同源**)+
+  grid 步长 16(快路)/ 8(回落)+ 单测 **`gdn_rec_geometry_matches_route`**
+  (判据不同源不是"慢一点"而是**列覆盖错位**:legacy 的列步长 8、快路 16);
+- 台:`crates/kernels/tests/gdn_recurrence_bench.rs`(生产形状 µs/token + 逐位参考落盘/比对 +
+  **时钟自证**:空载 210 MHz,不预热会系统性偏低 2×)。
+
+### 68.5 验收(全部实测)
+
+| 面 | 读数 |
+|---|---|
+| 核台(3080 单卡,T=1024,刷新前参考) | **1.75 → 1.08 µs/token(−38% / 1.61×)**;**out+state 逐字节相同** |
+| `gdn_chunked_golden` · `gdn_scalar_golden` · `gdn_big_t_arms_parity`(0.8B 大 T 双臂) | ✅ 全绿 |
+| `tp_g8_gate`(0.8B TP2≡TP1,**L1 逐位**)· `tp_determinism` · `tp_transport_bits` · `tp_assemble` | ✅ 全绿 |
+| `driver::tests`(含新几何门) | ✅ 9/9 |
+| **端到端 std(TP2 / 双 3080 / 五点三轮 / `tp2-nospec-vsplit-fused`)** | prefill **1486.1 → 1570.35(+5.7%)** · decode 49.25 → **49.41**(噪声内,GDN decode 走另一核,未动)· TTFT@8k 5255 ms |
+
+**机器状态**:本次 std 期间 3090 对上有别的会话(`owl_models` 3.7GB + `llama-tokenize`),
+**3080 对本轮干净**(启动日志 `[boot] 选卡` 自证 rank0/1 = 3080 两张)。
+
+### 68.6 遗留
+
+1. **q/k 装载仍是 2 列冗余**(每 block 8 warp 各读一遍):下一个杠杆是"**lane 持有连续 4 行** +
+   `uint2` 8B 向量装载"(每 lane 每 token 2 条装载代替 8 条)—— 但**求和序变**,
+   不再是逐位相同(要另立容差判据);
+2. **FLA chunked(matmul)版**是另一条路:TP1 的 `spec-dflash` 已用(`gdn_chunked=true`),
+   但 AOT cubin 按 `NV=48` 烘死(`crates/kernels/triton/gdn_chunked_aot.json`),
+   TP2 的 (8,24) 需重编 + 重走 c1–c5 金标 ⇒ **未量过它 vs 串行核**,属"待翻案"清单新条目;
+3. `op_tables` 两门**在 HEAD 上就是红的**(`owl_comm_ar_stage_f8_f16` 的 `.cu` 形参表
+   解析不出 —— P1.3 fp8 AR 遗留),与本刀无关,已当场用 `git stash` 复现验证。
