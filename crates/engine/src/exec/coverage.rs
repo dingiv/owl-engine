@@ -566,6 +566,27 @@ impl<D: DeviceClient> RunningEngine<D> {
                 sink.push((i, *h, slot));
             }
         }
+        // ── **懒沉**(2026-10-20):池仍有余量 ⇒ 本轮**不沉**,整链常驻 ──
+        //
+        // 为什么:KVMem 的"每边界只留工作集"在**短 ctx**(整链装得下池)是纯开销
+        // —— 每边界下沉 ~16-20 块 + 下一边界再 stage 回来(两次 swap 同步 +
+        // 两次 PCIe),而 prefill 的 attention 读放大远小于 17.7 GB 权重读。
+        // 判据 = 空闲槽够"下一 chunk + 工作集"的余量;池将满(长 ctx)时自动回
+        // 到逐块下沉。语义不变:视图仍只读选中块(懒沉只是**少腾**设备槽)。
+        let page = self.dev.pool.page.max(1);
+        let margin = self.cfg.prefill_chunk.div_ceil(page).max(1)
+            + self.cfg.knobs.workspace_per_req.div_ceil(page).max(1)
+            + 2;
+        if !sink.is_empty() && self.bank.rel.leg.slots_free() >= margin + need.len() {
+            self.partial.lazy_keep += sink.len();
+            owl_shared::log_debug!(
+                "cov-probe",
+                "懒沉:池余 {} 槽 ≥ 余量 {margin} ⇒ 本轮 {} 块保持常驻",
+                self.bank.rel.leg.slots_free(),
+                sink.len()
+            );
+            sink.clear();
+        }
         // ①′ **可沉性前置**:store 的宿主层按**缓存树条目**键控 ⇒ 只有
         // "树 + 会话双持"(refs == 2)的块才能:decref(→1 = 缓存独占)→ 下沉。
         // 本轮刚写、**还没进缓存树**的块(refs == 1)若 decref 会直接变自由槽

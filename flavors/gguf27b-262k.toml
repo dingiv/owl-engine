@@ -3,8 +3,9 @@
 # 单卡 3090 Ti(24 GB)**(2026-10-20 GGUF×KVMem 联调轮)
 # ============================================================================
 #
-# **一句话**:设备上只留工作集(1 GiB 池),全量 KV(8 GiB fp8)在宿主;
-# 设备池 = 上下文的 **1/8**(超卖 8×),选择层每 512 tok 召回一次。
+# **一句话**:设备上只留工作集(2 GiB f16 池 / 32K tok),全量 KV(16 GiB f16)在宿主;
+# 设备池 = 上下文的 **1/8**(超卖 8×),选择层每 1024 tok 召回一次。
+# (fp8 池是省显存档:decode −8%、prefill −5%;内存紧时再把 `kv_fp8` 打开)
 #
 # 靶位(用户档里给 `[model] dir`):
 #   models/ggml-org/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf
@@ -18,10 +19,11 @@
 #
 # 实测(2026-10-20,单张 3090 Ti 41:00.0;详见
 #   docs/arch/gguf-格式支持-设计与施工.md §二十三):
-#   · **258 486 tok prompt(≈1280 tok 短于上限)一次跑通,190.3 s**(≈1360 tok/s),
-#     needle 放 50% 处,**recall 命中**(答出 passcode);峰值占 20.4 GB / 24 GB;
-#   · 219 057 tok prompt:161.1 s(≈1360 tok/s),同样命中;
+#   · **258 486 tok prompt:179.5 s**(≈1440 tok/s),needle 50% 处 **recall 命中**;
+#     峰值 20.7 GB / 24 GB(f16 池,1 GiB 档;本档 2 GiB 池再 +1 GiB);
 #   · 同前缀二次请求(22 906 tok):18.7 s → **3.2 s**(快照恢复 + 宿主 KV 命中);
+#   · std 五点三轮:prefill **1608** t/s / decode **36.6** t/s
+#     (对照全量常驻 f16 档 1788 / 36.4 ⇒ decode 持平,prefill 差在边界);
 #   · 全程零 Xid、零下沉 Exhausted、N4 未归还清单为空(修复后)。
 #
 # ── 三层账(改数只动这三行;算式见 [kvmem]/[pool] 注释)────────────────────
@@ -29,21 +31,22 @@
 #   [pool].pool_tokens       = **设备 KV 池**(可 ≪ 上下文 —— 这就是超卖)
 #   [kvmem].workspace_per_req = 每活跃 turn 在设备池里的工作集(token;含保底)
 #
-# 24 GB 卡的账(实测):
+# 24 GB 卡的账(f16 定档;实测):
 #   17.69 GiB 权重/运行底价(live)
 #   +1.19 GiB  治理器固定项(GDN 格 148M + 快照池 297M + 图 slab 640M + warmup 138M)
-#   +1.00 GiB  设备 KV 池(32768 tok / 1024 页)—— **工作集,不是缓存**
-#   +~0.25 GiB prefill 激活面(chunk 512 实测峰值 ~226 MiB)+ 守卫 128 MiB
-#   ≈ 20.1 GiB ⇒ 余 ~4 GiB(258k 实测峰值 20.4 GB)
-#   KV 全量 = 262144 tok × 32 KiB(fp8)= **8 GiB** ⇒ 非驻留块**全部**在宿主腿
-#   ⇒ `host_cache_mb = 9216`(实测 258k 下沉 8045 块 = 7.86 GiB,腿内)
+#   +2.00 GiB  设备 KV 池(32768 tok / 1024 页 × 2 MiB)—— **工作集,不是缓存**
+#   +~0.5  GiB prefill 激活面(chunk 1024)+ 守卫 128 MiB
+#   ≈ 21.4 GiB ⇒ 余 ~2.2 GiB(258k 实测峰值:1 GiB 池 20.7 GB ⇒ 本档 ~21.7 GB)
+#   KV 全量 = 262144 tok × 64 KiB(f16)= **16 GiB** ⇒ 非驻留块**全部**在宿主腿
+#   ⇒ `host_cache_mb = 17408`(实测 f16 258k 下沉 7777 块 ≈ 15.2 GiB,腿内)
+#   宿主 RAM 需求 ≈ 17 GiB KV + 2 GiB 快照(本机 108 GiB,无压力)
 #
 # ⚠️ **池越小 = 前缀复用越浅**:二次请求的**整段命中链要一次性回灌设备**
-#   (`phases.rs` 的 `pending_loads` 不设上限)⇒ 池 1 GiB 支持约 3.2 万 tok 的
-#   前缀回灌(实测 22.9k 复跑 3.2 s)。**同前缀 26 万 tok 的整链复跑会撞
-#   「槽池耗尽」**(需 >1024 槽;这是已知限制,见设计 §二十三.4 —— 修法 =
-#   回灌按工作集截断,待立项)。要长前缀复跑就调大 `pool_tokens`(每次
-#   1 GiB ≈ 3.2 万 tok 回灌面),代价是 prefill 激活面余量变小。
+#   (`phases.rs` 的 `pending_loads` 不设上限)⇒ 池 1024 页(f16 2 GiB)支持约
+#   **3.2 万 tok** 的前缀回灌(实测 22.9k 复跑 3.2 s)。**同前缀 26 万 tok 的整链
+#   复跑会撞「槽池耗尽」**(需 8192 页;这是已知限制,见设计 §二十三.4 ——
+#   修法 = 回灌按工作集截断,待立项)。要更长前缀复跑就调大 `pool_tokens`
+#   (每 2 GiB ≈ 3.2 万 tok 回灌面),代价是 prefill 激活面余量变小。
 #
 # 需配套:`[model] dir`(GGUF 单文件)。
 [model]
@@ -52,29 +55,32 @@ kind = "gguf"
 [runtime]
 # 262k:GGUF 文件自带 context_length = 262144(§十四.1),无需扩表
 max_seq = 262144
-# chunk 512(KVMem 档定档;与 awq27b-262k 同律):
-#   · 边界 = 每 512 tok 一次完整召回(recall_every = 1);chunk 越小边界越密、
-#     召回越勤,但 GEMM 的 M 维越小;
-#   · 实测(GGUF 27B,int8-MMA 臂)262k 窗内 ≈1360 tok/s(含边界开销);
-#   · 改它要成对改 `[kvmem].recall_every` 的节奏(见 awq27b-262k 注释)。
-prefill_chunk = 512
+# chunk 1024(2026-10-20 定档;替代 512):
+#   · 边界 = 每 1024 tok 一次完整召回(recall_every = 1);chunk 翻倍 ⇒ 边界数
+#     减半(索引/快照/打分的固定税各减半),GEMM 的 M 维更大;
+#   · 实测(GGUF 27B,f16 池,std 五点三轮):**+8.2%**(1518.6 → 1643,含边界);
+#   · 质量门:needle 50% @ 56k/219k/258k 三档全命中(召回节奏 1024 tok 足够);
+#   · 改它要成对看 `recall_every` 的节奏(边界 = chunk)。
+prefill_chunk = 1024
 
 [pool]
-# **设备池 = 工作集**(1024 页 = 1 GiB = 32768 tok;超卖 8×)。
+# **设备池 = 工作集 + 前缀回灌面**(1024 页 × 2 MiB = 2 GiB = 32768 tok;超卖 8×)。
 # 为什么不是更大:设备池是"热面",而 262k 的非驻留块结构性全在宿主;
-# 池只保证 ①每 turn 工作集 32 页 ②chunk 增量 16 页 ③前缀回灌面(见上)。
+# 池保证 ①每 turn 工作集 32 页 ②chunk 增量 32 页 ③前缀回灌面(见上)。
+# 为什么是 f16 而不是 fp8:同池字节下解码快 **8%**(fp8 的 v2 decode 核逐元素
+# 反量化,实测 29.6 vs 26.3 ms/步),prefill 也快 ~5%;代价 = 宿主腿翻倍。
 # boot 硬校验:nb ≥ gdn_slots × (ceil(workspace_per_req/32) + ceil(chunk/32))
-#   1024 ≥ 1 × (32 + 16) = 48 ✓
+#   1024 ≥ 1 × (32 + 32) = 64 ✓
 pool_tokens = 32768
 gdn_slots = 1
 snap_max = 2
 # 24 GiB 贴顶:预留压到最小(治理器 cap 实测 127266 tok,本档只用 32768)
 vram_reserve_mb = 128
 # **宿主双腿必须给量**(262k 的非驻留 KV 全落这里):
-#   - KV 腿:262k 全量 8192 块 − 工作集 ~48 块 = 8144 MiB ⇒ 给 9216 MiB
-#     (实测 258k 时 host_blocks = 8045 = 7.86 GiB)
-#   - 状态腿:GDN 快照 159 MB/张;512 个边界 ⇒ 只留最近 ~13 张 ⇒ 给 2048 MiB
-host_cache_mb = 9216
+#   - KV 腿:262k 全量 8192 块 × 2 MiB = 16 GiB ⇒ 给 17408 MiB
+#     (实测 258k 时 host_blocks = 7777 ≈ 15.2 GiB)
+#   - 状态腿:GDN 快照 159 MB/张;chunk 1024 ⇒ 256 个边界,只留最近 ~13 张 ⇒ 2048 MiB
+host_cache_mb = 17408
 snap_host_mb = 2048
 # ⚠️ 虚拟化档**必须开**:下沉机制 = 缓存树 + 会话双持(refs==2)→ decref →
 # 缓存独占 → 下沉;关着 prefix_cache ⇒ 缓存树 cap=0 ⇒ **结构性不可沉**(boot 拒启)
@@ -89,8 +95,10 @@ max_concurrency = 1
 mode = "greedy"
 
 [dispatch]
-# fp8 池:容量 ×2(KV 32 KiB/tok)+ FI/XQA 读核前提
-kv_fp8 = true
+# f16 池(2026-10-20 定档):同容量下 decode +8% / prefill +5% —— fp8 的 v2 读核
+# 逐元素反量化是 CPU 侧实测瓶颈(见设计 §二十三.5)。**省显存档**再改回 true
+# (KV 32 KiB/tok:设备池 1 GiB、宿主 8 GiB)。FI 两档都有读核(fp8kv / f16)。
+kv_fp8 = false
 # GDN prefill 臂 = chunked(T 并行分块 delta-rule;varlen 顺序扫描 2.42 ms/层
 # 对 chunked 0.65 ms/层)。**GGUF 档此前漏配**,已由 gguf27b 固化。
 gdn_chunked = true

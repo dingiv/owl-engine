@@ -255,6 +255,8 @@ pub struct PartialStats {
     pub staged: usize,
     /// **本轮不可沉**的块数(还没进缓存树 ⇒ 无宿主键;见 §8.19 第 2b 项)
     pub not_cacheable: usize,
+    /// **懒沉保留**的块数(池仍有余量 ⇒ 本轮不沉、整链常驻;2026-10-20)
+    pub lazy_keep: usize,
     /// **prefill 子集表**生效的 chunk 数(= 链上有洞后才换表的次数;第 3 项证据)
     pub prefill_subset: usize,
 }
@@ -344,8 +346,8 @@ impl PartialStats {
     /// 人类可读一行。
     pub fn line(&self) -> String {
         format!(
-            "部分驻留:下沉 {} 块 · 回灌 {} 块 · 不可沉(未入缓存树){} 块 · prefill 子集表 {} 次",
-            self.sunk, self.staged, self.not_cacheable, self.prefill_subset
+            "部分驻留:下沉 {} 块 · 回灌 {} 块 · 不可沉(未入缓存树){} 块 · 懒沉保留 {} 块 · prefill 子集表 {} 次",
+            self.sunk, self.staged, self.not_cacheable, self.lazy_keep, self.prefill_subset
         )
     }
 }
