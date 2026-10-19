@@ -40,10 +40,38 @@ impl Embedding {
     /// untied + 头部量化计划(C1:生产入口;plan 量化且 eligible 时
     /// lm_head 走 marlin 臂,否则 f16 直读)
     pub fn new_untied_quant(vocab: usize, d_dim: usize, plan: QuantPlan) -> Embedding {
-        Embedding {
-            w: Weight::new("weight", vec![vocab, d_dim]),
-            lm_head: Some(Linear::new("lm_head", vocab, d_dim, plan)),
-            d_dim,
+        Embedding::new_untied_head(vocab, vocab, d_dim, plan) // 全量头(= 词表切关)
+    }
+
+    /// **untied + 词表切**(P1.1,2026-10-19):embed 表**全量**(每 rank 都要能查
+    /// 任意 token),lm_head 只建 `head_vocab` 行(每 rank 算半个词表的 logits)。
+    ///
+    /// 判据单源:`head_vocab < vocab` ⇒ 头部规则改 `UniformCol`(切 out 维)。
+    /// 装载侧的分片由 `build_shard_pass` 按同一规则表算 —— 两处约定不一致
+    /// 会在装载期**响亮拒**(见 `formats::shard` 的强校验)。
+    pub fn new_untied_head(vocab: usize, head_vocab: usize, d_dim: usize, plan: QuantPlan) -> Embedding {
+        let head = Linear::new("lm_head", head_vocab, d_dim, plan);
+        let head = if head_vocab < vocab {
+            head.with_tp_rule(crate::plan::rules::WeightRule::UniformCol)
+        } else {
+            head
+        };
+        Embedding { w: Weight::new("weight", vec![vocab, d_dim]), lm_head: Some(head), d_dim }
+    }
+
+    /// 头部 TP 规则(**只读**;判据用;tied = None ⇒ 取 embed 表规则 = Replicate)
+    pub fn head_rule(&self) -> crate::plan::rules::WeightRule {
+        match &self.lm_head {
+            Some(lin) => lin.tp_rule(),
+            None => crate::plan::rules::WeightRule::Replicate,
+        }
+    }
+
+    /// 头部输出行数(= 本 rank 的 logits 宽度;tied = 词表全量)
+    pub fn head_vocab(&self) -> usize {
+        match &self.lm_head {
+            Some(lin) => lin.out_dim(),
+            None => self.w.decl().shape[0],
         }
     }
 

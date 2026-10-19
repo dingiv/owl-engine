@@ -49,6 +49,14 @@ use crate::TensorOps;
 #[derive(Clone)]
 pub struct ModelSpec {
     pub vocab: usize,
+    /// **lm_head 的输出行数**(P1.1 词表切;缺省 = `vocab`)。
+    /// 由 [`ModelSpec::sharded`] 从 `head_split` 派生 —— 唯一的"本 rank
+    /// logits 宽度"真源(引擎侧 logits 槽形状/采样拼接都读它)。
+    pub head_vocab: usize,
+    /// **词表切开关**(P1.1;意图位,来自引擎配置 `runtime.tp_vocab_split`)。
+    /// `sharded()` 只读它一次:`true` ⇒ `head_vocab = vocab / world`(必须整除,
+    /// 否则响亮拒)。缺省 `false` ⇒ 逐字节等价于旧行为。
+    pub head_split: bool,
     pub hidden: usize,
     pub inter: usize,
     /// 模型计算 dtype(f16 基线 F5;装载/核名/KV 池的单一事实源)
@@ -83,12 +91,18 @@ impl ModelSpec {
     /// **整除硬门**:任一切分维不被 world 整除 ⇒ 结构化拒(不许 pad)。
     pub fn sharded(&self, plan: crate::plan::tp::TpPlan) -> Result<ModelSpec, String> {
         if plan.is_single() {
-            return Ok(self.clone());
+            let mut s = self.clone();
+            s.head_vocab = self.vocab; // 单卡退化:头也全量(与 head_split 无关)
+            return Ok(s);
         }
         let (hq, hkv, hd) = self.full_heads;
         let (nk, hk, nv, hv) = self.gdn_heads;
         Ok(ModelSpec {
             vocab: self.vocab,
+            // **词表切(P1.1)**:embed 表保持全量(查表要任意 token);
+            // lm_head 行数按 world 等分(`head_split = false` ⇒ 全量)。
+            head_vocab: if self.head_split { plan.shard_len(self.vocab)? } else { self.vocab },
+            head_split: self.head_split,
             hidden: self.hidden,
             inter: plan.shard_len(self.inter)?,
             dtype: self.dtype,
@@ -148,7 +162,8 @@ impl Model {
         let embed = if spec.tied {
             Embedding::new(spec.vocab, spec.hidden)
         } else {
-            Embedding::new_untied_quant(spec.vocab, spec.hidden, head_plan)
+            // P1.1:head_vocab < vocab ⇒ 词表切(每 rank 只建/只算自己那半)
+            Embedding::new_untied_head(spec.vocab, spec.head_vocab, spec.hidden, head_plan)
         };
         Model {
             embed,
@@ -166,6 +181,14 @@ impl Model {
 
     pub fn vocab_size(&self) -> usize {
         self.vocab
+    }
+
+    /// **本 rank 的 logits 宽度**(P1.1):词表切档 = `vocab / world`;
+    /// 未切档 = `vocab`(与 `vocab_size()` 同值)。
+    /// ⚠️ 引擎侧的 logits 槽形状、采样拼接、门判据都以**本函数**为真源;
+    /// `vocab_size()` 仍是"词表全量"(embed 表/tokenizer/draft 面用它)。
+    pub fn logits_vocab(&self) -> usize {
+        self.embed.head_vocab()
     }
 
     /// VLM 图像 token 注入(embed 之后 / 层循环之前 —— 与 HF
@@ -432,6 +455,76 @@ mod spec_shard_tests {
         assert_eq!((s1.inter, s1.full_heads, s1.gdn_heads), (s.inter, s.full_heads, s.gdn_heads));
     }
 
+    /// **P1.1 词表切**:`head_split = true` ⇒ `head_vocab = vocab / world`,
+    /// embed 表仍全量;`false` ⇒ 逐字段不变(缺省零行为变化)
+    #[test]
+    fn sharded_head_split_splits_only_the_head() {
+        let mut full = crate::formats::qwen35::qwen3_8_27b();
+        assert_eq!(full.head_vocab, full.vocab, "缺省:头 = 全量");
+        let s0 = full.sharded(plan(0, 2)).expect("未开切:可切");
+        assert_eq!(s0.head_vocab, 248320, "未开切 ⇒ 头全量(旧行为)");
+        full.head_split = true;
+        let s = full.sharded(plan(0, 2)).expect("词表切:可切");
+        assert_eq!(s.vocab, 248320, "**embed 表仍全量**(每 rank 查任意 token)");
+        assert_eq!(s.head_vocab, 124160, "lm_head 切半");
+        assert!(s.head_split, "意图位透传");
+        // 两 rank 行区间恰好覆盖 [0, vocab) 且互不重叠
+        let r0 = TpPlan::new(0, 2).unwrap().shard_range(248320).unwrap();
+        let r1 = TpPlan::new(1, 2).unwrap().shard_range(248320).unwrap();
+        assert_eq!((r0.start, r0.end, r1.start, r1.end), (0, 124160, 124160, 248320));
+        // world=1 退化:即使开了切,头也是全量
+        let s1 = full.sharded(TpPlan::single()).expect("单卡");
+        assert_eq!(s1.head_vocab, 248320);
+    }
+
+    /// **整除硬门**:词表不被 world 整除 ⇒ 响亮拒(不许 pad)
+    #[test]
+    fn sharded_head_split_refuses_uneven_vocab() {
+        let full = ModelSpec {
+            vocab: 5, // 奇数:world=2 切不动
+            head_vocab: 5,
+            head_split: true,
+            hidden: 8,
+            inter: 4,
+            dtype: crate::contract::Dtype::F16,
+            full_heads: (2, 2, 4), // hkv 也要被 2 整除(否则拒因不在词表那一维)
+            gdn_heads: (2, 4, 2, 4),
+            eps: 1e-6,
+            layer_types: vec![true],
+            tokenizer: crate::formats::qwen35::qwen3_5_0_8b().tokenizer,
+            tied: false,
+        };
+        let e = match full.sharded(plan(0, 2)) {
+            Err(e) => e,
+            Ok(_) => panic!("vocab 5 不被 2 整除应拒"),
+        };
+        assert!(e.contains("整除") || e.contains("shard"), "拒因应指向整除:{e}");
+        // 同 spec 关掉切 ⇒ 可切(证明拒因只在词表切那一维)
+        let mut ok = full.clone();
+        ok.head_split = false;
+        assert!(ok.sharded(plan(0, 2)).is_ok());
+    }
+
+    /// **Model::new 的头部**:切档 ⇒ `logits_vocab = vocab/world` 且头规则 = UniformCol;
+    /// 未切档 ⇒ 全量 + 默认规则(Replicate)
+    #[test]
+    fn model_head_vocab_and_rule_follow_the_split() {
+        let full = crate::formats::qwen35::qwen3_8_27b();
+        let keys = || crate::formats::qwen35::Qwen35Convention::new("model");
+        let m_full = super::Model::new(&full, keys(), crate::module::QuantPlan::F16, crate::module::QuantPlan::F16);
+        assert_eq!(m_full.logits_vocab(), 248320);
+        assert_eq!(m_full.vocab_size(), 248320);
+        assert_eq!(m_full.embed.head_rule(), crate::plan::rules::WeightRule::Replicate, "未切:头不切");
+
+        let mut sp = full.clone();
+        sp.head_split = true;
+        let sharded = sp.sharded(plan(0, 2)).expect("切");
+        let m = super::Model::new(&sharded, keys(), crate::module::QuantPlan::F16, crate::module::QuantPlan::F16);
+        assert_eq!(m.logits_vocab(), 124160, "本 rank 的 logits 宽度");
+        assert_eq!(m.vocab_size(), 248320, "词表全量(embed/tokenizer 面)");
+        assert_eq!(m.embed.head_rule(), crate::plan::rules::WeightRule::UniformCol, "切档:头按 out 维切");
+    }
+
     /// world=1 = 逐字段恒等(退化路径零特判)
     #[test]
     fn sharded_single_is_identity() {
@@ -531,6 +624,8 @@ mod tests {
 
     fn spec() -> ModelSpec {
         ModelSpec {
+            head_vocab: 248320,
+            head_split: false,
             vocab: VOCAB,
             hidden: HIDDEN,
             inter: INTER,
