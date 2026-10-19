@@ -217,6 +217,18 @@ pub trait AllocLedger: Send {
     fn pool_drain(&mut self) -> Vec<u64> {
         Vec::new()
     }
+
+    /// **账本身份令牌**(TP 两 rank 合流判据):同一个"书"必须给**同一个非零值**;
+    /// `0` = 不表态(无身份的实现 —— 一律按"另一本书"处理)。
+    ///
+    /// 用途:[`DeviceHandle::adopt_ledger`] 区分两种接管 ——
+    /// ① **同一本书**(令牌相等):接管**不丢任何事件** ⇒ 任何时点都幂等允许
+    /// (TP:调用方已在**装载前**用 `Engine::new_with_ledger` 合流,装配期那次
+    /// adopt 只是复用同一本;装载事件本就落在这本上);
+    /// ② **另一本书**:只有 boot 期(零事件)才许接管(否则事件进孤儿账)。
+    fn book_token(&self) -> usize {
+        0
+    }
 }
 
 /// **账本单元**(共享句柄;**同一本账**被 client 钩子与 store 自查共看)。
@@ -541,6 +553,23 @@ impl<D: DeviceClient> DeviceHandle<D> {
     /// 判据 = 本句柄**尚未发过任何事件**(发过就不是 boot 期了)；违反 ⇒ 响亮拒
     /// (接管会把已有事件丢进孤儿账 —— 静默丢账比拒更坏)。
     pub fn adopt_ledger(&mut self, ledger: LedgerCell) -> Result<(), ModelError> {
+        // **幂等支路(同一本书)**:接管不改"账在哪"⇒ 零事件丢失风险 ⇒ 放行。
+        // 判据 = 令牌相等(`Arc::ptr_eq` 先行:同一 cell 双锁会自死锁)。
+        if let Some(cur) = self.ledger.as_ref() {
+            let same = if Arc::ptr_eq(cur, &ledger) {
+                true
+            } else {
+                // 中毒 = 有 panic 发生在持账期间:取回内层数据续用(与 `ctx` 同律)
+                let a = match cur.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+                let b = match ledger.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+                let t = a.book_token();
+                t != 0 && t == b.book_token()
+            };
+            if same {
+                self.ledger = Some(ledger);
+                return Ok(());
+            }
+        }
         let sent = self.ctx().events_sent;
         if sent != 0 {
             return Err(ModelError::Msg(format!(

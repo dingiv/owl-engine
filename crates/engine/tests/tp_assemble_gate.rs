@@ -97,7 +97,9 @@ async fn body(oa: usize, ob: usize, dir: PathBuf) {
         .await
         .expect("rank0 分片装载");
     eprintln!("[tp-gate] rank0 装载完成(1/2)");
-    let mut e1 = Engine::new(cfg_of(ob)).expect("engine(rank1)");
+    // rank1 的账本/设备序**装载前**从 rank0 接过(`adopt_ledger` 的 boot 期判据
+    // 容不下事后接管 —— 装载即发事件)。见 `Engine::new_with_ledger`。
+    let mut e1 = Engine::new_with_ledger(cfg_of(ob), e0.ledger_cell(), 1).expect("engine(rank1)");
     let l1 = e1
         .loader()
         .slice(1, 2)

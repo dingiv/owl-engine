@@ -1262,6 +1262,13 @@ impl owl_iface::handle::AllocLedger for LedgerEntry {
     fn on_move(&mut self, ev: &owl_iface::handle::MoveEvent) {
         book_lock(&self.book).on_move(ev);
     }
+
+    /// 账本身份令牌 = **书本体指针**(同一本 `SharedLedger` ⇒ 同一个值;
+    /// `ledger_entry()` 每次新建的是"cell 包装",所以比 cell 指针没用 ——
+    /// 必须往里看一层,这是 TP 幂等接管的唯一判据)。
+    fn book_token(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.book) as usize
+    }
 }
 
 /// **boot 接线**:账本单元 → `DeviceHandle` 的事件入口(`LedgerCell`)。

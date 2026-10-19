@@ -157,7 +157,10 @@ async fn assemble(
         .load_qwen35_0_8b(dir)
         .await
         .expect("rank0 分片装载");
-    let mut e1 = Engine::new(cfg_of(ob, chunk, prefix_cache)).expect("engine(rank1)");
+    // rank1 账本/设备序装载前从 rank0 接过(TP 合流纪律;见 `Engine::new_with_ledger`)
+    let mut e1 =
+        Engine::new_with_ledger(cfg_of(ob, chunk, prefix_cache), e0.ledger_cell(), 1)
+            .expect("engine(rank1)");
     let l1 = e1
         .loader()
         .slice(1, 2)

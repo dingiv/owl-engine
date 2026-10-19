@@ -148,7 +148,7 @@ async fn body(oa: usize, ob: usize, oc: usize, dir: PathBuf) {
     let m0 = e0.loader().slice(0, 2)
         .load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16, owl_models::module::QuantPlan::W4A16Awq)
         .await.expect("rank0 分片装载");
-    let mut e1 = Engine::new(cfg_of(oc, chunk)).expect("engine(r1)");
+    let mut e1 = Engine::new_with_ledger(cfg_of(oc, chunk), e0.ledger_cell(), 1).expect("engine(r1)");
     let m1 = e1.loader().slice(1, 2)
         .load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16, owl_models::module::QuantPlan::W4A16Awq)
         .await.expect("rank1 分片装载");
