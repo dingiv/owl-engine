@@ -376,4 +376,10 @@ async fn pressure_offloads_without_deficit_and_prefers_host() {
         v.out.iter().map(|o| o.sink).collect::<Vec<_>>()
     );
     assert_eq!(v.out.iter().map(|o| o.span).sum::<usize>(), 3, "整链下沉凑满目标");
+    // **H5 空转整理**(步 4 入档):与 Pressure 同语义(零缺口也搬),只是 why 不同 ——
+    // 空转期只动缓存面(冷链),绝不碰活跃面。
+    let idle = plan(&l, Need { slots: 3, why: NeedWhy::Idle }, &[]);
+    assert!(!idle.out.is_empty(), "H5 空转整理必须出单(零缺口也搬)");
+    assert!(idle.out.iter().all(|o| o.sink == Sink::Host), "空转整理同样先下沉");
+    assert!(idle.deny.is_none(), "有可搬面 ⇒ 不拒");
 }

@@ -51,8 +51,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
             // **[N4 TurnEnd]**(弃置路径同款:归属下行;须在 act 还在手时取会话事实)
             self.set_ctx_after_turn(act.session_id, act.ephemeral);
-            self.n4_pool_sweep(act.id);
-            self.n4_report_unreturned(act.id);
+            // abandon 返回 TurnEvent(非 Result)⇒ 节点失败**响亮留痕**但不掩盖原错
+            if let Err(e) = self.node(crate::running::Node::TurnEnd(act.id)).await {
+                owl_shared::log_warn!("store", "N4 节点失败(继续收尾): {e}");
+            }
         }
         // 准入账同步(S3b §23.2):turn 生死 = 保留额生死
         self.close_admission(turn_id);
@@ -120,10 +122,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         // **[N4 TurnEnd]**:归属下行 —— 会话仍活 ⇒ `Session(s)`,焚毁 ⇒ `System`
         self.set_ctx_after_turn(act.session_id, act.ephemeral);
-        // 缺口 4:先把本 turn 已释放的临时块入**复用池**(改归属 Cache)
-        self.n4_pool_sweep(act.id);
-        // 归还清单(store 立案 §缺口1):非空 = 有临时面没在节点上归还 ⇒ 响亮留痕
-        self.n4_report_unreturned(act.id);
+        // **[N4 TurnEnd]**(节点入口):池清点(改归属 Cache)+ 未归还清单(响亮)
+        self.node(crate::running::Node::TurnEnd(act.id)).await?;
         // 准入账同步(S3b §23.2):turn 生死 = 保留额生死
         self.close_admission(act.id);
         // **B-3d**:选择层视图态随 turn 收口(视图是 turn 域资源 —— 下一 turn

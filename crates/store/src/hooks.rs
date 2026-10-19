@@ -105,8 +105,9 @@ pub struct Applied {
 pub fn plan(leg: &BlockLeg, need: Need, protect: &[ChainHash]) -> Verdict {
     let mut v = Verdict::default();
     let free = leg.slots_free();
-    // **N6 压力**:目标 = "腾出 slots 个槽"(与缺口无关)⇒ 不吃早退。
-    if need.why == NeedWhy::Pressure {
+    // **N6 压力 / H5 空转整理**:目标 = "腾出 slots 个槽"(与缺口无关)⇒ 不吃早退。
+    // (两者只差 `why` 的打点口径:Pressure = 救火,H5 = 空转期主动整理)
+    if matches!(need.why, NeedWhy::Pressure | NeedWhy::Idle) {
         let want = need.slots.min(leg.slots_total().saturating_sub(free));
         let mut got = 0usize;
         let mut picked: Vec<ChainHash> = protect.to_vec();

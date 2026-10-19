@@ -711,6 +711,64 @@ device_ledger 2(断言"turn 后池非空 + hits+misses>0")· 真机三轮同上�
 **门**:engine 54 · workspace check 干净 · store 88;次序门(需腿内有块的单测)仍在
 `hooks.rs` 的 FIXME 上 —— 与真机判据同刀收(构造用例:池贴顶 + 临时需求)。
 
+
+### 12.16 刀 N6-③/步 4:节点收编 + 池上限 + **拒绝不再直通致命** + 真机池贴顶实录(2026-10-19)
+
+#### (1) 步 4:全部保洁收进**唯一节点入口** `RunningEngine::node(Node)`
+
+`Node = { Need(need) | TurnEnd(t) | SessionClose(s) | Pressure(k) | Idle(k) }`:
+- **N1/N2/N3** → `Node::Need`(需求算式仍在 `step_need`,why = Admit/Grow);
+- **N4** → `Node::TurnEnd`(池清点 + 未归还清单);
+- **N5** → `Node::SessionClose`(链已由会话表经 store API 归还;节点只记账/复位);
+- **N6** → `Node::Pressure`;**H5** → `Node::Idle`(空转每 16 拍一次,常量非 env —— 引擎零 env 读取纪律);
+- 每个节点记 `store.node.{name}` metrics。
+
+**判据(grep 可证)**:engine 内 `owl_store::plan(` / `apply_verdict(` **只剩**
+`pool_housekeeping`(节点唯一执行臂)一处;`Node` 构造点 = `step_need` / `pump` / `turn_end`。
+
+**`plan()` 同步放宽**:`matches!(why, Pressure | Idle)` ⇒ **零缺口也搬**(目标 = 腾出 slots),
+次序不变(整链下沉 → 按叶下沉 → 仍要腾才驱逐 → 才 deny)。
+
+#### (2) 池上限(真机暴露的新缺口:池会囤积)
+
+27B 单轮释放后池**天然囤到 669 MiB**(复用率仅 ~37%)⇒ 无界池 = 新形态囤积。
+修:`LedgerBook.pool_cap`(缺省 **256 MiB**;`set_pool_cap` 可覆写)+ `pool_release` 改签名
+`Option<u64>`:**超上限 ⇒ 顶出最旧块并把 id 交回调用方真还驱动**(`pool_evicted` 计数)。
+真机复测:池 **243.7 MiB ≤ 256 MiB**,`evicted = 874`(逐块回驱动)。
+
+#### (3) **拒绝不再直通致命**(缺口 3 的核心判据,真机实证)
+
+旧行为(pressure 档第一跑):`pump` 冒 `PoolExhausted` ⇒ `[actor] 致命引擎错误 ⇒ 优雅关停`
+⇒ **整引擎退出**。新行为(`actor.rs`):
+`ModelError::PoolExhausted{..}` ⇒ 丢本 turn(客户端如实拿 500)+ **`relieve_pressure()`**
+(先池排空、再 N6 节点)+ **`continue` 继续泵**;只有 `ServerClosed` / `EngineInvariant` 仍致命。
+
+**真机实录(27B / 3090 Ti / `vram_target=0.98` / `reserve=2048MiB` / `host_cache_mb=32` /
+`snap_host_mb=0`,6×2400-token 长 prompt)**:
+
+```
+long1 200 · long2 200
+long3 500 · long4 500 · long5 500 · long6 500        ← 硬预算真不足(如实失败)
+小请求 200 · /health 200                              ← **引擎不死、可继续服务** ✓
+[WARN] 显存压力:已收缩(还缓存 0 块 + 目标腾 64 槽)⇒ 引擎继续(丢本 turn)   ×4
+N6 压力节点 ×45(驱动余量 3943→2383MiB < 目标 ⇒ 目标腾 64 槽)
+deny→degrade ×1(启动期无冷链可搬,累计 1 次;之后靠下沉/顶出消化)
+pool: 101 块 / 243.7MiB ≤ cap 256MiB · hits 9960 / misses 11526 · evicted 874 · drained 0
+```
+
+**"还缓存 0 块"的判读(重要,别误读成没做工)**:失败那一刻的临时块**都在使用中**(不在池里)
+⇒ 池无可排空;这正是"mid-turn 无缓存可退"的物理事实。真机上把内存还给驱动的是
+**池上限顶出(874 块)** 与 **N6 下沉**,不是排空(`drained` 的用武之地在"turn 之间"或
+N7 装载/拆卸期)。⇒ 日志已改成**如实报数**(`drained` 恒 0 也照说)。
+
+#### (4) 一处 API 纪律复用
+
+契约面新增 `drain_temp_pool()`(名字**故意**与句柄具名方法 `drain_pool_to_driver` 区分)——
+2026-10-19 同名解析事故的直接产物(见 §12.13)。
+
+**门**:store 90(+池上限门/Idle 次序断言)· iface 11 · cpu 18 · engine 54 ·
+`cargo check --workspace --all-targets` 干净 · server 构建 OK · 真机 6 长 ×2 轮实录如上。
+
 ## §十一 变更记录
 
 | 日期 | 版本 | 变更 |

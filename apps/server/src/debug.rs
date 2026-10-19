@@ -331,6 +331,8 @@ pub fn vram_json(snap: &crate::actor::VramSnapshot) -> Value {
                 "hits": r.events.pool.hits,
                 "misses": r.events.pool.misses,
                 "drained": r.events.pool.drained,
+                "evicted": r.events.pool.evicted,
+                "cap_bytes": r.events.pool.cap,
             },
             // **lifecycle 在借清单**(N4/N5 未归还的逐块指纹:名字 + id)。
             // 判据:同一 `name` 的条目**逐轮增长** = 该处没在节点上归还。

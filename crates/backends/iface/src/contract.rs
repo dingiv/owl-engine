@@ -361,6 +361,15 @@ pub trait DeviceClient: Send {
         crate::handle::CtxScope::noop()
     }
 
+    /// **复用池排空**(缺口 3/4;store 侧决策、本层执行):把池内可复用块**真还驱动**,
+    /// 返回释放块数。缺省 `0` = 无池面(裸 face/mock)。
+    ///
+    /// ⚠️ 名字**故意**与 `DeviceHandle::drain_pool_to_driver` 区分:2026-10-19 实测
+    /// 踩过"同名方法解析到契约缺省"⇒ 池只进不出。契约面用 `drain_temp_pool`。
+    fn drain_temp_pool(&mut self) -> impl Future<Output = usize> + Send {
+        async { 0 }
+    }
+
     /// **记账诊断三元组** `(hook_fail, window_unclosed, 窗内未归还块数)` —— 报告面用。
     /// 无账本的裸 face ⇒ 全 0(**真值**:没有账可失,也没有图窗簿记)。
     fn ledger_probe(&self) -> (u64, u64, usize) {

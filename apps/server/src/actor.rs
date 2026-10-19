@@ -202,8 +202,25 @@ pub async fn run_actor<D: DeviceClient>(
                     // 弃置滞留 = GDN 格泄漏 → 2 格两轮耗尽)+ 广播
                     owl_shared::log_warn!("actor", "pump 错误: {e}");
                     abandon_turn(running, &mut sinks, &format!("engine: {e}")).await;
-                    // **不可恢复**(显存硬预算拒发 / 设备 server 关闭)⇒ 不走"继续跑",
-                    // 直接优雅收摊(释放卡锁 + 有序退出):继续跑只会连环失败
+                    // **缺口 3(2026-10-19)**:硬预算/池耗尽 ⇒ **不再直通致命**:
+                    // 丢本 turn(客户端拿到 500/503,如实) + **立即收缩**(池排空 + N6)
+                    // + **继续跑**。判据:引擎不退出,后续请求仍可服务;只有真正的
+                    // 设备级错误(ServerClosed / 状态机失守)才走优雅关停。
+                    if matches!(e, owl_iface::contract::ModelError::PoolExhausted { .. }) {
+                        match running.relieve_pressure().await {
+                            // **如实报数**:还缓存 0 块也照说(mid-turn 池空是常态 ——
+                            // 失败那一刻的块都在使用中,不在池里)
+                            Ok((freed, k)) => owl_shared::log_warn!(
+                                "actor",
+                                "显存压力:已收缩(还缓存 {freed} 块 + 目标腾 {k} 槽)⇒ 引擎继续(丢本 turn)"
+                            ),
+                            Err(pe) => owl_shared::log_warn!(
+                                "actor",
+                                "收缩失败(继续跑,下次再试): {pe}"
+                            ),
+                        }
+                        continue;
+                    }
                     if e.is_fatal() {
                         owl_shared::log_warn!("actor", "致命引擎错误({e})⇒ 优雅关停");
                         shutdown.graceful(&format!("引擎不可恢复错误:{e}"));

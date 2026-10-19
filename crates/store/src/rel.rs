@@ -170,8 +170,12 @@ pub struct PoolReport {
     pub hits: u64,
     /// 取块未命中次数(走了真分配)。
     pub misses: u64,
-    /// 池排空次数(N6;此前恒 0)。
+    /// 池排空次数(N6)。
     pub drained: u64,
+    /// 超上限**顶出**块数(已真还驱动)。
+    pub evicted: u64,
+    /// 池上限字节(0 = 不限)。
+    pub cap: usize,
 }
 
 /// 在借清单的一行(报告面投影;`Loan` + id)。
@@ -721,7 +725,15 @@ impl Rel {
                     pool: {
                         let (n, by) = b.pool_stats();
                         let (hits, misses, drained) = b.pool_counters();
-                        PoolReport { entries: n, bytes: by, hits, misses, drained }
+                        PoolReport {
+                            entries: n,
+                            bytes: by,
+                            hits,
+                            misses,
+                            drained,
+                            evicted: b.pool_evicted(),
+                            cap: b.pool_cap(),
+                        }
                     },
                     open_lifecycle: b
                         .open_loans(|o| o.is_lifecycle())

@@ -206,9 +206,10 @@ pub trait AllocLedger: Send {
         None
     }
 
-    /// **池还块**:`true` = 已入池(**不许**再给驱动);`false` = 不归池 ⇒ 调用方真归还。
-    fn pool_release(&mut self, _id: u64) -> bool {
-        false
+    /// **池还块**:`None` = 已入池(**不许**再给驱动);
+    /// `Some(id)` = 该 id **必须真归还**(①不可池化 → 同一 id ②超池上限顶出的旧块)。
+    fn pool_release(&mut self, id: u64) -> Option<u64> {
+        Some(id)
     }
 
     /// **池排空**(压力路径 N6):清池并交出全部 id(调用方真归还驱动)。
@@ -679,8 +680,7 @@ impl<D: DeviceClient> DeviceHandle<D> {
             Command::Free { ids } => {
                 // **缺口 4**:可池化的块**不回驱动**(入 store 池 ⇒ 零命令复用);
                 // 池内那条**不**发 FreeEvent(块仍在借 —— 只是变得可复用)。
-                let rest = self.pool_release_all(&ids);
-                let pooled = ids.len() - rest.len();
+                let (rest, pooled) = self.pool_release_all(&ids);
                 if pooled > 0 {
                     self.note_pool_released(pooled);
                 }
@@ -777,7 +777,7 @@ impl<D: DeviceClient> DeviceHandle<D> {
     ///
     /// 为什么放在句柄:它是唯一同时握有**池(store 账本)**与**驱动口(face)**的一层
     /// —— 决策仍在 store(排空哪些 = `pool_drain`),执行在这里。
-    async fn drain_pool_to_driver(&mut self) -> usize {
+    pub async fn drain_pool_to_driver(&mut self) -> usize {
         let Some(cell) = self.ledger.as_ref() else { return 0 };
         let ids = {
             let mut g = match cell.lock() {
@@ -809,14 +809,25 @@ impl<D: DeviceClient> DeviceHandle<D> {
         ids.len()
     }
 
-    /// **池还块**(逐 id):返回"必须真归还"的那些(顺序保持原样)。
-    fn pool_release_all(&self, ids: &[u64]) -> Vec<u64> {
-        let Some(cell) = self.ledger.as_ref() else { return ids.to_vec() };
+    /// **池还块**(逐 id):返回 `(必须真归还的 id 列表, 入池条数)`。
+    ///
+    /// 两种"必须归还":①不可池化(同一 id)②超池上限**顶出**的旧块(那个旧 id)。
+    /// 入池条数 = 本次真正留在池里的块数(打点;顶出块在 store 侧另计 `pool_evicted`)。
+    fn pool_release_all(&self, ids: &[u64]) -> (Vec<u64>, usize) {
+        let Some(cell) = self.ledger.as_ref() else { return (ids.to_vec(), 0) };
         let mut g = match cell.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        ids.iter().copied().filter(|id| !g.pool_release(*id)).collect()
+        let mut must_free = Vec::new();
+        let mut pooled = 0usize;
+        for id in ids {
+            match g.pool_release(*id) {
+                None => pooled += 1,
+                Some(real) => must_free.push(real),
+            }
+        }
+        (must_free, pooled)
     }
 
     /// 发事件(客户端侧;**短锁**,绝不跨 await)。
@@ -891,6 +902,11 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
 
     fn ledger_probe(&self) -> (u64, u64, usize) {
         DeviceHandle::ledger_probe(self)
+    }
+
+    fn drain_temp_pool(&mut self) -> impl Future<Output = usize> + Send {
+        // UFCS 钉死走具名实现(见契约面注释:同名解析事故)
+        async move { DeviceHandle::drain_pool_to_driver(self).await }
     }
 
     fn op_env(&self) -> Option<owl_kernels::driver::OpEnv> {
@@ -1168,8 +1184,7 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
     fn free(&mut self, ids: &[u64]) -> impl Future<Output = Result<(), ModelError>> + Send {
         async move {
             // **缺口 4**:可池化 ⇒ 入池(不回驱动);其余真归还。池内那条不发 FreeEvent。
-            let rest = self.pool_release_all(ids);
-            let pooled = ids.len() - rest.len();
+            let (rest, pooled) = self.pool_release_all(ids);
             if pooled > 0 {
                 self.note_pool_released(pooled);
             }

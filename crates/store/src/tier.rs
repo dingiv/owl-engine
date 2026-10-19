@@ -638,7 +638,7 @@ mod tests {
             owner: IfOwner::Turn(1),
             rank: 0,
         });
-        assert!(b.pool_release(11), "temp 类可池化");
+        assert_eq!(b.pool_release(11), None, "None = 已入池");
         assert_eq!(b.open_count(), 1, "**入池 ≠ 归还**:块仍在借");
         assert_eq!(b.pool_stats(), (1, 4096));
         // ② 同类同尺寸命中;异类/异尺寸不命中(尺寸错 = 双错)
@@ -656,9 +656,9 @@ mod tests {
             owner: IfOwner::Turn(1),
             rank: 0,
         });
-        assert!(!b.pool_release(12), "常驻面不许进复用池");
+        assert_eq!(b.pool_release(12), Some(12), "常驻面不许进池 ⇒ 同 id 真归还");
         // ④ 清点:池内 Turn(1) → Cache(改归属,不变 tier/kind);非池块**不动**
-        b.pool_release(11);
+        let _ = b.pool_release(11);
         let swept = b.pool_sweep(IfOwner::Turn(1), IfOwner::Cache);
         assert_eq!(swept, (1, 4096), "只清点池内那块");
         assert_eq!(b.open_bytes(IfOwner::Turn(1)), 1024, "非池块仍归 turn(泄漏可见)");
@@ -666,6 +666,30 @@ mod tests {
         assert_eq!(b.tiers().kind_bytes(Tier::Gpu, AssetKind::Temp), 4096, "temp 面仍平");
         assert_eq!(b.tiers().kind_bytes(Tier::Gpu, AssetKind::Weight), 1024, "常驻面另账");
         let _ = cell;
+    }
+
+    /// **池上限门**(2026-10-19 实测:27B 一轮后池囤到 669 MiB ⇒ 必须有界):
+    /// 超上限时 `pool_release` 顶出**最旧**块并把它的 id 交回(调用方真还驱动)。
+    #[test]
+    fn pool_cap_evicts_oldest_and_hands_back_id() {
+        use owl_iface::handle::{AllocEvent, Owner as IfOwner};
+        let mut b = LedgerBook::new(TierBudget { host_bytes: 1 << 20, disk_bytes: 0 });
+        b.set_pool_cap(4096); // 只装 1 块
+        for (id, name) in [(1u64, "a"), (2, "b")] {
+            b.on_alloc(&AllocEvent {
+                id,
+                bytes: 4096,
+                name: name.into(),
+                class: owl_iface::handle::AssetClass::Temp,
+                owner: IfOwner::Turn(1),
+                rank: 0,
+            });
+        }
+        assert_eq!(b.pool_release(1), None, "第一块入池");
+        assert_eq!(b.pool_release(2), Some(1), "超上限 ⇒ 顶出最旧(1),由调用方真还");
+        assert_eq!(b.pool_stats(), (1, 4096), "池内只剩最新那块");
+        assert_eq!(b.pool_evicted(), 1, "顶出计数");
+        assert_eq!(b.pool_cap(), 4096, "上限可查(报告面)");
     }
 
     /// **第 0 刀:owner 维**(每字节唯一归属;出账逐 owner 判,不替他人平账)
@@ -739,11 +763,17 @@ pub struct LedgerBook {
     /// 3. 入池**不等于归还**:块仍在借(账上照旧占着),只是**可复用** ——
     ///    真还驱动 = 压力/关会话时的池排空(N6)。
     pool: BTreeMap<(AssetKind, usize), Vec<u64>>,
+    /// **池容量上限**(字节;2026-10-19 实测 27B 一轮后池囤到 669 MiB ⇒ 必须有界):
+    /// 超限时 `pool_release` **顶出最旧块**并把 id 交回调用方(真还驱动)。
+    /// 缺省 = `pool_cap_default()`;boot 可用 `set_pool_cap` 覆写。
+    pool_cap: usize,
     /// 池命中/未命中(打点:复用率 = hits/(hits+misses))
     pool_hits: u64,
     pool_misses: u64,
     /// 池排空(真还驱动)计数 —— N6 前恒 0
     pool_drained: u64,
+    /// **超上限顶出**计数(顶出的块已真还驱动)
+    pool_evicted: u64,
 }
 
 impl LedgerBook {
@@ -754,9 +784,11 @@ impl LedgerBook {
             open: BTreeMap::new(),
             hook_fail: 0,
             pool: BTreeMap::new(),
+            pool_cap: pool_cap_default(),
             pool_hits: 0,
             pool_misses: 0,
             pool_drained: 0,
+            pool_evicted: 0,
         }
     }
 
@@ -841,16 +873,57 @@ impl LedgerBook {
 
     /// **池还块**(只在 `on_free` 路径调:持有者已声明不再引用)。
     ///
-    /// 返回 `false` = 该块**不可池化**(类别不是临时面)或**不在借** ⇒ 调用方
-    /// 必须走真归还(不静默吞)。
-    pub fn pool_release(&mut self, id: u64) -> bool {
-        let Some(l) = self.open.get(&id) else { return false };
+    /// 返回:
+    /// - `None` = 本次**已入池**(调用方不要碰驱动);
+    /// - `Some(id)` = 该 id **必须真归还** —— 两种情形:①该块不可池化/不在借
+    ///   (同一个 id)②**超池上限,顶出最旧块**(被顶出的那个 id)。
+    ///
+    /// 顶出策略 = **FIFO 最旧**(池是"复用缓存",旧块留着只是白占;上限内保留
+    /// 最近释放的,与 CPU cache 的 LRU 直觉一致)。计数入 `pool_evicted`。
+    pub fn pool_release(&mut self, id: u64) -> Option<u64> {
+        let Some(l) = self.open.get(&id) else { return Some(id) };
         if !l.kind.poolable() {
-            return false;
+            return Some(id);
         }
         let key = (l.kind, l.bytes);
+        let mut evicted = None;
+        // 上限:池内字节 + 本块 > cap ⇒ 顶出最旧块(跨尺寸类也顶,先保总量)
+        while self.pool_bytes() + l.bytes > self.pool_cap {
+            let Some(old_key) = self
+                .pool
+                .iter()
+                .find(|(_, v)| !v.is_empty())
+                .map(|(k, _)| *k)
+            else {
+                break;
+            };
+            if let Some(v) = self.pool.get_mut(&old_key) {
+                if let Some(old) = v.first().copied() {
+                    v.remove(0);
+                    self.pool_evicted = self.pool_evicted.saturating_add(1);
+                    evicted = Some(old);
+                    continue;
+                }
+            }
+            self.pool.remove(&old_key);
+        }
         self.pool.entry(key).or_default().push(id);
-        true
+        evicted
+    }
+
+    /// 池内字节(键 × 块数的快速求和)。
+    fn pool_bytes(&self) -> usize {
+        self.pool.iter().map(|((_, b), v)| b * v.len()).sum()
+    }
+
+    /// boot/测试:设池容量上限(0 = 不限;>0 = 硬上限)。
+    pub fn set_pool_cap(&mut self, bytes: usize) {
+        self.pool_cap = bytes;
+    }
+
+    /// 池上限(报告面)。
+    pub fn pool_cap(&self) -> usize {
+        self.pool_cap
     }
 
     /// **N4 池清点**:把**池内**`from` 名下的块改归属 `to`(池 = 共享复用面,
@@ -906,6 +979,11 @@ impl LedgerBook {
     /// 池命中/未命中/排空计数。
     pub fn pool_counters(&self) -> (u64, u64, u64) {
         (self.pool_hits, self.pool_misses, self.pool_drained)
+    }
+
+    /// 超上限顶出计数(顶出块已真还驱动)。
+    pub fn pool_evicted(&self) -> u64 {
+        self.pool_evicted
     }
 
     /// **在借清单**(逐条带 **id 与点名**;N4"未归还清单"的原料)。
@@ -1041,7 +1119,16 @@ impl LedgerBook {
 /// HTTP 线程 ⇒ `Rc` 在那条路径上是真的 UB。单线程热路径无争用锁 ≈ ns 级。
 pub type SharedLedger = std::sync::Arc<std::sync::Mutex<LedgerBook>>;
 
-/// **建账**(boot 唯一入口;预算只能在这里给一次)。
+/// **池容量缺省上限** = 256 MiB。
+///
+/// 依据(2026-10-19 真机):27B 单轮释放后池天然囤到 **669 MiB**;而下一轮几乎
+/// 不会用到同一尺寸集合的全部(复用率 ~37%)⇒ 无界池 = 新形态囤积。256 MiB
+/// 覆盖实测单轮热集的大头,h按超出量逐块顶出回驱动。
+pub fn pool_cap_default() -> usize {
+    256 << 20
+}
+
+/// **建账**(boot 唯一入口;预算只能给一次 —— 池上限随账走)。
 pub fn shared_ledger(budget: TierBudget) -> SharedLedger {
     std::sync::Arc::new(std::sync::Mutex::new(LedgerBook::new(budget)))
 }
@@ -1079,7 +1166,7 @@ impl owl_iface::handle::AllocLedger for LedgerEntry {
         book_lock(&self.book).pool_acquire(kind, bytes)
     }
 
-    fn pool_release(&mut self, id: u64) -> bool {
+    fn pool_release(&mut self, id: u64) -> Option<u64> {
         book_lock(&self.book).pool_release(id)
     }
     fn on_free(&mut self, ev: &owl_iface::handle::FreeEvent) {

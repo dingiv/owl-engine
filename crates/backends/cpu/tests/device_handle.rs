@@ -75,14 +75,14 @@ impl AllocLedger for RecLedgerProxy {
         // 同尺寸才给(与 store 的 key 判据一致)
         g.pool.iter().rposition(|(b, _)| *b == bytes).map(|i| g.pool.remove(i).1)
     }
-    fn pool_release(&mut self, id: u64) -> bool {
+    fn pool_release(&mut self, id: u64) -> Option<u64> {
         let mut g = lock(&self.0);
         if !g.pool_on {
-            return false;
+            return Some(id);
         }
         let bytes = g.allocs.iter().rev().find(|e| e.id == id).map(|e| e.bytes).unwrap_or(0);
         g.pool.push((bytes, id));
-        true
+        None
     }
     fn pool_drain(&mut self) -> Vec<u64> {
         std::mem::take(&mut lock(&self.0).pool).into_iter().map(|(_, id)| id).collect()
@@ -538,9 +538,9 @@ async fn pool_reuses_released_temp_blocks() {
             }
             id
         }
-        fn pool_release(&mut self, id: u64) -> bool {
+        fn pool_release(&mut self, id: u64) -> Option<u64> {
             self.pool.entry((AssetClass::Temp as u8, 4096)).or_default().push(id);
-            true
+            None
         }
     }
     let rec: Rec = Arc::new(Mutex::new(RecLedger::default()));
@@ -560,7 +560,7 @@ async fn pool_reuses_released_temp_blocks() {
                 Err(p) => p.into_inner().pool_acquire(class, bytes),
             }
         }
-        fn pool_release(&mut self, id: u64) -> bool {
+        fn pool_release(&mut self, id: u64) -> Option<u64> {
             match self.0.lock() {
                 Ok(mut g) => g.pool_release(id),
                 Err(p) => p.into_inner().pool_release(id),
