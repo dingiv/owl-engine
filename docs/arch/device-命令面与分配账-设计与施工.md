@@ -783,8 +783,17 @@ N7 装载/拆卸期)。⇒ 日志已改成**如实报数**(`drained` 恒 0 也�
 | **P2-1** | 池指标入 metrics:N4 每 turn 记 `store.pool.{entries,bytes,hits,misses,evicted,drained}` | dump 可见时序 |
 | **P2-3** | `PoolReport.by_class` + `/debug/vram` 的 `events.pool.by_class[]` | 与 `events.rows` 同口径 |
 
-未打(留在工作单):P1-2(复用率:子 tag / uninit 允许 ≥尺寸,**需语义裁决**)、
-P1-3(RAII 偏离记档或补句柄)、P1-4(排空触发口径)、P2-2(池化块名字语义)、P2-4(立案卷回填——已做)。
+**其余四条已裁决/记档**(工作单同步):
+- **P1-3 ✅ 记档**:turn 作用域 RAII 未采用句柄式 —— 实现为"`free` 入池 + N4 清单清点"
+  (语义等价、不承诺"忘还不可编译");偏离已在立案卷 §九 登记。要编译期保证时再补 `TempArena`。
+- **P1-4 ❌ 不做**:池回驱动已由**上限顶出**(`pool_evicted`)承担;N5/N7 全量排空会**破坏复用**
+  (27B ephemeral 每 turn 焚毁 ⇒ 命中率崩)⇒ 排空只留给"分配失败自愈 / relieve_pressure"两条真路径。
+  **指标口径变更:`evicted` 才是"回驱动"主指标,`drained` 非常态。**
+- **P2-2 ✅ 已定**:池化块名字 = **首生名**(`Loan.name` 文档注明"池复用不改名");
+  OOM dump 的旧名按"该槽首生处"读;要"当前用途"再记 `reused_from`。
+- **P2-4 ✅**:立案卷已回填 §九(结案 + 临时池 + 偏离登记 + 指向工作单)。
+
+**唯一未决 = P1-2(复用率:子 tag / `uninit` 允许 ≥尺寸)—— 需语义裁决**,见工作单。
 
 **门**:store 89(+池 rank/双放门)· iface 11 · cpu 19(+窗门)· engine 54 · `device_ledger` 2 ·
 `cargo check --workspace --all-targets` 干净。
