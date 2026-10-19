@@ -352,10 +352,145 @@ N4 TurnEnd     → dev.set_owner(Owner::System);      // 复位;无上下文时�
 步 3:boot 接线 + N1/N4/N5 设 owner(零行为变化);
 步 4:`face` 类型替换;步 5:原生批 + 封印(§六)。
 
+
+### 12.6 步 3 实施记(全出生/死亡钩子 + 图窗 + 相位上下文;2026-10-19)
+
+**用户裁决(四条)**:① 账本原语改 `Arc<Mutex>`(真 `Send`);② 词表扩 4 类 + 相位上下文;
+③ 覆盖口径 = **全出生/死亡 + 全等门**(事件账 ids ↔ 块账房 ids);④ 先落步 1+2 提交。
+
+#### (1) 账本原语:`Rc<RefCell>` → `Arc<Mutex>`(方案甲字面被**硬约束**推翻)
+
+`DeviceClient: Send` 是契约硬要求,而 `/debug/blocks` 的 `face_clone()` **真的**把 face
+句柄送进 HTTP 线程(`main.rs` 的 `DbgFace = Arc<Mutex<GpuClient>>` 槽)—— `Rc` 在那条路径上
+是**真的 UB**,不是理论问题。落地:
+
+| 件 | 内容 |
+|---|---|
+| `iface/handle.rs` | `pub type LedgerCell = Arc<Mutex<dyn AllocLedger>>`(trait 加 `Send` 超界);`DeviceHandle.ctx: Arc<Mutex<Ctx>>`(**共享上下文**:face_clone 出来的句柄与本体同源 ⇒ 节点设一次全族生效) |
+| `store/tier.rs` | `LedgerBook { tiers, open, hook_fail }`(三层账 + 出借登记**同屋**:一笔出借同时改两处,分两处必分叉)+ `SharedLedger` + `book_lock()`(**锁中毒不许 panic 级联**:取回内部数据 + 计数可见)+ `LedgerEntry`(`AllocLedger` 的 store 适配器)+ `shared_ledger()`/`ledger_entry()`(boot 唯一入口) |
+| `store/rel.rs` | `Rel.ledger: SharedLedger`;`Rel::open(.., ledger)` **交叉校验**账本预算与 `VramBudget::tier_budget()` 逐字相等(不符 = boot 算式漂了 ⇒ 响亮拒) |
+| `store/lib.rs` + `engine` | `tier_budget_of(host_cache_mb, snap_host_mb)` = **中层预算唯一算式**(boot 造账与 `BudgetInputs.host_bytes` 同源) |
+
+两层锁的分工:**外层** = 事件入口对象(`LedgerCell`),**内层** = 账本本体(store 自查也要它);
+两层都只在同步段短暂持有、绝不跨 await、持内层时不回调外部代码。
+
+#### (2) 词表扩 4 类 + 相位上下文
+
+`AssetClass`/`AssetKind` 各 8 → **12**:`Weight`(装载)/`Graph`(图 slab)/`Pool`(池骨架)/
+`Unclassified`(兜底,**可见**)。映射单射(store 单测钉住)。相位上下文用 **RAII**(`CtxScope`,
+出作用域自动还原 —— 相位里任何 `?` 早退都不会漏还原):
+
+| 相位 | 设置点 | owner / class |
+|---|---|---|
+| 装载 | `loader.rs` 两个 `load_*` 入口 `scoped_ctx` | `System` / `Weight` |
+| 池骨架 | `boot_rank` 的 `StatePool::alloc` 外包一层 | `System` / `Pool` |
+| 捕获窗 | **自动**:窗内出生 ⇒ `Graph`(机制事实:捕获期后端恒走 slab 切片) | 窗内覆盖 |
+| 执行 | N1 设 `Turn(t)` / `Temp`;N4 落 `Session(s)`(会话仍活)或 `System`(焚毁)+ `Unclassified` | 见 §七 |
+
+上下文面同时进 `DeviceClient` **契约**(带缺省空实现:`set_owner/set_class/scoped_ctx/ledger_probe`
+—— 引擎内核按 `D: DeviceClient` 泛型写,拿不到具名句柄类型;裸 face 缺省 = 空实现,
+不是静默失败:无账本 ⇒ 无归属可谈)。
+
+#### (3) 覆盖口径:全出生/死亡 + 图窗(**契约缺口用"后端自述"补**)
+
+- **出生** = `alloc` / `alloc_uninit` / `htod` / `htod_on` / `htod_f32`(手心:字节 = 元素×dtype
+  / 源字节);**死亡** = `free`(成功收口才销);**换层** = `swap`(片段按逻辑块**聚合**成一条
+  `MoveEvent`;部分搬运由账本响亮拒);
+- **`launch` 不算出生** —— 实测 `cuda/src/launch.rs`:输出块 = 实参里最后一个 `Block`
+  (调用方先 `alloc` 再发射,服务端零分配)⇒ 出生只发生在分配族(这条推翻了我方文档原先的
+  "Launch 也产出块"的措辞);
+- **图窗**:`graph_begin` 开窗 → 窗内出生块记账 → `graph_end` 成功挂到 `GraphId` 名下
+  → `graph_destroy` 补发归还;
+- **契约缺口(新发现)**:窗失败/退休时"那些块去哪了"**两档后端语义真的不同** ——
+  CUDA 整批回收(`carve_block` ⇒ `graph_destroy`/空窗失败移出账房),host mock 交调用方 `free`
+  (CpuFace 注释原文)。**猜 = 静默错账** ⇒ 新增后端自述
+  [`DeviceClient::window_blocks_auto_reclaimed`](crate/backends/iface/src/contract.rs)(默认 false,
+  CUDA 覆写 true;契约三条:abort 成功 / destroy 成功 / **空窗失败** 都整批回收)。
+  `DeviceHandle` 按自述镜像:自述回收的场合补发事件;不回收/去向不明的场合**保留窗与 id**
+  并计 `window_unclosed`(可见),由调用方显式 `free` 收。
+
+#### (4) 报告面:`/debug/vram` 三面同刻
+
+`VramSnapshot { report, blocks(逐 rank 块账房快照), hook_fail, window_unclosed, open_window_blocks }`
+——**同一 actor turn 内取三面**(引擎不在 pump ⇒ 无交错,差集才是判据)。JSON 新增:
+
+- `events[]`(rank × owner × tier × kind;`EventRow`)、`handle{}`(`hook_fail`/`window_unclosed`)、
+- `recon[]`(**全等门**):逐 rank 比事件账 id 集 ↔ 块账房 id 集,给出 `equal`/`only_event`/
+  `only_block` + 前 16 个差集 id(纯比较,零决策)。
+
+#### (5) 实测门(全绿)
+
+| 门 | 判据 | 结果 |
+|---|---|---|
+| 单测 | iface 11 · store 87(+3+3)· cpu 16(行为门 16 条:含窗/自述/接管/同源)· models 217 · engine 54 · server 46(+1+2) | ✅ |
+| `cargo check --workspace --all-targets` | — | ✅ 干净(仅 2 条 models 存量 warning) |
+| **CPU mock 集成门**(新 `crates/engine/tests/device_ledger.rs`) | 装载 ⇒ `weight` 类 1.43 GiB / 304 条;装配 ⇒ `pool` 237 MiB / 161 条 + `graph` 485 KiB / 2 条;turn 后 `hook_fail=0` `window_unclosed=0` | ✅ |
+| 真机 27B(见 §12.7) | `recon.equal` + owner 曲线 | 待跑 |
+
+**三条实施教训**(值得记):
+1. **上下文读必须落变量**:`self.note_birth(&b, bytes, self.ctx().class, ..)` 里实参的临时
+   guard 活到**语句末**,而 `note_birth` 内部还要锁同一把 ⇒ **自锁死**(std Mutex 不可重入)。
+   同理 `match self.ctx().windows.pop()` 的 scrutinee guard 活过整个 `match`
+   ⇒ 分支里再锁 = 死锁。两处都实测踩到(make(1) 挂死),已改成"先落变量再调用"并写进注释。
+2. **`launch` 不产块**(见上):文档措辞与代码事实不符时,**以代码事实重写文档**。
+3. **`Engine::on_with_ledger` / `from_handle`**:TP 的 staging 握手要把 face 借出来再装回去,
+   而句柄承载账本身份 ⇒ 拆装只能"接着用"不能"重包"(重包 = 双包 `DeviceHandle<DeviceHandle<..>>`
+   + 上下文丢失)。TP 两 rank **合流同一本账**(`adopt_ledger`,仅 boot 期零事件;rank1 自己
+   那本必须为空 = 合流自证),事件带 `rank` 维区分卡。
+
+
+### 12.7 步 3 真机实测(27B AWQ INT4;2026-10-19)
+
+**档位**:`--flavor spec-dflash`(depth 7)· 3090 Ti(CUDA ordinal 1)· ctx 16384 / pool 16896 /
+gdn_slots 1 / `prefill_bucket = off`(临时档 `/tmp/owl-recon-27b.toml`,不入库)·
+**引擎装配(run)20.29s** · 启动即 `捕获态 Captured`。
+
+#### 事件账(启动后 + 1 轮请求)
+
+| rank | owner | kind | bytes | 条数 | 判读 |
+|---|---|---|---|---|---|
+| 0 | system | **Weight** | 16 652 MiB | 2217 | 27B AWQ INT4 权重,量级对(相位上下文生效) |
+| 0 | system | **Pool** | 1 772.8 MiB | 630 | 池骨架(KV/GDN/快照/草稿) |
+| 0 | system | **Unclassified** | 1 287.5 MiB | 254 | **未接线相位**(草稿模型装载等)——迁移进度指标 |
+| 0 | system | **Graph** | 61.9 MiB | 1749 | 捕获窗自产块(图族 slab;随图存活) |
+| 0 | **turn:1** | Temp | 0.02 MiB | 27 | N1 生效:turn 域临时面**可数** |
+
+`handle`: **`hook_fail = 0`** · `window_unclosed = 0` · `open_window_blocks = 1749`(图 slab 自产块,待图退休)。
+
+#### 全等门(`recon[0]`)
+
+```
+blocks = 4895    events = 4877    only_event = 0    only_block = 18
+block_bytes = 20 735 053 308 B   events.bytes = 19 774.3 MiB(≈ 同值)
+only_block_ids = [1099511627777 … +17]   ⇒ 账本 id 1 的前 18 个块
+```
+
+⇒ **18 块 = 服务端装配期自检块**,是**设计内**的账外分配:`GpuCtx::alloc_block` 的自检面
+(源码注释原文:*"装配期一次性小额…不计 slab/vram 音账"*,`cuda/src/server/mod.rs` §1915 附近)。
+⇒ **残差被解释干净**:36 个字节级差值之外**逐块全等**(id 集 + 字节),且**不随轮次增长**。
+
+#### 逐轮曲线(泄漏判据:4 轮同档请求)
+
+| 轮 | `turn:*` 在借条目 | `turn:*` 字节 | 全局 entries | 全局字节 | recon `only_block` |
+|---|---|---|---|---|---|
+| 1 | 27 | 0.020 MiB | 4877 | 19774.3 MiB | 18 |
+| 2 | 34 (**+7**) | 0.033 MiB | 4884 | 19774.3 MiB | 18 |
+| 3 | 41 (**+7**) | 0.050 MiB | 4891 | 19774.3 MiB | 18 |
+| 4 | 48 (**+7**) | 0.067 MiB | 4898 | 19774.3 MiB | 18 |
+
+⇒ **"未归还"第一次可数到块**:每 turn **+7 块 / +0.017 MiB**(`turn:N` 桶,内容极小但**条目线性增长**)
+= store 立案 §缺口 1「N4 无条件归还清单」缺位的**实测指纹**(此前只有"逐 turn 爬坡 ~480 MB"这种
+总量口径,看不见是谁)。**N4 清单 = 下一刀**,判据就写在这里:该列必须**不再随轮增长**。
+
+⇒ 另注:事件账面**看不到 480 MB/turn 量级的增长** ⇒ 那部分若复现,不在"设备块"这一层
+(属于腿/池的**复用缓存**面或视窗口径),与本节不冲突 —— 但**说明"爬坡"必须两面一起看**
+(事件账 = 块面;腿自报 = 池面),这正是 `/debug/vram` 三面同刻的理由。
+
 ## §十一 变更记录
 
 | 日期 | 版本 | 变更 |
 |---|---|---|
+| 2026-10-19 | v0.4 | **步 3 完成**:账本原语 `Arc<Mutex>`(真 Send)+ 词表扩 4 类 + 相位 RAII 上下文 + **全出生/死亡钩子**(含图窗自述契约)+ `/debug/vram` 三面同刻(事件账/句柄计数/**全等门**对账);CPU mock 集成门实测 weight/pool/graph 三类账落地;三条教训入档(自锁死两处 / launch 不产块 / TP 拆装只能接着用) |
 | 2026-10-19 | v0.3 | **步 2 完成**:store 侧 `impl AllocLedger`(`LedgerHandle`:出借登记 + 双持/幽灵拒 + 换层不注销)+ `TierLedger::move_owned` + `Owner` 复用 iface(单一真源)+ `Rel.ledger → Rc<RefCell<..>>`;三门全绿;澄清"事件账 vs 腿自报"互为校验 |
 | 2026-10-19 | v0.2 | **步 1 完成**:`iface/handle.rs` 落地(Owner/AssetClass/三事件/AllocLedger/Command+链式/Outcome/BatchOutcome/DeviceHandle + `alloc!`·`free!` 宏);`contract.rs` 仅把裸 client 的 `alloc!` 改名 `client_alloc!`;行为门 7 条全绿(真实 CpuFace 作内层);三条教训入档(宏归位 / `Outcome::Buf` / dev-dep 成环双实例) |
 | 2026-10-19 | v0.1 | 立项:三事同层(收编分配 / 账本接口 / 命令批发送);方案甲(`Rc<RefCell<dyn AllocLedger>>`)+ iface 薄包装(cuda 零改动);`Command` 链式构造 + `exec/batch` + `alloc!/free!` 宏;5 步施工序与判据 |
