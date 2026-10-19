@@ -5147,3 +5147,23 @@ host（engine）:
 - **下一刀（P2.2 host 尾巴治理）**:在 actor 循环 + `pump` 出口加打点,拆这 1.5ms
   （候选:事件通道/锁、`/debug` 统计、日志格式化、`turns` 账务、下一轮 `step_need` 之前
   的会话/KV 事、TTFT 记账…）。**预期上限 decode +7%**（扣掉已计相位）。
+
+#### 66.4 二次细分（P2.2 的**精确靶**;本轮收尾）
+
+加 `exec-main` 打点（`execute_decode` 321→637）后:
+
+| 段 | 读数 | 说明 |
+|---|---:|---|
+| `321→470`（decode 准备 + fill/launch）| **0.32 ms** | ✓ 小 |
+| `470→635`（图回放 + dtoh + 采样）| **18.58 ms** | ≈ 设备时间 |
+| `exec-main`（321→637）| **18.90 ms** | ✓ |
+| 步间隔 | 20.5 ms | — |
+| ⇒ **函数外**（637 → 下一步 321）| **≈ 1.55 ms** | ← **靶** |
+
+`pump` 的 dispatch 本身极薄（`set_phase` + timer + 调用 ⇒ 纳秒级）⇒ **1.55ms
+在「`pump` 返回 → actor 事件消费 → 下一轮 pump」之间** —— actor 循环每 token 走
+`deliver(sink)`（事件序列化 + 通道发送）+ 账务（`pending_cache`/统计）。**下一刀(P2.2)
+的入口 = `apps/server/actor.rs:124` 的 `running.pump()` 与 `deliver` 两侧加打点**。
+
+**打点留存**(恒开、纳秒级、零行为影响):`[sched] loophead=`(循环头 ✓ ≈0)、
+`step-prof exec-main=`(函数本体 18.9ms)。

@@ -635,6 +635,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             owl_shared::log_info!("step-prof", "pos={pos} token-dtoh={:?}", t_dtoh.unwrap().elapsed());
         }
         mrec("decode.step", t_step.elapsed());
+        // P2.2 侦察(2026-10-19):execute_decode 主体(321→此) vs 步间隔 ⇒ 定位
+        // "循环尾"是在函数内(321 前的准备/637 后的收尾)还是在 actor/pump 间隙。
+        if prof {
+            owl_shared::log_info!("step-prof", "pos={pos} exec-main={:?}", t_step.elapsed());
+        }
         // B4 降级期草稿同步(§6.24 方案 A):decode 图 taps → 1 行 encode。
         // 毒化带 ≤8 token 即被覆写,探测重入零损;成本 ≈ 0.5ms/tok(2%)
         // 2026-10-17:**播种裸步**走同一臂(两者同构:都要同步草稿池 + 计时进分母)
