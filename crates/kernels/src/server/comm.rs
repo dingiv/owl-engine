@@ -141,6 +141,26 @@ fn launch_ar(
     )
 }
 
+/// **fp8 载荷档**的核选(f16/bf16 两档;§47 第二步)
+fn pick_f8<'a>(op: OpId, dt: Dtype, k16: &'a Option<K>, kbf: &'a Option<K>) -> Result<&'a K, OpError> {
+    let slot = match dt {
+        Dtype::F16 => k16,
+        Dtype::BF16 => kbf,
+        other => {
+            return Err(OpError::Contract {
+                op: op.0.to_string(),
+                field: "payload dtype(f8 档)",
+                expect: "F16/BF16(fp8 载荷只对浮点载荷有意义)".into(),
+                got: format!("{other:?}"),
+            })
+        }
+    };
+    slot.as_ref().ok_or_else(|| OpError::Asset {
+        op: op.0.to_string(),
+        detail: format!("fp8 载荷核未装配(dtype {dt:?})"),
+    })
+}
+
 // ============================================================================
 // stage 族
 // ============================================================================
@@ -150,6 +170,9 @@ pub struct CommArStageRuntime {
     k_f32: Option<K>,
     k_f16: Option<K>,
     k_bf16: Option<K>,
+    /// **fp8 载荷档**(§47 第二步):只 f16/bf16 两档(拷入前先量化)
+    k_f8_f16: Option<K>,
+    k_f8_bf16: Option<K>,
 }
 
 impl CommArStageRuntime {
@@ -170,6 +193,8 @@ impl KernelFamily for CommArStageRuntime {
             k_f32: Some(exec.load_aot(res, asset::STAGE_SRC, asset::STAGE_F32, Self::ID)?),
             k_f16: Some(exec.load_aot(res, asset::STAGE_SRC, asset::STAGE_F16, Self::ID)?),
             k_bf16: Some(exec.load_aot(res, asset::STAGE_SRC, asset::STAGE_BF16, Self::ID)?),
+            k_f8_f16: Some(exec.load_aot(res, asset::STAGE_SRC, asset::STAGE_F8_F16, Self::ID)?),
+            k_f8_bf16: Some(exec.load_aot(res, asset::STAGE_SRC, asset::STAGE_F8_BF16, Self::ID)?),
         };
         Ok(FamilyGuard::boxed(me))
     }
@@ -181,7 +206,13 @@ impl KernelFamily for CommArStageRuntime {
         exec: &mut Exec,
     ) -> Result<Bytes, OpError> {
         let (call, out) = ArStageCall::parse(msg)?;
-        let k = pick(Self::ID, call.local().dtype, &self.k_f32, &self.k_f16, &self.k_bf16)?;
+        // **载荷档来自 client 的发射名**(§47 第二步)—— server 侧按名分派
+        // (核名不再是 dtype 的纯函数:同一 dtype 有 f16/fp8 两档载荷)
+        let k = if msg.kernel.name.contains("_f8_") {
+            pick_f8(Self::ID, call.local().dtype, &self.k_f8_f16, &self.k_f8_bf16)?
+        } else {
+            pick(Self::ID, call.local().dtype, &self.k_f32, &self.k_f16, &self.k_bf16)?
+        };
         // ── F2 尺寸自证(两块账长) ──
         let local_len = res.resolve_len(call.local().id)?;
         let own_len = res.resolve_len(call.own().id)?;
@@ -211,6 +242,9 @@ pub struct CommArReduceRuntime {
     k_f32: Option<K>,
     k_f16: Option<K>,
     k_bf16: Option<K>,
+    /// **fp8 载荷档**(§47 第二步;与 stage 成对)
+    k_f8_f16: Option<K>,
+    k_f8_bf16: Option<K>,
 }
 
 impl CommArReduceRuntime {
@@ -230,6 +264,8 @@ impl KernelFamily for CommArReduceRuntime {
             k_f32: Some(exec.load_aot(res, asset::REDUCE_SRC, asset::REDUCE_F32, Self::ID)?),
             k_f16: Some(exec.load_aot(res, asset::REDUCE_SRC, asset::REDUCE_F16, Self::ID)?),
             k_bf16: Some(exec.load_aot(res, asset::REDUCE_SRC, asset::REDUCE_BF16, Self::ID)?),
+            k_f8_f16: Some(exec.load_aot(res, asset::REDUCE_SRC, asset::REDUCE_F8_F16, Self::ID)?),
+            k_f8_bf16: Some(exec.load_aot(res, asset::REDUCE_SRC, asset::REDUCE_F8_BF16, Self::ID)?),
         };
         Ok(FamilyGuard::boxed(me))
     }
@@ -241,7 +277,11 @@ impl KernelFamily for CommArReduceRuntime {
         exec: &mut Exec,
     ) -> Result<Bytes, OpError> {
         let (call, out) = ArReduceCall::parse(msg)?;
-        let k = pick(Self::ID, call.out().dtype, &self.k_f32, &self.k_f16, &self.k_bf16)?;
+        let k = if msg.kernel.name.contains("_f8_") {
+            pick_f8(Self::ID, call.out().dtype, &self.k_f8_f16, &self.k_f8_bf16)?
+        } else {
+            pick(Self::ID, call.out().dtype, &self.k_f32, &self.k_f16, &self.k_bf16)?
+        };
         let out_len = res.resolve_len(call.out().id)?;
         let own_len = res.resolve_len(call.own().id)?;
         let _ = res.resolve_len(call.peer().id)?;
@@ -264,8 +304,11 @@ impl KernelFamily for CommArReduceRuntime {
 // 1-stage 族(对称缓冲 ⇒ 融合核,无 stage 段;`TP2-施工设计.md` §35)
 // ============================================================================
 
-/// 1-stage 发射(`out, own_hdr, peer_hdr, peer_data, bytes` —— 比 2-stage 少两个参数:
+/// 1-stage 发射(`out, src, own_hdr, peer_hdr, peer_data, bytes` —— 比 2-stage 少两个参数:
 /// 槽即块,没有 `slot_bytes`/`slab_off`)
+///
+/// ⚠️ `src` = **本端对称槽**(只读;`out` = 独立输出块)—— §59.2 修法后
+/// 输出不再原地,故多一个槽(参数表/声明表/client/本函数**四处必须同步**)。
 #[allow(clippy::too_many_arguments)]
 fn launch_ar_1stage(
     op: OpId,
@@ -274,6 +317,7 @@ fn launch_ar_1stage(
     exec: &mut Exec,
     k: &K,
     out: u64,
+    src: u64,
     own: u64,
     peer: u64,
     peer_data: u64,
@@ -290,6 +334,7 @@ fn launch_ar_1stage(
         0,
         &[
             LaunchVal::Ptr(out),
+            LaunchVal::Ptr(src),
             LaunchVal::Ptr(own),
             LaunchVal::Ptr(peer),
             LaunchVal::Ptr(peer_data),
@@ -342,12 +387,13 @@ impl KernelFamily for CommAr1StageRuntime {
         check_payload_span(Self::ID, "out", out_len, 0, call.bytes())?;
         check_payload_span(Self::ID, "peer_data", peer_len, 0, call.bytes())?;
         let out_p = res.resolve(call.out().id)?;
+        let src_p = res.resolve(call.src().id)?;
         let own_p = res.resolve(call.own().id)?;
         let peer_p = res.resolve(call.peer().id)?;
         let peer_data_p = res.resolve(call.peer_data().id)?;
         let grid = ar_reduce_grid(call.out().dtype, call.bytes());
         launch_ar_1stage(
-            Self::ID, "ar_1stage", res, exec, k, out_p, own_p, peer_p, peer_data_p,
+            Self::ID, "ar_1stage", res, exec, k, out_p, src_p, own_p, peer_p, peer_data_p,
             call.bytes(), grid,
         )?;
         Ok(out)

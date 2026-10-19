@@ -238,6 +238,11 @@ mod tests {
             (crate::family::comm::asset::ONE_STAGE_F16, crate::client::comm::PARSE_SLOTS_1STAGE),
             (crate::family::comm::asset::ONE_STAGE_BF16, crate::client::comm::PARSE_SLOTS_1STAGE),
             (crate::family::comm::asset::ONE_STAGE_F32, crate::client::comm::PARSE_SLOTS_1STAGE),
+            // fp8 载荷档(§47 第二步;线格式与常规档**逐字同形** —— 只是核名不同)
+            (crate::family::comm::asset::STAGE_F8_F16, crate::client::comm::PARSE_SLOTS),
+            (crate::family::comm::asset::STAGE_F8_BF16, crate::client::comm::PARSE_SLOTS),
+            (crate::family::comm::asset::REDUCE_F8_F16, crate::client::comm::PARSE_SLOTS_REDUCE),
+            (crate::family::comm::asset::REDUCE_F8_BF16, crate::client::comm::PARSE_SLOTS_REDUCE),
         ]);
         #[cfg(feature = "cublas")]
         cases.extend([
@@ -314,6 +319,10 @@ mod tests {
             crate::family::comm::asset::ONE_STAGE_F16,
             crate::family::comm::asset::ONE_STAGE_BF16,
             crate::family::comm::asset::ONE_STAGE_F32,
+            crate::family::comm::asset::STAGE_F8_F16,
+            crate::family::comm::asset::STAGE_F8_BF16,
+            crate::family::comm::asset::REDUCE_F8_F16,
+            crate::family::comm::asset::REDUCE_F8_BF16,
         ]);
         #[cfg(feature = "cublas")]
         want.extend([crate::family::cublas::GEMM_F16, crate::family::cublas::GEMM_BF16]);

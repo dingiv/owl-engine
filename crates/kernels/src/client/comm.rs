@@ -37,25 +37,27 @@ pub const SIG_REDUCE: &str = "O,T,T,sz,sz,sz";
 ///
 /// 两个 dtype 词汇(contract vs driver)的桥在此显式;非法 dtype **响亮
 /// panic**(发射名不是可以静默降级的东西 —— 与 driver 其他档同律)。
-fn stage_entry(dt: Dtype) -> &'static str {
+fn stage_entry_dt(dt: Dtype, f8: bool) -> &'static str {
     use crate::driver::DType as D;
-    match dt {
-        Dtype::F32 => crate::family::comm::stage_entry(D::F32),
-        Dtype::F16 => crate::family::comm::stage_entry(D::F16),
-        Dtype::BF16 => crate::family::comm::stage_entry(D::BF16),
+    let d = match dt {
+        Dtype::F32 => D::F32,
+        Dtype::F16 => D::F16,
+        Dtype::BF16 => D::BF16,
         other => panic!("comm_ar_stage: 非法 payload dtype {other:?}(f32/f16/bf16)"),
-    }
+    };
+    crate::family::comm::stage_entry_f8(d, f8)
 }
 
 /// payload dtype → reduce 发射名(单源同上)
-fn reduce_entry(dt: Dtype) -> &'static str {
+fn reduce_entry_dt(dt: Dtype, f8: bool) -> &'static str {
     use crate::driver::DType as D;
-    match dt {
-        Dtype::F32 => crate::family::comm::reduce_entry(D::F32),
-        Dtype::F16 => crate::family::comm::reduce_entry(D::F16),
-        Dtype::BF16 => crate::family::comm::reduce_entry(D::BF16),
+    let d = match dt {
+        Dtype::F32 => D::F32,
+        Dtype::F16 => D::F16,
+        Dtype::BF16 => D::BF16,
         other => panic!("comm_ar_reduce: 非法 payload dtype {other:?}(f32/f16/bf16)"),
-    }
+    };
+    crate::family::comm::reduce_entry_f8(d, f8)
 }
 
 /// payload dtype → **1-stage** 发射名(单源同上;2026-10-18 §35)
@@ -92,6 +94,9 @@ pub struct ArStageCall {
     bytes: u64,
     slot_bytes: u64,
     slab_off: u64,
+    /// ★ **fp8 载荷档**(§47 第二步):`true` ⇒ 发射名走 `*_f8_*`(量化写 +
+    /// 反量化读)。缺省 false ⇒ 逐字走常规档(零行为变化)。
+    f8: bool,
 }
 
 impl ArStageCall {
@@ -107,7 +112,13 @@ impl ArStageCall {
         slot_bytes: u64,
         slab_off: u64,
     ) -> Self {
-        Self { local, own, peer, data, bytes, slot_bytes, slab_off }
+        Self { local, own, peer, data, bytes, slot_bytes, slab_off, f8: false }
+    }
+
+    /// 切到 **fp8 载荷档**(§47 第二步;builder —— 存量调用点零改)
+    pub fn with_f8(mut self, f8: bool) -> Self {
+        self.f8 = f8;
+        self
     }
 
     /// 反序列化(7 槽;按名取址)。
@@ -126,6 +137,7 @@ impl ArStageCall {
             bytes: s.u64("bytes")?,
             slot_bytes: s.u64("slot_bytes")?,
             slab_off: s.u64("slab_off")?,
+            f8: false, // 反序列化面不决定发射名(名字由 msg.kernel.name 带)
         };
         Ok((me, own))
     }
@@ -134,7 +146,7 @@ impl ArStageCall {
     pub fn to_launch(&self) -> LaunchMsg {
         LaunchMsg {
             kernel: crate::contract::KernelSource {
-                name: stage_entry(self.local.dtype).to_string(),
+                name: stage_entry_dt(self.local.dtype, self.f8).to_string(),
                 source: String::new(),
             },
             args: vec![
@@ -189,6 +201,9 @@ pub struct ArReduceCall {
     bytes: u64,
     slot_bytes: u64,
     slab_off: u64,
+    /// ★ **fp8 载荷档**(与 `ArStageCall::f8` 同义;两侧必须同档 —— 否则
+    /// 收端按 f16 解读 fp8 载荷 = 静默错值)
+    f8: bool,
 }
 
 impl ArReduceCall {
@@ -202,7 +217,13 @@ impl ArReduceCall {
         slot_bytes: u64,
         slab_off: u64,
     ) -> Self {
-        Self { out, own, peer, data, bytes, slot_bytes, slab_off }
+        Self { out, own, peer, data, bytes, slot_bytes, slab_off, f8: false }
+    }
+
+    /// 切到 **fp8 载荷档**(与 `ArStageCall::with_f8` 成对使用)
+    pub fn with_f8(mut self, f8: bool) -> Self {
+        self.f8 = f8;
+        self
     }
 
     pub fn parse(msg: &LaunchMsg) -> Result<(Self, Bytes), OpError> {
@@ -219,6 +240,7 @@ impl ArReduceCall {
             bytes: s.u64("bytes")?,
             slot_bytes: s.u64("slot_bytes")?,
             slab_off: s.u64("slab_off")?,
+            f8: false, // 反序列化面不决定发射名(名字由 msg.kernel.name 带)
         };
         Ok((me, out))
     }
@@ -226,7 +248,7 @@ impl ArReduceCall {
     pub fn to_launch(&self) -> LaunchMsg {
         LaunchMsg {
             kernel: crate::contract::KernelSource {
-                name: reduce_entry(self.out.dtype).to_string(),
+                name: reduce_entry_dt(self.out.dtype, self.f8).to_string(),
                 source: String::new(),
             },
             args: vec![
@@ -248,6 +270,7 @@ impl ArReduceCall {
     pub fn out(&self) -> &Bytes {
         &self.out
     }
+
     pub fn own(&self) -> &Bytes {
         &self.own
     }
@@ -278,7 +301,7 @@ impl ArReduceCall {
 pub const SIG_1STAGE: &str = "O,T,T,T,sz";
 /// `SIG_1STAGE` 的槽名表(与 `ops::comm::CommAr1Stage*::PARAMS` **逐位对应**;
 /// `client::tests::parse_slots_are_exactly_declared` 锁)
-pub const PARSE_SLOTS_1STAGE: &[&str] = &["out", "own", "peer", "peer_data", "bytes"];
+pub const PARSE_SLOTS_1STAGE: &[&str] = &["out", "src", "own", "peer", "peer_data", "bytes"];
 
 /// **1-stage allreduce 调用**(对称缓冲;融合核 —— 没有 stage 段、零拷贝)。
 ///
@@ -290,6 +313,10 @@ pub const PARSE_SLOTS_1STAGE: &[&str] = &["out", "own", "peer", "peer_data", "by
 #[derive(Clone, Debug)]
 pub struct Ar1StageCall {
     out: Bytes,
+    /// ★ **本端对称槽**(只读;§59.2 修法,2026-10-19):GEMM 直写它 ⇒ 对端可读。
+    /// 旧实现把 `out` 指向它并**原地累加** ⇒ 与"对端可读"语义冲突 ⇒ 间歇竞态
+    /// (对端读到半加状态)。现在合成结果写 `out`(独立块),槽全程只读。
+    src: Bytes,
     own: Bytes,
     peer: Bytes,
     peer_data: Bytes,
@@ -297,8 +324,8 @@ pub struct Ar1StageCall {
 }
 
 impl Ar1StageCall {
-    pub fn new(out: Bytes, own: Bytes, peer: Bytes, peer_data: Bytes, bytes: u64) -> Self {
-        Self { out, own, peer, peer_data, bytes }
+    pub fn new(out: Bytes, src: Bytes, own: Bytes, peer: Bytes, peer_data: Bytes, bytes: u64) -> Self {
+        Self { out, src, own, peer, peer_data, bytes }
     }
 
     pub fn parse(msg: &LaunchMsg) -> Result<(Self, Bytes), OpError> {
@@ -306,6 +333,7 @@ impl Ar1StageCall {
         let out = s.out_block("out", msg.out_elems)?;
         let me = Self {
             out: out.clone(),
+            src: s.flat_block("src")?,
             own: s.flat_block("own")?,
             peer: s.flat_block("peer")?,
             peer_data: s.flat_block("peer_data")?,
@@ -322,6 +350,7 @@ impl Ar1StageCall {
             },
             args: vec![
                 Arg::block(self.out.id, self.out.dtype, self.out.rank),
+                Arg::block(self.src.id, self.src.dtype, self.src.rank),
                 Arg::block(self.own.id, self.own.dtype, self.own.rank),
                 Arg::block(self.peer.id, self.peer.dtype, self.peer.rank),
                 Arg::block(self.peer_data.id, self.peer_data.dtype, self.peer_data.rank),
@@ -336,6 +365,11 @@ impl Ar1StageCall {
 
     pub fn out(&self) -> &Bytes {
         &self.out
+    }
+
+    /// **本端对称槽**(只读;§59.2 修法:输出写独立块,槽全程只读)
+    pub fn src(&self) -> &Bytes {
+        &self.src
     }
     pub fn own(&self) -> &Bytes {
         &self.own

@@ -43,6 +43,17 @@ static __device__ __forceinline__ float owl_to_f32(const __half v) { return __ha
 static __device__ __forceinline__ float owl_to_f32(const __nv_bfloat16 v) { return __bfloat162float(v); }
 
 /// 一行的量化:两级归约求 absmax → 出 scale → strided 量化写回。
+///
+/// **2026-10-19 W4A8 decode 治理(§P0.1 逐核账)**:生产 nsys 实测本核
+/// **6.46 µs/次 × 345 次/步 = 2.23 ms/步**(W4A8 的 decode −12.4% 全在此)。
+/// 病根与 §58 刀③ 的 norm 同款:**每线程最多 20 次 2 字节标量依赖装载**
+/// (5120 宽、256 线程)—— 数据只 15KB,时间全在装载延迟/启动。
+/// ⇒ 两处结构改动(照 `cu/ln/rmsnorm.cu` / `fused_add_rmsnorm.cu` 的配方):
+///   ① **16B 向量装载**(`uint4` = 8 half)⇒ 每线程 2-3 次迭代(原 20);
+///   ② 量化趟**8B 向量写**(`long long`,对齐前提 `cols % 8 == 0`)。
+/// **数值逐位不变**(与旧版比):absmax = `fmaxf` 归约 —— max 可交换/结合,
+///   归约序变**不引入**浮点差;量化本身 = 逐元素 `cvt.rni.sat.s8`,与顺序无关。
+///   ⇒ 本刀**不需要新容差**,门按逐位比对即可(见 `quant_int8_row_probe`)。
 template <typename T>
 __device__ __forceinline__ void owl_quant_row(
     const T* __restrict__ x, int rows, int cols, const float* __restrict__ mul,
@@ -56,9 +67,23 @@ __device__ __forceinline__ void owl_quant_row(
     signed char* __restrict__ row_out = q + (size_t)row * (size_t)cols;
 
     // ① 行内 absmax(warp 内 shuffle → 每 warp 一把手 → 共享内存收口)
+    //    向量支:16B 装载(8 元素);对齐前提 = 行基址 16B 对齐(
+    //    `row·cols·sizeof(T)`:T = 2B 且 `cols % 8 == 0` ⇒ 16B ✓)
+    const bool vec_ok = ((cols % 8) == 0);
     float m = 0.f;
-    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
-        m = fmaxf(m, fabsf(owl_to_f32(row_in[i])));
+    if (vec_ok) {
+        for (int c = (int)threadIdx.x * 8; c < cols; c += (int)blockDim.x * 8) {
+            const uint4 xr = *reinterpret_cast<const uint4*>(row_in + c);
+            const T* xh = reinterpret_cast<const T*>(&xr);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                m = fmaxf(m, fabsf(owl_to_f32(xh[e])));
+            }
+        }
+    } else {
+        for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+            m = fmaxf(m, fabsf(owl_to_f32(row_in[i])));
+        }
     }
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -76,10 +101,23 @@ __device__ __forceinline__ void owl_quant_row(
     }
     __syncthreads();
 
-    // ②③ 量化(零行:inv = 0 ⇒ 整行 0)
+    // ②③ 量化(零行:inv = 0 ⇒ 整行 0);向量支同 ① 的装载 + 8B 写
     const float inv = (s_absmax == 0.f) ? 0.f : 127.f / s_absmax;
-    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
-        row_out[i] = owl_rn_i8(owl_to_f32(row_in[i]) * inv);
+    if (vec_ok) {
+        for (int c = (int)threadIdx.x * 8; c < cols; c += (int)blockDim.x * 8) {
+            const uint4 xr = *reinterpret_cast<const uint4*>(row_in + c);
+            const T* xh = reinterpret_cast<const T*>(&xr);
+            signed char o8[8];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                o8[e] = owl_rn_i8(owl_to_f32(xh[e]) * inv);
+            }
+            *reinterpret_cast<long long*>(row_out + c) = *reinterpret_cast<const long long*>(o8);
+        }
+    } else {
+        for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+            row_out[i] = owl_rn_i8(owl_to_f32(row_in[i]) * inv);
+        }
     }
 }
 

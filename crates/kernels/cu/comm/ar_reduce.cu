@@ -129,6 +129,22 @@ __device__ __forceinline__ float owl_ar_e4m3_round(float x, float inv) {
     return static_cast<float>(q) / inv;
 }
 
+/// **本秩自己的量化往返**(与 stage 侧 XFER **逐字同式**)
+///
+/// `q = enc(x * inv)`(`inv = 1/(m/448)`)→ 以**f16 落地的尺度**乘回
+/// (`scale16 = f16(m/448)`)。
+///
+/// ★ **为什么必须用这个而不是 `/inv`**(2026-10-19 立案):对端那一份是
+/// `dec(q) * scale16`(`sc[g]` 是 stage 落地的 **f16** 尺度)。旧实现本端走
+/// `dec(q) / inv`(f32 倒数)⇒ 两侧是**两个不同的函数** ⇒ `A_mine(a) + peer(b)`
+/// 与 `A_mine(b) + peer(a)` 不等 ⇒ **两 rank 结果在低位不一致**(对称律 §47.1
+/// 从未成立;此前该路零绝对判据,直到 G1b 立判据才抓获)。
+/// 统一到同一个 Q 后:`out = Q(a) + Q(b)`,f32 加法可交换 ⇒ 两 rank **逐位一致**。
+__device__ __forceinline__ float owl_ar_qdq_round_trip(float x, float inv, float scale16) {
+    __nv_fp8_e4m3 q(x * inv);
+    return static_cast<float>(q) * scale16;
+}
+
 // **尾部语义不变**:不足一个向量的**整元素**走标量尾巴;
 // **亚元素字节保持原值**(门判据:非整元素尾部不得被动)。
 template <typename T, typename V>
@@ -249,7 +265,253 @@ __device__ __forceinline__ void owl_ar_reduce_scalar(
     }
 }
 
-#define OWL_AR_REDUCE_KERNEL(NAME, T, PARAMS)                                          \
+// ── **§47 第二步:fp8 载荷的 reduce**(2026-10-19)─────────────────────────
+// 对端 slot 的 data 块布局 = `[fp8 载荷 n B][尺度 ng × f16]`(stage 侧写入);
+// 语义 = **对称律**(§47.1):`out = D_mine(q(v_mine)) + D_peer(q_peer)`
+//   · 本端那一份**自己算尺度并量化往返**(与对端对它的做法同式);
+//   · 对端那一份直接反量化(`f32(q) × peer_scale`)。
+// ⇒ 两 rank 算的是**同一对值的同一个加法** ⇒ IEEE 可交换 ⇒ 逐位一致(L1 判据)。
+// 分组 = **64 元素连续区间**(与 stage 侧同一索引);线程映射同 stage:
+// `sub = lane & 7`、`gsel = (lane>>3)&3`、warp 内 4 组 × 8 线程 × 8 元素。
+// ── **三操作数加法**(§59.2 的 1-stage 修法;2026-10-19)──────────────────
+// `dst[i] = a[i] + b[i]` —— 1-stage 融合核**不再原地加**:
+// 原位加法会让对端读到**半加状态**(§59.2 的竞态根因:同一个块被"对端可读"
+// 与"下游可读"两种语义共用)。改为独立输出块后,对称槽全程**只读**。
+// 向量化/8 路展开与 `owl_ar_reduce_vec` 同款(同一条尺)。
+template <typename T, typename V>
+__device__ __forceinline__ void owl_ar_add_vec(T* __restrict__ dst,
+                                               const T* __restrict__ a,
+                                               const T* __restrict__ b,
+                                               const size_t n) {
+    constexpr int PER_VEC = (int)(sizeof(V) / sizeof(T));
+    const size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    const size_t n_vec = n / (size_t)PER_VEC;
+    V* d4 = reinterpret_cast<V*>(dst);
+    const V* a4 = reinterpret_cast<const V*>(a);
+    const V* b4 = reinterpret_cast<const V*>(b);
+    for (size_t i = tid; i < n_vec; i += 8 * stride) {
+        V va[8], vb[8], vd[8];
+        bool ok[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const size_t j = i + (size_t)k * stride;
+            ok[k] = j < n_vec;
+            if (ok[k]) {
+                va[k] = a4[j];
+                vb[k] = b4[j];
+            }
+        }
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            if (!ok[k]) {
+                continue;
+            }
+            const T* ap = reinterpret_cast<const T*>(&va[k]);
+            const T* bp = reinterpret_cast<const T*>(&vb[k]);
+            T* dp = reinterpret_cast<T*>(&vd[k]);
+#pragma unroll
+            for (int m = 0; m < PER_VEC; ++m) {
+                dp[m] = owl_ar_from_float<T>(owl_ar_to_float<T>(ap[m]) + owl_ar_to_float<T>(bp[m]));
+            }
+            d4[i + (size_t)k * stride] = vd[k];
+        }
+    }
+    for (size_t j = n_vec * (size_t)PER_VEC + tid; j < n; j += stride) {
+        dst[j] = owl_ar_from_float<T>(owl_ar_to_float<T>(a[j]) + owl_ar_to_float<T>(b[j]));
+    }
+}
+
+#define OWL_AR_FP8_G 64
+
+/// **fp8 载荷的尺度区起点**(与 `ar_stage.cu` 的同名宏**逐字一致**;两处 = 一个线格式)
+/// —— 偶字节对齐(奇数 n 的 `__half` 存取会 `CUDA_ERROR_MISALIGNED_ADDRESS`)
+#define OWL_AR_FP8_SC_OFF(n) (((n) + 1u) & ~(size_t)1u)
+
+/// 未量化档的**统一签名包装**(`template<typename T> (T*, const T*, size_t)`)
+/// —— 宏里用 `XFER<T>(dst, src, n)` 派发,两档同形。
+template <typename T>
+__device__ __forceinline__ void owl_ar_reduce_v16(T* __restrict__ dst,
+                                                  const T* __restrict__ src,
+                                                  const size_t n) {
+    owl_ar_reduce_vec<T, uint4>(dst, src, n);
+}
+
+/// **向量路**(16 B 对齐):
+/// · **为什么 16 元素/lane**(2026-10-19 push×fp8 立案):fp8 载荷在 v1 档是
+///   **远端读**、push 档是**本地读**,但两侧原先都是 `sub = lane&7`、8 元素/lane
+///   ⇒ SASS = 16 × `LDG.E.U8` + 16 × `STG.E.U16`。远端逐字节读虽比逐字节写好得多
+///   (读可多路 outstanding + 32B sector 合并),但向量化后对**两档都**更省:
+///   每 lane 一次 `uint4` 读 16 个 q(16 B)、两次 `uint4` 写 16 个结果(32 B)。
+/// · 分组仍是 **64 元素连续区间**(与 stage 侧同一索引;`OWL_AR_G` 不变)
+///   ⇒ 尺度、量化、加法**逐位同前**(max 归约换 4 lane 窗口,但 max 是对同一 64 元素的同一张量,精确)
+/// · `sc[g]` 是同组 4 lane 同址读 ⇒ warp 内广播/同址缓存行
+/// · 指针非 16 B 对齐 ⇒ 降级标量路(只降速不改语义)。
+template <typename T>
+__device__ __forceinline__ void owl_ar_reduce_f8_vec(T* __restrict__ dst,
+                                                     const __nv_fp8_e4m3* __restrict__ qs,
+                                                     const __half* __restrict__ sc,
+                                                     const size_t n,
+                                                     const size_t ng) {
+    const int lane = (int)(threadIdx.x & 31u);
+    const int sub = lane & 3;
+    const int gsel = (lane >> 2) & 7;
+    const size_t wid = ((size_t)blockIdx.x * blockDim.x + (size_t)threadIdx.x) >> 5;
+    const size_t nwarp = ((size_t)gridDim.x * blockDim.x) >> 5;
+    // ⚠️ 上界按**整 warp 的基准组** `g0`(见 ar_stage.cu 同款注:否则 ng 非整倍时
+    //    lane 间 trip count 不同 ⇒ `__shfl_xor_sync` 在发散 warp 上死等)
+    for (size_t g0 = wid * 8u; g0 < ng; g0 += nwarp * 8u) {
+        const size_t g = g0 + (size_t)gsel;
+        const bool active = (g < ng);
+        const size_t off = g * OWL_AR_FP8_G + (size_t)sub * 16u;
+        float v[16];
+        float m = 0.0f;
+        const bool full = active && (off + 16u <= n);
+        if (full) {
+            const uint4 xa = *reinterpret_cast<const uint4*>(dst + off); // 8 元素
+            const uint4 xb = *reinterpret_cast<const uint4*>(dst + off + 8u);
+            const T* da = reinterpret_cast<const T*>(&xa);
+            const T* db = reinterpret_cast<const T*>(&xb);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                v[e] = owl_ar_to_float<T>(da[e]);
+                m = fmaxf(m, fabsf(v[e]));
+            }
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                v[8 + e] = owl_ar_to_float<T>(db[e]);
+                m = fmaxf(m, fabsf(v[8 + e]));
+            }
+        } else if (active) {
+#pragma unroll
+            for (int e = 0; e < 16; ++e) {
+                const size_t j = off + (size_t)e;
+                v[e] = (j < n) ? owl_ar_to_float<T>(dst[j]) : 0.0f;
+                m = fmaxf(m, fabsf(v[e]));
+            }
+        } else {
+#pragma unroll
+            for (int e = 0; e < 16; ++e) {
+                v[e] = 0.0f; // 空转 lane:不碰内存,但仍参与归约
+            }
+        }
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+        if (!active) {
+            continue; // 归约已参加完;后面无 warp 级同步 ⇒ continue 安全
+        }
+        const float mine_scale = owl_ar_qdq_scale(m);
+        const float mine_inv = 1.0f / mine_scale;
+        const float mine_scale16 = __half2float(__float2half(mine_scale)); // 与 stage 落地同
+        const float peer_scale = __half2float(sc[g]);
+        if (full) {
+            // ⚠️ 向量读进来的是**裸字节**,必须 `__nv_fp8_e4m3(byte)` **解码**后才乘尺度
+            //    (2026-10-19 现场:直接 `(float)byte * scale` ⇒ 数值错到 0.4 量级;
+            //     旧标量路是 `static_cast<float>(qs[j])` 自带解码,向量化时丢掉了这一步)
+            const uint4 q4 = *reinterpret_cast<const uint4*>(qs + off); // 16 个 fp8 = 16 B
+            // ⚠️ `__nv_fp8_e4m3` **没有** storage 构造(只有 float/half,且 float 那个是 explicit)
+            // ⇒ `__nv_fp8_e4m3(byte)` 会走 `uchar→float→fp8` 把字节**当成数值**再量化一次
+            //   (2026-10-19 现场:dec(121) 返回 120)。按**存储布局**取元素视图才对
+            //   (`__nv_fp8_e4m3` = 1 B,`__x` 公开;与标量路 `static_cast<float>(qs[j])` 同义)。
+            const __nv_fp8_e4m3* qv = reinterpret_cast<const __nv_fp8_e4m3*>(&q4);
+            uint4 o0, o1;
+            T* po0 = reinterpret_cast<T*>(&o0);
+            T* po1 = reinterpret_cast<T*>(&o1);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const float a = owl_ar_qdq_round_trip(v[e], mine_inv, mine_scale16);
+                const float b = static_cast<float>(qv[e]) * peer_scale;
+                po0[e] = owl_ar_from_float<T>(a + b);
+            }
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const float a = owl_ar_qdq_round_trip(v[8 + e], mine_inv, mine_scale16);
+                const float b = static_cast<float>(qv[8 + e]) * peer_scale;
+                po1[e] = owl_ar_from_float<T>(a + b);
+            }
+            *reinterpret_cast<uint4*>(dst + off) = o0;
+            *reinterpret_cast<uint4*>(dst + off + 8u) = o1;
+        } else {
+#pragma unroll
+            for (int e = 0; e < 16; ++e) {
+                const size_t j = off + (size_t)e;
+                if (j < n) {
+                    const float a = owl_ar_qdq_round_trip(v[e], mine_inv, mine_scale16);
+                    const float b = static_cast<float>(qs[j]) * peer_scale;
+                    dst[j] = owl_ar_from_float<T>(a + b);
+                }
+            }
+        }
+    }
+}
+
+/// **标量兜底路**(指针 16 B 未对齐;与向量路**逐位同构**,只降速不改语义)
+template <typename T>
+__device__ __forceinline__ void owl_ar_reduce_f8_scalar(T* __restrict__ dst,
+                                                        const __nv_fp8_e4m3* __restrict__ qs,
+                                                        const __half* __restrict__ sc,
+                                                        const size_t n,
+                                                        const size_t ng) {
+    const int lane = (int)(threadIdx.x & 31u);
+    const int sub = lane & 7;
+    const int gsel = (lane >> 3) & 3;
+    const size_t wid = ((size_t)blockIdx.x * blockDim.x + (size_t)threadIdx.x) >> 5;
+    const size_t nwarp = ((size_t)gridDim.x * blockDim.x) >> 5;
+    for (size_t g0 = wid * 4u; g0 < ng; g0 += nwarp * 4u) { // 上界按整 warp(见向量路注)
+        const size_t g = g0 + (size_t)gsel;
+        const bool active = (g < ng);
+        const size_t off = g * OWL_AR_FP8_G + (size_t)sub * 8u;
+        float v[8];
+        float m = 0.0f;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const size_t j = off + (size_t)e;
+            v[e] = (active && j < n) ? owl_ar_to_float<T>(dst[j]) : 0.0f;
+            m = fmaxf(m, fabsf(v[e]));
+        }
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 4));
+        if (!active) {
+            continue;
+        }
+        const float mine_scale = owl_ar_qdq_scale(m);
+        const float mine_inv = 1.0f / mine_scale;
+        const float mine_scale16 = __half2float(__float2half(mine_scale)); // 与 stage 落地同
+        const float peer_scale = __half2float(sc[g]);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const size_t j = off + (size_t)e;
+            if (j < n) {
+                const float a = owl_ar_qdq_round_trip(v[e], mine_inv, mine_scale16);
+                const float b = static_cast<float>(qs[j]) * peer_scale;
+                dst[j] = owl_ar_from_float<T>(a + b);
+            }
+        }
+    }
+}
+
+template <typename T>
+__device__ __forceinline__ void owl_ar_reduce_f8(T* __restrict__ dst,
+                                                 const T* __restrict__ src,
+                                                 const size_t n) {
+    if (n == 0) {
+        return;
+    }
+    const __nv_fp8_e4m3* qs = reinterpret_cast<const __nv_fp8_e4m3*>(src);
+    const __half* sc = reinterpret_cast<const __half*>(
+        reinterpret_cast<const unsigned char*>(src) + OWL_AR_FP8_SC_OFF(n));
+    const size_t ng = (n + OWL_AR_FP8_G - 1) / OWL_AR_FP8_G;
+    const bool aligned = ((reinterpret_cast<unsigned long long>(dst) |
+                           reinterpret_cast<unsigned long long>(src)) & 15ull) == 0ull;
+    if (aligned) {
+        owl_ar_reduce_f8_vec<T>(dst, qs, sc, n, ng);
+    } else {
+        owl_ar_reduce_f8_scalar<T>(dst, qs, sc, n, ng);
+    }
+}
+
+#define OWL_AR_REDUCE_KERNEL(NAME, T, XFER, PARAMS)                                          \
     static_assert(sizeof(T) == 4 || sizeof(T) == 2, "AR reduce: 仅 f32/f16/bf16");     \
     extern "C" __global__ void NAME PARAMS {                                           \
         unsigned char* own_b = reinterpret_cast<unsigned char*>(own);                      \
@@ -355,9 +617,9 @@ __device__ __forceinline__ void owl_ar_reduce_scalar(
         const unsigned long long da = reinterpret_cast<unsigned long long>(dst);       \
         const unsigned long long sa = reinterpret_cast<unsigned long long>(src);       \
         if (((da | sa) & 15ull) == 0ull) {                                             \
-            OWL_AR_REDUCE_FAST(T, dst, src, n); /* 快路:16 B 向量 + 8 路展开 */ \
+            XFER<T>(dst, src, n); /* 快路:16 B 向量 + 8 路展开(fp8 档 = 量化域) */ \
         } else {                                                                       \
-            owl_ar_reduce_scalar<T>(dst, src, n);     /* 未对齐:降级只降速 */        \
+            XFER<T>(dst, src, n);     /* 未对齐:fp8 档自带逐元素兜底;f16 档见 v16 */ \
         }                                                                              \
         __threadfence_system();                                                        \
         __syncthreads();                                                               \
@@ -372,9 +634,12 @@ __device__ __forceinline__ void owl_ar_reduce_scalar(
         }                                                                              \
     }
 
-OWL_AR_REDUCE_KERNEL(owl_comm_ar_reduce_f32, float, (float* __restrict__ out, unsigned char* __restrict__ own, const unsigned char* __restrict__ peer, const unsigned char* __restrict__ data, const size_t bytes, const size_t slot_bytes, const size_t slab_off))
-OWL_AR_REDUCE_KERNEL(owl_comm_ar_reduce_f16, __half, (__half* __restrict__ out, unsigned char* __restrict__ own, const unsigned char* __restrict__ peer, const unsigned char* __restrict__ data, const size_t bytes, const size_t slot_bytes, const size_t slab_off))
-OWL_AR_REDUCE_KERNEL(owl_comm_ar_reduce_bf16, __nv_bfloat16, (__nv_bfloat16* __restrict__ out, unsigned char* __restrict__ own, const unsigned char* __restrict__ peer, const unsigned char* __restrict__ data, const size_t bytes, const size_t slot_bytes, const size_t slab_off))
+OWL_AR_REDUCE_KERNEL(owl_comm_ar_reduce_f32, float, owl_ar_reduce_v16, (float* __restrict__ out, unsigned char* __restrict__ own, const unsigned char* __restrict__ peer, const unsigned char* __restrict__ data, const size_t bytes, const size_t slot_bytes, const size_t slab_off))
+OWL_AR_REDUCE_KERNEL(owl_comm_ar_reduce_f16, __half, owl_ar_reduce_v16, (__half* __restrict__ out, unsigned char* __restrict__ own, const unsigned char* __restrict__ peer, const unsigned char* __restrict__ data, const size_t bytes, const size_t slot_bytes, const size_t slab_off))
+OWL_AR_REDUCE_KERNEL(owl_comm_ar_reduce_bf16, __nv_bfloat16, owl_ar_reduce_v16, (__nv_bfloat16* __restrict__ out, unsigned char* __restrict__ own, const unsigned char* __restrict__ peer, const unsigned char* __restrict__ data, const size_t bytes, const size_t slot_bytes, const size_t slab_off))
+// **fp8 载荷档**(§47 第二步):对端 data 块 = `[fp8 n][尺度 ng×f16]`
+OWL_AR_REDUCE_KERNEL(owl_comm_ar_reduce_f8_f16, __half, owl_ar_reduce_f8, (__half* __restrict__ out, unsigned char* __restrict__ own, const unsigned char* __restrict__ peer, const unsigned char* __restrict__ data, const size_t bytes, const size_t slot_bytes, const size_t slab_off))
+OWL_AR_REDUCE_KERNEL(owl_comm_ar_reduce_f8_bf16, __nv_bfloat16, owl_ar_reduce_f8, (__nv_bfloat16* __restrict__ out, unsigned char* __restrict__ own, const unsigned char* __restrict__ peer, const unsigned char* __restrict__ data, const size_t bytes, const size_t slot_bytes, const size_t slab_off))
 
 // ============================================================================
 // ★ **1-stage allreduce**(2026-10-18;对称缓冲 ⇒ 融合核)—— TP2-施工设计.md §35
@@ -497,15 +762,21 @@ OWL_AR_REDUCE_KERNEL(owl_comm_ar_reduce_bf16, __nv_bfloat16, (__nv_bfloat16* __r
             return;                                                                    \
         }                                                                              \
         __threadfence_system(); /* acquire 全线程(与 2-stage 同律) */                 \
+        /* ★ §59.2 修法:输出到**独立块**(dst),对称槽(own_data)全程只读。       \
+         * 旧实现 `dst = out`(对称槽本身)原地累加 ⇒ 对端在 ① 之后来读我的槽,    \
+         * 而我正在原地改它 ⇒ 间歇读到**半加状态**(复现:3 跑 1 红)。              \
+         * 正解与 vLLM `cross_device_reduce_1stage` 同构:result 是独立输出块。 */  \
         T* dst = reinterpret_cast<T*>(out);                                            \
-        const T* src = peer_data;                                                      \
+        const T* own_data = src;                                                       \
+        const T* peer_view = peer_data;                                                \
         const size_t n = bytes / sizeof(T);                                            \
         const unsigned long long da = reinterpret_cast<unsigned long long>(dst);       \
-        const unsigned long long sa = reinterpret_cast<unsigned long long>(src);       \
-        if (((da | sa) & 15ull) == 0ull) {                                             \
-            OWL_AR_REDUCE_FAST(T, dst, src, n);                                  \
+        const unsigned long long aa = reinterpret_cast<unsigned long long>(own_data);  \
+        const unsigned long long sa = reinterpret_cast<unsigned long long>(peer_view); \
+        if (((da | aa | sa) & 15ull) == 0ull) {                                        \
+            owl_ar_add_vec<T, uint4>(dst, own_data, peer_view, n);                     \
         } else {                                                                       \
-            owl_ar_reduce_scalar<T>(dst, src, n);                                      \
+            owl_ar_add_vec<T, T>(dst, own_data, peer_view, n);                         \
         }                                                                              \
         __threadfence_system();                                                        \
         __syncthreads();                                                               \
@@ -539,6 +810,6 @@ OWL_AR_REDUCE_KERNEL(owl_comm_ar_reduce_bf16, __nv_bfloat16, (__nv_bfloat16* __r
         }                                                                              \
     }
 
-OWL_AR_1STAGE_KERNEL(owl_comm_ar_1stage_f32, float, (float* __restrict__ out, unsigned char* __restrict__ own, const unsigned char* __restrict__ peer, const float* __restrict__ peer_data, const size_t bytes))
-OWL_AR_1STAGE_KERNEL(owl_comm_ar_1stage_f16, __half, (__half* __restrict__ out, unsigned char* __restrict__ own, const unsigned char* __restrict__ peer, const __half* __restrict__ peer_data, const size_t bytes))
-OWL_AR_1STAGE_KERNEL(owl_comm_ar_1stage_bf16, __nv_bfloat16, (__nv_bfloat16* __restrict__ out, unsigned char* __restrict__ own, const unsigned char* __restrict__ peer, const __nv_bfloat16* __restrict__ peer_data, const size_t bytes))
+OWL_AR_1STAGE_KERNEL(owl_comm_ar_1stage_f32, float, (float* __restrict__ out, const float* __restrict__ src, unsigned char* __restrict__ own, const unsigned char* __restrict__ peer, const float* __restrict__ peer_data, const size_t bytes))
+OWL_AR_1STAGE_KERNEL(owl_comm_ar_1stage_f16, __half, (__half* __restrict__ out, const __half* __restrict__ src, unsigned char* __restrict__ own, const unsigned char* __restrict__ peer, const __half* __restrict__ peer_data, const size_t bytes))
+OWL_AR_1STAGE_KERNEL(owl_comm_ar_1stage_bf16, __nv_bfloat16, (__nv_bfloat16* __restrict__ out, const __nv_bfloat16* __restrict__ src, unsigned char* __restrict__ own, const unsigned char* __restrict__ peer, const __nv_bfloat16* __restrict__ peer_data, const size_t bytes))

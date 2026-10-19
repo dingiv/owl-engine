@@ -1010,8 +1010,54 @@ where
     //   标记来源 = 节点上的 `tp_role`(`Linear::new` 从规则表算好透传);
     //   语义 = payload 原地累加(输出仍是 `out` 的同块别名)。
     let out: Bytes = if t.tp_role == crate::plan::rules::WeightRule::UniformRow {
-        match ctx.tp.as_ref() {
-            Some(tp) => {
+        // ★ **§59.2 修法(2026-10-19):1-stage 写独立输出块**。
+        //   旧实现把融合核的输出指向对称槽本身并**原地累加** ⇒ 与"对端可读我这份"
+        //   的语义冲突:对端在 ① 之后来读,而我正在原地改它 ⇒ 间歇读到**半加状态**
+        //   (实测 3 跑 1 红,max|Δ| = 0.32)。正解与 vLLM `cross_device_reduce_1stage`
+        //   同构 —— `result` 是**独立输出块**,输入对称缓冲全程只读。
+        //   代价 = 一个本地块的 D2D 写;收益 = 协议语义不再冲突(AR α 的账见 §59.1)。
+        //
+        //   ① arena 句柄先**快照**(纯克隆、无 await ⇒ 对 `ctx.tp` 的借用不跨越
+        //      下面的 `&mut ctx` 分配);
+        let arena_snap: Option<(Bytes, Bytes, Bytes)> = ctx
+            .tp
+            .as_ref()
+            .and_then(|tp| tp.arena.as_ref())
+            .and_then(|a| {
+                let i = a.own_slots.iter().position(|s| s.id == out.id)?;
+                Some((a.own_hdr.clone(), a.peer_hdr.clone(), a.peer_slots[i].clone()))
+            });
+        //   ② 融合核:out = src(对称槽) + peer_slot
+        let fused: Option<Bytes> = match arena_snap {
+            Some((own_hdr, peer_hdr, peer_slot)) => {
+                let dst = ctx
+                    .alloc_out(out.dtype, out.len, false, "tp.ar.1stage.dst")
+                    .await?
+                    .view(out.dtype, out.rank);
+                ctx.track_new(dst.id);
+                owl_shared::slab_hint::probe_name(dst.id, "tp.ar.1stage.dst");
+                let call = owl_kernels::client::comm::Ar1StageCall::new(
+                    dst.clone(), // out:独立输出块(写)
+                    out.clone(), // src:本端对称槽(只读)
+                    own_hdr,
+                    peer_hdr,
+                    peer_slot,
+                    n_bytes as u64,
+                )
+                .to_launch();
+                ctx.face.launch(call).await?;
+                owl_shared::metrics::with_metrics_store(|s| {
+                    s.counter_add("tp.ar.1stage", 1, file!(), line!())
+                });
+                Some(dst)
+            }
+            None => None,
+        };
+        if let Some(d) = fused {
+            d
+        } else {
+            match ctx.tp.as_ref() {
+                Some(tp) => {
                 if n_bytes as u64 > tp.slot_bytes {
                     return Err(ModelError::Msg(format!(
                         "TP allreduce: 载荷 {n_bytes}B > slot {}B(v1 单块;多块是 S5 ——                          调大 staging 或改计划)",
@@ -1035,8 +1081,10 @@ where
                 });
                 owl_shared::log_debug!(
                     "tp",
-                    "AR 注入 rank={rank} node={} label={:?} bytes={n_bytes} slot={}",
+                    "AR 注入 rank={rank} node={} op={:?} tp_role={:?} label={:?} bytes={n_bytes} slot={}",
                     t.id(),
+                    t.op,
+                    t.tp_role,
                     t.label(),
                     tp.slot_bytes
                 );
@@ -1047,28 +1095,6 @@ where
                 // 两个 counter —— 门断言"开 1-stage 时前者 > 0 且后者 == 0"。
                 // 动机是现场教训:融合核写好了、门全绿,但它**一次都没被走到**
                 // (只改了 `Op::Call` 的 alloc,payload 却来自 `Op::Matmul`)。
-                let fused = match tp.arena.as_ref() {
-                    Some(a) => match a.own_slots.iter().position(|s| s.id == out.id) {
-                        Some(i) => {
-                            let call = owl_kernels::client::comm::Ar1StageCall::new(
-                                out.clone(),
-                                a.own_hdr.clone(),
-                                a.peer_hdr.clone(),
-                                a.peer_slots[i].clone(),
-                                n_bytes as u64,
-                            )
-                            .to_launch();
-                            ctx.face.launch(call).await?;
-                            owl_shared::metrics::with_metrics_store(|s| {
-                                s.counter_add("tp.ar.1stage", 1, file!(), line!())
-                            });
-                            true
-                        }
-                        None => false,
-                    },
-                    None => false,
-                };
-                if !fused {
                     // ★ **push 档(§36.6/§36.7)**:两核把 `own`/`peer` **实参对调** ——
                     //   v1 : stage 写**本端**槽 → reduce 读**对端**槽（数据腿 = 读对端）
                     //   push: stage 写**对端**槽 → reduce 读**本端**槽（数据腿 = 写对端）
@@ -1103,6 +1129,11 @@ where
                         tp.slot_bytes,
                         0,
                     )
+                    // **载荷分档**(§47 第二步的既定设计):fp8 只对**大载荷**净赚
+                    // —— 2026-10-19 实测:prefill(10.5MB/次)+7.3%,而 decode
+                    // (10KB/次)量化开销 > 省下的传输(-6.4%)。阈值 256KB 落在两
+                    // 者之间(chunk128 ⇒ 1.3MB、decode ⇒ 10KB)。
+                    .with_f8(tp.ar_f8 && n_bytes >= 262_144)
                     .to_launch();
                     ctx.face.launch(stage).await?;
                     let reduce = owl_kernels::client::comm::ArReduceCall::new(
@@ -1114,12 +1145,13 @@ where
                         tp.slot_bytes,
                         0,
                     )
+                    .with_f8(tp.ar_f8 && n_bytes >= 262_144)
                     .to_launch();
                     ctx.face.launch(reduce).await?;
+                    out // 别名:payload 原地累加(v1/push 两段路径:原地加在 payload 上)
                 }
-                out // 别名:payload 原地累加
+                None => out, // 单卡:无 TP 上下文
             }
-            None => out, // 单卡:无 TP 上下文
         }
     } else {
         out
@@ -1273,6 +1305,7 @@ mod tp_injection_tests {
             slot_bytes: 64,
             arena: None,
             push: false,
+            ar_f8: false, // 测试档:载荷走 f16(装配期由配置填)
         };
         let err = eval_ops_scoped_env(
             &row_node(),
@@ -1310,6 +1343,7 @@ mod tp_injection_tests {
             slot_bytes: 4, // < 载荷 8B
             arena: None,
             push: false,
+            ar_f8: false, // 测试档:载荷走 f16(装配期由配置填)
         };
         let err = eval_ops_scoped_env(
             &row_node(),

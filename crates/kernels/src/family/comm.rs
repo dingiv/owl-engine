@@ -34,6 +34,32 @@ pub fn stage_entry(dt: crate::driver::DType) -> &'static str {
 }
 
 /// payload dtype → reduce 发射名(单源)
+/// **fp8 载荷档的发射名**(`f8 = false` ⇒ 逐字返回常规档 ⇒ 零行为变化)
+pub fn stage_entry_f8(dt: crate::driver::DType, f8: bool) -> &'static str {
+    use crate::driver::DType;
+    if !f8 {
+        return stage_entry(dt);
+    }
+    match dt {
+        DType::F16 => asset::STAGE_F8_F16,
+        DType::BF16 => asset::STAGE_F8_BF16,
+        other => panic!("comm.ar_stage(f8): 载荷量化只支持 f16/bf16,实得 {other:?}"),
+    }
+}
+
+/// 同上(reduce 面)
+pub fn reduce_entry_f8(dt: crate::driver::DType, f8: bool) -> &'static str {
+    use crate::driver::DType;
+    if !f8 {
+        return reduce_entry(dt);
+    }
+    match dt {
+        DType::F16 => asset::REDUCE_F8_F16,
+        DType::BF16 => asset::REDUCE_F8_BF16,
+        other => panic!("comm.ar_reduce(f8): 载荷量化只支持 f16/bf16,实得 {other:?}"),
+    }
+}
+
 pub fn reduce_entry(dt: crate::driver::DType) -> &'static str {
     use crate::driver::DType;
     match dt {
@@ -67,6 +93,13 @@ pub mod asset {
     pub const REDUCE_F32: &str = "owl_comm_ar_reduce_f32";
     pub const REDUCE_F16: &str = "owl_comm_ar_reduce_f16";
     pub const REDUCE_BF16: &str = "owl_comm_ar_reduce_bf16";
+
+    /// **fp8 载荷档**(§47 第二步;2026-10-19):同协议/同几何,搬运面换成
+    /// "量化写 + 反量化读"(载荷 1B/元素 + 64 元素/尺度 ⇒ 1.031× 原字节)。
+    pub const STAGE_F8_F16: &str = "owl_comm_ar_stage_f8_f16";
+    pub const STAGE_F8_BF16: &str = "owl_comm_ar_stage_f8_bf16";
+    pub const REDUCE_F8_F16: &str = "owl_comm_ar_reduce_f8_f16";
+    pub const REDUCE_F8_BF16: &str = "owl_comm_ar_reduce_f8_bf16";
 
     /// **1-stage 与 reduce 同源文件**(同族两种形态;共享 dtype 桥与向量循环)
     pub const ONE_STAGE_SRC: &str = "cu/comm/ar_reduce.cu";
