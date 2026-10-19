@@ -1670,6 +1670,30 @@ pub mod elems {
         })
     }
 
+    /// **装载期 lm_head 逐行 int8 量化**(两发:scale → q;P1.5-a)。
+    /// 几何 = **一 block 一行**(grid = rows,block 256,零动态 smem)。
+    pub fn quant_i8_row_w_scale() -> KernelPick {
+        KernelPick::of::<crate::ops::load::QuantI8RowWScaleBf16>(Shape {
+            grid: (1, 1, 1),  // 调用方按 rows 覆盖(见 quant_i8_row_w_grid)
+            block: (256, 1, 1),
+            smem: 0,
+        })
+    }
+
+    /// 同上的第二步(q);几何同 [`quant_i8_row_w_scale`]
+    pub fn quant_i8_row_w_q() -> KernelPick {
+        KernelPick::of::<crate::ops::load::QuantI8RowWQBf16>(Shape {
+            grid: (1, 1, 1),
+            block: (256, 1, 1),
+            smem: 0,
+        })
+    }
+
+    /// 两步共用的真实几何(grid.x = rows)
+    pub fn quant_i8_row_w_grid(rows: usize) -> Shape {
+        Shape { grid: (rows.max(1) as u32, 1, 1), block: (256, 1, 1), smem: 0 }
+    }
+
     /// 行栈 concat(arity ≤ 8;哨兵 1D)
     pub fn concat(dt: DType) -> KernelPick {
         KernelPick { name: dt_name("concat", dt), shape: SENTINEL_1D }
