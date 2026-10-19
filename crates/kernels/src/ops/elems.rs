@@ -715,6 +715,7 @@ impl KernelSpec for QuantInt8RowBf16 {
 pub static METAS: &[&KernelMeta] = &[
     &NARROW_STRIDED_F16,
     &GEMV_DUAL_F16,
+    &GEMV_I8W_F16,
     &ADD_F16,
     &ADD_BF16,
     &SIGMOID_F16,
