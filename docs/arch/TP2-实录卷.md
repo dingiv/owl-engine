@@ -5327,3 +5327,59 @@ C 的扫描:C=1 1.41 / **C=2 1.087** / C=4 1.20(C=4 让并行 warp 数掉到 1/4
    TP2 的 (8,24) 需重编 + 重走 c1–c5 金标 ⇒ **未量过它 vs 串行核**,属"待翻案"清单新条目;
 3. `op_tables` 两门**在 HEAD 上就是红的**(`owl_comm_ar_stage_f8_f16` 的 `.cu` 形参表
    解析不出 —— P1.3 fp8 AR 遗留),与本刀无关,已当场用 `git stash` 复现验证。
+
+---
+
+## 69. decode 逐核账(2026-10-19,刀后重量)+ **一个仪器陷阱**(nsys node 模式虚报 graph launch 17×)
+
+### 69.1 现状(TP2 / 双 3080 / `tp2-nospec-vsplit-fused`;prompt 63 tok、64 token 解码)
+
+`tools/nsys-decode-account.sh p14-dec`(node 模式)单步:核 964 个、设备 Σ **17.22 ms**。
+
+| 项 | µs/步 | 占比 | 判语 |
+|---|---:|---:|---|
+| marlin(量化权重;含次档) | 11461 | **57%** | 617 GB/s = **81% 峰值**,已贴墙 |
+| **`owl_comm_ar_fused_f16`(128 对)** | **2285** | **11%** | 17.9 µs/对;10 KB 载荷的**传输只占 ~1 µs** ⇒ 全是小包延迟 |
+| lm_head(`internal::…` = gemv) | 1755 | 9% | 词表切后(原 3506);**715 GB/s** |
+| paged attention | 396 | 2% | |
+| `gdn_decode_step_v2` | 348 | 1.7% | |
+| `gemv_dual` / norm 两族 / silu / add / gdn_conv … | ~750 | 4% | |
+| **设备合计** | **17216** | 85% | |
+
+### 69.2 ★ 陷阱:node 模式把 `cuGraphLaunch` 量成 1.47 ms(真值 0.17 ms)
+
+node 模式的分账显示"段间空隙 3.26 ms/步",其中 `cuGraphLaunch` **2.84 ms/步**
+(p50 **1469 µs**/发 × 2 发 = 两 rank 各一张 ~994 节点的图)。若当真,这是 decode 的
+第三大项(16%)。
+
+**同一份配置换 `--cuda-graph-trace=graph` 复测:`cuGraphLaunch` p50 = 171 µs**
+(Σ 23.2 ms / 132 发)⇒ 1.47 ms 里 **~1.3 ms 是 CUPTI 逐节点插桩的开销**,不是驱动。
+
+**再用引擎自己的钟交叉验证**(`[probes] step_profile = true`,无 nsys):
+```
+[pump-phases] head=1.5µs [entry→lh=0.7µs lh→sched=0.6µs sched→exec=0.23µs] exec=19.13ms
+[step-prof]  fill+launch=0.30~0.44ms   sample-and-emit=23µs   token-dtoh=18.78ms
+```
+⇒ **真实 host 面 = fill+launch + 采样 ≈ 0.33 ms/步(1.6%)**,与 §66 的 0.6 ms 同量级 ✓;
+node 模式的 3.26 ms **作废**。
+
+**律(新增 @40)**:**任何"图内"读数,先问仪器**——`--cuda-graph-trace=node` 会**逐节点插桩**,
+它的 `cuGraphLaunch`/空隙**不可用于 host 面归因**(虚报 17×);host 面一律用
+`step_profile` 或 `--cuda-graph-trace=graph` 复核。
+(反向也成立:node 模式的**核内时长**仍然可信 —— 那才是它的用途。)
+
+### 69.3 于是 decode 20.2 ms/步的真实构成(8k ctx 口径)
+
+| 项 | ms | 占比 | 杠杆 |
+|---|---:|---:|---|
+| marlin 权重遍 | 11.1 | **55%** | 已 81% 带宽 ⇒ **只能减字节**(投机=一次权重读算 k 个 token)|
+| **AR 小包**(128 对 × 17.9 µs) | **2.3** | **11%** | 传输 ~1 µs ⇒ **94% 是延迟**;上限 +11% |
+| lm_head | 1.75 | 8.6% | 715 GB/s;**int4/int8 化可到 ~0.45 ms ⇒ +6.4%** |
+| attention(+8k 上下文的 Δ)| 0.4~0.9 | 2–4% | |
+| GDN+norm+小核 | ~1.1 | 5% | |
+| **图内节点税**(994 节点:host 0.3 + 设备侧依赖间隙 ~1.5) | **~1.8** | **9%** | **节点数 ∝ 成本** ⇒ 融合小核 |
+| host 尾巴 | 0.33 | 1.6% | 已定谳(§66) |
+
+**⇒ "小包延迟"是 decode 里**真实存在**的一块(11%),但它**不是最大的一块**:
+lm_head 量化(+6.4%,一刀)与节点税(~1.8 ms,9%)都在同一量级,而 marlin 的 55%
+只能靠结构(投机已给 110 t/s)。
