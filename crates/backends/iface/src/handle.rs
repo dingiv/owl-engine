@@ -200,9 +200,9 @@ pub trait AllocLedger: Send {
     /// 换层(只改 tier/owner,不注销)。
     fn on_move(&mut self, ev: &MoveEvent);
 
-    /// **池取块**(缺口 4):同 kind + 同尺寸才给;`None` = 未命中(调用方真分配)。
-    /// 缺省 `None` = 无池面。
-    fn pool_acquire(&mut self, _class: AssetClass, _bytes: usize) -> Option<u64> {
+    /// **池取块**(缺口 4):**同 rank + 同 kind + 同尺寸**才给(P0-1:TP 两 rank
+    /// 共写一本账 ⇒ 键必须带 rank);`None` = 未命中(调用方真分配)。缺省 = 无池面。
+    fn pool_acquire(&mut self, _rank: u8, _class: AssetClass, _bytes: usize) -> Option<u64> {
         None
     }
 
@@ -764,13 +764,23 @@ impl<D: DeviceClient> DeviceHandle<D> {
     }
 
     /// **池取块**(真分配之前问一次;命中 ⇒ 零命令复用)。
+    ///
+    /// **P0-3(安全门)**:捕获窗开着时**一律不取池** —— 窗内块若来自池(而非 slab 切片),
+    /// 它的指针会被烘进图,之后被复用/顶出/排空 ⇒ 图回放踩已改嫁的块。
     fn pool_acquire(&self, class: AssetClass, bytes: usize) -> Option<u64> {
         let cell = self.ledger.as_ref()?;
+        let (rank, in_window) = {
+            let c = self.ctx();
+            (c.dev_rank, !c.windows.is_empty())
+        };
+        if in_window {
+            return None;
+        }
         let mut g = match cell.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        g.pool_acquire(class, bytes)
+        g.pool_acquire(rank, class, bytes)
     }
 
     /// **压力自愈**(N6 第一刀):池排空 ⇒ 真归还驱动 ⇒ 销账。返回释放块数。

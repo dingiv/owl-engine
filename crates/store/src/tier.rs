@@ -642,11 +642,22 @@ mod tests {
         assert_eq!(b.open_count(), 1, "**入池 ≠ 归还**:块仍在借");
         assert_eq!(b.pool_stats(), (1, 4096));
         // ② 同类同尺寸命中;异类/异尺寸不命中(尺寸错 = 双错)
-        assert_eq!(b.pool_acquire(AssetKind::Temp, 4096), Some(11));
-        assert_eq!(b.pool_acquire(AssetKind::Temp, 8192), None);
-        assert_eq!(b.pool_acquire(AssetKind::KvBlock, 4096), None);
+        assert_eq!(b.pool_acquire(0, AssetKind::Temp, 4096), Some(11));
+        assert_eq!(b.pool_acquire(0, AssetKind::Temp, 8192), None);
+        assert_eq!(b.pool_acquire(0, AssetKind::KvBlock, 4096), None);
         let (hits, misses, _) = b.pool_counters();
         assert_eq!((hits, misses), (1, 2), "命中/未中计数");
+        // **P0-1**:rank 不匹配不命中(TP 两 rank 共写一本账 ⇒ 键必须带 rank)
+        assert_eq!(b.pool_release(11), None);
+        assert_eq!(b.pool_acquire(1, AssetKind::Temp, 4096), None, "rank1 不许拿 rank0 的块");
+        assert_eq!(b.pool_acquire(0, AssetKind::Temp, 4096), Some(11), "本 rank 可拿");
+        // **P0-2**:同一块二次入池 ⇒ 响亮拒(不 push 第二份),且不交回调用方去 free
+        assert_eq!(b.pool_release(11), None, "首次入池");
+        let fails_before = b.hook_fail();
+        assert_eq!(b.pool_release(11), None, "二次入池 ⇒ 拒(不产生第二份)");
+        assert_eq!(b.hook_fail(), fails_before + 1, "双次入池必须计数");
+        assert_eq!(b.pool_stats(), (1, 4096), "池里仍只有 1 份");
+        let _ = b.pool_acquire(0, AssetKind::Temp, 4096);
         // ③ 不可池化类:拒绝(bool = false ⇒ 调用方必须真归还)
         b.on_alloc(&AllocEvent {
             id: 12,
@@ -739,8 +750,11 @@ pub struct Loan {
     pub tier: Tier,
     /// 全量字节(登记值 —— 出账/换层都按它扣)。
     pub bytes: usize,
-    /// 分配点点名(排障:哪一处要的这块)。
+    /// 分配点点名(排障:哪一处要的这块;池复用**不改名** —— 名字 = 首生名,见收尾单 P2-2)。
     pub name: String,
+    /// **是否在池内**(P0-2:同一块二次入池 = 别名事故 ⇒ 响亮拒)。
+    /// 入池置 true;池取命中置 false;真归还随登记一起删。
+    pub pooled: bool,
 }
 
 /// **共享账本单元** = 三层账(决策面)+ 出借登记(事件面)。
@@ -756,13 +770,13 @@ pub struct LedgerBook {
     /// **临时块池**(缺口 4;2026-10-19):`(kind, bytes) → 可复用 id 栈`(LIFO)。
     ///
     /// 三条律:
-    /// 1. **同 kind + 同尺寸**才复用(尺寸不等 = 元素数/字节对不上,复用会让
-    ///    形状与账目双错 ⇒ 不许);
+    /// 1. **同 rank + 同 kind + 同尺寸**才复用(P0-1:TP 两 rank 共写一本账 ⇒
+    ///    键必须带 rank,否则跨卡发句柄;尺寸不等 = 形状/账目双错 ⇒ 不许);
     /// 2. **只有"已被持有者释放"的块入池**(`on_free` 路径),池成员 = 无活持有者
     ///    ⇒ 再发放不会造成别名/UAF;
     /// 3. 入池**不等于归还**:块仍在借(账上照旧占着),只是**可复用** ——
     ///    真还驱动 = 压力/关会话时的池排空(N6)。
-    pool: BTreeMap<(AssetKind, usize), Vec<u64>>,
+    pool: BTreeMap<(u8, AssetKind, usize), Vec<u64>>,
     /// **池容量上限**(字节;2026-10-19 实测 27B 一轮后池囤到 669 MiB ⇒ 必须有界):
     /// 超限时 `pool_release` **顶出最旧块**并把 id 交回调用方(真还驱动)。
     /// 缺省 = `pool_cap_default()`;boot 可用 `set_pool_cap` 覆写。
@@ -857,11 +871,15 @@ impl LedgerBook {
     }
 
     /// **池取块**(同 kind + 同尺寸才给;`None` = 未命中 ⇒ 调用方走真分配)。
-    pub fn pool_acquire(&mut self, kind: AssetKind, bytes: usize) -> Option<u64> {
-        let id = self.pool.get_mut(&(kind, bytes)).and_then(|v| v.pop());
+    pub fn pool_acquire(&mut self, rank: u8, kind: AssetKind, bytes: usize) -> Option<u64> {
+        let id = self.pool.get_mut(&(rank, kind, bytes)).and_then(|v| v.pop());
         match id {
             Some(id) => {
                 self.pool_hits = self.pool_hits.saturating_add(1);
+                // 出池即回到"借出"态(再次入池前不许被二次释放)
+                if let Some(l) = self.open.get_mut(&id) {
+                    l.pooled = false;
+                }
                 Some(id)
             }
             None => {
@@ -881,11 +899,17 @@ impl LedgerBook {
     /// 顶出策略 = **FIFO 最旧**(池是"复用缓存",旧块留着只是白占;上限内保留
     /// 最近释放的,与 CPU cache 的 LRU 直觉一致)。计数入 `pool_evicted`。
     pub fn pool_release(&mut self, id: u64) -> Option<u64> {
-        let Some(l) = self.open.get(&id) else { return Some(id) };
+        let Some(l) = self.open.get(&id).cloned() else { return Some(id) };
         if !l.kind.poolable() {
             return Some(id);
         }
-        let key = (l.kind, l.bytes);
+        // **P0-2**:同一块二次入池 ⇒ 池里会有两份 ⇒ 两个未来 alloc 拿到同一 id(别名)。
+        // 响亮拒(计数可见),且**不**把它交回调用方去 free(它已在池里)。
+        if l.pooled {
+            self.fail("双次入池(同一块重复释放)", format!("id={id} name={}", l.name));
+            return None;
+        }
+        let key = (l.rank, l.kind, l.bytes);
         let mut evicted = None;
         // 上限:池内字节 + 本块 > cap ⇒ 顶出最旧块(跨尺寸类也顶,先保总量)
         while self.pool_bytes() + l.bytes > self.pool_cap {
@@ -908,12 +932,15 @@ impl LedgerBook {
             self.pool.remove(&old_key);
         }
         self.pool.entry(key).or_default().push(id);
+        if let Some(m) = self.open.get_mut(&id) {
+            m.pooled = true;
+        }
         evicted
     }
 
     /// 池内字节(键 × 块数的快速求和)。
     fn pool_bytes(&self) -> usize {
-        self.pool.iter().map(|((_, b), v)| b * v.len()).sum()
+        self.pool.iter().map(|((_, _, b), v)| b * v.len()).sum()
     }
 
     /// boot/测试:设池容量上限(0 = 不限;>0 = 硬上限)。
@@ -965,14 +992,24 @@ impl LedgerBook {
         ids
     }
 
+    /// **按类明细**(P2-3;报告面):`(kind, entries, bytes)`,字节降序。
+    pub fn pool_by_class(&self) -> Vec<(AssetKind, usize, usize)> {
+        let mut agg: BTreeMap<AssetKind, (usize, usize)> = BTreeMap::new();
+        for ((_, kind, bytes), v) in &self.pool {
+            let e = agg.entry(*kind).or_insert((0, 0));
+            e.0 += v.len();
+            e.1 += bytes * v.len();
+        }
+        let mut out: Vec<(AssetKind, usize, usize)> =
+            agg.into_iter().map(|(k, (n, b))| (k, n, b)).collect();
+        out.sort_by(|a, b| b.2.cmp(&a.2));
+        out
+    }
+
     /// 池内块数 / 字节(一等指标)。
     pub fn pool_stats(&self) -> (usize, usize) {
         let n = self.pool.values().map(|v| v.len()).sum();
-        let b: usize = self
-            .pool
-            .iter()
-            .map(|((_, bytes), v)| bytes * v.len())
-            .sum();
+        let b: usize = self.pool.iter().map(|((_, _, bytes), v)| bytes * v.len()).sum();
         (n, b)
     }
 
@@ -1059,6 +1096,7 @@ impl LedgerBook {
                         tier: Tier::Gpu,
                         bytes: ev.bytes,
                         name: ev.name.clone(),
+                        pooled: false,
                     },
                 );
             }
@@ -1161,9 +1199,14 @@ impl owl_iface::handle::AllocLedger for LedgerEntry {
         book_lock(&self.book).on_alloc(ev);
     }
 
-    fn pool_acquire(&mut self, class: owl_iface::handle::AssetClass, bytes: usize) -> Option<u64> {
+    fn pool_acquire(
+        &mut self,
+        rank: u8,
+        class: owl_iface::handle::AssetClass,
+        bytes: usize,
+    ) -> Option<u64> {
         let kind = AssetKind::from(class);
-        book_lock(&self.book).pool_acquire(kind, bytes)
+        book_lock(&self.book).pool_acquire(rank, kind, bytes)
     }
 
     fn pool_release(&mut self, id: u64) -> Option<u64> {

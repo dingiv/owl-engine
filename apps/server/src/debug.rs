@@ -333,6 +333,10 @@ pub fn vram_json(snap: &crate::actor::VramSnapshot) -> Value {
                 "drained": r.events.pool.drained,
                 "evicted": r.events.pool.evicted,
                 "cap_bytes": r.events.pool.cap,
+                // P2-3:按类明细(与 events.rows 同口径)
+                "by_class": r.events.pool.by_class.iter().map(|(k, n, b)| json!({
+                    "kind": format!("{k:?}"), "entries": n, "bytes": b,
+                })).collect::<Vec<_>>(),
             },
             // **lifecycle 在借清单**(N4/N5 未归还的逐块指纹:名字 + id)。
             // 判据:同一 `name` 的条目**逐轮增长** = 该处没在节点上归还。

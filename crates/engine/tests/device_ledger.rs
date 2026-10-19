@@ -29,7 +29,12 @@ async fn ledger_captures_load_pool_and_graph_phases() {
         device_ordinal: 0,
         max_seq_tokens: 256,
         prefill_chunk: 32,
-        knobs: EngineKnobs { sampler_enabled: false, ..Default::default() },
+        knobs: EngineKnobs {
+            sampler_enabled: false,
+            // P1-1 门:池上限走配置面(值随 knobs 进 Rel → 账本)
+            pool_cap_mb: 32,
+            ..Default::default()
+        },
     };
     // 账本**由测试预造**并交给引擎(boot 期接管的那一本)—— 与生产 `Engine::on`
     // 内部造的同一形状,只是为了能在外面读账。
@@ -95,6 +100,9 @@ async fn ledger_captures_load_pool_and_graph_phases() {
     );
     assert!(pool.0 > 0, "turn 后应有过释放的临时块入池(缺口 4)");
     assert!(hits + misses > 0, "取块计数必须有量(hits+misses>0)");
+    // **P1-1 门**:池上限来自配置(`pool_cap_mb = 32`),且报告面可查
+    assert_eq!(b.pool_cap(), 32 << 20, "池上限必须由配置注入(不是硬编码)");
+    assert!(b.pool_stats().1 <= b.pool_cap(), "池字节不许超上限");
 }
 
 /// **账本预算交叉校验**:`Rel::open` 必须拒"账本与分解不符"(boot 算式漂了 = 响亮拒)

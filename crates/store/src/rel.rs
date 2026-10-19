@@ -160,7 +160,7 @@ pub struct EventBook {
 }
 
 /// **复用池报告**(缺口 4:池内可复用面 —— 不再是告警里的一行,而是一等指标)。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PoolReport {
     /// 池内块数。
     pub entries: usize,
@@ -176,6 +176,8 @@ pub struct PoolReport {
     pub evicted: u64,
     /// 池上限字节(0 = 不限)。
     pub cap: usize,
+    /// **按类明细**(P2-3):`(kind, entries, bytes)`,字节降序。
+    pub by_class: Vec<(AssetKind, usize, usize)>,
 }
 
 /// 在借清单的一行(报告面投影;`Loan` + id)。
@@ -733,6 +735,7 @@ impl Rel {
                             drained,
                             evicted: b.pool_evicted(),
                             cap: b.pool_cap(),
+                            by_class: b.pool_by_class(),
                         }
                     },
                     open_lifecycle: b
@@ -791,6 +794,11 @@ impl Rel {
         push(&mut owners, &mut rows, crate::tier::Owner::System, Tier::Gpu,
              AssetKind::Row, rows_in_use * self.state.row_bytes(), rows_in_use);
         crate::tier::TierReport { rows, owners, ..Default::default() }
+    }
+
+    /// **复用池上限**(缺口 4 收尾 P1-1;boot 一次,显式配置)。`0` = 不限。
+    pub fn set_pool_cap(&mut self, bytes: usize) {
+        crate::tier::book_lock(&self.ledger).set_pool_cap(bytes);
     }
 
     /// **账本单元**(boot 接线:DeviceHandle 的事件入口与 store 的 `Rel` 要**同一本**)

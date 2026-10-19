@@ -769,6 +769,26 @@ N7 装载/拆卸期)。⇒ 日志已改成**如实报数**(`drained` 恒 0 也�
 **门**:store 90(+池上限门/Idle 次序断言)· iface 11 · cpu 18 · engine 54 ·
 `cargo check --workspace --all-targets` 干净 · server 构建 OK · 真机 6 长 ×2 轮实录如上。
 
+
+### 12.17 收尾小刀(回收池 P0+P1-1+P2):2026-10-19
+
+按 `roadmap.local/26-10-19-回收池-收尾工作单.md` 打掉 6 条:
+
+| # | 内容 | 门 |
+|---|---|---|
+| **P0-1** | 池键 `(kind,bytes)` → **`(rank,kind,bytes)`**;`AllocLedger::pool_acquire(rank,class,bytes)` | store 单测:rank1 不许拿 rank0 的块 |
+| **P0-2** | `Loan.pooled` 标记;**二次入池 = 响亮拒**(`hook_fail+1`,不产生第二份、也不交回调用方去 free —— 它已在池里) | store 单测:池内仍 1 份 + 计数 |
+| **P0-3** | **捕获窗内禁止取池**(窗栈非空 ⇒ `pool_acquire` 恒 `None`):窗内块必须真分配/slab 切块,否则指针烘进图后被复用 = UAF | cpu 行为门 `pool_is_disabled_inside_capture_window` |
+| **P1-1** | 池上限进配置:`[pool] pool_cap_mb`(缺省 256,0=不限)→ `EngineKnobs` → `Rel::set_pool_cap`;boot 逐行打印 | `device_ledger` 门断言 `pool_cap()==32<<20` 且池字节 ≤ 上限 |
+| **P2-1** | 池指标入 metrics:N4 每 turn 记 `store.pool.{entries,bytes,hits,misses,evicted,drained}` | dump 可见时序 |
+| **P2-3** | `PoolReport.by_class` + `/debug/vram` 的 `events.pool.by_class[]` | 与 `events.rows` 同口径 |
+
+未打(留在工作单):P1-2(复用率:子 tag / uninit 允许 ≥尺寸,**需语义裁决**)、
+P1-3(RAII 偏离记档或补句柄)、P1-4(排空触发口径)、P2-2(池化块名字语义)、P2-4(立案卷回填——已做)。
+
+**门**:store 89(+池 rank/双放门)· iface 11 · cpu 19(+窗门)· engine 54 · `device_ledger` 2 ·
+`cargo check --workspace --all-targets` 干净。
+
 ## §十一 变更记录
 
 | 日期 | 版本 | 变更 |

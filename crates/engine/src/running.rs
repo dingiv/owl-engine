@@ -954,6 +954,20 @@ impl<D: DeviceClient> RunningEngine<D> {
             owl_iface::handle::Owner::Turn(turn),
             owl_iface::handle::Owner::Cache,
         );
+        // **P2-1**:池指标入 metrics(时序可见;每 turn 一次,量级 = 计数快照)
+        {
+            let (n, bytes) = b.pool_stats();
+            let (hits, misses, drained) = b.pool_counters();
+            let evicted = b.pool_evicted();
+            owl_shared::metrics::with_metrics_store(|m| {
+                m.counter_add("store.pool.entries", n as u64, file!(), line!());
+                m.counter_add("store.pool.bytes", bytes as u64, file!(), line!());
+                m.counter_add("store.pool.hits", hits, file!(), line!());
+                m.counter_add("store.pool.misses", misses, file!(), line!());
+                m.counter_add("store.pool.evicted", evicted, file!(), line!());
+                m.counter_add("store.pool.drained", drained, file!(), line!());
+            });
+        }
         if swept.0 > 0 {
             let (n, bytes) = b.pool_stats();
             let (hits, misses, _) = b.pool_counters();

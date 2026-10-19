@@ -304,6 +304,9 @@ pub struct PoolCfg {
     pub snap_max: usize,
     /// **宿主 KV 腿**(MiB;0 = 关层)。下沉的落点之一。
     pub host_cache_mb: usize,
+    /// **复用池容量上限**(MiB;缺口 4 收尾 P1-1;缺省 256,0 = 不限)。
+    /// 释放的临时块先进池复用、不立即还驱动;超出本上限的**逐块顶出**回驱动。
+    pub pool_cap_mb: usize,
     /// **宿主状态腿**(MiB;0 = 关层)。GDN 快照下沉的落点 ——
     /// ⚠️ 超卖档会把压力推给它(实测 27B 单快照 607 MiB),别只给 KV 腿留量。
     pub snap_host_mb: usize,
@@ -977,6 +980,7 @@ impl Default for PoolCfg {
             snap_max: 4,
             host_cache_mb: 0,
             snap_host_mb: 0,
+            pool_cap_mb: 256,
             vram_target: 0.97,
             vram_reserve_mb: 1024,
             prefix_cache: true,

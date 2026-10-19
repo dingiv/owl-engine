@@ -153,6 +153,11 @@ pub struct EngineKnobs {
     pub dense_floor_mib: Option<u64>,
     /// **状态腿宿主预算 MiB**(S2 §25.2;缺省 **0 = 关层**)。`OWL_SNAP_HOST_MB`。
     ///
+    /// **复用池容量上限**(MiB;缺口 4 收尾 P1-1;2026-10-19)。
+    ///
+    /// 缺省 256:27B 单轮释放后池天然囤到 669 MiB、复用率仅 ~46% ⇒ 无界池 = 新形态囤积;
+    /// 256 覆盖实测热集大头,超出部分逐块顶出回驱动。0 = 不限(仅供诊断/对照)。
+    pub pool_cap_mb: usize,
     /// 与 [`Self::host_cache_mb`] 同属 store 中层总账的两个**分片**
     /// (KV 块腿 / GDN 快照腿)—— 总账 = 两者之和(`Rel::open` 交叉校验分片
     /// 不超总账)。为什么分开:两条腿的搬运形态与热区完全不同,共用一个数
@@ -246,6 +251,7 @@ impl Default for EngineKnobs {
             prefix_cache_share: 0.5,
             host_cache_mb: 0,
             snap_host_mb: 0,
+            pool_cap_mb: 256,
             index_probe: false,
             coverage_probe: false,
             coverage_analyze_at: 0,
@@ -489,6 +495,7 @@ impl EngineKnobs {
             // 测试面只保留"运行器级"env(选卡/资产路径/场景过滤),见
             // `docs/arch/配置面-单一来源.md`。
             pool_tokens: cfg.pool.pool_tokens,
+            pool_cap_mb: cfg.pool.pool_cap_mb,
             draft: DraftCfg {
                 depth: cfg.spec.depth,
                 dumb: cfg.spec.dumb,
@@ -888,6 +895,14 @@ pub(crate) fn into_running<D: DeviceClient>(
                 dev.pool.mtp_pool_layout(0),
                 ledger,
             )?;
+            // **复用池上限**(缺口 4 收尾 P1-1):配置面显式(=0 ⇒ 不限,仅诊断用)
+            let cap = cfg.knobs.pool_cap_mb << 20;
+            b.rel.set_pool_cap(cap.max(0) as usize);
+            owl_shared::log_info!(
+                "store",
+                "复用池上限 = {}(缺省 256MiB;超限逐块顶出回驱动)",
+                if cap == 0 { "不限".to_string() } else { format!("{}MiB", cfg.knobs.pool_cap_mb) }
+            );
             // **B-4 驱逐策略装配**(boot 一次;缺省 LRU ⇒ 与历史逐字一致)
             b.rel.set_evict_policy(cfg.knobs.evict_policy.build());
             owl_shared::log_info!("store", "驱逐策略 = {}", b.rel.evict_policy_name());

@@ -31,6 +31,8 @@ struct RecLedger {
     /// (默认开会把 `free` 全部截进池,别的门就看不到"真归还")
     pool: Vec<(usize, u64)>,
     pool_on: bool,
+    /// 桩池的 rank(验 P0-1:非本 rank 不命中)
+    pool_rank: u8,
 }
 
 impl AllocLedger for RecLedger {
@@ -67,7 +69,7 @@ impl AllocLedger for RecLedgerProxy {
     fn on_move(&mut self, ev: &MoveEvent) {
         lock(&self.0).moves.push(ev.clone());
     }
-    fn pool_acquire(&mut self, _class: AssetClass, bytes: usize) -> Option<u64> {
+    fn pool_acquire(&mut self, _rank: u8, _class: AssetClass, bytes: usize) -> Option<u64> {
         let mut g = lock(&self.0);
         if !g.pool_on {
             return None;
@@ -530,7 +532,7 @@ async fn pool_reuses_released_temp_blocks() {
         fn on_alloc(&mut self, _ev: &AllocEvent) {}
         fn on_free(&mut self, _ev: &FreeEvent) {}
         fn on_move(&mut self, _ev: &MoveEvent) {}
-        fn pool_acquire(&mut self, class: AssetClass, bytes: usize) -> Option<u64> {
+        fn pool_acquire(&mut self, _rank: u8, class: AssetClass, bytes: usize) -> Option<u64> {
             let k = (class as u8, bytes);
             let id = self.pool.get_mut(&k).and_then(|v| v.pop());
             if id.is_some() {
@@ -554,10 +556,10 @@ async fn pool_reuses_released_temp_blocks() {
         fn on_alloc(&mut self, _ev: &AllocEvent) {}
         fn on_free(&mut self, _ev: &FreeEvent) {}
         fn on_move(&mut self, _ev: &MoveEvent) {}
-        fn pool_acquire(&mut self, class: AssetClass, bytes: usize) -> Option<u64> {
+        fn pool_acquire(&mut self, rank: u8, class: AssetClass, bytes: usize) -> Option<u64> {
             match self.0.lock() {
-                Ok(mut g) => g.pool_acquire(class, bytes),
-                Err(p) => p.into_inner().pool_acquire(class, bytes),
+                Ok(mut g) => g.pool_acquire(rank, class, bytes),
+                Err(p) => p.into_inner().pool_acquire(rank, class, bytes),
             }
         }
         fn pool_release(&mut self, id: u64) -> Option<u64> {
@@ -605,4 +607,24 @@ async fn pool_drain_heals_pool_exhausted_alloc() {
     assert_eq!(b.len, 32);
     let f = freed.lock().map(|g| g.clone()).unwrap_or_default();
     assert_eq!(f, vec![a.id], "排空 = 把池里那块真还给驱动");
+}
+
+/// 门 ⑲:**P0-3 捕获窗内不取池**(窗内块必须真分配 —— 否则指针烘进图后被复用 = UAF)
+#[tokio::test]
+async fn pool_is_disabled_inside_capture_window() {
+    let (cell, rec) = cell();
+    lock(&rec).pool_on = true;
+    let mut dev = DeviceHandle::new(StubFace::new(true), Some(cell));
+    dev.set_class(AssetClass::Temp);
+    // 先造一块入池
+    let a = dev.alloc_uninit(Dtype::F16, 16, "w.0").await.expect("alloc");
+    dev.free(&[a.id]).await.expect("入池");
+    // 窗内:同尺寸也**不许**命中 ⇒ 真分配(新 id)
+    dev.graph_begin().await.expect("开窗");
+    let in_win = dev.alloc_uninit(Dtype::F16, 16, "w.1").await.expect("窗内分配");
+    assert_ne!(in_win.id, a.id, "窗内禁止取池(P0-3)");
+    dev.graph_abort().await.expect("关窗");
+    // 窗关后:同尺寸照常命中
+    let after = dev.alloc_uninit(Dtype::F16, 16, "w.2").await.expect("窗后分配");
+    assert_eq!(after.id, a.id, "窗关后恢复池复用");
 }
