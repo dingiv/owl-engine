@@ -5115,3 +5115,35 @@ host（engine）:
 2. **fp8 融合腿**(prefill 的 >256KB 载荷)仍两核 —— decode 收益面已全覆盖,prefill 收益小;
 3. **spec 档的融合收益**需更多样本(±5% 方差;当前 2+2 样本 ⇒ 持平略好);
 4. `tp_vocab_split × tp_ar_fused × spec` 三档组合的**恒等门**(两臂逐字)未固化。
+
+---
+
+## §66 P0.3 host 尾巴**定谳**（2026-10-19 深夜;单刀 ≤1h）
+
+> 目标（路线图 §3 P0.3）:把"host 尾巴 ~2.1ms/步"拆开 —— 上限 = decode **+10%**。
+
+### 66.1 账（非投机档 `tp2-nosplit-fused`;`[probes] step_profile = true`）
+
+| 相位 | 读数 | 判语 |
+|---|---:|---|
+| `fill+launch`（图入队准备 + launch）| **0.20–0.37 ms** | 小 ✓ |
+| `host-sample`（logits dtoh 1MB + host 采样;采样档）| **0.35 ms** | 小 ✓ |
+| `token-dtoh`（含**等 GPU 图回放**的同步点）| 18.3–18.8 ms | **不是 host 成本**（≈ 设备时间）|
+| **循环头**（`step_need`/`admission_gate`/`pool_housekeeping`/`schedule`）| **≈ 0.000 ms**（新打点;`[sched] loophead=`）| **已排除** ✓ |
+| **步间隔（wall 差）** | 20.5 ms | — |
+| ⇒ **循环尾**（`host-sample` 打印 → 下次 `fill+launch` 打印）| **≈ 1.4–1.7 ms** | ← **主缺口（未拆）** |
+| ⇒ **host 暴露合计** | **≈ 2.0 ms/步（~10%）** | 与 §2.1 旧账吻合 ⇒ **上限 decode +10% 成立** |
+
+### 66.2 已落打点（恒开;纳秒级,零行为影响）
+
+- `running.rs::pump`:`t_loophead`（循环头四件）并入既有 `[sched]` 日志
+  ⇒ `[sched] n=… avg=… last=… loophead=…ms` ✓ 当场证明**循环头 ≈ 0**。
+
+### 66.3 结论与下一刀（P2.2 的靶）
+
+- **靶 = 循环尾 ~1.5ms/步**:它在 `pump()` 返回 `TurnEvent` **之后**（actor 事件消费 →
+  下一轮 pump 头 → decode 准备）—— 即**在 `apps/server/actor.rs` 的循环里**,
+  而**不是**引擎内部（引擎侧的 sink 侧全加起来 < 0.6ms）。
+- **下一刀（P2.2 host 尾巴治理）**:在 actor 循环 + `pump` 出口加打点,拆这 1.5ms
+  （候选:事件通道/锁、`/debug` 统计、日志格式化、`turns` 账务、下一轮 `step_need` 之前
+  的会话/KV 事、TTFT 记账…）。**预期上限 decode +7%**（扣掉已计相位）。

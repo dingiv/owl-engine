@@ -1194,10 +1194,14 @@ impl<D: DeviceClient> RunningEngine<D> {
         //    预搬是显式策略,不是默认行为)。
         // 保洁**先于** `schedule` 里的 `ensure_for_len` ⇒ 正常路径下同步驱逐恒为空
         // (报告面 `ops.ensure_evicted` 可查)。
+        // P0.3 定谳(2026-10-19):**循环头**耗时(需求驱动保洁:need/gate/housekeeping)
+        // —— 它是"步墙钟 − 设备 − fill/launch − 采样"的缺口候选(此前未打点)。
+        let t_loophead = (prof || true).then(std::time::Instant::now);
         let need = self.step_need()?;
         let mut need = need;
         self.admission_gate(&mut need)?;
         self.pool_housekeeping(need).await?;
+        let loophead_ms = t_loophead.map(|t| t.elapsed().as_secs_f64() * 1e3).unwrap_or(0.0);
         owl_shared::timer_start!("engine.pump.schedule");
         let t_sched = (prof || true).then(std::time::Instant::now);
         let out = self.schedule()?;
@@ -1206,10 +1210,11 @@ impl<D: DeviceClient> RunningEngine<D> {
             self.sched_acc_ns += d.as_nanos() as u64;
             self.sched_cnt += 1;
             if self.sched_cnt.is_multiple_of(16) {
-                owl_shared::log_info!("sched", "n={} avg={:.2}ms last={:.2}ms",
+                owl_shared::log_info!("sched", "n={} avg={:.2}ms last={:.2}ms loophead={:.3}ms",
                     self.sched_cnt,
                     self.sched_acc_ns as f64 / self.sched_cnt as f64 / 1e6,
-                    d.as_secs_f64() * 1e3
+                    d.as_secs_f64() * 1e3,
+                    loophead_ms
                 );
             }
         }
