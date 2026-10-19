@@ -33,6 +33,11 @@ pub enum NeedWhy {
     Grow,
     /// H5:空转整理(无活跃 turn;冷资产下沉)。
     Idle,
+    /// **N6 压力节点**(缺口 3;2026-10-19):**零缺口也搬** —— 驱动/池告急时
+    /// 主动把冷面腾到宿主(pressure 次序 = 先下沉、再驱逐、仍不足才拒),
+    /// `slots` 读作"**目标腾出的槽数**"(不是缺口)。与其它节点的区别只有一条:
+    /// 不吃 `free >= slots` 早退(压力下"手上有货"也要整理)。
+    Pressure,
 }
 
 /// 一块该去哪儿。
@@ -100,6 +105,50 @@ pub struct Applied {
 pub fn plan(leg: &BlockLeg, need: Need, protect: &[ChainHash]) -> Verdict {
     let mut v = Verdict::default();
     let free = leg.slots_free();
+    // **N6 压力**:目标 = "腾出 slots 个槽"(与缺口无关)⇒ 不吃早退。
+    if need.why == NeedWhy::Pressure {
+        let want = need.slots.min(leg.slots_total().saturating_sub(free));
+        let mut got = 0usize;
+        let mut picked: Vec<ChainHash> = protect.to_vec();
+        // ① 先下沉(内容不丢):整链 → 退化按叶
+        let host_room = leg.host_free_slots().min(want);
+        if host_room > 0 {
+            for c in leg.chain_offload_candidates(&picked, host_room) {
+                v.out.push(EvictOut { chain: c.tail, sink: Sink::Host, span: c.dev_blocks });
+                picked.push(c.tail);
+                got += c.dev_blocks;
+                if got >= host_room {
+                    break;
+                }
+            }
+            if got < host_room {
+                for chain in leg.offload_candidates(&picked, host_room - got) {
+                    v.out.push(EvictOut { chain, sink: Sink::Host, span: 1 });
+                    picked.push(chain);
+                    got += 1;
+                }
+            }
+        }
+        // ② 仍要腾(宿主满)⇒ 驱逐(丢内容,按叶)
+        if got < want {
+            for chain in leg.offload_candidates(&picked, want - got) {
+                v.out.push(EvictOut { chain, sink: Sink::Drop, span: 1 });
+                picked.push(chain);
+                got += 1;
+            }
+        }
+        if got < want {
+            v.deny = Some(format!(
+                "{} 压力:要腾 {} 槽,可搬面只凑出 {} 槽(短 {});宿主预算 {} 字节",
+                leg.label(),
+                want,
+                got,
+                want - got,
+                leg.host_budget_bytes()
+            ));
+        }
+        return v;
+    }
     if free >= need.slots {
         return v; // 手上有货,不动任何人
     }
@@ -153,3 +202,8 @@ pub fn plan(leg: &BlockLeg, need: Need, protect: &[ChainHash]) -> Verdict {
     v
 }
 
+
+// FIXME(N6-①,2026-10-19):**次序门待补** —— `NeedWhy::Pressure` 的分支已落(零缺口也搬),
+// 但要写出可判的门,腿里必须**有块**(`BlockLeg` 的装载 API + `ChainHash` 构造在 test 面
+// 未暴露)。⇒ 与引擎触发点(N6 节点)一起做:用 `StoreBank` 真装几条链,断言
+// ①`Pressure` 在 `free >= slots` 时仍出单 ②出单优先 `Sink::Host` ③非压力节点照旧早退。

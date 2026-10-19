@@ -679,6 +679,23 @@ device_ledger 2(断言"turn 后池非空 + hits+misses>0")· 真机三轮同上�
 判据 = 构造用例(池贴顶 + 临时需求)从"vram-guard 拒发 ⇒ 优雅关停"变成"收缩/降级后继续跑",
 届时 `pool.drained` / `degrade` 计数才该非 0。
 
+
+### 12.14 刀 N6-①:Pressure 节点(store 侧次序律;2026-10-19)
+
+**改动(store/hooks.rs)**:
+- `NeedWhy += Pressure` —— 语义与其它节点的**唯一差别**:不吃 `free >= slots` 早退。
+  `need.slots` 在此档读作"**目标腾出的槽数**"(不是缺口)。
+- `plan(Pressure)` 次序:**① 整链下沉(内容不丢)→ ② 退化按叶下沉 → ③ 仍要腾才驱逐(丢内容,按叶)
+  → ④ 凑不够才 `deny`**(同既有次序律,只换触发判据);出单 `Sink::Host` 优先。
+
+**门(诚实标注)**:`store 88` 全绿,但**次序门本身还没写** —— 要可判,腿里必须有块
+(`BlockLeg` 的装载 API 与 `ChainHash` 构造在 test 面未暴露)。`hooks.rs` 末尾留了 FIXME,
+写明下一刀与**引擎 N6 触发点**一起做(用真装链的 bank 验三条:Pressure 在无缺口时仍出单 /
+出单优先 Host / 非压力节点照旧早退)。
+
+**引擎侧(N6-②,未做)**:触发点(驱动 free < reserve 或池告急)⇒ 调 `Need{slots: K, why: Pressure}`
+→ `apply_verdict`;`deny` 不再直通致命 ⇒ 进**降级链**(关桶图/退 eager/缩生成长度,记 `degrade`)。
+
 ## §十一 变更记录
 
 | 日期 | 版本 | 变更 |
