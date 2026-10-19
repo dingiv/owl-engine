@@ -940,3 +940,71 @@ decode    30.9 tok/s · 首步 logits 预热+捕获共 ~19s
 - §14.5 的"GGUF + TP2 待做" ⇒ **已收口**(本节);
 - `docs/arch/新格式接入-改动点清单.md` 的 TP 一节:新增"源自担分片(`owns_shard`)"一条
   与"分片档源事实(去掉 A2 表)"一条。
+
+---
+
+## 十六、W-2:prefill 权重复用臂(2026-10-19;`vec_dot` 复用 → 算术墙定式)
+
+### 16.1 立案:MMVQ 的流量公式(一条就解释了全部数字)
+
+MMVQ 的网格是 `(n / n_warps, m)`,每个 (权重行, token) 对独立读一遍该行 ⇒
+
+```text
+一次前向的权重流量 = m × 权重字节数        ← 与 chunk 无关、与 m 无关
+```
+
+实测(单测「prefill 探针」`tests_gguf::gpu_gguf_prefill_probe`,1001-token prompt):
+
+| 档 | 权重 | 带宽推导 | 实测 |
+|---|---|---|---|
+| 27B Q4_K_M | 17.7 GB | 936 GB/s ÷ 17.7 GB = **53 t/s** | **48.9 t/s** |
+| 4B Q4_K_M(历史) | 2.81 GB | 936 ÷ 2.81 = 333 | 327.7(§13.4) |
+
+⇒ decode(m = 1)本来就该读一遍,**prefill 是纯浪费**:m = 1001 时同一行权重被读了 1001 次。
+
+### 16.2 复用臂(`owl_gguf_gemm_tile_*`,已落地)
+
+改动只在**调度**:同一 warp 一次拿住一行权重,连续算 `TILE_MT = 16` 个 token 的
+`vec_dot` ⇒ 权重流量 ÷ 16。`vec_dot` 的归约序**一字未动**(每 token 仍是同一串
+k 块 + 同一 warp reduce)⇒ 输出与 MMVQ **逐位相同**:
+
+- 门①(位级,GPU):`kernel_gate::gpu_gguf_tile_gemm_matches_mmvq_bitwise`
+  —— 四型 × `m = 16 / 20`(整窗 + 尾窗)**逐位相同**;
+- 门②(端到端):`gpu_gguf_prefill_probe` 里两臂(`OWL_GGUF_TILE=0|1`)在
+  1001-token prompt 上**首 token 相同**。
+
+分派:`m ≥ 8` 走复用臂(`linear.rs::GGUF_TILE_MIN_M`);decode(1)与投机 verify
+(2..7)留 MMVQ。白名单(`PROD_GGUF4B` / `flavors/gguf4b.toml`)已补四个 tile 入口。
+
+### 16.3 实测收益与**新墙**
+
+| chunk | MMVQ | 复用臂 | 加速比 |
+|---|---|---|---|
+| 128 | 48.6 t/s | **80.4 t/s** | 1.65× |
+| 512 | 48.9 t/s | 78.0 t/s | 1.60× |
+
+**为什么只有 1.65×**(这条是本刀的真正结论):权重流量已降到 1/16(≈ 0.08 s),
+剩下的 12.4 s 全是**算术** —— `vec_dot` 对每个 token **重新解量化**同一个块 ⇒
+有效算力只有 **≈ 4.4 TFLOPS**(54 GFLOP/token × 1001 ÷ 12.4 s)。
+即:**复用解掉了带宽墙,露出了算术墙**。
+
+### 16.4 W-2b 立案:dequant-to-smem + f16 点积(下一刀)
+
+目标:把"每 token 重新解量化"改成"**每窗解量化一次**",之后是纯 f16 点积。
+
+设计要点(已核过的三条事实,省下次重查):
+
+1. **`threadIdx.x` 即 lane**:现有核的 block 形状是 `(32, n_warps)`,所以
+   `gguf.cuh` 的协作式 `dequantize_block_q4_K/q5_K`(用 `threadIdx.x` 分工,
+   需 32 线程)**可以被任意单个 warp 直接调用**且语义正确 ⇒ 解量化到 smem
+   不需要抄数学;
+2. **Q6_K 是例外**:它假定 64 线程(`ip = tid/32`)⇒ 只能在 `blockDim.x = 64`
+   时正确;复用臂里保持"Q6_K 走 `vec_dot` 复用"(现成,1.65×),或另写
+   lane 参数化的 64 线程版本;
+3. **数值门要换口径**:smem 臂喂**原始 f16 激活**(不再经 q8_1 量化)⇒ 与 MMVQ
+   **不再位级相同**,门改成 `max|Δ|/max|ref| < 1e-2`(参考 = §13.4 的 CPU f64
+   对拍),并保留"两臂首 token 一致"作端到端判据。
+
+预算:smem = `n_tile × k_chunk × 2B`(如 32×256 = 16 KB)+ x 窗(16×256 = 8 KB)
+⇒ 每 CTA < 32 KB,4 CTA/SM 可跑;理论算力档:纯 f16 FMA(f32 累加)≈ 40 TFLOPS
+⇒ 27B prefill **≈ 600-800 t/s**;再用 `wmma`(f16×f16→f32)可到 ~1000 t/s。
