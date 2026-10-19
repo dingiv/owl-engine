@@ -1599,3 +1599,36 @@ nvcc -DGGML_CUDA_USE_GRAPHS -DGGML_SCHED_MAX_COPIES=4 \
 ⇒ 剩下唯一的量级项是 **GEMM 的核质量**:marlin-a8 实测 145 TFLOPS 对 llava-MMQ 的
 103(-29%),即还有 ~110 ms(≈+20% 吞吐)可挖;GDN 已从"劣势"翻成"优势"
 (0.63 µs/token vs llama.cpp 的 1.97)。
+
+### 22.7 W-2h 立案:decode(2026-10-19)—— 带宽墙 86%,三处可挖
+
+**方法**:`nsys --cuda-graph-trace=node`(必须开:decode 每步是**图回放**,
+默认 trace 只出 graph 级一行)+ 23.4 MB 级 trace;按 `argmax→argmax` 切**单步**。
+
+**单步实账(27B Q4_K_M,单 3090 Ti,24 completion tokens)**
+
+| 项 | 时间 | 占比 | 次数 | 有效带宽 |
+|---|---:|---:|---:|---:|
+| `owl_gguf_gemm_q4k`(MMVQ) | 10.90 ms | 44.3% | 192 | **880 GB/s** |
+| `owl_gguf_gemm_q8_0` | 9.19 | 37.3% | 288 | **772 GB/s** ← 落后 |
+| `owl_gguf_gemm_q6k` | 1.83 | 7.4% | 17 | 787 |
+| `owl_gguf_quant_act_f16` | 0.78 | 3.2% | **497** | — |
+| GDN `gdn_decode_step_v2_f16` | 0.48 | 2.0% | 48 | fused 臂已在 |
+| attention `v2_..._hd256bs32` | 0.40 | 1.6% | 16 | |
+| norm/add/gather/argmax | ~0.6 | 2.4% | | |
+| **GPU busy 合计** | **24.62 ms** | | **1478 发** | 17.7 GB ⇒ **808 GB/s** |
+
+客户端口径 27.4 ms/步(36.5 t/s)⇒ **图外 host 开销 ≈ 2.8 ms/步**。
+llama.cpp 同模型 24.3 ms/步(41.2 t/s,≈885 GB/s)。
+
+**三处可挖(按收益)**
+
+1. **q8_0 的 MMVQ 读对齐**(772 → 880 GB/s):Q8_0 块 34 B 不整除 32,
+   逐块读放大 ~1.9×;改"整段字节连续读 → smem → 按块解"即与 q4k 同档 ⇒ **−1.1 ms/步(+4.5%)**。
+2. **`quant_act` 497 发/步折进 MMVQ**(−497 发 + 0.78 ms);顺带把 1478 发/步压到 ~980。
+3. **图外 2.8 ms host**:采样/分词/页账在图外逐 token 同步;与 §20.7 的桶图族同源
+   (decode 图已捕获,剩的是图外那段)。
+
+**墙**:17.7 GB / 936 GB/s = **18.9 ms** 是 m=1 的物理地板 ⇒ 单卡上限 ≈ 53 t/s;
+追平 llama.cpp(24.3)即 78% 效率,再往上要靠 **4-bit 更省的格式/更小模型**,
+不是 scheduling 问题。
