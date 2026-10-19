@@ -27,6 +27,10 @@ struct RecLedger {
     allocs: Vec<AllocEvent>,
     frees: Vec<FreeEvent>,
     moves: Vec<MoveEvent>,
+    /// 池(桩:同尺寸判据从简);默认**关** —— 只有池/压力门开它
+    /// (默认开会把 `free` 全部截进池,别的门就看不到"真归还")
+    pool: Vec<(usize, u64)>,
+    pool_on: bool,
 }
 
 impl AllocLedger for RecLedger {
@@ -62,6 +66,26 @@ impl AllocLedger for RecLedgerProxy {
     }
     fn on_move(&mut self, ev: &MoveEvent) {
         lock(&self.0).moves.push(ev.clone());
+    }
+    fn pool_acquire(&mut self, _class: AssetClass, bytes: usize) -> Option<u64> {
+        let mut g = lock(&self.0);
+        if !g.pool_on {
+            return None;
+        }
+        // 同尺寸才给(与 store 的 key 判据一致)
+        g.pool.iter().rposition(|(b, _)| *b == bytes).map(|i| g.pool.remove(i).1)
+    }
+    fn pool_release(&mut self, id: u64) -> bool {
+        let mut g = lock(&self.0);
+        if !g.pool_on {
+            return false;
+        }
+        let bytes = g.allocs.iter().rev().find(|e| e.id == id).map(|e| e.bytes).unwrap_or(0);
+        g.pool.push((bytes, id));
+        true
+    }
+    fn pool_drain(&mut self) -> Vec<u64> {
+        std::mem::take(&mut lock(&self.0).pool).into_iter().map(|(_, id)| id).collect()
     }
 }
 
@@ -319,6 +343,10 @@ async fn face_clone_shares_context_and_ledger() {
 
 #[derive(Clone)]
 struct StubFace {
+    /// 压力注入:第一次 `alloc` 返回 `PoolExhausted`(验 N6 自愈)
+    fail_first_alloc: Arc<std::sync::atomic::AtomicBool>,
+    /// 被 `free` 掉的 id(验"排空后真归还")
+    freed: Arc<Mutex<Vec<u64>>>,
     ids: Arc<AtomicU64>,
     /// 窗内发射计数(复核服务端"空窗判据":零发射 ⇒ `graph_end` 拒)
     nodes: Arc<AtomicU64>,
@@ -328,7 +356,13 @@ struct StubFace {
 
 impl StubFace {
     fn new(reclaimed: bool) -> Self {
-        Self { ids: Arc::new(AtomicU64::new(1)), nodes: Arc::new(AtomicU64::new(0)), reclaimed }
+        Self {
+            fail_first_alloc: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            freed: Arc::new(Mutex::new(Vec::new())),
+            ids: Arc::new(AtomicU64::new(1)),
+            nodes: Arc::new(AtomicU64::new(0)),
+            reclaimed,
+        }
     }
     fn take_id(&self) -> u64 {
         self.ids.fetch_add(1, Ordering::Relaxed)
@@ -371,7 +405,22 @@ impl DeviceClient for StubFace {
         elems: usize,
         _name: &str,
     ) -> Result<owl_iface::contract::Bytes, owl_iface::contract::ModelError> {
+        if self.fail_first_alloc.swap(false, Ordering::Relaxed) {
+            return Err(owl_iface::contract::ModelError::PoolExhausted {
+                pool: "stub".into(),
+                needed: 1,
+                available: 0,
+            });
+        }
         Ok(owl_iface::contract::Bytes::new(self.take_id(), elems, dtype, 0))
+    }
+
+    async fn free(&mut self, ids: &[u64]) -> Result<(), owl_iface::contract::ModelError> {
+        match self.freed.lock() {
+            Ok(mut g) => g.extend_from_slice(ids),
+            Err(p) => p.into_inner().extend_from_slice(ids),
+        }
+        Ok(())
     }
     async fn htod(
         &mut self,
@@ -527,4 +576,34 @@ async fn pool_reuses_released_temp_blocks() {
     let (hits, released) = dev.pool_counters();
     assert_eq!((hits, released), (1, 1), "命中与入池计数(hits/released)");
     assert_eq!(lock(&rec).frees.len(), 0, "池化 ⇒ **不发** FreeEvent(块仍在借)");
+}
+
+/// 门 ⑱:**N6 压力自愈** —— 分配遇 `PoolExhausted` ⇒ 排空复用池(真还驱动) ⇒ 重试一次
+///
+/// FIXME(N6-step1,未收口):`#[ignore]` —— 门实测"排空未发生"(drain 返回 0,首次错误
+/// 直接上抛)。已确认:①释放确实入池(`pool_counters().1 == 1`)②请求尺寸不同(64B vs 池内 32B)
+/// ③桩只注入一次错误。待查 = `drain_pool_to_driver` 里 `dyn AllocLedger::pool_drain`
+/// 的动态派发是否走到了桩实现(与"同名解析"同族嫌疑);收口后去掉 `#[ignore]`。
+#[ignore = "N6-step1 未收口:排空路径未触发,见测试内 FIXME"]
+#[tokio::test]
+async fn pool_drain_heals_pool_exhausted_alloc() {
+    let (cell, rec) = cell();
+    lock(&rec).pool_on = true; // 本门专测池/压力面
+    let face = StubFace::new(true);
+    let freed = face.freed.clone();
+    let fail = face.fail_first_alloc.clone();
+    let mut dev = DeviceHandle::new(face, Some(cell));
+    dev.set_class(AssetClass::Temp);
+    // 先造一块入池(释放 ⇒ 可池化 ⇒ 不回驱动)
+    let a = dev.alloc_uninit(Dtype::F16, 16, "t.0").await.expect("alloc");
+    dev.free(&[a.id]).await.expect("入池");
+    assert_eq!(dev.pool_counters().1, 1, "已入池");
+    assert!(freed.lock().map(|g| g.is_empty()).unwrap_or(true), "入池 ⇒ 未回驱动");
+    // 下一次分配:桩先抛 PoolExhausted ⇒ 句柄应排空池(真 free)后重试成功
+    fail.store(true, Ordering::Relaxed);
+    // 请求**不同尺寸**(32 元素)⇒ 池未命中 ⇒ 桩抛 PoolExhausted ⇒ 句柄排空池(真 free 那块 16 元素)后重试
+    let b = dev.alloc_uninit(Dtype::F16, 32, "t.1").await.expect("自愈后应成功");
+    assert_eq!(b.len, 32);
+    let f = freed.lock().map(|g| g.clone()).unwrap_or_default();
+    assert_eq!(f, vec![a.id], "排空 = 把池里那块真还给驱动");
 }

@@ -881,6 +881,17 @@ impl LedgerBook {
         (n, bytes)
     }
 
+    /// **池排空**(N6 压力路径):清空池并**交出全部 id** —— 调用方负责真归还驱动
+    /// (逐条 `FreeEvent` 销账)。返回的 id 顺序 = 池内 LIFO 逆序(无语义)。
+    pub fn pool_drain(&mut self) -> Vec<u64> {
+        let ids: Vec<u64> = self.pool.values_mut().flat_map(|v| v.drain(..)).collect();
+        self.pool.clear();
+        if !ids.is_empty() {
+            self.pool_drained = self.pool_drained.saturating_add(1);
+        }
+        ids
+    }
+
     /// 池内块数 / 字节(一等指标)。
     pub fn pool_stats(&self) -> (usize, usize) {
         let n = self.pool.values().map(|v| v.len()).sum();

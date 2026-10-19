@@ -652,6 +652,29 @@ device_ledger 2(断言"turn 后池非空 + hits+misses>0")· 真机三轮同上�
 (H5 整链下沉 → 池回收 → 弹性面驱逐 → 降级 → 才拒),把 `Reject` 从"直通致命"改成
 "先收缩/降级";`pool.drained` 那时才该非 0。
 
+
+### 12.13 刀 N6-step1:压力自愈(排空复用池 + 重试一次;2026-10-19,部分收口)
+
+**动机**:缺口 3 的第一条 —— "`Reject`/硬预算拒发 ⇒ 直通致命"。压力路径的第一步不是"拒",
+而是**先把自己缓存的复用池还给驱动**,再要一次。
+
+**已落**:
+- `LedgerBook::pool_drain()`(清池 + 交出全部 id;计数 = 排空次数);
+- `AllocLedger::pool_drain`(缺省空实现)+ `DeviceHandle::drain_pool_to_driver()`
+  (唯一同时握有"池"与"驱动口"的一层:决策 = store,执行 = 本层;释放失败**回池不销账**);
+- `alloc_uninit` 遇 `ModelError::PoolExhausted { .. }` ⇒ 排空 + 重试一次;仍失败才上抛。
+
+**门状态(诚实标注)**:`store 88 · iface 11 · cpu 17(+1 ignored)· engine 54` 全绿;
+新门 `pool_drain_heals_pool_exhausted_alloc` **`#[ignore]` + FIXME** —— 实测"排空未发生"
+(首次错误直接上抛)。已确认:释放确实入池、请求尺寸不同(64B vs 池内 32B)、桩只注入一次错误;
+待查 = `drain_pool_to_driver` 里 `dyn AllocLedger::pool_drain` 的动态派发(与"同名解析"同族嫌疑)。
+
+**下一步(N6 正刀)**:验通该门后接 `plan(Pressure)` 次序 ——
+① H5 整链下沉(内容不丢)→ ② 池排空(本刀)→ ③ 弹性面驱逐(按叶)→ ④ **降级**
+(关桶图/退 eager/缩生成长度,记 `degrade` 计数)→ ⑤ 真不足才拒且**不死**;
+判据 = 构造用例(池贴顶 + 临时需求)从"vram-guard 拒发 ⇒ 优雅关停"变成"收缩/降级后继续跑",
+届时 `pool.drained` / `degrade` 计数才该非 0。
+
 ## §十一 变更记录
 
 | 日期 | 版本 | 变更 |

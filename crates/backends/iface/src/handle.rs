@@ -210,6 +210,11 @@ pub trait AllocLedger: Send {
     fn pool_release(&mut self, _id: u64) -> bool {
         false
     }
+
+    /// **池排空**(压力路径 N6):清池并交出全部 id(调用方真归还驱动)。
+    fn pool_drain(&mut self) -> Vec<u64> {
+        Vec::new()
+    }
 }
 
 /// **账本单元**(共享句柄;**同一本账**被 client 钩子与 store 自查共看)。
@@ -766,6 +771,42 @@ impl<D: DeviceClient> DeviceHandle<D> {
             Err(p) => p.into_inner(),
         };
         g.pool_acquire(class, bytes)
+    }
+
+    /// **压力自愈**(N6 第一刀):池排空 ⇒ 真归还驱动 ⇒ 销账。返回释放块数。
+    ///
+    /// 为什么放在句柄:它是唯一同时握有**池(store 账本)**与**驱动口(face)**的一层
+    /// —— 决策仍在 store(排空哪些 = `pool_drain`),执行在这里。
+    async fn drain_pool_to_driver(&mut self) -> usize {
+        let Some(cell) = self.ledger.as_ref() else { return 0 };
+        let ids = {
+            let mut g = match cell.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            g.pool_drain()
+        };
+        if ids.is_empty() {
+            return 0;
+        }
+        if let Err(e) = self.inner.free(&ids).await {
+            // 释放失败**不许静默**:本块仍归池(不销账),下次再来
+            eprintln!("[device-handle] 池排空释放失败({} 块):{e}", ids.len());
+            let mut g = match cell.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            for id in &ids {
+                let _ = g.pool_release(*id);
+            }
+            return 0;
+        }
+        let frees: Vec<FreeEvent> = ids.iter().map(|id| FreeEvent { id: *id, bytes: 0 }).collect();
+        self.send_events(&[], &frees, &[]);
+        for id in &ids {
+            self.untrack(*id);
+        }
+        ids.len()
     }
 
     /// **池还块**(逐 id):返回"必须真归还"的那些(顺序保持原样)。
