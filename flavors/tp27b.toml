@@ -131,7 +131,7 @@ allowed_ops = [
         "owl_gdn_conv_fwd_f16", "owl_gdn_conv_upd_dual_f16",
         "owl_gdn_decode_step_v2_f16", "owl_gdn_gating_g_f16",
         "owl_gdn_l2norm_f16", "owl_gdn_norm_act_f16",
-        "owl_gdn_recurrence_varlen_gqa_f16", "owl_gemv_dual_f16",
+        "owl_gdn_recurrence_varlen_gqa_f16", "owl_gemv_dual_f16", "owl_gemv_i8w_f16",
         "owl_narrow_strided_f16", "owl_norm_rope_f16",
         "owl_qknorm_rope_kv_insert_f16_knhd", "vllm_reshape_and_cache_f16_knhd",
         "owl_rmsnorm_f16", "owl_sigmoid_f16",

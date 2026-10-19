@@ -645,7 +645,7 @@ impl<D: DeviceClient> DeviceHandle<D> {
         let mut events: Vec<AllocEvent> = Vec::new();
         let mut frees: Vec<FreeEvent> = Vec::new();
         let mut moves: Vec<MoveEvent> = Vec::new();
-        for (i, cmd) in cmds.into_iter().enumerate() {
+        for (i, cmd) in cmds.into_iter().enumerate() { // FIXME: 这里没有达到批处理的目的，你要知道。这个Command，它是要让后端实现去感知的，你懂吧？为什么要搞批处理？搞批处理是为了省掉这个线程间同步开销啊。对吧？这一来一回，走这个线程间同步啊，那么就让这个每一个命令时间拖长了。
             segments += 1;
             let r = self.run_one(cmd, &mut events, &mut frees, &mut moves).await;
             if r.is_err() && first_err.is_none() {

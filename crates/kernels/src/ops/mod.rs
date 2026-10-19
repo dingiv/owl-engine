@@ -350,6 +350,9 @@ pub const PROD_SPEC_DFLASH_2026_10_13: &[&str] = &[
 pub const PROD_AWQ27B_2026_10_13: &[&str] = &[
     "cublas_gemm_f16",
     "flashinfer_prefill_paged_fp8kv",
+    // 2026-10-20:`gdn_chunked` 定谳后转缺省 true(prefill 大 T 五核);
+    // 档位不显式关就必须列它(否则首次 prefill 撞准入门)
+    "gdn_chunked_delta_rule_fwd",
     "marlin_gemm_w4a16_awq",
     // W4A8 档(S2;env `OWL_W4A8=1` 才实际发射 —— 白名单超集无害)
     "marlin_gemm_w4a8_awq",

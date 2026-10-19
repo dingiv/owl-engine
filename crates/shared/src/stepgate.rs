@@ -60,7 +60,7 @@
 ///
 /// 配置面反序列化用 serde 严格名(`off|sticky|single`);[`StepMode::parse`]
 /// 另接受少量别名(CLI/HTTP 用,不放松配置面)。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StepMode {
     /// 零干预(缺省)

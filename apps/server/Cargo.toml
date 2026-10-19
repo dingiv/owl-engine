@@ -17,6 +17,7 @@ owl-shared = { path = "../../crates/shared" }
 owl-store = { path = "../../crates/store" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
 # chat template 渲染(agent 服务面 §3.2/§7.1;HF transformers 语义兼容层)
 minijinja = { workspace = true }
 minijinja-contrib = { workspace = true }

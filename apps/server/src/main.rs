@@ -97,6 +97,10 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    if args.help {
+        eprintln!("{}", crate::config::HELP);
+        return;
+    }
     if args.list_flavors {
         eprintln!("可用 flavor:");
         for n in owl_shared::flavors::preset_names() {
@@ -104,11 +108,42 @@ async fn main() {
         }
         return;
     }
-    // 配置:四层叠加(Default → Flavor → 文件 → CLI),非法即拒
-    let config = match ServerConfig::load(args.flavor.as_deref(), args.config.as_deref(), &args) {
-        Ok(c) => c,
+    if args.list_profiles {
+        eprintln!("可用意图档(--profile):");
+        for n in owl_shared::flavors::profile_names() {
+            eprintln!("  {n}");
+        }
+        return;
+    }
+    // 配置:意图/预设 → 位置参数 → 站点 → CLI(非法即拒;**预检不解意图不选卡**)
+    let resolved = match ServerConfig::load_resolved(&args) {
+        Ok(r) => r,
         Err(e) => {
             // 拒启必须可见(A1):此刻 logger 尚未初始化,`log_info!` 会被丢弃
+            eprintln!("[boot] 配置非法: {e}");
+            std::process::exit(1);
+        }
+    };
+    // `--check` / `--print-config` / `--explain`:不加载权重、不选卡、不起引擎
+    if args.check || args.print_config || !args.explain.is_empty() {
+        match crate::config::inspect(&args, &resolved) {
+            Ok(()) => return,
+            // 预检报告已把 FAIL 行打在 stdout/stderr,这里只置退出码(不重复刷屏)
+            Err(e) if e.contains("预检未通过") => std::process::exit(1),
+            Err(e) => {
+                eprintln!("[config] FAIL: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    // boot 一行摘要(意图档;详细依据用 --check / --print-config)
+    if let Some(line) = crate::config::summary_line(&resolved) {
+        eprintln!("{line}");
+    }
+    // 完整解析 → server 形态(选卡在这里;预检已提前返回)
+    let config = match ServerConfig::from_resolved(resolved, &args) {
+        Ok(c) => c,
+        Err(e) => {
             eprintln!("[boot] 配置非法: {e}");
             std::process::exit(1);
         }

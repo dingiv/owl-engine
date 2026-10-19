@@ -1,0 +1,25 @@
+# owl 意图档 `awq27b-3090-max`(单张 3090 Ti / 24GB / W4A16 满血档)
+#
+# 只写意图;低层键(chunk/池/图臂/快照/白名单)由 config/resolve 派生。
+# 预检(不加载权重,<2s):
+#   ./target/release/server --profile awq27b-3090-max \
+#       --site testdata/args/base.toml --check
+# 启动:
+#   ./target/release/server --profile awq27b-3090-max \
+#       --site testdata/args/base.toml
+# 依据/来源:--print-config --format json / --explain pool.pool_tokens
+[intent]
+model       = "qwen3.8-27b-awq"   # 注册表键(27B AWQ-INT4 + lm_head int4)
+hardware    = "3090ti-24g"        # 内存模型档(实测 [vram-gov] total=23.60G)
+goal        = "max-context"       # 最大上下文:复用关 / 512+512 桶档 / 贴顶
+context     = "max"               # 由内存模型求解(--check 打印依据)
+concurrency = 1                   # 单会话:gdn_slots = max_concurrency = max_batch = 1
+spec        = "off"               # 草稿池 +20KiB/token ⇒ 上下文腰斩;投机另用 spec-dflash
+kv          = "fp8"               # 容量 ×2 + FI 读核
+kvmem       = "off"               # 池 ≥ 上下文,不要选择层/宿主/磁盘腿
+graphs      = "auto"              # FI 单图 decode + prefill 桶族;不可用自动降级并打印原因
+reuse       = "off"               # 单会话最大上下文档:快照/前缀缓存是纯开销
+
+[sampling]
+# 测速/恒等门口径(高级覆盖:profile 仍可写任意低层键)
+mode = "greedy"
