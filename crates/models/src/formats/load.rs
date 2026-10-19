@@ -1250,12 +1250,26 @@ async fn load_transposed<D: DeviceClient, S: WeightSource + ?Sized>(
     };
     let (dtype, bytes) = {
         let _s = probe.span("convert");
+        // **按声明 dtype 交付**(2026-10-19 定谳):原实现对非 F16 走 F32 分支 ——
+        // `htod(F32, shape, 4n 字节)` 后 `LoadEntry.dtype` 却报 `w.dtype`,块内容
+        // 是 **F32 字节冒充 f16/bf16** ⇒ 读者按 2B 解释 ⇒ **静默垃圾**。
+        // 命中面 = DFlash2 未量化草稿的 `fc`(`Weight::new_transposed` 唯一用户,
+        // 2026-10-10 悬案的真因之二:memory 与参考实现 cos ≈ 0)。
+        // 其余 dtype = 转置臂未覆盖 ⇒ 响亮拒(不许再走“默认 F32”的静默路)。
         match w.dtype {
             Dtype::F16 => (Dtype::F16, to_f16_bytes(&t)),
-            _ => (
+            Dtype::BF16 => (Dtype::BF16, to_bf16_bytes(&t)),
+            Dtype::F32 => (
                 Dtype::F32,
                 t.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>(),
             ),
+            other => {
+                return Err(ModelError::Msg(format!(
+                    "Weight '{}': 转置臂不支持 dtype {other:?}(只有 f16/bf16/f32;\
+                     新增 dtype 必须先补字节转换 —— 不许回落 F32 冒充)",
+                    w.key
+                )))
+            }
         }
     };
     let b = {
@@ -1333,6 +1347,15 @@ fn transpose_into_vec(data: &[f32], w: &crate::module::Want, n: usize) -> Result
 fn to_f16_bytes(v: &[f32]) -> Vec<u8> {
     let mut dst = vec![0u8; v.len() * 2];
     crate::f16c::f32_slice_to_f16_bytes(v, &mut dst);
+    dst
+}
+
+/// f32 切片 → bf16 字节(RNE,与 `half::bf16::from_f32` 同律)
+fn to_bf16_bytes(v: &[f32]) -> Vec<u8> {
+    let mut dst = Vec::with_capacity(v.len() * 2);
+    for &x in v {
+        dst.extend_from_slice(&half::bf16::from_f32(x).to_le_bytes());
+    }
     dst
 }
 
@@ -1681,5 +1704,76 @@ mod generic_entry_tests {
         assert_eq!(a.len(), b.len(), "量化族清单条目数");
         assert_eq!(a, b, "量化族键/dtype/形状逐条相等");
         eprintln!("[L2] 量化族通用入口 ≡ AwqSource 直开:{} 条逐项相等 ✓", a.len());
+    }
+
+    /// **转置臂按声明 dtype 交付**(2026-10-19 立案):原实现对非 F16 走 F32 分支,
+    /// 但 `LoadEntry.dtype` 仍报 `w.dtype` ⇒ **F32 字节冒充 bf16/f16**。
+    /// 命中面 = DFlash2 未量化草稿的 `fc`(`Weight::new_transposed` 唯一用户):
+    /// memory 与参考实现 cos ≈ 0 ⇒ z-lab 草稿 AL 恒 1.0(10-10 悬案的真因之二)。
+    ///
+    /// 本门:源 [row=2, col=3] → 声明转置 [3, 2],**BF16** 交付 ⇒ 回读必须
+    /// = 源转置且 dtype = BF16(CPU face;无卡可跑)。
+    #[tokio::test]
+    async fn transposed_arm_delivers_declared_dtype() {
+        use crate::module::{Loadable, LoaderCtx, LoaderOps, Weight, WeightSource};
+
+        struct One(Weight);
+        impl Loadable for One {
+            fn layout(&self, ctx: &LoaderCtx) -> LoaderOps {
+                self.0.layout(ctx)
+            }
+        }
+        struct Mem(Vec<f32>);
+        impl WeightSource for Mem {
+            fn take(&self, _key: &str) -> crate::module::Taken<Vec<f32>> {
+                Ok(Some(self.0.clone()))
+            }
+            fn take_range(&self, _key: &str, off: usize, len: usize) -> crate::module::Taken<Vec<f32>> {
+                Ok(self.0.get(off..off + len).map(<[f32]>::to_vec))
+            }
+            fn elem_len(&self, _key: &str) -> crate::module::Taken<usize> {
+                Ok(Some(self.0.len()))
+            }
+            fn native_dtype(&self, _key: &str) -> crate::module::Taken<crate::contract::Dtype> {
+                Ok(Some(crate::contract::Dtype::F32))
+            }
+        }
+
+        // 源 [rows=2, cols=3];声明转置 ⇒ 设备形状 [3, 2]
+        let src: Vec<f32> = (0..6).map(|i| i as f32 + 0.5).collect();
+        let mut face = owl_cpu::CpuFace::new();
+        for dt in [crate::contract::Dtype::BF16, crate::contract::Dtype::F16] {
+            // ⚠️ dtype 单元在 Weight 内是 `Cell`(clone **不共享**)⇒ 必须读
+            // 装载层持有的那一份,不能拿手建的副本对账
+            let layer = One(Weight::new_transposed("fc", 2, 3));
+            let ctx = LoaderCtx {
+                dtype: dt,
+                ..LoaderCtx::default()
+            };
+            eval_load(&layer, &mut face, &Mem(src.clone()), &ctx)
+                .await
+                .expect("eval_load(transposed)");
+            assert_eq!(layer.0.dtype(), dt, "声明 dtype 必须落为装载 dtype");
+            let got = match dt {
+                crate::contract::Dtype::BF16 => crate::testkit::harvest_bf16(&mut face, &layer.0.decl()).await,
+                crate::contract::Dtype::F16 => crate::testkit::harvest_f16(&mut face, &layer.0.decl()).await,
+                _ => unreachable!(),
+            };
+            // 期望:目标 [c*rows + r] = 源 [r*cols + c]
+            let mut want = vec![0f32; 6];
+            for r in 0..2 {
+                for c in 0..3 {
+                    want[c * 2 + r] = src[r * 3 + c];
+                }
+            }
+            assert_eq!(got.len(), 6, "元素数");
+            for (i, (g, e)) in got.iter().zip(want.iter()).enumerate() {
+                assert!(
+                    (g - e).abs() <= 1e-3,
+                    "{dt:?} 转置臂第 {i} 项错:得 {g} 期 {e}(F32 字节冒充?)"
+                );
+            }
+        }
+        eprintln!("[loader] 转置臂 dtype 交付门:bf16/f16 逐元素 ✓");
     }
 }
