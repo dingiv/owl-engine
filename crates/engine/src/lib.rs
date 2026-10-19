@@ -55,6 +55,11 @@ pub(crate) mod tp;
 pub mod tests;
 
 pub use engine::{Engine, EngineConfig, EngineKnobs};
+pub use owl_iface::handle::{AssetClass, DeviceHandle, Owner};
+
+/// **GPU 设备面类型糖**(内核后端 + 事件账钩子):`RunningEngine`/`TpEngine` 的
+/// 公共签名用它 —— 上层不必手写嵌套泛型(2026-10-19 步 3)。
+pub type GpuFace = DeviceHandle<owl_cuda::GpuClient>;
 pub use loader::{LoadedModel, ModelLoader};
 
 /// lm_head 量化方案映射(**唯一点**:配置枚举 → owl_models QuantPlan;

@@ -24,7 +24,7 @@
 //! | 0.8B 默认档(默认 knobs,max_seq ≤4096) | schedule_decision_surface / two_turns / session_continuity / multi_session_isolation / prefix_cache_hit / longctx_4k | 6 → 1 |
 //! | 27B 默认档(默认 knobs,max_seq 1024) | 27b_chat_inference / awq27b_marlin_e2e | 2 → 1 |
 //! | 独立(配置不同,不可合并) | w4a16_marlin_e2e(另一装载器)/ spec_identity_gate(Dumb 草稿)/ spec_identity_gate_27b(MTP 草稿)/ dflash2_gate(DFlash2+fp8)/ decode_marginal_bench(greedy+slots1)/ raw_completion_diag(greedy+Dumb) | 各 1 |
-//! 合并做法 = 场景签名改收 `&mut RunningEngine<GpuClient>`(删各自 3 行装配),
+//! 合并做法 = 场景签名改收 `&mut RunningEngine<owl_engine::GpuFace>`(删各自 3 行装配),
 //! 由本入口建一次并传入。**改动面大、需逐场景核对借用**,单独立刀。
 
 use owl_engine::tests as scen;

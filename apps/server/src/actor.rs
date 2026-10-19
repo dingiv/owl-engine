@@ -42,11 +42,28 @@ pub enum EngineReq {
         chat_wrap: bool,
         reply: tokio::sync::oneshot::Sender<Result<owl_engine::TokenizeReply, String>>,
     },
-    /// **store 账查询旁路**(`GET /debug/vram`;第 0 刀):不落 turn、不碰设备。
-    /// 应答 = 三层账 + **owner 维明细**(谁占着多少 —— 泄漏判据面)。
+    /// **store 账查询旁路**(`GET /debug/vram`;第 0/3 刀):不落 turn、不改状态。
+    /// 应答 = 三层账 + **owner 维明细** + **事件账** + **块账房对账**(全等门)。
     VramReport {
-        reply: tokio::sync::oneshot::Sender<owl_store::StoreReport>,
+        reply: tokio::sync::oneshot::Sender<VramSnapshot>,
     },
+}
+
+/// **`/debug/vram` 的一次快照**(三面事实:store 账 / 块账房 / 句柄计数)。
+///
+/// 为什么三面同屋:它们必须**同一时刻**取(引擎不在 pump 时)—— 分开取会让
+/// "事件账 vs 块账房"的差集混入并发窗口的噪声,判据就不再是判据。
+pub struct VramSnapshot {
+    /// store 报告(三层账 + owner 维 + 事件账)
+    pub report: owl_store::StoreReport,
+    /// 块账房快照(逐 rank;`Err` = 后端不支持/读失败,如实带出,不静默)
+    pub blocks: Vec<(u8, Result<Vec<owl_iface::contract::BlockLedgerRow>, String>)>,
+    /// 记账失败计数(非零 = 有事件没入账)
+    pub hook_fail: u64,
+    /// 窗未收次数(图窗失败且去向未定)
+    pub window_unclosed: u64,
+    /// 窗内未归还块数
+    pub open_window_blocks: usize,
 }
 
 /// 事件投递(律 #1:不许静默丢弃可失败返回值)。
@@ -268,8 +285,19 @@ async fn handle_req<D: DeviceClient>(
             }
         }
         EngineReq::VramReport { reply } => {
-            // 纯读账(store_report 是 &self 的只读投影)⇒ 零副作用、零搬运
-            if reply.send(running.store_report()).is_err() {
+            // 纯读账(store_report 是只读投影)+ **块账房快照**(命令面只读口)。
+            // 同一 turn 内取两面 ⇒ 无交错(引擎此刻不在 pump)⇒ "事件账 vs 块账房"
+            // 的全等门才有意义。**本路零副作用**:不落 turn、不搬块、不建图。
+            let (hook_fail, window_unclosed, open_window_blocks) = running.handle_probe();
+            let blocks = running.block_ledger_probe().await;
+            let snap = VramSnapshot {
+                report: running.store_report(),
+                blocks,
+                hook_fail,
+                window_unclosed,
+                open_window_blocks,
+            };
+            if reply.send(snap).is_err() {
                 owl_shared::log_debug!("actor", "vram 账应答投递失败(请求方已断开)");
             }
         }

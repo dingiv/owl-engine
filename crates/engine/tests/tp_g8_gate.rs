@@ -89,7 +89,7 @@ struct Steps {
 /// prefill 中间块与终局 `Completed` 都不产 token ⇒ 不记 —— 后者若记会多一条,
 /// 其 logits 槽是最后一次采样的旧值)。
 async fn run_turn_steps(
-    running: &mut RunningEngine<owl_cuda::GpuClient>,
+    running: &mut RunningEngine<owl_engine::GpuFace>,
     sid: u64,
     prompt: &str,
     max_new: usize,

@@ -78,8 +78,12 @@ const ENGINE_STACK_BYTES: usize = 32 << 20;
 
 /// **诊断投影面共享单元**(`/debug/blocks` 的 GPU 命令出口)。
 /// 显式依赖律:不做全局变量 —— `main` 建、actor 装、HTTP 读,全走参数。
-type DbgFace =
-    std::sync::Arc<std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<owl_cuda::GpuClient>>>>;
+/// 类型 = **设备句柄**(`DeviceHandle<GpuClient>`;2026-10-19 步 3:face 收编到句柄)。
+/// 注意:句柄的账本单元是 `Arc<Mutex<..>>`(真 Send)⇒ 送到 HTTP 线程是安全的
+/// ——这正是选 `Arc<Mutex>` 而不是 `Rc<RefCell>` 的实证理由(设计卷 §十二)。
+type DbgFace = std::sync::Arc<
+    std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<owl_engine::GpuFace>>>,
+>;
 
 #[tokio::main]
 async fn main() {
@@ -475,7 +479,7 @@ async fn actor_main(
             // 分片装载 → `TpEngine::assemble`(分档 / staging 对称握手**在建图
             // 之前** / 每 rank `boot_rank`)→ `run`(rank0 束 = 主设备面,
             // rank1 束 = peer)。**actor/HTTP 面零改动** —— `run()` 返回同型
-            // `RunningEngine<GpuClient>`。
+            // `RunningEngine<owl_engine::GpuFace>`。
             2 => {
                 let ord = config.devices.ordinals();
                 let model0 = load_shard(&config, &mut engine, 0, 2).await?;

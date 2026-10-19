@@ -432,6 +432,13 @@ impl<D: DeviceClient> RunningEngine<D> {
                 }
                 _ => (self.cfg.knobs.sampler, self.cfg.knobs.sampler_enabled),
             };
+            // **[N1 TurnBegin]**:turn 上设备 —— 归属 `Turn(id)`;类别 `Temp`
+            //    (turn 域的一切分配都是临时面:激活/工作区/回退;常驻面在 boot 已归 System)
+            let admit_id = turn.id;
+            self.set_dev_ctx(
+                owl_iface::handle::Owner::Turn(admit_id),
+                owl_iface::handle::AssetClass::Temp,
+            );
             self.turns.active = Some(crate::turn::ActiveTurn {
                 id: turn.id,
                 session_id: turn.session_id,

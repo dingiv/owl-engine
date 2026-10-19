@@ -139,7 +139,9 @@ async fn body(oa: usize, ob: usize, dir: PathBuf) {
     let js: Vec<String> = {
         let mut v = Vec::new();
         for r in 0..2 {
-            v.push(tp.face_clone(r).expect("face clone").ledger_json().await.expect("ledger_json"));
+            // `ledger_json` 是 GpuClient 固有面(peer 账房)→ 走可变直通口
+            let mut f = tp.face_clone(r).expect("face clone");
+            v.push(f.client_mut().ledger_json().await.expect("ledger_json"));
         }
         v
     };
@@ -194,8 +196,8 @@ async fn body(oa: usize, ob: usize, dir: PathBuf) {
     let k0 = tp.face_clone(0).expect("face0(收尾)");
     let k1 = tp.face_clone(1).expect("face1(收尾)");
     tp.shutdown().await.expect("TP 收尾");
-    for (tag, f) in [("rank0", k0), ("rank1", k1)] {
-        let j = f.ledger_json().await.expect("ledger_json(after shutdown)");
+    for (tag, mut f) in [("rank0", k0), ("rank1", k1)] {
+        let j = f.client_mut().ledger_json().await.expect("ledger_json(after shutdown)");
         assert_eq!(json_u64(&j, "shared_bytes"), 0, "{tag} shared 未归零(泄漏)");
         assert_eq!(json_u64(&j, "alias_bytes"), 0, "{tag} alias 未归零(泄漏)");
         assert_eq!(json_u64(&j, "mappings"), 0, "{tag} mappings 未归零(泄漏)");

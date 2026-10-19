@@ -36,6 +36,7 @@ use owl_cuda::{DeviceSelector, GpuClient};
 use owl_models::layers::rope::Rope;
 use owl_models::model::{Model, ModelSpec};
 use owl_iface::contract::{DeviceClient, ModelError};
+use owl_iface::handle::{AssetClass, DeviceHandle, Owner};
 
 use crate::graph_fleet::{FleetBoot, GraphFleet};
 use crate::loader::{LoadedModel, ModelLoader, RankModel};
@@ -621,7 +622,10 @@ pub struct EngineConfig {
 }
 
 pub struct Engine<D: DeviceClient> {
-    face: D,
+    /// 设备面(**唯一咽喉**:分配/归还/换层都在这里发事件;见 `iface::handle`)
+    face: DeviceHandle<D>,
+    /// **共享账本单元**(与执行态 store 的 `Rel` 同一本;boot 造、随句柄传)
+    ledger: owl_store::SharedLedger,
     cfg: EngineConfig,
     /// boot 显存快照(准入预算装配的真源;S3b §23.3)
     boot: BootVram,
@@ -676,6 +680,9 @@ fn assemble_budget(
     let runtime_floor = live_now
         .saturating_sub(live_loaded)
         .saturating_sub(kv_pool + gdn_pool + snap_pool + draft_pool);
+    // 中层预算(host/盘):**唯一算式在 store**(`tier_budget_of`)—— boot 造账与
+    // 本处预算入参必须同源(两处各算一遍 = 迟早漂;`Rel::open` 还会交叉校验兜底)。
+    let tier_budget = owl_store::tier_budget_of(cfg.knobs.host_cache_mb, cfg.knobs.snap_host_mb);
     let inputs = owl_store::BudgetInputs {
         v_card_bytes: boot.v_card_bytes as usize,
         weights_bytes: weights as usize,
@@ -685,8 +692,8 @@ fn assemble_budget(
         kv_bytes_per_token: (block_bytes / page).max(1),
         page_tokens: page,
         // 中层总账 = KV 块腿分片 + 状态腿(快照)分片(S2 §25.2)
-        host_bytes: (cfg.knobs.host_cache_mb + cfg.knobs.snap_host_mb) << 20,
-        disk_bytes: 0,
+        host_bytes: tier_budget.host_bytes,
+        disk_bytes: tier_budget.disk_bytes,
         kv_face_bytes: kv_pool as usize,
     };
     let mb = |b: u64| b as f64 / 1048576.0;
@@ -735,25 +742,67 @@ impl Engine<GpuClient> {
 }
 
 impl<D: DeviceClient + 'static> Engine<D> {
-    /// 注入 face(CPU 测试/自定义后端;唯一构造机制,new 是其 GPU 特化)
+    /// 注入 face(CPU 测试/自定义后端;唯一构造机制,`new` 是其 GPU 特化)。
+    ///
+    /// **账本在这里造**(boot 唯一入口):装载/捕获期的分配也要进账 ⇒
+    /// 必须在**任何设备动作之前**拥有账本;窗口侧 store 的 `Rel::open` 拿的是
+    /// 同一本(`into_running` 传入)。
     pub fn on(cfg: EngineConfig, face: D) -> Result<Self> {
+        let ledger = owl_store::shared_ledger(owl_store::tier_budget_of(
+            cfg.knobs.host_cache_mb,
+            cfg.knobs.snap_host_mb,
+        ));
+        Self::on_with_ledger(cfg, face, ledger)
+    }
+
+    /// 注入 face + **指定账本**(TP:两 rank 必须写同一本;测试:预置账本读)。
+    pub fn on_with_ledger(
+        cfg: EngineConfig,
+        face: D,
+        ledger: owl_store::SharedLedger,
+    ) -> Result<Self> {
         // boot 显存快照(准入预算的真源;S3b §23.3)—— 必须在任何池/权重之前取
         let boot = BootVram {
             v_card_bytes: owl_shared::vram::free_bytes(),
             live_at_new: owl_shared::vram::live_bytes(),
         };
-        Self::on_with(cfg, face, boot)
-    }
-
-    fn on_with(cfg: EngineConfig, face: D, boot: BootVram) -> Result<Self> {
         // 注:`[graph] prefill_bucket` 的**真接线在 [`Self::run`]**(桶捕获需要
         // 模型与状态池;静止点律 ⇒ 只在 boot 做)。此处不再拒启(2026-10-15
         // M2b 落地;此前的"配了没实现就拒"临时门已被真接线取代)。
-        Ok(Self { face, cfg, boot })
+        let face = DeviceHandle::new(face, Some(owl_store::ledger_entry(&ledger)));
+        Ok(Self { face, ledger, cfg, boot })
     }
 
-    /// 模型加载器(借用引擎 face;装载即校验,错误在 load 边界落地)
-    pub fn loader(&mut self) -> ModelLoader<'_, D> {
+    /// **续用已有句柄**装配引擎壳(TP:staging 握手要把 face 借出来再装回去;
+    /// 拆装会丢掉上下文与账本身份 ⇒ 必须“接着用”而不是“重包一遍”)。
+    ///
+    /// **契约**:`face` 的事件入口与 `ledger` **必须是同一本账**(单卡由
+    /// [`Self::on_with_ledger`] 保证;TP 由 `adopt_ledger` 保证)。
+    pub(crate) fn from_handle(
+        cfg: EngineConfig,
+        face: DeviceHandle<D>,
+        ledger: owl_store::SharedLedger,
+    ) -> Result<Self> {
+        let boot = BootVram {
+            v_card_bytes: owl_shared::vram::free_bytes(),
+            live_at_new: owl_shared::vram::live_bytes(),
+        };
+        Ok(Self { face, ledger, cfg, boot })
+    }
+
+    /// 本引擎的**账本单元**(TP 接管/诊断面)。
+    pub fn ledger_cell(&self) -> owl_store::SharedLedger {
+        self.ledger.clone()
+    }
+
+    /// 设备面(boot 期上下文设置/诊断面)。
+    pub fn device(&self) -> &DeviceHandle<D> {
+        &self.face
+    }
+
+    /// 模型加载器(借用引擎 face;装载即校验,错误在 load 边界落地)。
+    /// 面类型 = 句柄(`DeviceHandle<D>`)—— 装载期的每一块都进事件账(Weight 类)。
+    pub fn loader(&mut self) -> ModelLoader<'_, DeviceHandle<D>> {
         ModelLoader::new(&mut self.face)
     }
 
@@ -766,18 +815,20 @@ impl<D: DeviceClient + 'static> Engine<D> {
     // A3 同步隔离:引擎单线程模型(每卡一线程);Arc 仅作共享句柄,
     // 不跨线程发送 —— clippy 的 Send+Sync 建议不适用。
     #[allow(clippy::arc_with_non_send_sync)]
-    pub async fn run(self, loaded: LoadedModel) -> Result<RunningEngine<D>> {
+    pub async fn run(self, loaded: LoadedModel) -> Result<RunningEngine<DeviceHandle<D>>> {
         let t_run = std::time::Instant::now();
-        let Engine { face, mut cfg, boot } = self;
+        let Engine { face, ledger, mut cfg, boot } = self;
         let (rm, tokenizer) = loaded.into_parts();
         // 设备侧装配(单卡:tp = None;双 rank 走 `TpEngine` 的同一 `boot_rank`)
         let dev = boot_rank(face, &mut cfg, rm, None, t_run).await?;
-        Ok(into_running(cfg, tokenizer, boot, dev, None)?)
+        Ok(into_running(cfg, tokenizer, boot, dev, None, ledger)?)
     }
 
-    /// **拆件**(TP 双 rank 装配面:face/cfg 同源单持有;S4 ⑤-K2)
-    pub(crate) fn into_parts(self) -> (D, EngineConfig) {
-        (self.face, self.cfg)
+    /// **拆件**(TP 双 rank 装配面:face/cfg/账本同源单持有;S4 ⑤-K2)
+    pub(crate) fn into_parts(
+        self,
+    ) -> (DeviceHandle<D>, EngineConfig, owl_store::SharedLedger) {
+        (self.face, self.cfg, self.ledger)
     }
 
     /// 绑定设备序号(TP 探测面:UUID/BAR1/P2P 按 ordinal 查)
@@ -799,6 +850,7 @@ pub(crate) fn into_running<D: DeviceClient>(
     boot: BootVram,
     dev: RankDev<D>,
     peer: Option<RankDev<D>>,
+    ledger: owl_store::SharedLedger,
 ) -> Result<RunningEngine<D>> {
     // **store 装配(host 半;S3b §23.3)** —— 预算/策略/层布局/快照腿:
     // 单卡与 TP 都**只做一份**(host 账单一)。
@@ -834,6 +886,7 @@ pub(crate) fn into_running<D: DeviceClient>(
                 admission_policy,
                 dev.pool.pool_layout(0),
                 dev.pool.mtp_pool_layout(0),
+                ledger,
             )?;
             // **B-4 驱逐策略装配**(boot 一次;缺省 LRU ⇒ 与历史逐字一致)
             b.rel.set_evict_policy(cfg.knobs.evict_policy.build());
@@ -918,12 +971,12 @@ pub(crate) struct RankDev<D: DeviceClient> {
 /// 命令;staging 的 VMM 握手由调用方在更早完成,见 `tp.rs`)。
 #[allow(clippy::arc_with_non_send_sync)]
 pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
-    mut face: D,
+    mut face: DeviceHandle<D>,
     cfg: &mut EngineConfig,
     rm: RankModel,
     tp: Option<owl_models::module::TpCtx>,
     t_run: std::time::Instant,
-) -> Result<RankDev<D>> {
+) -> Result<RankDev<DeviceHandle<D>>> {
         // **投机深度定形门**(2026-10-16):verify 块 = `depth + 1` 行,而首轮
         // 拼接核的输入槽数是**声明面事实**(`CONCAT_ROWS_SLOTS` = 8)⇒ depth 超界
         // 会在**首个 verify 步**才爆(且那时树已经 pad 到错槽数)。
@@ -1074,7 +1127,12 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
                  视图×XQA 的对接是挂账,不在此刀)—— 本档走 v2 分页 decode"
             );
         }
-        let pool = StatePool::alloc(&mut face, dims, &rm.spec.layer_types, &plan).await?;
+        // **池骨架 = `Pool` 类**(boot 相位;不加这个上下文就会落“未分类”桶 ——
+        // 可见但无用)。作用域 RAII:块分配途中任何早退都会还原上下文。
+        let pool = {
+            let _scope = face.scoped_ctx(Owner::System, AssetClass::Pool);
+            StatePool::alloc(&mut face, dims, &rm.spec.layer_types, &plan).await?
+        };
 
         // **锁①:虚拟化档的池容量硬校验**(2026-10-19;响亮拒,不静默落空槽)。
         //
@@ -1210,7 +1268,8 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
         // vface + extra_faces(pop 消费桶))
         let vface = face.face_clone();
         // E5-M5:fold/propose 桶形图族的 face 句柄(depth × 2)
-        let extra_faces: Vec<D> = (0..2 * spec.depth.max(1) + 2).filter_map(|_| face.face_clone()).collect();
+        let extra_faces: Vec<DeviceHandle<D>> =
+            (0..2 * spec.depth.max(1) + 2).filter_map(|_| face.face_clone()).collect();
         let graphs = GraphFleet::assemble(
             face,
             vface,

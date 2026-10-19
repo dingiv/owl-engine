@@ -117,6 +117,12 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
     // A3 同步隔离:引擎单线程模型;Arc 仅作共享句柄,不跨线程发送。
     #[allow(clippy::arc_with_non_send_sync)]
     pub async fn load_qwen35_0_8b(&mut self, dir: &Path) -> Result<LoadedModel> {
+        // **[相位上下文]装载 = `Weight` 类 + `System` 归属**(RAII:任何早退都还原)
+        let _scope = self.face.scoped_ctx(
+            owl_iface::handle::Owner::System,
+            owl_iface::handle::AssetClass::Weight,
+        );
+
         let (spec, rep) = ModelSpec::from_ckpt(dir, SpecSource::family(&qwen3_5_0_8b()))?;
         log_spec_report("0.8B", &rep);
         let spec = self.shard_spec(spec)?;
@@ -186,6 +192,12 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         head_plan: owl_models::module::QuantPlan,
         quant: owl_models::module::QuantPlan,
     ) -> Result<LoadedModel> {
+        // **[相位上下文]装载 = `Weight` 类 + `System` 归属**(RAII:任何早退都还原)
+        let _scope = self.face.scoped_ctx(
+            owl_iface::handle::Owner::System,
+            owl_iface::handle::AssetClass::Weight,
+        );
+
         // metrics 装载分相(直用 API 恒开;装载一次性路径,release 有数据)
         let _ = owl_shared::metrics::init_metrics(owl_shared::metrics::MetricsStore::new());
         owl_shared::metrics::with_metrics_store(|s| {

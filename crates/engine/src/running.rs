@@ -668,6 +668,66 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 相位定相:**引擎 env + 各 GraphPlan 的 env 快照**同步。
     /// 相位是 perf tag 维度(`interp.host.node.<phase>.<核>`),GraphPlan
     /// 构造期只拿到 env 快照 ⇒ 逐相位显式下发(perf-framework.md §十.3)。
+    /// **设备归属/类别上下文**(生命周期节点 N1/N4/N5)。
+    ///
+    /// 两 rank 一起设(上下文各引擎一份、账本共用):只设 rank0 会让 rank1 的
+    /// 分配归错 owner —— 而这正是"谁占着多少"要回答的问题。
+    pub(crate) fn set_dev_ctx(&mut self, owner: owl_iface::handle::Owner, class: owl_iface::handle::AssetClass) {
+        for dev in std::iter::once(&mut self.dev).chain(self.peer.as_mut()) {
+            let f = dev.graphs.dev_ctx_face_mut();
+            f.set_owner(owner);
+            f.set_class(class);
+        }
+    }
+
+    /// **句柄计数三元组**(诊断面;`/debug/vram`):`(hook_fail, window_unclosed, 窗内块数)`
+    ///
+    /// 判据:三者非零 = 有事件没入账 / 有窗未收 —— **可见**比"账看起来平"更重要。
+    pub fn handle_probe(&self) -> (u64, u64, usize) {
+        self.dev.graphs.dev_ctx_face().ledger_probe()
+    }
+
+    /// **块账房快照(逐 rank)**:`/debug/vram` 与事件账做**全等门**的右值。
+    ///
+    /// 返回逐 rank 的 `Result`(不合并成败):"后端不支持"与"真出错"都如实带出文本,
+    /// 由报告面分别标——**不静默降级成 None**。
+    pub async fn block_ledger_probe(
+        &mut self,
+    ) -> Vec<(u8, std::result::Result<Vec<owl_iface::contract::BlockLedgerRow>, String>)> {
+        #[allow(clippy::type_complexity)]
+        let mut out: Vec<(u8, std::result::Result<Vec<owl_iface::contract::BlockLedgerRow>, String>)> =
+            Vec::new();
+        let ranks: Vec<(u8, &mut RankDev<D>)> = {
+            let mut v: Vec<(u8, &mut RankDev<D>)> = vec![(0, &mut self.dev)];
+            if let Some(p) = self.peer.as_mut() {
+                v.push((1, p));
+            }
+            v
+        };
+        for (rank, dev) in ranks {
+            let r = dev
+                .graphs
+                .dev_ctx_face_mut()
+                .block_ledger_dump()
+                .await
+                .map_err(|e| e.to_string());
+            out.push((rank, r));
+        }
+        out
+    }
+
+    /// **N4 TurnEnd**:turn 收尾后的归属 —— 会话仍活 ⇒ `Session(s)`(它持有 KV/快照
+    /// 与 GDN 行,跨 turn),临时会话焚毁 ⇒ `System`;类别回 `Unclassified`
+    /// (turn 相位结束,后续分配未分类就**可见地**落 Unclassified 桶)。
+    pub(crate) fn set_ctx_after_turn(&mut self, session_id: u64, burned: bool) {
+        let owner = if burned {
+            owl_iface::handle::Owner::System
+        } else {
+            owl_iface::handle::Owner::Session(session_id)
+        };
+        self.set_dev_ctx(owner, owl_iface::handle::AssetClass::Unclassified);
+    }
+
     pub(crate) fn set_phase(&mut self, p: owl_models::env::EvalPhase) {
         self.dev.env.phase = p;
         self.dev.graphs.set_phase(p);

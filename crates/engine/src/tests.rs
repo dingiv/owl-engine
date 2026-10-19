@@ -1888,7 +1888,7 @@ pub async fn gpu_08b_fuse_text_parity() {
     assert_eq!(b1, b2, "fused greedy 跨 boot 确定性");
 }
 
-pub async fn gpu_two_turns_lifecycle(shared: Option<&mut RunningEngine<owl_cuda::GpuClient>>) {
+pub async fn gpu_two_turns_lifecycle(shared: Option<&mut RunningEngine<crate::GpuFace>>) {
     let Some(ordinal) = gpu_ordinal() else {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
@@ -1896,7 +1896,7 @@ pub async fn gpu_two_turns_lifecycle(shared: Option<&mut RunningEngine<owl_cuda:
     let dir = asset_dir();
     // 共享装载(§四.1);None = 单跑自带装载
     let mut own;
-    let running: &mut RunningEngine<owl_cuda::GpuClient> = match shared {
+    let running: &mut RunningEngine<crate::GpuFace> = match shared {
         Some(r) => r,
         None => {
         let mut engine =
@@ -1947,7 +1947,7 @@ pub async fn gpu_two_turns_lifecycle(shared: Option<&mut RunningEngine<owl_cuda:
 /// GPU 门控:同会话连续 turn(S0 验收)—— turn2 应命中账本
 /// (跳过 GDN 重置,只 prefill 增量段);临时会话路径由生命周期
 /// 测试覆盖,此处验 Some(id) 连续性 + 收口账推进。
-pub async fn gpu_session_continuity(shared: Option<&mut RunningEngine<owl_cuda::GpuClient>>) {
+pub async fn gpu_session_continuity(shared: Option<&mut RunningEngine<crate::GpuFace>>) {
     let Some(ordinal) = gpu_ordinal() else {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
@@ -1955,7 +1955,7 @@ pub async fn gpu_session_continuity(shared: Option<&mut RunningEngine<owl_cuda::
     let dir = asset_dir();
     // 共享装载(§四.1);None = 单跑自带装载
     let mut own;
-    let running: &mut RunningEngine<owl_cuda::GpuClient> = match shared {
+    let running: &mut RunningEngine<crate::GpuFace> = match shared {
         Some(r) => r,
         None => {
         let mut engine = Engine::new(EngineConfig {
@@ -2005,7 +2005,7 @@ pub async fn gpu_session_continuity(shared: Option<&mut RunningEngine<owl_cuda::
 /// 旧 OWL_MAX_KV=256 滑窗截断下物理不可过(暗号在窗外)。兼验收:
 /// 4k 预算守卫、分页 prefill 百级 chunk、v1 decode 长程、同会话
 /// turn2(前缀失配回退全量路径 @4k)。
-pub async fn gpu_longctx_4k_prefix_qa(shared: Option<&mut RunningEngine<owl_cuda::GpuClient>>) {
+pub async fn gpu_longctx_4k_prefix_qa(shared: Option<&mut RunningEngine<crate::GpuFace>>) {
     let Some(ordinal) = gpu_ordinal() else {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
@@ -2014,7 +2014,7 @@ pub async fn gpu_longctx_4k_prefix_qa(shared: Option<&mut RunningEngine<owl_cuda
     let seq: usize = owl_shared::env_reader::parse_or("OWL_E2E_SEQ", 4096);
     // 共享装载(§四.1);None = 单跑自带装载
     let mut own;
-    let running: &mut RunningEngine<owl_cuda::GpuClient> = match shared {
+    let running: &mut RunningEngine<crate::GpuFace> = match shared {
         Some(r) => r,
         None => {
         let mut engine = Engine::new(EngineConfig {
@@ -2287,7 +2287,7 @@ pub async fn gpu_w4a16_marlin_e2e() {
 /// GEMM_W4A16_AWQ)+ 图捕获 + 生成。门控 ckpt:27b-awq = 检查点
 /// 目录(models/cyankiwi/Qwen3.8-27B-AWQ-INT4);未设则 skip。
 /// VRAM 预算:权重 ~17.5GB + KV/GDN 状态 ~1.3GB → 3090 Ti 24G。
-pub async fn gpu_awq27b_marlin_e2e(shared: Option<&mut RunningEngine<owl_cuda::GpuClient>>) {
+pub async fn gpu_awq27b_marlin_e2e(shared: Option<&mut RunningEngine<crate::GpuFace>>) {
     let Some(dir) = owl_shared::testkit::resource("ckpt:27b-awq") else {
         eprintln!("skip: ckpt:27b-awq 未设(cyankiwi 检查点目录)");
         return;
@@ -2301,7 +2301,7 @@ pub async fn gpu_awq27b_marlin_e2e(shared: Option<&mut RunningEngine<owl_cuda::G
     let _t0 = std::time::Instant::now();
     // 共享装载(§四.1);None = 单跑自带装载
     let mut own;
-    let running: &mut RunningEngine<owl_cuda::GpuClient> = match shared {
+    let running: &mut RunningEngine<crate::GpuFace> = match shared {
         Some(r) => r,
         None => {
         let mut engine = Engine::new(EngineConfig {
@@ -2365,7 +2365,7 @@ pub async fn gpu_awq27b_marlin_e2e(shared: Option<&mut RunningEngine<owl_cuda::G
 /// ① B 的 turn 前后,A 的块链/账本逐字节不受扰;② A/B 物理块互异
 /// (无前缀缓存时零共享);③ 双会话产出非空。隔离 = 块管理器的
 /// 直接行为证据(块链不同 ⇒ KV 物理槽不同)。
-pub async fn gpu_multi_session_isolation(shared: Option<&mut RunningEngine<owl_cuda::GpuClient>>) {
+pub async fn gpu_multi_session_isolation(shared: Option<&mut RunningEngine<crate::GpuFace>>) {
     let Some(ordinal) = gpu_ordinal() else {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
@@ -2373,7 +2373,7 @@ pub async fn gpu_multi_session_isolation(shared: Option<&mut RunningEngine<owl_c
     let dir = asset_dir();
     // 共享装载(§四.1);None = 单跑自带装载
     let mut own;
-    let running: &mut RunningEngine<owl_cuda::GpuClient> = match shared {
+    let running: &mut RunningEngine<crate::GpuFace> = match shared {
         Some(r) => r,
         None => {
         let mut engine = Engine::new(EngineConfig {
@@ -2453,7 +2453,7 @@ pub async fn gpu_multi_session_isolation(shared: Option<&mut RunningEngine<owl_c
 /// 二轮:A 建档(块链 + 快照登记),B 同前缀 + 异尾 → 块链复用 +
 /// 快照恢复,prefill 只算尾部。机械断言:B 的 prefill chunk 数 ≪ A;
 /// B 块链前缀与 A 物理共享;TTFT 可测下降。
-pub async fn gpu_prefix_cache_hit(shared: Option<&mut RunningEngine<owl_cuda::GpuClient>>) {
+pub async fn gpu_prefix_cache_hit(shared: Option<&mut RunningEngine<crate::GpuFace>>) {
     let Some(ordinal) = gpu_ordinal() else {
         eprintln!("skip: OWL_TEST_DEVICE 未设");
         return;
@@ -2461,7 +2461,7 @@ pub async fn gpu_prefix_cache_hit(shared: Option<&mut RunningEngine<owl_cuda::Gp
     let dir = asset_dir();
     // 共享装载(§四.1);None = 单跑自带装载
     let mut own;
-    let running: &mut RunningEngine<owl_cuda::GpuClient> = match shared {
+    let running: &mut RunningEngine<crate::GpuFace> = match shared {
         Some(r) => r,
         None => {
         let mut engine = Engine::new(EngineConfig {
@@ -2572,7 +2572,7 @@ pub async fn gpu_prefix_cache_hit(shared: Option<&mut RunningEngine<owl_cuda::Gp
 /// greedy(模板已含 thinking-off 空 think 块),验收 = 回答非空 +
 /// 无退化复读(启发式:任意 2-8 字片段连现 4 次即退化)。
 /// 输出全文打印供人工判读;复读启发式是底线门不是质量门。
-pub async fn gpu_27b_chat_inference(shared: Option<&mut RunningEngine<owl_cuda::GpuClient>>) {
+pub async fn gpu_27b_chat_inference(shared: Option<&mut RunningEngine<crate::GpuFace>>) {
     let Some(dir) = owl_shared::testkit::resource("ckpt:27b-awq") else {
         eprintln!("skip: ckpt:27b-awq 未设(cyankiwi 检查点目录)");
         return;
@@ -2585,7 +2585,7 @@ pub async fn gpu_27b_chat_inference(shared: Option<&mut RunningEngine<owl_cuda::
     let ordinal = gpu_ordinal().expect("OWL_TEST_DEVICE");
     // 共享装载(§四.1);None = 单跑自带装载
     let mut own;
-    let running: &mut RunningEngine<owl_cuda::GpuClient> = match shared {
+    let running: &mut RunningEngine<crate::GpuFace> = match shared {
         Some(r) => r,
         None => {
         let mut engine = Engine::new(EngineConfig {
@@ -2688,7 +2688,7 @@ pub async fn gpu_27b_chat_inference(shared: Option<&mut RunningEngine<owl_cuda::
 /// schedule_decision_surface / two_turns_lifecycle / session_continuity /
 /// multi_session_isolation / prefix_cache_hit / longctx_4k_prefix_qa)。
 /// 装载本身即一步测试(构造+装载+装配+捕获态断言+计时)。
-pub async fn boot_08b(max_seq: usize) -> RunningEngine<owl_cuda::GpuClient> {
+pub async fn boot_08b(max_seq: usize) -> RunningEngine<crate::GpuFace> {
     let ordinal = gpu_ordinal().expect("OWL_TEST_DEVICE");
     let dir = asset_dir();
     let t0 = std::time::Instant::now();
@@ -2712,7 +2712,7 @@ pub async fn boot_08b(max_seq: usize) -> RunningEngine<owl_cuda::GpuClient> {
 
 /// **27B 默认档共享装载**(chat_inference / awq27b_marlin_e2e 共用;
 /// 27B 装载 ~24-32s/次,重复装载 = 纯浪费)。
-pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
+pub async fn boot_27b_default() -> RunningEngine<crate::GpuFace> {
     let dir = std::path::PathBuf::from(
         owl_shared::testkit::resource("ckpt:27b-awq").expect("ckpt:27b-awq"),
     );
@@ -2889,7 +2889,7 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
         let prompt = owl_shared::env_reader::str_or("OWL_GATE_PROMPT", "用五十字介绍长城。");
 
         /// **装载一次**(带 MTP 草稿;2026-10-13 用户令:不再每轮重载)
-        async fn boot_gate_engine(ordinal: usize, dir: &str) -> RunningEngine<owl_cuda::GpuClient> {
+        async fn boot_gate_engine(ordinal: usize, dir: &str) -> RunningEngine<crate::GpuFace> {
             let mut knobs = EngineKnobs { sampler_enabled: false, ..Default::default() };
             // 24G 贴顶三旋钮(单会话门不需要多格/多快照/前缀缓存)
             knobs.gdn_slots = 1;
@@ -2928,7 +2928,7 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
 
         /// 单轮(`spec_depth = 0` = 不投机;>0 = 投机)
         async fn round(
-            running: &mut RunningEngine<owl_cuda::GpuClient>,
+            running: &mut RunningEngine<crate::GpuFace>,
             spec_depth: usize,
             prompt: &str,
             tag: &str,
@@ -2996,7 +2996,7 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
             dir: &str,
             ddir: &str,
             max_new: usize,
-        ) -> RunningEngine<owl_cuda::GpuClient> {
+        ) -> RunningEngine<crate::GpuFace> {
             let mut knobs = EngineKnobs { sampler_enabled: false, ..Default::default() };
             knobs.gdn_slots = 1;
             knobs.snap_max = 1;
@@ -3057,7 +3057,7 @@ pub async fn boot_27b_default() -> RunningEngine<owl_cuda::GpuClient> {
         /// 单轮(`spec_depth = 0` = 不投机 baseline;>0 = 投机)。
         /// spec_depth 是 `pub(crate)` 运行时可切字段(exec/spec.rs 每轮读)。
         async fn round(
-            running: &mut RunningEngine<owl_cuda::GpuClient>,
+            running: &mut RunningEngine<crate::GpuFace>,
             spec_depth: usize,
             prompt: &str,
             max_new: usize,
@@ -3438,7 +3438,7 @@ async fn gpu_prefill_bucket_matches_eager() {
         b: PrefillBucket,
         gdn_slots: usize,
         fi_plan_restore: bool,
-    ) -> RunningEngine<owl_cuda::GpuClient> {
+    ) -> RunningEngine<crate::GpuFace> {
         // `EnvProvider::default()` 是 attest=false(诊断 A/B 保留位);生产走
         // `from_config` ⇒ `from_dispatch` 恒真(2026-10-13 用户令)⇒ 本测显式打开。
         let env = owl_models::env::EnvProvider { attn: owl_models::env::AttnEnv { fi: true, ..Default::default() }, ..Default::default() };
@@ -3463,7 +3463,7 @@ async fn gpu_prefill_bucket_matches_eager() {
     }
     let prompt = "长城是中国古代的军事防御工程,用来抵御北方游牧民族的侵袭。".repeat(40);
     async fn gen_session(
-        running: &mut RunningEngine<owl_cuda::GpuClient>,
+        running: &mut RunningEngine<crate::GpuFace>,
         session: Option<u64>,
         prompt: &str,
         n: usize,
@@ -3478,7 +3478,7 @@ async fn gpu_prefill_bucket_matches_eager() {
             }
         }
     }
-    async fn gen(running: &mut RunningEngine<owl_cuda::GpuClient>, prompt: &str, n: usize) -> String {
+    async fn gen(running: &mut RunningEngine<crate::GpuFace>, prompt: &str, n: usize) -> String {
         gen_session(running, None, prompt, n).await
     }
     // ① 桶档

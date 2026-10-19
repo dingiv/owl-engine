@@ -236,7 +236,8 @@ pub fn blocks_json(rows: &[owl_cuda::BlockLedgerRow]) -> Value {
 ///
 /// **判据面**:`owners[]` 里同一 owner 的 `bytes` 逐轮**单调爬坡 = 泄漏**;
 /// 持平 = 正常。`system` 桶 = 尚未接线 owner 的存量调用点(随 N4/N5 排空)。
-pub fn vram_json(r: &owl_store::StoreReport) -> Value {
+pub fn vram_json(snap: &crate::actor::VramSnapshot) -> Value {
+    let r = &snap.report;
     let owners: Vec<Value> = r
         .tiers
         .owners
@@ -306,5 +307,74 @@ pub fn vram_json(r: &owl_store::StoreReport) -> Value {
             "host_free_bytes": r.host_free_bytes,
             "policy": r.policy,
         },
+        // **事件账**(DeviceHandle 钩子的出借登记;第 3 刀)—— 与腿自报/块账房
+        // 互为**独立来源**:三者对不上就是 bug(不是"取其一"的问题)。
+        "events": {
+            "entries": r.events.entries,
+            "bytes": r.events.bytes,
+            "hook_fail": r.events.hook_fail,
+            "rows": r.events.rows.iter().map(|e| json!({
+                "rank": e.rank,
+                "owner": e.owner.label(),
+                "lifecycle": e.owner.is_lifecycle(),
+                "tier": format!("{:?}", e.tier),
+                "kind": format!("{:?}", e.kind),
+                "bytes": e.bytes,
+                "mib": (e.bytes as f64) / (1024.0 * 1024.0),
+                "entries": e.entries,
+            })).collect::<Vec<_>>(),
+        },
+        // **句柄计数**(非零必须能解释:记账失败 / 窗未收)
+        "handle": {
+            "hook_fail": snap.hook_fail,
+            "window_unclosed": snap.window_unclosed,
+            "open_window_blocks": snap.open_window_blocks,
+        },
+        // **对账(全等门)**:事件账 id 集 vs 块账房 id 集,逐 rank。
+        // `only_event` = 账里已销/账外有块(或后端自管块)—— 两者都必须能解释;
+        // `bytes_*` 给量级(不止块数)。
+        "recon": snap.blocks.iter().map(|(rank, r)| recon_json(*rank, r, &r_events(&snap.report))).collect::<Vec<_>>(),
     })
+}
+
+/// 事件账的逐 rank id 集(对账左值)
+fn r_events(rep: &owl_store::StoreReport) -> Vec<(u8, Vec<u64>)> {
+    rep.events.ids.clone()
+}
+
+/// **单个 rank 的对账投影**(纯比较,零决策):
+/// - `only_block`:块账房有、事件账没有 ⇒ 该块**没走 DeviceHandle**(或后端自管,如 peer 面);
+/// - `only_event`:事件账有、块账房没有 ⇒ 已销但块仍在(含"被图租约拒收的 free")或**后端已回收但本层未销**;
+/// - `equal`:两面 id 集逐字相等(= 全等门通过)。
+fn recon_json(
+    rank: u8,
+    dump: &Result<Vec<owl_iface::contract::BlockLedgerRow>, String>,
+    events: &[(u8, Vec<u64>)],
+) -> Value {
+    let ev: Vec<u64> = events
+        .iter()
+        .filter(|(rk, _)| *rk == rank)
+        .flat_map(|(_, ids)| ids.iter().copied())
+        .collect();
+    match dump {
+        Err(e) => json!({"rank": rank, "available": false, "error": e}),
+        Ok(rows) => {
+            let blk: Vec<u64> = rows.iter().map(|r| r.id).collect();
+            let only_event: Vec<u64> = ev.iter().copied().filter(|id| !blk.contains(id)).collect();
+            let only_block: Vec<u64> = blk.iter().copied().filter(|id| !ev.contains(id)).collect();
+            let bytes_blk: usize = rows.iter().map(|r| r.bytes).sum();
+            json!({
+                "rank": rank,
+                "available": true,
+                "blocks": blk.len(),
+                "events": ev.len(),
+                "equal": only_event.is_empty() && only_block.is_empty(),
+                "only_event": only_event.len(),
+                "only_block": only_block.len(),
+                "only_event_ids": only_event.iter().take(16).collect::<Vec<_>>(),
+                "only_block_ids": only_block.iter().take(16).collect::<Vec<_>>(),
+                "block_bytes": bytes_blk,
+            })
+        }
+    }
 }

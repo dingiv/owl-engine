@@ -25,6 +25,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// complete 与 abandon 共用 —— 两路径的清理原 ~20 行双写。
     pub(crate) fn burn_ephemeral(&mut self, session_id: u64) {
         self.bank.burn(session_id);
+        // **[N5 SessionClose]**:会话关闭 ⇒ 归属回 `System`(会话面已交还给
+        //    缓存/池;后续分配没有会话归属可谈)
+        self.set_dev_ctx(
+            owl_iface::handle::Owner::System,
+            owl_iface::handle::AssetClass::Unclassified,
+        );
     }
     pub async fn abandon(&mut self, err: String) -> TurnEvent {
         let turn_id = self.turns.active.as_ref().map(|a| a.id).unwrap_or(0);
@@ -43,6 +49,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             if let Err(e) = self.bank.rel.state.return_row(act.gdn_slot, None) {
                 owl_shared::log_warn!("session", "弃置 turn {} 还 GDN 行失败: {e}", act.id);
             }
+            // **[N4 TurnEnd]**(弃置路径同款:归属下行;须在 act 还在手时取会话事实)
+            self.set_ctx_after_turn(act.session_id, act.ephemeral);
         }
         // 准入账同步(S3b §23.2):turn 生死 = 保留额生死
         self.close_admission(turn_id);
@@ -108,6 +116,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if let Err(e) = self.bank.rel.state.return_row(act.gdn_slot, None) {
             owl_shared::log_warn!("session", "turn {} 还 GDN 行失败: {e}", act.id);
         }
+        // **[N4 TurnEnd]**:归属下行 —— 会话仍活 ⇒ `Session(s)`,焚毁 ⇒ `System`
+        self.set_ctx_after_turn(act.session_id, act.ephemeral);
         // 准入账同步(S3b §23.2):turn 生死 = 保留额生死
         self.close_admission(act.id);
         // **B-3d**:选择层视图态随 turn 收口(视图是 turn 域资源 —— 下一 turn

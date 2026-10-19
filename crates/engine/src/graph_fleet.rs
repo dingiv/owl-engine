@@ -351,6 +351,20 @@ impl<D: DeviceClient> GraphFleet<D> {
         self.session.face_clone()
     }
 
+    /// **设备上下文面**(生命周期节点 N1/N4/N5 用):主会话图的 face。
+    ///
+    /// 为什么改这一个就够:`DeviceHandle` 的 owner/class 上下文是 `Arc<Mutex<..>>`
+    /// **共享**的(face_clone 出来的句柄与本体同源)⇒ 图族每张图各持一个句柄,
+    /// 但设一次即全族生效(逐个设 = 漏设的温床)。
+    pub(crate) fn dev_ctx_face_mut(&mut self) -> &mut D {
+        self.session.face_mut()
+    }
+
+    /// 主会话图 face 的只读面(诊断计数:`hook_fail`/窗栈)
+    pub(crate) fn dev_ctx_face(&self) -> &D {
+        self.session.face_ref()
+    }
+
     /// main 侧签名(V1c 宿主标量槽):额外返回 FI 断点臂的 `ctx_total` 槽
     async fn plan_session(
         face: D,
