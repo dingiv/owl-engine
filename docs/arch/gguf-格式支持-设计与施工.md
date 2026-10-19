@@ -1181,3 +1181,62 @@ W-2a(vec_dot 复用)     78.0 t/s      流量 ÷16,露出算术墙(≈4.4 TFLOPS
 W-2b(自研 smem 臂)    121.4 t/s      每窗解量化一次(≈6.6 TFLOPS)
 W-2c(官方 MMQ·dp4a)   335.1 t/s      大 token 窗 + dp4a int8 点积   ← 现役
 ```
+
+---
+
+## 十九、W-2d 立案:port 官方 **dequant + cuBLAS** 臂(2026-10-19;用户裁决"直接 port")
+
+### 19.1 为什么必须 port 这条(而不是继续调 MMQ)
+
+同工具(std,单 3090 Ti,同文件)实测:**owl 364 t/s vs llama.cpp 1211 t/s**
+(稳态边际 362 vs **1374 t/s**)。而 llama.cpp 在 `ne11 ≥ 64` 时**根本不走 MMQ**
+(`ggml_cuda_mul_mat` 分派,`mmq.cu:ggml_cuda_should_use_mmq`):
+NVIDIA 上 MMQ 条件 = `ne11 < MMQ_DP4A_MAX_BATCH_SIZE(64)`;`-ub` 默认 512 ⇒
+prefill 走 **`ggml_cuda_op_mul_mat_cublas`**。
+
+### 19.2 上游同代源码事实(`llama.cpp@1b1e27cb49`,`ggml-cuda.cu:1250`)
+
+```cpp
+// ldc == dst 的行数(cuBLAS 写列主序)
+int64_t ldc = id == ctx.device ? ne0 : row_diff;
+// ① 权重**整块**反量化成 f16 进 pool(粒度 = src0 行窗 row_diff,由外层 split 定)
+to_fp16_cuda(src0_dd_i, src0_as_f16.get(), row_diff*ne00, stream);
+// ② 一次 cublasGemmEx:C^cm[row_diff, src1_ncols] = op(src0)·src1
+cublasGemmEx(..., CUBLAS_OP_T, CUBLAS_OP_N,
+             row_diff, src1_ncols, ne10,
+             &alpha_f16, src0_ptr, CUDA_R_16F, ne00,
+                         src1_ptr, CUDA_R_16F, ne10,
+             &beta_f16,  dst_f16.get(), CUDA_R_16F, ldc,
+             CUBLAS_COMPUTE_16F,                 // ★ f16 累加(不是 f32)
+             CUBLAS_GEMM_DEFAULT_TENSOR_OP);     // ★ 张量核
+```
+
+三条关键(照抄,别"优化"):
+1. **`CUBLAS_COMPUTE_16F`** —— 上游这条路的累加也是 f16(精度换速度);
+2. **`CUBLAS_GEMM_DEFAULT_TENSOR_OP`**;
+3. 权重反量化粒度 = **src0 行窗**(外层 split 按显存预算定),不是按 k 切。
+
+### 19.3 owl 侧要补的两个**引擎机制**(本刀真正的工作量)
+
+我们的 op 模型里,一个核**总是自己分配输出块**(`alloc_out`),而这条路要求
+"**多个 tile 写进同一个 y 的不同列窗**" ⇒ 缺两块拼图:
+
+| # | 机制 | 形态 | 工作量 |
+|---|---|---|---|
+| M1 | **无清零分配**(scratch) | `Op::Uninit`(tensor.rs 工厂 + eval 臂 + reference 桩);slab 复用保证峰值 = 1-2 个块 | 小 |
+| M2 | **写入既有块**(dest = 父) | `Op::CallDst`(parents[0] = dst;eval 返回 `ins[0].clone()` 并 `track_alias`;`lower_kernel` 的末位 out 槽就是它) | 小 |
+
+有了 M1/M2,整条臂就是**纯声明**:
+`y = Uninit([m, out]);for tile: { s = Uninit([R,k]); dequant_range(w, s, n0); CallDst(y, cublas_dst(x, s, off=n0, ldc=out)) }`。
+
+### 19.4 落地清单(下一刀,逐条)
+
+1. `Op::Uninit` + `Op::CallDst`(+ 各自的 CPU reference 桩与单测);
+2. `owl_gguf_dequant_range_<ty>`(行窗 `[n0, n0+R)` → f16 `[R,k]`;复用
+   `gguf.cuh::dequantize_block_*`,与既有 `owl_gguf_dequant_rows_*` 同构、去掉 ids);
+3. `cublas_gemm_f16_dst`(新名,槽序加 `ldc`/`off`;server 家族分派同 `GEMM_F16`);
+   `CUBLAS_COMPUTE_16F` + `DEFAULT_TENSOR_OP` **照 19.2**;
+4. `linear.rs` 分派:`m ≥ 64` → 本臂(R 由 scratch 预算定,默认 512 行 ≈ 17.8 MB);
+   `8..63` → MMQ(现 335);`≤ 7` → MMVQ;`ssm_out`(A2 表)→ smem 回退;
+5. 门:vs MMVQ `max|Δ|/max < 3e-2`(f16 累加比 f32 累加宽一档)、首 token、
+   **llm_speedtest std 同工具**(验收:avg ≥ 1100 t/s,TTFT@8192 ≤ 7 s)。
