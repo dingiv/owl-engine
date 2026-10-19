@@ -50,6 +50,15 @@ fn gguf_cublas_arm_enabled() -> bool {
     !matches!(std::env::var("OWL_GGUF_CUBLAS").as_deref(), Ok("0"))
 }
 
+/// **head 版 int8-MMA MMQ 的最小 token 数**(W-2f)。J=64 打底 ⇒ `m ≥ 64`;
+/// 更小的批留在 cuBLAS/MMQ(dp4a)/复用臂。
+pub(crate) const GGUF_MMQ2_MIN_M: usize = 64;
+
+/// int8-MMA MMQ 开关(诊断/对拍;缺省开)。`OWL_GGUF_MMQ2=0` ⇒ 回退 cuBLAS 臂。
+fn gguf_mmq2_arm_enabled() -> bool {
+    !matches!(std::env::var("OWL_GGUF_MMQ2").as_deref(), Ok("0"))
+}
+
 /// **官方 MMQ 的最小 token 数**(W-2c)。
 ///
 /// 上游的批分界:MMVQ 用于小批、MMQ 用于大批(`MMVQ_MAX_BATCH_SIZE = 8`)。
@@ -111,6 +120,43 @@ pub(crate) fn gguf_quant_gemm(
         }
         other => (xs, other),
     };
+    // **head 版 int8-MMA MMQ**(W-2f;§21 之后的唯一大杠杆):权重块字节直读 +
+    // 激活量化成 `block_q8_1_mmq` ⇒ `mma.sync.m16n8k16.s8`。
+    //
+    // 为什么排在 cuBLAS 臂之前:同机同形状实测本臂 **103 TFLOPS 等效**
+    // (llama.cpp)对 cuBLAS 的 66,而且**省掉"权重→f16 解量化"那 10.4%**
+    // (设计 §21.2)。`OWL_GGUF_MMQ2=0` 一键回退。
+    if m >= GGUF_MMQ2_MIN_M
+        && xs.dtype == Dtype::F16
+        && col_index.is_none()
+        && gguf_mmq2_arm_enabled()
+        && owl_kernels::family::gguf::mmq2_ok(ty, m, out_dim, k)
+    {
+        use owl_kernels::family::gguf as famg;
+        let quant = if famg::mmq2_quant_entry_for(ty) == Some(famg::MMQ2_QUANT_DS4) {
+            SemanticKernel::GgufMmq2QuantDs4
+        } else {
+            SemanticKernel::GgufMmq2QuantD4
+        };
+        // 激活 → q8_1_mmq([k/128][token] × 144B;展平成 U8 二秩)
+        let xq = TensorOps::call(quant)
+            .arg(xs)
+            .arg_i32(m as i32)
+            .arg_i32(k as i32)
+            .aux(&[m, k])
+            .with_shape(
+                Dtype::U8,
+                vec![k / famg::MMQ2_QK, m * famg::MMQ2_Q8_1_BLOCK_BYTES],
+            );
+        return TensorOps::call(SemanticKernel::GgufMmq2)
+            .arg(&w.decl())
+            .arg(&xq)
+            .arg_i32(out_dim as i32)
+            .arg_i32(m as i32)
+            .arg_i32(k as i32)
+            .aux(&[ty.code() as usize, m, out_dim])
+            .with_shape(Dtype::F16, vec![m, out_dim]);
+    }
     // **dequant + cuBLAS 臂**(W-2d;llama.cpp 的 prefill 正路 —— 见设计 §十九)
     //
     // 形态(与上游同构):把权重按**行窗**反量化成 f16 scratch,再逐窗 cuBLAS

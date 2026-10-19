@@ -805,6 +805,165 @@ mod tests {
         eprintln!("[gguf-gather] ③ 位级绿:GEMM 输出 {m}×{rows} 全同 ⇒ 分派可无缝切路");
     }
 
+    /// **head 版 int8-MMA MMQ 门**(W-2f;2026-10-19)。
+    ///
+    /// 三判据:
+    /// ① **激活量化逐字节**:`owl_mmq2_quant_*` vs host 参考([k/128][token] × 144B,
+    ///    ds4/d4 按型)—— 布局一旦错位 ⇒ 数值门会给垃圾,但这条先钉"错在哪"。
+    /// ② **数值**:MMQ2 臂 vs **cuBLAS 臂**(f16 输入 × f32 累加,参考更准)
+    ///    4B+27B 真实张量 × m=128/512,判据 2e-2(§19.5 同口径)。
+    /// ③ 「q 窗 J」覆盖:`m=128` 走 J=128,`m=64` 走 J=64 两档都跑。
+    #[owl_test(gpu)]
+    async fn gpu_gguf_mmq2_matches_cublas() {
+        use owl_kernels::family::gguf as famg;
+        if !resource_ok("gguf:4b") {
+            eprintln!("skip: 资源清单缺 \"gguf:4b\"");
+            return;
+        }
+        let mut gpu = crate::testkit::gpu_client().await;
+        for (res_key, cases) in [
+            ("gguf:4b", &[
+                ("blk.0.attn_gate.weight", "Q4_K"),
+                ("blk.0.ssm_out.weight", "Q8_0"),
+                ("blk.0.attn_qkv.weight", "Q6_K"),
+                ("blk.3.attn_k.weight", "Q5_K"),
+            ][..]),
+            ("gguf:27b", &[
+                ("blk.0.ffn_down.weight", "Q4_K"),
+                ("blk.0.attn_gate.weight", "Q8_0"),
+            ][..]),
+        ] {
+            if !resource_ok(res_key) {
+                eprintln!("skip: 资源清单缺 \"{res_key}\"");
+                continue;
+            }
+            let g = Gguf::open(&PathBuf::from(resource(res_key).expect("列了就有"))).expect("open");
+            for (tname, want_ty) in cases.iter().copied() {
+                let ti = g.get_tensor(tname).unwrap_or_else(|| panic!("缺张量 {tname}"));
+                let bytes = g.bytes(g.index_of(tname).unwrap());
+                let (rows, inner) = (ti.rows() as usize, ti.inner() as usize);
+                let (be, bb) = ti.ty.block();
+                let row_bytes = inner / be * bb;
+                assert!(inner % famg::MMQ2_QK == 0 && rows % famg::MMQ2_I == 0, "{tname} 形状不进本门");
+                let ty = famg::ALL
+                    .iter()
+                    .copied()
+                    .find(|t| t.name() == want_ty)
+                    .unwrap_or_else(|| panic!("未知型 {want_ty}"));
+                let wblk = TensorOps::from_host(Dtype::U8, vec![rows, row_bytes], bytes);
+                for m in [64usize, 128, 512] {
+                    let xv: Vec<f32> = (0..m * inner)
+                        .map(|i| {
+                            half::f16::from_f32(((i as f32 * 0.0097).cos() * 1.5).clamp(-2.5, 2.5))
+                                .to_f32()
+                        })
+                        .collect();
+                    let xb: Vec<u8> =
+                        xv.iter().flat_map(|v| half::f16::from_f32(*v).to_le_bytes()).collect();
+                    let x = TensorOps::from_host(Dtype::F16, vec![m, inner], &xb);
+
+                    // ---- ① 激活量化 vs host 参考(逐字节) ----
+                    let ds4 = famg::mmq2_quant_entry_for(ty) == Some(famg::MMQ2_QUANT_DS4);
+                    let qk = famg::MMQ2_QUANT_DS4;
+                    let quant = if ds4 {
+                        TensorOps::call(SemanticKernel::GgufMmq2QuantDs4)
+                    } else {
+                        TensorOps::call(SemanticKernel::GgufMmq2QuantD4)
+                    };
+                    let xq = quant
+                        .arg(&x)
+                        .arg_i32(m as i32)
+                        .arg_i32(inner as i32)
+                        .aux(&[m, inner])
+                        .with_shape(Dtype::U8, vec![inner / famg::MMQ2_QK, m * famg::MMQ2_Q8_1_BLOCK_BYTES]);
+                    let got = dtoh_raw(&mut gpu, &xq, famg::mmq2_xq_bytes(m, inner), "mmq2-xq").await;
+                    let mut want = vec![0u8; got.len()];
+                    let nkb = inner / famg::MMQ2_QK;
+                    for kb in 0..nkb {
+                        for row in 0..m {
+                            let base = (kb * m + row) * famg::MMQ2_Q8_1_BLOCK_BYTES;
+                            for g4 in 0..4 {
+                                let off = kb * famg::MMQ2_QK + g4 * 32;
+                                let blk = &xv[row * inner + off..row * inner + off + 32];
+                                let amax = blk.iter().fold(0f32, |a, v| a.max(v.abs()));
+                                let d = if amax > 0.0 { amax / 127.0 } else { 0.0 };
+                                let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+                                let sum: f32 = blk.iter().sum();
+                                if ds4 {
+                                    want[base + g4 * 4..base + g4 * 4 + 2]
+                                        .copy_from_slice(&half::f16::from_f32(d).to_le_bytes());
+                                    want[base + g4 * 4 + 2..base + g4 * 4 + 4]
+                                        .copy_from_slice(&half::f16::from_f32(sum).to_le_bytes());
+                                } else {
+                                    want[base + g4 * 4..base + g4 * 4 + 4]
+                                        .copy_from_slice(&d.to_le_bytes());
+                                }
+                                for (j, v) in blk.iter().enumerate() {
+                                    want[base + 16 + g4 * 32 + j] = (v * inv).round() as i8 as u8;
+                                }
+                            }
+                        }
+                    }
+                    let ndiff = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+                    assert_eq!(
+                        ndiff, 0,
+                        "{tname}({want_ty}, m={m}): q8_1_mmq 与 host 参考分歧 {ndiff} 字节(布局/公式错)"
+                    );
+                    let _ = qk;
+                    if std::env::var("OWL_MMQ2_Q_ONLY").is_ok() {
+                        eprintln!("[gguf-mmq2] ① 位级绿({tname}, {want_ty}, m={m})");
+                        continue;
+                    }
+
+                    // ---- ② 数值:MMQ2 vs cuBLAS 臂 ----
+                    let y2 = TensorOps::call(SemanticKernel::GgufMmq2)
+                        .arg(&wblk)
+                        .arg(&xq)
+                        .arg_i32(rows as i32)
+                        .arg_i32(m as i32)
+                        .arg_i32(inner as i32)
+                        .aux(&[ty.code() as usize, m, rows])
+                        .with_shape(Dtype::F16, vec![m, rows]);
+                    let got2 = harvest_f16(&mut gpu, &y2).await;
+                    // 参考 = 先解量化全窗再 cuBLAS(f32 累加)
+                    let s = TensorOps::uninit(Dtype::F16, vec![rows, inner]);
+                    let dq = TensorOps::call_dst(&s, SemanticKernel::GgufCvtRange)
+                        .arg(&wblk)
+                        .arg_i32(0)
+                        .arg_i32(rows as i32)
+                        .arg_i32(inner as i32)
+                        .aux(&[ty.code() as usize, rows, inner])
+                        .with_shape(Dtype::F16, vec![rows, inner]);
+                    let yref = TensorOps::call(SemanticKernel::GgufCublasDst)
+                        .arg(&x)
+                        .arg(&dq)
+                        .arg_usize(rows)
+                        .arg_usize(inner)
+                        .arg_usize(m)
+                        .arg_usize(1)
+                        .arg_usize(rows)
+                        .arg_usize(0)
+                        .with_shape(Dtype::F16, vec![m, rows]);
+                    let r = harvest_f16(&mut gpu, &yref).await;
+                    let scale = r.iter().fold(0f64, |a, v| a.max((*v as f64).abs())).max(1e-12);
+                    let mut maxd = 0f64;
+                    let mut worst = 0usize;
+                    for (i, (a, b)) in got2.iter().zip(&r).enumerate() {
+                        let d = (*a as f64 - *b as f64).abs() / scale;
+                        if d > maxd {
+                            maxd = d;
+                            worst = i;
+                        }
+                    }
+                    eprintln!(
+                        "[gguf-mmq2] {tname}({want_ty}, {m}×{inner}) MMQ2 vs cuBLAS: max|Δ|/max = {maxd:.3e} @ {worst}"
+                    );
+                    assert!(maxd < 2e-2, "{tname}(m={m}) 超阈 {maxd:.3e}");
+                }
+            }
+        }
+    }
+
     /// 型名 → ggml 型码(用例表写法;与 `family::gguf::entry_for` 同一词表)
     fn want_ty_code(name: &str) -> usize {
         use owl_kernels::family::gguf::ALL;

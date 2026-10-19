@@ -224,6 +224,13 @@ pub enum SemanticKernel {
     /// cuBLAS/MMQ 臂(此前只能退回自研 tile 臂;
     /// 见设计 §19.5 定位 ①)
     GgufGatherCols,
+    /// **GGUF int8-MMA MMQ**(W-2f;head 版 llama.cpp):权重块字节直读 +
+    /// q8_1_mmq 激活 → f16 —— 走 `mma.sync.m16n8k16.s8`(sm80+ int8 张量核)
+    GgufMmq2,
+    /// 同上:**激活量化** f16 → `block_q8_1_mmq`(DS4 布局;Q4_K/Q5_K)
+    GgufMmq2QuantDs4,
+    /// 同上(D4 布局;Q8_0/Q6_K)
+    GgufMmq2QuantD4,
     /// **GGUF 行窗解量化**(W-2d):量化块行窗 `[n0, n0+rows)` → f16 `[rows, k]`
     /// (写进调用方给的 scratch;配 `Op::CallDst`)
     GgufCvtRange,
@@ -344,6 +351,9 @@ impl SemanticKernel {
             SemanticKernel::GgufGemmTile => "gguf.gemm_tile",
             SemanticKernel::GgufGemmSmem => "gguf.gemm_smem",
             SemanticKernel::GgufMmq => "gguf.mmq",
+            SemanticKernel::GgufMmq2 => "gguf.mmq2",
+            SemanticKernel::GgufMmq2QuantDs4 => "gguf.mmq2_quant_ds4",
+            SemanticKernel::GgufMmq2QuantD4 => "gguf.mmq2_quant_d4",
             SemanticKernel::GgufCvtRange => "gguf.dequant_range",
             SemanticKernel::GgufGatherCols => "gguf.gather_cols",
             SemanticKernel::GgufCublasDst => "cublas.gemm_f16_dst",

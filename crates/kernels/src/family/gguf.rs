@@ -294,6 +294,118 @@ pub const QUANT_ACT_F16_TILED: &str = "owl_gguf_quant_act_f16_tiled";
 /// 同上,bf16 入
 pub const QUANT_ACT_BF16_TILED: &str = "owl_gguf_quant_act_bf16_tiled";
 
+// ---- **head 版 int8-MMA MMQ**(W-2f;设计 §二十二)----------------------------
+//
+// 与 §十八 的 `../vendor/mmq.cu`(2024-05 同代,dp4a)根本差别:本臂走
+// `mma.sync.m16n8k16.s8`(sm80+ 的 int8 张量核)⇒ 同机实测 103 TFLOPS 等效
+// (llama.cpp 同形状),且**零权重搬运**(不吃 dequant→f16)。
+pub const MMQ2_SRC: &str = "cu/gguf/gguf_mmq2.cu";
+
+/// 激活量化 f16 → `block_q8_1_mmq`(DS4 布局:Q4_K/Q5_K —— 要 sum 抵 min)
+pub const MMQ2_QUANT_DS4: &str = "owl_mmq2_quant_q8_1_ds4";
+/// 同上(D4 布局:Q8_0/Q6_K)
+pub const MMQ2_QUANT_D4: &str = "owl_mmq2_quant_q8_1_d4";
+
+/// `owl_mmq2_q8_0_j64`(J = 每 CTA 的 token 窗)
+pub const MMQ2_Q8_0_J64: &str = "owl_mmq2_q8_0_j64";
+/// 同上(J=128)
+pub const MMQ2_Q8_0_J128: &str = "owl_mmq2_q8_0_j128";
+/// Q4_K / J=64
+pub const MMQ2_Q4K_J64: &str = "owl_mmq2_q4k_j64";
+/// Q4_K / J=128
+pub const MMQ2_Q4K_J128: &str = "owl_mmq2_q4k_j128";
+/// Q5_K / J=64
+pub const MMQ2_Q5K_J64: &str = "owl_mmq2_q5k_j64";
+/// Q5_K / J=128
+pub const MMQ2_Q5K_J128: &str = "owl_mmq2_q5k_j128";
+/// Q6_K / J=64
+pub const MMQ2_Q6K_J64: &str = "owl_mmq2_q6k_j64";
+/// Q6_K / J=128
+pub const MMQ2_Q6K_J128: &str = "owl_mmq2_q6k_j128";
+
+/// 每 CTA 的权重行数(上游 ampere 档 `I = 128`;分派门要求 `n % I == 0`)
+pub const MMQ2_I: usize = 128;
+/// 每 CTA 线程数(上游 `nthreads = 256`,occupancy 1)
+pub const MMQ2_THREADS: usize = 256;
+/// 激活块:`block_q8_1_mmq` 字节数(16B 头 + 128 int8)
+pub const MMQ2_Q8_1_BLOCK_BYTES: usize = 144;
+/// 激活块覆盖的 k 宽(元素)
+pub const MMQ2_QK: usize = 128;
+/// smem 的 X 面字节(X tile:I × sram_stride × 4;四种型的 sram_stride 都是 76)
+pub const MMQ2_SMEM_X: usize = MMQ2_I * 76 * 4;
+
+/// 型 → (量化入口, MMQ 入口 J64/J128);`None` = 本臂未移植
+pub const fn mmq2_entry_for(ty: GgmlTy, m: usize) -> Option<&'static str> {
+    let (e64, e128) = match ty {
+        GgmlTy::Q8_0 => (MMQ2_Q8_0_J64, MMQ2_Q8_0_J128),
+        GgmlTy::Q4K => (MMQ2_Q4K_J64, MMQ2_Q4K_J128),
+        GgmlTy::Q5K => (MMQ2_Q5K_J64, MMQ2_Q5K_J128),
+        GgmlTy::Q6K => (MMQ2_Q6K_J64, MMQ2_Q6K_J128),
+        _ => return None,
+    };
+    Some(if m >= MMQ2_I { e128 } else { e64 })
+}
+
+/// 型 → 激活量化入口(DS4 = Q4_K/Q5_K;D4 = Q8_0/Q6_K)
+pub const fn mmq2_quant_entry_for(ty: GgmlTy) -> Option<&'static str> {
+    match ty {
+        GgmlTy::Q4K | GgmlTy::Q5K => Some(MMQ2_QUANT_DS4),
+        GgmlTy::Q8_0 | GgmlTy::Q6K => Some(MMQ2_QUANT_D4),
+        _ => None,
+    }
+}
+
+/// 本臂适用门(单一产地;`linear.rs` 与门/测试同读这一份):
+/// ① 型已移植 ② `m ≥ 64`(小批仍给 MMVQ/复用臂)
+/// ③ `n % 128 == 0`(上游 `I=128`,首版**不装 fallback**)
+/// ④ `k % 128 == 0`(激活块 128 值)
+pub const fn mmq2_ok(ty: GgmlTy, m: usize, n: usize, k: usize) -> bool {
+    mmq2_entry_for(ty, m).is_some()
+        && m >= 64
+        && n % MMQ2_I == 0
+        && k % MMQ2_QK == 0
+}
+
+/// 激活缓冲字节数(`[k/128][n_token]` × 144B)
+pub const fn mmq2_xq_bytes(m: usize, k: usize) -> usize {
+    (k / MMQ2_QK) * m * MMQ2_Q8_1_BLOCK_BYTES
+}
+
+/// **MMQ 发射几何**(上游 stream-k 支的"一 tile/block"形态):
+/// `grid = (ceil(n/I)·ceil(m/J), 1, 1)`、`block = (32, THREADS/32)`、
+/// `smem = J·4(ids) + X 面 + PAD(J·144, THREADS·4)`。
+pub fn mmq2_geom(m: usize, n: usize, j: usize) -> ((u32, u32, u32), (u32, u32, u32), u32) {
+    // ⚠️ 一维 grid:`ntiles = nty·ntx`(上游 stream-k 支在 tiles 效率 ≥90% 的形态 ——
+    // 每 block 恰一个 tile、无 fixup)。核内用 blockIdx.x 走线性 tile 解码。
+    let nty = n.div_ceil(MMQ2_I).max(1);
+    let ntx = m.div_ceil(j).max(1);
+    let gx = (nty * ntx) as u32;
+    let gy = 1u32;
+    let block = (32u32, (MMQ2_THREADS / 32) as u32, 1u32);
+    ((gx, gy, 1), block, mmq2_smem(j) as u32)
+}
+
+/// smem 字节(与 `vendor2/mmq.cuh::mmq_get_nbytes_shared` 逐项同式;
+/// 单测 `mmq2_smem_matches_formula` 钉住)
+pub const fn mmq2_smem(j: usize) -> usize {
+    let nbs_ids = j * 4;
+    let nbs_y = j * MMQ2_Q8_1_BLOCK_BYTES;
+    let pad_to = MMQ2_THREADS * 4;
+    nbs_ids + MMQ2_SMEM_X + nbs_y.div_ceil(pad_to) * pad_to
+}
+
+/// J 档(分派用;与 `mmq2_entry_for` 同一判据)
+pub const fn mmq2_j(m: usize) -> usize {
+    if m >= MMQ2_I { 128 } else { 64 }
+}
+
+/// **激活量化的几何**:`grid = (n_tokens, ceil(k/(4·BLK)), 1)`、`block = (BLK,1,1)`
+pub fn mmq2_quant_geom(m: usize, k: usize) -> ((u32, u32, u32), (u32, u32, u32)) {
+    const BLK: usize = 128;
+    let gy = k.div_ceil(4 * BLK).max(1) as u32;
+    ((m.max(1) as u32, gy, 1), (BLK as u32, 1, 1))
+}
+
 // ---- **行窗解量化**(W-2d;dequant+cuBLAS 臂的喂料手)--------------------------
 /// `owl_gguf_dequant_range_q8_0`
 pub const RANGE_Q8_0: &str = "owl_gguf_dequant_range_q8_0";

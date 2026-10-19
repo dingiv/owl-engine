@@ -1517,3 +1517,59 @@ nvcc -DGGML_CUDA_USE_GRAPHS -DGGML_SCHED_MAX_COPIES=4 \
 - **`ggml_cuda_info()`**:我们按 H2 改成**boot 期常量**(cc=86 + smem 上限),沿用 §18 的壳思路;
 - **数值**:int8 MMA 的 d/s 布局与 q8_1 不同 ⇒ 参考臂只能对 **cuBLAS 臂**(f16 输入,更准)
   给 allclose,不给位级门;判据沿用 §19.5 的 2e-2 口径。
+
+### 22.5 W-2f 落地实录(2026-10-19):**prefill std avg 964 → 1504.7(+56%),已超 llama.cpp**
+
+按 §22.3 全落地。**三处登记补丁**(`vendor2/README.md` 有表):
+
+| # | 补丁 | 原因 |
+|---|---|---|
+| P1 | `mul_mat_q`:`__launch_bounds__(...) static __global__` → `static __device__ __forceinline__` | fatbin 构建只出**设备码**(宿主函数永不执行)⇒ 入口必须由本仓 `extern "C" __global__` wrapper 提供;`launch_bounds(256,1)` 搬到 wrapper(与上游 ampere 档 `nthreads=256/occupancy=1` 同) |
+| P2 | 内核 + `write_back_{mma,dp4a}` + `process_tile` 的 `dst`:`float*` → `__half*`(+`__float2half`) | 本仓输出 f16 `[m,n]` 行主序,布局与上游 `dst[col*stride+row]` **逐位相同** ⇒ 省 f32 中间缓冲(§十八 同款) |
+| P3 | (无需改)StreamK:取上游"tiles 效率 ≥90%"形态 —— 一维 `grid=ntiles`、`tmp_fixup=nullptr` | 零 fixup 核、零新机制 |
+
+**本仓新增**(非 vendored):
+
+1. **激活量化** `owl_mmq2_quant_q8_1_{ds4,d4}`(f16 → `block_q8_1_mmq`,144 B/128 值)。
+   **布局定谳**:`y[(k/128)·n_token + token] = {d4[4] | ds4[4]} , int8 qs[128]` —— 块内是
+   **k 序**(无块内转置),"转置"只在**外层** [k_block][token];DS 布局按型
+   (Q4_K/Q5_K = DS4 带 `sum`,`Q8_0/Q6_K = D4`)。上游那支吃 **f32** 且是 `__global__`
+   ⇒ 按其布局逐式重写为 f16 入。**门:与 host 参考逐字节相同**(全型 × m=64/128/512)。
+2. **8 个 wrapper**(type × J ∈ {64,128})。J 的选择:`m ≥ 128` ⇒ J=128,否则 64;
+   `fallback` 恒 false(`n % 128 == 0` 是分派门)。
+3. **fastdiv 设备版**:上游 `init_fastdiv_values` 是 host-only ⇒ 同式设`(mp, L, d)`。
+4. **`stride_row_x` 单位定谳**:是**块数**(`k/qk`)**不是字节** ——
+   `bxi = (block_q4_K*)x + kbx0 + i*stride` 且 `offset_x = it*I*stride_row_x`
+   当块偏移传进装载器(与 `mmvq.cu` 的 `off = (…+i*stride_row_x+…)*bs` 同口径)。
+   首跑 ILLEGAL_ADDRESS 就是这里(误传 `row_bytes`)。
+5. **smem**:`J·4(ids) + I·sram_stride·4(38912,X 面) + PAD(J·144, 1024)`
+   ⇒ J=64: 48 384 B / J=128: 57 856 B(>48 KB,走既有 opt-in 通道)。
+
+**门(全绿)**
+
+| 门 | 判据 | 结果 |
+|---|---|---|
+| `gpu_gguf_mmq2_matches_cublas` ① | q8_1_mmq vs host 参考**逐字节** | 0 字节分歧(4B 四型 + 27B, m=64/128/512)|
+| 同上 ② | MMQ2 vs **cuBLAS 臂**(f16×f32 累加) | `1.3e-3 ~ 1.0e-2`(< 2e-2;覆盖 k=17408 的 27B `ffn_down`)|
+| `gpu_gguf_27b_smoke`(e2e) | 首 token / prompt ids / 24 token 文本 / 图捕获 | 首 token **" Paris"**(与 llama.cpp 同)· ids 逐值同 · 文本连贯 · `Captured` ✅ |
+| `owl-models --lib gguf` 全卷 | — | 39/39 ✅ |
+
+**实测(`llm_speedtest std` 五点三轮,3090 Ti 41:00.0,chunk 1024,出厂 flavor)**
+
+| prompt | llama.cpp(同工具) | owl **W-2d**(cuBLAS) | owl **W-2f**(int8 MMA) |
+|---:|---:|---:|---:|
+| 512 | 979 | 833 | **1450** |
+| 1024 | 1247 | 1005 | **1531** |
+| 2048 | 1348 | 1122 | **1527** |
+| 4096 | 1369 | 1170 | **1519** |
+| 8192 | 1383 | 1159 | **1496** |
+| **avg** | **1265** | **964** | **1504.7(+56% vs W-2d,+19% vs llama.cpp)** |
+| decode | 41.2 | 36.6 | 36.6(不动,`m=1` 不走本臂)|
+| TTFT@8192 | 6356 ms | 7040 | **5465 ms** |
+
+**为什么能超**:int8 MMA 的 matmul 有效算力 103 TFLOPS(§21.1)对 cuBLAS
+(f16×f32 累加)66 的 1.56×;**且权重零搬运** —— dequant 那 10.4% 整块消失,
+只留激活量化(0.019 ms/token 量级)。⇒ 与 §21.2 的预算表逐项对上。
+
+**下一步**(按 §21.3 的账,只剩 GDN 4%):`owl_gdn_recurrence_varlen_gqa_f16`
+2.42 ms/层 vs llama 1.64;以及 m=512 段仍偏慢(1450 vs 1531,GEMM 小 m 效率)。
