@@ -19,6 +19,8 @@ rayon = "1"
 serde_json = { workspace = true }
 # safetensors 权重源(loader.rs;F32/BF16 → host f32,量化另立)
 safetensors = "0.8.0"
+# ahash:tokenizers 的 BPE 词表 map 类型(`AHashMap`;构造 BPE 必须同型)
+ahash = "0.8"
 # mmap 只读映射(loader.rs)+ join_all 并发装载(interpreter.rs)
 libc = "0.2"
 futures-util = "0.3"

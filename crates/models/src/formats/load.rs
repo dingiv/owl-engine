@@ -155,7 +155,7 @@ fn quant_family(dir: &Path) -> Result<crate::formats::kind::QuantScheme, ModelEr
 /// - `PackQuantized` / `AwqGemm` → 按 `quant_method` 选族
 ///   (`compressed-tensors` → [`W4A16Source`];`awq` → [`AwqSource`];其余响亮拒)。
 pub async fn load_from_dir<T, D>(
-    dir: &Path,
+    path: &Path,
     face: &mut D,
     comp: &T,
     opts: LoadOpts,
@@ -165,23 +165,23 @@ where
     D: DeviceClient,
 {
     use crate::formats::kind::CheckpointKind;
-    let det = crate::formats::kind::detect(dir)?;
+    let det = crate::formats::kind::detect(path)?;
     match det.kind {
         CheckpointKind::SafeTensors => {
-            let src = crate::formats::safetensors::SafeTensorsSource::open_dir(dir)?;
+            let src = crate::formats::safetensors::SafeTensorsSource::open_dir(path)?;
             load_component(face, comp, &src, opts).await
         }
         CheckpointKind::PackQuantized | CheckpointKind::AwqGemm => {
-            match quant_family(dir)? {
+            match quant_family(path)? {
                 crate::formats::kind::QUANT_G32_ASYM => {
-                    let src = crate::formats::awq::AwqSource::open_dir(dir)?;
+                    let src = crate::formats::awq::AwqSource::open_dir(path)?;
                     // 源侧重排模式注入(起点开箱的一环:量化大键的 marlin B
                     // 由 CPU 还是 GPU repack 产出;**须在首键物化前**)
                     src.set_device_repack(opts.device_repack.unwrap_or(false));
                     load_component(face, comp, &src, opts).await
                 }
                 crate::formats::kind::QUANT_G128_SYM => {
-                    let src = crate::formats::w4a16::W4A16Source::open_dir(dir)?;
+                    let src = crate::formats::w4a16::W4A16Source::open_dir(path)?;
                     src.set_device_repack(opts.device_repack.unwrap_or(false));
                     load_component(face, comp, &src, opts).await
                 }
@@ -189,6 +189,20 @@ where
                     "load_from_dir: 量化方案 {other} 未接源族(响亮拒,不许猜)"
                 ))),
             }
+        }
+        // **GGUF 臂**(2026-10-19 刀 7c 接线):容器解析(刀 1)+ 内嵌超参(刀 3)
+        // + 反变换权重源(刀 4c)。源的契约与其他三族**一致**(键 → 字节):
+        // 量化键交给装载面的是**压缩块字节**(槽 dtype = `U8`),永不在 host
+        // 解量化(设计 I-3);行置换/`ln(-x)` 在源侧完成(逐键描述符)。
+        // 起点的**事实面**(超参 / 词表 / 模板)不在这里 —— 它们由引擎侧从
+        // 同一索引取(刀 2/刀 3):本函数只管"键 → 字节"。
+        CheckpointKind::Gguf => {
+            let sel = (opts.shard > 1).then_some(crate::formats::gguf::ShardSel {
+                id: opts.slice_id,
+                world: opts.shard,
+            });
+            let src = crate::formats::gguf::GgufSource::open_shard(path, sel)?;
+            load_component(face, comp, &src, opts).await
         }
     }
 }
@@ -215,7 +229,14 @@ where
     // 改写 want 形状(→ 分片形状;DeviceRearrange 的 rows/cols 同步),并把源
     // 包成"只读本片"的视图 —— 6 条装载路径**零改动**(它们只经 WeightSource 取数)。
     // `shard = 1` 时 pass 返回空表、源直通(零开销)。
-    let spans = crate::formats::shard::build_shard_pass(&mut want, ctx)?;
+    // **源自担分片**的源(GGUF):跳过通用 pass —— 源已按 `(slice_id, world)`
+    // 交付本 rank 的数据(`WeightSource::owns_shard`)。
+    let spans = if src.owns_shard() {
+        debug_assert!(ctx.shard > 1, "owns_shard 却单卡装载:源会按 world=1 交付");
+        std::collections::HashMap::new()
+    } else {
+        crate::formats::shard::build_shard_pass(&mut want, ctx)?
+    };
     let sharded = crate::formats::shard::ShardedSource::new(src, spans);
     let tap = if ctx.debug_tap { Some(std::sync::Mutex::new(Box::new(StderrTap) as Box<dyn LoadTap>)) } else { None }; // 观测:ctx.debug_tap 门控,缺省零开销
     let t0 = std::time::Instant::now();
@@ -1472,7 +1493,7 @@ mod generic_entry_tests {
                 Qwen35Convention::new("model.language_model"),
                 crate::module::QuantPlan::F16,
                 crate::module::QuantPlan::F16,
-            )
+            ).expect("Model::new")
         };
         let mut face = owl_cpu::CpuFace::new();
         let opts = LoadOpts {
@@ -1569,7 +1590,7 @@ mod generic_entry_tests {
             Qwen35Convention::new(rep.keys_base.trim_end_matches('.')),
             crate::module::QuantPlan::F16,
             crate::module::QuantPlan::F16,
-        );
+        ).expect("Model::new");
         let mut face = owl_cpu::CpuFace::new();
         let t0 = std::time::Instant::now();
         let manifest = load_from_dir(&dir, &mut face, &model, LoadOpts::plain(spec.dtype))
@@ -1613,7 +1634,7 @@ mod generic_entry_tests {
                 Qwen35Convention::new("model.language_model"),
                 crate::module::QuantPlan::W4A16,
                 crate::module::QuantPlan::F16,
-            )
+            ).expect("Model::new")
         };
         let mut face = crate::testkit::gpu_client().await;
         let opts = LoadOpts {

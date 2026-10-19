@@ -28,7 +28,7 @@ use crate::contract::{Dtype, ModelError};
 use crate::layers::mrope::{split_video_frames, token_types, MropeCfg};
 use crate::layers::vision::{GridThw, VisionCfg, VisionInputs, VisionTables, VisionTower};
 use crate::model::{Model, ModelSpec};
-use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, QuantPlan};
+use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, PlanSource, QuantPlan};
 use crate::formats::qwen35::Qwen35Convention;
 use crate::TensorOps;
 
@@ -229,7 +229,11 @@ impl Vlm {
     ///
     /// 装配期互证:塔输出宽 = 文本 hidden(`VlmCfg::from_json` 已查,这里
     /// 再按实际 spec 查一遍 —— 两处入口不互相假定)。
-    pub fn new(cfg: VlmCfg, plan: QuantPlan, head_plan: QuantPlan) -> Result<Vlm, ModelError> {
+    pub fn new<'a>(
+        cfg: VlmCfg,
+        plan: impl Into<PlanSource<'a>>,
+        head_plan: impl Into<PlanSource<'a>>,
+    ) -> Result<Vlm, ModelError> {
         let spec = &cfg.text_spec;
         if cfg.vision.out_hidden != spec.hidden {
             return Err(ModelError::Msg(format!(
@@ -239,7 +243,7 @@ impl Vlm {
         }
         Ok(Vlm {
             tower: VisionTower::new(cfg.vision),
-            model: Model::new(spec, Qwen35Convention::new(&cfg.text_prefix), plan, head_plan),
+            model: Model::new(spec, Qwen35Convention::new(&cfg.text_prefix), plan, head_plan)?,
             cfg,
         })
     }

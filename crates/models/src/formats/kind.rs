@@ -17,6 +17,11 @@
 //! | [`CheckpointKind::SafeTensors`] | 无量化后缀;全条目 dtype ∈ {F32, BF16, F16} | 0.8B 488 张(BF16+F32)· 4B-VL 738 张 · DFlash2 草稿 81 张(BF16) |
 //! | [`CheckpointKind::PackQuantized`] | `.weight_packed` ∧ `.weight_scale` 在场 | cyankiwi 27B AWQ-INT4 2396 张(399×3 后缀 + I64/I32/BF16) |
 //! | [`CheckpointKind::AwqGemm`] | `.qweight` ∧ `.scales` 在场(经典 AWQ 命名) | 仓内 `formats/awq.rs` 兼容族(本机暂无样本,规则留位) |
+//! | [`CheckpointKind::Gguf`] | **单文件** magic `"GGUF"`(不由扩展名定;扩展名只作提示) | 9B Q5_K_M 427 张 · 27B Q4_K_M 851 张(2026-10-19 实测) |
+//!
+//! **路径语义(2026-10-19 阔展)**:本入口吃**目录或单文件** —— GGUF 是单文件格式
+//! (设计 §四 L4)。目录内若同时有 `.gguf` 与 `.safetensors` = **响亮拒**(不猜);
+//! 目录内多个 `.gguf` = 分片 GGUF(本仓未支持)⇒ 也拒。
 
 use crate::contract::ModelError;
 use std::path::{Path, PathBuf};
@@ -31,6 +36,8 @@ pub enum CheckpointKind {
     PackQuantized,
     /// 经典 AWQ GEMM 命名(`.qweight/.scales/.zeros[/.g_idx]`)
     AwqGemm,
+    /// **GGUF 单文件**(压缩驻留 + 内嵌词表/模板;`formats::gguf` 起点族)
+    Gguf,
 }
 
 /// 量化**方案**词表(config 实测分族;`quant_method` 不足以分族 —— 两者同为
@@ -63,17 +70,53 @@ impl Detection {
     }
 }
 
-/// 探测目录的起点格式(唯一入口;`checkpoint` 无条件实现族)。
-pub fn detect(dir: &Path) -> Result<Detection, ModelError> {
+/// 探测**路径**的起点格式(唯一入口;目录或单文件都收)。
+///
+/// 目录:既有三族(键面 + dtype 判据)+ **GGUF 臂**(目录内 `.gguf`);
+/// 文件:直接按容器判(magic 权威,扩展名只作提示)。
+pub fn detect(path: &Path) -> Result<Detection, ModelError> {
+    if path.is_file() {
+        return detect_gguf_file(path);
+    }
+    if !path.is_dir() {
+        return Err(ModelError::Msg(format!("detect: {path:?} 既不是目录也不是文件")));
+    }
     // 文件清单(与 open_raw_index 同口径:字典序;分片键天然互斥)
-    let mut files: Vec<PathBuf> = owl_shared::file_loader::read_dir(dir)
-        .map_err(|e| ModelError::Msg(format!("detect: 读目录 {dir:?}: {e}")))?
+    let files: Vec<PathBuf> = owl_shared::file_loader::read_dir(path)
+        .map_err(|e| ModelError::Msg(format!("detect: 读目录 {path:?}: {e}")))?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
+        .collect();
+    // ---- GGUF 臂(先于 safetensors:两者混存 = 响亮拒,禁猜)----
+    let mut ggufs: Vec<PathBuf> = files
+        .iter()
+        .filter(|p| p.extension().is_some_and(|x| x == "gguf"))
+        .cloned()
+        .collect();
+    ggufs.sort();
+    if !ggufs.is_empty() {
+        let n_st = files.iter().filter(|p| p.extension().is_some_and(|x| x == "safetensors")).count();
+        if n_st > 0 {
+            return Err(ModelError::Msg(format!(
+                "detect: {path:?} 同时含 .gguf 与 .safetensors(起点格式歧义;不许猜)"
+            )));
+        }
+        if ggufs.len() > 1 {
+            return Err(ModelError::Msg(format!(
+                "detect: {path:?} 含 {} 个 .gguf(分片 GGUF 本仓未支持;给单文件路径)",
+                ggufs.len()
+            )));
+        }
+        return detect_gguf_file(&ggufs[0]);
+    }
+
+    // ---- safetensors 三族(既有规则不动)----
+    let mut files: Vec<PathBuf> = files
+        .into_iter()
         .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
         .collect();
     files.sort();
-    let (_, raw) = crate::formats::mmap::open_raw_index(dir)?;
+    let (_, raw) = crate::formats::mmap::open_raw_index(path)?;
     let entries = raw.len();
     let mut counts: Vec<(String, usize)> = Vec::new();
     for e in raw.values() {
@@ -127,6 +170,20 @@ pub fn detect(dir: &Path) -> Result<Detection, ModelError> {
         }
     };
     Ok(Detection { kind, files, entries, dtypes: counts })
+}
+
+/// **GGUF 单文件探测**(magic 权威;扩展名只作提示)
+fn detect_gguf_file(file: &Path) -> Result<Detection, ModelError> {
+    let g = crate::formats::gguf::Gguf::open(file)?;
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for t in &g.tensors {
+        match counts.iter_mut().find(|(k, _)| k == t.ty.name()) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((t.ty.name().to_string(), 1)),
+        }
+    }
+    counts.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(Detection { kind: CheckpointKind::Gguf, files: vec![file.to_path_buf()], entries: g.tensors.len(), dtypes: counts })
 }
 
 #[cfg(test)]
@@ -185,5 +242,68 @@ mod tests {
         std::fs::create_dir_all(&tmp).expect("mkdir");
         assert!(detect(&tmp).is_err(), "空目录必须响亮拒");
         assert!(detect(&tmp.join("nope")).is_err());
+    }
+
+    /// **GGUF 族**(2026-10-19):单文件 / 目录(单文件)/ 混存拒 / 多文件拒。
+    #[test]
+    fn detects_gguf_family() {
+        for (key, default, entries, want_types) in [
+            // M1 靶位(2026-10-19 由 9B 改 4B;原 9B 目录已删 —— 用例改随靶位,
+            // 不留"默认路径不存在 ⇒ 静默 skip"的空档)
+            (
+                "gguf:4b",
+                "/home/div/Documents/codes/models/bartowski/Qwen_Qwen3.5-4B-GGUF/Qwen_Qwen3.5-4B-Q4_K_M.gguf",
+                441,
+                ["F32", "Q4_K", "Q5_K", "Q6_K", "Q8_0"].as_slice(),
+            ),
+            (
+                "gguf:27b",
+                "/home/div/Documents/codes/models/ggml-org/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf",
+                851,
+                ["F32", "Q4_K", "Q6_K", "Q8_0"].as_slice(),
+            ),
+        ] {
+            let p = PathBuf::from(owl_shared::testkit::resource_or(key, default));
+            if !p.is_file() {
+                eprintln!("skip: {default} 不在(资源清单 {key})");
+                continue;
+            }
+            let det = detect(&p).expect("detect(gguf 文件)");
+            assert_eq!(det.kind, CheckpointKind::Gguf, "{key}");
+            assert_eq!(det.entries, entries, "{key} 张量数");
+            assert_eq!(det.files, vec![p.clone()]);
+            for want in want_types {
+                assert!(
+                    det.dtypes.iter().any(|(d, _)| d == want),
+                    "{key} 型直方图缺 {want}(实得 {:?})",
+                    det.dtypes
+                );
+            }
+            assert!(det.single_dtype().is_none(), "{key} 混型(单型直方图不计)");
+
+            // 目录形态(单文件在场)⇒ 同结论
+            let tmp = std::env::temp_dir().join(format!("owl_kind_gguf_probe_{}", det.entries));
+            std::fs::create_dir_all(&tmp).expect("mkdir");
+            let link = tmp.join(p.file_name().expect("文件名"));
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&p, &link).expect("symlink");
+            let det_dir = detect(&tmp).expect("detect(目录内单 gguf)");
+            assert_eq!(det_dir.kind, CheckpointKind::Gguf, "{key} 目录形态");
+            assert_eq!(det_dir.entries, entries, "{key} 目录形态张量数");
+
+            // 混存 ⇒ 响亮拒(不许猜)
+            let st = tmp.join("dummy.safetensors");
+            std::fs::write(&st, [0u8; 8]).expect("write");
+            assert!(detect(&tmp).is_err(), "{key} gguf+safetensors 混存必须拒");
+            std::fs::remove_file(&st).expect("rm");
+
+            // 多 gguf ⇒ 拒(分片未支持)
+            let second = tmp.join("another.gguf");
+            let _ = std::fs::remove_file(&second);
+            std::os::unix::fs::symlink(&p, &second).expect("symlink");
+            assert!(detect(&tmp).is_err(), "{key} 多 gguf 必须拒(分片未支持)");
+            std::fs::remove_file(&second).expect("rm");
+            std::fs::remove_file(&link).expect("rm");
+        }
     }
 }

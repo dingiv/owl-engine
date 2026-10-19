@@ -18,7 +18,7 @@ use crate::layers::attention::Attention;
 use crate::layers::gdn::GatedDeltaNet;
 use crate::layers::mlp::Mlp;
 use crate::layers::rmsnorm::RmsNorm;
-use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, QuantPlan};
+use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, PlanSource};
 use crate::TensorOps;
 
 /// token mixer 枚举(layer_types 分派;同层二选一)
@@ -39,24 +39,28 @@ pub struct DecoderLayer {
 
 impl DecoderLayer {
     /// full_attention 层容器(`plan` = 量化计划构造期注入)
-    pub fn new_full(hq: usize, hkv: usize, hd: usize, hidden: usize, inter: usize, eps: f32, plan: QuantPlan) -> Self {
+    pub fn new_full<'a>(hq: usize, hkv: usize, hd: usize, hidden: usize, inter: usize, eps: f32, plan: impl Into<PlanSource<'a>>) -> Self {
+        let src = plan.into();
+        let facts = src.facts();
         DecoderLayer {
-            input_ln: RmsNorm::new_add_one("input_layernorm", hidden, eps),
-            post_ln: RmsNorm::new_add_one("post_attention_layernorm", hidden, eps),
-            mixer: TokenMixer::Full(Attention::new(hq, hkv, hd, hidden, eps, plan)),
-            mlp: Mlp::new(hidden, inter, plan),
+            input_ln: RmsNorm::new_by_facts("input_layernorm", hidden, eps, facts),
+            post_ln: RmsNorm::new_by_facts("post_attention_layernorm", hidden, eps, facts),
+            mixer: TokenMixer::Full(Attention::new(hq, hkv, hd, hidden, eps, src)),
+            mlp: Mlp::new(hidden, inter, src),
             hidden,
         }
     }
 
     /// linear_attention(GDN)层容器(`plan` = 量化计划构造期注入)
     #[allow(clippy::too_many_arguments)]
-    pub fn new_gdn(nk: usize, hk_dim: usize, nv: usize, hv_dim: usize, hidden: usize, inter: usize, eps: f32, plan: QuantPlan) -> Self {
+    pub fn new_gdn<'a>(nk: usize, hk_dim: usize, nv: usize, hv_dim: usize, hidden: usize, inter: usize, eps: f32, plan: impl Into<PlanSource<'a>>) -> Self {
+        let src = plan.into();
+        let facts = src.facts();
         DecoderLayer {
-            input_ln: RmsNorm::new_add_one("input_layernorm", hidden, eps),
-            post_ln: RmsNorm::new_add_one("post_attention_layernorm", hidden, eps),
-            mixer: TokenMixer::Gdn(GatedDeltaNet::new(nk, hk_dim, nv, hv_dim, hidden, eps, plan)),
-            mlp: Mlp::new(hidden, inter, plan),
+            input_ln: RmsNorm::new_by_facts("input_layernorm", hidden, eps, facts),
+            post_ln: RmsNorm::new_by_facts("post_attention_layernorm", hidden, eps, facts),
+            mixer: TokenMixer::Gdn(GatedDeltaNet::new(nk, hk_dim, nv, hv_dim, hidden, eps, src)),
+            mlp: Mlp::new(hidden, inter, src),
             hidden,
         }
     }
@@ -176,6 +180,7 @@ const _: Dtype = Dtype::F32;
 mod tests {
     use owl_macros::owl_test;
     use super::*;
+    use crate::module::QuantPlan;
 
     fn src_map(entries: &[(&str, usize, f32)]) -> std::collections::HashMap<String, Vec<f32>> {
         entries

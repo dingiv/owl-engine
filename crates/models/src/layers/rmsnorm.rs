@@ -2,7 +2,7 @@
 //! 无 offset —— Qwen3.5 主干 norm 全系 use_offset=false)。
 //! 容器 + LoaderOps 装载形态。
 
-use crate::module::{Loadable, LoaderCtx, LoaderOps, Weight};
+use crate::module::{Loadable, LoaderCtx, LoaderOps, SourceFacts, Weight};
 use crate::module::{ForwardCtx, Module};
 use crate::TensorOps;
 
@@ -23,6 +23,16 @@ impl RmsNorm {
     /// ×(1+w) 语义变体(Qwen3.5 qk-norm:per-head add_one)
     pub fn new_add_one(key: &'static str, n: usize, eps: f32) -> RmsNorm {
         RmsNorm { w: Weight::new(key, vec![n]), eps, w_off: true }
+    }
+
+    /// **按源事实选档**(源事实的唯一消费者;设计 §11.3 语义法):
+    /// GGUF 的 gamma 已烘焙 `+1` ⇒ `×w`(`w_off = false`,零变换);
+    /// HF 一切档位 = 零中心 `×(1+w)`(与 [`RmsNorm::new_add_one`] 同档)。
+    ///
+    /// 为什么不在源侧减 1:那要动每一个 norm 张量的字节(6 类变换多一类),
+    /// 而语义法零成本、零精度损失 —— 源交出什么就存什么。
+    pub fn new_by_facts(key: &'static str, n: usize, eps: f32, facts: SourceFacts) -> RmsNorm {
+        RmsNorm { w: Weight::new(key, vec![n]), eps, w_off: facts.rmsnorm_w_off() }
     }
 
     /// gamma 槽声明(融合核接线用;norm_rope 等跨模块融合读 w)

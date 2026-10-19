@@ -7,12 +7,12 @@
 
 #[cfg(test)]
 use crate::ops::SemanticKernel;
-#[cfg(test)]
 use crate::tensor::Dtype;
 use crate::module::{Loadable, LoaderCtx, LoaderOps, QuantPlan, Weight};
 use crate::module::{ForwardCtx, Module};
-use crate::layers::linear::Linear;
+use crate::layers::linear::{gguf_quant_gemm, Linear};
 use crate::TensorOps;
+use owl_kernels::family::gguf::GgmlTy;
 
 pub struct Embedding {
     /// [vocab, D](checkpoint 原布局;查表 + nt matmul 共用一份)
@@ -23,39 +23,104 @@ pub struct Embedding {
     /// lm_head int4 +0.6%PPL/GSM8K 不变,推翻旧“输出头不量化”裁决)
     lm_head: Option<Linear>,
     d_dim: usize,
+    vocab: usize,
+    /// **GGUF 量化表臂**(tied + 量化表;设计 §11.5 ②):`Some` ⇒ 槽是
+    /// `U8` 块字节 `[vocab, row_bytes]`,查表走 `GgufDequantRows`、头走
+    /// `GgufGemm`(同一张表两用 —— 4B 实测 `token_embd` = Q6_K 且
+    /// `tie_word_embeddings=True`)。
+    gguf_ty: Option<GgmlTy>,
 }
 
 impl Embedding {
     /// 准备容器(局部键 "weight":C10 前缀源下 →
     /// `{base}.embed_tokens.weight`;单槽,tied 经 nt matmul 复用)
     pub fn new(vocab: usize, d_dim: usize) -> Embedding {
-        Embedding { w: Weight::new("weight", vec![vocab, d_dim]), lm_head: None, d_dim }
+        Embedding { w: Weight::new("weight", vec![vocab, d_dim]), lm_head: None, d_dim, vocab, gguf_ty: None }
+    }
+
+    /// **tied + 计划定形**(2026-10-19 刀 7g):`QuantPlan::Gguf(ty)` ⇒ 槽 = 块字节
+    /// (`U8`、`[vocab, 行字节]`);其余计划 ⇒ f16 表(行为逐位不变)。
+    ///
+    /// **响亮拒**:该型无行解量化入口(`ROWS_PORTED` 外,如 Q8_0 —— 快照无
+    /// `dequantize_block_q8_0`)⇒ 构造期就报错,不做“装了才发现读不了”。
+    pub fn new_by_plan(vocab: usize, d_dim: usize, plan: QuantPlan) -> Result<Embedding, crate::contract::ModelError> {
+        let mut e = Embedding::new(vocab, d_dim);
+        e.set_table_plan(plan)?;
+        Ok(e)
+    }
+
+    /// **表槽按计划定形**(tied/untied 两臂共用;**唯一产地**):
+    /// `QuantPlan::Gguf(ty)` ⇒ 槽 = 块字节(`U8`、`[vocab, 行字节]`)+ 查表走
+    /// `GgufDequantRows`;其余计划 ⇒ f16 表(既有行为逐位不变)。
+    ///
+    /// ⚠️ **untied 也必须走这里**(2026-10-19 27B 实测):`token_embd` 在 27B 里
+    /// 是 **Q4_K**,而 untied 臂原来只给 `lm_head` 传计划、表自己按 f16 建槽
+    /// ⇒ 装载期源侧响亮拒(「量化键只能以 U8 交付」)。tied/untied 是**头部**
+    /// 的差别,与"表怎么存"无关 —— 两件事不许混。
+    fn set_table_plan(&mut self, plan: QuantPlan) -> Result<(), crate::contract::ModelError> {
+        let QuantPlan::Gguf(ty) = plan else { return Ok(()) };
+        if owl_kernels::family::gguf::rows_entry_for(ty).is_none() {
+            return Err(crate::contract::ModelError::Msg(format!(
+                "Embedding: 量化表型 {} 无行解量化入口(行臂集 = {:?})—— \
+                 查表自带解量化是本臂的前提,响亮拒(设计 §11.5 ②)",
+                ty.name(),
+                owl_kernels::family::gguf::ROWS_PORTED
+            )));
+        }
+        let (be, bb) = ty.block();
+        // 判据(结构上不可失败):`GgufPlan::plan_at` 已要求索引内维 ==
+        // 声明的 `d_dim`;而索引的 `nbytes` 定义是 `elems/be*bb` ⇒ 内维必被
+        // 块元素数整除(否则该 GGUF 的字节账本身就不自洽,reader 已拒)
+        assert!(
+            be > 0 && self.d_dim % be == 0,
+            "Embedding: GGUF {} 内维 {} 不是块大小 {be} 的整数倍(块布局无定义)",
+            ty.name(),
+            self.d_dim
+        );
+        self.w = Weight::new_typed("weight", vec![self.vocab, self.d_dim / be * bb], Dtype::U8);
+        self.gguf_ty = Some(ty);
+        Ok(())
     }
 
     /// untied(lm_head 独立权重;f16 直读;测试 fixture/mtp/dflash2 同构)
     pub fn new_untied(vocab: usize, d_dim: usize) -> Embedding {
-        Embedding::new_untied_quant(vocab, d_dim, QuantPlan::F16)
-    }
-
-    /// untied + 头部量化计划(C1:生产入口;plan 量化且 eligible 时
-    /// lm_head 走 marlin 臂,否则 f16 直读)
-    pub fn new_untied_quant(vocab: usize, d_dim: usize, plan: QuantPlan) -> Embedding {
         Embedding {
             w: Weight::new("weight", vec![vocab, d_dim]),
-            lm_head: Some(Linear::new("lm_head", vocab, d_dim, plan)),
+            lm_head: Some(Linear::new("lm_head", vocab, d_dim, QuantPlan::F16)),
             d_dim,
+            vocab,
+            gguf_ty: None,
         }
     }
 
-    /// untied lm_head 槽装载声明(键 = 检查点裸键 `lm_head.weight`,
-    /// 量化套件键 `lm_head.qweight/...` 直通;tied = None)。调用方
-    /// 不加 map_keys —— 键已是最终形态。
+    /// **untied + 两个独立计划**(C1 生产入口 + GGUF 档):
+    /// - `table_plan` = **表**自己的计划(GGUF 档是逐张量事实:27B 的
+    ///   `token_embd` = Q4_K ⇒ 必须走块槽,否则源侧响亮拒);
+    /// - `head_plan` = `lm_head` 的计划(plan 量化且 eligible ⇒ marlin 臂)。
+    ///
+    /// tied/untied 只决定"表兼不兼做头",与"表怎么存"正交(见 `set_table_plan`)。
+    pub fn new_untied_quant(
+        vocab: usize,
+        d_dim: usize,
+        table_plan: QuantPlan,
+        head_plan: QuantPlan,
+    ) -> Result<Embedding, crate::contract::ModelError> {
+        let mut e = Embedding {
+            w: Weight::new("weight", vec![vocab, d_dim]),
+            lm_head: Some(Linear::new("lm_head", vocab, d_dim, head_plan)),
+            d_dim,
+            vocab,
+            gguf_ty: None,
+        };
+        e.set_table_plan(table_plan)?;
+        Ok(e)
+    }
+
+    /// untied lm_head 槽装载声明(键 = **局部键** `lm_head[*]`;全键由调用方
+    /// 经 [`crate::module::KeyConvention::head_key`] 改写 —— **第 4 类键**:
+    /// HF 叫 `lm_head.weight`,GGUF 叫 `output.weight`)。
     pub fn layout_lm_head(&self, ctx: &LoaderCtx) -> Option<LoaderOps> {
-        self.lm_head.as_ref().map(|lin| {
-            lin.layout(ctx).map_keys(|k| {
-                if k == "lm_head" { "lm_head.weight".to_string() } else { k.to_string() }
-            })
-        })
+        self.lm_head.as_ref().map(|lin| lin.layout(ctx))
     }
 
     /// 装载完备性
@@ -68,6 +133,17 @@ impl Embedding {
     /// 槽序契约:kernel 签名 (w, ids, d_dim, out) → T 槽序 w、ids,输出块末尾
     /// (w = 物化块引用,eval 时 Block 叶子零操作)。
     pub fn embed(&self, ids: &TensorOps, tokens: usize) -> TensorOps {
+        // **GGUF 量化表臂**:查表自带解量化(`token_embd` 在 GGUF 里是量化块)
+        if let Some(ty) = self.gguf_ty {
+            return TensorOps::call(crate::ops::SemanticKernel::GgufDequantRows)
+                .arg(&self.w.decl()) // [vocab, 行字节] U8
+                .arg(ids) // 词表 id(f32 承载设备侧索引)
+                .arg_i32(self.d_dim as i32)
+                .arg_i32(tokens as i32)
+                .arg_i32(self.vocab as i32)
+                .aux(&[ty.code() as usize, tokens, self.d_dim])
+                .with_shape(Dtype::F16, vec![tokens, self.d_dim]);
+        }
         // 输出 dtype 跟随表 Weight(F5;LoaderCtx 自动跟随)
         let dt = self.w.dtype();
         TensorOps::call(crate::ops::SemanticKernel::Embed).aux(&[tokens])
@@ -82,9 +158,21 @@ impl Embedding {
     /// C1:untied 量化臂经 Linear::forward_inner(marlin GEMV/GEMM;
     /// f16 臂 = 原语义 matmul_nt,零行为变更)
     pub fn lm_head_matmul(&self, hidden: &TensorOps) -> TensorOps {
+        // ⚠️ **分支键 = `lm_head.is_none()`(tied 事实),不是 `gguf_ty`**
+        // (2026-10-19 27B 实测定谳):`gguf_ty` 说的是"**表**是不是量化块",
+        // 而 tied/untied 说的是"**头**用不用这张表" —— 两件事正交。
+        // 早先拿 `gguf_ty` 当判据 ⇒ **untied 的 GGUF 模型把头算成了
+        // `hidden @ token_embdᵀ`**(静默错值:首 token 直接垃圾,而权重面全对,
+        // 极难归因;4B tied 档照不到这条雷)。
         match &self.lm_head {
+            // untied:独立头(marlin / GGUF 量化 / f16 三臂都在 `Linear` 里)
             Some(lin) => lin.forward_inner(hidden),
-            None => hidden.matmul_nt(&self.w.decl()),
+            // tied:**表兼头** —— 表是量化块(GGUF 档)时走同一套两发路径
+            // (设计 §11.5 ②;与 `Linear` 的 GGUF 臂**同一实现**)
+            None => match self.gguf_ty {
+                Some(ty) => gguf_quant_gemm(&self.w, ty, hidden, self.vocab, self.d_dim, None),
+                None => hidden.matmul_nt(&self.w.decl()),
+            },
         }
     }
 }

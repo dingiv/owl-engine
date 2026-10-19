@@ -40,7 +40,7 @@ fn xqa_q_scale_bits(hd: usize) -> u64 {
 use crate::layers::linear::Linear;
 use crate::layers::{concat_rows_hier, narrow_strided};
 use crate::layers::rmsnorm::RmsNorm;
-use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, QuantPlan, KvBuffers};
+use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, PlanSource, KvBuffers};
 use crate::TensorOps;
 
 pub struct Attention {
@@ -138,14 +138,16 @@ fn nb_pages(kv: &KvBuffers, dt: Dtype, shape: Vec<usize>, what: &str) -> Result<
 impl Attention {
     /// 准备容器(0.8B:hq=8, hkv=2, hd=256 → q_proj out 4096 / kv out 512;
     /// `plan` = 量化计划构造期注入,尺寸门控在 Linear 内定形)
-    pub fn new(hq: usize, hkv: usize, hd: usize, hidden: usize, eps: f32, plan: QuantPlan) -> Attention {
+    pub fn new<'a>(hq: usize, hkv: usize, hd: usize, hidden: usize, eps: f32, plan: impl Into<PlanSource<'a>>) -> Attention {
+        let p = plan.into();
+        let facts = p.facts();
         Attention {
-            q_proj: Linear::new("q_proj", hq * hd * 2, hidden, plan),
-            k_proj: Linear::new("k_proj", hkv * hd, hidden, plan),
-            v_proj: Linear::new("v_proj", hkv * hd, hidden, plan),
-            o_proj: Linear::new("o_proj", hidden, hq * hd, plan),
-            q_norm: RmsNorm::new_add_one("q_norm", hd, eps),
-            k_norm: RmsNorm::new_add_one("k_norm", hd, eps),
+            q_proj: Linear::new("q_proj", hq * hd * 2, hidden, p.of("q_proj", hq * hd * 2, hidden)),
+            k_proj: Linear::new("k_proj", hkv * hd, hidden, p.of("k_proj", hkv * hd, hidden)),
+            v_proj: Linear::new("v_proj", hkv * hd, hidden, p.of("v_proj", hkv * hd, hidden)),
+            o_proj: Linear::new("o_proj", hidden, hq * hd, p.of("o_proj", hidden, hq * hd)),
+            q_norm: RmsNorm::new_by_facts("q_norm", hd, eps, facts),
+            k_norm: RmsNorm::new_by_facts("k_norm", hd, eps, facts),
             hq,
             hkv,
             hd,
@@ -1357,6 +1359,7 @@ impl Loadable for Attention {
 mod tests {
     use owl_macros::owl_test;
     use super::*;
+    use crate::module::QuantPlan;
     use crate::layers::rope::Rope as RopeT;
     use crate::module::KvBuffers;
     use crate::testkit::{f32b, harvest, Src};
@@ -1606,6 +1609,7 @@ mod tests {
 mod f16_tests {
     use owl_macros::owl_test;
     use super::*;
+    use crate::module::QuantPlan;
     use crate::contract::DeviceClient as _;
     use crate::module::KvBuffers;
     use crate::testkit::{f32b, gpu_client};
@@ -2300,6 +2304,7 @@ mod owl_port_tests {
         assert_eq!(n, 4);
     }
     use super::*;
+    use crate::module::QuantPlan;
     use crate::contract::DeviceClient as _;
     use crate::testkit::gpu_client;
     use crate::tensor::Dtype;
@@ -2620,6 +2625,7 @@ mod owl_port_tests {
 mod view_alias_tests {
     use owl_macros::owl_test;
     use super::*;
+    use crate::module::QuantPlan;
     use crate::module::AttnV2Scratch;
     use crate::testkit::{f32b, gpu_client, harvest_f16};
     use crate::tensor::Dtype;

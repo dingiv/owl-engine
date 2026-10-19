@@ -714,6 +714,18 @@ pub type Taken<T> = Result<Option<T>, ModelError>;
 /// 只有"在途"的一份;同键多 Want(tied 双槽)由装载域按键分组,
 /// 一次 take 供全组)。
 pub trait WeightSource {
+    /// **源是否自己承担分片**(默认 `false` = 由 `formats::shard` 的 span
+    /// 包装器翻译"目标区间 → 源区间")。
+    ///
+    /// GGUF 臂为 `true`:量化块的列切是**块算术**,且 `ssm_out` 的列要按
+    /// v-head **grouped 序聚合** —— 通用包装器的"连续源区间"模型表达不了
+    /// (见 `formats::gguf::shard`)。此时 `eval_load` **跳过**分片 pass,
+    /// 由源自己按 `(slice_id, world)` 交付本 rank 的字节;`elem_len` 也必须
+    /// 报分片口径(装载面按 `shape.product` 对账,不符即拒)。
+    fn owns_shard(&self) -> bool {
+        false
+    }
+
     fn take(&self, key: &str) -> Taken<Vec<f32>>;
 
     /// 区间取数(流式大张量:分块转换上传,主机在途 = 单块)。
@@ -916,6 +928,19 @@ pub trait KeyConvention {
     fn layer_key(&self, i: usize, local: &str) -> String;
     /// final norm:局部键(恒 "norm")→ checkpoint 全键
     fn norm_key(&self, local: &str) -> String;
+
+    /// **untied lm_head**(第 4 类键;2026-10-19 GGUF 轮新增)。
+    ///
+    /// 局部键 = `lm_head`(裸)或带量化后缀(`lm_head.qweight` …);
+    /// 默认实现 = 既行为(`lm_head` → `lm_head.weight`,后缀族原样)。
+    /// GGUF 覆写:`lm_head` → **`output.weight`**(源的命名事实)。
+    fn head_key(&self, local: &str) -> String {
+        if local == "lm_head" {
+            "lm_head.weight".to_string()
+        } else {
+            local.to_string()
+        }
+    }
 }
 
 /// HF/Llama 系默认约定(纯前缀 + `.weight` 叶;无子前缀无裸键)
@@ -1189,6 +1214,190 @@ pub enum QuantPlan {
     /// 与 `W4A16Awq` 的差别**全在布局与激活面**:权重同源、模型同构 ⇒
     /// 换 plan 即 A/B(端口/配置不动)。
     W4A8Awq,
+    /// **GGUF 块型**(2026-10-19 gguf 轮):权重以 **GGUF 块字节原样驻留**
+    /// (槽 dtype = `U8`、形状 `[out, row_bytes]`),forward = **两发**:
+    /// `GgufQuantAct{_F16,_Bf16}`(激活 → q8_1) + `GgufGemm`(dequant-in-kernel)。
+    ///
+    /// **逐张量型**:26B/4B 等混型 GGUF 里同一个模型不同张量型不同
+    /// ⇒ 由 [`PlanSource`] 逐键给(设计刀 0);未移植型 = 构造期**响亮拒**。
+    Gguf(crate::formats::gguf::GgmlTy),
+}
+
+/// **逐张量量化计划表**(混型源的计划来源;2026-10-19 GGUF 轮)。
+///
+/// 为什么需要:量化型在 GGUF 里是**逐张量**事实 —— `Qwen3.8-27B-Q4_K_M`
+/// 同一模型混存 Q4_K(193 张)/Q8_0(288)/Q6_K(17)/F32(353),
+/// `Holo-3.1-9B-Q5_K_M` 更是**同一角色跨层不同型**(`attn_qkv` Q5_K 12 层
+/// + Q6_K 12 层)⇒ 单一 [`QuantPlan`] 值表达不了。
+///
+/// 纪律**不变**:计划仍在**构造期**定形(禁 `enable_*` 可变后置范式)——
+/// 变的只是定形依据,从"全局一个值"变成"检查点全键 → 型"的表。
+/// 键算全复用 [`KeyConvention`](与 `Model::layout` 的 `map_keys` 同源;
+/// 不存在第二套键规则)。
+///
+/// **总量性与响亮拒**:表的覆盖面由源保证(每个 GGUF 条目都有 ggml 型);
+/// 模型问出表外的键(缺键 / 形态不合法)⇒ 记进 [`PlanTable::take_unresolved`],
+/// 由 `Model::new` **响亮拒** —— 禁静默落 F16(那会让显存账静默失真)。
+pub trait PlanTable {
+    /// 检查点全键 → 计划(`out_dim`/`in_dim` = 目标形状,供形态门控用)
+    fn plan_at(&self, full_key: &str, out_dim: usize, in_dim: usize) -> QuantPlan;
+    /// 取走"模型问过但表里没有"的键清单(**取走即清**;构造期尾声消费)
+    fn take_unresolved(&self) -> Vec<String>;
+}
+
+/// **源的事实**(构造期常量;与 plan 正交 —— plan 答"这个键什么精度",
+/// facts 答"这个源把什么烘焙进了数值/键面")。
+///
+/// 为什么挂在 [`PlanSource`] 上而不是单开一路参数:facts 的**消费者**
+/// (RmsNorm / GDN 分段)正是拿 plan 的那批构造器 ⇒ 同一注入通道,层构造器
+/// 签名不用再加一路(`impl Into<PlanSource>` 形态对既有调用点零改动)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SourceFacts {
+    /// **norm 的 gamma 已烘焙 `+1`**(GGUF 转换器行为:除 `linear_attn.norm`
+    /// 外一律 `w+1`)⇒ 该档 RmsNorm 用 `×w`(零变换);
+    /// `false`(HF 一切档位)= 零中心 `×(1+w)`(`RmsNorm::new_add_one`)。
+    /// 详见设计 §11.3。
+    pub norm_baked_plus_one: bool,
+    /// **融合键的分段可异型**:GGUF 逐张量定精度 ⇒ `attn_qkv ⊕ attn_gate`
+    /// 两段型常常不同(4B 实测 24/24 层 Q6_K vs Q4_K)—— 此时**不可**合成
+    /// 单一同型张量,GDN 必须声明两个 Linear(设计 §11.5 ①)。
+    pub merged_segments_may_differ: bool,
+    /// **v-head 列序已被转换器改成 tiled 序**(GGUF 写侧 `_reorder_v_heads`;
+    /// 仅 `nk != nv` 时发生)⇒ `ssm_out` 权重的**内维**是 ggml 序,而 GDN 核
+    /// 产出 grouped 序 ⇒ 消费者必须先在**激活侧**做等价置换
+    /// (置换跨量化块 ⇒ 权重字节不可逆;设计 §11.4)。
+    ///
+    /// 消费者 = GDN 层:声明 `ssm_out_perm` 虚拟键(源生成 32 元素块序表)
+    /// + `out_proj` 前插一发 `owl_gguf_col_gather`。
+    pub vhead_tiled_columns: bool,
+}
+
+impl SourceFacts {
+    /// 既有一切档位(HF / safetensors / ct / awq):零中心 norm、融合键同型、HF v-head 列序
+    pub const HF: SourceFacts = SourceFacts {
+        norm_baked_plus_one: false,
+        merged_segments_may_differ: false,
+        vhead_tiled_columns: false,
+    };
+    /// GGUF 起点族(norm 已 +1;逐张量型 ⇒ 融合键分段独立;tiled v-head 列序)
+    pub const GGUF: SourceFacts = SourceFacts {
+        norm_baked_plus_one: true,
+        merged_segments_may_differ: true,
+        vhead_tiled_columns: true,
+    };
+    /// **GGUF + TP 分片档**(W-1):装载期已按 v-head **grouped 序聚合**
+    /// (`GgufSource` 自担分片)⇒ 本 rank 的权重内维就是 grouped 序,
+    /// **不需要** A2 激活侧列序表(`vhead_tiled_columns = false`)。
+    pub const GGUF_TP: SourceFacts = SourceFacts {
+        norm_baked_plus_one: true,
+        merged_segments_may_differ: true,
+        vhead_tiled_columns: false,
+    };
+
+    /// norm 的 I/O 语义:GGUF 用 `×w`(`w_off = false`),HF 用 `×(1+w)`
+    pub fn rmsnorm_w_off(self) -> bool {
+        !self.norm_baked_plus_one
+    }
+}
+
+/// **计划来源**(构造期注入;值语义 `Copy`)—— 一切 plan 与源事实的唯一入口。
+///
+/// - [`PlanKind::Uniform`]:全模型统一计划(既有一切档位;零开销臂);
+/// - [`PlanKind::Keyed`]:逐键查表(混型源,如 GGUF)。
+///
+/// `QuantPlan` 经 `From` 直落 Uniform 臂 ⇒ 既有调用点写字面量即可 ——
+/// **单接口,非旁路**:Uniform 本身就是一种 [`PlanSource`]。
+#[derive(Clone, Copy)]
+pub struct PlanSource<'a> {
+    kind: PlanKind<'a>,
+    facts: SourceFacts,
+}
+
+/// 计划的两种来源(内层;外部一律经 [`PlanSource`] 构造/消费)
+#[derive(Clone, Copy)]
+enum PlanKind<'a> {
+    Uniform(QuantPlan),
+    Keyed {
+        table: &'a dyn PlanTable,
+        keys: &'a dyn KeyConvention,
+        /// 本层层号(层内局部键算全用);非层键走 [`PlanSource::at`]
+        layer: usize,
+    },
+}
+
+impl<'a> From<QuantPlan> for PlanSource<'a> {
+    fn from(p: QuantPlan) -> Self {
+        Self { kind: PlanKind::Uniform(p), facts: SourceFacts::HF }
+    }
+}
+
+impl<'a> PlanSource<'a> {
+    /// **逐键查表来源**(混型源接线点;`facts` = 源族事实)
+    pub fn keyed(
+        table: &'a dyn PlanTable,
+        keys: &'a dyn KeyConvention,
+        facts: SourceFacts,
+    ) -> Self {
+        Self { kind: PlanKind::Keyed { table, keys, layer: 0 }, facts }
+    }
+
+    /// 覆写源事实(既有牌位一律 [`SourceFacts::HF`],无需调用)
+    pub fn with_facts(mut self, facts: SourceFacts) -> Self {
+        self.facts = facts;
+        self
+    }
+
+    /// 源事实(norm 语义 / 融合键分段)
+    pub fn facts(&self) -> SourceFacts {
+        self.facts
+    }
+
+    /// 绑定层号(`Model::new` 每层造一份;Uniform 臂原样返回)
+    pub fn at_layer(self, i: usize) -> Self {
+        match self.kind {
+            PlanKind::Keyed { table, keys, .. } => {
+                Self { kind: PlanKind::Keyed { table, keys, layer: i }, facts: self.facts }
+            }
+            _ => self,
+        }
+    }
+
+    /// **层内局部键 → 计划**(层构造器唯一入口;Uniform 臂忽略键)
+    pub fn of(&self, local: &str, out_dim: usize, in_dim: usize) -> QuantPlan {
+        match self.kind {
+            PlanKind::Uniform(p) => p,
+            PlanKind::Keyed { table, keys, layer } => {
+                table.plan_at(&keys.layer_key(layer, local), out_dim, in_dim)
+            }
+        }
+    }
+
+    /// **检查点全键 → 计划**(embed / final norm 等非层键;Uniform 臂忽略键)
+    pub fn at(&self, full_key: &str, out_dim: usize, in_dim: usize) -> QuantPlan {
+        match self.kind {
+            PlanKind::Uniform(p) => p,
+            PlanKind::Keyed { table, .. } => table.plan_at(full_key, out_dim, in_dim),
+        }
+    }
+
+    /// untied `lm_head` 计划(键名属**源**事实;Keyed 臂向**约定**索取 ——
+    /// 与 want 侧 [`KeyConvention::head_key`] 同一实现,单源)
+    pub fn head(&self, out_dim: usize, in_dim: usize) -> QuantPlan {
+        match self.kind {
+            PlanKind::Uniform(p) => p,
+            PlanKind::Keyed { table, keys, .. } => {
+                table.plan_at(&keys.head_key("lm_head"), out_dim, in_dim)
+            }
+        }
+    }
+
+    /// 未解析键清单(Uniform 臂恒空;Keyed 臂取走即清)
+    pub fn take_unresolved(&self) -> Vec<String> {
+        match self.kind {
+            PlanKind::Uniform(_) => Vec::new(),
+            PlanKind::Keyed { table, .. } => table.take_unresolved(),
+        }
+    }
 }
 
 /// 装载语境(layout 钩子的 ctx;按值传递,Copy)

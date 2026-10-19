@@ -28,7 +28,7 @@ use crate::contract::Dtype;
 use crate::ops::SemanticKernel;
 use crate::layers::linear::Linear;
 use crate::layers::{concat_rows, narrow_strided};
-use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, QuantPlan, Weight};
+use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, PlanSource, QuantPlan, Weight};
 use crate::TensorOps;
 
 // ============================================================================
@@ -486,6 +486,31 @@ pub fn norm_act(
 // 批6:GatedDeltaNet 层(Qwen3.5 线性注意力层;decode 全链)
 // ============================================================================
 
+/// **输入投影形态**(构造期定形;设计 §11.5 ①)
+///
+/// GGUF 逐张量定精度 ⇒ `attn_qkv` 与 `attn_gate` 两段**型常常不同**
+/// (4B 实测 24/24 层 Q6_K vs Q4_K)⇒ 合并成单一同型张量**不可表达**,
+/// 必须声明两条 Linear。HF 一切档位两段同型 ⇒ 保持既有合并单投影
+/// (一个 GEMM 吃 `[2K+2V, hidden]`,marlin tile 完美)。
+///
+/// 判据 = [`SourceFacts::merged_segments_may_differ`](源事实,不是猜)。
+enum GdnProj {
+    /// 合并单投影(`in_proj_qkvz`,HF 臂)
+    Merged(Linear),
+    /// 两条独立投影(GGUF 臂;`in_proj_qkv` = attn_qkv,`in_proj_z` = attn_gate)
+    Split { qkv: Linear, z: Linear },
+}
+
+/// 投影产物(**Merged 臂下 `qkv` 是完整 qkvz、`z` 是它的尾段视图**;两臂同形)
+struct GdnProjOut {
+    /// q/k/v 三段所在张量([T, qkv_w])
+    qkv: TensorOps,
+    /// 上面那个张量的行宽(元素;Merged = 2K+2V,Split = 2K+V)
+    qkv_w: usize,
+    /// z 段([T, V])
+    z: TensorOps,
+}
+
 /// Qwen3.5 GatedDeltaNet(SplitQkvZa 投影形态 —— checkpoint 四独立投影;
 /// 旧世界 GdnProjection::SplitQkvZaLegacy 同款)。
 ///
@@ -499,9 +524,8 @@ pub fn norm_act(
 ///   ├ norm_act(×w 非零中心 × silu(z) per-head)→ out_proj → [T, hidden]
 /// ```
 pub struct GatedDeltaNet {
-    /// 刀2:qkv+z 列合并单投影([2K+2V, hidden];装载期行堆叠合成,
-    /// n%256==0 marlin tile 完美;qkv 段偏移不变,z 段 narrow 切出)
-    in_proj_qkvz: Linear, // [2K+2V, hidden]
+    /// 输入投影(臂由源事实选;见 [`GdnProj`])
+    proj: GdnProj,
     in_proj_b: Linear,    // [HV, hidden]
     in_proj_a: Linear,    // [HV, hidden]
     out_proj: Linear,    // [hidden, V]
@@ -521,14 +545,58 @@ impl GatedDeltaNet {
     /// 准备容器(纯元数据;0.8B = nk 16/hk_dim 128/nv 16/hv_dim 128/hidden 1024;
     /// `plan` = 量化计划构造期注入,尺寸门控在 Linear 内定形;conv/A_log/
     /// dt_bias 保持高精度,不在量化面)
-    pub fn new(nk: usize, hk_dim: usize, nv: usize, hv_dim: usize, hidden: usize, eps: f32, plan: QuantPlan) -> Self {
+    pub fn new<'a>(nk: usize, hk_dim: usize, nv: usize, hv_dim: usize, hidden: usize, eps: f32, plan: impl Into<PlanSource<'a>>) -> Self {
+        let p = plan.into();
+        let facts = p.facts();
         let (key_dim, value_dim) = (nk * hk_dim, nv * hv_dim);
         let conv_dim = 2 * key_dim + value_dim;
+        // ---- out_proj 先建:可能需挂**内维列序表**(设计 §11.4 落点 A2)----
+        //
+        // 源事实:v-head 重排生效(`nk != nv`;GGUF 转换器 `_reorder_v_heads`)
+        // ⇒ `ssm_out` 的**内维**是 ggml tiled 序,而本层递推核产出 grouped 序。
+        // 行粒度件(alpha/beta/qkv/gate/conv)已在**源侧装载期**扭回;列粒度
+        // (`ssm_out`)跨量化块不可字节级 ⇒ 在**激活侧**置换。
+        //
+        // 两条臂分派(同一条不变式:装载后的权重序 ≡ 喂进去的激活序):
+        // · **量化臂**:折进激活量化核(零额外发射)= 本表;
+        // · **原生臂**:源侧装载期做**元素面**列置换(`ColVHead`)⇒ 无需表。
+        // 表长与量化核的块数同口径(`in_dim / 32`);若 `hv_dim % 32 != 0`
+        // (置换单元与量化块错位)则由源侧 `vhead_q8_blocks` **响亮拒**(不静默)。
+        let out_plan = p.of("out_proj", hidden, value_dim);
+        let mut out_proj = Linear::new("out_proj", hidden, value_dim, out_plan);
+        if facts.vhead_tiled_columns && nk != nv && matches!(out_plan, QuantPlan::Gguf(_)) {
+            out_proj.set_gguf_col_index(Weight::new_typed_u32(
+                "ssm_out_perm",
+                vec![value_dim / 32],
+            ));
+        }
         GatedDeltaNet {
-            in_proj_qkvz: Linear::new("in_proj_qkvz", conv_dim + value_dim, hidden, plan),
-            in_proj_b: Linear::new("in_proj_b", nv, hidden, plan),
-            in_proj_a: Linear::new("in_proj_a", nv, hidden, plan),
-            out_proj: Linear::new("out_proj", hidden, value_dim, plan),
+            proj: if facts.merged_segments_may_differ {
+                GdnProj::Split {
+                    qkv: Linear::new(
+                        "in_proj_qkv",
+                        conv_dim,
+                        hidden,
+                        p.of("in_proj_qkv", conv_dim, hidden),
+                    ),
+                    z: Linear::new(
+                        "in_proj_z",
+                        value_dim,
+                        hidden,
+                        p.of("in_proj_z", value_dim, hidden),
+                    ),
+                }
+            } else {
+                GdnProj::Merged(Linear::new(
+                    "in_proj_qkvz",
+                    conv_dim + value_dim,
+                    hidden,
+                    p.of("in_proj_qkvz", conv_dim + value_dim, hidden),
+                ))
+            },
+            in_proj_b: Linear::new("in_proj_b", nv, hidden, p.of("in_proj_b", nv, hidden)),
+            in_proj_a: Linear::new("in_proj_a", nv, hidden, p.of("in_proj_a", nv, hidden)),
+            out_proj,
             conv_w: Weight::new("conv1d", vec![conv_dim, 4]),
             a_log: Weight::new("A_log", vec![nv]),
             dt_bias: Weight::new("dt_bias", vec![nv]),
@@ -539,6 +607,31 @@ impl GatedDeltaNet {
 
     fn key_dim(&self) -> usize {
         self.nk * self.hk_dim
+    }
+
+    /// **输入投影**(单接口;臂内收)
+    ///
+    /// - `Merged`:`[T, 2K+2V]` 一发 + 尾段 narrow(z);
+    /// - `Split`:qkv 与 z 各一发(`attn_qkv` / `attn_gate` 异型常态)。
+    ///
+    /// 两臂产物同形 ⇒ 三条 forward(批量 / 展开 / decode)零分叉。
+    fn project(&self, xs: &TensorOps, ctx: &ForwardCtx) -> GdnProjOut {
+        let tokens = ctx.tokens;
+        let (key_dim, value_dim) = (self.key_dim(), self.value_dim());
+        let conv_dim = 2 * key_dim + value_dim;
+        match &self.proj {
+            GdnProj::Merged(l) => {
+                let qkvz = l.forward(xs, ctx); // [T, 2K+2V]
+                let qkv_w = conv_dim + value_dim;
+                let z = narrow_strided(&qkvz, tokens, qkv_w, conv_dim, value_dim, vec![tokens, value_dim]);
+                GdnProjOut { qkv: qkvz, qkv_w, z }
+            }
+            GdnProj::Split { qkv, z } => GdnProjOut {
+                qkv: qkv.forward(xs, ctx), // [T, 2K+V]
+                qkv_w: conv_dim,
+                z: z.forward(xs, ctx), // [T, V]
+            },
+        }
     }
 
     fn value_dim(&self) -> usize {
@@ -573,15 +666,17 @@ impl GatedDeltaNet {
         };
         let key_dim = self.key_dim();
         let value_dim = self.value_dim();
-        let conv_dim = 2 * key_dim + value_dim;
 
-        // T 批量投影(刀2:qkvz 列合并单投影;z 段 narrow)
-        let qkvz = self.in_proj_qkvz.forward(xs, ctx); // [T, 2K+2V]
+        // T 批量投影(臂由源事实选;见 `GdnProj`)
+        let pr = self.project(xs, ctx);
         // 刀3a' 同款接 verify(2026-10-08 性能会战):T=8 verify 的 b/a
         // 曾落 cublas wmma 16x16 小 tile(96 发 × 24.4µs = 2.34ms/轮,
         // nsys 定谳);gemv_dual 权重 0.5MB×2 全在 L2,T≤16 的读放大
         // 无痛。T>16 保持 cublas(真 GEMM 区)。
-        let (b, a) = if tokens <= 16 {
+        // ⚠️ 旁路的**合法性** = 权重 f16 直读态(GEMV 核只吃 f16 位型);
+        // 量化档(b/a 也量化:GGUF 的 `ssm_alpha`/`ssm_beta`)必须走 forward
+        // —— 无此门就是**静默错值**(把块字节当 f16 读)。
+        let (b, a) = if tokens <= 16 && self.in_proj_b.is_f16_direct() && self.in_proj_a.is_f16_direct() {
             // 形状律:xs = [T, hidden](空形状 = 声明失守 ⇒ **毒化**,
             // 原 `unwrap_or(0)` 会把 cols=0 交给核 = 静默错值;2026-10-17 审查)
             let hidden_gdn = match xs.shape().last() {
@@ -610,11 +705,10 @@ impl GatedDeltaNet {
         } else {
             (self.in_proj_b.forward(xs, ctx), self.in_proj_a.forward(xs, ctx))
         };
-        let qkv_w = conv_dim + value_dim;
-        let q = narrow_strided(&qkvz, tokens, qkv_w, 0, key_dim, vec![tokens, key_dim]);
-        let k = narrow_strided(&qkvz, tokens, qkv_w, key_dim, key_dim, vec![tokens, key_dim]);
-        let v = narrow_strided(&qkvz, tokens, qkv_w, 2 * key_dim, value_dim, vec![tokens, value_dim]);
-        let z = narrow_strided(&qkvz, tokens, qkv_w, conv_dim, value_dim, vec![tokens, value_dim]);
+        let q = narrow_strided(&pr.qkv, tokens, pr.qkv_w, 0, key_dim, vec![tokens, key_dim]);
+        let k = narrow_strided(&pr.qkv, tokens, pr.qkv_w, key_dim, key_dim, vec![tokens, key_dim]);
+        let v = narrow_strided(&pr.qkv, tokens, pr.qkv_w, 2 * key_dim, value_dim, vec![tokens, value_dim]);
+        let z = pr.z;
 
         // cu_seqlens = [0, T](单序列;vLLM 契约形态,M2 packed 直用)。
         // E5-M4:verify 图注入(捕获期禁 Htod);eager 路自建不变。
@@ -824,23 +918,20 @@ impl GatedDeltaNet {
         };
         let key_dim = self.key_dim();
         let value_dim = self.value_dim();
-        let conv_dim = 2 * key_dim + value_dim;
 
-        // T 批量投影(SplitQkvZa 同 decode;T 无关算子单发即批量;
-        // 刀2:qkvz 列合并单投影,z 段整段 narrow)
-        let qkvz = self.in_proj_qkvz.forward(xs, ctx); // [T, 2K+2V]
+        // T 批量投影(SplitQkvZa 同 decode;T 无关算子单发即批量)
+        let pr = self.project(xs, ctx);
         let b = self.in_proj_b.forward(xs, ctx); // [T, HV]
         let a = self.in_proj_a.forward(xs, ctx); // [T, HV]
-        let qkv_w = conv_dim + value_dim;
-        let z = narrow_strided(&qkvz, tokens, qkv_w, conv_dim, value_dim, vec![tokens, value_dim]);
+        let z = pr.z;
 
         // 逐 token 段(conv 滑窗 / rec 递推链式;slot 恒 gdn_slot)
         let mut ys: Vec<TensorOps> = Vec::with_capacity(tokens);
         for t in 0..tokens {
             // 读侧行窄切(直接从 [T,·] 投影读,start = 行基址)
-            let q_t = narrow_strided(&qkvz, 1, qkv_w, t * qkv_w, key_dim, vec![1, key_dim]);
-            let k_t = narrow_strided(&qkvz, 1, qkv_w, t * qkv_w + key_dim, key_dim, vec![1, key_dim]);
-            let v_t = narrow_strided(&qkvz, 1, qkv_w, t * qkv_w + 2 * key_dim, value_dim, vec![1, value_dim]);
+            let q_t = narrow_strided(&pr.qkv, 1, pr.qkv_w, t * pr.qkv_w, key_dim, vec![1, key_dim]);
+            let k_t = narrow_strided(&pr.qkv, 1, pr.qkv_w, t * pr.qkv_w + key_dim, key_dim, vec![1, key_dim]);
+            let v_t = narrow_strided(&pr.qkv, 1, pr.qkv_w, t * pr.qkv_w + 2 * key_dim, value_dim, vec![1, value_dim]);
             let a_t = narrow_strided(&a, 1, self.nv, t * self.nv, self.nv, vec![1, self.nv]);
             let b_t = narrow_strided(&b, 1, self.nv, t * self.nv, self.nv, vec![1, self.nv]);
 
@@ -910,16 +1001,21 @@ impl GatedDeltaNet {
                 );
             }
         };
-        let (key_dim, value_dim, conv_dim) = (self.key_dim(), self.value_dim(), 2 * self.key_dim() + self.value_dim());
+        let (key_dim, value_dim) = (self.key_dim(), self.value_dim());
 
-        // 投影(刀2:qkvz 列合并单投影 + b/a 独立)
-        let qkvz = self.in_proj_qkvz.forward(xs, ctx); // [T, 2K+2V]
+        // 投影(臂由源事实选)
+        let pr = self.project(xs, ctx);
         // 刀3a'(2026-10-04):b/a 双权 GEMV 单发(自研 owl_gemv_dual_f16,
         // warp-per-row;杀 cublas gemvx + splitKreduce 各 ×48 = -96 节点
         // + 免 splitK 核时间;decode 专用 f16 臂 —— f32 语义锚链保持
         // Linear/cublas。输出 [T, 2·HV] 行堆叠,T=1 时列切 = 连续切片 →
         // BlockSlice 免费视图(刀1))。
-        let (b, a) = if xs.dtype == Dtype::F16 {
+        // ⚠️ 合法性门 = 权重 f16 直读(GEMV 核只吃 f16 位型);GGUF 档
+        // `ssm_alpha`/`ssm_beta` 是量化块 ⇒ 必走 forward(否则静默错值)。
+        let (b, a) = if xs.dtype == Dtype::F16
+            && self.in_proj_b.is_f16_direct()
+            && self.in_proj_a.is_f16_direct()
+        {
             // 形状律:xs = [T, hidden](空形状 = 声明失守 ⇒ **毒化**,
             // 原 `unwrap_or(0)` 会把 cols=0 交给核 = 静默错值;2026-10-17 审查)
             let hidden_gdn = match xs.shape().last() {
@@ -950,12 +1046,12 @@ impl GatedDeltaNet {
         };
 
         // qkvz 段切分(narrow;conv 权重不切 —— 段基址走 w_offset 标量;
-        // q/k/v 段偏移与分立时代一致,z 段接在 conv_dim 之后)
-        let qkv_w = conv_dim + value_dim;
-        let q = narrow_strided(&qkvz, tokens, qkv_w, 0, key_dim, vec![tokens, key_dim]);
-        let k = narrow_strided(&qkvz, tokens, qkv_w, key_dim, key_dim, vec![tokens, key_dim]);
-        let v = narrow_strided(&qkvz, tokens, qkv_w, 2 * key_dim, value_dim, vec![tokens, value_dim]);
-        let z = narrow_strided(&qkvz, tokens, qkv_w, conv_dim, value_dim, vec![tokens, value_dim]);
+        // 段内偏移与分立时代一致,行宽取投影产物自己的 `qkv_w`)
+        let qkv_w = pr.qkv_w;
+        let q = narrow_strided(&pr.qkv, tokens, qkv_w, 0, key_dim, vec![tokens, key_dim]);
+        let k = narrow_strided(&pr.qkv, tokens, qkv_w, key_dim, key_dim, vec![tokens, key_dim]);
+        let v = narrow_strided(&pr.qkv, tokens, qkv_w, 2 * key_dim, value_dim, vec![tokens, value_dim]);
+        let z = pr.z;
 
         // conv 三段独立发射(零拼接算子;state 原地滑窗;段基址 = w_offset)
         // D1 融合臂(env.gdn.fused_decode):v 段之后的六算子合一(v-conv +
@@ -1080,7 +1176,21 @@ impl Module for GatedDeltaNet {
 impl Loadable for GatedDeltaNet {
     fn layout(&self, ctx: &LoaderCtx) -> LoaderOps {
         let (k_dim, v_dim) = (self.key_dim(), self.value_dim());
-        self.in_proj_qkvz.layout(ctx)
+        // **投影臂的键面事实**(源事实驱动;两臂键不同 —— Merged 走虚拟合并键
+        // `in_proj_qkvz`(源侧拆 attn_qkv ⊕ attn_gate),Split 走两个真实键)
+        let proj_ops = match &self.proj {
+            GdnProj::Merged(l) => l
+                .layout(ctx)
+                // **融合权重的段长事实**(S4 ②;TP 分段切按它展开 —— 切分逻辑在
+                // 装载面,这里只声明"本张量怎么拼的"):narrow 顺序 = q|k|v|z
+                .with_segments_for("in_proj_qkvz", vec![k_dim, k_dim, v_dim, v_dim]),
+            GdnProj::Split { qkv, z } => qkv
+                .layout(ctx)
+                // 段长 = q|k|v(GGUF 的 attn_qkv 是单张量,段内型一致)
+                .with_segments_for("in_proj_qkv", vec![k_dim, k_dim, v_dim])
+                .chain(z.layout(ctx)),
+        };
+        proj_ops
             .chain(self.in_proj_b.layout(ctx))
             .chain(self.in_proj_a.layout(ctx))
             .chain(self.out_proj.layout(ctx))
@@ -1088,9 +1198,7 @@ impl Loadable for GatedDeltaNet {
             .chain(self.a_log.layout(ctx))
             .chain(self.dt_bias.layout(ctx))
             .chain(self.norm_w.layout(ctx))
-            // **融合权重的段长事实**(S4 ②;TP 分段切按它展开 —— 切分逻辑在
-            // 装载面,这里只声明"本张量怎么拼的"):narrow 顺序 = q|k|v|z 与 q|k|v
-            .with_segments_for("in_proj_qkvz", vec![k_dim, k_dim, v_dim, v_dim])
+            // conv 三段段长(q|k|v)
             .with_segments_for("conv1d", vec![k_dim, k_dim, v_dim])
     }
 }
@@ -1125,6 +1233,7 @@ pub mod fixture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::module::QuantPlan;
     use crate::testkit::{f32b, harvest, harvest_f16, gpu_client};
     use owl_macros::owl_test;
 
@@ -2135,6 +2244,7 @@ mod tests {
 #[cfg(test)]
 mod f16_tests {
     use super::*;
+    use crate::module::QuantPlan;
     use crate::contract::DeviceClient as _;
     use crate::testkit::gpu_client;
     use owl_macros::owl_test;

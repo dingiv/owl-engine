@@ -30,11 +30,11 @@
 //! - **CSE/DAG**:层内残差共享子树只求值一次;跨步状态(KV/GDN)
 //!   靠常驻块 + 每步重建声明推进。
 
-use crate::contract::Dtype;
+use crate::contract::{Dtype, ModelError};
 use crate::layers::decoder::DecoderLayer;
 use crate::layers::embedding::Embedding;
 use crate::layers::rmsnorm::RmsNorm;
-use crate::module::{ForwardCtx, KeyConvention, Loadable, LoaderCtx, LoaderOps, Module, QuantPlan};
+use crate::module::{ForwardCtx, KeyConvention, Loadable, LoaderCtx, LoaderOps, Module, PlanSource};
 use crate::TensorOps;
 
 // ============================================================================
@@ -126,38 +126,75 @@ impl Model {
     /// 实证 int4 lm_head +0.6%PPL/GSM8K 不变,推翻旧“输出头不量化”
     /// 裁决;embed 表恒 f16 —— 查表增益微小,int8 化另立项)。tied
     /// 模型 head_plan 无效(lm_head 复用 w)。
-    pub fn new(
+    ///
+    /// **2026-10-19 延展(GGUF 轮)**:两个 plan 参数型改为
+    /// `impl Into<PlanSource>` —— `QuantPlan` 字面量经 `From` 直落
+    /// `PlanKind::Uniform` 臂(既有调用点零改动),逐张量混型源(GGUF)
+    /// 改传 [`PlanSource::keyed`](逐键查表 + 源事实)。
+    ///
+    /// **返回值 = `Result`**(新增):Keyed 臂下模型可能问出表外的键
+    /// (缺键 / K-quant 形态不合法)⇒ 此处**响亮拒**——禁静默落 F16
+    /// (那会让显存账静默失真;设计 I-2)。
+    pub fn new<'a>(
         spec: &ModelSpec,
         keys: impl KeyConvention + Send + Sync + 'static,
-        plan: QuantPlan,
-        head_plan: QuantPlan,
-    ) -> Model {
-        let layers = spec
-            .layer_types
-            .iter()
-            .map(|&full| {
-                if full {
-                    let (hq, hkv, hd) = spec.full_heads;
-                    DecoderLayer::new_full(hq, hkv, hd, spec.hidden, spec.inter, spec.eps, plan)
-                } else {
-                    let (nk, hk_dim, nv, hv_dim) = spec.gdn_heads;
-                    DecoderLayer::new_gdn(nk, hk_dim, nv, hv_dim, spec.hidden, spec.inter, spec.eps, plan)
-                }
-            })
-            .collect();
+        plan: impl Into<PlanSource<'a>>,
+        head_plan: impl Into<PlanSource<'a>>,
+    ) -> Result<Model, ModelError> {
+        let plan: PlanSource<'a> = plan.into();
+        let head: PlanSource<'a> = head_plan.into();
+        let mut layers = Vec::with_capacity(spec.layer_types.len());
+        for (i, &full) in spec.layer_types.iter().enumerate() {
+            let src = plan.at_layer(i);
+            layers.push(if full {
+                let (hq, hkv, hd) = spec.full_heads;
+                DecoderLayer::new_full(hq, hkv, hd, spec.hidden, spec.inter, spec.eps, src)
+            } else {
+                let (nk, hk_dim, nv, hv_dim) = spec.gdn_heads;
+                DecoderLayer::new_gdn(nk, hk_dim, nv, hv_dim, spec.hidden, spec.inter, spec.eps, src)
+            });
+        }
+        // 计划表覆盖门(响亮;Keyed 臂)。为什么在**构造期**判:计划在此定形,
+        // 槽形状/显存账随之确定 ⇒ 缺键必须当场拒,而不能等到装载期
+        // (那时已按 f16 建槽,账已失真)。
+        let mut unresolved = plan.take_unresolved();
+        unresolved.extend(head.take_unresolved());
+        unresolved.sort();
+        unresolved.dedup();
+        if !unresolved.is_empty() {
+            return Err(ModelError::Msg(format!(
+                "Model::new: 计划表未覆盖 {} 个键(缺键或 K-quant 形态不合法 ⇒ 拒建):{}",
+                unresolved.len(),
+                unresolved.join(", ")
+            )));
+        }
+        // **tied 臂**:表真的要按计划定形 —— GGUF 的 `token_embd` 是量化块
+        // (4B = Q6_K)⇒ 槽= 块字节 + 查表自带解量化;HF 一切档位= f16 表。
+        // 键 = `KeyConvention::embed_key`(“词表键”的唯一出口)。
         let embed = if spec.tied {
-            Embedding::new(spec.vocab, spec.hidden)
+            Embedding::new_by_plan(
+                spec.vocab,
+                spec.hidden,
+                plan.at(&keys.embed_key("weight"), spec.vocab, spec.hidden),
+            )?
         } else {
-            Embedding::new_untied_quant(spec.vocab, spec.hidden, head_plan)
+            Embedding::new_untied_quant(
+                spec.vocab,
+                spec.hidden,
+                // **表自己的计划**(逐张量;GGUF 档的表是量化块 —— 与 tied/untied 无关)
+                plan.at(&keys.embed_key("weight"), spec.vocab, spec.hidden),
+                head.head(spec.vocab, spec.hidden),
+            )?
         };
-        Model {
+        Ok(Model {
             embed,
             layers,
-            norm: RmsNorm::new_add_one("norm", spec.hidden, spec.eps),
+            // 最终 norm 的语义随**源事实**:GGUF 已烘焙 +1 ⇒ ×w(设计 §11.3)
+            norm: RmsNorm::new_by_facts("norm", spec.hidden, spec.eps, plan.facts()),
             keys: Box::new(keys),
             hidden: spec.hidden,
             vocab: spec.vocab,
-        }
+        })
     }
 
     pub fn hidden(&self) -> usize {
@@ -387,9 +424,10 @@ impl Loadable for Model {
     /// tied embedding 的双 Want(直读 + 转置)同键改写,天然保持同键。
     fn layout(&self, ctx: &LoaderCtx) -> LoaderOps {
         let mut ops = self.embed.layout(ctx).map_keys(|k| self.keys.embed_key(k));
-        // untied lm_head:独立槽裸键(检查点顶层 `lm_head.weight`;零 map)
+        // untied lm_head:独立槽(**局部键**;全键经 head_key 改写 ——
+        // 第 4 类键:HF `lm_head.weight` / GGUF `output.weight`)
         if let Some(lm) = self.embed.layout_lm_head(ctx) {
-            ops = ops.chain(lm);
+            ops = ops.chain(lm.map_keys(|k| self.keys.head_key(k)));
         }
         for (i, layer) in self.layers.iter().enumerate() {
             ops = ops.chain(layer.layout(ctx).map_keys(|k| self.keys.layer_key(i, k)));
@@ -500,6 +538,7 @@ mod spec_shard_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::module::QuantPlan;
     use crate::layers::gdn::GdnBuffers;
     use crate::module::LlamaFamily;
     use crate::layers::rope::Rope;
@@ -636,7 +675,7 @@ mod tests {
             LlamaFamily::new("model.language_model"),
             QuantPlan::F16,
             QuantPlan::F16,
-        );
+        ).expect("Model::new");
         crate::interpreters::eval_load(&model, &mut face, &checkpoint_src(), &Default::default())
             .await
             .expect("model.eval_load(C10 声明路径)");
@@ -958,7 +997,7 @@ mod tests {
             LlamaFamily::new("model.language_model"),
             QuantPlan::F16,
             QuantPlan::F16,
-        );
+        ).expect("Model::new");
         let src = checkpoint_src();
         let mut gpu = gpu_client().await;
         crate::interpreters::eval_load(&model, &mut gpu, &src, &Default::default())
@@ -1082,7 +1121,7 @@ mod tests {
             LlamaFamily::new("model.language_model"),
             QuantPlan::F16,
             QuantPlan::F16,
-        );
+        ).expect("Model::new");
         let src = checkpoint_src();
         let mut gpu = gpu_client().await;
         crate::interpreters::eval_load(&model, &mut gpu, &src, &Default::default())

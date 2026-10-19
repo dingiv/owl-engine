@@ -23,6 +23,8 @@
 
 pub mod awq;
 pub(crate) mod awq_build;
+/// **GGUF 起点族**(2026-10-19;容器解析 + 元数据 + 内嵌词表 + 键约定 + 块字节源)
+pub mod gguf;
 pub mod kind;
 pub mod load;
 pub mod mmap;

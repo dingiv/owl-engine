@@ -199,6 +199,25 @@ pub enum SemanticKernel {
     /// marlin W4A8 × AWQ GEMM(int8 激活 + per-token fp32 尺度;8 父块 ——
     /// W4A8 线,2026-10-16:层侧按档位/选层显式声明而非常见于两档)
     MarlinW4A8Awq,
+    /// **GGUF 激活 → q8_1 块**(f16 入;MMVQ 喂料手;2026-10-19 gguf 轮)
+    /// —— 与 `QuantInt8RowF16` 同律:输出恒 U8,`dt` 载不了输入档 ⇒ 按输入
+    /// dtype 分 op_id(bf16 臂另立变体)
+    GgufQuantActF16,
+    /// 同上,bf16 入
+    GgufQuantActBf16,
+    /// **GGUF dequant-in-kernel GEMM**(MMVQ;权重 = GGUF 块字节,压缩驻留)。
+    /// 块型住 `aux[0]`(ggml 型码)→ driver 经 `family::gguf::entry_for` 单一
+    /// 映射拾取入口(H3:逐型一条准入声明)
+    GgufGemm,
+    /// **GGUF 量化表的行解量化**(查表臂;`token_embd` 在 GGUF 里是量化块,
+    /// 既不是 f16 表也不可解量化驻留 ⇒ 查表自带解量化;块型住 `aux[0]`,几何 = `rows_geom`)
+    GgufDequantRows,
+    /// **GGUF 激活侧列置换**(v-head 反重排:内维是 ggml tiled 序而 GDN 核
+    /// 产出 grouped 序;置换跨量化块 ⇒ 只能在激活侧等价置换,
+    /// **折进已要跑的激活量化核**:零额外发射零额外趟数。两档 dtype 各一入口。
+    GgufQuantActTiledF16,
+    /// 同上,bf16 入
+    GgufQuantActTiledBf16,
     /// FlashInfer paged prefill(f16 KV)
     FiPrefill,
     /// FlashInfer paged prefill(e4m3 KV)
@@ -298,6 +317,12 @@ impl SemanticKernel {
             SemanticKernel::DflashConv => "dflash.conv",
             SemanticKernel::NaiveAttnNc => "attn.naive_nc",
             SemanticKernel::NaiveAttnNcFp8kv => "attn.naive_nc_fp8kv",
+            SemanticKernel::GgufQuantActF16 => "gguf.quant_act_f16",
+            SemanticKernel::GgufQuantActBf16 => "gguf.quant_act_bf16",
+            SemanticKernel::GgufGemm => "gguf.gemm",
+            SemanticKernel::GgufDequantRows => "gguf.dequant_rows",
+            SemanticKernel::GgufQuantActTiledF16 => "gguf.quant_act_f16_tiled",
+            SemanticKernel::GgufQuantActTiledBf16 => "gguf.quant_act_bf16_tiled",
             SemanticKernel::MarlinW4A16 => "marlin.w4a16",
             SemanticKernel::MarlinW4A8Awq => "marlin.w4a8_awq",
             SemanticKernel::FiPrefill => "attn.fi_prefill",

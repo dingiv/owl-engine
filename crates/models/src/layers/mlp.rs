@@ -6,7 +6,7 @@
 //! 容器 + LoaderOps 装载形态(子层描述 chain 聚合)。
 
 use super::linear::Linear;
-use crate::module::{Loadable, LoaderCtx, LoaderOps, QuantPlan};
+use crate::module::{Loadable, LoaderCtx, LoaderOps, PlanSource};
 use crate::module::{ForwardCtx, Module};
 use crate::TensorOps;
 
@@ -19,11 +19,12 @@ pub struct Mlp {
 impl Mlp {
     /// 准备容器(hidden = 1024, intermediate = 3584 —— 0.8B 实测配置;
     /// `plan` = 量化计划构造期注入,尺寸门控在 Linear 内定形)
-    pub fn new(hidden: usize, intermediate: usize, plan: QuantPlan) -> Mlp {
+    pub fn new<'a>(hidden: usize, intermediate: usize, plan: impl Into<PlanSource<'a>>) -> Mlp {
+        let p = plan.into();
         Mlp {
-            gate_proj: Linear::new("gate_proj", intermediate, hidden, plan),
-            up_proj: Linear::new("up_proj", intermediate, hidden, plan),
-            down_proj: Linear::new("down_proj", hidden, intermediate, plan),
+            gate_proj: Linear::new("gate_proj", intermediate, hidden, p.of("gate_proj", intermediate, hidden)),
+            up_proj: Linear::new("up_proj", intermediate, hidden, p.of("up_proj", intermediate, hidden)),
+            down_proj: Linear::new("down_proj", hidden, intermediate, p.of("down_proj", hidden, intermediate)),
         }
     }
 }
@@ -63,6 +64,7 @@ impl Loadable for Mlp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::module::QuantPlan;
     use crate::testkit::{assert_close, f32b, harvest, hf_python, parity_enabled, skip_note, st_read, st_write, tmp_path, Src};
     use std::collections::HashMap;
     use crate::tensor::Dtype;

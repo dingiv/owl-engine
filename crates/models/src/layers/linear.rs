@@ -9,8 +9,82 @@ use crate::contract::Dtype;
 use crate::ops::SemanticKernel;
 use crate::layers::narrow_strided;
 use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, QuantPlan, Weight};
+use crate::formats::gguf::GgmlTy;
 use crate::formats::util::marlin_n_pack;
 use crate::TensorOps;
+
+/// **GGUF 块型 GEMM**(两发、零解量化中间态;设计 §四 L5 calltree)
+///
+/// ① `GgufQuantAct{_F16,_Bf16}`(激活 → q8_1 块:块内 warp 归约出 scale+sum);
+/// ② `GgufGemm`(权重块字节原样读,`vec_dot` 在核内解量化)。
+/// 权重**压缩驻留**(18G 的 27B Q4_K_M 可上单卡,而 f16 需 54G)。
+///
+/// **唯一实现 · 两个消费者**:[`Linear::forward_inner`](普通权重)与
+/// [`Embedding::lm_head_matmul`](tied 量化表兼输出头 —— 同一张 `[vocab, hidden]`
+/// 表既查表又做头 GEMM,设计 §11.5 ②)。两份实现 = 接口不唯一 ⇒ 这里只有一个。
+///
+/// 槽序/几何见 `ops/gguf.rs` 与 `family/gguf.rs::gemm_geom`;
+/// 激活 dtype 分档(输出恒 `U8`,`dt` 载不了输入档 ⇒ 两个 op_id 各一档)。
+pub(crate) fn gguf_quant_gemm(
+    w: &Weight,
+    ty: GgmlTy,
+    xs: &TensorOps,
+    out_dim: usize,
+    in_dim: usize,
+    col_index: Option<&Weight>,
+) -> TensorOps {
+    // 形状律:xs = [.., in](空形状 = 声明失守 ⇒ **毒化**,不 panic)
+    if xs.shape().is_empty() {
+        return TensorOps::poisoned(Dtype::F16, vec![out_dim], "GGUF GEMM: xs 形状为空(需 [.., in])");
+    }
+    let m: usize = xs.shape()[..xs.shape().len() - 1].iter().product();
+    let k = in_dim;
+    if k % 32 != 0 {
+        return TensorOps::poisoned(
+            Dtype::F16,
+            vec![m, out_dim],
+            format!("GGUF GEMM: in_dim {k} 不是 q8_1 块(32)的整数倍"),
+        );
+    }
+    // 激活量化核:按 **(激活 dtype, 是否有列序表)** 四选一
+    // (列序表 = 本层权重的**内维**处于 ggml tiled 序 ⇒ 激活必须按 32 元素块
+    // 置换着喂;置换折进量化核本身 —— 零额外发射,与“先 gather 再量化”逐位等)
+    let act = match (xs.dtype, col_index.is_some()) {
+        (Dtype::F16, false) => SemanticKernel::GgufQuantActF16,
+        (Dtype::BF16, false) => SemanticKernel::GgufQuantActBf16,
+        (Dtype::F16, true) => SemanticKernel::GgufQuantActTiledF16,
+        (Dtype::BF16, true) => SemanticKernel::GgufQuantActTiledBf16,
+        (other, _) => {
+            return TensorOps::poisoned(
+                Dtype::F16,
+                vec![m, out_dim],
+                format!("GGUF GEMM: 激活 dtype {other:?} 无对应量化臂(需 F16/BF16)"),
+            )
+        }
+    };
+    let xq_row = k / 32 * crate::formats::gguf::Q8_1_BLOCK_BYTES; // q8_1 块 = half2 ds(2+2) + qs(32) = 36B
+    let act_call = match col_index {
+        // 槽序对位 `.cu`:tiled 变体把表插在 x 与输出之间
+        Some(t) => TensorOps::call(act).arg(xs).arg(&t.decl()),
+        None => TensorOps::call(act).arg(xs),
+    };
+    let xq = act_call
+        .arg_i32(k as i32)
+        .arg_i32(k as i32)
+        .aux(&[m, k])
+        .with_shape(Dtype::U8, vec![m, xq_row]);
+    TensorOps::call(SemanticKernel::GgufGemm)
+        .arg(&w.decl())
+        .arg(&xq)
+        .arg_i32(m as i32)
+        .arg_i32(out_dim as i32)
+        .arg_i32(k as i32)
+        .arg_i32(k as i32)
+        .arg_i32(0)
+        .arg_i32(out_dim as i32)
+        .aux(&[ty.code() as usize, m, out_dim])
+        .with_shape(Dtype::F16, vec![m, out_dim])
+}
 
 pub struct Linear {
     /// 权重槽 [out, in](检查点原生布局,零转置)
@@ -31,6 +105,14 @@ pub struct Linear {
     /// `pack_marlin_s_a8` 第二返回值 `max/4096`)。`Some` = 本层走 a8 臂
     /// (**单一事实源**:因子在则 a8 在)。
     a8_factor: Option<Weight>,
+    /// **GGUF 块型**(2026-10-19):`Some` = 本层权重以 GGUF 块字节驻留
+    /// (槽 dtype=U8、形状 [out, row_bytes]);forward 走 quant_act + gemm 两发
+    gguf_ty: Option<crate::formats::gguf::GgmlTy>,
+    /// **GGUF 内维列序表**(设计 §11.4 落点 A2):`Some` = 本层权重的**内维**
+    /// 处于 ggml **tiled** 序(`ssm_out` 的 v-head 反重排)⇒ 喂它的激活须按
+    /// 32 元素块置换 —— 折进激活量化核(零额外发射)。表 = `U32[in_dim/32]`,
+    /// 由源侧**虚拟键**生成并常驻显存(见 `GgufSource::virtual_perm`)。
+    gguf_col_index: Option<Weight>,
     /// **TP 角色标记**(S4 ③';构造期从规则表算一次 —— **纯标注,零决策**:
     /// 层不构造通信节点,只把它透传到图节点上,解释器统一追加 allreduce)
     tp_role: crate::plan::rules::WeightRule,
@@ -59,10 +141,13 @@ impl Linear {
             ws: None,
             ctmp: None,
             a8_factor: None,
+            gguf_ty: None,
+            gguf_col_index: None,
             tp_role: crate::plan::rules::rule_of(key),
         };
         let eligible = crate::formats::util::marlin_eligible(out_dim, in_dim);
         match plan {
+            QuantPlan::Gguf(ty) => lin.shape_gguf(ty),
             QuantPlan::W4A16 if eligible => lin.quantize_g128(),
             QuantPlan::W4A16Awq if eligible => lin.quantize_awq32(),
             QuantPlan::W4A8Awq if eligible => lin.quantize_awq_a8(),
@@ -71,9 +156,63 @@ impl Linear {
         lin
     }
 
+    /// 权重�@ f16 直读态(**逐层旁路的合法性判据**):未量化且非 GGUF 块型
+    /// ⇒ 槽里真的是 f16 位型。
+    ///
+    /// 为什么要有这个门:自研 GEMV 旁路(`weight_decl()` + `GemvDual`)
+    /// 只吃 f16 位型 —— 量化档若误走旁路,核会把块字节当 f16 读(静默错值)。
+    /// 旧世界量化档的 `b`/`a`(out 极小)因尺寸门控总落 f16 ⇒ 雷未爆;
+    /// **GGUF 是第一个 b/a 也量化的档位**(`ssm_alpha`/`ssm_beta`)。
+    pub fn is_f16_direct(&self) -> bool {
+        self.quant_group.is_none() && self.gguf_ty.is_none()
+    }
+
     /// 取出权重槽(单权重基本函数 `load_weight` 的入口;消费层容器)
     pub fn into_weight(self) -> Weight {
         self.w
+    }
+
+    /// **挂内维列序表**(GGUF `ssm_out` 的 v-head 反重排;设计 §11.4 落点 A2)。
+    ///
+    /// 两条不变式(**响亮**,不静默):
+    /// 1. 只在 **GGUF 量化臂**下合法 —— f16 直读臂没有激活量化这一步,
+    ///    表会被静默忽略 ⇒ 那种场景必须由**源侧装载期**把列序扭回来
+    ///    (native 件的列置换,`GgufSource::read_elements`);
+    /// 2. 表长必须 = `in_dim / 32`(与激活量化核的块数同口径;不等 = 静默错值)。
+    pub fn set_gguf_col_index(&mut self, t: Weight) {
+        assert!(
+            self.gguf_ty.is_some(),
+            "Linear::set_gguf_col_index: 本层不是 GGUF 量化臂(gguf_ty = None)—— \
+             f16 臂没有激活量化,列序表会被静默忽略(native 件请走源侧装载期列置换)"
+        );
+        let want = self.in_dim / 32;
+        let got = t.shape().first().copied().unwrap_or(0);
+        assert_eq!(
+            got, want,
+            "Linear::set_gguf_col_index: 表长 {got} ≠ in_dim/32 = {want}(与激活量化核的块数不同口径)"
+        );
+        self.gguf_col_index = Some(t);
+    }
+
+    /// **GGUF 块型定形**(2026-10-19;构造期私有):权重槽 = 原始块字节
+    /// (`U8`、形状 `[out, 块行字节]`),不转不复排 —— 块布局 = 内核读序。
+    ///
+    /// 形态门:最内维必须被块元素数整除(不满足 = 块布局无定义 ⇒ **响亮拒**);
+    /// 未移植型由 `entry_for` 在 forward 期拒(此处只管槽形态 —— 声明面不该
+    /// 因“内核还没写”而无法构造,否则装载测试也跑不了)。
+    fn shape_gguf(&mut self, ty: crate::formats::gguf::GgmlTy) {
+        let (be, bb) = ty.block();
+        assert!(
+            self.in_dim % be == 0,
+            "GGUF {}: 最内维 {} 不是块大小 {} 的整数倍(块布局无定义)",
+            ty.name(),
+            self.in_dim,
+            be
+        );
+        let row_bytes = self.in_dim / be * bb;
+        // **零拷贝直读**:同名键、同形状(行主序),只是行宽单位从元素变成字节
+        self.w = Weight::new_typed(self.w.key(), vec![self.out_dim, row_bytes], Dtype::U8);
+        self.gguf_ty = Some(ty);
     }
 
     /// W4A16 定形(E3;REQ-PRE-01,构造期私有):forward 换 marlin GEMM
@@ -208,6 +347,10 @@ impl Module for Linear {
 impl Linear {
     /// ctx 无关前向(Embedding::lm_head_matmul 复用;14 个调用点零改动)。
     pub(crate) fn forward_inner(&self, xs: &TensorOps) -> TensorOps {
+        // ---- **GGUF 块型臂**(2026-10-19):激活 → q8_1 → dequant-in-kernel GEMM ----
+        if let Some(ty) = self.gguf_ty {
+            return gguf_quant_gemm(&self.w, ty, xs, self.out_dim, self.in_dim, self.gguf_col_index.as_ref());
+        }
         // ---- W4A8 × AWQ 臂(S2):激活量化 → a8 GEMM ----
         //
         // 与 a16 臂**同源不同布局**;两处本仓特有的形态:
@@ -377,7 +520,15 @@ impl Loadable for Linear {
                 ops.chain(ws.layout_as(format!("{base}.marlin_ws"), ctx))
                     .chain(ctmp.layout_as(format!("{base}.marlin_ctmp"), ctx))
             }
-            _ => self.w.layout(ctx),
+            _ => {
+                let ops = self.w.layout(ctx);
+                // GGUF 内维列序表:与权重**同层声明**(键 = `blk.N.ssm_out.perm`
+                // 虚拟键,源侧合成字节;见 `GgufSource::virtual_perm`)
+                match &self.gguf_col_index {
+                    Some(t) => ops.chain(t.layout(ctx)),
+                    None => ops,
+                }
+            }
         }
     }
 }

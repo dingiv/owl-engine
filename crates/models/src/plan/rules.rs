@@ -152,6 +152,12 @@ pub fn want_axis(key: &str) -> WantAxis {
 }
 
 /// **键 → 规则**(唯一入口;探测顺序从具体到一般)。
+///
+/// ⚠️ **只认 owl 语义名**(`gate_proj`/`out_proj`/`in_proj_qkvz`…),**不认**
+/// GGUF 的文件名(`blk.N.ffn_gate` 等):AR 标记在**层构造期**查表(那时用的
+/// 就是短键),GGUF 的分片几何又走"源自担"路线(`formats/gguf/shard.rs` 的
+/// 角色表)—— 所以全键永远不会到这里。将来若有代码拿**全键**查本表,必须先
+/// 经 `GgufConvention` 反译;否则会静默落 `Replicate`(漏 AR)。
 pub fn rule_of(key: &str) -> WeightRule {
     // 非数据派生件(scratch/标量):一律不切(形状已按分片 spec 声明)
     if is_scratch_key(key) {

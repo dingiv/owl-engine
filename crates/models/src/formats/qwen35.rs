@@ -388,7 +388,7 @@ mod tests {
             Qwen35Convention::new("model.language_model"),
             crate::module::QuantPlan::F16,
             crate::module::QuantPlan::F16,
-        );
+        ).expect("Model::new");
         let mut opts = LoadOpts::plain(spec.dtype);
         // 逐键分相账(`OWL_LOAD_DEBUG=1`;装载测速/瓶颈定位用)
         opts.debug_tap = owl_shared::env_reader::flag("OWL_LOAD_DEBUG");
@@ -991,7 +991,7 @@ mod tests {
             Qwen35Convention::new("model.language_model"),
             crate::module::QuantPlan::F16,
             crate::module::QuantPlan::F16,
-        );
+        ).expect("Model::new");
         let manifest = {
             let src = crate::formats::safetensors::SafeTensorsSource::open_dir(&dir)?;
             let ctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
