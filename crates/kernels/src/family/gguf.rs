@@ -315,16 +315,41 @@ pub const fn range_entry_for(ty: GgmlTy) -> Option<&'static str> {
     }
 }
 
-/// 行窗解量化几何:`grid = (rows, k / qk)`,`block = (32, 1, 1)`
-/// (Q5_K/Q6_K 的 64 线程型由 `RowDeq` 两趟覆盖 ⇒ 32 线程即可)。
+/// 行窗解量化几何(v2;`grid = ceil(rows·(k/GQ) / (NW·GPW))`、`block = (32, NW)`)。
+///
+/// **v1 → v2**(W-2e):v1 是 `grid = (rows, k/qk)`、`block = (32,1,1)`(一 CTA 一块,
+/// 窄写),实测 Q8_0 388 / Q4_K 273 GB/s ⇒ 改成"组 = 256 元素 + 8 warp/CTA +
+/// 16 B/lane 向量落盘"(详见 `.cu` 头注)。常量与 `cu/gguf/gguf_smem.cu`
+/// `namespace owl_gguf_range` **逐项互锁**(单测 `range_geom_matches_cu`)。
+pub const RANGE_NW: usize = 8;
+/// 每 warp 组数
+pub const RANGE_GPW: usize = 4;
+/// 组宽(元素)= 512 B
+pub const RANGE_GQ: usize = 256;
+
+/// 本臂前置:`k % GQ == 0`(与 `.cu` 的 `gpr = k / GQ` 同一判据)。
+pub const fn range_ok(ty: GgmlTy, k: usize) -> bool {
+    range_entry_for(ty).is_some() && k % RANGE_GQ == 0
+}
+
 pub fn range_geom(ty: GgmlTy, rows: usize, k: usize) -> Option<((u32, u32, u32), (u32, u32, u32))> {
     let (be, _) = ty.block();
-    if range_entry_for(ty).is_none() || be == 0 || k % be != 0 {
+    if range_entry_for(ty).is_none() || be == 0 || k % be != 0 || k % RANGE_GQ != 0 {
         return None;
     }
-    let gx = rows.max(1) as u32;
-    let gy = (k / be).max(1) as u32;
-    Some(((gx, gy, 1), (32, 1, 1)))
+    let total = (rows.max(1) * (k / RANGE_GQ)).max(1);
+    let per_cta = RANGE_NW * RANGE_GPW;
+    let gx = total.div_ceil(per_cta).max(1) as u32;
+    Some(((gx, 1, 1), (32, RANGE_NW as u32, 1)))
+}
+
+// ---- **内维列序 gather**(W-2e;`ssm_out` 的 tiled → grouped)------------------
+/// `owl_gather_cols_f16`(f16;`out[.., 32·i] = x[.., 32·tbl[i]]`)
+pub const GATHER_COLS_F16: &str = "owl_gather_cols_f16";
+
+/// gather 几何:`grid = (rows, 1, 1)`、`block = (256, 1, 1)`
+pub fn gather_geom(rows: usize) -> ((u32, u32, u32), (u32, u32, u32)) {
+    ((rows.max(1) as u32, 1, 1), (256, 1, 1))
 }
 
 // ---- **官方 MMQ**(W-2c;tensor-core prefill)--------------------------------

@@ -241,50 +241,123 @@ __device__ __forceinline__ void body(
 } // namespace owl_gguf_smem
 
 // ============================================================================
-// **行窗解量化**(W-2d 的 dequant+cuBLAS 臂用):`[n0, n0+rows)` 行 → f16 `[rows, k]`
+// **行窗解量化 v2**(W-2e;dequant+cuBLAS 臂的喂料手):`[n0, n0+rows)` 行 → f16
 //
-// 几何:`grid = (rows, k / qk)`,`block = (32, 1, 1)` —— 一个 CTA 解一个块;
-// 逐型行解量化**复用本文件的 `RowDeq`**(与 smem 臂同一份数学,零第二实现;
-// Q5_K/Q6_K 的 64 线程型由 `RowDeq::run` 的两趟覆盖吸收)。
+// # v1 的问题(2026-10-19 nsys 定谳)
+//
+// v1 几何 = `grid = (rows, k/qk)`、`block = (32,1,1)`:一个 CTA 一个块 ⇒
+// ① 每 CTA 只有 1 warp(调度/发射开销摊在 32 B 读 + 64 B 写上);
+// ② 落盘是**窄写**(Q8_0 = 每 lane 2 B / 整 warp 64 B;K-quant = 8 条窄写)。
+// 实测 Q8_0 388 GB/s、Q4_K 273 GB/s(卡 936 GB/s)⇒ dequant 占 prefill 21%。
+//
+// # v2 的三改(数学零改动)
+//
+//   ① **组 = 256 元素**(= 512 B):K-quant = 1 个超块,Q8_0 = 8 个块
+//      (与 `RowDeq` 的逐块/两趟语义天然兼容);
+//   ② CTA = `NW` warp(**256 线程**),每 warp 连续吃 `GPW` 组 ⇒ 每 CTA 4 KB;
+//      解量化仍按原协作式写 **smem**(片内窄写无代价);
+//   ③ 出 smem → 全局**一条 uint4**(16 B/lane,整 warp 512 B 连续)。
+//
+// 几何(唯一产地 `family::gguf::range_geom`;两边由单测互锁):
+//   `grid = ceil(rows·(k/256) / (NW·GPW))`、`block = (32, NW)`、smem 静态 4 KB
+// 前置:`k % 256 == 0`(调用方门;
+// 27B 的 5120/6144/10240/17408 全满足)。
 // ============================================================================
+namespace owl_gguf_range {
+
+constexpr int NW = 8;    // 每 CTA warp 数(256 线程)
+constexpr int GPW = 4;   // 每 warp 组数
+constexpr int GQ = 256;  // 组宽(元素)
+
+/// 共享体:`gi` = 全局组序号(组 = 一行内的 256 元素窗)
 template <typename block_q_t, int qk, void (*ROW)(const void *, __half *, int)>
 __device__ __forceinline__ void range_body(const void * __restrict__ w,
                                            __half * __restrict__ out, int n0, int rows, int k) {
-    const int r = blockIdx.x;
-    const int b = blockIdx.y;
-    if (r >= rows) {
-        return;
+    __shared__ __half stage[NW * GQ];  // 每 warp 一格(512 B)
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    __half * s = stage + warp * GQ;
+
+    const int nb = k / qk;              // 每行块数
+    const int gpr = k / GQ;             // 每组行内组数
+    const int total = rows * gpr;       // 本次行窗的组总数
+    const int base = (blockIdx.x * NW + warp) * GPW;
+
+    for (int g = 0; g < GPW; ++g) {
+        const int gi = base + g;
+        if (gi >= total) {
+            return;
+        }
+        const int r = gi / gpr;
+        const int gg = gi - r * gpr;
+        const block_q_t * src = reinterpret_cast<const block_q_t *>(w)
+                                + (size_t) (n0 + r) * (size_t) nb + (size_t) gg * (GQ / qk);
+#pragma unroll
+        for (int b = 0; b < GQ / qk; ++b) {
+            owl_gguf_smem::RowDeq<block_q_t, qk, ROW>::run(
+                reinterpret_cast<const void *>(src + b), s + b * qk, lane);
+        }
+        __syncwarp();
+        // 512 B 连续落盘:1 条 16 B/lane 的向量写(地址恒 512 B 对齐:
+        // k 与 GQ 都是 256 的倍数 ⇒ 行基 + 组基都是 8 的倍数)
+        *reinterpret_cast<uint4 *>(out + (size_t) r * (size_t) k + (size_t) gg * GQ + lane * 8) =
+            *reinterpret_cast<const uint4 *>(s + lane * 8);
+        __syncwarp();
     }
-    const int nb = k / qk;
-    if (b >= nb) {
-        return;
-    }
-    const block_q_t * rowp =
-        reinterpret_cast<const block_q_t *>(w) + (size_t) (n0 + r) * (size_t) nb;
-    owl_gguf_smem::RowDeq<block_q_t, qk, ROW>::run(
-        reinterpret_cast<const void *>(rowp + b), out + (size_t) r * (size_t) k + (size_t) b * qk,
-        threadIdx.x);
 }
+
+} // namespace owl_gguf_range
 
 extern "C" __global__ void owl_gguf_dequant_range_q8_0(const void * __restrict__ w,
                                                         __half * __restrict__ out, int n0,
                                                         int rows, int k) {
-    range_body<block_q8_0, QK8_0, owl_gguf_smem::row_q8_0>(w, out, n0, rows, k);
+    owl_gguf_range::range_body<block_q8_0, QK8_0, owl_gguf_smem::row_q8_0>(w, out, n0, rows, k);
 }
 extern "C" __global__ void owl_gguf_dequant_range_q4k(const void * __restrict__ w,
                                                       __half * __restrict__ out, int n0, int rows,
                                                       int k) {
-    range_body<block_q4_K, QK_K, owl_gguf_smem::row_q4_K>(w, out, n0, rows, k);
+    owl_gguf_range::range_body<block_q4_K, QK_K, owl_gguf_smem::row_q4_K>(w, out, n0, rows, k);
 }
 extern "C" __global__ void owl_gguf_dequant_range_q5k(const void * __restrict__ w,
                                                       __half * __restrict__ out, int n0, int rows,
                                                       int k) {
-    range_body<block_q5_K, QK_K, owl_gguf_smem::row_q5_K>(w, out, n0, rows, k);
+    owl_gguf_range::range_body<block_q5_K, QK_K, owl_gguf_smem::row_q5_K>(w, out, n0, rows, k);
 }
 extern "C" __global__ void owl_gguf_dequant_range_q6k(const void * __restrict__ w,
                                                       __half * __restrict__ out, int n0, int rows,
                                                       int k) {
-    range_body<block_q6_K, QK_K, owl_gguf_smem::row_q6_K>(w, out, n0, rows, k);
+    owl_gguf_range::range_body<block_q6_K, QK_K, owl_gguf_smem::row_q6_K>(w, out, n0, rows, k);
+}
+
+// ============================================================================
+// **内维列序 gather**(f16;W-2e):`out[.., 32·i] = x[.., 32·tbl[i]]`
+//
+// 为什么要它:GGUF 转换器把 `ssm_out` 的**内维**(v-head 轴)写成 ggml tiled 序,
+// 而 owl 的 GDN 核产 grouped 序。置换单元 = **32 元素块**(`hv=128` < 超块 256 ⇒
+// 跨块不可逆 ⇒ 只能在激活侧等价置换)。
+//
+// 此前这条置换**折进激活量化核**(`gguf.quant_act_f16_tiled`)—— 那只覆盖 MMVQ/
+// tile 两臂;**cuBLAS / MMQ 臂直吃 f16/q8_1 激活** ⇒ `ssm_out` 只能退回自研 tile
+// 臂(实测 2.67 ms/次,占 prefill 19%;见设计 §19.5)。本核把置换抽成**独立一发**:
+// 先把激活按块序 gather 成 f16(置换后),再走与其它层**完全相同**的臂 ⇒
+// `ssm_out` 也吃 cuBLAS/MMQ(代价 = 每层一次 m×k×2B×2 的拷贝 ~20 µs)。
+//
+// 几何:`grid = (rows, 1, 1)`、`block = (256, 1, 1)`;每 lane 一次 8 元素(16 B)。
+// 前置:`k % 8 == 0`(GGUF 内维恒为 32 的倍数)。
+// ============================================================================
+extern "C" __global__ void owl_gather_cols_f16(const __half * __restrict__ x,
+                                               const unsigned int * __restrict__ tbl,
+                                               __half * __restrict__ out, int rows, int k) {
+    const int row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+    const size_t base = (size_t) row * (size_t) k;
+    for (int e = threadIdx.x * 8; e < k; e += blockDim.x * 8) {
+        const unsigned int blk = tbl[e >> 5];              // 源块号(32 元素块)
+        const int src = (int) (blk << 5) + (e & 31);       // 块内偏移不变
+        *reinterpret_cast<uint4 *>(out + base + e) = *reinterpret_cast<const uint4 *>(x + base + src);
+    }
 }
 
 // ---- M1 实例集(四型)----

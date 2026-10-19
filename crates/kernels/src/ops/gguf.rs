@@ -109,6 +109,29 @@ gguf_range_spec!(GgufRangeQ4K, crate::family::gguf::RANGE_Q4K);
 gguf_range_spec!(GgufRangeQ5K, crate::family::gguf::RANGE_Q5K);
 gguf_range_spec!(GgufRangeQ6K, crate::family::gguf::RANGE_Q6K);
 
+// ---- **内维列序 gather**(W-2e;`ssm_out` tiled → grouped)------------------------
+//
+// 槽序与 `.cu` 实例同形:`x[F16,2], tbl[U32,1], out[F16,2], rows, k`
+// (表 = 32 元素块序表;`out[.., 32·i] = x[.., 32·tbl[i]]`)
+
+/// `owl_gather_cols_f16`
+pub struct GgufGatherCols;
+
+impl KernelSpec for GgufGatherCols {
+    const ENTRY: &'static str = crate::family::gguf::GATHER_COLS_F16;
+    const SRC: &'static str = crate::family::gguf::SMEM_SRC;
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("x", Dtype::F16, 2),
+        Param::t_in("tbl", Dtype::U32, 1),
+        Param::t_out("out", Dtype::F16, 2),
+        Param::i32("rows"),
+        Param::i32("k"),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
 // ---- **官方 MMQ**(W-2c;tensor-core prefill)———————————————
 //
 // 槽序 = 适配 TU `gguf_mmq.cu` 的形参序(6 参:3 张量 + 3 标量);几何由
@@ -380,6 +403,9 @@ pub static RANGE_Q4K: KernelMeta = meta_of::<GgufRangeQ4K>();
 pub static RANGE_Q5K: KernelMeta = meta_of::<GgufRangeQ5K>();
 pub static RANGE_Q6K: KernelMeta = meta_of::<GgufRangeQ6K>();
 
+// ---- 内维列序 gather 的元数据表项(W-2e)----
+pub static GATHER_COLS_F16: KernelMeta = meta_of::<GgufGatherCols>();
+
 // ---- MMQ 的元数据表项 ----
 pub static MMQ_Q8_0: KernelMeta = meta_of::<GgufMmqQ8_0>();
 pub static MMQ_Q4K: KernelMeta = meta_of::<GgufMmqQ4K>();
@@ -413,6 +439,7 @@ pub static METAS: &[&KernelMeta] = &[
     &RANGE_Q4K,
     &RANGE_Q5K,
     &RANGE_Q6K,
+    &GATHER_COLS_F16,
     &QUANT_ACT_F16,
     &QUANT_ACT_BF16,
     &QUANT_ACT_F16_TILED,

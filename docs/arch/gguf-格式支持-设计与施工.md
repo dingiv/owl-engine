@@ -1282,3 +1282,83 @@ cublasGemmEx(..., CUBLAS_OP_T, CUBLAS_OP_N,
 ⇒ W-2e 清单(下一刀,按收益排序):①`ssm_out` 的 `_tiled` 行窗解量化(去掉
 2.67 ms 的热点)②解量化网格/tile 调优(或"每个 Linear 解一次进 f16 常驻"对
 小权重档)③cuBLAS 形状扫描(按 `m` 选 tile)。
+
+## 二十、W-2e:cuBLAS 臂的三处定位收口(2026-10-19;**prefill 364 → 1067 t/s**)
+
+### 20.1 先立 ground truth(不做这一步就会瞎调)
+
+torch/cuBLAS 在本机(3090 Ti,**本仓的 GEMM 形状**)实测:
+
+| m(批) | n(权重行) | k | 用时 | TFLOPS |
+|---:|---:|---:|---:|---:|
+| 512 | 2048 | 5120 | 199 µs | 53.9 |
+| 512 | 17408 | 5120 | 1623 µs | 56.2 |
+| 512 | 248320 | 2560 | 10301 µs | 63.2 |
+| 1024 | 2048 | 5120 | 335 µs | **64.2** |
+| 128 | 2048 | 5120 | 48 µs | 55.9 |
+
+⇒ 3090 Ti 的 **f16×f32 累加**张量核在本形状域的天花板 = **55-65 TFLOPS**
+(理论 fp16-f32acc ≈ 80 TFLOPS 的 70-80%;fp16 累加另有一倍但数值不可用,见 §19.5)。
+**判据从此有了分母**:W-2d 的 333 t/s ≈ 18 TFLOPS ⇒ 在 cuBLAS 的 1/3 处。
+
+### 20.2 三处定位 → 三个落地件
+
+| # | 定位(§19.5) | 落地 | 文件 |
+|---|---|---|---|
+| ① | `ssm_out` 只能回退自研 tile 臂(2.67 ms/次,19%) | **`owl_gather_cols_f16`**:tiled→grouped 的 32 元素块 gather,置换一次(≈20 µs/层)后与普通层**同路** | `cu/gguf/gguf_smem.cu` · `family::gguf::GATHER_COLS_F16` · `driver` `gguf.gather_cols` · `layers/linear.rs` 头部 |
+| ② | 解量化 388/273 GB/s(**一 CTA 一块、32 线程、窄写**) | **行窗解量化 v2**:组 = 256 元素(=Q8_0 八块 / K-quant 一超块),CTA = 8 warp,解量化进 smem 后**一条 uint4(16 B/lane)向量落盘** | `gguf_smem.cu::owl_gguf_range` · `family::gguf::{RANGE_NW,RANGE_GPW,RANGE_GQ,range_geom}` |
+| ③ | cuBLAS 行窗 960/2048 行 ⇒ 每发只 30-67 CTA(0.4-0.8 波) | **行窗预算 32 → 96 MiB**(27B 大张量 1-3 块/发,每发数百 CTA);`OWL_GGUF_CUBLAS_TILE` 仍可强制 A/B | `layers/linear.rs` |
+
+**关键机制记一笔**:cuBLAS 的 CTA 数 = `ceil(rows/128) × ceil(m/128)`,而**每个行窗
+是独立一发**(同流串行)⇒ 窗不够大就是白丢 SM。旧档 960 行 × m=1024 → 7.5×8 ≈ 60 CTA
+/ 84 SM = **0.7 波**;现档 8704 行 → 68×8 = 544 CTA = 6.5 波。这一条比"换 tile 形状"
+更基本 —— **先让每次发射喂饱机器**。
+
+### 20.3 门
+
+| 门 | 判据 | 结果 |
+|---|---|---|
+| `gpu_gguf_cublas_dst_arm_matches_mmvq` | 4B+27B 真实张量 × m=128/512 | 2.4e-3 ~ 8.5e-3(与 v1 同量级)✅ |
+| **`gpu_gguf_ssm_out_gather_matches_tiled_act`**(新) | ①gather 字节 == host 同表置换 ②`gather+plain 量化` 与 `tiled 量化` 的 q8_1 **逐字节相同** ③两路 GEMM **位级相同** | ①②③全绿 ✅ |
+| `gpu_gguf_prefill_probe`(改) | 两臂(cuBLAS / MMQ)× chunk 512/1024,首 token 一致 | 首 token `" The"` 全同 ✅ |
+
+### 20.4 实测(同机同日,`llm_speedtest std` 五点三轮;3090 Ti 41:00.0)
+
+| `prefill_chunk` | std avg | @512 | @1024 | @2048 | @4096 | @8192 |
+|---:|---:|---:|---:|---:|---:|---:|
+| **1024**(旧档) | 964.4 | 833 | 1005 | 1000 | 998 | 987 |
+| 2048 | 1019.7 | 830 | 1002 | 1125 | 1121 | 1110 |
+| **4096** | **1058.6** | 834 | 1004 | 1124 | 1173 | 1159 |
+| 8192 | 1066.9 | 833 | 1006 | 1126 | 1175 | 1193 |
+
+- **W-2d 基线 364 t/s(avg)→ 964(同 chunk)⇒ 2.65×**;换 chunk 4096 再 **+9.8%**。
+- decode **不动**(36.6 t/s;臂集未变)。
+- chunk 阶梯的机理:**每个 chunk 都要把 17.7 GB 权重解一遍**(dequant 88 ms/chunk)
+  ⇒ chunk 越大,摊到每 token 的解量化越少;4096 之后边际收益 <1%,而切片显存
+  (m=8192 的 ffn 中间张量 285 MB×2 = 543 MB)不再划算 ⇒ **flavor 取 4096**。
+
+### 20.5 新分布(nsys,chunk 1024,1001-token prompt,prefill 部分)
+
+| 项 | 时间 | 占比 | 说明 |
+|---|---:|---:|---|
+| cuBLAS f16 GEMM | 730 ms | 72% | **68 TFLOPS = §20.1 天花板的 105%**(已吃满) |
+| attention(`vllm_chunked_prefill_paged_attn hd256`) | 148 ms | 14.5% | 12.3 GFLOP/层 ⇒ 2.7 TFLOPS(**非 GGUF 面**) |
+| GDN `recurrence_varlen_gqa` | 133 ms | 13% | 48 层 × 1.39 ms(**非 GGUF 面**) |
+| dequant(四型合计) | 88 ms | 8.6% | v2 后 433 GB/s 有效(含写 37.7 GB) |
+| 其它(quant/silu/norm/gather…) | ~40 ms | 4% | |
+
+⇒ **GGUF 专属的最后一个大头是那 8.6% 的解量化**,而它已经是"每条 chunk 权重解一遍"
+的理论下限量级;再往下要么把它藏进 GEMM 的空隙(需要第二流/事件,引擎机制),
+要么彻底不搬(**int8 MMA 的 MMQ = §18 的同代版没有 mma,须薅 head 版**)。
+
+### 20.6 结论与下一刀
+
+1. **cuBLAS 臂已在 f16 天花板上**(68 TFLOPS)。想再翻倍只有两条路:
+   ① `CUBLAS_COMPUTE_16F` —— **数值不可用**(k=5120 时 f16 累加误差 O(10),§19.5);
+   ② **int8 MMA 的 MMQ**(head 版 `mmq-config-ampere` 有 x=8..128 一整套,
+      `mmq.cu+mmq.cuh+mmq-vec-dot+mmq-load-tiles+mmq-config-*` = 5.4k 行 + 新激活布局
+      `block_q8_1_mmq` + `quantize_mmq_q8_1`)⇒ 立项时按"独立一刀"评估,别混进调优。
+2. 非 GGUF 面(attention 14.5% + GDN 13%)合计 **27.5%**,大于解量化;
+   它们对任何权重格式都成立 ⇒ 属**引擎级**下一步(优先级应高于 GGUF 收尾)。
+3. 本轮之后本机对照:llama.cpp 同工具 **1211 avg / 1374 边际**;本仓 **1059 / 1175**
+   ⇒ 差 **14% / 14%**(全程从 3.6× 追到 1.14×)。

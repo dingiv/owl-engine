@@ -688,6 +688,123 @@ mod tests {
         );
     }
 
+    /// **`ssm_out` 列序 gather 门**(W-2e;2026-10-19)。
+    ///
+    /// 背景:这条置换此前**只**折进激活量化核(`GgufQuantActTiled*`)⇒ cuBLAS/MMQ
+    /// 两臂对 `ssm_out` 不可用(直吃 f16/q8_1,不做块置换)。W-2e 把置换抽成
+    /// 独立一发 `GgufGatherCols`(f16 块级 gather)⇒ 之后与普通层同路。
+    ///
+    /// 钉三件事(任一错都会静默错值):
+    /// ① gather 的字节 == host 同表置换(逐字节);
+    /// ② `gather + 普通量化` 与 `tiled 量化` 的 q8_1 缓冲**逐字节相同**(块内容不变);
+    /// ③ 端到端 GEMM 两路**位级相同**(同一 MMVQ 归约序)。
+    #[owl_test(gpu)]
+    async fn gpu_gguf_ssm_out_gather_matches_tiled_act() {
+        use crate::formats::gguf::transform;
+        if !resource_ok("gguf:4b") {
+            eprintln!("skip: 资源清单缺 \"gguf:4b\"");
+            return;
+        }
+        let path = PathBuf::from(resource("gguf:4b").expect("resource_ok 已过"));
+        let g = Gguf::open(&path).expect("open 4B");
+        let tname = "blk.0.ssm_out.weight";
+        let ti = g.get_tensor(tname).unwrap_or_else(|| panic!("缺张量 {tname}"));
+        assert_eq!(ti.ty.name(), "Q8_0", "{tname} 型不符(用例表过期?)");
+        let bytes = g.bytes(g.index_of(tname).unwrap());
+        let (rows, inner) = (ti.rows() as usize, ti.inner() as usize);
+        let (be, bb) = ti.ty.block();
+        let row_bytes = inner / be * bb;
+
+        let (nk, nv, hv) = (16usize, 32usize, 128usize);
+        assert_eq!(inner, nv * hv, "内维 {inner} ≠ nv·hv(用例表过期?)");
+        let tbl_v = transform::vhead_q8_blocks(nk, nv, hv).expect("列序表");
+        assert_eq!(tbl_v.len(), inner / 32, "表长 ≠ 内维块数");
+        let tbl_b: Vec<u8> = tbl_v.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let tbl = TensorOps::from_host(Dtype::U32, vec![tbl_v.len()], &tbl_b);
+
+        // m 取 64:同时覆盖两档(≥64 走 cuBLAS,<32 走 MMVQ)之外的最小公共面
+        let m = 64usize;
+        let k = inner;
+        let xv: Vec<f32> = (0..m * k)
+            .map(|i| {
+                let f = half::f16::from_f32(((i as f32 * 0.0173).sin() * 1.7).clamp(-2.5, 2.5));
+                f.to_f32()
+            })
+            .collect();
+        let xb: Vec<u8> = xv.iter().flat_map(|v| half::f16::from_f32(*v).to_le_bytes()).collect();
+        let x = TensorOps::from_host(Dtype::F16, vec![m, k], &xb);
+
+        // host 参考置换(与 tiled 量化门同一公式)
+        let mut xp: Vec<f32> = vec![0f32; xv.len()];
+        for r in 0..m {
+            for (j, s) in tbl_v.iter().enumerate() {
+                let d = r * k + j * 32;
+                let so = r * k + *s as usize * 32;
+                xp[d..d + 32].copy_from_slice(&xv[so..so + 32]);
+            }
+        }
+        let xpb: Vec<u8> = xp.iter().flat_map(|v| half::f16::from_f32(*v).to_le_bytes()).collect();
+
+        let xg = TensorOps::call(SemanticKernel::GgufGatherCols)
+            .arg(&x)
+            .arg(&tbl)
+            .arg_i32(m as i32)
+            .arg_i32(k as i32)
+            .aux(&[m, k])
+            .with_shape(Dtype::F16, vec![m, k]);
+
+        let mut gpu = crate::testkit::gpu_client().await;
+        // ① gather 字节 == host 置换
+        let gb = dtoh_raw(&mut gpu, &xg, m * k * 2, "gather").await;
+        let diff = gb.iter().zip(&xpb).filter(|(a, b)| a != b).count();
+        assert_eq!(diff, 0, "`GgufGatherCols` 与 host 置换分歧 {diff} 字节(块粒度/表方向错)");
+        eprintln!("[gguf-gather] ① 位级绿:{tname}({rows}×{inner}, m={m}) gather == host 置换");
+
+        // ② 量化缓冲:gather + plain  vs  tiled
+        let xq_row = k / 32 * XQ_BLOCK;
+        let xq_tiled = TensorOps::call(SemanticKernel::GgufQuantActTiledF16)
+            .arg(&x)
+            .arg(&tbl)
+            .arg_i32(k as i32)
+            .arg_i32(k as i32)
+            .aux(&[m, k])
+            .with_shape(Dtype::U8, vec![m, xq_row]);
+        let xq_plain = TensorOps::call(SemanticKernel::GgufQuantActF16)
+            .arg(&xg)
+            .arg_i32(k as i32)
+            .arg_i32(k as i32)
+            .aux(&[m, k])
+            .with_shape(Dtype::U8, vec![m, xq_row]);
+        let a = dtoh_raw(&mut gpu, &xq_tiled, m * xq_row, "tiled").await;
+        let b = dtoh_raw(&mut gpu, &xq_plain, m * xq_row, "gather+plain").await;
+        let diff = a.iter().zip(&b).filter(|(u, v)| u != v).count();
+        assert_eq!(diff, 0, "gather+plain 与 tiled 的 q8_1 缓冲分歧 {diff} 字节");
+        eprintln!("[gguf-gather] ② 位级绿:q8_1 缓冲 {}B 逐字节相同", a.len());
+
+        // ③ 端到端 GEMM 两路位级相同(MMVQ 归约序不变)
+        let wblk = TensorOps::from_host(Dtype::U8, vec![rows, row_bytes], bytes);
+        let mk = |xq: &TensorOps| -> TensorOps {
+            TensorOps::call(SemanticKernel::GgufGemm)
+                .arg(&wblk)
+                .arg(xq)
+                .arg_i32(m as i32)
+                .arg_i32(rows as i32)
+                .arg_i32(k as i32)
+                .arg_i32(k as i32)
+                .arg_i32(0)
+                .arg_i32(rows as i32)
+                .aux(&[want_ty_code("Q8_0"), m, rows])
+                .with_shape(Dtype::F16, vec![m, rows])
+        };
+        let y1 = mk(&xq_tiled);
+        let y2 = mk(&xq_plain);
+        let g1 = harvest_f16(&mut gpu, &y1).await;
+        let g2 = harvest_f16(&mut gpu, &y2).await;
+        let d = g1.iter().zip(&g2).filter(|(a, b)| a != b).count();
+        assert_eq!(d, 0, "两路 GEMM 输出分歧 {d} 项(gather 路径改变了归约序?)");
+        eprintln!("[gguf-gather] ③ 位级绿:GEMM 输出 {m}×{rows} 全同 ⇒ 分派可无缝切路");
+    }
+
     /// 型名 → ggml 型码(用例表写法;与 `family::gguf::entry_for` 同一词表)
     fn want_ty_code(name: &str) -> usize {
         use owl_kernels::family::gguf::ALL;

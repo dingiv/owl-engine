@@ -29,6 +29,10 @@
 # 双卡实测(2026-10-19,3090 Ti 对 41/42):首 token " Paris" · 两 rank logits
 # 0 项不同 · AR 注入 r0=r1=256 · decode 30.9 tok/s(debug 构建)。
 #
+# **prefill chunk(W-2e 定档:4096)**:每 chunk 都要把 17.7 GB 权重解一遍(dequant
+# 88 ms/chunk)⇒ chunk 越大越好;实测 std avg 964(chunk 1024)→ **1059**(4096)→
+# 1067(8192,但切片显存 +0.6G 且边际 <1%)。@8192-token 点 987 → **1173**。
+#
 # **prefill(W-2 后)**:MMVQ 的权重流量 = m × 权重字节 ⇒ 带宽上限 53 t/s
 # (实测 48.5)。W-2a 权重复用臂 + W-2b smem 复用臂(权重窗解量化进 smem 一次、
 # 寄存器 4×4 分块)后实测 **121.4 t/s @1001-token prompt(chunk 512)** = 2.5×;
@@ -41,7 +45,7 @@ kind = "gguf"
 bind = "127.0.0.1:8139"
 # 27B:池 = 全 ctx 常驻(单卡 24G:权重 17.7 + KV 1G@32k + 状态/图 ~0.8 ⇒ 留足)
 max_seq = 32768
-prefill_chunk = 1024
+prefill_chunk = 4096
 
 [pool]
 # 池 = max_seq(全 ctx 常驻;别再走宿主下沉 —— 4B 测速档的教训见 gguf4b.toml)

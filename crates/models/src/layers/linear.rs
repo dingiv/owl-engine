@@ -88,24 +88,53 @@ pub(crate) fn gguf_quant_gemm(
     }
     let m: usize = xs.shape()[..xs.shape().len() - 1].iter().product();
     let k = in_dim;
+    // **内维列序 gather**(W-2e;`ssm_out` tiled → grouped)
+    //
+    // `ssm_out` 的内维(v-head 轴)是 ggml **tiled** 序。此前这条置换折进
+    // 激活量化核(`GgufQuantActTiled*`),但那只覆盖 MMVQ/tile 两臂 ——
+    // cuBLAS/MMQ 臂直吃 f16/q8_1 激活 ⇒ `ssm_out` 只能退到自研 tile 臂
+    // (实测 2.67 ms/次、占 prefill 19%;设计 §19.5 定位 ①)。
+    // 现在改成:在 f16 激活上做**一次块级 gather**(m×k×2B 拷贝 ≈ 20 µs),
+    // 置换后与普通层**完全同路** ⇒ 臂集不再分叉(各臂的门原样适用)。
+    // bf16 档仍走既有 tiled 量化折叠(不新增 bf16 gather 臂)。
+    let permuted;
+    let (xs, col_index) = match col_index {
+        Some(t) if xs.dtype == Dtype::F16 => {
+            permuted = TensorOps::call(SemanticKernel::GgufGatherCols)
+                .arg(xs)
+                .arg(&t.decl())
+                .arg_i32(m as i32)
+                .arg_i32(k as i32)
+                .aux(&[m, k])
+                .with_shape(Dtype::F16, xs.shape().to_vec());
+            (&permuted, None)
+        }
+        other => (xs, other),
+    };
     // **dequant + cuBLAS 臂**(W-2d;llama.cpp 的 prefill 正路 —— 见设计 §十九)
     //
     // 形态(与上游同构):把权重按**行窗**反量化成 f16 scratch,再逐窗 cuBLAS
-    // 写进 `y[:, n0..]`(`ldc` = y 行宽)。四个适用门(缺一回退下一臂):
+    // 写进 `y[:, n0..]`(`ldc` = y 行宽)。适用门(缺一回退下一臂):
     // 1. `m ≥ GGUF_CUBLAS_MIN_M`(上游对 `ne11 ≥ 64` 才走这条路);
     // 2. 激活 = F16(本臂直吃 f16,不做量化);
-    // 3. 无内维列序表(`ssm_out` 单卡档的 tiled 列序要激活侧置换);
-    // 4. 型有行窗解量化入口。
+    // 3. 型有行窗解量化入口且 `k % 256 == 0`(解量化组的几何判据);
+    // 4. 列序表已在上面 gather 掉(`col_index` 已归零;bf16 档除外)。
     if m >= GGUF_CUBLAS_MIN_M
         && xs.dtype == Dtype::F16
         && col_index.is_none()
         && gguf_cublas_arm_enabled()
-        && owl_kernels::family::gguf::range_entry_for(ty).is_some()
+        && owl_kernels::family::gguf::range_ok(ty, k)
     {
-        // 行窗预算:单块 scratch ≤ 32 MiB(峰值 = 2 块,发射序串行);
+        // 行窗预算(W-2e 加宽):cuBLAS 的 CTA 数 = `ceil(rows/128) × ceil(m/128)`
+        // —— 每个窗独立一发 cuBLAS(同流串行),故窗小于一波就会白丢 SM。
+        // 旧档 32 MiB ⇒ 27B 的 17408 行张量被切成 19 块、每次只 30-67 CTA
+        // ⇒ 实测 26 TFLOPS(cuBLAS 同形状可达 55-65;见设计 §19.5 定位 ③)。
+        // 现档 96 MiB ⇒ 大张量 1-2 块(每发几百 CTA);峰值 = 单块 scratch
+        // (2·rows·k 字节,不进双缓冲 —— 发射序串行),27B 最大 96 MiB。
         // `OWL_GGUF_CUBLAS_TILE` 可强制行窗(诊断/调参用;0 = 预算档)
-        let budget_rows = (32usize << 20) / (k.max(1) * 2);
-        let mut tile = budget_rows.clamp(128, 2048) / 64 * 64;
+        let budget_rows = (96usize << 20) / (k.max(1) * 2);
+        let mut tile = budget_rows.clamp(128, 8 * 1024) / 64 * 64;
+        tile = tile.min(out_dim).max(64);
         if let Ok(v) = std::env::var("OWL_GGUF_CUBLAS_TILE") {
             if let Ok(v) = v.parse::<usize>() {
                 if v > 0 {
@@ -113,7 +142,6 @@ pub(crate) fn gguf_quant_gemm(
                 }
             }
         }
-        let tile = tile.max(64);
         // 首 tile 用**普通 Call**(由 eval 分配并 `track_new` 整块 y —— 账本上
         // "这个块是新分配的"必须只说一次);后续 tile 用 `CallDst` 写同一块
         // (同块别名,链式)。若首 tile 也用 CallDst,块从未被 `track_new`,
@@ -157,7 +185,7 @@ pub(crate) fn gguf_quant_gemm(
     // 适用门(缺一即回退到下一臂,不静默):
     // 1. `m ≥ GGUF_MMQ_MIN_M`(小批让位给 MMVQ —— 上游同款分界思想);
     // 2. `k % 32 == 0`(q8_1 块轴;GGUF 计划面已保证);
-    // 3. **无内维列序表**(MMQ 不做 tiled 置换 ⇒ 单卡 `ssm_out` 走 smem 臂)。
+    // 3. 列序表已在上面 gather 掉(MMQ 不做 tiled 置换)。
     if m >= GGUF_MMQ_MIN_M
         && k % 32 == 0
         && col_index.is_none()

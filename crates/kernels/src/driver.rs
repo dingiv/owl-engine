@@ -179,6 +179,8 @@ pub fn resolve(req: OpReq) -> KernelPick {
             ax(1),
             ax(2),
         ),
+        // **内维列序 gather**(W-2e):aux = [rows](k 走标量槽;几何只吃 rows)
+        "gguf.gather_cols" => gguf::gather_cols(ax(0)),
         // cuBLAS 写列窗(foreign;形状 = FOREIGN 哨兵,server 家族 runtime 自管)
         "cublas.gemm_f16_dst" => KernelPick {
             name: crate::family::cublas::GEMM_F16_DST,
@@ -596,6 +598,13 @@ pub mod gguf {
             GgmlTy::Q6K => KernelPick::of::<crate::ops::gguf::GgufRangeQ6K>(shape),
             other => panic!("owl_gguf_dequant_range: {} 未移植", other.name()),
         }
+    }
+
+    /// **内维列序 gather**(W-2e;`ssm_out` tiled → grouped):
+    /// `grid = (rows,1,1)`、`block = (256,1,1)`
+    pub fn gather_cols(rows: usize) -> KernelPick {
+        let (grid, block) = fam::gather_geom(rows);
+        KernelPick::of::<crate::ops::gguf::GgufGatherCols>(Shape { grid, block, smem: 0 })
     }
 
     /// 型 → 入口名(诊断/门用;与 [`gemm`] 同一映射源)

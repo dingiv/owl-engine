@@ -219,6 +219,11 @@ pub enum SemanticKernel {
     /// **GGUF 官方 MMQ**(tensor-core prefill;内核 = llama.cpp vendoring)。
     /// 与 smem/vec_dot 臂同槽序?**不**:MMQ 只吃 (weights, xq, out, k, n, m)。
     GgufMmq,
+    /// **GGUF 内维列序 gather**(W-2e;f16):`out[.., 32·i] = x[.., 32·tbl[i]]`
+    /// —— 把 `ssm_out` 的 tiled 列序一次性换成 grouped 序,使它也能吃
+    /// cuBLAS/MMQ 臂(此前只能退回自研 tile 臂;
+    /// 见设计 §19.5 定位 ①)
+    GgufGatherCols,
     /// **GGUF 行窗解量化**(W-2d):量化块行窗 `[n0, n0+rows)` → f16 `[rows, k]`
     /// (写进调用方给的 scratch;配 `Op::CallDst`)
     GgufCvtRange,
@@ -340,6 +345,7 @@ impl SemanticKernel {
             SemanticKernel::GgufGemmSmem => "gguf.gemm_smem",
             SemanticKernel::GgufMmq => "gguf.mmq",
             SemanticKernel::GgufCvtRange => "gguf.dequant_range",
+            SemanticKernel::GgufGatherCols => "gguf.gather_cols",
             SemanticKernel::GgufCublasDst => "cublas.gemm_f16_dst",
             SemanticKernel::GgufDequantRows => "gguf.dequant_rows",
             SemanticKernel::GgufQuantActTiledF16 => "gguf.quant_act_f16_tiled",
